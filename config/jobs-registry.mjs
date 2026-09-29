@@ -1338,19 +1338,6 @@ export const JOBS_REGISTRY = [
     runbook: '1 か月、楽天・Yahoo・auPAY・Qoo10 の取得と送信が問題なく動いていたら、フォルダごと削除し、このエントリも消す',
   },
   {
-    id: 'settlement-history-rebuild',
-    type: 'temporary_asset',
-    importance: 'TMP',
-    owner: '中原さん',
-    purpose: 'Amazon 決済の重複除去を「同じ文書の中の出現順つき」に直した (2026-09-28・#1511。(決済, 鍵) だけで 1 行にして 2 週間ごとに 55〜65 万円を数え落としていた) 後に、'
-      + '過去の集計 (月の集計・日次の財務・アカウント単位の手数料) を 1 回だけ作り直して Render に送り直し、決済ごとに振込額と照合するスクリプト。定期実行はしない',
-    where: 'bfaith-portal リポジトリ apps/warehouse/rebuild-amazon-settlement-history.js (miniPC で手で 1 回)',
-    remove_by: '2026-10-31',
-    lifecycle: 'temporary',
-    runbook: 'マージの後、daily-sync の時間を避けて miniPC で node -r dotenv/config apps/warehouse/rebuild-amazon-settlement-history.js --data-dir C:/Users/bfaith/bfaith-portal/data。'
-      + '最後の照合が全部一致 (終了コード 0) を確かめたら、スクリプトを消す PR を作り、このエントリも消す',
-  },
-  {
     id: 'settlement-v1-fallback',
     type: 'temporary_asset',
     importance: 'TMP',

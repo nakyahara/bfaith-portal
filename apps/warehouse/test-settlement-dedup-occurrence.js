@@ -117,13 +117,7 @@ const ins = db.prepare(`INSERT INTO raw_amazon_settlement_lines (${cols.join(','
 for (const r of src) { const { id, ...rest } = r; ins.run({ ...rest, physical_line_hash: rest.physical_line_hash + '-old', ingest_run_id: 'old-run', ingested_at: '2026-01-01 00:00:00' }); }
 expectAll('過去の膨張の残骸 (同じ行が 2 回)');
 
-// 過去の作り直しのスクリプト (rebuild-amazon-settlement-history.js): 作り直し + 照合が通る (Render へは送らない) / 行番号の空があれば止まる
-const hist = (extra = []) => { try { return { code: 0, out: runNode(['apps/warehouse/rebuild-amazon-settlement-history.js', '--data-dir', tmpDir, '--no-sync', ...extra]) }; } catch (e) { return { code: e.status, out: String(e.stdout || '') + String(e.stderr || '') }; } };
-let h = hist();
-ok(h.code === 0 && /決済 1 件のうち振込額と一致 1 件/.test(h.out), `作り直しのスクリプト: 作り直して照合 = 1 件一致・終了コード 0 (${h.code})`);
-db.prepare(`UPDATE raw_amazon_settlement_lines SET source_line_no = NULL WHERE id = (SELECT MIN(id) FROM raw_amazon_settlement_lines)`).run();
-h = hist(['--check-only']);
-ok(h.code === 1 && /行番号の空/.test(h.out), `作り直しのスクリプト: 行番号の空があれば作り直さずに止まる (${h.code})`);
+// (過去の作り直しのスクリプト rebuild-amazon-settlement-history.js の試験は、スクリプトと一緒に 2026-09-29 に消した = 1 回きりの作り直しは済んだ・照合 17/17)
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 出現順つき重複除去テスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

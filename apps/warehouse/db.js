@@ -2248,7 +2248,8 @@ function createTables() {
   //   🚨 前提: 1 文書 = 1 決済の全部 (完全なレポート) で、行番号 (source_line_no) がある。raw に書くのは fetch-amazon-settlements.js だけ
   //   (SP-API の決済レポート 1 本 = 1 文書。manual_csv の層に書く処理は無い・本番も sp_api_v1 だけ・行番号の空 0 = 2026-09-28)。
   //   1 つの決済を複数の文書に分けて書く取込 (期間で区切った CSV など) を足すときは、この数え方を見直す (文書ごとの出現順を取るので、分かれた行を 1 行にしてしまう)。
-  //   作り直しと照合 = apps/warehouse/rebuild-amazon-settlement-history.js (行番号の空があれば止める)
+  //   過去の作り直しと照合のスクリプト (rebuild-amazon-settlement-history.js・#1511) は 2026-09-29 に消した (1〜9 月を作り直し・照合 17/17)。
+  //   また過去を作り直すときは git の履歴から戻す (月の集計 --all → 日次の財務を月ごと → アカウント単位の手数料 → 決済ごとに振込額と照合)
   db.exec(`CREATE VIEW v_amazon_settlement_unified AS
     WITH occ AS (
       SELECT l.*,
