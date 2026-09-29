@@ -838,5 +838,58 @@ await ta('[27] 機能の旗 LZ_MANUAL_V4 が立っていない = 今までの動
   }
 });
 
+await ta('[28] 口 (③c-1b-3b-2b): 成果物を送る (バイト列・中身から計算し直す・申告違い 400・同じ ID の違う中身 409・大きすぎる 413・Bearer の前に本文を読まない) / 一覧・1 つ・無い 404 / outbox の取り出しと送れた印 (1 回だけ)', async () => {
+  await withServer(async ({ url, db }) => {
+    const c = C.createImportStateClient({ url, token: 'tok' });
+    S.init(db, { by: 'x', now: T0 });
+    const buf = csvOf(['A-1', 'B-2']);
+    const meta = { csvBuf: buf, sourceRunId: 'lzd_20300115_a', targetAsOf: '2030-01-15', verdict: 'pass', sha256: shaOf(buf), rows: 2, by: 'lz-daily' };
+    const r = await c.putArtifact(meta);
+    assert.deepEqual([r.ok, r.stored, r.csv_sha256, r.rows], [true, true, shaOf(buf), 2]);
+    assert.equal((await c.putArtifact(meta)).same, true);
+    const codeOf = async (p) => { try { await p; return 'ok'; } catch (e) { return `${e.status}:${e.code}`; } };
+    const other = csvOf(['A-1', 'C-3']);
+    assert.equal(await codeOf(c.putArtifact({ ...meta, csvBuf: other, sha256: shaOf(other) })), '409:conflict');
+    assert.equal(await codeOf(c.putArtifact({ ...meta, sourceRunId: 'lzd_20300115_b', sha256: 'b'.repeat(64) })), '400:mismatch');
+    assert.equal(await codeOf(c.putArtifact({ ...meta, sourceRunId: 'lzd_20300115_b', rows: 'x' })), '400:bad_request');
+    // JSON で送る・空の本文 = 400 / 大きすぎる = 413 (短い決まった文言)
+    const post = (headers, body, q = 'source_run_id=lzd_q&target_as_of=2030-01-15&verdict=pass&sha256=x&rows=1&by=x') => fetch(`${url}/apps/logizard-import-state/api/artifacts?${q}`, { method: 'POST', headers, body });
+    let res = await post({ Authorization: 'Bearer tok', 'Content-Type': 'application/json' }, JSON.stringify({ csv: 'x' }));
+    assert.deepEqual([res.status, (await res.json()).error], [400, 'bad_request']);
+    res = await post({ Authorization: 'Bearer tok', 'Content-Type': 'application/octet-stream' }, Buffer.alloc(0));
+    assert.equal(res.status, 400);
+    const big = Buffer.alloc(S.LIMITS.csvBytes + 1, 0x41);
+    res = await post({ Authorization: 'Bearer tok', 'Content-Type': 'application/octet-stream' }, big);
+    const j = await res.json();
+    assert.deepEqual([res.status, j.error, j.message], [413, 'too_large', '本文が大きすぎる']);
+    // Bearer が無い・違う = 本文を読まずに 401 (大きな本文でも 413 でなく 401)
+    res = await post({ 'Content-Type': 'application/octet-stream' }, big);
+    assert.equal(res.status, 401);
+    res = await post({ Authorization: 'Bearer nope', 'Content-Type': 'application/octet-stream' }, buf);
+    assert.equal(res.status, 401);
+    // 同じ名前が 2 つ = 無い扱い
+    res = await post({ Authorization: 'Bearer tok', 'Content-Type': 'application/octet-stream' }, buf, `source_run_id=lzd_a&source_run_id=lzd_b&target_as_of=2030-01-15&verdict=pass&sha256=${shaOf(buf)}&rows=2&by=x`);
+    assert.deepEqual([res.status, (await res.json()).error], [400, 'bad_request']);
+    // 一覧・1 つ・無い
+    const list = await c.listArtifacts();
+    assert.deepEqual(list.artifacts.map((x) => [x.source_run_id, x.rows, x.csv === undefined]), [['lzd_20300115_a', 2, true]]);
+    assert.equal((await c.getArtifact('lzd_20300115_a')).artifact.csv_sha256, shaOf(buf));
+    assert.equal(await codeOf(c.getArtifact('lzd_nothing')), '404:not_found');
+    // outbox: halt で積む → 取り出す → 送れた (1 回だけ)
+    await c.halt({ by: '中原', reason: '口の試験で止める' });
+    const ob = (await c.outbox()).outbox;
+    assert.deepEqual(ob.map((o) => o.kind), ['halt']);
+    assert.deepEqual([(await c.outboxSent({ id: ob[0].id, by: 'lz-daily-import' })).already, (await c.outboxSent({ id: ob[0].id, by: 'x' })).already], [false, true]);
+    assert.deepEqual((await c.outbox()).outbox, []);
+    assert.equal(await codeOf(c.outboxSent({ id: 'x', by: 'x' })), '400:bad_request');
+    assert.equal(await codeOf(c.outboxSent({ id: 999, by: 'x' })), '404:not_found');
+    // 機械の口には手の取込・設定の口が無い (画面の口 = 3b-4)
+    for (const p of ['/api/settings', '/api/manual', '/api/pending']) {
+      res = await fetch(`${url}/apps/logizard-import-state${p}`, { headers: { Authorization: 'Bearer tok' } });
+      assert.equal(res.status, 404, p);
+    }
+  });
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);

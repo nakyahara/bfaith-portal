@@ -3,7 +3,8 @@
  *
  * Render だけ (server.js の JOBS_MONITOR_ENABLED の中で mount = miniPC は同じ server.js でも口を立てない = 状態が 2 つにならない)。
  * **どの body parser よりも前に mount** する (method・Content-Type によらず、認証の前に本文を読まない。Codex #1513 R1 Medium)。
- * 認証 = Bearer LZ_LOCK_TOKEN (無ければ 503 = 閉じる)。呼ぶのは miniPC の取込 (自動の ③) と Stream Deck の PC の auto-barcode.js (手の ③) と人の CLI。
+ * 認証 = Bearer LZ_LOCK_TOKEN (無ければ 503 = 閉じる)。呼ぶのは miniPC の取込 (自動の ③・少数件の試験・毎晩の成果物の送り) と人の CLI (機械の口)。
+ * 手の取込・設定・waiver はここに出さない (ログインして使う画面の口 = ③c-1b-3b-4)。
  *
  *   GET  /apps/logizard-import-state/api/status
  *   POST /apps/logizard-import-state/api/init        { by, note }
@@ -17,6 +18,13 @@
  *   POST /apps/logizard-import-state/api/halt         { by, reason }
  *   POST /apps/logizard-import-state/api/resume       { by, note }
  *   POST /apps/logizard-import-state/api/notified     { run_id, state, state_event_id, by }   (知らせたのが今の状態のときだけ。③c-1b-2b K9)
+ *   ③c-1b-3b-2b (契約 v4 + 設計 R1 K3-1・K3-4):
+ *   POST /apps/logizard-import-state/api/artifacts?source_run_id&target_as_of&verdict&sha256&rows&by   本文 = 毎晩の成果物の CSV のバイト列
+ *        (application/octet-stream・4MB まで)。ポータルが中身から sha256・行数・形を計算し直す (申告と違う = 400 mismatch・同じ ID の違う中身 = 409 conflict)
+ *   GET  /apps/logizard-import-state/api/artifacts[?limit]   成果物の識別の一覧 (中身は返さない)
+ *   GET  /apps/logizard-import-state/api/artifacts/:source_run_id   1 つの識別 (無い = 404)
+ *   GET  /apps/logizard-import-state/api/outbox[?limit]       まだ送れていない知らせ (halt・残った再適用待ち・確認待ち)
+ *   POST /apps/logizard-import-state/api/outbox/sent          { id, by }   送れた (1 回だけ・もう送れた = already)
  * 断る = 409 (状態・鍵) / 400 (形) / 404 (まだ初期化していない)。{ error: code, message }
  */
 import { Router } from 'express';
@@ -48,11 +56,12 @@ export function createImportStateRouter({ getDb = null, now = () => Date.now(), 
   });
   router.use(express.json({ limit: '64kb' }));
   // 本文が大きすぎる・JSON でない = 短い JSON で返す (スタックを出さない)
-  router.use((err, req, res, next) => {
+  // 決まった文言だけ返す (本文の断片を返さない。Codex #1513 R1 Low)
+  const bodyError = (err, req, res, next) => {
     if (!err) return next();
-    // 決まった文言だけ返す (本文の断片を返さない。Codex #1513 R1 Low)
-    return res.status(err.status === 413 ? 413 : 400).json({ ok: false, error: err.status === 413 ? 'too_large' : 'bad_json', message: err.status === 413 ? '本文が大きすぎる (64KB まで)' : 'JSON として読めない' });
-  });
+    return res.status(err.status === 413 ? 413 : 400).json({ ok: false, error: err.status === 413 ? 'too_large' : 'bad_json', message: err.status === 413 ? '本文が大きすぎる' : 'JSON として読めない' });
+  };
+  router.use(bodyError);
   const handle = (fn) => (req, res) => {
     try {
       res.json({ ok: true, ...fn(req.body || {}, req) });
@@ -74,6 +83,26 @@ export function createImportStateRouter({ getDb = null, now = () => Date.now(), 
   router.post('/api/halt', handle((b) => S.halt(dbOf(), { by: b.by, reason: b.reason, now: now() })));
   router.post('/api/resume', handle((b) => S.resume(dbOf(), { by: b.by, note: b.note, now: now() })));
   router.post('/api/notified', handle((b) => S.markNotified(dbOf(), { runId: b.run_id, state: b.state, stateEventId: b.state_event_id, by: b.by, now: now() })));
+  // ── ③c-1b-3b-2b: 毎晩の成果物 (K3-1)・知らせの outbox (K3-4) ──
+  // 成果物の本文は Bearer の後に、この口だけの parser (octet-stream・4MB) で読む
+  const rawCsv = express.raw({ type: 'application/octet-stream', limit: S.LIMITS.csvBytes });
+  const INT_RE = /^[0-9]{1,6}$/;
+  router.post('/api/artifacts', rawCsv, handle((body, req) => {
+    if (!req.is('application/octet-stream') || !Buffer.isBuffer(body) || !body.length) throw new S.ImportStateError('bad_request', '本文は成果物の CSV のバイト列 (application/octet-stream)', 400);
+    const q = req.query || {};
+    const one = (k) => (typeof q[k] === 'string' ? q[k] : undefined);   // 同じ名前が 2 つ (配列) = 無い扱い
+    if (!INT_RE.test(one('rows') || '')) throw new S.ImportStateError('bad_request', 'rows (行数) が要る', 400);
+    return S.putArtifact(dbOf(), { sourceRunId: one('source_run_id'), targetAsOf: one('target_as_of'), verdict: one('verdict'), csvBuf: body, sha256: one('sha256'), rows: Number(one('rows')), by: one('by'), now: now() });
+  }));
+  router.get('/api/artifacts', handle((_b, req) => ({ artifacts: S.listArtifacts(dbOf(), { limit: Number(req.query.limit) || 14 }) })));
+  router.get('/api/artifacts/:id', handle((_b, req) => {
+    const a = S.getArtifact(dbOf(), { sourceRunId: req.params.id });
+    if (!a) throw new S.ImportStateError('not_found', 'その成果物は無い', 404);
+    return { artifact: a };
+  }));
+  router.get('/api/outbox', handle((_b, req) => ({ outbox: S.outboxPending(dbOf(), { limit: Number(req.query.limit) || 20 }) })));
+  router.post('/api/outbox/sent', handle((b) => S.outboxMarkSent(dbOf(), { id: b.id, by: b.by, now: now() })));
+  router.use(bodyError);   // この口だけの parser の失敗 (大きすぎる) も同じ短い JSON で
   return router;
 }
 
