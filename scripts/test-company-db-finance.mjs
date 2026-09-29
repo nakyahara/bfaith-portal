@@ -162,6 +162,9 @@ await t('0044 mart.finance_daily_range = mart.v_finance_daily (同じ期間で�
   const cross = await cmp('2026-08-15', '2026-10-15');
   assert.ok(cross.some((r) => r.economic_date_jst.toISOString ? r.economic_date_jst.toISOString().startsWith('2026-08-31') : String(r.economic_date_jst).startsWith('2026-08-31')));
   assert.equal(await num(`select count(*) as n from mart.finance_daily_range(1::smallint, 'amazon', 'us', '2026-09-01', '2026-09-30')`), 0);
+  // 0045: 関数の中だけ nested loop を使わない (本番で見込みが外れて 1,786 万回の比較 = 33 秒・120 秒で打ち切りだった)
+  const cfg = (await one(`select array_to_string(proconfig, ',') as c from pg_proc where proname = 'finance_daily_range'`)).c;
+  assert.match(String(cfg), /enable_nestloop=off/);
   const src = fs.readFileSync(new URL('../apps/company-db/router.mjs', import.meta.url), 'utf8');
   assert.match(src, /from mart\.finance_daily_range\(1::smallint, \$1, \$2, \$3::date, \$4::date\)/);   // 受け口の /daily は関数を使う
   await apply('O-AUG', 2, []);
