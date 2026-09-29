@@ -768,6 +768,21 @@ commit;
 - Render の受け口 (`router.mjs`): `POST /apps/company-db/sync/order-finance`・`GET .../status` (件数・世代・run・DB の大きさ = pg_database_size と読めれば WAL)・`/receipt`・`/keys` (受領状態の注文番号・collate "C")・`/daily` (v_finance_daily・62 日まで)・`/account-fees`・`/uncovered`
 
 試験 = `node scripts/test-company-db-finance.mjs` (PGlite 16 件: 0043 の安全の手順・旧互換が無い・policy / apply の applied・stale・same・版違い・空集合 / SQL の歯止め / net / **v_finance_daily = SQLite の試験 (test-finance-promotion-tax.js) と同じ場面の手で計算した値** (返品・カードの支払い取り消し・ポイント・値引きの税・注文番号の無い補てん)・単価の ROUND / 月の手数料 / uncovered / 注文の累計 / 指紋の決め / 受け口の検証)。🚨 policy の重複検査と受領行の for update の 2 接続の並行は PGlite では書けない
+
+### Amazon 財務の送り手 (miniPC・F2b-2 = `apps/company-db/push/amazon-finance.mjs`)
+
+- **集約** = `push/amazon-finance-transform.mjs`。SQLite の日次の財務の build (`sql/amazon/build_f_amazon_finance_sku_daily_v1.sql`) と月の手数料の build (`rebuild-amazon-account-fees.js`) の **別の実装** → **同じ決済の行を両方に通して全列一致** の試験で守る (build の CASE を変えたら集約も変えて試験を流す)。手数料の分け方は `apps/warehouse/amazon-account-fee-rules.js` の 1 か所 (build と送り手が共用)
+  - 重複除去 = build と同じ出現順つき・注文 (疑似注文 = 注文番号の無いその計上日の行) ごとに全期間の全部の行を読む (business_line_key は注文番号・posted_date・SKU・金額を含む = 絞っても build と同じ)
+  - SKU のある BuyerRecharge・預かり金 = build が日次の財務から除く → SKU を `-` にして not_account_fee (金額は net に残す)
+  - 円未満の端数・読めない計上日・JPY 以外・空白だけの SKU・1 注文 500 行超 = その注文はまるごと送らない (台帳の「送れない鍵」・次の回に必ず読み直す)
+  - 注文番号も計上日も読めない行 = 台帳の「鍵の分からない不正な行」→ その間は **疑似注文を 1 つも送らない** (空の集合も)・❌
+  - どの列にも入らない金額 (shipment_fee・order_fee・direct_payment・SKU の行の知らない手数料の種類) = unmapped_jpy。「元の行に 0 でない金額があったか」を行で数えて ⚠️
+- **鍵の選び方**: `--from/--to` = 計上日がその範囲にある行を持つ注文 (選んだ注文は全期間の全部の行を送る)・`--incremental` = 台帳の watermark (前回そろって終わった回の ingested_at の最大) の 3 日前から後に入った行を持つ注文 + 送れなかった鍵 (watermark が無い・変換の版が変わった = 全部)・`--full` = 全部を集約し直して指紋が変わったもの + **Render にだけある鍵に空の集合**
+- **容量の見張り** (D-W5): chunk の前に「Render の DB の大きさ (+ WAL・読めなければ見込み) + 送った分 + 次の chunk の行 × 1 行の大きさ × 置き換えの倍率 + 余裕」が `CDB_DB_LIMIT_BYTES` の 80% を超えるなら送らずに止まる。🚨 `CDB_DB_LIMIT_BYTES` が無ければ送らない。1 行の大きさ・倍率 (`CDB_FINANCE_ROW_BYTES` / `CDB_FINANCE_REPLACE_FACTOR`) は `node scripts/company-db/measure-amazon-finance.mjs --from … --to …` (PGlite に入れて測る・Render に触れない) の値
+- **突き合わせ** `--reconcile [--all]` = 直近 45 日 + 台帳の「未照合の月」(送った集合の新旧の計上日の月) の 日 × SKU (鍵の和集合・Easy Ship の割り振りだけの行は除く・数量 5 列 + 金額 21 列 + profit_before_cogs) と月 × 手数料の種類 (金額・行数) と uncovered。差の月 → 日次の財務のやり残し (`amazon-finance-pending.json`) / 月の手数料のやり残し (`amazon-account-fees-pending.json`・daily-sync の手数料の build / sync がその月までさかのぼり、両方が通ったら消す)。差が 1 回目 ⚠️・2 回続けば ❌
+- 受領記録の指紋は受け口が作り直した行で計算する (`receiptRows`) = 次の回に「Render が復元された」と誤判定しない
+- 手順 (F2b-2 = 手で。daily-sync には F2b-3 で入れる): ① `--from 月初 --to 月末 --dry-run` (1 注文の最大の行数 ≤ 500・最大の JSON・拾われない金額・鍵の分からない行) → ② 測る → ③ 中原さんが D-W5 を決める → ④ env を置いて 1 か月だけ送る → ⑤ `--reconcile`
+- 試験 = `node scripts/test-company-db-amazon-finance.mjs` (二重の実装の一致・送り手の通し (本物の router を HTTP で)・突き合わせ・手数料のやり残し)
 ## 受注・出荷の受け皿 (0013。08 §4.1〜4.3 / §4.7。D4)
 
 受注の raw は Company DB に持ち込まない (年 236 万注文)。miniPC が warehouse.db の追記ログから core の形に整えて §4.7 の契約で push する (取込ジョブ = D5)。**注文 = モールの注文 1 件、出荷 = NE の伝票 1 件**。状態の履歴は持たない (D-36。出荷済み・取消の時刻を列で)。

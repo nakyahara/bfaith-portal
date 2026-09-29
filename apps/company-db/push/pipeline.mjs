@@ -9,7 +9,11 @@
  *
  * 種類ごとに渡すもの:
  *   kind / label / paths { post, status, receipt, keys } / countOf(statusJson) → { count, maxBatchSeq } / keysOf(keysJson) → string[]
- *   iterate(warehouse, stats) = raw を鍵順に流し読みする generator (呼ぶ側の読み取り取引の中で動く。stats は自由に使ってよい)
+ *   iterate(warehouse, stats, ctx) = raw を鍵順に流し読みする generator (呼ぶ側の読み取り取引の中で動く。stats は自由に使ってよい。ctx = { startedAt, fps, pre, dryRun })
+ *   任意 (Amazon 財務 F2b-2 で足した):
+ *     beforeScan(hctx) → pre = 走査の前 (lock の中・台帳の初期化の後) に 1 回だけ Render を読む (全件の作り直しで Render にだけある鍵を知る)。dry-run では呼ばない
+ *     beforeChunk({ rows, lines, ...hctx }) = 各 chunk を送る直前 (容量の見張り。throw = 送らずに止める)
+ *     receiptRows(body) → 受け口が正規化した rows (key つき) = 受領記録の指紋を受け口と同じ形で計算する (受け口が行を作り直す種類。既定 = 送った行そのまま)
  *   inScope(group, fps) / build(group, ctx) → { key, payload, n_lines, no_synced_at? } (throw = 整形できない) / transformVersion
  */
 import crypto from 'node:crypto';
@@ -100,6 +104,7 @@ export async function runPush({
   minSplit = MIN_SPLIT, maxBodyBytes = MAX_BODY_BYTES, stats = {},
   metaOnFirstChunk = null,   // 最初の chunk の直前 (世代を取る取引) に台帳へ書く印 { 鍵: 値 } = 「送った後に要る処理」を HTTP より先に永続化 (注文の結び直し。Codex D5b-1 R2 #1)
   afterSend = null,          // 送り終えた後 (lock の中・持ち主の確認の後) に回す処理 (ctx) → 結果。error があれば run は ok = false (Codex D5b-1 R2 #3)
+  beforeScan = null, beforeChunk = null, receiptRows = null,   // 上の「任意」
 }) {
   if (chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk は 1〜${MAX_CHUNK}`);
   if (!dryRun) {
@@ -146,14 +151,16 @@ export async function runPush({
       ledger.markInitialized(startedAt);
       mustOwn();
     }
+    let pre = null;
+    if (beforeScan && !dryRun) { pre = await beforeScan({ fetchImpl, base, syncKey, log, mustOwn }); mustOwn(); }
     fps = ledger.loadFingerprints();
     // ── ① raw を 1 つの読み取り取引で流し読み (snapshot はここで閉じる。HTTP の間は持たない。Codex R2 #6) ──
     let buf = [];
     const flushBuf = () => { if (buf.length) { ledger.pushOutbox(r.runId, buf); buf = []; } };
-    const ctx = { startedAt, fps };
+    const ctx = { startedAt, fps, pre, dryRun };
     warehouse.exec('begin');
     try {
-      for (const group of iterate(warehouse, stats)) {
+      for (const group of iterate(warehouse, stats, ctx)) {
         r.scanned++;
         if (!dryRun && r.scanned % HEARTBEAT_EVERY === 0) mustOwn();   // 走査中も心拍 (Codex R3 #4)
         if (!inScope(group, fps)) continue;
@@ -188,6 +195,7 @@ export async function runPush({
       if (r.batchSeq == null) r.batchSeq = ledger.nextBatchSeq(now(), owner, metaOnFirstChunk);   // 世代は最初の chunk の直前に取る (送る物が無い run では進めない。持ち主の確認・送る前に残す印と同じ取引)
       const items = rows.map((p) => p.item);
       const body = { run_id: r.runId, batch_seq: r.batchSeq, chunk_index: chunkIndex++, last, transform_version: transformVersion, rows: items };
+      if (beforeChunk) { await beforeChunk({ rows: items, lines: rows.reduce((s, p) => s + (p.item.lines ? p.item.lines.length : 0), 0), fetchImpl, base, syncKey, log, mustOwn }); mustOwn(); }
       const res = await postJson(fetchImpl, { base, syncKey, path: paths.post, log, sleep, body, beforeAttempt: mustOwn });
       if (res.deadline) {
         chunkIndex--;                                                                // 使わなかった番号を戻す
@@ -206,7 +214,7 @@ export async function runPush({
       r.failed.push(...res.failed.map((f, i) => ({ ...f, key: failedKeys[i] }))); r.staleKeys.push(...staleKeys);
       const skip = new Set([...failedKeys, ...staleKeys]);
       // 受領記録の指紋は受け口と同じ計算 (validateChunk が正規化した rows = key を含む) → 送る行に key を足して計算
-      const normalized = rows.map((p) => ({ key: p.key, ...p.item }));
+      const normalized = receiptRows ? receiptRows(body) : rows.map((p) => ({ key: p.key, ...p.item }));
       ledger.ackOutbox(rows, rows.filter((p) => !skip.has(p.key)).map((p) => ({ key: p.key, fp: p.fp })), r.batchSeq,
         { owner, at: now(), receipt: { run_id: r.runId, chunk_index: body.chunk_index, payload_checksum: payloadChecksum(normalized) } });
       r.sent += rows.length; r.chunks++;

@@ -13,7 +13,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
 import { isWarnSummary } from './amazon-fees-outcome.js';
-import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS } from './amazon-finance-months.js';
+import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS } from './amazon-finance-months.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -825,18 +825,33 @@ async function main() {
     // === Amazon アカウント単位フィー月次 (amazon-dashboard PR-C) ===
     // 保管料/長期在庫追加手数料/返送等の SKU 無しフィーを月次集計して mirror へ。
     // raw settlement は上の fetch-amazon-settlements.js で更新済みの前提 (失敗時も前回分で再集計、冪等)。
+    // ふだん 14 か月。Company DB との突き合わせで月の手数料に差が出た月 (amazon-account-fees-pending.json) があれば その月までさかのぼる (2026-09-29 F2b-2)。
+    //   やり残しは build と sync の両方が通った後にだけ消す (日次の財務のやり残しと同じ約束)
+    let feesPlan;
+    try { feesPlan = accountFeesMonthsBack(process.env.DATA_DIR, { currentMonth }); }
+    catch (e) { feesPlan = { months: ACCOUNT_FEES_BASE_MONTHS, pending: [], covered: [], warn: true, notes: [`月の手数料のやり残しを読めない (${e.message})`] }; }
+    if (feesPlan.notes.length) console.log(`[DailySync] Amazonアカウントフィー: ${feesPlan.notes.join(' / ')}`);
+    if (feesPlan.warn) results.push({ name: 'Amazonアカウントフィー やり残し', success: true, warn: true, summary: `⚠️ ${feesPlan.notes.join(' / ')}` });
     const accountFeesBuildResult = runScript(
-      `apps/warehouse/rebuild-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} --months 14`,
+      `apps/warehouse/rebuild-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} --months ${feesPlan.months}`,
       'Amazonアカウントフィー build', 300000
     );
     // 分けられない SKU なしの取引 (名前が変わった手数料の疑い) があれば最後の行が ⚠️ = 成功だが「全部 OK」に数えない (2026-09-28: 7 月から保管料の名前が変わって 0 になっていた)
     results.push({ name: 'Amazonアカウントフィー build', ...accountFeesBuildResult, warn: accountFeesBuildResult.success && isWarnSummary(accountFeesBuildResult.summary) });
     if (accountFeesBuildResult.success) {
       const accountFeesSyncResult = runScript(
-        `apps/warehouse/sync-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} --months 14`,
+        `apps/warehouse/sync-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} --months ${feesPlan.months}`,
         'Amazonアカウントフィー sync', 300000
       );
       results.push({ name: 'Amazonアカウントフィー sync', ...accountFeesSyncResult });
+      if (accountFeesSyncResult.success && feesPlan.covered.length) {
+        try {
+          const left = writePendingMonths(process.env.DATA_DIR, [], { attempted: feesPlan.covered, file: ACCOUNT_FEES_PENDING_FILE });
+          console.log(`[DailySync] Amazonアカウントフィー: やり残し ${feesPlan.covered.join(', ')} を作り直した (残り ${left.join(', ') || 'なし'})`);
+        } catch (e) {
+          results.push({ name: 'Amazonアカウントフィー やり残し', success: true, warn: true, summary: `⚠️ 月の手数料のやり残しを消せない (${e.message}) = 次の朝も同じ月を作り直す` });
+        }
+      }
     } else {
       console.log('[DailySync] Amazonアカウントフィー sync は build 失敗のためスキップ');
     }
