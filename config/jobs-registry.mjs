@@ -1263,7 +1263,7 @@ export const JOBS_REGISTRY = [
     importance: 'P3',
     owner: 'Claude + 中原さん (実機の取込と切替日は中原さんと)',
     purpose: 'ロジザードの毎日の商品マスタの取込を GAS から Company DB の自動に切り替える (マスタ正本切替 ③c)。完了の条件 (v3 M6) = '
-      + '① daily-sync の「ロジザード毎日の商品マスタ(影)」(証跡 lz-daily) が 3 日続けて合格 (説明できない差・判定できない・形の差・不正 = 0。作る回そのものは lz-daily-build が見る) '
+      + '① daily-sync の「ロジザード毎日の商品マスタ(影)」(証跡 lz-daily) が 3 日続けて合格 **かつ成果物をポータルに送れた** (verdict = pass かつ portal.ok = true・版 lzd-v3 以降。説明できない差・判定できない・形の差・不正 = 0。作る回そのものは lz-daily-build が見る。③c-1b-3b-3) '
       + '② ③c-1b (鍵の口・auto-barcode の起動の分け方・取込の記録) の後に、少数件の実機の取込で ロジザードの照合の鍵・大文字小文字・無効の商品・取り込んだ後の値・対象外の列を確かめる '
       + '③ 切替日 = Stream Deck を ①② だけにし (この PC の C:\\tools\\logizard-automation\\.env に LOGIZARD_BC_DAILY=auto・③c-1b-3a)、自動の ③ を始める。止まると GAS の手の取込のまま (現場は止まらない) = P3',
     where: 'miniPC の daily-sync (lz-daily.mjs) の証跡 + 中原さんとの実機の取込。手順 = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」',
@@ -1271,7 +1271,7 @@ export const JOBS_REGISTRY = [
     period_hours: 30 * 24,
     warn_days: 5,
     lifecycle: 'permanent',   // human_obligation は台帳の決まりで permanent。完了の後に RETIRED_JOBS へ移す
-    runbook: '① 毎朝の daily-sync の「ロジザード毎日の商品マスタ(影)」の行と DATA_DIR/company-db-evidence/<日付>/lz-daily.json の verdict を見る (3 日続けて pass か) '
+    runbook: '① 毎朝の daily-sync の「ロジザード毎日の商品マスタ(影)」の行と DATA_DIR/company-db-evidence/<日付>/lz-daily.json の verdict と portal.ok を見る (3 日続けて pass かつ portal.ok = true か。送れていない日は数えない) '
       + '② 不合格なら report.json の unexplained / invalid を読み、直すか中原さんに認めてもらう '
       + '③ ③c-1b の後に中原さんと少数件の実機の取込 (scripts/logizard-import/lz-import-test.mjs plan → 中原さんが一覧を認める → run・手順 = db/company/README.md) → 切替日 → 完了の ping を 1 回 → この項目を RETIRED_JOBS へ移す',
   },
