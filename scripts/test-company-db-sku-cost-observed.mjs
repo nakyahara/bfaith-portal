@@ -99,6 +99,12 @@ await t('正規の JSON: 鍵の順は作った順に依らない・null は null
   assert.equal(canonicalSha256({ b: 1, a: [null, 'x'] }), canonicalSha256({ a: [null, 'x'], b: 1 }));
   assert.notEqual(canonicalSha256({ a: null }), canonicalSha256({ a: 0 }));
   for (const v of [{ a: 1.5 }, { a: NaN }, { a: undefined }, { a: new Date() }, { a: 1n }, [Infinity]]) assert.throws(() => canonicalJsonStrict(v), /整数|素の object|JSON にできない/);
+  assert.throws(() => canonicalSha256(Array(1)), /配列に穴/);   // 疎な配列は [] と同じ指紋にしない (Codex #1549 R3 Low1)
+  assert.throws(() => canonicalJsonStrict({ a: 1, [Symbol('s')]: 2 }), /symbol の鍵/);
+  // 正規化の後に ASCII でない商品コード = 送らない (Codex #1549 R3 M1)
+  const na = planPayload({ codes: ['SKU-İ', 'SKU-A'], periods: [] }, new Set(['sku-a']));
+  assert.deepEqual(na.nonAsciiCodes, ['SKU-İ']);
+  assert.deepEqual(planPayload({ codes: ['ＳＫＵ－Ａ'], periods: [] }, new Set()).nonAsciiCodes, []);   // 全角の英数記号は正規化の後に ASCII = 通す
 });
 await t('🚨 正規化で同じになる履歴のコードは曖昧 = どれも送らない (夜間ロードと同じ normSku)・Render に無い / 形が不正なコードは結びつかない・数は履歴に出るコード (行の無いコードも)', () => {
   const rows = [H('ABC-1', BL, 'BASELINE_RESET', 10), H('abc－1', '2026-06-01 00:00:00', 'INSERT', 20), H('ZZZ', BL, 'BASELINE_RESET', 1), H('Q', BL, 'BASELINE_RESET', 1, 'PARTIAL'),
@@ -186,6 +192,7 @@ await t('新しい世代 = その会社 × 送り元の行を全部入れ替え�
   assert.deepEqual((await loads()).map((x) => x.g), [1, 3]);
   await assert.rejects(pg.query(`update core.sku_cost_observed_loads set row_count = 0 where generation = 1`), /append-only/);
   await assert.rejects(pg.query(`delete from core.sku_cost_observed_loads where generation = 1`), /append-only/);
+  await assert.rejects(pg.query(`update core.sku_cost_observed set cost_jpy = cost_jpy + 1`), /UPDATE できない/);   // 行は UPDATE させない (Codex #1549 R3 M3)
   const before = [await rowsNow(), await loads(), await runs()];
   const st = await ingestSkuCostObserved(db, OB([R({ cost_jpy: 999 })], { generation: 2 }), { todayJst: TODAY });
   assert.deepEqual([st.status, st.remote_generation], ['stale', 3]);
@@ -385,6 +392,14 @@ await t('🚨 見出しの行の数と実際の行の数がずれた (Render で
   assert.match(r.lastLine, /^⚠️ Company DB 観測の原価: 入れ替えた .*Render の行の数 \d+ が見出しの \d+ と違う = 入れ替えて直した/);
   assert.equal((await push(wh)).status, 'unchanged');   // 直った後は変わりなし
   assert.throws(() => parseArgs(['--dry-run', '--force']), /--force は --send と一緒に/);
+  // Render より新しい pending (応答が失われた回) があっても、ずれていれば pending の世代を使い回さない (Codex #1549 R3 Low2)
+  addH(wh, 'SKU-A', '2026-09-12 00:00:00', 'UPDATE', 133);
+  const g2 = await remoteGen();
+  await assert.rejects(push(wh, { fetchImpl: spyFetch(async () => { throw new Error('ECONNRESET'); }) }), /ECONNRESET/);
+  assert.equal(JSON.parse(L.getMeta(META_PENDING)).generation, g2 + 1);
+  await pg.query(`delete from core.sku_cost_observed where sku_cost_observed_id = (select min(sku_cost_observed_id) from core.sku_cost_observed)`);
+  const r3 = await push(wh);
+  assert.deepEqual([r3.status, r3.generation, r3.reusedGeneration], ['applied', g2 + 2, false]);
 });
 await t('0046 の適用前 (0045 までの DB): status は 409 not_migrated → 送り手は ⚠️ (ok・POST しない・世代を採らない = マージから migrate までの朝を ❌ にしない・⏭️ だと migrate を忘れても全部 OK に見える = Codex #1549 R1 M1)', async () => {
   const old = new PGlite();
@@ -441,11 +456,14 @@ await t('daily-sync: 「m_products 履歴記録」の直後に --send で 1 工�
   assert.ok(iHist > 0 && iPush > iHist && iSales > iPush, `${iHist} ${iPush} ${iSales}`);
   assert.match(src, /results\.push\(\{ name: 'CompanyDB観測原価', \.\.\.cdbObservedResult, warn: cdbObservedResult\.success && isWarnSummary\(cdbObservedResult\.summary\) \}\);/);
   const retryable = JSON.parse(`[${/const RETRYABLE_JOBS = \[([^\]]*)\]/.exec(src)[1].replace(/'/g, '"')}]`);
-  assert.ok(retryable.includes('CompanyDB観測原価'));
+  assert.ok(retryable.includes('CompanyDB観測原価') && retryable.includes('m_products_history'));
+  // 🚨 履歴の記録が失敗した朝は送らない (retry で記録してから送る。Codex #1549 R3 M2)
+  assert.ok(src.includes("const cdbObservedResult = historyResult.success\n    ? runScript('apps/company-db/push/sku-cost-observed.mjs --send'") || src.includes("const cdbObservedResult = historyResult.success\r\n    ? runScript('apps/company-db/push/sku-cost-observed.mjs --send'"), '履歴の記録の成功を条件にしていない');
   const { JOB_DEFINITIONS, RETRY_ORDER, UPSTREAM_OF } = await import('../apps/warehouse/retry-failed-jobs.js');
   assert.deepEqual([JOB_DEFINITIONS['CompanyDB観測原価'].script, JOB_DEFINITIONS['CompanyDB観測原価'].args], ['apps/company-db/push/sku-cost-observed.mjs', ['--send']]);
-  assert.ok(RETRY_ORDER.includes('CompanyDB観測原価') && RETRY_ORDER.indexOf('CompanyDB観測原価') < RETRY_ORDER.indexOf('CompanyDB見張り'));
-  assert.equal(Object.hasOwn(UPSTREAM_OF, 'CompanyDB観測原価'), false);
+  assert.deepEqual([JOB_DEFINITIONS['m_products_history'].script, JOB_DEFINITIONS['m_products_history'].args], ['apps/warehouse/record-m-products-history.js', []]);   // --baseline は付けない
+  assert.ok(RETRY_ORDER.includes('CompanyDB観測原価') && RETRY_ORDER.indexOf('m_products_history') < RETRY_ORDER.indexOf('CompanyDB観測原価') && RETRY_ORDER.indexOf('CompanyDB観測原価') < RETRY_ORDER.indexOf('CompanyDB見張り'));
+  assert.equal(UPSTREAM_OF['CompanyDB観測原価'], 'm_products_history');
   const reg = fs.readFileSync(path.join(repoRoot, 'config/jobs-registry.mjs'), 'utf8');
   const entry = reg.slice(reg.indexOf("id: 'warehouse-daily-sync'"), reg.indexOf("where: 'miniPC TaskScheduler [WarehouseDailySync"));
   assert.ok(entry.includes('Company DB 観測の原価') && entry.includes('sku-cost-observed.mjs --send') && entry.includes('新しい定期実行は無い'), 'warehouse-daily-sync の説明に無い');

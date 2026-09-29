@@ -22,8 +22,14 @@ export function canonicalJsonStrict(v, where = '$') {
       if (!Number.isSafeInteger(v)) throw new Error(`${where}: 数は安全な整数だけ (${v})`);
       return String(v);
     case 'object': {
-      if (Array.isArray(v)) return `[${v.map((x, i) => canonicalJsonStrict(x, `${where}[${i}]`)).join(',')}]`;
+      if (Array.isArray(v)) {
+        // 🚨 疎な配列 (穴) は例外 (map は穴を飛ばす = Array(1) と [] が同じ指紋になる。Codex #1549 R3 Low1)
+        const parts = [];
+        for (let i = 0; i < v.length; i++) { if (!Object.hasOwn(v, i)) throw new Error(`${where}[${i}]: 配列に穴がある`); parts.push(canonicalJsonStrict(v[i], `${where}[${i}]`)); }
+        return `[${parts.join(',')}]`;
+      }
       if (Object.getPrototypeOf(v) !== Object.prototype && Object.getPrototypeOf(v) !== null) throw new Error(`${where}: 素の object でない (Date などは文字列にしてから)`);
+      if (Object.getOwnPropertySymbols(v).length) throw new Error(`${where}: symbol の鍵は使えない (黙って落とさない)`);
       const keys = Object.keys(v).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
       return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJsonStrict(v[k], `${where}.${k}`)}`).join(',')}}`;
     }

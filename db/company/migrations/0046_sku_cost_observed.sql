@@ -58,6 +58,13 @@ create table core.sku_cost_observed (
   unique (observed_load_id, sku_id, valid_from)
 );
 create index ix_sku_cost_observed_sku on core.sku_cost_observed (company_id, sku_id, valid_from);
+-- 行は UPDATE させない (入れ替えは受け口の DELETE + INSERT だけ = 行の数が同じまま中身だけ変わって「変わりなし」に見えるのを防ぐ。Codex #1549 R3 M3)
+create function core.sku_cost_observed_no_update() returns trigger language plpgsql as $$
+begin
+  raise exception 'core.sku_cost_observed は UPDATE できない (入れ替えは新しい世代の DELETE + INSERT)';
+end
+$$;
+create trigger trg_sku_cost_observed_no_update before update on core.sku_cost_observed for each statement execute function core.sku_cost_observed_no_update();
 comment on table core.sku_cost_observed is '観測の原価 (0046・D-57)。SQLite の m_products_history から作った SKU × 期間 [valid_from, valid_to] (両端を含む)。core.sku_costs とは別 = 読むときは mart.v_sku_cost_observed_effective (sku_costs の最初の日より前だけ)';
 
 -- 読む口: SKU ごとに core.sku_costs の最初の valid_from より前だけ (その日から先は sku_costs が正。状態によらず最初の行 = PARTIAL / MISSING の行でも sku_costs の側で「原価不明」)。

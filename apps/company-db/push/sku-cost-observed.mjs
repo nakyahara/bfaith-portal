@@ -159,7 +159,9 @@ export function planPayload(built, renderNorms) {
   const rows = built.periods.filter((p) => !ambiguous.has(p.product_code) && !unresolved.has(p.product_code)).map((p) => observedRowOf(p));
   const manifest = { checksum: observedChecksum(rows), row_count: rows.length, unresolved_code_count: unresolved.size, ambiguous_code_count: ambiguous.size };
   const sort = (s) => [...s].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  return { rows, manifest, ambiguousCodes: sort(ambiguous), unresolvedCodes: sort(unresolved), skus: new Set(rows.map((r) => r.product_code)).size };
+  // 🚨 正規化の後の鍵が ASCII でない商品コード = JS の normSku と DB の core.norm_code が同じ答えになると保証できない (README「同じ SKU か」を決めるのは DB。Codex #1549 R3 M1)
+  const nonAscii = sort(new Set(built.codes.filter((c) => /[^\x00-\x7F]/.test(normSku(c)))));
+  return { rows, manifest, ambiguousCodes: sort(ambiguous), unresolvedCodes: sort(unresolved), nonAsciiCodes: nonAscii, skus: new Set(rows.map((r) => r.product_code)).size };
 }
 
 /** 履歴を読む (1 文 = 1 つの読み取りの時点)。表が無ければ例外 */
@@ -239,6 +241,8 @@ export async function pushSkuCostObserved({ warehouse, dataDir = null, ledger = 
     Object.assign(out, { rows: plan.rows.length, skus: plan.skus, manifest: plan.manifest,
       built: { baselineAt: built.baselineAt, baselineDay: built.baselineDay, codes: built.codes.length, periods: built.periods.length, estimatedRows: built.estimatedRows, ignoredBeforeBaseline: built.ignoredBeforeBaseline,
         ambiguousExamples: plan.ambiguousCodes.slice(0, 5), unresolvedExamples: plan.unresolvedCodes.slice(0, 5) } });
+    // 🚨 鍵が ASCII でない商品コードが 1 つでもあれば、その回は送らない (⚠️・exit 0 = FBA の在庫の版と同じ扱い。本番の履歴は 9/30 に 7,322 種類とも ASCII)
+    if (plan.nonAsciiCodes.length) { out.status = 'blocked_non_ascii'; out.ok = true; out.nonAscii = plan.nonAsciiCodes; return out; }
     if (plan.rows.length > MAX_ROWS) throw new Error(`行が多すぎる (${plan.rows.length} > 受け口の上限 ${MAX_ROWS})`);
     const payloadBase = { source: SOURCE, ...plan.manifest, rows: plan.rows };
     const bytes = Buffer.byteLength(JSON.stringify({ ...payloadBase, generation: Number.MAX_SAFE_INTEGER }));
@@ -276,6 +280,7 @@ export async function pushSkuCostObserved({ warehouse, dataDir = null, ledger = 
     const tail = b ? ` / SKU ${out.skus} (推定の行 ${b.estimatedRows}) / 結びつかない商品コード ${out.manifest.unresolved_code_count} / 曖昧 ${out.manifest.ambiguous_code_count}${b.ignoredBeforeBaseline ? ` / 最初の写しより前の履歴 ${b.ignoredBeforeBaseline} 行は使わない` : ''}` : '';
     if (!out.lockedBy) {
       out.lastLine = err ? `❌ Company DB 観測の原価: ${String(err.message).replace(/\s+/g, ' ').slice(0, 300)}${out.generation ? ` (世代 ${out.generation})` : ''}`
+        : out.status === 'blocked_non_ascii' ? `⚠️ Company DB 観測の原価: 正規化の後に ASCII でない商品コードが ${out.nonAscii.length} 個 (${out.nonAscii.slice(0, 5).join(', ')}) = JS と DB で同じ SKU と言い切れないので送らない (扱いを決める)`
         : out.status === 'not_migrated' ? '⚠️ Company DB 観測の原価: Render に migration 0046 がまだ無い = 送らない (中原さんの指示で migrate した後に送る)'
         : out.status === 'dry-run' ? `dry-run: 送る予定 行 ${out.rows}${tail} / Render の今の世代 ${out.remote ? out.remote.generation : 'なし'} [dry-run = 送っていない]`
         : out.status === 'unchanged' ? `✅ Company DB 観測の原価: 変わりなし (Render の世代 ${out.generation} と同じ中身・送らない) 行 ${out.rows}${tail}`

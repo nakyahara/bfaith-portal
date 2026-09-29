@@ -187,7 +187,7 @@ export async function skuCostObservedStatus(db, { companyId = COMPANY_ID, source
   if (!SOURCES.includes(source)) throw bad('source が不正');
   const cur = (await db.query(`select ${LOAD_COLS} from core.sku_cost_observed_loads where company_id = $1::smallint and source = $2 order by generation desc limit 1`, [companyId, source])).rows[0];
   const c = (await db.query(`select count(*)::int as n, count(distinct sku_id)::int as skus from core.sku_cost_observed o
-     where o.company_id = $1::smallint and o.observed_load_id in (select observed_load_id from core.sku_cost_observed_loads where company_id = $1::smallint and source = $2)`, [companyId, source])).rows[0];
+     where o.company_id = $1::smallint and o.observed_load_id = $2::bigint`, [companyId, cur ? cur.observed_load_id : null])).rows[0];   // 今の見出しの行だけ数える (Codex #1549 R3 M3)
   return { source, load: loadOut(cur), rows: Number(c.n), skus: Number(c.skus) };
 }
 

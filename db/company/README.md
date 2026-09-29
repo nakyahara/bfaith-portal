@@ -1149,9 +1149,9 @@ select sku_code, sku_name, units_net, units_by_mall, sales_jpy, amazon_ad_cost, 
 - **受け口 (Render)**: `POST /apps/company-db/sync/sku-cost-observed` (`apps/company-db/ingest/sku-cost-observed.mjs`)。全部 = 1 要求 = 1 取引で、その会社 × 送り元の行を消して新しい見出しと行を入れる。
   🚨 古い世代 = `stale` (書かない) / 同じ世代で manifest が全部同じ = `same` / 違う = 409 / Render に無い SKU の商品コード = 409 `SKU_UNRESOLVED` (送り手の SKU の一覧が古い = 次の回で読み直す)。
   checksum = 共通の部品 `apps/company-db/canonical-hash.mjs` (正規の JSON の SHA-256・鍵の順は固定・数は整数だけ) を受け口が届いた行から計算し直す (版 `sco-v1`)。`GET …/sku-cost-observed/status` / `GET …/sku-cost-observed/sku-codes`
-- **毎朝**: daily-sync の「m_products 履歴記録」の直後に `--send` (新しい定期実行は無い。台帳 jobs-registry の warehouse-daily-sync に記載)。送信の失敗・409・別の送り手の見送り = ❌ (exit 1) = retry (`CompanyDB観測原価 --send`)。
+- **毎朝**: daily-sync の「m_products 履歴記録」の直後に `--send` (新しい定期実行は無い。台帳 jobs-registry の warehouse-daily-sync に記載)。送信の失敗・409・別の送り手の見送り = ❌ (exit 1) = retry (`CompanyDB観測原価 --send`)。**「m_products 履歴記録」が失敗した朝は送らない** (その日の原価の変化を取り逃さないよう、retry で履歴の記録 (`m_products_history`) → 観測の原価の順に走らせる = 上流)。正規化の後に ASCII でない商品コードが 1 つでもあれば送らない (⚠️・JS と DB で同じ SKU と言い切れない = そのときに扱いを決める)。行は UPDATE できない (trigger)。
   Render に 0046 がまだ無い (status が 409 `not_migrated`) = ⚠️ (exit 0・送らない・世代も採らない) = マージから migrate までの朝を ❌ にしない・⏭️ ではなく ⚠️ = migrate を忘れても毎朝見える。
-  🛑 安全弁: 前の世代があり、新しい中身が 0 行 / 行が前の 80% 未満 / 結びつかない + 曖昧の数が前より max(20, 前の数) を超えて増える = 送らずに ❌ (既存の行を消さない)。履歴と SKU の一覧を確かめ、わざと減らすときだけ手で `--send --force`。**migrate の後も ⏭️ が続いたら** Render のデプロイと migrate を確かめる
+  🛑 安全弁: 前の世代があり、新しい中身が 0 行 / 行が前の 80% 未満 / 結びつかない + 曖昧の数が前より max(20, 前の数) を超えて増える = 送らずに ❌ (既存の行を消さない)。履歴と SKU の一覧を確かめ、わざと減らすときだけ手で `--send --force`。**migrate の後も ⚠️ が続いたら** Render のデプロイと migrate を確かめる
 
 ```
 # 初回 (miniPC の PowerShell。🚨 migrate は中原さんの指示の後に dry-run → 本適用)
