@@ -34,7 +34,16 @@ const fromMonth = new Date(Date.UTC(nowJst.getUTCFullYear(), nowJst.getUTCMonth(
 const fromDate = fromMonth.toISOString().slice(0, 10);
 
 const db = new Database(dbPath);
-db.pragma('busy_timeout = 5000');
+// 待ち時間は db.js と同じ決め (daily-sync は WAREHOUSE_DB_BUSY_TIMEOUT_MS=60000 を渡す・無ければ / 不正なら 5 秒。Codex #1526 R1)
+const busyEnv = Number(process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS);
+db.pragma(`busy_timeout = ${process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS && Number.isInteger(busyEnv) && busyEnv >= 0 ? busyEnv : 5000}`);
+// 🚨 2026-09-29: SKU なしの行だけの索引 (決済の行 約 440 万行のうち SKU なしはごく一部)。
+//   索引が無いと下の 3 つの問い合わせが毎回ほぼ全行 (14 か月) をなめ、朝の daily-sync の制限時間 300 秒を超えて止まった
+//   (9/29 朝 ETIMEDOUT = Render への送信も飛んだ。9/28 夜の手動の作り直しでも 297 秒)。
+//   問い合わせは INDEXED BY でこの索引を使う (使えない形に変わったら黙って遅くならずにエラーで止まる)。
+//   初回だけ索引を作る時間がかかる (IF NOT EXISTS)
+db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_nosku_econ ON raw_amazon_settlement_lines(economic_date)
+  WHERE seller_sku_normalized IS NULL OR seller_sku_normalized = ''`);
 
 db.exec(`CREATE TABLE IF NOT EXISTS f_amazon_account_fees_monthly_v1 (
   month_start_jst TEXT NOT NULL CHECK(month_start_jst GLOB '????-??-01'),
@@ -98,7 +107,7 @@ const result = db.transaction(() => {
       SELECT source_settlement_id, business_line_key, source_document_id, source_layer, ingested_at,
         economic_date, transaction_type, other_amount_micro, item_related_fee_amount_micro,
         DENSE_RANK() OVER (PARTITION BY source_settlement_id, business_line_key, source_document_id ORDER BY source_line_no) AS occ
-      FROM raw_amazon_settlement_lines
+      FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_nosku_econ
       WHERE economic_date >= ?
         -- SKU 無し行のみ対象。SKU 付きフィー行 (Inbound Defect 等の一部) は
         -- SKU daily fact 側に流れるため、ここに入れると二重計上になる
@@ -137,14 +146,14 @@ const result = db.transaction(() => {
 // ⚠️ ① 前方一致で手数料に入れたが確かめていない名前 (金額は入っている。人が確かめて CONFIRMED_NAMES に足す)
 const unconfirmedTx = db.prepare(`
   SELECT transaction_type t, ${FEE_CASE_SQL} f, COUNT(*) n, SUM(COALESCE(other_amount_micro, 0) + COALESCE(item_related_fee_amount_micro, 0)) / 1000000.0 a, GROUP_CONCAT(DISTINCT substr(economic_date, 1, 7)) ms
-    FROM raw_amazon_settlement_lines
+    FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_nosku_econ
    WHERE economic_date >= ? AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '') AND (${FEE_FILTER_SQL}) AND NOT ${CONFIRMED_SQL}
    GROUP BY 1 ORDER BY 1`).all(fromDate);
 // ⚠️ ② 分けられない SKU なしの取引 (手数料の分け方にも、入れない一覧にも無い名前) = 名前が変わった手数料の疑い (金額は入らない)
 const unknownTx = db.prepare(`
   SELECT transaction_type t, COUNT(*) n, SUM(COALESCE(other_amount_micro, 0) + COALESCE(item_related_fee_amount_micro, 0) + COALESCE(price_amount_micro, 0)) / 1000000.0 a,
          GROUP_CONCAT(DISTINCT substr(economic_date, 1, 7)) ms
-    FROM raw_amazon_settlement_lines
+    FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_nosku_econ
    WHERE economic_date >= ? AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '')
      AND NOT (${FEE_FILTER_SQL}) AND transaction_type NOT IN (${NOT_ACCOUNT_FEE.map(q).join(', ')})
    GROUP BY 1 ORDER BY 1`).all(fromDate);
