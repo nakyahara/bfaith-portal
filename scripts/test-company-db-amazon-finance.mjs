@@ -538,6 +538,24 @@ await t("'-' で始まる不正な本物の注文番号は疑似注文と取り�
   const r3 = await pushClose(L0, { mode: 'range', from: d(MB, 27), to: d(MB, 27) });
   assert.equal(r3.transformErrors.length, 0); assert.deepEqual(retryStore(L0).list(), []);
 });
+await t('Render から読む (GET) は 502 / 503 / 504 / 429・通信の失敗を読み直し、4xx はすぐ止める (Render の入れ替わりをまたぐ)', async () => {
+  const { getJson } = await import('../apps/company-db/push/amazon-finance.mjs');
+  const seq = (list) => { let i = 0; const calls = []; const f = async (url) => { calls.push(url); const x = list[Math.min(i++, list.length - 1)]; if (x instanceof Error) throw x; return new Response(typeof x === 'number' ? '<html>502</html>' : JSON.stringify(x), { status: typeof x === 'number' ? x : 200 }); }; f.calls = calls; return f; };
+  let slept = [];
+  const sleep = async (ms) => { slept.push(ms); };
+  const f1 = seq([502, 503, { ok: 1 }]);
+  assert.deepEqual(await getJson(f1, 'u', 'k', 'x', { sleep }), { ok: 1 });
+  assert.equal(f1.calls.length, 3); assert.deepEqual(slept, [5000, 10000]);
+  slept = [];
+  const f2 = seq([new TypeError('fetch failed'), { ok: 2 }]);
+  assert.deepEqual(await getJson(f2, 'u', 'k', 'x', { sleep }), { ok: 2 });
+  const f3 = seq([400]);
+  await assert.rejects(getJson(f3, 'u', 'k', 'Render の鍵', { sleep }), /Render の鍵が取れない: HTTP 400/);
+  assert.equal(f3.calls.length, 1);
+  const f4 = seq([502]);
+  await assert.rejects(getJson(f4, 'u', 'k', 'x', { sleep, retries: 3 }), /HTTP 502/);
+  assert.equal(f4.calls.length, 3);
+});
 await t('parseArgs: 操作は 1 つ・--from/--to は組・--all は --reconcile と', async () => {
   assert.throws(() => parseArgs([]), /どれか 1 つ/);
   assert.throws(() => parseArgs(['--incremental', '--full']), /どれか 1 つ/);

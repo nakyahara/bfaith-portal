@@ -253,10 +253,29 @@ export function capacityGuard({ limitBytes, rowBytes, replaceFactor, walAllowanc
 }
 const mb = (b) => `${Math.round(b / 1048576).toLocaleString()} MB`;
 
-async function getJson(fetchImpl, url, syncKey, what) {
-  const res = await fetchImpl(url, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`${what}が取れない: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
-  return res.json();
+/**
+ * Render から読む (GET)。502 / 503 / 504 / 429・通信の失敗は間を空けて読み直す (Render の入れ替わりの 1〜3 分をまたぐ。2026-09-30 の完了印で 502 に一度で負けた)。
+ * 4xx (429 以外) はすぐ止める (直しても読み直しでは通らない)。本文は 200 文字まで (502 の HTML を長く出さない)
+ */
+export const GET_RETRIES = 5;
+export const getBackoffMs = (attempt) => 5000 * 2 ** (attempt - 1);   // 5・10・20・40 秒 = 合計 75 秒
+const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export async function getJson(fetchImpl, url, syncKey, what, { retries = GET_RETRIES, sleep = defaultSleep, log = () => {} } = {}) {
+  let last = null;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetchImpl(url, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+      if (res.ok) return await res.json();
+      const text = (await res.text()).replace(/\s+/g, ' ').slice(0, 200);
+      last = new Error(`${what}が取れない: HTTP ${res.status} ${text}`);
+      if (!(res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504)) throw Object.assign(last, { fatal: true });
+    } catch (e) {
+      if (e.fatal) throw e;
+      last = e && e.message && e.message.includes('が取れない') ? e : new Error(`${what}が取れない: ${e && e.message}`);
+    }
+    if (attempt < retries) { log(`  ${what}: ${String(last.message).slice(0, 120)} → ${getBackoffMs(attempt) / 1000} 秒後に読み直す (${attempt}/${retries})`); await sleep(getBackoffMs(attempt)); }
+  }
+  throw last;
 }
 /** Render の鍵を全部 (注文番号 → 行数) */
 export async function fetchRenderKeys(fetchImpl, { base, syncKey, mustOwn = () => {} }) {
