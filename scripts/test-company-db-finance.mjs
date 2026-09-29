@@ -13,6 +13,7 @@
  * 実行: node scripts/test-company-db-finance.mjs
  */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
@@ -146,6 +147,24 @@ await t('返品・カードの支払い取り消し・ポイント・値引き�
   assert.equal(Number(b5.closing_fee_jpy), 0); assert.equal(b5.units_marketplace_guarantee, 0);   // build の固定値
   // SQLite の試験の B の合計と同じ: 原価を除いた利益 = 790 − 532 − 912 = −654 (SQLite は原価 400 を引いて −1,054)
   assert.equal(await num(`select sum(profit_before_cogs_jpy) as n from mart.v_finance_daily where seller_sku = 'sku-q' and economic_date_jst in ('2026-09-05','2026-09-10','2026-09-12')`), -654);
+});
+await t('0044 mart.finance_daily_range = mart.v_finance_daily (同じ期間で全列一致・期間の途中の日だけでも単価は月の全部の行・月をまたぐ・別の scope は入らない)', async () => {
+  await apply('O-AUG', 1, [row('2026-08-31', 'sku-q', { units_ordered: 1, sales_principal_jpy: 3000, source_lines: 2 })]);   // 8 月は別の単価 (月をまたぐ期間の確かめ)
+  const cmp = async (from, to) => {
+    const v = (await pg.query(`select * from mart.v_finance_daily where company_id = 1 and mall = 'amazon' and scope_key = 'jp' and economic_date_jst between $1::date and $2::date order by economic_date_jst, seller_sku`, [from, to])).rows;
+    const f = (await pg.query(`select * from mart.finance_daily_range(1::smallint, 'amazon', 'jp', $1::date, $2::date) order by economic_date_jst, seller_sku`, [from, to])).rows;
+    assert.deepEqual(f, v, `${from}〜${to}`);
+    return f;
+  };
+  assert.ok((await cmp('2026-09-01', '2026-09-30')).length >= 5);
+  const only10 = await cmp('2026-09-10', '2026-09-10');   // 返品の日だけ = 単価は 9 月の全部の行 (5 日の売上) から → 1 個
+  assert.equal(only10.find((r) => r.seller_sku === 'sku-q').units_refunded_customer, 1);
+  const cross = await cmp('2026-08-15', '2026-10-15');
+  assert.ok(cross.some((r) => r.economic_date_jst.toISOString ? r.economic_date_jst.toISOString().startsWith('2026-08-31') : String(r.economic_date_jst).startsWith('2026-08-31')));
+  assert.equal(await num(`select count(*) as n from mart.finance_daily_range(1::smallint, 'amazon', 'us', '2026-09-01', '2026-09-30')`), 0);
+  const src = fs.readFileSync(new URL('../apps/company-db/router.mjs', import.meta.url), 'utf8');
+  assert.match(src, /from mart\.finance_daily_range\(1::smallint, \$1, \$2, \$3::date, \$4::date\)/);   // 受け口の /daily は関数を使う
+  await apply('O-AUG', 2, []);
 });
 await t('単価の丸め = ROUND (0.5 は 0 から遠い方)・Order の数量 0 の月は返品数 0', async () => {
   // 3 個で 2 円 → 単価 666,666.67 micro → ROUND = 666,667 (trunc なら 666,666)。本体の返金 1 円 → 1,000,000 ÷ 666,667 = 1.4999… → 1 個 (trunc の単価だと 1.5000… → 2 個)
