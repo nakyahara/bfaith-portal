@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { acquireRetryLock, releaseRetryLock, otherRunAlive, remainingRetrySlots, RETRY_LOCK_TTL_MS } from '../apps/warehouse/retry-lock.js';
+import { acquireRetryLock, releaseRetryLock, otherRunAlive, remainingRetrySlots, isAliveNodeSince } from '../apps/warehouse/retry-lock.js';
 
 let ok = 0, ng = 0;
 const t = (name, fn) => { try { fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
@@ -61,15 +61,30 @@ t('自分の lock を書いた後に daily-sync が動き始めていたら、�
   assert.equal(a.ok, false); assert.equal(a.dailySync, true); assert.match(a.reason, /動き始めた/);
   assert.equal(fs.existsSync(lockFile), false);   // 自分の lock は外した
 });
-t('期限: 持ち主の pid が生きていても started_at が期限より古い lock は残骸 (pid の使い回しで永久に見送らない・#1538 Codex R1 Medium)', () => {
-  clean(); alive.add(111);
-  fs.writeFileSync(lockFile, JSON.stringify({ token: 'x', pid: 111, started_at: at(RETRY_LOCK_TTL_MS + 60000) }));
-  const a = acquireRetryLock({ lockFile, isAlive, pid: 222, now: NOW });
-  assert.equal(a.ok, true); assert.match(a.recovered, /pid 111/);
-  releaseRetryLock(a);
-  fs.writeFileSync(dsLock, JSON.stringify({ run_id: 'r', pid: 111, started_at: at(13 * 3600 * 1000) }));   // daily-sync の lock も 12 時間より古ければ動いていない扱い
-  assert.equal(otherRunAlive(dsLock, { isAlive, now: NOW, ttlMs: 12 * 3600 * 1000 }), null);
-  assert.equal(acquireRetryLock({ lockFile, dailySyncLockFile: dsLock, isAlive, pid: 222, now: NOW }).ok, true);
+t('pid の使い回し: 生きている node でも lock より後に始まったプロセスは持ち主ではない・長く動いている本物の持ち主からは奪わない・未来の日付の lock は残骸 (#1538 Codex R1 Medium / R2 Medium・Low)', () => {
+  const start = (iso) => () => new Date(iso);
+  const yes = () => true;
+  // lock = 08:30・プロセスの開始 = 08:29 (本物) → 何時間たっても生きている
+  assert.equal(isAliveNodeSince(111, '2026-09-29T23:30:00Z', { aliveNode: yes, startTimeOf: start('2026-09-29T23:29:00Z') }), true);
+  // lock = 08:30・プロセスの開始 = 翌日 (使い回し) → 動いていない
+  assert.equal(isAliveNodeSince(111, '2026-09-29T23:30:00Z', { aliveNode: yes, startTimeOf: start('2026-09-30T20:00:00Z') }), false);
+  // 開始時刻が取れない = 生きている側 (並走しない)
+  assert.equal(isAliveNodeSince(111, '2026-09-29T23:30:00Z', { aliveNode: yes, startTimeOf: () => null }), true);
+  assert.equal(isAliveNodeSince(111, 'x', { aliveNode: yes, startTimeOf: () => null }), false);
+  // 長く動いている本物の回 (7 時間前の lock・開始時刻はその前) からは奪わない
+  clean();
+  fs.writeFileSync(lockFile, JSON.stringify({ token: 'x', pid: 111, started_at: at(7 * 3600 * 1000) }));
+  const real = (pid, startedAt) => isAliveNodeSince(pid, startedAt, { aliveNode: yes, startTimeOf: () => new Date(Date.parse(startedAt) - 1000) });
+  const b = acquireRetryLock({ lockFile, isAlive: real, pid: 222, now: NOW });
+  assert.equal(b.ok, false); assert.match(b.reason, /前の再試行の回がまだ動いている/);
+  // 未来の日付の lock は残骸 (pid が生きていても)
+  clean();
+  fs.writeFileSync(lockFile, JSON.stringify({ token: 'x', pid: 111, started_at: '2099-01-01T00:00:00Z' }));
+  const c = acquireRetryLock({ lockFile, isAlive: yes, pid: 222, now: NOW });
+  assert.equal(c.ok, true); assert.match(c.recovered, /pid 111/);
+  releaseRetryLock(c);
+  fs.writeFileSync(dsLock, JSON.stringify({ run_id: 'r', pid: 111, started_at: '2099-01-01T00:00:00Z' }));
+  assert.equal(otherRunAlive(dsLock, { isAlive: yes, now: NOW }), null);
 });
 t('外すのは自分の token だけ (回収された古い回が後から外しても、新しい回の lock は消えない)', () => {
   clean();
@@ -93,7 +108,8 @@ t('残っている再試行の時刻 (JST): 7:00 = 3 つ・9:00 = 2 つ・11:31 
 t('daily-sync.js: 自分の lock を書いた後に再試行の lock を見て、動いていれば自分の lock を外して止まる・通知は残っている時刻だけ', () => {
   const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
   const ds = fs.readFileSync(path.join(root, 'apps/warehouse/daily-sync.js'), 'utf8');
-  assert.match(ds, /myLockRunId = runId;\s*\/\/[^\n]*\n\s*const retryRun = otherRunAlive\(RETRY_LOCK_FILE, \{ isAlive: isAliveNodeProcess, ttlMs: RETRY_LOCK_TTL_MS \}\);\s*if \(retryRun\) \{\s*releaseLock\(\);/);
+  assert.match(ds, /myLockRunId = runId;\s*\/\/[^\n]*\n\s*const retryRun = otherRunAlive\(RETRY_LOCK_FILE\);[^\n]*\n\s*if \(retryRun\) \{\s*releaseLock\(\);/);
+  assert.match(ds, /if \(prev && prev\.pid && isAliveNodeSince\(prev\.pid, prev\.started_at\)\) \{/);   // daily-sync 自身の多重起動の確かめも同じ判定
   assert.match(ds, /RETRY_LOCK_FILE = path\.join\(PROJECT_DIR, 'data', 'retry-failed-jobs\.lock\.json'\)/);
   assert.match(ds, /const slots = remainingRetrySlots\(new Date\(\)\);/);
   const rj = fs.readFileSync(path.join(root, 'apps/warehouse/retry-failed-jobs.js'), 'utf8');

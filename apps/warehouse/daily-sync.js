@@ -13,7 +13,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
 import { isWarnSummary } from './amazon-fees-outcome.js';
-import { otherRunAlive, RETRY_LOCK_TTL_MS, remainingRetrySlots } from './retry-lock.js';
+import { otherRunAlive, isAliveNodeSince, remainingRetrySlots } from './retry-lock.js';
 import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS, amazonFinanceDailyArgs } from './amazon-finance-months.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -359,7 +359,8 @@ async function main() {
       try { prev = prevRaw !== null ? JSON.parse(prevRaw) : null; } catch { /* 破損 = prev null のまま残骸扱い */ }
       // 先行 run が「生きている node プロセス」なら常に中止 (ハング中でも並走は SQLite 直列書き込み前提を壊すので不可)。
       // pid 再利用の誤検知はプロセス名照合で排除。それでも残る場合は通知の手動対応案内で回収する
-      if (prev && prev.pid && isAliveNodeProcess(prev.pid)) {
+      // 🆕 2026-09-29 (#1538): そのプロセスが lock の started_at より前から動いているかも見る = pid が別の node に使い回されても毎朝止まらない
+      if (prev && prev.pid && isAliveNodeSince(prev.pid, prev.started_at)) {
         const msg = `⚠️ *Warehouse日次同期 多重起動を中止* (先行 run: pid=${prev.pid}, started_at=${prev.started_at})\n先行 run がハングしている場合はプロセス終了後に手動削除を: ${LOCK_FILE}`;
         console.error(`[DailySync] ${msg}`);
         await notify(msg);
@@ -392,7 +393,7 @@ async function main() {
     fs.writeFileSync(LOCK_FILE, JSON.stringify({ run_id: runId, pid: process.pid, started_at: startTime.toISOString(), business_date: businessDate }), { flag: 'wx' });
     myLockRunId = runId;
     // 自動再試行の回が動いている間は走らない (retry-lock.js と対で、どちらも「自分の lock を書いた後に相手を見る」= 同時に起動しても片方は必ず気づく。#1538 Codex R1 High)
-    const retryRun = otherRunAlive(RETRY_LOCK_FILE, { isAlive: isAliveNodeProcess, ttlMs: RETRY_LOCK_TTL_MS });
+    const retryRun = otherRunAlive(RETRY_LOCK_FILE);   // 持ち主 = pid が生きている node で、lock より前から動いているプロセス (retry-lock.js の isAliveNodeSince)
     if (retryRun) {
       releaseLock();
       const msg = `⚠️ *Warehouse日次同期 起動を中止* 自動再試行の回が動いている (pid=${retryRun.pid}, started_at=${retryRun.started_at})。終わってから手で流す`;

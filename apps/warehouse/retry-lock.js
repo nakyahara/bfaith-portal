@@ -9,17 +9,19 @@
  * 決め:
  *   - data/retry-failed-jobs.lock.json を排他的に作る (flag 'wx')。持ち主 = { token, pid, started_at }
  *   - 既にあって持ち主が生きている = 前の回がまだ動いている → 見送る (retry-state には触らない = 動いている回が結果を書く・次の回が拾う)
- *     「生きている」= その pid が生きている node で、started_at が期限 (RETRY_LOCK_TTL_MS) の中 (pid が別の node に使い回されても、永久に動いているとは見ない)
+ *     「生きている」= その pid が生きている node で、**そのプロセスが lock の started_at より前から動いている** (後から始まったプロセス = pid の使い回し = 残骸)。
+ *       期限では奪わない (長い工程 = DB バックアップ最大 6 時間 を実行中の生きた回から奪わない。#1538 Codex R2 Medium)。started_at が未来・読めない lock も残骸
  *   - 持ち主が死んでいる・期限切れ・壊れた lock = 残骸 → 自分が読んだ中身とバイト一致するものだけを回収してから取り直す (daily-sync の lock と同じ手順 = 名前を変えて奪う)
  *   - 朝の daily-sync と互いに避ける: **どちらも「自分の lock を書いた後に相手の lock を見る」** (daily-sync.js も retry の lock を見る) = 同時に起動しても、少なくとも片方は相手に気づいて退く
  *   - 外すのは自分の token の lock だけ (中身を先に読んで自分のものでなければ触らない)
+ *   - 残る狭い競合: 3 つの回が同時に同じ残骸を回収し合うと、読んでから名前を変えるまでの間に別の回の新しい lock を外しうる (定刻の起動は 90 分おき = 起きない。手で何度も同時に起動しない)
  */
 import fs from 'fs';
 import crypto from 'crypto';
 import { execFileSync } from 'child_process';
 
-export const RETRY_LOCK_TTL_MS = 6 * 3600 * 1000;        // 再試行の 1 回の上限 (08:30 → 11:30 の 3 回 + 余裕)。これより古い lock は残骸
-export const DAILY_SYNC_LOCK_TTL_MS = 12 * 3600 * 1000;  // daily-sync の 1 回の上限の見なし (07:00 → 翌朝の 07:00 までに必ず切れる)
+export const START_SKEW_MS = 120000;           // プロセスの開始時刻と lock の started_at の許す差 (lock はプロセスが始まった後に書く = 開始時刻 ≦ started_at + この差)
+export const FUTURE_SKEW_MS = 10 * 60 * 1000;  // started_at がこれより未来 = 壊れた lock
 export const RETRY_SLOTS_JST = ['08:30', '10:00', '11:30'];   // Task Scheduler の WarehouseDailySyncRetry1〜3 (台帳 warehouse-daily-sync)
 /** いま (JST) から後に残っている再試行の時刻 (daily-sync が 11:30 より後に retry-state を書いた日は空 = その日は自動で再試行されない) */
 export function remainingRetrySlots(now = new Date()) {
@@ -43,20 +45,44 @@ export function isAliveNodeProcess(pid) {
   }
 }
 
+/** そのプロセスの開始時刻 (Windows = PowerShell の Get-Process)。取れなければ null */
+export function processStartTime(pid) {
+  if (process.platform !== 'win32') return null;
+  try {
+    const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')`], { encoding: 'utf-8', timeout: 15000, windowsHide: true });
+    const t = Date.parse(out.trim());
+    return Number.isFinite(t) ? new Date(t) : null;
+  } catch {
+    return null;
+  }
+}
+/**
+ * lock の持ち主 (pid・started_at) がいま動いているか = pid が生きている node で、そのプロセスが started_at より前 (+ 許す差) から動いている。
+ *   開始時刻が取れなければ生きている側に倒す (並走しない)
+ */
+export function isAliveNodeSince(pid, startedAt, { startTimeOf = processStartTime, aliveNode = isAliveNodeProcess } = {}) {
+  if (!aliveNode(pid)) return false;
+  const lockAt = Date.parse(startedAt);
+  if (!Number.isFinite(lockAt)) return false;
+  const start = startTimeOf(pid);
+  if (!start) return true;
+  return start.getTime() <= lockAt + START_SKEW_MS;
+}
+
 const readRaw = (f) => { try { return fs.readFileSync(f, 'utf-8'); } catch { return null; } };
 const parse = (raw) => { try { return raw == null ? null : JSON.parse(raw); } catch { return null; } };
 
-/** lock の中身の持ち主がいま動いているか (pid が生きている node・started_at が期限の中) */
-function holderAlive(j, { isAlive, now, ttlMs }) {
+/** lock の中身の持ち主がいま動いているか。isAlive(pid, started_at)。started_at が読めない・未来 = 壊れた lock = 動いていない */
+function holderAlive(j, { isAlive, now }) {
   if (!j || !Number.isInteger(j.pid)) return false;
   const t = Date.parse(j.started_at);
-  if (!Number.isFinite(t) || now.getTime() - t > ttlMs) return false;
-  return !!isAlive(j.pid);
+  if (!Number.isFinite(t) || t > now.getTime() + FUTURE_SKEW_MS) return false;
+  return !!isAlive(j.pid, j.started_at);
 }
 /** 別の回 (daily-sync / 再試行) の lock の持ち主がいま動いていれば { pid, started_at }・いなければ null */
-export function otherRunAlive(lockFile, { isAlive = isAliveNodeProcess, now = new Date(), ttlMs }) {
+export function otherRunAlive(lockFile, { isAlive = isAliveNodeSince, now = new Date() } = {}) {
   const j = parse(readRaw(lockFile));
-  return holderAlive(j, { isAlive, now, ttlMs }) ? { pid: j.pid, started_at: j.started_at } : null;
+  return holderAlive(j, { isAlive, now }) ? { pid: j.pid, started_at: j.started_at } : null;
 }
 
 /** 名前を変えて奪い、中身が matchFn に合えば消す・合わなければ戻す (daily-sync.js の claimAndDeleteLock と同じ手順) */
@@ -75,9 +101,8 @@ function claimAndDelete(lockFile, matchFn) {
  * 取る。戻り値 = { ok: true, token, lockFile, recovered } / { ok: false, reason, error?, dailySync? }
  *   error = lock を書けない (data の異常) = 呼び手は通知して止まる / dailySync = 朝の daily-sync が動いているので見送った
  */
-export function acquireRetryLock({ lockFile, dailySyncLockFile = null, isAlive = isAliveNodeProcess, now = new Date(), pid = process.pid,
-  ttlMs = RETRY_LOCK_TTL_MS, dailySyncTtlMs = DAILY_SYNC_LOCK_TTL_MS }) {
-  const dsBusy = () => (dailySyncLockFile ? otherRunAlive(dailySyncLockFile, { isAlive, now, ttlMs: dailySyncTtlMs }) : null);
+export function acquireRetryLock({ lockFile, dailySyncLockFile = null, isAlive = isAliveNodeSince, now = new Date(), pid = process.pid }) {
+  const dsBusy = () => (dailySyncLockFile ? otherRunAlive(dailySyncLockFile, { isAlive, now }) : null);
   const ds0 = dsBusy();
   if (ds0) return { ok: false, dailySync: true, reason: `朝の daily-sync がまだ動いている (pid ${ds0.pid}・開始 ${ds0.started_at})` };
   let recovered = null;
@@ -98,8 +123,8 @@ export function acquireRetryLock({ lockFile, dailySyncLockFile = null, isAlive =
     const raw = readRaw(lockFile);
     if (raw === null) continue;   // 消えた直後 = もう一度 wx で決着
     const prev = parse(raw);
-    if (holderAlive(prev, { isAlive, now, ttlMs })) return { ok: false, reason: `前の再試行の回がまだ動いている (pid ${prev.pid}・開始 ${prev.started_at})` };
-    const r = claimAndDelete(lockFile, (x) => x === raw);   // 残骸 (持ち主が死んでいる・期限切れ・壊れている) = 読んだ中身と一致するものだけ回収
+    if (holderAlive(prev, { isAlive, now })) return { ok: false, reason: `前の再試行の回がまだ動いている (pid ${prev.pid}・開始 ${prev.started_at})` };
+    const r = claimAndDelete(lockFile, (x) => x === raw);   // 残骸 (持ち主が死んでいる・pid の使い回し・壊れている) = 読んだ中身と一致するものだけ回収
     if (r === 'restored' || r === 'conflict') return { ok: false, reason: 'lock の回収で別の再試行の回と競合した (その回が動く)' };
     recovered = prev ? `pid ${prev.pid}・開始 ${prev.started_at}` : '(壊れた lock)';
   }
