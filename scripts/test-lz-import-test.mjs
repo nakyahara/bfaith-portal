@@ -75,13 +75,14 @@ function fakeLz({ over = {} } = {}) {
   };
   const ops = {
     exportShohin,
-    exportBarcodes: async () => { st.calls.push('exportBarcodes'); if (over.barcodeCorruptAlways) throw SE.invalidCsvError('3 行目の列数が違います (ヘッダ 3 / この行 2)'); return { buf: csvBuf(['商品ID', '商品名', 'バーコード'], st.bc) }; },
+    exportBarcodes: async () => { st.calls.push('exportBarcodes'); if (over.postBarcodeDelayMs && st.calls.includes('execute')) await new Promise((r) => setTimeout(r, over.postBarcodeDelayMs)); if (over.barcodeCorruptAlways) throw SE.invalidCsvError('3 行目の列数が違います (ヘッダ 3 / この行 2)'); return { buf: csvBuf(['商品ID', '商品名', 'バーコード'], st.bc) }; },
     previewImport: async (p) => { st.calls.push('preview'); if (over.previewThrows) throw new Error('プレビューに失敗'); st.previewed = p; if (over.previewDelayMs) await new Promise((r) => setTimeout(r, over.previewDelayMs)); return { previewed: true }; },
     executeImport: async ({ guard, onExecuteIssued }) => {
       if (over.throwBeforeIssue) { const e = new Error('押す前に失敗'); e.executeIssued = false; throw e; }
       guard.check('実行ボタン');
       onExecuteIssued();
       st.calls.push('execute');
+      if (over.afterExecuteDelayMs) await new Promise((r) => setTimeout(r, over.afterExecuteDelayMs));   // 押した後に時間が経つ (締め切りの試験)
       if (over.throwAfterIssue) { const e = new Error('押した後に失敗'); e.executeIssued = true; throw e; }
       const csv = iconv.decode(fs.readFileSync(st.previewed), 'cp932').split('\r\n').slice(1).map((l) => l.split(',').map((x) => x.replace(/^"|"$/g, '')));
       let processed = 0;
@@ -302,8 +303,10 @@ await ta('[11] ポータルの書き込みの分け方 (K5): 決まった 4xx �
 
 await ta('[12] 00:00〜01:30 は動かない・GChat は https だけ・引数', async () => {
   assert.deepEqual(['2030-01-15T14:59:00Z', '2030-01-15T15:00:00Z', '2030-01-15T16:29:00Z', '2030-01-15T16:30:00Z'].map((t) => T.inNightBlock(new Date(t))), [false, true, true, false]);
-  assert.equal(await T.sendGChat('x', { env: { GCHAT_WEBHOOK: 'http://example.test/hook' }, fetchImpl: async () => ({ ok: true }) }), false);
-  assert.equal(await T.sendGChat('x', { env: { GCHAT_WEBHOOK: 'https://example.test/hook' }, fetchImpl: async () => ({ ok: true }) }), true);
+  // 送り先 = 要対応スペース GCHAT_WEBHOOK_JOBS (Render の即時の知らせ・毎晩の本番と同じ。③c-1b-2b-2 契約 v3 H)。https だけ・前の GCHAT_WEBHOOK は使わない
+  assert.equal(await T.sendGChat('x', { env: { GCHAT_WEBHOOK_JOBS: 'http://example.test/hook' }, fetchImpl: async () => ({ ok: true }) }), false);
+  assert.equal(await T.sendGChat('x', { env: { GCHAT_WEBHOOK_JOBS: 'https://example.test/hook' }, fetchImpl: async () => ({ ok: true }) }), true);
+  assert.equal(await T.sendGChat('x', { env: { GCHAT_WEBHOOK: 'https://example.test/hook' }, fetchImpl: async () => ({ ok: true }) }), false, '前の送り先は使わない');
   assert.deepEqual(T.parseArgs(['plan', '--normal', 'A-1,B-2', '--missing', 'N-1:A-1', '--case', 'Abc-1:abc-1', '--occupancy', 'x']).tests,
     { normal: ['A-1', 'B-2'], missing: [{ id: 'N-1', copy_from: 'A-1' }], deleted: [], case: [{ id: 'Abc-1', from: 'abc-1' }] });
   assert.throws(() => T.parseArgs(['run', '--plan', 'p', '--sha256', 'short']), /64 桁/);
@@ -598,7 +601,10 @@ await ta('[27] 共通の仕組み (3b-1): POLICIES の外の決まり (試験の
   assert.deepEqual([touched, lz.st.calls.slice(callsAfterPlan), S.getStatus(pt.db).state, fs.existsSync(base.runsDir)], [[], [], 'idle', false]);
   // 決まりは凍結 (書き換えて使えない)・decided:false の確かめの決まりを許すのは試験だけ
   assert.ok(Object.isFrozen(E.POLICIES) && Object.values(E.POLICIES).every((x) => Object.isFrozen(x)));
-  for (const x of Object.values(E.POLICIES)) assert.ok(x.allowUndecided ? x.mode === 'test' : V.compileRules(x.rules).decided, x.name);
+  // 試験以外の決まりは decided:true の確かめの決まりだけ。毎晩の決まりは実機の試験で決めるまで無い (null) = 動かない (③c-1b-2b-2)
+  for (const x of Object.values(E.POLICIES)) assert.ok(x.allowUndecided ? x.mode === 'test' : (x.rules === null || V.compileRules(x.rules).decided), x.name);
+  assert.equal(E.POLICIES.nightly.rules, null, '2b-2a = 毎晩の確かめの列の決まりはまだ無い');
+  assert.throws(() => E.assertPolicyReady(E.POLICIES.nightly), /確かめの列の決まりがまだ無い/);
   assert.deepEqual([E.POLICIES.test.holder, E.POLICIES.test.mode, E.POLICIES.test.by, E.POLICIES.test.rules, E.POLICIES.test.barcode], ['auto', 'test', 'lz-import-test', V.RULES_2B1, true]);
   assert.match(T.newRunId(NOW), /^lzim_test_20300116T030000_[0-9a-f]{6}$/);
   for (const k of ['STOP_STATES', 'inNightBlock', 'nextNightStart', 'writeJsonAtomic', 'saveOnce', 'grabPostExports', 'isInvalidExport']) assert.equal(T[k], E[k], k);
@@ -662,11 +668,18 @@ await ta('[28] 共通の仕組みに渡す試験だけの値が効く (3b-1): im
   };
   // 旧い手の ③ の回 (manual_daily・旗が無いときだけ作れる) も試験の決まりでは確かめない
   for (const [name, o, re] of [['旧い手の ③ の回', { holder: 'manual_daily', mode: 'manual' }, /確かめをやり直せる状態でない/], ['毎晩の回 (同じ持ち主 auto)', { holder: 'auto', mode: 'nightly' }, /確かめをやり直せる状態でない \(今 = imported_unverified・lzim_night_/],
-    ['持ち主が違う回', { holder: 'auto', mode: 'test', byOverride: 'manual_daily' }, /確かめをやり直せる状態でない \(今 = /], ['記録の mode が違う', { holder: 'auto', mode: 'test', recMode: 'nightly' }, /記録が違う回/]]) {
+    ['持ち主が違う回', { holder: 'auto', mode: 'test', byOverride: 'manual_daily' }, /確かめをやり直せる状態でない \(今 = /]]) {
     const { dd, l, q, c } = unverified(o);
     await assert.rejects(T.verifyOnly({ lzMinRows: 1, dataDir: dd, runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: c, checkInit: q.checkInit,
       withSession: l.withSession, capabilities: { exportBarcodes: true }, notify: async () => true, log: () => {} }), re, name);
     assert.deepEqual([S.getStatus(q.db).state, S.getStatus(q.db).lock, l.st.calls], ['imported_unverified', null, []], name);
+  }
+  {
+    // 記録の mode が違う (違う回の記録) = 鍵を取ってから記録を読む = verify_failed (evidence_mismatch・ロジザードに触らない・人が見る。③c-1b-2b-2 契約 v3)
+    const { dd, l, q, c } = unverified({ holder: 'auto', mode: 'test', recMode: 'nightly' });
+    const r = await T.verifyOnly({ lzMinRows: 1, dataDir: dd, runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: c, checkInit: q.checkInit,
+      withSession: l.withSession, capabilities: { exportBarcodes: true }, notify: async () => true, log: () => {} });
+    assert.deepEqual([r.state, r.reason, S.getStatus(q.db).state, S.getStatus(q.db).run.detail.verify_detail.reason, S.getStatus(q.db).lock, l.st.calls], ['verify_failed', 'evidence_mismatch', 'verify_failed', 'evidence_mismatch', null, []]);
   }
   {
     // エンジンを直に (実行 ID の形の分け方に頼らない守り): 毎晩の回の実行 ID・記録は test でも、ポータルの回の mode = nightly = 試験の決まりでは確かめない (Codex #1535 R1 Medium)
@@ -725,6 +738,42 @@ await ta('[29] 対象の lz-daily はポータルに送れた回だけ (③c-1b-
   assert.equal(pick({ portal: undefined, version: 'lzd-v2' }, false, { legacyV2Until: AS_OF }).ok, true);   // 期限の日 = 許す
   assert.equal(pick({ portal: undefined, version: 'lzd-v2' }, false, { legacyV2Until: '2030-01-15' }).reason, 'portal_not_stored');   // 期限の翌日 = 断る
   assert.equal(pick({ portal: undefined, version: 'lzd-v2' }, true, { legacyV2Until: AS_OF }).reason, 'portal_not_stored');   // 合格を要る読み手 (試験・本番) には許さない
+});
+
+await ta('[31] 取込の後の書き出しの前にも締め切りの旗 (押した後に締め切りを過ぎた = 直後の書き出しをしない = imported_unverified のまま = 確かめのやり直しへ。Codex #1547 R1 Medium)', async () => {
+  const dataDir = setupData(); const lz = fakeLz({ over: { afterExecuteDelayMs: 1500 } }); const pt = portal();
+  const p = await planned(dataDir, lz);
+  const callsAfterPlan = lz.st.calls.length;
+  // 締め切り = 始めた時から 5 秒 (旗の余白) + 800 ミリ秒 = 押すときは内・押した後 1.5 秒で外
+  const nightMarginMs = (Date.parse('2030-01-17T00:00:00+09:00') - NOW.getTime()) - 5000 - 800;
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt, { nightMarginMs }), withSession: lz.withSession, notify: async () => true });
+  assert.deepEqual([r.state, S.getStatus(pt.db).state], ['imported_unverified', 'imported_unverified']);
+  assert.deepEqual(lz.st.calls.slice(callsAfterPlan), ['exportShohin', 'exportBarcodes', 'preview', 'execute'], '直後の書き出しをしない');
+  assert.ok(stagesOf(r).includes('post_export_stopped'));
+});
+
+await ta('[32] 取込の後の最後の書き出しの途中で締め切りを過ぎた = 確かめの結果を書かない = imported_unverified のまま (比べた結果は verify.json。Codex #1547 R1 Medium)', async () => {
+  const dataDir = setupData(); const lz = fakeLz({ over: { postBarcodeDelayMs: 1500 } }); const pt = portal();
+  const p = await planned(dataDir, lz);
+  const nightMarginMs = (Date.parse('2030-01-17T00:00:00+09:00') - NOW.getTime()) - 5000 - 800;
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt, { nightMarginMs }), withSession: lz.withSession, notify: async () => true });
+  assert.deepEqual([r.state, S.getStatus(pt.db).state], ['imported_unverified', 'imported_unverified']);
+  assert.ok(stagesOf(r).includes('verify_result_stopped') && fs.existsSync(path.join(r.runDir, 'verify.json')), stagesOf(r).join(','));
+});
+
+await ta('[33] CLI: run / verify / notify は要対応スペースの送り先 (GCHAT_WEBHOOK_JOBS) が無い・壊れている = 始めない (止まったときに黙って知らせが届かない、をしない) / plan は送らないので要らない', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lzt-cli-'));
+  const cli = (args, env) => spawnSync(process.execPath, ['scripts/logizard-import/lz-import-test.mjs', ...args], { cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..'), encoding: 'utf8',
+    env: { ...process.env, DATA_DIR: tmp, LZ_DAILY_IMPORT: '', LZ_LOCK_TOKEN: '', ...env } });
+  for (const [args, hook] of [[['run', '--plan', 'lzt_x', '--sha256', 'a'.repeat(64), '--occupancy', '倉庫は使っていない (確認)'], ''], [['verify', '--run', 'lzim_test_x', '--occupancy', '倉庫は使っていない (確認)'], 'https://'], [['notify'], 'not a url']]) {
+    const c = cli(args, { GCHAT_WEBHOOK_JOBS: hook });
+    assert.equal(c.status, 1, args[0] + c.stdout + c.stderr);
+    assert.match(c.stderr, /GCHAT_WEBHOOK_JOBS/, args[0]);
+  }
+  // plan は送り先を見ない (ほかの理由で止まるが、送り先では止めない)
+  const p = cli(['plan', '--normal', 'A-1', '--occupancy', '倉庫は使っていない (確認)'], { GCHAT_WEBHOOK_JOBS: '' });
+  assert.ok(!/GCHAT_WEBHOOK_JOBS/.test(p.stderr), p.stderr);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

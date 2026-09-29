@@ -21,6 +21,12 @@ import iconv from 'iconv-lite';
 
 export const SYSTEM_COLS = Object.freeze(['登録日時', '変更日時', 'インポート日時']);
 
+/**
+ * 毎晩の本番 (③c-1b-2b-2) の確かめの列の決まり。**実機の少数件の試験で決めてから入れる (2b-2b)**。
+ * それまで null = エンジンが「決まりがまだ無い」で断る (ファイル・鍵・ログイン・知らせが全部ゼロ)。decided:true (observe の列がゼロ) だけ入れる
+ */
+export const RULES_NIGHTLY = null;
+
 /** 2b-1 の決まり (実機の取込の前)。mode: key = 商品ID の文字の一致 / exact = CSV の文字のとおり / observe = 記録だけ (lz = 候補の列) */
 export const RULES_2B1 = Object.freeze({
   version: 'lzv-2b1-observe',
