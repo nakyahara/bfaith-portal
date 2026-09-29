@@ -190,6 +190,10 @@ export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: appro
       if (!bcPre.ok) throw new Error(`直前のバーコードが読めない (${bcPre.reason}) = 押さない (K4)`);
       const bcMiss = barcodeMissing(lz, bcPre);   // 直前の商品マスタの全商品が直前のバーコードにある = 途中で切れていない (Codex #1530 R2 High)
       if (bcMiss.length) throw new Error(`直前のバーコードの書き出しに無い商品がある = 途中で切れた疑い = 押さない (K4): ${bcMiss.length} 件 (${bcMiss.slice(0, 5).join(', ')})`);
+      // 取込の後に確かめられる形か (押す前に見る。Codex #1530 R4 Medium): 商品ごとの行がひとまとまり・比べる商品が最後の商品でない
+      const checkIds = new Set([...validateImportCsv(testCsv).table.map((r) => r[0]), ...body.groups.flatMap((g) => g.ids)]);
+      if (bcPre.grouped === false) throw new Error('直前のバーコードの書き出しで商品ごとの行がひとまとまりでない = 取込の後に確かめられない = 押さない (K4)');
+      if (checkIds.has(bcPre.lastId)) throw new Error(`比べる商品 ${bcPre.lastId} がバーコードの書き出しの最後の商品 = 取込の後に確かめられない = 押さない (K4・この商品を試験から外す)`);
       const again = checkPlanAgainstPre(body, lz);
       if (!again.ok) { stage('plan_changed', { diffs: again.diffs.slice(0, 50) }); throw new Error(`承認のときから一覧が変わった = 取り込まない (計画を作り直す): ${again.diffs.slice(0, 5).map((d) => `${d.kind}:${d.id}`).join(', ')}`); }
       // ── 押す前にそろえる記録 (D) ──

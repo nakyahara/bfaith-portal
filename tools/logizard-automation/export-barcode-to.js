@@ -29,10 +29,13 @@ if (OUT && /バーコードマスタ\.csv$/i.test(OUT)) { console.error('❌ バ
 if (OUT && !isAllowedOut(OUT, { dir: DIR })) { console.error(`❌ 書いてよいのは ${path.join(DIR, 'out')} の下だけ (共有ドライブ・ネットワークの場所・ジャンクションの先には書かない)`); process.exit(1); }
 
 let locked = false;
+const releaseOnExit = () => { try { releaseLock(); } catch { /* */ } };
 try {
   assertLocalWriteDirs();
   acquireLock({ name: 'logizard-session.lock' });
   locked = true;
+  // 共通部品が process.exit しても鍵を返す (Chrome が無い・ID が無い など。finally は通らない。Codex #1530 R4 Low)
+  process.once('exit', releaseOnExit);
   const { browser, page } = await launchBrowser({ headless: HEADLESS });
   try {
     await login(page, { label: 'バーコードの書き出し (確かめ)' });
@@ -49,5 +52,5 @@ try {
   console.error(`❌ 失敗: ${e.message}`);
   process.exitCode = 1;
 } finally {
-  if (locked) releaseLock();
+  if (locked) { releaseLock(); process.removeListener('exit', releaseOnExit); }
 }

@@ -540,7 +540,12 @@ await ta('[10] バーコードの書き出し (barcode-export.js・③c-1b-2b K4
   fp = fakePage('エクスポート処理を行います。よろしいですか？');
   await B.dismissNotice(fp, () => {});
   assert.deepEqual(fp.clicks, []);
-  for (const t of ['在庫を削除します。よろしいですか？', '在庫を削除します。続行するには OK を押してください。']) {
+  // 知っている注意文も完全一致 (ほかの文が足されていたら止める)・キャンセルを押せない = OK は押さずに止める (Codex #1530 R4 Medium)
+  fp = fakePage('1年以上離れた日付が指定されています');
+  fp.click = async (sel) => { fp.clicks.push(sel); if (sel === '#popup_cancel') throw new Error('見つからない'); };
+  await assert.rejects(B.dismissNotice(fp, () => {}), /キャンセルを押せない/);
+  assert.deepEqual(fp.clicks, ['#popup_cancel']);
+  for (const t of ['在庫を削除します。よろしいですか？', '在庫を削除します。続行するには OK を押してください。', '1年以上離れた日付が指定されています。在庫も削除します']) {
     fp = fakePage(t);
     await assert.rejects(B.dismissNotice(fp, () => {}), /想定外のモーダル/);
     assert.deepEqual(fp.clicks, [], t);
@@ -573,7 +578,9 @@ await ta('[10] バーコードの書き出し (barcode-export.js・③c-1b-2b K4
     assert.match(cli(['--out', path.join(tmp, 'バーコードマスタ.csv')]).stderr, /バーコードマスタ\.csv/);
   }
   const t = fs.readFileSync(path.join(TOOL, 'export-barcode-to.js'), 'utf8');
-  for (const kept of ["flag: 'wx'", "acquireLock({ name: 'logizard-session.lock' })", 'exportBarcodeMaster(page', 'バーコードマスタ\\.csv$', 'isAllowedOut(OUT, { dir: DIR })']) assert.ok(t.includes(kept), kept);
+  for (const kept of ["flag: 'wx'", "acquireLock({ name: 'logizard-session.lock' })", 'exportBarcodeMaster(page', 'バーコードマスタ\\.csv$', 'isAllowedOut(OUT, { dir: DIR })',
+    "process.once('exit', releaseOnExit)", "process.removeListener('exit', releaseOnExit)"]) assert.ok(t.includes(kept), kept);   // 共通部品が process.exit しても鍵を返す (Codex #1530 R4 Low)
+  assert.ok(t.indexOf("process.once('exit', releaseOnExit)") > t.indexOf("acquireLock({ name: 'logizard-session.lock' })") && t.indexOf("process.once('exit', releaseOnExit)") < t.indexOf('launchBrowser({'), '鍵を取った直後・ブラウザの前');
   // 写す一覧: miniPC (取込の試験が動く PC) に barcode-export.js と export-barcode-to.js
   const m = JSON.parse(fs.readFileSync(path.join(TOOL, 'manifest.json'), 'utf8'));
   assert.ok(m.pcs.minipc.includes('barcode-export.js') && m.pcs.minipc.includes('export-barcode-to.js'));

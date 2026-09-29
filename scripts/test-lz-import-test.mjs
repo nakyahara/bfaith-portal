@@ -538,5 +538,18 @@ await ta('[25] バーコードの書き出しが途中で切れた (同じ回の
   assert.ok(vj.barcode.diffs.some((d) => d.kind === 'missing_in_post_barcode' && d.head.includes('C-3')), JSON.stringify(vj.barcode.diffs));
 });
 
+await ta('[26] 取込の後に確かめられない形 = 押す前に止める: 比べる商品がバーコードの書き出しの最後の商品 / 商品ごとの行がひとまとまりでない (Codex #1530 R4 Medium)', async () => {
+  for (const [bc, re] of [[[['A-1', 'a', '4900000000001'], ['C-3', 'c', '4900000000003'], ['B-2', 'b', '4900000000002']], /比べる商品 B-2 がバーコードの書き出しの最後の商品/],
+    [[['A-1', 'a', '4900000000001'], ['B-2', 'b', '4900000000002'], ['A-1', 'a', '4900000000009'], ['C-3', 'c', '4900000000003']], /ひとまとまりでない/]]) {
+    const dataDir = setupData(); const lz = fakeLz(); const pt = portal();
+    const p = await planned(dataDir, lz);
+    lz.st.bc = bc;
+    const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+    assert.ok(!lz.st.calls.includes('execute') && !lz.st.calls.includes('preview'), '押さない');
+    assert.match(r.record.error, re);
+    assert.deepEqual([r.state, S.getStatus(pt.db).state], ['not_started', 'idle']);
+  }
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);

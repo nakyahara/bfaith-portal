@@ -25,11 +25,11 @@ import { jstTodaySlash, invalidCsvError } from './shohin-export.js';
 export const BARCODE_TYPE_LABEL = 'SKU';
 export const BARCODE_PATTERN_LABEL = 'バーコード情報';
 export const BARCODE_REQUIRED_COLS = ['商品ID', 'バーコード'];
-/** 閉じてよい注意文 (実機で出ることが分かっているものだけ)。日付を空にしたときの「1年以上離れた日付が指定されています」 */
-export const KNOWN_NOTICES = Object.freeze([/1年以上離れた日付/]);
+/** 閉じてよい注意文 (空白を除いて完全一致・実機で出ることが分かっているものだけ)。日付を空にしたときの「1年以上離れた日付が指定されています」(Codex #1530 R4 Medium) */
+export const KNOWN_NOTICES = Object.freeze([/^1年以上離れた日付が指定されています[。．.]?$/]);
 
 /**
- * 承認以外のモーダルが出ていたら閉じる。閉じるのは KNOWN_NOTICES の注意文だけ (キャンセル → 無ければ OK)。
+ * 承認以外のモーダルが出ていたら閉じる。閉じるのは KNOWN_NOTICES の注意文だけ・キャンセルだけ (押せない = 止める。承認以外の OK は押さない。Codex #1530 R4 Medium)。
  * 知らない文 = 何も押さずに止める (知らない確認を承認しない。Codex #1530 R1 Medium)。⚠「エクスポート処理を行います」は触らない (条件が固まる前にエクスポートが走る)
  * @returns {Promise<string|null>}  出ていた文 (無い = null)
  */
@@ -42,9 +42,9 @@ export async function dismissNotice(page, log) {
   });
   if (t == null) return null;
   if (/エクスポート処理を行います/.test(t.replace(/\s+/g, ''))) return t;
-  if (!KNOWN_NOTICES.some((re) => re.test(t))) throw new Error(`想定外のモーダル: ${t.slice(0, 200)} (何も押さずに止める)`);
+  if (!KNOWN_NOTICES.some((re) => re.test(t.replace(/\s+/g, '')))) throw new Error(`想定外のモーダル: ${t.slice(0, 200)} (何も押さずに止める)`);
   log(`💬 画面からの注意: ${t.slice(0, 120)}`);
-  await page.click('#popup_cancel').catch(async () => { await page.click('#popup_ok').catch(() => {}); });
+  await page.click('#popup_cancel').catch((e) => { throw new Error(`注意のモーダルのキャンセルを押せない (OK は押さずに止める): ${String(e && e.message).slice(0, 120)}`); });
   await page.waitForFunction(() => {
     const ov = document.getElementById('popup_overlay');
     return !ov || ov.offsetParent === null;
