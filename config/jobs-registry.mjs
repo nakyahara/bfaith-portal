@@ -440,6 +440,7 @@ export const JOBS_REGISTRY = [
       + '最新の夜間ロード (Render・02:00) が実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直し、Company DB (watcher で読むだけ) と比べる = ロードの検証。'
       + '全件 JSON = DATA_DIR/cdb-master-compare/<日付>/ (35 日)・証跡 master-compare (始めに実行中で前の結果を無効に)。見張りの W13 が読む。差がある・判定できないは ⚠️ (exit 0)・照合そのものの失敗だけ ❌。'
       + 'retry: Render同期 が retry で直ったら マスタ照合 → 見張り も走らせ直す (retry-failed-jobs.js の RERUN_AFTER)。新しい定期実行ではない) が走る。'
+      + '自動再試行 (Retry1〜3) は 2026-09-29 から 1 回ずつしか動かない (apps/warehouse/retry-lock.js = data/retry-failed-jobs.lock.json)。前の回・朝の daily-sync がまだ動いていれば見送り、retry-state があれば ⏸️ を通知 (最後の 11:30 を見送った日は残りを人が確かめる)。'
       + '全部の push の後に「Company DB 見張り」(apps/company-db/watch/run.mjs。設計 = AI_reference CompanyDB構想/09。今朝の push の証跡 (DATA_DIR/company-db-evidence) と Render の完了の印を読み、'
       + '在庫の取込の完了 W1 / 欠測 W2 / 在庫の差 W3 / 注文の取込 W7 / 売上日次の公開 W9 を 4 値 (pass / breach / blocked / execution_error) で判定。結果は ops.watch_runs / watch_results / watch_issues (0023)。'
       + '業務の異常は ⚠️ (exit 0)・見張り自身の失敗だけ ❌。env COMPANY_DB_WATCH_URL / _WRITER_URL (ロール watcher / watch_writer = scripts/company-db/create-watch-roles.mjs) が無ければ ⏭️ 未設定。新しい定期実行は無い) が走る。'

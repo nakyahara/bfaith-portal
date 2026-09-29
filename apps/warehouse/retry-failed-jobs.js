@@ -21,6 +21,10 @@
  *   WarehouseDailySyncRetry3: 11:30 JST 毎日
  *   いずれも `node apps/warehouse/retry-failed-jobs.js` を実行。
  *   state ファイルが無ければ即時 no-op で終了するので、空振り起動は無害。
+ *
+ * 🚨 回は 1 つずつ (2026-09-29・retry-lock.js): 前の回がまだ動いている・朝の daily-sync がまだ動いている間は見送る (retry-state には触らない)。
+ *   1 回の中の工程の上限の合計は 90 分の間隔を超えうる (Amazon Settlement 60 分 → Company DB の送り手 30 分 …) = 並ぶと同じ工程が重なり、
+ *   片方が消した state をもう片方が書き戻す。見送った回は、retry-state があれば ⏸️ を通知する (最後の 11:30 を見送ると次の回が無い = 人が見る)
  */
 import 'dotenv/config';
 import fs from 'fs';
@@ -28,10 +32,13 @@ import { execFileSync } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { isWarnSummary } from './amazon-fees-outcome.js';
+import { acquireRetryLock, releaseRetryLock } from './retry-lock.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
 const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.json');
+const RETRY_LOCK_FILE = path.join(PROJECT_DIR, 'data', 'retry-failed-jobs.lock.json');
+const DAILY_SYNC_LOCK_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync.lock.json');   // daily-sync.js の LOCK_FILE と同じ
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -331,6 +338,23 @@ export function runRetryRound(remainingJobs, { run = runScript, log = console.lo
 }
 
 async function main() {
+  const lock = acquireRetryLock({ lockFile: RETRY_LOCK_FILE, dailySyncLockFile: DAILY_SYNC_LOCK_FILE });
+  if (!lock.ok) {
+    console.log(`[Retry] 見送り: ${lock.reason}`);
+    // やることがある (retry-state がある)・lock を書けない ときだけ知らせる (空振りの見送りは静かに)
+    if (lock.error || fs.existsSync(RETRY_STATE_FILE)) await notify(`⏸️ *Warehouse自動再試行 見送り*\n${lock.reason}\nretry-state はそのまま (動いている回が結果を書く・次の回が拾う。最後の 11:30 を見送った日は残りを手で確かめる)`);
+    if (lock.error) process.exitCode = 1;
+    return;
+  }
+  if (lock.recovered) console.warn(`[Retry] 前の回の lock の残骸を回収した (${lock.recovered}) = 前の回は途中で止まった`);
+  try {
+    await runLocked();
+  } finally {
+    releaseRetryLock(lock);
+  }
+}
+
+async function runLocked() {
   const loadResult = loadState();
   if (!loadResult.found) {
     console.log('[Retry] retry-state 無し → no-op');
