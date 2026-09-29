@@ -257,10 +257,11 @@ const financeMallScopeOf = (req) => {
   if (!FINANCE_MALLS.includes(mall) || !/^[0-9A-Za-z][0-9A-Za-z_-]{0,30}$/.test(scope)) return null;
   return { mall, scope };
 };
+const isRealDate = (s) => DATE_RE.test(s) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;   // 2026-02-30 は通さない (DB の 500 ではなく 400)
 const financeRangeOf = (req, maxDays) => {
   const from = String(req.query.from || ''), to = String(req.query.to || '');
-  if (!DATE_RE.test(from) || !DATE_RE.test(to) || from > to) return { error: 'from / to must be YYYY-MM-DD and from <= to' };
-  if ((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 > maxDays) return { error: `range must be <= ${maxDays} days` };
+  if (!isRealDate(from) || !isRealDate(to) || from > to) return { error: 'from / to must be real dates (YYYY-MM-DD) and from <= to' };
+  if ((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 + 1 > maxDays) return { error: `range must be <= ${maxDays} days (both ends included)` };
   return { from, to };
 };
 
@@ -311,7 +312,9 @@ router.get('/order-finance/status', requireSyncKey, async (req, res) => {
 router.get('/order-finance/keys', requireSyncKey, async (req, res) => {
   const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
   const after = String(req.query.after || '');
-  const limit = Math.min(Math.max(Number(req.query.limit) || 20000, 1), 50000);
+  const limitRaw = req.query.limit === undefined ? 20000 : Number(req.query.limit);
+  if (!Number.isInteger(limitRaw)) return res.status(400).json({ error: 'limit must be an integer' });
+  const limit = Math.min(Math.max(limitRaw, 1), 50000);
   await withPg(res, async (client) => {
     // 受領状態の表 = 空の集合を受け取った注文も入る (lines = 0)。鍵の並びは collate "C" (バイト順・送り手の after と同じ)
     const rows = (await client.query(`select mall_order_no, lines from core.order_finance_receipts where company_id = 1 and mall = $1 and scope_key = $2 and mall_order_no collate "C" > $3 order by mall_order_no collate "C" limit $4`,

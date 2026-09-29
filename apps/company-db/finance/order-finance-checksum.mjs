@@ -5,7 +5,7 @@
  *
  * 行 = { economic_date_jst, seller_sku, line_kind, source, units_ordered, <20 金額列>, unmapped_jpy, <内訳 3 列>, account_fee_amount_jpy, source_lines }
  *   金額・数量は整数円・JS で安全に扱える整数 (Number.isSafeInteger)。SKU は NFC で変わらない文字列 ('-' = SKU が無い)
- * 指紋 = 行を (計上日, SKU, line_kind, source) の UTF-8 のバイト列で並べ、各行を CONTENT_COLUMNS の順の配列にして JSON.stringify → UTF-8 → sha256 (16 進)。空の集合 = '[]' の sha256
+ * 指紋 = 行を 鍵 4 つ (計上日, SKU, line_kind, source = 表の主キーの注文の下の部分) の UTF-8 のバイト列で並べ、各行を CONTENT_COLUMNS の順の配列にして JSON.stringify → UTF-8 → sha256 (16 進)。空の集合 = '[]' の sha256
  *   世代・時刻・content_hash・transform_version は入れない (transform_version は受け口が別に比べる)
  */
 import crypto from 'node:crypto';
@@ -28,6 +28,7 @@ export const pseudoOrderNo = (date) => `${PSEUDO_PREFIX}${date}`;
 export const isPseudoOrderNo = (no) => typeof no === 'string' && no.startsWith('-');
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER), MIN_SAFE = -MAX_SAFE;
 const isDate = (s) => typeof s === 'string' && DATE_RE.test(s) && !Number.isNaN(Date.parse(`${s}T00:00:00Z`)) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;
 
 /**
@@ -42,6 +43,8 @@ export function validateFinanceRows(mallOrderNo, rows) {
   const seen = new Set();
   return rows.map((r, i) => {
     if (!r || typeof r !== 'object' || Array.isArray(r)) throw new Error(`rows[${i}] must be an object`);
+    // 通貨は JPY だけ (正規化で捨てる前に確かめる = 捨てた後の SQL の検査には届かない。#1533 Codex R1 High)
+    if (r.currency !== undefined && r.currency !== null && r.currency !== 'JPY') throw new Error(`rows[${i}].currency must be JPY (${r.currency})`);
     if (!isDate(r.economic_date_jst)) throw new Error(`rows[${i}].economic_date_jst is not a date`);
     if (pseudo && mallOrderNo !== pseudoOrderNo(r.economic_date_jst)) throw new Error(`rows[${i}]: pseudo order ${mallOrderNo} holds a row of ${r.economic_date_jst}`);
     if (typeof r.seller_sku !== 'string' || r.seller_sku === '' || r.seller_sku.length > 200) throw new Error(`rows[${i}].seller_sku must be a non-empty string`);
@@ -57,8 +60,12 @@ export function validateFinanceRows(mallOrderNo, rows) {
     }
     if (out.source_lines <= 0) throw new Error(`rows[${i}].source_lines must be > 0`);
     if (out.line_kind === 'sku' && out.account_fee_amount_jpy !== 0) throw new Error(`rows[${i}]: account_fee_amount_jpy must be 0 on a sku row`);
-    const net = [...AMOUNT_COLUMNS, 'unmapped_jpy'].reduce((a, c) => a + out[c], 0);
-    if (!Number.isSafeInteger(net)) throw new Error(`rows[${i}]: net is not a safe integer`);
+    // net を BigInt で正確に足し、途中も結果も安全な整数の範囲か (途中で精度を落として最後だけ範囲に戻るのを見逃さない。#1533 Codex R1)
+    let net = 0n;
+    for (const c of [...AMOUNT_COLUMNS, 'unmapped_jpy']) {
+      net += BigInt(out[c]);
+      if (net > MAX_SAFE || net < MIN_SAFE) throw new Error(`rows[${i}]: net is not a safe integer (at ${c})`);
+    }
     const k = KEY_COLUMNS.map((c) => out[c]).join('\u0000');
     if (seen.has(k)) throw new Error(`rows[${i}]: duplicate row key (${KEY_COLUMNS.map((c) => out[c]).join(' / ')})`);
     seen.add(k);

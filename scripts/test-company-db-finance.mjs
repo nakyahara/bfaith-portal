@@ -17,7 +17,8 @@ import crypto from 'node:crypto';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { validateFinanceRows, orderFinanceChecksum, CONTENT_COLUMNS, pseudoOrderNo } from '../apps/company-db/finance/order-finance-checksum.mjs';
-import { validateFinanceChunk } from '../apps/company-db/ingest/order-finance.mjs';
+import { validateFinanceChunk, ingestOrderFinanceChunk } from '../apps/company-db/ingest/order-finance.mjs';
+import Database from 'better-sqlite3';
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.message || e)); } };
@@ -210,6 +211,70 @@ await t('受け口: 送り手の申告の指紋が内容と違えば 400・合�
   assert.equal(validateFinanceChunk(body(good)).rows[0].set_checksum, good);
   assert.throws(() => validateFinanceChunk(body('0'.repeat(64))), /set_checksum differs/);
   assert.throws(() => validateFinanceChunk({ ...body(good), rows: [{ ...body(good).rows[0], mall_order_no: '-:2026-9-1' }] }), /mall_order_no has a bad form/);
+});
+
+console.log('#1533 Codex R1 の直し');
+await t('🚨 丸め = 本物の SQLite の CAST(ROUND(a * 1.0 / b) AS INTEGER) と同じ答え (Codex の例 + 0.5 の境目の近く + 乱数 3,000 組)', async () => {
+  const sq = new Database(':memory:');
+  const sqRound = sq.prepare('SELECT CAST(ROUND(? * 1.0 / ?) AS INTEGER) AS r');
+  const pairs = [[4000002001000000, 2000001], [1000000000, 2000000000], [1000000000, 2000000001], [2000000, 3], [1000000, 666667], [-1000000, 3], [5, 10], [15, 10], [-15, 10]];
+  let seed = 12345; const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  for (let i = 0; i < 3000; i++) {
+    const b = 1 + Math.floor(rnd() * 5000000);
+    const k = Math.floor(rnd() * 3000000000);
+    const a = k * b + Math.floor(b / 2) + Math.floor(rnd() * 3) - 1;   // 0.5 の境目の近く
+    if (Number.isSafeInteger(a)) pairs.push([rnd() < 0.2 ? -a : a, b]);
+  }
+  const bad = [];
+  for (const [a, b] of pairs) {
+    const want = Number(sqRound.get(BigInt(a), BigInt(b)).r);
+    const got = Number((await one(`select core.sqlite_round($1::bigint::float8 / $2::bigint::float8) as r`, [String(a), String(b)])).r);
+    if (want !== got) bad.push([a, b, want, got]);
+  }
+  sq.close();
+  assert.equal(bad.length, 0, `SQLite と違う: ${JSON.stringify(bad.slice(0, 5))}`);
+  // view でも: 本体 4,000,002,001 円・2,000,001 個 → 単価 2,000,000,000 micro (SQLite) → 本体の返金 1,000 円は 1 個
+  await apply('RB', 1, [row('2026-06-03', 'sku-rb', { units_ordered: 2000001, sales_principal_jpy: 4000002001 }), row('2026-06-20', 'sku-rb', { refund_principal_jpy: -1000, refund_principal_customer_jpy: -1000 })]);
+  assert.equal((await one(`select units_refunded_customer u from mart.v_finance_daily where seller_sku = 'sku-rb' and economic_date_jst = '2026-06-20'`)).u, 1);
+});
+await t('🚨 通貨: JPY 以外の行は形の確かめで拒む (受け口の 400・HTTP の道で USD が円として入らない)', async () => {
+  assert.throws(() => validateFinanceRows('C1', [row('2026-09-01', 'a', { currency: 'USD', sales_principal_jpy: 100 })]), /currency must be JPY/);
+  const rows = [row('2026-09-01', 'a', { currency: 'USD', sales_principal_jpy: 100 })];
+  const body = { run_id: 'ship_202609291200000_abcdef', batch_seq: 1, chunk_index: 0, last: true, transform_version: 't1',
+    rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'C1', header: { transform_version: 't1', set_checksum: '0'.repeat(64) }, lines: rows }] };
+  assert.throws(() => validateFinanceChunk(body), /currency must be JPY/);
+  assert.doesNotThrow(() => validateFinanceRows('C1', [row('2026-09-01', 'a', { currency: 'JPY' })]));
+});
+await t('受け口の道 (validateFinanceChunk → ingestOrderFinanceChunk) で入る・同じ chunk の再送は同じ結果', async () => {
+  const rows = [row('2026-09-01', 'sku-http', { units_ordered: 1, sales_principal_jpy: 300 })];
+  const cs = orderFinanceChecksum(validateFinanceRows('H1', rows));
+  const body = { run_id: 'ship_202609291300000_abcdef', batch_seq: 3, chunk_index: 0, last: true, transform_version: 't1',
+    rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'H1', header: { transform_version: 't1', set_checksum: cs }, lines: rows }] };
+  const r = await ingestOrderFinanceChunk(pgliteAdapter(pg), { ...validateFinanceChunk(body), host: 'test' });
+  assert.equal(r.applied, 1, JSON.stringify(r));
+  assert.equal(Number((await one(`select sales_principal_jpy s from core.order_finance_daily where mall_order_no = 'H1'`)).s), 300);
+  assert.equal((await one(`select currency from core.order_finance_daily where mall_order_no = 'H1'`)).currency, 'JPY');
+});
+await t('足し算の途中で安全な整数を超えたら拒む (最後だけ範囲に戻っても)', async () => {
+  assert.throws(() => validateFinanceRows('A1', [row('2026-09-01', 'a', { sales_principal_jpy: Number.MAX_SAFE_INTEGER, sales_shipping_jpy: 2, sales_giftwrap_jpy: -2 })]), /net is not a safe integer \(at sales_shipping_jpy\)/);
+});
+await t('指紋は固定の値 (日本語の SKU = UTF-8 のバイト順で a < あ < b)', async () => {
+  const rs = validateFinanceRows('A1', [row('2026-09-02', 'b', { sales_principal_jpy: 5 }), row('2026-09-01', 'あ', { units_ordered: 1 }), row('2026-09-01', 'a', { commission_jpy: -3 })]);
+  const json = '[["2026-09-01","a","sku","amazon_settlement_unified",0,0,0,0,0,-3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],["2026-09-01","あ","sku","amazon_settlement_unified",1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],["2026-09-02","b","sku","amazon_settlement_unified",0,5,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]]';
+  assert.equal(crypto.createHash('sha256').update(Buffer.from(json, 'utf8')).digest('hex'), 'da0531f5f6d092cdc3cc473c2be393713813f923f10fe373d6603aa456bb81b1');
+  assert.equal(orderFinanceChecksum(rs), 'da0531f5f6d092cdc3cc473c2be393713813f923f10fe373d6603aa456bb81b1');   // 列の順・並べ方・JSON の書き方を変えたら落ちる (送り手と受け口の取り決め)
+});
+await t('🚨 0043 は受領状態・公開の表のどれかに 1 行でもあれば止まる', async () => {
+  for (const setup of [
+    `insert into core.order_finance_receipts (company_id, mall, scope_key, mall_order_no, received_batch_seq, set_checksum, lines) values (1, 'amazon', 'jp', 'x', 1, 'c', 0)`,
+    `insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source) values ('r', 1, '2026-09-01', 'amazon', 'jp', 's')`,
+  ]) {
+    const pg3 = new PGlite();
+    await applyMigrations(pgliteAdapter(pg3), { log: quiet, to: '0042' });
+    await pg3.query(setup);
+    await rejects(() => applyMigrations(pgliteAdapter(pg3), { log: quiet }), /0012 の表が空ではない/);
+    await pg3.close();
+  }
 });
 
 console.log(`\n${ok} 件 PASS${ng ? ` / ${ng} 件 NG` : ''}`);

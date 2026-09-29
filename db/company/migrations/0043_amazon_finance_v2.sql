@@ -195,10 +195,18 @@ begin
 end
 $$;
 
+-- ─── SQLite の ROUND(double) と同じ丸め (#1533 Codex R1 High) ───
+-- SQLite の roundFunc (桁 0) = 正なら (double)(int64)(x + 0.5)・負なら −(double)(int64)(−x + 0.5) = double のまま 0.5 を足して 0 の方へ切り捨てる。
+--   numeric の round に変えると 0.5 の境目の直前の値 (例 4,000,002,001,000,000 ÷ 2,000,001 = 1,999,999,999.5000002…) で 1 ずれる。
+--   float8 の足し算と trunc は IEEE で SQLite と同じ。試験 = 本物の SQLite (better-sqlite3) と答えを突き合わせる (scripts/test-company-db-finance.mjs)
+create or replace function core.sqlite_round(x float8) returns bigint language sql immutable as $$
+  select case when x is null then null when x >= 0 then trunc(x + 0.5::float8)::bigint else -(trunc(-x + 0.5::float8)::bigint) end
+$$;
+
 -- ─── 採用する行 (policy が指す source・その日) ───
 -- 日次の財務 (SQLite の f_amazon_finance_sku_daily_v1 と同じ列名・同じ式。line_kind = 'sku' の行・日 × SKU)
 --   費用の列 = −Σ(符号のまま) / 売上・補てん・misc / other = Σ / closing_fee・units_marketplace_guarantee = 0 (build の固定値)
---   単価 (計上日の月 × SKU) = ROUND(Σ Order の本体 (micro) ÷ Σ Order の数量) (build の unit_price_month。SQLite の ROUND は double の割り算の後に 0.5 を 0 から遠い方へ = ここも double で割ってから numeric の round)
+--   単価 (計上日の月 × SKU) = ROUND(Σ Order の本体 (micro) ÷ Σ Order の数量) (build の unit_price_month。double で割って core.sqlite_round = SQLite の ROUND と同じ)
 --   返品数 = ROUND(−Σ 本体の返金 (micro) ÷ 単価)・単価が無い / 0 なら 0
 --   profit_before_cogs_jpy = build の profit_amount から原価を除いた式 (sales_tax・misc・other・promotion_tax は入れない・points は引く)
 create view mart.v_finance_daily as
@@ -227,14 +235,14 @@ daily as (
 unit_price_month as (
   select company_id, mall, scope_key, seller_sku, date_trunc('month', economic_date_jst)::date as month,
          case when sum(units_ordered) = 0 then null
-              else round(((sum(sales_principal_jpy) * 1000000)::float8 / sum(units_ordered)::float8)::numeric) end as unit_price_micro
+              else core.sqlite_round((sum(sales_principal_jpy) * 1000000)::float8 / sum(units_ordered)::float8) end as unit_price_micro
     from adopted
    group by company_id, mall, scope_key, seller_sku, date_trunc('month', economic_date_jst)::date
 ),
 est as (
   select d.*,
-         coalesce(round(((d.refund_customer_jpy * 1000000)::float8 / nullif(u.unit_price_micro, 0)::float8)::numeric), 0)::integer as units_refunded_customer,
-         coalesce(round(((d.refund_atoz_jpy * 1000000)::float8 / nullif(u.unit_price_micro, 0)::float8)::numeric), 0)::integer as units_a_to_z_refund
+         coalesce(core.sqlite_round((d.refund_customer_jpy * 1000000)::float8 / nullif(u.unit_price_micro, 0)::float8), 0)::integer as units_refunded_customer,
+         coalesce(core.sqlite_round((d.refund_atoz_jpy * 1000000)::float8 / nullif(u.unit_price_micro, 0)::float8), 0)::integer as units_a_to_z_refund
     from daily d
     left join unit_price_month u
       on u.company_id = d.company_id and u.mall = d.mall and u.scope_key = d.scope_key and u.seller_sku = d.seller_sku and u.month = date_trunc('month', d.economic_date_jst)::date

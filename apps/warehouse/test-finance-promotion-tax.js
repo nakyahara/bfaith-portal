@@ -134,6 +134,15 @@ ok(cEx === 1000 - 20,`C の税抜で引いた利益 = 1,000 − ポイント 20 
   const snapAfter = db.prepare(`SELECT unit_cost_snapshot s, cost_snapshot_date_jst d FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-b' AND date_jst = ?`).get(`${YM}-05`);
   ok(c10gone === 0 && c5kept && c5kept.pt === 30 && JSON.stringify(snapAfter) === JSON.stringify(snapBefore),
     `材料の無くなった日 × SKU (C の 10 日) は作り直しで消える・ほかの行 (C の 5 日) と原価の記録 (B の 5 日) は残る (${c10gone} / ${c5kept && c5kept.pt} / ${JSON.stringify(snapAfter)})`);
+  // 月の境: ほかの月の行は消さない (#1533 Codex R1)
+  db.prepare(`INSERT INTO f_amazon_finance_sku_daily_v1 (date_jst, seller_sku, cost_status, source_layer_summary, source_row_count, built_at) VALUES ('2020-01-31', 'sku-other-month', 'complete', 'sp_api_v2', 1, 't')`).run();
+  // 月の材料が全部消えた: 決済の行を全部消して作り直す → その月の行は全部消える (ほかの月は残る)
+  db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE year_month_int = ?`).run(YMI);
+  let out = '';
+  try { out = execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch (e) { out = String(e.stdout || '') + String(e.stderr || ''); }
+  const leftMonth = db.prepare(`SELECT COUNT(*) n FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ?`).get(YM).n;
+  const otherMonth = db.prepare(`SELECT COUNT(*) n FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-other-month'`).get().n;
+  ok(leftMonth === 0 && otherMonth === 1, `月の材料が全部消えたら その月の行は全部消える・ほかの月の行は残る (${leftMonth} / ${otherMonth} ${leftMonth ? out.slice(-300) : ''})`);
 }
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 値引きの税の分テスト ALL PASS ===');
