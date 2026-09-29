@@ -38,7 +38,7 @@ import { connectWatcher } from '../../apps/company-db/master-compare/run.mjs';
 import { readNeForLz, joinLzSnapshot } from '../../apps/master-decisions/lz-snapshot.mjs';
 import { buildLzCsv, DAILY, LZ_CONVERTER_VERSION } from '../../apps/master-decisions/lz-csv.mjs';
 import { compareLz, LZ_COMPARE_VERSION } from '../../apps/master-decisions/lz-compare.mjs';
-import { readLzShohinMaster, classifyForLz, compareNeIndex, explainCdbDiffs } from '../../apps/master-decisions/lz-cdb.mjs';
+import { readLzShohinMaster, classifyForLz, compareNeIndex, cdbLagOf, explainCdbDiffs } from '../../apps/master-decisions/lz-cdb.mjs';
 
 export const EVIDENCE_NAME = 'lz-daily';
 export const OUT_DIR = 'lz-daily';
@@ -138,12 +138,14 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
   if (!cdbRead.mark || cdbRead.mark.compare_run_id !== ev.compare_run_id) return skip('codes_not_this_run', { code_mark: cdbRead.mark, compare_run_id: ev.compare_run_id });
   // ── 5. 分けて作って比べる ──
   const snap = joinLzSnapshot(ne, { mark: cdbRead.mark, rows: cdbRead.codes }, { takenAt: now.toISOString() });
-  const cls = classifyForLz({ neItems: snap.items, cdb: cdbRead.cdb, lz });
+  const compareIndex = compareNeIndex(compareJson);
+  // Company DB にまだ無い新しい商品のうち、同じ朝の照合 ② が lag と言うもの = 翌朝のロード待ち (不合格に数えない。2026-09-29)
+  const cls = classifyForLz({ neItems: snap.items, cdb: cdbRead.cdb, lz, cdbLag: cdbLagOf(compareIndex) });
   const cdbCsv = buildLzCsv(cls.compare.map((x) => x.cdb), 'daily');
   const neCsv = buildLzCsv(cls.compare.map((x) => x.ne), 'daily');
   const raw = compareLz({ gas: neCsv.bytes, ours: cdbCsv, compareCols: [0, 1, 2, 3, 4], header: DAILY.header });
   // NE の道の推測の形 (neCsv.rows の unverified) も判定に入れる (Codex #1507 R1 High)
-  const result = explainCdbDiffs(raw, { compareIndex: compareNeIndex(compareJson), byKey: new Map(cls.compare.map((x) => [x.key, x])), neRows: neCsv.rows });
+  const result = explainCdbDiffs(raw, { compareIndex, byKey: new Map(cls.compare.map((x) => [x.key, x])), neRows: neCsv.rows });
   const failBy = [
     ['shape', result.shape.length], ['undeterminable', result.undeterminable.length], ['unexplained', result.unexplained.length],
     ['invalid', cls.invalid.length],   // 不正で出さない商品が残る = 合格にしない (v3 M5)
@@ -157,7 +159,7 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
   fs.mkdirSync(dir, { recursive: true });
   const csvRel = path.join(rel, `cdb_${DAILY.file}`).replace(/\\/g, '/');
   fs.writeFileSync(path.join(outDir, csvRel), cdbCsv.bytes, { flag: 'wx' });
-  const report = { run_id: runId, as_of: asOf, verdict, fail_by: failBy, classes: { counts: cls.counts, awaiting: cls.awaiting, invalid: cls.invalid, cost_zero_over_lz: cls.cost_zero_over_lz }, compare: result,
+  const report = { run_id: runId, as_of: asOf, verdict, fail_by: failBy, classes: { counts: cls.counts, awaiting: cls.awaiting, lagging: cls.lagging, invalid: cls.invalid, cost_zero_over_lz: cls.cost_zero_over_lz }, compare: result,
     build: { counts: cdbCsv.counts, unmade: cdbCsv.unmade, subs: cdbCsv.rows.flatMap((r) => r.subs.map((x) => ({ code: r.key, ...x }))) } };
   const reportBuf = Buffer.from(JSON.stringify(report, null, 1), 'utf8');
   fs.writeFileSync(path.join(dir, 'report.json'), reportBuf, { flag: 'wx' });
@@ -176,7 +178,7 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
   save(evidence);
   const s = evidence.summary;
   const line = `${verdict === 'pass' ? '✅' : '⚠️'} ロジザード毎日の商品マスタ (影): ${verdict === 'pass' ? '合格' : `不合格 (${failBy.join('・')})`}`
-    + ` / 比べる ${cls.counts.compare}・新商品待ち ${cls.counts.awaiting}・不正 ${cls.counts.invalid}`
+    + ` / 比べる ${cls.counts.compare}・新商品待ち ${cls.counts.awaiting}・Company DB 待ち ${cls.counts.lagging}・不正 ${cls.counts.invalid}`
     + ` / 同じ ${s.same_rows}・許す差 ${s.allowed}・説明できない ${s.unexplained}・判定できない ${s.undeterminable}・形の差 ${s.shape}`;
   return { state: 'complete', evidence: { as_of: asOf, run_id: runId, version: LZ_DAILY_VERSION, ...evidence }, line, runId, report };
 }

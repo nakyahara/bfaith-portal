@@ -160,6 +160,19 @@ await ta('[3b] NE の道の推測の形 (GAS で確かめていないセル) = �
   assert.equal(D.explainCdbDiffs(raw, { compareIndex: new Map(), byKey: new Map(), neRows: neCsv.rows }).verdict, 'fail');
 });
 
+await ta('[2b] Company DB 待ち: ロジザードにあり Company DB に無い新しい商品のうち、照合 ② が「NE だけにある・lag」と言うもの = 出さない・不正に数えない / lag でない・照合 ② に無い = 不正 (cdb_no_sku) (2026-09-29)', async () => {
+  const idx = D.compareNeIndex(cmpJson([['lag-1', 'exists', null, null, 'lag'], ['unx-1', 'exists', null, null, 'unexplained'], ['val-1', 'name', 'a', 'b', 'lag']]));
+  const r = D.classifyForLz({ neItems: [neItem('Lag-1'), neItem('Unx-1'), neItem('Val-1'), neItem('Nosku-1')], cdb: cdbOf([]), lz: lzOf(['Lag-1', 'Unx-1', 'Val-1', 'Nosku-1']), cdbLag: D.cdbLagOf(idx) });
+  assert.deepEqual(r.lagging.map((x) => [x.ne_code, x.why]), [['Lag-1', 'cdb_lag']]);
+  assert.deepEqual(r.invalid.map((x) => [x.code_norm, x.reason]), [['unx-1', 'cdb_no_sku'], ['val-1', 'cdb_no_sku'], ['nosku-1', 'cdb_no_sku']]);   // 列の lag (名前) は「無い」の lag ではない
+  assert.deepEqual([r.counts.lagging, r.counts.invalid, r.counts.compare], [1, 3, 0]);
+  // ロジザードに無い = 新商品待ちが先 (lag でも)
+  const a = D.classifyForLz({ neItems: [neItem('Lag-1')], cdb: cdbOf([]), lz: lzOf(['X-1']), cdbLag: D.cdbLagOf(idx) });
+  assert.deepEqual([a.awaiting.length, a.lagging.length], [1, 0]);
+  // cdbLag を渡さない = 今までどおり不正
+  assert.deepEqual(D.classifyForLz({ neItems: [neItem('Lag-1')], cdb: cdbOf([]), lz: lzOf(['Lag-1']) }).invalid.map((x) => x.reason), ['cdb_no_sku']);
+});
+
 // ── CLI (runLzDaily) の材料: 一時の DATA_DIR ──
 const now = new Date('2030-01-15T01:00:00Z');   // JST 2030-01-15 10:00
 const asOf = '2030-01-15';
@@ -210,7 +223,7 @@ await ta('[4] CLI: 作れた = 変えない CSV・報告・完了の印 (sha256�
   assert.deepEqual([ev.inputs.compare_run_id, ev.inputs.lz_master.rows, ev.inputs.lz_master.sha256], ['mc_20300115T000000000Z_aaaaaa', 2, sha(fs.readFileSync(s.lzPath))]);
   assert.ok(fs.existsSync(path.join(out, ev.report.path)));
   assert.equal(fs.existsSync(path.join(s.dataDir, 'company-db-evidence', asOf, 'lz-daily.json')), false);   // 材料の場所には書かない
-  assert.match(r.line, /^✅ ロジザード毎日の商品マスタ \(影\): 合格 \/ 比べる 2・新商品待ち 1・不正 0/);
+  assert.match(r.line, /^✅ ロジザード毎日の商品マスタ \(影\): 合格 \/ 比べる 2・新商品待ち 1・Company DB 待ち 0・不正 0/);
   const r2 = await run(s, { outDir: out });
   assert.notEqual(r2.runId, r.runId);
   assert.equal(fs.readFileSync(path.join(out, ev.csv.path)).toString('hex'), csv.toString('hex'));   // 前の回の CSV は変わらない
@@ -243,6 +256,22 @@ await ta('[5] CLI: 不正が残る = 不合格 (説明できない差 0 でも) 
   ev = evOf(s.dataDir);
   assert.deepEqual([ev.verdict, ev.counts.cost_zero_over_lz], ['pass', 1]);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(s.dataDir, ev.report.path), 'utf8')).classes.cost_zero_over_lz, [{ code_norm: 'b-2', ne_code: 'B-2', lz_cost: '5200' }]);
+});
+
+await ta('[5c] CLI: 新しい商品が Company DB にまだ無い = 照合 ② が lag と言えば Company DB 待ち (合格・CSV に出さない) / 言わなければ不正 (不合格) (2026-09-29 の 23 件)', async () => {
+  const ne2 = () => { const n = neFake()(); n.products = [...n.products, { code: 'new-2', name: '新しい', cost_src: J('10.00'), supplier: '0001' }];
+    n.entries = [...n.entries, { code_norm: 'new-2', kind: 'product', state: 'ok', ne_code: 'NEW-2' }]; return n; };
+  const cdb2 = cdbFake({ codes: [{ code_norm: 'a-1', state: 'ok', ne_code: 'A-1' }, { code_norm: 'b-2', state: 'ok', ne_code: 'B-2' }, { code_norm: 'new-1', state: 'ok', ne_code: 'NEW-1' }, { code_norm: 'new-2', state: 'ok', ne_code: 'NEW-2' }] });
+  let s = setup({ lzRows: [{ id: 'A-1', name: 'x' }, { id: 'B-2' }, { id: 'NEW-2' }], compareItems: [['b-2', 'cost', 0, 5200], ['new-2', 'exists', null, null, 'lag']] });
+  let r = await run(s, { readNe: ne2, readCdb: cdb2 });
+  let ev = evOf(s.dataDir);
+  assert.deepEqual([ev.verdict, ev.fail_by, ev.counts.lagging, ev.counts.invalid, ev.csv.rows], ['pass', [], 1, 0, 2]);
+  assert.match(r.line, /Company DB 待ち 1・不正 0/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(s.dataDir, ev.report.path), 'utf8')).classes.lagging, [{ code_norm: 'new-2', ne_code: 'NEW-2', why: 'cdb_lag' }]);
+  s = setup({ lzRows: [{ id: 'A-1', name: 'x' }, { id: 'B-2' }, { id: 'NEW-2' }] });   // 照合 ② が lag と言わない
+  r = await run(s, { readNe: ne2, readCdb: cdb2 });
+  ev = evOf(s.dataDir);
+  assert.deepEqual([ev.verdict, ev.fail_by, ev.counts.lagging, ev.counts.invalid], ['fail', ['invalid'], 0, 1]);
 });
 
 await ta('[5b] CLI: NE の道の推測の形は判定できない = 不合格 (NE の仕入先 "1" が Company DB の 0001 と同じになっても)', async () => {

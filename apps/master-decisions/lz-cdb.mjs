@@ -5,6 +5,8 @@
  * 対象 = NE の取得の商品 (③b-2 と同じ集合) を 3 つに分ける (v3 M5):
  *   compare  = ロジザードにある (商品ID が文字の完全一致) かつ Company DB の値が全部そろう → 両方の道 (Company DB / NE の取得) で行を作って比べる
  *   awaiting = ロジザードに無い = 新商品の登録 (①) 待ち。ロジザードに無い ID の行は取込でエラーになる (中原さん L-7) = 出さない
+ *   lagging  = ロジザードにあるが Company DB にまだ無い新しい商品で、同じ朝の照合 ② が lag (NE だけにある = 夜間ロードの材料が NE の取込より古い) と言っているもの
+ *              = 翌朝のロード待ち。出さない・不合格に数えない (2026-09-29 中原さん。新商品を登録した翌朝に毎回不合格になっていた)。照合 ② が lag と言わない cdb_no_sku は invalid のまま
  *   invalid  = 出さない (理由つき)。0 や空で埋めない (v2 H5)。1 件でも残れば、その商品を中原さんが認めない限り切替の合格にしない
  * 値の出どころ (v2 H5・L-4):
  *   形式/型番 = NE の元の書き方 (ops.master_ne_codes)・商品名 = core.skus.name (前後の空白を削った形 = 許す差 L-4)・
@@ -74,11 +76,12 @@ export function readLzShohinMaster(buf, { minRows = LZ_SHOHIN.minRows } = {}) {
  * @param {Array<{ code_norm, ne_code, code_reason, name, cost_src, supplier }>} p.neItems  lz-snapshot の材料の items (NE の取得の値・元のコード)
  * @param {object} p.cdb  compare-load.mjs readCdbMaster の結果 (skuByNorm・costs・primary)
  * @param {object} p.lz   readLzShohinMaster の結果
- * @returns {{ compare: Array<{ key, cdb: object, ne: object }>, awaiting: object[], invalid: object[], cost_zero_over_lz: object[], counts: object }}
+ * @param {(codeNorm: string) => boolean} [p.cdbLag]  照合 ② がその商品を「NE だけにある・lag」と言っているか (cdbLagOf)
+ * @returns {{ compare: Array<{ key, cdb: object, ne: object }>, awaiting: object[], lagging: object[], invalid: object[], cost_zero_over_lz: object[], counts: object }}
  *   cost_zero_over_lz = Company DB の原価 0 を出すが、ロジザードには 0 でない原価がある商品 (止めない・報告に残すだけ = 0 で上書きする。今の GAS と同じ)
  */
-export function classifyForLz({ neItems, cdb, lz }) {
-  const compare = [], awaiting = [], invalid = [], costZeroOverLz = [];
+export function classifyForLz({ neItems, cdb, lz, cdbLag = () => false }) {
+  const compare = [], awaiting = [], lagging = [], invalid = [], costZeroOverLz = [];
   let costZero = 0;
   const no = (it, reason, extra = {}) => invalid.push({ code_norm: it.code_norm, ne_code: it.ne_code || null, reason, ...extra });
   for (const it of neItems) {
@@ -89,7 +92,10 @@ export function classifyForLz({ neItems, cdb, lz }) {
     if (!lzRow) { awaiting.push({ code_norm: it.code_norm, ne_code: it.ne_code }); continue; }
     if (lzRow.deleted !== '0') { no(it, 'lz_deleted'); continue; }
     const sku = cdb.skuByNorm.get(it.code_norm);
-    if (!sku) { no(it, 'cdb_no_sku'); continue; }
+    if (!sku) {
+      if (cdbLag(it.code_norm)) { lagging.push({ code_norm: it.code_norm, ne_code: it.ne_code, why: 'cdb_lag' }); continue; }   // 翌朝のロード待ち
+      no(it, 'cdb_no_sku'); continue;
+    }
     if (it.name == null || String(it.name).trim() === '') { no(it, 'ne_name_blank'); continue; }   // コードで補った名前の疑い (v3 M4)
     const name = String(sku.name ?? '').trim();
     if (!name) { no(it, 'cdb_name_blank'); continue; }
@@ -110,8 +116,8 @@ export function classifyForLz({ neItems, cdb, lz }) {
     }
   }
   const reasons = invalid.reduce((m, x) => ((m[x.reason] = (m[x.reason] || 0) + 1), m), {});
-  return { compare, awaiting, invalid, cost_zero_over_lz: costZeroOverLz,
-    counts: { targets: neItems.length, compare: compare.length, awaiting: awaiting.length, invalid: invalid.length, invalid_reasons: reasons, cost_zero: costZero, cost_zero_over_lz: costZeroOverLz.length } };
+  return { compare, awaiting, lagging, invalid, cost_zero_over_lz: costZeroOverLz,
+    counts: { targets: neItems.length, compare: compare.length, awaiting: awaiting.length, lagging: lagging.length, invalid: invalid.length, invalid_reasons: reasons, cost_zero: costZero, cost_zero_over_lz: costZeroOverLz.length } };
 }
 
 /** セルの中身のバイト = ロジザードの CSV と同じ変換・比べる側 (parseCsvBytes) と同じ復号 (引用符を外し "" を " に。Codex #1507 R1 Low) */
@@ -121,6 +127,12 @@ const LZ_COL_TO_COMPARE = Object.freeze({ 1: 'name', 2: 'name', 3: 'cost', 4: 'p
 /**
  * 照合 ② の全件 JSON (mc-v2 の ne.items) → (code_norm|列) → { n, c } の一覧
  */
+/** 照合 ② が「NE だけにある (only_in_ne)・lag」と言っている商品か (Company DB 待ち)。compareNeIndex の結果から */
+export const cdbLagOf = (compareIndex) => (codeNorm) => {
+  const x = compareIndex.get(`${codeNorm}|exists`);
+  return !!x && x.cls === 'lag';
+};
+
 export function compareNeIndex(compareJson) {
   const m = new Map();
   for (const x of (compareJson && compareJson.ne && compareJson.ne.items) || []) {
