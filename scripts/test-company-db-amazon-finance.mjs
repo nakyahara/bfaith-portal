@@ -526,6 +526,18 @@ await t('返送の注文番号 (+ / を含む) も送れる (本番の決済に 
   const keys = await (await fetch(`${BASE}/order-finance/keys?mall=amazon&scope=jp&after=${encodeURIComponent('+')}&limit=5`, { headers: { 'x-sync-key': 'k' } })).json();
   assert.ok(keys.keys.includes('+3gubNop3S'), JSON.stringify(keys));
 });
+await t("'-' で始まる不正な本物の注文番号は疑似注文と取り違えず、別の月の回でも送れない鍵に残る (#1534 Codex R5 Medium)", async () => {
+  retryStore(L0).replace([]);
+  raw({ order: '-BAD', sku: 'sku-u', date: d(MA, 3), pt: 'Principal', pa: 1000, ingested: '2026-06-12 00:00:00' });
+  const r1 = await pushClose(L0, { mode: 'range', from: d(MA, 1), to: d(MA, 5) });
+  assert.ok(r1.transformErrors.some((x) => x.key === financeKey('-BAD')), JSON.stringify(r1.transformErrors));
+  const r2 = await pushClose(L0, { mode: 'range', from: d(MB, 27), to: d(MB, 27) });   // 別の月の回
+  assert.ok(r2.transformErrors.some((x) => x.key === financeKey('-BAD')));
+  assert.ok(retryStore(L0).list().some((f) => f.key === financeKey('-BAD')));
+  wdb.prepare(`delete from raw_amazon_settlement_lines where amazon_order_id = '-BAD'`).run();
+  const r3 = await pushClose(L0, { mode: 'range', from: d(MB, 27), to: d(MB, 27) });
+  assert.equal(r3.transformErrors.length, 0); assert.deepEqual(retryStore(L0).list(), []);
+});
 await t('parseArgs: 操作は 1 つ・--from/--to は組・--all は --reconcile と', async () => {
   assert.throws(() => parseArgs([]), /どれか 1 つ/);
   assert.throws(() => parseArgs(['--incremental', '--full']), /どれか 1 つ/);

@@ -151,7 +151,10 @@ export function makeIterate(sel, run) {
     }
     const addKey = (k) => {
       let no; try { no = orderNoOfKey(k); } catch { stats.badKeys = (stats.badKeys || 0) + 1; return; }
-      if (isPseudoOrderNo(no)) { const d = no.slice(PSEUDO_PREFIX.length); if (isRealDate(d)) dates.add(d); } else orders.add(no);
+      // 疑似注文は '-:YYYY-MM-DD' (本物の日付) の完全一致だけ。'-' で始まるほかの番号は本物の注文として読み直す = 形の検査で また送れない鍵に残る
+      //   (疑似注文と取り違えて落とすと、次の回に一覧から消えて未投入のまま完了印まで通る。#1534 Codex R5 Medium)
+      const d = no.startsWith(PSEUDO_PREFIX) ? no.slice(PSEUDO_PREFIX.length) : null;
+      if (d != null && /^\d{4}-\d{2}-\d{2}$/.test(d) && isRealDate(d)) dates.add(d); else orders.add(no);
     };
     // 読み直す鍵 (送れなかった・止めた・前の回に outbox に残った。#1534 Codex R1 High)
     for (const k of sel.extraKeys || []) addKey(k);
