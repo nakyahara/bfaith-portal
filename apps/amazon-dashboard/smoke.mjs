@@ -188,6 +188,31 @@ check('getWaterfall SKU', () => {
   assert(ad.amount > 0, 'SKU広告費(直接+按分)>0');
 });
 
+// 🆕 2026-09-30: 税込で引いた計算 (_incl) の広告の後は広告費 × 1.1 を引く (広告費は税抜)。全部の _incl の場所で確かめる (Codex #1550 R1)
+//   差 = 広告費 × 1.1 (丸めで ±1 円) かつ 広告費そのまま (旧い式) ではない
+check('税込で引いた計算の広告の後 = 広告費 × 1.1 を引く (推移・内訳の段・SKU の表・Easy Ship の後)', () => {
+  const near = (a, b) => Math.abs(a - b) <= 1;
+  const tr = q.getTrend(d(29), today, 'day').rows.filter((x) => x.ad_cost > 20);
+  assert(tr.length > 0, '広告費のある日がある');
+  for (const x of tr) assert(Math.abs((x.profit_before_ads_incl - x.profit_after_ads_incl) - x.ad_cost * 1.1) < 1e-6, '推移の日 ' + JSON.stringify([x.bucket, x.profit_before_ads_incl, x.profit_after_ads_incl, x.ad_cost]));
+  const trm = q.getTrend(d(89), today, 'month').rows.filter((x) => x.ad_cost > 20);
+  for (const x of trm) assert(Math.abs((x.profit_before_ads_incl - x.profit_after_ads_incl) - x.ad_cost * 1.1) < 1e-6, '推移の月 ' + JSON.stringify([x.bucket, x.ad_cost]));
+  for (const sku of [null, 'pr_alpha']) {
+    const wf = q.getWaterfall(d(29), today, sku);
+    const ad = wf.steps.find((s) => s.key === 'ad_cost').amount;
+    const diff = wf.incl.profit_before_ads - wf.incl.profit_after_ads;
+    assert(ad > 20 && near(diff, ad * 1.1) && !near(diff, ad), '内訳の段 ' + JSON.stringify([sku, diff, ad]));
+  }
+  const rows = q.getSkuProfit(d(29), today, {}).rows.filter((r) => r.ad_direct + r.ad_allocated > 20);
+  assert(rows.length > 0, '広告費のある SKU がある');
+  for (const r of rows) {
+    const ad = r.ad_direct + r.ad_allocated;
+    const diff = r.profit_before_ads_incl - r.profit_after_ads_incl;
+    assert(near(diff, ad * 1.1) && !near(diff, ad), 'SKU の表 ' + JSON.stringify([r.seller_sku, diff, ad]));
+    assert(near(r.profit_after_ads_incl - r.profit_after_easy_ship_incl, r.easy_ship_incl), 'Easy Ship の後 ' + JSON.stringify([r.seller_sku, r.profit_after_ads_incl, r.profit_after_easy_ship_incl, r.easy_ship_incl]));
+  }
+});
+
 const sp = check('getSkuProfit', () => {
   const r = q.getSkuProfit(d(29), today, {});
   assert(r.rows.length === 3, '3 SKU');
