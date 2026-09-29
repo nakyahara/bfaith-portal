@@ -13,7 +13,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
 import { isWarnSummary } from './amazon-fees-outcome.js';
-import { otherRunAlive, isAliveNodeSince, remainingRetrySlots } from './retry-lock.js';
+import { waitOtherRunGone, isAliveNodeSince, remainingRetrySlots } from './retry-lock.js';
 import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS, amazonFinanceDailyArgs } from './amazon-finance-months.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -392,8 +392,9 @@ async function main() {
     const runId = `${process.pid}-${crypto.randomUUID()}`;
     fs.writeFileSync(LOCK_FILE, JSON.stringify({ run_id: runId, pid: process.pid, started_at: startTime.toISOString(), business_date: businessDate }), { flag: 'wx' });
     myLockRunId = runId;
-    // 自動再試行の回が動いている間は走らない (retry-lock.js と対で、どちらも「自分の lock を書いた後に相手を見る」= 同時に起動しても片方は必ず気づく。#1538 Codex R1 High)
-    const retryRun = otherRunAlive(RETRY_LOCK_FILE);   // 持ち主 = pid が生きている node で、lock より前から動いているプロセス (retry-lock.js の isAliveNodeSince)
+    // 自動再試行の回が動いている間は走らない (retry-lock.js と対で、どちらも「自分の lock を書いた後に相手を見る」= 同時に起動しても片方は必ず気づく。#1538 Codex R1 High)。
+    //   daily-sync が優先: 再試行は daily-sync の lock を見たら必ず退く = 最大 60 秒待って、退いたら続ける (完全に同時に起動しても両方退かない。#1538 Codex R3 Medium)
+    const retryRun = await waitOtherRunGone(RETRY_LOCK_FILE);   // 持ち主 = pid が生きている node で、lock より前から動いているプロセス (retry-lock.js の isAliveNodeSince)
     if (retryRun) {
       releaseLock();
       const msg = `⚠️ *Warehouse日次同期 起動を中止* 自動再試行の回が動いている (pid=${retryRun.pid}, started_at=${retryRun.started_at})。終わってから手で流す`;

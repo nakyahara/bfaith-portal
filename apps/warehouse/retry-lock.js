@@ -12,7 +12,9 @@
  *     「生きている」= その pid が生きている node で、**そのプロセスが lock の started_at より前から動いている** (後から始まったプロセス = pid の使い回し = 残骸)。
  *       期限では奪わない (長い工程 = DB バックアップ最大 6 時間 を実行中の生きた回から奪わない。#1538 Codex R2 Medium)。started_at が未来・読めない lock も残骸
  *   - 持ち主が死んでいる・期限切れ・壊れた lock = 残骸 → 自分が読んだ中身とバイト一致するものだけを回収してから取り直す (daily-sync の lock と同じ手順 = 名前を変えて奪う)
- *   - 朝の daily-sync と互いに避ける: **どちらも「自分の lock を書いた後に相手の lock を見る」** (daily-sync.js も retry の lock を見る) = 同時に起動しても、少なくとも片方は相手に気づいて退く
+ *   - 朝の daily-sync と互いに避ける: **どちらも「自分の lock を書いた後に相手の lock を見る」** (daily-sync.js も retry の lock を見る) = 同時に起動しても、少なくとも片方は相手に気づく。
+ *     **daily-sync が優先**: 再試行は相手を見たら必ず退く・daily-sync は再試行の lock を見たら最大 60 秒待ち (waitOtherRunGone)、その間に退けば続ける
+ *     (完全に同時に起動したときに両方退いて、その朝の処理が丸ごと抜けない。#1538 Codex R3 Medium)
  *   - 外すのは自分の token の lock だけ (中身を先に読んで自分のものでなければ触らない)
  *   - 残る狭い競合: 3 つの回が同時に同じ残骸を回収し合うと、読んでから名前を変えるまでの間に別の回の新しい lock を外しうる (定刻の起動は 90 分おき = 起きない。手で何度も同時に起動しない)
  */
@@ -20,7 +22,8 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { execFileSync } from 'child_process';
 
-export const START_SKEW_MS = 120000;           // プロセスの開始時刻と lock の started_at の許す差 (lock はプロセスが始まった後に書く = 開始時刻 ≦ started_at + この差)
+export const START_SKEW_MS = 30000;            // プロセスの開始時刻と lock の started_at の許す差 (同じ PC の時計。lock はプロセスが始まった後に書く = 開始時刻 ≦ started_at + この差)。
+//   この差の中で pid が使い回されると別のプロセスを持ち主と見る (残る狭い穴 = 人が lock を消す。#1538 Codex R3 Low で 2 分 → 30 秒)
 export const FUTURE_SKEW_MS = 10 * 60 * 1000;  // started_at がこれより未来 = 壊れた lock
 export const RETRY_SLOTS_JST = ['08:30', '10:00', '11:30'];   // Task Scheduler の WarehouseDailySyncRetry1〜3 (台帳 warehouse-daily-sync)
 /** いま (JST) から後に残っている再試行の時刻 (daily-sync が 11:30 より後に retry-state を書いた日は空 = その日は自動で再試行されない) */
@@ -60,10 +63,10 @@ export function processStartTime(pid) {
  * lock の持ち主 (pid・started_at) がいま動いているか = pid が生きている node で、そのプロセスが started_at より前 (+ 許す差) から動いている。
  *   開始時刻が取れなければ生きている側に倒す (並走しない)
  */
-export function isAliveNodeSince(pid, startedAt, { startTimeOf = processStartTime, aliveNode = isAliveNodeProcess } = {}) {
-  if (!aliveNode(pid)) return false;
+export function isAliveNodeSince(pid, startedAt, { startTimeOf = processStartTime, aliveNode = isAliveNodeProcess, now = new Date() } = {}) {
   const lockAt = Date.parse(startedAt);
-  if (!Number.isFinite(lockAt)) return false;
+  if (!Number.isFinite(lockAt) || lockAt > now.getTime() + FUTURE_SKEW_MS) return false;   // 読めない・未来 = 壊れた lock (daily-sync 自身の確かめにも効く。#1538 Codex R3 Medium)
+  if (!aliveNode(pid)) return false;
   const start = startTimeOf(pid);
   if (!start) return true;
   return start.getTime() <= lockAt + START_SKEW_MS;
@@ -83,6 +86,16 @@ function holderAlive(j, { isAlive, now }) {
 export function otherRunAlive(lockFile, { isAlive = isAliveNodeSince, now = new Date() } = {}) {
   const j = parse(readRaw(lockFile));
   return holderAlive(j, { isAlive, now }) ? { pid: j.pid, started_at: j.started_at } : null;
+}
+
+/** 別の回の lock の持ち主が退くのを最大 timeoutMs 待つ。退いた = null / 動いたまま = { pid, started_at } (daily-sync が再試行の lock を見たとき = daily-sync 優先) */
+export async function waitOtherRunGone(lockFile, { timeoutMs = 60000, intervalMs = 2000, isAlive = isAliveNodeSince, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), clock = () => Date.now() } = {}) {
+  const until = clock() + timeoutMs;
+  for (;;) {
+    const holder = otherRunAlive(lockFile, { isAlive, now: new Date(clock()) });
+    if (!holder || clock() >= until) return holder;
+    await sleep(intervalMs);
+  }
 }
 
 /** 名前を変えて奪い、中身が matchFn に合えば消す・合わなければ戻す (daily-sync.js の claimAndDeleteLock と同じ手順) */
