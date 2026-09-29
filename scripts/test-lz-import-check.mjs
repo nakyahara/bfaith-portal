@@ -162,8 +162,12 @@ await ta('[7] バーコード: 見出しに 商品ID・バーコード・列の�
   const renamed = bc([['A-1', '新しい名前', '4900000000002', '9'], ['A-1', '新しい名前', '4900000000001', '9'], ['B-2', 'b2', '4900000000003', '1']]);
   assert.deepEqual(V.compareBarcodes({ pre, post: renamed, ids: ['A-1', 'B-2'] }), { ok: true, diffs: [] });
   // 見出しの 商品ID・バーコード の位置が変わった = 差 / 見出しの名前だけ違う列 = 差にしない / 同じ見出しが 2 つ = 読まない
-  assert.deepEqual(V.compareBarcodes({ pre, post: bc([['a', 'A-1', '4900000000001', '1']], ['商品名', '商品ID', 'バーコード', '入数']), ids: [] }).diffs, [{ id: null, kind: 'header_changed' }]);
-  assert.deepEqual(V.compareBarcodes({ pre, post: bc([['A-1', 'a', '4900000000001', '1']], ['商品ID', '名前', 'バーコード', '数']), ids: [] }).diffs, []);
+  assert.deepEqual(V.compareBarcodes({ pre, post: bc([['a', 'A-1', '4900000000001', '1'], ['a', 'A-1', '4900000000002', '1'], ['b', 'B-2', '4900000000003', '1']], ['商品名', '商品ID', 'バーコード', '入数']), ids: [] }).diffs, [{ id: null, kind: 'header_changed' }]);
+  assert.deepEqual(V.compareBarcodes({ pre, post: bc([['A-1', 'a', '4900000000001', '1'], ['A-1', 'a', '4900000000002', '1'], ['B-2', 'b', '4900000000003', '1']], ['商品ID', '名前', 'バーコード', '数']), ids: [] }).diffs, []);
+  // 途中で切れた (Codex #1530 R1 High): 末尾が改行で終わる = 読まない / 後の行が前より少ない = 差 (前後とも対象より手前で切れて「同じ」に見えるのを防ぐ)
+  assert.equal(V.readBarcodeExport(Buffer.concat([csvOf([['A-1', 'a', '4900000000001', '1']], { header: BH }), Buffer.from('\r\n')])).reason, 'barcode_truncated');
+  assert.deepEqual(V.compareBarcodes({ pre, post: bc([['A-1', 'a', '4900000000001', '1'], ['A-1', 'a', '4900000000002', '1']]), ids: [] }).diffs, [{ id: null, kind: 'rows_decreased', pre: 3, post: 2 }]);
+  assert.deepEqual(V.compareBarcodes({ pre, post: bc([['A-1', 'a', '4900000000001', '1'], ['A-1', 'a', '4900000000002', '1'], ['B-2', 'b', '4900000000003', '1'], ['C-3', 'c', '4900000000004', '1']]), ids: [] }).diffs, []);   // 増えた (ほかの人の新商品) は差にしない
   assert.equal(bc([['A-1', '1', '2']], ['商品ID', 'バーコード', 'バーコード']).reason, 'barcode_header');
 });
 

@@ -11,6 +11,8 @@
  *
  * 約束 (lz-import-test.mjs realTestSession): exportBarcodeMaster(page, { dlDir, log }) → { buf, v, fileName }。固定の出力先には書かない。
  * 中身の検証に落ちた = invalidCsvError (code invalid_csv = 中身が壊れている / export_not_csv = HTML) を投げる。
+ * 途中で切れた CSV (Codex #1530 R1 High): 行の途中 = 引用符・列の数で分かる / 行の切れ目 = 本物の書き出しは末尾が改行で終わらない (2026-09-29 に確かめた) ので、改行で終わる = 切れた疑い /
+ *   下限 4,000 行 (9/29 は 5,188 行)。取込の試験は前後の行の数も比べる (lz-import-verify.mjs compareBarcodes の rows_decreased)。
  * ロジザードは照会 (エクスポート) だけ = 業務データを変えない。セッションの鍵は呼び手が持つ。
  */
 import fs from 'fs';
@@ -22,11 +24,15 @@ import { jstTodaySlash, invalidCsvError } from './shohin-export.js';
 export const BARCODE_TYPE_LABEL = 'SKU';
 export const BARCODE_PATTERN_LABEL = 'バーコード情報';
 export const BARCODE_REQUIRED_COLS = ['商品ID', 'バーコード'];
+/** 閉じてよい注意文 (実機で出ることが分かっているものだけ)。日付を空にしたときの「1年以上離れた日付が指定されています」 */
+export const KNOWN_NOTICES = Object.freeze([/1年以上離れた日付/]);
+
 /**
- * 承認以外の通知モーダルを閉じる (shohin-export.js の dismissNotice と同じ中身。写してある shohin-export.js を替えずに使えるよう、ここにも持つ)。
- * ⚠「エクスポート処理を行います」は絶対に触らない (条件が固まる前にエクスポートが走る)
+ * 承認以外のモーダルが出ていたら閉じる。閉じるのは KNOWN_NOTICES の注意文だけ (キャンセル → 無ければ OK)。
+ * 知らない文 = 何も押さずに止める (知らない確認を承認しない。Codex #1530 R1 Medium)。⚠「エクスポート処理を行います」は触らない (条件が固まる前にエクスポートが走る)
+ * @returns {Promise<string|null>}  出ていた文 (無い = null)
  */
-async function dismissNotice(page, log) {
+export async function dismissNotice(page, log) {
   const t = await page.evaluate(() => {
     const ov = document.getElementById('popup_overlay');
     if (!ov || ov.offsetParent === null) return null;
@@ -35,6 +41,7 @@ async function dismissNotice(page, log) {
   });
   if (t == null) return null;
   if (/エクスポート処理を行います/.test(t.replace(/\s+/g, ''))) return t;
+  if (!KNOWN_NOTICES.some((re) => re.test(t))) throw new Error(`想定外のモーダル: ${t.slice(0, 200)} (何も押さずに止める)`);
   log(`💬 画面からの注意: ${t.slice(0, 120)}`);
   await page.click('#popup_cancel').catch(async () => { await page.click('#popup_ok').catch(() => {}); });
   await page.waitForFunction(() => {
@@ -44,13 +51,25 @@ async function dismissNotice(page, log) {
   return t;
 }
 
+/**
+ * 確かめの道具 (export-barcode-to.js) が書いてよい場所 = このフォルダの out\ の下か OS の一時フォルダの下だけ
+ * (共有ドライブ・ネットワークの場所・ほかのフォルダには書かない。Codex #1530 R1 Medium)
+ */
+export function isAllowedOut(p, { dir, tmp }) {
+  if (!p) return false;
+  const norm = (x) => path.resolve(x).toLowerCase().replace(/[\\/]+$/, '');
+  const f = norm(p);
+  return [path.join(dir, 'out'), tmp].some((root) => { const r = norm(root); return f.startsWith(r + path.sep) || f.startsWith(r + '/'); });
+}
+
+export const BARCODE_MIN_ROWS = 4000;   // 9/29 の全件 = 5,188 行
 export const BARCODE_FILE_NAME = 'barcode_master';   // 保存ファイル名は必須 (空 = 「条件入力に不備があります」)
 
 /**
  * 書き出したバーコードの CSV を確かめる (壊れた・HTML・見出しが違う・列の数が違う・少なすぎる = ok: false)
  * @returns {{ ok: boolean, reason?: string, dataRows?: number, header?: string[] }}
  */
-export function validateBarcodeCsv(buf, { minRows = 100 } = {}) {
+export function validateBarcodeCsv(buf, { minRows = BARCODE_MIN_ROWS } = {}) {
   if (!buf || buf.length === 0) return { ok: false, reason: '中身が空です' };
   const head = buf.slice(0, 2000).toString('latin1');
   if (/<html|<!DOCTYPE|user_id|SUSPENDED/i.test(head)) return { ok: false, reason: 'CSVではなくHTML(ログイン/SUSPENDED)が返っています' };
@@ -60,6 +79,7 @@ export function validateBarcodeCsv(buf, { minRows = 100 } = {}) {
   } catch (e) {
     return { ok: false, reason: `Shift-JIS として読めません (${e.message})` };
   }
+  if (/[\r\n]$/.test(text)) return { ok: false, reason: '末尾が改行で終わっています (本物の書き出しは改行で終わらない = 行の切れ目で切れた疑い)' };
   let rows;
   try {
     ({ rows } = parseCsv(text));
@@ -90,7 +110,7 @@ export function validateBarcodeCsv(buf, { minRows = 100 } = {}) {
  * @param {boolean} [opts.dry]  条件の設定まで (実行ボタンを押さない)
  * @returns {Promise<{ dry: true } | { buf: Buffer, v: object, fileName: string }>}
  */
-export async function exportBarcodeMaster(page, { dlDir, minRows = 100, dry = false, log = console.log } = {}) {
+export async function exportBarcodeMaster(page, { dlDir, minRows = BARCODE_MIN_ROWS, dry = false, log = console.log } = {}) {
   fs.mkdirSync(dlDir, { recursive: true });
   let dlPath = null;
   try {

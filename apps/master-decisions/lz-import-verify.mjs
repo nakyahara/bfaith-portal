@@ -136,6 +136,8 @@ export function readBarcodeExport(buf) {
   if (/<html|<!DOCTYPE|SUSPENDED/i.test(b.subarray(0, 2000).toString('latin1'))) return bad('barcode_html');
   const P = parseCsvBytes(b);
   if (P.shape.unterminated || P.shape.bare_quote || P.shape.after_quote) return bad('barcode_broken');
+  // 本物の書き出しは末尾が改行で終わらない (2026-09-29) = 改行で終わる = 行の切れ目で切れた疑い (Codex #1530 R1 High)
+  if (P.shape.trailing_newline) return bad('barcode_truncated');
   const dec = (x) => iconv.decode(Buffer.from(x), 'cp932');
   for (const r of P.records) for (const c of r.cells) if (!iconv.encode(dec(c), 'cp932').equals(Buffer.from(c))) return bad('barcode_encoding');
   const header = (P.records[0] || { cells: [] }).cells.map(dec);
@@ -164,6 +166,8 @@ export function compareBarcodes({ pre, post, ids }) {
   const diffs = [];
   const pos = (h) => [h.indexOf('商品ID'), h.indexOf('バーコード')].join(',');
   if (pos(pre.header) !== pos(post.header)) diffs.push({ id: null, kind: 'header_changed' });
+  // 後の行が前より少ない = 途中で切れた・消えた (前後とも対象より手前で切れて「同じ」に見えるのを防ぐ。Codex #1530 R1 High)
+  if (post.rows < pre.rows) diffs.push({ id: null, kind: 'rows_decreased', pre: pre.rows, post: post.rows });
   for (const id of new Set(ids)) {
     const a = pre.byId.get(id) || [], b = post.byId.get(id) || [];
     const count = (list) => list.reduce((m, r) => m.set(r, (m.get(r) || 0) + 1), new Map());
