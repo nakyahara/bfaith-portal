@@ -24,7 +24,7 @@ import { validateImportCsv } from '../../apps/master-decisions/lz-import-check.m
 import { buildTestPlan, planSha256, checkTestCsv } from '../../apps/master-decisions/lz-import-test-plan.mjs';
 import { portalWrite } from './portal-io.mjs';
 import { realSession } from './lz-real-session.mjs';
-import { sendJobsChat } from './notify-jobs.mjs';
+import { sendJobsChat, jobsHook } from './notify-jobs.mjs';
 import { POLICIES, STOP_STATES, inNightBlock, nextNightStart, writeJsonAtomic, saveOnce, checkOccupancy, grabPostExports, isInvalidExport, newRunId as engineRunId, importOne, verifyAgain } from './lz-import-engine.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import dotenv from 'dotenv';
@@ -194,6 +194,8 @@ if (isMain) {
     dotenv.config({ path: path.join(REPO_ROOT, '.env') });
     if ((process.env.LZ_DAILY_IMPORT || '').trim().toLowerCase() === 'on') throw new Error('LZ_DAILY_IMPORT=on (毎晩の本番) は 2b-2 まで断る');
     const a = parseArgs(process.argv.slice(2));
+    // 取り込む・確かめる・知らせる回は、要対応スペースの送り先が無い・壊れている = 始めない (止まったときに黙って知らせが届かない、をしない。毎晩の本番と同じ)
+    if (a.cmd !== 'plan' && !jobsHook(process.env)) throw new Error('要対応スペースの送り先 GCHAT_WEBHOOK_JOBS がリポジトリ直下の .env に無い・壊れている = 止まったときに知らせられない = 始めない (Render の GCHAT_WEBHOOK_JOBS と同じ値を足す)');
     const automationDir = (process.env.LOGIZARD_AUTOMATION_DIR || 'C:\\tools\\logizard-automation').trim();
     const { createImportStateClient, checkInit } = await import(pathToFileURL(path.join(automationDir, 'import-state-client.js')).href);
     const client = createImportStateClient();

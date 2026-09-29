@@ -761,5 +761,20 @@ await ta('[32] 取込の後の最後の書き出しの途中で締め切りを�
   assert.ok(stagesOf(r).includes('verify_result_stopped') && fs.existsSync(path.join(r.runDir, 'verify.json')), stagesOf(r).join(','));
 });
 
+await ta('[33] CLI: run / verify / notify は要対応スペースの送り先 (GCHAT_WEBHOOK_JOBS) が無い・壊れている = 始めない (止まったときに黙って知らせが届かない、をしない) / plan は送らないので要らない', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lzt-cli-'));
+  const cli = (args, env) => spawnSync(process.execPath, ['scripts/logizard-import/lz-import-test.mjs', ...args], { cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..'), encoding: 'utf8',
+    env: { ...process.env, DATA_DIR: tmp, LZ_DAILY_IMPORT: '', LZ_LOCK_TOKEN: '', ...env } });
+  for (const [args, hook] of [[['run', '--plan', 'lzt_x', '--sha256', 'a'.repeat(64), '--occupancy', '倉庫は使っていない (確認)'], ''], [['verify', '--run', 'lzim_test_x', '--occupancy', '倉庫は使っていない (確認)'], 'https://'], [['notify'], 'not a url']]) {
+    const c = cli(args, { GCHAT_WEBHOOK_JOBS: hook });
+    assert.equal(c.status, 1, args[0] + c.stdout + c.stderr);
+    assert.match(c.stderr, /GCHAT_WEBHOOK_JOBS/, args[0]);
+  }
+  // plan は送り先を見ない (ほかの理由で止まるが、送り先では止めない)
+  const p = cli(['plan', '--normal', 'A-1', '--occupancy', '倉庫は使っていない (確認)'], { GCHAT_WEBHOOK_JOBS: '' });
+  assert.ok(!/GCHAT_WEBHOOK_JOBS/.test(p.stderr), p.stderr);
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);
