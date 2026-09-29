@@ -5,6 +5,9 @@
  * monthly validation: f_amazon_finance_sku_daily_v1 の日次 rollup と
  * v_amazon_sku_profit_actual_v4.gross_margin_with_reimbursement_excl_tax を
  * SKU x month で比較し、差分を 7 bucket に分類して `accounting_diff_buckets` に保存。
+ * 🚨 2026-09-29: 2 つは計算の決まりが違う (原価・ポイント・送料の税・返品の管理手数料・返金の範囲) →
+ *   amazon-finance-v4-reconcile.js で決まりの違いを引いてから比べる (月の合計の差・説明できない残り)。
+ *   決まりの違いは adjustment_diff に内訳つきで残す。本番 1〜9 月の残り = 0 円
  * 6 つの DQ check を実行して `dq_run_results` に severity 付きで記録。
  *
  * severity='error' の check が 1 件以上あれば exit code 1 で停止 (gate failure)。
@@ -40,6 +43,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
+import { reconcileMonthly } from './amazon-finance-v4-reconcile.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -151,27 +155,22 @@ recordResult(
 // ============================================================
 // Check 2: monthly_total_diff_pct (gross_margin_with_reimbursement)
 // ============================================================
-const dailyTotal = db.prepare(`
-  SELECT SUM(profit_amount) AS p FROM f_amazon_finance_sku_daily_v1
-  WHERE substr(date_jst, 1, 7) = ?
-`).get(monthStr).p || 0;
-const v4Total = db.prepare(`
-  SELECT
-    SUM(gross_margin_excl_tax)
-    + SUM(warehouse_damage_jpy) + SUM(warehouse_lost_jpy) + SUM(safe_t_jpy)
-    + SUM(refund_principal_jpy) + SUM(reversal_reimbursement_jpy) AS p
-  FROM v_amazon_sku_profit_actual_v4
-  WHERE year_month_int = ?
-`).get(yearMonthInt).p || 0;
-const totalDiff = Math.abs(dailyTotal - v4Total);
-const totalDiffPct = v4Total !== 0 ? (totalDiff / Math.abs(v4Total)) * 100 : 0;
+// 決まりの違い (原価・ポイント・送料の税・返品の管理手数料・返金の範囲) を引いてから比べる (2026-09-29)
+const rec = reconcileMonthly(db, { month: monthStr })[0] || { profit_d: 0, profit_v4: 0, raw_diff: 0, cogs_d: 0, cogs_v4: 0, points: 0, ship_tax: 0, refund_commission: 0, other_refund: 0, cmp_d: 0, cmp_v4: 0, resid: 0, resid_pct: 0 };
+const dailyTotal = rec.profit_d, v4Total = rec.profit_v4;
+const totalDiff = Math.abs(rec.resid);   // 決まりの違いを引いた後の差
+const totalDiffPct = rec.resid_pct;
+const explained = {   // 日次 − v4 の向き (利益への効き)
+  cogs: -(rec.cogs_d - rec.cogs_v4), points: -rec.points, ship_tax: -rec.ship_tax,
+  refund_commission: rec.refund_commission, other_refund: rec.other_refund,
+};
 recordResult(
   'monthly_total_diff_pct',
   totalDiffPct > THRESHOLDS.monthly_total_diff_pct.error ? 'error' :
     totalDiffPct > THRESHOLDS.monthly_total_diff_pct.warn ? 'warn' : 'info',
   totalDiffPct,
   THRESHOLDS.monthly_total_diff_pct.error,
-  { daily_total_jpy: dailyTotal, v4_total_jpy: v4Total, diff_jpy: dailyTotal - v4Total }
+  { daily_total_jpy: dailyTotal, v4_total_jpy: v4Total, raw_diff_jpy: rec.raw_diff, aligned_daily_jpy: rec.cmp_d, aligned_v4_jpy: rec.cmp_v4, resid_jpy: rec.resid, explained_jpy: explained }
 );
 
 // ============================================================
@@ -266,18 +265,18 @@ if (dailyOnly.length > 0) {
   });
 }
 
-// adjustment_diff (説明可能な差)
-recordBucket(monthStr, '__multi__', 'adjustment_diff',
-  totalDiff - skuNull * 0 - (costStats.missing_amount || 0),  // 簡易計算
-  1, { method: 'total_diff - sku_null_amount - cost_late_binding_amount' });
+// adjustment_diff (説明できる差 = 決まりの違い。2026-09-29 から内訳つき)
+const explainableSum = Object.values(explained).reduce((a, b) => a + b, 0);
+recordBucket(monthStr, '__multi__', 'adjustment_diff', explainableSum, 1, {
+  method: 'amazon-finance-v4-reconcile.js (決まりの違い 5 つ)', raw_diff: rec.raw_diff, ...explained,
+});
 
-// unbucketed (説明できない残差)
-const explainableSum = (costStats.missing_amount || 0);
-const unbucketed = totalDiff - explainableSum;
-recordBucket(monthStr, '__multi__', 'unbucketed', unbucketed, 1, {
-  total_diff: totalDiff,
+// unbucketed (説明できない残差) = 決まりの違いを引いた後の差
+const unbucketed = totalDiff;
+recordBucket(monthStr, '__multi__', 'unbucketed', rec.resid, 1, {
+  raw_diff: rec.raw_diff,
   explainable_sum: explainableSum,
-  formula: 'total_diff - sum(known buckets)'
+  formula: 'raw_diff - sum(決まりの違い) = (日次 + 原価 + ポイント) - (v4 + 原価 - 送料の税 + 返品の管理手数料 + 返金の範囲)'
 });
 
 recordResult(
@@ -286,7 +285,7 @@ recordResult(
     unbucketed > THRESHOLDS.unbucketed_diff_jpy.warn ? 'warn' : 'info',
   unbucketed,
   THRESHOLDS.unbucketed_diff_jpy.error,
-  { total_diff_jpy: totalDiff, explainable_sum_jpy: explainableSum }
+  { resid_jpy: rec.resid, raw_diff_jpy: rec.raw_diff, explainable_sum_jpy: explainableSum }
 );
 
 // ============================================================
