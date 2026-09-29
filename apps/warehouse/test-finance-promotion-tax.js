@@ -124,5 +124,17 @@ const b10b = db.prepare(`SELECT profit_amount p, promotion_tax_jpy t FROM f_amaz
 ok(c5b.pt === 30 && c5b.p === 970 && b10b.p === -132 && b10b.t === -30, `2 回目の集計 (上書き) でも同じ: C のポイント 30・利益 970 / B の返品の日の利益 −132・値引きの税 −30 (${[c5b.pt, c5b.p, b10b.p, b10b.t]})`);
 ok(cEx === 1000 - 20,`C の税抜で引いた利益 = 1,000 − ポイント 20 (額面のまま) = 980 (${cEx})`);
 
+// 材料の無くなった日 × SKU は作り直しで消える (UPSERT だけだと古い行が残る = Company DB との突き合わせが 0 にならない。2026-09-29 F2b-1)
+{
+  const snapBefore = db.prepare(`SELECT unit_cost_snapshot s, cost_snapshot_date_jst d FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-b' AND date_jst = ?`).get(`${YM}-05`);
+  db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE seller_sku_normalized = 'sku-c' AND economic_date = ?`).run(`${YM}-10`);
+  execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
+  const c10gone = db.prepare(`SELECT COUNT(*) n FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-c' AND date_jst = ?`).get(`${YM}-10`).n;
+  const c5kept = db.prepare(`SELECT points_jpy pt FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-c' AND date_jst = ?`).get(`${YM}-05`);
+  const snapAfter = db.prepare(`SELECT unit_cost_snapshot s, cost_snapshot_date_jst d FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-b' AND date_jst = ?`).get(`${YM}-05`);
+  ok(c10gone === 0 && c5kept && c5kept.pt === 30 && JSON.stringify(snapAfter) === JSON.stringify(snapBefore),
+    `材料の無くなった日 × SKU (C の 10 日) は作り直しで消える・ほかの行 (C の 5 日) と原価の記録 (B の 5 日) は残る (${c10gone} / ${c5kept && c5kept.pt} / ${JSON.stringify(snapAfter)})`);
+}
+
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 値引きの税の分テスト ALL PASS ===');
 process.exit(failed ? 1 : 0);
