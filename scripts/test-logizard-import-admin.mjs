@@ -113,6 +113,7 @@ await ta('[3] 手の取込の流れ: 止める (知らせをすぐ送る) → �
     r = await j('/halt', { method: 'POST', body: { reason: '自動の取込がおかしい', by: 'attacker' } });
     assert.deepEqual([r.status, r.body.halted, r.body.notified, sent.length], [200, true, true, 1]);
     assert.match(sent[0], /止めた \(admin@b-faith\.biz\)/);
+    assert.ok(sent[0].includes('画面 ▶ https://bfaith-portal.onrender.com/apps/logizard-import-state/admin'), '知らせから画面を開ける (ダッシュボードのカードは作らない)');
     assert.deepEqual(S.outboxPending(db), []);   // 送れた = 送れた印
     r = await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a', by: 'attacker' } });
     assert.equal(r.status, 200, JSON.stringify(r.body));
@@ -271,6 +272,41 @@ await ta('[8] 待ちの義務は番号の後から・商品で探せる (500 件
     assert.equal((await j('/pending?product=P-0600')).body.items.length, 0);
     for (const q of ['after=x', 'limit=0', 'limit=5001', 'product=', 'after=1&after=2']) assert.equal((await j(`/pending?${q}`)).status, 400, q);
   });
+});
+
+await ta('[9] 画面 (③c-1b-3b-4b): 描ける・中の JS が組み立てられる・値は textContent だけ (innerHTML などを使わない)・JS が使う id が全部ある・手順がある・server.js は管理者だけ', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const { default: ejs } = await import('ejs');
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const file = path.join(root, 'apps', 'logizard-import-state', 'views', 'admin.ejs');
+  const html = await ejs.renderFile(file, { username: 'admin@b-faith.biz', displayName: '<script>x</script>' });
+  assert.ok(html.includes('&lt;script&gt;x&lt;/script&gt;'), '名前は escape');
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+  assert.equal(scripts.length, 1);
+  new Function(scripts[0]);   // 組み立てられる (構文の誤りが無い)。自分の画面の JS を組み立てるだけで動かさない (外からの値は入らない)
+  for (const bad of ['innerHTML', 'outerHTML', 'insertAdjacentHTML', 'document.write', 'eval(']) assert.ok(!scripts[0].includes(bad), bad);
+  const ids = new Set([...html.matchAll(/ id="([^"]+)"/g)].map((m) => m[1]));
+  // JS が使う id = $('…')・act('ボタン', '知らせ欄', …)・say('知らせ欄', …) の全部
+  const used = [...scripts[0].matchAll(/\$\('([^']+)'\)/g)].map((m) => m[1])
+    .concat([...scripts[0].matchAll(/\bact\('([^']+)', '([^']+)'/g)].flatMap((m) => [m[1], m[2]]))
+    .concat([...scripts[0].matchAll(/\bsay\('([^']+)'/g)].map((m) => m[1]));
+  assert.ok(used.length > 30);
+  for (const id of used) assert.ok(ids.has(id), `JS が使う id が画面に無い: ${id}`);
+  assert.ok(scripts[0].includes("const API = '/apps/logizard-import-state/admin-api';"));
+  for (const w of ['手順', '自分のアカウント', 'ファイル名を変えない', '結果の文', '取込の履歴', '要確認', '自動を再開', 'Render が止まっている']) assert.ok(html.includes(w), w);
+  // server.js: 画面は requireAdmin の後・JOBS_MONITOR_ENABLED の中
+  const sv = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
+  const at = sv.indexOf("app.get('/apps/logizard-import-state/admin', requireAdmin, renderLogizardImportAdminPage);");
+  assert.ok(at > 0);
+  const g = sv.lastIndexOf("if (process.env.JOBS_MONITOR_ENABLED === '1') {", at);
+  assert.ok(g > 0 && !sv.slice(g, at).includes('}'), 'JOBS_MONITOR_ENABLED の中');
+  // 画面を返す関数: no-store と管理者の名前
+  const { renderAdminPage } = await import('../apps/logizard-import-state/admin-router.js');
+  const got = {};
+  renderAdminPage({ session: { email: 'a@b', displayName: 'A' } }, { set: (k, v) => { got[k] = v; }, render: (p, l) => { got.path = p; got.locals = l; } });
+  assert.deepEqual([got['Cache-Control'], path.basename(got.path), got.locals], ['no-store', 'admin.ejs', { username: 'a@b', displayName: 'A' }]);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

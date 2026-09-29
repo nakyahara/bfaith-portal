@@ -75,6 +75,8 @@ export const v4On = () => String(process.env.LZ_MANUAL_V4 || '').trim().toLowerC
 const LEGACY_HOLDERS = Object.freeze(['auto', 'manual_daily']);
 const LEGACY_MODES = Object.freeze({ auto: ['nightly', 'test'], manual_daily: ['manual'] });
 const MINUTE = 60000;
+/** 知らせに書く画面の場所 (ダッシュボードのカードは作らない = 知らせから開く。③c-1b-3b-4b) */
+export const ADMIN_PAGE_URL = 'https://bfaith-portal.onrender.com/apps/logizard-import-state/admin';
 const PRIVATE_EVENTS = new Set(['manual_open', 'manual_complete', 'manual_cancel', 'manual_ack', 'setting', 'reapply_waive']);
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const UNRESOLVED = new Set(['importing', 'imported_unverified', 'unknown', 'partial', 'verify_failed']);
@@ -535,7 +537,7 @@ export function halt(db, { by, reason, now = Date.now() }) {
     update(db, now, { halted: 1, halted_reason: String(reason).slice(0, 300), halted_by: by, halted_at: now });
     const eventId = event(db, now, 'halt', null, by, { reason });
     // どこから止めても同じ取引で知らせを積む (送るのは定時の入口と画面。K3-4)
-    const outboxId = outboxPut(db, now, 'halt', `halt:${eventId}`, `⏸ ロジザードの毎日の商品マスタの自動の取込を止めた (${by}): ${String(reason).slice(0, 300)}\n戻し方 = ポータルの画面の「手の取込」・再開 = 未解決の取込と開いた手の取込が無いときに resume`);
+    const outboxId = outboxPut(db, now, 'halt', `halt:${eventId}`, `⏸ ロジザードの毎日の商品マスタの自動の取込を止めた (${by}): ${String(reason).slice(0, 300)}\n戻し方 = 画面の「手の取込」・再開 = 未解決の取込と開いた手の取込が無いときに resume\n画面 ▶ ${ADMIN_PAGE_URL}`);
     return { halted: true, outbox_id: outboxId };
   })();
 }
@@ -590,7 +592,7 @@ function closeForNightly(db, now, runId, by) {
   if (remaining) {
     const head = db.prepare(`SELECT DISTINCT o.product_id ${OPEN_OBLIGATIONS} ORDER BY o.id LIMIT 5`).all().map((o) => o.product_id).join(', ');
     outboxPut(db, now, 'pending_reapply', `pending:${openFingerprint(db)}:${jstDate(now)}`,
-      `⚠️ ロジザードの再適用待ちが ${remaining} 件残っている (毎晩の取込 ${runId} の成果物に無い商品・例 ${head})。Company DB の待ち・対象外かを確かめて、残す理由があれば画面で waiver`);
+      `⚠️ ロジザードの再適用待ちが ${remaining} 件残っている (毎晩の取込 ${runId} の成果物に無い商品・例 ${head})。Company DB の待ち・対象外かを確かめて、残す理由があれば画面で waiver\n画面 ▶ ${ADMIN_PAGE_URL}`);
   }
   event(db, now, 'reapply', runId, by, { closed, remaining, artifact: a ? snap.source_run_id : null });
   return { closed, remaining };
@@ -745,7 +747,7 @@ export function completeManualSession(db, { sessionId, resultText, history, note
     db.prepare('UPDATE manual_sessions SET status = ?, closed_by = ?, closed_at = ?, close_detail = ?, updated_at = ? WHERE session_id = ?').run(status, by, now, JSON.stringify(detail), now, x.session_id);
     const eventId = event(db, now, 'manual_complete', null, by, { session_id: x.session_id, status, judged, mismatches });
     const outboxId = status !== 'needs_review' ? null : outboxPut(db, now, 'manual_review', `manual_review:${x.session_id}`,
-      `⚠️ ロジザードの手の取込 ${x.session_id} が確認待ち (needs_review): ${[judged.to !== 'imported_unverified' ? `結果 = ${judged.why}` : null, mismatches.length ? `履歴と合わない = ${mismatches.join('・')}` : null].filter(Boolean).join('・')}。ロジザードの履歴を見て画面で確認 (ack) するまで自動を再開できない`);
+      `⚠️ ロジザードの手の取込 ${x.session_id} が確認待ち (needs_review): ${[judged.to !== 'imported_unverified' ? `結果 = ${judged.why}` : null, mismatches.length ? `履歴と合わない = ${mismatches.join('・')}` : null].filter(Boolean).join('・')}。ロジザードの履歴を見て画面で確認 (ack) するまで自動を再開できない\n画面 ▶ ${ADMIN_PAGE_URL}`);
     return { session_id: x.session_id, status, judged, mismatches, event_id: eventId, outbox_id: outboxId };
   })();
 }

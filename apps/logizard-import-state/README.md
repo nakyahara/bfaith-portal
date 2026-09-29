@@ -58,11 +58,24 @@ server.js の `JOBS_MONITOR_ENABLED` の中で、**どの body parser よりも�
 - `GET /pending[?after&limit&product]` = 待ちの義務 (番号の後から・商品で探す = 何件あっても全部に届く)。
 - `POST /halt`・`/resume`・`/resolve`・`/mark-unknown`・`/manual/open` (毎晩の成果物)・`/manual/open-gas?lz_account&target_as_of` (本文 = GAS の CSV のバイト列)・`GET /manual/:id/csv` (attachment・no-store・nosniff)・`/manual/:id/complete`・`/cancel`・`/ack`・`/waive`・`/settings`。
 - 止める・終える (needs_review) の後は、**今回積んだ知らせを真っ先に**すぐ送る (前の知らせが溜まっていても・要対応スペース `GCHAT_WEBHOOK_JOBS`。応答の `notified` = 今回の知らせを送れたか。送れない = outbox に残る = 定時の入口が送り直す)。
-- ブラウザの画面と手順書は 3b-4b。
+- **画面 (③c-1b-3b-4b)** = `https://bfaith-portal.onrender.com/apps/logizard-import-state/admin` (管理者だけ = requireAdmin・`views/admin.ejs`)。ダッシュボードのカードは作らない = GChat の知らせ (止めた・要確認・再適用待ち) に画面の場所を書く。
+  値は全部 textContent で出す (結果の文・メモ・商品 ID・アカウントは信用しない値)。画面の中に手順 (📖 はじめに読む) がある。
+
+## 手順書 (手の取込・どの端末でも)
+画面の「📖 手順」と同じ。
+1. いつ使う = 自動が止まったと GChat (要対応) に来た / miniPC が動かない / 今日のうちに取り込みたい。
+2. 自動を止める (理由) → GChat に知らせ。
+3. 手の取込を始める: **自分のロジザードのアカウント** (共通アカウントは使わない)・CSV = 毎晩の成果物の一番新しい判定 pass。
+4. CSV をダウンロード → ロジザードの商品マスタの取込の画面に**そのファイルをそのまま** (ファイル名を変えない) → 実行。
+5. 結果の文をコピー・取込の履歴のファイル名・日時 (分まで・始めた分の次の分から)・アカウントを入れて「終える」。
+6. 全部合う = 完了 / 合わない = 要確認 → ロジザードの履歴を見てメモを書いて「確認」。置かなかった = 取り消し。
+7. 原因が直ったら「自動を再開」→ 次の夜の自動が Company DB の値で入れ直す (再適用待ちが減る)。残り続ける商品は理由を書いて waiver。
+8. 画面が開かない (Render が止まっている) = 手の取込は始められない = Render を待つ (急ぐ = 中原さんの判断でシステム全体の GAS への戻し)。
+9. 手の取込は旗 `LZ_MANUAL_V4=on` (Render の env) が立ってから (切替のとき)。GAS の CSV は移行の段階 (transition) の間だけ。
 
 ## 使い方 (人)
 `tools/logizard-automation/import-state-cli.js` (status / init / adopt / recover / halt / resume / resolve)。README = `tools/logizard-automation/README.md`。
 
 ## 試験
-`node scripts/test-logizard-import-admin.mjs` (画面の口・8 件)。
+`node scripts/test-logizard-import-admin.mjs` (画面の口・画面・9 件)。
 `node scripts/test-logizard-import-state.mjs` (28 件)。手の取込・義務・成果物・outbox・設定の口 (画面・CLI) は 3b-2b 以降 (この段階では関数だけ = 使えない)。

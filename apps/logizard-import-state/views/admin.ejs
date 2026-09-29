@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ロジザードの取込 (戻し方) | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .lz-wrap { max-width: 1100px; margin: 0 auto; padding: 12px 16px; }
+    .lz-box { background: #f8f9fa; border-radius: 8px; padding: 12px 16px; margin-bottom: 14px; }
+    .lz-box h2 { font-size: 1.05em; margin: 0 0 8px; }
+    .lz-box p.hint { font-size: 0.86em; color: #495057; margin: 4px 0; line-height: 1.6; }
+    .lz-warn { background: #fff3bf; }
+    .lz-bad { background: #ffe3e3; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+    .row label { font-size: 0.9em; }
+    .row input[type=text], .row select, .row textarea, .row input[type=datetime-local] { padding: 5px 6px; font-size: 0.9em; }
+    textarea { width: 100%; min-height: 60px; box-sizing: border-box; }
+    .btn-sm { padding: 5px 12px; font-size: 0.9em; cursor: pointer; white-space: nowrap; }
+    .btn-sm:disabled { opacity: 0.35; cursor: default; }
+    .msg { font-size: 0.9em; margin: 6px 0; min-height: 1.2em; } .msg.err { color: #c92a2a; } .msg.ok { color: #2b8a3e; }
+    table.lz { width: 100%; border-collapse: collapse; font-size: 0.84em; background: #fff; }
+    table.lz th, table.lz td { border-bottom: 1px solid #dee2e6; padding: 4px 6px; text-align: left; vertical-align: top; word-break: break-all; }
+    table.lz th { background: #f1f3f5; white-space: nowrap; }
+    .tbox { max-height: 45vh; overflow: auto; border: 1px solid #dee2e6; }
+    .kv { font-size: 0.9em; line-height: 1.8; } .kv b { display: inline-block; min-width: 9em; color: #495057; font-weight: normal; }
+    pre.v { background: #fff; border: 1px solid #dee2e6; padding: 6px 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; font-size: 0.85em; max-height: 200px; overflow: auto; }
+    .muted { color: #868e96; }
+    details.manual { background: #fff; border: 1px solid #adb5bd; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; }
+    details.manual li { margin: 4px 0; line-height: 1.6; font-size: 0.92em; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📦 ロジザードの取込 (戻し方)</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= displayName || username %></span>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="lz-wrap">
+    <div class="lz-box">
+      <p class="hint">
+        ロジザードの毎日の商品マスタの取込は、ふだんは <b>毎晩の自動 (miniPC)</b> だけです。自動が止まった・miniPC が動かない・急ぐときに、
+        <b>どの端末からでも、この画面で「手の取込」を始めて、ロジザードの画面で取り込みます</b>。取り込んだ商品は、次の夜の自動が Company DB の値で入れ直します。
+      </p>
+      <div class="kv" id="summary">読み込み中…</div>
+      <div class="msg" id="msg-top"></div>
+    </div>
+
+    <details class="manual" id="manual">
+      <summary><b>📖 手順 (はじめに読む)</b></summary>
+      <ol>
+        <li><b>いつ使う</b>: 自動が止まったと GChat (要対応) に知らせが来た / miniPC が動かない / 今日のうちに取り込みたい。</li>
+        <li><b>自動を止める</b> (まだ止まっていなければ): 下の「自動を止める」に理由を書いて押す。止めると GChat に知らせが行きます。</li>
+        <li><b>手の取込を始める</b>: 使うロジザードの<b>自分のアカウント</b>を選ぶ (共通アカウントは使わない = Stream Deck とぶつかる)。CSV は「毎晩の成果物」の一番新しい <b>判定 pass</b> を選ぶ。</li>
+        <li><b>CSV をダウンロード</b>して、ロジザードの商品マスタの取込の画面に<b>そのファイルをそのまま</b>置いて実行する (<b>ファイル名を変えない</b>・ほかの CSV を置かない)。</li>
+        <li>ロジザードに出た<b>結果の文</b> (「インポート結果 総件数 : … エラー件数 : …」) をコピーして貼る。</li>
+        <li>ロジザードの<b>取込の履歴</b>で、今の取込の<b>ファイル名・日時 (分まで)・アカウント</b>を見て入れ、「終える」を押す。</li>
+        <li>全部合えば <b>完了</b>。合わない・エラーがある = <b>要確認</b> (GChat に知らせ)。ロジザードの履歴を見て、何が起きたかをメモに書いて「確認」を押す。</li>
+        <li>ロジザードに置かなかった = 「取り消し」(メモ必須)。</li>
+        <li>原因が直ったら「<b>自動を再開</b>」。次の夜の自動が、手で取り込んだ商品を Company DB の値で入れ直します (下の「再適用待ち」が減る)。</li>
+        <li>再適用待ちが何日も残る商品は、Company DB の対象外などの理由を確かめて、理由を書いて閉じる (waiver)。</li>
+        <li><b>この画面が開かない (Render が止まっている)</b> = 手の取込は始められない。Render が戻るのを待つ。急ぐときは中原さんの判断でシステム全体の戻し (GAS への戻し) の手順。</li>
+        <li>GAS の CSV を使うのは <b>移行の段階 (transition) の間だけ</b>。切替の後は使えない。</li>
+      </ol>
+    </details>
+
+    <div class="lz-box hidden" id="box-unresolved">
+      <h2>⚠️ 未解決の取込</h2>
+      <div class="kv" id="unresolved-info"></div>
+      <p class="hint">ロジザードのインポート履歴を見てから解除する。一部だけ (partial) は、対象外の列に差が無い・差のある商品が全部次の夜の対象にある、か、人が直した、が要る。</p>
+      <div class="row">
+        <label>結果 <select id="rs-outcome"><option value="imported">取り込まれていた</option><option value="not_imported">取り込まれていない</option><option value="partial">一部だけ</option></select></label>
+        <label><input type="checkbox" id="rs-nontarget"> 対象外の列に差が無い</label>
+        <label><input type="checkbox" id="rs-allnext"> 差のある商品が全部次の夜の対象</label>
+        <label><input type="checkbox" id="rs-repaired"> 人が直した</label>
+      </div>
+      <div class="row"><textarea id="rs-note" placeholder="何を確かめたか (4〜500 字)"></textarea></div>
+      <div class="row"><button class="btn-sm" id="btn-resolve">解除する</button> <button class="btn-sm hidden" id="btn-unknown">importing のまま (鍵が切れた) を unknown にする</button></div>
+      <div class="msg" id="msg-resolve"></div>
+    </div>
+
+    <div class="lz-box">
+      <h2>⏸ 自動を止める / 再開</h2>
+      <div class="row" id="row-halt"><input type="text" id="halt-reason" size="40" placeholder="止める理由 (4〜500 字)"> <button class="btn-sm" id="btn-halt">自動を止める</button></div>
+      <div class="row" id="row-resume"><input type="text" id="resume-note" size="40" placeholder="再開のメモ (4〜500 字)"> <button class="btn-sm" id="btn-resume">自動を再開</button></div>
+      <div class="msg" id="msg-halt"></div>
+    </div>
+
+    <div class="lz-box" id="box-manual">
+      <h2>🖐 手の取込</h2>
+      <div id="manual-start">
+        <p class="hint" id="start-hint"></p>
+        <div class="row">
+          <label>ロジザードのアカウント <select id="st-account"></select></label>
+        </div>
+        <div class="row">
+          <label><input type="radio" name="st-src" value="artifact" checked> 毎晩の成果物</label>
+          <select id="st-artifact"></select>
+        </div>
+        <div class="row hidden" id="row-gas">
+          <label><input type="radio" name="st-src" value="gas"> GAS の CSV (移行の間だけ)</label>
+          <input type="file" id="st-gas-file" accept=".csv">
+          <label>対象の日 <input type="date" id="st-gas-date"></label>
+        </div>
+        <div class="row"><button class="btn-sm" id="btn-start">手の取込を始める</button></div>
+      </div>
+      <div id="manual-open" class="hidden">
+        <div class="kv" id="open-info"></div>
+        <div class="row"><a class="btn-sm" id="open-download" href="#">⬇ CSV をダウンロード</a> <span class="muted">ロジザードに置くのはこのファイルだけ (ファイル名を変えない)</span></div>
+        <div class="row"><textarea id="cp-result" placeholder="ロジザードに出た結果の文 (インポート結果 総件数 : … エラー件数 : …)"></textarea></div>
+        <div class="row">
+          <label>履歴のファイル名 <input type="text" id="cp-file" size="40"></label>
+          <label>履歴の日時 (分まで・日本時間) <input type="datetime-local" id="cp-at" step="60"></label>
+          <label>履歴のアカウント <select id="cp-account"></select></label>
+        </div>
+        <div class="row"><textarea id="cp-note" placeholder="メモ (なくてもよい・500 字まで)"></textarea></div>
+        <div class="row"><button class="btn-sm" id="btn-complete">終える</button></div>
+        <div class="row"><input type="text" id="cancel-note" size="40" placeholder="取り消しの理由 (ロジザードに置かなかった・4〜500 字)"> <button class="btn-sm" id="btn-cancel">取り消し</button></div>
+      </div>
+      <div id="manual-review" class="hidden lz-warn" style="padding: 8px; border-radius: 6px;">
+        <b>⚠️ 要確認 (needs_review)</b> — 確認するまで自動を再開できません
+        <div class="kv" id="review-info"></div>
+        <pre class="v" id="review-text"></pre>
+        <div class="row"><textarea id="ack-note" placeholder="ロジザードの履歴を見て分かったこと (4〜500 字)"></textarea></div>
+        <div class="row"><button class="btn-sm" id="btn-ack">確認した</button></div>
+      </div>
+      <div class="msg" id="msg-manual"></div>
+    </div>
+
+    <div class="lz-box">
+      <h2>🔁 再適用待ち (次の夜の自動が入れ直す商品)</h2>
+      <div class="kv" id="pending-info"></div>
+      <div class="row"><input type="text" id="pending-product" size="24" placeholder="商品 ID で探す"> <button class="btn-sm" id="btn-pending-find">探す</button> <button class="btn-sm" id="btn-pending-first">はじめから</button> <button class="btn-sm" id="btn-pending-next">つぎ</button></div>
+      <div class="tbox"><table class="lz"><thead><tr><th></th><th>番号</th><th>商品 ID</th><th>手の取込</th><th>いつ</th></tr></thead><tbody id="pending-rows"></tbody></table></div>
+      <div class="row"><input type="text" id="waive-note" size="40" placeholder="残す理由 (Company DB の対象外など・4〜500 字)"> <button class="btn-sm" id="btn-waive">選んだものを閉じる (waiver)</button></div>
+      <div class="msg" id="msg-pending"></div>
+    </div>
+
+    <div class="lz-box">
+      <h2>📨 送れていない知らせ</h2>
+      <div class="tbox"><table class="lz"><thead><tr><th>いつ</th><th>種類</th><th>中身</th></tr></thead><tbody id="outbox-rows"></tbody></table></div>
+    </div>
+
+    <div class="lz-box">
+      <h2>⚙ 設定</h2>
+      <div class="row"><label>手の取込で使うロジザードのアカウント (カンマ区切り) <input type="text" id="set-accounts" size="40"></label> <button class="btn-sm" id="btn-accounts">保存</button></div>
+      <div class="row"><label>移行の段階 <select id="set-phase"><option value="transition">transition (移行の間 = GAS の CSV も使える)</option><option value="cutover">cutover (切替の後 = GAS の CSV は使えない・戻せない)</option></select></label> <button class="btn-sm" id="btn-phase">保存</button></div>
+      <div class="msg" id="msg-settings"></div>
+    </div>
+
+    <div class="lz-box">
+      <h2>📦 毎晩の成果物 (新しい順)</h2>
+      <div class="tbox"><table class="lz"><thead><tr><th>実行 ID</th><th>対象の日</th><th>判定</th><th>行数</th><th>受け取った</th></tr></thead><tbody id="artifact-rows"></tbody></table></div>
+    </div>
+
+    <div class="lz-box">
+      <h2>🧾 最近の手の取込・出来事</h2>
+      <div class="tbox"><table class="lz"><thead><tr><th>手の取込</th><th>状態</th><th>誰</th><th>始めた</th><th>アカウント</th><th>行数</th></tr></thead><tbody id="session-rows"></tbody></table></div>
+      <div class="tbox" style="margin-top: 8px;"><table class="lz"><thead><tr><th>いつ</th><th>出来事</th><th>誰</th><th>中身</th></tr></thead><tbody id="event-rows"></tbody></table></div>
+    </div>
+  </div>
+
+  <script>
+  (() => {
+    // 値は全部 textContent で出す (ロジザードの結果の文・メモ・商品 ID・アカウントは信用しない値。Codex #1541 R1)
+    const API = '/apps/logizard-import-state/admin-api';
+    const $ = (id) => document.getElementById(id);
+    const el = (tag, text, attrs) => { const e = document.createElement(tag); if (text != null) e.textContent = String(text); if (attrs) for (const k of Object.keys(attrs)) e.setAttribute(k, attrs[k]); return e; };
+    const clear = (node) => { while (node.firstChild) node.removeChild(node.firstChild); };
+    const jst = (ms) => (ms == null ? '-' : new Date(Number(ms) + 9 * 3600000).toISOString().slice(0, 16).replace('T', ' '));
+    const say = (id, text, ok) => { const m = $(id); m.textContent = text || ''; m.className = 'msg ' + (ok ? 'ok' : 'err'); };
+    async function call(path, { method = 'GET', body, raw } = {}) {
+      const opt = { method, headers: { Accept: 'application/json' }, credentials: 'same-origin' };
+      if (raw) { opt.headers['Content-Type'] = 'application/octet-stream'; opt.body = raw; }
+      else if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+      const r = await fetch(API + path, opt);
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) throw new Error(j.message || j.error || ('HTTP ' + r.status));
+      return j;
+    }
+    const kv = (node, pairs) => { clear(node); for (const [k, v] of pairs) { const d = el('div'); d.appendChild(el('b', k)); d.appendChild(document.createTextNode(' ' + (v == null || v === '' ? '-' : String(v)))); node.appendChild(d); } };
+    const fillSelect = (sel, items, current) => { clear(sel); for (const [value, label] of items) { const o = el('option', label); o.value = value; if (value === current) o.selected = true; sel.appendChild(o); } };
+    let S = null, pendingAfter = 0, pendingNext = null, pendingProduct = null;
+
+    async function load() {
+      try {
+        S = await call('/status');
+      } catch (e) { say('msg-top', '読み込めない: ' + e.message); return; }
+      const st = S.status;
+      if (!st.initialized) { $('summary').textContent = 'ポータルの取込の状態がまだ初期化されていない'; return; }
+      const m = S.manual_sessions || {};
+      kv($('summary'), [
+        ['取込の状態', st.state + (st.run ? ' (' + st.run.run_id + ')' : '')],
+        ['自動', st.halted ? '⏸ 止めてある: ' + (st.halted_reason || '') + ' (' + (st.halted_by || '') + '・' + jst(st.halted_at) + ')' : '▶ 動く'],
+        ['鍵', st.lock ? st.lock.holder + '・' + st.lock.purpose + '・' + st.lock.run_id + ' (期限 ' + jst(st.lock.expires_at) + ')' : 'なし'],
+        ['手の取込 (旗)', st.manual && st.manual.v4 ? '使える (LZ_MANUAL_V4)' : 'まだ使えない (LZ_MANUAL_V4 が立っていない)'],
+        ['再適用待ち', (S.pending ? S.pending.count : 0) + ' 件'],
+        ['送れていない知らせ', (S.outbox || []).length + ' 件'],
+      ]);
+      // 未解決
+      const unresolved = ['unknown', 'partial', 'verify_failed'].includes(st.state);
+      const stuck = st.state === 'importing' && !st.lock;
+      $('box-unresolved').classList.toggle('hidden', !(unresolved || stuck));
+      $('btn-resolve').classList.toggle('hidden', !unresolved);
+      $('btn-unknown').classList.toggle('hidden', !stuck);
+      if (unresolved || stuck) kv($('unresolved-info'), [['状態', st.state], ['実行 ID', st.run && st.run.run_id], ['結果', st.run && st.run.detail ? JSON.stringify(st.run.detail.result_detail || st.run.detail.verify_detail || {}) : '']]);
+      // 止める / 再開
+      $('row-halt').classList.toggle('hidden', !!st.halted);
+      $('row-resume').classList.toggle('hidden', !st.halted);
+      // 手の取込
+      const accounts = (S.settings && S.settings.lz_accounts) || [];
+      const open = m.open, review = m.needs_review_unacked;
+      $('manual-start').classList.toggle('hidden', !!(open || review));
+      $('manual-open').classList.toggle('hidden', !open);
+      $('manual-review').classList.toggle('hidden', !review);
+      $('start-hint').textContent = !st.halted ? '始めるには、先に自動を止める。' : !accounts.length ? '先に設定で「手の取込で使うロジザードのアカウント」を入れる。' : '';
+      fillSelect($('st-account'), accounts.map((a) => [a, a]), accounts[0]);
+      fillSelect($('st-artifact'), (S.artifacts || []).filter((a) => a.verdict === 'pass').map((a) => [a.source_run_id, a.target_as_of + ' ・ ' + a.rows + ' 行 ・ ' + a.source_run_id]));
+      $('row-gas').classList.toggle('hidden', !(S.settings && S.settings.cutover_phase === 'transition'));
+      if (open) {
+        kv($('open-info'), [['手の取込', open.session_id], ['始めた', jst(open.opened_at) + ' (' + open.opened_by + ')'], ['CSV', (open.source_kind === 'gas_upload' ? 'GAS の CSV' : '毎晩の成果物 ' + open.source_run_id) + '・対象の日 ' + open.target_as_of + '・' + open.rows + ' 行'], ['ファイル名', open.download_name], ['アカウント', open.lz_account]]);
+        $('open-download').setAttribute('href', API + '/manual/' + encodeURIComponent(open.session_id) + '/csv');
+        if (!$('cp-file').value) $('cp-file').value = open.download_name;
+        fillSelect($('cp-account'), accounts.map((a) => [a, a]), open.lz_account);
+      }
+      if (review) {
+        const d = review.close_detail || {};
+        kv($('review-info'), [['手の取込', review.session_id], ['合わなかったもの', (d.mismatches || []).join('・') || '(なし)'], ['結果の読み', d.judged ? d.judged.to + ' / ' + d.judged.why : ''], ['履歴', d.history ? d.history.fileName + '・' + jst(d.history.at) + '・' + d.history.account : '']]);
+        $('review-text').textContent = d.result_text || '';
+      }
+      renderPending(S.pending);
+      const ob = $('outbox-rows'); clear(ob);
+      for (const o of S.outbox || []) { const tr = el('tr'); tr.appendChild(el('td', jst(o.created_at))); tr.appendChild(el('td', o.kind)); tr.appendChild(el('td', o.text)); ob.appendChild(tr); }
+      $('set-accounts').value = accounts.join(', ');
+      $('set-phase').value = (S.settings && S.settings.cutover_phase) || 'cutover';
+      const ar = $('artifact-rows'); clear(ar);
+      for (const a of S.artifacts || []) { const tr = el('tr'); for (const v of [a.source_run_id, a.target_as_of, a.verdict, a.rows, jst(a.received_at)]) tr.appendChild(el('td', v)); ar.appendChild(tr); }
+      const sr = $('session-rows'); clear(sr);
+      for (const x of m.recent || []) { const tr = el('tr'); for (const v of [x.session_id, x.status + (x.ack_at ? ' (確認済み)' : ''), x.opened_by, jst(x.opened_at), x.lz_account, x.rows]) tr.appendChild(el('td', v)); sr.appendChild(tr); }
+      const er = $('event-rows'); clear(er);
+      for (const e of st.events || []) { const tr = el('tr'); for (const v of [jst(e.at), e.kind, e.by || '', e.detail ? JSON.stringify(e.detail).slice(0, 300) : '']) tr.appendChild(el('td', v)); er.appendChild(tr); }
+    }
+
+    function renderPending(p) {
+      const tb = $('pending-rows'); clear(tb);
+      if (!p) return;
+      kv($('pending-info'), [['残っている', p.count + ' 件']]);
+      for (const o of p.items || []) {
+        const tr = el('tr');
+        const td = el('td'); const cb = el('input', null, { type: 'checkbox' }); cb.dataset.id = String(o.id); td.appendChild(cb); tr.appendChild(td);
+        for (const v of [o.id, o.product_id, o.session_id, jst(o.created_at)]) tr.appendChild(el('td', v));
+        tb.appendChild(tr);
+      }
+      pendingNext = p.next_after;
+      $('btn-pending-next').disabled = pendingNext == null;
+    }
+    async function loadPending() {
+      const q = new URLSearchParams();
+      if (pendingAfter) q.set('after', String(pendingAfter));
+      if (pendingProduct) q.set('product', pendingProduct);
+      try { renderPending(await call('/pending' + (q.toString() ? '?' + q : ''))); } catch (e) { say('msg-pending', e.message); }
+    }
+
+    const act = (btn, msgId, fn) => $(btn).addEventListener('click', async () => {
+      $(btn).disabled = true;
+      try { const r = await fn(); say(msgId, r || '済み', true); await load(); } catch (e) { say(msgId, e.message); } finally { $(btn).disabled = false; }
+    });
+    act('btn-halt', 'msg-halt', async () => { const r = await call('/halt', { method: 'POST', body: { reason: $('halt-reason').value } }); return '止めた' + (r.notified ? ' (GChat に知らせた)' : ' (知らせは後で送り直す)'); });
+    act('btn-resume', 'msg-halt', async () => { await call('/resume', { method: 'POST', body: { note: $('resume-note').value } }); return '再開した'; });
+    act('btn-start', 'msg-manual', async () => {
+      const account = $('st-account').value;
+      const src = document.querySelector('input[name=st-src]:checked').value;
+      if (src === 'gas') {
+        const f = $('st-gas-file').files[0];
+        if (!f) throw new Error('GAS の CSV を選ぶ');
+        const q = new URLSearchParams({ lz_account: account, target_as_of: $('st-gas-date').value });
+        await call('/manual/open-gas?' + q, { method: 'POST', raw: f });
+      } else {
+        await call('/manual/open', { method: 'POST', body: { lz_account: account, source_run_id: $('st-artifact').value } });
+      }
+      $('cp-file').value = ''; $('cp-result').value = ''; $('cp-note').value = '';
+      return '始めた。CSV をダウンロードしてロジザードで取り込む';
+    });
+    act('btn-complete', 'msg-manual', async () => {
+      const v = $('cp-at').value;   // YYYY-MM-DDTHH:MM = 日本時間として読む
+      const at = v ? Date.parse(v.slice(0, 16) + ':00+09:00') : NaN;
+      if (!Number.isFinite(at)) throw new Error('履歴の日時を入れる');
+      const r = await call('/manual/' + encodeURIComponent(S.manual_sessions.open.session_id) + '/complete', { method: 'POST',
+        body: { result_text: $('cp-result').value, history: { file_name: $('cp-file').value, at, account: $('cp-account').value }, note: $('cp-note').value || null } });
+      return r.status === 'completed_ok' ? '完了 (照合が全部合った)' : '要確認 (needs_review): ' + (r.mismatches || []).join('・') + ' ' + (r.judged ? r.judged.why : '');
+    });
+    act('btn-cancel', 'msg-manual', async () => { await call('/manual/' + encodeURIComponent(S.manual_sessions.open.session_id) + '/cancel', { method: 'POST', body: { note: $('cancel-note').value } }); return '取り消した'; });
+    act('btn-ack', 'msg-manual', async () => { await call('/manual/' + encodeURIComponent(S.manual_sessions.needs_review_unacked.session_id) + '/ack', { method: 'POST', body: { note: $('ack-note').value } }); return '確認した'; });
+    act('btn-resolve', 'msg-resolve', async () => {
+      const outcome = $('rs-outcome').value;
+      const pc = $('rs-nontarget').checked && $('rs-allnext').checked ? { non_target_unchanged: true, all_in_next_csv: true } : null;
+      await call('/resolve', { method: 'POST', body: { run_id: S.status.run.run_id, outcome, note: $('rs-note').value, partial_check: pc, repaired: $('rs-repaired').checked } });
+      return '解除した';
+    });
+    act('btn-unknown', 'msg-resolve', async () => { await call('/mark-unknown', { method: 'POST', body: { run_id: S.status.run.run_id, reason: $('rs-note').value || null } }); return 'unknown にした (次に解除する)'; });
+    act('btn-waive', 'msg-pending', async () => {
+      const ids = [...document.querySelectorAll('#pending-rows input[type=checkbox]:checked')].map((c) => Number(c.dataset.id));
+      if (!ids.length) throw new Error('閉じる義務を選ぶ');
+      const r = await call('/waive', { method: 'POST', body: { obligation_ids: ids, note: $('waive-note').value } });
+      return r.waived + ' 件を閉じた';
+    });
+    act('btn-accounts', 'msg-settings', async () => {
+      const list = $('set-accounts').value.split(',').map((s) => s.trim()).filter(Boolean);
+      await call('/settings', { method: 'POST', body: { key: 'lz_accounts', value: list } });
+      return '保存した';
+    });
+    act('btn-phase', 'msg-settings', async () => {
+      const v = $('set-phase').value;
+      if (v === 'cutover' && !confirm('cutover にすると GAS の CSV は使えなくなり、transition には戻せません。よいですか')) throw new Error('やめた');
+      await call('/settings', { method: 'POST', body: { key: 'cutover_phase', value: v } });
+      return '保存した';
+    });
+    $('btn-pending-find').addEventListener('click', () => { pendingProduct = $('pending-product').value.trim() || null; pendingAfter = 0; loadPending(); });
+    $('btn-pending-first').addEventListener('click', () => { pendingProduct = null; $('pending-product').value = ''; pendingAfter = 0; loadPending(); });
+    $('btn-pending-next').addEventListener('click', () => { if (pendingNext != null) { pendingAfter = pendingNext; loadPending(); } });
+    load();
+  })();
+  </script>
+</body>
+</html>
