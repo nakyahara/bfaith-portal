@@ -143,7 +143,7 @@ const BASE = `http://127.0.0.1:${server.address().port}/apps/company-db/sync`;
 process.env.MIRROR_SYNC_KEY = 'k';
 process.env.COMPANY_DB_URL = 'postgres://pglite';
 const reader = () => new Database(path.join(tmpDir, 'warehouse.db'), { readonly: true });
-const BIG = { limitBytes: 1e15, rowBytes: 1000, replaceFactor: 2, walAllowanceBytes: 0, marginBytes: 0 };
+const BIG = { limitBytes: 1e15, rowBytes: 1000, replaceFactor: 2, walAllowanceBytes: 0, marginBytes: 0, orderBytes: 300 };
 const pushClose = async (ledger, x) => { const w = reader(); try { return await pushAmazonFinance({ warehouse: w, ledger, base: BASE, syncKey: 'k', log: quiet, sleep: async () => {}, capacity: BIG, ...x }); } finally { w.close(); } };
 const newLedger = () => { const l = openLedger(tmpDir, { memory: true, kind: FINANCE_KIND }); l.markInitialized(); return l; };
 const renderDaily = async (from, to) => (await all(`select economic_date_jst::text as date_jst, seller_sku, units_ordered, units_refunded_customer, units_marketplace_guarantee, units_a_to_z_refund, units_net_sold,
@@ -388,11 +388,11 @@ await t('鍵の分からない不正な行 (注文番号なし・計上日が読
 await t('容量の見張り: 上限が無ければ送らない / いまは 80% 未満でも次の chunk を足すと超えるなら送らずに止める / 送った分を足して見込む', async () => {
   assert.throws(() => capacityGuard({ limitBytes: 0, rowBytes: 1, replaceFactor: 1, walAllowanceBytes: 0, marginBytes: 0, fetchStatus: async () => ({}) }), /CDB_DB_LIMIT_BYTES/);
   let calls = 0;
-  const g = capacityGuard({ limitBytes: 1000, rowBytes: 10, replaceFactor: 2, walAllowanceBytes: 50, marginBytes: 0, refreshEvery: 100, fetchStatus: async () => { calls++; return { size: { db_bytes: 600, wal_bytes: null } }; } });
+  const g = capacityGuard({ limitBytes: 1000, rowBytes: 10, replaceFactor: 2, walAllowanceBytes: 50, marginBytes: 0, orderBytes: 1, refreshEvery: 100, fetchStatus: async () => { calls++; return { size: { db_bytes: 600, wal_bytes: null } }; } });
   await g({ lines: 5, mustOwn: () => {} });            // DB 600 + WAL の見込み 50 + 次の 5 行 × 10 × 2 = 750 < 800
   await assert.rejects(g({ lines: 5, mustOwn: () => {} }), /超える/);   // 650 + 送った分 100 + 次の 100 = 850 > 800 (いまの 650 は 80% 未満)
   assert.equal(calls, 1);
-  const g2 = capacityGuard({ limitBytes: 1000, rowBytes: 1, replaceFactor: 1, walAllowanceBytes: 0, marginBytes: 0, fetchStatus: async () => ({ size: {} }) });
+  const g2 = capacityGuard({ limitBytes: 1000, rowBytes: 1, replaceFactor: 1, walAllowanceBytes: 0, marginBytes: 0, orderBytes: 1, fetchStatus: async () => ({ size: {} }) });
   await assert.rejects(g2({ lines: 1, mustOwn: () => {} }), /db_bytes/);
   // 送り手の通しでも: 小さな上限なら何も送らずに止まる
   const L = newLedger();
@@ -465,21 +465,22 @@ await t('疑似注文を止めた回が送信の途中で落ちても、止め�
   assert.equal(r.ok, true, JSON.stringify(r.transformErrors)); assert.deepEqual(retryStore(L0).list(), []);
 });
 await t('受け口が受け取らない注文番号は その注文だけ送れない鍵にする (同じ chunk の正常な注文は送る)・行が消えたら一覧から外れる (#1534 Codex R1 Medium)', async () => {
-  raw({ order: 'BAD/ORDER', sku: 'sku-r', date: d(MB, 24), qty: 1, ingested: '2026-06-05 00:00:00' });
+  raw({ order: 'BAD#ORDER', sku: 'sku-r', date: d(MB, 24), qty: 1, ingested: '2026-06-05 00:00:00' });
   raw({ order: 'O11', sku: 'sku-s', date: d(MB, 24), qty: 1, ingested: '2026-06-05 00:00:00' });
   const r = await pushClose(L0, { mode: 'range', from: d(MB, 24), to: d(MB, 24) });
-  assert.deepEqual(r.transformErrors.map((x) => x.key), [financeKey('BAD/ORDER')]);
+  assert.deepEqual(r.transformErrors.map((x) => x.key), [financeKey('BAD#ORDER')]);
   assert.equal(r.failed.length, 0);
   assert.equal(Number((await one(`select count(*) as n from core.order_finance_daily where mall_order_no = 'O11'`)).n), 1);
-  assert.ok(retryStore(L0).list().some((f) => f.key === financeKey('BAD/ORDER') || f.key === financeKey('O-FRAC')));
-  wdb.prepare(`delete from raw_amazon_settlement_lines where amazon_order_id = 'BAD/ORDER'`).run();
+  assert.ok(retryStore(L0).list().some((f) => f.key === financeKey('BAD#ORDER') || f.key === financeKey('O-FRAC')));
+  wdb.prepare(`delete from raw_amazon_settlement_lines where amazon_order_id = 'BAD#ORDER'`).run();
   const r2 = await pushClose(L0, { mode: 'range', from: d(MB, 24), to: d(MB, 24) });
   assert.equal(r2.transformErrors.length, 0);
   assert.deepEqual(retryStore(L0).list(), []);
 });
 await t('容量の見張り: 空の集合で消す行も数える (max(前, 新))・注文ごとの受領の分・期限超過の予約は戻す・1 行の大きさと倍率は 0 を許さない (#1534 Codex R3)', async () => {
   assert.throws(() => capacityGuard({ limitBytes: 1000, rowBytes: 0, replaceFactor: 1, walAllowanceBytes: 0, marginBytes: 0, fetchStatus: async () => ({}) }), /0 より大きい/);
-  assert.throws(() => capacityGuard({ limitBytes: 1000, rowBytes: 1, replaceFactor: 0, walAllowanceBytes: 0, marginBytes: 0, fetchStatus: async () => ({}) }), /0 より大きい/);
+  assert.throws(() => capacityGuard({ limitBytes: 1000, rowBytes: 1, replaceFactor: 0, walAllowanceBytes: 0, marginBytes: 0, orderBytes: 1, fetchStatus: async () => ({}) }), /0 より大きい/);
+  assert.throws(() => capacityGuard({ limitBytes: 1000, rowBytes: 1, replaceFactor: 1, walAllowanceBytes: 0, marginBytes: 0, orderBytes: 0, fetchStatus: async () => ({}) }), /0 より大きい/);
   const st = async () => ({ size: { db_bytes: 100, wal_bytes: 0 } });
   const g = capacityGuard({ limitBytes: 1000, rowBytes: 1, replaceFactor: 1, walAllowanceBytes: 0, marginBytes: 0, orderBytes: 10, refreshEvery: 100, fetchStatus: st,
     weightOf: (rows) => rows.reduce((s, x) => s + (x.mall_order_no === 'BIG' ? 600 : x.lines.length), 0) });
@@ -503,6 +504,27 @@ await t('送り終えた後に lock を奪われていたら、読み直す鍵�
   assert.equal(L0.getMeta(META.watermark), wm);
   L0.putMeta('lock', '');   // 片付け (奪った体の lock を外す)
   retryStore(L0).replace([]);
+});
+await t('容量の見込みの「消える行」は Render のいまの行数 (incremental でも・台帳に頼らない。#1534 Codex R4 High)', async () => {
+  const before = Number((await one(`select count(*) as n from core.order_finance_daily where mall_order_no = 'O2'`)).n);
+  assert.ok(before >= 4);
+  // O2 を 1 行 (5 日の売上) だけにする (Render は まだ before 行)。取込時刻は窓の中
+  wdb.prepare(`delete from raw_amazon_settlement_lines where amazon_order_id = 'O2' and economic_date <> ?`).run(d(MB, 5));
+  wdb.prepare(`update raw_amazon_settlement_lines set ingested_at = '2026-06-10 00:00:00' where amazon_order_id = 'O2' and quantity_purchased is not null`).run();
+  const r = await pushClose(L0, { mode: 'incremental' });
+  assert.equal(r.ok, true); assert.ok(r.changed >= 1);
+  assert.ok(r.finance.weightLines >= before, `見込み ${r.finance.weightLines} 行 < Render の ${before} 行`);
+  assert.equal(Number((await one(`select count(*) as n from core.order_finance_daily where mall_order_no = 'O2'`)).n), 1);
+});
+await t('返送の注文番号 (+ / を含む) も送れる (本番の決済に 26 注文)', async () => {
+  raw({ order: 'a+aKPxfQ/X', date: d(MB, 26), tt: 'FBA Removal Order: Return Fee', oa: -120, ingested: '2026-06-11 00:00:00' });
+  raw({ order: '+3gubNop3S', date: d(MB, 26), tt: 'RemovalComplete', oa: -80, ingested: '2026-06-11 00:00:00' });
+  const r = await pushClose(L0, { mode: 'incremental' });
+  assert.equal(r.ok, true, JSON.stringify(r.transformErrors)); assert.equal(r.transformErrors.length, 0);
+  const n = await one(`select count(*)::int as n, sum(account_fee_amount_jpy)::int as a from core.order_finance_daily where mall_order_no in ('a+aKPxfQ/X', '+3gubNop3S') and line_kind = 'removal'`);
+  assert.deepEqual([n.n, n.a], [2, -200]);
+  const keys = await (await fetch(`${BASE}/order-finance/keys?mall=amazon&scope=jp&after=${encodeURIComponent('+')}&limit=5`, { headers: { 'x-sync-key': 'k' } })).json();
+  assert.ok(keys.keys.includes('+3gubNop3S'), JSON.stringify(keys));
 });
 await t('parseArgs: 操作は 1 つ・--from/--to は組・--all は --reconcile と', async () => {
   assert.throws(() => parseArgs([]), /どれか 1 つ/);

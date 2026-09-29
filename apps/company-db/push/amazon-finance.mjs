@@ -92,14 +92,15 @@ export function sinceOf(watermark, days = WATERMARK_LOOKBACK_DAYS) {
   return new Date(t - days * 86400000).toISOString().replace('T', ' ').slice(0, 19);
 }
 
-/** 台帳の中の「鍵ごとの前に送った集合」= 計上日の月 (未照合の月の古い側。§4.4) と行数 (置き換えで消える行 = 容量の見込み。§7) */
-function keyStateStore(ledger) {
-  ledger.db.exec(`create table if not exists finance_key_state (kind text not null, key text not null, months text not null, lines integer not null, primary key (kind, key))`);
-  const get = ledger.db.prepare(`select months, lines from finance_key_state where kind = ? and key = ?`);
-  const put = ledger.db.prepare(`insert into finance_key_state (kind, key, months, lines) values (?, ?, ?, ?) on conflict (kind, key) do update set months = excluded.months, lines = excluded.lines`);
+/** 台帳の中の「鍵ごとの前回の計上日の月」(未照合の月の古い側を取る。§4.4)。
+ *  置き換えで消える行数 (容量の見込み) は台帳に持たない = 毎回 Render の鍵の一覧の行数を正にする (台帳の欠け・送る前の上書きで小さく見込まない。#1534 Codex R4 High) */
+function keyMonthsStore(ledger) {
+  ledger.db.exec(`create table if not exists finance_key_months (kind text not null, key text not null, months text not null, primary key (kind, key))`);
+  const get = ledger.db.prepare(`select months from finance_key_months where kind = ? and key = ?`);
+  const put = ledger.db.prepare(`insert into finance_key_months (kind, key, months) values (?, ?, ?) on conflict (kind, key) do update set months = excluded.months`);
   return {
-    get: (key) => { const r = get.get(ledger.kind, key); return r ? { months: r.months.split(',').filter(Boolean), lines: Number(r.lines) } : { months: [], lines: null }; },
-    putMany: (entries) => ledger.db.transaction(() => { for (const [k, ms, n] of entries) put.run(ledger.kind, k, ms.join(','), n); })(),
+    get: (key) => { const r = get.get(ledger.kind, key); return r ? r.months.split(',').filter(Boolean) : []; },
+    putMany: (entries) => ledger.db.transaction(() => { for (const [k, ms] of entries) put.run(ledger.kind, k, ms.join(',')); })(),
   };
 }
 
@@ -181,7 +182,7 @@ export function makeIterate(sel, run) {
     if (!pseudoBlocked) for (const d of [...dates].sort()) yield { key: financeKey(pseudoOrderNo(d)), orderNo: pseudoOrderNo(d), rows: byPseudo.all(d) };
     for (const no of renderOnly.sort()) {
       if (pseudoBlocked && isPseudoOrderNo(no)) continue;
-      yield { key: financeKey(no), orderNo: no, rows: [], renderOnly: true, renderLines: ctx.pre.renderKeys.get(no) };
+      yield { key: financeKey(no), orderNo: no, rows: [], renderOnly: true };
     }
     run.persistBeforeSend(stats);   // 送る前に未照合の月と送れない鍵を台帳に書く (全部の build の後・outbox から送る前 = 送信の途中で落ちても残る)
   };
@@ -209,15 +210,15 @@ export function makeBuild(run, transformVersion = AMAZON_FINANCE_TRANSFORM_VERSI
       for (const id of stats.unmapped.exampleIds) if (s.unmapped.exampleIds.length < 5) s.unmapped.exampleIds.push(String(id));
     }
     const fp = fingerprintOf(transformVersion, payload);
-    if (ctx.fps.get(group.key) !== fp) run.noteChanged(group.key, lines, ctx.pre && ctx.pre.renderKeys ? ctx.pre.renderKeys.get(group.orderNo) : group.renderLines);
+    if (ctx.fps.get(group.key) !== fp) run.noteChanged(group.key, lines, ctx.pre && ctx.pre.renderKeys ? ctx.pre.renderKeys.get(group.orderNo) : null);
     return { key: group.key, payload, n_lines: lines.length };
   }
 }
 
 /** 容量の見張り (§7)。chunk ごとに「いまの大きさ + 送った分の見込み + 次の chunk の見込み + 余裕」が上限 × ratio を超えるなら throw */
-export function capacityGuard({ limitBytes, rowBytes, replaceFactor, walAllowanceBytes, marginBytes, orderBytes = 0, ratio = 0.8, refreshEvery = 20, fetchStatus, weightOf = null }) {
+export function capacityGuard({ limitBytes, rowBytes, replaceFactor, walAllowanceBytes, marginBytes, orderBytes, ratio = 0.8, refreshEvery = 20, fetchStatus, weightOf = null }) {
   if (!(limitBytes > 0)) throw new Error('容量の上限 (CDB_DB_LIMIT_BYTES) が無い = D-W5 (Render の Postgres のプラン) を決めるまで送らない');
-  if (!(rowBytes > 0) || !(replaceFactor > 0)) throw new Error(`容量の設定が不正: 1 行の大きさ ${rowBytes}・置き換えの倍率 ${replaceFactor} (どちらも 0 より大きい = 0 だと見張りが効かない。#1534 Codex R3 Low)`);
+  if (!(rowBytes > 0) || !(replaceFactor > 0) || !(orderBytes > 0)) throw new Error(`容量の設定が不正: 1 行の大きさ ${rowBytes}・置き換えの倍率 ${replaceFactor}・1 注文の受領の大きさ ${orderBytes} (どれも 0 より大きい = 0 だと見張りが効かない。#1534 Codex R3 Low / R4 Medium)`);
   let known = null, since = 0, n = 0;
   const state = { checks: 0, lastKnown: null, maxProjected: 0 };
   // weightOf(rows) = chunk の行数の見込み (注文ごとに max(前に送った行数, 新しい行数) = 空の集合で大量に消すのも 0 と見なさない。#1534 Codex R3 High)
@@ -284,17 +285,17 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
   const leftover = ledger.outboxKeys();
   if (!dryRun && leftover.length) retry.add(leftover.map((key) => ({ key, error: 'outbox_leftover' })));
   const sel = { mode, from, to, since, extraKeys: [...new Set([...retry.list().map((f) => f.key), ...leftover].filter((k) => typeof k === 'string'))] };
-  const store = keyStateStore(ledger);
+  const store = keyMonthsStore(ledger);
   const changedMonths = new Set(); const keyMonthsNew = []; const weight = new Map();
   const run = {
-    stats: { lines: 0, rawRows: 0, dedupRows: 0, maxLines: 0, maxLinesKey: null, maxBytes: 0, maxBytesKey: null, unmapped: { rows: 0, columns: {}, exampleIds: [] } },
+    stats: { lines: 0, rawRows: 0, dedupRows: 0, maxLines: 0, maxLinesKey: null, maxBytes: 0, maxBytesKey: null, weightLines: 0, unmapped: { rows: 0, columns: {}, exampleIds: [] } },
     noteChanged: (key, lines, renderLines = null) => {
       const ms = [...new Set(lines.map((l) => monthOf(l.economic_date_jst)))].sort();
-      const prev = store.get(key);
-      for (const m of [...prev.months, ...ms]) changedMonths.add(m);
-      keyMonthsNew.push([key, ms, lines.length]);
-      // 置き換えで消える行 = 前に送った行数 (台帳・無ければ Render の鍵の一覧の行数)。容量の見込みは max(前, 新)
-      weight.set(key, Math.max(lines.length, prev.lines ?? 0, Number.isFinite(renderLines) ? renderLines : 0));
+      for (const m of [...store.get(key), ...ms]) changedMonths.add(m);
+      keyMonthsNew.push([key, ms]);
+      // 置き換えで消える行 = Render のいまの行数 (走査の前に取った鍵の一覧)。容量の見込みは max(Render, 新)
+      const w = Math.max(lines.length, Number.isFinite(renderLines) ? renderLines : 0);
+      weight.set(key, w); run.stats.weightLines += w;
     },
     buildFailed: [],
     persistBeforeSend: (st) => {
@@ -320,7 +321,8 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
     iterate: makeIterate(sel, run), inScope: () => true, build: makeBuild(run, transformVersion), transformVersion,
     mode, scopeLabel: mode === 'range' ? `計上日 ${from}〜${to} の行を持つ注文` : mode === 'full' ? '全部 (作り直し)' : since ? `ingested_at ${since} 以後` : '全部 (watermark 無し / 変換の版が変わった)',
     chunkSize, dryRun, force, log, now, stats,
-    beforeScan: mode === 'full' ? async ({ mustOwn }) => ({ renderKeys: await fetchRenderKeys(fetchImpl, { base, syncKey, mustOwn }) }) : null,
+    // Render の鍵の一覧 (注文ごとの行数) はどの mode でも取る = --full は Render にだけある鍵・どれも容量の見込みの「消える行」(#1534 Codex R4 High)
+    beforeScan: async ({ mustOwn }) => ({ renderKeys: await fetchRenderKeys(fetchImpl, { base, syncKey, mustOwn }) }),
     beforeChunk: guard,
     receiptRows: (body) => validateFinanceChunk(body).rows,   // 受け口は行を作り直す (内容の列だけ + 付け足し) = 受領記録の指紋も同じ形で
     // failed / stale の鍵は outbox から消える前に「読み直す鍵」へ (後の chunk で落ちても失わない。#1534 Codex R2 High)
@@ -453,11 +455,12 @@ export async function reconcileAmazonFinance({ warehouse, ledger, dataDir, base,
   const diffMonths = new Set([...dailyDiffMonths, ...feeDiffMonths]);
   const left = readJson(ledger, META.unreconciled, []).filter((m) => !(fullyChecked.has(m) && !diffMonths.has(m)));
   const streak = anyDiff ? (Number(ledger.getMeta(META.diffStreak)) || 0) + 1 : 0;
-  ledger.setMeta({ [META.unreconciled]: JSON.stringify([...new Set([...left, ...diffMonths])].sort()), [META.diffStreak]: String(streak) });
+  ledger.setMeta({ [META.unreconciled]: JSON.stringify([...new Set([...left, ...diffMonths])].sort()), [META.diffStreak]: String(streak) });   // 戻り値の unreconciledLeft と同じ
   const level = !anyDiff ? 'ok' : streak >= 2 ? 'error' : 'warn';
   for (const d of dailyDiff.slice(0, 20)) log(`  差 ${d.date_jst} ${d.seller_sku}: ${d.side === 'both' ? d.columns.map((c) => `${c.c} ${c.sqlite} / ${c.render}`).join(', ') : d.side === 'sqlite_only' ? 'SQLite にだけある' : 'Render にだけある'} (SQLite / Render)`);
   for (const f of fees.slice(0, 20)) log(`  月の手数料の差 ${f.month} ${f.fee_type}: SQLite ${f.sqlite ? `${f.sqlite.amount_jpy} 円・${f.sqlite.row_count} 行` : '無し'} / Render ${f.render ? `${f.render.amount_jpy} 円・${f.render.row_count} 行` : '無し'}`);
-  return { ok: !anyDiff, level, daily: dailyDiff, fees, uncovered, checkedMonths: months, dailyDiffMonths, feeDiffMonths, streak, unreconciledLeft: left.length };
+  const saved = [...new Set([...left, ...diffMonths])].sort();
+  return { ok: !anyDiff, level, daily: dailyDiff, fees, uncovered, checkedMonths: months, dailyDiffMonths, feeDiffMonths, streak, unreconciledLeft: saved.length };
 }
 
 export function summarizeReconcile(rr, { all = false } = {}) {
@@ -516,7 +519,7 @@ export function capacityFromEnv(env = process.env) {
   const c = { limitBytes: n('CDB_DB_LIMIT_BYTES', 0), rowBytes: n('CDB_FINANCE_ROW_BYTES', 1000), replaceFactor: n('CDB_FINANCE_REPLACE_FACTOR', 2), orderBytes: n('CDB_FINANCE_ORDER_BYTES', 300),
     walAllowanceBytes: n('CDB_WAL_ALLOWANCE_BYTES', 1024 ** 3), marginBytes: n('CDB_CAPACITY_MARGIN_BYTES', 512 * 1024 ** 2) };
   for (const [k, v] of Object.entries(c)) if (!Number.isFinite(v) || v < 0) throw new Error(`容量の設定が不正: ${k} = ${v}`);
-  if (!(c.rowBytes > 0) || !(c.replaceFactor > 0)) throw new Error('容量の設定が不正: CDB_FINANCE_ROW_BYTES / CDB_FINANCE_REPLACE_FACTOR は 0 より大きく');
+  if (!(c.rowBytes > 0) || !(c.replaceFactor > 0) || !(c.orderBytes > 0)) throw new Error('容量の設定が不正: CDB_FINANCE_ROW_BYTES / CDB_FINANCE_REPLACE_FACTOR / CDB_FINANCE_ORDER_BYTES は 0 より大きく');
   return c;
 }
 

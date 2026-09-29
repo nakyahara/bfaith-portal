@@ -6,7 +6,7 @@
  *   ① 初回の投入: 表 (core.order_finance_daily / order_finance_receipts・索引こみ) の大きさ・DB 全体の増え・1 行あたり
  *   ② 全部の注文をもう 1 回置き換える (変換の版を変えて delete → insert = 死んだ行の分の一時の増え。vacuum しない)
  *   ③ 日次の view (mart.v_finance_daily) の時間: 最後の 1 か月 / 全期間。月の手数料の view も
- * 出力の 1 行あたりの大きさ・置き換えの倍率を、送り手の容量の見張り (CDB_FINANCE_ROW_BYTES / CDB_FINANCE_REPLACE_FACTOR) の値にする。
+ * 出力の「財務の 1 行 (表 + 索引)」= CDB_FINANCE_ROW_BYTES・「受領の 1 注文」= CDB_FINANCE_ORDER_BYTES・置き換えの倍率 = CDB_FINANCE_REPLACE_FACTOR (送り手の容量の見張りの値)
  * 🚨 PGlite は本物の Postgres と大きさが少し違う (ページの詰め方は同じ・TOAST も同じ)。Render での 1 か月の試しでも測る (§7)
  *
  * 使い方 (miniPC): node scripts/company-db/measure-amazon-finance.mjs --from 2026-08-01 --to 2026-08-31 [--pglite-dir <空のフォルダ>]
@@ -80,8 +80,8 @@ const tLoad = Date.now();
 await load(`${AMAZON_FINANCE_TRANSFORM_VERSION}_m`);   // 置き換え (版が違う = delete → insert)
 const s2 = await size();
 const tReplace = Date.now();
-const per = s1.n_rows ? (s1.daily + s1.receipts) / s1.n_rows : 0;
-console.log(`① 初回: 行 ${s1.n_rows.toLocaleString()} / 注文 ${s1.n_orders.toLocaleString()}・表 ${mb(s1.daily)} (本体 ${mb(s1.heap)})・受領 ${mb(s1.receipts)}・DB の増え ${mb(s1.db - s0.db)}・1 行あたり ${Math.round(per)} B (表 + 索引 + 受領) / DB の増え ÷ 行 ${Math.round((s1.db - s0.db) / Math.max(s1.n_rows, 1))} B (${((tLoad - tBuild) / 1000).toFixed(1)} 秒)`);
+console.log(`① 初回: 行 ${s1.n_rows.toLocaleString()} / 注文 ${s1.n_orders.toLocaleString()}・表 ${mb(s1.daily)} (本体 ${mb(s1.heap)})・受領 ${mb(s1.receipts)}・DB の増え ${mb(s1.db - s0.db)} (${((tLoad - tBuild) / 1000).toFixed(1)} 秒)`);
+console.log(`   → CDB_FINANCE_ROW_BYTES = 財務の 1 行 (表 + 索引) ${Math.round(s1.daily / Math.max(s1.n_rows, 1))} B / CDB_FINANCE_ORDER_BYTES = 受領の 1 注文 ${Math.round(s1.receipts / Math.max(s1.n_orders, 1))} B (受領の run の記録などを含めた DB の増え ÷ 行 = ${Math.round((s1.db - s0.db) / Math.max(s1.n_rows, 1))} B)`);
 console.log(`② 置き換え (vacuum 前): 表 ${mb(s2.daily)}・DB ${mb(s2.db)}・初回からの増え ${mb(s2.db - s1.db)}・倍率 (置き換え後 ÷ 初回の DB の増え) ${((s2.db - s0.db) / Math.max(s1.db - s0.db, 1)).toFixed(2)} (${((tReplace - tLoad) / 1000).toFixed(1)} 秒)`);
 
 // ③ view の時間
