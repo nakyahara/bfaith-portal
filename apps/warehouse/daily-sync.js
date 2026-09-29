@@ -13,6 +13,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
 import { isWarnSummary } from './amazon-fees-outcome.js';
+import { waitOtherRunGone, isAliveNodeSince, remainingRetrySlots } from './retry-lock.js';
 import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS, amazonFinanceDailyArgs } from './amazon-finance-months.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -24,6 +25,7 @@ const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.
 // プロセス abort (libuv assertion 等、JS の catch に落ちない死に方) の時だけ残る。
 // 残骸は ①翌朝の起動時に「前回異常終了」として通知 ②bat 側の notify-crash.js が即時通知、の2段で拾う。
 const LOCK_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync.lock.json');
+const RETRY_LOCK_FILE = path.join(PROJECT_DIR, 'data', 'retry-failed-jobs.lock.json');   // retry-failed-jobs.js の lock (retry-lock.js)
 
 // この run が取得した lock の run_id。releaseLock は自分の lock だけ削除する
 // (stale 上書き後に旧 run が完走して新 run の lock を消す事故の防止 — Codex Medium #1)
@@ -357,7 +359,8 @@ async function main() {
       try { prev = prevRaw !== null ? JSON.parse(prevRaw) : null; } catch { /* 破損 = prev null のまま残骸扱い */ }
       // 先行 run が「生きている node プロセス」なら常に中止 (ハング中でも並走は SQLite 直列書き込み前提を壊すので不可)。
       // pid 再利用の誤検知はプロセス名照合で排除。それでも残る場合は通知の手動対応案内で回収する
-      if (prev && prev.pid && isAliveNodeProcess(prev.pid)) {
+      // 🆕 2026-09-29 (#1538): そのプロセスが lock の started_at より前から動いているかも見る = pid が別の node に使い回されても毎朝止まらない
+      if (prev && prev.pid && isAliveNodeSince(prev.pid, prev.started_at)) {
         const msg = `⚠️ *Warehouse日次同期 多重起動を中止* (先行 run: pid=${prev.pid}, started_at=${prev.started_at})\n先行 run がハングしている場合はプロセス終了後に手動削除を: ${LOCK_FILE}`;
         console.error(`[DailySync] ${msg}`);
         await notify(msg);
@@ -389,6 +392,16 @@ async function main() {
     const runId = `${process.pid}-${crypto.randomUUID()}`;
     fs.writeFileSync(LOCK_FILE, JSON.stringify({ run_id: runId, pid: process.pid, started_at: startTime.toISOString(), business_date: businessDate }), { flag: 'wx' });
     myLockRunId = runId;
+    // 自動再試行の回が動いている間は走らない (retry-lock.js と対で、どちらも「自分の lock を書いた後に相手を見る」= 同時に起動しても片方は必ず気づく。#1538 Codex R1 High)。
+    //   daily-sync が優先: 再試行は daily-sync の lock を見たら必ず退く = 最大 60 秒待って、退いたら続ける (完全に同時に起動しても両方退かない。#1538 Codex R3 Medium)
+    const retryRun = await waitOtherRunGone(RETRY_LOCK_FILE);   // 持ち主 = pid が生きている node で、lock より前から動いているプロセス (retry-lock.js の isAliveNodeSince)
+    if (retryRun) {
+      releaseLock();
+      const msg = `⚠️ *Warehouse日次同期 起動を中止* 自動再試行の回が動いている (pid=${retryRun.pid}, started_at=${retryRun.started_at})。終わってから手で流す`;
+      console.error(`[DailySync] ${msg}`);
+      await notify(msg);
+      process.exit(1);
+    }
   } catch (e) {
     if (e.code === 'EEXIST') {
       // 直前の残骸回収と自分の取得の間に別プロセスが lock を取った = 多重起動レース負け
@@ -1661,7 +1674,11 @@ async function main() {
   }
   if (retryableFailed.length > 0) {
     if (retryStateWritten) {
-      msg += `\n🔄 自動再試行予定: ${retryableFailed.join(', ')} を本日 8:30 / 10:00 / 11:30 JST に再実行\n`;
+      // 残っている再試行の時刻だけを書く。11:30 を過ぎていれば その日は自動で再試行されない = 手で (翌朝の再試行は別日の state を消す。#1538 Codex R1 High)
+      const slots = remainingRetrySlots(new Date());
+      msg += slots.length
+        ? `\n🔄 自動再試行予定: ${retryableFailed.join(', ')} を本日 ${slots.join(' / ')} JST に再実行\n`
+        : `\n⚠️ 本日の自動再試行 (8:30 / 10:00 / 11:30) の時刻は過ぎている = ${retryableFailed.join(', ')} は自動で再試行されない。手で流す\n`;
     } else {
       msg += `\n⚠️ retry-state 書き込み失敗 (${retryStateError})、自動再試行されません。手動対応必要\n`;
     }
