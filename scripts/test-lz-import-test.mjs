@@ -60,7 +60,7 @@ function setupData() {
 
 /** 偽物のロジザード (商品マスタとバーコード)。executeImport は CSV の値を入れる */
 function fakeLz({ over = {} } = {}) {
-  const st = { lz: new Map([['A-1', lzCells('A-1')], ['B-2', lzCells('B-2')], ['C-3', lzCells('C-3')]]), bc: [['A-1', 'a', '4900000000001'], ['B-2', 'b', '4900000000002']], calls: [] };
+  const st = { lz: new Map([['A-1', lzCells('A-1')], ['B-2', lzCells('B-2')], ['C-3', lzCells('C-3')]]), bc: [['A-1', 'a', '4900000000001'], ['B-2', 'b', '4900000000002'], ['C-3', 'c', '4900000000003']], calls: [] };   // 本物と同じく全商品にバーコード (9/29)
   const exportShohin = async () => {
     st.calls.push('exportShohin');
     if (over.postExportFails && st.calls.includes('execute')) throw new Error('書き出しに失敗');
@@ -89,6 +89,7 @@ function fakeLz({ over = {} } = {}) {
       }
       if (over.touchOther) st.lz.get('C-3')[col('商品名')] = '書き換わった';
       if (over.touchBarcode) st.bc[0][2] = '4900000000999';
+      if (over.postBarcodeCut) st.bc = st.bc.filter((r) => r[0] !== 'C-3');   // 後のバーコードの書き出しが途中で切れた (末尾の商品が無い)
       const errors = csv.length - processed;
       return { executeIssued: true, confirm: 'clicked', reason: null, resultText: `インポート結果 総件数 : ${csv.length} 処理件数 : ${processed} 処理不要件数 : 0 エラー件数 : ${errors}` };
     },
@@ -519,6 +520,35 @@ await ta('[24] 確かめのやり直しで import.json を書けない (始め�
   const v = await T.verifyOnly({ lzMinRows: 1, dataDir, runId: r.runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: pt.client, checkInit: pt.checkInit, withSession: lz2.withSession, capabilities: { exportBarcodes: true }, notify: async (x) => { sent.push(x); return true; }, log: () => {}, writeJson: wj });
   assert.deepEqual([v.state, S.getStatus(pt.db).state, sent.length], ['verified', 'verified', 1]);
   assert.match(sent[0], /確かめの記録を書けない \(import\.json: EACCES\)/);
+});
+
+await ta('[25] バーコードの書き出しが途中で切れた (同じ回の商品マスタの商品が無い): 直前 = 押さない (K4) / 後 = verify_failed (Codex #1530 R2 High)', async () => {
+  let dataDir = setupData(), lz = fakeLz(), pt = portal();
+  let p = await planned(dataDir, lz);
+  lz.st.bc = lz.st.bc.filter((r) => r[0] !== 'C-3');   // 直前の書き出しから C-3 が抜けた
+  let r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+  assert.ok(!lz.st.calls.includes('execute'), '押さない');
+  assert.match(r.record.error, /直前のバーコードの書き出しに無い商品がある.*C-3/);
+  assert.deepEqual([r.state, S.getStatus(pt.db).state], ['not_started', 'idle']);
+  dataDir = setupData(); lz = fakeLz({ over: { postBarcodeCut: true } }); pt = portal();
+  p = await planned(dataDir, lz);
+  r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+  assert.deepEqual([r.state, S.getStatus(pt.db).state], ['verify_failed', 'verify_failed']);
+  const vj = JSON.parse(fs.readFileSync(path.join(r.runDir, 'verify.json'), 'utf8'));
+  assert.ok(vj.barcode.diffs.some((d) => d.kind === 'missing_in_post_barcode' && d.head.includes('C-3')), JSON.stringify(vj.barcode.diffs));
+});
+
+await ta('[26] 取込の後に確かめられない形 = 押す前に止める: 比べる商品がバーコードの書き出しの最後の商品 / 商品ごとの行がひとまとまりでない (Codex #1530 R4 Medium)', async () => {
+  for (const [bc, re] of [[[['A-1', 'a', '4900000000001'], ['C-3', 'c', '4900000000003'], ['B-2', 'b', '4900000000002']], /比べる商品 B-2 がバーコードの書き出しの最後の商品/],
+    [[['A-1', 'a', '4900000000001'], ['B-2', 'b', '4900000000002'], ['A-1', 'a', '4900000000009'], ['C-3', 'c', '4900000000003']], /ひとまとまりでない/]]) {
+    const dataDir = setupData(); const lz = fakeLz(); const pt = portal();
+    const p = await planned(dataDir, lz);
+    lz.st.bc = bc;
+    const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+    assert.ok(!lz.st.calls.includes('execute') && !lz.st.calls.includes('preview'), '押さない');
+    assert.match(r.record.error, re);
+    assert.deepEqual([r.state, S.getStatus(pt.db).state], ['not_started', 'idle']);
+  }
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
