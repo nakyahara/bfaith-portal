@@ -412,7 +412,7 @@ await ta('[13] 前の夜の毎晩の回が未確かめ = その夜は確かめ�
   assert.throws(() => N.nightlyRunDir(dataDir, '../lzim_night_20300116T152000_abcdef'), /形が違う/);
 });
 
-await ta('[14] importing が残っている (N7): 鍵が生きている = 動いている (何もしない) / 鍵が無い = mark-unknown → 読み直し → 知らせる / 断られた (busy・鍵が生きていた) = 動いている / 断られた (bad_transition・もう進んだ) = 振り分け直す / 応答が分からない = 読み直して照らす。どれもロジザードに入らない', async () => {
+await ta('[14] importing が残っている (N7): 鍵が生きている = 動いている (何もしない) / 鍵が無い = mark-unknown → 読み直し → 知らせる / 断られた (busy・鍵が生きていた) = 動いている / 断られた (bad_transition・もう進んだ・解除された) = 報告して終わる (取込に進まない。Codex #1547 R1) / 応答が分からない = 読み直して照らす。どれもロジザードに入らない', async () => {
   const run = async (p, extra = {}) => { const eng = fakeEngine(); const { sent, o } = nightlyOpts(p, setupData(), { ...eng, ...extra }); const r = await N.runNightly(o); return { r, eng, sent }; };
   // 鍵が生きている
   let p = portal();
@@ -424,25 +424,25 @@ await ta('[14] importing が残っている (N7): 鍵が生きている = 動い
   makeNightly(p, { ttl: 30 });
   p.clock.now += 60000;
   x = await run(p);
-  assert.deepEqual([x.r.state, x.r.reason, S.getStatus(p.db, { now: p.clock.now }).state, x.sent.some((t) => /止まっている: 状態 unknown/.test(t))], ['stopped', 'unknown', 'unknown', true]);
+  assert.deepEqual([x.r.state, x.r.reason, S.getStatus(p.db, { now: p.clock.now }).state, x.sent.some((t) => /止まっている: 状態 unknown/.test(t))], ['stopped', 'marked_unknown', 'unknown', true]);
   // 断られた (busy) = ほかが鍵を取り直した = 動いている
   p = portal({ hooks: { markUnknown: async (b, { db, now }) => { const s = S.getStatus(db, { now: now() }); db.prepare('UPDATE import_state SET lock_token = ?, lock_expires_at = ? WHERE id = 1').run('other', now() + 600000); void s; throw new S.ImportStateError('busy', 'まだ鍵が生きている', 409); } } });
   makeNightly(p, { ttl: 30 });
   p.clock.now += 60000;
   x = await run(p);
   assert.deepEqual([x.r.state, x.r.mark], ['running', 'refused']);
-  // 断られた (bad_transition) = ほかが先に unknown にして解除した (idle) = 振り分け直す = 同じ対象の日はもう始まった = 何もしない
+  // 断られた (bad_transition) = ほかが先に unknown にして解除した (idle) = 報告して終わる (この起動では取込に進まない)
   p = portal({ hooks: { markUnknown: async (b, { db, now }) => { S.markUnknown(db, { runId: b.run_id, by: 'other', now: now() }); S.resolve(db, { runId: b.run_id, outcome: 'not_imported', note: '履歴を見た', by: '中原', now: now() }); throw new S.ImportStateError('bad_transition', 'unknown にできるのは importing の回だけ', 409); } } });
   makeNightly(p, { ttl: 30 });
   p.clock.now += 60000;
   x = await run(p);
-  assert.deepEqual([x.r.state, x.eng.calls.importOne.length], ['already_started', 0]);
+  assert.deepEqual([x.r.state, x.r.reason, x.eng.calls.importOne.length, x.eng.calls.verifyAgain.length], ['stopped', 'state_changed_after_mark_unknown', 0, 0]);
   // 応答が分からない (入っていた) = 読み直すと unknown = 止まった
   p = portal({ hooks: { markUnknown: async (b, { db, now }) => { S.markUnknown(db, { runId: b.run_id, by: 'lz-daily-import', now: now() }); throw Object.assign(new Error('fetch failed'), { code: 'unreachable', status: null }); } } });
   makeNightly(p, { ttl: 30 });
   p.clock.now += 60000;
   x = await run(p);
-  assert.deepEqual([x.r.state, x.r.reason, x.r.mark], ['stopped', 'unknown', undefined]);
+  assert.deepEqual([x.r.state, x.r.reason, x.r.mark], ['stopped', 'marked_unknown', 'unknown']);
   // 応答が分からない (入っていない・鍵も無い) = importing のまま = 照らせない = 止まった (押さない)
   p = portal({ hooks: { markUnknown: async () => { throw Object.assign(new Error('fetch failed'), { code: 'unreachable', status: null }); } } });
   makeNightly(p, { ttl: 30 });
@@ -490,6 +490,130 @@ await ta('[16] nightlyMain: 送り先 (GCHAT_WEBHOOK_JOBS) → 毎晩の確か�
   assert.deepEqual([r.code, r.ping, r.job, /確かめの列の決まりがまだ無い/.test(r.line)], [1, 'fail', N.JOB_SHADOW, true], '決まりが無い = DATA_DIR より先に断る (何もしない)');
   assert.deepEqual([N.summarize({ state: 'imported', result: 'verified', ping: 'ok', runId: 'r' }).code, N.summarize({ state: 'notify_only', ping: null }).code, N.summarize({ state: 'running', ping: null }).code,
     N.summarize({ state: 'skipped', reason: 'x', ping: null }).code, N.summarize({ state: 'imported', result: 'partial', ping: null }).code], [0, 0, 0, 3, 3]);
+});
+
+await ta('[17] 前の夜の毎晩の回の止まった状態の知らせが知らせ済みにならない (送れない・予算の外) = 確かめのやり直しに進まない・ping しない (故障が隠れない。Codex #1547 R1 High)', async () => {
+  // 送れない
+  let p = portal({ at: JST('2030-01-16T00:20:00') });
+  makeNightly(p, { to: 'imported_unverified' });
+  p.clock.now = NIGHT;
+  let eng = fakeEngine();
+  let x = nightlyOpts(p, setupData(), eng);
+  x.o.notify = async () => false;
+  let r = await N.runNightly(x.o);
+  assert.deepEqual([r.state, r.reason, r.ping, eng.calls.verifyAgain.length, S.getStatus(p.db).state], ['stopped', 'stop_notice_pending', null, 0, 'imported_unverified']);
+  // 止め・要確認の outbox が 50 件あって止まった状態の知らせが予算の外
+  p = portal({ at: JST('2030-01-16T00:20:00') });
+  makeNightly(p, { to: 'imported_unverified' });
+  for (let i = 0; i < 50; i++) p.db.prepare('INSERT INTO outbox (kind, dedupe_key, text, created_at) VALUES (?, ?, ?, ?)').run('halt', `h:${i}`, `止め ${i}`, i);
+  p.clock.now = NIGHT;
+  eng = fakeEngine();
+  x = nightlyOpts(p, setupData(), eng);
+  r = await N.runNightly(x.o);
+  assert.deepEqual([r.state, r.reason, r.ping, eng.calls.verifyAgain.length, x.sent.length, r.notices[0].stop_notice], ['stopped', 'stop_notice_pending', null, 0, 50, 'budget']);
+  // 知らせ済みになっていれば確かめる
+  p = portal({ at: JST('2030-01-16T00:20:00') });
+  makeNightly(p, { to: 'imported_unverified' });
+  p.clock.now = NIGHT;
+  eng = fakeEngine();
+  x = nightlyOpts(p, setupData(), eng);
+  r = await N.runNightly(x.o);
+  assert.deepEqual([r.state, r.result, r.ping, eng.calls.verifyAgain.length, x.sent.length], ['verify_again', 'verified', 'ok', 1, 1]);
+});
+
+await ta('[18] ping は前後の回を通して: 最初の回で止まった状態を知らせ済みにできなかった (読み直しが食い違っても) = 最後の回の残りが 0 で verified でも ping しない', async () => {
+  const p = portal({ at: JST('2030-01-16T00:20:00') });
+  makeNightly(p, { to: 'imported_unverified' });
+  p.clock.now = NIGHT;
+  const eng = fakeEngine();
+  const x = nightlyOpts(p, setupData(), eng);
+  // 知らせ済みの印の応答が分からない (入っていない) → 最初の回の終わりは知らせ済みでない / 振り分けの読み直しでは知らせ済み (食い違い = ほかの入口が印を付けた)
+  let statusCalls = 0;
+  const orig = x.o.client.status;
+  x.o.client = { ...x.o.client, notified: async () => { throw Object.assign(new Error('fetch failed'), { code: 'unreachable', status: null }); },
+    status: async (n) => { const s = await orig(n); statusCalls++; if (statusCalls === 4) { S.markNotified(p.db, { runId: s.run.run_id, state: s.state, stateEventId: s.state_event_id, by: 'other', now: p.clock.now }); return orig(n); } return s; } };
+  const r = await N.runNightly(x.o);
+  assert.equal(r.notices[0].stop_pending, true, '最初の回は知らせ済みにできなかった');
+  assert.deepEqual([r.state, r.result, r.notices[1].remaining, r.ping], ['verify_again', 'verified', 0, null], '最後の回の残りが 0 でも ping しない');
+});
+
+await ta('[19] 知らせの予算は 1 回の起動で共通 (前後の送り直し + エンジンの知らせ・50 件 / 60 秒。Codex #1547 R1 Medium) / 窓の中の最初の回は再適用待ちを送らない (止めを先に)', async () => {
+  const p = portal();
+  p.putArtifact();
+  for (let i = 0; i < 49; i++) p.db.prepare('INSERT INTO outbox (kind, dedupe_key, text, created_at) VALUES (?, ?, ?, ?)').run('manual_review', `m:${i}`, `要確認 ${i}`, i);
+  p.db.prepare('INSERT INTO outbox (kind, dedupe_key, text, created_at) VALUES (?, ?, ?, ?)').run('pending_reapply', 'p:1', '再適用待ち', 100);
+  const engineSent = [];
+  const eng = fakeEngine();
+  const x = nightlyOpts(p, setupData(), { ...eng, importOneFn: async (o) => { engineSent.push(await o.notify('エンジン 1'), await o.notify('エンジン 2')); return { runId: 'r', state: 'verified' }; } });
+  const r = await N.runNightly(x.o);
+  assert.deepEqual([x.sent.length, engineSent, x.sent.includes('再適用待ち')], [50, [true, false], false], '49 + エンジン 1 = 50 件で打ち止め');
+  assert.deepEqual([r.notices[0].sent, r.notices[1].skipped_by_budget, r.ping], [49, 1, null], '再適用待ちは予算の外 = 未送 = ping しない');
+  // 時間の予算も前後で共通
+  const p2 = portal();
+  p2.putArtifact();
+  for (let i = 0; i < 5; i++) p2.db.prepare('INSERT INTO outbox (kind, dedupe_key, text, created_at) VALUES (?, ?, ?, ?)').run('halt', `h:${i}`, `止め ${i}`, i);
+  p2.db.prepare('INSERT INTO outbox (kind, dedupe_key, text, created_at) VALUES (?, ?, ?, ?)').run('pending_reapply', 'p:1', '再適用待ち', 100);
+  const { c, perfNow } = perfClock();
+  const y = nightlyOpts(p2, setupData(), { ...fakeEngine(), perfNow });
+  y.o.notify = async (t) => { c.t += 13000; y.sent.push(t); return true; };   // 1 件 13 秒 = 5 件で 65 秒 = 後の回は予算の外
+  const r2 = await N.runNightly(y.o);
+  assert.deepEqual([y.sent.length, r2.notices[1].skipped_by_budget, r2.ping], [5, 1, null]);
+});
+
+await ta('[20] 確かめのやり直しの最後の書き出しの途中で締め切り・鍵を失った = 結果を書かない = 未確かめのまま (Codex #1547 R1 Medium) / 記録の分け方: JSON でない・形が違う = evidence_broken (Codex #1547 R1 Low)', async () => {
+  const at = JST('2030-01-17T12:00:00');
+  const mkRun = (runId) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzn-run2-'));
+    const H = LZ_SHOHIN.header;
+    const cells = (id) => H.map((h) => (h === '商品ID' ? id : h === '削除フラグ' ? '0' : `${h}-${id}`));
+    const pre = csvBuf(H, [cells('A-1'), cells('B-2'), cells('C-3')]);
+    const preBc = csvBuf(['商品ID', '商品名', 'バーコード'], [['A-1', 'a', '4900000000001'], ['B-2', 'b', '4900000000002'], ['C-3', 'c', '4900000000003']]);
+    fs.writeFileSync(path.join(dir, 'import.csv'), dailyBuf()); fs.writeFileSync(path.join(dir, 'pre.csv'), pre); fs.writeFileSync(path.join(dir, 'pre-barcode.csv'), preBc);
+    fs.writeFileSync(path.join(dir, 'import.json'), JSON.stringify({ run_id: runId, mode: 'test', ...PLAN_REC, stages: [], files: { import_csv: sha(dailyBuf()), pre: sha(pre), pre_barcode: sha(preBc) } }));
+    return { dir, pre, preBc };
+  };
+  // 締め切り: 始めたときは余白の外 (あと 800 ミリ秒)・最後の書き出しに 1.5 秒 = 結果を書く前に締め切り
+  {
+    const p = portal({ at });
+    const runId = unverifiedTest(p, { at });
+    const { dir, pre, preBc } = mkRun(runId);
+    const ops = { exportShohin: async () => ({ buf: pre }), exportBarcodes: async () => { await new Promise((res) => setTimeout(res, 1500)); return { buf: preBc }; } };
+    const nightMarginMs = (JST('2030-01-18T00:00:00') - at) - 5000 - 800;
+    const r = await E.verifyAgain({ ...verifyBase(p), runId, now: new Date(at), nightMarginMs, heartbeatMs: 60000, locateRun: () => dir, withSession: (fn) => fn(ops) });
+    assert.deepEqual([r.state, r.reason, S.getStatus(p.db, { now: at }).state], ['imported_unverified', 'stopped_deadline', 'imported_unverified']);
+  }
+  // 鍵を失った: 最後の書き出しの途中で延長が断られた
+  {
+    let n = 0;
+    const p = portal({ at, hooks: { extend: async () => { n++; throw new S.ImportStateError('lock_lost', '鍵が切れた・ほかに移った', 409); } } });
+    const runId = unverifiedTest(p, { at });
+    const { dir, pre, preBc } = mkRun(runId);
+    const ops = { exportShohin: async () => ({ buf: pre }), exportBarcodes: async () => { await new Promise((res) => setTimeout(res, 300)); return { buf: preBc }; } };
+    const r = await E.verifyAgain({ ...verifyBase(p), runId, now: new Date(at), heartbeatMs: 50, locateRun: () => dir, withSession: (fn) => fn(ops) });
+    assert.deepEqual([r.state, r.reason, S.getStatus(p.db, { now: at }).state, n >= 1], ['imported_unverified', 'stopped_lock_lost', 'imported_unverified', true]);
+  }
+  // 記録の分け方
+  for (const [name, body, want] of [['JSON でない', '{壊れ', 'evidence_broken'], ['形が違う (stages なし)', JSON.stringify({ run_id: 'x', mode: 'test' }), 'evidence_broken'], ['配列', '[]', 'evidence_broken']]) {
+    const p = portal({ at });
+    const runId = unverifiedTest(p, { at });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzn-bad-'));
+    fs.writeFileSync(path.join(dir, 'import.json'), body);
+    const r = await E.verifyAgain({ ...verifyBase(p), runId, now: new Date(at), locateRun: () => dir, withSession: async () => { throw new Error('入った'); } });
+    assert.deepEqual([r.state, r.reason, S.getStatus(p.db, { now: at }).run.detail.verify_detail.reason], ['verify_failed', want, want], name);
+  }
+  {
+    const p = portal({ at });
+    const runId = unverifiedTest(p, { at });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzn-mm-'));
+    fs.writeFileSync(path.join(dir, 'import.json'), JSON.stringify({ run_id: 'lzim_test_other', mode: 'test', stages: [] }));
+    const r = await E.verifyAgain({ ...verifyBase(p), runId, now: new Date(at), locateRun: () => dir, withSession: async () => { throw new Error('入った'); } });
+    assert.deepEqual([r.state, r.reason], ['verify_failed', 'evidence_mismatch']);
+  }
+});
+
+await ta('[21] package.json の test:company-db (いつもの試験の組) にこの試験が入っている (Codex #1547 R1 Low)', async () => {
+  const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.ok(pkg.scripts['test:company-db'].split('&&').map((x) => x.trim()).includes('node scripts/test-lz-nightly.mjs'));
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

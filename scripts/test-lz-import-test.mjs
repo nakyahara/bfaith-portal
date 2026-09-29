@@ -75,13 +75,14 @@ function fakeLz({ over = {} } = {}) {
   };
   const ops = {
     exportShohin,
-    exportBarcodes: async () => { st.calls.push('exportBarcodes'); if (over.barcodeCorruptAlways) throw SE.invalidCsvError('3 行目の列数が違います (ヘッダ 3 / この行 2)'); return { buf: csvBuf(['商品ID', '商品名', 'バーコード'], st.bc) }; },
+    exportBarcodes: async () => { st.calls.push('exportBarcodes'); if (over.postBarcodeDelayMs && st.calls.includes('execute')) await new Promise((r) => setTimeout(r, over.postBarcodeDelayMs)); if (over.barcodeCorruptAlways) throw SE.invalidCsvError('3 行目の列数が違います (ヘッダ 3 / この行 2)'); return { buf: csvBuf(['商品ID', '商品名', 'バーコード'], st.bc) }; },
     previewImport: async (p) => { st.calls.push('preview'); if (over.previewThrows) throw new Error('プレビューに失敗'); st.previewed = p; if (over.previewDelayMs) await new Promise((r) => setTimeout(r, over.previewDelayMs)); return { previewed: true }; },
     executeImport: async ({ guard, onExecuteIssued }) => {
       if (over.throwBeforeIssue) { const e = new Error('押す前に失敗'); e.executeIssued = false; throw e; }
       guard.check('実行ボタン');
       onExecuteIssued();
       st.calls.push('execute');
+      if (over.afterExecuteDelayMs) await new Promise((r) => setTimeout(r, over.afterExecuteDelayMs));   // 押した後に時間が経つ (締め切りの試験)
       if (over.throwAfterIssue) { const e = new Error('押した後に失敗'); e.executeIssued = true; throw e; }
       const csv = iconv.decode(fs.readFileSync(st.previewed), 'cp932').split('\r\n').slice(1).map((l) => l.split(',').map((x) => x.replace(/^"|"$/g, '')));
       let processed = 0;
@@ -737,6 +738,27 @@ await ta('[29] 対象の lz-daily はポータルに送れた回だけ (③c-1b-
   assert.equal(pick({ portal: undefined, version: 'lzd-v2' }, false, { legacyV2Until: AS_OF }).ok, true);   // 期限の日 = 許す
   assert.equal(pick({ portal: undefined, version: 'lzd-v2' }, false, { legacyV2Until: '2030-01-15' }).reason, 'portal_not_stored');   // 期限の翌日 = 断る
   assert.equal(pick({ portal: undefined, version: 'lzd-v2' }, true, { legacyV2Until: AS_OF }).reason, 'portal_not_stored');   // 合格を要る読み手 (試験・本番) には許さない
+});
+
+await ta('[31] 取込の後の書き出しの前にも締め切りの旗 (押した後に締め切りを過ぎた = 直後の書き出しをしない = imported_unverified のまま = 確かめのやり直しへ。Codex #1547 R1 Medium)', async () => {
+  const dataDir = setupData(); const lz = fakeLz({ over: { afterExecuteDelayMs: 1500 } }); const pt = portal();
+  const p = await planned(dataDir, lz);
+  const callsAfterPlan = lz.st.calls.length;
+  // 締め切り = 始めた時から 5 秒 (旗の余白) + 800 ミリ秒 = 押すときは内・押した後 1.5 秒で外
+  const nightMarginMs = (Date.parse('2030-01-17T00:00:00+09:00') - NOW.getTime()) - 5000 - 800;
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt, { nightMarginMs }), withSession: lz.withSession, notify: async () => true });
+  assert.deepEqual([r.state, S.getStatus(pt.db).state], ['imported_unverified', 'imported_unverified']);
+  assert.deepEqual(lz.st.calls.slice(callsAfterPlan), ['exportShohin', 'exportBarcodes', 'preview', 'execute'], '直後の書き出しをしない');
+  assert.ok(stagesOf(r).includes('post_export_stopped'));
+});
+
+await ta('[32] 取込の後の最後の書き出しの途中で締め切りを過ぎた = 確かめの結果を書かない = imported_unverified のまま (比べた結果は verify.json。Codex #1547 R1 Medium)', async () => {
+  const dataDir = setupData(); const lz = fakeLz({ over: { postBarcodeDelayMs: 1500 } }); const pt = portal();
+  const p = await planned(dataDir, lz);
+  const nightMarginMs = (Date.parse('2030-01-17T00:00:00+09:00') - NOW.getTime()) - 5000 - 800;
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt, { nightMarginMs }), withSession: lz.withSession, notify: async () => true });
+  assert.deepEqual([r.state, S.getStatus(pt.db).state], ['imported_unverified', 'imported_unverified']);
+  assert.ok(stagesOf(r).includes('verify_result_stopped') && fs.existsSync(path.join(r.runDir, 'verify.json')), stagesOf(r).join(','));
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

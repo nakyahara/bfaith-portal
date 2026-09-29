@@ -33,6 +33,7 @@ import { realSession } from './lz-real-session.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const JOB_SHADOW = 'lz-daily-import-shadow';
+export const JOB_NIGHTLY = 'lz-daily-import';   // 毎晩の本番 (lz-nightly.mjs と同じ。台帳への登録は切替の PR)
 export const EXIT = Object.freeze({ ok: 0, error: 1, skipped: 3 });
 export const DEFAULT_AUTOMATION_DIR = 'C:\\tools\\logizard-automation';
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
@@ -138,7 +139,10 @@ if (isMain) {
     const a = parseArgs(process.argv.slice(2));
     ping = !a.forceWindow;
     if ((process.env.LZ_DAILY_IMPORT || '').trim().toLowerCase() === 'on') {
-      // 毎晩の本番 (③c-1b-2b-2)。影はしない。時刻は Render の時計 (ここでは見ない)
+      ping = true;   // 毎晩の本番の失敗は必ず知らせる (手の試しの引数が付いていても)
+      // 毎晩の本番 (③c-1b-2b-2)。影はしない。時刻は Render の時計 (ここでは見ない)。on を見た時点で ping は毎晩の項目
+      // (途中の例外の fail も lz-daily-import へ。決まりが無い = nightlyMain の戻り値で影の項目へ。Codex #1547 R1 Medium)
+      job = JOB_NIGHTLY;
       if (a.forceWindow || a.asOf) throw new Error('--force-window / --as-of は影の手の試しだけ (毎晩の本番には無い)');
       const { nightlyMain } = await import('./lz-nightly.mjs');
       const r = await nightlyMain({ env: process.env });

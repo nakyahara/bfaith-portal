@@ -330,7 +330,14 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
       if (w.outcome !== 'ok') return;   // 手元に残した・知らせる (下)
       if (judged.to === 'unknown') return;
       // ── 直後の書き出しと確かめ (K4: 商品 + バーコードの両方を比べてから verified) ──
-      const g = await grabPostExports(ops, { save, files: { shohin: path.join(runDir, 'post.csv'), barcode: path.join(runDir, 'post-barcode.csv') } });
+      let g;
+      try {
+        g = await grabPostExports(ops, { save, before: (which) => guard.check(`直後の書き出し (${which}) の前`), files: { shohin: path.join(runDir, 'post.csv'), barcode: path.join(runDir, 'post-barcode.csv') } });
+      } catch (e) {
+        if (!(e && e.stopped)) throw e;
+        stage('post_export_stopped', { reason: e.reason });   // 締め切り・鍵を失った = 書き出さない = imported_unverified のまま (確かめのやり直しへ)
+        return;
+      }
       for (const x of g.saveErrors) rec.record_errors.push({ name: x.file, error: x.error });
       // 中身が壊れていた (invalid_csv) = 読めない = 確かめの失敗 / 一時の失敗 (通信・ログイン・時間切れ) だけ = 未確かめのまま (verify でやり直す。取れた側は保存した。Codex #1524 R2・R3)
       if (g.invalid) stage('post_export_invalid', g.invalid);
@@ -351,7 +358,14 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
       try { writeJson(path.join(runDir, 'verify.json'), { product: vr, barcode: br }); } catch (e) { rec.record_errors.push({ name: 'verify.json', error: String(e && e.message).slice(0, 200) }); }
       rec.verify = { ok: vr.ok && br.ok, decided: vr.decided, rules_version: vr.rules_version, product_diffs: vr.diffs.length, barcode_diffs: br.diffs.length };
       stage('verified_checked');
-      if (judged.to === 'imported_unverified') await move(vr.ok && br.ok ? 'verified' : 'verify_failed', rec.verify);
+      if (judged.to === 'imported_unverified') {
+        try { guard.check('確かめの結果を書く前'); } catch (e) {
+          if (!(e && e.stopped)) throw e;
+          stage('verify_result_stopped', { reason: e.reason });   // 比べた結果は verify.json に残した・状態は imported_unverified のまま
+          return;
+        }
+        await move(vr.ok && br.ok ? 'verified' : 'verify_failed', rec.verify);
+      }
       // partial = 状態は partial のまま (差は verify.json = 解除の材料。H)
     });
   } catch (e) {
@@ -451,17 +465,33 @@ export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, 
   let result = null, recordError = null, failure = null;
   try {
     // ── 記録を探して読む (鍵を取った後 = 無い・違う回でも verify_failed を書ける) ──
+    // 記録: 無い = evidence_missing / 読めない・JSON でない・形が違う = evidence_broken / 違う回・違う決まり = evidence_mismatch (どれも verify_failed = 人が見る)
     let evidence = null;
     try { runDir = locateRun(); } catch (e) { evidence = { reason: 'evidence_missing', error: String(e && e.message).slice(0, 200) }; }
     if (!evidence) {
-      try { rec = JSON.parse(fs.readFileSync(path.join(runDir, 'import.json'), 'utf8')); } catch (e) { rec = null; evidence = { reason: 'evidence_missing', error: `import.json を読めない: ${String(e && e.message).slice(0, 160)}` }; }
+      let raw = null;
+      try { raw = fs.readFileSync(path.join(runDir, 'import.json'), 'utf8'); } catch (e) {
+        evidence = { reason: e && e.code === 'ENOENT' ? 'evidence_missing' : 'evidence_broken', error: `import.json を読めない: ${String(e && e.message).slice(0, 160)}` };
+      }
+      if (!evidence) { try { rec = JSON.parse(raw); } catch { rec = null; evidence = { reason: 'evidence_broken', error: 'import.json が JSON でない' }; } }
+      if (!evidence && (!rec || typeof rec !== 'object' || Array.isArray(rec) || !Array.isArray(rec.stages))) { rec = null; evidence = { reason: 'evidence_broken', error: 'import.json の形が違う (stages が無い)' }; }
+      // 記録がこの回・この決まりの回か (違う決まりの確かめの決まりで verified にしない。Codex #1535 R1 Medium)
+      if (!evidence && (rec.run_id !== runId || rec.mode !== policy.mode)) {
+        evidence = { reason: 'evidence_mismatch', record: { run_id: rec.run_id ?? null, mode: rec.mode ?? null } };
+        rec = null;   // 違う回の記録には書かない
+      }
     }
-    // 記録がこの回・この決まりの回か (違う決まりの確かめの決まりで verified にしない。Codex #1535 R1 Medium)
-    if (!evidence && (!rec || rec.run_id !== runId || rec.mode !== policy.mode || !Array.isArray(rec.stages))) {
-      evidence = { reason: 'evidence_mismatch', record: rec ? { run_id: rec.run_id ?? null, mode: rec.mode ?? null } : null };
-      rec = null;   // 違う回の記録には書かない
-    }
+    // 結果を書く前に旗を見る (締め切り・鍵を失った = 書かない = 未確かめのまま。Codex #1547 R1 Medium)
+    const stoppedBeforeWrite = (where) => {
+      try { guard.check(where); return null; } catch (e) {
+        if (!(e && e.stopped)) throw e;
+        stage('verify_only_result_stopped', { where, reason: e.reason });
+        return { runId, state: 'imported_unverified', reason: `stopped_${e.reason}` };
+      }
+    };
     if (evidence) {
+      const st0 = stoppedBeforeWrite('記録の不一致を書く前');
+      if (st0) return st0;
       result = await move('verify_failed', evidence);
       return result.outcome === 'ok' ? { runId, state: 'verify_failed', reason: evidence.reason } : { runId, state: 'imported_unverified', reason: 'result_not_written', compared: evidence.reason };
     }
@@ -474,6 +504,8 @@ export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, 
     if (!preBuf || sha256(preBuf) !== (rec.files && rec.files.pre)) broken.push('pre.csv');
     if (!preBcBuf || sha256(preBcBuf) !== (rec.files && rec.files.pre_barcode)) broken.push('pre-barcode.csv');
     if (broken.length) {
+      const st1 = stoppedBeforeWrite('記録の壊れを書く前');
+      if (st1) return st1;
       result = await move('verify_failed', { reason: 'evidence_broken', files: broken });
       return result.outcome === 'ok' ? { runId, state: 'verify_failed', reason: 'evidence_broken' } : { runId, state: 'imported_unverified', reason: 'result_not_written', compared: 'evidence_broken' };
     }
@@ -512,8 +544,9 @@ export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, 
     try { writeJson(path.join(runDir, `verify-${tag}.json`), { product: vr, barcode: br, note: '取り込んだ後に時間が経っている = 人の直しと区別がつかない (差があれば人が見る)' }); }
     catch (e) { recordError = [recordError, `verify-${tag}.json: ${String(e && e.message).slice(0, 200)}`].filter(Boolean).join('・'); stage('verify_only_record_failed', { error: recordError }); }
     const ok = vr.ok && br.ok;
-    // 結果を書く前に旗を見る (記録に残す)。書き込みは同じ鍵 (token) のときだけポータルが通す = 鍵をほかが取っていれば断られる (止めない)
-    stage('verify_only_before_result', { guard_stopped: guard.isStopped() ? guard.reason : null, heartbeat: hbEvents.slice(-3) });
+    stage('verify_only_before_result', { heartbeat: hbEvents.slice(-3) });
+    const st2 = stoppedBeforeWrite('確かめの結果を書く前');
+    if (st2) return st2;
     result = await move(ok ? 'verified' : 'verify_failed', { product_diffs: vr.diffs.length, barcode_diffs: br.diffs.length, decided: vr.decided, rules_version: vr.rules_version, late: true });
     // 結果をポータルに書けたかで返す (書けない = 未確かめのまま + 知らせ。比べた結果は手元の verify-*.json。Codex #1524 R1 High)
     if (result.outcome !== 'ok') return { runId, state: 'imported_unverified', reason: 'result_not_written', compared: ok ? 'verified' : 'verify_failed' };

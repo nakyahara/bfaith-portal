@@ -226,10 +226,13 @@ await ta('[7] CLI: LZ_DAILY_IMPORT=on = 毎晩の本番 = 確かめの列の決�
   c = spied({ DATA_DIR: tmp, LZ_DAILY_IMPORT: 'on', GCHAT_WEBHOOK_JOBS: '' });
   assert.equal(c.status, 1);
   assert.match(c.stdout.trim().split('\n').pop(), /^❌ ロジザード毎日の商品マスタの取込 \(毎晩\): 要対応スペースの送り先 GCHAT_WEBHOOK_JOBS が/);
-  // 手の試しの引数は影だけ
-  c = cli({ DATA_DIR: tmp, LZ_DAILY_IMPORT: 'on', GCHAT_WEBHOOK_JOBS: 'https://chat.example.test/hook' });
+  // 手の試しの引数は影だけ・on の途中の失敗の fail は毎晩の項目 lz-daily-import へ (影の項目ではない。Codex #1547 R1 Medium)
+  fs.rmSync(log, { force: true });
+  c = spawnSync(process.execPath, ['--import', pathToFileURL(spy).href, 'scripts/logizard-import/lz-daily-import.mjs', '--force-window'], { cwd: ROOT, encoding: 'utf8',
+    env: { ...process.env, FETCH_LOG: log, JOBS_MONITOR_TOKEN: 'dummy-token', JOBS_MONITOR_URL: 'https://jobs.example.test', DATA_DIR: tmp, LZ_DAILY_IMPORT: 'on', GCHAT_WEBHOOK_JOBS: 'https://chat.example.test/hook' } });
   assert.equal(c.status, 1);
   assert.match(c.stdout.trim().split('\n').pop(), /--force-window \/ --as-of は影の手の試しだけ/);
+  assert.deepEqual(fetched().map((u) => u.replace(/\?.*/, '')), ['https://jobs.example.test/apps/jobs-monitor/ping/lz-daily-import'], '毎晩の項目に fail');
   assert.deepEqual(fs.readdirSync(tmp), []);
   c = cli({ DATA_DIR: '' });
   assert.equal(c.status, 1);
