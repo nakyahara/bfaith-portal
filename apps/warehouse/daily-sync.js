@@ -767,6 +767,7 @@ async function main() {
     // CHUNK_SIZE は 3000 推奨 (issue #72)、env 経由で override 可
     if (!process.env.CHUNK_SIZE) process.env.CHUNK_SIZE = '3000';
     const financeFailed = [];
+    const financeBuildFailed = [];   // build (SQLite の日次の財務) が失敗した月 = Company DB との突き合わせの比べる側が古い (sync の失敗は SQLite に関係しない)
     for (const month of financeMonths) {
       const isCurrent = month === currentMonth;
       const buildName = isCurrent ? 'Amazon finance build' : `Amazon finance build (${month})`;
@@ -783,6 +784,7 @@ async function main() {
         // build を再実行せずに sync 単独 retry してしまい、古い fact を sync する事故。
         // 失敗した月はやり残しとして翌朝に持ち越す (build + sync が両方通るまで)。
         financeFailed.push(month);
+        financeBuildFailed.push(month);
         console.log(`[DailySync] ${syncName} は build 失敗のため記録せず (やり残しとして翌朝に持ち越す)`);
       }
     }
@@ -876,8 +878,12 @@ async function main() {
       cdbFinanceResult = { success: false, summary: '⏭️ skipped (Amazon Settlement の取込が失敗。取込の再試行が成功したら送る)' };
       results.push({ name: 'CompanyDB財務(Amazon)', ...cdbFinanceResult });
     }
-    // 突き合わせは実際に送った朝だけ (バックフィル前の ⏭️・見送りの朝は起動しない。#1536 Codex R1 Low)
-    if (cdbFinanceResult.success && !String(cdbFinanceResult.summary || '').trimStart().startsWith('⏭️')) {
+    // 突き合わせは実際に送った朝だけ (バックフィル前の ⏭️・見送りの朝は起動しない。#1536 Codex R1 Low)。
+    //   比べる側 (SQLite の日次の財務・月の手数料) の build が今朝失敗していれば比べない = 古い SQLite との偽の差でやり残しと「差が続いた回数」を進めない (#1536 Codex R2 Medium)。
+    //   失敗した build の月はやり残しとして翌朝に作り直される = 翌朝の突き合わせで見る
+    const financeSqliteFresh = financeBuildFailed.length === 0 && accountFeesBuildResult.success;
+    if (!financeSqliteFresh) console.log(`[DailySync] Company DB Amazon 財務の突き合わせはスキップ (比べる側の build が失敗: 日次の財務 ${financeBuildFailed.join(', ') || 'OK'} / 月の手数料 ${accountFeesBuildResult.success ? 'OK' : '失敗'})`);
+    if (financeSqliteFresh && cdbFinanceResult.success && !String(cdbFinanceResult.summary || '').trimStart().startsWith('⏭️')) {
       const cdbFinanceRecResult = runScript('apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled', 'Company DB Amazon 財務 突き合わせ', 600000);
       results.push({ name: 'CompanyDB財務突合(Amazon)', ...cdbFinanceRecResult, warn: cdbFinanceRecResult.success && isWarnSummary(cdbFinanceRecResult.summary) });
     } else {

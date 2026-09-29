@@ -632,7 +632,9 @@ await t('daily-sync: 手数料の工程の後に送り手 → 送れたときだ
   assert.ok(iFees > 0 && iPush > iFees && iRec > iPush, `${iFees} ${iPush} ${iRec}`);
   assert.match(src, /const financeArgs = amazonFinanceDailyArgs\(businessDate\);/);
   assert.match(src, /if \(settlementResult\.success\) \{\s*cdbFinanceResult = runScript/);   // 決済の取込が失敗した朝は送らない
-  assert.match(src, /if \(cdbFinanceResult\.success && !String\(cdbFinanceResult\.summary \|\| ''\)\.trimStart\(\)\.startsWith\('⏭️'\)\) \{\s*const cdbFinanceRecResult/);   // ⏭️ の朝は突き合わせない
+  assert.match(src, /if \(financeSqliteFresh && cdbFinanceResult\.success && !String\(cdbFinanceResult\.summary \|\| ''\)\.trimStart\(\)\.startsWith\('⏭️'\)\) \{\s*const cdbFinanceRecResult/);   // ⏭️ の朝・比べる側の build が失敗した朝は突き合わせない
+  assert.match(src, /const financeSqliteFresh = financeBuildFailed\.length === 0 && accountFeesBuildResult\.success;/);
+  assert.match(src, /financeFailed\.push\(month\);\s*financeBuildFailed\.push\(month\);/);   // build の失敗だけを数える (sync の失敗は SQLite に関係しない)
   const { UPSTREAM_OF } = await import('../apps/warehouse/retry-failed-jobs.js');
   assert.equal(UPSTREAM_OF['CompanyDB財務(Amazon)'], 'Amazon Settlement');
   const retryable = JSON.parse(`[${/const RETRYABLE_JOBS = \[([^\]]*)\]/.exec(src)[1].replace(/'/g, '"')}]`);
