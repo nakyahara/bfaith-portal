@@ -247,7 +247,7 @@ router.get('/orders/daily', requireSyncKey, async (req, res) => {
  *   GET  /apps/company-db/sync/order-finance/status?mall&scope        件数・世代・直近の run・DB の大きさ (pg_database_size と、読めれば WAL の大きさ = 送り手が次の chunk の前に容量を見る)
  *   GET  /apps/company-db/sync/order-finance/receipt                  受領記録 (伝票と同じ = run_id で引く)
  *   GET  /apps/company-db/sync/order-finance/keys?mall&scope&after&limit     受け取った注文番号 (疑似注文も。送り手の全件の作り直しで Render にだけある鍵を見つける)
- *   GET  /apps/company-db/sync/order-finance/daily?mall&scope&from&to        mart.v_finance_daily (日 × SKU・突き合わせの材料)
+ *   GET  /apps/company-db/sync/order-finance/daily?mall&scope&from&to        mart.finance_daily_range (0044 = v_finance_daily と同じ式を期間の月だけで。日 × SKU・突き合わせの材料)
  *   GET  /apps/company-db/sync/order-finance/account-fees?mall&scope&from&to mart.v_finance_account_fees_monthly (月 × 手数料の種類)
  *   GET  /apps/company-db/sync/order-finance/uncovered?mall&scope            mart.v_order_finance_uncovered の件数と例 (policy が無い日・source が違う日)
  * 設計 = AI_reference『CompanyDB構想/12_Amazon財務のCompanyDB取込_設計_20260929.md』
@@ -328,11 +328,13 @@ router.get('/order-finance/daily', requireSyncKey, async (req, res) => {
   const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
   const rg = financeRangeOf(req, 62); if (rg.error) return res.status(400).json({ error: rg.error });
   await withPg(res, async (client) => {
+    // 🚨 view (mart.v_finance_daily) は全期間をまとめてから絞る = 52 万行で 5 分を超えた (2026-09-29) → 期間の月だけ読む関数 (0044)。止まらないように時間の上限も
+    await client.query(`set statement_timeout = '120s'`);
     const rows = (await client.query(`select economic_date_jst::text as date_jst, seller_sku, units_ordered, units_refunded_customer, units_marketplace_guarantee, units_a_to_z_refund, units_net_sold,
         sales_principal_jpy, sales_shipping_jpy, sales_giftwrap_jpy, sales_tax_jpy, commission_jpy, fba_fulfillment_jpy, fba_storage_jpy, closing_fee_jpy,
         shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy, promotion_tax_jpy, points_jpy, warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy,
         refund_principal_jpy, reversal_reimbursement_jpy, misc_fee_jpy, other_fee_jpy, other_amount_jpy, profit_before_cogs_jpy
-       from mart.v_finance_daily where company_id = 1 and mall = $1 and scope_key = $2 and economic_date_jst between $3::date and $4::date
+       from mart.finance_daily_range(1::smallint, $1, $2, $3::date, $4::date)
        order by economic_date_jst, seller_sku collate "C"`, [ms.mall, ms.scope, rg.from, rg.to])).rows;
     res.json({ mall: ms.mall, scope: ms.scope, from: rg.from, to: rg.to, rows: rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, k === 'date_jst' || k === 'seller_sku' ? v : Number(v)]))) });
   });
@@ -342,6 +344,7 @@ router.get('/order-finance/account-fees', requireSyncKey, async (req, res) => {
   const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
   const rg = financeRangeOf(req, 800); if (rg.error) return res.status(400).json({ error: rg.error });
   await withPg(res, async (client) => {
+    await client.query(`set statement_timeout = '120s'`);
     const rows = (await client.query(`select month_start_jst::text as month_start_jst, fee_type, amount_jpy, row_count from mart.v_finance_account_fees_monthly
        where company_id = 1 and mall = $1 and scope_key = $2 and month_start_jst between date_trunc('month', $3::date) and $4::date order by 1, 2`, [ms.mall, ms.scope, rg.from, rg.to])).rows;
     res.json({ mall: ms.mall, scope: ms.scope, rows: rows.map((r) => ({ ...r, amount_jpy: Number(r.amount_jpy), row_count: Number(r.row_count) })) });
