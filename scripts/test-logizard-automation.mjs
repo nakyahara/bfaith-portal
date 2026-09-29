@@ -9,6 +9,7 @@
  *   4 .bat は CRLF・.js は LF (各 PC の今のファイルと同じバイト)
  *   5 入荷バーコード連携 (auto-barcode.js・③c-1b-3a): JST 00:00〜01:30 は動かない (CSV・鍵・ブラウザの前 / 各ステップと実行ボタンの前) /
  *     LOGIZARD_BC_DAILY=auto = ①② だけ (③ の CSV を要求しない) / 引数は --dry だけ
+ *   6 バーコードの書き出し (barcode-export.js・③c-1b-2b K4): 検証は印つきの例外・全件の条件・承認は「エクスポート処理を行います」だけ・② の出力には書かない
  * 使い方: node scripts/test-logizard-automation.mjs
  */
 import assert from 'node:assert/strict';
@@ -495,6 +496,53 @@ await ta('[9] 押してよいかの旗 (import-guard.js・③c-1b-2b-1b K7): 持
   assert.equal(h.stop('lock_extend_failed'), true);
   assert.deepEqual(hs, ['lock_extend_failed', '2:lock_extend_failed']);
   assert.throws(() => h.check('確認の OK'), (e) => e.stopped && e.reason === 'lock_extend_failed');
+});
+
+await ta('[10] バーコードの書き出し (barcode-export.js・③c-1b-2b K4): 検証 (HTML・Shift-JIS でない・必須列 商品ID / バーコード・列が 2 つ・列の数違い・少なすぎる) = invalid_csv / 全件の条件 (登録日・開始日なし・有効 + 無効) / 承認は「エクスポート処理を行います」だけ / ② の出力 (バーコードマスタ.csv) には書かない', async () => {
+  const B = await import('../tools/logizard-automation/barcode-export.js');
+  // 実機の見出し (2026-09-29 の全件の書き出し = 商品ID,商品名,検索名称,バーコード,有効期限区分)
+  const csv = (rows) => sj(['"商品ID","商品名","検索名称","バーコード","有効期限区分"', ...rows].join('\r\n'));
+  let v = B.validateBarcodeCsv(csv(['"A-1","商品A","商品A","4900000000001","0"', '"A-1","商品A","商品A","4900000000002","0"', '']), { minRows: 2 });
+  assert.deepEqual([v.ok, v.dataRows, v.header], [true, 2, ['商品ID', '商品名', '検索名称', 'バーコード', '有効期限区分']]);
+  assert.match(B.validateBarcodeCsv(Buffer.from('<html><body>login</body></html>'), { minRows: 1 }).reason, /HTML/);
+  assert.match(B.validateBarcodeCsv(Buffer.from([0x22, 0x81, 0x22]), { minRows: 1 }).reason, /Shift-JIS/);
+  assert.match(B.validateBarcodeCsv(sj('"商品ID","商品名"\r\n"A","x"'), { minRows: 1 }).reason, /必須列がありません: バーコード/);
+  assert.match(B.validateBarcodeCsv(sj('"商品ID","バーコード","バーコード"\r\n"A","1","2"'), { minRows: 1 }).reason, /2 つあります/);
+  assert.match(B.validateBarcodeCsv(csv(['"A-1","商品A"']), { minRows: 1 }).reason, /列数が違います/);
+  assert.match(B.validateBarcodeCsv(csv(['"A-1","商品A","商品A","1","0"']), { minRows: 2 }).reason, /少なすぎます/);
+  assert.match(B.validateBarcodeCsv(csv(['"A-1","商品A","商品A","1","0"'])).reason, /下限 100/);
+  assert.equal(B.validateBarcodeCsv(Buffer.alloc(0)).reason, '中身が空です');
+  // 検証に落ちた = 印つきの例外 (取込の試験が「中身の壊れ = 確かめの失敗」に使う)
+  const src = fs.readFileSync(path.join(TOOL, 'barcode-export.js'), 'utf8');
+  assert.match(src, /if \(!v\.ok\) \{ await errorShot\(page, 'bcx-invalid-csv'\); throw invalidCsvError\(v\.reason\); \}/);
+  assert.equal(E.invalidCsvError(B.validateBarcodeCsv(Buffer.from([0x22, 0x81, 0x22]), { minRows: 1 }).reason).code, 'invalid_csv');
+  // 全件の条件 (登録日・開始日を空・終わり = 今日・有効 + 無効) を設定して読み戻し、合わない = 実行しない
+  for (const s of ["page.check('#FM08_01_BR010_targetDate1')", "page.fill('#FM08_01_BR010_fromTargetDate', '')", "page.fill('#FM08_01_BR010_toTargetDate', today)",
+    "page.check('#FM08_01_BR010_expStatus1')", "page.check('#FM08_01_BR010_expStatus2')", "c.from === '' && c.to === today && c.exp1 === true && c.exp2 === true"]) assert.ok(src.includes(s), s);
+  assert.ok(src.indexOf("if (!condOk) {") < src.indexOf("await page.click('#FM08_01_executeBtn')"), '条件を確かめてから実行');
+  // 種類・抽出パターンは表示の文字の完全一致で 1 つだけ
+  assert.deepEqual([B.BARCODE_TYPE_LABEL, B.BARCODE_PATTERN_LABEL], ['SKU', 'バーコード情報']);
+  // 承認のモーダルは「エクスポート処理を行います」のときだけ OK・通知を閉じる処理は shohin-export.js と同じ中身
+  assert.match(src, /if \(!\/エクスポート処理を行います\/\.test\(confirmMsg\.replace\(\/\\s\+\/g, ''\)\)\)/);
+  const x = fs.readFileSync(path.join(TOOL, 'shohin-export.js'), 'utf8');
+  const body = (t) => { const i = t.indexOf('function dismissNotice'); return t.slice(i, t.indexOf('\n}\n', i)); };
+  assert.equal(body(src), body(x));
+  // 固定の出力先に書かない (本体は Buffer を返すだけ) / 確かめの道具は ② の出力 (バーコードマスタ.csv)・既存のファイルに書かない
+  assert.ok(!/writeFileSync|G:\\\\|共有ドライブ/.test(src.replace(/\/\*\*[\s\S]*?\*\//g, '')), '本体は書かない');
+  const cli = (args) => spawnSync(process.execPath, [path.join(TOOL, 'export-barcode-to.js'), ...args], { encoding: 'utf8', cwd: TOOL });
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bcx-'));
+  const exists = path.join(tmp, 'x.csv'); fs.writeFileSync(exists, 'x');
+  const envOk = fs.existsSync(path.join(TOOL, '.env'));
+  if (envOk) {   // .env がある PC (本物) だけ CLI の断りを見る (ログインの前に断る)
+    assert.match(cli([]).stderr, /--out/);
+    assert.match(cli(['--out', exists]).stderr, /すでにある/);
+    assert.match(cli(['--out', path.join(tmp, 'バーコードマスタ.csv')]).stderr, /バーコードマスタ\.csv/);
+  }
+  const t = fs.readFileSync(path.join(TOOL, 'export-barcode-to.js'), 'utf8');
+  for (const kept of ["flag: 'wx'", "acquireLock({ name: 'logizard-session.lock' })", 'exportBarcodeMaster(page', 'バーコードマスタ\\.csv$']) assert.ok(t.includes(kept), kept);
+  // 写す一覧: miniPC (取込の試験が動く PC) に barcode-export.js と export-barcode-to.js
+  const m = JSON.parse(fs.readFileSync(path.join(TOOL, 'manifest.json'), 'utf8'));
+  assert.ok(m.pcs.minipc.includes('barcode-export.js') && m.pcs.minipc.includes('export-barcode-to.js'));
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
