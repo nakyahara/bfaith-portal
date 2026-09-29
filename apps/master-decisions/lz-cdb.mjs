@@ -6,7 +6,8 @@
  *   compare  = ロジザードにある (商品ID が文字の完全一致) かつ Company DB の値が全部そろう → 両方の道 (Company DB / NE の取得) で行を作って比べる
  *   awaiting = ロジザードに無い = 新商品の登録 (①) 待ち。ロジザードに無い ID の行は取込でエラーになる (中原さん L-7) = 出さない
  *   lagging  = ロジザードにあるが Company DB にまだ無い新しい商品で、同じ朝の照合 ② が lag (NE だけにある = 夜間ロードの材料が NE の取込より古い) と言っているもの
- *              = 翌朝のロード待ち。出さない・不合格に数えない (2026-09-29 中原さん。新商品を登録した翌朝に毎回不合格になっていた)。照合 ② が lag と言わない cdb_no_sku は invalid のまま
+ *              = 翌朝のロード待ち。出さない (2026-09-29 中原さん。新商品を登録した翌朝に毎回不合格になっていた)。照合 ② が lag と言わない cdb_no_sku は invalid のまま。
+ *              不合格に数えないのは、ロジザードに今ある値が NE の道の値と同じとき (= 出さなくても古い値が残らない) だけ = checkLagging (Codex #1527 R1 High)
  *   invalid  = 出さない (理由つき)。0 や空で埋めない (v2 H5)。1 件でも残れば、その商品を中原さんが認めない限り切替の合格にしない
  * 値の出どころ (v2 H5・L-4):
  *   形式/型番 = NE の元の書き方 (ops.master_ne_codes)・商品名 = core.skus.name (前後の空白を削った形 = 許す差 L-4)・
@@ -93,7 +94,8 @@ export function classifyForLz({ neItems, cdb, lz, cdbLag = () => false }) {
     if (lzRow.deleted !== '0') { no(it, 'lz_deleted'); continue; }
     const sku = cdb.skuByNorm.get(it.code_norm);
     if (!sku) {
-      if (cdbLag(it.code_norm)) { lagging.push({ code_norm: it.code_norm, ne_code: it.ne_code, why: 'cdb_lag' }); continue; }   // 翌朝のロード待ち
+      // 翌朝のロード待ち。NE の名前が空 (コードで補った名前の疑い) は待ちにしない = 不正 (Codex #1527 R1 High)
+      if (cdbLag(it.code_norm) && !(it.name == null || String(it.name).trim() === '')) { lagging.push({ code_norm: it.code_norm, ne_code: it.ne_code, why: 'cdb_lag', ne: it }); continue; }
       no(it, 'cdb_no_sku'); continue;
     }
     if (it.name == null || String(it.name).trim() === '') { no(it, 'ne_name_blank'); continue; }   // コードで補った名前の疑い (v3 M4)
@@ -127,6 +129,30 @@ const LZ_COL_TO_COMPARE = Object.freeze({ 1: 'name', 2: 'name', 3: 'cost', 4: 'p
 /**
  * 照合 ② の全件 JSON (mc-v2 の ne.items) → (code_norm|列) → { n, c } の一覧
  */
+/**
+ * Company DB 待ちの商品を、ロジザードに今ある値のまま置いてよいか (出さなくても古い値が残らないか。Codex #1527 R1 High)。
+ * NE の道の行 (buildLzCsv 'daily' の rows = 今の GAS と同じ変換) とロジザードの今の行を比べる:
+ *   形を決められないセルがある = undeterminable / 商品名・取引先のバイトか仕入単価の数が違う = stale (取り込まないとロジザードの値が古いまま) / 全部同じ = held
+ *   ふりがな (検索名称) は比べない (取込でどの列に入るかがまだ決まっていない = observe。NE の道では商品名と同じ値)
+ */
+export function checkLagging({ rows, lz }) {
+  const held = [], stale = [], undeterminable = [];
+  const C = LZ_SHOHIN.cols;
+  const dec = (b) => iconv.decode(Buffer.from(b), 'cp932');
+  for (const r of rows) {
+    const l = lz.byId.get(r.key);
+    if (!l) { stale.push({ ne_code: r.key, why: 'lz_missing' }); continue; }
+    if (r.unverified.length) { undeterminable.push({ ne_code: r.key, unverified: r.unverified }); continue; }
+    const diffs = [];
+    if (!Buffer.from(r.cells[1]).equals(Buffer.from(l.raw[C.name]))) diffs.push({ col: '商品名', ne: dec(r.cells[1]), lz: l.name });
+    const nt = dec(r.cells[3]).trim(), lt = String(l.cost ?? '').trim();
+    if (!(nt !== '' && lt !== '' && Number.isFinite(Number(nt)) && Number(nt) === Number(lt))) diffs.push({ col: '仕入単価', ne: nt, lz: lt });
+    if (!Buffer.from(r.cells[4]).equals(Buffer.from(l.raw[C.supplier]))) diffs.push({ col: '取引先id', ne: dec(r.cells[4]), lz: l.supplier });
+    if (diffs.length) stale.push({ ne_code: r.key, diffs }); else held.push({ ne_code: r.key });
+  }
+  return { held, stale, undeterminable };
+}
+
 /** 照合 ② が「NE だけにある (only_in_ne)・lag」と言っている商品か (Company DB 待ち)。compareNeIndex の結果から */
 export const cdbLagOf = (compareIndex) => (codeNorm) => {
   const x = compareIndex.get(`${codeNorm}|exists`);
