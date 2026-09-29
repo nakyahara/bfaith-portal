@@ -21,7 +21,7 @@ import crypto from 'node:crypto';
 import { readLzShohinMaster } from '../../apps/master-decisions/lz-cdb.mjs';
 import { pickTarget, jstDateOf } from '../../apps/master-decisions/lz-import-plan.mjs';
 import { validateImportCsv } from '../../apps/master-decisions/lz-import-check.mjs';
-import { buildTestPlan, planSha256, checkPlanAgainstPre, checkTestCsv } from '../../apps/master-decisions/lz-import-test-plan.mjs';
+import { buildTestPlan, planSha256, checkTestCsv } from '../../apps/master-decisions/lz-import-test-plan.mjs';
 import { portalWrite } from './portal-io.mjs';
 import { POLICIES, STOP_STATES, inNightBlock, nextNightStart, writeJsonAtomic, saveOnce, checkOccupancy, grabPostExports, isInvalidExport, newRunId as engineRunId, importOne, verifyAgain } from './lz-import-engine.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -102,14 +102,8 @@ export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: appro
   return importOne({
     policy: POLICIES.test, lzMinRows, runsDir: path.join(dir, 'runs'), csvBuf: testCsv,
     csv: { sha256: body.test_csv.sha256, rows: body.test_csv.rows, target_as_of: body.source.as_of, source_run_id: body.source.run_id },
-    context: {
-      planId, planSha256: approved, extraIds: body.groups.flatMap((g) => g.ids),
-      // 承認のときから一覧が変わった = 取り込まない (K2)
-      preCheck: (lz) => {
-        const again = checkPlanAgainstPre(body, lz);
-        return again.ok ? null : { stage: ['plan_changed', { diffs: again.diffs.slice(0, 50) }], error: `承認のときから一覧が変わった = 取り込まない (計画を作り直す): ${again.diffs.slice(0, 5).map((d) => `${d.kind}:${d.id}`).join(', ')}` };
-      },
-    },
+    // 計画そのものを渡す (承認の印・CSV・計画の照らし直し (K2)・組の商品は共通の仕組みが計画から作る)
+    context: { planId, planSha256: approved, plan: body },
     occupancy: occ, now, localInitFile, client, checkInit, withSession, capabilities, notify, createGuard, log, heartbeatMs, writeJson, nightMarginMs, save,
   });
 }
@@ -170,8 +164,8 @@ export function findRunDir(dataDir, runId) {
 export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, log = console.log, writeJson = writeJsonAtomic, save = saveOnce }) {
   return verifyAgain({
     policy: POLICIES.test, lzMinRows, runId, locateRun: () => findRunDir(dataDir, runId),
-    // 試験の組の商品も比べる (計画 = <計画 ID>/plan.json)
-    context: { readExtraIds: (runDir) => JSON.parse(fs.readFileSync(path.join(runDir, '..', '..', 'plan.json'), 'utf8')).groups.flatMap((g) => g.ids) },
+    // その回の計画 (<計画 ID>/plan.json) = 試験の組の商品も比べる
+    context: { readPlan: (runDir) => JSON.parse(fs.readFileSync(path.join(runDir, '..', '..', 'plan.json'), 'utf8')) },
     occupancy, now, localInitFile, client, checkInit, withSession, capabilities, notify, log, writeJson, save,
   });
 }

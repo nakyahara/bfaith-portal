@@ -15,6 +15,7 @@ import crypto from 'node:crypto';
 import { readLzShohinMaster } from '../../apps/master-decisions/lz-cdb.mjs';
 import { validateImportCsv, parseImportResult, judgeImportResult } from '../../apps/master-decisions/lz-import-check.mjs';
 import { verifyImport, readBarcodeExport, compareBarcodes, barcodeMissing, compileRules, RULES_2B1 } from '../../apps/master-decisions/lz-import-verify.mjs';
+import { planSha256 as planDigest, checkPlanAgainstPre, checkTestCsv } from '../../apps/master-decisions/lz-import-test-plan.mjs';
 import { portalWrite, startHeartbeat } from './portal-io.mjs';
 
 export const STOP_STATES = Object.freeze(['unknown', 'partial', 'verify_failed', 'imported_unverified']);
@@ -43,29 +44,59 @@ function exactKeys(c, want) {
   const got = Object.keys(c).sort();
   if (got.join(',') !== [...want].sort().join(',')) throw ctxError(`キーは ${want.join('・')} だけ (今 = ${got.join('・') || '-'})`);
 }
+/** 計画の組の商品 (空・文字でない = 比べる商品が分からない = 断る) */
+function groupIds(plan) {
+  const ids = (Array.isArray(plan && plan.groups) ? plan.groups : []).flatMap((g) => (g && Array.isArray(g.ids) ? g.ids : [null]));
+  if (!ids.length || ids.some((x) => typeof x !== 'string' || !x)) throw ctxError('計画の組の商品 (groups) が空か形が違う');
+  return ids;
+}
 const CONTEXTS = Object.freeze({
   test: Object.freeze({
-    // 計画の ID・承認の印・計画の照らし直し・計画の組の商品 (全部要る)
-    import: (c) => {
-      exactKeys(c, ['planId', 'planSha256', 'preCheck', 'extraIds']);
+    // 計画の ID・承認の印・計画 (plan.json から plan_id・created_at・occupancy を除いたもの)。
+    // 承認の印・取り込む CSV・計画の照らし直し・計画の組の商品は、ここで計画から作る (呼び手が省けない。Codex #1535 R2 Medium)
+    import: (c, { csvBuf, csv }) => {
+      exactKeys(c, ['planId', 'planSha256', 'plan']);
       if (!/^lzt_[0-9A-Za-z_]{1,80}$/.test(String(c.planId))) throw ctxError('planId の形');
       if (!/^[0-9a-f]{64}$/.test(String(c.planSha256))) throw ctxError('planSha256 (64 桁)');
-      if (typeof c.preCheck !== 'function') throw ctxError('preCheck (計画の照らし直し)');
-      if (!Array.isArray(c.extraIds) || c.extraIds.some((x) => typeof x !== 'string' || !x)) throw ctxError('extraIds (計画の組の商品)');
-      return { tag: { plan_id: c.planId }, recExtra: { plan_id: c.planId, plan_sha256: c.planSha256 }, notifyTail: `・計画 ${c.planId}`, preCheck: c.preCheck, extraIds: [...c.extraIds] };
+      const plan = c.plan;
+      if (!plan || typeof plan !== 'object' || !plan.test_csv || !plan.source) throw ctxError('plan (計画) が無い・形が違う');
+      if (planDigest(plan) !== c.planSha256) throw ctxError('計画が承認の印と違う');
+      const tc = checkTestCsv(plan, csvBuf);
+      if (!tc.ok) throw ctxError(`取り込む CSV が計画の CSV と違う (${tc.reason})`);
+      if (csv.sha256 !== plan.test_csv.sha256 || csv.rows !== plan.test_csv.rows || csv.target_as_of !== plan.source.as_of || csv.source_run_id !== plan.source.run_id) throw ctxError('CSV の識別が計画と違う');
+      const extraIds = groupIds(plan);
+      // 承認のときから一覧が変わった = 取り込まない (K2)
+      const preCheck = (lz) => {
+        const again = checkPlanAgainstPre(plan, lz);
+        return again.ok ? null : { stage: ['plan_changed', { diffs: again.diffs.slice(0, 50) }], error: `承認のときから一覧が変わった = 取り込まない (計画を作り直す): ${again.diffs.slice(0, 5).map((d) => `${d.kind}:${d.id}`).join(', ')}` };
+      };
+      return { tag: { plan_id: c.planId }, recExtra: { plan_id: c.planId, plan_sha256: c.planSha256 }, notifyTail: `・計画 ${c.planId}`, preCheck, extraIds };
     },
+    // 確かめのやり直し: その回の計画を読む (記録の承認の印・計画の ID と照らしてから組の商品を使う)
     verify: (c) => {
-      exactKeys(c, ['readExtraIds']);
-      if (typeof c.readExtraIds !== 'function') throw ctxError('readExtraIds (計画の組の商品)');
-      return { readExtraIds: c.readExtraIds };
+      exactKeys(c, ['readPlan']);
+      if (typeof c.readPlan !== 'function') throw ctxError('readPlan (その回の計画)');
+      return {
+        readExtraIds: (runDir, rec) => {
+          const { plan_id: planId, created_at: _c, occupancy: _o, ...body } = c.readPlan(runDir) || {};
+          if (planId !== rec.plan_id || planDigest(body) !== rec.plan_sha256) throw new Error('計画 (plan.json) が記録の計画の ID・承認の印と違う = 比べる商品が分からない');
+          return groupIds(body);
+        },
+      };
     },
   }),
 });
-/** 取り込む CSV の識別の形 (sha256 は中身と同じ) */
+const isRealDate = (x) => /^\d{4}-\d{2}-\d{2}$/.test(String(x)) && new Date(`${x}T00:00:00Z`).toISOString().slice(0, 10) === x;
+/** 取り込む CSV の識別の形と中身 (sha256・形・行数・実在の日・出どころ)。読んだ表を返す (後で使い回す。Codex #1535 R2 Medium) */
 function checkCsv(csvBuf, csv) {
   exactKeys(csv, ['sha256', 'rows', 'target_as_of', 'source_run_id']);
   if (!Buffer.isBuffer(csvBuf) || sha256(csvBuf) !== csv.sha256) throw ctxError('csv.sha256 が取り込む CSV の中身と違う');
-  if (!Number.isSafeInteger(csv.rows) || csv.rows < 1 || !/^\d{4}-\d{2}-\d{2}$/.test(String(csv.target_as_of))) throw ctxError('csv.rows・csv.target_as_of');
+  const v = validateImportCsv(csvBuf);
+  if (!v.ok) throw ctxError(`取り込む CSV の形が違う (${v.reason})`);
+  if (csv.rows !== v.table.length) throw ctxError(`csv.rows (${csv.rows}) が CSV の行数 (${v.table.length}) と違う`);
+  if (!isRealDate(csv.target_as_of)) throw ctxError('csv.target_as_of (実在の日 YYYY-MM-DD)');
+  if (typeof csv.source_run_id !== 'string' || !/^[0-9A-Za-z_.-]{1,120}$/.test(csv.source_run_id)) throw ctxError('csv.source_run_id');
+  return v.table;
 }
 
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
@@ -117,7 +148,7 @@ export function preflight({ policy, now, occupancy, capabilities, purpose = 'imp
  * @param {string} p.runsDir     実行の記録を置くフォルダ (<runsDir>/<実行 ID>/)
  * @param {Buffer} p.csvBuf      取り込む CSV (呼び手が承認と照らしたもの)
  * @param {{ sha256, rows, target_as_of, source_run_id }} p.csv  取り込む CSV の識別 (importing に書く)
- * @param {object} p.context     決まりごとの呼び手の値 (CONTEXTS。試験 = { planId, planSha256, preCheck: (lz) => null | { stage, error }, extraIds })
+ * @param {object} p.context     決まりごとの呼び手の値 (CONTEXTS。試験 = { planId, planSha256, plan })
  * @param {object} p.client      import-state-client (acquire / extend / release / transition / status / notified)
  * @param {(client, localFile) => Promise<{ ok, reason, status }>} p.checkInit
  * @param {(fn) => Promise} p.withSession  ops = { exportShohin, exportBarcodes, previewImport, executeImport }
@@ -126,8 +157,8 @@ export function preflight({ policy, now, occupancy, capabilities, purpose = 'imp
  */
 export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv, context, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, createGuard, log = console.log, heartbeatMs = 30000, writeJson = writeJsonAtomic, nightMarginMs = 60000, save = saveOnce }) {
   const occ = preflight({ policy, now, occupancy, capabilities });
-  const { tag, recExtra, notifyTail, preCheck, extraIds } = CONTEXTS[policy.name].import(context);
-  checkCsv(csvBuf, csv);
+  const table0 = checkCsv(csvBuf, csv);
+  const { tag, recExtra, notifyTail, preCheck, extraIds } = CONTEXTS[policy.name].import(context, { csvBuf, csv });
   const init = await checkInit(client, localInitFile);
   if (!init.ok) throw new Error(`ポータルの初期化の照合が合わない (${init.reason})`);
 
@@ -199,10 +230,10 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
       const bcMiss = barcodeMissing(lz, bcPre);   // 直前の商品マスタの全商品が直前のバーコードにある = 途中で切れていない (Codex #1530 R2 High)
       if (bcMiss.length) throw new Error(`直前のバーコードの書き出しに無い商品がある = 途中で切れた疑い = 押さない (K4): ${bcMiss.length} 件 (${bcMiss.slice(0, 5).join(', ')})`);
       // 取込の後に確かめられる形か (押す前に見る。Codex #1530 R4 Medium): 商品ごとの行がひとまとまり・比べる商品が最後の商品でない
-      const checkIds = new Set([...validateImportCsv(csvBuf).table.map((r) => r[0]), ...extraIds]);
+      const checkIds = new Set([...table0.map((r) => r[0]), ...extraIds]);
       if (bcPre.grouped === false) throw new Error('直前のバーコードの書き出しで商品ごとの行がひとまとまりでない = 取込の後に確かめられない = 押さない (K4)');
       if (checkIds.has(bcPre.lastId)) throw new Error(`比べる商品 ${bcPre.lastId} がバーコードの書き出しの最後の商品 = 取込の後に確かめられない = 押さない (K4・この商品を試験から外す)`);
-      const again = preCheck ? preCheck(lz) : null;
+      const again = preCheck(lz);
       if (again) { stage(...again.stage); throw new Error(again.error); }
       // ── 押す前にそろえる記録 (D) ──
       const importCsv = path.join(runDir, 'import.csv');
@@ -240,7 +271,7 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
       // 中身が壊れていた (invalid_csv) = 読めない = 確かめの失敗 / 一時の失敗 (通信・ログイン・時間切れ) だけ = 未確かめのまま (verify でやり直す。取れた側は保存した。Codex #1524 R2・R3)
       if (g.invalid) stage('post_export_invalid', g.invalid);
       const bad = (which) => (g.invalid && g.invalid.which === which ? `書き出しの中身が壊れている (${g.invalid.reason})` : `書き出せなかった (${g.transient ? g.transient.error : '-'})`);
-      const table = validateImportCsv(csvBuf).table;
+      const table = table0;
       const ids = new Set([...table.map((r) => r[0]), ...extraIds]);
       // 取れた側 (と中身の壊れ) は比べる。一時の失敗で取れなかった側 = null (Codex #1524 R4)
       const lzPost = g.post ? readLzShohinMaster(g.post.buf, { minRows: lzMinRows }) : null;
@@ -312,7 +343,7 @@ export const isInvalidExport = (e) => !!e && e.code === 'invalid_csv';
  * @param {object} p
  * @param {object} p.policy      POLICIES のどれか (その回と同じ持ち主)
  * @param {() => string} p.locateRun  実行の記録のフォルダ (見つからない = 例外)
- * @param {object} p.context     決まりごとの呼び手の値 (CONTEXTS。試験 = { readExtraIds: (runDir) => 計画の組の商品 })
+ * @param {object} p.context     決まりごとの呼び手の値 (CONTEXTS。試験 = { readPlan: (runDir) => その回の plan.json })
  */
 export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, context, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, log = console.log, writeJson = writeJsonAtomic, save = saveOnce }) {
   const occ = preflight({ policy, now, occupancy, capabilities, purpose: 'verify' });
@@ -361,7 +392,7 @@ export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, 
     }
     const table = validateImportCsv(importCsv).table;
     const lz = readLzShohinMaster(preBuf, { minRows: lzMinRows }), bcPre = readBarcodeExport(preBcBuf);
-    const ids = new Set([...table.map((r) => r[0]), ...readExtraIds(runDir)]);
+    const ids = new Set([...table.map((r) => r[0]), ...readExtraIds(runDir, rec)]);
     const tag = `${new Date().toISOString().replace(/[-:.]/g, '').slice(0, 18)}_${crypto.randomBytes(3).toString('hex')}`;   // 続けてやり直しても名前がぶつからない
     // 1 つずつ取る・取れたものはすぐ保存 (保存の失敗は知らせて続ける = 壊れの判定まで進む。Codex #1524 R3)
     const got = await withSession((ops) => grabPostExports(ops, { save, files: { shohin: path.join(runDir, `post-${tag}.csv`), barcode: path.join(runDir, `post-barcode-${tag}.csv`) } }))

@@ -22,6 +22,7 @@ const { default: iconv } = await import('iconv-lite');
 const T = await import('./logizard-import/lz-import-test.mjs');
 const E = await import('./logizard-import/lz-import-engine.mjs');
 const V = await import('../apps/master-decisions/lz-import-verify.mjs');
+const TP = await import('../apps/master-decisions/lz-import-test-plan.mjs');
 const IO = await import('./logizard-import/portal-io.mjs');
 const S = await import('../apps/logizard-import-state/store.js');
 const G = await import('../tools/logizard-automation/import-guard.js');
@@ -561,28 +562,39 @@ await ta('[27] 共通の仕組み (3b-1): POLICIES の外の決まり (試験の
   const spyInit = async (...a) => { touched.push('checkInit'); return pt.checkInit(...a); };
   const spySession = (fn) => { touched.push('session'); return lz.withSession(fn); };
   const copy = { ...E.POLICIES.test };
-  const base = { lzMinRows: 1, runsDir: path.join(dataDir, 'engine-runs'), csvBuf: dailyBuf(), csv: { sha256: sha(dailyBuf()), rows: 2, target_as_of: AS_OF, source_run_id: RUN_DIR },
+  const { plan_id: _pid, created_at: _cat, occupancy: _occ, ...body } = JSON.parse(fs.readFileSync(path.join(p.dir, 'plan.json'), 'utf8'));
+  const base = { lzMinRows: 1, runsDir: path.join(dataDir, 'engine-runs'), csvBuf: fs.readFileSync(path.join(p.dir, 'test.csv')),
+    csv: { sha256: body.test_csv.sha256, rows: body.test_csv.rows, target_as_of: body.source.as_of, source_run_id: body.source.run_id },
     occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: pt.client, checkInit: spyInit, withSession: spySession,
     capabilities: { exportBarcodes: true }, notify: async () => true, createGuard: G.createGuard, log: () => {}, heartbeatMs: 60000 };
   await assert.rejects(E.importOne({ ...base, policy: copy }), /POLICIES に無い/);
   await assert.rejects(E.importOne({ ...base, policy: undefined }), /POLICIES に無い/);
   await assert.rejects(E.verifyAgain({ ...base, policy: copy, runId: 'lzim_test_x', locateRun: () => { touched.push('locate'); return dataDir; } }), /POLICIES に無い/);
-  // 試験の決まりでも、呼び手の値 (context) の欠け・余計なキー (予約のキーで固定の項目を上書き)・CSV の識別の違い = 何も触らずに断る (Codex #1535 R1)
-  const ctx = { planId: p.planId, planSha256: p.planSha256, preCheck: () => null, extraIds: [] };
+  // 試験の決まりでも、呼び手の値 (context) の欠け・余計なキー (予約のキーで固定の項目を上書き)・計画と承認の印・CSV の違い = 何も触らずに断る (Codex #1535 R1・R2)
+  const ctx = { planId: p.planId, planSha256: p.planSha256, plan: body };
+  const emptyGroups = { ...body, groups: [] };
+  const otherCsv = csvBuf(['形式/型番', '商品名', 'ふりがな', '仕入単価', '取引先id'], [['A-1', '別の名前', '別の名前', '1', '0007'], ['B-2', 'B', 'B', '0', '0002']]);
+  const broken = Buffer.from('abc');
   for (const [name, over, re] of [
     ['context なし', { context: undefined }, /context が無い/],
-    ['preCheck なし', { context: { planId: ctx.planId, planSha256: ctx.planSha256, extraIds: [] } }, /キーは/],
-    ['extraIds なし', { context: { planId: ctx.planId, planSha256: ctx.planSha256, preCheck: ctx.preCheck } }, /キーは/],
+    ['計画なし', { context: { planId: ctx.planId, planSha256: ctx.planSha256 } }, /キーは/],
+    ['前の形 (preCheck・extraIds を呼び手が渡す)', { context: { planId: ctx.planId, planSha256: ctx.planSha256, preCheck: () => null, extraIds: [] } }, /キーは/],
     ['tag で mode を上書き', { context: { ...ctx, tag: { mode: 'nightly' } } }, /キーは/],
     ['recExtra で run_id を上書き', { context: { ...ctx, recExtra: { run_id: 'x' } } }, /キーは/],
-    ['preCheck が関数でない', { context: { ...ctx, preCheck: null } }, /preCheck/],
-    ['extraIds に空', { context: { ...ctx, extraIds: [''] } }, /extraIds/],
+    ['計画が承認の印と違う', { context: { ...ctx, plan: { ...body, rows: body.rows.slice(1) } } }, /承認の印と違う/],
+    ['組の商品が空の計画 (印も計算し直した)', { context: { ...ctx, plan: emptyGroups, planSha256: TP.planSha256(emptyGroups) } }, /計画の組の商品/],
+    ['計画の CSV と違う CSV', { context: ctx, csvBuf: otherCsv, csv: { ...base.csv, sha256: sha(otherCsv), rows: 2 } }, /計画の CSV と違う/],
+    ['CSV の出どころが計画と違う', { context: ctx, csv: { ...base.csv, source_run_id: 'lzd_other' } }, /CSV の識別が計画と違う/],
     ['承認の印の形', { context: { ...ctx, planSha256: 'short' } }, /planSha256/],
     ['計画 ID の形', { context: { ...ctx, planId: '../x' } }, /planId/],
     ['CSV の識別が中身と違う', { context: ctx, csv: { ...base.csv, sha256: 'b'.repeat(64) } }, /csv\.sha256/],
     ['CSV の識別に余計なキー', { context: ctx, csv: { ...base.csv, mode: 'nightly' } }, /キーは/],
+    ['壊れた CSV (sha256 は合っている)', { context: ctx, csvBuf: broken, csv: { ...base.csv, sha256: sha(broken) } }, /取り込む CSV の形が違う/],
+    ['行数が CSV と違う', { context: ctx, csv: { ...base.csv, rows: base.csv.rows + 1 } }, /csv\.rows/],
+    ['実在しない日', { context: ctx, csv: { ...base.csv, target_as_of: '2030-02-30' } }, /target_as_of/],
+    ['出どころが無い', { context: ctx, csv: { ...base.csv, source_run_id: undefined } }, /source_run_id/],
   ]) await assert.rejects(E.importOne({ ...base, policy: E.POLICIES.test, ...over }), re, name);
-  await assert.rejects(E.verifyAgain({ ...base, policy: E.POLICIES.test, runId: 'lzim_test_x', context: {}, locateRun: () => { touched.push('locate'); return dataDir; } }), /キーは/);
+  for (const c of [{}, { readExtraIds: () => ['A-1'] }]) await assert.rejects(E.verifyAgain({ ...base, policy: E.POLICIES.test, runId: 'lzim_test_x', context: c, locateRun: () => { touched.push('locate'); return dataDir; } }), /キーは/);
   assert.deepEqual([touched, lz.st.calls.slice(callsAfterPlan), S.getStatus(pt.db).state, fs.existsSync(base.runsDir)], [[], [], 'idle', false]);
   // 決まりは凍結 (書き換えて使えない)・decided:false の確かめの決まりを許すのは試験だけ
   assert.ok(Object.isFrozen(E.POLICIES) && Object.values(E.POLICIES).every((x) => Object.isFrozen(x)));
@@ -646,6 +658,20 @@ await ta('[28] 共通の仕組みに渡す試験だけの値が効く (3b-1): im
   const vj = JSON.parse(fs.readFileSync(path.join(r.runDir, 'verify.json'), 'utf8'));
   assert.ok(vj.barcode.diffs.some((d) => d.id === 'A-1'), JSON.stringify(vj.barcode.diffs));
   assert.equal(S.getStatus(pt.db).state, 'partial');
+  // 確かめのやり直し: その回の計画 (plan.json) が記録の計画の ID・承認の印と違う (組を空に・ID を変えた) = 比べる商品が分からない = 確かめない・未確かめのまま・知らせる (Codex #1535 R2 Medium)
+  for (const tamper of [(x) => ({ ...x, groups: [] }), (x) => ({ ...x, plan_id: 'lzt_other' })]) {
+    const dd = setupData(); const l = fakeLz({ over: { postExportFails: true } }); const q = portal();
+    const pp = await planned(dd, l);
+    const rr = await T.runTest({ ...runOpts(dd, pp, q), withSession: l.withSession, notify: async () => true });
+    assert.equal(S.getStatus(q.db).state, 'imported_unverified');
+    const pf = path.join(pp.dir, 'plan.json');
+    fs.writeFileSync(pf, JSON.stringify(tamper(JSON.parse(fs.readFileSync(pf, 'utf8')))));
+    const sent = [];
+    await assert.rejects(T.verifyOnly({ lzMinRows: 1, dataDir: dd, runId: rr.runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: q.client, checkInit: q.checkInit,
+      withSession: fakeLz().withSession, capabilities: { exportBarcodes: true }, notify: async (x) => { sent.push(x); return true; }, log: () => {} }), /計画 \(plan\.json\) が記録の計画の ID・承認の印と違う/);
+    assert.deepEqual([S.getStatus(q.db).state, S.getStatus(q.db).lock, sent.length], ['imported_unverified', null, 1]);
+    assert.match(sent[0], /途中で失敗: 計画 \(plan\.json\)/);
+  }
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
