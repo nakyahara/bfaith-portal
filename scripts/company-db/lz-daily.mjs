@@ -20,10 +20,13 @@
  *   - 🚨 始めに running を書く = 同じ日の前の回の完了の印を無効にする。証跡を書けない = 作ること自体の失敗 (❌。前の合格を残さない)
  * 合否 (v2 H6・v3 M5): 説明できない差 0・判定できない 0 (NE の道の推測の形も)・形の差 0・不正で出さない 0・作れない行 0・比べる商品が 1 つ以上
  * 終わり方 (v2 M9・v3 M6。材料が無いを成功にしない):
- *   作れた (合格でも不合格でも) = exit 0 (✅ / ⚠️) + 成功の ping (台帳 lz-daily-build)
+ *   作れた (合格でも不合格でも) **かつポータルが成果物を受け取れた** = exit 0 (✅ / ⚠️) + 成功の ping (台帳 lz-daily-build)
  *   材料が無い・未設定 = ⏭️ exit 3 (daily-sync と朝の再試行では失敗 = retry に載る) + fail の ping (理由つき)
- *   作ること自体の失敗 = ❌ exit 1 + fail の ping
- *   ping は --daily で --out-dir が無い回 (daily-sync の回) だけ
+ *   作ること自体の失敗・**成果物をポータルに送れない** = ❌ exit 1 + fail の ping
+ *   ping と成果物の送りは --daily で --out-dir が無い回 (daily-sync の回) だけ
+ * 成果物の送り (③c-1b-3b 契約 v4 + 設計 R1 K3-1): 作った CSV を読み直して (sha256 が証跡と同じ) ポータルの口 (import-state-client.js の putArtifact・
+ *   LZ_LOCK_TOKEN) に送る。ポータルは中身から計算し直す。届かない・5xx = 少し待って 3 回まで / 断られた (4xx) = すぐ失敗。結果は証跡の portal に残す。
+ *   **ポータルの保存は warn ではなく成功の条件** (送れない日は miniPC が止まったときにどの端末からも取れない = 気づけるように失敗にする)。
  */
 import 'dotenv/config';
 import fs from 'node:fs';
@@ -39,6 +42,7 @@ import { readNeForLz, joinLzSnapshot } from '../../apps/master-decisions/lz-snap
 import { buildLzCsv, DAILY, LZ_CONVERTER_VERSION } from '../../apps/master-decisions/lz-csv.mjs';
 import { compareLz, LZ_COMPARE_VERSION } from '../../apps/master-decisions/lz-compare.mjs';
 import { readLzShohinMaster, classifyForLz, compareNeIndex, cdbLagOf, checkLagging, explainCdbDiffs } from '../../apps/master-decisions/lz-cdb.mjs';
+import { createImportStateClient } from '../../tools/logizard-automation/import-state-client.js';
 
 export const EVIDENCE_NAME = 'lz-daily';
 export const OUT_DIR = 'lz-daily';
@@ -49,6 +53,7 @@ export const STAMP_MAX_LAG_MS = 15 * 60 * 1000;   // 保存 → Drive への転�
 export const PREV_LOOKBACK_DAYS = 7;
 export const EXIT = Object.freeze({ complete: 0, error: 1, skipped: 3 });   // 2 は使わない (朝の再試行が「通知済み・打ち切り」と読む)
 export const LZ_DAILY_VERSION = 'lzd-v2';
+export const ARTIFACT_TRIES = 3;
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 /** YYYY-MM-DD の翌日 (暦の日付だけ。時刻の帯に関係なく) */
 export const nextDay = (ymd) => new Date(Date.parse(`${ymd}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
@@ -197,6 +202,43 @@ export function markSkipped({ outDir, asOf, reason, now = new Date(), write = (d
   return runId;
 }
 
+/**
+ * 作れた成果物をポータルへ送る (③c-1b-3b 契約 K3-1)。送るのは証跡の CSV を読み直して sha256 が同じもの (作ったものと送るものが同じ)。
+ * 届かない・5xx = 少し待って tries 回まで / 断られた (4xx: 申告違い・同じ ID の違う中身など) = すぐ失敗 (何度送っても同じ)
+ * @returns {Promise<{ ok: boolean, stored?: boolean, same?: boolean, tries?: number, error?: string }>}
+ */
+export async function sendArtifact({ outDir, evidence, client, by = 'lz-daily', tries = ARTIFACT_TRIES, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+  let buf;
+  try { buf = fs.readFileSync(path.join(outDir, evidence.csv.path)); } catch { return { ok: false, error: 'csv_missing' }; }
+  if (sha256(buf) !== evidence.csv.sha256 || buf.length !== evidence.csv.bytes) return { ok: false, error: 'csv_changed' };
+  let last = 'error';
+  for (let i = 1; i <= tries; i++) {
+    try {
+      const r = await client.putArtifact({ csvBuf: buf, sourceRunId: evidence.run_id, targetAsOf: evidence.as_of, verdict: evidence.verdict, sha256: evidence.csv.sha256, rows: evidence.csv.rows, by });
+      if (!r || r.csv_sha256 !== evidence.csv.sha256 || r.rows !== evidence.csv.rows) return { ok: false, error: 'portal_answer_mismatch', tries: i };   // 受け取ったと言うが中身の識別が違う
+      return { ok: true, stored: !!r.stored, same: !!r.same, tries: i };
+    } catch (e) {
+      last = `${(e && e.code) || 'error'}${e && e.status ? `_${e.status}` : ''}`.slice(0, 60);
+      const transient = !!e && (e.code === 'unreachable' || (Number.isInteger(e.status) && e.status >= 500));
+      if (!transient || i === tries) return { ok: false, error: last, tries: i };
+      await sleep(i * 5000);
+    }
+  }
+  return { ok: false, error: last };
+}
+
+/**
+ * 作れた回の後始末 (daily-sync の回): 成果物をポータルへ送り、結果を証跡 (portal) に残す。
+ * 送れない・証跡を書けない = 成功にしない (❌ exit 1 = 朝の再試行に載る。K3-1)
+ */
+export async function afterBuild({ outDir, r, client, now = new Date(), write = (d, n, p) => writeEvidence(d, n, p, { now }), send = sendArtifact }) {
+  const p = await send({ outDir, evidence: r.evidence, client });
+  const portal = { at: now.toISOString(), ...p };
+  if (!write(outDir, EVIDENCE_NAME, { ...r.evidence, portal })) return { code: EXIT.error, line: `❌ ロジザード毎日の商品マスタ (影): 証跡 lz-daily を書けない (ポータルへの送りの記録) / ${r.line}` };
+  if (!p.ok) return { code: EXIT.error, line: `❌ ロジザード毎日の商品マスタ (影): 成果物をポータルに送れない (${p.error}) = 成功にしない / ${r.line}` };
+  return { code: EXIT.complete, line: `${r.line} / ポータル ${p.same ? '受け取り済み' : '受け取った'}` };
+}
+
 /** 終わり方 → 監視への報告 (作れた回だけ ok。材料が無い・失敗は fail = ok が進まない = 締切で気づく) */
 export function pingFor(code, line) {
   return { status: code === EXIT.complete ? 'ok' : 'fail', note: String(line || '').replace(/\s+/g, ' ').slice(0, 180) };
@@ -257,6 +299,8 @@ if (isMain) {
       const lzStampPath = (a.lzStamp || process.env.LZ_SHOHIN_STAMP_PATH || DEFAULT_LZ_STAMP).trim();
       const r = await runLzDaily({ dataDir, outDir, asOf, lzMasterPath, lzStampPath, connect: () => connectWatcher(url) });
       last = r.line; code = r.state === 'complete' ? EXIT.complete : EXIT.skipped;
+      // daily-sync の回は成果物をポータルへ送る (受け取れたときだけ成功。手の試し = 送らない。K3-1)。LZ_LOCK_TOKEN が無い = 送れない = 失敗
+      if (r.state === 'complete' && ping) ({ code, line: last } = await afterBuild({ outDir, r, client: createImportStateClient() }));
     }
   } catch (e) {
     last = `❌ ロジザード毎日の商品マスタ (影): ${String(e && e.message).replace(/\s+/g, ' ').slice(0, 400)}`;

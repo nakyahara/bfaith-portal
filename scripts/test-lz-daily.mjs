@@ -464,5 +464,65 @@ await ta('[7] Company DB の読み手: 1 つの読み取りの取引 (repeatable
   assert.equal(seen[seen.length - 1], 'commit');
 });
 
+await ta('[11] 成果物をポータルへ送る (③c-1b-3b-3・K3-1): 作った CSV がポータルの確かめを通る (本物の状態の機械)・受け取れた = 成功 / 2 回目 = 受け取り済み / 届かない・5xx = 待って 3 回まで・4xx = すぐ失敗 / 送れない = ❌ exit 1 と証跡の portal / CSV が証跡と違う = 送らない / 口の答えの識別が違う = 失敗', async () => {
+  const s = setup();
+  const r = await run(s);
+  assert.equal(r.state, 'complete');
+  const S = await import('../apps/logizard-import-state/store.js');
+  const db = S.openImportStateDb(':memory:');
+  S.init(db, { by: 'x' });
+  const calls = [];
+  const real = { putArtifact: async (m) => { calls.push(m); return { ok: true, ...S.putArtifact(db, { sourceRunId: m.sourceRunId, targetAsOf: m.targetAsOf, verdict: m.verdict, csvBuf: m.csvBuf, sha256: m.sha256, rows: m.rows, by: m.by }) }; } };
+  const w = (d, n, p) => writeEvidence(d, n, p, { now, warn: () => {} });
+  const fast = (o) => RUN.sendArtifact({ ...o, sleep: async () => {} });
+  let f = await RUN.afterBuild({ outDir: s.dataDir, r, client: real, now, write: w, send: fast });
+  assert.equal(f.code, RUN.EXIT.complete);
+  assert.match(f.line, /^✅ ロジザード毎日の商品マスタ \(影\): 合格 .* \/ ポータル 受け取った$/);
+  const art = S.getArtifact(db, { sourceRunId: r.runId });
+  assert.deepEqual([art.csv_sha256, art.rows, art.verdict, art.target_as_of, art.received_by], [r.evidence.csv.sha256, r.evidence.csv.rows, 'pass', asOf, 'lz-daily']);
+  let ev = evOf(s.dataDir);
+  assert.deepEqual([ev.state, ev.run_id, ev.portal.ok, ev.portal.stored, ev.portal.tries], ['complete', r.runId, true, true, 1]);
+  f = await RUN.afterBuild({ outDir: s.dataDir, r, client: real, now, write: w, send: fast });
+  assert.match(f.line, /ポータル 受け取り済み$/);
+  // 届かない 2 回 → 3 回目で届く = 成功 / 3 回とも = 失敗 / 5xx も待つ / 4xx はすぐ
+  const err = (code, status = null) => Object.assign(new Error(code), { code, status });
+  let n = 0;
+  const flaky = { putArtifact: async (m) => { n++; if (n < 3) throw err('unreachable'); return real.putArtifact(m); } };
+  assert.deepEqual(await fast({ outDir: s.dataDir, evidence: r.evidence, client: flaky }), { ok: true, stored: false, same: true, tries: 3 });
+  const always = (e) => { let k = 0; return { client: { putArtifact: async () => { k++; throw e; } }, count: () => k }; };
+  for (const [e, want, tries] of [[err('unreachable'), 'unreachable', 3], [err('internal', 500), 'internal_500', 3], [err('conflict', 409), 'conflict_409', 1], [err('mismatch', 400), 'mismatch_400', 1]]) {
+    const c = always(e);
+    const x = await fast({ outDir: s.dataDir, evidence: r.evidence, client: c.client });
+    assert.deepEqual([x.ok, x.error, x.tries, c.count()], [false, want, tries, tries], want);
+  }
+  const down = always(err('unreachable'));
+  f = await RUN.afterBuild({ outDir: s.dataDir, r, client: down.client, now, write: w, send: fast });
+  assert.equal(f.code, RUN.EXIT.error);
+  assert.match(f.line, /^❌ ロジザード毎日の商品マスタ \(影\): 成果物をポータルに送れない \(unreachable\) = 成功にしない \/ ✅/);
+  ev = evOf(s.dataDir);
+  assert.deepEqual([ev.state, ev.portal.ok, ev.portal.error], ['complete', false, 'unreachable']);
+  assert.equal(RUN.pingFor(f.code, f.line).status, 'fail');
+  // 証跡を書けない = 成功にしない
+  f = await RUN.afterBuild({ outDir: s.dataDir, r, client: real, now, write: () => false, send: fast });
+  assert.deepEqual([f.code, /証跡 lz-daily を書けない/.test(f.line)], [RUN.EXIT.error, true]);
+  // 口の答えの識別が違う = 失敗
+  const liar = { putArtifact: async () => ({ ok: true, stored: true, csv_sha256: 'x'.repeat(64), rows: r.evidence.csv.rows }) };
+  assert.deepEqual((await fast({ outDir: s.dataDir, evidence: r.evidence, client: liar })).error, 'portal_answer_mismatch');
+  // CSV が証跡と違う (書き換わった・消えた) = 送らない
+  const before = calls.length;
+  const csvPath = path.join(s.dataDir, r.evidence.csv.path);
+  const orig = fs.readFileSync(csvPath);
+  fs.chmodSync(csvPath, 0o666);
+  fs.writeFileSync(csvPath, Buffer.concat([orig, Buffer.from('x')]));
+  assert.deepEqual(await fast({ outDir: s.dataDir, evidence: r.evidence, client: real }), { ok: false, error: 'csv_changed' });
+  fs.rmSync(csvPath);
+  assert.deepEqual(await fast({ outDir: s.dataDir, evidence: r.evidence, client: real }), { ok: false, error: 'csv_missing' });
+  assert.equal(calls.length, before);
+  // 本番の入口: daily-sync の回 (ping を打つ回 = --daily で --out-dir なし) だけ、作れた後に送る (手の試しは送らない)
+  const src = fs.readFileSync(new URL('./company-db/lz-daily.mjs', import.meta.url), 'utf8');
+  assert.ok(src.includes("if (r.state === 'complete' && ping) ({ code, line: last } = await afterBuild({ outDir, r, client: createImportStateClient() }));"));
+  assert.ok(src.includes('ping = a.daily && !a.outDir;'));
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);
