@@ -72,6 +72,8 @@ export function createImportStateClient({ url = process.env.LZ_IMPORT_STATE_URL 
     listArtifacts: (limit = 14) => call('GET', `/artifacts?limit=${checkLimit(limit, 60)}`),
     outbox: (limit = 20) => call('GET', `/outbox?limit=${checkLimit(limit, 100)}`),
     outboxSent: (b) => call('POST', '/outbox/sent', b),
+    // 毎晩の本番を始められるか (副作用なし・③c-1b-2b-2 N4)
+    nightlyReadiness: ({ source_run_id, csv_sha256, rows, target_as_of }) => call('GET', `/nightly-readiness?${new URLSearchParams({ source_run_id: String(source_run_id), csv_sha256: String(csv_sha256), rows: String(rows), target_as_of: String(target_as_of) })}`),
   };
 }
 
