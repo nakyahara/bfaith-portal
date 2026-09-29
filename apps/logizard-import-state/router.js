@@ -25,6 +25,9 @@
  *   GET  /apps/logizard-import-state/api/artifacts/:source_run_id   1 つの識別 (無い = 404)
  *   GET  /apps/logizard-import-state/api/outbox[?limit]       まだ送れていない知らせ (halt・残った再適用待ち・確認待ち)
  *   POST /apps/logizard-import-state/api/outbox/sent          { id, by }   送れた (1 回だけ・もう送れた = already)
+ *   ③c-1b-2b-2 (契約 v3 N1・N4・N6): GET /api/status に clock (Render の時計)・nightly_last (最後の毎晩の回の履歴)
+ *   GET  /apps/logizard-import-state/api/nightly-readiness?source_run_id&csv_sha256&rows&target_as_of
+ *        毎晩の本番を始められるか (副作用なし・本当の nightly と同じ照らし)。{ ready, codes, messages, manual_v4, cutover_phase, clock, ... }
  * 断る = 409 (状態・鍵) / 400 (形) / 404 (まだ初期化していない)。{ error: code, message }
  */
 import { Router } from 'express';
@@ -107,6 +110,12 @@ export function createImportStateRouter({ getDb = null, now = () => Date.now(), 
     const a = S.getArtifact(dbOf(), { sourceRunId: req.params.id });
     if (!a) throw new S.ImportStateError('not_found', 'その成果物は無い', 404);
     return { artifact: a };
+  }));
+  // 毎晩の本番を始められるか (副作用なし。N4)。rows は数に直してから渡す (形の違い = 400)
+  router.get('/api/nightly-readiness', handle((_b, req) => {
+    const q = req.query || {};
+    const rows = /^[0-9]{1,9}$/.test(String(q.rows ?? '')) ? Number(q.rows) : NaN;
+    return S.nightlyReadiness(dbOf(), { sourceRunId: q.source_run_id, csvSha256: q.csv_sha256, rows, targetAsOf: q.target_as_of, now: now() });
   }));
   router.get('/api/outbox', handle((_b, req) => ({ outbox: S.outboxPending(dbOf(), { limit: limitOf(req, 20, 100) }) })));
   router.post('/api/outbox/sent', handle((b) => S.outboxMarkSent(dbOf(), { id: b.id, by: b.by, now: now() })));

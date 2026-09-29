@@ -9,11 +9,21 @@
  * 押す動きは二度としない (呼び手の決まり)。
  */
 
-/** 口の断りの code (store.js の fail の code と router の 4xx)。これ以外の 4xx・5xx・通信の失敗 = unknown */
+/**
+ * 口の断りの code (store.js・router.js・admin-router.js の 4xx の code 全部)。これ以外の 4xx・5xx・通信の失敗 = unknown。
+ * 足し忘れ・消し忘れは試験が機械で照らす (store と口の code を全部拾って一致を見る。③c-1b-2b-2 契約 v3 = R0-L11)
+ */
 export const REFUSAL_CODES = Object.freeze(new Set([
+  // 状態・鍵 (store.js)
   'bad_request', 'not_initialized', 'init_mismatch', 'busy', 'halted', 'not_halted', 'state', 'run_mismatch', 'run_used',
   'lock_lost', 'lock_used', 'bad_transition', 'nightly_done', 'partial_unchecked', 'stale', 'already_initialized', 'history_exists',
-  'unauthorized', 'bad_json', 'too_large',
+  // 手の取込・成果物・設定 (③c-1b-3b)
+  'disabled', 'retired', 'manual_open', 'needs_review', 'not_open', 'not_found', 'artifact_missing', 'artifact_broken', 'mismatch', 'conflict',
+  'bad_csv', 'bad_account', 'gas_closed', 'one_way',
+  // 毎晩の本番 (③c-1b-2b-2 N1)
+  'bad_run_id', 'outside_window', 'stale_target',
+  // 口 (router.js・admin-router.js)
+  'unauthorized', 'session_expired', 'forbidden', 'origin_mismatch', 'unsupported_media_type', 'bad_json', 'too_large',
 ]));
 /** 送る前に止まった (呼び手を作れない) / 口が中身を読む前に断った (503 not_configured) = 更新していない */
 const NOT_SENT = Object.freeze(new Set(['no_token', 'bad_url', 'not_configured']));

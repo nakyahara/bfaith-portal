@@ -16,6 +16,9 @@
  *     毎晩の verified の取引で区切りまでの成果物にある商品だけ閉じる・毎晩の成果物は中身から計算し直して受け取り nightly はそれが無いと始めない・
  *     halt と残った待ちと確認待ちは outbox に積む・設定 (cutover_phase は一方通行・lz_accounts)・表は追記だけ・機械の口には数と真偽だけ
  *     機能の旗 LZ_MANUAL_V4 (この試験は on で動かす・[27] で off = 今までの動き)
+ *   30〜35 (③c-1b-2b-2 契約 v3・毎晩の本番のポータル側): Render の時計の窓 [00:15, 00:50)・対象の日 = 前の日・実行 ID の形 (断ったら何も残らない)・
+ *     nightly の回の確かめのやり直しの窓・nightly_last は出来事の履歴から・副作用の無い nightly-readiness (本当の照らしと同じ答え)・
+ *     outbox は止め・要確認が先・断りの code の一覧を機械で照らす
  * 使い方: node scripts/test-logizard-import-state.mjs
  */
 import assert from 'node:assert/strict';
@@ -51,6 +54,11 @@ const nightlyDetail = (a) => ({ csv_sha256: a.csv_sha256, rows: a.rows, mode: 'n
 const RESULT_OK = (n) => `インポート結果 総件数 : ${n} 処理件数 : ${n} 処理不要件数 : 0 エラー件数 : 0`;
 const MIN = 60000;
 const fm = (ms) => Math.floor(ms / MIN) * MIN;   // ロジザードの履歴は分まで
+// 毎晩の本番 (③c-1b-2b-2 N1): Render の時刻の窓 [00:15, 00:50)・対象の日 = JST の前の日・実行 ID の形 (lzim_night_…)
+const DAY = 86400000;
+const nightAt = (target, plus = 0) => Date.parse(`${target}T00:00:00Z`) + DAY - 9 * 3600000 + 20 * MIN + plus;   // 対象の日の次の日の JST 00:20
+let nightSeq = 0;
+const nightRun = (now) => `lzim_night_${new Date(now).toISOString().replace(/[-:.]/g, '').slice(0, 15)}_${(++nightSeq).toString(16).padStart(6, '0')}`;
 
 console.log('test-logizard-import-state');
 
@@ -505,32 +513,36 @@ await ta('[19] importing には mode (auto = nightly / test・手の ③ = manua
   const db = S.openImportStateDb(':memory:');
   const { init_id } = S.init(db, { by: 'x', now: T0 });
   let n = 0;
-  const start = (mode, target, now = T0 + (++n) * 1000) => {
-    const runId = `lzim_e${n}`;
+  const start = (mode, target) => {
+    n++;
+    // 毎晩の本番 = 対象の日の次の日の JST 00:20 に・形の正しい実行 ID で (③c-1b-2b-2 N1)
+    const night = mode === 'nightly' && /^\d{4}-\d{2}-\d{2}$/.test(String(target));
+    const now = night ? nightAt(target, n * 1000) : T0 + n * 1000;
+    const runId = night ? nightRun(now) : `lzim_e${n}`;
     const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId, ttlSec: 30, by: 'auto', now });
     // nightly は同じ識別の成果物があるときだけ (K3-1) = 形の正しい対象の日には成果物を置いてから
     const detail = () => (mode === 'nightly' && /^\d{4}-\d{2}-\d{2}$/.test(String(target)) ? nightlyDetail(artifact(db, { id: `lzd_${target.replace(/-/g, '')}_n`, asOf: target, now })) : imp(mode, target));
-    return { L, runId, go: () => S.transition(db, { lockToken: L.lock_token, runId, to: 'importing', detail: detail(), by: 'auto', now }) };
+    return { L, runId, now, go: () => S.transition(db, { lockToken: L.lock_token, runId, to: 'importing', detail: detail(), by: 'auto', now }) };
   };
   for (const [mode, target] of [[undefined, '2030-01-15'], ['manual', '2030-01-15'], ['nightly', '2030/01/15'], ['nightly', null], ['shadow', '2030-01-15']]) {
     const x = start(mode, target);
     throwsCode(() => x.go(), 'bad_request');
     S.release(db, { lockToken: x.L.lock_token, by: 'auto', now: T0 + n * 1000 });
   }
-  const done = (x) => { x.go(); S.transition(db, { lockToken: x.L.lock_token, runId: x.runId, to: 'unknown', by: 'auto', now: T0 + n * 1000 }); S.resolve(db, { runId: x.runId, outcome: 'not_imported', note: '履歴を見た', by: '中原', now: T0 + n * 1000 }); };
+  const done = (x) => { x.go(); S.transition(db, { lockToken: x.L.lock_token, runId: x.runId, to: 'unknown', by: 'auto', now: x.now }); S.resolve(db, { runId: x.runId, outcome: 'not_imported', note: '履歴を見た', by: '中原', now: x.now }); };
   done(start('test', '2030-01-15'));
   done(start('test', '2030-01-15'));   // test は何回でも
   done(start('nightly', '2030-01-15'));   // 1 回目 (unknown → 解除の後も)
   const again = start('nightly', '2030-01-15');
   throwsCode(() => again.go(), 'nightly_done');
-  S.release(db, { lockToken: again.L.lock_token, by: 'auto', now: T0 + n * 1000 });
+  S.release(db, { lockToken: again.L.lock_token, by: 'auto', now: again.now });
   done(start('nightly', '2030-01-16'));   // 次の対象の日は始められる
   // 成果物が無い・中身 (sha256) が違う・判定 fail = 始めない (K3-1)
   for (const d of [imp('nightly', '2030-01-17', { source_run_id: 'lzd_nothing' }), { ...nightlyDetail(artifact(db, { id: 'lzd_20300118_x', asOf: '2030-01-18' })), csv_sha256: SHA },
     nightlyDetail(artifact(db, { id: 'lzd_20300119_f', asOf: '2030-01-19', verdict: 'fail' })), { ...nightlyDetail(artifact(db, { id: 'lzd_20300120_x', asOf: '2030-01-20' })), target_as_of: '2030-01-21' }]) {
-    const x = start('test', '2030-01-15');
-    throwsCode(() => S.transition(db, { lockToken: x.L.lock_token, runId: x.runId, to: 'importing', detail: d, by: 'auto', now: T0 + n * 1000 }), 'artifact_missing');
-    S.release(db, { lockToken: x.L.lock_token, by: 'auto', now: T0 + n * 1000 });
+    const x = start('nightly', d.target_as_of);   // その対象の日の夜に (窓・対象の日は合う = 成果物で断る)
+    throwsCode(() => S.transition(db, { lockToken: x.L.lock_token, runId: x.runId, to: 'importing', detail: d, by: 'auto', now: x.now }), 'artifact_missing');
+    S.release(db, { lockToken: x.L.lock_token, by: 'auto', now: x.now });
   }
   const runs = db.prepare('SELECT run_id, mode, target_as_of FROM import_runs ORDER BY started_at').all();
   assert.deepEqual(runs.map((r) => `${r.mode}:${r.target_as_of}`), ['test:2030-01-15', 'test:2030-01-15', 'nightly:2030-01-15', 'nightly:2030-01-16']);
@@ -554,11 +566,11 @@ await ta('[20] 前からある表 (Render の今の DB) にも列を足す・足
   assert.deepEqual([s.init_id, s.state, s.state_event_id, s.notified], ['lzi_old', 'idle', null, false]);
   assert.deepEqual(db.prepare('SELECT run_id, mode, target_as_of FROM import_runs').all(), [{ run_id: 'lzim_old', mode: null, target_as_of: null }]);
   assert.throws(() => db.prepare("UPDATE import_runs SET mode = 'nightly'").run(), /追記だけ/);
-  const L = S.acquire(db, { initId: 'lzi_old', holder: 'auto', purpose: 'import', runId: 'lzim_new', by: 'auto', now: T0 });
-  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_new', to: 'importing', detail: nightlyDetail(artifact(db)), by: 'auto', now: T0 });
+  const L = S.acquire(db, { initId: 'lzi_old', holder: 'auto', purpose: 'import', runId: 'lzim_night_20300115T152000_00000a', by: 'auto', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_night_20300115T152000_00000a', to: 'importing', detail: nightlyDetail(artifact(db)), by: 'auto', now: T0 });
   db.close();
   const again = S.openImportStateDb(file);   // 2 回開いても列・表は 1 回だけ足す
-  assert.equal(again.prepare("SELECT mode FROM import_runs WHERE run_id = 'lzim_new'").get().mode, 'nightly');
+  assert.equal(again.prepare("SELECT mode FROM import_runs WHERE run_id = 'lzim_night_20300115T152000_00000a'").get().mode, 'nightly');
   assert.deepEqual([again.prepare('SELECT COUNT(*) AS n FROM daily_artifacts').get().n, again.prepare('SELECT COUNT(*) AS n FROM nightly_snapshots').get().n, S.getSettings(again)],
     [1, 1, { cutover_phase: 'cutover', lz_accounts: [] }]);
   again.close();
@@ -656,9 +668,9 @@ await ta('[23] 再適用待ちは (手の取込, 商品) の義務 (K3-2): 毎�
   let t = T0, n = 0;
   const nightly = (ids, { fail = false, inject = null } = {}) => {
     t += 86400000; n++;
-    const asOf = new Date(t + 9 * 3600000).toISOString().slice(0, 10);
+    const asOf = new Date(t - DAY + 9 * 3600000).toISOString().slice(0, 10);   // 対象の日 = JST の前の日 (③c-1b-2b-2 N1)
     const a = artifact(db, { id: `lzd_n${n}`, asOf, ids, now: t });
-    const runId = `lzim_n${n}`;
+    const runId = nightRun(t);
     const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId, by: 'auto', now: t });
     S.transition(db, { lockToken: L.lock_token, runId, to: 'importing', detail: nightlyDetail(a), by: 'auto', now: t });
     if (inject) inject();   // 区切りの後に足された義務 (状態の決まりでは起きないが、閉じる範囲の試験のため)
@@ -728,8 +740,8 @@ await ta('[24] 毎晩の成果物 (K3-1): 中身から sha256・行数・形を�
   // 整理: 毎日 1 つずつ 20 日 → 14 日より前は消える (新しい 3 つは残す)。取込の途中の回が使う成果物は古くても残す
   const day = 86400000;
   const inflight = artifact(db, { id: 'lzd_inflight', asOf: '2030-01-16', now: T0 + day });
-  const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_if', by: 'auto', now: T0 + day });
-  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_if', to: 'importing', detail: nightlyDetail(inflight), by: 'auto', now: T0 + day });
+  const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_night_20300116T152000_00000b', by: 'auto', now: T0 + day });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_night_20300116T152000_00000b', to: 'importing', detail: nightlyDetail(inflight), by: 'auto', now: T0 + day });
   for (let i = 2; i <= 20; i++) artifact(db, { id: `lzd_d${i}`, asOf: new Date(T0 + i * day + 9 * 3600000).toISOString().slice(0, 10), now: T0 + i * day });
   const ids = S.listArtifacts(db, { limit: 60 }).map((x) => x.source_run_id);
   assert.ok(ids.includes('lzd_inflight') && !ids.includes('lzd_x1') && !ids.includes('lzd_d2') && ids.includes('lzd_d6') && ids.includes('lzd_d20'), ids.join(','));
@@ -796,10 +808,10 @@ await ta('[27] 機能の旗 LZ_MANUAL_V4 が立っていない = 今までの動
     const db = S.openImportStateDb(':memory:');
     const { init_id } = S.init(db, { by: 'x', now: T0 });
     // nightly は成果物が無くても始められる (今までどおり)
-    const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_n0', by: 'auto', now: T0 });
-    S.transition(db, { lockToken: L.lock_token, runId: 'lzim_n0', to: 'importing', detail: imp('nightly'), by: 'auto', now: T0 });
-    S.transition(db, { lockToken: L.lock_token, runId: 'lzim_n0', to: 'imported_unverified', by: 'auto', now: T0 });
-    S.transition(db, { lockToken: L.lock_token, runId: 'lzim_n0', to: 'verified', by: 'auto', now: T0 });
+    const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_night_20300115T152000_00000c', by: 'auto', now: T0 });
+    S.transition(db, { lockToken: L.lock_token, runId: 'lzim_night_20300115T152000_00000c', to: 'importing', detail: imp('nightly'), by: 'auto', now: T0 });
+    S.transition(db, { lockToken: L.lock_token, runId: 'lzim_night_20300115T152000_00000c', to: 'imported_unverified', by: 'auto', now: T0 });
+    S.transition(db, { lockToken: L.lock_token, runId: 'lzim_night_20300115T152000_00000c', to: 'verified', by: 'auto', now: T0 });
     S.release(db, { lockToken: L.lock_token, by: 'auto', now: T0 });
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM nightly_snapshots').get().n, 0);
     // 旧い手の ③ (止めてから)
@@ -942,6 +954,198 @@ await ta('[29] 止めの番号 (Codex #1542 R2): 前からある DB が止まっ
   throwsCode(() => S.resume(db, { by: '中原', note: 'もう一度再開', expectedHaltRevision: r2, now: T0 }), 'not_halted');
   assert.equal(S.getStatus(db, { now: T0 }).halt_revision, null);
   db.close();
+});
+
+// ── ③c-1b-2b-2 (毎晩の本番のポータル側・契約 v3) ──
+const JST = (s) => Date.parse(`${s}+09:00`);
+const cnts = (db) => ['import_events', 'import_runs', 'nightly_snapshots', 'outbox', 'reapply_closures'].map((t) => db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n);
+
+await ta('[30] Render の時計 (N1): 始めてよい窓 [00:15, 00:50)・対象の日 = JST の前の日・締め切り 00:55 / nightly の importing は Render の時刻で窓・前の日・実行 ID の形を照らす (断ったら import_runs も区切りも残らない) / nightly の回の確かめのやり直しの鍵も同じ窓', async () => {
+  const c = (s) => S.nightlyClock(JST(s));
+  assert.deepEqual([c('2030-01-16T00:14:59.999').in_start_window, c('2030-01-16T00:15:00.000').in_start_window, c('2030-01-16T00:49:59.999').in_start_window, c('2030-01-16T00:50:00.000').in_start_window], [false, true, true, false]);
+  const x = c('2030-01-16T00:20:00');
+  assert.deepEqual([x.jst_date, x.expected_target_as_of, x.nightly_deadline_at, x.start_window.from, x.start_window.to, x.server_now], ['2030-01-16', '2030-01-15', JST('2030-01-16T00:55:00'), JST('2030-01-16T00:15:00'), JST('2030-01-16T00:50:00'), JST('2030-01-16T00:20:00')]);
+  assert.deepEqual([c('2030-01-16T23:59:59.999').expected_target_as_of, c('2030-01-17T00:00:00').expected_target_as_of, c('2030-03-01T00:20:00').expected_target_as_of], ['2030-01-15', '2030-01-16', '2030-02-28']);
+  // importing を断る (Render の時刻で。miniPC の時計ではない)
+  const db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  const a15 = artifact(db), a14 = artifact(db, { id: 'lzd_20300114_a', asOf: '2030-01-14' });
+  const tryAt = (now, { detail = nightlyDetail(a15), runId = nightRun(now) } = {}) => {
+    const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId, ttlSec: 60, by: 'auto', now });
+    const before = cnts(db);
+    try { return S.transition(db, { lockToken: L.lock_token, runId, to: 'importing', detail, by: 'auto', now }); } catch (e) {
+      const after = cnts(db);
+      assert.deepEqual([after[1], after[2]], [before[1], before[2]], '断ったら import_runs と区切りは残らない');
+      S.release(db, { lockToken: L.lock_token, by: 'auto', now });
+      throw e;
+    }
+  };
+  throwsCode(() => tryAt(JST('2030-01-16T00:14:59.999')), 'outside_window');
+  throwsCode(() => tryAt(JST('2030-01-16T00:50:00.000')), 'outside_window');
+  throwsCode(() => tryAt(JST('2030-01-16T12:00:00')), 'outside_window');   // 昼 (miniPC の時計が夜でも、Render の時刻が昼 = 断る)
+  throwsCode(() => tryAt(JST('2030-01-16T00:20:00'), { detail: nightlyDetail(a14) }), 'stale_target');   // 古い成果物 (前の前の日)
+  throwsCode(() => tryAt(JST('2030-01-17T00:20:00')), 'stale_target');   // 時計がずれて 1 日後 = 前の日が合わない
+  for (const bad of ['lzim_e1', 'lzim_night_20300115T152000_ABCDEF', 'lzim_night_2030011T152000_abcdef', 'lzim_test_20300115T152000_abcdef']) {
+    assert.throws(() => tryAt(JST('2030-01-16T00:20:00'), { runId: bad }), (e) => e.code === 'bad_run_id' && e.status === 400, bad);
+  }
+  assert.deepEqual([db.prepare('SELECT COUNT(*) AS n FROM import_runs').get().n, db.prepare('SELECT COUNT(*) AS n FROM nightly_snapshots').get().n], [0, 0]);
+  // 試験の回 (test) は時刻と実行 ID の形を見ない (昼に中原さんと)
+  const tl = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_test_x1', by: 'auto', now: JST('2030-01-16T12:00:00') });
+  S.transition(db, { lockToken: tl.lock_token, runId: 'lzim_test_x1', to: 'importing', detail: imp('test', '2030-01-16'), by: 'auto', now: JST('2030-01-16T12:00:00') });
+  S.transition(db, { lockToken: tl.lock_token, runId: 'lzim_test_x1', to: 'unknown', by: 'auto', now: JST('2030-01-16T12:00:01') });
+  S.resolve(db, { runId: 'lzim_test_x1', outcome: 'not_imported', note: '履歴を見た', by: '中原', now: JST('2030-01-16T12:00:02') });
+  // 窓のはじめちょうど = 始められる → imported_unverified → 確かめのやり直しの鍵は窓の中だけ
+  const t0 = JST('2030-01-17T00:15:00.000');
+  const a16 = artifact(db, { id: 'lzd_20300116_a', asOf: '2030-01-16', now: t0 });
+  const rid = nightRun(t0);
+  const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: rid, ttlSec: 60, by: 'auto', now: t0 });
+  S.transition(db, { lockToken: L.lock_token, runId: rid, to: 'importing', detail: nightlyDetail(a16), by: 'auto', now: t0 });
+  S.transition(db, { lockToken: L.lock_token, runId: rid, to: 'imported_unverified', by: 'auto', now: t0 + 1000 });
+  S.release(db, { lockToken: L.lock_token, by: 'auto', now: t0 + 2000 });
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'verify', runId: rid, by: 'auto', now: JST('2030-01-17T08:40:00') }), 'outside_window');   // 昼は知らせだけ (K3-5)
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'verify', runId: rid, by: 'auto', now: JST('2030-01-18T00:50:00.000') }), 'outside_window');
+  const V = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'verify', runId: rid, by: 'auto', now: JST('2030-01-18T00:49:59.999') });
+  assert.equal(typeof V.lock_token, 'string');
+});
+
+await ta('[31] nightly_last (N6) = 最後の毎晩の回の履歴 (出来事から): 解除した・その後に試験の回が走った でもその夜の回の結末 / mark-unknown / verified', async () => {
+  const db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  assert.equal(S.getStatus(db, { now: T0 }).nightly_last, null);
+  const run = (target, steps) => {
+    const now = nightAt(target);
+    const a = artifact(db, { id: `lzd_${target.replace(/-/g, '')}_l`, asOf: target, now });
+    const runId = nightRun(now);
+    const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId, ttlSec: 30, by: 'auto', now });
+    S.transition(db, { lockToken: L.lock_token, runId, to: 'importing', detail: nightlyDetail(a), by: 'auto', now });
+    steps({ L, runId, now, a });
+    return { runId, now, a };
+  };
+  // 1 夜目: unknown → 解除 → 試験の回 (verified) が後から走る
+  const n1 = run('2030-01-15', ({ L, runId, now }) => {
+    S.transition(db, { lockToken: L.lock_token, runId, to: 'unknown', by: 'auto', now: now + 1 });
+    S.resolve(db, { runId, outcome: 'not_imported', note: '履歴を見た', by: '中原', now: now + 2 });
+  });
+  const tl = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_test_l1', by: 'auto', now: n1.now + 3 });
+  S.transition(db, { lockToken: tl.lock_token, runId: 'lzim_test_l1', to: 'importing', detail: imp('test'), by: 'auto', now: n1.now + 3 });
+  S.transition(db, { lockToken: tl.lock_token, runId: 'lzim_test_l1', to: 'imported_unverified', by: 'auto', now: n1.now + 4 });
+  S.transition(db, { lockToken: tl.lock_token, runId: 'lzim_test_l1', to: 'verified', by: 'auto', now: n1.now + 5 });
+  S.release(db, { lockToken: tl.lock_token, by: 'auto', now: n1.now + 6 });
+  let nl = S.getStatus(db, { now: n1.now + 7 }).nightly_last;
+  assert.equal(S.getStatus(db, { now: n1.now + 7 }).state, 'verified', '今の状態は試験の回の verified');
+  assert.deepEqual(nl, { run_id: n1.runId, target_as_of: '2030-01-15', source_run_id: n1.a.source_run_id, started_at: n1.now, last_state: 'unknown', resolved: { outcome: 'not_imported', from: 'unknown' } }, 'その夜の回の結末 (今の状態をそのまま付けない)');
+  // 2 夜目: importing のまま鍵が切れた → mark-unknown
+  const n2 = run('2030-01-16', ({ runId, now }) => { S.markUnknown(db, { runId, by: 'auto', reason: '起動したら importing が残っていた', now: now + 60000 }); });
+  nl = S.getStatus(db, { now: n2.now + 61000 }).nightly_last;
+  assert.deepEqual([nl.run_id, nl.last_state, nl.resolved], [n2.runId, 'unknown', null]);
+  S.resolve(db, { runId: n2.runId, outcome: 'not_imported', note: '履歴を見た', by: '中原', now: n2.now + 62000 });
+  // 3 夜目: verified
+  const n3 = run('2030-01-17', ({ L, runId, now }) => {
+    S.transition(db, { lockToken: L.lock_token, runId, to: 'imported_unverified', by: 'auto', now: now + 1 });
+    S.transition(db, { lockToken: L.lock_token, runId, to: 'verified', by: 'auto', now: now + 2 });
+    S.release(db, { lockToken: L.lock_token, by: 'auto', now: now + 3 });
+  });
+  nl = S.getStatus(db, { now: n3.now + 4 }).nightly_last;
+  assert.deepEqual([nl.run_id, nl.target_as_of, nl.last_state, nl.resolved], [n3.runId, '2030-01-17', 'verified', null]);
+  // 機械の口 (Bearer) の status にも出る (clock と一緒に)
+  await withServer(async ({ url, db: d2 }) => {
+    S.init(d2, { by: 'x', now: T0 });
+    const s = await C.createImportStateClient({ url, token: 'tok' }).status(1);
+    assert.deepEqual([s.clock.server_now, s.clock.expected_target_as_of, s.clock.in_start_window, s.nightly_last], [T0, '2030-01-15', true, null]);
+  });
+});
+
+await ta('[32] nightly-readiness (N4) = 副作用なし・本当の nightly (acquire + importing) と同じ照らしの答え / 止めている間も成果物の無い nightly を断ると分かる / 旗が無い = 成果物は見ない / 形の違い = 400', async () => {
+  const db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  const buf = csvOf(['A-1', 'B-2']);
+  const q = (o = {}) => ({ sourceRunId: 'lzd_20300115_a', csvSha256: shaOf(buf), rows: 2, targetAsOf: '2030-01-15', now: T0, ...o });
+  // 本当の道で試す (鍵 → importing)。断りの code を返す (通った = 'ok' = 取り消して戻す)
+  const real = (o = {}) => {
+    const p = q(o);
+    const runId = nightRun(p.now);
+    let L;
+    try { L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId, ttlSec: 30, by: 'auto', now: p.now }); } catch (e) { return e.code; }
+    try {
+      S.transition(db, { lockToken: L.lock_token, runId, to: 'importing', detail: { csv_sha256: p.csvSha256, rows: p.rows, mode: 'nightly', target_as_of: p.targetAsOf, source_run_id: p.sourceRunId }, by: 'auto', now: p.now });
+      return 'ok';
+    } catch (e) { S.release(db, { lockToken: L.lock_token, by: 'auto', now: p.now }); return e.code; }
+  };
+  const same = (o, want) => {
+    const before = cnts(db);
+    const r = S.nightlyReadiness(db, q(o));
+    assert.deepEqual(cnts(db), before, '副作用なし');
+    assert.deepEqual(r.codes, want, JSON.stringify(o));
+    assert.equal(r.ready, want.length === 0);
+    if (want.length) assert.equal(real(o), want[0], '本当の道も同じ最初の断り');
+    return r;
+  };
+  // 止めている + 成果物が無い (切替の手順: 止めたまま成果物の無い nightly が断られると分かる)
+  S.halt(db, { by: '中原', reason: '切替の確かめ', now: T0 });
+  let r = same({}, ['halted', 'artifact_missing']);
+  assert.deepEqual([r.manual_v4, r.halted, r.artifact.found, r.cutover_phase, r.clock.expected_target_as_of], [true, true, false, 'cutover', '2030-01-15']);
+  S.resume(db, { by: '中原', note: '確かめた', expectedHaltRevision: S.getStatus(db).halt_revision, now: T0 });
+  same({}, ['artifact_missing']);
+  artifact(db);
+  same({ rows: 3 }, ['artifact_missing']);
+  same({ now: JST('2030-01-16T00:50:00') }, ['outside_window']);
+  same({ now: JST('2030-01-17T00:20:00') }, ['stale_target']);
+  r = same({}, []);
+  assert.deepEqual([r.artifact, r.nightly_started, r.lock_active, r.manual_open], [{ found: true, verdict: 'pass', same: true }, false, false, false]);
+  assert.equal(real({}), 'ok');   // 始めた (importing)
+  r = S.nightlyReadiness(db, q());
+  assert.deepEqual([r.codes, r.nightly_started, r.lock_active, r.state], [['busy', 'state', 'nightly_done'], true, true, 'importing']);
+  // 旗が無い = 成果物は見ない (今までの動きと同じ)
+  const prev = process.env.LZ_MANUAL_V4;
+  delete process.env.LZ_MANUAL_V4;
+  try {
+    const d2 = S.openImportStateDb(':memory:');
+    S.init(d2, { by: 'x', now: T0 });
+    const r2 = S.nightlyReadiness(d2, q());
+    assert.deepEqual([r2.ready, r2.codes, r2.manual_v4], [true, [], false]);
+  } finally { process.env.LZ_MANUAL_V4 = prev; }
+  // 形の違い = 400
+  for (const o of [{ targetAsOf: '2030-02-30' }, { sourceRunId: '../x' }, { csvSha256: 'x' }, { rows: 0 }, { rows: 1.5 }]) {
+    assert.throws(() => S.nightlyReadiness(db, q(o)), (e) => e.code === 'bad_request' && e.status === 400, JSON.stringify(o));
+  }
+  // 機械の口 (Bearer・GET)
+  await withServer(async ({ url, db: d3 }) => {
+    S.init(d3, { by: 'x', now: T0 });
+    const c = C.createImportStateClient({ url, token: 'tok' });
+    const x = await c.nightlyReadiness({ source_run_id: 'lzd_20300115_a', csv_sha256: shaOf(buf), rows: 2, target_as_of: '2030-01-15' });
+    assert.deepEqual([x.ready, x.codes, x.clock.server_now], [false, ['artifact_missing'], T0]);
+    await assert.rejects(c.nightlyReadiness({ source_run_id: 'lzd_20300115_a', csv_sha256: shaOf(buf), rows: 'abc', target_as_of: '2030-01-15' }), (e) => e.code === 'bad_request' && e.status === 400);
+    assert.equal(d3.prepare('SELECT COUNT(*) AS n FROM import_events').get().n, 1, '口も副作用なし (init だけ)');
+  });
+});
+
+await ta('[33] outbox (N5) = 止め・要確認を先に、再適用待ちを後に (同じ組の中は古い順・古い再適用待ちが多くても新しい止めが後ろに隠れない)', async () => {
+  const db = S.openImportStateDb(':memory:');
+  S.init(db, { by: 'x', now: T0 });
+  const put = (kind, i) => db.prepare('INSERT INTO outbox (kind, dedupe_key, text, created_at) VALUES (?, ?, ?, ?)').run(kind, `${kind}:${i}`, `${kind} ${i}`, T0 + i);
+  for (let i = 1; i <= 30; i++) put('pending_reapply', i);
+  put('other', 31);
+  S.halt(db, { by: '中原', reason: '新しい止め', now: T0 + 32 });
+  put('manual_review', 33);
+  const got = S.outboxPending(db, { limit: 5 }).map((x) => x.kind);
+  assert.deepEqual(got, ['halt', 'manual_review', 'other', 'pending_reapply', 'pending_reapply']);
+  assert.deepEqual(S.outboxPending(db, { limit: 100 }).filter((x) => x.kind === 'pending_reapply').map((x) => x.text).slice(0, 3), ['pending_reapply 1', 'pending_reapply 2', 'pending_reapply 3']);
+});
+
+await ta('[34] 断りの code (R0-L11): store.js・router.js・admin-router.js の 4xx の code を全部拾って、portal-io.mjs の REFUSAL_CODES と一致 (足し忘れ・消し忘れが無い)・新しい code は refused', async () => {
+  const { REFUSAL_CODES, classifyPortalError } = await import('../scripts/logizard-import/portal-io.mjs');
+  const src = ['store.js', 'router.js', 'admin-router.js'].map((f) => fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'apps', 'logizard-import-state', f), 'utf8')).join('\n');
+  const found = new Set();
+  for (const m of src.matchAll(/fail\('([a-z_]+)'/g)) found.add(m[1]);
+  for (const m of src.matchAll(/out\.push\(\['([a-z_]+)'/g)) found.add(m[1]);   // 照らしの関数の断り (failFirst で 4xx になる)
+  for (const m of src.matchAll(/status\((4\d\d)\)\.json\(\{[^}]*?error: '([a-z_]+)'/g)) found.add(m[2]);
+  for (const m of src.matchAll(/error: err\.status === 413 \? '([a-z_]+)' : '([a-z_]+)'/g)) { found.add(m[1]); found.add(m[2]); }
+  assert.ok(!/fail\('[a-z_]+'[^;]*, 5\d\d\)/.test(src), 'store の断りは 4xx だけ (5xx の fail は無い)');
+  assert.ok(found.size >= 30, `拾えた code が少なすぎる (${found.size}) = 拾い方が壊れた`);
+  assert.deepEqual([...found].filter((c) => !REFUSAL_CODES.has(c)).sort(), [], '一覧に足し忘れ');
+  assert.deepEqual([...REFUSAL_CODES].filter((c) => !found.has(c)).sort(), [], '一覧の消し忘れ (どこでも使っていない code)');
+  for (const [status, code] of [[409, 'outside_window'], [409, 'stale_target'], [400, 'bad_run_id'], [409, 'artifact_missing'], [409, 'manual_open']]) assert.equal(classifyPortalError({ status, code }), 'refused', code);
+  assert.equal(classifyPortalError({ status: 409, code: 'no_such_code' }), 'unknown');
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
