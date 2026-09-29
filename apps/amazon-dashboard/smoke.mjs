@@ -332,7 +332,7 @@ check('ほかのタブも決済のそろった日で切る', () => {
   // 2026-09-29: 主の利益は税抜で引いた計算 (手数料 ÷ 1.1)・税込で引いた計算 (profit_amount) も _incl で持つ
   const settledProfitEx = db.prepare(`SELECT COALESCE(SUM(${q.PROFIT_EX_SQL}),0) AS p FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(monthFrom, last).p;
   assert(tm.settled_profit_after_ads === Math.round(settledProfitEx - expAds), '今月のタイルの確定利益 (広告後・税抜で引く) はそろった日までの広告費だけ引く ' + JSON.stringify([tm.settled_profit_after_ads, settledProfitEx, expAds]));
-  assert(tm.settled_profit_after_ads_incl === Math.round(settledProfit - expAds), '税込で引いた計算も持つ ' + JSON.stringify([tm.settled_profit_after_ads_incl, settledProfit, expAds]));
+  assert(tm.settled_profit_after_ads_incl === Math.round(settledProfit - expAds * 1.1), '税込で引いた計算も持つ (広告費は税抜 = × 1.1 を引く・2026-09-30) ' + JSON.stringify([tm.settled_profit_after_ads_incl, settledProfit, expAds]));
   const feesIn = db.prepare(`SELECT COALESCE(SUM(${q.TAXED_FEES_SQL}),0) AS f, COALESCE(SUM(promotion_tax_jpy),0) AS t FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(monthFrom, last);
   assert(Math.abs((settledProfitEx - settledProfit) - (feesIn.f / 11 + feesIn.t)) < 0.01 && feesIn.f > 0, '税抜 − 税込 = 課税の手数料 × 1/11 + 値引きの税の分 ' + JSON.stringify([settledProfitEx - settledProfit, feesIn.f / 11]));
   assert(tm.ad_cost === Math.round(campIn(monthFrom, today)), '広告費の行は今日までの実額のまま');
