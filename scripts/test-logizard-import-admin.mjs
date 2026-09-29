@@ -111,7 +111,7 @@ await ta('[3] 手の取込の流れ: 止める (知らせをすぐ送る) → �
     let r = await j('/settings', { method: 'POST', body: { key: 'lz_accounts', value: ['nakahara'], by: 'attacker' } });
     assert.deepEqual([r.status, r.body.value], [200, ['nakahara']]);
     r = await j('/halt', { method: 'POST', body: { reason: '自動の取込がおかしい', by: 'attacker' } });
-    assert.deepEqual([r.status, r.body.halted, r.body.notified, sent.length], [200, true, 1, 1]);
+    assert.deepEqual([r.status, r.body.halted, r.body.notified, sent.length], [200, true, true, 1]);
     assert.match(sent[0], /止めた \(admin@b-faith\.biz\)/);
     assert.deepEqual(S.outboxPending(db), []);   // 送れた = 送れた印
     r = await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a', by: 'attacker' } });
@@ -149,8 +149,8 @@ await ta('[4] 照合が合わない = needs_review → 知らせをすぐ送る 
     const m = (await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a' } })).body;
     tick(MIN);
     fail = true;   // この後の知らせは送れない
-    let r = await j(`/manual/${m.session_id}/complete`, { method: 'POST', body: { result_text: RESULT_OK(2), history: { file_name: 'logizard_shohinmaster_upload.csv', at: T0, account: 'nakahara' } } });
-    assert.deepEqual([r.status, r.body.status, r.body.mismatches, r.body.notified], [200, 'needs_review', ['file_name'], 0]);
+    let r = await j(`/manual/${m.session_id}/complete`, { method: 'POST', body: { result_text: RESULT_OK(2), history: { file_name: 'logizard_shohinmaster_upload.csv', at: T0 + MIN, account: 'nakahara' } } });
+    assert.deepEqual([r.status, r.body.status, r.body.mismatches, r.body.notified], [200, 'needs_review', ['file_name'], false]);
     assert.deepEqual(S.outboxPending(db).map((o) => o.kind), ['manual_review']);   // 送れない = 残る (定時の入口が送り直す)
     assert.ok(sent.some((t) => t.includes(m.session_id)));
     r = await j('/resume', { method: 'POST', body: { note: '再開したい' } });
@@ -211,6 +211,65 @@ await ta('[5] GAS の CSV (移行の段階だけ・バイト列・JSON は 415�
       r = await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a' } });
       assert.deepEqual([r.status, r.body.error], [409, 'disabled']);
     } finally { process.env.LZ_MANUAL_V4 = 'on'; }
+  });
+});
+
+await ta('[6] メモ・理由は文字で 500 字まで (オブジェクト・配列・501 字 = 400) / 似た型 (application/json-patch+json・octet-stream+csv) = 415 (Codex #1541 R1)', async () => {
+  await withApp(async ({ db, j }) => {
+    S.init(db, { by: 'x', now: T0 });
+    S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: 'x', now: T0 });
+    for (const v of [{ a: 1 }, ['理由の配列'], 'x'.repeat(501), 12345]) {
+      assert.equal((await j('/halt', { method: 'POST', body: { reason: v } })).status, 400, JSON.stringify(v).slice(0, 30));
+      assert.equal((await j('/resume', { method: 'POST', body: { note: v } })).status, 400);
+      assert.equal((await j('/resolve', { method: 'POST', body: { run_id: 'lzim_x', outcome: 'imported', note: v } })).status, 400);
+      assert.equal((await j('/mark-unknown', { method: 'POST', body: { run_id: 'lzim_x', reason: v } })).status, 400);
+      assert.equal((await j('/waive', { method: 'POST', body: { obligation_ids: [1], note: v } })).status, 400);
+    }
+    assert.equal(S.getStatus(db).halted, false);
+    await j('/halt', { method: 'POST', body: { reason: '手で取り込む' } });
+    artifact(db);
+    const m = (await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a' } })).body;
+    for (const v of [{ a: 1 }, ['x'], 'x'.repeat(501)]) {
+      assert.equal((await j(`/manual/${m.session_id}/cancel`, { method: 'POST', body: { note: v } })).status, 400);
+      assert.equal((await j(`/manual/${m.session_id}/complete`, { method: 'POST', body: { result_text: RESULT_OK(2), history: { file_name: m.download_name, at: T0 + MIN, account: 'nakahara' }, note: v } })).status, 400);
+    }
+    for (const type of ['application/json-patch+json', 'application/jsonx', 'text/json']) {
+      assert.equal((await j('/halt', { method: 'POST', body: JSON.stringify({ reason: '止めたい理由' }), type })).status, 415, type);
+    }
+    assert.equal((await j('/halt', { method: 'POST', body: JSON.stringify({ reason: '止めたい理由' }), type: 'application/json; charset=utf-8' })).status, 200);
+    assert.equal((await j('/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16', { method: 'POST', body: csvOf(['A-1']), type: 'application/octet-stream+csv' })).status, 415);
+  });
+});
+
+await ta('[7] 今回の知らせを真っ先に送る (前の知らせが 20 件以上溜まっていても)・notified = 今回の知らせを送れたか (Codex #1541 R1 Medium)', async () => {
+  let up = false;
+  await withApp(async ({ db, j, sent }) => {
+    S.init(db, { by: 'x', now: T0 });
+    for (let i = 0; i < 25; i++) S.halt(db, { by: 'cli', reason: `溜まった止め ${i}`, now: T0 + i });   // 送れないまま溜まった 25 件
+    up = true;
+    const r = await j('/halt', { method: 'POST', body: { reason: '今回の止め' } });
+    assert.deepEqual([r.status, r.body.notified, /今回の止め/.test(sent[0])], [200, true, true]);
+    assert.ok(!S.outboxPending(db, { limit: 100 }).some((o) => o.id === r.body.outbox_id), '今回の知らせは送れた印');
+  }, { notify: async () => up });
+});
+
+await ta('[8] 待ちの義務は番号の後から・商品で探せる (500 件を超えても全部に届く)・形の誤り (Codex #1541 R1 Medium)', async () => {
+  await withApp(async ({ db, j }) => {
+    S.init(db, { by: 'x', now: T0 });
+    S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: 'x', now: T0 });
+    const ids = Array.from({ length: 620 }, (_, i) => `P-${String(i).padStart(4, '0')}`);
+    artifact(db, ids, 'lzd_20300115_big');
+    await j('/halt', { method: 'POST', body: { reason: '手で取り込む' } });
+    await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_big' } });
+    let r = await j('/pending');
+    assert.deepEqual([r.body.count, r.body.items.length, r.body.next_after != null], [620, 500, true]);
+    r = await j(`/pending?after=${r.body.next_after}`);
+    assert.deepEqual([r.body.items.length, r.body.items[0].product_id, r.body.next_after], [120, 'P-0500', null]);
+    r = await j('/pending?product=P-0600');
+    assert.deepEqual(r.body.items.map((x) => x.product_id), ['P-0600']);
+    assert.equal((await j('/waive', { method: 'POST', body: { obligation_ids: [r.body.items[0].id], note: '501 件目より後だけ閉じる' } })).body.waived, 1);
+    assert.equal((await j('/pending?product=P-0600')).body.items.length, 0);
+    for (const q of ['after=x', 'limit=0', 'limit=5001', 'product=', 'after=1&after=2']) assert.equal((await j(`/pending?${q}`)).status, 400, q);
   });
 });
 

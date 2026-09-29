@@ -271,7 +271,10 @@ function mustRow(db) { const r = row(db); if (!r) fail('not_initialized', 'ま�
 function checkInit(r, initId) { if (!initId || initId !== r.init_id) fail('init_mismatch', `初期化の識別子が違う (ポータル = ${r.init_id})。記録の消失か設定違い = 止める`); }
 function checkBy(by) { if (!BY_RE.test(String(by || ''))) fail('bad_request', 'by (誰が) が要る', 400); }
 function checkRunId(runId) { if (!RUN_ID_RE.test(String(runId || ''))) fail('bad_request', '実行 ID の形が違う', 400); }
-function checkNote(note, what = 'note') { if (!note || String(note).trim().length < 4 || String(note).length > LIMITS.note) fail('bad_request', `${what} (4〜${LIMITS.note} 文字) が要る`, 400); }
+/** メモ・理由 = 文字 (オブジェクト・配列・数は断る)・4〜LIMITS.note 文字 (Codex #1541 R1 Medium) */
+function checkNote(note, what = 'note') { if (typeof note !== 'string' || note.trim().length < 4 || note.length > LIMITS.note) fail('bad_request', `${what} (4〜${LIMITS.note} 文字の文字列) が要る`, 400); }
+/** 省けるメモ・理由 (null / undefined = 無し。あれば文字で上限まで) */
+function checkOptText(v, what) { if (v != null && (typeof v !== 'string' || v.length > LIMITS.note)) fail('bad_request', `${what} は ${LIMITS.note} 文字までの文字列`, 400); }
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const isRealDate = (x) => DATE_RE.test(String(x)) && new Date(`${x}T00:00:00Z`).toISOString().slice(0, 10) === x;
 const jstDate = (ms) => new Date(ms + 9 * 3600000).toISOString().slice(0, 10);
@@ -292,7 +295,10 @@ const openObligationCount = (db) => db.prepare(`SELECT COUNT(*) AS n ${OPEN_OBLI
 const openFingerprint = (db) => sha256(Buffer.from(db.prepare(`SELECT o.id ${OPEN_OBLIGATIONS} ORDER BY o.id`).all().map((o) => o.id).join(','))).slice(0, 16);
 function needV4() { if (!v4On()) fail('disabled', '手の取込 (③c-1b-3b v4) はまだ使えない (LZ_MANUAL_V4 が立っていない)'); }
 /** 知らせを積む (同じ dedupe_key は 1 回だけ) */
-function outboxPut(db, now, kind, dedupeKey, text) { db.prepare('INSERT OR IGNORE INTO outbox (kind, dedupe_key, text, created_at) VALUES (?, ?, ?, ?)').run(kind, dedupeKey, String(text).slice(0, 3000), now); }
+function outboxPut(db, now, kind, dedupeKey, text) {
+  db.prepare('INSERT OR IGNORE INTO outbox (kind, dedupe_key, text, created_at) VALUES (?, ?, ?, ?)').run(kind, dedupeKey, String(text).slice(0, 3000), now);
+  return db.prepare('SELECT id FROM outbox WHERE dedupe_key = ?').get(dedupeKey).id;   // 今回積んだ (か前に積んだ同じ) 知らせの番号 = 画面の口が真っ先に送る
+}
 const sessionMeta = (x) => (x ? { session_id: x.session_id, status: x.status, opened_by: x.opened_by, opened_at: x.opened_at, lz_account: x.lz_account, source_kind: x.source_kind,
   source_run_id: x.source_run_id, target_as_of: x.target_as_of, csv_sha256: x.csv_sha256, rows: x.rows, download_name: x.download_name,
   closed_by: x.closed_by, closed_at: x.closed_at, close_detail: x.close_detail ? JSON.parse(x.close_detail) : null, ack_by: x.ack_by, ack_at: x.ack_at, ack_note: x.ack_note } : null);
@@ -345,7 +351,7 @@ export function init(db, { by, note = null, now = Date.now() }) {
  */
 export function recover(db, { by, note, now = Date.now() }) {
   checkBy(by);
-  if (!note || String(note).trim().length < 4) fail('bad_request', 'recover には note (何を確かめたか) が要る', 400);
+  checkNote(note, 'recover の note (何を確かめたか)');
   return db.transaction(() => {
     const r = row(db);
     const initId = rid('lzi', now);
@@ -482,7 +488,7 @@ export function transition(db, { lockToken, runId, to, detail = null, by, now = 
 
 /** 起動したときに importing が残っている (鍵は切れている) = 結果が分からない = unknown に移す (自動では二度と押さない。H4) */
 export function markUnknown(db, { runId, by, reason = null, now = Date.now() }) {
-  checkBy(by); checkRunId(runId);
+  checkBy(by); checkRunId(runId); checkOptText(reason, 'reason');
   return db.transaction(() => {
     const r = mustRow(db);
     if (r.state !== 'importing' || r.run_id !== runId) fail('bad_transition', `unknown にできるのは importing の回だけ (今 = ${r.state}・${r.run_id})`);
@@ -502,7 +508,7 @@ export function markUnknown(db, { runId, by, reason = null, now = Date.now() }) 
 export function resolve(db, { runId, outcome, note, by, partialCheck = null, repaired = false, now = Date.now() }) {
   checkBy(by); checkRunId(runId);
   if (!['imported', 'not_imported', 'partial'].includes(outcome)) fail('bad_request', 'outcome は imported / not_imported / partial', 400);
-  if (!note || String(note).trim().length < 4) fail('bad_request', 'note (何を確かめたか) が要る', 400);
+  checkNote(note, 'note (何を確かめたか)');
   return db.transaction(() => {
     const r = mustRow(db);
     if (!['unknown', 'partial', 'verify_failed'].includes(r.state)) fail('bad_transition', `解除するものが無い (今 = ${r.state})`);
@@ -523,21 +529,21 @@ export function resolve(db, { runId, outcome, note, by, partialCheck = null, rep
 /** 自動の取込を止める (戻し方の手の ③ の前・人の判断) */
 export function halt(db, { by, reason, now = Date.now() }) {
   checkBy(by);
-  if (!reason || String(reason).trim().length < 4) fail('bad_request', 'reason が要る', 400);
+  checkNote(reason, 'reason');
   return db.transaction(() => {
     mustRow(db);
     update(db, now, { halted: 1, halted_reason: String(reason).slice(0, 300), halted_by: by, halted_at: now });
     const eventId = event(db, now, 'halt', null, by, { reason });
     // どこから止めても同じ取引で知らせを積む (送るのは定時の入口と画面。K3-4)
-    outboxPut(db, now, 'halt', `halt:${eventId}`, `⏸ ロジザードの毎日の商品マスタの自動の取込を止めた (${by}): ${String(reason).slice(0, 300)}\n戻し方 = ポータルの画面の「手の取込」・再開 = 未解決の取込と開いた手の取込が無いときに resume`);
-    return { halted: true };
+    const outboxId = outboxPut(db, now, 'halt', `halt:${eventId}`, `⏸ ロジザードの毎日の商品マスタの自動の取込を止めた (${by}): ${String(reason).slice(0, 300)}\n戻し方 = ポータルの画面の「手の取込」・再開 = 未解決の取込と開いた手の取込が無いときに resume`);
+    return { halted: true, outbox_id: outboxId };
   })();
 }
 
 /** 自動の取込を再開する = 未解決の取込が無い (state が idle / verified)・鍵が空いている ときだけ (H6) */
 export function resume(db, { by, note, now = Date.now() }) {
   checkBy(by);
-  if (!note || String(note).trim().length < 4) fail('bad_request', 'note が要る', 400);
+  checkNote(note);
   return db.transaction(() => {
     const r = mustRow(db);
     if (UNRESOLVED.has(r.state)) fail('state', `未解決の取込がある (${r.state}・${r.run_id})。先に resolve`);
@@ -712,7 +718,8 @@ export function listManualSessions(db, { limit = 20 } = {}) {
 /**
  * 手の取込を終える (K3-3)。結果の文 (今回新しく出た表示)・ロジザードの履歴 (ファイル名・日時 (ms)・アカウント)・メモ。
  * 通常の完了 (completed_ok) = 結果が成功 (総件数 = 行数・エラー 0) かつ 履歴のファイル名 = 出した名前・アカウント = 固定したもの・
- *   日時 = **分まで** (ロジザードの履歴は分までの前提・秒は 0 で渡す = 違う = 400) で「始めた分 ≦ 履歴 ≦ 今の分」(同じ分は通す。実物の履歴の画面で確かめる)。
+ *   日時 = **分まで** (ロジザードの履歴は分までの前提・秒は 0 で渡す = 違う = 400) で「始めた分 < 履歴 ≦ 今の分」。
+ *   **始めた分と同じ分の履歴 = 要確認** (始める前の取込と見分けられない = 安全側。Codex #1541 R1 High)。実物の履歴の画面で確かめる。
  * どれかが違う = needs_review (管理者の確認まで resume できない。知らせを積む)。
  */
 export function completeManualSession(db, { sessionId, resultText, history, note = null, by, now = Date.now() }) {
@@ -720,7 +727,7 @@ export function completeManualSession(db, { sessionId, resultText, history, note
   if (typeof resultText !== 'string' || !resultText.trim() || resultText.length > LIMITS.resultText) fail('bad_request', `結果の文 (1〜${LIMITS.resultText} 文字) が要る`, 400);
   if (!history || typeof history !== 'object' || typeof history.fileName !== 'string' || history.fileName.length > LIMITS.fileName
     || !Number.isSafeInteger(history.at) || history.at % MINUTE !== 0 || typeof history.account !== 'string' || history.account.length > 60) fail('bad_request', 'history = { fileName, at (ms・分まで = 秒は 0), account } が要る', 400);
-  if (note != null && (typeof note !== 'string' || note.length > LIMITS.note)) fail('bad_request', `note は ${LIMITS.note} 文字まで`, 400);
+  checkOptText(note, 'note');
   return db.transaction(() => {
     mustRow(db);
     const x = db.prepare('SELECT * FROM manual_sessions WHERE session_id = ?').get(String(sessionId ?? ''));
@@ -731,15 +738,15 @@ export function completeManualSession(db, { sessionId, resultText, history, note
     const mismatches = [];
     if (history.fileName !== x.download_name) mismatches.push('file_name');
     const floorMin = (ms) => Math.floor(ms / MINUTE) * MINUTE;
-    if (history.at < floorMin(x.opened_at) || history.at > floorMin(now)) mismatches.push('history_time');
+    if (history.at <= floorMin(x.opened_at) || history.at > floorMin(now)) mismatches.push('history_time');
     if (history.account !== x.lz_account) mismatches.push('account');
     const status = judged.to === 'imported_unverified' && !mismatches.length ? 'completed_ok' : 'needs_review';
     const detail = { result_text: resultText, parsed, judged, history: { fileName: history.fileName, at: history.at, account: history.account }, mismatches, note };   // 原文も残す (読めない文も。Codex #1537 R2 Medium)
     db.prepare('UPDATE manual_sessions SET status = ?, closed_by = ?, closed_at = ?, close_detail = ?, updated_at = ? WHERE session_id = ?').run(status, by, now, JSON.stringify(detail), now, x.session_id);
     const eventId = event(db, now, 'manual_complete', null, by, { session_id: x.session_id, status, judged, mismatches });
-    if (status === 'needs_review') outboxPut(db, now, 'manual_review', `manual_review:${x.session_id}`,
+    const outboxId = status !== 'needs_review' ? null : outboxPut(db, now, 'manual_review', `manual_review:${x.session_id}`,
       `⚠️ ロジザードの手の取込 ${x.session_id} が確認待ち (needs_review): ${[judged.to !== 'imported_unverified' ? `結果 = ${judged.why}` : null, mismatches.length ? `履歴と合わない = ${mismatches.join('・')}` : null].filter(Boolean).join('・')}。ロジザードの履歴を見て画面で確認 (ack) するまで自動を再開できない`);
-    return { session_id: x.session_id, status, judged, mismatches, event_id: eventId };
+    return { session_id: x.session_id, status, judged, mismatches, event_id: eventId, outbox_id: outboxId };
   })();
 }
 
@@ -772,10 +779,15 @@ export function acknowledgeManualSession(db, { sessionId, note, by, now = Date.n
 }
 
 /** 残っている再適用待ちの義務 */
-export function listPending(db, { limit = 200 } = {}) {
+export function listPending(db, { limit = 200, afterId = 0, productId = null } = {}) {
   const count = openObligationCount(db);
-  const items = db.prepare(`SELECT o.id, o.session_id, o.product_id, o.created_at ${OPEN_OBLIGATIONS} ORDER BY o.id LIMIT ?`).all(Math.max(1, Math.min(5000, Number(limit) || 200)));
-  return { count, fingerprint: count ? openFingerprint(db) : null, items };
+  // 番号の後から (ページ送り)・商品で探す (完全一致) = 何件あっても全部の義務に届く (Codex #1541 R1 Medium)
+  const lim = Math.max(1, Math.min(5000, Number(limit) || 200));
+  const after = Number.isSafeInteger(afterId) && afterId > 0 ? afterId : 0;
+  const items = productId == null
+    ? db.prepare(`SELECT o.id, o.session_id, o.product_id, o.created_at ${OPEN_OBLIGATIONS} AND o.id > ? ORDER BY o.id LIMIT ?`).all(after, lim)
+    : db.prepare(`SELECT o.id, o.session_id, o.product_id, o.created_at ${OPEN_OBLIGATIONS} AND o.id > ? AND o.product_id = ? ORDER BY o.id LIMIT ?`).all(after, String(productId), lim);
+  return { count, fingerprint: count ? openFingerprint(db) : null, items, next_after: items.length === lim ? items[items.length - 1].id : null };
 }
 
 /** 特定の義務だけを理由を書いて閉じる (waived)。閉じていない義務だけ (違う = 全部断る) */
@@ -796,6 +808,10 @@ export function waiveObligations(db, { obligationIds, note, by, now = Date.now()
 }
 
 /** まだ送れていない知らせ (古い順) */
+/** 1 つの知らせ (まだ送れていないときだけ) */
+export function outboxGet(db, { id }) {
+  return db.prepare('SELECT id, kind, dedupe_key, text, created_at FROM outbox WHERE id = ? AND sent_at IS NULL').get(Number(id)) || null;
+}
 export function outboxPending(db, { limit = 20 } = {}) {
   return db.prepare('SELECT id, kind, dedupe_key, text, created_at FROM outbox WHERE sent_at IS NULL ORDER BY id LIMIT ?').all(Math.max(1, Math.min(100, Number(limit) || 20)));
 }

@@ -19,6 +19,7 @@
  *   GET  /manual/:id/csv                                         手の取込の CSV (ロジザードに置くのはこれだけ・attachment・no-store)
  *   POST /manual/:id/complete {result_text, history: {file_name, at, account}, note}
  *   POST /manual/:id/cancel {note} / /manual/:id/ack {note}
+ *   GET  /pending[?after&limit&product]                         待ちの義務 (番号の後から・商品で探す)
  *   POST /waive {obligation_ids, note}
  *   POST /settings {key, value}                                  cutover_phase (一方通行)・lz_accounts
  * halt・終える (needs_review) の後は、積んだ知らせをすぐ送る (GCHAT_WEBHOOK_JOBS・送れない = 定時の入口が送り直す。K3-4)。
@@ -65,8 +66,9 @@ export function createAdminRouter({ getDb = null, now = () => Date.now(), notify
   });
   const typeIs = (re, name) => (req, res, next) => (re.test(String(req.headers['content-type'] || '')) ? next()
     : res.status(415).json({ ok: false, error: 'unsupported_media_type', message: `Content-Type は ${name}` }));
-  const json = [typeIs(/^application\/json\b/i, 'application/json'), express.json({ limit: '64kb' })];
-  const csv = [typeIs(/^application\/octet-stream\b/i, 'application/octet-stream'), express.raw({ type: 'application/octet-stream', limit: S.LIMITS.csvBytes })];
+  // 型はちょうどその名前だけ (後ろに ; の引数は可・application/json-patch+json などの似た型 = 415。Codex #1541 R1 Low)
+  const json = [typeIs(/^application\/json\s*(;|$)/i, 'application/json'), express.json({ limit: '64kb' })];
+  const csv = [typeIs(/^application\/octet-stream\s*(;|$)/i, 'application/octet-stream'), express.raw({ type: 'application/octet-stream', limit: S.LIMITS.csvBytes })];
   const who = (req) => String((req.session && req.session.email) || '').slice(0, 60);
   const one = (q, k) => (typeof q[k] === 'string' ? q[k] : undefined);   // 同じ名前が 2 つ = 無い扱い
   const bad = (m) => new S.ImportStateError('bad_request', m, 400);
@@ -79,20 +81,21 @@ export function createAdminRouter({ getDb = null, now = () => Date.now(), notify
       return res.status(500).json({ ok: false, error: 'internal', message: 'ポータルの中で失敗した (ログを見る)' });
     }
   };
-  /** 積んだ知らせを送る (送れた = 送れた印。送れない = 定時の入口が送り直す)。取引の外 = 状態の書き込みは先に済んでいる */
-  const flushOutbox = async () => {
-    let sent = 0;
-    for (const o of S.outboxPending(dbOf(), { limit: 20 })) {
-      const ok = await notify(o.text).catch(() => false);
-      if (!ok) break;
-      S.outboxMarkSent(dbOf(), { id: o.id, by: 'portal', now: now() });
-      sent++;
-    }
-    return sent;
+  /**
+   * 積んだ知らせを送る。今回積んだ知らせ (firstId) を真っ先に (前の知らせが溜まっていても。Codex #1541 R1 Medium)・ほかは古い順に 20 件まで。
+   * 送れた = 送れた印。送れない = 定時の入口が送り直す。取引の外 = 状態の書き込みは先に済んでいる。
+   * @returns {Promise<boolean|null>} 今回の知らせを送れたか (無い = null)
+   */
+  const flushOutbox = async (firstId = null) => {
+    const send = async (o) => { const ok = await notify(o.text).catch(() => false); if (ok) S.outboxMarkSent(dbOf(), { id: o.id, by: 'portal', now: now() }); return ok; };
+    let mine = null;
+    if (firstId != null) { const o = S.outboxGet(dbOf(), { id: firstId }); mine = o ? await send(o) : null; if (mine === false) return false; }
+    for (const o of S.outboxPending(dbOf(), { limit: 20 })) if (!(await send(o))) break;
+    return mine;
   };
 
   router.get('/status', handle(() => S.getAdminOverview(dbOf(), { now: now() })));
-  router.post('/halt', json, handle(async (b, req) => { const r = S.halt(dbOf(), { by: who(req), reason: b.reason, now: now() }); return { ...r, notified: await flushOutbox() }; }));
+  router.post('/halt', json, handle(async (b, req) => { const r = S.halt(dbOf(), { by: who(req), reason: b.reason, now: now() }); return { ...r, notified: await flushOutbox(r.outbox_id) }; }));
   router.post('/resume', json, handle((b, req) => S.resume(dbOf(), { by: who(req), note: b.note, now: now() })));
   router.post('/resolve', json, handle((b, req) => S.resolve(dbOf(), { runId: b.run_id, outcome: b.outcome, note: b.note, by: who(req), partialCheck: b.partial_check ?? null, repaired: b.repaired === true, now: now() })));
   router.post('/mark-unknown', json, handle((b, req) => S.markUnknown(dbOf(), { runId: b.run_id, by: who(req), reason: b.reason ?? null, now: now() })));
@@ -120,10 +123,20 @@ export function createAdminRouter({ getDb = null, now = () => Date.now(), notify
   router.post('/manual/:id/complete', json, handle(async (b, req) => {
     const h = b.history && typeof b.history === 'object' ? { fileName: b.history.file_name, at: b.history.at, account: b.history.account } : null;
     const r = S.completeManualSession(dbOf(), { sessionId: req.params.id, resultText: b.result_text, history: h, note: b.note ?? null, by: who(req), now: now() });
-    return { ...r, notified: await flushOutbox() };
+    return { ...r, notified: r.outbox_id != null ? await flushOutbox(r.outbox_id) : null };
   }));
   router.post('/manual/:id/cancel', json, handle((b, req) => S.cancelManualSession(dbOf(), { sessionId: req.params.id, note: b.note, by: who(req), now: now() })));
   router.post('/manual/:id/ack', json, handle((b, req) => S.acknowledgeManualSession(dbOf(), { sessionId: req.params.id, note: b.note, by: who(req), now: now() })));
+  // 待ちの義務 (番号の後から・商品で探す = 何件あっても全部に届く)
+  router.get('/pending', handle((_b, req) => {
+    const q = req.query || {};
+    for (const k of ['after', 'limit', 'product']) if (q[k] !== undefined && typeof q[k] !== 'string') throw bad(`${k} は 1 つだけ`);   // 同じ名前が 2 つ = 断る
+    const after = one(q, 'after'), limit = one(q, 'limit'), product = one(q, 'product');
+    if (after !== undefined && !/^[0-9]{1,12}$/.test(after)) throw bad('after は番号');
+    if (limit !== undefined && (!/^[1-9][0-9]{0,3}$/.test(limit) || Number(limit) > 5000)) throw bad('limit は 1〜5000 の整数');
+    if (product !== undefined && (!product || product.length > 200)) throw bad('product は 1〜200 文字');
+    return S.listPending(dbOf(), { afterId: after === undefined ? 0 : Number(after), limit: limit === undefined ? 500 : Number(limit), productId: product ?? null });
+  }));
   router.post('/waive', json, handle((b, req) => S.waiveObligations(dbOf(), { obligationIds: b.obligation_ids, note: b.note, by: who(req), now: now() })));
   router.post('/settings', json, handle((b, req) => S.setSetting(dbOf(), { key: b.key, value: b.value, by: who(req), now: now() })));
   // 本文が大きすぎる・JSON でない = 短い決まった JSON (本文の断片を返さない)

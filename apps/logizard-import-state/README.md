@@ -30,7 +30,7 @@
 - **知らせの outbox**: halt (どこから止めても)・残った再適用待ち・needs_review を同じ取引で積む。送れた印は 1 回だけ。
 - **設定**: `cutover_phase` (無い → transition → cutover の一方通行・無い / cutover = GAS の CSV を断る)・`lz_accounts` (無い = 手の取込を始められない)。
 - **成果物の台帳** `artifact_ledger` は中身の整理の後も残す = 同じ source_run_id の違う中身をいつまでも断る (同じ中身は入れ直せる)。
-- **手の取込を終えるときの履歴の日時は分まで** (秒は 0)・「始めた分 ≦ 履歴 ≦ 今の分」。閉じ・確認の記録と outbox の送れた印は 1 回だけ一式で (表の決まり)。
+- **手の取込を終えるときの履歴の日時は分まで** (秒は 0)・「始めた分 < 履歴 ≦ 今の分」(**始めた分と同じ分 = 要確認** = 始める前の取込と見分けられない・安全側。Codex #1541 R1 High)。閉じ・確認の記録と outbox の送れた印は 1 回だけ一式で (表の決まり)。
 - **機械の口 (`/api/status`) には数と真偽だけ** (`manual` = v4・open・needs_review_unacked・pending_reapply・outbox_unsent)。手の取込・設定・waiver の出来事は種類と時刻だけ (誰・アカウント・メモは画面の口 = 3b-4)。
 - 実行ボタンを押す直前に `importing` (CSV の sha256・行数)。**始めるのは期限内の鍵・今の初期化の世代で取った鍵・まだ始めていない鍵だけ** (1 つの鍵で始めるのは 1 回だけ)。**一度始めた実行 ID は二度と使えない** (import_runs・追記だけ = 古い要求が同じ実行 ID の新しい回に当たらない)。
 - 結果の画面で成功 = `imported_unverified` (**自動も手の ③ も**)。取り込んだ側が直後の書き出しで確かめて `verified`。verified になるまで次の取込・再開はしない。一部だけ = `partial`・分からない = `unknown`。
@@ -54,13 +54,15 @@ server.js の `JOBS_MONITOR_ENABLED` の中で、**どの body parser よりも�
 - 機械の口の Bearer は `/api` だけに掛ける = 画面の口は機械の口を素通りしてセッションの後へ。フォームの parser (urlencoded) もこの前置きは読まない。
 - 誰 = セッションのメール (本文の by は使わない)。
 - `GET /status` = 全部の見え方 (出来事の中身・開いた手の取込・確認待ち・最近の手の取込・待ち・送れていない知らせ・設定・成果物)。
+- メモ・理由は文字で 4〜500 字 (オブジェクト・配列・数 = 400)。Content-Type はちょうどその型 (`application/json` / `application/octet-stream`・後ろの `; charset` は可・似た型 = 415)。
+- `GET /pending[?after&limit&product]` = 待ちの義務 (番号の後から・商品で探す = 何件あっても全部に届く)。
 - `POST /halt`・`/resume`・`/resolve`・`/mark-unknown`・`/manual/open` (毎晩の成果物)・`/manual/open-gas?lz_account&target_as_of` (本文 = GAS の CSV のバイト列)・`GET /manual/:id/csv` (attachment・no-store・nosniff)・`/manual/:id/complete`・`/cancel`・`/ack`・`/waive`・`/settings`。
-- 止める・終える (needs_review) の後は、積んだ知らせをすぐ送る (要対応スペース `GCHAT_WEBHOOK_JOBS`。送れない = outbox に残る = 定時の入口が送り直す)。
+- 止める・終える (needs_review) の後は、**今回積んだ知らせを真っ先に**すぐ送る (前の知らせが溜まっていても・要対応スペース `GCHAT_WEBHOOK_JOBS`。応答の `notified` = 今回の知らせを送れたか。送れない = outbox に残る = 定時の入口が送り直す)。
 - ブラウザの画面と手順書は 3b-4b。
 
 ## 使い方 (人)
 `tools/logizard-automation/import-state-cli.js` (status / init / adopt / recover / halt / resume / resolve)。README = `tools/logizard-automation/README.md`。
 
 ## 試験
-`node scripts/test-logizard-import-admin.mjs` (画面の口・5 件)。
+`node scripts/test-logizard-import-admin.mjs` (画面の口・8 件)。
 `node scripts/test-logizard-import-state.mjs` (28 件)。手の取込・義務・成果物・outbox・設定の口 (画面・CLI) は 3b-2b 以降 (この段階では関数だけ = 使えない)。
