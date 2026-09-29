@@ -58,7 +58,8 @@
  *   N1 時刻の元は Render の時計: status の clock (server_now・JST の日・expected_target_as_of = JST の前の日・始めてよい窓 [00:15, 00:50)・
  *      nightly_deadline_at = 00:55)。nightly の importing はこの時計で 窓・対象の日 = 前の日・実行 ID の形 (lzim_night_…) を照らす。
  *      nightly の回の確かめのやり直しの鍵 (acquire verify) も同じ窓。
- *   N4 副作用の無い nightly-readiness (本当の nightly と同じ照らしの関数 = autoImportProblems + nightlyProblems)。
+ *   N4 副作用の無い nightly-readiness (本当の nightly と同じ照らしの関数と順番 = autoImportProblems → nightlyFormatProblems → nightlyProblems)。
+ *      始められるか = ready (口の ok は通信の成功)。clock は status (未初期化も)・鍵を取る / 延ばす応答にも。
  *   N5 outbox は止め・要確認を先に、再適用待ちを後に。N6 nightly_last = 最後の nightly の回の履歴 (出来事から・今の状態をそのまま付けない)。
  */
 import Database from 'better-sqlite3';
@@ -343,19 +344,19 @@ const sessionMeta = (x) => (x ? { session_id: x.session_id, status: x.status, op
 /**
  * 最後の毎晩の回 (N6): 開始の履歴 (import_runs) と、その実行 ID の出来事から。今の状態 (import_state) をそのまま付けない
  * (その後に試験の回が走った・解除した でも、その夜の回の結末を返す)。
- * last_state = その回の最後の状態の動き (transition の行き先・mark_unknown = unknown)・resolved = その回を解除したか (outcome)
+ * last_state = その回の最後の状態の動き (transition の行き先・mark_unknown = unknown)・resolved = その回を解除したか (真偽)・resolution = 解除の中身 (outcome・from)
  */
 function nightlyLast(db) {
   const x = db.prepare("SELECT run_id, target_as_of, source_run_id, started_at FROM import_runs WHERE mode = 'nightly' ORDER BY started_at DESC, rowid DESC LIMIT 1").get();
   if (!x) return null;
-  let lastState = null, resolved = null;
+  let lastState = null, resolution = null;
   for (const e of db.prepare("SELECT kind, detail FROM import_events WHERE run_id = ? AND kind IN ('transition', 'mark_unknown', 'resolve') ORDER BY id").all(x.run_id)) {
     const d = e.detail ? JSON.parse(e.detail) : {};
     if (e.kind === 'transition') lastState = d.to;
     else if (e.kind === 'mark_unknown') lastState = 'unknown';
-    else resolved = { outcome: d.outcome ?? null, from: d.from ?? null };
+    else resolution = { outcome: d.outcome ?? null, from: d.from ?? null };
   }
-  return { run_id: x.run_id, target_as_of: x.target_as_of, source_run_id: x.source_run_id, started_at: x.started_at, last_state: lastState, resolved };
+  return { run_id: x.run_id, target_as_of: x.target_as_of, source_run_id: x.source_run_id, started_at: x.started_at, last_state: lastState, resolved: resolution !== null, resolution };
 }
 
 /**
@@ -363,18 +364,18 @@ function nightlyLast(db) {
  * (止めている間にも「成果物の無い nightly が断られる」を確かめられる = 切替の手順)
  */
 export function nightlyReadiness(db, { sourceRunId, csvSha256, rows, targetAsOf, now = Date.now() }) {
-  if (!isRealDate(targetAsOf)) fail('bad_request', 'target_as_of (実在の日 YYYY-MM-DD) が要る', 400);
-  if (!SOURCE_RUN_RE.test(String(sourceRunId ?? ''))) fail('bad_request', 'source_run_id (lzd_…) が要る', 400);
-  if (!/^[0-9a-f]{64}$/.test(String(csvSha256 ?? ''))) fail('bad_request', 'csv_sha256 (64 桁) が要る', 400);
-  if (!Number.isSafeInteger(rows) || rows < 1) fail('bad_request', 'rows (1 以上の整数) が要る', 400);
   const r = mustRow(db);
-  const problems = [...autoImportProblems(db, r, now), ...nightlyProblems(db, { target: targetAsOf, sourceRunId, csvSha256, rows }, now)];
-  const a = db.prepare('SELECT source_run_id, target_as_of, verdict, csv_sha256, rows FROM daily_artifacts WHERE source_run_id = ?').get(String(sourceRunId));
+  // 本当の道と同じ順番: 鍵の照らし (acquire) → 識別の形 → 毎晩の照らし (transition)。形が違う = codes に bad_request (投げない。Codex #1546 R1 Medium)
+  const ident = { target: targetAsOf, sourceRunId, csvSha256, rows };
+  const fmt = nightlyFormatProblems(ident);
+  const problems = [...autoImportProblems(db, r, now), ...fmt, ...(fmt.length ? [] : nightlyProblems(db, ident, now))];
+  const a = db.prepare('SELECT source_run_id, target_as_of, verdict, csv_sha256, rows FROM daily_artifacts WHERE source_run_id = ?').get(String(sourceRunId ?? ''));
   return {
+    // ready = 始められるか (口の ok は通信の成功 = 別。Codex #1546 R1 High の直し方 = 名前を分ける。契約 v3 N4 の文言も ready に)
     ready: problems.length === 0, codes: problems.map((p) => p[0]), messages: problems.map((p) => p[1]),
-    manual_v4: v4On(), cutover_phase: getSettings(db).cutover_phase, clock: nightlyClock(now),   // 設定の読み方は画面と同じ (無い = cutover)
+    manual: { v4: v4On() }, cutover_phase: getSettings(db).cutover_phase, clock: nightlyClock(now),   // manual は status と同じ形・設定の読み方は画面と同じ (無い = cutover)
     state: r.state, halted: !!r.halted, lock_active: lockActive(r, now), manual_open: !!openSessionOf(db),
-    nightly_started: !!db.prepare("SELECT 1 FROM import_runs WHERE mode = 'nightly' AND target_as_of = ?").get(targetAsOf),
+    nightly_started: !!db.prepare("SELECT 1 FROM import_runs WHERE mode = 'nightly' AND target_as_of = ?").get(String(targetAsOf ?? '')),
     artifact: a ? { found: true, verdict: a.verdict, same: a.csv_sha256 === csvSha256 && a.rows === rows && a.target_as_of === targetAsOf } : { found: false, verdict: null, same: false },
   };
 }
@@ -385,7 +386,7 @@ export function getStatus(db, { now = Date.now(), events = 20, reveal = false } 
   // 手の取込・設定・waiver の出来事は、機械の口では種類と時刻だけ (誰・アカウント・メモは画面の口。Codex #1537 R1 Medium)
   const ev = db.prepare('SELECT * FROM import_events ORDER BY id DESC LIMIT ?').all(Math.max(0, Math.min(200, events)))
     .map((e) => (!reveal && PRIVATE_EVENTS.has(e.kind) ? { ...e, by: null, detail: null } : { ...e, detail: e.detail ? JSON.parse(e.detail) : null }));   // reveal = 画面の口 (管理者) だけ
-  if (!r) return { initialized: false, events: ev };
+  if (!r) return { initialized: false, events: ev, clock: nightlyClock(now) };   // 時計はまだ初期化していなくても (N1)
   return {
     initialized: true, init_id: r.init_id, state: r.state, halted: !!r.halted, halted_reason: r.halted_reason, halted_by: r.halted_by, halted_at: r.halted_at,
     halt_revision: r.halted ? (r.halted_event_id ?? null) : null,
@@ -484,7 +485,16 @@ function nightlyProblems(db, { target, sourceRunId, csvSha256, rows, runId = und
   }
   return out;
 }
-const failFirst = (problems) => { if (problems.length) fail(problems[0][0], problems[0][1], problems[0][0] === 'bad_run_id' ? 400 : 409); };
+/** 毎晩の本番の識別の形 (readiness と transition で共用 = 同じ順番。Codex #1546 R1 Medium)。形が違う = 400 bad_request */
+function nightlyFormatProblems({ target, sourceRunId, csvSha256, rows }) {
+  const bad = [];
+  if (!isRealDate(target)) bad.push('target_as_of (実在の日 YYYY-MM-DD)');
+  if (!SOURCE_RUN_RE.test(String(sourceRunId ?? ''))) bad.push('source_run_id (lzd_…)');
+  if (!/^[0-9a-f]{64}$/.test(String(csvSha256 ?? ''))) bad.push('csv_sha256 (64 桁)');
+  if (!Number.isSafeInteger(rows) || rows < 1) bad.push('rows (1 以上の整数)');
+  return bad.length ? [['bad_request', `毎晩の本番の識別の形が違う: ${bad.join('・')}`]] : [];
+}
+const failFirst = (problems) => { if (problems.length) fail(problems[0][0], problems[0][1], ['bad_run_id', 'bad_request'].includes(problems[0][0]) ? 400 : 409); };
 
 /** 鍵を取る (始めてよい条件は上)。返す lock_token は結果を書くときに使う */
 export function acquire(db, { initId, holder, purpose, runId, ttlSec = 180, by, now = Date.now() }) {
@@ -517,7 +527,7 @@ export function acquire(db, { initId, holder, purpose, runId, ttlSec = 180, by, 
     const expires = now + ttl * 1000;
     update(db, now, { lock_token: token, lock_holder: holder, lock_purpose: purpose, lock_run_id: runId, lock_expires_at: expires, lock_init_id: r.init_id, lock_started: 0 });
     event(db, now, 'lock_acquire', runId, by, { holder, purpose, expires_at: expires });
-    return { lock_token: token, expires_at: expires };
+    return { lock_token: token, expires_at: expires, clock: nightlyClock(now) };   // 鍵の応答にも Render の時計 (N1)
   })();
 }
 
@@ -529,7 +539,7 @@ export function extend(db, { lockToken, ttlSec = 180, now = Date.now() }) {
     if (!lockToken || r.lock_token !== lockToken || !lockActive(r, now)) fail('lock_lost', '鍵が切れた・ほかに移った');
     const expires = now + ttl * 1000;
     update(db, now, { lock_expires_at: expires });
-    return { expires_at: expires };
+    return { expires_at: expires, clock: nightlyClock(now) };
   })();
 }
 
@@ -569,7 +579,10 @@ export function transition(db, { lockToken, runId, to, detail = null, by, now = 
       const v4 = v4On();
       if (!((v4 ? MODES : LEGACY_MODES)[holder] || []).includes(mode) || !DATE_RE.test(String(target || ''))) fail('bad_request', 'importing には mode (auto = nightly / test・手の ③ = manual) と target_as_of (YYYY-MM-DD) が要る', 400);
       // 毎晩の本番 = 実行 ID の形・Render の時刻の窓・対象の日 = 前の日・1 回だけ・成果物 (N1・E・K3-1)。import_runs に書く前 (断ったら何も残らない)
-      if (mode === 'nightly') failFirst(nightlyProblems(db, { target, sourceRunId: detail.source_run_id, csvSha256: detail.csv_sha256, rows: detail.rows, runId }, now));
+      if (mode === 'nightly') {
+        const ident = { target, sourceRunId: detail.source_run_id, csvSha256: detail.csv_sha256, rows: detail.rows };
+        failFirst([...nightlyFormatProblems(ident), ...nightlyProblems(db, { ...ident, runId }, now)]);   // 形 → 毎晩の照らし (readiness と同じ順番)
+      }
       db.prepare('INSERT INTO import_runs (run_id, by, started_at, mode, target_as_of, source_run_id) VALUES (?, ?, ?, ?, ?, ?)')
         .run(runId, holder, now, mode, target, detail.source_run_id == null ? null : String(detail.source_run_id).slice(0, 120));
       if (holder === 'auto' && r.halted) fail('halted', '自動の取込は止めてある');

@@ -27,7 +27,8 @@
  *   POST /apps/logizard-import-state/api/outbox/sent          { id, by }   送れた (1 回だけ・もう送れた = already)
  *   ③c-1b-2b-2 (契約 v3 N1・N4・N6): GET /api/status に clock (Render の時計)・nightly_last (最後の毎晩の回の履歴)
  *   GET  /apps/logizard-import-state/api/nightly-readiness?source_run_id&csv_sha256&rows&target_as_of
- *        毎晩の本番を始められるか (副作用なし・本当の nightly と同じ照らし)。{ ready, codes, messages, manual_v4, cutover_phase, clock, ... }
+ *        毎晩の本番を始められるか (副作用なし・本当の nightly と同じ照らしと順番)。{ ready, codes, messages, manual: { v4 }, cutover_phase, clock, ... }
+ *        (ready = 始められるか・ok = 通信の成功。識別の形が違う = codes に bad_request)
  * 断る = 409 (状態・鍵) / 400 (形) / 404 (まだ初期化していない)。{ error: code, message }
  */
 import { Router } from 'express';
@@ -111,7 +112,7 @@ export function createImportStateRouter({ getDb = null, now = () => Date.now(), 
     if (!a) throw new S.ImportStateError('not_found', 'その成果物は無い', 404);
     return { artifact: a };
   }));
-  // 毎晩の本番を始められるか (副作用なし。N4)。rows は数に直してから渡す (形の違い = 400)
+  // 毎晩の本番を始められるか (副作用なし。N4)。rows は数に直してから渡す (形の違い = codes に bad_request)
   router.get('/api/nightly-readiness', handle((_b, req) => {
     const q = req.query || {};
     const rows = /^[0-9]{1,9}$/.test(String(q.rows ?? '')) ? Number(q.rows) : NaN;

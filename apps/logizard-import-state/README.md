@@ -41,11 +41,11 @@
 - 再開 (`resume`) は未解決の取込が無いときだけ・**止めてあるときだけ・見ていた止めの番号 (`halt_revision`) が今の止めと同じときだけ** (どの入口でも = 画面・機械の口 `expected_halt_revision`・CLI `--halt-revision`。止めるたび・止めたまま recover するたびに番号が変わる = 古い画面や古い確認で新しい止めを解除しない。前からの止めには DB を開いたときに番号を付ける。Codex #1542 R1・R2)。手の取込を始めるときも同じ番号を照らす。
 - **importing の詳細に mode と対象の日** (`mode` = 自動は nightly / test・手の ③ は manual・`target_as_of` = YYYY-MM-DD)。開始の履歴 (import_runs) に残す。**nightly は同じ対象の日に 1 回だけ** (resolve の後も・手元の済みの印に頼らない)。test / manual は数えない (③c-1b-2b 契約 v3 E)。
 - **知らせ済みは「今の状態」と「状態を変えた出来事の番号 (`state_event_id`)」に結ぶ**。状態が変わるたびに消える。`notified` は送ってきた状態と番号が今と同じときだけ (違う = `stale` = 新しい状態を知らせ直す)。`status` の `notified` = 今の状態を知らせたか (K9)。
-- **毎晩の本番 (③c-1b-2b-2 契約 v3)**: 時刻の元は **Render の時計** (N1)。`/api/status` の `clock` = `server_now`・`jst_date`・`expected_target_as_of` (JST の前の日)・`start_window` (その日の JST 00:15〜00:50・終わりは含まない)・`nightly_deadline_at` (00:55)。miniPC はこれを単調な時計に写して、窓・対象の日・締め切りを同じ時計で見る。
+- **毎晩の本番 (③c-1b-2b-2 契約 v3)**: 時刻の元は **Render の時計** (N1)。`/api/status` (未初期化も)・鍵を取る / 延ばす応答の `clock` = `server_now`・`jst_date`・`expected_target_as_of` (JST の前の日)・`start_window` (その日の JST 00:15〜00:50・終わりは含まない)・`nightly_deadline_at` (00:55)。miniPC はこれを単調な時計に写して、窓・対象の日・締め切りを同じ時計で見る。
   - nightly の importing は Render の時刻で **実行 ID の形** (`lzim_night_<YYYYMMDDTHHMMSS>_<16 進 6 桁>` = 違う 400 `bad_run_id`)・**窓** (`outside_window`)・**対象の日 = 前の日** (`stale_target`)・1 回だけ (`nightly_done`)・(旗が立っていれば) 同じ識別の成果物 (`artifact_missing`) を照らす。断ったら import_runs も区切りも残らない (同じ取引)。試験の回 (test) は時刻と形を見ない (昼に中原さんと)。
   - nightly の回の確かめのやり直しの鍵 (`acquire` verify) も Render の時刻の窓の中だけ (昼 08:40 / 11:45 は知らせだけ = K3-5)。
-  - `nightly_last` (status) = 最後の毎晩の回 (`run_id`・`target_as_of`・`source_run_id`・`started_at`・`last_state` = その回の最後の状態の動き・`resolved` = その回の解除)。**出来事の履歴から** = 今の状態 (後から試験の回が走った・解除した) をそのまま付けない (N6)。
-  - `nightly-readiness` = 毎晩の本番を始められるか (**副作用なし**・本当の nightly と同じ照らしの関数 = 鍵の照らし + 毎晩の照らし)。`ready`・`codes` (断りの code の全部・最初の 1 つが本当の道の断り)・`manual_v4`・`cutover_phase`・`clock`・`artifact`・`nightly_started` (N4)。止めている間も「成果物の無い nightly が断られる」を確かめられる (切替の手順)。
+  - `nightly_last` (status) = 最後の毎晩の回 (`run_id`・`target_as_of`・`source_run_id`・`started_at`・`last_state` = その回の最後の状態の動き・`resolved` = その回を解除したか (真偽)・`resolution` = 解除の中身)。**出来事の履歴から** = 今の状態 (後から試験の回が走った・解除した) をそのまま付けない (N6)。
+  - `nightly-readiness` = 毎晩の本番を始められるか (**副作用なし**・本当の nightly と同じ照らしの関数と順番 = 鍵の照らし → 識別の形 → 毎晩の照らし)。`ready` (始められるか・口の `ok` は通信の成功)・`codes` (断りの code の全部・最初の 1 つが本当の道の断り・形が違う = `bad_request`)・`manual.v4`・`cutover_phase`・`clock`・`artifact`・`nightly_started` (N4)。止めている間も「成果物の無い nightly が断られる」を確かめられる (切替の手順)。
   - 知らせの outbox は**止め・要確認を先に、再適用待ちを後に** (同じ組の中は古い順。N5)。
 - 初期化は 1 回だけ (`init`・状態が無くても履歴が残っていれば断る = 消失)。各 PC は同じ識別子を手元の印に持ち、起動のたびに照合 (食い違い・片方が無い = 止める)。消失からの復旧 = `recover` (ポータルの状態が無いときは止めた状態で作る)。
 

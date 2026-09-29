@@ -809,7 +809,7 @@ await ta('[27] 機能の旗 LZ_MANUAL_V4 が立っていない = 今までの動
     const { init_id } = S.init(db, { by: 'x', now: T0 });
     // nightly は成果物が無くても始められる (今までどおり)
     const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_night_20300115T152000_00000c', by: 'auto', now: T0 });
-    S.transition(db, { lockToken: L.lock_token, runId: 'lzim_night_20300115T152000_00000c', to: 'importing', detail: imp('nightly'), by: 'auto', now: T0 });
+    S.transition(db, { lockToken: L.lock_token, runId: 'lzim_night_20300115T152000_00000c', to: 'importing', detail: imp('nightly', '2030-01-15', { source_run_id: 'lzd_20300115_legacy' }), by: 'auto', now: T0 });   // 形は旗に依らず照らす (出どころは要る)・成果物は要らない
     S.transition(db, { lockToken: L.lock_token, runId: 'lzim_night_20300115T152000_00000c', to: 'imported_unverified', by: 'auto', now: T0 });
     S.transition(db, { lockToken: L.lock_token, runId: 'lzim_night_20300115T152000_00000c', to: 'verified', by: 'auto', now: T0 });
     S.release(db, { lockToken: L.lock_token, by: 'auto', now: T0 });
@@ -1033,11 +1033,11 @@ await ta('[31] nightly_last (N6) = 最後の毎晩の回の履歴 (出来事か�
   S.release(db, { lockToken: tl.lock_token, by: 'auto', now: n1.now + 6 });
   let nl = S.getStatus(db, { now: n1.now + 7 }).nightly_last;
   assert.equal(S.getStatus(db, { now: n1.now + 7 }).state, 'verified', '今の状態は試験の回の verified');
-  assert.deepEqual(nl, { run_id: n1.runId, target_as_of: '2030-01-15', source_run_id: n1.a.source_run_id, started_at: n1.now, last_state: 'unknown', resolved: { outcome: 'not_imported', from: 'unknown' } }, 'その夜の回の結末 (今の状態をそのまま付けない)');
+  assert.deepEqual(nl, { run_id: n1.runId, target_as_of: '2030-01-15', source_run_id: n1.a.source_run_id, started_at: n1.now, last_state: 'unknown', resolved: true, resolution: { outcome: 'not_imported', from: 'unknown' } }, 'その夜の回の結末 (今の状態をそのまま付けない)');
   // 2 夜目: importing のまま鍵が切れた → mark-unknown
   const n2 = run('2030-01-16', ({ runId, now }) => { S.markUnknown(db, { runId, by: 'auto', reason: '起動したら importing が残っていた', now: now + 60000 }); });
   nl = S.getStatus(db, { now: n2.now + 61000 }).nightly_last;
-  assert.deepEqual([nl.run_id, nl.last_state, nl.resolved], [n2.runId, 'unknown', null]);
+  assert.deepEqual([nl.run_id, nl.last_state, nl.resolved, nl.resolution], [n2.runId, 'unknown', false, null]);
   S.resolve(db, { runId: n2.runId, outcome: 'not_imported', note: '履歴を見た', by: '中原', now: n2.now + 62000 });
   // 3 夜目: verified
   const n3 = run('2030-01-17', ({ L, runId, now }) => {
@@ -1046,12 +1046,19 @@ await ta('[31] nightly_last (N6) = 最後の毎晩の回の履歴 (出来事か�
     S.release(db, { lockToken: L.lock_token, by: 'auto', now: now + 3 });
   });
   nl = S.getStatus(db, { now: n3.now + 4 }).nightly_last;
-  assert.deepEqual([nl.run_id, nl.target_as_of, nl.last_state, nl.resolved], [n3.runId, '2030-01-17', 'verified', null]);
+  assert.deepEqual([nl.run_id, nl.target_as_of, nl.last_state, nl.resolved], [n3.runId, '2030-01-17', 'verified', false]);
   // 機械の口 (Bearer) の status にも出る (clock と一緒に)
   await withServer(async ({ url, db: d2 }) => {
-    S.init(d2, { by: 'x', now: T0 });
-    const s = await C.createImportStateClient({ url, token: 'tok' }).status(1);
+    const c = C.createImportStateClient({ url, token: 'tok' });
+    const s0 = await c.status(1);   // まだ初期化していなくても時計は返す (Codex #1546 R1 High)
+    assert.deepEqual([s0.initialized, s0.clock.server_now, s0.clock.expected_target_as_of], [false, T0, '2030-01-15']);
+    const { init_id } = S.init(d2, { by: 'x', now: T0 });
+    const s = await c.status(1);
     assert.deepEqual([s.clock.server_now, s.clock.expected_target_as_of, s.clock.in_start_window, s.nightly_last], [T0, '2030-01-15', true, null]);
+    // 鍵を取る・延ばす応答にも同じ時計 (N1)
+    const L = await c.acquire({ init_id, holder: 'auto', purpose: 'import', run_id: 'lzim_test_clk', ttl_sec: 60, by: 'auto' });
+    const E = await c.extend({ lock_token: L.lock_token, ttl_sec: 60 });
+    assert.deepEqual([L.clock.server_now, L.clock.nightly_deadline_at, E.clock.server_now], [T0, JST('2030-01-16T00:55:00'), T0]);
   });
 });
 
@@ -1083,7 +1090,7 @@ await ta('[32] nightly-readiness (N4) = 副作用なし・本当の nightly (acq
   // 止めている + 成果物が無い (切替の手順: 止めたまま成果物の無い nightly が断られると分かる)
   S.halt(db, { by: '中原', reason: '切替の確かめ', now: T0 });
   let r = same({}, ['halted', 'artifact_missing']);
-  assert.deepEqual([r.manual_v4, r.halted, r.artifact.found, r.cutover_phase, r.clock.expected_target_as_of], [true, true, false, 'cutover', '2030-01-15']);
+  assert.deepEqual([r.manual, r.halted, r.artifact.found, r.cutover_phase, r.clock.expected_target_as_of], [{ v4: true }, true, false, 'cutover', '2030-01-15']);
   S.resume(db, { by: '中原', note: '確かめた', expectedHaltRevision: S.getStatus(db).halt_revision, now: T0 });
   same({}, ['artifact_missing']);
   artifact(db);
@@ -1095,6 +1102,31 @@ await ta('[32] nightly-readiness (N4) = 副作用なし・本当の nightly (acq
   assert.equal(real({}), 'ok');   // 始めた (importing)
   r = S.nightlyReadiness(db, q());
   assert.deepEqual([r.codes, r.nightly_started, r.lock_active, r.state], [['busy', 'state', 'nightly_done'], true, true, 'importing']);
+  // 形の違い = codes に bad_request (本当の道も同じ最初の断り = 400。Codex #1546 R1 Medium)。止めている + 形の違い = どちらも最初は halted
+  {
+    const d4 = S.openImportStateDb(':memory:');
+    const { init_id: i4 } = S.init(d4, { by: 'x', now: T0 });
+    const real4 = (o) => {
+      const p = q(o);
+      const runId = nightRun(p.now);
+      let L;
+      try { L = S.acquire(d4, { initId: i4, holder: 'auto', purpose: 'import', runId, ttlSec: 30, by: 'auto', now: p.now }); } catch (e) { return `${e.code}:${e.status}`; }
+      try {
+        S.transition(d4, { lockToken: L.lock_token, runId, to: 'importing', detail: { csv_sha256: p.csvSha256, rows: p.rows, mode: 'nightly', target_as_of: p.targetAsOf, source_run_id: p.sourceRunId }, by: 'auto', now: p.now });
+        return 'ok';
+      } catch (e) { S.release(d4, { lockToken: L.lock_token, by: 'auto', now: p.now }); return `${e.code}:${e.status}`; }
+    };
+    for (const o of [{ targetAsOf: '2030-02-30' }, { sourceRunId: '../x' }, { csvSha256: 'x' }, { rows: 0 }, { rows: 1.5 }, { rows: NaN }]) {
+      const before = cnts(d4);
+      const x = S.nightlyReadiness(d4, q(o));
+      assert.deepEqual([x.ready, x.codes[0], cnts(d4)], [false, 'bad_request', before], JSON.stringify(o));
+      assert.equal(real4(o), 'bad_request:400', '本当の道も最初は形の断り (400) ' + JSON.stringify(o));
+    }
+    S.halt(d4, { by: '中原', reason: '形の違いと止め', now: T0 });
+    const x = S.nightlyReadiness(d4, q({ sourceRunId: '../x' }));
+    assert.deepEqual(x.codes, ['halted', 'bad_request']);
+    assert.equal(real4({ sourceRunId: '../x' }), 'halted:409');
+  }
   // 旗が無い = 成果物は見ない (今までの動きと同じ)
   const prev = process.env.LZ_MANUAL_V4;
   delete process.env.LZ_MANUAL_V4;
@@ -1102,19 +1134,16 @@ await ta('[32] nightly-readiness (N4) = 副作用なし・本当の nightly (acq
     const d2 = S.openImportStateDb(':memory:');
     S.init(d2, { by: 'x', now: T0 });
     const r2 = S.nightlyReadiness(d2, q());
-    assert.deepEqual([r2.ready, r2.codes, r2.manual_v4], [true, [], false]);
+    assert.deepEqual([r2.ready, r2.codes, r2.manual], [true, [], { v4: false }]);
   } finally { process.env.LZ_MANUAL_V4 = prev; }
-  // 形の違い = 400
-  for (const o of [{ targetAsOf: '2030-02-30' }, { sourceRunId: '../x' }, { csvSha256: 'x' }, { rows: 0 }, { rows: 1.5 }]) {
-    assert.throws(() => S.nightlyReadiness(db, q(o)), (e) => e.code === 'bad_request' && e.status === 400, JSON.stringify(o));
-  }
   // 機械の口 (Bearer・GET)
   await withServer(async ({ url, db: d3 }) => {
     S.init(d3, { by: 'x', now: T0 });
     const c = C.createImportStateClient({ url, token: 'tok' });
     const x = await c.nightlyReadiness({ source_run_id: 'lzd_20300115_a', csv_sha256: shaOf(buf), rows: 2, target_as_of: '2030-01-15' });
     assert.deepEqual([x.ready, x.codes, x.clock.server_now], [false, ['artifact_missing'], T0]);
-    await assert.rejects(c.nightlyReadiness({ source_run_id: 'lzd_20300115_a', csv_sha256: shaOf(buf), rows: 'abc', target_as_of: '2030-01-15' }), (e) => e.code === 'bad_request' && e.status === 400);
+    const y = await c.nightlyReadiness({ source_run_id: 'lzd_20300115_a', csv_sha256: shaOf(buf), rows: 'abc', target_as_of: '2030-01-15' });
+    assert.deepEqual([y.ready, y.codes], [false, ['bad_request']], '形の違い = codes に bad_request');
     assert.equal(d3.prepare('SELECT COUNT(*) AS n FROM import_events').get().n, 1, '口も副作用なし (init だけ)');
   });
 });
@@ -1138,6 +1167,8 @@ await ta('[34] 断りの code (R0-L11): store.js・router.js・admin-router.js �
   const found = new Set();
   for (const m of src.matchAll(/fail\('([a-z_]+)'/g)) found.add(m[1]);
   for (const m of src.matchAll(/out\.push\(\['([a-z_]+)'/g)) found.add(m[1]);   // 照らしの関数の断り (failFirst で 4xx になる)
+  for (const m of src.matchAll(/\[\['([a-z_]+)', `/g)) found.add(m[1]);   // 形の照らし (nightlyFormatProblems)
+  for (const m of src.matchAll(/ImportStateError\('([a-z_]+)'/g)) found.add(m[1]);   // 口が直に作る断り (new S.ImportStateError('code', …))
   for (const m of src.matchAll(/status\((4\d\d)\)\.json\(\{[^}]*?error: '([a-z_]+)'/g)) found.add(m[2]);
   for (const m of src.matchAll(/error: err\.status === 413 \? '([a-z_]+)' : '([a-z_]+)'/g)) { found.add(m[1]); found.add(m[2]); }
   assert.ok(!/fail\('[a-z_]+'[^;]*, 5\d\d\)/.test(src), 'store の断りは 4xx だけ (5xx の fail は無い)');
