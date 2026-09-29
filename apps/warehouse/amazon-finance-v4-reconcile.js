@@ -42,7 +42,9 @@ const LONG_ADJ = `
  *   (Easy Ship の割り振りだけの行を日次の側で数えないのと同じ向き)
  */
 export const V4_SKU_HAS_DAILY_SQL = `EXISTS (SELECT 1 FROM fact_amazon_settlement_monthly_long l4
-  WHERE l4.year_month_int = v4.year_month_int AND l4.seller_sku_normalized = v4.seller_sku AND l4.transaction_type NOT LIKE 'Inbound Defect Fee%')`;
+  WHERE l4.year_month_int = v4.year_month_int AND l4.seller_sku_normalized = v4.seller_sku AND TRIM(l4.seller_sku_normalized) <> ''
+    AND l4.transaction_type NOT IN ('BuyerRecharge', 'Previous Reserve Amount Balance', 'Current Reserve Amount')
+    AND l4.transaction_type NOT LIKE 'Inbound Defect Fee%')`;   // 日次の silver の対象の条件と全部そろえる (Codex #1551 R1 M1: 納品不備 + BuyerRecharge だけの SKU × 月は日次に行が無い)
 
 const V4_PROFIT = `gross_margin_excl_tax + warehouse_damage_jpy + warehouse_lost_jpy + safe_t_jpy + refund_principal_jpy + reversal_reimbursement_jpy`;
 

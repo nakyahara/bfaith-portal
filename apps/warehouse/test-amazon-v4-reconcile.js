@@ -59,6 +59,8 @@ line({ ...C, ft: 'Commission', fa: 110 }); line({ ...C, ft: 'RefundCommission', 
 line({ tt: 'Other', pt: 'SAFE-T Reimbursement', oa: 634, day: '15' }); line({ tt: 'PAYMENT_RETRACTION_ITEMS', oa: -120, day: '15' });
 line({ tt: 'Inbound Defect Fee - Missing label', oa: -200, day: '16', order: null });
 line({ sku: 'SKU-I', tt: 'Inbound Defect Fee - Barcode cannot be scanned', oa: -90, day: '17', order: null });
+// 納品不備 + BuyerRecharge だけの SKU (SKU-J) も日次に行が無い = v4 の側でも数えない (日次の silver の除外の条件と全部そろえる・Codex #1551 R1 M1)
+line({ sku: 'SKU-J', tt: 'Inbound Defect Fee - Missing label', oa: -70, day: '18', order: null }); line({ sku: 'SKU-J', tt: 'BuyerRecharge', oa: 40, day: '18', order: null });
 db.prepare(`INSERT INTO m_products (商品コード, 商品名, 商品区分, 原価状態, 原価, updated_at) VALUES ('sku-b', 'B', '単品', 'ok', 400, 't')`).run();
 // v4 は SKU 別の広告費の表を参照する (本番は広告の取込が作る・ここでは空の表だけ)
 db.exec(`CREATE TABLE IF NOT EXISTS fact_ad_spend (日付 TEXT, モール TEXT, ターゲット粒度 TEXT, ターゲット TEXT, 広告費 REAL, 広告経由売上 REAL)`);
