@@ -47,21 +47,22 @@ export function createImportStateRouter({ getDb = null, now = () => Date.now(), 
   let db = null;
   const dbOf = () => (getDb ? getDb() : (db ||= S.openImportStateDb()));
   const router = Router();
-  router.use((req, res, next) => {
+  // Bearer は /api だけ (同じ前置きの画面の口 /admin-api は、ここを素通りしてセッションの後の admin-router.js へ。③c-1b-3b-4a・K3-7)
+  router.use('/api', (req, res, next) => {
     const t = token();
     if (!t) return res.status(503).json({ error: 'not_configured', message: 'LZ_LOCK_TOKEN 未設定' });
     const got = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     if (!got || !timingSafeEq(got, t)) return res.status(401).json({ error: 'unauthorized' });
     return next();
   });
-  router.use(express.json({ limit: '64kb' }));
+  router.use('/api', express.json({ limit: '64kb' }));
   // 本文が大きすぎる・JSON でない = 短い JSON で返す (スタックを出さない)
   // 決まった文言だけ返す (本文の断片を返さない。Codex #1513 R1 Low)
   const bodyError = (err, req, res, next) => {
     if (!err) return next();
     return res.status(err.status === 413 ? 413 : 400).json({ ok: false, error: err.status === 413 ? 'too_large' : 'bad_json', message: err.status === 413 ? '本文が大きすぎる' : 'JSON として読めない' });
   };
-  router.use(bodyError);
+  router.use('/api', bodyError);
   const handle = (fn) => (req, res) => {
     try {
       res.json({ ok: true, ...fn(req.body || {}, req) });

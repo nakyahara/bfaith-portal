@@ -109,6 +109,7 @@ import abaExtRouter from './apps/aba-keywords/router.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
 import jobsMonitorRouter from './apps/jobs-monitor/router.js';
 import logizardImportStateRouter from './apps/logizard-import-state/router.js';
+import logizardImportAdminRouter, { adminApiGate as logizardImportAdminGate } from './apps/logizard-import-state/admin-router.js';
 import { startJobsMonitor } from './apps/jobs-monitor/notify-job.js';
 import stockBotRouter, { stockBotAuth } from './apps/stock-bot/router.js';
 import shohyoLinksRouter from './apps/shohyo-links/router.js';
@@ -319,7 +320,9 @@ if (process.env.JOBS_MONITOR_ENABLED === '1') {
   app.use('/apps/logizard-import-state', logizardImportStateRouter);
   console.log('[server] logizard-import-state mounted');
 }
-app.use(express.urlencoded({ extended: true }));
+// フォームの parser も /apps/logizard-import-state (機械の口・画面の口) は読まない = どちらも認証の後にその口だけの parser で読む (画面の口 = ログイン・管理者・Origin の後。③c-1b-3b-4a)
+const urlencodedParser = express.urlencoded({ extended: true });
+app.use((req, res, next) => (String(req.path || '').toLowerCase().startsWith('/apps/logizard-import-state') ? next() : urlencodedParser(req, res, next)));
 // グローバル JSON parser (10MB)。ただし大容量受信が必要な endpoint は除外。
 // 除外対象 endpoint は route 側で独自の parser (例: 50MB) を定義する。
 // 単純に全体 limit を上げると未認可リクエストのDoS面が広がるため、例外列挙方式を採る。
@@ -911,6 +914,12 @@ app.use('/apps/fba-box', express.json({ limit: '256kb' }), fbaBoxRouter);
 app.use('/apps/staff', express.json({ limit: '256kb' }), staffRouter);
 // マスタの判断 (照合 ② の NE との差・D2')。Render だけ (env MASTER_DECISIONS_ENABLED=1)。miniPC は同じ server.js を動かすが載せない = Company DB に人が書く口を 1 つに。
 // 見る = 利用権 (requireAppAccess)。決める (承認・却下・取り消し) = router 内の名簿 MASTER_DECISION_APPROVERS (空なら誰も決められない)。/apps/company-db/sync (機械用) とは別の口
+// ロジザードの取込の状態の画面の口 (③c-1b-3b-4a・人がどの端末でもブラウザで使う手の取込など)。Render だけ (機械の口と同じ JOBS_MONITOR_ENABLED)。
+// ログイン + 管理者 (JSON の 401 / 403) → router の中で Origin → Content-Type → その口だけの parser。機械の口 (Bearer) は /api だけ = ここは通らない
+if (process.env.JOBS_MONITOR_ENABLED === '1') {
+  app.use('/apps/logizard-import-state/admin-api', logizardImportAdminGate, logizardImportAdminRouter);
+  console.log('[server] logizard-import-state admin-api mounted');
+}
 if (process.env.MASTER_DECISIONS_ENABLED === '1') {
   app.use('/apps/master-decisions', requireAppAccess('master-decisions'), masterDecisionsRouter);
   console.log('[server] master-decisions mounted');

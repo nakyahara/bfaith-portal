@@ -156,9 +156,9 @@ await ta('[5] 手の取込 (v4): 旧い手の ③ は断る・止めてから・
   throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: src, now: T0 + 2000 }), 'manual_open');
   throwsCode(() => S.resume(db, { by: '中原', note: '再開したい', now: T0 + 2000 }), 'manual_open');
   assert.equal(S.getStatus(db, { now: T0 + 2000 }).manual.open, true);
-  const c = S.completeManualSession(db, { sessionId: m.session_id, resultText: RESULT_OK(2), history: { fileName: m.download_name, at: fm(T0 + 5000), account: 'nakahara' }, by: '中原', now: T0 + 6000 });
+  const c = S.completeManualSession(db, { sessionId: m.session_id, resultText: RESULT_OK(2), history: { fileName: m.download_name, at: T0 + MIN, account: 'nakahara' }, by: '中原', now: T0 + 2 * MIN });
   assert.deepEqual([c.status, c.mismatches], ['completed_ok', []]);
-  throwsCode(() => S.completeManualSession(db, { sessionId: m.session_id, resultText: RESULT_OK(2), history: { fileName: m.download_name, at: fm(T0 + 5000), account: 'nakahara' }, by: '中原', now: T0 + 6500 }), 'bad_transition');
+  throwsCode(() => S.completeManualSession(db, { sessionId: m.session_id, resultText: RESULT_OK(2), history: { fileName: m.download_name, at: T0 + MIN, account: 'nakahara' }, by: '中原', now: T0 + 2 * MIN + 500 }), 'bad_transition');
   assert.deepEqual(S.listPending(db).items.map((o) => o.product_id), ['A-1', 'B-2']);
   S.resume(db, { by: '中原', note: '自動を直したので再開', now: T0 + 7000 });
   const s = S.getStatus(db, { now: T0 + 7000 });
@@ -308,9 +308,16 @@ await ta('[11] Render だけに立てる (JOBS_MONITOR_ENABLED の中)・どの 
   assert.equal(s.indexOf("app.use('/apps/logizard-import-state'", at + 1), -1, 'ほかの場所で mount しない');
   const guard = s.lastIndexOf("if (process.env.JOBS_MONITOR_ENABLED === '1') {", at);
   assert.ok(guard > 0 && !s.slice(guard, at).includes('}'), 'JOBS_MONITOR_ENABLED の中');
-  assert.ok(at < s.indexOf('app.use(express.urlencoded('), 'urlencoded より前');
+  assert.ok(at < s.indexOf('const urlencodedParser = express.urlencoded('), 'urlencoded より前');
+  assert.equal(s.indexOf('app.use(express.urlencoded('), -1, 'フォームの parser を前置きなしで全部に掛けない');
+  assert.ok(s.includes("app.use((req, res, next) => (String(req.path || '').toLowerCase().startsWith('/apps/logizard-import-state') ? next() : urlencodedParser(req, res, next)));"), 'フォームの parser もこの前置きは読まない (③c-1b-3b-4a)');
   assert.ok(at < s.indexOf('return globalJsonParser(req, res, next);'), '共通の JSON より前');
   assert.ok(s.includes("if (normalizedPath.toLowerCase().startsWith('/apps/logizard-import-state')) return next();"));
+  // 画面の口 = セッションの後・JOBS_MONITOR_ENABLED の中・ログイン + 管理者の門を先に (③c-1b-3b-4a)
+  const adm = s.indexOf("app.use('/apps/logizard-import-state/admin-api', logizardImportAdminGate, logizardImportAdminRouter);");
+  assert.ok(adm > s.indexOf('const sessionMiddleware = session({') && adm > 0, 'セッションの後');
+  const g2 = s.lastIndexOf("if (process.env.JOBS_MONITOR_ENABLED === '1') {", adm);
+  assert.ok(g2 > at && !s.slice(g2, adm).includes('}'), '画面の口も JOBS_MONITOR_ENABLED の中');
   const m = JSON.parse(fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'manifest.json'), 'utf8'));
   for (const pc of ['minipc', 'streamdeck']) for (const f of ['import-state-client.js', 'import-state-cli.js']) assert.ok(m.pcs[pc].includes(f), `${pc}: ${f}`);
 });
@@ -565,16 +572,17 @@ function openedSession(db, { ids = ['A-1', 'B-2'], now = T0, id = 'lzd_20300115_
 
 await ta('[21] 手の取込を終える照合 (K3-3・K3-6): ファイル名・履歴の日時 (始める前 / 今より後)・アカウント・結果 (エラー・件数違い・読めない) のどれか = needs_review + 知らせ / 確認 (ack) まで再開も次の手の取込もできない / 取り消しは note・待ちは残る', async () => {
   const cases = [
-    ['ファイル名が違う', (m) => ({ fileName: 'logizard_shohinmaster_upload.csv', at: T0, account: 'nakahara' }), RESULT_OK(2), ['file_name']],
+    ['ファイル名が違う', (m) => ({ fileName: 'logizard_shohinmaster_upload.csv', at: T0 + MIN, account: 'nakahara' }), RESULT_OK(2), ['file_name']],
     ['履歴が始めた分より前', (m) => ({ fileName: m.download_name, at: T0 - MIN, account: 'nakahara' }), RESULT_OK(2), ['history_time']],
+    ['履歴が始めた分と同じ分 (始める前の取込と見分けられない = 要確認。Codex #1541 R1 High)', (m) => ({ fileName: m.download_name, at: T0, account: 'nakahara' }), RESULT_OK(2), ['history_time']],
     ['履歴が今の分より後', (m) => ({ fileName: m.download_name, at: fm(T0 + 3 * MIN + 200) + MIN, account: 'nakahara' }), RESULT_OK(2), ['history_time']],
-    ['アカウントが違う', (m) => ({ fileName: m.download_name, at: T0, account: 'staff1' }), RESULT_OK(2), ['account']],
-    ['エラーあり', (m) => ({ fileName: m.download_name, at: T0, account: 'nakahara' }), 'インポート結果 総件数 : 2 処理件数 : 1 処理不要件数 : 0 エラー件数 : 1', []],
-    ['件数が行数と違う (前の結果の文)', (m) => ({ fileName: m.download_name, at: T0, account: 'nakahara' }), RESULT_OK(5036), []],
-    ['結果が読めない', (m) => ({ fileName: m.download_name, at: T0, account: 'nakahara' }), '何かのエラー', []],
+    ['アカウントが違う', (m) => ({ fileName: m.download_name, at: T0 + MIN, account: 'staff1' }), RESULT_OK(2), ['account']],
+    ['エラーあり', (m) => ({ fileName: m.download_name, at: T0 + MIN, account: 'nakahara' }), 'インポート結果 総件数 : 2 処理件数 : 1 処理不要件数 : 0 エラー件数 : 1', []],
+    ['件数が行数と違う (前の結果の文)', (m) => ({ fileName: m.download_name, at: T0 + MIN, account: 'nakahara' }), RESULT_OK(5036), []],
+    ['結果が読めない', (m) => ({ fileName: m.download_name, at: T0 + MIN, account: 'nakahara' }), '何かのエラー', []],
   ];
-  // 境目 (分まで): 始めた分 (T0 + 10ms に始めた = T0 の分) と今の分は通す
-  for (const at of [T0, fm(T0 + 3 * MIN + 200)]) {
+  // 境目 (分まで): 始めた分の次の分 (T0 + 10ms に始めた = T0 の分 → T0 + 1 分) と今の分は通す
+  for (const at of [T0 + MIN, fm(T0 + 3 * MIN + 200)]) {
     const db = S.openImportStateDb(':memory:');
     S.init(db, { by: 'x', now: T0 });
     const m = openedSession(db);
@@ -660,8 +668,9 @@ await ta('[23] 再適用待ちは (手の取込, 商品) の義務 (K3-2): 毎�
   const manual = (ids) => {
     t += 1000;
     const m = openedSession(db, { ids, now: t, id: `lzd_m${t}` });
-    S.completeManualSession(db, { sessionId: m.session_id, resultText: RESULT_OK(ids.length), history: { fileName: m.download_name, at: fm(t + 20), account: 'nakahara' }, by: '中原', now: t + 30 });
-    S.resume(db, { by: '中原', note: '手で取り込んだので再開', now: t + 40 });
+    S.completeManualSession(db, { sessionId: m.session_id, resultText: RESULT_OK(ids.length), history: { fileName: m.download_name, at: fm(t + 10) + MIN, account: 'nakahara' }, by: '中原', now: t + 2 * MIN });
+    S.resume(db, { by: '中原', note: '手で取り込んだので再開', now: t + 2 * MIN + 10 });
+    t += 2 * MIN + 10;
     return m;
   };
   const pending = () => S.listPending(db).items.map((o) => `${o.product_id}@${o.session_id.slice(-6)}`);
@@ -774,7 +783,7 @@ await ta('[26] 義務・閉じ・区切りの表は追記だけ・status に手�
   const m3 = openedSession(db, { now: T0 + MIN });
   for (const sql of ["UPDATE manual_sessions SET closed_at = 1, closed_by = 'x', close_detail = '{}' WHERE status = 'open'", "UPDATE manual_sessions SET status = 'cancelled' WHERE status = 'open'",
     "UPDATE manual_sessions SET closed_by = 'tampered' WHERE status = 'open'", "UPDATE manual_sessions SET close_detail = '{}' WHERE status = 'open'", "UPDATE manual_sessions SET closed_at = 1 WHERE status = 'open'"]) assert.throws(() => db.prepare(sql).run(), /変えない/, sql);
-  S.completeManualSession(db, { sessionId: m3.session_id, resultText: RESULT_OK(2), history: { fileName: m3.download_name, at: T0 + MIN, account: 'nakahara' }, by: '中原', now: T0 + MIN + 100 });
+  S.completeManualSession(db, { sessionId: m3.session_id, resultText: RESULT_OK(2), history: { fileName: m3.download_name, at: T0 + 2 * MIN, account: 'nakahara' }, by: '中原', now: T0 + 2 * MIN + 100 });
   assert.throws(() => db.prepare("UPDATE manual_sessions SET ack_at = 1, ack_by = 'x', ack_note = 'yyyy' WHERE session_id = ?").run(m3.session_id), /変えない/);
 });
 
