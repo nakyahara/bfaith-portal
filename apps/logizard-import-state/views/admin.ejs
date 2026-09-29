@@ -59,12 +59,13 @@
       <summary><b>📖 手順 (はじめに読む)</b></summary>
       <ol>
         <li><b>いつ使う</b>: 自動が止まったと GChat (要対応) に知らせが来た / miniPC が動かない / 今日のうちに取り込みたい。</li>
-        <li><b>自動を止める</b> (まだ止まっていなければ): 下の「自動を止める」に理由を書いて押す。止めると GChat に知らせが行きます。</li>
-        <li><b>手の取込を始める</b>: 使うロジザードの<b>自分のアカウント</b>を選ぶ (共通アカウントは使わない = Stream Deck とぶつかる)。CSV は「毎晩の成果物」の一番新しい <b>判定 pass</b> を選ぶ。</li>
-        <li><b>CSV をダウンロード</b>して、ロジザードの商品マスタの取込の画面に<b>そのファイルをそのまま</b>置いて実行する (<b>ファイル名を変えない</b>・ほかの CSV を置かない)。</li>
+        <li><b>自動を止める</b> (まだ止まっていなければ): 下の「自動を止める」に理由を書いて押す。止めると GChat に知らせが行きます。ほかの人が止め直した・再開したときは「画面を読み直して」と出るので、読み直して今の止めの理由を見てから操作する。</li>
+        <li><b>手の取込を始める</b>: 使うロジザードの<b>自分のアカウント</b>を選ぶ (共通アカウントは使わない = Stream Deck とぶつかる)。CSV は「毎晩の成果物」から<b>対象の日が一番新しい判定 pass</b> を自分で選ぶ (一覧は対象の日の新しい順)。</li>
+        <li><b>CSV をダウンロード</b>して、ロジザードの商品マスタの取込の画面に<b>そのファイルをそのまま</b>置いて実行する (<b>ファイル名を変えない</b>・ほかの CSV を置かない)。<b>始めた時刻の次の分になってから実行する</b> (履歴の日時が始めた分と同じ = 始める前の取込と見分けられない = 要確認になる)。</li>
         <li>ロジザードに出た<b>結果の文</b> (「インポート結果 総件数 : … エラー件数 : …」) をコピーして貼る。</li>
-        <li>ロジザードの<b>取込の履歴</b>で、今の取込の<b>ファイル名・日時 (分まで)・アカウント</b>を見て入れ、「終える」を押す。</li>
+        <li>ロジザードの<b>取込の履歴</b>を開いて、今の取込の<b>ファイル名・日時 (分まで)・アカウントを履歴から写して</b>入れ、「終える」を押す (画面の参考の値を写さない = 履歴と照らすため)。</li>
         <li>全部合えば <b>完了</b>。合わない・エラーがある = <b>要確認</b> (GChat に知らせ)。ロジザードの履歴を見て、何が起きたかをメモに書いて「確認」を押す。</li>
+        <li><b>完了でも、結果の文と履歴は人が写したもの (自己申告)</b>。ロジザードの値が本当に正しいかは、<b>次の夜の自動の入れ直しと照合</b>で確かめる (画面の「再適用待ち」が減るのを見る)。</li>
         <li>ロジザードに置かなかった = 「取り消し」(メモ必須)。</li>
         <li>原因が直ったら「<b>自動を再開</b>」。次の夜の自動が、手で取り込んだ商品を Company DB の値で入れ直します (下の「再適用待ち」が減る)。</li>
         <li>再適用待ちが何日も残る商品は、Company DB の対象外などの理由を確かめて、理由を書いて閉じる (waiver)。</li>
@@ -117,8 +118,9 @@
         <div class="kv" id="open-info"></div>
         <div class="row"><a class="btn-sm" id="open-download" href="#">⬇ CSV をダウンロード</a> <span class="muted">ロジザードに置くのはこのファイルだけ (ファイル名を変えない)</span></div>
         <div class="row"><textarea id="cp-result" placeholder="ロジザードに出た結果の文 (インポート結果 総件数 : … エラー件数 : …)"></textarea></div>
+        <p class="hint">下の 3 つは<b>ロジザードの取込の履歴から写す</b> (上の「比べる用」を写さない)。</p>
         <div class="row">
-          <label>履歴のファイル名 <input type="text" id="cp-file" size="40"></label>
+          <label>履歴のファイル名 <input type="text" id="cp-file" size="40" autocomplete="off"></label>
           <label>履歴の日時 (分まで・日本時間) <input type="datetime-local" id="cp-at" step="60"></label>
           <label>履歴のアカウント <select id="cp-account"></select></label>
         </div>
@@ -189,7 +191,8 @@
     }
     const kv = (node, pairs) => { clear(node); for (const [k, v] of pairs) { const d = el('div'); d.appendChild(el('b', k)); d.appendChild(document.createTextNode(' ' + (v == null || v === '' ? '-' : String(v)))); node.appendChild(d); } };
     const fillSelect = (sel, items, current) => { clear(sel); for (const [value, label] of items) { const o = el('option', label); o.value = value; if (value === current) o.selected = true; sel.appendChild(o); } };
-    let S = null, pendingAfter = 0, pendingNext = null, pendingProduct = null;
+    let S = null, pendingAfter = 0, pendingNext = null, pendingProduct = null, shownSession = null;
+    const resetManualInputs = () => { for (const id of ['cp-result', 'cp-file', 'cp-at', 'cp-note', 'cancel-note', 'ack-note']) $(id).value = ''; };
 
     async function load() {
       try {
@@ -224,13 +227,21 @@
       $('manual-review').classList.toggle('hidden', !review);
       $('start-hint').textContent = !st.halted ? '始めるには、先に自動を止める。' : !accounts.length ? '先に設定で「手の取込で使うロジザードのアカウント」を入れる。' : '';
       fillSelect($('st-account'), accounts.map((a) => [a, a]), accounts[0]);
-      fillSelect($('st-artifact'), (S.artifacts || []).filter((a) => a.verdict === 'pass').map((a) => [a.source_run_id, a.target_as_of + ' ・ ' + a.rows + ' 行 ・ ' + a.source_run_id]));
+      // 成果物は自分で選ぶ (空から。一覧は対象の日の新しい順)。選んでいたものは読み直しても残す
+      const keepArtifact = $('st-artifact').value;
+      fillSelect($('st-artifact'), [['', '(選ぶ: 対象の日が一番新しい判定 pass)']].concat((S.artifacts || []).filter((a) => a.verdict === 'pass').map((a) => [a.source_run_id, a.target_as_of + ' ・ ' + a.rows + ' 行 ・ ' + a.source_run_id])), keepArtifact);
       $('row-gas').classList.toggle('hidden', !(S.settings && S.settings.cutover_phase === 'transition'));
+      // 手の取込が変わった (別の画面で閉じて開き直した) = 入力欄を全部消す (古い値を新しい手の取込に送らない。Codex #1542 R1 Low)
+      const nowSession = open ? open.session_id : (review ? review.session_id : null);
+      if (nowSession !== shownSession) { resetManualInputs(); shownSession = nowSession; }
       if (open) {
-        kv($('open-info'), [['手の取込', open.session_id], ['始めた', jst(open.opened_at) + ' (' + open.opened_by + ')'], ['CSV', (open.source_kind === 'gas_upload' ? 'GAS の CSV' : '毎晩の成果物 ' + open.source_run_id) + '・対象の日 ' + open.target_as_of + '・' + open.rows + ' 行'], ['ファイル名', open.download_name], ['アカウント', open.lz_account]]);
+        kv($('open-info'), [['手の取込', open.session_id], ['始めた', jst(open.opened_at) + ' (' + open.opened_by + ')'], ['CSV', (open.source_kind === 'gas_upload' ? 'GAS の CSV' : '毎晩の成果物 ' + open.source_run_id) + '・対象の日 ' + open.target_as_of + '・' + open.rows + ' 行'],
+          ['比べる用: ファイル名', open.download_name], ['比べる用: アカウント', open.lz_account], ['比べる用: 日時', jst(open.opened_at) + ' の次の分から']]);
         $('open-download').setAttribute('href', API + '/manual/' + encodeURIComponent(open.session_id) + '/csv');
-        if (!$('cp-file').value) $('cp-file').value = open.download_name;
-        fillSelect($('cp-account'), accounts.map((a) => [a, a]), open.lz_account);
+        // 履歴のアカウントは空から選ぶ (固定したアカウントが設定から消えていても選べる。入力欄に正解を入れない。Codex #1542 R1 High)
+        const keepAcc = $('cp-account').value;
+        const accs = [...new Set(accounts.concat([open.lz_account]))];
+        fillSelect($('cp-account'), [['', '(履歴を見て選ぶ)']].concat(accs.map((a) => [a, a])), keepAcc);
       }
       if (review) {
         const d = review.close_detail || {};
@@ -275,19 +286,22 @@
       try { const r = await fn(); say(msgId, r || '済み', true); await load(); } catch (e) { say(msgId, e.message); } finally { $(btn).disabled = false; }
     });
     act('btn-halt', 'msg-halt', async () => { const r = await call('/halt', { method: 'POST', body: { reason: $('halt-reason').value } }); return '止めた' + (r.notified ? ' (GChat に知らせた)' : ' (知らせは後で送り直す)'); });
-    act('btn-resume', 'msg-halt', async () => { await call('/resume', { method: 'POST', body: { note: $('resume-note').value } }); return '再開した'; });
+    // 画面が見ていた止めの番号を送る (ほかの人が止め直した・再開した = 409 = 読み直す。Codex #1542 R1 High)
+    const haltRev = () => (S && S.status ? S.status.halt_revision : null);
+    act('btn-resume', 'msg-halt', async () => { await call('/resume', { method: 'POST', body: { note: $('resume-note').value, expected_halt_revision: haltRev() } }); return '再開した'; });
     act('btn-start', 'msg-manual', async () => {
       const account = $('st-account').value;
       const src = document.querySelector('input[name=st-src]:checked').value;
       if (src === 'gas') {
         const f = $('st-gas-file').files[0];
         if (!f) throw new Error('GAS の CSV を選ぶ');
-        const q = new URLSearchParams({ lz_account: account, target_as_of: $('st-gas-date').value });
+        const q = new URLSearchParams({ lz_account: account, target_as_of: $('st-gas-date').value, expected_halt_revision: String(haltRev()) });
         await call('/manual/open-gas?' + q, { method: 'POST', raw: f });
       } else {
-        await call('/manual/open', { method: 'POST', body: { lz_account: account, source_run_id: $('st-artifact').value } });
+        if (!$('st-artifact').value) throw new Error('毎晩の成果物を選ぶ');
+        await call('/manual/open', { method: 'POST', body: { lz_account: account, source_run_id: $('st-artifact').value, expected_halt_revision: haltRev() } });
       }
-      $('cp-file').value = ''; $('cp-result').value = ''; $('cp-note').value = '';
+      resetManualInputs();
       return '始めた。CSV をダウンロードしてロジザードで取り込む';
     });
     act('btn-complete', 'msg-manual', async () => {
@@ -328,6 +342,7 @@
     $('btn-pending-first').addEventListener('click', () => { pendingProduct = null; $('pending-product').value = ''; pendingAfter = 0; loadPending(); });
     $('btn-pending-next').addEventListener('click', () => { if (pendingNext != null) { pendingAfter = pendingNext; loadPending(); } });
     load();
+    setInterval(load, 60000);   // 1 分ごとに読み直す (ほかの画面の変化・閉じた手の取込のダウンロードのリンクを古いまま残さない)
   })();
   </script>
 </body>

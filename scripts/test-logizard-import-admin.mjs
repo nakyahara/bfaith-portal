@@ -52,7 +52,8 @@ async function withApp(fn, { notify = async () => true } = {}) {
     body: body === undefined ? undefined : (Buffer.isBuffer(body) || typeof body === 'string' ? body : JSON.stringify(body)),
   });
   const j = async (p, o) => { const r = await api(p, o); return { status: r.status, body: await r.json() }; };
-  try { await fn({ db, base, api, j, sent, tick: (ms) => { clock += ms; }, now: () => clock }); } finally { await new Promise((r) => srv.close(r)); }
+  const rev = async () => (await j('/status')).body.status.halt_revision;   // 画面が見ている止めの番号
+  try { await fn({ db, base, api, j, rev, sent, tick: (ms) => { clock += ms; }, now: () => clock }); } finally { await new Promise((r) => srv.close(r)); }
 }
 const artifact = (db, ids = ['A-1', 'B-2'], id = 'lzd_20300115_a') => {
   const buf = csvOf(ids);
@@ -105,7 +106,7 @@ await ta('[2] 書く口: Origin = Host だけ (無い・違う・壊れた = 403
 });
 
 await ta('[3] 手の取込の流れ: 止める (知らせをすぐ送る) → 成果物で始める (誰 = セッション) → CSV のダウンロード (同じバイト列・attachment・no-store・nosniff) → 終える (completed_ok) → 再開', async () => {
-  await withApp(async ({ db, j, api, sent, tick, now }) => {
+  await withApp(async ({ db, j, api, rev, sent, tick, now }) => {
     S.init(db, { by: 'x', now: T0 });
     const buf = artifact(db);
     let r = await j('/settings', { method: 'POST', body: { key: 'lz_accounts', value: ['nakahara'], by: 'attacker' } });
@@ -115,7 +116,7 @@ await ta('[3] 手の取込の流れ: 止める (知らせをすぐ送る) → �
     assert.match(sent[0], /止めた \(admin@b-faith\.biz\)/);
     assert.ok(sent[0].includes('画面 ▶ https://bfaith-portal.onrender.com/apps/logizard-import-state/admin'), '知らせから画面を開ける (ダッシュボードのカードは作らない)');
     assert.deepEqual(S.outboxPending(db), []);   // 送れた = 送れた印
-    r = await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a', by: 'attacker' } });
+    r = await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a', by: 'attacker', expected_halt_revision: await rev() } });
     assert.equal(r.status, 200, JSON.stringify(r.body));
     const m = r.body;
     assert.deepEqual([m.rows, m.csv_sha256, m.source_run_id], [2, shaOf(buf), 'lzd_20300115_a']);
@@ -131,7 +132,7 @@ await ta('[3] 手の取込の流れ: 止める (知らせをすぐ送る) → �
     tick(3 * MIN);
     r = await j(`/manual/${m.session_id}/complete`, { method: 'POST', body: { result_text: RESULT_OK(2), history: { file_name: m.download_name, at: T0 + MIN, account: 'nakahara' }, note: '取り込んだ' } });
     assert.deepEqual([r.status, r.body.status, r.body.mismatches], [200, 'completed_ok', []]);
-    r = await j('/resume', { method: 'POST', body: { note: '自動を直したので再開' } });
+    r = await j('/resume', { method: 'POST', body: { expected_halt_revision: await rev(), note: '自動を直したので再開' } });
     assert.deepEqual([r.status, r.body.halted], [200, false]);
     // 管理者の見え方には出来事の中身も (機械の口には出さない)
     r = await j('/status');
@@ -142,25 +143,25 @@ await ta('[3] 手の取込の流れ: 止める (知らせをすぐ送る) → �
 
 await ta('[4] 照合が合わない = needs_review → 知らせをすぐ送る → 確認 (ack) まで再開できない / 知らせを送れない = outbox に残る', async () => {
   let fail = false;
-  await withApp(async ({ db, j, sent, tick }) => {
+  await withApp(async ({ db, j, api, rev, sent, tick }) => {
     S.init(db, { by: 'x', now: T0 });
     artifact(db);
     S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: 'x', now: T0 });
     await j('/halt', { method: 'POST', body: { reason: '自動の取込がおかしい' } });
-    const m = (await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a' } })).body;
+    const m = (await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a', expected_halt_revision: await rev() } })).body;
     tick(MIN);
     fail = true;   // この後の知らせは送れない
     let r = await j(`/manual/${m.session_id}/complete`, { method: 'POST', body: { result_text: RESULT_OK(2), history: { file_name: 'logizard_shohinmaster_upload.csv', at: T0 + MIN, account: 'nakahara' } } });
     assert.deepEqual([r.status, r.body.status, r.body.mismatches, r.body.notified], [200, 'needs_review', ['file_name'], false]);
     assert.deepEqual(S.outboxPending(db).map((o) => o.kind), ['manual_review']);   // 送れない = 残る (定時の入口が送り直す)
     assert.ok(sent.some((t) => t.includes(m.session_id)));
-    r = await j('/resume', { method: 'POST', body: { note: '再開したい' } });
+    r = await j('/resume', { method: 'POST', body: { expected_halt_revision: await rev(), note: '再開したい' } });
     assert.deepEqual([r.status, r.body.error], [409, 'needs_review']);
     r = await j(`/manual/${m.session_id}/ack`, { method: 'POST', body: { note: '' } });
     assert.equal(r.status, 400);
     r = await j(`/manual/${m.session_id}/ack`, { method: 'POST', body: { note: 'ロジザードの履歴を見た' } });
     assert.equal(r.status, 200);
-    assert.equal((await j('/resume', { method: 'POST', body: { note: '確認したので再開' } })).status, 200);
+    assert.equal((await j('/resume', { method: 'POST', body: { expected_halt_revision: await rev(), note: '確認したので再開' } })).status, 200);
     // 形の誤り
     for (const b of [{ result_text: '' }, { result_text: RESULT_OK(2), history: null }, { result_text: RESULT_OK(2), history: { file_name: 'x', at: T0 + 1234, account: 'nakahara' } }]) {
       assert.equal((await j(`/manual/${m.session_id}/complete`, { method: 'POST', body: b })).status, 400, JSON.stringify(b));
@@ -169,21 +170,21 @@ await ta('[4] 照合が合わない = needs_review → 知らせをすぐ送る 
 });
 
 await ta('[5] GAS の CSV (移行の段階だけ・バイト列・JSON は 415・大きすぎる 413・一方通行) / 取り消し・waiver・解除・unknown / 旗が無い = 手の取込は disabled', async () => {
-  await withApp(async ({ db, j, api, tick }) => {
+  await withApp(async ({ db, j, api, rev, tick }) => {
     S.init(db, { by: 'x', now: T0 });
     S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: 'x', now: T0 });
     await j('/halt', { method: 'POST', body: { reason: '手で取り込む' } });
     const gas = csvOf(['A-1', 'C-3']);
-    let r = await j('/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16', { method: 'POST', body: gas, type: 'application/octet-stream' });
+    let r = await j(`/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16&expected_halt_revision=${await rev()}`, { method: 'POST', body: gas, type: 'application/octet-stream' });
     assert.deepEqual([r.status, r.body.error], [409, 'gas_closed']);   // 設定が無い = cutover
     assert.equal((await j('/settings', { method: 'POST', body: { key: 'cutover_phase', value: 'transition' } })).status, 200);
-    r = await j('/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16', { method: 'POST', body: { csv: 'x' } });
+    r = await j(`/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16&expected_halt_revision=${await rev()}`, { method: 'POST', body: { csv: 'x' } });
     assert.equal(r.status, 415);
-    const big = await api('/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16', { method: 'POST', body: Buffer.alloc(S.LIMITS.csvBytes + 1, 0x41), type: 'application/octet-stream' });
+    const big = await api(`/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16&expected_halt_revision=${await rev()}`, { method: 'POST', body: Buffer.alloc(S.LIMITS.csvBytes + 1, 0x41), type: 'application/octet-stream' });
     assert.equal(big.status, 413);
-    r = await j('/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16&target_as_of=2030-01-15', { method: 'POST', body: gas, type: 'application/octet-stream' });
+    r = await j(`/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16&target_as_of=2030-01-15&expected_halt_revision=${await rev()}`, { method: 'POST', body: gas, type: 'application/octet-stream' });
     assert.equal(r.status, 400);   // 同じ名前が 2 つ = 無い扱い
-    r = await j('/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16', { method: 'POST', body: gas, type: 'application/octet-stream' });
+    r = await j(`/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16&expected_halt_revision=${await rev()}`, { method: 'POST', body: gas, type: 'application/octet-stream' });
     assert.deepEqual([r.status, r.body.source_kind, r.body.rows], [200, 'gas_upload', 2]);
     assert.equal((await j(`/manual/${r.body.session_id}/cancel`, { method: 'POST', body: { note: 'ロジザードに置かなかった' } })).status, 200);
     // waiver (特定の義務)
@@ -195,7 +196,7 @@ await ta('[5] GAS の CSV (移行の段階だけ・バイト列・JSON は 415�
     r = await j('/settings', { method: 'POST', body: { key: 'cutover_phase', value: 'transition' } });
     assert.deepEqual([r.status, r.body.error], [409, 'one_way']);
     // 解除・unknown (自動の回を作って)
-    await j('/resume', { method: 'POST', body: { note: '取り消したので再開' } });
+    await j('/resume', { method: 'POST', body: { expected_halt_revision: await rev(), note: '取り消したので再開' } });
     const L = S.acquire(db, { initId: S.getStatus(db).init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 60, by: 'auto', now: T0 });
     S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: 'a'.repeat(64), rows: 2, mode: 'test', target_as_of: '2030-01-16' }, by: 'auto', now: T0 });
     r = await j('/mark-unknown', { method: 'POST', body: { run_id: 'lzim_a', reason: '鍵が切れた' } });
@@ -209,14 +210,14 @@ await ta('[5] GAS の CSV (移行の段階だけ・バイト列・JSON は 415�
     try {
       artifact(db);
       await j('/halt', { method: 'POST', body: { reason: '旗なしで止める' } });
-      r = await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a' } });
+      r = await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a', expected_halt_revision: await rev() } });
       assert.deepEqual([r.status, r.body.error], [409, 'disabled']);
     } finally { process.env.LZ_MANUAL_V4 = 'on'; }
   });
 });
 
 await ta('[6] メモ・理由は文字で 500 字まで (オブジェクト・配列・501 字 = 400) / 似た型 (application/json-patch+json・octet-stream+csv) = 415 (Codex #1541 R1)', async () => {
-  await withApp(async ({ db, j }) => {
+  await withApp(async ({ db, j, api, rev }) => {
     S.init(db, { by: 'x', now: T0 });
     S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: 'x', now: T0 });
     for (const v of [{ a: 1 }, ['理由の配列'], 'x'.repeat(501), 12345]) {
@@ -229,7 +230,7 @@ await ta('[6] メモ・理由は文字で 500 字まで (オブジェクト・�
     assert.equal(S.getStatus(db).halted, false);
     await j('/halt', { method: 'POST', body: { reason: '手で取り込む' } });
     artifact(db);
-    const m = (await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a' } })).body;
+    const m = (await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a', expected_halt_revision: await rev() } })).body;
     for (const v of [{ a: 1 }, ['x'], 'x'.repeat(501)]) {
       assert.equal((await j(`/manual/${m.session_id}/cancel`, { method: 'POST', body: { note: v } })).status, 400);
       assert.equal((await j(`/manual/${m.session_id}/complete`, { method: 'POST', body: { result_text: RESULT_OK(2), history: { file_name: m.download_name, at: T0 + MIN, account: 'nakahara' }, note: v } })).status, 400);
@@ -238,7 +239,7 @@ await ta('[6] メモ・理由は文字で 500 字まで (オブジェクト・�
       assert.equal((await j('/halt', { method: 'POST', body: JSON.stringify({ reason: '止めたい理由' }), type })).status, 415, type);
     }
     assert.equal((await j('/halt', { method: 'POST', body: JSON.stringify({ reason: '止めたい理由' }), type: 'application/json; charset=utf-8' })).status, 200);
-    assert.equal((await j('/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16', { method: 'POST', body: csvOf(['A-1']), type: 'application/octet-stream+csv' })).status, 415);
+    assert.equal((await j(`/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16&expected_halt_revision=${await rev()}`, { method: 'POST', body: csvOf(['A-1']), type: 'application/octet-stream+csv' })).status, 415);
   });
 });
 
@@ -255,13 +256,13 @@ await ta('[7] 今回の知らせを真っ先に送る (前の知らせが 20 件
 });
 
 await ta('[8] 待ちの義務は番号の後から・商品で探せる (500 件を超えても全部に届く)・形の誤り (Codex #1541 R1 Medium)', async () => {
-  await withApp(async ({ db, j }) => {
+  await withApp(async ({ db, j, api, rev }) => {
     S.init(db, { by: 'x', now: T0 });
     S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: 'x', now: T0 });
     const ids = Array.from({ length: 620 }, (_, i) => `P-${String(i).padStart(4, '0')}`);
     artifact(db, ids, 'lzd_20300115_big');
     await j('/halt', { method: 'POST', body: { reason: '手で取り込む' } });
-    await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_big' } });
+    await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_big', expected_halt_revision: await rev() } });
     let r = await j('/pending');
     assert.deepEqual([r.body.count, r.body.items.length, r.body.next_after != null], [620, 500, true]);
     r = await j(`/pending?after=${r.body.next_after}`);
@@ -307,6 +308,124 @@ await ta('[9] 画面 (③c-1b-3b-4b): 描ける・中の JS が組み立てら�
   const got = {};
   renderAdminPage({ session: { email: 'a@b', displayName: 'A' } }, { set: (k, v) => { got[k] = v; }, render: (p, l) => { got.path = p; got.locals = l; } });
   assert.deepEqual([got['Cache-Control'], path.basename(got.path), got.locals], ['no-store', 'admin.ejs', { username: 'a@b', displayName: 'A' }]);
+});
+
+await ta('[10] 画面が見ていた止めの番号 (Codex #1542 R1 High): 無い = 400・古い (止め直された) = 409 stale・止めてないのに再開 = 409 / 閉じた手の取込の CSV は取れない (409) / 成果物は対象の日の新しい順', async () => {
+  await withApp(async ({ db, j, api, rev }) => {
+    S.init(db, { by: 'x', now: T0 });
+    S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: 'x', now: T0 });
+    await j('/halt', { method: 'POST', body: { reason: '一度目の止め' } });
+    const r1 = await rev();
+    assert.ok(Number.isSafeInteger(r1));
+    assert.deepEqual([(await j('/resume', { method: 'POST', body: { note: '再開したい' } })).status, S.getStatus(db).halted], [400, true]);
+    // 別の画面で「再開 → 別の理由で止め直し」= 番号が変わる → 古い画面の再開は断る
+    S.resume(db, { by: 'other', note: '別の画面で再開', now: T0 + 1 });
+    S.halt(db, { by: 'other', reason: '別の障害で止め直し', now: T0 + 2 });
+    let r = await j('/resume', { method: 'POST', body: { note: '古い画面から再開', expected_halt_revision: r1 } });
+    assert.deepEqual([r.status, r.body.error, S.getStatus(db).halted], [409, 'stale', true]);
+    artifact(db);
+    r = await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a', expected_halt_revision: r1 } });
+    assert.deepEqual([r.status, r.body.error], [409, 'stale']);
+    r = await j('/manual/open-gas?lz_account=nakahara&target_as_of=2030-01-16', { method: 'POST', body: csvOf(['A-1']), type: 'application/octet-stream' });
+    assert.equal(r.status, 400);   // 番号なし
+    // 今の番号なら通る
+    const m = (await j('/manual/open', { method: 'POST', body: { lz_account: 'nakahara', source_run_id: 'lzd_20300115_a', expected_halt_revision: await rev() } })).body;
+    assert.ok(m.session_id);
+    assert.equal((await api(`/manual/${m.session_id}/csv`)).status, 200);
+    await j(`/manual/${m.session_id}/cancel`, { method: 'POST', body: { note: 'ロジザードに置かなかった' } });
+    r = await j(`/manual/${m.session_id}/csv`);
+    assert.deepEqual([r.status, r.body.error], [409, 'not_open']);   // 閉じた後に古い画面から取れない
+    assert.equal((await j('/resume', { method: 'POST', body: { note: '今の止めを見て再開', expected_halt_revision: await rev() } })).status, 200);
+    r = await j('/resume', { method: 'POST', body: { note: 'もう一度再開', expected_halt_revision: 1 } });
+    assert.deepEqual([r.status, r.body.error], [409, 'not_halted']);
+    assert.equal((await j('/status')).body.status.halt_revision, null);
+    // 成果物は対象の日の新しい順 (古い日の成果物が後から届いても先頭にしない)
+    const b1 = csvOf(['A-1']), b2 = csvOf(['B-2']);
+    S.putArtifact(db, { sourceRunId: 'lzd_20300117_x', targetAsOf: '2030-01-17', verdict: 'pass', csvBuf: b1, sha256: shaOf(b1), rows: 1, by: 'lz-daily', now: T0 + 10 });
+    S.putArtifact(db, { sourceRunId: 'lzd_20300110_old', targetAsOf: '2030-01-10', verdict: 'pass', csvBuf: b2, sha256: shaOf(b2), rows: 1, by: 'lz-daily', now: T0 + 20 });
+    assert.deepEqual((await j('/status')).body.artifacts.map((x) => x.target_as_of), ['2030-01-17', '2030-01-15', '2030-01-10']);
+  });
+});
+
+await ta('[11] 画面を本物のブラウザで動かす (Codex #1542 R1 Medium): 悪い値は文字のまま・連打で 2 つ始めない・入力欄は空から・履歴の日時は日本時間 (端末はニューヨーク)・GAS の CSV は同じバイト列・古い画面の再開は断る', async () => {
+  let chromium;
+  try { ({ chromium } = await import('playwright')); } catch { console.log('      (playwright が無い = この試験はとばす)'); passed--; return; }
+  const { renderAdminPage } = await import('../apps/logizard-import-state/admin-router.js');
+  const db = S.openImportStateDb(':memory:');
+  let clock = T0;
+  const app = express();
+  app.use((req, res, next) => { req.session = { authenticated: true, email: 'admin@b-faith.biz', displayName: '管理者', role: 'admin' }; next(); });   // ブラウザ = 管理者
+  app.get('/apps/logizard-import-state/admin', renderAdminPage);
+  app.use('/apps/logizard-import-state/admin-api', adminApiGate, createAdminRouter({ getDb: () => db, now: () => clock, notify: async () => true }));
+  const srv = await new Promise((resolve) => { const x = app.listen(0, '127.0.0.1', () => resolve(x)); });
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    S.init(db, { by: 'x', now: T0 });
+    const EVIL = '<img src=x onerror="window.__xss=1">';
+    S.setSetting(db, { key: 'lz_accounts', value: ['nakahara', EVIL], by: 'x', now: T0 });
+    artifact(db);
+    const ctx = await browser.newContext({ timezoneId: 'America/New_York' });
+    const page = await ctx.newPage();
+    const waitMsg = (id, re) => page.waitForFunction(([i, r]) => new RegExp(r).test(document.getElementById(i).textContent), [id, re.source], { timeout: 10000 });
+    await page.goto(`${base}/apps/logizard-import-state/admin`);
+    await page.waitForFunction(() => /取込の状態/.test(document.getElementById('summary').textContent));
+    // 止める (悪い値の理由)
+    await page.fill('#halt-reason', EVIL + ' 止める理由');
+    await page.click('#btn-halt');
+    await waitMsg('msg-halt', /止めた/);
+    await page.waitForFunction(() => /止めてある/.test(document.getElementById('summary').textContent));
+    assert.equal(S.getStatus(db).halted, true);
+    assert.ok((await page.textContent('#summary')).includes(EVIL), '理由は文字のまま出る');
+    assert.deepEqual(await page.evaluate(() => [window.__xss, document.querySelectorAll('img').length]), [undefined, 0]);
+    // 始める (連打しても 1 つ)
+    await page.selectOption('#st-account', 'nakahara');
+    await page.selectOption('#st-artifact', 'lzd_20300115_a');
+    await page.dblclick('#btn-start');
+    await waitMsg('msg-manual', /始めた/);
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM manual_sessions').get().n, 1);
+    const m = db.prepare("SELECT session_id, download_name FROM manual_sessions WHERE status = 'open'").get();
+    await page.waitForFunction(() => !document.getElementById('manual-open').classList.contains('hidden'));
+    assert.deepEqual(await page.evaluate(() => [document.getElementById('cp-file').value, document.getElementById('cp-account').value, document.getElementById('open-download').getAttribute('href')]),
+      ['', '', `/apps/logizard-import-state/admin-api/manual/${m.session_id}/csv`]);   // 入力欄に正解を入れない
+    assert.ok((await page.textContent('#open-info')).includes(m.download_name), '比べる用に出す');
+    // 終える (履歴の日時 = 日本時間 12:03。端末はニューヨーク)
+    clock = T0 + 5 * MIN;
+    await page.fill('#cp-result', RESULT_OK(2));
+    await page.fill('#cp-file', m.download_name);
+    await page.fill('#cp-at', '2030-01-16T12:03');
+    await page.selectOption('#cp-account', 'nakahara');
+    await page.click('#btn-complete');
+    await waitMsg('msg-manual', /完了/);
+    const done = S.getManualSession(db, { sessionId: m.session_id });
+    assert.deepEqual([done.status, done.close_detail.history.at], ['completed_ok', Date.parse('2030-01-16T12:03:00+09:00')]);
+    assert.deepEqual(await page.evaluate(() => [window.__xss, document.querySelectorAll('img').length]), [undefined, 0]);
+    // 古い画面: 別のところで再開 → 止め直し = 画面の再開は断る
+    S.resume(db, { by: 'other', note: '別の画面で再開', now: clock });
+    S.halt(db, { by: 'other', reason: '別の障害で止め直し', now: clock });
+    await page.fill('#resume-note', '古い画面から再開');
+    await page.click('#btn-resume');
+    await waitMsg('msg-halt', /読み直/);
+    assert.equal(S.getStatus(db).halted, true);
+    // GAS の CSV (移行の段階) = 同じバイト列
+    S.setSetting(db, { key: 'cutover_phase', value: 'transition', by: 'x', now: clock });
+    await page.reload();
+    await page.waitForFunction(() => !document.getElementById('row-gas').classList.contains('hidden'));
+    const gas = csvOf(['A-1', 'C-3']);
+    await page.selectOption('#st-account', 'nakahara');
+    await page.check('input[name=st-src][value=gas]');
+    await page.setInputFiles('#st-gas-file', { name: 'logizard_shohinmaster_upload.csv', mimeType: 'text/csv', buffer: gas });
+    await page.fill('#st-gas-date', '2030-01-16');
+    await page.click('#btn-start');
+    await waitMsg('msg-manual', /始めた/);
+    const g = db.prepare("SELECT session_id, source_kind FROM manual_sessions WHERE status = 'open'").get();
+    assert.equal(g.source_kind, 'gas_upload');
+    assert.ok(S.manualSessionCsv(db, { sessionId: g.session_id }).csv.equals(gas), 'GAS の CSV は同じバイト列');
+    await ctx.close();
+  } finally {
+    await browser.close();
+    await new Promise((r) => srv.close(r));
+  }
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

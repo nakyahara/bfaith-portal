@@ -141,6 +141,7 @@ export function openImportStateDb(file = path.join(process.env.DATA_DIR || path.
   const st = cols('import_state');
   if (!st.has('state_event_id')) db.exec('ALTER TABLE import_state ADD COLUMN state_event_id INTEGER');
   if (!st.has('notified_for')) db.exec('ALTER TABLE import_state ADD COLUMN notified_for INTEGER');
+  if (!st.has('halted_event_id')) db.exec('ALTER TABLE import_state ADD COLUMN halted_event_id INTEGER');   // 止めの番号 (画面が見ていた止めと今の止めを照らす。Codex #1542 R1 High)
   const ir = cols('import_runs');
   for (const c of ['mode', 'target_as_of', 'source_run_id']) if (!ir.has(c)) db.exec(`ALTER TABLE import_runs ADD COLUMN ${c} TEXT`);
   // ③c-1b-3b 契約 (v4 + 設計 R1): 手の取込・再適用待ちの義務・毎晩の成果物・毎晩の取込の義務の区切り・知らせの outbox・設定 (前からある DB にも足す・何度開いても同じ)
@@ -314,6 +315,7 @@ export function getStatus(db, { now = Date.now(), events = 20, reveal = false } 
   if (!r) return { initialized: false, events: ev };
   return {
     initialized: true, init_id: r.init_id, state: r.state, halted: !!r.halted, halted_reason: r.halted_reason, halted_by: r.halted_by, halted_at: r.halted_at,
+    halt_revision: r.halted ? (r.halted_event_id ?? null) : null,
     run: r.run_id ? { run_id: r.run_id, by: r.run_by, detail: r.run_detail ? JSON.parse(r.run_detail) : null } : null,
     lock: lockActive(r, now) ? { holder: r.lock_holder, purpose: r.lock_purpose, run_id: r.lock_run_id, expires_at: r.lock_expires_at } : null,
     lock_expired: !!(r.lock_token && !lockActive(r, now)),
@@ -368,6 +370,7 @@ export function recover(db, { by, note, now = Date.now() }) {
     }
     // 状態を作り直した (ポータル側の消失) ときだけ状態の出来事 (手元の印の消失 = 状態はそのまま・知らせ済みも変えない)
     const eventId = (r ? event : stateEvent)(db, now, 'recover', null, by, { init_id: initId, prev_init_id: r ? r.init_id : null, note });
+    if (!r) update(db, now, { halted_event_id: eventId });
     // ポータルの状態を作り直した = 自動を止めた = halt と同じ知らせを同じ取引で積む (K3-4。Codex #1537 R2 Medium)
     if (!r) outboxPut(db, now, 'halt', `halt:${eventId}`, `⏸ ロジザードの取込の状態をポータルで作り直した (${by}) = 自動の取込は止めた状態: ${String(note).slice(0, 300)}
 ロジザードの履歴を確かめてから resume`);
@@ -536,25 +539,35 @@ export function halt(db, { by, reason, now = Date.now() }) {
     mustRow(db);
     update(db, now, { halted: 1, halted_reason: String(reason).slice(0, 300), halted_by: by, halted_at: now });
     const eventId = event(db, now, 'halt', null, by, { reason });
+    update(db, now, { halted_event_id: eventId });   // 止めの番号 = この止め (止め直すたびに変わる)
     // どこから止めても同じ取引で知らせを積む (送るのは定時の入口と画面。K3-4)
     const outboxId = outboxPut(db, now, 'halt', `halt:${eventId}`, `⏸ ロジザードの毎日の商品マスタの自動の取込を止めた (${by}): ${String(reason).slice(0, 300)}\n戻し方 = 画面の「手の取込」・再開 = 未解決の取込と開いた手の取込が無いときに resume\n画面 ▶ ${ADMIN_PAGE_URL}`);
-    return { halted: true, outbox_id: outboxId };
+    return { halted: true, outbox_id: outboxId, halt_revision: eventId };
   })();
 }
 
 /** 自動の取込を再開する = 未解決の取込が無い (state が idle / verified)・鍵が空いている ときだけ (H6) */
-export function resume(db, { by, note, now = Date.now() }) {
+/** 画面が見ていた止めの番号 (渡されたときだけ) と今の止めを照らす (違う = 止めた後に状態が変わった = 画面を読み直す。Codex #1542 R1 High) */
+function checkHaltRevision(r, expected) {
+  if (expected === undefined) return;
+  if (!(expected === null || Number.isSafeInteger(expected))) fail('bad_request', 'expected_halt_revision は番号', 400);
+  if ((r.halted_event_id ?? null) !== expected) fail('stale', '画面を開いた後に止め直された・再開された = 画面を読み直して今の止めの理由を見てから');
+}
+
+export function resume(db, { by, note, expectedHaltRevision = undefined, now = Date.now() }) {
   checkBy(by);
   checkNote(note);
   return db.transaction(() => {
     const r = mustRow(db);
+    if (!r.halted) fail('not_halted', '止めてない (もう再開してある)');
+    checkHaltRevision(r, expectedHaltRevision);
     if (UNRESOLVED.has(r.state)) fail('state', `未解決の取込がある (${r.state}・${r.run_id})。先に resolve`);
     if (lockActive(r, now)) fail('busy', '鍵をほかが持っている');
     const open = openSessionOf(db);
     if (open) fail('manual_open', `手の取込 ${open.session_id} が開いている (終えるか取り消してから)`);
     const review = unackedReviewOf(db);
     if (review) fail('needs_review', `手の取込 ${review.session_id} が確認待ち (needs_review)。ロジザードの履歴を見て確認 (ack) してから`);
-    update(db, now, { halted: 0, halted_reason: null, halted_by: null, halted_at: null });
+    update(db, now, { halted: 0, halted_reason: null, halted_by: null, halted_at: null, halted_event_id: null });
     event(db, now, 'resume', null, by, { note });
     return { halted: false };
   })();
@@ -629,7 +642,7 @@ export function putArtifact(db, { sourceRunId, targetAsOf, verdict, csvBuf, sha2
 
 /** 成果物の識別 (中身は返さない) */
 export function listArtifacts(db, { limit = 14 } = {}) {
-  return db.prepare('SELECT source_run_id, target_as_of, verdict, csv_sha256, rows, received_at, received_by FROM daily_artifacts ORDER BY received_at DESC LIMIT ?').all(Math.max(1, Math.min(60, Number(limit) || 14)));
+  return db.prepare('SELECT source_run_id, target_as_of, verdict, csv_sha256, rows, received_at, received_by FROM daily_artifacts ORDER BY target_as_of DESC, received_at DESC LIMIT ?').all(Math.max(1, Math.min(60, Number(limit) || 14)));
 }
 export function getArtifact(db, { sourceRunId }) {
   return db.prepare('SELECT source_run_id, target_as_of, verdict, csv_sha256, rows, received_at, received_by FROM daily_artifacts WHERE source_run_id = ?').get(String(sourceRunId ?? '')) || null;
@@ -666,12 +679,13 @@ export function setSetting(db, { key, value, by, now = Date.now() }) {
  * source = { kind: 'cdb_artifact', sourceRunId } (判定 pass の成果物) | { kind: 'gas_upload', csvBuf, targetAsOf } (cutover_phase = transition の間だけ・対象の日は今日か昨日 (JST))。
  * CSV の中身・識別・使うロジザードのアカウント (lz_accounts から) を固定して持ち、全部の商品の再適用待ちの義務を同じ取引で足す。
  */
-export function openManualSession(db, { by, lzAccount, source, now = Date.now() }) {
+export function openManualSession(db, { by, lzAccount, source, expectedHaltRevision = undefined, now = Date.now() }) {
   needV4(); checkBy(by);
   if (!source || typeof source !== 'object') fail('bad_request', 'source が要る', 400);
   return db.transaction(() => {
     const r = mustRow(db);
     if (!r.halted) fail('not_halted', '手の取込は、自動の取込を止めてから (halt)');
+    checkHaltRevision(r, expectedHaltRevision);
     if (!['idle', 'verified'].includes(r.state)) fail('state', `始められない状態: ${r.state} (${r.run_id || ''})。先に resolve`);
     if (lockActive(r, now)) fail('busy', '鍵をほかが持っている');
     const open = openSessionOf(db);
@@ -706,8 +720,10 @@ export function openManualSession(db, { by, lzAccount, source, now = Date.now() 
 
 /** 手の取込の CSV (人がダウンロードしてロジザードに置くのはこれだけ) */
 export function manualSessionCsv(db, { sessionId }) {
-  const x = db.prepare('SELECT download_name, csv, csv_sha256 FROM manual_sessions WHERE session_id = ?').get(String(sessionId ?? ''));
+  const x = db.prepare('SELECT status, download_name, csv, csv_sha256 FROM manual_sessions WHERE session_id = ?').get(String(sessionId ?? ''));
   if (!x) fail('not_found', 'その手の取込は無い', 404);
+  // 開いている手の取込だけ (閉じた後に古い画面から取ってロジザードに置く = 記録の外の取込。Codex #1542 R1 Medium)
+  if (x.status !== 'open') fail('not_open', 'この手の取込はもう閉じている (画面を読み直す)');
   return { download_name: x.download_name, csv: Buffer.from(x.csv), csv_sha256: x.csv_sha256 };
 }
 export function getManualSession(db, { sessionId }) {
