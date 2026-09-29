@@ -58,8 +58,9 @@ server.js の `JOBS_MONITOR_ENABLED` の中で、**どの body parser よりも�
 - `GET /pending[?after&limit&product]` = 待ちの義務 (番号の後から・商品で探す = 何件あっても全部に届く)。
 - `POST /halt`・`/resume`・`/resolve`・`/mark-unknown`・`/manual/open` (毎晩の成果物)・`/manual/open-gas?lz_account&target_as_of` (本文 = GAS の CSV のバイト列)・`GET /manual/:id/csv` (attachment・no-store・nosniff)・`/manual/:id/complete`・`/cancel`・`/ack`・`/waive`・`/settings`。
 - 止める・終える (needs_review) の後は、**今回積んだ知らせを真っ先に**すぐ送る (前の知らせが溜まっていても・要対応スペース `GCHAT_WEBHOOK_JOBS`。応答の `notified` = 今回の知らせを送れたか。送れない = outbox に残る = 定時の入口が送り直す)。
-- **画面 (③c-1b-3b-4b)** = `https://bfaith-portal.onrender.com/apps/logizard-import-state/admin` (管理者だけ = 門は `admin-router.js` の `adminPageGate` (ログインなし = /login へ・管理者でない = 403)・`views/admin.ejs`)。始める入力 (アカウント・成果物・GAS のファイル・対象の日) は空から・1 分ごとの読み直しでは選んだものを保つ・手の取込が閉じる / 変わるたびに空へ。ダッシュボードのカードは作らない = GChat の知らせ (止めた・要確認・再適用待ち) に画面の場所を書く。
+- **画面 (③c-1b-3b-4b)** = `https://bfaith-portal.onrender.com/apps/logizard-import-state/admin` (管理者だけ = 門は `admin-router.js` の `adminPageGate` (ログインなし = /login へ・管理者でない = 403)・`views/admin.ejs`)。始める入力 (アカウント・出どころ・成果物・GAS のファイル・対象の日) は空から・1 分ごとの読み直しでは選んだものを保つ・手の取込が始まる / 閉じる (別の画面で、も) たびに空へ・**止めの番号が変わった (ほかで止め直された・再開された) = 再開のメモと始める入力を消して知らせる** (新しい止めを黙って引き継がない)。
   値は全部 textContent で出す (結果の文・メモ・商品 ID・アカウントは信用しない値)。画面の中に手順 (📖 はじめに読む) がある。
+- **マージ・配る順番 (止めの番号の必須化)**: Render (自動) と両 PC の CLI を一緒に。マージ → miniPC の pull + `deploy.mjs --pc minipc --apply/--check` → この PC の master で `deploy.mjs --pc streamdeck --apply/--check`。配り終えるまでの古い CLI の `resume` は 400 で断られる (取り違えは起きない・配った後にやり直す)。ダッシュボードのカードは作らない = GChat の知らせ (止めた・要確認・再適用待ち) に画面の場所を書く。
 
 ## 手順書 (手の取込・どの端末でも)
 画面の「📖 手順」と同じ。

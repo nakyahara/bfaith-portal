@@ -104,7 +104,7 @@
           <label>ロジザードのアカウント <select id="st-account"></select></label>
         </div>
         <div class="row">
-          <label><input type="radio" name="st-src" value="artifact" checked> 毎晩の成果物</label>
+          <label><input type="radio" name="st-src" value="artifact"> 毎晩の成果物</label>
           <select id="st-artifact"></select>
         </div>
         <div class="row hidden" id="row-gas">
@@ -192,12 +192,14 @@
     const kv = (node, pairs) => { clear(node); for (const [k, v] of pairs) { const d = el('div'); d.appendChild(el('b', k)); d.appendChild(document.createTextNode(' ' + (v == null || v === '' ? '-' : String(v)))); node.appendChild(d); } };
     const fillSelect = (sel, items, current) => { clear(sel); for (const [value, label] of items) { const o = el('option', label); o.value = value; if (value === current) o.selected = true; sel.appendChild(o); } };
     let S = null, pendingAfter = 0, pendingNext = null, pendingProduct = null, shownSession = null;
+    // 画面が見ている止めの番号と手の取込の世代 (最近の手の取込も含む)。変わった = 入力を消す (新しい止め・別の画面の手の取込を黙って引き継がない。Codex #1542 R3)
+    let shownHaltRev, shownGen;
     const resetManualInputs = () => { for (const id of ['cp-result', 'cp-file', 'cp-at', 'cp-note', 'cancel-note', 'ack-note']) $(id).value = ''; };
     // 始める入力 (アカウント・成果物・出どころ・GAS のファイル・対象の日) は手の取込が変わる・閉じるたびに空へ (毎回自分で選ぶ。Codex #1542 R2 Medium)
     const resetStartInputs = () => {
       for (const id of ['st-account', 'st-artifact', 'st-gas-date']) $(id).value = '';
       $('st-gas-file').value = '';
-      document.querySelector('input[name=st-src][value=artifact]').checked = true;
+      for (const x of document.querySelectorAll('input[name=st-src]')) x.checked = false;   // 出どころも空へ (Codex #1542 R3 Low)
     };
 
     async function load() {
@@ -207,6 +209,17 @@
       const st = S.status;
       if (!st.initialized) { $('summary').textContent = 'ポータルの取込の状態がまだ初期化されていない'; return; }
       const m = S.manual_sessions || {};
+      const hr = st.halt_revision ?? null;
+      // 手の取込の世代 = 最近の手の取込 (閉じたものも) の番号と状態。別の画面で始めて閉じた (開いているものは前後とも無い) も分かる
+      const gen = (m.recent || []).map((x) => x.session_id + ':' + x.status + ':' + (x.ack_at || '')).sort().join('|');
+      if (shownHaltRev !== undefined && hr !== shownHaltRev) {
+        // 止め直された・再開された = 再開のメモと始める入力は消す = 今の理由を見てから入れ直す (この画面で止めた・再開した = 後で「止めた / 再開した」に書き換わる)
+        $('resume-note').value = '';
+        resetStartInputs();
+        say('msg-halt', '止めの理由が変わった (ほかで止め直された・再開された)。今の理由を見てから入れ直す');
+      }
+      if (shownGen !== undefined && gen !== shownGen) resetStartInputs();   // 手の取込が始まった・閉じた (別の画面で始めて閉じた、も) = 始める入力を空へ
+      shownHaltRev = hr; shownGen = gen;
       kv($('summary'), [
         ['取込の状態', st.state + (st.run ? ' (' + st.run.run_id + ')' : '')],
         ['自動', st.halted ? '⏸ 止めてある: ' + (st.halted_reason || '') + ' (' + (st.halted_by || '') + '・' + jst(st.halted_at) + ')' : '▶ 動く'],
@@ -290,7 +303,7 @@
 
     const act = (btn, msgId, fn) => $(btn).addEventListener('click', async () => {
       $(btn).disabled = true;
-      try { const r = await fn(); say(msgId, r || '済み', true); await load(); } catch (e) { say(msgId, e.message); } finally { $(btn).disabled = false; }
+      try { const r = await fn(); await load(); say(msgId, r || '済み', true); } catch (e) { say(msgId, e.message); } finally { $(btn).disabled = false; }
     });
     act('btn-halt', 'msg-halt', async () => { const r = await call('/halt', { method: 'POST', body: { reason: $('halt-reason').value } }); return '止めた' + (r.notified ? ' (GChat に知らせた)' : ' (知らせは後で送り直す)'); });
     // 画面が見ていた止めの番号を送る (ほかの人が止め直した・再開した = 409 = 読み直す。Codex #1542 R1 High)
@@ -299,7 +312,9 @@
     act('btn-start', 'msg-manual', async () => {
       const account = $('st-account').value;
       if (!account) throw new Error('自分のロジザードのアカウントを選ぶ');
-      const src = document.querySelector('input[name=st-src]:checked').value;
+      const srcEl = document.querySelector('input[name=st-src]:checked');
+      if (!srcEl) throw new Error('CSV の出どころ (毎晩の成果物 / GAS の CSV) を選ぶ');
+      const src = srcEl.value;
       if (src === 'gas') {
         const f = $('st-gas-file').files[0];
         if (!f) throw new Error('GAS の CSV を選ぶ');

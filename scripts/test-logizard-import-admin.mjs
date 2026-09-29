@@ -379,11 +379,17 @@ await ta('[11] 画面を本物のブラウザで動かす (Codex #1542 R1 Medium
     await waitMsg('msg-halt', /止めた/);
     await page.waitForFunction(() => /止めてある/.test(document.getElementById('summary').textContent));
     assert.equal(S.getStatus(db).halted, true);
+    assert.ok(!(await page.textContent('#msg-halt')).includes('理由が変わった'), '自分で止めた = 知らせない');
     assert.ok((await page.textContent('#summary')).includes(EVIL), '理由は文字のまま出る');
     assert.deepEqual(await page.evaluate(() => [window.__xss, document.querySelectorAll('img').length]), [undefined, 0]);
     // 始める (連打しても 1 つ)
+    assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('input[name=st-src]')].map((x) => x.checked)), [false, false], '出どころも空から (Codex #1542 R3 Low)');
     await page.selectOption('#st-account', 'nakahara');
     await page.selectOption('#st-artifact', 'lzd_20300115_a');
+    await page.click('#btn-start');
+    await waitMsg('msg-manual', /出どころ/);
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM manual_sessions').get().n, 0, '出どころを選ばない = 始めない');
+    await page.check('input[name=st-src][value=artifact]');
     await page.dblclick('#btn-start');
     await waitMsg('msg-manual', /始めた/);
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM manual_sessions').get().n, 1);
@@ -403,15 +409,29 @@ await ta('[11] 画面を本物のブラウザで動かす (Codex #1542 R1 Medium
     const done = S.getManualSession(db, { sessionId: m.session_id });
     // 閉じた = 始める入力は空へ (毎回自分で選ぶ)
     await page.waitForFunction(() => !document.getElementById('manual-start').classList.contains('hidden'));
-    assert.deepEqual(await page.evaluate(() => [document.getElementById('st-account').value, document.getElementById('st-artifact').value]), ['', '']);
-    // 読み直し (1 分ごとの読み直しと同じ) でも選んだものを保つ
-    await page.selectOption('#st-account', 'staff1');   // 先頭でないアカウント (読み直しで先頭に戻したら分かる)
-    await page.selectOption('#st-artifact', 'lzd_20300115_a');
-    const before = await page.textContent('#summary');
-    await page.evaluate(() => { document.getElementById('summary').textContent = '読み直し中'; document.dispatchEvent(new Event('lz-reload')); });
-    await page.waitForFunction(() => /取込の状態/.test(document.getElementById('summary').textContent));
-    assert.deepEqual(await page.evaluate(() => [document.getElementById('st-account').value, document.getElementById('st-artifact').value]), ['staff1', 'lzd_20300115_a']);
-    void before;
+    const startInputs = () => page.evaluate(() => [document.getElementById('st-account').value, document.getElementById('st-artifact').value, ...[...document.querySelectorAll('input[name=st-src]')].map((x) => x.checked)]);
+    assert.deepEqual(await startInputs(), ['', '', false, false]);
+    const reload = async () => {   // 1 分ごとの読み直しと同じ
+      await page.evaluate(() => { document.getElementById('summary').textContent = '読み直し中'; document.dispatchEvent(new Event('lz-reload')); });
+      await page.waitForFunction(() => /取込の状態/.test(document.getElementById('summary').textContent));
+    };
+    const fillStart = async () => {
+      await page.selectOption('#st-account', 'staff1');   // 先頭でないアカウント (読み直しで先頭に戻したら分かる)
+      await page.check('input[name=st-src][value=artifact]');
+      await page.selectOption('#st-artifact', 'lzd_20300115_a');
+    };
+    // 読み直し (止めの番号・手の取込は変わらない) = 選んだもの・再開のメモを保つ
+    await fillStart();
+    await page.fill('#resume-note', '書きかけのメモ');
+    await reload();
+    assert.deepEqual(await startInputs(), ['staff1', 'lzd_20300115_a', true, false]);
+    assert.equal(await page.inputValue('#resume-note'), '書きかけのメモ');
+    // 別の画面で手の取込を始めて閉じた (読み直しの前後とも開いているものは無い) = 始める入力は空へ (Codex #1542 R3 Medium)
+    const other = S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: 'other', lzAccount: 'staff1', source: { kind: 'cdb_artifact', sourceRunId: 'lzd_20300115_a' }, now: clock });
+    S.cancelManualSession(db, { sessionId: other.session_id, note: '別の画面で取り消した', by: 'other', now: clock });
+    await reload();
+    assert.deepEqual(await startInputs(), ['', '', false, false], '別の画面の手の取込の後 = 空へ');
+    assert.equal(await page.inputValue('#resume-note'), '書きかけのメモ', '止めの番号は同じ = 再開のメモは保つ');
     assert.deepEqual([done.status, done.close_detail.history.at], ['completed_ok', Date.parse('2030-01-16T12:03:00+09:00')]);
     assert.deepEqual(await page.evaluate(() => [window.__xss, document.querySelectorAll('img').length]), [undefined, 0]);
     // 古い画面: 別のところで再開 → 止め直し = 画面の再開は断る
@@ -421,10 +441,20 @@ await ta('[11] 画面を本物のブラウザで動かす (Codex #1542 R1 Medium
     await page.click('#btn-resume');
     await waitMsg('msg-halt', /読み直/);
     assert.equal(S.getStatus(db).halted, true);
+    // 読み直しで止めの番号が変わった = 再開のメモと始める入力を消して知らせる (新しい止めを黙って引き継がない。Codex #1542 R3 High)
+    await fillStart();
+    await reload();
+    await waitMsg('msg-halt', /理由が変わった/);
+    assert.equal(await page.inputValue('#resume-note'), '', '再開のメモは消す');
+    assert.deepEqual(await startInputs(), ['', '', false, false], '始める入力も消す');
+    await page.click('#btn-resume');
+    await waitMsg('msg-halt', /note|4〜/);
+    assert.equal(S.getStatus(db).halted, true, 'メモが空 = 再開しない');
     // GAS の CSV (移行の段階) = 同じバイト列
     S.setSetting(db, { key: 'cutover_phase', value: 'transition', by: 'x', now: clock });
     await page.reload();
     await page.waitForFunction(() => !document.getElementById('row-gas').classList.contains('hidden'));
+    assert.deepEqual(await startInputs(), ['', '', false, false], '止めてある画面を開き直した = 始める入力は空から (出どころも)');
     const gas = csvOf(['A-1', 'C-3']);
     await page.selectOption('#st-account', 'nakahara');
     await page.check('input[name=st-src][value=gas]');
