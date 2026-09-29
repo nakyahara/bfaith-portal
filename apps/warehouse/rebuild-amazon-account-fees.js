@@ -18,6 +18,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
+import { FEE_TYPE_RULES, NOT_ACCOUNT_FEE, CONFIRMED_NAMES } from './amazon-account-fee-rules.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -28,9 +29,11 @@ if (!DATA_DIR) { console.error('FATAL: DATA_DIR is required'); process.exit(2); 
 const dbPath = path.join(DATA_DIR, 'warehouse.db');
 if (!fs.existsSync(dbPath)) { console.error(`FATAL: warehouse.db not found at ${dbPath}`); process.exit(2); }
 
-// JST 今日から monthsBack ヶ月前の月初
+// JST 今日から monthsBack ヶ月前の月初。--from-month YYYY-MM があればその月から (daily-sync が月の手数料のやり残しまでさかのぼるとき・2026-09-29 F2b-2)
+const fromMonthArg = getArg('--from-month');
+if (fromMonthArg != null && !/^\d{4}-(0[1-9]|1[0-2])$/.test(fromMonthArg)) { console.error(`FATAL: --from-month は YYYY-MM: ${fromMonthArg}`); process.exit(2); }
 const nowJst = new Date(Date.now() + 9 * 3600 * 1000);
-const fromMonth = new Date(Date.UTC(nowJst.getUTCFullYear(), nowJst.getUTCMonth() - (monthsBack - 1), 1));
+const fromMonth = fromMonthArg ? new Date(`${fromMonthArg}-01T00:00:00Z`) : new Date(Date.UTC(nowJst.getUTCFullYear(), nowJst.getUTCMonth() - (monthsBack - 1), 1));
 const fromDate = fromMonth.toISOString().slice(0, 10);
 
 const db = new Database(dbPath);
@@ -54,36 +57,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS f_amazon_account_fees_monthly_v1 (
   PRIMARY KEY (month_start_jst, fee_type)
 )`);
 
-// transaction_type → fee_type mapping (2026-07-06 実データの distinct から作成)
-// 🚨 2026-09-28: Amazon が決済の取引の名前を変えていた (7 月から保管料・長期保管料、6 月から返送料) のに古い名前しか拾わず、
-//   7〜9 月の保管料 (月 30〜66 万円)・長期保管料 (月 約 10 万円)・返送料が 0 = アカウント全体の利益が月 40〜80 万円多く出ていた。
-//   新しい名前を足した + 分けられない SKU なしの取引が出たら最後の行を ⚠️ にする (daily-sync で「全部 OK」に数えない = 次に名前が変わったら気づく)
-const FEE_TYPE_RULES = [
-  // [fee_type, 完全一致の名前, 前方一致の名前]
-  ['storage', ['Storage Fee', 'Storage Fee - Correction', 'Storage Fee - Reversal'], ['FBA Inventory Storage Fee']],   // 2026-07〜 FBA Inventory Storage Fee
-  ['long_term_storage', ['StorageRenewalBilling'], ['FBA Long Term Storage Fee']],                                        // 2026-07〜 FBA Long Term Storage Fee
-  ['removal', ['RemovalComplete'], ['FBA Removal Order']],                                                                // 2026-06〜 FBA Removal Order: Return Fee
-  ['inbound_defect', [], ['Inbound Defect Fee']],
-  ['low_inventory', [], []],   // '%LowInventory%' / '%Low-Inventory%' (下の LIKE)
-  ['subscription', ['Subscription Fee'], []],
-  // 🆕 2026-09-28: Easy Ship の配送料 (注文ごと・SKU なし)。今までどこにも入れておらず、Amazon 分析の確定利益が月 130〜230 万円多く出ていた
-  //   (カスタム経費も 0 件・管理会計は代表指示 2026-09-01 で「Easy Ship運賃」として数えている)。金額は Amazon の符号・税込のまま (保管料と同じ)。
-  //   金額の列は月で違う (古い月 = other-amount / 新しい月 = item-related-fee-amount) → 両方を足す
-  ['easy_ship', ['Amazon Easy Ship Charges'], []],
-  // 🆕 2026-09-29: 手数料の調整・払いすぎた手数料の返還 (Amazon からの戻り = 正。中原さん「3」)。今まで NOT_ACCOUNT_FEE でどこにも入れていなかった
-  //   (SKU のある行は日次の財務の reversal_reimbursement に入る = ここは SKU なしの行だけ = 二重にならない)。月の最終利益では ÷1.1 (ほかの手数料と同じ)
-  ['other_account_fee', ['Fee Adjustment', 'Overpaid Fees Adjustment'], []],
-];
-// アカウント単位の手数料に入れない SKU なしの取引 (今までも入れていない。これ以外の SKU なしの取引が出たら ⚠️)
-//   預かり金の出し入れ (Current / Previous Reserve = 相殺) / 調整 (Goodwill・Retrocharge・ServiceFee・BuyerRecharge)
-//   (Easy Ship の料金は 2026-09-28 から easy_ship・手数料の調整 (Fee Adjustment / Overpaid) は 2026-09-29 から other_account_fee として入れる)
-const NOT_ACCOUNT_FEE = ['Current Reserve Amount', 'Previous Reserve Amount Balance', 'Goodwill Concession',
-  'Order_Retrocharge', 'Refund_Retrocharge', 'ServiceFee', 'BuyerRecharge'];
-// 確かめた名前 (本番の決済に出た名前・2026-09-28)。前方一致で拾ったがここに無い名前 = 金額は入れた上で ⚠️ (人が確かめてここに足す。Codex #1515 R1)
-//   Inbound Defect Fee… / LowInventory は最初 (2026-07-06) から名前の揺れを前提にした型 = 型ごと確かめ済み
-const CONFIRMED_NAMES = ['Storage Fee', 'Storage Fee - Correction', 'Storage Fee - Reversal', 'FBA Inventory Storage Fee',
-  'StorageRenewalBilling', 'FBA Long Term Storage Fee', 'RemovalComplete', 'FBA Removal Order: Return Fee', 'Subscription Fee', 'Amazon Easy Ship Charges',
-  'Fee Adjustment', 'Overpaid Fees Adjustment'];
+// 手数料の分け方 (FEE_TYPE_RULES / NOT_ACCOUNT_FEE / CONFIRMED_NAMES) は amazon-account-fee-rules.js (1 か所。Company DB へ財務を送る送り手も同じものを使う。2026-09-29 F2b-2)
 const q = (x) => `'${String(x).replace(/'/g, "''")}'`;
 const likePrefix = (p) => `transaction_type LIKE ${q(String(p).replace(/[\\%_]/g, (c) => '\\' + c) + '%')} ESCAPE '\\'`;   // % と _ はその文字として
 const matchSql = (exact, prefix) => [

@@ -21,6 +21,12 @@ import Database from 'better-sqlite3';
 
 export const FINANCE_DIRTY_DAYS = 35;
 export const PENDING_FILE = 'amazon-finance-pending.json';
+// 月の手数料 (f_amazon_account_fees_monthly_v1) のやり残し (2026-09-29 F2b-2)。Company DB との突き合わせで月の手数料に差が出た月を登録し、
+//   daily-sync の手数料の build / sync がふだんの 14 か月に加えてその月までさかのぼって作り直す (14 か月より古い月の訂正も直る)。
+//   build と sync の両方が通った後にだけ消す (日次の財務のやり残しと同じ読み書き = 下の関数に file を渡す)
+export const ACCOUNT_FEES_PENDING_FILE = 'amazon-account-fees-pending.json';
+export const ACCOUNT_FEES_BASE_MONTHS = 14;
+export const ACCOUNT_FEES_MAX_MONTHS = 60;   // rebuild-amazon-account-fees.js / sync-amazon-account-fees.js の --months の上限
 
 // 入った時刻の索引 (db.js の idx_settle_lines_ingested) で引く。指定しないと SQLite が月と SKU の索引を丸ごと読む (本番 97 秒)。
 // 索引が無ければ例外 → planFinanceMonths は 当月 + 前月 に戻る (止めない・warn)
@@ -61,12 +67,13 @@ export function pickFinanceMonths(dataDir, opts) {
   }
 }
 
-const CORRUPT_RE = /^amazon-finance-pending\.corrupt-.+\.json$/;
-/** やり残し (③)。ファイルが無ければ空・壊れていれば空 + 理由。corruptFiles = 前に読めずに名前を変えて残したファイル */
-export function readPendingMonths(dataDir) {
-  const f = path.join(dataDir, PENDING_FILE);
+const stemOf = (file) => file.replace(/\.json$/, '');
+const isCorruptOf = (file, name) => name.startsWith(`${stemOf(file)}.corrupt-`) && name.endsWith('.json');
+/** やり残し (③)。ファイルが無ければ空・壊れていれば空 + 理由。corruptFiles = 前に読めずに名前を変えて残したファイル。file = 月の手数料なら ACCOUNT_FEES_PENDING_FILE */
+export function readPendingMonths(dataDir, { file = PENDING_FILE } = {}) {
+  const f = path.join(dataDir, file);
   let corruptFiles = [];
-  try { corruptFiles = fs.readdirSync(dataDir).filter((x) => CORRUPT_RE.test(x)).sort(); } catch { corruptFiles = []; }
+  try { corruptFiles = fs.readdirSync(dataDir).filter((x) => isCorruptOf(file, x)).sort(); } catch { corruptFiles = []; }
   if (!fs.existsSync(f)) return { months: [], error: null, corruptFiles };
   try {
     const j = JSON.parse(fs.readFileSync(f, 'utf8'));
@@ -102,15 +109,45 @@ export function planFinanceMonths(dataDir, { currentMonth, now = new Date(), day
 /** 回の終わりに書くやり残し = 今回失敗した月 ∪ (今のファイルにあって今回作り直していない月)。
  *  attempted = 今回作り直した月 (成功した月はここで消える)。朝にだけ読めなかったファイルの月も、作り直していないので残る (Codex #1514 R3)。
  *  今のファイルが読めなければ、上書きせずに corrupt-<日時>.json に名前を変えて残す (中の月を消さない)。書けなければ例外 */
-export function writePendingMonths(dataDir, failedMonths, { attempted = [], now = new Date() } = {}) {
-  const f = path.join(dataDir, PENDING_FILE);
+export function writePendingMonths(dataDir, failedMonths, { attempted = [], now = new Date(), file = PENDING_FILE } = {}) {
+  const f = path.join(dataDir, file);
   let carry = [];
   if (fs.existsSync(f)) {
-    const cur = readPendingMonths(dataDir);
-    if (cur.error) fs.renameSync(f, path.join(dataDir, `amazon-finance-pending.corrupt-${now.toISOString().replace(/[:.]/g, '-')}.json`));
+    const cur = readPendingMonths(dataDir, { file });
+    if (cur.error) fs.renameSync(f, path.join(dataDir, `${stemOf(file)}.corrupt-${now.toISOString().replace(/[:.]/g, '-')}.json`));
     else carry = cur.months.filter((m) => !attempted.includes(m));
   }
   const months = [...new Set([...failedMonths, ...carry])].filter(isYm).sort();
   fs.writeFileSync(f, JSON.stringify({ months, updated_at: now.toISOString() }, null, 1));
   return months;
+}
+
+/** やり残しに月を足す (今のファイルの月は残す)。Company DB との突き合わせで差が出た月 (F2b-2)。file = 日次の財務 PENDING_FILE / 月の手数料 ACCOUNT_FEES_PENDING_FILE */
+export function addPendingMonths(dataDir, months, { now = new Date(), file = PENDING_FILE } = {}) {
+  return writePendingMonths(dataDir, months, { attempted: [], now, file });
+}
+
+/** 月の手数料の build / sync の --months (当月から数えた月数)。ふだん 14・手数料のやり残しがあれば一番古い月まで (上限 60)。
+ *  戻り値 = { months, pending: [やり残しの月 (当月まで)], warn, notes }。やり残しのファイルが読めなければ 14 のまま warn */
+export function accountFeesMonthsBack(dataDir, { currentMonth }) {
+  if (!isYm(currentMonth)) throw new Error(`currentMonth は YYYY-MM: ${currentMonth}`);
+  const p = readPendingMonths(dataDir, { file: ACCOUNT_FEES_PENDING_FILE });
+  const notes = [];
+  let warn = false;
+  if (p.error) { warn = true; notes.push(`月の手数料の${p.error}`); }
+  if (p.corruptFiles.length) { warn = true; notes.push(`読めなかった月の手数料のやり残しのファイルが残っている (${p.corruptFiles.join(', ')}) = 中身を見て月を足すか消す`); }
+  const pending = p.months.filter((m) => m <= currentMonth).sort();
+  let months = ACCOUNT_FEES_BASE_MONTHS;
+  if (pending.length) {
+    const [y, mo] = pending[0].split('-').map(Number), [cy, cm] = currentMonth.split('-').map(Number);
+    const span = (cy - y) * 12 + (cm - mo) + 1;
+    if (span > ACCOUNT_FEES_MAX_MONTHS) { warn = true; notes.push(`月の手数料のやり残し ${pending[0]} は ${ACCOUNT_FEES_MAX_MONTHS} か月より古い = 作り直せない (人が見る)`); }
+    months = Math.min(Math.max(months, span), ACCOUNT_FEES_MAX_MONTHS);
+    notes.push(`月の手数料のやり残し: ${pending.join(', ')} (${months} か月さかのぼる)`);
+  }
+  // covered = 今回の build / sync の範囲に入るやり残し (両方が通ったらこれだけを消す。範囲の外 = 60 か月より古い月は残す)
+  const [cy, cm] = currentMonth.split('-').map(Number);
+  const fromD = new Date(Date.UTC(cy, cm - 1 - (months - 1), 1));
+  const fromMonth = `${fromD.getUTCFullYear()}-${String(fromD.getUTCMonth() + 1).padStart(2, '0')}`;
+  return { months, fromMonth, pending, covered: pending.filter((m) => m >= fromMonth), warn, notes };
 }

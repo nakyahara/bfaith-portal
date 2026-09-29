@@ -10,7 +10,9 @@ import { MALLS, SCOPE_RE, orderKey } from './orders.mjs';
 import { validateFinanceRows, orderFinanceChecksum, isPseudoOrderNo } from '../finance/order-finance-checksum.mjs';
 
 export const FINANCE_MALLS = MALLS.filter((m) => m !== 'other');   // 0043 の mall の CHECK
-export const FINANCE_ORDER_NO_RE = /^([0-9A-Za-z][0-9A-Za-z._:-]{0,60}|-:\d{4}-\d{2}-\d{2})$/;   // 本物の注文番号 / 疑似注文 '-:YYYY-MM-DD'
+// 本物の注文番号 / 疑似注文 '-:YYYY-MM-DD'。🚨 返送 (RemovalComplete / FBA Removal Order) の注文番号は + / を含む (例 '+3gubNop3S'・'a+aKPxfQ/X'。
+//   本番の決済に 26 注文・2026-09-29 に miniPC の 8 月の見積りで見つけた) → + / = も通す。先頭は '-' 以外 (疑似注文と重ならない)
+export const FINANCE_ORDER_NO_RE = /^([0-9A-Za-z+/=][0-9A-Za-z._:+/=-]{0,60}|-:\d{4}-\d{2}-\d{2})$/;
 
 /** body の形を確かめて正規化する (throw code=BAD_REQUEST → 400)。mall / scope は chunk の中で 1 つ */
 export function validateFinanceChunk(body) {
