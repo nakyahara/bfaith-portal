@@ -257,7 +257,8 @@ const financeMallScopeOf = (req) => {
   if (!FINANCE_MALLS.includes(mall) || !/^[0-9A-Za-z][0-9A-Za-z_-]{0,30}$/.test(scope)) return null;
   return { mall, scope };
 };
-const isRealDate = (s) => DATE_RE.test(s) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;   // 2026-02-30 は通さない (DB の 500 ではなく 400)
+// 2026-02-30 は通さない (DB の 500 ではなく 400)・2026-13-01 は Date が不正 = toISOString の例外の前に NaN で落とす (#1533 Codex R2)
+const isRealDate = (s) => { if (!DATE_RE.test(s)) return false; const ms = Date.parse(`${s}T00:00:00Z`); return !Number.isNaN(ms) && new Date(ms).toISOString().slice(0, 10) === s; };
 const financeRangeOf = (req, maxDays) => {
   const from = String(req.query.from || ''), to = String(req.query.to || '');
   if (!isRealDate(from) || !isRealDate(to) || from > to) return { error: 'from / to must be real dates (YYYY-MM-DD) and from <= to' };

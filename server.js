@@ -311,7 +311,7 @@ if (PERF_ON) {
 
 // Company DB の伝票 push (miniPC → Render) は x-sync-key の検査を**どの body parser よりも前**に置く (未認可の body を読まない。
 // app.use の prefix は routing と同じく大文字小文字を区別しない = 下の共通 parser の素通り判定と組で。Codex PR #1336 R1 #6)
-app.use(['/apps/company-db/sync/shipments', '/apps/company-db/sync/orders', '/apps/company-db/sync/stock-daily', '/apps/company-db/sync/ad-spend'], companyDbRequireSyncKey);
+app.use(['/apps/company-db/sync/shipments', '/apps/company-db/sync/orders', '/apps/company-db/sync/order-finance', '/apps/company-db/sync/stock-daily', '/apps/company-db/sync/ad-spend'], companyDbRequireSyncKey);   // order-finance = Amazon 財務 (0043・F2b-1。'/orders' の前方一致には入らない)
 // ロジザードの毎日の商品マスタの取込の状態 (マスタ正本切替 ③c-1b-1)。自動の ③ (miniPC) と手の ③ (Stream Deck の PC) が 1 つの状態と鍵を共用する。
 // Render だけ (miniPC に立てると状態が 2 つになる = jobs-monitor と同じ JOBS_MONITOR_ENABLED)。
 // **どの body parser (urlencoded・共通の JSON) よりも前に mount** = method・Content-Type によらず、Bearer LZ_LOCK_TOKEN の認証の前に本文を読まない (Codex #1513 R1 Medium)。
@@ -346,6 +346,8 @@ app.use((req, res, next) => {
     // /apps/company-db/sync/shipments (miniPC からの伝票 push) は x-sync-key の検査 (上の app.use、body parser より前) の後に router 側の 12MB parser が走る (mirror と同じ流儀)。
     // routing は大文字小文字を区別しないので、ここも小文字にそろえて比べる (Codex PR #1336 R1 #6)
     if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/shipments') || normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/orders')) return next();
+    // /apps/company-db/sync/order-finance (Amazon 財務の push。router 側の 12MB・圧縮なしの parser) も同じ (#1533 Codex R2)
+    if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/order-finance')) return next();
     // /apps/company-db/sync/stock-daily (在庫の日次。router 側の 4MB parser) も同じ: 共通の 10MB parser が先に読むと、後段の 4MB の上限が効かない (Codex #1383 R1 #2)
     if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/stock-daily')) return next();
     // /apps/company-db/sync/ad-spend (広告費の日次。router 側の 4MB parser) も同じ

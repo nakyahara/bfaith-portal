@@ -252,8 +252,17 @@ await t('受け口の道 (validateFinanceChunk → ingestOrderFinanceChunk) で�
     rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'H1', header: { transform_version: 't1', set_checksum: cs }, lines: rows }] };
   const r = await ingestOrderFinanceChunk(pgliteAdapter(pg), { ...validateFinanceChunk(body), host: 'test' });
   assert.equal(r.applied, 1, JSON.stringify(r));
+  const again = await ingestOrderFinanceChunk(pgliteAdapter(pg), { ...validateFinanceChunk(body), host: 'test' });   // 同じ chunk の再送 (#1533 Codex R2)
+  assert.ok(again.replay === true, JSON.stringify(again));
+  assert.equal(await num(`select count(*) as n from core.order_finance_daily where mall_order_no = 'H1'`), 1);
   assert.equal(Number((await one(`select sales_principal_jpy s from core.order_finance_daily where mall_order_no = 'H1'`)).s), 300);
   assert.equal((await one(`select currency from core.order_finance_daily where mall_order_no = 'H1'`)).currency, 'JPY');
+});
+await t('🚨 server.js は order-finance を 事前の鍵の検査 と 共通の 10MB parser の素通り の両方に入れている (router 側の 12MB・圧縮なしが効く。#1533 Codex R2)', async () => {
+  const fs = await import('node:fs'), path = await import('node:path'), { fileURLToPath } = await import('node:url');
+  const srv = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'server.js'), 'utf8');
+  assert.match(srv, /app\.use\(\[[^\]]*'\/apps\/company-db\/sync\/order-finance'[^\]]*\], companyDbRequireSyncKey\);/);
+  assert.match(srv, /normalizedPath\.toLowerCase\(\)\.startsWith\('\/apps\/company-db\/sync\/order-finance'\)\) return next\(\);/);
 });
 await t('足し算の途中で安全な整数を超えたら拒む (最後だけ範囲に戻っても)', async () => {
   assert.throws(() => validateFinanceRows('A1', [row('2026-09-01', 'a', { sales_principal_jpy: Number.MAX_SAFE_INTEGER, sales_shipping_jpy: 2, sales_giftwrap_jpy: -2 })]), /net is not a safe integer \(at sales_shipping_jpy\)/);
