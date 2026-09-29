@@ -94,13 +94,16 @@ line({ day: 8, o: 'O6', tx: 'Amazon Easy Ship Charges', fee: 20, feeType: 'Amazo
 line({ day: 9, o: 'O6', tx: 'Amazon Easy Ship Charges', fee: -10, feeType: 'Amazon Easy Ship Charges' });   // 別の日
 line({ day: 6, o: 'O7', sku: 'SKU-S', pt: 'Principal', pa: 800 });
 line({ day: 8, o: 'O7', tx: 'Amazon Easy Ship Charges', fee: -300, feeType: 'Amazon Easy Ship Charges' });
-line({ day: 8, o: 'O7', tx: 'Amazon Easy Ship Charges', fee: 300, feeType: 'Amazon Easy Ship Charges' });   // 打ち消し合う
+build();
+const s8before = fact('sku-s', 8);
+ok(s8before && s8before.e === 300, `(前) O7 の料金 300 だけ = 300 (${s8before && s8before.e})`);
+line({ day: 8, o: 'O7', tx: 'Amazon Easy Ship Charges', fee: 300, feeType: 'Amazon Easy Ship Charges' });   // あとから返金 = 打ち消し合う
 build();
 const pqr8 = ['sku-p', 'sku-q', 'sku-r'].map((s) => fact(s, 8)?.e), pqr9 = ['sku-p', 'sku-q', 'sku-r'].map((s) => fact(s, 9)?.e);
 ok(JSON.stringify(pqr8) === JSON.stringify([27, 27, 26]), `🚨 同じ注文 × 日の料金 100 と返金 20 = 正味 80 を 27 / 27 / 26 (行ごとだと 27 / 26 / 27 になる) (${pqr8.join(' / ')})`);
 ok(JSON.stringify(pqr9) === JSON.stringify([4, 3, 3]), `別の日の料金 10 は別に割り振る = 4 / 3 / 3 (${pqr9.join(' / ')})`);
 const s8 = fact('sku-s', 8);
-ok(s8 && s8.e === 0, `🚨 正味 0 (料金と返金が打ち消し合う) = 0 円の行 (行を消すと Render の mirror に前の額が残る。Codex #1548 R1) (${s8 && s8.e})`);
+ok(s8 && s8.e === 0, `🚨 300 のあとに返金が届いて正味 0 = 同じ行が 0 円に上書きされる (行を消すと Render の mirror に前の 300 が残る = 同期は今ある行の日だけ送り直す。Codex #1548 R1・R2) (${s8 && s8.e})`);
 
 // 重複除去 (出現順つき) は正味にする前: 同じ文書の同じ鍵 2 回 = 本物の 2 行 / 別の文書 (manual) の同じ鍵 = 重複で 1 回
 line({ day: 6, o: 'O8', sku: 'SKU-T', pt: 'Principal', pa: 700 });
