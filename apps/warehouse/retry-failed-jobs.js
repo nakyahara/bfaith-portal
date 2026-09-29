@@ -196,7 +196,7 @@ async function notify(text) {
 
 // execFileSync(shell:false): timeout時のWAL lock残留と引数のshell解釈を避ける
 // (feedback_execfile_vs_execsync — daily-sync.js と同方針)
-function runScript(scriptPath, label, timeoutMs, args = ['7']) {
+export function runScript(scriptPath, label, timeoutMs, args = ['7']) {
   const filePath = path.join(PROJECT_DIR, scriptPath);
   console.log(`\n=== ${label} ===`);
   try {
@@ -226,7 +226,9 @@ function runScript(scriptPath, label, timeoutMs, args = ['7']) {
       return { success: true, summary: `⚠不完全だが通知済み | ${lastLine}`.slice(0, 200) };
     }
     console.error(`[${label}] エラー:`, e.message);
-    return { success: false, summary: e.message.slice(0, 200) };
+    // 失敗の理由は子の最後の行にあることが多い (❌ …) = 残す (Codex #1540 R1 Low)
+    const tail = String(e.stdout ?? '').trim().split('\n').slice(-1)[0] || '';
+    return { success: false, summary: (tail ? `${tail} | ${e.message}` : e.message).slice(0, 200) };
   }
 }
 

@@ -1219,7 +1219,8 @@ export const JOBS_REGISTRY = [
       + 'conflict_409 (同じ実行 ID で違う中身 = 起きないはず・証跡とポータルの成果物を比べる) / mismatch_400・bad_request_400 (送った識別と中身が違う) / '
       + 'csv_changed・csv_missing (作った CSV が証跡と違う・消えた) / no_token (miniPC の .env に LZ_LOCK_TOKEN が無い)。証跡の portal に結果。'
       + 'ポータルの成果物の一覧 = import-state-client.js の listArtifacts (Bearer)。'
-      + '手で試す = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」 (--out-dir の回は送らない)',
+      + '手で試す = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」 (--out-dir の回は送らない)。'
+      + '送れなかった回の証跡は state = complete のまま portal.ok = false = 影の取込・少数件の試験の計画・切替の判定はその回を使わない (portal_not_stored)',
   },
   {
     id: 'lz-daily-import-shadow',

@@ -10,7 +10,7 @@
  */
 import assert from 'node:assert/strict';
 
-const { runRetryRound, RERUN_AFTER, rerunAfterProblems, RETRY_ORDER, JOB_DEFINITIONS } = await import('../apps/warehouse/retry-failed-jobs.js');
+const { runRetryRound, RERUN_AFTER, rerunAfterProblems, RETRY_ORDER, JOB_DEFINITIONS, runScript } = await import('../apps/warehouse/retry-failed-jobs.js');
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -63,6 +63,23 @@ await ta('[4] 足した下流の失敗も結果に入る (次の回の remaining
   const results = runRetryRound(['Render同期'], { run: f.run, log: quiet });
   assert.deepEqual(f.calls, ['Render同期', 'マスタ照合']);   // 照合が失敗 = 見張りは走らせ直さない (新しい結果が無い)
   assert.deepEqual(results.filter((r) => !r.success).map((r) => r.name), ['マスタ照合']);
+});
+
+await ta('[5] 失敗した子の最後の行 (❌ 理由) を要約に残す (Codex #1540 R1 Low)', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'retry-'));
+  const file = path.join(dir, 'fail.mjs');
+  fs.writeFileSync(file, "console.log('途中の行'); console.log('❌ 成果物をポータルに送れない (unreachable)'); process.exitCode = 1;");
+  const projectDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const origErr = console.error, origLog = console.log;
+  console.error = quiet; console.log = quiet;
+  let r;
+  try { r = runScript(path.relative(projectDir, file), '試験', 30000, []); } finally { console.error = origErr; console.log = origLog; }
+  assert.equal(r.success, false);
+  assert.match(r.summary, /^❌ 成果物をポータルに送れない \(unreachable\) \| /);
 });
 
 console.log(`\n${passed} 件 PASS`);

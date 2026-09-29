@@ -606,7 +606,7 @@ export function putArtifact(db, { sourceRunId, targetAsOf, verdict, csvBuf, sha2
     // 台帳 (整理の後も残る) と照らす: 同じ識別 = 中身がまだあればそのまま・整理の後なら入れ直す / 違う = 断る
     const led = db.prepare('SELECT target_as_of, verdict, csv_sha256, rows FROM artifact_ledger WHERE source_run_id = ?').get(sourceRunId);
     if (led && (led.csv_sha256 !== got || led.target_as_of !== targetAsOf || led.verdict !== verdict || led.rows !== table.length)) fail('conflict', 'その source_run_id は別の中身で受け取り済み');
-    if (led && db.prepare('SELECT 1 FROM daily_artifacts WHERE source_run_id = ?').get(sourceRunId)) return { stored: false, same: true, source_run_id: sourceRunId, csv_sha256: got, rows: table.length };
+    if (led && db.prepare('SELECT 1 FROM daily_artifacts WHERE source_run_id = ?').get(sourceRunId)) return { stored: false, same: true, source_run_id: sourceRunId, target_as_of: targetAsOf, verdict, csv_sha256: got, rows: table.length };
     if (!led) db.prepare('INSERT INTO artifact_ledger (source_run_id, target_as_of, verdict, csv_sha256, rows, first_at) VALUES (?, ?, ?, ?, ?, ?)').run(sourceRunId, targetAsOf, verdict, got, table.length, now);
     db.prepare('INSERT INTO daily_artifacts (source_run_id, target_as_of, verdict, csv_sha256, rows, csv, received_at, received_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .run(sourceRunId, targetAsOf, verdict, got, table.length, csvBuf, now, by);
@@ -615,7 +615,7 @@ export function putArtifact(db, { sourceRunId, targetAsOf, verdict, csvBuf, sha2
     db.prepare(`DELETE FROM daily_artifacts WHERE received_at < ?
       AND source_run_id NOT IN (SELECT source_run_id FROM daily_artifacts ORDER BY received_at DESC LIMIT 3)
       AND source_run_id NOT IN (SELECT s.source_run_id FROM nightly_snapshots s JOIN import_state st ON st.run_id = s.run_id AND st.state IN ('importing', 'imported_unverified'))`).run(now - ARTIFACT_KEEP_MS);
-    return { stored: true, same: !!led, source_run_id: sourceRunId, csv_sha256: got, rows: table.length };
+    return { stored: true, same: !!led, source_run_id: sourceRunId, target_as_of: targetAsOf, verdict, csv_sha256: got, rows: table.length };
   })();
 }
 

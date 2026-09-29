@@ -57,7 +57,7 @@ function setupData() {
   fs.mkdirSync(path.join(dataDir, path.dirname(rel)), { recursive: true });
   const buf = dailyBuf();
   fs.writeFileSync(path.join(dataDir, rel), buf);
-  writeEvidence(dataDir, 'lz-daily', { state: 'complete', as_of: AS_OF, run_id: RUN_DIR, verdict: 'pass', deadline: '2030-01-17T01:00:00+09:00', csv: { path: rel, sha256: sha(buf), rows: DAILY.length } },
+  writeEvidence(dataDir, 'lz-daily', { state: 'complete', version: 'lzd-v3', portal: { ok: true, stored: true }, as_of: AS_OF, run_id: RUN_DIR, verdict: 'pass', deadline: '2030-01-17T01:00:00+09:00', csv: { path: rel, sha256: sha(buf), rows: DAILY.length } },
     { now: new Date('2030-01-15T22:00:00Z'), warn: () => {} });
   return dataDir;
 }
@@ -686,6 +686,24 @@ await ta('[28] 共通の仕組みに渡す試験だけの値が効く (3b-1): im
     assert.deepEqual([S.getStatus(q.db).state, S.getStatus(q.db).lock, sent.length], ['imported_unverified', null, 1]);
     assert.match(sent[0], /途中で失敗: 計画 \(plan\.json\)/);
   }
+});
+
+await ta('[29] 対象の lz-daily はポータルに送れた回だけ (③c-1b-3b-3・Codex #1540 R1 High): 送れていない (portal なし・ok でない) = portal_not_stored / 送る前の版 (lzd-v2) は影 (合否を見ない) だけ許す', async () => {
+  const P = await import('../apps/master-decisions/lz-import-plan.mjs');
+  const pick = (patch, requirePass) => {
+    const dataDir = setupData();
+    const cur = JSON.parse(fs.readFileSync(path.join(dataDir, 'company-db-evidence', AS_OF, 'lz-daily.json'), 'utf8'));
+    const { name: _n, date: _d, written_at: _w, sync_run_id: _s, ...payload } = cur;
+    const next = { ...payload, ...patch };
+    for (const k of Object.keys(patch)) if (patch[k] === undefined) delete next[k];
+    writeEvidence(dataDir, 'lz-daily', next, { now: new Date('2030-01-15T22:00:00Z'), warn: () => {} });
+    return P.pickTarget({ dataDir, now: NOW, requirePass, asOf: AS_OF });
+  };
+  assert.equal(pick({}, true).ok, true);
+  for (const [patch, rp] of [[{ portal: undefined }, true], [{ portal: { ok: false, error: 'unreachable' } }, true], [{ portal: undefined }, false], [{ portal: undefined, version: 'lzd-v2' }, true]]) {
+    assert.equal(pick(patch, rp).reason, 'portal_not_stored', JSON.stringify([patch, rp]));
+  }
+  assert.equal(pick({ portal: undefined, version: 'lzd-v2' }, false).ok, true);   // 送る前の版の影だけ (経過措置)
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

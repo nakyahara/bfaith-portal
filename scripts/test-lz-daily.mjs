@@ -475,14 +475,14 @@ await ta('[11] 成果物をポータルへ送る (③c-1b-3b-3・K3-1): 作っ�
   const real = { putArtifact: async (m) => { calls.push(m); return { ok: true, ...S.putArtifact(db, { sourceRunId: m.sourceRunId, targetAsOf: m.targetAsOf, verdict: m.verdict, csvBuf: m.csvBuf, sha256: m.sha256, rows: m.rows, by: m.by }) }; } };
   const w = (d, n, p) => writeEvidence(d, n, p, { now, warn: () => {} });
   const fast = (o) => RUN.sendArtifact({ ...o, sleep: async () => {} });
-  let f = await RUN.afterBuild({ outDir: s.dataDir, r, client: real, now, write: w, send: fast });
+  let f = await RUN.afterBuild({ outDir: s.dataDir, r, makeClient: () => real, now, write: w, send: fast });
   assert.equal(f.code, RUN.EXIT.complete);
   assert.match(f.line, /^✅ ロジザード毎日の商品マスタ \(影\): 合格 .* \/ ポータル 受け取った$/);
   const art = S.getArtifact(db, { sourceRunId: r.runId });
   assert.deepEqual([art.csv_sha256, art.rows, art.verdict, art.target_as_of, art.received_by], [r.evidence.csv.sha256, r.evidence.csv.rows, 'pass', asOf, 'lz-daily']);
   let ev = evOf(s.dataDir);
   assert.deepEqual([ev.state, ev.run_id, ev.portal.ok, ev.portal.stored, ev.portal.tries], ['complete', r.runId, true, true, 1]);
-  f = await RUN.afterBuild({ outDir: s.dataDir, r, client: real, now, write: w, send: fast });
+  f = await RUN.afterBuild({ outDir: s.dataDir, r, makeClient: () => real, now, write: w, send: fast });
   assert.match(f.line, /ポータル 受け取り済み$/);
   // 届かない 2 回 → 3 回目で届く = 成功 / 3 回とも = 失敗 / 5xx も待つ / 4xx はすぐ
   const err = (code, status = null) => Object.assign(new Error(code), { code, status });
@@ -496,18 +496,25 @@ await ta('[11] 成果物をポータルへ送る (③c-1b-3b-3・K3-1): 作っ�
     assert.deepEqual([x.ok, x.error, x.tries, c.count()], [false, want, tries, tries], want);
   }
   const down = always(err('unreachable'));
-  f = await RUN.afterBuild({ outDir: s.dataDir, r, client: down.client, now, write: w, send: fast });
+  f = await RUN.afterBuild({ outDir: s.dataDir, r, makeClient: () => down.client, now, write: w, send: fast });
   assert.equal(f.code, RUN.EXIT.error);
   assert.match(f.line, /^❌ ロジザード毎日の商品マスタ \(影\): 成果物をポータルに送れない \(unreachable\) = 成功にしない \/ ✅/);
   ev = evOf(s.dataDir);
   assert.deepEqual([ev.state, ev.portal.ok, ev.portal.error], ['complete', false, 'unreachable']);
   assert.equal(RUN.pingFor(f.code, f.line).status, 'fail');
   // 証跡を書けない = 成功にしない
-  f = await RUN.afterBuild({ outDir: s.dataDir, r, client: real, now, write: () => false, send: fast });
+  f = await RUN.afterBuild({ outDir: s.dataDir, r, makeClient: () => real, now, write: () => false, send: fast });
   assert.deepEqual([f.code, /証跡 lz-daily を書けない/.test(f.line)], [RUN.EXIT.error, true]);
   // 口の答えの識別が違う = 失敗
-  const liar = { putArtifact: async () => ({ ok: true, stored: true, csv_sha256: 'x'.repeat(64), rows: r.evidence.csv.rows }) };
-  assert.deepEqual((await fast({ outDir: s.dataDir, evidence: r.evidence, client: liar })).error, 'portal_answer_mismatch');
+  const good = { source_run_id: r.runId, target_as_of: asOf, verdict: 'pass', csv_sha256: r.evidence.csv.sha256, rows: r.evidence.csv.rows };
+  for (const bad of [{ csv_sha256: 'x'.repeat(64) }, { source_run_id: 'lzd_other' }, { target_as_of: '2030-01-14' }, { verdict: 'fail' }, { rows: 99 }]) {
+    const liar = { putArtifact: async () => ({ ok: true, stored: true, ...good, ...bad }) };
+    assert.deepEqual((await fast({ outDir: s.dataDir, evidence: r.evidence, client: liar })).error, 'portal_answer_mismatch', JSON.stringify(bad));
+  }
+  assert.equal((await fast({ outDir: s.dataDir, evidence: r.evidence, client: { putArtifact: async () => ({ ok: true, stored: true, ...good }) } })).ok, true);
+  // 口の用意の失敗 (LZ_LOCK_TOKEN が無い) = 送れない・証跡に残す (Codex #1540 R1 Medium)
+  f = await RUN.afterBuild({ outDir: s.dataDir, r, makeClient: () => { throw Object.assign(new Error('LZ_LOCK_TOKEN が無い'), { code: 'no_token' }); }, now, write: w, send: fast });
+  assert.deepEqual([f.code, /送れない \(no_token\)/.test(f.line), evOf(s.dataDir).portal.error], [RUN.EXIT.error, true, 'no_token']);
   // CSV が証跡と違う (書き換わった・消えた) = 送らない
   const before = calls.length;
   const csvPath = path.join(s.dataDir, r.evidence.csv.path);
@@ -518,10 +525,42 @@ await ta('[11] 成果物をポータルへ送る (③c-1b-3b-3・K3-1): 作っ�
   fs.rmSync(csvPath);
   assert.deepEqual(await fast({ outDir: s.dataDir, evidence: r.evidence, client: real }), { ok: false, error: 'csv_missing' });
   assert.equal(calls.length, before);
-  // 本番の入口: daily-sync の回 (ping を打つ回 = --daily で --out-dir なし) だけ、作れた後に送る (手の試しは送らない)
-  const src = fs.readFileSync(new URL('./company-db/lz-daily.mjs', import.meta.url), 'utf8');
-  assert.ok(src.includes("if (r.state === 'complete' && ping) ({ code, line: last } = await afterBuild({ outDir, r, client: createImportStateClient() }));"));
-  assert.ok(src.includes('ping = a.daily && !a.outDir;'));
+});
+
+await ta('[12] 入口 (cli): daily-sync の回 (--daily・--out-dir なし) だけ作れた後に送る / LZ_LOCK_TOKEN が無い・Render が落ちている = ❌ exit 1・fail の ping・証跡の portal / --out-dir・--daily なし = 送らない・ping しない / 送れた = ✅ exit 0・ok の ping (Codex #1540 R1 Medium)', async () => {
+  const S = await import('../apps/logizard-import-state/store.js');
+  const go = async (argv, { client = undefined, makeClient = undefined, outDir = null } = {}) => {
+    const s = setup();
+    const pings = [], logs = [];
+    const res = await RUN.cli([...argv, ...(outDir ? ['--out-dir', outDir] : [])], {
+      env: { DATA_DIR: s.dataDir, COMPANY_DB_WATCH_URL: 'postgres://fake', LZ_SHOHIN_MASTER_PATH: s.lzPath, LZ_SHOHIN_STAMP_PATH: s.stampPath },
+      now, runBuild: (o) => RUN.runLzDaily({ ...o, readNe: neFake(), readCdb: cdbFake(), lzMinRows: 1 }),
+      makeClient: makeClient || (() => client), ping: async (id, p) => { pings.push([id, p.status]); }, log: (x) => logs.push(x),
+      write: (d, n, p) => writeEvidence(d, n, p, { now, warn: () => {} }), sleep: async () => {},
+    });
+    return { ...res, pings, logs, s };
+  };
+  const db = S.openImportStateDb(':memory:');
+  S.init(db, { by: 'x' });
+  const sent = [];
+  const real = { putArtifact: async (m) => { sent.push(m.sourceRunId); return { ok: true, ...S.putArtifact(db, { sourceRunId: m.sourceRunId, targetAsOf: m.targetAsOf, verdict: m.verdict, csvBuf: m.csvBuf, sha256: m.sha256, rows: m.rows, by: m.by }) }; } };
+  // 送れた = ✅ exit 0・ok の ping・証跡の portal
+  let x = await go(['--daily', '--as-of', asOf], { client: real });
+  assert.deepEqual([x.code, x.pings, sent.length, /ポータル 受け取った$/.test(x.last), evOf(x.s.dataDir).portal.ok, evOf(x.s.dataDir).version], [0, [['lz-daily-build', 'ok']], 1, true, true, 'lzd-v3']);
+  // LZ_LOCK_TOKEN が無い = 口を作れない = ❌ exit 1・fail の ping・証跡の portal.error
+  x = await go(['--daily', '--as-of', asOf], { makeClient: () => { throw Object.assign(new Error('LZ_LOCK_TOKEN が無い'), { code: 'no_token' }); } });
+  assert.deepEqual([x.code, x.pings, /^❌ .*送れない \(no_token\)/.test(x.last), evOf(x.s.dataDir).state, evOf(x.s.dataDir).portal.error], [1, [['lz-daily-build', 'fail']], true, 'complete', 'no_token']);
+  // Render が落ちている = 3 回送って ❌ exit 1
+  let tries = 0;
+  x = await go(['--daily', '--as-of', asOf], { client: { putArtifact: async () => { tries++; throw Object.assign(new Error('x'), { code: 'unreachable', status: null }); } } });
+  assert.deepEqual([x.code, x.pings, tries, evOf(x.s.dataDir).portal.error], [1, [['lz-daily-build', 'fail']], 3, 'unreachable']);
+  // 手の試し (--out-dir)・--daily なし = 送らない・ping しない (作れた = exit 0)
+  const before = sent.length;
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'lzd-cli-'));
+  x = await go(['--daily', '--as-of', asOf], { client: real, outDir: out });
+  assert.deepEqual([x.code, x.pings, sent.length], [0, [], before]);
+  x = await go(['--as-of', asOf], { client: real });
+  assert.deepEqual([x.code, x.pings, sent.length, 'portal' in evOf(x.s.dataDir)], [0, [], before, false]);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

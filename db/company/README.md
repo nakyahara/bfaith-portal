@@ -600,7 +600,8 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - `DATA_DIR/lz-daily/<日付>/<実行 ID>/cdb_logizard_shohinmaster_upload.csv` (変えない = 新しく作るだけ) と `report.json` (3 つの分け方・差・「?」にした文字)。
 - 証跡 `lz-daily` (完了の印) = 入力の世代 (照合の回・NE の取得・ロジザードの一覧の時刻と sha256・成功の印・前回の行数)・CSV の sha256 と行数・取込の期限 (翌日 01:00 = 翌日 00:20 の取込の回まで)・合否と理由。③c-1b の取込はこの印と CSV が合うときだけ取り込む。
   - 始めに `running` を書く = 同じ日の前の回の完了の印を無効にする。証跡を書けない = 作ること自体の失敗 (❌・前の合格を残さない)。
-- 終わり方: 作れた (合格でも不合格でも) = exit 0 (✅ / ⚠️) + 成功の ping (台帳 `lz-daily-build`)。材料が無い・未設定 = ⏭️ exit 3 + fail の ping (理由つき。未設定の回も `skipped` を書いて前の回の完了の印を無効にする)。作ること自体の失敗 = ❌ exit 1 + fail の ping。ping は `--daily` で `--out-dir` が無い回だけ。
+- **成果物をポータルに送る** (③c-1b-3b-3・契約 K3-1・証跡の版 `lzd-v3`): daily-sync の回は、作った CSV を読み直して (sha256 と大きさが証跡と同じ) ポータルの口 (`POST /apps/logizard-import-state/api/artifacts`・`LZ_LOCK_TOKEN`) に送る。届かない・5xx = 5 秒・10 秒待って 3 回まで / 4xx = すぐ失敗。口の答えの識別 (実行 ID・対象の日・判定・sha256・行数) も照らす。結果は証跡の `portal` (送れない回も)。影の取込・少数件の試験の計画・切替の判定は `portal.ok = true` の回だけ使う (送る前の版 `lzd-v2` は影だけ許す = 経過措置)。
+- 終わり方: 作れた (合格でも不合格でも) **かつポータルが受け取れた** = exit 0 (✅ / ⚠️) + 成功の ping (台帳 `lz-daily-build`)。材料が無い・未設定 = ⏭️ exit 3 + fail の ping (理由つき。未設定の回も `skipped` を書いて前の回の完了の印を無効にする)。作ること自体の失敗・**成果物をポータルに送れない (LZ_LOCK_TOKEN が無いも)** = ❌ exit 1 + fail の ping (朝の再試行で作り直して送り直す)。ping と送りは `--daily` で `--out-dir` が無い回だけ。
 - 手で試すとき (本番の証跡を書かない): `node scripts/company-db/lz-daily.mjs --data-dir C:\Users\bfaith\bfaith-portal\data --out-dir <一時の場所>`
 
 **2026-09-28 の試し (本番のデータを読むだけ)**: 比べる 5,006・新商品待ち 5・不正 2 (NE の大文字小文字の衝突 = 9/28 に NE で直した)・同じ 4,909 行・許す差 159 (名前の空白 62 商品 × 2 列・原価 35 商品)・説明できない 0。
@@ -628,7 +629,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 
 **台帳**: `lz-daily-build` (scheduled_job・P3・毎日 07:00 + 猶予 7 時間 = 作れた回の ok が来なければ気づく) / `lz-daily-import-shadow` (scheduled_job・P3・00:20 + 猶予 6 時間。切替で RETIRED_JOBS へ = `lz-daily-import-shadow-retire`) / `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
 
-**試験**: `scripts/test-lz-daily.mjs` [1]〜[10] (ロジザードの一覧の見出しは実ファイルの 1 行目のバイト)・`scripts/test-retry-rerun.mjs` (照合が直ったら作り直す)
+**試験**: `scripts/test-lz-daily.mjs` [1]〜[12] (ロジザードの一覧の見出しは実ファイルの 1 行目のバイト。[11][12] = 成果物をポータルへ送る・入口)・`scripts/test-retry-rerun.mjs` (照合が直ったら作り直す)
 
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 

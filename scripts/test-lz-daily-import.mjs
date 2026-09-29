@@ -48,7 +48,7 @@ function setup({ ids = ['A-1', 'B-2'], state = 'complete', verdict = 'pass', syn
   fs.writeFileSync(path.join(dataDir, rel), buf);
   const prev = process.env.DAILY_SYNC_RUN_ID;
   if (!syncRun) delete process.env.DAILY_SYNC_RUN_ID;
-  writeEvidence(dataDir, 'lz-daily', { state, as_of: AS_OF, run_id: RUN_DIR, verdict, deadline, csv: { path: rel, sha256: shaOverride || sha(buf), rows: rowsOverride ?? ids.length } }, { now: new Date('2030-01-15T00:20:00Z'), warn: () => {} });
+  writeEvidence(dataDir, 'lz-daily', { state, version: 'lzd-v3', portal: { ok: true, stored: true }, as_of: AS_OF, run_id: RUN_DIR, verdict, deadline, csv: { path: rel, sha256: shaOverride || sha(buf), rows: rowsOverride ?? ids.length } }, { now: new Date('2030-01-15T00:20:00Z'), warn: () => {} });
   process.env.DAILY_SYNC_RUN_ID = prev;
   return { dataDir, csvFull: path.join(dataDir, rel) };
 }
@@ -225,7 +225,7 @@ await ta('[8] 毎晩の影は on のときだけ (既定 = 止めてある)・�
   const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-'));
   const rel = `lz-daily/2030-01-16/lzd_20300116T001500000Z_abcdef/cdb_logizard_shohinmaster_upload.csv`, buf = dailyCsv(['A-1']);
   fs.mkdirSync(path.join(d2, path.dirname(rel)), { recursive: true }); fs.writeFileSync(path.join(d2, rel), buf);
-  writeEvidence(d2, 'lz-daily', { state: 'complete', as_of: '2030-01-16', run_id: 'lzd_20300116T001500000Z_abcdef', verdict: 'pass', deadline: '2030-01-17T01:00:00+09:00', csv: { path: rel, sha256: sha(buf), rows: 1 } }, { now: new Date('2030-01-16T00:20:00Z'), warn: () => {} });
+  writeEvidence(d2, 'lz-daily', { state: 'complete', version: 'lzd-v3', portal: { ok: true, stored: true }, as_of: '2030-01-16', run_id: 'lzd_20300116T001500000Z_abcdef', verdict: 'pass', deadline: '2030-01-17T01:00:00+09:00', csv: { path: rel, sha256: sha(buf), rows: 1 } }, { now: new Date('2030-01-16T00:20:00Z'), warn: () => {} });
   f = fakes();
   r = await RUN.runShadow({ dataDir: d2, now: noon, forceWindow: true, asOf: '2030-01-16', localInitFile: 'x', lzMinRows: 1, log: () => {}, ...f });
   assert.deepEqual([r.state, r.record.target.as_of, f.calls.preview.length], ['shadow_ok', '2030-01-16', 1]);

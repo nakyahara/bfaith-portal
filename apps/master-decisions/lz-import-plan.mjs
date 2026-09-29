@@ -44,6 +44,9 @@ export function pickTarget({ dataDir, now, requirePass = true, asOf = targetAsOf
   if (ev.state !== 'complete') return no(`not_complete_${ev.state || 'unknown'}`);   // running / skipped = その日は作れていない (前の日を探さない)
   if (ev.as_of !== asOf) return no('as_of_mismatch');
   if (requirePass && ev.verdict !== 'pass') return no('not_pass', { evidence: ev });
+  // ポータルに送れた成果物だけ (③c-1b-3b 契約 K3-1。Codex #1540 R1 High)。送る前の版 (lzd-v2) は影 (requirePass = false) だけ許す (切替の前の 1 晩の経過措置)
+  const stored = !!(ev.portal && ev.portal.ok === true);
+  if (!stored && (requirePass || ev.version !== 'lzd-v2')) return no('portal_not_stored', { evidence: ev });
   if (!ev.deadline || Date.parse(ev.deadline) < now.getTime()) return no('deadline_passed', { evidence: ev });
   if (!ev.csv || typeof ev.csv.path !== 'string' || !/^lz-daily\/\d{4}-\d{2}-\d{2}\/lzd_[0-9TZ]+_[0-9a-f]{6}\/cdb_logizard_shohinmaster_upload\.csv$/.test(ev.csv.path)) return no('csv_path_bad');
   const csvPath = path.join(dataDir, ...ev.csv.path.split('/'));
