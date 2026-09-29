@@ -781,7 +781,12 @@ commit;
 - **容量の見張り** (D-W5): chunk の前に「Render の DB の大きさ (+ WAL・読めなければ見込み) + 送った分 + 次の chunk の行 × 1 行の大きさ × 置き換えの倍率 + 余裕」が `CDB_DB_LIMIT_BYTES` の 80% を超えるなら送らずに止まる。🚨 `CDB_DB_LIMIT_BYTES` が無ければ送らない。1 行の大きさ・倍率 (`CDB_FINANCE_ROW_BYTES` / `CDB_FINANCE_REPLACE_FACTOR`) は `node scripts/company-db/measure-amazon-finance.mjs --from … --to …` (PGlite に入れて測る・Render に触れない) の値
 - **突き合わせ** `--reconcile [--all]` = 直近 45 日 + 台帳の「未照合の月」(送った集合の新旧の計上日の月) の 日 × SKU (鍵の和集合・Easy Ship の割り振りだけの行は除く・数量 5 列 + 金額 21 列 + profit_before_cogs) と月 × 手数料の種類 (金額・行数) と uncovered。差の月 → 日次の財務のやり残し (`amazon-finance-pending.json`) / 月の手数料のやり残し (`amazon-account-fees-pending.json`・daily-sync の手数料の build / sync がその月までさかのぼり、両方が通ったら消す)。差が 1 回目 ⚠️・2 回続けば ❌
 - 受領記録の指紋は受け口が作り直した行で計算する (`receiptRows`) = 次の回に「Render が復元された」と誤判定しない
-- 手順 (F2b-2 = 手で。daily-sync には F2b-3 で入れる): ① `--from 月初 --to 月末 --dry-run` (1 注文の最大の行数 ≤ 500・最大の JSON・拾われない金額・鍵の分からない行) → ② 測る → ③ 中原さんが D-W5 を決める → ④ env を置いて 1 か月だけ送る → ⑤ `--reconcile`
+- **daily-sync の工程 (F2b-3)**: 手数料の build / sync の後に `amazon-finance.mjs --incremental --require-backfilled` (日曜 = `--full`・`amazonFinanceDailyArgs`) → 送れたら `--reconcile --require-backfilled`。バックフィルの完了印の前はどちらも「⏭️ バックフィル前」で何もしない。送り手は retry の対象 (`--full`)・突き合わせは retry に載せない (差の続いた回数を数えている)
+- **バックフィルの手順** (miniPC・人が。daily-sync の 07:00〜09:10 は避ける。送り手の lock があるので重なっても片方は見送る):
+  1. `--from 月初 --to 月末 --dry-run` (1 注文の最大の行数 ≤ 500・最大の JSON・拾われない金額・鍵の分からない行) と `node scripts/company-db/measure-amazon-finance.mjs --from … --to …` (1 行・1 注文の大きさ・置き換えの倍率)
+  2. 中原さんが D-W5 (Render の Postgres のプラン) を決める → miniPC の `.env` に `CDB_DB_LIMIT_BYTES` (と測った `CDB_FINANCE_ROW_BYTES` / `CDB_FINANCE_ORDER_BYTES` / `CDB_FINANCE_REPLACE_FACTOR`) を置く
+  3. 1 か月ずつ `--from 月初 --to 月末` → `--reconcile` (差 0 を見る。差の月は翌朝の build が作り直す) を 2026-01 から当月まで
+  4. `--mark-backfilled` (送れない鍵・鍵の分からない行が 0 で、全期間の突き合わせ `--reconcile --all` が一致したときだけ印を付ける) → 翌朝から daily-sync が送る
 - 試験 = `node scripts/test-company-db-amazon-finance.mjs` (二重の実装の一致・送り手の通し (本物の router を HTTP で)・突き合わせ・手数料のやり残し)
 ## 受注・出荷の受け皿 (0013。08 §4.1〜4.3 / §4.7。D4)
 

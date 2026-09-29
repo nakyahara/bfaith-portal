@@ -467,7 +467,12 @@ export const JOBS_REGISTRY = [
       + '(7 月から 0 だった)。2026-09-28 から Easy Ship の配送料 (Amazon Easy Ship Charges) を全部 easy_ship として入れる (月の最終利益から引く)。「Amazon finance build」は同じ料金を注文番号で SKU に割り振って日次の財務の easy_ship_jpy に入れる (SKU ごとの利益を見るための列・利益の合計からは引かない = 二重にならない。冒頭に「Easy Ship 割り振りテスト」test-easy-ship-allocation.js・一時 DB)。「Amazon finance build」は 2026-09-29 から値引きの消費税の分 (promotion_tax_jpy) も持つ (Amazon 分析の税抜で引いた利益で使う。冒頭に「値引きの税の分テスト」test-finance-promotion-tax.js・一時 DB)。冒頭に「v4 突き合わせテスト」test-amazon-v4-reconcile.js (日次の財務と v4 は決まりの違い 5 つを引くと残り 0 = 手で流す照合の道具 run-amazon-finance-dq.js / validate-v4-reference.js の判定・一時 DB) も走る。分けられない SKU なしの取引が出たら最後の行が ⚠️ (名前が変わった手数料の疑い)。冒頭に「Amazonアカウントフィー テスト」(test-amazon-account-fees.js・一時 DB) も走る。'
       + '2026-09-29 (F2b-2・#1534) から「Amazonアカウントフィー build / sync」はふだん 14 か月・DATA_DIR/amazon-account-fees-pending.json (月の手数料のやり残し = Company DB の Amazon 財務との突き合わせで差が出た月) があれば '
       + 'その一番古い月まで (最大 60 か月) さかのぼって作り直す (--from-month で始まりの月を明示 = 途中で月をまたいでも範囲がずれない)。やり残しは build と sync の両方が通った後にだけ消す。'
-      + 'やり残しのファイルが読めない・60 か月より古い = ⚠️ (Amazonアカウントフィー やり残し)。さかのぼる回は所要時間が延びる (1 か月あたり数秒〜十数秒の見込み)。新しい定期実行は無い',
+      + 'やり残しのファイルが読めない・60 か月より古い = ⚠️ (Amazonアカウントフィー やり残し)。さかのぼる回は所要時間が延びる (1 か月あたり数秒〜十数秒の見込み)。新しい定期実行は無い。'
+      + '「Amazonアカウントフィー build / sync」の後に「Company DB Amazon 財務 push」(apps/company-db/push/amazon-finance.mjs。F2b-3・設計 = AI_reference CompanyDB構想/12 §5。'
+      + '決済の行を 注文 × 計上日 × SKU × 行の種類 にまとめて Company DB (0043) へ。日曜は --full = 全部を集約し直す + Render にだけある鍵に空の集合・ほかは --incremental。'
+      + 'バックフィルの完了印 (台帳 DATA_DIR/company-db-push.db の order_finance:amazon) の前は「⏭️ バックフィル前」で送らない。容量の上限 CDB_DB_LIMIT_BYTES が無ければ送らない (D-W5)。'
+      + '送信の失敗・送れない鍵 = ❌ (retry = --full)・拾われない金額 = ⚠️) → 送れたら「Company DB Amazon 財務 突き合わせ」(--reconcile。直近 45 日 + 未照合の月の 日 × SKU と月の手数料を SQLite と。'
+      + '差の月は amazon-finance-pending.json / amazon-account-fees-pending.json に登録 = 次の朝の build が作り直す。差が 1 回目 ⚠️・2 回続けば ❌・retry には載せない)。新しい定期実行は無い',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
     anchor_hour_jst: 7,

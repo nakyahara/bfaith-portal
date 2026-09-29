@@ -151,3 +151,12 @@ export function accountFeesMonthsBack(dataDir, { currentMonth }) {
   const fromMonth = `${fromD.getUTCFullYear()}-${String(fromD.getUTCMonth() + 1).padStart(2, '0')}`;
   return { months, fromMonth, pending, covered: pending.filter((m) => m >= fromMonth), warn, notes };
 }
+
+/** daily-sync の Company DB の Amazon 財務の送り手 (apps/company-db/push/amazon-finance.mjs) の引数 (F2b-3。設計 = AI_reference CompanyDB構想/12 §5)。
+ *  日曜 (JST の業務日) = --full (全部を集約し直して指紋を比べる + Render にだけある鍵に空の集合 = 同じ注文の中の一部の行の削除・訂正を拾う) / ほか = --incremental。
+ *  どちらも --require-backfilled (バックフィルの完了印の前は送らずに「⏭️ バックフィル前」) */
+export function amazonFinanceDailyArgs(businessDate) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(businessDate || ''))) throw new Error(`businessDate は YYYY-MM-DD: ${businessDate}`);
+  const sunday = new Date(`${businessDate}T00:00:00Z`).getUTCDay() === 0;
+  return [sunday ? '--full' : '--incremental', '--require-backfilled'];
+}
