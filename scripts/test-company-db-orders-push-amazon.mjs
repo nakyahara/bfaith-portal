@@ -261,7 +261,7 @@ await t('--require-backfilled (daily-sync 用) の CLI: 完了印が無ければ
       + 'sales_channel TEXT, asin TEXT, seller_sku TEXT, title TEXT, quantity INTEGER, item_price REAL, item_tax REAL, shipping_price REAL, shipping_tax REAL, promotion_discount REAL, currency TEXT, item_status TEXT, synced_at TEXT)');
     insertAz(w, az({ no: '250-0000009-0000009' })); w.close();
     const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'apps', 'company-db', 'push', 'mall-orders.mjs');
-    const env = { ...process.env, DATA_DIR: dir, RENDER_MIRROR_URL: 'https://127.0.0.1:' + tcp.address().port + '/apps/mirror', RENDER_PORTAL_URL: '', MIRROR_SYNC_KEY: 'k' };
+    const env = { ...process.env, DATA_DIR: dir, RENDER_MIRROR_URL: 'https://127.0.0.1:' + tcp.address().port + '/apps/mirror', RENDER_PORTAL_URL: '', MIRROR_SYNC_KEY: 'k', CDB_GET_MAX_ATTEMPTS: '1' };   // つながらない Render を読み直して待たない
     const run = (args) => new Promise((resolve) => {   // spawnSync は使わない (この process の TCP の待ち受けが止まる)
       const c = spawn(process.execPath, [cli, ...args], { env }); let out = '';
       c.stdout.on('data', (d) => { out += d; }); c.stderr.on('data', (d) => { out += d; });
