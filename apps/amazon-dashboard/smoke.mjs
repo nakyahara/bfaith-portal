@@ -196,6 +196,7 @@ check('税込で引いた計算の広告の後 = 広告費 × 1.1 を引く (推
   assert(tr.length > 0, '広告費のある日がある');
   for (const x of tr) assert(Math.abs((x.profit_before_ads_incl - x.profit_after_ads_incl) - x.ad_cost * 1.1) < 1e-6, '推移の日 ' + JSON.stringify([x.bucket, x.profit_before_ads_incl, x.profit_after_ads_incl, x.ad_cost]));
   const trm = q.getTrend(d(89), today, 'month').rows.filter((x) => x.ad_cost > 20);
+  assert(trm.length > 0, '広告費のある月がある');
   for (const x of trm) assert(Math.abs((x.profit_before_ads_incl - x.profit_after_ads_incl) - x.ad_cost * 1.1) < 1e-6, '推移の月 ' + JSON.stringify([x.bucket, x.ad_cost]));
   for (const sku of [null, 'pr_alpha']) {
     const wf = q.getWaterfall(d(29), today, sku);
