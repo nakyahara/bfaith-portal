@@ -15,7 +15,6 @@
  */
 import 'dotenv/config';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { PGlite } from '@electric-sql/pglite';
@@ -32,13 +31,14 @@ const from = arg('--from'), to = arg('--to');
 if (!all && !(isDate(from) && isDate(to) && from <= to)) { console.error('--from YYYY-MM-DD --to YYYY-MM-DD か --all'); process.exit(2); }
 const dataDir = (process.env.DATA_DIR || '').trim();
 if (!dataDir) { console.error('DATA_DIR が無い'); process.exit(2); }
-const pgDir = arg('--pglite-dir') || fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-finance-measure-'));
-if (fs.existsSync(pgDir) && fs.readdirSync(pgDir).length) { console.error(`--pglite-dir は空のフォルダ (${pgDir})`); process.exit(2); }
+// 既定 = メモリ上 (ディスク上の PGlite は 1 か月で 1.5 時間以上かかった)。--pglite-dir <空のフォルダ> でディスク上
+const pgDir = arg('--pglite-dir');
+if (pgDir && fs.existsSync(pgDir) && fs.readdirSync(pgDir).length) { console.error(`--pglite-dir は空のフォルダ (${pgDir})`); process.exit(2); }
 
 const mb = (b) => `${(Number(b) / 1048576).toFixed(1)} MB`;
 const t0 = Date.now();
 const warehouse = new Database(path.join(dataDir, 'warehouse.db'), { readonly: true, fileMustExist: true });
-const pg = new PGlite(pgDir);
+const pg = pgDir ? new PGlite(pgDir) : new PGlite();
 await applyMigrations(pgliteAdapter(pg), { log: () => {} });
 const db = pgliteAdapter(pg);
 const size = async () => {
@@ -93,6 +93,6 @@ if (range.b) {
   await timed(`日次の財務 全期間 ${range.a}〜${range.b}`, `select * from mart.v_finance_daily`, []);
   await timed('月の手数料 全期間', `select * from mart.v_finance_account_fees_monthly`, []);
 }
-console.log(`PGlite = ${pgDir} (測り終えたら消してよい)。全体 ${((Date.now() - t0) / 1000).toFixed(1)} 秒`);
+console.log(`PGlite = ${pgDir || 'メモリ'}${pgDir ? ' (測り終えたら消してよい)' : ''}。全体 ${((Date.now() - t0) / 1000).toFixed(1)} 秒`);
 await pg.close();
 warehouse.close();
