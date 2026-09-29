@@ -9,6 +9,7 @@
 旧い手の ③ (持ち主 `manual_daily`・Stream Deck の PC で押す) はやめる (鍵を取れない = `retired`)。
 **機能の旗 `LZ_MANUAL_V4=on`** (Render の env): 立つまでは今までの動き (旧い手の ③ を使える・nightly に成果物は要らない・手の取込と waiver は `disabled`)。
 成果物の受け取り・設定・halt の知らせは旗に依らない (切替の前から成果物を貯める)。旗を立てるのは、成果物の受け口・画面・毎晩の本番がそろった切替のとき。
+旗を外した後も、もう開いている / 確認待ちの手の取込は終える・取り消す・確認できる (片付け。新しく始めるのと waiver は旗が要る)。ポータルの状態を作り直した recover (止めた状態で作る) も halt と同じ知らせを積む。
 
 ## 持つもの (SQLite `DATA_DIR/logizard-import-state.db`)
 - `state` = idle / importing / imported_unverified / verified / unknown / partial / verify_failed

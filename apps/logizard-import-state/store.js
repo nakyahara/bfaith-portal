@@ -52,6 +52,7 @@
  *   **機能の旗 LZ_MANUAL_V4=on** (Codex #1537 R1 High): 立つまでは今までの動き (旧い手の ③ manual_daily を使える・nightly に成果物は要らない・
  *     手の取込 / 義務 / waiver は断る = disabled)。成果物の受け取り・設定・outbox は旗に依らない (切替の前から成果物を貯める)。
  *     旗を立てるのは、成果物の受け口・画面・毎晩の本番がそろった切替のとき (manual_daily の拒否と成果物の必須を同時に)。
+ *     旗を外した後も、もう開いている / 確認待ちの手の取込は終える・取り消す・確認できる (片付け。新しく始めるのと waiver は旗が要る)。
  */
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -170,6 +171,7 @@ export function openImportStateDb(file = path.join(process.env.DATA_DIR || path.
         OR NEW.csv_sha256 IS NOT OLD.csv_sha256 OR NEW.rows IS NOT OLD.rows OR NEW.csv IS NOT OLD.csv OR NEW.download_name IS NOT OLD.download_name
         OR (OLD.status <> 'open' AND NEW.status IS NOT OLD.status)
         OR (OLD.status = 'open' AND NEW.status <> 'open' AND (NEW.closed_at IS NULL OR NEW.closed_by IS NULL OR NEW.close_detail IS NULL))
+        OR (NEW.status = 'open' AND (NEW.closed_at IS NOT NULL OR NEW.closed_by IS NOT NULL OR NEW.close_detail IS NOT NULL))
         OR (OLD.closed_at IS NOT NULL AND (NEW.closed_by IS NOT OLD.closed_by OR NEW.closed_at IS NOT OLD.closed_at OR NEW.close_detail IS NOT OLD.close_detail))
         OR (OLD.closed_at IS NULL AND NEW.closed_at IS NOT NULL AND NEW.status = 'open')
         OR (OLD.ack_at IS NOT NULL AND (NEW.ack_by IS NOT OLD.ack_by OR NEW.ack_at IS NOT OLD.ack_at OR NEW.ack_note IS NOT OLD.ack_note))
@@ -236,7 +238,7 @@ export function openImportStateDb(file = path.join(process.env.DATA_DIR || path.
     );
     CREATE TRIGGER IF NOT EXISTS outbox_no_delete BEFORE DELETE ON outbox BEGIN SELECT RAISE(ABORT, 'outbox は消さない'); END;
     CREATE TRIGGER IF NOT EXISTS outbox_only_sent BEFORE UPDATE ON outbox
-      WHEN NEW.kind IS NOT OLD.kind OR NEW.dedupe_key IS NOT OLD.dedupe_key OR NEW.text IS NOT OLD.text OR NEW.created_at IS NOT OLD.created_at
+      WHEN NEW.id IS NOT OLD.id OR NEW.kind IS NOT OLD.kind OR NEW.dedupe_key IS NOT OLD.dedupe_key OR NEW.text IS NOT OLD.text OR NEW.created_at IS NOT OLD.created_at
         OR OLD.sent_at IS NOT NULL OR NEW.sent_at IS NULL OR NEW.sent_by IS NULL
       BEGIN SELECT RAISE(ABORT, 'outbox は送れた印 (sent_at と sent_by を一緒に) だけ・1 回だけ'); END;
     CREATE TABLE IF NOT EXISTS settings (
@@ -357,7 +359,10 @@ export function recover(db, { by, note, now = Date.now() }) {
       update(db, now, { init_id: initId, ...clearLock });
     }
     // 状態を作り直した (ポータル側の消失) ときだけ状態の出来事 (手元の印の消失 = 状態はそのまま・知らせ済みも変えない)
-    (r ? event : stateEvent)(db, now, 'recover', null, by, { init_id: initId, prev_init_id: r ? r.init_id : null, note });
+    const eventId = (r ? event : stateEvent)(db, now, 'recover', null, by, { init_id: initId, prev_init_id: r ? r.init_id : null, note });
+    // ポータルの状態を作り直した = 自動を止めた = halt と同じ知らせを同じ取引で積む (K3-4。Codex #1537 R2 Medium)
+    if (!r) outboxPut(db, now, 'halt', `halt:${eventId}`, `⏸ ロジザードの取込の状態をポータルで作り直した (${by}) = 自動の取込は止めた状態: ${String(note).slice(0, 300)}
+ロジザードの履歴を確かめてから resume`);
     return { init_id: initId, halted: !r ? true : !!r.halted };
   })();
 }
@@ -711,7 +716,7 @@ export function listManualSessions(db, { limit = 20 } = {}) {
  * どれかが違う = needs_review (管理者の確認まで resume できない。知らせを積む)。
  */
 export function completeManualSession(db, { sessionId, resultText, history, note = null, by, now = Date.now() }) {
-  needV4(); checkBy(by);
+  checkBy(by);   // 旗が無くても、もう開いている手の取込は終えられる (旗を外した後の片付け。Codex #1537 R2 Medium)
   if (typeof resultText !== 'string' || !resultText.trim() || resultText.length > LIMITS.resultText) fail('bad_request', `結果の文 (1〜${LIMITS.resultText} 文字) が要る`, 400);
   if (!history || typeof history !== 'object' || typeof history.fileName !== 'string' || history.fileName.length > LIMITS.fileName
     || !Number.isSafeInteger(history.at) || history.at % MINUTE !== 0 || typeof history.account !== 'string' || history.account.length > 60) fail('bad_request', 'history = { fileName, at (ms・分まで = 秒は 0), account } が要る', 400);
@@ -729,7 +734,7 @@ export function completeManualSession(db, { sessionId, resultText, history, note
     if (history.at < floorMin(x.opened_at) || history.at > floorMin(now)) mismatches.push('history_time');
     if (history.account !== x.lz_account) mismatches.push('account');
     const status = judged.to === 'imported_unverified' && !mismatches.length ? 'completed_ok' : 'needs_review';
-    const detail = { parsed, judged, history: { fileName: history.fileName, at: history.at, account: history.account }, mismatches, note };
+    const detail = { result_text: resultText, parsed, judged, history: { fileName: history.fileName, at: history.at, account: history.account }, mismatches, note };   // 原文も残す (読めない文も。Codex #1537 R2 Medium)
     db.prepare('UPDATE manual_sessions SET status = ?, closed_by = ?, closed_at = ?, close_detail = ?, updated_at = ? WHERE session_id = ?').run(status, by, now, JSON.stringify(detail), now, x.session_id);
     const eventId = event(db, now, 'manual_complete', null, by, { session_id: x.session_id, status, judged, mismatches });
     if (status === 'needs_review') outboxPut(db, now, 'manual_review', `manual_review:${x.session_id}`,
@@ -740,7 +745,7 @@ export function completeManualSession(db, { sessionId, resultText, history, note
 
 /** 手の取込を取り消す (ロジザードに置かなかった)。義務は残す (自動が入れ直すので害は無い) */
 export function cancelManualSession(db, { sessionId, note, by, now = Date.now() }) {
-  needV4(); checkBy(by); checkNote(note);
+  checkBy(by); checkNote(note);   // 旗が無くても取り消せる (片付け)
   return db.transaction(() => {
     mustRow(db);
     const x = db.prepare('SELECT * FROM manual_sessions WHERE session_id = ?').get(String(sessionId ?? ''));
@@ -754,7 +759,7 @@ export function cancelManualSession(db, { sessionId, note, by, now = Date.now() 
 
 /** 確認待ち (needs_review) を管理者が確認した (ロジザードの履歴を見て)。義務は残る */
 export function acknowledgeManualSession(db, { sessionId, note, by, now = Date.now() }) {
-  needV4(); checkBy(by); checkNote(note);
+  checkBy(by); checkNote(note);   // 旗が無くても確認できる (片付け)
   return db.transaction(() => {
     mustRow(db);
     const x = db.prepare('SELECT * FROM manual_sessions WHERE session_id = ?').get(String(sessionId ?? ''));

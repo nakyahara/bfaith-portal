@@ -631,13 +631,24 @@ await ta('[28] 共通の仕組みに渡す試験だけの値が効く (3b-1): im
   const runId = 'lzim_test_20300116T030000_abcdef';
   const unverified = ({ holder, mode, recMode = 'test', byOverride = null }) => {
     const dd = setupData(), l = fakeLz(), q = portal();
-    const a = S.acquire(q.db, { initId: q.init_id, holder, purpose: 'import', runId, by: 'x' });
-    // 毎晩の回は同じ識別の成果物がポータルにあるときだけ始められる (③c-1b-3b K3-1)
-    const buf = dailyBuf();
-    if (mode === 'nightly') S.putArtifact(q.db, { sourceRunId: RUN_DIR, targetAsOf: AS_OF, verdict: 'pass', csvBuf: buf, sha256: sha(buf), rows: DAILY.length, by: 'lz-daily' });
-    S.transition(q.db, { lockToken: a.lock_token, runId, to: 'importing', detail: { mode, target_as_of: AS_OF, csv_sha256: sha(buf), rows: DAILY.length, source_run_id: RUN_DIR }, by: 'x' });
-    S.transition(q.db, { lockToken: a.lock_token, runId, to: 'imported_unverified', by: 'x' });
-    S.release(q.db, { lockToken: a.lock_token, by: 'x' });
+    // 毎晩の回 = ③c-1b-3b の旗を立てて、同じ識別の成果物がポータルにあるときだけ始められる (K3-1)。旧い手の ③ = 旗が無いとき (今までの動き)
+    const prevFlag = process.env.LZ_MANUAL_V4;
+    if (mode === 'nightly') process.env.LZ_MANUAL_V4 = 'on'; else delete process.env.LZ_MANUAL_V4;
+    try {
+      if (holder === 'manual_daily') S.halt(q.db, { by: 'x', reason: '旧い手の ③ の試験' });
+      const a = S.acquire(q.db, { initId: q.init_id, holder, purpose: 'import', runId, by: 'x' });
+      const buf = dailyBuf();
+      const detail = { mode, target_as_of: AS_OF, csv_sha256: sha(buf), rows: DAILY.length, source_run_id: RUN_DIR };
+      if (mode === 'nightly') {
+        assert.throws(() => S.transition(q.db, { lockToken: a.lock_token, runId, to: 'importing', detail, by: 'x' }), (e) => e.code === 'artifact_missing');   // 成果物が無い = 始めない
+        S.putArtifact(q.db, { sourceRunId: RUN_DIR, targetAsOf: AS_OF, verdict: 'pass', csvBuf: buf, sha256: sha(buf), rows: DAILY.length, by: 'lz-daily' });
+      }
+      S.transition(q.db, { lockToken: a.lock_token, runId, to: 'importing', detail, by: 'x' });
+      S.transition(q.db, { lockToken: a.lock_token, runId, to: 'imported_unverified', by: 'x' });
+      S.release(q.db, { lockToken: a.lock_token, by: 'x' });
+    } finally {
+      if (prevFlag === undefined) delete process.env.LZ_MANUAL_V4; else process.env.LZ_MANUAL_V4 = prevFlag;
+    }
     const rd = path.join(dd, 'lz-import-test', 'lzt_x', 'runs', runId);
     fs.mkdirSync(rd, { recursive: true });
     fs.writeFileSync(path.join(rd, 'import.json'), JSON.stringify({ run_id: runId, mode: recMode, stages: [] }));
@@ -645,8 +656,8 @@ await ta('[28] 共通の仕組みに渡す試験だけの値が効く (3b-1): im
     const c = byOverride ? { ...q.client, status: async (n) => { const x = await q.client.status(n); if (x.run) x.run = { ...x.run, by: byOverride }; return x; } } : q.client;
     return { dd, l, q, c };
   };
-  // (旧い手の ③ の回 (manual_daily) はもう作れない = ③c-1b-3b v4 でやめた)
-  for (const [name, o, re] of [['毎晩の回 (同じ持ち主 auto)', { holder: 'auto', mode: 'nightly' }, /確かめをやり直せる状態でない \(その回の mode = nightly/],
+  // 旧い手の ③ の回 (manual_daily・旗が無いときだけ作れる) も試験の決まりでは確かめない
+  for (const [name, o, re] of [['旧い手の ③ の回', { holder: 'manual_daily', mode: 'manual' }, /確かめをやり直せる状態でない/], ['毎晩の回 (同じ持ち主 auto)', { holder: 'auto', mode: 'nightly' }, /確かめをやり直せる状態でない \(その回の mode = nightly/],
     ['持ち主が違う回', { holder: 'auto', mode: 'test', byOverride: 'manual_daily' }, /確かめをやり直せる状態でない \(今 = /], ['記録の mode が違う', { holder: 'auto', mode: 'test', recMode: 'nightly' }, /記録が違う回/]]) {
     const { dd, l, q, c } = unverified(o);
     await assert.rejects(T.verifyOnly({ lzMinRows: 1, dataDir: dd, runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: c, checkInit: q.checkInit,

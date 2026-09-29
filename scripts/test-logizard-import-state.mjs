@@ -172,11 +172,13 @@ await ta('[6] recover: ポータルに状態が無い = 止めた状態で作る
   let r = S.recover(db, { by: '中原', note: 'ロジザードの履歴を見た', now: T0 });
   let s = S.getStatus(db, { now: T0 });
   assert.deepEqual([r.halted, s.halted, s.state, /recovered/.test(s.halted_reason)], [true, true, 'idle', true]);
+  // 状態を作り直して止めた = halt と同じ知らせを同じ取引で積む (Codex #1537 R2 Medium)
+  assert.deepEqual(S.outboxPending(db).map((o) => [o.kind, /作り直した/.test(o.text)]), [['halt', true]]);
   db = S.openImportStateDb(':memory:');
   const { init_id } = S.init(db, { by: 'x', now: T0 });
   r = S.recover(db, { by: '中原', note: 'miniPC の印が消えた', now: T0 + 1000 });
   assert.notEqual(r.init_id, init_id);
-  assert.equal(S.getStatus(db, { now: T0 }).halted, false);
+  assert.deepEqual([S.getStatus(db, { now: T0 }).halted, S.outboxPending(db).length], [false, 0]);   // 手元の印だけの作り直し = 止めない・知らせない
   throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', by: 'auto', now: T0 }), 'init_mismatch');
   throwsCode(() => S.acquire(db, { initId: null, holder: 'auto', purpose: 'import', runId: 'lzim_a', by: 'auto', now: T0 }), 'init_mismatch');
   S.acquire(db, { initId: r.init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', by: 'auto', now: T0 });
@@ -584,6 +586,7 @@ await ta('[21] 手の取込を終える照合 (K3-3・K3-6): ファイル名・�
     const m = openedSession(db);
     const c = S.completeManualSession(db, { sessionId: m.session_id, resultText: text, history: hist(m), by: '中原', now: T0 + 3 * MIN + 200 });
     assert.deepEqual([c.status, c.mismatches], ['needs_review', mism], name);
+    assert.equal(S.getManualSession(db, { sessionId: m.session_id }).close_detail.result_text, text, name);   // 原文も残す (読めない文も。Codex #1537 R2 Medium)
     throwsCode(() => S.resume(db, { by: '中原', note: '再開したい', now: T0 + 300 }), 'needs_review');
     throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: 'lzd_20300115_a' }, now: T0 + 300 }), 'needs_review');
     assert.ok(S.outboxPending(db).some((o) => o.kind === 'manual_review' && o.text.includes(m.session_id)), name);
@@ -738,6 +741,7 @@ await ta('[25] 知らせの outbox (K3-4): どこから止めても halt と同�
   assert.throws(() => db.prepare("UPDATE outbox SET sent_by = 'x' WHERE id = ?").run(ob[1].id), /1 回だけ/);   // 送れた時刻なしで誰だけ
   assert.throws(() => db.prepare('UPDATE outbox SET sent_at = 5 WHERE id = ?').run(ob[1].id), /1 回だけ/);   // 誰なしで時刻だけ
   assert.throws(() => db.prepare('UPDATE outbox SET sent_at = NULL, sent_by = NULL WHERE id = ?').run(ob[0].id), /1 回だけ/);   // 送れた印を消す
+  assert.throws(() => db.prepare("UPDATE outbox SET id = 999, sent_at = 5, sent_by = 'x' WHERE id = ?").run(ob[1].id), /1 回だけ/);   // 送れた印と一緒に番号を変える (Codex #1537 R2 Medium)
   assert.throws(() => db.prepare('UPDATE outbox SET sent_at = 9 WHERE id = ?').run(ob[0].id), /1 回だけ/);
   assert.throws(() => db.prepare('DELETE FROM outbox').run(), /消さない/);
   throwsCode(() => S.outboxMarkSent(db, { id: 999, by: 'x', now: T0 }), 'not_found');
@@ -768,7 +772,8 @@ await ta('[26] 義務・閉じ・区切りの表は追記だけ・status に手�
   // 開いたまま閉じの記録だけ・閉じの記録なしで閉じる・completed_ok に確認 = 断る
   S.resume(db, { by: '中原', note: '確認したので再開', now: T0 + 400 });
   const m3 = openedSession(db, { now: T0 + MIN });
-  for (const sql of ["UPDATE manual_sessions SET closed_at = 1, closed_by = 'x', close_detail = '{}' WHERE status = 'open'", "UPDATE manual_sessions SET status = 'cancelled' WHERE status = 'open'"]) assert.throws(() => db.prepare(sql).run(), /変えない/, sql);
+  for (const sql of ["UPDATE manual_sessions SET closed_at = 1, closed_by = 'x', close_detail = '{}' WHERE status = 'open'", "UPDATE manual_sessions SET status = 'cancelled' WHERE status = 'open'",
+    "UPDATE manual_sessions SET closed_by = 'tampered' WHERE status = 'open'", "UPDATE manual_sessions SET close_detail = '{}' WHERE status = 'open'", "UPDATE manual_sessions SET closed_at = 1 WHERE status = 'open'"]) assert.throws(() => db.prepare(sql).run(), /変えない/, sql);
   S.completeManualSession(db, { sessionId: m3.session_id, resultText: RESULT_OK(2), history: { fileName: m3.download_name, at: T0 + MIN, account: 'nakahara' }, by: '中原', now: T0 + MIN + 100 });
   assert.throws(() => db.prepare("UPDATE manual_sessions SET ack_at = 1, ack_by = 'x', ack_note = 'yyyy' WHERE session_id = ?").run(m3.session_id), /変えない/);
 });
@@ -791,13 +796,43 @@ await ta('[27] 機能の旗 LZ_MANUAL_V4 が立っていない = 今までの動
     const M = S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'import', runId: 'lzim_m0', by: 'm', now: T0 + 1000 });
     S.transition(db, { lockToken: M.lock_token, runId: 'lzim_m0', to: 'importing', detail: imp('manual'), by: 'm', now: T0 + 1000 });
     assert.equal(S.getStatus(db, { now: T0 + 1000 }).run.by, 'manual_daily');
+    S.transition(db, { lockToken: M.lock_token, runId: 'lzim_m0', to: 'imported_unverified', by: 'm', now: T0 + 1000 });
+    S.release(db, { lockToken: M.lock_token, by: 'm', now: T0 + 1000 });
+    throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'verify', runId: 'lzim_m0', by: 'auto', now: T0 + 1000 }), 'state');   // 取り込んだ側が確かめる (今までどおり)
+    const V = S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'verify', runId: 'lzim_m0', by: 'm', now: T0 + 1000 });
+    S.transition(db, { lockToken: V.lock_token, runId: 'lzim_m0', to: 'verified', by: 'm', now: T0 + 1000 });
+    S.release(db, { lockToken: V.lock_token, by: 'm', now: T0 + 1000 });
+    assert.equal(S.getStatus(db, { now: T0 + 1000 }).state, 'verified');
     // 手の取込・義務の waiver は disabled / 成果物・設定・halt の知らせは使える
     S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: '中原', now: T0 });
     const a = artifact(db, { now: T0 });
     throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: a.source_run_id }, now: T0 + 2000 }), 'disabled');
     throwsCode(() => S.waiveObligations(db, { obligationIds: [1], note: '試験の waiver', by: '中原', now: T0 }), 'disabled');
-    for (const fn of [S.completeManualSession, S.cancelManualSession, S.acknowledgeManualSession]) throwsCode(() => fn(db, { sessionId: 'lzm_x', note: 'ロジザードを見た', by: '中原', now: T0 }), 'disabled');
+    // 終える・取り消す・確認は旗が無くても片付けのために使える (無い手の取込 = not_found)
+    for (const fn of [S.cancelManualSession, S.acknowledgeManualSession]) throwsCode(() => fn(db, { sessionId: 'lzm_x', note: 'ロジザードを見た', by: '中原', now: T0 }), 'not_found');
+    throwsCode(() => S.completeManualSession(db, { sessionId: 'lzm_x', resultText: RESULT_OK(2), history: { fileName: 'x.csv', at: T0, account: 'nakahara' }, by: '中原', now: T0 }), 'not_found');
     assert.deepEqual([S.getStatus(db, { now: T0 + 2000 }).manual.v4, S.outboxPending(db).map((o) => o.kind)], [false, ['halt']]);
+    // 旗 on で手の取込を開いた後に旗を外した = 片付け (取り消し・終える・確認) はできる → 旧い手の ③ を始められる (Codex #1537 R2 Medium)
+    for (const how of ['cancel', 'review']) {
+      const db2 = S.openImportStateDb(':memory:');
+      const { init_id: i2 } = S.init(db2, { by: 'x', now: T0 });
+      process.env.LZ_MANUAL_V4 = 'on';
+      const m = openedSession(db2, { now: T0 });
+      delete process.env.LZ_MANUAL_V4;
+      // 開いたまま = 旧い手の ③ も始めない (鍵は取れても importing で断る)
+      const Lb = S.acquire(db2, { initId: i2, holder: 'manual_daily', purpose: 'import', runId: `lzim_m1${how}`, by: 'm', now: T0 + 100 });
+      throwsCode(() => S.transition(db2, { lockToken: Lb.lock_token, runId: `lzim_m1${how}`, to: 'importing', detail: imp('manual'), by: 'm', now: T0 + 100 }), 'manual_open');
+      S.release(db2, { lockToken: Lb.lock_token, by: 'm', now: T0 + 100 });
+      if (how === 'cancel') S.cancelManualSession(db2, { sessionId: m.session_id, note: 'ロジザードに置かなかった', by: '中原', now: T0 + 200 });
+      else {
+        assert.equal(S.completeManualSession(db2, { sessionId: m.session_id, resultText: '読めない', history: { fileName: m.download_name, at: T0, account: 'nakahara' }, by: '中原', now: T0 + 200 }).status, 'needs_review');
+        throwsCode(() => S.resume(db2, { by: '中原', note: '再開したい', now: T0 + 250 }), 'needs_review');
+        S.acknowledgeManualSession(db2, { sessionId: m.session_id, note: 'ロジザードの履歴を見た', by: '中原', now: T0 + 300 });
+      }
+      const L2 = S.acquire(db2, { initId: i2, holder: 'manual_daily', purpose: 'import', runId: `lzim_m2${how}`, by: 'm', now: T0 + 400 });
+      S.transition(db2, { lockToken: L2.lock_token, runId: `lzim_m2${how}`, to: 'importing', detail: imp('manual'), by: 'm', now: T0 + 400 });
+      assert.equal(S.getStatus(db2, { now: T0 + 400 }).state, 'importing', how);
+    }
   } finally {
     process.env.LZ_MANUAL_V4 = prev;
   }
