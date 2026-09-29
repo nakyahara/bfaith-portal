@@ -8,6 +8,7 @@
  *   4 ポータルの書き込みの 3 つの結末 (K5): 応答が分からない = 状態で照らす・照らせない = 押さない / 結果を書けない = 手元に残して知らせる
  *   5 直後の書き出し (商品・バーコード) と確かめ → verified / verify_failed・partial は差を残して partial のまま・書き出しの失敗 = 未確かめのまま (H)
  *   6 知らせ: 止まった状態を GChat・状態と出来事の番号で知らせ済み (K9)・送り直し
+ *   7 共通の仕組み (lz-import-engine.mjs・③c-1b-3b-1): 閉じた決まり (POLICIES) の外の決まり = 何も触らずに断る・試験の決まりの中身・ランナーは同じ部品を使う
  * 使い方: node scripts/test-lz-import-test.mjs
  */
 import assert from 'node:assert/strict';
@@ -19,6 +20,8 @@ import crypto from 'node:crypto';
 process.env.DAILY_SYNC_RUN_ID = 'ds_test';
 const { default: iconv } = await import('iconv-lite');
 const T = await import('./logizard-import/lz-import-test.mjs');
+const E = await import('./logizard-import/lz-import-engine.mjs');
+const V = await import('../apps/master-decisions/lz-import-verify.mjs');
 const IO = await import('./logizard-import/portal-io.mjs');
 const S = await import('../apps/logizard-import-state/store.js');
 const G = await import('../tools/logizard-automation/import-guard.js');
@@ -549,6 +552,67 @@ await ta('[26] 取込の後に確かめられない形 = 押す前に止める: 
     assert.match(r.record.error, re);
     assert.deepEqual([r.state, S.getStatus(pt.db).state], ['not_started', 'idle']);
   }
+});
+
+await ta('[27] 共通の仕組み (3b-1): POLICIES の外の決まり (試験の決まりの写しでも) = 初期化の照合・鍵・ロジザードに触らずに断る / 決まりは凍結・decided:false を許すのは試験だけ / ランナーは同じ部品', async () => {
+  const dataDir = setupData(); const lz = fakeLz(); const pt = portal();
+  const p = await planned(dataDir, lz);
+  const touched = [], callsAfterPlan = lz.st.calls.length;   // 計画の書き出しの後から数える
+  const spyInit = async (...a) => { touched.push('checkInit'); return pt.checkInit(...a); };
+  const spySession = (fn) => { touched.push('session'); return lz.withSession(fn); };
+  const copy = { ...E.POLICIES.test };
+  const base = { lzMinRows: 1, runsDir: path.join(dataDir, 'engine-runs'), csvBuf: dailyBuf(), csv: { sha256: sha(dailyBuf()), rows: 2, target_as_of: AS_OF, source_run_id: RUN_DIR },
+    occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: pt.client, checkInit: spyInit, withSession: spySession,
+    capabilities: { exportBarcodes: true }, notify: async () => true, createGuard: G.createGuard, log: () => {}, heartbeatMs: 60000 };
+  await assert.rejects(E.importOne({ ...base, policy: copy }), /POLICIES に無い/);
+  await assert.rejects(E.importOne({ ...base, policy: undefined }), /POLICIES に無い/);
+  await assert.rejects(E.verifyAgain({ ...base, policy: copy, runId: 'lzim_test_x', locateRun: () => { touched.push('locate'); return dataDir; } }), /POLICIES に無い/);
+  assert.deepEqual([touched, lz.st.calls.slice(callsAfterPlan), S.getStatus(pt.db).state, fs.existsSync(base.runsDir)], [[], [], 'idle', false]);
+  // 決まりは凍結 (書き換えて使えない)・decided:false の確かめの決まりを許すのは試験だけ
+  assert.ok(Object.isFrozen(E.POLICIES) && Object.values(E.POLICIES).every((x) => Object.isFrozen(x)));
+  for (const x of Object.values(E.POLICIES)) assert.ok(x.allowUndecided ? x.mode === 'test' : V.compileRules(x.rules).decided, x.name);
+  assert.deepEqual([E.POLICIES.test.holder, E.POLICIES.test.mode, E.POLICIES.test.by, E.POLICIES.test.rules, E.POLICIES.test.barcode], ['auto', 'test', 'lz-import-test', V.RULES_2B1, true]);
+  assert.match(T.newRunId(NOW), /^lzim_test_20300116T030000_[0-9a-f]{6}$/);
+  for (const k of ['STOP_STATES', 'inNightBlock', 'nextNightStart', 'writeJsonAtomic', 'saveOnce', 'grabPostExports', 'isInvalidExport']) assert.equal(T[k], E[k], k);
+  // 試験のランナーを通すと試験の決まりで動く (鍵の持ち主 auto・mode test・名乗り)
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+  const st = S.getStatus(pt.db);
+  assert.deepEqual([r.state, st.state, st.run.by, st.run.detail.mode, st.run.detail.plan_id, r.record.mode, r.record.plan_id], ['verified', 'verified', 'auto', 'test', p.planId, 'test', p.planId]);
+  // 確かめは決まりの確かめの決まりで (版を記録に残す)
+  const vj = JSON.parse(fs.readFileSync(path.join(r.runDir, 'verify.json'), 'utf8'));
+  assert.deepEqual([r.record.verify.rules_version, vj.product.rules_version, st.run.detail.verify_detail.rules_version], [V.RULES_2B1.version, V.RULES_2B1.version, V.RULES_2B1.version]);
+});
+
+await ta('[28] 共通の仕組みに渡す試験だけの値が効く (3b-1): importing の応答不明の照らしは計画 ID まで見る / 確かめのやり直しは同じ持ち主の回だけ / 計画の組の商品 (CSV に無い) のバーコードも比べる', async () => {
+  // importing は入ったが応答を失った・読み直した状態の計画 ID が違う = この回と見ない = 押さない
+  let dataDir = setupData(), lz = fakeLz(), pt = portal({ faults: { transition: (b) => (b.to === 'importing' ? 'lost_after' : null) } });
+  let p = await planned(dataDir, lz);
+  const client = { ...pt.client, status: async (n) => { const s = await pt.client.status(n); if (s.state === 'importing' && s.run && s.run.detail) s.run.detail = { ...s.run.detail, plan_id: 'lzt_other' }; return s; } };
+  let r = await T.runTest({ ...runOpts(dataDir, p, pt, { client }), withSession: lz.withSession, notify: async () => true });
+  assert.ok(!lz.st.calls.includes('execute'), '押さない');
+  assert.match(r.record.error, /importing を書けない/);
+  // 手の ③ (manual_daily) の imported_unverified = 試験のランナーは確かめをやり直さない (鍵を取りに行く前に断る)
+  dataDir = setupData(); lz = fakeLz(); pt = portal();
+  const runId = 'lzim_test_20300116T030000_abcdef';
+  S.halt(pt.db, { by: 'x', reason: '手の ③ の試験' });
+  const a = S.acquire(pt.db, { initId: pt.init_id, holder: 'manual_daily', purpose: 'import', runId, by: 'x' });
+  S.transition(pt.db, { lockToken: a.lock_token, runId, to: 'importing', detail: { mode: 'manual', target_as_of: AS_OF, csv_sha256: 'a'.repeat(64), rows: 1 }, by: 'x' });
+  S.transition(pt.db, { lockToken: a.lock_token, runId, to: 'imported_unverified', by: 'x' });
+  S.release(pt.db, { lockToken: a.lock_token, by: 'x' });
+  const rd = path.join(dataDir, 'lz-import-test', 'lzt_x', 'runs', runId);
+  fs.mkdirSync(rd, { recursive: true });
+  fs.writeFileSync(path.join(rd, 'import.json'), JSON.stringify({ stages: [] }));
+  await assert.rejects(T.verifyOnly({ lzMinRows: 1, dataDir, runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: pt.client, checkInit: pt.checkInit,
+    withSession: lz.withSession, capabilities: { exportBarcodes: true }, notify: async () => true, log: () => {} }), /確かめをやり直せる状態でない/);
+  assert.deepEqual([S.getStatus(pt.db).state, lz.st.calls], ['imported_unverified', []]);
+  // 計画の組: N-1 (無い商品・A-1 の写し) を取り込む = CSV に A-1 は無いが、組の A-1 のバーコードが変わった = 差として残す
+  dataDir = setupData(); lz = fakeLz({ over: { errorRow: 'N-1', touchBarcode: true } }); pt = portal();
+  const mp = await T.planTest({ lzMinRows: 1, dataDir, now: NOW, tests: { normal: ['B-2'], missing: [{ id: 'N-1', copy_from: 'A-1' }] }, mapping: { version: 'm1', furiganaCol: '検索名称', costRule: 'same' },
+    occupancy: '倉庫は使っていない (中原さん確認)', withSession: lz.withSession, log: () => {} });
+  r = await T.runTest({ ...runOpts(dataDir, mp, pt), withSession: lz.withSession, notify: async () => true });
+  const vj = JSON.parse(fs.readFileSync(path.join(r.runDir, 'verify.json'), 'utf8'));
+  assert.ok(vj.barcode.diffs.some((d) => d.id === 'A-1'), JSON.stringify(vj.barcode.diffs));
+  assert.equal(S.getStatus(pt.db).state, 'partial');
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

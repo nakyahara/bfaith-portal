@@ -20,41 +20,20 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { readLzShohinMaster } from '../../apps/master-decisions/lz-cdb.mjs';
 import { pickTarget, jstDateOf } from '../../apps/master-decisions/lz-import-plan.mjs';
-import { validateImportCsv, parseImportResult, judgeImportResult } from '../../apps/master-decisions/lz-import-check.mjs';
-import { verifyImport, readBarcodeExport, compareBarcodes, barcodeMissing, RULES_2B1 } from '../../apps/master-decisions/lz-import-verify.mjs';
+import { validateImportCsv } from '../../apps/master-decisions/lz-import-check.mjs';
 import { buildTestPlan, planSha256, checkPlanAgainstPre, checkTestCsv } from '../../apps/master-decisions/lz-import-test-plan.mjs';
-import { portalWrite, startHeartbeat } from './portal-io.mjs';
+import { portalWrite } from './portal-io.mjs';
+import { POLICIES, STOP_STATES, inNightBlock, nextNightStart, writeJsonAtomic, saveOnce, checkOccupancy, grabPostExports, isInvalidExport, newRunId as engineRunId, importOne, verifyAgain } from './lz-import-engine.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import dotenv from 'dotenv';
 
+// 鍵・押す・確かめ・知らせは共通の仕組み (lz-import-engine.mjs・③c-1b-3b-1)。ここは試験だけの部分 (計画・承認の印・計画の照らし直し)
+export { STOP_STATES, inNightBlock, nextNightStart, writeJsonAtomic, saveOnce, grabPostExports, isInvalidExport };
 export const EXIT = Object.freeze({ ok: 0, error: 1, stopped: 3 });
-export const STOP_STATES = Object.freeze(['unknown', 'partial', 'verify_failed', 'imported_unverified']);
-const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const rand = () => crypto.randomBytes(3).toString('hex');
 const stamp = (d) => d.toISOString().replace(/[-:.]/g, '').slice(0, 15);
 export const newPlanId = (now = new Date()) => `lzt_${stamp(now)}_${rand()}`;
-export const newRunId = (now = new Date()) => `lzim_test_${stamp(now)}_${rand()}`;
-
-/** JST 00:00〜01:30 = 毎晩の取込の時間 = 試験は動かない */
-export function inNightBlock(now = new Date()) {
-  const d = new Date(now.getTime() + 9 * 3600 * 1000);
-  const m = d.getUTCHours() * 60 + d.getUTCMinutes();
-  return m < 90;
-}
-
-/** 一時ファイル → rename (書けない = 例外 = 進まない) */
-export function writeJsonAtomic(file, obj) {
-  const tmp = `${file}.${process.pid}.${rand()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 1), { flag: 'wx' });
-  fs.renameSync(tmp, file);
-}
-/** 1 回だけ書く (もうある = 例外) */
-export const saveOnce = (file, buf) => fs.writeFileSync(file, buf, { flag: 'wx' });
-
-function checkOccupancy(occupancy) {
-  if (!occupancy || String(occupancy).trim().length < 8) throw new Error('--occupancy に、共通アカウントを使う人・作業が止まっていることを確かめた内容を書く (L-16・8 文字以上)');
-  return String(occupancy).trim().slice(0, 300);
-}
+export const newRunId = (now = new Date()) => engineRunId(now, POLICIES.test);
 
 /**
  * 計画を作る (ロジザードには書き出しのログインだけ)
@@ -119,190 +98,19 @@ export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: appro
   const testCsv = fs.readFileSync(path.join(dir, 'test.csv'));
   const tc = checkTestCsv(body, testCsv);
   if (!tc.ok) throw new Error(`取り込む CSV が承認した CSV と違う (${tc.reason})`);
-  if (!capabilities || !capabilities.exportBarcodes) throw new Error('バーコードの書き出しの部品が無い = 試験はしない (K4)');
-  const init = await checkInit(client, localInitFile);
-  if (!init.ok) throw new Error(`ポータルの初期化の照合が合わない (${init.reason})`);
-
-  // この回の時計 (試験では now を差し替える) と、ポータルの期限をこの回の時計に写す
-  const t0 = Date.now();
-  const clock = () => now.getTime() + (Date.now() - t0);
-  const toClock = (serverMs) => clock() + (serverMs - Date.now());
-  // 夜の止め: 次の 00:00 (JST) の nightMarginMs 前より後は押さない = 旗の締め切りの上限 (始めた後に 00:00 を迎えても押さない。Codex #1524 R1 High)
-  const nightCap = nextNightStart(now) - nightMarginMs;
-
-  const prevState = init.status.state;
-  const runId = newRunId(now);
-  const runDir = path.join(dir, 'runs', runId);
-  fs.mkdirSync(runDir, { recursive: true });
-  const rec = { run_id: runId, plan_id: planId, plan_sha256: approved, mode: 'test', started_at: now.toISOString(), occupancy: occ, stages: [], record_errors: [] };
-  // 記録: 押す前 (required) は書けない = 止める (D)・押した後は書けなくても状態の書き込みと知らせは続ける (Codex #1524 R1 Medium)
-  const stage = (name, extra = {}, { required = false } = {}) => {
-    rec.stages.push({ name, at: new Date().toISOString(), ...extra });
-    rec.stage = name;
-    try { writeJson(path.join(runDir, 'import.json'), rec); return true; } catch (e) {
-      rec.record_errors.push({ name, error: String(e && e.message).slice(0, 200) });
-      if (required) throw new Error(`記録を書けない (${name}) = 押さない: ${String(e && e.message).slice(0, 120)}`);
-      return false;
-    }
-  };
-  stage('begin', {}, { required: true });
-
-  // 鍵 (auto・import)。応答が分からない = token が分からない = 止める (K5)
-  const acq = await portalWrite(() => client.acquire({ init_id: init.status.init_id, holder: 'auto', purpose: 'import', run_id: runId, ttl_sec: 180, by: 'lz-import-test' }),
-    { expect: (x) => typeof x.lock_token === 'string' && Number.isFinite(x.expires_at) });
-  if (acq.outcome !== 'ok' || acq.confirmed) { stage('lock_not_acquired', { outcome: acq.outcome, code: acq.code || null }); throw new Error(`鍵を取れない (${acq.outcome}${acq.code ? `・${acq.code}` : ''})`); }
-  const lockToken = acq.res.lock_token;
-  const deadlineOf = (expiresAt) => Math.min(toClock(expiresAt) - 20000, nightCap);
-  const guard = createGuard({ now: clock, deadlineMs: deadlineOf(acq.res.expires_at) });
-  const hb = startHeartbeat({ client, lockToken, guard, everyMs: heartbeatMs, mapDeadline: deadlineOf, onEvent: (e) => { rec.heartbeat = e; } });
-  let state = null, executeIssued = false;
-  const notWritten = [];
-  // 状態を進める (K5): 成功 = 行き先の状態の応答・応答不明 = 状態を読み直して、この回の実行 ID・行き先・中身 (sha256・行数など) で照らす
-  const move = async (to, detail = null) => {
-    const r = await portalWrite(() => client.transition({ lock_token: lockToken, run_id: runId, to, detail, by: 'lz-import-test' }), {
-      // failed_before_execute = importing の前の状態に戻る (違う応答 = 状態を読み直して照らす)
-      expect: (x) => x.state === (to === 'failed_before_execute' ? prevState : to),
-      confirm: async () => {
-        const s = await client.status(1);
-        if (!s.run || s.run.run_id !== runId) return false;
-        const d = s.run.detail || {};
-        if (to === 'importing') return s.state === 'importing' && d.csv_sha256 === detail.csv_sha256 && d.rows === detail.rows && d.mode === 'test' && d.plan_id === planId;
-        if (to === 'failed_before_execute') return s.state !== 'importing' && d.result === 'failed_before_execute';
-        if (to === 'verified' || to === 'verify_failed') return s.state === to && d.verify === to;
-        return s.state === to && d.result === to;
-      },
-    });
-    stage(`state_${to}`, { outcome: r.outcome, confirmed: !!r.confirmed, code: r.code || null });
-    if (r.outcome === 'ok') state = to === 'failed_before_execute' ? 'reverted' : to;
-    else if (to !== 'importing') { notWritten.push(to); stage('result_not_written', { to, outcome: r.outcome }); }   // importing を書けない = 押さない (下)
-    return r;
-  };
-  try {
-    await withSession(async (ops) => {
-      // ── 直前の書き出し (商品・バーコード) と照らし直し (K2・K4) ──
-      const pre = await ops.exportShohin();
-      saveOnce(path.join(runDir, 'pre.csv'), pre.buf);
-      const lz = readLzShohinMaster(pre.buf, { minRows: lzMinRows });
-      if (!lz.ok) throw new Error(`直前の一覧が読めない (${lz.reason})`);
-      const preBc = await ops.exportBarcodes();
-      saveOnce(path.join(runDir, 'pre-barcode.csv'), preBc.buf);
-      const bcPre = readBarcodeExport(preBc.buf);
-      if (!bcPre.ok) throw new Error(`直前のバーコードが読めない (${bcPre.reason}) = 押さない (K4)`);
-      const bcMiss = barcodeMissing(lz, bcPre);   // 直前の商品マスタの全商品が直前のバーコードにある = 途中で切れていない (Codex #1530 R2 High)
-      if (bcMiss.length) throw new Error(`直前のバーコードの書き出しに無い商品がある = 途中で切れた疑い = 押さない (K4): ${bcMiss.length} 件 (${bcMiss.slice(0, 5).join(', ')})`);
-      // 取込の後に確かめられる形か (押す前に見る。Codex #1530 R4 Medium): 商品ごとの行がひとまとまり・比べる商品が最後の商品でない
-      const checkIds = new Set([...validateImportCsv(testCsv).table.map((r) => r[0]), ...body.groups.flatMap((g) => g.ids)]);
-      if (bcPre.grouped === false) throw new Error('直前のバーコードの書き出しで商品ごとの行がひとまとまりでない = 取込の後に確かめられない = 押さない (K4)');
-      if (checkIds.has(bcPre.lastId)) throw new Error(`比べる商品 ${bcPre.lastId} がバーコードの書き出しの最後の商品 = 取込の後に確かめられない = 押さない (K4・この商品を試験から外す)`);
+  // ここから先 (バーコードの部品・初期化の照合・鍵・押す・確かめ・知らせ) は共通の仕組み (3b-1)
+  return importOne({
+    policy: POLICIES.test, lzMinRows, runsDir: path.join(dir, 'runs'), csvBuf: testCsv,
+    csv: { sha256: body.test_csv.sha256, rows: body.test_csv.rows, target_as_of: body.source.as_of, source_run_id: body.source.run_id },
+    tag: { plan_id: planId }, recExtra: { plan_id: planId, plan_sha256: approved }, extraIds: body.groups.flatMap((g) => g.ids),
+    // 承認のときから一覧が変わった = 取り込まない (K2)
+    preCheck: (lz) => {
       const again = checkPlanAgainstPre(body, lz);
-      if (!again.ok) { stage('plan_changed', { diffs: again.diffs.slice(0, 50) }); throw new Error(`承認のときから一覧が変わった = 取り込まない (計画を作り直す): ${again.diffs.slice(0, 5).map((d) => `${d.kind}:${d.id}`).join(', ')}`); }
-      // ── 押す前にそろえる記録 (D) ──
-      const importCsv = path.join(runDir, 'import.csv');
-      saveOnce(importCsv, testCsv);
-      if (sha256(fs.readFileSync(importCsv)) !== body.test_csv.sha256) throw new Error('import.csv を書いたが sha256 が違う');
-      rec.files = { pre: sha256(pre.buf), pre_barcode: sha256(preBc.buf), import_csv: body.test_csv.sha256 };
-      stage('prepared', {}, { required: true });
-      await ops.previewImport(importCsv, { captureDir: runDir });
-      stage('previewed', {}, { required: true });
-      guard.check('importing の前');
-      // ── importing (書けない = 押さない) ──
-      const imp = await move('importing', { csv_sha256: body.test_csv.sha256, rows: body.test_csv.rows, mode: 'test', target_as_of: body.source.as_of, source_run_id: body.source.run_id, plan_id: planId });
-      if (imp.outcome !== 'ok') throw new Error(`importing を書けない (${imp.outcome}) = 押さない`);
-      // ── 押す (K7: 押す直前に記録。記録を書けない = 押さない) ──
-      let exec;
-      try {
-        exec = await ops.executeImport({ guard, onExecuteIssued: () => { stage('execute_issued', {}, { required: true }); executeIssued = true; }, captureDir: runDir, log });
-      } catch (e) {
-        if (e && e.executeIssued) { stage('execute_error', { error: String(e.message).slice(0, 300), after_stop: e.afterStop || null }); await move('unknown', { reason: 'execute_error', error: String(e.message).slice(0, 200) }); return; }
-        stage('execute_not_issued', { error: String(e && e.message).slice(0, 300) });
-        await move('failed_before_execute', { reason: String(e && e.message).slice(0, 200) });
-        return;
-      }
-      // after_stop = 止めた後に押された (ページに送った後の押す処理は取り消せない。#1521)
-      rec.execute = { confirm: exec.confirm, reason: exec.reason, after_stop: exec.afterStop || null, result_text: exec.resultText ? exec.resultText.slice(0, 2000) : null };
-      const parsed = exec.reason ? { found: false, reason: exec.reason } : parseImportResult(exec.resultText);
-      const judged = judgeImportResult(parsed, body.test_csv.rows);
-      rec.result = { parsed, judged };
-      const w = await move(judged.to, { why: judged.why, total: parsed.total ?? null, processed: parsed.processed ?? null, noop: parsed.noop ?? null, errors: parsed.errors ?? null });
-      if (w.outcome !== 'ok') return;   // 手元に残した・知らせる (下)
-      if (judged.to === 'unknown') return;
-      // ── 直後の書き出しと確かめ (K4: 商品 + バーコードの両方を比べてから verified) ──
-      const g = await grabPostExports(ops, { save, files: { shohin: path.join(runDir, 'post.csv'), barcode: path.join(runDir, 'post-barcode.csv') } });
-      for (const x of g.saveErrors) rec.record_errors.push({ name: x.file, error: x.error });
-      // 中身が壊れていた (invalid_csv) = 読めない = 確かめの失敗 / 一時の失敗 (通信・ログイン・時間切れ) だけ = 未確かめのまま (verify でやり直す。取れた側は保存した。Codex #1524 R2・R3)
-      if (g.invalid) stage('post_export_invalid', g.invalid);
-      const bad = (which) => (g.invalid && g.invalid.which === which ? `書き出しの中身が壊れている (${g.invalid.reason})` : `書き出せなかった (${g.transient ? g.transient.error : '-'})`);
-      const table = validateImportCsv(testCsv).table;
-      const ids = new Set([...table.map((r) => r[0]), ...body.groups.flatMap((g) => g.ids)]);
-      // 取れた側 (と中身の壊れ) は比べる。一時の失敗で取れなかった側 = null (Codex #1524 R4)
-      const lzPost = g.post ? readLzShohinMaster(g.post.buf, { minRows: lzMinRows }) : null;
-      const bcPost = g.postBc ? readBarcodeExport(g.postBc.buf) : null;
-      const vr0 = lzPost ? (lzPost.ok ? verifyImport({ table, pre: lz, post: lzPost, rules: RULES_2B1 }) : { ok: false, diffs: [{ kind: 'post_unreadable', reason: lzPost.reason }] })
-        : (g.invalid && g.invalid.which === 'shohin' ? { ok: false, diffs: [{ kind: 'post_unreadable', reason: bad('shohin') }] } : null);
-      const br0 = bcPost ? (bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids, cover: { pre: lz, post: lzPost && lzPost.ok ? lzPost : null } }) : { ok: false, diffs: [{ kind: 'post_barcode_unreadable', reason: bcPost.reason }] })
-        : (g.invalid && g.invalid.which === 'barcode' ? { ok: false, diffs: [{ kind: 'post_barcode_unreadable', reason: bad('barcode') }] } : null);
-      // 片方が一時の失敗で取れず、取れた側に差も壊れも無い = 確かめきれない = 未確かめのまま (verify でやり直す) / 取れた側に差・壊れ = verify_failed
-      if ((!vr0 || !br0) && !((vr0 && !vr0.ok) || (br0 && !br0.ok))) { stage('post_export_failed', g.transient || {}); return; }
-      const vr = vr0 || { ok: false, diffs: [{ kind: 'post_not_exported', reason: bad('shohin') }] };
-      const br = br0 || { ok: false, diffs: [{ kind: 'post_barcode_not_exported', reason: bad('barcode') }] };
-      try { writeJson(path.join(runDir, 'verify.json'), { product: vr, barcode: br }); } catch (e) { rec.record_errors.push({ name: 'verify.json', error: String(e && e.message).slice(0, 200) }); }
-      rec.verify = { ok: vr.ok && br.ok, decided: vr.decided, rules_version: vr.rules_version, product_diffs: vr.diffs.length, barcode_diffs: br.diffs.length };
-      stage('verified_checked');
-      if (judged.to === 'imported_unverified') await move(vr.ok && br.ok ? 'verified' : 'verify_failed', rec.verify);
-      // partial = 状態は partial のまま (差は verify.json = 解除の材料。H)
-    });
-  } catch (e) {
-    rec.error = String(e && e.message).slice(0, 300);
-    stage('error', { error: rec.error, execute_issued: executeIssued });
-    // importing を書いた後で押す前の失敗 = failed_before_execute / 押した後 = unknown
-    if (state === 'importing') await move(executeIssued ? 'unknown' : 'failed_before_execute', { reason: rec.error.slice(0, 200) }).catch(() => { notWritten.push('after_error'); });
-  } finally {
-    hb.stop();
-    const rel = await portalWrite(() => client.release({ lock_token: lockToken, by: 'lz-import-test' })).catch(() => ({ outcome: 'unknown' }));
-    stage('released', { outcome: rel.outcome });
-  }
-  // ── 知らせ (K9) = 止まった状態・ポータルに書けなかった・押した後の記録を書けなかった ──
-  const final = await client.status(1).catch(() => null);
-  const stoppedState = final && STOP_STATES.includes(final.state) && final.run && final.run.run_id === runId ? final.state : (state && STOP_STATES.includes(state) ? state : null);
-  const stuck = final && final.state === 'importing' && final.run && final.run.run_id === runId;
-  if (stoppedState || notWritten.length || stuck || (executeIssued && rec.record_errors.length)) {
-    const why = [stoppedState ? `状態 ${stoppedState}` : null, notWritten.length ? `ポータルに書けない (${notWritten.join('・')})` : null, stuck ? 'ポータルは importing のまま' : null,
-      rec.record_errors.length ? `記録を書けない (${rec.record_errors.map((x) => x.name).join('・')})` : null].filter(Boolean).join('・');
-    const text = `⚠️ ロジザードの取込の試験 ${runId} が止まった: ${why}・計画 ${planId}。記録 = ${runDir}\n解除は人 (ロジザードのインポート履歴を確かめてから import-state-cli.js resolve / mark-unknown)`;
-    const sent = await notify(text).catch(() => false);
-    rec.notified = sent;
-    if (sent && final && final.state_event_id != null && STOP_STATES.includes(final.state)) await portalWrite(() => client.notified({ run_id: runId, state: final.state, state_event_id: final.state_event_id, by: 'lz-import-test' })).catch(() => {});
-    stage('notified', { sent });
-  }
-  // 返す状態 = この回が書けた結末だけ (前の回の verified・押す前の失敗で戻った前の状態を、この回の成功と返さない。Codex #1524 R2)
-  const result = state === 'reverted' ? 'failed_before_execute' : (state || 'not_started');
-  return { runId, runDir, state: result, portalState: final ? final.state : null, record: rec };
-}
-
-/**
- * 直後の書き出し (商品・バーコード) を 1 つずつ取る。片方が失敗してももう片方は取る (partial の戻しの証跡・K4)。取れたものはすぐ保存 (保存の失敗は saveErrors に残して続ける)。
- * invalid = 中身が壊れていた (最初の 1 つ) / transient = 一時の失敗 (最初の 1 つ)。(Codex #1524 R3)
- */
-export async function grabPostExports(ops, { save, files }) {
-  const g = { post: null, postBc: null, invalid: null, transient: null, saveErrors: [] };
-  for (const [key, which, fn, file] of [['post', 'shohin', ops.exportShohin, files.shohin], ['postBc', 'barcode', ops.exportBarcodes, files.barcode]]) {
-    try { g[key] = await fn(); } catch (e) {
-      if (isInvalidExport(e)) { if (!g.invalid) g.invalid = { which, reason: String(e.reason || e.message).slice(0, 200) }; }
-      else if (!g.transient) g.transient = { which, error: String(e && e.message).slice(0, 300) };
-      continue;
-    }
-    try { save(file, g[key].buf); } catch (e) { g.saveErrors.push({ file: path.basename(file), error: String(e && e.message).slice(0, 200) }); }
-  }
-  return g;
-}
-
-/** 書き出した CSV の中身が壊れていた (shohin-export.js の invalidCsvError・barcode-export.js も同じ印) = 一時の失敗ではない */
-export const isInvalidExport = (e) => !!e && e.code === 'invalid_csv';
-
-/** 次の 00:00 (JST) の時刻 (ms) */
-export function nextNightStart(now = new Date()) {
-  const j = new Date(now.getTime() + 9 * 3600 * 1000);
-  return Date.UTC(j.getUTCFullYear(), j.getUTCMonth(), j.getUTCDate() + 1) - 9 * 3600 * 1000;
+      return again.ok ? null : { stage: ['plan_changed', { diffs: again.diffs.slice(0, 50) }], error: `承認のときから一覧が変わった = 取り込まない (計画を作り直す): ${again.diffs.slice(0, 5).map((d) => `${d.kind}:${d.id}`).join(', ')}` };
+    },
+    notifyTail: `・計画 ${planId}`,
+    occupancy: occ, now, localInitFile, client, checkInit, withSession, capabilities, notify, createGuard, log, heartbeatMs, writeJson, nightMarginMs, save,
+  });
 }
 
 /**
@@ -359,96 +167,12 @@ export function findRunDir(dataDir, runId) {
  * 確かめのやり直し (imported_unverified の回だけ・昼・L-16 の後。K10・H)。取り込んだ CSV と直前の書き出しはその回の記録から (sha256 を照らす)
  */
 export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, log = console.log, writeJson = writeJsonAtomic, save = saveOnce }) {
-  if (inNightBlock(now)) throw new Error('00:00〜01:30 は動かない (毎晩の取込の時間)');
-  const occ = checkOccupancy(occupancy);
-  if (!capabilities || !capabilities.exportBarcodes) throw new Error('バーコードの書き出しの部品が無い = 確かめはしない (K4)');
-  const runDir = findRunDir(dataDir, runId);
-  const rec = JSON.parse(fs.readFileSync(path.join(runDir, 'import.json'), 'utf8'));
-  // 記録: 始めの 1 つは書けない = 止める・後は書けなくても状態の書き込みと知らせは続ける (Codex #1524 R1 Medium)
-  const stageErrors = new Set();   // 書けなかった import.json (知らせに足す。Codex #1524 R4)
-  const stage = (name, extra = {}, { required = false } = {}) => {
-    rec.stages.push({ name, at: new Date().toISOString(), ...extra }); rec.stage = name;
-    try { writeJson(path.join(runDir, 'import.json'), rec); } catch (e) { if (required) throw e; stageErrors.add(`import.json: ${String(e && e.message).slice(0, 200)}`); }
-  };
-  const init = await checkInit(client, localInitFile);
-  if (!init.ok) throw new Error(`ポータルの初期化の照合が合わない (${init.reason})`);
-  const st = init.status;
-  if (st.state !== 'imported_unverified' || !st.run || st.run.run_id !== runId || st.run.by !== 'auto') throw new Error(`確かめをやり直せる状態でない (今 = ${st.state}・${st.run ? st.run.run_id : '-'})`);
-  const acq = await portalWrite(() => client.acquire({ init_id: st.init_id, holder: 'auto', purpose: 'verify', run_id: runId, ttl_sec: 300, by: 'lz-import-test' }),
-    { expect: (x) => typeof x.lock_token === 'string' });
-  if (acq.outcome !== 'ok' || acq.confirmed) throw new Error(`確かめの鍵を取れない (${acq.outcome}${acq.code ? `・${acq.code}` : ''})`);
-  const lockToken = acq.res.lock_token;
-  const move = async (to, detail) => {
-    const r = await portalWrite(() => client.transition({ lock_token: lockToken, run_id: runId, to, detail, by: 'lz-import-test' }),
-      { expect: (x) => x.state === to, confirm: async () => { const s2 = await client.status(1); return !!(s2.run && s2.run.run_id === runId && s2.state === to && s2.run.detail && s2.run.detail.verify === to); } });
-    stage(`verify_only_${to}`, { outcome: r.outcome, confirmed: !!r.confirmed });
-    return { ...r, to };
-  };
-  let result = null, recordError = null, failure = null;
-  try {
-    stage('verify_only_begin', { occupancy: occ }, { required: true });
-    // 記録を照らす (壊れた・sha256 が違う = 比べられない = verify_failed。H)
-    const read = (f) => { try { return fs.readFileSync(path.join(runDir, f)); } catch { return null; } };
-    const importCsv = read('import.csv'), preBuf = read('pre.csv'), preBcBuf = read('pre-barcode.csv');
-    const broken = [];
-    if (!importCsv || sha256(importCsv) !== (rec.files && rec.files.import_csv)) broken.push('import.csv');
-    if (!preBuf || sha256(preBuf) !== (rec.files && rec.files.pre)) broken.push('pre.csv');
-    if (!preBcBuf || sha256(preBcBuf) !== (rec.files && rec.files.pre_barcode)) broken.push('pre-barcode.csv');
-    if (broken.length) {
-      result = await move('verify_failed', { reason: 'evidence_broken', files: broken });
-      return result.outcome === 'ok' ? { runId, state: 'verify_failed', reason: 'evidence_broken' } : { runId, state: 'imported_unverified', reason: 'result_not_written', compared: 'evidence_broken' };
-    }
-    const table = validateImportCsv(importCsv).table;
-    const lz = readLzShohinMaster(preBuf, { minRows: lzMinRows }), bcPre = readBarcodeExport(preBcBuf);
-    const plan = JSON.parse(fs.readFileSync(path.join(runDir, '..', '..', 'plan.json'), 'utf8'));
-    const ids = new Set([...table.map((r) => r[0]), ...plan.groups.flatMap((g) => g.ids)]);
-    const tag = `${new Date().toISOString().replace(/[-:.]/g, '').slice(0, 18)}_${crypto.randomBytes(3).toString('hex')}`;   // 続けてやり直しても名前がぶつからない
-    // 1 つずつ取る・取れたものはすぐ保存 (保存の失敗は知らせて続ける = 壊れの判定まで進む。Codex #1524 R3)
-    const got = await withSession((ops) => grabPostExports(ops, { save, files: { shohin: path.join(runDir, `post-${tag}.csv`), barcode: path.join(runDir, `post-barcode-${tag}.csv`) } }))
-      .catch((e) => { stage('verify_only_export_failed', { error: String(e && e.message).slice(0, 300) }); return null; });
-    if (got && got.saveErrors.length) { recordError = got.saveErrors.map((x) => `${x.file}: ${x.error}`).join('・'); stage('verify_only_record_failed', { error: recordError }); }
-    if (got && got.invalid) stage('verify_only_export_invalid', got.invalid);
-    if (!got) return { runId, state: 'imported_unverified', reason: 'post_export_failed' };   // 一時の失敗 (ログイン・通信) = 未確かめのまま
-    const bad = (which) => (got.invalid && got.invalid.which === which ? `書き出しの中身が壊れている (${got.invalid.reason})` : `書き出せなかった (${got.transient ? got.transient.error : '-'})`);
-    // 取れた側 (と中身の壊れ) は比べる。一時の失敗で取れなかった側 = null (Codex #1524 R4)
-    const lzPost = got.post ? readLzShohinMaster(got.post.buf, { minRows: lzMinRows }) : null;
-    const bcPost = got.postBc ? readBarcodeExport(got.postBc.buf) : null;
-    const vr0 = lzPost ? (lz.ok && lzPost.ok ? verifyImport({ table, pre: lz, post: lzPost, rules: RULES_2B1 }) : { ok: false, diffs: [{ kind: 'unreadable', reason: lz.ok ? lzPost.reason : lz.reason }], decided: false, rules_version: RULES_2B1.version })
-      : (got.invalid && got.invalid.which === 'shohin' ? { ok: false, diffs: [{ kind: 'unreadable', reason: bad('shohin') }], decided: false, rules_version: RULES_2B1.version } : null);
-    const br0 = bcPost ? (bcPre.ok && bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids, cover: { pre: lz.ok ? lz : null, post: lzPost && lzPost.ok ? lzPost : null } }) : { ok: false, diffs: [{ kind: 'barcode_unreadable', reason: bcPre.ok ? bcPost.reason : bcPre.reason }] })
-      : (got.invalid && got.invalid.which === 'barcode' ? { ok: false, diffs: [{ kind: 'barcode_unreadable', reason: bad('barcode') }] } : null);
-    if ((!vr0 || !br0) && !((vr0 && !vr0.ok) || (br0 && !br0.ok))) {   // 片方が一時の失敗で取れず、取れた側に差も壊れも無い = 未確かめのまま
-      stage('verify_only_export_failed', got.transient || {});
-      return { runId, state: 'imported_unverified', reason: 'post_export_failed' };
-    }
-    const vr = vr0 || { ok: false, diffs: [{ kind: 'not_exported', reason: bad('shohin') }], decided: false, rules_version: RULES_2B1.version };
-    const br = br0 || { ok: false, diffs: [{ kind: 'barcode_not_exported', reason: bad('barcode') }] };
-    // 記録を書けなくても、比べた結果の状態の書き込みと知らせは続ける (Codex #1524 R2)
-    try { writeJson(path.join(runDir, `verify-${tag}.json`), { product: vr, barcode: br, note: '取り込んだ後に時間が経っている = 人の直しと区別がつかない (差があれば人が見る)' }); }
-    catch (e) { recordError = [recordError, `verify-${tag}.json: ${String(e && e.message).slice(0, 200)}`].filter(Boolean).join('・'); stage('verify_only_record_failed', { error: recordError }); }
-    const ok = vr.ok && br.ok;
-    result = await move(ok ? 'verified' : 'verify_failed', { product_diffs: vr.diffs.length, barcode_diffs: br.diffs.length, decided: vr.decided, rules_version: vr.rules_version, late: true });
-    // 結果をポータルに書けたかで返す (書けない = 未確かめのまま + 知らせ。比べた結果は手元の verify-*.json。Codex #1524 R1 High)
-    if (result.outcome !== 'ok') return { runId, state: 'imported_unverified', reason: 'result_not_written', compared: ok ? 'verified' : 'verify_failed' };
-    return { runId, state: ok ? 'verified' : 'verify_failed' };
-  } catch (e) {
-    failure = e;
-    throw e;
-  } finally {
-    await portalWrite(() => client.release({ lock_token: lockToken, by: 'lz-import-test' })).catch(() => {});
-    const recErr = [recordError, ...stageErrors].filter(Boolean).join('・');
-    const notes = [recErr ? `確かめの記録を書けない (${recErr})` : null, failure ? `途中で失敗: ${String(failure && failure.message).slice(0, 200)}` : null].filter(Boolean);
-    const tail = notes.length ? `・${notes.join('・')}` : '';
-    if (result && result.outcome === 'ok' && result.to === 'verify_failed') {
-      const sent = await notify(`⚠️ ロジザードの取込の試験 ${runId} の確かめのやり直しが verify_failed${tail}。記録 = ${runDir}`).catch(() => false);
-      const eventId = result.res && result.res.state_event_id != null ? result.res.state_event_id : await client.status(1).then((x) => (x.state === 'verify_failed' && x.run && x.run.run_id === runId ? x.state_event_id : null)).catch(() => null);
-      if (sent && eventId != null) await portalWrite(() => client.notified({ run_id: runId, state: 'verify_failed', state_event_id: eventId, by: 'lz-import-test' })).catch(() => {});
-    } else if (result && result.outcome !== 'ok') {
-      await notify(`⚠️ ロジザードの取込の試験 ${runId} の確かめのやり直しの結果をポータルに書けない (未確かめのまま)${tail}。記録 = ${runDir}`).catch(() => false);
-    } else if (notes.length) {
-      await notify(`⚠️ ロジザードの取込の試験 ${runId} の確かめのやり直し${tail}。記録 = ${runDir}`).catch(() => false);
-    }
-  }
+  return verifyAgain({
+    policy: POLICIES.test, lzMinRows, runId, locateRun: () => findRunDir(dataDir, runId),
+    // 試験の組の商品も比べる (計画 = <計画 ID>/plan.json)
+    readExtraIds: (runDir) => JSON.parse(fs.readFileSync(path.join(runDir, '..', '..', 'plan.json'), 'utf8')).groups.flatMap((g) => g.ids),
+    occupancy, now, localInitFile, client, checkInit, withSession, capabilities, notify, log, writeJson, save,
+  });
 }
 
 /** 止まった状態の知らせがまだなら送る (送れなかった回の送り直し。K9・I) */
