@@ -616,5 +616,59 @@ await ta('[21] package.json の test:company-db (いつもの試験の組) に�
   assert.ok(pkg.scripts['test:company-db'].split('&&').map((x) => x.trim()).includes('node scripts/test-lz-nightly.mjs'));
 });
 
+await ta('[22] 済みの印は新しい取込を始める門だけ (Codex #1547 R2 Medium): 印があっても 残った importing (鍵なし) は mark-unknown して知らせる (ログインしない) / 前の夜の未確かめは確かめ直す / 取込は始めない', async () => {
+  // 印あり + 残った importing (取込の途中でプロセスが落ちた)
+  let p = portal();
+  makeNightly(p, { ttl: 30 });
+  p.clock.now += 60000;
+  let dd = setupData();
+  fs.mkdirSync(path.dirname(N.nightlyMarker(dd, '2030-01-17')), { recursive: true });
+  fs.writeFileSync(N.nightlyMarker(dd, '2030-01-17'), '{}');
+  let eng = fakeEngine();
+  let x = nightlyOpts(p, dd, eng);
+  let r = await N.runNightly(x.o);
+  assert.deepEqual([r.state, r.reason, S.getStatus(p.db, { now: p.clock.now }).state, x.sent.some((t) => /状態 unknown/.test(t)), eng.calls.importOne.length], ['stopped', 'marked_unknown', 'unknown', true, 0]);
+  // 印あり + 前の夜の毎晩の回が未確かめ (知らせ済み) = 確かめ直す
+  p = portal({ at: JST('2030-01-16T00:20:00') });
+  makeNightly(p, { to: 'imported_unverified' });
+  const s0 = S.getStatus(p.db);
+  S.markNotified(p.db, { runId: s0.run.run_id, state: s0.state, stateEventId: s0.state_event_id, by: 'x' });
+  p.clock.now = NIGHT;
+  dd = setupData();
+  fs.mkdirSync(path.dirname(N.nightlyMarker(dd, '2030-01-17')), { recursive: true });
+  fs.writeFileSync(N.nightlyMarker(dd, '2030-01-17'), '{}');
+  eng = fakeEngine();
+  x = nightlyOpts(p, dd, eng);
+  r = await N.runNightly(x.o);
+  assert.deepEqual([r.state, r.result, eng.calls.verifyAgain.length], ['verify_again', 'verified', 1]);
+  // 確かめ直した夜は、その夜の取込を始めない (L-25)
+  S.transition(p.db, { lockToken: S.acquire(p.db, { initId: p.init_id, holder: 'auto', purpose: 'verify', runId: s0.run.run_id, by: 'x', now: NIGHT }).lock_token, runId: s0.run.run_id, to: 'verified', by: 'x', now: NIGHT });
+  p.putArtifact();
+  r = await N.runNightly(x.o);
+  assert.deepEqual([r.state, eng.calls.importOne.length], ['already', 0]);
+});
+
+await ta('[23] 同時の起動 (Codex #1547 R2 Low): 済みの印がぶつかった (EEXIST) = もう動いている = 失敗にしない・取込は最大 1 回 / 送り先の URL が壊れている = ログインの前に ❌ (ファイル・ポータル・ログイン = 0。Codex #1547 R2 Medium)', async () => {
+  // 2 つの起動が同じ夜に同時に: 片方の readiness の間にもう片方が印を書いた
+  const p = portal();
+  p.putArtifact();
+  const dd = setupData();
+  const eng = fakeEngine();
+  const x = nightlyOpts(p, dd, eng);
+  const orig = x.o.client.nightlyReadiness;
+  x.o.client = { ...x.o.client, nightlyReadiness: async (q) => { const res = await orig(q); fs.mkdirSync(path.dirname(N.nightlyMarker(dd, '2030-01-17')), { recursive: true }); fs.writeFileSync(N.nightlyMarker(dd, '2030-01-17'), '{"other":1}'); return res; } };
+  const r = await N.runNightly(x.o);
+  assert.deepEqual([r.state, r.reason, r.ping, eng.calls.importOne.length, N.summarize(r).code], ['already', 'concurrent', null, 0, 0]);
+  // 送り先の URL が壊れている
+  const { jobsHook } = await import('./logizard-import/notify-jobs.mjs');
+  for (const bad of ['https://', 'https://not a url', 'http://chat.googleapis.com/x', 'https://localhost/x', 'ftp://chat.example.test/x', ' ']) {
+    assert.equal(jobsHook({ GCHAT_WEBHOOK_JOBS: bad }), null, bad);
+    const touched = [];
+    const m = await N.nightlyMain({ env: { GCHAT_WEBHOOK_JOBS: bad, DATA_DIR: dd }, deps: { client: new Proxy({}, { get: () => { touched.push('client'); return async () => ({}); } }), session: { withSession: async () => { touched.push('login'); }, capabilities: {} } } });
+    assert.deepEqual([m.code, /GCHAT_WEBHOOK_JOBS/.test(m.line), touched], [1, true, []], bad);
+  }
+  assert.equal(jobsHook({ GCHAT_WEBHOOK_JOBS: 'https://chat.googleapis.com/v1/spaces/AAA/messages?key=k&token=t' }), 'https://chat.googleapis.com/v1/spaces/AAA/messages?key=k&token=t');
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);

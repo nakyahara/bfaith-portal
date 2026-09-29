@@ -5,10 +5,13 @@
  * miniPC の設定はリポジトリ直下の .env の 1 つだけ。送り先が無い = 毎晩の本番はログインの前に止める (呼び手)。
  */
 
-/** 送り先 (https だけ)。無い・形が違う = null */
+/** 送り先 (https の URL として読めて、ホスト名があるものだけ)。無い・壊れている = null (呼び手はログインの前に止める。Codex #1547 R2 Medium) */
 export function jobsHook(env = process.env) {
   const h = String(env.GCHAT_WEBHOOK_JOBS || '').trim();
-  return /^https:\/\//.test(h) ? h : null;
+  if (!h || /\s/.test(h)) return null;
+  let u;
+  try { u = new URL(h); } catch { return null; }
+  return u.protocol === 'https:' && /^[a-z0-9.-]+$/i.test(u.hostname) && u.hostname.includes('.') ? h : null;
 }
 
 /** 送る (送れた = true・送り先が無い / 失敗 = false。例外は投げない) */

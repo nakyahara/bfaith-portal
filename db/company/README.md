@@ -616,10 +616,10 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - プレビューが「できた」 = ファイルを渡した後に処理が始まった・画面が変わった・入力欄に今回のファイル名・エラーのモーダルが無い (全部そろったときだけ)。サーバーエラー (「エラーが発生しました」) は OK を押さずに止める (画面 `preview-failed.html` を残す。やり直しは人)。
 - **毎晩の本番 (③c-1b-2b-2)** = `LZ_DAILY_IMPORT=on` のとき、`lz-daily-import.mjs` が `scripts/logizard-import/lz-nightly.mjs` の `nightlyMain` を呼ぶ (影はしない)。
   - **2b-2a の間は動かない**: 毎晩の確かめの列の決まり (`RULES_NIGHTLY` = ふりがなの列・仕入単価の書き方・システムの列) は実機の少数件の試験で決める (2b-2b)。それまでは on にしても ❌ で何もしない (ファイル・ポータル・ロジザード・知らせ = 0・fail の ping は影の項目 `lz-daily-import-shadow` に)。on にするのは切替の PR の後。
-  - 呼ぶ前に見る順: 要対応スペースの送り先 `GCHAT_WEBHOOK_JOBS` (miniPC のリポジトリ直下の .env・無い = ❌) → 決まり → `DATA_DIR`。
+  - 呼ぶ前に見る順: 要対応スペースの送り先 `GCHAT_WEBHOOK_JOBS` (miniPC のリポジトリ直下の .env・無い・https の URL として読めない = ❌) → 決まり → `DATA_DIR`。
   - 時刻の元は **Render の時計** (`/api/status` の `clock.server_now` を単調な時計に写す。miniPC の壁時計は判断に使わない)。
   - どの回も最初に知らせの送り直し: 止め・要確認の outbox → 今の止まった状態の知らせ (窓の中の回は再適用待ちを最後の回に回す = 止めを先に)。予算 = **1 回の起動で共通** 50 件・60 秒 (前後の送り直しとエンジンの知らせで分け合う)。**08:40 / 11:45 (Render の時刻で窓の外) は知らせだけ** (ロジザードに入らない・ping しない)。
-  - 00:20 の回 (Render の時刻で JST 00:15〜00:50・1 日 1 回 = `DATA_DIR/lz-import/<JST の日>/nightly-done.json` とポータルの nightly_done):
+  - 00:20 の回 (Render の時刻で JST 00:15〜00:50)。その夜の済みの印 `DATA_DIR/lz-import/<JST の日>/nightly-done.json` は**新しい取込を始める門だけ** (残った importing の回収と前の夜の未確かめの確かめのやり直しは印より先・印がぶつかった = もう動いている = 静かに終わる)。本当の 1 回だけの守りはポータルの nightly_done:
     - ポータルの手の取込の旗 (`manual.v4`) が無い = ❌。止めてある・手の取込が開いている・unknown / partial / verify_failed・試験の回の imported_unverified = 始めない。
     - importing が残っている: 鍵が生きている = 動いている (何もしない) / 鍵が無い = mark-unknown → どの結末でも読み直して報告して**終わる** (この起動では取込に進まない・ロジザードに入らない)。
     - 前の夜の毎晩の回が未確かめ (imported_unverified) = **その夜は確かめのやり直しだけ** (L-25・記録 = `DATA_DIR/lz-import/runs/<実行 ID>/`)。止まった状態の知らせが知らせ済みになるまでは確かめない (知らせが届かないまま verified になって故障が隠れない)。

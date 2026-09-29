@@ -10,7 +10,8 @@
  *   1. どの回も最初に知らせの送り直し (N5): outbox の止め・要確認 → 今の止まった状態の知らせ (K9) (→ 窓の外の回は再適用待ちの outbox も)。
  *      予算 = **1 回の起動で共通** 50 件・60 秒 (前後の送り直しとエンジンの知らせで分け合う。Codex #1547 R1 Medium)
  *   2. Render の時刻で窓の外 (08:40 / 11:45) = 知らせだけ (ロジザードに入らない・ping しない。K3-5)
- *   3. 窓の中 (JST 00:15〜00:50): その夜の済みの印 → ポータルの手の取込の旗 (LZ_MANUAL_V4) → 状態で振り分け:
+ *   3. 窓の中 (JST 00:15〜00:50): ポータルの手の取込の旗 (LZ_MANUAL_V4) → 状態で振り分け (その夜の済みの印は「新しい取込を始める」門だけ = 残った importing の回収と
+ *      前の夜の未確かめの確かめのやり直しは済みの印より先。印がぶつかった = もう動いている = 静かに終わる。Codex #1547 R2):
  *        importing で鍵が生きている = 動いている / 鍵なし = mark-unknown → どの結末でも読み直して報告して**終わる** (この起動では取込に進まない。N7・Codex #1547 R1 Medium)
  *        止めてある・手の取込が開いている・unknown / partial / verify_failed・試験の回の imported_unverified = 始めない
  *        毎晩の回の imported_unverified = **その夜は確かめのやり直しだけ** (L-25)。止まった状態の知らせが知らせ済みになるまでは確かめない
@@ -133,10 +134,13 @@ export async function runNightly({ dataDir, client, checkInit, localInitFile, wi
     return { ...outcome, ping: verified && unsent === 0 && !stopPending ? 'ok' : null, unsent, notices };
   };
   const marker = nightlyMarker(dataDir, clk.jst_date);
-  if (fs.existsSync(marker)) return finish({ state: 'already' });
+  /** 済みの印を書く (もうある = false = ほかの起動が先に書いた) */
   const writeMarker = (extra) => {
     fs.mkdirSync(path.dirname(marker), { recursive: true });
-    fs.writeFileSync(marker, JSON.stringify({ at_server: nowMs(), ...extra }), { flag: 'wx' });
+    try { fs.writeFileSync(marker, JSON.stringify({ at_server: nowMs(), ...extra }), { flag: 'wx' }); return true; } catch (e) {
+      if (e && e.code === 'EEXIST') return false;
+      throw e;
+    }
   };
   const st = await client.status(20);
   if (!st.manual || st.manual.v4 !== true) throw new Error('ポータルの手の取込の旗 (LZ_MANUAL_V4) が立っていない = 毎晩の本番はしない (成果物の照合・区切りが効かない。切替の順番の 3〜4)');
@@ -160,13 +164,14 @@ export async function runNightly({ dataDir, client, checkInit, localInitFile, wi
     if (!st.notified) return finish({ state: 'stopped', reason: 'stop_notice_pending' });
     // 前の夜の回が未確かめ = その夜は確かめのやり直しだけ (L-25)
     const runId = st.run.run_id;
-    writeMarker({ kind: 'verify_again', run_id: runId });
+    writeMarker({ kind: 'verify_again', run_id: runId });   // もうある (同じ夜の 2 回目) でも確かめ直してよい (状態の機械が 1 回ずつにする)
     const r = await verifyAgainFn({ policy: POLICIES.nightly, runId, locateRun: () => nightlyRunDir(dataDir, runId), context: {}, now: new Date(nowMs()),
       localInitFile, client, checkInit, withSession, capabilities, notify: engineNotify, createGuard, log });
     return finish({ state: 'verify_again', runId, result: r.state, reason: r.reason || null });
   }
   if (STOP_STATES.includes(st.state)) return finish({ state: 'stopped', reason: st.state });
-  // idle / verified
+  // idle / verified = 新しい取込を始める。その夜の済みの印が門 (前の夜の未確かめの確かめのやり直しをした夜も = L-25 の「その夜は確かめだけ」)
+  if (fs.existsSync(marker)) return finish({ state: 'already' });
   const target = clk.expected_target_as_of;
   if (st.nightly_last && st.nightly_last.target_as_of === target) return finish({ state: 'already_started', runId: st.nightly_last.run_id });
   const t = pickTarget({ dataDir, now: new Date(nowMs()), requirePass: true, asOf: target });
@@ -184,7 +189,7 @@ export async function runNightly({ dataDir, client, checkInit, localInitFile, wi
   }
   const rd = await client.nightlyReadiness(ident);
   if (!rd.ready) return finish({ state: 'skipped', reason: 'not_ready', codes: rd.codes });
-  writeMarker({ kind: 'import', target_as_of: target, source_run_id: ident.source_run_id });
+  if (!writeMarker({ kind: 'import', target_as_of: target, source_run_id: ident.source_run_id })) return finish({ state: 'already', reason: 'concurrent' });   // 同時の起動 = ほかが先に書いた = 取り込まない
   const r = await importOneFn({ policy: POLICIES.nightly, runsDir: path.join(dataDir, 'lz-import', 'runs'), csvBuf: t.csvBuf,
     csv: { sha256: ident.csv_sha256, rows: ident.rows, target_as_of: ident.target_as_of, source_run_id: ident.source_run_id },
     context: { artifact }, now: new Date(nowMs()), localInitFile, client, checkInit, withSession, capabilities, notify: engineNotify, createGuard, log });
