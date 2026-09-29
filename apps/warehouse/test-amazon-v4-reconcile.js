@@ -47,6 +47,8 @@ line({ prt: 'Shipping', pra: -300 }); line({ prt: 'TaxDiscount', pra: -30 });
 const R = { tt: 'Refund', day: '10' };
 line({ ...R, pt: 'Principal', pa: -1000 }); line({ ...R, pt: 'Tax', pa: -100 }); line({ ...R, pt: 'Shipping', pa: -300 }); line({ ...R, pt: 'RestockingFee', pa: 50 });
 line({ ...R, ft: 'Commission', fa: 110 }); line({ ...R, ft: 'RefundCommission', fa: -22 }); line({ ...R, ft: 'ShippingChargeback', fa: 330 });
+// 原価の登録が無い SKU (原価未登録 = missing_cost・利益 500)。関所の cost_late_binding は金額を数えず診断額だけ残す (Codex #1531 R2)
+line({ sku: 'SKU-M', order: 'O9', qty: 1 }); line({ sku: 'SKU-M', order: 'O9', pt: 'Principal', pa: 500 });
 line({ ...R, prt: 'Shipping', pra: 300 }); line({ ...R, prt: 'TaxDiscount', pra: 30 });
 const C = { tt: 'Chargeback Refund', day: '12' };
 line({ ...C, pt: 'Principal', pa: -1000 }); line({ ...C, pt: 'Tax', pa: -100 });
@@ -82,11 +84,11 @@ const det = adj && JSON.parse(adj.d);
 ok(adj && Math.abs(adj.a - det.raw_diff) < 1e-6 && Math.round(det.points) === -20 && Math.round(det.other_refund) === -1250, `関所: 説明できる差 (決まりの違い) の内訳 = そのままの差 (${adj && Math.round(adj.a)} / ${det && Math.round(det.raw_diff)})`);
 
 // 壊れたら残りが出る: v4 の元 (月の集計) を 1 円ずらす
-db.prepare(`UPDATE fact_amazon_settlement_monthly_wide SET sales_principal_micro = sales_principal_micro + 1000000 WHERE year_month_int = ?`).run(YMI);
+db.prepare(`UPDATE fact_amazon_settlement_monthly_wide SET sales_principal_micro = sales_principal_micro + 1000000 WHERE year_month_int = ? AND seller_sku_normalized = 'sku-b'`).run(YMI);
 const r2 = reconcileMonthly(db, { month: YM })[0];
 ok(Math.round(r2.resid) === -1, `v4 側が 1 円ずれると残り −1 円 (${r2.resid})`);
 
-db.prepare(`UPDATE fact_amazon_settlement_monthly_wide SET sales_principal_micro = sales_principal_micro - 1000000 WHERE year_month_int = ?`).run(YMI);   // 戻す
+db.prepare(`UPDATE fact_amazon_settlement_monthly_wide SET sales_principal_micro = sales_principal_micro - 1000000 WHERE year_month_int = ? AND seller_sku_normalized = 'sku-b'`).run(YMI);   // 戻す
 
 // 打ち消しを見逃さない (Codex #1531 R1)
 const dq = (runId) => {
@@ -118,8 +120,15 @@ ok(r5.long_only_skus === 1 && Math.round(r5.resid_abs) === 5, `縦長の表に�
 ok(reconcileSkuTop(db, { month: YM }).some((x) => x.sku === 'sku-long' && x.in_long && !x.in_d && !x.in_v4), 'SKU × 月の一覧にも縦長の表だけの SKU が出る');
 q = dq('test-long');
 ok(q.res.long_only_skus?.severity === 'warn' && q.res.long_only_skus.actual_value === 1, `関所: 縦長の表だけの SKU = warn (${JSON.stringify(q.res.long_only_skus)})`);
-ok(db.prepare(`SELECT bucket_amount a FROM accounting_diff_buckets WHERE run_id = 'test-reconcile' AND bucket_code = 'cost_late_binding'`).get() === undefined
-  || db.prepare(`SELECT bucket_amount a FROM accounting_diff_buckets WHERE run_id = 'test-reconcile' AND bucket_code = 'cost_late_binding'`).get().a === 0, '原価未登録の分類は金額を数えない (原価の差は決まりの違い ① に入る = 二重にしない)');
+const clb = db.prepare(`SELECT bucket_amount a, row_count n, details_json d FROM accounting_diff_buckets WHERE run_id = 'test-reconcile' AND bucket_code = 'cost_late_binding'`).get();
+ok(clb && clb.a === 0 && clb.n === 1 && JSON.parse(clb.d).missing_profit_jpy_diagnostic === 500,
+  `原価未登録の分類はある (1 行) が金額は 0・影響額 500 は診断に (原価の差は決まりの違い ① に入る = 二重にしない) (${clb && JSON.stringify([clb.a, clb.n, clb.d])})`);
+// 月の差 % に売上の残りも入る (利益の残り 0・売上の残り 100 → % は 0 にならない。Codex #1531 R2)
+db.prepare(`DELETE FROM fact_amazon_settlement_monthly_long WHERE seller_sku_normalized = 'sku-long'`).run();
+db.prepare(`UPDATE f_amazon_finance_sku_daily_v1 SET sales_principal_jpy = sales_principal_jpy + 100, commission_jpy = commission_jpy + 100 WHERE seller_sku = 'sku-b' AND date_jst = ?`).run(`${YM}-05`);
+const r6 = reconcileMonthly(db, { month: YM })[0];
+ok(r6.resid_abs < 1e-6 && Math.round(r6.rev_resid_abs) === 100 && Math.abs(r6.resid_pct - 100 / Math.abs(r6.cmp_v4) * 100) < 1e-9 && r6.resid_pct > 0,
+  `月の差 % の分子 = 利益の残り 0 + 売上の残り 100 (${r6.resid_pct.toFixed(3)}%)`);
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 日次の財務と v4 の突き合わせテスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

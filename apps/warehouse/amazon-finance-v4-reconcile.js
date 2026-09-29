@@ -88,7 +88,8 @@ export function reconcileMonthly(db, { month = null } = {}) {
   }
   return [...byMonth.values()].map((m) => ({
     ...m, raw_diff: m.profit_d - m.profit_v4,
-    resid_pct: m.cmp_v4 !== 0 ? m.resid_abs / Math.abs(m.cmp_v4) * 100 : (m.resid_abs === 0 ? 0 : 100),
+    // 分子 = 利益の残りの絶対値 + 売上の残りの絶対値 (項目どうしの打ち消しも % に入れる。Codex #1531 R2)
+    resid_pct: m.cmp_v4 !== 0 ? (m.resid_abs + m.rev_resid_abs) / Math.abs(m.cmp_v4) * 100 : (m.resid_abs + m.rev_resid_abs === 0 ? 0 : 100),
   }));
 }
 
