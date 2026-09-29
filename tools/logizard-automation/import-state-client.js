@@ -17,6 +17,11 @@ export const BASE_PATH = '/apps/logizard-import-state/api';
 export class ImportStateClientError extends Error {
   constructor(code, message, status = null) { super(message); this.code = code; this.status = status; }
 }
+/** limit は 1〜max の整数 (ほか = 送らずに断る) */
+function checkLimit(limit, max) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > max) throw new ImportStateClientError('bad_request', `limit は 1〜${max} の整数`);
+  return limit;
+}
 
 /**
  * @param {object} [opts]
@@ -64,8 +69,8 @@ export function createImportStateClient({ url = process.env.LZ_IMPORT_STATE_URL 
       return call('POST', `/artifacts?${qs}`, csvBuf, { raw: true });
     },
     getArtifact: (sourceRunId) => call('GET', `/artifacts/${encodeURIComponent(String(sourceRunId))}`),
-    listArtifacts: (limit = 14) => call('GET', `/artifacts?limit=${Number(limit) || 14}`),
-    outbox: (limit = 20) => call('GET', `/outbox?limit=${Number(limit) || 20}`),
+    listArtifacts: (limit = 14) => call('GET', `/artifacts?limit=${checkLimit(limit, 60)}`),
+    outbox: (limit = 20) => call('GET', `/outbox?limit=${checkLimit(limit, 100)}`),
     outboxSent: (b) => call('POST', '/outbox/sent', b),
   };
 }

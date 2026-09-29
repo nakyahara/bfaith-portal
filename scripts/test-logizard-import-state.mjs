@@ -875,6 +875,18 @@ await ta('[28] 口 (③c-1b-3b-2b): 成果物を送る (バイト列・中身か
     assert.deepEqual(list.artifacts.map((x) => [x.source_run_id, x.rows, x.csv === undefined]), [['lzd_20300115_a', 2, true]]);
     assert.equal((await c.getArtifact('lzd_20300115_a')).artifact.csv_sha256, shaOf(buf));
     assert.equal(await codeOf(c.getArtifact('lzd_nothing')), '404:not_found');
+    // limit = 無い か 1 つの正の整数で上限まで (小数・0・負・文字・2 つ・上限超え = 400。Codex #1539 R1 Medium)
+    for (const [p, max] of [['artifacts', 60], ['outbox', 100]]) {
+      for (const q of ['limit=1.5', 'limit=0', 'limit=-1', 'limit=abc', 'limit=1&limit=2', `limit=${max + 1}`, 'limit=Infinity', 'limit=01', 'limit=']) {
+        res = await fetch(`${url}/apps/logizard-import-state/api/${p}?${q}`, { headers: { Authorization: 'Bearer tok' } });
+        const jj = await res.json();
+        assert.deepEqual([res.status, jj.error], [400, 'bad_request'], `${p}?${q}`);
+      }
+      res = await fetch(`${url}/apps/logizard-import-state/api/${p}?limit=${max}`, { headers: { Authorization: 'Bearer tok' } });
+      assert.equal(res.status, 200, `${p} max`);
+    }
+    for (const bad of [1.5, 0, 61, '3', NaN]) assert.throws(() => c.listArtifacts(bad), (e) => e.code === 'bad_request', String(bad));
+    assert.throws(() => c.outbox(101), (e) => e.code === 'bad_request');
     // outbox: halt で積む → 取り出す → 送れた (1 回だけ)
     await c.halt({ by: '中原', reason: '口の試験で止める' });
     const ob = (await c.outbox()).outbox;

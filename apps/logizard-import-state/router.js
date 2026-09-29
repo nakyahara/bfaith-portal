@@ -87,6 +87,13 @@ export function createImportStateRouter({ getDb = null, now = () => Date.now(), 
   // 成果物の本文は Bearer の後に、この口だけの parser (octet-stream・4MB) で読む
   const rawCsv = express.raw({ type: 'application/octet-stream', limit: S.LIMITS.csvBytes });
   const INT_RE = /^[0-9]{1,6}$/;
+  // limit = 無い (既定) か、1 つの 10 進の正の整数で上限まで。ほか (小数・0・負・文字・2 つ) = 400 (Codex #1539 R1 Medium)
+  const limitOf = (req, dflt, max) => {
+    const v = req.query ? req.query.limit : undefined;
+    if (v === undefined) return dflt;
+    if (typeof v !== 'string' || !/^[1-9][0-9]{0,2}$/.test(v) || Number(v) > max) throw new S.ImportStateError('bad_request', `limit は 1〜${max} の整数`, 400);
+    return Number(v);
+  };
   router.post('/api/artifacts', rawCsv, handle((body, req) => {
     if (!req.is('application/octet-stream') || !Buffer.isBuffer(body) || !body.length) throw new S.ImportStateError('bad_request', '本文は成果物の CSV のバイト列 (application/octet-stream)', 400);
     const q = req.query || {};
@@ -94,13 +101,13 @@ export function createImportStateRouter({ getDb = null, now = () => Date.now(), 
     if (!INT_RE.test(one('rows') || '')) throw new S.ImportStateError('bad_request', 'rows (行数) が要る', 400);
     return S.putArtifact(dbOf(), { sourceRunId: one('source_run_id'), targetAsOf: one('target_as_of'), verdict: one('verdict'), csvBuf: body, sha256: one('sha256'), rows: Number(one('rows')), by: one('by'), now: now() });
   }));
-  router.get('/api/artifacts', handle((_b, req) => ({ artifacts: S.listArtifacts(dbOf(), { limit: Number(req.query.limit) || 14 }) })));
+  router.get('/api/artifacts', handle((_b, req) => ({ artifacts: S.listArtifacts(dbOf(), { limit: limitOf(req, 14, 60) }) })));
   router.get('/api/artifacts/:id', handle((_b, req) => {
     const a = S.getArtifact(dbOf(), { sourceRunId: req.params.id });
     if (!a) throw new S.ImportStateError('not_found', 'その成果物は無い', 404);
     return { artifact: a };
   }));
-  router.get('/api/outbox', handle((_b, req) => ({ outbox: S.outboxPending(dbOf(), { limit: Number(req.query.limit) || 20 }) })));
+  router.get('/api/outbox', handle((_b, req) => ({ outbox: S.outboxPending(dbOf(), { limit: limitOf(req, 20, 100) }) })));
   router.post('/api/outbox/sent', handle((b) => S.outboxMarkSent(dbOf(), { id: b.id, by: b.by, now: now() })));
   router.use(bodyError);   // この口だけの parser の失敗 (大きすぎる) も同じ短い JSON で
   return router;
