@@ -250,5 +250,47 @@ process.env.MARGIN_ALERT_THRESHOLD_PCT = '15';
 check('正常値15は採用', resolveThresholdPct() === 15);
 delete process.env.MARGIN_ALERT_THRESHOLD_PCT;
 
+// ─── Test 6: Amazon の決済のそろった日 (2026-09-29 Codex #1528 R1) ───
+//   決済の最後の日 = addDays(d1, 1) (途中の日) → そろっている最後の日 = d1
+console.log('Test 6: Amazon の決済のそろった日');
+{
+  const full = collectMarginRows(db, from, to);
+  check('期間の終わりが短い = amazonWindow.effective_to は d1 (決済のそろった日)', full.amazonWindow?.effective_to === d1 && full.amazonWindow?.trimmed === true, JSON.stringify(full.amazonWindow));
+  const r6 = classifyMarginRows(full.rows, 10, []);
+  const text6 = formatMarginAlertMessage({ todayJst: today, from, to, thresholdPct: 10, result: r6, isFirstRun: false, skipped: full.skipped, skipReasons: full.skipReasons, amazonWindow: full.amazonWindow });
+  check('通知に「Amazon は決済のそろった日まで」', text6.includes(`※ Amazon は決済のそろった ${d1} まで`), text6.split('\n').slice(0, 4).join(' | '));
+
+  // 期間の最初の日 = 決済のそろった日 (境目) = その 1 日は入る
+  const edge = collectMarginRows(db, d1, to);
+  check('境目: 決済のそろった日 = 期間の最初の日 → Amazon は判定する (スキップしない)', !edge.skipped.includes('amazon') && edge.rows.some((r) => r.mall === 'amazon' && r.code === 'amz-low'), JSON.stringify(edge.skipped));
+
+  // 期間の中に決済のそろった日が無い (最初の日が決済の最後の日 = 途中の日)
+  const none = collectMarginRows(db, addDays(d1, 1), to);
+  check('決済のそろった日が期間内に無い = Amazon は集計スキップ (空で「割れなし」にしない)', none.skipped.includes('amazon') && !none.rows.some((r) => r.mall === 'amazon'), JSON.stringify(none.skipped));
+  check('スキップの理由 = 決済の最後の日つき', /決済のそろった日が期間内に無い \(決済は .* まで\)/.test(none.skipReasons.amazon || ''), none.skipReasons.amazon);
+  const rNone = classifyMarginRows(none.rows, 10, ['amazon:amz-low', 'rakuten:rk-low']);
+  const textNone = formatMarginAlertMessage({ todayJst: today, from: addDays(d1, 1), to, thresholdPct: 10, result: rNone, isFirstRun: false, skipped: none.skipped, skipReasons: none.skipReasons, amazonWindow: none.amazonWindow });
+  check('通知に Amazon の集計スキップと理由 (「決済のそろった日まで」の注記は出さない)', /集計スキップ.*Amazon \(決済のそろった日が期間内に無い/.test(textNone) && !textNone.includes('※ Amazon は決済のそろった'), textNone.split('\n').filter((l) => /Amazon/.test(l)).join(' | '));
+  // 長い通知でも集計スキップが消えない (先頭に出す。Codex #1529 R1)
+  const longRows = Array.from({ length: 40 }, (_, i) => ({ mall: 'rakuten', code: 'x'.repeat(500) + i, name: '長い名前'.repeat(10), sales: 1000, marginPct: -5 - i, adInclPct: null, costComplete: true }));
+  const rLong = classifyMarginRows(longRows, 10, ['rakuten:none']);
+  const textLong = formatMarginAlertMessage({ todayJst: today, from, to, thresholdPct: 10, result: rLong, isFirstRun: false, skipped: ['amazon'], skipReasons: none.skipReasons, amazonWindow: none.amazonWindow });
+  check('長い通知 (切り詰め) でも集計スキップと理由が残る', textLong.includes('…(省略)') && textLong.includes('集計スキップ') && textLong.includes('決済のそろった日が期間内に無い'), `len=${textLong.length}`);
+  const rZero = classifyMarginRows([], 10, []);
+  const textZero = formatMarginAlertMessage({ todayJst: today, from, to, thresholdPct: 10, result: rZero, isFirstRun: false, skipped: ['amazon'], skipReasons: none.skipReasons, amazonWindow: none.amazonWindow });
+  check('スキップがある日の 0 件は「集計できたモールでは割れなし」', textZero.includes('✅ 集計できたモールでは 10%割れの商品はありません'));
+  const textNoTrim = formatMarginAlertMessage({ todayJst: today, from, to, thresholdPct: 10, result: rZero, isFirstRun: false, skipped: [], amazonWindow: { ...full.amazonWindow, trimmed: false } });
+  check('期間を切っていない日は「決済のそろった日まで」の注記を出さない', !textNoTrim.includes('※ Amazon は決済のそろった') && textNoTrim.includes('✅ 10%割れの商品はありません'));
+  check('前回の Amazon の記録は引き継ぐ (消さない)', mergeStateKeys(rNone.keys, ['amazon:amz-low', 'rakuten:rk-low'], none.skipped).includes('amazon:amz-low'));
+
+  // 決済のデータがまったく無い
+  const saved = db.prepare(`SELECT * FROM mirror_amazon_finance_sku_daily`).all();
+  db.prepare(`DELETE FROM mirror_amazon_finance_sku_daily`).run();
+  const empty = collectMarginRows(db, from, to);
+  check('決済のデータが無い = Amazon は集計スキップ (理由: 決済のデータが無い)', empty.skipped.includes('amazon') && empty.skipReasons.amazon === '決済のデータが無い', JSON.stringify([empty.skipped, empty.skipReasons]));
+  const ins = db.prepare(`INSERT INTO mirror_amazon_finance_sku_daily (${Object.keys(saved[0]).join(', ')}) VALUES (${Object.keys(saved[0]).map(() => '?').join(', ')})`);
+  for (const r of saved) ins.run(...Object.values(r));
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exit(fail > 0 ? 1 : 0);
