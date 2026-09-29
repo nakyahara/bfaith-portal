@@ -301,10 +301,12 @@ daily_base AS (
 
     -- 保持のみ (利益式に入れない)
     SUM(COALESCE(s.misc_fee_amount_micro, 0)) AS misc_fee_micro,
+    -- 2026-09-29 (F2b-1): MFNPostageFee も符号のまま (前は ABS)。SKU のある行には MFNPostageFee が 0 件 = 値は変わらない。
+    --   Company DB (0043) の日次の財務と同じ決まり (全部の列が「符号のまま → 反転か合算」で作れる)
     SUM(
       COALESCE(s.other_fee_amount_micro, 0)
       + CASE WHEN s.item_related_fee_type IN ('MFNPostageFee', 'MFNPostageFeeTax')
-             THEN ABS(COALESCE(s.item_related_fee_amount_micro, 0)) ELSE 0 END
+             THEN COALESCE(s.item_related_fee_amount_micro, 0) ELSE 0 END
     ) AS other_fee_micro,
     SUM(
       CASE
@@ -518,5 +520,17 @@ ON CONFLICT (date_jst, seller_sku) DO UPDATE SET
   source_layer_summary = excluded.source_layer_summary,
   source_row_count = excluded.source_row_count,
   built_at         = excluded.built_at;
+
+-- ----------------------------
+-- 材料の無くなった日 × SKU を消す (2026-09-29 F2b-1)
+-- ----------------------------
+-- UPSERT だけでは、決済の行が全部消えた (重複の片付け・訂正) 日 × SKU の古い行が残る = Company DB (0043) との突き合わせで差が 0 にならない。
+-- その月の行のうち、今回の材料 (silver = 決済の行 + Easy Ship の割り振り) に無い日 × SKU を消す。材料が無い = 原価の snapshot も要らない
+DELETE FROM f_amazon_finance_sku_daily_v1
+ WHERE CAST(replace(substr(date_jst, 1, 7), '-', '') AS INTEGER) = :year_month_int
+   AND NOT EXISTS (
+     SELECT 1 FROM _silver_month_v1 s
+      WHERE s.date_jst = f_amazon_finance_sku_daily_v1.date_jst AND s.seller_sku = f_amazon_finance_sku_daily_v1.seller_sku
+   );
 
 DROP TABLE IF EXISTS _silver_month_v1;

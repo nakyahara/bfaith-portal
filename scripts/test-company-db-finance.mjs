@@ -1,20 +1,24 @@
 #!/usr/bin/env node
 /**
- * test-company-db-finance.mjs — 0012 (Amazon 財務の受け皿) の受入試験 (Company DB 構想 08 §4.4 / §4.7。F2 の DDL 部分)
+ * test-company-db-finance.mjs — Amazon 財務の受け口 (0012 → 0043 で作り直し・F2b-1) の受入試験
  *
- * PGlite で 0001〜0012 を流し、DDL の「歯止め」を実際の操作で確かめる:
- *   policy の期間は重ならない (同じ 会社 × モール × scope) / 版の境目 (11/1) は隣接なら可 / scope が違えば可 / update でも検査 / period_to > from /
- *   policy の欠落 (finance_policy_gaps) を検出し、assert は例外 / 未採用の行は v_order_finance_uncovered に出る /
- *   集約は JPY だけ・net は 19 列の合計 (符号は決済レポートのまま)・source_lines > 0・会社違いの SKU / 出品は付かない /
- *   apply_order_finance_batch = 注文の明細集合を丸ごと置換 (古い世代は拒む・同じ内容は世代だけ進む・同じ世代で内容違いは例外・空の集合でも受領状態が残る) /
- *   注文の累計 view は policy が指す source の行だけ (旧と V2 の両方が入っていても二重にならない)・全内訳を出す・'-' の費用行は入らない /
- *   finance_daily は旧表と同じ列 (絶対値の列は負を拒む)・listing / sku / seller_sku のどれが null でも主キーが組める・JPY だけ
+ * 設計 = AI_reference『CompanyDB構想/12_Amazon財務のCompanyDB取込_設計_20260929.md』v5.1。PGlite で 0001〜0043 を流して確かめる:
+ *   0043 の安全の手順 (0012 の表が空でなければ止まる) / 旧互換 (legacy_*・v_finance_daily_legacy・assert_legacy_complete) が無い / policy (amazon / jp = unified 1 行) /
+ *   policy の重なり・欠落 (0012 の検査は残る) / apply = 集合の丸ごと置換 (古い世代は stale・同じ内容 + 同じ版は same・版が違えば置換・同じ世代で内容違いは例外・空の集合) /
+ *   入力の歯止め (整数でない金額・未知の line_kind・疑似注文と計上日・SKU と種類・SKU の行の手数料の材料・net = 20 列 + unmapped) /
+ *   mart.v_finance_daily = SQLite の日次の財務と同じ値 (SQLite 側の試験 test-finance-promotion-tax.js と同じ場面・手で計算した期待値) /
+ *   月の手数料の view / uncovered (policy 無し・source 違い) / 注文の累計は疑似注文を入れない /
+ *   指紋 (checksum) の決め (並べ方・列の順・NFC・安全な整数・空の集合) / 受け口の検証 (送り手の申告と内容の指紋が違えば 400)
  * 🚨 policy の重複検査・受領行の for update の 2 接続の並行は PGlite では書けない → 本番で手で確かめる (08 §7.6)
  * 実行: node scripts/test-company-db-finance.mjs
  */
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
+import { validateFinanceRows, orderFinanceChecksum, CONTENT_COLUMNS, pseudoOrderNo } from '../apps/company-db/finance/order-finance-checksum.mjs';
+import { validateFinanceChunk, ingestOrderFinanceChunk } from '../apps/company-db/ingest/order-finance.mjs';
+import Database from 'better-sqlite3';
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.message || e)); } };
@@ -22,246 +26,265 @@ const rejects = async (fn, re) => { let threw = null; try { await fn(); } catch 
 const quiet = () => {};
 
 const pg = new PGlite();
-const db = pgliteAdapter(pg);
-const applied = await applyMigrations(db, { log: quiet });
-assert.ok(applied.applied.includes('0012'), '0012 が流れていない');
+const applied = await applyMigrations(pgliteAdapter(pg), { log: quiet });
+assert.ok(applied.applied.includes('0043'), '0043 が流れていない');
 const one = async (sql, p = []) => (await pg.query(sql, p)).rows[0];
 const num = async (sql, p = []) => Number((await one(sql, p)).n);
-const co = (await one(`select company_id from core.companies order by company_id limit 1`)).company_id;
-await pg.query(`insert into core.products (company_id, name) values ($1, '見本A')`, [co]);
-await pg.query(`insert into core.skus (company_id, product_id, sku_kind, code, name) select company_id, product_id, 'single', 'sku-a', name from core.products`);
-const sku = (await one(`select sku_id from core.skus where code = 'sku-a'`)).sku_id;
-const listing = (await one(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values ($1, 'amazon', 'main@A1VC38T7YXB528', 'pr_SKU-A', 'active') returning listing_id`, [co])).listing_id;
-const other = (await one(`select max(company_id)::smallint + 1 as c from core.companies`)).c;
-await pg.query(`insert into core.companies (company_id, name, kind) values ($1, 'other', 'subsidiary')`, [other]);
-await pg.query(`insert into core.products (company_id, name) values ($1, '他社品')`, [other]);
-const skuOther = (await one(`insert into core.skus (company_id, product_id, sku_kind, code, name) select company_id, product_id, 'single', 'other-1', name from core.products where company_id = $1 returning sku_id`, [other])).sku_id;
-const listingOther = (await one(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values ($1, 'amazon', 'other@X', 'pr_OTHER-1', 'active') returning listing_id`, [other])).listing_id;
+const co = 1;
+await pg.query(`insert into core.products (company_id, name) values (1, '見本B')`);
+await pg.query(`insert into core.skus (company_id, product_id, sku_kind, code, name) select company_id, product_id, 'single', 'sku-b', name from core.products`);
+const listing = (await one(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'amazon', 'main@A1VC38T7YXB528', 'sku-b', 'active') returning listing_id`)).listing_id;
 
-const policy = (mall, scope, from, to, source) => pg.query(`insert into core.finance_source_policy (company_id, mall, scope_key, period_from, period_to, source) values ($1, $2, $3, $4, $5, $6)`, [co, mall, scope, from, to, source]);
-/** 注文の明細集合を 1 世代ぶん適用 (関数経由) */
-const apply = (order, seq, checksum, rows, { scope = 'jp', company = co, mall = 'amazon', version = 'v1' } = {}) =>
-  one(`select core.apply_order_finance_batch($1::smallint, $2, $3, $4, $5::bigint, $6, $7, $8::jsonb) as r`, [company, mall, scope, order, seq, checksum, version, JSON.stringify(rows)]).then((r) => r.r);
-const line = (date, source, x = {}) => ({ economic_date_jst: date, seller_sku: 'pr_SKU-A', source, source_lines: 1, source_updated_at: `${date}T00:00:00Z`, content_hash: 'h', ...x });
-const gaps = (from, to, scope = 'jp') => pg.query(`select gap_from::text f, gap_to::text t from core.finance_policy_gaps($1::smallint, 'amazon', $2, $3::date, $4::date)`, [co, scope, from, to]).then((r) => r.rows.map((g) => `${g.f}..${g.t}`));
+const U = 'amazon_settlement_unified';
+/** 行 (無い整数列は 0) */
+const row = (date, sku, x = {}) => ({ economic_date_jst: date, seller_sku: sku, line_kind: sku === '-' ? 'unknown' : 'sku', source: U, source_lines: 1, source_updated_at: `${date}T00:00:00Z`, content_hash: 'h', ...x });
+/** 受け口と同じ手順: 形を確かめ → 指紋を計算 → 関数へ */
+const apply = async (order, seq, rows, { version = 't1', mall = 'amazon', scope = 'jp' } = {}) => {
+  const content = validateFinanceRows(order, rows);
+  const checksum = orderFinanceChecksum(content);
+  const lines = content.map((c, i) => ({ ...c, source_updated_at: rows[i].source_updated_at, content_hash: rows[i].content_hash }));
+  return (await one(`select core.apply_order_finance_batch($1::smallint, $2, $3, $4, $5::bigint, $6, $7, $8::jsonb) as r`, [co, mall, scope, order, seq, checksum, version, JSON.stringify(lines)])).r;
+};
+/** 形の検査を通さずに関数へ直接 (SQL の歯止めを確かめる) */
+const applyRaw = (order, seq, rows, checksum = 'a'.repeat(64), version = 't1') =>
+  one(`select core.apply_order_finance_batch($1::smallint, 'amazon', 'jp', $2, $3::bigint, $4, $5, $6::jsonb) as r`, [co, order, seq, checksum, version, JSON.stringify(rows)]);
 
-console.log('0012: 表と view');
-await t('表・view・関数・trigger がある', async () => {
-  const tables = (await pg.query(`select table_schema || '.' || table_name as t from information_schema.tables where table_schema in ('core','mart') and table_type = 'BASE TABLE' and table_name in ('finance_source_policy','order_finance_receipts','order_finance_daily','finance_daily') order by 1`)).rows.map((r) => r.t);
-  assert.deepEqual(tables, ['core.finance_source_policy', 'core.order_finance_daily', 'core.order_finance_receipts', 'mart.finance_daily']);
-  const views = (await pg.query(`select table_name as t from information_schema.views where table_schema = 'mart' and (table_name like 'v_order_finance%' or table_name = 'v_finance_daily_legacy') order by 1`)).rows.map((r) => r.t);
-  assert.deepEqual(views, ['v_finance_daily_legacy', 'v_order_finance_summary', 'v_order_finance_uncovered']);
-  assert.equal(await num(`select count(*) as n from pg_proc where proname in ('finance_policy_gaps','assert_finance_policy_covered','apply_order_finance_batch','check_finance_policy_overlap')`), 4);
-  assert.equal(await num(`select count(*) as n from pg_trigger where tgname = 'trg_finance_source_policy_overlap'`), 1);
+console.log('0043: 作り直しと安全の手順');
+await t('表・view・関数がそろい、旧互換 (legacy_*・v_finance_daily_legacy・assert_legacy_complete) は無い', async () => {
+  const views = (await pg.query(`select table_name as t from information_schema.views where table_schema = 'mart' and table_name like '%finance%' order by 1`)).rows.map((r) => r.t);
+  assert.deepEqual(views, ['v_finance_account_fees_monthly', 'v_finance_daily', 'v_order_finance_summary', 'v_order_finance_uncovered']);
+  assert.equal(await num(`select count(*) as n from information_schema.columns where table_schema = 'core' and table_name = 'order_finance_daily' and column_name like 'legacy%'`), 0);
+  assert.equal(await num(`select count(*) as n from pg_proc where proname = 'assert_legacy_complete'`), 0);
+  assert.equal(await num(`select count(*) as n from pg_proc where proname in ('apply_order_finance_batch','finance_policy_gaps','assert_finance_policy_covered','check_finance_policy_overlap')`), 4);
+  const cols = (await pg.query(`select column_name as c from information_schema.columns where table_schema = 'core' and table_name = 'order_finance_daily'`)).rows.map((r) => r.c);
+  for (const c of ['line_kind', 'points_jpy', 'unmapped_jpy', 'promotion_tax_jpy', 'refund_principal_customer_jpy', 'refund_principal_atoz_jpy', 'account_fee_amount_jpy']) assert.ok(cols.includes(c), `列 ${c} が無い`);
 });
-
-console.log('policy (採用する取得元)');
-await t('🚨 期間 [from, to) は同じ 会社 × モール × scope で重ならない。版の境目 (10/31 まで v1 → 11/1 から V2) は隣接なので可、scope が違えば可', async () => {
-  await policy('amazon', 'jp', '2025-01-01', '2026-11-01', 'amazon_settlement_flat_v1');
-  await policy('amazon', 'jp', '2026-11-01', null, 'amazon_settlement_flat_v2');
-  await rejects(() => policy('amazon', 'jp', '2026-10-01', '2026-12-01', 'amazon_finances_api'), /overlaps/);
-  await rejects(() => policy('amazon', 'jp', '2024-01-01', '2025-01-02', 'amazon_finances_api'), /overlaps/);   // 端が 1 日でも重なる
-  await rejects(() => policy('amazon', 'jp', '2027-01-01', null, 'amazon_finances_api'), /overlaps/);           // 開いた期間 (to = null) とも重なる
-  await policy('amazon', 'us', '2026-10-01', null, 'amazon_finances_api');
-  await policy('rakuten', 'jp', '2025-01-01', null, 'mall_finance_daily_v1');
-  assert.equal(await num(`select count(*) as n from core.finance_source_policy`), 4);
+await t('policy = amazon / jp に amazon_settlement_unified [2026-01-01, 無期限) の 1 行', async () => {
+  const p = (await pg.query(`select company_id, mall, scope_key, period_from::text f, period_to, source from core.finance_source_policy`)).rows;
+  assert.deepEqual(p, [{ company_id: 1, mall: 'amazon', scope_key: 'jp', f: '2026-01-01', period_to: null, source: U }]);
 });
-await t('update でも重複を検査する (境目を動かす順は「縮める → 伸ばす」)。period_to > from。source は決まった値だけ', async () => {
-  await rejects(() => pg.query(`update core.finance_source_policy set period_from = date '2026-10-01' where source = 'amazon_settlement_flat_v2' and scope_key = 'jp'`), /overlaps/);
-  await pg.query(`update core.finance_source_policy set period_to = date '2026-10-01' where source = 'amazon_settlement_flat_v1' and scope_key = 'jp'`);
-  await pg.query(`update core.finance_source_policy set period_from = date '2026-10-01' where source = 'amazon_settlement_flat_v2' and scope_key = 'jp'`);
-  await pg.query(`update core.finance_source_policy set period_from = date '2026-11-01' where source = 'amazon_settlement_flat_v2' and scope_key = 'jp'`);
-  await pg.query(`update core.finance_source_policy set period_to = date '2026-11-01' where source = 'amazon_settlement_flat_v1' and scope_key = 'jp'`);
-  await rejects(() => policy('amazon', 'jp2', '2026-01-01', '2026-01-01', 'amazon_settlement_flat_v1'), /ck_finance_source_policy_period/);
-  await rejects(() => policy('amazon', 'jp2', '2026-01-01', null, 'settlement'), /finance_source_policy_source_check|violates check/);
-});
-await t('🚨 policy の欠落: gaps は無い区間を返す (前・間・後・開いた期間・全部無し)。assert は例外、揃っていれば通る', async () => {
-  assert.deepEqual(await gaps('2026-01-01', '2026-12-31'), []);                                   // jp は 2025-01-01〜 v1、11/1〜 V2 (開いた期間)
-  assert.deepEqual(await gaps('2024-12-01', '2025-01-10'), ['2024-12-01..2025-01-01']);            // 前に無い
-  assert.deepEqual(await gaps('2026-09-01', '2026-12-01', 'us'), ['2026-09-01..2026-10-01']);      // us は 10/1〜 だけ
-  assert.deepEqual(await gaps('2026-01-01', '2026-02-01', 'none'), ['2026-01-01..2026-02-01']);    // 全部無し
-  await policy('amazon', 'gap', '2026-01-01', '2026-02-01', 'amazon_settlement_flat_v1');
-  await policy('amazon', 'gap', '2026-03-01', '2026-04-01', 'amazon_settlement_flat_v2');
-  assert.deepEqual(await gaps('2025-12-15', '2026-05-01', 'gap'), ['2025-12-15..2026-01-01', '2026-02-01..2026-03-01', '2026-04-01..2026-05-01']);   // 間にも無い
-  assert.deepEqual(await gaps('2026-01-10', '2026-01-20', 'gap'), []);
-  assert.deepEqual(await gaps('2026-02-01', '2026-01-01', 'gap'), []);                               // 空の窓
-  await rejects(() => pg.query(`select core.assert_finance_policy_covered($1::smallint, 'amazon', 'gap', date '2026-01-01', date '2026-03-15')`, [co]), /gap \[2026-02-01, 2026-03-01\)/);
-  await pg.query(`select core.assert_finance_policy_covered($1::smallint, 'amazon', 'jp', date '2025-01-01', date '2027-12-31')`, [co]);
+await t('🚨 0012 の表が空でなければ 0043 は止まる (何も変えない)', async () => {
+  const pg2 = new PGlite();
+  await applyMigrations(pgliteAdapter(pg2), { log: quiet, to: '0042' });
+  await pg2.query(`insert into core.finance_source_policy (company_id, mall, scope_key, period_from, source) values (1, 'amazon', 'jp', '2026-01-01', 'amazon_settlement_flat_v1')`);
+  await rejects(() => applyMigrations(pgliteAdapter(pg2), { log: quiet }), /0012 の表が空ではない/);
+  assert.equal(Number((await pg2.query(`select count(*) as n from ops.schema_migrations where version = '0043'`)).rows[0].n), 0);
+  assert.equal(Number((await pg2.query(`select count(*) as n from information_schema.views where table_schema = 'mart' and table_name = 'v_finance_daily_legacy'`)).rows[0].n), 1);   // 旧のまま
+  await pg2.close();
 });
 
-console.log('apply_order_finance_batch (§4.7 の契約) と order_finance_daily');
-await t('🚨 適用: 受領状態 + 明細行。古い世代は stale (何も変えない)。同じ内容は世代だけ進む (same、行は変わらない)。同じ世代で内容が違えば例外', async () => {
-  const rows1 = [line('2026-10-31', 'amazon_settlement_flat_v1', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000, sales_tax_jpy: 100, commission_jpy: -150, fba_fulfillment_jpy: -300 })];
-  assert.equal(await apply('503-1', 10, 'c1', rows1), 'applied');
-  const rc = await one(`select received_batch_seq, set_checksum, lines from core.order_finance_receipts where mall_order_no = '503-1'`);
-  assert.equal(Number(rc.received_batch_seq), 10); assert.equal(rc.set_checksum, 'c1'); assert.equal(rc.lines, 1);
-  const r = await one(`select net_jpy, listing_id, received_batch_seq, built_at from core.order_finance_daily where mall_order_no = '503-1'`);
-  assert.equal(Number(r.net_jpy), 650); assert.equal(r.listing_id, listing); assert.equal(Number(r.received_batch_seq), 10);   // net は自動計算、listing は seller_sku から
-  assert.equal(await apply('503-1', 9, 'c0', [line('2026-10-31', 'amazon_settlement_flat_v1', { sales_principal_jpy: 1 })]), 'stale');
-  assert.equal(Number((await one(`select net_jpy from core.order_finance_daily where mall_order_no = '503-1'`)).net_jpy), 650);
-  assert.equal(await apply('503-1', 11, 'c1', rows1), 'same');
-  const r2 = await one(`select net_jpy, received_batch_seq, built_at from core.order_finance_daily where mall_order_no = '503-1'`);
-  assert.equal(Number(r2.received_batch_seq), 11); assert.equal(String(r2.built_at), String(r.built_at));   // 世代だけ進む
-  assert.equal(Number((await one(`select received_batch_seq from core.order_finance_receipts where mall_order_no = '503-1'`)).received_batch_seq), 11);
-  await rejects(() => apply('503-1', 11, 'c9', [line('2026-10-31', 'amazon_settlement_flat_v1', { sales_principal_jpy: 1 })]), /already applied with a different checksum/);
+console.log('policy (0012 の検査は残る)');
+await t('期間の重なりは拒む・欠落は gaps に出る・source は決まった値だけ (unified を含む)', async () => {
+  await rejects(() => pg.query(`insert into core.finance_source_policy (company_id, mall, scope_key, period_from, source) values (1, 'amazon', 'jp', '2027-01-01', 'amazon_settlement_flat_v2')`), /overlaps/);
+  await rejects(() => pg.query(`insert into core.finance_source_policy (company_id, mall, scope_key, period_from, source) values (1, 'amazon', 'x', '2026-01-01', 'settlement')`), /ck_finance_source_policy_source/);
+  const g = (await pg.query(`select gap_from::text f, gap_to::text t from core.finance_policy_gaps(1::smallint, 'amazon', 'jp', date '2025-12-01', date '2026-02-01')`)).rows;
+  assert.deepEqual(g, [{ f: '2025-12-01', t: '2026-01-01' }]);
 });
-await t('🚨 新しい世代は明細集合を丸ごと置換 (消えた計上日の行は消える)。空の集合でも受領状態 (世代) は残り、その後の古い世代は拒まれる', async () => {
-  const rows2 = [
-    line('2026-10-31', 'amazon_settlement_flat_v1', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000, sales_tax_jpy: 100, commission_jpy: -150, fba_fulfillment_jpy: -300 }),
-    line('2026-11-02', 'amazon_settlement_flat_v2', { units_refunded_customer: 1, units_net_sold: -1, refund_principal_jpy: -200, sales_giftwrap_jpy: 30 }),
-    line('2026-11-02', 'amazon_settlement_flat_v1', { refund_principal_jpy: -999 }),   // 11 月は V2 が採用 → 累計に入らない (R3 #6 の筋書き)
-  ];
-  assert.equal(await apply('503-1', 12, 'c2', rows2), 'applied');
-  assert.equal(await num(`select count(*) as n from core.order_finance_daily where mall_order_no = '503-1'`), 3);
-  assert.equal(await apply('503-2', 5, 'c5', [line('2026-10-20', 'amazon_settlement_flat_v1', { sales_principal_jpy: 500 })]), 'applied');
-  assert.equal(await apply('503-2', 6, 'empty', []), 'applied');   // 明細が全部消えた
+
+console.log('apply_order_finance_batch (集合の丸ごと置換)');
+await t('🚨 applied → 古い世代は stale → 同じ内容 + 同じ版は same (世代だけ) → 同じ世代で内容違いは例外 → 版が違えば置換', async () => {
+  const r1 = [row('2026-09-05', 'sku-b', { units_ordered: 1, sales_principal_jpy: 1000, commission_jpy: -110 })];
+  assert.equal(await apply('503-1', 10, r1), 'applied');
+  const f = await one(`select net_jpy, listing_id, received_batch_seq, built_at from core.order_finance_daily where mall_order_no = '503-1'`);
+  assert.equal(Number(f.net_jpy), 890); assert.equal(f.listing_id, listing);
+  assert.equal(await apply('503-1', 9, [row('2026-09-05', 'sku-b', { sales_principal_jpy: 1 })]), 'stale');
+  assert.equal(await apply('503-1', 11, r1), 'same');
+  const f2 = await one(`select received_batch_seq, built_at from core.order_finance_daily where mall_order_no = '503-1'`);
+  assert.equal(Number(f2.received_batch_seq), 11); assert.equal(String(f2.built_at), String(f.built_at));
+  await rejects(() => apply('503-1', 11, [row('2026-09-05', 'sku-b', { sales_principal_jpy: 2 })]), /already applied with a different content or version/);
+  assert.equal(await apply('503-1', 12, r1, { version: 't2' }), 'applied');   // 同じ内容でも変換の版が違えば置き換える
+  assert.equal((await one(`select transform_version v from core.order_finance_receipts where mall_order_no = '503-1'`)).v, 't2');
+});
+await t('新しい世代は集合を丸ごと置換 (消えた計上日は消える)・空の集合でも受領状態は残り、遅れた古い世代は戻らない', async () => {
+  assert.equal(await apply('503-2', 5, [row('2026-09-05', 'sku-b', { sales_principal_jpy: 500 }), row('2026-09-10', 'sku-b', { refund_principal_jpy: -500 })]), 'applied');
+  assert.equal(await apply('503-2', 6, [row('2026-09-10', 'sku-b', { refund_principal_jpy: -500 })]), 'applied');
+  assert.equal(await num(`select count(*) as n from core.order_finance_daily where mall_order_no = '503-2'`), 1);
+  assert.equal(await apply('503-2', 7, []), 'applied');
   assert.equal(await num(`select count(*) as n from core.order_finance_daily where mall_order_no = '503-2'`), 0);
-  const rc = await one(`select received_batch_seq, lines from core.order_finance_receipts where mall_order_no = '503-2'`);
-  assert.equal(Number(rc.received_batch_seq), 6); assert.equal(rc.lines, 0);
-  assert.equal(await apply('503-2', 5, 'c5', [line('2026-10-20', 'amazon_settlement_flat_v1', { sales_principal_jpy: 500 })]), 'stale');   // 遅れて届いた古い世代は復活しない
-  assert.equal(await num(`select count(*) as n from core.order_finance_daily where mall_order_no = '503-2'`), 0);
+  assert.equal((await one(`select lines from core.order_finance_receipts where mall_order_no = '503-2'`)).lines, 0);
+  assert.equal(await apply('503-2', 6, [row('2026-09-10', 'sku-b', { refund_principal_jpy: -500 })]), 'stale');
 });
-await t('apply の入力検査: 配列でない / 世代 0 / 違う注文番号の行 / net の検算違い (CHECK) / source_lines 0 / 決まっていない source → 例外で何も変わらない', async () => {
+await t('SQL の歯止め: 整数でない金額・未知の line_kind・疑似注文と計上日の違い・SKU と種類の食い違い・SKU の行の手数料の材料・指紋の形 → 例外で何も変わらない', async () => {
   const before = await num(`select count(*) as n from core.order_finance_daily`);
-  await rejects(() => one(`select core.apply_order_finance_batch($1::smallint, 'amazon', 'jp', 'x-1', 1, 'c', 'v1', '{}'::jsonb)`, [co]), /json array/);
-  await rejects(() => apply('x-1', 0, 'c', []), /positive/);
-  await rejects(() => apply('x-1', 1, 'c', [line('2026-10-01', 'amazon_settlement_flat_v1', { mall_order_no: 'x-2' })]), /different mall_order_no/);
-  await rejects(() => apply('x-1', 1, 'c', [line('2026-10-01', 'amazon_settlement_flat_v1', { sales_principal_jpy: 100, net_jpy: 99 })]), /ck_order_finance_daily_net/);
-  await rejects(() => apply('x-1', 1, 'c', [line('2026-10-01', 'amazon_settlement_flat_v1', { source_lines: 0 })]), /source_lines/);
-  await rejects(() => apply('x-1', 1, 'c', [line('2026-10-01', 'settlement')]), /source_check|violates check/);
+  await rejects(() => applyRaw('x-1', 1, [row('2026-09-05', 'sku-b', { sales_principal_jpy: 1.5 })]), /bigint|invalid input syntax/);
+  await rejects(() => applyRaw('x-2', 1, [row('2026-09-05', '-', { line_kind: 'mystery' })]), /line_kind_check|violates check/);
+  await rejects(() => applyRaw('-:2026-09-05', 1, [row('2026-09-06', '-', { line_kind: 'storage' })]), /ck_order_finance_daily_pseudo/);
+  await rejects(() => applyRaw('x-3', 1, [row('2026-09-05', 'sku-b', { line_kind: 'storage' })]), /ck_order_finance_daily_kind/);
+  await rejects(() => applyRaw('x-4', 1, [row('2026-09-05', 'sku-b', { account_fee_amount_jpy: -1 })]), /ck_order_finance_daily_account_fee/);
+  await rejects(() => applyRaw('x-5', 1, [row('2026-09-05', 'sku-b')], 'not-a-hash'), /sha256/);
+  await rejects(() => applyRaw('x-6', 1, [row('2026-09-05', 'sku-b', { currency: 'USD' })]), /non-JPY/);
   assert.equal(await num(`select count(*) as n from core.order_finance_daily`), before);
-  assert.equal(await num(`select count(*) as n from core.order_finance_receipts where mall_order_no = 'x-1'`), 0);   // 受領行も残らない (同じ取引で巻き戻る)
 });
-await t('JPY だけ。受領状態の無い注文の行は入らない (FK)。会社違いの SKU / 出品は付かない (複合 FK)。同じ会社の SKU・出品は付く', async () => {
-  const cols = 'company_id, mall, scope_key, mall_order_no, economic_date_jst, seller_sku, source, source_lines, received_batch_seq, source_updated_at, transform_version, content_hash';
-  await rejects(() => pg.query(`insert into core.order_finance_daily (${cols}, currency) values ($1, 'amazon', 'jp', '503-1', current_date, 'X', 'amazon_settlement_flat_v1', 1, 12, now(), 'v1', 'h', 'USD')`, [co]), /currency/);
-  await rejects(() => pg.query(`insert into core.order_finance_daily (${cols}) values ($1, 'amazon', 'jp', 'no-receipt', current_date, 'X', 'amazon_settlement_flat_v1', 1, 1, now(), 'v1', 'h')`, [co]), /foreign key|violates/i);
-  await rejects(() => pg.query(`insert into core.order_finance_daily (${cols}, sku_id) values ($1, 'amazon', 'jp', '503-1', date '2026-12-01', 'X', 'amazon_settlement_flat_v1', 1, 12, now(), 'v1', 'h', $2)`, [co, skuOther]), /foreign key|violates/i);
-  await rejects(() => pg.query(`insert into core.order_finance_daily (${cols}, listing_id) values ($1, 'amazon', 'jp', '503-1', date '2026-12-01', 'X', 'amazon_settlement_flat_v1', 1, 12, now(), 'v1', 'h', $2)`, [co, listingOther]), /foreign key|violates/i);
-  await pg.query(`insert into core.order_finance_daily (${cols}, sku_id, listing_id) values ($1, 'amazon', 'jp', '503-1', date '2026-12-01', 'X', 'amazon_settlement_flat_v1', 1, 12, now(), 'v1', 'h', $2, $3)`, [co, sku, listing]);
-  await pg.query(`delete from core.order_finance_daily where mall_order_no = '503-1' and seller_sku = 'X'`);
+await t('net = 20 金額列 + unmapped (内訳 3 列と手数料の材料は足さない)', async () => {
+  await apply('503-3', 1, [row('2026-09-06', 'sku-b', { sales_principal_jpy: 1000, points_jpy: -20, unmapped_jpy: -7, promotion_jpy: -50, promotion_tax_jpy: -5, refund_principal_jpy: -100, refund_principal_customer_jpy: -100 })]);
+  assert.equal(Number((await one(`select net_jpy from core.order_finance_daily where mall_order_no = '503-3'`)).net_jpy), 1000 - 20 - 7 - 50 - 100);
+  await apply('503-3', 2, []);
 });
 
-console.log('mart.v_order_finance_summary / v_order_finance_uncovered');
-await t('🚨 累計は policy が指す source の行だけ: 10/31 は v1、11/2 は V2 (v1 の 11/2 の行は入らない)。全内訳が出て、内訳の合計 = net。ギフト代も出る', async () => {
-  const s = await one(`select *, first_economic_date_jst::text as f, last_economic_date_jst::text as l from mart.v_order_finance_summary where mall_order_no = '503-1'`);
-  assert.equal(Number(s.lines), 2); assert.equal(Number(s.units_net_sold), 0); assert.equal(Number(s.units_ordered), 1); assert.equal(Number(s.units_refunded_customer), 1);
-  assert.equal(Number(s.sales_principal_jpy), 1000); assert.equal(Number(s.sales_giftwrap_jpy), 30); assert.equal(Number(s.refund_principal_jpy), -200); assert.equal(Number(s.commission_jpy), -150);
-  assert.equal(Number(s.net_jpy), 480); assert.equal(s.f, '2026-10-31'); assert.equal(s.l, '2026-11-02');
-  const parts = ['sales_principal_jpy', 'sales_shipping_jpy', 'sales_giftwrap_jpy', 'sales_tax_jpy', 'commission_jpy', 'fba_fulfillment_jpy', 'fba_storage_jpy', 'closing_fee_jpy', 'shipping_chargeback_jpy', 'giftwrap_chargeback_jpy', 'promotion_jpy', 'warehouse_damage_jpy', 'warehouse_lost_jpy', 'safe_t_jpy', 'refund_principal_jpy', 'reversal_reimbursement_jpy', 'misc_fee_jpy', 'other_fee_jpy', 'other_amount_jpy'];
-  assert.equal(parts.reduce((a, k) => a + Number(s[k]), 0), Number(s.net_jpy));
-  const types = (await pg.query(`select column_name, data_type from information_schema.columns where table_schema = 'mart' and table_name = 'v_order_finance_summary' and column_name like '%_jpy'`)).rows;
-  assert.equal(types.length, 20); assert.ok(types.every((c) => c.data_type === 'bigint'), JSON.stringify(types));
+console.log('mart.v_finance_daily (SQLite の日次の財務と同じ値・test-finance-promotion-tax.js と同じ場面)');
+// SKU-Q (注文 O2・SQLite の試験の SKU-B と同じ): 5 日に 2 個 (本体 2,000・税 200・送料 300・手数料 −220・FBA −660・送料のチャージバック −330… ではなく −300・値引き −330 (税 −30))
+//   10 日に返品 (本体 −1,000・送料の返金 −300・返品の手数料 +50 = 返金 −1,250 (うち本体 customer −1,000)・手数料 +110 −22 = +88・チャージバック +300・値引き +330 (税 +30))
+//   12 日にカードの支払い取り消し (本体 −1,000 = 返金 −1,000・customer には入れない = 返品数に入れない・手数料 +88)
+// SKU-C: 5 日に 1 個 1,000・ポイント −30 / 注文番号の無い SKU の行: 7 日 倉庫の破損の補てん +500 (疑似注文 -:2026-09-07)
+await t('返品・カードの支払い取り消し・ポイント・値引きの税・補てん (注文番号なし) の日次 = 手で計算した値', async () => {
+  await apply('O2', 1, [
+    row('2026-09-05', 'sku-q', { units_ordered: 2, sales_principal_jpy: 2000, sales_tax_jpy: 200, sales_shipping_jpy: 300, commission_jpy: -220, fba_fulfillment_jpy: -660, shipping_chargeback_jpy: -300, promotion_jpy: -330, promotion_tax_jpy: -30, source_lines: 9 }),
+    row('2026-09-10', 'sku-q', { refund_principal_jpy: -1250, refund_principal_customer_jpy: -1000, sales_tax_jpy: -100, commission_jpy: 88, shipping_chargeback_jpy: 300, promotion_jpy: 330, promotion_tax_jpy: 30, source_lines: 9 }),
+    row('2026-09-12', 'sku-q', { refund_principal_jpy: -1000, sales_tax_jpy: -100, commission_jpy: 88, source_lines: 4 }),
+  ]);
+  await apply('O3', 1, [row('2026-09-05', 'sku-c', { units_ordered: 1, sales_principal_jpy: 1000, points_jpy: -30, source_lines: 3 })]);
+  await apply(pseudoOrderNo('2026-09-07'), 1, [row('2026-09-07', 'sku-b', { warehouse_damage_jpy: 500 })]);
+  const d = async (date, sku) => one(`select * from mart.v_finance_daily where economic_date_jst = $1 and seller_sku = $2`, [date, sku]);
+  const b5 = await d('2026-09-05', 'sku-q'), b10 = await d('2026-09-10', 'sku-q'), b12 = await d('2026-09-12', 'sku-q'), c5 = await d('2026-09-05', 'sku-c'), b7 = await d('2026-09-07', 'sku-b');
+  const n = (x) => Number(x);
+  assert.deepEqual([b5.units_ordered, n(b5.commission_jpy), n(b5.fba_fulfillment_jpy), n(b5.shipping_chargeback_jpy), n(b5.promotion_jpy), n(b5.promotion_tax_jpy), n(b5.profit_before_cogs_jpy)], [2, 220, 660, 300, 330, 30, 2300 - 220 - 660 - 300 - 330]);
+  assert.deepEqual([n(b10.commission_jpy), n(b10.shipping_chargeback_jpy), n(b10.promotion_jpy), n(b10.promotion_tax_jpy), n(b10.refund_principal_jpy), b10.units_refunded_customer, b10.units_net_sold, n(b10.profit_before_cogs_jpy)],
+    [-88, -300, -330, -30, 1250, 1, -1, 88 + 300 + 330 - 1250]);   // 単価 = 2,000 ÷ 2 = 1,000 → 本体の返金 1,000 ÷ 1,000 = 1 個
+  assert.deepEqual([n(b12.refund_principal_jpy), b12.units_refunded_customer, n(b12.commission_jpy), n(b12.profit_before_cogs_jpy)], [1000, 0, -88, 88 - 1000]);   // 支払い取り消しは返品数に入れない
+  assert.deepEqual([n(c5.points_jpy), n(c5.profit_before_cogs_jpy)], [30, 1000 - 30]);
+  assert.deepEqual([n(b7.warehouse_damage_jpy), n(b7.profit_before_cogs_jpy)], [500, 500]);   // 注文番号の無い SKU の行も日次に入る
+  assert.equal(Number(b5.closing_fee_jpy), 0); assert.equal(b5.units_marketplace_guarantee, 0);   // build の固定値
+  // SQLite の試験の B の合計と同じ: 原価を除いた利益 = 790 − 532 − 912 = −654 (SQLite は原価 400 を引いて −1,054)
+  assert.equal(await num(`select sum(profit_before_cogs_jpy) as n from mart.v_finance_daily where seller_sku = 'sku-q' and economic_date_jst in ('2026-09-05','2026-09-10','2026-09-12')`), -654);
 });
-await t('🚨 policy が無い計上日の行は累計に入らず、v_order_finance_uncovered に出る (黙って落ちない)。policy を足すと消える', async () => {
-  await policy('amazon', 'late', '2026-01-01', '2026-11-01', 'amazon_settlement_flat_v1');
-  await apply('L-1', 1, 'c', [line('2026-10-31', 'amazon_settlement_flat_v1', { sales_principal_jpy: 300 }), line('2026-11-01', 'amazon_settlement_flat_v1', { sales_principal_jpy: 500 })], { scope: 'late' });
-  assert.equal(Number((await one(`select net_jpy from mart.v_order_finance_summary where mall_order_no = 'L-1'`)).net_jpy), 300);
-  const u = (await pg.query(`select mall_order_no, economic_date_jst::text d, net_jpy from mart.v_order_finance_uncovered where scope_key = 'late'`)).rows;
-  assert.equal(u.length, 1); assert.equal(u[0].d, '2026-11-01'); assert.equal(Number(u[0].net_jpy), 500);
-  await rejects(() => pg.query(`select core.assert_finance_policy_covered($1::smallint, 'amazon', 'late', date '2026-10-01', date '2026-12-01')`, [co]), /gap \[2026-11-01, 2026-12-01\)/);
-  await policy('amazon', 'late', '2026-11-01', null, 'amazon_settlement_flat_v1');
-  assert.equal(await num(`select count(*) as n from mart.v_order_finance_uncovered where scope_key = 'late'`), 0);
-  assert.equal(Number((await one(`select net_jpy from mart.v_order_finance_summary where mall_order_no = 'L-1'`)).net_jpy), 800);
-});
-await t("注文に紐付かない費用 (mall_order_no = '-') は累計 view に出ない。採用されていない source の行は uncovered には出ない (期間の policy はある)", async () => {
-  assert.equal(await apply('-', 1, 'fee', [line('2026-10-15', 'amazon_settlement_flat_v1', { seller_sku: '-', fba_storage_jpy: -5000 })]), 'applied');
-  assert.equal(await num(`select count(*) as n from mart.v_order_finance_summary where mall_order_no = '-'`), 0);
-  assert.equal(await num(`select count(*) as n from core.order_finance_daily where mall_order_no = '-'`), 1);
-  assert.equal(await num(`select count(*) as n from mart.v_order_finance_uncovered where mall_order_no = '503-1'`), 0);   // v1 の 11/2 は「未採用」だが期間の policy はある
-});
-
-console.log('mart.finance_daily (日次集計。旧表と同じ列・符号規約)');
-await t('旧表 f_amazon_finance_sku_daily_v1 の数量 5 列・金額 19 列が同じ名前である。絶対値の列に負は入らない', async () => {
-  const oldCols = ['units_ordered', 'units_refunded_customer', 'units_marketplace_guarantee', 'units_a_to_z_refund', 'units_net_sold',
-    'sales_principal_jpy', 'sales_shipping_jpy', 'sales_giftwrap_jpy', 'sales_tax_jpy', 'commission_jpy', 'fba_fulfillment_jpy', 'fba_storage_jpy', 'closing_fee_jpy',
-    'shipping_chargeback_jpy', 'giftwrap_chargeback_jpy', 'promotion_jpy', 'warehouse_damage_jpy', 'warehouse_lost_jpy', 'safe_t_jpy', 'refund_principal_jpy',
-    'reversal_reimbursement_jpy', 'misc_fee_jpy', 'other_fee_jpy', 'other_amount_jpy'];
-  const have = new Set((await pg.query(`select column_name from information_schema.columns where table_schema = 'mart' and table_name = 'finance_daily'`)).rows.map((r) => r.column_name));
-  assert.deepEqual(oldCols.filter((c) => !have.has(c)), []);
-  const haveOrder = new Set((await pg.query(`select column_name from information_schema.columns where table_schema = 'core' and table_name = 'order_finance_daily'`)).rows.map((r) => r.column_name));
-  assert.deepEqual(oldCols.filter((c) => !haveOrder.has(c)), []);
-  await rejects(() => pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source, fba_storage_jpy) values ('r0', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1', -1)`, [co]), /ck_finance_daily_abs/);
-  await pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source, commission_jpy, warehouse_damage_jpy) values ('r0', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1', -150, -20)`, [co]);   // commission は正味 (返還だけの日は負)、補填は符号そのまま
-});
-await t('🚨 旧互換 (legacy_*): 明細単位の ABS 合計を別に持つ。保管料 −100 + 訂正 +40 → 符号つき −60・旧互換 140。返還だけの日の commission は負。legacy_* に負は入らない', async () => {
-  await policy('amazon', 'lg', '2026-01-01', null, 'amazon_settlement_flat_v1');
-  const rows = [
-    line('2026-10-05', 'amazon_settlement_flat_v1', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000, fba_storage_jpy: -60, commission_jpy: -150, promotion_jpy: -80, other_fee_jpy: 5,
-      legacy_fba_storage_jpy: 140, legacy_commission_gross_jpy: 150, legacy_promotion_jpy: 80, legacy_other_fee_jpy: 25, legacy_complete: true }),
-    line('2026-10-06', 'amazon_settlement_flat_v1', { units_refunded_customer: 1, units_net_sold: -1, refund_principal_jpy: -1000, commission_jpy: 150,
-      legacy_refund_principal_customer_jpy: 1000, legacy_refund_commission_jpy: 150, legacy_complete: true }),   // 返還だけの日
-  ];
-  assert.equal(await apply('LG-1', 1, 'c', rows, { scope: 'lg' }), 'applied');
-  const d5 = await one(`select * from mart.v_finance_daily_legacy where scope_key = 'lg' and economic_date_jst = date '2026-10-05'`);
-  assert.equal(Number(d5.fba_storage_jpy), 140); assert.equal(Number(d5.commission_jpy), 150); assert.equal(Number(d5.promotion_jpy), 80); assert.equal(Number(d5.other_fee_jpy), 25);
-  assert.equal(Number(d5.sales_principal_jpy), 1000); assert.equal(Number(d5.closing_fee_jpy), 0); assert.equal(Number(d5.units_net_sold), 1); assert.equal(Number(d5.source_row_count), 1);
-  const d6 = await one(`select commission_jpy, refund_principal_jpy, units_refunded_customer, units_net_sold from mart.v_finance_daily_legacy where scope_key = 'lg' and economic_date_jst = date '2026-10-06'`);
-  assert.equal(Number(d6.commission_jpy), -150); assert.equal(Number(d6.refund_principal_jpy), 1000); assert.equal(Number(d6.units_refunded_customer), 1); assert.equal(Number(d6.units_net_sold), -1);
-  // 符号つきの真の値はそのまま (net = 合計)
-  const s = await one(`select fba_storage_jpy, commission_jpy, net_jpy from mart.v_order_finance_summary where mall_order_no = 'LG-1'`);
-  assert.equal(Number(s.fba_storage_jpy), -60); assert.equal(Number(s.commission_jpy), 0); assert.equal(Number(s.net_jpy), 1000 - 60 - 150 - 80 + 5 - 1000 + 150);
-  // legacy 列は旧表 (v_finance_daily_legacy) と同じ名前で finance_daily に写せる (旧表の 24 列すべて)
-  const legacyCols = (await pg.query(`select column_name from information_schema.columns where table_schema = 'mart' and table_name = 'v_finance_daily_legacy'`)).rows.map((r) => r.column_name);
-  const fdCols = new Set((await pg.query(`select column_name from information_schema.columns where table_schema = 'mart' and table_name = 'finance_daily'`)).rows.map((r) => r.column_name));
-  assert.deepEqual(legacyCols.filter((c) => !['order_rows', 'legacy_incomplete_rows'].includes(c) && !fdCols.has(c)), []);
-  await rejects(() => apply('LG-2', 1, 'c', [line('2026-10-05', 'amazon_settlement_flat_v1', { legacy_fba_storage_jpy: -1 })], { scope: 'lg' }), /legacy_fba_storage_jpy/);
-  // policy が指さない source の行は旧互換の日次にも入らない
-  await apply('LG-3', 1, 'c', [line('2026-10-05', 'amazon_settlement_flat_v2', { legacy_fba_storage_jpy: 999, legacy_complete: true })], { scope: 'lg' });
-  assert.equal(Number((await one(`select fba_storage_jpy from mart.v_finance_daily_legacy where scope_key = 'lg' and economic_date_jst = date '2026-10-05'`)).fba_storage_jpy), 140);
-});
-await t('🚨 旧 SQL の式を期待値に: 返品数量は「日 × SKU の返金額 ÷ 月の Order 単価」を丸める (注文ごとに丸めない)。SKU 無しの行は旧互換に入らない。source_row_count = Σ source_lines', async () => {
-  await policy('amazon', 'old', '2026-01-01', null, 'amazon_settlement_flat_v1');
-  const L = (date, x) => line(date, 'amazon_settlement_flat_v1', { legacy_complete: true, ...x });
-  // 10 月の Order: 3 注文で 単価 1,000 円 × 各 1 個 (月の単価 = trunc(3000 * 1e6 / 3) = 1,000,000 micro)
-  await apply('O-1', 1, 'c', [L('2026-10-01', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000 })], { scope: 'old' });
-  await apply('O-2', 1, 'c', [L('2026-10-02', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000 })], { scope: 'old' });
-  await apply('O-3', 1, 'c', [L('2026-10-02', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000 })], { scope: 'old' });
-  // 10/10: 別注文に 400 円ずつの返金 (customer) + 別注文に 600 円の A-to-z。旧: ROUND(800/1000)=1、ROUND(600/1000)=1。注文ごとなら 0+0+1
-  await apply('O-1', 2, 'c2', [L('2026-10-01', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000 }), L('2026-10-10', { refund_principal_jpy: -400, legacy_refund_principal_customer_jpy: 400, source_lines: 2 })], { scope: 'old' });
-  await apply('O-2', 2, 'c2', [L('2026-10-02', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000 }), L('2026-10-10', { refund_principal_jpy: -400, legacy_refund_principal_customer_jpy: 400 })], { scope: 'old' });
-  await apply('O-3', 2, 'c2', [L('2026-10-02', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000 }), L('2026-10-10', { refund_principal_jpy: -600, legacy_refund_principal_atoz_jpy: 600 })], { scope: 'old' });
-  // 旧 build と同じ式を JS で (unit_price_micro = trunc(Σ principal_micro / Σ qty)、units = ROUND(refund_micro / unit_price_micro))
-  const unitPriceMicro = Math.trunc((3000 * 1e6) / 3);
-  const expectCustomer = Math.round((800 * 1e6) / unitPriceMicro), expectAtoz = Math.round((600 * 1e6) / unitPriceMicro);
-  assert.equal(expectCustomer, 1); assert.equal(expectAtoz, 1);
-  const d = await one(`select * from mart.v_finance_daily_legacy where scope_key = 'old' and economic_date_jst = date '2026-10-10'`);
-  assert.equal(Number(d.units_refunded_customer), expectCustomer); assert.equal(Number(d.units_a_to_z_refund), expectAtoz); assert.equal(Number(d.units_marketplace_guarantee), 0);
-  assert.equal(Number(d.units_net_sold), 0 - expectCustomer - expectAtoz); assert.equal(Number(d.refund_principal_jpy), 1400); assert.equal(Number(d.source_row_count), 4);   // 2 + 1 + 1
-  const d2 = await one(`select units_ordered, units_net_sold, sales_principal_jpy, source_row_count, order_rows from mart.v_finance_daily_legacy where scope_key = 'old' and economic_date_jst = date '2026-10-02'`);
-  assert.equal(Number(d2.units_ordered), 2); assert.equal(Number(d2.units_net_sold), 2); assert.equal(Number(d2.sales_principal_jpy), 2000); assert.equal(Number(d2.order_rows), 2);
-  // 単価が無い月 (Order が無い) の返金 → 旧は NULL → 0
-  await apply('O-9', 1, 'c', [L('2026-11-05', { refund_principal_jpy: -500, legacy_refund_principal_customer_jpy: 500 })], { scope: 'old' });
-  assert.equal(Number((await one(`select units_refunded_customer from mart.v_finance_daily_legacy where scope_key = 'old' and economic_date_jst = date '2026-11-05'`)).units_refunded_customer), 0);
-  // SKU 無しの費用行は core には残るが旧互換の日次には出ない
-  await apply('-', 1, 'fee-old', [L('2026-10-10', { seller_sku: '-', fba_storage_jpy: -5000, legacy_fba_storage_jpy: 5000 })], { scope: 'old' });
-  assert.equal(await num(`select count(*) as n from mart.v_finance_daily_legacy where scope_key = 'old' and seller_sku = '-'`), 0);
-  assert.equal(Number((await one(`select fba_storage_jpy from mart.v_finance_daily_legacy where scope_key = 'old' and economic_date_jst = date '2026-10-10'`)).fba_storage_jpy), 0);
-  assert.equal(await num(`select count(*) as n from core.order_finance_daily where scope_key = 'old' and mall_order_no = '-'`), 1);
-});
-await t('🚨 legacy_* の未提供は 0 と区別する: legacy_complete=false の行があると legacy_incomplete_rows > 0 で、assert_legacy_complete は例外。apply で JPY 以外の currency は例外', async () => {
-  await apply('O-8', 1, 'c', [line('2026-10-20', 'amazon_settlement_flat_v1', { fba_storage_jpy: -100 })], { scope: 'old' });   // legacy 無し (V2 に切り替えた後に省略した想定)
-  const d = await one(`select fba_storage_jpy, legacy_incomplete_rows from mart.v_finance_daily_legacy where scope_key = 'old' and economic_date_jst = date '2026-10-20'`);
-  assert.equal(Number(d.fba_storage_jpy), 0); assert.equal(Number(d.legacy_incomplete_rows), 1);   // 0 に見えるが「未提供」と分かる
-  await rejects(() => pg.query(`select core.assert_legacy_complete($1::smallint, 'amazon', 'old', date '2026-10-01', date '2026-11-01')`, [co]), /1 adopted rows .*legacy_complete = false/);
-  await pg.query(`select core.assert_legacy_complete($1::smallint, 'amazon', 'old', date '2026-11-01', date '2026-12-01')`, [co]);   // 11 月は揃っている
-  await pg.query(`select core.assert_legacy_complete($1::smallint, 'amazon', 'lg', date '2026-10-01', date '2026-11-01')`, [co]);
-  await rejects(() => apply('O-7', 1, 'c', [line('2026-10-21', 'amazon_settlement_flat_v1', { currency: 'USD', sales_principal_jpy: 100 })], { scope: 'old' }), /non-JPY/);
-  assert.equal(await num(`select count(*) as n from core.order_finance_daily where mall_order_no = 'O-7'`), 0);
-});
-await t('listing / sku / seller_sku のどれが null でも主キーが組める (grain_key)。同じ run に同じ粒度は 2 行入らない。seller_sku の「無し」は null だけ。JPY だけ。会社違いの SKU / 出品は付かない', async () => {
-  await pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source) values ('r1', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1')`, [co]);
-  await rejects(() => pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source) values ('r1', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1')`, [co]), /duplicate key/);
-  await pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source, sku_id, listing_id, seller_sku) values ('r1', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1', $2, $3, 'pr_SKU-A')`, [co, sku, listing]);
-  await pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source, seller_sku) values ('r1', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1', 'pr_SKU-A')`, [co]);
-  const g = (await pg.query(`select grain_key from mart.finance_daily where run_id = 'r1' order by grain_key`)).rows.map((r) => r.grain_key);
-  assert.deepEqual(g, ['-|-|-', '-|-|pr_SKU-A', `${listing}|${sku}|pr_SKU-A`]);
-  await rejects(() => pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source, seller_sku) values ('r1', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1', '-')`, [co]), /finance_daily_seller_sku_check|violates check/);
-  await rejects(() => pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source, currency) values ('r2', $1, current_date, 'amazon', 'us', 'amazon_finances_api', 'USD')`, [co]), /currency/);
-  await rejects(() => pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source, sku_id) values ('r3', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1', $2)`, [co, skuOther]), /foreign key|violates/i);
-  await rejects(() => pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source, listing_id) values ('r3', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1', $2)`, [co, listingOther]), /foreign key|violates/i);
+await t('単価の丸め = ROUND (0.5 は 0 から遠い方)・Order の数量 0 の月は返品数 0', async () => {
+  // 3 個で 2 円 → 単価 666,666.67 micro → ROUND = 666,667 (trunc なら 666,666)。本体の返金 1 円 → 1,000,000 ÷ 666,667 = 1.4999… → 1 個 (trunc の単価だと 1.5000… → 2 個)
+  await apply('R1', 1, [row('2026-08-03', 'sku-r', { units_ordered: 3, sales_principal_jpy: 2 }), row('2026-08-20', 'sku-r', { refund_principal_jpy: -1, refund_principal_customer_jpy: -1 })]);
+  assert.equal((await one(`select units_refunded_customer u from mart.v_finance_daily where seller_sku = 'sku-r' and economic_date_jst = '2026-08-20'`)).u, 1);
+  await apply('R2', 1, [row('2026-07-20', 'sku-z', { refund_principal_jpy: -500, refund_principal_customer_jpy: -500 })]);   // その月に売上が無い
+  assert.equal((await one(`select units_refunded_customer u from mart.v_finance_daily where seller_sku = 'sku-z'`)).u, 0);
 });
 
-await pg.close();
-console.log(`\n${ok} ok / ${ng} NG`);
-process.exitCode = ng ? 1 : 0;
+console.log('月の手数料・uncovered・注文の累計');
+await t('月の手数料 = 種類ごとの Σ(other_amount + item_related_fee)。本物の注文の Easy Ship も入る・手数料に入れない種類は入らない', async () => {
+  await apply(pseudoOrderNo('2026-09-03'), 1, [
+    row('2026-09-03', '-', { line_kind: 'storage', fba_storage_jpy: -300, account_fee_amount_jpy: -300 }),
+    row('2026-09-03', '-', { line_kind: 'subscription', other_amount_jpy: -4900, account_fee_amount_jpy: -4900 }),
+    row('2026-09-03', '-', { line_kind: 'not_account_fee', other_amount_jpy: -1000, account_fee_amount_jpy: -1000 }),
+  ]);
+  await apply('ES-1', 1, [row('2026-09-04', '-', { line_kind: 'easy_ship', other_fee_jpy: -440, other_amount_jpy: -100, account_fee_amount_jpy: -540 })]);   // 新しい月 = item_related_fee (-440) + 古い月の列 (-100)
+  const m = Object.fromEntries((await pg.query(`select fee_type, amount_jpy from mart.v_finance_account_fees_monthly where month_start_jst = '2026-09-01'`)).rows.map((r) => [r.fee_type, Number(r.amount_jpy)]));
+  assert.deepEqual(m, { easy_ship: -540, storage: -300, subscription: -4900 });
+});
+await t('🚨 uncovered = policy の無い日 (no_policy) と source の違う日 (source_mismatch)。どちらも日次に入らない', async () => {
+  await apply('U1', 1, [row('2025-12-31', 'sku-u', { sales_principal_jpy: 100 }), row('2026-09-08', 'sku-u', { sales_principal_jpy: 200, source: 'amazon_settlement_flat_v1' })]);
+  const u = (await pg.query(`select economic_date_jst::text d, reason from mart.v_order_finance_uncovered where mall_order_no = 'U1' order by 1`)).rows;
+  assert.deepEqual(u, [{ d: '2025-12-31', reason: 'no_policy' }, { d: '2026-09-08', reason: 'source_mismatch' }]);
+  assert.equal(await num(`select count(*) as n from mart.v_finance_daily where seller_sku = 'sku-u'`), 0);
+});
+await t('注文の累計は本物の注文だけ (疑似注文 -: は入らない)', async () => {
+  assert.equal(await num(`select count(*) as n from mart.v_order_finance_summary where mall_order_no like '-%'`), 0);
+  const o2 = await one(`select units_ordered, net_jpy from mart.v_order_finance_summary where mall_order_no = 'O2'`);
+  assert.equal(o2.units_ordered, 2);
+});
+
+console.log('指紋 (checksum) の決めと受け口の検証');
+await t('指紋 = 並べ方 (UTF-8 のバイト順)・列の順・空の集合 = [] の sha256。行の順が違っても同じ・列を 1 つ変えると変わる', async () => {
+  const rs = validateFinanceRows('A1', [row('2026-09-02', 'b', { sales_principal_jpy: 5 }), row('2026-09-01', 'a', { units_ordered: 1 })]);
+  const expectJson = JSON.stringify([
+    CONTENT_COLUMNS.map((c) => ({ economic_date_jst: '2026-09-01', seller_sku: 'a', line_kind: 'sku', source: U, units_ordered: 1, source_lines: 1 }[c] ?? 0)),
+    CONTENT_COLUMNS.map((c) => ({ economic_date_jst: '2026-09-02', seller_sku: 'b', line_kind: 'sku', source: U, sales_principal_jpy: 5, source_lines: 1 }[c] ?? 0)),
+  ]);
+  assert.equal(orderFinanceChecksum(rs), crypto.createHash('sha256').update(Buffer.from(expectJson, 'utf8')).digest('hex'));
+  assert.equal(orderFinanceChecksum([...rs].reverse()), orderFinanceChecksum(rs));
+  assert.equal(orderFinanceChecksum([]), crypto.createHash('sha256').update('[]').digest('hex'));
+  const base = orderFinanceChecksum(rs);
+  for (const c of CONTENT_COLUMNS.filter((c) => !['economic_date_jst', 'seller_sku', 'line_kind', 'source'].includes(c))) {
+    const x = rs.map((r, i) => (i === 0 ? { ...r, [c]: r[c] + 1 } : r));
+    assert.notEqual(orderFinanceChecksum(x), base, `列 ${c} を変えても指紋が変わらない`);
+  }
+});
+await t('形の検査: 安全でない整数 (上限外・足すと超える)・NFC でない SKU・疑似注文の日付違い・行の鍵の重複 → 整形できない', async () => {
+  assert.throws(() => validateFinanceRows('A1', [row('2026-09-01', 'a', { sales_principal_jpy: Number.MAX_SAFE_INTEGER + 2 })]), /safe integer/);
+  assert.throws(() => validateFinanceRows('A1', [row('2026-09-01', 'a', { sales_principal_jpy: Number.MAX_SAFE_INTEGER, commission_jpy: 10 })]), /net is not a safe integer/);
+  assert.doesNotThrow(() => validateFinanceRows('A1', [row('2026-09-01', 'a', { sales_principal_jpy: Number.MAX_SAFE_INTEGER })]));
+  assert.throws(() => validateFinanceRows('A1', [row('2026-09-01', 'é')]), /NFC/);   // é を 2 文字で
+  assert.throws(() => validateFinanceRows('-:2026-09-01', [row('2026-09-02', '-', { line_kind: 'storage' })]), /pseudo order/);
+  assert.throws(() => validateFinanceRows('A1', [row('2026-09-01', 'a'), row('2026-09-01', 'a')]), /duplicate row key/);
+  assert.throws(() => validateFinanceRows('A1', [row('2026-02-30', 'a')]), /not a date/);
+});
+await t('受け口: 送り手の申告の指紋が内容と違えば 400・合っていれば通る', async () => {
+  const rows = [row('2026-09-01', 'a', { sales_principal_jpy: 5 })];
+  const good = orderFinanceChecksum(validateFinanceRows('A1', rows));
+  const body = (cs) => ({ run_id: 'ship_202609291200000_abcdef', batch_seq: 1, chunk_index: 0, last: true, transform_version: 't1',
+    rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'A1', header: { transform_version: 't1', set_checksum: cs }, lines: rows }] });
+  assert.equal(validateFinanceChunk(body(good)).rows[0].set_checksum, good);
+  assert.throws(() => validateFinanceChunk(body('0'.repeat(64))), /set_checksum differs/);
+  assert.throws(() => validateFinanceChunk({ ...body(good), rows: [{ ...body(good).rows[0], mall_order_no: '-:2026-9-1' }] }), /mall_order_no has a bad form/);
+});
+
+console.log('#1533 Codex R1 の直し');
+await t('🚨 丸め = 本物の SQLite の CAST(ROUND(a * 1.0 / b) AS INTEGER) と同じ答え (Codex の例 + 0.5 の境目の近く + 乱数 3,000 組)', async () => {
+  const sq = new Database(':memory:');
+  const sqRound = sq.prepare('SELECT CAST(ROUND(? * 1.0 / ?) AS INTEGER) AS r');
+  const pairs = [[4000002001000000, 2000001], [1000000000, 2000000000], [1000000000, 2000000001], [2000000, 3], [1000000, 666667], [-1000000, 3], [5, 10], [15, 10], [-15, 10]];
+  let seed = 12345; const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  for (let i = 0; i < 3000; i++) {
+    const b = 1 + Math.floor(rnd() * 5000000);
+    const k = Math.floor(rnd() * 3000000000);
+    const a = k * b + Math.floor(b / 2) + Math.floor(rnd() * 3) - 1;   // 0.5 の境目の近く
+    if (Number.isSafeInteger(a)) pairs.push([rnd() < 0.2 ? -a : a, b]);
+  }
+  const bad = [];
+  for (const [a, b] of pairs) {
+    const want = Number(sqRound.get(BigInt(a), BigInt(b)).r);
+    const got = Number((await one(`select core.sqlite_round($1::bigint::float8 / $2::bigint::float8) as r`, [String(a), String(b)])).r);
+    if (want !== got) bad.push([a, b, want, got]);
+  }
+  sq.close();
+  assert.equal(bad.length, 0, `SQLite と違う: ${JSON.stringify(bad.slice(0, 5))}`);
+  // view でも: 本体 4,000,002,001 円・2,000,001 個 → 単価 2,000,000,000 micro (SQLite) → 本体の返金 1,000 円は 1 個
+  await apply('RB', 1, [row('2026-06-03', 'sku-rb', { units_ordered: 2000001, sales_principal_jpy: 4000002001 }), row('2026-06-20', 'sku-rb', { refund_principal_jpy: -1000, refund_principal_customer_jpy: -1000 })]);
+  assert.equal((await one(`select units_refunded_customer u from mart.v_finance_daily where seller_sku = 'sku-rb' and economic_date_jst = '2026-06-20'`)).u, 1);
+});
+await t('🚨 通貨: JPY 以外の行は形の確かめで拒む (受け口の 400・HTTP の道で USD が円として入らない)', async () => {
+  assert.throws(() => validateFinanceRows('C1', [row('2026-09-01', 'a', { currency: 'USD', sales_principal_jpy: 100 })]), /currency must be JPY/);
+  const rows = [row('2026-09-01', 'a', { currency: 'USD', sales_principal_jpy: 100 })];
+  const body = { run_id: 'ship_202609291200000_abcdef', batch_seq: 1, chunk_index: 0, last: true, transform_version: 't1',
+    rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'C1', header: { transform_version: 't1', set_checksum: '0'.repeat(64) }, lines: rows }] };
+  assert.throws(() => validateFinanceChunk(body), /currency must be JPY/);
+  assert.doesNotThrow(() => validateFinanceRows('C1', [row('2026-09-01', 'a', { currency: 'JPY' })]));
+});
+await t('受け口の道 (validateFinanceChunk → ingestOrderFinanceChunk) で入る・同じ chunk の再送は同じ結果', async () => {
+  const rows = [row('2026-09-01', 'sku-http', { units_ordered: 1, sales_principal_jpy: 300 })];
+  const cs = orderFinanceChecksum(validateFinanceRows('H1', rows));
+  const body = { run_id: 'ship_202609291300000_abcdef', batch_seq: 3, chunk_index: 0, last: true, transform_version: 't1',
+    rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'H1', header: { transform_version: 't1', set_checksum: cs }, lines: rows }] };
+  const r = await ingestOrderFinanceChunk(pgliteAdapter(pg), { ...validateFinanceChunk(body), host: 'test' });
+  assert.equal(r.applied, 1, JSON.stringify(r));
+  const again = await ingestOrderFinanceChunk(pgliteAdapter(pg), { ...validateFinanceChunk(body), host: 'test' });   // 同じ chunk の再送 (#1533 Codex R2)
+  assert.ok(again.replay === true, JSON.stringify(again));
+  assert.equal(await num(`select count(*) as n from core.order_finance_daily where mall_order_no = 'H1'`), 1);
+  assert.equal(Number((await one(`select sales_principal_jpy s from core.order_finance_daily where mall_order_no = 'H1'`)).s), 300);
+  assert.equal((await one(`select currency from core.order_finance_daily where mall_order_no = 'H1'`)).currency, 'JPY');
+});
+await t('🚨 server.js は order-finance を 事前の鍵の検査 と 共通の 10MB parser の素通り の両方に入れている (router 側の 12MB・圧縮なしが効く。#1533 Codex R2)', async () => {
+  const fs = await import('node:fs'), path = await import('node:path'), { fileURLToPath } = await import('node:url');
+  const srv = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'server.js'), 'utf8');
+  assert.match(srv, /app\.use\(\[[^\]]*'\/apps\/company-db\/sync\/order-finance'[^\]]*\], companyDbRequireSyncKey\);/);
+  assert.match(srv, /normalizedPath\.toLowerCase\(\)\.startsWith\('\/apps\/company-db\/sync\/order-finance'\)\) return next\(\);/);
+});
+await t('足し算の途中で安全な整数を超えたら拒む (最後だけ範囲に戻っても)', async () => {
+  assert.throws(() => validateFinanceRows('A1', [row('2026-09-01', 'a', { sales_principal_jpy: Number.MAX_SAFE_INTEGER, sales_shipping_jpy: 2, sales_giftwrap_jpy: -2 })]), /net is not a safe integer \(at sales_shipping_jpy\)/);
+});
+await t('指紋は固定の値 (日本語の SKU = UTF-8 のバイト順で a < あ < b)', async () => {
+  const rs = validateFinanceRows('A1', [row('2026-09-02', 'b', { sales_principal_jpy: 5 }), row('2026-09-01', 'あ', { units_ordered: 1 }), row('2026-09-01', 'a', { commission_jpy: -3 })]);
+  const json = '[["2026-09-01","a","sku","amazon_settlement_unified",0,0,0,0,0,-3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],["2026-09-01","あ","sku","amazon_settlement_unified",1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],["2026-09-02","b","sku","amazon_settlement_unified",0,5,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]]';
+  assert.equal(crypto.createHash('sha256').update(Buffer.from(json, 'utf8')).digest('hex'), 'da0531f5f6d092cdc3cc473c2be393713813f923f10fe373d6603aa456bb81b1');
+  assert.equal(orderFinanceChecksum(rs), 'da0531f5f6d092cdc3cc473c2be393713813f923f10fe373d6603aa456bb81b1');   // 列の順・並べ方・JSON の書き方を変えたら落ちる (送り手と受け口の取り決め)
+});
+await t('🚨 0043 は受領状態・公開の表のどれかに 1 行でもあれば止まる', async () => {
+  for (const setup of [
+    `insert into core.order_finance_receipts (company_id, mall, scope_key, mall_order_no, received_batch_seq, set_checksum, lines) values (1, 'amazon', 'jp', 'x', 1, 'c', 0)`,
+    `insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source) values ('r', 1, '2026-09-01', 'amazon', 'jp', 's')`,
+  ]) {
+    const pg3 = new PGlite();
+    await applyMigrations(pgliteAdapter(pg3), { log: quiet, to: '0042' });
+    await pg3.query(setup);
+    await rejects(() => applyMigrations(pgliteAdapter(pg3), { log: quiet }), /0012 の表が空ではない/);
+    await pg3.close();
+  }
+});
+
+console.log(`\n${ok} 件 PASS${ng ? ` / ${ng} 件 NG` : ''}`);
+process.exit(ng ? 1 : 0);

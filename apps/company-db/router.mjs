@@ -24,6 +24,7 @@ import { ingestStockDay, stockDayStatus } from './ingest/stock-daily.mjs';
 import { ingestAdSpendDay, adSpendStatus, relinkAdSpend } from './ingest/ad-spend.mjs';
 import { ingestShipmentChunk, validateChunk } from './ingest/shipments.mjs';
 import { ingestOrderChunk, validateChunk as validateOrderChunk, MALLS } from './ingest/orders.mjs';
+import { ingestOrderFinanceChunk, validateFinanceChunk, FINANCE_MALLS } from './ingest/order-finance.mjs';
 
 const router = express.Router();
 
@@ -240,6 +241,122 @@ router.get('/orders/daily', requireSyncKey, async (req, res) => {
   });
 });
 
+/**
+ * 注文 (疑似注文) の財務の push の受け口 (F2b-1。送り手 = apps/company-db/push/amazon-finance.mjs (F2b-2)、本体 = ingest/order-finance.mjs・0043):
+ *   POST /apps/company-db/sync/order-finance                          1 chunk (1 モール × 1 scope) を 1 取引で core.apply_order_finance_batch() に。集合の指紋は受け口が計算し直す
+ *   GET  /apps/company-db/sync/order-finance/status?mall&scope        件数・世代・直近の run・DB の大きさ (pg_database_size と、読めれば WAL の大きさ = 送り手が次の chunk の前に容量を見る)
+ *   GET  /apps/company-db/sync/order-finance/receipt                  受領記録 (伝票と同じ = run_id で引く)
+ *   GET  /apps/company-db/sync/order-finance/keys?mall&scope&after&limit     受け取った注文番号 (疑似注文も。送り手の全件の作り直しで Render にだけある鍵を見つける)
+ *   GET  /apps/company-db/sync/order-finance/daily?mall&scope&from&to        mart.v_finance_daily (日 × SKU・突き合わせの材料)
+ *   GET  /apps/company-db/sync/order-finance/account-fees?mall&scope&from&to mart.v_finance_account_fees_monthly (月 × 手数料の種類)
+ *   GET  /apps/company-db/sync/order-finance/uncovered?mall&scope            mart.v_order_finance_uncovered の件数と例 (policy が無い日・source が違う日)
+ * 設計 = AI_reference『CompanyDB構想/12_Amazon財務のCompanyDB取込_設計_20260929.md』
+ */
+const financeMallScopeOf = (req) => {
+  const mall = String(req.query.mall || ''), scope = String(req.query.scope || '');
+  if (!FINANCE_MALLS.includes(mall) || !/^[0-9A-Za-z][0-9A-Za-z_-]{0,30}$/.test(scope)) return null;
+  return { mall, scope };
+};
+// 2026-02-30 は通さない (DB の 500 ではなく 400)・2026-13-01 は Date が不正 = toISOString の例外の前に NaN で落とす (#1533 Codex R2)
+const isRealDate = (s) => { if (!DATE_RE.test(s)) return false; const ms = Date.parse(`${s}T00:00:00Z`); return !Number.isNaN(ms) && new Date(ms).toISOString().slice(0, 10) === s; };
+const financeRangeOf = (req, maxDays) => {
+  const from = String(req.query.from || ''), to = String(req.query.to || '');
+  if (!isRealDate(from) || !isRealDate(to) || from > to) return { error: 'from / to must be real dates (YYYY-MM-DD) and from <= to' };
+  if ((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 + 1 > maxDays) return { error: `range must be <= ${maxDays} days (both ends included)` };
+  return { from, to };
+};
+
+router.post('/order-finance', requireSyncKey, shipmentsJson, shipmentsParserError, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let chunk;
+  try { chunk = validateFinanceChunk(req.body); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  if (!chunk.mall) return res.status(400).json({ error: 'an order finance chunk needs at least one row (mall / scope come from the rows)' });
+  let client;
+  const t0 = Date.now();
+  try {
+    client = await pgClientFactory(url);
+    await client.query(`set statement_timeout = '20s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '60s'`);
+    const r = await ingestOrderFinanceChunk(pgAdapter(client), { ...chunk, host: 'render', log: (m) => console.log(`[company-db order-finance ${chunk.mall}] ${chunk.runId} ${m}`) });
+    res.json(r);
+  } catch (e) {
+    const status = e.code === 'CHUNK_DEADLINE' ? 503 : (e.code === 'RUN_MISMATCH' || e.code === 'CHUNK_MISMATCH' || e.code === 'RUN_CLOSED') ? 409 : e.code === 'BAD_REQUEST' ? 400 : 500;
+    console.error(`[company-db order-finance ${chunk.mall}] ${chunk.runId} chunk ${chunk.chunkIndex} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null, run_id: chunk.runId, chunk_index: chunk.chunkIndex });
+  } finally { if (client) { try { await client.end(); } catch { /* */ } } }
+});
+
+router.get('/order-finance/status', requireSyncKey, async (req, res) => {
+  const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  await withPg(res, async (client) => {
+    const q = async (sql, p = []) => (await client.query(sql, p)).rows;
+    const [c] = await q(`select (select count(*) from core.order_finance_receipts where company_id = 1 and mall = $1 and scope_key = $2) as orders,
+      (select count(*) from core.order_finance_daily where company_id = 1 and mall = $1 and scope_key = $2) as rows,
+      (select max(received_batch_seq) from core.order_finance_receipts where company_id = 1 and mall = $1 and scope_key = $2) as max_batch_seq,
+      (select max(economic_date_jst)::text from core.order_finance_daily where company_id = 1 and mall = $1 and scope_key = $2) as max_economic_date,
+      pg_database_size(current_database()) as db_bytes`, [ms.mall, ms.scope]);
+    // WAL の大きさ (pg_database_size は WAL を含まない)。権限が無ければ null = 送り手は Render での試しで測った倍率で見込む
+    let walBytes = null;
+    try { walBytes = Number((await q(`select coalesce(sum(size), 0) as b from pg_ls_waldir()`))[0].b); } catch { walBytes = null; }
+    const runs = await q(`select r.ingest_run_id, r.status, r.started_at, r.finished_at, r.rows_seen, r.rows_inserted, r.rows_skipped, r.checksum as batch_seq, r.pages as chunks_expected, r.error,
+        (select count(*)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as chunks_received,
+        (select coalesce(sum(c.rows_failed), 0)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as rows_failed,
+        (r.status = 'running' and r.started_at < now() - interval '6 hours') as stalled
+       from ops.ingest_runs r where r.source_system = $1 and r.entity = 'order_finance' and r.scope_key = $2 order by r.started_at desc limit 5`, [ms.mall, ms.scope]);
+    res.json({ mall: ms.mall, scope: ms.scope,
+      counts: { orders: Number(c.orders), rows: Number(c.rows), max_batch_seq: c.max_batch_seq == null ? null : Number(c.max_batch_seq), max_economic_date: c.max_economic_date },
+      size: { db_bytes: Number(c.db_bytes), wal_bytes: walBytes }, runs });
+  });
+});
+
+router.get('/order-finance/keys', requireSyncKey, async (req, res) => {
+  const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  const after = String(req.query.after || '');
+  const limitRaw = req.query.limit === undefined ? 20000 : Number(req.query.limit);
+  if (!Number.isInteger(limitRaw)) return res.status(400).json({ error: 'limit must be an integer' });
+  const limit = Math.min(Math.max(limitRaw, 1), 50000);
+  await withPg(res, async (client) => {
+    // 受領状態の表 = 空の集合を受け取った注文も入る (lines = 0)。鍵の並びは collate "C" (バイト順・送り手の after と同じ)
+    const rows = (await client.query(`select mall_order_no, lines from core.order_finance_receipts where company_id = 1 and mall = $1 and scope_key = $2 and mall_order_no collate "C" > $3 order by mall_order_no collate "C" limit $4`,
+      [ms.mall, ms.scope, after, limit])).rows;
+    res.json({ keys: rows.map((r) => r.mall_order_no), lines: rows.map((r) => Number(r.lines)), next: rows.length === limit ? rows[rows.length - 1].mall_order_no : null });
+  });
+});
+
+router.get('/order-finance/daily', requireSyncKey, async (req, res) => {
+  const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  const rg = financeRangeOf(req, 62); if (rg.error) return res.status(400).json({ error: rg.error });
+  await withPg(res, async (client) => {
+    const rows = (await client.query(`select economic_date_jst::text as date_jst, seller_sku, units_ordered, units_refunded_customer, units_marketplace_guarantee, units_a_to_z_refund, units_net_sold,
+        sales_principal_jpy, sales_shipping_jpy, sales_giftwrap_jpy, sales_tax_jpy, commission_jpy, fba_fulfillment_jpy, fba_storage_jpy, closing_fee_jpy,
+        shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy, promotion_tax_jpy, points_jpy, warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy,
+        refund_principal_jpy, reversal_reimbursement_jpy, misc_fee_jpy, other_fee_jpy, other_amount_jpy, profit_before_cogs_jpy
+       from mart.v_finance_daily where company_id = 1 and mall = $1 and scope_key = $2 and economic_date_jst between $3::date and $4::date
+       order by economic_date_jst, seller_sku collate "C"`, [ms.mall, ms.scope, rg.from, rg.to])).rows;
+    res.json({ mall: ms.mall, scope: ms.scope, from: rg.from, to: rg.to, rows: rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, k === 'date_jst' || k === 'seller_sku' ? v : Number(v)]))) });
+  });
+});
+
+router.get('/order-finance/account-fees', requireSyncKey, async (req, res) => {
+  const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  const rg = financeRangeOf(req, 800); if (rg.error) return res.status(400).json({ error: rg.error });
+  await withPg(res, async (client) => {
+    const rows = (await client.query(`select month_start_jst::text as month_start_jst, fee_type, amount_jpy, row_count from mart.v_finance_account_fees_monthly
+       where company_id = 1 and mall = $1 and scope_key = $2 and month_start_jst between date_trunc('month', $3::date) and $4::date order by 1, 2`, [ms.mall, ms.scope, rg.from, rg.to])).rows;
+    res.json({ mall: ms.mall, scope: ms.scope, rows: rows.map((r) => ({ ...r, amount_jpy: Number(r.amount_jpy), row_count: Number(r.row_count) })) });
+  });
+});
+
+router.get('/order-finance/uncovered', requireSyncKey, async (req, res) => {
+  const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  await withPg(res, async (client) => {
+    const rows = (await client.query(`select reason, count(*)::int as n, min(economic_date_jst)::text as first_date, max(economic_date_jst)::text as last_date
+       from mart.v_order_finance_uncovered where company_id = 1 and mall = $1 and scope_key = $2 group by reason order by reason`, [ms.mall, ms.scope])).rows;
+    res.json({ mall: ms.mall, scope: ms.scope, rows });
+  });
+});
+
 router.post('/shipments/relink', requireSyncKey, express.json({ limit: '4kb' }), async (req, res) => {
   const after = Number(req.body && req.body.after) || 0, limit = Math.min(Math.max(Number(req.body && req.body.limit) || 20000, 1), 100000);
   await withPg(res, async (client) => {
@@ -380,7 +497,7 @@ router.post('/ad-spend/relink', requireSyncKey, async (req, res) => {
   await withPg(res, async (client) => { await client.query(`set statement_timeout = '120s'`); res.json(await relinkAdSpend(pgAdapter(client))); });
 });
 
-router.get(['/shipments/receipt', '/orders/receipt'], requireSyncKey, async (req, res) => {
+router.get(['/shipments/receipt', '/orders/receipt', '/order-finance/receipt'], requireSyncKey, async (req, res) => {
   const url = process.env.COMPANY_DB_URL;
   if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
   const runId = String(req.query.run_id || ''), idx = Number(req.query.chunk_index);
