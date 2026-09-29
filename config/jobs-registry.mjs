@@ -1200,6 +1200,8 @@ export const JOBS_REGISTRY = [
     owner: 'Claude + 中原さん',
     purpose: 'ロジザードの毎日の商品マスタを Company DB の値で作る (マスタ正本切替 ③c-1a。daily-sync の「ロジザード毎日の商品マスタ(影)」= scripts/company-db/lz-daily.mjs)。'
       + '作る (このステップ) と取り込む (③c-1b の miniPC のタスク) は別の項目 (v2 M9)。作れた回だけ ok の ping (合格でも不合格でも。合否と 3 日の合格は lz-daily-cutover が見る)。'
+      + '🆕2026-09-29 (③c-1b-3b-3・契約 K3-1): 作れた回は成果物 (CSV) をポータルの口 (LZ_LOCK_TOKEN・/apps/logizard-import-state/api/artifacts) に送り、**ポータルが受け取れたときだけ ok** '
+      + '(送れない = fail = 朝の再試行で作り直して送り直す)。ポータルの成果物 = miniPC が止まったときにどの端末からも取れる手の取込の材料 + 毎晩の本番の取込の条件。'
       + '材料が欠けた朝 (その朝の照合・NE の取得・ロジザードの全件の一覧 = logizard-shohin-csv のその日の成功した書き出し) と作ること自体の失敗は fail の ping (理由つき) = ok が進まない = 締切で気づく (v3 M6)。'
       + '今は作って突き合わせるだけ (まだ取り込まない)。③c-1b の後は自動の取込の材料 = 止まると取り込まない (GAS の手の取込のまま・現場は止まらない) = P3',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3] の 1 ステップ (新しい定期実行ではない。ping は lz-daily.mjs が自分で打つ = --daily で --out-dir が無い回だけ)',
@@ -1213,7 +1215,12 @@ export const JOBS_REGISTRY = [
       + 'lz_master_missing / lz_master_not_today / lz_stamp_missing / lz_export_not_confirmed = logizard-shohin-csv のその日の書き出しが成功していない '
       + '(miniPC の C:\\tools\\logizard-automation\\logs\\shohin-last-success.txt の中身と時刻・out\\shohin_master.csv の時刻。印は保存の 15 分以内) / '
       + 'lz_master_shrunk = 前回の半分より少ない (抽出の事故の疑い。ロジザードの画面で商品数を確かめる) / lz_master_blank_id・header・row_width・broken・duplicate_id = 書き出しが壊れた。'
-      + '手で試す = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」',
+      + '❌「成果物をポータルに送れない (理由)」= unreachable / internal_5xx (Render が落ちている・遅い。3 回まで待って送り直した後) / '
+      + 'conflict_409 (同じ実行 ID で違う中身 = 起きないはず・証跡とポータルの成果物を比べる) / mismatch_400・bad_request_400 (送った識別と中身が違う) / '
+      + 'csv_changed・csv_missing (作った CSV が証跡と違う・消えた) / no_token (miniPC の .env に LZ_LOCK_TOKEN が無い)。証跡の portal に結果。'
+      + 'ポータルの成果物の一覧 = import-state-client.js の listArtifacts (Bearer)。'
+      + '手で試す = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」 (--out-dir の回は送らない)。'
+      + '送れなかった回の証跡は state = complete のまま portal.ok = false = 影の取込・少数件の試験の計画・切替の判定はその回を使わない (portal_not_stored)',
   },
   {
     id: 'lz-daily-import-shadow',
@@ -1256,7 +1263,7 @@ export const JOBS_REGISTRY = [
     importance: 'P3',
     owner: 'Claude + 中原さん (実機の取込と切替日は中原さんと)',
     purpose: 'ロジザードの毎日の商品マスタの取込を GAS から Company DB の自動に切り替える (マスタ正本切替 ③c)。完了の条件 (v3 M6) = '
-      + '① daily-sync の「ロジザード毎日の商品マスタ(影)」(証跡 lz-daily) が 3 日続けて合格 (説明できない差・判定できない・形の差・不正 = 0。作る回そのものは lz-daily-build が見る) '
+      + '① daily-sync の「ロジザード毎日の商品マスタ(影)」(証跡 lz-daily) が 3 日続けて合格 **かつ成果物をポータルに送れた** (verdict = pass かつ portal.ok = true・版 lzd-v3 以降。説明できない差・判定できない・形の差・不正 = 0。作る回そのものは lz-daily-build が見る。③c-1b-3b-3) '
       + '② ③c-1b (鍵の口・auto-barcode の起動の分け方・取込の記録) の後に、少数件の実機の取込で ロジザードの照合の鍵・大文字小文字・無効の商品・取り込んだ後の値・対象外の列を確かめる '
       + '③ 切替日 = Stream Deck を ①② だけにし (この PC の C:\\tools\\logizard-automation\\.env に LOGIZARD_BC_DAILY=auto・③c-1b-3a)、自動の ③ を始める。止まると GAS の手の取込のまま (現場は止まらない) = P3',
     where: 'miniPC の daily-sync (lz-daily.mjs) の証跡 + 中原さんとの実機の取込。手順 = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」',
@@ -1264,7 +1271,7 @@ export const JOBS_REGISTRY = [
     period_hours: 30 * 24,
     warn_days: 5,
     lifecycle: 'permanent',   // human_obligation は台帳の決まりで permanent。完了の後に RETIRED_JOBS へ移す
-    runbook: '① 毎朝の daily-sync の「ロジザード毎日の商品マスタ(影)」の行と DATA_DIR/company-db-evidence/<日付>/lz-daily.json の verdict を見る (3 日続けて pass か) '
+    runbook: '① 毎朝の daily-sync の「ロジザード毎日の商品マスタ(影)」の行と DATA_DIR/company-db-evidence/<日付>/lz-daily.json の verdict と portal.ok を見る (3 日続けて pass かつ portal.ok = true か。送れていない日は数えない) '
       + '② 不合格なら report.json の unexplained / invalid を読み、直すか中原さんに認めてもらう '
       + '③ ③c-1b の後に中原さんと少数件の実機の取込 (scripts/logizard-import/lz-import-test.mjs plan → 中原さんが一覧を認める → run・手順 = db/company/README.md) → 切替日 → 完了の ping を 1 回 → この項目を RETIRED_JOBS へ移す',
   },
