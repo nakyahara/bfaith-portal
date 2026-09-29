@@ -143,9 +143,10 @@ const aligned = reconcileMonthly(db, { month: monthFilter || null }).map((r) => 
   month_jst: r.month, raw_diff: Math.round(r.raw_diff),
   cogs: Math.round(-(r.cogs_d - r.cogs_v4)), points: Math.round(-r.points), ship_tax: Math.round(-r.ship_tax),
   refund_commission: Math.round(r.refund_commission), other_refund: Math.round(r.other_refund),
-  resid: Math.round(r.resid), resid_pct: Math.round(r.resid_pct * 1000) / 1000,
+  resid: Math.round(r.resid), resid_abs: Math.round(r.resid_abs), rev_resid_abs: Math.round(r.rev_resid_abs), long_only_skus: r.long_only_skus,
+  resid_pct: Math.round(r.resid_pct * 1000) / 1000,
 }));
-const skuResid = reconcileSkuTop(db, { month: monthFilter || null, minYen: 1, limit: 20 }).map((r) => ({ month_jst: r.month, seller_sku: r.sku, aligned_d: Math.round(r.cmp_d), aligned_v4: Math.round(r.cmp_v4), resid: Math.round(r.resid) }));
+const skuResid = reconcileSkuTop(db, { month: monthFilter || null, minYen: 1, limit: 20 }).map((r) => ({ month_jst: r.month, seller_sku: r.sku, aligned_d: Math.round(r.cmp_d), aligned_v4: Math.round(r.cmp_v4), resid: Math.round(r.resid), rev_resid: Math.round(r.rev_resid), only_in: r.in_d && r.in_v4 ? '' : [r.in_d ? 'daily' : '', r.in_v4 ? 'v4' : '', r.in_long ? 'long' : ''].filter(Boolean).join('+') }));
 
 // cost_status 内訳
 const costStatus = db.prepare(`
@@ -174,18 +175,18 @@ if (isMarkdown) {
   }
 
   console.log('\n## A2. 決まりの違いを引いた後の差 (日次 − v4・利益への効き)\n');
-  console.log('| 月 | そのままの差 | 原価 | ポイント | 送料の税 | 返品の管理手数料 | 返金の範囲 | 残り | 残り % |');
-  console.log('|---|---|---|---|---|---|---|---|---|');
+  console.log('| 月 | そのままの差 | 原価 | ポイント | 送料の税 | 返品の管理手数料 | 返金の範囲 | 残り | SKU ごとの残りの絶対値 | 売上の残りの絶対値 | 縦長の表だけの SKU | 残り % |');
+  console.log('|---|---|---|---|---|---|---|---|---|---|---|---|');
   for (const r of aligned) {
-    console.log(`| ${r.month_jst} | ${r.raw_diff.toLocaleString()} | ${r.cogs.toLocaleString()} | ${r.points.toLocaleString()} | ${r.ship_tax.toLocaleString()} | ${r.refund_commission.toLocaleString()} | ${r.other_refund.toLocaleString()} | ${r.resid.toLocaleString()} | ${r.resid_pct}% |`);
+    console.log(`| ${r.month_jst} | ${r.raw_diff.toLocaleString()} | ${r.cogs.toLocaleString()} | ${r.points.toLocaleString()} | ${r.ship_tax.toLocaleString()} | ${r.refund_commission.toLocaleString()} | ${r.other_refund.toLocaleString()} | ${r.resid.toLocaleString()} | ${r.resid_abs.toLocaleString()} | ${r.rev_resid_abs.toLocaleString()} | ${r.long_only_skus} | ${r.resid_pct}% |`);
   }
 
-  console.log('\n## B2. SKU x 月で 決まりの違いを引いた後の残り TOP 20 (1 円超)\n');
-  if (skuResid.length === 0) console.log('(残りのある SKU 無し)');
+  console.log('\n## B2. SKU x 月で 決まりの違いを引いた後の残り (利益 / 売上) TOP 20 (1 円以上)\n');
+  if (skuResid.length === 0) console.log('(1 円以上の残りのある SKU 無し)');
   else {
-    console.log('| 月 | SKU | 日次 (揃えた後) | v4 (揃えた後) | 残り |');
-    console.log('|---|---|---|---|---|');
-    for (const r of skuResid) console.log(`| ${r.month_jst} | ${r.seller_sku} | ${r.aligned_d.toLocaleString()} | ${r.aligned_v4.toLocaleString()} | ${r.resid.toLocaleString()} |`);
+    console.log('| 月 | SKU | 日次 (揃えた後) | v4 (揃えた後) | 利益の残り | 売上の残り | 片方だけ |');
+    console.log('|---|---|---|---|---|---|---|');
+    for (const r of skuResid) console.log(`| ${r.month_jst} | ${r.seller_sku} | ${r.aligned_d.toLocaleString()} | ${r.aligned_v4.toLocaleString()} | ${r.resid.toLocaleString()} | ${r.rev_resid.toLocaleString()} | ${r.only_in} |`);
   }
 
   console.log('\n## B. SKU x 月で profit 差絶対値 TOP 20\n');
@@ -218,8 +219,8 @@ if (isMarkdown) {
   console.table(monthly);
   console.log('\n=== A2. 決まりの違いを引いた後の差 (日次 − v4・利益への効き。残りが 0 なら一致) ===');
   console.table(aligned);
-  console.log('\n=== B2. SKU x 月で 決まりの違いを引いた後の残り TOP 20 (1 円超) ===');
-  if (skuResid.length === 0) console.log('(残りのある SKU 無し)'); else console.table(skuResid);
+  console.log('\n=== B2. SKU x 月で 決まりの違いを引いた後の残り (利益 / 売上) TOP 20 (1 円以上) ===');
+  if (skuResid.length === 0) console.log('(1 円以上の残りのある SKU 無し)'); else console.table(skuResid);
   console.log('\n=== B. SKU x 月で profit 差絶対値 TOP 20 (>100円) ===');
   console.table(topDiff);
   console.log('\n=== C. 集合差 ===');

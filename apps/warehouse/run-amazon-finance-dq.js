@@ -156,9 +156,10 @@ recordResult(
 // Check 2: monthly_total_diff_pct (gross_margin_with_reimbursement)
 // ============================================================
 // 決まりの違い (原価・ポイント・送料の税・返品の管理手数料・返金の範囲) を引いてから比べる (2026-09-29)
-const rec = reconcileMonthly(db, { month: monthStr })[0] || { profit_d: 0, profit_v4: 0, raw_diff: 0, cogs_d: 0, cogs_v4: 0, points: 0, ship_tax: 0, refund_commission: 0, other_refund: 0, cmp_d: 0, cmp_v4: 0, resid: 0, resid_pct: 0 };
+const rec = reconcileMonthly(db, { month: monthStr })[0] || { profit_d: 0, profit_v4: 0, raw_diff: 0, cogs_d: 0, cogs_v4: 0, points: 0, ship_tax: 0, refund_commission: 0, other_refund: 0, cmp_d: 0, cmp_v4: 0, resid: 0, resid_abs: 0, rev_resid: 0, rev_resid_abs: 0, long_only_skus: 0, resid_pct: 0 };
 const dailyTotal = rec.profit_d, v4Total = rec.profit_v4;
-const totalDiff = Math.abs(rec.resid);   // 決まりの違いを引いた後の差
+// 決まりの違いを引いた後の差 = SKU ごとの残りの絶対値の合計 (SKU どうしの打ち消しで 0 にしない) + 売上だけの残りの絶対値の合計 (項目どうしの打ち消し)。Codex #1531 R1
+const totalDiff = rec.resid_abs + rec.rev_resid_abs;
 const totalDiffPct = rec.resid_pct;
 const explained = {   // 日次 − v4 の向き (利益への効き)
   cogs: -(rec.cogs_d - rec.cogs_v4), points: -rec.points, ship_tax: -rec.ship_tax,
@@ -170,7 +171,15 @@ recordResult(
     totalDiffPct > THRESHOLDS.monthly_total_diff_pct.warn ? 'warn' : 'info',
   totalDiffPct,
   THRESHOLDS.monthly_total_diff_pct.error,
-  { daily_total_jpy: dailyTotal, v4_total_jpy: v4Total, raw_diff_jpy: rec.raw_diff, aligned_daily_jpy: rec.cmp_d, aligned_v4_jpy: rec.cmp_v4, resid_jpy: rec.resid, explained_jpy: explained }
+  { daily_total_jpy: dailyTotal, v4_total_jpy: v4Total, raw_diff_jpy: rec.raw_diff, aligned_daily_jpy: rec.cmp_d, aligned_v4_jpy: rec.cmp_v4, resid_jpy: rec.resid, resid_abs_jpy: rec.resid_abs, rev_resid_abs_jpy: rec.rev_resid_abs, explained_jpy: explained }
+);
+// 縦長の表 (v4 の元) にだけある SKU = 日次にも v4 にも無いのに決済の調整だけある (取込か集計の漏れの疑い)。Codex #1531 R1
+recordResult(
+  'long_only_skus',
+  rec.long_only_skus > 0 ? 'warn' : 'info',
+  rec.long_only_skus,
+  0,
+  { long_only_skus: rec.long_only_skus }
 );
 
 // ============================================================
@@ -215,9 +224,10 @@ recordResult(
 );
 
 if (costStats.missing > 0) {
+  // 金額は数えない (原価の差は決まりの違い ① として adjustment_diff に入る = ここで数えると二重。Codex #1531 R1)。影響額は details に診断として残す
   recordBucket(monthStr, '__multi__', 'cost_late_binding',
-    costStats.missing_amount || 0, costStats.missing,
-    { missing_count: costStats.missing, late_bound_count: costStats.late_bound });
+    0, costStats.missing,
+    { missing_count: costStats.missing, late_bound_count: costStats.late_bound, missing_profit_jpy_diagnostic: costStats.missing_amount || 0 });
 }
 
 // cost_late_binding_pct
@@ -274,6 +284,7 @@ recordBucket(monthStr, '__multi__', 'adjustment_diff', explainableSum, 1, {
 // unbucketed (説明できない残差) = 決まりの違いを引いた後の差
 const unbucketed = totalDiff;
 recordBucket(monthStr, '__multi__', 'unbucketed', rec.resid, 1, {
+  resid_abs: rec.resid_abs, rev_resid_abs: rec.rev_resid_abs,
   raw_diff: rec.raw_diff,
   explainable_sum: explainableSum,
   formula: 'raw_diff - sum(決まりの違い) = (日次 + 原価 + ポイント) - (v4 + 原価 - 送料の税 + 返品の管理手数料 + 返金の範囲)'
@@ -285,7 +296,7 @@ recordResult(
     unbucketed > THRESHOLDS.unbucketed_diff_jpy.warn ? 'warn' : 'info',
   unbucketed,
   THRESHOLDS.unbucketed_diff_jpy.error,
-  { resid_jpy: rec.resid, raw_diff_jpy: rec.raw_diff, explainable_sum_jpy: explainableSum }
+  { resid_jpy: rec.resid, resid_abs_jpy: rec.resid_abs, rev_resid_abs_jpy: rec.rev_resid_abs, raw_diff_jpy: rec.raw_diff, explainable_sum_jpy: explainableSum }
 );
 
 // ============================================================

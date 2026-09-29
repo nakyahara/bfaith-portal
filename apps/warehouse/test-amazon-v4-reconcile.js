@@ -86,5 +86,40 @@ db.prepare(`UPDATE fact_amazon_settlement_monthly_wide SET sales_principal_micro
 const r2 = reconcileMonthly(db, { month: YM })[0];
 ok(Math.round(r2.resid) === -1, `v4 側が 1 円ずれると残り −1 円 (${r2.resid})`);
 
+db.prepare(`UPDATE fact_amazon_settlement_monthly_wide SET sales_principal_micro = sales_principal_micro - 1000000 WHERE year_month_int = ?`).run(YMI);   // 戻す
+
+// 打ち消しを見逃さない (Codex #1531 R1)
+const dq = (runId) => {
+  let code = 0;
+  try { execFileSync(process.execPath, ['apps/warehouse/run-amazon-finance-dq.js', '--month', YM, '--run-id', runId], { cwd: repoRoot, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch (e) { code = e.status; }
+  return { code, res: Object.fromEntries(db.prepare(`SELECT check_name, severity, actual_value FROM dq_run_results WHERE run_id = ?`).all(runId).map((x) => [x.check_name, x])) };
+};
+// ① SKU どうし: sku-b +1,000 / 日次にだけある sku-z −1,000 = 月の合計は 0 でも SKU ごとの絶対値は 2,000
+db.prepare(`UPDATE f_amazon_finance_sku_daily_v1 SET profit_amount = profit_amount + 1000 WHERE seller_sku = 'sku-b' AND date_jst = ?`).run(`${YM}-05`);
+db.prepare(`INSERT INTO f_amazon_finance_sku_daily_v1 (date_jst, seller_sku, profit_amount, cost_status, source_layer_summary, source_row_count, built_at) VALUES (?, 'sku-z', -1000, 'complete', 'sp_api_v2', 1, 't')`).run(`${YM}-05`);
+const r3 = reconcileMonthly(db, { month: YM })[0];
+ok(Math.abs(r3.resid) < 1e-6 && Math.round(r3.resid_abs) === 2000, `SKU どうしの打ち消し: 月の残りは 0 でも SKU ごとの絶対値の合計 = 2,000 (${r3.resid} / ${r3.resid_abs})`);
+let q = dq('test-offset');
+ok(q.res.unbucketed_diff_jpy?.severity === 'warn' && q.res.unbucketed_diff_jpy.actual_value === 2000 && q.res.monthly_total_diff_pct?.severity === 'error' && q.code === 1,
+  `関所: 説明できない残り 2,000 円 = warn (500 超)・月の差 (絶対値の合計 ÷ v4) は試しのデータが小さいので error = 終了コード 1 (${JSON.stringify([q.res.unbucketed_diff_jpy, q.res.monthly_total_diff_pct])} / ${q.code})`);
+db.prepare(`UPDATE f_amazon_finance_sku_daily_v1 SET profit_amount = profit_amount - 1000 WHERE seller_sku = 'sku-b' AND date_jst = ?`).run(`${YM}-05`);
+db.prepare(`DELETE FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-z'`).run();
+// ② 項目どうし: sku-b の売上と手数料が同じだけ多い (+10,000 / +10,000) = 利益の残りは 0 でも売上の残りが 10,000
+db.prepare(`UPDATE f_amazon_finance_sku_daily_v1 SET sales_principal_jpy = sales_principal_jpy + 10000, commission_jpy = commission_jpy + 10000 WHERE seller_sku = 'sku-b' AND date_jst = ?`).run(`${YM}-05`);
+const r4 = reconcileMonthly(db, { month: YM })[0];
+ok(Math.abs(r4.resid_abs) < 1e-6 && Math.round(r4.rev_resid_abs) === 10000, `項目どうしの打ち消し: 利益の残りは 0 でも売上の残り = 10,000 (${r4.resid_abs} / ${r4.rev_resid_abs})`);
+q = dq('test-rev');
+ok(q.res.unbucketed_diff_jpy?.severity === 'error' && q.code === 1, `関所: 売上の残り 10,000 円 = error (5,000 超)・終了コード 1 (${JSON.stringify(q.res.unbucketed_diff_jpy)} / ${q.code})`);
+db.prepare(`UPDATE f_amazon_finance_sku_daily_v1 SET sales_principal_jpy = sales_principal_jpy - 10000, commission_jpy = commission_jpy - 10000 WHERE seller_sku = 'sku-b' AND date_jst = ?`).run(`${YM}-05`);
+// ③ 縦長の表にだけある SKU (日次にも v4 にも無い) を落とさない
+db.prepare(`INSERT INTO fact_amazon_settlement_monthly_long (year_month_int, seller_sku_normalized, transaction_type, component_family, component_type, value_micro, row_count, source_layer, generated_at) VALUES (?, 'sku-long', 'Refund', 'fee', 'RefundCommission', -5000000, 1, 'sp_api_v2', 't')`).run(YMI);
+const r5 = reconcileMonthly(db, { month: YM })[0];
+ok(r5.long_only_skus === 1 && Math.round(r5.resid_abs) === 5, `縦長の表にだけある SKU = 1・その調整 (−5) も残りに出る (${r5.long_only_skus} / ${r5.resid_abs})`);
+ok(reconcileSkuTop(db, { month: YM }).some((x) => x.sku === 'sku-long' && x.in_long && !x.in_d && !x.in_v4), 'SKU × 月の一覧にも縦長の表だけの SKU が出る');
+q = dq('test-long');
+ok(q.res.long_only_skus?.severity === 'warn' && q.res.long_only_skus.actual_value === 1, `関所: 縦長の表だけの SKU = warn (${JSON.stringify(q.res.long_only_skus)})`);
+ok(db.prepare(`SELECT bucket_amount a FROM accounting_diff_buckets WHERE run_id = 'test-reconcile' AND bucket_code = 'cost_late_binding'`).get() === undefined
+  || db.prepare(`SELECT bucket_amount a FROM accounting_diff_buckets WHERE run_id = 'test-reconcile' AND bucket_code = 'cost_late_binding'`).get().a === 0, '原価未登録の分類は金額を数えない (原価の差は決まりの違い ① に入る = 二重にしない)');
+
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 日次の財務と v4 の突き合わせテスト ALL PASS ===');
 process.exit(failed ? 1 : 0);
