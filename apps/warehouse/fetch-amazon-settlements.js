@@ -20,6 +20,7 @@
  *     (一覧の要求が取込の時間やレートの枠を食わない。Codex #1555 R1 High・R2 High)
  *   - 一覧の記録の要求は **専用の SP-API の接続** (getInventoryClient = 要求の時間の上限つき・429 / 通信の失敗で自動の再試行なし)。
  *     期限でライブラリが socket を破棄する = 取込が済んだら node が自分で終わる (Codex #1555 R3)。取込の接続 (getClient) の設定は変えない
+ *     トークンの自動の取り直しも切り、最初に期限の中で 1 回だけ取る (403 expired = 一覧の失敗・再帰で呼ばない。Codex #1555 R4)
  *   - nextToken が残ったまま上限のページ (21) に来たら last_page_reached = 0 + ⚠️
  *   - 一覧の失敗・記録の失敗は ⚠️ だけ (取込の結果・終了コードは変わらない)。記録に失敗した回は completed_at を入れず record_error に理由
  *   - 取込が例外で止まった回も一覧を記録する (completed_at null・ingest_error)。kill された回は記録が無い = coverage に使えない (安全側)
@@ -80,7 +81,7 @@ function getClient() {
   return spClient;
 }
 
-// 一覧の記録用の **専用の接続** (Codex #1555 R3): 時間の上限つき・429 / 通信の失敗で自動の再試行をしない
+// 一覧の記録用の **専用の接続** (Codex #1555 R3・R4): 時間の上限つき・429 / 通信の失敗 / 403 expired で自動の再試行・トークンの取り直しをしない
 // (取消されない再試行の timer や socket が残ると、取込が済んでも node が終わらず daily-sync の枠で kill される)。
 // 取込の接続 (getClient) の設定は変えない
 let inventorySpClient = null;

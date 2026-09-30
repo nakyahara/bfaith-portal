@@ -332,12 +332,16 @@ ok(!res.error && rCan && rCan.processing_status === 'CANCELLED' && rCan.report_d
   `CANCELLED = 一覧に保存・ダウンロードしない・skipped_not_done (${rCan?.import_note})`);
 
 // ════ R3. 一覧の記録用の要求は専用の接続 = 時間の上限つき・自動の再試行なし・期限で要求そのものを止める (Codex #1555 R3) ════
-eq(inv.inventoryClientOptions(5000), { auto_request_throttled: false, retry_remote_timeout: false, timeouts: { response: 5000, idle: 5000, deadline: 5000 } }, '専用の接続の options = 429 / 通信の失敗で再試行しない・時間の上限');
+eq(inv.inventoryClientOptions(5000), { auto_request_tokens: false, auto_request_throttled: false, retry_remote_timeout: false, timeouts: { response: 5000, idle: 5000, deadline: 5000 } }, '専用の接続の options = トークンの自動の取り直し・429 / 通信の失敗の再試行をしない・時間の上限');
+const SellingPartner = (await import('amazon-sp-api')).default;
+// 本物の amazon-sp-api (1.2.0) に専用の options を渡し、通信の所だけ差し替える (_request.execute = LWA のトークン / _request.api = SP-API)。外には出ない
+const dummyClient = (timeoutMs) => new SellingPartner({ region: 'fe', refresh_token: 'dummy', credentials: { SELLING_PARTNER_APP_CLIENT_ID: 'dummy', SELLING_PARTNER_APP_CLIENT_SECRET: 'dummy' }, options: inv.inventoryClientOptions(timeoutMs) });
+const yieldTurn = () => new Promise((r) => setImmediate(r));
+const EXPIRED_403 = { statusCode: 403, headers: {}, body: JSON.stringify({ errors: [{ code: 'Unauthorized', message: 'Access to requested resource is denied.', details: 'The access token you provided has expired.' }] }) };
 {
-  // 本物の amazon-sp-api (1.2.0) に専用の options を渡し、通信の所だけ差し替える (_request.api・_validateAccessToken)
-  const SellingPartner = (await import('amazon-sp-api')).default;
-  const client = new SellingPartner({ region: 'fe', refresh_token: 'dummy', credentials: { SELLING_PARTNER_APP_CLIENT_ID: 'dummy', SELLING_PARTNER_APP_CLIENT_SECRET: 'dummy' }, options: inv.inventoryClientOptions(5000) });
-  client._validateAccessToken = async () => {};
+  const client = dummyClient(5000);
+  const tokenCalls = [];
+  client._request.execute = async (opts) => { tokenCalls.push(opts.timeouts); await yieldTurn(); return { body: JSON.stringify({ access_token: 'tok' }) }; };
   const seen = [];
   client._request.api = async (token, reqParams) => {
     seen.push(reqParams.timeouts);
@@ -349,35 +353,65 @@ eq(inv.inventoryClientOptions(5000), { auto_request_throttled: false, retry_remo
   try { await inv.listInventoryReports(client, { reportType: V2T, marketplaceId: MKT, startedAt: NOW, timeoutMs: 5000 }); } catch (e) { err = e; }
   ok(err && err.code === 'QuotaExceeded' && seen.length === 1, `本物のライブラリ: 429 で待って再試行しない = 一覧の失敗 (${err?.code} / 呼んだ回数 ${seen.length})`);
   ok(seen[0] && seen[0].deadline > 0 && seen[0].deadline <= 5000 && seen[0].response === seen[0].deadline && seen[0].idle === seen[0].deadline, `本物のライブラリ: 要求に残り時間の timeouts が付く (${JSON.stringify(seen[0])})`);
+  ok(tokenCalls.length === 1 && tokenCalls[0] && tokenCalls[0].deadline > 0 && tokenCalls[0].deadline <= 5000, `本物のライブラリ: トークンは最初に 1 回だけ・残り時間の timeouts で取る (${JSON.stringify(tokenCalls[0])})`);
 }
 {
-  // 子プロセス: 一覧の記録用の fake の要求は、ライブラリと同じく timeouts.deadline があればその時刻で timer を消して失敗 (socket の破棄)、
-  // 無ければ 60 秒の timer (= 取消されない再試行の待ち・active handle) を持つ。取込が済んだら子が期限の内に自分で終わること (process.exit で無理に終わらせない)
-  const { spawnSync } = await import('node:child_process');
-  const { pathToFileURL } = await import('node:url');
+  // 403 (access token expired) を繰り返し返す = トークンを取り直して再帰で呼ばない (Codex #1555 R4)。取り直すなら 5 回目で成功させて止める (試験が終わらなくならないように)
+  const client = dummyClient(2000);
+  let tokenCount = 0, apiCount = 0;
+  client._request.execute = async () => { tokenCount++; await yieldTurn(); return { body: JSON.stringify({ access_token: `tok${tokenCount}` }) }; };
+  client._request.api = async () => { apiCount++; await yieldTurn(); return apiCount >= 5 ? { statusCode: 200, headers: {}, body: JSON.stringify({ reports: [] }) } : EXPIRED_403; };
+  const t0e = Date.now();
+  let err = null;
+  try { await inv.listInventoryReports(client, { reportType: V2T, marketplaceId: MKT, startedAt: NOW, timeoutMs: 2000 }); } catch (e) { err = e; }
+  ok(err && err.code === 'Unauthorized' && apiCount === 1 && tokenCount === 1 && Date.now() - t0e < 2000,
+    `本物のライブラリ: 403 expired でトークンを取り直さない = 呼んだ回数 1・トークン 1 回・期限の内に一覧の失敗 (${err?.code} / 要求 ${apiCount} / トークン ${tokenCount})`);
+}
+// 子プロセス: 取込が済んだら、一覧の要求の後に子が期限の内に自分で終わること (process.exit で無理に終わらせない)
+const { spawnSync } = await import('node:child_process');
+const { pathToFileURL } = await import('node:url');
+const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+const runChild = (invSpLines) => {
   const childDir = fs.mkdtempSync(path.join(os.tmpdir(), 'settlement-inventory-child-'));
-  const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
   const code = [
     `process.env.DATA_DIR = ${JSON.stringify(childDir)};`,
     `const { initDB, getDB } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'db.js')).href)});`,
     `const { runSettlementFetch } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'fetch-amazon-settlements.js')).href)});`,
+    `const { inventoryClientOptions } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'amazon-settlement-inventory.js')).href)});`,
+    `const SellingPartner = (await import(${JSON.stringify(import.meta.resolve('amazon-sp-api'))})).default;`,
     'await initDB();',
     `const TSV = ${JSON.stringify(DOCS['D-IMP'])};`,
     `const REP = ${JSON.stringify(R.imp)};`,
+    `const EXPIRED_403 = ${JSON.stringify(EXPIRED_403)};`,
     'const ingestSp = { async callAPI(req) { return { reports: [REP] }; } };',
-    'const invSp = { callAPI(req) { const d = req.options && req.options.timeouts && req.options.timeouts.deadline;',
-    '  return new Promise((resolve, reject) => { if (d) setTimeout(() => reject(new Error("API_DEADLINE_TIMEOUT (作り物)")), d); else setTimeout(() => resolve({ reports: [] }), 60000); }); } };',
+    ...invSpLines,
     'const r = await runSettlementFetch({ reportId: null, dryRun: false, source: "v2" }, { db: getDB(), sp: ingestSp, inventorySp: invSp, runId: "child", downloadTsv: async () => TSV, inventoryTimeoutMs: 300 });',
     'const lines = getDB().prepare("SELECT COUNT(*) n FROM raw_amazon_settlement_lines").get().n;',
     'console.log("CHILD_RESULT " + JSON.stringify({ blocked: r.blocked.length, lines, listError: (r.inventory && r.inventory.listError) || null }));',
   ].join('\n');
   const t0c = Date.now();
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: childDir, encoding: 'utf8', timeout: 20000, env: { ...process.env, DATA_DIR: childDir } });
-  const tookMs = Date.now() - t0c;
   const line = (child.stdout || '').split(/\r?\n/).find((l) => l.startsWith('CHILD_RESULT ')) || '';
-  const out = line ? JSON.parse(line.slice('CHILD_RESULT '.length)) : null;
+  return { child, tookMs: Date.now() - t0c, out: line ? JSON.parse(line.slice('CHILD_RESULT '.length)) : null };
+};
+{
+  // fake の要求は、ライブラリと同じく timeouts.deadline があればその時刻で timer を消して失敗 (socket の破棄)、無ければ 60 秒の timer (active handle) を持つ
+  const { child, tookMs, out } = runChild([
+    'const invSp = { callAPI(req) { const d = req.options && req.options.timeouts && req.options.timeouts.deadline;',
+    '  return new Promise((resolve, reject) => { if (d) setTimeout(() => reject(new Error("API_DEADLINE_TIMEOUT (作り物)")), d); else setTimeout(() => resolve({ reports: [] }), 60000); }); } };',
+  ]);
   ok(child.status === 0 && tookMs < 15000, `🚨 一覧の要求が timer を持っていても、子プロセスは期限の内に自分で終わる (exit ${child.status}・${tookMs} ms${child.error ? `・${child.error.message}` : ''})`);
   ok(out && out.blocked === 0 && out.lines === 2 && /時間切れ|DEADLINE/.test(out.listError || ''), `子プロセスの取込の結果は同じ (生の行 ${out?.lines}・一覧 ${out?.listError})`);
+}
+{
+  // 本物のライブラリの専用の接続に 403 expired を返し続ける (通信の所だけ差し替え・10 ms の timer = active handle)。取り直して再帰で呼ぶなら子は終わらない
+  const { child, tookMs, out } = runChild([
+    'const invSp = new SellingPartner({ region: "fe", refresh_token: "dummy", credentials: { SELLING_PARTNER_APP_CLIENT_ID: "dummy", SELLING_PARTNER_APP_CLIENT_SECRET: "dummy" }, options: inventoryClientOptions(300) });',
+    'invSp._request.execute = () => new Promise((r) => setTimeout(() => r({ body: JSON.stringify({ access_token: "tok" }) }), 10));',
+    'invSp._request.api = () => new Promise((r) => setTimeout(() => r(EXPIRED_403), 10));',
+  ]);
+  ok(child.status === 0 && tookMs < 15000, `🚨 403 expired が続いても、子プロセスは期限の内に自分で終わる (exit ${child.status}・${tookMs} ms${child.error ? `・${child.error.message}` : ''})`);
+  ok(out && out.blocked === 0 && out.lines === 2 && /denied|Unauthorized/.test(out.listError || ''), `403 の子プロセスの取込の結果は同じ・一覧は失敗として残す (生の行 ${out?.lines}・一覧 ${out?.listError})`);
 }
 
 // ════ 7. digest の再現性 ════

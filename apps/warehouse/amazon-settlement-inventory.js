@@ -113,10 +113,24 @@ export async function listReportPages(sp, firstQuery, { maxPages = MAX_LIST_PAGE
  */
 export function inventoryClientOptions(timeoutMs = INVENTORY_TIMEOUT_MS) {
   return {
+    // auto_request_tokens: false = 403 (access token expired) でトークンを取り直して callAPI を再帰で呼ばない
+    //   (再帰の時は要求ごとの timeouts を失う = 期限を越えて要求が生きる。Codex #1555 R4)。トークンは ensureAccessToken で最初に 1 回だけ取る
+    auto_request_tokens: false,
     auto_request_throttled: false,
     retry_remote_timeout: false,
     timeouts: { response: timeoutMs, idle: timeoutMs, deadline: timeoutMs },
   };
+}
+
+/**
+ * 専用の接続のアクセストークンを、全体の期限の中で (残り時間の timeouts で) 明示的に 1 回だけ取る (Codex #1555 R4)。
+ * amazon-sp-api 1.2.0: refreshAccessToken(scope) は LWA (api.amazon.com) への要求に this._current_call_timeouts を使う
+ *   → 取る前に残り時間を入れる。トークンを持っている・refreshAccessToken の無い接続 (試験の fake) は何もしない
+ */
+async function ensureAccessToken(sp, leftMs) {
+  if (typeof sp.refreshAccessToken !== 'function' || sp.access_token) return;
+  sp._current_call_timeouts = { response: leftMs, idle: leftMs, deadline: leftMs };
+  await sp.refreshAccessToken();
 }
 
 /** 期限つきの待ち。期限を過ぎたら例外 (要求そのものは options.timeouts でライブラリが止める。ここは待つ側の保険・後で失敗しても unhandled にしない) */
@@ -152,6 +166,8 @@ export async function listInventoryReports(sp, { reportType, marketplaceId, star
     createdSince: window.createdSince,
     createdUntil: window.createdUntil,
   };
+  // 先にトークンを 1 回だけ (期限の中で)。403 (expired) が来ても取り直さない = 一覧の失敗
+  await withDeadline(ensureAccessToken(sp, Math.max(1, deadline - Date.now())), deadline, timeoutMs);
   const r = await listReportPages(timedSp, firstQuery, { maxPages, label: 'inventory', strict: true });
   return { ...r, window };
 }
