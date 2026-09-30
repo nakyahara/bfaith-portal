@@ -91,6 +91,15 @@ export async function postCoverage(fetchImpl, { base, syncKey, body, sleep = def
   throw last;
 }
 
+/**
+ * この環境が coverage で回ったことがあるか (404 を今までの送り方にしてよいかの判定・#1567 R2 Medium 3 / R3 L3)。
+ *   証拠 = 台帳 (company-db-push.db) の coverage の世代 **か** warehouse.db の一覧の回に coverage の世代がある (台帳を失くした後の fail-open を防ぐ)
+ */
+export function coverageEverRan(db, ledger) {
+  if (ledger.getMeta(LEDGER_META.generation) != null) return true;
+  return !!db.prepare(`SELECT 1 FROM amazon_settlement_report_inventory_runs WHERE coverage_generation IS NOT NULL LIMIT 1`).get();
+}
+
 /** 最新の初期の印の epoch (無ければ null) */
 const latestEpoch = (db) => db.prepare(`SELECT MAX(evidence_epoch) e FROM initial_marker_headers`).get().e ?? null;
 
@@ -165,7 +174,7 @@ export async function runCoverage({
       //   一度でも coverage で回った後の 404 = Render が #1561 の前のコードに戻った = 古いコードは token の無い chunk で complete を落とさない = 送ると fail-open → 取込だけして送らない (❌)
       catch (e) {
         if (/HTTP 409/.test(e.message) && /not_migrated/.test(e.message)) out.mode = 'legacy';
-        else if (/HTTP 404/.test(e.message)) out.mode = ledger.getMeta(LEDGER_META.generation) == null ? 'legacy' : 'render_404';
+        else if (/HTTP 404/.test(e.message)) out.mode = coverageEverRan(db, ledger) ? 'render_404' : 'legacy';
         else throw e;
       }
     }
@@ -283,7 +292,10 @@ export async function runCoverage({
   } finally {
     try { V.releaseCoverageLease(db, lease, now()); } catch { /* 放せなくても次の回が持ち主の死を見て取る */ }
     ledger.close();
-    writeLastRun(dataDir, { mode: out.mode, exit_code: out.exitCode, retryable: out.exitCode !== 0, finance_pushed: !!out.financePushed, coverage_complete: !!(out.coverage && out.coverage.complete), generation: out.generation });
+    // retry の見送りは終了コード (人が直す理由だけ = exit 0) で成り立つ = この記録は daily-sync の突き合わせのためだけ (#1567 R3 L1)。
+    //   finance_push_ok = 送信がそろって終わったか (failed chunk・整形できない・stale があれば false = 突き合わせを見送る。R3 L2)
+    writeLastRun(dataDir, { mode: out.mode, exit_code: out.exitCode, finance_pushed: !!out.financePushed, finance_push_ok: !!(out.push && out.push.ok),
+      coverage_complete: !!(out.coverage && out.coverage.complete), generation: out.generation });
   }
 }
 

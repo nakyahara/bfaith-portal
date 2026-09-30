@@ -433,13 +433,25 @@ await t('Render の status が 404: 台帳に coverage の世代が一度も無�
   assert.match(r.summary, /^❌ .*財務 push: 送らない = Render の決済のそろいの受け口が 404/);
   assert.equal(f.calls.chunks + f.calls.updating + f.calls.complete, 0, '送らない (fail-open にしない)');
   assert.ok(r.ingest && r.ingest.inventory, '取込はした');
-  setLedgerMeta('coverage_generation', null);   // 一度も coverage で回っていない台帳
+  setLedgerMeta('coverage_generation', null);   // 台帳を失くした (台帳には coverage の世代が無い)
+  const ranIds = db.prepare(`SELECT id, coverage_generation g FROM amazon_settlement_report_inventory_runs WHERE coverage_generation IS NOT NULL`).all();
   try {
+    // 🚨 台帳を失くしても warehouse.db の一覧の回に coverage の世代がある = 回ったことがある = 今までの送り方にしない (#1567 R3 L3)
+    const f3 = spyFetch({ statusOverride: () => new Response('Cannot GET', { status: 404 }) });
+    const r3 = await run({ fetchImpl: f3 });
+    assert.equal(r3.mode, 'render_404', r3.summary); assert.equal(r3.exitCode, 1);
+    assert.equal(f3.calls.chunks, 0);
+    // 台帳にも一覧の回にも証拠が無い (一度も coverage で回っていない) = 今までの送り方
+    db.prepare(`UPDATE amazon_settlement_report_inventory_runs SET coverage_generation = NULL WHERE coverage_generation IS NOT NULL`).run();
     const f2 = spyFetch({ statusOverride: () => new Response('Cannot GET', { status: 404 }) });
     const r2 = await run({ fetchImpl: f2 });
     assert.equal(r2.mode, 'legacy'); assert.equal(r2.exitCode, 0, r2.summary);
     assert.equal(f2.calls.updating + f2.calls.complete + f2.calls.tokenedChunks, 0);
-  } finally { setLedgerMeta('coverage_generation', g0); }
+  } finally {
+    setLedgerMeta('coverage_generation', g0);
+    const back = db.prepare(`UPDATE amazon_settlement_report_inventory_runs SET coverage_generation = ? WHERE id = ?`);
+    for (const x of ranIds) back.run(x.g, x.id);
+  }
 });
 await t('Render に 0050 が無い (status が 409 not_migrated) = 今までの送り方 (token なし・coverage を送らない・⚠️)', async () => {
   const f = spyFetch({ statusOverride: () => new Response(JSON.stringify({ error: 'not_migrated' }), { status: 409, headers: { 'content-type': 'application/json' } }) });
@@ -490,11 +502,24 @@ await t('🚨 中身の悪い版しか無い決済 (見出しの total ≠ 明�
   assert.equal((await cov()).state, 'updating', '正式な値は出さない (見出しの検算・frontier で落ちる)');
   assert.equal((await covState()).complete_to, null);
   const last = JSON.parse(fs.readFileSync(path.join(tmpDir, LAST_RUN_FILE), 'utf8'));
-  assert.deepEqual([last.finance_pushed, last.retryable, last.exit_code], [true, false, 0]);
+  assert.deepEqual([last.finance_pushed, last.finance_push_ok, last.exit_code], [true, true, 0]);   // retry の見送りは exit 0 で成り立つ (retryable は書かない・#1567 R3 L1)
+  assert.equal(Object.hasOwn(last, 'retryable'), false);
 });
 await t('retry-state の旧い工程の名前 (Amazon Settlement / CompanyDB財務(Amazon)) は新しい名前に読み替える (#1567 R1 L4)', async () => {
   assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon Settlement', 'CompanyDB財務(Amazon)', 'Render同期']), ['f_sales', 'Amazon決済と財務', 'Render同期']);
   assert.deepEqual(renameRetryJobs(['Amazon決済と財務', 'Amazon Settlement']), ['Amazon決済と財務']);
+});
+
+await t('送信の途中で失敗した朝 (failed chunk) = 記録の finance_push_ok は false = daily-sync は突き合わせを見送る (#1567 R3 L2)', async () => {
+  // chunk の送信を毎回落とす (送り直し 6 回も全部失敗 = 送信の途中の失敗)
+  const g = spyFetch({ onChunk: () => { throw new Error('socket hang up (作り物・毎回)'); } });
+  // 変わる注文を 1 つ作る (台帳の指紋を空に)
+  const L1 = openLedger(tmpDir, { kind: FINANCE_KIND });
+  try { L1.db.prepare(`update sent set fp = 'x' where kind = ? and key like '%O-A'`).run(FINANCE_KIND); } finally { L1.close(); }
+  const r = await run({ fetchImpl: g });
+  assert.equal(r.exitCode, 1, r.summary);
+  const last = JSON.parse(fs.readFileSync(path.join(tmpDir, LAST_RUN_FILE), 'utf8'));
+  assert.equal(last.finance_push_ok, false, JSON.stringify(last));
 });
 
 console.log('⑧ 判定の部品 (単体)');

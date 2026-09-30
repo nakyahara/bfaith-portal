@@ -249,23 +249,49 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
   ok(V.documentVersionsReady(db) && !V.documentVersionWarnings(db).some((w) => w.code === 'provisional_broken_version'), '行の無い版は数えない');
 }
 
-// ─── 🆕 #1567 R2 Medium 2: 決済 ID が 2 つある文書の版 = 決済 ID が決まらない = 止めない・人が直す別の code (retry しない)・版付けの dry-run でも数える ───
+// ─── 🆕 #1567 R2 Medium 2 / R3 Medium 1: 決済 ID が 2 つある過去の文書 (3 つの形) = 版を付けずに止まる (明示の allowUnresolved だけ進める) ───
+//   形 1 = 見出しが 2 つ (S-U1 と S-U2)・明細は S-U1 / 形 2 = 見出しは S-U1・明細は S-U1 と S-U2 / 形 3 = 見出しなし・明細は S-U1 と S-U2
 {
-  const insU = db.prepare(`INSERT INTO raw_amazon_settlement_lines (physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version,
-    source_settlement_id, posted_date_utc, posted_datetime_jst, economic_date, year_month_int, amazon_order_id, seller_sku_normalized, transaction_type, price_type, price_amount_micro, currency, ingested_at)
-    VALUES (?, ?, 'UNRES', 'uh', 'p', ?, 'sp_api_v1', 'v1.0.0', ?, 'x', 'x', ?, ?, ?, 'sku-u', 'Order', 'Principal', 1000000, 'JPY', '2026-01-01 00:00:00')`);
-  insU.run('un-1', 'un-k1', 1, 'S-U1', `${YM}-05`, Number(YM.replace('-', '')), 'OU1');
-  insU.run('un-2', 'un-k2', 2, 'S-U2', `${YM}-05`, Number(YM.replace('-', '')), 'OU2');
   const { runMigrate } = await import('./migrate-settlement-document-versions.js');
-  const logs = [];
-  await runMigrate({ commit: false, log: (m) => logs.push(m) });
-  ok(logs.some((l) => /決済 ID が 2 つ以上ある文書 1 \(UNRES 2\)/.test(l)), `版付けの dry-run で「決済 ID が 2 つ以上ある文書」を数える (${logs.filter((l) => /2 つ以上/.test(l)).join(' ')})`);
-  V.backfillDocumentVersions(db);
-  const probs = V.documentVersionProblems(db).map((p) => p.code), warns = V.documentVersionWarnings(db);
-  ok(!probs.length && V.documentVersionsReady(db), `🚨 止めない (次の回では直らない = 毎朝 ❌ と retry にしない) (${probs.join(', ')})`);
-  ok(warns.some((w) => w.code === 'version_unresolved_settlement' && w.human && /UNRES/.test(w.detail)), `人が直す別の code = version_unresolved_settlement (${warns.map((w) => w.code).join(', ')})`);
-  db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE source_document_id = 'UNRES'`).run();   // 片付け
-  V.refreshStaleVersionDetails(db);
+  const ym = Number(YM.replace('-', ''));
+  const insL = db.prepare(`INSERT INTO raw_amazon_settlement_lines (physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version,
+    source_settlement_id, posted_date_utc, posted_datetime_jst, economic_date, year_month_int, amazon_order_id, seller_sku_normalized, transaction_type, price_type, price_amount_micro, currency, ingested_at)
+    VALUES (?, ?, ?, 'uh', 'p', ?, 'sp_api_v1', 'v1.0.0', ?, 'x', 'x', ?, ?, ?, 'sku-u', 'Order', 'Principal', 1000000, 'JPY', '2026-01-01 00:00:00')`);
+  const insH = db.prepare(`INSERT INTO raw_amazon_settlement_headers (physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version,
+    source_settlement_id, settlement_start_date, settlement_end_date, total_amount_micro, currency, ingested_at)
+    VALUES (?, ?, ?, 'uh', 'p', 0, 'sp_api_v1', 'v1.0.0', ?, ?, ?, 1000000, 'JPY', '2026-01-01 00:00:00')`);
+  const FORMS = [
+    { n: 1, headers: ['S-U1', 'S-U2'], lines: ['S-U1'] },
+    { n: 2, headers: ['S-U1'], lines: ['S-U1', 'S-U2'] },
+    { n: 3, headers: [], lines: ['S-U1', 'S-U2'] },
+  ];
+  for (const form of FORMS) {
+    const doc = `UNRES-${form.n}`;
+    form.headers.forEach((sid, i) => insH.run(`${doc}-h${i}`, `${doc}-hk${i}`, doc, sid, `${YM}-01T00:00:00+00:00`, `${YM}-15T00:00:00+00:00`));
+    form.lines.forEach((sid, i) => insL.run(`${doc}-l${i}`, `${doc}-lk${i}`, doc, i + 1, sid, `${YM}-05`, ym, `${doc}-O${i}`));
+    const logs = [];
+    await runMigrate({ commit: false, log: (m) => logs.push(m) });
+    ok(logs.some((l) => l.includes(`決済 ID が 2 つ以上ある文書 1 (${doc} 2)`)), `形 ${form.n}: 版付けの dry-run で「決済 ID が 2 つ以上ある文書」を数える`);
+    let threw = null; try { V.backfillDocumentVersions(db); } catch (e) { threw = e; }
+    const nullRows = db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_document_id = ? AND document_version_seq IS NULL`).get(doc).n;
+    ok(threw && threw.code === 'UNRESOLVED_SETTLEMENT_DOCS' && nullRows === form.lines.length && !db.prepare(`SELECT 1 FROM amazon_settlement_document_versions WHERE source_document_id = ?`).get(doc),
+      `🚨 形 ${form.n}: 版を付けずに止まる (行は版の無いまま・版も作らない) (${threw && threw.code})`);
+    ok(V.documentVersionProblems(db).some((p) => p.code === 'rows_without_version') && !V.documentVersionsReady(db), `形 ${form.n}: build と送り手は「版の無い行」で止まる (S-U2 の行を黙って落とさない・墓石を送らない)`);
+    let mthrew = null; try { await runMigrate({ commit: true, log: () => {}, isAlive: () => false }); } catch (e) { mthrew = e; }
+    ok(mthrew && mthrew.code === 'UNRESOLVED_SETTLEMENT_DOCS', `形 ${form.n}: migrate --commit も止まる (${mthrew && mthrew.code})`);
+    // 明示の allowUnresolved (人が確かめた後) だけ進める = 決済 ID が null の版・止めない・人が直す code
+    await runMigrate({ commit: true, allowUnresolved: true, log: () => {}, isAlive: () => false });
+    const v = db.prepare(`SELECT seq, settlement_id FROM amazon_settlement_document_versions WHERE source_document_id = ?`).get(doc);
+    V.refreshVersionDetail(db, v.seq);   // 要約を作り直しても見出しの 1 行目で決済 ID を埋めない (和集合が 2 つ)
+    const v2 = db.prepare(`SELECT settlement_id FROM amazon_settlement_document_versions WHERE seq = ?`).get(v.seq);
+    ok(v.settlement_id === null && v2.settlement_id === null, `🚨 形 ${form.n}: 決済 ID は見出しと明細の和集合で決める = 決まらない = null (見出しの 1 行目の ${form.headers[0] || '-'} にしない)`);
+    ok(V.documentVersionsReady(db) && V.documentVersionWarnings(db).some((w) => w.code === 'version_unresolved_settlement' && w.detail.includes(doc)),
+      `形 ${form.n}: allowUnresolved の後は止めない・「🚨 決済 ID の決まらない版」(人が直す)`);
+    ok(!V.selectedVersionOf(db, 'S-U1') || V.selectedVersionOf(db, 'S-U1').seq !== v.seq, `形 ${form.n}: その版はどの決済にも採られない (S-U1 の壊れた版として仮に採らない)`);
+    db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE source_document_id = ?`).run(doc);   // 片付け
+    db.prepare(`DELETE FROM raw_amazon_settlement_headers WHERE source_document_id = ?`).run(doc);
+    V.refreshStaleVersionDetails(db);
+  }
 }
 
 // ─── 🆕 #1567 R2 High 1: 過去の行で、見出しの無い新しい一部だけの文書が、見出しつきの全部の古い文書を押しのけない ───

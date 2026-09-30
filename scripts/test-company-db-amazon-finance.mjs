@@ -873,7 +873,7 @@ await t('daily-sync (🆕 2026-10-01 D7b-1b-3): 決済の取込と財務の送�
   assert.ok(!src.includes("'apps/warehouse/fetch-amazon-settlements.js --days 14'") && !src.includes('amazon-finance.mjs ${financeArgs'), '旧い 2 工程 (取込・送り手) は無い');
   // 送ったかは coordinator の記録の構造の値 (要約の文字でない・#1567 R1 L3)。財務 push: ⏭️ (バックフィル前) の朝・失敗の朝は突き合わせない
   assert.ok(src.includes('const financeSent = coordinatorPushedFinance(process.env.DATA_DIR, process.env.DAILY_SYNC_RUN_ID);'), '突き合わせの条件 (送った朝は coordinator の exit に依らず・#1567 R2 L2)');
-  assert.match(src, /j\.finance_pushed === true && \(runId == null \|\| j\.daily_sync_run_id === runId\)/);
+  assert.match(src, /j\.finance_pushed === true && j\.finance_push_ok === true && \(runId == null \|\| j\.daily_sync_run_id === runId\)/);   // 送信の途中の失敗の朝は比べない (#1567 R3 L2)
   assert.match(src, /if \(financeSqliteFresh && financeSent\) \{\s*const cdbFinanceRecResult/);
   assert.match(src, /const financeSqliteFresh = financeBuildFailed\.length === 0 && accountFeesBuildResult\.success;/);
   assert.match(src, /financeFailed\.push\(month\);\s*financeBuildFailed\.push\(month\);/);   // build の失敗だけを数える (sync の失敗は SQLite に関係しない)

@@ -337,10 +337,13 @@ export function refreshVersionDetail(db, seq) {
     header_start: h0 ? h0.settlement_start_date : null, header_end: h0 ? h0.settlement_end_date : null, header_total_micro: h0 ? h0.total_amount_micro : null,
     header_currency: h0 ? h0.currency : null, header_currency_raw: h0 ? h0.currency_raw : null,
   };
+  // 決済 ID = 見出しと明細の決済 ID の **和集合** が 1 種類のときだけ (#1567 R3 Medium 1: 見出しの 1 行目で決めると、明細の別の決済の行が build から黙って落ちる)
+  const union = new Set([...settlements, ...hs.map((h) => h.source_settlement_id)].filter((x) => x != null));
+  const settle = union.size === 1 ? [...union][0] : null;
   const reg = db.prepare(`SELECT registered_by, settlement_id FROM amazon_settlement_document_versions WHERE seq = ?`).get(seq) || {};
-  out.detail_valid = versionDetailValid({ ...out, registered_by: reg.registered_by, settlement_id: reg.settlement_id ?? out.header_settlement_id ?? sOne }) ? 1 : 0;
+  out.detail_valid = versionDetailValid({ ...out, registered_by: reg.registered_by, settlement_id: reg.settlement_id ?? settle }) ? 1 : 0;
   db.prepare(`UPDATE amazon_settlement_document_versions SET ${Object.keys(out).map((k) => `${k} = @${k}`).join(', ')},
-      settlement_id = COALESCE(settlement_id, @settle) WHERE seq = @seq`).run({ ...out, settle: out.header_settlement_id ?? sOne, seq });
+      settlement_id = COALESCE(settlement_id, @settle) WHERE seq = @seq`).run({ ...out, settle, seq });
   return out;
 }
 /**
@@ -448,20 +451,33 @@ export function assertDocumentVersionsReady(db) {
  *   行の更新は id の範囲ごとの取引 (batchIds)。trigger は版の鍵の null → 値を数えない = 最後に source_revision を 1 つ進める。
  *   check = 各取引の中の確かめ (lease)。戻り = { groups, versions, lines, headers }
  */
-export function backfillDocumentVersions(db, { batchIds = 200000, check = null, log = () => {}, now = new Date() } = {}) {
+/** 決済 ID が 2 つ以上ある過去の文書を見つけた (版を付けずに止まる = その行は版の無いまま = build と送り手も止まる。#1567 R3 Medium 1) */
+export class UnresolvedSettlementDocsError extends Error {
+  constructor(groups) {
+    super(`🚨 決済 ID が 2 つ以上ある過去の文書 ${groups.length} (${groups.slice(0, 5).map((g) => `${g.source_layer} ${g.source_document_id} = 決済 ${g.u_n} 個`).join(' / ')}) = どの決済の行か決まらない = 版を付けずに止めた `
+      + '(build と送り手も「版の無い行」で止まる = 行を黙って落とさない・墓石を送らない)。文書を確かめ、分けて入れ直すか、確かめた上で migrate-settlement-document-versions.js --commit --allow-unresolved');
+    this.code = 'UNRESOLVED_SETTLEMENT_DOCS';
+    this.groups = groups;
+  }
+}
+export function backfillDocumentVersions(db, { batchIds = 200000, check = null, log = () => {}, now = new Date(), allowUnresolved = false } = {}) {
   const tx = (fn) => db.transaction(() => { if (check) check(db); return fn(); }).immediate();
   // 決済 ID も group で取る (R1 High 1: 版の登録と同じ取引で入れる = 行の UPDATE の後に止まっても決済 ID の無い版を残さない)。
   //   見出しの決済 ID が 1 つならそれ・見出しが無ければ明細の決済 ID が 1 つならそれ・どちらでもなければ null (壊れた文書 = assertDocumentVersionsReady が止める)
   const groups = db.prepare(`
     SELECT source_layer, source_document_id, source_file_hash, parser_version, MIN(ingested_at) AS ingested_at,
            COUNT(DISTINCT CASE WHEN is_header = 1 THEN source_settlement_id END) AS h_n, MAX(CASE WHEN is_header = 1 THEN source_settlement_id END) AS h_id,
-           COUNT(DISTINCT CASE WHEN is_header = 0 THEN source_settlement_id END) AS l_n, MAX(CASE WHEN is_header = 0 THEN source_settlement_id END) AS l_id
+           COUNT(DISTINCT CASE WHEN is_header = 0 THEN source_settlement_id END) AS l_n, MAX(CASE WHEN is_header = 0 THEN source_settlement_id END) AS l_id,
+           COUNT(DISTINCT source_settlement_id) AS u_n, MAX(source_settlement_id) AS u_id
     FROM (
       SELECT source_layer, source_document_id, source_file_hash, parser_version, ingested_at, source_settlement_id, 0 AS is_header FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_docver WHERE document_version_seq IS NULL
       UNION ALL
       SELECT source_layer, source_document_id, source_file_hash, parser_version, ingested_at, source_settlement_id, 1 AS is_header FROM raw_amazon_settlement_headers INDEXED BY idx_settle_headers_docver WHERE document_version_seq IS NULL
     ) GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4`).all();
   if (!groups.length) return { groups: 0, versions: 0, lines: 0, headers: 0, refreshed: refreshStaleVersionDetails(db, { check, log }) };
+  // 見出しと明細の決済 ID の和集合が 2 つ以上 = 決まらない → 版を付けずに止まる (明示の allowUnresolved だけ進める = 決済 ID が null の版・version_unresolved_settlement)
+  const unresolved = groups.filter((g) => g.u_n > 1);
+  if (unresolved.length && !allowUnresolved) throw new UnresolvedSettlementDocsError(unresolved);
   log(`[versions] 版の無い文書 ${groups.length} 個に版を付ける`);
   const seqs = [];
   tx(() => {
@@ -474,7 +490,7 @@ export function backfillDocumentVersions(db, { batchIds = 200000, check = null, 
         source_layer: g.source_layer, report_type: api ? REPORT_TYPE_OF_LAYER[g.source_layer] : null, report_id: api ? g.source_document_id : null,
         report_document_id: null, file_hash: g.source_file_hash ?? null, normalization_version: g.parser_version,
       };
-      const settlementId = g.h_n === 1 ? g.h_id : (g.h_n === 0 && g.l_n === 1 ? g.l_id : null);
+      const settlementId = g.u_n === 1 ? g.u_id : null;   // 見出しと明細の決済 ID の和集合が 1 種類のときだけ (#1567 R3 Medium 1)
       const v = registerDocumentVersion(db, { ...meta, document_version_id: documentVersionId(meta), source_document_id: g.source_document_id, settlement_id: settlementId, ingested_at: g.ingested_at || nowSql(now) }, { registeredBy: 'backfill', now });
       if (v.settlement_id == null && settlementId != null) db.prepare(`UPDATE amazon_settlement_document_versions SET settlement_id = ? WHERE seq = ?`).run(settlementId, v.seq);
       ins.run(g.source_layer, g.source_document_id, g.source_file_hash ?? null, g.parser_version, v.seq);

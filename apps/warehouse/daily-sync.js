@@ -249,7 +249,8 @@ function runScript(scriptPath, label, timeoutMs = 600000, { retryLibuvCrash = fa
 export function coordinatorPushedFinance(dataDir, runId) {
   try {
     const j = JSON.parse(fs.readFileSync(path.join(dataDir, 'amazon-finance-coverage-last.json'), 'utf8'));
-    return !!(j && j.finance_pushed === true && (runId == null || j.daily_sync_run_id === runId));
+    // 送った (finance_pushed) かつ送信がそろって終わった (finance_push_ok。途中の失敗の朝は比べない = 古い Render との偽の差を数えない。#1567 R3 L2)
+    return !!(j && j.finance_pushed === true && j.finance_push_ok === true && (runId == null || j.daily_sync_run_id === runId));
   } catch { return false; }
 }
 

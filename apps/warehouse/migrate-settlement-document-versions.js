@@ -13,6 +13,8 @@
  * 使い方:
  *   node apps/warehouse/migrate-settlement-document-versions.js            → 数えるだけ (dry-run・書かない)
  *   node apps/warehouse/migrate-settlement-document-versions.js --commit   → coverage の lease を取って版を付ける (coordinator が動いていれば止まる)
+ *   🚨 決済 ID が 2 つ以上ある過去の文書があれば版を付けずに止まる (#1567 R3 Medium 1)。文書を確かめた上で進めるときだけ --commit --allow-unresolved
+ *      (その版は決済 ID が null = どの決済にも採られない = 行は build に入らない・朝の報告に 🚨 version_unresolved_settlement)
  * env: DATA_DIR (必須)
  */
 import 'dotenv/config';
@@ -22,7 +24,7 @@ import { backfillDocumentVersions, refreshStaleVersionDetails, acquireCoverageLe
 import { isAliveNodeSince } from './retry-lock.js';
 import { pathToFileURL } from 'node:url';
 
-export async function runMigrate({ commit = false, log = console.log, isAlive = isAliveNodeSince } = {}) {
+export async function runMigrate({ commit = false, allowUnresolved = false, log = console.log, isAlive = isAliveNodeSince } = {}) {
   if (!process.env.DATA_DIR) throw new Error('DATA_DIR が無い (cwd の data に作らない)');
   await initDB();
   const db = getDB();
@@ -47,7 +49,7 @@ export async function runMigrate({ commit = false, log = console.log, isAlive = 
   const lease = got.lease;
   try {
     const check = (dbx) => assertLease(dbx, lease);
-    const out = backfillDocumentVersions(db, { check, log });
+    const out = backfillDocumentVersions(db, { check, log, allowUnresolved });
     const refreshed = refreshStaleVersionDetails(db, { check, log });
     const problems = documentVersionProblems(db);
     log(`[versions] ${problems.length ? '⚠️' : '✅'} 版を付けた: 文書 ${out.groups}・版 ${out.versions}・明細 ${out.lines} 行・見出し ${out.headers} 行 / 要約を作り直した版 ${refreshed + (out.refreshed || 0)} / 1 取引の最長 ${out.maxTxMs || 0} ms`);
@@ -65,6 +67,7 @@ export async function runMigrate({ commit = false, log = console.log, isAlive = 
 const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isDirectRun) {
   const args = process.argv.slice(2);
-  for (const a of args) if (a !== '--commit') { console.error(`知らない引数: ${a}`); process.exit(2); }
-  runMigrate({ commit: args.includes('--commit') }).catch((e) => { console.error(`❌ 決済の文書の版: ${e.message}`); process.exitCode = 1; });
+  for (const a of args) if (a !== '--commit' && a !== '--allow-unresolved') { console.error(`知らない引数: ${a}`); process.exit(2); }
+  if (args.includes('--allow-unresolved') && !args.includes('--commit')) { console.error('--allow-unresolved は --commit と一緒に'); process.exit(2); }
+  runMigrate({ commit: args.includes('--commit'), allowUnresolved: args.includes('--allow-unresolved') }).catch((e) => { console.error(`❌ 決済の文書の版: ${e.message}`); process.exitCode = 1; });
 }
