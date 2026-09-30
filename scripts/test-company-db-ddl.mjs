@@ -115,6 +115,8 @@ await ta('[!] 期待する表がすべてある', async () => {
     'ops.load_decisions',
     // 0046 観測の原価 (13 §3.4・D7b-2)
     'core.sku_cost_observed_loads', 'core.sku_cost_observed',
+    // 0050 マスタ入力画面の土台 (14 §6 ⑤-1)
+    'ops.master_cutover_state', 'ops.master_cutover_events', 'ops.master_edit_requests', 'ops.sku_component_requests',
   ];
   const missing = expect.filter((t) => !have.has(t));
   assert.deepEqual(missing, [], `無い表: ${missing.join(', ')}`);
@@ -122,6 +124,17 @@ await ta('[!] 期待する表がすべてある', async () => {
   assert.deepEqual(martTables.map((v) => v.t).sort(), ['finance_daily', 'sales_daily', 'sales_daily_published', 'sales_daily_runs', 'sales_daily_session_dates', 'sales_daily_state']);   // mart は view が基本。表は run_id publish の日次集計とその公開の管理 (0021) だけ
   const views = await q("select table_schema || '.' || table_name as t from information_schema.views where table_schema = 'mart'");
   assert.deepEqual(views.map((v) => v.t).sort(), ['mart.v_ad_spend_daily', 'mart.v_cross_mall_diff', 'mart.v_finance_account_fees_monthly', 'mart.v_finance_daily', 'mart.v_listing_360', 'mart.v_order_finance_summary', 'mart.v_order_finance_uncovered', 'mart.v_product_360', 'mart.v_product_dq', 'mart.v_purchase_backorder_by_sku', 'mart.v_purchase_order_open', 'mart.v_sales_daily', 'mart.v_shipments_daily', 'mart.v_shipments_unlinked', 'mart.v_sku_cost_observed_effective', 'mart.v_sku_stock', 'mart.v_warehouse_stock_current']);
+});
+
+await ta('[!] 0050 (14 §6 ⑤-1): 切替の段階は legacy_open から・セットの 2 列は null で足す・保存の記録は追記だけ・原価の期間の重なりの守りは夜間ロードを見ない', async () => {
+  assert.deepEqual((await q('select phase from ops.master_cutover_state'))[0], { phase: 'legacy_open' });
+  const cols = await q("select column_name as c, data_type as t, is_nullable as n from information_schema.columns where table_schema = 'core' and table_name = 'skus' and column_name in ('set_sales_class_override', 'handling_own') order by 1");
+  assert.deepEqual(cols.map((r) => [r.c, r.t, r.n]), [['handling_own', 'text', 'YES'], ['set_sales_class_override', 'smallint', 'YES']]);
+  assert.equal((await q("select count(*)::int as n from core.skus where set_sales_class_override is not null or handling_own is not null"))[0].n, 0);
+  const trg = await q("select tgname as t from pg_trigger where tgrelid in ('ops.master_edit_requests'::regclass, 'core.sku_costs'::regclass, 'ops.sku_component_requests'::regclass, 'ops.master_cutover_state'::regclass) and not tgisinternal order by 1");
+  for (const t of ['trg_append_only_row', 'trg_sku_costs_no_overlap', 'trg_sku_component_requests_guard', 'trg_master_cutover_state_guard']) assert.ok(trg.some((r) => r.t === t), `trigger ${t} が無い`);
+  const fn = await q("select pg_get_functiondef('core.guard_sku_cost_overlap()'::regprocedure) as d");
+  assert.match(fn[0].d, /portal_master_edit/);
 });
 
 await ta('[!] 0047 (13 §3.2・§3.7・D7b-1a): 財務の行に分けられない部品の 4 列 (既定 0)・日 × 正規化 SKU の関数 mart.finance_daily_sku_range', async () => {
