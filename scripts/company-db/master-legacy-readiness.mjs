@@ -18,7 +18,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from './migrate.mjs';
 import { readCutoverPhase } from '../../lib/master-cutover.mjs';
-import { phaseUrlFrom, gateUrlFor, GATE_URL_ENV, legacyManifest, resolveBuildId } from '../../lib/master-legacy-gate.mjs';
+import { phaseUrlFrom, gateUrlFor, GATE_URL_ENV, legacyManifest, resolveBuildId, ACK_FUNCTION_SIGNATURE } from '../../lib/master-legacy-gate.mjs';
 
 export async function checkReadiness({ host, env = process.env, open = (url) => openPgClient(url, { application_name: 'master-legacy-readiness', connectionTimeoutMillis: 5000, statement_timeout: 5000 }) } = {}) {
   const lines = [];
@@ -46,8 +46,8 @@ export async function checkReadiness({ host, env = process.env, open = (url) => 
       c = await open(gateUrl);
       const who = (await c.query('select session_user::text as u')).rows[0].u;
       if (who === `master_gate_${host}`) ok(`門のログインの役 = ${who}`); else ng(`門のログインの役が ${who} (期待 master_gate_${host}。⑤-1 の記録の関数は場所と役が違えば拒む)`);
-      const fn = (await c.query(`select to_regprocedure('ops.record_legacy_gate_ack(text,text,text,jsonb,text,text,integer,timestamptz)') as f`)).rows[0].f;
-      if (!fn) ng('記録の関数 ops.record_legacy_gate_ack が無い (0050 の前)');
+      const fn = (await c.query('select to_regprocedure($1)::text as f', [ACK_FUNCTION_SIGNATURE])).rows[0].f;
+      if (!fn) ng(`記録の関数 ${ACK_FUNCTION_SIGNATURE} が無い (0050 の前か、⑤-1 の古い版)`);
       else {
         const can = (await c.query(`select has_function_privilege(session_user, $1::regprocedure, 'execute') as ok`, [fn])).rows[0].ok;
         if (can) ok('記録の関数を実行できる'); else ng('記録の関数の実行権が無い (⑤-1 の scripts/company-db/create-master-edit-roles.mjs を流す)');

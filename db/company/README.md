@@ -757,14 +757,14 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
     - Render = `COMPANY_DB_MASTER_GATE_RENDER_URL` (`master_gate_render`)
     - miniPC = `COMPANY_DB_MASTER_GATE_MINIPC_URL` (`master_gate_minipc`)
     - 🚨 ほかの場所のログインは使わない (miniPC は Render の URL があっても書かない)。
-  - いつ: 起動のとき・要求が来たついでに 5 分おき (新しい定期実行は作らない)・読み戻しを呼んだとき・止めるとき (SIGTERM / SIGINT = 「止めた」と理由・書きかけ 0・長くても 2 秒で諦めて止まる)。
+  - いつ: 起動のとき・要求が来たついでに 5 分おき (新しい定期実行は作らない)・読み戻しを呼んだとき・止めるとき (SIGTERM / SIGINT = 「止めた」と理由 (200 字まで)・書きかけ 0・長くても 2 秒で諦めて止まる。返事の stopped も確かめる)。ログインと場所が違う = DB が `gate_host_mismatch` (42501) で拒む (env の取り違え)。
   - 中身: host・プロセスの名札 (`RENDER_INSTANCE_ID` か PC 名 + pid + 起動の乱数)・build の番号 (Render = `RENDER_GIT_COMMIT`・miniPC = git の HEAD)・一覧 (manifest `{ entries: [{ id, kind: code | manual }] }`・ハッシュは DB が計算)・持ち主表・見た段階・書きかけの件数といちばん古い開始。
   - 書く前に確かめる (場所・build の番号・段階を読める・門のログインがある・関数がある)。書いた後に返事 (`ack_id`・DB が同じ一覧から計算した `manifest_hash`・`acked_at`) を確かめてから `acked`。だめなら書かずに理由をログ (同じ理由は 1 回) と読み戻しに出す (関数が無い = 0050 の前 = 注意 1 回)。書く間に段階が変わった (`stale_phase`) = 読み直して 1 回だけ書き直す。
   - 止まり方が分からないプロセス (落ちた・電源・2 秒で書けなかった) = ⑤-1 の段階を進める関数は「24 時間以内に記録があり、最後の記録が 15 分より前で『止めた』でもない」プロセスがあると進めない → 人が止まったのを確かめて `node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list` / `--stop --host minipc --instance <名札> --reason "…" --yes` (手の操作・定期実行にしない)。
 - **読み戻し**: `GET /apps/warehouse/api/master-legacy-gate` (miniPC と Render の両方にある) = その環境・そのプロセスが見ている段階・書けるか・manifest_hash (最後に DB が受け取った一覧)・一覧の数・持ち主表のハッシュ・build の番号・名札・書きかけ (`inflight.count`・`oldest_started_at`)・数・門の記録 (呼ぶと記録も書き直す)。
 - 🚨 **マージ・配る前に** (PR の本文のチェックリスト):
   1. 0050 (⑤-1) が本番に本適用済み (表が無い = 読めない = 古い入口が全部 503 で閉じる)。
-  2. ⑤-1 の `create-master-edit-roles.mjs` を流し、`master_gate_render` / `master_gate_minipc` のパスワードを Render と miniPC の .env に `COMPANY_DB_MASTER_GATE_RENDER_URL` / `COMPANY_DB_MASTER_GATE_MINIPC_URL` で入れた (miniPC は WarehouseServer を再起動)。
+  2. ⑤-1 の `create-master-edit-roles.mjs` を流し、出た `COMPANY_DB_MASTER_GATE_RENDER_URL` (Render の env) / `COMPANY_DB_MASTER_GATE_MINIPC_URL` (miniPC の .env) を入れた (miniPC は WarehouseServer を再起動)。パスワードが出るのはロールを初めて作ったときだけ。もうあって接続文字列が分からない = `--rotate-password master_gate_render` (または `master_gate_minipc`) で変えて、その場所の env を同じ日に書き換える。
   3. `node -r dotenv/config scripts/company-db/master-legacy-readiness.mjs --host minipc` と Render の Shell で `--host render` が終了コード 0 (読むだけ・何も書かない)。
   4. 配った後: 両方の読み戻しで `ack.state = acked`・`writable: true` (legacy_open)・同じ manifest_hash と build の番号。
 - **切替の手順 (legacy_open → frozen → 最後の同期)**:

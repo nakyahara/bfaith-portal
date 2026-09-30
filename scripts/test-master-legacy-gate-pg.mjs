@@ -17,6 +17,10 @@
  *  10 止めるとき (SIGTERM / SIGINT) の「止めた」の記録と、人が別のプロセスを「止めた」にする (scripts/company-db/master-legacy-instance.mjs)
  *  11 配る前の確かめ (scripts/company-db/master-legacy-readiness.mjs): そろっていれば ok・場所と役が違えば「足りない」
  *  12 門のログインの接続は、同時に 20 件の読み + 記録を書いても 2 本まで (プール 1 本 + 記録 1 本)
+ *  13 env の取り違え (miniPC の env に Render のログイン) = ⑤-1 の関数が gate_host_mismatch で拒む・何も書かない
+ *  14 ⑤-3 の記録で ⑤-1 の段階の関数が frozen に進める。黙っているプロセス (24 時間以内に記録・最後が 15 分より前・止めたでもない) があれば拒む
+ *     → scripts/company-db/master-legacy-instance.mjs で「止めた」を書けば進める
+ * ロールは ⑤-1 の本物の作り (scripts/company-db/create-master-edit-roles.mjs) だけで作る (試験で足さない)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-legacy-gate-pg.mjs
  *   (cd C:/tmp/pg-embed && node run-conc.mjs scripts/test-master-legacy-gate-pg.mjs C:/tmp/sor53-work)
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す)。localhost 以外の URL は拒む (本番を渡さない)。package.json の test:company-db には入れない
@@ -25,7 +29,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { openPgClient, pgAdapter, applyMigrations } from './company-db/migrate.mjs';
 import { createRoles, urlFor } from './company-db/create-watch-roles.mjs';
-import { createMasterEditRoles, MASTER_EDIT_ROLES } from './company-db/create-master-edit-roles.mjs';
+import { createMasterEditRoles, GATE_LOGIN_ROLES } from './company-db/create-master-edit-roles.mjs';
 
 const url = process.env.TEST_PG_URL || '';
 if (!url) { console.log('⏭️ TEST_PG_URL が無い (実 PostgreSQL の門の試験は飛ばす。PGlite と偽の読み方の試験は scripts/test-master-legacy-gate.mjs)'); process.exit(0); }
@@ -59,14 +63,9 @@ const ackCount = async () => Number((await M.query('select count(*)::int as n fr
 try {
   await applyMigrations(db, { log: () => {} });
   await createRoles(M, { watcherPw: 'w-pw', writerPw: 'ww-pw' });
-  // ⑤-1 の門のロール。場所ごとのログイン (master_gate_render / master_gate_minipc = master_gate の権限を継ぐ) が
-  // まだ作られない版の ⑤-1 なら、ここで作る (⑤-1 の新しい形に合わせる。ある版ならそのまま使う)
-  const pw = Object.fromEntries([...MASTER_EDIT_ROLES, 'master_gate_render', 'master_gate_minipc'].map((r) => [r, `${r}-pw`]));
-  await createMasterEditRoles(M, { pw });
-  for (const h of ['render', 'minipc']) {
-    const role = `master_gate_${h}`;
-    if (!(await M.query('select 1 from pg_roles where rolname = $1', [role])).rowCount) await M.query(`create role ${role} login inherit password '${role}-pw' in role master_gate`);
-  }
+  // ⑤-1 のロールの作り (本物の scripts/company-db/create-master-edit-roles.mjs = まとめの master_gate (ログインなし) と場所ごとのログイン)。
+  // 試験は門のログインのパスワードだけ決めて渡す (ほかのロールは作りに任せる)
+  await createMasterEditRoles(M, { pw: Object.fromEntries(Object.values(GATE_LOGIN_ROLES).map((r) => [r, `${r}-pw`])) });
   const gateUrl = (h) => urlFor(u.toString(), `master_gate_${h}`, `master_gate_${h}-pw`);
   process.env.COMPANY_DB_WATCH_URL = urlFor(u.toString(), 'watcher', 'w-pw');
   G.__setLegacyPhaseReader(null);   // 本物の読み方 (プール)
@@ -201,12 +200,12 @@ try {
     let r;
     try { r = await G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM (試験)', env, timeoutMs: 5000 }); } finally { end(); }
     assert.equal(r.state, 'stopped', JSON.stringify(r));
-    assert.equal((await M.query('select inflight_count from ops.master_legacy_gate_acks where ack_id = $1', [r.ack_id])).rows[0].inflight_count, 0);
+    assert.deepEqual(Object.values((await M.query('select inflight_count, stopped, stopped_reason, session_role from ops.master_legacy_gate_acks where ack_id = $1', [r.ack_id])).rows[0]), [0, true, 'SIGTERM (試験)', 'master_gate_minipc']);
     const { markStopped, listInstances } = await import('./company-db/master-legacy-instance.mjs');
     const r2 = await markStopped({ host: 'minipc', instance: 'ghost-pc:999:deadbeef', reason: '電源が切れて戻らない (試験)', env });
     assert.equal(r2.state, 'stopped', JSON.stringify(r2));
     const rows = await listInstances(M, { hours: 24 });
-    assert.ok(rows.some((x) => x.instance_id === 'ghost-pc:999:deadbeef' && x.host === 'minipc' && x.fresh === true), JSON.stringify(rows));
+    assert.ok(rows.some((x) => x.instance_id === 'ghost-pc:999:deadbeef' && x.host === 'minipc' && x.stopped === true && x.stopped_reason === '電源が切れて戻らない (試験)'), JSON.stringify(rows));
     await assert.rejects(() => markStopped({ host: 'render', instance: 'x:1:2', reason: '試験', env: { ...env, COMPANY_DB_MASTER_GATE_RENDER_URL: '' } }), /COMPANY_DB_MASTER_GATE_RENDER_URL/);
   });
   await ta('[11] 配る前の確かめ: そろっていれば ok・場所と役が違えば「足りない」・build が分からなければ「足りない」(何も書かない)', async () => {
@@ -231,6 +230,41 @@ try {
       assert.ok(rs.every((s) => s.writable === true)); assert.equal(ack.state, 'acked', JSON.stringify(ack));
     } finally { stop = true; await watch; }
     assert.ok(peak >= 1 && peak <= 2, `門のログインの接続 ${peak} 本`);
+  });
+  await ta('[13] env の取り違え (miniPC の env に Render のログイン) = ⑤-1 の関数が gate_host_mismatch (42501) で拒む・何も書かない・直し方を出す', async () => {
+    const before = await ackCount();
+    const r = await quiet(() => G.ackLegacyGates({ host: 'minipc', env: { ...env, COMPANY_DB_MASTER_GATE_MINIPC_URL: gateUrl('render') } }));
+    assert.equal(r.state, 'error'); assert.match(r.detail, /gate_host_mismatch/); assert.match(r.detail, /COMPANY_DB_MASTER_GATE_MINIPC_URL は master_gate_minipc/);
+    assert.equal(await ackCount(), before);
+  });
+  await ta('[14] ⑤-3 の記録で ⑤-1 の段階の関数が frozen に進める。黙っているプロセスがあれば拒む → master-legacy-instance.mjs で「止めた」を書けば進める', async () => {
+    const { markStopped } = await import('./company-db/master-legacy-instance.mjs');
+    const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
+    const C = await import('../lib/master-cutover.mjs');
+    // Render の記録も ⑤-3 の書き方で (Render のログイン)
+    G.__resetLegacyAck();
+    const rr = await G.ackLegacyGates({ host: 'render', env: { ...env, COMPANY_DB_MASTER_GATE_RENDER_URL: gateUrl('render') } });
+    assert.equal(rr.state, 'acked', JSON.stringify(rr));
+    G.__resetLegacyAck();
+    assert.equal((await G.ackLegacyGates({ host: 'minipc', env })).state, 'acked');
+    const manifest = G.legacyManifest();
+    const mh = await C.manifestHashOf(db, manifest);
+    const oh = C.ownershipHash(MASTER_OWNERSHIP);
+    // 1 時間前の記録だけのプロセス (落ちて「止めた」を書けなかった) = 黙っている
+    await M.query(`insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, session_role, acked_at)
+      values ('minipc', 'old-pc:1:aaaaaaaa', $1, $2, $3, 'legacy_open', 0, 'master_gate_minipc', clock_timestamp() - interval '1 hour')`, ['b'.repeat(40), mh, oh]);
+    const evidence = {
+      expected_builds: { render: ['b'.repeat(40)], minipc: ['b'.repeat(40)] }, manifest_hash: mh, owner_hash: oh,
+      manual_entries_stopped: manifest.entries.filter((x) => x.kind === 'manual').map((x) => ({ id: x.id, by: 'test', at: '2026-10-01T00:00:00Z' })),
+      drain: { done: true, checked_by: 'test', checked_at: '2026-10-01T00:00:00Z' },
+    };
+    await assert.rejects(() => C.advanceCutoverPhase(db, { to: 'frozen', actor: 'test', evidence }), /old-pc:1:aaaaaaaa: 黙っている/);
+    const st = await markStopped({ host: 'minipc', instance: 'old-pc:1:aaaaaaaa', reason: '再起動で消えたのを確かめた (試験)', env });
+    assert.equal(st.state, 'stopped', JSON.stringify(st));
+    const r = await C.advanceCutoverPhase(db, { to: 'frozen', actor: 'test', evidence });
+    assert.ok(r.acks.some((a) => a.instance_id === 'old-pc:1:aaaaaaaa' && a.stopped === true), JSON.stringify(r.acks));
+    assert.ok(r.acks.some((a) => a.host === 'render' && !a.stopped) && r.acks.some((a) => a.host === 'minipc' && !a.stopped));
+    assert.equal((await G.checkLegacyGate()).writable, false, '進めた直後から古い入口は閉じる');
   });
 } finally {
   G.__setLegacyPhaseReader(null);

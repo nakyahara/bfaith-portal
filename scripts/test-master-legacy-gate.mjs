@@ -269,7 +269,7 @@ const fakeGateDb = ({ hasFn = true, reply = null, calls = [] } = {}) => async ()
       calls.push({ sql, params });
       if (/to_regprocedure/.test(sql)) return { rows: [{ ok: hasFn }] };
       if (/legacy_manifest_hash/.test(sql)) return { rows: [{ h: 'f'.repeat(64) }] };
-      if (/record_legacy_gate_ack/.test(sql)) return { rows: [{ r: reply || { ack_id: 7, manifest_hash: 'f'.repeat(64), acked_at: '2026-10-01T00:00:00Z' } }] };
+      if (/record_legacy_gate_ack/.test(sql)) return { rows: [{ r: reply || { ack_id: 7, manifest_hash: 'f'.repeat(64), acked_at: '2026-10-01T00:00:00Z', stopped: params[8] === true } }] };
       throw new Error(`知らない SQL: ${sql}`);
     },
   },
@@ -307,18 +307,24 @@ await t('門の記録: ⑤-1 の関数に場所・名札・build・manifest・�
     assert.equal(r.state, 'acked', r.detail); assert.equal(r.ack_id, '7'); assert.equal(r.manifest_hash, 'f'.repeat(64));
   } finally { end(); }
   const call = calls.find((c) => /select ops\.record_legacy_gate_ack\(/.test(c.sql));
-  const [host, inst, build, manifest, owner, phase, n, oldest] = call.params;
+  assert.equal(call.params.length, 10, '⑤-1 の関数は 10 個 (止めた・止めた理由まで)');
+  const [host, inst, build, manifest, owner, phase, n, oldest, stopped, reason] = call.params;
   const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
   assert.equal(host, 'render'); assert.match(inst, /^srv-1:\d+:[0-9a-f]{8}$/); assert.equal(build, 'a'.repeat(40));
   assert.deepEqual(JSON.parse(manifest), G.legacyManifest());
   assert.equal(owner, ownershipHash(MASTER_OWNERSHIP)); assert.equal(phase, 'legacy_open');
-  assert.equal(n, 1); assert.ok(oldest);
+  assert.equal(n, 1); assert.ok(oldest); assert.equal(stopped, false); assert.equal(reason, null);
   // 返事が違う = 「書けた」にしない
   await quiet(async () => {
     let bad = await G.ackLegacyGates({ host: 'render', connect: fakeGateDb({ reply: { ack_id: 8, manifest_hash: 'e'.repeat(64), acked_at: 'x' } }), env: { RENDER_GIT_COMMIT: 'a'.repeat(40) } });
     assert.equal(bad.state, 'bad_reply');
     bad = await G.ackLegacyGates({ host: 'render', connect: fakeGateDb({ reply: { manifest_hash: 'f'.repeat(64) } }), env: { RENDER_GIT_COMMIT: 'a'.repeat(40) } });
     assert.equal(bad.state, 'bad_reply');
+    // 「止めた」を頼んだのに普通の記録 (stopped: false) が返った = 書けたことにしない (段階を進める門が黙っているプロセスとして止める)
+    bad = await G.ackLegacyGates({ host: 'render', connect: fakeGateDb({ reply: { ack_id: 9, manifest_hash: 'f'.repeat(64), acked_at: 'x', stopped: false } }), env: { RENDER_GIT_COMMIT: 'a'.repeat(40) }, stopped: true, stoppedReason: '試験' });
+    assert.equal(bad.state, 'bad_reply');
+    bad = await G.ackLegacyGates({ host: 'render', connect: fakeGateDb({ reply: { ack_id: 9, manifest_hash: 'f'.repeat(64), acked_at: 'x' } }), env: { RENDER_GIT_COMMIT: 'a'.repeat(40) } });
+    assert.equal(bad.state, 'bad_reply', '返事に stopped が無い = ⑤-1 の古い版 = 書けたことにしない');
   });
 });
 await t('止めるとき: 「止めた」の記録 (理由つき・書きかけ 0) を書く。人が別のプロセスを「止めた」にできる (名札を指定)。理由が無い = 書かない', async () => {
@@ -332,12 +338,14 @@ await t('止めるとき: 「止めた」の記録 (理由つき・書きかけ 
     assert.equal(r2.state, 'stopped', r2.detail);
     const call = calls.find((c) => /select ops\.record_legacy_gate_ack\(/.test(c.sql));
     assert.equal(call.params[6], 0, '止めた = 書きかけ 0'); assert.equal(call.params[7], null);
+    assert.equal(call.params[8], true); assert.equal(call.params[9], 'SIGTERM で止めた');
     const { markStopped } = await import('./company-db/master-legacy-instance.mjs');
     calls.length = 0;
     const r3 = await markStopped({ host: 'render', instance: 'srv-9:123:deadbeef', reason: '電源が落ちて戻らない', connect: fakeGateDb({ calls }), env: { RENDER_GIT_COMMIT: 'c'.repeat(40) } });
     assert.equal(r3.state, 'stopped');
     assert.equal(calls.find((c) => /select ops\.record_legacy_gate_ack\(/.test(c.sql)).params[1], 'srv-9:123:deadbeef', '指定した名札で書く');
     await assert.rejects(() => markStopped({ host: 'render', instance: 'srv-9', reason: '', connect: fakeGateDb() }), /reason/);
+    await assert.rejects(() => markStopped({ host: 'render', instance: 'srv-9', reason: 'x'.repeat(201), connect: fakeGateDb() }), /200 字/);
     await assert.rejects(() => markStopped({ host: 'laptop', instance: 'srv-9', reason: 'x', connect: fakeGateDb() }), /host/);
     assert.equal((await quiet(() => G.ackLegacyGates({ host: 'minipc', connect: fakeGateDb(), stopped: true, stoppedReason: ' ' }))).state, 'precheck_failed');
   } finally { end(); }
@@ -412,25 +420,45 @@ await t('表が無い (0050 の前の DB) = 読めない = 閉じる', async () 
   assert.equal(s.writable, false); assert.equal(s.readable, false);
   await pg2.close();
 });
-await t('門の記録を ⑤-1 の本物の関数 (ops.record_legacy_gate_ack) で書く: 行と manifest (手の入口つき) が残る・返事を確かめる・書く間に段階が変わった (stale_phase) = 読み直して 1 回書き直す', async () => {
+await t('門の記録を ⑤-1 の本物の関数 (ops.record_legacy_gate_ack) で書く: 場所ごとのログイン (session_user) で書く・行と manifest (手の入口つき) が残る・書く間に段階が変わった (stale_phase) = 読み直して 1 回書き直す・止めた・場所の取り違えは DB が拒む', async () => {
+  // ⑤-1 のロールの作り (本物の scripts/company-db/create-master-edit-roles.mjs)。DB の関数は session_user を見る = SET ROLE では足りない → SET SESSION AUTHORIZATION
+  const { createMasterEditRoles, ACK_FUNCTION } = await import('./company-db/create-master-edit-roles.mjs');
+  assert.equal(G.ACK_FUNCTION_SIGNATURE, ACK_FUNCTION.replace(/\s+/g, ''), '⑤-1 のロールの作りと同じ関数 (引数 10 個)');
+  await createMasterEditRoles(pg);
+  const sessionUser = (await pg.query('select session_user::text as u')).rows[0].u;
+  const loginAs = (role) => async () => {
+    await pg.query(`set session authorization ${role}`);
+    return { db: cdb, close: async () => { await pg.query(`set session authorization ${sessionUser}`); await pg.query('set role deploy'); } };
+  };
   await forcePhase('legacy_open');
-  const connect = async () => ({ db: cdb, close: async () => {} });
   const env = { RENDER_GIT_COMMIT: 'd'.repeat(40), RENDER_INSTANCE_ID: 'pglite-1' };
   G.__setLegacyPhaseReader(() => readCutoverPhase(cdb));
   G.__resetLegacyAck();
-  const r = await G.ackLegacyGates({ host: 'minipc', connect, env });
+  const r = await G.ackLegacyGates({ host: 'minipc', connect: loginAs('master_gate_minipc'), env });
   assert.equal(r.state, 'acked', r.detail);
   const row = (await cdb.query('select a.*, m.entries from ops.master_legacy_gate_acks a join ops.master_legacy_manifests m using (manifest_hash) where a.ack_id = $1', [r.ack_id])).rows[0];
   assert.equal(row.host, 'minipc'); assert.equal(row.build_id, 'd'.repeat(40)); assert.equal(row.phase_seen, 'legacy_open'); assert.match(row.instance_id, /^pglite-1:/);
+  assert.deepEqual([row.session_role, row.stopped, row.stopped_reason], ['master_gate_minipc', false, null]);
   assert.equal(row.manifest_hash, r.manifest_hash);
   assert.deepEqual(row.entries.entries.filter((x) => x.kind === 'manual').map((x) => x.id), ['ne:item-screen', 'gas:logizard-sheet-and-sku-map']);
   // 1 回目に読んだ段階は古い (legacy_open)・DB はもう frozen = 関数が stale_phase で拒む → 読み直して frozen で書く
   await forcePhase('frozen');
   let n = 0;
   G.__setLegacyPhaseReader(async () => (n++ === 0 ? { readable: true, phase: 'legacy_open' } : readCutoverPhase(cdb)));
-  const r2 = await quiet(() => G.ackLegacyGates({ host: 'minipc', connect, env }));
+  const r2 = await quiet(() => G.ackLegacyGates({ host: 'minipc', connect: loginAs('master_gate_minipc'), env }));
   assert.equal(r2.state, 'acked', r2.detail);
   assert.equal((await cdb.query('select phase_seen from ops.master_legacy_gate_acks where ack_id = $1', [r2.ack_id])).rows[0].phase_seen, 'frozen');
+  G.__setLegacyPhaseReader(() => readCutoverPhase(cdb));
+  // 止めた (理由つき) = 行の stopped / stopped_reason
+  const r3 = await G.ackLegacyGates({ host: 'minipc', connect: loginAs('master_gate_minipc'), env, stopped: true, stoppedReason: 'SIGTERM で止めた (試験)' });
+  assert.equal(r3.state, 'stopped', r3.detail);
+  assert.deepEqual(Object.values((await cdb.query('select stopped, stopped_reason, inflight_count from ops.master_legacy_gate_acks where ack_id = $1', [r3.ack_id])).rows[0]), [true, 'SIGTERM で止めた (試験)', 0]);
+  // Render のログインで minipc を名乗る = DB が拒む (gate_host_mismatch)・何も書かない
+  const before = (await cdb.query('select count(*)::int as n from ops.master_legacy_gate_acks')).rows[0].n;
+  const r4 = await quiet(() => G.ackLegacyGates({ host: 'minipc', connect: loginAs('master_gate_render'), env }));
+  assert.equal(r4.state, 'error'); assert.match(r4.detail, /gate_host_mismatch/); assert.match(r4.detail, /COMPANY_DB_MASTER_GATE_MINIPC_URL/);
+  assert.equal((await cdb.query('select count(*)::int as n from ops.master_legacy_gate_acks')).rows[0].n, before);
+  assert.equal((await pg.query('select current_user::text as u')).rows[0].u, 'deploy', '試験の接続は持ち主のロールに戻っている');
   await forcePhase('legacy_open');
 });
 

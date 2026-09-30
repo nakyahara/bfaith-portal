@@ -18,7 +18,7 @@ import { openPgClient } from './migrate.mjs';
 import { ackLegacyGates, gateUrlFor, GATE_URL_ENV } from '../../lib/master-legacy-gate.mjs';
 
 export async function listInstances(client, { hours = 24 } = {}) {
-  return (await client.query(`select distinct on (host, instance_id) host, instance_id, build_id, phase_seen, inflight_count, acked_at::text as acked_at,
+  return (await client.query(`select distinct on (host, instance_id) host, instance_id, build_id, phase_seen, inflight_count, acked_at::text as acked_at, stopped, stopped_reason, session_role,
         acked_at >= clock_timestamp() - make_interval(mins => ops.master_cutover_ack_fresh_minutes()) as fresh
       from ops.master_legacy_gate_acks where acked_at >= clock_timestamp() - make_interval(hours => $1)
       order by host, instance_id, acked_at desc, ack_id desc`, [hours])).rows;
@@ -28,6 +28,7 @@ export async function markStopped({ host, instance, reason, env = process.env, c
   if (!['render', 'minipc'].includes(host)) throw Object.assign(new Error('--host は render か minipc'), { code: 2 });
   if (!instance || !/^[A-Za-z0-9_.:-]{1,100}$/.test(instance)) throw Object.assign(new Error('--instance (名札: 英数字と _.:- で 100 字まで) が要る'), { code: 2 });
   if (!reason || !String(reason).trim()) throw Object.assign(new Error('--reason (なぜ止まったと言えるか) が要る'), { code: 2 });
+  if (String(reason).trim().length > 200) throw Object.assign(new Error('--reason は 200 字まで (0050 の約束)'), { code: 2 });
   if (!connect && !gateUrlFor(host, env)) throw Object.assign(new Error(`${GATE_URL_ENV[host]} が無い (その場所の門のログインで書く)`), { code: 1 });
   return ackLegacyGates({ host, env, connect, stopped: true, stoppedReason: String(reason), instance });
 }
@@ -44,7 +45,7 @@ if (isMain) {
         const c = await openPgClient(url, { application_name: 'master-legacy-instance' });
         try {
           const rows = await listInstances(c, { hours: Number(getArg('--hours') || 24) });
-          for (const r of rows) console.log(`${r.host}\t${r.instance_id}\t最後 ${r.acked_at}\t${r.fresh ? '新しい' : '⚠️ 15 分より前 (止まった? → 確かめて --stop)'}\t段階 ${r.phase_seen}\t書きかけ ${r.inflight_count}\tbuild ${String(r.build_id).slice(0, 12)}`);
+          for (const r of rows) console.log(`${r.host}\t${r.instance_id}\t最後 ${r.acked_at}\t${r.stopped ? `止めた (${r.stopped_reason})` : r.fresh ? '新しい' : '⚠️ 黙っている = 15 分より前で「止めた」も無い (段階を進められない。止まったのを確かめて --stop)'}\t段階 ${r.phase_seen}\t書きかけ ${r.inflight_count}\tbuild ${String(r.build_id).slice(0, 12)}`);
           if (!rows.length) console.log('(24 時間以内の記録は無い)');
         } finally { await c.end(); }
       }
