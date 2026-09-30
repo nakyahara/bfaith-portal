@@ -4,7 +4,7 @@
  * 固定する契約:
  *   1 rebuild-m-products.js は規則を lib から export し直しているだけ (同じ関数) = 規則は 1 か所
  *   2 Company DB の形の規則 (deriveSet*Cdb) は、作り直し (NE の形) の答えを夜間ロードの写し方 (sources.mjs の mapHandling / mapTaxClass) で写したものと同じ
- *   3 deriveSetCdb の決まった例 (輸出 4 の混在・税率の混在・未入力・中止の構成品・数量 1 の構成品が無い・上書き・例外原価)
+ *   3 deriveSetCdb の決まった例 (輸出 4 の混在・税率の混在・未入力・中止の構成品・数量 1 の構成品が無い = 何も言わない・上書き・例外原価)
  *   4 構成が同じか (compositionEquals) = 構成品・数量・並び・行の数まで。並びが決められない = 同じと言わない
  *   5 作り直しのセットの原価 (共用の setCostFromComponents に変えた) は今までと同じ: 全部そろう = 合計 (小数 2 桁) / 一部 = PARTIAL / 無い = MISSING / 例外 = OVERRIDDEN
  * 使い方: node scripts/test-master-set-rules.mjs
@@ -87,11 +87,11 @@ await ta('[3] deriveSetCdb の決まった例: 輸出 4 の混在・税率の混
   // 中止の構成品 = セットも中止 + 気をつけること
   d = L.deriveSetCdb([c('a', 1, 0.1, 3, 100), c('b', 1, 0.1, 3, 50, 'discontinued')], { handlingOwn: 'active' });
   assert.equal(d.handling, 'discontinued'); assert.match(d.warnings.join(), /中止の構成品 \(b\)/);
-  // 数量 1 の構成品が無い / 先頭でない = 気をつけること (NE の決まりは確かめていない = 止めない)
-  d = L.deriveSetCdb([c('a', 2, 0.1, 3, 100)]);
-  assert.deepEqual(d.blockers, []); assert.match(d.warnings.join(), /数量 1 の構成品がありません/);
-  d = L.deriveSetCdb([c('a', 2, 0.1, 3, 100), c('b', 1, 0.1, 3, 100)]);
-  assert.match(d.warnings.join(), /数量 1 の構成品を先頭に/);
+  // 数量 1 の構成品が無い / 先頭でない = NE の決まりではない (中原さん 2026-10-01) = 止めない・気をつけることも出さない
+  d = L.deriveSetCdb([c('a', 2, 0.1, 3, 100)], { handlingOwn: 'active' });
+  assert.deepEqual([d.blockers, d.warnings], [[], []]);
+  d = L.deriveSetCdb([c('a', 2, 0.1, 3, 100), c('b', 1, 0.1, 3, 100)], { handlingOwn: 'active' });
+  assert.deepEqual([d.blockers, d.warnings], [[], []]);
   // 構成品なし
   d = L.deriveSetCdb([]);
   assert.match(d.blockers.join(), /構成品がありません/);

@@ -341,6 +341,13 @@ await ta('[7] 形の誤り (400): 名前・売価・税率・分類・月数・�
   assert.equal(e.extra.field, 'shipping_code');
 });
 
+await ta('[7] 新しい商品コードの形 (⑤-2 で使う): 小文字の英数字・- _・30 字まで・大文字は禁止・前後の空白・SET- で始まらない', () => {
+  for (const ok of ['abc-01', 'a_b', '0', 'x'.repeat(30)]) assert.deepEqual(W.validateNewSkuCode(ok), { ok: true, code: ok, message: null }, ok);
+  const bad = (v, re) => { const r = W.validateNewSkuCode(v); assert.equal(r.ok, false, String(v)); assert.match(r.message, re); };
+  bad('', /入れて/); bad(null, /入れて/); bad(' abc', /空白/); bad('Abc', /大文字/); bad('ABC-01', /大文字/);
+  bad('abc 01', /使える文字/); bad('ａｂｃ', /使える文字/); bad('x'.repeat(31), /30 字/); bad('abc.01', /使える文字/); bad('set-abc', /set-/);
+});
+
 console.log('\nセットの導く値');
 
 await ta('[8] 単品の税率を変えると、含むセットの税率・税区分を同じ取引で (記録も同じ request_id)。NE でやることに出る', async () => {

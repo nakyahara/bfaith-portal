@@ -147,7 +147,7 @@
         </table>
         <template id="comp-tpl"><tr class="comp-row"><td class="no"></td><td><input type="text" class="c-code" placeholder="商品コード"> <span class="c-name sub"></span></td><td><input type="text" class="c-qty" value="1"></td><td class="c-tax"></td><td class="c-sales"></td><td class="c-cost n"></td><td class="c-handling"></td><td><button type="button" class="btn-sm" data-act="up">↑</button><button type="button" class="btn-sm" data-act="down">↓</button><button type="button" class="btn-sm" data-act="del">×</button></td></tr></template>
         <div class="fl" style="margin-top: 6px;"><button type="button" class="btn-sm" id="comp-add"<%= dis('components') %>>+ 構成品</button>
-          <span class="sub">1〜<%= MAX_COMPONENTS %> 行・数量 1〜999・同じ品は 1 行・セットは入れられません ・ ※数量 1 の品を先頭に (NE の注意) ・ 今の構成に戻すと依頼を取り下げます</span></div>
+          <span class="sub">1〜<%= MAX_COMPONENTS %> 行・数量 1〜999・同じ品は 1 行・セットは入れられません ・ 並びも入れたとおり ・ 今の構成に戻すと依頼を取り下げます</span></div>
       </div>
       <div class="sec"><h3>上書き</h3>
         <div class="fl"><label class="k">売上分類</label><select data-field="set_sales_class_override"<%= dis('set_sales_class_override') %>>
