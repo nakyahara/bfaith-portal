@@ -24,7 +24,7 @@
     const c = page ? page.cur : null;
     const F = page ? page.fields : {};
     const isSet = !!c && c.sku_kind === 'set';
-    const canSave = !!page && canEdit && !dbError && c.sku_kind !== 'exception';
+    const canSave = !!page && canEdit && !dbError && !closed && c.sku_kind !== 'exception';
     const dis = (f) => (!canSave || !F[f] || !F[f].editable ? ' disabled' : '');
     const cut = (f) => (F[f] && !F[f].editable ? '<span class="tag">切替前</span>' : '');
     const SALES = { 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' };
@@ -37,7 +37,7 @@
     <p class="sub"><a href="<%= base %>/">← 一覧へ</a></p>
     <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
     <% if (page) { %>
-    <% if (closed) { %><div class="band warn">切替前です (段階: <%= phaseText %>): この商品の正はまだ NE・/register です。見るだけです (保存しても「切替前」で断られ、何も変わりません)。</div><% } %>
+    <% if (closed) { %><div class="band warn">いまは保存できません (<%= closedWhy %>)。見るだけです。切替日までは、この商品の正は NE・/register です。</div><% } %>
     <% if (!canEdit) { %><div class="band info"><%= gateMessage %></div><% } %>
     <% if (c.sku_kind === 'exception') { %><div class="band info">例外の SKU (NE に無い商品) はこの画面では直せません。</div><% } %>
 
@@ -125,6 +125,13 @@
             <% for (const b of dv.requested.blockers) { %><div class="blk">✖ <%= b %></div><% } %>
             <% for (const w of dv.requested.warnings) { %><div class="wrn">⚠ <%= w %></div><% } %>
           </div>
+        </div>
+        <% } %>
+        <% const BK = { mismatch: 'NE の構成が依頼と違う', stale: '依頼から日がたっても NE の構成が違う', unrequested_diff: '依頼が無いのに NE の構成が今の構成と違う' }; %>
+        <% for (const b of page.breaches) { %>
+        <div class="todo"><b>NE でやること (食い違い: <%= BK[b.kind] || b.kind %>)</b> ・ <%= String(b.created_at).slice(0, 16) %>
+          <div>NE の構成: <%= (b.details.observed || []).map((x) => x.code + '×' + x.qty).join(', ') || 'なし' %> ・ あるべき構成: <%= (b.details.expected || []).map((x) => x.code + '×' + x.qty).join(', ') || 'なし' %></div>
+          <div class="sub">NE の画面で構成 (構成品・数量・並び) を直すか、この画面で依頼を直してください。</div>
         </div>
         <% } %>
         <h3 style="margin-top: 10px;">構成を変える (依頼する) <%- cut('components') %></h3>

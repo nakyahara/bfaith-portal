@@ -138,13 +138,16 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
       : [];
     const amazon = Number((await db.query(`select count(distinct lc.listing_id)::int as n from core.listing_components lc join core.listings l on l.listing_id = lc.listing_id
        where lc.sku_id = $1 and l.mall in ('amazon', 'amazon_us')`, [id])).rows[0].n);
+    const breaches = cur.sku_kind === 'set' && await regclass(db, 'ops.sku_component_breaches')
+      ? (await db.query(`select kind, details, created_at::text as created_at from ops.sku_component_breaches where set_sku_id = $1 and status = 'open' order by breach_id`, [id])).rows : [];
     const csvRows = (await regclass(db, 'ops.ne_csv_export_rows'))
       ? (await db.query('select col, child, source, export_id::text as export_id from ops.ne_csv_export_rows where reserved and code_norm = $1 order by col, child', [cur.code_norm])).rows : [];
     return {
       cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today,
       state: cur.handling === 'discontinued' ? 'discontinued' : 'available',
       derived: cur.sku_kind === 'set' ? setDerivations(cur) : null,
-      fields: fieldOwnership(cur.sku_kind, ownership, open && newEntryWritable(phase)),
+      fields: fieldOwnership(cur.sku_kind, ownership, open && newEntryWritable(phase, ownership)),
+      breaches,
       phase,
       token: editTokenOf(cur),
       seenEventId,

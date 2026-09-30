@@ -15,7 +15,9 @@
  *   GET  /api/lookup?code=   構成品の引き当て
  *   POST /api/sku/:code      保存 { request_id, reason?, seen: { token (編集の印), event_id? }, values: {...} }
  * Company DB に届かない = 画面は「つながらない (保存できない)」の帯・保存は 503 (何も書かない)。SQLite と NE には書かない
- * env: COMPANY_DB_URL (表の持ち主のロール)
+ * env: COMPANY_DB_MASTER_EDIT_URL = この画面だけのロール master_edit (scripts/company-db/create-master-edit-roles.mjs が作る。読む・この画面の書き込みだけ・
+ *        切替の段階を進める関数・構成の依頼を上げる / 観測を書く権限は無い)。🚨 保存はこの接続だけ = 無ければ見るだけ (保存は 503・#1563 R1 M8)
+ *      COMPANY_DB_URL = 表の持ち主のロール。COMPANY_DB_MASTER_EDIT_URL が無いときの読むだけの接続 (書き込みには使わない)
  */
 import express from 'express';
 import path from 'node:path';
@@ -81,8 +83,12 @@ export function editorGate(req) {
   return { ok: true, message: null };
 }
 
-async function connect() {
-  const url = process.env.COMPANY_DB_URL;
+/** 書き込み用の接続 (この画面だけのロール) が設定されているか */
+const writeConfigured = () => !!process.env.COMPANY_DB_MASTER_EDIT_URL;
+/** kind = 'read' (この画面のロール・無ければ持ち主のロールで読むだけ) / 'write' (この画面のロールだけ) */
+async function connect(kind = 'read') {
+  const url = kind === 'write' ? process.env.COMPANY_DB_MASTER_EDIT_URL : (process.env.COMPANY_DB_MASTER_EDIT_URL || process.env.COMPANY_DB_URL);
+  if (!url && kind === 'write') return { error: '書き込み用の接続 (COMPANY_DB_MASTER_EDIT_URL・この画面だけのロール) が設定されていないので、保存できません (見るだけ)', reason: 'no_write_role' };
   if (!url) return { error: 'Company DB の接続先が設定されていません (COMPANY_DB_URL)。いまは見ることも保存もできません' };
   try {
     const client = await pgClientFactory(url, { application_name: 'master-edit' });
@@ -107,10 +113,10 @@ async function withPgPage(req, res, fn) {
     if (!res.headersSent) res.status(500).render(view('error.ejs'), { ...pageLocals(req), message: 'サーバーエラーが発生しました' });
   } finally { if (c.client) { try { await c.client.end(); } catch { /* */ } } }
 }
-/** API: つながらない = 503 */
-async function withPgApi(res, fn) {
-  const c = await connect();
-  if (!c.client) return res.status(503).json({ ok: false, error: c.error, reason: 'db_unreachable' });
+/** API: つながらない = 503 (書き込み用の接続が無い = no_write_role) */
+async function withPgApi(res, fn, kind = 'read') {
+  const c = await connect(kind);
+  if (!c.client) return res.status(503).json({ ok: false, error: c.error, reason: c.reason || 'db_unreachable' });
   try {
     await fn(pgAdapter(c.client));
   } catch (e) {
@@ -122,17 +128,21 @@ async function withPgApi(res, fn) {
   } finally { try { await c.client.end(); } catch { /* */ } }
 }
 
-/** 画面の共通の値。phase = 切替の段階 (読めない・渡されない = 閉じている扱い) */
+/** 画面の共通の値。phase = 切替の段階 (読めない・渡されない = 閉じている扱い)。closed = 保存を開いていない (画面の保存のボタンも出さない = #1563 R1 M5) */
 const pageLocals = (req, phase = null) => {
   const gate = editorGate(req);
   const own = ownershipNow();
-  const phaseOpen = newEntryWritable(phase);
+  const phaseText = phase && phase.readable ? PHASE_LABELS[phase.phase] : '読めない (閉じている扱い)';
+  const why = !phase || !phase.readable || phase.phase !== 'new_open' ? `段階: ${phaseText}`
+    : !newEntryWritable(phase, own) ? '持ち主表が切替のときの記録と違う'
+      : !isOpen() ? '保存を開くスイッチ (MASTER_EDIT_OPEN) が入っていない'
+        : Object.values(own).every((v) => v === 'load') ? '持ち主表の列が全部 NE・/register'
+          : !writeConfigured() ? '書き込み用の接続 (COMPANY_DB_MASTER_EDIT_URL) が無い' : '';
   return {
     title: 'マスタの入力 (商品・セット)', username: req.session?.email || '', displayName: req.session?.displayName || '',
     canEdit: gate.ok, gateMessage: gate.message || '', base: req.baseUrl || '',
-    open: isOpen(),
-    phaseText: phase && phase.readable ? PHASE_LABELS[phase.phase] : '読めない (閉じている扱い)',
-    closed: !phaseOpen || !isOpen() || Object.values(own).every((v) => v === 'load'),
+    open: isOpen(), phaseText,
+    closed: !!why, closedWhy: why,
   };
 };
 const fmt = {
@@ -186,7 +196,7 @@ router.post('/api/sku/:code', (req, res) => {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, code: req.params.code, reason: b.reason ?? null, seen: b.seen, values: b.values,
     }, { open: isOpen(), ownership: ownershipNow(), shippingRates, now: clockOverridden ? new Date(clock()) : undefined });
     res.json(r);
-  });
+  }, 'write');
 });
 
 export default router;

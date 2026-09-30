@@ -11,7 +11,7 @@
   %>
   <div class="me-wrap">
     <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
-    <% if (closed) { %><div class="band warn">切替前です (段階: <%= phaseText %>): 商品マスタの正はまだ NE・/register です。この画面は見るだけです (保存しても「切替前」で断られ、何も変わりません)。</div><% } %>
+    <% if (closed) { %><div class="band warn">いまは保存できません (<%= closedWhy %>)。この画面は見るだけです。切替日までは商品マスタの正は NE・/register です。</div><% } %>
     <% if (!canEdit) { %><div class="band info"><%= gateMessage %></div><% } %>
     <div class="me-box">
       <p class="hint">

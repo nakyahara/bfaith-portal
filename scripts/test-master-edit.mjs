@@ -1,23 +1,28 @@
 /**
- * test-master-edit.mjs — マスタの入力 (apps/master-edit・lib/master-write.mjs・lib/master-cutover.mjs・0050。Company DB構想 14 §6 ⑤-1 / Codex ⑤-R0・R1)
+ * test-master-edit.mjs — マスタの入力 (apps/master-edit・lib/master-write.mjs・lib/master-cutover.mjs・0050。Company DB構想 14 §6 ⑤-1 / Codex ⑤-R0・R1・PR #1563 R1)
  *
- * Company DB = PGlite (Render と同じ条件の持ち主のロール deploy で migration)。本物の router を HTTP 越しにも通す (セッションは x-test-session で模擬)
+ * Company DB = PGlite (Render と同じ条件の持ち主のロール deploy で migration)。保存は画面だけのロール master_edit で流す (権限が足りているかも確かめる)。
+ * 本物の router を HTTP 越しにも通す (セッションは x-test-session で模擬)
  * 固定する契約:
- *   1 切替の段階: legacy_open → frozen → company_owner → new_open の一方向・1 段ずつ (飛ばさない・戻さない・直接は書けない・記録が残る)・読めない = 閉じている
- *   2 保存を開く = 段階 new_open **かつ** 持ち主表の列が 'company' **かつ** MASTER_EDIT_OPEN (opts.open)。どれかが欠ければ 409 切替前・何も書かない (失敗の記録は残る)
- *   3 単品の保存: 変わった列だけ・商品の行 (名前・取扱) もそろう・代表 (親) は manual・代表の仕入先の付け替え・変更の記録の actor / source / request_id / reason
- *   4 保存した値は夜間ロードを 2 回流しても残る (持ち主 company)。持ち主を load に戻すと夜間ロードが戻す (= 守っているのは持ち主表)
- *   5 同じ request_id: 同じ中身 = 前の結果 (記録は増えない) / 違う中身・違う人 = 409 / 失敗 = 同じ誤り。記録は保存と同じ取引 (処理中の行は作らない)・追記だけ
- *   6 編集の印: SKU・商品・仕入先ごとの商品・原価・JAN・構成品・構成の依頼・含むセットのどれかの行が変わった / 増えた = 409 とその間の変更・何も書かない
- *   7 入力の検証 (名前・税率・売価・分類・月数・原価・構成の規則・種類に無い項目・番号・編集の印)
- *   8 単品の税率・取扱・原価を変えると、含むセットの導く値を同じ取引で計算し直す (記録も同じ request_id)
- *   9 原価は今日だけ (東京の日付・取引の初めに 1 回): 今の行を昨日で閉じる・今日 2 回目は入れ替え・先の日付の行があれば入れない。期間の重なりは DB が拒む (夜間ロードは見ない)
- *  10 NE に取り込む CSV が出ている列 (作った・確かめた / 申告して確かめ待ち) は変えない (409)。void・確かめ済み・CSV に無い列は変えられる
- *  11 セットの構成 = 依頼だけ (core.sku_components は書かない)。置き換え・取り下げ (構成品・数量・並びまで同じとき)・並べ替えも依頼。
- *     依頼を上げる = NE の観測が完全・依頼より後・構成品 / 数量 / 並び / 行の数まで同じときだけ (同じ取引で構成を上げ・導く値を計算し直し・依頼を閉じる)
- *  12 セットの導く値が決まらない = 保存しない (上書き・例外原価で通る・税率は通らない)・導けるのに上書き = 400・例外原価をやめる = 今日から合計
- *  13 画面: 一覧・単品・セット・変更の記録・つかいかた・404 の描画と画面の JS / 名簿・Origin・Content-Type / Company DB が無い・届かない = 帯と 503 /
- *     保存を開いていない = 切替前の帯と欄が閉じている / server.js は Render だけ・共通の JSON parser を通さない
+ *   1 切替の段階: 一方向・1 段ずつ。進めるには証拠 (drain・手の入口を止めた一覧 / 持ち主表のハッシュ) と、全部の場所 (render・minipc) の門の記録が要る
+ *     (⑤-1 では誰も門の記録を書かない = 進められない)。直接は書けない・記録が残る・読めない = 閉じている
+ *   2 保存を開く = 段階 new_open **かつ** 持ち主表のハッシュが段階の記録と同じ **かつ** 列が 'company' **かつ** MASTER_EDIT_OPEN。欠ければ 409 切替前・何も書かない
+ *     (変わる項目が無い保存も 409 = done を残さない)。構成の依頼も持ち主 sku_components が 'company' のときだけ
+ *   3 単品の保存: 変わった列だけ・商品の行もそろう・代表 (親) は manual・代表の仕入先・変更の記録の actor / source / request_id / reason
+ *   4 保存した値は夜間ロードを 2 回流しても残る (持ち主 company)。持ち主を load に戻すと夜間ロードが戻す
+ *   5 同じ request_id: 同じ中身 = 前の結果 / 違う中身・違う人・違う SKU = 409 / 失敗 = 同じ誤り。記録は保存と同じ取引・追記だけ
+ *   6 編集の印: 読んだ行の全部と「行が無いこと」(phantom) のどれかが変わった = 409 とその間の変更・何も書かない
+ *   7 入力の検証 / 新しい商品コードの形 (⑤-2 用)
+ *   8 単品の税率・取扱・原価を変えると、含むセットの導く値を同じ取引で計算し直す
+ *   9 原価は今日だけ (東京の日付・取引の初めに 1 回)・期間を重ねない・重なりは DB が拒む (この画面と昇格だけ)
+ *  10 NE に取り込む CSV が出ている列は変えない (409)
+ *  11 セットの構成 = 依頼だけ。NE の観測 (DB に残した完全な回・依頼より後) が構成品・数量・並び・行の数まで同じときだけ上げる (同じ取引で構成・導く値・依頼・食い違い)。
+ *     違えば食い違い (mismatch / stale / unrequested_diff) を残す。偽の観測・完全でない回・依頼より前の観測は上げない。観測を書く関数は画面のロールでは動かない
+ *  12 セットの導く値: 今の構成と依頼の構成の両方で確かめる (上書きを外すのは両方が導けるときだけ)・例外原価をやめる = 今日から合計
+ *  13 上げる処理と単品の保存の順番 (どちらが先でもセットの値が新しい単品の値になる・後の保存は含むセットが増えたことに気づく)
+ *  14 DB のロール: master_edit = 画面の読み書きだけ (段階を進める・観測を書く・構成を上げる・門の記録は不可) / master_ops = 段階を進める関数だけ
+ *  15 画面: 一覧・単品・セット・変更の記録・つかいかた・404 の描画と画面の JS / 名簿・Origin・Content-Type / 書き込み用の接続が無い = 見るだけ /
+ *     Company DB が無い・届かない = 帯と 503 / 保存を開いていない = 帯・欄と保存のボタンが閉じている / server.js は Render だけ
  * 使い方: node scripts/test-master-edit.mjs
  */
 import assert from 'node:assert/strict';
@@ -30,6 +35,7 @@ import express from 'express';
 const { PGlite } = await import('@electric-sql/pglite');
 const { applyMigrations, pgliteAdapter } = await import('./company-db/migrate.mjs');
 const { createRoles } = await import('./company-db/create-watch-roles.mjs');
+const { createMasterEditRoles } = await import('./company-db/create-master-edit-roles.mjs');
 const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
 const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
 const W = await import('../lib/master-write.mjs');
@@ -49,16 +55,7 @@ const rejectsWith = async (p, status, reason) => {
   }
   assert.fail(`${status} ${reason || ''} にならなかった`);
 };
-
-// ── Company DB (Render と同じ = 持ち主のロールで) ──
-const pg = new PGlite();
-await pg.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);
-await pg.query(`alter database ${(await pg.query('select current_database() as d')).rows[0].d} owner to deploy`);
-await pg.query('set role deploy');
-const db = pgliteAdapter(pg);
-await applyMigrations(db, { log: quiet });
-await createRoles(pg, { watcherPw: 'a', writerPw: 'b' });
-const q = async (sql, params) => (await db.query(sql, params)).rows;
+const pgCode = async (p) => { try { await p; return 'ok'; } catch (e) { return e.code || e.message; } };
 
 const ALL_COMPANY = Object.fromEntries(Object.keys(MASTER_OWNERSHIP).map((k) => [k, 'company']));
 const withOwn = (over) => ({ ...MASTER_OWNERSHIP, ...over });
@@ -66,6 +63,10 @@ const LOAD_NOW = new Date('2030-01-05T03:00:00Z');   // 夜間ロードの日 (�
 const NOW = new Date('2030-01-10T03:00:00Z');        // 画面の今日 (東京 2030-01-10)
 const TODAY = '2030-01-10';
 const RATES = new Map([['S01', { method: 'ゆうパケット', cost: 210.4 }], ['S02', { method: '宅急便', cost: 520 }]]);
+const FROZEN_EVIDENCE = {
+  drain: { done: true, checked_by: 'naka@test', checked_at: '2030-01-09T10:00:00+09:00' },
+  manual_entries_stopped: [{ entry: 'NE の商品画面', stopped_by: 'naka@test', stopped_at: '2030-01-09T10:00:00+09:00' }],
+};
 
 /** 夜間ロードの材料 (sources.mjs が作る形) */
 function makePlan() {
@@ -81,15 +82,18 @@ function makePlan() {
       sku('s003', '単品 3', 'single', 0.1, 1, 50, { representativeCode: 'grp1', representativeState: 'value' }),
       sku('s004', '単品 4 (分類・原価なし)', 'single', 0.1, null, null),
       sku('s005', '単品 5 (税率なし)', 'single', null, 3, 80),
+      sku('s006', '単品 6 (分類・原価なし)', 'single', 0.1, null, null),
       sku('set001', 'セット 1', 'set', 0.08, null, 400, { taxClass: 'MIXED' }),
       sku('set004', 'セット 4 (導けない)', 'set', 0.1, null, null),
       sku('set005', 'セット 5 (税率が決まらない)', 'set', null, null, 180),
+      sku('set006', 'セット 6 (今の構成は導けない)', 'set', 0.1, null, null),
     ],
     variationGroups: [{ code: 'grp1', name: '名札', childCodes: ['s001', 's003'], status: 'active' }],
     setComponents: [
       { parentCode: 'set001', childCode: 's001', qty: 2, source: 'ne' }, { parentCode: 'set001', childCode: 's002', qty: 1, source: 'ne' },
       { parentCode: 'set004', childCode: 's001', qty: 1, source: 'ne' }, { parentCode: 'set004', childCode: 's004', qty: 1, source: 'ne' },
       { parentCode: 'set005', childCode: 's001', qty: 1, source: 'ne' }, { parentCode: 'set005', childCode: 's005', qty: 1, source: 'ne' },
+      { parentCode: 'set006', childCode: 's001', qty: 1, source: 'ne' }, { parentCode: 'set006', childCode: 's006', qty: 1, source: 'ne' },
     ],
     listings: [], observations: [], physicals: [], compliance: [], workers: [],
     suppliers: [{ code: '0001', name: 'AMC', orderMethod: 'fax', leadTimeDays: 10 }, { code: '0002', name: 'ビーフリー', orderMethod: 'email', leadTimeDays: 5 }, { code: '0003', name: '止めた仕入先' }],
@@ -98,13 +102,48 @@ function makePlan() {
     reorder: { available: true, runId: 'pml_test' },
   };
 }
+
+/** 1 つの Company DB (PGlite) を作る: 持ち主のロール deploy で migration・見張りと画面のロール・夜間ロード */
+async function setupDb() {
+  const pg = new PGlite();
+  await pg.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);
+  await pg.query(`alter database ${(await pg.query('select current_database() as d')).rows[0].d} owner to deploy`);
+  await pg.query('set role deploy');
+  const db = pgliteAdapter(pg);
+  await applyMigrations(db, { log: quiet });
+  await createRoles(pg, { watcherPw: 'a', writerPw: 'b' });
+  await createMasterEditRoles(pg, { editPw: 'e', opsPw: 'o' });
+  const r = await runInitialLoad(db, makePlan(), { log: quiet, runId: 'load_setup', ownership: MASTER_OWNERSHIP, now: LOAD_NOW });
+  assert.equal(r.ok, true, r.error);
+  await pg.query("update core.suppliers set active = false where code = '0003'");
+  return { pg, db };
+}
+/** 試験だけの切替: 全部の場所の門の記録 (版 1) を足しながら、証拠つきで new_open まで進める (本番の関数そのまま・門は弱めない) */
+async function openCutover(E, ownership) {
+  const h = C.ownershipHash(ownership);
+  const ack = (phase) => E.pg.query(`insert into ops.master_legacy_gate_acks (host, build_id, owner_hash, legacy_gates_version, phase_seen)
+    select x, 'test-build', $1, 1, $2 from unnest(array['render', 'minipc']) x`, [h, phase]);
+  await ack('legacy_open');
+  await C.advanceCutoverPhase(E.db, { to: 'frozen', actor: 'naka@test', evidence: FROZEN_EVIDENCE });
+  await ack('frozen');
+  await C.advanceCutoverPhase(E.db, { to: 'company_owner', actor: 'naka@test', evidence: { owner_hash: h } });
+  await ack('company_owner');
+  await C.advanceCutoverPhase(E.db, { to: 'new_open', actor: 'naka@test', evidence: { owner_hash: h } });
+}
+/** 画面だけのロールで動かす (保存は必ずこれ = 権限が足りているかも確かめる) */
+async function asEditor(E, fn) {
+  await E.pg.query('set role master_edit');
+  try { return await fn(); } finally { await E.pg.query('set role deploy'); }
+}
+
+const E0 = await setupDb();
+const { pg, db } = E0;
+const q = async (sql, params) => (await db.query(sql, params)).rows;
 const load = async (ownership) => {
   const r = await runInitialLoad(db, makePlan(), { log: quiet, runId: `load_${crypto.randomBytes(3).toString('hex')}`, ownership, now: LOAD_NOW });
   assert.equal(r.ok, true, r.error);
   return r;
 };
-await load(MASTER_OWNERSHIP);
-await pg.query("update core.suppliers set active = false where code = '0003'");
 
 const skuId = async (code) => (await q('select sku_id::text as id from core.skus where code = $1', [code]))[0].id;
 const cur = async (code) => W.readCurrent(db, await skuId(code), TODAY);
@@ -112,10 +151,15 @@ const tokenOf = async (code) => W.editTokenOf(await cur(code));
 const lastEvent = async () => (await q('select coalesce(max(event_id), 0)::text as id from events.master_change_events'))[0].id;
 const nEvents = async () => Number((await q('select count(*)::int as n from events.master_change_events'))[0].n);
 const uuid = () => crypto.randomUUID();
-/** 画面と同じ形で保存 (seen は今の値から) */
-async function save(code, values, { ownership = ALL_COMPANY, open = true, requestId = uuid(), reason = 'テスト', actor = 'Naka@Test', token, eventId, shippingRates = RATES, now = NOW } = {}) {
-  const seen = { token: token ?? await tokenOf(code), event_id: eventId ?? await lastEvent() };
-  return W.saveSku(db, { actor, requestId, code, reason, seen, values }, { ownership, open, now, shippingRates });
+/** その DB の今の編集の印 (無い SKU = 形だけの印) */
+async function tokenIn2(E, code) {
+  const id = (await E.db.query('select sku_id::text as id from core.skus where code = $1', [code])).rows[0]?.id;
+  return id ? W.editTokenOf(await W.readCurrent(E.db, id, TODAY)) : 'a'.repeat(64);
+}
+/** 画面と同じ形で保存 (seen は今の値から)・画面だけのロールで */
+async function save(code, values, { E = E0, ownership = ALL_COMPANY, open = true, requestId = uuid(), reason = 'テスト', actor = 'Naka@Test', token, eventId, shippingRates = RATES, now = NOW } = {}) {
+  const seen = { token: token ?? await tokenIn2(E, code), event_id: eventId ?? await lastEvent() };
+  return asEditor(E, () => W.saveSku(E.db, { actor, requestId, code, reason, seen, values }, { ownership, open, now, shippingRates }));
 }
 const skuRow = async (code) => (await q(`select s.name, s.tax_rate::float8 as tax_rate, s.tax_class, s.handling, s.standard_price_jpy::int as price, s.shipping_code, s.shipping_method,
     s.shipping_cost_jpy::int as ship, s.reorder_months::float8 as months, s.set_sales_class_override as override, s.handling_own,
@@ -128,19 +172,42 @@ const compsOf = async (code) => (await q(`select k.code, c.qty, c.sort_order as 
 const primaryOf = async (code) => (await q(`select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id join core.skus k on k.sku_id = x.sku_id
   where k.code = $1 and x.is_primary`, [code])).map((r) => r.code);
 const reqRow = async (id) => (await q('select status, result, error, sku_id::text as sku_id, operation, target_code from ops.master_edit_requests where request_id = $1', [id]))[0];
+let runSeq = 0;
+/** NE のセットの構成の観測を 1 回分書く (夜間ロードのロール = deploy)。戻り値 = set_code → observation_id */
+async function observe(sets, { complete = true, at = new Date(Date.now() + 60000).toISOString() } = {}) {
+  const runId = `ne_run_${++runSeq}`;
+  await W.recordNeSetObservations(db, { run_id: runId, observed_at: at, complete, sets });
+  const rows = await q('select o.observation_id::text as id, k.code from ops.ne_set_observations o join core.skus k on k.sku_id = o.set_sku_id where o.run_id = $1', [runId]);
+  return Object.fromEntries(rows.map((r) => [r.code, r.id]));
+}
+const promote = (id, opts = {}) => W.promoteComponentRequest(db, id, { ownership: ALL_COMPANY, now: NOW, ...opts });
 
-console.log('切替の段階');
+console.log('切替の段階と門');
 
-await ta('[1] 最初は legacy_open。1 段ずつ一方向 (飛ばす・戻す・知らない段階・人なし = 拒む)・直接の UPDATE は拒む・読めない = 閉じている', async () => {
+await ta('[1] 最初は legacy_open。証拠が無い・形が違う・門の記録が無い / 版が足りない・飛ばす・知らない段階 = 拒む。直接の UPDATE も拒む。読めない = 閉じている', async () => {
   let s = await C.readCutoverPhase(db);
-  assert.deepEqual([s.readable, s.phase], [true, 'legacy_open']);
+  assert.deepEqual([s.readable, s.phase, s.owner_hash], [true, 'legacy_open', null]);
   assert.equal(C.newEntryWritable(s), false); assert.equal(C.legacyWritable(s), true);
-  await assert.rejects(() => C.advanceCutoverPhase(db, { to: 'company_owner', actor: 'naka@test' }), /one_way/);
-  await assert.rejects(() => pg.query("select ops.set_master_cutover_phase('frozen', '')"), /actor/);
-  await assert.rejects(() => C.advanceCutoverPhase(db, { to: 'open', actor: 'naka@test' }), /知らない段階/);
+  assert.equal(C.LEGACY_GATES_VERSION, 0);   // ⑤-1 のコードは門を持たない = 自分では進められない
+  const adv = (to, evidence) => C.advanceCutoverPhase(db, { to, actor: 'naka@test', evidence });
+  await assert.rejects(() => pg.query(`select ops.set_master_cutover_phase('frozen', 'naka@test', null)`), /evidence_required/);
+  await assert.rejects(() => adv('frozen', {}), /evidence_invalid: drain/);
+  await assert.rejects(() => adv('frozen', { ...FROZEN_EVIDENCE, drain: { done: false, checked_by: 'x', checked_at: '2030-01-09' } }), /evidence_invalid: drain/);
+  await assert.rejects(() => adv('frozen', { ...FROZEN_EVIDENCE, drain: { done: true, checked_by: 'x', checked_at: 'きのう' } }), /evidence_invalid: drain/);
+  await assert.rejects(() => adv('frozen', { ...FROZEN_EVIDENCE, manual_entries_stopped: [] }), /manual_entries_stopped/);
+  await assert.rejects(() => adv('frozen', { ...FROZEN_EVIDENCE, manual_entries_stopped: [{ entry: 'NE', stopped_by: '' , stopped_at: '2030-01-09' }] }), /manual_entries_stopped の各行/);
+  await assert.rejects(() => adv('frozen', FROZEN_EVIDENCE), /acks_missing: .*minipc, render/);
+  // 門を持たない版 (0) の記録・片方の場所だけ = まだ進めない
+  const h = C.ownershipHash(MASTER_OWNERSHIP);
+  await C.recordLegacyGateAck(db, { host: 'render', buildId: 'b1', ownership: MASTER_OWNERSHIP, phaseSeen: 'legacy_open' });   // 版 0 = このコード
+  await pg.query(`insert into ops.master_legacy_gate_acks (host, build_id, owner_hash, legacy_gates_version, phase_seen) values ('minipc', 'b1', $1, 1, 'legacy_open')`, [h]);
+  await assert.rejects(() => adv('frozen', FROZEN_EVIDENCE), /足りない場所: render [(]/);
+  await assert.rejects(() => adv('company_owner', { owner_hash: h }), /one_way/);
+  await assert.rejects(() => adv('open', FROZEN_EVIDENCE), /知らない段階/);
   await assert.rejects(() => pg.query("update ops.master_cutover_state set phase = 'new_open'"), /set_master_cutover_phase/);
   await assert.rejects(() => pg.query('delete from ops.master_cutover_state'), /消さない/);
-  // 読めない = 閉じている (新しい画面も古い入口も書けない側)
+  await assert.rejects(() => pg.query('delete from ops.master_legacy_gate_acks'), /append-only/);
+  assert.equal((await C.readCutoverPhase(db)).phase, 'legacy_open');
   const broken = { query: async () => { throw new Error('connection terminated'); } };
   s = await C.readCutoverPhase(broken);
   assert.deepEqual([s.readable, s.phase], [false, null]);
@@ -148,7 +215,7 @@ await ta('[1] 最初は legacy_open。1 段ずつ一方向 (飛ばす・戻す�
   assert.equal(C.newEntryWritable({ readable: true, phase: 'bogus' }), false);
 });
 
-await ta('[2] 段階が new_open でない = 持ち主 company + MASTER_EDIT_OPEN でも 409 切替前・何も書かない・失敗の記録が残る', async () => {
+await ta('[2] 段階が new_open でない = 持ち主 company + MASTER_EDIT_OPEN でも 409 切替前・何も書かない。変わる項目が無い保存も 409 (done を残さない)', async () => {
   const before = await nEvents();
   const id = uuid();
   const e = await rejectsWith(save('s001', { name: '直した名前' }, { requestId: id }), 409, 'before_cutover');
@@ -158,40 +225,63 @@ await ta('[2] 段階が new_open でない = 持ち主 company + MASTER_EDIT_OPE
   assert.equal(await nEvents(), before);
   const r = await reqRow(id);
   assert.equal(r.status, 'failed'); assert.equal(r.error.reason, 'before_cutover'); assert.equal(r.target_code, 's001'); assert.ok(r.sku_id);
-  // 段階を進める (切替日の手順の順)。記録が残る
-  for (const to of ['frozen', 'company_owner', 'new_open']) await C.advanceCutoverPhase(db, { to, actor: 'naka@test', note: `試験: ${to}` });
-  assert.deepEqual((await q('select from_phase, to_phase, actor from ops.master_cutover_events order by event_id')).map((x) => [x.from_phase, x.to_phase, x.actor]),
-    [['legacy_open', 'frozen', 'naka@test'], ['frozen', 'company_owner', 'naka@test'], ['company_owner', 'new_open', 'naka@test']]);
-  await assert.rejects(() => C.advanceCutoverPhase(db, { to: 'legacy_open', actor: 'naka@test' }), /one_way/);
-  assert.equal(C.newEntryWritable(await C.readCutoverPhase(db)), true);
-  await assert.rejects(() => pg.query('delete from ops.master_cutover_events'), /append-only/);
+  const noop = uuid();
+  await rejectsWith(save('s001', { name: '単品 1' }, { requestId: noop }), 409, 'before_cutover');
+  assert.equal((await reqRow(noop)).status, 'failed');
+  assert.equal(Number((await q("select count(*)::int as n from ops.master_edit_requests where status = 'done'"))[0].n), 0);
 });
 
-await ta('[2] 段階 new_open でも、持ち主が load (今の本番の持ち主表) = 409 / MASTER_EDIT_OPEN が無い = 409', async () => {
-  let e = await rejectsWith(save('s001', { name: '直した名前' }, { ownership: MASTER_OWNERSHIP }), 409, 'before_cutover');
-  assert.deepEqual(e.extra.fields, ['名前']);
-  assert.deepEqual(e.extra.load_keys.sort(), ['products.name', 'skus.name']);
-  e = await rejectsWith(save('s001', { name: '直した名前' }, { open: false }), 409, 'before_cutover');
-  assert.equal(e.extra.open, false); assert.match(e.message, /保存はまだ開いていません/);
+await ta('[2] 証拠と門の記録がそろえば 1 段ずつ進む。company_owner の後は持ち主表のハッシュが記録と同じでないと保存しない / 前の段階の記録では進めない', async () => {
+  const h = C.ownershipHash(ALL_COMPANY);
+  const ack = (host, phase, hash = h) => pg.query(`insert into ops.master_legacy_gate_acks (host, build_id, owner_hash, legacy_gates_version, phase_seen) values ($1, 'b2', $2, 1, $3)`, [host, hash, phase]);
+  await ack('render', 'legacy_open');
+  const r1 = await C.advanceCutoverPhase(db, { to: 'frozen', actor: 'naka@test', evidence: FROZEN_EVIDENCE, note: '試験' });
+  assert.deepEqual(r1.acks.map((a) => [a.host, a.version]), [['minipc', 1], ['render', 1]]);
+  // frozen の前の記録 (legacy_open を見た) では company_owner に進めない
+  await assert.rejects(() => C.advanceCutoverPhase(db, { to: 'company_owner', actor: 'naka@test', evidence: { owner_hash: h } }), /acks_missing/);
+  await ack('render', 'frozen'); await ack('minipc', 'frozen', 'f'.repeat(64));   // minipc は違う持ち主表で起動した
+  await assert.rejects(() => C.advanceCutoverPhase(db, { to: 'company_owner', actor: 'naka@test', evidence: { owner_hash: h } }), /足りない場所: minipc [(]/);
+  await assert.rejects(() => C.advanceCutoverPhase(db, { to: 'company_owner', actor: 'naka@test', evidence: { owner_hash: 'x' } }), /owner_hash/);
+  await ack('minipc', 'frozen');
+  await C.advanceCutoverPhase(db, { to: 'company_owner', actor: 'naka@test', evidence: { owner_hash: h } });
+  await ack('render', 'company_owner'); await ack('minipc', 'company_owner');
+  await assert.rejects(() => C.advanceCutoverPhase(db, { to: 'new_open', actor: 'naka@test', evidence: { owner_hash: 'a'.repeat(64) } }), /company_owner のときと違う/);
+  await C.advanceCutoverPhase(db, { to: 'new_open', actor: 'naka@test', evidence: { owner_hash: h } });
+  const ev = await q('select from_phase, to_phase, evidence, jsonb_array_length(acks) as n from ops.master_cutover_events order by event_id');
+  assert.deepEqual(ev.map((x) => [x.from_phase, x.to_phase, x.n]), [['legacy_open', 'frozen', 2], ['frozen', 'company_owner', 2], ['company_owner', 'new_open', 2]]);
+  assert.deepEqual(ev[0].evidence, FROZEN_EVIDENCE);
+  await assert.rejects(() => C.advanceCutoverPhase(db, { to: 'legacy_open', actor: 'naka@test', evidence: {} }), /one_way/);
+  await assert.rejects(() => pg.query('delete from ops.master_cutover_events'), /append-only/);
+  const s = await C.readCutoverPhase(db);
+  assert.deepEqual([s.phase, s.owner_hash], ['new_open', h]);
+  assert.equal(C.newEntryWritable(s, ALL_COMPANY), true);
+  assert.equal(C.newEntryWritable(s, MASTER_OWNERSHIP), false);
+  // 動いているコードの持ち主表が記録と違う = 保存しない (今の本番の持ち主表 = 全部 load のまま動かした)
+  const e = await rejectsWith(save('s001', { name: '直した名前' }, { ownership: MASTER_OWNERSHIP }), 409, 'before_cutover');
+  assert.match(e.message, /持ち主表が切替のときの記録と違う/);
+  const e2 = await rejectsWith(save('s001', { name: '直した名前' }, { open: false }), 409, 'before_cutover');
+  assert.match(e2.message, /保存はまだ開いていません/);
   assert.equal((await skuRow('s001')).name, '単品 1');
 });
 
-await ta('[2] 一部だけ company: 名前 (company) + 税率 (load) を一緒に保存 = 全部断る。名前だけなら通る。変わる項目が無い = 変わりなし', async () => {
-  const own = withOwn({ 'skus.name': 'company', 'products.name': 'company' });
-  const e = await rejectsWith(save('s002', { name: '名前 2 改', tax_rate: '10' }, { ownership: own }), 409, 'before_cutover');
+await ta('[2] 一部だけ company で切り替えた DB: 名前 (company) + 税率 (load) = 全部断る・名前だけは通る。構成の依頼も sku_components が load なら 409', async () => {
+  const own = withOwn({ 'skus.name': 'company', 'products.name': 'company', 'skus.shipping': 'company' });
+  const E1 = await setupDb();
+  await openCutover(E1, own);
+  const tok = (code) => tokenIn2(E1, code);
+  const e = await rejectsWith(save('s002', { name: '名前 2 改', tax_rate: '10' }, { E: E1, ownership: own, token: await tok('s002') }), 409, 'before_cutover');
   assert.deepEqual(e.extra.fields, ['税率']);
-  assert.equal((await skuRow('s002')).name, '単品 2');
-  const r = await save('s002', { name: '名前 2 改', tax_rate: '8' }, { ownership: own });   // 税率は今と同じ = 変わらない列は見ない
+  const r = await save('s002', { name: '名前 2 改', tax_rate: '8' }, { E: E1, ownership: own, token: await tok('s002') });
   assert.deepEqual(r.changed.map((c) => c.field), ['name']);
-  assert.equal((await skuRow('s002')).name, '名前 2 改');
-  const before = await nEvents();
-  assert.equal((await save('s001', { name: '単品 1', tax_rate: '0.1' }, { ownership: MASTER_OWNERSHIP })).no_change, true);
-  assert.equal(await nEvents(), before);
+  const e3 = await rejectsWith(save('set001', { components: [{ code: 's001', qty: 1 }] }, { E: E1, ownership: own, token: await tok('set001') }), 409, 'before_cutover');
+  assert.deepEqual([e3.extra.fields, e3.extra.load_keys], [['構成の依頼'], ['sku_components']]);
+  assert.equal(Number((await E1.db.query('select count(*)::int as n from ops.sku_component_requests')).rows[0].n), 0);
+  await E1.pg.close();
 });
 
 console.log('\n単品の保存');
 
-await ta('[3] 単品: 名前・取扱・売価・税率・分類・送料・月数・代表の仕入先・代表 (親) を 1 回で。変わった列だけ・商品の行もそろう', async () => {
+await ta('[3] 単品: 名前・取扱・売価・税率・分類・送料・月数・代表の仕入先・代表 (親) を 1 回で。変わった列だけ・商品の行もそろう (画面のロールで)', async () => {
   const id = uuid();
   const r = await save('s003', {
     name: '単品 3 改', handling: 'active', standard_price: '1,280', tax_rate: '8', sales_class: '2', shipping_code: 'S01', reorder_months: '1.5',
@@ -211,12 +301,11 @@ await ta('[3] 単品: 名前・取扱・売価・税率・分類・送料・月�
 await ta('[3] 変更の記録: トリガーが actor = human・メール・portal_master_edit・request_id・理由を残す。設定は取引の外に漏れない', async () => {
   const id = uuid();
   await save('s002', { name: '名前 2 改 2', handling: 'discontinued' }, { requestId: id, reason: '取扱をやめた', actor: 'Other@Test' });
-  const ev = await q('select entity_type, attribute, actor_type, actor_id, source_system, reason_text from events.master_change_events where request_id = $1 order by event_id', [id]);
+  const ev = await q('select entity_type, attribute, actor_type, actor_id, source_system, reason_text, db_user from events.master_change_events where request_id = $1 order by event_id', [id]);
   assert.ok(ev.length >= 4, JSON.stringify(ev));
-  for (const e of ev) assert.deepEqual([e.actor_type, e.actor_id, e.source_system, e.reason_text], ['human', 'other@test', 'portal_master_edit', '取扱をやめた']);
+  for (const e of ev) assert.deepEqual([e.actor_type, e.actor_id, e.source_system, e.reason_text, e.db_user], ['human', 'other@test', 'portal_master_edit', '取扱をやめた', 'master_edit']);
   assert.deepEqual(ev.filter((e) => e.entity_type === 'product').map((e) => e.attribute).sort(), ['name', 'status']);
-  const s002 = await skuId('s002');
-  const skuEv = await q("select attribute from events.master_change_events where request_id = $1 and entity_type = 'sku' and entity_id = $2", [id, s002]);
+  const skuEv = await q("select attribute from events.master_change_events where request_id = $1 and entity_type = 'sku' and entity_id = $2", [id, await skuId('s002')]);
   assert.deepEqual(skuEv.map((e) => e.attribute).sort(), ['handling', 'name']);
   assert.equal((await q("select current_setting('core.actor_type', true) as a"))[0].a || '', '');
 });
@@ -226,7 +315,7 @@ await ta('[4] 保存した値は夜間ロード (持ち主 company) を 2 回流
   const before = await snap();
   await load(ALL_COMPANY); await load(ALL_COMPANY);
   assert.deepEqual(await snap(), before);
-  await load(MASTER_OWNERSHIP);   // 持ち主 load の夜間ロードは NE の値に戻す (守っているのは持ち主表)
+  await load(MASTER_OWNERSHIP);
   assert.equal((await skuRow('s003')).name, '単品 3');
   assert.equal((await skuRow('s003')).tax_rate, 0.1);
   assert.equal((await skuRow('s003')).parent, 's001');   // 人が決めた親 (manual) は load でも触らない (0036)
@@ -235,10 +324,10 @@ await ta('[4] 保存した値は夜間ロード (持ち主 company) を 2 回流
 
 console.log('\n同じ request_id');
 
-await ta('[5] 同じ中身 = 前の結果 (記録は増えない) / 違う中身・違う人 = 409 / 失敗 = 同じ誤り / 記録は追記だけ', async () => {
+await ta('[5] 同じ中身 = 前の結果 (記録は増えない) / 違う中身・違う人・違う SKU = 409 / 失敗 = 同じ誤り / 記録は追記だけ', async () => {
   const id = uuid();
   const token = await tokenOf('s004');
-  const eventId = await lastEvent();   // 画面は同じ本文を送り直す (編集の印・見た記録の番号も同じ)
+  const eventId = await lastEvent();
   const first = await save('s004', { sales_class: '3' }, { requestId: id, token, eventId });
   const n = await nEvents();
   const again = await save('s004', { sales_class: '3' }, { requestId: id, token, eventId });
@@ -247,13 +336,13 @@ await ta('[5] 同じ中身 = 前の結果 (記録は増えない) / 違う中身
   assert.equal(await nEvents(), n);
   await rejectsWith(save('s004', { sales_class: '2' }, { requestId: id, token, eventId }), 409, 'request_id_reused');
   await rejectsWith(save('s004', { sales_class: '3' }, { requestId: id, token, eventId, actor: 'other@test' }), 409, 'request_id_reused');
+  await rejectsWith(save('s002', { sales_class: '3' }, { requestId: id }), 409, 'request_id_reused');   // 違う SKU へ同じ番号
   const bad = uuid();
   const t2 = await tokenOf('s004'); const e2 = await lastEvent();
-  await rejectsWith(save('s004', { sales_class: '1' }, { requestId: bad, token: t2, eventId: e2, ownership: MASTER_OWNERSHIP }), 409, 'before_cutover');
-  const e = await rejectsWith(save('s004', { sales_class: '1' }, { requestId: bad, token: t2, eventId: e2, ownership: MASTER_OWNERSHIP }), 409, 'before_cutover');
+  await rejectsWith(save('s004', { sales_class: '1' }, { requestId: bad, token: t2, eventId: e2, open: false }), 409, 'before_cutover');
+  const e = await rejectsWith(save('s004', { sales_class: '1' }, { requestId: bad, token: t2, eventId: e2, open: false }), 409, 'before_cutover');
   assert.equal(e.extra.replayed, true);
   assert.equal(Number((await q('select count(*)::int as n from ops.master_edit_requests where request_id = $1', [bad]))[0].n), 1);
-  // 処理中の行は作らない (done / failed だけ)・追記だけ
   assert.deepEqual((await q('select distinct status from ops.master_edit_requests order by 1')).map((x) => x.status), ['done', 'failed']);
   await assert.rejects(() => pg.query(`update ops.master_edit_requests set status = 'failed' where request_id = $1`, [id]), /append-only/);
   await assert.rejects(() => pg.query('delete from ops.master_edit_requests where request_id = $1', [id]), /append-only/);
@@ -266,21 +355,20 @@ await ta('[6] 画面を開いた後に別の保存が SKU を変えた = 409 と
   const since = await lastEvent();
   await save('s004', { standard_price: '1500' }, { actor: 'other@test' });
   const n = await nEvents();
-  const e = await rejectsWith(W.saveSku(db, { actor: 'naka@test', requestId: uuid(), code: 's004', reason: null, seen: { token, event_id: since }, values: { name: '上書き' } },
-    { ownership: ALL_COMPANY, open: true, now: NOW }), 409, 'version_conflict');
+  const e = await rejectsWith(save('s004', { name: '上書き' }, { token, eventId: since, reason: null }), 409, 'version_conflict');
   assert.ok(e.extra.events.some((x) => x.attribute === 'standard_price_jpy' && x.actor_id === 'other@test'), JSON.stringify(e.extra.events));
   assert.equal(await nEvents(), n);
   assert.equal((await skuRow('s004')).name, '単品 4 (分類・原価なし)');
 });
 
-await ta('[6] 行が増えた・変わった (仕入先ごとの商品・原価の行・JAN・商品の行・構成品の税率・含むセット) でも編集の印は変わる', async () => {
+await ta('[6] 行が増えた・変わった (仕入先ごとの商品・JAN・商品の行・構成品の値・含むセット) でも編集の印は変わる', async () => {
   const s001 = await skuId('s001');
   const pid = (await q('select product_id::text as id from core.skus where code = $1', ['s001']))[0].id;
   const steps = [
     ["update core.supplier_skus set vendor_code = 'AMC-XXX' where sku_id = $1", [s001]],
     ["insert into core.supplier_skus (company_id, supplier_id, sku_id) select 1, supplier_id, $1 from core.suppliers where code = '0002'", [s001]],   // 行が増えた (phantom)
     ["insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type) values (1, 'product', $1, 'jan', 'jan', '4900000000001', 'manual', 'human')", [pid]],
-    ["update core.products set sales_class = 1 where product_id = $1", [pid]],
+    ['update core.products set sales_class = 1 where product_id = $1', [pid]],
   ];
   for (const [sql, params] of steps) {
     const t0 = await tokenOf('s001');
@@ -289,7 +377,6 @@ await ta('[6] 行が増えた・変わった (仕入先ごとの商品・原価�
     await rejectsWith(save('s001', { name: '変える' }, { token: t0 }), 409, 'version_conflict');
   }
   await pg.query('update core.products set sales_class = 3 where product_id = $1', [pid]);
-  // 構成品の値が変わった = セットの印が変わる / 含むセットが変わった = 単品の印が変わる
   const t1 = await tokenOf('set001');
   await pg.query("update core.skus set standard_price_jpy = 1001 where code = 's002'");
   assert.notEqual(await tokenOf('set001'), t1);
@@ -363,7 +450,7 @@ await ta('[8] 単品の税率を変えると、含むセットの税率・税区
 
 await ta('[8] 単品を中止にすると含むセットも中止 / 取扱中に戻しても「セット自身の取扱」が決まっていないセットは中止のまま (気をつけること)', async () => {
   let r = await save('s001', { handling: 'discontinued' });
-  assert.deepEqual(r.derived.filter((d) => d.col === 'handling').map((d) => d.code).sort(), ['set001', 'set004', 'set005']);
+  assert.deepEqual(r.derived.filter((d) => d.col === 'handling').map((d) => d.code).sort(), ['set001', 'set004', 'set005', 'set006']);
   assert.equal((await skuRow('set001')).handling, 'discontinued');
   r = await save('s001', { handling: 'active' });
   assert.equal((await skuRow('set001')).handling, 'discontinued');
@@ -379,7 +466,7 @@ await ta('[9] 単品の原価: 今日から (今の行は昨日で閉じる)・�
   assert.deepEqual((await costsOf('s001')).map((c) => [c.jpy, c.f, c.t]), [[100, '2030-01-05', null]]);
   const r = await save('s001', { cost: { jpy: '130', reason: '値上げ' } });
   assert.deepEqual((await costsOf('s001')).map((c) => [c.jpy, c.src, c.st, c.f, c.t]), [[100, 'ne', 'COMPLETE', '2030-01-05', '2030-01-09'], [130, 'manual', 'COMPLETE', TODAY, null]]);
-  // set001 = s001×2 + s002×1 = 260 + 200 / set005 = s001 + s005 = 130 + 80 / set004 は s004 に原価が無い = 合計できない (行も無いので何もしない)
+  // set001 = s001×2 + s002×1 = 260 + 200 / set005 = s001 + s005 = 130 + 80 / set004・set006 は原価の無い構成品がある (行も無いので何もしない)
   assert.deepEqual(r.derived.filter((d) => d.col === 'cost').map((d) => [d.code, d.from, d.to]), [['set001', 400, 460], ['set005', 180, 210]]);
   assert.deepEqual((await costsOf('set001')).map((c) => [c.jpy, c.src, c.f, c.t]), [[400, 'set_calc', '2030-01-05', '2030-01-09'], [460, 'set_calc', TODAY, null]]);
 });
@@ -399,7 +486,7 @@ await ta('[9] 今日 2 回目は今日の行を入れ替える (期間を重ね�
   await pg.query("update core.sku_costs set valid_to = null where valid_to = '2030-01-14'");
 });
 
-await ta('[9] 期間の重なりは DB が拒む (この画面・昇格の書き込み)。夜間ロード・ほかの書き手は見ない (今の動きを止めない)', async () => {
+await ta('[9] 期間の重なりは DB が拒む (この画面・昇格の書き込み)。夜間ロード・ほかの書き手は見ない (今の動きを止めない = ⑥ の前提)', async () => {
   const sid = await skuId('s003');
   const asPortal = async (sql) => {
     await pg.query('begin');
@@ -407,7 +494,6 @@ await ta('[9] 期間の重なりは DB が拒む (この画面・昇格の書き
     catch (e) { await pg.query('rollback'); throw e; }
   };
   await assert.rejects(() => asPortal("insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from, valid_to) values (1, $1, 1, 'manual', 'COMPLETE', '2030-01-06', '2030-01-07')"), /sku_cost_overlap/);
-  // 重ならない前の期間は入る (両端を含む: 前の行の終わり 1/4 と今の行の始まり 1/5 は重ならない)
   await asPortal("insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from, valid_to) values (1, $1, 1, 'manual', 'COMPLETE', '2029-12-01', '2030-01-04')");
   await assert.rejects(() => asPortal("update core.sku_costs set valid_to = '2030-01-05' where sku_id = $1 and valid_from = '2029-12-01'"), /sku_cost_overlap/);
   await pg.query("delete from core.sku_costs where sku_id = $1 and valid_from = '2029-12-01'", [sid]);
@@ -424,7 +510,6 @@ await ta('[9] 「今日」は東京の日付 (UTC 14:59:59 と 15:00 の境目�
     assert.equal(W.jstDate(new Date(iso)), want, iso);
     assert.equal((await q(`select (($1::timestamptz) at time zone 'Asia/Tokyo')::date::text as d`, [iso]))[0].d, want, `DB ${iso}`);
   }
-  // 日をまたいだ保存: 東京の 1/11 00:00 (UTC 1/10 15:00) の保存は 1/11 から
   await save('s005', { cost: { jpy: '81', reason: '日の境目' } }, { now: new Date('2030-01-10T15:00:00Z') });
   assert.deepEqual((await costsOf('s005')).map((c) => [c.jpy, c.f, c.t]), [[80, '2030-01-05', '2030-01-10'], [81, '2030-01-11', null]]);
 });
@@ -433,33 +518,33 @@ console.log('\nNE に取り込む CSV');
 
 await ta('[10] CSV が出ている列は変えない (作った・確かめた / 申告して確かめ待ち)。CSV に無い列・void・確かめ済みは変えられる', async () => {
   const mk = async (state) => {
-    const extra = state === 'declared' ? ', checked_at, checked_run, declared_at, declared_by' : state === 'void' ? ', void_at, void_by' : '';
-    const vals = state === 'declared' ? ", now(), 'mc_20300101T000000000Z_abcdef', now(), 'x@test'" : state === 'void' ? ", now(), 'x@test'" : '';
+    const extra = state === 'declared' ? ', checked_at, checked_run, declared_at, declared_by' : '';
+    const vals = state === 'declared' ? ", now(), 'mc_20300101T000000000Z_abcdef', now(), 'x@test'" : '';
     return (await q(`insert into ops.ne_csv_exports (kind, col, ne_column, converter_version, encoding, trial, row_count, sha256, file_bytes, compare_run_id, created_by, state${extra})
       values ('products', 'name', 'syohin_name', 'v1', 'utf8', true, 1, repeat('a', 64), decode('00', 'hex'), 'mc_20300101T000000000Z_abcdef', 'x@test', '${state}'${vals}) returning export_id::text as id`))[0].id;
   };
-  const row = (id, code, col, reserved = true) => pg.query(`insert into ops.ne_csv_export_rows (export_id, source, code_norm, col, ne_code, target, cell, cdb_version, evidence, reserved, released_at, release_reason)
-    values ($1, 'to_ne', $2, $3, $2, '{"value":"a"}', 'a', 1, '{}', $4, ${reserved ? 'null' : 'now()'}, ${reserved ? 'null' : "'confirmed'"})`, [id, code, col, reserved]);
+  const row = (id, code, col) => pg.query(`insert into ops.ne_csv_export_rows (export_id, source, code_norm, col, ne_code, target, cell, cdb_version, evidence)
+    values ($1, 'to_ne', $2, $3, $2, '{"value":"a"}', 'a', 1, '{}')`, [id, code, col]);
   const made = await mk('made');
   await row(made, 's003', 'name');
   const monthsBefore = (await skuRow('s003')).months;
   let e = await rejectsWith(save('s003', { name: '直したい', reorder_months: '3' }), 409, 'csv_issued');
   assert.match(e.message, new RegExp(`#${made}`));
   assert.equal((await skuRow('s003')).months, monthsBefore);
-  await save('s003', { reorder_months: '3' });   // CSV に無い列は変えられる
+  await save('s003', { reorder_months: '3' });
   await pg.query("update ops.ne_csv_exports set state = 'void', void_at = now(), void_by = 'x@test', void_reason = 'by_user' where export_id = $1", [made]);
-  await pg.query('update ops.ne_csv_export_rows set reserved = false, released_at = now(), release_reason = $2 where export_id = $1', [made, 'void']);
-  await save('s003', { name: '単品 3 改 2' });   // 人が「使わない」にした = 変えられる
+  await pg.query("update ops.ne_csv_export_rows set reserved = false, released_at = now(), release_reason = 'void' where export_id = $1", [made]);
+  await save('s003', { name: '単品 3 改 2' });
   const declared = await mk('declared');
-  await row(declared, 's003', 'tax_rate', true);
+  await row(declared, 's003', 'tax_rate');
   e = await rejectsWith(save('s003', { tax_rate: '10' }), 409, 'csv_issued');
   assert.deepEqual(e.extra.exports.map((x) => [x.col, x.state]), [['tax_rate', 'declared']]);
   await pg.query("update ops.ne_csv_export_rows set reserved = false, released_at = now(), release_reason = 'confirmed' where export_id = $1", [declared]);
-  await save('s003', { tax_rate: '10' });   // 確かめが終わった = 変えられる
+  await save('s003', { tax_rate: '10' });
   assert.equal((await skuRow('s003')).tax_rate, 0.1);
 });
 
-console.log('\nセット: 構成の依頼・上げる・導けない・例外原価');
+console.log('\nセット: 構成の依頼・NE の観測・上げる・食い違い');
 
 await ta('[11] 構成を変える = 依頼だけ (core は変えない)。NE でやること・印が変わる・置き換え・今の構成に戻す = 取り下げ・並べ替えも依頼', async () => {
   const before = await compsOf('set001');
@@ -475,58 +560,100 @@ await ta('[11] 構成を変える = 依頼だけ (core は変えない)。NE で
   assert.deepEqual(open[0].base_rows.map((x) => [x.code, x.qty]), [['s001', 2], ['s002', 1]]);
   assert.deepEqual([open[0].requested_by, open[0].reason], ['naka@test', '中身を変える']);
   assert.notEqual(await tokenOf('set001'), t0);
-  assert.deepEqual((await cur('set001')).component_request.rows.map((x) => x.code), ['s001', 's003']);
   await save('set001', { components: [{ code: 's001', qty: 1 }, { code: 's003', qty: 3 }] });
   assert.deepEqual((await q('select status, close_reason from ops.sku_component_requests order by component_request_id')).map((x) => [x.status, x.close_reason]), [['cancelled', 'superseded'], ['open', null]]);
-  // 今の構成と同じ (構成品・数量・並び) に戻す = 取り下げ
   const w = await save('set001', { components: [{ code: 's001', qty: 2 }, { code: 's002', qty: 1 }] });
   assert.ok(w.ne_steps.some((s) => /取り下げ/.test(s)));
   assert.deepEqual((await q('select status, close_reason from ops.sku_component_requests order by component_request_id')).map((x) => [x.status, x.close_reason]), [['cancelled', 'superseded'], ['cancelled', 'withdrawn']]);
-  // 並びだけ違う = 依頼 (並びも構成のうち)
   const re = await save('set001', { components: [{ code: 's002', qty: 1 }, { code: 's001', qty: 2 }] });
   assert.ok(re.ne_steps.some((s) => /並びを s002 → s001/.test(s)), JSON.stringify(re.ne_steps));
-  await save('set001', { components: [{ code: 's001', qty: 2 }, { code: 's002', qty: 1 }] });   // 取り下げて元に
+  await save('set001', { components: [{ code: 's001', qty: 2 }, { code: 's002', qty: 1 }] });
   await assert.rejects(() => pg.query(`update ops.sku_component_requests set rows = '[{"sku_id":1,"qty":1,"sort":1}]'::jsonb`), /書き換えない|閉じた依頼/);
   await assert.rejects(() => pg.query('delete from ops.sku_component_requests'), /消さない/);
 });
 
-await ta('[11] 依頼を上げる: NE の観測が完全・依頼より後・構成品 / 数量 / 並び / 行の数まで同じときだけ。同じ取引で構成・導く値・依頼を', async () => {
+await ta('[11] NE の観測を書く: 同じ回の再送 = 何もしない・中身が違う = 拒む・知らないセット = 飛ばす・知らない構成品 = sku_id なし・追記だけ', async () => {
+  const at = new Date(Date.now() + 60000).toISOString();
+  const payload = { run_id: 'ne_run_w1', observed_at: at, complete: true, sets: [{ set_code: 'SET001', rows: [{ code: 's001', qty: 2, sort: 1 }, { code: 'zzz', qty: 1, sort: 2 }] }, { set_code: 's001', rows: [] }, { set_code: 'nope', rows: [] }] };
+  const r = await W.recordNeSetObservations(db, payload);
+  assert.deepEqual([r.state, r.sets, r.skipped], ['written', 1, 2]);
+  assert.equal((await W.recordNeSetObservations(db, payload)).state, 'unchanged');
+  await assert.rejects(() => W.recordNeSetObservations(db, { ...payload, complete: false }), /run_conflict/);
+  await assert.rejects(() => W.recordNeSetObservations(db, { ...payload, run_id: 'bad run' }), /run_id/);
+  await assert.rejects(() => W.recordNeSetObservations(db, { ...payload, run_id: 'ne_run_w2', complete: 'yes' }), /complete/);
+  const rows = (await q("select rows from ops.ne_set_observations where run_id = 'ne_run_w1'"))[0].rows;
+  assert.deepEqual(rows.map((x) => [x.code, x.qty, x.sort, x.sku_id == null]), [['s001', 2, 1, false], ['zzz', 1, 2, true]]);
+  await assert.rejects(() => pg.query("delete from ops.ne_set_observations where run_id = 'ne_run_w1'"), /append-only/);
+  await assert.rejects(() => pg.query("update ops.ne_set_observation_runs set complete = false where run_id = 'ne_run_w1'"), /append-only/);
+});
+
+await ta('[11] 上げない: 偽の番号・完全でない回・依頼より前の観測・並び / 行の数 / 数量 / 知らない構成品が違う (食い違いを残す)・保存が開いていない', async () => {
   await save('set001', { components: [{ code: 's003', qty: 2 }, { code: 's001', qty: 1 }] }, { reason: '入れ替え' });
   const reqAt = Date.parse((await q("select created_at::text as t from ops.sku_component_requests where status = 'open'"))[0].t);
-  const after = new Date(Date.now() + 60000).toISOString();
-  const ok = { set_code: 'set001', complete: true, observed_at: after, run_id: 'ne_run_1', rows: [{ code: 's003', qty: 2, sort: 10 }, { code: 'S001', qty: 1, sort: 20 }] };
   const before = await compsOf('set001');
+  const good = [{ code: 's003', qty: 2, sort: 10 }, { code: 'S001', qty: 1, sort: 20 }];
+  for (const fake of ['999999', 'abc', null, { set_code: 'set001', complete: true, rows: good }]) assert.equal((await promote(fake)).reason, 'no_observation', JSON.stringify(fake));
+  assert.equal((await promote((await observe([{ set_code: 'set001', rows: good }], { complete: false })).set001)).reason, 'incomplete_observation');
+  assert.equal((await promote((await observe([{ set_code: 'set001', rows: good }], { at: new Date(reqAt - 3600000).toISOString() })).set001)).reason, 'stale_observation');
+  assert.equal((await promote((await observe([{ set_code: 'set001', rows: good }])).set001, { ownership: MASTER_OWNERSHIP })).reason, 'before_cutover');
   const tries = [
-    [{ ...ok, complete: false }, 'incomplete_observation'],
-    [{ ...ok, observed_at: new Date(reqAt - 1000).toISOString() }, 'stale_observation'],
-    [{ ...ok, rows: [ok.rows[1], ok.rows[0]].map((r, i) => ({ ...r, sort: i + 1 })) }, 'mismatch'],   // 並びが違う
-    [{ ...ok, rows: [...ok.rows, { code: 's002', qty: 1, sort: 30 }] }, 'mismatch'],                     // 行が多い
-    [{ ...ok, rows: [ok.rows[0]] }, 'mismatch'],                                                          // 行が足りない
-    [{ ...ok, rows: [{ ...ok.rows[0], qty: 3 }, ok.rows[1]] }, 'mismatch'],                               // 数量が違う
-    [{ ...ok, rows: [ok.rows[0], { ...ok.rows[1], sort: 10 }] }, 'mismatch'],                             // 並びが決められない
-    [{ ...ok, rows: [ok.rows[0], { code: 'nope', qty: 1, sort: 20 }] }, 'unknown_component'],
-    [{ ...ok, set_code: 's001' }, 'not_a_set'],
+    [[good[1], good[0]].map((r, i) => ({ ...r, sort: i + 1 })), 'mismatch'],   // 並びが違う
+    [[...good, { code: 's002', qty: 1, sort: 30 }], 'mismatch'],                 // 行が多い
+    [[good[0]], 'mismatch'],                                                      // 行が足りない
+    [[{ ...good[0], qty: 3 }, good[1]], 'mismatch'],                              // 数量が違う
+    [[good[0], { code: 'nope', qty: 1, sort: 20 }], 'mismatch'],                  // 知らない構成品
   ];
-  for (const [obs, why] of tries) {
-    const r = await W.promoteComponentRequest(db, obs, { ownership: ALL_COMPANY, now: NOW });
-    assert.deepEqual([r.promoted, r.reason], [false, why], JSON.stringify(obs));
+  for (const [rows, why] of tries) {
+    const r = await promote((await observe([{ set_code: 'set001', rows }])).set001);
+    assert.deepEqual([r.promoted, r.reason], [false, why], JSON.stringify(rows));
   }
-  assert.equal((await W.promoteComponentRequest(db, ok, { ownership: MASTER_OWNERSHIP, now: NOW })).reason, 'before_cutover');
   assert.deepEqual(await compsOf('set001'), before);
-  assert.equal(Number((await q("select count(*)::int as n from ops.sku_component_requests where status = 'open'"))[0].n), 1);
-  // 同じ = 上げる
-  const r = await W.promoteComponentRequest(db, ok, { ownership: ALL_COMPANY, now: NOW });
+  // 食い違いは開いているのが 1 つ (中身が変われば前のを閉じて新しく)
+  const br = await q("select kind, status, close_reason from ops.sku_component_breaches where set_sku_id = (select sku_id from core.skus where code = 'set001') order by breach_id");
+  assert.deepEqual(br.filter((b) => b.status === 'open').map((b) => b.kind), ['mismatch']);
+  assert.equal(br.filter((b) => b.close_reason === 'superseded').length, tries.length - 1);
+  // 同じ中身の食い違いをもう一度 = 増やさない
+  const n = br.length;
+  await promote((await observe([{ set_code: 'set001', rows: tries.at(-1)[0] }])).set001);
+  assert.equal(Number((await q('select count(*)::int as n from ops.sku_component_breaches'))[0].n), n);
+  // 依頼から 7 日より後の観測でも違う = stale (mismatch は閉じる)
+  const st = await promote((await observe([{ set_code: 'set001', rows: [good[0]] }], { at: new Date(reqAt + 8 * 86400000).toISOString() })).set001);
+  assert.equal(st.reason, 'stale');
+  assert.deepEqual((await q("select kind from ops.sku_component_breaches where status = 'open'")).map((b) => b.kind), ['stale']);
+  // 画面にも出る
+  const page = await R.readSkuPage(db, 'set001', { now: NOW, ownership: ALL_COMPANY, open: true });
+  assert.deepEqual(page.breaches.map((b) => b.kind), ['stale']);
+  await assert.rejects(() => pg.query("update ops.sku_component_breaches set kind = 'mismatch' where status = 'open'"), /書き換えない/);
+  await assert.rejects(() => pg.query("update ops.sku_component_breaches set closed_by = 'x' where status = 'closed'"), /閉じた食い違いは変えない/);
+  await assert.rejects(() => pg.query('delete from ops.sku_component_breaches'), /消さない/);
+});
+
+await ta('[11] 上げる: 観測が完全・依頼より後・構成品 / 数量 / 並び / 行の数まで同じ。同じ取引で構成・導く値・依頼 (applied)・食い違い (resolved)', async () => {
+  const good = [{ code: 's003', qty: 2, sort: 10 }, { code: 'S001', qty: 1, sort: 20 }];
+  const obsId = (await observe([{ set_code: 'set001', rows: good }], { at: new Date(Date.now() + 120000).toISOString() })).set001;
+  const r = await promote(obsId);
   assert.equal(r.promoted, true, JSON.stringify(r));
   assert.deepEqual(await compsOf('set001'), [['s003', 2, 1, 'ne'], ['s001', 1, 2, 'ne']]);
-  assert.deepEqual((await q("select status, close_reason, closed_by, applied_run from ops.sku_component_requests where set_sku_id = (select sku_id from core.skus where code = 'set001') order by component_request_id desc limit 1"))[0],
-    { status: 'applied', close_reason: 'matched', closed_by: 'system', applied_run: 'ne_run_1' });
-  // 導く値も同じ取引で (s003 税 10%・s001 10% / 原価 s003 50×2 + s001 120 = 220)
+  const req = (await q("select status, close_reason, closed_by, applied_observation_id::text as oid from ops.sku_component_requests where set_sku_id = (select sku_id from core.skus where code = 'set001') order by component_request_id desc limit 1"))[0];
+  assert.deepEqual(req, { status: 'applied', close_reason: 'matched', closed_by: 'system', oid: obsId });
+  assert.deepEqual((await q("select distinct status, close_reason from ops.sku_component_breaches where set_sku_id = (select sku_id from core.skus where code = 'set001') and close_reason <> 'superseded'")),
+    [{ status: 'closed', close_reason: 'resolved' }]);
+  // 導く値も同じ取引で (s003 50×2 + s001 120 = 220・税率 s003 10% (直した)・s001 10%)
   assert.ok(r.derived.some((d) => d.col === 'cost' && d.to === 220), JSON.stringify(r.derived));
   assert.equal((await costsOf('set001')).at(-1).jpy, 220);
   const ev = await q("select distinct actor_type, source_system, run_id from events.master_change_events where source_system = 'ne_observation'");
-  assert.deepEqual(ev, [{ actor_type: 'system', source_system: 'ne_observation', run_id: 'ne_run_1' }]);
-  // もう開いている依頼は無い = もう一度は上げない
-  assert.equal((await W.promoteComponentRequest(db, ok, { ownership: ALL_COMPANY, now: NOW })).reason, 'no_open_request');
+  assert.deepEqual(ev.map((x) => [x.actor_type, x.source_system]), [['system', 'ne_observation']]);
+  assert.equal((await promote(obsId)).reason, 'no_open_request');
+});
+
+await ta('[11] 依頼が無いのに NE の構成が今の構成と違う = unrequested_diff を残す → NE が今の構成に戻った観測で resolved', async () => {
+  let r = await promote((await observe([{ set_code: 'set005', rows: [{ code: 's001', qty: 1, sort: 1 }] }])).set005);
+  assert.deepEqual([r.promoted, r.reason], [false, 'unrequested_diff']);
+  assert.deepEqual((await q("select kind, component_request_id from ops.sku_component_breaches where status = 'open' and set_sku_id = (select sku_id from core.skus where code = 'set005')")),
+    [{ kind: 'unrequested_diff', component_request_id: null }]);
+  r = await promote((await observe([{ set_code: 'set005', rows: [{ code: 's001', qty: 1, sort: 1 }, { code: 's005', qty: 1, sort: 2 }] }])).set005);
+  assert.deepEqual([r.reason, r.closed_breaches], ['no_open_request', 1]);
+  assert.equal(Number((await q("select count(*)::int as n from ops.sku_component_breaches where status = 'open' and set_sku_id = (select sku_id from core.skus where code = 'set005')"))[0].n), 0);
 });
 
 await ta('[12] 導く値が決まらないセットは保存しない: 分類 → 上書きで・原価 → 例外原価で通る。税率が決まらない (上書きなし) は通らない', async () => {
@@ -548,6 +675,23 @@ await ta('[12] 導く値が決まらないセットは保存しない: 分類 �
   assert.match(e.message, /導けるので、上書きはできません/);
 });
 
+await ta('[12] 今の構成は導けない + 依頼の構成は導ける: 上書き・例外原価を外すのは拒む (今の構成の値を壊さない)。依頼の構成が導けない依頼も拒む', async () => {
+  let r = await save('set006', { set_sales_class_override: '3', exception_cost: { jpy: '500', reason: '見積' } });
+  assert.deepEqual(r.changed.map((c) => c.field).sort(), ['exception_cost', 'set_sales_class_override']);
+  r = await save('set006', { components: [{ code: 's001', qty: 1 }, { code: 's002', qty: 1 }] });   // 依頼の構成は上書きなしでも導ける
+  assert.equal(r.changed[0].field, 'components');
+  const before = { costs: await costsOf('set006'), row: await skuRow('set006') };
+  let e = await rejectsWith(save('set006', { exception_cost: { clear: true, reason: 'やめる' } }), 400, 'set_underivable');
+  assert.match(e.extra.blockers.join(' '), /今の構成: .*s006 の原価/);
+  assert.ok(!e.extra.blockers.some((b) => /依頼の構成/.test(b)), JSON.stringify(e.extra.blockers));
+  e = await rejectsWith(save('set006', { set_sales_class_override: '' }), 400, 'set_underivable');
+  assert.match(e.extra.blockers.join(' '), /今の構成: .*売上分類/);
+  assert.deepEqual({ costs: await costsOf('set006'), row: await skuRow('set006') }, before);
+  // 逆: 今の構成は導ける・依頼の構成が導けない (s006 = 原価・分類なし) = 依頼を受けない
+  e = await rejectsWith(save('set001', { components: [{ code: 's001', qty: 1 }, { code: 's006', qty: 1 }] }), 400, 'set_underivable');
+  assert.match(e.extra.blockers.join(' '), /依頼の構成: /);
+});
+
 await ta('[12] 例外原価をやめる = 今日の例外の行を消して、今日から構成品の合計 (合計できなければ保存しない)', async () => {
   const e = await rejectsWith(save('set004', { exception_cost: { clear: true, reason: 'やめる' } }), 400, 'set_underivable');
   assert.match(e.message, /原価/);
@@ -557,15 +701,67 @@ await ta('[12] 例外原価をやめる = 今日の例外の行を消して、�
   assert.deepEqual((await costsOf('set004')).map((c) => [c.jpy, c.src, c.f, c.t]), [[190, 'set_calc', TODAY, null]]);
 });
 
+console.log('\n上げる処理と単品の保存の順番');
+
+await ta('[13] 単品の保存 → 上げる: 上げたセットは新しい単品の値で計算する / 上げる → 単品の保存: 上げる前の画面は 409・新しい画面の保存は増えたセットも計算し直す', async () => {
+  // set004 に s003 を足す依頼。s003 の原価を 50 → 55 に直してから上げる
+  await save('set004', { components: [{ code: 's001', qty: 1 }, { code: 's004', qty: 1 }, { code: 's003', qty: 1 }] });
+  await save('s003', { cost: { jpy: '55', reason: '上げる前に直した' } });
+  const before = await tokenOf('s003');
+  const r = await promote((await observe([{ set_code: 'set004', rows: [{ code: 's001', qty: 1, sort: 1 }, { code: 's004', qty: 1, sort: 2 }, { code: 's003', qty: 1, sort: 3 }] }], { at: new Date(Date.now() + 180000).toISOString() })).set004);
+  assert.equal(r.promoted, true, JSON.stringify(r));
+  assert.equal((await costsOf('set004')).at(-1).jpy, 120 + 70 + 55);   // s001 + s004 + 直した s003
+  // 上げた後: s003 を含むセットが増えた = 上げる前に開いた画面の保存は 409
+  await rejectsWith(save('s003', { cost: { jpy: '56', reason: '古い画面' } }, { token: before }), 409, 'version_conflict');
+  const s2 = await save('s003', { cost: { jpy: '56', reason: '新しい画面' } });
+  assert.ok(s2.derived.some((d) => d.code === 'set004' && d.col === 'cost' && d.to === 120 + 70 + 56), JSON.stringify(s2.derived));
+});
+
+console.log('\nDB のロール');
+
+await ta('[14] master_edit = 画面の読み書きだけ: 段階を進める・観測を書く・構成を上げる・門の記録・段階の行・キーの列・読まない表は不可 / master_ops = 段階を進める関数だけ', async () => {
+  const as = async (role, sql, params = []) => {
+    await pg.query(`set role ${role}`);
+    try { return await pgCode(pg.query(sql, params)); } finally { await pg.query('set role deploy'); }
+  };
+  const deny = [
+    [`select ops.set_master_cutover_phase('frozen', 'x', '{}'::jsonb)`, '42501'],
+    [`select ops.record_ne_set_observations('{}'::jsonb)`, '42501'],
+    ['insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, source) values (1, 1, 2, 1, \'manual\')', '42501'],
+    ['delete from core.sku_components where false', '42501'],
+    ["update ops.master_cutover_state set note = 'x'", '42501'],
+    ["insert into ops.master_legacy_gate_acks (host, build_id, owner_hash, legacy_gates_version, phase_seen) values ('render', 'x', repeat('a', 64), 9, 'legacy_open')", '42501'],
+    ["insert into ops.ne_set_observation_runs (run_id, observed_at, complete, set_count, content_hash) values ('x', now(), true, 0, repeat('a', 32))", '42501'],
+    ['update core.skus set code = code where false', '42501'],
+    ['delete from core.skus where false', '42501'],
+    ['select 1 from core.orders limit 1', '42501'],
+    ['update ops.sku_component_requests set rows = rows where false', '42501'],
+  ];
+  for (const [sql, want] of deny) assert.equal(await as('master_edit', sql), want, sql);
+  for (const sql of ['select 1 from core.skus limit 1', 'select 1 from ops.master_cutover_state', "update core.skus set name = name where false", 'select 1 from ops.sku_component_breaches limit 1']) assert.equal(await as('master_edit', sql), 'ok', sql);
+  // master_ops: 関数は動く (段階はもう new_open = one_way で止まる = 権限では拒まれない)・表は直接書けない・商品は読めない
+  assert.equal(await as('master_ops', `select ops.set_master_cutover_phase('frozen', 'x', '{}'::jsonb)`), 'P0001');
+  assert.equal(await as('master_ops', "update ops.master_cutover_state set note = 'x'"), '42501');
+  assert.equal(await as('master_ops', 'select 1 from core.skus limit 1'), '42501');
+  assert.equal(await as('master_ops', 'select phase from ops.master_cutover_state'), 'ok');
+  const roles = await q("select rolname, rolsuper, rolcreaterole, rolinherit, rolcanlogin from pg_roles where rolname in ('master_edit', 'master_ops') order by 1");
+  assert.deepEqual(roles.map((r) => [r.rolname, r.rolsuper, r.rolcreaterole, r.rolinherit, r.rolcanlogin]), [['master_edit', false, false, false, true], ['master_ops', false, false, false, true]]);
+});
+
 console.log('\n画面 (router)');
 
-process.env.COMPANY_DB_URL = 'postgres://test@localhost:5432/test';
+process.env.COMPANY_DB_URL = 'postgres://owner@localhost:5432/test';
+process.env.COMPANY_DB_MASTER_EDIT_URL = 'postgres://master_edit@localhost:5432/test';
 process.env.MASTER_EDITORS = 'Naka@Test, other@test';
 process.env.MASTER_EDIT_OPEN = '1';
 let factoryMode = 'ok';
-__setPgClientFactory(async () => {
+const opened = [];
+__setPgClientFactory(async (url) => {
   if (factoryMode === 'down') throw new Error('connect ECONNREFUSED');
-  return { query: (t, p) => pg.query(t, p), end: async () => {}, on: () => {} };
+  const role = /master_edit@/.test(url) ? 'master_edit' : 'deploy';
+  opened.push(role);
+  await pg.query(`set role ${role}`);
+  return { query: (t, p) => pg.query(t, p), end: async () => { await pg.query('set role deploy'); }, on: () => {} };
 });
 __setClock(() => NOW.getTime());
 __setOwnership(ALL_COMPANY);
@@ -602,24 +798,24 @@ function checkScripts(html, expected) {
 const tokenIn = (html) => /data-token="([0-9a-f]{64})"/.exec(html)?.[1];
 const eventIn = (html) => /data-event-id="(\d+)"/.exec(html)?.[1];
 
-await ta('[13] 一覧: 描画・検索 (コード・名前)・区分・状態・未入力 (売上分類はセットを導いてから)・導いた値の * ・末尾の /・つかいかた', async () => {
+await ta('[15] 一覧: 描画・検索・区分・状態・未入力 (売上分類はセットを導いてから)・導いた値の * ・末尾の /・つかいかた (画面のロールで読む)', async () => {
+  opened.length = 0;
   let r = await call('GET', '/');
   assert.equal(r.status, 200); assert.match(r.text, /マスタの入力/);
+  assert.deepEqual(opened, ['master_edit']);
   checkScripts(r.text, 0);
   assert.match(r.text, /href="sku\/set001"/);
-  assert.match(r.text, /10\*/);   // セットの税率に *
-  assert.ok(!/切替前です/.test(r.text));
+  assert.match(r.text, /10\*/);
+  assert.ok(!/いまは保存できません/.test(r.text));
   r = await call('GET', '/?q=S00&kind=single');
   assert.ok(r.text.includes('sku/s001') && !r.text.includes('sku/set001'));
   r = await call('GET', '/?q=' + encodeURIComponent('セット 5'));
   assert.ok(r.text.includes('sku/set005') && !r.text.includes('sku/s001"'));
   await pg.query("update core.products set sales_class = null where product_id = (select product_id from core.skus where code = 's003')");
-  assert.deepEqual((await R.listSkus(db, { missing: 'sales' }, { now: NOW })).rows.map((x) => x.code), ['s003', 'set001']);
+  assert.deepEqual((await R.listSkus(db, { missing: 'sales' }, { now: NOW })).rows.map((x) => x.code), ['s003', 's006', 'set001']);
   await pg.query("update core.products set sales_class = 1 where product_id = (select product_id from core.skus where code = 's003')");
-  assert.deepEqual((await R.listSkus(db, { missing: 'sales' }, { now: NOW })).rows.map((x) => x.code), []);
-  // set004・set005 は s001 を一度中止にしたとき一緒に中止になり、セット自身の取扱が決まっていないので中止のまま ([8])
   assert.deepEqual((await R.listSkus(db, { kind: 'set', state: 'available' }, { now: NOW })).rows.map((x) => [x.code, x.tax_derived]), [['set001', true]]);
-  assert.deepEqual((await R.listSkus(db, { kind: 'set', state: 'discontinued' }, { now: NOW })).rows.map((x) => x.code), ['set004', 'set005']);
+  assert.deepEqual((await R.listSkus(db, { kind: 'set', state: 'discontinued' }, { now: NOW })).rows.map((x) => x.code), ['set004', 'set005', 'set006']);
   const bare = await fetch(`${ORIGIN}/apps/master-edit`, { headers: { 'x-test-session': 'editor' }, redirect: 'manual' });
   assert.equal(bare.status, 301); assert.equal(bare.headers.get('location'), '/apps/master-edit/');
   const m = await call('GET', '/manual');
@@ -627,7 +823,7 @@ await ta('[13] 一覧: 描画・検索 (コード・名前)・区分・状態・
   for (const word of ['保存', '+ 構成品', '表示し直す', '画面を開き直す', '例外原価をやめる (構成品の合計に戻す)', 'NEとの差あり', '未入力', '切替前', 'NE でやること']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
 });
 
-await ta('[13] 単品・セットの画面: 描画・画面の JS・編集の印・導く値 (今の構成と依頼の構成)・JAN とロジザードは単品だけ・404', async () => {
+await ta('[15] 単品・セットの画面: 描画・画面の JS・編集の印・導く値・食い違い・JAN とロジザードは単品だけ・404', async () => {
   let r = await call('GET', '/sku/s001');
   assert.equal(r.status, 200);
   const scripts = checkScripts(r.text, 1);
@@ -635,13 +831,13 @@ await ta('[13] 単品・セットの画面: 描画・画面の JS・編集の印
   assert.equal(tokenIn(r.text), await tokenOf('s001'));
   assert.match(r.text, /data-can-save="1"/);
   assert.match(r.text, /<label class="k">JAN<\/label>/); assert.match(r.text, /ロジザードが正/);
-  const pageSet = await call('GET', '/sku/set001');
-  checkScripts(pageSet.text, 1);
-  assert.ok(!/<label class="k">JAN<\/label>/.test(pageSet.text) && !/ロジザードが正/.test(pageSet.text), 'セットに JAN・ロジザードの欄を出さない');
-  assert.match(pageSet.text, /導く値 \(今の構成/);
-  await save('set001', { components: [{ code: 's001', qty: 1 }, { code: 's002', qty: 1 }] });
+  await save('set001', { components: [{ code: 's001', qty: 1 }, { code: 's003', qty: 2 }] });
+  await promote((await observe([{ set_code: 'set001', rows: [{ code: 's001', qty: 1, sort: 1 }] }], { at: new Date(Date.now() + 240000).toISOString() })).set001);
   r = await call('GET', '/sku/set001');
-  assert.match(r.text, /NE でやること \(構成の依頼\)/); assert.match(r.text, /導く値 \(依頼の構成\)/);
+  checkScripts(r.text, 1);
+  assert.ok(!/<label class="k">JAN<\/label>/.test(r.text) && !/ロジザードが正/.test(r.text), 'セットに JAN・ロジザードの欄を出さない');
+  assert.match(r.text, /導く値 \(今の構成/); assert.match(r.text, /NE でやること \(構成の依頼\)/); assert.match(r.text, /導く値 \(依頼の構成\)/);
+  assert.match(r.text, /NE でやること \(食い違い: NE の構成が依頼と違う\)/);
   const hist = await call('GET', '/sku/set001/history');
   assert.equal(hist.status, 200); assert.match(hist.text, /構成の依頼/); assert.match(hist.text, /マスタの入力/);
   assert.equal((await call('GET', '/sku/nope')).status, 404);
@@ -651,7 +847,7 @@ await ta('[13] 単品・セットの画面: 描画・画面の JS・編集の印
   assert.equal((await call('GET', '/api/lookup?code=nope')).status, 404);
 });
 
-await ta('[13] 保存の API: 画面と同じ形で通る・名簿 (名簿に無い admin も不可・空なら誰も不可)・Origin・Content-Type・押し直し・印の違い', async () => {
+await ta('[15] 保存の API: 画面と同じ形で通る (画面のロールで書く)・名簿・Origin・Content-Type・押し直し・印の違い', async () => {
   const page = await call('GET', '/sku/s002');
   const body = { request_id: uuid(), reason: '画面から', seen: { token: tokenIn(page.text), event_id: eventIn(page.text) }, values: { name: '画面から直した', reorder_months: '2' } };
   assert.equal((await call('POST', '/api/sku/s002', { body, session: 'admin' })).status, 403);
@@ -662,8 +858,10 @@ await ta('[13] 保存の API: 画面と同じ形で通る・名簿 (名簿に無
   process.env.MASTER_EDITORS = keep;
   assert.equal((await call('POST', '/api/sku/s002', { body, origin: false })).j.error, 'origin_mismatch');
   assert.equal((await call('POST', '/api/sku/s002', { body, ctype: false })).status, 415);
+  opened.length = 0;
   const ok = await call('POST', '/api/sku/s002', { body });
   assert.equal(ok.status, 200, ok.text);
+  assert.deepEqual(opened, ['master_edit']);
   assert.deepEqual(ok.j.changed.map((c) => c.field), ['name']);
   assert.equal((await skuRow('s002')).name, '画面から直した');
   assert.equal((await call('POST', '/api/sku/s002', { body })).j.replayed, true);
@@ -673,26 +871,38 @@ await ta('[13] 保存の API: 画面と同じ形で通る・名簿 (名簿に無
   assert.equal((await call('POST', '/api/sku/s002', { body: { ...body, request_id: uuid(), values: { tax_rate: '5' } } })).status, 400);
 });
 
-await ta('[13] 保存を開いていない (MASTER_EDIT_OPEN なし / 持ち主が load) = 切替前の帯・欄は閉じる・API は 409', async () => {
+await ta('[15] 保存を開いていない (MASTER_EDIT_OPEN なし / 持ち主表が記録と違う) = 帯・欄と保存のボタンが閉じる・API は 409', async () => {
   delete process.env.MASTER_EDIT_OPEN;
   let r = await call('GET', '/sku/s001');
-  assert.match(r.text, /切替前です/);
+  assert.match(r.text, /いまは保存できません \(保存を開くスイッチ/);
+  assert.match(r.text, /data-can-save="0"/); assert.match(r.text, /id="save" disabled/);
   assert.match(r.text, /data-field="name" value="[^"]*" size="60" disabled/);
   assert.match(r.text, /<span class="tag">切替前<\/span>/);
   const body = { request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) }, values: { name: 'x' } };
-  const res = await call('POST', '/api/sku/s001', { body });
-  assert.deepEqual([res.status, res.j.reason], [409, 'before_cutover']);
+  assert.deepEqual([(await call('POST', '/api/sku/s001', { body })).status], [409]);
   process.env.MASTER_EDIT_OPEN = '1';
-  __setOwnership(null);   // 本番の持ち主表 (全部 load)
+  __setOwnership(null);   // 本番の持ち主表 (全部 load) = 切替のときの記録と違う
   r = await call('GET', '/sku/s001');
-  assert.match(r.text, /切替前です/); assert.match(r.text, /size="60" disabled/);
+  assert.match(r.text, /いまは保存できません \(持ち主表が切替のときの記録と違う\)/); assert.match(r.text, /data-can-save="0"/);
   const res2 = await call('POST', '/api/sku/s001', { body: { ...body, request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) } } });
   assert.deepEqual([res2.status, res2.j.reason], [409, 'before_cutover']);
   __setOwnership(ALL_COMPANY);
-  assert.ok(!/切替前です/.test((await call('GET', '/sku/s001')).text));
+  assert.ok(!/いまは保存できません/.test((await call('GET', '/sku/s001')).text));
 });
 
-await ta('[13] Company DB が無い・届かない = 画面は帯 (保存のボタンなし)・API は 503', async () => {
+await ta('[15] 書き込み用の接続 (COMPANY_DB_MASTER_EDIT_URL) が無い = 持ち主のロールで読むだけ・保存のボタンなし・API は 503', async () => {
+  const keep = process.env.COMPANY_DB_MASTER_EDIT_URL;
+  delete process.env.COMPANY_DB_MASTER_EDIT_URL;
+  opened.length = 0;
+  const r = await call('GET', '/sku/s001');
+  assert.equal(r.status, 200); assert.deepEqual(opened, ['deploy']);
+  assert.match(r.text, /いまは保存できません \(書き込み用の接続/); assert.match(r.text, /data-can-save="0"/);
+  const res = await call('POST', '/api/sku/s001', { body: { request_id: uuid(), seen: { token: tokenIn(r.text) }, values: { name: 'x' } } });
+  assert.deepEqual([res.status, res.j.reason], [503, 'no_write_role']);
+  process.env.COMPANY_DB_MASTER_EDIT_URL = keep;
+});
+
+await ta('[15] Company DB が無い・届かない = 画面は帯 (保存のボタンなし)・API は 503', async () => {
   factoryMode = 'down';
   let r = await call('GET', '/');
   assert.equal(r.status, 200); assert.match(r.text, /Company DB につながりません/);
@@ -701,17 +911,18 @@ await ta('[13] Company DB が無い・届かない = 画面は帯 (保存のボ�
   const res = await call('POST', '/api/sku/s001', { body: { request_id: uuid(), seen: { token: 'a'.repeat(64) }, values: { name: 'x' } } });
   assert.deepEqual([res.status, res.j.reason], [503, 'db_unreachable']);
   factoryMode = 'ok';
-  const url = process.env.COMPANY_DB_URL; delete process.env.COMPANY_DB_URL;
+  const keep = [process.env.COMPANY_DB_URL, process.env.COMPANY_DB_MASTER_EDIT_URL];
+  delete process.env.COMPANY_DB_URL; delete process.env.COMPANY_DB_MASTER_EDIT_URL;
   r = await call('GET', '/');
   assert.match(r.text, /COMPANY_DB_URL/);
   assert.equal((await call('GET', '/api/lookup?code=s001')).status, 503);
-  process.env.COMPANY_DB_URL = url;
+  [process.env.COMPANY_DB_URL, process.env.COMPANY_DB_MASTER_EDIT_URL] = keep;
 });
 
-await ta('[13] server.js: Render だけ (env + PORTAL_VARIANT)・requireAppAccess・共通の JSON parser を通さない・アプリ一覧に載る', async () => {
+await ta('[15] server.js: Render だけ (env + PORTAL_VARIANT)・requireAppAccess・共通の JSON parser を通さない・アプリ一覧に載る', async () => {
   const s = fs.readFileSync(new URL('../server.js', import.meta.url), 'utf8');
   assert.match(s, /if \(process\.env\.MASTER_EDIT_ENABLED === '1' && PORTAL_VARIANT === 'render'\) \{\r?\n\s+app\.use\('\/apps\/master-edit', requireAppAccess\('master-edit'\), masterEditRouter\);/);
-  assert.equal((s.match(/masterEditRouter/g) || []).length, 2);   // import と mount だけ
+  assert.equal((s.match(/masterEditRouter/g) || []).length, 2);
   const skip = s.indexOf("if (normalizedPath.toLowerCase().startsWith('/apps/master-edit')) return next();");
   assert.ok(skip > 0 && skip < s.indexOf('return globalJsonParser(req, res, next);'), '共通の JSON parser の除外に master-edit が無い');
   const { apps } = await import('../lib/portal-apps.js');
