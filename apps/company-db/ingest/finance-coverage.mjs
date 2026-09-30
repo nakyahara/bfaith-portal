@@ -14,6 +14,8 @@
  *   ・同じ世代の complete の再送 = request_hash が同じなら same (応答だけ失われた)・違えば 409
  *   ・無効の印 (invalidated_at = complete の後に token の無い chunk か、ほかの coverage の token の chunk が受領記録を変えた) のある世代は complete に戻れない = 409 (次の世代から)
  *   ・complete の manifest の端: settlements_through > policy の起点・evidence_chain_from ≤ policy の起点 (UTC の瞬間で比べる)。鎖の窓の連続は coordinator (D7b-1b-3) が確かめる
+ *   ・complete の manifest.policy_fingerprint = 今の policy の全期間の指紋 (違えば 409 POLICY_MISMATCH)。保存した指紋が後で今の policy と違えば
+ *     (policy を後から変えた) core.finance_coverage_state は complete_to を返さない = 次の回の updating → complete でやり直す (#1561 Codex R2 High)
  *
  * 財務の chunk との約束 (ingest/order-finance.mjs が呼ぶ):
  *   ・takeFinanceLock = chunk も coverage の要求も同じ lock (会社 × モール × scope) を取引の最初に取る (待つ・lock_timeout で 503 LOCKED)
@@ -59,7 +61,7 @@ const SELECT_COLS = [
   'complete_to::text as complete_to', ts('settlements_through'), 'source_revision::text as source_revision', 'headers_count', 'headers_checksum',
   'receipt_count', 'receipt_lines::text as receipt_lines', 'receipt_digest', 'inventory_snapshot_id', 'inventory_count', 'inventory_digest', ts('inventory_completed_at'),
   'initial_marker_id', 'initial_marker_digest', 'selected_documents_count', 'selected_documents_digest', ts('evidence_chain_from'), ts('evidence_chain_through'),
-  'expected_report_count', 'expected_report_digest', 'inventory_runs_digest', 'request_hash',
+  'expected_report_count', 'expected_report_digest', 'inventory_runs_digest', 'policy_fingerprint', 'request_hash',
   `to_char(completed_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as completed_at`,
   `to_char(invalidated_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as invalidated_at`, 'invalidated_reason',
 ].join(', ');
@@ -127,13 +129,18 @@ async function policyOrigin(db, { companyId, mall, scope, source }) {
   return `${r.f}T00:00:00+09:00`;
 }
 
+/** 今の policy の全期間の指紋 (SQL の core.finance_policy_fingerprint = JS の policyFingerprint) */
+export async function currentPolicyFingerprint(db, { companyId = COMPANY_ID, mall, scope }) {
+  return (await db.query(`select core.finance_policy_fingerprint($1::smallint, $2, $3) as f`, [companyId, mall, scope])).rows[0].f;
+}
+
 const MANIFEST_COLS = Object.keys(MANIFEST_FIELDS);
 const NULL_MANIFEST = [...MANIFEST_COLS, 'request_hash', 'completed_at', 'invalidated_at', 'invalidated_reason'].map((c) => `${c} = null`).join(', ');
 
 /**
  * updating / complete を 1 取引で。db = { query, exec } (router の pgAdapter / 試験の PGlite)。
  * @returns {{ status: 'applied'|'same'|'stale', state, generation, current_generation?, complete_to?, receipt? }}
- *   例外: BAD_REQUEST (400) / CONFLICT・RECEIPT_MISMATCH・NO_POLICY・NOT_MIGRATED (409) / LOCKED (503)
+ *   例外: BAD_REQUEST (400) / CONFLICT・RECEIPT_MISMATCH・NO_POLICY・POLICY_MISMATCH・NOT_MIGRATED (409) / LOCKED (503)
  *   hooks.afterLock = 試験の差し込み口 (lock を取った直後)
  */
 export async function applyCoverage(db, body, { companyId = COMPANY_ID, now = () => new Date(), log = () => {}, hooks = {} } = {}) {
@@ -177,6 +184,10 @@ export async function applyCoverage(db, body, { companyId = COMPANY_ID, now = ()
       } else if (cur.invalidated_at) {
         throw err('CONFLICT', `世代 ${v.generation} は ${cur.invalidated_at} に無効にされた (${cur.invalidated_reason}) = この世代では complete に戻れない。次の世代の updating から回し直す`);
       } else {
+        // 🚨 送り手が検査した policy (の指紋) が今の policy と同じこと (#1561 Codex R2 High)。違えば 409 = 回の始めに status で読み直してやり直す。
+        //    保存した指紋と今の指紋が後で違えば (policy を後から変えた) core.finance_coverage_state は complete_to を返さない
+        const fp = await currentPolicyFingerprint(db, key);
+        if (v.manifest.policy_fingerprint !== fp) throw err('POLICY_MISMATCH', `manifest.policy_fingerprint (${v.manifest.policy_fingerprint.slice(0, 12)}…) が今の policy の指紋 (${fp.slice(0, 12)}…) と違う = 送り手が検査した後に policy が変わった。次の回でやり直す`);
         if (Date.parse(v.manifest.settlements_through) <= Date.parse(origin)) throw bad(`settlements_through (${v.manifest.settlements_through}) が policy の起点 (${origin}) より後でない = 起点を覆う決済が無い`);
         // 🚨 証拠の鎖 (初期の印 + 積み上げた一覧) は policy の起点まで届いていること (#1561 Codex R1 High 2)。比べるのは UTC の瞬間 (起点 = period_from の JST 00:00・§3.1 の期間の型)。
         //    Render が確かめられるのは端だけ = 鎖の窓が途切れずにつながること (createdSince / Until の重なり・保持期間の空白) は coordinator (D7b-1b-3) が確かめる
@@ -258,6 +269,10 @@ export async function coverageStatus(db, { companyId = COMPANY_ID, mall, scope, 
     const e = (await db.query(`select complete_to::text as complete_to, generation::text as generation, source_revision::text as source_revision
        from core.finance_coverage_state($1::smallint, $2, $3, $4)`, [companyId, mall, scope, source])).rows[0];
     out.effective = e || { complete_to: null, generation: null, source_revision: null };
+    // 送り手は回の始めにこの指紋を読み、検査した policy として manifest.policy_fingerprint に入れる
+    const pol = (await db.query(`select period_from::text as period_from, period_to::text as period_to, source from core.finance_source_policy
+       where company_id = $1::smallint and mall = $2 and scope_key = $3 order by period_from, source collate "C"`, [companyId, mall, scope])).rows;
+    out.policy = { fingerprint: await currentPolicyFingerprint(db, key), rows: pol };
     if (withReceipts) out.receipts = await computeReceiptDigest(db, { companyId, mall, scope });
     await db.exec('commit');
   } catch (err0) {

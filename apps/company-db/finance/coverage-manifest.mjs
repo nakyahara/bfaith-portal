@@ -10,6 +10,7 @@
  *     🚨 51 万注文でも手元に全部を持たない: createReceiptDigester() に 1 行ずつ **並んだ順に** 渡す (順が崩れたら例外 = 黙って別の digest にしない)
  * ② request_hash = complete の要求の正規の JSON の SHA-256 (状態・世代・token・complete_to・manifest の全部)。サーバーの作る列 (completed_at など) は入れない
  * ③ validateCoverageManifest = manifest の形を確かめて正規化する (送り手は送る前に・受け口は受けたときに同じ関数で)
+ * ④ policyFingerprint = 会社 × モール × scope の policy の全期間の指紋 (SQL の core.finance_policy_fingerprint と同じ値)。manifest の policy_fingerprint
  *
  * 正規の JSON の決まり = canonical-hash.mjs (鍵の順は固定・null は null・数は安全な整数だけ)。
  *   ID と bigint (世代・source_revision・一覧 / 印の ID) = **10 進の文字列** / 件数 = 数 / 日時 = UTC の YYYY-MM-DDTHH:MM:SSZ / 日付 = YYYY-MM-DD
@@ -115,7 +116,22 @@ export const MANIFEST_FIELDS = Object.freeze({
   expected_report_count: 'count',
   expected_report_digest: 'hex',
   inventory_runs_digest: 'hex',
+  policy_fingerprint: 'hex',   // 検査した policy (その会社 × モール × scope の全期間) の指紋 = policyFingerprint (#1561 Codex R2 High)
 });
+
+// ─── ④ policy の指紋 ───
+export const POLICY_FINGERPRINT_FORMAT = 'fpf-v1';
+/**
+ * 会社 × モール × scope の finance_source_policy の **全期間** の指紋 (SQL の core.finance_policy_fingerprint と同じ値・試験で固定)。
+ *   正規の JSON {"format":"fpf-v1","policies":[{period_from, period_to (null 可), source}, …]} の SHA-256。並び = period_from → source (どちらも ASCII)
+ *   complete はこの指紋と一緒に保存され、今の policy の指紋と違えば core.finance_coverage_state は complete_to を返さない (policy を変えたら次の回でやり直す)
+ */
+export function policyFingerprint(rows) {
+  const list = rows.map((r) => ({ period_from: r.period_from, period_to: r.period_to ?? null, source: r.source }))
+    .sort((a, b) => (a.period_from < b.period_from ? -1 : a.period_from > b.period_from ? 1 : a.source < b.source ? -1 : a.source > b.source ? 1 : 0));
+  for (const r of list) if (!isRealDate(r.period_from) || (r.period_to !== null && !isRealDate(r.period_to)) || typeof r.source !== 'string') throw new Error(`policy の行の形が違う: ${JSON.stringify(r)}`);
+  return canonicalSha256({ format: POLICY_FINGERPRINT_FORMAT, policies: list });
+}
 /** 未来の時刻の許し (時計のずれ) */
 export const FUTURE_SKEW_MS = 10 * 60e3;
 

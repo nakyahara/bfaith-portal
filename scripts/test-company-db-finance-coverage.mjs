@@ -22,7 +22,7 @@ import express from 'express';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { validateFinanceRows, orderFinanceChecksum, pseudoOrderNo } from '../apps/company-db/finance/order-finance-checksum.mjs';
 import { canonicalSha256 } from '../apps/company-db/canonical-hash.mjs';
-import { createReceiptDigester, receiptDigest, coverageRequestHash, validateCoverageManifest, RECEIPT_DIGEST_FORMAT, MANIFEST_FIELDS } from '../apps/company-db/finance/coverage-manifest.mjs';
+import { createReceiptDigester, receiptDigest, coverageRequestHash, validateCoverageManifest, policyFingerprint, RECEIPT_DIGEST_FORMAT, MANIFEST_FIELDS } from '../apps/company-db/finance/coverage-manifest.mjs';
 import { applyCoverage, computeReceiptDigest, coverageStatus, financeLockKey } from '../apps/company-db/ingest/finance-coverage.mjs';
 import { validateFinanceChunk, ingestOrderFinanceChunk } from '../apps/company-db/ingest/order-finance.mjs';
 import companyDbRouter, { requireSyncKey, __setPgClientFactory } from '../apps/company-db/router.mjs';
@@ -79,13 +79,15 @@ const expected = () => receiptDigest([...ledger.values()]);
 // ─── coverage の要求 ───
 const TOK = 'tok-aaaaaaaaaaaaaaaa', TOK2 = 'tok-bbbbbbbbbbbbbbbb';
 const key = { mall: 'amazon', scope: 'jp', source: U };
+const policyFp = async () => (await one(`select core.finance_policy_fingerprint(1::smallint, 'amazon', 'jp') as f`)).f;
+const PFP = await policyFp();   // 今の policy (amazon / jp = unified [2026-01-01, 無期限)) の指紋
 const upd = (generation, run_token = TOK, x = {}) => applyCoverage(db, { state: 'updating', ...key, generation, run_token, ...x }, { log: quiet });
 const M = (rc, x = {}) => ({
   complete_to: '2026-06-10', settlements_through: '2026-06-10T15:00:00Z', source_revision: 42,   // JST 6/11 00:00 = end → complete_to は前日の 6/10
   headers_count: 3, headers_checksum: H('headers'), receipt_count: rc.count, receipt_lines: rc.lines, receipt_digest: rc.digest,
   inventory_snapshot_id: '17', inventory_count: 5, inventory_digest: H('inventory'), inventory_completed_at: '2026-06-11T01:00:00Z',
   initial_marker_id: '1', initial_marker_digest: H('marker'), selected_documents_count: 3, selected_documents_digest: H('documents'),
-  evidence_chain_from: '2025-12-01T00:00:00Z', evidence_chain_through: '2026-06-11T01:00:00Z', expected_report_count: 20, expected_report_digest: H('expected'), inventory_runs_digest: H('runs'),
+  evidence_chain_from: '2025-12-01T00:00:00Z', evidence_chain_through: '2026-06-11T01:00:00Z', expected_report_count: 20, expected_report_digest: H('expected'), inventory_runs_digest: H('runs'), policy_fingerprint: PFP,
   ...x,
 });
 const comp = (generation, run_token = TOK, manifest = M(expected()), x = {}) => applyCoverage(db, { state: 'complete', ...key, generation, run_token, manifest, ...x }, { log: quiet });
@@ -164,6 +166,19 @@ await t('🚨 Render の cursor の計算 (collate "C"・区切りの大きさ�
   assert.deepEqual(nos, ['-:2026-06-05', 'A-1', 'A-2', 'B+/x', 'Zed', 'a-lower']);
 });
 
+await t('🚨 policy の指紋: SQL (core.finance_policy_fingerprint) = JS (policyFingerprint)・手で書いた正規の JSON・並び (period_from → source)・null の period_to', async () => {
+  const cur = [{ period_from: '2026-01-01', period_to: null, source: U }];
+  assert.equal(PFP, policyFingerprint(cur));
+  assert.equal(PFP, H(`{"format":"fpf-v1","policies":[{"period_from":"2026-01-01","period_to":null,"source":"${U}"}]}`));
+  // 行が 2 つ (別の scope に置いて比べる・並びは period_from の順)
+  await pg.query(`insert into core.finance_source_policy (company_id, mall, scope_key, period_from, period_to, source) values
+    (1, 'amazon', 'fpt', '2026-03-01', null, 'amazon_settlement_flat_v2'), (1, 'amazon', 'fpt', '2025-06-01', '2026-03-01', 'amazon_settlement_flat_v1')`);
+  const two = [{ period_from: '2026-03-01', period_to: null, source: 'amazon_settlement_flat_v2' }, { period_from: '2025-06-01', period_to: '2026-03-01', source: 'amazon_settlement_flat_v1' }];
+  assert.equal((await one(`select core.finance_policy_fingerprint(1::smallint, 'amazon', 'fpt') as f`)).f, policyFingerprint(two));
+  assert.equal((await one(`select core.finance_policy_fingerprint(1::smallint, 'amazon', 'none') as f`)).f, H('{"format":"fpf-v1","policies":[]}'));   // policy なし = 空の配列
+  await pg.query(`delete from core.finance_source_policy where scope_key = 'fpt'`);
+});
+
 console.log('状態の移り方 (§3.1)');
 await t('🚨 行なしの complete = 409 (新しい世代は updating から)・updating = applied → 同じ token の再送 = same → 違う token = 409・この世代の complete の違う token = 409・新しい世代の complete = 409', async () => {
   await rejects(() => comp(5), 'CONFLICT', /updating を受けていない/);
@@ -239,6 +254,11 @@ await t('manifest の形 (400): complete_to が end の JST の日の前日で�
   // 起点 (policy の 2026-01-01 の JST 00:00 = 2025-12-31T15:00:00Z) を覆わない end
   await rejects(() => comp(6, TOK2, M(rc, { complete_to: '2025-12-31', settlements_through: '2025-12-31T15:00:00Z' })), 'BAD_REQUEST', /policy の起点/);
   await rejects(() => applyCoverage(db, { state: 'updating', ...key, source: 'amazon_settlement_flat_v1', generation: 1, run_token: TOK }), 'NO_POLICY');
+  // 🚨 送り手が検査した policy の指紋が今と違う = 409 POLICY_MISMATCH (#1561 Codex R2 High)・指紋の形は 400
+  await rejects(() => comp(6, TOK2, M(rc, { policy_fingerprint: H('old policy') })), 'POLICY_MISMATCH', /今の policy の指紋/);
+  await rejects(() => comp(6, TOK2, M(rc, { policy_fingerprint: 'x' })), 'BAD_REQUEST', /policy_fingerprint/);
+  const { policy_fingerprint, ...noFp } = M(rc);
+  await rejects(() => comp(6, TOK2, noFp), 'BAD_REQUEST', /policy_fingerprint が無い/);
   // 🚨 証拠の鎖が policy の起点まで届いていない (#1561 Codex R1 High 2): 起点 = 2026-01-01 の JST 00:00 = 2025-12-31T15:00:00Z (UTC の瞬間で比べる)
   await rejects(() => comp(6, TOK2, M(rc, { evidence_chain_from: '2025-12-31T15:00:01Z' })), 'BAD_REQUEST', /evidence_chain_from .*policy の起点 \(2025-12-31T15:00:00Z\) より後/);
   await rejects(() => comp(6, TOK2, M(rc, { evidence_chain_from: '2026-01-01T00:00:00Z' })), 'BAD_REQUEST', /evidence_chain_from/);   // UTC の 1/1 00:00 = JST の 1/1 09:00 = 起点より後
@@ -335,7 +355,7 @@ await t('source ごと: 別の source の coverage は触らない読み方 (行
   // 別の source の complete の行を直接置く (policy は 1 つなので受け口では作れない = 表に直接)
   await pg.query(`insert into core.finance_coverage select company_id, mall, scope_key, 'amazon_settlement_flat_v2', state, generation, run_token, updating_at, complete_to, settlements_through, source_revision,
       headers_count, headers_checksum, receipt_count, receipt_lines, receipt_digest, inventory_snapshot_id, inventory_count, inventory_digest, inventory_completed_at, initial_marker_id, initial_marker_digest,
-      selected_documents_count, selected_documents_digest, evidence_chain_from, evidence_chain_through, expected_report_count, expected_report_digest, inventory_runs_digest, request_hash, completed_at
+      selected_documents_count, selected_documents_digest, evidence_chain_from, evidence_chain_through, expected_report_count, expected_report_digest, inventory_runs_digest, policy_fingerprint, request_hash, completed_at
     from core.finance_coverage where source = $1`, [U]);
   const r = await sendChunk(chunkBody([['A-4', [row('2026-06-05', 'LA', { units_ordered: 1, sales_principal_jpy: 2 })]]]));
   assert.equal(r.coverage_invalidated, 2);
@@ -350,9 +370,9 @@ await t('🚨 source が 2 つ (#1561 Codex R1 High 1): 過去の source A が c
     await pg.query(`delete from core.finance_coverage where source = $1`, [A]);
     await pg.query(`insert into core.finance_coverage (company_id, mall, scope_key, source, state, generation, run_token, updating_at, complete_to, settlements_through, source_revision,
         headers_count, headers_checksum, receipt_count, receipt_lines, receipt_digest, inventory_snapshot_id, inventory_count, inventory_digest, inventory_completed_at, initial_marker_id, initial_marker_digest,
-        selected_documents_count, selected_documents_digest, evidence_chain_from, evidence_chain_through, expected_report_count, expected_report_digest, inventory_runs_digest, request_hash, completed_at)
+        selected_documents_count, selected_documents_digest, evidence_chain_from, evidence_chain_through, expected_report_count, expected_report_digest, inventory_runs_digest, policy_fingerprint, request_hash, completed_at)
       values (1, 'amazon', 'jp', $1, 'complete', 3, $2, now(), '2026-06-10', '2026-06-10T15:00:00Z', 1, 1, $3, 0, 0, $3, '1', 0, $3, '2026-06-11T00:00:00Z', '1', $3, 1, $3,
-        '2025-12-01T00:00:00Z', '2026-06-11T00:00:00Z', 0, $3, $3, $3, now())`, [A, TOK2, H('a')]);
+        '2025-12-01T00:00:00Z', '2026-06-11T00:00:00Z', 0, $3, $3, $4, $3, now())`, [A, TOK2, H('a'), PFP]);
   };
   const stA = async () => (await pg.query(`select state, invalidated_reason from core.finance_coverage where source = $1`, [A])).rows[0];
   // A の既存の行 (token 無しで入れる = 今の送り手と同じ道)
@@ -408,6 +428,52 @@ await t('🚨 complete のときだけ: complete_to (6/10) 以前の日 = comple
   await upd(13, TOK2);
   rows = await profitRows();
   assert.ok(rows.every((r) => r.day_finance_status !== 'complete' && r.contribution_before_ad_incl_jpy == null && r.g === '13' && r.rev == null));
+});
+
+console.log('policy を後から変える (#1561 Codex R2 High)・返品の状態の partial は coverage 基準 (R2 Medium)');
+const setPolicy = (set) => pg.query(`update core.finance_source_policy set ${set} where company_id = 1 and mall = 'amazon' and scope_key = 'jp'`);
+const ON = [{ complete_to: '2026-06-10', g: '13', rev: '42' }], OFF = [{ complete_to: null, g: '13', rev: null }];
+const POLICY_CHANGES = [
+  ['起点を広げる', `period_from = '2025-01-01'`, `period_from = '2026-01-01'`],
+  ['起点を狭める', `period_from = '2026-02-01'`, `period_from = '2026-01-01'`],
+  ['source を変える', `source = 'amazon_settlement_flat_v2'`, `source = '${U}'`],
+  ['終わりを付ける', `period_to = '2027-01-01'`, `period_to = null`],
+];
+await t('🚨 complete の後に policy を変える (起点を広げる・狭める・source を変える・終わりを付ける) → complete_to は null・正式な値も null / 戻せば (同じ指紋) 出る', async () => {
+  // 5 月の返品 (次の試験) を入れてから世代 13 を complete (policy の指紋 = PFP)
+  await sendChunk(chunkBody([['MAY-1', [row('2026-05-10', 'MZ', { units_ordered: 2, sales_principal_jpy: 2000 }), row('2026-05-20', 'MZ', { refund_principal_jpy: -1000, refund_principal_customer_jpy: -1000 })]]]));
+  assert.equal((await comp(13, TOK2, M(expected()))).status, 'applied');
+  const d5 = async () => (await profitRows()).find((r) => r.d === '2026-06-05');
+  const day2025 = async () => (await pg.query(`select day_finance_status from mart.amazon_profit_day_totals_range(1::smallint, 'amazon', 'jp', '2025-06-01', '2025-06-01') where row_kind = 'day'`)).rows[0].day_finance_status;
+  assert.deepEqual(await stateFn(), ON);
+  assert.equal((await d5()).day_finance_status, 'complete');
+  for (const [name, change, back] of POLICY_CHANGES) {
+    await setPolicy(change);
+    assert.notEqual(await policyFp(), PFP, name);
+    assert.deepEqual(await stateFn(), OFF, name);
+    const r = await d5();   // source を変えると 6/5 の行は採られない (行が無い) = どちらでも正式な値は無い
+    assert.ok(!r || (r.day_finance_status !== 'complete' && r.contribution_before_ad_incl_jpy == null), `${name} ${JSON.stringify(r)}`);
+    if (name === '起点を広げる') assert.equal(await day2025(), 'missing', '財務も証拠も無い 2025 年の日が complete (確定の 0) にならない');
+    await setPolicy(back);
+    assert.equal(await policyFp(), PFP, `${name} を戻す`);
+    assert.deepEqual(await stateFn(), ON, `${name} を戻す`);
+    assert.equal((await d5()).day_finance_status, 'complete', `${name} を戻す`);
+  }
+  assert.equal((await covRow()).state, 'complete');   // 行は complete のまま (読み方で null にするだけ = policy を戻せば出る・新しい policy は次の回でやり直す)
+});
+await t('🚨 返品の状態の partial = coverage 基準 (0047 の差し替え): complete_to 6/10 → 5 月の返品は monthly・6 月は partial / complete_to が null → 5 月も partial・0049 の mart の返品の状態と同じ', async () => {
+  const sku = async () => Object.fromEntries((await pg.query(`select economic_date_jst::text || ' ' || seller_sku_norm as k, refund_units_status as s
+      from mart.finance_daily_sku_range(1::smallint, 'amazon', 'jp', '2026-05-01', '2026-06-30') where refund_units_status <> 'no_refund'`)).rows.map((r) => [r.k, r.s]));
+  const mart = async () => Object.fromEntries((await pg.query(`select economic_date_jst::text || ' ' || coalesce(listing_id::text, seller_sku_norm) as k, refund_units_status as s
+      from mart.amazon_profit_daily_range(1::smallint, 'amazon', 'jp', '2026-05-01', '2026-06-30') where refund_units_status <> 'no_refund'`)).rows.map((r) => [r.k, r.s]));
+  const M_ = 'estimated_monthly_unit_price', P_ = 'estimated_partial_month_unit_price';
+  assert.deepEqual(await sku(), { '2026-05-20 mz': M_, '2026-06-07 la': P_ });   // 5/31 ≤ 6/10 = 月末までそろった / 6/30 > 6/10
+  assert.deepEqual(await mart(), { '2026-05-20 mz': M_, [`2026-06-07 ${LA}`]: P_ });
+  await setPolicy(`period_to = '2027-01-01'`);   // complete_to が null になる
+  assert.deepEqual(await sku(), { '2026-05-20 mz': P_, '2026-06-07 la': P_ });
+  assert.deepEqual(await mart(), { '2026-05-20 mz': P_, [`2026-06-07 ${LA}`]: P_ });
+  await setPolicy('period_to = null');
+  assert.deepEqual(await sku(), { '2026-05-20 mz': M_, '2026-06-07 la': P_ });
 });
 
 console.log('0051 の前 (Render が先に deploy された朝)');
@@ -475,6 +541,7 @@ await t('GET /order-finance/coverage/status: 行・effective (core.finance_cover
     ['complete', '14', '2026-06-10', '2026-06-10T15:00:00Z', '42', expected().lines]);
   assert.deepEqual(s.json.effective, { complete_to: '2026-06-10', generation: '14', source_revision: '42' });
   assert.deepEqual(s.json.receipts, expected());
+  assert.deepEqual(s.json.policy, { fingerprint: PFP, rows: [{ period_from: '2026-01-01', period_to: null, source: U }] });   // 送り手は回の始めにこれを読む
   assert.equal((await http('GET', `/order-finance/coverage/status?mall=amazon&scope=jp&source=x`)).status, 400);
   assert.equal((await http('GET', ST, { key: null })).status, 401);
   const none = await http('GET', `/order-finance/coverage/status?mall=amazon&scope=us&source=${U}`);

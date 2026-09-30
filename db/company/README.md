@@ -921,7 +921,7 @@ D7b-1 のうち coverage (決済のそろい・coordinator・レポートの一�
   - 0045 との違い: 粒度 / `closing_fee_jpy` = −Σ closing_fee で `profit_before_cogs_jpy` からも引く (§3.5b・0045 は固定の 0。今の決済には 0 = 金額は同じ) / net・unmapped・4 列は **決済の符号のまま** (0045 の費用を正にした列とは向きが逆)
   - 返品数は 0045 と同じ「計上日の月 × **受け取った** seller SKU の単価」で子ごとに計算してから正規化 SKU にまとめる (合計は 0045 と同じ)
   - `refund_units_status` (子の状態・1 つの子に表記の違う seller SKU が 2 つ以上なら弱い方): `no_refund` (本体の customer / A-to-z の返金なし) / `estimated_monthly_unit_price` / `estimated_partial_month_unit_price` (その月がまだ終わっていない = 単価が動く) / `unit_price_missing` (返金があるのに単価なし = 返品数 0 個・丸める前は null・額は `refund_unestimated_jpy`)。
-    🚨 **partial の判定は当面「計上日の月の最後の日が今日 (JST) 以降」**。D7b-1b で coverage (月末まで決済がそろったか) に置き換える
+    🚨 **partial の判定は 0051 で coverage 基準に置き換えた** (計上日の月の最後の日 > その source の complete_to か null = 月末まで決済がそろっていない。下の「決済のそろい」の節)。0047 の当面の「今日」基準はもう使わない
   - 契約: `from <= to`・最大 400 日 (両端を含む)・違えば例外 (22023 `invalid_input`)。期間の月だけを読む・関数の中だけ nested loop を使わない (0045 と同じ)
 - 試験 = `node scripts/test-company-db-finance.mjs` (0047 の節: 形の確かめ・表の CHECK・旧い形 / 今の形の受け口・版と行の形の結び付け (JS と SQL の規則の突き合わせ)・旧い版への戻しは 409 / 例外で 4 列が残る・0047 の適用前の NOT_MIGRATED と適用後の既存の行・手で計算した子の値・返品の状態の 4 つ・今の関数と同じ期間の合計が一致・契約) と
   `node scripts/test-company-db-amazon-finance.mjs` (決済の行から: 相殺する +100 / −100 と misc_fee・MFNPostageFee = 部品 4・月の手数料の行の保存則・二つの関数の合計の一致・二重の実装の一致は既存の列のまま)
@@ -979,7 +979,12 @@ select economic_date_jst, seller_sku_norm, unclassified_component_count, unclass
 
 - 表 = 会社 × モール × scope × source の **1 行 = 今の世代の状態** (`state` = `updating` / `complete`・`generation` = coverage 専用の連番・`run_token`)。列は §3.1 の一覧 (manifest = `complete_to`・`settlements_through`・`source_revision`・見出し・受領・一覧・初期の印・採った文書・証拠の鎖・期待の report の数と digest) + `request_hash`・`completed_at` + 無効の印 (`invalidated_at` / `invalidated_reason`)。
   CHECK = complete なら manifest が全部そろう・`complete_to` = `settlements_through` の JST の日の前日・無効の印の組
-- `core.finance_coverage_state(会社, モール, scope, source)` を **差し替えた** (0049 の差し込み口。同じ形): `complete_to` と `source_revision` = **complete のときだけ** / `generation` = 今の世代 (updating でも) / 行なし = 全部 null
+- `core.finance_coverage_state(会社, モール, scope, source)` を **差し替えた** (0049 の差し込み口。同じ形): `complete_to` と `source_revision` = **complete かつ policy の指紋が今と同じときだけ** / `generation` = 今の世代 (updating でも) / 行なし = 全部 null
+- 🚨 **policy の指紋** `core.finance_policy_fingerprint(会社, モール, scope)` = その会社 × モール × scope の `finance_source_policy` の全期間 (source・period_from・period_to) の正規の JSON `{"format":"fpf-v1","policies":[…]}` の SHA-256 (JS の `policyFingerprint` と同じ値)。
+  complete の manifest に `policy_fingerprint` (送り手が回の始めに status で読んだ値) を入れ、今の指紋と違えば 409 `POLICY_MISMATCH`。保存した指紋が **後で今の policy と違えば** (起点を広げる・狭める・source を変える・終わりを付ける) complete_to は null と読む
+  (前の complete を新しい期間に流用しない = 財務も証拠も無い日を確定の 0 にしない・#1561 Codex R2 High)。**policy を変えたら、次の回の updating → complete (新しい指紋) でやり直す**。policy を元に戻せば (同じ指紋) 前の complete がまた効く
+- 🚨 **`mart.finance_daily_sku_range` (0047) を 0051 で差し替えた**: 返品の状態の `estimated_partial_month_unit_price` の判定を当面の「今日」基準から **coverage の complete_to** 基準に = 計上日の月の最後の日 > その行の source の complete_to (または null) なら partial (§3.2・#1561 Codex R2 Medium)。
+  0049 の mart の再判定と同じ条件 (矛盾しない)。引数・戻り・金額の式は 0047 のまま。**coverage が complete になるまでは返品のある行は全部 partial** (0049 の正式な利益は元々 null)
 - **状態の移り方** (受け口 `ingest/finance-coverage.mjs` が 1 取引・財務の chunk と同じ advisory lock の中で):
   - 古い世代 → `stale` (何もしない) / 新しい世代は **updating からだけ** (直接の complete = 409)。新しい世代の updating は前の complete を無効にする (manifest の列を空に)
   - 同じ世代・同じ token の updating の再送 = `same` / 違う token = 409 / 同じ世代の complete → updating = 409
@@ -1005,7 +1010,7 @@ select economic_date_jst, seller_sku_norm, unclassified_component_count, unclass
   - 0051 の前 (Render の deploy が migrate より先): token の無い chunk は今までどおり・token 付きの chunk と coverage の口は 409 `not_migrated`
 - 受け口 (`router.mjs`・鍵は server.js の `/apps/company-db/sync/order-finance` の前方一致に入る):
   - `POST /apps/company-db/sync/order-finance/coverage` `{ state, mall, scope, source, generation, run_token, manifest? (complete だけ), request_hash? }` → `{ status: applied | same | stale, state, generation, current_generation?, complete_to?, receipt? }`
-  - `GET /apps/company-db/sync/order-finance/coverage/status?mall&scope&source[&receipts=1]` → `{ coverage: 行 | null, effective: core.finance_coverage_state の値, receipts? }` (送り手が回の始めに Render の今の世代を読む・世代と版は 10 進の文字列)
+  - `GET /apps/company-db/sync/order-finance/coverage/status?mall&scope&source[&receipts=1]` → `{ coverage: 行 | null, effective: core.finance_coverage_state の値, policy: { fingerprint, rows }, receipts? }` (送り手が回の始めに Render の今の世代と policy の指紋を読む・世代と版は 10 進の文字列)
 - 試験 = `node scripts/test-company-db-finance-coverage.mjs` (PGlite・本物の router を HTTP でも: 状態の移り方の全部の場面・receipt digest の一致 / 不一致 と JS / cursor の一致・manifest の形・token 付きの chunk の 409・順序の逆転・3 つの受け口が同じ lock・token 無しの chunk で complete が落ちる・0049 の mart が正式な値を出す・0051 の前)。
   🚨 PGlite は 1 接続 = 「lock を持ったまま止まった chunk を新しい世代の updating が待つ」の 2 接続の待ちは書けない (同じ lock を持つことと、lock の前で止めた chunk が 409 になることで確かめた)
 

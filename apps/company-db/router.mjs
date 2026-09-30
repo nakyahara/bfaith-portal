@@ -305,9 +305,9 @@ router.post('/order-finance', requireSyncKey, shipmentsJson, shipmentsParserErro
  * 決済のそろい (coverage・0051・D7b-1b-2。本体 = ingest/finance-coverage.mjs。設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.1):
  *   POST /apps/company-db/sync/order-finance/coverage   { state: 'updating' | 'complete', mall, scope, source, generation, run_token, manifest? (complete だけ), request_hash? }
  *     → { status: 'applied' | 'same' | 'stale', state, generation, current_generation?, complete_to?, receipt? }
- *       400 = 形 / 409 = CONFLICT (状態の移り方で受けない)・RECEIPT_MISMATCH (受領記録が manifest と違う = detail.render に Render の数と digest)・NO_POLICY・not_migrated (0051 の前) / 503 LOCKED (lock が空かない)
+ *       400 = 形 / 409 = CONFLICT (状態の移り方で受けない)・RECEIPT_MISMATCH (受領記録が manifest と違う = detail.render に Render の数と digest)・NO_POLICY・POLICY_MISMATCH (manifest.policy_fingerprint が今の policy と違う)・not_migrated (0051 の前) / 503 LOCKED (lock が空かない)
  *   GET  /apps/company-db/sync/order-finance/coverage/status?mall&scope&source[&receipts=1]
- *     → { mall, scope, source, coverage: 行 | null, effective: { complete_to, generation, source_revision } (core.finance_coverage_state), receipts?: { count, lines, digest } }
+ *     → { mall, scope, source, coverage: 行 | null, effective: { complete_to, generation, source_revision } (core.finance_coverage_state), policy: { fingerprint, rows }, receipts?: { count, lines, digest } }
  *       世代・source_revision = 10 進の文字列。0051 の前は 409 { error: 'not_migrated' }
  *   🚨 送るのは miniPC の coordinator (D7b-1b-3・後の PR) だけ。今の送り手 (daily-sync) は coverage を送らない = complete が無い間は正式な利益は全部 null のまま
  *   🚨 鍵の検査は server.js の '/apps/company-db/sync/order-finance' の前方一致 (body parser より前) に入る
@@ -328,7 +328,7 @@ router.post('/order-finance/coverage', requireSyncKey, coverageJson, parserError
     res.json({ ...r, ms: Date.now() - t0 });
   } catch (e) {
     if (e.code === 'NOT_MIGRATED') return res.status(409).json({ error: 'not_migrated', detail: 'migration 0051 (core.finance_coverage) is not applied', code: e.code });
-    const status = e.code === 'BAD_REQUEST' ? 400 : (e.code === 'CONFLICT' || e.code === 'RECEIPT_MISMATCH' || e.code === 'NO_POLICY') ? 409 : e.code === 'LOCKED' ? 503 : 500;
+    const status = e.code === 'BAD_REQUEST' ? 400 : (e.code === 'CONFLICT' || e.code === 'RECEIPT_MISMATCH' || e.code === 'NO_POLICY' || e.code === 'POLICY_MISMATCH') ? 409 : e.code === 'LOCKED' ? 503 : 500;
     console.error(`[company-db coverage] ${tag} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
     res.status(status).json({ error: String(e.message).slice(0, 400), code: e.code || null, ...(e.detail ? { detail: e.detail } : {}) });
   } finally { if (client) { try { await client.end(); } catch { /* 閉じられなくても応答は出す */ } } }

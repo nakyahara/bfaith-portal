@@ -182,6 +182,10 @@ await ta('[!] 0051 (13 §3.1・D7b-1b-2): 決済のそろい core.finance_covera
   assert.equal((await q(`select pg_get_function_result('core.finance_coverage_state(smallint,text,text,text)'::regprocedure) as r`))[0].r, 'TABLE(complete_to date, generation bigint, source_revision bigint)');
   assert.deepEqual(await q(`select * from core.finance_coverage_state(1::smallint, 'amazon', 'jp', 'amazon_settlement_unified')`), [{ complete_to: null, generation: null, source_revision: null }]);
   assert.equal((await q(`select count(*)::int as n from core.finance_coverage`))[0].n, 0);   // 作るだけ (値は coordinator = D7b-1b-3 が送る)
+  // policy の指紋 (#1561 Codex R2 High) と、0047 の関数の差し替え (partial = coverage 基準・同じ引数と戻り・R2 Medium)
+  assert.match((await q(`select core.finance_policy_fingerprint(1::smallint, 'amazon', 'jp') as f`))[0].f, /^[0-9a-f]{64}$/);
+  const src = (await q(`select prosrc as s from pg_proc where oid = 'mart.finance_daily_sku_range(smallint,text,text,date,date)'::regprocedure`))[0].s;
+  assert.ok(src.includes('core.finance_coverage_state') && !src.includes('statement_timestamp'), '0047 の partial が今日基準のまま');
 });
 
 await ta('[!] 03 §10: 円の金額列 (*_jpy) はすべて bigint', async () => {
