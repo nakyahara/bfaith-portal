@@ -40,6 +40,7 @@ export const RULES_2B1 = Object.freeze({
  *   ふりがな → **検索名称** (CSV の文字そのまま・検索名称2 は変わらない = 対象外の列として前後が同じ)・
  *   仕入単価 = **文字のまま** (CSV の "5200" → ロジザードの "5200")・
  *   取り込んだ商品のシステムの列 = **import_stamp** (登録日時は変わらない・変更日時とインポート日時は取込の時刻に変わる = 値が同じ商品も)。
+ *   import_stamp = 2 つが同じ・実在する JST の 14 桁・前の値より後・**取込の時刻の窓の中** (押した時刻 − 10 分 〜 結果を読んだ時刻 + 10 分。Codex #1556 R1 High)
  * observe の列がゼロ = decided: true
  */
 export const RULES_2B2 = Object.freeze({
@@ -60,8 +61,19 @@ export const RULES_2B2 = Object.freeze({
  */
 export const RULES_NIGHTLY = RULES_2B2;
 
-/** 取込の時刻の印 (ロジザードの 変更日時・インポート日時 = YYYYMMDDHHMMSS の 14 桁。2026-09-30 の実機) */
+/** 取込の時刻の印 (ロジザードの 変更日時・インポート日時 = YYYYMMDDHHMMSS の 14 桁・JST。2026-09-30 の実機) */
 const STAMP_RE = /^\d{14}$/;
+/** 実在する JST の日時の 14 桁か (2030-02-30・25 時などは違う) */
+export function isRealStamp(s) {
+  if (!STAMP_RE.test(String(s))) return false;
+  const [y, mo, d, h, mi, se] = [0, 4, 6, 8, 10, 12].map((i, k) => Number(String(s).slice(i, k === 0 ? 4 : i + 2)));
+  const t = new Date(Date.UTC(y, mo - 1, d, h, mi, se));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d && t.getUTCHours() === h && t.getUTCMinutes() === mi && t.getUTCSeconds() === se;
+}
+/** epoch ms → JST の 14 桁 (ロジザードの印と同じ形) */
+export const jstStamp = (ms) => new Date(Number(ms) + 9 * 3600 * 1000).toISOString().replace(/[-:T]/g, '').slice(0, 14);
+/** 取込の時刻の窓の余白 (ロジザードの時計とこの回の時計のずれ・処理の長さ。狭すぎ = 誤って verify_failed (人が見る = 安全側)) */
+export const STAMP_TOLERANCE_MS = 10 * 60 * 1000;
 
 /** import_stamp で取込の時刻の印として照らす列 (登録日時は印ではない = 変わらない) */
 const STAMP_COLS = new Set(['変更日時', 'インポート日時']);
@@ -100,8 +112,12 @@ export function compileRules(rules) {
  * @param {object} [p.rules]
  * @returns {{ ok: boolean, decided: boolean, rules_version: string, diffs: object[], observed: { targets: object[], imported_system: object[] }, counts: object }}
  */
-export function verifyImport({ table, pre, post, rules = RULES_2B1 }) {
+export function verifyImport({ table, pre, post, rules = RULES_2B1, importWindow = null }) {
   const R = compileRules(rules);
+  // import_stamp = 取込の時刻の窓が要る (押した時刻 − 余白 〜 結果の時刻 + 余白・JST の 14 桁。呼び手 = エンジンが記録から渡す。Codex #1556 R1 High)
+  if (R.importedSystem === 'import_stamp' && !(importWindow && isRealStamp(importWindow.from) && isRealStamp(importWindow.to) && importWindow.from <= importWindow.to)) {
+    throw new Error('import_stamp には取込の時刻の窓 (importWindow = { from, to } の JST 14 桁) が要る');
+  }
   if (!pre || !pre.ok || !post || !post.ok) throw new Error('直前と直後の一覧 (ok) が要る');
   const H = LZ_SHOHIN.header;
   const diffs = [], observed = { targets: [], imported_system: [] };
@@ -143,8 +159,9 @@ export function verifyImport({ table, pre, post, rules = RULES_2B1 }) {
     if (R.importedSystem === 'import_stamp') {
       const u = b.cells[colIndex('変更日時')], im = b.cells[colIndex('インポート日時')];
       const uPre = a.cells[colIndex('変更日時')], imPre = a.cells[colIndex('インポート日時')];
-      const why = !STAMP_RE.test(u) || !STAMP_RE.test(im) ? 'not_14_digits' : u !== im ? 'not_equal' : !(u > uPre) || !(im > imPre) ? 'not_after_pre' : null;
-      if (why) diffs.push({ id, kind: 'import_stamp_bad', why, pre: { 変更日時: uPre, インポート日時: imPre }, post: { 変更日時: u, インポート日時: im } });
+      const why = !STAMP_RE.test(u) || !STAMP_RE.test(im) ? 'not_14_digits' : !isRealStamp(u) || !isRealStamp(im) ? 'not_real_datetime' : u !== im ? 'not_equal'
+        : !(u > uPre) || !(im > imPre) ? 'not_after_pre' : u < importWindow.from || u > importWindow.to ? 'outside_import_window' : null;
+      if (why) diffs.push({ id, kind: 'import_stamp_bad', why, pre: { 変更日時: uPre, インポート日時: imPre }, post: { 変更日時: u, インポート日時: im }, window: importWindow });
     }
   }
   let untouched = 0;

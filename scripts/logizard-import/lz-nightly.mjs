@@ -172,10 +172,10 @@ export async function runNightly({ dataDir, client, checkInit, localInitFile, wi
     if (!st.notified) return finish({ state: 'stopped', reason: 'stop_notice_pending' });
     // 前の夜の回が未確かめ = その夜は確かめのやり直しだけ (L-25)
     const runId = st.run.run_id;
+    if (!startAllowed(POLICIES.nightly, 'verify', nowMs())) return finish({ state: 'skipped', reason: 'window_closed' });   // 振り分けの間に窓を過ぎた (Render の時計) = 済みの印を書かない
     writeMarker({ kind: 'verify_again', run_id: runId });   // もうある (同じ夜の 2 回目) でも確かめ直してよい (状態の機械が 1 回ずつにする)
-    if (!startAllowed(POLICIES.nightly, 'verify', nowMs())) return finish({ state: 'skipped', reason: 'window_closed' });   // 振り分けの間に窓を過ぎた (Render の時計)
     const r = await verifyAgainFn({ policy: POLICIES.nightly, runId, locateRun: () => nightlyRunDir(dataDir, runId), context: {}, now: new Date(nowMs()),
-      localInitFile, client, checkInit, withSession, capabilities, notify: engineNotify, createGuard, log, ...minRows });
+      localInitFile, client, checkInit, withSession, capabilities, notify: engineNotify, createGuard, log, perfNow, ...minRows });
     return finish({ state: 'verify_again', runId, result: r.state, reason: r.reason || null });
   }
   if (STOP_STATES.includes(st.state)) return finish({ state: 'stopped', reason: st.state });
@@ -203,7 +203,7 @@ export async function runNightly({ dataDir, client, checkInit, localInitFile, wi
   if (!writeMarker({ kind: 'import', target_as_of: target, source_run_id: ident.source_run_id })) return finish({ state: 'already', reason: 'concurrent' });   // 同時の起動 = ほかが先に書いた = 取り込まない
   const r = await importOneFn({ policy: POLICIES.nightly, runsDir: path.join(dataDir, 'lz-import', 'runs'), csvBuf: t.csvBuf,
     csv: { sha256: ident.csv_sha256, rows: ident.rows, target_as_of: ident.target_as_of, source_run_id: ident.source_run_id },
-    context: { artifact }, now: new Date(nowMs()), localInitFile, client, checkInit, withSession, capabilities, notify: engineNotify, createGuard, log, ...minRows });
+    context: { artifact }, now: new Date(nowMs()), localInitFile, client, checkInit, withSession, capabilities, notify: engineNotify, createGuard, log, perfNow, ...minRows });
   return finish({ state: 'imported', runId: r.runId, result: r.state });
 }
 

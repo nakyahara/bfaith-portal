@@ -44,13 +44,13 @@ const TARGET = '2030-01-16', RUN_DIR = 'lzd_20300116T070000000Z_abcdef';
 const NIGHT = JST('2030-01-17T00:20:00'), DAY = JST('2030-01-17T08:40:00');
 
 /** 前の日 (TARGET) の lz-daily の正式な証跡と CSV */
-function setupData({ verdict = 'pass', portalOk = true } = {}) {
+function setupData({ verdict = 'pass', portalOk = true, rows = DAILY } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzn-'));
   const rel = `lz-daily/${TARGET}/${RUN_DIR}/cdb_logizard_shohinmaster_upload.csv`;
   fs.mkdirSync(path.join(dataDir, path.dirname(rel)), { recursive: true });
-  const buf = dailyBuf();
+  const buf = csvBuf(['形式/型番', '商品名', 'ふりがな', '仕入単価', '取引先id'], rows);
   fs.writeFileSync(path.join(dataDir, rel), buf);
-  writeEvidence(dataDir, 'lz-daily', { state: 'complete', version: 'lzd-v3', portal: { ok: portalOk, stored: portalOk }, as_of: TARGET, run_id: RUN_DIR, verdict, deadline: '2030-01-17T01:00:00+09:00', csv: { path: rel, sha256: sha(buf), rows: DAILY.length } },
+  writeEvidence(dataDir, 'lz-daily', { state: 'complete', version: 'lzd-v3', portal: { ok: portalOk, stored: portalOk }, as_of: TARGET, run_id: RUN_DIR, verdict, deadline: '2030-01-17T01:00:00+09:00', csv: { path: rel, sha256: sha(buf), rows: rows.length } },
     { now: new Date('2030-01-15T22:00:00Z'), warn: () => {} });
   return dataDir;
 }
@@ -705,10 +705,19 @@ await ta('[24] 止まった状態でも同じ回の鍵が生きている (前の
  * 偽物のロジザード (9/30 の実機の動き): 取込 = 商品名・検索名称 (ふりがな)・仕入単価 (文字のまま)・商品予備項目００３ を CSV のとおりに・
  * 変更日時とインポート日時を取込の時刻 (14 桁) に (値が同じ商品も)・登録日時は変えない。結果の文 = 総件数 = 処理件数 (処理不要 0)
  */
-function realLikeLz({ over = {} } = {}) {
+function realLikeLz({ over = {}, ids = ['A-1', 'B-2', 'C-3'], same = {}, now = null } = {}) {
   const H = LZ_SHOHIN.header, col = (n) => H.indexOf(n);
-  const cells = (id) => { const c = H.map((h) => `${h}-${id}`); Object.assign(c, { [col('商品ID')]: id, [col('削除フラグ')]: '0', [col('登録日時')]: '20300101000000', [col('変更日時')]: '20300110000000', [col('インポート日時')]: '20300110000000' }); return c; };
-  const st = { lz: new Map(['A-1', 'B-2', 'C-3'].map((id) => [id, cells(id)])), bc: [['A-1', 'a', '4900000000001'], ['B-2', 'b', '4900000000002'], ['C-3', 'c', '4900000000003']], calls: [], stamp: '20300117002130' };
+  const cells = (id) => {
+    const c = H.map((h) => `${h}-${id}`);
+    Object.assign(c, { [col('商品ID')]: id, [col('削除フラグ')]: '0', [col('登録日時')]: '20300101000000', [col('変更日時')]: '20300110000000', [col('インポート日時')]: '20300110000000' });
+    // 前から CSV と同じ値の商品 (取り込んでも対象の列は変わらない = 印だけ進む)
+    if (same[id]) { const [n, f, p, s] = same[id]; Object.assign(c, { [col('商品名')]: n, [col('検索名称')]: f, [col('仕入単価')]: p, [col('商品予備項目００３')]: s }); }
+    return c;
+  };
+  const st = { lz: new Map(ids.map((id) => [id, cells(id)])), bc: ids.map((id, i) => [id, id.toLowerCase(), String(4900000000000 + i)]), calls: [] };
+  // 印 = ロジザードの取込の時刻 (JST 14 桁)。Render の時刻 (now) があればそこから・商品ごとに秒が進む (長い取込)
+  const V = { jstStamp: (ms) => new Date(Number(ms) + 9 * 3600 * 1000).toISOString().replace(/[-:T]/g, '').slice(0, 14) };
+  const stampOf = (i) => (now ? V.jstStamp(now() + (over.stampOffsetMs ?? 5000) + Math.floor(i / 50) * 1000) : '20300117002130');   // stampOffsetMs = 窓の外の印 (別の時刻の取込)
   let exported = 0;
   const ops = {
     exportShohin: async () => {
@@ -722,12 +731,16 @@ function realLikeLz({ over = {} } = {}) {
       guard.check('実行ボタン');
       onExecuteIssued();
       st.calls.push('execute');
+      if (over.executeTakes) over.executeTakes();   // 取込に時間がかかる (この回の単調な時計を進める)
       const rows = iconv.decode(fs.readFileSync(st.previewed), 'cp932').split('\r\n').slice(1).map((l) => l.split(',').map((x) => x.replace(/^"|"$/g, '')));
-      for (const r of rows) {
+      rows.forEach((r, i) => {
         const c = st.lz.get(r[0]);
+        const unchanged = c[col('商品名')] === r[1] && c[col('検索名称')] === r[2] && c[col('仕入単価')] === r[3] && c[col('商品予備項目００３')] === r[4];
         c[col('商品名')] = r[1]; c[col('検索名称')] = r[2]; c[col('仕入単価')] = r[3]; c[col('商品予備項目００３')] = r[4];
-        c[col('変更日時')] = st.stamp; c[col('インポート日時')] = over.importStampLag ? '20300117002131' : st.stamp;
-      }
+        if (unchanged && over.noStampForSame) return;   // 値が同じ商品の印を進めない (= 取り込まれていない行)
+        const s = stampOf(i);
+        c[col('変更日時')] = s; c[col('インポート日時')] = over.importStampLag && i === rows.length - 1 ? stampOf(i + 60) : s;
+      });
       if (over.touchBarcode) st.bc[0][2] = '4900000000999';
       return { executeIssued: true, confirm: 'clicked', reason: null, resultText: `インポート結果 総件数 : ${rows.length} 処理件数 : ${rows.length} 処理不要件数 : 0 エラー件数 : 0` };
     },
@@ -747,7 +760,7 @@ await ta('[25] 2b-2b 端から端まで (本物の nightly の決まり・本物
   // 手の取込の義務 (A-1 = 今夜の成果物にある = 閉じる・Z-9 = 無い = 残る)
   for (const pid of ['A-1', 'Z-9']) p.db.prepare('INSERT INTO reapply_obligations (session_id, product_id, created_at) VALUES (?, ?, ?)').run('ms_e2e', pid, NIGHT - 3600000);
   const dataDir = setupData();
-  const lz = realLikeLz();
+  const lz = realLikeLz({ same: { 'B-2': ['B', 'B', '0', '0002'] }, now: () => p.clock.now });   // B-2 = 前から CSV と同じ値 = 印だけ進む (9/30 の実機の 0726-001868 と同じ)
   const { sent, o } = e2eOpts(p, dataDir, lz);
   const r = await N.runNightly(o);
   const st = S.getStatus(p.db, { now: p.clock.now });
@@ -766,10 +779,11 @@ await ta('[25] 2b-2b 端から端まで (本物の nightly の決まり・本物
 });
 
 await ta('[26] 2b-2b 端から端まで: 商品は合うがバーコードが変わった = verify_failed (両方が合うときだけ verified) / 取込の時刻の印が食い違う = verify_failed / 知らせる・ping しない', async () => {
-  for (const [over, why] of [[{ touchBarcode: true }, 'バーコード'], [{ importStampLag: true }, '変更日時とインポート日時が違う']]) {
+  for (const [over, why] of [[{ touchBarcode: true }, 'バーコード'], [{ importStampLag: true }, '変更日時とインポート日時が違う'],
+    [{ stampOffsetMs: 30 * 60000 }, '印が窓の後 (30 分後 = 別の取込で進んだ)'], [{ stampOffsetMs: -30 * 60000 }, '印が窓の前 (押す前の別の取込)']]) {
     const p = portal();
     p.putArtifact();
-    const lz = realLikeLz({ over });
+    const lz = realLikeLz({ over, now: () => p.clock.now });
     const { sent, o } = e2eOpts(p, setupData(), lz);
     const r = await N.runNightly(o);
     assert.deepEqual([r.result, S.getStatus(p.db, { now: p.clock.now }).state, r.ping], ['verify_failed', 'verify_failed', null], why);
@@ -782,7 +796,7 @@ await ta('[27] 2b-2b 端から端まで: 取込の後の書き出しの一時の
   const p = portal();
   p.putArtifact();
   const dataDir = setupData();
-  const lz = realLikeLz({ over: { postShohinFailsOnce: true } });
+  const lz = realLikeLz({ over: { postShohinFailsOnce: true }, now: () => p.clock.now });
   let x = e2eOpts(p, dataDir, lz);
   let r = await N.runNightly(x.o);
   assert.deepEqual([r.result, S.getStatus(p.db, { now: p.clock.now }).state, r.ping], ['imported_unverified', 'imported_unverified', null]);
@@ -797,7 +811,7 @@ await ta('[27] 2b-2b 端から端まで: 取込の後の書き出しの一時の
   const p2 = portal();
   p2.putArtifact();
   const d2 = setupData();
-  const lz2 = realLikeLz({ over: { postShohinFailsOnce: true } });
+  const lz2 = realLikeLz({ over: { postShohinFailsOnce: true }, now: () => p2.clock.now });
   r = await N.runNightly(e2eOpts(p2, d2, lz2).o);
   fs.rmSync(N.nightlyRunDir(d2, r.runId), { recursive: true, force: true });
   p2.clock.now = NIGHT + 86400000;
@@ -809,30 +823,31 @@ await ta('[28] 2b-2b 端から端まで: Render の時計の境目 (00:49:59 = �
   // 境目 (1 秒前 = 始める / ちょうど = 知らせだけ / 振り分けの間に過ぎた = 静かにしない)
   let p = portal({ at: JST('2030-01-17T00:49:59.000') });
   p.putArtifact();
-  let lz = realLikeLz();
+  let lz = realLikeLz({ now: () => p.clock.now });
   let r = await N.runNightly(e2eOpts(p, setupData(), lz).o);
   assert.deepEqual([r.state, r.result], ['imported', 'verified']);
   p = portal({ at: JST('2030-01-17T00:50:00.000') });
   p.putArtifact();
-  lz = realLikeLz();
+  lz = realLikeLz({ now: () => p.clock.now });
   r = await N.runNightly(e2eOpts(p, setupData(), lz).o);
   assert.deepEqual([r.state, lz.st.calls], ['notify_only', []]);
   p = portal({ at: JST('2030-01-17T00:49:59.900') });
   p.putArtifact();
-  lz = realLikeLz();
+  lz = realLikeLz({ now: () => p.clock.now });
   const { c, perfNow } = perfClock();
-  const y = e2eOpts(p, setupData(), lz, { perfNow });
+  const dClosed = setupData();
+  const y = e2eOpts(p, dClosed, lz, { perfNow });
   const origR = y.o.client.nightlyReadiness;
   y.o.client = { ...y.o.client, nightlyReadiness: async (q) => { const res = await origR(q); c.t += 500; return res; } };   // readiness の間に 0.5 秒 = 00:50:00.400
   r = await N.runNightly(y.o);
-  assert.deepEqual([r.state, r.reason, lz.st.calls, N.summarize(r).code], ['skipped', 'window_closed', [], 3]);
+  assert.deepEqual([r.state, r.reason, lz.st.calls, N.summarize(r).code, fs.existsSync(N.nightlyMarker(dClosed, '2030-01-17'))], ['skipped', 'window_closed', [], 3, false], '済みの印を書かない');
   // miniPC の壁時計が 3 時間ずれている (Date.now を差し替え) = 判断は Render の時計
   const realNow = Date.now;
   Date.now = () => realNow() + 3 * 3600000;
   try {
     p = portal();
     p.putArtifact();
-    lz = realLikeLz();
+    lz = realLikeLz({ now: () => p.clock.now });
     r = await N.runNightly(e2eOpts(p, setupData(), lz).o);
     assert.deepEqual([r.state, r.result], ['imported', 'verified']);
   } finally { Date.now = realNow; }
@@ -841,6 +856,101 @@ await ta('[28] 2b-2b 端から端まで: Render の時計の境目 (00:49:59 = �
   assert.throws(() => { 'use strict'; E.POLICIES.nightly.rules = null; });
   const copy = { ...E.POLICIES.nightly, rules: E.POLICIES.test.rules };
   assert.throws(() => E.assertPolicyReady(copy), /POLICIES に無い/);
+});
+
+await ta('[29] 2b-2b 端から端まで (Codex #1556 R1): 値が同じ商品は印だけ進む = verified / 印が進まない (取り込まれていない行) = verify_failed / 記録に取込の時刻の窓 (押した時刻 − 10 分 〜 結果の時刻 + 10 分・Render の時計) / 窓の無い記録の確かめのやり直し = verify_failed', async () => {
+  const same = { 'A-1': ['新しい名前', '新しい名前', '1200', '0007'], 'B-2': ['B', 'B', '0', '0002'] };
+  let p = portal();
+  p.putArtifact();
+  let d = setupData();
+  let lz = realLikeLz({ same, now: () => p.clock.now });
+  let r = await N.runNightly(e2eOpts(p, d, lz).o);
+  assert.deepEqual([r.result, S.getStatus(p.db, { now: p.clock.now }).state], ['verified', 'verified'], '全部が値の同じ商品 = 印だけ進む = verified');
+  const rec = JSON.parse(fs.readFileSync(path.join(N.nightlyRunDir(d, r.runId), 'import.json'), 'utf8'));
+  const V = await import('../apps/master-decisions/lz-import-verify.mjs');
+  assert.deepEqual([rec.stamp_window.from <= V.jstStamp(p.clock.now), V.jstStamp(p.clock.now) <= rec.stamp_window.to, rec.stamp_window.from, rec.execute_at >= p.clock.now],
+    [true, true, V.jstStamp(rec.execute_at - V.STAMP_TOLERANCE_MS), true], '窓 = Render の時計の押した時刻から');
+  assert.deepEqual([rec.stamp_window.to, rec.result_at >= rec.execute_at], [V.jstStamp(rec.result_at + V.STAMP_TOLERANCE_MS), true], '窓の終わり = 結果を読んだ時刻 + 余白');
+  // 窓の始め = 押した時刻 − 10 分・終わり = 結果を読んだ時刻 + 10 分 (取込に 2 分かかる。ぎりぎり内側の印 = verified)
+  for (const [offset, why] of [[-(10 * 60000 - 30000), '押した時刻の 9 分 30 秒前 (始めの内側)'], [10 * 60000 + 60000, '押した時刻の 11 分後 = 結果の時刻の 9 分後 (終わりの内側)']]) {
+    p = portal();
+    p.putArtifact();
+    const { c, perfNow } = perfClock();
+    lz = realLikeLz({ over: { stampOffsetMs: offset, executeTakes: () => { c.t += 120000; } }, now: () => p.clock.now });
+    r = await N.runNightly(e2eOpts(p, setupData(), lz, { perfNow }).o);
+    assert.deepEqual([r.result, S.getStatus(p.db, { now: p.clock.now }).state], ['verified', 'verified'], why);
+  }
+  // 印が進まない = 取り込まれていない
+  p = portal();
+  p.putArtifact();
+  lz = realLikeLz({ same, over: { noStampForSame: true }, now: () => p.clock.now });
+  r = await N.runNightly(e2eOpts(p, setupData(), lz).o);
+  assert.deepEqual([r.result, S.getStatus(p.db, { now: p.clock.now }).state, r.ping], ['verify_failed', 'verify_failed', null]);
+  // 確かめのやり直しも記録の窓で照らす (1 夜目の窓の外の印 = 次の夜も verify_failed)
+  p = portal();
+  p.putArtifact();
+  d = setupData();
+  lz = realLikeLz({ over: { postShohinFailsOnce: true, stampOffsetMs: 30 * 60000 }, now: () => p.clock.now });
+  r = await N.runNightly(e2eOpts(p, d, lz).o);
+  assert.equal(r.result, 'imported_unverified');
+  p.clock.now = NIGHT + 86400000;
+  r = await N.runNightly(e2eOpts(p, d, lz).o);
+  assert.deepEqual([r.state, r.result, S.getStatus(p.db, { now: p.clock.now }).state], ['verify_again', 'verify_failed', 'verify_failed'], '窓の外の印は次の夜も差');
+  // 窓の無い記録 (前の版の記録) の確かめのやり直し = 記録の壊れ = verify_failed
+  p = portal();
+  p.putArtifact();
+  d = setupData();
+  lz = realLikeLz({ over: { postShohinFailsOnce: true }, now: () => p.clock.now });
+  r = await N.runNightly(e2eOpts(p, d, lz).o);
+  const f = path.join(N.nightlyRunDir(d, r.runId), 'import.json');
+  const j = JSON.parse(fs.readFileSync(f, 'utf8')); delete j.stamp_window; fs.writeFileSync(f, JSON.stringify(j));
+  p.clock.now = NIGHT + 86400000;
+  r = await N.runNightly(e2eOpts(p, d, lz).o);
+  assert.deepEqual([r.state, r.result, r.reason, S.getStatus(p.db, { now: p.clock.now }).run.detail.verify_detail.files], ['verify_again', 'verify_failed', 'evidence_broken', ['import.json (取込の時刻の窓)']]);
+});
+
+await ta('[30] 2b-2b 端から端まで (Codex #1556 R1): 約 5,000 商品 (本番と同じ下限 4,000 行) の取込で、印の秒が商品ごとに違っても verified / 1 商品だけ 2 つの印が違う = verify_failed', async () => {
+  const N0 = 5000;
+  const ids = Array.from({ length: N0 }, (_, i) => `P-${String(i).padStart(5, '0')}`);
+  const rows = ids.map((id, i) => [id, `名前${i}`, `名前${i}`, String(100 + i), '0001']);
+  const all = [...ids, 'ZZ-LAST'];   // 取り込まない最後の商品 (バーコードの書き出しの最後の商品は比べる商品にしない)
+  for (const [over, want] of [[{}, 'verified'], [{ importStampLag: true }, 'verify_failed']]) {
+    const p = portal();
+    const buf = csvBuf(['形式/型番', '商品名', 'ふりがな', '仕入単価', '取引先id'], rows);
+    p.putArtifact({ csvBuf: buf, sha256: sha(buf), rows: rows.length });
+    const d = setupData({ rows });
+    const lz = realLikeLz({ ids: all, over, now: () => p.clock.now });
+    const x = e2eOpts(p, d, lz, { lzMinRows: undefined });
+    const r = await N.runNightly(x.o);
+    assert.equal(r.result, want, JSON.stringify(over));
+    if (want === 'verified') {
+      const post = [...lz.st.lz.values()].map((c) => c[LZ_SHOHIN.header.indexOf('インポート日時')]);
+      assert.ok(new Set(post.slice(0, N0)).size > 50, '印の秒は商品ごとに違う (長い取込)');
+    }
+  }
+});
+
+await ta('[31] 確かめのやり直しの道も、振り分けの間に 00:50 を過ぎた = window_closed・済みの印を書かない・ロジザードを開かない (Codex #1556 R1 Low) / 1 秒前なら確かめる', async () => {
+  const p = portal();
+  p.putArtifact();
+  const d = setupData();
+  const lz = realLikeLz({ over: { postShohinFailsOnce: true }, now: () => p.clock.now });
+  let r = await N.runNightly(e2eOpts(p, d, lz).o);
+  assert.equal(r.result, 'imported_unverified');
+  const calls0 = lz.st.calls.length;
+  // 2 夜目の 00:49:59.900 に始まり、状態を読む間に 0.5 秒 = 00:50:00.400
+  p.clock.now = JST('2030-01-18T00:49:59.900');
+  const { c, perfNow } = perfClock();
+  const y = e2eOpts(p, d, lz, { perfNow });
+  const origS = y.o.client.status;
+  y.o.client = { ...y.o.client, status: async (q) => { const res = await origS(q); c.t += 500; return res; } };
+  r = await N.runNightly(y.o);
+  assert.deepEqual([r.state, r.reason, lz.st.calls.length - calls0, fs.existsSync(N.nightlyMarker(d, '2030-01-18')), S.getStatus(p.db, { now: p.clock.now }).state],
+    ['skipped', 'window_closed', 0, false, 'imported_unverified']);
+  // 1 秒前 (状態を読む間に時間が進まない) = 確かめる
+  p.clock.now = JST('2030-01-18T00:49:59.000');
+  r = await N.runNightly(e2eOpts(p, d, lz).o);
+  assert.deepEqual([r.state, r.result, fs.existsSync(N.nightlyMarker(d, '2030-01-18'))], ['verify_again', 'verified', true]);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

@@ -16,7 +16,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { readLzShohinMaster } from '../../apps/master-decisions/lz-cdb.mjs';
 import { validateImportCsv, parseImportResult, judgeImportResult } from '../../apps/master-decisions/lz-import-check.mjs';
-import { verifyImport, readBarcodeExport, compareBarcodes, barcodeMissing, compileRules, RULES_2B1, RULES_NIGHTLY } from '../../apps/master-decisions/lz-import-verify.mjs';
+import { verifyImport, readBarcodeExport, compareBarcodes, barcodeMissing, compileRules, RULES_2B1, RULES_NIGHTLY, jstStamp, STAMP_TOLERANCE_MS, isRealStamp } from '../../apps/master-decisions/lz-import-verify.mjs';
 import { precheck } from '../../apps/master-decisions/lz-import-plan.mjs';
 import { createGuard as defaultCreateGuard } from '../../tools/logizard-automation/import-guard.js';
 import { planSha256 as planDigest, checkPlanAgainstPre, checkTestCsv } from '../../apps/master-decisions/lz-import-test-plan.mjs';
@@ -158,10 +158,11 @@ export function deadlineAt(policy, nowMs, marginMs) {
 /**
  * この回の時計 = now (nightly = Render の server_now から作った値) + 単調な時計の経過 (壁時計を使わない)。
  * ポータルの期限 (serverMs) の写し方: Render の時計の回 = そのまま比べる / 手元の時計の回 = 手元の今との差で写す
+ * perfNow = 単調な時計 (既定 performance.now。nightly の入口は自分と同じものを渡す = 入口とエンジンの時計の元が同じ)
  */
-function runClock(policy, now) {
-  const p0 = performance.now();
-  const clock = () => now.getTime() + (performance.now() - p0);
+function runClock(policy, now, perfNow = () => performance.now()) {
+  const p0 = perfNow();
+  const clock = () => now.getTime() + (perfNow() - p0);
   const toClock = policy.serverClock ? (serverMs) => serverMs : (serverMs) => clock() + (serverMs - Date.now());
   return { clock, toClock };
 }
@@ -221,7 +222,7 @@ export function preflight({ policy, now, occupancy, capabilities, purpose = 'imp
  * @param {(text: string) => Promise<boolean>} p.notify  GChat (送れた = true)
  * @param {Function} p.createGuard  import-guard.js の createGuard
  */
-export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv, context, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, createGuard, log = console.log, heartbeatMs = 30000, writeJson = writeJsonAtomic, nightMarginMs = 60000, save = saveOnce }) {
+export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv, context, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, createGuard, log = console.log, heartbeatMs = 30000, writeJson = writeJsonAtomic, nightMarginMs = 60000, save = saveOnce, perfNow = () => performance.now() }) {
   const occ = preflight({ policy, now, occupancy, capabilities });
   const table0 = checkCsv(csvBuf, csv);
   const { tag, recExtra, notifyTail, preCheck, extraIds } = CONTEXTS[policy.name].import(context, { csvBuf, csv });
@@ -229,7 +230,7 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
   if (!init.ok) throw new Error(`ポータルの初期化の照合が合わない (${init.reason})`);
 
   // この回の時計 (now + 単調な時計の経過) と、ポータルの期限の写し方 (runClock)
-  const { clock, toClock } = runClock(policy, now);
+  const { clock, toClock } = runClock(policy, now, perfNow);
   // 締め切り = 旗の上限 (test = 次の 00:00 の nightMarginMs 前 (始めた後に 00:00 を迎えても押さない。Codex #1524 R1 High) / nightly = その日の 00:55 − 余白)
   const nightCap = deadlineAt(policy, now.getTime(), nightMarginMs);
 
@@ -314,7 +315,8 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
       // ── 押す (K7: 押す直前に記録。記録を書けない = 押さない) ──
       let exec;
       try {
-        exec = await ops.executeImport({ guard, onExecuteIssued: () => { stage('execute_issued', {}, { required: true }); executeIssued = true; }, captureDir: runDir, log });
+        // 押した時刻 (この回の時計 = nightly は Render の時計) を押す前の記録に残す = 取込の時刻の窓の始め (Codex #1556 R1 High)
+        exec = await ops.executeImport({ guard, onExecuteIssued: () => { rec.execute_at = clock(); stage('execute_issued', { execute_at: rec.execute_at }, { required: true }); executeIssued = true; }, captureDir: runDir, log });
       } catch (e) {
         if (e && e.executeIssued) { stage('execute_error', { error: String(e.message).slice(0, 300), after_stop: e.afterStop || null }); await move('unknown', { reason: 'execute_error', error: String(e.message).slice(0, 200) }); return; }
         stage('execute_not_issued', { error: String(e && e.message).slice(0, 300) });
@@ -323,6 +325,9 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
       }
       // after_stop = 止めた後に押された (ページに送った後の押す処理は取り消せない。#1521)
       rec.execute = { confirm: exec.confirm, reason: exec.reason, after_stop: exec.afterStop || null, result_text: exec.resultText ? exec.resultText.slice(0, 2000) : null };
+      // 取込の時刻の窓 (押した時刻 − 余白 〜 結果を読んだ時刻 + 余白・JST の 14 桁)。記録に残す = 次の夜の確かめのやり直しも同じ窓
+      rec.result_at = clock();
+      rec.stamp_window = { from: jstStamp(rec.execute_at - STAMP_TOLERANCE_MS), to: jstStamp(rec.result_at + STAMP_TOLERANCE_MS) };
       const parsed = exec.reason ? { found: false, reason: exec.reason } : parseImportResult(exec.resultText);
       const judged = judgeImportResult(parsed, csv.rows);
       rec.result = { parsed, judged };
@@ -347,7 +352,7 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
       // 取れた側 (と中身の壊れ) は比べる。一時の失敗で取れなかった側 = null (Codex #1524 R4)
       const lzPost = g.post ? readLzShohinMaster(g.post.buf, { minRows: lzMinRows }) : null;
       const bcPost = g.postBc ? readBarcodeExport(g.postBc.buf) : null;
-      const vr0 = lzPost ? (lzPost.ok ? verifyImport({ table, pre: lz, post: lzPost, rules: policy.rules }) : { ok: false, diffs: [{ kind: 'post_unreadable', reason: lzPost.reason }] })
+      const vr0 = lzPost ? (lzPost.ok ? verifyImport({ table, pre: lz, post: lzPost, rules: policy.rules, importWindow: rec.stamp_window }) : { ok: false, diffs: [{ kind: 'post_unreadable', reason: lzPost.reason }] })
         : (g.invalid && g.invalid.which === 'shohin' ? { ok: false, diffs: [{ kind: 'post_unreadable', reason: bad('shohin') }] } : null);
       const br0 = bcPost ? (bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids, cover: { pre: lz, post: lzPost && lzPost.ok ? lzPost : null } }) : { ok: false, diffs: [{ kind: 'post_barcode_unreadable', reason: bcPost.reason }] })
         : (g.invalid && g.invalid.which === 'barcode' ? { ok: false, diffs: [{ kind: 'post_barcode_unreadable', reason: bad('barcode') }] } : null);
@@ -427,10 +432,10 @@ export const isInvalidExport = (e) => !!e && e.code === 'invalid_csv';
  * @param {() => string} p.locateRun  実行の記録のフォルダ (見つからない = 例外 = evidence_missing)
  * @param {object} p.context     決まりごとの呼び手の値 (CONTEXTS。試験 = { readPlan: (runDir) => その回の plan.json } / 毎晩 = {})
  */
-export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, context, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, createGuard = defaultCreateGuard, log = console.log, writeJson = writeJsonAtomic, save = saveOnce, heartbeatMs = 30000, nightMarginMs = 60000 }) {
+export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, context, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, createGuard = defaultCreateGuard, log = console.log, writeJson = writeJsonAtomic, save = saveOnce, heartbeatMs = 30000, nightMarginMs = 60000, perfNow = () => performance.now() }) {
   const occ = preflight({ policy, now, occupancy, capabilities, purpose: 'verify' });
   const { readExtraIds } = CONTEXTS[policy.name].verify(context);
-  const { clock, toClock } = runClock(policy, now);
+  const { clock, toClock } = runClock(policy, now, perfNow);
   const nightCap = deadlineAt(policy, now.getTime(), nightMarginMs);
   const init = await checkInit(client, localInitFile);
   if (!init.ok) throw new Error(`ポータルの初期化の照合が合わない (${init.reason})`);
@@ -503,6 +508,9 @@ export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, 
     if (!importCsv || sha256(importCsv) !== (rec.files && rec.files.import_csv)) broken.push('import.csv');
     if (!preBuf || sha256(preBuf) !== (rec.files && rec.files.pre)) broken.push('pre.csv');
     if (!preBcBuf || sha256(preBcBuf) !== (rec.files && rec.files.pre_barcode)) broken.push('pre-barcode.csv');
+    const needWindow = compileRules(policy.rules).importedSystem === 'import_stamp';
+    const w = rec.stamp_window;
+    if (needWindow && !(w && isRealStamp(w.from) && isRealStamp(w.to) && w.from <= w.to)) broken.push('import.json (取込の時刻の窓)');
     if (broken.length) {
       const st1 = stoppedBeforeWrite('記録の壊れを書く前');
       if (st1) return st1;
@@ -530,7 +538,7 @@ export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, 
     // 取れた側 (と中身の壊れ) は比べる。一時の失敗で取れなかった側 = null (Codex #1524 R4)
     const lzPost = got.post ? readLzShohinMaster(got.post.buf, { minRows: lzMinRows }) : null;
     const bcPost = got.postBc ? readBarcodeExport(got.postBc.buf) : null;
-    const vr0 = lzPost ? (lz.ok && lzPost.ok ? verifyImport({ table, pre: lz, post: lzPost, rules: policy.rules }) : { ok: false, diffs: [{ kind: 'unreadable', reason: lz.ok ? lzPost.reason : lz.reason }], decided: false, rules_version: RV })
+    const vr0 = lzPost ? (lz.ok && lzPost.ok ? verifyImport({ table, pre: lz, post: lzPost, rules: policy.rules, importWindow: needWindow ? w : null }) : { ok: false, diffs: [{ kind: 'unreadable', reason: lz.ok ? lzPost.reason : lz.reason }], decided: false, rules_version: RV })
       : (got.invalid && got.invalid.which === 'shohin' ? { ok: false, diffs: [{ kind: 'unreadable', reason: bad('shohin') }], decided: false, rules_version: RV } : null);
     const br0 = bcPost ? (bcPre.ok && bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids, cover: { pre: lz.ok ? lz : null, post: lzPost && lzPost.ok ? lzPost : null } }) : { ok: false, diffs: [{ kind: 'barcode_unreadable', reason: bcPre.ok ? bcPost.reason : bcPre.reason }] })
       : (got.invalid && got.invalid.which === 'barcode' ? { ok: false, diffs: [{ kind: 'barcode_unreadable', reason: bad('barcode') }] } : null);
