@@ -1144,6 +1144,48 @@ select sku_code, sku_name, units_net, units_by_mall, sales_jpy, amazon_ad_cost, 
 
 試験 = `node scripts/test-company-db-sku-activity.mjs` (11 件: 公開の値が古い日 (本物の作り直し)・売上に効く金額不明の明細の数 (店の null と空文字)・ 数量の展開 (出品の構成・NE のセット・取消)・売上と広告費は 1 SKU だけの品物にだけ・在庫の不明は null / 取れていて行が無いのは 0・何日もつか・gaps の合計が材料と一致・期間の外を読まない・一部だけ展開できる品物 (構成の無いセット・循環)・1 つの構成品だけの NE のセットと入れ子もセット経由・広告経由の売上の不明を一部の和にしない)
 
+## 観測の原価 (0046。D7b-2。Company DB構想 13 §3.3・§3.4・D-57)
+
+設計の正本 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』。`core.sku_costs` (夜間ロードの原価) は有効期間の始まりが全部 2026-09-10 以降 = それより前の Amazon の利益 (D7b-3) に原価が付かない。
+→ miniPC の SQLite の原価の履歴 `m_products_history` (5/5 の最初の写しから・`changed_at` = 日次の処理が気づいた UTC の時刻) から **SKU × 原価の期間** を作って **別の表** に持つ (`core.sku_costs` には触らない = マスタ正本切替 (10) の持ち主・監査・版と混ぜない)。
+
+- **表**: `core.sku_cost_observed_loads` = 受領の見出し (会社 × 送り元 `warehouse_sqlite` × 世代 = 1 行・**追記だけ** = 古い世代の見出しは監査の履歴として残る・今の世代 = 最大の generation。manifest = checksum・行の数・結びつかない商品コードの数・曖昧な商品コードの数) /
+  `core.sku_cost_observed` = SKU × 期間 `[valid_from, valid_to]` (両端を含む・null = 今も)・`cost_jpy` (整数円)・`cost_status` (COMPLETE / OVERRIDDEN)・`backfill_method`・`first_observed_at`・`source_history_id`・`product_code` (履歴の原文)。行は今の世代の見出しのものだけ
+- **読む口** = `mart.v_sku_cost_observed_effective`: **SKU ごとに `core.sku_costs` の最初の `valid_from` より前だけ** (終わりを前日で切る・後に始まる行は出さない・sku_costs の無い SKU はそのまま・`cost_basis` = observed / estimated)。
+  境目は送り手で切らない = sku_costs が後から始まる SKU・夜間ロードとの前後でも読むときに正しく切れる。🚨 D7b-3 (利益の関数) は表を直に読まずにこの口を読む
+- **期間の作り方** (送り手 `apps/company-db/push/sku-cost-observed.mjs`): `changed_at` の **JST の日の翌日から** 有効 (その日の注文は前の原価)。🚨 例外 = **最初の BASELINE_RESET (5/5)** はその日から `observed_daily_diff`・それより前は同じ値を `estimated_before_first_snapshot` で 2026-01-01 から推定。
+  5/5 の写しに無く後で初めて出たコードは、それより前を推定しない。同じ有効日の複数の変化は最後の値 (changed_at → history_id)。DELETE = 原価不明の始まり (再 INSERT はその翌日から)。
+  値は夜間ロードと同じ (状態は COMPLETE / OVERRIDDEN だけ = `mapCost`・`Math.round`・数でない / 負は不明 = `costForLoad`)。原価と状態が変わらない履歴の行は区切りにしない。最初の写しより前の履歴の行は使わない (要約に数が出る)
+- **商品コード → SKU**: 夜間ロードと同じ正規化 (`normSku` = `core.norm_code`)。**正規化で 2 つ以上の履歴のコードが同じになる = 曖昧 = どれも送らない**。Render の `core.skus` に無い (`GET …/sku-cost-observed/sku-codes` で読む)・形が不正 = 結びつかない = 送らない。数は見出しに残る
+- **世代** (送り手の台帳 `DATA_DIR/company-db-push.db` の `sku_cost_observed:` の連番): 回の始めに Render の今の世代まで進め、Render の今の manifest と同じなら送らない。違えば新しい世代を **HTTP の前に** 台帳に書いて (送る manifest も `pending`) 送る。
+  応答が失われた = 同じ回の再送は同じ body (same)・次の回は pending が Render より新しく中身も同じなら同じ世代で送る
+- **受け口 (Render)**: `POST /apps/company-db/sync/sku-cost-observed` (`apps/company-db/ingest/sku-cost-observed.mjs`)。全部 = 1 要求 = 1 取引で、その会社 × 送り元の行を消して新しい見出しと行を入れる。
+  🚨 古い世代 = `stale` (書かない) / 同じ世代で manifest が全部同じ = `same` / 違う = 409 / Render に無い SKU の商品コード = 409 `SKU_UNRESOLVED` (送り手の SKU の一覧が古い = 次の回で読み直す)。
+  checksum = 共通の部品 `apps/company-db/canonical-hash.mjs` (正規の JSON の SHA-256・鍵の順は固定・数は整数だけ) を受け口が届いた行から計算し直す (版 `sco-v1`)。`GET …/sku-cost-observed/status` / `GET …/sku-cost-observed/sku-codes`
+- **毎朝**: daily-sync の「m_products 履歴記録」の直後に `--send` (新しい定期実行は無い。台帳 jobs-registry の warehouse-daily-sync に記載)。送信の失敗・409・別の送り手の見送り = ❌ (exit 1) = retry (`CompanyDB観測原価 --send`)。**「m_products 履歴記録」が失敗した朝は送らない** (その日の原価の変化を取り逃さないよう、retry で履歴の記録 (`m_products_history`) → 観測の原価の順に走らせる = 上流)。正規化の後に ASCII でない商品コードが 1 つでもあれば送らない (⚠️・JS と DB で同じ SKU と言い切れない = そのときに扱いを決める)。行は UPDATE できない (trigger)。
+  Render に 0046 がまだ無い (status が 409 `not_migrated`) = ⚠️ (exit 0・送らない・世代も採らない) = マージから migrate までの朝を ❌ にしない・⏭️ ではなく ⚠️ = migrate を忘れても毎朝見える。
+  🛑 安全弁: 前の世代があり、新しい中身が 0 行 / 行が前の 80% 未満 / 結びつかない + 曖昧の数が前より max(20, 前の数) を超えて増える = 送らずに ❌ (既存の行を消さない)。履歴と SKU の一覧を確かめ、わざと減らすときだけ手で `--send --force`。**migrate の後も ⚠️ が続いたら** Render のデプロイと migrate を確かめる
+
+```
+# 初回 (miniPC の PowerShell。🚨 migrate は中原さんの指示の後に dry-run → 本適用)
+cd C:\Users\bfaith\bfaith-portal
+node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                 # 0046 だけが出ること
+node -r dotenv/config scripts\company-db\migrate.mjs                           # 0046 (applied=1)
+node apps\company-db\push\sku-cost-observed.mjs --dry-run                      # 送る予定の行・SKU・推定の行・結びつかない / 曖昧な商品コードの数 (台帳は開かない・Render は読むだけ)
+node apps\company-db\push\sku-cost-observed.mjs --send                         # 1 回で全部 (約 2 万行・1 要求)
+
+# ふだん = 何もしない (daily-sync が毎朝)。同じ中身なら「変わりなし」で送らない
+```
+
+```sql
+-- 見出し (今の世代 = 最大の generation) と行の数
+select generation, checksum, row_count, unresolved_code_count, ambiguous_code_count, sent_at from core.sku_cost_observed_loads order by generation desc limit 3;
+-- ある SKU の 9/10 より前の原価 (sku_costs の境目で切った後)
+select valid_from, valid_to, cost_jpy, cost_status, cost_basis from mart.v_sku_cost_observed_effective v join core.skus s using (sku_id) where s.code = 'xxx' order by valid_from;
+```
+
+試験 = `node scripts/test-company-db-sku-cost-observed.mjs` (32 件: 0046 の適用前は ⚠️ / 🛑 安全弁 / 見出しと実際の行の数のずれを直す / 期間の作り方 (JST の翌日・写しの日の例外と推定・同じ changed_at / 同じ日の最後・DELETE と再 INSERT・状態・丸め・まとめる・後で出たコードは推定しない・写しの前の行) / 衝突の隔離と結びつかない数 / 正規の JSON と checksum / 検証 / applied・same・409・stale・入れ替え・見出しは追記だけ / SKU_UNRESOLVED・巻き戻し / 読む口の境目 / HTTP と server.js の配線 / 送り手 = 台帳の世代・変わりなし・応答が失われた (同じ回・回をまたぐ)・409・stale・dry-run は何も書かない・lock / CLI の失敗 = exit 1 / daily-sync・retry・jobs-registry の配線)
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。
