@@ -80,7 +80,12 @@ WHERE rn = 1;
 -- 割り振り: その月 (料金の日の月) の料金 → 同じ注文番号の売上の行 (transaction_type = Order・SKU あり・どの月でも) の SKU へ
 --   複数 SKU の注文は本体売上 (Principal) の割合・本体の合計が 0 以下なら SKU の数で等分・日付は料金の日
 --   売上の行が無い注文 (まだ届いていない等) は割り振らない
---   1 円単位で割り振り、端数は小数部の大きい SKU から 1 円ずつ (料金ごとの合計が必ず元の額と一致)
+--   1 円単位で割り振り、端数は小数部の大きい SKU から 1 円ずつ (同じなら SKU の順・料金ごとの合計が必ず元の額と一致)
+--   🆕 2026-09-30 (D7b-0): 料金は **注文 × 計上日で正味 (料金 + 返金) にしてから** 割り振る (前は行ごと。
+--     同じ注文 × 日に料金と返金など 2 行以上ある組が 58,478 組のうち 25,869 組 = 行ごとの端数で SKU の額が 1 円ずれた。
+--     Company DB の Amazon の利益 (D7b) も同じ規則 = AI_reference CompanyDB構想/13 D-59)。
+--     正味が 0 の組も 0 円の行を作る (行を作らないと、前に送った額の行が Render の mirror に残る = 同期は今ある行の日しか消さない。Codex #1548 R1)
+--     重複除去 (出現順つき) は正味にする前 (es の rn = 1 だけを足す)
 -- 🚨 easy_ship_jpy は SKU ごとの利益を見るための列 = profit_amount から引かない (月の Easy Ship は全部アカウント単位の手数料で引く)
 -- 金額は other-amount (古い月) と item-related-fee-amount (新しい月) の両方。重複除去は silver と同じ出現順つき
 DROP TABLE IF EXISTS _easyship_alloc_v1;
@@ -144,11 +149,17 @@ wt AS (
   SELECT w.*, SUM(principal) OVER (PARTITION BY amazon_order_id) AS total, COUNT(*) OVER (PARTITION BY amazon_order_id) AS n_sku
   FROM w
 ),
+esn AS (
+  -- 注文 × 計上日で正味にする (charge_id = 割り振りの単位)
+  SELECT economic_date, amazon_order_id, economic_date || '|' || amazon_order_id AS charge_id, SUM(amt) AS amt
+  FROM es
+  WHERE rn = 1 AND amazon_order_id IS NOT NULL
+  GROUP BY economic_date, amazon_order_id
+),
 share AS (
-  SELECT es.charge_id, es.economic_date, es.amt, wt.seller_sku,
-         ABS(es.amt) / 1000000.0 * CASE WHEN wt.total > 0 THEN wt.principal * 1.0 / wt.total ELSE 1.0 / wt.n_sku END AS yen_exact
-  FROM es JOIN wt ON wt.amazon_order_id = es.amazon_order_id
-  WHERE es.rn = 1
+  SELECT esn.charge_id, esn.economic_date, esn.amt, wt.seller_sku,
+         ABS(esn.amt) / 1000000.0 * CASE WHEN wt.total > 0 THEN wt.principal * 1.0 / wt.total ELSE 1.0 / wt.n_sku END AS yen_exact
+  FROM esn JOIN wt ON wt.amazon_order_id = esn.amazon_order_id
 ),
 base AS (
   SELECT share.*, CAST(yen_exact AS INTEGER) AS yen_floor,
