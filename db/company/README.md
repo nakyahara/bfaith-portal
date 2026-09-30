@@ -806,6 +806,7 @@ commit;
 
 - 書き手 = `apps/warehouse/fetch-amazon-settlements.js` (部品 `apps/warehouse/amazon-settlement-inventory.js`)。表 = warehouse.db の `amazon_settlement_report_inventory_runs` (回) / `amazon_settlement_report_inventory` (report ごと)。**今は記録だけ** (読み手 = 後の coverage)。取込む行には関わらない
 - 呼ぶ順 = 取込の一覧の要求 (日時の境なし・今と同じ) → 取込のダウンロードのループ (結果は report ごとにメモリ) → **ループが全部終わった後** に別の getReports で一覧を取る (窓 = `createdUntil` = 回の開始の時刻・`createdSince` = その 85 日前・時間の上限 120 秒) → 一覧の行・取込の結果・完了を **1 つの取引** で書く。最後のページまで取れない・応答の形が違う・時間切れ = `last_page_reached = 0` / `list_error` (取込の結果・終了コードは変わらない)
+- 一覧の要求は **専用の SP-API の接続** (amazon-sp-api の `auto_request_throttled: false`・`retry_remote_timeout: false`・要求ごとに残り時間の `timeouts`) = 期限で socket を破棄し、429 でも待って再試行しない (取込が済んだら node が自分で終わる)。取込の接続の設定は変えない
 - 🚨 **途中で落ちた回**: 取込が例外で止まった回は一覧を記録するが `completed_at` は null・`ingest_error` に理由。**daily-sync の時間切れなどで kill された回は一覧の記録が無い** = その回は coverage の証拠に使えない (安全側・次の回で取り直す)
 - 🚨 **記録の失敗**: 一覧の行・取込の結果のどこかを書けなければ取引ごと戻し、見出しだけを `record_error` つき・`completed_at` null で書く (行は無い = 「成功した回」に見せない)。見出しも書けなければ回は残らない
 - 回の所属 = `company_id` / `mall` / `scope_key` (今は 1 / `amazon` / `jp` 固定)

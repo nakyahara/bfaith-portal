@@ -18,6 +18,8 @@
  *   - 🚨 呼ぶ順 = 取込の一覧の要求 (今と同じ位置・同じ形) → 取込のダウンロードのループ (結果は report ごとにメモリ) →
  *     **ループが全部終わった後** に一覧の記録の要求 (時間の上限 120 秒・ページの応答の形も確かめる) → 一覧・取込の結果・完了を 1 つの取引で書く
  *     (一覧の要求が取込の時間やレートの枠を食わない。Codex #1555 R1 High・R2 High)
+ *   - 一覧の記録の要求は **専用の SP-API の接続** (getInventoryClient = 要求の時間の上限つき・429 / 通信の失敗で自動の再試行なし)。
+ *     期限でライブラリが socket を破棄する = 取込が済んだら node が自分で終わる (Codex #1555 R3)。取込の接続 (getClient) の設定は変えない
  *   - nextToken が残ったまま上限のページ (21) に来たら last_page_reached = 0 + ⚠️
  *   - 一覧の失敗・記録の失敗は ⚠️ だけ (取込の結果・終了コードは変わらない)。記録に失敗した回は completed_at を入れず record_error に理由
  *   - 取込が例外で止まった回も一覧を記録する (completed_at null・ingest_error)。kill された回は記録が無い = coverage に使えない (安全側)
@@ -50,7 +52,7 @@ import { initDB, getDB } from './db.js';
 import { convertV2TsvToV1Tsv, parseV2Tsv } from './amazon-settlement-v2.js';
 import {
   MAX_LIST_PAGES, INVENTORY_TIMEOUT_MS, listReportPages, listInventoryReports, inventoryWindow, inventoryEntries, inventorySnapshotDigest,
-  recordInventorySnapshot,
+  recordInventorySnapshot, inventoryClientOptions,
 } from './amazon-settlement-inventory.js';
 
 const REGION = 'fe';
@@ -76,6 +78,27 @@ function getClient() {
     });
   }
   return spClient;
+}
+
+// 一覧の記録用の **専用の接続** (Codex #1555 R3): 時間の上限つき・429 / 通信の失敗で自動の再試行をしない
+// (取消されない再試行の timer や socket が残ると、取込が済んでも node が終わらず daily-sync の枠で kill される)。
+// 取込の接続 (getClient) の設定は変えない
+let inventorySpClient = null;
+function getInventoryClient() {
+  if (!inventorySpClient) {
+    inventorySpClient = new SellingPartner({
+      region: REGION,
+      refresh_token: process.env.SP_API_REFRESH_TOKEN,
+      credentials: {
+        SELLING_PARTNER_APP_CLIENT_ID: process.env.SP_API_CLIENT_ID,
+        SELLING_PARTNER_APP_CLIENT_SECRET: process.env.SP_API_CLIENT_SECRET,
+        AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+      options: inventoryClientOptions(INVENTORY_TIMEOUT_MS),
+    });
+  }
+  return inventorySpClient;
 }
 
 const nowIso = () => new Date().toISOString();
@@ -577,11 +600,12 @@ function inventorySummary(inv, args) {
 /**
  * 取込の本体 (main から呼ぶ。試験から SP-API を差し替えて呼べるように関数にした)。
  * deps = { db, sp (callAPI を持つ), runId, downloadTsv(reportDocumentId) → TSV の文字 (既定 = SP-API), now() → Date,
+ *          inventorySp (一覧の記録用の専用の接続・既定 = sp。本番は getInventoryClient = 時間の上限つき・自動の再試行なし),
  *          inventoryTimeoutMs (一覧の記録用の要求の時間の上限) }
  * 返り値 = { totalHeaders, totalLines, dirtyMonths, blocked, inventory }
  * 🚨 取込む report の選び方・取込む行は今までと同じ。足したのは一覧の記録 (別の要求) と、各分岐での取込の結果の記録だけ
  */
-export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = null, now = () => new Date(), inventoryTimeoutMs = INVENTORY_TIMEOUT_MS }) {
+export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = null, now = () => new Date(), inventorySp = null, inventoryTimeoutMs = INVENTORY_TIMEOUT_MS }) {
   const src = SOURCES[args.source];
   const download = downloadTsv || ((reportDocumentId) => downloadReportTsv(sp, reportDocumentId));
   const startedAt = now();   // 回の開始の時刻 = 一覧の窓の createdUntil
@@ -678,7 +702,7 @@ export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = nu
   // 2. 決済のレポートの一覧 (inventory) = 取込のループが全部終わった後に、時間の上限つきの別の要求で取り、取込の結果と合わせて 1 回で書く。
   //    失敗・時間切れ・記録の失敗でも取込の結果 (生の行・終了コード) は変わらない。--report-id の 1 本だけの回は一覧の回にしない (設計 §3.1)。
   //    取込が例外で止まった回も一覧を記録する (completed_at は null・ingest_error)。kill された回は記録が無い = coverage に使えない (安全側)
-  const inv = args.reportId ? null : await takeSettlementInventory(db, sp, {
+  const inv = args.reportId ? null : await takeSettlementInventory(db, inventorySp || sp, {
     reportType: src.reportType, runId, dryRun: args.dryRun, now, startedAt, timeoutMs: inventoryTimeoutMs,
     results, ingestError: ingestError ? `例外: ${ingestError?.message || ingestError}` : null,
   });
@@ -698,7 +722,8 @@ async function main() {
   await initDB();
   const db = getDB();
 
-  const { blocked } = await runSettlementFetch(args, { db, sp: getClient(), runId });
+  // --report-id の回は一覧を取らない = 専用の接続も作らない
+  const { blocked } = await runSettlementFetch(args, { db, sp: getClient(), inventorySp: args.reportId ? null : getInventoryClient(), runId });
   if (blocked.length) {
     console.error(`[settlements] ❌ 取り込まなかった V2 のレポート ${blocked.length} 本: ${JSON.stringify(blocked)}`);
     console.error('[settlements] → apps/warehouse/amazon-settlement-v2.js に規則を足す (V1 の書き方に合わせる。11/11 までは --source v1 でも取れる)。直るまで毎回 終了コード 3');

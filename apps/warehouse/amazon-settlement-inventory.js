@@ -104,7 +104,22 @@ export async function listReportPages(sp, firstQuery, { maxPages = MAX_LIST_PAGE
   return { reports, pages, lastPageReached: !nextToken };
 }
 
-/** 期限つきの待ち。期限を過ぎたら例外 (元の要求は止められない = 後で失敗しても unhandled にしない) */
+/**
+ * 一覧の記録用の **専用の SP-API の接続** の options (amazon-sp-api 1.2.0 の lib/SellingPartner.js の名前・Codex #1555 R3):
+ *   - auto_request_throttled: false = 429 (QuotaExceeded) で待って再試行しない (_retryThrottledRequest の timer を作らない)
+ *   - retry_remote_timeout: false = ETIMEDOUT / ENOTFOUND / ECONNRESET で再試行しない
+ *   - timeouts = 要求の時間の上限 (lib/TimeoutManager.js が期限で req.destroy = socket を破棄)。要求ごとに残り時間で上書きする (listInventoryReports)
+ * 🚨 取込に使う接続 (getClient) の設定は変えない
+ */
+export function inventoryClientOptions(timeoutMs = INVENTORY_TIMEOUT_MS) {
+  return {
+    auto_request_throttled: false,
+    retry_remote_timeout: false,
+    timeouts: { response: timeoutMs, idle: timeoutMs, deadline: timeoutMs },
+  };
+}
+
+/** 期限つきの待ち。期限を過ぎたら例外 (要求そのものは options.timeouts でライブラリが止める。ここは待つ側の保険・後で失敗しても unhandled にしない) */
 function withDeadline(promise, deadline, timeoutMs) {
   Promise.resolve(promise).catch(() => {});
   const ms = deadline - Date.now();
@@ -122,7 +137,14 @@ function withDeadline(promise, deadline, timeoutMs) {
 export async function listInventoryReports(sp, { reportType, marketplaceId, startedAt, maxPages = MAX_LIST_PAGES, timeoutMs = INVENTORY_TIMEOUT_MS }) {
   const window = inventoryWindow(startedAt);
   const deadline = Date.now() + timeoutMs;
-  const timedSp = { callAPI: (req) => withDeadline(sp.callAPI(req), deadline, timeoutMs) };
+  // 要求ごとに残り時間を timeouts に入れる = ライブラリが期限で socket を破棄する (待つのをやめるだけだと timer / socket が残り、node が終わらない)
+  const timedSp = {
+    callAPI: (req) => {
+      const left = Math.max(1, deadline - Date.now());
+      const timeouts = { response: left, idle: left, deadline: left };
+      return withDeadline(sp.callAPI({ ...req, options: { ...(req.options || {}), timeouts } }), deadline, timeoutMs);
+    },
+  };
   const firstQuery = {
     reportTypes: [reportType],
     marketplaceIds: [marketplaceId],
