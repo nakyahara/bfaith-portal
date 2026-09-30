@@ -732,6 +732,25 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 
 **試験**: `scripts/test-lz-nightly.mjs` (毎晩の本番の miniPC 側) / `scripts/test-lz-cutover-check.mjs` (切替・戻しの確かめ・本物のポータルの状態の機械・戻しの版の sha256 と tag) / `scripts/test-lz-daily.mjs` [1]〜[12] (ロジザードの一覧の見出しは実ファイルの 1 行目のバイト。[11][12] = 成果物をポータルへ送る・入口)・`scripts/test-retry-rerun.mjs` (照合が直ったら作り直す)
 
+### マスタの古い入口の門 (⑤-3。Company DB構想 14 §5・§9 v2 M2・§10 契約 v3 H1)
+
+古い入口 = NE の写しにマスタを書く API・画面・手の CLI (miniPC の `/apps/warehouse/register` と SKU マスタ・会計アプリ 5 つの `POST /register`・fba-profitability の原価・product-hub の税率・profit-calculator の NE 用 CSV と仕入れ先・手の取込)。
+
+- **一覧 = `config/master-legacy-entries.mjs`** (閉じる入口・閉じないもの (理由つき)・CLI の mode)。一覧がそのまま門の設定。
+- **門 = `lib/master-legacy-gate.mjs`**。切替の段階 (`ops.master_cutover_state`・0050) が `legacy_open` のときだけ今までどおり書ける。
+  - `frozen` 以降は、持ち主表 (`config/master-ownership.mjs`) がまだ `load` でも閉じる (持ち主の切替より先に古い入口を閉じる順番のため)。
+  - API = 410 `{error:'master_frozen', message, url}`。段階が読めない = 503 `{error:'master_phase_unreadable'}` (閉じる側)。何も書かない。
+  - 画面 = 帯「マスタは新しい画面で直します ↗」+ 書く部品を隠す。product-hub の税率は欄を外して Company DB の税率を見せるだけ。
+  - CLI = データに触る前に終了コード 3。csv-import.js は `product_shipping`・`exception_genka` だけ閉じる (受注・ロジザード・NE の写し・送料の表は止めない)。
+- **段階の読み方** (新しい秘密は足さない):
+  - miniPC (WarehouseServer・CLI) = `COMPANY_DB_WATCH_URL` (見張りの照会用ロール watcher)。無ければ `COMPANY_DB_URL`。
+  - Render = `COMPANY_DB_URL`。
+  - 書き込みは毎回読む。読めないときだけ「5 分以内に読めた `legacy_open`」で通す (一時の途切れで作業を止めない)。frozen 以降を一度読んだら使わない。画面の帯は 30 秒だけ前の結果を使う。
+- 🚨 **配る前に**: 0050 を本適用しておく (表が無い = 読めない = 古い入口が全部閉じる)。miniPC の .env に `COMPANY_DB_WATCH_URL`、Render に `COMPANY_DB_URL` があること。
+- **読み戻し** (切替の手順の「全部の環境で閉じたかを確かめる」): `GET /apps/warehouse/api/master-legacy-gate` (miniPC と Render の両方にある) = その環境が見ている段階・書けるか・門の版 (`LEGACY_GATES_VERSION`)・持ち主表の指紋。
+- **ack** (⑤-1 R1): server.js の起動のときに 1 回、`ops.ack_master_legacy_gate(host, build_id, owner_hash, 版, 段階)` を呼ぶ (関数がまだ無ければ何もしない)。定期実行ではない。
+- 試験: `scripts/test-master-legacy-entries.mjs` (ルートを数える = 一覧に無いマスタの書き込みの口を落とす) / `scripts/test-master-legacy-gate.mjs` (入口ごとに legacy_open・閉じた・読めない)。
+
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。

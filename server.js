@@ -67,6 +67,8 @@ import { startNotifyOutbox as startFbaBoxNotifyOutbox } from './apps/fba-box/not
 import staffRouter from './apps/staff/router.js';
 import masterDecisionsRouter from './apps/master-decisions/router.mjs';
 import masterEditRouter from './apps/master-edit/router.mjs';
+import { ackLegacyGates } from './lib/master-legacy-gate.mjs';
+import { isRender as isRenderHost } from './lib/is-render.js';
 import { startInboundCheckCron, startInboundCheckPrintQueueWorker } from './apps/inbound-check/sync-job.js';
 // 🆕 新商品のパッケージ裏面ラベル写真を Drive へ送るキュー (プロセス内2分間隔の再試行)
 import { startBackLabelWorker } from './apps/inbound-check/back-label.js';
@@ -1180,6 +1182,19 @@ app.listen(PORT, () => {
   if (process.env.RENDER) {
     try { startMgmtAutoSyncScheduler(); }
     catch (e) { console.warn('[mgmt-auto-sync] scheduler 起動スキップ:', e.message); }
+  }
+
+  // マスタの古い入口の門を載せた印 (ack) を Company DB に残す (Company DB構想 14 §10 契約 v3 H1・⑤-1 Codex R1:
+  // 段階を legacy_open から進めるには、必要な全部の環境がこの版の門を載せた ack が要る)。起動のときに 1 回だけ・定期実行ではない。
+  // Render = 'render' / miniPC (PORTAL_VARIANT=warehouse) = 'minipc'。それ以外 (手元の PC) は書かない。
+  // DB の関数がまだ無い・つながらない = 何もしない (起動は止めない)
+  {
+    const ackHost = isRenderHost() ? 'render' : (PORTAL_VARIANT === 'warehouse' ? 'minipc' : null);
+    if (ackHost) {
+      ackLegacyGates({ host: ackHost })
+        .then((r) => console.log(`[master-legacy-gate] ack ${ackHost}: ${r.state}${r.detail ? ` (${r.detail})` : ''}`))
+        .catch((e) => console.warn('[master-legacy-gate] ack の誤り:', e && e.message));
+    }
   }
 
   // ミニPC warehouse死活監視
