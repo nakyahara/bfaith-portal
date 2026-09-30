@@ -32,6 +32,8 @@ export const IMPORT_FILETYPE_LABEL = '商品マスタ';
 export const DAILY_PATTERN_LABEL = 'デイリー取込商品マスタ';
 /** 取込を始める確認のモーダルの文言 (auto-barcode.js と同じ) */
 const CONFIRM_TEXT = 'ファイルアップロードを開始します';
+/** 本物の確認 (jAlerts の jConfirm) の文言の全文 (2026-09-30 の実機・半角の ?)。jConfirm の箱のときは空白を除いてこれと完全一致だけ (Codex #1553 R1 Medium) */
+export const JCONFIRM_TEXT = 'ファイルアップロードを開始します。よろしいですか?';
 
 /** 処理中の表示が消えるのを待つ。エラーのモーダルが出た = throw (auto-barcode.js と同じ判定) */
 export async function waitOverlayGone(page, label, timeoutMs) {
@@ -89,8 +91,12 @@ export async function selectOptionByText(page, sel, label, what, { log = console
  * 決まった文言のモーダルの中の OK を見つけ、click のときは**同じページの中の処理で押す** (確かめと押すの間に画面は変わらない = JavaScript は 1 本。Codex #1521 R2)。
  *   1. 見えている文字 (空白を除いてつなげたもの) に文言が ちょうど 1 回 (0 = absent / 2 回以上 = ambiguous。OK の有無によらない)
  *   2. モーダルの枠 (role=dialog・class ui-dialog・**jAlerts の確認の箱** のうち、本文に文言があるものが ちょうど 1 つ。popup のような共通の親は枠にしない)。
- *      jAlerts の確認の箱 = #popup_container の直下に #popup_content.confirm だけ・その直下に #popup_message と #popup_panel だけ・#popup_panel の中は
- *      #popup_ok と #popup_cancel の 2 つのボタンだけ (形がぴったりでない = 枠にしない = unidentified。jAlert (お知らせ = .alert)・jPrompt も枠にしない)。
+ *      jAlerts の確認の箱 = 実機どおりの形だけ (Codex #1553 R1 Medium):
+ *        見えている #popup_overlay が箱の兄弟・箱の直下 = [h1#popup_title, div#popup_content] の 2 つだけ (この順)・#popup_content の class は confirm だけ・
+ *        その直下 = [div#popup_message, div#popup_panel] の 2 つだけ・#popup_message と #popup_title の中に要素が無い (入力欄・入れ子の枠を入れない)・
+ *        #popup_panel の直下 = [input#popup_ok (OK), input#popup_cancel (Cancel)] の 2 つの type=button だけ。
+ *        形が違う = 枠にしない = unidentified (jAlert = .alert + OK だけ・jPrompt = .prompt + 入力欄 も枠にしない)。
+ *        文言は #popup_message の文字 (空白を除く) が JCONFIRM_TEXT と完全一致だけ (呼び手が jconfirmExact で渡す。渡さない = jConfirm は押さない)。
  *      タイトル (#popup_title) の文字は ui-dialog のタイトルの帯と同じく本文に数えない
  *      本文 = 枠の中の見えている文字を空白を除いてつなげたもの (入れ子の枠・ボタン・タイトルの帯 ui-dialog-titlebar・決まった語 (確認・お知らせ・メッセージ・×・閉じる・キャンセル) を除く)。
  *      改行や <br> で文が分かれても同じ (Codex #1521 R3 Medium)。無い = unidentified (文言が枠の外)・2 つ以上 = ambiguous
@@ -102,19 +108,25 @@ export async function selectOptionByText(page, sel, label, what, { log = console
  *      (mousedown / mouseup は出さない = 確かめと押すの間にページの処理が走らない。Codex #1521 R3 High)
  * @returns {Promise<{ state: 'ready'|'clicked'|'absent'|'ambiguous'|'unidentified'|'not_enabled'|'busy'|'stopped'|'result_present'|'late'|'covered', why?: string, text?: string, at?: number }>}
  */
-export async function okInDialog(page, needle, { click = false, requireNoResult = false, pressBy = null } = {}) {
-  return page.evaluate(({ needle, click, requireNoResult, pressBy }) => {
+export async function okInDialog(page, needle, { click = false, requireNoResult = false, pressBy = null, jconfirmExact = null } = {}) {
+  return page.evaluate(({ needle, click, requireNoResult, pressBy, jconfirmExact }) => {
     const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-    // jAlerts の確認の箱 (jConfirm) = 形がぴったりのときだけ枠 (2026-09-30 の実機の形)
-    const kids = (el) => [...el.children];
+    // jAlerts の確認の箱 (jConfirm) = 実機どおりの形のときだけ枠 (2026-09-30 の実機の形。Codex #1553 R1 Medium)
+    const is = (el, tag, id) => !!el && el.tagName === tag && el.id === id;
     const isJConfirm = (el) => {
       if (el.nodeType !== 1 || el.id !== 'popup_container') return false;
-      const c = kids(el).filter((x) => x.id !== 'popup_title');
-      if (c.length !== 1 || c[0].id !== 'popup_content' || !c[0].classList.contains('confirm')) return false;
-      const parts = kids(c[0]);
-      if (parts.length !== 2 || parts[0].id !== 'popup_message' || parts[1].id !== 'popup_panel') return false;
-      const btns = kids(parts[1]);
-      return btns.length === 2 && btns.every((b) => b.tagName === 'INPUT' && b.type === 'button') && btns[0].id === 'popup_ok' && btns[1].id === 'popup_cancel';
+      const ov = document.getElementById('popup_overlay');
+      if (!ov || !vis(ov) || ov.parentElement !== el.parentElement) return false;   // 見えている覆いが箱の兄弟
+      const c = [...el.children];
+      if (c.length !== 2 || !is(c[0], 'H1', 'popup_title') || !is(c[1], 'DIV', 'popup_content')) return false;
+      if (c[1].classList.length !== 1 || !c[1].classList.contains('confirm')) return false;
+      const parts = [...c[1].children];
+      if (parts.length !== 2 || !is(parts[0], 'DIV', 'popup_message') || !is(parts[1], 'DIV', 'popup_panel')) return false;
+      if (c[0].children.length || parts[0].children.length) return false;   // 題と文言に要素を入れない (入力欄・入れ子の枠)
+      const btns = [...parts[1].children];
+      const lab = (b) => String(b.value || '').trim();
+      return btns.length === 2 && is(btns[0], 'INPUT', 'popup_ok') && is(btns[1], 'INPUT', 'popup_cancel') && btns.every((b) => b.type === 'button')
+        && lab(btns[0]) === 'OK' && lab(btns[1]) === 'Cancel';
     };
     const isRoot = (el) => el.nodeType === 1 && (el.getAttribute('role') === 'dialog' || el.classList.contains('ui-dialog') || isJConfirm(el));
     const squash = (s) => String(s || '').replace(/\s+/g, '');
@@ -142,6 +154,8 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
     if (!hits.length) return { state: 'unidentified', why: 'no_dialog_root' };
     if (hits.length > 1) return { state: 'ambiguous', why: `dialogs_${hits.length}` };
     const { root, body, nested } = hits[0];
+    // jConfirm の箱 = 文言は実機の全文と完全一致だけ (空白を除く。全角の ？・質問なし・句点なし・後ろに足した文 = 押さない)
+    if (isJConfirm(root) && (!jconfirmExact || squash(document.getElementById('popup_message').textContent) !== squash(jconfirmExact))) return { state: 'unidentified', why: 'jconfirm_text' };
     if (!/^[。．.!！?？]*(よろしいですか[？?]?)?[。．.!！?？]*$/.test(body.replace(N, ''))) return { state: 'unidentified', why: 'extra_text' };
     const own = (el) => !nested.some((r) => r.contains(el));
     const label = (b) => String(b.tagName === 'INPUT' ? b.value : b.innerText).trim();
@@ -163,7 +177,7 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
     if (pressBy != null && at > pressBy) return { state: 'late', text };   // 位置の計算の間に過ぎた (Codex #1521 R4)
     ok.click();
     return { state: 'clicked', text, at };
-  }, { needle, click, requireNoResult, pressBy });
+  }, { needle, click, requireNoResult, pressBy, jconfirmExact });
 }
 
 /**
@@ -377,7 +391,7 @@ export async function executeImport(page, { guard, onExecuteIssued, log = consol
       if (unexpectedDialog) break;
       if ((await watchState(page)).resAt != null) break;   // 結果の表示が出た = 確認の OK は押さない (古い結果か確認なしの結果かは下で見る)
       const confirmBy = await pressBy('確認の OK を押す直前');
-      const m = await okInDialog(page, CONFIRM_TEXT, { click: true, requireNoResult: true, pressBy: confirmBy });
+      const m = await okInDialog(page, CONFIRM_TEXT, { click: true, requireNoResult: true, pressBy: confirmBy, jconfirmExact: JCONFIRM_TEXT });
       if (m.state === 'clicked') {
         out.confirm = 'clicked';
         pressing = false;
