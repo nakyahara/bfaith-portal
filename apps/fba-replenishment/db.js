@@ -248,6 +248,21 @@ export function runSkuMappingBackfillOnce({ now = new Date(), extra = null } = {
   }
 }
 
+/**
+ * runSkuMappingBackfillOnce を、保存の競合 (FBA_DB_EXTERNAL_WRITE = 流している間に常駐のサーバが fba.db を書いた) のときだけやり直す。
+ * 競合のときは saveToFile がファイルを読み直している (こちらの変更は捨てた) ので、もう一度流せば相手の行も残る
+ * @param {object} [o]  runSkuMappingBackfillOnce に渡すもの + attempts (既定 3)・onRetry (試験・ログ用)
+ */
+export function runSkuMappingBackfillOnceRetrying({ attempts = 3, onRetry = () => {}, ...o } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try { return runSkuMappingBackfillOnce(o); }
+    catch (e) {
+      if (!e || e.code !== 'FBA_DB_EXTERNAL_WRITE' || attempt >= attempts) throw e;
+      onRetry(attempt, e);
+    }
+  }
+}
+
 // ===== 初期化 =====
 /**
  * 読む → 表をそろえる → 保存。最後の保存で「読んだ後に外から書かれた」と分かったら、最初からやり直す (3 回まで)。
@@ -2279,8 +2294,10 @@ function buildAmazonSkuCaseMap() {
     'SELECT amazon_sku FROM planning_latest',
     'SELECT DISTINCT amazon_sku FROM daily_snapshots',
     'SELECT amazon_sku FROM ever_seen_skus',
-    // Sheet なしのモードでは Sheet の写しから大小文字も取らない (⑦-F)
-    ...(isSheetlessRequested() ? [] : ['SELECT amazon_sku FROM sku_mapping']),
+    // Sheet なしのモードでは Sheet の写しから大小文字を取らない。代わりに fba_sku_attrs (SP-API のレポートの FNSKU の更新が書く
+    //   = Amazon の元の大小文字) から取る (⑦-F)。🚨 どのレポートにもまだ出ていない SKU は、ここに無ければ小文字のまま
+    //   (モードを入れた後に登録した SKU の元の大小文字は、次の段で Company DB から持ってくる)
+    isSheetlessRequested() ? 'SELECT amazon_sku FROM fba_sku_attrs' : 'SELECT amazon_sku FROM sku_mapping',
   ]) {
     try { for (const r of queryAll(sql)) add(r.amazon_sku); } catch (e) { /* テーブル未作成等は無視 */ }
   }
@@ -3170,6 +3187,8 @@ export function clearDraft() {
 // ===== FNSKU一括更新 =====
 export function updateFnskuBatch(items) {
   // 🚨 Sheet なしのモードでは fba_sku_attrs だけに書く (sku_mapping は凍結。⑦-F・Codex 設計 R1 High 3)
+  //    ASIN も fba_sku_attrs に書く (Sheet の backfill が止まるので、新しい SKU の ASIN はレポートからしか入らない)。
+  //    item.asin が空なら前の ASIN のまま。モードなしのときは今までどおり ASIN に触らない
   const writeSheetCopy = !isSheetlessRequested();
   db.run('BEGIN TRANSACTION');
   try {
@@ -3183,6 +3202,7 @@ export function updateFnskuBatch(items) {
            ON CONFLICT(amazon_sku) DO UPDATE SET fnsku=excluded.fnsku, source='restock', updated_at=excluded.updated_at`,
           [item.sku, item.fnsku]
         );
+        if (!writeSheetCopy) writeAttrsAsin(item);
       }
     }
     db.run('COMMIT');
@@ -3199,7 +3219,7 @@ export function updateFnskuBatch(items) {
  * この関数は payload 通りに上書きするので、FNSKUが外された場合も正しく反映される。
  */
 export function syncFnskuBatch(items) {
-  // 🚨 Sheet なしのモードでは fba_sku_attrs だけに書く (sku_mapping は凍結。⑦-F・Codex 設計 R1 High 3)
+  // 🚨 Sheet なしのモードでは fba_sku_attrs だけに書く (sku_mapping は凍結。⑦-F・Codex 設計 R1 High 3)。ASIN も (updateFnskuBatch と同じ)
   const writeSheetCopy = !isSheetlessRequested();
   db.run('BEGIN TRANSACTION');
   try {
@@ -3213,6 +3233,7 @@ export function syncFnskuBatch(items) {
          ON CONFLICT(amazon_sku) DO UPDATE SET fnsku=excluded.fnsku, source='planning', updated_at=excluded.updated_at`,
         [item.sku, item.fnsku || null]
       );
+      if (!writeSheetCopy) writeAttrsAsin(item);
     }
     db.run('COMMIT');
     saveToFile();
@@ -3220,6 +3241,13 @@ export function syncFnskuBatch(items) {
     rollbackQuiet();
     throw e;
   }
+}
+
+/** Sheet なしのモード: レポートの ASIN を fba_sku_attrs に入れる (空なら前の ASIN のまま = COALESCE)。行は直前の upsert で必ずある */
+function writeAttrsAsin(item) {
+  const asin = String(item.asin ?? '').trim();
+  if (!asin) return;
+  db.run('UPDATE fba_sku_attrs SET asin = COALESCE(?, asin) WHERE amazon_sku = ?', [asin, item.sku]);
 }
 
 // ===== Amazon仮確定 =====

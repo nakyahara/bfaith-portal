@@ -357,6 +357,7 @@ await ta('10:40 にそろった → 決める: 写しの倉庫在庫でエンジ
   assert.deepEqual((await openProposals()).map((p) => p.qty), [60], '前日の提案は superseded、今日の提案だけ');
   assert.deepEqual(calls.ping.map((p) => p[0]), ['ok'], '提案を記録できたら ok (Company DB に出品が無い・未マップがあって job_runs が partial でも)');
   assert.match((await jobRuns()).at(-1).summary, /提案 1 件/);
+  assert.equal('fnsku_skip_reason' in last.report_sync, false, 'FNSKU を見送っていない日は項目を足さない (今までと同じ形。⑦-F)');
 });
 
 await ta('11:40 (もう決めた日) → 何もしない: 取り込みも計算もしない・書かない・ping しない', async () => {
@@ -476,6 +477,25 @@ await ta('🚨 記録の途中で 25 分を超えた → 確定しない (巻き
   slow = false;
   const again = await runDecisionAttempt(makeDeps({ freshness: fr, mirror }).deps, { nowMs: () => start + 3600e3, log: quiet });
   assert.equal(again.outcome, 'decided', '次の回で決め直せる');
+});
+
+await ta('Sheet なしのモードで miniPC の FNSKU を反映しなかった日 → 提案は記録し、ping は partial・run 要約行に理由 (⑦-F)', async () => {
+  const reason = 'miniPC の FNSKU が fba_sku_attrs からではない (fnsku_source=なし)。Sheet なしのモードなので反映しない';
+  const { deps, calls } = makeDeps({
+    sync: { ok: true, snapshot_date: '2026-10-20', fnsku_skip_reason: reason },
+    freshness: FRESH({
+      restock_source_at: '2026-10-19 22:42:00', restock_source_max: '2026-10-19 22:42:00',
+      planning_source_at: '2026-10-19 22:43:00', planning_source_max: '2026-10-19 22:43:00',
+    }),
+    mirror: { rows: FIXTURE.map((x) => ({ ...x, captured_at: '2026-10-20T00:20:00.000Z' })), meta: META({ captured_at: '2026-10-20T00:20:00.000Z', source_at: '2026-10-20T00:05:00.000Z' }) },
+  });
+  const r = await runDecisionAttempt(deps, { nowMs: at('2026-10-20T00:40:00Z'), log: quiet });
+  assert.equal(r.outcome, 'decided', JSON.stringify(r.detail));
+  assert.deepEqual(calls.ping.map((p) => p[0]), ['partial']);
+  assert.match(calls.ping[0][1], /FNSKU を反映していない/);
+  const last = (await runSummaries()).at(-1).inputs_ref;
+  assert.equal(last.business_date, '2026-10-20');
+  assert.equal(last.report_sync.fnsku_skip_reason, reason);
 });
 
 await ta('runDecisionAttemptSafe: 接続できない → 投げずに ping fail / 同じプロセスで重ねない', async () => {

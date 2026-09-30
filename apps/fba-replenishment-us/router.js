@@ -153,7 +153,7 @@ router.get('/api/allocation', async (req, res) => {
     const { view, alloc } = await computeAll(payload);
     res.json({ ok: true, ...alloc, us_slips: summarizeUsReserved(alloc._usReserved) });
   } catch (e) {
-    const status = e.code === 'JP_DB_NOT_READY' ? 503 : 500;
+    const status = (e.code === 'JP_DB_NOT_READY' || e.code === 'FBA_SHEETLESS_MISCONFIG') ? 503 : 500;   // Sheet なしのモードの設定の誤り (⑦-F) も 503
     res.status(status).json({ ok: false, error: e.code || 'allocation_failed', message: e.message });
   }
 });

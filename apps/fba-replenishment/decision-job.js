@@ -248,6 +248,8 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
         ok: !!sync.ok, error: sync.error || sync.thrown || null, snapshot_date: sync.snapshot_date || null,
         restock: sync.restock ?? null, planning_latest: sync.planning_latest ?? null,
         restock_skip_reason: sync.restock_skip_reason || null, planning_latest_skip_reason: sync.planning_latest_skip_reason || null,
+        // Sheet なしのモードで miniPC の FNSKU を反映しなかった (miniPC のコードが古い。⑦-F)。無い日は項目を足さない (今までと同じ形)
+        ...(sync.fnsku_skip_reason ? { fnsku_skip_reason: sync.fnsku_skip_reason } : {}),
       } : null,
     };
     const rec = await recordShadowDraft(db, result || { items: [], data_quality: {}, snapshot_date: null }, {
@@ -270,7 +272,9 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
       return { outcome: 'gated_final', detail: rec };
     }
     // 試す候補 (v3-3) の材料が読めなかった日は partial で知らせる (提案は記録済み。候補は翌日また計算する)
-    deps.ping(rec.trialsFailed ? 'partial' : 'ok', `${businessDate} 提案${rec.proposals}/不能${rec.blocked}${rec.trialsFailed ? ' / 🚨 試す候補を計算できなかった' : ''} (${trigger})`);
+    //   Sheet なしのモードで FNSKU を反映しなかった日も partial (提案は記録済み。miniPC を配り直すまで FNSKU が古いまま。⑦-F)
+    const fnskuSkipped = !!sync?.fnsku_skip_reason;
+    deps.ping(rec.trialsFailed || fnskuSkipped ? 'partial' : 'ok', `${businessDate} 提案${rec.proposals}/不能${rec.blocked}${rec.trialsFailed ? ' / 🚨 試す候補を計算できなかった' : ''}${fnskuSkipped ? ' / 🚨 FNSKU を反映していない (miniPC が古い)' : ''} (${trigger})`);
     return { outcome: 'decided', detail: rec };
   } finally {
     if (locked) { try { await db.query('select pg_advisory_unlock($1::bigint)', [DECISION_LOCK_KEY]); } catch { /* 接続を閉じればロックも外れる */ } }

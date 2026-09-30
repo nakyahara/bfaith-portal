@@ -73,21 +73,17 @@ async function main() {
 
   const db = await import(pathToFileURL(path.join(root, 'apps', 'fba-replenishment', 'db.js')).href);
   await db.initDb();
-  for (let attempt = 1; ; attempt++) {
-    try {
-      // initDb() は (印が無くモードも無いので) 起動時の backfill を今までどおり流す。ここで数える入った行は 0 になりやすいので、
-      // 流す前に数えた件数も印に残す
-      const r = db.runSkuMappingBackfillOnce({ extra: { before_init: { attrs_rows: before.attrs_rows, would_insert: before.would_insert } } });
-      console.log(`[fba-sheetless-backfill] 済んだ: ${JSON.stringify(r)}`);
-      return;
-    } catch (e) {
-      if (e && e.code === 'FBA_DB_EXTERNAL_WRITE' && attempt < 3) {
-        console.warn(`[fba-sheetless-backfill] 流している間に fba.db が外から書かれた → 読み直してやり直す (${attempt}/3)`);
-        continue;
-      }
-      if (e && (e.code === 'FBA_BACKFILL_ALREADY_DONE' || e.code === 'FBA_BACKFILL_MODE_ON')) return fail(e.message);
-      throw e;
-    }
+  try {
+    // initDb() は (印が無くモードも無いので) 起動時の backfill を今までどおり流す。ここで数える入った行は 0 になりやすいので、
+    // 流す前に数えた件数も印に残す。保存の競合 (常駐のサーバが書いた) は読み直して 3 回までやり直す (試験 = test-fba-sheetless-mode.mjs)
+    const r = db.runSkuMappingBackfillOnceRetrying({
+      extra: { before_init: { attrs_rows: before.attrs_rows, would_insert: before.would_insert } },
+      onRetry: (n) => console.warn(`[fba-sheetless-backfill] 流している間に fba.db が外から書かれた → 読み直してやり直す (${n}/3)`),
+    });
+    console.log(`[fba-sheetless-backfill] 済んだ: ${JSON.stringify(r)}`);
+  } catch (e) {
+    if (e && (e.code === 'FBA_BACKFILL_ALREADY_DONE' || e.code === 'FBA_BACKFILL_MODE_ON')) return fail(e.message);
+    throw e;
   }
 }
 

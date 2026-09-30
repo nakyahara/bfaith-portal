@@ -115,7 +115,7 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
         // FNSKU 更新 (RESTOCK からも取れる)
         const fnskuRows = normalizedRestock
           .filter(r => r.fnsku && r.amazon_sku)
-          .map(r => ({ sku: r.amazon_sku, fnsku: r.fnsku }));
+          .map(r => ({ sku: r.amazon_sku, fnsku: r.fnsku, asin: r.asin || null }));   // asin は Sheet なしのモードのときだけ使う (⑦-F)
         if (fnskuRows.length > 0) db.updateFnskuBatch(fnskuRows);
       }
 
@@ -144,7 +144,7 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
         // PLANNING報告に含まれる全SKUについて現在のFNSKUを明示同期（nullなら明示的にクリア）
         const fnskuRows = results.planning
           .filter(r => r['sku'])
-          .map(r => ({ sku: r['sku'], fnsku: r['fnsku'] || null }));
+          .map(r => ({ sku: r['sku'], fnsku: r['fnsku'] || null, asin: r['asin'] || null }));   // asin は Sheet なしのモードのときだけ使う (⑦-F)
         if (fnskuRows.length > 0) db.syncFnskuBatch(fnskuRows);
       }
 

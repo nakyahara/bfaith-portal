@@ -395,6 +395,11 @@ await t('台帳 (fba-daily-sync・fba-decision-draft) に Sheet なしのモー�
   assert.match(daily.runbook, /ok の基準 = Sheet なしの材料/);
   assert.match(daily.runbook, /fba-sheetless-backfill-once\.mjs/);
   assert.match(jobs.find((j) => j.id === 'fba-decision-draft').runbook, /Sheet なしのモード/);
+  // 一回限りの移行・比べる道具・モードなしの Sheet の経路は一時物 (撤去期限つき)
+  const tmp = jobs.find((j) => j.id === 'fba-sheetless-transition');
+  assert.equal(tmp?.type, 'temporary_asset');
+  assert.match(tmp.remove_by, /^\d{4}-\d{2}-\d{2}$/);
+  assert.match(tmp.where, /fba-sheetless-backfill-once\.mjs/);
 });
 
 // =====================================================================================
@@ -562,6 +567,13 @@ for (const [name, env, re] of [
       assert.deepEqual(called, ['dodai', 'inbound']);
       assert.equal(pings[0][1], 'fail');
       assert.equal((await call('POST', '/api/sync-sku-mappings')).status, 410);
+      // 画面の状態の口・米国の画面も、そのままの 500 ではなく理由 (日本語) を返す
+      const st = await call('GET', '/api/status');
+      assert.equal(st.status, 503);
+      assert.equal(st.body.sheetless_misconfig, true);
+      assert.match(st.body.error, /Sheet なしのモードの設定がそろっていない/);
+      const us = await imp('apps/fba-replenishment-us/router.js');
+      await assert.rejects(us.loadJpInputs(), (e) => e.code === 'FBA_SHEETLESS_MISCONFIG');
     } finally {
       process.env.FBA_SKU_MAPPING_SOURCE = saved.FBA_SKU_MAPPING_SOURCE;
       process.env.FBA_NONFBA_SOURCE = saved.FBA_NONFBA_SOURCE;
@@ -569,6 +581,79 @@ for (const [name, env, re] of [
     }
   });
 }
+
+// =====================================================================================
+console.log('⑨ 大小文字・ASIN・移行のやり直し (独立レビューの直し)');
+await t('モードあり: どのレポートにも無い大文字の SKU は、fba_sku_attrs の大小文字を保つ (除外の完全一致も合う) / モードなしは今までどおり', async () => {
+  modeOn();
+  mdb.prepare(`INSERT INTO mirror_sku_resolved (seller_sku, ne_code, quantity, source, 商品名, source_updated_at, sort_order, synced_at) VALUES ('pr_new001', 'newc', 1, 'master', 'マスタN', ?, 0, ?)`).run(now, now);
+  mdb.prepare('INSERT INTO mirror_sku_master (seller_sku, 商品名, source_created_at, source_updated_at, synced_at) VALUES (?, ?, ?, ?, ?)').run('pr_new001', 'マスタN', now, now, now);
+  db.syncFnskuBatch([{ sku: 'pr_NEW001', fnsku: 'X0NEW1', asin: 'B0NEW00001' }]);
+  const m = db.getSkuMappings().find((x) => x.amazon_sku.toLowerCase() === 'pr_new001');
+  assert.deepEqual([m.amazon_sku, m.fnsku, m.asin], ['pr_NEW001', 'X0NEW1', 'B0NEW00001'], '小文字になった (納品プランの MSKU・除外・非表示の完全一致が外れる)');
+  db.excludeReplenishmentSku('pr_NEW001', '試験');
+  assert.ok(new Set(db.getReplenishmentExcluded().map((e) => e.amazon_sku)).has(m.amazon_sku));
+  db.unexcludeReplenishmentSku('pr_NEW001');
+  modeOff();
+  assert.equal(db.getSkuMappings().find((x) => x.amazon_sku.toLowerCase() === 'pr_new001').amazon_sku, 'pr_new001', 'モードなしで fba_sku_attrs を大小文字の出どころにしている (今までの動きが変わった)');
+});
+await t('モードあり: FNSKU の更新で ASIN も fba_sku_attrs に書く (空なら前のまま) / モードなしは ASIN に触らない', async () => {
+  modeOn();
+  db.updateFnskuBatch([{ sku: 'pr_NEW001', fnsku: 'X0NEW2', asin: 'B0NEW00002' }]);
+  assert.deepEqual([attrsOf('pr_NEW001').fnsku, attrsOf('pr_NEW001').asin], ['X0NEW2', 'B0NEW00002']);
+  db.syncFnskuBatch([{ sku: 'pr_NEW001', fnsku: 'X0NEW3' }, { sku: 'pr_NEW001', fnsku: 'X0NEW3', asin: '  ' }]);
+  assert.deepEqual([attrsOf('pr_NEW001').fnsku, attrsOf('pr_NEW001').asin], ['X0NEW3', 'B0NEW00002']);
+  modeOff();
+  db.syncFnskuBatch([{ sku: 'pr_NEW001', fnsku: 'X0NEW3', asin: 'B0OFF' }]);
+  db.updateFnskuBatch([{ sku: 'Gamma-3', fnsku: 'X0GAMMA3', asin: 'B0OFFG' }]);
+  assert.equal(attrsOf('pr_NEW001').asin, 'B0NEW00002');
+  assert.equal(attrsOf('Gamma-3').asin, null);
+});
+await t('モードあり: Render の引き取りで、同じ回の RESTOCK の ASIN も入れる (SKU の大小文字は無視) / モードなしは入れない', async () => {
+  const pull = (withSource, asin) => (u) => (u.includes('/sync/latest-planning') ? {
+    ok: true, snapshot_date: '2026-09-30', rows: [{ amazon_sku: 'Alpha-1', product_name: 'A', units_sold_30d: 60 }],
+    fnskus: [{ sku: 'pr_NEW001', fnsku: 'X0PULL' }], restock_rows: [{ amazon_sku: 'PR_new001', asin }], planning_latest_rows: [],
+    ...(withSource ? { fnsku_source: 'fba_sku_attrs' } : {}),
+  } : { ok: false });
+  modeOn();
+  miniHandler = pull(true, 'B0FROMRESTOCK');
+  await routerMod.syncLatestPlanningFromMiniPC();
+  assert.deepEqual([attrsOf('pr_NEW001').fnsku, attrsOf('pr_NEW001').asin], ['X0PULL', 'B0FROMRESTOCK']);
+  modeOff();
+  miniHandler = pull(false, 'B0OFFPULL');
+  await routerMod.syncLatestPlanningFromMiniPC();
+  assert.equal(attrsOf('pr_NEW001').asin, 'B0FROMRESTOCK');
+});
+await t('移行のやり直し: 流している間に常駐のサーバが fba.db を書いた → 読み直して 1 回やり直し、相手の行も印も残る', async () => {
+  modeOff();
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'fba-sheetless-2-'));
+  const dbUrl = pathToFileURL(path.join(root, 'apps', 'fba-replenishment', 'db.js')).href;
+  process.env.DATA_DIR = dir2;   // db.js は import の時点で DATA_DIR を読む。module の実体を分ける = 別のプロセスの代わり
+  const A = await import(dbUrl + '?proc=resident');
+  const B = await import(dbUrl + '?proc=script');
+  process.env.DATA_DIR = dataDir;
+  await A.initDb();
+  A.upsertSkuMappings([{ amazon_sku: 'Kilo-1', asin: 'B0KILO', ne_code: 'kilo' }]);
+  await tick();
+  await B.initDb();   // 移行のスクリプトの役 (起動時の backfill で Kilo-1 が入る)
+  await tick();
+  let code = null;
+  try { A.updateSetting('resident_memo', 'a1'); } catch (e) { code = e.code; }
+  assert.equal(code, 'FBA_DB_EXTERNAL_WRITE', '前提: 常駐の役もスクリプトの保存に気づく');
+  A.updateSetting('resident_memo', 'a1');   // 常駐の役はやり直して書く (スクリプトが読んだ後)
+  await tick();
+  const retries = [];
+  const r = B.runSkuMappingBackfillOnceRetrying({ onRetry: (n, e) => retries.push([n, e.code]) });
+  assert.deepEqual(retries, [[1, 'FBA_DB_EXTERNAL_WRITE']]);
+  assert.equal(r.attrs_after, 1);
+  const f = new Database(path.join(dir2, 'fba.db'), { readonly: true });
+  try {
+    assert.equal(f.prepare(`SELECT value FROM settings WHERE key = 'resident_memo'`).get()?.value, 'a1', '常駐の役の行が消えた');
+    assert.equal(f.prepare('SELECT key FROM fba_migration_marks').get()?.key, sheetless.BACKFILL_MARK_KEY);
+  } finally { f.close(); }
+  // もう一度流しても断る (印がある)
+  assert.throws(() => B.runSkuMappingBackfillOnceRetrying(), (e) => e.code === 'FBA_BACKFILL_ALREADY_DONE');
+});
 
 server.close();
 globalThis.fetch = realFetch;

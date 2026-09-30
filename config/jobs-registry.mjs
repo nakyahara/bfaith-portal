@@ -1031,12 +1031,32 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',
     runbook: 'Render Logs で「FBA-Decision」を検索。ok = その日の提案を記録した / partial = 11:40 でも入力がそろわず「今日は決められない」を記録 (前日以前の提案は superseded) / fail = 計算の失敗・例外。'
       + 'Sheet なしのモード (FBA_SHEETLESS_MODE=1) で SKU の対応・商品管理リスト・env が欠けた日も fail (「Sheet なしのモード: 理由」。Sheet の値には戻らない・fba-daily-sync の note と同じ理由)。'
+      + '同じモードで miniPC の FNSKU を反映しなかった日 (miniPC のコードが古い = ?fnsku_source=attrs に答えない) は、提案を記録したうえで partial '
+      + '(note「🚨 FNSKU を反映していない」・run 要約行の report_sync.fnsku_skip_reason)。miniPC を配り直す。'
       + '09:40・10:40 で入力がそろわない回は ping せず ops.job_runs (job_id=fba-decision-draft) に「待機 (理由)」を残す。'
       + '理由コード: report_not_this_morning (RESTOCK/PLANNING の元データが今日 05:00 JST より前 = miniPC の daily-sync の Amazon 取得を確認) / '
       + 'report_sync_failed・report_sync_skipped (取り込みの失敗・件数急減ガード) / warehouse_mirror_not_ready (ロジザード毎時取り込み logizard-stock-hourly と写しの転送を確認) / '
       + 'inbound_working_not_fresh (miniPC の準備中の取得) / self_sales_unavailable / pending_slips_unknown。'
       + 'その日に決めたか = ai.decisions の dedupe_key=fba_replenishment:__run__ で inputs_ref.business_date と decision_final。'
       + '試行は Company DB の advisory lock (鍵 0x46424144) で 1 本に絞る。COMPANY_DB_URL が無ければ何もしない (ping も無い → 締切で通知)',
+  },
+  {
+    id: 'fba-sheetless-transition',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: 'Claude + 中原さん',
+    purpose: 'FBA 補充を Google Sheet「商品コード変換テーブル」から切り離すまでの一時のもの (マスタ正本切替 ⑦-F)。'
+      + '① 一回限りの移行 scripts/fba-sheetless-backfill-once.mjs (Render と miniPC の fba.db に印 fba_migration_marks を書く) '
+      + '② 同じか確かめる道具 scripts/fba-sheetless-parity.mjs (モードなしで master と同じ出力か) '
+      + '③ モードを使わないときの Sheet の経路 (06:00 の Sheet の同期・手の Sheet 同期の口・sku_mapping と fba_sku_attrs の二重書き・起動時の backfill・Sheet の値への戻り) と env FBA_SHEETLESS_MODE の切り替えそのもの。'
+      + 'モードを入れて 7 日問題が無ければ、片付けの PR で ①② を消し、③ を外して Sheet なしを既定にする (sku_mapping は読み取り専用で残すか消すかをそこで決める)',
+    where: 'scripts/fba-sheetless-backfill-once.mjs・scripts/fba-sheetless-parity.mjs・apps/fba-replenishment/sheetless-mode.js・'
+      + 'apps/fba-replenishment/db.js / router.js / sheets-sync.js の Sheet の経路・apps/warehouse/fba-service.js の /sync-sku-mappings と /sync/latest-planning の fnsku_source',
+    remove_by: '2027-01-31',
+    lifecycle: 'temporary',
+    runbook: 'モードを入れる手順 = fba-daily-sync の runbook (① を Render と miniPC で 1 回ずつ → Render の env)。'
+      + '片付け = モードを 7 日動かして fba-daily-sync・fba-decision-draft が ok なら、①② と Sheet の経路を消す PR を出し、このエントリを消す。'
+      + '切替が延びるなら remove_by を延ばす (理由を書く)',
   },
   {
     id: 'inbound-info-daily',

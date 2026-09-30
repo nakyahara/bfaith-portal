@@ -375,7 +375,8 @@ export async function syncLatestPlanningFromMiniPC() {
     console.warn(`[FBA] 同期: ${fnskuSkipReason}`);
   } else if (fnskus.length > 0) {
     // syncFnskuBatch は null も反映（FNSKUが外された商品を正しく同期）
-    syncFnskuBatch(fnskus);
+    // Sheet なしのモード: 同じ回の RESTOCK の ASIN も fba_sku_attrs に入れる (新しい SKU の ASIN は Sheet の backfill では入らなくなる。⑦-F)
+    syncFnskuBatch(sheetless ? withRestockAsin(fnskus, pull.restock_rows) : fnskus);
     savedFnskus = fnskus.length;
   }
 
@@ -428,6 +429,14 @@ export async function syncLatestPlanningFromMiniPC() {
     snapshot_date: snapshotDate,
     ...(fnskuSkipReason ? { fnsku_skip_reason: fnskuSkipReason } : {}),
   };
+}
+
+/** FNSKU の行に、同じ回の RESTOCK の ASIN を付ける (SKU は大小文字・前後の空白を無視して突き合わせる。無ければ付けない) */
+function withRestockAsin(fnskus, restockRows) {
+  const k = (v) => String(v ?? '').trim().toLowerCase();
+  const asinOf = new Map();
+  for (const r of restockRows || []) if (r && r.amazon_sku && r.asin) asinOf.set(k(r.amazon_sku), r.asin);
+  return fnskus.map((f) => (asinOf.has(k(f.sku)) ? { ...f, asin: asinOf.get(k(f.sku)) } : f));
 }
 
 router.post('/api/sync-latest-planning', async (req, res) => {
@@ -1176,7 +1185,14 @@ router.delete('/api/replenishment-excluded/:sku', (req, res) => {
 router.get('/api/status', (req, res) => {
   const snapshots = getLatestSnapshots();
   const restockRows = getRestockLatest();
-  const mappings = getSkuMappings();
+  let mappings;
+  try {
+    mappings = getSkuMappings();
+  } catch (e) {
+    // Sheet なしのモードの設定の誤り (⑦-F) は、そのままの 500 ではなく理由を日本語で返す。ほかの失敗は今までどおり
+    if (e && e.code === 'FBA_SHEETLESS_MISCONFIG') return res.status(503).json({ error: e.message, sheetless_misconfig: true });
+    throw e;
+  }
   const warehouse = getWarehouseInventory();
   const warehouseProducts = new Set(warehouse.map(w => w.logizard_code)).size;
   // 新データソース (RESTOCK) があればそれを正、無ければ従来 snapshot を使う
