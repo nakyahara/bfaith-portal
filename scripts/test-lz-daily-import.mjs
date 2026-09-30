@@ -414,6 +414,14 @@ const show = (html) => { const o = document.getElementById('popup_overlay'); o.i
 const hide = () => { document.getElementById('popup_overlay').style.display = 'none'; };
 const RES = 'インポート結果 総件数 : 1 処理件数 : 1 処理不要件数 : 0 エラー件数 : 0';
 function dialog(text, okId, extra = '') { return '<div class="ui-dialog"><div class="ui-dialog-content">' + text + '</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="' + okId + '"' + extra + '></div></div>'; }
+// 本物のロジザードの確認 (jAlerts の jConfirm・2026-09-30 の実機の形): 覆い #popup_overlay の兄弟に箱 #popup_container (z-index が覆いより上)
+function jbox(kind, msg, panel, { title = '<h1 id="popup_title"></h1>', overlay = true } = {}) {
+  const ov = document.getElementById('popup_overlay'); ov.innerHTML = '';
+  ov.style.cssText = overlay ? 'position:absolute;z-index:99998;top:0;left:0;width:100%;height:1400px;background:#fff;opacity:0.01' : 'display:none';
+  document.body.insertAdjacentHTML('beforeend', '<div id="popup_container" class="ui-draggable" style="position:fixed;z-index:99999;min-width:395px;top:100px;left:100px;background:#fff">' + title + '<div id="popup_content" class="' + kind + '"><div id="popup_message">' + msg + '</div><div id="popup_panel">' + panel + '</div></div></div>');
+}
+function jclose() { const c = document.getElementById('popup_container'); if (c) c.remove(); document.getElementById('popup_overlay').style.display = 'none'; }
+const JPANEL = '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok"> <input type="button" value="&nbsp;Cancel&nbsp;" id="popup_cancel">';
 function result() {
   if (V === 'session') { location.href = '/login'; return; }
   const n = V === 'tworesults' ? 2 : 1;
@@ -445,6 +453,43 @@ document.getElementById('FM07_01_executeBtn').onclick = () => {
   if (V === 'noconfirm') { setTimeout(result, 200); return; }
   if (V === 'staleinclick') { show(dialog('ファイルアップロードを開始します', 'cfmOk')); document.getElementById('cfmOk').onclick = () => log('cfmOk'); return; }   // 古い結果の後に確認が出る
   if (V === 'othermodal') { show('<div class="ui-dialog">取込できません (形式が違います)</div>'); return; }
+  // ── 本物の形 (jAlerts) ──
+  if (V.startsWith('jconfirm') || V.startsWith('jreal')) {
+    const FULL = 'ファイルアップロードを開始します。よろしいですか?';
+    const MSG = { 'jconfirm-extra': 'ファイルアップロードを開始します。在庫をすべて削除します。よろしいですか?', 'jconfirm-fullwidth': 'ファイルアップロードを開始します。よろしいですか？',
+      'jconfirm-short': 'ファイルアップロードを開始します', 'jconfirm-noperiod': 'ファイルアップロードを開始しますよろしいですか?',
+      'jconfirm-msginput': FULL + '<input type="checkbox" id="chk">', 'jconfirm-nested': FULL + '<div class="ui-dialog">在庫を削除<input type="button" value="OK" id="nestOk"></div>',
+      'jreal-prompt': FULL + '<br><input type="text" size="30" id="popup_prompt">' };
+    const msg = V === 'jconfirm-dupmsg' || V === 'jconfirm-uicontainer' ? 'ファイルアップロードを開始します' : (MSG[V] || FULL);
+    const kind = V === 'jreal-alert' ? 'alert' : V === 'jreal-prompt' ? 'prompt' : V === 'jconfirm-twoclass' ? 'confirm alert' : V === 'jconfirm-innerui' ? 'confirm ui-dialog' : 'confirm';
+    // 非表示の重複の #popup_message (前にある = getElementById が拾う) に全文・見えている箱は短い文
+    if (V === 'jconfirm-dupmsg') document.body.insertAdjacentHTML('afterbegin', '<div style="display:none"><div id="popup_message">' + FULL + '</div></div>');
+    const PANEL = { 'jconfirm-twook': JPANEL + ' <input type="button" value="OK" id="popup_ok2">', 'jconfirm-okonly': '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok">',
+      'jreal-alert': '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok">',
+      'jconfirm-otherbtn': '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok"> <input type="button" value="削除" id="popup_delete">',
+      'jconfirm-cancellabel': '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok"> <input type="button" value="削除" id="popup_cancel">' };
+    jbox(kind, msg, PANEL[V] || JPANEL, { title: V === 'jconfirm-notitle' ? '' : V === 'jconfirm-h2title' ? '<h2 id="popup_title"></h2>' : undefined, overlay: V !== 'jconfirm-nooverlay' });
+    // 入力欄が箱の外 (文言と台の間) に足された形
+    if (V === 'jconfirm-prompt') document.getElementById('popup_message').insertAdjacentHTML('afterend', '<input type="text" id="popup_prompt">');
+    // 形の違う箱 (Cancel なし) に ui-dialog / role=dialog が付いた = 前の道に回さない
+    if (V === 'jconfirm-uicontainer') { const b = document.getElementById('popup_container'); b.classList.add('ui-dialog'); b.setAttribute('role', 'dialog'); document.getElementById('popup_cancel').remove(); }
+    if (V === 'jconfirm-uionly') { document.getElementById('popup_container').classList.add('ui-dialog'); document.getElementById('popup_cancel').remove(); }
+    if (V === 'jconfirm-roleonly') { document.getElementById('popup_container').setAttribute('role', 'dialog'); document.getElementById('popup_cancel').remove(); }
+    // ボタンの type が button でない
+    if (V === 'jconfirm-submit') document.getElementById('popup_ok').type = 'submit';
+    if (V === 'jconfirm-cancelsubmit') document.getElementById('popup_cancel').type = 'submit';
+    // 見えている覆いはあるが箱の兄弟ではない (箱を別の div で包む)
+    if (V === 'jconfirm-notsibling') { const c = document.getElementById('popup_container'); const w = document.createElement('div'); c.parentNode.insertBefore(w, c); w.appendChild(c); }
+    // 外側の前の道の枠 (ui-dialog) が形の違う箱 (覆いの兄弟でない・Cancel なし) を包む = 外側から押さない
+    if (V === 'jconfirm-outerui') { const c = document.getElementById('popup_container'); document.getElementById('popup_cancel').remove(); const w = document.createElement('div'); w.className = 'ui-dialog'; w.style.cssText = 'position:fixed;z-index:99999;top:100px;left:100px'; c.parentNode.insertBefore(w, c); w.appendChild(c); c.style.position = 'static'; }
+    if (V === 'jconfirm-covered') document.body.insertAdjacentHTML('beforeend', '<div style="position:fixed;z-index:100000;top:0;left:0;width:100%;height:100%"></div>');   // 箱の上にさらに覆い
+    document.getElementById('popup_ok').onclick = () => { log('cfmOk'); jclose(); document.getElementById('busy').style.display = 'block';
+      // 結果の表示も jAlerts (jAlert = .alert) で出る形 / いつもの形
+      setTimeout(() => { document.getElementById('busy').style.display = 'none'; if (V === 'jconfirm-jresult') { jbox('alert', RES, '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok">'); } else result(); }, 300); };
+    for (const id of ['popup_ok2', 'nestOk']) if (document.getElementById(id)) document.getElementById(id).onclick = () => log('otherOk');
+    return;
+  }
+  if (V === 'uidialog-hidetitle') { show('<div class="ui-dialog"><div id="popup_title">在庫をすべて削除します</div><div class="ui-dialog-content">ファイルアップロードを開始します</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
   if (V === 'sharedshort') { show('<div class="ui-dialog"><div>ファイルアップロードを開始します</div><div>削除しますか<input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
   if (V === 'secondconfirm') {   // 確認の OK が押せるようになる前に 2 つ目の確認が出る
     show(dialog('ファイルアップロードを開始します', 'cfmOk', ' disabled'));
@@ -544,6 +589,28 @@ await ta('[11] 押す部品 executeImport: 実行 → 決まった文言のモ�
     let x = await run('ok');
     assert.deepEqual([x.out.executeIssued, x.out.confirm, x.out.reason, x.issued, x.log], [true, 'clicked', null, ['issued'], ['execute', 'cfmOk']]);
     assert.equal(K.judgeImportResult(K.parseImportResult(x.out.resultText), 1).to, 'imported_unverified');
+    // ── 本物の形 (jAlerts の jConfirm・2026-09-30 の実機の試験で見た) ──
+    x = await run('jconfirm');   // 覆いと箱が兄弟・OK の値に &nbsp; = 押せる → 結果を読む
+    assert.deepEqual([x.out && x.out.confirm, x.out && x.out.reason, x.log], ['clicked', null, ['execute', 'cfmOk']]);
+    assert.equal(K.judgeImportResult(K.parseImportResult(x.out.resultText), 1).to, 'imported_unverified');
+    x = await run('jconfirm-jresult');   // 結果も jAlerts の箱で出る = 読める
+    assert.deepEqual([x.out && x.out.confirm, x.out && x.out.reason, x.log], ['clicked', null, ['execute', 'cfmOk']]);
+    assert.equal(K.judgeImportResult(K.parseImportResult(x.out.resultText), 1).to, 'imported_unverified');
+    for (const [v, why] of [
+      ['jreal-alert', '本物の jAlert (お知らせ = .alert + OK だけ)'], ['jreal-prompt', '本物の jPrompt (.prompt + 文言の中に入力欄 + OK / Cancel)'],
+      ['jconfirm-extra', '文言の後に別の文'], ['jconfirm-fullwidth', '全角の ？ (実機は半角)'], ['jconfirm-short', '質問の部分が無い'], ['jconfirm-noperiod', '句点が無い'],
+      ['jconfirm-twook', 'OK が 2 つ'], ['jconfirm-okonly', 'Cancel が無い'], ['jconfirm-otherbtn', '2 つ目のボタンが Cancel でない'], ['jconfirm-cancellabel', '同じ ID で表示が「削除」'],
+      ['jconfirm-prompt', '文言と台の間に入力欄'], ['jconfirm-msginput', '文言の中に入力欄'], ['jconfirm-nested', '文言の中に入れ子の枠 + 外側にも OK'],
+      ['jconfirm-notitle', '題が無い'], ['jconfirm-h2title', '題が h1 でない'], ['jconfirm-twoclass', 'class が confirm alert'], ['jconfirm-nooverlay', '覆いが無い (見えない)'], ['jconfirm-covered', '箱の上に覆い'],
+      ['jconfirm-innerui', '中身が confirm ui-dialog (前の道に回さない)'], ['jconfirm-uicontainer', '形の違う箱に ui-dialog・role=dialog (前の道に回さない)'], ['jconfirm-dupmsg', '非表示の重複の文言は照らさない (見えている箱は短い文)'],
+      ['uidialog-hidetitle', '前の道の枠の中の id=popup_title の文字も本文に数える'],
+      ['jconfirm-uionly', '形の違う箱に ui-dialog だけ'], ['jconfirm-roleonly', '形の違う箱に role=dialog だけ'], ['jconfirm-submit', 'OK の type が submit'], ['jconfirm-cancelsubmit', 'Cancel の type が submit'],
+      ['jconfirm-notsibling', '見えている覆いが箱の兄弟でない'], ['jconfirm-outerui', '外側の ui-dialog が形の違う箱を包む (外側から押さない)'],
+    ]) {
+      x = await run(v);
+      assert.deepEqual([x.err && x.err.executeIssued, x.log], [true, ['execute']], `${v}: ${why} = 押さない`);
+      assert.match(String(x.err && x.err.reason), /^confirm_(unidentified|covered|ambiguous)$/, v);
+    }
     x = await run('decoy');   // 関係ない「お知らせ」の OK は押さない
     assert.deepEqual([x.out.confirm, x.log], ['clicked', ['execute', 'cfmOk']]);
     x = await run('noconfirm');   // 確認が出ない = 押さずに結果を待つ
