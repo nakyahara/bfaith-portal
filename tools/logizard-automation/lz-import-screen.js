@@ -98,6 +98,8 @@ export async function selectOptionByText(page, sel, label, what, { log = console
  *        形が違う = 枠にしない = unidentified (jAlert = .alert + OK だけ・jPrompt = .prompt + 入力欄 も枠にしない)。
  *        文言は #popup_message の文字 (空白を除く) が JCONFIRM_TEXT と完全一致だけ (呼び手が jconfirmExact で渡す。渡さない = jConfirm は押さない)。
  *      #popup_container の中 (自身も) は、この形を満たす箱そのものだけが候補 (形の違う箱に ui-dialog / role=dialog が付いても前の道に回さない。Codex #1553 R2)。
+ *      前の道の枠 (ui-dialog / role=dialog) が #popup_container を中に含む = 候補にしない・中の #popup_container は形に依らず入れ子として本文とボタンから外す
+ *      (形の違う箱を外側の枠で包んで押す、をさせない。二重の守り。Codex #1553 R3 Medium)。
  *      題 (#popup_title) を本文に数えないのは、形を満たした箱の直下の題だけ (ほかの枠の中の id=popup_title は数える)。文言は選んだ箱の中の #popup_message で照らす
  *      本文 = 枠の中の見えている文字を空白を除いてつなげたもの (入れ子の枠・ボタン・タイトルの帯 ui-dialog-titlebar・決まった語 (確認・お知らせ・メッセージ・×・閉じる・キャンセル) を除く)。
  *      改行や <br> で文が分かれても同じ (Codex #1521 R3 Medium)。無い = unidentified (文言が枠の外)・2 つ以上 = ambiguous
@@ -131,7 +133,7 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
     };
     const isRoot = (el) => el.nodeType === 1 && (el.getAttribute('role') === 'dialog' || el.classList.contains('ui-dialog') || isJConfirm(el));
     // 枠の候補: jAlerts の箱の中 (自身も) は形を満たす箱そのものだけ = 形の違う箱に ui-dialog / role=dialog が付いても前の道に回らない (Codex #1553 R2 Medium)
-    const candidate = (el) => (el.closest('#popup_container') ? isJConfirm(el) : isRoot(el));
+    const candidate = (el) => (el.closest('#popup_container') ? isJConfirm(el) : (isRoot(el) && !el.querySelector('#popup_container')));
     const squash = (s) => String(s || '').replace(/\s+/g, '');
     const N = squash(needle);
     const bodyAll = squash(document.body.innerText);
@@ -140,7 +142,7 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
     if (count > 1) return { state: 'ambiguous', why: `text_${count}` };
     const ALLOWED = new Set(['確認', 'お知らせ', 'メッセージ', '×', '閉じる', 'キャンセル']);
     const bodyOf = (root) => {
-      const nested = [...root.querySelectorAll('*')].filter(isRoot);
+      const nested = [...root.querySelectorAll('*')].filter((x) => isRoot(x) || x.id === 'popup_container');   // 中の jAlerts の箱は形に依らず入れ子
       const jTitle = isJConfirm(root) ? root.children[0] : null;   // 数えない題 = 形を満たした箱の直下の h1#popup_title だけ
       let t = '';
       const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);

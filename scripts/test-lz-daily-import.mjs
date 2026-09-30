@@ -473,6 +473,15 @@ document.getElementById('FM07_01_executeBtn').onclick = () => {
     if (V === 'jconfirm-prompt') document.getElementById('popup_message').insertAdjacentHTML('afterend', '<input type="text" id="popup_prompt">');
     // 形の違う箱 (Cancel なし) に ui-dialog / role=dialog が付いた = 前の道に回さない
     if (V === 'jconfirm-uicontainer') { const b = document.getElementById('popup_container'); b.classList.add('ui-dialog'); b.setAttribute('role', 'dialog'); document.getElementById('popup_cancel').remove(); }
+    if (V === 'jconfirm-uionly') { document.getElementById('popup_container').classList.add('ui-dialog'); document.getElementById('popup_cancel').remove(); }
+    if (V === 'jconfirm-roleonly') { document.getElementById('popup_container').setAttribute('role', 'dialog'); document.getElementById('popup_cancel').remove(); }
+    // ボタンの type が button でない
+    if (V === 'jconfirm-submit') document.getElementById('popup_ok').type = 'submit';
+    if (V === 'jconfirm-cancelsubmit') document.getElementById('popup_cancel').type = 'submit';
+    // 見えている覆いはあるが箱の兄弟ではない (箱を別の div で包む)
+    if (V === 'jconfirm-notsibling') { const c = document.getElementById('popup_container'); const w = document.createElement('div'); c.parentNode.insertBefore(w, c); w.appendChild(c); }
+    // 外側の前の道の枠 (ui-dialog) が形の違う箱 (覆いの兄弟でない・Cancel なし) を包む = 外側から押さない
+    if (V === 'jconfirm-outerui') { const c = document.getElementById('popup_container'); document.getElementById('popup_cancel').remove(); const w = document.createElement('div'); w.className = 'ui-dialog'; w.style.cssText = 'position:fixed;z-index:99999;top:100px;left:100px'; c.parentNode.insertBefore(w, c); w.appendChild(c); c.style.position = 'static'; }
     if (V === 'jconfirm-covered') document.body.insertAdjacentHTML('beforeend', '<div style="position:fixed;z-index:100000;top:0;left:0;width:100%;height:100%"></div>');   // 箱の上にさらに覆い
     document.getElementById('popup_ok').onclick = () => { log('cfmOk'); jclose(); document.getElementById('busy').style.display = 'block';
       // 結果の表示も jAlerts (jAlert = .alert) で出る形 / いつもの形
@@ -595,6 +604,8 @@ await ta('[11] 押す部品 executeImport: 実行 → 決まった文言のモ�
       ['jconfirm-notitle', '題が無い'], ['jconfirm-h2title', '題が h1 でない'], ['jconfirm-twoclass', 'class が confirm alert'], ['jconfirm-nooverlay', '覆いが無い (見えない)'], ['jconfirm-covered', '箱の上に覆い'],
       ['jconfirm-innerui', '中身が confirm ui-dialog (前の道に回さない)'], ['jconfirm-uicontainer', '形の違う箱に ui-dialog・role=dialog (前の道に回さない)'], ['jconfirm-dupmsg', '非表示の重複の文言は照らさない (見えている箱は短い文)'],
       ['uidialog-hidetitle', '前の道の枠の中の id=popup_title の文字も本文に数える'],
+      ['jconfirm-uionly', '形の違う箱に ui-dialog だけ'], ['jconfirm-roleonly', '形の違う箱に role=dialog だけ'], ['jconfirm-submit', 'OK の type が submit'], ['jconfirm-cancelsubmit', 'Cancel の type が submit'],
+      ['jconfirm-notsibling', '見えている覆いが箱の兄弟でない'], ['jconfirm-outerui', '外側の ui-dialog が形の違う箱を包む (外側から押さない)'],
     ]) {
       x = await run(v);
       assert.deepEqual([x.err && x.err.executeIssued, x.log], [true, ['execute']], `${v}: ${why} = 押さない`);
