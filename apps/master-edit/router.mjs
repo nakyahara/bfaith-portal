@@ -14,6 +14,12 @@
  *   GET  /sku/:code/history  変更の記録
  *   GET  /api/lookup?code=   構成品の引き当て
  *   POST /api/sku/:code      保存 { request_id, reason?, seen: { token (編集の印), event_id? }, values: {...} }
+ *   GET  /new?kind=single|set 新商品の登録 (画面 D・⑤-2a)
+ *   GET  /api/code-check?code= 新しい商品コードを確かめる (形 + Company DB・NE・使ったことがあるか)
+ *   POST /api/new            新商品の登録 { request_id, kind, code, reason?, values: {...}, card: {...} } (lib/master-register.mjs)。
+ *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
+ *   POST /api/sku/:code/card-retry  カードの取り込みをもう一度 (名簿の人・衝突 / 失敗の知らせも試す)
+ *   POST /api/sku/:code/card-link   衝突を解く = 既存のカード (同じ商品コード) をこの商品に結ぶ (名簿の人。PR #1566 R1 M6)
  * Company DB に届かない = 画面は「つながらない (保存できない)」の帯・保存は 503 (何も書かない)。SQLite と NE には書かない
  * env: COMPANY_DB_MASTER_EDIT_URL = この画面だけのロール master_edit (scripts/company-db/create-master-edit-roles.mjs が作る。読む・この画面の書き込みだけ・
  *        切替の段階を進める関数・構成の依頼を上げる / 観測を書く権限は無い)。🚨 保存はこの接続だけ = 無ければ見るだけ (保存は 503・#1563 R1 M8)
@@ -25,7 +31,11 @@ import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { MASTER_OWNERSHIP, validateOwnership } from '../../config/master-ownership.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS } from '../../lib/master-write.mjs';
-import { listSkus, readSkuPage, lookupSku, skuHistory, normalizeFilters, KINDS, MISSING, STATES } from './read.mjs';
+import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
+import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
+import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
+import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
+import { listSkus, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES } from './read.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -61,6 +71,36 @@ async function defaultShippingRates() {
 }
 let shippingRatesProvider = defaultShippingRates;
 export function __setShippingRatesProvider(fn) { shippingRatesProvider = fn || defaultShippingRates; }
+
+/**
+ * product-hub のカードの取り込み (SQLite)。本番 = apps/product-hub/services/cdb-card-intake.js (使うときに読む = この画面の試験は SQLite 無しで動く)。
+ * 試験は差し替える
+ */
+let cardApplier = null;
+export function __setCardApplier(fn) { cardApplier = fn || null; }
+async function applyCard(ev) {
+  if (cardApplier) return cardApplier(ev);
+  const m = await import('../product-hub/services/cdb-card-intake.js');
+  return m.applyCdbCardEvent(ev);
+}
+/** 衝突を解く (既存のカードに結ぶ)。本番 = cdb-card-intake.js の linkCdbCardToExisting。試験は差し替える */
+let cardLinker = null;
+export function __setCardLinker(fn) { cardLinker = fn || null; }
+async function linkCard(ev, opts) {
+  if (cardLinker) return cardLinker(ev, opts);
+  const m = await import('../product-hub/services/cdb-card-intake.js');
+  return m.linkCdbCardToExisting(ev, opts);
+}
+/** 知らせを 1 つ取り込む (保存の直後・「もう一度」)。誤りは投げない (画面に「カード作成待ち」を出す) */
+async function tryCard(db, { eventId = null, skuId = null, manual = false }) {
+  try {
+    const r = await runCardOutbox(db, applyCard, { eventId, skuId, manual, limit: 1 });
+    return r[0] || null;
+  } catch (e) {
+    console.error(`[master-edit] カードの取り込みの失敗: ${e && e.message}`);
+    return { status: 'pending', error: String(e && e.message || e) };
+  }
+}
 
 // ─── CSRF 二段ガード (マスタの判断と同じ): 書く API は Origin 必須で Host と一致・Content-Type は JSON ───
 router.use('/api/', (req, res, next) => {
@@ -157,10 +197,26 @@ router.get('/', (req, res) => {
     const filters = normalizeFilters(req.query);
     const data = db ? await listSkus(db, filters, { now: new Date(clock()) }) : { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false };
     const phase = db ? await readCutoverPhase(db) : null;
-    res.render(view('index.ejs'), { ...pageLocals(req, phase), dbError, data, filters, KINDS, MISSING, STATES, fmt });
+    res.render(view('index.ejs'), { ...pageLocals(req, phase), dbError, data, filters, KINDS, MISSING, STATES, REG_STATES, fmt });
   });
 });
 router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), MAX_COMPONENTS }));
+
+// 新商品の登録 (画面 D)。つながらないときも画面は出す (帯・保存のボタンは出さない)
+router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const kind = Object.prototype.hasOwnProperty.call(KINDS_NEW, String(req.query.kind || '')) ? String(req.query.kind) : 'single';
+  const page = db ? await readNewPage(db) : null;
+  const shipping = await shippingRatesProvider();
+  const locals = pageLocals(req, page ? page.phase : null);
+  const own = ownershipNow();
+  res.render(view('new.ejs'), {
+    ...locals, dbError, kind, page, fmt, KINDS_NEW, MAX_COMPONENTS, MAX_REFERENCE_URLS,
+    // 登録を開いているか = 段階 new_open・MASTER_EDIT_OPEN・この種類で書く列の持ち主が全部 company (lib/master-register.mjs と同じ)
+    entryClosed: !newEntryWritable(page ? page.phase : null) || !isOpen() || NEW_ENTRY_KEYS[kind].some((k) => own[k] !== 'company'),
+    shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
+    yahooDeliveries: Object.values(SHIPPING_METHOD_GROUPS), setPlanChoices: SET_PLAN_CHOICES, setDecisionReasons: SET_DECISION_REASONS,
+  });
+}));
 
 router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) => {
   const now = new Date(clock());
@@ -168,7 +224,7 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
   if (db && !page) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), message: `商品コード ${req.params.code} は Company DB にありません` });
   const shipping = page ? await shippingRatesProvider() : null;
   res.render(view('sku.ejs'), {
-    ...pageLocals(req, page ? page.phase : null), dbError, page, code: req.params.code, fmt, KINDS, STATES, MAX_COMPONENTS,
+    ...pageLocals(req, page ? page.phase : null), dbError, page, code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS,
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
   });
 }));
@@ -185,6 +241,62 @@ router.get('/api/lookup', (req, res) => withPgApi(res, async (db) => {
   if (!item) return res.status(404).json({ ok: false, error: `${code} は Company DB にありません` });
   res.json({ ok: true, item });
 }));
+
+router.get('/api/code-check', (req, res) => withPgApi(res, async (db) => {
+  const code = String(req.query.code ?? '');
+  if (code.length > 60) return res.status(400).json({ ok: false, error: '長すぎます' });
+  res.json(await checkNewCodeInDb(db, code));
+}));
+
+router.post('/api/new', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  return withPgApi(res, async (db) => {
+    const r = await registerNewSku(db, {
+      actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card,
+    }, { open: isOpen(), ownership: ownershipNow(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined });
+    // カードは保存の後で 1 回だけ試す (同じ取引ではない = 失敗しても登録はできている。ボードを開いたとき・「もう一度」で続きを)
+    let card = r.card || null;
+    if (card && card.status !== 'done') {
+      const t = await tryCard(db, { eventId: card.event_id });
+      if (t) card = { ...card, status: t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null };
+    }
+    res.json({ ...r, card, card_label: card ? CARD_STATUS_LABELS[card.status] || card.status : null });
+  });
+});
+
+router.post('/api/sku/:code/card-retry', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  return withPgApi(res, async (db) => {
+    const sku = (await db.query('select sku_id::text as id from core.skus where company_id = 1 and code_norm = core.norm_code($1)', [String(req.params.code || '')])).rows[0];
+    if (!sku) return res.status(404).json({ ok: false, error: `商品コード ${req.params.code} は Company DB にありません` });
+    const t = await tryCard(db, { skuId: sku.id, manual: true });
+    if (!t) return res.status(409).json({ ok: false, error: 'もう一度試せる知らせがありません (作成済み・カードを作らない登録・ほかの処理が取り込み中)', reason: 'nothing_to_retry' });
+    res.json({ ok: t.status === 'done', status: t.status, label: CARD_STATUS_LABELS[t.status] || t.status, error: t.error ?? null, draft_id: t.result?.draft_id ?? null });
+  });
+});
+
+router.post('/api/sku/:code/card-link', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  return withPgApi(res, async (db) => {
+    const sku = (await db.query('select sku_id::text as id from core.skus where company_id = 1 and code_norm = core.norm_code($1)', [String(req.params.code || '')])).rows[0];
+    if (!sku) return res.status(404).json({ ok: false, error: `商品コード ${req.params.code} は Company DB にありません` });
+    let r;
+    try {
+      r = await linkCardToExisting(db, linkCard, { skuId: sku.id, actor: String(req.session.email).trim().toLowerCase() });
+    } catch (e) {
+      if (e && e.code === 'CDB_CARD_INVALID') return res.status(409).json({ ok: false, error: `結べませんでした: ${e.message}`, reason: 'link_refused' });
+      throw e;
+    }
+    if (r.ok) return res.json({ ok: true, draft_id: r.draft_id, already: !!r.already, label: CARD_STATUS_LABELS.done });
+    const msg = { no_event: 'この商品にはカードの知らせがありません', not_conflict: '衝突の知らせではありません (「カードをもう一度作る」を使ってください)', leased: 'ほかの処理がちょうど取り込み中です。少し待ってからもう一度',
+      already_done: 'カードはもう作ってあります', hash_mismatch: '知らせの中身が壊れています' }[r.reason] || r.reason;
+    res.status(409).json({ ok: false, error: msg, reason: r.reason });
+  });
+});
 
 router.post('/api/sku/:code', (req, res) => {
   const gate = editorGate(req);

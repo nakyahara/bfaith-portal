@@ -1,0 +1,28 @@
+<%- include('_header') %>
+<%# 新規作成の案内 (2026-10-01・Company DB構想 14 §11 の 2)。切替の後は、新商品は「マスタの入力 → 新商品の登録」の 1 か所から作る。
+    保存すると、この product-hub の出品カードが自動でできる (売価・発送方法・URL・Yahoo! の欄も一緒に入る)。
+    mode = guide (切替の後) / paused (切替の途中・Company DB の段階が読めない = 登録は止めている) %>
+<div class="wrap" style="max-width:640px">
+  <div class="card">
+    <h2>新商品の登録</h2>
+    <% if (mode === 'guide') { %>
+      <p>新しい商品は <b>「マスタの入力 → 新商品の登録」</b> で作ります。ここ (product-hub) では作りません。</p>
+      <p class="muted" style="font-size:13px;">
+        登録で入れた売価・発送方法・Amazon URL・ASIN・参考 URL・公式ページ URL・セット商品を作るか・Yahoo!向け追記は、
+        この product-hub の出品カードに自動で入ります (カードができるまで少し待つことがあります。ボードを開き直すと出てきます)。
+      </p>
+      <div style="display:flex; gap:10px; margin-top:14px;">
+        <a class="btn btn-primary" href="/apps/master-edit/new?kind=single">単品を登録する</a>
+        <a class="btn btn-primary" href="/apps/master-edit/new?kind=set">セットを登録する</a>
+        <a class="btn" href="/apps/product-hub/board">ボードへ戻る</a>
+      </div>
+    <% } else { %>
+      <p style="color:#b45309;"><b>いまは新商品の登録を止めています。</b></p>
+      <p class="muted" style="font-size:13px;">
+        商品マスタの切替の途中<%= phase ? ` (段階: ${phase})` : ' (または Company DB につながらない)' %> のため、ここからも新しい画面からも登録できません。
+        切替が終わってから、もう一度開いてください。
+      </p>
+      <div style="margin-top:14px;"><a class="btn" href="/apps/product-hub/board">ボードへ戻る</a></div>
+    <% } %>
+  </div>
+</div>

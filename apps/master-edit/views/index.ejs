@@ -18,6 +18,7 @@
         Company DB の商品・セットの一覧です。コードを押すと 1 つずつ見て直せます。<b>*</b> = 構成品から導いた値 (セットの税率・原価の合計・売上分類)。
         「未入力」で、まだ入っていない項目の商品だけを出せます (今の /register の「未登録」の代わり)。
         <a href="manual">📖 つかいかた</a> ・ <a href="/apps/master-decisions/">⚖️ マスタの判断 (NE との差)</a>
+        ・ <a href="new?kind=single">＋ 新商品 (単品)</a> ・ <a href="new?kind=set">＋ 新商品 (セット)</a>
       </p>
     </div>
 
@@ -25,6 +26,7 @@
       <input name="q" value="<%= filters.q %>" placeholder="コード・名前・JAN で検索" size="26">
       <label>区分 <select name="kind"><option value="">全部</option><% for (const [k, v] of Object.entries(KINDS)) { %><option value="<%= k %>"<%= filters.kind === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
       <label>状態 <select name="state"><option value="">全部</option><% for (const [k, v] of Object.entries(STATES)) { %><option value="<%= k %>"<%= filters.state === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
+      <label>登録 <select name="reg"><option value="">全部</option><% for (const [k, v] of Object.entries(REG_STATES)) { %><option value="<%= k %>"<%= filters.reg === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
       <label>未入力 <select name="missing"><option value="">—</option><% for (const [k, v] of Object.entries(MISSING)) { %><option value="<%= k %>"<%= filters.missing === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
       <label><input type="checkbox" name="diff" value="1"<%= filters.diff ? ' checked' : '' %><%= data.diffAvailable ? '' : ' disabled' %>> NEとの差あり</label>
       <button class="btn-sm" type="submit">表示</button>
@@ -33,15 +35,16 @@
 
     <div class="tbox">
       <table class="me">
-        <thead><tr><th>コード</th><th>名前</th><th>区分</th><th>状態</th><th>税</th><th>売価</th><th>原価</th><th>分類</th><th>仕入先</th><th>⚠</th></tr></thead>
+        <thead><tr><th>コード</th><th>名前</th><th>区分</th><th>状態</th><th>登録</th><th>税</th><th>売価</th><th>原価</th><th>分類</th><th>仕入先</th><th>⚠</th></tr></thead>
         <tbody>
-          <% if (!data.rows.length) { %><tr><td colspan="10" class="muted"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
+          <% if (!data.rows.length) { %><tr><td colspan="11" class="muted"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
           <% for (const r of data.rows) { %>
           <tr>
             <td><a href="sku/<%= encodeURIComponent(r.code) %>"><%= r.code %></a></td>
             <td><%= r.name %></td>
             <td><%= KINDS[r.kind] || r.kind %></td>
             <td><%= STATES[r.state] || r.state %></td>
+            <td><%= r.reg_state === 'none' ? '—' : (REG_STATES[r.reg_state] || r.reg_state) %></td>
             <td class="n"><%= r.tax_rate == null ? '' : fmt.tax(r.tax_rate) %><%= r.tax_derived ? '*' : '' %></td>
             <td class="n"><%= fmt.yen(r.standard_price) %></td>
             <td class="n"><%= fmt.yen(r.cost) %><%= r.cost_derived ? '*' : '' %></td>
@@ -58,7 +61,7 @@
       <% if (data.total > data.offset + data.rows.length) { %><a href="<%= pageHref(data.offset + data.limit) %>">次の <%= data.limit %> 件 →</a><% } %>
       <% if (data.total) { %><span class="muted"><%= data.offset + 1 %>〜<%= data.offset + data.rows.length %> 件目</span><% } %>
     </div>
-    <p class="muted" style="font-size: 0.82em;">売上分類: <%= Object.values(SALES).join(' / ') %> ・ 新商品の登録・Amazon SKU の画面は次の段階で足します。</p>
+    <p class="muted" style="font-size: 0.82em;">売上分類: <%= Object.values(SALES).join(' / ') %> ・ 登録 = 新商品の登録の進み (— = 切替の前からある商品) ・ Amazon SKU の画面は次の段階で足します。</p>
   </div>
 </body>
 </html>
