@@ -757,9 +757,9 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - **切替の手順 (legacy_open → frozen → 最後の同期)**:
   1. 全部の環境に門を配る → 読み戻しで manifest_hash・持ち主表のハッシュ・build の番号がそろい、門の記録が `acked` であることを確かめる。
   2. NE の画面・GAS など機械で閉じられない入口 (manifest の `manual_entry_ids`) を止め、止めた人と時刻を証拠 (`manual_entries_stopped`) に書く。
-  3. 段階を `frozen` に進める (⑤-1 の関数が門の記録と証拠を確かめる)。
+  3. 段階を `frozen` に進める (⑤-1 の関数が、全部の場所・全部のプロセスの新しい門の記録と証拠を確かめる)。
   4. 🚨 **全部の環境の読み戻しで `writable: false`・`inflight.count` が 0 になるまで待つ**。miniPC で手の取込 (csv-import ほか) が動いていないことも目で確かめる (CLI は別のプロセス = 読み戻しに出ない)。
-  5. そこで初めて最後の同期 (NE → Company DB) に進む。drain を確かめた人・時刻を証拠 (`drain`) に書く。
+  5. そこで初めて最後の同期 (NE → Company DB) に進む。書きかけ 0 を確かめた人・時刻・各環境の読み戻しを切替の証跡に残す (段階を進める DB の関数が求める証拠の形 = `drain` など は ⑤-1 の 0050 に従う)。
 - 試験: `scripts/test-master-legacy-entries.mjs` (ルートと関数の呼び出しをたどって、一覧に無いマスタの書き込みの口を落とす) / `scripts/test-master-legacy-gate.mjs` (入口ごとに legacy_open・閉じた・読めない・途中で閉じた・CLI)。
 
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)

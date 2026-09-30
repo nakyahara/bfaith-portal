@@ -123,9 +123,10 @@ import { dashboardLocals, validateRegistry } from './lib/portal-dashboard.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
-// マスタの古い入口の門の記録 (ack。Company DB構想 14 §10 契約 v3 H1・PR #1565 R1 H2・0051)。Render = 'render' / miniPC (PORTAL_VARIANT=warehouse) = 'minipc'。
+// マスタの古い入口の門の記録 (ack。Company DB構想 14 §10 契約 v3 H1・PR #1565 R1 H2。表と書き手の関数は ⑤-1 の 0050)。Render = 'render' / miniPC (PORTAL_VARIANT=warehouse) = 'minipc'。
 // それ以外 (手元の PC) は書かない。起動のとき (下の listen) と、要求が来たついでに 5 分おきに書き直す (死活の確かめの要求でも回る。新しい定期実行は作らない)。
-// 書く前に確かめる (段階を読める・build の番号・書く接続先・関数)。だめなら書かずに理由をログと読み戻し (/apps/warehouse/api/master-legacy-gate) に出す
+// 中身 = build の番号・manifest_hash・持ち主表のハッシュ・見た段階・書きかけの件数。書く前に確かめる (段階を読める・build の番号・書く接続先・関数)。
+// だめなら書かずに理由をログと読み戻し (/apps/warehouse/api/master-legacy-gate) に出す
 const LEGACY_ACK_HOST = isRenderHost() ? 'render' : (String(process.env.PORTAL_VARIANT || 'render').toLowerCase() === 'warehouse' ? 'minipc' : null);
 if (LEGACY_ACK_HOST) app.use(legacyAckHeartbeat(LEGACY_ACK_HOST));
 const SQLiteStore = connectSqlite3(session);
@@ -1190,8 +1191,8 @@ app.listen(PORT, () => {
     catch (e) { console.warn('[mgmt-auto-sync] scheduler 起動スキップ:', e.message); }
   }
 
-  // マスタの古い入口の門の記録 (ack) を起動のときに書く (段階を legacy_open から進めるには、全部の場所・全部のプロセスが
-  // この版・この一覧の門を持つ記録が 15 分以内に要る = 0051)。その後は要求が来たついでに 5 分おき (上の legacyAckHeartbeat)。起動は止めない
+  // マスタの古い入口の門の記録 (ack) を起動のときに書く (段階を legacy_open から進めるには、全部の場所・全部のプロセスの
+  // 新しい記録が要る = 確かめは ⑤-1 の DB の関数)。その後は要求が来たついでに 5 分おき (上の legacyAckHeartbeat)。起動は止めない
   if (LEGACY_ACK_HOST) {
     Promise.resolve(maybeRefreshLegacyAck({ host: LEGACY_ACK_HOST, force: true }))
       .then(() => { const a = legacyAckState(); console.log(`[master-legacy-gate] ack ${LEGACY_ACK_HOST}: ${a.state}${a.detail ? ` (${a.detail})` : ''}`); })
