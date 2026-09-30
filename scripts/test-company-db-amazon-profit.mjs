@@ -39,7 +39,7 @@ const row = (date, sku, x = {}) => ({ economic_date_jst: date, seller_sku: sku, 
 const v2 = (date, sku, x = {}) => row(date, sku, { ...C4(), ...x });
 let seq = 0;
 const apply = async (order, rows) => {
-  const legacy = financeRowsFormat(rows) !== 'v2';
+  const legacy = rows.length > 0 && financeRowsFormat(rows) !== 'v2';   // 墓石 (空の集合) は今の形の版で送る (旧い版への戻しは拒まれる)
   const content = validateFinanceRows(order, rows);
   const checksum = orderFinanceChecksum(content, { legacy });
   const lines = content.map((c, i) => { const o = { ...c, source_updated_at: rows[i].source_updated_at, content_hash: rows[i].content_hash }; if (legacy) for (const k of CLASS_COLUMNS) delete o[k]; return o; });
@@ -127,8 +127,9 @@ const LN2 = await listing('LN', 'other@X'); await comp(LN2, S1, 1);   // 受け�
 // ─── 広告 (SP) ───
 const adDay = (d, total, report = null) => pg.query(`insert into core.ad_spend_days (company_id, mall, scope_key, ad_type, date_jst, source_generation, source_report_id, checksum, row_count, cost_total, ingest_run_id)
   values (1, 'amazon', 'jp', 'SP', $1, 1, $2, $3, 0, $4, 'ad-run')`, [d, report || `r-${d}`, 'b'.repeat(64), total]);
-const adRow = (d, camp, gran, code, c) => pg.query(`insert into core.ad_spend_daily (company_id, mall, scope_key, ad_type, date_jst, campaign_id, target_granularity, target_code, clicks, impressions, ad_cost, ingest_run_id)
-  values (1, 'amazon', 'jp', 'SP', $1, $2, $3, $4, 0, 0, $5, 'ad-run')`, [d, camp, gran, code, c]);
+// 受け口 (0035) と同じく、受け取ったときのマスタで sku の行だけ listing_id を入れる (保存済みの値 = 診断の「受け取り時の出品」)
+const adRow = (d, camp, gran, code, c) => pg.query(`insert into core.ad_spend_daily (company_id, mall, scope_key, ad_type, date_jst, campaign_id, target_granularity, target_code, listing_id, clicks, impressions, ad_cost, ingest_run_id)
+  values (1, 'amazon', 'jp', 'SP', $1, $2, $3, $4, case when $3 = 'sku' then core.resolve_listing_id(1::smallint, 'amazon', $4) end, 0, 0, $5, 'ad-run')`, [d, camp, gran, code, c]);
 const AD_TOTAL = { '2026-06-05': '120.50', '2026-06-06': '15.00', '2026-06-07': '50.00', '2026-06-13': '39.00', '2026-06-16': '1.00' };
 for (let dd = 1; dd <= 30; dd++) {
   const d = `2026-06-${String(dd).padStart(2, '0')}`;
@@ -142,8 +143,10 @@ await adRow('2026-06-13', 'c1', 'sku', 'LF', '30.00'); await adRow('2026-06-13',
 await adRow('2026-06-16', 'c1', 'sku', 'LC', '1.00');                                                                    // 売上の無い日の原価不明の出品 = 数 0 でも原価 null
 
 // ─── 読み方 ───
-const setCoverage = (d) => pg.exec(`create or replace function core.finance_coverage_complete_to(p_company_id smallint, p_mall text, p_scope_key text, p_source text)
-  returns date language plpgsql stable as $$ begin return ${d ? `date '${d}'` : 'null'}; end $$;`);
+// D7b-1b が差し替える形 (core.finance_coverage_state だけ) で coverage を与える
+const setCoverage = (d, gen = null, rev = null) => pg.exec(`create or replace function core.finance_coverage_state(p_company_id smallint, p_mall text, p_scope_key text, p_source text)
+  returns table (complete_to date, generation bigint, source_revision bigint) language plpgsql stable as $$
+  begin return query select ${d ? `date '${d}'` : 'null::date'}, ${gen == null ? 'null::bigint' : `${gen}::bigint`}, ${rev == null ? 'null::bigint' : `${rev}::bigint`}; end $$;`);
 const setAuditSince = (ts) => pg.exec(`create or replace function mart.amazon_profit_composition_audit_since() returns timestamptz language sql immutable as $$ select '${ts}'::timestamptz $$;`);
 const rowsOf = async (from, to) => (await pg.query(`select r.*, r.economic_date_jst::text as d from mart.amazon_profit_daily_range(1::smallint, 'amazon', 'jp', $1::date, $2::date) r`, [from, to])).rows;
 const totalsOf = async (from, to) => (await pg.query(`select t.*, t.period_from::text as pf, t.period_to::text as pt, t.economic_date_jst::text as ed, t.month_start::text as ms,
@@ -157,9 +160,11 @@ const ORDER = ['finance_incomplete', 'finance_unclassified', 'refund_units_unkno
 const BEFORE_CODES = ORDER.slice(0, 7);
 
 console.log('coverage (決済のそろい) の差し込み口');
-await t('🚨 core.finance_coverage_complete_to は今は常に null = 全部の日が provisional / missing・正式な値は全部 null・0 と仮定の値は出る', async () => {
-  assert.equal((await one(`select core.finance_coverage_complete_to(1::smallint, 'amazon', 'jp', $1) as d`, [U])).d, null);
+await t('🚨 core.finance_coverage_state は今は 1 行・全部 null = 全部の日が provisional / missing・正式な値と世代・版は全部 null・0 と仮定の値は出る', async () => {
+  const st = (await pg.query(`select complete_to, generation, source_revision from core.finance_coverage_state(1::smallint, 'amazon', 'jp', $1)`, [U])).rows;
+  assert.deepEqual(st, [{ complete_to: null, generation: null, source_revision: null }]);
   const rows = await rowsOf('2026-06-01', '2026-06-30');
+  assert.ok(rows.every((r) => r.finance_coverage_generation == null && r.finance_source_revision == null));
   assert.ok(rows.length >= 20, String(rows.length));
   assert.deepEqual([at(rows, '2026-06-05', LA).day_finance_status, at(rows, '2026-06-07', LA).day_finance_status], ['provisional', 'missing']);   // 6/7 = 広告だけの日 (財務の行なし)
   for (const r of rows) {
@@ -179,7 +184,7 @@ await t('🚨 core.finance_coverage_complete_to は今は常に null = 全部の
   assert.equal(all.profit_incomplete_reasons[0], 'finance_incomplete');
 });
 
-await setCoverage('2026-06-30');
+await setCoverage('2026-06-30', 5, 42);
 let rows = await rowsOf('2026-06-01', '2026-06-30');
 
 console.log('手で計算した行 (coverage を 2026-06-30 に差し替えた = D7b-1b の後の形)');
@@ -197,7 +202,9 @@ await t('🚨 税込 / 税抜 / 値引きの税 / 広告 × 1.1: 6/5 LA = 本体
   assert.deepEqual([r.profit_incomplete_reasons, r.assumed_zero_reasons], [[], []]);
   assert.equal(N(r.easy_ship_alloc_jpy), 330);   // 内訳 (寄与から引かない)
   assert.deepEqual(r.cost_sku_cost_ids.map(Number), [C_S1]);
-  assert.deepEqual([r.observed_generation == null ? null : Number(r.observed_generation), r.finance_coverage_generation, r.finance_source_revision, r.calculation_version], [7, null, null, 'amazon_profit_v1']);
+  assert.deepEqual([N(r.observed_generation), N(r.finance_coverage_generation), N(r.finance_source_revision), r.calculation_version], [7, 5, 42, 'amazon_profit_v1']);   // 世代と版は coverage の関数から
+  assert.deepEqual([r.units_marketplace_guarantee, String(r.units_refunded_customer_unrounded), String(r.units_a_to_z_refund_unrounded)], [0, '0', '0']);   // 子の列もまとめて出す (Codex R1 Low)
+  assert.deepEqual([r.received_listing_ids.map(Number), r.ad_received_listing_ids.map(Number), r.ad_received_unresolved_rows, r.master_notes.includes('listing_changed_since_received')], [[LA], [LA], 0, false]);
 });
 await t('🚨 返品 (推定の数) と負の手数料: 6/6 LA = 返金 1,000 (単価 1,000 → 1 個)・手数料の戻り 150 → 原価も −1 個分・税抜は −150 / 11', async () => {
   const r = at(rows, '2026-06-06', LA);
@@ -207,6 +214,7 @@ await t('🚨 返品 (推定の数) と負の手数料: 6/6 LA = 返金 1,000 (�
   assert.deepEqual([r.contribution_after_ad_incl, r.contribution_after_ad_excl, r.ad_cost], [null, null, '10.00']);
   assert.deepEqual([r.profit_incomplete_reasons, r.assumed_zero_reasons], [['ad_unresolved'], ['ad_unresolved']]);
   assert.deepEqual([r.contribution_after_ad_assuming_incomplete_zero_incl, r.contribution_after_ad_assuming_incomplete_zero_excl], ['-261.00', '-273.64']);
+  assert.deepEqual([String(r.units_refunded_customer_unrounded), String(r.units_a_to_z_refund_unrounded)], ['1.000000', '0']);   // 丸める前の返品数 (子の列)
 });
 await t('🚨 原価 0 円 (override_zero) は正しい 0 / 原価不明 (PARTIAL) は null + cost_missing + missing_cost_sku_ids・0 と仮定では 0', async () => {
   const b = at(rows, '2026-06-05', LB);
@@ -254,6 +262,7 @@ await t('🚨 分けられない部品 (+100 / −100 = 金額 0 でも数) と 
   const h = at(rows, '2026-06-12', LH);
   assert.deepEqual([h.refund_units_status, h.refund_incomplete_child_count, N(h.refund_unestimated_jpy), h.units_refunded_customer, h.contribution_before_ad_incl_jpy, h.profit_incomplete_reasons, h.assumed_zero_reasons],
     ['unit_price_missing', 1, 500, 0, null, ['refund_units_unknown'], ['refund_units_unknown']]);
+  assert.equal(h.units_refunded_customer_unrounded, null);   // 単価が無い = 丸める前の数も分からない
 });
 await t('原価の選び方: 同じ日 (6/15) に 2 回変わった取込の行 = valid_from → created_at の遅い方 1 行だけ (二重に数えない)・前の日は前の行 / 観測の原価 (sku_costs の無い SKU) は observed', async () => {
   const k14 = at(rows, '2026-06-14', LK), k15 = at(rows, '2026-06-15', LK);
@@ -287,11 +296,25 @@ await t('🚨 ASIN の広告は出品のコードと同じ文字でも未解決 
   const f13 = at(rows, '2026-06-13', LF);
   assert.deepEqual([f13.ad_cost, f13.contribution_after_ad_assuming_incomplete_zero_incl], ['30.00', String((-100 - 33).toFixed(2))]);   // 結びついた 30 円だけ引く
   assert.ok(!rows.some((r) => r.d === '2026-06-13' && r.seller_sku_norm === 'le'), 'LE の広告 (候補 2 件) が行を作った');
-  // 保存済みの listing_id は使わない: 受け取りの relink で LA を入れておいても ASIN の行は未解決のまま (列の CHECK で asin に listing_id は入らないので sku の別名の行で確かめる)
-  await pg.query(`update core.ad_spend_daily set listing_id = $1 where target_code = 'LA-ALIAS'`, [LB]);   // 保存済みの値が今のマスタと違う
-  const again = at(await rowsOf('2026-06-05', '2026-06-05'), '2026-06-05', LA);
-  assert.equal(again.ad_cost, '120.50');
+  // 🚨 保存済みの listing_id は結び直しに使わない = 診断だけ (#1559 Codex R1 Medium 2): 受け取ったときは LB・今は LA → 広告費は LA・印が付く
+  await pg.query(`update core.ad_spend_daily set listing_id = $1 where target_code = 'LA-ALIAS'`, [LB]);
+  let again = at(await rowsOf('2026-06-05', '2026-06-05'), '2026-06-05', LA);
+  assert.deepEqual([again.ad_cost, again.ad_received_listing_ids.map(Number), again.received_listing_ids.map(Number), again.master_notes.includes('listing_changed_since_received'), N(again.contribution_before_ad_incl_jpy)],
+    ['120.50', [LA, LB], [LA], true, 170]);   // 印は値を止めない
+  // 受け取ったとき未解決 (保存済みが null) の sku の広告も印
   await pg.query(`update core.ad_spend_daily set listing_id = null where target_code = 'LA-ALIAS'`);
+  again = at(await rowsOf('2026-06-05', '2026-06-05'), '2026-06-05', LA);
+  assert.deepEqual([again.ad_received_listing_ids.map(Number), again.ad_received_unresolved_rows, again.master_notes.includes('listing_changed_since_received')], [[LA], 1, true]);
+  await pg.query(`update core.ad_spend_daily set listing_id = $1 where target_code = 'LA-ALIAS'`, [LA]);   // 元に戻す (受け取りも LA)
+  assert.equal(at(await rowsOf('2026-06-05', '2026-06-05'), '2026-06-05', LA).master_notes.includes('listing_changed_since_received'), false);
+});
+await t('🚨 財務の受け取り時の出品も集合で比べる: 同じ日・同じ SKU に「今の出品」と「別の出品」で受け取った行がある = 印 (今の ID を含んでいても)', async () => {
+  await apply('O15', [v2('2026-06-08', 'LA', { units_ordered: 0 })]);   // 金額 0 の行 (値は変わらない)
+  await pg.query(`update core.order_finance_daily set listing_id = $1 where mall_order_no = 'O15'`, [LB]);   // 受け取ったときは LB だった
+  const r = at(await rowsOf('2026-06-08', '2026-06-08'), '2026-06-08', LA);
+  assert.deepEqual([r.received_listing_ids.map(Number), r.master_notes.includes('listing_changed_since_received'), N(r.profit_before_cogs_jpy)], [[LA, LB], true, 1000]);
+  await apply('O15', []);   // 墓石 (行を消す)
+  assert.equal(at(await rowsOf('2026-06-08', '2026-06-08'), '2026-06-08', LA).master_notes.includes('listing_changed_since_received'), false);
 });
 
 console.log('Easy Ship の割り振り (D-59)');
@@ -376,7 +399,7 @@ await t('🚨 どの行も: 理由は固定の順・寄与は前の 7 つのど�
   assert.deepEqual(at(r10, '2026-06-13', LA).profit_incomplete_reasons, ['finance_incomplete', 'ad_unresolved']);
   await setCoverage(null);
   check(await rowsOf('2026-06-01', '2026-06-30'), 'coverage null');
-  await setCoverage('2026-06-30');
+  await setCoverage('2026-06-30', 5, 42);
 });
 
 console.log('日の合計 (§3.6)');
@@ -468,8 +491,22 @@ await t('master_note_counts (鍵は 3 つに固定・値は印を持つ行の数
   assert.equal(m.master_note_counts.listing_changed_since_received, 2);   // LM・LN
   assert.equal(m.master_note_counts.pre_audit_unverifiable, rows.filter((r) => r.master_notes.includes('pre_audit_unverifiable')).length);
   assert.ok(tot.every((x) => x.master_basis === 'current'));
+  assert.ok(tot.every((x) => N(x.finance_coverage_generation) === 5 && N(x.finance_source_revision) === 42), '合計の世代と版 (coverage の関数から)');
   assert.equal(new Set(tot.map((x) => new Date(x.calculated_at).getTime())).size, 1);
   assert.equal(new Set((await rowsOf('2026-06-01', '2026-06-30')).map((x) => new Date(x.calculated_at).getTime())).size, 1);
+});
+
+await t('🚨 材料は 1 回だけ計算する (#1559 Codex R1 Medium 1): 日の合計の本体は Easy Ship の割り振り・広告・日の状態を 1 回ずつ呼んで行の本体に配列で渡す・行の本体は自分で呼ばない', async () => {
+  const src = async (f) => (await one(`select p.prosrc as s from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'mart' and p.proname = $1`, [f])).s;
+  const count = (s, name) => (s.match(new RegExp(`mart\\.${name}\\(`, 'g')) || []).length;
+  const totalsSrc = await src('_amazon_profit_totals'), rowsSrc = await src('_amazon_profit_rows');
+  for (const f of ['_amazon_easy_ship_alloc', '_amazon_profit_ad_children', '_amazon_profit_ad_days', '_amazon_profit_finance_days', '_amazon_profit_rows']) {
+    assert.equal(count(totalsSrc, f), 1, `合計の本体で ${f} が 1 回でない`);
+    assert.equal(count(rowsSrc, f), 0, `行の本体が ${f} を自分で呼んでいる`);
+  }
+  // 日の合計の Easy Ship の内訳は行と同じ材料 = 配った額 + 配れない額 = 月の手数料の Easy Ship
+  const all = tot.find((x) => x.row_kind === 'range_total');
+  assert.equal(N(all.easy_ship_alloc_jpy) + N(all.easy_ship_unallocated_jpy), N(all.account_fee_easy_ship_cost_jpy));
 });
 
 console.log('契約');
@@ -516,7 +553,12 @@ await t('鍵が無ければ 401 / 契約の外は 400 (from > to・401 日・実
   }
   assert.equal((await http('/amazon-profit/daily?mall=rakuten&scope=jp&from=2026-06-01&to=2026-06-01')).status, 400);
   assert.equal((await http('/amazon-profit/daily?mall=amazon&scope=us&from=2026-06-01&to=2026-06-01')).status, 400);
-  assert.equal((await http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-01-01&to=2027-02-04')).status, 200);   // 400 日
+  // /daily = 1 回 93 日まで (行が多い = 長い期間は日の範囲で区切る) / /totals = 400 日まで (#1559 Codex R1 Medium 1)
+  assert.equal((await http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-01&to=2026-09-01')).status, 200);   // 93 日
+  const d94 = await http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-01&to=2026-09-02');
+  assert.deepEqual([d94.status, /93 days/.test(d94.json.error)], [400, true]);
+  assert.equal((await http('/amazon-profit/totals?mall=amazon&scope=jp&from=2026-01-01&to=2027-02-04')).status, 200);   // 400 日
+  assert.equal((await http('/amazon-profit/totals?mall=amazon&scope=jp&from=2026-01-01&to=2027-02-05')).status, 400);
 });
 await t('🚨 /daily = 関数の行 (ID と ID の配列は 10 進の文字列・円は数・税抜などは小数 2 桁の文字列・日付は YYYY-MM-DD) / /totals = row_kind つき', async () => {
   const r = await http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-05&to=2026-06-06');
@@ -526,7 +568,9 @@ await t('🚨 /daily = 関数の行 (ID と ID の配列は 10 進の文字列�
   assert.ok(la, JSON.stringify(r.json.rows.slice(0, 2)));
   assert.deepEqual([la.contribution_before_ad_incl_jpy, la.contribution_before_ad_excl, la.contribution_after_ad_incl, la.ad_cost, la.cogs_jpy, la.easy_ship_alloc_jpy],
     [170, '225.45', '37.45', '120.50', 1200, 330]);
-  assert.deepEqual([la.received_listing_ids, la.cost_sku_cost_ids, la.missing_cost_sku_ids, la.observed_generation, la.profit_incomplete_reasons, la.master_basis], [[String(LA)], [String(C_S1)], [], '7', [], 'current']);
+  assert.deepEqual([la.received_listing_ids, la.ad_received_listing_ids, la.cost_sku_cost_ids, la.missing_cost_sku_ids, la.observed_generation, la.finance_coverage_generation, la.finance_source_revision, la.profit_incomplete_reasons, la.master_basis],
+    [[String(LA)], [String(LA)], [String(C_S1)], [], '7', '5', '42', [], 'current']);
+  assert.deepEqual([la.units_marketplace_guarantee, la.units_refunded_customer_unrounded], [0, '0']);
   assert.match(la.calculated_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
   const le = r.json.rows.find((x) => x.seller_sku_norm === 'le');
   assert.deepEqual([le.listing_id, le.listing_resolution], [null, 'unresolved']);

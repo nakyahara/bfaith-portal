@@ -5,9 +5,10 @@
 --   🚨 分からないもの (決済のそろい・原価・広告費・返品数) を 0 として利益を確定しない = 正式な列は null + 理由のコード。0 と仮定した値は別の名前 (…_assuming_incomplete_zero_…)。
 --
 -- 作るもの:
---   ① core.finance_coverage_complete_to(会社, モール, scope, source) = 決済がそろった最後の日。🚨 **今は常に null を返す** (決済のそろい = core.finance_coverage は D7b-1b・後の PR)。
---      → 今は全部の日が day_finance_status = missing / provisional = **正式な利益は全部 null** (0 と仮定の値は出る)。
---      D7b-1b がこの関数を **差し替える** (同じ名前・同じ引数・戻り値 date。coverage が complete のときだけ complete_to を返す)。呼び手 (この mart) は変えない
+--   ① core.finance_coverage_state(会社, モール, scope, source) = 決済のそろいを 1 行 (complete_to・generation・source_revision) で返す。
+--      🚨 **今は全部 null を返す** (決済のそろい = core.finance_coverage は D7b-1b・後の PR)。
+--      → 今は全部の日が day_finance_status = missing / provisional = **正式な利益は全部 null** (0 と仮定の値は出る)・finance_coverage_generation / finance_source_revision も null。
+--      D7b-1b は **この関数だけを差し替える** (同じ名前・同じ引数・同じ戻りの形。coverage が complete のときだけ complete_to を返す)。呼び手 (この mart) は変えない
 --   ② mart.amazon_profit_composition_audit_since() = この mart を有効にした時刻 (0049 の適用の時刻を埋め込む・D-62 の composition_audit_since。0026 の適用時刻ではない)
 --   ③ mart.amazon_account_fee_tax_rate(line_kind) = 月の手数料の税の表 (Amazon の決済の手数料は全部税込 = 8 種類とも 10%・#1517 と同じ。§3.6)
 --   ④ mart.amazon_profit_daily_range(会社, モール, scope, from, to)      = 日 × 出品の行 (§3.5・§3.5b・§3.7)
@@ -62,19 +63,23 @@
 --     保存則 = net_jpy = profit_before_cogs_jpy + sales_tax_jpy − account_fee_cost_jpy + unknown_line_mapped_jpy + unclassified_mapped_jpy + unmapped_jpy + not_account_fee_mapped_jpy
 --   ・契約: from <= to・最大 400 日 (両端を含む = to − from <= 399)・今は amazon / jp だけ (受け取り時の出品の決め方が shop_code を見ない = Amazon のアカウントが 1 つの間だけ正しい・§3.5)。
 --     違えば例外 (22023 invalid_input)。行の関数はその期間に財務・広告・Easy Ship のどの行も無ければ 0 行・日の合計の関数は日の行を必ず返す
---   ・calculated_at = statement_timestamp() (1 回の呼び出しの全部の行・合計で同じ値)。finance_coverage_generation / finance_source_revision は D7b-1b まで null
+--   ・calculated_at = statement_timestamp() (1 回の呼び出しの全部の行・合計で同じ値)。finance_coverage_generation / finance_source_revision = ① から (D7b-1b まで null)
+--   ・受け取り時の出品 (財務の received_listing_ids と広告の ad_received_listing_ids = 保存済みの listing_id) は診断だけ。今の結び直しと **集合で** 比べて違えば
+--     master_notes に listing_changed_since_received (出品の行 = 受け取りの記録があり「今の出品 1 つだけ・未解決 0」と一致しない / 未解決の行 = 受け取り時に出品が決まっていた)
 -- 🚨 表は作らない (関数だけ)・既存の表・関数には触らない (0043〜0048 の関数はそのまま呼ぶ)。
 
--- ─── ① 決済のそろい (D7b-1b が差し替える) ───
-create or replace function core.finance_coverage_complete_to(p_company_id smallint, p_mall text, p_scope_key text, p_source text)
-returns date language plpgsql stable as $$
+-- ─── ① 決済のそろい (D7b-1b が **この関数だけ** 差し替える・#1559 Codex R1 Medium 3) ───
+--   戻り = 1 行 (complete_to・generation・source_revision)。complete_to = 決済がそろった最後の日 (その source の coverage が complete のときだけ・違えば null) /
+--   generation = coverage の世代 / source_revision = 決済の生の表の版 (§3.1)。0 行を返しても fail-closed (complete_to が無い = 正式な値は出ない)
+create or replace function core.finance_coverage_state(p_company_id smallint, p_mall text, p_scope_key text, p_source text)
+returns table (complete_to date, generation bigint, source_revision bigint) language plpgsql stable as $$
 begin
   -- 🚨 今は常に null = 決済がそろったと言える日が無い = 全部の日の正式な利益は null (0 と仮定の値は出る)。
-  --    D7b-1b (core.finance_coverage・coordinator・決済のレポートの一覧) がこの関数を差し替え、その source の coverage が complete のときだけ complete_to を返す
-  return null;
+  --    D7b-1b (core.finance_coverage・coordinator・決済のレポートの一覧) がこの関数を差し替える。呼び手 (この mart) は変えない
+  return query select null::date, null::bigint, null::bigint;
 end
 $$;
-comment on function core.finance_coverage_complete_to(smallint, text, text, text) is '決済がそろった最後の日 (0049)。今は常に null (D7b-1b の core.finance_coverage が差し替える)。Amazon の利益の mart (0049) の日の状態 (day_finance_status) がこれを読む';
+comment on function core.finance_coverage_state(smallint, text, text, text) is '決済のそろい (0049)。1 行 = complete_to・generation・source_revision。今は全部 null (D7b-1b の core.finance_coverage が差し替える)。Amazon の利益の mart (0049) の日の状態 (day_finance_status) と finance_coverage_generation / finance_source_revision がこれを読む';
 
 -- ─── ② composition_audit_since = この mart を有効にした時刻 (0049 の適用の時刻を埋め込む) ───
 do $do$ begin
@@ -109,8 +114,16 @@ $$;
 
 -- ─── 日の決済の状態 (§3.1 の最後: 日に当てる coverage = その日を覆う policy の source の coverage。policy が 0 件 / 2 件以上の日は missing) ───
 --   day_finance_status: 日 <= complete_to → complete (財務の行が無い日は確定の 0) / それ以外で財務の行 (どの line_kind でも) あり → provisional / 無し → missing
+-- 内部の部品の戻りは型にする (#1559 Codex R1 Medium 1): 1 回だけ計算して配列で本体に渡す (日の合計が同じ材料を 2 回読まない)
+create type mart.amazon_profit_finance_day as (economic_date_jst date, policy_count integer, policy_source text, complete_to date,
+  coverage_generation bigint, source_revision bigint, has_finance_rows boolean, day_finance_status text);
+create type mart.amazon_profit_ad_day as (date_jst date, ad_status text, ad_cost_total numeric);
+create type mart.amazon_profit_ad_child as (date_jst date, ad_type text, listing_id bigint, unresolved_granularity text, unresolved_code text,
+  ad_cost numeric, ad_rows integer, received_listing_ids bigint[], received_unresolved_rows integer);
+create type mart.amazon_easy_ship_alloc_row as (economic_date_jst date, mall_order_no text, seller_sku_norm text, easy_ship_cost_jpy bigint, allocated boolean);
+
 create or replace function mart._amazon_profit_finance_days(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date)
-returns table (economic_date_jst date, policy_count integer, policy_source text, complete_to date, has_finance_rows boolean, day_finance_status text)
+returns setof mart.amazon_profit_finance_day
 language sql stable as $$
   with d as (select g::date as day from generate_series(p_from::timestamp, p_to::timestamp, interval '1 day') g),
   pol as (
@@ -120,9 +133,13 @@ language sql stable as $$
        and d.day >= p.period_from and (p.period_to is null or d.day < p.period_to)
      group by d.day
   ),
-  cov as materialized (
-    select s.source, core.finance_coverage_complete_to(p_company_id, p_mall, p_scope_key, s.source) as complete_to
+  cov as materialized (   -- source ごとに 1 回。ちょうど 1 行のときだけ使う (0 行 / 2 行以上 = 全部 null = fail-closed)
+    select s.source, st.complete_to, st.generation, st.source_revision
       from (select distinct pol.source from pol where pol.n = 1) s
+      cross join lateral (select case when count(*) = 1 then min(x.complete_to) end as complete_to,
+                                 case when count(*) = 1 then min(x.generation) end as generation,
+                                 case when count(*) = 1 then min(x.source_revision) end as source_revision
+                            from core.finance_coverage_state(p_company_id, p_mall, p_scope_key, s.source) x) st
   ),
   fin as (
     select f.economic_date_jst as day
@@ -133,7 +150,7 @@ language sql stable as $$
      where f.company_id = p_company_id and f.mall = p_mall and f.scope_key = p_scope_key and f.economic_date_jst between p_from and p_to
      group by f.economic_date_jst
   )
-  select pol.day, pol.n, case when pol.n = 1 then pol.source end, cov.complete_to, fin.day is not null,
+  select pol.day, pol.n, case when pol.n = 1 then pol.source end, cov.complete_to, cov.generation, cov.source_revision, fin.day is not null,
          case when pol.n <> 1 then 'missing'
               when cov.complete_to is not null and pol.day <= cov.complete_to then 'complete'
               when fin.day is not null then 'provisional'
@@ -147,7 +164,7 @@ $$;
 --   日 < 2026-02-05 → not_collected / 親が無い → missing (費用 null) / 親の source_report_id が legacy: → legacy_incomplete / それ以外 → complete。
 --   広告の種類が 2 つ以上になったら弱い方 (not_collected > missing > legacy_incomplete > verified_legacy (将来) > complete)。必須の種類 = 今は SP だけ
 create or replace function mart._amazon_profit_ad_days(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date)
-returns table (date_jst date, ad_status text, ad_cost_total numeric)
+returns setof mart.amazon_profit_ad_day
 language sql stable as $$
   with d as (select g::date as day from generate_series(p_from::timestamp, p_to::timestamp, interval '1 day') g),
   req as (select t.ad_type from (values ('SP')) as t(ad_type)),   -- 必須の広告の種類 (種類が増えたらここに足す)
@@ -168,12 +185,13 @@ language sql stable as $$
 $$;
 
 -- ─── 広告の子を今のマスタで出品に結び直す (§3.5・R14 H2)。sku の行だけ core.resolve_listing_id・asin / none は常に未解決 (listing_id null) ───
---   保存済みの core.ad_spend_daily.listing_id は使わない (受け取り・relink のときのマスタ = D-64 では今のマスタで決め直す)
+--   保存済みの core.ad_spend_daily.listing_id (受け取り・relink のときのマスタ) は結び直しに使わない = 診断だけ (#1559 Codex R1 Medium 2):
+--   received_listing_ids = 保存済みの listing_id の集合 (ID の昇順) / received_unresolved_rows = sku の行で保存済みが null の行の数 → 行の listing_changed_since_received
 create or replace function mart._amazon_profit_ad_children(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date)
-returns table (date_jst date, ad_type text, listing_id bigint, unresolved_granularity text, unresolved_code text, ad_cost numeric, ad_rows integer)
+returns setof mart.amazon_profit_ad_child
 language sql stable as $$
   with a as materialized (
-    select x.date_jst, x.ad_type, x.target_granularity, x.target_code, x.ad_cost
+    select x.date_jst, x.ad_type, x.target_granularity, x.target_code, x.ad_cost, x.listing_id as received_lid
       from core.ad_spend_daily x
      where x.company_id = p_company_id and x.mall = p_mall and x.scope_key = p_scope_key and x.date_jst between p_from and p_to
   ),
@@ -183,7 +201,9 @@ language sql stable as $$
   )
   select a.date_jst, a.ad_type, res.lid,
          case when res.lid is null then a.target_granularity end, case when res.lid is null then a.target_code end,
-         sum(a.ad_cost), count(*)::int
+         sum(a.ad_cost), count(*)::int,
+         coalesce(array_agg(distinct a.received_lid order by a.received_lid) filter (where a.received_lid is not null), '{}'::bigint[]),
+         (count(*) filter (where a.target_granularity = 'sku' and a.received_lid is null))::int
     from a left join res on a.target_granularity = 'sku' and res.target_code = a.target_code
    group by 1, 2, 3, 4, 5
 $$;
@@ -192,8 +212,9 @@ $$;
 --   料金 = 期間の中の easy_ship の行を 注文 × 計上日 で正味 (Σ account_fee_amount_jpy。負 = 費用)。正味 0 は配らない
 --   割り振り = 同じ注文の SKU (正規化) の本体売上 (全部の日) の割合 / 合計が 0 以下なら等分。1 円単位・端数は小数部の大きい順 → 正規化 SKU のバイトの順
 --   easy_ship_cost_jpy = 費用を正 (正味が負 = 料金 → 正の額・正味が正 = 返金が多い → 負の額)。allocated = false = 売上の行が無くて配らない額 (seller_sku_norm は null)
+--   🚨 重い (期間の中に料金がある注文の全部の日の SKU の行を読む) = 1 回の呼び出しで 1 回だけ (公開の関数が計算して本体に配列で渡す・#1559 Codex R1 Medium 1)
 create or replace function mart._amazon_easy_ship_alloc(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date)
-returns table (economic_date_jst date, mall_order_no text, seller_sku_norm text, easy_ship_cost_jpy bigint, allocated boolean)
+returns setof mart.amazon_easy_ship_alloc_row
 language sql stable as $$
   with charge as materialized (
     select f.mall_order_no, f.economic_date_jst as day, sum(f.account_fee_amount_jpy) as amt
@@ -243,12 +264,15 @@ language sql stable as $$
 $$;
 
 -- ─── 行の本体 (日 × 出品・未解決は日 × 正規化 seller SKU) ───
-create or replace function mart._amazon_profit_rows(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date)
+--   材料 (日の決済の状態・広告の日の状態・広告の子・Easy Ship の割り振り) は呼び手が 1 回だけ計算して配列で渡す (日の合計が同じ材料を使い回す・#1559 Codex R1 Medium 1)
+create or replace function mart._amazon_profit_rows(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date,
+  p_days mart.amazon_profit_finance_day[], p_ad_days mart.amazon_profit_ad_day[], p_adc mart.amazon_profit_ad_child[], p_es mart.amazon_easy_ship_alloc_row[])
 returns table (
   company_id smallint, mall text, scope_key text, economic_date_jst date,
   listing_id bigint, seller_sku_norm text, listing_resolution text, listing_code text,
-  received_listing_ids bigint[], received_listing_unresolved_count integer,
-  units_ordered integer, units_refunded_customer integer, units_a_to_z_refund integer, units_net_sold integer,
+  received_listing_ids bigint[], received_listing_unresolved_count integer, ad_received_listing_ids bigint[], ad_received_unresolved_rows integer,
+  units_ordered integer, units_refunded_customer integer, units_marketplace_guarantee integer, units_a_to_z_refund integer, units_net_sold integer,
+  units_refunded_customer_unrounded numeric, units_a_to_z_refund_unrounded numeric,
   sales_principal_jpy bigint, sales_shipping_jpy bigint, sales_giftwrap_jpy bigint, sales_tax_jpy bigint,
   commission_jpy bigint, fba_fulfillment_jpy bigint, fba_storage_jpy bigint, closing_fee_jpy bigint,
   shipping_chargeback_jpy bigint, giftwrap_chargeback_jpy bigint, promotion_jpy bigint, promotion_tax_jpy bigint, points_jpy bigint,
@@ -271,8 +295,8 @@ returns table (
   finance_coverage_generation bigint, finance_source_revision bigint, calculated_at timestamptz)
 language sql stable as $$
 with
-days as materialized (select * from mart._amazon_profit_finance_days(p_company_id, p_mall, p_scope_key, p_from, p_to)),
-ad_days as materialized (select * from mart._amazon_profit_ad_days(p_company_id, p_mall, p_scope_key, p_from, p_to)),
+days as materialized (select u.* from unnest(p_days) u),
+ad_days as materialized (select u.* from unnest(p_ad_days) u),
 child as materialized (select * from mart.finance_daily_sku_range(p_company_id, p_mall, p_scope_key, p_from, p_to)),
 -- 旧い形の版の SKU の行 (分けられない部品の 4 列を持たない = 数で確かめられない = fail-closed で finance_unclassified)
 legacy as materialized (
@@ -287,12 +311,19 @@ legacy as materialized (
 ),
 es as materialized (
   select e.economic_date_jst as day, e.seller_sku_norm as sku_norm, sum(e.easy_ship_cost_jpy)::bigint as cost
-    from mart._amazon_easy_ship_alloc(p_company_id, p_mall, p_scope_key, p_from, p_to) e
+    from unnest(p_es) e
    where e.allocated
    group by 1, 2
 ),
-adc as materialized (select * from mart._amazon_profit_ad_children(p_company_id, p_mall, p_scope_key, p_from, p_to)),
-ad_l as (select adc.date_jst as day, adc.listing_id as lid, sum(adc.ad_cost) as cost, sum(adc.ad_rows)::int as n from adc where adc.listing_id is not null group by 1, 2),
+adc as materialized (select u.* from unnest(p_adc) u),
+ad_l as (select adc.date_jst as day, adc.listing_id as lid, sum(adc.ad_cost) as cost, sum(adc.ad_rows)::int as n,
+                sum(adc.received_unresolved_rows)::int as rcv_unres from adc where adc.listing_id is not null group by 1, 2),
+-- 広告の受け取り時の出品の集合 (日 × 今の出品ごと・ID の昇順)
+ad_rcv as (
+  select x.day, x.lid, array_agg(distinct x.rid order by x.rid) as ids
+    from (select adc.date_jst as day, adc.listing_id as lid, unnest(adc.received_listing_ids) as rid from adc where adc.listing_id is not null) x
+   group by 1, 2
+),
 ad_u as (select adc.date_jst as day, sum(adc.ad_rows)::int as n from adc where adc.listing_id is null group by 1),
 -- 今のマスタで正規化 seller SKU → 出品 (0043 の受け口と同じ = listing_norm の直接の一致・会社 × モールで 1 件のときだけ。0 件 / 2 件以上 = 未解決)
 norms as (select child.seller_sku_norm as sku_norm from child union select es.sku_norm from es),
@@ -391,6 +422,11 @@ r0 as (
          f.received_listing_ids, f.received_listing_unresolved_count,
          coalesce(f.units_ordered, 0) as units_ordered, coalesce(f.units_refunded_customer, 0) as units_refunded_customer,
          coalesce(f.units_a_to_z_refund, 0) as units_a_to_z_refund, coalesce(f.units_net_sold, 0) as units_net_sold,
+         coalesce(f.units_marketplace_guarantee, 0) as units_marketplace_guarantee,
+         -- 丸める前の返品数 (子の値。unit_price_missing の子は null のまま・子の無い行は 0)
+         case when f.economic_date_jst is null then 0::numeric else f.units_refunded_customer_unrounded end as units_refunded_customer_unrounded,
+         case when f.economic_date_jst is null then 0::numeric else f.units_a_to_z_refund_unrounded end as units_a_to_z_refund_unrounded,
+         coalesce(ad_rcv.ids, '{}'::bigint[]) as ad_received_ids, coalesce(ad_l.rcv_unres, 0) as ad_received_unres,
          coalesce(f.sales_principal_jpy, 0) as sales_principal_jpy, coalesce(f.sales_shipping_jpy, 0) as sales_shipping_jpy,
          coalesce(f.sales_giftwrap_jpy, 0) as sales_giftwrap_jpy, coalesce(f.sales_tax_jpy, 0) as sales_tax_jpy,
          coalesce(f.commission_jpy, 0) as commission_jpy, coalesce(f.fba_fulfillment_jpy, 0) as fba_fulfillment_jpy,
@@ -412,7 +448,7 @@ r0 as (
               when d.complete_to is null or (date_trunc('month', k.day) + interval '1 month - 1 day')::date > d.complete_to then 3
               else 2 end as refund_rank,
          coalesce(f.refund_unestimated_jpy, 0) as refund_unestimated_jpy,
-         d.day_finance_status, ad.ad_status, ad_l.cost as ad_linked, coalesce(ad_l.n, 0) as ad_n, coalesce(ad_u.n, 0) as ad_unres_n,
+         d.day_finance_status, d.coverage_generation, d.source_revision, ad.ad_status, ad_l.cost as ad_linked, coalesce(ad_l.n, 0) as ad_n, coalesce(ad_u.n, 0) as ad_unres_n,
          coalesce(ek.cost, 0) as es_cost,
          comp_l.n_comp, comp_l.composition_hash,
          uc.all_known, uc.known_sum, uc.basis_rank, uc.missing_ids, uc.sc_ids, uc.ob_ids, uc.cost_input_hash,
@@ -424,6 +460,7 @@ r0 as (
     left join fk f on f.economic_date_jst = k.day and f.rk = k.rk
     left join ek on ek.day = k.day and ek.rk = k.rk
     left join ad_l on ad_l.day = k.day and ad_l.lid = k.lid
+    left join ad_rcv on ad_rcv.day = k.day and ad_rcv.lid = k.lid
     left join ad_u on ad_u.day = k.day
     left join comp_l on comp_l.lid = k.lid
     left join uc on uc.day = k.day and uc.lid = k.lid
@@ -448,10 +485,16 @@ r1 as (
          r0.ad_unres_n > 0 as g_ad_unres,
          r0.lid is not null and r0.audit_from < mart.amazon_profit_composition_audit_since() as n_pre,
          r0.lid is not null and r0.through is not null and r0.through >= r0.audit_from as n_after,
+         -- 受け取り時の出品 (財務と広告の保存済みの listing_id) を **集合で** 比べる (#1559 Codex R1 Medium 2):
+         --   出品の行 = 受け取りの記録があり、「今の出品 1 つだけ・受け取り時の未解決 0」と一致しない / 未解決の行 = 受け取り時に出品が決まっていた
          case when r0.lid is not null
-              then coalesce(r0.lid <> any(r0.received_listing_ids), false) or coalesce(r0.received_listing_unresolved_count, 0) > 0
-              else coalesce(cardinality(r0.received_listing_ids), 0) > 0 end as n_changed
-    from r0
+              then (cardinality(r0.rcv_ids) > 0 or r0.rcv_unres > 0) and (r0.rcv_ids <> array[r0.lid] or r0.rcv_unres > 0)
+              else cardinality(r0.rcv_ids) > 0 end as n_changed
+    from (select r.*,
+                 (select coalesce(array_agg(distinct x order by x), '{}'::bigint[])
+                    from unnest(coalesce(r.received_listing_ids, '{}'::bigint[]) || r.ad_received_ids) x) as rcv_ids,
+                 coalesce(r.received_listing_unresolved_count, 0) + r.ad_received_unres as rcv_unres
+            from r0 r) r0
 ),
 r2 as (
   select r1.*,
@@ -469,8 +512,9 @@ r3 as (
 )
 select p_company_id, p_mall, p_scope_key, r3.day,
        r3.lid, r3.unorm, case when r3.lid is null then 'unresolved' else 'resolved' end, r3.listing_code,
-       coalesce(r3.received_listing_ids, '{}'::bigint[]), coalesce(r3.received_listing_unresolved_count, 0),
-       r3.units_ordered, r3.units_refunded_customer, r3.units_a_to_z_refund, r3.units_net_sold,
+       coalesce(r3.received_listing_ids, '{}'::bigint[]), coalesce(r3.received_listing_unresolved_count, 0), r3.ad_received_ids, r3.ad_received_unres,
+       r3.units_ordered, r3.units_refunded_customer, r3.units_marketplace_guarantee, r3.units_a_to_z_refund, r3.units_net_sold,
+       r3.units_refunded_customer_unrounded, r3.units_a_to_z_refund_unrounded,
        r3.sales_principal_jpy, r3.sales_shipping_jpy, r3.sales_giftwrap_jpy, r3.sales_tax_jpy,
        r3.commission_jpy, r3.fba_fulfillment_jpy, r3.fba_storage_jpy, r3.closing_fee_jpy,
        r3.shipping_chargeback_jpy, r3.giftwrap_chargeback_jpy, r3.promotion_jpy, r3.promotion_tax_jpy, r3.points_jpy,
@@ -521,7 +565,7 @@ select p_company_id, p_mall, p_scope_key, r3.day,
        (select max(g.generation) from core.sku_cost_observed_loads g where g.company_id = p_company_id and g.source = 'warehouse_sqlite'),
        mart.amazon_profit_composition_audit_since(),
        r3.through,
-       null::bigint, null::bigint,   -- D7b-1b (core.finance_coverage の世代と source_revision) まで null
+       r3.coverage_generation, r3.source_revision,   -- core.finance_coverage_state (D7b-1b まで null)
        statement_timestamp()
   from r3
  order by r3.day, r3.lid is null, r3.lid, r3.unorm collate "C"
@@ -552,13 +596,20 @@ returns table (
   calculation_version text, finance_coverage_generation bigint, finance_source_revision bigint, calculated_at timestamptz)
 language sql stable as $$
 with
-days as materialized (select * from mart._amazon_profit_finance_days(p_company_id, p_mall, p_scope_key, p_from, p_to)),
-ad_days as materialized (select * from mart._amazon_profit_ad_days(p_company_id, p_mall, p_scope_key, p_from, p_to)),
-rws as materialized (select * from mart._amazon_profit_rows(p_company_id, p_mall, p_scope_key, p_from, p_to)),
-adc as materialized (select * from mart._amazon_profit_ad_children(p_company_id, p_mall, p_scope_key, p_from, p_to)),
+-- 材料は 1 回だけ計算し、行の本体と合計の両方で使う (#1559 Codex R1 Medium 1: Easy Ship の割り振りを 2 回読まない)
+inp as materialized (
+  select array(select d from mart._amazon_profit_finance_days(p_company_id, p_mall, p_scope_key, p_from, p_to) d) as days,
+         array(select a from mart._amazon_profit_ad_days(p_company_id, p_mall, p_scope_key, p_from, p_to) a) as ad_days,
+         array(select c from mart._amazon_profit_ad_children(p_company_id, p_mall, p_scope_key, p_from, p_to) c) as adc,
+         array(select e from mart._amazon_easy_ship_alloc(p_company_id, p_mall, p_scope_key, p_from, p_to) e) as es
+),
+days as materialized (select u.* from inp cross join lateral unnest(inp.days) u),
+ad_days as materialized (select u.* from inp cross join lateral unnest(inp.ad_days) u),
+rws as materialized (select r.* from inp cross join lateral mart._amazon_profit_rows(p_company_id, p_mall, p_scope_key, p_from, p_to, inp.days, inp.ad_days, inp.adc, inp.es) r),
+adc as materialized (select u.* from inp cross join lateral unnest(inp.adc) u),
 esu as (
   select e.economic_date_jst as day, sum(e.easy_ship_cost_jpy) as cost, count(*)::int as n
-    from mart._amazon_easy_ship_alloc(p_company_id, p_mall, p_scope_key, p_from, p_to) e
+    from inp cross join lateral unnest(inp.es) e
    where not e.allocated group by 1
 ),
 -- SKU の無い行 (月の手数料・損益の外・unknown)。行き先は §3.7 の表
@@ -620,7 +671,7 @@ adu as (
     from adc group by 1
 ),
 dd as (
-  select d.economic_date_jst as day, d.day_finance_status, a.ad_status, a.ad_cost_total,
+  select d.economic_date_jst as day, d.day_finance_status, d.coverage_generation, d.source_revision, a.ad_status, a.ad_cost_total,
          case a.ad_status when 'not_collected' then 5 when 'missing' then 4 when 'legacy_incomplete' then 3 when 'verified_legacy' then 2 else 1 end as ad_rank,
          coalesce(rd.n_res, 0) as n_res, coalesce(rd.n_unres, 0) as n_unres,
          coalesce(rd.units_ordered, 0) as units_ordered, coalesce(rd.units_net_sold, 0) as units_net_sold, coalesce(rd.sales_principal, 0) as sales_principal,
@@ -714,7 +765,11 @@ select g.kind, g.pf, g.pt, g.eday, g.ms, count(*)::int,
        'current',
        jsonb_build_object('pre_audit_unverifiable', sum(dv.n_pre)::int, 'current_after_recorded_change', sum(dv.n_after)::int,
                           'listing_changed_since_received', sum(dv.n_changed)::int),
-       'amazon_profit_v1', null::bigint, null::bigint, statement_timestamp()
+       'amazon_profit_v1',
+       -- coverage の世代と版 = 対象の日で 1 つに決まるときだけ (日によって違う・null の日がある = null)
+       case when count(*) = count(dv.coverage_generation) and min(dv.coverage_generation) = max(dv.coverage_generation) then min(dv.coverage_generation) end,
+       case when count(*) = count(dv.source_revision) and min(dv.source_revision) = max(dv.source_revision) then min(dv.source_revision) end,
+       statement_timestamp()
   from grp g join dv on dv.day between g.pf and g.pt
  group by g.kind, g.pf, g.pt, g.eday, g.ms, g.ord
  order by g.ord, g.pf
@@ -725,8 +780,9 @@ create or replace function mart.amazon_profit_daily_range(p_company_id smallint,
 returns table (
   company_id smallint, mall text, scope_key text, economic_date_jst date,
   listing_id bigint, seller_sku_norm text, listing_resolution text, listing_code text,
-  received_listing_ids bigint[], received_listing_unresolved_count integer,
-  units_ordered integer, units_refunded_customer integer, units_a_to_z_refund integer, units_net_sold integer,
+  received_listing_ids bigint[], received_listing_unresolved_count integer, ad_received_listing_ids bigint[], ad_received_unresolved_rows integer,
+  units_ordered integer, units_refunded_customer integer, units_marketplace_guarantee integer, units_a_to_z_refund integer, units_net_sold integer,
+  units_refunded_customer_unrounded numeric, units_a_to_z_refund_unrounded numeric,
   sales_principal_jpy bigint, sales_shipping_jpy bigint, sales_giftwrap_jpy bigint, sales_tax_jpy bigint,
   commission_jpy bigint, fba_fulfillment_jpy bigint, fba_storage_jpy bigint, closing_fee_jpy bigint,
   shipping_chargeback_jpy bigint, giftwrap_chargeback_jpy bigint, promotion_jpy bigint, promotion_tax_jpy bigint, points_jpy bigint,
@@ -750,7 +806,11 @@ returns table (
 language plpgsql stable as $$
 begin
   perform mart.amazon_profit_assert_args(p_company_id, p_mall, p_scope_key, p_from, p_to);
-  return query select * from mart._amazon_profit_rows(p_company_id, p_mall, p_scope_key, p_from, p_to);
+  return query select * from mart._amazon_profit_rows(p_company_id, p_mall, p_scope_key, p_from, p_to,
+    array(select d from mart._amazon_profit_finance_days(p_company_id, p_mall, p_scope_key, p_from, p_to) d),
+    array(select a from mart._amazon_profit_ad_days(p_company_id, p_mall, p_scope_key, p_from, p_to) a),
+    array(select c from mart._amazon_profit_ad_children(p_company_id, p_mall, p_scope_key, p_from, p_to) c),
+    array(select e from mart._amazon_easy_ship_alloc(p_company_id, p_mall, p_scope_key, p_from, p_to) e));
 end
 $$;
 comment on function mart.amazon_profit_daily_range(smallint, text, text, date, date) is 'Amazon の利益の mart (0049・D7b-3): 日 × 出品の寄与の利益 (月の手数料を引く前)。構成と出品の結びつけは計算のときの今のマスタ (master_basis = current)。正式な値は分からないものがあれば null + profit_incomplete_reasons。0 と仮定の値は …_assuming_incomplete_zero_…';
@@ -789,6 +849,6 @@ comment on function mart.amazon_profit_day_totals_range(smallint, text, text, da
 do $$ begin
   if exists (select 1 from pg_roles where rolname = 'watcher') then
     execute 'grant execute on function mart.amazon_profit_daily_range(smallint, text, text, date, date), mart.amazon_profit_day_totals_range(smallint, text, text, date, date),'
-         || ' core.finance_coverage_complete_to(smallint, text, text, text), mart.amazon_profit_composition_audit_since(), mart.amazon_account_fee_tax_rate(text) to watcher';
+         || ' core.finance_coverage_state(smallint, text, text, text), mart.amazon_profit_composition_audit_since(), mart.amazon_account_fee_tax_rate(text) to watcher';
   end if;
 end $$;
