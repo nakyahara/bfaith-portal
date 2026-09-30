@@ -139,6 +139,8 @@ export function dedupSettlementRows(rows) {
  *   SKU の行 (line_kind = sku): 寄与・税の預かり・値引きの列に入った部品は消費済み。misc_fee / other_fee / other_amount の列 (UNCLASSIFIED_SKU_COLUMNS) = 分けられない
  *   月の手数料の行: 手数料の材料だけが消費済み。ほかの部品 (price・promotion・misc_fee・other_fee) = 分けられない (fail-closed。税の price も)
  *   🚨 集約の後では復元できない (+100 と −100 は打ち消して 0 になるが、数は 2・絶対値は 200) = ここで数える。0 の部品は数えない
+ *   🚨 受け口は別の列の間の相殺までは見抜く (order-finance-checksum.mjs と表の CHECK) が、**同じ集約の列の中での相殺** は受け口では復元できない
+ *      = ここの数え方は scripts/test-company-db-amazon-finance.mjs (純粋関数の +100 / −100・乱数の決済の行 400 注文) で守る (#1554 Codex R3)
  */
 export function classifyComponent(a, kind, col, v, feeMaterial) {
   if (v == null || v === 0n) return;

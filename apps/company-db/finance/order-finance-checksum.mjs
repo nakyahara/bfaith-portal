@@ -42,6 +42,14 @@ export function versionHasClass(v) {
   const m = typeof v === 'string' ? CLASS_VERSION_RE.exec(v) : null;
   return !!m && Number(m[1]) >= 2;
 }
+/**
+ * 月の手数料の行の列の分け方 (#1554 Codex R3 Medium 2。送り手の変換 = 手数料の材料 (other_amount + item_related_fee) の行き先の列):
+ *   FEE_ROW_MATERIAL_COLUMNS = 手数料の材料が入りうる 8 列 (材料でない部品も入りうる = 和 − account_fee_amount がこの 8 列の中の分けられない分)
+ *   FEE_ROW_UNCLASSIFIED_COLUMNS = それ以外の 12 列 (月の手数料の行では入った部品が全部「分けられない」)
+ *   🚨 同じ集約の列の中での相殺 (misc_fee の +3 と −3 = 列は 0) は受け口では復元できない = 送り手の変換の試験で守る
+ */
+export const FEE_ROW_MATERIAL_COLUMNS = ['commission_jpy', 'fba_fulfillment_jpy', 'fba_storage_jpy', 'shipping_chargeback_jpy', 'giftwrap_chargeback_jpy', 'points_jpy', 'other_fee_jpy', 'other_amount_jpy'];
+export const FEE_ROW_UNCLASSIFIED_COLUMNS = AMOUNT_COLUMNS.filter((c) => !FEE_ROW_MATERIAL_COLUMNS.includes(c));
 // SKU の行で「分けられない」金額が入る列 (§3.7 の表・D-63 で分けるまで)。SKU の行ではこの 3 列の和 = unclassified_mapped_jpy
 export const UNCLASSIFIED_SKU_COLUMNS = ['misc_fee_jpy', 'other_fee_jpy', 'other_amount_jpy'];
 export const LINE_KINDS = ['sku', 'storage', 'long_term_storage', 'removal', 'inbound_defect', 'low_inventory', 'subscription', 'easy_ship', 'other_account_fee', 'not_account_fee', 'unknown'];
@@ -130,11 +138,19 @@ export function validateFinanceRows(mallOrderNo, rows) {
         const sum = UNCLASSIFIED_SKU_COLUMNS.reduce((s, c) => s + out[c], 0), absSum = UNCLASSIFIED_SKU_COLUMNS.reduce((s, c) => s + Math.abs(out[c]), 0);
         if (out.unclassified_mapped_jpy !== sum) throw new Error(`rows[${i}]: on a sku row unclassified_mapped_jpy must equal ${UNCLASSIFIED_SKU_COLUMNS.join(' + ')} (${out.unclassified_mapped_jpy} <> ${sum})`);
         if (out.unclassified_abs_jpy < absSum) throw new Error(`rows[${i}]: on a sku row unclassified_abs_jpy must be >= |${UNCLASSIFIED_SKU_COLUMNS.join('| + |')}| (${out.unclassified_abs_jpy} < ${absSum})`);
+        const nz = UNCLASSIFIED_SKU_COLUMNS.filter((c) => out[c] !== 0).length;
+        if (out.unclassified_component_count < nz) throw new Error(`rows[${i}]: on a sku row unclassified_component_count (${out.unclassified_component_count}) must be >= the non-zero unclassified columns (${nz})`);
       } else if (ACCOUNT_FEE_KINDS.includes(out.line_kind)) {
         // 月の手数料の行 = 手数料の材料 (account_fee_amount_jpy) ・分けられない部品・unmapped の 3 つで net の全部 (#1554 Codex R2 Medium 2)。
         //   4 列を 0 と偽って分類の漏れた金額を隠せない (例 misc_fee +3 を数えずに送ると net −97 ≠ −100 + 0 + 0)
         const want = BigInt(out.account_fee_amount_jpy) + BigInt(out.unclassified_mapped_jpy) + BigInt(out.unmapped_jpy);
         if (net !== want) throw new Error(`rows[${i}]: on an account fee row net (${net}) must equal account_fee_amount_jpy + unclassified_mapped_jpy + unmapped_jpy (${want})`);
+        // 部品が別の列の間で相殺しても隠せない (#1554 Codex R3 Medium 2。例 misc_fee +3 と promotion −3 = net は −100 のまま):
+        //   分けられないものの組 = 材料の入らない 12 列 + (材料の入りうる 8 列の和 − account_fee_amount) の絶対値の和 ≤ unclassified_abs・0 でないものの数 ≤ 部品の数。表の CHECK と同じ
+        const parts = [...FEE_ROW_UNCLASSIFIED_COLUMNS.map((c) => BigInt(out[c])), FEE_ROW_MATERIAL_COLUMNS.reduce((s, c) => s + BigInt(out[c]), 0n) - BigInt(out.account_fee_amount_jpy)];
+        const absParts = parts.reduce((s, v) => s + (v < 0n ? -v : v), 0n), nzParts = parts.filter((v) => v !== 0n).length;
+        if (BigInt(out.unclassified_abs_jpy) < absParts) throw new Error(`rows[${i}]: on an account fee row unclassified_abs_jpy (${out.unclassified_abs_jpy}) must be >= the absolute unclassified parts (${absParts})`);
+        if (out.unclassified_component_count < nzParts) throw new Error(`rows[${i}]: on an account fee row unclassified_component_count (${out.unclassified_component_count}) must be >= the non-zero unclassified parts (${nzParts})`);
       } else if (out.unclassified_component_count !== 0) {
         // not_account_fee / unknown の行 = 部品は全部 ② / ③ で消費済み (損益の外 / unknown_line_mapped) = 分けられない部品は無い
         throw new Error(`rows[${i}]: a ${out.line_kind} row must not carry unclassified components (they are consumed as ${out.line_kind})`);

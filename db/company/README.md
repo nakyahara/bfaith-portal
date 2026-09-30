@@ -812,7 +812,8 @@ D7b-1 のうち coverage (決済のそろい・coordinator・レポートの一�
   - 🚨 **集約の後では復元できない** (+100 と −100 は金額 0 でも部品 2・絶対値 200) → 送り手の変換 (`amazon-finance-transform.mjs` の `classifyComponent`) が生の部品を分類するときに数える。D7b-3 の正式な利益は **金額でなく数** で止める (`finance_unclassified`)
   - 分類の優先順位 (§3.7・部品を 1 回だけ消費): ① 月の手数料の行の手数料の材料 (other_amount + item_related_fee = `account_fee_amount_jpy`) → ② not_account_fee の行 → ③ unknown の行 → ④ **どれにも消費されない = 分けられない** → ⑤ unmapped_jpy (別に数える)。
     SKU の行の分けられない = `misc_fee` / `other_fee` (MFNPostageFee を含む) / `other_amount` の列に入った部品 (SKU の行ではこの 3 列の和 = `unclassified_mapped_jpy`)。月の手数料の行の分けられない = 手数料の材料以外 (price (税も)・promotion・misc_fee・other_fee = fail-closed)
-  - 形の確かめ (`order-finance-checksum.mjs`・送り手と受け口が同じ): 4 列は全部あるか全部無いか・数 0 ⇔ 絶対値 0・|符号つき| ≤ 絶対値・今の形なら unmapped の金額 ≠ 0 は部品 ≥ 1・SKU の行は 3 列の和 = 符号つき / 絶対値 ≥ 3 列の絶対値の和。表の CHECK は数と絶対値の形だけ (既存の行 = 0 で満たす)
+  - 形の確かめ (`order-finance-checksum.mjs`・送り手と受け口が同じ): 4 列は全部あるか全部無いか・数 0 ⇔ 絶対値 0・|符号つき| ≤ 絶対値・今の形なら unmapped の金額 ≠ 0 は部品 ≥ 1・SKU の行は 3 列の和 = 符号つき / 絶対値 ≥ 3 列の絶対値の和 (ほかは下の「今の形の版の行の等式」)。
+    表の CHECK は 3 つ = 数と絶対値の形 (`ck_order_finance_daily_unclassified` / `_unmapped_count`・どの版の行にも・既存の行 = 0 で満たす) と今の形の版の行の等式 (`ck_order_finance_daily_class_form`・旧い版の行は対象の外)
   - **旧い形の送り手** (0047 の前 = 4 列の鍵が無い) は受け口がそのまま受ける: 集合の指紋は旧い列 (`LEGACY_CONTENT_COLUMNS`) で計算し、正規化した行からも 4 列を外す (= Render の deploy と miniPC の deploy の間も 400 にせず、受領記録の指紋も変わらない = 「Render が復元された」と誤って台帳を空にしない)。保存は 4 列 = 0
   - **今の形の行が 0047 の適用前に届いたら 409 `NOT_MIGRATED`** (0043 の apply は知らない鍵を黙って捨てる = 4 列が落ちたまま受領記録の指紋には入り、送り直しても 'same' で直らない)
   - 変換の版 = `amazon_finance_v2` (全部の注文の payload が変わる = **全部の送り直しが要る**。版が変わると `--incremental` も全部を選ぶ = 下の手順の夜の `--full` を先に済ませる)
@@ -820,7 +821,10 @@ D7b-1 のうち coverage (決済のそろい・coordinator・レポートの一�
   - 🚨 **旧い版への戻し (downgrade) を拒む**: 受領記録が今の形の版になった注文を旧い版 (4 列なし) で置き換えると 4 列が 0 に戻る (分けられない部品が消えて正式な利益が fail-open) → 受け口が chunk ごと **409 `DOWNGRADE`** (送り手は ❌)・SQL の apply も例外。**miniPC を旧いコード (amazon_finance_v1) に戻さない**。
     受け口の事前の照会の後に別の送信が受領記録を v2 にした競合でも、SQL の downgrade の例外は行の failed に吸収せず **chunk 全体を rollback して 409** (`ingest/chunk.mjs` の `fatalRowError`。ほかの受け口は今までどおり行ごと)
   - 🚨 **今の形の版の行の等式** (#1554 Codex R2・JS の形の確かめと表の CHECK `ck_order_finance_daily_class_form` の両方): unmapped の金額 ≠ 0 なら部品 ≥ 1 / SKU の行 = 分けられない 3 列の和 = 符号つき・絶対値 ≥ 3 列の絶対値の和 /
-    **月の手数料の行 = `net = account_fee_amount + unclassified_mapped + unmapped`** (4 列を 0 と偽って分類の漏れた金額を隠せない) / not_account_fee・unknown の行 = 分けられない部品 0。旧い版の行は対象の外
+    **月の手数料の行 = `net = account_fee_amount + unclassified_mapped + unmapped`** (4 列を 0 と偽って分類の漏れた金額を隠せない) / not_account_fee・unknown の行 = 分けられない部品 0。旧い版の行は対象の外。
+    SKU の行と月の手数料の行は **部品が別の列の間で相殺しても隠せない** (#1554 Codex R3): SKU の行 = 0 でない分けられない列の数 ≤ 部品の数 / 月の手数料の行 = 「材料の入らない 12 列」と「材料の入りうる 8 列 (commission・fba_fulfillment・fba_storage・chargeback 2 つ・points・other_fee・other_amount) の和 − account_fee_amount」の
+    絶対値の和 ≤ `unclassified_abs_jpy`・0 でないものの数 ≤ `unclassified_component_count` (例 storage 行の misc_fee +3・promotion −3 を 4 列 0 と申告できない = 正しくは部品 2・符号つき 0・絶対値 6)。
+    🚨 **同じ集約の列の中での相殺** (例 misc_fee の +3 と −3 = 列は 0) は受け口では完全には復元できない = **送り手の変換の試験で守る** (`scripts/test-company-db-amazon-finance.mjs` の純粋関数と乱数の決済の行 400 注文)
   - CHECK (3 つ) は 0047 で `NOT VALID` (新しい行には効く)・既存の行の検査は **0048** (`VALIDATE CONSTRAINT` = 読み書きを止めない lock。59 万行の検査を 0047 の ACCESS EXCLUSIVE の中でしない)
 - **`mart.finance_daily_sku_range(会社, モール, scope, from, to)`** = **日 × 正規化 seller SKU (`core.norm_code`) の子の粒度** (§3.2・R13 H1)。D7b-3 の利益の関数が計算のときに **今のマスタ** で出品に結び直してまとめる材料 (D-64)。
   今の `mart.finance_daily_range` (0045) は画面・突き合わせのため残す (戻りの型も変えない)

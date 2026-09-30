@@ -56,9 +56,13 @@ $$;
 -- ─── 今の形の版の行の等式 (#1554 Codex R2 Medium 2)。JS の validateFinanceRows と同じ (送り手の変換 classifyComponent の規則) ───
 --   4 列を 0 と偽って分類の漏れた金額を隠せない (正式な利益の finance_unclassified が fail-open にならない)。旧い版の行 (4 列 = 0) は対象の外
 --   ・unmapped_jpy <> 0 なら unmapped の部品は 1 つ以上
---   ・SKU の行: 分けられない列 (misc_fee / other_fee / other_amount) の和 = unclassified_mapped・絶対値の合計 ≥ その列の絶対値の和
+--   ・SKU の行: 分けられない列 (misc_fee / other_fee / other_amount) の和 = unclassified_mapped・絶対値の合計 ≥ その列の絶対値の和・部品の数 ≥ 0 でない列の数
 --   ・月の手数料の行: net = account_fee_amount (手数料の材料) + unclassified_mapped + unmapped
+--       + (#1554 Codex R3 Medium 2) 部品が相殺しても隠せない: 「分けられない」ものの組 = 手数料の材料が入らない 12 列 (売上・税・値引き・misc_fee・補てんなど) と
+--         「手数料の材料が入りうる 8 列 (commission・fba_fulfillment・fba_storage・chargeback 2 つ・points・other_fee・other_amount) の和 − account_fee_amount」(= その 8 列の中の分けられない分)。
+--         その組の絶対値の和 ≤ unclassified_abs・0 でないものの数 ≤ unclassified_component_count (例 misc_fee +3 と promotion −3 を 4 列 0 と申告できない)
 --   ・not_account_fee / unknown の行: 分けられない部品は無い (② / ③ で消費済み)
+--   🚨 同じ集約の列の中での相殺 (例 misc_fee の +3 と −3 = 列は 0) は受け口では復元できない = 送り手の変換の試験で守る (scripts/test-company-db-amazon-finance.mjs)
 --   NOT VALID (既存の行の検査は 0048)
 alter table core.order_finance_daily
   add constraint ck_order_finance_daily_class_form check (
@@ -68,8 +72,15 @@ alter table core.order_finance_daily
         when line_kind = 'sku' then
           unclassified_mapped_jpy = misc_fee_jpy + other_fee_jpy + other_amount_jpy
           and unclassified_abs_jpy >= abs(misc_fee_jpy) + abs(other_fee_jpy) + abs(other_amount_jpy)
+          and unclassified_component_count >= (misc_fee_jpy <> 0)::int + (other_fee_jpy <> 0)::int + (other_amount_jpy <> 0)::int
         when line_kind in ('storage', 'long_term_storage', 'removal', 'inbound_defect', 'low_inventory', 'subscription', 'easy_ship', 'other_account_fee') then
           net_jpy = account_fee_amount_jpy + unclassified_mapped_jpy + unmapped_jpy
+          and unclassified_abs_jpy >= abs(sales_principal_jpy) + abs(sales_shipping_jpy) + abs(sales_giftwrap_jpy) + abs(sales_tax_jpy) + abs(closing_fee_jpy)
+            + abs(promotion_jpy) + abs(warehouse_damage_jpy) + abs(warehouse_lost_jpy) + abs(safe_t_jpy) + abs(refund_principal_jpy) + abs(reversal_reimbursement_jpy) + abs(misc_fee_jpy)
+            + abs(commission_jpy + fba_fulfillment_jpy + fba_storage_jpy + shipping_chargeback_jpy + giftwrap_chargeback_jpy + points_jpy + other_fee_jpy + other_amount_jpy - account_fee_amount_jpy)
+          and unclassified_component_count >= (sales_principal_jpy <> 0)::int + (sales_shipping_jpy <> 0)::int + (sales_giftwrap_jpy <> 0)::int + (sales_tax_jpy <> 0)::int + (closing_fee_jpy <> 0)::int
+            + (promotion_jpy <> 0)::int + (warehouse_damage_jpy <> 0)::int + (warehouse_lost_jpy <> 0)::int + (safe_t_jpy <> 0)::int + (refund_principal_jpy <> 0)::int + (reversal_reimbursement_jpy <> 0)::int + (misc_fee_jpy <> 0)::int
+            + (commission_jpy + fba_fulfillment_jpy + fba_storage_jpy + shipping_chargeback_jpy + giftwrap_chargeback_jpy + points_jpy + other_fee_jpy + other_amount_jpy - account_fee_amount_jpy <> 0)::int
         else unclassified_component_count = 0
       end)) not valid;
 
@@ -110,11 +121,13 @@ begin
   on conflict (company_id, mall, scope_key, mall_order_no) do nothing;
   select * into rec from core.order_finance_receipts
    where company_id = p_company_id and mall = p_mall and scope_key = p_scope_key and mall_order_no = p_mall_order_no for update;
-  if p_batch_seq < rec.received_batch_seq then return 'stale'; end if;
   -- 0047: 今の形の版の注文を旧い版で置き換えない (downgrade = 4 列が 0 に戻る。受け口の JS も chunk ごと 409 にする)
+  --   🚨 stale の判定より前 (#1554 Codex R3 Medium 1): 旧い版の chunk (世代 51) の事前の照会の後に、別の送信が v2 を世代 52 で入れた競合で
+  --      stale を返すと受け口は例外を見ず、chunk のほかの行を commit して 200 になる → 世代に関係なく downgrade の例外 (chunk 全体を rollback)
   if rec.received_batch_seq > 0 and core.finance_version_has_class(rec.transform_version) and not core.finance_version_has_class(p_transform_version) then
     raise exception 'downgrade: order % was received with % and must not be replaced by %', p_mall_order_no, rec.transform_version, p_transform_version using errcode = '22023';
   end if;
+  if p_batch_seq < rec.received_batch_seq then return 'stale'; end if;
   if rec.received_batch_seq > 0 and rec.set_checksum = p_set_checksum and rec.transform_version is not distinct from p_transform_version then
     if p_batch_seq > rec.received_batch_seq then
       update core.order_finance_receipts set received_batch_seq = p_batch_seq
