@@ -229,6 +229,9 @@ await ta('[8] NE のコードの元の書き方 (③b-1b): 保存の前に集め
   // 1 ページ目に ABC-1・2 ページ目に abc-1 (保存は小文字で上書き = 片方しか残らない)
   ne.goods = [...Array.from({ length: 1000 }, (_, i) => ({ goods_id: i === 5 ? 'ABC-1' : `g${i}`, goods_representation_id: i < 3 ? 'GRP-X' : '' })),
     { goods_id: 'abc-1', goods_representation_id: 'grp-x' }, { goods_id: 'Up-2' }];
+  // 前の試験の取得と別の世代 (秒) にする: 同じ秒に入ると 2 つの回が 1 つの世代にまとまり、下の「新しい 3 つを残す」で
+  //   2020 年の古い印が 3 つの中に残って落ちる (npm run test:company-db を続けて流したときだけ時々落ちた・2026-09-30)
+  await new Promise((r) => setTimeout(r, 1100));
   await quietly(fetchProducts);
   const pAt = meta('ne_api_products_complete_at');
   assert.ok(pAt);
