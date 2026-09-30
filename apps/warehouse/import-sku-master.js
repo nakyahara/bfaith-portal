@@ -25,7 +25,7 @@ import fs from 'fs';
 import path from 'path';
 import iconv from 'iconv-lite';
 import { getDB, initDB } from './db.js';
-import { legacyCliGate } from '../../lib/master-legacy-gate.mjs';
+import { legacyCliGate, runWithLegacyCliLock } from '../../lib/master-legacy-gate.mjs';
 
 /**
  * RFC4180準拠の簡易CSVパーサ
@@ -236,8 +236,9 @@ async function cliMain() {
   console.log(`[import] encoding: ${encoding}`);
   console.log(`[import] dryRun: ${dryRun}`);
 
-  if (!(await legacyCliGate('cli:import-sku-master.js'))) return;   // 書く直前 (この後は同期で読み・書き)
-  const result = importSkuMasterCSV(csvPath, { dryRun, encoding });
+  // 書くところ = 段階の鍵を共有で持ったまま読み直し、legacy_open のときだけ書く (段階を変える関数は書き終わるまで待つ)
+  const { ran, result } = await runWithLegacyCliLock('cli:import-sku-master.js', () => importSkuMasterCSV(csvPath, { dryRun, encoding }));
+  if (!ran) return;
 
   console.log('\n=== 結果 ===');
   console.log(`m_sku_master  : ${result.masterCount}件`);

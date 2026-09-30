@@ -635,7 +635,7 @@ function parseCsvBuffer(buf) {
 
 // POST /api/csv/shipping — 送料CSV一括登録（追加・更新、既存は消さない）
 // CSV形式: 商品コード, 送料コード, 配送方法, 送料
-router.post('/api/csv/shipping', upload.single('file'), legacyRecheck('warehouse:POST /api/csv/shipping'), (req, res) => {
+router.post('/api/csv/shipping', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/shipping'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -689,7 +689,7 @@ router.post('/api/csv/shipping', upload.single('file'), legacyRecheck('warehouse
 
 // POST /api/csv/genka — 原価CSV一括登録
 // CSV形式: 商品コード, 原価, 商品名（任意）
-router.post('/api/csv/genka', upload.single('file'), legacyRecheck('warehouse:POST /api/csv/genka'), (req, res) => {
+router.post('/api/csv/genka', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/genka'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -731,7 +731,7 @@ function uploadSkuMasterMw(req, res, next) {
     return res.status(400).json({ error: 'アップロード処理に失敗しました' });
   });
 }
-router.post('/api/csv/m-sku-master', uploadSkuMasterMw, legacyRecheck('warehouse:POST /api/csv/m-sku-master'), (req, res) => {
+router.post('/api/csv/m-sku-master', uploadSkuMasterMw, legacyRecheck('warehouse:POST:/api/csv/m-sku-master'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const csvPath = req.file.path;
   const dryRun = req.query.dry_run === '1';
@@ -1248,7 +1248,7 @@ router.post('/api/sales_class', (req, res) => {
 // 売上分類CSV一括登録
 // CSV形式: 商品コード, 売上分類(1-4)
 
-router.post('/api/csv/sales_class', upload.single('file'), legacyRecheck('warehouse:POST /api/csv/sales_class'), (req, res) => {
+router.post('/api/csv/sales_class', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/sales_class'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -1385,7 +1385,7 @@ router.get('/api/reorder/unregistered', (req, res) => {
 
 // POST /api/csv/reorder_setting — 推奨保有月数CSV一括登録
 //   CSV形式: 商品コード, 推奨保有月数(0〜60) ／ ヘッダー行は自動スキップ
-router.post('/api/csv/reorder_setting', upload.single('file'), legacyRecheck('warehouse:POST /api/csv/reorder_setting'), (req, res) => {
+router.post('/api/csv/reorder_setting', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/reorder_setting'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -1472,7 +1472,7 @@ router.post('/api/tax_rate', (req, res) => {
 // 消費税率CSV一括登録
 // CSV形式: 商品コード, 税率(0.08 or 0.1)
 
-router.post('/api/csv/tax_rate', upload.single('file'), legacyRecheck('warehouse:POST /api/csv/tax_rate'), (req, res) => {
+router.post('/api/csv/tax_rate', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/tax_rate'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);

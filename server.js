@@ -67,7 +67,7 @@ import { startNotifyOutbox as startFbaBoxNotifyOutbox } from './apps/fba-box/not
 import staffRouter from './apps/staff/router.js';
 import masterDecisionsRouter from './apps/master-decisions/router.mjs';
 import masterEditRouter from './apps/master-edit/router.mjs';
-import { legacyAckHeartbeat, maybeRefreshLegacyAck, legacyAckState } from './lib/master-legacy-gate.mjs';
+import { legacyAckHeartbeat, maybeRefreshLegacyAck, legacyAckState, ackLegacyGatesStopped } from './lib/master-legacy-gate.mjs';
 import { isRender as isRenderHost } from './lib/is-render.js';
 import { startInboundCheckCron, startInboundCheckPrintQueueWorker } from './apps/inbound-check/sync-job.js';
 // 🆕 新商品のパッケージ裏面ラベル写真を Drive へ送るキュー (プロセス内2分間隔の再試行)
@@ -1273,15 +1273,23 @@ app.listen(PORT, () => {
   startCompanyDbInventoryHourlyCron();
 });
 
+// 止めるとき: マスタの古い入口の門の「止めた」を書いてから終わる (長くても 2 秒。書けなくても止まる = 人が master-legacy-instance.mjs で「止めた」を書ける)
+function stopLegacyGateThenExit(signal) {
+  if (!LEGACY_ACK_HOST) return process.exit(0);
+  ackLegacyGatesStopped({ host: LEGACY_ACK_HOST, reason: `${signal} で止めた`, timeoutMs: 2000 })
+    .then((r) => bootNote('web', `門の「止めた」: ${r.state}`))
+    .catch(() => {})
+    .finally(() => process.exit(0));
+}
 process.on('SIGTERM', () => {
   bootNote('web', 'SIGTERM受信 → shutdown');
   stopPythonBackend();
-  process.exit(0);
+  stopLegacyGateThenExit('SIGTERM');
 });
 process.on('SIGINT', () => {
   bootNote('web', 'SIGINT受信 → shutdown');
   stopPythonBackend();
-  process.exit(0);
+  stopLegacyGateThenExit('SIGINT');
 });
 process.on('exit', (code) => {
   bootNote('web', `process.exit code=${code}`);

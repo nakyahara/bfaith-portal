@@ -1472,7 +1472,7 @@ router.post('/api/email/mode', (req, res) => {
 });
 
 // 宛先マスタCSV取込 (既存GASスプシ「仕入先ごとの発注メール送信先一覧」の生DL。仕入先名称で突合)
-router.post('/api/email/recipients/csv', upload.single('file'), legacyRecheck('purchase-orders:POST /api/email/recipients/csv'), (req, res) => {
+router.post('/api/email/recipients/csv', upload.single('file'), legacyRecheck('purchase-orders:POST:/api/email/recipients/csv'), (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'ファイルがありません' });
     let buf;
@@ -2728,7 +2728,7 @@ router.delete('/api/masters/:kind/:id', (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-router.post('/api/masters/:kind/csv', upload.single('file'), legacyRecheck('purchase-orders:POST /api/masters/:kind/csv (suppliers)'), (req, res) => {
+router.post('/api/masters/:kind/csv', upload.single('file'), legacyRecheck('purchase-orders:POST:/api/masters/:kind/csv:suppliers'), (req, res) => {
   const def = MASTER_DEFS[req.params.kind];
   if (!def) return res.status(404).json({ ok: false, error: 'unknown master' });
   if (!req.file) return res.status(400).json({ ok: false, error: 'CSVファイルが必要です' });
@@ -2922,7 +2922,7 @@ function bulkInvalidReason(table, row) {
 }
 const TABLE_LABEL = { materials: '原料グループ', conditions: '発注条件グループ', suppliers: '仕入先', attrs: '商品紐付け', selectable: '選べるセット構成' };
 
-router.post('/api/import', upload.array('files', 12), legacyRecheck('purchase-orders:POST /api/import'), (req, res) => {
+router.post('/api/import', upload.array('files', 12), legacyRecheck('purchase-orders:POST:/api/import'), (req, res) => {
   if (!req.files || !req.files.length) return res.status(400).json({ ok: false, error: 'CSVファイルを選択してください' });
   const classified = []; const fileErrors = []; const warnings = [];
   const warn = m => { if (warnings.length < 200) warnings.push(m); };

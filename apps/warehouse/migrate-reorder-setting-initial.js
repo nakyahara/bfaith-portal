@@ -14,7 +14,7 @@
 import fs from 'fs';
 import iconv from 'iconv-lite';
 import { getDB, initDB } from './db.js';
-import { legacyCliGate } from '../../lib/master-legacy-gate.mjs';
+import { legacyCliGate, runWithLegacyCliLock } from '../../lib/master-legacy-gate.mjs';
 
 const REORDER_MONTHS_MAX = 60;
 function parseMonths(v) {
@@ -104,8 +104,9 @@ async function main() {
       imported++;
     }
   });
-  if (!(await legacyCliGate('cli:migrate-reorder-setting-initial.js'))) return;   // 書く直前 (この後は同期で書く)
-  apply(records.slice(1));
+  // 書くところ = 段階の鍵を共有で持ったまま読み直し、legacy_open のときだけ書く (段階を変える関数は書き終わるまで待つ)
+  const { ran } = await runWithLegacyCliLock('cli:migrate-reorder-setting-initial.js', () => apply(records.slice(1)));
+  if (!ran) return;
 
   console.log(`${dryRun ? '[DRY-RUN] ' : ''}投入 ${imported} / スキップ ${skipped} (無効 ${invalid}) / 全 ${records.length - 1} 行`);
   process.exit(0);

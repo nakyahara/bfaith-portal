@@ -17,7 +17,7 @@ import fs from 'fs';
 import iconv from 'iconv-lite';
 import { initDB, getDB, saveToFile, updateSyncMeta, clearNeCompleteMarks, neSrc } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
-import { legacyCliGate } from '../../lib/master-legacy-gate.mjs';
+import { legacyCliGate, runWithLegacyCliLock } from '../../lib/master-legacy-gate.mjs';
 import { cliEntry } from '../../config/master-legacy-entries.mjs';
 
 function now() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
@@ -452,9 +452,9 @@ async function main() {
   };
 
   if (handlers[command]) {
-    // 書く直前にもう一度段階を読む (DB を開いている間に frozen になっても全部消して入れ直さない。この後は読み・書きとも同期で走る)
-    if (legacyEntry && !(await legacyCliGate(legacyEntry.id))) return;
-    handlers[command]();
+    // マスタを書く mode = 段階の鍵を共有で持ったまま読み直し、legacy_open のときだけ書く (段階を変える関数は書き終わるまで待つ。PR #1565 中間レビュー M2)
+    if (legacyEntry) await runWithLegacyCliLock(legacyEntry.id, () => handlers[command]());
+    else handlers[command]();
   } else {
     console.error(`不明なコマンド: ${command}`);
     console.log(`有効なコマンド: ${Object.keys(handlers).join(', ')}`);

@@ -27,7 +27,7 @@ import express from 'express';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // 本番の接続先は子プロセスにも渡さない (この試験は PGlite・偽の読み方・127.0.0.1 だけ)
-for (const k of ['COMPANY_DB_URL', 'COMPANY_DB_WATCH_URL', 'COMPANY_DB_WATCH_WRITER_URL', 'RENDER_GIT_COMMIT']) delete process.env[k];
+for (const k of ['COMPANY_DB_URL', 'COMPANY_DB_WATCH_URL', 'COMPANY_DB_WATCH_WRITER_URL', 'COMPANY_DB_MASTER_GATE_RENDER_URL', 'COMPANY_DB_MASTER_GATE_MINIPC_URL', 'RENDER_GIT_COMMIT', 'RENDER_INSTANCE_ID']) delete process.env[k];
 process.env.WAREHOUSE_API_KEY = '';
 delete process.env.RENDER;
 
@@ -143,7 +143,7 @@ await t('一覧: app ごとの入口・知らない app の門は起動時に落
     assert.ok(E.entriesForApp(app).length > 0, app);
   }
   assert.throws(() => G.masterLegacyGate('no-such-app'));
-  assert.equal(E.cliEntry('apps/warehouse/csv-import.js', 'product_shipping').id, 'cli:csv-import.js product_shipping');
+  assert.equal(E.cliEntry('apps/warehouse/csv-import.js', 'product_shipping').id, 'cli:csv-import.js:product_shipping');
   assert.equal(E.cliEntry('apps/warehouse/csv-import.js', 'orders'), null);
   assert.ok(E.LEGACY_EXEMPT.every((e) => ['replication', 'already_closed', 'manual'].includes(e.kind)));
 });
@@ -176,7 +176,7 @@ await t('drain (R1 H3): 門を通った書き込みを終わるまで数える (
     const p = fetch(url, { method: 'POST' });
     for (let i = 0; i < 50 && G.legacyInflight().count === 0; i++) await new Promise((ok) => setTimeout(ok, 10));
     const mid = G.legacyInflight();
-    assert.equal(mid.count, 1); assert.ok(mid.oldest_started_at); assert.equal(mid.by_entry['warehouse:POST /api/shipping'], 1);
+    assert.equal(mid.count, 1); assert.ok(mid.oldest_started_at); assert.equal(mid.by_entry['warehouse:POST:/api/shipping'], 1);
     release();
     assert.equal((await p).status, 200);
     for (let i = 0; i < 50 && G.legacyInflight().count > 0; i++) await new Promise((ok) => setTimeout(ok, 10));
@@ -186,33 +186,73 @@ await t('drain (R1 H3): 門を通った書き込みを終わるまで数える (
     assert.equal(G.legacyInflight().count, 0);
   } finally { await new Promise((ok) => srv.close(ok)); }
 });
-await t('route_part: 断らずに res.locals.masterLegacyWrite (毎回読んだ状態) を渡す = handler がマスタの部分だけ書かない', async () => {
+await t('route_part: 読めて legacy_open = そのまま / 読めて閉じている = 断らずにマスタの部分だけ書かない / 🚨 読めない = 要求ごと 503 (中間レビュー High-1: 切替前の瞬断で税率の無いセットを黙って作らない)', async () => {
   const app = express();
   const r = express.Router();
   r.use(express.json());
   r.use(G.masterLegacyGate('product-hub'));
-  r.post('/api/drafts/:id/set-drafts', (req, res) => res.json({ w: res.locals.masterLegacyWrite?.writable ?? null }));
+  let called = 0;
+  r.post('/api/drafts/:id/set-drafts', (req, res) => { called++; res.json({ w: res.locals.masterLegacyWrite?.writable ?? null }); });
   app.use('/', r);
   const srv = http.createServer(app);
   await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
   try {
-    const post = async () => (await (await fetch(`http://127.0.0.1:${srv.address().port}/api/drafts/1/set-drafts`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).json()).w;
-    setPhase('legacy_open'); assert.equal(await post(), true);
-    setPhase('frozen'); assert.equal(await post(), false);
-    setPhase('unreadable'); assert.equal(await quiet(post), false);
+    const post = async () => { const res = await fetch(`http://127.0.0.1:${srv.address().port}/api/drafts/1/set-drafts`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }); return { status: res.status, json: await res.json() }; };
+    setPhase('legacy_open'); assert.deepEqual(await post(), { status: 200, json: { w: true } });
+    setPhase('frozen'); assert.deepEqual(await post(), { status: 200, json: { w: false } });
+    called = 0;
+    setPhase('unreadable');
+    const r3 = await quiet(post);
+    assert.equal(r3.status, 503); assert.equal(r3.json.error, 'master_phase_unreadable');
+    assert.equal(called, 0, '読めない = セットを作らない (税率の無いセットを作らない)');
   } finally { await new Promise((ok) => srv.close(ok)); }
 });
-await t('manifest: 形を決めた JSON の sha256 (同じ一覧 = 同じ値・一覧が変われば変わる)・手の入口の id を含む', async () => {
+await t('中間レビュー Medium-1: 段階を読んでいる間に相手が切れた = 書かない・書きかけに数えない (drain が 0 に戻らない、を起こさない)', async () => {
+  let release;
+  const hold = new Promise((r) => { release = r; });
+  G.__setLegacyPhaseReader(async () => { await hold; return { readable: true, phase: 'legacy_open' }; });
+  const app = express();
+  const r = express.Router();
+  r.use(G.masterLegacyGate('warehouse'));
+  let called = 0;
+  r.post('/api/shipping', (req, res) => { called++; res.json({ ok: true }); });
+  app.use('/', r);
+  const srv = http.createServer(app);
+  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  try {
+    const before = G.legacyGateStats().client_gone;
+    const ac = new AbortController();
+    const p = fetch(`http://127.0.0.1:${srv.address().port}/api/shipping`, { method: 'POST', signal: ac.signal }).catch(() => 'aborted');
+    await new Promise((ok) => setTimeout(ok, 100));
+    ac.abort();
+    assert.equal(await p, 'aborted');
+    await new Promise((ok) => setTimeout(ok, 100));
+    await quiet(async () => { release(); await new Promise((ok) => setTimeout(ok, 100)); });
+    assert.equal(called, 0, '相手が居ない = 書かない');
+    assert.equal(G.legacyInflight().count, 0, '書きかけに残らない');
+    assert.equal(G.legacyGateStats().client_gone, before + 1);
+  } finally { await new Promise((ok) => srv.close(ok)); }
+});
+await t('中間レビュー Medium-3: 画面の読みは、同時の画面で 1 回を分け合い、1 秒で打ち切る (読み直さない)。書き込みは待つ', async () => {
+  let calls = 0;
+  const attempts = [];
+  G.__setLegacyPhaseReader(async (opts = {}) => { calls++; attempts.push(opts.attempts); await new Promise((ok) => setTimeout(ok, 3000)); return { readable: true, phase: 'legacy_open' }; });
+  const t0 = Date.now();
+  const rs = await quiet(() => Promise.all([G.checkLegacyGate({ purpose: 'screen' }), G.checkLegacyGate({ purpose: 'screen' }), G.checkLegacyGate({ purpose: 'screen' })]));
+  const ms = Date.now() - t0;
+  assert.ok(ms < 1800, `${ms}ms`);
+  assert.equal(calls, 1, '1 回の読みを分け合う');
+  assert.deepEqual(attempts, [1], '画面は読み直さない');
+  assert.ok(rs.every((s) => s.readable === false && s.writable === false));
+  assert.ok(G.legacyGateStats().screen_timeouts >= 1);
+});
+await t('manifest (⑤-1 の形): { entries: [{ id, kind: code | manual }] }・id は英数字と _.:/- だけ・一意・手の入口 = 切替の証拠 manual_entries_stopped と同じ集合', async () => {
   const m = G.legacyManifest();
-  assert.equal(G.manifestHash(), G.manifestHash(G.legacyManifest()));
-  assert.match(G.manifestHash(), /^[0-9a-f]{64}$/);
-  assert.deepEqual(m.manual_entry_ids, E.LEGACY_EXEMPT.filter((e) => e.kind === 'manual').map((e) => e.id));
-  assert.ok(m.manual_entry_ids.includes('ne:商品画面'));
-  assert.equal(m.entries.length, E.LEGACY_ENTRIES.length);
-  assert.notEqual(G.manifestHash({ ...m, entries: m.entries.slice(1) }), G.manifestHash(m));
-  // キーの並びが違っても同じ値 (どの PC でも同じ)
-  const reordered = { manual_entry_ids: m.manual_entry_ids, exempt: m.exempt, entries: m.entries, schema: m.schema };
-  assert.equal(G.manifestHash(reordered), G.manifestHash(m));
+  assert.ok(Array.isArray(m.entries) && m.entries.length === E.LEGACY_ENTRIES.length + E.LEGACY_EXEMPT.filter((e) => e.kind === 'manual').length);
+  assert.ok(m.entries.every((x) => /^[A-Za-z0-9_.:/-]{1,120}$/.test(x.id) && ['code', 'manual'].includes(x.kind)), JSON.stringify(m.entries.find((x) => !/^[A-Za-z0-9_.:/-]{1,120}$/.test(x.id))));
+  assert.equal(new Set(m.entries.map((x) => x.id)).size, m.entries.length);
+  assert.deepEqual(m.entries.filter((x) => x.kind === 'manual').map((x) => x.id), ['ne:item-screen', 'gas:logizard-sheet-and-sku-map']);
+  assert.ok(m.exempt.every((x) => !m.entries.some((y) => y.id === x.id)), '閉じない口は入口に入れない');
 });
 await t('build の番号: Render = RENDER_GIT_COMMIT / miniPC = リポジトリの git HEAD / 分からない = null (記録を書かない)', async () => {
   assert.equal(G.resolveBuildId({ env: { RENDER_GIT_COMMIT: 'ABCDEF1234567' }, fresh: true }), 'abcdef1234567');
@@ -220,39 +260,87 @@ await t('build の番号: Render = RENDER_GIT_COMMIT / miniPC = リポジトリ�
   assert.match(head, /^[0-9a-f]{40}$/);
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'mlg-nogit-'));
   assert.equal(G.resolveBuildId({ env: {}, repoDir: empty, fresh: true }), null);
+  assert.match(G.instanceId({ RENDER_INSTANCE_ID: 'srv@1 x' }), /^srv_1_x:\d+:[0-9a-f]{8}$/, '⑤-1 の形 (英数字と _.:-)');
 });
-await t('門の記録 (R1 H2・M6): 書く前に確かめる (場所・build の番号・段階を読める・書く接続先・書き手の関数)・書く中身 (manifest・書きかけ・持ち主表)', async () => {
+/** 偽の接続 (⑤-1 の関数の返事の形を返す)。hashOf = DB の legacy_manifest_hash の代わり */
+const fakeGateDb = ({ hasFn = true, reply = null, calls = [] } = {}) => async () => ({
+  db: {
+    query: async (sql, params) => {
+      calls.push({ sql, params });
+      if (/to_regprocedure/.test(sql)) return { rows: [{ ok: hasFn }] };
+      if (/legacy_manifest_hash/.test(sql)) return { rows: [{ h: 'f'.repeat(64) }] };
+      if (/record_legacy_gate_ack/.test(sql)) return { rows: [{ r: reply || { ack_id: 7, manifest_hash: 'f'.repeat(64), acked_at: '2026-10-01T00:00:00Z' } }] };
+      throw new Error(`知らない SQL: ${sql}`);
+    },
+  },
+  close: async () => {},
+});
+await t('門の記録: 書く前に確かめる (場所・build の番号・段階を読める・場所ごとの門のログイン・関数)。関数が無い = 注意は 1 回だけ', async () => {
   const noGit = fs.mkdtempSync(path.join(os.tmpdir(), 'mlg-nogit-'));
-  const calls = [];
-  const fakeDb = (hasFn) => async () => ({ db: { query: async (sql, params) => { calls.push({ sql, params }); if (/to_regprocedure/.test(sql)) return { rows: [{ ok: hasFn }] }; return { rows: [{ r: 'ack-1' }] }; } }, close: async () => {} });
-  await quiet(async () => {
+  const logs = [];
+  const w = console.warn, e = console.error, l = console.log;
+  console.warn = (...a) => logs.push(['warn', a.join(' ')]); console.error = (...a) => logs.push(['error', a.join(' ')]); console.log = () => {};
+  try {
+    G.__resetLegacyAck();
     setPhase('legacy_open');
-    assert.equal((await G.ackLegacyGates({ host: 'laptop', connect: fakeDb(true) })).state, 'precheck_failed');
-    let r = await G.ackLegacyGates({ host: 'minipc', connect: fakeDb(true), repoDir: noGit, env: {} });
+    assert.equal((await G.ackLegacyGates({ host: 'laptop', connect: fakeGateDb() })).state, 'precheck_failed');
+    let r = await G.ackLegacyGates({ host: 'minipc', connect: fakeGateDb(), repoDir: noGit, env: {} });
     assert.equal(r.state, 'precheck_failed'); assert.match(r.detail, /build の番号/);
     setPhase('unreadable');
-    r = await G.ackLegacyGates({ host: 'minipc', connect: fakeDb(true) });
+    r = await G.ackLegacyGates({ host: 'minipc', connect: fakeGateDb() });
     assert.equal(r.state, 'precheck_failed'); assert.match(r.detail, /段階を読めない/);
     setPhase('legacy_open');
-    r = await G.ackLegacyGates({ host: 'minipc', env: {} });
-    assert.equal(r.state, 'precheck_failed'); assert.match(r.detail, /接続先が無い/);
-    r = await G.ackLegacyGates({ host: 'minipc', connect: fakeDb(false) });
-    assert.equal(r.state, 'no_function');
-  });
-  calls.length = 0;
-  const end = G.beginLegacyWrite('warehouse:POST /api/shipping');
+    r = await G.ackLegacyGates({ host: 'minipc', env: { COMPANY_DB_MASTER_GATE_RENDER_URL: 'postgres://x@127.0.0.1:1/x' } });
+    assert.equal(r.state, 'precheck_failed'); assert.match(r.detail, /COMPANY_DB_MASTER_GATE_MINIPC_URL/, 'miniPC は miniPC の門のログインだけで書く (Render のものは使わない)');
+    logs.length = 0;
+    for (let i = 0; i < 3; i++) assert.equal((await G.ackLegacyGates({ host: 'minipc', connect: fakeGateDb({ hasFn: false }) })).state, 'no_function');
+    assert.equal(logs.filter((x) => /no_function/.test(x[1])).length, 1, '同じ理由は 1 回だけ出す');
+    assert.equal(logs.find((x) => /no_function/.test(x[1]))[0], 'warn');
+  } finally { console.warn = w; console.error = e; console.log = l; }
+});
+await t('門の記録: ⑤-1 の関数に場所・名札・build・manifest・持ち主表・見た段階・書きかけを渡し、返事 (ack_id・manifest_hash が DB の計算と同じ・acked_at) を確かめてから「書けた」', async () => {
+  const calls = [];
+  const end = G.beginLegacyWrite('warehouse:POST:/api/shipping');
   try {
-    const r = await G.ackLegacyGates({ host: 'render', connect: fakeDb(true), env: { RENDER_GIT_COMMIT: 'a'.repeat(40), RENDER_INSTANCE_ID: 'srv-1' } });
-    assert.equal(r.state, 'acked'); assert.equal(r.ack_id, 'ack-1');
+    setPhase('legacy_open');
+    const r = await G.ackLegacyGates({ host: 'render', connect: fakeGateDb({ calls }), env: { RENDER_GIT_COMMIT: 'a'.repeat(40), RENDER_INSTANCE_ID: 'srv-1' } });
+    assert.equal(r.state, 'acked', r.detail); assert.equal(r.ack_id, '7'); assert.equal(r.manifest_hash, 'f'.repeat(64));
   } finally { end(); }
-  const call = calls.find((c) => c.sql === G.ACK_WRITER.call);
-  const p = JSON.parse(call.params[0]);
+  const call = calls.find((c) => /select ops\.record_legacy_gate_ack\(/.test(c.sql));
+  const [host, inst, build, manifest, owner, phase, n, oldest] = call.params;
   const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
-  assert.equal(p.host, 'render'); assert.equal(p.build_id, 'a'.repeat(40)); assert.match(p.instance_id, /^srv-1:\d+:[0-9a-f]{8}$/);
-  assert.equal(p.manifest_hash, G.manifestHash()); assert.deepEqual(p.manifest.manual_entry_ids, G.legacyManifest().manual_entry_ids);
-  assert.equal(p.owner_hash, ownershipHash(MASTER_OWNERSHIP)); assert.equal(p.phase_seen, 'legacy_open');
-  assert.equal(p.inflight_count, 1); assert.ok(p.oldest_inflight_at);
-  assert.equal(G.legacyAckState().state, 'acked');
+  assert.equal(host, 'render'); assert.match(inst, /^srv-1:\d+:[0-9a-f]{8}$/); assert.equal(build, 'a'.repeat(40));
+  assert.deepEqual(JSON.parse(manifest), G.legacyManifest());
+  assert.equal(owner, ownershipHash(MASTER_OWNERSHIP)); assert.equal(phase, 'legacy_open');
+  assert.equal(n, 1); assert.ok(oldest);
+  // 返事が違う = 「書けた」にしない
+  await quiet(async () => {
+    let bad = await G.ackLegacyGates({ host: 'render', connect: fakeGateDb({ reply: { ack_id: 8, manifest_hash: 'e'.repeat(64), acked_at: 'x' } }), env: { RENDER_GIT_COMMIT: 'a'.repeat(40) } });
+    assert.equal(bad.state, 'bad_reply');
+    bad = await G.ackLegacyGates({ host: 'render', connect: fakeGateDb({ reply: { manifest_hash: 'f'.repeat(64) } }), env: { RENDER_GIT_COMMIT: 'a'.repeat(40) } });
+    assert.equal(bad.state, 'bad_reply');
+  });
+});
+await t('止めるとき: 「止めた」の記録 (理由つき・書きかけ 0) を書く。人が別のプロセスを「止めた」にできる (名札を指定)。理由が無い = 書かない', async () => {
+  const calls = [];
+  const end = G.beginLegacyWrite('warehouse:POST:/api/shipping');
+  try {
+    setPhase('legacy_open');
+    const r = await G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM で止めた', env: { RENDER_GIT_COMMIT: 'b'.repeat(40) }, timeoutMs: 2000 }).catch((e) => ({ state: 'x', detail: e.message }));
+    assert.equal(r.state, 'precheck_failed', '門のログインが無い = 書かない (止まるのは待たせない)');
+    const r2 = await G.ackLegacyGates({ host: 'minipc', connect: fakeGateDb({ calls }), env: { RENDER_GIT_COMMIT: 'b'.repeat(40) }, stopped: true, stoppedReason: 'SIGTERM で止めた' });
+    assert.equal(r2.state, 'stopped', r2.detail);
+    const call = calls.find((c) => /select ops\.record_legacy_gate_ack\(/.test(c.sql));
+    assert.equal(call.params[6], 0, '止めた = 書きかけ 0'); assert.equal(call.params[7], null);
+    const { markStopped } = await import('./company-db/master-legacy-instance.mjs');
+    calls.length = 0;
+    const r3 = await markStopped({ host: 'render', instance: 'srv-9:123:deadbeef', reason: '電源が落ちて戻らない', connect: fakeGateDb({ calls }), env: { RENDER_GIT_COMMIT: 'c'.repeat(40) } });
+    assert.equal(r3.state, 'stopped');
+    assert.equal(calls.find((c) => /select ops\.record_legacy_gate_ack\(/.test(c.sql)).params[1], 'srv-9:123:deadbeef', '指定した名札で書く');
+    await assert.rejects(() => markStopped({ host: 'render', instance: 'srv-9', reason: '', connect: fakeGateDb() }), /reason/);
+    await assert.rejects(() => markStopped({ host: 'laptop', instance: 'srv-9', reason: 'x', connect: fakeGateDb() }), /host/);
+    assert.equal((await quiet(() => G.ackLegacyGates({ host: 'minipc', connect: fakeGateDb(), stopped: true, stoppedReason: ' ' }))).state, 'precheck_failed');
+  } finally { end(); }
 });
 await t('門の記録は 5 分おき (要求が来たついで)・同時に 2 本走らせない・読み戻しは今すぐ書き直す', async () => {
   let now = Date.parse('2026-10-01T02:00:00Z');
@@ -324,6 +412,27 @@ await t('表が無い (0050 の前の DB) = 読めない = 閉じる', async () 
   assert.equal(s.writable, false); assert.equal(s.readable, false);
   await pg2.close();
 });
+await t('門の記録を ⑤-1 の本物の関数 (ops.record_legacy_gate_ack) で書く: 行と manifest (手の入口つき) が残る・返事を確かめる・書く間に段階が変わった (stale_phase) = 読み直して 1 回書き直す', async () => {
+  await forcePhase('legacy_open');
+  const connect = async () => ({ db: cdb, close: async () => {} });
+  const env = { RENDER_GIT_COMMIT: 'd'.repeat(40), RENDER_INSTANCE_ID: 'pglite-1' };
+  G.__setLegacyPhaseReader(() => readCutoverPhase(cdb));
+  G.__resetLegacyAck();
+  const r = await G.ackLegacyGates({ host: 'minipc', connect, env });
+  assert.equal(r.state, 'acked', r.detail);
+  const row = (await cdb.query('select a.*, m.entries from ops.master_legacy_gate_acks a join ops.master_legacy_manifests m using (manifest_hash) where a.ack_id = $1', [r.ack_id])).rows[0];
+  assert.equal(row.host, 'minipc'); assert.equal(row.build_id, 'd'.repeat(40)); assert.equal(row.phase_seen, 'legacy_open'); assert.match(row.instance_id, /^pglite-1:/);
+  assert.equal(row.manifest_hash, r.manifest_hash);
+  assert.deepEqual(row.entries.entries.filter((x) => x.kind === 'manual').map((x) => x.id), ['ne:item-screen', 'gas:logizard-sheet-and-sku-map']);
+  // 1 回目に読んだ段階は古い (legacy_open)・DB はもう frozen = 関数が stale_phase で拒む → 読み直して frozen で書く
+  await forcePhase('frozen');
+  let n = 0;
+  G.__setLegacyPhaseReader(async () => (n++ === 0 ? { readable: true, phase: 'legacy_open' } : readCutoverPhase(cdb)));
+  const r2 = await quiet(() => G.ackLegacyGates({ host: 'minipc', connect, env }));
+  assert.equal(r2.state, 'acked', r2.detail);
+  assert.equal((await cdb.query('select phase_seen from ops.master_legacy_gate_acks where ack_id = $1', [r2.ack_id])).rows[0].phase_seen, 'frozen');
+  await forcePhase('legacy_open');
+});
 
 // ═══ C. 入口ごと (本物の router を HTTP で) ═══
 console.log('── C. 入口ごと (HTTP) ──');
@@ -380,25 +489,25 @@ const isGateRefusal = (r) => r.json && ['master_frozen', 'master_phase_unreadabl
 
 // miniPC の /register (warehouse の router): 一覧の全部の API に要求の見本を持つ (一覧に足したら、ここにも足さないと落ちる)
 const WH_SAMPLES = {
-  'warehouse:POST /api/shipping': ['POST', '/api/shipping', { sku: 'ne-aaa', shipping_code: 'S01', ship_method: 'ゆうパケット', ship_cost: 300 }],
-  'warehouse:POST /api/genka': ['POST', '/api/genka', { sku: 'ne-aaa', genka: 120 }],
-  'warehouse:POST /api/csv/shipping': ['POST', '/api/csv/shipping', undefined, '商品コード,送料コード\nne-aaa,S01\n'],
-  'warehouse:POST /api/csv/genka': ['POST', '/api/csv/genka', undefined, 'ne-aaa,150\n'],
-  'warehouse:POST /api/csv/m-sku-master': ['POST', '/api/csv/m-sku-master', undefined, 'sku,asin,商品名,NE商品コード,数量\nsku-csv,B000,CSVの品,ne-aaa,1\n'],
-  'warehouse:DELETE /api/shipping/:sku': ['DELETE', '/api/shipping/ne-aaa'],
-  'warehouse:DELETE /api/genka/:sku': ['DELETE', '/api/genka/ne-aaa'],
-  'warehouse:DELETE /api/sales_class/:sku': ['DELETE', '/api/sales_class/ne-aaa'],
-  'warehouse:DELETE /api/tax_rate/:sku': ['DELETE', '/api/tax_rate/ne-aaa'],
-  'warehouse:POST /api/sales_class': ['POST', '/api/sales_class', { sku: 'ne-aaa', sales_class: 1 }],
-  'warehouse:POST /api/csv/sales_class': ['POST', '/api/csv/sales_class', undefined, 'ne-aaa,2\n'],
-  'warehouse:POST /api/reorder_setting': ['POST', '/api/reorder_setting', { sku: 'ne-aaa', 推奨保有月数: 3 }],
-  'warehouse:DELETE /api/reorder_setting/:sku': ['DELETE', '/api/reorder_setting/ne-aaa'],
-  'warehouse:POST /api/csv/reorder_setting': ['POST', '/api/csv/reorder_setting', undefined, 'ne-aaa,2\n'],
-  'warehouse:POST /api/tax_rate': ['POST', '/api/tax_rate', { sku: 'ne-aaa', tax_rate: '0.1' }],
-  'warehouse:POST /api/csv/tax_rate': ['POST', '/api/csv/tax_rate', undefined, 'ne-aaa,0.08\n'],
-  'warehouse:POST /api/m-sku-master': ['POST', '/api/m-sku-master', { seller_sku: 'sku-x', 商品名: 'X', components: [{ ne_code: 'ne-aaa', 数量: 1 }] }],
-  'warehouse:PUT /api/m-sku-master/:sku': ['PUT', '/api/m-sku-master/sku-x', { 商品名: 'X2', components: [{ ne_code: 'ne-aaa', 数量: 2 }] }],
-  'warehouse:DELETE /api/m-sku-master/:sku': ['DELETE', '/api/m-sku-master/sku-x'],
+  'warehouse:POST:/api/shipping': ['POST', '/api/shipping', { sku: 'ne-aaa', shipping_code: 'S01', ship_method: 'ゆうパケット', ship_cost: 300 }],
+  'warehouse:POST:/api/genka': ['POST', '/api/genka', { sku: 'ne-aaa', genka: 120 }],
+  'warehouse:POST:/api/csv/shipping': ['POST', '/api/csv/shipping', undefined, '商品コード,送料コード\nne-aaa,S01\n'],
+  'warehouse:POST:/api/csv/genka': ['POST', '/api/csv/genka', undefined, 'ne-aaa,150\n'],
+  'warehouse:POST:/api/csv/m-sku-master': ['POST', '/api/csv/m-sku-master', undefined, 'sku,asin,商品名,NE商品コード,数量\nsku-csv,B000,CSVの品,ne-aaa,1\n'],
+  'warehouse:DELETE:/api/shipping/:sku': ['DELETE', '/api/shipping/ne-aaa'],
+  'warehouse:DELETE:/api/genka/:sku': ['DELETE', '/api/genka/ne-aaa'],
+  'warehouse:DELETE:/api/sales_class/:sku': ['DELETE', '/api/sales_class/ne-aaa'],
+  'warehouse:DELETE:/api/tax_rate/:sku': ['DELETE', '/api/tax_rate/ne-aaa'],
+  'warehouse:POST:/api/sales_class': ['POST', '/api/sales_class', { sku: 'ne-aaa', sales_class: 1 }],
+  'warehouse:POST:/api/csv/sales_class': ['POST', '/api/csv/sales_class', undefined, 'ne-aaa,2\n'],
+  'warehouse:POST:/api/reorder_setting': ['POST', '/api/reorder_setting', { sku: 'ne-aaa', 推奨保有月数: 3 }],
+  'warehouse:DELETE:/api/reorder_setting/:sku': ['DELETE', '/api/reorder_setting/ne-aaa'],
+  'warehouse:POST:/api/csv/reorder_setting': ['POST', '/api/csv/reorder_setting', undefined, 'ne-aaa,2\n'],
+  'warehouse:POST:/api/tax_rate': ['POST', '/api/tax_rate', { sku: 'ne-aaa', tax_rate: '0.1' }],
+  'warehouse:POST:/api/csv/tax_rate': ['POST', '/api/csv/tax_rate', undefined, 'ne-aaa,0.08\n'],
+  'warehouse:POST:/api/m-sku-master': ['POST', '/api/m-sku-master', { seller_sku: 'sku-x', 商品名: 'X', components: [{ ne_code: 'ne-aaa', 数量: 1 }] }],
+  'warehouse:PUT:/api/m-sku-master/:sku': ['PUT', '/api/m-sku-master/sku-x', { 商品名: 'X2', components: [{ ne_code: 'ne-aaa', 数量: 2 }] }],
+  'warehouse:DELETE:/api/m-sku-master/:sku': ['DELETE', '/api/m-sku-master/sku-x'],
 };
 const WH_TABLES = ['product_shipping', 'exception_genka', 'product_sales_class', 'product_tax_rate', 'm_reorder_setting', 'm_sku_master', 'm_sku_components', 'm_products', 'audit_log'];
 const whSnap = () => JSON.stringify(WH_TABLES.map((tb) => whdb.prepare(`SELECT * FROM ${tb} ORDER BY rowid`).all()));
@@ -441,9 +550,9 @@ await t('🚨 R1 H3: CSV を受け取っている間に frozen になった = �
 });
 await t('miniPC /register: legacy_open = 今までどおり書ける (登録 → CSV → 削除 → SKU マスタ)', async () => {
   setPhase('legacy_open');
-  for (const id of ['warehouse:POST /api/shipping', 'warehouse:POST /api/genka', 'warehouse:POST /api/sales_class', 'warehouse:POST /api/tax_rate', 'warehouse:POST /api/reorder_setting',
-    'warehouse:POST /api/csv/genka', 'warehouse:POST /api/csv/shipping', 'warehouse:POST /api/csv/sales_class', 'warehouse:POST /api/csv/tax_rate', 'warehouse:POST /api/csv/reorder_setting',
-    'warehouse:POST /api/m-sku-master', 'warehouse:PUT /api/m-sku-master/:sku', 'warehouse:POST /api/csv/m-sku-master']) {
+  for (const id of ['warehouse:POST:/api/shipping', 'warehouse:POST:/api/genka', 'warehouse:POST:/api/sales_class', 'warehouse:POST:/api/tax_rate', 'warehouse:POST:/api/reorder_setting',
+    'warehouse:POST:/api/csv/genka', 'warehouse:POST:/api/csv/shipping', 'warehouse:POST:/api/csv/sales_class', 'warehouse:POST:/api/csv/tax_rate', 'warehouse:POST:/api/csv/reorder_setting',
+    'warehouse:POST:/api/m-sku-master', 'warehouse:PUT:/api/m-sku-master/:sku', 'warehouse:POST:/api/csv/m-sku-master']) {
     const r = await whReq(id);
     assert.equal(r.status < 300, true, `${id}: ${r.status} ${r.text.slice(0, 200)}`);
   }
@@ -454,8 +563,8 @@ await t('miniPC /register: legacy_open = 今までどおり書ける (登録 →
   assert.equal(whdb.prepare("SELECT 推奨保有月数 AS m FROM m_reorder_setting WHERE sku = 'ne-aaa'").get().m, 2);
   assert.equal(whdb.prepare("SELECT 商品名 FROM m_sku_master WHERE seller_sku = 'sku-x'").get().商品名, 'X2');
   assert.ok(whdb.prepare("SELECT 1 FROM m_sku_master WHERE seller_sku = 'sku-csv'").get());
-  for (const id of ['warehouse:DELETE /api/shipping/:sku', 'warehouse:DELETE /api/genka/:sku', 'warehouse:DELETE /api/sales_class/:sku', 'warehouse:DELETE /api/tax_rate/:sku',
-    'warehouse:DELETE /api/reorder_setting/:sku', 'warehouse:DELETE /api/m-sku-master/:sku']) {
+  for (const id of ['warehouse:DELETE:/api/shipping/:sku', 'warehouse:DELETE:/api/genka/:sku', 'warehouse:DELETE:/api/sales_class/:sku', 'warehouse:DELETE:/api/tax_rate/:sku',
+    'warehouse:DELETE:/api/reorder_setting/:sku', 'warehouse:DELETE:/api/m-sku-master/:sku']) {
     const r = await whReq(id);
     assert.equal(r.status, 200, `${id}: ${r.status} ${r.text.slice(0, 200)}`);
   }
@@ -484,9 +593,11 @@ await t('読み戻し GET /apps/warehouse/api/master-legacy-gate = 段階・書�
   assert.equal(r.status, 200);
   const s = r.json;
   assert.deepEqual([s.phase, s.writable, s.host], ['frozen', false, 'minipc']);
-  assert.equal(s.manifest_hash, G.manifestHash()); assert.match(s.owner_hash, /^[0-9a-f]{64}$/); assert.match(s.build_id, /^[0-9a-f]{40}$/);
+  // manifest_hash = 最後に DB が受け取った一覧のハッシュ (DB が計算・まだ書いていなければ null)。一覧の数・持ち主表・build・名札を見せる
+  assert.ok(s.manifest_hash === null || /^[0-9a-f]{64}$/.test(s.manifest_hash)); assert.equal(s.manifest_entries, G.legacyManifest().entries.length);
+  assert.match(s.owner_hash, /^[0-9a-f]{64}$/); assert.match(s.build_id, /^[0-9a-f]{40}$/); assert.match(s.instance_id, /^[A-Za-z0-9_.:-]{1,100}$/);
   assert.equal(s.inflight.count, 0); assert.ok('oldest_started_at' in s.inflight);
-  assert.ok(s.stats.reads_ok > 0 && 'refused_410' in s.stats && 'last_latency_ms' in s.stats);
+  assert.ok(s.stats.reads_ok > 0 && 'refused_410' in s.stats && 'last_latency_ms' in s.stats && 'client_gone' in s.stats && 'screen_timeouts' in s.stats);
   assert.ok(s.ack && s.ack.state);
 });
 
@@ -604,6 +715,7 @@ await t('product-hub (⑤-2a M5): 古い新商品の作り方 (POST /api/drafts�
       assert.equal((await call('POST', '/apps/product-hub/api/drafts', { ne_code: 'new-after-frozen', name: '閉じた後の新商品' })).status, phase === 'unreadable' ? 503 : 410);
       assert.equal((await call('POST', '/apps/product-hub/api/register-codes', { codes: 'new-after-frozen' })).status, phase === 'unreadable' ? 503 : 410);
       assert.equal((await call('POST', '/apps/product-hub/api/intake/run', {})).status, phase === 'unreadable' ? 503 : 410);
+      assert.equal((await call('POST', '/apps/product-hub/api/notion-image-import', { status: 'x' })).status, phase === 'unreadable' ? 503 : 410);
     });
     assert.equal(nDrafts(), n0);
   }
@@ -658,13 +770,68 @@ await t('product-hub (R1 H5): 楽天の出品のプレビューは、閉じた�
   __setCdbTaxReader(cdbRates({ 'ph-rep-a': 0.08, 'ph-rep-b': 0.08 }));
   r = await quiet(() => call('GET', `/apps/product-hub/api/drafts/${repDraftId}/rakuten/preview`));
   assert.ok(!taxBlocked(r), JSON.stringify(r.json));
+  // 🚨 中間レビュー High-1: 段階を読めない = 切替前かもしれない = Company DB の税率に黙って切り替えない・古い値でも送らない = 止める
   setPhase('unreadable');
-  __setCdbTaxReader(async () => ({ ok: false, reason: 'Company DB を読めない (試験)' }));
+  let asked = false;
+  __setCdbTaxReader(async (codes) => { asked = true; return cdbRates({ 'ph-rep-a': 0.08, 'ph-rep-b': 0.08 })(codes); });
   r = await quiet(() => call('GET', `/apps/product-hub/api/drafts/${repDraftId}/rakuten/preview`));
-  assert.ok(taxBlocked(r), '段階が読めない = Company DB の税率だけ = 読めなければ止める');
+  assert.ok((r.json?.reasons || []).some((x) => x.includes('切替の段階を読めない')), JSON.stringify(r.json));
+  assert.equal(asked, false, '段階が読めないときに Company DB の税率へ切り替えない');
   setPhase('legacy_open');
   r = await quiet(() => call('GET', `/apps/product-hub/api/drafts/${repDraftId}/rakuten/preview`));
   assert.ok(!taxBlocked(r) && !(r.json?.reasons || []).some((x) => x.includes('税率の決め方')), JSON.stringify(r.json));
+  __setCdbTaxReader(null);
+});
+await t('product-hub (R1 H5): 楽天への本当の登録 (registerItem) も、閉じた後に税率を決められない = RMS に送らずに止める', async () => {
+  const listing = await import('../apps/product-hub/services/rakuten-listing.js');
+  setPhase('frozen');
+  __setCdbTaxReader(async () => ({ ok: false, reason: 'Company DB を読めない (試験)' }));
+  const r = await quiet(() => listing.registerItem(repDraftId, { actor: 'test' }));
+  assert.equal(r.ok, false); assert.ok((r.reasons || []).some((x) => x.includes('税率を Company DB から決められない')), JSON.stringify(r));
+  setPhase('unreadable');
+  const r2 = await quiet(() => listing.registerItem(repDraftId, { actor: 'test' }));
+  assert.equal(r2.ok, false); assert.ok((r2.reasons || []).some((x) => x.includes('切替の段階を読めない')), JSON.stringify(r2));
+  __setCdbTaxReader(null);
+});
+await t('中間レビュー Medium-3: Company DB が止まっていても (段階を読めない)、税率を変えない保存 (名前・売価・メモ・Yahoo! の値) は通る', async () => {
+  setPhase('unreadable');
+  let calls = 0;
+  G.__setLegacyPhaseReader(async () => { calls++; return { readable: false, phase: null, error: '止まっている (試験)' }; });
+  const r = await quiet(() => call('POST', `/apps/product-hub/api/drafts/${draftId}`, { name: '税率の試験 改', price: 1980, memo: 'CDB 停止中' }));
+  assert.equal(r.status, 200, r.text.slice(0, 200));
+  assert.equal(phdb.prepare('SELECT name FROM product_drafts WHERE id = ?').get(draftId).name, '税率の試験 改');
+  assert.equal((await quiet(() => call('POST', `/apps/product-hub/api/drafts/${draftId}/yahoo`, { yahoo_price: 2000 }))).status, 200);
+  assert.equal(calls, 0, '税率を送らない保存は段階を読まない');
+  // 画面は税率を変えたときだけ送る (欄の元の値 = defaultValue と比べる)
+  const src = fs.readFileSync(path.join(ROOT, 'apps/product-hub/views/detail.ejs'), 'utf8');
+  assert.equal((src.match(/el\.value !== el\.defaultValue \? el\.value : undefined/g) || []).length, 2, '基本情報の保存と Yahoo! の保存の 2 か所');
+  assert.ok(!/tax_rate: document\.getElementById\('y-tax'\)(\?)?\.value/.test(src), '欄の値をそのまま送る書き方が残っていない');
+});
+await t('中間レビュー Medium-4: 税率が決まっていない (data-tax が空) = 画面の利益の試算を出さない (Number(\'\') = 0 で利益を多く見せない)', async () => {
+  __setCdbTaxReader(cdbRates({ 'ph-rep-a': 0.08, 'ph-rep-b': 0.1 }));
+  setPhase('frozen'); G.__resetLegacyGate();
+  const html = (await call('GET', `/apps/product-hub/detail/${repDraftId}`)).text;
+  const at = html.indexOf('(function initProfitSim() {');
+  assert.ok(at > 0);
+  let depth = 0, end = -1;
+  for (let i = html.indexOf('{', at); i < html.length; i++) { if (html[i] === '{') depth++; else if (html[i] === '}') { depth--; if (depth === 0) { end = i; break; } } }
+  const code = html.slice(at, end + 1) + ')();';
+  const els = {
+    'profit-sim': { dataset: { cost: '500', ship: '300', tax: '', take: '0.9' } },
+    'profit-sim-body': { textContent: '' },
+    'f-price': { value: '3000', addEventListener: () => {} },
+    'profit-sim-figs': { hidden: false, classList: { toggle: () => {} } },
+    'profit-sim-amount': { textContent: '', classList: { toggle: () => {} } },
+    'profit-sim-margin': { textContent: '', classList: { toggle: () => {} } },
+  };
+  const vm = await import('node:vm');
+  vm.runInNewContext(code, { document: { getElementById: (id) => els[id] || null, createElement: () => ({}) }, console });
+  assert.match(els['profit-sim-body'].textContent, /税率が決まっていません/);
+  assert.equal(els['profit-sim-figs'].hidden, true, '利益額を出さない');
+  els['profit-sim'].dataset.tax = '8'; els['profit-sim-body'].textContent = ''; els['profit-sim-figs'].hidden = true;
+  vm.runInNewContext(code, { document: { getElementById: (id) => els[id] || null, createElement: () => ({}) }, console });
+  assert.equal(els['profit-sim-figs'].hidden, false, '税率が決まれば出す');
+  assert.match(els['profit-sim-amount'].textContent, /円/);
   __setCdbTaxReader(null);
 });
 await t('product-hub の詳細画面: 閉じたら手入力の欄 (id="y-tax") を出さず Company DB の税率 (代表コードは構成の SKU) を見せ、利益の試算もその税率・legacy_open は今までどおり', async () => {

@@ -86,6 +86,7 @@ function writesDirectly(b) {
   }
   for (const f of MASTER_WRITE_TARGETS.files) if (b.text.includes(f.match) && /writeFileSync|writeFile\(/.test(b.text)) return `ファイル (${f.id})`;
   for (const d of MASTER_WRITE_TARGETS.dynamic) if (b.file === d.file && d.match.some((s) => b.text.includes(s))) return `表の名前を変数で (${d.id})`;
+  for (const n of MASTER_WRITE_TARGETS.new_products) if (n.match.test(b.text)) return `新商品を作る (${n.id})`;
   return null;
 }
 /** ファイルが読み込んだ名前 → { from: 読み込んだファイル, name: 元の名前 } (相対の import だけ) */
@@ -234,9 +235,10 @@ console.log('── 5. 門が実際に掛かっている ──');
   }
   for (const e of LEGACY_ENTRIES.filter((x) => x.kind === 'cli')) {
     const src = text.get(e.file) || '';
-    const n = e.mode === '*' ? (src.match(new RegExp(`legacyCliGate\\('${e.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'\\)`, 'g')) || []).length
-      : (src.match(/legacyCliGate\(legacyEntry\.id\)/g) || []).length;
-    ok(n >= 2, `${e.id}: 門を 2 回 (mode が分かったらすぐ + 書く直前) 通す (${n} 回)`);
+    const q = e.mode === '*' ? `'${e.id}'` : 'legacyEntry.id';
+    const first = src.includes(`legacyCliGate(${q})`);
+    const locked = src.includes(`runWithLegacyCliLock(${q},`);
+    ok(first && locked, `${e.id}: mode が分かったらすぐ門を通し (legacyCliGate)、書くところは段階の鍵を持って読み直す (runWithLegacyCliLock)`);
   }
   for (const e of LEGACY_ENTRIES.filter((x) => x.kind === 'job')) {
     const src = text.get(e.file) || '';
