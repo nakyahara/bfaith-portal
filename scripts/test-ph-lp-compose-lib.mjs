@@ -242,6 +242,26 @@ eq(lp.submitResult(db, gN.generation_id, {
   receipt: { images: [{ file_id: 'FILEID000001', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
 }).status, 'done', '渡した画像なら通る');
 
+console.log('⑯ R9 の修正');
+// #1 同じキーの再送は、材料の検証より先に既存 job を返す
+//    (受付後に商品情報が消えても、通信リトライが not_ready にならない)
+const dQ = mkDraft('LP-Q', 'ハッカ油スプレー 8L');
+const rQ = lp.requestJob(db, args(dQ, s2.spec, 'key-0001', { now: min(140) }));
+ok(rQ.ok && rQ.created, '受け付ける');
+const rQ2 = lp.requestJob(db, args(dQ, s2.spec, 'key-0001', { now: min(141), productInfo: '' }));
+ok(rQ2.ok && !rQ2.created && rQ2.job.id === rQ.job.id,
+  '🚨 受付後に商品情報が消えても、同じキーの再送は既存の依頼を返す (R9 #1)');
+// #2 packet の画像は重複させない (証跡と 1 対 1 で対応させるため)
+const dR = mkDraft('LP-R', 'ハッカ油スプレー 9L');
+const rR = lp.requestJob(db, args(dR, s2.spec, 'key-0001', {
+  now: min(150),
+  images: [{ file_id: 'FILEID000001' }, { file_id: 'FILEID000001' }, { file_id: 'FILEID000002' }],
+}));
+eq(JSON.parse(rR.job.packet_json).images.length, 2, '🚨 packet の画像は重複を取り除く (R9 #2)');
+// この節で作った依頼をキューに残さない (後の節の claim が先に拾ってしまう)
+db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled', completed_at = ? WHERE id IN (?, ?)`)
+  .run(new Date(min(151)).toISOString(), rQ.job.id, rR.job.id);
+
 console.log('⑮ R8 の修正');
 // #1 packet と job 行の突き合わせ (それぞれの hash が正しくても、job の spec_id だけ書き換えれば別の仕様書を渡せた)
 const dO = mkDraft('LP-O', 'ハッカ油スプレー 6L');

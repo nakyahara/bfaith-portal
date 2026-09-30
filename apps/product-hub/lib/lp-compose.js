@@ -191,11 +191,21 @@ export function specSummary(db, kind = 'product_analysis') {
  * composeProductInfo / composeColorVariations が正本で、ここで組み直さない (二重に持たない)。
  */
 export function buildPacket({ draft, productInfo, colorVariations, images = [], spec }) {
-  const imgs = (Array.isArray(images) ? images : []).slice(0, MAX_IMAGES).map((im) => ({
-    file_id: trim(im?.file_id || im?.drive_file_id, 200),
-    // Drive の更新日時。何を見て作ったかを後から辿るために packet に残す (設計 §4.2)
-    modified_time: trim(im?.modified_time || im?.drive_modified_time, 40) || null,
-  })).filter((im) => im.file_id);
+  // file_id は重複させない (コード R9)。証跡 (receipt.images) 側は重複を禁じているので、
+  // packet に同じ画像が 2 回あると「渡した材料」と「見た証跡」が 1 対 1 で対応しなくなる
+  const seen = new Set();
+  const imgs = [];
+  for (const im of Array.isArray(images) ? images : []) {
+    const fileId = trim(im?.file_id || im?.drive_file_id, 200);
+    if (!fileId || seen.has(fileId)) continue;
+    seen.add(fileId);
+    imgs.push({
+      file_id: fileId,
+      // Drive の更新日時。何を見て作ったかを後から辿るために packet に残す (設計 §4.2)
+      modified_time: trim(im?.modified_time || im?.drive_modified_time, 40) || null,
+    });
+    if (imgs.length >= MAX_IMAGES) break;
+  }
   const packet = {
     packet_version: PACKET_VERSION,
     draft_id: Number(draft.id),
@@ -229,13 +239,19 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
   // 切り詰めない — 81 文字目以降だけ違うキーを同一視すると、別の依頼を既存 job として返す (コード R5)
   const key = exact(idempotencyKey, IDEMPOTENCY_KEY_RE);
   if (!key) return { code: 'bad_request', error: 'idempotency_key の形が不正です (英数記号 8〜80 文字)' };
-  const blocked = requestBlockReason({ draft, productInfo, spec });
-  if (blocked) return { code: 'not_ready', error: blocked };
   // 🚨 ID は入口で正規化して、packet・検索・INSERT・ログで同じ値だけを使う。
   //    SQLite の非 STRICT 表は文字列も受けるので、検証しないと packet と行で ID が食い違う (コード R1 #4)
   const draftId = posInt(draft?.id);
+  if (!draftId) return { code: 'bad_request', error: '商品の ID が不正です' };
+  // 🚨 **同じキーの再送は、材料の検証より先に**既存の job を返す (コード R9)。
+  //    受付のあとに商品情報や仕様書が変わっていると、通信リトライが not_ready / bad_request になり、
+  //    画面は「作れなかった」と見えるのに裏では job が動いている、という食い違いが起きる
+  const prior = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draftId, key);
+  if (prior) return { ok: true, job: prior, created: false };
+  const blocked = requestBlockReason({ draft, productInfo, spec });
+  if (blocked) return { code: 'not_ready', error: blocked };
   const specId = posInt(spec?.id);
-  if (!draftId || !specId) return { code: 'bad_request', error: '商品または仕様書の ID が不正です' };
+  if (!specId) return { code: 'bad_request', error: '仕様書の ID が不正です' };
   const a = trim(actor, 120) || 'unknown';
   const nowS = new Date(now).toISOString();
   const deadline = new Date(now + MEASUREMENT_WINDOW_MIN * 60_000).toISOString();
