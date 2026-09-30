@@ -139,8 +139,13 @@ eq(db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(c5.job.j
 console.log('⑩ 仕様書の版が消えた依頼は claim で止める');
 const dE = mkDraft('LP-E', 'ハッカ油スプレー 1L');
 const r5 = lp.requestJob(db, args(dE, s2.spec, 'key-0001', { now: min(40) }));
-db.prepare('UPDATE ph_lp_compose_jobs SET spec_hash = ? WHERE id = ?').run('すり替わった hash', r5.job.id);
-ok(lp.claimJob(db, { runnerRunId: 'run-8', now: min(41) }).job === null, 'hash が合わなければ claim しない');
+// packet と job 行を**揃えて**別の hash にする (packet 側の自己検査は通るが、仕様書の行と合わない状態)。
+// 片方だけ書き換えると R8 #1 の突き合わせが先に落として packet_tampered になる
+const bogus = 'b'.repeat(64);
+const p5 = { ...JSON.parse(r5.job.packet_json), spec_hash: bogus };
+db.prepare('UPDATE ph_lp_compose_jobs SET spec_hash = ?, packet_json = ?, packet_hash = ? WHERE id = ?')
+  .run(bogus, JSON.stringify(p5), lp.sha256(lp.canonicalJson(p5)), r5.job.id);
+ok(lp.claimJob(db, { runnerRunId: 'run-8', now: min(41) }).job === null, '仕様書の行と hash が合わなければ claim しない');
 eq(db.prepare('SELECT error_code FROM ph_lp_compose_jobs WHERE id = ?').get(r5.job.id).error_code, 'spec_changed', '理由が残る');
 
 console.log('⑪ 機能フラグ (fail-closed)');
@@ -236,6 +241,27 @@ eq(lp.submitResult(db, gN.generation_id, {
   packetHash: cN.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1,
   receipt: { images: [{ file_id: 'FILEID000001', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
 }).status, 'done', '渡した画像なら通る');
+
+console.log('⑮ R8 の修正');
+// #1 packet と job 行の突き合わせ (それぞれの hash が正しくても、job の spec_id だけ書き換えれば別の仕様書を渡せた)
+const dO = mkDraft('LP-O', 'ハッカ油スプレー 6L');
+const rO = lp.requestJob(db, args(dO, sTabs.spec, 'key-0001', { now: min(120) }));
+db.prepare('UPDATE ph_lp_compose_jobs SET spec_id = ?, spec_hash = ? WHERE id = ?').run(s2.spec.id, s2.spec.hash, rO.job.id);
+ok(lp.claimJob(db, { runnerRunId: 'run-30', now: min(121) }).job === null, '🚨 job の spec_id だけすり替えても claim しない (R8 #1)');
+eq(db.prepare('SELECT error_code FROM ph_lp_compose_jobs WHERE id = ?').get(rO.job.id).error_code, 'packet_tampered', '理由が残る');
+
+// #2 同じ画像を並べて枚数を水増しできない
+const dP = mkDraft('LP-P', 'ハッカ油スプレー 7L');
+lp.requestJob(db, args(dP, s2.spec, 'key-0001', { now: min(130) }));
+const cP = lp.claimJob(db, { runnerRunId: 'run-31', now: min(130) });
+const gP = lp.reserveGeneration(db, cP.job.job_id, { leaseToken: cP.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(130) });
+eq(lp.submitResult(db, gP.generation_id, {
+  packetHash: cP.job.packet_hash, verdict: 'accepted', output: OUT,
+  receipt: { images: [
+    { file_id: 'FILEID000001', sha256: 'f'.repeat(64), bytes: 1 },
+    { file_id: 'FILEID000001', sha256: 'f'.repeat(64), bytes: 1 },
+  ] }, now: min(131),
+}).code, 'bad_request', '🚨 同じ画像を 2 回並べられない (R8 #2)');
 const subBig = lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1,
   receipt: { images: [{ file_id: 'FILEID000001', sha256: 'b'.repeat(64), bytes: 999, extra: 'x' }] }, now: min(91),

@@ -362,8 +362,17 @@ export function claimJob(db, { runnerRunId, now = Date.now() } = {}) {
       //    保存済みの hash を信じず、**中身から計算し直して**照合する (コード R7 #1)。
       //    追記専用トリガーや app の経路だけでは、DB を直接いじられたときに気づけない。
       const packetOk = (() => {
-        try { return sha256(canonicalJson(JSON.parse(job.packet_json))) === job.packet_hash; }
-        catch { return false; }
+        try {
+          const p = JSON.parse(job.packet_json);
+          if (sha256(canonicalJson(p)) !== job.packet_hash) return false;
+          // 🚨 packet と job 行の**突き合わせ**も要る (コード R8 #1)。
+          //    それぞれの hash が個別に正しくても、job の spec_id / spec_hash だけ書き換えれば
+          //    「受付時とは別の仕様書」を渡せてしまう
+          return p.draft_id === job.draft_id
+            && p.packet_version === job.packet_version
+            && p.spec_id === job.spec_id
+            && p.spec_hash === job.spec_hash;
+        } catch { return false; }
       })();
       if (!packetOk) {
         db.prepare(`UPDATE ph_lp_compose_jobs
@@ -409,7 +418,10 @@ export function claimJob(db, { runnerRunId, now = Date.now() } = {}) {
         },
       };
     }
-    return { ok: true, job: null };
+    // 🚨 ここに来た = 50 件続けて掴めなかった。「仕事なし」と同じ顔で返すと、
+    //    壊れた job が並んでいるときに正常な依頼が永遠に拾われない (コード R8 #3)。
+    //    実行役はすぐ掛け直し、監視には異常として見える形にする
+    return { ok: true, job: null, exhausted: true, error: 'claim を 50 回試しても掴めなかった (壊れた依頼が並んでいる可能性)' };
   })();
 }
 
@@ -509,6 +521,10 @@ export function submitResult(db, generationId, {
       const bytes = posInt(im?.bytes);
       if (!hex || !bytes) {
         return { code: 'bad_request', error: 'receipt.images は sha256 (16進小文字64桁) と bytes (正の整数) が要ります' };
+      }
+      // 同じ画像を並べて枚数を水増しさせない (コード R8 #2)
+      if (imgs.some((x) => x.file_id === fileId)) {
+        return { code: 'bad_request', error: `receipt.images に同じ画像が 2 回あります (${fileId})` };
       }
       imgs.push({ file_id: fileId, sha256: hex, bytes });
     }
