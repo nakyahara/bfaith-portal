@@ -130,5 +130,25 @@ ok(!/easy_ship_jpy/.test(dq + vr) && (dq.match(/source_layer_summary <> 'easy_sh
 const dqCount = db.prepare(`SELECT COUNT(DISTINCT seller_sku) c FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ? AND source_layer_summary <> 'easy_ship_alloc'`).get(YM).c;
 ok(dqCount === 14, `照合の SKU の数 = 売上のある SKU だけ (A・B・C・X・Y・Z・P・Q・R・S・T・U・V・W = 14) (${dqCount})`);
 
+// ⑫ 本体売上が負の SKU (Company DB の #1559 Codex R3・同じ規則): 重み = max(本体, 0)・正の重みの合計が 0 以下なら等分・どの注文も配った合計 = 元の額
+//   前の規則は −18 / −18 / 1,036 に 100 → −1 / −1 / 103 (合計 101 = 保存則が壊れる)
+line({ day: 10, o: 'O10', sku: 'SKU-NA', pt: 'Principal', pa: -18 });
+line({ day: 10, o: 'O10', sku: 'SKU-NB', pt: 'Principal', pa: -18 });
+line({ day: 10, o: 'O10', sku: 'SKU-NC', pt: 'Principal', pa: 1036 });
+line({ day: 11, o: 'O10', tx: 'Amazon Easy Ship Charges', fee: -100, feeType: 'Amazon Easy Ship Charges' });
+line({ day: 10, o: 'O11', sku: 'SKU-MA', pt: 'Principal', pa: -10 });   // 全部が負 = 等分
+line({ day: 10, o: 'O11', sku: 'SKU-MB', pt: 'Principal', pa: -20 });
+line({ day: 11, o: 'O11', tx: 'Amazon Easy Ship Charges', fee: -11, feeType: 'Amazon Easy Ship Charges' });
+build();
+const neg = ['sku-na', 'sku-nb', 'sku-nc'].map((s) => fact(s, 11)?.e ?? 0), allNeg = ['sku-ma', 'sku-mb'].map((s) => fact(s, 11)?.e);
+ok(JSON.stringify(neg) === JSON.stringify([0, 0, 100]), `🚨 本体が負の SKU には配らない: −18 / −18 / 1,036 に 100 → 0 / 0 / 100 (前は −1 / −1 / 103 = 101) (${neg.join(' / ')})`);
+ok(JSON.stringify(allNeg) === JSON.stringify([6, 5]), `全部が負 (正の重みの合計 0) = 売上の行のある SKU で等分: 11 → 6 / 5 (端数は SKU の順) (${allNeg.join(' / ')})`);
+run(['apps/warehouse/rebuild-amazon-account-fees.js', '--data-dir', tmpDir, '--months', '1']);
+const day11 = db.prepare(`SELECT SUM(easy_ship_jpy) s FROM f_amazon_finance_sku_daily_v1 WHERE date_jst = ?`).get(`${YM}-11`).s;
+ok(day11 === 111, `🚨 保存則: 11 日に配った合計 = 料金の合計 100 + 11 = 111 (${day11})`);
+const allocAll = db.prepare(`SELECT SUM(easy_ship_jpy) s FROM f_amazon_finance_sku_daily_v1`).get().s;
+const acctAll = db.prepare(`SELECT amount_jpy a FROM f_amazon_account_fees_monthly_v1 WHERE month_start_jst = ? AND fee_type = 'easy_ship'`).get(`${YM}-01`).a;
+ok(allocAll === -acctAll, `🚨 保存則: 月に配った額の合計 = 月の手数料の Easy Ship (配れない額なし = O4 は売上の行が届いた後) (${allocAll} / ${-acctAll})`);
+
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== Easy Ship の割り振りテスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

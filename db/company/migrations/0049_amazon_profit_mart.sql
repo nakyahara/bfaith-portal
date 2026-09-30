@@ -50,7 +50,7 @@
 --       cost_input_hash  = [{"cost_jpy":n,"cost_status":"…","row_id":"…","sku_id":"…","source":"sku_costs"|"observed"}] (sku_id → source の順。cost_missing・unresolved・missing のときは null)
 --     鍵は固定の ASCII の名前だけ = 文字列の順とバイトの順が同じ。JS の canonicalSha256 と一致することを試験で固定 (scripts/test-company-db-amazon-profit.mjs)
 --   ・Easy Ship (D-59) = 注文 × 計上日で料金と返金を正味 (−Σ account_fee_amount_jpy = 費用を正) にしてから、同じ注文の SKU の本体売上の割合で 1 円単位に割り振る
---     (合計が 0 以下なら売上の行のある SKU で等分・端数は小数部の大きい順 → 同じなら正規化 SKU のバイトの順・正味が負なら絶対値で配って符号を戻す・正味 0 は配らない)。
+--     (重み = max(本体売上, 0) = 負の SKU には配らない・正の重みの合計が 0 以下なら売上の行のある SKU で等分・配った合計 = 元の額・端数は小数部の大きい順 → 同じなら正規化 SKU のバイトの順・正味が負なら絶対値で配って符号を戻す・正味 0 は配らない)。
 --     🚨 **期間に依らない** (R15 M1): 期間の中に料金がある注文の本体売上は **期間の外の日も含む全部の日** (日ごとに policy が採った source の行だけ) から取る。
 --     「売上の行」= その注文の SKU の行で units_ordered・sales_principal・sales_shipping・sales_giftwrap のどれかが 0 でない (= 決済の Order の行から来た値)。
 --     行の easy_ship_alloc_jpy は内訳 (寄与から引かない)・日の合計は月の手数料 (easy_ship) で引く = 二重に引かない。売上の行が無くて配らない額は日の合計の easy_ship_unallocated_jpy と件数
@@ -214,7 +214,7 @@ $$;
 
 -- ─── Easy Ship の割り振り (D-59・R15 M1。SQLite の build (D7b-0 = #1548) と同じ規則) ───
 --   料金 = 期間の中の easy_ship の行を 注文 × 計上日 で正味 (Σ account_fee_amount_jpy。負 = 費用)。正味 0 は配らない
---   割り振り = 同じ注文の SKU (正規化) の本体売上 (全部の日) の割合 / 合計が 0 以下なら等分。1 円単位・端数は小数部の大きい順 → 正規化 SKU のバイトの順
+--   割り振り = 同じ注文の SKU (正規化) の本体売上 (全部の日) の重み max(本体, 0) の割合 / 正の重みの合計が 0 以下なら等分。1 円単位・端数は小数部の大きい順 → 正規化 SKU のバイトの順
 --   easy_ship_cost_jpy = 費用を正 (正味が負 = 料金 → 正の額・正味が正 = 返金が多い → 負の額)。allocated = false = 売上の行が無くて配らない額 (seller_sku_norm は null)
 --   🚨 重い (期間の中に料金がある注文の全部の日の SKU の行を読む) = 1 回の呼び出しで 1 回だけ (公開の関数が計算して本体に配列で渡す・#1559 Codex R1 Medium 1)
 create or replace function mart._amazon_easy_ship_alloc(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date)
@@ -243,15 +243,19 @@ language sql stable as $$
      group by f.mall_order_no, core.norm_code(f.seller_sku)
     having bool_or(f.units_ordered <> 0 or f.sales_principal_jpy <> 0 or f.sales_shipping_jpy <> 0 or f.sales_giftwrap_jpy <> 0)   -- 売上の行 (Order の行から来た値)
   ),
+  -- 重み = max(SKU の本体売上, 0) (#1559 Codex R3: 負の SKU に負の端数が乗ると trunc と端数の配り方で合計が元の額とずれる。例 −18 / −18 / 1,036 に 100 → −1 / −1 / 103 = 101)。
+  --   正の重みの合計 > 0 = 正の SKU だけで割合 (重み 0 の SKU は配る相手にしない) / 正の重みの合計 <= 0 = 売上の行のある SKU で等分。
+  --   どちらも exact >= 0 = trunc は切り捨て・端数 (remainder) は 0 以上 SKU の数未満 = 配った合計 = 元の額 (正味)。SQLite の build (sql/amazon/build_f_amazon_finance_sku_daily_v1.sql) と同じ規則
   wt as (
     select w.mall_order_no, w.sku_norm, w.principal,
-           sum(w.principal) over (partition by w.mall_order_no) as total, count(*) over (partition by w.mall_order_no) as n
+           sum(greatest(w.principal, 0)) over (partition by w.mall_order_no) as ptotal, count(*) over (partition by w.mall_order_no) as n
       from w
   ),
   share as (
     select c.day, c.mall_order_no, c.amt, wt.sku_norm,
-           case when wt.total > 0 then abs(c.amt)::numeric * wt.principal / wt.total else abs(c.amt)::numeric / wt.n end as exact
+           case when wt.ptotal > 0 then abs(c.amt)::numeric * greatest(wt.principal, 0) / wt.ptotal else abs(c.amt)::numeric / wt.n end as exact
       from charge c join wt on wt.mall_order_no = c.mall_order_no
+     where wt.ptotal <= 0 or wt.principal > 0
   ),
   base as (
     select s.day, s.mall_order_no, s.amt, s.sku_norm, trunc(s.exact) as fl,

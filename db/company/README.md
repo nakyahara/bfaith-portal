@@ -1307,7 +1307,8 @@ select valid_from, valid_to, cost_jpy, cost_status, cost_basis from mart.v_sku_c
     どの印も「無い」ことは「変わっていない」の証明ではない。
     `composition_basis` = listing_unresolved → missing → pre_audit_unverifiable → current_after_recorded_change → current_no_recorded_change (前の 2 つだけがゲート)。日 / 月 / 期間は `master_note_counts` (jsonb・鍵は 3 つ)
   - `composition_hash` / `cost_input_hash` = 正規の JSON の SHA-256 (`apps/company-db/canonical-hash.mjs` と同じ規則・ID は 10 進の文字列)
-- **Easy Ship** (D-59) = 注文 × 計上日で正味にしてから同じ注文の SKU の本体売上の割合 (合計 0 以下なら等分) で 1 円単位・端数は小数部の大きい順。**期間に依らない** (本体売上は期間の外の日も含む全部の日)。
+- **Easy Ship** (D-59) = 注文 × 計上日で正味にしてから同じ注文の SKU の本体売上の割合で 1 円単位・端数は小数部の大きい順。
+  重み = **max(本体売上, 0)** (負の SKU には配らない・正の重みの合計が 0 以下なら売上の行のある SKU で等分) = どの場合も配った合計 = 元の額 (#1559 Codex R3・SQLite の build と同じ規則)。**期間に依らない** (本体売上は期間の外の日も含む全部の日)。
   行の `easy_ship_alloc_jpy` は内訳 (寄与から引かない)・日の合計は月の手数料で引く。売上の行が無い注文は `easy_ship_unallocated_jpy` / `_count`
 - **日の合計**: 月の手数料 `account_fee_cost_jpy = −Σ account_fee_amount_jpy` (8 種類の列も)・税抜は種類ごとに ÷ 1.1 (Amazon の決済の手数料は全部税込)・`profit_after_account_fees_* = contribution_after_ad_* − 手数料`。
   分けられない金額は 3 区分 (`unknown_line_mapped_jpy` / `unclassified_mapped_jpy` / `unmapped_jpy`)。**保存則** = `net_jpy = profit_before_cogs_jpy + sales_tax_jpy − account_fee_cost_jpy + unknown_line_mapped_jpy + unclassified_mapped_jpy + unmapped_jpy + not_account_fee_mapped_jpy`。

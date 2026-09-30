@@ -82,7 +82,7 @@ WHERE rn = 1;
 -- 決済の Amazon Easy Ship Charges は SKU の無い行 (注文番号だけ) = 上の silver に入らず、SKU 別の利益に入っていなかった
 -- (アカウント単位の手数料にもカスタム経費にも無く、Amazon 分析の確定利益が月 130〜230 万円多く出ていた)
 -- 割り振り: その月 (料金の日の月) の料金 → 同じ注文番号の売上の行 (transaction_type = Order・SKU あり・どの月でも) の SKU へ
---   複数 SKU の注文は本体売上 (Principal) の割合・本体の合計が 0 以下なら SKU の数で等分・日付は料金の日
+--   複数 SKU の注文は本体売上 (Principal) の割合 (🆕 重み = max(本体, 0) = 負の SKU には配らない)・正の重みの合計が 0 以下なら SKU の数で等分・日付は料金の日
 --   売上の行が無い注文 (まだ届いていない等) は割り振らない
 --   1 円単位で割り振り、端数は小数部の大きい SKU から 1 円ずつ (同じなら SKU の順・料金ごとの合計が必ず元の額と一致)
 --   🆕 2026-09-30 (D7b-0): 料金は **注文 × 計上日で正味 (料金 + 返金) にしてから** 割り振る (前は行ごと。
@@ -149,8 +149,12 @@ w AS (
   FROM od WHERE rn = 1
   GROUP BY amazon_order_id, seller_sku
 ),
+-- 🆕 2026-09-30 (Company DB の #1559 Codex R3): 重み = max(SKU の本体売上, 0)。本体が負の SKU は重み 0 (配らない) =
+--   前は負の SKU に負の端数が乗り、CAST (0 の方へ切り捨て) と端数の配り方で合計が元の額とずれた (例 −18 / −18 / 1,036 に 100 → −1 / −1 / 103 = 101)。
+--   正の重みの合計 > 0 = 正の SKU だけで割合 / 正の重みの合計 <= 0 = 売上の行のある SKU で等分 (今の規則)。どの場合も配った合計 = 元の額 (正味)。
+--   Company DB (db/company/migrations/0049 の mart._amazon_easy_ship_alloc) と同じ規則
 wt AS (
-  SELECT w.*, SUM(principal) OVER (PARTITION BY amazon_order_id) AS total, COUNT(*) OVER (PARTITION BY amazon_order_id) AS n_sku
+  SELECT w.*, SUM(MAX(principal, 0)) OVER (PARTITION BY amazon_order_id) AS ptotal, COUNT(*) OVER (PARTITION BY amazon_order_id) AS n_sku
   FROM w
 ),
 esn AS (
@@ -162,8 +166,9 @@ esn AS (
 ),
 share AS (
   SELECT esn.charge_id, esn.economic_date, esn.amt, wt.seller_sku,
-         ABS(esn.amt) / 1000000.0 * CASE WHEN wt.total > 0 THEN wt.principal * 1.0 / wt.total ELSE 1.0 / wt.n_sku END AS yen_exact
+         ABS(esn.amt) / 1000000.0 * CASE WHEN wt.ptotal > 0 THEN MAX(wt.principal, 0) * 1.0 / wt.ptotal ELSE 1.0 / wt.n_sku END AS yen_exact
   FROM esn JOIN wt ON wt.amazon_order_id = esn.amazon_order_id
+  WHERE wt.ptotal <= 0 OR wt.principal > 0   -- 正の重みがある注文では重み 0 の SKU を配る相手にしない
 ),
 base AS (
   SELECT share.*, CAST(yen_exact AS INTEGER) AS yen_floor,

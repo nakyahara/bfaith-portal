@@ -105,6 +105,12 @@ await apply('O9', [v2('2026-06-13', 'LP', { units_ordered: 1 }), v2('2026-06-13'
 await apply('O8', [v2('2026-06-13', '-', { line_kind: 'easy_ship', other_fee_jpy: -50, account_fee_amount_jpy: -50 })]);   // 売上の行が無い注文 = 配らない
 await apply('O10', [v2('2026-06-12', 'LF', { units_ordered: 1, sales_principal_jpy: 400 }), v2('2026-06-14', '-', { line_kind: 'easy_ship', other_fee_jpy: -80, account_fee_amount_jpy: -80 })]);
 await apply('O13', [v2('2026-06-20', 'LA', { units_ordered: 1, sales_principal_jpy: 1000 }), v2('2026-06-21', '-', { line_kind: 'easy_ship', other_fee_jpy: 30, account_fee_amount_jpy: 30 })]);   // 返金が多い = 正味が正
+// 本体売上が負の SKU を含む注文 (#1559 Codex R3): −18 / −18 / 1,036 に料金 100 → 重み = max(本体, 0) = 0 / 0 / 100 (前の規則は −1 / −1 / 103 = 101)
+await apply('O16', [v2('2026-06-22', 'LP', { units_ordered: 1, sales_principal_jpy: -18 }), v2('2026-06-22', 'LQ', { units_ordered: 1, sales_principal_jpy: -18 }),
+  v2('2026-06-22', 'LR', { units_ordered: 1, sales_principal_jpy: 1036 }), v2('2026-06-22', '-', { line_kind: 'easy_ship', other_fee_jpy: -100, account_fee_amount_jpy: -100 })]);
+// 全部が負 (正の重みの合計 0) = 売上の行のある SKU で等分: 料金 11 → 6 / 5
+await apply('O17', [v2('2026-06-23', 'LP', { units_ordered: 1, sales_principal_jpy: -10 }), v2('2026-06-23', 'LQ', { units_ordered: 1, sales_principal_jpy: -20 }),
+  v2('2026-06-23', '-', { line_kind: 'easy_ship', other_fee_jpy: -11, account_fee_amount_jpy: -11 })]);
 await apply('OK1', [v2('2026-06-14', 'LK', { units_ordered: 1, sales_principal_jpy: 900 })]);
 await apply('OK2', [v2('2026-06-15', 'LK', { units_ordered: 1, sales_principal_jpy: 900 })]);
 await apply('O11', [v2('2026-06-10', 'LB', { units_ordered: 1, sales_principal_jpy: 1000, unmapped_jpy: -3, ...C4(2, 0, 200, 1) })]);   // 分けられない部品 (+100 / −100 = 金額 0 でも 2 つ) と unmapped
@@ -326,6 +332,16 @@ await t('🚨 本体売上の割合 (1,000 : 400 = 71 / 29・端数は小数部�
   assert.equal(es('2026-06-21', LA), -30);
   const f14 = at(rows, '2026-06-14', LF);
   assert.deepEqual([f14.units_ordered, N(f14.contribution_before_ad_incl_jpy), f14.profit_incomplete_reasons], [0, 0, []]);   // 寄与から引かない
+});
+await t('🚨 本体売上が負の SKU (#1559 Codex R3): 重み = max(本体, 0) = −18 / −18 / 1,036 に 100 → 0 / 0 / 100・全部が負は等分 (11 → 6 / 5)・どの注文も配った合計 = 元の額 (保存則)', async () => {
+  const es = (d, key) => N((at(rows, d, key) || {}).easy_ship_alloc_jpy);
+  assert.deepEqual([es('2026-06-22', LP), es('2026-06-22', LQ), es('2026-06-22', LR)], [0, 0, 100]);
+  assert.deepEqual([es('2026-06-23', LP), es('2026-06-23', LQ)], [6, 5]);   // 等分 5.5 / 5.5 → 端数 1 円は同じ小数部 = 正規化 SKU の順 (lp)
+  const t2 = await totalsOf('2026-06-22', '2026-06-23');
+  for (const x of t2) assert.equal(N(x.easy_ship_alloc_jpy) + N(x.easy_ship_unallocated_jpy), N(x.account_fee_easy_ship_cost_jpy), `${x.row_kind} ${x.pf}`);
+  assert.deepEqual([N(dayOf(t2, '2026-06-22').easy_ship_alloc_jpy), N(dayOf(t2, '2026-06-23').easy_ship_alloc_jpy)], [100, 11]);
+  // 1 日ずつの合計も元の額 (日の合計の配った額 = 月の手数料の Easy Ship・配れない額なし)
+  for (const x of (await totalsOf('2026-06-01', '2026-06-30')).filter((y) => y.row_kind === 'day')) assert.equal(N(x.easy_ship_alloc_jpy) + N(x.easy_ship_unallocated_jpy), N(x.account_fee_easy_ship_cost_jpy), x.ed);
 });
 await t('🚨 割り振りは期間に依らない (1 日・1 か月・1 年で同じ)・期間の外の日の売上で割り振る', async () => {
   const pick = (rs) => rs.filter((r) => ['2026-06-13', '2026-06-14', '2026-06-21'].includes(r.d)).map((r) => [r.d, N(r.listing_id), N(r.easy_ship_alloc_jpy)]).sort((a, b) => (a[0] + a[1]).localeCompare(b[0] + b[1]));
