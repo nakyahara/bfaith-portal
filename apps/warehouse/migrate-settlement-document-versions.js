@@ -14,6 +14,7 @@
  *   node apps/warehouse/migrate-settlement-document-versions.js            → 数えるだけ (dry-run・書かない)
  *   node apps/warehouse/migrate-settlement-document-versions.js --commit   → coverage の lease を取って版を付ける (coordinator が動いていれば止まる)
  *   🚨 決済 ID が 2 つ以上ある過去の文書があれば版を付けずに止まる (#1567 R3 Medium 1)。文書を確かめた上で進めるときだけ --commit --allow-unresolved
+ *      (🚨 その文書の行は SQLite の build から外れ、Render の仮の財務からも消える (墓石)。正しく分けて入れ直せば戻る・#1567 R4 Low 1)
  *      (その版は決済 ID が null = どの決済にも採られない = 行は build に入らない・朝の報告に 🚨 version_unresolved_settlement)
  * env: DATA_DIR (必須)
  */

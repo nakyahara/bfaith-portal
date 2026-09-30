@@ -455,7 +455,7 @@ export function assertDocumentVersionsReady(db) {
 export class UnresolvedSettlementDocsError extends Error {
   constructor(groups) {
     super(`🚨 決済 ID が 2 つ以上ある過去の文書 ${groups.length} (${groups.slice(0, 5).map((g) => `${g.source_layer} ${g.source_document_id} = 決済 ${g.u_n} 個`).join(' / ')}) = どの決済の行か決まらない = 版を付けずに止めた `
-      + '(build と送り手も「版の無い行」で止まる = 行を黙って落とさない・墓石を送らない)。文書を確かめ、分けて入れ直すか、確かめた上で migrate-settlement-document-versions.js --commit --allow-unresolved');
+      + '(build と送り手も「版の無い行」で止まる = 行を黙って落とさない・墓石を送らない)。文書を確かめ、分けて入れ直すか、確かめた上で migrate-settlement-document-versions.js --commit --allow-unresolved (🚨 その文書の行は SQLite の build から外れ、Render の仮の財務からも消える (墓石)。正しく分けて入れ直せば戻る)');
     this.code = 'UNRESOLVED_SETTLEMENT_DOCS';
     this.groups = groups;
   }
