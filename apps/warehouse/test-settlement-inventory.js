@@ -7,7 +7,8 @@ await temporaryTestRoot(import.meta.url);
  *   - 一覧の窓の固定 (最初の要求に createdSince = createdUntil − 85 日・createdUntil = 回の開始の時刻。2 ページ目からは nextToken だけ)
  *   - 取込の一覧の要求は今までと同じ形 (日時の境なし) = 取込む report は変わらない
  *   - 最後のページまで取れた回 / 取れなかった回 (nextToken が残ったまま上限 = last_page_reached 0・取込は続ける)
- *   - 各分岐の取込の結果 (skipped_not_done / imported / skipped_v1 / failed / not_processed)・同じ report ID を 2 回見たら最後の状態
+ *   - 各分岐の取込の結果 (skipped_not_done / imported / failed / not_processed)・同じ report ID を 2 回見たら最後の状態
+ *     (2026-10-01 D-66: V1 で取込済みの決済の V2 も版として入れる = imported。前の skipped_v1 はもう出ない)
  *   - dry-run は表に書かない / --report-id は一覧の回にしない / 一覧の失敗でも取込は続ける / 例外で落ちた回は completed_at が null
  *   - 取込む行は変わらない (正規化した行の physical_line_hash の集まりと一致・一覧の有無で生の表が同じ)
  *   - digest の再現性 (並びに依らない・UTF-8 のバイトの順・保存した行から作り直して一致・式の固定)
@@ -136,7 +137,7 @@ const nowFn = () => new Date(NOW.getTime() + (tick++) * 1000);
 await initDB();
 const db = getDB();
 
-// 前提: S-V1 は V1 で取込済み (V2 では入れない = skipped_v1)
+// 前提: S-V1 は V1 で取込済み (2026-10-01 から V2 も版として入れる = imported・採る版は新しい V2)
 const v1Prep = prepareReportTsv(tsvOf(V1_COLUMNS, [
   { 'settlement-id': 'S-V1', 'settlement-start-date': '2099-01-01T00:20:09+00:00', 'settlement-end-date': '2099-01-15T00:20:09+00:00', 'deposit-date': '2099-01-17T00:20:09+00:00', 'total-amount': '300.00', currency: 'JPY' },
   { 'settlement-id': 'S-V1', 'marketplace-name': 'Amazon.co.jp', 'posted-date': '2099-01-05T01:00:00+00:00', 'transaction-type': 'Order', 'order-id': 'O9', sku: 'SKU-Y', 'price-type': 'Principal', 'price-amount': '300.00' },
@@ -182,13 +183,14 @@ eq([run1.company_id, run1.mall, run1.scope_key, run1.evidence_epoch], [1, 'amazo
 ok(run1.inventory_run_seq === 1 && run1.ingest_run_id === 'run-1', '回の連番 1・取込の回の ID');
 
 // 各分岐の取込の結果
-eq(rows(run1.id).map((r) => [r.report_id, r.import_result]), [['R-BAD', 'failed'], ['R-IMP', 'imported'], ['R-NOTDONE', 'skipped_not_done'], ['R-ONLYINV', 'not_processed'], ['R-V1', 'skipped_v1']], '各分岐の取込の結果 (取込の一覧にだけ居る R-ONLYING は一覧の行にしない)');
+eq(rows(run1.id).map((r) => [r.report_id, r.import_result]), [['R-BAD', 'failed'], ['R-IMP', 'imported'], ['R-NOTDONE', 'skipped_not_done'], ['R-ONLYINV', 'not_processed'], ['R-V1', 'imported']], '各分岐の取込の結果 (取込の一覧にだけ居る R-ONLYING は一覧の行にしない)');
 const imp = rowOf(run1.id, 'R-IMP');
 ok(imp.source_file_hash === sha256(DOCS['D-IMP']) && imp.settlement_id === 'S-IMP' && imp.header_inserted === 1 && imp.lines_inserted === 2 && imp.imported_report_document_id === 'D-IMP', 'imported: file hash・決済 ID・入れた行の数・落とした文書 ID');
 const rawHash = db.prepare(`SELECT DISTINCT source_file_hash h FROM raw_amazon_settlement_lines WHERE source_document_id = 'R-IMP'`).all().map((r) => r.h);
 eq(rawHash, [imp.source_file_hash], 'imported の file hash = 生の表の source_file_hash と同じ式');
 const v1row = rowOf(run1.id, 'R-V1');
-ok(v1row.settlement_id === 'S-V1' && v1row.source_file_hash === sha256(DOCS['D-V1']) && v1row.processing_status === 'DONE' && v1row.report_document_id === 'D-V1' && v1row.last_seen_ordinal === 6, `skipped_v1: 決済 ID・file hash / 同じ report ID を 2 回見たら最後の状態と位置 (last_seen_ordinal ${v1row.last_seen_ordinal})`);
+ok(v1row.settlement_id === 'S-V1' && v1row.source_file_hash === sha256(DOCS['D-V1']) && v1row.processing_status === 'DONE' && v1row.report_document_id === 'D-V1' && v1row.last_seen_ordinal === 6
+  && v1row.document_version_seq != null && db.prepare(`SELECT document_version_seq s FROM v_amazon_settlement_selected_documents WHERE settlement_id = 'S-V1'`).get().s === v1row.document_version_seq, `V1 取込済みの決済の V2 = imported・採る版は V2: 決済 ID・file hash / 同じ report ID を 2 回見たら最後の状態と位置 (last_seen_ordinal ${v1row.last_seen_ordinal})`);
 const badRow = rowOf(run1.id, 'R-BAD');
 ok(/^blocked: /.test(badRow.import_note) && badRow.source_file_hash === sha256(DOCS['D-BAD']), `failed (blocked): 理由と file hash (${badRow.import_note})`);
 const nd = rowOf(run1.id, 'R-NOTDONE');
@@ -198,8 +200,10 @@ ok(res.value.blocked.length === 1 && res.value.blocked[0].reportId === 'R-BAD', 
 ok(/決済の一覧 5 本を記録$/.test(res.logs.find((l) => l.includes('[settlements] 完了')) || ''), '完了の行の末尾 = 一覧の本数 (daily-sync の朝の報告)');
 
 // 取込む行は変わらない = 正規化した行の集まりとちょうど同じ
-const expected = [...prepareV2ReportTsv(DOCS['D-IMP'], 'R-IMP', 'x').lineRows, ...prepareV2ReportTsv(DOCS['D-ONLYING'], 'R-ONLYING', 'x').lineRows].map((r) => r.physical_line_hash).sort();
-eq(rawLines(), expected, '🚨 生の表 (V2) = 取込む report (R-IMP・R-ONLYING) の正規化した行とちょうど同じ (一覧にだけ居る R-ONLYINV は入れない)');
+// 🆕 2026-10-01: 文書の版 (文書 ID を含む) は物理の行の hash に入る = 取込と同じ文書 ID で作る。V1 取込済みの S-V1 の V2 (R-V1) も入る
+const expected = [...prepareV2ReportTsv(DOCS['D-IMP'], 'R-IMP', 'x', { reportDocumentId: 'D-IMP' }).lineRows, ...prepareV2ReportTsv(DOCS['D-V1'], 'R-V1', 'x', { reportDocumentId: 'D-V1' }).lineRows,
+  ...prepareV2ReportTsv(DOCS['D-ONLYING'], 'R-ONLYING', 'x', { reportDocumentId: 'D-ONLYING' }).lineRows].map((r) => r.physical_line_hash).sort();
+eq(rawLines(), expected, '🚨 生の表 (V2) = 取込む report (R-IMP・R-V1・R-ONLYING) の正規化した行とちょうど同じ (一覧にだけ居る R-ONLYINV は入れない)');
 const afterRun1 = rawCounts();
 
 // digest = 保存した行から作り直して一致
@@ -295,7 +299,7 @@ ok(!rf1.out.error && rf1.run.ingest_run_id === 'run-rf-ins' && rf1.run.completed
   `一覧の行の INSERT の失敗 = 見出しだけ・completed_at null・record_error (${rf1.run.record_error})`);
 ok(JSON.stringify(rf1.downloads) === JSON.stringify(base.downloads) && JSON.stringify(rf1.blocked) === JSON.stringify(base.blocked) && JSON.stringify(rf1.after) === JSON.stringify(rf1.before) && /⚠️ 決済の一覧を記録できなかった/.test(rf1.out.logs.find((l) => l.includes('[settlements] 完了')) || ''),
   '記録の失敗でも取込の結果・生の行は同じ (⚠️ だけ)');
-const rf2 = await recFail(`CREATE TRIGGER trg_test_inventory_fail BEFORE UPDATE ON amazon_settlement_report_inventory WHEN NEW.import_result = 'skipped_v1' BEGIN SELECT RAISE(ABORT, 'わざとの取込の結果の UPDATE の失敗'); END`, 'run-rf-upd');
+const rf2 = await recFail(`CREATE TRIGGER trg_test_inventory_fail BEFORE UPDATE ON amazon_settlement_report_inventory WHEN NEW.import_result = 'imported' AND NEW.report_id = 'R-V1' BEGIN SELECT RAISE(ABORT, 'わざとの取込の結果の UPDATE の失敗'); END`, 'run-rf-upd');
 ok(!rf2.out.error && rf2.run.ingest_run_id === 'run-rf-upd' && rf2.run.completed_at === null && /UPDATE の失敗/.test(rf2.run.record_error || '') && rows(rf2.run.id).length === 0 && JSON.stringify(rf2.after) === JSON.stringify(rf2.before),
   `取込の結果の UPDATE の失敗 = 取引ごと戻して見出しだけ・completed_at null・record_error (${rf2.run.record_error})`);
 const runsBefore = runs().length;

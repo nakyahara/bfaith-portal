@@ -139,7 +139,14 @@ pr = processV2Report(db, good2, 'R-G', 'run-b', { dryRun: true });
 ok(pr.status === 'dry_run' && rawCount() === 0, 'dry-run は書かない');
 pr = processV2Report(db, good2, 'R-G', 'run-b');
 ok(pr.status === 'ingested' && rawCount() === 2, '規則どおりなら取り込む (本体の行 + 個数だけの行)');
-ok(processV2Report(db, V2_TSV, 'R-V2b', 'run-c').status === 'skipped_v1', 'V1 で取込済みの決済は skipped_v1');
+// 🆕 2026-10-01 (D-66・R23 H1): V1 で取込済みの決済でも V2 を版として入れる (skipped_v1 をやめた)。採る版は 1 つ = 下流は二重にならない
+{
+  const beforeU = unified();
+  const pv = processV2Report(db, V2_TSV, 'R-V2b', 'run-c', { reportDocumentId: 'DOC-V2b' });
+  const afterU = unified();
+  ok(pv.status === 'ingested' && pv.result.lineInserted === p2.lineRows.length && pv.coveredByOtherVersion === true, `V1 で取込済みの決済の V2 も版として入れる (${pv.status}・${pv.result && pv.result.lineInserted} 行)`);
+  ok(beforeU.n === afterU.n && beforeU.s === afterU.s, `版が 3 つあっても下流は採った版 1 つだけ (${beforeU.n} 行 / ${afterU.n} 行)`);
+}
 // 🚨 規則に無いもので止まった決済を V1 で代わりに入れたら、V2 はもう ❌ にしない (並べ直しより先に V1 取込済みを見る。Codex #1508 R2)
 const S3 = 'S902', hdr3 = { ...V2_ROWS[0], 'settlement-id': S3 }, v2c = (o) => ({ ...v2(o), 'settlement-id': S3 });
 const bad3 = tsvOf(V2_COLUMNS, [hdr3, v2c({ 'transaction-type': 'NewThing', 'amount-type': 'Mystery', 'amount-description': 'x', amount: '-7.00' }), v2c({ 'transaction-type': 'Order', sku: 'Z', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '1.00', 'posted-date-time': '' })]);
@@ -147,7 +154,7 @@ ok(processV2Report(db, bad3, 'R-B3', 'run-d').status === 'blocked', '前提: V1 
 const v1of3 = prepareReportTsv(tsvOf(V1_COLUMNS, [{ ...V1_ROWS[0], 'settlement-id': S3 }, v1({ 'settlement-id': S3, 'transaction-type': 'NewThing', 'other-amount': '-7.00' })]), 'R-V1-3', 'run-d');
 ingestSettlement(db, v1of3.headerRow, v1of3.lineRows, v1of3.ctx);   // --source v1 で代わりに入れた
 pr = processV2Report(db, bad3, 'R-B3', 'run-e');
-ok(pr.status === 'skipped_v1' && pr.settlementId === S3, '規則に無いもの・日時の空があっても、V1 で取込済みなら skipped_v1 (毎朝 ❌ にしない)');
+ok(pr.status === 'blocked' && pr.settlementId === S3 && pr.coveredByOtherVersion === true, '規則に無いもの・日時の空がある V2 は入れない。V1 で取込済みなら coveredByOtherVersion (毎朝 exit 3 にはしない・coverage は満たせない)');
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== V2 並べ直しテスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

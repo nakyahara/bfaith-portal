@@ -8,7 +8,9 @@
  *   今の取込は Reports API の一覧を残さず、DONE でないレポートは黙って飛ばし、20 ページで黙って打ち切る。
  *   → 毎回の一覧 (どの report を見たか・状態・期間・文書 ID・取込の結果) を SQLite に残す。
  *
- * この部品は **記録だけ**。coverage・coordinator・lease・文書の版の選び方 (D-66) は後の PR。
+ * この部品は **記録だけ**。読み手 = coverage の判定 (amazon-finance-coverage.js)。
+ * 🆕 2026-10-01 (D7b-1b-3): coordinator の回は見出しに coverage_generation・run_token・evidence_epoch (その時の最新の初期の印) を書き、
+ *   記録の取引の中で lease を確かめる (params.check)。行には取込が入れた文書の版 (document_version_seq) も書く。
  *   取込む行 (raw_amazon_settlement_lines / headers) の中身と数は変えない:
  *   一覧の記録用の getReports は **取込の一覧とは別の要求** (窓を固定する)。取込は今までどおり日時の境なしの一覧で選ぶ
  *   (日時の境なし = Amazon の既定の createdSince 90 日前〜今。85 日の窓に揃えると 85〜90 日前に作られた report を取込まなくなる)。
@@ -27,7 +29,7 @@ export const MAX_LIST_PAGES = 21;
 export const IMPORT_RESULTS = Object.freeze([
   'not_processed',     // 一覧には居たが、この回の取込の繰り返しで扱わなかった (取込の一覧に無い・途中で落ちた)
   'skipped_not_done',  // processingStatus が DONE でない / reportDocumentId が無い (今のコードは飛ばす)
-  'skipped_v1',        // V2 のレポートだが、同じ決済を V1 (sp_api_v1) で取込済み (今のコードは入れない)
+  'skipped_v1',        // (旧) V2 のレポートだが、同じ決済を V1 で取込済みで入れなかった (2026-10-01 に廃止 = V2 も必ず版として保存。過去の行に残る)
   'imported',          // 取込の処理を通した (INSERT OR IGNORE = 既に入っていた行は 0 行でも imported)
   'failed',            // 取り込まなかった (V2 の並べ直しの規則に無い = blocked) / ダウンロード・処理で例外
 ]);
@@ -228,13 +230,14 @@ export function inventorySnapshotDigest(entries) {
  * listing = listInventoryReports の返り値 (失敗なら null)・listError = 失敗の文言・ingestError = 取込の例外・
  * recordError = 記録の失敗 (これを渡したときは行を書かない = 見出しだけの「記録できなかった回」)
  */
-export function recordInventoryRun(db, { reportType, marketplaceId, window, startedAt, listCompletedAt, listing, listError, ingestRunId, ingestError = null, recordError = null }) {
+export function recordInventoryRun(db, { reportType, marketplaceId, window, startedAt, listCompletedAt, listing, listError, ingestRunId, ingestError = null, recordError = null,
+  coverageGeneration = null, runToken = null, evidenceEpoch = null }) {
   const headerOnly = recordError != null;
   const { entries, missingId } = listing && !headerOnly ? inventoryEntries(listing.reports, reportType) : { entries: [], missingId: 0 };
   const errors = [];
   if (listError) errors.push(listError);
   if (missingId) errors.push(`reportId の無い report ${missingId} 件`);
-  // evidence_epoch / coverage_generation / run_token = null (後の初期の印・coordinator が入れる。null の回はどの印の鎖にも属さない)
+  // evidence_epoch / coverage_generation / run_token = coordinator の回だけ (null の回はどの印の鎖にも属さない = coverage の積み上げに使わない)
   const insertRun = db.prepare(`INSERT INTO amazon_settlement_report_inventory_runs (
       company_id, mall, scope_key, report_type, marketplace_id, query_created_since, query_created_until,
       started_at, list_completed_at, completed_at, last_page_reached, page_count, report_count,
@@ -242,7 +245,7 @@ export function recordInventoryRun(db, { reportType, marketplaceId, window, star
     ) VALUES (
       @company_id, @mall, @scope_key, @report_type, @marketplace_id, @query_created_since, @query_created_until,
       @started_at, @list_completed_at, NULL, @last_page_reached, @page_count, @report_count,
-      @snapshot_digest, @list_error, @ingest_error, @record_error, NULL, NULL, NULL, @inventory_run_seq, @ingest_run_id
+      @snapshot_digest, @list_error, @ingest_error, @record_error, @evidence_epoch, @coverage_generation, @run_token, @inventory_run_seq, @ingest_run_id
     )`);
   const insertRow = db.prepare(`INSERT INTO amazon_settlement_report_inventory (
       inventory_run_id, report_id, report_type, processing_status, created_time,
@@ -272,6 +275,9 @@ export function recordInventoryRun(db, { reportType, marketplaceId, window, star
       record_error: recordError,
       inventory_run_seq: seq,
       ingest_run_id: ingestRunId,
+      evidence_epoch: evidenceEpoch ?? null,
+      coverage_generation: coverageGeneration ?? null,
+      run_token: runToken ?? null,
     }).lastInsertRowid);
     for (const e of entries) insertRow.run({ ...e, inventory_run_id: runId });
     return runId;
@@ -281,14 +287,14 @@ export function recordInventoryRun(db, { reportType, marketplaceId, window, star
 
 /**
  * 取込の結果を一覧の行に書く (その回の一覧に無い report = 0 行・何もしない)。返り値 = 書いた行の数
- * extra = { note, settlementId, fileHash, importedReportDocumentId, headerInserted, linesInserted }
+ * extra = { note, settlementId, fileHash, importedReportDocumentId, headerInserted, linesInserted, documentVersionSeq }
  */
 export function recordImportResult(db, inventoryRunId, reportId, result, extra = {}) {
   if (!IMPORT_RESULTS.includes(result) || result === 'not_processed') throw new Error(`取込の結果が違う: ${result}`);
   return db.prepare(`UPDATE amazon_settlement_report_inventory SET
       import_result = @result, import_note = @note, settlement_id = @settlement_id,
       source_file_hash = @source_file_hash, imported_report_document_id = @imported_report_document_id,
-      header_inserted = @header_inserted, lines_inserted = @lines_inserted
+      header_inserted = @header_inserted, lines_inserted = @lines_inserted, document_version_seq = @document_version_seq
     WHERE inventory_run_id = @run_id AND report_id = @report_id`).run({
     result,
     note: extra.note ?? null,
@@ -297,6 +303,7 @@ export function recordImportResult(db, inventoryRunId, reportId, result, extra =
     imported_report_document_id: extra.importedReportDocumentId ?? null,
     header_inserted: extra.headerInserted ?? null,
     lines_inserted: extra.linesInserted ?? null,
+    document_version_seq: extra.documentVersionSeq ?? null,
     run_id: inventoryRunId,
     report_id: String(reportId),
   }).changes;
@@ -317,14 +324,16 @@ export function finishInventoryRun(db, inventoryRunId, completedAt) {
  */
 export function recordInventorySnapshot(db, params, results, completedAt) {
   const txn = db.transaction(() => {
+    if (params.check) params.check(db);   // coordinator の lease (違えば LEASE_LOST = 何も書かない)
     const id = recordInventoryRun(db, params);
     for (const [reportId, r] of results) recordImportResult(db, id, reportId, r.result, r.extra);
     if (completedAt && !params.ingestError) finishInventoryRun(db, id, completedAt);
     return id;
   });
   try {
-    return { id: txn(), recordError: null };
+    return { id: txn.immediate(), recordError: null };
   } catch (e) {
+    if (e && e.code === 'LEASE_LOST') return { id: null, recordError: `一覧を記録しない (lease を失った): ${e.message}` };
     const recordError = `一覧を記録できない: ${e?.message || e}`;
     let id = null;
     try { id = recordInventoryRun(db, { ...params, recordError }); }

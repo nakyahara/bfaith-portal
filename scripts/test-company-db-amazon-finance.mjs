@@ -26,7 +26,8 @@ import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import companyDbRouter, { requireSyncKey, __setPgClientFactory } from '../apps/company-db/router.mjs';
 import { openLedger } from '../apps/company-db/push/ledger.mjs';
-import { aggregateOrderFinance, dedupSettlementRows, feeKindOf, skuKindOf, AMAZON_FINANCE_TRANSFORM_VERSION } from '../apps/company-db/push/amazon-finance-transform.mjs';
+import { aggregateOrderFinance, dedupSettlementRows, filterSelectedRows, feeKindOf, skuKindOf, AMAZON_FINANCE_TRANSFORM_VERSION } from '../apps/company-db/push/amazon-finance-transform.mjs';
+import { backfillDocumentVersions, clearDirtyOrders } from '../apps/warehouse/amazon-settlement-versions.js';
 import { pushAmazonFinance, reconcileAmazonFinance, readSqliteDaily, readSqliteFees, diffFinanceDaily, diffAccountFees, capacityGuard, parseArgs, sinceOf, META, FINANCE_KIND, financeKey, retryStore }
   from '../apps/company-db/push/amazon-finance.mjs';
 import { classifyAccountFee, classifySkuAccountFee } from '../apps/warehouse/amazon-account-fee-rules.js';
@@ -102,7 +103,8 @@ raw({ order: 'O5', date: d(MB, 8), tt: 'Amazon Easy Ship Charges', oa: -100, ft:
 const O6 = { order: 'O6', sku: 'sku-g', date: d(MB, 9) };
 raw({ ...O6, qty: 1, blk: 'dup-q', lineNo: 1001 }); raw({ ...O6, qty: 1, blk: 'dup-q', lineNo: 1002 });
 raw({ ...O6, pt: 'Principal', pa: 700, blk: 'dup-p', lineNo: 1003 }); raw({ ...O6, pt: 'Principal', pa: 700, blk: 'dup-p', lineNo: 1004 });
-raw({ ...O6, pt: 'Principal', pa: 900, blk: 'v12', doc: 'D-V1', layer: 'sp_api_v1', lineNo: 5 }); raw({ ...O6, pt: 'Principal', pa: 900, blk: 'v12', doc: 'D-V2', layer: 'sp_api_v2', lineNo: 7, ingested: '2026-02-01 00:00:00' });
+// 🆕 2026-10-01 (D-66): 1 つの決済の文書 = その決済の全部の行 = V1 と V2 は別の決済 S-V12 の 2 つの文書 (決済ごとに採る版は 1 つ)
+raw({ ...O6, pt: 'Principal', pa: 900, blk: 'v12', doc: 'D-V1', layer: 'sp_api_v1', lineNo: 5, settlement: 'S-V12' }); raw({ ...O6, pt: 'Principal', pa: 900, blk: 'v12', doc: 'D-V2', layer: 'sp_api_v2', lineNo: 7, ingested: '2026-02-01 00:00:00', settlement: 'S-V12' });
 // O7: BuyerRecharge (SKU あり = 日次の財務は除く)
 raw({ order: 'O7', sku: 'sku-h', date: d(MB, 11), tt: 'BuyerRecharge', pt: 'Principal', pa: -100 });
 // 注文番号なし・SKU あり = 補てん (MB 7 日)
@@ -114,7 +116,7 @@ NS(d(MB, 15), 'FBA Long Term Storage Fee', { oa: -1200 }); NS(d(MB, 1), 'Subscri
 NS(d(MB, 16), 'Inbound Defect Fee - Unplanned Service', { oa: -150 }); NS(d(MB, 17), 'FBA Inventory Fee - LowInventoryLevel', { oa: -50 });
 NS(d(MB, 18), 'Fee Adjustment', { oa: 80 }); NS(d(MB, 18), 'Overpaid Fees Adjustment', { oa: 20 });
 NS(d(MB, 19), 'Current Reserve Amount', { oa: -10000 }); NS(d(MB, 19), 'Previous Reserve Amount Balance', { oa: 10000 }); NS(d(MB, 19), 'Mystery Fee', { oa: -77 });
-NS(d(MA, 7), 'StorageRenewalBilling', { oa: -900, blk: 'v12s', doc: 'D-V1', lineNo: 3 }); NS(d(MA, 7), 'StorageRenewalBilling', { oa: -900, blk: 'v12s', doc: 'D-V2', layer: 'sp_api_v2', lineNo: 4 });
+NS(d(MA, 7), 'StorageRenewalBilling', { oa: -900, blk: 'v12s', doc: 'D-V1', lineNo: 3, settlement: 'S-V12' }); NS(d(MA, 7), 'StorageRenewalBilling', { oa: -900, blk: 'v12s', doc: 'D-V2', layer: 'sp_api_v2', lineNo: 4, settlement: 'S-V12' });
 // 🆕 2026-09-30 (D-63): SKU のある行の「行き先の無い金額」を種類ごとに分ける
 //   O13 (sku-v): MB 13 に売上・MB 14 に SAFE-T の補てん (取引の種類 Other・price_type SAFE-T Reimbursement) → safe_t と 補てんの取り消し (PAYMENT_RETRACTION_ITEMS) → reversal_reimbursement
 //   SKU のある納品不備 → 月の手数料の inbound_defect (MB 16 = SKU の無い納品不備 −150 と同じ疑似注文の同じ行)・日次の財務には入らない
@@ -137,8 +139,16 @@ raw({ order: 'O14', sku: 'sku-u14', date: d(MB, 23), misc: 30 });
 raw({ order: 'O14', sku: 'sku-u14', date: d(MB, 23), ft: 'MFNPostageFee', fa: -40 });
 NS(d(MB, 23), 'Subscription Fee', { oa: -100, misc: 3 });
 NS(d(MB, 23), 'Goodwill Concession', { misc: 9 });
+// 🆕 2026-10-01 (D-66): 決済 S-DIFF に文書が 2 つ・中身が違う (旧い V1 には相殺の +100 / −100 (Other / Something) がある・新しい V2 には無い)。
+//   採る版 = 新しい V2 = build も変換も相殺の行を数えない (前は文書をまたいで行ごとに選び、旧い文書にだけある行が残った = 分けられない部品 2 が出た)
+const O20 = { order: 'O20', sku: 'sku-o20', date: d(MB, 27), settlement: 'S-DIFF' };
+raw({ ...O20, qty: 1, blk: 'o20q', doc: 'D-OLD', lineNo: 1 }); raw({ ...O20, pt: 'Principal', pa: 500, blk: 'o20p', doc: 'D-OLD', lineNo: 2 });
+raw({ ...O20, tt: 'Other', pt: 'Something', oa: 100, blk: 'o20x', doc: 'D-OLD', lineNo: 3 }); raw({ ...O20, tt: 'Other', pt: 'Something', oa: -100, blk: 'o20y', doc: 'D-OLD', lineNo: 4 });
+raw({ ...O20, qty: 1, blk: 'o20q', doc: 'D-NEW', layer: 'sp_api_v2', lineNo: 1, ingested: '2026-01-15 00:00:00' }); raw({ ...O20, pt: 'Principal', pa: 500, blk: 'o20p', doc: 'D-NEW', layer: 'sp_api_v2', lineNo: 2, ingested: '2026-01-15 00:00:00' });
 
+// 直接入れた行には文書の版が無い = 過去の行と同じ backfill で版を付けてから build・送る (どちらも版の無い行があれば止まる)
 const build = (months = 14) => {
+  backfillDocumentVersions(wdb);
   for (const m of [MA, MB]) execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', m], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
   return execFileSync(process.execPath, ['apps/warehouse/rebuild-amazon-account-fees.js', '--data-dir', tmpDir, '--months', String(months)], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
 };
@@ -167,7 +177,9 @@ process.env.MIRROR_SYNC_KEY = 'k';
 process.env.COMPANY_DB_URL = 'postgres://pglite';
 const reader = () => new Database(path.join(tmpDir, 'warehouse.db'), { readonly: true });
 const BIG = { limitBytes: 1e15, rowBytes: 1000, replaceFactor: 2, walAllowanceBytes: 0, marginBytes: 0, orderBytes: 300 };
-const pushClose = async (ledger, x) => { const w = reader(); try { return await pushAmazonFinance({ warehouse: w, ledger, base: BASE, syncKey: 'k', log: quiet, sleep: async () => {}, capacity: BIG, ...x }); } finally { w.close(); } };
+// dirty = 読み直す注文の記録を消す口 (coordinator が渡すのと同じ = 読み取りの版 R 以下だけ)
+const pushClose = async (ledger, x) => { backfillDocumentVersions(wdb); const w = reader(); try { return await pushAmazonFinance({ warehouse: w, ledger, base: BASE, syncKey: 'k', log: quiet, sleep: async () => {}, capacity: BIG,
+  dirty: { clear: (nos, rev) => clearDirtyOrders(wdb, nos, rev) }, ...x }); } finally { w.close(); } };
 const newLedger = () => { const l = openLedger(tmpDir, { memory: true, kind: FINANCE_KIND }); l.markInitialized(); return l; };
 const renderDaily = async (from, to) => (await all(`select economic_date_jst::text as date_jst, seller_sku, units_ordered, units_refunded_customer, units_marketplace_guarantee, units_a_to_z_refund, units_net_sold,
   sales_principal_jpy, sales_shipping_jpy, sales_giftwrap_jpy, sales_tax_jpy, commission_jpy, fba_fulfillment_jpy, fba_storage_jpy, closing_fee_jpy, shipping_chargeback_jpy, giftwrap_chargeback_jpy,
@@ -234,6 +246,15 @@ await t('行き先の無い金額を種類ごとに (2026-09-30 D-63): Other の
   const cdb = await all(`select economic_date_jst::text as d, seller_sku, line_kind, account_fee_amount_jpy::int as a, source_lines from core.order_finance_daily
     where line_kind = 'inbound_defect' order by 1`);
   assert.deepEqual(cdb.map((x) => [x.d, x.seller_sku, x.a, x.source_lines]), [[d(MB, 16), '-', -350, 2], [d(MB, 17), '-', -100, 2]]);
+});
+await t('🚨 D-66: 文書が 2 つで中身が違う決済 (S-DIFF) = 新しい版だけ (build も変換も相殺の行を数えない・分けられない部品 0)', async () => {
+  const u = await one(`select sales_principal_jpy::int p, other_amount_jpy::int oa, unclassified_component_count c from core.order_finance_daily where mall_order_no = 'O20' and line_kind = 'sku'`);
+  assert.deepEqual([u.p, u.oa, u.c], [500, 0, 0]);
+  const w = reader();
+  try {
+    const s2 = w.prepare(`select sales_principal_jpy p, other_amount_jpy o, units_ordered q from f_amazon_finance_sku_daily_v1 where seller_sku = 'sku-o20' and date_jst = ?`).get(d(MB, 27));
+    assert.deepEqual([s2.p, s2.o, s2.q], [500, 0, 1]);
+  } finally { w.close(); }
 });
 await t('月 × 手数料: mart.v_finance_account_fees_monthly = f_amazon_account_fees_monthly_v1 (金額・行数)', async () => {
   const w = reader();
@@ -327,15 +348,19 @@ await t('円未満の端数・読めない計上日・JPY 以外・空白だけ�
   const huge = BigInt(Number.MAX_SAFE_INTEGER) * 1000000n;
   assert.throws(() => aggregateOrderFinance('X1', [base({ price_type: 'Principal', price_amount_micro: huge }), base({ id: 2, business_line_key: 'k2', price_type: 'Principal', price_amount_micro: 1000000n })]), /安全な整数/);
 });
-await t('重複除去 = build と同じ (同じ文書の同じ鍵の 2 行は残す・別の文書 = 層 → ingested_at の新しい順 → 文書で 1 行・行番号が同じなら同じ出現)', async () => {
+await t('重複除去 = build と同じ (同じ版の同じ鍵の 2 行は残す・行番号が同じなら同じ出現 = 1 行) / 🆕 D-66: 決済ごとに採った版の行だけ・版が 2 つ混ざれば整形できない', async () => {
   const a = base({ id: 1, source_line_no: 1 }), b = base({ id: 2, source_line_no: 2 });
   assert.equal(dedupSettlementRows([a, b]).length, 2);
-  const v1 = base({ id: 3, source_document_id: 'A', source_line_no: 9 }), v2 = base({ id: 4, source_document_id: 'B', source_line_no: 3, ingested_at: '2026-05-01 00:00:00' });
-  assert.deepEqual(dedupSettlementRows([v1, v2]).map((r) => r.id), [4]);   // ingested_at の新しい方
-  const man = base({ id: 5, source_document_id: 'M', source_layer: 'manual_csv', ingested_at: '2027-01-01 00:00:00' });
-  assert.deepEqual(dedupSettlementRows([v1, man]).map((r) => r.id), [3]);   // 層が先
   const same = base({ id: 6, source_line_no: 1 });
   assert.equal(dedupSettlementRows([a, same]).length, 1);
+  const lateSame = base({ id: 7, source_line_no: 1, ingested_at: '2026-05-01 00:00:00' });
+  assert.deepEqual(dedupSettlementRows([a, lateSame]).map((r) => r.id), [7]);   // 残骸は ingested_at の新しい方 (build と同じ)
+  const v1 = base({ id: 3, source_document_id: 'A', document_version_seq: 1, source_line_no: 9 }), v2 = base({ id: 4, source_document_id: 'B', document_version_seq: 2, source_line_no: 3 });
+  assert.throws(() => dedupSettlementRows([v1, v2]), /版が 2 つ以上/);   // 選び忘れ = 黙って両方を足さない
+  const man = base({ id: 5, source_document_id: 'M', document_version_seq: 3, source_layer: 'manual_csv' });
+  assert.deepEqual(filterSelectedRows([v1, v2, man], new Map([['S', 2]])).map((r) => r.id), [4]);   // 採った版 (seq 2) だけ
+  assert.deepEqual(filterSelectedRows([v1, v2], new Map([['OTHER', 1]])).map((r) => r.id), []);    // 採った版の無い決済の行は落とす
+  assert.throws(() => filterSelectedRows([v1], null), /Map/);
 });
 await t('SKU のある行の行き先 (2026-09-30 D-63・純粋関数): Other の SAFE-T → safe_t / ほかの price_type の Other → other_amount / 取り消し → reversal / 納品不備 → SKU は - の inbound_defect', async () => {
   const M = 1000000n;
@@ -496,13 +521,16 @@ await t('🚨 旧いコードの送り手に戻しても 4 列は消えない (#
   const u = await one(`select unclassified_component_count c, transform_version v from core.order_finance_daily where mall_order_no = 'O14' and line_kind = 'sku'`);
   assert.deepEqual([u.c, u.v], [4, AMAZON_FINANCE_TRANSFORM_VERSION]);
 });
-await t('--full: 注文の中の一部の行の削除 (ingested_at も鍵も変わらない) を拾う・Render にだけある注文に空の集合', async () => {
-  // O3 の返品のポイントの行を消す (incremental では拾えない)
+await t('--full: 注文の中の一部の行の削除 (ingested_at も鍵も変わらない) を拾う・Render にだけある注文に空の集合 / 🆕 incremental も「読み直す注文」で削除を拾う', async () => {
+  // O3 の返品のポイントの行を消す (前は incremental では拾えなかった → 2026-10-01 D7b-1b-3 から生の表の trigger が「読み直す注文」に記録 = incremental も拾う)
   wdb.prepare(`delete from raw_amazon_settlement_lines where amazon_order_id = 'O3' and item_related_fee_type = 'PointsReturned'`).run();
   const ri = await pushClose(L0, { mode: 'incremental' });
-  assert.equal(ri.changed, 0);
+  assert.equal(ri.changed, 1); assert.ok(ri.finance.dirtyOrders >= 1, `読み直す注文 ${ri.finance.dirtyOrders}`);
+  assert.equal(wdb.prepare(`select count(*) n from amazon_settlement_dirty_orders where mall_order_no = 'O3'`).get().n, 0);   // 送れた = R 以下の記録を消した
   // O9 の行を全部消す = Render にだけある
   wdb.prepare(`delete from raw_amazon_settlement_lines where amazon_order_id = 'O9'`).run();
+  // 「Render にだけある鍵」の道を通す = trigger の記録 (読み直す注文) を消してから (記録があれば読み直す注文として同じ墓石が送られる)
+  wdb.prepare(`delete from amazon_settlement_dirty_orders where mall_order_no = 'O9'`).run();
   const rf = await pushClose(L0, { mode: 'full' });
   assert.equal(rf.ok, true);
   assert.equal(rf.finance.renderOnly, 1);
@@ -880,7 +908,9 @@ await t('CLI: バックフィルの完了印の前は送らずに「⏭️ バ�
     }
     const l = openLedger(dir, { kind: FINANCE_KIND }); l.putMeta(META.backfill, '1'); l.close();
     const r = cli(['--incremental', '--require-backfilled']);
-    assert.equal(r.code, 1); assert.match(r.out, /CDB_DB_LIMIT_BYTES/);
+    assert.equal(r.code, 1); assert.match(r.out, /coordinator/);   // 🆕 D7b-1b-3: 送る回は coordinator の中だけ (単独は dry-run)
+    const rr = cli(['--from', '2026-01-01', '--to', '2026-01-31']);
+    assert.equal(rr.code, 1); assert.match(rr.out, /CDB_DB_LIMIT_BYTES/);   // バックフィルの範囲の送信は今までどおり (容量の上限が無ければ送らない)
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 await t('月の手数料のやり残し: 60 か月より古い月は範囲の外 = 消さずに warn・読めないファイルは warn', async () => {

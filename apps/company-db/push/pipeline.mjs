@@ -15,6 +15,11 @@
  *     beforeChunk({ rows, lines, ...hctx }) = 各 chunk を送る直前 (容量の見張り。throw = 送らずに止める)。戻り値の release() = 期限超過で送らなかったときに呼ぶ (見込みの予約を戻す)
  *     receiptRows(body) → 受け口が正規化した rows (key つき) = 受領記録の指紋を受け口と同じ形で計算する (受け口が行を作り直す種類。既定 = 送った行そのまま)
  *     beforeAck({ failedKeys, staleKeys }) = chunk の応答で failed / stale になった鍵を、outbox から消す前に呼ぶ (全部を読み直さない種類が「読み直す鍵」に残す)
+ *   任意 (Amazon 財務の決済のそろい D7b-1b-3 で足した・設計 13 §3.1):
+ *     onScanSnapshot({ warehouse, stats, ctx, r }) → snapshot = 走査の **同じ読み取りの取引の中** で (全部の build の後・rollback の前) 1 回だけ呼ぶ
+ *       (manifest と生の表の版を計算する)。戻り値は r.scanSnapshot に入り afterSend({ scanSnapshot }) に渡る。例外 = 走査を戻して run ごと失敗 (coverage は updating のまま)
+ *       dry-run でも呼ぶ (計算してよい・送らない)
+ *     chunkExtra = 全部の chunk の body に足す object (Amazon 財務 = { coverage_generation, run_token })。受領記録の指紋 (receiptRows) には入らない
  *   inScope(group, fps) / build(group, ctx) → { key, payload, n_lines, no_synced_at? } (throw = 整形できない) / transformVersion
  */
 import crypto from 'node:crypto';
@@ -138,6 +143,7 @@ export async function runPush({
   metaOnFirstChunk = null,   // 最初の chunk の直前 (世代を取る取引) に台帳へ書く印 { 鍵: 値 } = 「送った後に要る処理」を HTTP より先に永続化 (注文の結び直し。Codex D5b-1 R2 #1)
   afterSend = null,          // 送り終えた後 (lock の中・持ち主の確認の後) に回す処理 (ctx) → 結果。error があれば run は ok = false (Codex D5b-1 R2 #3)
   beforeScan = null, beforeChunk = null, receiptRows = null, beforeAck = null,   // 上の「任意」
+  onScanSnapshot = null, chunkExtra = null,                                       // 上の「任意」(D7b-1b-3)
 }) {
   if (chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk は 1〜${MAX_CHUNK}`);
   if (!dryRun) {
@@ -146,7 +152,7 @@ export async function runPush({
   }
   const startedAt = now();
   const r = { ok: false, kind, mode, dryRun, force, runId: null, batchSeq: null, scanned: 0, inScope: 0, unchanged: 0, changed: 0, sent: 0, applied: 0, same: 0, stale: 0, failed: [], staleKeys: [], chunks: 0,
-    transformErrors: [], noSyncedAt: 0, lockedBy: null, example: null, remote: null, ledgerReset: null, ledgerRebuilt: 0, carriedOver: 0, stats, afterSend: null };
+    transformErrors: [], noSyncedAt: 0, lockedBy: null, example: null, remote: null, ledgerReset: null, ledgerRebuilt: 0, carriedOver: 0, stats, afterSend: null, scanSnapshot: null };
   if (!dryRun) {
     const lock = ledger.acquireLock({ owner, pid, now: startedAt, ...(isAlive ? { isAlive } : {}) });
     if (!lock.ok) { r.lockedBy = lock.held; log(`[company-db push ${label}] 別の送り手が走っている (${lock.held.owner} pid ${lock.held.pid} 心拍 ${lock.held.heartbeat_at}) ので見送った`); return r; }
@@ -215,6 +221,8 @@ export async function runPush({
         if (buf.length >= 1000) flushBuf();
       }
       flushBuf();
+      // 同じ読み取りの取引の中で manifest と生の表の版を計算する (D7b-1b-3)。例外 = run ごと失敗 (送らない)
+      if (onScanSnapshot) r.scanSnapshot = onScanSnapshot({ warehouse, stats, ctx, r });
     } finally {
       try { warehouse.exec('rollback'); } catch { /* 読むだけの取引 */ }
     }
@@ -228,7 +236,7 @@ export async function runPush({
     const sendRows = async (rows, last) => {
       if (r.batchSeq == null) r.batchSeq = ledger.nextBatchSeq(now(), owner, metaOnFirstChunk);   // 世代は最初の chunk の直前に取る (送る物が無い run では進めない。持ち主の確認・送る前に残す印と同じ取引)
       const items = rows.map((p) => p.item);
-      const body = { run_id: r.runId, batch_seq: r.batchSeq, chunk_index: chunkIndex++, last, transform_version: transformVersion, rows: items };
+      const body = { run_id: r.runId, batch_seq: r.batchSeq, chunk_index: chunkIndex++, last, transform_version: transformVersion, rows: items, ...(chunkExtra || {}) };
       let hold = null;
       if (beforeChunk) { hold = await beforeChunk({ rows: items, lines: rows.reduce((s, p) => s + (p.item.lines ? p.item.lines.length : 0), 0), fetchImpl, base, syncKey, log, mustOwn }); mustOwn(); }
       const res = await postJson(fetchImpl, { base, syncKey, path: paths.post, log, sleep, body, beforeAttempt: mustOwn });
@@ -270,7 +278,7 @@ export async function runPush({
     r.ok = r.failed.length === 0 && r.transformErrors.length === 0 && r.stale === 0;
     if (afterSend) {
       mustOwn();   // 送った後の処理も同じ lock の中 (別の送り手が印を消せない)。HTTP のたびに ctx.mustOwn で持ち主を確かめる
-      r.afterSend = await afterSend({ ledger, owner, fetchImpl, base, syncKey, log, now, mustOwn, r });
+      r.afterSend = await afterSend({ ledger, owner, fetchImpl, base, syncKey, log, now, mustOwn, r, scanSnapshot: r.scanSnapshot });
       if (r.afterSend && r.afterSend.error) r.ok = false;
     }
     if (total.n >= 50000) { try { ledger.vacuum(); } catch { /* 詰めるだけ */ } }

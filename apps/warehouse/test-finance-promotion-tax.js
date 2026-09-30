@@ -21,6 +21,7 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'finance-promo-tax-test-'))
 process.env.DATA_DIR = tmpDir;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const { initDB, getDB } = await import('./db.js');
+const { backfillDocumentVersions } = await import('./amazon-settlement-versions.js');   // 直接入れた行に文書の版を付ける (build は版の無い行があれば止まる)
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -66,7 +67,7 @@ line({ ...P, tt: 'Refund', day: '10', ft: 'PointsReturned', fa: 10 });
 // SKU-B の原価 1 個 400 円 (m_products の直の商品コード = v_sku_costed の direct_master)。返品の 1 個は原価を戻す・支払い取り消しの 1 個は戻さない (Codex #1522 R2)
 db.prepare(`INSERT INTO m_products (商品コード, 商品名, 商品区分, 原価状態, 原価, updated_at) VALUES ('sku-b', 'B', '単品', 'ok', 400, 't')`).run();
 
-execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
+(backfillDocumentVersions(db), execFileSync)(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
 const r = db.prepare(`SELECT promotion_jpy pr, promotion_tax_jpy pt, profit_amount p, commission_jpy c, fba_fulfillment_jpy f FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-a'`).get();
 ok(r && r.pr === 270 && r.pt === 20, `値引き 270 (本体 200 + 送料 50 + 税の分 20) のうち税の分 = 20 (${r && r.pr} / ${r && r.pt})`);
 ok(r && r.p === 1000 - 110 - 330 - 270, `profit_amount (税込で引いた利益) は今まで通り = 1,000 − 110 − 330 − 270 = 290 (${r && r.p})`);
@@ -118,7 +119,7 @@ ok(c10 && c10.pt === -10 && c10.p === 10, `C ポイント: 返品で戻る 10 = 
 // 税抜で引いた利益の式 (profit + 課税の手数料 × 1/11 + 値引きの税) にポイントは足し戻さない = 額面のまま引く
 const cEx = db.prepare(`SELECT SUM(profit_amount + (commission_jpy + fba_fulfillment_jpy + fba_storage_jpy + closing_fee_jpy + shipping_chargeback_jpy + giftwrap_chargeback_jpy) / 11 + COALESCE(promotion_tax_jpy, 0)) e FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-c'`).get().e;
 // 2 回目の集計 = 既存の行の上書き (ON CONFLICT の側の利益の式) でもポイントを引く・値が変わらない (Codex #1525 R1)
-execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
+(backfillDocumentVersions(db), execFileSync)(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
 const c5b = db.prepare(`SELECT points_jpy pt, profit_amount p FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-c' AND date_jst = ?`).get(`${YM}-05`);
 const b10b = db.prepare(`SELECT profit_amount p, promotion_tax_jpy t FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-b' AND date_jst = ?`).get(`${YM}-10`);
 ok(c5b.pt === 30 && c5b.p === 970 && b10b.p === -132 && b10b.t === -30, `2 回目の集計 (上書き) でも同じ: C のポイント 30・利益 970 / B の返品の日の利益 −132・値引きの税 −30 (${[c5b.pt, c5b.p, b10b.p, b10b.t]})`);
@@ -128,7 +129,7 @@ ok(cEx === 1000 - 20,`C の税抜で引いた利益 = 1,000 − ポイント 20 
 {
   const snapBefore = db.prepare(`SELECT unit_cost_snapshot s, cost_snapshot_date_jst d FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-b' AND date_jst = ?`).get(`${YM}-05`);
   db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE seller_sku_normalized = 'sku-c' AND economic_date = ?`).run(`${YM}-10`);
-  execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
+  (backfillDocumentVersions(db), execFileSync)(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
   const c10gone = db.prepare(`SELECT COUNT(*) n FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-c' AND date_jst = ?`).get(`${YM}-10`).n;
   const c5kept = db.prepare(`SELECT points_jpy pt FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-c' AND date_jst = ?`).get(`${YM}-05`);
   const snapAfter = db.prepare(`SELECT unit_cost_snapshot s, cost_snapshot_date_jst d FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-b' AND date_jst = ?`).get(`${YM}-05`);
@@ -139,7 +140,7 @@ ok(cEx === 1000 - 20,`C の税抜で引いた利益 = 1,000 − ポイント 20 
   // 月の材料が全部消えた: 決済の行を全部消して作り直す → その月の行は全部消える (ほかの月は残る)
   db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE year_month_int = ?`).run(YMI);
   let out = '';
-  try { out = execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch (e) { out = String(e.stdout || '') + String(e.stderr || ''); }
+  try { out = (backfillDocumentVersions(db), execFileSync)(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch (e) { out = String(e.stdout || '') + String(e.stderr || ''); }
   const leftMonth = db.prepare(`SELECT COUNT(*) n FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ?`).get(YM).n;
   const otherMonth = db.prepare(`SELECT COUNT(*) n FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-other-month'`).get().n;
   ok(leftMonth === 0 && otherMonth === 1, `月の材料が全部消えたら その月の行は全部消える・ほかの月の行は残る (${leftMonth} / ${otherMonth} ${leftMonth ? out.slice(-300) : ''})`);
