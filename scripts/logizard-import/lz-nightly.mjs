@@ -28,7 +28,7 @@ import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { pickTarget } from '../../apps/master-decisions/lz-import-plan.mjs';
-import { POLICIES, STOP_STATES, assertPolicyReady, importOne, verifyAgain } from './lz-import-engine.mjs';
+import { POLICIES, STOP_STATES, assertPolicyReady, importOne, verifyAgain, startAllowed } from './lz-import-engine.mjs';
 import { portalWrite } from './portal-io.mjs';
 import { jobsHook, sendJobsChat } from './notify-jobs.mjs';
 import { realSession } from './lz-real-session.mjs';
@@ -113,7 +113,8 @@ export async function sendNotices({ client, notify, budget, includePending = tru
  * 1 回分 (試験では client・withSession・importOneFn・verifyAgainFn・perfNow を差し替える)
  * @returns {Promise<{ state: string, reason?: string, result?: string, runId?: string, ping: 'ok'|null, unsent: number, notices: object[], codes?: string[] }>}
  */
-export async function runNightly({ dataDir, client, checkInit, localInitFile, withSession, capabilities, notify, createGuard, importOneFn = importOne, verifyAgainFn = verifyAgain, perfNow = () => performance.now(), log = console.log, budget: budgetLimits = BUDGET }) {
+export async function runNightly({ dataDir, client, checkInit, localInitFile, withSession, capabilities, notify, createGuard, importOneFn = importOne, verifyAgainFn = verifyAgain, perfNow = () => performance.now(), log = console.log, budget: budgetLimits = BUDGET, lzMinRows = undefined }) {
+  const minRows = lzMinRows === undefined ? {} : { lzMinRows };   // 直前の一覧の行数の下限 (試験だけ小さくする。本番の入口は渡さない = エンジンの既定 4,000)
   const st0 = await client.status(20);
   if (!st0.initialized) throw new Error('ポータルの取込の状態がまだ初期化されていない');
   if (!st0.clock || !Number.isFinite(st0.clock.server_now)) throw new Error('ポータルが時計 (clock) を返さない = 古いポータル = 毎晩の本番はしない');
@@ -171,9 +172,10 @@ export async function runNightly({ dataDir, client, checkInit, localInitFile, wi
     if (!st.notified) return finish({ state: 'stopped', reason: 'stop_notice_pending' });
     // 前の夜の回が未確かめ = その夜は確かめのやり直しだけ (L-25)
     const runId = st.run.run_id;
+    if (!startAllowed(POLICIES.nightly, 'verify', nowMs())) return finish({ state: 'skipped', reason: 'window_closed' });   // 振り分けの間に窓を過ぎた (Render の時計) = 済みの印を書かない
     writeMarker({ kind: 'verify_again', run_id: runId });   // もうある (同じ夜の 2 回目) でも確かめ直してよい (状態の機械が 1 回ずつにする)
     const r = await verifyAgainFn({ policy: POLICIES.nightly, runId, locateRun: () => nightlyRunDir(dataDir, runId), context: {}, now: new Date(nowMs()),
-      localInitFile, client, checkInit, withSession, capabilities, notify: engineNotify, createGuard, log });
+      localInitFile, client, checkInit, withSession, capabilities, notify: engineNotify, createGuard, log, perfNow, ...minRows });
     return finish({ state: 'verify_again', runId, result: r.state, reason: r.reason || null });
   }
   if (STOP_STATES.includes(st.state)) return finish({ state: 'stopped', reason: st.state });
@@ -196,10 +198,12 @@ export async function runNightly({ dataDir, client, checkInit, localInitFile, wi
   }
   const rd = await client.nightlyReadiness(ident);
   if (!rd.ready) return finish({ state: 'skipped', reason: 'not_ready', codes: rd.codes });
+  // 取り込む直前に Render の時計で窓をもう一度 (振り分け・readiness の間に 00:50 を過ぎた = 静かにしない。エンジンも照らす)
+  if (!startAllowed(POLICIES.nightly, 'import', nowMs())) return finish({ state: 'skipped', reason: 'window_closed' });
   if (!writeMarker({ kind: 'import', target_as_of: target, source_run_id: ident.source_run_id })) return finish({ state: 'already', reason: 'concurrent' });   // 同時の起動 = ほかが先に書いた = 取り込まない
   const r = await importOneFn({ policy: POLICIES.nightly, runsDir: path.join(dataDir, 'lz-import', 'runs'), csvBuf: t.csvBuf,
     csv: { sha256: ident.csv_sha256, rows: ident.rows, target_as_of: ident.target_as_of, source_run_id: ident.source_run_id },
-    context: { artifact }, now: new Date(nowMs()), localInitFile, client, checkInit, withSession, capabilities, notify: engineNotify, createGuard, log });
+    context: { artifact }, now: new Date(nowMs()), localInitFile, client, checkInit, withSession, capabilities, notify: engineNotify, createGuard, log, perfNow, ...minRows });
   return finish({ state: 'imported', runId: r.runId, result: r.state });
 }
 

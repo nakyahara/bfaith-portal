@@ -204,7 +204,7 @@ await ta('[6] 影の取込は実行ボタンを押さない (押すのは画面�
   for (const pc of ['minipc', 'streamdeck']) assert.ok(m.pcs[pc].includes('lz-import-screen.js'), pc);
 });
 
-await ta('[7] CLI: LZ_DAILY_IMPORT=on = 毎晩の本番 = 確かめの列の決まりが無いうち (2b-2a) は ❌ で何もしない (ファイル・ポータル・ロジザード・知らせ = 0・fail の ping は影の項目に 1 回)・送り先が無い = ❌・--force-window は影だけ・DATA_DIR が無い = ❌', async () => {
+await ta('[7] CLI: LZ_DAILY_IMPORT=on = 毎晩の本番 (2b-2b = 決まりがある) = ポータルに聞く (答えが壊れている = ❌・ファイル 0・GChat 0・ロジザード 0・fail の ping は毎晩の項目に 1 回)・送り先が無い = ❌・--force-window は影だけ・DATA_DIR が無い = ❌', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-cli-'));
   const cli = (env, args = ['--force-window']) => spawnSync(process.execPath, ['scripts/logizard-import/lz-daily-import.mjs', ...args], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, JOBS_MONITOR_TOKEN: '', ...env } });
   // 送った先を数える (ポータル・GChat・ping = fetch を全部ファイルに)
@@ -213,15 +213,15 @@ await ta('[7] CLI: LZ_DAILY_IMPORT=on = 毎晩の本番 = 確かめの列の決�
   fs.writeFileSync(spy, "import fs from 'node:fs';\nglobalThis.fetch = async (url) => { fs.appendFileSync(process.env.FETCH_LOG, String(url) + '\\n'); return new Response('{}', { status: 200 }); };\n");
   const { pathToFileURL } = await import('node:url');
   const spied = (env) => spawnSync(process.execPath, ['--import', pathToFileURL(spy).href, 'scripts/logizard-import/lz-daily-import.mjs'], { cwd: ROOT, encoding: 'utf8',
-    env: { ...process.env, FETCH_LOG: log, JOBS_MONITOR_TOKEN: 'dummy-token', JOBS_MONITOR_URL: 'https://jobs.example.test', LZ_LOCK_TOKEN: 'tok', LZ_IMPORT_STATE_URL: 'https://portal.example.test', ...env } });
+    env: { ...process.env, FETCH_LOG: log, JOBS_MONITOR_TOKEN: 'dummy-token', JOBS_MONITOR_URL: 'https://jobs.example.test', LZ_LOCK_TOKEN: 'tok', LZ_IMPORT_STATE_URL: 'https://portal.example.test',
+      LOGIZARD_AUTOMATION_DIR: path.join(ROOT, 'tools', 'logizard-automation'), ...env } });
   const fetched = () => { try { return fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean); } catch { return []; } };
   let c = spied({ DATA_DIR: tmp, LZ_DAILY_IMPORT: 'on', GCHAT_WEBHOOK_JOBS: 'https://chat.example.test/hook' });
   assert.equal(c.status, 1, c.stdout + c.stderr);
-  assert.match(c.stdout.trim().split('\n').pop(), /^❌ ロジザード毎日の商品マスタの取込 \(毎晩\): .*確かめの列の決まりがまだ無い.*何もしない/);
+  assert.match(c.stdout.trim().split('\n').pop(), /^❌ ロジザード毎日の商品マスタの取込 \(毎晩\): /);
   assert.deepEqual(fs.readdirSync(tmp), [], 'ファイルを作らない');
-  const f1 = fetched();
-  assert.equal(f1.length, 1, 'ポータル・GChat には行かない (ping の 1 回だけ): ' + f1.join(' '));
-  assert.match(f1[0], /^https:\/\/jobs\.example\.test\/apps\/jobs-monitor\/ping\/lz-daily-import-shadow\?status=fail&note=/, '早すぎる on = 影の項目に fail');
+  const f1 = fetched().map((u) => u.replace(/\?.*/, ''));
+  assert.deepEqual(f1, ['https://portal.example.test/apps/logizard-import-state/api/status', 'https://jobs.example.test/apps/jobs-monitor/ping/lz-daily-import'], 'ポータルに聞いて、壊れた答え = fail の ping を毎晩の項目に (GChat には行かない)');
   // 送り先 (GCHAT_WEBHOOK_JOBS) が無い = 決まりより先に ❌ (ログインの前)
   c = spied({ DATA_DIR: tmp, LZ_DAILY_IMPORT: 'on', GCHAT_WEBHOOK_JOBS: '' });
   assert.equal(c.status, 1);

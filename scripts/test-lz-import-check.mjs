@@ -305,5 +305,52 @@ await ta('[10] 試験の計画: 退避はバイトも (違うバイトが同じ�
   assert.notEqual(TP.buildTestPlan({ source, pre: renamed, tests: { normal: ['A-1', '__proto__'] } }).planSha256, p.planSha256);
 });
 
+await ta('[5b] 2b-2b の決まり RULES_2B2 (9/30 の実機): ふりがな → 検索名称・仕入単価は文字のまま・取り込んだ商品は import_stamp (登録日時は同じ・変更日時とインポート日時は同じ 14 桁で前より後) / decided: true / 毎晩の決まり = RULES_2B2', async () => {
+  assert.equal(V.RULES_NIGHTLY, V.RULES_2B2);
+  const C = V.compileRules(V.RULES_2B2);
+  assert.deepEqual([C.decided, C.version, C.targets.map((t) => t.mode).filter((m) => m === 'observe').length], [true, 'lzv-2b2', 0]);
+  assert.ok(Object.isFrozen(V.RULES_2B2) && Object.isFrozen(V.RULES_2B2.targets));
+  // 中の配列まで全部凍結 = 実行中に照らす列を書き換えられない (Codex #1556 R2 Medium)
+  const unfrozen = (x, at = '') => (x && typeof x === 'object' ? (Object.isFrozen(x) ? [] : [at || '(root)']).concat(...Object.entries(x).map(([k, v]) => unfrozen(v, `${at}.${k}`))) : []);
+  for (const [name, r] of [['RULES_2B1', V.RULES_2B1], ['RULES_2B2', V.RULES_2B2], ['RULES_NIGHTLY', V.RULES_NIGHTLY]]) assert.deepEqual(unfrozen(r), [], name);
+  assert.throws(() => { V.RULES_NIGHTLY.targets[2].lz[0] = '検索名称2'; }, TypeError);
+  assert.throws(() => { V.RULES_NIGHTLY.targets[2].lz.push('検索名称2'); }, TypeError);
+  assert.deepEqual([V.RULES_NIGHTLY.targets[2].lz, V.compileRules(V.RULES_NIGHTLY).decided], [['検索名称'], true]);
+  const R = V.RULES_2B2;
+  const table = [['A-1', '新しい名前', 'しんしい', '5200', '0007']];
+  const PRE = { 登録日時: '20260101000000', 変更日時: '20260929171153', インポート日時: '20260929171153' };
+  const OK = { 商品名: '新しい名前', 検索名称: 'しんしい', 仕入単価: '5200', 商品予備項目００３: '0007', 登録日時: '20260101000000', 変更日時: '20260930143813', インポート日時: '20260930143813' };
+  const pre = lz([lzRow('A-1', PRE), lzRow('B-2', PRE)]);
+  const W = { from: '20260930140000', to: '20260930150000' };   // 取込の時刻の窓 (押した時刻 − 余白 〜 結果の時刻 + 余白)
+  const run = (a1, b2 = PRE, w = W) => V.verifyImport({ table, pre, post: lz([lzRow('A-1', a1), lzRow('B-2', b2)]), rules: R, importWindow: w });
+  let r = run(OK);
+  assert.deepEqual([r.ok, r.decided, r.rules_version, r.diffs, r.observed.targets, r.observed.imported_system], [true, true, 'lzv-2b2', [], [], []]);
+  const kinds = (a1, b2, w) => run(a1, b2, w).diffs.map((d) => `${d.kind}:${d.col || d.why || ''}`);
+  assert.deepEqual(kinds({ ...OK, 検索名称: 'ちがう' }), ['target_mismatch:検索名称'], 'ふりがな = 検索名称');
+  assert.deepEqual(kinds({ ...OK, 検索名称2: 'しんしい' }), ['non_target_changed:検索名称2'], '検索名称2 は変わらない');
+  assert.deepEqual(kinds({ ...OK, 仕入単価: '5200.00' }), ['target_mismatch:仕入単価'], '仕入単価は文字のまま');
+  assert.deepEqual(kinds({ ...OK, 登録日時: '20260930143813' }), ['system_changed:登録日時'], '登録日時は変わらない');
+  assert.deepEqual(kinds({ ...OK, 変更日時: PRE.変更日時, インポート日時: PRE.インポート日時 }), ['import_stamp_bad:not_after_pre'], '時刻が進んでいない = 取り込まれていない');
+  assert.deepEqual(kinds({ ...OK, インポート日時: '20260930143814' }), ['import_stamp_bad:not_equal']);
+  assert.deepEqual(kinds({ ...OK, 変更日時: '2026/09/30 14:38', インポート日時: '2026/09/30 14:38' }), ['import_stamp_bad:not_14_digits']);
+  assert.deepEqual(kinds({ ...OK, 変更日時: '20260928000000', インポート日時: '20260928000000' }), ['import_stamp_bad:not_after_pre'], '前より前');
+  assert.deepEqual(kinds({ ...OK, 変更日時: '20260930143813', インポート日時: '20260929171153' }), ['import_stamp_bad:not_equal']);
+  // 取込の時刻の窓 (Codex #1556 R1 High): 窓の後 (別の操作で進んだ)・窓の前・実在しない日時・日付をまたぐ窓・窓が無い = 例外
+  assert.deepEqual(kinds({ ...OK, 変更日時: '20260930160000', インポート日時: '20260930160000' }), ['import_stamp_bad:outside_import_window'], '窓の後');
+  assert.deepEqual(kinds({ ...OK, 変更日時: '20260930133000', インポート日時: '20260930133000' }), ['import_stamp_bad:outside_import_window'], '窓の前 (前の値より後でも)');
+  assert.deepEqual(kinds({ ...OK, 変更日時: '20260931143813', インポート日時: '20260931143813' }), ['import_stamp_bad:not_real_datetime'], '9 月 31 日');
+  assert.deepEqual(kinds({ ...OK, 変更日時: '20260930250000', インポート日時: '20260930250000' }), ['import_stamp_bad:not_real_datetime'], '25 時');
+  assert.deepEqual(kinds({ ...OK, 変更日時: '20261001000130', インポート日時: '20261001000130' }, PRE, { from: '20260930235500', to: '20261001000500' }), [], '日付をまたぐ窓');
+  assert.throws(() => run(OK, PRE, null), /取込の時刻の窓/);
+  assert.throws(() => run(OK, PRE, { from: '20260930150000', to: '20260930140000' }), /取込の時刻の窓/);
+  assert.throws(() => run(OK, PRE, { from: '20260230140000', to: '20260930150000' }), /取込の時刻の窓/);
+  assert.deepEqual([V.isRealStamp('20240229000000'), V.isRealStamp('20230229000000'), V.jstStamp(Date.UTC(2026, 8, 30, 5, 38, 13))], [true, false, '20260930143813']);
+  // 取り込まなかった商品の時刻が変わった = 差 (今までどおり)
+  assert.deepEqual(kinds(OK, { ...PRE, インポート日時: '20260930143813' }), ['untouched_system_changed:インポート日時']);
+  // 前の値が空 (はじめての取込) = 14 桁ならよい
+  const pre0 = lz([lzRow('A-1', { ...PRE, 変更日時: '', インポート日時: '' })]);
+  assert.equal(V.verifyImport({ table, pre: pre0, post: lz([lzRow('A-1', OK)]), rules: R, importWindow: W }).ok, true);
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);

@@ -21,24 +21,63 @@ import iconv from 'iconv-lite';
 
 export const SYSTEM_COLS = Object.freeze(['登録日時', '変更日時', 'インポート日時']);
 
-/**
- * 毎晩の本番 (③c-1b-2b-2) の確かめの列の決まり。**実機の少数件の試験で決めてから入れる (2b-2b)**。
- * それまで null = エンジンが「決まりがまだ無い」で断る (ファイル・鍵・ログイン・知らせが全部ゼロ)。decided:true (observe の列がゼロ) だけ入れる
- */
-export const RULES_NIGHTLY = null;
 
-/** 2b-1 の決まり (実機の取込の前)。mode: key = 商品ID の文字の一致 / exact = CSV の文字のとおり / observe = 記録だけ (lz = 候補の列) */
+/** 2b-1 の決まり (実機の取込の前)。mode: key = 商品ID の文字の一致 / exact = CSV の文字のとおり / observe = 記録だけ (lz = 候補の列)
+ * 決まりは中の配列まで全部凍結する (実行中に列を書き換える裏口を作らない。Codex #1556 R2 Medium) */
 export const RULES_2B1 = Object.freeze({
   version: 'lzv-2b1-observe',
   targets: Object.freeze([
-    Object.freeze({ csv: '形式/型番', lz: ['商品ID'], mode: 'key' }),
-    Object.freeze({ csv: '商品名', lz: ['商品名'], mode: 'exact' }),
-    Object.freeze({ csv: 'ふりがな', lz: ['検索名称', '検索名称2'], mode: 'observe' }),   // どちらに入るかは実機で決める
-    Object.freeze({ csv: '仕入単価', lz: ['仕入単価'], mode: 'observe' }),                // 書き方 (1200 / 1200.00 など) は実機で決める
-    Object.freeze({ csv: '取引先id', lz: ['商品予備項目００３'], mode: 'exact' }),
+    Object.freeze({ csv: '形式/型番', lz: Object.freeze(['商品ID']), mode: 'key' }),
+    Object.freeze({ csv: '商品名', lz: Object.freeze(['商品名']), mode: 'exact' }),
+    Object.freeze({ csv: 'ふりがな', lz: Object.freeze(['検索名称', '検索名称2']), mode: 'observe' }),   // どちらに入るかは実機で決める
+    Object.freeze({ csv: '仕入単価', lz: Object.freeze(['仕入単価']), mode: 'observe' }),                // 書き方 (1200 / 1200.00 など) は実機で決める
+    Object.freeze({ csv: '取引先id', lz: Object.freeze(['商品予備項目００３']), mode: 'exact' }),
   ]),
   importedSystem: 'observe',   // 取り込んだ商品のシステムの列 (変わるのが正しいかは実機で決める)
 });
+
+/**
+ * 2b-2b の決まり = 2026-09-30 の実機の少数件の試験で決めた (AI_reference CompanyDB構想/10 §6.3「実機の少数件の試験の結果」):
+ *   ふりがな → **検索名称** (CSV の文字そのまま・検索名称2 は変わらない = 対象外の列として前後が同じ)・
+ *   仕入単価 = **文字のまま** (CSV の "5200" → ロジザードの "5200")・
+ *   取り込んだ商品のシステムの列 = **import_stamp** (登録日時は変わらない・変更日時とインポート日時は取込の時刻に変わる = 値が同じ商品も)。
+ *   import_stamp = 2 つが同じ・実在する JST の 14 桁・前の値より後・**取込の時刻の窓の中** (押した時刻 − 10 分 〜 結果を読んだ時刻 + 10 分。Codex #1556 R1 High)
+ * observe の列がゼロ = decided: true
+ */
+export const RULES_2B2 = Object.freeze({
+  version: 'lzv-2b2',
+  targets: Object.freeze([
+    Object.freeze({ csv: '形式/型番', lz: Object.freeze(['商品ID']), mode: 'key' }),
+    Object.freeze({ csv: '商品名', lz: Object.freeze(['商品名']), mode: 'exact' }),
+    Object.freeze({ csv: 'ふりがな', lz: Object.freeze(['検索名称']), mode: 'exact' }),
+    Object.freeze({ csv: '仕入単価', lz: Object.freeze(['仕入単価']), mode: 'exact' }),
+    Object.freeze({ csv: '取引先id', lz: Object.freeze(['商品予備項目００３']), mode: 'exact' }),
+  ]),
+  importedSystem: 'import_stamp',
+});
+
+/**
+ * 毎晩の本番 (③c-1b-2b-2) の確かめの列の決まり = RULES_2B2 (2b-2b で入れた)。
+ * decided:true (observe の列がゼロ) だけ入れる (エンジンが照らす)。毎晩の本番が動くのは、ポータルの旗 (LZ_MANUAL_V4) と miniPC の LZ_DAILY_IMPORT=on の後 (切替の PR)
+ */
+export const RULES_NIGHTLY = RULES_2B2;
+
+/** 取込の時刻の印 (ロジザードの 変更日時・インポート日時 = YYYYMMDDHHMMSS の 14 桁・JST。2026-09-30 の実機) */
+const STAMP_RE = /^\d{14}$/;
+/** 実在する JST の日時の 14 桁か (2030-02-30・25 時などは違う) */
+export function isRealStamp(s) {
+  if (!STAMP_RE.test(String(s))) return false;
+  const [y, mo, d, h, mi, se] = [0, 4, 6, 8, 10, 12].map((i, k) => Number(String(s).slice(i, k === 0 ? 4 : i + 2)));
+  const t = new Date(Date.UTC(y, mo - 1, d, h, mi, se));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d && t.getUTCHours() === h && t.getUTCMinutes() === mi && t.getUTCSeconds() === se;
+}
+/** epoch ms → JST の 14 桁 (ロジザードの印と同じ形) */
+export const jstStamp = (ms) => new Date(Number(ms) + 9 * 3600 * 1000).toISOString().replace(/[-:T]/g, '').slice(0, 14);
+/** 取込の時刻の窓の余白 (ロジザードの時計とこの回の時計のずれ・処理の長さ。狭すぎ = 誤って verify_failed (人が見る = 安全側)) */
+export const STAMP_TOLERANCE_MS = 10 * 60 * 1000;
+
+/** import_stamp で取込の時刻の印として照らす列 (登録日時は印ではない = 変わらない) */
+const STAMP_COLS = new Set(['変更日時', 'インポート日時']);
 
 const colIndex = (name) => {
   const i = LZ_SHOHIN.header.indexOf(name);
@@ -56,7 +95,7 @@ export function compileRules(rules) {
     if (!['exact', 'observe'].includes(t.mode)) throw new Error(`mode は exact / observe: ${t.csv}`);
     if (t.mode === 'exact' && t.lz.length !== 1) throw new Error(`exact は 1 列: ${t.csv}`);
   }
-  if (!['exact_unchanged', 'observe'].includes(rules.importedSystem)) throw new Error('importedSystem は exact_unchanged / observe');
+  if (!['exact_unchanged', 'observe', 'import_stamp'].includes(rules.importedSystem)) throw new Error('importedSystem は exact_unchanged / observe / import_stamp');
   const targets = rules.targets.map((t, i) => ({ ...t, csvIdx: i, lzIdx: t.lz.map(colIndex) }));
   const targetLz = new Set(targets.slice(1).flatMap((t) => t.lzIdx));
   const system = new Set(SYSTEM_COLS.map(colIndex));
@@ -74,8 +113,12 @@ export function compileRules(rules) {
  * @param {object} [p.rules]
  * @returns {{ ok: boolean, decided: boolean, rules_version: string, diffs: object[], observed: { targets: object[], imported_system: object[] }, counts: object }}
  */
-export function verifyImport({ table, pre, post, rules = RULES_2B1 }) {
+export function verifyImport({ table, pre, post, rules = RULES_2B1, importWindow = null }) {
   const R = compileRules(rules);
+  // import_stamp = 取込の時刻の窓が要る (押した時刻 − 余白 〜 結果の時刻 + 余白・JST の 14 桁。呼び手 = エンジンが記録から渡す。Codex #1556 R1 High)
+  if (R.importedSystem === 'import_stamp' && !(importWindow && isRealStamp(importWindow.from) && isRealStamp(importWindow.to) && importWindow.from <= importWindow.to)) {
+    throw new Error('import_stamp には取込の時刻の窓 (importWindow = { from, to } の JST 14 桁) が要る');
+  }
   if (!pre || !pre.ok || !post || !post.ok) throw new Error('直前と直後の一覧 (ok) が要る');
   const H = LZ_SHOHIN.header;
   const diffs = [], observed = { targets: [], imported_system: [] };
@@ -105,12 +148,21 @@ export function verifyImport({ table, pre, post, rules = RULES_2B1 }) {
     for (let col = 0; col < H.length; col++) {
       if (col === R.idIdx || R.targetLz.has(col)) continue;
       if (R.system.has(col)) {
+        if (R.importedSystem === 'import_stamp' && STAMP_COLS.has(H[col])) continue;   // 取込の時刻の印は下でまとめて照らす
         if (same(a, b, col)) continue;
         if (R.importedSystem === 'observe') observed.imported_system.push({ id, col: H[col], pre: a.cells[col], post: b.cells[col] });
         else diffs.push({ id, kind: 'system_changed', col: H[col], pre: a.cells[col], post: b.cells[col] });
         continue;
       }
       if (!same(a, b, col)) diffs.push({ id, kind: 'non_target_changed', col: H[col], pre: a.cells[col], post: b.cells[col] });
+    }
+    // import_stamp: 変更日時とインポート日時 = 同じ値の 14 桁で、どちらも前の値より後 (取り込まれた = 時刻が進む。進まない = 取り込まれていない行)
+    if (R.importedSystem === 'import_stamp') {
+      const u = b.cells[colIndex('変更日時')], im = b.cells[colIndex('インポート日時')];
+      const uPre = a.cells[colIndex('変更日時')], imPre = a.cells[colIndex('インポート日時')];
+      const why = !STAMP_RE.test(u) || !STAMP_RE.test(im) ? 'not_14_digits' : !isRealStamp(u) || !isRealStamp(im) ? 'not_real_datetime' : u !== im ? 'not_equal'
+        : !(u > uPre) || !(im > imPre) ? 'not_after_pre' : u < importWindow.from || u > importWindow.to ? 'outside_import_window' : null;
+      if (why) diffs.push({ id, kind: 'import_stamp_bad', why, pre: { 変更日時: uPre, インポート日時: imPre }, post: { 変更日時: u, インポート日時: im }, window: importWindow });
     }
   }
   let untouched = 0;
