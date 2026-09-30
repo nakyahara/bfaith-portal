@@ -186,11 +186,13 @@ export function inventorySnapshotDigest(entries) {
 }
 
 /**
- * 一覧の回を記録する (見出し + 行を 1 つの取引で)。返り値 = 回の id。
- * listing = listInventoryReports の返り値 (失敗なら null)・listError = 失敗の文言
+ * 一覧の回を記録する (見出し + 行を 1 つの取引で)。返り値 = 回の id。completed_at は入れない (recordInventorySnapshot が入れる)。
+ * listing = listInventoryReports の返り値 (失敗なら null)・listError = 失敗の文言・ingestError = 取込の例外・
+ * recordError = 記録の失敗 (これを渡したときは行を書かない = 見出しだけの「記録できなかった回」)
  */
-export function recordInventoryRun(db, { reportType, marketplaceId, window, startedAt, listCompletedAt, listing, listError, ingestRunId }) {
-  const { entries, missingId } = listing ? inventoryEntries(listing.reports, reportType) : { entries: [], missingId: 0 };
+export function recordInventoryRun(db, { reportType, marketplaceId, window, startedAt, listCompletedAt, listing, listError, ingestRunId, ingestError = null, recordError = null }) {
+  const headerOnly = recordError != null;
+  const { entries, missingId } = listing && !headerOnly ? inventoryEntries(listing.reports, reportType) : { entries: [], missingId: 0 };
   const errors = [];
   if (listError) errors.push(listError);
   if (missingId) errors.push(`reportId の無い report ${missingId} 件`);
@@ -198,11 +200,11 @@ export function recordInventoryRun(db, { reportType, marketplaceId, window, star
   const insertRun = db.prepare(`INSERT INTO amazon_settlement_report_inventory_runs (
       company_id, mall, scope_key, report_type, marketplace_id, query_created_since, query_created_until,
       started_at, list_completed_at, completed_at, last_page_reached, page_count, report_count,
-      snapshot_digest, list_error, evidence_epoch, coverage_generation, run_token, inventory_run_seq, ingest_run_id
+      snapshot_digest, list_error, ingest_error, record_error, evidence_epoch, coverage_generation, run_token, inventory_run_seq, ingest_run_id
     ) VALUES (
       @company_id, @mall, @scope_key, @report_type, @marketplace_id, @query_created_since, @query_created_until,
       @started_at, @list_completed_at, NULL, @last_page_reached, @page_count, @report_count,
-      @snapshot_digest, @list_error, NULL, NULL, NULL, @inventory_run_seq, @ingest_run_id
+      @snapshot_digest, @list_error, @ingest_error, @record_error, NULL, NULL, NULL, @inventory_run_seq, @ingest_run_id
     )`);
   const insertRow = db.prepare(`INSERT INTO amazon_settlement_report_inventory (
       inventory_run_id, report_id, report_type, processing_status, created_time,
@@ -223,11 +225,13 @@ export function recordInventoryRun(db, { reportType, marketplaceId, window, star
       query_created_until: window.createdUntil,
       started_at: toUtcSeconds(startedAt),
       list_completed_at: listCompletedAt ? toUtcSeconds(listCompletedAt) : null,
-      last_page_reached: listing && !listError && listing.lastPageReached ? 1 : 0,
+      last_page_reached: listing && !listError && !headerOnly && listing.lastPageReached ? 1 : 0,
       page_count: listing ? listing.pages : 0,
       report_count: entries.length,
-      snapshot_digest: listing ? inventorySnapshotDigest(entries) : null,
+      snapshot_digest: listing && !headerOnly ? inventorySnapshotDigest(entries) : null,
       list_error: errors.length ? errors.join(' / ') : null,
+      ingest_error: ingestError,
+      record_error: recordError,
       inventory_run_seq: seq,
       ingest_run_id: ingestRunId,
     }).lastInsertRowid);
@@ -263,4 +267,30 @@ export function recordImportResult(db, inventoryRunId, reportId, result, extra =
 /** 回の完了 (取込の繰り返しが最後まで回った)。途中で落ちた回は completed_at が null のまま = 完了していない回 */
 export function finishInventoryRun(db, inventoryRunId, completedAt) {
   db.prepare(`UPDATE amazon_settlement_report_inventory_runs SET completed_at = ? WHERE id = ?`).run(toUtcSeconds(completedAt), inventoryRunId);
+}
+
+/**
+ * 取込のループが終わった後に、一覧の回・行・取込の結果・完了を **1 つの取引** で書く (Codex #1555 R2)。
+ *   results = Map<report_id, { result, extra }> (取込のループがメモリに持った結果・同じ report は最後の結果)
+ *   completedAt = 取込が最後まで回ったときだけ (例外で止まった回は null + ingestError)
+ * 🚨 どこかで失敗したら取引ごと戻し、見出しだけを record_error つき・completed_at null で書き直す
+ *   (= 「成功した回」に見せない)。その書き直しも失敗したら何も残らない (= coverage は使えない = 安全側)。
+ * 返り値 = { id, recordError }
+ */
+export function recordInventorySnapshot(db, params, results, completedAt) {
+  const txn = db.transaction(() => {
+    const id = recordInventoryRun(db, params);
+    for (const [reportId, r] of results) recordImportResult(db, id, reportId, r.result, r.extra);
+    if (completedAt && !params.ingestError) finishInventoryRun(db, id, completedAt);
+    return id;
+  });
+  try {
+    return { id: txn(), recordError: null };
+  } catch (e) {
+    const recordError = `一覧を記録できない: ${e?.message || e}`;
+    let id = null;
+    try { id = recordInventoryRun(db, { ...params, recordError }); }
+    catch (e2) { return { id: null, recordError: `${recordError} / 見出しも書けない: ${e2?.message || e2}` }; }
+    return { id, recordError };
+  }
 }

@@ -472,6 +472,9 @@ async function main() {
   // 決済の行の重複除去 (出現順つき) テスト (2026-09-28。同じ鍵の本物の別々の行を潰していた = 2 週間ごとに 55〜65 万円の数え落とし。4 か所を一時DBで検証)
   const settleOccTestResult = runScript('apps/warehouse/test-settlement-dedup-occurrence.js', 'Settlement 重複除去テスト', 300000);
   results.push({ name: 'Settlement 重複除去テスト', ...settleOccTestResult });
+  // 決済のレポートの一覧 (inventory) の記録のテスト (2026-09-30・D7b-1b の下ごしらえ。取込の後に一覧を記録・取込む行は変えない。一時DB・SP-API は差し替え)
+  const settleInvTestResult = runScript('apps/warehouse/test-settlement-inventory.js', 'Settlement 一覧テスト', 120000);
+  results.push({ name: 'Settlement 一覧テスト', ...settleInvTestResult });
   // 日次の財務を作り直す月の決め方のテスト (2026-09-28。当月 + 直近 35 日に決済の行が入った月 = 5 月が半分欠けた再発防止。一時DB)
   const financeMonthsTestResult = runScript('apps/warehouse/test-amazon-finance-months.js', 'Amazon finance 作り直す月テスト', 120000);
   results.push({ name: 'Amazon finance 作り直す月テスト', ...financeMonthsTestResult });

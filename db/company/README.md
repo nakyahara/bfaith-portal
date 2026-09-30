@@ -805,11 +805,13 @@ commit;
 ### 決済のレポートの一覧 (miniPC の SQLite・D7b-1b の下ごしらえ・Company DB構想 13 §3.1 / D-65)
 
 - 書き手 = `apps/warehouse/fetch-amazon-settlements.js` (部品 `apps/warehouse/amazon-settlement-inventory.js`)。表 = warehouse.db の `amazon_settlement_report_inventory_runs` (回) / `amazon_settlement_report_inventory` (report ごと)。**今は記録だけ** (読み手 = 後の coverage)。取込む行には関わらない
-- 取込の一覧の要求 (日時の境なし) を先に確定し、その後に別の getReports で一覧を取る (窓 = `createdUntil` = 回の開始の時刻・`createdSince` = その 85 日前・時間の上限 120 秒)。最後のページまで取れない・応答の形が違う・時間切れ = `last_page_reached = 0` / `list_error` (取込は続ける)
+- 呼ぶ順 = 取込の一覧の要求 (日時の境なし・今と同じ) → 取込のダウンロードのループ (結果は report ごとにメモリ) → **ループが全部終わった後** に別の getReports で一覧を取る (窓 = `createdUntil` = 回の開始の時刻・`createdSince` = その 85 日前・時間の上限 120 秒) → 一覧の行・取込の結果・完了を **1 つの取引** で書く。最後のページまで取れない・応答の形が違う・時間切れ = `last_page_reached = 0` / `list_error` (取込の結果・終了コードは変わらない)
+- 🚨 **途中で落ちた回**: 取込が例外で止まった回は一覧を記録するが `completed_at` は null・`ingest_error` に理由。**daily-sync の時間切れなどで kill された回は一覧の記録が無い** = その回は coverage の証拠に使えない (安全側・次の回で取り直す)
+- 🚨 **記録の失敗**: 一覧の行・取込の結果のどこかを書けなければ取引ごと戻し、見出しだけを `record_error` つき・`completed_at` null で書く (行は無い = 「成功した回」に見せない)。見出しも書けなければ回は残らない
 - 回の所属 = `company_id` / `mall` / `scope_key` (今は 1 / `amazon` / `jp` 固定)
 - 🚨 **`evidence_epoch` の規則**: 初期の印 (D-65 = Seller Central の決済の一覧を書き出した印) を作るたびに採番し、その後の回に入れる。**`evidence_epoch` が null の回はどの印の鎖にも属さない = 期待の report の集合の積み上げに使わない** (今の回は全部 null)。印を作り直したら、積み上げは新しい epoch の回だけ
-- 回の完了 = `completed_at` がある・`last_page_reached = 1`・`list_error` が null。これを満たさない回は後の coverage で「失敗した回」として扱う
-- 試験 = `node apps/warehouse/test-settlement-inventory.js` (一時 DB・SP-API は差し替え)
+- 回の完了 = `completed_at` がある・`last_page_reached = 1`・`list_error` / `ingest_error` / `record_error` が null。これを満たさない回は後の coverage で「失敗した回」として扱う
+- 試験 = `node apps/warehouse/test-settlement-inventory.js` (一時 DB・SP-API は差し替え・daily-sync の冒頭でも「Settlement 一覧テスト」として走る)
 
 ## 受注・出荷の受け皿 (0013。08 §4.1〜4.3 / §4.7。D4)
 

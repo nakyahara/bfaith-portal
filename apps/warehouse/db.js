@@ -1507,12 +1507,14 @@ function createTables() {
     query_created_until TEXT NOT NULL,             -- 最初の要求で明示した createdUntil (= 回の開始の時刻)
     started_at          TEXT NOT NULL,
     list_completed_at   TEXT,                      -- 一覧を読み終えた時刻 (一覧の要求が失敗したら null)
-    completed_at        TEXT,                      -- 取込の繰り返しが最後まで回った時刻 (途中で落ちたら null)
+    completed_at        TEXT,                      -- 取込の繰り返しが最後まで回り、一覧と結果を全部書けた時刻 (途中で落ちた・書けなかったら null)
     last_page_reached   INTEGER NOT NULL CHECK (last_page_reached IN (0, 1)),   -- 0 = nextToken が残ったまま上限のページで打ち切った / 一覧の失敗
     page_count          INTEGER NOT NULL,
     report_count        INTEGER NOT NULL,
     snapshot_digest     TEXT,                      -- 行の {report_id, processing_status, created_time, data_start_time, data_end_time, report_document_id} を report ID の UTF-8 の順の正規の JSON の SHA-256
     list_error          TEXT,
+    ingest_error        TEXT,                      -- 取込のループが例外で止まった (completed_at は null)
+    record_error        TEXT,                      -- 一覧・取込の結果を書けなかった (行は無く見出しだけ・completed_at は null)
     evidence_epoch      INTEGER,                   -- 初期の印 (D-65) を作るたびに採番。null = どの印の鎖にも属さない (今の回は全部 null・積み上げに使わない)
     coverage_generation INTEGER,                   -- 後の coordinator が入れる (今は null)
     run_token           TEXT,                      -- 後の coordinator が入れる (今は null)

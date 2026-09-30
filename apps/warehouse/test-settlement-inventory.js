@@ -83,9 +83,12 @@ const R = {
  */
 // opts: failInventory = 一覧の要求が失敗 / hangInventory = 一覧の要求が返らない (長い retry) / invalidInventory = 一覧のページの応答 (そのまま返す)
 //       tokens = getReports の共有のレートの枠 (無くなると QuotaExceeded) / clock = { ms, stepMs } = 呼ぶたびに時計が進む (page 関数に呼んだ時刻を渡す)
+// events = 呼んだ順の記録 (list:ing = 取込の一覧 / list:inv = 一覧の記録 / next:* = 2 ページ目から / dl:文書 = ダウンロード)
+const events = [];
 function fakeSp(pages, { failInventory = false, hangInventory = false, invalidInventory, tokens = Infinity, clock = null, reportById = {} } = {}) {
   const calls = [];
   let left = tokens;
+  events.length = 0;
   const page = (kind, idx, at) => {
     const src = pages[kind];
     const p = typeof src === 'function' ? src(idx, at) : src[idx];
@@ -95,6 +98,10 @@ function fakeSp(pages, { failInventory = false, hangInventory = false, invalidIn
     calls,
     async callAPI(req) {
       calls.push(JSON.parse(JSON.stringify(req)));
+      if (req.operation === 'getReports') {
+        const q = req.query;
+        events.push(q.nextToken ? `next:${q.nextToken.split(':')[0]}` : q.createdSince ? 'list:inv' : 'list:ing');
+      } else events.push(req.operation);
       const at = clock ? clock.ms : null;
       if (clock) clock.ms += clock.stepMs;
       if (req.operation === 'getReports') {
@@ -116,6 +123,7 @@ function fakeSp(pages, { failInventory = false, hangInventory = false, invalidIn
 const downloaded = [];
 const fakeDownload = (throwFor = null) => async (docId) => {
   downloaded.push(docId);
+  events.push(`dl:${docId}`);
   if (docId === throwFor) throw new Error(`ダウンロードの失敗 (作り物) ${docId}`);
   if (!Object.hasOwn(DOCS, docId)) throw new Error(`文書が無い ${docId}`);
   return DOCS[docId];
@@ -161,6 +169,8 @@ eq(reportsCalls[1].query, { reportTypes: [V2T], marketplaceIds: [MKT], pageSize:
 eq(reportsCalls[2].query, { nextToken: 'inv:1' }, '一覧の 2 ページ目は nextToken だけ (窓を付け直さない)');
 ok(reportsCalls.length === 3, `getReports は取込 1 + 一覧 2 = 3 回 (${reportsCalls.length})`);
 ok(sp.calls.findIndex((c) => c.operation === 'getReports' && c.query.createdSince) > sp.calls.findIndex((c) => c.operation === 'getReports' && !c.query.createdSince && !c.query.nextToken), '一覧の記録の要求は取込の一覧の要求より後');
+const lastDl = (ev) => ev.reduce((m, e, i) => (e.startsWith('dl:') ? i : m), -1);
+eq(events, ['list:ing', 'dl:D-IMP', 'dl:D-V1', 'dl:D-BAD', 'dl:D-ONLYING', 'list:inv', 'next:inv'], '🚨 呼ぶ順 = 取込の一覧 → ダウンロード全部 → 一覧の記録 (Codex #1555 R2 High)');
 
 let [run1] = runs();
 ok(run1 && run1.report_type === V2T && run1.marketplace_id === MKT, '回の見出し: report type・marketplace');
@@ -233,7 +243,8 @@ sp = fakeSp(PAGES_NORMAL);
 res = await captured(() => runSettlementFetch(ARGS, { db, sp, runId: 'run-6', downloadTsv: fakeDownload('D-V1'), now: nowFn }));
 const run6 = runs().at(-1);
 ok(res.error && /ダウンロードの失敗/.test(res.error.message), '例外は今までどおり投げる (FATAL・終了コード 1)');
-ok(run6.completed_at === null && run6.last_page_reached === 1, '途中で落ちた回は completed_at が null (一覧は最後まで取れている)');
+ok(run6.completed_at === null && run6.last_page_reached === 1 && /ダウンロードの失敗/.test(run6.ingest_error || ''), `例外で止まった回も一覧は記録する = completed_at null・ingest_error (${run6.ingest_error})`);
+ok(events.at(-2) === 'list:inv' && events.indexOf('list:inv') > lastDl(events), '例外で止まった回も、一覧の記録の要求は取込のループの後');
 const r6 = rowOf(run6.id, 'R-V1');
 ok(r6.import_result === 'failed' && /^例外: /.test(r6.import_note) && r6.imported_report_document_id === 'D-V1', `落ちた report = failed + 理由 (${r6.import_note})`);
 ok(rowOf(run6.id, 'R-IMP').import_result === 'imported' && rowOf(run6.id, 'R-BAD').import_result === 'not_processed', '落ちる前の report は結果あり・後の report は not_processed');
@@ -268,6 +279,29 @@ const t0 = Date.now();
 const hang = await ingestOutcome({ hangInventory: true }, 'run-h-hang', { inventoryTimeoutMs: 50 });
 ok(!hang.out.error && JSON.stringify(hang.downloads) === JSON.stringify(base.downloads) && JSON.stringify(hang.blocked) === JSON.stringify(base.blocked) && Date.now() - t0 < 10000, '🚨 一覧の要求が返らなくても時間の上限で打ち切り、取込の結果は同じ');
 ok(hang.run.last_page_reached === 0 && /時間切れ/.test(hang.run.list_error) && hang.run.completed_at !== null, `時間切れの一覧は失敗として残す (${hang.run.list_error})`);
+ok(events.indexOf('list:inv') > lastDl(events) && lastDl(events) === 4, '🚨 一覧の要求が返らなくても、取込のダウンロードは全部その前に済んでいる');
+
+// ════ M (R2). 記録の失敗 = completed_at を入れない・record_error・取込の結果は同じ ════
+const recFail = async (triggerSql, runId) => {
+  db.exec(triggerSql);
+  try {
+    const before = rawCounts();
+    const o = await ingestOutcome({}, runId);
+    return { ...o, before, after: rawCounts() };
+  } finally { db.exec(`DROP TRIGGER IF EXISTS trg_test_inventory_fail`); }
+};
+const rf1 = await recFail(`CREATE TRIGGER trg_test_inventory_fail BEFORE INSERT ON amazon_settlement_report_inventory WHEN NEW.report_id = 'R-BAD' BEGIN SELECT RAISE(ABORT, 'わざとの一覧の行の INSERT の失敗'); END`, 'run-rf-ins');
+ok(!rf1.out.error && rf1.run.ingest_run_id === 'run-rf-ins' && rf1.run.completed_at === null && /INSERT の失敗/.test(rf1.run.record_error || '') && rf1.run.report_count === 0 && rf1.run.last_page_reached === 0 && rows(rf1.run.id).length === 0,
+  `一覧の行の INSERT の失敗 = 見出しだけ・completed_at null・record_error (${rf1.run.record_error})`);
+ok(JSON.stringify(rf1.downloads) === JSON.stringify(base.downloads) && JSON.stringify(rf1.blocked) === JSON.stringify(base.blocked) && JSON.stringify(rf1.after) === JSON.stringify(rf1.before) && /⚠️ 決済の一覧を記録できなかった/.test(rf1.out.logs.find((l) => l.includes('[settlements] 完了')) || ''),
+  '記録の失敗でも取込の結果・生の行は同じ (⚠️ だけ)');
+const rf2 = await recFail(`CREATE TRIGGER trg_test_inventory_fail BEFORE UPDATE ON amazon_settlement_report_inventory WHEN NEW.import_result = 'skipped_v1' BEGIN SELECT RAISE(ABORT, 'わざとの取込の結果の UPDATE の失敗'); END`, 'run-rf-upd');
+ok(!rf2.out.error && rf2.run.ingest_run_id === 'run-rf-upd' && rf2.run.completed_at === null && /UPDATE の失敗/.test(rf2.run.record_error || '') && rows(rf2.run.id).length === 0 && JSON.stringify(rf2.after) === JSON.stringify(rf2.before),
+  `取込の結果の UPDATE の失敗 = 取引ごと戻して見出しだけ・completed_at null・record_error (${rf2.run.record_error})`);
+const runsBefore = runs().length;
+const rf3 = await recFail(`CREATE TRIGGER trg_test_inventory_fail BEFORE INSERT ON amazon_settlement_report_inventory_runs BEGIN SELECT RAISE(ABORT, 'わざとの見出しの失敗'); END`, 'run-rf-hdr');
+ok(!rf3.out.error && runs().length === runsBefore && rf3.out.value?.inventory?.id === null && /見出しも書けない/.test(rf3.out.value?.inventory?.recordError || '') && JSON.stringify(rf3.downloads) === JSON.stringify(base.downloads),
+  '見出しも書けない = 回は残らない (coverage に使えない = 安全側)・取込は同じ');
 
 // ════ M1. 不正なページの応答を「最後まで取れた空のページ」にしない ════
 for (const [bad, label] of [[null, 'null'], [{ reports: 'x' }, 'reports が文字'], [{}, 'reports が無い'], [{ reports: [], nextToken: 5 }, 'nextToken が数']]) {
