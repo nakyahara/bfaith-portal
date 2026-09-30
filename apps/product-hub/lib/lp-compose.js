@@ -73,6 +73,31 @@ const trim = (v, max) => {
   return max && s.length > max ? s.slice(0, max) : s;
 };
 
+/** 正の安全な整数か (SQLite の非 STRICT 表は文字列も入るので、入口で正規化する。コード R1 #4) */
+const posInt = (v) => {
+  const n = typeof v === 'number' ? v : Number.parseInt(String(v ?? ''), 10);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+};
+
+/**
+ * 実行役から来た JSON を保存できる形にする。
+ * 直列化できない・大きすぎるなら `false` を返す (呼び手が bad_request にする)。
+ * 壊れた実行役が DB を肥らせたり、例外を API まで漏らしたりしないための入口検査 (コード R1 #5)。
+ */
+function jsonOrNull(v, max) {
+  if (v == null) return null;
+  let s;
+  try { s = JSON.stringify(v); } catch { return false; }
+  if (typeof s !== 'string') return false;
+  return s.length > max ? false : s;
+}
+
+/** SQLite の一意制約違反か (better-sqlite3 は code に SQLITE_CONSTRAINT_* を入れる) */
+const isUniqueViolation = (e) => String(e?.code || '').startsWith('SQLITE_CONSTRAINT');
+
+export const LINT_MAX = 100_000;
+export const RECEIPT_IMAGES_MAX = MAX_IMAGES;
+
 // ─── 仕様書のスナップショット ────────────────────────────────
 
 /**
@@ -95,8 +120,17 @@ export function importSpec(db, { kind, title, body, sheetTitles = [], actor } = 
   return db.transaction(() => {
     const hit = db.prepare('SELECT * FROM ph_lp_specs WHERE kind = ? AND hash = ?').get(k, hash);
     if (hit) return { ok: true, spec: hit, created: false };
-    const id = Number(db.prepare(`INSERT INTO ph_lp_specs (kind, title, body, hash, sheet_titles_json, imported_by)
-      VALUES (?, ?, ?, ?, ?, ?)`).run(k, t, b, hash, JSON.stringify(titles), a).lastInsertRowid);
+    let id;
+    try {
+      id = Number(db.prepare(`INSERT INTO ph_lp_specs (kind, title, body, hash, sheet_titles_json, imported_by)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(k, t, b, hash, JSON.stringify(titles), a).lastInsertRowid);
+    } catch (e) {
+      // 同時に同じ中身を上げた = 相手の行を返す (SELECT→INSERT の競合。コード R1 #3)
+      if (!isUniqueViolation(e)) throw e;
+      const raced = db.prepare('SELECT * FROM ph_lp_specs WHERE kind = ? AND hash = ?').get(k, hash);
+      if (raced) return { ok: true, spec: raced, created: false };
+      throw e;
+    }
     return { ok: true, spec: db.prepare('SELECT * FROM ph_lp_specs WHERE id = ?').get(id), created: true };
   })();
 }
@@ -165,22 +199,44 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
   if (!key) return { code: 'bad_request', error: 'idempotency_key が要ります' };
   const blocked = requestBlockReason({ draft, productInfo, spec });
   if (blocked) return { code: 'not_ready', error: blocked };
+  // 🚨 ID は入口で正規化して、packet・検索・INSERT・ログで同じ値だけを使う。
+  //    SQLite の非 STRICT 表は文字列も受けるので、検証しないと packet と行で ID が食い違う (コード R1 #4)
+  const draftId = posInt(draft?.id);
+  const specId = posInt(spec?.id);
+  if (!draftId || !specId) return { code: 'bad_request', error: '商品または仕様書の ID が不正です' };
   const a = trim(actor, 120) || 'unknown';
   const nowS = new Date(now).toISOString();
   const deadline = new Date(now + MEASUREMENT_WINDOW_MIN * 60_000).toISOString();
-  const { packet, hash } = buildPacket({ draft, productInfo, colorVariations, images, spec });
   return db.transaction(() => {
+    // 渡された spec を信じず、DB から引き直して種類と hash を照合する (コード R1 #4)
+    const specRow = db.prepare('SELECT * FROM ph_lp_specs WHERE id = ?').get(specId);
+    if (!specRow || specRow.kind !== 'product_analysis' || (spec.hash && specRow.hash !== spec.hash)) {
+      return { code: 'bad_request', error: '仕様書の版が見つかりません (取り込み直してください)' };
+    }
+    const { packet, hash } = buildPacket({ draft: { ...draft, id: draftId }, productInfo, colorVariations, images, spec: specRow });
     recoverExpired(db, now);
-    const hit = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draft.id, key);
+    const hit = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draftId, key);
     if (hit) return { ok: true, job: hit, created: false };
-    const live = db.prepare(`SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND status IN ('queued','running')`).get(draft.id);
+    const live = db.prepare(`SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND status IN ('queued','running')`).get(draftId);
     if (live) return { code: 'already_running', error: 'この商品の構成をいま作っています', job: live };
-    const id = Number(db.prepare(`INSERT INTO ph_lp_compose_jobs
-      (draft_id, idempotency_key, status, packet_json, packet_hash, packet_version, spec_id, spec_hash,
-       requested_by, measurement_deadline_at, created_at, updated_at)
-      VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(draft.id, key, JSON.stringify(packet), hash, PACKET_VERSION, spec.id, spec.hash, a, deadline, nowS, nowS).lastInsertRowid);
-    logEvent(db, draft.id, 'lp_compose_requested', `依頼 ${id} (仕様書 v${spec.id})`, a);
+    let id;
+    try {
+      id = Number(db.prepare(`INSERT INTO ph_lp_compose_jobs
+        (draft_id, idempotency_key, status, packet_json, packet_hash, packet_version, spec_id, spec_hash,
+         requested_by, measurement_deadline_at, created_at, updated_at)
+        VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(draftId, key, JSON.stringify(packet), hash, PACKET_VERSION, specId, specRow.hash, a, deadline, nowS, nowS).lastInsertRowid);
+    } catch (e) {
+      // SELECT と INSERT の間に別の接続が入った (二重クリック・リトライ)。
+      // 例外にせず、相手が作った行 / 動いている依頼を返す (コード R1 #3)
+      if (!isUniqueViolation(e)) throw e;
+      const raced = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draftId, key);
+      if (raced) return { ok: true, job: raced, created: false };
+      const racedLive = db.prepare(`SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND status IN ('queued','running')`).get(draftId);
+      if (racedLive) return { code: 'already_running', error: 'この商品の構成をいま作っています', job: racedLive };
+      throw e;
+    }
+    logEvent(db, draftId, 'lp_compose_requested', `依頼 ${id} (仕様書 v${specId})`, a);
     return { ok: true, job: db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE id = ?').get(id), created: true };
   })();
 }
@@ -190,34 +246,51 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
 const jobById = (db, id) => db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE id = ?').get(Number(id)) || null;
 const genOf = (db, jobId) => db.prepare(`SELECT * FROM ph_lp_compose_generations WHERE job_id = ? AND status = 'reserved'`).get(Number(jobId)) || null;
 
-/** 終端に落とす (completed_at を必ず入れる = 設計 §7.1b・Codex R4 #2) */
+/**
+ * lease 切れの job を終端に落とす (completed_at を必ず入れる = 設計 §7.1b・Codex R4 #2)。
+ * 🚨 **`status='running' かつ lease_until < now` を UPDATE の条件に入れる** — これが無いと、
+ *    SELECT と UPDATE の間に実行役が結果を出して done になった job を、後から needs_review /
+ *    failed で塗り潰してしまう (`output_text` は残ったまま status だけ変わる。コード R1 #1 critical)。
+ */
+function expireJob(db, jobId, status, { code, message, nowS }) {
+  return db.prepare(`UPDATE ph_lp_compose_jobs
+    SET status = ?, error_code = ?, error = ?, lease_token = NULL, lease_until = NULL,
+        updated_at = ?, completed_at = COALESCE(completed_at, ?)
+    WHERE id = ? AND status = 'running' AND lease_until < ?`)
+    .run(status, code, message, nowS, nowS, Number(jobId), nowS).changes;
+}
+
+/** 終端に落とす (lease が有効な job を、その lease の持ち主が終わらせるとき) */
 function finishJob(db, jobId, status, { code = null, message = null, nowS }) {
   return db.prepare(`UPDATE ph_lp_compose_jobs
     SET status = ?, error_code = ?, error = ?, lease_token = NULL, lease_until = NULL,
         updated_at = ?, completed_at = COALESCE(completed_at, ?)
-    WHERE id = ?`).run(status, code, message, nowS, nowS, Number(jobId)).changes;
+    WHERE id = ? AND status = 'running'`)
+    .run(status, code, message, nowS, nowS, Number(jobId)).changes;
 }
 
 /**
  * lease が切れた job を倒す。
  * **予約済みなら needs_review** (AI を呼んだ後に結果を持ち帰れなかった = 成否不明)。
  * 段階1 は人がボタンを押して画面を見ているので、**自動で作り直さない**。
+ *
+ * 🚨 全体を 1 トランザクションにする。`jobStateFor` (画面のポーリング) からも呼ばれるので、
+ *    ここが裸だと 5 秒ごとの読み取りが書き込みと競合する (コード R1 #1)。
  */
 export function recoverExpired(db, now = Date.now()) {
   const nowS = new Date(now).toISOString();
-  let n = 0;
-  for (const job of db.prepare(`SELECT * FROM ph_lp_compose_jobs WHERE status = 'running' AND lease_until < ?`).all(nowS)) {
-    const gen = genOf(db, job.id);
-    if (gen) {
-      n += finishJob(db, job.id, 'needs_review', {
-        code: 'lease_expired_after_reserve',
-        message: '予約後に結果が届かないまま期限が切れた (成否不明・自動では作り直さない)', nowS,
-      });
-    } else {
-      n += finishJob(db, job.id, 'failed', { code: 'lease_expired', message: '実行役の期限が切れた', nowS });
+  return db.transaction(() => {
+    let n = 0;
+    for (const job of db.prepare(`SELECT id FROM ph_lp_compose_jobs WHERE status = 'running' AND lease_until < ?`).all(nowS)) {
+      n += genOf(db, job.id)
+        ? expireJob(db, job.id, 'needs_review', {
+          code: 'lease_expired_after_reserve',
+          message: '予約後に結果が届かないまま期限が切れた (成否不明・自動では作り直さない)', nowS,
+        })
+        : expireJob(db, job.id, 'failed', { code: 'lease_expired', message: '実行役の期限が切れた', nowS });
     }
-  }
-  return n;
+    return n;
+  })();
 }
 
 /** キューの要約 (実行役の「仕事なし」判定・監視用) */
@@ -253,10 +326,13 @@ export function claimJob(db, { runnerRunId, now = Date.now() } = {}) {
       if (!job) return { ok: true, job: null };
       const spec = db.prepare('SELECT * FROM ph_lp_specs WHERE id = ?').get(job.spec_id);
       if (!spec || spec.hash !== job.spec_hash) {
-        finishJob(db, job.id, 'failed', {
-          code: 'spec_changed',
-          message: '受付時の仕様書の版が見つからない (取り込み直してからもう一度依頼してください)', nowS,
-        });
+        // まだ queued なので status の条件は 'queued'。running を条件にすると 1 行も動かず、
+        // 同じ job を掴み続けて claim が空回りする
+        db.prepare(`UPDATE ph_lp_compose_jobs
+          SET status = 'failed', error_code = 'spec_changed', error = ?,
+              updated_at = ?, completed_at = COALESCE(completed_at, ?)
+          WHERE id = ? AND status = 'queued'`)
+          .run('受付時の仕様書の版が見つからない (取り込み直してからもう一度依頼してください)', nowS, nowS, job.id);
         continue;
       }
       const token = randomBytes(16).toString('hex');
@@ -299,7 +375,12 @@ function liveLease(db, jobId, leaseToken, nowS) {
 export function reserveGeneration(db, jobId, { leaseToken, model, promptVersion, now = Date.now() } = {}) {
   if (!lpComposeEnabled()) return { code: 'disabled', error: 'PH_LP_COMPOSE_ENABLED が無効です' };
   const m = trim(model, 80), pv = trim(promptVersion, 80);
-  if (!m || !pv) return { code: 'bad_request', error: 'model と prompt_version が要ります' };
+  if (!m) return { code: 'bad_request', error: 'model が要ります' };
+  // 🚨 段階1 は 1 つの prompt を測るのが目的。実行役が旧版や打ち間違いを送ってきたら、
+  //    AI 枠を使う前に断る (通すと「別の条件で作ったもの」が測定結果に混ざる。コード R1 #6)
+  if (pv !== PROMPT_VERSION) {
+    return { code: 'bad_prompt_version', error: `prompt_version は ${PROMPT_VERSION} です (実行役が古い可能性)` };
+  }
   const nowS = new Date(now).toISOString();
   return db.transaction(() => {
     const l = liveLease(db, jobId, leaseToken, nowS);
@@ -342,7 +423,19 @@ export function submitResult(db, generationId, {
     if (!out.trim()) return { code: 'bad_request', error: '構成の本文が空です' };
     if (out.length > OUTPUT_MAX) return { code: 'too_large', error: `構成が大きすぎます (${OUTPUT_MAX} 文字まで)` };
   }
-  const payloadHash = sha256(canonicalJson({ verdict: v, output: out, lint, review_rounds: reviewRounds, reason: trim(reason, REASON_MAX) }));
+  // 🚨 実行役から来た値の検査は **payloadHash を作る前**。canonicalJson は循環参照で
+  //    スタックを溢れさせるので、先に JSON にできるかを確かめる (コード R1 #5)
+  const rounds = Number.isInteger(reviewRounds) && reviewRounds >= 0 && reviewRounds <= 10 ? reviewRounds : null;
+  const lintJson = jsonOrNull(lint, LINT_MAX);
+  if (lintJson === false) return { code: 'bad_request', error: `lint が大きすぎるか JSON にできません (${LINT_MAX} 文字まで)` };
+  // receipt は「何を見て作ったか」だけ。許す形を決め打ちして、それ以外は捨てる
+  const imgs = Array.isArray(receipt?.images)
+    ? receipt.images.slice(0, RECEIPT_IMAGES_MAX)
+      .map((im) => ({ file_id: trim(im?.file_id, 200), sha256: trim(im?.sha256, 64), bytes: posInt(im?.bytes) }))
+      .filter((im) => im.file_id)
+    : null;
+  const reasonText = trim(reason, REASON_MAX);
+  const payloadHash = sha256(canonicalJson({ verdict: v, output: out, lint: lintJson, review_rounds: rounds, reason: reasonText }));
   return db.transaction(() => {
     const gen = db.prepare('SELECT * FROM ph_lp_compose_generations WHERE id = ?').get(Number(generationId));
     if (!gen) return { code: 'not_found', error: '予約がありません' };
@@ -359,35 +452,48 @@ export function submitResult(db, generationId, {
     }
     const job = jobById(db, gen.job_id);
     if (!job) return { code: 'not_found', error: '依頼がありません' };
+    // 🚨 確定してよいのは running (通常) と needs_review (lease 切れ後の復旧) だけ。
+    //    これが無いと、cancelled や別理由で failed になった job を後から done に戻せてしまう
+    //    (コード R1 #2)。lease 切れ後の復旧を受けるのは AI 枠を消費済みだから (設計 ④)。
+    if (!['running', 'needs_review'].includes(job.status)) {
+      return { code: 'job_finalized', error: `この依頼は ${job.status} で終わっています (結果は受け取れません)` };
+    }
 
-    const rounds = Number.isInteger(reviewRounds) && reviewRounds >= 0 ? reviewRounds : null;
-    const lintJson = lint == null ? null : JSON.stringify(lint).slice(0, 100_000);
     const receiptObj = {
       verdict: v, review_rounds: rounds, model: gen.model, prompt_version: gen.prompt_version,
       finalized_at: nowS,
       // 何を見て作ったか (実際に配った商品画像のバイト列の sha256 と枚数)。
       // Drive の差し替えに対する事前照合は段階2 で入れる (設計 §4.2)
-      images: receipt?.images ?? null,
+      images: imgs,
     };
-    db.prepare(`UPDATE ph_lp_compose_generations
+    // 🚨 generation と job の両方が 1 行ずつ動いたことを確かめ、片方でも動かなければ throw して
+    //    トランザクションごと戻す (中途半端な状態を残さない。コード R1 #2)
+    const genCh = db.prepare(`UPDATE ph_lp_compose_generations
       SET status = ?, payload_hash = ?, receipt_json = ?, discard_reason = ?, finalized_at = ?
       WHERE id = ? AND status = 'reserved'`)
-      .run(v, payloadHash, JSON.stringify(receiptObj), v === 'rejected' ? trim(reason, REASON_MAX) : null, nowS, gen.id);
+      .run(v, payloadHash, JSON.stringify(receiptObj), v === 'rejected' ? reasonText : null, nowS, gen.id).changes;
 
+    const jobCh = v === 'accepted'
+      ? db.prepare(`UPDATE ph_lp_compose_jobs
+          SET status = 'done', output_text = ?, output_hash = ?, lint_json = ?, review_rounds = ?,
+              error_code = NULL, error = NULL, lease_token = NULL, lease_until = NULL,
+              updated_at = ?, completed_at = COALESCE(completed_at, ?), finalized_at = ?
+          WHERE id = ? AND status IN ('running', 'needs_review')`)
+        .run(out, sha256(out), lintJson, rounds, nowS, nowS, nowS, job.id).changes
+      : db.prepare(`UPDATE ph_lp_compose_jobs
+          SET status = 'failed', lint_json = ?, review_rounds = ?, error_code = 'rejected', error = ?,
+              lease_token = NULL, lease_until = NULL,
+              updated_at = ?, completed_at = COALESCE(completed_at, ?), finalized_at = ?
+          WHERE id = ? AND status IN ('running', 'needs_review')`)
+        .run(lintJson, rounds, reasonText || '検品で通らなかった', nowS, nowS, nowS, job.id).changes;
+
+    if (genCh !== 1 || jobCh !== 1) {
+      throw new Error(`lp-compose: 結果の確定で行が動かなかった (generation=${genCh} job=${jobCh})`);
+    }
     if (v === 'accepted') {
-      db.prepare(`UPDATE ph_lp_compose_jobs
-        SET status = 'done', output_text = ?, output_hash = ?, lint_json = ?, review_rounds = ?,
-            error_code = NULL, error = NULL, lease_token = NULL, lease_until = NULL,
-            updated_at = ?, completed_at = COALESCE(completed_at, ?), finalized_at = ?
-        WHERE id = ?`).run(out, sha256(out), lintJson, rounds, nowS, nowS, nowS, job.id);
       logEvent(db, job.draft_id, 'lp_compose_done', `依頼 ${job.id} (${rounds ?? '?'} 巡)`, 'ph-lp-compose');
       return { ok: true, status: 'done', already: false, receipt: receiptObj };
     }
-    db.prepare(`UPDATE ph_lp_compose_jobs
-      SET status = 'failed', lint_json = ?, review_rounds = ?, error_code = 'rejected', error = ?,
-          lease_token = NULL, lease_until = NULL,
-          updated_at = ?, completed_at = COALESCE(completed_at, ?), finalized_at = ?
-      WHERE id = ?`).run(lintJson, rounds, trim(reason, REASON_MAX) || '検品で通らなかった', nowS, nowS, nowS, job.id);
     logEvent(db, job.draft_id, 'lp_compose_rejected', `依頼 ${job.id}: ${trim(reason, 200)}`, 'ph-lp-compose');
     return { ok: true, status: 'failed', already: false, receipt: receiptObj };
   })();

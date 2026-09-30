@@ -82,7 +82,8 @@ ok(c2.ok && c2.job.job_id === c1.job.job_id, '戻った依頼をまた掴める'
 console.log('⑤ 予約 — AI を呼ぶ前に必ず通す');
 const g1 = lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(0.8) });
 ok(g1.ok && g1.generation_id > 0, '予約できる');
-ok(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: 'x', promptVersion: 'y', now: min(0.8) }).code === 'already_reserved', '1 依頼 1 回');
+ok(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(0.8) }).code === 'already_reserved', '1 依頼 1 回');
+ok(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: 'claude-opus-5', promptVersion: 'ふるい版', now: min(0.8) }).code === 'bad_prompt_version', '🚨 実行役の prompt 版が違えば AI を呼ぶ前に断る (コード R1 #6)');
 ok(lp.failJob(db, c2.job.job_id, { leaseToken: c2.job.lease_token, code: 'x', now: min(0.9) }).code === 'already_reserved',
   '🚨 予約後に fail は使えない (result で rejected を出す・§4.3b)');
 ok(lp.releaseJob(db, c2.job.job_id, { leaseToken: c2.job.lease_token, now: min(0.9) }).code === 'already_reserved',
@@ -156,6 +157,54 @@ eq(st.job.output_text, OUT, 'done なら本文を返す');
 eq(st.job.within_deadline, true, '期限内だったか');
 const stRej = lp.jobStateFor(db, dB.id, { now: min(60) });
 eq(stRej.job.output_text, null, 'done 以外は本文を返さない');
+
+console.log('⑬ コードレビュー R1 の修正');
+// #1 期限切れ処理が正常結果を上書きしない (SELECT と UPDATE の間で done になった job を塗り潰さない)
+const dG = mkDraft('LP-G', 'ハッカ油スプレー 5L');
+lp.requestJob(db, args(dG, s2.spec, 'k1', { now: min(70) }));
+const c6 = lp.claimJob(db, { runnerRunId: 'run-10', now: min(70) });
+const g6 = lp.reserveGeneration(db, c6.job.job_id, { leaseToken: c6.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(70) });
+lp.submitResult(db, g6.generation_id, { packetHash: c6.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, now: min(71) });
+lp.recoverExpired(db, min(70 + lp.LEASE_MIN + 5));
+eq(db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(c6.job.job_id).status, 'done',
+  '🚨 期限切れ処理は done を上書きしない (R1 #1)');
+
+// #2 終わった job は結果で復活できない。ただし needs_review からの復旧は受ける
+const dH = mkDraft('LP-H', 'ハッカ油スプレー 10L');
+lp.requestJob(db, args(dH, s2.spec, 'k1', { now: min(80) }));
+const c7 = lp.claimJob(db, { runnerRunId: 'run-11', now: min(80) });
+const g7 = lp.reserveGeneration(db, c7.job.job_id, { leaseToken: c7.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(80) });
+db.prepare("UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?").run(c7.job.job_id);
+eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdict: 'accepted', output: OUT, now: min(81) }).code, 'job_finalized',
+  '🚨 cancelled の依頼を結果で done に戻せない (R1 #2)');
+db.prepare("UPDATE ph_lp_compose_jobs SET status = 'needs_review' WHERE id = ?").run(c7.job.job_id);
+eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdict: 'accepted', output: OUT, now: min(82) }).status, 'done',
+  'needs_review からの復旧は受ける (AI 枠を使っているので取りこぼさない)');
+
+// #5 壊れた実行役が DB を肥らせたり例外を漏らしたりできない
+const dI = mkDraft('LP-I', 'ハッカ油スプレー 20L');
+lp.requestJob(db, args(dI, s2.spec, 'k1', { now: min(90) }));
+const c8 = lp.claimJob(db, { runnerRunId: 'run-12', now: min(90) });
+const g8 = lp.reserveGeneration(db, c8.job.job_id, { leaseToken: c8.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(90) });
+const cyc = {}; cyc.self = cyc;
+eq(lp.submitResult(db, g8.generation_id, { packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT, lint: cyc, now: min(91) }).code, 'bad_request',
+  '🚨 JSON にできない lint は bad_request (例外を漏らさない・R1 #5)');
+eq(lp.submitResult(db, g8.generation_id, { packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT, lint: { big: 'x'.repeat(lp.LINT_MAX) }, now: min(91) }).code, 'bad_request',
+  '大きすぎる lint も断る');
+const subBig = lp.submitResult(db, g8.generation_id, {
+  packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1,
+  receipt: { images: Array.from({ length: 50 }, (_, i) => ({ file_id: 'F' + i, sha256: 'a'.repeat(200), extra: 'x'.repeat(10_000) })) },
+  now: min(91),
+});
+eq(subBig.status, 'done', '受け取れる');
+eq(subBig.receipt.images.length, lp.RECEIPT_IMAGES_MAX, '🚨 receipt の画像は上限で切る');
+ok(subBig.receipt.images.every((im) => im.sha256.length <= 64 && im.extra === undefined), '許した項目だけ残す');
+
+// #4 不正な ID は受け付けない
+ok(lp.requestJob(db, args({ ...dA, id: 'abc' }, s2.spec, 'kx', { now: min(95) })).code === 'bad_request',
+  '🚨 商品 ID が数でなければ断る (R1 #4)');
+ok(lp.requestJob(db, args(mkDraft('LP-J', 'テスト'), { ...s2.spec, id: 99999 }, 'k1', { now: min(95) })).code === 'bad_request',
+  '存在しない仕様書の版は断る');
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);
 process.exit(fail === 0 ? 0 : 1);
