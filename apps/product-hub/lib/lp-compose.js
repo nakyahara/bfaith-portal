@@ -73,11 +73,20 @@ const trim = (v, max) => {
   return max && s.length > max ? s.slice(0, max) : s;
 };
 
-/** 正の安全な整数か (SQLite の非 STRICT 表は文字列も入るので、入口で正規化する。コード R1 #4) */
+/**
+ * 正の安全な整数か (SQLite の非 STRICT 表は文字列も入るので、入口で正規化する。コード R1 #4)。
+ * 🚨 `Number.parseInt` は使わない — "12abc" / "12.9" / "12 " を 12 として通してしまい、
+ *    入力と違う draft / spec を指す job を作れる (コード R2 #2)。
+ */
 const posInt = (v) => {
-  const n = typeof v === 'number' ? v : Number.parseInt(String(v ?? ''), 10);
+  if (typeof v === 'number') return Number.isSafeInteger(v) && v > 0 ? v : null;
+  if (typeof v !== 'string' || !/^[1-9]\d*$/.test(v.trim())) return null;
+  const n = Number(v.trim());
   return Number.isSafeInteger(n) && n > 0 ? n : null;
 };
+
+/** 実行役が出す画像の証跡の sha256 (16 進 64 桁ちょうど) */
+const SHA256_RE = /^[0-9a-f]{64}$/;
 
 /**
  * 実行役から来た JSON を保存できる形にする。
@@ -209,8 +218,9 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
   const deadline = new Date(now + MEASUREMENT_WINDOW_MIN * 60_000).toISOString();
   return db.transaction(() => {
     // 渡された spec を信じず、DB から引き直して種類と hash を照合する (コード R1 #4)
+    // hash は**必須**。省略を許すと ID と kind だけで通り、照合の意味が無くなる (コード R2 #3)
     const specRow = db.prepare('SELECT * FROM ph_lp_specs WHERE id = ?').get(specId);
-    if (!specRow || specRow.kind !== 'product_analysis' || (spec.hash && specRow.hash !== spec.hash)) {
+    if (!specRow || specRow.kind !== 'product_analysis' || trim(spec?.hash, 80) !== specRow.hash) {
       return { code: 'bad_request', error: '仕様書の版が見つかりません (取り込み直してください)' };
     }
     const { packet, hash } = buildPacket({ draft: { ...draft, id: draftId }, productInfo, colorVariations, images, spec: specRow });
@@ -428,14 +438,31 @@ export function submitResult(db, generationId, {
   const rounds = Number.isInteger(reviewRounds) && reviewRounds >= 0 && reviewRounds <= 10 ? reviewRounds : null;
   const lintJson = jsonOrNull(lint, LINT_MAX);
   if (lintJson === false) return { code: 'bad_request', error: `lint が大きすぎるか JSON にできません (${LINT_MAX} 文字まで)` };
-  // receipt は「何を見て作ったか」だけ。許す形を決め打ちして、それ以外は捨てる
-  const imgs = Array.isArray(receipt?.images)
-    ? receipt.images.slice(0, RECEIPT_IMAGES_MAX)
-      .map((im) => ({ file_id: trim(im?.file_id, 200), sha256: trim(im?.sha256, 64), bytes: posInt(im?.bytes) }))
-      .filter((im) => im.file_id)
-    : null;
+  // receipt = 「実際に配った商品画像のバイト列の sha256 と枚数」。証跡なので**黙って直さない** —
+  // 枚数超過も形の違う要素も bad_request にする (切り捨てると証跡として信用できない。コード R2 #4)
+  let imgs = null;
+  if (receipt?.images != null) {
+    if (!Array.isArray(receipt.images)) return { code: 'bad_request', error: 'receipt.images は配列です' };
+    if (receipt.images.length > RECEIPT_IMAGES_MAX) {
+      return { code: 'bad_request', error: `receipt.images は ${RECEIPT_IMAGES_MAX} 枚までです (${receipt.images.length} 枚)` };
+    }
+    imgs = [];
+    for (const im of receipt.images) {
+      const fileId = trim(im?.file_id, 200);
+      const hex = trim(im?.sha256, 80).toLowerCase();
+      const bytes = posInt(im?.bytes);
+      if (!fileId || !SHA256_RE.test(hex) || !bytes) {
+        return { code: 'bad_request', error: 'receipt.images は file_id・sha256 (16進64桁)・bytes が要ります' };
+      }
+      imgs.push({ file_id: fileId, sha256: hex, bytes });
+    }
+  }
   const reasonText = trim(reason, REASON_MAX);
-  const payloadHash = sha256(canonicalJson({ verdict: v, output: out, lint: lintJson, review_rounds: rounds, reason: reasonText }));
+  // 🚨 receipt も hash の対象に入れる。入れないと「画像の証跡だけ違う再送」を
+  //    同じ結果と見なして保存済みを返してしまう (コード R2 #1)。finalized_at は毎回変わるので入れない
+  const payloadHash = sha256(canonicalJson({
+    verdict: v, output: out, lint: lintJson, review_rounds: rounds, reason: reasonText, images: imgs,
+  }));
   return db.transaction(() => {
     const gen = db.prepare('SELECT * FROM ph_lp_compose_generations WHERE id = ?').get(Number(generationId));
     if (!gen) return { code: 'not_found', error: '予約がありません' };
