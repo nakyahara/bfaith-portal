@@ -424,11 +424,22 @@ await t('🚨 complete の応答だけ失われた = 同じ中身で送り直し
   assert.equal(f.calls.complete, 2); assert.equal(r.coverage.status, 'same');
   assert.equal((await cov()).state, 'complete');
 });
-await t('Render に #1561 の受け口がまだ無い (status が 404) = 409 not_migrated と同じく今までの送り方 (deploy の順番がずれた保険・#1567 R1 Medium 4)', async () => {
+await t('Render の status が 404: 台帳に coverage の世代が一度も無い = 今までの送り方 (deploy の順番がずれた保険) / 一度でも coverage で回った後 = Render が戻った疑い = 取込だけして送らない ❌ (#1567 R1 Medium 4・R2 Medium 3)', async () => {
+  const g0 = ledgerMeta('coverage_generation');
+  assert.ok(g0, '前提: この台帳は coverage で回ったことがある');
   const f = spyFetch({ statusOverride: () => new Response('Cannot GET', { status: 404 }) });
   const r = await run({ fetchImpl: f });
-  assert.equal(r.mode, 'legacy'); assert.equal(r.exitCode, 0, r.summary);
-  assert.equal(f.calls.updating + f.calls.complete + f.calls.tokenedChunks, 0);
+  assert.equal(r.mode, 'render_404'); assert.equal(r.exitCode, 1, r.summary);
+  assert.match(r.summary, /^❌ .*財務 push: 送らない = Render の決済のそろいの受け口が 404/);
+  assert.equal(f.calls.chunks + f.calls.updating + f.calls.complete, 0, '送らない (fail-open にしない)');
+  assert.ok(r.ingest && r.ingest.inventory, '取込はした');
+  setLedgerMeta('coverage_generation', null);   // 一度も coverage で回っていない台帳
+  try {
+    const f2 = spyFetch({ statusOverride: () => new Response('Cannot GET', { status: 404 }) });
+    const r2 = await run({ fetchImpl: f2 });
+    assert.equal(r2.mode, 'legacy'); assert.equal(r2.exitCode, 0, r2.summary);
+    assert.equal(f2.calls.updating + f2.calls.complete + f2.calls.tokenedChunks, 0);
+  } finally { setLedgerMeta('coverage_generation', g0); }
 });
 await t('Render に 0050 が無い (status が 409 not_migrated) = 今までの送り方 (token なし・coverage を送らない・⚠️)', async () => {
   const f = spyFetch({ statusOverride: () => new Response(JSON.stringify({ error: 'not_migrated' }), { status: 409, headers: { 'content-type': 'application/json' } }) });
@@ -462,19 +473,24 @@ await t('🚨 一覧の窓の空白 (前の成功した回から 85 日以上あ
   NOW = Date.parse('2026-03-20T00:00:00Z');
 });
 
-await t('🚨 中身の悪い版しか無い決済 (見出しの total ≠ 明細の合計) = 採らない・送らない・❌ 🚨「決済の版の問題」(build も止まる・行を黙って落とさない。#1567 R1 Medium 3 / L5)', async () => {
+await t('🚨 中身の悪い版しか無い決済 (見出しの total ≠ 明細の合計) = 仮に採って送る・全部を止めない・⚠️🚨 で retry しない (exit 0)・正式な値は null (coverage は complete にしない) (#1567 R2 Medium 1 案 C / L3)', async () => {
   const good = settlementTsv('S9', '2026-03-16T10:00:00Z', '2026-03-18T10:00:00Z', [{ kind: 'order', order: 'O-9', sku: 'SKU-9', yen: 40, day: '2026-03-17T01:00:00Z' }]);
   DOCS.D9 = good.replace('\t40.00\tJPY', '\t41.00\tJPY');   // 見出しの total だけ 41 (途中で切れたファイルの形)
   assert.notEqual(DOCS.D9, good);
   SP.ing = [...SP.ing, rep('R9', 'DONE', 'D9', ['2026-03-16T10:00:00Z', '2026-03-18T10:00:00Z'], '2026-03-19T00:00:00Z')]; SP.inv = SP.ing;
   const f = spyFetch();
   const r = await run({ fetchImpl: f });
-  assert.equal(r.exitCode, 1, r.summary);
-  assert.match(r.summary, /^❌ Amazon 決済と財務: 🚨 決済の版の問題/);
-  assert.ok(codes(r).includes('settlement_blocked'), codes(r).join(','));
-  assert.equal(f.calls.chunks, 0, '送らない');
-  assert.equal(V.selectedVersionOf(db, 'S9'), null);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(tmpDir, LAST_RUN_FILE), 'utf8')).finance_pushed, false);
+  assert.equal(r.exitCode, 0, r.summary);
+  assert.match(r.summary, /^⚠️🚨 Amazon 決済と財務: .*仮に採った壊れた版/);
+  assert.ok(codes(r).includes('provisional_broken_version'), codes(r).join(','));
+  assert.ok(f.calls.chunks > 0, '送る (ほかの決済も止めない)');
+  const sel = V.selectedVersionOf(db, 'S9');
+  assert.ok(sel && sel.detail_valid === 0, '壊れた版を仮に採る');
+  assert.ok((await receipt('O-9')).lines > 0, 'O-9 は仮の財務として Render に入る (墓石にしない = 案 B はとらない)');
+  assert.equal((await cov()).state, 'updating', '正式な値は出さない (見出しの検算・frontier で落ちる)');
+  assert.equal((await covState()).complete_to, null);
+  const last = JSON.parse(fs.readFileSync(path.join(tmpDir, LAST_RUN_FILE), 'utf8'));
+  assert.deepEqual([last.finance_pushed, last.retryable, last.exit_code], [true, false, 0]);
 });
 await t('retry-state の旧い工程の名前 (Amazon Settlement / CompanyDB財務(Amazon)) は新しい名前に読み替える (#1567 R1 L4)', async () => {
   assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon Settlement', 'CompanyDB財務(Amazon)', 'Render同期']), ['f_sales', 'Amazon決済と財務', 'Render同期']);

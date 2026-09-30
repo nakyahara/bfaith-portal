@@ -59,7 +59,7 @@ export const COVERAGE_POST_TIMEOUT_MS = 120000;   // complete は Render が受�
 export const LAST_RUN_FILE = 'amazon-finance-coverage-last.json';
 /** 決済のデータが壊れている合図 (朝の報告で目立たせる・R1 L5)。人が直す理由のまま */
 export const DATA_BROKEN_CODES = new Set(['header_count', 'header_period_unreadable', 'header_period_reversed', 'header_settlement_mismatch', 'line_settlement_mismatch',
-  'header_currency', 'line_currency', 'total_mismatch', 'version_without_settlement', 'settlement_blocked', 'version_incomplete']);
+  'header_currency', 'line_currency', 'total_mismatch', 'version_without_settlement', 'provisional_broken_version', 'version_unresolved_settlement']);
 function writeLastRun(dataDir, x) {
   try {
     const file = path.join(dataDir, LAST_RUN_FILE), tmp = `${file}.${process.pid}.tmp`;
@@ -108,7 +108,7 @@ export async function runCoverage({
   if (!Object.hasOwn(SOURCES, source)) throw new Error(`source は v1 か v2: ${source}`);
   await initDB();
   const db = getDB();
-  const out = { exitCode: 0, summary: '', mode: null, generation: null, ingest: null, push: null, coverage: null, reasons: [], manual: [] };
+  const out = { exitCode: 0, summary: '', mode: null, generation: null, ingest: null, push: null, coverage: null, reasons: [], manual: [], versionWarnings: [] };
   const runId = `settlement-${now().getTime()}`;
   const ledger = openLedger(dataDir, { kind: FINANCE_KIND });
   const openReader = () => new Database(path.join(dataDir, 'warehouse.db'), { readonly: true, fileMustExist: true, timeout: readonlyTimeoutMs });
@@ -160,8 +160,14 @@ export async function runCoverage({
     else {
       if (!base || !syncKey) throw new Error('送り先 (RENDER_MIRROR_URL) か MIRROR_SYNC_KEY が無い');
       try { status = await getJson(fetchImpl, `${base}${STATUS_PATH}`, syncKey, 'Render の決済のそろい', getOpts); out.mode = 'coverage'; }
-      // 409 not_migrated = 0050 がまだ / 404 = PR #1561 の受け口がまだ deploy されていない (順番がずれた保険)。どちらも今までの送り方 (token なし = Render は complete を作らない = fail-open ではない)
-      catch (e) { if ((/HTTP 409/.test(e.message) && /not_migrated/.test(e.message)) || /HTTP 404/.test(e.message)) out.mode = 'legacy'; else throw e; }
+      // 409 not_migrated = 0050 がまだ = 今までの送り方 (token なし = Render は complete を作らない = fail-open ではない)
+      // 404 = PR #1561 の受け口がまだ deploy されていない (順番がずれた保険) → 今までの送り方は **台帳に coverage の世代が一度も無いとき (0050 で一度も回っていない) だけ** (#1567 R2 Medium 3)。
+      //   一度でも coverage で回った後の 404 = Render が #1561 の前のコードに戻った = 古いコードは token の無い chunk で complete を落とさない = 送ると fail-open → 取込だけして送らない (❌)
+      catch (e) {
+        if (/HTTP 409/.test(e.message) && /not_migrated/.test(e.message)) out.mode = 'legacy';
+        else if (/HTTP 404/.test(e.message)) out.mode = ledger.getMeta(LEDGER_META.generation) == null ? 'legacy' : 'render_404';
+        else throw e;
+      }
     }
     log(`[coverage] mode = ${out.mode}`);
 
@@ -192,13 +198,17 @@ export async function runCoverage({
     });
     V.refreshStaleVersionDetails(db, { check, log });
     // 🚨 決済の版の問題 (壊れた決済・途中の版) = build と送り手は止まる (行を黙って落とさない・R1 High 1 / Medium 3) → ここで理由を朝の報告に出す
+    //   止めるのは次の回で直る一時の状態だけ (版の無い行・要約の古い版)。人が直すもの (決済 ID の決まらない版・仮に採った壊れた版) は止めずに朝の報告へ (#1567 R2 Medium 1 / 2)
     const verProblems = V.documentVersionProblems(db);
     if (verProblems.length) {
       out.exitCode = 1;
-      out.reasons = verProblems.map((p) => ({ ...p, human: p.code === 'settlement_blocked' }));
-      out.summary = `❌ Amazon 決済と財務: 🚨 決済の版の問題 = 送らない・SQLite の build も止まる: ${verProblems.map((p) => p.detail).join(' ／ ')}`.slice(0, 900);
+      out.reasons = verProblems.map((p) => ({ ...p, human: false }));
+      out.summary = `❌ Amazon 決済と財務: 決済の版が途中 (次の回で直る) = 送らない・SQLite の build も止まる: ${verProblems.map((p) => p.detail).join(' ／ ')}`.slice(0, 900);
       return out;
     }
+    out.versionWarnings = V.documentVersionWarnings(db);
+    const warnPart = out.versionWarnings.length ? ` | ${out.versionWarnings.map((w) => w.detail).join(' ／ ')}`.slice(0, 600) : '';
+    for (const w of out.versionWarnings) log(`[versions] ${w.detail}`);
     if (out.ingest.blocked.length) {
       out.exitCode = 3;
       out.summary = `❌ Amazon 決済と財務: 取り込めない V2 のレポート ${out.ingest.blocked.length} 本 (${out.ingest.blocked.map((b) => b.reportId).join(', ')}) → amazon-settlement-v2.js に規則を足す。Company DB には送らない (coverage は updating のまま)`;
@@ -209,8 +219,13 @@ export async function runCoverage({
 
     // ── ⑤ 送る ──
     if (out.mode === 'ingest_only') {
-      out.summary = `✅ Amazon 決済と財務: ${ingestPart} | 財務 push: ⏭️ 初回のバックフィル前 (台帳に完了印が無い) = 送らない${manualFailed ? ` | ⚠️ 手のファイルの失敗 ${manualFailed}` : ''}`;
-      if (manualFailed) out.summary = out.summary.replace(/^✅/, '⚠️');
+      out.summary = `✅ Amazon 決済と財務: ${ingestPart} | 財務 push: ⏭️ 初回のバックフィル前 (台帳に完了印が無い) = 送らない${manualFailed ? ` | ⚠️ 手のファイルの失敗 ${manualFailed}` : ''}${warnPart}`;
+      if (manualFailed || out.versionWarnings.length) out.summary = out.summary.replace(/^✅/, out.versionWarnings.length ? '⚠️🚨' : '⚠️');
+      return out;
+    }
+    if (out.mode === 'render_404') {
+      out.exitCode = 1;
+      out.summary = `❌ Amazon 決済と財務: ${ingestPart} | 財務 push: 送らない = Render の決済のそろいの受け口が 404 なのに、この台帳は coverage で回ったことがある = Render が #1561 の前のコードに戻った疑い (送ると complete が落ちない = fail-open) → Render の版を確かめる${warnPart}`;
       return out;
     }
     const cap = capacity === undefined ? capacityFromEnv() : capacity;
@@ -238,7 +253,7 @@ export async function runCoverage({
     out.financePushed = true;
     if (out.mode === 'legacy') {
       out.exitCode = r.ok ? 0 : 1;
-      out.summary = `${r.ok ? '⚠️' : '❌'} Amazon 決済と財務: ${ingestPart} | ${pushPart} | coverage: Render に 0050 が無い = coverage を送らない (今までの送り方)`;
+      out.summary = `${r.ok ? '⚠️' : '❌'} Amazon 決済と財務: ${ingestPart} | ${pushPart} | coverage: Render に 0050 が無い = coverage を送らない (今までの送り方)${warnPart}`;
       return out;
     }
     const cov = f.coverage || { complete: false, reasons: [{ code: 'no_finalize', detail: '完成の判定まで進まなかった', human: false }] };
@@ -255,8 +270,10 @@ export async function runCoverage({
       for (const x of out.reasons.slice(0, 15)) log(`  [coverage] ${x.human ? '⚠️' : '❌'} ${x.code}: ${String(x.detail || '').slice(0, 300)}`);
     }
     if (!r.ok) out.exitCode = 1;
-    const head = out.exitCode !== 0 ? '❌' : (!cov.complete || pushWarn || manualFailed || out.ingest.blockedCovered.length) ? '⚠️' : '✅';
-    out.summary = `${head} Amazon 決済と財務: ${ingestPart} | ${pushPart} | ${covPart}${manualFailed ? ` | ⚠️ 手のファイルの失敗 ${manualFailed}` : ''}`;
+    const broken = out.versionWarnings.length || (out.reasons || []).some((x) => DATA_BROKEN_CODES.has(x.code));
+    // 人が直すまで直らない理由だけ = exit 0 (retry しない)。要約の頭は ⚠️🚨 (データが壊れている疑い) / ⚠️ (#1567 R2 Medium 1)
+    const head = out.exitCode !== 0 ? '❌' : broken ? '⚠️🚨' : (!cov.complete || pushWarn || manualFailed || out.ingest.blockedCovered.length) ? '⚠️' : '✅';
+    out.summary = `${head} Amazon 決済と財務: ${ingestPart} | ${pushPart} | ${covPart}${manualFailed ? ` | ⚠️ 手のファイルの失敗 ${manualFailed}` : ''}${warnPart}`;
     return out;
   } catch (e) {
     out.exitCode = 1;
@@ -266,7 +283,7 @@ export async function runCoverage({
   } finally {
     try { V.releaseCoverageLease(db, lease, now()); } catch { /* 放せなくても次の回が持ち主の死を見て取る */ }
     ledger.close();
-    writeLastRun(dataDir, { mode: out.mode, exit_code: out.exitCode, finance_pushed: !!out.financePushed, coverage_complete: !!(out.coverage && out.coverage.complete), generation: out.generation });
+    writeLastRun(dataDir, { mode: out.mode, exit_code: out.exitCode, retryable: out.exitCode !== 0, finance_pushed: !!out.financePushed, coverage_complete: !!(out.coverage && out.coverage.complete), generation: out.generation });
   }
 }
 

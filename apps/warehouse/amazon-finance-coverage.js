@@ -42,6 +42,7 @@ export const HUMAN_REASONS = new Set([
   'marker_settlement_mismatch', 'marker_report_id_unknown', 'evidence_chain_gap', 'report_cancelled', 'report_fatal', 'report_period_unknown', 'report_selected_differs',
   'header_currency_unverified', 'version_without_settlement', 'header_count', 'header_period_unreadable', 'header_period_reversed', 'header_settlement_mismatch',
   'line_settlement_mismatch', 'header_currency', 'line_currency', 'total_mismatch', 'origin_not_covered', 'report_blocked',
+  'provisional_broken_version', 'version_unresolved_settlement',
 ]);
 
 const utc = (s) => { const v = normalizeApiTime(s); return v && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(v) ? v : null; };
@@ -65,6 +66,8 @@ function checkSelected(v, { nowMs, markerMatched }) {
   const reasons = [];
   const push = (code, detail) => reasons.push({ code, detail: `決済 ${v.settlement_id}: ${detail}` });
   if (v.detail_stale) push('version_detail_stale', '版の要約が古い (作り直す前)');
+  // 良い版が無いので中身の悪い版を仮に採っている (#1567 R2 Medium 1) = 正式な値は出さない (下の検算でも落ちる)・人が直す
+  if (Number(v.detail_valid) !== 1) push('provisional_broken_version', `🚨 仮に採った壊れた版 #${v.seq} (良い版が無い・見出し ${v.header_count} 行)`);
   if (v.header_count !== 1) push('header_count', `見出しが ${v.header_count} 行 (1 行だけ)`);
   const start = utc(v.header_start), end = utc(v.header_end);
   if (v.header_count >= 1 && (!start || !end)) push('header_period_unreadable', `見出しの期間が読めない (${v.header_start} 〜 ${v.header_end})`);

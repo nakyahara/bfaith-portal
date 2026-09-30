@@ -907,7 +907,8 @@ async function main() {
     const financeSqliteFresh = financeBuildFailed.length === 0 && accountFeesBuildResult.success;
     // 送ったかは coordinator の小さな記録 (DATA_DIR/amazon-finance-coverage-last.json) の構造の値で決める (要約の文字で決めない・#1567 R1 L3)。
     //   同じ daily-sync の回 (DAILY_SYNC_RUN_ID) の記録で finance_pushed = true のときだけ。読めない = 見送る (安全側)
-    const financeSent = settlementResult.success && coordinatorPushedFinance(process.env.DATA_DIR, process.env.DAILY_SYNC_RUN_ID);
+    //   coordinator が coverage の理由で exit 1 でも、財務を送った朝は突き合わせる (#1567 R2 L2)
+    const financeSent = coordinatorPushedFinance(process.env.DATA_DIR, process.env.DAILY_SYNC_RUN_ID);
     if (!financeSqliteFresh) console.log(`[DailySync] Company DB Amazon 財務の突き合わせはスキップ (比べる側の build が失敗: 日次の財務 ${financeBuildFailed.join(', ') || 'OK'} / 月の手数料 ${accountFeesBuildResult.success ? 'OK' : '失敗'})`);
     if (financeSqliteFresh && financeSent) {
       const cdbFinanceRecResult = runScript('apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled', 'Company DB Amazon 財務 突き合わせ', 600000);

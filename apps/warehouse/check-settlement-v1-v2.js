@@ -17,7 +17,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import Database from 'better-sqlite3';
 import { prepareV2ReportTsv, listSettlementReports, downloadReportTsv, spClients, SOURCES } from './fetch-amazon-settlements.js';
-import { detailDigestOfRows, selectDocumentVersions, versionDetailValid } from './amazon-settlement-versions.js';
+import { detailDigestOfRows, selectDocumentVersions, versionDetailValid, header0MultiVersionSettlements } from './amazon-settlement-versions.js';
 
 /** 1 本の V2 の TSV と DB の採った版を比べる (試験から呼ぶ) */
 export function compareV2WithSelected(db, v2Tsv, reportId) {
@@ -29,8 +29,11 @@ export function compareV2WithSelected(db, v2Tsv, reportId) {
   const vs = db.prepare(`SELECT * FROM amazon_settlement_document_versions WHERE settlement_id = ?`).all(sid);
   const sel = selectDocumentVersions(vs).get(sid) || null;
   const out = { reportId, settlementId: sid, v2: { lineCount: d.lineCount, digest: d.detailDigest, sum: String(d.componentsSumMicro), total: total == null ? null : String(total), valid: v2Valid, unknown: p.unknown.length },
-    selected: sel ? { seq: sel.seq, layer: sel.source_layer, reportId: sel.report_id, lineCount: sel.line_count, digest: sel.detail_digest, valid: versionDetailValid(sel), stale: sel.detail_stale } : null };
-  out.status = !sel ? 'no_selected_version' : (sel.detail_stale ? 'selected_stale' : (sel.line_count === d.lineCount && sel.detail_digest === d.detailDigest ? 'match' : 'differs'));
+    selected: sel ? { seq: sel.seq, layer: sel.source_layer, reportId: sel.report_id, lineCount: sel.line_count, digest: sel.detail_digest, valid: versionDetailValid(sel), stale: sel.detail_stale, headerCount: sel.header_count } : null,
+    versions: vs.length, header0Versions: vs.filter((v) => Number(v.header_count) === 0).length };
+  // no_version = SQLite にその決済の版が無い (V2 だけで入る) / blocked = 版はあるが採れない / provisional = 良い版が無く壊れた版を仮に採っている (#1567 R2 L1)
+  out.status = !vs.length ? 'no_version' : !sel ? 'blocked' : sel.detail_stale ? 'selected_stale' : Number(sel.detail_valid) !== 1 ? 'provisional'
+    : (sel.line_count === d.lineCount && sel.detail_digest === d.detailDigest ? 'match' : 'differs');
   return out;
 }
 
@@ -42,14 +45,17 @@ async function main() {
     const { sp } = spClients({ withInventory: false });
     const reports = (await listSettlementReports(sp, SOURCES.v2.reportType)).filter((r) => r.processingStatus === 'DONE' && r.reportDocumentId);
     console.log(`[check] V2 のレポート ${reports.length} 本 (DONE)`);
+    const h0 = header0MultiVersionSettlements(db);
+    console.log(h0.length ? `[check] 🚨 見出し 0 行の版があり、ほかの版もある決済 ${h0.length}: ${h0.map((x) => `${x.settlement_id} (版 ${x.versions}・見出し 0 行 ${x.header0})`).join(' / ')} = どの版を採るか人が確かめる` : '[check] 見出し 0 行の版があり、ほかの版もある決済 0 (✅)');
     let bad = 0;
     for (const r of reports) {
       const tsv = await downloadReportTsv(sp, r.reportDocumentId);
       const c = compareV2WithSelected(db, tsv, r.reportId);
-      if (c.status !== 'match' && c.status !== 'no_selected_version') bad++;
+      if (c.status !== 'match' && c.status !== 'no_version') bad++;
       const s = c.selected;
-      console.log(`  ${c.status === 'match' ? '✅ 一致' : c.status === 'no_selected_version' ? '・ SQLite に版が無い (V2 だけで入る)' : '❌ ' + c.status} 決済 ${c.settlementId} (report ${r.reportId}): V2 ${c.v2.lineCount} 行 ${c.v2.digest.slice(0, 12)}… 合計 ${c.v2.sum} / total ${c.v2.total}${c.v2.valid ? '' : ' ⚠️V2 の中身が確かでない'}`
-        + (s ? ` | 採っている版 #${s.seq} ${s.layer} ${s.reportId} ${s.lineCount} 行 ${String(s.digest).slice(0, 12)}…${s.valid ? '' : ' ⚠️'}` : ''));
+      console.log(`  ${c.status === 'match' ? '✅ 一致' : c.status === 'no_version' ? '・ SQLite に版が無い (V2 だけで入る)' : '❌ ' + c.status} 決済 ${c.settlementId} (report ${r.reportId}): V2 ${c.v2.lineCount} 行 ${c.v2.digest.slice(0, 12)}… 合計 ${c.v2.sum} / total ${c.v2.total}${c.v2.valid ? '' : ' ⚠️V2 の中身が確かでない'}`
+        + (s ? ` | 採っている版 #${s.seq} ${s.layer} ${s.reportId} 見出し ${s.headerCount} 行 ${s.lineCount} 行 ${String(s.digest).slice(0, 12)}…${s.valid ? '' : ' ⚠️'}` : '')
+        + ` | この決済の版 ${c.versions}${c.header0Versions ? ` (🚨 見出し 0 行の版 ${c.header0Versions})` : ''}`);
     }
     console.log(bad ? `❌ 違う決済 ${bad} = coordinator の初回で採る版が替わると値が動く / coverage は complete にならない (report_selected_differs)。中身を確かめてから流す` : '✅ V2 と採っている版の明細は全部一致 (または SQLite に無い決済)');
     process.exitCode = bad ? 1 : 0;

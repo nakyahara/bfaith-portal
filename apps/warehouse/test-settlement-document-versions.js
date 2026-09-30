@@ -132,7 +132,7 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
     const meta = { source_layer: layers[rnd(4)], report_type: null, report_id: `FZ-${i}`, report_document_id: null, file_hash: `fz${i}`, normalization_version: 'v' };
     const v = V.registerDocumentVersion(db, { ...meta, document_version_id: V.documentVersionId(meta), source_document_id: `FZ-${i}`, settlement_id: `FZ-S${rnd(25)}`, ingested_at: times[rnd(4)] }, { registeredBy: 'backfill' });
     // 🆕 #1567 R1 Medium 3: 中身の確かな版 (detail_valid = 1) だけが候補 = 乱数で 1 / 0 / null を混ぜる
-    db.prepare(`UPDATE amazon_settlement_document_versions SET detail_valid = ?, detail_stale = 0 WHERE seq = ?`).run([1, 1, 0, null][rnd(4)], v.seq);
+    db.prepare(`UPDATE amazon_settlement_document_versions SET detail_valid = ?, header_count = ?, detail_stale = 0 WHERE seq = ?`).run([1, 1, 0, null][rnd(4)], [1, 1, 0, 2, null][rnd(5)], v.seq);   // R2: 見出しの行数も混ぜる
   }
   const js = V.selectDocumentVersions(V.readVersions(db));
   const sql = db.prepare(`SELECT settlement_id, document_version_seq FROM v_amazon_settlement_selected_documents`).all();
@@ -142,7 +142,12 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
   ok(pick([{ source_layer: 'manual_csv', ingested_at: '2027', document_version_id: 'a' }, { source_layer: 'sp_api_v2', ingested_at: '2026', document_version_id: 'b' }]) === 1, '層 1 (API) が manual より先 (manual が新しくても)');
   ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'b' }, { source_layer: 'sp_api_v2', ingested_at: '2026', document_version_id: 'a' }]) === 1, 'V1 と V2 は同じ順位 → 同じ時刻なら ID のバイトの順');
   ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'a' }, { source_layer: 'sp_api_v2', ingested_at: '2027', document_version_id: 'b', detail_valid: 0 }]) === 0, '🚨 中身の悪い新しい版 (detail_valid 0) は良い旧い版を押しのけない (#1567 R1 Medium 3)');
-  ok(pick([{ source_layer: 'sp_api_v2', ingested_at: '2027', document_version_id: 'b', detail_valid: 0 }]) === null, '中身の悪い版しか無い = 採らない (build と送り手は blocked で止まる)');
+  ok(pick([{ source_layer: 'sp_api_v2', ingested_at: '2027', document_version_id: 'b', detail_valid: 0 }]) === 0, '中身の悪い版しか無い = その中で一番の版を仮に採る (#1567 R2 Medium 1・全部を止めない)');
+  ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'a', header_count: 1 }, { source_layer: 'sp_api_v1', ingested_at: '2027', document_version_id: 'b', header_count: 0 }]) === 0,
+    '🚨 見出し 0 行の新しい版 (過去の backfill・detail_valid 1) は見出し 1 行の古い版を押しのけない (#1567 R2 High 1)');
+  ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'a', header_count: 0 }]) === 0, '見出し 0 行の版はほかに候補が無いときだけ採る');
+  ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2027', document_version_id: 'a', header_count: 1, detail_valid: 0 }, { source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'b', header_count: 0 }]) === 1,
+    '並びの頭は中身の確かさ (detail_valid) → 見出しの行数');
 }
 
 // ─── ⑤ trigger: UPDATE は OLD と NEW の両方 / DELETE / backfill は数えない ───
@@ -232,15 +237,57 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
   const { id: _hid, ...hrest } = hsrc;
   db.prepare(`INSERT INTO raw_amazon_settlement_headers (${Object.keys(hrest).join(',')}) VALUES (${Object.keys(hrest).map((k) => '@' + k).join(',')})`).run({ ...hrest, physical_line_hash: hrest.physical_line_hash + '-2', business_line_key: hrest.business_line_key + '-2', total_amount_micro: 11000000 });
   V.refreshStaleVersionDetails(db);
-  const probs = V.documentVersionProblems(db);
-  ok(probs.some((p) => p.code === 'settlement_blocked' && p.detail.includes(S2b)) && V.blockedSettlements(db).some((b) => b.settlement_id === S2b), `🚨 採れる版が 1 つも無い決済 = blocked (${probs.map((p) => p.code).join(', ')})`);
-  let threw = null; try { V.assertDocumentVersionsReady(db); } catch (e) { threw = e; }
-  ok(threw && threw.code === 'SETTLEMENT_VERSIONS_NOT_READY' && /壊れている/.test(threw.message), '🚨 blocked = build と送り手の前の確かめで止まる (行が黙って消えない)');
-  // 片付け (以降の試験のため): 壊れた決済の行を消して ready に戻す
+  // 🆕 #1567 R2 Medium 1 (案 C): 良い版が無い決済 = 中身の悪い版を仮に採る (PR の前もその行で build していた)・全部を止めない・朝の報告と coverage の理由に出す
+  ok(V.documentVersionsReady(db) && !V.documentVersionProblems(db).length, '🚨 壊れた版しか無い決済があっても build と送り手は止めない (1 つの決済の違反で全部を止めない)');
+  const warns = V.documentVersionWarnings(db);
+  ok(warns.some((w) => w.code === 'provisional_broken_version' && w.human && w.detail.includes(S2b)), `「🚨 仮に採った壊れた版」として出す (${warns.map((w) => w.code).join(', ')})`);
+  ok(V.selectedVersionOf(db, S2b) && db.prepare(`SELECT COUNT(*) n FROM v_amazon_settlement_unified WHERE source_settlement_id = ?`).get(S2b).n === 1, '仮に採った版の行は build に入る (黙って落とさない)');
+  // 片付け (以降の試験のため): 壊れた決済の行を消す
   db.prepare(`DELETE FROM raw_amazon_settlement_headers WHERE source_settlement_id = ?`).run(S2b);
   db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE source_settlement_id = ?`).run(S2b);
   V.refreshStaleVersionDetails(db);
-  ok(V.documentVersionsReady(db), '行の無い版は blocked に数えない');
+  ok(V.documentVersionsReady(db) && !V.documentVersionWarnings(db).some((w) => w.code === 'provisional_broken_version'), '行の無い版は数えない');
+}
+
+// ─── 🆕 #1567 R2 Medium 2: 決済 ID が 2 つある文書の版 = 決済 ID が決まらない = 止めない・人が直す別の code (retry しない)・版付けの dry-run でも数える ───
+{
+  const insU = db.prepare(`INSERT INTO raw_amazon_settlement_lines (physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version,
+    source_settlement_id, posted_date_utc, posted_datetime_jst, economic_date, year_month_int, amazon_order_id, seller_sku_normalized, transaction_type, price_type, price_amount_micro, currency, ingested_at)
+    VALUES (?, ?, 'UNRES', 'uh', 'p', ?, 'sp_api_v1', 'v1.0.0', ?, 'x', 'x', ?, ?, ?, 'sku-u', 'Order', 'Principal', 1000000, 'JPY', '2026-01-01 00:00:00')`);
+  insU.run('un-1', 'un-k1', 1, 'S-U1', `${YM}-05`, Number(YM.replace('-', '')), 'OU1');
+  insU.run('un-2', 'un-k2', 2, 'S-U2', `${YM}-05`, Number(YM.replace('-', '')), 'OU2');
+  const { runMigrate } = await import('./migrate-settlement-document-versions.js');
+  const logs = [];
+  await runMigrate({ commit: false, log: (m) => logs.push(m) });
+  ok(logs.some((l) => /決済 ID が 2 つ以上ある文書 1 \(UNRES 2\)/.test(l)), `版付けの dry-run で「決済 ID が 2 つ以上ある文書」を数える (${logs.filter((l) => /2 つ以上/.test(l)).join(' ')})`);
+  V.backfillDocumentVersions(db);
+  const probs = V.documentVersionProblems(db).map((p) => p.code), warns = V.documentVersionWarnings(db);
+  ok(!probs.length && V.documentVersionsReady(db), `🚨 止めない (次の回では直らない = 毎朝 ❌ と retry にしない) (${probs.join(', ')})`);
+  ok(warns.some((w) => w.code === 'version_unresolved_settlement' && w.human && /UNRES/.test(w.detail)), `人が直す別の code = version_unresolved_settlement (${warns.map((w) => w.code).join(', ')})`);
+  db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE source_document_id = 'UNRES'`).run();   // 片付け
+  V.refreshStaleVersionDetails(db);
+}
+
+// ─── 🆕 #1567 R2 High 1: 過去の行で、見出しの無い新しい一部だけの文書が、見出しつきの全部の古い文書を押しのけない ───
+{
+  const Sh = 'S-H0';
+  const insL = db.prepare(`INSERT INTO raw_amazon_settlement_lines (physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version,
+    source_settlement_id, posted_date_utc, posted_datetime_jst, economic_date, year_month_int, amazon_order_id, seller_sku_normalized, transaction_type, price_type, price_amount_micro, currency, ingested_at)
+    VALUES (?, ?, ?, ?, 'p', ?, 'sp_api_v1', 'v1.0.0', ?, 'x', 'x', ?, ?, ?, 'sku-h0', 'Order', 'Principal', 1000000000, 'JPY', ?)`);
+  const ym = Number(YM.replace('-', ''));
+  for (const [i, o] of ['H-A', 'H-B', 'H-C'].entries()) insL.run(`h0-full-${i}`, `h0-k-${o}`, 'H0-FULL', 'hf', i + 2, Sh, `${YM}-03`, ym, o, '2026-03-01 00:00:00');
+  db.prepare(`INSERT INTO raw_amazon_settlement_headers (physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version,
+    source_settlement_id, settlement_start_date, settlement_end_date, total_amount_micro, currency, ingested_at)
+    VALUES ('h0-full-h', 'h0-hdr', 'H0-FULL', 'hf', 'p', 1, 'sp_api_v1', 'v1.0.0', ?, ?, ?, 3000000000, 'JPY', '2026-03-01 00:00:00')`).run(Sh, `${YM}-01T00:00:00+00:00`, `${YM}-15T00:00:00+00:00`);
+  insL.run('h0-part-0', 'h0-k-H-A', 'H0-PART', 'hp', 1, Sh, `${YM}-03`, ym, 'H-A', '2026-03-02 00:00:00');   // 新しい・見出しなし・一部だけ
+  V.backfillDocumentVersions(db);
+  const sel = V.selectedVersionOf(db, Sh);
+  const sql = db.prepare(`SELECT s.document_version_seq q, v.source_document_id d FROM v_amazon_settlement_selected_documents s JOIN amazon_settlement_document_versions v ON v.seq = s.document_version_seq WHERE s.settlement_id = ?`).get(Sh);
+  ok(sel && sel.source_document_id === 'H0-FULL' && sql && sql.d === 'H0-FULL', `🚨 採る版 = 見出しつきの全部の古い文書 (JS ${sel && sel.source_document_id} / SQL ${sql && sql.d})`);
+  const u = db.prepare(`SELECT COUNT(DISTINCT amazon_order_id) n, SUM(price_amount_micro) / 1000000 y FROM v_amazon_settlement_unified WHERE source_settlement_id = ?`).get(Sh);
+  ok(u.n === 3 && u.y === 3000, `build が見る行 = 3 注文・3,000 円 (${u.n} 注文・${u.y} 円 = 1 注文・1,000 円に落ちない)`);
+  const h0 = V.header0MultiVersionSettlements(db);
+  ok(h0.some((x) => x.settlement_id === Sh && x.versions === 2 && x.header0 === 1), '「見出し 0 行の版があり、ほかの版もある決済」を数える (本番のコピーで 0 件を確かめる問い合わせ)');
 }
 
 // ─── 🆕 #1567 R1 Medium 3: 本番のコピーで V1 (採っている版) と V2 の明細を比べる道具 (check-settlement-v1-v2.js・読むだけ) ───

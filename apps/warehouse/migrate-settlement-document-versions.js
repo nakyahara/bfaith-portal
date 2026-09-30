@@ -17,7 +17,8 @@
  */
 import 'dotenv/config';
 import { initDB, getDB } from './db.js';
-import { backfillDocumentVersions, refreshStaleVersionDetails, acquireCoverageLease, releaseCoverageLease, assertLease, documentVersionsReady, documentVersionProblems } from './amazon-settlement-versions.js';
+import { backfillDocumentVersions, refreshStaleVersionDetails, acquireCoverageLease, releaseCoverageLease, assertLease, documentVersionsReady, documentVersionProblems,
+  documentVersionWarnings, header0MultiVersionSettlements } from './amazon-settlement-versions.js';
 import { isAliveNodeSince } from './retry-lock.js';
 import { pathToFileURL } from 'node:url';
 
@@ -32,6 +33,12 @@ export async function runMigrate({ commit = false, log = console.log, isAlive = 
   if (!commit) {
     const groups = db.prepare(`SELECT source_layer, source_document_id, COUNT(*) n FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_docver WHERE document_version_seq IS NULL GROUP BY 1, 2 ORDER BY 1, 2`).all();
     for (const g of groups.slice(0, 50)) log(`  ${g.source_layer} ${g.source_document_id}: ${g.n} 行`);
+    // 決済 ID の決まらない文書 (見出し・明細の決済 ID が 2 つ以上) = 版を付けても決済 ID が null = 人が直す (#1567 R2 Medium 2)
+    const multi = db.prepare(`SELECT source_layer, source_document_id, COUNT(DISTINCT source_settlement_id) n FROM (
+        SELECT source_layer, source_document_id, source_settlement_id FROM raw_amazon_settlement_headers INDEXED BY idx_settle_headers_docver WHERE document_version_seq IS NULL
+        UNION ALL SELECT source_layer, source_document_id, source_settlement_id FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_docver WHERE document_version_seq IS NULL
+      ) GROUP BY 1, 2 HAVING COUNT(DISTINCT source_settlement_id) > 1`).all();
+    log(multi.length ? `[versions] 🚨 決済 ID が 2 つ以上ある文書 ${multi.length} (${multi.slice(0, 10).map((m) => `${m.source_document_id} ${m.n}`).join(' / ')}) = 版を付けても決済 ID が決まらない` : '[versions] 決済 ID が 2 つ以上ある文書 0');
     log(`[versions] dry-run (書かない)。付けるなら --commit`);
     return { ready: documentVersionsReady(db), nullLines, nullHeaders, stale, committed: false };
   }
@@ -45,8 +52,13 @@ export async function runMigrate({ commit = false, log = console.log, isAlive = 
     const problems = documentVersionProblems(db);
     log(`[versions] ${problems.length ? '⚠️' : '✅'} 版を付けた: 文書 ${out.groups}・版 ${out.versions}・明細 ${out.lines} 行・見出し ${out.headers} 行 / 要約を作り直した版 ${refreshed + (out.refreshed || 0)} / 1 取引の最長 ${out.maxTxMs || 0} ms`);
     for (const p of problems) log(`[versions] ❌ ${p.code}: ${p.detail}`);
-    if (!problems.length) log('[versions] build と送り手が読める状態 (版の無い行・途中の版・壊れた決済なし)');
-    return { ready: problems.length === 0, problems, ...out, refreshed, committed: true };
+    if (!problems.length) log('[versions] build と送り手が読める状態 (版の無い行・要約の古い版なし)');
+    const warnings = documentVersionWarnings(db);
+    for (const w of warnings) log(`[versions] ⚠️ ${w.code}: ${w.detail}`);
+    // 🚨 見出し 0 行の版があり、ほかの版もある決済 (#1567 R2 High 1) = 初回の coordinator の前に 0 件を確かめる
+    const h0 = header0MultiVersionSettlements(db);
+    log(h0.length ? `[versions] 🚨 見出し 0 行の版があり、ほかの版もある決済 ${h0.length}: ${h0.slice(0, 10).map((x) => `${x.settlement_id} (版 ${x.versions}・見出し 0 行 ${x.header0})`).join(' / ')} = どの版を採るか人が確かめてから初回を流す` : '[versions] 見出し 0 行の版があり、ほかの版もある決済 0 (✅)');
+    return { ready: problems.length === 0, problems, warnings, header0Multi: h0, ...out, refreshed, committed: true };
   } finally { releaseCoverageLease(db, lease); }
 }
 

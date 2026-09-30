@@ -10,11 +10,14 @@
  *   - 生の表 (headers / lines) は document_version_seq (版の表の整数の鍵) で版を参照する。
  *     🚨 設計書は「document_version_id を参照する」。64 文字の hash を 440 万行に持つと約 +600MB (索引を含む) = 整数の鍵で参照する (版の表で 1 対 1)
  *   - 決済ごとに採る版を 1 つ (selectDocumentVersions = SQL の view v_amazon_settlement_selected_documents と同じ規則):
- *       **中身の確かな版 (detail_valid = 1) だけ** を候補に (R1 Medium 3・fail-closed) →
+ *       **中身の確かな版 (detail_valid = 1) が先** → **見出しがちょうど 1 行の版が先** (#1567 R1 Medium 3・R2 High 1・Medium 1) →
  *       層の順 (sp_api_v1 と sp_api_v2 が同じ 1 → manual_csv 2 → ほか 3) → ingested_at の新しい順 → document_version_id の UTF-8 のバイトの順
  *     detail_valid = 見出しがちょうど 1 行・明細の部品の合計 = 見出しの total・明細の決済 ID が 1 つで見出しと同じ・通貨 JPY
- *       (例外 = 過去の行の backfill の版で見出しが 0 行 = 明細の決済 ID が 1 つなら候補にする。coverage は見出し 1 行を要る = complete にはならない)
- *     🚨 行のある決済で候補の版が 1 つも無い (中身の悪い版しか無い) = 「決済の版が壊れている」= build と送り手を止める (assertDocumentVersionsReady・行を黙って落とさない)
+ *       (例外 = 過去の行の backfill の版で見出しが 0 行 = 明細の決済 ID が 1 つなら 1。ただし並びで見出し 1 行の版より後 = ほかに候補が無いときだけ採る。
+ *        coverage は見出し 1 行を要る = complete にはならない)
+ *     🚨 良い版 (detail_valid = 1) が 1 つも無い決済は、中身の悪い版の中で一番の版を **仮に採る** (PR の前もその行で build していた = 値は動かない・
+ *       1 つの決済の違反で全部を止めない)。朝の報告と coverage の理由に「🚨 仮に採った壊れた版」(provisional_broken_version・人が直す) を出し、
+ *       正式な値は見出しの検算と frontier で null のまま (fail-closed)。その決済を除いて続ける (Render に墓石を送る) はしない
  *     財務 (SQLite の build・送り手の変換)・見出しの検算・manifest は **その版の行だけ** から作る (版をまたいで行ごとに最新を選ばない)
  *   - 版の明細の要約 detail_digest = (business_line_key, 出現順, 9 つの金額, 数量, 取引の種類, 注文番号, SKU, 計上日) を
  *     business_line_key の UTF-8 のバイトの順 → 出現順で並べた正規の JSON の SHA-256。出現順 = 同じ鍵の中の source_line_no の DENSE_RANK
@@ -55,8 +58,14 @@ export function documentVersionId({ source_layer, report_type = null, report_id 
   return canonicalSha256({ source_layer, report_type: s(report_type), report_id: s(report_id), report_document_id: s(report_document_id), file_hash: s(file_hash), normalization_version });
 }
 
-/** 採る版の並び (a が b より先 = 負)。SQL の view の ORDER BY と同じ */
+/** 採る版の並び (a が b より先 = 負)。SQL の view の ORDER BY と同じ: 中身の確かな版が先 → 見出しがちょうど 1 行の版が先 → 層 → 新しい順 → ID */
+export const validRank = (v) => (Number(v.detail_valid) === 1 ? 0 : 1);
+export const headerRank = (v) => (Number(v.header_count) === 1 ? 0 : 1);
 export function compareVersionOrder(a, b) {
+  const va = validRank(a), vb = validRank(b);
+  if (va !== vb) return va - vb;
+  const ha = headerRank(a), hb = headerRank(b);
+  if (ha !== hb) return ha - hb;
   const la = layerRank(a.source_layer), lb = layerRank(b.source_layer);
   if (la !== lb) return la - lb;
   if (a.ingested_at !== b.ingested_at) return String(a.ingested_at) > String(b.ingested_at) ? -1 : 1;   // 新しい順 ('YYYY-MM-DD HH:MM:SS' = 文字の順)
@@ -67,7 +76,7 @@ export function compareVersionOrder(a, b) {
 export function selectDocumentVersions(versions) {
   const out = new Map();
   for (const v of versions) {
-    if (v.settlement_id == null || Number(v.detail_valid) !== 1) continue;   // 中身の確かな版だけ (SQL の view と同じ)
+    if (v.settlement_id == null) continue;   // 決済 ID の決まらない版はどの決済にも採られない (SQL の view と同じ)
     const cur = out.get(v.settlement_id);
     if (!cur || compareVersionOrder(v, cur) < 0) out.set(v.settlement_id, v);
   }
@@ -169,9 +178,10 @@ export function createSettlementVersionSchema(db) {
   db.exec(`CREATE VIEW v_amazon_settlement_selected_documents AS
     SELECT settlement_id, seq AS document_version_seq, document_version_id, source_layer, report_id, report_document_id, file_hash, ingested_at
     FROM (
-      SELECT v.*, ROW_NUMBER() OVER (PARTITION BY v.settlement_id ORDER BY ${LAYER_RANK_SQL}, v.ingested_at DESC, v.document_version_id) AS rn
+      SELECT v.*, ROW_NUMBER() OVER (PARTITION BY v.settlement_id ORDER BY CASE WHEN v.detail_valid = 1 THEN 0 ELSE 1 END, CASE WHEN v.header_count = 1 THEN 0 ELSE 1 END,
+        ${LAYER_RANK_SQL}, v.ingested_at DESC, v.document_version_id) AS rn
       FROM amazon_settlement_document_versions v
-      WHERE v.settlement_id IS NOT NULL AND v.detail_valid = 1
+      WHERE v.settlement_id IS NOT NULL
     ) WHERE rn = 1`);
 
   // coverage の lease (1 行・持ち主は coordinator の親だけ)
@@ -381,10 +391,10 @@ export function registerDocumentVersion(db, meta, { registeredBy = 'ingest', now
 const HAS_ROWS = (v) => `(EXISTS (SELECT 1 FROM raw_amazon_settlement_lines l INDEXED BY idx_settle_lines_docver WHERE l.document_version_seq = ${v}.seq)
   OR EXISTS (SELECT 1 FROM raw_amazon_settlement_headers h INDEXED BY idx_settle_headers_docver WHERE h.document_version_seq = ${v}.seq))`;
 /**
- * build・送り手が決済の行を読んでよいかの問題の一覧 (空 = 読んでよい)。どれも「黙って行を落とす」を防ぐ (R1 High 1・Medium 3):
+ * build・送り手が決済の行を読んでよいかの問題の一覧 (空 = 読んでよい)。**次の回で直る一時の状態だけ** (R1 High 1・R2 Medium 1):
  *   ① 版の無い行がある (過去の行の backfill の前・途中)
- *   ② 行のある版に決済 ID が無い / 要約が古い (detail_stale = 1。backfill や取込が要約を作る前に止まった・行を手で直した)
- *   ③ 行のある決済で、採る版の候補 (detail_valid = 1) が 1 つも無い = 決済の版が壊れている (blocked)
+ *   ② 行のある版の要約が古い (detail_stale = 1。backfill や取込が要約を作る前に止まった・行を手で直した)
+ *   人が直すまで直らないもの (決済 ID の決まらない版・仮に採った壊れた版) は止めない = documentVersionWarnings (朝の報告と coverage の理由)
  */
 export function documentVersionProblems(db) {
   const out = [];
@@ -392,20 +402,39 @@ export function documentVersionProblems(db) {
     || db.prepare(`SELECT 1 FROM raw_amazon_settlement_headers INDEXED BY idx_settle_headers_docver WHERE document_version_seq IS NULL LIMIT 1`).get()) {
     out.push({ code: 'rows_without_version', detail: '決済の生の行に文書の版 (document_version_seq) の無い行がある = 過去の行の backfill がまだ・途中 → node apps/warehouse/migrate-settlement-document-versions.js --commit (coordinator の回の始めでも流れる)' });
   }
-  const bad = db.prepare(`SELECT v.seq, v.settlement_id, v.detail_stale FROM amazon_settlement_document_versions v
-     WHERE (v.settlement_id IS NULL OR v.detail_stale = 1) AND ${HAS_ROWS('v')} ORDER BY v.seq LIMIT 5`).all();
-  if (bad.length) out.push({ code: 'version_incomplete', detail: `行のある文書の版に決済 ID が無い・要約が古い (${bad.map((b) => `#${b.seq} ${b.settlement_id ?? '決済なし'}${b.detail_stale ? '・要約が古い' : ''}`).join(' / ')}) = 版付け・取込が途中で止まった → migrate-settlement-document-versions.js --commit か coordinator の次の回で作り直す` });
-  const blocked = blockedSettlements(db);
-  if (blocked.length) out.push({ code: 'settlement_blocked', detail: `🚨 決済の版が壊れている = 採れる版が 1 つも無い決済 ${blocked.length} (${blocked.slice(0, 5).map((b) => `${b.settlement_id} (版 ${b.versions})`).join(' / ')}) → 見出しの数・部品の合計・通貨を確かめる (行を黙って落とさないために build と送り手を止めている)` });
+  const bad = db.prepare(`SELECT v.seq, v.settlement_id FROM amazon_settlement_document_versions v
+     WHERE v.detail_stale = 1 AND ${HAS_ROWS('v')} ORDER BY v.seq LIMIT 5`).all();
+  if (bad.length) out.push({ code: 'version_incomplete', detail: `行のある文書の版の要約が古い (${bad.map((b) => `#${b.seq} ${b.settlement_id ?? '決済なし'}`).join(' / ')}) = 版付け・取込が途中で止まった・行を手で直した → migrate-settlement-document-versions.js --commit か coordinator の次の回で作り直す` });
   return out;
 }
-/** 行のある決済で、採る版の候補 (detail_valid = 1) が 1 つも無いもの */
-export function blockedSettlements(db) {
-  return db.prepare(`SELECT v.settlement_id, COUNT(*) AS versions FROM amazon_settlement_document_versions v
-     WHERE v.settlement_id IS NOT NULL AND ${HAS_ROWS('v')}
-     GROUP BY v.settlement_id HAVING SUM(CASE WHEN v.detail_valid = 1 THEN 1 ELSE 0 END) = 0 ORDER BY v.settlement_id`).all();
+/**
+ * 人が直すまで直らない版の問題 (止めない・朝の報告と coverage の理由に出す・retry しない。#1567 R2 Medium 1 / 2):
+ *   version_unresolved_settlement = 行のある版の決済 ID が決まらない (見出し・明細の決済 ID が 2 つ以上) = その版の行はどの決済にも採られない
+ *   provisional_broken_version    = 良い版が無い決済で、中身の悪い版を仮に採っている (見出しの数・部品の合計・通貨を人が確かめる)
+ */
+export function documentVersionWarnings(db) {
+  const out = [];
+  const unresolved = db.prepare(`SELECT v.seq, v.report_id, v.source_document_id FROM amazon_settlement_document_versions v
+     WHERE v.settlement_id IS NULL AND ${HAS_ROWS('v')} ORDER BY v.seq`).all();
+  if (unresolved.length) out.push({ code: 'version_unresolved_settlement', human: true, count: unresolved.length,
+    detail: `🚨 決済 ID の決まらない文書の版 ${unresolved.length} (${unresolved.slice(0, 5).map((u) => `#${u.seq} ${u.report_id ?? u.source_document_id}`).join(' / ')}) = 見出し・明細の決済 ID が 2 つ以上 = その版の行はどの決済にも採られない → 文書を確かめる (次の回では直らない)` });
+  const prov = provisionalBrokenSettlements(db);
+  if (prov.length) out.push({ code: 'provisional_broken_version', human: true, count: prov.length,
+    detail: `🚨 仮に採った壊れた版 ${prov.length} 決済 (${prov.slice(0, 5).map((p) => `${p.settlement_id} #${p.seq} 見出し ${p.header_count}`).join(' / ')}) = 良い版が無いので中身の悪い版で build・送信している (正式な値は null) → 見出しの数・部品の合計・通貨を確かめる` });
+  return out;
 }
-/** 版の無い行・途中の版・壊れた決済が無いか */
+/** 良い版 (detail_valid = 1) が無く、中身の悪い版を仮に採っている決済 (行のあるもの) */
+export function provisionalBrokenSettlements(db) {
+  return db.prepare(`SELECT s.settlement_id, v.seq, v.header_count, v.detail_valid FROM v_amazon_settlement_selected_documents s
+     JOIN amazon_settlement_document_versions v ON v.seq = s.document_version_seq
+     WHERE COALESCE(v.detail_valid, 0) <> 1 AND ${HAS_ROWS('v')} ORDER BY s.settlement_id`).all();
+}
+/** 見出しが 0 行の版がある決済で、ほかの版もあるもの (#1567 R2 High 1 = 本番のコピーで 0 件を確かめてから初回を流す) */
+export function header0MultiVersionSettlements(db) {
+  return db.prepare(`SELECT settlement_id, COUNT(*) AS versions, SUM(header_count = 0) AS header0 FROM amazon_settlement_document_versions
+     WHERE settlement_id IS NOT NULL GROUP BY 1 HAVING SUM(header_count = 0) > 0 AND COUNT(*) > 1 ORDER BY 1`).all();
+}
+/** 版の無い行・要約の古い版が無いか (一時の状態だけ) */
 export function documentVersionsReady(db) { return documentVersionProblems(db).length === 0; }
 /** build・送り手の前の確かめ (問題があれば止める = 黙って行を落とさない) */
 export function assertDocumentVersionsReady(db) {
