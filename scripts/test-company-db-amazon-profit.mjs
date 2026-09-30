@@ -26,7 +26,8 @@ const rejects = async (fn, re) => { let threw = null; try { await fn(); } catch 
 const quiet = () => {};
 
 const pg = new PGlite();
-const applied = await applyMigrations(pgliteAdapter(pg), { log: quiet });
+// 0050 (速くした本体) の結果が 0049 と完全に同じかを確かめるため、まず 0049 まで流してデータを入れ、控えを取ってから 0050 を流す (下の「0050 = 0049」の試験)
+const applied = await applyMigrations(pgliteAdapter(pg), { log: quiet, to: '0049' });
 assert.ok(applied.applied.includes('0049'), '0049 が流れていない');
 const one = async (sql, p = []) => (await pg.query(sql, p)).rows[0];
 const co = 1;
@@ -38,12 +39,12 @@ const C4 = (c = 0, m = 0, a = 0, u = 0) => ({ unclassified_component_count: c, u
 const row = (date, sku, x = {}) => ({ economic_date_jst: date, seller_sku: sku, line_kind: sku === '-' ? 'unknown' : 'sku', source: U, source_lines: 1, source_updated_at: `${date}T00:00:00Z`, content_hash: 'h', ...x });
 const v2 = (date, sku, x = {}) => row(date, sku, { ...C4(), ...x });
 let seq = 0;
-const apply = async (order, rows) => {
+const apply = async (order, rows, version = null) => {
   const legacy = rows.length > 0 && financeRowsFormat(rows) !== 'v2';   // 墓石 (空の集合) は今の形の版で送る (旧い版への戻しは拒まれる)
   const content = validateFinanceRows(order, rows);
   const checksum = orderFinanceChecksum(content, { legacy });
   const lines = content.map((c, i) => { const o = { ...c, source_updated_at: rows[i].source_updated_at, content_hash: rows[i].content_hash }; if (legacy) for (const k of CLASS_COLUMNS) delete o[k]; return o; });
-  const r = (await one(`select core.apply_order_finance_batch($1::smallint, 'amazon', 'jp', $2, $3::bigint, $4, $5, $6::jsonb) as r`, [co, order, ++seq, checksum, legacy ? 't1' : 'amazon_finance_v2', JSON.stringify(lines)])).r;
+  const r = (await one(`select core.apply_order_finance_batch($1::smallint, 'amazon', 'jp', $2, $3::bigint, $4, $5, $6::jsonb) as r`, [co, order, ++seq, checksum, version ?? (legacy ? 't1' : 'amazon_finance_v2'), JSON.stringify(lines)])).r;
   assert.equal(r, 'applied', `${order}: ${r}`);
 };
 
@@ -115,6 +116,7 @@ await apply('OK1', [v2('2026-06-14', 'LK', { units_ordered: 1, sales_principal_j
 await apply('OK2', [v2('2026-06-15', 'LK', { units_ordered: 1, sales_principal_jpy: 900 })]);
 await apply('O11', [v2('2026-06-10', 'LB', { units_ordered: 1, sales_principal_jpy: 1000, unmapped_jpy: -3, ...C4(2, 0, 200, 1) })]);   // 分けられない部品 (+100 / −100 = 金額 0 でも 2 つ) と unmapped
 await apply('OL', [row('2026-06-11', 'LG', { units_ordered: 1, sales_principal_jpy: 400 })]);   // 旧い形 (4 列なし・t1)
+await apply('OV3', [v2('2026-06-25', 'LK', { units_ordered: 1, sales_principal_jpy: 400 })], 'amazon_finance_v3');   // 今の形のより新しい版 (4 列あり) = 旧い形ではない (0050 の文字の比較の前置きの確かめ)
 await apply('OH', [v2('2026-06-12', 'LH', { refund_principal_jpy: -500, refund_principal_customer_jpy: -500 })]);   // 6 月に売上が無い = 単価が無い
 await apply('OM', [v2('2026-06-16', 'LM', { units_ordered: 1, sales_principal_jpy: 500 })]);   // 出品を作る前 = 受け取ったときは未解決
 await apply('ON', [v2('2026-06-16', 'LN', { units_ordered: 1, sales_principal_jpy: 500 })]);   // 受け取ったときは LN1
@@ -164,6 +166,44 @@ const dayOf = (tot, d) => tot.find((x) => x.row_kind === 'day' && x.ed === d);
 const ORDER = ['finance_incomplete', 'finance_unclassified', 'refund_units_unknown', 'refund_units_partial_month', 'listing_unresolved', 'composition_missing', 'cost_missing',
   'ad_not_collected', 'ad_missing', 'ad_legacy_unverified', 'ad_unresolved'];
 const BEFORE_CODES = ORDER.slice(0, 7);
+
+// ─── 0049 のままで控え (coverage の 3 つの状態 × 4 つの期間 × 行と日の合計) → 0050 を流す ───
+const SNAP_COVERAGE = [[null], ['2026-06-30', 5, 42], ['2026-06-10']];
+const SNAP_PERIODS = [['2026-06-01', '2026-06-30'], ['2026-01-01', '2026-01-31'], ['2026-06-13', '2026-06-14'], ['2026-05-20', '2026-07-10']];
+const snapshot = async () => {
+  const out = [];
+  for (const cov of SNAP_COVERAGE) {
+    await setCoverage(...cov);
+    for (const [f, to] of SNAP_PERIODS) {
+      for (const [kind, sql] of [['daily', `select * from mart.amazon_profit_daily_range(1::smallint, 'amazon', 'jp', $1::date, $2::date) order by 1, 2, 3, 4, 5, 6`],
+        ['totals', `select * from mart.amazon_profit_day_totals_range(1::smallint, 'amazon', 'jp', $1::date, $2::date) order by 1, 2, 3, 4, 5, 6`]]) {
+        const rows = (await pg.query(sql, [f, to])).rows.map(({ calculated_at, ...rest }) => JSON.stringify(rest));
+        out.push({ label: `${kind} ${f}〜${to} coverage=${cov[0]}`, rows });
+      }
+    }
+  }
+  await setCoverage(null);
+  return out;
+};
+const SNAP_0049 = await snapshot();
+const applied50 = await applyMigrations(pgliteAdapter(pg), { log: quiet });
+assert.ok(applied50.applied.includes('0050'), '0050 が流れていない');
+
+console.log('0050 (速くした本体) = 0049');
+await t('🚨 0050 の行の本体・日の合計は 0049 と結果が完全に同じ (coverage の 3 つの状態 × 4 つの期間 × 行と日の合計・calculated_at を除く全部の列・行の順も)', async () => {
+  const now = await snapshot();
+  assert.equal(now.length, SNAP_0049.length);
+  let rows = 0;
+  for (let i = 0; i < now.length; i++) {
+    assert.equal(now[i].rows.length, SNAP_0049[i].rows.length, `${now[i].label} の行の数`);
+    for (let j = 0; j < now[i].rows.length; j++) assert.equal(now[i].rows[j], SNAP_0049[i].rows[j], `${now[i].label} の ${j} 行目`);
+    rows += now[i].rows.length;
+  }
+  assert.ok(rows > 500, String(rows));
+  // 0050 の本体はこの関数の中だけ work_mem と nested loop の設定を持つ (幅の広い行がディスクに溢れない・見込み違いの nested loop を選ばない)
+  const cfg = (await one(`select array_to_string(p.proconfig, ',') as c from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'mart' and p.proname = '_amazon_profit_rows'`)).c;
+  assert.match(String(cfg), /work_mem=64MB/); assert.match(String(cfg), /enable_nestloop=off/);
+});
 
 console.log('coverage (決済のそろい) の差し込み口');
 await t('🚨 core.finance_coverage_state は今は 1 行・全部 null = 全部の日が provisional / missing・正式な値と世代・版は全部 null・0 と仮定の値は出る', async () => {
@@ -265,6 +305,8 @@ await t('🚨 分けられない部品 (+100 / −100 = 金額 0 でも数) と 
   assert.deepEqual([b10.contribution_before_ad_incl_jpy, b10.profit_incomplete_reasons, N(b10.contribution_before_ad_assuming_incomplete_zero_incl_jpy)], [null, ['finance_unclassified'], 1000]);
   const g = at(rows, '2026-06-11', LG);
   assert.deepEqual([g.finance_legacy_rows, g.unclassified_component_count, g.contribution_before_ad_incl_jpy, g.profit_incomplete_reasons], [1, 0, null, ['finance_unclassified']]);
+  const v3 = at(rows, '2026-06-25', LK);   // 今の形のより新しい版 (amazon_finance_v3) は旧い形ではない
+  assert.deepEqual([v3.finance_legacy_rows, v3.profit_incomplete_reasons, N(v3.contribution_before_ad_incl_jpy)], [0, [], 400 - 120]);
   const h = at(rows, '2026-06-12', LH);
   assert.deepEqual([h.refund_units_status, h.refund_incomplete_child_count, N(h.refund_unestimated_jpy), h.units_refunded_customer, h.contribution_before_ad_incl_jpy, h.profit_incomplete_reasons, h.assumed_zero_reasons],
     ['unit_price_missing', 1, 500, 0, null, ['refund_units_unknown'], ['refund_units_unknown']]);
@@ -561,12 +603,17 @@ await t('🚨 材料は 1 回だけ計算する (#1559 Codex R1 Medium 1): 日�
 });
 
 console.log('契約');
-await t('from <= to・最大 400 日 (両端を含む)・amazon / jp だけ・null は拒む (22023)', async () => {
+await t('from <= to・行は最大 400 日・日の合計は最大 93 日 (0050・両端を含む)・amazon / jp だけ・null は拒む (22023)', async () => {
   for (const fn of ['amazon_profit_daily_range', 'amazon_profit_day_totals_range']) {
     const q = (m, s, f, to) => pg.query(`select count(*) from mart.${fn}(1::smallint, $1, $2, $3::date, $4::date)`, [m, s, f, to]);
     await rejects(() => q('amazon', 'jp', '2026-06-02', '2026-06-01'), /invalid_input: from/);
     await rejects(() => q('amazon', 'jp', '2026-01-01', '2027-02-05'), /400 日/);
-    await q('amazon', 'jp', '2026-01-01', '2027-02-04');
+    if (fn === 'amazon_profit_daily_range') await q('amazon', 'jp', '2026-01-01', '2027-02-04');
+    else {
+      await q('amazon', 'jp', '2026-06-01', '2026-09-01');   // 93 日
+      const e = await rejects(() => q('amazon', 'jp', '2026-06-01', '2026-09-02'), /93 日まで/);   // 94 日 (0049 は 400 日まで = 本番で 1〜9 月が 120 秒で打ち切り)
+      assert.equal(e.code, '22023');
+    }
     await rejects(() => q('rakuten', 'jp', '2026-06-01', '2026-06-01'), /amazon \/ jp だけ/);
     await rejects(() => q('amazon', 'us', '2026-06-01', '2026-06-01'), /amazon \/ jp だけ/);
     await rejects(() => q('amazon', 'jp', null, '2026-06-01'), /invalid_input/);
@@ -604,12 +651,12 @@ await t('鍵が無ければ 401 / 契約の外は 400 (from > to・401 日・実
   }
   assert.equal((await http('/amazon-profit/daily?mall=rakuten&scope=jp&from=2026-06-01&to=2026-06-01')).status, 400);
   assert.equal((await http('/amazon-profit/daily?mall=amazon&scope=us&from=2026-06-01&to=2026-06-01')).status, 400);
-  // /daily = 1 回 93 日まで (行が多い = 長い期間は日の範囲で区切る) / /totals = 400 日まで (#1559 Codex R1 Medium 1)
-  assert.equal((await http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-01&to=2026-09-01')).status, 200);   // 93 日
-  const d94 = await http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-01&to=2026-09-02');
-  assert.deepEqual([d94.status, /93 days/.test(d94.json.error)], [400, true]);
-  assert.equal((await http('/amazon-profit/totals?mall=amazon&scope=jp&from=2026-01-01&to=2027-02-04')).status, 200);   // 400 日
-  assert.equal((await http('/amazon-profit/totals?mall=amazon&scope=jp&from=2026-01-01&to=2027-02-05')).status, 400);
+  // /daily も /totals も 1 回 93 日まで (#1559 Codex R1 Medium 1・0050 で /totals も 400 → 93 日 = 本番で 1〜9 月が 120 秒で打ち切り)
+  for (const kind of ['daily', 'totals']) {
+    assert.equal((await http(`/amazon-profit/${kind}?mall=amazon&scope=jp&from=2026-06-01&to=2026-09-01`)).status, 200, `${kind} 93 日`);
+    const d94 = await http(`/amazon-profit/${kind}?mall=amazon&scope=jp&from=2026-06-01&to=2026-09-02`);
+    assert.deepEqual([d94.status, /93 days/.test(d94.json.error)], [400, true], `${kind} 94 日`);
+  }
 });
 await t('🚨 /daily = 関数の行 (ID と ID の配列は 10 進の文字列・円は数・税抜などは小数 2 桁の文字列・日付は YYYY-MM-DD) / /totals = row_kind つき', async () => {
   const r = await http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-05&to=2026-06-06');
