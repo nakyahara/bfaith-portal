@@ -34,7 +34,7 @@
  *   node apps/company-db/push/amazon-finance.mjs --from 2026-08-01 --to 2026-08-31 --dry-run     → 送らずに件数・1 注文の最大の行数・最大の JSON・拾われない金額
  *   node apps/company-db/push/amazon-finance.mjs --from 2026-08-01 --to 2026-08-31               → 1 か月だけ送る (上限の env が要る)
  *   node apps/company-db/push/amazon-finance.mjs --reconcile [--all]                             → 突き合わせ (差があれば exit 1)
- *   node apps/company-db/push/amazon-finance.mjs --incremental --require-backfilled | --full --require-backfilled   (F2b-3 の daily-sync)
+ *   node apps/company-db/push/amazon-finance.mjs --incremental --require-backfilled --dry-run | --full --require-backfilled --dry-run   (🆕 送る回は coordinator の中だけ = 単独は dry-run)
  *   node apps/company-db/push/amazon-finance.mjs --mark-backfilled                                → 全期間の突き合わせが一致したら完了印
  *   node apps/company-db/push/amazon-finance.mjs --reset-ledger                                   → 台帳の指紋を空にする
  * env: DATA_DIR / RENDER_MIRROR_URL / MIRROR_SYNC_KEY / CDB_PUSH_CHUNK / CDB_DB_LIMIT_BYTES (必須・送るとき) / CDB_FINANCE_ROW_BYTES / CDB_FINANCE_REPLACE_FACTOR / CDB_WAL_ALLOWANCE_BYTES / CDB_CAPACITY_MARGIN_BYTES

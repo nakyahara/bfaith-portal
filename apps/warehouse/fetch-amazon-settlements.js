@@ -516,7 +516,7 @@ export function prepareV2ReportTsv(v2Tsv, reportId, runId, opts = {}) {
  *   coverage はその V2 を満たせない = complete にしない = 規則を足すまで正式な利益は出ない)
  * opts = { dryRun, reportDocumentId, lease, layer ('manual_csv'), fileName }
  */
-export function processV2Report(db, v2Tsv, reportId, runId, { dryRun = false, reportDocumentId = null, lease = null, layer = null, fileName = null } = {}) {
+export function processV2Report(db, v2Tsv, reportId, runId, { dryRun = false, reportDocumentId = null, lease = null, layer = null, fileName = null, now = null } = {}) {
   let settlementId = null;
   try { settlementId = parseV2Tsv(v2Tsv).rows.map((r) => r['settlement-id']).find((x) => x) || null; }
   catch (e) { return { status: 'blocked', reason: `V2 として読めない: ${e.message}`, unknown: [], itemCodeUnresolved: 0, coveredByOtherVersion: false }; }
@@ -529,7 +529,7 @@ export function processV2Report(db, v2Tsv, reportId, runId, { dryRun = false, re
   if (p.unknown.length || p.itemCodeUnresolved) return { ...base, status: 'blocked', reason: `規則に無い組み合わせ ${JSON.stringify(p.unknown)} / 品物の番号を補えないポイントの行 ${p.itemCodeUnresolved}` };
   if (!p.headerRow || p.headerRow.source_settlement_id !== settlementId) return { ...base, status: 'blocked', reason: '決済の見出しの行が無い / 明細と決済の番号が違う' };
   if (dryRun) return { ...base, status: 'dry_run' };
-  return { ...base, status: 'ingested', result: ingestSettlement(db, p.headerRow, p.lineRows, p.ctx, { lease }) };
+  return { ...base, status: 'ingested', result: ingestSettlement(db, p.headerRow, p.lineRows, p.ctx, { lease, now }) };
 }
 
 /** その決済の文書の版が既にあるか (層を問わない) */
@@ -547,7 +547,8 @@ export function settlementIngestedByV1(db, settlementId) {
 // 🆕 2026-10-01 (D7b-1b-3): 1 取引の中で ① lease (coordinator の世代・token) を確かめる ② 採っている版を読む ③ 版を登録 ④ 行を入れる (trigger = source_revision・読み直す注文)
 //   ⑤ 版の要約 (件数・detail_digest・見出し) を作り直す (行が入ったときだけ) ⑥ 採る版が変わったら旧い版の全部の注文を「読み直す注文」に記録
 //   opts.lease = coordinator の lease ({ runToken, generation })。無い = 試験・backfill だけ (本番の取込は coordinator の中で lease を渡す)
-export function ingestSettlement(db, headerRow, lineRows, ctx, { lease = null } = {}) {
+//   opts.now = 版の ingested_at (採る版の「新しい順」) の時計 (() => Date。既定 = 今)。coordinator は回の時計を渡す
+export function ingestSettlement(db, headerRow, lineRows, ctx, { lease = null, now = null } = {}) {
   const insertHeader = db.prepare(INSERT_HEADER_SQL);
   const insertLine = db.prepare(INSERT_LINE_SQL);
   const upsertDimTx = db.prepare(UPSERT_DIM_TX_SQL);
@@ -569,7 +570,7 @@ export function ingestSettlement(db, headerRow, lineRows, ctx, { lease = null } 
   const txn = db.transaction(() => {
     if (lease) assertLease(db, lease);
     selectedBefore = selectedVersionOf(db, settlementId);
-    version = registerDocumentVersion(db, { ...ctx.versionMeta, document_version_id: ctx.documentVersionId, source_document_id: String(ctx.sourceDocumentId), settlement_id: settlementId, ingested_at: nowSql() });
+    version = registerDocumentVersion(db, { ...ctx.versionMeta, document_version_id: ctx.documentVersionId, source_document_id: String(ctx.sourceDocumentId), settlement_id: settlementId, ingested_at: (now ? now() : new Date()).toISOString().replace('T', ' ').slice(0, 19) });
     if (version.settlement_id !== settlementId) throw new Error(`文書の版 ${version.document_version_id.slice(0, 12)}… の決済 ID (${version.settlement_id}) が ${settlementId} と違う`);
     if (headerRow) {
       const r = insertHeader.run({ ...headerRow, document_version_seq: version.seq });
@@ -726,7 +727,7 @@ export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = nu
         const tsv = await download(r.reportDocumentId);
         doc.fileHash = sha256(tsv);   // raw の source_file_hash と同じ式 (V2 は並べ直す前の元のファイル)
         if (args.source === 'v2') {
-          const v = processV2Report(db, tsv, r.reportId, runId, { dryRun: args.dryRun, reportDocumentId: r.reportDocumentId, lease });
+          const v = processV2Report(db, tsv, r.reportId, runId, { dryRun: args.dryRun, reportDocumentId: r.reportDocumentId, lease, now });
           if (v.prepared) console.log(`  bytes: ${tsv.length}, rows: ${v.prepared.rowCount} (V2 の元の行 ${v.prepared.v2RowCount} → V1 の形), lines=${v.prepared.lineRows.length}`);
           if (v.status === 'blocked') {
             if (v.coveredByOtherVersion) {
@@ -772,7 +773,7 @@ export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = nu
           continue;
         }
 
-        const result = ingestSettlement(db, headerRow, lineRows, ctx, { lease });
+        const result = ingestSettlement(db, headerRow, lineRows, ctx, { lease, now });
         console.log(`  inserted: header=${result.headerInserted}, lines=${result.lineInserted}, dirty_months=${result.dirtyMonths.join(',')}, 版 #${result.documentVersionSeq}`);
         totalHeaders += result.headerInserted;
         totalLines += result.lineInserted;

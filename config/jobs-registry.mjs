@@ -460,7 +460,14 @@ export const JOBS_REGISTRY = [
       + '出すもの = DATA_DIR/lz-daily/<日付>/<実行ID>/ と証跡 lz-daily。新しい定期実行は無い)。'
       + '冒頭の「Settlement冪等性テスト」の後に「Settlement V2 並べ直しテスト」(apps/warehouse/test-settlement-v2.js。2026-09-28 に決済の取込を V2 に切り替えた = #1508) と '
       + '「Settlement 重複除去テスト」(apps/warehouse/test-settlement-dedup-occurrence.js。同じ決済の同じ鍵の本物の別々の行を潰さない = 出現順つき。#1511) も走る (どちらも一時 DB だけ・失敗しても後続は止めない。新しい定期実行は無い)。'
-      + '「Amazon Settlement」(fetch-amazon-settlements.js) は 2026-09-30 (D7b-1b の下ごしらえ・設計 = AI_reference CompanyDB構想/13 §3.1) から決済のレポートの一覧も warehouse.db の amazon_settlement_report_inventory_runs / amazon_settlement_report_inventory に記録する '
+      + '🆕 2026-10-01 (D7b-1b-3・設計 = AI_reference CompanyDB構想/13 §3.1・D-65・D-66): 前の「Amazon Settlement」(取込) と「CompanyDB財務(Amazon)」(Company DB Amazon 財務 push) の 2 工程を '
+      + '「Amazon決済と財務」(apps/warehouse/amazon-finance-coverage-run.js = coordinator・工程の上限 90 分) の 1 工程にまとめた (新しい定期実行ではない・retry の単位も同じ 1 工程)。'
+      + 'coordinator は warehouse.db の lease (amazon_finance_coverage_lease の 1 行・持ち主の判定は retry-lock.js と同じ) を持ち、① 過去の決済の行に文書の版を付ける (初回だけ数分) '
+      + '② Render の決済のそろい (core.finance_coverage・0051) を新しい世代で updating (失敗なら取込を始めない) ③ 手で積んだ決済のファイル (amazon-settlement-manual-file.js) → SP-API の取込 (V2・一覧を記録) '
+      + '④ 財務の送信 (全部の chunk に世代・token・coverage の回は --full) ⑤ 完成の判定 (一覧の鎖・初期の印・採った文書の版・receipt digest・source_revision の読み直し) → complete を 1 回として回す。'
+      + '財務のバックフィルの完了印の前 = 取込だけ (最後の行に「財務 push: ⏭️」)・Render に 0051 が無い = 今までの送り方 (⚠️)・初期の印が無いなど人が直すまで complete にしない = ⚠️ (exit 0。正式な利益は null のまま)・'
+      + '失敗 = ❌ (retry)・取り込めない V2 = 終了コード 3。初期の印 = apps/warehouse/amazon-finance-initial-marker.js (Seller Central の過去の決済情報)。冒頭に「Settlement 文書の版テスト」(test-settlement-document-versions.js・一時 DB) も走る。'
+      + '(以下は取込の中身の説明) 決済のレポートの一覧は 2026-09-30 (D7b-1b の下ごしらえ) から warehouse.db の amazon_settlement_report_inventory_runs / amazon_settlement_report_inventory に記録する '
       + '(取込のダウンロードのループが全部終わった後に別の getReports・窓 = 回の開始の時刻から 85 日前を明示・時間の上限 120 秒・report ごとの取込の結果と 1 回で書く。取込む行は変わらない)。一覧が最後のページまで取れない・一覧の要求の失敗・記録の失敗 = 完了の行の末尾に ⚠️ (取込の結果・終了コードは変えない)。今は記録だけ (読み手は後の coverage)。'
       + '冒頭に「Settlement 一覧テスト」(apps/warehouse/test-settlement-inventory.js・一時 DB・SP-API は差し替え) も走る。新しい定期実行は無い。'
       + '「Amazon finance build / sync」(日次の財務 f_amazon_finance_sku_daily_v1 を作って Render へ) は 2026-09-28 から **当月 + 直近 35 日に決済の行が入った月** を全部作り直す '
@@ -472,10 +479,10 @@ export const JOBS_REGISTRY = [
       + '2026-09-29 (F2b-2・#1534) から「Amazonアカウントフィー build / sync」はふだん 14 か月・DATA_DIR/amazon-account-fees-pending.json (月の手数料のやり残し = Company DB の Amazon 財務との突き合わせで差が出た月) があれば '
       + 'その一番古い月まで (最大 60 か月) さかのぼって作り直す (--from-month で始まりの月を明示 = 途中で月をまたいでも範囲がずれない)。やり残しは build と sync の両方が通った後にだけ消す。'
       + 'やり残しのファイルが読めない・60 か月より古い = ⚠️ (Amazonアカウントフィー やり残し)。さかのぼる回は所要時間が延びる (1 か月あたり数秒〜十数秒の見込み)。新しい定期実行は無い。'
-      + '「Amazonアカウントフィー build / sync」の後に「Company DB Amazon 財務 push」(apps/company-db/push/amazon-finance.mjs。F2b-3・設計 = AI_reference CompanyDB構想/12 §5。'
+      + '「Amazonアカウントフィー build / sync」の後に (2026-10-01 まで) 「Company DB Amazon 財務 push」(apps/company-db/push/amazon-finance.mjs。F2b-3・設計 = AI_reference CompanyDB構想/12 §5。🆕 送信は「Amazon決済と財務」の中に移った・突き合わせだけここに残る。'
       + '決済の行を 注文 × 計上日 × SKU × 行の種類 にまとめて Company DB (0043) へ。日曜は --full = 全部を集約し直す + Render にだけある鍵に空の集合・ほかは --incremental。'
       + 'バックフィルの完了印 (台帳 DATA_DIR/company-db-push.db の order_finance:amazon) の前は「⏭️ バックフィル前」で送らない。容量の上限 CDB_DB_LIMIT_BYTES が無ければ送らない (D-W5)。'
-      + '送信の失敗・送れない鍵 = ❌ (retry = --full)・拾われない金額 = ⚠️) → 送れたら「Company DB Amazon 財務 突き合わせ」(--reconcile。直近 45 日 + 未照合の月の 日 × SKU と月の手数料を SQLite と。'
+      + '送信の失敗・送れない鍵 = ❌ (retry = Amazon決済と財務)・拾われない金額 = ⚠️) → 送れた朝 (最後の行に「財務 push (」がある) だけ「Company DB Amazon 財務 突き合わせ」(--reconcile。直近 45 日 + 未照合の月の 日 × SKU と月の手数料を SQLite と。'
       + '差の月は amazon-finance-pending.json / amazon-account-fees-pending.json に登録 = 次の朝の build が作り直す。差が 1 回目 ⚠️・2 回続けば ❌・retry には載せない)。新しい定期実行は無い。'
       + '🚨 2026-09-30 (D7b-1a・PR #1554・受け皿 0047 / 0048) から財務の送り手の変換の版は amazon_finance_v2 (行に「分けられない決済の部品」の 4 列)。'
       + '版が変わると --incremental も全部 (約 51 万注文) を選ぶ = 手で --full を済ませる前の朝の daily-sync は 1 工程 30 分の上限に当たりうる → マージの夜に手で --full を済ませる。'
@@ -1411,13 +1418,14 @@ export const JOBS_REGISTRY = [
     importance: 'TMP',
     owner: '中原さん',
     purpose: 'Amazon 決済レポートの取込 (fetch-amazon-settlements.js) を 2026-09-28 に V2 (GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2) に切り替えた。'
-      + 'V1 (GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE) に戻す逃げ道 --source v1 と、V2 で V1 取込済みの決済を入れない判定 (settlementIngestedByV1) を残してある。'
+      + 'V1 (GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE) に戻す逃げ道 --source v1 (coordinator amazon-finance-coverage-run.js の引数) を残してある。'
+      + '(2026-10-01 D-66: V2 で V1 取込済みの決済を入れない判定 (settlementIngestedByV1) は取込では使わなくなった = V2 も必ず文書の版として保存。関数は調べ用に残る)。'
       + 'V1 は 2026-11-11 に Amazon 側で廃止 = その後は使えない',
-    where: 'bfaith-portal リポジトリ apps/warehouse/fetch-amazon-settlements.js (SOURCES.v1・--source・settlementIngestedByV1)',
+    where: 'bfaith-portal リポジトリ apps/warehouse/fetch-amazon-settlements.js (SOURCES.v1・settlementIngestedByV1) と apps/warehouse/amazon-finance-coverage-run.js (--source)',
     remove_by: '2026-11-30',
     lifecycle: 'temporary',
-    runbook: '11/11 以降、毎朝の Amazon Settlement (V2) が問題なく動いていたら --source v1 の分岐を消す。'
-      + 'settlementIngestedByV1 は V1 で入れた決済が 98 日の取得窓から外れる (2027-02 ごろ) まで残してよい (消す PR で判断)。このエントリも消す',
+    runbook: '11/11 以降、毎朝の Amazon決済と財務 (V2) が問題なく動いていたら --source v1 の分岐を消す。'
+      + 'settlementIngestedByV1 (調べ用) も同じ PR で消してよい。このエントリも消す',
   },
   {
     id: 'rclone-own-client-id',

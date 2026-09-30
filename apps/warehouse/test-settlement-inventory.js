@@ -142,7 +142,7 @@ const v1Prep = prepareReportTsv(tsvOf(V1_COLUMNS, [
   { 'settlement-id': 'S-V1', 'settlement-start-date': '2099-01-01T00:20:09+00:00', 'settlement-end-date': '2099-01-15T00:20:09+00:00', 'deposit-date': '2099-01-17T00:20:09+00:00', 'total-amount': '300.00', currency: 'JPY' },
   { 'settlement-id': 'S-V1', 'marketplace-name': 'Amazon.co.jp', 'posted-date': '2099-01-05T01:00:00+00:00', 'transaction-type': 'Order', 'order-id': 'O9', sku: 'SKU-Y', 'price-type': 'Principal', 'price-amount': '300.00' },
 ]), 'R-V1-OLD', 'seed');
-ingestSettlement(db, v1Prep.headerRow, v1Prep.lineRows, v1Prep.ctx);
+ingestSettlement(db, v1Prep.headerRow, v1Prep.lineRows, v1Prep.ctx, { now: () => new Date('2026-09-01T00:00:00Z') });   // 版の ingested_at = 回の時計 (下の回より前)
 
 const runs = () => db.prepare(`SELECT * FROM amazon_settlement_report_inventory_runs ORDER BY id`).all();
 const rows = (runId) => db.prepare(`SELECT * FROM amazon_settlement_report_inventory WHERE inventory_run_id = ? ORDER BY report_id`).all(runId);

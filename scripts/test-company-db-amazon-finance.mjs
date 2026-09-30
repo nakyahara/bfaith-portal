@@ -866,26 +866,25 @@ await t('日曜 (JST の業務日) は --full・ほかは --incremental・どち
   assert.deepEqual(amazonFinanceDailyArgs('2026-10-03'), ['--incremental', '--require-backfilled']); // 土曜
   assert.throws(() => amazonFinanceDailyArgs('2026/10/04'), /YYYY-MM-DD/);
 });
-await t('daily-sync: 手数料の工程の後に送り手 → 送れたときだけ突き合わせ・送り手は retry (--full)・突き合わせは retry に載せない', async () => {
+await t('daily-sync (🆕 2026-10-01 D7b-1b-3): 決済の取込と財務の送信は coordinator の 1 工程 (Amazon決済と財務)・送れたときだけ突き合わせ・retry の単位も coordinator・突き合わせは retry に載せない', async () => {
   const src = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/daily-sync.js'), 'utf8');
-  const iFees = src.indexOf("'Amazonアカウントフィー sync', 300000"), iPush = src.indexOf('apps/company-db/push/amazon-finance.mjs ${financeArgs.join'), iRec = src.indexOf("'apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled'");
-  assert.ok(iFees > 0 && iPush > iFees && iRec > iPush, `${iFees} ${iPush} ${iRec}`);
-  assert.match(src, /const financeArgs = amazonFinanceDailyArgs\(businessDate\);/);
-  assert.match(src, /if \(settlementResult\.success\) \{\s*cdbFinanceResult = runScript/);   // 決済の取込が失敗した朝は送らない
-  assert.match(src, /if \(financeSqliteFresh && cdbFinanceResult\.success && !String\(cdbFinanceResult\.summary \|\| ''\)\.trimStart\(\)\.startsWith\('⏭️'\)\) \{\s*const cdbFinanceRecResult/);   // ⏭️ の朝・比べる側の build が失敗した朝は突き合わせない
+  const iCoord = src.indexOf("runScript('apps/warehouse/amazon-finance-coverage-run.js --source v2', 'Amazon決済と財務'"), iFees = src.indexOf("'Amazonアカウントフィー sync', 300000"), iRec = src.indexOf("'apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled'");
+  assert.ok(iCoord > 0 && iFees > iCoord && iRec > iFees, `${iCoord} ${iFees} ${iRec}`);
+  assert.ok(!src.includes("'apps/warehouse/fetch-amazon-settlements.js --days 14'") && !src.includes('amazon-finance.mjs ${financeArgs'), '旧い 2 工程 (取込・送り手) は無い');
+  assert.ok(src.includes("const financeSent = settlementResult.success && /財務 push \\(/.test(String(settlementResult.summary || ''));"), '財務 push: ⏭️ (バックフィル前) の朝・失敗の朝は突き合わせない');
+  assert.match(src, /if \(financeSqliteFresh && financeSent\) \{\s*const cdbFinanceRecResult/);
   assert.match(src, /const financeSqliteFresh = financeBuildFailed\.length === 0 && accountFeesBuildResult\.success;/);
   assert.match(src, /financeFailed\.push\(month\);\s*financeBuildFailed\.push\(month\);/);   // build の失敗だけを数える (sync の失敗は SQLite に関係しない)
-  const { UPSTREAM_OF } = await import('../apps/warehouse/retry-failed-jobs.js');
-  assert.equal(UPSTREAM_OF['CompanyDB財務(Amazon)'], 'Amazon Settlement');
+  const { UPSTREAM_OF, JOB_DEFINITIONS, RETRY_ORDER } = await import('../apps/warehouse/retry-failed-jobs.js');
+  assert.ok(!Object.hasOwn(UPSTREAM_OF, 'CompanyDB財務(Amazon)'));
   const retryable = JSON.parse(`[${/const RETRYABLE_JOBS = \[([^\]]*)\]/.exec(src)[1].replace(/'/g, '"')}]`);
-  assert.ok(retryable.includes('CompanyDB財務(Amazon)')); assert.ok(!retryable.includes('CompanyDB財務突合(Amazon)'));
-  const { JOB_DEFINITIONS, RETRY_ORDER } = await import('../apps/warehouse/retry-failed-jobs.js');
-  assert.deepEqual(JOB_DEFINITIONS['CompanyDB財務(Amazon)'].args, ['--full', '--require-backfilled']);
-  assert.ok(RETRY_ORDER.indexOf('Amazon Settlement') < RETRY_ORDER.indexOf('CompanyDB財務(Amazon)'));
+  assert.ok(retryable.includes('Amazon決済と財務')); assert.ok(!retryable.includes('CompanyDB財務(Amazon)') && !retryable.includes('Amazon Settlement') && !retryable.includes('CompanyDB財務突合(Amazon)'));
+  assert.deepEqual(JOB_DEFINITIONS['Amazon決済と財務'], { script: 'apps/warehouse/amazon-finance-coverage-run.js', args: ['--source', 'v2'], timeoutMs: 5400000 });
+  assert.ok(!Object.hasOwn(JOB_DEFINITIONS, 'CompanyDB財務(Amazon)') && !Object.hasOwn(JOB_DEFINITIONS, 'Amazon Settlement') && RETRY_ORDER.includes('Amazon決済と財務'));
   const reg = fs.readFileSync(path.join(repoRoot, 'config/jobs-registry.mjs'), 'utf8');
-  assert.ok(reg.includes('Company DB Amazon 財務 push') && reg.includes('Company DB Amazon 財務 突き合わせ'));
-  // D7b-1a (#1554 Codex R1 Medium): 変換の版 v2 の注意 (全部を選ぶ朝・migrate の前に pull しない・旧い版に戻さない・手の --full の完了の条件) が台帳にある
-  for (const s of [AMAZON_FINANCE_TRANSFORM_VERSION, '1 工程 30 分の上限', 'migrate の前に miniPC 本体を pull しない', '旧い版 (amazon_finance_v1) の送り手に戻さない', '手の --full の完了の条件']) assert.ok(reg.includes(s), `台帳に「${s}」が無い`);
+  assert.ok(reg.includes('Amazon決済と財務') && reg.includes('amazon-finance-coverage-run.js') && reg.includes('Company DB Amazon 財務 突き合わせ'));
+  // D7b-1a (#1554 Codex R1 Medium): 変換の版 v2 の注意 (migrate の前に pull しない・旧い版に戻さない・手の --full の完了の条件) が台帳にある
+  for (const x of [AMAZON_FINANCE_TRANSFORM_VERSION, 'migrate の前に miniPC 本体を pull しない', '旧い版 (amazon_finance_v1) の送り手に戻さない', '手の --full の完了の条件']) assert.ok(reg.includes(x), `台帳に「${x}」が無い`);
 });
 await t('要約の頭: Render の復元・台帳の取り戻しは ⚠️ (daily-sync が全部 OK に数えない)・拾われない金額も ⚠️・失敗は ❌', async () => {
   const { summarizeFinance } = await import('../apps/company-db/push/amazon-finance.mjs');
