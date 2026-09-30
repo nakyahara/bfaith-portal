@@ -551,7 +551,7 @@ async function main() {
   //   前は「Amazon Settlement」(fetch-amazon-settlements.js) と後ろの「CompanyDB財務(Amazon)」(amazon-finance.mjs) の 2 工程 = 別のプロセスで lease を渡す規則が無かった
   //   → coordinator (amazon-finance-coverage-run.js) が lease を持ち、① 過去の行の文書の版 ② Render の coverage を updating (失敗なら取込を始めない)
   //   ③ 手で積んだ決済のファイル → SP-API の取込 (V2・一覧を記録) ④ 財務の送信 (世代・token つき・coverage の回は --full) ⑤ 完成の判定 → complete を 1 回として回す。
-  //   財務のバックフィルの完了印の前 = 取込だけ (財務 push: ⏭️)・Render に 0051 が無い = 今までの送り方 (⚠️)。
+  //   財務のバックフィルの完了印の前 = 取込だけ (財務 push: ⏭️)・Render に 0050 が無い = 今までの送り方 (⚠️)。
   //   決済の行 → settlement_refresh_queue の月 → 後段の mart rebuild・Amazon finance build が拾う (今までと同じ)。
   //   ⚠️ = 初期の印が無いなど人が直すまで complete にしない (exit 0)・❌ = 失敗 (retry = 同じ coordinator の 1 回)・終了コード 3 = 取り込めない V2 (規則を足す)
   //   引数を必ず渡す (runScript は引数なしだと '7' を足す)

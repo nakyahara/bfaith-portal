@@ -9,7 +9,7 @@
  * 1 回の順 (lease を取る・放すのは この親だけ。子のステップ (取込・送り手) は lease を引数で受け、自分では取らない):
  *   ⓪ lease (warehouse.db の 1 行) を取る = 持ち主の判定は retry-lock.js と同じ (pid が生きている node で開始が lease より前でない)・心拍の期限では奪わない
  *   ① 過去の行に文書の版を付ける (backfill・版の要約) — lease を取引の中で確かめる
- *   ② Company DB の mode を決める: 財務のバックフィルの完了印が無い = ingest_only (取込だけ) / Render に 0051 が無い = legacy (今までの送り方・coverage なし) / coverage
+ *   ② Company DB の mode を決める: 財務のバックフィルの完了印が無い = ingest_only (取込だけ) / Render に 0050 が無い = legacy (今までの送り方・coverage なし) / coverage
  *   ③ (coverage) Render の今の世代を読み、台帳 (company-db-push.db) の世代を少なくともそこまで進め、新しい世代と token を **HTTP の前に台帳と lease に保存**
  *      → Render の coverage を updating (失敗なら取込を始めない = 生の表を書く前に無効にする。R16 H2)
  *   ④ 決済の取込 = 手で積んだファイル (amazon-settlement-manual-file.js) → SP-API の一覧と取込 (fetch-amazon-settlements.js)。
@@ -211,7 +211,7 @@ export async function runCoverage({
     const pushWarn = (f.unmapped && f.unmapped.rows) || r.ledgerReset || r.ledgerRebuilt;
     if (out.mode === 'legacy') {
       out.exitCode = r.ok ? 0 : 1;
-      out.summary = `${r.ok ? '⚠️' : '❌'} Amazon 決済と財務: ${ingestPart} | ${pushPart} | coverage: Render に 0051 が無い = coverage を送らない (今までの送り方)`;
+      out.summary = `${r.ok ? '⚠️' : '❌'} Amazon 決済と財務: ${ingestPart} | ${pushPart} | coverage: Render に 0050 が無い = coverage を送らない (今までの送り方)`;
       return out;
     }
     const cov = f.coverage || { complete: false, reasons: [{ code: 'no_finalize', detail: '完成の判定まで進まなかった', human: false }] };

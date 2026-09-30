@@ -407,7 +407,7 @@ await t('🚨 complete の応答だけ失われた = 同じ中身で送り直し
 await t('Render に 0050 が無い (status が 409 not_migrated) = 今までの送り方 (token なし・coverage を送らない・⚠️)', async () => {
   const f = spyFetch({ statusOverride: () => new Response(JSON.stringify({ error: 'not_migrated' }), { status: 409, headers: { 'content-type': 'application/json' } }) });
   const r = await run({ fetchImpl: f });
-  assert.equal(r.mode, 'legacy'); assert.equal(r.exitCode, 0, r.summary); assert.match(r.summary, /^⚠️ .*coverage: Render に 0051 が無い|^⚠️ .*0051/);
+  assert.equal(r.mode, 'legacy'); assert.equal(r.exitCode, 0, r.summary); assert.match(r.summary, /^⚠️ .*coverage: Render に 0050 が無い/);
   assert.equal(f.calls.updating + f.calls.complete + f.calls.tokenedChunks, 0);
 });
 await t('🚨 coordinator を通らない単独の送り手 (token の無い chunk が受領記録を変える) = Render は complete を無効にする', async () => {
