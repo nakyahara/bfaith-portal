@@ -707,7 +707,8 @@ export function getSkuProfit(from, to, opts = {}) {
  */
 // Easy Ship の割り振りだけの行 (料金の日に SKU の売上が無い・2026-09-28) = 決済の最後の日の判定に入れない
 //   (売上の最後の日より後の日に料金だけがあると、最後の日が後ろにずれ、まだ決済の届いていない日の広告費まで引く。Codex #1520 R2)
-//   Easy Ship の額は問わない (料金と返金が打ち消し合って 0 円の行も同じ = 行は作り直しで 0 に上書きするため残る。Codex #1520 R3)
+//   Easy Ship の額は問わない (料金と返金が打ち消し合って 0 円の行も同じ = 行は作り直しで 0 に上書きするため残る。Codex #1520 R3。
+//   2026-09-30 D7b-0 = 注文 × 計上日で正味にしてから割り振る・正味 0 の組も 0 円の行を作る = この判定はそのまま要る)
 export const NOT_EASY_SHIP_ONLY_ROW = `NOT (units_ordered = 0 AND units_refunded_customer = 0 AND units_a_to_z_refund = 0
   AND sales_principal_jpy = 0 AND sales_shipping_jpy = 0 AND sales_giftwrap_jpy = 0 AND sales_tax_jpy = 0
   AND commission_jpy = 0 AND fba_fulfillment_jpy = 0 AND fba_storage_jpy = 0 AND closing_fee_jpy = 0
