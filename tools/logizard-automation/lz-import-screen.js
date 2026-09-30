@@ -97,7 +97,8 @@ export async function selectOptionByText(page, sel, label, what, { log = console
  *        #popup_panel の直下 = [input#popup_ok (OK), input#popup_cancel (Cancel)] の 2 つの type=button だけ。
  *        形が違う = 枠にしない = unidentified (jAlert = .alert + OK だけ・jPrompt = .prompt + 入力欄 も枠にしない)。
  *        文言は #popup_message の文字 (空白を除く) が JCONFIRM_TEXT と完全一致だけ (呼び手が jconfirmExact で渡す。渡さない = jConfirm は押さない)。
- *      タイトル (#popup_title) の文字は ui-dialog のタイトルの帯と同じく本文に数えない
+ *      #popup_container の中 (自身も) は、この形を満たす箱そのものだけが候補 (形の違う箱に ui-dialog / role=dialog が付いても前の道に回さない。Codex #1553 R2)。
+ *      題 (#popup_title) を本文に数えないのは、形を満たした箱の直下の題だけ (ほかの枠の中の id=popup_title は数える)。文言は選んだ箱の中の #popup_message で照らす
  *      本文 = 枠の中の見えている文字を空白を除いてつなげたもの (入れ子の枠・ボタン・タイトルの帯 ui-dialog-titlebar・決まった語 (確認・お知らせ・メッセージ・×・閉じる・キャンセル) を除く)。
  *      改行や <br> で文が分かれても同じ (Codex #1521 R3 Medium)。無い = unidentified (文言が枠の外)・2 つ以上 = ambiguous
  *   3. 本文は「文言」と「。」「よろしいですか？」だけ (ほかの文字 = 別のものが同じ枠にいるかもしれない = unidentified)
@@ -129,6 +130,8 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
         && lab(btns[0]) === 'OK' && lab(btns[1]) === 'Cancel';
     };
     const isRoot = (el) => el.nodeType === 1 && (el.getAttribute('role') === 'dialog' || el.classList.contains('ui-dialog') || isJConfirm(el));
+    // 枠の候補: jAlerts の箱の中 (自身も) は形を満たす箱そのものだけ = 形の違う箱に ui-dialog / role=dialog が付いても前の道に回らない (Codex #1553 R2 Medium)
+    const candidate = (el) => (el.closest('#popup_container') ? isJConfirm(el) : isRoot(el));
     const squash = (s) => String(s || '').replace(/\s+/g, '');
     const N = squash(needle);
     const bodyAll = squash(document.body.innerText);
@@ -138,24 +141,25 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
     const ALLOWED = new Set(['確認', 'お知らせ', 'メッセージ', '×', '閉じる', 'キャンセル']);
     const bodyOf = (root) => {
       const nested = [...root.querySelectorAll('*')].filter(isRoot);
+      const jTitle = isJConfirm(root) ? root.children[0] : null;   // 数えない題 = 形を満たした箱の直下の h1#popup_title だけ
       let t = '';
       const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
       for (let n = w.nextNode(); n; n = w.nextNode()) {
         const p = n.parentElement;
         if (!p || !vis(p) || nested.some((r) => r.contains(p))) continue;
-        if (p.closest('button') || p.closest('.ui-dialog-titlebar') || p.closest('#popup_title')) continue;
+        if (p.closest('button') || p.closest('.ui-dialog-titlebar') || (jTitle && jTitle.contains(p))) continue;
         const s = squash(n.nodeValue);
         if (!s || ALLOWED.has(s)) continue;
         t += s;
       }
       return { root, body: t, nested };
     };
-    const hits = [...document.querySelectorAll('[role="dialog"], .ui-dialog, #popup_container')].filter(isRoot).filter(vis).map(bodyOf).filter((x) => x.body.includes(N));
+    const hits = [...document.querySelectorAll('[role="dialog"], .ui-dialog, #popup_container')].filter(candidate).filter(vis).map(bodyOf).filter((x) => x.body.includes(N));
     if (!hits.length) return { state: 'unidentified', why: 'no_dialog_root' };
     if (hits.length > 1) return { state: 'ambiguous', why: `dialogs_${hits.length}` };
     const { root, body, nested } = hits[0];
     // jConfirm の箱 = 文言は実機の全文と完全一致だけ (空白を除く。全角の ？・質問なし・句点なし・後ろに足した文 = 押さない)
-    if (isJConfirm(root) && (!jconfirmExact || squash(document.getElementById('popup_message').textContent) !== squash(jconfirmExact))) return { state: 'unidentified', why: 'jconfirm_text' };
+    if (isJConfirm(root) && (!jconfirmExact || squash(root.children[1].children[0].textContent) !== squash(jconfirmExact))) return { state: 'unidentified', why: 'jconfirm_text' };   // 選んだ箱の中の文言
     if (!/^[。．.!！?？]*(よろしいですか[？?]?)?[。．.!！?？]*$/.test(body.replace(N, ''))) return { state: 'unidentified', why: 'extra_text' };
     const own = (el) => !nested.some((r) => r.contains(el));
     const label = (b) => String(b.tagName === 'INPUT' ? b.value : b.innerText).trim();

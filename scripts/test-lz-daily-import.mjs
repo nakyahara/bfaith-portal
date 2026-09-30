@@ -460,8 +460,10 @@ document.getElementById('FM07_01_executeBtn').onclick = () => {
       'jconfirm-short': 'ファイルアップロードを開始します', 'jconfirm-noperiod': 'ファイルアップロードを開始しますよろしいですか?',
       'jconfirm-msginput': FULL + '<input type="checkbox" id="chk">', 'jconfirm-nested': FULL + '<div class="ui-dialog">在庫を削除<input type="button" value="OK" id="nestOk"></div>',
       'jreal-prompt': FULL + '<br><input type="text" size="30" id="popup_prompt">' };
-    const msg = MSG[V] || FULL;
-    const kind = V === 'jreal-alert' ? 'alert' : V === 'jreal-prompt' ? 'prompt' : V === 'jconfirm-twoclass' ? 'confirm alert' : 'confirm';
+    const msg = V === 'jconfirm-dupmsg' || V === 'jconfirm-uicontainer' ? 'ファイルアップロードを開始します' : (MSG[V] || FULL);
+    const kind = V === 'jreal-alert' ? 'alert' : V === 'jreal-prompt' ? 'prompt' : V === 'jconfirm-twoclass' ? 'confirm alert' : V === 'jconfirm-innerui' ? 'confirm ui-dialog' : 'confirm';
+    // 非表示の重複の #popup_message (前にある = getElementById が拾う) に全文・見えている箱は短い文
+    if (V === 'jconfirm-dupmsg') document.body.insertAdjacentHTML('afterbegin', '<div style="display:none"><div id="popup_message">' + FULL + '</div></div>');
     const PANEL = { 'jconfirm-twook': JPANEL + ' <input type="button" value="OK" id="popup_ok2">', 'jconfirm-okonly': '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok">',
       'jreal-alert': '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok">',
       'jconfirm-otherbtn': '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok"> <input type="button" value="削除" id="popup_delete">',
@@ -469,6 +471,8 @@ document.getElementById('FM07_01_executeBtn').onclick = () => {
     jbox(kind, msg, PANEL[V] || JPANEL, { title: V === 'jconfirm-notitle' ? '' : V === 'jconfirm-h2title' ? '<h2 id="popup_title"></h2>' : undefined, overlay: V !== 'jconfirm-nooverlay' });
     // 入力欄が箱の外 (文言と台の間) に足された形
     if (V === 'jconfirm-prompt') document.getElementById('popup_message').insertAdjacentHTML('afterend', '<input type="text" id="popup_prompt">');
+    // 形の違う箱 (Cancel なし) に ui-dialog / role=dialog が付いた = 前の道に回さない
+    if (V === 'jconfirm-uicontainer') { const b = document.getElementById('popup_container'); b.classList.add('ui-dialog'); b.setAttribute('role', 'dialog'); document.getElementById('popup_cancel').remove(); }
     if (V === 'jconfirm-covered') document.body.insertAdjacentHTML('beforeend', '<div style="position:fixed;z-index:100000;top:0;left:0;width:100%;height:100%"></div>');   // 箱の上にさらに覆い
     document.getElementById('popup_ok').onclick = () => { log('cfmOk'); jclose(); document.getElementById('busy').style.display = 'block';
       // 結果の表示も jAlerts (jAlert = .alert) で出る形 / いつもの形
@@ -476,6 +480,7 @@ document.getElementById('FM07_01_executeBtn').onclick = () => {
     for (const id of ['popup_ok2', 'nestOk']) if (document.getElementById(id)) document.getElementById(id).onclick = () => log('otherOk');
     return;
   }
+  if (V === 'uidialog-hidetitle') { show('<div class="ui-dialog"><div id="popup_title">在庫をすべて削除します</div><div class="ui-dialog-content">ファイルアップロードを開始します</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
   if (V === 'sharedshort') { show('<div class="ui-dialog"><div>ファイルアップロードを開始します</div><div>削除しますか<input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
   if (V === 'secondconfirm') {   // 確認の OK が押せるようになる前に 2 つ目の確認が出る
     show(dialog('ファイルアップロードを開始します', 'cfmOk', ' disabled'));
@@ -588,6 +593,8 @@ await ta('[11] 押す部品 executeImport: 実行 → 決まった文言のモ�
       ['jconfirm-twook', 'OK が 2 つ'], ['jconfirm-okonly', 'Cancel が無い'], ['jconfirm-otherbtn', '2 つ目のボタンが Cancel でない'], ['jconfirm-cancellabel', '同じ ID で表示が「削除」'],
       ['jconfirm-prompt', '文言と台の間に入力欄'], ['jconfirm-msginput', '文言の中に入力欄'], ['jconfirm-nested', '文言の中に入れ子の枠 + 外側にも OK'],
       ['jconfirm-notitle', '題が無い'], ['jconfirm-h2title', '題が h1 でない'], ['jconfirm-twoclass', 'class が confirm alert'], ['jconfirm-nooverlay', '覆いが無い (見えない)'], ['jconfirm-covered', '箱の上に覆い'],
+      ['jconfirm-innerui', '中身が confirm ui-dialog (前の道に回さない)'], ['jconfirm-uicontainer', '形の違う箱に ui-dialog・role=dialog (前の道に回さない)'], ['jconfirm-dupmsg', '非表示の重複の文言は照らさない (見えている箱は短い文)'],
+      ['uidialog-hidetitle', '前の道の枠の中の id=popup_title の文字も本文に数える'],
     ]) {
       x = await run(v);
       assert.deepEqual([x.err && x.err.executeIssued, x.log], [true, ['execute']], `${v}: ${why} = 押さない`);
