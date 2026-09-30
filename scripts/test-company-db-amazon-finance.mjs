@@ -371,6 +371,38 @@ await t('分けられない部品 (0047・純粋関数): 同じ SKU の行の ot
   ]).lines[0];
   assert.deepEqual([f.line_kind, f.account_fee_amount_jpy, f.sales_tax_jpy, f.unclassified_component_count, f.unclassified_mapped_jpy], ['storage', -300, -30, 1, -30]);
 });
+await t('🚨 受け口で見分けられない「同じ箱の中の相殺」を変換が数える (#1554 Codex R4・期待値は変換と独立に手で書いた固定の値)', async () => {
+  const M = 1000000n;
+  const P = (x) => base({ amazon_order_id: null, seller_sku_normalized: null, transaction_type: 'Storage Fee', ...x });   // 疑似注文 -:2026-03-01 の保管料の行
+  const pick = (lines, kind) => { const l = lines.find((x) => x.line_kind === kind); return [l.unclassified_component_count, l.unclassified_mapped_jpy, l.unclassified_abs_jpy, l.unmapped_component_count]; };
+  // ① 月の手数料の行の同じ列の中の相殺: 材料 −100 (other_amount)・misc_fee +3 と −3 (列は 0) → 部品 2・符号つき 0・絶対値 6
+  const a = aggregateOrderFinance('-:2026-03-01', [
+    P({ id: 1, business_line_key: 'm1', other_amount_micro: -100n * M }),
+    P({ id: 2, business_line_key: 'm2', misc_fee_amount_micro: 3n * M }),
+    P({ id: 3, business_line_key: 'm3', misc_fee_amount_micro: -3n * M }),
+  ]).lines;
+  assert.deepEqual(pick(a, 'storage'), [2, 0, 6, 0]);
+  assert.deepEqual([a[0].misc_fee_jpy, a[0].fba_storage_jpy, a[0].account_fee_amount_jpy], [0, -100, -100]);
+  // ② 8 列の合計の残差の中の別の列の間の相殺: 材料 −100 (fba_storage)・分けられない other_fee +3 (other_fee の列)・分けられない未知の price −3 (other_amount の列)
+  //    → 残差 = (−100 + 3 − 3) − (−100) = 0 = 受け口では見分けられない。変換は 部品 2・符号つき 0・絶対値 6
+  const b = aggregateOrderFinance('-:2026-03-01', [
+    P({ id: 4, business_line_key: 'r1', other_amount_micro: -100n * M }),
+    P({ id: 5, business_line_key: 'r2', other_fee_amount_micro: 3n * M }),
+    P({ id: 6, business_line_key: 'r3', price_type: 'Weird', price_amount_micro: -3n * M }),
+  ]).lines;
+  assert.deepEqual([b[0].fba_storage_jpy, b[0].other_fee_jpy, b[0].other_amount_jpy, b[0].account_fee_amount_jpy], [-100, 3, -3, -100]);
+  assert.deepEqual(pick(b, 'storage'), [2, 0, 6, 0]);
+  // ③ SKU の行の別の列の間の相殺: other_amount +5 (取引の種類 Other の分けられない補てん)・misc_fee −5 → 部品 2・符号つき 0・絶対値 10
+  //    + 同じ列 (other_fee) の中の相殺: MFNPostageFee −7 と other_fee +7 → さらに部品 2・絶対値 14
+  const c = aggregateOrderFinance('X1', [
+    base({ id: 7, business_line_key: 's1', transaction_type: 'Other', price_type: 'x', other_amount_micro: 5n * M }),
+    base({ id: 8, business_line_key: 's2', misc_fee_amount_micro: -5n * M }),
+    base({ id: 9, business_line_key: 's3', item_related_fee_type: 'MFNPostageFee', item_related_fee_amount_micro: -7n * M }),
+    base({ id: 10, business_line_key: 's4', other_fee_amount_micro: 7n * M }),
+  ]).lines;
+  assert.deepEqual([c[0].other_amount_jpy, c[0].misc_fee_jpy, c[0].other_fee_jpy], [5, -5, 0]);
+  assert.deepEqual(pick(c, 'sku'), [4, 0, 24, 0]);
+});
 await t('SKU なしの行の種類 = 月の手数料の build と同じ (大文字小文字は LIKE だけ無視・最初に当たった種類)', async () => {
   assert.equal(feeKindOf('FBA INVENTORY STORAGE FEE'), 'storage');   // 前方一致 (LIKE) は大文字小文字を無視
   assert.equal(feeKindOf('storage fee'), 'unknown');                 // 完全一致 (IN) は区別する

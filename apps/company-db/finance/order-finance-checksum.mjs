@@ -46,7 +46,9 @@ export function versionHasClass(v) {
  * 月の手数料の行の列の分け方 (#1554 Codex R3 Medium 2。送り手の変換 = 手数料の材料 (other_amount + item_related_fee) の行き先の列):
  *   FEE_ROW_MATERIAL_COLUMNS = 手数料の材料が入りうる 8 列 (材料でない部品も入りうる = 和 − account_fee_amount がこの 8 列の中の分けられない分)
  *   FEE_ROW_UNCLASSIFIED_COLUMNS = それ以外の 12 列 (月の手数料の行では入った部品が全部「分けられない」)
- *   🚨 同じ集約の列の中での相殺 (misc_fee の +3 と −3 = 列は 0) は受け口では復元できない = 送り手の変換の試験で守る
+ *   🚨 受け口が見るのは「箱」ごとの値だけ = **同じ箱の中の相殺は受け口では復元できない = 送り手の変換の試験で守る** (#1554 Codex R4)。
+ *      箱 = 12 列のそれぞれ (例 misc_fee の +3 と −3 = 列は 0) と、8 列の合計の残差 1 つ (例 材料 −100・other_fee +3・other_amount −3 = 残差 0 = 別の列の間の相殺でも見分けられない)。
+ *      SKU の行の箱 = misc_fee / other_fee / other_amount のそれぞれ
  */
 export const FEE_ROW_MATERIAL_COLUMNS = ['commission_jpy', 'fba_fulfillment_jpy', 'fba_storage_jpy', 'shipping_chargeback_jpy', 'giftwrap_chargeback_jpy', 'points_jpy', 'other_fee_jpy', 'other_amount_jpy'];
 export const FEE_ROW_UNCLASSIFIED_COLUMNS = AMOUNT_COLUMNS.filter((c) => !FEE_ROW_MATERIAL_COLUMNS.includes(c));
@@ -145,7 +147,8 @@ export function validateFinanceRows(mallOrderNo, rows) {
         //   4 列を 0 と偽って分類の漏れた金額を隠せない (例 misc_fee +3 を数えずに送ると net −97 ≠ −100 + 0 + 0)
         const want = BigInt(out.account_fee_amount_jpy) + BigInt(out.unclassified_mapped_jpy) + BigInt(out.unmapped_jpy);
         if (net !== want) throw new Error(`rows[${i}]: on an account fee row net (${net}) must equal account_fee_amount_jpy + unclassified_mapped_jpy + unmapped_jpy (${want})`);
-        // 部品が別の列の間で相殺しても隠せない (#1554 Codex R3 Medium 2。例 misc_fee +3 と promotion −3 = net は −100 のまま):
+        // 部品が別の箱の間で相殺しても隠せない (#1554 Codex R3 Medium 2。例 misc_fee +3 と promotion −3 = net は −100 のまま)。
+        //   同じ箱 (12 列のそれぞれ・8 列の合計の残差) の中の相殺は見分けられない = 送り手の変換の試験で守る (上の FEE_ROW_* の注釈・R4):
         //   分けられないものの組 = 材料の入らない 12 列 + (材料の入りうる 8 列の和 − account_fee_amount) の絶対値の和 ≤ unclassified_abs・0 でないものの数 ≤ 部品の数。表の CHECK と同じ
         const parts = [...FEE_ROW_UNCLASSIFIED_COLUMNS.map((c) => BigInt(out[c])), FEE_ROW_MATERIAL_COLUMNS.reduce((s, c) => s + BigInt(out[c]), 0n) - BigInt(out.account_fee_amount_jpy)];
         const absParts = parts.reduce((s, v) => s + (v < 0n ? -v : v), 0n), nzParts = parts.filter((v) => v !== 0n).length;

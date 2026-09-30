@@ -822,9 +822,10 @@ D7b-1 のうち coverage (決済のそろい・coordinator・レポートの一�
     受け口の事前の照会の後に別の送信が受領記録を v2 にした競合でも、SQL の downgrade の例外は行の failed に吸収せず **chunk 全体を rollback して 409** (`ingest/chunk.mjs` の `fatalRowError`。ほかの受け口は今までどおり行ごと)
   - 🚨 **今の形の版の行の等式** (#1554 Codex R2・JS の形の確かめと表の CHECK `ck_order_finance_daily_class_form` の両方): unmapped の金額 ≠ 0 なら部品 ≥ 1 / SKU の行 = 分けられない 3 列の和 = 符号つき・絶対値 ≥ 3 列の絶対値の和 /
     **月の手数料の行 = `net = account_fee_amount + unclassified_mapped + unmapped`** (4 列を 0 と偽って分類の漏れた金額を隠せない) / not_account_fee・unknown の行 = 分けられない部品 0。旧い版の行は対象の外。
-    SKU の行と月の手数料の行は **部品が別の列の間で相殺しても隠せない** (#1554 Codex R3): SKU の行 = 0 でない分けられない列の数 ≤ 部品の数 / 月の手数料の行 = 「材料の入らない 12 列」と「材料の入りうる 8 列 (commission・fba_fulfillment・fba_storage・chargeback 2 つ・points・other_fee・other_amount) の和 − account_fee_amount」の
+    SKU の行と月の手数料の行は **部品が別の「箱」の間で相殺しても隠せない** (#1554 Codex R3): SKU の行 = 0 でない分けられない列の数 ≤ 部品の数 / 月の手数料の行 = 「材料の入らない 12 列」と「材料の入りうる 8 列 (commission・fba_fulfillment・fba_storage・chargeback 2 つ・points・other_fee・other_amount) の和 − account_fee_amount」の
     絶対値の和 ≤ `unclassified_abs_jpy`・0 でないものの数 ≤ `unclassified_component_count` (例 storage 行の misc_fee +3・promotion −3 を 4 列 0 と申告できない = 正しくは部品 2・符号つき 0・絶対値 6)。
-    🚨 **同じ集約の列の中での相殺** (例 misc_fee の +3 と −3 = 列は 0) は受け口では完全には復元できない = **送り手の変換の試験で守る** (`scripts/test-company-db-amazon-finance.mjs` の純粋関数と乱数の決済の行 400 注文)
+    🚨 **同じ箱の中の相殺は受け口では復元できない = 送り手の変換の試験で守る** (#1554 Codex R4)。箱 = SKU の行の 3 列のそれぞれ / 月の手数料の行の 12 列のそれぞれ (例 misc_fee の +3 と −3 = 列は 0) と **8 列の合計の残差 1 つ**
+    (例 材料 −100・other_fee +3・other_amount −3 = 残差 0 = 別の列の間の相殺でも見分けられない)。試験 = `scripts/test-company-db-amazon-finance.mjs` の手で書いた固定の期待値 (同じ列の中・残差の箱の中・SKU の行の別の列の間) と乱数の決済の行 400 注文
   - CHECK (3 つ) は 0047 で `NOT VALID` (新しい行には効く)・既存の行の検査は **0048** (`VALIDATE CONSTRAINT` = 読み書きを止めない lock。59 万行の検査を 0047 の ACCESS EXCLUSIVE の中でしない)
 - **`mart.finance_daily_sku_range(会社, モール, scope, from, to)`** = **日 × 正規化 seller SKU (`core.norm_code`) の子の粒度** (§3.2・R13 H1)。D7b-3 の利益の関数が計算のときに **今のマスタ** で出品に結び直してまとめる材料 (D-64)。
   今の `mart.finance_daily_range` (0045) は画面・突き合わせのため残す (戻りの型も変えない)

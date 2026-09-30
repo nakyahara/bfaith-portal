@@ -58,11 +58,13 @@ $$;
 --   ・unmapped_jpy <> 0 なら unmapped の部品は 1 つ以上
 --   ・SKU の行: 分けられない列 (misc_fee / other_fee / other_amount) の和 = unclassified_mapped・絶対値の合計 ≥ その列の絶対値の和・部品の数 ≥ 0 でない列の数
 --   ・月の手数料の行: net = account_fee_amount (手数料の材料) + unclassified_mapped + unmapped
---       + (#1554 Codex R3 Medium 2) 部品が相殺しても隠せない: 「分けられない」ものの組 = 手数料の材料が入らない 12 列 (売上・税・値引き・misc_fee・補てんなど) と
+--       + (#1554 Codex R3 Medium 2) 部品が別の箱の間で相殺しても隠せない: 「分けられない」ものの組 = 手数料の材料が入らない 12 列 (売上・税・値引き・misc_fee・補てんなど) と
 --         「手数料の材料が入りうる 8 列 (commission・fba_fulfillment・fba_storage・chargeback 2 つ・points・other_fee・other_amount) の和 − account_fee_amount」(= その 8 列の中の分けられない分)。
 --         その組の絶対値の和 ≤ unclassified_abs・0 でないものの数 ≤ unclassified_component_count (例 misc_fee +3 と promotion −3 を 4 列 0 と申告できない)
 --   ・not_account_fee / unknown の行: 分けられない部品は無い (② / ③ で消費済み)
---   🚨 同じ集約の列の中での相殺 (例 misc_fee の +3 と −3 = 列は 0) は受け口では復元できない = 送り手の変換の試験で守る (scripts/test-company-db-amazon-finance.mjs)
+--   🚨 同じ「箱」の中の相殺は受け口では復元できない = 送り手の変換の試験で守る (scripts/test-company-db-amazon-finance.mjs・#1554 Codex R4)。
+--      箱 = SKU の行の 3 列のそれぞれ / 月の手数料の行の 12 列のそれぞれ (例 misc_fee の +3 と −3 = 列は 0) と 8 列の合計の残差 1 つ
+--      (例 材料 −100・other_fee +3・other_amount −3 = 残差 0 = 別の列の間の相殺でも見分けられない)
 --   NOT VALID (既存の行の検査は 0048)
 alter table core.order_finance_daily
   add constraint ck_order_finance_daily_class_form check (
