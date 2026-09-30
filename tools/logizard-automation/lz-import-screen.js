@@ -12,7 +12,9 @@
  * ログイン・セッションの鍵・ブラウザは呼び手が持つ (同じブラウザで「直前の書き出し → プレビュー」を続けて使う。契約 v3 H8)。
  *
  * ③c-1b-2b-1b (契約 v3 K6・K7・C):
- *   - 画面全体の「最初の OK」は押さない。押すのは、決まった文言のモーダル (枠 = ui-dialog / role=dialog) の中の OK だけ (okInDialog)。
+ *   - 画面全体の「最初の OK」は押さない。押すのは、決まった文言のモーダル (枠 = ui-dialog / role=dialog / jAlerts の確認の箱) の中の OK だけ (okInDialog)。
+ *     本物のロジザード (2026-09-30 の実機の試験で見た) の取込の確認 = jAlerts の jConfirm:
+ *       #popup_overlay (覆い) の兄弟に #popup_container > h1#popup_title + #popup_content.confirm > #popup_message (文言) + #popup_panel > #popup_ok・#popup_cancel
  *     特定できない = 押さずに止める。プレビューのサーバーエラー (「エラーが発生しました」) は OK を押さずに止める (画面を残す。Codex #1521 R6)。
  *   - executeImport = 実行ボタン → 「ファイルアップロードを開始します」の OK → 今回押した後に新しく出た結果の表示を返す (読み方は lz-import-check.mjs)。
  *     押す操作は、確かめと押すを**同じページの中の処理で**行う (その間に画面は変わらない。Codex #1521 R2)。止める旗 (import-guard.js) はページにも写し、押す処理の中でも見る。
@@ -86,7 +88,10 @@ export async function selectOptionByText(page, sel, label, what, { log = console
 /**
  * 決まった文言のモーダルの中の OK を見つけ、click のときは**同じページの中の処理で押す** (確かめと押すの間に画面は変わらない = JavaScript は 1 本。Codex #1521 R2)。
  *   1. 見えている文字 (空白を除いてつなげたもの) に文言が ちょうど 1 回 (0 = absent / 2 回以上 = ambiguous。OK の有無によらない)
- *   2. モーダルの枠 (role=dialog・class ui-dialog だけ。popup のような共通の親は枠にしない) のうち、本文に文言があるものが ちょうど 1 つ。
+ *   2. モーダルの枠 (role=dialog・class ui-dialog・**jAlerts の確認の箱** のうち、本文に文言があるものが ちょうど 1 つ。popup のような共通の親は枠にしない)。
+ *      jAlerts の確認の箱 = #popup_container の直下に #popup_content.confirm だけ・その直下に #popup_message と #popup_panel だけ・#popup_panel の中は
+ *      #popup_ok と #popup_cancel の 2 つのボタンだけ (形がぴったりでない = 枠にしない = unidentified。jAlert (お知らせ = .alert)・jPrompt も枠にしない)。
+ *      タイトル (#popup_title) の文字は ui-dialog のタイトルの帯と同じく本文に数えない
  *      本文 = 枠の中の見えている文字を空白を除いてつなげたもの (入れ子の枠・ボタン・タイトルの帯 ui-dialog-titlebar・決まった語 (確認・お知らせ・メッセージ・×・閉じる・キャンセル) を除く)。
  *      改行や <br> で文が分かれても同じ (Codex #1521 R3 Medium)。無い = unidentified (文言が枠の外)・2 つ以上 = ambiguous
  *   3. 本文は「文言」と「。」「よろしいですか？」だけ (ほかの文字 = 別のものが同じ枠にいるかもしれない = unidentified)
@@ -100,7 +105,18 @@ export async function selectOptionByText(page, sel, label, what, { log = console
 export async function okInDialog(page, needle, { click = false, requireNoResult = false, pressBy = null } = {}) {
   return page.evaluate(({ needle, click, requireNoResult, pressBy }) => {
     const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-    const isRoot = (el) => el.nodeType === 1 && (el.getAttribute('role') === 'dialog' || el.classList.contains('ui-dialog'));
+    // jAlerts の確認の箱 (jConfirm) = 形がぴったりのときだけ枠 (2026-09-30 の実機の形)
+    const kids = (el) => [...el.children];
+    const isJConfirm = (el) => {
+      if (el.nodeType !== 1 || el.id !== 'popup_container') return false;
+      const c = kids(el).filter((x) => x.id !== 'popup_title');
+      if (c.length !== 1 || c[0].id !== 'popup_content' || !c[0].classList.contains('confirm')) return false;
+      const parts = kids(c[0]);
+      if (parts.length !== 2 || parts[0].id !== 'popup_message' || parts[1].id !== 'popup_panel') return false;
+      const btns = kids(parts[1]);
+      return btns.length === 2 && btns.every((b) => b.tagName === 'INPUT' && b.type === 'button') && btns[0].id === 'popup_ok' && btns[1].id === 'popup_cancel';
+    };
+    const isRoot = (el) => el.nodeType === 1 && (el.getAttribute('role') === 'dialog' || el.classList.contains('ui-dialog') || isJConfirm(el));
     const squash = (s) => String(s || '').replace(/\s+/g, '');
     const N = squash(needle);
     const bodyAll = squash(document.body.innerText);
@@ -115,14 +131,14 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
       for (let n = w.nextNode(); n; n = w.nextNode()) {
         const p = n.parentElement;
         if (!p || !vis(p) || nested.some((r) => r.contains(p))) continue;
-        if (p.closest('button') || p.closest('.ui-dialog-titlebar')) continue;
+        if (p.closest('button') || p.closest('.ui-dialog-titlebar') || p.closest('#popup_title')) continue;
         const s = squash(n.nodeValue);
         if (!s || ALLOWED.has(s)) continue;
         t += s;
       }
       return { root, body: t, nested };
     };
-    const hits = [...document.querySelectorAll('[role="dialog"], .ui-dialog')].filter(vis).map(bodyOf).filter((x) => x.body.includes(N));
+    const hits = [...document.querySelectorAll('[role="dialog"], .ui-dialog, #popup_container')].filter(isRoot).filter(vis).map(bodyOf).filter((x) => x.body.includes(N));
     if (!hits.length) return { state: 'unidentified', why: 'no_dialog_root' };
     if (hits.length > 1) return { state: 'ambiguous', why: `dialogs_${hits.length}` };
     const { root, body, nested } = hits[0];

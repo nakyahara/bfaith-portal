@@ -414,6 +414,13 @@ const show = (html) => { const o = document.getElementById('popup_overlay'); o.i
 const hide = () => { document.getElementById('popup_overlay').style.display = 'none'; };
 const RES = 'インポート結果 総件数 : 1 処理件数 : 1 処理不要件数 : 0 エラー件数 : 0';
 function dialog(text, okId, extra = '') { return '<div class="ui-dialog"><div class="ui-dialog-content">' + text + '</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="' + okId + '"' + extra + '></div></div>'; }
+// 本物のロジザードの確認 (jAlerts の jConfirm・2026-09-30 の実機の形): 覆い #popup_overlay の兄弟に箱 #popup_container (z-index が覆いより上)
+function jbox(kind, msg, panel) {
+  const ov = document.getElementById('popup_overlay'); ov.innerHTML = ''; ov.style.cssText = 'position:absolute;z-index:99998;top:0;left:0;width:100%;height:1400px;background:#fff;opacity:0.01';
+  document.body.insertAdjacentHTML('beforeend', '<div id="popup_container" style="position:fixed;z-index:99999;min-width:395px;top:100px;left:100px;background:#fff"><h1 id="popup_title"></h1><div id="popup_content" class="' + kind + '"><div id="popup_message">' + msg + '</div><div id="popup_panel">' + panel + '</div></div></div>');
+}
+function jclose() { const c = document.getElementById('popup_container'); if (c) c.remove(); document.getElementById('popup_overlay').style.display = 'none'; }
+const JPANEL = '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok"> <input type="button" value="&nbsp;Cancel&nbsp;" id="popup_cancel">';
 function result() {
   if (V === 'session') { location.href = '/login'; return; }
   const n = V === 'tworesults' ? 2 : 1;
@@ -445,6 +452,22 @@ document.getElementById('FM07_01_executeBtn').onclick = () => {
   if (V === 'noconfirm') { setTimeout(result, 200); return; }
   if (V === 'staleinclick') { show(dialog('ファイルアップロードを開始します', 'cfmOk')); document.getElementById('cfmOk').onclick = () => log('cfmOk'); return; }   // 古い結果の後に確認が出る
   if (V === 'othermodal') { show('<div class="ui-dialog">取込できません (形式が違います)</div>'); return; }
+  // ── 本物の形 (jAlerts) ──
+  if (V.startsWith('jconfirm')) {
+    const msg = V === 'jconfirm-extra' ? 'ファイルアップロードを開始します。在庫をすべて削除します。よろしいですか?' : 'ファイルアップロードを開始します。よろしいですか?';
+    const kind = V === 'jconfirm-alert' ? 'alert' : 'confirm';
+    const panel = V === 'jconfirm-twook' ? JPANEL + ' <input type="button" value="OK" id="popup_ok2">' : V === 'jconfirm-okonly' ? '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok">'
+      : V === 'jconfirm-otherbtn' ? '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok"> <input type="button" value="削除" id="popup_delete">' : JPANEL;
+    jbox(kind, msg, panel);
+    // 入力欄が足された形 (jPrompt に近い = 確認ではない)
+    if (V === 'jconfirm-prompt') document.getElementById('popup_message').insertAdjacentHTML('afterend', '<input type="text" id="popup_prompt">');
+    if (V === 'jconfirm-covered') document.body.insertAdjacentHTML('beforeend', '<div style="position:fixed;z-index:100000;top:0;left:0;width:100%;height:100%"></div>');   // 箱の上にさらに覆い
+    document.getElementById('popup_ok').onclick = () => { log('cfmOk'); jclose(); document.getElementById('busy').style.display = 'block';
+      // 結果の表示も jAlerts (jAlert = .alert) で出る形 / いつもの形
+      setTimeout(() => { document.getElementById('busy').style.display = 'none'; if (V === 'jconfirm-jresult') { jbox('alert', RES, '<input type="button" value="&nbsp;OK&nbsp;" id="popup_ok">'); } else result(); }, 300); };
+    if (document.getElementById('popup_ok2')) document.getElementById('popup_ok2').onclick = () => log('otherOk');
+    return;
+  }
   if (V === 'sharedshort') { show('<div class="ui-dialog"><div>ファイルアップロードを開始します</div><div>削除しますか<input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
   if (V === 'secondconfirm') {   // 確認の OK が押せるようになる前に 2 つ目の確認が出る
     show(dialog('ファイルアップロードを開始します', 'cfmOk', ' disabled'));
@@ -544,6 +567,18 @@ await ta('[11] 押す部品 executeImport: 実行 → 決まった文言のモ�
     let x = await run('ok');
     assert.deepEqual([x.out.executeIssued, x.out.confirm, x.out.reason, x.issued, x.log], [true, 'clicked', null, ['issued'], ['execute', 'cfmOk']]);
     assert.equal(K.judgeImportResult(K.parseImportResult(x.out.resultText), 1).to, 'imported_unverified');
+    // ── 本物の形 (jAlerts の jConfirm・2026-09-30 の実機の試験で見た) ──
+    x = await run('jconfirm');   // 覆いと箱が兄弟・OK の値に &nbsp; = 押せる → 結果を読む
+    assert.deepEqual([x.out && x.out.confirm, x.out && x.out.reason, x.log], ['clicked', null, ['execute', 'cfmOk']]);
+    assert.equal(K.judgeImportResult(K.parseImportResult(x.out.resultText), 1).to, 'imported_unverified');
+    x = await run('jconfirm-jresult');   // 結果も jAlerts の箱で出る = 読める
+    assert.deepEqual([x.out && x.out.confirm, x.out && x.out.reason, x.log], ['clicked', null, ['execute', 'cfmOk']]);
+    assert.equal(K.judgeImportResult(K.parseImportResult(x.out.resultText), 1).to, 'imported_unverified');
+    for (const [v, why] of [['jconfirm-alert', 'お知らせ (jAlert) の箱 = 確認の枠ではない'], ['jconfirm-extra', '文言の後に別の文'], ['jconfirm-twook', 'OK が 2 つ'], ['jconfirm-okonly', 'Cancel が無い (形が違う)'], ['jconfirm-otherbtn', '2 つ目のボタンが Cancel でない'], ['jconfirm-prompt', '箱の中に入力欄 (jPrompt に近い)'], ['jconfirm-covered', '箱の上に覆い']]) {
+      x = await run(v);
+      assert.deepEqual([x.err && x.err.executeIssued, x.log], [true, ['execute']], `${v}: ${why} = 押さない`);
+      assert.match(String(x.err && x.err.reason), /^confirm_(unidentified|covered|ambiguous)$/, v);
+    }
     x = await run('decoy');   // 関係ない「お知らせ」の OK は押さない
     assert.deepEqual([x.out.confirm, x.log], ['clicked', ['execute', 'cfmOk']]);
     x = await run('noconfirm');   // 確認が出ない = 押さずに結果を待つ
