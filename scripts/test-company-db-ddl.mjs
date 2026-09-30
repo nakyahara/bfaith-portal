@@ -173,6 +173,17 @@ await ta('[!] 0049 (13 §3.5・§3.6・D7b-3): Amazon の利益の mart = 関数
   assert.equal(tables[0].n, 0);
 });
 
+await ta('[!] 0051 (13 §3.1・D7b-1b-2): 決済のそろい core.finance_coverage = 会社 × モール × scope × source の 1 行・core.finance_coverage_state は同じ形のまま差し替え (行なし = 全部 null)', async () => {
+  const pk = await q(`select a.attname as c from pg_index i join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
+    where i.indrelid = 'core.finance_coverage'::regclass and i.indisprimary order by array_position(i.indkey, a.attnum)`);
+  assert.deepEqual(pk.map((r) => r.c), ['company_id', 'mall', 'scope_key', 'source']);
+  const ck = await q(`select conname as n from pg_constraint where conrelid = 'core.finance_coverage'::regclass and contype = 'c' and conname like 'ck\\_finance\\_coverage\\_%' order by 1`);
+  assert.deepEqual(ck.map((r) => r.n), ['ck_finance_coverage_complete', 'ck_finance_coverage_complete_to', 'ck_finance_coverage_evidence', 'ck_finance_coverage_invalidated', 'ck_finance_coverage_receipts']);
+  assert.equal((await q(`select pg_get_function_result('core.finance_coverage_state(smallint,text,text,text)'::regprocedure) as r`))[0].r, 'TABLE(complete_to date, generation bigint, source_revision bigint)');
+  assert.deepEqual(await q(`select * from core.finance_coverage_state(1::smallint, 'amazon', 'jp', 'amazon_settlement_unified')`), [{ complete_to: null, generation: null, source_revision: null }]);
+  assert.equal((await q(`select count(*)::int as n from core.finance_coverage`))[0].n, 0);   // 作るだけ (値は coordinator = D7b-1b-3 が送る)
+});
+
 await ta('[!] 03 §10: 円の金額列 (*_jpy) はすべて bigint', async () => {
   const rows = await q("select table_schema, table_name, column_name, data_type from information_schema.columns where column_name like '%\\_jpy%' escape '\\' and table_schema in ('core','snapshots','events','ai','mart') and data_type <> 'bigint'");
   assert.deepEqual(rows, [], JSON.stringify(rows));

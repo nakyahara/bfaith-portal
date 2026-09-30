@@ -972,6 +972,43 @@ select economic_date_jst, seller_sku_norm, unclassified_component_count, unclass
 - 回の完了 = `completed_at` がある・`last_page_reached = 1`・`list_error` / `ingest_error` / `record_error` が null。これを満たさない回は後の coverage で「失敗した回」として扱う
 - 試験 = `node apps/warehouse/test-settlement-inventory.js` (一時 DB・SP-API は差し替え・daily-sync の冒頭でも「Settlement 一覧テスト」として走る)
 
+### 決済のそろい `core.finance_coverage` (0051。D7b-1b-2 = Render 側。Company DB構想 13 §3.1・D-65・D-66)
+
+「Amazon 側で決済がそろった」と「その全部の行が Company DB に入った」の **両方** を満たす最後の日 = `complete_to`。これが来るまで 0049 の正式な利益は全部 null。
+**値を作って送るのは miniPC の coordinator (D7b-1b-3・後の PR = 一覧・初期の印・文書の版・lease・SQLite の `source_revision`)**。この PR は受け皿と受け口と、財務の chunk を世代に縛るところだけ。**今の送り手 (daily-sync) は変えていない = coverage を送らない**。
+
+- 表 = 会社 × モール × scope × source の **1 行 = 今の世代の状態** (`state` = `updating` / `complete`・`generation` = coverage 専用の連番・`run_token`)。列は §3.1 の一覧 (manifest = `complete_to`・`settlements_through`・`source_revision`・見出し・受領・一覧・初期の印・採った文書・証拠の鎖・期待の report の数と digest) + `request_hash`・`completed_at` + 無効の印 (`invalidated_at` / `invalidated_reason`)。
+  CHECK = complete なら manifest が全部そろう・`complete_to` = `settlements_through` の JST の日の前日・無効の印の組
+- `core.finance_coverage_state(会社, モール, scope, source)` を **差し替えた** (0049 の差し込み口。同じ形): `complete_to` と `source_revision` = **complete のときだけ** / `generation` = 今の世代 (updating でも) / 行なし = 全部 null
+- **状態の移り方** (受け口 `ingest/finance-coverage.mjs` が 1 取引・財務の chunk と同じ advisory lock の中で):
+  - 古い世代 → `stale` (何もしない) / 新しい世代は **updating からだけ** (直接の complete = 409)。新しい世代の updating は前の complete を無効にする (manifest の列を空に)
+  - 同じ世代・同じ token の updating の再送 = `same` / 違う token = 409 / 同じ世代の complete → updating = 409
+  - 同じ世代・同じ token の updating → complete は **1 回だけ**: lock → **今の受領記録から receipt digest を計算** → manifest と違えば 409 `RECEIPT_MISMATCH` (`detail.render` = Render の数・行の数・digest) → complete
+  - 同じ世代の complete の再送 = `request_hash` が同じなら `same` (応答だけ失われた)・違えば 409
+- **receipt digest** (`apps/company-db/finance/coverage-manifest.mjs` = 送り手と受け口が同じ関数): 会社 × モール × scope の `lines > 0` の受領記録 (墓石は除く・疑似注文を含む・期間では絞らない) を
+  `mall_order_no` の **UTF-8 のバイトの順** (PostgreSQL は `collate "C"`) に並べた正規の JSON `{"format":"frd-v1","receipts":[{lines, mall_order_no, set_checksum, transform_version}…]}` の SHA-256 + 数 + 行の数。
+  Render は cursor で 1 万行ずつ読んで 1 行ずつ hash に足す (51 万注文でも手元に全部を持たない)。run ID・token は入れない
+- **request_hash** = 正規の JSON `{format: "fcr-v1", company_id, mall, scope_key, source, state: "complete", generation (10 進の文字列), run_token, manifest の全部}` の SHA-256。送り手が付けたら受け口の計算と比べる (違えば 400)
+- manifest の形 (400): 全部の列が必須・日時は UTC の `YYYY-MM-DDTHH:MM:SSZ`・bigint と ID は 10 進の文字列 (`source_revision` は数でもよい)・digest は 64 桁の小文字の 16 進・未来の時刻は不可 (+10 分)・
+  `selected_documents_count = headers_count`・`receipt_lines ≥ receipt_count`・知らない鍵は不可 / `settlements_through` が policy の起点 (その source の `period_from` の JST 00:00) より後でなければ 400 / policy に無い source = 409 `NO_POLICY`
+- 🚨 Render が確かめられるのは **受領記録 (receipt digest) と形だけ**。一覧・初期の印・採った文書・期待の report の集合は miniPC の SQLite にしか無い = 送り手の申告を保存するだけ (D7b-1b-3 が作る・試験する)
+- **財務の chunk を世代に縛る** (§3.1 R10 H1・R23 M5):
+  - 全部の財務の chunk・updating・complete が **同じ advisory lock** (`company-db:order-finance:会社:モール:scope`) を取引の最初に取る (待つ。chunk は lock_timeout 10 秒・coverage は 20 秒で 503 `LOCKED` = 送り手がやり直す)
+  - chunk の body に `coverage_generation` と `run_token` (両方) = **その世代・その token の coverage が updating のときだけ適用** (complete の後・別の世代・別の token・行の source が coverage の source と違う = 409 `COVERAGE_MISMATCH`・何も書かない)
+  - 🚨 **付いていない chunk (今の送り手) は今までどおり受ける (互換)**。ただし受領記録を 1 つでも変えたら (applied > 0)、その会社 × モール × scope の **complete を updating に落とす** (無効の印・応答の `coverage_invalidated`)。
+    受領記録は source を持たない = その key の全部の source の complete を落とす (fail-closed)。無効の印のある世代は complete に戻れない (409) = 次の世代の updating から。same / stale (受領記録が変わらない) では落とさない
+  - 🚨 **coordinator (D7b-1b-3) ができたら token の無い chunk は拒む契約にする** (今の daily-sync の送り手を止めないために当面は受ける)
+  - 0051 の前 (Render の deploy が migrate より先): token の無い chunk は今までどおり・token 付きの chunk と coverage の口は 409 `not_migrated`
+- 受け口 (`router.mjs`・鍵は server.js の `/apps/company-db/sync/order-finance` の前方一致に入る):
+  - `POST /apps/company-db/sync/order-finance/coverage` `{ state, mall, scope, source, generation, run_token, manifest? (complete だけ), request_hash? }` → `{ status: applied | same | stale, state, generation, current_generation?, complete_to?, receipt? }`
+  - `GET /apps/company-db/sync/order-finance/coverage/status?mall&scope&source[&receipts=1]` → `{ coverage: 行 | null, effective: core.finance_coverage_state の値, receipts? }` (送り手が回の始めに Render の今の世代を読む・世代と版は 10 進の文字列)
+- 試験 = `node scripts/test-company-db-finance-coverage.mjs` (PGlite・本物の router を HTTP でも: 状態の移り方の全部の場面・receipt digest の一致 / 不一致 と JS / cursor の一致・manifest の形・token 付きの chunk の 409・順序の逆転・3 つの受け口が同じ lock・token 無しの chunk で complete が落ちる・0049 の mart が正式な値を出す・0051 の前)。
+  🚨 PGlite は 1 接続 = 「lock を持ったまま止まった chunk を新しい世代の updating が待つ」の 2 接続の待ちは書けない (同じ lock を持つことと、lock の前で止めた chunk が 409 になることで確かめた)
+
+**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後)**: 🚨 **0050 (別の PR) が先に master に入ってから** (番号の欠番があると migrate が止まる)。
+Render の deploy が先でも今の送り手は今までどおり (token の無い chunk は 0051 の前も受ける)。migrate は本番で使っていない worktree から dry-run → 本適用 (0051 だけが出ること)。
+coverage が complete になるのは D7b-1b-3 (coordinator) が動いた後 = それまで正式な利益は全部 null のまま。
+
 ## 受注・出荷の受け皿 (0013。08 §4.1〜4.3 / §4.7。D4)
 
 受注の raw は Company DB に持ち込まない (年 236 万注文)。miniPC が warehouse.db の追記ログから core の形に整えて §4.7 の契約で push する (取込ジョブ = D5)。**注文 = モールの注文 1 件、出荷 = NE の伝票 1 件**。状態の履歴は持たない (D-36。出荷済み・取消の時刻を列で)。
@@ -1360,8 +1397,9 @@ select valid_from, valid_to, cost_jpy, cost_status, cost_basis from mart.v_sku_c
 
 設計の正本 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』v26。Company DB に入った Amazon の財務 (0043・0047) に **原価・広告費・Easy Ship** を足し、**日 × 出品の利益** を関数で都度計算する (表は作らない・D-60)。
 🚨 **分からないもの (決済のそろい・原価・広告費・返品数) を 0 として利益を確定しない**: 正式な列は null + 理由のコード。0 と仮定した値は別の名前 (`…_assuming_incomplete_zero_…`) = AI はこれを「利益」と読まない。
-🚨 **決済のそろい (coverage) はまだ無い** (D7b-1b・後の PR) → `core.finance_coverage_state()` が **今は 1 行・全部 null** = 全部の日が `day_finance_status = provisional / missing` = **正式な利益は全部 null** (0 と仮定の値は出る)。
-**D7b-1b はこの関数だけを差し替える** (同じ引数・同じ戻り = `complete_to`・`generation`・`source_revision` の 1 行。0 行 / 2 行以上は全部 null と読む = fail-closed)。この mart は変えない。
+🚨 **決済のそろい (coverage)** = `core.finance_coverage_state()` を **0051 (D7b-1b-2) が表 `core.finance_coverage` を読む形に差し替えた** (下の「決済のそろい」の節)。
+complete の行が無い間 (= coordinator の D7b-1b-3 が complete を送るまで) は **complete_to が null** = 全部の日が `day_finance_status = provisional / missing` = **正式な利益は全部 null** (0 と仮定の値は出る)。
+この関数だけの差し替え (同じ引数・同じ戻り = `complete_to`・`generation`・`source_revision` の 1 行。0 行 / 2 行以上は全部 null と読む = fail-closed)。この mart は変えない。
 
 - **関数**:
   - `mart.amazon_profit_daily_range(会社, モール, scope, from, to)` = **日 × 出品の寄与の利益** (月の手数料を引く前)。行の鍵 = `listing_id` / `seller_sku_norm` / `listing_resolution` (resolved = 出品あり・seller_sku_norm は null / unresolved = 出品に結びつかない正規化 seller SKU・listing_id は null)。その期間に財務・広告・Easy Ship のどの行も無ければ 0 行
@@ -1369,7 +1407,7 @@ select valid_from, valid_to, cost_jpy, cost_status, cost_basis from mart.v_sku_c
   - 契約 = `from <= to`・最大 400 日 (両端を含む)・**今は amazon / jp だけ** (受け取り時の出品の決め方が shop_code を見ない = Amazon のアカウントが 1 つの間だけ正しい)・違えば例外 (22023 `invalid_input`)
   - 内部の部品 (直に呼ばない): `mart._amazon_profit_finance_days` (日の決済の状態) / `_amazon_profit_ad_days` (広告の日の状態) / `_amazon_profit_ad_children` (広告の子を今のマスタで結び直す) / `_amazon_easy_ship_alloc` (Easy Ship の割り振り) / `_amazon_profit_rows` / `_amazon_profit_totals`。
     🚨 材料 (日の状態・広告・Easy Ship の割り振り) は **1 回の呼び出しで 1 回だけ** 計算し、型 (`mart.amazon_profit_finance_day` など) の配列で行の本体に渡す = 日の合計も同じ材料を使い回す (Easy Ship の割り振りは期間の外の日も読む = 重い・#1559 Codex R1 Medium 1)
-  - `core.finance_coverage_state(会社, モール, scope, source)` (今は全部 null・D7b-1b が差し替える) / `mart.amazon_profit_composition_audit_since()` (0049 の適用の時刻) / `mart.amazon_account_fee_tax_rate(line_kind)` (月の手数料の税の表)
+  - `core.finance_coverage_state(会社, モール, scope, source)` (0051 で差し替え = complete のときだけ complete_to) / `mart.amazon_profit_composition_audit_since()` (0049 の適用の時刻) / `mart.amazon_account_fee_tax_rate(line_kind)` (月の手数料の税の表)
   - 行には子 (0047) の財務の列も出品にまとめて出す (`units_marketplace_guarantee`・丸める前の返品数 `units_refunded_customer_unrounded` / `units_a_to_z_refund_unrounded` = 単価の無い子は null)
 - **今のマスタで結び直す (D-64・`master_basis = 'current'`)**: 財務 (`mart.finance_daily_sku_range` の正規化 seller SKU の子) は今の `core.listings` の `listing_norm` の **直接の一致** (0043 の受け口と同じ = 会社 × モールで 1 件のときだけ・0 件 / 2 件以上 = 未解決)。
   広告は `target_granularity = 'sku'` の行だけ `core.resolve_listing_id` (external_ids の別名も含む)・**asin / none は常に未解決** (ASIN が出品のコードと同じ文字でも)。保存済みの `listing_id` は診断 (`received_listing_ids`) だけ。構成も今の `core.listing_components`
@@ -1406,7 +1444,7 @@ select valid_from, valid_to, cost_jpy, cost_status, cost_basis from mart.v_sku_c
   **`/daily` は 1 回 93 日まで** (行が多い = メモリに全部を載せて返す。長い期間は日の範囲で区切って何回かに分けて読む)・`/totals` は 400 日まで (日 + 月 + 合計だけ)。
   JSON の形: ID と ID の配列は 10 進の文字列 / 円 (`*_jpy`)・個数・件数は数 / **金額の numeric (税抜・広告費・0 と仮定・手数料の後) は小数 2 桁の文字列** (例 `"225.45"`) /
   **`units_*_unrounded` (丸める前の返品数) は小数 最大 6 桁の文字列** (例 `"1.499999"`・返品が無い = `"0"`・単価の無い子 = null) / 日付は YYYY-MM-DD / 時刻は UTC の ISO (ミリ秒)
-- `finance_coverage_generation` / `finance_source_revision` = `core.finance_coverage_state` の値 (D7b-1b まで null)。
+- `finance_coverage_generation` / `finance_source_revision` = `core.finance_coverage_state` の値 (世代 = 今の世代・updating でも出る / 版 = complete のときだけ)。
   合計は対象の日で **(source・generation・source_revision) の組が 1 つに決まるときだけ** (null の日がある・source が違う = null。#1559 Codex R2 Low 1)・`calculation_version = 'amazon_profit_v1'`・`calculated_at` = 1 回の呼び出しで同じ値
 - **受け取り時の出品** (診断・値を止めない): 財務の `received_listing_ids` / `received_listing_unresolved_count` と広告の `ad_received_listing_ids` / `ad_received_unresolved_rows` (保存済みの `listing_id`)。
   出品の行は、受け取りの記録があって「今の出品 1 つだけ・受け取り時の未解決 0」と **集合で** 一致しなければ `listing_changed_since_received` (#1559 Codex R1 Medium 2)。

@@ -356,9 +356,9 @@ await t('受け口: 旧い形 = 旧い列の指紋・正規化した行に 4 列
   const vNew = validateFinanceChunk(body(neu, orderFinanceChecksum(validateFinanceRows('F1', neu)), V2)).rows[0];
   assert.deepEqual([vNew.lines[0].unclassified_component_count, vNew.lines[0].unclassified_abs_jpy], [2, 200]);
   assert.throws(() => validateFinanceChunk(body(neu, orderFinanceChecksum(validateFinanceRows('F1', neu), { legacy: true }), V2)), /set_checksum differs/);
-  // router: NOT_MIGRATED / DOWNGRADE は 409
+  // router: NOT_MIGRATED / DOWNGRADE (と 0051 の COVERAGE_MISMATCH) は 409
   const src = fs.readFileSync(new URL('../apps/company-db/router.mjs', import.meta.url), 'utf8');
-  assert.match(src, /e\.code === 'NOT_MIGRATED' \|\| e\.code === 'DOWNGRADE'\) \? 409/);
+  assert.match(src, /e\.code === 'NOT_MIGRATED' \|\| e\.code === 'DOWNGRADE' \|\| e\.code === 'COVERAGE_MISMATCH'\) \? 409/);
 });
 await t('🚨 版と行の形 (#1554 Codex R1 High): v2 の版で 4 列が無い・null・一部 = 400 / 旧い版で 4 列あり = 400 / 墓石 (空の集合) はどちらでも通る / JS と SQL の版の規則が同じ', async () => {
   const body = (lines, v) => ({ run_id: 'ship_202609301200000_abcdef', batch_seq: 1, chunk_index: 0, last: true, transform_version: v,
