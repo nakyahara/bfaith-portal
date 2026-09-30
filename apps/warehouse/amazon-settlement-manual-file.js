@@ -60,10 +60,20 @@ export function inspectManualFile(tsv, { fileName = null, format = null } = {}) 
   return { format: fmt, prepared, settlementId: ids.size === 1 ? [...ids][0] : null, fileHash: fmt === 'v2' ? prepared.sourceFileHash : fileHash, header: h, lineCount: prepared.lineRows.length, componentsSumMicro: sum, totalMicro: total, ok: problems.length === 0, problems };
 }
 
-/** 順番待ちに積む (ファイルを DATA_DIR に写す + 表に 1 行)。同じ file hash は 1 回だけ */
+/**
+ * その決済に API の版 (sp_api_v1 / v2) が既にあるか (R1 Medium 1)。あれば手のファイルは採られない (層の順が後) = 積んでも値は変わらない。
+ *   手のファイルにだけある注文は「読み直す注文」には入るが、送るものが無い = 消える (無駄な回・紛らわしい) → 積む前に警告する
+ */
+export function apiVersionsOf(db, settlementId) {
+  if (!settlementId) return [];
+  return db.prepare(`SELECT seq, source_layer, report_id FROM amazon_settlement_document_versions WHERE settlement_id = ? AND source_layer IN ('sp_api_v1', 'sp_api_v2') ORDER BY seq`).all(settlementId);
+}
+
+/** 順番待ちに積む (ファイルを DATA_DIR に写す + 表に 1 行)。同じ file hash は 1 回だけ。戻りの apiVersions があれば呼び手は警告を出す */
 export function queueManualFile(db, dataDir, tsv, { fileName, format = null, now = new Date() }) {
   const x = inspectManualFile(tsv, { fileName, format });
   if (!x.ok) throw new Error(`取り込めない: ${x.problems.join(' / ')}`);
+  x.apiVersions = apiVersionsOf(db, x.settlementId);
   const dir = path.join(dataDir, MANUAL_DIR);
   fs.mkdirSync(dir, { recursive: true });
   const stored = path.join(dir, `${x.fileHash}.txt`);
@@ -129,6 +139,8 @@ if (isDirectRun) {
     const x = inspectManualFile(tsv, { fileName: path.basename(a.file), format: a.format });
     console.log(`[manual] ${path.basename(a.file)}: 形式 ${x.format}・決済 ${x.settlementId}・期間 ${x.header?.settlement_start_date} 〜 ${x.header?.settlement_end_date}・total ${x.totalMicro}・明細 ${x.lineCount} 行・部品の合計 ${x.componentsSumMicro}`);
     if (!x.ok) { console.log(`[manual] ❌ 取り込めない: ${x.problems.join(' / ')}`); process.exitCode = 1; return; }
+    const api = apiVersionsOf(db, x.settlementId);
+    if (api.length) console.log(`[manual] ⚠️ 決済 ${x.settlementId} には API の版が既にある (${api.map((v) => `#${v.seq} ${v.source_layer} ${v.report_id}`).join(' / ')}) = 手のファイルは採られない (API の版が先)。積む必要があるか確かめる`);
     if (!a.queue) { console.log('[manual] dry-run (積まない)。積むなら --queue (次の coordinator の回で入る)'); return; }
     const q = queueManualFile(db, process.env.DATA_DIR, tsv, { fileName: path.basename(a.file), format: a.format });
     console.log(q.queued ? `[manual] ✅ 順番待ちに積んだ (${q.storedPath})。次の coordinator の回で入る` : '[manual] 同じファイルは積んである');

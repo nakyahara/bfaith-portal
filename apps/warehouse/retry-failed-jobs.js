@@ -264,11 +264,26 @@ function toJstDate(d) {
  *   { found: true, state }                        正常読み込み
  *   { found: true, state: null, parseError }      破損 (呼び出し側で deleteState を試みる)
  */
+/**
+ * 旧い工程の名前 → 新しい名前 (#1567 R1 L4)。マージの前の朝に書かれた retry-state を、マージの後の retry が読んでも走らせる
+ *   'Amazon Settlement' / 'CompanyDB財務(Amazon)' = 2026-10-01 に coordinator 'Amazon決済と財務' の 1 工程にまとめた
+ */
+export const RENAMED_JOBS = Object.freeze({ 'Amazon Settlement': 'Amazon決済と財務', 'CompanyDB財務(Amazon)': 'Amazon決済と財務' });
+/** remaining_jobs の旧い名前を新しい名前に (重複は 1 つに・順は最初に出た位置) */
+export function renameRetryJobs(jobs) {
+  if (!Array.isArray(jobs)) return jobs;
+  const out = [];
+  for (const j of jobs) { const n = Object.hasOwn(RENAMED_JOBS, j) ? RENAMED_JOBS[j] : j; if (!out.includes(n)) out.push(n); }
+  return out;
+}
+
 function loadState() {
   if (!fs.existsSync(RETRY_STATE_FILE)) return { found: false };
   try {
     const json = fs.readFileSync(RETRY_STATE_FILE, 'utf-8');
-    return { found: true, state: JSON.parse(json) };
+    const state = JSON.parse(json);
+    if (state && Array.isArray(state.remaining_jobs)) state.remaining_jobs = renameRetryJobs(state.remaining_jobs);
+    return { found: true, state };
   } catch (e) {
     console.error('[Retry] state file 読み込み失敗:', e.message);
     return { found: true, state: null, parseError: e.message };

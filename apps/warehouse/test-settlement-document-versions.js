@@ -130,15 +130,19 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
   let seed = 7; const rnd = (n) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
   for (let i = 0; i < 300; i++) {
     const meta = { source_layer: layers[rnd(4)], report_type: null, report_id: `FZ-${i}`, report_document_id: null, file_hash: `fz${i}`, normalization_version: 'v' };
-    V.registerDocumentVersion(db, { ...meta, document_version_id: V.documentVersionId(meta), source_document_id: `FZ-${i}`, settlement_id: `FZ-S${rnd(25)}`, ingested_at: times[rnd(4)] }, { registeredBy: 'backfill' });
+    const v = V.registerDocumentVersion(db, { ...meta, document_version_id: V.documentVersionId(meta), source_document_id: `FZ-${i}`, settlement_id: `FZ-S${rnd(25)}`, ingested_at: times[rnd(4)] }, { registeredBy: 'backfill' });
+    // 🆕 #1567 R1 Medium 3: 中身の確かな版 (detail_valid = 1) だけが候補 = 乱数で 1 / 0 / null を混ぜる
+    db.prepare(`UPDATE amazon_settlement_document_versions SET detail_valid = ?, detail_stale = 0 WHERE seq = ?`).run([1, 1, 0, null][rnd(4)], v.seq);
   }
   const js = V.selectDocumentVersions(V.readVersions(db));
   const sql = db.prepare(`SELECT settlement_id, document_version_seq FROM v_amazon_settlement_selected_documents`).all();
   ok(sql.length === js.size && sql.every((r) => js.get(r.settlement_id) && js.get(r.settlement_id).seq === r.document_version_seq), `🚨 採る版: JS の selectDocumentVersions = SQL の view (${sql.length} 決済・層 → 新しい順 → ID のバイトの順)`);
   // 手で: 層 1 が 2 より先 (manual が新しくても) / 同じ層・同じ時刻 = ID の小さい方
-  const pick = (vs) => V.selectDocumentVersions(vs.map((v, i) => ({ settlement_id: 'X', seq: i, ...v }))).get('X').seq;
+  const pick = (vs) => V.selectDocumentVersions(vs.map((v, i) => ({ settlement_id: 'X', seq: i, detail_valid: 1, ...v }))).get('X')?.seq ?? null;
   ok(pick([{ source_layer: 'manual_csv', ingested_at: '2027', document_version_id: 'a' }, { source_layer: 'sp_api_v2', ingested_at: '2026', document_version_id: 'b' }]) === 1, '層 1 (API) が manual より先 (manual が新しくても)');
   ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'b' }, { source_layer: 'sp_api_v2', ingested_at: '2026', document_version_id: 'a' }]) === 1, 'V1 と V2 は同じ順位 → 同じ時刻なら ID のバイトの順');
+  ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'a' }, { source_layer: 'sp_api_v2', ingested_at: '2027', document_version_id: 'b', detail_valid: 0 }]) === 0, '🚨 中身の悪い新しい版 (detail_valid 0) は良い旧い版を押しのけない (#1567 R1 Medium 3)');
+  ok(pick([{ source_layer: 'sp_api_v2', ingested_at: '2027', document_version_id: 'b', detail_valid: 0 }]) === null, '中身の悪い版しか無い = 採らない (build と送り手は blocked で止まる)');
 }
 
 // ─── ⑤ trigger: UPDATE は OLD と NEW の両方 / DELETE / backfill は数えない ───
@@ -174,6 +178,93 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
   ok(leg.document_version_id === V.documentVersionId({ source_layer: 'sp_api_v1', report_type: V.REPORT_TYPES.v1, report_id: 'LEG-1', report_document_id: null, file_hash: 'lh', normalization_version: 'v1.0.0' }), '過去の行の版の ID の規則');
   ok(db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_document_id = 'LEG-1' AND normalization_version = 'v1.0.0'`).get().n === 5, 'backfill は normalization_version も埋める');
   ok(V.backfillDocumentVersions(db).groups === 0, 'backfill は冪等 (2 回目は何もしない)');
+}
+
+// ─── 🆕 #1567 R1 High 1: backfill が途中で止まる (行の UPDATE の後・要約の前 / 登録の後・行の前) = ready にしない (build が行を黙って落とさない) ───
+{
+  const insLeg = (doc, sid, n0) => {
+    const ins = db.prepare(`INSERT INTO raw_amazon_settlement_lines (physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version,
+      source_settlement_id, posted_date_utc, posted_datetime_jst, economic_date, year_month_int, amazon_order_id, seller_sku_normalized, transaction_type, price_type, price_amount_micro, currency, ingested_at)
+      VALUES (?, ?, ?, 'kh', 'p', ?, 'sp_api_v1', 'v1.0.0', ?, 'x', 'x', ?, ?, ?, 'sku-k', 'Order', 'Principal', 1000000, 'JPY', '2026-01-01 00:00:00')`);
+    for (let i = 1; i <= 3; i++) ins.run(`${doc}-${i}`, `${doc}-k${i}`, doc, i, sid, `${YM}-04`, Number(YM.replace('-', '')), `${doc}-O${i}`);
+  };
+  const buildFails = () => { let out = ''; try { execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch (e) { out = String(e.stdout || '') + String(e.stderr || ''); } return out; };
+  const stopAt = (k) => { let n = 0; return () => { n++; if (n >= k) throw new Error(`わざと止めた (${k} 回目)`); }; };
+  // (1) 行の UPDATE の後・要約 (refresh) の前で止める: check = 登録 1 → 明細 2 → 版の +1 3 → 要約 4
+  insLeg('KILL-A', 'S-KILL-A');
+  let stopped = null; try { V.backfillDocumentVersions(db, { check: stopAt(4) }); } catch (e) { stopped = e.message; }
+  const va = db.prepare(`SELECT * FROM amazon_settlement_document_versions WHERE source_document_id = 'KILL-A'`).get();
+  ok(/4 回目/.test(stopped || '') && db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_document_id = 'KILL-A' AND document_version_seq IS NULL`).get().n === 0, `前提: 行の UPDATE は済み・要約の前で止まった (${stopped})`);
+  ok(va && va.settlement_id === 'S-KILL-A' && va.detail_stale === 1, `🚨 (a) 決済 ID は版の登録と同じ取引で入る (止まっても決済 ID の無い版を残さない) (${va && va.settlement_id}・要約が古い ${va && va.detail_stale})`);
+  const pa = V.documentVersionProblems(db).map((p) => p.code);
+  ok(pa.includes('version_incomplete') && !V.documentVersionsReady(db), `🚨 (b) 要約の古い版があれば ready にしない (${pa.join(', ')})`);
+  ok(/要約が古い/.test(buildFails()), '🚨 build は止まる (0 行・0 円で作り直さない)');
+  // (2) 版の登録の後・行の UPDATE の前で止める
+  insLeg('KILL-B', 'S-KILL-B');
+  stopped = null; try { V.backfillDocumentVersions(db, { check: stopAt(2) }); } catch (e) { stopped = e.message; }
+  const pb = V.documentVersionProblems(db).map((p) => p.code);
+  ok(/2 回目/.test(stopped || '') && pb.includes('rows_without_version'), `登録の後・行の前で止まった = 版の無い行が残る = ready にしない (${pb.join(', ')})`);
+  // 流し直すと両方そろう (冪等・古い要約も作り直す)
+  const again = V.backfillDocumentVersions(db);
+  ok(V.documentVersionsReady(db) && again.refreshed >= 2, `流し直すと ready (要約を作り直した版 ${again.refreshed})`);
+  ok(!/文書の版|要約が古い/.test(buildFails()), '流し直した後は build が通る');
+}
+
+// ─── 🆕 #1567 R1 Medium 3: 中身の悪い新しい版は採らない・悪い版しか無い決済は blocked (build と送り手を止める) ───
+{
+  const Sbad = 'S-DV-BAD';
+  const good = prepareReportTsv(tsvOf(V1_COLUMNS, [{ ...HDR1, 'settlement-id': Sbad, 'total-amount': '1000.00' }, v1line({ 'settlement-id': Sbad, 'order-id': 'OG', 'price-type': 'Principal', 'price-amount': '1000.00' })]), 'R-G', 'x');
+  const rg = ingestSettlement(db, good.headerRow, good.lineRows, good.ctx, { now: () => new Date('2026-09-01T00:00:00Z') });
+  // 新しい版: 見出しの total が明細の合計と違う (途中で切れたファイル)
+  const bad = prepareReportTsv(tsvOf(V1_COLUMNS, [{ ...HDR1, 'settlement-id': Sbad, 'total-amount': '1000.00' }, v1line({ 'settlement-id': Sbad, 'order-id': 'OG', 'price-type': 'Principal', 'price-amount': '999.00' })]), 'R-G', 'x2', { reportDocumentId: 'DOC-NEW' });
+  const rbad = ingestSettlement(db, bad.headerRow, bad.lineRows, bad.ctx, { now: () => new Date('2026-09-02T00:00:00Z') });
+  const vbad = db.prepare(`SELECT detail_valid FROM amazon_settlement_document_versions WHERE seq = ?`).get(rbad.documentVersionSeq);
+  ok(vbad.detail_valid === 0 && rbad.selectedChanged === false && V.selectedVersionOf(db, Sbad).seq === rg.documentVersionSeq, '🚨 新しい版の部品の合計 ≠ total = 候補にしない = 良い旧い版のまま (押しのけない)');
+  const sqlSel = db.prepare(`SELECT document_version_seq s FROM v_amazon_settlement_selected_documents WHERE settlement_id = ?`).get(Sbad);
+  ok(sqlSel && sqlSel.s === rg.documentVersionSeq, 'SQL の view も同じ (旧い版)');
+  ok(V.documentVersionsReady(db), '良い版がある決済は blocked にしない');
+  // 悪い版しか無い決済 (見出しが 2 行)
+  const S2b = 'S-DV-BAD2';
+  const two = prepareReportTsv(tsvOf(V1_COLUMNS, [{ ...HDR1, 'settlement-id': S2b, 'total-amount': '10.00' }, { ...HDR1, 'settlement-id': S2b, 'total-amount': '11.00' }, v1line({ 'settlement-id': S2b, 'order-id': 'OB2', 'price-type': 'Principal', 'price-amount': '10.00' })]), 'R-B2', 'x');
+  // 見出しの行は 1 本しか返らない (prepare は最後の見出し) = 2 本目は直接足す
+  ingestSettlement(db, two.headerRow, two.lineRows, two.ctx);
+  const hsrc = db.prepare(`SELECT * FROM raw_amazon_settlement_headers WHERE source_settlement_id = ?`).get(S2b);
+  const { id: _hid, ...hrest } = hsrc;
+  db.prepare(`INSERT INTO raw_amazon_settlement_headers (${Object.keys(hrest).join(',')}) VALUES (${Object.keys(hrest).map((k) => '@' + k).join(',')})`).run({ ...hrest, physical_line_hash: hrest.physical_line_hash + '-2', business_line_key: hrest.business_line_key + '-2', total_amount_micro: 11000000 });
+  V.refreshStaleVersionDetails(db);
+  const probs = V.documentVersionProblems(db);
+  ok(probs.some((p) => p.code === 'settlement_blocked' && p.detail.includes(S2b)) && V.blockedSettlements(db).some((b) => b.settlement_id === S2b), `🚨 採れる版が 1 つも無い決済 = blocked (${probs.map((p) => p.code).join(', ')})`);
+  let threw = null; try { V.assertDocumentVersionsReady(db); } catch (e) { threw = e; }
+  ok(threw && threw.code === 'SETTLEMENT_VERSIONS_NOT_READY' && /壊れている/.test(threw.message), '🚨 blocked = build と送り手の前の確かめで止まる (行が黙って消えない)');
+  // 片付け (以降の試験のため): 壊れた決済の行を消して ready に戻す
+  db.prepare(`DELETE FROM raw_amazon_settlement_headers WHERE source_settlement_id = ?`).run(S2b);
+  db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE source_settlement_id = ?`).run(S2b);
+  V.refreshStaleVersionDetails(db);
+  ok(V.documentVersionsReady(db), '行の無い版は blocked に数えない');
+}
+
+// ─── 🆕 #1567 R1 Medium 3: 本番のコピーで V1 (採っている版) と V2 の明細を比べる道具 (check-settlement-v1-v2.js・読むだけ) ───
+{
+  const { compareV2WithSelected } = await import('./check-settlement-v1-v2.js');
+  const S10 = 'S-DV-10';
+  const a = prepareReportTsv(tsvOf(V1_COLUMNS, [{ ...HDR1, 'settlement-id': S10, 'total-amount': '1000.00' }, v1line({ 'settlement-id': S10, 'order-id': 'O10', 'merchant-order-id': 'O10', 'price-type': 'Principal', 'price-amount': '1000.00' }), v1line({ 'settlement-id': S10, 'order-id': 'O10', 'merchant-order-id': 'O10', 'quantity-purchased': '1' })]), 'R-10', 'x');
+  ingestSettlement(db, a.headerRow, a.lineRows, a.ctx);
+  const cnt = () => db.prepare(`SELECT (SELECT COUNT(*) FROM raw_amazon_settlement_lines) l, (SELECT COUNT(*) FROM amazon_settlement_document_versions) v`).get();
+  const c0 = cnt();
+  const same = compareV2WithSelected(db, tsvOf(V2_COLUMNS, [{ ...HDR2, 'settlement-id': S10, 'total-amount': '1000.00' }, v2line({ 'settlement-id': S10, 'order-id': 'O10', 'merchant-order-id': 'O10', amount: '1000.00' })]), 'R-10v2');
+  ok(same.status === 'match' && same.v2.valid, `V2 と採っている V1 の明細が同じ = match (${same.status})`);
+  const diff = compareV2WithSelected(db, tsvOf(V2_COLUMNS, [{ ...HDR2, 'settlement-id': S10, 'total-amount': '1100.00' }, v2line({ 'settlement-id': S10, 'order-id': 'O10', 'merchant-order-id': 'O10', amount: '1000.00' }), v2line({ 'settlement-id': S10, 'order-id': 'O11', 'merchant-order-id': 'O11', 'order-item-code': 'I9', amount: '100.00' })]), 'R-10v2b');
+  ok(diff.status === 'differs', `V2 にだけある注文 = differs (${diff.status})`);
+  ok(JSON.stringify(cnt()) === JSON.stringify(c0), '比べる道具は書かない (行も版も同じ)');
+}
+
+// ─── 🆕 #1567 R1 Medium 2: 表の用意は 2 回目以降は何もしない (毎回の initDB で ALTER・索引・trigger を作り直さない) ───
+{
+  const schema = () => db.prepare(`SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`).all();
+  const before = JSON.stringify(schema());
+  const r0 = V.readSourceRevision(db);
+  V.createSettlementVersionSchema(db); V.createSettlementVersionSchema(db);
+  ok(JSON.stringify(schema()) === before && V.readSourceRevision(db) === r0, '表の用意を 2 回流しても表・列・索引・trigger・view と source_revision は同じ');
 }
 
 // ─── ⑥ R 以下だけ消す ───
@@ -228,8 +319,9 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
   V.refreshStaleVersionDetails(db);
   execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   const f = db.prepare(`SELECT SUM(sales_principal_jpy) p, SUM(other_amount_jpy) o, COUNT(*) n FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-a' AND date_jst = ?`).get(`${YM}-02`);
-  // SKU-A (2 日) = S1 の採った版 (OA 1,000) + S-DV-7 (O7 10)。S-DV-2 の OB の返品 (50) は返金 = 売上ではない・S-DV-9 は取り込んでいない
-  ok(f && f.p === 1000 + 10 && f.o === 0, `🚨 build: 採った版だけ = 本体 1,010・other_amount 0 (旧い版の OB の 300 と相殺の行を数えない) (${f && [f.p, f.o]})`);
+  // SKU-A (2 日) = S1 の採った版 (OA 1,000) + S-DV-7 (O7 10) + S-DV-BAD の良い旧い版 (OG 1,000・中身の悪い新しい版 999 は採らない) + S-DV-10 (O10 1,000)。
+  //   S-DV-2 の OB の返品 (50) は返金 = 売上ではない・S-DV-9 は取り込んでいない
+  ok(f && f.p === 1000 + 10 + 1000 + 1000 && f.o === 0, `🚨 build: 採った版だけ = 本体 3,010・other_amount 0 (旧い版の OB の 300・相殺の行・悪い版の 999 を数えない) (${f && [f.p, f.o]})`);
   const unified = db.prepare(`SELECT COUNT(*) n FROM v_amazon_settlement_unified WHERE source_settlement_id = ?`).get(S1).n;
   ok(unified === 2, `表示用の集まり (v_amazon_settlement_unified) も採った版の 2 行だけ (${unified})`);
 }

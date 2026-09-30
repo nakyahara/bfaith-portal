@@ -10,7 +10,11 @@
  *   - 生の表 (headers / lines) は document_version_seq (版の表の整数の鍵) で版を参照する。
  *     🚨 設計書は「document_version_id を参照する」。64 文字の hash を 440 万行に持つと約 +600MB (索引を含む) = 整数の鍵で参照する (版の表で 1 対 1)
  *   - 決済ごとに採る版を 1 つ (selectDocumentVersions = SQL の view v_amazon_settlement_selected_documents と同じ規則):
+ *       **中身の確かな版 (detail_valid = 1) だけ** を候補に (R1 Medium 3・fail-closed) →
  *       層の順 (sp_api_v1 と sp_api_v2 が同じ 1 → manual_csv 2 → ほか 3) → ingested_at の新しい順 → document_version_id の UTF-8 のバイトの順
+ *     detail_valid = 見出しがちょうど 1 行・明細の部品の合計 = 見出しの total・明細の決済 ID が 1 つで見出しと同じ・通貨 JPY
+ *       (例外 = 過去の行の backfill の版で見出しが 0 行 = 明細の決済 ID が 1 つなら候補にする。coverage は見出し 1 行を要る = complete にはならない)
+ *     🚨 行のある決済で候補の版が 1 つも無い (中身の悪い版しか無い) = 「決済の版が壊れている」= build と送り手を止める (assertDocumentVersionsReady・行を黙って落とさない)
  *     財務 (SQLite の build・送り手の変換)・見出しの検算・manifest は **その版の行だけ** から作る (版をまたいで行ごとに最新を選ばない)
  *   - 版の明細の要約 detail_digest = (business_line_key, 出現順, 9 つの金額, 数量, 取引の種類, 注文番号, SKU, 計上日) を
  *     business_line_key の UTF-8 のバイトの順 → 出現順で並べた正規の JSON の SHA-256。出現順 = 同じ鍵の中の source_line_no の DENSE_RANK
@@ -63,7 +67,7 @@ export function compareVersionOrder(a, b) {
 export function selectDocumentVersions(versions) {
   const out = new Map();
   for (const v of versions) {
-    if (v.settlement_id == null) continue;
+    if (v.settlement_id == null || Number(v.detail_valid) !== 1) continue;   // 中身の確かな版だけ (SQL の view と同じ)
     const cur = out.get(v.settlement_id);
     if (!cur || compareVersionOrder(v, cur) < 0) out.set(v.settlement_id, v);
   }
@@ -124,8 +128,10 @@ export function createSettlementVersionSchema(db) {
     header_end            TEXT,
     header_total_micro    INTEGER,
     header_currency       TEXT,
-    header_currency_raw   TEXT
+    header_currency_raw   TEXT,
+    detail_valid          INTEGER                 -- 1 = 採る版の候補 (中身が確か) / 0 = 候補にしない (見出しが 1 行でない・部品の合計 ≠ total など)。要約を作るまで null
   )`);
+  addCol('amazon_settlement_document_versions', 'detail_valid', 'INTEGER');
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_docver_settlement ON amazon_settlement_document_versions(settlement_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_docver_report ON amazon_settlement_document_versions(report_id, report_document_id)`);
 
@@ -165,7 +171,7 @@ export function createSettlementVersionSchema(db) {
     FROM (
       SELECT v.*, ROW_NUMBER() OVER (PARTITION BY v.settlement_id ORDER BY ${LAYER_RANK_SQL}, v.ingested_at DESC, v.document_version_id) AS rn
       FROM amazon_settlement_document_versions v
-      WHERE v.settlement_id IS NOT NULL
+      WHERE v.settlement_id IS NOT NULL AND v.detail_valid = 1
     ) WHERE rn = 1`);
 
   // coverage の lease (1 行・持ち主は coordinator の親だけ)
@@ -321,10 +327,30 @@ export function refreshVersionDetail(db, seq) {
     header_start: h0 ? h0.settlement_start_date : null, header_end: h0 ? h0.settlement_end_date : null, header_total_micro: h0 ? h0.total_amount_micro : null,
     header_currency: h0 ? h0.currency : null, header_currency_raw: h0 ? h0.currency_raw : null,
   };
+  const reg = db.prepare(`SELECT registered_by, settlement_id FROM amazon_settlement_document_versions WHERE seq = ?`).get(seq) || {};
+  out.detail_valid = versionDetailValid({ ...out, registered_by: reg.registered_by, settlement_id: reg.settlement_id ?? out.header_settlement_id ?? sOne }) ? 1 : 0;
   db.prepare(`UPDATE amazon_settlement_document_versions SET ${Object.keys(out).map((k) => `${k} = @${k}`).join(', ')},
       settlement_id = COALESCE(settlement_id, @settle) WHERE seq = @seq`).run({ ...out, settle: out.header_settlement_id ?? sOne, seq });
   return out;
 }
+/**
+ * 版の中身が確かか (採る版の候補にしてよいか・R1 Medium 3)。
+ *   見出し 1 行・明細の部品の合計 = 見出しの total・明細の決済 ID が 1 つで見出しと同じ・通貨 JPY (原文が JPY か空) = 候補
+ *   過去の行の backfill の版で見出しが 0 行 = 明細の決済 ID が 1 つなら候補 (昔の取込は見出しを入れていないことがある・build は今までどおり作る)
+ */
+export function versionDetailValid(d) {
+  const settle = d.settlement_id ?? null;
+  if (settle == null) return false;
+  if ((d.line_settlement_count ?? 0) > 1) return false;
+  if (d.line_settlement_count === 1 && d.line_settlement_id !== settle) return false;
+  if ((d.line_currency_bad ?? 0) > 0) return false;
+  if (d.header_count === 0) return d.registered_by === 'backfill' && d.line_settlement_count === 1;
+  if (d.header_count !== 1) return false;
+  if (d.header_settlement_id !== settle) return false;
+  if (d.header_currency !== 'JPY' || (d.header_currency_raw != null && d.header_currency_raw !== 'JPY')) return false;
+  return String(d.components_sum_micro ?? 0) === String(d.header_total_micro ?? 'x');
+}
+
 /** 古い印の版を全部作り直す (1 版 = 1 取引)。check = 取引の中の確かめ (lease)。戻り = 作り直した数 */
 export function refreshStaleVersionDetails(db, { check = null, log = () => {} } = {}) {
   const seqs = db.prepare(`SELECT seq FROM amazon_settlement_document_versions WHERE detail_stale = 1 ORDER BY seq`).all().map((r) => r.seq);
@@ -352,17 +378,39 @@ export function registerDocumentVersion(db, meta, { registeredBy = 'ingest', now
 }
 
 // ─── 過去の行の backfill (D-66: report_document_id = null で版を作る) ───
-/** まだ版の無い行があるか (索引で一瞬) */
-export function documentVersionsReady(db) {
-  const l = db.prepare(`SELECT 1 FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_docver WHERE document_version_seq IS NULL LIMIT 1`).get();
-  const h = db.prepare(`SELECT 1 FROM raw_amazon_settlement_headers INDEXED BY idx_settle_headers_docver WHERE document_version_seq IS NULL LIMIT 1`).get();
-  return !l && !h;
-}
-/** build・送り手の前の確かめ (版の無い行があれば止める = 黙って行を落とさない) */
-export function assertDocumentVersionsReady(db) {
-  if (!documentVersionsReady(db)) {
-    throw new Error('決済の生の行に文書の版 (document_version_seq) の無い行がある = 過去の行の backfill がまだ → node apps/warehouse/migrate-settlement-document-versions.js --commit (coordinator の回でも自動で流れる)');
+const HAS_ROWS = (v) => `(EXISTS (SELECT 1 FROM raw_amazon_settlement_lines l INDEXED BY idx_settle_lines_docver WHERE l.document_version_seq = ${v}.seq)
+  OR EXISTS (SELECT 1 FROM raw_amazon_settlement_headers h INDEXED BY idx_settle_headers_docver WHERE h.document_version_seq = ${v}.seq))`;
+/**
+ * build・送り手が決済の行を読んでよいかの問題の一覧 (空 = 読んでよい)。どれも「黙って行を落とす」を防ぐ (R1 High 1・Medium 3):
+ *   ① 版の無い行がある (過去の行の backfill の前・途中)
+ *   ② 行のある版に決済 ID が無い / 要約が古い (detail_stale = 1。backfill や取込が要約を作る前に止まった・行を手で直した)
+ *   ③ 行のある決済で、採る版の候補 (detail_valid = 1) が 1 つも無い = 決済の版が壊れている (blocked)
+ */
+export function documentVersionProblems(db) {
+  const out = [];
+  if (db.prepare(`SELECT 1 FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_docver WHERE document_version_seq IS NULL LIMIT 1`).get()
+    || db.prepare(`SELECT 1 FROM raw_amazon_settlement_headers INDEXED BY idx_settle_headers_docver WHERE document_version_seq IS NULL LIMIT 1`).get()) {
+    out.push({ code: 'rows_without_version', detail: '決済の生の行に文書の版 (document_version_seq) の無い行がある = 過去の行の backfill がまだ・途中 → node apps/warehouse/migrate-settlement-document-versions.js --commit (coordinator の回の始めでも流れる)' });
   }
+  const bad = db.prepare(`SELECT v.seq, v.settlement_id, v.detail_stale FROM amazon_settlement_document_versions v
+     WHERE (v.settlement_id IS NULL OR v.detail_stale = 1) AND ${HAS_ROWS('v')} ORDER BY v.seq LIMIT 5`).all();
+  if (bad.length) out.push({ code: 'version_incomplete', detail: `行のある文書の版に決済 ID が無い・要約が古い (${bad.map((b) => `#${b.seq} ${b.settlement_id ?? '決済なし'}${b.detail_stale ? '・要約が古い' : ''}`).join(' / ')}) = 版付け・取込が途中で止まった → migrate-settlement-document-versions.js --commit か coordinator の次の回で作り直す` });
+  const blocked = blockedSettlements(db);
+  if (blocked.length) out.push({ code: 'settlement_blocked', detail: `🚨 決済の版が壊れている = 採れる版が 1 つも無い決済 ${blocked.length} (${blocked.slice(0, 5).map((b) => `${b.settlement_id} (版 ${b.versions})`).join(' / ')}) → 見出しの数・部品の合計・通貨を確かめる (行を黙って落とさないために build と送り手を止めている)` });
+  return out;
+}
+/** 行のある決済で、採る版の候補 (detail_valid = 1) が 1 つも無いもの */
+export function blockedSettlements(db) {
+  return db.prepare(`SELECT v.settlement_id, COUNT(*) AS versions FROM amazon_settlement_document_versions v
+     WHERE v.settlement_id IS NOT NULL AND ${HAS_ROWS('v')}
+     GROUP BY v.settlement_id HAVING SUM(CASE WHEN v.detail_valid = 1 THEN 1 ELSE 0 END) = 0 ORDER BY v.settlement_id`).all();
+}
+/** 版の無い行・途中の版・壊れた決済が無いか */
+export function documentVersionsReady(db) { return documentVersionProblems(db).length === 0; }
+/** build・送り手の前の確かめ (問題があれば止める = 黙って行を落とさない) */
+export function assertDocumentVersionsReady(db) {
+  const p = documentVersionProblems(db);
+  if (p.length) throw Object.assign(new Error(p.map((x) => x.detail).join(' ／ ')), { code: 'SETTLEMENT_VERSIONS_NOT_READY', problems: p });
 }
 
 /**
@@ -373,13 +421,18 @@ export function assertDocumentVersionsReady(db) {
  */
 export function backfillDocumentVersions(db, { batchIds = 200000, check = null, log = () => {}, now = new Date() } = {}) {
   const tx = (fn) => db.transaction(() => { if (check) check(db); return fn(); }).immediate();
+  // 決済 ID も group で取る (R1 High 1: 版の登録と同じ取引で入れる = 行の UPDATE の後に止まっても決済 ID の無い版を残さない)。
+  //   見出しの決済 ID が 1 つならそれ・見出しが無ければ明細の決済 ID が 1 つならそれ・どちらでもなければ null (壊れた文書 = assertDocumentVersionsReady が止める)
   const groups = db.prepare(`
-    SELECT source_layer, source_document_id, source_file_hash, parser_version, MIN(ingested_at) AS ingested_at FROM (
-      SELECT source_layer, source_document_id, source_file_hash, parser_version, ingested_at FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_docver WHERE document_version_seq IS NULL
+    SELECT source_layer, source_document_id, source_file_hash, parser_version, MIN(ingested_at) AS ingested_at,
+           COUNT(DISTINCT CASE WHEN is_header = 1 THEN source_settlement_id END) AS h_n, MAX(CASE WHEN is_header = 1 THEN source_settlement_id END) AS h_id,
+           COUNT(DISTINCT CASE WHEN is_header = 0 THEN source_settlement_id END) AS l_n, MAX(CASE WHEN is_header = 0 THEN source_settlement_id END) AS l_id
+    FROM (
+      SELECT source_layer, source_document_id, source_file_hash, parser_version, ingested_at, source_settlement_id, 0 AS is_header FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_docver WHERE document_version_seq IS NULL
       UNION ALL
-      SELECT source_layer, source_document_id, source_file_hash, parser_version, ingested_at FROM raw_amazon_settlement_headers INDEXED BY idx_settle_headers_docver WHERE document_version_seq IS NULL
+      SELECT source_layer, source_document_id, source_file_hash, parser_version, ingested_at, source_settlement_id, 1 AS is_header FROM raw_amazon_settlement_headers INDEXED BY idx_settle_headers_docver WHERE document_version_seq IS NULL
     ) GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4`).all();
-  if (!groups.length) return { groups: 0, versions: 0, lines: 0, headers: 0 };
+  if (!groups.length) return { groups: 0, versions: 0, lines: 0, headers: 0, refreshed: refreshStaleVersionDetails(db, { check, log }) };
   log(`[versions] 版の無い文書 ${groups.length} 個に版を付ける`);
   const seqs = [];
   tx(() => {
@@ -392,7 +445,9 @@ export function backfillDocumentVersions(db, { batchIds = 200000, check = null, 
         source_layer: g.source_layer, report_type: api ? REPORT_TYPE_OF_LAYER[g.source_layer] : null, report_id: api ? g.source_document_id : null,
         report_document_id: null, file_hash: g.source_file_hash ?? null, normalization_version: g.parser_version,
       };
-      const v = registerDocumentVersion(db, { ...meta, document_version_id: documentVersionId(meta), source_document_id: g.source_document_id, ingested_at: g.ingested_at || nowSql(now) }, { registeredBy: 'backfill', now });
+      const settlementId = g.h_n === 1 ? g.h_id : (g.h_n === 0 && g.l_n === 1 ? g.l_id : null);
+      const v = registerDocumentVersion(db, { ...meta, document_version_id: documentVersionId(meta), source_document_id: g.source_document_id, settlement_id: settlementId, ingested_at: g.ingested_at || nowSql(now) }, { registeredBy: 'backfill', now });
+      if (v.settlement_id == null && settlementId != null) db.prepare(`UPDATE amazon_settlement_document_versions SET settlement_id = ? WHERE seq = ?`).run(settlementId, v.seq);
       ins.run(g.source_layer, g.source_document_id, g.source_file_hash ?? null, g.parser_version, v.seq);
       seqs.push(v.seq);
     }
@@ -408,14 +463,16 @@ export function backfillDocumentVersions(db, { batchIds = 200000, check = null, 
     if (mm.a == null) continue;
     const upd = db.prepare(setSql(t));
     for (let a = mm.a; a <= mm.b; a += batchIds) {
+      const t0 = Date.now();
       out[key] += tx(() => upd.run(a, Math.min(a + batchIds - 1, mm.b)).changes);
-      if (key === 'lines') log(`[versions]   明細 id ${a}〜${Math.min(a + batchIds - 1, mm.b)}: 累計 ${out.lines} 行`);
+      out.maxTxMs = Math.max(out.maxTxMs || 0, Date.now() - t0);
+      if (key === 'lines') log(`[versions]   明細 id ${a}〜${Math.min(a + batchIds - 1, mm.b)}: 累計 ${out.lines} 行 (この取引 ${Date.now() - t0} ms = 書き込みの lock を持った時間)`);
     }
   }
   tx(() => { bumpSourceRevision(db); db.exec(`DROP TABLE IF EXISTS temp._asdv_map`); });
-  // 決済 ID と要約 (1 版 = 1 取引)
-  for (const seq of [...new Set(seqs)]) tx(() => refreshVersionDetail(db, seq));
-  log(`[versions] 版を付けた: 文書 ${out.groups} / 版 ${out.versions} / 明細 ${out.lines} 行 / 見出し ${out.headers} 行`);
+  // 要約 (1 版 = 1 取引)。今回の版だけでなく、古い印の版を全部 (前の回が途中で止まった版・行を手で直した版も)
+  out.refreshed = refreshStaleVersionDetails(db, { check, log });
+  log(`[versions] 版を付けた: 文書 ${out.groups} / 版 ${out.versions} / 明細 ${out.lines} 行 / 見出し ${out.headers} 行 / 1 取引の最長 ${out.maxTxMs || 0} ms`);
   return out;
 }
 

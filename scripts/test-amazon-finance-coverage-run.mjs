@@ -29,10 +29,12 @@ process.env.DATA_DIR = tmpDir;
 process.env.MIRROR_SYNC_KEY = 'k';
 process.env.COMPANY_DB_URL = 'postgres://pglite';
 const { initDB, getDB } = await import('../apps/warehouse/db.js');
-const { runCoverage, STATUS_PATH } = await import('../apps/warehouse/amazon-finance-coverage-run.js');
+process.env.DAILY_SYNC_RUN_ID = 'ds_test_run';
+const { runCoverage, STATUS_PATH, LAST_RUN_FILE } = await import('../apps/warehouse/amazon-finance-coverage-run.js');
 const { completionBlockers, frontierFrom, evaluateCoverage } = await import('../apps/warehouse/amazon-finance-coverage.js');
 const { runMarkerCli, normalizeMarker, yenToMicro } = await import('../apps/warehouse/amazon-finance-initial-marker.js');
 const { queueManualFile } = await import('../apps/warehouse/amazon-settlement-manual-file.js');
+const { renameRetryJobs } = await import('../apps/warehouse/retry-failed-jobs.js');
 const V = await import('../apps/warehouse/amazon-settlement-versions.js');
 const { V2_COLUMNS } = await import('../apps/warehouse/amazon-settlement-v2.js');
 const { openLedger } = await import('../apps/company-db/push/ledger.mjs');
@@ -157,6 +159,9 @@ await t('完了印の前 = 取込だけ・Render に触れない・最後の行�
   const inv = db.prepare(`SELECT * FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get();
   assert.ok(inv.completed_at && inv.coverage_generation === null && inv.run_token && inv.evidence_epoch === null, '一覧の回 (世代なし・token = lease)');
   assert.equal(V.readLease(db).released_at != null, true, 'lease を放した');
+  // 🆕 #1567 R1 L3: daily-sync は要約の文字でなく、この記録の構造の値で「送った回か」を決める
+  const last = JSON.parse(fs.readFileSync(path.join(tmpDir, LAST_RUN_FILE), 'utf8'));
+  assert.deepEqual([last.mode, last.finance_pushed, last.exit_code, last.daily_sync_run_id], ['ingest_only', false, 0, 'ds_test_run']);
 });
 setLedgerMeta(META.backfill, '1');
 
@@ -245,14 +250,29 @@ await t('Render の世代を追う (台帳の世代が古い = Render の復元�
   assert.deepEqual([(await cov()).state, (await cov()).g], ['complete', '4']);
 });
 
+await t('🚨 API の版がある決済に手のファイル (余計な注文 O-X つき) を積む = 警告 (apiVersions)・O-X は送るものが無い = 読み直す注文から消える = dirty_left で止まらず complete (#1567 R1 Medium 1)', async () => {
+  const q = queueManualFile(db, tmpDir, settlementTsv('S2', ...P.S2, [...L.S2, { kind: 'order', order: 'O-X', sku: 'SKU-X', yen: 50, day: '2026-02-02T01:00:00Z' }]), { fileName: 'S2-manual.txt', now: new Date(NOW) });
+  assert.ok(q.queued && q.apiVersions.length >= 1, '積むときに API の版があると返す (CLI は ⚠️ を出す)');
+  const r = await run({ fetchImpl: spyFetch() });
+  assert.equal(r.exitCode, 0, `${r.summary} ${JSON.stringify(r.reasons)}`);
+  assert.equal((await cov()).state, 'complete');
+  assert.equal(V.selectedVersionOf(db, 'S2').source_layer, 'sp_api_v2', '採る版は API の版のまま');
+  assert.equal(db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_dirty_orders WHERE mall_order_no = 'O-X'`).get().n, 0, 'O-X の記録は消えた');
+  assert.equal(await receipt('O-X'), null, 'O-X は送らない (採った版に無い・Render に無い)');
+  assert.ok(r.push.finance.skippedEmpty >= 1);
+  const last = JSON.parse(fs.readFileSync(path.join(tmpDir, LAST_RUN_FILE), 'utf8'));
+  assert.deepEqual([last.mode, last.finance_pushed, last.coverage_complete], ['coverage', true, true]);
+});
+
 console.log('④ 読み取りの後の変化 (source_revision)');
 await t('🚨 読み直しと complete の隙間: complete の直前に生の行を変える = complete にしない (❌ source_revision_changed)・Render は updating → 次の回で complete', async () => {
+  const g0 = Number((await cov()).g);
   const r = await run({ fetchImpl: spyFetch(), hooks: { beforeComplete: (dbx) => dbx.prepare(`UPDATE raw_amazon_settlement_lines SET marketplace_name = 'Amazon.co.jp ' WHERE amazon_order_id = 'O-A'`).run() } });
   assert.equal(r.exitCode, 1, r.summary); assert.ok(codes(r).includes('source_revision_changed'), codes(r).join(','));
-  assert.deepEqual([(await cov()).state, (await cov()).g], ['updating', '5']);
+  assert.deepEqual([(await cov()).state, (await cov()).g], ['updating', String(g0 + 1)]);
   const r2 = await run({ fetchImpl: spyFetch() });
   assert.equal(r2.exitCode, 0, r2.summary);
-  assert.deepEqual([(await cov()).state, (await cov()).g], ['complete', '6']);
+  assert.deepEqual([(await cov()).state, (await cov()).g], ['complete', String(g0 + 2)]);
 });
 await t('🚨 同じ report ID で file hash が変わる (O-C が消えた新しい文書) + 最後の chunk の送信中に生の行を変える = complete にしない → 次の回で complete・O-C は墓石・O-B は S2 に残る', async () => {
   DOCS.D3 = settlementTsv('S3', ...P.S3, [L.S3[0]]);   // O-C の行が無い
@@ -404,6 +424,12 @@ await t('🚨 complete の応答だけ失われた = 同じ中身で送り直し
   assert.equal(f.calls.complete, 2); assert.equal(r.coverage.status, 'same');
   assert.equal((await cov()).state, 'complete');
 });
+await t('Render に #1561 の受け口がまだ無い (status が 404) = 409 not_migrated と同じく今までの送り方 (deploy の順番がずれた保険・#1567 R1 Medium 4)', async () => {
+  const f = spyFetch({ statusOverride: () => new Response('Cannot GET', { status: 404 }) });
+  const r = await run({ fetchImpl: f });
+  assert.equal(r.mode, 'legacy'); assert.equal(r.exitCode, 0, r.summary);
+  assert.equal(f.calls.updating + f.calls.complete + f.calls.tokenedChunks, 0);
+});
 await t('Render に 0050 が無い (status が 409 not_migrated) = 今までの送り方 (token なし・coverage を送らない・⚠️)', async () => {
   const f = spyFetch({ statusOverride: () => new Response(JSON.stringify({ error: 'not_migrated' }), { status: 409, headers: { 'content-type': 'application/json' } }) });
   const r = await run({ fetchImpl: f });
@@ -434,6 +460,25 @@ await t('🚨 一覧の窓の空白 (前の成功した回から 85 日以上あ
   assert.equal(r.exitCode, 0, r.summary); assert.ok(codes(r).includes('evidence_chain_gap'), codes(r).join(','));
   assert.equal((await cov()).state, 'updating');
   NOW = Date.parse('2026-03-20T00:00:00Z');
+});
+
+await t('🚨 中身の悪い版しか無い決済 (見出しの total ≠ 明細の合計) = 採らない・送らない・❌ 🚨「決済の版の問題」(build も止まる・行を黙って落とさない。#1567 R1 Medium 3 / L5)', async () => {
+  const good = settlementTsv('S9', '2026-03-16T10:00:00Z', '2026-03-18T10:00:00Z', [{ kind: 'order', order: 'O-9', sku: 'SKU-9', yen: 40, day: '2026-03-17T01:00:00Z' }]);
+  DOCS.D9 = good.replace('\t40.00\tJPY', '\t41.00\tJPY');   // 見出しの total だけ 41 (途中で切れたファイルの形)
+  assert.notEqual(DOCS.D9, good);
+  SP.ing = [...SP.ing, rep('R9', 'DONE', 'D9', ['2026-03-16T10:00:00Z', '2026-03-18T10:00:00Z'], '2026-03-19T00:00:00Z')]; SP.inv = SP.ing;
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f });
+  assert.equal(r.exitCode, 1, r.summary);
+  assert.match(r.summary, /^❌ Amazon 決済と財務: 🚨 決済の版の問題/);
+  assert.ok(codes(r).includes('settlement_blocked'), codes(r).join(','));
+  assert.equal(f.calls.chunks, 0, '送らない');
+  assert.equal(V.selectedVersionOf(db, 'S9'), null);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(tmpDir, LAST_RUN_FILE), 'utf8')).finance_pushed, false);
+});
+await t('retry-state の旧い工程の名前 (Amazon Settlement / CompanyDB財務(Amazon)) は新しい名前に読み替える (#1567 R1 L4)', async () => {
+  assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon Settlement', 'CompanyDB財務(Amazon)', 'Render同期']), ['f_sales', 'Amazon決済と財務', 'Render同期']);
+  assert.deepEqual(renameRetryJobs(['Amazon決済と財務', 'Amazon Settlement']), ['Amazon決済と財務']);
 });
 
 console.log('⑧ 判定の部品 (単体)');

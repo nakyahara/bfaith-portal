@@ -245,6 +245,14 @@ function runScript(scriptPath, label, timeoutMs = 600000, { retryLibuvCrash = fa
 }
 
 /** Date を JST (UTC+9) の YYYY-MM-DD に変換 */
+/** coordinator (amazon-finance-coverage-run.js) の最後の回の記録から「この daily-sync の回で財務を送ったか」 */
+export function coordinatorPushedFinance(dataDir, runId) {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(dataDir, 'amazon-finance-coverage-last.json'), 'utf8'));
+    return !!(j && j.finance_pushed === true && (runId == null || j.daily_sync_run_id === runId));
+  } catch { return false; }
+}
+
 function toJstDate(d) {
   const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
   return jst.toISOString().slice(0, 10);
@@ -897,7 +905,9 @@ async function main() {
     //   比べる側 (SQLite の日次の財務・月の手数料) の build が今朝失敗していれば比べない = 古い SQLite との偽の差でやり残しと「差が続いた回数」を進めない (#1536 Codex R2 Medium)。
     //   失敗した build の月はやり残しとして翌朝に作り直される = 翌朝の突き合わせで見る
     const financeSqliteFresh = financeBuildFailed.length === 0 && accountFeesBuildResult.success;
-    const financeSent = settlementResult.success && /財務 push \(/.test(String(settlementResult.summary || ''));
+    // 送ったかは coordinator の小さな記録 (DATA_DIR/amazon-finance-coverage-last.json) の構造の値で決める (要約の文字で決めない・#1567 R1 L3)。
+    //   同じ daily-sync の回 (DAILY_SYNC_RUN_ID) の記録で finance_pushed = true のときだけ。読めない = 見送る (安全側)
+    const financeSent = settlementResult.success && coordinatorPushedFinance(process.env.DATA_DIR, process.env.DAILY_SYNC_RUN_ID);
     if (!financeSqliteFresh) console.log(`[DailySync] Company DB Amazon 財務の突き合わせはスキップ (比べる側の build が失敗: 日次の財務 ${financeBuildFailed.join(', ') || 'OK'} / 月の手数料 ${accountFeesBuildResult.success ? 'OK' : '失敗'})`);
     if (financeSqliteFresh && financeSent) {
       const cdbFinanceRecResult = runScript('apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled', 'Company DB Amazon 財務 突き合わせ', 600000);

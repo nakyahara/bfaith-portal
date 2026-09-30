@@ -46,7 +46,8 @@
  *   - 原文の通貨 (空なら null) を currency_raw に残す (currency は今までどおり空なら JPY。R16 M1)
  *
  * 使い方 (単独 = 書かない):
- *   node apps/warehouse/fetch-amazon-settlements.js              # 直近90日全件を読んで数えるだけ (dry-run・一覧も記録しない)
+ *   node apps/warehouse/fetch-amazon-settlements.js              # 直近90日全件を読んで数えるだけ (dry-run・生の表にも一覧にも書かない。
+ *                                                                #   ただし initDB の表の用意は走り・SP-API の一覧とダウンロードはする = レートの枠を使う)
  *   node apps/warehouse/fetch-amazon-settlements.js --report-id 1487945020577   # 特定 reportId の調べ (dry-run)
  *   node apps/warehouse/fetch-amazon-settlements.js --source v1  # 旧 V1 レポートで読む (2026-11-11 まで)
  *   書く取込 = node apps/warehouse/amazon-finance-coverage-run.js (daily-sync・retry と同じ)
@@ -835,4 +836,4 @@ if (isDirectRun) {
 }
 
 // テスト用 export (本番経路と同一の関数群。監査PR-13 冪等性smokeテストが使用)
-export { makePhysicalHash, makeBusinessKey, parseAmount, PHYSICAL_HASH_EXCLUDE, sha256 };
+export { makePhysicalHash, makeBusinessKey, parseAmount, PHYSICAL_HASH_EXCLUDE, sha256, listSettlementReports, downloadReportTsv };

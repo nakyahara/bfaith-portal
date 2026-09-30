@@ -7,7 +7,8 @@
  *   source_file_hash, parser_version) ごとに 1 つの版 (amazon-settlement-versions.js の backfillDocumentVersions)。
  *   🚨 版の無い行がある間、build (日次の財務・月の手数料・月の mart) と Company DB の送り手は止まる (黙って行を落とさない)。
  *   coordinator (amazon-finance-coverage-run.js) の回の始めでも自動で流れる = ふつうは手で流さなくてよい (夜の daily-sync の最初の回が付ける)。
- *   手で先に流すときはこれ (本番の 440 万行で数分・WAL が大きくなる = daily-sync と重ならない時間に)
+ *   手で先に流すときはこれ (本番の 440 万行で数分・WAL が大きくなる = daily-sync と重ならない時間に)。
+ *   明細の UPDATE は id の範囲 20 万行ごとの取引 = 1 取引ずつ書き込みの lock を持つ (ログに ms)。最後に「build と送り手が読める状態か」の問題を出す
  *
  * 使い方:
  *   node apps/warehouse/migrate-settlement-document-versions.js            → 数えるだけ (dry-run・書かない)
@@ -16,7 +17,7 @@
  */
 import 'dotenv/config';
 import { initDB, getDB } from './db.js';
-import { backfillDocumentVersions, refreshStaleVersionDetails, acquireCoverageLease, releaseCoverageLease, assertLease, documentVersionsReady } from './amazon-settlement-versions.js';
+import { backfillDocumentVersions, refreshStaleVersionDetails, acquireCoverageLease, releaseCoverageLease, assertLease, documentVersionsReady, documentVersionProblems } from './amazon-settlement-versions.js';
 import { isAliveNodeSince } from './retry-lock.js';
 import { pathToFileURL } from 'node:url';
 
@@ -41,8 +42,11 @@ export async function runMigrate({ commit = false, log = console.log, isAlive = 
     const check = (dbx) => assertLease(dbx, lease);
     const out = backfillDocumentVersions(db, { check, log });
     const refreshed = refreshStaleVersionDetails(db, { check, log });
-    log(`[versions] ✅ 版を付けた: 文書 ${out.groups}・版 ${out.versions}・明細 ${out.lines} 行・見出し ${out.headers} 行 / 要約を作り直した版 ${refreshed}`);
-    return { ready: documentVersionsReady(db), ...out, refreshed, committed: true };
+    const problems = documentVersionProblems(db);
+    log(`[versions] ${problems.length ? '⚠️' : '✅'} 版を付けた: 文書 ${out.groups}・版 ${out.versions}・明細 ${out.lines} 行・見出し ${out.headers} 行 / 要約を作り直した版 ${refreshed + (out.refreshed || 0)} / 1 取引の最長 ${out.maxTxMs || 0} ms`);
+    for (const p of problems) log(`[versions] ❌ ${p.code}: ${p.detail}`);
+    if (!problems.length) log('[versions] build と送り手が読める状態 (版の無い行・途中の版・壊れた決済なし)');
+    return { ready: problems.length === 0, problems, ...out, refreshed, committed: true };
   } finally { releaseCoverageLease(db, lease); }
 }
 

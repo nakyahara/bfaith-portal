@@ -1428,6 +1428,36 @@ export const JOBS_REGISTRY = [
       + 'settlementIngestedByV1 (調べ用) も同じ PR で消してよい。このエントリも消す',
   },
   {
+    id: 'cdb-coverage-legacy-path',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'Amazon の決済と財務の coordinator (apps/warehouse/amazon-finance-coverage-run.js・D7b-1b-3・PR #1567) の「Render に 0050 (core.finance_coverage・PR #1561) が無いとき '
+      + '(status が 409 not_migrated か 404) は今までの送り方 (token の無い chunk・coverage を送らない) で送る」互換の分岐。'
+      + 'deploy の順番がずれた朝に決済の取込と財務の送信を止めないための保険 (token が無い = Render は complete を作らない = fail-open ではない)。'
+      + '0050 が本番に入り、coordinator が coverage の mode で回るようになったら要らない',
+    where: 'bfaith-portal リポジトリ apps/warehouse/amazon-finance-coverage-run.js (mode = legacy の分岐・amazonFinanceDailyArgs の曜日の incremental / full) と scripts/test-amazon-finance-coverage-run.mjs の「Render に 0050 が無い」の試験',
+    remove_by: '2026-11-30',
+    lifecycle: 'temporary',
+    runbook: '0050 の本適用の後、daily-sync の「Amazon決済と財務」の最後の行に「Render に 0050 が無い」が 1 週間出ていなければ、legacy の分岐と試験を消す PR を作る '
+      + '(Render を読めない朝は今までどおり取込も始めない)。このエントリも消す',
+  },
+  {
+    id: 'cdb-finance-untokened-chunk',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'Company DB の財務の受け口 (Render apps/company-db/ingest/order-finance.mjs・PR #1561) が、coverage の世代・token の無い chunk (今までの送り手・人のバックフィル --from/--to・'
+      + 'coordinator の legacy の分岐) をまだ受けている互換の道 (受けたら complete を無効にする = fail-closed)。'
+      + '設計 (AI_reference CompanyDB構想/13 §3.1) の終わりの形 = 送るのは coordinator だけ = token の無い chunk は拒む契約にする (後の PR)',
+    where: 'bfaith-portal リポジトリ apps/company-db/ingest/order-finance.mjs (coverageOfChunk が null の chunk を受ける分岐・invalidateCompleteAfterWrite の untokened) と '
+      + 'apps/company-db/push/amazon-finance.mjs (--from/--to の単独の送信)',
+    remove_by: '2026-11-30',
+    lifecycle: 'temporary',
+    runbook: 'cdb-coverage-legacy-path を消した後、Render の受け口で token の無い chunk を 409 にする PR を作る (人のバックフィルも coordinator の回か token つきで送る形に)。'
+      + '消す前に core.finance_coverage の invalidated_reason = untokened_finance_write が 2 週間出ていないことを確かめる。このエントリも消す',
+  },
+  {
     id: 'rclone-own-client-id',
     type: 'temporary_asset',
     importance: 'TMP',

@@ -82,7 +82,9 @@ const financeCheck = () => {
   runNode(['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM]);
   return db.prepare(`SELECT units_ordered q, sales_principal_jpy p, refund_principal_jpy r FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-a'`).get();
 };
+const { refreshStaleVersionDetails } = await import('./amazon-settlement-versions.js');
 const expectAll = (label) => {
+  refreshStaleVersionDetails(db);   // 行を直接足した (残骸) = 版の要約が古い = build は止まる → coordinator の回と同じく作り直してから (2026-10-01 #1567 R1 High 1)
   const v = viewSum();
   ok(v.n === 9 && v.a === TOTAL_MICRO && v.q === 3, `${label}: 表示用の集まり (v_amazon_settlement_unified) = 9 行・振込額 1,800 円・個数 3 (${v.n} 行 / ${v.a / 1e6} 円 / ${v.q} 個)`);
   const m = martCheck();

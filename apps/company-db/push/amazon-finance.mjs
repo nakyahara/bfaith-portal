@@ -94,7 +94,7 @@ export const SQL = {
   ingestedSince: `SELECT DISTINCT amazon_order_id AS o, economic_date AS d FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_ingested WHERE ingested_at >= ?`,
   economicRange: `SELECT DISTINCT amazon_order_id AS o, economic_date AS d FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_economic WHERE economic_date BETWEEN ? AND ?`,
   // 🆕 D7b-1b-3: 文書の版 (決済ごとに採る版を JS で決める)・生の表の版 R・読み直す注文
-  versions: `SELECT seq, document_version_id, settlement_id, source_layer, ingested_at FROM amazon_settlement_document_versions`,
+  versions: `SELECT seq, document_version_id, settlement_id, source_layer, ingested_at, detail_valid FROM amazon_settlement_document_versions`,
   revision: `SELECT revision FROM amazon_settlement_source_revision WHERE id = 1`,
   dirty: `SELECT mall_order_no AS o, revision AS r FROM amazon_settlement_dirty_orders`,
 };
@@ -205,15 +205,18 @@ export function makeIterate(sel, run) {
     // 採った版の行が無い注文 (ほかの版にだけある・行が消えた) で、台帳にも Render にも無いもの = 送らない (空の集合の受領記録を作らない)
     const known = (no) => ctx.fps.has(financeKey(no)) || !!(ctx.pre && ctx.pre.renderKeys && ctx.pre.renderKeys.has(no));
     stats.skippedEmpty = 0;
+    // 送るものが無いと確かめた注文 (採った版に行が無く、台帳にも Render にも無い / 行が無く受け口の形でもない) = 読み直す注文の記録を消してよい (R1 Medium 1)。
+    //   消さないと毎回 dirty_left で complete にならない (API の版がある決済に手のファイルを積んだ・採る版が替わって旧い版にだけ未送信の注文があった)
+    stats.nothingToSend = [];
     for (const no of [...orders].sort()) {
       const rows = pick(byOrder.all(no));
-      if (!rows.length && !FINANCE_ORDER_NO_RE.test(no)) continue;   // 行が消えた不正な形の番号 = 受け口が受け取らない = Render に無い (空の集合も送れない)
-      if (!rows.length && !known(no)) { stats.skippedEmpty++; continue; }
+      if (!rows.length && !FINANCE_ORDER_NO_RE.test(no)) { stats.nothingToSend.push(no); continue; }   // 行が消えた不正な形の番号 = 受け口が受け取らない = Render に無い (空の集合も送れない)
+      if (!rows.length && !known(no)) { stats.skippedEmpty++; stats.nothingToSend.push(no); continue; }
       yield { key: financeKey(no), orderNo: no, rows };
     }
     if (!pseudoBlocked) for (const d of [...dates].sort()) {
       const no = pseudoOrderNo(d), rows = pick(byPseudo.all(d));
-      if (!rows.length && !known(no)) { stats.skippedEmpty++; continue; }
+      if (!rows.length && !known(no)) { stats.skippedEmpty++; stats.nothingToSend.push(no); continue; }
       yield { key: financeKey(no), orderNo: no, rows };
     }
     for (const no of renderOnly.sort()) {
@@ -398,7 +401,8 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
       //    unchanged の 3 つの条件 = 台帳の指紋が送付確認済み・Render の復元の検査を通過 (受領記録が無ければ runPush が指紋を空にする)・今回の読み取りで同じ中身を再計算した = R17 M3)
       if (dirty && mode !== 'range' && stats.sourceRevision != null) {
         const bad = new Set(failed.map((x) => { try { return orderNoOfKey(x.key); } catch { return null; } }).filter(Boolean));
-        const clearable = [...run.built].filter((no) => !bad.has(no));
+        // + 送るものが無いと確かめた注文 (同じ読み取りの取引の中で確かめた = R 以下の記録だけ消す)
+        const clearable = [...new Set([...run.built, ...(stats.nothingToSend || [])])].filter((no) => !bad.has(no));
         out.dirtyClearable = clearable.length;
         mustOwn();
         out.dirtyCleared = dirty.clear(clearable, stats.sourceRevision);
