@@ -80,8 +80,9 @@ const trim = (v, max) => {
  */
 const posInt = (v) => {
   if (typeof v === 'number') return Number.isSafeInteger(v) && v > 0 ? v : null;
-  if (typeof v !== 'string' || !/^[1-9]\d*$/.test(v.trim())) return null;
-  const n = Number(v.trim());
+  // 🚨 trim してから検査しない — " 12" と "12" を同じ 12 に畳むと、入力と保存値が食い違う (コード R3)
+  if (typeof v !== 'string' || !/^[1-9]\d*$/.test(v)) return null;
+  const n = Number(v);
   return Number.isSafeInteger(n) && n > 0 ? n : null;
 };
 
@@ -449,10 +450,12 @@ export function submitResult(db, generationId, {
     imgs = [];
     for (const im of receipt.images) {
       const fileId = trim(im?.file_id, 200);
-      const hex = trim(im?.sha256, 80).toLowerCase();
+      // 🚨 trim / toLowerCase してから検査しない — 大文字や空白混じりを受けて同じ hash に畳むと、
+      //    別の入力が同じ payloadHash になり「同じ結果の再送」の判定が狂う (コード R3)
+      const hex = im?.sha256;
       const bytes = posInt(im?.bytes);
-      if (!fileId || !SHA256_RE.test(hex) || !bytes) {
-        return { code: 'bad_request', error: 'receipt.images は file_id・sha256 (16進64桁)・bytes が要ります' };
+      if (!fileId || typeof hex !== 'string' || !SHA256_RE.test(hex) || !bytes) {
+        return { code: 'bad_request', error: 'receipt.images は file_id・sha256 (16進小文字64桁)・bytes が要ります' };
       }
       imgs.push({ file_id: fileId, sha256: hex, bytes });
     }

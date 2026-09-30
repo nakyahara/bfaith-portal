@@ -219,6 +219,13 @@ eq(lp.submitResult(db, g8.generation_id, {
 // posInt: "12abc" のような値を ID として通さない (R2 #2)
 ok(lp.requestJob(db, args({ ...dA, id: '12abc' }, s2.spec, 'kz', { now: min(95) })).code === 'bad_request',
   '🚨 "12abc" を 12 として通さない (R2 #2)');
+// 正規化で別入力を同一視しない (R3)
+ok(lp.requestJob(db, args({ ...dA, id: ' 12' }, s2.spec, 'kw', { now: min(95) })).code === 'bad_request',
+  '🚨 " 12" を 12 として通さない (R3)');
+eq(lp.submitResult(db, g8.generation_id, {
+  packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT,
+  receipt: { images: [{ file_id: 'F1', sha256: 'B'.repeat(64), bytes: 1 }] }, now: min(93),
+}).code, 'bad_request', '🚨 sha256 の大文字は受けない (R3)');
 // spec.hash を省いた照合の回避を防ぐ (R2 #3)
 ok(lp.requestJob(db, args(mkDraft('LP-K', 'テスト2'), { ...s2.spec, hash: '' }, 'k1', { now: min(95) })).code === 'bad_request',
   '🚨 spec.hash を省くと通らない (R2 #3)');
