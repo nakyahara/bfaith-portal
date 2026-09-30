@@ -93,7 +93,12 @@ router.post('/ping/:id', requireToken, (req, res) => {
 // ── 全評価 (デバッグ・将来の一覧画面用) ──
 router.get('/status', requireToken, (req, res) => {
   const states = getStates();
-  const results = evaluateAll(JOBS_REGISTRY, states, Date.now());
+  // scheduled_job は予定の時刻と猶予も返す (切替の確かめ lz-cutover-check.mjs --expect ready が、Render の締切が miniPC の台帳と同じかを照らす。Codex #1558 R3 Low)
+  const byId = new Map(JOBS_REGISTRY.map((e) => [e.id, e]));
+  const results = evaluateAll(JOBS_REGISTRY, states, Date.now()).map((r) => {
+    const d = byId.get(r.id);
+    return d && d.type === 'scheduled_job' ? { ...r, anchor_hour_jst: d.anchor_hour_jst, anchor_minute_jst: d.anchor_minute_jst ?? 0, grace_hours: d.grace_hours } : r;
+  });
   const unknown = Object.keys(states).filter((id) => !REGISTERED.has(id) && !RETIRED.has(id));
   res.json({ evaluatedAt: new Date().toISOString(), results, unknownIds: unknown, retiredIds: RETIRED_JOBS.map((e) => e.id) });
 });

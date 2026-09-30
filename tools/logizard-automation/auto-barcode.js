@@ -52,28 +52,27 @@ import {
 import { parseCsv } from './csv-util.js';
 import { resolveBarcodeMode, inNightBlock, nightBlockMessage, assertOutsideNightBlock, clickBudgetMs, asNightError } from './barcode-mode.js';
 
-loadEnv();
-assertLocalWriteDirs();
-
-// 起動の形 (③c-1b-3a)。夜の止めは何よりも先に見る (CSV・鍵・ブラウザに触る前)
+// 起動の形 (③c-1b-3a)。引数の確かめ → 配った版の読み戻し → 夜の止め は .env より前 (.env・CSV・鍵・ブラウザに触る前。Codex #1558 R3 Low)
 let MODE;
 try {
-  MODE = resolveBarcodeMode();
+  MODE = resolveBarcodeMode({ env: {} });   // 引数だけ (.env の前の設定の注意は .env を読んだ後に作る)
 } catch (e) {
   console.error(`❌ ${e.message}`);
   process.exit(1);
 }
-// 配った版の読み戻し (切替の手順 7・Codex #1558 R2 High): 何にも触らずに見出しを出して終わる (夜でも)
+// 配った版の読み戻し (切替の手順 7・Codex #1558 R2 High): 何にも触らずに見出しを出して終わる (夜でも・.env が無くても)
 if (MODE.showMode) {
   console.log(`ℹ ${MODE.label}`);
   console.log('ℹ ③ 毎日の商品マスタの取込: この版には無い (切替済み)');
-  for (const n of MODE.notes) console.log(`ℹ ${n}`);
   process.exit(0);
 }
 if (inNightBlock()) {
   console.error(`❌ ${nightBlockMessage()}`);
   process.exit(1);
 }
+loadEnv();
+assertLocalWriteDirs();
+MODE = resolveBarcodeMode();   // .env を読んだ後 = 前の設定 LOGIZARD_BC_DAILY の注意 (notes)
 const DRY_RUN = MODE.dry;
 
 // ---- 設定 (.env で上書き可) ----

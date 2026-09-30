@@ -358,6 +358,20 @@ globalThis.Date = D;
     assert.match(r.out, /① 新商品の取込 → ② バーコード情報の書き出し \(③ 毎日の商品マスタは miniPC の自動が取り込む\)/);
     assert.match(r.out, /③ 毎日の商品マスタの取込: この版には無い/);
     assert.ok(!r.out.includes('📥') && !touched(), '--show-mode は CSV も鍵も見ない');
+    // .env が無くても・夜でも・CSV が無くても exit 0 (.env を読む前に終わる。Codex #1558 R3 Low)
+    {
+      const envFile = path.join(tmp, '.env');
+      const saved = fs.readFileSync(envFile);
+      fs.rmSync(envFile);
+      try {
+        const { LOGIZARD_BC_DAILY: _d, LOGIZARD_USER_ID: _u, LOGIZARD_PASSWORD: _p, ...bare } = process.env;
+        const c = spawnSync(process.execPath, ['--import', pathToFileURL(path.join(tmp, 'fake-now.mjs')).href, path.join(tmp, 'auto-barcode.js'), '--show-mode'],
+          { cwd: tmp, encoding: 'utf8', env: { ...bare, FAKE_NOW: jst('00:20').toISOString() }, timeout: 60000 });
+        assert.equal(c.status, 0, c.stdout + c.stderr);
+        assert.match(c.stdout, /③ 毎日の商品マスタの取込: この版には無い/);
+        assert.ok(!touched(), '.env が無くても何にも触らない');
+      } finally { fs.writeFileSync(envFile, saved); }
+    }
     for (const [o, re] of [[{ args: ['--dyr'] }, /知らない引数です: --dyr/], [{ args: ['--only-daily'] }, /この道具から外しました/]]) {
       r = run(jst('10:00'), o);
       assert.equal(r.status, 1);

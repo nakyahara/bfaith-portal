@@ -150,8 +150,10 @@ export async function cutoverCheck({ expect, client, env = process.env, dataDir 
     if (js) {
       const results = Array.isArray(js.results) ? js.results : [];
       const rj = results.find((r) => r.id === 'lz-daily-import');
-      check('Render の見張りに lz-daily-import (P2・この miniPC と同じ台帳)', !!rj && rj.type === 'scheduled_job' && rj.importance === 'P2' && !!job && rj.runbook === job.runbook,
-        rj ? `${rj.type}・${rj.importance}・runbook ${job && rj.runbook === job.runbook ? '同じ' : '違う (Render の反映がまだ)'}` : '無い = Render の反映がまだ');
+      // 時刻と猶予も照らす = 01:00 の締切が Render で効く (runbook だけだと版の推定。Codex #1558 R3 Low)。答えに時刻が無い = 古い Render
+      const sameSchedule = !!rj && !!job && rj.anchor_hour_jst === job.anchor_hour_jst && rj.anchor_minute_jst === (job.anchor_minute_jst ?? 0) && rj.grace_hours === job.grace_hours;
+      check('Render の見張りに lz-daily-import (P2・00:20・猶予 40 分・この miniPC と同じ台帳)', !!rj && rj.type === 'scheduled_job' && rj.importance === 'P2' && !!job && rj.runbook === job.runbook && sameSchedule,
+        rj ? `${rj.type}・${rj.importance}・${rj.anchor_hour_jst ?? '?'}:${String(rj.anchor_minute_jst ?? '?').padStart(2, '0')}・猶予 ${Number.isFinite(rj.grace_hours) ? Math.round(rj.grace_hours * 60) + ' 分' : '? (古い Render の版)'}・runbook ${job && rj.runbook === job.runbook ? '同じ' : '違う (Render の反映がまだ)'}` : '無い = Render の反映がまだ');
       check('Render の見張りで影 lz-daily-import-shadow は退役', (js.retiredIds || []).includes('lz-daily-import-shadow') && !results.some((r) => r.id === 'lz-daily-import-shadow'), '');
     }
   }
