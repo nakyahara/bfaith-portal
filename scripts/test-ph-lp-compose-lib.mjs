@@ -93,13 +93,13 @@ console.log('⑥ 結果 — accepted');
 const OUT = '# LP制作システム V2.1\n\n## ⑦ AI画像生成プロンプト\n… 本文 …';
 ok(lp.submitResult(db, g1.generation_id, { packetHash: 'ちがう', verdict: 'accepted', output: OUT, now: min(1) }).code === 'packet_mismatch',
   '材料が予約時と違えば受け取らない');
-const sub1 = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: true }, reviewRounds: 1, receipt: { images: [{ file_id: 'FID-1', sha256: 'a'.repeat(64), bytes: 12345 }] }, now: min(1) });
+const sub1 = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: true }, reviewRounds: 1, receipt: { images: [{ file_id: 'FIDXXXXXX1', sha256: 'a'.repeat(64), bytes: 12345 }] }, now: min(1) });
 eq(sub1.status, 'done', '受け取ると done');
 const jDone = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE id = ?').get(c2.job.job_id);
 eq(jDone.output_text, OUT, '本文が保存される');
 ok(!!jDone.completed_at, '🚨 終端では completed_at が必ず入る (R4 #2)');
 ok(jDone.completed_at <= jDone.measurement_deadline_at, '3 分以内に終わったと後から計算できる');
-const sub1b = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: true }, reviewRounds: 1, receipt: { images: [{ file_id: 'FID-1', sha256: 'a'.repeat(64), bytes: 12345 }] }, now: min(1.5) });
+const sub1b = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: true }, reviewRounds: 1, receipt: { images: [{ file_id: 'FIDXXXXXX1', sha256: 'a'.repeat(64), bytes: 12345 }] }, now: min(1.5) });
 ok(sub1b.ok && sub1b.already, '同じ結果の再送は保存済みを返す (応答断のリトライ)');
 ok(lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'rejected', reason: 'ちがう内容', now: min(1.5) }).code === 'already_finalized',
   '別の内容では上書きできない');
@@ -194,19 +194,19 @@ eq(lp.submitResult(db, g8.generation_id, { packetHash: c8.job.packet_hash, verdi
 // 証跡は黙って直さない (切り捨てると「何を見て作ったか」として信用できない・R2 #4)
 eq(lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT,
-  receipt: { images: Array.from({ length: 50 }, (_, i) => ({ file_id: 'F' + i, sha256: 'a'.repeat(64), bytes: 1 })) }, now: min(91),
+  receipt: { images: Array.from({ length: 50 }, (_, i) => ({ file_id: 'FILEID' + String(i).padStart(6, '0'), sha256: 'a'.repeat(64), bytes: 1 })) }, now: min(91),
 }).code, 'bad_request', '🚨 receipt の枚数超過は切り捨てず断る (R2 #4)');
 eq(lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT,
-  receipt: { images: [{ file_id: 'F1', sha256: 'abc', bytes: 1 }] }, now: min(91),
+  receipt: { images: [{ file_id: 'FILEID000001', sha256: 'abc', bytes: 1 }] }, now: min(91),
 }).code, 'bad_request', 'sha256 が 16 進 64 桁でなければ断る');
 eq(lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT,
-  receipt: { images: [{ file_id: 'F1', sha256: 'a'.repeat(64) }] }, now: min(91),
+  receipt: { images: [{ file_id: 'FILEID000001', sha256: 'a'.repeat(64) }] }, now: min(91),
 }).code, 'bad_request', 'bytes が無ければ断る');
 const subBig = lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1,
-  receipt: { images: [{ file_id: 'F1', sha256: 'b'.repeat(64), bytes: 999, extra: 'x' }] }, now: min(91),
+  receipt: { images: [{ file_id: 'FILEID000001', sha256: 'b'.repeat(64), bytes: 999, extra: 'x' }] }, now: min(91),
 });
 eq(subBig.status, 'done', '正しい証跡なら受け取れる');
 eq(subBig.receipt.images.length, 1, '証跡が残る');
@@ -214,7 +214,7 @@ ok(subBig.receipt.images.every((im) => im.extra === undefined), '許した項目
 // 🚨 証跡だけ違う再送は「同じ結果」に見なさない (R2 #1)
 eq(lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1,
-  receipt: { images: [{ file_id: 'F1', sha256: 'c'.repeat(64), bytes: 999 }] }, now: min(92),
+  receipt: { images: [{ file_id: 'FILEID000001', sha256: 'c'.repeat(64), bytes: 999 }] }, now: min(92),
 }).code, 'already_finalized', '🚨 画像の証跡が違う再送は別物として断る (R2 #1)');
 // posInt: "12abc" のような値を ID として通さない (R2 #2)
 ok(lp.requestJob(db, args({ ...dA, id: '12abc' }, s2.spec, 'kz', { now: min(95) })).code === 'bad_request',
@@ -224,7 +224,7 @@ ok(lp.requestJob(db, args({ ...dA, id: ' 12' }, s2.spec, 'kw', { now: min(95) })
   '🚨 " 12" を 12 として通さない (R3)');
 eq(lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT,
-  receipt: { images: [{ file_id: 'F1', sha256: 'B'.repeat(64), bytes: 1 }] }, now: min(93),
+  receipt: { images: [{ file_id: 'FILEID000001', sha256: 'B'.repeat(64), bytes: 1 }] }, now: min(93),
 }).code, 'bad_request', '🚨 sha256 の大文字は受けない (R3)');
 // spec.hash を省いた照合の回避を防ぐ (R2 #3)
 ok(lp.requestJob(db, args(mkDraft('LP-K', 'テスト2'), { ...s2.spec, hash: '' }, 'k1', { now: min(95) })).code === 'bad_request',

@@ -254,8 +254,9 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
 
 // ─── 実行役 (miniPC) ─────────────────────────────────────
 
-const jobById = (db, id) => db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE id = ?').get(Number(id)) || null;
-const genOf = (db, jobId) => db.prepare(`SELECT * FROM ph_lp_compose_generations WHERE job_id = ? AND status = 'reserved'`).get(Number(jobId)) || null;
+// 外部から来た ID も posInt を通す。Number() だと " 12" や "" が別の数値になる (コード R4)
+const jobById = (db, id) => { const n = posInt(id); return n ? db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE id = ?').get(n) || null : null; };
+const genOf = (db, jobId) => { const n = posInt(jobId); return n ? db.prepare(`SELECT * FROM ph_lp_compose_generations WHERE job_id = ? AND status = 'reserved'`).get(n) || null : null; };
 
 /**
  * lease 切れの job を終端に落とす (completed_at を必ず入れる = 設計 §7.1b・Codex R4 #2)。
@@ -268,7 +269,7 @@ function expireJob(db, jobId, status, { code, message, nowS }) {
     SET status = ?, error_code = ?, error = ?, lease_token = NULL, lease_until = NULL,
         updated_at = ?, completed_at = COALESCE(completed_at, ?)
     WHERE id = ? AND status = 'running' AND lease_until < ?`)
-    .run(status, code, message, nowS, nowS, Number(jobId), nowS).changes;
+    .run(status, code, message, nowS, nowS, posInt(jobId), nowS).changes;
 }
 
 /** 終端に落とす (lease が有効な job を、その lease の持ち主が終わらせるとき) */
@@ -277,7 +278,7 @@ function finishJob(db, jobId, status, { code = null, message = null, nowS }) {
     SET status = ?, error_code = ?, error = ?, lease_token = NULL, lease_until = NULL,
         updated_at = ?, completed_at = COALESCE(completed_at, ?)
     WHERE id = ? AND status = 'running'`)
-    .run(status, code, message, nowS, nowS, Number(jobId)).changes;
+    .run(status, code, message, nowS, nowS, posInt(jobId)).changes;
 }
 
 /**
@@ -449,13 +450,17 @@ export function submitResult(db, generationId, {
     }
     imgs = [];
     for (const im of receipt.images) {
-      const fileId = trim(im?.file_id, 200);
+      // file_id も trim / 切り詰めしない — 別の入力が同じ証跡に畳まれると provenance にならない (コード R4)
+      const fileId = im?.file_id;
+      if (typeof fileId !== 'string' || !/^[-\w]{10,200}$/.test(fileId)) {
+        return { code: 'bad_request', error: 'receipt.images の file_id が Drive の ID の形ではありません' };
+      }
       // 🚨 trim / toLowerCase してから検査しない — 大文字や空白混じりを受けて同じ hash に畳むと、
       //    別の入力が同じ payloadHash になり「同じ結果の再送」の判定が狂う (コード R3)
       const hex = im?.sha256;
       const bytes = posInt(im?.bytes);
-      if (!fileId || typeof hex !== 'string' || !SHA256_RE.test(hex) || !bytes) {
-        return { code: 'bad_request', error: 'receipt.images は file_id・sha256 (16進小文字64桁)・bytes が要ります' };
+      if (typeof hex !== 'string' || !SHA256_RE.test(hex) || !bytes) {
+        return { code: 'bad_request', error: 'receipt.images は sha256 (16進小文字64桁) と bytes (正の整数) が要ります' };
       }
       imgs.push({ file_id: fileId, sha256: hex, bytes });
     }
@@ -467,7 +472,7 @@ export function submitResult(db, generationId, {
     verdict: v, output: out, lint: lintJson, review_rounds: rounds, reason: reasonText, images: imgs,
   }));
   return db.transaction(() => {
-    const gen = db.prepare('SELECT * FROM ph_lp_compose_generations WHERE id = ?').get(Number(generationId));
+    const gen = db.prepare('SELECT * FROM ph_lp_compose_generations WHERE id = ?').get(posInt(generationId));
     if (!gen) return { code: 'not_found', error: '予約がありません' };
     if (trim(packetHash, 80) !== gen.packet_hash) {
       return { code: 'packet_mismatch', error: '材料が予約時と違います (受付時に固定した packet ではありません)' };
@@ -571,7 +576,7 @@ export function releaseJob(db, jobId, { leaseToken, reason = null, now = Date.no
  */
 export function jobStateFor(db, draftId, { now = Date.now() } = {}) {
   recoverExpired(db, now);
-  const job = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(Number(draftId));
+  const job = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(posInt(draftId));
   if (!job) return { enabled: lpComposeEnabled(), job: null };
   const elapsed = Math.max(0, Math.round((Date.parse(job.completed_at || new Date(now).toISOString()) - Date.parse(job.created_at)) / 1000));
   return {
