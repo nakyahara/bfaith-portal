@@ -1,0 +1,266 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
+/**
+ * test-settlement-inventory.js — 決済のレポートの一覧 (inventory) の記録の試験 (D7b-1b の下ごしらえ・2026-09-30)
+ *
+ * 設計 = AI_reference CompanyDB構想/13 §3.1。SP-API は差し替え (fake の callAPI / download)。本番 DB には触れない (一時 DATA_DIR)。
+ *   - 一覧の窓の固定 (最初の要求に createdSince = createdUntil − 85 日・createdUntil = 回の開始の時刻。2 ページ目からは nextToken だけ)
+ *   - 取込の一覧の要求は今までと同じ形 (日時の境なし) = 取込む report は変わらない
+ *   - 最後のページまで取れた回 / 取れなかった回 (nextToken が残ったまま上限 = last_page_reached 0・取込は続ける)
+ *   - 各分岐の取込の結果 (skipped_not_done / imported / skipped_v1 / failed / not_processed)・同じ report ID を 2 回見たら最後の状態
+ *   - dry-run は表に書かない / --report-id は一覧の回にしない / 一覧の失敗でも取込は続ける / 例外で落ちた回は completed_at が null
+ *   - 取込む行は変わらない (正規化した行の physical_line_hash の集まりと一致・一覧の有無で生の表が同じ)
+ *   - digest の再現性 (並びに依らない・UTF-8 のバイトの順・保存した行から作り直して一致・式の固定)
+ *
+ * 実行: node apps/warehouse/test-settlement-inventory.js
+ */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'settlement-inventory-test-'));
+process.env.DATA_DIR = tmpDir;
+
+const { initDB, getDB } = await import('./db.js');
+const { SOURCES, runSettlementFetch, prepareReportTsv, prepareV2ReportTsv, ingestSettlement } = await import('./fetch-amazon-settlements.js');
+const { V1_COLUMNS, V2_COLUMNS } = await import('./amazon-settlement-v2.js');
+const inv = await import('./amazon-settlement-inventory.js');
+const { canonicalSha256 } = await import('../company-db/canonical-hash.mjs');
+
+let failed = 0;
+const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
+const eq = (a, b, label) => ok(JSON.stringify(a) === JSON.stringify(b), `${label}${JSON.stringify(a) === JSON.stringify(b) ? '' : ` (実際 ${JSON.stringify(a)} / 期待 ${JSON.stringify(b)})`}`);
+const sha256 = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
+const tsvOf = (cols, rows) => [cols.join('\t'), ...rows.map((r) => cols.map((c) => r[c] ?? '').join('\t'))].join('\n') + '\n';
+
+// 試験の中の console.log を拾う (取込のログは多い)
+async function captured(fn) {
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try { return { value: await fn(), logs, error: null }; }
+  catch (e) { return { value: null, logs, error: e }; }
+  finally { console.log = orig; }
+}
+
+// ── 作り物のレポート ──
+const V2T = SOURCES.v2.reportType;
+const MKT = 'A1VC38T7YXB528';
+const T1 = '2099/01/05 01:00:00 UTC';
+function v2Tsv(sid, { bad = false, amount = '300.00' } = {}) {
+  const hdr = { 'settlement-id': sid, 'settlement-start-date': '2099/01/01 00:20:09 UTC', 'settlement-end-date': '2099/01/15 00:20:09 UTC', 'deposit-date': '2099/01/17 00:20:09 UTC', 'total-amount': amount, currency: 'JPY' };
+  const line = { 'settlement-id': sid, currency: '', 'marketplace-name': 'Amazon.co.jp', 'posted-date': T1.slice(0, 10), 'posted-date-time': T1, 'transaction-type': 'Order', 'order-id': `O-${sid}`, 'merchant-order-id': `O-${sid}`, 'order-item-code': `OI-${sid}`, sku: 'SKU-X', 'quantity-purchased': '1', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount };
+  const rows = [hdr, line];
+  if (bad) rows.push({ ...line, 'transaction-type': 'NewThing', 'amount-type': 'Mystery', 'amount-description': 'x', amount: '-7.00' });
+  return tsvOf(V2_COLUMNS, rows);
+}
+const rep = (id, status, doc, over = {}) => ({
+  reportId: id, reportType: V2T, processingStatus: status, marketplaceIds: [MKT],
+  createdTime: '2026-09-20T03:04:05+00:00', dataStartTime: '2026-09-01T00:00:00+00:00', dataEndTime: '2026-09-15T00:00:00+09:00',
+  ...(doc ? { reportDocumentId: doc } : {}), ...over,
+});
+
+const DOCS = {
+  'D-IMP': v2Tsv('S-IMP'),
+  'D-V1': v2Tsv('S-V1'),
+  'D-BAD': v2Tsv('S-BAD', { bad: true }),
+  'D-ONLYINV': v2Tsv('S-ONLYINV'),
+  'D-ONLYING': v2Tsv('S-ONLYING'),
+};
+const R = {
+  notDone: rep('R-NOTDONE', 'IN_PROGRESS', null, { dataStartTime: undefined, dataEndTime: undefined }),
+  imp: rep('R-IMP', 'DONE', 'D-IMP'),
+  v1: rep('R-V1', 'DONE', 'D-V1'),
+  bad: rep('R-BAD', 'DONE', 'D-BAD'),
+  onlyInv: rep('R-ONLYINV', 'DONE', 'D-ONLYINV'),          // 一覧にだけ居る (取込の一覧に無い)
+  onlyIng: rep('R-ONLYING', 'DONE', 'D-ONLYING', { createdTime: '2026-07-03T00:00:00+00:00' }),   // 取込の一覧にだけ居る (85〜90 日前に作られた)
+};
+
+/**
+ * fake の SP-API。getReports の最初の要求は createdSince の有無で「一覧の記録用」か「取込用」かを分ける。
+ * pages = { inv: [page, ...] | (idx) => page, ing: [...] }・page = { reports, next }
+ */
+function fakeSp(pages, { failInventory = false, reportById = {} } = {}) {
+  const calls = [];
+  const page = (kind, idx) => {
+    const src = pages[kind];
+    const p = typeof src === 'function' ? src(idx) : src[idx];
+    return { reports: p.reports, ...(p.next ? { nextToken: `${kind}:${idx + 1}` } : {}) };
+  };
+  return {
+    calls,
+    async callAPI(req) {
+      calls.push(JSON.parse(JSON.stringify(req)));
+      if (req.operation === 'getReports') {
+        const q = req.query;
+        if (q.nextToken) { const [kind, idx] = q.nextToken.split(':'); return page(kind, Number(idx)); }
+        const kind = q.createdSince ? 'inv' : 'ing';
+        if (kind === 'inv' && failInventory) throw new Error('QuotaExceeded (作り物)');
+        return page(kind, 0);
+      }
+      if (req.operation === 'getReport') return reportById[req.path.reportId];
+      throw new Error(`想定外の呼び出し ${req.operation}`);
+    },
+  };
+}
+const fakeDownload = (throwFor = null) => async (docId) => {
+  if (docId === throwFor) throw new Error(`ダウンロードの失敗 (作り物) ${docId}`);
+  if (!Object.hasOwn(DOCS, docId)) throw new Error(`文書が無い ${docId}`);
+  return DOCS[docId];
+};
+const ARGS = { reportId: null, dryRun: false, source: 'v2' };
+const NOW = new Date('2026-09-30T00:00:05.500Z');
+let tick = 0;
+const nowFn = () => new Date(NOW.getTime() + (tick++) * 1000);
+
+await initDB();
+const db = getDB();
+
+// 前提: S-V1 は V1 で取込済み (V2 では入れない = skipped_v1)
+const v1Prep = prepareReportTsv(tsvOf(V1_COLUMNS, [
+  { 'settlement-id': 'S-V1', 'settlement-start-date': '2099-01-01T00:20:09+00:00', 'settlement-end-date': '2099-01-15T00:20:09+00:00', 'deposit-date': '2099-01-17T00:20:09+00:00', 'total-amount': '300.00', currency: 'JPY' },
+  { 'settlement-id': 'S-V1', 'marketplace-name': 'Amazon.co.jp', 'posted-date': '2099-01-05T01:00:00+00:00', 'transaction-type': 'Order', 'order-id': 'O9', sku: 'SKU-Y', 'price-type': 'Principal', 'price-amount': '300.00' },
+]), 'R-V1-OLD', 'seed');
+ingestSettlement(db, v1Prep.headerRow, v1Prep.lineRows, v1Prep.ctx);
+
+const runs = () => db.prepare(`SELECT * FROM amazon_settlement_report_inventory_runs ORDER BY id`).all();
+const rows = (runId) => db.prepare(`SELECT * FROM amazon_settlement_report_inventory WHERE inventory_run_id = ? ORDER BY report_id`).all(runId);
+const rowOf = (runId, reportId) => db.prepare(`SELECT * FROM amazon_settlement_report_inventory WHERE inventory_run_id = ? AND report_id = ?`).get(runId, reportId);
+const rawLines = () => db.prepare(`SELECT physical_line_hash FROM raw_amazon_settlement_lines WHERE source_layer = 'sp_api_v2' ORDER BY physical_line_hash`).all().map((r) => r.physical_line_hash);
+const rawCounts = () => db.prepare(`SELECT (SELECT COUNT(*) FROM raw_amazon_settlement_lines) l, (SELECT COUNT(*) FROM raw_amazon_settlement_headers) h`).get();
+
+// ════ 1. ふつうの回 (一覧 2 ページ・最後まで取れた) ════
+const PAGES_NORMAL = {
+  // R-V1 を 1 ページ目で IN_QUEUE・2 ページ目で DONE に = 同じ report ID を 2 回見たら最後の状態
+  inv: [
+    { reports: [R.notDone, R.imp, { ...R.v1, processingStatus: 'IN_QUEUE', reportDocumentId: undefined }], next: true },
+    { reports: [R.bad, R.onlyInv, R.v1] },
+  ],
+  ing: [{ reports: [R.notDone, R.imp, R.v1, R.bad, R.onlyIng] }],
+};
+let sp = fakeSp(PAGES_NORMAL);
+let res = await captured(() => runSettlementFetch(ARGS, { db, sp, runId: 'run-1', downloadTsv: fakeDownload(), now: nowFn }));
+ok(!res.error, `ふつうの回は落ちない ${res.error ? res.error.message : ''}`);
+
+// 窓の固定: 最初の要求に createdSince / createdUntil を明示・2 ページ目は nextToken だけ
+const reportsCalls = sp.calls.filter((c) => c.operation === 'getReports');
+eq(reportsCalls[0].query, { reportTypes: [V2T], marketplaceIds: [MKT], pageSize: 100, createdSince: '2026-07-07T00:00:05Z', createdUntil: '2026-09-30T00:00:05Z' }, '一覧の最初の要求 = createdUntil は回の開始の時刻 (秒に切り捨て)・createdSince はその 85 日前');
+eq(reportsCalls[1].query, { nextToken: 'inv:1' }, '一覧の 2 ページ目は nextToken だけ (窓を付け直さない)');
+eq(reportsCalls[2].query, { reportTypes: [V2T], marketplaceIds: [MKT], pageSize: 100 }, '🚨 取込の一覧の要求は今までと同じ形 (日時の境なし) = 取込む report は変わらない');
+ok(reportsCalls.length === 3, `getReports は一覧 2 + 取込 1 = 3 回 (${reportsCalls.length})`);
+
+let [run1] = runs();
+ok(run1 && run1.report_type === V2T && run1.marketplace_id === MKT, '回の見出し: report type・marketplace');
+eq([run1.query_created_since, run1.query_created_until, run1.started_at], ['2026-07-07T00:00:05Z', '2026-09-30T00:00:05Z', '2026-09-30T00:00:05Z'], '回の見出し: 窓 (UTC) と開始の時刻');
+eq([run1.last_page_reached, run1.page_count, run1.report_count], [1, 2, 5], '最後のページまで取れた = last_page_reached 1・2 ページ・5 本 (重複を除く)');
+ok(run1.completed_at && run1.list_completed_at && run1.list_error === null, '完了の時刻がある・一覧の失敗なし');
+ok(run1.coverage_generation === null && run1.run_token === null, 'coverage_generation / run_token は null (後の coordinator が入れる)');
+ok(run1.inventory_run_seq === 1 && run1.ingest_run_id === 'run-1', '回の連番 1・取込の回の ID');
+
+// 各分岐の取込の結果
+eq(rows(run1.id).map((r) => [r.report_id, r.import_result]), [['R-BAD', 'failed'], ['R-IMP', 'imported'], ['R-NOTDONE', 'skipped_not_done'], ['R-ONLYINV', 'not_processed'], ['R-V1', 'skipped_v1']], '各分岐の取込の結果 (取込の一覧にだけ居る R-ONLYING は一覧の行にしない)');
+const imp = rowOf(run1.id, 'R-IMP');
+ok(imp.source_file_hash === sha256(DOCS['D-IMP']) && imp.settlement_id === 'S-IMP' && imp.header_inserted === 1 && imp.lines_inserted === 2 && imp.imported_report_document_id === 'D-IMP', 'imported: file hash・決済 ID・入れた行の数・落とした文書 ID');
+const rawHash = db.prepare(`SELECT DISTINCT source_file_hash h FROM raw_amazon_settlement_lines WHERE source_document_id = 'R-IMP'`).all().map((r) => r.h);
+eq(rawHash, [imp.source_file_hash], 'imported の file hash = 生の表の source_file_hash と同じ式');
+const v1row = rowOf(run1.id, 'R-V1');
+ok(v1row.settlement_id === 'S-V1' && v1row.source_file_hash === sha256(DOCS['D-V1']) && v1row.processing_status === 'DONE' && v1row.report_document_id === 'D-V1' && v1row.last_seen_ordinal === 6, `skipped_v1: 決済 ID・file hash / 同じ report ID を 2 回見たら最後の状態と位置 (last_seen_ordinal ${v1row.last_seen_ordinal})`);
+const badRow = rowOf(run1.id, 'R-BAD');
+ok(/^blocked: /.test(badRow.import_note) && badRow.source_file_hash === sha256(DOCS['D-BAD']), `failed (blocked): 理由と file hash (${badRow.import_note})`);
+const nd = rowOf(run1.id, 'R-NOTDONE');
+ok(nd.processing_status === 'IN_PROGRESS' && nd.data_start_time === null && nd.data_end_time === null && nd.report_document_id === null && /IN_PROGRESS/.test(nd.import_note), 'skipped_not_done: 期間の無い report も行にする (null のまま)');
+eq([imp.created_time, imp.data_start_time, imp.data_end_time], ['2026-09-20T03:04:05Z', '2026-09-01T00:00:00Z', '2026-09-14T15:00:00Z'], '日時は UTC の YYYY-MM-DDTHH:MM:SSZ に (+09:00 も UTC に直す)');
+ok(res.value.blocked.length === 1 && res.value.blocked[0].reportId === 'R-BAD', '取り込まなかった V2 は今までどおり blocked で返る (main が終了コード 3)');
+ok(/決済の一覧 5 本を記録$/.test(res.logs.find((l) => l.includes('[settlements] 完了')) || ''), '完了の行の末尾 = 一覧の本数 (daily-sync の朝の報告)');
+
+// 取込む行は変わらない = 正規化した行の集まりとちょうど同じ
+const expected = [...prepareV2ReportTsv(DOCS['D-IMP'], 'R-IMP', 'x').lineRows, ...prepareV2ReportTsv(DOCS['D-ONLYING'], 'R-ONLYING', 'x').lineRows].map((r) => r.physical_line_hash).sort();
+eq(rawLines(), expected, '🚨 生の表 (V2) = 取込む report (R-IMP・R-ONLYING) の正規化した行とちょうど同じ (一覧にだけ居る R-ONLYINV は入れない)');
+const afterRun1 = rawCounts();
+
+// digest = 保存した行から作り直して一致
+const dbDigest = inv.inventorySnapshotDigest(rows(run1.id));
+ok(run1.snapshot_digest === dbDigest && /^[0-9a-f]{64}$/.test(dbDigest), 'snapshot の digest = 保存した行から作り直した digest と一致 (hex 64 桁)');
+
+// ════ 2. dry-run は表に書かない ════
+sp = fakeSp(PAGES_NORMAL);
+res = await captured(() => runSettlementFetch({ ...ARGS, dryRun: true }, { db, sp, runId: 'run-dry', downloadTsv: fakeDownload(), now: nowFn }));
+ok(!res.error && runs().length === 1 && db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_report_inventory`).get().n === 5, 'dry-run は一覧の表に書かない');
+eq(rawCounts(), afterRun1, 'dry-run は生の表にも書かない');
+ok(res.logs.some((l) => /\[inventory\] \[dry-run\] 一覧は記録しない/.test(l)) && /決済の一覧 5 本 \(dry-run = 記録しない\)$/.test(res.logs.find((l) => l.includes('[settlements] 完了')) || ''), 'dry-run は一覧を取って本数を出すが「記録しない」');
+
+// ════ 3. 最後のページまで取れなかった回 (nextToken が残ったまま上限) = last_page_reached 0・取込は続ける ════
+sp = fakeSp({ inv: (idx) => ({ reports: idx === 0 ? [R.imp] : [], next: true }), ing: PAGES_NORMAL.ing });
+res = await captured(() => runSettlementFetch(ARGS, { db, sp, runId: 'run-3', downloadTsv: fakeDownload(), now: nowFn }));
+const run3 = runs().at(-1);
+ok(!res.error && run3.last_page_reached === 0 && run3.page_count === inv.MAX_LIST_PAGES && run3.ingest_run_id === 'run-3', `nextToken が残ったまま上限 = last_page_reached 0 (${run3.page_count} ページ)`);
+ok(run3.completed_at !== null && rowOf(run3.id, 'R-IMP').import_result === 'imported', '取込は今までどおり続ける (取込の結果も記録)');
+ok(res.logs.some((l) => /⚠️ 21 ページで打ち切り/.test(l)) && /⚠️ 決済の一覧が途中まで/.test(res.logs.find((l) => l.includes('[settlements] 完了')) || ''), '黙って打ち切らない = ⚠️ をログと完了の行に');
+ok(run3.inventory_run_seq === 2, '回の連番は増える (dry-run は数えない)');
+eq(rawCounts(), afterRun1, '同じレポートの取り直しで生の表は増えない (今までどおり冪等)');
+
+// ════ 4. --report-id の 1 本だけの回は一覧の回にしない ════
+sp = fakeSp({ inv: [], ing: [] }, { reportById: { 'R-IMP': R.imp } });
+const before4 = runs().length;
+res = await captured(() => runSettlementFetch({ ...ARGS, reportId: 'R-IMP' }, { db, sp, runId: 'run-4', downloadTsv: fakeDownload(), now: nowFn }));
+ok(!res.error && runs().length === before4 && !sp.calls.some((c) => c.operation === 'getReports'), '--report-id は一覧を取らない・一覧の回にしない');
+ok(sp.calls.some((c) => c.operation === 'getReport'), '--report-id は今までどおり getReport で 1 本');
+
+// ════ 5. 一覧の要求が失敗しても取込は続ける (回は失敗として残す) ════
+sp = fakeSp(PAGES_NORMAL, { failInventory: true });
+res = await captured(() => runSettlementFetch(ARGS, { db, sp, runId: 'run-5', downloadTsv: fakeDownload(), now: nowFn }));
+const run5 = runs().at(-1);
+ok(!res.error && run5.ingest_run_id === 'run-5' && run5.last_page_reached === 0 && run5.report_count === 0 && run5.snapshot_digest === null && /QuotaExceeded/.test(run5.list_error), `一覧の失敗 = last_page_reached 0・digest null・list_error (${run5.list_error})`);
+ok(res.value?.blocked.length === 1 && /⚠️ 決済の一覧を取れなかった/.test(res.logs.find((l) => l.includes('[settlements] 完了')) || ''), '取込は最後まで回る (⚠️ は完了の行に)');
+eq(rawCounts(), afterRun1, '一覧が無くても取込む行は同じ (一覧の有無で生の表は変わらない)');
+
+// ════ 6. ダウンロードで例外 = 今までどおり回ごと止める・その report は failed・回は completed_at null ════
+sp = fakeSp(PAGES_NORMAL);
+res = await captured(() => runSettlementFetch(ARGS, { db, sp, runId: 'run-6', downloadTsv: fakeDownload('D-V1'), now: nowFn }));
+const run6 = runs().at(-1);
+ok(res.error && /ダウンロードの失敗/.test(res.error.message), '例外は今までどおり投げる (FATAL・終了コード 1)');
+ok(run6.completed_at === null && run6.last_page_reached === 1, '途中で落ちた回は completed_at が null (一覧は最後まで取れている)');
+const r6 = rowOf(run6.id, 'R-V1');
+ok(r6.import_result === 'failed' && /^例外: /.test(r6.import_note) && r6.imported_report_document_id === 'D-V1', `落ちた report = failed + 理由 (${r6.import_note})`);
+ok(rowOf(run6.id, 'R-IMP').import_result === 'imported' && rowOf(run6.id, 'R-BAD').import_result === 'not_processed', '落ちる前の report は結果あり・後の report は not_processed');
+
+// ════ 7. digest の再現性 ════
+const E = (id, over = {}) => ({ report_id: id, processing_status: 'DONE', created_time: '2026-09-01T00:00:00Z', data_start_time: '2026-08-01T00:00:00Z', data_end_time: null, report_document_id: `amzn1.doc.${id}`, ...over });
+const d1 = inv.inventorySnapshotDigest([E('2'), E('10'), E('9')]);
+ok(d1 === inv.inventorySnapshotDigest([E('9'), E('2'), E('10')]), '並びに依らない (report ID の順に並べ直す)');
+ok(d1 === canonicalSha256([E('10'), E('2'), E('9')].map(({ report_id, processing_status, created_time, data_start_time, data_end_time, report_document_id }) => ({ report_id, processing_status, created_time, data_start_time, data_end_time, report_document_id }))), '並びは UTF-8 のバイトの順 ("10" < "2" < "9"・数の順ではない)');
+ok(d1 !== inv.inventorySnapshotDigest([E('2', { processing_status: 'CANCELLED' }), E('10'), E('9')]), 'status が変われば digest が変わる');
+ok(d1 !== inv.inventorySnapshotDigest([E('2', { data_end_time: '2026-08-15T00:00:00Z' }), E('10'), E('9')]), '期間が変われば digest が変わる');
+ok(d1 === inv.inventorySnapshotDigest([{ ...E('2'), last_seen_ordinal: 3, import_result: 'imported' }, E('10'), E('9')]), '取込の結果・位置は digest に入れない (一覧の中身だけ)');
+// 期待値 = 手で書いた正規の JSON '[{"created_time":…,"report_id":"10"},{…"2"},{…"9"}]' (鍵は名前の順・null は null) の SHA-256 (canonical-hash.mjs を通さずに計算)
+eq(d1, '1af95e644f6383a90cd7c9b20dbe2007445c844a86354f19b34457ba701a8f32', '式の固定 (手で書いた正規の JSON の SHA-256 と一致・変えるときは版を足す)');
+// UTF-16 の順と UTF-8 のバイトの順が違う例 (U+FF61 と U+1F600): UTF-8 では U+FF61 (EF..) が先
+const d2 = inv.inventorySnapshotDigest([E('😀'), E('｡')]);
+ok(d2 === canonicalSha256([E('｡'), E('😀')]), 'UTF-16 の順でなく UTF-8 のバイトの順 (U+FF61 が U+1F600 より先)');
+let threw = false;
+try { inv.inventorySnapshotDigest([E('1'), E('1')]); } catch { threw = true; }
+ok(threw, '同じ report ID が 2 つある並びは例外 (黙って digest にしない)');
+eq(inv.inventoryEntries([{ reportId: '5', processingStatus: 'IN_QUEUE' }, { processingStatus: 'DONE' }, { reportId: '5', processingStatus: 'DONE', reportDocumentId: 'd5' }], V2T), { entries: [{ report_id: '5', report_type: V2T, processing_status: 'DONE', created_time: null, data_start_time: null, data_end_time: null, report_document_id: 'd5', last_seen_ordinal: 3 }], missingId: 1 }, '同じ report ID は最後の状態・reportId の無いものは数える');
+
+// 日時の正規化
+eq(['2026-09-20T03:04:05+00:00', '2026-09-20T12:04:05+09:00', '2026-09-20T03:04:05.789Z', null, ''].map(inv.normalizeApiTime), ['2026-09-20T03:04:05Z', '2026-09-20T03:04:05Z', '2026-09-20T03:04:05Z', null, null], '日時 → UTC の YYYY-MM-DDTHH:MM:SSZ');
+eq(['2026-02-30T00:00:00Z', '2026-09-20T03:04:05', '2026-09-20', 'x'].map(inv.normalizeApiTime), ['2026-02-30T00:00:00Z', '2026-09-20T03:04:05', '2026-09-20', 'x'], '読めない日時 (暦に無い・時差が無い・日付だけ) は元の文字のまま (null にしない = 期間が無いと区別)');
+eq(inv.inventoryWindow(new Date('2026-01-01T00:00:00.999Z')), { createdSince: '2025-10-08T00:00:00Z', createdUntil: '2026-01-01T00:00:00Z' }, '窓 = 開始の時刻 (秒に切り捨て) から 85 日前');
+
+// 表の決まり: 取込の結果は固定の集合
+let chk = false;
+try { db.prepare(`UPDATE amazon_settlement_report_inventory SET import_result = 'skipped_already' WHERE inventory_run_id = ?`).run(run1.id); } catch { chk = true; }
+ok(chk, '取込の結果は固定の集合 (表の CHECK)');
+let chk2 = false;
+try { inv.recordImportResult(db, run1.id, 'R-IMP', 'satisfied'); } catch { chk2 = true; }
+ok(chk2, '取込の結果は固定の集合 (記録の関数)');
+
+// reportId の無い report は落とさず list_error に数える (完了の行も ⚠️)
+sp = fakeSp({ inv: [{ reports: [R.imp, { processingStatus: 'DONE' }] }], ing: [{ reports: [] }] });
+res = await captured(() => runSettlementFetch(ARGS, { db, sp, runId: 'run-8', downloadTsv: fakeDownload(), now: nowFn }));
+const run8 = runs().at(-1);
+ok(!res.error && run8.report_count === 1 && /reportId の無い report 1 件/.test(run8.list_error) && /⚠️ 決済の一覧 1 本/.test(res.logs.find((l) => l.includes('[settlements] 完了')) || ''), `reportId の無い report = list_error に数える・⚠️ (${run8.list_error})`);
+
+console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 決済の一覧 (inventory) テスト ALL PASS ===');
+process.exit(failed ? 1 : 0);

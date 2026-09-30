@@ -11,6 +11,15 @@
  *   (daily-sync で ❌ = 規則を足す合図。取り込んでから規則を直すと古い行と新しい行が二重になるため。V2 は約 90 日取り直せる = 落ちない。Codex #1508 R1)
  *   V1 が必要なら --source v1 (11/11 まで)
  *
+ * 🆕 2026-09-30 (D7b-1b の下ごしらえ・設計 = AI_reference CompanyDB構想/13 §3.1): 決済のレポートの一覧 (inventory) を記録する
+ *   = amazon_settlement_report_inventory_runs (回) / amazon_settlement_report_inventory (report ごと・取込の結果)。部品 = amazon-settlement-inventory.js
+ *   - 一覧の記録用の getReports は **取込の一覧とは別の要求** で、最初の要求に createdUntil = 回の開始の時刻・createdSince = その 85 日前 を明示して固定
+ *     (取込の一覧は今までどおり日時の境なし = Amazon の既定の 90 日前〜今 → 取込む report は変わらない)
+ *   - nextToken が残ったまま上限のページ (21) に来たら last_page_reached = 0 + ⚠️ (取込は続ける)
+ *   - 一覧の失敗・記録の失敗でも取込は止めない (⚠️)。--dry-run は表に書かない。--report-id の 1 本だけの回は一覧の回にしない
+ *   - 今は記録だけ (読み手 = 後の coverage)。取込む行 (raw_amazon_settlement_*) の中身と数は変えない
+ *   - 🚨 daily-sync が渡す --days 14 はこのスクリプトでは読んでいない (昔から。取込の一覧は既定の 90 日)
+ *
  * 機能:
  *   - SP-API getReports で過去 Settlement 一覧取得 (最大90日)
  *   - getReportDocument → TSV DL
@@ -21,9 +30,9 @@
  *   - settlement_refresh_queue に dirty month 追加
  *
  * 使い方:
- *   node apps/warehouse/fetch-amazon-settlements.js              # 直近90日全件
- *   node apps/warehouse/fetch-amazon-settlements.js --report-id 1487945020577   # 特定 reportId のみ
- *   node apps/warehouse/fetch-amazon-settlements.js --dry-run    # DL だけして DB に書かない
+ *   node apps/warehouse/fetch-amazon-settlements.js              # 直近90日全件 (+ 決済の一覧を記録)
+ *   node apps/warehouse/fetch-amazon-settlements.js --report-id 1487945020577   # 特定 reportId のみ (一覧の回にしない)
+ *   node apps/warehouse/fetch-amazon-settlements.js --dry-run    # DL だけして DB に書かない (一覧も記録しない)
  *   node apps/warehouse/fetch-amazon-settlements.js --source v1  # 旧 V1 レポートで取る (2026-11-11 まで)
  */
 
@@ -34,6 +43,10 @@ import crypto from 'crypto';
 import canonicalize from 'canonicalize';
 import { initDB, getDB } from './db.js';
 import { convertV2TsvToV1Tsv, parseV2Tsv } from './amazon-settlement-v2.js';
+import {
+  MAX_LIST_PAGES, listReportPages, listInventoryReports, inventoryWindow, inventoryEntries, inventorySnapshotDigest,
+  recordInventoryRun, recordImportResult, finishInventoryRun,
+} from './amazon-settlement-inventory.js';
 
 const REGION = 'fe';
 const MARKETPLACE_ID = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
@@ -77,29 +90,18 @@ function parseArgs() {
 
 // ─── SP-API ───
 
-async function listSettlementReports(reportType) {
-  const sp = getClient();
-  const all = [];
-  let nextToken = null;
-  let pageNum = 0;
-  do {
-    pageNum++;
-    const params = nextToken ? { nextToken } : {
-      reportTypes: [reportType],
-      marketplaceIds: [MARKETPLACE_ID],
-      pageSize: 100,
-    };
-    const resp = await sp.callAPI({ operation: 'getReports', endpoint: 'reports', query: params });
-    if (resp.reports) all.push(...resp.reports);
-    nextToken = resp.nextToken || null;
-    console.log(`[list] page ${pageNum}: cumulative ${all.length}, nextToken=${nextToken ? 'yes' : 'no'}`);
-    if (pageNum > 20) { console.log('(safety break at page 20)'); break; }
-  } while (nextToken);
-  return all;
+// 取込の一覧 = 今までと同じ要求 (日時の境なし = Amazon の既定の 90 日前〜今・21 ページで打ち切り)。
+// 🚨 取込む report の選び方を変えないため、一覧の記録 (窓を固定) はこれとは別の要求 (amazon-settlement-inventory.js)
+async function listSettlementReports(sp, reportType) {
+  const r = await listReportPages(sp, {
+    reportTypes: [reportType],
+    marketplaceIds: [MARKETPLACE_ID],
+    pageSize: 100,
+  }, { maxPages: MAX_LIST_PAGES, label: 'list' });
+  return r.reports;
 }
 
-async function downloadReportTsv(reportDocumentId) {
-  const sp = getClient();
+async function downloadReportTsv(sp, reportDocumentId) {
   const document = await sp.callAPI({
     operation: 'getReportDocument',
     endpoint: 'reports',
@@ -511,23 +513,87 @@ export function ingestSettlement(db, headerRow, lineRows, ctx) {
 
 // ─── Main ───
 
-async function main() {
-  const args = parseArgs();
-  const runId = `settlement-${Date.now()}`;
-  const src = SOURCES[args.source];
-  console.log(`[settlements] run_id=${runId}, dry-run=${args.dryRun}, source=${args.source} (${src.reportType})`);
+/**
+ * 決済のレポートの一覧 (inventory) を取って記録する (取込の一覧とは別の要求・窓を固定)。
+ * 🚨 一覧の失敗・記録の失敗で取込を止めない (⚠️ を出して続ける = 今の取込は今までどおり)。dry-run は表に書かない
+ */
+async function takeSettlementInventory(db, sp, { reportType, runId, dryRun, now }) {
+  const startedAt = now();
+  const window = inventoryWindow(startedAt);
+  const state = { id: null, window, listing: null, listError: null, recordError: null, count: 0 };
+  try {
+    state.listing = await listInventoryReports(sp, { reportType, marketplaceId: MARKETPLACE_ID, startedAt });
+  } catch (e) {
+    state.listError = `一覧の要求の失敗: ${e?.message || e}`;
+    console.log(`[inventory] ⚠️ ${state.listError} (取込は続ける)`);
+  }
+  const listCompletedAt = state.listing ? now() : null;
+  if (dryRun) {
+    if (state.listing) {
+      try {
+        const { entries, missingId } = inventoryEntries(state.listing.reports, reportType);
+        state.count = entries.length;
+        console.log(`[inventory] 窓 ${window.createdSince} 〜 ${window.createdUntil}: report ${entries.length} 本 / ${state.listing.pages} ページ / 最後のページまで ${state.listing.lastPageReached ? '✅' : '⚠️ 取れていない'} / digest ${inventorySnapshotDigest(entries).slice(0, 12)}…${missingId ? ` / ⚠️ reportId の無いもの ${missingId} 件` : ''}`);
+      } catch (e) { console.log(`[inventory] ⚠️ 一覧を読めない: ${e?.message || e}`); }
+    }
+    console.log('[inventory] [dry-run] 一覧は記録しない');
+    return state;
+  }
+  try {
+    state.id = recordInventoryRun(db, {
+      reportType, marketplaceId: MARKETPLACE_ID, window, startedAt, listCompletedAt,
+      listing: state.listing, listError: state.listError, ingestRunId: runId,
+    });
+    const h = db.prepare(`SELECT report_count, page_count, last_page_reached, snapshot_digest, list_error, inventory_run_seq FROM amazon_settlement_report_inventory_runs WHERE id = ?`).get(state.id);
+    state.count = h.report_count;
+    state.warn = h.list_error;
+    console.log(`[inventory] 回 #${h.inventory_run_seq} 窓 ${window.createdSince} 〜 ${window.createdUntil}: report ${h.report_count} 本 / ${h.page_count} ページ / 最後のページまで ${h.last_page_reached ? '✅' : '⚠️ 取れていない'} / digest ${(h.snapshot_digest || '-').slice(0, 12)}${h.list_error ? ` / ⚠️ ${h.list_error}` : ''}`);
+  } catch (e) {
+    state.recordError = `一覧を記録できない: ${e?.message || e}`;
+    console.log(`[inventory] ⚠️ ${state.recordError} (取込は続ける)`);
+  }
+  return state;
+}
 
-  await initDB();
-  const db = getDB();
+/** 完了の行の末尾 (daily-sync の朝の報告に出る) */
+function inventorySummary(inv, args) {
+  if (!inv) return '';
+  if (inv.listError) return ' | ⚠️ 決済の一覧を取れなかった (取込は続けた)';
+  if (args.dryRun) return ` | 決済の一覧 ${inv.count} 本 (dry-run = 記録しない)`;
+  if (inv.recordError) return ' | ⚠️ 決済の一覧を記録できなかった';
+  if (!inv.listing.lastPageReached) return ` | ⚠️ 決済の一覧が途中まで (${inv.listing.pages} ページで打ち切り・一覧 ${inv.count} 本)`;
+  if (inv.warn) return ` | ⚠️ 決済の一覧 ${inv.count} 本 (${inv.warn})`;
+  return ` | 決済の一覧 ${inv.count} 本を記録`;
+}
+
+/**
+ * 取込の本体 (main から呼ぶ。試験から SP-API を差し替えて呼べるように関数にした)。
+ * deps = { db, sp (callAPI を持つ), runId, downloadTsv(reportDocumentId) → TSV の文字 (既定 = SP-API), now() → Date }
+ * 返り値 = { totalHeaders, totalLines, dirtyMonths, blocked, inventory }
+ * 🚨 取込む report の選び方・取込む行は今までと同じ。足したのは一覧の記録 (別の要求) と、各分岐での取込の結果の記録だけ
+ */
+export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = null, now = () => new Date() }) {
+  const src = SOURCES[args.source];
+  const download = downloadTsv || ((reportDocumentId) => downloadReportTsv(sp, reportDocumentId));
+
+  // 0. 決済のレポートの一覧 (inventory)。--report-id の 1 本だけの回は一覧の回にしない (設計 §3.1)
+  const inv = args.reportId ? null : await takeSettlementInventory(db, sp, { reportType: src.reportType, runId, dryRun: args.dryRun, now });
+  const rec = (reportId, result, extra) => {
+    if (!inv?.id) return;
+    try { recordImportResult(db, inv.id, reportId, result, extra); }
+    catch (e) {
+      inv.recordError = inv.recordError || `取込の結果を記録できない: ${e?.message || e}`;
+      console.log(`  ⚠️ 一覧に取込の結果を記録できない (取込は続ける): ${e?.message || e}`);
+    }
+  };
 
   // 1. Settlement 一覧取得
   let reports;
   if (args.reportId) {
-    const sp = getClient();
     const r = await sp.callAPI({ operation: 'getReport', endpoint: 'reports', path: { reportId: args.reportId } });
     reports = [r];
   } else {
-    reports = await listSettlementReports(src.reportType);
+    reports = await listSettlementReports(sp, src.reportType);
   }
   console.log(`[settlements] 対象 reports: ${reports.length}件`);
 
@@ -539,57 +605,85 @@ async function main() {
     const r = reports[i];
     if (r.processingStatus !== 'DONE' || !r.reportDocumentId) {
       console.log(`[skip ${i + 1}/${reports.length}] reportId=${r.reportId} status=${r.processingStatus}`);
+      rec(r.reportId, 'skipped_not_done', { note: `status=${r.processingStatus}${r.reportDocumentId ? '' : ' / reportDocumentId なし'}` });
       continue;
     }
     console.log(`\n[${i + 1}/${reports.length}] reportId=${r.reportId} (${r.dataStartTime?.slice(0, 10)} 〜 ${r.dataEndTime?.slice(0, 10)})`);
 
-    const tsv = await downloadReportTsv(r.reportDocumentId);
-    if (args.source === 'v2') {
-      const v = processV2Report(db, tsv, r.reportId, runId, { dryRun: args.dryRun });
-      if (v.prepared) console.log(`  bytes: ${tsv.length}, rows: ${v.prepared.rowCount} (V2 の元の行 ${v.prepared.v2RowCount} → V1 の形), lines=${v.prepared.lineRows.length}`);
-      if (v.status === 'blocked') { console.log(`  ❌ 取り込まない: ${v.reason}`); blocked.push({ reportId: r.reportId, reason: v.reason }); continue; }
-      if (v.status === 'skipped_v1') { console.log(`  [skip] settlement-id ${v.settlementId} は V1 (sp_api_v1) で取込済み = V2 では入れない`); continue; }
-      if (v.status === 'dry_run') { console.log('  [dry-run] DB 投入スキップ'); continue; }
-      console.log(`  inserted: header=${v.result.headerInserted}, lines=${v.result.lineInserted}, dirty_months=${v.result.dirtyMonths.join(',')}`);
-      totalHeaders += v.result.headerInserted; totalLines += v.result.lineInserted;
-      v.result.dirtyMonths.forEach((m) => allDirtyMonths.add(m));
-      continue;
-    }
-    const prepared = prepareReportTsv(tsv, r.reportId, runId);
-    const { headerRow, lineRows, ctx, sourceFileHash, rowCount } = prepared;
-    console.log(`  bytes: ${tsv.length}, file_hash: ${sourceFileHash.slice(0, 12)}...`);
-    console.log(`  rows: ${rowCount}`);
-    console.log(`  parsed: header=${headerRow ? 1 : 0}, lines=${lineRows.length}`);
-
-    if (args.dryRun) {
-      console.log('  [dry-run] DB 投入スキップ');
-      // sample 表示
-      if (lineRows.length > 0) {
-        const sample = lineRows[0];
-        console.log('  sample line:', JSON.stringify({
-          settlement_id: sample.source_settlement_id,
-          posted_jst: sample.posted_datetime_jst,
-          economic_date: sample.economic_date,
-          year_month: sample.year_month_int,
-          tx: sample.transaction_type,
-          sku: sample.seller_sku_normalized,
-          qty: sample.quantity_purchased,
-          price_type: sample.price_type,
-          price_micro: sample.price_amount_micro,
-        }));
+    try {
+      const tsv = await download(r.reportDocumentId);
+      const doc = { importedReportDocumentId: r.reportDocumentId, fileHash: sha256(tsv) };   // raw の source_file_hash と同じ式 (V2 は並べ直す前の元のファイル)
+      if (args.source === 'v2') {
+        const v = processV2Report(db, tsv, r.reportId, runId, { dryRun: args.dryRun });
+        if (v.prepared) console.log(`  bytes: ${tsv.length}, rows: ${v.prepared.rowCount} (V2 の元の行 ${v.prepared.v2RowCount} → V1 の形), lines=${v.prepared.lineRows.length}`);
+        if (v.status === 'blocked') { console.log(`  ❌ 取り込まない: ${v.reason}`); blocked.push({ reportId: r.reportId, reason: v.reason }); rec(r.reportId, 'failed', { ...doc, note: `blocked: ${v.reason}` }); continue; }
+        if (v.status === 'skipped_v1') { console.log(`  [skip] settlement-id ${v.settlementId} は V1 (sp_api_v1) で取込済み = V2 では入れない`); rec(r.reportId, 'skipped_v1', { ...doc, settlementId: v.settlementId }); continue; }
+        if (v.status === 'dry_run') { console.log('  [dry-run] DB 投入スキップ'); continue; }
+        console.log(`  inserted: header=${v.result.headerInserted}, lines=${v.result.lineInserted}, dirty_months=${v.result.dirtyMonths.join(',')}`);
+        totalHeaders += v.result.headerInserted; totalLines += v.result.lineInserted;
+        v.result.dirtyMonths.forEach((m) => allDirtyMonths.add(m));
+        rec(r.reportId, 'imported', { ...doc, settlementId: v.prepared.headerRow?.source_settlement_id, headerInserted: v.result.headerInserted, linesInserted: v.result.lineInserted });
+        continue;
       }
-      continue;
-    }
+      const prepared = prepareReportTsv(tsv, r.reportId, runId);
+      const { headerRow, lineRows, ctx, sourceFileHash, rowCount } = prepared;
+      console.log(`  bytes: ${tsv.length}, file_hash: ${sourceFileHash.slice(0, 12)}...`);
+      console.log(`  rows: ${rowCount}`);
+      console.log(`  parsed: header=${headerRow ? 1 : 0}, lines=${lineRows.length}`);
 
-    const result = ingestSettlement(db, headerRow, lineRows, ctx);
-    console.log(`  inserted: header=${result.headerInserted}, lines=${result.lineInserted}, dirty_months=${result.dirtyMonths.join(',')}`);
-    totalHeaders += result.headerInserted;
-    totalLines += result.lineInserted;
-    result.dirtyMonths.forEach(m => allDirtyMonths.add(m));
+      if (args.dryRun) {
+        console.log('  [dry-run] DB 投入スキップ');
+        // sample 表示
+        if (lineRows.length > 0) {
+          const sample = lineRows[0];
+          console.log('  sample line:', JSON.stringify({
+            settlement_id: sample.source_settlement_id,
+            posted_jst: sample.posted_datetime_jst,
+            economic_date: sample.economic_date,
+            year_month: sample.year_month_int,
+            tx: sample.transaction_type,
+            sku: sample.seller_sku_normalized,
+            qty: sample.quantity_purchased,
+            price_type: sample.price_type,
+            price_micro: sample.price_amount_micro,
+          }));
+        }
+        continue;
+      }
+
+      const result = ingestSettlement(db, headerRow, lineRows, ctx);
+      console.log(`  inserted: header=${result.headerInserted}, lines=${result.lineInserted}, dirty_months=${result.dirtyMonths.join(',')}`);
+      totalHeaders += result.headerInserted;
+      totalLines += result.lineInserted;
+      result.dirtyMonths.forEach(m => allDirtyMonths.add(m));
+      rec(r.reportId, 'imported', { ...doc, settlementId: headerRow?.source_settlement_id, headerInserted: result.headerInserted, linesInserted: result.lineInserted });
+    } catch (e) {
+      // 今までどおり例外で回ごと止める (FATAL・終了コード 1)。一覧の行に failed を残し、回の completed_at は null のまま
+      rec(r.reportId, 'failed', { importedReportDocumentId: r.reportDocumentId, note: `例外: ${e?.message || e}` });
+      throw e;
+    }
   }
 
-  console.log(`\n[settlements] 完了: headers=${totalHeaders}, lines=${totalLines}, dirty_months=${[...allDirtyMonths].join(',')}`);
+  if (inv?.id) {
+    try { finishInventoryRun(db, inv.id, now()); }
+    catch (e) { inv.recordError = inv.recordError || `回の完了を記録できない: ${e?.message || e}`; console.log(`[inventory] ⚠️ ${inv.recordError}`); }
+  }
+
+  console.log(`\n[settlements] 完了: headers=${totalHeaders}, lines=${totalLines}, dirty_months=${[...allDirtyMonths].join(',')}${inventorySummary(inv, args)}`);
   if (args.dryRun) console.log('[dry-run] 実 DB 変更なし');
+  return { totalHeaders, totalLines, dirtyMonths: [...allDirtyMonths], blocked, inventory: inv };
+}
+
+async function main() {
+  const args = parseArgs();
+  const runId = `settlement-${Date.now()}`;
+  const src = SOURCES[args.source];
+  console.log(`[settlements] run_id=${runId}, dry-run=${args.dryRun}, source=${args.source} (${src.reportType})`);
+
+  await initDB();
+  const db = getDB();
+
+  const { blocked } = await runSettlementFetch(args, { db, sp: getClient(), runId });
   if (blocked.length) {
     console.error(`[settlements] ❌ 取り込まなかった V2 のレポート ${blocked.length} 本: ${JSON.stringify(blocked)}`);
     console.error('[settlements] → apps/warehouse/amazon-settlement-v2.js に規則を足す (V1 の書き方に合わせる。11/11 までは --source v1 でも取れる)。直るまで毎回 終了コード 3');

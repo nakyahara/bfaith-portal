@@ -1492,6 +1492,52 @@ function createTables() {
     processed_at   TEXT
   )`);
 
+  // ---- 決済のレポートの一覧 (inventory) (2026-09-30・D7b-1b の下ごしらえ) ----
+  // 設計 = AI_reference CompanyDB構想/13 §3.1「決済のレポートの一覧を持つ」「一覧の窓が途切れていないことを証明する」
+  // 書き手 = fetch-amazon-settlements.js (amazon-settlement-inventory.js)。今は記録だけ (読み手は後の coverage)。取込む行には関わらない
+  // 日時は全部 UTC の YYYY-MM-DDTHH:MM:SSZ (API の日時が読めないときだけ元の文字のまま)
+  db.exec(`CREATE TABLE IF NOT EXISTS amazon_settlement_report_inventory_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_type         TEXT NOT NULL,
+    marketplace_id      TEXT,
+    query_created_since TEXT NOT NULL,             -- 最初の要求で明示した createdSince (= createdUntil − 85 日)
+    query_created_until TEXT NOT NULL,             -- 最初の要求で明示した createdUntil (= 回の開始の時刻)
+    started_at          TEXT NOT NULL,
+    list_completed_at   TEXT,                      -- 一覧を読み終えた時刻 (一覧の要求が失敗したら null)
+    completed_at        TEXT,                      -- 取込の繰り返しが最後まで回った時刻 (途中で落ちたら null)
+    last_page_reached   INTEGER NOT NULL CHECK (last_page_reached IN (0, 1)),   -- 0 = nextToken が残ったまま上限のページで打ち切った / 一覧の失敗
+    page_count          INTEGER NOT NULL,
+    report_count        INTEGER NOT NULL,
+    snapshot_digest     TEXT,                      -- 行の {report_id, processing_status, created_time, data_start_time, data_end_time, report_document_id} を report ID の UTF-8 の順の正規の JSON の SHA-256
+    list_error          TEXT,
+    coverage_generation INTEGER,                   -- 後の coordinator が入れる (今は null)
+    run_token           TEXT,                      -- 後の coordinator が入れる (今は null)
+    inventory_run_seq   INTEGER NOT NULL UNIQUE,   -- 回の連番 (最新の観測の順 = coverage_generation → inventory_run_seq → last_seen_ordinal)
+    ingest_run_id       TEXT NOT NULL              -- 取込の回の ID (raw_amazon_settlement_*.ingest_run_id と同じ)
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS amazon_settlement_report_inventory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inventory_run_id   INTEGER NOT NULL REFERENCES amazon_settlement_report_inventory_runs(id),
+    report_id          TEXT NOT NULL,
+    report_type        TEXT NOT NULL,
+    processing_status  TEXT,
+    created_time       TEXT,
+    data_start_time    TEXT,                       -- API では任意 = null 可
+    data_end_time      TEXT,
+    report_document_id TEXT,
+    import_result      TEXT NOT NULL DEFAULT 'not_processed'
+      CHECK (import_result IN ('not_processed', 'skipped_not_done', 'skipped_v1', 'imported', 'failed')),
+    import_note        TEXT,                       -- failed の理由など
+    settlement_id      TEXT,                       -- 取込で読めた決済 ID (imported / skipped_v1)
+    source_file_hash   TEXT,                       -- 取込で落としたファイルの SHA-256 (raw の source_file_hash と同じ式)
+    imported_report_document_id TEXT,              -- 取込が実際に落とした文書 ID (取込の一覧は別の要求 = 一覧の行と違うことがある)
+    header_inserted    INTEGER,
+    lines_inserted     INTEGER,
+    last_seen_ordinal  INTEGER NOT NULL,           -- 一覧の並びの 1 始まりの位置 (同じ report ID を 2 回見たら最後の位置)
+    UNIQUE (inventory_run_id, report_id)
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_inventory_report ON amazon_settlement_report_inventory(report_id)`);
+
   // ---- Phase 1 #1-7a: job_locks (concurrency guard)
   // daily-sync / mart rebuild / sync の重複起動防止
   // - acquire 時に expires_at < now() なら takeover 可
