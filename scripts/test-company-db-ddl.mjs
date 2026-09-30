@@ -157,8 +157,8 @@ await ta('[!] 0049 (13 §3.5・§3.6・D7b-3): Amazon の利益の mart = 関数
     ['core.finance_coverage_state', 'plpgsql'],
     ['mart._amazon_easy_ship_alloc', 'sql'], ['mart._amazon_profit_ad_children', 'sql'], ['mart._amazon_profit_ad_days', 'sql'],
     ['mart._amazon_profit_finance_days', 'sql'], ['mart._amazon_profit_rows', 'sql'], ['mart._amazon_profit_totals', 'sql'],
-    ['mart.amazon_account_fee_tax_rate', 'sql'], ['mart.amazon_profit_assert_args', 'plpgsql'], ['mart.amazon_profit_composition_audit_since', 'sql'],
-    ['mart.amazon_profit_daily_range', 'plpgsql'], ['mart.amazon_profit_day_totals_range', 'plpgsql']]);
+    ['mart.amazon_account_fee_tax_rate', 'sql'], ['mart.amazon_profit_args_ok', 'plpgsql'], ['mart.amazon_profit_assert_args', 'plpgsql'], ['mart.amazon_profit_composition_audit_since', 'sql'],
+    ['mart.amazon_profit_daily_range', 'sql'], ['mart.amazon_profit_day_totals_range', 'plpgsql']]);   // 0050: 行の公開の関数は sql (plpgsql の return query の結果の溜めがディスクに溢れる)
   for (const f of ['mart.amazon_profit_daily_range', 'mart.amazon_profit_day_totals_range']) {
     assert.equal(fns.find((r) => r.f === f).a, 'p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date', f);
   }

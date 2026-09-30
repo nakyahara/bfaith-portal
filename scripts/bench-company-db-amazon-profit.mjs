@@ -8,7 +8,8 @@
  *   広告 = 出品ごとに毎日 1 行 (sku) + 50 行に 1 行は ASIN / 監査の記録 = 出品と構成を作ったときの INSERT
  * 手順: 0049 まで流す → データを入れる → 0049 の関数を測る (と結果を控える) → 0050 を流す → 測る → 結果が完全に同じか確かめる (calculated_at を除く全部の列)
  * 使い方: node scripts/bench-company-db-amazon-profit.mjs [--listings 1000] [--days 30] [--runs 3]
- *   --profile [--latest] [--full] [--generic] = 行の本体の SQL を EXPLAIN ANALYZE (--latest = 最新の migration の本体・--generic = 関数の中と同じ generic plan)
+ *   --profile [--latest] [--full] [--generic] [--nestloop on,off] = 行の本体の SQL を EXPLAIN ANALYZE (--latest = 最新の migration の本体・--generic = 関数の中と同じ generic plan)。
+ *     関数の中の設定 (work_mem・enable_nestloop) を当ててから計画する。--nestloop で on / off の両方を比べる (既定 = 関数の設定)
  *   🚨 本番の件数での時間は README の「本番の所要時間を読むだけで測る」(本適用の後に読むだけで)
  */
 import assert from 'node:assert/strict';
@@ -100,29 +101,44 @@ if (process.argv.includes('--profile')) {
   const args = { p_company_id: '1::smallint', p_mall: `'amazon'`, p_scope_key: `'jp'`, p_from: `date '${FROM}'`, p_to: `date '${TO}'` };
   const arr = { p_days: '_amazon_profit_finance_days', p_ad_days: '_amazon_profit_ad_days', p_adc: '_amazon_profit_ad_children', p_es: '_amazon_easy_ship_alloc' };
   const call = `(1::smallint, 'amazon', 'jp', date '${FROM}', date '${TO}')`;
-  let body = src;
+  // 🚨 関数の中の設定 (proconfig = work_mem・enable_nestloop) を本体の SQL にも当てる (#1562 Codex R1 Medium 4)。nestloop は --nestloop on,off で両方を比べる
+  const cfg = Object.fromEntries(((await q(`select p.proconfig from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'mart' and p.proname = '_amazon_profit_rows'`)).rows[0].proconfig || []).map((x) => x.split('=')));
+  const ni = process.argv.indexOf('--nestloop');
+  const nestloops = ni >= 0 ? process.argv[ni + 1].split(',') : [cfg.enable_nestloop || 'on'];
+  const workMem = cfg.work_mem || '4MB';
+  console.log(`  関数の設定: ${JSON.stringify(cfg)} / 比べる nestloop: ${nestloops.join(', ')}`);
+  const setGuc = (nl) => pg.exec(`set work_mem = '${workMem}'; set enable_nestloop = ${nl};`);
+  const time = async (label, sql) => { const s = performance.now(); const n = (await q(`select count(*) as n from (${sql}) z`)).rows[0].n; console.log(`  ${label}: ${((performance.now() - s) / 1000).toFixed(2)} 秒 (${n} 行・DB の中)`); };
+  await time('公開の関数 (関数が自分の設定を当てる)', `select * from mart.amazon_profit_daily_range(1::smallint, 'amazon', 'jp', '${FROM}', '${TO}')`);
   if (process.argv.includes('--generic')) {
-    // 関数の中と同じ = 引数を値でなく parameter のまま計画する (generic plan)
+    // 関数の中と同じ = 引数を値でなく parameter のまま計画する (generic plan)。設定は PREPARE (計画) の前に当てる
+    let gbody = src;
     const names = ['p_company_id', 'p_mall', 'p_scope_key', 'p_from', 'p_to', 'p_days', 'p_ad_days', 'p_adc', 'p_es'];
-    names.forEach((k, i) => { body = body.replace(new RegExp(`\\b${k}\\b`, 'g'), `$${i + 1}`); });
-    await pg.exec(`set plan_cache_mode = force_generic_plan`);
-    await q(`prepare gp(smallint, text, text, date, date, mart.amazon_profit_finance_day[], mart.amazon_profit_ad_day[], mart.amazon_profit_ad_child[], mart.amazon_easy_ship_alloc_row[]) as ${body}`);
+    names.forEach((k, i) => { gbody = gbody.replace(new RegExp(`\\b${k}\\b`, 'g'), `$${i + 1}`); });
     const lits = [];
     for (const fn of Object.values(arr)) lits.push((await q(`select array(select x from mart.${fn}${call} x)::text as t`)).rows[0].t);   // EXECUTE の引数に副問い合わせは書けない = 値の文字で渡す
     const types = ['mart.amazon_profit_finance_day[]', 'mart.amazon_profit_ad_day[]', 'mart.amazon_profit_ad_child[]', 'mart.amazon_easy_ship_alloc_row[]'];
-    const ex = `execute gp(1::smallint, 'amazon', 'jp', date '${FROM}', date '${TO}', ${lits.map((l, i) => `'${l.replace(/'/g, "''")}'::${types[i]}`).join(', ')})`;
-    const plan = (await q(`explain (analyze, costs on, buffers off) ${ex}`)).rows.map((r) => r['QUERY PLAN']);
-    console.log(plan.join('\n'));
+    const ex = `(1::smallint, 'amazon', 'jp', date '${FROM}', date '${TO}', ${lits.map((l, i) => `'${l.replace(/'/g, "''")}'::${types[i]}`).join(', ')})`;
+    await pg.exec(`set plan_cache_mode = force_generic_plan`);
+    for (const nl of nestloops) {
+      await setGuc(nl);
+      await q(`prepare gp_${nl}(smallint, text, text, date, date, mart.amazon_profit_finance_day[], mart.amazon_profit_ad_day[], mart.amazon_profit_ad_child[], mart.amazon_easy_ship_alloc_row[]) as ${gbody}`);
+      const plan = (await q(`explain (analyze, costs on, buffers off) execute gp_${nl}${ex}`)).rows.map((r) => r['QUERY PLAN']);
+      console.log(`--- generic plan・work_mem = ${workMem}・enable_nestloop = ${nl} ---`);
+      console.log(process.argv.includes('--full') ? plan.join('\n') : plan.filter((l) => /Execution|Planning/.test(l)).join('\n'));
+    }
     process.exit(0);
   }
+  let body = src;
   for (const [k, fn] of Object.entries(arr)) body = body.replace(new RegExp(`\\b${k}\\b`, 'g'), `array(select x from mart.${fn}${call} x)`);
   for (const [k, v] of Object.entries(args)) body = body.replace(new RegExp(`\\b${k}\\b`, 'g'), v);
-  const time = async (label, sql) => { const s = performance.now(); const n = (await q(sql)).rows.length; console.log(`  ${label}: ${((performance.now() - s) / 1000).toFixed(2)} 秒 (${n} 行)`); };
-  await time('公開の関数 (plpgsql の包み + 本体)', `select * from mart.amazon_profit_daily_range(1::smallint, 'amazon', 'jp', '${FROM}', '${TO}')`);
-  await time('本体の関数を直に (材料の配列を渡す)', `select * from mart._amazon_profit_rows(1::smallint, 'amazon', 'jp', date '${FROM}', date '${TO}', ${Object.values(arr).map((fn) => `array(select x from mart.${fn}${call} x)`).join(', ')})`);
-  await time('本体の SQL を引数を埋めて', body);
-  const plan = (await q(`explain (analyze, costs off, buffers off) ${body}`)).rows.map((r) => r['QUERY PLAN']);
-  console.log(process.argv.includes('--full') ? plan.join('\n') : plan.filter((l) => /actual time=\d+\.\d+\.\.(\d{3,})/.test(l) || /CTE|Execution/.test(l)).join('\n'));
+  for (const nl of nestloops) {
+    await setGuc(nl);
+    console.log(`--- 本体の SQL を引数を埋めて・work_mem = ${workMem}・enable_nestloop = ${nl} ---`);
+    await time('本体の SQL', body);
+    const plan = (await q(`explain (analyze, costs off, buffers off) ${body}`)).rows.map((r) => r['QUERY PLAN']);
+    console.log(process.argv.includes('--full') ? plan.join('\n') : plan.filter((l) => /actual time=\d+\.\d+\.\.(\d{3,})/.test(l) || /CTE|Execution/.test(l)).join('\n'));
+  }
   process.exit(0);
 }
 

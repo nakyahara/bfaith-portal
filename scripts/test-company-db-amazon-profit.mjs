@@ -200,9 +200,16 @@ await t('🚨 0050 の行の本体・日の合計は 0049 と結果が完全に�
     rows += now[i].rows.length;
   }
   assert.ok(rows > 500, String(rows));
+  // 公開の行の関数の順は、並べ替えを書かなくても 0049 と同じ (0050: 行の本体は並べ替えず、公開の関数だけが order by・#1562 Codex R1 Medium 2)
+  await setCoverage('2026-06-30', 5, 42);
+  const plain = (await pg.query(`select * from mart.amazon_profit_daily_range(1::smallint, 'amazon', 'jp', '2026-06-01', '2026-06-30')`)).rows.map(({ calculated_at, ...rest }) => JSON.stringify(rest));
+  const snap = SNAP_0049.find((x) => x.label === 'daily 2026-06-01〜2026-06-30 coverage=2026-06-30').rows;
+  assert.deepEqual(plain, snap);
+  await setCoverage(null);
   // 0050 の本体はこの関数の中だけ work_mem と nested loop の設定を持つ (幅の広い行がディスクに溢れない・見込み違いの nested loop を選ばない)
   const cfg = (await one(`select array_to_string(p.proconfig, ',') as c from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'mart' and p.proname = '_amazon_profit_rows'`)).c;
-  assert.match(String(cfg), /work_mem=64MB/); assert.match(String(cfg), /enable_nestloop=off/);
+  // 32MB (#1562 Codex R1 Medium 1: 64MB は節ごと = 2 本重なると Render の 1GB に危ない)・generic plan に固定 (PostgreSQL 18 の sql の関数の custom plan は 3 倍遅い)
+  assert.equal(String(cfg), 'work_mem=32MB,enable_nestloop=off,plan_cache_mode=force_generic_plan');
 });
 
 console.log('coverage (決済のそろい) の差し込み口');
@@ -607,7 +614,8 @@ await t('from <= to・行は最大 400 日・日の合計は最大 93 日 (0050�
   for (const fn of ['amazon_profit_daily_range', 'amazon_profit_day_totals_range']) {
     const q = (m, s, f, to) => pg.query(`select count(*) from mart.${fn}(1::smallint, $1, $2, $3::date, $4::date)`, [m, s, f, to]);
     await rejects(() => q('amazon', 'jp', '2026-06-02', '2026-06-01'), /invalid_input: from/);
-    await rejects(() => q('amazon', 'jp', '2026-01-01', '2027-02-05'), /400 日/);
+    // 401 日: 行の関数 = 400 日の文 / 日の合計 = 93 日の文 (93 日の確かめを先に・#1562 Codex R1 Low 2)
+    await rejects(() => q('amazon', 'jp', '2026-01-01', '2027-02-05'), fn === 'amazon_profit_daily_range' ? /400 日/ : /93 日まで.*長い期間は月ごとに呼ぶ/);
     if (fn === 'amazon_profit_daily_range') await q('amazon', 'jp', '2026-01-01', '2027-02-04');
     else {
       await q('amazon', 'jp', '2026-06-01', '2026-09-01');   // 93 日
@@ -690,7 +698,42 @@ await t('🚨 /daily = 関数の行 (ID と ID の配列は 10 進の文字列�
   const src = fs.readFileSync(new URL('../apps/company-db/router.mjs', import.meta.url), 'utf8');
   assert.match(src, /daily: \{ fn: 'mart\.amazon_profit_daily_range'/);
   assert.match(src, /totals: \{ fn: 'mart\.amazon_profit_day_totals_range'/);
-  assert.match(src, /set statement_timeout = '120s'`\);\s+const rows = \(await client\.query\(`select \$\{sel\.list\} from \$\{spec\.fn\}\(1::smallint/);   // 止まらないように時間の上限 (Company DB の読む口の流儀)
+  // 取引の中で advisory lock → 時間の上限 → 関数 (Company DB の読む口の流儀 + 同時に 1 本だけ)
+  assert.match(src, /begin read only`\);[\s\S]{0,200}pg_try_advisory_xact_lock\(\$1::bigint\)[\s\S]{0,400}set local statement_timeout = '120s'`\);\s+rows = \(await client\.query\(`select \$\{sel\.list\} from \$\{spec\.fn\}\(1::smallint/);
+  assert.match(src, /daily: \{ fn: 'mart\.amazon_profit_daily_range', maxDays: 93, order: '' \}/);   // /daily は関数の順のまま (幅の広い行をもう一度並べ替えない)
+});
+await t('🚨 読む口は同時に 1 本だけ (#1562 Codex R1 Medium 1): 1 本目が lock を持っている間の 2 本目 = 503 BUSY (retryable)・1 本目は最後まで返る・終われば次は通る', async () => {
+  // PGlite は 1 つの接続 = 2 つの session の advisory lock を作れない → 接続の包みで lock を持つ / 持たないを作る (lock の SQL・取引の範囲は本物の router のまま)
+  let held = null, release = null, sawLockSql = 0;
+  const gate = new Promise((r) => { release = r; });
+  let n = 0;
+  __setPgClientFactory(async () => {
+    const id = ++n;
+    const base = await factoryOf(pg)();
+    return {
+      query: async (text, params) => {
+        if (/pg_try_advisory_xact_lock/.test(text)) { sawLockSql++; if (held && held !== id) return { rows: [{ ok: false }] }; held = id; return { rows: [{ ok: true }] }; }
+        if (/^(begin read only|commit|rollback)$/.test(text)) { if (text !== 'begin read only' && held === id) held = null; return { rows: [] }; }   // 共有の PGlite に取引を開かない
+        if (/set local statement_timeout/.test(text)) return { rows: [] };
+        if (id === 1 && /from mart\.amazon_profit_daily_range/.test(text)) await gate;   // 1 本目は lock を持ったまま待つ
+        return base.query(text, params);
+      },
+      end: async () => {},
+    };
+  });
+  try {
+    const first = http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-05&to=2026-06-05');
+    for (let i = 0; i < 200 && held !== 1; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(held, 1, '1 本目が lock を持っていない');
+    const second = await http('/amazon-profit/totals?mall=amazon&scope=jp&from=2026-06-05&to=2026-06-05');
+    assert.deepEqual([second.status, second.json.code, second.json.retryable], [503, 'BUSY', true]);
+    release();
+    const r1 = await first;
+    assert.equal(r1.status, 200); assert.ok(r1.json.rows.length > 0);
+    assert.equal(held, null, 'commit で lock を放していない');
+    assert.equal((await http('/amazon-profit/totals?mall=amazon&scope=jp&from=2026-06-05&to=2026-06-05')).status, 200);   // 終われば次は通る
+    assert.equal(sawLockSql, 3);
+  } finally { release(); __setPgClientFactory(factoryOf(pg)); }
 });
 await t('0049 の適用前は 409 not_migrated (関数が無い = 500 にしない)', async () => {
   const pg2 = new PGlite();

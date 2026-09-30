@@ -1367,7 +1367,9 @@ select valid_from, valid_to, cost_jpy, cost_status, cost_basis from mart.v_sku_c
   - `mart.amazon_profit_daily_range(会社, モール, scope, from, to)` = **日 × 出品の寄与の利益** (月の手数料を引く前)。行の鍵 = `listing_id` / `seller_sku_norm` / `listing_resolution` (resolved = 出品あり・seller_sku_norm は null / unresolved = 出品に結びつかない正規化 seller SKU・listing_id は null)。その期間に財務・広告・Easy Ship のどの行も無ければ 0 行
   - `mart.amazon_profit_day_totals_range(会社, モール, scope, from, to)` = `row_kind` = `day` (取引の無い日も 1 行) / `calendar_month` (期間が暦の月をまるごと含む) / `range_month_subtotal` (期間の端の一部だけの月) / `range_total` (重ならない)。`period_from` / `period_to` (両端を含む)・`economic_date_jst` (day だけ)・`month_start` (月の行だけ)
   - 契約 = `from <= to`・行の関数は最大 400 日・**日の合計の関数は最大 93 日** (0050。両端を含む)・**今は amazon / jp だけ** (受け取り時の出品の決め方が shop_code を見ない = Amazon のアカウントが 1 つの間だけ正しい)・違えば例外 (22023 `invalid_input`)。
-    日の合計の長い期間は **月の境で区切って** (93 日以内ずつ) 呼ぶ = `calendar_month` の行はそのまま使える (0049 の 400 日は本番で 1〜9 月が 120 秒で打ち切り)
+    (0049 の日の合計の 400 日は本番で 1〜9 月が 120 秒で打ち切り)。🚨 **長い期間 (年の合計など) の日の合計は、分けて呼んでつなげても作れない**
+    (正式かどうかは期間の全部の日で決まる = 月ごとの結果を足しても期間の合計の正式な値・不完全な日の組にならない)。今は利用者がいないので 93 日のまま。
+    **長い期間の合計は、夜に月ごとの集計表を作る別の設計 (後で・#1562 Codex R1 Medium 3)**。行の関数の長い期間は月ごとに呼ぶ
   - 内部の部品 (直に呼ばない): `mart._amazon_profit_finance_days` (日の決済の状態) / `_amazon_profit_ad_days` (広告の日の状態) / `_amazon_profit_ad_children` (広告の子を今のマスタで結び直す) / `_amazon_easy_ship_alloc` (Easy Ship の割り振り) / `_amazon_profit_rows` / `_amazon_profit_totals`。
     🚨 材料 (日の状態・広告・Easy Ship の割り振り) は **1 回の呼び出しで 1 回だけ** 計算し、型 (`mart.amazon_profit_finance_day` など) の配列で行の本体に渡す = 日の合計も同じ材料を使い回す (Easy Ship の割り振りは期間の外の日も読む = 重い・#1559 Codex R1 Medium 1)
   - `core.finance_coverage_state(会社, モール, scope, source)` (今は全部 null・D7b-1b が差し替える) / `mart.amazon_profit_composition_audit_since()` (0049 の適用の時刻) / `mart.amazon_account_fee_tax_rate(line_kind)` (月の手数料の税の表)
@@ -1404,7 +1406,9 @@ select valid_from, valid_to, cost_jpy, cost_status, cost_basis from mart.v_sku_c
   不完全な日 = `before_ad_incomplete_days` / `after_ad_incomplete_days` / `after_account_fees_incomplete_days` (と数)
 - **読む口 (Render)**: `GET /apps/company-db/sync/amazon-profit/daily?mall=amazon&scope=jp&from&to` / `GET …/amazon-profit/totals?…` (x-sync-key・statement_timeout 120s・0049 の前は 409 `not_migrated`)。
   🚨 設計書 (13 §4) の `/apps/company-db/api/...` ではなく、**Company DB の既存の読む口の流儀** (`/sync` の下 + x-sync-key。例 `/order-finance/daily`) にそろえた (#1559 Codex R1 Medium 4)。
-  **`/daily` も `/totals` も 1 回 93 日まで** (0050。`/daily` = 行が多い = メモリに全部を載せて返す / `/totals` = 中で期間の全部の日の行を作る。長い期間は月の境で区切って何回かに分けて読む。0049 では `/totals` は 400 日までだった)。
+  **`/daily` も `/totals` も 1 回 93 日まで** (0050。`/daily` = 行が多い = メモリに全部を載せて返す / `/totals` = 中で期間の全部の日の行を作る。`/daily` の長い期間は月ごとに読む・`/totals` の長い期間の合計は後の別の設計。0049 では `/totals` は 400 日までだった)。
+  🚨 **同時に 1 本だけ** (0050・#1562 Codex R1 Medium 1): 取引の中で advisory lock (`pg_try_advisory_xact_lock`) を try で取り、ほかの読みが走っていれば **503 `BUSY`** (`retryable: true` = 少し待って再試行してよい・読むだけ)。
+  関数の中の `work_mem` (32MB) は並べ替え・hash の節ごと = 重なると Render の Postgres (1GB) に重いため
   JSON の形: ID と ID の配列は 10 進の文字列 / 円 (`*_jpy`)・個数・件数は数 / **金額の numeric (税抜・広告費・0 と仮定・手数料の後) は小数 2 桁の文字列** (例 `"225.45"`) /
   **`units_*_unrounded` (丸める前の返品数) は小数 最大 6 桁の文字列** (例 `"1.499999"`・返品が無い = `"0"`・単価の無い子 = null) / 日付は YYYY-MM-DD / 時刻は UTC の ISO (ミリ秒)
 - `finance_coverage_generation` / `finance_source_revision` = `core.finance_coverage_state` の値 (D7b-1b まで null)。
@@ -1474,20 +1478,31 @@ Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/c
 - 部品 (9 月): `mart.finance_daily_sku_range` 3.1 秒 / `_amazon_easy_ship_alloc` 0.9 秒 / `_amazon_profit_ad_children` 0.7 秒 / `_amazon_profit_ad_days`・`_amazon_profit_finance_days` 0.1 秒 = 重いのは `_amazon_profit_rows` の本体
 
 0050 で直したこと (**結果は 0049 と完全に同じ** = 試験の「0050 = 0049」と合成のデータの突き合わせ):
-- 守り = `mart.amazon_profit_day_totals_range` と読む口 `/totals` を **最大 93 日** に (1〜9 月の 120 秒の打ち切りを起こさない)
+- 守り = `mart.amazon_profit_day_totals_range` と読む口 `/totals` を **最大 93 日** に (1〜9 月の 120 秒の打ち切りを起こさない)。93 日の確かめを 400 日より先に (401 日以上でも「93 日まで・長い期間は月ごとに呼ぶ」の文)。
+  長い期間の合計は夜に月ごとの集計表を作る別の設計 (後で)
+- 守り = 読む口 `/daily`・`/totals` は **同時に 1 本だけ** (advisory lock・2 本目は 503 `BUSY`・再試行してよい)
 - `mart._amazon_profit_rows` (create or replace・引数と戻りは同じ) = 行ごとの計算を先にまとめてから結ぶ形に:
   - 受け取り時の出品の「集合」を行ごとの副問い合わせ (unnest → array_agg(distinct)・1 行に 2 回) で作るのをやめ、配列を作らない同じ判定に
   - 日の単位の値 (前日の JST 00:00・監査の始まりとの比べ・月末まで決済がそろったか・広告の日の状態) を 1 日 1 行に・出品の単位の値 (コード・構成の数と hash・監査の記録の最大の時刻) を 1 出品 1 行に・日 × 出品の値 (原価・広告費・広告の受け取り時の出品) を 1 つに
   - `cost_input_hash` (JSON の組み立て + SHA-256) を行ごとでなく「採った原価の行の組」ごとに 1 回
-  - 旧い形の版の行の数え方: 今の版 (`amazon_finance_v2`) を先に文字の比較で外してから正規表現
-  - この関数の中だけ `work_mem = 64MB` (幅の広い行の並べ替え・hash がディスクに溢れない) と `enable_nestloop = off` (配列の引数の行の数の見込み違いで CTE を何万回も読み直す nested loop を選ばない保険・0045 と同じ)。
-    🚨 64MB は「溢れていた分だけ実際に使う」= 1 回の呼び出しで数十 MB。同時に何本も流す読む口ではない想定 (Render の Postgres のメモリ 1GB)
-- 合成のデータ (PGlite・`node scripts/bench-company-db-amazon-profit.mjs`・DB の中の時間・中央値): 出品 1,000 × 30 日 (3 万行) = 0049 4.05 秒 → 0050 3.01 秒 (**0.74 倍**)・日の合計も 0.74 倍 /
-  出品 600 × 93 日 (5.6 万行) = 行 0.86 倍・日の合計 0.91 倍。どちらも結果は完全に同じ (calculated_at を除く全部の列)。
+  - 旧い形の版の行の数え方: 今の版 (`amazon_finance_v2`) は正規表現を通さずに外す (`CASE WHEN transform_version = 'amazon_finance_v2' THEN false ELSE …` = 評価の順を決める)
+  - 並べ替えない (約 100 列の幅の広い行の並べ替えをやめた)。順は公開の `mart.amazon_profit_daily_range` だけが決める (日の合計は並べ替え不要)
+  - この関数の中だけ:
+    - `work_mem = 32MB` = 幅の広い行の hash・集計がディスクに溢れにくい。🚨 work_mem は節ごと (hash は hash_mem_multiplier 倍) = 64MB は 2 本重なると Render の 1GB に危ない (#1562 Codex R1 Medium 1) → 32MB + 読む口は同時に 1 本だけ
+    - `enable_nestloop = off` = 配列の引数の行の数の見込み違いで CTE を何万回も読み直す nested loop を選ばない保険 (0045 と同じ)
+    - 🆕 `plan_cache_mode = force_generic_plan` = **PostgreSQL 18 から sql の関数の文も plan cache を使い、最初の数回は引数の値を入れた custom plan になる**。
+      合成のデータ (PGlite = PostgreSQL 18.3) で custom plan は約 9.5 秒・generic plan は約 2.8 秒 (同じ結果) = いつも generic にそろえる (17 以前は害なし)。
+      🚨 本番の Postgres が 18 なら、0049 の遅さの一部はこれかもしれない (本適用の後に `select version()` と時間で確かめる)
+- `mart.amazon_profit_daily_range` (公開の行の関数) を plpgsql → sql に (引数・戻り・順は同じ)。plpgsql の `return query` は結果 (約 100 列 × 行) を一度ためる = work_mem を超えるとディスクに溢れる
+  (合成のデータで 6.3 秒 → 3.4 秒)。引数の確かめは `mart.amazon_profit_args_ok` を where で (行を見ない = 最初に 1 回だけ評価)。順 (`order by 日, 未解決は後, 出品, 正規化 SKU`) はここだけ
+- 合成のデータ (PGlite・`node scripts/bench-company-db-amazon-profit.mjs`・DB の中の時間 = count(*) で包む・中央値): 出品 1,000 × 30 日 (3 万行) = 行 0049 4.02 秒 → 0050 3.02 秒 (**0.75 倍**)・日の合計 4.39 → 3.08 秒 (**0.70 倍**) /
+  出品 600 × 93 日 (5.6 万行) = 行 7.79 → 5.95 秒 (0.76 倍)・日の合計 7.43 → 5.72 秒 (0.77 倍)。どれも結果は完全に同じ (calculated_at を除く全部の列)。
   🚨 PGlite の「ディスク」はメモリの中 = ディスクへの溢れの差は本番のほうが大きく出るはず。本番の時間は本適用の後に上の手順で測る (目標 = 1 か月 5 秒以内・93 日 30 秒以内)。
   残りの時間の内訳 (PGlite・1 か月): `finance_daily_sku_range` 約 1/3 / 広告の子・Easy Ship の割り振り (本体の外の部品) / 本体の結び・集計・行ごとの式 = 突出した 1 か所は無い
-- 本番の関数の中の計画を見たいとき (読むだけ): `node scripts/bench-company-db-amazon-profit.mjs --profile --latest` と同じやり方 = 本体の SQL (`select prosrc from pg_proc where proname = '_amazon_profit_rows'`) の引数を値に置き換えて
-  `begin read only; set local statement_timeout = '120s'; set local work_mem = '64MB'; set local enable_nestloop = off; explain (analyze, buffers) <本体>; rollback;`
+- 本番の関数の中の計画を見たいとき (読むだけ): `node scripts/bench-company-db-amazon-profit.mjs --profile --latest [--generic] --nestloop on,off` と同じやり方 =
+  本体の SQL (`select prosrc from pg_proc where proname = '_amazon_profit_rows'`) の引数を値に置き換え、**関数と同じ設定を当ててから** (nestloop は on / off の両方で比べる):
+  `begin read only; set local statement_timeout = '120s'; set local work_mem = '32MB'; set local enable_nestloop = off; explain (analyze, buffers) <本体>; rollback;`
+  (続けて `set local enable_nestloop = on` でもう 1 回)。関数の中と同じ generic plan を見るときは `set local plan_cache_mode = force_generic_plan` の後に、引数を `$1`〜`$9` にした本体を `prepare` → `explain (analyze, buffers) execute …`
 
 ```
 # 0050 の本適用 (🚨 まだ流さない = 中原さんの指示の後。0049 と同じ手順: 本番で使っていない worktree から)
@@ -1495,7 +1510,7 @@ node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                 #
 node -r dotenv/config scripts\company-db\migrate.mjs                           # 0050 (applied=1)
 ```
 
-試験 = `node scripts/test-company-db-amazon-profit.mjs` (34 件: 0050 = 0049 (coverage の 3 つの状態 × 4 つの期間 × 行と日の合計の全部の列と行の順) / 材料は 1 回だけ計算 (関数の本体を数えて固定) / 受け取り時の出品を集合で比べる (財務・広告) / relink の後は印が付かない (わかる範囲の印の限界を固定) / coverage の関数の世代と版 (合計は source を含めて 1 つのときだけ) / coverage が null なら正式な値は全部 null / 差し替えた後の手で計算した値 (税込・税抜・値引きの税・広告 × 1.1・返品の推定・負の手数料・override_zero と原価不明) / 構成 0 件・候補 2 件・出品なし / 広告の状態 (legacy・missing・not_collected) / 分けられない部品の相殺・旧い形の行・単価の無い返品 / 同じ日に 2 回変わった原価・観測と推定 / hash が JS と一致 / ASIN は未解決・別名は結ぶ・未解決は出品の行だけ止める / Easy Ship (割合・等分・端数・返金・期間に依らない・配れない額・負の重み (0 にする)・全部が非正 (等分)・保存則) / master_notes (受け取りとの違い・監査の記録・タイトルは数えない) / 理由の順と列ごとの null (3 つの coverage で全行) / 日の合計 (列の組ごとの条件・税の表・保存則・row_kind が重ならない・取引の無い日) / 契約 / HTTP (鍵・400・409・ID は文字列))
+試験 = `node scripts/test-company-db-amazon-profit.mjs` (35 件: 0050 = 0049 (coverage の 3 つの状態 × 4 つの期間 × 行と日の合計の全部の列と行の順・公開の関数は並べ替えを書かなくても同じ順) / 読む口は同時に 1 本だけ (2 本目 = 503 BUSY) / 材料は 1 回だけ計算 (関数の本体を数えて固定) / 受け取り時の出品を集合で比べる (財務・広告) / relink の後は印が付かない (わかる範囲の印の限界を固定) / coverage の関数の世代と版 (合計は source を含めて 1 つのときだけ) / coverage が null なら正式な値は全部 null / 差し替えた後の手で計算した値 (税込・税抜・値引きの税・広告 × 1.1・返品の推定・負の手数料・override_zero と原価不明) / 構成 0 件・候補 2 件・出品なし / 広告の状態 (legacy・missing・not_collected) / 分けられない部品の相殺・旧い形の行・単価の無い返品 / 同じ日に 2 回変わった原価・観測と推定 / hash が JS と一致 / ASIN は未解決・別名は結ぶ・未解決は出品の行だけ止める / Easy Ship (割合・等分・端数・返金・期間に依らない・配れない額・負の重み (0 にする)・全部が非正 (等分)・保存則) / master_notes (受け取りとの違い・監査の記録・タイトルは数えない) / 理由の順と列ごとの null (3 つの coverage で全行) / 日の合計 (列の組ごとの条件・税の表・保存則・row_kind が重ならない・取引の無い日) / 契約 / HTTP (鍵・400・409・ID は文字列))
 
 ## 発注の受け皿 (0014。08 §5。D6)
 

@@ -6,7 +6,9 @@
 --   部品 (9 月): finance_daily_sku_range 3.1 秒 / _amazon_easy_ship_alloc 0.9 秒 / _amazon_profit_ad_children 0.7 秒 = 重いのは _amazon_profit_rows の本体
 -- 直すもの (結果は 0049 と完全に同じ = scripts/test-company-db-amazon-profit.mjs と合成のデータの scripts/bench-company-db-amazon-profit.mjs で突き合わせる):
 --   ① mart._amazon_profit_rows (create or replace・引数と戻りは 0049 のまま) = 行ごとの計算を先にまとめてから結ぶ形に
---   ② mart.amazon_profit_day_totals_range の契約を最大 93 日 (両端を含む) に縮める (400 日は 120 秒で打ち切り = 守り)。読む口 /totals も 93 日
+--   ② mart.amazon_profit_day_totals_range の契約を最大 93 日 (両端を含む) に縮める (400 日は 120 秒で打ち切り = 守り)。読む口 /totals も 93 日。
+--      長い期間 (年の合計など) は分けて呼んでつなげても正式な合計にならない = 夜に月ごとの集計表を作る別の設計 (後で。今は利用者がいない)
+--   ③ mart.amazon_profit_daily_range (公開の行の関数・引数と戻りは 0049 のまま) = 結果の順をここだけで決める (行の本体は幅の広い行を並べ替えない)
 -- 🚨 0049 のファイルは直さない (本番に入った)。表・型・ほかの関数は変えない
 -- ─── 行の本体 (日 × 出品・未解決は日 × 正規化 seller SKU) ───
 --   材料 (日の決済の状態・広告の日の状態・広告の子・Easy Ship の割り振り) は呼び手が 1 回だけ計算して配列で渡す (日の合計が同じ材料を使い回す・#1559 Codex R1 Medium 1)
@@ -40,11 +42,16 @@ returns table (
   finance_coverage_generation bigint, finance_source_revision bigint, calculated_at timestamptz)
 language sql stable
 -- 0050: この関数の中だけ
---   ・work_mem 64MB = 幅の広い行 (1 行 約 100 列) の並べ替え・hash の結び・集計がディスクに溢れない (合成のデータ 3 万行で 3〜15MB の溢れが 4 か所・93 日なら 3 倍)。
---     本番の Postgres のメモリ (1GB) に対して、1 回の呼び出しで使うのは実際に要る分だけ (溢れていた分 = 数十 MB)。同時に何本も流さない読む口 (AI・画面) の想定
+--   ・work_mem 32MB = 幅の広い行 (1 行 約 100 列) の hash の結び・集計がディスクに溢れにくい (合成のデータ 3 万行で 3〜15MB の溢れが 4 か所)。
+--     🚨 work_mem は sort / hash の節ごと (hash はさらに hash_mem_multiplier 倍) = 1 回の呼び出しで数倍になりうる。Render の Postgres (1GB) に対して
+--        64MB は 2 本重なると危ない (#1562 Codex R1 Medium 1) → 32MB (PGlite で 64MB とほぼ同じ速さ) + 読む口は同時に 1 本だけ (advisory lock・router.mjs)
 --   ・enable_nestloop off = 材料の配列 (引数) の行の数の見込みが外れて、CTE を何万回も読み直す nested loop を選ばない保険 (0045 と同じ)
-set work_mem = '64MB'
+--   ・plan_cache_mode = force_generic_plan = PostgreSQL 18 から sql の関数の文も plan cache を使い、最初の数回は引数の値 (材料の配列) を入れた custom plan になる。
+--     合成のデータ (PGlite = PostgreSQL 18.3) で custom plan は約 9.5 秒・generic plan は約 2.8 秒 (同じ結果) = いつも generic にそろえる
+--     (PostgreSQL 17 以前は sql の関数の文を引数の値を知らずに計画する = もともと generic と同じ形・この設定は害が無い)
+set work_mem = '32MB'
 set enable_nestloop = off
+set plan_cache_mode = force_generic_plan
 as $$
 with
 days as materialized (select u.* from unnest(p_days) u),
@@ -59,8 +66,8 @@ legacy as materialized (
      and f.economic_date_jst >= p.period_from and (p.period_to is null or f.economic_date_jst < p.period_to)
    where f.line_kind = 'sku' and f.company_id = p_company_id and f.mall = p_mall and f.scope_key = p_scope_key
      and f.economic_date_jst between p_from and p_to
-     -- 0050: 今の送り手の版 (amazon_finance_v2) を先に文字の比較で外す (正規表現は残りの行だけ = 同じ判定)
-     and f.transform_version <> 'amazon_finance_v2' and not core.finance_version_has_class(f.transform_version)
+     -- 0050: 今の送り手の版 (amazon_finance_v2) は正規表現を通さずに外す (同じ判定)。AND の評価の順は保証されない = CASE で順を決める (#1562 Codex R1 Low 1)
+     and case when f.transform_version = 'amazon_finance_v2' then false else not core.finance_version_has_class(f.transform_version) end
    group by 1, 2
 ),
 es as materialized (
@@ -359,7 +366,60 @@ select p_company_id, p_mall, p_scope_key, r3.day,
        r3.coverage_generation, r3.source_revision,   -- core.finance_coverage_state (D7b-1b まで null)
        statement_timestamp()
   from r3
- order by r3.day, r3.lid is null, r3.lid, r3.unorm collate "C"
+  -- 0050: 並べ替えない (約 100 列の幅の広い行の並べ替え = 重い・日の合計には要らない)。順は公開の mart.amazon_profit_daily_range だけが決める (#1562 Codex R1 Medium 2)
+$$;
+
+-- ─── 引数の確かめ (sql の関数の where から呼ぶ形。0049 の mart.amazon_profit_assert_args と同じ確かめ・違えば例外) ───
+create or replace function mart.amazon_profit_args_ok(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date)
+returns boolean language plpgsql stable as $$
+begin
+  perform mart.amazon_profit_assert_args(p_company_id, p_mall, p_scope_key, p_from, p_to);
+  return true;
+end
+$$;
+
+-- ─── 公開の行の関数 (0050: 順はここだけで決める = 行の本体は並べ替えない) ───
+create or replace function mart.amazon_profit_daily_range(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date)
+returns table (
+  company_id smallint, mall text, scope_key text, economic_date_jst date,
+  listing_id bigint, seller_sku_norm text, listing_resolution text, listing_code text,
+  received_listing_ids bigint[], received_listing_unresolved_count integer, ad_received_listing_ids bigint[], ad_received_unresolved_rows integer,
+  units_ordered integer, units_refunded_customer integer, units_marketplace_guarantee integer, units_a_to_z_refund integer, units_net_sold integer,
+  units_refunded_customer_unrounded numeric, units_a_to_z_refund_unrounded numeric,
+  sales_principal_jpy bigint, sales_shipping_jpy bigint, sales_giftwrap_jpy bigint, sales_tax_jpy bigint,
+  commission_jpy bigint, fba_fulfillment_jpy bigint, fba_storage_jpy bigint, closing_fee_jpy bigint,
+  shipping_chargeback_jpy bigint, giftwrap_chargeback_jpy bigint, promotion_jpy bigint, promotion_tax_jpy bigint, points_jpy bigint,
+  warehouse_damage_jpy bigint, warehouse_lost_jpy bigint, safe_t_jpy bigint, refund_principal_jpy bigint, reversal_reimbursement_jpy bigint,
+  misc_fee_jpy bigint, other_fee_jpy bigint, other_amount_jpy bigint,
+  profit_before_cogs_jpy bigint, taxable_sku_fee_cost_jpy bigint, net_jpy bigint, unmapped_jpy bigint,
+  unclassified_component_count integer, unclassified_mapped_jpy bigint, unclassified_abs_jpy bigint, unmapped_component_count integer, finance_legacy_rows integer,
+  source_lines integer, order_rows integer,
+  day_finance_status text, refund_units_status text, refund_incomplete_child_count integer, refund_unestimated_jpy bigint,
+  component_unit_cost_jpy bigint, cogs_jpy bigint, cost_basis text, composition_basis text,
+  missing_cost_sku_ids bigint[], cost_sku_cost_ids bigint[], cost_observed_ids bigint[],
+  ad_status text, ad_cost numeric, ad_rows integer, easy_ship_alloc_jpy bigint,
+  contribution_before_ad_incl_jpy bigint, contribution_before_ad_excl numeric,
+  contribution_after_ad_incl numeric, contribution_after_ad_excl numeric,
+  contribution_before_ad_assuming_incomplete_zero_incl_jpy bigint, contribution_before_ad_assuming_incomplete_zero_excl numeric,
+  contribution_after_ad_assuming_incomplete_zero_incl numeric, contribution_after_ad_assuming_incomplete_zero_excl numeric,
+  profit_incomplete_reasons text[], assumed_zero_reasons text[],
+  master_basis text, master_notes text[], composition_hash text, cost_input_hash text,
+  calculation_version text, observed_generation bigint, composition_audit_since timestamptz, composition_audit_through timestamptz,
+  finance_coverage_generation bigint, finance_source_revision bigint, calculated_at timestamptz)
+-- 0050: plpgsql → sql (引数・戻りは 0049 のまま)。plpgsql の return query は結果 (約 100 列 × 行) を一度ためる = work_mem を超えるとディスクに溢れる
+--   (合成のデータ 3 万行で 6.3 秒 → sql の関数で 3.4 秒)。引数の確かめは where の関数 (行を見ない = 最初に 1 回だけ評価される one-time filter)
+--   work_mem 32MB = 最後の並べ替え (幅の広い行) も溢れにくく (本体と同じ値・読む口は同時に 1 本だけ)
+language sql stable
+set work_mem = '32MB'
+as $$
+  select r.* from mart._amazon_profit_rows(p_company_id, p_mall, p_scope_key, p_from, p_to,
+    array(select d from mart._amazon_profit_finance_days(p_company_id, p_mall, p_scope_key, p_from, p_to) d),
+    array(select a from mart._amazon_profit_ad_days(p_company_id, p_mall, p_scope_key, p_from, p_to) a),
+    array(select c from mart._amazon_profit_ad_children(p_company_id, p_mall, p_scope_key, p_from, p_to) c),
+    array(select e from mart._amazon_easy_ship_alloc(p_company_id, p_mall, p_scope_key, p_from, p_to) e)) r
+   where mart.amazon_profit_args_ok(p_company_id, p_mall, p_scope_key, p_from, p_to)
+   -- 公開の結果の順 (0049 の行の本体の最後の並べ替えと同じ)。ここだけで決める (読む口の /daily はこの順をそのまま返す・#1562 Codex R1 Medium 2)
+   order by r.economic_date_jst, r.listing_id is null, r.listing_id, r.seller_sku_norm collate "C"
 $$;
 
 create or replace function mart.amazon_profit_day_totals_range(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date)
@@ -386,13 +446,22 @@ returns table (
   calculation_version text, finance_coverage_generation bigint, finance_source_revision bigint, calculated_at timestamptz)
 language plpgsql stable as $$
 begin
-  perform mart.amazon_profit_assert_args(p_company_id, p_mall, p_scope_key, p_from, p_to);
   -- 0050: 日の合計は最大 93 日 (両端を含む = to − from <= 92)。本番で 1〜9 月が 120 秒で打ち切り (行の本体を期間の全部の日で作る) = 守り。
-  --   長い期間は月の境で区切って (93 日以内ずつ) 呼ぶ = calendar_month の行はそのまま使える (日・月の行は区切り方に依らない)
+  --   400 日の確かめ (assert_args) より先 = 401 日以上でも 93 日の文が出る (#1562 Codex R1 Low 2。null は下の assert_args が拒む)。
+  --   🚨 長い期間 (年の合計など) は分けて呼んでつなげても正式な合計にならない (正式かどうかは期間の全部の日で決まる) = 今は利用者がいないので 93 日のまま。
+  --      長い期間の合計は、夜に月ごとの集計表を作る別の設計 (後で・#1562 Codex R1 Medium 3)
   if p_to - p_from > 92 then
-    raise exception 'invalid_input: 日の合計は 93 日まで (両端を含む。% 〜 % = % 日)。長い期間は 93 日ずつに区切る', p_from, p_to, p_to - p_from + 1 using errcode = '22023';
+    raise exception 'invalid_input: 日の合計は 93 日まで (両端を含む。% 〜 % = % 日)。長い期間は月ごとに呼ぶ', p_from, p_to, p_to - p_from + 1 using errcode = '22023';
   end if;
+  perform mart.amazon_profit_assert_args(p_company_id, p_mall, p_scope_key, p_from, p_to);
   return query select * from mart._amazon_profit_totals(p_company_id, p_mall, p_scope_key, p_from, p_to);
 end
 $$;
 comment on function mart.amazon_profit_day_totals_range(smallint, text, text, date, date) is 'Amazon の利益の mart (0049・D7b-3・0050 で最大 93 日): 日 / 暦の月 / 期間の中の月の小計 / 期間の合計 (row_kind)。寄与・広告の後・月の手数料を引いた後を列の組ごとの条件で正式にし、不完全な日を返す';
+
+-- ─── 権限 (0049 と同じ形: ロールがあれば付ける) ───
+do $$ begin
+  if exists (select 1 from pg_roles where rolname = 'watcher') then
+    execute 'grant execute on function mart.amazon_profit_args_ok(smallint, text, text, date, date) to watcher';
+  end if;
+end $$;
