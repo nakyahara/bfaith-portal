@@ -538,6 +538,48 @@ await t("'-' で始まる不正な本物の注文番号は疑似注文と取り�
   const r3 = await pushClose(L0, { mode: 'range', from: d(MB, 27), to: d(MB, 27) });
   assert.equal(r3.transformErrors.length, 0); assert.deepEqual(retryStore(L0).list(), []);
 });
+await t('Render から読む (GET) は 408・429・5xx・通信の失敗を読み直し、ほかの 4xx はすぐ止める・回数と締め切りで止まる・読み直しをログに残す (共通部 pipeline.mjs・#1545 Codex R1)', async () => {
+  const { getJson } = await import('../apps/company-db/push/pipeline.mjs');
+  const seq = (list) => { let i = 0; const calls = []; const f = async (url) => { calls.push(url); const x = list[Math.min(i++, list.length - 1)]; if (x instanceof Error) throw x; return new Response(typeof x === 'number' ? '<html>  502\n bad </html>' : JSON.stringify(x), { status: typeof x === 'number' ? x : 200 }); }; f.calls = calls; return f; };
+  let slept = []; const logs = [];
+  const sleep = async (ms) => { slept.push(ms); };
+  const f1 = seq([502, 500, 408, 429, { ok: 1 }]);
+  assert.deepEqual(await getJson(f1, 'u', 'k', 'x', { sleep, log: (m) => logs.push(m) }), { ok: 1 });
+  assert.equal(f1.calls.length, 5); assert.deepEqual(slept, [5000, 10000, 20000, 30000]);
+  assert.equal(logs.length, 4); assert.match(logs[0], /HTTP 502 <html> 502 bad <\/html> → 5 秒後に読み直す \(1\/8\)/);
+  slept = [];
+  const f2 = seq([new TypeError('fetch failed'), { ok: 2 }]);
+  assert.deepEqual(await getJson(f2, 'u', 'k', 'x', { sleep }), { ok: 2 });
+  const f3 = seq([400]);
+  await assert.rejects(getJson(f3, 'u', 'k', 'Render の鍵', { sleep }), /Render の鍵が取れない: HTTP 400/);
+  assert.equal(f3.calls.length, 1);
+  const f4 = seq([502]);
+  await assert.rejects(getJson(f4, 'u', 'k', 'x', { sleep }), /HTTP 502 .*\(8 回読んだ\)/);
+  assert.equal(f4.calls.length, 8);
+  // 締め切り: 残りの時間で次の待ちが入らなければ止まる (工程の上限より前に自分で理由を出す)
+  let t0 = 0; const now = () => t0;
+  const f5 = seq([503]);
+  await assert.rejects(getJson(f5, 'u', 'k', 'x', { sleep: async (ms) => { t0 += ms; }, now, deadline: 20000 }), /\(3 回読んだ\)/);   // 0 秒・5 秒・15 秒に読む → 次の 20 秒待ちは締め切り (20 秒) を越える = 3 回で止まる
+  // 締め切りを過ぎていれば 1 度も読まない (#1545 Codex R2)
+  const f6 = seq([{ ok: 6 }]);
+  await assert.rejects(getJson(f6, 'u', 'k', 'x', { now: () => 1000, deadline: 100 }), /締め切りを過ぎた \(0 回読んだ\)/);
+  assert.equal(f6.calls.length, 0);
+  // 読み直した後の 4xx にも回数
+  await assert.rejects(getJson(seq([502, 400]), 'u', 'k', 'x', { sleep }), /HTTP 400 .*\(2 回読んだ\)/);
+  // 共通の鍵の一覧はページごとに心拍
+  const { fetchAllKeys } = await import('../apps/company-db/push/pipeline.mjs');
+  let pages = 0, beats = 0;
+  const kf = async () => { pages++; return new Response(JSON.stringify({ keys: ['a'], next: pages < 3 ? 'x' : null }), { status: 200 }); };
+  const keys = await fetchAllKeys(kf, { base: 'b', syncKey: 'k', path: '/p', keysOf: (j) => j.keys, onPage: () => { beats++; } });
+  assert.deepEqual([keys.length, beats], [3, 3]);
+});
+await t('送り手の最初の読み取り (Render の状態) も 502 を読み直して進む (共通部 = 伝票・注文の送り手も同じ・#1545 Codex R1 High)', async () => {
+  const L = newLedger();
+  let first = true;
+  const flaky = async (url, init) => { if (first && String(url).includes('/order-finance/status')) { first = false; return new Response('<html>502</html>', { status: 502 }); } return fetch(url, init); };
+  const r = await pushClose(L, { mode: 'range', from: d(MB, 27), to: d(MB, 27), fetchImpl: flaky });
+  assert.equal(first, false); assert.equal(r.ok, true);
+});
 await t('parseArgs: 操作は 1 つ・--from/--to は組・--all は --reconcile と', async () => {
   assert.throws(() => parseArgs([]), /どれか 1 つ/);
   assert.throws(() => parseArgs(['--incremental', '--full']), /どれか 1 つ/);

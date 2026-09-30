@@ -37,7 +37,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { openLedger } from './ledger.mjs';
-import { runPush, fingerprintOf, isDate, jstDate, splitWindows, DEFAULT_CHUNK, MAX_CHUNK, MAX_LINES_PER_ROW, HTTP_TIMEOUT_MS } from './pipeline.mjs';
+import { runPush, fingerprintOf, isDate, jstDate, splitWindows, getJson, DEFAULT_CHUNK, MAX_CHUNK, MAX_LINES_PER_ROW } from './pipeline.mjs';
 import { syncBase } from './ne-shipments.mjs';
 import { writeEvidence } from './evidence.mjs';
 import { orderKey } from '../ingest/orders.mjs';
@@ -253,16 +253,11 @@ export function capacityGuard({ limitBytes, rowBytes, replaceFactor, walAllowanc
 }
 const mb = (b) => `${Math.round(b / 1048576).toLocaleString()} MB`;
 
-async function getJson(fetchImpl, url, syncKey, what) {
-  const res = await fetchImpl(url, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`${what}が取れない: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
-  return res.json();
-}
 /** Render の鍵を全部 (注文番号 → 行数) */
-export async function fetchRenderKeys(fetchImpl, { base, syncKey, mustOwn = () => {} }) {
+export async function fetchRenderKeys(fetchImpl, { base, syncKey, mustOwn = () => {}, getOpts = {} }) {
   const out = new Map(); let after = '';
   for (let i = 0; i < 1000; i++) {
-    const j = await getJson(fetchImpl, `${base}${RENDER_PATHS.keys}&after=${encodeURIComponent(after)}&limit=50000`, syncKey, 'Render の鍵');
+    const j = await getJson(fetchImpl, `${base}${RENDER_PATHS.keys}&after=${encodeURIComponent(after)}&limit=50000`, syncKey, 'Render の鍵', getOpts);
     mustOwn();
     if (!Array.isArray(j.keys) || !Array.isArray(j.lines) || j.keys.length !== j.lines.length) throw new Error('Render の鍵の応答の形が違う');
     j.keys.forEach((k, idx) => out.set(k, Number(j.lines[idx])));
@@ -313,7 +308,7 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
   };
   let guard = null;
   if (!dryRun) {
-    guard = capacityGuard({ ...capacity, fetchStatus: () => getJson(fetchImpl, `${base}${RENDER_PATHS.status}`, syncKey, 'Render の状態 (容量)'),
+    guard = capacityGuard({ ...capacity, fetchStatus: () => getJson(fetchImpl, `${base}${RENDER_PATHS.status}`, syncKey, 'Render の状態 (容量)', { log, sleep: rest.sleep }),
       weightOf: (rows) => rows.reduce((s, x) => s + (weight.get(financeKey(x.mall_order_no)) ?? (x.lines ? x.lines.length : 0)), 0) });
   }
   const stats = {};
@@ -325,7 +320,7 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
     mode, scopeLabel: mode === 'range' ? `計上日 ${from}〜${to} の行を持つ注文` : mode === 'full' ? '全部 (作り直し)' : since ? `ingested_at ${since} 以後` : '全部 (watermark 無し / 変換の版が変わった)',
     chunkSize, dryRun, force, log, now, stats,
     // Render の鍵の一覧 (注文ごとの行数) はどの mode でも取る = --full は Render にだけある鍵・どれも容量の見込みの「消える行」(#1534 Codex R4 High)
-    beforeScan: async ({ mustOwn }) => ({ renderKeys: await fetchRenderKeys(fetchImpl, { base, syncKey, mustOwn }) }),
+    beforeScan: async ({ mustOwn }) => ({ renderKeys: await fetchRenderKeys(fetchImpl, { base, syncKey, mustOwn, getOpts: { log, sleep: rest.sleep } }) }),
     beforeChunk: guard,
     receiptRows: (body) => validateFinanceChunk(body).rows,   // 受け口は行を作り直す (内容の列だけ + 付け足し) = 受領記録の指紋も同じ形で
     // failed / stale の鍵は outbox から消える前に「読み直す鍵」へ (後の chunk で落ちても失わない。#1534 Codex R2 High)
@@ -410,8 +405,11 @@ const monthEnd = (ym) => { const [y, m] = ym.split('-').map(Number); return new 
  * 突き合わせる。all = 全期間 (FINANCE_FLOOR〜今日)。戻り値 = { ok, level: 'ok' | 'warn' | 'error', daily: [差], fees: [差], uncovered, checkedMonths, dailyDiffMonths, feeDiffMonths, streak }
  * 差の月は日次の財務 / 月の手数料のやり残しに登録。未照合の月は、その月をまるごと比べて差が無ければ消す
  */
-export async function reconcileAmazonFinance({ warehouse, ledger, dataDir, base, syncKey, fetchImpl = fetch, all = false, today = jstDate(0), log = console.log, registerPending = true }) {
+export const RECONCILE_BUDGET_MS = 480000;   // 突き合わせ全体の読み取りの締め切り (daily-sync の工程の上限 600 秒より前に、自分で理由を出して止まる)
+export async function reconcileAmazonFinance({ warehouse, ledger, dataDir, base, syncKey, fetchImpl = fetch, all = false, today = jstDate(0), log = console.log, registerPending = true, sleep = undefined, budgetMs = RECONCILE_BUDGET_MS }) {
   if (!base) throw new Error('送り先が決まらない (RENDER_MIRROR_URL / RENDER_PORTAL_URL)');
+  // 読み取りは 5xx などを読み直す (Render の入れ替わりをまたぐ)。全体の締め切りは 1 つ (1 つの読み取りが長引いても工程の上限を越えない)
+  const getOpts = { log, sleep, deadline: Date.now() + budgetMs };
   const unreconciled = readJson(ledger, META.unreconciled, []).filter((m) => /^\d{4}-\d{2}$/.test(m) && m <= today.slice(0, 7));
   const windows = [];   // [from, to, fullMonth | null]
   if (all) { for (const m of monthsBetween(FINANCE_FLOOR.slice(0, 7), today.slice(0, 7))) windows.push([`${m}-01`, m === today.slice(0, 7) ? today : monthEnd(m), m]); }
@@ -423,7 +421,7 @@ export async function reconcileAmazonFinance({ warehouse, ledger, dataDir, base,
   const daily = new Map();   // 日 × SKU の差 (窓が重なっても 1 つ)
   const monthsChecked = new Set();
   for (const [a, b] of windows) {
-    const j = await getJson(fetchImpl, `${base}/order-finance/daily?mall=${FINANCE_MALL}&scope=${FINANCE_SCOPE}&from=${a}&to=${b}`, syncKey, 'Render の日次の財務');
+    const j = await getJson(fetchImpl, `${base}/order-finance/daily?mall=${FINANCE_MALL}&scope=${FINANCE_SCOPE}&from=${a}&to=${b}`, syncKey, 'Render の日次の財務', getOpts);
     if (!Array.isArray(j.rows)) throw new Error('Render の日次の財務の応答に rows が無い');
     for (const d of diffFinanceDaily(readSqliteDaily(warehouse, a, b), j.rows)) daily.set(`${d.date_jst}\u0000${d.seller_sku}`, d);
     for (const m of monthsBetween(a.slice(0, 7), b.slice(0, 7))) monthsChecked.add(m);
@@ -437,13 +435,13 @@ export async function reconcileAmazonFinance({ warehouse, ledger, dataDir, base,
     const parts = [];
     for (const m of months) { const last = parts[parts.length - 1]; if (last && idx(m) - idx(last[0]) < FEE_WINDOW_MONTHS) last.push(m); else parts.push([m]); }
     for (const part of parts) {
-      const j = await getJson(fetchImpl, `${base}/order-finance/account-fees?mall=${FINANCE_MALL}&scope=${FINANCE_SCOPE}&from=${part[0]}-01&to=${monthEnd(part[part.length - 1])}`, syncKey, 'Render の月の手数料');
+      const j = await getJson(fetchImpl, `${base}/order-finance/account-fees?mall=${FINANCE_MALL}&scope=${FINANCE_SCOPE}&from=${part[0]}-01&to=${monthEnd(part[part.length - 1])}`, syncKey, 'Render の月の手数料', getOpts);
       if (!Array.isArray(j.rows)) throw new Error('Render の月の手数料の応答に rows が無い');
       for (const r of j.rows) { const m = String(r.month_start_jst).slice(0, 7); if (part.includes(m)) remote.push({ month: m, fee_type: r.fee_type, amount_jpy: r.amount_jpy, row_count: r.row_count }); }
     }
     fees = diffAccountFees(readSqliteFees(warehouse, months), remote);
   }
-  const unc = await getJson(fetchImpl, `${base}/order-finance/uncovered?mall=${FINANCE_MALL}&scope=${FINANCE_SCOPE}`, syncKey, 'Render の採用されない行');
+  const unc = await getJson(fetchImpl, `${base}/order-finance/uncovered?mall=${FINANCE_MALL}&scope=${FINANCE_SCOPE}`, syncKey, 'Render の採用されない行', getOpts);
   const uncovered = Array.isArray(unc.rows) ? unc.rows.reduce((s, r) => s + Number(r.n || 0), 0) : NaN;
   const dailyDiff = [...daily.values()];
   const dailyDiffMonths = [...new Set(dailyDiff.map((d) => monthOf(d.date_jst)))].sort();
@@ -551,7 +549,8 @@ async function main() {
         if (ledger.countConfirmed() === 0) throw new Error('台帳に送付確認済みが 1 件も無い = バックフィルをまだ流していない');
         if (failed.length || unkeyed.length) throw new Error(`送れなかった鍵 ${failed.length} / 鍵の分からない不正な行 ${unkeyed.length} が残っている = 完了印を付けない (直してから流し直す)`);
       }
-      const rr = await reconcileAmazonFinance({ warehouse, ledger, dataDir, base, syncKey, all: a.all || a.markBackfilled });
+      // 手で流す全期間 (--all・完了印) は月が増えても締め切りに当たらないよう 1 時間 (daily-sync の直近 45 日は既定 480 秒)
+      const rr = await reconcileAmazonFinance({ warehouse, ledger, dataDir, base, syncKey, all: a.all || a.markBackfilled, ...(a.all || a.markBackfilled ? { budgetMs: 3600000 } : {}) });
       console.log(summarizeReconcile(rr, { all: a.all || a.markBackfilled }));
       if (a.markBackfilled) {
         if (!rr.ok) { console.log('❌ 全期間の突き合わせに差がある = 完了印を付けない'); process.exitCode = 1; return; }
