@@ -17,6 +17,7 @@
  */
 import { google } from 'googleapis';
 import { upsertSkuMappings, saveNonFbaSalesSnapshot, replaceDodaiMaster, getDodaiMaster } from './db.js';
+import { isSheetlessRequested, SHEET_SYNC_GONE_MESSAGE } from './sheetless-mode.js';
 
 const SPREADSHEET_ID = process.env.FBA_SPREADSHEET_ID || '1NruozyuL_lwdnk3WqtlRvwpB1frrbqSRVEDN9l6Uh50';
 const SHEET_NAME = '商品コード変換テーブル';
@@ -44,6 +45,8 @@ async function getAuth() {
  * スプレッドシートからSKUマッピングを取得してDBに同期
  */
 export async function syncSkuMappings() {
+  // Sheet なしのモード (⑦-F): Sheet を読みにも行かない (呼び手の 410 / cron の見送りの後ろの歯止め)
+  if (isSheetlessRequested()) throw Object.assign(new Error(SHEET_SYNC_GONE_MESSAGE), { code: 'FBA_SHEETLESS_GONE' });
   console.log('[Sheets] SKUマッピング同期開始...');
 
   const auth = await getAuth();

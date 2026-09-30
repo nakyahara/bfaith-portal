@@ -23,7 +23,8 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          getLastRecommendationRun, saveRecommendationRun, getRecentRecommendationRuns,
          getInboundDailySummary, getInboundMonthlySummary, getInboundShipmentsByDate, getInboundItems,
          getInboundUnreceived, getInboundSyncStatus, getInboundShipmentsWithoutDate,
-         importInboundRows, getInboundSyncCursor } from './db.js';
+         importInboundRows, getInboundSyncCursor, checkSheetlessInputs } from './db.js';
+import { isSheetlessRequested, SHEET_SYNC_GONE_MESSAGE } from './sheetless-mode.js';
 import { parseCsv, decodeCsvBuffer, buildShiftJisCsv } from './picking-csv.js';
 import { parseWarehouseCsv } from './warehouse-csv.js';
 import * as pp from './picking-prep.js';
@@ -146,47 +147,8 @@ initDb().then(() => {
     console.log('[FBA] 非Render環境のため定期同期スケジュールをスキップ');
   } else {
     bootStart('fba-cron', 'fba-sku-sync-cron');
-    cron.schedule('0 6 * * *', async () => {
-      console.log('[FBA-Cron] SKUマッピング定期同期開始...');
-      // dead-man 監視 (jobs-registry: fba-daily-sync)。
-      // 主目的の SKU マッピング同期が成功したかを ok/fail の基準にし、
-      // 後続2つ (best-effort) の結果は note に載せる。
-      let skuOk = false;
-      let inboundOk = false;
-      const notes = [];
-      try {
-        const result = await syncSkuMappings();
-        console.log(`[FBA-Cron] 完了: ${result.total}件 (スナップショット: ${result.snapshots}件)`);
-        skuOk = true;
-        notes.push(`sku=${result.total}`);
-      } catch (e) {
-        console.error('[FBA-Cron] SKUマッピング同期エラー:', e);
-        notes.push(`sku失敗: ${e.message}`);
-      }
-      // 土台商品マスタ(ピッキング準備)も同期。失敗しても他処理に影響させない (best-effort)。
-      try {
-        const dr = await syncDodaiMaster();
-        console.log(`[FBA-Cron] 土台商品マスタ同期完了: ${dr.count}件`);
-        notes.push(`土台=${dr.count}`);
-      } catch (e) {
-        console.error('[FBA-Cron] 土台商品マスタ同期エラー:', e);
-        notes.push(`土台失敗: ${e.message}`);
-      }
-      // 納品実績 (Fulfillment Inbound v0)。独立したスケジュールを増やさず、ここに1ステップとして載せる。
-      try {
-        const ih = await runInboundHistoryDailySync();
-        console.log(`[FBA-Cron] 納品実績同期完了: シップメント${ih.shipments}件 / 明細${ih.items}件${ih.items_failed ? ` / 明細の取得失敗 ${ih.items_failed}件` : ''}`);
-        // miniPC が明細を取れなかったシップメントがあれば、取れた分は引き取ったうえで partial (Codex #1451 R1 Medium 1)
-        inboundOk = !ih.items_failed;
-        notes.push(`納品=${ih.shipments}/${ih.items}${ih.items_failed ? ` 明細失敗${ih.items_failed} (${ih.items_failed_sample.join(' / ')})` : ''}`);
-      } catch (e) {
-        console.error('[FBA-Cron] 納品実績同期エラー:', e);
-        notes.push(`納品失敗: ${e.message}`);
-      }
-      // 影の下書き (その日の提案を Company DB に記録) は 09:40 の自動決定 (decision-job.js) へ移した (2026-09-25 A2b)。
-      //   06:00 は Amazon のレポートがまだ前日のもの (miniPC の朝の取得は 7 時台)
-      pingJob('fba-daily-sync', dailySyncPingStatus({ skuOk, inboundOk }), notes.join(' '));
-    }, { timezone: 'Asia/Tokyo' });
+    // 本体は runFbaDailySync (試験で外の世界を差し替えられるように切り出した。中身・順番・ping は今までどおり)
+    cron.schedule('0 6 * * *', () => runFbaDailySync(), { timezone: 'Asia/Tokyo' });
     console.log('[FBA] 定期同期スケジュール設定: 毎日06:00 JST');
     bootEnd('fba-cron', 'fba-sku-sync-cron', 'cron=0 6 * * * JST');
 
@@ -207,6 +169,67 @@ initDb().then(() => {
   bootFail('fba-db', 'fba-replenishment.db', e);
   console.error('[FBA] DB初期化エラー:', e);
 });
+
+/**
+ * 06:00 の定期同期の本体 (cron から呼ぶ)。dead-man 監視 (jobs-registry: fba-daily-sync)。
+ * 主目的の SKU マッピング同期が成功したかを ok/fail の基準にし、後続2つ (best-effort) の結果は note に載せる。
+ * 🚨 Sheet なしのモード (FBA_SHEETLESS_MODE=1・⑦-F): Sheet の同期の段だけ外す (手の口の 410 と同じ理由)。
+ *    代わりに「Sheet なしの材料」(env・SKU の対応・商品管理リスト) がそろっているかを ok/fail の基準にする。
+ *    土台商品マスタ (別の Sheet)・納品実績は今までどおり続ける
+ * @param {object} [over]  試験用の差し替え (本番は既定のまま)
+ */
+export async function runFbaDailySync(over = {}) {
+  const d = { sheetless: isSheetlessRequested(), syncSkuMappings, syncDodaiMaster, runInboundHistoryDailySync, checkSheetlessInputs, pingJob, ...over };
+  console.log('[FBA-Cron] SKUマッピング定期同期開始...');
+  let skuOk = false;
+  let inboundOk = false;
+  const notes = [];
+  if (d.sheetless) {
+    const chk = d.checkSheetlessInputs();
+    skuOk = chk.ok;
+    if (chk.ok) {
+      console.log(`[FBA-Cron] Sheet なしのモード: Sheet の同期はしない。材料はそろっている (対応 ${chk.mapping_rows} 行 / 他CH ${chk.pml_rows} 件)`);
+      notes.push(`Sheetなし 対応=${chk.mapping_rows} 他CH=${chk.pml_rows}`);
+    } else {
+      console.error('[FBA-Cron] Sheet なしのモード: 材料が欠けている (計算は止まる):', chk.reasons.join(' / '));
+      notes.push(`Sheetなし 材料が欠けている: ${chk.reasons.join(' / ')}`);
+    }
+  } else {
+    try {
+      const result = await d.syncSkuMappings();
+      console.log(`[FBA-Cron] 完了: ${result.total}件 (スナップショット: ${result.snapshots}件)`);
+      skuOk = true;
+      notes.push(`sku=${result.total}`);
+    } catch (e) {
+      console.error('[FBA-Cron] SKUマッピング同期エラー:', e);
+      notes.push(`sku失敗: ${e.message}`);
+    }
+  }
+  // 土台商品マスタ(ピッキング準備)も同期。失敗しても他処理に影響させない (best-effort)。
+  try {
+    const dr = await d.syncDodaiMaster();
+    console.log(`[FBA-Cron] 土台商品マスタ同期完了: ${dr.count}件`);
+    notes.push(`土台=${dr.count}`);
+  } catch (e) {
+    console.error('[FBA-Cron] 土台商品マスタ同期エラー:', e);
+    notes.push(`土台失敗: ${e.message}`);
+  }
+  // 納品実績 (Fulfillment Inbound v0)。独立したスケジュールを増やさず、ここに1ステップとして載せる。
+  try {
+    const ih = await d.runInboundHistoryDailySync();
+    console.log(`[FBA-Cron] 納品実績同期完了: シップメント${ih.shipments}件 / 明細${ih.items}件${ih.items_failed ? ` / 明細の取得失敗 ${ih.items_failed}件` : ''}`);
+    // miniPC が明細を取れなかったシップメントがあれば、取れた分は引き取ったうえで partial (Codex #1451 R1 Medium 1)
+    inboundOk = !ih.items_failed;
+    notes.push(`納品=${ih.shipments}/${ih.items}${ih.items_failed ? ` 明細失敗${ih.items_failed} (${ih.items_failed_sample.join(' / ')})` : ''}`);
+  } catch (e) {
+    console.error('[FBA-Cron] 納品実績同期エラー:', e);
+    notes.push(`納品失敗: ${e.message}`);
+  }
+  // 影の下書き (その日の提案を Company DB に記録) は 09:40 の自動決定 (decision-job.js) へ移した (2026-09-25 A2b)。
+  //   06:00 は Amazon のレポートがまだ前日のもの (miniPC の朝の取得は 7 時台)
+  d.pingJob('fba-daily-sync', dailySyncPingStatus({ skuOk, inboundOk }), notes.join(' '));
+  return { skuOk, inboundOk, notes };
+}
 
 /**
  * 9:40 の自動決定 (影だけ) を 1 回。**失敗しても投げない** (decision-job.js)。
@@ -324,7 +347,9 @@ router.post('/api/fetch-reports', async (req, res) => {
  *   planning_latest_skip_reason?: string|null, planning_latest_error?: string|null, snapshot_date?: string }>}
  */
 export async function syncLatestPlanningFromMiniPC() {
-  const pull = await callMiniPC('/sync/latest-planning', { timeout: 60000 });
+  // Sheet なしのモード (⑦-F): FNSKU は miniPC の fba_sku_attrs からだけ受け取る (sku_mapping の値を使わない)
+  const sheetless = isSheetlessRequested();
+  const pull = await callMiniPC(sheetless ? '/sync/latest-planning?fnsku_source=attrs' : '/sync/latest-planning', { timeout: 60000 });
   if (!pull?.ok) {
     return { ok: false, error: 'ミニPCからの同期データ取得に失敗', detail: pull };
   }
@@ -343,7 +368,12 @@ export async function syncLatestPlanningFromMiniPC() {
 
   const savedRows = savePlanningDataWithHistory(rows, snapshotDate);
   let savedFnskus = 0;
-  if (fnskus.length > 0) {
+  let fnskuSkipReason = null;
+  if (fnskus.length > 0 && sheetless && pull.fnsku_source !== 'fba_sku_attrs') {
+    // 🚨 miniPC が fba_sku_attrs から返したと言っていない (古いコード) = sku_mapping の値かもしれない → 反映しない (前の FNSKU のまま)
+    fnskuSkipReason = `miniPC の FNSKU が fba_sku_attrs からではない (fnsku_source=${pull.fnsku_source ?? 'なし'})。Sheet なしのモードなので反映しない`;
+    console.warn(`[FBA] 同期: ${fnskuSkipReason}`);
+  } else if (fnskus.length > 0) {
     // syncFnskuBatch は null も反映（FNSKUが外された商品を正しく同期）
     syncFnskuBatch(fnskus);
     savedFnskus = fnskus.length;
@@ -396,6 +426,7 @@ export async function syncLatestPlanningFromMiniPC() {
     planning_latest_skip_reason: planningLatestSkipReason,
     planning_latest_error: planningLatestError,
     snapshot_date: snapshotDate,
+    ...(fnskuSkipReason ? { fnsku_skip_reason: fnskuSkipReason } : {}),
   };
 }
 
@@ -469,6 +500,8 @@ router.get('/api/sku-mappings', (req, res) => {
 
 // ===== スプレッドシート同期 =====
 router.post('/api/sync-sku-mappings', async (req, res) => {
+  // Sheet なしのモード (⑦-F): 手の Sheet 同期の口は止める (画面の Step3 はこの文言をログに出す)
+  if (isSheetlessRequested()) return res.status(410).json({ error: SHEET_SYNC_GONE_MESSAGE, sheetless: true });
   try {
     const result = await syncSkuMappings();
     res.json({ success: true, ...result });
@@ -748,6 +781,8 @@ router.get('/api/recommendations', async (req, res) => {
     const debug = req.query.debug === '1' || req.query.debug === 'true';
     const inboundOverride = await getInboundWorkingData();
     const result = generateRecommendations(debug, inboundOverride);
+    // Sheet なしのモードで材料が欠けた = 計算しなかった (⑦-F)。健全性の記録 (前回) は書かずにエラーを返す = 画面は今の一覧のまま
+    if (result.sheetless_blocked) return res.status(503).json({ error: result.errors.join(' / '), sheetless_blocked: true });
     // PR4: norm キーで join (mirror 小文字 vs item 元ケースでも fnsku/除外が取りこぼれない)
     const normSku = (v) => String(v ?? '').trim().toLowerCase();
     // FNSKU情報を付与
@@ -808,6 +843,7 @@ router.get('/api/recommendations/:sku', async (req, res) => {
   try {
     const inboundOverride = await getInboundWorkingData();
     const result = generateRecommendations(true, inboundOverride);
+    if (result.sheetless_blocked) return res.status(503).json({ error: result.errors.join(' / '), sheetless_blocked: true });
     const item = result.items.find(i => i.amazon_sku === req.params.sku);
     if (!item) return res.status(404).json({ error: 'SKUが見つかりません' });
     res.json(item);

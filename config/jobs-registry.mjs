@@ -983,7 +983,9 @@ export const JOBS_REGISTRY = [
     purpose: 'FBA SKUマッピング同期 (Sheets「商品コード変換テーブル」→ sku_mapping + 他CH売上スナップショット)'
       + ' + 土台商品マスタ + 納品実績。'
       + '補充計算の土台なので、止まると計算が古いマッピングのまま静かにズレる。'
-      + '(影の下書きは 2026-09-25 に 09:40 の fba-decision-draft へ移した)',
+      + '(影の下書きは 2026-09-25 に 09:40 の fba-decision-draft へ移した)。'
+      + '🆕 Sheet なしのモード (env FBA_SHEETLESS_MODE=1・マスタ正本切替 ⑦-F・既定は OFF) では Sheet の同期の段だけ外し、'
+      + '「Sheet なしの材料」(env FBA_SKU_MAPPING_SOURCE=mirror・FBA_NONFBA_SOURCE=pml / SKU の対応 mirror_sku_resolved が 1 行以上 / 商品管理リストの snapshot が使える) を確かめる。土台・納品実績は続ける',
     where: 'Render bfaith-portal 内 node-cron (apps/fba-replenishment/router.js)',
     schedule: '毎日 06:00',
     anchor_hour_jst: 6,
@@ -994,7 +996,12 @@ export const JOBS_REGISTRY = [
       + '2026-09-25 まで納品実績の失敗も ok にしていて、miniPC のジョブの応答 { ok, job } の読み違いで 8/5 から一度も引き取れていないのに 7 週間気づかなかった)。'
       + '土台は best-effort で note に出る。納品実績の手動の引き取り = POST /apps/fba-replenishment/api/inbound-history/pull。'
       + 'GOOGLE_SERVICE_ACCOUNT_KEY 未設定/失効、Sheets の共有解除で落ちる。手動実行 = FBA在庫補充画面の同期ボタン。'
-      + '2026-09-24 までの影の下書きの記録は ops.job_runs (job_id=fba-daily-sync) に残っている',
+      + '2026-09-24 までの影の下書きの記録は ops.job_runs (job_id=fba-daily-sync) に残っている。'
+      + '【Sheet なしのモード (FBA_SHEETLESS_MODE=1)】ok の基準 = Sheet なしの材料がそろっている (note「Sheetなし 対応=N 他CH=M」)。'
+      + '欠けていれば fail (note「Sheetなし 材料が欠けている: 理由」= 09:40 の計算も止まる。Sheet には戻らない)。材料がそろい納品実績が失敗なら partial (今までと同じ)。'
+      + '手の Sheet 同期の口 (画面の Step3・POST /api/sync-sku-mappings・miniPC の /service-api/fba/sync-sku-mappings) は 410。'
+      + 'モードを入れる前に scripts/fba-sheetless-backfill-once.mjs を Render と miniPC の fba.db で 1 回ずつ流す (起動時の sku_mapping → fba_sku_attrs を止める印)。'
+      + 'miniPC は ?fnsku_source=attrs に答えるコードを先に配る (古いままだと Render は FNSKU を反映しない)',
   },
   {
     id: 'fba-decision-draft',
@@ -1023,6 +1030,7 @@ export const JOBS_REGISTRY = [
     grace_hours: 3,   // 11:40 の最後の回 + 処理時間 (最大 25 分) まで。09:40 に決められればその時点で ok
     lifecycle: 'permanent',
     runbook: 'Render Logs で「FBA-Decision」を検索。ok = その日の提案を記録した / partial = 11:40 でも入力がそろわず「今日は決められない」を記録 (前日以前の提案は superseded) / fail = 計算の失敗・例外。'
+      + 'Sheet なしのモード (FBA_SHEETLESS_MODE=1) で SKU の対応・商品管理リスト・env が欠けた日も fail (「Sheet なしのモード: 理由」。Sheet の値には戻らない・fba-daily-sync の note と同じ理由)。'
       + '09:40・10:40 で入力がそろわない回は ping せず ops.job_runs (job_id=fba-decision-draft) に「待機 (理由)」を残す。'
       + '理由コード: report_not_this_morning (RESTOCK/PLANNING の元データが今日 05:00 JST より前 = miniPC の daily-sync の Amazon 取得を確認) / '
       + 'report_sync_failed・report_sync_skipped (取り込みの失敗・件数急減ガード) / warehouse_mirror_not_ready (ロジザード毎時取り込み logizard-stock-hourly と写しの転送を確認) / '

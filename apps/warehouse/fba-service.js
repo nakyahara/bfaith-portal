@@ -27,6 +27,7 @@ import {
 } from '../fba-replenishment/inbound-plans.js';
 import { syncInboundHistory } from '../fba-replenishment/inbound-history.js';
 import { syncSkuMappings } from '../fba-replenishment/sheets-sync.js';
+import { isSheetlessRequested, SHEET_SYNC_GONE_MESSAGE } from '../fba-replenishment/sheetless-mode.js';
 import { generateRecommendations } from '../fba-replenishment/calculation-engine.js';
 import { nextInboundCache } from '../fba-replenishment/inbound-state.js';
 
@@ -401,6 +402,8 @@ router.get('/sku-mappings', dbHandler(async (req, res, db) => {
 }));
 
 router.post('/sync-sku-mappings', async (req, res) => {
+  // Sheet なしのモード (⑦-F): 手の Sheet 同期の口は止める
+  if (isSheetlessRequested()) return errorResponse(res, { status: 410, error: 'SHEETLESS_MODE', message: SHEET_SYNC_GONE_MESSAGE, requestId: req.requestId });
   try {
     const result = await syncSkuMappings();
     okResponse(res, { result });
@@ -512,11 +515,15 @@ router.get('/recommendations-inbound-cache', async (req, res) => {
 router.get('/sync/latest-planning', dbHandler(async (req, res, db) => {
   const rows = db.getLatestSnapshots();
   const snapshotDate = rows[0]?.snapshot_date || null;
-  const mappings = db.getSkuMappings();
+  // Sheet なしのモードの Render は ?fnsku_source=attrs で頼む (⑦-F): FNSKU は fba_sku_attrs からだけ返す (sku_mapping の値を渡さない)。
+  //   付いていなければ今までどおり
+  const fromAttrs = req.query?.fnsku_source === 'attrs';
   // 全SKU対象（fnsku=nullも含む）。Render側で現状に合わせてupsert（null時はクリア）
-  const fnskus = mappings
-    .filter(m => m.amazon_sku)
-    .map(m => ({ sku: m.amazon_sku, fnsku: m.fnsku || null }));
+  const fnskus = fromAttrs
+    ? db.getFbaSkuAttrs().filter(a => a.amazon_sku).map(a => ({ sku: a.amazon_sku, fnsku: a.fnsku || null }))
+    : db.getSkuMappings()
+      .filter(m => m.amazon_sku)
+      .map(m => ({ sku: m.amazon_sku, fnsku: m.fnsku || null }));
   // RESTOCK / PLANNING_LATEST も同送 (Render側で saveRestockLatest / savePlanningLatest される)
   const restockRows = typeof db.getRestockLatest === 'function' ? db.getRestockLatest() : [];
   const planningLatestRows = typeof db.getPlanningLatest === 'function' ? db.getPlanningLatest() : [];
@@ -526,6 +533,7 @@ router.get('/sync/latest-planning', dbHandler(async (req, res, db) => {
     fnskus,
     restock_rows: restockRows,
     planning_latest_rows: planningLatestRows,
+    ...(fromAttrs ? { fnsku_source: 'fba_sku_attrs' } : {}),
   };
 }));
 
