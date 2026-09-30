@@ -1303,7 +1303,8 @@ select valid_from, valid_to, cost_jpy, cost_status, cost_basis from mart.v_sku_c
 | `ad_unresolved` | その日に出品に結びつかない広告の行がある | 値 | null | 値 / **値** (ad_spend_days の全額を引く) / 値 |
 
   - `assumed_zero_reasons` = 上から `refund_units_partial_month` を除いたもの (0 と仮定の値で 0 と置いたもの。partial は推定の返品数を使う)
-  - `master_notes` (情報の印・**値を止めない**・固定の順): `pre_audit_unverifiable` (前日の JST 00:00 が `composition_audit_since` = 0049 の適用より前) / `current_after_recorded_change` (前日の JST 00:00 以降にその出品の構成か識別 (INSERT・DELETE・mall・shop_code・listing_code) の監査の記録) / `listing_changed_since_received`。
+  - `master_notes` (情報の印・**値を止めない**・固定の順): `pre_audit_unverifiable` (前日の JST 00:00 が `composition_audit_since` = 0049 の適用より前) / `current_after_recorded_change` (前日の JST 00:00 以降にその出品の構成か識別 (INSERT・DELETE・mall・shop_code・listing_code) の監査の記録) / `listing_changed_since_received` (受け取り時の出品 (保存済みの `listing_id`) と今の結び直しが違う = **わかる範囲の印**。下の「受け取り時の出品」)。
+    どの印も「無い」ことは「変わっていない」の証明ではない。
     `composition_basis` = listing_unresolved → missing → pre_audit_unverifiable → current_after_recorded_change → current_no_recorded_change (前の 2 つだけがゲート)。日 / 月 / 期間は `master_note_counts` (jsonb・鍵は 3 つ)
   - `composition_hash` / `cost_input_hash` = 正規の JSON の SHA-256 (`apps/company-db/canonical-hash.mjs` と同じ規則・ID は 10 進の文字列)
 - **Easy Ship** (D-59) = 注文 × 計上日で正味にしてから同じ注文の SKU の本体売上の割合 (合計 0 以下なら等分) で 1 円単位・端数は小数部の大きい順。**期間に依らない** (本体売上は期間の外の日も含む全部の日)。
@@ -1314,10 +1315,15 @@ select valid_from, valid_to, cost_jpy, cost_status, cost_basis from mart.v_sku_c
 - **読む口 (Render)**: `GET /apps/company-db/sync/amazon-profit/daily?mall=amazon&scope=jp&from&to` / `GET …/amazon-profit/totals?…` (x-sync-key・statement_timeout 120s・0049 の前は 409 `not_migrated`)。
   🚨 設計書 (13 §4) の `/apps/company-db/api/...` ではなく、**Company DB の既存の読む口の流儀** (`/sync` の下 + x-sync-key。例 `/order-finance/daily`) にそろえた (#1559 Codex R1 Medium 4)。
   **`/daily` は 1 回 93 日まで** (行が多い = メモリに全部を載せて返す。長い期間は日の範囲で区切って何回かに分けて読む)・`/totals` は 400 日まで (日 + 月 + 合計だけ)。
-  ID と ID の配列は 10 進の文字列・円と個数は数・numeric は小数 2 桁の文字列・日付は YYYY-MM-DD・時刻は UTC の ISO
-- `finance_coverage_generation` / `finance_source_revision` = `core.finance_coverage_state` の値 (D7b-1b まで null。合計は対象の日で 1 つに決まるときだけ)・`calculation_version = 'amazon_profit_v1'`・`calculated_at` = 1 回の呼び出しで同じ値
+  JSON の形: ID と ID の配列は 10 進の文字列 / 円 (`*_jpy`)・個数・件数は数 / **金額の numeric (税抜・広告費・0 と仮定・手数料の後) は小数 2 桁の文字列** (例 `"225.45"`) /
+  **`units_*_unrounded` (丸める前の返品数) は小数 最大 6 桁の文字列** (例 `"1.499999"`・返品が無い = `"0"`・単価の無い子 = null) / 日付は YYYY-MM-DD / 時刻は UTC の ISO (ミリ秒)
+- `finance_coverage_generation` / `finance_source_revision` = `core.finance_coverage_state` の値 (D7b-1b まで null)。
+  合計は対象の日で **(source・generation・source_revision) の組が 1 つに決まるときだけ** (null の日がある・source が違う = null。#1559 Codex R2 Low 1)・`calculation_version = 'amazon_profit_v1'`・`calculated_at` = 1 回の呼び出しで同じ値
 - **受け取り時の出品** (診断・値を止めない): 財務の `received_listing_ids` / `received_listing_unresolved_count` と広告の `ad_received_listing_ids` / `ad_received_unresolved_rows` (保存済みの `listing_id`)。
-  出品の行は、受け取りの記録があって「今の出品 1 つだけ・受け取り時の未解決 0」と **集合で** 一致しなければ `listing_changed_since_received` (#1559 Codex R1 Medium 2)
+  出品の行は、受け取りの記録があって「今の出品 1 つだけ・受け取り時の未解決 0」と **集合で** 一致しなければ `listing_changed_since_received` (#1559 Codex R1 Medium 2)。
+  🚨 **わかる範囲の印 (best-effort)** (#1559 Codex R2 Medium 1): 広告の保存済みの `listing_id` は **relink (0035 `core.relink_ad_spend_listings`) の後の値**。
+  relink は受け取り時に null だった行を後から埋める = 「受け取り時は未解決 → 別名 (external_ids) を足す → relink」の行は、受け取り時の未解決を区別できない (**印が付かない = 仕様**・試験で固定)。
+  スキーマは変えない (受け取り時の値を別の列に残さない)。印は情報だけ = **正式な利益は止めない** (D-64)
 
 **マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0049 は関数だけ (表・既存の関数に触らない) = Render は旧いコードのままでも困らない (読む口が 409 `not_migrated` になるだけ)
 
@@ -1343,8 +1349,10 @@ select row_kind, period_from, period_to, profit_after_account_fees_assuming_inco
   from mart.amazon_profit_day_totals_range(1::smallint, 'amazon', 'jp', '2026-08-01', '2026-09-30') where row_kind <> 'day';
 ```
 
-**本番の所要時間を読むだけで測る** (本適用の後・#1559 Codex R1 Medium 1。PGlite では測れない)。🚨 読むだけ = `begin read only` の中で・120 秒で打ち切り。daily-sync の 07:00〜09:10 を避ける。
-目安 = どれも 120 秒 (読む口の statement_timeout) より十分短いこと。長ければ次の番号の migration で計画を直す (0045 と同じ流儀)
+**🚨 受け入れの条件 = 本番の所要時間を読むだけで測る** (#1559 Codex R1 Medium 1・R2 Medium 2。PGlite では本番の件数の時間を測れない):
+- **0049 を本適用した直後に**、読むだけで次の 3 つの期間を測る = **1 か月** / **93 日** (`/daily` の上限) / **400 日** (`/totals` の上限)。`begin read only` の中で・120 秒で打ち切り・daily-sync の 07:00〜09:10 を避ける
+- 合格 = どれも 120 秒 (読む口の statement_timeout) より十分短い (目安 = 1 か月 数秒・上限の期間で 60 秒以内)
+- **遅ければ、AI・画面 (読む口の使い手) に使う前に直す** (次の番号の migration で計画を直す = 0045 と同じ流儀)。測るまでは読む口を AI・画面から呼ばない
 
 ```sql
 -- Render の Shell の psql (または miniPC から External URL)。\timing on で時間を出す
@@ -1364,10 +1372,11 @@ rollback;
 # 読む口を通しての時間 (miniPC の PowerShell。鍵は本体の .env の MIRROR_SYNC_KEY を人が入れる)
 $h = @{ 'x-sync-key' = '<MIRROR_SYNC_KEY>' }
 Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/company-db/sync/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-30&to=2026-09-30' | Out-Null }
-Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/company-db/sync/amazon-profit/totals?mall=amazon&scope=jp&from=2026-01-01&to=2026-09-30' | Out-Null }
+Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/company-db/sync/amazon-profit/daily?mall=amazon&scope=jp&from=2026-08-01&to=2026-08-31' | Out-Null }
+Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/company-db/sync/amazon-profit/totals?mall=amazon&scope=jp&from=2026-01-01&to=2027-02-04' | Out-Null }
 ```
 
-試験 = `node scripts/test-company-db-amazon-profit.mjs` (30 件: 材料は 1 回だけ計算 (関数の本体を数えて固定) / 受け取り時の出品を集合で比べる (財務・広告) / coverage の関数の世代と版 / coverage が null なら正式な値は全部 null / 差し替えた後の手で計算した値 (税込・税抜・値引きの税・広告 × 1.1・返品の推定・負の手数料・override_zero と原価不明) / 構成 0 件・候補 2 件・出品なし / 広告の状態 (legacy・missing・not_collected) / 分けられない部品の相殺・旧い形の行・単価の無い返品 / 同じ日に 2 回変わった原価・観測と推定 / hash が JS と一致 / ASIN は未解決・別名は結ぶ・未解決は出品の行だけ止める / Easy Ship (割合・等分・端数・返金・期間に依らない・配れない額) / master_notes (受け取りとの違い・監査の記録・タイトルは数えない) / 理由の順と列ごとの null (3 つの coverage で全行) / 日の合計 (列の組ごとの条件・税の表・保存則・row_kind が重ならない・取引の無い日) / 契約 / HTTP (鍵・400・409・ID は文字列))
+試験 = `node scripts/test-company-db-amazon-profit.mjs` (32 件: 材料は 1 回だけ計算 (関数の本体を数えて固定) / 受け取り時の出品を集合で比べる (財務・広告) / relink の後は印が付かない (わかる範囲の印の限界を固定) / coverage の関数の世代と版 (合計は source を含めて 1 つのときだけ) / coverage が null なら正式な値は全部 null / 差し替えた後の手で計算した値 (税込・税抜・値引きの税・広告 × 1.1・返品の推定・負の手数料・override_zero と原価不明) / 構成 0 件・候補 2 件・出品なし / 広告の状態 (legacy・missing・not_collected) / 分けられない部品の相殺・旧い形の行・単価の無い返品 / 同じ日に 2 回変わった原価・観測と推定 / hash が JS と一致 / ASIN は未解決・別名は結ぶ・未解決は出品の行だけ止める / Easy Ship (割合・等分・端数・返金・期間に依らない・配れない額) / master_notes (受け取りとの違い・監査の記録・タイトルは数えない) / 理由の順と列ごとの null (3 つの coverage で全行) / 日の合計 (列の組ごとの条件・税の表・保存則・row_kind が重ならない・取引の無い日) / 契約 / HTTP (鍵・400・409・ID は文字列))
 
 ## 発注の受け皿 (0014。08 §5。D6)
 

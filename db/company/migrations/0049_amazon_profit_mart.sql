@@ -66,6 +66,9 @@
 --   ・calculated_at = statement_timestamp() (1 回の呼び出しの全部の行・合計で同じ値)。finance_coverage_generation / finance_source_revision = ① から (D7b-1b まで null)
 --   ・受け取り時の出品 (財務の received_listing_ids と広告の ad_received_listing_ids = 保存済みの listing_id) は診断だけ。今の結び直しと **集合で** 比べて違えば
 --     master_notes に listing_changed_since_received (出品の行 = 受け取りの記録があり「今の出品 1 つだけ・未解決 0」と一致しない / 未解決の行 = 受け取り時に出品が決まっていた)
+--     🚨 **わかる範囲の印 (best-effort)** (#1559 Codex R2 Medium 1): 広告の「受け取り時の出品」は relink (0035 core.relink_ad_spend_listings) の **後の保存値**。
+--        relink は受け取り時に null だった listing_id を後から埋める = 「受け取り時は未解決 → 別名を足す → relink」の行は、受け取り時の未解決を区別できない (印が付かない)。
+--        スキーマは変えない (受け取り時の値を別の列に残さない)。印は情報だけ = 正式な利益は止めない (D-64)。印が無いことは「変わっていない」の証明ではない
 -- 🚨 表は作らない (関数だけ)・既存の表・関数には触らない (0043〜0048 の関数はそのまま呼ぶ)。
 
 -- ─── ① 決済のそろい (D7b-1b が **この関数だけ** 差し替える・#1559 Codex R1 Medium 3) ───
@@ -187,6 +190,7 @@ $$;
 -- ─── 広告の子を今のマスタで出品に結び直す (§3.5・R14 H2)。sku の行だけ core.resolve_listing_id・asin / none は常に未解決 (listing_id null) ───
 --   保存済みの core.ad_spend_daily.listing_id (受け取り・relink のときのマスタ) は結び直しに使わない = 診断だけ (#1559 Codex R1 Medium 2):
 --   received_listing_ids = 保存済みの listing_id の集合 (ID の昇順) / received_unresolved_rows = sku の行で保存済みが null の行の数 → 行の listing_changed_since_received
+--   🚨 保存済み = relink (0035) の後の値 = わかる範囲の印 (relink で埋まった行は受け取り時の未解決を区別できない・#1559 Codex R2 Medium 1)
 create or replace function mart._amazon_profit_ad_children(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date)
 returns setof mart.amazon_profit_ad_child
 language sql stable as $$
@@ -534,7 +538,7 @@ select p_company_id, p_mall, p_scope_key, r3.day,
             when r3.n_pre then 'pre_audit_unverifiable' when r3.n_after then 'current_after_recorded_change'
             else 'current_no_recorded_change' end,
        coalesce(r3.missing_ids, '{}'::bigint[]), coalesce(r3.sc_ids, '{}'::bigint[]), coalesce(r3.ob_ids, '{}'::bigint[]),
-       r3.ad_status, r3.ad_cost_v, r3.ad_n, r3.es_cost,
+       r3.ad_status, round(r3.ad_cost_v, 2), r3.ad_n, r3.es_cost,   -- 金額の numeric は小数 2 桁 (広告の行が無い日の 0 も '0.00')
        r3.before_incl,
        case when r3.ok_before then round(r3.before_incl + r3.taxable::numeric / 11 + r3.promotion_tax_jpy, 2) end,
        case when r3.ok_after then round(r3.before_incl - r3.ad_cost_v * 1.1, 2) end,
@@ -671,7 +675,7 @@ adu as (
     from adc group by 1
 ),
 dd as (
-  select d.economic_date_jst as day, d.day_finance_status, d.coverage_generation, d.source_revision, a.ad_status, a.ad_cost_total,
+  select d.economic_date_jst as day, d.day_finance_status, d.policy_source, d.coverage_generation, d.source_revision, a.ad_status, a.ad_cost_total,
          case a.ad_status when 'not_collected' then 5 when 'missing' then 4 when 'legacy_incomplete' then 3 when 'verified_legacy' then 2 else 1 end as ad_rank,
          coalesce(rd.n_res, 0) as n_res, coalesce(rd.n_unres, 0) as n_unres,
          coalesce(rd.units_ordered, 0) as units_ordered, coalesce(rd.units_net_sold, 0) as units_net_sold, coalesce(rd.sales_principal, 0) as sales_principal,
@@ -766,9 +770,14 @@ select g.kind, g.pf, g.pt, g.eday, g.ms, count(*)::int,
        jsonb_build_object('pre_audit_unverifiable', sum(dv.n_pre)::int, 'current_after_recorded_change', sum(dv.n_after)::int,
                           'listing_changed_since_received', sum(dv.n_changed)::int),
        'amazon_profit_v1',
-       -- coverage の世代と版 = 対象の日で 1 つに決まるときだけ (日によって違う・null の日がある = null)
-       case when count(*) = count(dv.coverage_generation) and min(dv.coverage_generation) = max(dv.coverage_generation) then min(dv.coverage_generation) end,
-       case when count(*) = count(dv.source_revision) and min(dv.source_revision) = max(dv.source_revision) then min(dv.source_revision) end,
+       -- coverage の世代と版 = 対象の日で (source・generation・source_revision) の組が 1 つに決まるときだけ
+       --   (日によって違う・null の日がある・source が違えば世代と版が同じ数でも別の coverage = null。#1559 Codex R2 Low 1)
+       case when count(*) = count(dv.policy_source) and count(*) = count(dv.coverage_generation) and count(*) = count(dv.source_revision)
+             and min(dv.policy_source) = max(dv.policy_source) and min(dv.coverage_generation) = max(dv.coverage_generation) and min(dv.source_revision) = max(dv.source_revision)
+            then min(dv.coverage_generation) end,
+       case when count(*) = count(dv.policy_source) and count(*) = count(dv.coverage_generation) and count(*) = count(dv.source_revision)
+             and min(dv.policy_source) = max(dv.policy_source) and min(dv.coverage_generation) = max(dv.coverage_generation) and min(dv.source_revision) = max(dv.source_revision)
+            then min(dv.source_revision) end,
        statement_timestamp()
   from grp g join dv on dv.day between g.pf and g.pt
  group by g.kind, g.pf, g.pt, g.eday, g.ms, g.ord
@@ -813,7 +822,7 @@ begin
     array(select e from mart._amazon_easy_ship_alloc(p_company_id, p_mall, p_scope_key, p_from, p_to) e));
 end
 $$;
-comment on function mart.amazon_profit_daily_range(smallint, text, text, date, date) is 'Amazon の利益の mart (0049・D7b-3): 日 × 出品の寄与の利益 (月の手数料を引く前)。構成と出品の結びつけは計算のときの今のマスタ (master_basis = current)。正式な値は分からないものがあれば null + profit_incomplete_reasons。0 と仮定の値は …_assuming_incomplete_zero_…';
+comment on function mart.amazon_profit_daily_range(smallint, text, text, date, date) is 'Amazon の利益の mart (0049・D7b-3): 日 × 出品の寄与の利益 (月の手数料を引く前)。構成と出品の結びつけは計算のときの今のマスタ (master_basis = current)。正式な値は分からないものがあれば null + profit_incomplete_reasons。0 と仮定の値は …_assuming_incomplete_zero_…。master_notes は情報の印 (値を止めない)。listing_changed_since_received はわかる範囲の印 = 広告の受け取り時の出品は relink (0035) の後の保存値 (relink で埋まった行は受け取り時の未解決を区別できない)';
 
 create or replace function mart.amazon_profit_day_totals_range(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date)
 returns table (

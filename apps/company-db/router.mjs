@@ -368,7 +368,8 @@ router.get('/order-finance/uncovered', requireSyncKey, async (req, res) => {
  *   GET /apps/company-db/sync/amazon-profit/totals?mall=amazon&scope=jp&from&to   mart.amazon_profit_day_totals_range (日 / 暦の月 / 期間の中の月の小計 / 期間の合計 = row_kind)
  *   契約 = from <= to・/daily は 1 回 93 日まで (長い期間は日の範囲で区切る)・/totals は 400 日まで (両端を含む)・今は amazon / jp だけ (400)・statement_timeout 120s・0049 の前は 409 not_migrated
  *   🚨 設計書 (13 §4) の `/apps/company-db/api/...` ではなく、Company DB の既存の読む口の流儀 (/sync の下 + x-sync-key) にそろえた (#1559 Codex R1 Medium 4)
- *   JSON: ID と ID の配列 (listing_id・*_ids・世代・版) = 10 進の文字列 / 円 (*_jpy)・個数・件数 = 数 / numeric (税抜・広告・0 と仮定・手数料の後) = 小数 2 桁の文字列 /
+ *   JSON: ID と ID の配列 (listing_id・*_ids・世代・版) = 10 進の文字列 / 円 (*_jpy)・個数・件数 = 数 /
+ *         金額の numeric (税抜・広告費・0 と仮定・手数料の後) = 小数 2 桁の文字列 / units_*_unrounded (丸める前の返品数) = 小数 最大 6 桁の文字列 (返品なし = "0") /
  *         日付 = YYYY-MM-DD / 時刻 = UTC の ISO (ミリ秒)。列は関数の戻りの定義 (pg_proc) から作る = 関数に列を足しても受け口を直さなくてよい
  *   🚨 決済のそろい (D7b-1b) の前は正式な利益 (contribution_* / profit_after_account_fees_*) は全部 null。0 と仮定の値 (…_assuming_incomplete_zero_…) を「利益」と読まない
  */

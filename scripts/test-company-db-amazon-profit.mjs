@@ -496,6 +496,41 @@ await t('master_note_counts (鍵は 3 つに固定・値は印を持つ行の数
   assert.equal(new Set((await rowsOf('2026-06-01', '2026-06-30')).map((x) => new Date(x.calculated_at).getTime())).size, 1);
 });
 
+await t('🚨 わかる範囲の印の限界 (仕様・#1559 Codex R2 Medium 1): 受け取り時は未解決の広告 → 別名を足す → relink = 保存値が埋まる = 印は付かない・どの段でも正式な利益は止めない', async () => {
+  await adRow('2026-06-20', 'c9', 'sku', 'LA-LATE', '1.00');   // 受け取り時は結びつかない (保存値 null)
+  const r20 = async () => at(await rowsOf('2026-06-20', '2026-06-20'), '2026-06-20', LA);
+  let r = await r20();   // 別名の前 = 今も未解決 = 行を作らない・その日の出品の広告の後は ad_unresolved
+  assert.deepEqual([r.ad_cost, r.profit_incomplete_reasons, r.master_notes.includes('listing_changed_since_received')], ['0.00', ['ad_unresolved'], false]);
+  const alias = N((await one(`insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type) values (1, 'listing', $1, 'amazon', 'seller_sku', 'LA-LATE', 'manual', 'human') returning external_id_row`, [LA])).external_id_row);
+  try {
+    r = await r20();   // relink の前 = 保存値が null のまま = 受け取り時の未解決が見える
+    assert.deepEqual([r.ad_cost, r.ad_received_unresolved_rows, r.master_notes.includes('listing_changed_since_received'), r.contribution_after_ad_incl], ['1.00', 1, true, '398.90']);
+    assert.equal(N((await one(`select core.relink_ad_spend_listings(1::smallint) as n`)).n), 1);
+    r = await r20();   // relink の後 = 保存値が LA に埋まる = 受け取り時の未解決は区別できない = 印は付かない (仕様)
+    assert.deepEqual([r.ad_cost, r.ad_received_listing_ids.map(Number), r.ad_received_unresolved_rows, r.master_notes.includes('listing_changed_since_received'), r.contribution_after_ad_incl],
+      ['1.00', [LA], 0, false, '398.90']);
+  } finally {
+    await pg.query(`delete from core.ad_spend_daily where campaign_id = 'c9'`);
+    await pg.query(`delete from core.external_ids where external_id_row = $1`, [alias]);
+  }
+});
+await t('合計の coverage の世代と版は (source・generation・source_revision) の組が 1 つのときだけ = source が違えば世代と版が同じ数でも null (#1559 Codex R2 Low 1)', async () => {
+  const total = (s) => s.find((x) => x.row_kind === 'range_total');
+  assert.deepEqual([N(total(await totalsOf('2026-06-10', '2026-06-20')).finance_coverage_generation)], [5]);
+  await pg.query(`update core.finance_source_policy set period_to = '2026-06-16' where company_id = 1 and mall = 'amazon' and scope_key = 'jp'`);
+  await pg.query(`insert into core.finance_source_policy (company_id, mall, scope_key, period_from, source) values (1, 'amazon', 'jp', '2026-06-16', 'amazon_settlement_flat_v2')`);
+  try {
+    const s = await totalsOf('2026-06-10', '2026-06-20');   // 6/16〜 は別の source (coverage の関数は同じ世代 5・版 42 を返す)
+    assert.deepEqual([total(s).finance_coverage_generation, total(s).finance_source_revision], [null, null]);
+    assert.deepEqual([N(dayOf(s, '2026-06-12').finance_coverage_generation), N(dayOf(s, '2026-06-18').finance_coverage_generation)], [5, 5]);   // 日の行はその日の source の値
+    const one15 = total(await totalsOf('2026-06-10', '2026-06-15'));   // 1 つの source だけの期間
+    assert.deepEqual([N(one15.finance_coverage_generation), N(one15.finance_source_revision)], [5, 42]);
+  } finally {
+    await pg.query(`delete from core.finance_source_policy where source = 'amazon_settlement_flat_v2' and company_id = 1 and mall = 'amazon' and scope_key = 'jp'`);
+    await pg.query(`update core.finance_source_policy set period_to = null where company_id = 1 and mall = 'amazon' and scope_key = 'jp'`);
+  }
+  assert.equal(N(total(await totalsOf('2026-06-10', '2026-06-20')).finance_coverage_generation), 5);
+});
 await t('🚨 材料は 1 回だけ計算する (#1559 Codex R1 Medium 1): 日の合計の本体は Easy Ship の割り振り・広告・日の状態を 1 回ずつ呼んで行の本体に配列で渡す・行の本体は自分で呼ばない', async () => {
   const src = async (f) => (await one(`select p.prosrc as s from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'mart' and p.proname = $1`, [f])).s;
   const count = (s, name) => (s.match(new RegExp(`mart\\.${name}\\(`, 'g')) || []).length;
@@ -571,6 +606,14 @@ await t('🚨 /daily = 関数の行 (ID と ID の配列は 10 進の文字列�
   assert.deepEqual([la.received_listing_ids, la.ad_received_listing_ids, la.cost_sku_cost_ids, la.missing_cost_sku_ids, la.observed_generation, la.finance_coverage_generation, la.finance_source_revision, la.profit_incomplete_reasons, la.master_basis],
     [[String(LA)], [String(LA)], [String(C_S1)], [], '7', '5', '42', [], 'current']);
   assert.deepEqual([la.units_marketplace_guarantee, la.units_refunded_customer_unrounded], [0, '0']);
+  // 形の説明 (README・router の注釈) = 実際の出力 (#1559 Codex R2 Low 2): 金額の numeric は小数 2 桁の文字列・units_*_unrounded は最大 6 桁の文字列
+  const money = ['ad_cost', 'contribution_before_ad_excl', 'contribution_after_ad_incl', 'contribution_after_ad_excl', 'contribution_before_ad_assuming_incomplete_zero_excl',
+    'contribution_after_ad_assuming_incomplete_zero_incl', 'contribution_after_ad_assuming_incomplete_zero_excl'];
+  for (const x of r.json.rows) {
+    for (const c of money) assert.ok(x[c] === null || /^-?\d+\.\d{2}$/.test(x[c]), `${c} = ${JSON.stringify(x[c])}`);
+    for (const c of ['units_refunded_customer_unrounded', 'units_a_to_z_refund_unrounded']) assert.ok(x[c] === null || /^-?\d+(\.\d{1,6})?$/.test(x[c]), `${c} = ${JSON.stringify(x[c])}`);
+  }
+  assert.ok(r.json.rows.some((x) => x.units_refunded_customer_unrounded === '1.000000'));
   assert.match(la.calculated_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
   const le = r.json.rows.find((x) => x.seller_sku_norm === 'le');
   assert.deepEqual([le.listing_id, le.listing_resolution], [null, 'unresolved']);
