@@ -20,7 +20,7 @@
  */
 import crypto from 'node:crypto';
 import { classifyAccountFee, classifySkuAccountFee, NOT_ACCOUNT_FEE } from '../../warehouse/amazon-account-fee-rules.js';
-import { validateFinanceRows, orderFinanceChecksum, pseudoOrderNo, AMOUNT_COLUMNS, SUB_COLUMNS, CONTENT_COLUMNS, CLASS_COLUMNS, ACCOUNT_FEE_KINDS, UNCLASSIFIED_SKU_COLUMNS }
+import { validateFinanceRows, orderFinanceChecksum, financeRowsFormat, assertVersionForm, pseudoOrderNo, AMOUNT_COLUMNS, SUB_COLUMNS, CONTENT_COLUMNS, CLASS_COLUMNS, ACCOUNT_FEE_KINDS, UNCLASSIFIED_SKU_COLUMNS }
   from '../finance/order-finance-checksum.mjs';
 
 // 🚨 v2 (2026-09-30 D7b-1a) = 行に「分けられない部品」の 4 列 (0047) を足した = 全部の注文の payload が変わる → 全部を送り直す (マージの後に --full・約 51 万注文)
@@ -266,6 +266,7 @@ export function aggregateOrderFinance(orderNo, rawRows) {
 
 /** 送る形 (受け口 ingest/order-finance.mjs の 1 要素)。lines = aggregateOrderFinance の lines (空 = 注文の行が全部消えた) */
 export function financePayload(orderNo, lines, transformVersion = AMAZON_FINANCE_TRANSFORM_VERSION) {
+  assertVersionForm(transformVersion, financeRowsFormat(lines));   // 版と行の形 (今の形 = amazon_finance_v2 以上。受け口も同じ検査で 400)
   const setChecksum = orderFinanceChecksum(lines);
   return { mall: FINANCE_MALL, scope_key: FINANCE_SCOPE, mall_order_no: orderNo, header: { transform_version: transformVersion, set_checksum: setChecksum, content_hash: setChecksum }, lines };
 }

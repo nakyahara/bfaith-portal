@@ -7,7 +7,7 @@
  */
 import { ingestChunk, validateChunkBody, bad } from './chunk.mjs';
 import { MALLS, SCOPE_RE, orderKey } from './orders.mjs';
-import { validateFinanceRows, orderFinanceChecksum, financeRowsFormat, isPseudoOrderNo, CLASS_COLUMNS } from '../finance/order-finance-checksum.mjs';
+import { validateFinanceRows, orderFinanceChecksum, financeRowsFormat, assertVersionForm, versionHasClass, isPseudoOrderNo, CLASS_COLUMNS } from '../finance/order-finance-checksum.mjs';
 
 export const FINANCE_MALLS = MALLS.filter((m) => m !== 'other');   // 0043 の mall の CHECK
 // 本物の注文番号 / 疑似注文 '-:YYYY-MM-DD'。🚨 返送 (RemovalComplete / FBA Removal Order) の注文番号は + / を含む (例 '+3gubNop3S'・'a+aKPxfQ/X'。
@@ -25,7 +25,7 @@ export function validateFinanceChunk(body) {
     if (mall == null) { mall = r.mall; scope = r.scope_key; }
     else if (r.mall !== mall || r.scope_key !== scope) throw bad(`rows[${i}]: one chunk must hold one mall / scope (${mall}/${scope})`);
     let content, format;
-    try { format = financeRowsFormat(r.lines); content = validateFinanceRows(no, r.lines); } catch (e) { throw bad(`rows[${i}] (${no}): ${e.message}`); }
+    try { format = financeRowsFormat(r.lines); assertVersionForm(r.header.transform_version, format); content = validateFinanceRows(no, r.lines); } catch (e) { throw bad(`rows[${i}] (${no}): ${e.message}`); }
     // 🚨 古い送り手 (0047 の前の版 = 4 列の鍵が無い) の行 = 指紋は旧い形の列で計算し (送り手の申告と合わせる)、正規化した行からも 4 列を外す
     //    (送り手の受領記録の指紋 (receiptRows = この関数の戻り) と Render の指紋を、古い送り手と新しい受け口の組でも同じにする =
     //     「Render が復元された」と誤って台帳を空にしない)。保存するときは 0047 の apply が 4 列を 0 にする (既存の行と同じ)
@@ -59,8 +59,21 @@ export async function ingestOrderFinanceChunk(db, { companyId = 1, mall, scope, 
   if (!FINANCE_MALLS.includes(m) || !s) throw bad('mall / scope are required for an order finance chunk');
   // 🚨 新しい形 (4 列あり) の行を 0047 の前の apply に渡すと 4 列が黙って落ち、受領記録の指紋には入る (= 送り直しても 'same' で直らない) →
   //    0047 の適用前は受けない (409 NOT_MIGRATED = 送り手の回は ❌・次の回に送り直す)。古い形の行はそのまま受ける
-  if (opts.rows.some((x) => x.lines.length && CLASS_COLUMNS.every((c) => Object.hasOwn(x.lines[0], c))) && !(await classColumnsReady(db))) {
+  if ((versionHasClass(transformVersion) || opts.rows.some((x) => x.lines.length && CLASS_COLUMNS.every((c) => Object.hasOwn(x.lines[0], c)))) && !(await classColumnsReady(db))) {
     throw Object.assign(new Error('not_migrated: migration 0047 (core.order_finance_daily の分けられない部品の 4 列) is not applied'), { code: 'NOT_MIGRATED' });
+  }
+  // 🚨 旧い形の版への戻し (downgrade) を拒む (#1554 Codex R1 High): 受領記録が今の形の版 (amazon_finance_v2 以上) の注文を、旧い版の chunk で置き換えると
+  //    4 列が 0 に戻り、分けられない部品の数が黙って消える (正式な利益が fail-open)。chunk ごと 409 (送り手は ❌)。
+  //    0047 の apply も同じ規則で例外にする (同時の書き込みの保険)。墓石 (空の集合) も旧い版なら拒む (受領記録の版を戻さない)
+  if (!versionHasClass(transformVersion) && opts.rows.length) {
+    const nos = opts.rows.map((x) => x.mall_order_no);
+    const cur = (await db.query(`select mall_order_no, transform_version from core.order_finance_receipts
+       where company_id = $1 and mall = $2 and scope_key = $3 and mall_order_no = any($4::text[])`, [companyId, m, s, nos])).rows;
+    const down = cur.filter((x) => versionHasClass(x.transform_version));
+    if (down.length) {
+      throw Object.assign(new Error(`downgrade: ${down.length} order(s) were received with ${down[0].transform_version} (e.g. ${down[0].mall_order_no}); `
+        + `transform_version ${transformVersion} would drop the unclassified component counts (do not go back to the old sender)`), { code: 'DOWNGRADE' });
+    }
   }
   return ingestChunk(db, {
     ...opts, transformVersion,

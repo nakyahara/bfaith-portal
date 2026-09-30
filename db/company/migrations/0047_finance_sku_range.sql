@@ -15,7 +15,9 @@
 --       → ③ unknown の行 (unknown_line_mapped) → ④ どれにも消費されなかった部品 = 「分けられない」→ ⑤ unmapped_jpy
 --       SKU の行で分けられない = misc_fee / other_fee / other_amount の列に入った部品 (D-63 で分けるまで)。
 --       月の手数料の行で分けられない = 手数料の材料以外の部品 (price・promotion・misc_fee・other_fee)
--- ② core.apply_order_finance_batch を 4 列も入れるように (引数・戻り値・規則は 0043 のまま)
+--    CHECK は NOT VALID (既存の行の検査は 0048 = 読み書きを止めない lock。#1554 Codex R1 Medium)
+-- ② core.apply_order_finance_batch を 4 列も入れるように (引数・戻り値は 0043 のまま)。
+--    + 版と行の形を結び付ける (core.finance_version_has_class = amazon_finance_v2 以上 ⇔ 4 列あり) + 今の形の版の注文を旧い版で置き換えない (downgrade。#1554 Codex R1 High)
 -- ③ mart.finance_daily_sku_range(会社, モール, scope, from, to) = 日 × 正規化 seller SKU (core.norm_code) の子の粒度 (§3.2・R13 H1)
 --    D7b-3 の利益の関数が計算のときに今のマスタで出品に結び直してまとめる材料。今の mart.finance_daily_range (0045) は画面・突き合わせのため残し、戻りの型は変えない (R20 M4)
 --    金額の式は 0045 と同じ。違いは次だけ:
@@ -35,12 +37,21 @@ alter table core.order_finance_daily
   add column unmapped_component_count     integer not null default 0;
 -- 数と額の形 (既存の行 = 全部 0 で満たす)。「0 でない部品があれば数 > 0」は送り手と受け口の形の確かめ (order-finance-checksum.mjs) が見る
 --   (unmapped_jpy <> 0 なら数 > 0 は既存の行 (数 = 0) が満たさないので表の CHECK にしない = 送り直すまでの行の 'same' の更新で落とさない)
+--   🚨 NOT VALID で足す (#1554 Codex R1 Medium): 既存の 59 万行の検査を ACCESS EXCLUSIVE のまま migration の commit まで続けない。
+--      新しく入る・変わる行には NOT VALID でも効く。既存の行の検査 (VALIDATE CONSTRAINT = 読み書きを止めない lock) は 0048
 alter table core.order_finance_daily
   add constraint ck_order_finance_daily_unclassified check (
     unclassified_component_count >= 0 and unclassified_abs_jpy >= 0
     and abs(unclassified_mapped_jpy) <= unclassified_abs_jpy
-    and (unclassified_component_count = 0) = (unclassified_abs_jpy = 0)),
-  add constraint ck_order_finance_daily_unmapped_count check (unmapped_component_count >= 0);
+    and (unclassified_component_count = 0) = (unclassified_abs_jpy = 0)) not valid,
+  add constraint ck_order_finance_daily_unmapped_count check (unmapped_component_count >= 0) not valid;
+
+-- ─── 版と行の形 (#1554 Codex R1 High)。JS の versionHasClass (apps/company-db/finance/order-finance-checksum.mjs) と同じ規則 ───
+--   今の形の版 = amazon_finance_v2 以上 (後ろに _名前 が付いても同じ)。今の形の版の行は 4 列が必須 (null 不可)・旧い版の行は 4 列を持たない
+--   受領記録が今の形の版の注文を旧い版で置き換えない (downgrade = 4 列が 0 に戻って分けられない部品の数が消える)
+create or replace function core.finance_version_has_class(p text) returns boolean language sql immutable as $$
+  select coalesce(p ~ '^amazon_finance_v[0-9]+(_[0-9A-Za-z_]+)?$' and substring(p from '^amazon_finance_v([0-9]+)')::numeric >= 2, false)
+$$;
 
 -- ─── ② apply = 0043 と同じ + 4 列 ───
 create or replace function core.apply_order_finance_batch(
@@ -63,12 +74,27 @@ begin
   if exists (select 1 from jsonb_array_elements(p_rows) r where r ? 'currency' and r ->> 'currency' <> 'JPY') then
     raise exception 'p_rows contains a non-JPY currency (only JPY is accepted)';
   end if;
+  -- 0047: 版と行の形 (今の形の版 ⇔ 4 列が全部あって null でない。空の集合はどちらでもよい)
+  if core.finance_version_has_class(p_transform_version) then
+    if exists (select 1 from jsonb_array_elements(p_rows) r
+                where jsonb_typeof(r -> 'unclassified_component_count') is distinct from 'number' or jsonb_typeof(r -> 'unclassified_mapped_jpy') is distinct from 'number'
+                   or jsonb_typeof(r -> 'unclassified_abs_jpy') is distinct from 'number' or jsonb_typeof(r -> 'unmapped_component_count') is distinct from 'number') then
+      raise exception 'version_form: transform_version % needs the 4 unclassified columns (numbers) on every row', p_transform_version using errcode = '22023';
+    end if;
+  elsif exists (select 1 from jsonb_array_elements(p_rows) r
+                 where r ?| array['unclassified_component_count', 'unclassified_mapped_jpy', 'unclassified_abs_jpy', 'unmapped_component_count']) then
+    raise exception 'version_form: transform_version % is an old version but the rows carry the unclassified columns', p_transform_version using errcode = '22023';
+  end if;
   insert into core.order_finance_receipts (company_id, mall, scope_key, mall_order_no, received_batch_seq, set_checksum, lines, transform_version)
   values (p_company_id, p_mall, p_scope_key, p_mall_order_no, 0, '', 0, p_transform_version)
   on conflict (company_id, mall, scope_key, mall_order_no) do nothing;
   select * into rec from core.order_finance_receipts
    where company_id = p_company_id and mall = p_mall and scope_key = p_scope_key and mall_order_no = p_mall_order_no for update;
   if p_batch_seq < rec.received_batch_seq then return 'stale'; end if;
+  -- 0047: 今の形の版の注文を旧い版で置き換えない (downgrade = 4 列が 0 に戻る。受け口の JS も chunk ごと 409 にする)
+  if rec.received_batch_seq > 0 and core.finance_version_has_class(rec.transform_version) and not core.finance_version_has_class(p_transform_version) then
+    raise exception 'downgrade: order % was received with % and must not be replaced by %', p_mall_order_no, rec.transform_version, p_transform_version using errcode = '22023';
+  end if;
   if rec.received_batch_seq > 0 and rec.set_checksum = p_set_checksum and rec.transform_version is not distinct from p_transform_version then
     if p_batch_seq > rec.received_batch_seq then
       update core.order_finance_receipts set received_batch_seq = p_batch_seq

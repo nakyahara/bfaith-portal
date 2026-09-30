@@ -31,6 +31,17 @@ export const INT_COLUMNS = [...LEGACY_INT_COLUMNS, ...CLASS_COLUMNS];
 export const KEY_COLUMNS = ['economic_date_jst', 'seller_sku', 'line_kind', 'source'];
 export const LEGACY_CONTENT_COLUMNS = [...KEY_COLUMNS, ...LEGACY_INT_COLUMNS];   // 旧い形の指紋の列 (0043〜0046 の取り決め・変えない)
 export const CONTENT_COLUMNS = [...KEY_COLUMNS, ...INT_COLUMNS];                 // 今の形の指紋の列 (旧い形の後ろに 4 列)
+/**
+ * 変換の版と行の形を結び付ける (#1554 Codex R1 High)。「今の形の版」= amazon_finance_v2 以上 (後ろに _名前 が付いても同じ)。
+ *   今の形の版 ⇔ 行が今の形 (4 列あり・null でない)。空の集合 (墓石) はどちらの版でもよい。
+ *   受領記録が一度 今の形の版になった注文は、旧い形の版では置き換えない (409 DOWNGRADE。旧いコードに戻した送り手が 4 列を 0 に戻して正式な利益を fail-open にしない)
+ *   🚨 SQL の core.finance_version_has_class (0047) と同じ規則 (試験で突き合わせる)
+ */
+export const CLASS_VERSION_RE = /^amazon_finance_v([0-9]+)(?:_[0-9A-Za-z_]+)?$/;
+export function versionHasClass(v) {
+  const m = typeof v === 'string' ? CLASS_VERSION_RE.exec(v) : null;
+  return !!m && Number(m[1]) >= 2;
+}
 // SKU の行で「分けられない」金額が入る列 (§3.7 の表・D-63 で分けるまで)。SKU の行ではこの 3 列の和 = unclassified_mapped_jpy
 export const UNCLASSIFIED_SKU_COLUMNS = ['misc_fee_jpy', 'other_fee_jpy', 'other_amount_jpy'];
 export const LINE_KINDS = ['sku', 'storage', 'long_term_storage', 'removal', 'inbound_defect', 'low_inventory', 'subscription', 'easy_ship', 'other_account_fee', 'not_account_fee', 'unknown'];
@@ -61,6 +72,14 @@ export function financeRowsFormat(rows) {
   return withAll ? 'v2' : 'legacy';
 }
 
+/** 版と行の形の組を確かめる (throw)。format = financeRowsFormat の戻り */
+export function assertVersionForm(transformVersion, format) {
+  if (format === 'empty') return;
+  const cls = versionHasClass(transformVersion);
+  if (cls && format !== 'v2') throw new Error(`transform_version ${transformVersion} needs ${CLASS_COLUMNS.join(' / ')} on every row`);
+  if (!cls && format === 'v2') throw new Error(`transform_version ${transformVersion} is an old version but the rows carry ${CLASS_COLUMNS.join(' / ')} (use amazon_finance_v2 or later)`);
+}
+
 /**
  * 1 注文の行の集合を確かめる (throw = 整形できない = その注文はまるごと送らない / 受け口は 400 か failed)。
  * 戻り値 = 正規化した行の配列 (CONTENT_COLUMNS の値だけ・無い整数列は 0 = 旧い形の行の 4 列も 0)
@@ -83,6 +102,8 @@ export function validateFinanceRows(mallOrderNo, rows) {
     if (!LINE_KINDS.includes(r.line_kind)) throw new Error(`rows[${i}].line_kind is not known: ${r.line_kind}`);
     if ((r.seller_sku === '-') !== (r.line_kind !== 'sku')) throw new Error(`rows[${i}]: seller_sku '-' iff line_kind is a fee kind`);
     if (!SOURCES.includes(r.source)) throw new Error(`rows[${i}].source is not known: ${r.source}`);
+    // 今の形の 4 列は null を 0 と読まない (欠けた値を 0 にして分けられない部品を消さない。#1554 Codex R1 High)
+    if (v2) for (const c of CLASS_COLUMNS) if (r[c] === null) throw new Error(`rows[${i}].${c} must not be null`);
     const out = { economic_date_jst: r.economic_date_jst, seller_sku: r.seller_sku, line_kind: r.line_kind, source: r.source };
     for (const c of INT_COLUMNS) {
       const v = r[c] ?? 0;

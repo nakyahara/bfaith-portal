@@ -282,8 +282,8 @@ router.post('/order-finance', requireSyncKey, shipmentsJson, shipmentsParserErro
     const r = await ingestOrderFinanceChunk(pgAdapter(client), { ...chunk, host: 'render', log: (m) => console.log(`[company-db order-finance ${chunk.mall}] ${chunk.runId} ${m}`) });
     res.json(r);
   } catch (e) {
-    // NOT_MIGRATED = 新しい形 (分けられない部品の 4 列) の行が 0047 の適用前に届いた (ingest/order-finance.mjs)
-    const status = e.code === 'CHUNK_DEADLINE' ? 503 : (e.code === 'RUN_MISMATCH' || e.code === 'CHUNK_MISMATCH' || e.code === 'RUN_CLOSED' || e.code === 'NOT_MIGRATED') ? 409 : e.code === 'BAD_REQUEST' ? 400 : 500;
+    // NOT_MIGRATED = 新しい形 (分けられない部品の 4 列) の行が 0047 の適用前に届いた / DOWNGRADE = 今の形の版の注文を旧い版で置き換えようとした (ingest/order-finance.mjs)
+    const status = e.code === 'CHUNK_DEADLINE' ? 503 : (e.code === 'RUN_MISMATCH' || e.code === 'CHUNK_MISMATCH' || e.code === 'RUN_CLOSED' || e.code === 'NOT_MIGRATED' || e.code === 'DOWNGRADE') ? 409 : e.code === 'BAD_REQUEST' ? 400 : 500;
     console.error(`[company-db order-finance ${chunk.mall}] ${chunk.runId} chunk ${chunk.chunkIndex} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
     res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null, run_id: chunk.runId, chunk_index: chunk.chunkIndex });
   } finally { if (client) { try { await client.end(); } catch { /* */ } } }

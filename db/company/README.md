@@ -816,6 +816,9 @@ D7b-1 のうち coverage (決済のそろい・coordinator・レポートの一�
   - **旧い形の送り手** (0047 の前 = 4 列の鍵が無い) は受け口がそのまま受ける: 集合の指紋は旧い列 (`LEGACY_CONTENT_COLUMNS`) で計算し、正規化した行からも 4 列を外す (= Render の deploy と miniPC の deploy の間も 400 にせず、受領記録の指紋も変わらない = 「Render が復元された」と誤って台帳を空にしない)。保存は 4 列 = 0
   - **今の形の行が 0047 の適用前に届いたら 409 `NOT_MIGRATED`** (0043 の apply は知らない鍵を黙って捨てる = 4 列が落ちたまま受領記録の指紋には入り、送り直しても 'same' で直らない)
   - 変換の版 = `amazon_finance_v2` (全部の注文の payload が変わる = **全部の送り直しが要る**。版が変わると `--incremental` も全部を選ぶ = 下の手順の夜の `--full` を先に済ませる)
+  - 🚨 **版と行の形を結び付ける** (#1554 Codex R1 High): 今の形の版 = `amazon_finance_v2` 以上 (`_名前` が付いても同じ・JS `versionHasClass` = SQL `core.finance_version_has_class`) ⇔ 全部の行に 4 列 (null 不可)。違えば 400 (SQL の apply も例外)。空の集合 (墓石) はどちらの版でもよい
+  - 🚨 **旧い版への戻し (downgrade) を拒む**: 受領記録が今の形の版になった注文を旧い版 (4 列なし) で置き換えると 4 列が 0 に戻る (分けられない部品が消えて正式な利益が fail-open) → 受け口が chunk ごと **409 `DOWNGRADE`** (送り手は ❌)・SQL の apply も例外。**miniPC を旧いコード (amazon_finance_v1) に戻さない**
+  - CHECK は 0047 で `NOT VALID` (新しい行には効く)・既存の行の検査は **0048** (`VALIDATE CONSTRAINT` = 読み書きを止めない lock。59 万行の検査を 0047 の ACCESS EXCLUSIVE の中でしない)
 - **`mart.finance_daily_sku_range(会社, モール, scope, from, to)`** = **日 × 正規化 seller SKU (`core.norm_code`) の子の粒度** (§3.2・R13 H1)。D7b-3 の利益の関数が計算のときに **今のマスタ** で出品に結び直してまとめる材料 (D-64)。
   今の `mart.finance_daily_range` (0045) は画面・突き合わせのため残す (戻りの型も変えない)
   - 列 = 0045 の全部の金額と数量の列 + `seller_sku_norm`・`received_listing_ids` (受け取りのときの listing_id・ID の昇順・診断だけ)・`received_listing_unresolved_count` (受け取りのとき未解決だった行の数)・`net_jpy`・`unmapped_jpy`・4 列・`refund_units_status`・`units_refunded_customer_unrounded` / `units_a_to_z_refund_unrounded` (丸める前の返品数・小数 6 桁)・`refund_unestimated_jpy` (推定できない返品の額)
@@ -824,21 +827,38 @@ D7b-1 のうち coverage (決済のそろい・coordinator・レポートの一�
   - `refund_units_status` (子の状態・1 つの子に表記の違う seller SKU が 2 つ以上なら弱い方): `no_refund` (本体の customer / A-to-z の返金なし) / `estimated_monthly_unit_price` / `estimated_partial_month_unit_price` (その月がまだ終わっていない = 単価が動く) / `unit_price_missing` (返金があるのに単価なし = 返品数 0 個・丸める前は null・額は `refund_unestimated_jpy`)。
     🚨 **partial の判定は当面「計上日の月の最後の日が今日 (JST) 以降」**。D7b-1b で coverage (月末まで決済がそろったか) に置き換える
   - 契約: `from <= to`・最大 400 日 (両端を含む)・違えば例外 (22023 `invalid_input`)。期間の月だけを読む・関数の中だけ nested loop を使わない (0045 と同じ)
-- 試験 = `node scripts/test-company-db-finance.mjs` (0047 の節: 形の確かめ・表の CHECK・旧い形 / 今の形の受け口・0047 の適用前の NOT_MIGRATED と適用後の既存の行・手で計算した子の値・返品の状態の 4 つ・今の関数と同じ期間の合計が一致・契約) と
+- 試験 = `node scripts/test-company-db-finance.mjs` (0047 の節: 形の確かめ・表の CHECK・旧い形 / 今の形の受け口・版と行の形の結び付け (JS と SQL の規則の突き合わせ)・旧い版への戻しは 409 / 例外で 4 列が残る・0047 の適用前の NOT_MIGRATED と適用後の既存の行・手で計算した子の値・返品の状態の 4 つ・今の関数と同じ期間の合計が一致・契約) と
   `node scripts/test-company-db-amazon-finance.mjs` (決済の行から: 相殺する +100 / −100 と misc_fee・MFNPostageFee = 部品 4・月の手数料の行の保存則・二つの関数の合計の一致・二重の実装の一致は既存の列のまま)
 
+**マージの後の手順 (二段。🚨 まだ流さない = migrate は中原さんの指示の後)**。台帳 (jobs-registry の warehouse-daily-sync) にも同じ注意を書いた
+1. マージ → Render は自動で deploy (旧い形の送り手の payload はそのまま受ける = 朝の daily-sync は今までどおり)。**miniPC の本体 (`C:\Users\bfaith\bfaith-portal`) はまだ pull しない** (pull すると v2 の送り手が有効になり、0047 の前は 409 `NOT_MIGRATED` = ❌・0047 の後でも朝の `--incremental` が全部 (約 51 万注文) を選んで 30 分の上限に当たりうる)
+2. 新しいコードを **本番で使っていない worktree** に取り、そこから migrate (0047 → 0048)
+3. Render の新しい版が動いていることを確かめる (`/order-finance/status` が返る・Render の Events の最新の deploy が master の新しいコミット)
+4. **同じ夜に** miniPC の本体を pull (= v2 の送り手が有効) → `--full` (daily-sync の 07:00〜09:10 を避ける) → `--reconcile --all`
+5. 完了の条件 = `--full` の最後の行が ✅ (failed 0・整形できない 0・stale 0)・下の SQL で `lines > 0` の受領記録が全部 `amazon_finance_v2`・`--reconcile --all` が一致
+
 ```
-# マージの後 (🚨 migrate は中原さんの指示の後に dry-run → 本適用。全部の送り直しは夜に)
+# ② 本番で使っていない worktree から migrate (miniPC の PowerShell。.env は本体の 1 つを読む = -r dotenv/config に DOTENV_CONFIG_PATH)
 cd C:\Users\bfaith\bfaith-portal
-node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                 # 0047 だけが出ること
-node -r dotenv/config scripts\company-db\migrate.mjs                           # 0047 (applied=1)
-node apps\company-db\push\amazon-finance.mjs --full                            # 変換の版 v2 で全部を送り直す (約 51 万注文・夜に。daily-sync の 07:00〜09:10 は避ける)
+git fetch origin
+git worktree add C:\tmp\d7b1a origin/master
+cd C:\tmp\d7b1a
+npm ci
+$env:DOTENV_CONFIG_PATH = 'C:\Users\bfaith\bfaith-portal\.env'
+node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                 # 0047 と 0048 だけが出ること
+node -r dotenv/config scripts\company-db\migrate.mjs                           # 0047 → 0048 (applied=2)
+# ④ 同じ夜に本体を pull して全部を送り直す
+cd C:\Users\bfaith\bfaith-portal
+git pull
+node apps\company-db\push\amazon-finance.mjs --full                            # 変換の版 v2 で全部を送り直す (約 51 万注文)
 node apps\company-db\push\amazon-finance.mjs --reconcile --all                 # 全期間の突き合わせ (既存の列が SQLite と一致のまま)
+# 後片付け
+git worktree remove C:\tmp\d7b1a
 ```
 
 ```sql
--- 送り直しの進み (版ごとの注文の数)
-select transform_version, count(*) from core.order_finance_receipts where mall = 'amazon' and scope_key = 'jp' group by 1;
+-- 送り直しの進み (版ごとの注文の数。lines > 0 が全部 amazon_finance_v2 になれば済み・空の集合の墓石は旧い版のままでよい)
+select transform_version, lines > 0 as has_lines, count(*) from core.order_finance_receipts where mall = 'amazon' and scope_key = 'jp' group by 1, 2 order by 1, 2;
 -- 分けられない部品のある SKU の行 (D7b-3 で正式な利益が null になる行)
 select economic_date_jst, seller_sku_norm, unclassified_component_count, unclassified_mapped_jpy, unclassified_abs_jpy, unmapped_component_count
   from mart.finance_daily_sku_range(1::smallint, 'amazon', 'jp', '2026-09-01', '2026-09-30') where unclassified_component_count > 0 or unmapped_component_count > 0;

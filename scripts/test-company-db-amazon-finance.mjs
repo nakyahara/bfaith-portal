@@ -439,12 +439,30 @@ await t('watermark: incremental はそろって終わった回の ingested_at �
   assert.ok(r3.finance.selectedOrders >= 8, `selected ${r3.finance.selectedOrders}`);
 });
 await t('変換の版が変わった回は全部を選び、全部送り直す', async () => {
-  const r = await pushClose(L0, { mode: 'incremental', transformVersion: 'amazon_finance_v1_test' });
+  // 版は今の形 (amazon_finance_v2 以上) の名前でないと送れない (版と行の形の結び付け・#1554 Codex R1 High)
+  const r = await pushClose(L0, { mode: 'incremental', transformVersion: 'amazon_finance_v2_test' });
+  assert.equal(r.ok, true, JSON.stringify({ te: r.transformErrors.slice(0, 2), f: r.failed.slice(0, 2), e: r.error }));
   assert.equal(r.finance.since, null);
   assert.ok(r.changed >= 10, `changed ${r.changed}`);
   const r2 = await pushClose(L0, { mode: 'incremental' });   // 元の版に戻す = また全部
   assert.ok(r2.changed >= 10);
   assert.equal(L0.getMeta(META.transformVersion), AMAZON_FINANCE_TRANSFORM_VERSION);
+});
+await t('🚨 旧いコードの送り手に戻しても 4 列は消えない (#1554 Codex R1 High): 旧い版の名前では変換の時点で整形できない / 受け口は v2 の注文への旧い形を 409 DOWNGRADE', async () => {
+  const L = newLedger();
+  const r = await pushClose(L, { mode: 'range', from: d(MB, 23), to: d(MB, 23), force: true, transformVersion: 'amazon_finance_v1' });
+  assert.equal(r.ok, false);
+  assert.ok(r.transformErrors.length >= 1 && r.transformErrors.every((x) => /old version/.test(x.error)), JSON.stringify(r.transformErrors.slice(0, 2)));
+  // 旧いコードそのもの (4 列の鍵の無い行・旧い版) を HTTP で送る = 409 (送り手は ❌)
+  const lines = (await all(`select * from core.order_finance_daily where mall_order_no = 'O14'`)).map((x) => ({ economic_date_jst: x.economic_date_jst.toISOString().slice(0, 10), seller_sku: x.seller_sku,
+    line_kind: x.line_kind, source: x.source, source_lines: x.source_lines, sales_principal_jpy: Number(x.sales_principal_jpy), source_updated_at: '2026-01-01T00:00:00Z', content_hash: 'h' }));
+  const { orderFinanceChecksum, validateFinanceRows } = await import('../apps/company-db/finance/order-finance-checksum.mjs');
+  const body = { run_id: 'ship_202609301500000_eeeeee', batch_seq: 999999, chunk_index: 0, last: true, transform_version: 'amazon_finance_v1',
+    rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'O14', header: { transform_version: 'amazon_finance_v1', set_checksum: orderFinanceChecksum(validateFinanceRows('O14', lines), { legacy: true }) }, lines }] };
+  const res = await fetch(`${BASE}/order-finance`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-sync-key': 'k' }, body: JSON.stringify(body) });
+  assert.equal(res.status, 409, await res.text());
+  const u = await one(`select unclassified_component_count c, transform_version v from core.order_finance_daily where mall_order_no = 'O14' and line_kind = 'sku'`);
+  assert.deepEqual([u.c, u.v], [4, AMAZON_FINANCE_TRANSFORM_VERSION]);
 });
 await t('--full: 注文の中の一部の行の削除 (ingested_at も鍵も変わらない) を拾う・Render にだけある注文に空の集合', async () => {
   // O3 の返品のポイントの行を消す (incremental では拾えない)
@@ -806,6 +824,8 @@ await t('daily-sync: 手数料の工程の後に送り手 → 送れたときだ
   assert.ok(RETRY_ORDER.indexOf('Amazon Settlement') < RETRY_ORDER.indexOf('CompanyDB財務(Amazon)'));
   const reg = fs.readFileSync(path.join(repoRoot, 'config/jobs-registry.mjs'), 'utf8');
   assert.ok(reg.includes('Company DB Amazon 財務 push') && reg.includes('Company DB Amazon 財務 突き合わせ'));
+  // D7b-1a (#1554 Codex R1 Medium): 変換の版 v2 の注意 (全部を選ぶ朝・migrate の前に pull しない・旧い版に戻さない・手の --full の完了の条件) が台帳にある
+  for (const s of [AMAZON_FINANCE_TRANSFORM_VERSION, '1 工程 30 分の上限', 'migrate の前に miniPC 本体を pull しない', '旧い版 (amazon_finance_v1) の送り手に戻さない', '手の --full の完了の条件']) assert.ok(reg.includes(s), `台帳に「${s}」が無い`);
 });
 await t('要約の頭: Render の復元・台帳の取り戻しは ⚠️ (daily-sync が全部 OK に数えない)・拾われない金額も ⚠️・失敗は ❌', async () => {
   const { summarizeFinance } = await import('../apps/company-db/push/amazon-finance.mjs');
