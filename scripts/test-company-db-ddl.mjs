@@ -124,6 +124,31 @@ await ta('[!] 期待する表がすべてある', async () => {
   assert.deepEqual(views.map((v) => v.t).sort(), ['mart.v_ad_spend_daily', 'mart.v_cross_mall_diff', 'mart.v_finance_account_fees_monthly', 'mart.v_finance_daily', 'mart.v_listing_360', 'mart.v_order_finance_summary', 'mart.v_order_finance_uncovered', 'mart.v_product_360', 'mart.v_product_dq', 'mart.v_purchase_backorder_by_sku', 'mart.v_purchase_order_open', 'mart.v_sales_daily', 'mart.v_shipments_daily', 'mart.v_shipments_unlinked', 'mart.v_sku_cost_observed_effective', 'mart.v_sku_stock', 'mart.v_warehouse_stock_current']);
 });
 
+await ta('[!] 0047 (13 §3.2・§3.7・D7b-1a): 財務の行に分けられない部品の 4 列 (既定 0)・日 × 正規化 SKU の関数 mart.finance_daily_sku_range', async () => {
+  const cols = await q("select column_name as c, data_type as t, column_default as d, is_nullable as n from information_schema.columns where table_schema = 'core' and table_name = 'order_finance_daily' and column_name in ('unclassified_component_count', 'unclassified_mapped_jpy', 'unclassified_abs_jpy', 'unmapped_component_count') order by 1");
+  assert.deepEqual(cols.map((r) => [r.c, r.t, r.d, r.n]), [
+    ['unclassified_abs_jpy', 'bigint', '0', 'NO'], ['unclassified_component_count', 'integer', '0', 'NO'], ['unclassified_mapped_jpy', 'bigint', '0', 'NO'], ['unmapped_component_count', 'integer', '0', 'NO']]);
+  const fns = await q("select p.proname as f, pg_get_function_identity_arguments(p.oid) as a from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'mart' and p.proname in ('finance_daily_range', 'finance_daily_sku_range') order by 1");
+  assert.deepEqual(fns.map((r) => r.f), ['finance_daily_range', 'finance_daily_sku_range']);   // 今の関数は残す (R20 M4)
+  assert.ok(fns.every((r) => /p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date/.test(r.a)), JSON.stringify(fns));
+  const ck = await q("select conname as n, convalidated as v from pg_constraint where conname in ('ck_order_finance_daily_unclassified', 'ck_order_finance_daily_unmapped_count', 'ck_order_finance_daily_class_form') order by 1");
+  assert.deepEqual(ck.map((r) => [r.n, r.v]), [['ck_order_finance_daily_class_form', true], ['ck_order_finance_daily_unclassified', true], ['ck_order_finance_daily_unmapped_count', true]]);   // 0048 で確かめ済み
+});
+
+await ta('[!] 0047 の CHECK は NOT VALID で足し (59 万行の検査を ACCESS EXCLUSIVE の中でしない)、0048 が既存の行で確かめる (#1554 Codex R1 Medium)', async () => {
+  const p2 = new PGlite(); const d2 = pgliteAdapter(p2);
+  await applyMigrations(d2, { log: quiet, to: '0047' });
+  const st = async () => (await d2.query("select conname as n, convalidated as v from pg_constraint where conname in ('ck_order_finance_daily_unclassified', 'ck_order_finance_daily_unmapped_count', 'ck_order_finance_daily_class_form') order by 1")).rows.map((r) => [r.n, r.v]);
+  assert.deepEqual(await st(), [['ck_order_finance_daily_class_form', false], ['ck_order_finance_daily_unclassified', false], ['ck_order_finance_daily_unmapped_count', false]]);
+  const src47 = fs.readFileSync(path.join(DEFAULT_DIR, '0047_finance_sku_range.sql'), 'utf8');
+  const code47 = src47.split(/\r?\n/).map((l) => l.replace(/--.*$/, '')).join('\n');   // 注釈を除いた SQL
+  assert.ok(!/validate\s+constraint/i.test(code47), '0047 で既存の行を検査している');
+  assert.equal((code47.match(/\bnot valid\b/gi) || []).length, 3, '0047 の 3 つの CHECK が NOT VALID でない');
+  await applyMigrations(d2, { log: quiet });
+  assert.deepEqual(await st(), [['ck_order_finance_daily_class_form', true], ['ck_order_finance_daily_unclassified', true], ['ck_order_finance_daily_unmapped_count', true]]);
+  await p2.close();
+});
+
 await ta('[!] 03 §10: 円の金額列 (*_jpy) はすべて bigint', async () => {
   const rows = await q("select table_schema, table_name, column_name, data_type from information_schema.columns where column_name like '%\\_jpy%' escape '\\' and table_schema in ('core','snapshots','events','ai','mart') and data_type <> 'bigint'");
   assert.deepEqual(rows, [], JSON.stringify(rows));

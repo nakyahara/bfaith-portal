@@ -207,6 +207,7 @@ export function makeBuild(run, transformVersion = AMAZON_FINANCE_TRANSFORM_VERSI
     s.lines += lines.length; s.rawRows += stats ? stats.rawRows : 0; s.dedupRows += stats ? stats.dedupRows : 0;
     if (lines.length > s.maxLines) { s.maxLines = lines.length; s.maxLinesKey = group.key; }
     if (bytes > s.maxBytes) { s.maxBytes = bytes; s.maxBytesKey = group.key; }
+    if (stats && stats.unclassifiedComponents) s.unclassifiedComponents = (s.unclassifiedComponents || 0) + stats.unclassifiedComponents;   // 分けられない部品の数 (0047)
     if (stats && stats.unmapped.rows) {
       s.unmapped.rows += stats.unmapped.rows;
       for (const [c, n] of Object.entries(stats.unmapped.columns)) s.unmapped.columns[c] = (s.unmapped.columns[c] || 0) + n;
@@ -478,6 +479,8 @@ export function summarizeFinance(r) {
   const warn = [
     f.unkeyed && f.unkeyed.length ? `❌ 注文番号も計上日も読めない行 ${f.unkeyed.reduce((s, u) => s + Number(u.n), 0)} 行 (例 id ${f.unkeyed[0].example_id}) = 疑似注文 ${f.pseudoBlocked} 件を送らなかった` : '',
     f.unmapped && f.unmapped.rows ? `⚠️ どの列にも入らない金額を持つ決済の行 ${f.unmapped.rows} (${Object.entries(f.unmapped.columns).map(([c, n]) => `${c} ${n}`).join(', ')}・例 id ${f.unmapped.exampleIds.join(', ')})` : '',
+    // 分けられない部品 (0047 = D7b-3 の正式な利益を止める。種類を分けるまでは続く = 頭の ✅ / ⚠️ は変えず、数だけ見せる)
+    f.unclassifiedComponents ? `分けられない決済の部品 ${f.unclassifiedComponents} (集約した注文の中・D7b-3 でその行の正式な利益は null)` : '',
   ].filter(Boolean).join(' / ');
   if (r.lockedBy) return `⏸️ Company DB Amazon 財務 push: 別の送り手が走っているので見送り (${r.lockedBy.owner} pid ${r.lockedBy.pid})`;
   if (r.dryRun) return `${r.transformErrors.length || (f.unkeyed && f.unkeyed.length) ? '❌' : f.unmapped && f.unmapped.rows ? '⚠️' : '✅'} dry-run: ${lines} / 変わった ${r.changed} / 整形できない ${r.transformErrors.length}${warn ? ` / ${warn}` : ''}`;

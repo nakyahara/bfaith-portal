@@ -125,6 +125,18 @@ raw({ order: 'O13', sku: 'sku-v', date: d(MB, 14), tt: 'PAYMENT_RETRACTION_ITEMS
 raw({ order: null, sku: 'sku-v', date: d(MB, 16), tt: 'Inbound Defect Fee - Missing label', oa: -200 });
 raw({ order: null, sku: 'sku-w', date: d(MB, 17), tt: 'Inbound Defect Fee - Barcode cannot be scanned', oa: -90 });
 raw({ order: null, sku: 'sku-w', date: d(MB, 17), tt: 'inbound defect fee - x', oa: -10 });
+// 🆕 2026-09-30 (D7b-1a・0047): 分けられない部品の数
+//   O14 (sku-u14・MB 23): 売上 500・Other (price_type Something) の other_amount +100 と −100 (相殺して 0)・misc_fee +30・MFNPostageFee −40 (other_fee)
+//     → SKU の行の分けられない部品 4 (+100 / −100 / +30 / −40)・符号つき −10・絶対値 270・other_amount は 0
+//   月の手数料の行に手数料の材料でない部品: Subscription Fee (MB 23) の other_amount −100 (材料) + misc_fee +3 (分けられない 1)
+//   手数料に入れない行の部品は数えない: Goodwill Concession (MB 23・SKU なし) の misc_fee +9 = not_account_fee (損益の外)
+raw({ order: 'O14', sku: 'sku-u14', date: d(MB, 23), qty: 1 }); raw({ order: 'O14', sku: 'sku-u14', date: d(MB, 23), pt: 'Principal', pa: 500 });
+raw({ order: 'O14', sku: 'sku-u14', date: d(MB, 23), tt: 'Other', pt: 'Something', oa: 100 });
+raw({ order: 'O14', sku: 'sku-u14', date: d(MB, 23), tt: 'Other', pt: 'Something', oa: -100 });
+raw({ order: 'O14', sku: 'sku-u14', date: d(MB, 23), misc: 30 });
+raw({ order: 'O14', sku: 'sku-u14', date: d(MB, 23), ft: 'MFNPostageFee', fa: -40 });
+NS(d(MB, 23), 'Subscription Fee', { oa: -100, misc: 3 });
+NS(d(MB, 23), 'Goodwill Concession', { misc: 9 });
 
 const build = (months = 14) => {
   for (const m of [MA, MB]) execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', m], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
@@ -262,6 +274,46 @@ await t('拾われない金額を数える (shipment_fee と知らない手数�
     economic_date: '2026-03-01', amazon_order_id: 'X1', seller_sku_normalized: 's', transaction_type: 'Order', currency: 'JPY', shipment_fee_amount_micro: -5000000n }];
   const a = aggregateOrderFinance('X1', rows);
   assert.equal(a.lines[0].unmapped_jpy, 0); assert.equal(a.stats.unmapped.rows, 2);
+  assert.equal(a.lines[0].unmapped_component_count, 2);   // 0047: 打ち消して 0 でも部品の数は残る
+});
+
+console.log('分けられない部品の数 (0047・D7b-1a)');
+await t('🚨 SKU の行: +100 と −100 (相殺して 0)・misc_fee・MFNPostageFee = 部品 4・符号つき −10・絶対値 270 (手で計算)。Company DB に入る', async () => {
+  const u = await one(`select other_amount_jpy::int oa, misc_fee_jpy::int mf, other_fee_jpy::int ofe, unclassified_component_count c, unclassified_mapped_jpy::int m, unclassified_abs_jpy::int a,
+    unmapped_component_count uc, transform_version v from core.order_finance_daily where mall_order_no = 'O14' and line_kind = 'sku'`);
+  assert.deepEqual([u.oa, u.mf, u.ofe, u.c, u.m, u.a, u.uc], [0, 30, -40, 4, -10, 270, 0]);
+  assert.equal(u.v, 'amazon_finance_v2');
+  // SKU の行では 分けられない列の和 = 符号つきの合計 (受け口の形の確かめと同じ)
+  const bad = await one(`select count(*)::int n from core.order_finance_daily where line_kind = 'sku' and unclassified_mapped_jpy <> misc_fee_jpy + other_fee_jpy + other_amount_jpy`);
+  assert.equal(bad.n, 0);
+  // O1 = unmapped (shipment_fee −70・知らない手数料 −10) の部品 2・分けられない部品 0
+  const o1 = await one(`select unmapped_jpy::int u, unmapped_component_count uc, unclassified_component_count c from core.order_finance_daily where mall_order_no = 'O1' and line_kind = 'sku'`);
+  assert.deepEqual([o1.u, o1.uc, o1.c], [-80, 2, 0]);
+});
+await t('月の手数料の行: 手数料の材料 (other_amount + item_related_fee) の外の部品だけ数える・手数料に入れない行 (not_account_fee) は数えない', async () => {
+  const sub = await one(`select account_fee_amount_jpy::int af, net_jpy::int n, unclassified_component_count c, unclassified_mapped_jpy::int m, unclassified_abs_jpy::int a
+    from core.order_finance_daily where mall_order_no = $1 and line_kind = 'subscription'`, [`-:${d(MB, 23)}`]);
+  assert.deepEqual([sub.af, sub.n, sub.c, sub.m, sub.a], [-100, -97, 1, 3, 3]);
+  const gw = await one(`select net_jpy::int n, unclassified_component_count c from core.order_finance_daily where mall_order_no = $1 and line_kind = 'not_account_fee'`, [`-:${d(MB, 23)}`]);
+  assert.deepEqual([gw.n, gw.c], [9, 0]);
+  // 保存則 (月の手数料の行): net = 手数料の材料 + 分けられない (符号つき) + unmapped。全部の月の手数料の行で
+  const bad = await all(`select mall_order_no, line_kind from core.order_finance_daily
+    where line_kind in ('storage','long_term_storage','removal','inbound_defect','low_inventory','subscription','easy_ship','other_account_fee')
+      and net_jpy <> account_fee_amount_jpy + unclassified_mapped_jpy + unmapped_jpy`);
+  assert.deepEqual(bad, []);
+});
+await t('🚨 mart.finance_daily_sku_range = mart.finance_daily_range と同じ期間の金額・数量の合計が一致 (粒度だけ違う)・分けられない部品は数で残る', async () => {
+  const cols = ['units_ordered', 'units_refunded_customer', 'units_marketplace_guarantee', 'units_a_to_z_refund', 'units_net_sold', 'sales_principal_jpy', 'sales_shipping_jpy', 'sales_giftwrap_jpy', 'sales_tax_jpy',
+    'commission_jpy', 'fba_fulfillment_jpy', 'fba_storage_jpy', 'closing_fee_jpy', 'shipping_chargeback_jpy', 'giftwrap_chargeback_jpy', 'promotion_jpy', 'promotion_tax_jpy', 'points_jpy',
+    'warehouse_damage_jpy', 'warehouse_lost_jpy', 'safe_t_jpy', 'refund_principal_jpy', 'reversal_reimbursement_jpy', 'misc_fee_jpy', 'other_fee_jpy', 'other_amount_jpy', 'profit_before_cogs_jpy', 'source_lines', 'order_rows'];
+  const sums = async (fn) => (await one(`select ${cols.map((c) => `sum(${c})::text as ${c}`).join(', ')}, count(*)::int as n
+    from mart.${fn}(1::smallint, 'amazon', 'jp', $1::date, $2::date)`, [`${MA}-01`, monthEnd(MB)]));
+  const a = await sums('finance_daily_range'), b = await sums('finance_daily_sku_range');
+  for (const c of cols) assert.equal(b[c], a[c], c);
+  assert.ok(a.n >= 10);
+  const u = await one(`select unclassified_component_count c, unclassified_mapped_jpy::int m, unclassified_abs_jpy::int ab, other_amount_jpy::int oa, received_listing_unresolved_count r
+    from mart.finance_daily_sku_range(1::smallint, 'amazon', 'jp', $1::date, $1::date) where seller_sku_norm = 'sku-u14'`, [d(MB, 23)]);
+  assert.deepEqual([u.c, u.m, u.ab, u.oa, u.r], [4, -10, 270, 0, 1]);   // 出品が無い = 受け取りのとき未解決
 });
 
 console.log('集約の歯止め (純粋関数)');
@@ -302,6 +354,54 @@ await t('SKU のある行の行き先 (2026-09-30 D-63・純粋関数): Other �
   assert.equal(classifySkuAccountFee('FBA Inventory Storage Fee'), null);   // ほかの手数料の種類は SKU のある行なら日次の財務の側 (今まで通り)
   assert.equal(classifySkuAccountFee('Fee Adjustment'), null);
   assert.equal(classifySkuAccountFee('Order'), null);
+});
+await t('分けられない部品 (0047・純粋関数): 同じ SKU の行の other_amount +100 / −100 = 部品 2・符号つき 0・絶対値 200 / 0 円の部品は数えない / 月の手数料の行の税の price も分けられない (fail-closed)', async () => {
+  const M = 1000000n;
+  const a = aggregateOrderFinance('X1', [
+    base({ id: 1, business_line_key: 'a', transaction_type: 'Other', price_type: 'x', other_amount_micro: 100n * M }),
+    base({ id: 2, business_line_key: 'b', transaction_type: 'Other', price_type: 'x', other_amount_micro: -100n * M }),
+    base({ id: 3, business_line_key: 'c', misc_fee_amount_micro: 0n }),
+    base({ id: 4, business_line_key: 'd', price_type: 'Principal', price_amount_micro: 500n * M, promotion_type: 'Principal', promotion_amount_micro: -50n * M }),
+  ]);
+  const l = a.lines[0];
+  assert.deepEqual([l.other_amount_jpy, l.unclassified_component_count, l.unclassified_mapped_jpy, l.unclassified_abs_jpy, l.unmapped_component_count], [0, 2, 0, 200, 0]);
+  assert.equal(a.stats.unclassifiedComponents, 2);
+  const f = aggregateOrderFinance('-:2026-03-01', [
+    base({ id: 5, amazon_order_id: null, seller_sku_normalized: null, transaction_type: 'Storage Fee', other_amount_micro: -300n * M, price_type: 'Tax', price_amount_micro: -30n * M }),
+  ]).lines[0];
+  assert.deepEqual([f.line_kind, f.account_fee_amount_jpy, f.sales_tax_jpy, f.unclassified_component_count, f.unclassified_mapped_jpy], ['storage', -300, -30, 1, -30]);
+});
+await t('🚨 受け口で見分けられない「同じ箱の中の相殺」を変換が数える (#1554 Codex R4・期待値は変換と独立に手で書いた固定の値)', async () => {
+  const M = 1000000n;
+  const P = (x) => base({ amazon_order_id: null, seller_sku_normalized: null, transaction_type: 'Storage Fee', ...x });   // 疑似注文 -:2026-03-01 の保管料の行
+  const pick = (lines, kind) => { const l = lines.find((x) => x.line_kind === kind); return [l.unclassified_component_count, l.unclassified_mapped_jpy, l.unclassified_abs_jpy, l.unmapped_component_count]; };
+  // ① 月の手数料の行の同じ列の中の相殺: 材料 −100 (other_amount)・misc_fee +3 と −3 (列は 0) → 部品 2・符号つき 0・絶対値 6
+  const a = aggregateOrderFinance('-:2026-03-01', [
+    P({ id: 1, business_line_key: 'm1', other_amount_micro: -100n * M }),
+    P({ id: 2, business_line_key: 'm2', misc_fee_amount_micro: 3n * M }),
+    P({ id: 3, business_line_key: 'm3', misc_fee_amount_micro: -3n * M }),
+  ]).lines;
+  assert.deepEqual(pick(a, 'storage'), [2, 0, 6, 0]);
+  assert.deepEqual([a[0].misc_fee_jpy, a[0].fba_storage_jpy, a[0].account_fee_amount_jpy], [0, -100, -100]);
+  // ② 8 列の合計の残差の中の別の列の間の相殺: 材料 −100 (fba_storage)・分けられない other_fee +3 (other_fee の列)・分けられない未知の price −3 (other_amount の列)
+  //    → 残差 = (−100 + 3 − 3) − (−100) = 0 = 受け口では見分けられない。変換は 部品 2・符号つき 0・絶対値 6
+  const b = aggregateOrderFinance('-:2026-03-01', [
+    P({ id: 4, business_line_key: 'r1', other_amount_micro: -100n * M }),
+    P({ id: 5, business_line_key: 'r2', other_fee_amount_micro: 3n * M }),
+    P({ id: 6, business_line_key: 'r3', price_type: 'Weird', price_amount_micro: -3n * M }),
+  ]).lines;
+  assert.deepEqual([b[0].fba_storage_jpy, b[0].other_fee_jpy, b[0].other_amount_jpy, b[0].account_fee_amount_jpy], [-100, 3, -3, -100]);
+  assert.deepEqual(pick(b, 'storage'), [2, 0, 6, 0]);
+  // ③ SKU の行の別の列の間の相殺: other_amount +5 (取引の種類 Other の分けられない補てん)・misc_fee −5 → 部品 2・符号つき 0・絶対値 10
+  //    + 同じ列 (other_fee) の中の相殺: MFNPostageFee −7 と other_fee +7 → さらに部品 2・絶対値 14
+  const c = aggregateOrderFinance('X1', [
+    base({ id: 7, business_line_key: 's1', transaction_type: 'Other', price_type: 'x', other_amount_micro: 5n * M }),
+    base({ id: 8, business_line_key: 's2', misc_fee_amount_micro: -5n * M }),
+    base({ id: 9, business_line_key: 's3', item_related_fee_type: 'MFNPostageFee', item_related_fee_amount_micro: -7n * M }),
+    base({ id: 10, business_line_key: 's4', other_fee_amount_micro: 7n * M }),
+  ]).lines;
+  assert.deepEqual([c[0].other_amount_jpy, c[0].misc_fee_jpy, c[0].other_fee_jpy], [5, -5, 0]);
+  assert.deepEqual(pick(c, 'sku'), [4, 0, 24, 0]);
 });
 await t('SKU なしの行の種類 = 月の手数料の build と同じ (大文字小文字は LIKE だけ無視・最初に当たった種類)', async () => {
   assert.equal(feeKindOf('FBA INVENTORY STORAGE FEE'), 'storage');   // 前方一致 (LIKE) は大文字小文字を無視
@@ -371,12 +471,30 @@ await t('watermark: incremental はそろって終わった回の ingested_at �
   assert.ok(r3.finance.selectedOrders >= 8, `selected ${r3.finance.selectedOrders}`);
 });
 await t('変換の版が変わった回は全部を選び、全部送り直す', async () => {
-  const r = await pushClose(L0, { mode: 'incremental', transformVersion: 'amazon_finance_v1_test' });
+  // 版は今の形 (amazon_finance_v2 以上) の名前でないと送れない (版と行の形の結び付け・#1554 Codex R1 High)
+  const r = await pushClose(L0, { mode: 'incremental', transformVersion: 'amazon_finance_v2_test' });
+  assert.equal(r.ok, true, JSON.stringify({ te: r.transformErrors.slice(0, 2), f: r.failed.slice(0, 2), e: r.error }));
   assert.equal(r.finance.since, null);
   assert.ok(r.changed >= 10, `changed ${r.changed}`);
   const r2 = await pushClose(L0, { mode: 'incremental' });   // 元の版に戻す = また全部
   assert.ok(r2.changed >= 10);
   assert.equal(L0.getMeta(META.transformVersion), AMAZON_FINANCE_TRANSFORM_VERSION);
+});
+await t('🚨 旧いコードの送り手に戻しても 4 列は消えない (#1554 Codex R1 High): 旧い版の名前では変換の時点で整形できない / 受け口は v2 の注文への旧い形を 409 DOWNGRADE', async () => {
+  const L = newLedger();
+  const r = await pushClose(L, { mode: 'range', from: d(MB, 23), to: d(MB, 23), force: true, transformVersion: 'amazon_finance_v1' });
+  assert.equal(r.ok, false);
+  assert.ok(r.transformErrors.length >= 1 && r.transformErrors.every((x) => /old version/.test(x.error)), JSON.stringify(r.transformErrors.slice(0, 2)));
+  // 旧いコードそのもの (4 列の鍵の無い行・旧い版) を HTTP で送る = 409 (送り手は ❌)
+  const lines = (await all(`select * from core.order_finance_daily where mall_order_no = 'O14'`)).map((x) => ({ economic_date_jst: x.economic_date_jst.toISOString().slice(0, 10), seller_sku: x.seller_sku,
+    line_kind: x.line_kind, source: x.source, source_lines: x.source_lines, sales_principal_jpy: Number(x.sales_principal_jpy), source_updated_at: '2026-01-01T00:00:00Z', content_hash: 'h' }));
+  const { orderFinanceChecksum, validateFinanceRows } = await import('../apps/company-db/finance/order-finance-checksum.mjs');
+  const body = { run_id: 'ship_202609301500000_eeeeee', batch_seq: 999999, chunk_index: 0, last: true, transform_version: 'amazon_finance_v1',
+    rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'O14', header: { transform_version: 'amazon_finance_v1', set_checksum: orderFinanceChecksum(validateFinanceRows('O14', lines), { legacy: true }) }, lines }] };
+  const res = await fetch(`${BASE}/order-finance`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-sync-key': 'k' }, body: JSON.stringify(body) });
+  assert.equal(res.status, 409, await res.text());
+  const u = await one(`select unclassified_component_count c, transform_version v from core.order_finance_daily where mall_order_no = 'O14' and line_kind = 'sku'`);
+  assert.deepEqual([u.c, u.v], [4, AMAZON_FINANCE_TRANSFORM_VERSION]);
 });
 await t('--full: 注文の中の一部の行の削除 (ingested_at も鍵も変わらない) を拾う・Render にだけある注文に空の集合', async () => {
   // O3 の返品のポイントの行を消す (incremental では拾えない)
@@ -738,6 +856,8 @@ await t('daily-sync: 手数料の工程の後に送り手 → 送れたときだ
   assert.ok(RETRY_ORDER.indexOf('Amazon Settlement') < RETRY_ORDER.indexOf('CompanyDB財務(Amazon)'));
   const reg = fs.readFileSync(path.join(repoRoot, 'config/jobs-registry.mjs'), 'utf8');
   assert.ok(reg.includes('Company DB Amazon 財務 push') && reg.includes('Company DB Amazon 財務 突き合わせ'));
+  // D7b-1a (#1554 Codex R1 Medium): 変換の版 v2 の注意 (全部を選ぶ朝・migrate の前に pull しない・旧い版に戻さない・手の --full の完了の条件) が台帳にある
+  for (const s of [AMAZON_FINANCE_TRANSFORM_VERSION, '1 工程 30 分の上限', 'migrate の前に miniPC 本体を pull しない', '旧い版 (amazon_finance_v1) の送り手に戻さない', '手の --full の完了の条件']) assert.ok(reg.includes(s), `台帳に「${s}」が無い`);
 });
 await t('要約の頭: Render の復元・台帳の取り戻しは ⚠️ (daily-sync が全部 OK に数えない)・拾われない金額も ⚠️・失敗は ❌', async () => {
   const { summarizeFinance } = await import('../apps/company-db/push/amazon-finance.mjs');
@@ -779,6 +899,44 @@ await t('daily-sync: 手数料の build / sync に やり残しの月数を渡�
   assert.match(src, /sync-amazon-account-fees\.js --data-dir \$\{DATA_DIR_ARG\} \$\{feesRange\}/);
   assert.match(src, /const feesRange = feesPlan\.fromMonth \? `--from-month \$\{feesPlan\.fromMonth\}`/);
   assert.match(src, /accountFeesSyncResult\.success && feesPlan\.covered\.length[\s\S]{0,200}attempted: feesPlan\.covered, file: ACCOUNT_FEES_PENDING_FILE/);
+});
+
+await t('🚨 変換が作る payload は全部 JS と SQL の等式を通る (#1554 Codex R2 Medium 2): 乱数の決済の行 400 注文 (取引の種類・price / 手数料の種類・9 つの金額の列・SKU の有無・注文番号なし) → 集約 → 0047 の apply (CHECK)', async () => {
+  const { orderFinanceChecksum } = await import('../apps/company-db/finance/order-finance-checksum.mjs');
+  let seed = 20260930; const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const pick = (a) => a[Math.floor(rnd() * a.length)];
+  const TX = ['Order', 'Order', 'Refund', 'Chargeback Refund', 'A-to-z Guarantee Refund', 'Other', 'SAFE-T Reimbursement', 'WAREHOUSE_DAMAGE', 'WAREHOUSE_LOST', 'REVERSAL_REIMBURSEMENT',
+    'PAYMENT_RETRACTION_ITEMS', 'Storage Fee', 'FBA Inventory Storage Fee', 'StorageRenewalBilling', 'Subscription Fee', 'Amazon Easy Ship Charges', 'Fee Adjustment', 'Inbound Defect Fee - x',
+    'FBA Removal Order: Return Fee', 'FBA Inventory Fee - LowInventoryLevel', 'Current Reserve Amount', 'Goodwill Concession', 'BuyerRecharge', 'Refund_Retrocharge', 'Mystery Fee'];
+  const PT = [null, null, 'Principal', 'Shipping', 'GiftWrap', 'Tax', 'ShippingTax', 'RestockingFee', 'SAFE-T Reimbursement', 'Weird'];
+  const FT = [null, null, 'Commission', 'RefundCommission', 'FBAPerUnitFulfillmentFee', 'ShippingChargeback', 'PointsGranted', 'MFNPostageFee', 'EasyShipFee', 'VariableClosingFee'];
+  const PR = [null, null, 'Principal', 'Shipping', 'TaxDiscount'];
+  const amt = () => (rnd() < 0.3 ? BigInt(Math.floor(rnd() * 1001) - 500) * 1000000n : null);
+  let id = 900000, checked = 0, withClass = 0, feeRows = 0;
+  for (let o = 0; o < 400; o++) {
+    const pseudo = rnd() < 0.3;
+    const date = `2031-0${1 + Math.floor(rnd() * 9)}-1${Math.floor(rnd() * 9)}`;
+    const orderNo = pseudo ? `-:${date}` : `FZ-${o}`;
+    const rows = [];
+    for (let k = 0, n = 1 + Math.floor(rnd() * 8); k < n; k++) {
+      const sku = rnd() < 0.5 ? null : pick(['fz-a', 'fz-b', 'FZ-A']);
+      rows.push({ id: ++id, source_settlement_id: 'SFZ', business_line_key: `fz-${id}`, source_document_id: 'DFZ', source_line_no: id, source_layer: 'sp_api_v2', ingested_at: OLD_INGEST, posted_date_utc: 'x',
+        economic_date: pseudo ? date : (rnd() < 0.8 ? date : `2031-0${1 + Math.floor(rnd() * 9)}-20`), amazon_order_id: pseudo ? null : orderNo, seller_sku_normalized: sku, transaction_type: pick(TX), currency: 'JPY',
+        quantity_purchased: rnd() < 0.3 ? 1n : null, price_type: pick(PT), price_amount_micro: amt(), item_related_fee_type: pick(FT), item_related_fee_amount_micro: amt(),
+        promotion_type: pick(PR), promotion_amount_micro: amt(), shipment_fee_amount_micro: rnd() < 0.1 ? amt() : null, order_fee_amount_micro: rnd() < 0.05 ? amt() : null,
+        misc_fee_amount_micro: amt(), other_fee_amount_micro: amt(), direct_payment_amount_micro: rnd() < 0.05 ? amt() : null, other_amount_micro: amt() });
+    }
+    const { lines } = aggregateOrderFinance(orderNo, rows);   // JS の等式 (validateFinanceRows) はこの中で通る
+    for (const l of lines) { if (l.unclassified_component_count) withClass++; if (l.line_kind !== 'sku' && l.line_kind !== 'not_account_fee' && l.line_kind !== 'unknown') feeRows++; }
+    // 同じ疑似注文 (同じ日) が 2 回出てもよいように世代は注文ごとに進める
+    const r = (await one(`select core.apply_order_finance_batch(1::smallint, 'amazon', 'jp', $1, $5::bigint, $2, $3, $4::jsonb) as r`,
+      [orderNo, orderFinanceChecksum(lines), AMAZON_FINANCE_TRANSFORM_VERSION, JSON.stringify(lines), 900000 + 2 * o + 1])).r;
+    assert.equal(r, 'applied', orderNo);
+    checked++;
+    await one(`select core.apply_order_finance_batch(1::smallint, 'amazon', 'jp', $1, $4::bigint, $2, $3, '[]'::jsonb) as r`, [orderNo, orderFinanceChecksum([]), AMAZON_FINANCE_TRANSFORM_VERSION, 900000 + 2 * o + 2]);
+  }
+  assert.equal(checked, 400);
+  assert.ok(withClass > 50 && feeRows > 50, `分けられない部品のある行 ${withClass}・月の手数料の行 ${feeRows} (場面が薄い)`);
 });
 
 server.close();

@@ -80,7 +80,9 @@ export function payloadChecksum(rows) {
  * db = pgAdapter / pgliteAdapter (query / exec)。取引はこの中で begin〜commit する。
  * throw: code = BAD_REQUEST (400) / RUN_MISMATCH・CHUNK_MISMATCH・RUN_CLOSED (409) / CHUNK_DEADLINE (503) / その他 (500)
  */
-export async function ingestChunk(db, { run, apply, runId, batchSeq, chunkIndex, last, transformVersion, rows, host = 'render', log = () => {}, deadlineMs = DEFAULT_DEADLINE_MS, now = () => Date.now(), statementTimeoutMs = STATEMENT_TIMEOUT_MS, rowWord = 'row', labelRow = () => ({}) }) {
+export async function ingestChunk(db, { run, apply, runId, batchSeq, chunkIndex, last, transformVersion, rows, host = 'render', log = () => {}, deadlineMs = DEFAULT_DEADLINE_MS, now = () => Date.now(), statementTimeoutMs = STATEMENT_TIMEOUT_MS, rowWord = 'row', labelRow = () => ({}),
+  fatalRowError = () => null }) {
+  // fatalRowError(e) → null (行の failed に吸収する = 既定・今までどおり) / Error (chunk 全体を rollback してその Error を投げる。#1554 Codex R2 Medium 1 = 財務の downgrade)
   const started = now();
   const remaining = () => deadlineMs - (now() - started);
   const deadline = (where) => err('CHUNK_DEADLINE', `chunk ${chunkIndex} exceeded ${deadlineMs} ms (${where}; send smaller chunks)`);
@@ -140,6 +142,8 @@ export async function ingestChunk(db, { run, apply, runId, batchSeq, chunkIndex,
         await db.exec('rollback to savepoint row');
         await db.exec('release savepoint row');
         if (isTimeout(e)) throw deadline(`statement timeout at ${r.key}`);   // 期限は行の failed に吸収しない (chunk ごと rollback)
+        const fatal = fatalRowError(e);
+        if (fatal) throw fatal;   // 呼び手が chunk ごと止めると決めた例外 (下の catch で取引全体を rollback)
         failed.push({ key: r.key, ...labelRow(r), error: String(e && e.message ? e.message : e).slice(0, 300) });
       }
       if (remaining() <= 0) throw deadline(`after ${rowWord} ${applied + same + stale + failed.length} of ${rows.length}`);

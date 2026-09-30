@@ -17,7 +17,8 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
-import { validateFinanceRows, orderFinanceChecksum, CONTENT_COLUMNS, pseudoOrderNo } from '../apps/company-db/finance/order-finance-checksum.mjs';
+import { validateFinanceRows, orderFinanceChecksum, financeRowsFormat, versionHasClass, CONTENT_COLUMNS, LEGACY_CONTENT_COLUMNS, CLASS_COLUMNS, pseudoOrderNo,
+  AMOUNT_COLUMNS, FEE_ROW_MATERIAL_COLUMNS, FEE_ROW_UNCLASSIFIED_COLUMNS } from '../apps/company-db/finance/order-finance-checksum.mjs';
 import { validateFinanceChunk, ingestOrderFinanceChunk } from '../apps/company-db/ingest/order-finance.mjs';
 import Database from 'better-sqlite3';
 
@@ -40,15 +41,19 @@ const U = 'amazon_settlement_unified';
 /** 行 (無い整数列は 0) */
 const row = (date, sku, x = {}) => ({ economic_date_jst: date, seller_sku: sku, line_kind: sku === '-' ? 'unknown' : 'sku', source: U, source_lines: 1, source_updated_at: `${date}T00:00:00Z`, content_hash: 'h', ...x });
 /** 受け口と同じ手順: 形を確かめ → 指紋を計算 → 関数へ */
-const apply = async (order, seq, rows, { version = 't1', mall = 'amazon', scope = 'jp' } = {}) => {
+//   0047: 旧い形 (4 列の鍵が無い) = 版 't1'・4 列を外して渡す / 今の形 = 版 amazon_finance_v2 (版と行の形は結び付いている)
+const V2 = 'amazon_finance_v2';
+const apply = async (order, seq, rows, { version = null, mall = 'amazon', scope = 'jp' } = {}) => {
+  const legacy = financeRowsFormat(rows) !== 'v2';
   const content = validateFinanceRows(order, rows);
-  const checksum = orderFinanceChecksum(content);
-  const lines = content.map((c, i) => ({ ...c, source_updated_at: rows[i].source_updated_at, content_hash: rows[i].content_hash }));
-  return (await one(`select core.apply_order_finance_batch($1::smallint, $2, $3, $4, $5::bigint, $6, $7, $8::jsonb) as r`, [co, mall, scope, order, seq, checksum, version, JSON.stringify(lines)])).r;
+  const checksum = orderFinanceChecksum(content, { legacy });
+  const lines = content.map((c, i) => { const o = { ...c, source_updated_at: rows[i].source_updated_at, content_hash: rows[i].content_hash }; if (legacy) for (const k of CLASS_COLUMNS) delete o[k]; return o; });
+  return (await one(`select core.apply_order_finance_batch($1::smallint, $2, $3, $4, $5::bigint, $6, $7, $8::jsonb) as r`, [co, mall, scope, order, seq, checksum, version ?? (legacy ? 't1' : V2), JSON.stringify(lines)])).r;
 };
-/** 形の検査を通さずに関数へ直接 (SQL の歯止めを確かめる) */
-const applyRaw = (order, seq, rows, checksum = 'a'.repeat(64), version = 't1') =>
-  one(`select core.apply_order_finance_batch($1::smallint, 'amazon', 'jp', $2, $3::bigint, $4, $5, $6::jsonb) as r`, [co, order, seq, checksum, version, JSON.stringify(rows)]);
+/** 形の検査を通さずに関数へ直接 (SQL の歯止めを確かめる)。4 列の鍵があれば版は amazon_finance_v2 */
+const applyRaw = (order, seq, rows, checksum = 'a'.repeat(64), version = null) =>
+  one(`select core.apply_order_finance_batch($1::smallint, 'amazon', 'jp', $2, $3::bigint, $4, $5, $6::jsonb) as r`,
+    [co, order, seq, checksum, version ?? (financeRowsFormat(rows) === 'v2' ? V2 : 't1'), JSON.stringify(rows)]);
 
 console.log('0043: 作り直しと安全の手順');
 await t('表・view・関数がそろい、旧互換 (legacy_*・v_finance_daily_legacy・assert_legacy_complete) は無い', async () => {
@@ -226,8 +231,8 @@ await t('形の検査: 安全でない整数 (上限外・足すと超える)・
   assert.throws(() => validateFinanceRows('A1', [row('2026-02-30', 'a')]), /not a date/);
 });
 await t('受け口: 送り手の申告の指紋が内容と違えば 400・合っていれば通る', async () => {
-  const rows = [row('2026-09-01', 'a', { sales_principal_jpy: 5 })];
-  const good = orderFinanceChecksum(validateFinanceRows('A1', rows));
+  const rows = [row('2026-09-01', 'a', { sales_principal_jpy: 5 })];   // 旧い形 (0047 の 4 列の鍵が無い) = 指紋は旧い形の列で
+  const good = orderFinanceChecksum(validateFinanceRows('A1', rows), { legacy: true });
   const body = (cs) => ({ run_id: 'ship_202609291200000_abcdef', batch_seq: 1, chunk_index: 0, last: true, transform_version: 't1',
     rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'A1', header: { transform_version: 't1', set_checksum: cs }, lines: rows }] });
   assert.equal(validateFinanceChunk(body(good)).rows[0].set_checksum, good);
@@ -269,7 +274,7 @@ await t('🚨 通貨: JPY 以外の行は形の確かめで拒む (受け口の 
 });
 await t('受け口の道 (validateFinanceChunk → ingestOrderFinanceChunk) で入る・同じ chunk の再送は同じ結果', async () => {
   const rows = [row('2026-09-01', 'sku-http', { units_ordered: 1, sales_principal_jpy: 300 })];
-  const cs = orderFinanceChecksum(validateFinanceRows('H1', rows));
+  const cs = orderFinanceChecksum(validateFinanceRows('H1', rows), { legacy: true });   // 旧い形
   const body = { run_id: 'ship_202609291300000_abcdef', batch_seq: 3, chunk_index: 0, last: true, transform_version: 't1',
     rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'H1', header: { transform_version: 't1', set_checksum: cs }, lines: rows }] };
   const r = await ingestOrderFinanceChunk(pgliteAdapter(pg), { ...validateFinanceChunk(body), host: 'test' });
@@ -293,7 +298,13 @@ await t('指紋は固定の値 (日本語の SKU = UTF-8 のバイト順で a < 
   const rs = validateFinanceRows('A1', [row('2026-09-02', 'b', { sales_principal_jpy: 5 }), row('2026-09-01', 'あ', { units_ordered: 1 }), row('2026-09-01', 'a', { commission_jpy: -3 })]);
   const json = '[["2026-09-01","a","sku","amazon_settlement_unified",0,0,0,0,0,-3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],["2026-09-01","あ","sku","amazon_settlement_unified",1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],["2026-09-02","b","sku","amazon_settlement_unified",0,5,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]]';
   assert.equal(crypto.createHash('sha256').update(Buffer.from(json, 'utf8')).digest('hex'), 'da0531f5f6d092cdc3cc473c2be393713813f923f10fe373d6603aa456bb81b1');
-  assert.equal(orderFinanceChecksum(rs), 'da0531f5f6d092cdc3cc473c2be393713813f923f10fe373d6603aa456bb81b1');   // 列の順・並べ方・JSON の書き方を変えたら落ちる (送り手と受け口の取り決め)
+  // 旧い形 (0043〜0046 の取り決め) の値は 0047 の後も変わらない = 古い送り手の申告と合う
+  assert.equal(orderFinanceChecksum(rs, { legacy: true }), 'da0531f5f6d092cdc3cc473c2be393713813f923f10fe373d6603aa456bb81b1');   // 列の順・並べ方・JSON の書き方を変えたら落ちる (送り手と受け口の取り決め)
+  // 今の形 (0047) = 各行の後ろに 4 列 (分けられない部品の数・符号つき・絶対値・unmapped の部品の数)
+  const json2 = '[["2026-09-01","a","sku","amazon_settlement_unified",0,0,0,0,0,-3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0],["2026-09-01","あ","sku","amazon_settlement_unified",1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0],["2026-09-02","b","sku","amazon_settlement_unified",0,5,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0]]';
+  const want2 = crypto.createHash('sha256').update(Buffer.from(json2, 'utf8')).digest('hex');
+  assert.equal(want2, 'ef7750d06729d79ec9439656a7965b8e54442dbff988c29dac478a4e45ae12c4');
+  assert.equal(orderFinanceChecksum(rs), 'ef7750d06729d79ec9439656a7965b8e54442dbff988c29dac478a4e45ae12c4');
 });
 await t('🚨 0043 は受領状態・公開の表のどれかに 1 行でもあれば止まる', async () => {
   for (const setup of [
@@ -306,6 +317,301 @@ await t('🚨 0043 は受領状態・公開の表のどれかに 1 行でもあ�
     await rejects(() => applyMigrations(pgliteAdapter(pg3), { log: quiet }), /0012 の表が空ではない/);
     await pg3.close();
   }
+});
+
+console.log('0047 分けられない部品の 4 列・mart.finance_daily_sku_range (D7b-1a)');
+/** 今の形 (0047) の 4 列 = 部品の数・符号つき・絶対値・unmapped の部品の数 */
+const C4 = (c = 0, m = 0, a = 0, u = 0) => ({ unclassified_component_count: c, unclassified_mapped_jpy: m, unclassified_abs_jpy: a, unmapped_component_count: u });
+await t('🚨 形の確かめ: 4 列は全部あるか全部無いか (行の中・行の間)・今の形だけ unmapped の金額には部品が要る・SKU の行は 分けられない列の和 = 符号つき・絶対値はその列の絶対値の和以上・どの形でも数 0 ⇔ 絶対値 0', async () => {
+  assert.throws(() => validateFinanceRows('V1', [row('2026-09-01', 'a', { unclassified_component_count: 1 })]), /all together/);
+  assert.throws(() => validateFinanceRows('V1', [row('2026-09-01', 'a', C4()), row('2026-09-02', 'a')]), /mix the new form/);
+  assert.equal(financeRowsFormat([]), 'empty'); assert.equal(financeRowsFormat([row('2026-09-01', 'a')]), 'legacy'); assert.equal(financeRowsFormat([row('2026-09-01', 'a', C4())]), 'v2');
+  assert.throws(() => validateFinanceRows('V1', [row('2026-09-01', 'a', { unmapped_jpy: -7, ...C4() })]), /unmapped_component_count is 0/);
+  assert.doesNotThrow(() => validateFinanceRows('V1', [row('2026-09-01', 'a', { unmapped_jpy: -7 })]));   // 旧い形 = 数を持たない (既存の行と同じ)
+  assert.doesNotThrow(() => validateFinanceRows('V1', [row('2026-09-01', 'a', { unmapped_jpy: 0, ...C4(0, 0, 0, 2) })]));   // +5 / −5 の相殺 = 部品 2
+  assert.throws(() => validateFinanceRows('V1', [row('2026-09-01', 'a', { other_amount_jpy: 100, ...C4() })]), /must equal/);   // 分けられない金額があるのに数 0
+  assert.throws(() => validateFinanceRows('V1', [row('2026-09-01', 'a', { other_amount_jpy: 100, misc_fee_jpy: -100, ...C4(1, 0, 150) })]), /must be >=/);   // 列の打ち消しを絶対値で隠さない
+  assert.doesNotThrow(() => validateFinanceRows('V1', [row('2026-09-01', 'a', { other_amount_jpy: 100, misc_fee_jpy: -100, ...C4(2, 0, 200) })]));
+  assert.throws(() => validateFinanceRows('V1', [row('2026-09-01', '-', { line_kind: 'storage', ...C4(0, 0, 5) })]), /iff/);
+  assert.throws(() => validateFinanceRows('V1', [row('2026-09-01', '-', { line_kind: 'storage', ...C4(1, 9, 5) })]), /<= unclassified_abs_jpy/);
+  assert.throws(() => validateFinanceRows('V1', [row('2026-09-01', '-', { line_kind: 'storage', ...C4(0, 0, 0, -1) })]), />= 0/);
+  assert.doesNotThrow(() => validateFinanceRows('V1', [row('2026-09-01', '-', { line_kind: 'storage', misc_fee_jpy: 3, fba_storage_jpy: -300, account_fee_amount_jpy: -300, ...C4(1, 3, 3) })]));   // 手数料の行は列の和の決めなし
+});
+await t('🚨 SQL の歯止め (0047 の CHECK): 数 0 で絶対値あり・|符号つき| > 絶対値・負の数 → 例外', async () => {
+  await rejects(() => applyRaw('ck-1', 1, [row('2026-09-05', 'sku-b', C4(0, 0, 5))]), /ck_order_finance_daily_unclassified/);
+  // |符号つき| > 絶対値: 今の形の版の行では ck_order_finance_daily_class_form が先に拒む (絶対値 ≥ 部品の絶対値の和 ≥ |符号つき|) → どの版の行にも効く表の CHECK を旧い版の行の更新で確かめる
+  await rejects(() => applyRaw('ck-2', 1, [row('2026-09-05', '-', { line_kind: 'storage', misc_fee_jpy: -9, ...C4(1, -9, 5) })]), /ck_order_finance_daily_class_form/);
+  await rejects(() => pg.query(`update core.order_finance_daily set unclassified_component_count = 1, unclassified_mapped_jpy = -9, unclassified_abs_jpy = 5 where mall_order_no = 'O3'`), /ck_order_finance_daily_unclassified/);
+  await rejects(() => applyRaw('ck-3', 1, [row('2026-09-05', 'sku-b', C4(0, 0, 0, -1))]), /ck_order_finance_daily_unmapped_count/);
+  assert.equal(await num(`select count(*) as n from core.order_finance_daily where mall_order_no like 'ck-%'`), 0);
+});
+await t('受け口: 旧い形 = 旧い列の指紋・正規化した行に 4 列を出さない (古い送り手の受領記録の指紋と同じ) / 今の形 = 4 列つきの指紋 (旧い列の指紋は 400)', async () => {
+  const body = (lines, cs, v = 't1') => ({ run_id: 'ship_202609301200000_abcdef', batch_seq: 1, chunk_index: 0, last: true, transform_version: v,
+    rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'F1', header: { transform_version: v, set_checksum: cs }, lines }] });
+  const old = [row('2026-09-01', 'a', { sales_principal_jpy: 5 })];
+  const vOld = validateFinanceChunk(body(old, orderFinanceChecksum(validateFinanceRows('F1', old), { legacy: true }))).rows[0];
+  for (const c of CLASS_COLUMNS) assert.ok(!Object.hasOwn(vOld.lines[0], c), `旧い形の正規化した行に ${c} がある`);
+  assert.deepEqual(Object.keys(vOld.lines[0]), [...LEGACY_CONTENT_COLUMNS, 'source_updated_at', 'content_hash']);   // 0046 までの受け口と同じ形 = 受領記録の指紋が同じ
+  const neu = [row('2026-09-01', 'a', { sales_principal_jpy: 5, other_amount_jpy: 0, ...C4(2, 0, 200) })];
+  const vNew = validateFinanceChunk(body(neu, orderFinanceChecksum(validateFinanceRows('F1', neu)), V2)).rows[0];
+  assert.deepEqual([vNew.lines[0].unclassified_component_count, vNew.lines[0].unclassified_abs_jpy], [2, 200]);
+  assert.throws(() => validateFinanceChunk(body(neu, orderFinanceChecksum(validateFinanceRows('F1', neu), { legacy: true }), V2)), /set_checksum differs/);
+  // router: NOT_MIGRATED / DOWNGRADE は 409
+  const src = fs.readFileSync(new URL('../apps/company-db/router.mjs', import.meta.url), 'utf8');
+  assert.match(src, /e\.code === 'NOT_MIGRATED' \|\| e\.code === 'DOWNGRADE'\) \? 409/);
+});
+await t('🚨 版と行の形 (#1554 Codex R1 High): v2 の版で 4 列が無い・null・一部 = 400 / 旧い版で 4 列あり = 400 / 墓石 (空の集合) はどちらでも通る / JS と SQL の版の規則が同じ', async () => {
+  const body = (lines, v) => ({ run_id: 'ship_202609301200000_abcdef', batch_seq: 1, chunk_index: 0, last: true, transform_version: v,
+    rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'G1', header: { transform_version: v, set_checksum: orderFinanceChecksum(validateFinanceRows('G1', lines), { legacy: financeRowsFormat(lines) !== 'v2' }) }, lines }] });
+  const old = [row('2026-09-01', 'a', { sales_principal_jpy: 5 })];
+  assert.throws(() => validateFinanceChunk(body(old, V2)), /needs unclassified_component_count/);
+  assert.throws(() => validateFinanceChunk(body(old, 'amazon_finance_v3_x')), /needs/);
+  const nul = [row('2026-09-01', 'a', { sales_principal_jpy: 5, ...C4(), unclassified_abs_jpy: null })];
+  assert.throws(() => validateFinanceChunk(body(nul, V2)), /must not be null/);
+  assert.throws(() => validateFinanceChunk(body([row('2026-09-01', 'a', { unclassified_component_count: 0 })], V2)), /all together/);
+  const neu = [row('2026-09-01', 'a', { sales_principal_jpy: 5, ...C4() })];
+  assert.throws(() => validateFinanceChunk(body(neu, 'amazon_finance_v1')), /old version but the rows carry/);
+  assert.doesNotThrow(() => validateFinanceChunk(body([], V2)));
+  assert.doesNotThrow(() => validateFinanceChunk(body([], 't1')));
+  // SQL の歯止め (受け口の JS を通らない道でも)
+  await rejects(() => applyRaw('vf-1', 1, [row('2026-09-05', 'sku-b')], 'a'.repeat(64), V2), /version_form/);
+  await rejects(() => applyRaw('vf-2', 1, [row('2026-09-05', 'sku-b', { ...C4(), unclassified_mapped_jpy: null })], 'a'.repeat(64), V2), /version_form/);
+  await rejects(() => applyRaw('vf-3', 1, [row('2026-09-05', 'sku-b', C4())], 'a'.repeat(64), 't1'), /version_form/);
+  for (const v of ['amazon_finance_v1', 'amazon_finance_v2', 'amazon_finance_v10', 'amazon_finance_v2_test', 'amazon_finance_v1_test', 't1', '', 'xamazon_finance_v2', 'amazon_finance_v2-x', null]) {
+    const sql = (await one(`select core.finance_version_has_class($1) as b`, [v])).b;
+    assert.equal(sql, versionHasClass(v), `版 ${v}: SQL ${sql} / JS ${versionHasClass(v)}`);
+  }
+  assert.deepEqual(['amazon_finance_v1', 'amazon_finance_v2', 'amazon_finance_v2_test', 't1'].map(versionHasClass), [false, true, true, false]);
+});
+await t('🚨 旧い版への戻しを拒む (#1554 Codex R1 High): v2 で受けた注文を より新しい世代の旧い版 (4 列なし) で送っても 4 列は残る (受け口 = chunk ごと 409 DOWNGRADE / SQL = 例外)・墓石も・v2 の世代の続きは通る', async () => {
+  const good = [row('2026-09-02', 'sku-dg', { sales_principal_jpy: 100, other_amount_jpy: 7, ...C4(1, 7, 7, 0) })];
+  const send = (no, lines, seq, v, run) => ingestOrderFinanceChunk(pgliteAdapter(pg), { ...validateFinanceChunk({ run_id: run, batch_seq: seq, chunk_index: 0, last: true, transform_version: v,
+    rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: no, header: { transform_version: v, set_checksum: orderFinanceChecksum(validateFinanceRows(no, lines), { legacy: financeRowsFormat(lines) !== 'v2' }) }, lines }] }), host: 'test' });
+  assert.equal((await send('DG1', good, 10, V2, 'ship_202609301400000_dddddd')).applied, 1);
+  const e = await rejects(() => send('DG1', [row('2026-09-02', 'sku-dg', { sales_principal_jpy: 100, other_amount_jpy: 7 })], 11, 'amazon_finance_v1', 'ship_202609301400001_dddddd'), /downgrade/);
+  assert.equal(e.code, 'DOWNGRADE');
+  await rejects(() => send('DG1', [], 12, 'amazon_finance_v1', 'ship_202609301400002_dddddd'), /downgrade/);   // 墓石で消すのも旧い版では拒む
+  const kept = await one(`select unclassified_component_count c, unclassified_abs_jpy::int a, received_batch_seq::int s from core.order_finance_daily where mall_order_no = 'DG1'`);
+  assert.deepEqual([kept.c, kept.a, kept.s], [1, 7, 10]);
+  assert.equal((await one(`select transform_version v from core.order_finance_receipts where mall_order_no = 'DG1'`)).v, V2);
+  // SQL の関数を直接 (JS の検査を通らない道・同時の書き込みの保険)
+  await rejects(() => apply('DG1', 13, [row('2026-09-02', 'sku-dg', { sales_principal_jpy: 100, other_amount_jpy: 7 })], { version: 'amazon_finance_v1' }), /downgrade/);
+  assert.equal((await one(`select unclassified_component_count c from core.order_finance_daily where mall_order_no = 'DG1'`)).c, 1);
+  // 今の形の版の続き (より新しい v2 の世代・v3) は通る
+  assert.equal((await send('DG1', good, 14, V2, 'ship_202609301400004_dddddd')).same, 1);
+  assert.equal((await send('DG1', good, 15, 'amazon_finance_v3', 'ship_202609301400005_dddddd')).applied, 1);
+  // 旧い版の注文 (受領記録が旧い版) は旧い版のまま送れる (downgrade ではない)
+  assert.equal((await send('DG2', [row('2026-09-02', 'sku-dg2', { sales_principal_jpy: 1 })], 16, 't1', 'ship_202609301400006_dddddd')).applied, 1);
+  assert.equal((await send('DG2', [row('2026-09-02', 'sku-dg2', { sales_principal_jpy: 2 })], 17, 't1', 'ship_202609301400007_dddddd')).applied, 1);
+  await apply('DG1', 16, [], { version: 'amazon_finance_v3' }); await apply('DG2', 18, []);
+});
+await t('🚨 競合 (#1554 Codex R2 Medium 1): 事前の照会の後・取引の前に別の送信が受領記録を v2 にしても、旧い版の chunk は全体が 409 DOWNGRADE・ほかの行も入らない (行の failed に吸収しない)', async () => {
+  const base = pgliteAdapter(pg);
+  let raced = false;
+  const racy = {
+    ...base,
+    query: async (sql, params) => {
+      const r = await base.query(sql, params);
+      // 受け口の事前の照会 (受領記録の版) の直後に、別の送り手が CR2 を v2 で送った
+      if (!raced && /from core\.order_finance_receipts/.test(sql) && /any\(\$4::text\[\]\)/.test(sql)) {
+        raced = true;
+        assert.equal(await apply('CR2', 50, [row('2026-09-03', 'sku-cr2', { sales_principal_jpy: 10, ...C4() })]), 'applied');
+      }
+      return r;
+    },
+  };
+  const lines1 = [row('2026-09-03', 'sku-cr1', { sales_principal_jpy: 1 })], lines2 = [row('2026-09-03', 'sku-cr2', { sales_principal_jpy: 2 })];
+  const cs = (no, l) => orderFinanceChecksum(validateFinanceRows(no, l), { legacy: true });
+  const body = { run_id: 'ship_202609301600000_ffffff', batch_seq: 51, chunk_index: 0, last: true, transform_version: 't1',
+    rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'CR1', header: { transform_version: 't1', set_checksum: cs('CR1', lines1) }, lines: lines1 },
+      { mall: 'amazon', scope_key: 'jp', mall_order_no: 'CR2', header: { transform_version: 't1', set_checksum: cs('CR2', lines2) }, lines: lines2 }] };
+  const e = await rejects(() => ingestOrderFinanceChunk(racy, { ...validateFinanceChunk(body), host: 'test' }), /downgrade/);
+  assert.ok(raced, '競合を作れていない');
+  assert.equal(e.code, 'DOWNGRADE');
+  assert.equal(await num(`select count(*) as n from core.order_finance_receipts where mall_order_no = 'CR1'`), 0);   // 先の行 (CR1) も入っていない = chunk 全体を rollback
+  assert.equal(await num(`select count(*) as n from ops.ingest_chunks where ingest_run_id = 'ship_202609301600000_ffffff'`), 0);
+  assert.equal((await one(`select transform_version v from core.order_finance_receipts where mall_order_no = 'CR2'`)).v, V2);
+  // ほかのモールの受け口の挙動は変えない = 財務でも downgrade 以外の行の例外は今までどおり行の failed
+  const bad = { ...body, run_id: 'ship_202609301600001_ffffff', batch_seq: 52, rows: [body.rows[0]] };
+  const r = await ingestOrderFinanceChunk({ ...base, query: async (sql, p) => { if (/apply_order_finance_batch/.test(sql)) throw new Error('boom'); return base.query(sql, p); } }, { ...validateFinanceChunk(bad), host: 'test' });
+  assert.deepEqual([r.applied, r.failed.length], [0, 1]);
+  await apply('CR2', 53, [], { version: V2 });
+});
+await t('🚨 競合で v2 の世代のほうが新しい (#1554 Codex R3 Medium 1): 旧い版の chunk 61 の事前の照会の後に別の送信が v2 を世代 62 で入れても stale で素通りせず、chunk 全体が 409・先の行と ops.ingest_chunks も入らない', async () => {
+  const base = pgliteAdapter(pg);
+  let raced = false;
+  const racy = {
+    ...base,
+    query: async (sql, params) => {
+      const r = await base.query(sql, params);
+      if (!raced && /from core\.order_finance_receipts/.test(sql) && /any\(\$4::text\[\]\)/.test(sql)) {
+        raced = true;
+        assert.equal(await apply('CR4', 62, [row('2026-09-03', 'sku-cr4', { sales_principal_jpy: 10, ...C4() })]), 'applied');   // chunk (61) より新しい世代
+      }
+      return r;
+    },
+  };
+  const lines3 = [row('2026-09-03', 'sku-cr3', { sales_principal_jpy: 1 })], lines4 = [row('2026-09-03', 'sku-cr4', { sales_principal_jpy: 2 })];
+  const cs = (no, l) => orderFinanceChecksum(validateFinanceRows(no, l), { legacy: true });
+  const body = { run_id: 'ship_202609301700000_ffffff', batch_seq: 61, chunk_index: 0, last: true, transform_version: 't1',
+    rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: 'CR3', header: { transform_version: 't1', set_checksum: cs('CR3', lines3) }, lines: lines3 },
+      { mall: 'amazon', scope_key: 'jp', mall_order_no: 'CR4', header: { transform_version: 't1', set_checksum: cs('CR4', lines4) }, lines: lines4 }] };
+  const e = await rejects(() => ingestOrderFinanceChunk(racy, { ...validateFinanceChunk(body), host: 'test' }), /downgrade/);
+  assert.ok(raced, '競合を作れていない');
+  assert.equal(e.code, 'DOWNGRADE');
+  assert.equal(await num(`select count(*) as n from core.order_finance_receipts where mall_order_no = 'CR3'`), 0);
+  assert.equal(await num(`select count(*) as n from ops.ingest_chunks where ingest_run_id = 'ship_202609301700000_ffffff'`), 0);
+  const cr4 = await one(`select r.transform_version v, r.received_batch_seq::int s, d.unclassified_component_count c from core.order_finance_receipts r join core.order_finance_daily d using (company_id, mall, scope_key, mall_order_no) where r.mall_order_no = 'CR4'`);
+  assert.deepEqual([cr4.v, cr4.s, cr4.c], [V2, 62, 0]);
+  // SQL の関数を直接: 旧い版で古い世代 (stale の分岐) でも downgrade の例外
+  await rejects(() => apply('CR4', 60, [row('2026-09-03', 'sku-cr4', { sales_principal_jpy: 2 })], { version: 't1' }), /downgrade/);
+  await apply('CR4', 63, [], { version: V2 });
+});
+await t('🚨 SKU の無い行の等式 (#1554 Codex R2 Medium 2): 月の手数料の行で分類の漏れを 4 列 0 と偽る (misc_fee +3・net −97) = JS も SQL も拒む / not_account_fee・unknown の行は分けられない部品を持たない', async () => {
+  const fake = row('2026-09-04', '-', { line_kind: 'storage', fba_storage_jpy: -100, account_fee_amount_jpy: -100, misc_fee_jpy: 3, ...C4() });
+  assert.throws(() => validateFinanceRows('-:2026-09-04', [fake]), /on an account fee row net \(-97\) must equal .* \(-100\)/);
+  await rejects(() => applyRaw('-:2026-09-04', 1, [fake]), /ck_order_finance_daily_class_form/);
+  const honest = { ...fake, ...C4(1, 3, 3) };
+  assert.doesNotThrow(() => validateFinanceRows('-:2026-09-04', [honest]));
+  const na = row('2026-09-04', '-', { line_kind: 'not_account_fee', other_amount_jpy: -5, account_fee_amount_jpy: -5, ...C4(1, -5, 5) });
+  assert.throws(() => validateFinanceRows('-:2026-09-04', [na]), /must not carry unclassified components/);
+  await rejects(() => applyRaw('-:2026-09-04', 1, [na]), /ck_order_finance_daily_class_form/);
+  assert.doesNotThrow(() => validateFinanceRows('-:2026-09-04', [{ ...na, ...C4() }]));
+  // 🚨 別の列の間の相殺 (#1554 Codex R3 Medium 2): misc_fee +3・promotion −3・4 列 0 → net は −100 のまま = 保存則だけでは通ってしまう → 絶対値と数で拒む
+  const cancel = row('2026-09-04', '-', { line_kind: 'storage', fba_storage_jpy: -100, account_fee_amount_jpy: -100, misc_fee_jpy: 3, promotion_jpy: -3, ...C4() });
+  assert.throws(() => validateFinanceRows('-:2026-09-04', [cancel]), /unclassified_abs_jpy \(0\) must be >= the absolute unclassified parts \(6\)/);
+  await rejects(() => applyRaw('-:2026-09-04', 1, [cancel]), /ck_order_finance_daily_class_form/);
+  assert.throws(() => validateFinanceRows('-:2026-09-04', [{ ...cancel, ...C4(1, 0, 6) }]), /unclassified_component_count \(1\) must be >= the non-zero unclassified parts \(2\)/);
+  await rejects(() => applyRaw('-:2026-09-04', 1, [{ ...cancel, ...C4(1, 0, 6) }]), /ck_order_finance_daily_class_form/);
+  assert.doesNotThrow(() => validateFinanceRows('-:2026-09-04', [{ ...cancel, ...C4(2, 0, 6) }]));   // 正しい申告 = 部品 2・符号つき 0・絶対値 6
+  // 材料の入りうる列の中の分けられない分 (Easy Ship の料金 −540 のうち材料 −500・other_amount に入った price −40) も数える
+  const mixed = row('2026-09-04', '-', { line_kind: 'easy_ship', other_fee_jpy: -500, other_amount_jpy: -40, account_fee_amount_jpy: -500, misc_fee_jpy: 40, ...C4(1, 40, 40) });
+  assert.throws(() => validateFinanceRows('-:2026-09-04', [mixed]), /must equal|must be >=/);
+  assert.doesNotThrow(() => validateFinanceRows('-:2026-09-04', [{ ...mixed, ...C4(2, 0, 80) }]));
+  assert.deepEqual([...FEE_ROW_MATERIAL_COLUMNS, ...FEE_ROW_UNCLASSIFIED_COLUMNS].sort(), [...AMOUNT_COLUMNS].sort());   // 20 列を過不足なく 2 つに分ける
+  // SKU の行も 0 でない分けられない列の数 ≤ 部品の数
+  assert.throws(() => validateFinanceRows('sq-0', [row('2026-09-04', 'sku-sq', { other_amount_jpy: 9, misc_fee_jpy: -9, ...C4(1, 0, 18) })]), /non-zero unclassified columns \(2\)/);
+  await rejects(() => applyRaw('sq-0', 1, [row('2026-09-04', 'sku-sq', { other_amount_jpy: 9, misc_fee_jpy: -9, ...C4(1, 0, 18) })]), /ck_order_finance_daily_class_form/);
+  // SQL の等式 (SKU の行・unmapped の部品) も JS と同じ
+  await rejects(() => applyRaw('sq-1', 1, [row('2026-09-04', 'sku-sq', { other_amount_jpy: 9, ...C4() })]), /ck_order_finance_daily_class_form/);
+  await rejects(() => applyRaw('sq-2', 1, [row('2026-09-04', 'sku-sq', { unmapped_jpy: 9, ...C4() })]), /ck_order_finance_daily_class_form/);
+  await rejects(() => applyRaw('sq-3', 1, [row('2026-09-04', 'sku-sq', { other_amount_jpy: 9, misc_fee_jpy: -9, ...C4(2, 0, 9) })]), /ck_order_finance_daily_class_form/);
+  assert.equal(await num(`select count(*) as n from core.order_finance_receipts where mall_order_no in ('-:2026-09-04', 'sq-1', 'sq-2', 'sq-3')`), 0);
+  // 旧い形の行 (旧い版) は対象の外 (既存の行と同じ = 数を持たない)
+  assert.equal(await apply('-:2026-09-04', 1, [row('2026-09-04', '-', { line_kind: 'storage', fba_storage_jpy: -100, account_fee_amount_jpy: -100, misc_fee_jpy: 3 })]), 'applied');
+  await apply('-:2026-09-04', 2, []);
+});
+await t('🚨 0047 の適用前: 旧い形は受ける・今の形は NOT_MIGRATED (4 列が黙って落ちない) → 0047 の後: 既存の行は 0・今の形が入る', async () => {
+  const pg2 = new PGlite();
+  const db2 = pgliteAdapter(pg2);
+  await applyMigrations(db2, { log: quiet, to: '0046' });
+  const send = async (no, lines, seq, run) => {
+    const legacy = financeRowsFormat(lines) === 'legacy';
+    const v = legacy ? 't1' : V2;
+    const body = { run_id: run, batch_seq: seq, chunk_index: 0, last: true, transform_version: v,
+      rows: [{ mall: 'amazon', scope_key: 'jp', mall_order_no: no, header: { transform_version: v, set_checksum: orderFinanceChecksum(validateFinanceRows(no, lines), { legacy }) }, lines }] };
+    return ingestOrderFinanceChunk(db2, { ...validateFinanceChunk(body), host: 'test' });
+  };
+  const r1 = await send('P1', [row('2026-09-01', 'sku-p1', { sales_principal_jpy: 100, unmapped_jpy: -3 })], 1, 'ship_202609301300000_aaaaaa');
+  assert.equal(r1.applied, 1);
+  const e = await rejects(() => send('P2', [row('2026-09-01', 'sku-p2', { sales_principal_jpy: 100, ...C4() })], 2, 'ship_202609301300001_aaaaaa'), /not_migrated/);
+  assert.equal(e.code, 'NOT_MIGRATED');
+  assert.equal(Number((await pg2.query(`select count(*) as n from core.order_finance_receipts where mall_order_no = 'P2'`)).rows[0].n), 0);
+  await applyMigrations(db2, { log: quiet });
+  const p1 = (await pg2.query(`select unclassified_component_count c, unclassified_mapped_jpy m, unclassified_abs_jpy a, unmapped_component_count u, unmapped_jpy uj from core.order_finance_daily where mall_order_no = 'P1'`)).rows[0];
+  assert.deepEqual([p1.c, Number(p1.m), Number(p1.a), p1.u, Number(p1.uj)], [0, 0, 0, 0, -3]);   // 既存の行は 0 (送り直すまで = D7b-1b の coverage は送り直すまで complete にならない)
+  const r2 = await send('P2', [row('2026-09-01', 'sku-p2', { sales_principal_jpy: 100, other_amount_jpy: 0, unmapped_jpy: -3, ...C4(2, 0, 200, 1) })], 3, 'ship_202609301300002_aaaaaa');
+  assert.equal(r2.applied, 1);
+  const p2 = (await pg2.query(`select unclassified_component_count c, unclassified_abs_jpy a, unmapped_component_count u from core.order_finance_daily where mall_order_no = 'P2'`)).rows[0];
+  assert.deepEqual([p2.c, Number(p2.a), p2.u], [2, 200, 1]);
+  await pg2.close();
+});
+
+// ── mart.finance_daily_sku_range ──
+// 2026-06 (もう終わった月 = estimated_monthly_unit_price) の場面:
+//   'sku-n1' (正規化) = 受け取った seller SKU 'SKU-N1' (N1) / 'sku-n1' (N2) / 'Sku-N1' (N3・出品を作る前に受け取った = 未解決)
+//     6/5: N1 2 個 2,000 円・手数料 −200・closing_fee −30・other_amount の +100 / −100 (部品 2・絶対値 200)
+//          N2 1 個 1,000 円・misc_fee +5 (部品 1)・unmapped −7 (部品 1) / N3 1 個 500 円
+//     6/10: N1 の返品 本体 −1,000 (customer) → 'SKU-N1' の 6 月の単価 1,000 → 1 個
+//   'sku-m' = 'SKU-M' (6/2 1 個 1,000・6/15 返品 −1,000 = 1 個) と 'sku-m' (6/15 A-to-z −300・6 月の売上なし = 単価なし) → 子は unit_price_missing
+//   'sku-zz' = 6/12 返品 −500・売上なし → unit_price_missing / 'sku-f7' = 6/3 3 個 2 円・6/20 返品 −1 円 → 1,000,000 ÷ 666,667 = 1.4999992… → 1 個・丸める前 1.499999
+// 2099-03 (まだ終わっていない月) = 'sku-p' 3/1 1 個 800・3/2 返品 −800 → estimated_partial_month_unit_price
+const skuRange = async (from, to) => (await pg.query(`select * from mart.finance_daily_sku_range(1::smallint, 'amazon', 'jp', $1::date, $2::date)`, [from, to])).rows;
+const at = (rows, date, norm) => rows.find((r) => (r.economic_date_jst.toISOString ? r.economic_date_jst.toISOString().slice(0, 10) : String(r.economic_date_jst)) === date && r.seller_sku_norm === norm);
+let listingN1 = null;
+await t('🚨 手で計算: 正規化 SKU にまとめる・受け取りの出品 (解決済みと未解決が同じ日・同じ SKU に混ざる)・closing_fee を引く・net / unmapped・分けられない部品は相殺しても数で残る', async () => {
+  await apply('N3', 1, [row('2026-06-05', 'Sku-N1', { units_ordered: 1, sales_principal_jpy: 500 })]);   // 出品を作る前 = 未解決
+  listingN1 = Number((await one(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'amazon', 'main@A1VC38T7YXB528', 'sku-n1', 'active') returning listing_id`)).listing_id);
+  await apply('N1', 1, [
+    row('2026-06-05', 'SKU-N1', { units_ordered: 2, sales_principal_jpy: 2000, commission_jpy: -200, closing_fee_jpy: -30, other_amount_jpy: 0, ...C4(2, 0, 200, 0) }),
+    row('2026-06-10', 'SKU-N1', { refund_principal_jpy: -1000, refund_principal_customer_jpy: -1000, ...C4() }),
+  ]);
+  await apply('N2', 1, [row('2026-06-05', 'sku-n1', { units_ordered: 1, sales_principal_jpy: 1000, misc_fee_jpy: 5, unmapped_jpy: -7, ...C4(1, 5, 5, 1) })]);
+  const rows = await skuRange('2026-06-01', '2026-06-30');
+  const n5 = at(rows, '2026-06-05', 'sku-n1');
+  assert.ok(n5, JSON.stringify(rows.map((r) => [r.economic_date_jst, r.seller_sku_norm])));
+  assert.equal(rows.filter((r) => r.seller_sku_norm === 'sku-n1' && at([r], '2026-06-05', 'sku-n1')).length, 1);   // 3 つの表記が 1 行に
+  assert.deepEqual(n5.received_listing_ids.map(Number), [listingN1]);
+  assert.equal(n5.received_listing_unresolved_count, 1);
+  const n = (x) => Number(x);
+  assert.deepEqual([n5.units_ordered, n(n5.sales_principal_jpy), n(n5.commission_jpy), n(n5.closing_fee_jpy), n(n5.misc_fee_jpy), n(n5.other_amount_jpy)], [4, 3500, 200, 30, 5, 0]);
+  assert.equal(n(n5.profit_before_cogs_jpy), 3500 - 200 - 30);   // §3.5b: closing_fee も引く
+  assert.deepEqual([n(n5.net_jpy), n(n5.unmapped_jpy)], [(2000 - 200 - 30) + (1000 + 5 - 7) + 500, -7]);
+  assert.deepEqual([n5.unclassified_component_count, n(n5.unclassified_mapped_jpy), n(n5.unclassified_abs_jpy), n5.unmapped_component_count], [3, 5, 205, 1]);   // +100 / −100 は金額 0 でも 2 つ
+  assert.deepEqual([n5.order_rows, n5.source_lines, n5.refund_units_status, Number(n5.units_refunded_customer_unrounded), n(n5.refund_unestimated_jpy)], [3, 3, 'no_refund', 0, 0]);
+  const n10 = at(rows, '2026-06-10', 'sku-n1');
+  assert.deepEqual([n10.units_refunded_customer, n10.units_net_sold, n(n10.refund_principal_jpy), n(n10.profit_before_cogs_jpy), n10.refund_units_status, String(n10.units_refunded_customer_unrounded)],
+    [1, -1, 1000, -1000, 'estimated_monthly_unit_price', '1.000000']);
+  assert.deepEqual([n10.received_listing_ids.map(Number), n10.received_listing_unresolved_count], [[listingN1], 0]);
+});
+await t('🚨 返品の状態の 4 つ: no_refund / estimated_monthly_unit_price / unit_price_missing (子にまとめると弱い方・推定できない額) / estimated_partial_month_unit_price (月が終わっていない)・丸める前の返品数', async () => {
+  await apply('M1', 1, [row('2026-06-02', 'SKU-M', { units_ordered: 1, sales_principal_jpy: 1000 }), row('2026-06-15', 'SKU-M', { refund_principal_jpy: -1000, refund_principal_customer_jpy: -1000 })]);
+  await apply('M2', 1, [row('2026-06-15', 'sku-m', { refund_principal_jpy: -300, refund_principal_atoz_jpy: -300 })]);
+  await apply('Z1', 1, [row('2026-06-12', 'sku-zz', { refund_principal_jpy: -500, refund_principal_customer_jpy: -500 })]);
+  await apply('F7', 1, [row('2026-06-03', 'sku-f7', { units_ordered: 3, sales_principal_jpy: 2 }), row('2026-06-20', 'sku-f7', { refund_principal_jpy: -1, refund_principal_customer_jpy: -1 })]);
+  await apply('PP', 1, [row('2099-03-01', 'sku-p', { units_ordered: 1, sales_principal_jpy: 800 }), row('2099-03-02', 'sku-p', { refund_principal_jpy: -800, refund_principal_customer_jpy: -800 })]);
+  const rows = await skuRange('2026-06-01', '2026-06-30');
+  const m15 = at(rows, '2026-06-15', 'sku-m');
+  assert.deepEqual([m15.refund_units_status, m15.units_refunded_customer, m15.units_a_to_z_refund, m15.units_refunded_customer_unrounded, m15.units_a_to_z_refund_unrounded, Number(m15.refund_unestimated_jpy), Number(m15.refund_principal_jpy)],
+    ['unit_price_missing', 1, 0, null, null, 300, 1300]);   // 'SKU-M' は 1 個と推定できるが 'sku-m' の A-to-z 300 円は単価が無い = 子は unit_price_missing
+  assert.equal(at(rows, '2026-06-02', 'sku-m').refund_units_status, 'no_refund');
+  const z = at(rows, '2026-06-12', 'sku-zz');
+  assert.deepEqual([z.refund_units_status, z.units_refunded_customer, Number(z.refund_unestimated_jpy)], ['unit_price_missing', 0, 500]);
+  const f7 = at(rows, '2026-06-20', 'sku-f7');
+  assert.deepEqual([f7.refund_units_status, f7.units_refunded_customer, String(f7.units_refunded_customer_unrounded)], ['estimated_monthly_unit_price', 1, '1.499999']);
+  const p = at(await skuRange('2099-03-01', '2099-03-31'), '2099-03-02', 'sku-p');
+  assert.deepEqual([p.refund_units_status, p.units_refunded_customer, String(p.units_refunded_customer_unrounded)], ['estimated_partial_month_unit_price', 1, '1.000000']);
+  const all4 = new Set([...rows, p].map((r) => r.refund_units_status));
+  for (const s of ['no_refund', 'estimated_monthly_unit_price', 'unit_price_missing', 'estimated_partial_month_unit_price']) assert.ok(all4.has(s), s);
+});
+await t('🚨 今の mart.finance_daily_range と同じ期間の金額・数量の合計が一致 (粒度だけ違う。closing_fee は新しい関数だけが持ち、その分だけ利益が小さい)', async () => {
+  const cols = ['units_ordered', 'units_refunded_customer', 'units_marketplace_guarantee', 'units_a_to_z_refund', 'units_net_sold', 'sales_principal_jpy', 'sales_shipping_jpy', 'sales_giftwrap_jpy', 'sales_tax_jpy',
+    'commission_jpy', 'fba_fulfillment_jpy', 'fba_storage_jpy', 'shipping_chargeback_jpy', 'giftwrap_chargeback_jpy', 'promotion_jpy', 'promotion_tax_jpy', 'points_jpy',
+    'warehouse_damage_jpy', 'warehouse_lost_jpy', 'safe_t_jpy', 'refund_principal_jpy', 'reversal_reimbursement_jpy', 'misc_fee_jpy', 'other_fee_jpy', 'other_amount_jpy', 'source_lines', 'order_rows'];
+  for (const [from, to] of [['2026-06-01', '2026-06-30'], ['2026-06-10', '2026-06-15'], ['2026-01-01', '2026-12-31'], ['2099-03-01', '2099-03-31']]) {
+    const q = (fn) => one(`select ${[...cols, 'closing_fee_jpy', 'profit_before_cogs_jpy'].map((c) => `coalesce(sum(${c}), 0)::bigint::text as ${c}`).join(', ')} from mart.${fn}(1::smallint, 'amazon', 'jp', $1::date, $2::date)`, [from, to]);
+    const a = await q('finance_daily_range'), b = await q('finance_daily_sku_range');
+    for (const c of cols) assert.equal(b[c], a[c], `${from}〜${to} ${c}`);
+    assert.equal(a.closing_fee_jpy, '0');   // 0045 は固定の 0
+    assert.equal(Number(b.profit_before_cogs_jpy) + Number(b.closing_fee_jpy), Number(a.profit_before_cogs_jpy), `${from}〜${to} profit`);
+  }
+  const b6 = await one(`select sum(closing_fee_jpy)::int c from mart.finance_daily_sku_range(1::smallint, 'amazon', 'jp', '2026-06-01', '2026-06-30')`);
+  assert.equal(b6.c, 30);
+});
+await t('契約: from <= to・最大 400 日 (両端を含む)・期間の月だけを読む・nested loop を使わない・別の scope は 0 行', async () => {
+  await rejects(() => skuRange('2026-06-02', '2026-06-01'), /invalid_input: from/);
+  assert.ok(Array.isArray(await skuRange('2026-01-01', '2027-02-04')));   // 400 日
+  await rejects(() => skuRange('2026-01-01', '2027-02-05'), /400 日/);
+  await rejects(() => pg.query(`select * from mart.finance_daily_sku_range(1::smallint, 'amazon', 'jp', null, '2026-06-01'::date)`), /invalid_input/);
+  const cfg = (await one(`select array_to_string(proconfig, ',') as c from pg_proc where proname = 'finance_daily_sku_range'`)).c;
+  assert.match(String(cfg), /enable_nestloop=off/);
+  assert.equal(await num(`select count(*) as n from mart.finance_daily_sku_range(1::smallint, 'amazon', 'us', '2026-06-01', '2026-06-30')`), 0);
+  // 期間の途中の日だけでも単価は月の全部の行 (6/10 だけ → 6/5 の売上から 1 個)
+  const only = at(await skuRange('2026-06-10', '2026-06-10'), '2026-06-10', 'sku-n1');
+  assert.deepEqual([only.units_refunded_customer, only.refund_units_status], [1, 'estimated_monthly_unit_price']);
+  // 今の関数の戻りの型は変えない (R20 M4)
+  const outs = (await one(`select pg_get_function_result(p.oid) as r from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'mart' and p.proname = 'finance_daily_range'`)).r;
+  assert.ok(!/seller_sku_norm|unclassified|net_jpy/.test(outs), outs);
 });
 
 console.log(`\n${ok} 件 PASS${ng ? ` / ${ng} 件 NG` : ''}`);

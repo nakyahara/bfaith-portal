@@ -802,6 +802,76 @@ commit;
   3. 1 か月ずつ `--from 月初 --to 月末` → `--reconcile` (差 0 を見る。差の月は翌朝の build が作り直す) を 2026-01 から当月まで
   4. `--mark-backfilled` (送れない鍵・鍵の分からない行が 0 で、全期間の突き合わせ `--reconcile --all` が一致したときだけ印を付ける) → 翌朝から daily-sync が送る
 - 試験 = `node scripts/test-company-db-amazon-finance.mjs` (二重の実装の一致・送り手の通し (本物の router を HTTP で)・突き合わせ・手数料のやり残し)
+
+### Amazon の利益の mart の下ごしらえ (0047。D7b-1a。設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.2・§3.5b・§3.6・§3.7)
+
+D7b-1 のうち coverage (決済のそろい・coordinator・レポートの一覧・lease・文書の版) を除いた部分。coverage は D7b-1b・利益の関数は D7b-3。
+
+- **分けられない決済の部品の 4 列** (`core.order_finance_daily`・既存の行は 0): `unclassified_component_count` (0 でない「分けられない」生の部品の数・全部の line_kind) /
+  `unclassified_mapped_jpy` (その符号つきの合計・決済の符号のまま) / `unclassified_abs_jpy` (**部品ごとの** 絶対値の合計) / `unmapped_component_count` (unmapped_jpy に入った 0 でない部品の数)。net には入らない
+  - 🚨 **集約の後では復元できない** (+100 と −100 は金額 0 でも部品 2・絶対値 200) → 送り手の変換 (`amazon-finance-transform.mjs` の `classifyComponent`) が生の部品を分類するときに数える。D7b-3 の正式な利益は **金額でなく数** で止める (`finance_unclassified`)
+  - 分類の優先順位 (§3.7・部品を 1 回だけ消費): ① 月の手数料の行の手数料の材料 (other_amount + item_related_fee = `account_fee_amount_jpy`) → ② not_account_fee の行 → ③ unknown の行 → ④ **どれにも消費されない = 分けられない** → ⑤ unmapped_jpy (別に数える)。
+    SKU の行の分けられない = `misc_fee` / `other_fee` (MFNPostageFee を含む) / `other_amount` の列に入った部品 (SKU の行ではこの 3 列の和 = `unclassified_mapped_jpy`)。月の手数料の行の分けられない = 手数料の材料以外 (price (税も)・promotion・misc_fee・other_fee = fail-closed)
+  - 形の確かめ (`order-finance-checksum.mjs`・送り手と受け口が同じ): 4 列は全部あるか全部無いか・数 0 ⇔ 絶対値 0・|符号つき| ≤ 絶対値・今の形なら unmapped の金額 ≠ 0 は部品 ≥ 1・SKU の行は 3 列の和 = 符号つき / 絶対値 ≥ 3 列の絶対値の和 (ほかは下の「今の形の版の行の等式」)。
+    表の CHECK は 3 つ = 数と絶対値の形 (`ck_order_finance_daily_unclassified` / `_unmapped_count`・どの版の行にも・既存の行 = 0 で満たす) と今の形の版の行の等式 (`ck_order_finance_daily_class_form`・旧い版の行は対象の外)
+  - **旧い形の送り手** (0047 の前 = 4 列の鍵が無い) は受け口がそのまま受ける: 集合の指紋は旧い列 (`LEGACY_CONTENT_COLUMNS`) で計算し、正規化した行からも 4 列を外す (= Render の deploy と miniPC の deploy の間も 400 にせず、受領記録の指紋も変わらない = 「Render が復元された」と誤って台帳を空にしない)。保存は 4 列 = 0
+  - **今の形の行が 0047 の適用前に届いたら 409 `NOT_MIGRATED`** (0043 の apply は知らない鍵を黙って捨てる = 4 列が落ちたまま受領記録の指紋には入り、送り直しても 'same' で直らない)
+  - 変換の版 = `amazon_finance_v2` (全部の注文の payload が変わる = **全部の送り直しが要る**。版が変わると `--incremental` も全部を選ぶ = 下の手順の夜の `--full` を先に済ませる)
+  - 🚨 **版と行の形を結び付ける** (#1554 Codex R1 High): 今の形の版 = `amazon_finance_v2` 以上 (`_名前` が付いても同じ・JS `versionHasClass` = SQL `core.finance_version_has_class`) ⇔ 全部の行に 4 列 (null 不可)。違えば 400 (SQL の apply も例外)。空の集合 (墓石) はどちらの版でもよい
+  - 🚨 **旧い版への戻し (downgrade) を拒む**: 受領記録が今の形の版になった注文を旧い版 (4 列なし) で置き換えると 4 列が 0 に戻る (分けられない部品が消えて正式な利益が fail-open) → 受け口が chunk ごと **409 `DOWNGRADE`** (送り手は ❌)・SQL の apply も例外。**miniPC を旧いコード (amazon_finance_v1) に戻さない**。
+    受け口の事前の照会の後に別の送信が受領記録を v2 にした競合でも、SQL の downgrade の例外は行の failed に吸収せず **chunk 全体を rollback して 409** (`ingest/chunk.mjs` の `fatalRowError`。ほかの受け口は今までどおり行ごと)
+  - 🚨 **今の形の版の行の等式** (#1554 Codex R2・JS の形の確かめと表の CHECK `ck_order_finance_daily_class_form` の両方): unmapped の金額 ≠ 0 なら部品 ≥ 1 / SKU の行 = 分けられない 3 列の和 = 符号つき・絶対値 ≥ 3 列の絶対値の和 /
+    **月の手数料の行 = `net = account_fee_amount + unclassified_mapped + unmapped`** (4 列を 0 と偽って分類の漏れた金額を隠せない) / not_account_fee・unknown の行 = 分けられない部品 0。旧い版の行は対象の外。
+    SKU の行と月の手数料の行は **部品が別の「箱」の間で相殺しても隠せない** (#1554 Codex R3): SKU の行 = 0 でない分けられない列の数 ≤ 部品の数 / 月の手数料の行 = 「材料の入らない 12 列」と「材料の入りうる 8 列 (commission・fba_fulfillment・fba_storage・chargeback 2 つ・points・other_fee・other_amount) の和 − account_fee_amount」の
+    絶対値の和 ≤ `unclassified_abs_jpy`・0 でないものの数 ≤ `unclassified_component_count` (例 storage 行の misc_fee +3・promotion −3 を 4 列 0 と申告できない = 正しくは部品 2・符号つき 0・絶対値 6)。
+    🚨 **同じ箱の中の相殺は受け口では復元できない = 送り手の変換の試験で守る** (#1554 Codex R4)。箱 = SKU の行の 3 列のそれぞれ / 月の手数料の行の 12 列のそれぞれ (例 misc_fee の +3 と −3 = 列は 0) と **8 列の合計の残差 1 つ**
+    (例 材料 −100・other_fee +3・other_amount −3 = 残差 0 = 別の列の間の相殺でも見分けられない)。試験 = `scripts/test-company-db-amazon-finance.mjs` の手で書いた固定の期待値 (同じ列の中・残差の箱の中・SKU の行の別の列の間) と乱数の決済の行 400 注文
+  - CHECK (3 つ) は 0047 で `NOT VALID` (新しい行には効く)・既存の行の検査は **0048** (`VALIDATE CONSTRAINT` = 読み書きを止めない lock。59 万行の検査を 0047 の ACCESS EXCLUSIVE の中でしない)
+- **`mart.finance_daily_sku_range(会社, モール, scope, from, to)`** = **日 × 正規化 seller SKU (`core.norm_code`) の子の粒度** (§3.2・R13 H1)。D7b-3 の利益の関数が計算のときに **今のマスタ** で出品に結び直してまとめる材料 (D-64)。
+  今の `mart.finance_daily_range` (0045) は画面・突き合わせのため残す (戻りの型も変えない)
+  - 列 = 0045 の全部の金額と数量の列 + `seller_sku_norm`・`received_listing_ids` (受け取りのときの listing_id・ID の昇順・診断だけ)・`received_listing_unresolved_count` (受け取りのとき未解決だった行の数)・`net_jpy`・`unmapped_jpy`・4 列・`refund_units_status`・`units_refunded_customer_unrounded` / `units_a_to_z_refund_unrounded` (丸める前の返品数・小数 6 桁)・`refund_unestimated_jpy` (推定できない返品の額)
+  - 0045 との違い: 粒度 / `closing_fee_jpy` = −Σ closing_fee で `profit_before_cogs_jpy` からも引く (§3.5b・0045 は固定の 0。今の決済には 0 = 金額は同じ) / net・unmapped・4 列は **決済の符号のまま** (0045 の費用を正にした列とは向きが逆)
+  - 返品数は 0045 と同じ「計上日の月 × **受け取った** seller SKU の単価」で子ごとに計算してから正規化 SKU にまとめる (合計は 0045 と同じ)
+  - `refund_units_status` (子の状態・1 つの子に表記の違う seller SKU が 2 つ以上なら弱い方): `no_refund` (本体の customer / A-to-z の返金なし) / `estimated_monthly_unit_price` / `estimated_partial_month_unit_price` (その月がまだ終わっていない = 単価が動く) / `unit_price_missing` (返金があるのに単価なし = 返品数 0 個・丸める前は null・額は `refund_unestimated_jpy`)。
+    🚨 **partial の判定は当面「計上日の月の最後の日が今日 (JST) 以降」**。D7b-1b で coverage (月末まで決済がそろったか) に置き換える
+  - 契約: `from <= to`・最大 400 日 (両端を含む)・違えば例外 (22023 `invalid_input`)。期間の月だけを読む・関数の中だけ nested loop を使わない (0045 と同じ)
+- 試験 = `node scripts/test-company-db-finance.mjs` (0047 の節: 形の確かめ・表の CHECK・旧い形 / 今の形の受け口・版と行の形の結び付け (JS と SQL の規則の突き合わせ)・旧い版への戻しは 409 / 例外で 4 列が残る・0047 の適用前の NOT_MIGRATED と適用後の既存の行・手で計算した子の値・返品の状態の 4 つ・今の関数と同じ期間の合計が一致・契約) と
+  `node scripts/test-company-db-amazon-finance.mjs` (決済の行から: 相殺する +100 / −100 と misc_fee・MFNPostageFee = 部品 4・月の手数料の行の保存則・二つの関数の合計の一致・二重の実装の一致は既存の列のまま)
+
+**マージの後の手順 (二段。🚨 まだ流さない = migrate は中原さんの指示の後)**。台帳 (jobs-registry の warehouse-daily-sync) にも同じ注意を書いた
+1. マージ → Render は自動で deploy (旧い形の送り手の payload はそのまま受ける = 朝の daily-sync は今までどおり)。**miniPC の本体 (`C:\Users\bfaith\bfaith-portal`) はまだ pull しない** (pull すると v2 の送り手が有効になり、0047 の前は 409 `NOT_MIGRATED` = ❌・0047 の後でも朝の `--incremental` が全部 (約 51 万注文) を選んで 30 分の上限に当たりうる)
+2. 新しいコードを **本番で使っていない worktree** に取り、そこから migrate (0047 → 0048)
+3. Render の新しい版が動いていることを確かめる (`/order-finance/status` が返る・Render の Events の最新の deploy が master の新しいコミット)
+4. **同じ夜に** miniPC の本体を pull (= v2 の送り手が有効) → `--full` (daily-sync の 07:00〜09:10 を避ける) → `--reconcile --all`
+5. 完了の条件 = `--full` の最後の行が ✅ (failed 0・整形できない 0・stale 0)・下の SQL で `lines > 0` の受領記録が全部 `amazon_finance_v2`・`--reconcile --all` が一致
+
+```
+# ② 本番で使っていない worktree から migrate (miniPC の PowerShell。.env は本体の 1 つを読む = -r dotenv/config に DOTENV_CONFIG_PATH)
+cd C:\Users\bfaith\bfaith-portal
+git fetch origin
+git worktree add C:\tmp\d7b1a origin/master
+cd C:\tmp\d7b1a
+npm ci
+$env:DOTENV_CONFIG_PATH = 'C:\Users\bfaith\bfaith-portal\.env'
+node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                 # 0047 と 0048 だけが出ること
+node -r dotenv/config scripts\company-db\migrate.mjs                           # 0047 → 0048 (applied=2)
+# ④ 同じ夜に本体を pull して全部を送り直す
+cd C:\Users\bfaith\bfaith-portal
+git pull
+node apps\company-db\push\amazon-finance.mjs --full                            # 変換の版 v2 で全部を送り直す (約 51 万注文)
+node apps\company-db\push\amazon-finance.mjs --reconcile --all                 # 全期間の突き合わせ (既存の列が SQLite と一致のまま)
+# 後片付け
+git worktree remove C:\tmp\d7b1a
+```
+
+```sql
+-- 送り直しの進み (版ごとの注文の数。lines > 0 が全部 amazon_finance_v2 になれば済み・空の集合の墓石は旧い版のままでよい)
+select transform_version, lines > 0 as has_lines, count(*) from core.order_finance_receipts where company_id = 1 and mall = 'amazon' and scope_key = 'jp' group by 1, 2 order by 1, 2;
+-- 分けられない部品のある SKU の行 (D7b-3 で正式な利益が null になる行)
+select economic_date_jst, seller_sku_norm, unclassified_component_count, unclassified_mapped_jpy, unclassified_abs_jpy, unmapped_component_count
+  from mart.finance_daily_sku_range(1::smallint, 'amazon', 'jp', '2026-09-01', '2026-09-30') where unclassified_component_count > 0 or unmapped_component_count > 0;
+```
+
 ### 決済のレポートの一覧 (miniPC の SQLite・D7b-1b の下ごしらえ・Company DB構想 13 §3.1 / D-65)
 
 - 書き手 = `apps/warehouse/fetch-amazon-settlements.js` (部品 `apps/warehouse/amazon-settlement-inventory.js`)。表 = warehouse.db の `amazon_settlement_report_inventory_runs` (回) / `amazon_settlement_report_inventory` (report ごと)。**今は記録だけ** (読み手 = 後の coverage)。取込む行には関わらない
