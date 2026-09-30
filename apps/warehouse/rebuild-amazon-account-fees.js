@@ -6,6 +6,7 @@
  * 返送・廃棄 / 納品不備 / 低在庫手数料 / 月額登録料) を月次×fee_type で集計する。
  * これらは f_amazon_finance_sku_daily_v1 (SKU 粒度) に載らないため、SKU 別利益の合計と
  * アカウント全体の実利益の差分になる (2026-07-06 実測: 月 70〜80 万円規模)。
+ * 🆕 2026-09-30 (D-63): 納品不備 (Inbound Defect Fee…) は SKU の付いた行も入れる (日次の財務からは外した = 二重にしない。amazon-account-fee-rules.js の SKU_ACCOUNT_FEE_TYPES)。
  *
  * 金額は raw の other_amount_micro 由来 (2026-07-06 実測で全額この列)。
  * **符号は Amazon のまま保持 (負 = 費用)**。Correction/Reversal も同 fee_type に合算 (net)。
@@ -18,7 +19,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { FEE_TYPE_RULES, NOT_ACCOUNT_FEE, CONFIRMED_NAMES } from './amazon-account-fee-rules.js';
+import { FEE_TYPE_RULES, NOT_ACCOUNT_FEE, CONFIRMED_NAMES, SKU_ACCOUNT_FEE_TYPES } from './amazon-account-fee-rules.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -68,25 +69,44 @@ const LOW_INV_SQL = `transaction_type LIKE '%LowInventory%' OR transaction_type 
 const FEE_FILTER_SQL = [...FEE_TYPE_RULES.filter(([t]) => t !== 'low_inventory').map(([, e, p]) => matchSql(e, p)).filter(Boolean), LOW_INV_SQL].map((x) => `(${x})`).join(' OR ');
 const CONFIRMED_SQL = `(transaction_type IN (${CONFIRMED_NAMES.map(q).join(', ')}) OR ${likePrefix('Inbound Defect Fee')} OR ${LOW_INV_SQL})`;
 const FEE_CASE_SQL = `CASE ${FEE_TYPE_RULES.map(([t, e, p]) => `WHEN ${t === 'low_inventory' ? LOW_INV_SQL : matchSql(e, p)} THEN '${t}'`).join(' ')} ELSE 'other_account_fee' END`;
+// 🆕 2026-09-30 (D-63): SKU の付いた行でも月の手数料に入れる種類 (納品不備だけ = SKU_ACCOUNT_FEE_TYPES)。日次の財務の build は同じ行を silver から外す (二重にしない)
+//   SKU の有無の決め = 日次の財務の silver と同じ (NOT NULL かつ TRIM <> '')。空白だけの SKU はどちらにも入らない (送り手も整形できないで止める)
+//   索引 = その行だけの部分索引 (決済の行 約 440 万行のうち数十行)。問い合わせの WHERE を索引の WHERE と同じ文字にする (INDEXED BY = 使えなければ黙って遅くならずにエラー)
+//   🚨 SKU_ACCOUNT_FEE_TYPES か納品不備の名前の決めを変えたら、索引の名前も変える (IF NOT EXISTS は古い定義のまま残る → INDEXED BY がエラーで止まって気づく)
+const SKU_FEE_SQL = `TRIM(seller_sku_normalized) <> '' AND (${FEE_TYPE_RULES.filter(([t]) => SKU_ACCOUNT_FEE_TYPES.includes(t)).map(([, e, p]) => matchSql(e, p)).join(' OR ')})`;
+db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_skufee_econ ON raw_amazon_settlement_lines(economic_date) WHERE ${SKU_FEE_SQL}`);
 const builtAt = new Date().toISOString();
 const result = db.transaction(() => {
   db.prepare(`DELETE FROM f_amazon_account_fees_monthly_v1 WHERE month_start_jst >= ?`).run(fromDate);
   const info = db.prepare(`
     INSERT INTO f_amazon_account_fees_monthly_v1 (month_start_jst, fee_type, amount_jpy, row_count, built_at)
-    WITH occ AS (
+    WITH src AS (
+      -- SKU 無し行 (手数料の分け方に当たる行)
+      SELECT source_settlement_id, business_line_key, source_document_id, source_line_no, source_layer, ingested_at,
+        economic_date, transaction_type, other_amount_micro, item_related_fee_amount_micro
+      FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_nosku_econ
+      WHERE economic_date >= ?
+        AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '')
+        AND (${FEE_FILTER_SQL})
+      UNION ALL
+      -- SKU 付き行のうち月の手数料に入れる種類 (納品不備・2026-09-30 D-63)。ほかの SKU 付き行 (保管料・調整など) は
+      -- 日次の財務の側 = ここに入れると二重になる。納品不備は日次の財務の silver から外している
+      SELECT source_settlement_id, business_line_key, source_document_id, source_line_no, source_layer, ingested_at,
+        economic_date, transaction_type, other_amount_micro, item_related_fee_amount_micro
+      FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_skufee_econ
+      WHERE economic_date >= ?
+        AND ${SKU_FEE_SQL}
+    ),
+    occ AS (
       -- 同一 settlement が sp_api_v1 / manual_csv の両 layer で raw に存在し得るため、
       -- SKU別 mart (rebuild-amazon-settlement-mart.js) と同じ business dedup を挟む
       -- (Codex High 指摘: dedup 無しだと保管料/LTSF が二重計上)
       -- 🚨 同じ文書の中の出現順 (occ) を鍵に足す (本物の同じ鍵の別々の行を潰さない。db.js の v_amazon_settlement_unified と同じ形。2026-09-28)
+      --   business_line_key は SKU と取引の種類を含む = SKU 無しの行と SKU 付きの行が同じ鍵になることはない (合わせてから数えても別々に数えても同じ)
       SELECT source_settlement_id, business_line_key, source_document_id, source_layer, ingested_at,
         economic_date, transaction_type, other_amount_micro, item_related_fee_amount_micro,
         DENSE_RANK() OVER (PARTITION BY source_settlement_id, business_line_key, source_document_id ORDER BY source_line_no) AS occ
-      FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_nosku_econ
-      WHERE economic_date >= ?
-        -- SKU 無し行のみ対象。SKU 付きフィー行 (Inbound Defect 等の一部) は
-        -- SKU daily fact 側に流れるため、ここに入れると二重計上になる
-        AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '')
-        AND (${FEE_FILTER_SQL})
+      FROM src
     ),
     dedup AS (
       SELECT economic_date, transaction_type, other_amount_micro, item_related_fee_amount_micro,
@@ -113,7 +133,7 @@ const result = db.transaction(() => {
     FROM dedup
     WHERE rn = 1
     GROUP BY 1, 2
-  `).run(fromDate, builtAt);
+  `).run(fromDate, fromDate, builtAt);
   return info.changes;
 })();
 

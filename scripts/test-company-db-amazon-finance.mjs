@@ -7,7 +7,8 @@
  *      場面 = 返品・カードの支払い取り消し・A-to-z・ポイント・値引きの税・送料の税・RestockingFee・補てん (注文番号なし・SKU あり)・
  *      保管料 (古い名前 / 新しい名前)・月額・長期保管料・返送料・納品不備・低在庫・手数料の調整・Easy Ship (古い月 = other_amount / 新しい月 = item_related_fee)・
  *      SKU なしで other_amount と item_related_fee の両方・unmapped (shipment_fee・知らない手数料の種類)・同じ鍵の 2 行 (出現順)・V1 と V2 の両方・
- *      BuyerRecharge (SKU あり)・預かり金・分けられない取引・Easy Ship の割り振りだけの日 × SKU
+ *      BuyerRecharge (SKU あり)・預かり金・分けられない取引・Easy Ship の割り振りだけの日 × SKU・
+ *      SAFE-T の補てん (取引の種類 Other + price_type)・補てんの取り消し (PAYMENT_RETRACTION_ITEMS)・SKU のある納品不備 (月の手数料へ。2026-09-30 D-63)
  *   ② 送り手 (本物の router を HTTP で): 期間は鍵を選ぶだけ・watermark・変換の版・--full (一部の行の削除・Render にだけある鍵に空の集合)・500 行超・
  *      鍵の分からない不正な行 (疑似注文を全部止める)・容量の見張り・受領記録 (2 回目に台帳を空にしない)・dry-run は台帳に書かない
  *   ③ 突き合わせ: 一致 / 差 → やり残しの月に登録・1 回目 ⚠️・2 回目 ❌ / 月の手数料の差 → 手数料のやり残し → 次の build (さかのぼる) で一致
@@ -28,7 +29,7 @@ import { openLedger } from '../apps/company-db/push/ledger.mjs';
 import { aggregateOrderFinance, dedupSettlementRows, feeKindOf, skuKindOf, AMAZON_FINANCE_TRANSFORM_VERSION } from '../apps/company-db/push/amazon-finance-transform.mjs';
 import { pushAmazonFinance, reconcileAmazonFinance, readSqliteDaily, readSqliteFees, diffFinanceDaily, diffAccountFees, capacityGuard, parseArgs, sinceOf, META, FINANCE_KIND, financeKey, retryStore }
   from '../apps/company-db/push/amazon-finance.mjs';
-import { classifyAccountFee } from '../apps/warehouse/amazon-account-fee-rules.js';
+import { classifyAccountFee, classifySkuAccountFee } from '../apps/warehouse/amazon-account-fee-rules.js';
 import { accountFeesMonthsBack, readPendingMonths, ACCOUNT_FEES_PENDING_FILE, PENDING_FILE } from '../apps/warehouse/amazon-finance-months.js';
 
 let ok = 0, ng = 0;
@@ -114,6 +115,16 @@ NS(d(MB, 16), 'Inbound Defect Fee - Unplanned Service', { oa: -150 }); NS(d(MB, 
 NS(d(MB, 18), 'Fee Adjustment', { oa: 80 }); NS(d(MB, 18), 'Overpaid Fees Adjustment', { oa: 20 });
 NS(d(MB, 19), 'Current Reserve Amount', { oa: -10000 }); NS(d(MB, 19), 'Previous Reserve Amount Balance', { oa: 10000 }); NS(d(MB, 19), 'Mystery Fee', { oa: -77 });
 NS(d(MA, 7), 'StorageRenewalBilling', { oa: -900, blk: 'v12s', doc: 'D-V1', lineNo: 3 }); NS(d(MA, 7), 'StorageRenewalBilling', { oa: -900, blk: 'v12s', doc: 'D-V2', layer: 'sp_api_v2', lineNo: 4 });
+// 🆕 2026-09-30 (D-63): SKU のある行の「行き先の無い金額」を種類ごとに分ける
+//   O13 (sku-v): MB 13 に売上・MB 14 に SAFE-T の補てん (取引の種類 Other・price_type SAFE-T Reimbursement) → safe_t と 補てんの取り消し (PAYMENT_RETRACTION_ITEMS) → reversal_reimbursement
+//   SKU のある納品不備 → 月の手数料の inbound_defect (MB 16 = SKU の無い納品不備 −150 と同じ疑似注文の同じ行)・日次の財務には入らない
+//   sku-w (MB 17) は納品不備だけ = 日 × SKU の行ができない (小文字の名前も = 前方一致は大文字小文字を問わない)
+raw({ order: 'O13', sku: 'sku-v', date: d(MB, 13), qty: 1 }); raw({ order: 'O13', sku: 'sku-v', date: d(MB, 13), pt: 'Principal', pa: 1000 });
+raw({ order: 'O13', sku: 'sku-v', date: d(MB, 14), tt: 'Other', pt: 'SAFE-T Reimbursement', oa: 634 });
+raw({ order: 'O13', sku: 'sku-v', date: d(MB, 14), tt: 'PAYMENT_RETRACTION_ITEMS', oa: -120 });
+raw({ order: null, sku: 'sku-v', date: d(MB, 16), tt: 'Inbound Defect Fee - Missing label', oa: -200 });
+raw({ order: null, sku: 'sku-w', date: d(MB, 17), tt: 'Inbound Defect Fee - Barcode cannot be scanned', oa: -90 });
+raw({ order: null, sku: 'sku-w', date: d(MB, 17), tt: 'inbound defect fee - x', oa: -10 });
 
 const build = (months = 14) => {
   for (const m of [MA, MB]) execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', m], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
@@ -189,6 +200,29 @@ await t('値の芯 (手で計算): 返品数 (単価で割る)・支払い取り
   assert.deepEqual([dmg.warehouse_damage_jpy, dmg.warehouse_lost_jpy, dmg.safe_t_jpy, dmg.reversal_reimbursement_jpy], [500, 300, 200, -60]);
   assert.equal(at(d(MB, 5), 'sku-c').points_jpy, 30);
 });
+await t('行き先の無い金額を種類ごとに (2026-09-30 D-63): Other の SAFE-T → safe_t・取り消し → reversal・利益に入る / SKU のある納品不備は日次に無く月の手数料に', async () => {
+  const rows = await renderDaily(`${MA}-01`, monthEnd(MB));
+  const at = (date, sku) => rows.find((r) => r.date_jst === date && r.seller_sku === sku);
+  const v14 = at(d(MB, 14), 'sku-v');
+  assert.deepEqual([v14.safe_t_jpy, v14.reversal_reimbursement_jpy, v14.other_amount_jpy, v14.profit_before_cogs_jpy], [634, -120, 0, 514]);
+  assert.equal(at(d(MB, 16), 'sku-v'), undefined);   // 納品不備だけの日 × SKU は無い
+  assert.equal(at(d(MB, 17), 'sku-w'), undefined);
+  // SKU のある行の other_amount = 0 (この試験の決済の行には、ほかに other_amount を持つ SKU のある行は無い)
+  assert.equal(rows.reduce((s, r) => s + r.other_amount_jpy, 0), 0);
+  const w = reader();
+  try {
+    // SQLite の日次の財務も同じ (利益 = 補てん 634 − 取り消し 120・原価の登録なし)
+    const s = w.prepare(`select safe_t_jpy s, reversal_reimbursement_jpy r, other_amount_jpy o, profit_amount p from f_amazon_finance_sku_daily_v1 where date_jst = ? and seller_sku = 'sku-v'`).get(d(MB, 14));
+    assert.deepEqual([s.s, s.r, s.o, s.p], [634, -120, 0, 514]);
+    assert.equal(w.prepare(`select count(*) n from f_amazon_finance_sku_daily_v1 where seller_sku in ('sku-v', 'sku-w') and date_jst in (?, ?)`).get(d(MB, 16), d(MB, 17)).n, 0);
+    const idf = w.prepare(`select amount_jpy a, row_count n from f_amazon_account_fees_monthly_v1 where month_start_jst = ? and fee_type = 'inbound_defect'`).get(`${MB}-01`);
+    assert.deepEqual([idf.a, idf.n], [-150 - 200 - 90 - 10, 4]);
+  } finally { w.close(); }
+  // Company DB: SKU は '-'・line_kind = inbound_defect (SKU の無い納品不備と同じ行)
+  const cdb = await all(`select economic_date_jst::text as d, seller_sku, line_kind, account_fee_amount_jpy::int as a, source_lines from core.order_finance_daily
+    where line_kind = 'inbound_defect' order by 1`);
+  assert.deepEqual(cdb.map((x) => [x.d, x.seller_sku, x.a, x.source_lines]), [[d(MB, 16), '-', -350, 2], [d(MB, 17), '-', -100, 2]]);
+});
 await t('月 × 手数料: mart.v_finance_account_fees_monthly = f_amazon_account_fees_monthly_v1 (金額・行数)', async () => {
   const w = reader();
   try {
@@ -250,6 +284,24 @@ await t('重複除去 = build と同じ (同じ文書の同じ鍵の 2 行は残
   assert.deepEqual(dedupSettlementRows([v1, man]).map((r) => r.id), [3]);   // 層が先
   const same = base({ id: 6, source_line_no: 1 });
   assert.equal(dedupSettlementRows([a, same]).length, 1);
+});
+await t('SKU のある行の行き先 (2026-09-30 D-63・純粋関数): Other の SAFE-T → safe_t / ほかの price_type の Other → other_amount / 取り消し → reversal / 納品不備 → SKU は - の inbound_defect', async () => {
+  const M = 1000000n;
+  const a = aggregateOrderFinance('X1', [
+    base({ id: 1, business_line_key: 'a', transaction_type: 'Other', price_type: 'SAFE-T Reimbursement', other_amount_micro: 634n * M }),
+    base({ id: 2, business_line_key: 'b', transaction_type: 'Other', price_type: 'Something', other_amount_micro: 7n * M }),
+    base({ id: 3, business_line_key: 'c', transaction_type: 'PAYMENT_RETRACTION_ITEMS', other_amount_micro: -120n * M }),
+    base({ id: 4, business_line_key: 'd', transaction_type: 'Inbound Defect Fee - Missing label', other_amount_micro: -200n * M }),
+    base({ id: 5, business_line_key: 'e', transaction_type: 'INBOUND DEFECT FEE x', other_amount_micro: -5n * M }),
+  ]);
+  const sku = a.lines.find((l) => l.line_kind === 'sku'), idf = a.lines.find((l) => l.line_kind === 'inbound_defect');
+  assert.deepEqual([sku.seller_sku, sku.safe_t_jpy, sku.other_amount_jpy, sku.reversal_reimbursement_jpy, sku.account_fee_amount_jpy], ['s', 634, 7, -120, 0]);
+  assert.deepEqual([idf.seller_sku, idf.account_fee_amount_jpy, idf.other_amount_jpy, idf.source_lines], ['-', -205, -205, 2]);
+  assert.equal(a.lines.length, 2);
+  assert.equal(classifySkuAccountFee('Inbound Defect Fee - x'), 'inbound_defect');
+  assert.equal(classifySkuAccountFee('FBA Inventory Storage Fee'), null);   // ほかの手数料の種類は SKU のある行なら日次の財務の側 (今まで通り)
+  assert.equal(classifySkuAccountFee('Fee Adjustment'), null);
+  assert.equal(classifySkuAccountFee('Order'), null);
 });
 await t('SKU なしの行の種類 = 月の手数料の build と同じ (大文字小文字は LIKE だけ無視・最初に当たった種類)', async () => {
   assert.equal(feeKindOf('FBA INVENTORY STORAGE FEE'), 'storage');   // 前方一致 (LIKE) は大文字小文字を無視

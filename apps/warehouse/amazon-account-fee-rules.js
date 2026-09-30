@@ -34,6 +34,13 @@ export const NOT_ACCOUNT_FEE = ['Current Reserve Amount', 'Previous Reserve Amou
 export const CONFIRMED_NAMES = ['Storage Fee', 'Storage Fee - Correction', 'Storage Fee - Reversal', 'FBA Inventory Storage Fee',
   'StorageRenewalBilling', 'FBA Long Term Storage Fee', 'RemovalComplete', 'FBA Removal Order: Return Fee', 'Subscription Fee', 'Amazon Easy Ship Charges',
   'Fee Adjustment', 'Overpaid Fees Adjustment'];
+// 🆕 2026-09-30 (D7b-2b / D-63・中原さん「種類ごとに分ける」): SKU の付いた行でも月の手数料に入れる種類 = 納品不備 (Inbound Defect Fee…) だけ。
+//   今までは SKU の付いた納品不備を日次の財務の other_amount (利益の式に入らない = 行き先の無い金額) に入れていた (4〜9 月 26 行・約 −1.4 万円)。
+//   → SKU の有無を問わず月の手数料の inbound_defect に入れ、日次の財務 (sql/amazon/build_f_amazon_finance_sku_daily_v1.sql の silver) からは外す (二重にしない)。
+//   🚨 3 か所が同じ決め: 月の手数料の build (rebuild-amazon-account-fees.js = FEE_TYPE_RULES の前方一致から SQL を作る) /
+//      日次の財務の build (silver の NOT LIKE 'Inbound Defect Fee%' = 手で書いた同じ前方一致) / Company DB の送り手 (amazon-finance-transform.mjs = classifySkuAccountFee)。
+//      ここに種類を足すなら 3 か所とも変えて scripts/test-company-db-amazon-finance.mjs を流す
+export const SKU_ACCOUNT_FEE_TYPES = ['inbound_defect'];
 
 // ── JS の判定 (SQL と同じ決め) ──
 // 🚨 SQLite の LIKE は ASCII の大文字小文字を区別しない / IN (完全一致) は区別する。SQL の CASE は FEE_TYPE_RULES の順に最初に当たったもの
@@ -51,4 +58,10 @@ export function classifyAccountFee(tx) {
     if (t === 'low_inventory' ? isLowInventory(tx) : matchRule(tx, e, p)) return t;
   }
   return 'other_account_fee';   // SQL の ELSE (ここには来ない)
+}
+
+/** SKU の付いた行を月の手数料に入れるなら その種類 (SKU_ACCOUNT_FEE_TYPES)。入れない (日次の財務の側) なら null */
+export function classifySkuAccountFee(tx) {
+  const k = classifyAccountFee(tx);
+  return k && SKU_ACCOUNT_FEE_TYPES.includes(k) ? k : null;
 }
