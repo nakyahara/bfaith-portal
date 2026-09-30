@@ -14,7 +14,9 @@
  *   cutover  = 手順 5 (旗 on と cutover_phase の後): 旗 on (status と readiness の両方)・cutover_phase を人が cutover に設定した・
  *              GAS の CSV の手の取込を断る (本当の道と同じ判定 = gas_closed)・成果物の無い毎晩を断る (artifact_missing)・
  *              旧い手の ③ (manual_daily) を断る (retired)・DATA_DIR がこの miniPC のもの (初期化の印が同じ)・次の夜の済みの印が無い
- *   ready    = 手順 8 の後 (miniPC の LZ_DAILY_IMPORT=on・止めの解除の前): cutover の全部 + LZ_DAILY_IMPORT=on・送り先 GCHAT_WEBHOOK_JOBS が本番と同じ判定で使える
+ *   ready    = 手順 8 の後 (miniPC の LZ_DAILY_IMPORT=on・止めの解除の前): cutover の全部 + LZ_DAILY_IMPORT=on・送り先 GCHAT_WEBHOOK_JOBS が本番と同じ判定で使える・
+ *              この miniPC のリポジトリの台帳が切替の PR の後 (lz-daily-import = P2・00:20・猶予 40 分・影は退役)・
+ *              Render の見張り (/apps/jobs-monitor/status・JOBS_MONITOR_TOKEN) も同じ台帳 (01:00 の締切が効く。Codex #1558 R2 Medium)
  *   rollback = GAS への戻し (K3-8・N2) の後: 旗は off・miniPC の毎晩の本番は off・戻しの固定の版 (台帳 lz-gas-rollback) の期限の内 (Render の日付)
  *
  * 設定 = リポジトリ直下の .env (LZ_LOCK_TOKEN・LZ_IMPORT_STATE_URL・DATA_DIR・LZ_DAILY_IMPORT・GCHAT_WEBHOOK_JOBS)。値は出さない (on / off と有無だけ)。
@@ -28,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import { nightlyMarker } from './lz-nightly.mjs';
 import { jobsHook } from './notify-jobs.mjs';
-import { JOBS_REGISTRY } from '../../config/jobs-registry.mjs';
+import { JOBS_REGISTRY, RETIRED_JOBS } from '../../config/jobs-registry.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const EXPECTS = Object.freeze(['before', 'cutover', 'ready', 'rollback']);
@@ -41,11 +43,24 @@ const isOn = (v) => String(v ?? '').trim().toLowerCase() === 'on';
 const nextJstDate = (ymd) => new Date(Date.parse(`${ymd}T00:00:00Z`) + DAY_MS).toISOString().slice(0, 10);
 const hhmm = (m) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
 
+/** Render の見張りの今の台帳の評価を読む (GET /apps/jobs-monitor/status・ping と同じ JOBS_MONITOR_TOKEN・https だけ) */
+export async function fetchJobsStatus({ env = process.env, fetchImpl = fetch } = {}) {
+  const token = String(env.JOBS_MONITOR_TOKEN || '').trim();
+  if (!token) throw Object.assign(new Error('JOBS_MONITOR_TOKEN が無い'), { code: 'no_token' });
+  let u;
+  try { u = new URL(String(env.JOBS_MONITOR_URL || 'https://bfaith-portal.onrender.com').trim()); } catch { throw Object.assign(new Error('JOBS_MONITOR_URL が URL でない'), { code: 'bad_url' }); }
+  if (u.protocol !== 'https:') throw Object.assign(new Error('JOBS_MONITOR_URL は https だけ (Bearer を載せる)'), { code: 'bad_url' });
+  let res;
+  try { res = await fetchImpl(`${u.origin}/apps/jobs-monitor/status`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(20000) }); } catch (e) { throw Object.assign(new Error(`見張りに届かない: ${String(e && e.message).slice(0, 120)}`), { code: 'unreachable' }); }
+  if (!res.ok) throw Object.assign(new Error(`見張りが断った: HTTP ${res.status}`), { code: `http_${res.status}` });
+  return res.json();
+}
+
 /**
  * 確かめる。client = import-state-client の口 (status・nightlyReadiness・acquire・release)。
  * @returns {Promise<{ ok: boolean, expect: string, checks: { name: string, ok: boolean, detail: string }[] }>}
  */
-export async function cutoverCheck({ expect, client, env = process.env, dataDir = null, registry = JOBS_REGISTRY, log = () => {} }) {
+export async function cutoverCheck({ expect, client, env = process.env, dataDir = null, registry = JOBS_REGISTRY, retired = RETIRED_JOBS, jobsStatus = () => fetchJobsStatus({ env }), log = () => {} }) {
   if (!EXPECTS.includes(expect)) throw new Error(`--expect は ${EXPECTS.join(' / ')}`);
   const checks = [];
   const check = (name, ok, detail = '') => { checks.push({ name, ok: !!ok, detail: String(detail) }); log(`${ok ? '✅' : '❌'} ${name}${detail ? ` (${detail})` : ''}`); return !!ok; };
@@ -123,6 +138,22 @@ export async function cutoverCheck({ expect, client, env = process.env, dataDir 
     // 本番 (lz-nightly.mjs の nightlyMain) と同じ判定。値は出さない
     check('要対応スペースの送り先 GCHAT_WEBHOOK_JOBS が使える (本番と同じ判定)', !!jobsHook(env), '値は出さない');
     if (isOn(env.LZ_DAILY_IMPORT_SHADOW)) log('ℹ LZ_DAILY_IMPORT_SHADOW=on が残っている (本番が on の夜は影はしない・消してよい)');
+    // この miniPC のリポジトリの台帳 = 切替の PR の後か (pull し忘れ = 前のコード = ❌)
+    const job = registry.find((e) => e.id === 'lz-daily-import');
+    const jobOk = !!job && job.type === 'scheduled_job' && job.importance === 'P2' && job.anchor_hour_jst === 0 && job.anchor_minute_jst === 20 && Math.round(job.grace_hours * 60) === 40;
+    check('この miniPC のリポジトリの台帳に lz-daily-import (P2・00:20・猶予 40 分)', jobOk,
+      job ? `${job.importance}・${job.anchor_hour_jst}:${String(job.anchor_minute_jst).padStart(2, '0')}・猶予 ${Math.round(job.grace_hours * 60)} 分` : '無い = 切替の PR の前のコード (git pull --ff-only)');
+    check('この miniPC のリポジトリの台帳で影 lz-daily-import-shadow は退役', retired.some((e) => e.id === 'lz-daily-import-shadow') && !registry.some((e) => e.id === 'lz-daily-import-shadow'), '');
+    // Render の見張りも同じ台帳か (反映を待った = 01:00 の締切が効く。見張りが台帳に無い id の ping も 200 で受けるので、ping の成功では分からない)
+    let js = null;
+    try { js = await jobsStatus(); } catch (e) { check('Render の見張りの台帳を読む (/apps/jobs-monitor/status)', false, `${e.code || 'error'}: ${e.message}`); }
+    if (js) {
+      const results = Array.isArray(js.results) ? js.results : [];
+      const rj = results.find((r) => r.id === 'lz-daily-import');
+      check('Render の見張りに lz-daily-import (P2・この miniPC と同じ台帳)', !!rj && rj.type === 'scheduled_job' && rj.importance === 'P2' && !!job && rj.runbook === job.runbook,
+        rj ? `${rj.type}・${rj.importance}・runbook ${job && rj.runbook === job.runbook ? '同じ' : '違う (Render の反映がまだ)'}` : '無い = Render の反映がまだ');
+      check('Render の見張りで影 lz-daily-import-shadow は退役', (js.retiredIds || []).includes('lz-daily-import-shadow') && !results.some((r) => r.id === 'lz-daily-import-shadow'), '');
+    }
   }
   if (expect === 'rollback') {
     // 戻しの固定の版の期限 (台帳 lz-gas-rollback の remove_by・Render の日付)。過ぎた = 使わない (Codex #1558 R1 Medium)

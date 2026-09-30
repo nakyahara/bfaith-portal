@@ -2,7 +2,8 @@
 cd /d "%~dp0"
 echo ============================================
 echo  Logizard auto: barcode master sync
-echo  (import bc_upload - export master - import shohin)
+echo  (import bc_upload - export master)
+echo  The daily product master is imported by the miniPC nightly (not here)
 echo  Does not run 00:00-01:30 JST (nightly auto import on miniPC)
 echo ============================================
 if not exist .env (

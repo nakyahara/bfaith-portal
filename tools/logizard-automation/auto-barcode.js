@@ -16,7 +16,8 @@
  *   node auto-barcode.js --dry   … 各画面の条件設定まで行い、実行ボタンは一切押さない試走。
  *                                  FM08画面のHTML/状態を captures/ に採取する (初回のセレクタ検証用)
  *   run-barcode.bat              … Stream Deck から叩く入口
- *   ※ 引数は --dry だけ (知らない引数は断る)。
+ *   node auto-barcode.js --show-mode … 配った版の読み戻し (①② だけの見出しを出して終わる。ログイン・CSV・鍵・ブラウザに触らない)
+ *   ※ 引数は --dry と --show-mode だけ (知らない引数は断る)。
  *
  * マスタ正本切替 ③c-1b-3a (2026-09-28・決まりは barcode-mode.js):
  *   - JST 00:00〜01:30 は動かない (始めない・各ステップと実行ボタンの直前でも時刻を見る)。
@@ -61,6 +62,13 @@ try {
 } catch (e) {
   console.error(`❌ ${e.message}`);
   process.exit(1);
+}
+// 配った版の読み戻し (切替の手順 7・Codex #1558 R2 High): 何にも触らずに見出しを出して終わる (夜でも)
+if (MODE.showMode) {
+  console.log(`ℹ ${MODE.label}`);
+  console.log('ℹ ③ 毎日の商品マスタの取込: この版には無い (切替済み)');
+  for (const n of MODE.notes) console.log(`ℹ ${n}`);
+  process.exit(0);
 }
 if (inNightBlock()) {
   console.error(`❌ ${nightBlockMessage()}`);

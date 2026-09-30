@@ -696,13 +696,27 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
    - 旧い手の ③ を断る (manual_daily → retired・DB に何も書かない)。
    - DATA_DIR がこの miniPC のもの (初期化の印がポータルと同じ)。
    - 次の夜の済みの印が無い。
-6. #1558 をマージする → Render の反映を待つ (台帳が `lz-daily-import` に・影は RETIRED_JOBS)。
+6. #1558 をマージする → Render の反映を待つ (台帳が `lz-daily-import` に・影は RETIRED_JOBS。読み戻しは 8 の `--expect ready`)。
    - `RETIRED_JOBS` の `lz-daily-import-shadow` の `retired_at` は、マージの日に直してからマージする。
-7. 配る:
-   - miniPC: `git pull --ff-only` → `node tools/logizard-automation/deploy.mjs --pc minipc --apply` → `--check` (bat の見出し・drift 0)。
-   - Stream Deck の PC: master の作業場所から `deploy.mjs --pc streamdeck --apply` → `--check` (drift 0 = ③ の無い版)。
+   - マージの commit (GitHub の #1558 の merge commit の SHA) を控える = 下の `<merge>`。
+7. 配る (**配る元が #1558 の後か確かめてから**。`deploy.mjs --check` は「配った先が配る元と同じ」しか見ない = 古い作業場所から配っても drift 0 になる。Codex #1558 R2 High):
+   - miniPC:
+     - `git pull --ff-only` → `git merge-base --is-ancestor <merge> HEAD` が exit 0 (#1558 が入っている) → `git status --porcelain` が空。
+     - `node tools/logizard-automation/deploy.mjs --pc minipc --apply` → `--check` (bat の見出し・drift 0)。
+   - Stream Deck の PC:
+     - 配るための作業場所を merge の commit で作る: `git fetch origin` → `git worktree add --detach C:\tmp\lz-cutover-deploy <merge>`。
+     - その作業場所で `node tools/logizard-automation/deploy.mjs --pc streamdeck --apply` → `--check` (drift 0)。
+     - **読み戻す**: `node C:\tools\logizard-automation\auto-barcode.js --show-mode` が「① 新商品の取込 → ② バーコード情報の書き出し (③ 毎日の商品マスタは miniPC の自動が取り込む)」と「③ … この版には無い」を出して exit 0。
+       - ログイン・CSV・鍵に触らない。
+       - 「知らない引数です: --show-mode」= ③ のある古い版を配った = 8 に進まない。
+     - 片付け: `git worktree remove C:\tmp\lz-cutover-deploy`。
 8. miniPC のリポジトリ直下の .env に `LZ_DAILY_IMPORT=on` を足す (`LZ_DAILY_IMPORT_SHADOW` の行は消す。.env は 1 つだけ)。
-   - → `lz-cutover-check.mjs --expect ready` = 全部 ✅ (cutover の全部 + 毎晩の本番 on + 送り先 `GCHAT_WEBHOOK_JOBS` が本番と同じ判定で使える)。
+   - → `lz-cutover-check.mjs --expect ready` = 全部 ✅。見るもの:
+     - cutover の全部。
+     - 毎晩の本番 on。
+     - 送り先 `GCHAT_WEBHOOK_JOBS` が本番と同じ判定で使える。
+     - この miniPC のリポジトリの台帳が #1558 の後 (`lz-daily-import` = P2・00:20・猶予 40 分・影は退役)。
+     - **Render の見張り (`/apps/jobs-monitor/status`) も同じ台帳** (反映を待った = 01:00 の締切が効く。見張りは台帳に無い id の ping も 200 で受けるので、ping の成功では分からない)。
 9. 止めの解除: `status` の `halt_revision` を見て `import-state-cli.js resume --by <名前> --note "切替" --halt-revision <番号>`。
 10. 次の夜 00:20 の後:
     - `C:\tools\logizard-automation\logs\scheduled.log` の `[lz-daily-import]` が ✅ verified になり、台帳 `lz-daily-import` の ok が来ている。

@@ -9,7 +9,9 @@
  *    毎日の商品マスタは miniPC の自動 (00:20) が取り込み、自動が止まったときに人が取り込むのはポータルの画面の「手の取込」。
  *    GAS の ③ に戻すのはシステム全体を旧方式に戻すときだけ (台帳 lz-gas-rollback の固定の版を配る)。
  *    .env に前の設定 LOGIZARD_BC_DAILY が残っていても、①② だけ (値は見ない・消してよいと出す)。
- * 3. 引数は --dry だけ (打ち間違いで本番が動かないように、知らない引数は断る)。
+ * 3. 引数は --dry と --show-mode だけ (打ち間違いで本番が動かないように、知らない引数は断る)。
+ *    --show-mode = 配った版を読み戻す (①② だけの版の見出しを出して終わる・ログイン・CSV・鍵・ブラウザに触らない・夜でも動く)。
+ *    ③ のある古い版はこの引数を知らない = 「知らない引数」で止まる = 古い作業場所から配ったと分かる (Codex #1558 R2 High)。
  *
  * 設計 = AI_reference CompanyDB構想/10 §6.3 (v2 §2・§6 / 契約 v3 / L-11 / L-14 の見直し / L-23 / 2b-2 契約 v3 の切替の PR)
  */
@@ -85,22 +87,22 @@ export function asNightError(e, where, now = new Date()) {
   return e;
 }
 
-const KNOWN_ARGS = new Set(['--dry']);
+const KNOWN_ARGS = new Set(['--dry', '--show-mode']);
 
 export const LABEL = '① 新商品の取込 → ② バーコード情報の書き出し (③ 毎日の商品マスタは miniPC の自動が取り込む)';
 
 /**
  * 起動の形を決める (①② だけ。③ は設定に依らず無い)。
- * @returns {{ dry: boolean, label: string, notes: string[] }}  notes = 起動のときに出す注意 (止めない)
+ * @returns {{ dry: boolean, showMode: boolean, label: string, notes: string[] }}  notes = 起動のときに出す注意 (止めない)
  */
 export function resolveBarcodeMode({ env = process.env, argv = process.argv.slice(2) } = {}) {
   if (argv.includes('--only-daily')) {
     throw new Error('③ 毎日の商品マスタの取込はこの道具から外しました (切替済み・毎晩 miniPC の自動が取り込む)。自動が止まったときに手で取り込むのは、ポータルの画面の「手の取込」です。');
   }
   const unknown = argv.filter((a) => !KNOWN_ARGS.has(a));
-  if (unknown.length) throw new Error(`知らない引数です: ${unknown.join(' ')} (使えるのは --dry だけ)`);
+  if (unknown.length) throw new Error(`知らない引数です: ${unknown.join(' ')} (使えるのは --dry と --show-mode だけ)`);
   const notes = [];
   // 前の設定が残っていても ①② だけ (値で ③ を戻せない = fail-closed。現場の ①② は止めない)
   if (Object.prototype.hasOwnProperty.call(env, 'LOGIZARD_BC_DAILY')) notes.push('.env の LOGIZARD_BC_DAILY はもう使いません (③ は切替で外した)。この行は消してかまいません。');
-  return { dry: argv.includes('--dry'), label: LABEL, notes };
+  return { dry: argv.includes('--dry'), showMode: argv.includes('--show-mode'), label: LABEL, notes };
 }

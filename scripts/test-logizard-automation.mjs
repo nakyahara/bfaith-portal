@@ -274,12 +274,13 @@ await ta('[6] 夜の止め: JST 00:00 以上 01:30 未満は動かない (境目
   const n = BM.asNightError(plain, '確認の OK の前', at('2030-01-15T23:59:58.1+09:00'));
   assert.ok(n.nightBlock && /\[Timeout 2900ms exceeded\.\]/.test(n.message), n.message);
   const mode = (env, argv = []) => BM.resolveBarcodeMode({ env, argv });
-  assert.deepEqual(mode({}), { dry: false, label: BM.LABEL, notes: [] });
+  assert.deepEqual(mode({}), { dry: false, showMode: false, label: BM.LABEL, notes: [] });
+  assert.deepEqual([mode({}, ['--show-mode']).showMode, mode({}, ['--show-mode']).dry], [true, false]);   // 配った版の読み戻し (Codex #1558 R2 High)
   assert.ok(!/→ ③/.test(BM.LABEL) && /③ 毎日の商品マスタは miniPC の自動/.test(BM.LABEL), BM.LABEL);
   // 前の設定が残っていても ①② だけ (値で ③ を戻せない = fail-closed)・現場の ①② は止めない (注意を出すだけ)
   for (const v of ['manual', 'auto', ' auto ', 'Auto', 'yes', '']) {
     const m = mode({ LOGIZARD_BC_DAILY: v });
-    assert.deepEqual([Object.keys(m).sort(), m.label, m.notes.length], [['dry', 'label', 'notes'], BM.LABEL, 1], JSON.stringify(v));
+    assert.deepEqual([Object.keys(m).sort(), m.label, m.notes.length], [['dry', 'label', 'notes', 'showMode'], BM.LABEL, 1], JSON.stringify(v));
     assert.match(m.notes[0], /LOGIZARD_BC_DAILY はもう使いません/);
   }
   assert.equal(mode({ LOGIZARD_BC_DAILY: 'manual' }, ['--dry']).dry, true);
@@ -305,6 +306,9 @@ await ta('[7] auto-barcode.js: 夜の止めは CSV・鍵・ブラウザに触る
   assert.ok(dlg.indexOf('if (inNightBlock())') > 0 && dlg.indexOf('if (inNightBlock())') < dlg.indexOf('d.accept()'), 'dialog の承認の前に夜の止め');
   const order = ['if (inNightBlock())', 'precheckImportCsv(IMPORT1_CSV', 'acquireLock(', 'await launchBrowser('].map((x) => s.indexOf(x));
   assert.ok(order.every((v, k) => v > 0 && (k === 0 || v > order[k - 1])), `順番 ${order}`);
+  // Stream Deck の bat の見出しも ①② だけ (Codex #1558 R2 Low)
+  const bat = fs.readFileSync(path.join(TOOL, 'run-barcode.bat'), 'latin1');
+  assert.ok(!/import shohin/.test(bat) && bat.includes('(import bc_upload - export master)') && /imported by the miniPC nightly/.test(bat), 'run-barcode.bat の見出し');
   // ③ 毎日の商品マスタの取込は無い (切替の PR・L-23)。GAS の ③ に戻すのは lz-gas-rollback の固定の版だけ
   for (const gone of ['IMPORT2', 'import2', 'pre2', 'デイリー取込商品マスタ', 'MODE.daily', "'③の前'", "withRelogin('③'"]) assert.ok(!s.includes(gone), gone);
   assert.equal((s.match(/runImport\(/g) || []).length, 2, '取込は ① の 1 か所だけ (定義 + 呼び 1 つ)');
@@ -348,6 +352,12 @@ globalThis.Date = D;
       assert.match(r.err, /②の保存先フォルダがありません/, daily);
       assert.match(r.out, /LOGIZARD_BC_DAILY はもう使いません/, daily);
     }
+    // 配った版の読み戻し --show-mode (Codex #1558 R2 High): 夜でも・何にも触らずに ①② の見出しを出して exit 0
+    r = run(jst('00:20'), { args: ['--show-mode'] });
+    assert.equal(r.status, 0, r.err);
+    assert.match(r.out, /① 新商品の取込 → ② バーコード情報の書き出し \(③ 毎日の商品マスタは miniPC の自動が取り込む\)/);
+    assert.match(r.out, /③ 毎日の商品マスタの取込: この版には無い/);
+    assert.ok(!r.out.includes('📥') && !touched(), '--show-mode は CSV も鍵も見ない');
     for (const [o, re] of [[{ args: ['--dyr'] }, /知らない引数です: --dyr/], [{ args: ['--only-daily'] }, /この道具から外しました/]]) {
       r = run(jst('10:00'), o);
       assert.equal(r.status, 1);
@@ -355,6 +365,26 @@ globalThis.Date = D;
       assert.ok(!r.out.includes('📥'));
     }
     assert.ok(!touched(), '鍵のフォルダ (logs) は一度も作られていない');
+    // ③ のある古い版 (戻しの固定の版 = tag の commit) に --show-mode = 知らない引数で止まる = 古い作業場所から配ったと分かる
+    const { JOBS_REGISTRY } = await import('../config/jobs-registry.mjs');
+    const rb = JOBS_REGISTRY.find((e) => e.id === 'lz-gas-rollback').rollback;
+    const old = fs.mkdtempSync(path.join(ROOT, '.tmp-lzbc-old-'));
+    try {
+      for (const f of ['auto-barcode.js', 'barcode-mode.js', 'logizard-common.js', 'csv-util.js']) {
+        const g = spawnSync('git', ['show', `${rb.commit}:tools/logizard-automation/${f}`], { cwd: ROOT, encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 });
+        assert.equal(g.status, 0, `${f} (git fetch origin tag ${rb.tag})`);
+        fs.writeFileSync(path.join(old, f), g.stdout);
+      }
+      fs.writeFileSync(path.join(old, 'fake-now.mjs'), fs.readFileSync(path.join(tmp, 'fake-now.mjs')));
+      fs.writeFileSync(path.join(old, '.env'), envBase.join('\n') + '\n');
+      const { LOGIZARD_BC_DAILY: _drop, ...env } = process.env;
+      const c = spawnSync(process.execPath, ['--import', pathToFileURL(path.join(old, 'fake-now.mjs')).href, path.join(old, 'auto-barcode.js'), '--show-mode'],
+        { cwd: old, encoding: 'utf8', env: { ...env, FAKE_NOW: jst('10:00').toISOString() }, timeout: 60000 });
+      assert.equal(c.status, 1, c.stdout + c.stderr);
+      assert.match(c.stderr, /知らない引数です: --show-mode/);
+    } finally {
+      fs.rmSync(old, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
+    }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });   // 子のブラウザがつかんでいる間は待って消す
   }

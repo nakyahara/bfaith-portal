@@ -1274,7 +1274,7 @@ export const JOBS_REGISTRY = [
       + '① daily-sync の「ロジザード毎日の商品マスタ(影)」(証跡 lz-daily) が 3 日続けて合格 **かつ成果物をポータルに送れた** (verdict = pass かつ portal.ok = true・版 lzd-v3 以降。説明できない差・判定できない・形の差・不正 = 0。作る回そのものは lz-daily-build が見る。③c-1b-3b-3) '
       + '② ③c-1b (鍵の口・auto-barcode の起動の分け方・取込の記録) の後に、少数件の実機の取込で ロジザードの照合の鍵・大文字小文字・無効の商品・取り込んだ後の値・対象外の列を確かめる '
       + '③ 切替日 = 切替の PR (Stream Deck の auto-barcode.js から ③ を外す・台帳 lz-daily-import) を切替の手順の中でマージし、自動の ③ を始める '
-      + '(手順 = db/company/README.md「毎晩の本番の切替と GAS への戻し」・確かめ = scripts/logizard-import/lz-cutover-check.mjs)。止まると GAS の手の取込のまま (現場は止まらない) = P3',
+      + '(手順 = db/company/README.md「毎晩の本番の切替と GAS への戻し」・確かめ = scripts/logizard-import/lz-cutover-check.mjs)。切替の前に止まる = GAS の手の取込のまま・切替の後に毎晩の取込が止まる = ポータルの画面の手の取込 (どちらも現場は止まらない) = P3',
     where: 'miniPC の daily-sync (lz-daily.mjs) の証跡 + 中原さんとの実機の取込。手順 = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」',
     schedule: '一度きり。期限 = 台帳に載ってから 30 日 (見張りは台帳に載った時から数える)',
     period_hours: 30 * 24,

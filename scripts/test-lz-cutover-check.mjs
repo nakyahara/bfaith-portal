@@ -57,7 +57,11 @@ const dataDirOf = (p, initId = p.init_id) => {
   if (initId) { fs.mkdirSync(path.join(d, 'lz-import'), { recursive: true }); fs.writeFileSync(path.join(d, 'lz-import', 'init.json'), JSON.stringify({ init_id: initId, by: 'x' })); }
   return d;
 };
-const run = (p, expect, { env = {}, dir, registry } = {}) => C.cutoverCheck({ expect, client: p.client, env, dataDir: dir === undefined ? dataDirOf(p) : dir, ...(registry ? { registry } : {}) });
+const { JOBS_REGISTRY: REG, RETIRED_JOBS: RET } = await import('../config/jobs-registry.mjs');
+/** Render の見張りの答え (既定 = この台帳と同じ = 切替の PR の後に反映された) */
+const renderOf = (registry = REG, retired = RET) => ({ evaluatedAt: 'x', results: registry.map((e) => ({ id: e.id, type: e.type, importance: e.importance, purpose: e.purpose, runbook: e.runbook, status: 'ok' })), unknownIds: [], retiredIds: retired.map((e) => e.id) });
+const run = (p, expect, { env = {}, dir, registry, retired, jobsStatus } = {}) => C.cutoverCheck({ expect, client: p.client, env, dataDir: dir === undefined ? dataDirOf(p) : dir,
+  ...(registry ? { registry } : {}), ...(retired ? { retired } : {}), jobsStatus: jobsStatus || (async () => renderOf()) });
 const bad = (r) => r.checks.filter((c) => !c.ok).map((c) => c.name);
 const names = (p) => p.calls.map((c) => c.name);
 
@@ -182,7 +186,7 @@ await ta('[7] ready (miniPC の LZ_DAILY_IMPORT=on の後・止めの解除の�
   setV4(true);
   const logs = [];
   const p = portal();
-  let r = await C.cutoverCheck({ expect: 'ready', client: p.client, env: { LZ_DAILY_IMPORT: 'on', GCHAT_WEBHOOK_JOBS: HOOK, LZ_DAILY_IMPORT_SHADOW: 'on' }, dataDir: dataDirOf(p), log: (s) => logs.push(s) });
+  let r = await C.cutoverCheck({ expect: 'ready', client: p.client, env: { LZ_DAILY_IMPORT: 'on', GCHAT_WEBHOOK_JOBS: HOOK, LZ_DAILY_IMPORT_SHADOW: 'on' }, dataDir: dataDirOf(p), jobsStatus: async () => renderOf(), log: (s) => logs.push(s) });
   assert.deepEqual([r.ok, bad(r)], [true, []]);
   assert.ok(!logs.join('\n').includes('SECRET'), '送り先の値は出さない');
   assert.ok(logs.some((s) => /LZ_DAILY_IMPORT_SHADOW=on が残っている/.test(s)));
@@ -247,6 +251,56 @@ await ta('[10] 戻しの版 (台帳 lz-gas-rollback・N9): commit の 11 ファ�
   const tag = git('rev-parse', '-q', '--verify', `refs/tags/${rb.tag}^{commit}`);
   assert.equal(tag.status, 0, `tag ${rb.tag} がこの clone に無い (git fetch origin tag ${rb.tag})`);
   assert.equal(tag.stdout.toString().trim(), rb.commit, 'tag は固定の commit を指す');
+});
+
+await ta('[11] ready の台帳 (Codex #1558 R2 Medium): この miniPC のリポジトリが切替の PR の前 (lz-daily-import が無い・影がある) = ❌ / Render の見張りが古い (影のまま・runbook が違う・読めない) = ❌ = ping の 200 では分からない 01:00 の締切を確かめる', async () => {
+  setV4(true);
+  const env = { LZ_DAILY_IMPORT: 'on', GCHAT_WEBHOOK_JOBS: HOOK };
+  let r = await run(portal(), 'ready', { env });
+  assert.deepEqual([r.ok, bad(r)], [true, []]);
+  // 切替の PR の前の台帳 (#1560 だけ = lz-daily-import が無く、影が台帳にある)
+  const shadow = { ...REG.find((e) => e.id === 'lz-daily-import'), id: 'lz-daily-import-shadow', importance: 'P3', grace_hours: 6 };
+  const before = [...REG.filter((e) => e.id !== 'lz-daily-import'), shadow];
+  const beforeRet = RET.filter((e) => e.id !== 'lz-daily-import-shadow');
+  r = await run(portal(), 'ready', { env, registry: before, retired: beforeRet, jobsStatus: async () => renderOf(before, beforeRet) });
+  assert.deepEqual(bad(r), ['この miniPC のリポジトリの台帳に lz-daily-import (P2・00:20・猶予 40 分)', 'この miniPC のリポジトリの台帳で影 lz-daily-import-shadow は退役',
+    'Render の見張りに lz-daily-import (P2・この miniPC と同じ台帳)', 'Render の見張りで影 lz-daily-import-shadow は退役']);
+  assert.match(r.checks.find((c) => !c.ok).detail, /切替の PR の前のコード/);
+  // miniPC は切替の後・Render の反映がまだ (影のまま)
+  r = await run(portal(), 'ready', { env, jobsStatus: async () => renderOf(before, beforeRet) });
+  assert.deepEqual(bad(r), ['Render の見張りに lz-daily-import (P2・この miniPC と同じ台帳)', 'Render の見張りで影 lz-daily-import-shadow は退役']);
+  // Render の lz-daily-import の runbook が違う (前の版) / 重要度が違う
+  for (const change of [{ runbook: '前の版' }, { importance: 'P3' }]) {
+    const x = renderOf(); x.results = x.results.map((e) => (e.id === 'lz-daily-import' ? { ...e, ...change } : e));
+    r = await run(portal(), 'ready', { env, jobsStatus: async () => x });
+    assert.deepEqual(bad(r), ['Render の見張りに lz-daily-import (P2・この miniPC と同じ台帳)'], JSON.stringify(change));
+  }
+  // 猶予が 40 分でない・00:20 でない (この miniPC の台帳)
+  for (const change of [{ grace_hours: 6 }, { anchor_minute_jst: 30 }]) {
+    const reg = REG.map((e) => (e.id === 'lz-daily-import' ? { ...e, ...change } : e));
+    r = await run(portal(), 'ready', { env, registry: reg, jobsStatus: async () => renderOf(reg) });
+    assert.deepEqual(bad(r), ['この miniPC のリポジトリの台帳に lz-daily-import (P2・00:20・猶予 40 分)'], JSON.stringify(change));
+  }
+  // 見張りを読めない
+  r = await run(portal(), 'ready', { env, jobsStatus: async () => { throw Object.assign(new Error('JOBS_MONITOR_TOKEN が無い'), { code: 'no_token' }); } });
+  assert.deepEqual(bad(r), ['Render の見張りの台帳を読む (/apps/jobs-monitor/status)']);
+  // cutover の段階では見張りを読まない (#1558 のマージの前に使う)
+  let called = 0;
+  r = await run(portal(), 'cutover', { jobsStatus: async () => { called++; return renderOf(); } });
+  assert.deepEqual([r.ok, called], [true, 0]);
+});
+
+await ta('[12] 見張りの読み方 fetchJobsStatus: GET /apps/jobs-monitor/status に Bearer (JOBS_MONITOR_TOKEN)・https だけ・token が無い / 断られた / 届かない = 理由つきで投げる', async () => {
+  const calls = [];
+  const ok = await C.fetchJobsStatus({ env: { JOBS_MONITOR_TOKEN: 'tok', JOBS_MONITOR_URL: 'https://jobs.example.test/x/y' }, fetchImpl: async (u, o) => { calls.push([u, o.headers.Authorization]); return { ok: true, status: 200, json: async () => ({ results: [], retiredIds: [] }) }; } });
+  assert.deepEqual([ok, calls], [{ results: [], retiredIds: [] }, [['https://jobs.example.test/apps/jobs-monitor/status', 'Bearer tok']]]);
+  const code = async (o) => { try { await C.fetchJobsStatus(o); return 'no-throw'; } catch (e) { return e.code; } };
+  assert.deepEqual([
+    await code({ env: {} }),
+    await code({ env: { JOBS_MONITOR_TOKEN: 't', JOBS_MONITOR_URL: 'http://jobs.example.test' } }),
+    await code({ env: { JOBS_MONITOR_TOKEN: 't' }, fetchImpl: async () => ({ ok: false, status: 401 }) }),
+    await code({ env: { JOBS_MONITOR_TOKEN: 't' }, fetchImpl: async () => { throw new Error('offline'); } }),
+  ], ['no_token', 'bad_url', 'http_401', 'unreachable']);
 });
 
 setV4(false);

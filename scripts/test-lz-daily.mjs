@@ -414,6 +414,11 @@ await ta('[9] 監視への報告: 作れた回だけ ok・作らない・失敗�
   assert.equal(await RUN.sendPing(RUN.JOB_ID, { status: 'ok' }, { env, fetchImpl: async () => ({ ok: false, status: 400 }), warn: (m) => warns.push(m) }), false);
   assert.equal(await RUN.sendPing(RUN.JOB_ID, { status: 'ok' }, { env, fetchImpl: async () => { throw new Error('offline'); }, warn: (m) => warns.push(m) }), false);
   assert.equal(warns.length, 2);
+  // 見張りの台帳に無い id (registered: false) = 締切で見てもらえない = 送れたと数えない (Codex #1558 R2 Medium)
+  assert.equal(await RUN.sendPing('lz-no-such-job', { status: 'ok' }, { env, fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ ok: true, registered: false }) }), warn: (m) => warns.push(m) }), false);
+  assert.match(warns.at(-1), /lz-no-such-job が Render の見張りの台帳に無い/);
+  assert.equal(await RUN.sendPing(RUN.JOB_ID, { status: 'ok' }, { env, fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ ok: true, registered: true }) }) }), true);
+  assert.equal(await RUN.sendPing(RUN.JOB_ID, { status: 'ok' }, { env, fetchImpl: async () => ({ ok: true, status: 200, json: async () => { throw new Error('not json'); } }) }), true, '本文が読めない = 今までどおり');
   // 台帳: 作るステップの項目 (v2 M9・v3 M6) = 毎日 07:00 の daily-sync・締切まで ok が無ければ気づく
   const { JOBS_REGISTRY, validateRegistry } = await import('../config/jobs-registry.mjs');
   const { evaluateEntry } = await import('../apps/jobs-monitor/evaluate.js');
