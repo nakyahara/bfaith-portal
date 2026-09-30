@@ -358,8 +358,30 @@ export function claimJob(db, { runnerRunId, now = Date.now() } = {}) {
     for (let guard = 0; guard < 50; guard++) {
       const job = db.prepare(`SELECT * FROM ph_lp_compose_jobs WHERE status = 'queued' ORDER BY id LIMIT 1`).get();
       if (!job) return { ok: true, job: null };
+      // 🚨 claim は「材料を AI に渡す瞬間」= 材料固定という設計の芯が試される所。
+      //    保存済みの hash を信じず、**中身から計算し直して**照合する (コード R7 #1)。
+      //    追記専用トリガーや app の経路だけでは、DB を直接いじられたときに気づけない。
+      const packetOk = (() => {
+        try { return sha256(canonicalJson(JSON.parse(job.packet_json))) === job.packet_hash; }
+        catch { return false; }
+      })();
+      if (!packetOk) {
+        db.prepare(`UPDATE ph_lp_compose_jobs
+          SET status = 'failed', error_code = 'packet_tampered', error = ?,
+              updated_at = ?, completed_at = COALESCE(completed_at, ?)
+          WHERE id = ? AND status = 'queued'`)
+          .run('受付時に固定した材料が変わっている (もう一度依頼してください)', nowS, nowS, job.id);
+        continue;
+      }
       const spec = db.prepare('SELECT * FROM ph_lp_specs WHERE id = ?').get(job.spec_id);
-      if (!spec || spec.hash !== job.spec_hash) {
+      const specOk = spec
+        && spec.hash === job.spec_hash
+        && (() => {
+          try {
+            return sha256(canonicalJson({ body: spec.body, sheet_titles: JSON.parse(spec.sheet_titles_json || '[]') })) === spec.hash;
+          } catch { return false; }
+        })();
+      if (!specOk) {
         // まだ queued なので status の条件は 'queued'。running を条件にすると 1 行も動かず、
         // 同じ job を掴み続けて claim が空回りする
         db.prepare(`UPDATE ph_lp_compose_jobs
@@ -513,6 +535,18 @@ export function submitResult(db, generationId, {
     }
     const job = jobById(db, gen.job_id);
     if (!job) return { code: 'not_found', error: '依頼がありません' };
+    // 🚨 証跡は「渡した材料のうち実際に見たもの」でなければ意味がない。
+    //    packet に無い file_id を含む receipt は受け取らない (コード R7 #2)。
+    //    完全一致までは求めない — 取得に失敗した画像があれば、その分は証跡に載らないのが正しい。
+    if (imgs?.length) {
+      let allowed;
+      try { allowed = new Set((JSON.parse(job.packet_json).images || []).map((im) => im.file_id)); }
+      catch { allowed = new Set(); }
+      const stray = imgs.find((im) => !allowed.has(im.file_id));
+      if (stray) {
+        return { code: 'bad_request', error: `receipt.images に渡していない画像があります (${stray.file_id})` };
+      }
+    }
     // 🚨 確定してよいのは running (通常) と needs_review (lease 切れ後の復旧) だけ。
     //    これが無いと、cancelled や別理由で failed になった job を後から done に戻せてしまう
     //    (コード R1 #2)。lease 切れ後の復旧を受けるのは AI 枠を消費済みだから (設計 ④)。

@@ -34,7 +34,7 @@ const args = (draft, spec, key, extra = {}) => ({
   draft, spec, idempotencyKey: key, actor: 'u@x', now: T0,
   productInfo: '■商品情報\nハッカ油 100ml',
   colorVariations: '■カラバリ\nなし (単品)',
-  images: [{ file_id: 'FID-1', modified_time: '2026-09-30T00:00:00Z' }],
+  images: [{ file_id: 'FILEID000001', modified_time: '2026-09-30T00:00:00Z' }],
   ...extra,
 });
 
@@ -93,13 +93,13 @@ console.log('⑥ 結果 — accepted');
 const OUT = '# LP制作システム V2.1\n\n## ⑦ AI画像生成プロンプト\n… 本文 …';
 ok(lp.submitResult(db, g1.generation_id, { packetHash: 'ちがう', verdict: 'accepted', output: OUT, now: min(1) }).code === 'packet_mismatch',
   '材料が予約時と違えば受け取らない');
-const sub1 = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: true }, reviewRounds: 1, receipt: { images: [{ file_id: 'FIDXXXXXX1', sha256: 'a'.repeat(64), bytes: 12345 }] }, now: min(1) });
+const sub1 = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: true }, reviewRounds: 1, receipt: { images: [{ file_id: 'FILEID000001', sha256: 'a'.repeat(64), bytes: 12345 }] }, now: min(1) });
 eq(sub1.status, 'done', '受け取ると done');
 const jDone = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE id = ?').get(c2.job.job_id);
 eq(jDone.output_text, OUT, '本文が保存される');
 ok(!!jDone.completed_at, '🚨 終端では completed_at が必ず入る (R4 #2)');
 ok(jDone.completed_at <= jDone.measurement_deadline_at, '3 分以内に終わったと後から計算できる');
-const sub1b = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: true }, reviewRounds: 1, receipt: { images: [{ file_id: 'FIDXXXXXX1', sha256: 'a'.repeat(64), bytes: 12345 }] }, now: min(1.5) });
+const sub1b = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: true }, reviewRounds: 1, receipt: { images: [{ file_id: 'FILEID000001', sha256: 'a'.repeat(64), bytes: 12345 }] }, now: min(1.5) });
 ok(sub1b.ok && sub1b.already, '同じ結果の再送は保存済みを返す (応答断のリトライ)');
 ok(lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'rejected', reason: 'ちがう内容', now: min(1.5) }).code === 'already_finalized',
   '別の内容では上書きできない');
@@ -194,7 +194,7 @@ eq(lp.submitResult(db, g8.generation_id, { packetHash: c8.job.packet_hash, verdi
 // 証跡は黙って直さない (切り捨てると「何を見て作ったか」として信用できない・R2 #4)
 eq(lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT,
-  receipt: { images: Array.from({ length: 50 }, (_, i) => ({ file_id: 'FILEID' + String(i).padStart(6, '0'), sha256: 'a'.repeat(64), bytes: 1 })) }, now: min(91),
+  receipt: { images: Array.from({ length: 50 }, (_, i) => ({ file_id: 'FILEID000001', sha256: 'a'.repeat(64), bytes: 1 })) }, now: min(91),
 }).code, 'bad_request', '🚨 receipt の枚数超過は切り捨てず断る (R2 #4)');
 eq(lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT,
@@ -213,6 +213,29 @@ ok(lp.requestJob(db, args(mkDraft('LP-L', 'テスト3'), s2.spec, 'key-0001\n', 
   '🚨 idempotency_key の末尾改行を弾く (R6)');
 ok(lp.requestJob(db, args({ ...dA, id: '12\n' }, s2.spec, 'key-000v', { now: min(96) })).code === 'bad_request',
   '🚨 ID の末尾改行を弾く (R6)');
+
+console.log('⑭ 材料固定を中身から確かめる (R7)');
+// #1 claim は保存済みの hash を信じず、packet と仕様書を中身から計算し直して照合する
+const dM = mkDraft('LP-M', 'ハッカ油スプレー 3L');
+const rM = lp.requestJob(db, args(dM, s2.spec, 'key-0001', { now: min(100) }));
+db.prepare(`UPDATE ph_lp_compose_jobs SET packet_json = ? WHERE id = ?`)
+  .run(JSON.stringify({ ...JSON.parse(rM.job.packet_json), name: 'すり替えた商品名' }), rM.job.id);
+ok(lp.claimJob(db, { runnerRunId: 'run-20', now: min(101) }).job === null, '🚨 packet を直接書き換えられたら claim しない (R7 #1)');
+eq(db.prepare('SELECT error_code FROM ph_lp_compose_jobs WHERE id = ?').get(rM.job.id).error_code, 'packet_tampered', '理由が残る');
+
+// #2 証跡に「渡していない画像」を混ぜられない
+const dN = mkDraft('LP-N', 'ハッカ油スプレー 4L');
+lp.requestJob(db, args(dN, s2.spec, 'key-0001', { now: min(110) }));
+const cN = lp.claimJob(db, { runnerRunId: 'run-21', now: min(110) });
+const gN = lp.reserveGeneration(db, cN.job.job_id, { leaseToken: cN.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(110) });
+eq(lp.submitResult(db, gN.generation_id, {
+  packetHash: cN.job.packet_hash, verdict: 'accepted', output: OUT,
+  receipt: { images: [{ file_id: 'OTHERFILE999', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
+}).code, 'bad_request', '🚨 渡していない画像を証跡に混ぜられない (R7 #2)');
+eq(lp.submitResult(db, gN.generation_id, {
+  packetHash: cN.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1,
+  receipt: { images: [{ file_id: 'FILEID000001', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
+}).status, 'done', '渡した画像なら通る');
 const subBig = lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1,
   receipt: { images: [{ file_id: 'FILEID000001', sha256: 'b'.repeat(64), bytes: 999, extra: 'x' }] }, now: min(91),
