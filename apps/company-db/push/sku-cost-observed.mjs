@@ -10,7 +10,8 @@
  * 期間の作り方 (設計 §3.4。🚨 core.sku_costs とは別の表 = 夜間ロードの原価の行を触らない):
  *   - 値 = 夜間ロードと同じ: 状態 (原価状態) は COMPLETE / OVERRIDDEN だけ (load/sources.mjs の mapCost)・原価は Math.round・数でない / 負は原価不明 (load/engine.mjs の costForLoad)
  *   - changed_at (履歴の記録が書いた UTC の時刻) の **JST の日の翌日から** 有効 (日次の処理が朝に気づく = その日の注文は前の原価)
- *   - 🚨 例外 = **最初の BASELINE_RESET (5/5 の写し)** はその日から observed。それより前 (2026-01-01 〜 写しの日の前日) は同じ値を estimated で推定
+ *   - 🚨 例外 = **最初の写し (BASELINE_RESET か INITIAL_SNAPSHOT = 5/5 の写し)** はその日から observed。
+ *     本番の最初の写し (2026-05-05 23:58:49 UTC・6,882 行) は旧い記録の名前 INITIAL_SNAPSHOT (今の記録の仕組みは BASELINE_RESET と書く・2026-09-30 本番の初回の dry-run で分かった)。それより前 (2026-01-01 〜 写しの日の前日) は同じ値を estimated で推定
  *   - 最初の写しに無く後で初めて出た商品コードは、初めて出た日より前を推定しない (原価不明)
  *   - 同じ有効日に複数の変化 = 最後の値 (changed_at → history_id の順で最後)。BASELINE_RESET / INSERT / UPDATE = 値の観測・DELETE = 原価不明の始まり (再 INSERT はその翌日から)
  *   - PARTIAL / MISSING / 読めない原価 = 原価不明の期間 (行を作らない)。原価と状態が変わらない履歴の行は区切りにしない (続く同じ値はまとめる)
@@ -62,7 +63,9 @@ export function guardReason(remote, manifest, rows) {
   return null;
 }
 export const META_PENDING = 'pending';            // 送る前に書く { generation, checksum, row_count, unresolved_code_count, ambiguous_code_count }
-const OPS = ['BASELINE_RESET', 'INSERT', 'UPDATE', 'DELETE'];
+const OPS = ['BASELINE_RESET', 'INITIAL_SNAPSHOT', 'INSERT', 'UPDATE', 'DELETE'];
+/** 写し (全部の商品の値の観測) の operation。INITIAL_SNAPSHOT = 旧い名前 (本番の 5/5 の最初の写し)・BASELINE_RESET = 今の --baseline */
+export const SNAPSHOT_OPS = ['BASELINE_RESET', 'INITIAL_SNAPSHOT'];
 const CHANGED_AT_RE = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})$/;
 const addDays = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
 
@@ -99,8 +102,8 @@ export function buildObservedPeriods(rows, { estimateFrom = ESTIMATE_FROM } = {}
     try { at = changedAtIso(r.changed_at); } catch (e) { throw new Error(`history_id ${hid}: ${e.message}`); }
     return { hid, code: r['商品コード'], at, operation: r.operation, row: r };
   });
-  const baselineAt = evs.filter((e) => e.operation === 'BASELINE_RESET').reduce((m, e) => (m === null || e.at < m ? e.at : m), null);
-  if (baselineAt === null) throw new Error('m_products_history に BASELINE_RESET (最初の写し) が無い = 観測の始まりが決まらない');
+  const baselineAt = evs.filter((e) => SNAPSHOT_OPS.includes(e.operation)).reduce((m, e) => (m === null || e.at < m ? e.at : m), null);
+  if (baselineAt === null) throw new Error('m_products_history に最初の写し (BASELINE_RESET / INITIAL_SNAPSHOT) が無い = 観測の始まりが決まらない');
   const baselineDay = jstDayOf(baselineAt);
   const byCode = new Map();
   let ignoredBeforeBaseline = 0;
@@ -116,7 +119,7 @@ export function buildObservedPeriods(rows, { estimateFrom = ESTIMATE_FROM } = {}
     const byEff = new Map();   // 有効日 → その日の最後の変化
     let baselineEv = null;
     for (const e of list) {
-      const firstBaseline = e.operation === 'BASELINE_RESET' && e.at === baselineAt;
+      const firstBaseline = SNAPSHOT_OPS.includes(e.operation) && e.at === baselineAt;
       const eff = firstBaseline ? baselineDay : addDays(jstDayOf(e.at), 1);
       if (firstBaseline) baselineEv = e;
       byEff.set(eff, e);

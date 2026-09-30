@@ -615,7 +615,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - ロジザードの商品マスタを取込の直前に書き出し (`DATA_DIR/lz-import/<日付>/<実行 ID>/pre.csv`)・CSV の全部の商品があり・削除されていないか → インポート画面で**プレビューまで**。記録 = 同じフォルダの `shadow.json`・プレビューの画面 `preview.html` / `preview.png`。
 - プレビューが「できた」 = ファイルを渡した後に処理が始まった・画面が変わった・入力欄に今回のファイル名・エラーのモーダルが無い (全部そろったときだけ)。サーバーエラー (「エラーが発生しました」) は OK を押さずに止める (画面 `preview-failed.html` を残す。やり直しは人)。
 - **毎晩の本番 (③c-1b-2b-2)** = `LZ_DAILY_IMPORT=on` のとき、`lz-daily-import.mjs` が `scripts/logizard-import/lz-nightly.mjs` の `nightlyMain` を呼ぶ (影はしない)。
-  - **2b-2a の間は動かない**: 毎晩の確かめの列の決まり (`RULES_NIGHTLY` = ふりがなの列・仕入単価の書き方・システムの列) は実機の少数件の試験で決める (2b-2b)。それまでは on にしても ❌ で何もしない (ファイル・ポータル・ロジザード・知らせ = 0・fail の ping は影の項目 `lz-daily-import-shadow` に)。on にするのは切替の PR の後。
+  - **確かめの列の決まり = RULES_2B2 (2b-2b・9/30 の実機の少数件の試験で決めた)**: ふりがな → 検索名称・仕入単価は文字のまま・取り込んだ商品は変更日時とインポート日時が取込の時刻に変わる (import_stamp = 同じ 14 桁・実在する JST の日時・前より後・**取込の時刻の窓の中** (押した時刻 − 10 分 〜 結果を読んだ時刻 + 10 分・Render の時計。記録 import.json の stamp_window に残し、次の夜の確かめのやり直しも同じ窓。窓の無い記録 = 記録の壊れ) ・登録日時は同じ)・取り込まなかった商品は全部の列が同じ。**毎晩の本番が動くのは切替の PR の後** (ポータルの旗 `LZ_MANUAL_V4=on`・`cutover_phase=cutover`・miniPC の `LZ_DAILY_IMPORT=on`)。それまで on にしても、ポータルの旗が無い = ❌ で取り込まない。
   - 呼ぶ前に見る順: 要対応スペースの送り先 `GCHAT_WEBHOOK_JOBS` (miniPC のリポジトリ直下の .env・無い・https の URL として読めない = ❌) → 決まり → `DATA_DIR`。
   - 時刻の元は **Render の時計** (`/api/status` の `clock.server_now` を単調な時計に写す。miniPC の壁時計は判断に使わない)。
   - どの回も最初に知らせの送り直し: 止め・要確認の outbox → 今の止まった状態の知らせ (窓の中の回は再適用待ちを最後の回に回す = 止めを先に)。予算 = **1 回の起動で共通** 50 件・60 秒 (前後の送り直しとエンジンの知らせで分け合う)。**08:40 / 11:45 (Render の時刻で窓の外) は知らせだけ** (ロジザードに入らない・ping しない)。
@@ -871,6 +871,18 @@ select transform_version, lines > 0 as has_lines, count(*) from core.order_finan
 select economic_date_jst, seller_sku_norm, unclassified_component_count, unclassified_mapped_jpy, unclassified_abs_jpy, unmapped_component_count
   from mart.finance_daily_sku_range(1::smallint, 'amazon', 'jp', '2026-09-01', '2026-09-30') where unclassified_component_count > 0 or unmapped_component_count > 0;
 ```
+
+### 決済のレポートの一覧 (miniPC の SQLite・D7b-1b の下ごしらえ・Company DB構想 13 §3.1 / D-65)
+
+- 書き手 = `apps/warehouse/fetch-amazon-settlements.js` (部品 `apps/warehouse/amazon-settlement-inventory.js`)。表 = warehouse.db の `amazon_settlement_report_inventory_runs` (回) / `amazon_settlement_report_inventory` (report ごと)。**今は記録だけ** (読み手 = 後の coverage)。取込む行には関わらない
+- 呼ぶ順 = 取込の一覧の要求 (日時の境なし・今と同じ) → 取込のダウンロードのループ (結果は report ごとにメモリ) → **ループが全部終わった後** に別の getReports で一覧を取る (窓 = `createdUntil` = 回の開始の時刻・`createdSince` = その 85 日前・時間の上限 120 秒) → 一覧の行・取込の結果・完了を **1 つの取引** で書く。最後のページまで取れない・応答の形が違う・時間切れ = `last_page_reached = 0` / `list_error` (取込の結果・終了コードは変わらない)
+- 一覧の要求は **専用の SP-API の接続** (amazon-sp-api の `auto_request_tokens: false`・`auto_request_throttled: false`・`retry_remote_timeout: false`・要求ごとに残り時間の `timeouts`) = 期限で socket を破棄し、429 でも待って再試行しない。アクセストークンは最初に全体の期限の中で 1 回だけ取り、403 (expired) でも取り直さず一覧の失敗にする (取込が済んだら node が自分で終わる)。取込の接続の設定は変えない
+- 🚨 **途中で落ちた回**: 取込が例外で止まった回は一覧を記録するが `completed_at` は null・`ingest_error` に理由。**daily-sync の時間切れなどで kill された回は一覧の記録が無い** = その回は coverage の証拠に使えない (安全側・次の回で取り直す)
+- 🚨 **記録の失敗**: 一覧の行・取込の結果のどこかを書けなければ取引ごと戻し、見出しだけを `record_error` つき・`completed_at` null で書く (行は無い = 「成功した回」に見せない)。見出しも書けなければ回は残らない
+- 回の所属 = `company_id` / `mall` / `scope_key` (今は 1 / `amazon` / `jp` 固定)
+- 🚨 **`evidence_epoch` の規則**: 初期の印 (D-65 = Seller Central の決済の一覧を書き出した印) を作るたびに採番し、その後の回に入れる。**`evidence_epoch` が null の回はどの印の鎖にも属さない = 期待の report の集合の積み上げに使わない** (今の回は全部 null)。印を作り直したら、積み上げは新しい epoch の回だけ
+- 回の完了 = `completed_at` がある・`last_page_reached = 1`・`list_error` / `ingest_error` / `record_error` が null。これを満たさない回は後の coverage で「失敗した回」として扱う
+- 試験 = `node apps/warehouse/test-settlement-inventory.js` (一時 DB・SP-API は差し替え・daily-sync の冒頭でも「Settlement 一覧テスト」として走る)
 
 ## 受注・出荷の受け皿 (0013。08 §4.1〜4.3 / §4.7。D4)
 
