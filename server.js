@@ -66,6 +66,7 @@ import { startIrohaPrintQueueWorker } from './apps/iroha-work/print-worker.js';
 import { startNotifyOutbox as startFbaBoxNotifyOutbox } from './apps/fba-box/notify-outbox.js';
 import staffRouter from './apps/staff/router.js';
 import masterDecisionsRouter from './apps/master-decisions/router.mjs';
+import masterEditRouter from './apps/master-edit/router.mjs';
 import { startInboundCheckCron, startInboundCheckPrintQueueWorker } from './apps/inbound-check/sync-job.js';
 // 🆕 新商品のパッケージ裏面ラベル写真を Drive へ送るキュー (プロセス内2分間隔の再試行)
 import { startBackLabelWorker } from './apps/inbound-check/back-label.js';
@@ -385,6 +386,8 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/apps/select-set/master-api')) return next();
     // /apps/master-decisions (マスタの判断) は mount 側で「requireAppAccess → router の Origin の守り → 512kb parser」の順に処理する (共通の 10MB が先に読むと router の上限が効かない・認証の前に本文を読む。Codex #1481 R1 Medium)
     if (normalizedPath.toLowerCase().startsWith('/apps/master-decisions')) return next();
+    // /apps/master-edit (マスタの入力) も同じ: mount 側で「requireAppAccess → router の Origin の守り → 256kb parser」の順 (認証の前に本文を読まない)
+    if (normalizedPath.toLowerCase().startsWith('/apps/master-edit')) return next();
     if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
   }
   return globalJsonParser(req, res, next);
@@ -926,6 +929,13 @@ if (process.env.JOBS_MONITOR_ENABLED === '1') {
 if (process.env.MASTER_DECISIONS_ENABLED === '1') {
   app.use('/apps/master-decisions', requireAppAccess('master-decisions'), masterDecisionsRouter);
   console.log('[server] master-decisions mounted');
+}
+// マスタの入力 (商品・セットを Company DB で直す・Company DB構想 14 ⑤-1)。Render だけ (env MASTER_EDIT_ENABLED=1 かつ PORTAL_VARIANT=render)。
+// 載せるだけでは見るだけ: 保存が開くのは 持ち主表 (config/master-ownership.mjs) が 'company' かつ env MASTER_EDIT_OPEN=1 のときだけ (router / lib/master-write.mjs)。
+// 見る = 利用権 (requireAppAccess)。保存 = router 内の名簿 MASTER_EDITORS (空なら誰も保存できない)
+if (process.env.MASTER_EDIT_ENABLED === '1' && PORTAL_VARIANT === 'render') {
+  app.use('/apps/master-edit', requireAppAccess('master-edit'), masterEditRouter);
+  console.log(`[server] master-edit mounted (保存 ${process.env.MASTER_EDIT_OPEN === '1' ? 'は開いている (持ち主表の company の列だけ)' : 'は閉じている = 見るだけ'})`);
 }
 // MF仕訳用 証憑リンク集 (apps/shohyo-links): 専用DB shohyo-links.db (DATA_DIR)。Notion「支払い関係リンク先」の移行先
 // limit 8mb = MF照合画面の証憑添付 (MFの上限5MBファイル → base64で約6.7MB) を受けるため

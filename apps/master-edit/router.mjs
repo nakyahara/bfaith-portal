@@ -1,0 +1,192 @@
+/**
+ * router.mjs — マスタ入力画面 (商品・セットを Company DB で直す。Company DB構想 14「マスタ入力画面」§2・§6 ⑤-1)
+ *
+ * 載せ方 (server.js): env MASTER_EDIT_ENABLED = 1 かつ Render (PORTAL_VARIANT = render) のときだけ
+ *   app.use('/apps/master-edit', requireAppAccess('master-edit'), router)
+ *   miniPC は同じ server.js を動かすが載せない (Company DB に人が書く口を 1 つに)
+ * 見る = アプリの利用権がある人 / 書く = env MASTER_EDITORS の名簿のメールだけ (空 = 誰も書けない。admin でも名簿に無ければ不可。画面で隠すだけでなく API で止める)
+ * 🚨 保存を開く = 切替の段階が new_open (ops.master_cutover_state・読めない = 閉) **かつ** 持ち主表 (config/master-ownership.mjs) の列が 'company'
+ *    **かつ** env MASTER_EDIT_OPEN = 1 (Codex ⑤-R0 High 1・R1 H1)。どれかが欠ければ、名簿の人でも保存は 409「切替前」(lib/master-write.mjs)。
+ *    MASTER_EDIT_ENABLED は画面を載せるだけ (見るだけ)
+ *   GET  /                   一覧 (画面 A)。?q=&kind=&state=&missing=&diff=1&offset=
+ *   GET  /manual             つかいかた
+ *   GET  /sku/:code          1 つの商品 (単品 = 画面 B / セット = 画面 C)
+ *   GET  /sku/:code/history  変更の記録
+ *   GET  /api/lookup?code=   構成品の引き当て
+ *   POST /api/sku/:code      保存 { request_id, reason?, seen: { token (編集の印), event_id? }, values: {...} }
+ * Company DB に届かない = 画面は「つながらない (保存できない)」の帯・保存は 503 (何も書かない)。SQLite と NE には書かない
+ * env: COMPANY_DB_URL (表の持ち主のロール)
+ */
+import express from 'express';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
+import { MASTER_OWNERSHIP, validateOwnership } from '../../config/master-ownership.mjs';
+import { saveSku, MasterWriteError, MAX_COMPONENTS } from '../../lib/master-write.mjs';
+import { listSkus, readSkuPage, lookupSku, skuHistory, normalizeFilters, KINDS, MISSING, STATES } from './read.mjs';
+import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const view = (name) => path.join(__dirname, 'views', name);
+const router = express.Router();
+
+/** Postgres の接続の作り方 (試験は PGlite に差し替える。本番では触らない) */
+let pgClientFactory = openPgClient;
+export function __setPgClientFactory(fn) { pgClientFactory = fn || openPgClient; }
+/** 今の時刻 (試験は日を固定する)。本番の保存の「今日」は DB の now() (取引の初めの東京の日付) */
+let clock = () => Date.now();
+let clockOverridden = false;
+export function __setClock(fn) { clock = fn || (() => Date.now()); clockOverridden = !!fn; }
+/** 列の持ち主 (試験は 'company' にした表に差し替える。本番は config/master-ownership.mjs のまま) */
+let ownershipOverride = null;
+export function __setOwnership(o) { ownershipOverride = o ? validateOwnership(o) : null; }
+const ownershipNow = () => ownershipOverride || MASTER_OWNERSHIP;
+/** 保存を開いているか (env MASTER_EDIT_OPEN = 1。切替日に持ち主表と一緒に開ける。要求ごとに読む = 再起動なしで閉じられる) */
+const isOpen = () => process.env.MASTER_EDIT_OPEN === '1';
+
+/**
+ * 送料の表 (送料コード → 配送方法・配送関係費合計)。Render の warehouse-mirror.db の mirror_shipping_rates (読むだけ)。
+ * 読めない = null (送料の保存は 503・ほかの項目は保存できる)
+ */
+async function defaultShippingRates() {
+  try {
+    const { getMirrorDB } = await import('../warehouse-mirror/db.js');
+    const rows = getMirrorDB().prepare('select shipping_code, 小分類区分名称 as method, 配送関係費合計 as cost from mirror_shipping_rates order by shipping_code').all();
+    return rows.length ? new Map(rows.map((r) => [String(r.shipping_code), { method: r.method ?? null, cost: r.cost ?? null }])) : null;
+  } catch {
+    return null;
+  }
+}
+let shippingRatesProvider = defaultShippingRates;
+export function __setShippingRatesProvider(fn) { shippingRatesProvider = fn || defaultShippingRates; }
+
+// ─── CSRF 二段ガード (マスタの判断と同じ): 書く API は Origin 必須で Host と一致・Content-Type は JSON ───
+router.use('/api/', (req, res, next) => {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  const origin = req.headers.origin;
+  let host = null;
+  try { host = origin ? new URL(origin).host : null; } catch { /* 壊れた Origin は不一致 */ }
+  if (!host || host !== req.headers.host) return res.status(403).json({ ok: false, error: 'origin_mismatch', message: 'ブラウザから操作してください (Origin ヘッダが必要です)' });
+  if (!/^application\/json\b/i.test(String(req.headers['content-type'] || ''))) return res.status(415).json({ ok: false, error: 'Content-Type は application/json にしてください' });
+  next();
+});
+router.use(express.json({ limit: '256kb' }));
+
+/** 書ける人か。env MASTER_EDITORS にメールをカンマ区切りで。名簿がすべて (admin でも名簿に無ければ不可・空なら誰も書けない) */
+export function editorGate(req) {
+  const list = String(process.env.MASTER_EDITORS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (!list.length) return { ok: false, message: '書ける人がまだ設定されていません (環境変数 MASTER_EDITORS)。設定されるまで誰も保存できません (見るのはできます)' };
+  const email = String(req.session?.email || '').trim().toLowerCase();
+  if (!email || !list.includes(email)) return { ok: false, message: '保存できるのは名簿の人だけです。見るのはできます' };
+  return { ok: true, message: null };
+}
+
+async function connect() {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return { error: 'Company DB の接続先が設定されていません (COMPANY_DB_URL)。いまは見ることも保存もできません' };
+  try {
+    const client = await pgClientFactory(url, { application_name: 'master-edit' });
+    if (client.on) client.on('error', (e) => console.error(`[master-edit] 接続のエラー: ${e.message}`));   // 切れた接続でプロセスを落とさない
+    await client.query(`set statement_timeout = '20s'`);
+    await client.query(`set lock_timeout = '10s'`);
+    await client.query(`set idle_in_transaction_session_timeout = '60s'`);
+    return { client };
+  } catch (e) {
+    console.error(`[master-edit] Company DB につながらない: ${e && e.message}`);
+    return { error: 'Company DB につながりません。いまは保存できません (つながったら画面を開き直してください)' };
+  }
+}
+
+/** 画面: つながらないときも画面は出す (帯で知らせる・保存のボタンは出さない) */
+async function withPgPage(req, res, fn) {
+  const c = await connect();
+  try {
+    await fn(c.client ? pgAdapter(c.client) : null, c.error || null);
+  } catch (e) {
+    console.error(`[master-edit] ${e && e.stack || e}`);
+    if (!res.headersSent) res.status(500).render(view('error.ejs'), { ...pageLocals(req), message: 'サーバーエラーが発生しました' });
+  } finally { if (c.client) { try { await c.client.end(); } catch { /* */ } } }
+}
+/** API: つながらない = 503 */
+async function withPgApi(res, fn) {
+  const c = await connect();
+  if (!c.client) return res.status(503).json({ ok: false, error: c.error, reason: 'db_unreachable' });
+  try {
+    await fn(pgAdapter(c.client));
+  } catch (e) {
+    if (e instanceof MasterWriteError) return res.status(e.status).json({ ok: false, error: e.message, reason: e.reason, ...e.extra });
+    if (e && e.code === '55P03') return res.status(409).json({ ok: false, error: 'ほかの処理 (夜間の処理・朝の照合・CSV など) が同じ商品を使っています。何も保存していません。少し待ってからもう一度', reason: 'locked' });
+    if (e && (e.code === '40P01' || e.code === '40001')) return res.status(409).json({ ok: false, error: 'ほかの処理とぶつかりました。何も保存していません。もう一度保存してください', reason: 'retry' });
+    console.error(`[master-edit] ${e && e.stack || e}`);
+    if (!res.headersSent) res.status(500).json({ ok: false, error: 'サーバーエラーが発生しました (何も保存していません)' });
+  } finally { try { await c.client.end(); } catch { /* */ } }
+}
+
+/** 画面の共通の値。phase = 切替の段階 (読めない・渡されない = 閉じている扱い) */
+const pageLocals = (req, phase = null) => {
+  const gate = editorGate(req);
+  const own = ownershipNow();
+  const phaseOpen = newEntryWritable(phase);
+  return {
+    title: 'マスタの入力 (商品・セット)', username: req.session?.email || '', displayName: req.session?.displayName || '',
+    canEdit: gate.ok, gateMessage: gate.message || '', base: req.baseUrl || '',
+    open: isOpen(),
+    phaseText: phase && phase.readable ? PHASE_LABELS[phase.phase] : '読めない (閉じている扱い)',
+    closed: !phaseOpen || !isOpen() || Object.values(own).every((v) => v === 'load'),
+  };
+};
+const fmt = {
+  yen: (v) => (v == null ? '' : Number(v).toLocaleString('ja-JP')),
+  tax: (v) => (v == null ? '' : String(Math.round(Number(v) * 100))),
+};
+
+router.get('/', (req, res) => {
+  // 画面の中のリンクは相対 (sku/… ・manual) = 末尾の / が無いと 1 つ上を指す
+  if (!String(req.originalUrl || '').split('?')[0].endsWith('/')) return res.redirect(301, `${req.baseUrl}/`);
+  return withPgPage(req, res, async (db, dbError) => {
+    const filters = normalizeFilters(req.query);
+    const data = db ? await listSkus(db, filters, { now: new Date(clock()) }) : { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false };
+    const phase = db ? await readCutoverPhase(db) : null;
+    res.render(view('index.ejs'), { ...pageLocals(req, phase), dbError, data, filters, KINDS, MISSING, STATES, fmt });
+  });
+});
+router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), MAX_COMPONENTS }));
+
+router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const now = new Date(clock());
+  const page = db ? await readSkuPage(db, req.params.code, { now, ownership: ownershipNow(), open: isOpen() }) : null;
+  if (db && !page) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), message: `商品コード ${req.params.code} は Company DB にありません` });
+  const shipping = page ? await shippingRatesProvider() : null;
+  res.render(view('sku.ejs'), {
+    ...pageLocals(req, page ? page.phase : null), dbError, page, code: req.params.code, fmt, KINDS, STATES, MAX_COMPONENTS,
+    shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
+  });
+}));
+router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const h = db ? await skuHistory(db, req.params.code) : null;
+  if (db && !h) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), message: `商品コード ${req.params.code} は Company DB にありません` });
+  res.render(view('history.ejs'), { ...pageLocals(req), dbError, h, code: req.params.code });
+}));
+
+router.get('/api/lookup', (req, res) => withPgApi(res, async (db) => {
+  const code = String(req.query.code || '').trim();
+  if (!code || code.length > 60) return res.status(400).json({ ok: false, error: 'コードを入れてください' });
+  const item = await lookupSku(db, code, { now: new Date(clock()) });
+  if (!item) return res.status(404).json({ ok: false, error: `${code} は Company DB にありません` });
+  res.json({ ok: true, item });
+}));
+
+router.post('/api/sku/:code', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  return withPgApi(res, async (db) => {
+    const shippingRates = b.values && Object.prototype.hasOwnProperty.call(b.values, 'shipping_code') ? await shippingRatesProvider() : null;
+    const r = await saveSku(db, {
+      actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, code: req.params.code, reason: b.reason ?? null, seen: b.seen, values: b.values,
+    }, { open: isOpen(), ownership: ownershipNow(), shippingRates, now: clockOverridden ? new Date(clock()) : undefined });
+    res.json(r);
+  });
+});
+
+export default router;

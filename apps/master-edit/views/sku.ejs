@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+  <style>
+    .sec { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 8px 14px; margin-bottom: 10px; }
+    .sec h3 { font-size: 0.95em; margin: 2px 0 8px; color: #343a40; }
+    .fl { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; font-size: 0.9em; }
+    .fl label.k { color: #495057; min-width: 6em; }
+    .fl input[type=text], .fl select { padding: 4px 6px; font-size: 0.95em; }
+    .sub { font-size: 0.82em; color: #868e96; }
+    .derived { background: #f1f3f5; border-radius: 6px; padding: 6px 10px; font-size: 0.88em; margin-top: 6px; }
+    .derived .blk { color: #c92a2a; } .derived .wrn { color: #7a5a00; }
+    .todo { background: #fff9db; border: 1px solid #ffe066; border-radius: 6px; padding: 6px 10px; font-size: 0.88em; margin: 6px 0; }
+    #comp input.c-code { width: 11em; } #comp input.c-qty { width: 4em; text-align: right; }
+    .bar { position: sticky; bottom: 0; background: #fff; border-top: 2px solid #dee2e6; padding: 8px 0; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .result { background: #fff; border: 1px solid #adb5bd; border-radius: 8px; padding: 8px 14px; margin: 8px 0; font-size: 0.88em; }
+    .result li { margin: 2px 0; }
+  </style>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    const c = page ? page.cur : null;
+    const F = page ? page.fields : {};
+    const isSet = !!c && c.sku_kind === 'set';
+    const canSave = !!page && canEdit && !dbError && c.sku_kind !== 'exception';
+    const dis = (f) => (!canSave || !F[f] || !F[f].editable ? ' disabled' : '');
+    const cut = (f) => (F[f] && !F[f].editable ? '<span class="tag">切替前</span>' : '');
+    const SALES = { 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' };
+    const HANDLING = { active: '取扱中', discontinued: '中止', unknown: '不明' };
+    const SRC = { ne: 'NE', manual: '人', set_calc: '構成品の合計', override_zero: '0 円の上書き', imported: '取込' };
+    const pct = (v) => (v == null ? '未入力' : fmt.tax(v) + '%');
+    const editRows = isSet ? (c.component_request ? c.component_request.rows : c.components) : [];
+  %>
+  <div class="me-wrap">
+    <p class="sub"><a href="<%= base %>/">← 一覧へ</a></p>
+    <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
+    <% if (page) { %>
+    <% if (closed) { %><div class="band warn">切替前です (段階: <%= phaseText %>): この商品の正はまだ NE・/register です。見るだけです (保存しても「切替前」で断られ、何も変わりません)。</div><% } %>
+    <% if (!canEdit) { %><div class="band info"><%= gateMessage %></div><% } %>
+    <% if (c.sku_kind === 'exception') { %><div class="band info">例外の SKU (NE に無い商品) はこの画面では直せません。</div><% } %>
+
+    <h2 style="font-size: 1.15em; margin: 6px 0;"><%= c.code %> <span class="muted" style="font-size: 0.8em;"><%= c.name %></span></h2>
+    <p class="sub"><%= KINDS[c.sku_kind] || c.sku_kind %> ・ 状態: <%= STATES[page.state] || page.state %> ・ version <%= c.version %> ・ <a href="<%= base %>/sku/<%= encodeURIComponent(c.code) %>/history">変更の記録</a></p>
+
+    <form id="f" onsubmit="return false" data-base="<%= base %>" data-code="<%= c.code %>" data-kind="<%= c.sku_kind %>"
+          data-token="<%= page.token %>" data-event-id="<%= page.seenEventId %>" data-can-save="<%= canSave ? '1' : '0' %>">
+
+    <% if (!isSet) { %>
+      <div class="sec"><h3>基本</h3>
+        <div class="fl"><label class="k">名前</label><input type="text" data-field="name" value="<%= c.name %>" size="60"<%= dis('name') %>><%- cut('name') %></div>
+        <div class="fl"><label class="k">取扱区分</label>
+          <label><input type="radio" name="handling" data-field="handling" value="active"<%= c.handling === 'active' ? ' checked' : '' %><%= dis('handling') %>> 取扱中</label>
+          <label><input type="radio" name="handling" data-field="handling" value="discontinued"<%= c.handling === 'discontinued' ? ' checked' : '' %><%= dis('handling') %>> 中止</label>
+          <% if (c.handling === 'unknown') { %><span class="sub">(今は不明)</span><% } %><%- cut('handling') %>
+        </div>
+        <div class="fl"><label class="k">代表 (親)</label><input type="text" data-field="parent_code" value="<%= c.parent_code || '' %>" size="20"<%= dis('parent_code') %>>
+          <span class="sub"><%= c.parent_name || '' %><%= c.parent_set_by === 'manual' ? ' (人が決めた)' : c.parent_set_by === 'load' ? ' (NE から)' : '' %> ・ 空にすると代表なし</span><%- cut('parent_code') %></div>
+      </div>
+      <div class="sec"><h3>お金</h3>
+        <div class="fl"><label class="k">標準売価</label><input type="text" data-field="standard_price" value="<%= c.standard_price ?? '' %>" size="10"<%= dis('standard_price') %>> 円<%- cut('standard_price') %></div>
+        <div class="fl"><label class="k">原価</label>
+          <span>今: <b><%= c.cost_today ? fmt.yen(c.cost_today.cost_jpy) + ' 円' : '未入力' %></b><% if (c.cost_today) { %> <span class="sub">(<%= c.cost_today.valid_from %> から・<%= SRC[c.cost_today.cost_source] || c.cost_today.cost_source %>)</span><% } %></span>
+        </div>
+        <div class="fl"><label class="k">新しい原価</label><input type="text" id="cost-jpy" size="10" placeholder="円"<%= dis('cost') %>>
+          <span class="sub">今日 (<%= page.today %>) から</span>
+          理由 <input type="text" id="cost-reason" size="28" maxlength="200" placeholder="例: 仕入値の改定"<%= dis('cost') %>><%- cut('cost') %></div>
+        <details><summary class="sub">原価の履歴 (<%= page.costs.length %>)</summary>
+          <table class="me"><thead><tr><th>原価</th><th>始まり</th><th>終わり</th><th>出どころ</th><th>状態</th><th>理由</th><th>入れた人</th></tr></thead><tbody>
+          <% for (const x of page.costs) { %><tr><td class="n"><%= fmt.yen(x.cost_jpy) %></td><td><%= x.valid_from %></td><td><%= x.valid_to || '' %></td><td><%= SRC[x.cost_source] || x.cost_source %></td><td><%= x.cost_status %></td><td><%= x.reason || '' %></td><td><%= x.created_by_id || x.created_by_type %></td></tr><% } %>
+          </tbody></table>
+        </details>
+      </div>
+      <div class="sec"><h3>税・分類</h3>
+        <div class="fl"><label class="k">税率</label>
+          <label><input type="radio" name="tax_rate" data-field="tax_rate" value="0.08"<%= c.tax_rate === 0.08 ? ' checked' : '' %><%= dis('tax_rate') %>> 8%</label>
+          <label><input type="radio" name="tax_rate" data-field="tax_rate" value="0.1"<%= c.tax_rate === 0.1 ? ' checked' : '' %><%= dis('tax_rate') %>> 10%</label>
+          <% if (c.tax_rate == null) { %><span class="sub">(今は未入力)</span><% } %><%- cut('tax_rate') %>
+        </div>
+        <div class="fl"><label class="k">売上分類</label><select data-field="sales_class"<%= dis('sales_class') %>>
+          <% if (c.sales_class == null) { %><option value="" selected>(未入力)</option><% } %>
+          <% for (const [k, v] of Object.entries(SALES)) { %><option value="<%= k %>"<%= String(c.sales_class) === k ? ' selected' : '' %>><%= v %></option><% } %>
+        </select><%- cut('sales_class') %></div>
+      </div>
+      <div class="sec"><h3>仕入先</h3>
+        <div class="fl"><label class="k">代表の仕入先</label><select data-field="primary_supplier"<%= dis('primary_supplier') %>>
+          <% if (!c.primary_supplier) { %><option value="" selected>(なし)</option><% } %>
+          <% for (const s of page.activeSuppliers) { %><option value="<%= s.code %>"<%= s.code === c.primary_supplier ? ' selected' : '' %>><%= s.code %> <%= s.name %></option><% } %>
+          <% if (c.primary_supplier && !page.activeSuppliers.some((s) => s.code === c.primary_supplier)) { %><option value="<%= c.primary_supplier %>" selected><%= c.primary_supplier %> (取引停止)</option><% } %>
+        </select><span class="sub">先方品番・入数・ロットは <a href="/apps/purchase-orders">発注アプリ ↗</a></span><%- cut('primary_supplier') %></div>
+        <% if (page.suppliers.length) { %><div class="sub">この商品の仕入先: <%= page.suppliers.map((s) => s.code + ' ' + s.name + (s.vendor_code ? ' (' + s.vendor_code + ')' : '') + (s.is_primary ? ' ★' : '')).join(' / ') %></div><% } %>
+      </div>
+    <% } else { %>
+      <%
+        const dv = page.derived;
+        const derivedLine = (d) => '税 ' + (d.tax.taxRate == null ? '未決' : fmt.tax(d.tax.taxRate) + '%') + ' (' + d.tax.taxClass + ') ・ 分類 ' + (d.salesClass ?? '導けない') + (d.salesSource === 'override' ? ' (上書き)' : '') + ' ・ 原価 ' + (d.cost.status === 'COMPLETE' ? fmt.yen(d.cost.jpy) + ' 円 (合計)' : '合計できない') + ' ・ 取扱 ' + (HANDLING[d.handling] || d.handling) + (d.price_sum == null ? '' : ' ・ 単品の売価 × 数 = ' + fmt.yen(d.price_sum) + ' 円');
+      %>
+      <div class="sec"><h3>基本</h3>
+        <div class="fl"><label class="k">セット名</label><input type="text" data-field="name" value="<%= c.name %>" size="60"<%= dis('name') %>><%- cut('name') %></div>
+        <div class="fl"><label class="k">標準売価</label><input type="text" data-field="standard_price" value="<%= c.standard_price ?? '' %>" size="10"<%= dis('standard_price') %>> 円
+          <span class="sub">(単品の売価 × 数 = <%= dv.current.price_sum == null ? '—' : fmt.yen(dv.current.price_sum) %>)</span><%- cut('standard_price') %></div>
+      </div>
+      <div class="sec"><h3>構成 (今の構成 = NE で確かめた構成)</h3>
+        <table class="me">
+          <thead><tr><th>#</th><th>今の構成品</th><th>数量</th><th>税</th><th>分類</th><th>原価</th><th>取扱</th></tr></thead>
+          <tbody>
+          <% if (!c.components.length) { %><tr><td colspan="7" class="muted">構成品がありません</td></tr><% } %>
+          <% c.components.forEach((x, i) => { %>
+            <tr><td><%= i + 1 %></td><td><%= x.code %> <span class="sub"><%= x.name %></span></td><td class="n"><%= x.qty %></td>
+              <td><%= x.tax_rate == null ? '未' : fmt.tax(x.tax_rate) %></td><td><%= x.sales_class ?? '未' %></td><td class="n"><%= x.cost_jpy == null ? '未' : fmt.yen(x.cost_jpy) %></td><td><%= HANDLING[x.handling] || x.handling %></td></tr>
+          <% }) %>
+          </tbody>
+        </table>
+        <div class="derived">導く値 (今の構成・見るだけ): <b><%= derivedLine(dv.current) %></b>
+          <div class="sub">保存している値: 税 <%= pct(c.tax_rate) %> (<%= c.tax_class || '—' %>) ・ 原価 <%= c.cost_today ? fmt.yen(c.cost_today.cost_jpy) + ' 円 (' + (SRC[c.cost_today.cost_source] || c.cost_today.cost_source) + ')' : '未入力' %> ・ 取扱 <%= HANDLING[c.handling] || c.handling %></div>
+          <% for (const b of dv.current.blockers) { %><div class="blk">✖ <%= b %></div><% } %>
+          <% for (const w of dv.current.warnings) { %><div class="wrn">⚠ <%= w %></div><% } %>
+        </div>
+        <% if (c.component_request) { %>
+        <div class="todo"><b>NE でやること (構成の依頼)</b> ・ <%= c.component_request.requested_by %> ・ <%= String(c.component_request.created_at).slice(0, 16) %><%= c.component_request.reason ? ' ・ ' + c.component_request.reason : '' %>
+          <div>依頼した構成: <%= c.component_request.rows.map((x) => x.code + '×' + x.qty).join(', ') %> (今の構成: <%= c.components.map((x) => x.code + '×' + x.qty).join(', ') || 'なし' %>)</div>
+          <div class="sub">NE の構成がこのとおり (構成品・数量・並び) になったのを NE の取得で確かめてから、今の構成に上げて依頼を閉じます。外す・入れ替える・並べ替えるは NE の画面で。</div>
+          <div class="derived">導く値 (依頼の構成): <b><%= derivedLine(dv.requested) %></b>
+            <% for (const b of dv.requested.blockers) { %><div class="blk">✖ <%= b %></div><% } %>
+            <% for (const w of dv.requested.warnings) { %><div class="wrn">⚠ <%= w %></div><% } %>
+          </div>
+        </div>
+        <% } %>
+        <h3 style="margin-top: 10px;">構成を変える (依頼する) <%- cut('components') %></h3>
+        <table class="me" id="comp" data-editable="<%= dis('components') ? '0' : '1' %>">
+          <thead><tr><th>#</th><th>構成品</th><th>数量</th><th>税</th><th>分類</th><th>原価</th><th>取扱</th><th></th></tr></thead>
+          <tbody id="comp-rows">
+          <% editRows.forEach((x, i) => { %>
+            <tr class="comp-row">
+              <td class="no"><%= i + 1 %></td>
+              <td><input type="text" class="c-code" value="<%= x.code %>"<%= dis('components') %>> <span class="c-name sub"><%= x.name %></span></td>
+              <td><input type="text" class="c-qty" value="<%= x.qty %>"<%= dis('components') %>></td>
+              <td class="c-tax"><%= x.tax_rate == null ? '未' : fmt.tax(x.tax_rate) %></td>
+              <td class="c-sales"><%= x.sales_class ?? '未' %></td>
+              <td class="c-cost n"><%= x.cost_jpy == null ? '未' : fmt.yen(x.cost_jpy) %></td>
+              <td class="c-handling"><%= HANDLING[x.handling] || x.handling %></td>
+              <td><button type="button" class="btn-sm" data-act="up"<%= dis('components') %>>↑</button><button type="button" class="btn-sm" data-act="down"<%= dis('components') %>>↓</button><button type="button" class="btn-sm" data-act="del"<%= dis('components') %>>×</button></td>
+            </tr>
+          <% }) %>
+          </tbody>
+        </table>
+        <template id="comp-tpl"><tr class="comp-row"><td class="no"></td><td><input type="text" class="c-code" placeholder="商品コード"> <span class="c-name sub"></span></td><td><input type="text" class="c-qty" value="1"></td><td class="c-tax"></td><td class="c-sales"></td><td class="c-cost n"></td><td class="c-handling"></td><td><button type="button" class="btn-sm" data-act="up">↑</button><button type="button" class="btn-sm" data-act="down">↓</button><button type="button" class="btn-sm" data-act="del">×</button></td></tr></template>
+        <div class="fl" style="margin-top: 6px;"><button type="button" class="btn-sm" id="comp-add"<%= dis('components') %>>+ 構成品</button>
+          <span class="sub">1〜<%= MAX_COMPONENTS %> 行・数量 1〜999・同じ品は 1 行・セットは入れられません ・ ※数量 1 の品を先頭に (NE の注意) ・ 今の構成に戻すと依頼を取り下げます</span></div>
+      </div>
+      <div class="sec"><h3>上書き</h3>
+        <div class="fl"><label class="k">売上分類</label><select data-field="set_sales_class_override"<%= dis('set_sales_class_override') %>>
+          <option value=""<%= c.set_sales_class_override == null ? ' selected' : '' %>>— (構成品から)</option>
+          <% for (const [k, v] of Object.entries(SALES)) { %><option value="<%= k %>"<%= String(c.set_sales_class_override) === k ? ' selected' : '' %>><%= v %></option><% } %>
+        </select><span class="sub">構成品から導けないとき (未入力の構成品・輸出 4 の混在) だけ</span><%- cut('set_sales_class_override') %></div>
+        <div class="fl"><label class="k">例外原価</label>
+          <span>今: <%= c.open_cost ? fmt.yen(c.open_cost.cost_jpy) + ' 円 (' + (SRC[c.open_cost.cost_source] || c.open_cost.cost_source) + '・' + c.open_cost.valid_from + ' から)' : '未入力' %></span></div>
+        <div class="fl"><label class="k">新しい例外原価</label><input type="text" id="xcost-jpy" size="10" placeholder="円"<%= dis('exception_cost') %>>
+          <span class="sub">今日 (<%= page.today %>) から</span>
+          理由 <input type="text" id="xcost-reason" size="24" maxlength="200"<%= dis('exception_cost') %>>
+          <label><input type="checkbox" id="xcost-clear"<%= dis('exception_cost') %>> 例外原価をやめる (構成品の合計に戻す)</label><%- cut('exception_cost') %></div>
+      </div>
+      <div class="sec"><h3>セット自身</h3>
+        <div class="fl"><label class="k">取扱</label>
+          <label><input type="radio" name="handling_own" data-field="handling_own" value="active"<%= c.handling_own === 'active' ? ' checked' : '' %><%= dis('handling_own') %>> 取扱中</label>
+          <label><input type="radio" name="handling_own" data-field="handling_own" value="discontinued"<%= c.handling_own === 'discontinued' ? ' checked' : '' %><%= dis('handling_own') %>> 中止</label>
+          <% if (c.handling_own == null) { %><span class="sub">(まだ決めていない)</span><% } %>
+          <span class="sub">実際の取扱区分は構成品と合わせて決まる (構成品が 1 つでも中止ならセットも中止)</span><%- cut('handling_own') %></div>
+      </div>
+    <% } %>
+
+    <% if (c.sku_kind !== 'exception') { %>
+      <div class="sec"><h3>物流</h3>
+        <div class="fl"><label class="k">送料コード</label>
+          <% if (shippingRates) { %>
+          <select data-field="shipping_code"<%= dis('shipping_code') %>>
+            <% if (!c.shipping_code) { %><option value="" selected>(未入力)</option><% } %>
+            <% for (const r of shippingRates) { %><option value="<%= r.code %>"<%= r.code === c.shipping_code ? ' selected' : '' %>><%= r.code %> <%= r.method || '' %> / <%= fmt.yen(r.cost) %> 円</option><% } %>
+            <% if (c.shipping_code && !shippingRates.some((r) => r.code === c.shipping_code)) { %><option value="<%= c.shipping_code %>" selected><%= c.shipping_code %> (表に無い)</option><% } %>
+          </select>
+          <% } else { %><span><%= c.shipping_code || '未入力' %></span> <span class="tag gray">送料の表が読めないので直せません</span><% } %>
+          <span class="sub">今: <%= c.shipping_method || '—' %> / <%= c.shipping_cost == null ? '—' : fmt.yen(c.shipping_cost) + ' 円' %> (方法と金額は表から)</span><%- cut('shipping_code') %></div>
+        <div class="fl"><label class="k">推奨保有月数</label><input type="text" data-field="reorder_months" value="<%= c.reorder_months ?? '' %>" size="5"<%= dis('reorder_months') %>> か月<%- cut('reorder_months') %></div>
+        <% if (!isSet) { %>
+        <div class="fl"><label class="k">JAN</label><span><%= page.jan.length ? page.jan.join(' / ') : '—' %></span><span class="tag gray">見るだけ</span></div>
+        <div class="fl"><label class="k">ロジザード</label><span class="sub">有効期限の管理 <%= c.expiry_managed ? 'あり' : 'なし' %> ・ 入荷日の管理 <%= c.inbound_date_managed == null ? '不明' : (c.inbound_date_managed ? 'あり' : 'なし') %> (ロジザードが正・見るだけ)</span></div>
+        <% } %>
+      </div>
+      <div class="sec"><h3>使われ方・NE</h3>
+        <% if (!isSet) { %><div class="fl"><span>セット <%= page.usedIn.length %> 件<%= page.usedIn.length ? ': ' + page.usedIn.map((u) => u.code + '×' + u.qty).join(', ') : '' %></span></div><% } %>
+        <div class="fl"><span>Amazon SKU <%= page.amazon %> 件 (見るだけ)</span></div>
+        <div class="fl"><span>NE に取り込む CSV の待ち: <%= page.csvRows.length ? page.csvRows.map((r) => r.col + (r.child ? '(' + r.child + ')' : '') + ' [' + r.source + ']').join(', ') : 'なし' %></span> <a href="/apps/master-decisions/csv">マスタの判断 ↗</a></div>
+      </div>
+
+      <div class="bar">
+        <label>理由 (任意) <input type="text" id="reason" size="36" maxlength="200"<%= canSave ? '' : ' disabled' %>></label>
+        <button type="button" class="btn-sm" id="save"<%= canSave ? '' : ' disabled' %>>保存</button>
+        <span id="count" class="sub">変わる項目 0</span>
+      </div>
+    <% } %>
+    </form>
+    <div class="msg" id="msg"></div>
+    <div id="result"></div>
+    <% } %>
+  </div>
+
+<script>
+(() => {
+  const form = document.getElementById('f');
+  if (!form) return;
+  const D = form.dataset;
+  const $ = (id) => document.getElementById(id);
+  const isSet = D.kind === 'set';
+  const canSave = D.canSave === '1';
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const show = (v) => (v === null || v === undefined || v === '' ? '(空)' : typeof v === 'object' ? (v.rate !== undefined ? (v.rate == null ? '未決' : Math.round(v.rate * 100) + '%') + ' ' + (v.class || '') : JSON.stringify(v)) : String(v));
+  const HANDLING = { active: '取扱中', discontinued: '中止', unknown: '不明' };
+  const NE = { csv: 'NE へ CSV', manual: 'NE の画面で', none: 'NE へ送らない' };
+  function uuid() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    const b = new Uint8Array(16); crypto.getRandomValues(b); b[6] = (b[6] & 15) | 64; b[8] = (b[8] & 63) | 128;
+    const h = Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+    return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
+  }
+  // 保存 1 回に 1 つ (通信が切れて押し直しても 2 回入らない)。返事が来た後にもう一度保存するときは新しい番号
+  let requestId = uuid();
+  const FIELDS = isSet ? ['name', 'standard_price', 'set_sales_class_override', 'handling_own', 'shipping_code', 'reorder_months']
+    : ['name', 'handling', 'parent_code', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months'];
+  function els(name) { return Array.from(form.querySelectorAll('[data-field="' + name + '"]')); }
+  function fieldValue(name) {
+    const list = els(name);
+    if (!list.length) return undefined;
+    if (list[0].type === 'radio') { const on = list.find((e) => e.checked); return on ? on.value : null; }
+    return list[0].value;
+  }
+  const editable = (name) => { const list = els(name); return list.length > 0 && !list.some((e) => e.disabled); };
+  const compTable = $('comp');
+  const compEditable = !!compTable && compTable.dataset.editable === '1';
+  function components() {
+    return Array.from(document.querySelectorAll('#comp-rows tr.comp-row'))
+      .map((tr) => ({ code: tr.querySelector('.c-code').value.trim(), qty: tr.querySelector('.c-qty').value.trim() }))
+      .filter((r) => r.code || r.qty);
+  }
+  function snapshot() {
+    const s = {};
+    for (const f of FIELDS) s[f] = fieldValue(f);
+    if (isSet) s.components = JSON.stringify(components());
+    return s;
+  }
+  const initial = snapshot();
+  function costOf(prefix, allowClear) {
+    const jpy = $(prefix + '-jpy'); if (!jpy || jpy.disabled) return undefined;
+    const clear = allowClear && $(prefix + '-clear') && $(prefix + '-clear').checked;
+    if (!clear && !jpy.value.trim()) return undefined;
+    const v = { reason: $(prefix + '-reason').value };
+    if (clear) v.clear = true; else v.jpy = jpy.value.trim();
+    return v;
+  }
+  function collect() {
+    const values = {};
+    for (const f of FIELDS) {
+      if (!editable(f)) continue;
+      const v = fieldValue(f);
+      if (v === undefined || v === null) continue;   // ラジオが未選択 = 送らない (今のまま)
+      values[f] = v;
+    }
+    if (isSet && compEditable && JSON.stringify(components()) !== initial.components) values.components = components();
+    const cost = isSet ? costOf('xcost', true) : costOf('cost', false);
+    if (cost) values[isSet ? 'exception_cost' : 'cost'] = cost;
+    return values;
+  }
+  function countChanges() {
+    const now = snapshot();
+    let n = Object.keys(now).filter((k) => now[k] !== initial[k]).length;
+    if ((isSet ? costOf('xcost', true) : costOf('cost', false))) n++;
+    const el = $('count'); if (el) el.textContent = '変わる項目 ' + n;
+  }
+  form.addEventListener('input', countChanges);
+  form.addEventListener('change', countChanges);
+
+  // ── セットの構成 (依頼) ──
+  function renumber() { Array.from(document.querySelectorAll('#comp-rows tr.comp-row')).forEach((tr, i) => { tr.querySelector('.no').textContent = String(i + 1); }); countChanges(); }
+  async function lookup(tr) {
+    const code = tr.querySelector('.c-code').value.trim();
+    const set = (cls, v) => { tr.querySelector(cls).textContent = v; };
+    if (!code) { set('.c-name', ''); return; }
+    try {
+      const r = await fetch(D.base + '/api/lookup?code=' + encodeURIComponent(code), { headers: { Accept: 'application/json' } });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) { set('.c-name', j.error || '見つかりません'); ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach((c) => set(c, '')); return; }
+      const x = j.item;
+      set('.c-name', x.name + (x.kind !== 'single' ? ' (単品でない = 構成品にできません)' : ''));
+      set('.c-tax', x.tax_rate == null ? '未' : String(Math.round(x.tax_rate * 100)));
+      set('.c-sales', x.sales_class == null ? '未' : String(x.sales_class));
+      set('.c-cost', x.cost_jpy == null ? '未' : x.cost_jpy.toLocaleString('ja-JP'));
+      set('.c-handling', HANDLING[x.handling] || x.handling);
+    } catch (e) { set('.c-name', '引き当てできません (通信)'); }
+  }
+  const rowsEl = $('comp-rows');
+  if (rowsEl) {
+    rowsEl.addEventListener('click', (ev) => {
+      const b = ev.target.closest('button[data-act]'); if (!b || b.disabled) return;
+      const tr = b.closest('tr');
+      if (b.dataset.act === 'del') tr.remove();
+      if (b.dataset.act === 'up' && tr.previousElementSibling) tr.parentNode.insertBefore(tr, tr.previousElementSibling);
+      if (b.dataset.act === 'down' && tr.nextElementSibling) tr.parentNode.insertBefore(tr.nextElementSibling, tr);
+      renumber();
+    });
+    rowsEl.addEventListener('change', (ev) => { if (ev.target.classList.contains('c-code')) lookup(ev.target.closest('tr')); });
+  }
+  const addBtn = $('comp-add');
+  if (addBtn) addBtn.addEventListener('click', () => {
+    const tpl = $('comp-tpl');
+    rowsEl.appendChild(tpl.content.firstElementChild.cloneNode(true));
+    renumber();
+    rowsEl.lastElementChild.querySelector('.c-code').focus();
+  });
+
+  // ── 保存 ──
+  function setMsg(text, cls) { const m = $('msg'); m.className = 'msg ' + (cls || ''); m.textContent = text || ''; }
+  function showResult(j) {
+    const r = $('result');
+    if (j.no_change) { r.innerHTML = '<div class="result">変わった項目がありません (何も保存していません)。</div>'; return; }
+    const li = (a) => a.map((x) => '<li>' + x + '</li>').join('');
+    const colText = (c) => (c === 'tax_rate' ? '税率' : c === 'handling' ? '取扱区分' : '原価');
+    r.innerHTML = '<div class="result"><b>保存しました' + (j.replayed ? ' (前に保存した結果)' : '') + '</b>'
+      + '<ul>' + li(j.changed.map((c) => esc(c.label) + ': ' + esc(show(c.from)) + ' → ' + esc(show(c.to)) + ' <span class="sub">(' + esc(NE[c.ne] || c.ne) + ')</span>')) + '</ul>'
+      + (j.derived.length ? '<div>構成品から計算し直した値:</div><ul>' + li(j.derived.map((d) => esc(d.code) + ' の ' + esc(colText(d.col)) + ': ' + esc(show(d.col === 'handling' ? HANDLING[d.from] || d.from : d.from)) + ' → ' + esc(show(d.col === 'handling' ? HANDLING[d.to] || d.to : d.to)))) + '</ul>' : '')
+      + (j.ne_steps.length ? '<div><b>NE でやること:</b></div><ul>' + li(j.ne_steps.map(esc)) + '</ul>' : '')
+      + (j.warnings.length ? '<div><b>気をつけること:</b></div><ul>' + li(j.warnings.map(esc)) + '</ul>' : '')
+      + '<button type="button" class="btn-sm" id="reload">表示し直す</button></div>';
+    $('reload').addEventListener('click', () => location.reload());
+  }
+  function showError(j, status) {
+    const r = $('result');
+    let html = '<div class="result"><b style="color:#c92a2a">' + esc(j.error || ('HTTP ' + status)) + '</b>';
+    if (j.reason === 'before_cutover' && j.fields) html += '<div class="sub">切替前の項目: ' + esc(j.fields.join('・')) + '</div>';
+    if (j.reason === 'set_underivable' && Array.isArray(j.blockers)) html += '<ul>' + j.blockers.map((b) => '<li>' + esc(b) + '</li>').join('') + '</ul>';
+    if (j.reason === 'version_conflict' && Array.isArray(j.events)) {
+      html += '<div>その間の変更:</div><ul>' + j.events.map((e) => '<li>' + esc(e.recorded_at) + ' ' + esc(e.entity_type) + ' ' + esc(e.attribute || e.operation) + ': '
+        + esc(show(e.old_value)) + ' → ' + esc(show(e.new_value)) + ' <span class="sub">(' + esc(e.actor_id || e.actor_type) + ' / ' + esc(e.source_system) + ')</span></li>').join('') + '</ul>';
+    }
+    const reopen = ['version_conflict', 'request_id_reused', 'retry', 'processing', 'abandoned'].includes(j.reason);
+    if (reopen) html += '<button type="button" class="btn-sm" id="reload">画面を開き直す</button>';
+    r.innerHTML = html + '</div>';
+    const b = $('reload'); if (b) b.addEventListener('click', () => location.reload());
+    return reopen;
+  }
+  const saveBtn = $('save');
+  if (saveBtn && canSave) saveBtn.addEventListener('click', async () => {
+    const body = { request_id: requestId, reason: $('reason').value, seen: { token: D.token, event_id: D.eventId }, values: collect() };
+    saveBtn.disabled = true; setMsg('保存しています…'); $('result').innerHTML = '';
+    let r, j;
+    try {
+      r = await fetch(D.base + '/api/sku/' + encodeURIComponent(D.code), { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) });
+      j = await r.json().catch(() => ({}));
+    } catch (e) {
+      saveBtn.disabled = false; setMsg('通信できませんでした。もう一度「保存」を押してください (同じ保存は 2 回入りません)', 'err'); return;
+    }
+    if (r.ok && j.ok) { setMsg(j.no_change ? '' : '保存しました', 'ok'); showResult(j); if (j.no_change) { requestId = uuid(); saveBtn.disabled = false; } return; }
+    setMsg('', 'err');
+    const reopen = showError(j, r.status);
+    requestId = uuid();   // 返事が来た = この番号の保存は終わった。直してもう一度保存するときは新しい番号
+    if (!reopen) saveBtn.disabled = false;
+  });
+})();
+</script>
+</body>
+</html>
