@@ -144,6 +144,13 @@ await ta('[!] 0050 (14 §6 ⑤-1・#1563 R1・R2): 切替の段階は legacy_ope
   assert.deepEqual(acl.map((r) => [r.proname, r.prosecdef, r.pub]), [['audit_master_change', true, false], ['bump_parent_version', true, false], ['lock_suppliers_for_share', true, false], ['master_cutover_prereq_problems', true, false],
     ['record_legacy_gate_ack', true, false], ['record_ne_set_observations', true, false], ['set_master_cutover_phase', true, false]]);
   assert.deepEqual((await q("select ops.master_cutover_required_hosts() as h, ops.master_cutover_ack_fresh_minutes() as m, ops.master_cutover_prereq_problems('legacy_open', 'frozen') as p"))[0], { h: ['minipc', 'render'], m: 15, p: [] });
+  // #1563 仮レビュー: 門の記録は場所ごとのログイン・止まった記録 (引数 10 個・後ろ 2 つは既定あり)・黙っているプロセスを見る時間・マスタの書き込みの鍵・原価の縮めるだけの UPDATE は見ない
+  assert.deepEqual((await q("select pg_get_function_identity_arguments('ops.record_legacy_gate_ack(text, text, text, jsonb, text, text, integer, timestamptz, boolean, text)'::regprocedure) as a"))[0].a.split(', ').map((x) => x.split(' ')[0]),
+    ['p_host', 'p_instance_id', 'p_build_id', 'p_manifest', 'p_owner_hash', 'p_phase_seen', 'p_inflight_count', 'p_oldest_inflight_at', 'p_stopped', 'p_stopped_reason']);
+  assert.deepEqual((await q('select ops.master_cutover_ack_silent_hours() as h, core.master_write_lock_key()::text as k'))[0], { h: 24, k: '4705310050' });
+  const ackCols = await q("select column_name as c from information_schema.columns where table_schema = 'ops' and table_name = 'master_legacy_gate_acks' and column_name in ('session_role', 'stopped', 'stopped_reason') order by 1");
+  assert.deepEqual(ackCols.map((r) => r.c), ['session_role', 'stopped', 'stopped_reason']);
+  assert.match(fn[0].d, /tg_op = 'UPDATE' and new\.sku_id = old\.sku_id/);
   await rejects(() => q(`select ops.set_master_cutover_phase('frozen', 'x', '{}'::jsonb)`), /manifest_hash/);   // 門の記録も manifest も無い = 進めない
   // security definer の関数は search_path を固定して最後に pg_temp
   const cfg = await q("select p.proname, p.proconfig from pg_proc p join pg_namespace n on n.oid = p.pronamespace where p.prosecdef and n.nspname in ('ops', 'core') and p.proname in ('set_master_cutover_phase', 'record_ne_set_observations', 'record_legacy_gate_ack', 'master_cutover_prereq_problems', 'audit_master_change', 'bump_parent_version', 'lock_suppliers_for_share')");

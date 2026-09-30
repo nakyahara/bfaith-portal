@@ -3,8 +3,8 @@
  *   (PGlite は 1 接続なので書けない。Codex ⑤-R1 H4・PR #1563 R1 H3 / M6・R2 H1 / H2 / M3 / M4 / M5 / M6 / M8 の試験)
  *
  * 接続は本番と同じロールでログインする (create-master-edit-roles.mjs で作る・パスワードは試験の回ごと):
- *   保存 (A・B・X) = master_edit / 門の記録 (G) = master_gate / 段階を進める (P) = master_ops / NE の観測 (V) = master_observer /
- *   持ち主 (O) = 夜間ロード・構成の依頼を上げる・ほかの処理の代わり
+ *   保存 (A・B・X) = master_edit / 門の記録 (GR・GM) = master_gate_render・master_gate_minipc / 段階を進める (P) = master_ops / NE の観測 (V) = master_observer /
+ *   持ち主 (O・O2) = 夜間ロード・構成の依頼を上げる・ほかの処理の代わり
  * 固定する契約:
  *   1 同じ SKU を 2 人が同じ画面から保存: 後の人は SKU の鍵で待ち、前の人の commit の後に 409 (編集の印が違う)。両方は書かない
  *   2 同じ request_id が 2 つ並んで来る (押し直し): 後の方は request_id の鍵で待ち、前の方の結果をそのまま返す (記録は 1 行・変更も 1 回)
@@ -19,7 +19,12 @@
  *  11 上げる側が鍵を待つ間に「依頼にだけある構成品」の原価が 0 になった: 鍵の後に読み直して上げない (core は変えない・underivable)
  *  12 画面を開いた後に仕入先の有効が変わった = 編集の印が違う (409)
  *  13 ロールの権限: 変更の記録 (events) の偽の insert・version・仕入先の行の鍵・門・段階・観測を、渡していないロールからは 42501
- *   (切替は master_gate の記録と master_ops の段階の関数で開く = 門の記録の約束を本物の権限で通す。観測は master_observer が書く)
+ *   (切替は master_gate_render / master_gate_minipc の記録と master_ops の段階の関数で開く = 門の記録の約束を本物の権限で通す。観測は master_observer が書く)
+ *   0 門の記録の場所はログインで決まる (Render のログインで minipc を名乗る = 42501)・まとめのロール master_gate ではログインできない・
+ *     黙っているプロセス (24 時間以内に記録・最後が 15 分より前) は段階を止める → 止まった記録 (stopped) で外れる (#1563 仮レビュー Low 3)
+ *  14 保存を開いていない = ほかの鍵を取る前に 409 (CSV の鍵・夜間ロードの鍵を持つ人がいても待たない。仮レビュー Low 1)
+ *  15 夜間ロード × 保存 (仮レビュー M3): ロードが先 = 保存・昇格はマスタの書き込みの鍵で短く待って 409 nightly_load → ロードは最後まで /
+ *     保存が先 = ロードは鍵で待ってから最後まで (行の鍵で待ち合わない = デッドロックしない)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-edit-pg.mjs
  *   (この PC では C:/tmp/pg-embed の run-conc.mjs が使い捨ての PostgreSQL を起動して TEST_PG_URL を渡す)
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロール master_* をクラスタに作る)。localhost 以外の URL は拒む (本番を渡さない)。
@@ -51,8 +56,10 @@ const denied = async (client, sql, label) => { await assert.rejects(() => client
 
 const ALL_COMPANY = Object.fromEntries(Object.keys(MASTER_OWNERSHIP).map((k) => [k, 'company']));
 const NOW = new Date('2030-01-10T03:00:00Z');
-const MANIFEST = { entries: [{ id: 'warehouse.register.post', kind: 'code' }, { id: 'ne.product_screen', kind: 'manual' }] };
-const ROLES = ['master_edit', 'master_gate', 'master_ops', 'master_observer'];
+/** ⑤-3 の manifest の形 ({ entries: [{ id, kind }] }・ASCII の id。手の入口 = ne:item-screen・gas:logizard-sheet-and-sku-map) */
+const MANIFEST = { entries: [{ id: 'warehouse.register.post', kind: 'code' }, { id: 'ne:item-screen', kind: 'manual' }, { id: 'gas:logizard-sheet-and-sku-map', kind: 'manual' }] };
+const MANUAL_STOPPED = [{ id: 'gas:logizard-sheet-and-sku-map', by: 't', at: '2030-01-09' }, { id: 'ne:item-screen', by: 't', at: '2030-01-09' }];
+const ROLES = ['master_edit', 'master_gate_render', 'master_gate_minipc', 'master_ops', 'master_observer'];   // ログインできるロール (master_gate はまとめ・ログインなし)
 const PW = Object.fromEntries(ROLES.map((r) => [r, `t_${crypto.randomBytes(12).toString('hex')}`]));
 const dbName = `cdb_me_${crypto.randomBytes(4).toString('hex')}`;
 const admin = await openPgClient(url);
@@ -66,10 +73,14 @@ try {
   const dbO = pgAdapter(O);
   await applyMigrations(dbO, { log: () => {} });
   await createMasterEditRoles(O, { pw: PW });
-  const [A, B, G, P, V] = [await open('master_edit'), await open('master_edit'), await open('master_gate'), await open('master_ops'), await open('master_observer')];
-  clients.push(A, B, G, P, V);
-  const [dbA, dbB, dbG, dbP, dbV] = [A, B, G, P, V].map(pgAdapter);
+  const [A, B, GR, GM, P, V, O2] = [await open('master_edit'), await open('master_edit'), await open('master_gate_render'), await open('master_gate_minipc'),
+    await open('master_ops'), await open('master_observer'), await open(null)];
+  clients.push(A, B, GR, GM, P, V, O2);
+  const [dbA, dbB, dbP, dbV] = [A, B, P, V].map(pgAdapter);
+  const dbGate = { render: pgAdapter(GR), minipc: pgAdapter(GM) };   // 門の記録は場所ごとのログイン
   assert.deepEqual((await A.query('select session_user::text as s, current_user::text as c')).rows[0], { s: 'master_edit', c: 'master_edit' });
+  // ロールの設定 (画面の接続と同じ。#1563 仮レビュー Low 4)
+  assert.deepEqual((await A.query(`select current_setting('lock_timeout') as l, current_setting('idle_in_transaction_session_timeout') as i`)).rows[0], { l: '10s', i: '1min' });
 
   const single = (code, cost) => ({ code, name: code, kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: 3, cost: { jpy: cost, source: 'ne', status: 'COMPLETE' } });
   const plan = {
@@ -80,24 +91,44 @@ try {
   };
   const r0 = await runInitialLoad(dbO, plan, { log: () => {}, runId: 'load_pg_1', now: new Date('2030-01-05T03:00:00Z') });
   assert.equal(r0.ok, true, r0.error);
-  // 切替を開く: 門の記録は master_gate、段階は master_ops (本物の権限で・本番の関数そのまま)
+  const q = async (sql, p) => (await O.query(sql, p)).rows;
+  // 切替を開く: 門の記録は場所ごとのログイン (master_gate_render / master_gate_minipc)、段階は master_ops (本物の権限で・本番の関数そのまま)
   const h = C.ownershipHash(ALL_COMPANY), legacy = C.ownershipHash(MASTER_OWNERSHIP);
   const mh = await C.manifestHashOf(dbO, MANIFEST);
   const builds = { render: ['r1'], minipc: ['m1'] };
-  const acks = async (ownership, phase) => { for (const [host, inst, build] of [['render', 'r-a', 'r1'], ['minipc', 'm-a', 'm1']]) await C.recordLegacyGateAck(dbG, { host, instanceId: inst, buildId: build, manifest: MANIFEST, ownership, phaseSeen: phase }); };
+  const acks = async (ownership, phase) => { for (const [host, inst, build] of [['render', 'r-a', 'r1'], ['minipc', 'm-a', 'm1']]) await C.recordLegacyGateAck(dbGate[host], { host, instanceId: inst, buildId: build, manifest: MANIFEST, ownership, phaseSeen: phase }); };
   await acks(MASTER_OWNERSHIP, 'legacy_open');
-  await C.advanceCutoverPhase(dbP, { to: 'frozen', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: legacy,
-    manual_entries_stopped: [{ id: 'ne.product_screen', by: 't', at: '2030-01-09' }], drain: { done: true, checked_by: 't', checked_at: '2030-01-09' } } });
+  const frozenEvidence = { expected_builds: builds, manifest_hash: mh, owner_hash: legacy, manual_entries_stopped: MANUAL_STOPPED, drain: { done: true, checked_by: 't', checked_at: '2030-01-09' } };
+  await ta('[0] 門の記録の場所はログインで決まる・まとめのロールではログインできない・黙っているプロセスは段階を止める → 止まった記録で外れる (→ frozen)', async () => {
+    const ack = (db, host, extra = {}) => C.recordLegacyGateAck(db, { host, instanceId: 'r-x', buildId: 'r1', manifest: MANIFEST, ownership: MASTER_OWNERSHIP, phaseSeen: 'legacy_open', ...extra });
+    await assert.rejects(() => ack(dbGate.render, 'minipc'), (e) => { assert.equal(e.code, '42501'); assert.match(e.message, /gate_host_mismatch/); return true; });
+    await assert.rejects(() => ack(dbGate.minipc, 'render'), (e) => e.code === '42501' && /gate_host_mismatch/.test(e.message));
+    await assert.rejects(() => ack(dbO, 'render'), (e) => e.code === '42501' && /gate_host_mismatch/.test(e.message));   // 持ち主のロールでも書けない
+    await assert.rejects(async () => { const c = await openPgClient(roleUrl('master_gate_render').replace('master_gate_render', 'master_gate')); await c.end(); }, /master_gate|login|password/i);
+    // 黙っているプロセス (1 時間前の記録だけ) = 拒む
+    await O.query(`insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, session_role, acked_at)
+      values ('render', 'r-old', 'r1', $1, $2, 'legacy_open', 0, 'master_gate_render', clock_timestamp() - interval '1 hour')`, [mh, legacy]);
+    await assert.rejects(() => C.advanceCutoverPhase(dbP, { to: 'frozen', actor: 't@test', evidence: frozenEvidence }), /render\/r-old: 黙っている/);
+    assert.equal((await O.query('select phase from ops.master_cutover_state')).rows[0].phase, 'legacy_open');
+    // 止まった記録 (Render のログインで r-old を止めたと書く) = 外れる → frozen
+    const st = await C.recordLegacyGateAck(dbGate.render, { host: 'render', instanceId: 'r-old', buildId: 'r1', manifest: MANIFEST, ownership: MASTER_OWNERSHIP, phaseSeen: 'legacy_open',
+      stopped: true, stoppedReason: 'Render の古い instance を止めた (試験)' });
+    assert.equal(st.stopped, true);
+    const r = await C.advanceCutoverPhase(dbP, { to: 'frozen', actor: 't@test', evidence: frozenEvidence });
+    assert.deepEqual(r.acks.map((a) => [a.host, a.instance_id, a.stopped ?? false]), [['minipc', 'm-a', false], ['render', 'r-a', false], ['render', 'r-old', true]]);
+    assert.deepEqual((await q("select session_role, stopped, stopped_reason from ops.master_legacy_gate_acks where instance_id = 'r-old' order by ack_id")).map((x) => [x.session_role, x.stopped, !!x.stopped_reason]),
+      [['master_gate_render', false, false], ['master_gate_render', true, true]]);
+  });
+  assert.equal((await O.query('select phase from ops.master_cutover_state')).rows[0].phase, 'frozen', '[0] で frozen に進んでいない');
   await acks(ALL_COMPANY, 'frozen');
   await C.advanceCutoverPhase(dbP, { to: 'company_owner', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: h } });
   await acks(ALL_COMPANY, 'company_owner');
   await C.advanceCutoverPhase(dbP, { to: 'new_open', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: h } });
   assert.equal((await O.query('select phase from ops.master_cutover_state')).rows[0].phase, 'new_open');
 
-  const q = async (sql, p) => (await O.query(sql, p)).rows;
   const tokenOf = async (code) => W.editTokenOf(await W.readCurrent(dbO, (await q('select sku_id::text as id from core.skus where code = $1', [code]))[0].id, '2030-01-10'));
-  const save = (db, code, values, { token, requestId = crypto.randomUUID(), beforeCommit } = {}) =>
-    W.saveSku(db, { actor: 'naka@test', requestId, code, reason: 'pg', seen: { token }, values }, { ownership: ALL_COMPANY, open: true, now: NOW, beforeCommit });
+  const save = (db, code, values, { token, requestId = crypto.randomUUID(), beforeCommit, open = true } = {}) =>
+    W.saveSku(db, { actor: 'naka@test', requestId, code, reason: 'pg', seen: { token }, values }, { ownership: ALL_COMPANY, open, now: NOW, beforeCommit });
 
   await ta('[1] 同じ SKU を 2 人が同じ画面から保存 = 後の人は待ってから 409 (両方は書かない)', async () => {
     const token = await tokenOf('p001');
@@ -325,7 +356,7 @@ try {
     await A.query('rollback');
     // master_gate (門の記録)
     for (const [sql, label] of [[fakeAck, 'gate: 門の記録 (直接)'], [fakeEvent, 'gate: events'], [phaseFn, 'gate: 段階の関数'], [obsFn, 'gate: 観測の関数'],
-      ["update ops.master_cutover_state set note = 'x'", 'gate: 段階の表']]) await denied(G, sql, label);
+      ["update ops.master_cutover_state set note = 'x'", 'gate: 段階の表']]) await denied(GR, sql, label);
     // master_ops (段階)
     for (const [sql, label] of [[ackFn, 'ops: 門の記録の関数'], [fakeAck, 'ops: 門の記録 (直接)'], ["update ops.master_cutover_state set note = 'x'", 'ops: 段階の表 (直接)'], [obsFn, 'ops: 観測の関数'],
       ['update core.skus set name = name where false', 'ops: skus']]) await denied(P, sql, label);
@@ -335,8 +366,66 @@ try {
     // 本物の記録: 保存の記録は全部 master_edit・門の記録と観測は関数を通って残った
     assert.equal(Number((await q("select count(*)::int as n from events.master_change_events where request_id in (select request_id::text from ops.master_edit_requests) and db_user <> 'master_edit'"))[0].n), 0);
     assert.ok(Number((await q("select count(*)::int as n from events.master_change_events where db_user = 'master_edit'"))[0].n) > 10);
-    assert.equal(Number((await q('select count(*)::int as n from ops.master_legacy_gate_acks'))[0].n), 6);
+    assert.equal(Number((await q('select count(*)::int as n from ops.master_legacy_gate_acks'))[0].n), 8);   // 場所ごと 3 回 × 2 + [0] の黙っている記録と止まった記録
     assert.equal(Number((await q("select count(*)::int as n from ops.ne_set_observation_runs where run_id like 'ne_pg_%'"))[0].n), runSeq);
+  });
+
+  await ta('[14] 保存を開いていない (MASTER_EDIT_OPEN なし) = ほかの鍵を取る前に 409 切替前 (CSV の鍵・夜間ロードの鍵を持つ人がいても待たない)', async () => {
+    const token = await tokenOf('p001');
+    await O.query('begin');
+    try {
+      await O.query("select pg_advisory_xact_lock(hashtext('ops.ne_csv'))");
+      await O.query(C.MASTER_WRITE_EXCLUSIVE_LOCK_SQL);
+      const t0 = Date.now();
+      const r = await save(dbA, 'p001', { reorder_months: '7' }, { token, open: false }).then((ok) => ({ ok }), (err) => ({ err }));
+      assert.equal(r.err?.reason, 'before_cutover', r.err?.message || 'ok になった');
+      assert.ok(Date.now() - t0 < 2000, `鍵を待った (${Date.now() - t0}ms)`);
+    } finally { await O.query('rollback'); }
+  });
+
+  /** 夜間ロードの接続を包む: マスタの書き込みの鍵を取った直後に止める (扉が開くまで) */
+  const pauseAfterLock = (client, g) => ({
+    query: async (text, params) => { const r = await client.query(text, params); if (text === C.MASTER_WRITE_EXCLUSIVE_LOCK_SQL) await g.wait(); return r; },
+    exec: (text) => client.query(text),
+  });
+  const loadAgain = (db, runId) => runInitialLoad(db, plan, { log: () => {}, runId, ownership: ALL_COMPANY, now: new Date('2030-01-05T03:00:00Z') });
+
+  await ta('[15] 夜間ロードが先 = 保存・昇格はマスタの書き込みの鍵で短く待って 409 nightly_load (記録も 409・行の鍵で待ち合わない) → ロードは最後まで', async () => {
+    const g = gate();
+    const l = launch(loadAgain(pauseAfterLock(O2, g), 'load_pg_lock1'));
+    await sleep(300);
+    assert.equal(l.done, false, 'ロードは鍵を取って止まっている');
+    const id = crypto.randomUUID();
+    const t0 = Date.now();
+    const r = await save(dbA, 'p001', { reorder_months: '5' }, { token: await tokenOf('p001'), requestId: id }).then((ok) => ({ ok }), (err) => ({ err }));
+    const waited = Date.now() - t0;
+    assert.deepEqual([r.err?.status, r.err?.reason], [409, 'nightly_load'], r.err?.message || 'ok になった');
+    assert.ok(waited >= 2000 && waited < 9000, `待った長さ ${waited}ms (MASTER_WRITE_WAIT = ${W.MASTER_WRITE_WAIT})`);
+    const rec = (await q('select status, error from ops.master_edit_requests where request_id = $1', [id]))[0];
+    assert.deepEqual([rec.status, rec.error.status, rec.error.reason], ['failed', 409, 'nightly_load']);
+    assert.equal((await A.query(`select current_setting('lock_timeout') as l`)).rows[0].l, '10s', '鍵の待ちの長さを接続に残さない');
+    const obsId = (await q('select max(observation_id)::text as id from ops.ne_set_observations'))[0].id;
+    const rp = await W.promoteComponentRequest(dbO, obsId, { ownership: ALL_COMPANY, now: NOW }).catch((e) => ({ thrown: e.message }));
+    assert.deepEqual([rp.promoted, rp.reason], [false, 'nightly_load'], JSON.stringify(rp));   // 投げない (夜間の段を止めない)
+    g.open();
+    const rl = await l.promise;
+    assert.equal(rl.ok?.ok, true, rl.err?.stack || JSON.stringify(rl.ok?.error));
+    const s = await save(dbA, 'p001', { reorder_months: '5' }, { token: await tokenOf('p001') });
+    assert.equal(s.ok, true);
+  });
+
+  await ta('[15] 保存が先 = 夜間ロードはマスタの書き込みの鍵で待ち、保存の commit の後に最後まで (デッドロックしない)', async () => {
+    const g = gate();
+    const a = launch(save(dbA, 'p002', { cost: { jpy: '260', reason: 'ロードの前' } }, { token: await tokenOf('p002'), beforeCommit: g.wait }));
+    await sleep(300);
+    const l = launch(loadAgain(pgAdapter(O2), 'load_pg_lock2'));
+    await sleep(700);
+    assert.equal(l.done, false, 'ロードは保存が終わるまで鍵で待つ');
+    g.open();
+    const ra = await a.promise;
+    assert.ok(ra.ok, ra.err?.message);
+    const rl = await l.promise;
+    assert.equal(rl.ok?.ok, true, rl.err?.stack || JSON.stringify(rl.ok?.error));
   });
 } finally {
   for (const c of clients.reverse()) { try { await c.end(); } catch { /* */ } }

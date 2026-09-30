@@ -108,6 +108,7 @@ function makePlan() {
 /** 1 つの Company DB (PGlite) を作る: 持ち主のロール deploy で migration・見張りと画面のロール・夜間ロード */
 async function setupDb() {
   const pg = new PGlite();
+  const sessionUser = (await pg.query('select session_user::text as u')).rows[0].u;   // 試験の接続のログイン (superuser)。門のログインから戻るときに使う
   await pg.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);
   await pg.query(`alter database ${(await pg.query('select current_database() as d')).rows[0].d} owner to deploy`);
   await pg.query('set role deploy');
@@ -118,7 +119,7 @@ async function setupDb() {
   const r = await runInitialLoad(db, makePlan(), { log: quiet, runId: 'load_setup', ownership: MASTER_OWNERSHIP, now: LOAD_NOW });
   assert.equal(r.ok, true, r.error);
   await pg.query("update core.suppliers set active = false where code = '0003'");
-  return { pg, db };
+  return { pg, db, sessionUser };
 }
 /** ロールを切り替えて動かす (試験は 1 つの接続 = SET ROLE。終わったら持ち主のロール deploy に戻す) */
 async function asRole(E, role, fn) {
@@ -127,8 +128,16 @@ async function asRole(E, role, fn) {
 }
 /** 画面だけのロールで動かす (保存は必ずこれ = 権限が足りているかも確かめる) */
 const asEditor = (E, fn) => asRole(E, 'master_edit', fn);
-/** ⑤-3 の門が書く記録 (ロール master_gate・DB の関数だけ) */
-const gateAck = (E, host, instanceId, buildId, ownership, phaseSeen, inflight = 0) => asRole(E, 'master_gate', () => C.recordLegacyGateAck(E.db,
+/**
+ * 場所ごとの門のログイン (master_gate_render / master_gate_minipc) で動かす。DB の関数は session_user を見る = SET ROLE では足りない → SET SESSION AUTHORIZATION。
+ * 終わったら試験の接続のログインに戻して、持ち主のロール deploy にする (PGlite は RESET SESSION AUTHORIZATION で戻らない)
+ */
+async function asGate(E, host, fn) {
+  await E.pg.query(`set session authorization master_gate_${host}`);
+  try { return await fn(); } finally { await E.pg.query(`set session authorization ${E.sessionUser}`); await E.pg.query('set role deploy'); }
+}
+/** ⑤-3 の門が書く記録 (場所ごとのログイン・DB の関数だけ) */
+const gateAck = (E, host, instanceId, buildId, ownership, phaseSeen, inflight = 0) => asGate(E, host, () => C.recordLegacyGateAck(E.db,
   { host, instanceId, buildId, manifest: MANIFEST, ownership, phaseSeen, inflightCount: inflight, oldestInflightAt: inflight ? new Date().toISOString() : null }));
 /** 段階を進める (運用のロール master_ops) */
 const advance = (E, to, evidence, note = null) => asRole(E, 'master_ops', () => C.advanceCutoverPhase(E.db, { to, actor: 'naka@test', evidence, note }));
@@ -181,24 +190,30 @@ const primaryOf = async (code) => (await q(`select sp.code from core.supplier_sk
   where k.code = $1 and x.is_primary`, [code])).map((r) => r.code);
 const reqRow = async (id) => (await q('select status, result, error, sku_id::text as sku_id, operation, target_code from ops.master_edit_requests where request_id = $1', [id]))[0];
 let runSeq = 0;
+/**
+ * 観測の時刻 (NE から取った時刻)。前の観測より必ず後 (1 秒ずつ) で、今より 1 分先 (依頼の後にする)。観測を受ける窓 (5 分先まで) の中。
+ * 🚨 昇格は「同じセットにもっと新しい完全な観測がある = 使わない」(#1563 仮レビュー M2) = 試験の観測の時刻は書いた順に進める
+ */
+let lastAt = 0;
+const nextAt = () => { lastAt = Math.max(lastAt + 1000, Date.now() + 60000); return new Date(lastAt).toISOString(); };
 /** NE のセットの構成の観測を 1 回分書く (観測のロール master_observer・DB の関数)。戻り値 = set_code → observation_id */
-async function observe(sets, { complete = true, at = new Date(Date.now() + 60000).toISOString() } = {}) {
+async function observe(sets, { complete = true, at = nextAt(), E = E0 } = {}) {
   const runId = `ne_run_${++runSeq}`;
   const payload = { run_id: runId, observed_at: at, complete, sets, ...(complete ? { requested: sets.length, fetched: sets.length, raw_hash: 'c'.repeat(64), source_generation: `gen_${runSeq}` } : {}) };
-  await asRole(E0, 'master_observer', () => W.recordNeSetObservations(db, payload));
-  const rows = await q('select o.observation_id::text as id, k.code from ops.ne_set_observations o join core.skus k on k.sku_id = o.set_sku_id where o.run_id = $1', [runId]);
+  await asRole(E, 'master_observer', () => W.recordNeSetObservations(E.db, payload));
+  const rows = (await E.db.query('select o.observation_id::text as id, k.code from ops.ne_set_observations o join core.skus k on k.sku_id = o.set_sku_id where o.run_id = $1', [runId])).rows;
   return Object.fromEntries(rows.map((r) => [r.code, r.id]));
 }
-/** 観測の関数を通さずに入れる (持ち主のロールだけ・試験で「依頼から 8 日後」の観測を作るため) */
-async function observeRaw(setCode, rows, at) {
+/** 観測の関数を通さずに入れる (持ち主のロールだけ・試験で「受けてから 40 時間たった」観測を作るため)。recordedAgo = 受けた時刻を今からどれだけ前にするか */
+async function observeRaw(setCode, rows, at, { E = E0, recordedAgo = '0 seconds' } = {}) {
   const runId = `ne_raw_${++runSeq}`;
-  await pg.query(`insert into ops.ne_set_observation_runs (run_id, observed_at, complete, requested_count, fetched_count, saved_count, skipped_count, raw_hash, source_generation, content_hash)
-    values ($1, $2, true, 1, 1, 1, 0, repeat('d', 64), 'raw', md5($1))`, [runId, at]);
+  await E.pg.query(`insert into ops.ne_set_observation_runs (run_id, observed_at, complete, requested_count, fetched_count, saved_count, skipped_count, raw_hash, source_generation, content_hash, recorded_at)
+    values ($1, $2, true, 1, 1, 1, 0, repeat('d', 64), 'raw', md5($1), now() - $3::interval)`, [runId, at, recordedAgo]);
   const resolved = [];
-  for (const r of rows) resolved.push({ sku_id: Number((await q('select sku_id from core.skus where code_norm = core.norm_code($1)', [r.code]))[0].sku_id), code: r.code, qty: r.qty, sort: r.sort });
-  return (await q(`insert into ops.ne_set_observations (run_id, set_sku_id, rows) select $1, sku_id, $3::jsonb from core.skus where code = $2 returning observation_id::text as id`, [runId, setCode, JSON.stringify(resolved)]))[0].id;
+  for (const r of rows) resolved.push({ sku_id: Number((await E.db.query('select sku_id from core.skus where code_norm = core.norm_code($1)', [r.code])).rows[0].sku_id), code: r.code, qty: r.qty, sort: r.sort });
+  return (await E.db.query(`insert into ops.ne_set_observations (run_id, set_sku_id, rows) select $1, sku_id, $3::jsonb from core.skus where code = $2 returning observation_id::text as id`, [runId, setCode, JSON.stringify(resolved)])).rows[0].id;
 }
-const promote = (id, opts = {}) => W.promoteComponentRequest(db, id, { ownership: ALL_COMPANY, now: NOW, ...opts });
+const promote = (id, opts = {}) => W.promoteComponentRequest(opts.E ? opts.E.db : db, id, { ownership: ALL_COMPANY, now: NOW, ...opts });
 
 
 console.log('切替の段階と門');
@@ -209,11 +224,21 @@ await ta('[1] 門の記録の関数: 時刻はサーバー・見た段階が今�
   assert.equal(r.manifest_hash, await C.manifestHashOf(db, MANIFEST));
   assert.ok(Date.parse(r.acked_at) >= before - 5000, r.acked_at);
   await assert.rejects(() => gateAck(E0, 'render', 'r-a', 'r1', MASTER_OWNERSHIP, 'frozen'), /stale_phase/);
-  await assert.rejects(() => asRole(E0, 'master_gate', () => C.recordLegacyGateAck(db, { host: 'render', instanceId: 'x', buildId: 'b', manifest: { entries: [] }, ownership: MASTER_OWNERSHIP, phaseSeen: 'legacy_open' })), /invalid_manifest/);
-  await assert.rejects(() => asRole(E0, 'master_gate', () => C.recordLegacyGateAck(db, { host: 'render', instanceId: 'x', buildId: 'b', manifest: { entries: [{ id: 'a', kind: 'code' }, { id: 'a', kind: 'manual' }] }, ownership: MASTER_OWNERSHIP, phaseSeen: 'legacy_open' })), /重なって/);
-  await assert.rejects(() => asRole(E0, 'master_gate', () => C.recordLegacyGateAck(db, { host: 'aws', instanceId: 'x', buildId: 'b', manifest: MANIFEST, ownership: MASTER_OWNERSHIP, phaseSeen: 'legacy_open' })), /check/);
+  const ack = (host, extra = {}) => C.recordLegacyGateAck(db, { host, instanceId: 'x', buildId: 'b', manifest: MANIFEST, ownership: MASTER_OWNERSHIP, phaseSeen: 'legacy_open', ...extra });
+  await assert.rejects(() => asGate(E0, 'render', () => ack('render', { manifest: { entries: [] } })), /invalid_manifest/);
+  await assert.rejects(() => asGate(E0, 'render', () => ack('render', { manifest: { entries: [{ id: 'a', kind: 'code' }, { id: 'a', kind: 'manual' }] } })), /重なって/);
+  await assert.rejects(() => asGate(E0, 'render', () => ack('aws')), /知らない場所/);
+  // 場所はログインで決まる (#1563 仮レビュー Low 3): Render のログインで minipc を名乗る・まとめのロールに SET ROLE しただけ (ログインは別) = 拒む (42501)
+  await assert.rejects(() => asGate(E0, 'render', () => ack('minipc')), (e) => e.code === '42501' && /gate_host_mismatch/.test(e.message));
+  await assert.rejects(() => asGate(E0, 'minipc', () => ack('render')), (e) => e.code === '42501' && /gate_host_mismatch/.test(e.message));
+  await assert.rejects(() => asRole(E0, 'master_gate', () => ack('render')), (e) => e.code === '42501' && /gate_host_mismatch/.test(e.message));
+  // 止まった記録は理由が要る・止まっていない記録に理由は付けない
+  await assert.rejects(() => asGate(E0, 'render', () => ack('render', { stopped: true })), /stopped_reason/);
+  await assert.rejects(() => asGate(E0, 'render', () => ack('render', { stoppedReason: '止めた' })), /止まった記録でない/);
   await gateAck(E0, 'minipc', 'm-a', 'm1', MASTER_OWNERSHIP, 'legacy_open');
   assert.equal(Number((await q('select count(*)::int as n from ops.master_legacy_manifests'))[0].n), 1);
+  assert.deepEqual((await q('select host, session_role, stopped from ops.master_legacy_gate_acks order by ack_id')).map((x) => [x.host, x.session_role, x.stopped]),
+    [['render', 'master_gate_render', false], ['minipc', 'master_gate_minipc', false]]);
   assert.equal(await pgCode(asRole(E0, 'master_edit', () => pg.query("select ops.record_legacy_gate_ack('render', 'x', 'b', '{}'::jsonb, repeat('a', 64), 'legacy_open', 0, null)"))), '42501');
   await assert.rejects(() => pg.query('delete from ops.master_legacy_gate_acks'), /append-only/);
   await assert.rejects(() => pg.query('delete from ops.master_legacy_manifests'), /append-only/);
@@ -230,9 +255,10 @@ await ta('[1] legacy_open → frozen の門: 証拠の形・manifest・手の入
       await assert.rejects(() => pg.query('select ops.set_master_cutover_phase($1, $2, $3::jsonb)', ['frozen', 'naka@test', JSON.stringify(evidence)]), re);
     } finally { await pg.query('rollback'); }
   };
-  const rawAck = (host, inst, build, { manifest = mh, owner = LEGACY_HASH, phase = 'legacy_open', ago = '0 minutes', inflight = 0 } = {}) =>
-    [`insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, oldest_inflight_at, acked_at)
-      values ($1, $2, $3, $4, $5, $6, $7, case when $7 > 0 then now() end, clock_timestamp() - $8::interval)`, [host, inst, build, manifest, owner, phase, inflight, ago]];
+  const rawAck = (host, inst, build, { manifest = mh, owner = LEGACY_HASH, phase = 'legacy_open', ago = '0 minutes', inflight = 0, stopped = false } = {}) =>
+    [`insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, oldest_inflight_at, acked_at, session_role, stopped, stopped_reason)
+      values ($1, $2, $3, $4, $5, $6, $7, case when $7 > 0 then now() end, clock_timestamp() - $8::interval, 'master_gate_' || $1, $9, case when $9 then '試験' end)`,
+    [host, inst, build, manifest, owner, phase, inflight, ago, stopped]];
   await assert.rejects(() => pg.query(`select ops.set_master_cutover_phase('frozen', 'naka@test', null)`), /evidence_required/);
   await refuse({ ...ev, manifest_hash: 'a'.repeat(64) }, /manifest_hash が記録された/);
   await refuse({ ...ev, owner_hash: 'x' }, /owner_hash/);
@@ -249,6 +275,22 @@ await ta('[1] legacy_open → frozen の門: 証拠の形・manifest・手の入
   await refuse(ev, /古い入口の一覧が違う/, [rawAck('minipc', 'm-z', 'm1', { manifest: 'e'.repeat(64) })]);
   await refuse(ev, /持ち主表のハッシュが違う/, [rawAck('minipc', 'm-z', 'm1', { owner: 'f'.repeat(64) })]);
   await refuse(ev, /見た段階が frozen/, [rawAck('minipc', 'm-z', 'm1', { phase: 'frozen' })]);
+  // 黙っているプロセス (24 時間以内に記録があり、最後の記録が 15 分より前・止まった記録なし) = 拒む。止まった記録が最後なら外す・24 時間より前のプロセスは見ない (#1563 仮レビュー Low 3)
+  await refuse(ev, /render\/r-z: 黙っている/, [rawAck('render', 'r-z', 'r1', { ago: '1 hour' })]);
+  await refuse(ev, /minipc\/m-z: 黙っている/, [rawAck('minipc', 'm-z', 'm1', { ago: '20 minutes' }), rawAck('minipc', 'm-z', 'm1', { ago: '30 minutes', stopped: true })]);   // 止まった後にまた動いて黙った
+  const passes = async (setup) => {
+    await pg.query('begin');
+    try {
+      for (const [sql, params] of setup) await pg.query(sql, params);
+      return (await pg.query('select ops.set_master_cutover_phase($1, $2, $3::jsonb) as r', ['frozen', 'naka@test', JSON.stringify(ev)])).rows[0].r;
+    } finally { await pg.query('rollback'); }
+  };
+  const ok1 = await passes([rawAck('render', 'r-z', 'r1', { ago: '1 hour' }), rawAck('render', 'r-z', 'r1', { ago: '10 minutes', stopped: true })]);
+  assert.deepEqual(ok1.acks.map((a) => [a.host, a.instance_id, a.stopped ?? false]), [['minipc', 'm-a', false], ['render', 'r-a', false], ['render', 'r-z', true]]);
+  const ok2 = await passes([rawAck('render', 'r-y', 'rOLD', { ago: '25 hours' })]);
+  assert.deepEqual(ok2.acks.map((a) => a.instance_id), ['m-a', 'r-a']);
+  // 止まった記録だけの場所 = 生きている記録が無い = 拒む
+  await refuse(ev, /minipc: 15 分以内の記録が無い/, [rawAck('minipc', 'm-a', 'm1', { stopped: true })]);
   // 差し込み口 (後の migration の「まだの項目」) を置き換えると止まる
   await refuse(ev, /prereq_failed: 構成の写しの作り直しがまだ/, [[`create or replace function ops.master_cutover_prereq_problems(p_from text, p_to text) returns text[]
     language plpgsql stable security definer set search_path = pg_catalog, ops, pg_temp as $$ begin return array['構成の写しの作り直しがまだ']; end $$`, []]]);
@@ -291,8 +333,8 @@ await ta('[2] 場所が足りない・古い記録だけ = 拒む → そろえ�
   const E2 = await setupDb();
   await gateAck(E2, 'render', 'r-a', 'r1', MASTER_OWNERSHIP, 'legacy_open');
   await assert.rejects(() => advance(E2, 'frozen', ev), /minipc: 15 分以内の記録が無い/);
-  await E2.pg.query(`insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, acked_at)
-    values ('minipc', 'm-a', 'm1', $1, $2, 'legacy_open', 0, clock_timestamp() - interval '20 minutes')`, [mh, LEGACY_HASH]);
+  await E2.pg.query(`insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, acked_at, session_role)
+    values ('minipc', 'm-a', 'm1', $1, $2, 'legacy_open', 0, clock_timestamp() - interval '20 minutes', 'master_gate_minipc')`, [mh, LEGACY_HASH]);
   await assert.rejects(() => advance(E2, 'frozen', ev), /minipc: 15 分以内の記録が無い/);
   await E2.pg.close();
   // この DB で進める
@@ -307,8 +349,8 @@ await ta('[2] 場所が足りない・古い記録だけ = 拒む → そろえ�
   await gateAck(E0, 'minipc', 'm-a', 'm1', ALL_COMPANY, 'frozen');
   // 段階に入る前の記録 (時刻を frozen の前にした別のプロセス) = 拒む
   await pg.query('begin');
-  await pg.query(`insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, acked_at)
-    select 'render', 'r-old', 'r1', $1, $2, 'frozen', 0, changed_at - interval '1 second' from ops.master_cutover_state`, [mh, h]);
+  await pg.query(`insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, acked_at, session_role)
+    select 'render', 'r-old', 'r1', $1, $2, 'frozen', 0, changed_at - interval '1 second', 'master_gate_render' from ops.master_cutover_state`, [mh, h]);
   await assert.rejects(() => pg.query('select ops.set_master_cutover_phase($1, $2, $3::jsonb)', ['company_owner', 'naka@test', JSON.stringify(ev2)]), /r-old: 記録が今の段階に入る前/);
   await pg.query('rollback');
   await assert.rejects(() => advance(E0, 'company_owner', { ...ev2, owner_hash: 'x' }), /owner_hash/);
@@ -643,7 +685,7 @@ await ta('[11] 構成を変える = 依頼だけ (core は変えない)。NE で
 });
 
 await ta('[11] NE の観測を書く: 完全な回は残せないセット・構成品・重なり・数の違い・原本のハッシュが無いと拒む / 完全でない回は飛ばして数える / 時刻の範囲 / 再送 / 観測のロールだけ', async () => {
-  const at = new Date(Date.now() + 60000).toISOString();
+  const at = nextAt();
   const full = (sets, extra = {}) => ({ run_id: `ne_w_${++runSeq}`, observed_at: at, complete: true, requested: sets.length, fetched: sets.length, raw_hash: 'c'.repeat(64), source_generation: 'g', sets, ...extra });
   const w = (p) => asRole(E0, 'master_observer', () => W.recordNeSetObservations(db, p));
   const ok = [{ set_code: 'SET001', rows: [{ code: 's001', qty: 2, sort: 1 }] }];
@@ -702,8 +744,14 @@ await ta('[11] 上げない: 偽の番号・完全でない回・依頼より前
   const n = br.length;
   await promote((await observe([{ set_code: 'set001', rows: tries.at(-1)[0] }])).set001);
   assert.equal(Number((await q('select count(*)::int as n from ops.sku_component_breaches'))[0].n), n);
-  // 依頼から 7 日より後の観測でも違う = stale (mismatch は閉じる)
-  const st = await promote(await observeRaw('set001', [good[0]], new Date(reqAt + 8 * 86400000).toISOString()));
+  // 依頼から 7 日より後の観測でも違う = stale (mismatch は閉じる)。依頼を 9 日前に作ったことにする (持ち主のロールで同じ中身の依頼に置き換える)。
+  //   🚨 未来の観測 (8 日後) で作らない: 同じセットにもっと新しい観測がある = 後の観測を上げない (#1563 仮レビュー M2) の試験を壊す
+  await pg.query(`update ops.sku_component_requests set status = 'cancelled', closed_at = now(), closed_by = 'test', close_reason = 'superseded'
+    where status = 'open' and set_sku_id = (select sku_id from core.skus where code = 'set001')`);
+  await pg.query(`insert into ops.sku_component_requests (company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, edit_request_id, created_at)
+    select company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, gen_random_uuid(), created_at - interval '9 days' from ops.sku_component_requests
+     where component_request_id = (select max(component_request_id) from ops.sku_component_requests where set_sku_id = (select sku_id from core.skus where code = 'set001'))`);
+  const st = await promote((await observe([{ set_code: 'set001', rows: [good[0]] }])).set001);
   assert.equal(st.reason, 'stale');
   assert.deepEqual((await q("select kind from ops.sku_component_breaches where status = 'open'")).map((b) => b.kind), ['stale']);
   // 画面にも出る
@@ -716,7 +764,7 @@ await ta('[11] 上げない: 偽の番号・完全でない回・依頼より前
 
 await ta('[11] 上げる: 観測が完全・依頼より後・構成品 / 数量 / 並び / 行の数まで同じ。同じ取引で構成・導く値・依頼 (applied)・食い違い (resolved)', async () => {
   const good = [{ code: 's003', qty: 2, sort: 10 }, { code: 'S001', qty: 1, sort: 20 }];
-  const obsId = (await observe([{ set_code: 'set001', rows: good }], { at: new Date(Date.now() + 120000).toISOString() })).set001;
+  const obsId = (await observe([{ set_code: 'set001', rows: good }], { at: nextAt() })).set001;
   const r = await promote(obsId);
   assert.equal(r.promoted, true, JSON.stringify(r));
   assert.deepEqual(await compsOf('set001'), [['s003', 2, 1, 'ne'], ['s001', 1, 2, 'ne']]);
@@ -748,7 +796,7 @@ await ta('[11] 依頼の後に「依頼にだけある構成品」の原価が 0
   assert.deepEqual(s2.derived, []);
   const before = { comps: await compsOf('set001'), cost: (await costsOf('set001')).at(-1) };
   const rows = [{ code: 's003', qty: 2, sort: 1 }, { code: 's001', qty: 1, sort: 2 }, { code: 's002', qty: 1, sort: 3 }];
-  let r = await promote((await observe([{ set_code: 'set001', rows }], { at: new Date(Date.now() + 90000).toISOString() })).set001);
+  let r = await promote((await observe([{ set_code: 'set001', rows }], { at: nextAt() })).set001);
   assert.deepEqual([r.promoted, r.reason], [false, 'underivable']);
   assert.match(r.blockers.join(' '), /s002 の原価/);
   assert.deepEqual({ comps: await compsOf('set001'), cost: (await costsOf('set001')).at(-1) }, before);
@@ -757,7 +805,7 @@ await ta('[11] 依頼の後に「依頼にだけある構成品」の原価が 0
   assert.deepEqual(br.map((b) => b.kind), ['underivable']);
   assert.ok(br[0].details.blockers.length > 0);
   await save('s002', { cost: { jpy: '200', reason: '戻した' } });
-  r = await promote((await observe([{ set_code: 'set001', rows }], { at: new Date(Date.now() + 100000).toISOString() })).set001);
+  r = await promote((await observe([{ set_code: 'set001', rows }], { at: nextAt() })).set001);
   assert.equal(r.promoted, true, JSON.stringify(r));
   assert.deepEqual(await compsOf('set001'), [['s003', 2, 1, 'ne'], ['s001', 1, 2, 'ne'], ['s002', 1, 3, 'ne']]);
   assert.equal(Number((await q("select count(*)::int as n from ops.sku_component_breaches where status = 'open'"))[0].n), 0);
@@ -815,13 +863,118 @@ await ta('[13] 単品の保存 → 上げる: 上げたセットは新しい単�
   await save('set004', { components: [{ code: 's001', qty: 1 }, { code: 's004', qty: 1 }, { code: 's003', qty: 1 }] });
   await save('s003', { cost: { jpy: '55', reason: '上げる前に直した' } });
   const before = await tokenOf('s003');
-  const r = await promote((await observe([{ set_code: 'set004', rows: [{ code: 's001', qty: 1, sort: 1 }, { code: 's004', qty: 1, sort: 2 }, { code: 's003', qty: 1, sort: 3 }] }], { at: new Date(Date.now() + 180000).toISOString() })).set004);
+  const r = await promote((await observe([{ set_code: 'set004', rows: [{ code: 's001', qty: 1, sort: 1 }, { code: 's004', qty: 1, sort: 2 }, { code: 's003', qty: 1, sort: 3 }] }], { at: nextAt() })).set004);
   assert.equal(r.promoted, true, JSON.stringify(r));
   assert.equal((await costsOf('set004')).at(-1).jpy, 120 + 70 + 55);   // s001 + s004 + 直した s003
   // 上げた後: s003 を含むセットが増えた = 上げる前に開いた画面の保存は 409
   await rejectsWith(save('s003', { cost: { jpy: '56', reason: '古い画面' } }, { token: before }), 409, 'version_conflict');
   const s2 = await save('s003', { cost: { jpy: '56', reason: '新しい画面' } });
   assert.ok(s2.derived.some((d) => d.code === 'set004' && d.col === 'cost' && d.to === 120 + 70 + 56), JSON.stringify(s2.derived));
+});
+
+console.log('\n古い観測・前からの原価の重なり・構成品の種類 (#1563 仮レビュー M1 / M2 / Low 6。別の DB)');
+
+const E3 = await setupDb();
+await openCutover(E3, ALL_COMPANY);
+const q3 = async (sql, params) => (await E3.db.query(sql, params)).rows;
+const costs3 = async (code) => (await q3(`select c.cost_jpy::int as jpy, c.valid_from::text as f, c.valid_to::text as t from core.sku_costs c join core.skus s on s.sku_id = c.sku_id
+  where s.code = $1 order by c.valid_from, c.valid_to nulls last, c.sku_cost_id`, [code])).map((c) => [c.jpy, c.f, c.t]);
+const comps3 = async (code) => (await q3(`select k.code, c.qty from core.sku_components c join core.skus k on k.sku_id = c.child_sku_id
+  where c.parent_sku_id = (select sku_id from core.skus where code = $1) order by c.sort_order`, [code])).map((r) => [r.code, r.qty]);
+const promote3 = (id, opts = {}) => W.promoteComponentRequest(E3.db, id, { ownership: ALL_COMPANY, now: NOW, ...opts });
+const openBreaches3 = async () => (await q3("select kind from ops.sku_component_breaches where status = 'open' order by breach_id")).map((b) => b.kind);
+/** 開いている依頼を、同じ中身で ago だけ前に作ったことにする (持ち主のロール) */
+const backdateRequest3 = async (code, ago) => {
+  await E3.pg.query(`update ops.sku_component_requests set status = 'cancelled', closed_at = now(), closed_by = 'test', close_reason = 'superseded'
+    where status = 'open' and set_sku_id = (select sku_id from core.skus where code = $1)`, [code]);
+  await E3.pg.query(`insert into ops.sku_component_requests (company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, edit_request_id, created_at)
+    select company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, gen_random_uuid(), created_at - $2::interval from ops.sku_component_requests
+     where component_request_id = (select max(component_request_id) from ops.sku_component_requests where set_sku_id = (select sku_id from core.skus where code = $1))`, [code, ago]);
+};
+
+await ta('[11b] 受けてから 36 時間より前の観測は使わない (依頼より後・ほかに新しい観測なし・依頼どおりでも上げない = observation_too_old)', async () => {
+  const want = [{ code: 's001', qty: 1 }, { code: 's002', qty: 1 }];
+  await save('set001', { components: want }, { E: E3 });
+  await backdateRequest3('set001', '3 days');
+  const old = await observeRaw('set001', want.map((w, i) => ({ ...w, sort: i + 1 })), new Date(Date.now() - 40 * 3600000).toISOString(), { E: E3, recordedAgo: '40 hours' });
+  const r = await promote3(old);
+  assert.deepEqual([r.promoted, r.reason, r.max_age_hours], [false, 'observation_too_old', W.OBSERVATION_MAX_AGE_HOURS]);
+  assert.deepEqual(await comps3('set001'), [['s001', 2], ['s002', 1]]);
+  assert.deepEqual(await openBreaches3(), []);
+  // 依頼を取り下げる (今の構成に戻す)
+  await save('set001', { components: [{ code: 's001', qty: 2 }, { code: 's002', qty: 1 }] }, { E: E3 });
+});
+
+await ta('[9b] 前からの原価の重なり (夜間ロードが同じ日に 2 回付け替えた [d, d] と [d, 続く]): 次の日の昇格・保存は通る (今の行を昨日で閉じる = 縮めるだけ) / 同じ日は 409 cost_overlap (500 にしない・昇格は投げない)', async () => {
+  const plan2 = makePlan();
+  for (const s of plan2.skus) if (['s001', 's002', 'set001'].includes(s.code)) s.cost = { ...s.cost, jpy: s.cost.jpy + 10 };
+  const lr = await runInitialLoad(E3.db, plan2, { log: quiet, runId: 'load_twice', ownership: MASTER_OWNERSHIP, now: LOAD_NOW });
+  assert.equal(lr.ok, true, lr.error);
+  assert.deepEqual(await costs3('s001'), [[100, '2030-01-05', '2030-01-05'], [110, '2030-01-05', null]]);   // 前からの重なり (1 日)
+  assert.deepEqual(await costs3('set001'), [[400, '2030-01-05', '2030-01-05'], [410, '2030-01-05', null]]);
+  const want = [{ code: 's001', qty: 1 }, { code: 's002', qty: 1 }];
+  await save('set001', { components: want }, { E: E3 });
+  const obsId = (await observe([{ set_code: 'set001', rows: want.map((w, i) => ({ ...w, sort: i + 1 })) }], { E: E3 })).set001;
+  // 同じ日 (夜間ロードの日): 今日始まった行を入れ直すと前からの行に当たる = 上げない (理由を返す・投げない = 夜間の段を止めない)
+  const same = await promote3(obsId, { now: LOAD_NOW });
+  assert.deepEqual([same.promoted, same.reason], [false, 'cost_overlap'], JSON.stringify(same));
+  assert.deepEqual(await comps3('set001'), [['s001', 2], ['s002', 1]]);
+  // 次の日: 今の行を昨日で閉じる (縮めるだけ = 重なりの守りは見ない) → 今日から
+  const next = await promote3(obsId);
+  assert.equal(next.promoted, true, JSON.stringify(next));
+  assert.deepEqual(await comps3('set001'), [['s001', 1], ['s002', 1]]);
+  assert.deepEqual(await costs3('set001'), [[400, '2030-01-05', '2030-01-05'], [410, '2030-01-05', '2030-01-09'], [110 + 210, TODAY, null]]);
+  // 単品の保存 (画面のロール): 次の日は通る・含むセットも計算し直す
+  const s = await save('s002', { cost: { jpy: '220', reason: '重なりの後' } }, { E: E3 });
+  assert.ok(s.derived.some((d) => d.code === 'set001' && d.col === 'cost' && d.to === 110 + 220), JSON.stringify(s.derived));
+  assert.deepEqual(await costs3('s002'), [[200, '2030-01-05', '2030-01-05'], [210, '2030-01-05', '2030-01-09'], [220, TODAY, null]]);
+  // 同じ日 (夜間ロードの日) の保存 = 409 cost_overlap・何も書かない・記録も 409
+  const before = await costs3('s001');
+  const id = uuid();
+  const e = await rejectsWith(save('s001', { cost: { jpy: '125', reason: '同じ日' } }, { E: E3, now: LOAD_NOW, requestId: id }), 409, 'cost_overlap');
+  assert.match(e.message, /重なって/);
+  assert.deepEqual(await costs3('s001'), before);
+  const rec = (await q3('select status, error from ops.master_edit_requests where request_id = $1', [id]))[0];
+  assert.deepEqual([rec.status, rec.error.status, rec.error.reason], ['failed', 409, 'cost_overlap']);
+});
+
+await ta('[11c] 古い観測で上げない: A (依頼どおり) → B (NE がまた変わった) の後で A を上げない (superseded_observation)・B は食い違い → また A = 上げる', async () => {
+  const A = [{ code: 's001', qty: 2, sort: 1 }, { code: 's002', qty: 1, sort: 2 }];
+  const B = [{ code: 's001', qty: 3, sort: 1 }, { code: 's002', qty: 1, sort: 2 }];
+  await save('set001', { components: A.map(({ code, qty }) => ({ code, qty })) }, { E: E3 });
+  const a1 = (await observe([{ set_code: 'set001', rows: A }], { E: E3 })).set001;
+  const b = (await observe([{ set_code: 'set001', rows: B }], { E: E3 })).set001;
+  let r = await promote3(a1);
+  assert.deepEqual([r.promoted, r.reason, r.newer_observation_id], [false, 'superseded_observation', b], JSON.stringify(r));
+  assert.deepEqual(await comps3('set001'), [['s001', 1], ['s002', 1]]);
+  assert.deepEqual(await openBreaches3(), []);
+  r = await promote3(b);
+  assert.deepEqual([r.promoted, r.reason], [false, 'mismatch']);
+  const a2 = (await observe([{ set_code: 'set001', rows: A }], { E: E3 })).set001;
+  assert.equal((await promote3(b)).reason, 'superseded_observation');   // B も A2 より古い = 食い違いを作り直さない
+  assert.equal((await promote3(a1)).reason, 'superseded_observation');
+  r = await promote3(a2);
+  assert.equal(r.promoted, true, JSON.stringify(r));
+  assert.deepEqual(await comps3('set001'), [['s001', 2], ['s002', 1]]);
+  assert.deepEqual(await openBreaches3(), []);
+});
+
+await ta('[11d] 上げる直前に構成品がまだ単品か確かめる: 夜間ロードが構成品をセットにした = 上げない (core は変えない・underivable)。単品に戻れば上げる', async () => {
+  const D = [{ code: 's001', qty: 2, sort: 1 }, { code: 's002', qty: 1, sort: 2 }, { code: 's003', qty: 1, sort: 3 }];
+  await save('set001', { components: D.map(({ code, qty }) => ({ code, qty })) }, { E: E3 });
+  const obsId = (await observe([{ set_code: 'set001', rows: D }], { E: E3 })).set001;
+  await E3.pg.query("update core.skus set sku_kind = 'set' where code = 's003'");   // 夜間ロードが NE の種類替えを写した
+  let r = await promote3(obsId);
+  assert.deepEqual([r.promoted, r.reason], [false, 'underivable'], JSON.stringify(r));
+  assert.match(r.blockers.join(' '), /s003 はセットになった/);
+  assert.deepEqual(await comps3('set001'), [['s001', 2], ['s002', 1]]);
+  assert.deepEqual(await openBreaches3(), ['underivable']);
+  await E3.pg.query("update core.skus set sku_kind = 'single' where code = 's003'");
+  r = await promote3(obsId);
+  assert.equal(r.promoted, true, JSON.stringify(r));
+  assert.deepEqual(await comps3('set001'), [['s001', 2], ['s002', 1], ['s003', 1]]);
+  assert.deepEqual(await openBreaches3(), []);
+  await E3.pg.close();
 });
 
 console.log('\nDB のロール');
@@ -862,16 +1015,44 @@ await ta('[14] master_edit = 画面の読み書きだけ (記録の偽造・過�
   // master_observer / master_gate: それぞれの関数だけ
   assert.equal(await as('master_observer', 'select 1 from core.skus limit 1'), '42501');
   assert.equal(await as('master_observer', `select ops.set_master_cutover_phase('frozen', 'x', '{}'::jsonb)`), '42501');
-  assert.equal(await as('master_gate', `select ops.record_ne_set_observations('{}'::jsonb)`), '42501');
-  assert.equal(await as('master_gate', 'select phase from ops.master_cutover_state'), 'ok');
+  assert.equal(await as('master_gate_render', `select ops.record_ne_set_observations('{}'::jsonb)`), '42501');
+  assert.equal(await as('master_gate_render', 'select phase from ops.master_cutover_state'), 'ok');   // まとめのロール master_gate の権限を INHERIT で使う
+  assert.equal(await as('master_gate_minipc', 'select 1 from core.skus limit 1'), '42501');
   // master_ops: 関数は動く (段階はもう new_open = one_way で止まる = 権限では拒まれない)・表は直接書けない・商品は読めない
   assert.equal(await as('master_ops', `select ops.set_master_cutover_phase('frozen', 'x', '{}'::jsonb)`), 'P0001');
   assert.equal(await as('master_ops', "update ops.master_cutover_state set note = 'x'"), '42501');
   assert.equal(await as('master_ops', 'select 1 from core.skus limit 1'), '42501');
   assert.equal(await as('master_ops', 'select phase from ops.master_cutover_state'), 'ok');
   const roles = await q("select rolname, rolsuper, rolcreaterole, rolinherit, rolcanlogin from pg_roles where rolname like 'master\\_%' order by 1");
-  assert.deepEqual(roles.map((r) => [r.rolname, r.rolsuper, r.rolcreaterole, r.rolinherit, r.rolcanlogin]),
-    ['master_edit', 'master_gate', 'master_observer', 'master_ops'].map((n) => [n, false, false, false, true]));
+  assert.deepEqual(roles.map((r) => [r.rolname, r.rolsuper, r.rolcreaterole, r.rolinherit, r.rolcanlogin]), [
+    ['master_edit', false, false, false, true], ['master_gate', false, false, false, false],
+    ['master_gate_minipc', false, false, true, true], ['master_gate_render', false, false, true, true],
+    ['master_observer', false, false, false, true], ['master_ops', false, false, false, true]]);
+  // ロールの設定 (画面の接続と同じ lock_timeout・idle_in_transaction_session_timeout。#1563 仮レビュー Low 4)
+  const conf = (await q("select coalesce(s.setconfig, '{}') as c from pg_db_role_setting s join pg_roles r on r.oid = s.setrole where r.rolname = 'master_edit' and s.setdatabase = 0"))[0].c;
+  assert.deepEqual([...conf].sort(), ['idle_in_transaction_session_timeout=60s', 'lock_timeout=10s', 'statement_timeout=20s']);
+  // 流し直し (#1563 仮レビュー Low 2): もうあるロールのパスワードは変えない (門のログインは Render と miniPC の両方が使う)。変えるのは --rotate-password のロールだけ
+  const pwOf = async () => {   // pg_authid は superuser だけ読める = 試験の接続のログインに戻って読む
+    await pg.query('reset role');
+    try { return Object.fromEntries((await pg.query("select rolname, rolpassword from pg_authid where rolname like 'master\\_%' order by 1")).rows.map((r) => [r.rolname, r.rolpassword])); }
+    finally { await pg.query('set role deploy'); }
+  };
+  const before = await pwOf();
+  const again = await createMasterEditRoles(pg, {});
+  assert.deepEqual(Object.keys(again.pw), []);
+  assert.deepEqual(await pwOf(), before);
+  const rot = await createMasterEditRoles(pg, { rotate: ['master_ops'] });
+  assert.deepEqual(Object.keys(rot.pw), ['master_ops']);
+  const after = await pwOf();
+  assert.notEqual(after.master_ops, before.master_ops);
+  assert.deepEqual({ ...after, master_ops: null }, { ...before, master_ops: null });
+  assert.equal(after.master_gate, null);   // まとめのロールはパスワードなし
+  await assert.rejects(() => createMasterEditRoles(pg, { rotate: ['master_gate'] }), /知らないロール/);
+  const { parseRotateArgs } = await import('./company-db/create-master-edit-roles.mjs');
+  assert.deepEqual(parseRotateArgs(['--dry-run', '--rotate-password', 'master_gate_render', '--rotate-password', 'master_ops']), ['master_gate_render', 'master_ops']);
+  assert.throws(() => parseRotateArgs(['--rotate-password']), /ロールの名前/);
+  const dry = await createMasterEditRoles(pg, { dryRun: true });
+  assert.ok(!dry.stmts.some((x) => /password '/.test(x)), 'もうあるロールにはパスワードの文を出さない');
   // 変更の記録は画面のロールで保存しても db_user = master_edit (security definer の関数でも呼び手を残す)
   assert.equal(Number((await q("select count(*)::int as n from events.master_change_events where source_system = 'portal_master_edit' and request_id in (select request_id::text from ops.master_edit_requests) and db_user <> 'master_edit'"))[0].n), 0);
   assert.ok(Number((await q("select count(*)::int as n from events.master_change_events where db_user = 'master_edit'"))[0].n) > 10);
@@ -961,7 +1142,7 @@ await ta('[15] 単品・セットの画面: 描画・画面の JS・編集の印
   assert.match(r.text, /data-can-save="1"/);
   assert.match(r.text, /<label class="k">JAN<\/label>/); assert.match(r.text, /ロジザードが正/);
   await save('set001', { components: [{ code: 's001', qty: 1 }, { code: 's003', qty: 2 }] });
-  await promote((await observe([{ set_code: 'set001', rows: [{ code: 's001', qty: 1, sort: 1 }] }], { at: new Date(Date.now() + 240000).toISOString() })).set001);
+  await promote((await observe([{ set_code: 'set001', rows: [{ code: 's001', qty: 1, sort: 1 }] }], { at: nextAt() })).set001);
   r = await call('GET', '/sku/set001');
   checkScripts(r.text, 1);
   assert.ok(!/<label class="k">JAN<\/label>/.test(r.text) && !/ロジザードが正/.test(r.text), 'セットに JAN・ロジザードの欄を出さない');

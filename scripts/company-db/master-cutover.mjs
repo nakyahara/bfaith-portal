@@ -8,8 +8,9 @@
  * 接続 = env COMPANY_DB_MASTER_OPS_URL (運用のロール master_ops = 段階を進める関数を実行できるだけ。create-master-edit-roles.mjs が作る) か --url
  * 段階: legacy_open → frozen → company_owner → new_open (1 段ずつ・戻さない。DB の関数 ops.set_master_cutover_phase が門の記録と証拠を確かめる):
  *   共通の証拠 { expected_builds: { render: [build_id, ...], minipc: [...] }, manifest_hash, owner_hash }
- *     + 門の記録 (ops.master_legacy_gate_acks・古い入口の門 = ⑤-3 が起動時と定期に書く) が、各場所に 15 分以内に 1 つ以上あり、
- *       直近 15 分に記録した全部の実体 (instance_id) の build が expected_builds にあり、manifest_hash・owner_hash が証拠と同じ
+ *     + 門の記録 (ops.master_legacy_gate_acks・古い入口の門 = ⑤-3 が起動時と定期に書く・ログインは場所ごと) が、各場所に 15 分以内に 1 つ以上あり、
+ *       直近 15 分に記録した全部の実体 (instance_id) の build が expected_builds にあり、manifest_hash・owner_hash が証拠と同じ。
+ *       24 時間以内に記録があるのに最後の記録が 15 分より前の実体 (黙っている) があれば進めない = 止めた実体は stopped の記録を書く (⑤-3 の CLI・正しく終わるとき)
  *   → frozen:        + manual_entries_stopped: [{ id, by, at }, ...] (id の集まり = manifest の手の入口 kind='manual' と完全に同じ)
  *                    + drain: { done: true, checked_by, checked_at }。owner_hash = いまの持ち主表 (全部 load) のハッシュ
  *   → company_owner: owner_hash = 新しい持ち主表のハッシュ。門の記録は frozen に入った後・phase_seen = 'frozen'・処理中 0

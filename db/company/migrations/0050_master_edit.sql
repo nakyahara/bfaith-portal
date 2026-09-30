@@ -9,8 +9,12 @@
 --      🚨 門 (PR #1563 R2 H2 の契約。⑤-3 は記録を書くだけ・中身の検査はここ):
 --        ・動いている場所 (ops.master_cutover_required_hosts() = render・minipc) のプロセスごと (instance_id) が、起動と一定の間隔で ops.record_legacy_gate_ack を呼ぶ
 --          (build_id・古い入口の一覧 (manifest) ・持ち主表のハッシュ・見た段階・書きかけの数)。時刻はサーバーの時計。記録は追記だけ。manifest は ops.master_legacy_manifests (ハッシュごとに 1 行)
---        ・段階を進めるとき、新しい記録 (ops.master_cutover_ack_fresh_minutes() 分以内) をプロセスごとの最後の 1 件で見る:
---          全部の場所に 1 件以上・どれも build_id が証拠の expected_builds[場所] の中・manifest_hash と owner_hash が証拠と同じ・見た段階が今の段階。1 つでも外れたら拒む
+--        ・場所はログインで決まる (#1563 仮レビュー Low 3): 書けるのはログインのロール master_gate_render / master_gate_minipc (まとめのロール master_gate のメンバー) だけ。
+--          session_user が 'master_gate_' || host でなければ拒む (gate_host_mismatch・42501)。記録に session_role を残す
+--        ・止まったプロセス: 止めるとき (正しく終わる・人が CLI で「止めた」と書く) は stopped = true + 理由 (stopped_reason) の記録を書く
+--        ・段階を進めるとき、ops.master_cutover_ack_silent_hours() (24) 時間以内に記録のあるプロセスごとに、最後の 1 件を見る:
+--          止まった記録 = 外す / ops.master_cutover_ack_fresh_minutes() (15) 分より前 = 黙っている = 拒む (止めたなら stopped の記録を書く) /
+--          新しい記録 = 全部の場所に 1 件以上・どれも build_id が証拠の expected_builds[場所] の中・manifest_hash と owner_hash が証拠と同じ・見た段階が今の段階。1 つでも外れたら拒む
 --          legacy_open → frozen     : + drain (書きかけを流し終えた) + 手の入口 (manifest の kind = manual) を止めた一覧が manifest の手の入口と完全に同じ集合
 --          frozen → company_owner   : + 記録が frozen に入った後・書きかけ 0 (新しい持ち主表のハッシュ = 証拠の owner_hash を段階に残す)
 --          company_owner → new_open : + 記録が company_owner に入った後・書きかけ 0・owner_hash が company_owner のときと同じ
@@ -28,12 +32,18 @@
 --      ops.sku_component_breaches = 食い違い (NE でやること): mismatch / stale / unrequested_diff / underivable (NE は依頼どおりだが、依頼の構成では導く値が決まらない)
 --      依頼を上げるのは lib/master-write.mjs の promoteComponentRequest(観測の番号) だけ (夜間ロード = 持ち主のロール)
 --   5. core.sku_costs: 期間の重なりの守り (この画面と昇格の書き込み・持ち主でないロールの書き込み) と、持ち主でないロールは過去の行を消さない・閉じた行を変えない
+--      ・期間を縮めるだけの UPDATE (同じ SKU・新しい期間が前の期間の中) は見ない (新しい重なりを作れない)。夜間ロードが同じ日に 2 回付け替えた [d, d] と [d, null] が
+--        既にあっても、今の行を「昨日で閉じる」は通す (#1563 仮レビュー M1)。今日の行を入れ直すときに前からの重なりに当たったら 23P01 = 画面・昇格は 409 cost_overlap (500 にしない)
+--      🚨 前からある重なりの行は ⑥ の前に掃除する (下の M7 の go/no-go の項目に入れる)
 --      🚨 既知の未達 (PR #1563 R1 M7・R2 M7): 表全体を半開区間 [from, to) にそろえて排他制約 (exclusion) を付けるのは ⑥ 切替の go/no-go の項目 (このPRではしない)。そろえる読み手・書き手 =
 --         夜間ロード apps/company-db/load/engine.mjs (§5 の付け替え = greatest(valid_from, 今日 − 1) で閉じる = 同じ日の 2 回で 1 日重なる)・照合 master-compare/compare-load.mjs / compare-ne.mjs・
 --         apps/master-decisions/lz-cdb.mjs・apps/company-db/router.mjs・push/sku-cost-observed.mjs・0007 / 0009 の mart (valid_to is null)・0046 v_sku_cost_observed_effective・
 --         0049 mart.amazon_profit_* (その日を覆う 1 行)。いまは全部が両端を含む前提で読み・書きしている
 --   6. 0026 の変更の記録の関数 (core.audit_master_change・core.bump_parent_version) を security definer にする (PR #1563 R2 M4)。
 --      画面のロールに events.master_change_events の insert を渡さない = 記録を偽れない。db_user は「SET ROLE の役 か ログインした役」(持ち主の権限で動いても呼び手を残す)
+--   7. マスタの書き込みの鍵 core.master_write_lock_key() = 4705310050 (0036 の親子の鍵 4705310036 と同じ作り。#1563 仮レビュー M3):
+--      夜間ロード (apps/company-db/load/engine.mjs) は取引の冒頭 (親子の鍵より前) に排他で取る。この画面の保存・構成の依頼の昇格は段階の共有の鍵の後に共有で取る
+--      (短く待つ = lib/master-write.mjs の MASTER_WRITE_WAIT。待ちきれなければ 409「夜間の取り込み中」)。夜間ロードの長い取引と保存が行の鍵で待ち合う (デッドロック) のを防ぐ
 -- 🚨 この migration は商品の値を何も変えない (列は全部 null で足す・切替の段階は legacy_open から・0026 の関数は同じ記録を書く)
 
 -- 1. 切替の段階と門
@@ -80,16 +90,23 @@ create table ops.master_legacy_gate_acks (
   phase_seen         text not null check (phase_seen in ('legacy_open', 'frozen', 'company_owner', 'new_open')),
   inflight_count     integer not null check (inflight_count >= 0),   -- 古い入口の書きかけ (受けたが終わっていない書き込み) の数
   oldest_inflight_at timestamptz,
+  session_role       text not null,                                   -- 書いたログインのロール (session_user)。場所ごとに決まる (#1563 仮レビュー Low 3)
+  stopped            boolean not null default false,                  -- このプロセスは止まった (正しく終わった・人が CLI で止めたと書いた)。段階を進める門はこのプロセスを外す
+  stopped_reason     text,
   acked_at           timestamptz not null default clock_timestamp(),
-  constraint ck_mlga_inflight check ((inflight_count = 0) = (oldest_inflight_at is null))
+  constraint ck_mlga_inflight check ((inflight_count = 0) = (oldest_inflight_at is null)),
+  constraint ck_mlga_session check (session_role = 'master_gate_' || host),
+  constraint ck_mlga_stopped check (stopped = (stopped_reason is not null) and (stopped_reason is null or length(stopped_reason) between 1 and 200))
 );
 create index ix_master_legacy_gate_acks_host on ops.master_legacy_gate_acks (host, instance_id, acked_at desc, ack_id desc);
 select core.make_append_only('ops', 'master_legacy_gate_acks');
-comment on table ops.master_legacy_gate_acks is 'プロセスごとの門の記録 (0050。書くのは ⑤-3 = ops.record_legacy_gate_ack だけ)。切替の段階を進める門が読む';
+comment on table ops.master_legacy_gate_acks is 'プロセスごとの門の記録 (0050。書くのは ⑤-3 = ops.record_legacy_gate_ack だけ・ログイン master_gate_<場所>)。切替の段階を進める門が読む';
 
 -- 門の設定 (⑤-3・⑥ で変えるときは create or replace)
 create function ops.master_cutover_required_hosts() returns text[] language sql immutable as $$ select array['minipc', 'render']::text[] $$;
 create function ops.master_cutover_ack_fresh_minutes() returns integer language sql immutable as $$ select 15 $$;
+-- この時間より前に最後の記録があるプロセスは、もう居ないとみなす (それより新しい記録のあるプロセスは、新しい記録か止まった記録が要る)
+create function ops.master_cutover_ack_silent_hours() returns integer language sql immutable as $$ select 24 $$;
 
 -- 段階を進める前にそろっているべきもの (差し込み口)。既定 = 問題なし。後の migration が create or replace で「まだの項目」を返す (空でなければ段階を進めない)
 create function ops.master_cutover_prereq_problems(p_from text, p_to text) returns text[]
@@ -137,29 +154,46 @@ begin
 end $$;
 
 -- 門の記録を 1 件書く (⑤-3 の古い入口の門が呼ぶ)。時刻はサーバーの時計・見た段階は今の段階と同じでないと拒む・manifest はハッシュごとに 1 回だけ残す
--- 🚨 security definer: 呼ぶロール (master_gate) に表の書き込みの権限を渡さない。一時の表を使わない・search_path の最後に pg_temp
+-- 場所はログインで決まる: session_user = 'master_gate_' || p_host でなければ拒む (gate_host_mismatch・42501。Render のログインで minipc を名乗れない)
+-- p_stopped = true = このプロセスは止まった (p_stopped_reason が要る)。段階を進める門はこのプロセスを外す (黙っているプロセスとして止めない)
+-- 🚨 security definer: 呼ぶロール (master_gate_<場所>) に表の書き込みの権限を渡さない。一時の表を使わない・search_path の最後に pg_temp
 create function ops.record_legacy_gate_ack(p_host text, p_instance_id text, p_build_id text, p_manifest jsonb, p_owner_hash text, p_phase_seen text,
-                                           p_inflight_count integer, p_oldest_inflight_at timestamptz) returns jsonb
+                                           p_inflight_count integer, p_oldest_inflight_at timestamptz,
+                                           p_stopped boolean default false, p_stopped_reason text default null) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, ops, pg_temp as $$
 declare
-  v_hash  text := ops.legacy_manifest_hash(p_manifest);
-  v_phase text;
-  v_id    bigint;
-  v_at    timestamptz;
+  v_hash    text := ops.legacy_manifest_hash(p_manifest);
+  v_phase   text;
+  v_id      bigint;
+  v_at      timestamptz;
+  v_stopped boolean := coalesce(p_stopped, false);
 begin
+  if p_host is null or not (p_host = any(ops.master_cutover_required_hosts())) then
+    raise exception 'invalid_input: 知らない場所 % (render / minipc)', p_host using errcode = '22023';
+  end if;
+  if session_user::text is distinct from 'master_gate_' || p_host then
+    raise exception 'gate_host_mismatch: ログイン % では場所 % の記録を書けない (master_gate_% でログインする)', session_user, p_host, p_host using errcode = '42501';
+  end if;
+  if v_stopped and (p_stopped_reason is null or length(btrim(p_stopped_reason)) = 0) then
+    raise exception 'invalid_input: 止まった記録 (stopped) には理由 (stopped_reason) が要る' using errcode = '22023';
+  end if;
+  if not v_stopped and p_stopped_reason is not null then
+    raise exception 'invalid_input: 止まった記録でないのに理由 (stopped_reason) がある' using errcode = '22023';
+  end if;
   select phase into v_phase from ops.master_cutover_state where id = 1;
   if p_phase_seen is distinct from v_phase then
     raise exception 'stale_phase: 見た段階 % が今の段階 % と違う (段階を読み直してから書く)', p_phase_seen, v_phase using errcode = 'P0001';
   end if;
   insert into ops.master_legacy_manifests (manifest_hash, entries) values (v_hash, p_manifest) on conflict (manifest_hash) do nothing;
-  insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, oldest_inflight_at)
-    values (p_host, p_instance_id, p_build_id, v_hash, p_owner_hash, p_phase_seen, p_inflight_count, p_oldest_inflight_at)
+  insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, oldest_inflight_at, session_role, stopped, stopped_reason)
+    values (p_host, p_instance_id, p_build_id, v_hash, p_owner_hash, p_phase_seen, p_inflight_count, p_oldest_inflight_at, session_user::text, v_stopped,
+            case when v_stopped then btrim(p_stopped_reason) end)
     returning ack_id, acked_at into v_id, v_at;
-  return jsonb_build_object('ack_id', v_id, 'manifest_hash', v_hash, 'acked_at', v_at);
+  return jsonb_build_object('ack_id', v_id, 'manifest_hash', v_hash, 'acked_at', v_at, 'stopped', v_stopped);
 end $$;
-revoke all on function ops.record_legacy_gate_ack(text, text, text, jsonb, text, text, integer, timestamptz) from public;
+revoke all on function ops.record_legacy_gate_ack(text, text, text, jsonb, text, text, integer, timestamptz, boolean, text) from public;
 
--- 1 段だけ進める (飛ばさない・戻さない・証拠と全部の場所の新しい記録が要る)。鍵 (排他) → 行 (for update) → 差し込み口 → 証拠 → 門 → 状態 → 記録
+-- 1 段だけ進める (飛ばさない・戻さない・証拠と全部の場所の新しい記録が要る・黙っているプロセスがあれば進めない)。鍵 (排他) → 行 (for update) → 差し込み口 → 証拠 → 門 → 状態 → 記録
 -- 証拠 = { expected_builds: { render: [...], minipc: [...] }, manifest_hash, owner_hash, (→ frozen だけ) drain: { done, checked_by, checked_at }, manual_entries_stopped: [{ id, by, at }] }
 -- 🚨 security definer: 呼ぶ人に表の書き込みの権限を渡さない (運用のロール master_ops に実行だけ)。一時の表を使わない・search_path の最後に pg_temp (0034 の約束)
 create function ops.set_master_cutover_phase(p_to text, p_actor text, p_evidence jsonb, p_note text default null) returns jsonb
@@ -171,6 +205,7 @@ declare
   v_hash    text;
   v_hosts   text[] := ops.master_cutover_required_hosts();
   v_fresh   interval := make_interval(mins => ops.master_cutover_ack_fresh_minutes());
+  v_silent  interval := make_interval(hours => ops.master_cutover_ack_silent_hours());
   v_now     timestamptz := clock_timestamp();
   v_manifest text;
   v_owner   text;
@@ -237,13 +272,23 @@ begin
     end if;
   end if;
 
-  -- 門: 場所ごと・プロセスごとの最後の新しい記録
+  -- 門: 場所ごと・プロセスごとの最後の記録 (ops.master_cutover_ack_silent_hours() 時間以内に記録のあるプロセス全部)。
+  --   止まった記録 = 外す / 新しい記録 (fresh 分以内) = 下の検査 / それより前 = 黙っている = 拒む (#1563 仮レビュー Low 3)
   v_problems := '{}';
   foreach v_host in array v_hosts loop
     v_n := 0;
     for a in select distinct on (k.instance_id) k.* from ops.master_legacy_gate_acks k
-               where k.host = v_host and k.acked_at >= v_now - v_fresh
+               where k.host = v_host and k.acked_at >= v_now - v_silent
                order by k.instance_id, k.acked_at desc, k.ack_id desc loop
+      if a.stopped then
+        v_acks := v_acks || jsonb_build_array(jsonb_build_object('ack_id', a.ack_id, 'host', a.host, 'instance_id', a.instance_id, 'build_id', a.build_id, 'acked_at', a.acked_at, 'stopped', true));
+        continue;
+      end if;
+      if a.acked_at < v_now - v_fresh then
+        v_problems := array_append(v_problems, format('%s/%s: 黙っている (最後の記録 %s が %s 分より前。止めたプロセスなら stopped の記録を書く)',
+                                                      v_host, a.instance_id, a.acked_at, ops.master_cutover_ack_fresh_minutes()));
+        continue;
+      end if;
       v_n := v_n + 1;
       if not ((v_builds -> v_host) ? a.build_id) then v_problems := array_append(v_problems, format('%s/%s: 予定に無い build %s が動いている', v_host, a.instance_id, a.build_id)); end if;
       if a.manifest_hash is distinct from v_manifest then v_problems := array_append(v_problems, format('%s/%s: 古い入口の一覧が違う', v_host, a.instance_id)); end if;
@@ -490,12 +535,18 @@ revoke all on function ops.record_ne_set_observations(jsonb) from public;
 
 -- 5. 原価の守り (両端を含む [valid_from, valid_to]。valid_to = null = ずっと)。上の 🚨 M7 = ⑥ の前提
 --   ・重なり: この画面と昇格の書き込み (source_system) と、表の持ち主でないロール (source_system を偽っても) の書き込みだけ見る
+--   ・期間を縮めるだけの UPDATE (同じ SKU・新しい [from, to] が前の [from, to] の中) は見ない = 新しい重なりは作れない。
+--     夜間ロードが同じ日に 2 回付け替えた [d, d] と [d, null] (前からの重なり) があっても、今の行を昨日で閉じるのは通す (#1563 仮レビュー M1)
 --   ・持ち主でないロールは、今日 (東京) より前に始まった行を消さない・閉じた行 (valid_to がある) を変えない・昨日より前で閉じない (過去の粗利を変えない)
 create function core.guard_sku_cost_overlap() returns trigger language plpgsql as $$
 declare
   v_owner boolean := pg_catalog.pg_has_role(current_user, (select c.relowner from pg_catalog.pg_class c where c.oid = tg_relid), 'USAGE');
 begin
   if v_owner and coalesce(pg_catalog.current_setting('core.source_system', true), '') not in ('portal_master_edit', 'ne_observation') then return null; end if;
+  if tg_op = 'UPDATE' and new.sku_id = old.sku_id and new.valid_from >= old.valid_from
+     and coalesce(new.valid_to, 'infinity'::date) <= coalesce(old.valid_to, 'infinity'::date) then
+    return null;
+  end if;
   if exists (select 1 from core.sku_costs o
               where o.sku_id = new.sku_id and o.sku_cost_id <> new.sku_cost_id
                 and o.valid_from <= coalesce(new.valid_to, 'infinity'::date) and new.valid_from <= coalesce(o.valid_to, 'infinity'::date)) then
@@ -611,6 +662,9 @@ begin
   perform 1 from core.suppliers where supplier_id = any(p_ids) order by supplier_id for share;
 end $$;
 revoke all on function core.lock_suppliers_for_share(bigint[]) from public;
+
+-- 7. マスタの書き込みの鍵 (上の 7.)。夜間ロードは排他・この画面の保存と構成の依頼の昇格は共有。数は 0036 の core.parent_lock_key() と重ならない固定の数
+create function core.master_write_lock_key() returns bigint language sql immutable as $$ select 4705310050::bigint $$;
 
 -- 読むだけの見張り (watcher)。書くロール (master_edit・master_ops・master_observer・master_gate) の権限は scripts/company-db/create-master-edit-roles.mjs が付ける
 do $$ begin
