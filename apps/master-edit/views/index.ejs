@@ -26,6 +26,7 @@
       <input name="q" value="<%= filters.q %>" placeholder="コード・名前・JAN で検索" size="26">
       <label>区分 <select name="kind"><option value="">全部</option><% for (const [k, v] of Object.entries(KINDS)) { %><option value="<%= k %>"<%= filters.kind === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
       <label>状態 <select name="state"><option value="">全部</option><% for (const [k, v] of Object.entries(STATES)) { %><option value="<%= k %>"<%= filters.state === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
+      <label>カード <select name="card"><option value="">全部</option><% for (const [k, v] of Object.entries(CARD_FILTERS)) { %><option value="<%= k %>"<%= filters.card === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
       <label>登録 <select name="reg"><option value="">全部</option><% for (const [k, v] of Object.entries(REG_STATES)) { %><option value="<%= k %>"<%= filters.reg === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
       <label>未入力 <select name="missing"><option value="">—</option><% for (const [k, v] of Object.entries(MISSING)) { %><option value="<%= k %>"<%= filters.missing === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
       <label><input type="checkbox" name="diff" value="1"<%= filters.diff ? ' checked' : '' %><%= data.diffAvailable ? '' : ' disabled' %>> NEとの差あり</label>

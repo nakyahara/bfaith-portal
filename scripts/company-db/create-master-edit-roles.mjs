@@ -10,7 +10,11 @@
  *      切替の段階・門の記録・NE の観測の書き込み。core.sku_costs の削除は渡すが、今日より前の行は DB の trigger が拒む (0051)
  *      core.suppliers の update (仕入先の行の共有の鍵は 0051 の関数 core.lock_suppliers_for_share = security definer の実行だけ)
  *   ロールの設定 = statement_timeout 20s・lock_timeout 10s・idle_in_transaction_session_timeout 60s (画面の接続の設定と同じ。画面が付け忘れても長く持たない)
- * master_ops      (手の操作 scripts/company-db/master-cutover.mjs が env COMPANY_DB_MASTER_OPS_URL で使う): ops.set_master_cutover_phase の実行と、段階・記録を読むだけ
+ *   ⑤-2a (0051・新商品の登録 lib/master-register.mjs・カードの知らせ lib/product-hub-outbox.mjs): 新商品の SKU・商品の insert (列を絞る)・カードの知らせの insert (列を絞る)・
+ *   登録の状態を作る関数 (ops.create_sku_registration)・SKU を足した commit の確かめ (ops.sku_registration_problem)・知らせを借りる / 結果を書く関数 (ops.claim_card_events / finish_card_event) の実行。
+ *   🚨 渡さない: 登録の状態・履歴・backfill の印の表の書き込み (関数だけ)・知らせの状態 / 結果 / 借りの列の update (関数だけ・仮レビュー L7)
+ * master_ops      (手の操作 scripts/company-db/master-cutover.mjs が env COMPANY_DB_MASTER_OPS_URL で使う): ops.set_master_cutover_phase の実行と、段階・記録を読むだけ。
+ *   ⑤-2a: 切替の日の backfill (ops.registration_backfill_plan / backfill_sku_registrations) と、登録をやめる (ops.transition_sku_registration) の実行・登録の状態を読む
  * master_observer (⑤-2 の夜間ロードが NE のセットの構成の観測を書く env COMPANY_DB_MASTER_OBSERVER_URL): ops.record_ne_set_observations の実行だけ
  * master_gate     (まとめのロール・ログインできない): ops.record_legacy_gate_ack の実行と、段階を読むだけ。ログインは場所ごとのメンバー (#1563 仮レビュー Low 3):
  *   master_gate_render (Render の ⑤-3 の古い入口の門 env COMPANY_DB_MASTER_GATE_RENDER_URL) / master_gate_minipc (miniPC の門 env COMPANY_DB_MASTER_GATE_MINIPC_URL)。
@@ -52,6 +56,8 @@ export const MASTER_EDIT_SELECT = [
   'events.master_change_events',
   'ops.master_cutover_state', 'ops.master_edit_requests', 'ops.sku_component_requests', 'ops.sku_component_breaches', 'ops.ne_set_observations', 'ops.ne_set_observation_runs',
   'ops.ne_csv_exports', 'ops.ne_csv_export_rows', 'ops.master_decision_candidates', 'ops.master_decision_observations', 'ops.master_compare_runs',
+  // ⑤-2a (0051): 登録の状態 (画面に出す)・backfill の印 (新商品の登録の前提)・カードの知らせ・NE の元のコード (新しいコードの確かめ)
+  'ops.master_registrations', 'ops.master_registration_backfill', 'ops.product_hub_outbox', 'ops.master_ne_codes',
 ];
 /** 保存の経路で書く表・列 (lib/master-write.mjs の saveSku)。insert も列を絞る */
 export const MASTER_EDIT_WRITE = [
@@ -62,7 +68,20 @@ export const MASTER_EDIT_WRITE = [
   ['insert (request_id, company_id, operation, target_code, sku_id, actor_id, payload_hash, status, result, error, started_at)', 'ops.master_edit_requests'],
   ['insert (company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, edit_request_id), update (status, closed_at, closed_by, close_reason)', 'ops.sku_component_requests'],
   ['update (status, closed_at, closed_by, close_reason)', 'ops.sku_component_breaches'],
+  // ⑤-2a (0051・lib/master-register.mjs): 新商品の商品・SKU・カードの知らせ (状態・結果・借りの列は渡さない = 関数だけ)
+  ['insert (company_id, display_code, name, sales_class, status, expiry_managed, inbound_date_managed, created_by_type, created_by_id)', 'core.products'],
+  ['insert (company_id, product_id, sku_kind, code, name, tax_rate, tax_class, handling, standard_price_jpy, shipping_code, shipping_method, shipping_cost_jpy, reorder_months, set_sales_class_override, handling_own, created_by_type, created_by_id)', 'core.skus'],
+  ['insert (company_id, sku_id, kind, schema_version, payload, payload_hash, request_id, created_by)', 'ops.product_hub_outbox'],
 ];
+/** ⑤-2a (0051): 画面のロールが実行する関数 (security definer) */
+export const REGISTER_EDIT_FUNCTIONS = Object.freeze(['ops.create_sku_registration(bigint, text, text, text)', 'ops.sku_registration_problem(bigint, text)',
+  'ops.claim_card_events(text, text, uuid, bigint, integer, integer, integer)', 'ops.finish_card_event(uuid, text, text, jsonb, text)']);
+/** ⑤-2a (0051): 運用のロールが実行する関数 (切替の日の backfill・登録をやめる) と読む表 */
+export const REGISTER_OPS_FUNCTIONS = Object.freeze(['ops.registration_backfill_plan()', 'ops.backfill_sku_registrations(integer, text, text, text)',
+  'ops.transition_sku_registration(bigint, text, text, text, text, jsonb, text)']);
+export const REGISTER_OPS_SELECT = Object.freeze(['ops.master_registrations', 'ops.master_registration_events', 'ops.master_registration_backfill']);
+/** ⑤-2a (0051): だれにも渡さない (夜間ロード = 持ち主だけ) */
+export const REGISTER_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.quarantine_unregistered_skus(text)']);
 export const CUTOVER_FUNCTION = 'ops.set_master_cutover_phase(text, text, jsonb, text)';
 export const OBSERVE_FUNCTION = 'ops.record_ne_set_observations(jsonb)';
 export const ACK_FUNCTION = 'ops.record_legacy_gate_ack(text, text, text, jsonb, text, text, integer, timestamptz, boolean, text)';
@@ -98,21 +117,27 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   }
   for (const [role, group] of Object.entries(MEMBER_OF)) s.push(`grant ${group} to ${role}`);
   // 前に付けた権限を外してから付け直す (流し直しで広い権限が残らない)
-  for (const t of new Set([...MASTER_EDIT_SELECT, ...MASTER_EDIT_WRITE.map(([, t2]) => t2), 'events.master_change_events', 'ops.master_legacy_gate_acks', 'ops.master_legacy_manifests', 'ops.master_cutover_events', 'ops.master_write_sessions', 'ops.master_cutover_prereq_checks'])) {
+  for (const t of new Set([...MASTER_EDIT_SELECT, ...MASTER_EDIT_WRITE.map(([, t2]) => t2), 'events.master_change_events', 'ops.master_legacy_gate_acks', 'ops.master_legacy_manifests', 'ops.master_cutover_events',
+    'ops.master_write_sessions', 'ops.master_cutover_prereq_checks', ...REGISTER_OPS_SELECT])) {
     s.push(`revoke all on ${t} from ${all}`);
   }
-  for (const f of [CUTOVER_FUNCTION, OBSERVE_FUNCTION, ACK_FUNCTION, LOCK_SUPPLIERS_FUNCTION, BEGIN_WRITE_FUNCTION]) s.push(`revoke all on function ${f} from public, ${all}`);
+  for (const f of [CUTOVER_FUNCTION, OBSERVE_FUNCTION, ACK_FUNCTION, LOCK_SUPPLIERS_FUNCTION, BEGIN_WRITE_FUNCTION, ...REGISTER_EDIT_FUNCTIONS, ...REGISTER_OPS_FUNCTIONS, ...REGISTER_OWNER_ONLY_FUNCTIONS]) {
+    s.push(`revoke all on function ${f} from public, ${all}`);
+  }
   // master_edit
   for (const sc of ['core', 'ops', 'events']) s.push(`grant usage on schema ${sc} to master_edit`);
   for (const t of MASTER_EDIT_SELECT) s.push(`grant select on ${t} to master_edit`);
   for (const [priv, t] of MASTER_EDIT_WRITE) s.push(`grant ${priv} on ${t} to master_edit`);
   s.push(`grant execute on function ${LOCK_SUPPLIERS_FUNCTION} to master_edit`);
   s.push(`grant execute on function ${BEGIN_WRITE_FUNCTION} to master_edit`);
+  for (const f of REGISTER_EDIT_FUNCTIONS) s.push(`grant execute on function ${f} to master_edit`);
   s.push('grant usage on sequence core.master_version_seq to master_edit');   // version の既定値・0026 の bump_master_version の nextval (呼び手の権限)
   // master_ops
   s.push('grant usage on schema ops to master_ops');
   for (const t of ['ops.master_cutover_state', 'ops.master_cutover_events', 'ops.master_legacy_gate_acks', 'ops.master_legacy_manifests']) s.push(`grant select on ${t} to master_ops`);
   s.push(`grant execute on function ${CUTOVER_FUNCTION} to master_ops`);
+  for (const t of REGISTER_OPS_SELECT) s.push(`grant select on ${t} to master_ops`);
+  for (const f of REGISTER_OPS_FUNCTIONS) s.push(`grant execute on function ${f} to master_ops`);
   // master_observer
   s.push('grant usage on schema ops to master_observer');
   s.push(`grant execute on function ${OBSERVE_FUNCTION} to master_observer`);

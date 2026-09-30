@@ -182,8 +182,8 @@ await ta('[!] 0051 (14 ⑤-2a): 登録の状態は 1 行も作らない (backfil
   assert.deepEqual(views.map((v) => v.t), ['v_sku_available', 'v_sku_distributable']);
   const trg = await q("select tgname as t from pg_trigger where tgrelid in ('ops.master_registrations'::regclass, 'ops.product_hub_outbox'::regclass, 'core.skus'::regclass, 'ops.master_registration_events'::regclass, 'ops.master_cutover_state'::regclass) and not tgisinternal order by 1");
   // 登録の状態を書く関数は security definer・search_path 固定・public の実行権なし (PR #1566 R1 H2)
-  const fns = await q("select p.proname as n, p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p join pg_namespace s on s.oid = p.pronamespace where s.nspname = 'ops' and p.proname in ('create_sku_registration', 'transition_sku_registration', 'backfill_sku_registrations', 'quarantine_unregistered_skus', 'registration_backfill_plan', 'sku_registration_problem', 'master_cutover_prereq_problems') order by 1");
-  assert.equal(fns.length, 7);
+  const fns = await q("select p.proname as n, p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p join pg_namespace s on s.oid = p.pronamespace where s.nspname = 'ops' and p.proname in ('create_sku_registration', 'transition_sku_registration', 'backfill_sku_registrations', 'quarantine_unregistered_skus', 'registration_backfill_plan', 'sku_registration_problem', 'master_cutover_prereq_problems', 'claim_card_events', 'finish_card_event') order by 1");
+  assert.equal(fns.length, 9);
   for (const f of fns) { assert.equal(f.d, true, f.n); assert.match(f.c, /search_path=pg_catalog, pg_temp/, f.n); assert.equal(f.pub, false, f.n); }
   for (const t of ['trg_master_registrations_guard', 'trg_master_registrations_no_truncate', 'trg_product_hub_outbox_guard', 'trg_skus_registered', 'trg_append_only_row', 'trg_master_cutover_state_prereq']) assert.ok(trg.some((r) => r.t === t), `trigger ${t} が無い`);
   const ck = await q("select pg_get_constraintdef(oid) as d from pg_constraint where conname = 'ck_mer_operation'");

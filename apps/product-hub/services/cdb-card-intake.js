@@ -19,21 +19,26 @@
  * 🚨 Drive の画像フォルダの自動作成など外への呼び出しはしない (知らせの取り込みは何度でも流せる形にする)
  */
 import { getDB, logEvent, upsertDraftYahoo } from '../db.js';
-import { ALL_SHIPPING_METHOD_GROUPS } from '../lib/shipping-groups.js';
+import { SHIPPING_METHOD_GROUPS } from '../lib/shipping-groups.js';
 import { SET_DECISION_REASONS } from '../lib/set-decision.js';
 
 /** 取り込める payload の版 (Company DB の lib/product-hub-outbox.mjs の CARD_SCHEMA_VERSION) */
 export const CARD_SCHEMAS = Object.freeze(['ph-card-v1']);
 const ACTOR = 'auto:cdb-register';
 
-/** 送料コードの方法 → 楽天の配送方法グループ (保存した対応だけ・推し量らない) */
+/**
+ * 送料コードの方法 → 楽天の配送方法グループ (保存した対応だけ・推し量らない)。
+ * 🚨 対応先は画面で選べる配送方法 (SHIPPING_METHOD_GROUPS = 「現在使用不可」を除く) だけ。使えないグループへの対応 = 要確認 (仮レビュー L4)。
+ *    送料の表の小分類区分名称 と ph_shipping_method_map.ne_label (mirror_products.配送方法) が同じ名前か = 本番の値で数える
+ *    (apps/product-hub/scripts/shipping-map-report.mjs・読むだけ)
+ */
 export function mapCdbShipping(db, shipping) {
   const method = String(shipping?.method ?? '').trim();
   const code = shipping?.code == null ? null : String(shipping.code);
   if (!method) return { status: 'unmapped', group: null, code, method: null, label: null };
   const row = db.prepare('SELECT rakuten_group FROM ph_shipping_method_map WHERE ne_label = ?').get(method);
   const g = row && row.rakuten_group ? String(row.rakuten_group).trim() : '';
-  if (g && ALL_SHIPPING_METHOD_GROUPS[g]) return { status: 'mapped', group: g, code, method, label: ALL_SHIPPING_METHOD_GROUPS[g] };
+  if (g && SHIPPING_METHOD_GROUPS[g]) return { status: 'mapped', group: g, code, method, label: SHIPPING_METHOD_GROUPS[g] };
   return { status: 'unmapped', group: null, code, method, label: null };
 }
 
@@ -109,6 +114,8 @@ export function applyCdbCardEvent(event, { db = getDB() } = {}) {
           .run(draftId, 'hold', text, p.created_by || ACTOR);
       }
     }
+    // セットの構成品 (仮レビュー L3)。Company DB の構成の依頼と同じ並び・数量。product-hub のセットの派生 (parent_draft_id) にはしない = 工程は単品と同じ
+    if (p.kind === 'set') writeSetMembers(db, draftId, p.components);
     // 楽天の配送方法 (対応があるときだけ)
     if (ship.group) db.prepare('INSERT INTO draft_rakuten (draft_id, shipping_method_group) VALUES (?, ?)').run(draftId, ship.group);
     // Yahoo!向け追記
@@ -133,11 +140,86 @@ export function applyCdbCardEvent(event, { db = getDB() } = {}) {
   })();
 }
 
+/** セットの構成品をカードに (同じ品は 1 行・並び = 入れた順)。前からある行は消さない (INSERT OR IGNORE) */
+function writeSetMembers(db, draftId, components) {
+  const list = Array.isArray(components) ? components : [];
+  list.forEach((c, i) => {
+    const code = String(c?.code ?? '').trim().toLowerCase();
+    const qty = Number(c?.qty);
+    if (!code || !Number.isInteger(qty) || qty < 1 || qty > 999) return;
+    db.prepare('INSERT OR IGNORE INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, ?)').run(draftId, code, qty, i);
+  });
+}
+
+/**
+ * 結ぶときにカードの空の欄を画面 D の値で埋める (仮レビュー L2)。入っている欄は変えない = not_applied に (欄・カードの値・画面 D の値) を返す。
+ * 戻り値 { applied: [欄の名前], not_applied: [{ field, label, card, entered }] }
+ */
+function fillEmptyCardFields(db, id, p) {
+  const applied = []; const notApplied = [];
+  const d = db.prepare('SELECT price, official_url, asin, amazon_url FROM product_drafts WHERE id = ?').get(id);
+  const empty = (v) => v == null || String(v).trim() === '';
+  const one = (field, label, cardVal, entered, write) => {
+    if (entered == null || entered === '') return;
+    if (empty(cardVal)) { write(); applied.push(label); } else if (String(cardVal) !== String(entered)) notApplied.push({ field, label, card: cardVal, entered });
+  };
+  const price = Number.isSafeInteger(Number(p.price)) ? Number(p.price) : null;
+  for (const [col, label, val] of [['price', '売価', price], ['official_url', '公式ページ URL', p.official_url || null], ['asin', 'ASIN', p.asin || null], ['amazon_url', 'Amazon URL', p.amazon_url || null]]) {
+    one(col, label, d[col], val, () => db.prepare(`UPDATE product_drafts SET ${col} = ? WHERE id = ? AND (${col} IS NULL OR TRIM(${col}) = '')`).run(val, id));
+  }
+  // 参考 URL: 無い URL だけ足す (前からある URL は消さない・並びの後ろに)
+  const refs = Array.isArray(p.reference_urls) ? p.reference_urls.filter((u) => typeof u === 'string' && /^https?:\/\/\S+$/i.test(u)) : [];
+  const have = new Set(db.prepare('SELECT url FROM draft_reference_urls WHERE draft_id = ?').all(id).map((r) => r.url));
+  let sort = Number(db.prepare('SELECT COALESCE(MAX(sort), -1) AS s FROM draft_reference_urls WHERE draft_id = ?').get(id).s);
+  const added = refs.filter((u) => !have.has(u));
+  for (const u of added) db.prepare('INSERT INTO draft_reference_urls (draft_id, url, sort) VALUES (?, ?, ?)').run(id, u, ++sort);
+  if (added.length) applied.push(`参考 URL ${added.length} 件`);
+  // セット商品を作るか: 判断がまだ無いときだけ
+  const sd = p.set_decision;
+  if (sd && p.kind === 'single') {
+    const has = db.prepare('SELECT 1 FROM draft_set_decisions WHERE draft_id = ? LIMIT 1').get(id);
+    if (has) notApplied.push({ field: 'set_decision', label: 'セット商品を作るか', card: '判断あり', entered: sd.decision });
+    else {
+      if (sd.decision === 'none' && SET_DECISION_REASONS[sd.reason_code]) {
+        db.prepare('INSERT INTO draft_set_decisions (draft_id, decision, reason_code, reason_text, decided_by) VALUES (?, ?, ?, ?, ?)').run(id, 'none', sd.reason_code, sd.reason_text || null, p.created_by || ACTOR);
+      } else if (sd.decision === 'hold' || sd.decision === 'create') {
+        const text = sd.decision === 'create' ? `作る予定 (新商品の登録で「作る」)${sd.reason_text ? `: ${sd.reason_text}` : ''}` : (sd.reason_text || null);
+        db.prepare('INSERT INTO draft_set_decisions (draft_id, decision, reason_code, reason_text, decided_by) VALUES (?, ?, NULL, ?, ?)').run(id, 'hold', text, p.created_by || ACTOR);
+      }
+      applied.push('セット商品を作るか');
+    }
+  }
+  if (p.kind === 'set') {
+    const n = db.prepare('SELECT COUNT(*) AS c FROM draft_set_members WHERE set_draft_id = ?').get(id).c;
+    if (n === 0) { writeSetMembers(db, id, p.components); applied.push('セットの構成品'); } else notApplied.push({ field: 'set_members', label: 'セットの構成品', card: `${n} 行`, entered: (p.components || []).map((c) => `${c.code}×${c.qty}`).join(', ') });
+  }
+  // 楽天の配送方法 (対応があるとき・カードが空のとき)
+  const ship = mapCdbShipping(db, p.shipping);
+  const rk = db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(id);
+  if (ship.group) {
+    if (!rk) { db.prepare('INSERT INTO draft_rakuten (draft_id, shipping_method_group) VALUES (?, ?)').run(id, ship.group); applied.push('楽天の配送方法'); } else one('shipping_method_group', '楽天の配送方法', rk.shipping_method_group, ship.group, () => db.prepare('UPDATE draft_rakuten SET shipping_method_group = ? WHERE draft_id = ?').run(ship.group, id));
+  }
+  // Yahoo! (欄ごと・空のときだけ)
+  const y = p.yahoo;
+  if (y) {
+    const cur = db.prepare('SELECT * FROM draft_yahoo WHERE draft_id = ?').get(id) || {};
+    const patch = {};
+    for (const [col, key, label] of [['yahoo_price', 'price', 'Yahoo!売価'], ['yahoo_price_sagawa', 'price_sagawa', 'Yahoo!売価 (佐川)'], ['delivery_label', 'delivery_label', 'Yahoo!の配送方法'],
+      ['yahoo_category_id', 'category_id', 'Yahoo!カテゴリID'], ['yahoo_path', 'path', 'Yahoo!path']]) {
+      one(col, label, cur[col], y[key] ?? null, () => { patch[col] = y[key]; });
+    }
+    if (patch.delivery_label) patch.shipping_override = patch.delivery_label !== (ship.label ?? null) ? 1 : 0;
+    if (Object.keys(patch).length) upsertDraftYahoo(db, id, patch);
+  }
+  return { applied, not_applied: notApplied };
+}
+
 /**
  * 衝突を人が解く = 既存のカード (同じ商品コード) をこの Company DB の SKU に結ぶ (SQLite の 1 つの取引・PR #1566 R1 M6)。
  * 取引の中で衝突をもう一度確かめる: カードがある・商品コードが同じ・ほかの SKU に結ばれていない・この SKU がほかのカードに結ばれていない。
  * もうこの SKU に結ばれている = 何もしない (冪等・already)。確かめに落ちたら throw (Company DB の知らせは conflict のまま)。
- * カードの値 (売価・URL など) は変えない (結ぶだけ)。戻り値 { outcome: 'linked', draft_id, already }
+ * カードの空の欄は画面 D の値で埋める・入っている欄は変えない (仮レビュー L2)。
+ * 戻り値 { outcome: 'linked', draft_id, already, applied: [欄], not_applied: [{ field, label, card, entered }] }
  */
 export function linkCdbCardToExisting(event, { draftId, actor = ACTOR, db = getDB() } = {}) {
   const { skuId, code, eventId } = checkPayload(event);
@@ -156,13 +238,17 @@ export function linkCdbCardToExisting(event, { draftId, actor = ACTOR, db = getD
       if (u.changes !== 1) throw fail(`カード #${id} をちょうどほかの処理が変えました`);
       logEvent(db, id, 'cdb_card_linked', `Company DB の新商品 ${code} (SKU ${skuId}) に結んだ (人が決めた)`, actor);
     }
+    const fill = already ? { applied: [], not_applied: [] } : fillEmptyCardFields(db, id, event.payload || {});
+    if (fill.applied.length || fill.not_applied.length) {
+      logEvent(db, id, 'cdb_card_link_fields', `埋めた: ${fill.applied.join('・') || 'なし'} / 入っていたので変えなかった: ${fill.not_applied.map((x) => x.label).join('・') || 'なし'}`, actor);
+    }
     db.prepare(`
       INSERT INTO ph_cdb_card_events (event_id, cdb_sku_id, ne_code, outcome, draft_id, conflict_draft_id)
       VALUES (?, ?, ?, 'linked', ?, NULL)
       ON CONFLICT(event_id) DO UPDATE SET outcome = 'linked', draft_id = excluded.draft_id, conflict_draft_id = NULL,
         applied_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(eventId, skuId, code, id);
-    return { outcome: 'linked', draft_id: id, already };
+    return { outcome: 'linked', draft_id: id, already, applied: fill.applied, not_applied: fill.not_applied };
   })();
 }
 

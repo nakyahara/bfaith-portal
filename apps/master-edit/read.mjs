@@ -19,6 +19,8 @@ export const KINDS = Object.freeze({ single: '単品', set: 'セット', excepti
 export const MISSING = Object.freeze({ tax: '税率', sales: '売上分類', shipping: '送料', reorder: '推奨月数', cost: '原価' });
 export const STATES = Object.freeze({ available: '利用可', discontinued: '中止' });
 /** 登録の状態 (0051)。none = 状態の行が無い (切替の前の商品。backfill の後は無い = 使えない) */
+/** カードの知らせ (0051) の絞り込み (仮レビュー L6): 作成待ち (まだ・失敗)・衝突 */
+export const CARD_FILTERS = Object.freeze({ waiting: 'カード作成待ち (まだ・失敗)', conflict: 'カードの衝突' });
 export const REG_STATES = Object.freeze({
   draft: '下書き', ne_pending: 'NE登録待ち', ne_confirmed: 'NE確認済み', distributable: '配る対象', available: '登録済み (利用可)',
   quarantined: '要確認 (NEで見つけた)', cancelled: 'やめた', none: '状態なし (切替の前)',
@@ -40,6 +42,7 @@ export function normalizeFilters(q = {}) {
     state: pick(String(q.state ?? ''), STATES),
     missing: pick(String(q.missing ?? ''), MISSING),
     reg: pick(String(q.reg ?? ''), REG_STATES),
+    card: pick(String(q.card ?? ''), CARD_FILTERS),
     diff: q.diff === '1' ? '1' : '',
     offset,
   };
@@ -73,6 +76,10 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   if (f.missing === 'cost') where.push(`coalesce(c.cost_status not in ('COMPLETE', 'OVERRIDDEN'), true)`);
   const hasReg = await regclass(db, 'ops.master_registrations');
   if (f.reg && !hasReg) where.push(f.reg === 'none' ? 'true' : 'false');
+  const hasOutbox = await regclass(db, 'ops.product_hub_outbox');
+  if (f.card && !hasOutbox) where.push('false');
+  else if (f.card === 'waiting') where.push(`exists (select 1 from ops.product_hub_outbox o where o.sku_id = s.sku_id and o.status in ('pending', 'failed'))`);
+  else if (f.card === 'conflict') where.push(`exists (select 1 from ops.product_hub_outbox o where o.sku_id = s.sku_id and o.status = 'conflict')`);
   else if (f.reg === 'none') where.push('not exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id)');
   else if (f.reg) { params.push(f.reg); where.push(`exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id and mr.state = $${params.length})`); }
   const diffAvailable = await regclass(db, 'ops.master_decision_candidates');
@@ -123,7 +130,11 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   if (norms.length && await regclass(db, 'ops.ne_csv_export_rows')) for (const r of (await db.query('select distinct code_norm from ops.ne_csv_export_rows where reserved and code_norm = any($1::text[])', [norms])).rows) csvSet.add(r.code_norm);
   const pageSets = pageRows.filter((r) => r.kind === 'set').map((r) => r.sku_id);
   if (pageSets.length && await regclass(db, 'ops.sku_component_requests')) for (const r of (await db.query(`select set_sku_id::text as id from ops.sku_component_requests where status = 'open' and set_sku_id = any($1::bigint[])`, [pageSets])).rows) reqSet.add(r.id);
-  for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : [])];
+  const cardOf = new Map();
+  if (pageRows.length && hasOutbox) for (const r of (await db.query(`select sku_id::text as id, status from ops.product_hub_outbox where status <> 'done' and sku_id = any($1::bigint[])`, [pageRows.map((x) => x.sku_id)])).rows) cardOf.set(r.id, r.status);
+  const CARD_FLAG = { pending: 'カード作成待ち', failed: 'カード作成待ち (失敗)', conflict: 'カードの衝突' };
+  for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : []),
+    ...(cardOf.has(r.sku_id) ? [CARD_FLAG[cardOf.get(r.sku_id)]] : [])];
   return { rows: pageRows, total: list.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable };
 }
 
@@ -171,11 +182,13 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
   }
 }
 
-/** 新商品の登録 (画面 D) に出すもの: 切替の段階・有効な仕入先 */
+/** 新商品の登録 (画面 D) に出すもの: 切替の段階・有効な仕入先・backfill 済みか (新商品の登録の前提) */
 export async function readNewPage(db) {
   const phase = await readCutoverPhase(db);
   const activeSuppliers = (await db.query('select code, name from core.suppliers where company_id = $1 and active order by code', [COMPANY_ID])).rows;
-  return { phase, activeSuppliers };
+  const backfillDone = (await regclass(db, 'ops.master_registration_backfill'))
+    ? Number((await db.query('select count(*)::int as n from ops.master_registration_backfill')).rows[0].n) === 1 : false;
+  return { phase, activeSuppliers, backfillDone };
 }
 
 /** 構成品を足すときの引き当て (コード → 名前・種類・税率・分類・原価・取扱) */

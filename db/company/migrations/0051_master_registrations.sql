@@ -1,5 +1,7 @@
 -- 0051: 新商品の登録と登録の状態・product-hub のカードの outbox (2026-10-01。Company DB構想 14「マスタ入力画面」§9 v2 H4・§10 契約 v3 H3 / Medium 1・§11 / 10 §2。
---       PR #1566 Codex R1 = High 3 / Medium 4 の直し)
+--       PR #1566 Codex R1 = High 3 / Medium 4 の直し・仮レビュー (Codex の代わり) の直し)
+-- 🚨 前提 = ⑤-1 (feat/sor5-input・PR #1563) の 0050_master_edit.sql だけ (と 0049 までの本流)。ほかの未マージのブランチの 0050 / 0051
+--    (#1561 finance-coverage の 0051・#1562 perf の 0050) には寄らない = マージの順番で番号を付け直すときは、このファイルの中身はそのまま動かせる
 --
 -- なぜ: 新商品を Company DB で作る (画面 D = apps/master-edit/new)。作ったばかりの商品は NE にもロジザードにも無い =
 --   「業務で使ってよい商品か」を SKU ごとの状態で持ち、行が無い商品は使わない (fail-closed)。
@@ -9,7 +11,7 @@
 --        draft (下書き) → ne_pending (NE 登録待ち) → ne_confirmed (NE 確認済み) → distributable (配る対象) → available (業務で使える)
 --        + quarantined (切替の後に夜間ロードが NE で見つけた知らない商品 = 自動では使えるにしない) / cancelled (やめた)
 --      🚨 行が無い = 使えない。
---      🚨 権限の境界 (R1 H2) = 表の権限: 画面や運用のロール (master_edit / master_ops・scripts/company-db/master-register-grants.mjs) には
+--      🚨 権限の境界 (R1 H2) = 表の権限: 画面や運用のロール (master_edit / master_ops・scripts/company-db/create-master-edit-roles.mjs) には
 --         この表と履歴の INSERT / UPDATE / DELETE を渡さない。書くのは下の security definer の関数 (search_path 固定・public の実行権なし) だけ。
 --         ops.registration_protocol (GUC) は関数の中の印でしかない (持ち主のロールの手の DML を止める保険。権限の境界ではない)
 --      🚨 根拠は本物の記録で (R1 H3): ne_pending (新規登録の CSV の品目)・ne_confirmed (SKU ごとの照合の結果)・distributable / available (配る世代と
@@ -24,12 +26,14 @@
 --        - backfill の前も、表の持ち主 (夜間ロード・migration) とスーパーユーザー以外 (= 画面のロール)
 --      夜間ロードが NE から作った SKU は ops.quarantine_unregistered_skus が同じ取引で quarantined にする (engine.mjs が呼ぶ。backfill の前は何もしない)
 --   4. 切替の門 (R1 H1): new_open に進むのは、backfill がちょうど 1 回済み **かつ** 状態の行の無い SKU が 0 件のときだけ
---      (ops.master_cutover_prereq_problems。段階の行の trigger が呼ぶ。⑤-1 の set_master_cutover_phase も呼ぶようになる = 下の TODO)
+--      (0050 の差し込み口 ops.master_cutover_prereq_problems を create or replace。set_master_cutover_phase が呼ぶ + 段階の行の trigger も呼ぶ = 下の理由)
 --   5. ops.v_sku_distributable (distributable・available = 写しに載せてよい) / ops.v_sku_available (available だけ = 業務で使ってよい)。
 --      🚨 今の読み手 (core.skus を直接読む所) はまだ切り替えない (⑤-3 / ⑥)
 --   6. ops.product_hub_outbox = product-hub のカードを作る知らせ。登録と同じ取引で書く。event_id・schema_version・payload・payload_hash は変えない。
 --      消費 (apps/product-hub/services/cdb-card-intake.js) は cdb_sku_id の一意で冪等。状態 = pending → done / failed (再試行) / conflict (同じコードのカードが既にある
---      = 人が「既存のカードをこの商品に結ぶ」で done にする)
+--      = 人が「既存のカードをこの商品に結ぶ」で done にする)。
+--      🚨 状態・結果・借りを書くのは security definer の関数 (ops.claim_card_events / ops.finish_card_event = 借りた人だけが結果を書ける) だけ。画面のロールは知らせの insert と読みだけ
+--      (仮レビュー L7)
 --   7. ops.master_edit_requests.operation に 'sku_create' (新商品の登録の保存 1 回) を足す
 -- 🚨 この migration は商品の値を何も変えない (状態の行は 1 行も作らない = backfill は切替の日に人が流す)
 -- 🚨 security definer の関数 = 一時の表を使わない・search_path = pg_catalog, pg_temp (名前は全部 schema つき)・public の実行権を外す (0034 の約束)
@@ -121,9 +125,10 @@ begin
   if exists (select 1 from ops.master_registrations where sku_id = p_sku_id) then
     raise exception 'already_registered: SKU % にはもう状態の行がある', p_sku_id using errcode = '23505';
   end if;
-  -- この取引で 0026 の記録に SKU の INSERT がある (= この取引で作った SKU)
-  if not exists (select 1 from events.master_change_events e
-                  where e.entity_type = 'sku' and e.entity_id = p_sku_id and e.operation = 'INSERT' and e.xmin = pg_catalog.pg_current_xact_id()::xid) then
+  -- この取引で作った SKU か = SKU の行そのもので見る (仮レビュー M-A: 変更の記録の表は見ない = 記録を偽っても通らない)。
+  --   行の xmin がこの取引 (= この取引で入れたか直した) **かつ** created_at がこの取引の時刻 (直しただけの前からの行は created_at が古い。画面のロールは created_at を書けない)
+  if not exists (select 1 from core.skus s
+                  where s.sku_id = p_sku_id and s.xmin = pg_catalog.pg_current_xact_id()::xid and s.created_at = pg_catalog.now()) then
     raise exception 'not_new_sku: 下書きの状態は SKU を作った取引の中でだけ作る (SKU %)', p_sku_id using errcode = 'P0001';
   end if;
   perform pg_catalog.set_config('ops.registration_protocol', '1', true);
@@ -273,9 +278,8 @@ end $$;
 create constraint trigger trg_skus_registered after insert on core.skus deferrable initially deferred
   for each row execute function ops.check_sku_registered();
 
--- 4. 切替の門: new_open に進む前提 (R1 H1)。問題の一覧 (空 = 進んでよい)
---    TODO (⑤-1 R2 の後): ⑤-1 は 0050 に同じ名前・同じ形の既定の関数 (空を返す) を置き、ops.set_master_cutover_phase がこれを呼んで問題があれば断る。
---    ここの create or replace がそれを上書きする。それまで (と、その後も保険として) 段階の行の trigger (trg_master_cutover_state_prereq) が呼ぶ
+-- 4. 切替の門: new_open に進む前提 (R1 H1)。問題の一覧 (空 = 進んでよい)。0050 の差し込み口 (既定 = 空) をここで上書きする = ops.set_master_cutover_phase が呼んで断る (prereq_failed)。
+--    ⑥ の準備でほかの前提を足すときは、この関数の中身に足す (create or replace で上書きし合わない)
 create or replace function ops.master_cutover_prereq_problems(p_from text, p_to text) returns text[]
   language plpgsql stable security definer set search_path = pg_catalog, pg_temp as $$
 declare
@@ -297,6 +301,10 @@ begin
 end $$;
 revoke all on function ops.master_cutover_prereq_problems(text, text) from public;
 
+-- 保険の trigger (段階の行が変わるときにも同じ前提を見る)。残す理由:
+--   ① ops.set_master_cutover_phase は後の migration (⑤-3・⑥) でも create or replace される = 差し込み口を呼び忘れた版が入っても new_open に進めない
+--   ② 持ち主のロールが印 (ops.cutover_protocol) を立てて段階の行を直接変えても、前提は外せない
+--   (復元は trigger を止めて入れる = 影響しない。段階の関数の中では差し込み口と同じ答え = 二重に断るだけで、通るものは変わらない)
 create function ops.guard_master_cutover_prereq() returns trigger
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
@@ -368,13 +376,60 @@ create trigger trg_product_hub_outbox_guard before update or delete on ops.produ
 create trigger trg_product_hub_outbox_no_truncate before truncate on ops.product_hub_outbox
   for each statement execute function core.reject_mutation();
 
+-- 取り込む知らせを借りる (lease)。p_mode = auto (まだ・失敗で回数の上限の前) / manual (人が押した = 失敗・衝突も) / link (衝突だけ = 既存のカードに結ぶ)。
+-- 借りた行を返す (for update skip locked = 同時に 2 つは借りない・借りの期限の前はほかが取らない)。試した回数を 1 増やす
+create function ops.claim_card_events(p_owner text, p_mode text, p_event_id uuid default null, p_sku_id bigint default null, p_limit integer default 20,
+                                      p_lease_seconds integer default 120, p_max_auto integer default 5)
+  returns table (event_id uuid, sku_id bigint, schema_version text, payload jsonb, payload_hash text, attempts integer, status text, result jsonb)
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+begin
+  if p_owner is null or p_owner !~ '^[A-Za-z0-9_.:-]{1,100}$' then raise exception 'invalid_input: 借りる人 (owner) の形が違う' using errcode = '22023'; end if;
+  if p_mode is null or p_mode not in ('auto', 'manual', 'link') then raise exception 'invalid_input: mode は auto / manual / link' using errcode = '22023'; end if;
+  return query
+  with c as (
+    select o.event_id from ops.product_hub_outbox o
+     where (case p_mode when 'auto' then o.status = 'pending' or (o.status = 'failed' and o.attempts < greatest(1, p_max_auto))
+                        when 'manual' then o.status in ('pending', 'failed', 'conflict')
+                        else o.status = 'conflict' end)
+       and (o.leased_until is null or o.leased_until < pg_catalog.now())
+       and (p_event_id is null or o.event_id = p_event_id) and (p_sku_id is null or o.sku_id = p_sku_id)
+     order by o.created_at, o.event_id limit greatest(1, least(200, coalesce(p_limit, 20))) for update skip locked)
+  update ops.product_hub_outbox o set lease_owner = p_owner, leased_until = pg_catalog.now() + pg_catalog.make_interval(secs => greatest(10, least(3600, coalesce(p_lease_seconds, 120)))),
+         attempts = o.attempts + 1, updated_at = pg_catalog.now()
+    from c where o.event_id = c.event_id
+  returning o.event_id, o.sku_id, o.schema_version, o.payload, o.payload_hash, o.attempts, o.status, o.result;
+end $$;
+revoke all on function ops.claim_card_events(text, text, uuid, bigint, integer, integer, integer) from public;
+
+-- 借りた知らせの結果を書く (借りた人だけ・済んだ知らせは変えない)。p_status = done / failed / conflict。書けたら true (借りが切れてほかが取った = false)
+create function ops.finish_card_event(p_event_id uuid, p_owner text, p_status text, p_result jsonb, p_error text) returns boolean
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_n integer;
+begin
+  if p_status is null or p_status not in ('done', 'failed', 'conflict') then raise exception 'invalid_input: status は done / failed / conflict' using errcode = '22023'; end if;
+  if p_result is not null and jsonb_typeof(p_result) <> 'object' then raise exception 'invalid_input: result は object' using errcode = '22023'; end if;
+  update ops.product_hub_outbox set status = p_status, result = p_result, last_error = left(p_error, 2000),
+         done_at = case when p_status = 'done' then pg_catalog.now() end, lease_owner = null, leased_until = null, updated_at = pg_catalog.now()
+   where event_id = p_event_id and lease_owner = p_owner and status <> 'done';
+  get diagnostics v_n = row_count;
+  return v_n = 1;
+end $$;
+revoke all on function ops.finish_card_event(uuid, text, text, jsonb, text) from public;
+
+-- 見張り・毎朝のまとめ用 (仮レビュー L6): カード作成待ち (まだ・失敗・衝突) の数と、いちばん古い知らせの時刻
+create view ops.v_product_hub_outbox_open as
+  select o.status, count(*)::int as n, min(o.created_at) as oldest_at, max(o.attempts) as max_attempts
+    from ops.product_hub_outbox o where o.status <> 'done' group by o.status;
+comment on view ops.v_product_hub_outbox_open is 'product-hub のカード作成待ち (0051)。done 以外の知らせの状態ごとの数 (見張り・毎朝のまとめ)';
+
 -- 7. 保存の記録に新商品の登録
 alter table ops.master_edit_requests drop constraint master_edit_requests_operation_check;
 alter table ops.master_edit_requests add constraint ck_mer_operation check (operation in ('sku_edit', 'sku_create'));
 
--- 見張りは読むだけ。画面・運用のロールの権限は scripts/company-db/master-register-grants.mjs (ロールを作る手の操作で流す)
+-- 見張りは読むだけ。画面・運用のロールの権限は scripts/company-db/create-master-edit-roles.mjs (⑤-1 のロールを作る手の操作。migration の後に流し直す)
 do $$ begin
   if exists (select 1 from pg_roles where rolname = 'watcher') then
-    execute 'grant select on ops.master_registrations, ops.master_registration_events, ops.master_registration_backfill, ops.product_hub_outbox, ops.v_sku_distributable, ops.v_sku_available to watcher';
+    execute 'grant select on ops.master_registrations, ops.master_registration_events, ops.master_registration_backfill, ops.product_hub_outbox, ops.v_sku_distributable, ops.v_sku_available, ops.v_product_hub_outbox_open to watcher';
   end if;
 end $$;

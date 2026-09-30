@@ -29,7 +29,7 @@
   <div class="me-wrap">
     <p class="sub"><a href="<%= base %>/">← 一覧へ</a> ・ <a href="<%= base %>/manual">📖 つかいかた</a></p>
     <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
-    <% if (page && entryClosed) { %><div class="band warn">切替前です (段階: <%= phaseText %>): 新商品はまだ NE・product-hub で登録します。この画面は見るだけです (登録を押しても「切替前」で断られ、何も変わりません)。</div><% } %>
+    <% if (page && entryClosed) { %><div class="band warn">切替前です (<%= entryWhy || ('段階: ' + phaseText) %>): 新商品はまだ NE・product-hub で登録します。この画面は見るだけです (登録を押しても「切替前」で断られ、何も変わりません)。</div><% } %>
     <% if (!canEdit) { %><div class="band info"><%= gateMessage %></div><% } %>
     <% if (page && !shippingRates) { %><div class="band err">送料の表が読めないので、発送方法を選べません (登録できません)。</div><% } %>
 
@@ -130,8 +130,9 @@
       </div>
 
       <div class="sec"><h3>Yahoo!向け追記</h3>
-        <div class="fl"><label class="k">Yahoo!売価</label><input type="text" id="y-price" size="10"<%= dis %>> 円
-          <label class="k" style="min-width: auto;">Yahoo!売価 (佐川)</label><input type="text" id="y-price-sagawa" size="10"<%= dis %>> 円</div>
+        <div class="fl"><label class="k">Yahoo!売価</label><input type="text" id="y-price" size="10" inputmode="numeric"<%= dis %>> 円
+          <label class="k" style="min-width: auto;">Yahoo!売価 (佐川)</label><input type="text" id="y-price-sagawa" size="10" inputmode="numeric"<%= dis %>> 円
+          <span class="sub">1 円以上 (決めていなければ空のまま・0 は入れない)</span></div>
         <div class="fl"><label class="k">配送方法</label><select id="y-delivery"<%= dis %>>
           <option value="">(楽天と同じ)</option>
           <% for (const d of yahooDeliveries) { %><option value="<%= d %>"><%= d %></option><% } %>
@@ -282,6 +283,9 @@
   const saveBtn = $('save');
   if (saveBtn && canSave) saveBtn.addEventListener('click', async () => {
     const body = collect();
+    // Yahoo!売価の 0 はサーバーと同じく断る (空 = 入れない)
+    const zero = ['y-price', 'y-price-sagawa'].filter((id) => /^[0０]+$/.test(val(id)));
+    if (zero.length) { setMsg('Yahoo!売価は 1 円以上で入れてください (決めていなければ空のまま)', 'err'); return; }
     saveBtn.disabled = true; setMsg('登録しています…'); $('result').innerHTML = '';
     let r, j;
     try {

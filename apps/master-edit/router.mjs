@@ -35,7 +35,7 @@ import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFE
 import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
-import { listSkus, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES } from './read.mjs';
+import { listSkus, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS } from './read.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -197,7 +197,7 @@ router.get('/', (req, res) => {
     const filters = normalizeFilters(req.query);
     const data = db ? await listSkus(db, filters, { now: new Date(clock()) }) : { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false };
     const phase = db ? await readCutoverPhase(db) : null;
-    res.render(view('index.ejs'), { ...pageLocals(req, phase), dbError, data, filters, KINDS, MISSING, STATES, REG_STATES, fmt });
+    res.render(view('index.ejs'), { ...pageLocals(req, phase), dbError, data, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, fmt });
   });
 });
 router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), MAX_COMPONENTS }));
@@ -211,8 +211,12 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
   const own = ownershipNow();
   res.render(view('new.ejs'), {
     ...locals, dbError, kind, page, fmt, KINDS_NEW, MAX_COMPONENTS, MAX_REFERENCE_URLS,
-    // 登録を開いているか = 段階 new_open・MASTER_EDIT_OPEN・この種類で書く列の持ち主が全部 company (lib/master-register.mjs と同じ)
-    entryClosed: !newEntryWritable(page ? page.phase : null) || !isOpen() || NEW_ENTRY_KEYS[kind].some((k) => own[k] !== 'company'),
+    // 登録を開いているか = 段階 new_open・持ち主表のハッシュが段階の記録と同じ・MASTER_EDIT_OPEN・この種類で書く列の持ち主が全部 company・
+    //   書き込み用の接続 (画面だけのロール)・backfill 済み (lib/master-register.mjs と同じ)
+    entryClosed: !newEntryWritable(page ? page.phase : null, own) || !isOpen() || NEW_ENTRY_KEYS[kind].some((k) => own[k] !== 'company') || !writeConfigured() || !(page && page.backfillDone),
+    entryWhy: locals.closedWhy
+      || (NEW_ENTRY_KEYS[kind].some((k) => own[k] !== 'company') ? `${KINDS_NEW[kind]}で書く項目の持ち主がまだ NE・/register` : '')
+      || (!(page && page.backfillDone) ? '切替の手順の「既存の商品の登録の状態 (backfill)」がまだ' : ''),
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
     yahooDeliveries: Object.values(SHIPPING_METHOD_GROUPS), setPlanChoices: SET_PLAN_CHOICES, setDecisionReasons: SET_DECISION_REASONS,
   });
@@ -263,7 +267,7 @@ router.post('/api/new', (req, res) => {
       if (t) card = { ...card, status: t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null };
     }
     res.json({ ...r, card, card_label: card ? CARD_STATUS_LABELS[card.status] || card.status : null });
-  });
+  }, 'write');
 });
 
 router.post('/api/sku/:code/card-retry', (req, res) => {
@@ -275,7 +279,7 @@ router.post('/api/sku/:code/card-retry', (req, res) => {
     const t = await tryCard(db, { skuId: sku.id, manual: true });
     if (!t) return res.status(409).json({ ok: false, error: 'もう一度試せる知らせがありません (作成済み・カードを作らない登録・ほかの処理が取り込み中)', reason: 'nothing_to_retry' });
     res.json({ ok: t.status === 'done', status: t.status, label: CARD_STATUS_LABELS[t.status] || t.status, error: t.error ?? null, draft_id: t.result?.draft_id ?? null });
-  });
+  }, 'write');
 });
 
 router.post('/api/sku/:code/card-link', (req, res) => {
@@ -284,18 +288,21 @@ router.post('/api/sku/:code/card-link', (req, res) => {
   return withPgApi(res, async (db) => {
     const sku = (await db.query('select sku_id::text as id from core.skus where company_id = 1 and code_norm = core.norm_code($1)', [String(req.params.code || '')])).rows[0];
     if (!sku) return res.status(404).json({ ok: false, error: `商品コード ${req.params.code} は Company DB にありません` });
+    const expected = req.body?.draft_id;
+    if (expected == null || !/^\d{1,12}$/.test(String(expected))) return res.status(400).json({ ok: false, error: '結ぶカードの番号 (draft_id) が要る。画面を開き直してください', reason: 'invalid_input' });
     let r;
     try {
-      r = await linkCardToExisting(db, linkCard, { skuId: sku.id, actor: String(req.session.email).trim().toLowerCase() });
+      r = await linkCardToExisting(db, linkCard, { skuId: sku.id, actor: String(req.session.email).trim().toLowerCase(), expectedDraftId: String(expected) });
     } catch (e) {
       if (e && e.code === 'CDB_CARD_INVALID') return res.status(409).json({ ok: false, error: `結べませんでした: ${e.message}`, reason: 'link_refused' });
       throw e;
     }
-    if (r.ok) return res.json({ ok: true, draft_id: r.draft_id, already: !!r.already, label: CARD_STATUS_LABELS.done });
+    if (r.ok) return res.json({ ok: true, draft_id: r.draft_id, already: !!r.already, label: CARD_STATUS_LABELS.done, applied: r.applied || [], not_applied: r.not_applied || [] });
     const msg = { no_event: 'この商品にはカードの知らせがありません', not_conflict: '衝突の知らせではありません (「カードをもう一度作る」を使ってください)', leased: 'ほかの処理がちょうど取り込み中です。少し待ってからもう一度',
-      already_done: 'カードはもう作ってあります', hash_mismatch: '知らせの中身が壊れています' }[r.reason] || r.reason;
-    res.status(409).json({ ok: false, error: msg, reason: r.reason });
-  });
+      already_done: 'カードはもう作ってあります', hash_mismatch: '知らせの中身が壊れています',
+      draft_mismatch: `衝突しているカードが画面を開いたときと違います (今は #${r.draft_id})。何も結んでいません。画面を開き直してください` }[r.reason] || r.reason;
+    res.status(409).json({ ok: false, error: msg, reason: r.reason, draft_id: r.draft_id ?? null });
+  }, 'write');
 });
 
 router.post('/api/sku/:code', (req, res) => {
