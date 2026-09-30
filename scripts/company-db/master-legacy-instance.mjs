@@ -9,6 +9,8 @@
  *   node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list                  # 24 時間以内に記録があるプロセスと、最後の記録・新しいか・止めたか
  *   node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --stop --host minipc --instance <名札> --reason "再起動で消えた" --yes
  *     書くのは、その場所の門のログイン (COMPANY_DB_MASTER_GATE_RENDER_URL / _MINIPC_URL) = ⑤-1 の関数が場所と役が同じかを確かめる
+ *     🚨 15 分以内に記録があるプロセス (= 動いているかもしれない) は拒む。本当に止まったのを確かめたときだけ --force (中間レビュー 2 回目 Low)
+ *        動いているプロセスを「止めた」にすると、段階を進める門がそのプロセス (古い版かもしれない) を見落とす
  * 見る接続先: COMPANY_DB_MASTER_OPS_URL (運用のロール) → COMPANY_DB_WATCH_URL (照会用)。
  * 🚨 定期実行にしない (人が止まったのを確かめてから)。--yes が無ければ書かない。終了コード 0 = 成功 / 1 = 失敗 / 2 = 引数
  */
@@ -24,12 +26,30 @@ export async function listInstances(client, { hours = 24 } = {}) {
       order by host, instance_id, acked_at desc, ack_id desc`, [hours])).rows;
 }
 
-export async function markStopped({ host, instance, reason, env = process.env, connect = null }) {
+/** そのプロセスの最後の記録 (無ければ null)。見る接続先は --list と同じ */
+async function latestAckOf({ host, instance, env }) {
+  const url = String(env.COMPANY_DB_MASTER_OPS_URL || '').trim() || String(env.COMPANY_DB_WATCH_URL || '').trim();
+  if (!url) throw Object.assign(new Error('15 分以内の記録が無いかを確かめる接続先 (COMPANY_DB_MASTER_OPS_URL か COMPANY_DB_WATCH_URL) が無い (確かめずに書くなら --force)'), { code: 1 });
+  const c = await openPgClient(url, { application_name: 'master-legacy-instance' });
+  try {
+    return (await c.query(`select acked_at::text as acked_at, stopped,
+        acked_at >= clock_timestamp() - make_interval(mins => ops.master_cutover_ack_fresh_minutes()) as fresh
+      from ops.master_legacy_gate_acks where host = $1 and instance_id = $2 order by acked_at desc, ack_id desc limit 1`, [host, instance])).rows[0] || null;
+  } finally { await c.end(); }
+}
+
+export async function markStopped({ host, instance, reason, env = process.env, connect = null, force = false, latest = latestAckOf }) {
   if (!['render', 'minipc'].includes(host)) throw Object.assign(new Error('--host は render か minipc'), { code: 2 });
   if (!instance || !/^[A-Za-z0-9_.:-]{1,100}$/.test(instance)) throw Object.assign(new Error('--instance (名札: 英数字と _.:- で 100 字まで) が要る'), { code: 2 });
   if (!reason || !String(reason).trim()) throw Object.assign(new Error('--reason (なぜ止まったと言えるか) が要る'), { code: 2 });
   if (String(reason).trim().length > 200) throw Object.assign(new Error('--reason は 200 字まで (0050 の約束)'), { code: 2 });
   if (!connect && !gateUrlFor(host, env)) throw Object.assign(new Error(`${GATE_URL_ENV[host]} が無い (その場所の門のログインで書く)`), { code: 1 });
+  if (!force) {
+    const last = await latest({ host, instance, env });
+    if (last && last.fresh && !last.stopped) {
+      throw Object.assign(new Error(`${host}/${instance} は 15 分以内 (${last.acked_at}) に記録がある = 動いているかもしれない。止まったのを確かめたなら --force`), { code: 1 });
+    }
+  }
   return ackLegacyGates({ host, env, connect, stopped: true, stoppedReason: String(reason), instance });
 }
 
@@ -52,7 +72,7 @@ if (isMain) {
     } else if (args.includes('--stop')) {
       if (!args.includes('--yes')) { console.log('--yes が無いので書かない (確かめてから --yes を付ける)'); }
       else {
-        const r = await markStopped({ host: getArg('--host'), instance: getArg('--instance'), reason: getArg('--reason') });
+        const r = await markStopped({ host: getArg('--host'), instance: getArg('--instance'), reason: getArg('--reason'), force: args.includes('--force') });
         console.log(`${r.state}: ${r.detail}`);
         process.exitCode = r.state === 'stopped' ? 0 : 1;
       }

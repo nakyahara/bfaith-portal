@@ -4,15 +4,17 @@
  *   段階を読めて legacy_open (切替前)   → { mode: 'legacy' } = 今までどおり draft_yahoo.tax_rate (buildItemPayload がそのまま読む)
  *   段階を読めて frozen 以降            → Company DB の税率 (代表コードは構成の SKU から)。決められない = { mode: 'blocked' } = 出品を止める
  *   🚨 段階を読めない                   → { mode: 'blocked' } = 出品を止める (切替前の瞬断で Company DB の税率に黙って切り替えない・古い値でも送らない)
+ *      プレビュー (preview: true = 楽天に送らない) だけは { mode: 'legacy', warning } = 今の値で見せて注意を添える (中間レビュー 2 回目 Low)
  * 段階は毎回読む (lib/master-legacy-gate.mjs の書き込みと同じ読み方。前の値は使わない)
  */
 import { checkLegacyGate } from '../../../lib/master-legacy-gate.mjs';
 import { resolveCdbDraftTax } from './cdb-tax-rate.mjs';
 
-export async function resolveListingTax(db, draft, { gate = checkLegacyGate } = {}) {
+export async function resolveListingTax(db, draft, { gate = checkLegacyGate, preview = false } = {}) {
   let g;
   try { g = await gate({ purpose: 'write' }); } catch (e) { g = { writable: false, readable: false, error: String((e && e.message) || e) }; }
   if (!g || g.readable !== true) {
+    if (preview) return { mode: 'legacy', warning: '切替の段階を読めないので、今の税率 (draft_yahoo) で見せています。登録はできません (少し待ってもう一度)' };
     return { mode: 'blocked', reason: `切替の段階を読めないので出品を止めています (少し待ってもう一度)${g && g.error ? `: ${g.error}` : ''}` };
   }
   if (g.writable === true) return { mode: 'legacy' };

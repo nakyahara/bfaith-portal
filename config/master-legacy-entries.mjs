@@ -81,15 +81,17 @@ export const LEGACY_ENTRIES = Object.freeze([
     file: 'apps/product-hub/router.js', mount: '/apps/product-hub', method, path: p, writes: ['draft_yahoo.tax_rate'], owner_cols: ['skus.tax_rate'], ref: '10 §4 #6',
   })),
   // Notion の取込 (Notion の税率を draft_yahoo.tax_rate に書く) = 閉じる (R1 H4)
-  ...[['POST', '/api/notion-import'], ['POST', '/api/notion-import-by-status']].map(([method, p]) => R({
+  // dry_run = 書かない試し (プレビュー) の見分け方。段階を読めないときだけ、試しは注意つきで通す (閉じた後は 410。中間レビュー 2 回目 Low)
+  //   'body_true' = 本文の dry_run が true のときだけ試し / 'body_not_false' = 本文の dry_run が false でなければ試し (既定が試し)
+  ...[['POST', '/api/notion-import'], ['POST', '/api/notion-import-by-status', 'body_not_false']].map(([method, p, dryRun]) => R({
     id: `product-hub:${method}:${p}`, app: 'product-hub', host: 'render', file: 'apps/product-hub/router.js', mount: '/apps/product-hub', method, path: p,
-    writes: ['draft_yahoo.tax_rate'], owner_cols: ['skus.tax_rate'], ref: '10 §4 #6 (PR #1565 R1 H4)',
+    ...(dryRun ? { dry_run: dryRun } : {}), writes: ['draft_yahoo.tax_rate'], owner_cols: ['skus.tax_rate'], ref: '10 §4 #6 (PR #1565 R1 H4)',
   })),
   // 古い新商品の作り方 (人が下書きを作る /new・NE のコードから一括登録・NE が先の自動取込を手で回す) = 閉じる。
   // 新商品は新しい登録の画面から Company DB 経由でだけ作る (10 §4 #11・Codex ⑤-2a M5)。税率 (NE の初期値) も書くので R1 H4 の対象でもある
-  ...[['POST', '/api/drafts'], ['POST', '/api/register-codes'], ['POST', '/api/intake/run'], ['POST', '/api/notion-image-import']].map(([method, p]) => R({
+  ...[['POST', '/api/drafts'], ['POST', '/api/register-codes', 'body_true'], ['POST', '/api/intake/run', 'body_true'], ['POST', '/api/notion-image-import', 'body_not_false']].map(([method, p, dryRun]) => R({
     id: `product-hub:${method}:${p}`, app: 'product-hub', host: 'render', file: 'apps/product-hub/router.js', mount: '/apps/product-hub', method, path: p,
-    writes: ['product_drafts (新商品)', 'draft_yahoo.tax_rate'], owner_cols: ['skus.tax_rate'], ref: '10 §4 #11 (Codex ⑤-2a M5)・#6 (PR #1565 R1 H4)',
+    ...(dryRun ? { dry_run: dryRun } : {}), writes: ['product_drafts (新商品)', 'draft_yahoo.tax_rate'], owner_cols: ['skus.tax_rate'], ref: '10 §4 #11 (Codex ⑤-2a M5)・#6 (PR #1565 R1 H4)',
   })),
   // セットを作る (企画中のセット・仮コード) = 作るのは通す、親の税率だけ写さない (R1 H4)
   Object.freeze({

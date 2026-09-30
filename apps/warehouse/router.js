@@ -25,7 +25,7 @@ import { mountSkuMasterApi } from './sku-master-api.js';
 import { isRender } from '../../lib/is-render.js';
 import { importSkuMasterCSV } from './import-sku-master.js';
 import { resolveTaxRate, resolveSetTaxRate, resolveSetSalesClass, KNOWN_DECIMAL_RATES } from './rebuild-m-products.js';
-import { masterLegacyGate, legacyRecheck, legacyBannerHtml, legacyGateStatus } from '../../lib/master-legacy-gate.mjs';
+import { masterLegacyGate, legacyRecheck, legacyBannerHtml, legacyGateStatus, legacyAckHost } from '../../lib/master-legacy-gate.mjs';
 
 const router = Router();
 const upload = multer({ dest: 'data/import/' });
@@ -109,7 +109,7 @@ function preparedQuery(sql, params = []) {
 // (段階・書けるか・持ち主表と入口の一覧の指紋)。読むだけ
 router.get('/api/master-legacy-gate', async (req, res) => {
   try {
-    res.json(await legacyGateStatus({ host: isRender() ? 'render' : 'minipc' }));
+    res.json(await legacyGateStatus({ host: legacyAckHost() }));   // server.js の門の記録と同じ判定 (手元の PC = null = 記録を書かない)
   } catch (e) {
     res.status(500).json({ error: '門の状態を読めませんでした', detail: String(e && e.message) });
   }

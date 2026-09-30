@@ -4,7 +4,7 @@
  * (PR #1565 中間レビュー Medium-5: 0050 の前にマージする・env が無い = 古い入口が全部閉じる、を先に気づく)
  *
  * 見るもの:
- *   1. env: 段階を読む接続先 (COMPANY_DB_MASTER_GATE_RENDER_URL / _MINIPC_URL → COMPANY_DB_WATCH_URL → COMPANY_DB_URL) と、この場所の門のログイン
+ *   1. env: 段階を読む接続先 (COMPANY_DB_MASTER_GATE_RENDER_URL / _MINIPC_URL → COMPANY_DB_URL。見張りの watcher は使わない) と、この場所の門のログイン
  *   2. 段階を読める = 0050 が本適用済み・select の権限がある (読めないと古い入口は全部 503)
  *   3. 門のログイン: ログインの役が master_gate_<場所>・記録の関数 (ops.record_legacy_gate_ack) の実行権がある・一覧 (manifest) を DB が受け取れる形
  *   4. build の番号が分かる (Render = RENDER_GIT_COMMIT・miniPC = git の HEAD)
@@ -27,7 +27,7 @@ export async function checkReadiness({ host, env = process.env, open = (url) => 
   const ng = (m) => { lines.push(`  ✗ ${m}`); problems.push(m); };
   // 1. env
   const phaseUrl = phaseUrlFrom(env);
-  if (phaseUrl) ok('段階を読む接続先がある'); else ng(`段階を読む接続先が無い (${GATE_URL_ENV.render} / ${GATE_URL_ENV.minipc} / COMPANY_DB_WATCH_URL / COMPANY_DB_URL のどれか)`);
+  if (phaseUrl) ok('段階を読む接続先がある'); else ng(`段階を読む接続先が無い (${GATE_URL_ENV.render} / ${GATE_URL_ENV.minipc} / COMPANY_DB_URL のどれか。見張りの COMPANY_DB_WATCH_URL は使わない)`);
   const gateUrl = gateUrlFor(host, env);
   if (gateUrl) ok(`この場所の門のログインがある (${GATE_URL_ENV[host]})`); else ng(`この場所の門のログインが無い (${GATE_URL_ENV[host]} = master_gate_${host})`);
   // 2. 段階を読める

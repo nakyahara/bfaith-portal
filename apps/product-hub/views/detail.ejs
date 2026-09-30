@@ -289,7 +289,7 @@ th.attr-unknown { color: #dc2626; }
     <details class="hdr-help" style="margin:0 0 6px;">
       <summary>送られる値・項目の場所</summary>
       <p>
-        <% const mlFrozenTax = typeof masterLegacy !== 'undefined' && masterLegacy && masterLegacy.frozen; %>税率 (<%= mlFrozenTax ? ('Company DB の税率 = ' + ((typeof cdbTax !== 'undefined' && cdbTax && cdbTax.ok) ? cdbTax.label : '決まっていない = 出品は止まります')) : (yahoo?.tax_rate || '未設定 = 店舗デフォルト10%') %>) と カタログID (JAN<%= (variation && variation.kind === 'variation' && variation.memberCount > 1) ? ' — SKU表の値をSKUごとに' : ': ' + (draft.jan_code || '未入力') %>) は基本情報タブの値を自動で送ります。
+        <% const phTaxMode = (typeof taxMode !== 'undefined' && taxMode) || 'legacy'; %>税率 (<%= phTaxMode === 'cdb' ? ('Company DB の税率 = ' + ((typeof cdbTax !== 'undefined' && cdbTax && cdbTax.ok) ? cdbTax.label : '決まっていない = 出品は止まります')) : phTaxMode === 'readonly' ? ((yahoo?.tax_rate || '未設定') + '。切替の段階を読めないので、いまは出品できません (少し待ってもう一度)') : (yahoo?.tax_rate || '未設定 = 店舗デフォルト10%') %>) と カタログID (JAN<%= (variation && variation.kind === 'variation' && variation.memberCount > 1) ? ' — SKU表の値をSKUごとに' : ': ' + (draft.jan_code || '未入力') %>) は基本情報タブの値を自動で送ります。
         在庫は常に 0 で登録します。<br>
         配送方法・売価は「基本情報」タブ、ジャンル・店舗内カテゴリ・商品属性は「カテゴリ・属性」タブにあります。
         </p>
@@ -860,7 +860,13 @@ th.attr-unknown { color: #dc2626; }
         </div>
         <div style="flex:1">
           <!-- 税率は基本情報 (2026-08-06 中原さん指示: Yahoo!欄から移動)。楽天・Yahoo!両方の登録で使う -->
-          <% if (typeof masterLegacy !== 'undefined' && masterLegacy && masterLegacy.frozen) { %>
+          <% const phTaxModeB = (typeof taxMode !== 'undefined' && taxMode) || 'legacy'; %>
+          <% if (phTaxModeB === 'readonly') { %>
+          <%# 段階を読めない (中間レビュー 2 回目 M-B): 今の値を見るだけ。手入力の欄 (id="y-tax") は出さない = 税率を送らない (ほかの欄の保存は通る) %>
+          <label>税率 <span class="muted">(見るだけ)</span></label>
+          <input type="text" id="y-tax-view" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="未設定" readonly disabled>
+          <div class="muted" style="font-size:12px;">切替の段階を読めないので、いまは税率を変えられません (少し待って開き直す)</div>
+          <% } else if (phTaxModeB === 'cdb') { %>
           <%# 切替で古い入口を閉じた後 (Company DB構想 10 §4 #6): 手入力の欄 (id="y-tax") は出さない = 保存でも即保存でも税率を送らない。Company DB の税率を見せるだけ %>
           <% const cdbTaxView = (typeof cdbTax !== 'undefined' && cdbTax) ? cdbTax : { ok: false, reason: '読めません' }; %>
           <label>税率 <span class="muted">(Company DB の税率・見るだけ)</span></label>
@@ -3622,6 +3628,7 @@ th.attr-unknown { color: #dc2626; }
       if (!(await saveRakutenFields())) return;
       const basicSnap = phKeep ? phKeep.saving(['basic']) : null;   // 送る値を控えてから送る (Codex R1)
       doneSending = phSending(basicSnap ? basicSnap.map((s) => [s.f.id, s.v]) : []);
+      const sentTax = (() => { const el = document.getElementById('y-tax'); return el && el.value !== el.defaultValue ? el.value : undefined; })();   // 税率は変えたときだけ送る (欄の元の値と比べる・欄が無い = 送らない)
       const json = await post(BASE, {
         name: document.getElementById('f-name').value,
         official_url: document.getElementById('f-official-url').value,
@@ -3639,10 +3646,11 @@ th.attr-unknown { color: #dc2626; }
         // drive_folder_url は画像タブの取込に一本化 (未送信 = サーバーは既存値を保持)
         // 税率は変えたときだけ送る (変えていない保存は門を読まない = Company DB が止まっても名前・売価・メモは保存できる)。
         // 欄が無い (切替で閉じた後) = 送らない (undefined は JSON に載らない)
-        tax_rate: (() => { const el = document.getElementById('y-tax'); return el && el.value !== el.defaultValue ? el.value : undefined; })(),
+        tax_rate: sentTax,
         memo: document.getElementById('f-memo').value,
       });
       sendSettled = true;
+      if (json && json.ok && sentTax !== undefined) { const taxEl = document.getElementById('y-tax'); if (taxEl) taxEl.defaultValue = sentTax; }   // 保存できたら送った税率を元の値に (読み直すまでの次の保存で送り直さない)
       if (json.ok && phKeep) phKeep.saved(basicSnap);
       reloading = !!json.ok;
       showAndReload(json, '保存しました');
@@ -4801,12 +4809,14 @@ th.attr-unknown { color: #dc2626; }
     const json = await res.json();
     const pre = document.getElementById('rk-preview');
     pre.style.display = 'block';
+    // 注意 (例: 切替の段階を読めない = 今の税率で見せている) は先頭に出す
+    const warn = (json.warnings || []).length ? '⚠️ ' + json.warnings.join('\n⚠️ ') + '\n\n' : '';
     if (!json.ok) {
-      pre.textContent = 'まだ送信できません:\n' + (json.reasons || []).map((r) => '・' + r).join('\n');
+      pre.textContent = warn + 'まだ送信できません:\n' + (json.reasons || []).map((r) => '・' + r).join('\n');
       return;
     }
     const cats = json.shopCategories || [];
-    pre.textContent = '商品管理番号: ' + json.manageNumber
+    pre.textContent = warn + '商品管理番号: ' + json.manageNumber
       + (cats.length ? '\n店舗内カテゴリ (登録時にアプリが自動で棚に反映 — この payload とは別API): ' + cats.join(' ／ ') : '')
       + '\n\n' + JSON.stringify(json.payload, null, 2);
   });
@@ -5615,6 +5625,7 @@ th.attr-unknown { color: #dc2626; }
     const doneSending = phSending(snap ? snap.map((s) => [s.f.id, s.v]) : []);
     let json;
     let sendSettled = false;
+    const sentTax = (() => { const el = document.getElementById('y-tax'); return el && el.value !== el.defaultValue ? el.value : undefined; })();   // 税率は変えたときだけ送る (欄の元の値と比べる・欄が無い = 送らない)
     try {
       json = await post(BASE + '/yahoo', {
         yahoo_price: document.getElementById('y-price').value,
@@ -5622,11 +5633,12 @@ th.attr-unknown { color: #dc2626; }
         delivery_label: document.getElementById('y-delivery').value,
         // 楽天項目より先に保存しても「別扱い」が落ちないよう、こちらでも現在値を送る
         shipping_override: yahooOverrideOn ? 1 : 0,
-        tax_rate: (() => { const el = document.getElementById('y-tax'); return el && el.value !== el.defaultValue ? el.value : undefined; })(),   // 変えたときだけ送る・切替で閉じた後は欄が無い = 送らない
+        tax_rate: sentTax,   // 変えたときだけ送る・切替で閉じた後は欄が無い = 送らない
         yahoo_category_id: document.getElementById('y-category-id').value,
         yahoo_path: document.getElementById('y-path').value,
       });
       sendSettled = true;
+      if (json && json.ok && sentTax !== undefined) { const taxEl = document.getElementById('y-tax'); if (taxEl) taxEl.defaultValue = sentTax; }   // 保存できたら送った税率を元の値に (読み直すまでの次の保存で送り直さない)
     } finally { if (sendSettled) doneSending(); }
     if (json.ok && phKeep) phKeep.saved(snap);
     showAndReload(json, 'Yahoo!項目を保存しました');

@@ -67,8 +67,7 @@ import { startNotifyOutbox as startFbaBoxNotifyOutbox } from './apps/fba-box/not
 import staffRouter from './apps/staff/router.js';
 import masterDecisionsRouter from './apps/master-decisions/router.mjs';
 import masterEditRouter from './apps/master-edit/router.mjs';
-import { legacyAckHeartbeat, maybeRefreshLegacyAck, legacyAckState, ackLegacyGatesStopped } from './lib/master-legacy-gate.mjs';
-import { isRender as isRenderHost } from './lib/is-render.js';
+import { legacyAckHeartbeat, maybeRefreshLegacyAck, legacyAckState, ackLegacyGatesStopped, legacyAckHost, markPreviousInstanceStopped } from './lib/master-legacy-gate.mjs';
 import { startInboundCheckCron, startInboundCheckPrintQueueWorker } from './apps/inbound-check/sync-job.js';
 // 🆕 新商品のパッケージ裏面ラベル写真を Drive へ送るキュー (プロセス内2分間隔の再試行)
 import { startBackLabelWorker } from './apps/inbound-check/back-label.js';
@@ -127,7 +126,7 @@ const app = express();
 // それ以外 (手元の PC) は書かない。起動のとき (下の listen) と、要求が来たついでに 5 分おきに書き直す (死活の確かめの要求でも回る。新しい定期実行は作らない)。
 // 中身 = build の番号・manifest_hash・持ち主表のハッシュ・見た段階・書きかけの件数。書く前に確かめる (段階を読める・build の番号・書く接続先・関数)。
 // だめなら書かずに理由をログと読み戻し (/apps/warehouse/api/master-legacy-gate) に出す
-const LEGACY_ACK_HOST = isRenderHost() ? 'render' : (String(process.env.PORTAL_VARIANT || 'render').toLowerCase() === 'warehouse' ? 'minipc' : null);
+const LEGACY_ACK_HOST = legacyAckHost();   // 読み戻しの API (apps/warehouse/router.js) と同じ判定
 if (LEGACY_ACK_HOST) app.use(legacyAckHeartbeat(LEGACY_ACK_HOST));
 const SQLiteStore = connectSqlite3(session);
 
@@ -1196,6 +1195,9 @@ app.listen(PORT, () => {
   if (LEGACY_ACK_HOST) {
     Promise.resolve(maybeRefreshLegacyAck({ host: LEGACY_ACK_HOST, force: true }))
       .then(() => { const a = legacyAckState(); console.log(`[master-legacy-gate] ack ${LEGACY_ACK_HOST}: ${a.state}${a.detail ? ` (${a.detail})` : ''}`); })
+      // miniPC だけ: 前の起動のプロセスが「止めた」を書かずに消えていたら書く (前の pid がまだある = 書かない)
+      .then(() => (LEGACY_ACK_HOST === 'minipc' ? markPreviousInstanceStopped({ host: LEGACY_ACK_HOST }) : null))
+      .then((p) => { if (p) console.log(`[master-legacy-gate] 前の起動: ${p.state} (${p.detail})`); })
       .catch((e) => console.warn('[master-legacy-gate] ack の誤り:', e && e.message));
   }
 

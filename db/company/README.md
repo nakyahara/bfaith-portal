@@ -732,48 +732,62 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 
 **試験**: `scripts/test-lz-nightly.mjs` (毎晩の本番の miniPC 側) / `scripts/test-lz-cutover-check.mjs` (切替・戻しの確かめ・本物のポータルの状態の機械・戻しの版の sha256 と tag) / `scripts/test-lz-daily.mjs` [1]〜[12] (ロジザードの一覧の見出しは実ファイルの 1 行目のバイト。[11][12] = 成果物をポータルへ送る・入口)・`scripts/test-retry-rerun.mjs` (照合が直ったら作り直す)
 
-### マスタの古い入口の門 (⑤-3。Company DB構想 14 §5・§9 v2 M2・§10 契約 v3 H1・PR #1565 Codex R1・中間レビュー)
+### マスタの古い入口の門 (⑤-3。Company DB構想 14 §5・§9 v2 M2・§10 契約 v3 H1・PR #1565 Codex R1・中間レビュー 2 回)
 
 古い入口 = NE の写しにマスタを書く API・画面・手の CLI・人の操作で動く取込 (miniPC の `/apps/warehouse/register` と SKU マスタ・会計アプリ 5 つの `POST /register`・fba-profitability の原価・product-hub の税率と古い新商品の作り方 (`/new`・NE のコードから登録・NE が先の自動取込・Notion の画像の取込)・Notion の取込・profit-calculator の NE 用 CSV と仕入れ先・発注アプリの仕入先・売れ筋共有の表示名・手の取込)。
 
-- **一覧 = `config/master-legacy-entries.mjs`** (閉じる入口・閉じない口 (写し・閉じ済み・手の入口の 3 種類)・CLI の mode)。一覧がそのまま門の設定。id は英数字と `_.:/-` だけ (⑤-1 の manifest の形)。
+- **一覧 = `config/master-legacy-entries.mjs`** (閉じる入口・閉じない口 (写し・閉じ済み・手の入口の 3 種類)・CLI の mode・書かない試しの見分け方 `dry_run`)。一覧がそのまま門の設定。id は英数字と `_.:/-` だけ (⑤-1 の manifest の形)。
 - **門 = `lib/master-legacy-gate.mjs`**。切替の段階 (`ops.master_cutover_state`・0050) を**読めて** `legacy_open` のときだけ今までどおり書ける。
   - `frozen` 以降は、持ち主表 (`config/master-ownership.mjs`) がまだ `load` でも閉じる (持ち主の切替より先に古い入口を閉じる順番のため)。
   - API = 410 `{error:'master_frozen', message, url}`。段階が読めない = 503 `{error:'master_phase_unreadable'}` (閉じる側)。何も書かない。画面は `message` を出す (`master_frozen` の文字は出さない)。
+  - 書かない試し (NE のコードから登録・自動取込を手で回す・Notion の画像の取込・Notion の状態から取込 の dry run) は、段階を読めないときだけ注意つきで通す (応答の見出し `X-Master-Legacy-Warning: phase_unreadable`)。閉じた後は 410 のまま。
   - 門で待っている間に相手が切れた (画面を閉じた) = 書かない (書きかけにも数えない)。
   - 画面 = 帯「マスタは新しい画面で直します ↗」+ 書く部品を隠す。
-  - product-hub: 税率の手入力は閉じたら 410 (税率を**変えたときだけ**送る = 名前・売価・メモの保存は Company DB が止まっていても通る)。詳細画面・利益の試算・楽天の出品 (プレビュー・登録) は Company DB の税率だけ (代表コードは構成の SKU から)。混ざる・無い・読めない = 出品を止める・試算は「税率が決まっていません」(0% で計算しない)。🚨 段階を読めない = 出品を止める (切替前の瞬断で Company DB の税率に黙って切り替えない)。セットを作る: 段階を読めない = 503 (作らない)・読めて閉じている = 作るが親の税率は写さない・legacy_open = 今までどおり。
+  - product-hub の税率:
+    - 手入力は閉じたら 410。画面は税率を**変えたときだけ**送る (保存できたら送った値を「元の値」にする) = 名前・売価・メモの保存は Company DB が止まっていても通る。
+    - 詳細画面: 切替前 = 今までどおり / 段階を読めて閉じている = Company DB の税率を見せるだけ (代表コードは構成の SKU から。混ざる・無い・読めない = 決められない・試算は「税率が決まっていません」= 0% で計算しない) / **段階を読めない = 今の値を見るだけ** (Company DB を読みに行かない・「出品は止まります」と言わない)。
+    - 楽天の登録: 段階を読めない = 止める (切替前の瞬断で Company DB の税率に黙って切り替えない)・閉じた後に Company DB の税率を決められない = 止める。プレビュー (送らない) は、段階を読めないとき今の税率で見せて注意を添える。
+    - AI の生成の材料 (`/generation-queue`・claim) は、切替前だけ `yahoo.tax_rate` を渡す (閉じた後・段階を読めない = null)。
+    - セットを作る: 段階を読めない = 503 (作らない)・読めて閉じている = 作るが親の税率は写さない・legacy_open = 今までどおり。
   - 発注アプリは仕入先 (`kind = suppliers` の追加・削除・CSV・宛先の CSV) と一括取込 (`POST /api/import` = 中に仕入先があるので**丸ごと**) を閉じる = 切替の手順で書き込み先を Company DB に替えるまで仕入先は見るだけ。発注条件・資材・先方品番の画面は止めない。
-  - CLI = mode が分かったらすぐ (引数・ファイルの検査より前・DB を開く前) に終了コード 3。書く間は段階の**共有の鍵** (`pg_advisory_lock_shared(hashtext('ops.master_cutover'))`) を持ち、鍵を取ってから段階を読み直す = 段階を変える側 (排他の鍵) は CLI が書き終わるまで待つ・変えている最中に始めた CLI は待ってから読む。csv-import.js は `product_shipping`・`exception_genka` だけ閉じる (受注・ロジザード・NE の写し・送料の表は止めない)。
+  - CLI = mode が分かったらすぐ (引数・ファイルの検査より前・DB を開く前) に終了コード 3。書く間は段階の**共有の鍵** (`pg_advisory_lock_shared(hashtext('ops.master_cutover'))`) を持ち、鍵を取ってから段階を読み直す = 段階を変える側 (排他の鍵) は CLI が書き終わるまで待つ・変えている最中に始めた CLI は待ってから読む。csv-import.js は `product_shipping`・`exception_genka` だけ閉じる (受注・ロジザード・NE の写し・送料の表は止めない)。CLI が書くのは miniPC の warehouse.db だけ = ⑤-1 の夜間ロードの鍵 (`core.master_write_lock_key`) は取らない。
   - 定期実行: product-hub の NE が先の自動取込 (intake-cron) は丸ごと止める (閉じている = ok の ping で「止めた」・読めない = fail の ping)。
 - **段階の読み方**:
-  - 接続先 = この場所の門のログイン (下) → 無ければ `COMPANY_DB_WATCH_URL` (見張りの照会用 watcher) → `COMPANY_DB_URL`。
-  - 🚨 書き込み・CLI は**毎回**読む。前に読めた値は使わない。途切れにはプロセスごとに接続 **1 本**のプール (使わなければ 10 秒で閉じる = 見張り・照合の接続と食い合わない) と 1 回の読み直し (200ms 後)。読めない = 503 / 終了コード 3。
-  - 画面の帯だけ 30 秒前の結果を使う。古ければ同時の画面で 1 回の読みを分け合い、1 秒で諦める (読み直さない・表示だけ)。
-  - 読めなかった回数・断った回数 (410・503)・切れた相手・画面の打ち切り・読むのにかかった時間は読み戻しに出す。1 秒を超えた読みと読めなかった回はログに出す。
+  - 接続先 = この場所の門のログイン (下) → 無ければ `COMPANY_DB_URL` (Render)。🚨 見張りの `COMPANY_DB_WATCH_URL` (watcher・接続 3 本まで) には落ちない = miniPC は門のログインが無いと古い入口が全部 503。
+  - 🚨 書き込み・CLI は**毎回**読む。前に読めた値は使わない。プロセスごとに接続 **1 本**のプールを 10 分つないだままにする (miniPC → Render はつなぎ直すと TLS と認証で 0.5〜0.8 秒) と 1 回の読み直し (200ms 後)。読めない = 503 / 終了コード 3。
+  - 画面の帯だけ前の結果を使う (読めた = 30 秒・読めない = 5 秒)。古ければ同時の画面で 1 回の読みを分け合い、1 秒待つ (読み直さない・表示だけ)。1 秒で返らない = その画面だけ 5 分前までの読めた結果を見せる (無ければ読めない扱い)。打ち切りは使い回さず、遅れて返った結果を使い回しに入れる。
+  - 読めなかった回数・断った回数 (410・503)・切れた相手・画面の打ち切り・書かない試しを通した回数・読むのにかかった時間は読み戻しに出す。1 秒を超えた読みと読めなかった回はログに出す。
+  - 読む時間を測る (読むだけ): `node -r dotenv/config scripts/company-db/master-legacy-latency.mjs --host minipc` = つなぎ直し + 読む / つないだまま読む の p50・p95・いちばん遅い。
 - **drain (書きかけを流し終える)**: 門を通った書き込みは、終わるまでプロセスの中で数える (件数・いちばん古い開始)。CSV の取込は受け取った後・書く前にもう一度段階を読む (受け取っている間に frozen になっても書かない・受け取ったファイルも消す)。
 - **門の記録 (ack) = ⑤-1 の `ops.record_legacy_gate_ack` (`lib/master-cutover.mjs` の `recordLegacyGateAck`)**:
   - 書くのは**場所ごとの門のログイン** (⑤-1 の `master_gate` の中の LOGIN ロール。関数は `session_user` と場所が違えば拒む):
     - Render = `COMPANY_DB_MASTER_GATE_RENDER_URL` (`master_gate_render`)
     - miniPC = `COMPANY_DB_MASTER_GATE_MINIPC_URL` (`master_gate_minipc`)
-    - 🚨 ほかの場所のログインは使わない (miniPC は Render の URL があっても書かない)。
-  - いつ: 起動のとき・要求が来たついでに 5 分おき (新しい定期実行は作らない)・読み戻しを呼んだとき・止めるとき (SIGTERM / SIGINT = 「止めた」と理由 (200 字まで)・書きかけ 0・長くても 2 秒で諦めて止まる。返事の stopped も確かめる)。ログインと場所が違う = DB が `gate_host_mismatch` (42501) で拒む (env の取り違え)。
+    - 🚨 ほかの場所のログインは使わない (miniPC は Render の URL があっても書かない)。ログインと場所が違う = DB が `gate_host_mismatch` (42501) で拒む (env の取り違え)。
+    - 場所の判定は server.js と読み戻しの API で同じ (`legacyAckHost()` = Render / miniPC の WarehouseServer (`PORTAL_VARIANT=warehouse`) / それ以外 = 書かない)。
+  - いつ: 起動のとき・要求が来たついでに 5 分おき (新しい定期実行は作らない)・読み戻しを呼んだとき・止めるとき (SIGTERM / SIGINT = 「止めた」と理由 (200 字まで)・書きかけ 0・長くても 2 秒で諦めて止まる。返事の stopped も確かめる)。
+  - miniPC の WarehouseServer は WinSW のサービス (止めるときは Ctrl+C = Node の SIGINT のはずだが、届いたか・2 秒で書けたかは分からない) → **次の起動で、前の起動のプロセスが居なければ「止めた」を書く** (名札は `DATA_DIR/master-legacy-instance.json`)。前の pid がまだある (使い回しを含む)・別の PC = 書かない (安全側)。Render は止めるとき SIGTERM を送り待つので使わない。
   - 中身: host・プロセスの名札 (`RENDER_INSTANCE_ID` か PC 名 + pid + 起動の乱数)・build の番号 (Render = `RENDER_GIT_COMMIT`・miniPC = git の HEAD)・一覧 (manifest `{ entries: [{ id, kind: code | manual }] }`・ハッシュは DB が計算)・持ち主表・見た段階・書きかけの件数といちばん古い開始。
-  - 書く前に確かめる (場所・build の番号・段階を読める・門のログインがある・関数がある)。書いた後に返事 (`ack_id`・DB が同じ一覧から計算した `manifest_hash`・`acked_at`) を確かめてから `acked`。だめなら書かずに理由をログ (同じ理由は 1 回) と読み戻しに出す (関数が無い = 0050 の前 = 注意 1 回)。書く間に段階が変わった (`stale_phase`) = 読み直して 1 回だけ書き直す。
-  - 止まり方が分からないプロセス (落ちた・電源・2 秒で書けなかった) = ⑤-1 の段階を進める関数は「24 時間以内に記録があり、最後の記録が 15 分より前で『止めた』でもない」プロセスがあると進めない → 人が止まったのを確かめて `node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list` / `--stop --host minipc --instance <名札> --reason "…" --yes` (手の操作・定期実行にしない)。
-- **読み戻し**: `GET /apps/warehouse/api/master-legacy-gate` (miniPC と Render の両方にある) = その環境・そのプロセスが見ている段階・書けるか・manifest_hash (最後に DB が受け取った一覧)・一覧の数・持ち主表のハッシュ・build の番号・名札・書きかけ (`inflight.count`・`oldest_started_at`)・数・門の記録 (呼ぶと記録も書き直す)。
-- 🚨 **マージ・配る前に** (PR の本文のチェックリスト):
+  - 書く前に確かめる (場所・build の番号・段階を読める・門のログインがある・関数がある)。書いた後に返事 (`ack_id`・DB が同じ一覧から計算した `manifest_hash`・`acked_at`・`stopped`) を確かめてから `acked`。だめなら書かずに理由をログ (同じ理由は 1 回) と読み戻しに出す (関数が無い = 0050 の前 = 注意 1 回)。書く間に段階が変わった (`stale_phase`) = 読み直して 1 回だけ書き直す。
+  - 止まり方が分からないプロセス (落ちた・電源・2 秒で書けなかった) = ⑤-1 の段階を進める関数は「24 時間以内に記録があり、最後の記録が 15 分より前で『止めた』でもない」プロセスがあると進めない → 人が止まったのを確かめて `node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list` / `--stop --host minipc --instance <名札> --reason "…" --yes` (手の操作・定期実行にしない)。🚨 15 分以内に記録があるプロセスは `--force` が無いと拒む (動いているかもしれない)。
+- **読み戻し**: `GET /apps/warehouse/api/master-legacy-gate` (miniPC と Render の両方にある) = その環境・**その 1 つのプロセス**が見ている段階・書けるか・manifest_hash (最後に DB が受け取った一覧)・一覧の数・持ち主表のハッシュ・build の番号・名札・書きかけ (`inflight.count`・`oldest_started_at`)・数・門の記録 (呼ぶと記録も書き直す)。全部のプロセスは `master-legacy-instance.mjs --list` で見る。
+- 🚨 **マージの前に** (PR の本文のチェックリスト。miniPC の PowerShell 5.1 で。まだ流さない → 中原さんの OK の後):
   1. 0050 (⑤-1) が本番に本適用済み (表が無い = 読めない = 古い入口が全部 503 で閉じる)。
-  2. ⑤-1 の `create-master-edit-roles.mjs` を流し、出た `COMPANY_DB_MASTER_GATE_RENDER_URL` (Render の env) / `COMPANY_DB_MASTER_GATE_MINIPC_URL` (miniPC の .env) を入れた (miniPC は WarehouseServer を再起動)。パスワードが出るのはロールを初めて作ったときだけ。もうあって接続文字列が分からない = `--rotate-password master_gate_render` (または `master_gate_minipc`) で変えて、その場所の env を同じ日に書き換える。
-  3. `node -r dotenv/config scripts/company-db/master-legacy-readiness.mjs --host minipc` と Render の Shell で `--host render` が終了コード 0 (読むだけ・何も書かない)。
-  4. 配った後: 両方の読み戻しで `ack.state = acked`・`writable: true` (legacy_open)・同じ manifest_hash と build の番号。
-- **切替の手順 (legacy_open → frozen → 最後の同期)**:
-  1. 全部の環境に門を配る → 上の 4 を確かめる。
+  2. ⑤-1 の `create-master-edit-roles.mjs` を流し、出た `COMPANY_DB_MASTER_GATE_RENDER_URL` を Render の env に、`COMPANY_DB_MASTER_GATE_MINIPC_URL` を miniPC の .env に入れた (miniPC は `Restart-Service WarehouseServer`)。パスワードが出るのはロールを初めて作ったときだけ。もうあって接続文字列が分からない = `--rotate-password master_gate_render` (または `master_gate_minipc`) で変えて、その場所の env を同じ日に書き換える。
+  3. **このブランチの miniPC の worktree** で配る前の確かめ (読むだけ・何も書かない。Render の Shell にはマージ前はこのスクリプトが無い):
+     - miniPC: `node -r dotenv/config scripts/company-db/master-legacy-readiness.mjs --host minipc` が終了コード 0。
+     - Render: Render の門のログインをこの 1 回だけ渡す: `$env:COMPANY_DB_MASTER_GATE_RENDER_URL = '<Render の門のログイン>'; node -r dotenv/config scripts/company-db/master-legacy-readiness.mjs --host render; Remove-Item Env:COMPANY_DB_MASTER_GATE_RENDER_URL` が終了コード 0 (役 = master_gate_render・関数の実行権・一覧の形)。
+     - 読む時間: `node -r dotenv/config scripts/company-db/master-legacy-latency.mjs --host minipc` の p95 を PR に残す (つなぎ直しの p95 が 1 秒を超える = 起動の直後などは画面が 5 分前の結果か帯になる。書き込みは待つので止まらない)。
+  4. マージして配った後: `node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list` で、Render と miniPC の**全部のプロセス**が「新しい」・段階 `legacy_open`・書きかけ 0・build = 配った commit。配る前の古いプロセスは「止めた」(または 24 時間より前)。黙っている古いプロセスが残る = 止まったのを確かめて `--stop` (再起動の後は毎回見る)。
+  5. **戻し方**: 配った後に古い入口が 503 のまま・門の記録が書けない = このマージを revert する PR → Render は自動で配り直し・miniPC は `git pull` → `Restart-Service WarehouseServer`。DB は何も変えていない (段階は legacy_open のまま・門の記録は追記だけで残っても害が無い)。🚨 **段階を frozen に進めた後は revert しない** (門の無いコードに戻る = 古い入口が開く)。
+- **切替の手順 (legacy_open → frozen → 最後の同期。⑤-1 の関数の求めに合わせる)**:
+  1. 上の 4 がそろっている (全部のプロセスが新しい記録・同じ build と一覧)。
   2. NE の画面・GAS など機械で閉じられない入口 (manifest の `kind: manual` = `ne:item-screen`・`gas:logizard-sheet-and-sku-map`) を止め、止めた人と時刻を証拠 (`manual_entries_stopped`) に書く。
-  3. 段階を `frozen` に進める (⑤-1 の関数が、全部の場所・全部のプロセスの新しい門の記録と証拠を確かめる)。
-  4. 🚨 **全部の環境の読み戻しで `writable: false`・`inflight.count` が 0 になるまで待つ** (⑤-1 は frozen 以降、段階が始まった後の記録で書きかけ 0 を求める)。miniPC で手の取込 (csv-import ほか) が動いていないことも目で確かめる (CLI は別のプロセス = 読み戻しに出ない。書いている間は共有の鍵を持つので、段階を変える側が待つ)。
-  5. そこで初めて最後の同期 (NE → Company DB) に進む。書きかけ 0 を確かめた人・時刻・各環境の読み戻しを切替の証跡 (`drain`) に残す。
-- 試験: `scripts/test-master-legacy-entries.mjs` (ルートと関数の呼び出しをたどって、一覧に無いマスタの書き込みの口を落とす) / `scripts/test-master-legacy-gate.mjs` (入口ごとに legacy_open・閉じた・読めない・途中で閉じた・切れた相手・CLI・PGlite の本物の記録の関数) / `scripts/test-master-legacy-gate-pg.mjs` (実 PostgreSQL = プール 1 本・毎回読む・切断・打ち切り・CLI の共有の鍵・場所ごとのログインで本物の記録・止めた・配る前の確かめ。`cd C:/tmp/pg-embed && node run-conc.mjs scripts/test-master-legacy-gate-pg.mjs <リポジトリ>`)。
+  3. miniPC で手の取込 (csv-import ほか) が動いていないのを確かめ、`--list` の書きかけが全部 0 = 証拠の `drain` (`{ done: true, checked_by, checked_at }`。**frozen に進めるときに要る**) を書いて、段階を `frozen` に進める (⑤-1 の関数が、全部の場所・全部のプロセスの新しい記録・build・一覧・持ち主表・黙っているプロセスが無いこと・証拠を確かめる)。
+  4. 🚨 **frozen の後の本当の drain**: `--list` で全部のプロセスに**段階 `frozen` の新しい記録**が来て、書きかけが 0 になるまで待つ (記録は要求のついでに 5 分おき。読み戻しを呼べばすぐ書く)。⑤-1 の関数は frozen → company_owner のときに「frozen に入った後の記録・書きかけ 0」を求める。CLI は書いている間は共有の鍵を持つので、段階を変える側が待つ (段階をまたいで書かない)。
+  5. そこで初めて最後の同期 (NE → Company DB) に進み、company_owner に進める。
+- 書き込みの猶予 (legacy_open を最後に読めてから 60 秒などは書かせる) は**入れていない** (約束を変えるので中原さんが決める。案と良し悪しは PR の本文)。
+- 試験: `scripts/test-master-legacy-entries.mjs` (ルートと関数の呼び出しをたどって、一覧に無いマスタの書き込みの口を落とす) / `scripts/test-master-legacy-gate.mjs` (入口ごとに legacy_open・閉じた・読めない・途中で閉じた・切れた相手・書かない試し・CLI・画面の遅い読み・PGlite の本物の記録の関数・前の起動) / `scripts/test-master-legacy-gate-pg.mjs` (実 PostgreSQL = 門のログインのプール 1 本・毎回読む・切断・打ち切り・CLI の共有の鍵・場所ごとのログインで本物の記録・止めた・--force・配る前の確かめ・frozen に進める・読む時間。`cd C:/tmp/pg-embed && node run-conc.mjs scripts/test-master-legacy-gate-pg.mjs <リポジトリ>`)。
 
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 

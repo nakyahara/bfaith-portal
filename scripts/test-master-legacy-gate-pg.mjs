@@ -3,7 +3,7 @@
  *   (PGlite は TCP の接続・プール・文の打ち切り・接続の切断・ログインの役を試せない。PR #1565 Codex R1 H1・M6 / 中間レビューの試験)
  *
  * 固定する契約:
- *   1 照会用のロール watcher (select だけ) で、本物の読み方 (プール) が段階を読める。legacy_open = 書ける
+ *   1 門のログイン (master_gate_minipc) で、本物の読み方 (プール) が段階を読める。watcher の env があっても使わない (接続 3 本までを食わない)。legacy_open = 書ける
  *   2 段階を frozen にした直後の書き込みは閉じる (前に読めた legacy_open を使わない = 毎回読む)
  *   3 同時に 20 件来ても、この門の接続は 1 本 (プールは 1 本・見張り・照合の watcher の接続と食い合わない)
  *   4 DB 側から門の接続を切られても、次の読みはつなぎ直して読める (途切れで止まり続けない)
@@ -20,6 +20,7 @@
  *  13 env の取り違え (miniPC の env に Render のログイン) = ⑤-1 の関数が gate_host_mismatch で拒む・何も書かない
  *  14 ⑤-3 の記録で ⑤-1 の段階の関数が frozen に進める。黙っているプロセス (24 時間以内に記録・最後が 15 分より前・止めたでもない) があれば拒む
  *     → scripts/company-db/master-legacy-instance.mjs で「止めた」を書けば進める
+ *  15 読む時間を測る (scripts/company-db/master-legacy-latency.mjs・読むだけ)
  * ロールは ⑤-1 の本物の作り (scripts/company-db/create-master-edit-roles.mjs) だけで作る (試験で足さない)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-legacy-gate-pg.mjs
  *   (cd C:/tmp/pg-embed && node run-conc.mjs scripts/test-master-legacy-gate-pg.mjs C:/tmp/sor53-work)
@@ -67,14 +68,18 @@ try {
   // 試験は門のログインのパスワードだけ決めて渡す (ほかのロールは作りに任せる)
   await createMasterEditRoles(M, { pw: Object.fromEntries(Object.values(GATE_LOGIN_ROLES).map((r) => [r, `${r}-pw`])) });
   const gateUrl = (h) => urlFor(u.toString(), `master_gate_${h}`, `master_gate_${h}-pw`);
-  process.env.COMPANY_DB_WATCH_URL = urlFor(u.toString(), 'watcher', 'w-pw');
+  process.env.COMPANY_DB_WATCH_URL = urlFor(u.toString(), 'watcher', 'w-pw');   // --stop の確かめ (見るだけ) に使う。門の段階の読みには使わない
+  process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = gateUrl('minipc');
   G.__setLegacyPhaseReader(null);   // 本物の読み方 (プール)
 
-  await ta('[1] 照会用のロール watcher と本物の読み方 (プール) で段階を読める。legacy_open = 書ける', async () => {
+  await ta('[1] 門のログイン (master_gate_minipc) と本物の読み方 (プール) で段階を読める。watcher の env があっても使わない。legacy_open = 書ける', async () => {
     const s = await G.checkLegacyGate();
     assert.deepEqual([s.readable, s.phase, s.writable, s.source], [true, 'legacy_open', true, 'db'], s.error);
     const who = (await M.query(`select usename from pg_stat_activity where datname = $1 and application_name = 'master-legacy-gate'`, [dbName])).rows.map((r) => r.usename);
-    assert.ok(who.length >= 1 && who.every((x) => x === 'watcher'), JSON.stringify(who));
+    assert.ok(who.length >= 1 && who.every((x) => x === 'master_gate_minipc'), JSON.stringify(who));
+    // 門の env が無い = COMPANY_DB_URL だけ (watcher には落ちない)
+    assert.equal(G.phaseUrlFrom({ COMPANY_DB_WATCH_URL: 'postgres://w@x/y' }), null);
+    assert.equal(G.phaseUrlFrom({ COMPANY_DB_WATCH_URL: 'postgres://w@x/y', COMPANY_DB_URL: 'postgres://o@x/y' }), 'postgres://o@x/y');
   });
   await ta('[2] frozen にした直後の書き込みは閉じる (前に読めた legacy_open を使わない)', async () => {
     assert.equal((await G.checkLegacyGate()).writable, true);
@@ -162,7 +167,6 @@ try {
   });
 
   // ─── 門の記録 (場所ごとの門のログイン・⑤-1 の本物の関数) ───
-  process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = gateUrl('minipc');
   await G.closeLegacyGatePool();
   await sleep(300);   // 閉じた接続が pg_stat_activity から消えるまで
   const env = { ...process.env, RENDER_GIT_COMMIT: 'b'.repeat(40), RENDER_INSTANCE_ID: 'pg-test' };
@@ -207,6 +211,14 @@ try {
     const rows = await listInstances(M, { hours: 24 });
     assert.ok(rows.some((x) => x.instance_id === 'ghost-pc:999:deadbeef' && x.host === 'minipc' && x.stopped === true && x.stopped_reason === '電源が切れて戻らない (試験)'), JSON.stringify(rows));
     await assert.rejects(() => markStopped({ host: 'render', instance: 'x:1:2', reason: '試験', env: { ...env, COMPANY_DB_MASTER_GATE_RENDER_URL: '' } }), /COMPANY_DB_MASTER_GATE_RENDER_URL/);
+    // 15 分以内に記録があるプロセス (= 動いているかもしれない) は --force なしでは「止めた」にしない (見る接続 = watcher)
+    G.__resetLegacyAck();
+    const live = await G.ackLegacyGates({ host: 'minipc', env, instance: null });
+    assert.equal(live.state, 'acked');
+    const liveId = (await M.query('select instance_id from ops.master_legacy_gate_acks where ack_id = $1', [live.ack_id])).rows[0].instance_id;
+    const before = await ackCount();
+    await assert.rejects(() => markStopped({ host: 'minipc', instance: liveId, reason: '試験', env }), /15 分以内/);
+    assert.equal(await ackCount(), before, '書かない');
   });
   await ta('[11] 配る前の確かめ: そろっていれば ok・場所と役が違えば「足りない」・build が分からなければ「足りない」(何も書かない)', async () => {
     const { checkReadiness } = await import('./company-db/master-legacy-readiness.mjs');
@@ -217,6 +229,7 @@ try {
     assert.equal(r.ok, false); assert.ok(r.problems.some((x) => /master_gate_minipc/.test(x) && /期待 master_gate_render/.test(x)), r.lines.join('\n'));
     r = await checkReadiness({ host: 'minipc', env: { COMPANY_DB_WATCH_URL: process.env.COMPANY_DB_WATCH_URL } });
     assert.equal(r.ok, false); assert.ok(r.problems.some((x) => /COMPANY_DB_MASTER_GATE_MINIPC_URL/.test(x)));
+    assert.ok(r.problems.some((x) => /段階を読む接続先が無い/.test(x)), 'watcher だけでは段階を読まない');
     assert.equal(await ackCount(), before, '確かめは書かない');
   });
   await ta('[12] 門のログインの接続は、同時に 20 件の読み + 記録を書いても 2 本まで (プール 1 本 + 記録 1 本)', async () => {
@@ -265,6 +278,16 @@ try {
     assert.ok(r.acks.some((a) => a.instance_id === 'old-pc:1:aaaaaaaa' && a.stopped === true), JSON.stringify(r.acks));
     assert.ok(r.acks.some((a) => a.host === 'render' && !a.stopped) && r.acks.some((a) => a.host === 'minipc' && !a.stopped));
     assert.equal((await G.checkLegacyGate()).writable, false, '進めた直後から古い入口は閉じる');
+  });
+  await ta('[15] 読む時間を測る (master-legacy-latency.mjs・読むだけ): つなぎ直し + 読む / つないだまま読む の p50・p95・いちばん遅い', async () => {
+    const { measureLatency } = await import('./company-db/master-legacy-latency.mjs');
+    const before = await ackCount();
+    const r = await measureLatency({ url: gateUrl('minipc'), n: 3, gapMs: 0 });
+    assert.deepEqual(r.errors, []);
+    assert.equal(r.role, 'master_gate_minipc'); assert.equal(r.phase, 'frozen');
+    assert.equal(r.cold.total.n, 3); assert.equal(r.warm.n, 3);
+    assert.ok(r.cold.total.p95 >= r.cold.connect.p50 && r.warm.max >= 0);
+    assert.equal(await ackCount(), before, '書かない');
   });
 } finally {
   G.__setLegacyPhaseReader(null);

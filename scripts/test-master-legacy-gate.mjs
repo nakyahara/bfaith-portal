@@ -73,7 +73,7 @@ await t('🚨 R1 H1: 直前に legacy_open を読めても、次に読めなけ�
   const s = await quiet(() => G.checkLegacyGate());
   assert.deepEqual([s.writable, s.readable, s.source], [false, false, 'unreadable']);
 });
-await t('書き込みは毎回読む (同時でも別々に読む)・画面だけ 30 秒前の結果 (読めない結果も) を使う', async () => {
+await t('書き込みは毎回読む (同時でも別々に読む)・画面だけ前の結果を使う (読めた = 30 秒・読めない = 5 秒)', async () => {
   let calls = 0, now = Date.parse('2026-10-01T01:00:00Z');
   G.__setLegacyClock(() => now);
   G.__setLegacyPhaseReader(async () => { calls++; return { readable: true, phase: 'legacy_open' }; });
@@ -91,7 +91,7 @@ await t('M6: 本物の読み方 = 接続先が無い → すぐ閉じる / つ�
   const before = G.legacyGateStats();
   let s = await quiet(() => G.checkLegacyGate());
   assert.equal(s.writable, false); assert.match(s.error, /接続先が無い/);
-  process.env.COMPANY_DB_WATCH_URL = 'postgres://gate-test@127.0.0.1:1/none';
+  process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = 'postgres://gate-test@127.0.0.1:1/none';
   try {
     s = await quiet(() => G.checkLegacyGate());
     assert.equal(s.writable, false); assert.equal(s.readable, false);
@@ -99,13 +99,13 @@ await t('M6: 本物の読み方 = 接続先が無い → すぐ閉じる / つ�
     assert.ok(after.retries >= before.retries + 1, '読み直した');
     assert.ok(after.reads_failed >= before.reads_failed + 2);
     assert.ok(after.last_latency_ms != null);
-  } finally { delete process.env.COMPANY_DB_WATCH_URL; await G.closeLegacyGatePool(); }
+  } finally { delete process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL; await G.closeLegacyGatePool(); }
 });
 await t('M6: 返事の無い Company DB (接続の打ち切り 3 秒) = 待ちすぎずに閉じる (再試行込みで 10 秒以内)', async () => {
   const sockets = [];
   const silent = net.createServer((sock) => { sockets.push(sock); /* 何も返さない */ });
   await new Promise((r) => silent.listen(0, '127.0.0.1', r));
-  process.env.COMPANY_DB_WATCH_URL = `postgres://gate-test@127.0.0.1:${silent.address().port}/none`;
+  process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = `postgres://gate-test@127.0.0.1:${silent.address().port}/none`;
   G.__setLegacyPhaseReader(null);
   const t0 = Date.now();
   try {
@@ -114,7 +114,7 @@ await t('M6: 返事の無い Company DB (接続の打ち切り 3 秒) = 待ち�
     assert.equal(s.writable, false);
     assert.ok(ms >= 2500 && ms < 10000, `${ms}ms`);
   } finally {
-    delete process.env.COMPANY_DB_WATCH_URL;
+    delete process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL;
     await G.closeLegacyGatePool();
     for (const s of sockets) s.destroy();
     await new Promise((r) => silent.close(r));
@@ -246,6 +246,45 @@ await t('中間レビュー Medium-3: 画面の読みは、同時の画面で 1 
   assert.ok(rs.every((s) => s.readable === false && s.writable === false));
   assert.ok(G.legacyGateStats().screen_timeouts >= 1);
 });
+await t('中間レビュー 2 回目 M-A: 画面の読みが 1 秒で返らない = 打ち切りを「読めない」として使い回さない・遅れて返った結果を使い回しに入れる・5 分前までの結果があればそれを見せる・読めない結果は 5 秒だけ', async () => {
+  const wait = (ms) => new Promise((ok) => setTimeout(ok, ms));
+  let now = Date.now();
+  G.__setLegacyClock(() => now);
+  let calls = 0, delay = 1300, phase = 'legacy_open', down = false;
+  G.__setLegacyPhaseReader(async () => { calls++; if (delay) await wait(delay); return down ? { readable: false, phase: null, error: 'down' } : { readable: true, phase }; });
+  try {
+    // (1) 前の結果が無い = その画面だけ読めない扱い。遅れて返った結果は使い回しに入る (次の画面は読み直さずに帯なし)
+    let s = await quiet(() => G.checkLegacyGate({ purpose: 'screen' }));
+    assert.deepEqual([s.readable, s.writable, s.source], [false, false, 'screen_timeout']);
+    await wait(500);
+    s = await G.checkLegacyGate({ purpose: 'screen' });
+    assert.deepEqual([s.readable, s.writable, s.phase, s.source], [true, true, 'legacy_open', 'screen_cache'], '遅れて返った結果');
+    assert.equal(calls, 1);
+    // (2) 30 秒を過ぎて次の読みが遅い = 5 分前までの読めた結果を見せる (screen_stale)。遅れて返った frozen が次から効く
+    phase = 'frozen';
+    now += 31 * 1000;
+    s = await quiet(() => G.checkLegacyGate({ purpose: 'screen' }));
+    assert.deepEqual([s.readable, s.phase, s.source], [true, 'legacy_open', 'screen_stale']);
+    await wait(500);
+    s = await G.checkLegacyGate({ purpose: 'screen' });
+    assert.deepEqual([s.phase, s.writable, s.source], ['frozen', false, 'screen_cache']);
+    // (3) 5 分より古い結果は使わない
+    now += 6 * 60 * 1000;
+    s = await quiet(() => G.checkLegacyGate({ purpose: 'screen' }));
+    assert.deepEqual([s.readable, s.source], [false, 'screen_timeout']);
+    await wait(500);
+    // (4) 読めない結果は 5 秒だけ使い回す (直ったらすぐ帯を外す)
+    delay = 0; down = true;
+    now += 60 * 1000;
+    s = await quiet(() => G.checkLegacyGate({ purpose: 'screen' }));
+    assert.equal(s.readable, false);
+    down = false;
+    now += 3 * 1000;
+    assert.equal((await G.checkLegacyGate({ purpose: 'screen' })).readable, false, '5 秒以内は使い回す');
+    now += 3 * 1000;
+    assert.equal((await G.checkLegacyGate({ purpose: 'screen' })).readable, true, '5 秒を過ぎたら読み直す');
+  } finally { G.__setLegacyClock(null); }
+});
 await t('manifest (⑤-1 の形): { entries: [{ id, kind: code | manual }] }・id は英数字と _.:/- だけ・一意・手の入口 = 切替の証拠 manual_entries_stopped と同じ集合', async () => {
   const m = G.legacyManifest();
   assert.ok(Array.isArray(m.entries) && m.entries.length === E.LEGACY_ENTRIES.length + E.LEGACY_EXEMPT.filter((e) => e.kind === 'manual').length);
@@ -341,14 +380,72 @@ await t('止めるとき: 「止めた」の記録 (理由つき・書きかけ 
     assert.equal(call.params[8], true); assert.equal(call.params[9], 'SIGTERM で止めた');
     const { markStopped } = await import('./company-db/master-legacy-instance.mjs');
     calls.length = 0;
-    const r3 = await markStopped({ host: 'render', instance: 'srv-9:123:deadbeef', reason: '電源が落ちて戻らない', connect: fakeGateDb({ calls }), env: { RENDER_GIT_COMMIT: 'c'.repeat(40) } });
+    const ackBefore = G.legacyAckState();
+    const r3 = await markStopped({ host: 'render', instance: 'srv-9:123:deadbeef', reason: '電源が落ちて戻らない', connect: fakeGateDb({ calls }), env: { RENDER_GIT_COMMIT: 'c'.repeat(40) }, latest: async () => null });
     assert.equal(r3.state, 'stopped');
     assert.equal(calls.find((c) => /select ops\.record_legacy_gate_ack\(/.test(c.sql)).params[1], 'srv-9:123:deadbeef', '指定した名札で書く');
+    assert.deepEqual(G.legacyAckState(), ackBefore, '別のプロセスの「止めた」は、このプロセスの門の記録の状態を変えない');
+    // 中間レビュー 2 回目 Low: 15 分以内に記録がある (動いているかもしれない) = 拒む。--force なら書く。最後が「止めた」なら書ける
+    const fresh = async () => ({ acked_at: '2026-10-01 10:00:00+09', fresh: true, stopped: false });
+    const envC = { RENDER_GIT_COMMIT: 'c'.repeat(40) };
+    await assert.rejects(() => markStopped({ host: 'render', instance: 'srv-9:1:aa', reason: '試験', connect: fakeGateDb(), env: envC, latest: fresh }), /15 分以内/);
+    assert.equal((await markStopped({ host: 'render', instance: 'srv-9:1:aa', reason: '試験', connect: fakeGateDb(), env: envC, latest: fresh, force: true })).state, 'stopped');
+    assert.equal((await markStopped({ host: 'render', instance: 'srv-9:1:aa', reason: '試験', connect: fakeGateDb(), env: envC, latest: async () => ({ fresh: true, stopped: true }) })).state, 'stopped');
+    await assert.rejects(() => markStopped({ host: 'render', instance: 'srv-9:1:aa', reason: '試験', connect: fakeGateDb(), env: envC }), /確かめる接続先.*--force/, '確かめる接続先が無い = 書かない');
     await assert.rejects(() => markStopped({ host: 'render', instance: 'srv-9', reason: '', connect: fakeGateDb() }), /reason/);
     await assert.rejects(() => markStopped({ host: 'render', instance: 'srv-9', reason: 'x'.repeat(201), connect: fakeGateDb() }), /200 字/);
     await assert.rejects(() => markStopped({ host: 'laptop', instance: 'srv-9', reason: 'x', connect: fakeGateDb() }), /host/);
     assert.equal((await quiet(() => G.ackLegacyGates({ host: 'minipc', connect: fakeGateDb(), stopped: true, stoppedReason: ' ' }))).state, 'precheck_failed');
   } finally { end(); }
+});
+await t('中間レビュー 2 回目 Low: 次の起動で、前の起動のプロセスが「止めた」を書かずに消えていたら書く (miniPC)。前の pid がまだある・別の PC / 場所 = 書かない', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mlg-inst-'));
+  const stateFile = path.join(dir, 'master-legacy-instance.json');
+  const env = { RENDER_GIT_COMMIT: 'e'.repeat(40), RENDER_INSTANCE_ID: 'mini' };
+  setPhase('legacy_open');
+  const ackBefore = G.legacyAckState();
+  // 名札が無い = 書かない・今の名札を残す
+  let r = await G.markPreviousInstanceStopped({ host: 'minipc', env, stateFile, connect: fakeGateDb() });
+  assert.equal(r.state, 'skipped');
+  const me = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  assert.deepEqual([me.host, me.pid, me.hostname, me.instance_id], ['minipc', process.pid, os.hostname(), G.instanceId(env)]);
+  // 前の起動 (別の pid・居ない) = その名札で「止めた」を書く
+  const prev = { host: 'minipc', instance_id: 'mini:111:deadbeef', pid: 111, hostname: os.hostname(), started_at: '2026-10-01T00:00:00Z' };
+  fs.writeFileSync(stateFile, JSON.stringify(prev));
+  const calls = [];
+  r = await G.markPreviousInstanceStopped({ host: 'minipc', env, stateFile, connect: fakeGateDb({ calls }), isAlive: () => false });
+  assert.equal(r.state, 'stopped', r.detail);
+  const call = calls.find((c) => /select ops\.record_legacy_gate_ack\(/.test(c.sql));
+  assert.deepEqual([call.params[1], call.params[8]], ['mini:111:deadbeef', true]); assert.match(call.params[9], /次の起動で前のプロセスが居ない/);
+  assert.deepEqual(G.legacyAckState(), ackBefore, 'このプロセスの門の記録の状態は変えない');
+  // 前の pid がまだある (使い回しも含む) = 書かない (安全側)
+  fs.writeFileSync(stateFile, JSON.stringify(prev));
+  calls.length = 0;
+  r = await G.markPreviousInstanceStopped({ host: 'minipc', env, stateFile, connect: fakeGateDb({ calls }), isAlive: () => true });
+  assert.equal(r.state, 'skipped'); assert.equal(calls.length, 0);
+  // 別の PC・別の場所の名札 = 書かない
+  for (const other of [{ ...prev, hostname: 'other-pc' }, { ...prev, host: 'render' }]) {
+    fs.writeFileSync(stateFile, JSON.stringify(other));
+    r = await G.markPreviousInstanceStopped({ host: 'minipc', env, stateFile, connect: fakeGateDb({ calls }), isAlive: () => false });
+    assert.equal(r.state, 'skipped'); assert.equal(calls.length, 0);
+  }
+  // 壊れたファイル = 書かない・今の名札で直す
+  fs.writeFileSync(stateFile, '{壊れた');
+  r = await G.markPreviousInstanceStopped({ host: 'minipc', env, stateFile, connect: fakeGateDb({ calls }), isAlive: () => false });
+  assert.equal(r.state, 'skipped'); assert.equal(JSON.parse(fs.readFileSync(stateFile, 'utf8')).pid, process.pid);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+await t('中間レビュー 2 回目 Low: 門の記録の場所は server.js と読み戻しの API で同じ判定 (Render / miniPC の WarehouseServer / それ以外 = 書かない)', async () => {
+  assert.equal(G.legacyAckHost({ RENDER: 'true' }), 'render');
+  assert.equal(G.legacyAckHost({ PORTAL_VARIANT: 'warehouse' }), 'minipc');
+  assert.equal(G.legacyAckHost({ PORTAL_VARIANT: 'render' }), null, '手元の PC は書かない');
+  assert.equal(G.legacyAckHost({}), null);
+  const server = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
+  const router = fs.readFileSync(path.join(ROOT, 'apps/warehouse/router.js'), 'utf8');
+  assert.ok(server.includes('const LEGACY_ACK_HOST = legacyAckHost();'));
+  assert.ok(router.includes('legacyGateStatus({ host: legacyAckHost() })'));
+  const { percentile } = await import('./company-db/master-legacy-latency.mjs');
+  assert.deepEqual([percentile([5, 1, 3, 2, 4], 50), percentile(Array.from({ length: 20 }, (_, i) => i + 1), 95), percentile([], 95)], [3, 19, null]);
 });
 await t('門の記録は 5 分おき (要求が来たついで)・同時に 2 本走らせない・読み戻しは今すぐ書き直す', async () => {
   let now = Date.parse('2026-10-01T02:00:00Z');
@@ -511,7 +608,7 @@ async function call(method, p, body, { csv = null, files = null } = {}) {
   const res = await fetch(base + p, opts);
   const text = await res.text();
   let json = null; try { json = JSON.parse(text); } catch { /* 画面 */ }
-  return { status: res.status, json, text };
+  return { status: res.status, json, text, warning: res.headers.get('x-master-legacy-warning') };
 }
 const isGateRefusal = (r) => r.json && ['master_frozen', 'master_phase_unreadable'].includes(r.json.error);
 
@@ -617,7 +714,10 @@ await t('miniPC の画面 (/register と /): 閉じたら帯と書く部品を�
 });
 await t('読み戻し GET /apps/warehouse/api/master-legacy-gate = 段階・書けるか・manifest・持ち主表・build・書きかけ・数・門の記録', async () => {
   setPhase('frozen');
-  const r = await quiet(() => call('GET', '/apps/warehouse/api/master-legacy-gate'));
+  const pv = process.env.PORTAL_VARIANT;
+  process.env.PORTAL_VARIANT = 'warehouse';   // 読み戻しの場所は server.js と同じ判定 (miniPC の WarehouseServer = minipc)
+  let r;
+  try { r = await quiet(() => call('GET', '/apps/warehouse/api/master-legacy-gate')); } finally { if (pv === undefined) delete process.env.PORTAL_VARIANT; else process.env.PORTAL_VARIANT = pv; }
   assert.equal(r.status, 200);
   const s = r.json;
   assert.deepEqual([s.phase, s.writable, s.host], ['frozen', false, 'minipc']);
@@ -743,7 +843,14 @@ await t('product-hub (⑤-2a M5): 古い新商品の作り方 (POST /api/drafts�
       assert.equal((await call('POST', '/apps/product-hub/api/drafts', { ne_code: 'new-after-frozen', name: '閉じた後の新商品' })).status, phase === 'unreadable' ? 503 : 410);
       assert.equal((await call('POST', '/apps/product-hub/api/register-codes', { codes: 'new-after-frozen' })).status, phase === 'unreadable' ? 503 : 410);
       assert.equal((await call('POST', '/apps/product-hub/api/intake/run', {})).status, phase === 'unreadable' ? 503 : 410);
-      assert.equal((await call('POST', '/apps/product-hub/api/notion-image-import', { status: 'x' })).status, phase === 'unreadable' ? 503 : 410);
+      assert.equal((await call('POST', '/apps/product-hub/api/notion-image-import', { status: 'x', dry_run: false })).status, phase === 'unreadable' ? 503 : 410);
+      assert.equal((await call('POST', '/apps/product-hub/api/notion-import-by-status', { dry_run: false })).status, phase === 'unreadable' ? 503 : 410);
+      // 中間レビュー 2 回目 Low: 書かない試し (dry run) は、段階を読めないときだけ注意つきで通す (閉じた後は 410 のまま)
+      for (const [p, body] of [['/api/register-codes', { codes: 'new-after-frozen', dry_run: true }], ['/api/intake/run', { dry_run: true }], ['/api/notion-image-import', { status: 'x' }], ['/api/notion-import-by-status', {}]]) {
+        const r = await call('POST', `/apps/product-hub${p}`, body);
+        if (phase === 'unreadable') { assert.ok(!isGateRefusal(r), `${p} ${r.status} ${r.text.slice(0, 120)}`); assert.equal(r.warning, 'phase_unreadable', p); }
+        else assert.equal(r.status, 410, p);
+      }
     });
     assert.equal(nDrafts(), n0);
   }
@@ -798,12 +905,14 @@ await t('product-hub (R1 H5): 楽天の出品のプレビューは、閉じた�
   __setCdbTaxReader(cdbRates({ 'ph-rep-a': 0.08, 'ph-rep-b': 0.08 }));
   r = await quiet(() => call('GET', `/apps/product-hub/api/drafts/${repDraftId}/rakuten/preview`));
   assert.ok(!taxBlocked(r), JSON.stringify(r.json));
-  // 🚨 中間レビュー High-1: 段階を読めない = 切替前かもしれない = Company DB の税率に黙って切り替えない・古い値でも送らない = 止める
+  // 🚨 中間レビュー High-1: 段階を読めない = 切替前かもしれない = Company DB の税率に黙って切り替えない (登録は止める = 下の registerItem の試験)
+  //    プレビューは送らないので、今の税率で見せて注意を添える (中間レビュー 2 回目 Low)
   setPhase('unreadable');
   let asked = false;
   __setCdbTaxReader(async (codes) => { asked = true; return cdbRates({ 'ph-rep-a': 0.08, 'ph-rep-b': 0.08 })(codes); });
   r = await quiet(() => call('GET', `/apps/product-hub/api/drafts/${repDraftId}/rakuten/preview`));
-  assert.ok((r.json?.reasons || []).some((x) => x.includes('切替の段階を読めない')), JSON.stringify(r.json));
+  assert.ok((r.json?.warnings || []).some((x) => x.includes('切替の段階を読めない')), JSON.stringify(r.json));
+  assert.ok(!taxBlocked(r) && !(r.json?.reasons || []).some((x) => x.includes('切替の段階を読めない')), 'プレビューは税率で止めない');
   assert.equal(asked, false, '段階が読めないときに Company DB の税率へ切り替えない');
   setPhase('legacy_open');
   r = await quiet(() => call('GET', `/apps/product-hub/api/drafts/${repDraftId}/rakuten/preview`));
@@ -832,8 +941,23 @@ await t('中間レビュー Medium-3: Company DB が止まっていても (段�
   assert.equal(calls, 0, '税率を送らない保存は段階を読まない');
   // 画面は税率を変えたときだけ送る (欄の元の値 = defaultValue と比べる)
   const src = fs.readFileSync(path.join(ROOT, 'apps/product-hub/views/detail.ejs'), 'utf8');
-  assert.equal((src.match(/el\.value !== el\.defaultValue \? el\.value : undefined/g) || []).length, 2, '基本情報の保存と Yahoo! の保存の 2 か所');
+  assert.equal((src.match(/const sentTax = \(\(\) => \{ const el = document\.getElementById\('y-tax'\); return el && el\.value !== el\.defaultValue \? el\.value : undefined; \}\)\(\);/g) || []).length, 2, '基本情報の保存と Yahoo! の保存の 2 か所で、変えたときだけ送る');
+  assert.equal((src.match(/tax_rate: sentTax/g) || []).length, 2, '送るのは sentTax');
+  const markRe = /if \(json && json\.ok && sentTax !== undefined\) \{ const taxEl = document\.getElementById\('y-tax'\); if \(taxEl\) taxEl\.defaultValue = sentTax; \}/g;
+  assert.equal((src.match(markRe) || []).length, 2, '保存できたら送った税率を元の値にする (2 か所)');
   assert.ok(!/tax_rate: document\.getElementById\('y-tax'\)(\?)?\.value/.test(src), '欄の値をそのまま送る書き方が残っていない');
+  // 中間レビュー 2 回目 Low: 1 回保存した後の保存では、同じ税率を送り直さない (読み直すまでの間)。画面の文をそのまま動かす
+  const pickSrc = src.match(/const sentTax = \(\(\) => \{[^\n]*?\}\)\(\);/)[0];
+  const markSrc = src.match(markRe)[0];
+  const vm = await import('node:vm');
+  const el = { value: '8%', defaultValue: '10%' };
+  const ctx = { document: { getElementById: (id) => (id === 'y-tax' ? el : null) }, out: [] };
+  const run = (ok) => vm.runInNewContext('{ ' + pickSrc + ' const json = { ok: ' + ok + ' }; out.push(sentTax); ' + markSrc + ' }', ctx);
+  run(true); run(true);
+  assert.deepEqual(ctx.out, ['8%', undefined], '保存できた後は送らない');
+  el.value = '10%';
+  run(false); run(false);
+  assert.deepEqual(ctx.out.slice(2), ['10%', '10%'], '保存できなかった = 次も送る');
 });
 await t('中間レビュー Medium-4: 税率が決まっていない (data-tax が空) = 画面の利益の試算を出さない (Number(\'\') = 0 で利益を多く見せない)', async () => {
   __setCdbTaxReader(cdbRates({ 'ph-rep-a': 0.08, 'ph-rep-b': 0.1 }));
@@ -880,6 +1004,14 @@ await t('product-hub の詳細画面: 閉じたら手入力の欄 (id="y-tax") �
   r = await call('GET', `/apps/product-hub/detail/${repDraftId}`);
   assert.ok(r.text.includes('id="y-tax"') && !r.text.includes('y-tax-cdb') && /data-tax="10"/.test(r.text));
   assert.equal(asked, false, '閉じる前は Company DB を読まない');
+  // 中間レビュー 2 回目 M-B: 段階を読めない = Company DB を読みに行かない・今の値を見るだけ (「出品は止まります」と言わない)・試算は今の値
+  setPhase('unreadable'); G.__resetLegacyGate();
+  r = await quiet(() => call('GET', `/apps/product-hub/detail/${repDraftId}`));
+  assert.equal(r.status, 200);
+  assert.equal(asked, false, '段階を読めない = Company DB を読まない');
+  assert.ok(/id="y-tax-view" value="10%"/.test(r.text) && !r.text.includes('id="y-tax"') && !r.text.includes('y-tax-cdb'), '今の値を見るだけ (手入力の欄なし)');
+  assert.ok(r.text.includes('切替の段階を読めないので、いまは税率を変えられません') && !r.text.includes('決まっていない = 出品は止まります'));
+  assert.ok(/data-tax="10"/.test(r.text), '試算は今の値');
   __setCdbTaxReader(null);
 });
 
@@ -997,7 +1129,7 @@ await t('csv-import.js の止めない 5 つの mode (NE の商品・セット�
   }
 });
 await t('CLI: 段階を読めない (Company DB につながらない) = 終了コード 3 (fail-closed)', async () => {
-  const r = runCli([CSV_IMPORT, 'product_shipping', shipCsv], { env: { COMPANY_DB_WATCH_URL: 'postgres://gate-test@127.0.0.1:1/none' } });
+  const r = runCli([CSV_IMPORT, 'product_shipping', shipCsv], { env: { COMPANY_DB_MASTER_GATE_MINIPC_URL: 'postgres://gate-test@127.0.0.1:1/none' } });
   assert.equal(r.code, 3, r.out); assert.ok(r.out.includes('読めない'));
   assert.equal(countIn('product_shipping'), 2);
 });

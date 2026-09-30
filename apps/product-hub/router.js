@@ -130,7 +130,7 @@ import {
   suggestShopCategories, canAutoApplyShopCategory, countSelectableShopCategories,
   shopCategoriesNeverSaved, isAutoApplyRequestValid,
 } from './lib/shop-categories.js';
-import { masterLegacyGate, legacyBannerHtml } from '../../lib/master-legacy-gate.mjs';
+import { masterLegacyGate, legacyBannerHtml, checkLegacyGate } from '../../lib/master-legacy-gate.mjs';
 import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
 import { resolveListingTax } from './services/listing-tax.mjs';
 
@@ -257,10 +257,20 @@ router.get('/new', (req, res) => {
   });
 });
 
-// 切替で古い入口を閉じた後 (res.locals.masterLegacy.frozen) だけ、税率の欄・利益の試算に使う Company DB の税率を読む
-// (代表コードは構成の SKU から。混ざる・無い・読めない = 決められない)。閉じる前は何もしない (今までどおり次の詳細画面へ)
+/**
+ * 詳細画面の税率の見せ方 (中間レビュー 2 回目 M-B):
+ *   'cdb'      = 段階を読めて閉じている (frozen 以降) → Company DB の税率を読む (代表コードは構成の SKU から。混ざる・無い・読めない = 決められない)
+ *   'readonly' = 段階を読めない → 今の値 (draft_yahoo) を見るだけ (Company DB を読みに行かない = 詳細を開くたびに接続を作らない・切替前に「出品は止まります」と出さない)
+ *   'legacy'   = 切替前 → 今までどおり (手入力の欄)
+ */
+function taxModeOf(ml) {
+  if (!ml) return 'legacy';
+  if (ml.readable !== true) return 'readonly';
+  return ml.frozen ? 'cdb' : 'legacy';
+}
 router.get('/detail/:id', async (req, res, next) => {
-  if (!res.locals.masterLegacy?.frozen) return next();
+  res.locals.taxMode = taxModeOf(res.locals.masterLegacy);
+  if (res.locals.taxMode !== 'cdb') return next();
   try {
     const id = Number.parseInt(req.params.id, 10);
     const draft = Number.isInteger(id) && id > 0 ? getDB().prepare('SELECT * FROM product_drafts WHERE id = ?').get(id) : null;
@@ -341,8 +351,8 @@ router.get('/detail/:id', (req, res) => {
   for (const r of db.prepare('SELECT sku_code, reason FROM draft_sku_catalog_exemptions WHERE draft_id = ?').all(draft.id)) {
     skuExemptions[r.sku_code] = r.reason;
   }
-  // 切替で閉じた後 = Company DB の税率だけ (決められない = 試算しない)。閉じる前は今までどおり (Yahoo 欄 → NE → 10%)
-  const cdbTaxForSim = res.locals.masterLegacy?.frozen ? (res.locals.cdbTax || { ok: false, reason: '読めません' }) : null;
+  // 切替で閉じた後 = Company DB の税率だけ (決められない = 試算しない)。閉じる前・段階を読めない (見るだけ) は今までどおり (Yahoo 欄 → NE → 10%)
+  const cdbTaxForSim = res.locals.taxMode === 'cdb' ? (res.locals.cdbTax || { ok: false, reason: '読めません' }) : null;
   const simTaxPercent = cdbTaxForSim ? (cdbTaxForSim.ok ? cdbTaxForSim.percent : null) : (() => {
     const t = String(yahoo?.tax_rate ?? '').trim().match(/^(\d+)/);
     if (t) return Number(t[1]);
@@ -2143,10 +2153,13 @@ router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
     try { await fetchGenreAttributes(db, String(rkRow.genre_id).trim()); } catch (_) { /* best-effort */ }
   }
   // 税率: 切替前は今までどおり / 閉じた後は Company DB (決められない = 止める)。PR #1565 R1 H5
-  const built = buildItemPayload(db, draft.id, { tax: await resolveListingTax(db, draft) });
-  if (!built.ok) return res.json({ ok: false, reasons: built.reasons });
+  // プレビューは送らないので、段階を読めないときは今の税率で見せて注意を添える (登録は止まる。中間レビュー 2 回目 Low)
+  const tax = await resolveListingTax(db, draft, { preview: true });
+  const built = buildItemPayload(db, draft.id, { tax });
+  if (!built.ok) return res.json({ ok: false, reasons: built.reasons, ...(tax.warning ? { warnings: [tax.warning] } : {}) });
   res.json({
     ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload,
+    ...(tax.warning ? { warnings: [tax.warning] } : {}),
     // 店舗内カテゴリは RMS payload に含まれない (item-mappings API で登録成功後に自動反映)。
     // プレビューには参考情報として添える
     shopCategories: selectedShopCategoryPaths(db, draft.id),
@@ -3646,14 +3659,30 @@ serviceApiRouter.post('/ad-kw-ai/jobs/:id/release', (req, res) => {
   res.json({ ok: true, status: r.status });
 });
 
+/**
+ * AI 生成の材料の税率 (draft_yahoo.tax_rate) は、切替前 (段階を読めて legacy_open) だけ渡す。
+ * 閉じた後・段階を読めない = 渡さない (null)。税率の持ち主は Company DB = 古い手入力の値を AI の文に入れない (中間レビュー 2 回目 Low)。
+ * 段階は画面と同じ読み方 (30 秒の使い回し・1 秒で諦める = 生成の材料を待たせない)
+ */
+async function dropLegacyTaxUnlessOpen(drafts) {
+  let g;
+  try { g = await checkLegacyGate({ purpose: 'screen' }); } catch { g = { readable: false, writable: false }; }
+  if (g.readable === true && g.writable === true) return drafts;
+  for (const d of drafts) if (d && d.yahoo) d.yahoo = { ...d.yahoo, tax_rate: null };
+  return drafts;
+}
+
 // 生成待ち一覧 (AI 生成の材料つき、読み取り専用 = プレビュー用)
-serviceApiRouter.get('/generation-queue', (req, res) => {
-  const db = getDB();
-  // キューは status='ready_for_ai' を見るので、切替バックフィル前の古い status のまま
-  // 拾い漏れ・拾い過ぎが起きないよう、AI キューの入口でも自己修復する
-  maybeBackfillDerivedStatus(db);
-  // drafts = 今 claim できるもの (人の確認待ちは含まない)。queue.blocked で人待ちの件数を別枠で返す
-  res.json({ ok: true, drafts: listGenerationQueue(db), queue: generationQueueSummary(db) });
+serviceApiRouter.get('/generation-queue', async (req, res, next) => {
+  try {
+    const db = getDB();
+    // キューは status='ready_for_ai' を見るので、切替バックフィル前の古い status のまま
+    // 拾い漏れ・拾い過ぎが起きないよう、AI キューの入口でも自己修復する
+    maybeBackfillDerivedStatus(db);
+    // drafts = 今 claim できるもの (人の確認待ちは含まない)。queue.blocked で人待ちの件数を別枠で返す
+    const drafts = listGenerationQueue(db);
+    res.json({ ok: true, drafts: await dropLegacyTaxUnlessOpen(drafts), queue: generationQueueSummary(db) });
+  } catch (e) { next(e); }   // async にしたので、誤りは今までどおり Express の誤りの扱いへ
 });
 
 // 生成対象の claim (2026-08-03、Codex設計相談 Critical 対応)。
@@ -3711,7 +3740,7 @@ serviceApiRouter.post('/generation-queue/claim', async (req, res) => {
       for (const d of claimedList) d.sp_keywords_error = kwError;
     }
   }
-  res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: r.claimed, queue: generationQueueSummary(db) });
+  res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: Array.isArray(r.claimed) ? await dropLegacyTaxUnlessOpen(r.claimed) : r.claimed, queue: generationQueueSummary(db) });
 });
 
 // claim の解放 (生成を断念した draft を他の実行がすぐ拾えるように)
