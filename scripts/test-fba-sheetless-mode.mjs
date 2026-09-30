@@ -481,6 +481,10 @@ await t('モードあり: 起動時の backfill を流さない (Sheet の古い
   modeOn();
   await db.initDb();
   assert.equal(attrsOf('Echo-5'), null);
+  // 一回限りの移行も、モードが入っている間は流せない (db.js 側の歯止め)
+  assert.throws(() => db.runSkuMappingBackfillOnce(), (e) => e.code === 'FBA_BACKFILL_MODE_ON');
+  assert.equal(attrsOf('Echo-5'), null);
+  assert.equal(db.getBackfillMark(), null);
 });
 await t('移行のスクリプト: --check は書かない', async () => {
   const st = fs.statSync(dbFile);
@@ -491,13 +495,17 @@ await t('移行のスクリプト: --check は書かない', async () => {
   const st2 = fs.statSync(dbFile);
   assert.deepEqual([st2.mtimeMs, st2.size], [st.mtimeMs, st.size]);
 });
-await t('移行のスクリプト: モードが入っている間は断る (印を書かない)', async () => {
+await t('移行のスクリプト: モードが入っている間は断る (印を書かない・fba.db に触らない)', async () => {
+  const st = fs.statSync(dbFile);
+  await tick();
   const r = cli([], '1');
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /断った/);
   assert.deepEqual(fileMark(), []);
   const r2 = cli([], 'yes');
   assert.equal(r2.code, 1, r2.out);
+  const st2 = fs.statSync(dbFile);
+  assert.deepEqual([st2.mtimeMs, st2.size], [st.mtimeMs, st.size], '断ったのに fba.db を書いた');
 });
 await t('移行のスクリプト: モードなしで流すと backfill して印を残す (時刻と件数)', async () => {
   const r = cli([]);
@@ -511,11 +519,15 @@ await t('移行のスクリプト: モードなしで流すと backfill して�
   assert.ok(Number.isFinite(detail.attrs_after));
   assert.ok(!Number.isNaN(Date.parse(marks[0].done_at)));
 });
-await t('移行のスクリプト: 二度目は断る', async () => {
+await t('移行のスクリプト: 二度目は断る (fba.db に触らない = 開いて保存もしない)', async () => {
+  const st = fs.statSync(dbFile);
+  await tick();
   const r = cli([]);
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /二度は流さない/);
   assert.equal(fileMark().length, 1);
+  const st2 = fs.statSync(dbFile);
+  assert.deepEqual([st2.mtimeMs, st2.size], [st.mtimeMs, st.size], '断ったのに fba.db を書いた');
 });
 await t('印があれば、モードを外しても起動時の backfill を流さない', async () => {
   modeOff();
