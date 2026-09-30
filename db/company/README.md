@@ -990,13 +990,17 @@ select economic_date_jst, seller_sku_norm, unclassified_component_count, unclass
   Render は cursor で 1 万行ずつ読んで 1 行ずつ hash に足す (51 万注文でも手元に全部を持たない)。run ID・token は入れない
 - **request_hash** = 正規の JSON `{format: "fcr-v1", company_id, mall, scope_key, source, state: "complete", generation (10 進の文字列), run_token, manifest の全部}` の SHA-256。送り手が付けたら受け口の計算と比べる (違えば 400)
 - manifest の形 (400): 全部の列が必須・日時は UTC の `YYYY-MM-DDTHH:MM:SSZ`・bigint と ID は 10 進の文字列 (`source_revision` は数でもよい)・digest は 64 桁の小文字の 16 進・未来の時刻は不可 (+10 分)・
-  `selected_documents_count = headers_count`・`receipt_lines ≥ receipt_count`・知らない鍵は不可 / `settlements_through` が policy の起点 (その source の `period_from` の JST 00:00) より後でなければ 400 / policy に無い source = 409 `NO_POLICY`
+  `selected_documents_count = headers_count`・`receipt_lines ≥ receipt_count`・知らない鍵は不可 / `settlements_through` が policy の起点 (その source の `period_from` の JST 00:00) より後でなければ 400 /
+  **`evidence_chain_from` が policy の起点以前でなければ 400** (UTC の瞬間で比べる = 証拠の鎖が起点まで届いている・#1561 Codex R1 High 2。鎖の窓が途切れずにつながることは coordinator = D7b-1b-3 が確かめる) / policy に無い source = 409 `NO_POLICY`
 - 🚨 Render が確かめられるのは **受領記録 (receipt digest) と形だけ**。一覧・初期の印・採った文書・期待の report の集合は miniPC の SQLite にしか無い = 送り手の申告を保存するだけ (D7b-1b-3 が作る・試験する)
 - **財務の chunk を世代に縛る** (§3.1 R10 H1・R23 M5):
   - 全部の財務の chunk・updating・complete が **同じ advisory lock** (`company-db:order-finance:会社:モール:scope`) を取引の最初に取る (待つ。chunk は lock_timeout 10 秒・coverage は 20 秒で 503 `LOCKED` = 送り手がやり直す)
-  - chunk の body に `coverage_generation` と `run_token` (両方) = **その世代・その token の coverage が updating のときだけ適用** (complete の後・別の世代・別の token・行の source が coverage の source と違う = 409 `COVERAGE_MISMATCH`・何も書かない)
-  - 🚨 **付いていない chunk (今の送り手) は今までどおり受ける (互換)**。ただし受領記録を 1 つでも変えたら (applied > 0)、その会社 × モール × scope の **complete を updating に落とす** (無効の印・応答の `coverage_invalidated`)。
-    受領記録は source を持たない = その key の全部の source の complete を落とす (fail-closed)。無効の印のある世代は complete に戻れない (409) = 次の世代の updating から。same / stale (受領記録が変わらない) では落とさない
+  - chunk の body に `coverage_generation` と `run_token` (両方) = **その世代・その token の coverage が updating のときだけ適用** (complete の後・別の世代・別の token・行の source が coverage の source と違う・
+    **置き換え / 墓石で消える既存の行の source が coverage の source と違う** = 409 `COVERAGE_MISMATCH`・何も消さない・書かない。#1561 Codex R1 High 1)
+  - 🚨 **付いていない chunk (今の送り手) は今までどおり受ける (互換)**
+  - 🚨 **どちらの chunk も、受領記録を 1 つでも変えたら (applied > 0・墓石と置き換えを含む)、その会社 × モール × scope の complete を全部 updating に落とす** (無効の印・応答の `coverage_invalidated`)。
+    受領記録と receipt digest は source で分かれていない = fail-closed。理由 = `untokened_finance_write` (token の無い chunk) / `other_coverage_finance_write` (token 付きの chunk = 落ちるのはほかの source か別の世代の complete。
+    例 過去の source A が complete・今の source B が updating で B の token の追加・墓石 → A は updating)。無効の印のある世代は complete に戻れない (409) = 次の世代の updating から。same / stale (受領記録が変わらない) では落とさない
   - 🚨 **coordinator (D7b-1b-3) ができたら token の無い chunk は拒む契約にする** (今の daily-sync の送り手を止めないために当面は受ける)
   - 0051 の前 (Render の deploy が migrate より先): token の無い chunk は今までどおり・token 付きの chunk と coverage の口は 409 `not_migrated`
 - 受け口 (`router.mjs`・鍵は server.js の `/apps/company-db/sync/order-finance` の前方一致に入る):

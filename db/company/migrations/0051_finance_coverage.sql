@@ -15,7 +15,9 @@
 --   ・同じ世代・同じ token の updating の再送 = same / 違う token = 409 / 同じ世代の complete → updating = 409
 --   ・同じ世代・同じ token の updating → complete は 1 回だけ (受領記録から receipt digest を計算し、manifest と合わなければ 409)
 --   ・同じ世代の complete の再送 = request_hash が同じなら same・違えば 409
---   ・🚨 token の無い財務の chunk (今の送り手) が受領記録を変えたら、complete の行を updating に落とす (invalidated_at = 印。同じ世代では complete に戻れない = 次の世代から)
+--   ・🚨 財務の chunk が受領記録を変えたら、その会社 × モール × scope の complete の行を全部 updating に落とす (invalidated_at = 印。同じ世代では complete に戻れない = 次の世代から)。
+--     token の無い chunk (今の送り手) = 全部の source / token 付きの chunk = ほかの source (か別の世代) の complete (受領記録と receipt digest は source で分かれていない。#1561 Codex R1 High 1)
+--   ・complete の manifest は evidence_chain_from ≤ policy の起点 (UTC の瞬間) でなければ受けない (#1561 Codex R1 High 2。鎖の窓の連続は coordinator = D7b-1b-3)
 --
 -- 🚨 manifest の値の多く (一覧・初期の印・採った文書・期待の report の集合) は Render では確かめられない (miniPC の SQLite にしか無い) = 送り手の申告を保存するだけ。
 --    Render が確かめるのは receipt digest (受領記録の今の集合) と、日付・時刻・数・digest の形と、complete_to = settlements_through の JST の日の前日。
@@ -56,7 +58,7 @@ create table core.finance_coverage (
   completed_at             timestamptz,
   -- ─── 無効にした印 (complete の後に token の無い書き込みが受領記録を変えた) ───
   invalidated_at           timestamptz,
-  invalidated_reason       text check (invalidated_reason in ('untokened_finance_write')),
+  invalidated_reason       text check (invalidated_reason in ('untokened_finance_write', 'other_coverage_finance_write')),   -- token の無い chunk / ほかの coverage の token の chunk
   updated_at               timestamptz not null default now(),
   primary key (company_id, mall, scope_key, source),
   -- complete = manifest が全部そろう (1 つでも欠けた complete を作らない)・無効の印は無い
@@ -79,7 +81,7 @@ create table core.finance_coverage (
   constraint ck_finance_coverage_invalidated check ((invalidated_at is null) = (invalidated_reason is null))
 );
 comment on table core.finance_coverage is '決済のそろい (0051・D7b-1b-2。13 §3.1)。会社 × モール × scope × source = 1 行 = 今の世代の状態。complete のときだけ complete_to が正式 (core.finance_coverage_state)。書くのは受け口 (ingest/finance-coverage.mjs) だけ = 財務の chunk と同じ advisory lock の中';
-comment on column core.finance_coverage.invalidated_at is 'complete の後に token の無い財務の chunk (今の送り手) が受領記録を変えて updating に落とした時刻。この世代では complete に戻れない (次の世代の updating で消える)';
+comment on column core.finance_coverage.invalidated_at is 'complete の後に財務の chunk (token の無い今の送り手・ほかの coverage の token の chunk) が受領記録を変えて updating に落とした時刻。この世代では complete に戻れない (次の世代の updating で消える)';
 create trigger trg_finance_coverage_touch before update on core.finance_coverage for each row execute function core.touch_updated_at();
 
 -- ─── core.finance_coverage_state を差し替える (0049 の差し込み口。名前・引数・戻りの形は同じ・呼び手は変えない) ───

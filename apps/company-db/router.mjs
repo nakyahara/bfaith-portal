@@ -46,14 +46,16 @@ export function __setPgClientFactory(fn) { pgClientFactory = fn || openPgClient;
  * 🚨 body の parse は鍵の検査の後 (server.js の共通 parser はこの path を素通りさせる = 未認可の 12MB を読まない。mirror と同じ流儀)
  */
 const shipmentsJson = express.json({ limit: '12mb', inflate: false });
-function shipmentsParserError(err, req, res, next) {
+/** parser の失敗の応答。上限の文言は受け口ごと (#1561 Codex R1 Low: coverage は 64KB なのに「12MB」と返していた) */
+const parserErrorFor = (limitLabel) => function parserError(err, req, res, next) {
   if (!err) return next();
-  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'payload too large (12MB)' });
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: `payload too large (${limitLabel})` });
   if (err.type === 'encoding.unsupported') return res.status(415).json({ error: 'compressed body is not accepted' });
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'invalid JSON' });
   if (err.type === 'request.aborted') return res.status(400).json({ error: 'request aborted' });
   return next(err);
-}
+};
+const shipmentsParserError = parserErrorFor('12MB');
 
 export function requireSyncKey(req, res, next) {
   const key = process.env.MIRROR_SYNC_KEY;
@@ -311,7 +313,7 @@ router.post('/order-finance', requireSyncKey, shipmentsJson, shipmentsParserErro
  *   🚨 鍵の検査は server.js の '/apps/company-db/sync/order-finance' の前方一致 (body parser より前) に入る
  */
 const coverageJson = express.json({ limit: '64kb', inflate: false });
-router.post('/order-finance/coverage', requireSyncKey, coverageJson, shipmentsParserError, async (req, res) => {
+router.post('/order-finance/coverage', requireSyncKey, coverageJson, parserErrorFor('64KB'), async (req, res) => {
   const url = process.env.COMPANY_DB_URL;
   if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
   let client;

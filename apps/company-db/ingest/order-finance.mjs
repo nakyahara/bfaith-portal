@@ -8,13 +8,16 @@
  * 🆕 決済のそろい (coverage・0051・D7b-1b-2。13 §3.1「財務の chunk も coverage の世代に縛る」):
  *   ・全部の chunk が取引の最初に **coverage の要求と同じ advisory lock** (会社 × モール × scope) を取る (ingest/finance-coverage.mjs の takeFinanceLock)
  *   ・body に coverage_generation と run_token が付いた chunk = その世代・その token の coverage が updating のときだけ適用 (complete の後・別の世代・別の token = 409 COVERAGE_MISMATCH)
- *   ・付いていない chunk (今の送り手) = 今までどおり受ける (互換)。ただし受領記録を 1 つでも変えたら (applied > 0)、その会社 × モール × scope の complete を updating に落とす (fail-closed)
+ *     置き換え・墓石で消える既存の行の source もその coverage の source と同じこと (違えば消す前に 409・#1561 Codex R1 High 1)
+ *   ・付いていない chunk (今の送り手) = 今までどおり受ける (互換)
+ *   ・どちらも、受領記録を 1 つでも変えたら (applied > 0・墓石と置き換えを含む)、その会社 × モール × scope の complete を全部 updating に落とす (fail-closed。
+ *     token 付きなら落ちるのはほかの source (か別の世代) の complete = 受領記録と receipt digest は source で分かれていない)
  *   🚨 coordinator (D7b-1b-3・miniPC) ができたら、token の無い chunk は拒む契約にする (今の daily-sync の送り手を止めないために当面は受ける)
  */
 import { ingestChunk, validateChunkBody, bad } from './chunk.mjs';
 import { MALLS, SCOPE_RE, orderKey } from './orders.mjs';
 import { validateFinanceRows, orderFinanceChecksum, financeRowsFormat, assertVersionForm, versionHasClass, isPseudoOrderNo, CLASS_COLUMNS } from '../finance/order-finance-checksum.mjs';
-import { takeFinanceLock, coverageReady, assertChunkCoverage, invalidateAfterUntokenedWrite } from './finance-coverage.mjs';
+import { takeFinanceLock, coverageReady, assertChunkCoverage, invalidateCompleteAfterWrite, INVALIDATED_REASONS } from './finance-coverage.mjs';
 import { bigintText, RUN_TOKEN_RE } from '../finance/coverage-manifest.mjs';
 
 export const FINANCE_MALLS = MALLS.filter((m) => m !== 'other');   // 0043 の mall の CHECK
@@ -109,12 +112,13 @@ export async function ingestOrderFinanceChunk(db, { companyId = 1, mall, scope, 
       if (!coverage) return;
       if (!covReady) throw Object.assign(new Error('not_migrated: migration 0051 (core.finance_coverage) is not applied (a chunk with coverage_generation / run_token needs it)'), { code: 'NOT_MIGRATED' });
       const sources = new Set(opts.rows.flatMap((x) => x.lines.map((l) => l.source)));
-      await assertChunkCoverage(dbx, { companyId, mall: m, scope: s, generation: coverage.generation, runToken: coverage.runToken, sources });
+      await assertChunkCoverage(dbx, { companyId, mall: m, scope: s, generation: coverage.generation, runToken: coverage.runToken, sources, orderNos: opts.rows.map((x) => x.mall_order_no) });
     },
-    // token の無い chunk が受領記録を変えた (applied > 0) = complete を updating に落とす (受領記録は source を持たない = その key の全部の source)
+    // chunk が受領記録を変えた (applied > 0・墓石と置き換えを含む) = その key の complete を全部 updating に落とす (受領記録は source を持たない)。
+    //   token の無い chunk = 全部の source / token 付き = その token の coverage は updating = ほかの source (か別の世代) の complete (#1561 Codex R1 High 1)
     afterRows: async (dbx, { applied }) => {
-      if (coverage || !covReady || applied === 0) return { coverage_invalidated: 0 };
-      const rows = await invalidateAfterUntokenedWrite(dbx, { companyId, mall: m, scope: s, log });
+      if (!covReady || applied === 0) return { coverage_invalidated: 0 };
+      const rows = await invalidateCompleteAfterWrite(dbx, { companyId, mall: m, scope: s, reason: coverage ? INVALIDATED_REASONS.otherCoverage : INVALIDATED_REASONS.untokened, log });
       return { coverage_invalidated: rows.length };
     },
     run: { sourceSystem: m, entity: 'order_finance', scopeKey: s },

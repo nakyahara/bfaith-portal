@@ -12,13 +12,15 @@
  *   ・同じ世代・同じ token の updating の再送 = same / 違う token = 409 / 同じ世代の complete → updating = 409
  *   ・同じ世代・同じ token の updating → complete は 1 回だけ: lock → 今の受領記録から receipt digest を計算 → manifest と一致しなければ 409 (RECEIPT_MISMATCH) → complete
  *   ・同じ世代の complete の再送 = request_hash が同じなら same (応答だけ失われた)・違えば 409
- *   ・無効の印 (invalidated_at = complete の後に token の無い chunk が受領記録を変えた) のある世代は complete に戻れない = 409 (次の世代から)
+ *   ・無効の印 (invalidated_at = complete の後に token の無い chunk か、ほかの coverage の token の chunk が受領記録を変えた) のある世代は complete に戻れない = 409 (次の世代から)
+ *   ・complete の manifest の端: settlements_through > policy の起点・evidence_chain_from ≤ policy の起点 (UTC の瞬間で比べる)。鎖の窓の連続は coordinator (D7b-1b-3) が確かめる
  *
  * 財務の chunk との約束 (ingest/order-finance.mjs が呼ぶ):
  *   ・takeFinanceLock = chunk も coverage の要求も同じ lock (会社 × モール × scope) を取引の最初に取る (待つ・lock_timeout で 503 LOCKED)
- *   ・assertChunkCoverage = chunk に coverage_generation / run_token が付いていれば、その世代・その token の updating のときだけ適用 (違えば 409)
- *   ・invalidateAfterUntokenedWrite = token の無い chunk (今の送り手) が受領記録を 1 つでも変えたら、その会社 × モール × scope の complete を updating に落とす
- *     (受領記録は source を持たない = その key の全部の source の complete を落とす = fail-closed)
+ *   ・assertChunkCoverage = chunk に coverage_generation / run_token が付いていれば、その世代・その token の updating のときだけ適用 (違えば 409)。
+ *     chunk の行の source と、置き換え・墓石で消える既存の行の source が、その coverage の source と同じこと (違えば何も消す前に 409)
+ *   ・invalidateCompleteAfterWrite = chunk が受領記録を 1 つでも変えたら (墓石・置き換えを含む)、その会社 × モール × scope の complete を全部 updating に落とす
+ *     (受領記録と receipt digest は source で分かれていない = fail-closed)。token の無い chunk = 全部の source / token 付き = ほかの source (か別の世代) の complete
  *   🚨 coordinator (D7b-1b-3) ができたら token の無い chunk を拒む契約にする (今は今の daily-sync の送り手を止めないために受ける)
  */
 import { MALLS, SCOPE_RE } from './orders.mjs';
@@ -176,6 +178,9 @@ export async function applyCoverage(db, body, { companyId = COMPANY_ID, now = ()
         throw err('CONFLICT', `世代 ${v.generation} は ${cur.invalidated_at} に無効にされた (${cur.invalidated_reason}) = この世代では complete に戻れない。次の世代の updating から回し直す`);
       } else {
         if (Date.parse(v.manifest.settlements_through) <= Date.parse(origin)) throw bad(`settlements_through (${v.manifest.settlements_through}) が policy の起点 (${origin}) より後でない = 起点を覆う決済が無い`);
+        // 🚨 証拠の鎖 (初期の印 + 積み上げた一覧) は policy の起点まで届いていること (#1561 Codex R1 High 2)。比べるのは UTC の瞬間 (起点 = period_from の JST 00:00・§3.1 の期間の型)。
+        //    Render が確かめられるのは端だけ = 鎖の窓が途切れずにつながること (createdSince / Until の重なり・保持期間の空白) は coordinator (D7b-1b-3) が確かめる
+        if (Date.parse(v.manifest.evidence_chain_from) > Date.parse(origin)) throw bad(`evidence_chain_from (${v.manifest.evidence_chain_from}) が policy の起点 (${new Date(Date.parse(origin)).toISOString().replace(/\.000Z$/, 'Z')}) より後 = 起点からの証拠が無い`);
         const rc = await computeReceiptDigest(db, { companyId, mall: v.mall, scope: v.scope });
         const m = v.manifest;
         if (rc.count !== m.receipt_count || rc.lines !== m.receipt_lines || rc.digest !== m.receipt_digest) {
@@ -201,7 +206,7 @@ export async function applyCoverage(db, body, { companyId = COMPANY_ID, now = ()
  * 財務の chunk に coverage_generation / run_token が付いていたら、その世代・その token の updating のときだけ通す (lock を取った後に呼ぶ)。
  *   sources = chunk の行の source の集合 (その coverage の source と違えば 409)
  */
-export async function assertChunkCoverage(db, { companyId = COMPANY_ID, mall, scope, generation, runToken, sources = [] }) {
+export async function assertChunkCoverage(db, { companyId = COMPANY_ID, mall, scope, generation, runToken, sources = [], orderNos = [] }) {
   const rows = (await db.query(`select source, state, generation::text as generation, run_token from core.finance_coverage
      where company_id = $1::smallint and mall = $2 and scope_key = $3 order by source`, [companyId, mall, scope])).rows;
   const hit = rows.filter((r) => r.generation === generation && r.run_token === runToken);
@@ -211,14 +216,31 @@ export async function assertChunkCoverage(db, { companyId = COMPANY_ID, mall, sc
   }
   const other = [...sources].filter((s) => s !== hit[0].source);
   if (other.length) throw err('COVERAGE_MISMATCH', `chunk の行の source (${other.join(', ')}) が coverage の source (${hit[0].source}) と違う`);
+  // 🚨 置き換え・墓石で消える **既存の行** の source も確かめる (#1561 Codex R1 High 1: 墓石 lines = [] は chunk の行の source が空 =
+  //    ほかの source (例 complete の過去の source A) の既存の行を B の token で消せた)。違えば何も消す前に 409
+  if (orderNos.length) {
+    const ex =(await db.query(`select distinct source from core.order_finance_daily
+       where company_id = $1::smallint and mall = $2 and scope_key = $3 and mall_order_no = any($4::text[]) and source <> $5 order by source`,
+      [companyId, mall, scope, orderNos, hit[0].source])).rows.map((r) => r.source);
+    if (ex.length) throw err('COVERAGE_MISMATCH', `chunk の注文の既存の行に別の source (${ex.join(', ')}) がある = coverage の source (${hit[0].source}) の token では置き換え・墓石にしない`);
+  }
   return hit[0];
 }
 
-/** token の無い chunk が受領記録を変えた後: その会社 × モール × scope の complete を updating に落とす (無効の印つき)。戻り = 落とした行 */
-export async function invalidateAfterUntokenedWrite(db, { companyId = COMPANY_ID, mall, scope, log = () => {} }) {
-  const rows = (await db.query(`update core.finance_coverage set state = 'updating', invalidated_at = now(), invalidated_reason = 'untokened_finance_write'
-     where company_id = $1::smallint and mall = $2 and scope_key = $3 and state = 'complete' returning source, generation::text as generation`, [companyId, mall, scope])).rows;
-  for (const r of rows) log(`coverage ${r.source} 世代 ${r.generation}: token の無い財務の書き込みで complete → updating (無効の印)`);
+/** 無効の印の理由 (0051 の CHECK と同じ) */
+export const INVALIDATED_REASONS = Object.freeze({ untokened: 'untokened_finance_write', otherCoverage: 'other_coverage_finance_write' });
+
+/**
+ * 財務の chunk が受領記録を変えた後: その会社 × モール × scope の **complete を全部** updating に落とす (無効の印つき)。戻り = 落とした行
+ *   ・token の無い chunk (今の送り手) = reason untokened_finance_write
+ *   ・token 付きの chunk = その token の coverage は updating (確かめ済み) = 落ちるのは **ほかの source (か別の世代) の complete** = reason other_coverage_finance_write
+ *     (#1561 Codex R1 High 1: 受領記録と receipt digest は source で分かれていない = ほかの source の complete が今の受領記録と食い違う)
+ */
+export async function invalidateCompleteAfterWrite(db, { companyId = COMPANY_ID, mall, scope, reason = INVALIDATED_REASONS.untokened, log = () => {} }) {
+  if (!Object.values(INVALIDATED_REASONS).includes(reason)) throw new Error(`知らない無効の理由: ${reason}`);
+  const rows = (await db.query(`update core.finance_coverage set state = 'updating', invalidated_at = now(), invalidated_reason = $4
+     where company_id = $1::smallint and mall = $2 and scope_key = $3 and state = 'complete' returning source, generation::text as generation`, [companyId, mall, scope, reason])).rows;
+  for (const r of rows) log(`coverage ${r.source} 世代 ${r.generation}: 財務の書き込み (${reason}) で complete → updating (無効の印)`);
   return rows;
 }
 

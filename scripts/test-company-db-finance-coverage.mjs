@@ -239,9 +239,14 @@ await t('manifest の形 (400): complete_to が end の JST の日の前日で�
   // 起点 (policy の 2026-01-01 の JST 00:00 = 2025-12-31T15:00:00Z) を覆わない end
   await rejects(() => comp(6, TOK2, M(rc, { complete_to: '2025-12-31', settlements_through: '2025-12-31T15:00:00Z' })), 'BAD_REQUEST', /policy の起点/);
   await rejects(() => applyCoverage(db, { state: 'updating', ...key, source: 'amazon_settlement_flat_v1', generation: 1, run_token: TOK }), 'NO_POLICY');
-  // 正しい request_hash を付ければ通る (送り手が同じ関数で作った値)
-  const rh = coverageRequestHash({ companyId: 1, mall: 'amazon', scopeKey: 'jp', source: U, generation: '6', runToken: TOK2, manifest: validateCoverageManifest(M(rc)) });
-  assert.equal((await comp(6, TOK2, M(rc), { request_hash: rh })).status, 'applied');
+  // 🚨 証拠の鎖が policy の起点まで届いていない (#1561 Codex R1 High 2): 起点 = 2026-01-01 の JST 00:00 = 2025-12-31T15:00:00Z (UTC の瞬間で比べる)
+  await rejects(() => comp(6, TOK2, M(rc, { evidence_chain_from: '2025-12-31T15:00:01Z' })), 'BAD_REQUEST', /evidence_chain_from .*policy の起点 \(2025-12-31T15:00:00Z\) より後/);
+  await rejects(() => comp(6, TOK2, M(rc, { evidence_chain_from: '2026-01-01T00:00:00Z' })), 'BAD_REQUEST', /evidence_chain_from/);   // UTC の 1/1 00:00 = JST の 1/1 09:00 = 起点より後
+  assert.equal((await covRow()).state, 'updating');
+  // 正しい request_hash を付ければ通る (送り手が同じ関数で作った値)・証拠の鎖の始まりが起点ちょうど (境目) も通る
+  const mEdge = M(rc, { evidence_chain_from: '2025-12-31T15:00:00Z' });
+  const rh = coverageRequestHash({ companyId: 1, mall: 'amazon', scopeKey: 'jp', source: U, generation: '6', runToken: TOK2, manifest: validateCoverageManifest(mEdge) });
+  assert.equal((await comp(6, TOK2, mEdge, { request_hash: rh })).status, 'applied');
   assert.equal((await covRow()).request_hash, rh);
 });
 
@@ -338,15 +343,56 @@ await t('source ごと: 別の source の coverage は触らない読み方 (行
   assert.deepEqual(st, [{ source: 'amazon_settlement_flat_v2', state: 'updating' }, { source: U, state: 'updating' }]);
   await pg.query(`delete from core.finance_coverage where source = 'amazon_settlement_flat_v2'`);
 });
+await t('🚨 source が 2 つ (#1561 Codex R1 High 1): 過去の source A が complete・今の source B が updating → B の token で A の既存の行の置き換え・墓石 = 409 (消す前に) / B の token の追加・墓石 = A が updating に落ちる / same では落とさない', async () => {
+  const A = 'amazon_settlement_flat_v1';
+  // A の complete の行 (policy は 1 つなので受け口では作れない = 表に直接。manifest は形だけ)
+  const putA = async () => {
+    await pg.query(`delete from core.finance_coverage where source = $1`, [A]);
+    await pg.query(`insert into core.finance_coverage (company_id, mall, scope_key, source, state, generation, run_token, updating_at, complete_to, settlements_through, source_revision,
+        headers_count, headers_checksum, receipt_count, receipt_lines, receipt_digest, inventory_snapshot_id, inventory_count, inventory_digest, inventory_completed_at, initial_marker_id, initial_marker_digest,
+        selected_documents_count, selected_documents_digest, evidence_chain_from, evidence_chain_through, expected_report_count, expected_report_digest, inventory_runs_digest, request_hash, completed_at)
+      values (1, 'amazon', 'jp', $1, 'complete', 3, $2, now(), '2026-06-10', '2026-06-10T15:00:00Z', 1, 1, $3, 0, 0, $3, '1', 0, $3, '2026-06-11T00:00:00Z', '1', $3, 1, $3,
+        '2025-12-01T00:00:00Z', '2026-06-11T00:00:00Z', 0, $3, $3, $3, now())`, [A, TOK2, H('a')]);
+  };
+  const stA = async () => (await pg.query(`select state, invalidated_reason from core.finance_coverage where source = $1`, [A])).rows[0];
+  // A の既存の行 (token 無しで入れる = 今の送り手と同じ道)
+  await sendChunk(chunkBody([['SA-1', [row('2026-06-25', 'ZZ', { units_ordered: 1, sales_principal_jpy: 7, source: A })]]]));
+  await putA();
+  await upd(12, TOK);   // B (= U) の今の世代
+  const before = await receiptOf('SA-1');
+  const nA = async () => Number((await one(`select count(*) as n from core.order_finance_daily where mall_order_no = 'SA-1' and source = $1`, [A])).n);
+  // ① B の token で A の既存の行を置き換える / 墓石にする = 409・何も消さない・A は complete のまま
+  await rejects(() => sendChunk(tokChunk([['SA-1', [row('2026-06-25', 'ZZ', { units_ordered: 1, sales_principal_jpy: 7 })]]], 12, TOK)), 'COVERAGE_MISMATCH', /既存の行に別の source \(amazon_settlement_flat_v1\)/);
+  await rejects(() => sendChunk(tokChunk([['SA-1', []]], 12, TOK)), 'COVERAGE_MISMATCH', /既存の行に別の source/);
+  assert.deepEqual([await receiptOf('SA-1'), await nA()], [before, 1]);
+  assert.deepEqual(await stA(), { state: 'complete', invalidated_reason: null });
+  // ② B の token の追加 = 受領記録が変わる = A の complete は今の受領記録と食い違う → updating (ほかの coverage の書き込み)。B 自身は updating のまま (印なし)
+  const r1 = await sendChunk(tokChunk([['SB-1', [row('2026-06-25', 'ZZ', { units_ordered: 1, sales_principal_jpy: 3 })]]], 12, TOK));
+  assert.deepEqual([r1.applied, r1.coverage_invalidated], [1, 1]);
+  assert.deepEqual(await stA(), { state: 'updating', invalidated_reason: 'other_coverage_finance_write' });
+  const b = await covRow();
+  assert.deepEqual([b.state, b.g, b.invalidated_at], ['updating', '12', null]);
+  // ③ B の token の墓石 (Codex の例) も同じ
+  await putA();
+  const r2 = await sendChunk(tokChunk([['SB-1', []]], 12, TOK));
+  assert.deepEqual([r2.applied, r2.coverage_invalidated], [1, 1]);
+  assert.deepEqual(await stA(), { state: 'updating', invalidated_reason: 'other_coverage_finance_write' });
+  // ④ 受領記録を変えない (same) token の chunk は落とさない
+  await putA();
+  const r3 = await sendChunk(tokChunk([['SB-1', []]], 12, TOK));
+  assert.deepEqual([r3.applied, r3.same, r3.coverage_invalidated], [0, 1, 0]);
+  assert.deepEqual(await stA(), { state: 'complete', invalidated_reason: null });
+  await pg.query(`delete from core.finance_coverage where source = $1`, [A]);
+});
 
 console.log('core.finance_coverage_state の差し替え = 0049 の mart が正式な値を出す');
 const profitRows = async () => (await pg.query(`select economic_date_jst::text as d, listing_id, day_finance_status, contribution_before_ad_incl_jpy, finance_coverage_generation::text as g,
     finance_source_revision::text as rev from mart.amazon_profit_daily_range(1::smallint, 'amazon', 'jp', '2026-06-01', '2026-06-30') where listing_id = $1 order by 1`, [LA])).rows;
 await t('🚨 complete のときだけ: complete_to (6/10) 以前の日 = complete・正式な寄与が出る / それより後 = provisional・null / 世代と版も coverage から', async () => {
-  // 今は updating (無効の印) = 全部 null
+  // 今は updating (世代 12) = 全部 null
   let rows = await profitRows();
   assert.ok(rows.length > 0 && rows.every((r) => r.day_finance_status !== 'complete' && r.contribution_before_ad_incl_jpy == null), JSON.stringify(rows));
-  assert.ok(rows.every((r) => r.g === '11' && r.rev == null));
+  assert.ok(rows.every((r) => r.g === '12' && r.rev == null));
   await upd(12, TOK);
   assert.equal((await comp(12, TOK, M(expected(), { source_revision: 77 }))).status, 'applied');
   rows = await profitRows();
@@ -416,6 +462,11 @@ await t('POST /order-finance/coverage: 鍵なし 401・形 400・updating 200・
   assert.deepEqual([back.status, back.json.code], [409, 'CONFLICT']);
   const st = await http('POST', '/order-finance/coverage', { body: b({ generation: 3 }) });
   assert.deepEqual([st.status, st.json.status, st.json.current_generation], [200, 'stale', '14']);
+  // 上限を超えた body = 413 で、この口の上限 (64KB) を返す (#1561 Codex R1 Low: 前は共用の文で「12MB」)
+  const big = await http('POST', '/order-finance/coverage', { body: b({ pad: 'x'.repeat(70000) }) });
+  assert.deepEqual([big.status, big.json.error], [413, 'payload too large (64KB)']);
+  const bigChunk = await http('POST', '/order-finance', { body: { pad: 'x'.repeat(13 * 1024 * 1024) } });
+  assert.deepEqual([bigChunk.status, bigChunk.json.error], [413, 'payload too large (12MB)']);   // 財務の chunk の口は 12MB のまま
 });
 await t('GET /order-finance/coverage/status: 行・effective (core.finance_coverage_state)・receipts=1 の digest・source の形 400・鍵なし 401', async () => {
   const s = await http('GET', `${ST}&receipts=1`);
