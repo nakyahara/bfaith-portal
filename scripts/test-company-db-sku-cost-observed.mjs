@@ -71,6 +71,16 @@ await t('原価と状態が変わらない履歴の行 (商品名だけの変化
   const rows = [H('G', BL, 'BASELINE_RESET', 30, 'COMPLETE', 21), H('G', '2026-06-01 00:00:00', 'UPDATE', 30, 'COMPLETE', 22), H('G', '2026-06-10 00:00:00', 'UPDATE', 30, 'OVERRIDDEN', 23)];
   assert.deepEqual(periodsOf(rows, 'G'), [['G', 30, 'COMPLETE', '2026-01-01', '2026-05-04', 'est', 21], ['G', 30, 'COMPLETE', '2026-05-05', '2026-06-10', 'obs', 21], ['G', 30, 'OVERRIDDEN', '2026-06-11', null, 'obs', 23]]);
 });
+await t('🚨 最初の写しの旧い名前 INITIAL_SNAPSHOT (本番の 5/5 の写し) も BASELINE_RESET と同じ = その日から observed・それより前は推定 (2026-09-30 本番の初回の dry-run)', () => {
+  const a = buildObservedPeriods([H('A', BL, 'INITIAL_SNAPSHOT', 100, 'COMPLETE', 1), H('A', '2026-06-10 00:00:00', 'UPDATE', 120, 'COMPLETE', 2)]);
+  const b = buildObservedPeriods([H('A', BL, 'BASELINE_RESET', 100, 'COMPLETE', 1), H('A', '2026-06-10 00:00:00', 'UPDATE', 120, 'COMPLETE', 2)]);
+  assert.deepEqual(a.periods, b.periods);
+  assert.equal(a.baselineDay, b.baselineDay);
+  assert.ok(a.periods.some((p) => p.backfill_method === 'estimated_before_first_snapshot'));
+  // 同じ時刻の UPDATE (本番に 2 行) はふつうの観測 = 翌日から
+  const c = buildObservedPeriods([H('C', BL, 'INITIAL_SNAPSHOT', 500, 'COMPLETE', 1), H('C', BL, 'UPDATE', 500.01, 'COMPLETE', 2), H('C', BL, 'UPDATE', 500, 'COMPLETE', 3)]);
+  assert.deepEqual(c.periods.map((p) => p.cost_jpy), [500, 500]);   // 推定 + 観測 (円に丸めると変化なし = 区切らない)
+});
 await t('🚨 最初の写しに無く後で初めて出たコードは、初めて出た日より前を推定しない / 2 回目の BASELINE_RESET はふつうの観測 (翌日から)', () => {
   const rows = [H('A', BL, 'BASELINE_RESET', 1, 'COMPLETE', 24), H('N', '2026-06-01 00:00:00', 'INSERT', 40, 'COMPLETE', 25), H('N', '2026-08-01 00:00:00', 'BASELINE_RESET', 45, 'COMPLETE', 26)];
   assert.deepEqual(periodsOf(rows, 'N'), [['N', 40, 'COMPLETE', '2026-06-02', '2026-08-01', 'obs', 25], ['N', 45, 'COMPLETE', '2026-08-02', null, 'obs', 26]]);
@@ -79,7 +89,7 @@ await t('🚨 最初の写しに無く後で初めて出たコードは、初め
 await t('最初の写しより前の履歴の行は使わずに数える / 写しが無い・changed_at が読めない・知らない operation は例外 (推測しない)', () => {
   const b = buildObservedPeriods([H('A', '2026-04-01 00:00:00', 'UPDATE', 7), H('OLD', '2026-04-02 00:00:00', 'INSERT', 7), H('A', BL, 'BASELINE_RESET', 1)]);
   assert.deepEqual([b.ignoredBeforeBaseline, b.codes], [2, ['A']]);
-  assert.throws(() => buildObservedPeriods([H('A', '2026-06-01 00:00:00', 'INSERT', 1)]), /BASELINE_RESET/);
+  assert.throws(() => buildObservedPeriods([H('A', '2026-06-01 00:00:00', 'INSERT', 1)]), /最初の写し/);
   assert.throws(() => buildObservedPeriods([H('A', BL, 'BASELINE_RESET', 1), H('A', '2026/06/01 00:00:00', 'UPDATE', 1)]), /changed_at が読めない/);
   assert.throws(() => buildObservedPeriods([H('A', BL, 'BASELINE_RESET', 1), H('A', '2026-02-30 00:00:00', 'UPDATE', 1)]), /changed_at が読めない/);
   assert.throws(() => buildObservedPeriods([H('A', BL, 'BASELINE_RESET', 1), H('A', '2026-06-01 00:00:00', 'MERGE', 1)]), /知らない operation/);
