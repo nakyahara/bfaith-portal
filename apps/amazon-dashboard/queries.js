@@ -176,6 +176,12 @@ function adCost(db, from, to) {
 //   課税の手数料 = 販売手数料・FBA 配送代行・在庫保管料・成約料・送料 / ギフト包装のチャージバック (profit_amount が引いている手数料の全部)
 //   補てん (破損・紛失・SAFE-T・取消) と返金は税抜の額のまま (手数料ではない)
 export const FEE_TAX_RATE = 0.10;
+// 🆕 2026-09-30: Amazon 広告の費用 (fact_ad_spend の ad_cost) は **税抜** = 請求書で消費税 10% が別に載る
+//   (Amazon 広告「スポンサー広告の追加ポリシー」: 支払う手数料には消費税を含む税金は含まれない。自社の決済にも広告の請求の行は無い)。
+//   税抜で引いた利益 (主) = 広告費をそのまま引く / 税込で引いた計算 (_incl) = 広告費 × 1.1 を引く (手数料を税込のまま引くのと同じ土俵にそろえる)。
+//   それまで _incl も広告費をそのまま引いていた = 税込の広告の後の利益が広告費の 10% だけ高く出ていた (AI_reference CompanyDB構想/13 D-61)
+export const AD_TAX_RATE = 0.10;
+export const adCostIncl = (adCost) => adCost * (1 + AD_TAX_RATE);
 export const TAXED_FEES_SQL = `(commission_jpy + fba_fulfillment_jpy + fba_storage_jpy + closing_fee_jpy + shipping_chargeback_jpy + giftwrap_chargeback_jpy)`;
 // promotion_tax_jpy が NULL = まだ送られていない行 (古い miniPC から来た行。Codex #1522 R1 High) → 0 として計算し、PROMO_TAX_MISSING_DAYS_SQL の日数を画面に出す
 export const PROFIT_EX_SQL = `(profit_amount + ${TAXED_FEES_SQL} * ${FEE_TAX_RATE} / (1 + ${FEE_TAX_RATE}) + COALESCE(promotion_tax_jpy, 0))`;
@@ -332,7 +338,7 @@ export function getOverview() {
       settled_profit_after_ads: Math.round(settled.profit_before_ads - settledAds),
       // 税込で引いた計算 (手数料を決済の額のまま引く・2026-09-29)
       settled_profit_before_ads_incl: Math.round(settled.profit_before_ads_incl),
-      settled_profit_after_ads_incl: Math.round(settled.profit_before_ads_incl - settledAds),
+      settled_profit_after_ads_incl: Math.round(settled.profit_before_ads_incl - adCostIncl(settledAds)),   // 広告費は税抜 = 税込で引く計算では × 1.1 (2026-09-30)
       settled_to: sTo >= p.from ? sTo : null,
       settled_refunds: Math.round(settled.refunds),
       settled_days: settled.days_with_data,
@@ -397,7 +403,7 @@ export function getTrend(from, to, granularity) {
   const rows = [...map.values()].sort((a, b) => a.bucket < b.bucket ? -1 : 1).map(r => ({
     ...r,
     profit_after_ads: r.profit_before_ads - r.ad_cost,
-    profit_after_ads_incl: r.profit_before_ads_incl - r.ad_cost,   // 税込で引いた計算 (2026-09-29)
+    profit_after_ads_incl: r.profit_before_ads_incl - adCostIncl(r.ad_cost),   // 税込で引いた計算 (2026-09-29)・広告費は × 1.1 (2026-09-30)
     margin_pct: r.revenue_excl > 0 ? Math.round((r.profit_before_ads - r.ad_cost) / r.revenue_excl * 1000) / 10 : null,
     tacos_pct: r.revenue_excl > 0 ? Math.round(r.ad_cost / r.revenue_excl * 1000) / 10 : null,
   }));
@@ -623,7 +629,7 @@ export function getWaterfall(from, toReq, sku) {
     { key: 'profit_after_ads', label: '広告後利益', amount: s.profit_before_ads - adCostValue, kind: 'total' },
   ];
   // 税込で引いた計算 (2026-09-29) も返す
-  const incl = { profit_before_ads: Math.round(s.profit_before_ads_incl), profit_after_ads: Math.round(s.profit_before_ads_incl - adCostValue) };
+  const incl = { profit_before_ads: Math.round(s.profit_before_ads_incl), profit_after_ads: Math.round(s.profit_before_ads_incl - adCostIncl(adCostValue)) };   // 広告費は × 1.1 (2026-09-30)
   return { from, to: toReq, settled: win, sku: sku || null, steps: steps.map(x => ({ ...x, amount: Math.round(x.amount) })), incl,
     not_in_profit: Math.round(s.not_in_profit), promo_tax_missing_days: s.promo_tax_missing_days || 0 };
 }
@@ -663,9 +669,9 @@ export function getSkuProfit(from, to, opts = {}) {
       profit_after_easy_ship: Math.round(profitAfter - exTax(r.easy_ship_incl || 0)),
       fees_incl: Math.round(r.fees_incl),
       profit_before_ads_incl: Math.round(r.profit_before_ads_incl),
-      profit_after_ads_incl: Math.round(r.profit_before_ads_incl - adTotal),
+      profit_after_ads_incl: Math.round(r.profit_before_ads_incl - adCostIncl(adTotal)),   // 広告費は × 1.1 (2026-09-30)
       easy_ship_incl: Math.round(r.easy_ship_incl || 0),
-      profit_after_easy_ship_incl: Math.round(r.profit_before_ads_incl - adTotal - (r.easy_ship_incl || 0)),
+      profit_after_easy_ship_incl: Math.round(r.profit_before_ads_incl - adCostIncl(adTotal) - (r.easy_ship_incl || 0)),
       margin_pct: r.revenue_excl > 0 ? Math.round(profitAfter / r.revenue_excl * 1000) / 10 : null,
       cost_status: r.all_cost_complete === 1 ? 'complete' : r.cost_status_sample,
       // 色分け用: gross 黒字なのに広告で赤字 = 'ad_bleed'、両方赤 = 'loss'

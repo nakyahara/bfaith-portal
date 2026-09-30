@@ -188,6 +188,32 @@ check('getWaterfall SKU', () => {
   assert(ad.amount > 0, 'SKU広告費(直接+按分)>0');
 });
 
+// 🆕 2026-09-30: 税込で引いた計算 (_incl) の広告の後は広告費 × 1.1 を引く (広告費は税抜)。全部の _incl の場所で確かめる (Codex #1550 R1)
+//   差 = 広告費 × 1.1 (丸めで ±1 円) かつ 広告費そのまま (旧い式) ではない
+check('税込で引いた計算の広告の後 = 広告費 × 1.1 を引く (推移・内訳の段・SKU の表・Easy Ship の後)', () => {
+  const near = (a, b) => Math.abs(a - b) <= 1;
+  const tr = q.getTrend(d(29), today, 'day').rows.filter((x) => x.ad_cost > 20);
+  assert(tr.length > 0, '広告費のある日がある');
+  for (const x of tr) assert(Math.abs((x.profit_before_ads_incl - x.profit_after_ads_incl) - x.ad_cost * 1.1) < 1e-6, '推移の日 ' + JSON.stringify([x.bucket, x.profit_before_ads_incl, x.profit_after_ads_incl, x.ad_cost]));
+  const trm = q.getTrend(d(89), today, 'month').rows.filter((x) => x.ad_cost > 20);
+  assert(trm.length > 0, '広告費のある月がある');
+  for (const x of trm) assert(Math.abs((x.profit_before_ads_incl - x.profit_after_ads_incl) - x.ad_cost * 1.1) < 1e-6, '推移の月 ' + JSON.stringify([x.bucket, x.ad_cost]));
+  for (const sku of [null, 'pr_alpha']) {
+    const wf = q.getWaterfall(d(29), today, sku);
+    const ad = wf.steps.find((s) => s.key === 'ad_cost').amount;
+    const diff = wf.incl.profit_before_ads - wf.incl.profit_after_ads;
+    assert(ad > 20 && near(diff, ad * 1.1) && !near(diff, ad), '内訳の段 ' + JSON.stringify([sku, diff, ad]));
+  }
+  const rows = q.getSkuProfit(d(29), today, {}).rows.filter((r) => r.ad_direct + r.ad_allocated > 20);
+  assert(rows.length > 0, '広告費のある SKU がある');
+  for (const r of rows) {
+    const ad = r.ad_direct + r.ad_allocated;
+    const diff = r.profit_before_ads_incl - r.profit_after_ads_incl;
+    assert(near(diff, ad * 1.1) && !near(diff, ad), 'SKU の表 ' + JSON.stringify([r.seller_sku, diff, ad]));
+    assert(near(r.profit_after_ads_incl - r.profit_after_easy_ship_incl, r.easy_ship_incl), 'Easy Ship の後 ' + JSON.stringify([r.seller_sku, r.profit_after_ads_incl, r.profit_after_easy_ship_incl, r.easy_ship_incl]));
+  }
+});
+
 const sp = check('getSkuProfit', () => {
   const r = q.getSkuProfit(d(29), today, {});
   assert(r.rows.length === 3, '3 SKU');
@@ -332,7 +358,7 @@ check('ほかのタブも決済のそろった日で切る', () => {
   // 2026-09-29: 主の利益は税抜で引いた計算 (手数料 ÷ 1.1)・税込で引いた計算 (profit_amount) も _incl で持つ
   const settledProfitEx = db.prepare(`SELECT COALESCE(SUM(${q.PROFIT_EX_SQL}),0) AS p FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(monthFrom, last).p;
   assert(tm.settled_profit_after_ads === Math.round(settledProfitEx - expAds), '今月のタイルの確定利益 (広告後・税抜で引く) はそろった日までの広告費だけ引く ' + JSON.stringify([tm.settled_profit_after_ads, settledProfitEx, expAds]));
-  assert(tm.settled_profit_after_ads_incl === Math.round(settledProfit - expAds), '税込で引いた計算も持つ ' + JSON.stringify([tm.settled_profit_after_ads_incl, settledProfit, expAds]));
+  assert(tm.settled_profit_after_ads_incl === Math.round(settledProfit - expAds * 1.1), '税込で引いた計算も持つ (広告費は税抜 = × 1.1 を引く・2026-09-30) ' + JSON.stringify([tm.settled_profit_after_ads_incl, settledProfit, expAds]));
   const feesIn = db.prepare(`SELECT COALESCE(SUM(${q.TAXED_FEES_SQL}),0) AS f, COALESCE(SUM(promotion_tax_jpy),0) AS t FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(monthFrom, last);
   assert(Math.abs((settledProfitEx - settledProfit) - (feesIn.f / 11 + feesIn.t)) < 0.01 && feesIn.f > 0, '税抜 − 税込 = 課税の手数料 × 1/11 + 値引きの税の分 ' + JSON.stringify([settledProfitEx - settledProfit, feesIn.f / 11]));
   assert(tm.ad_cost === Math.round(campIn(monthFrom, today)), '広告費の行は今日までの実額のまま');
