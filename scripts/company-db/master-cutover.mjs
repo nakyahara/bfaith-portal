@@ -6,11 +6,15 @@
  *   node -r dotenv/config scripts/company-db/master-cutover.mjs --status
  *   node -r dotenv/config scripts/company-db/master-cutover.mjs --to frozen --actor someone@b-faith.biz --evidence evidence.json [--note "理由"] --yes
  * 接続 = env COMPANY_DB_MASTER_OPS_URL (運用のロール master_ops = 段階を進める関数を実行できるだけ。create-master-edit-roles.mjs が作る) か --url
- * 段階: legacy_open → frozen → company_owner → new_open (1 段ずつ・戻さない。DB の関数が門と証拠を確かめる):
- *   → frozen:        証拠 { drain: { done: true, checked_by, checked_at }, manual_entries_stopped: [{ entry, stopped_by, stopped_at }, ...] }
- *                    + render・minipc が古い入口の門を持つ版で起動した記録 (⑤-3 の門が書く = ⑤-3 を配るまで進めない)
- *   → company_owner: 証拠 { owner_hash } + 全部の場所が frozen の後にそのハッシュで起動した記録
- *   → new_open:      証拠 { owner_hash } (同じもの) + 全部の場所が company_owner の後にそのハッシュで起動した記録
+ * 段階: legacy_open → frozen → company_owner → new_open (1 段ずつ・戻さない。DB の関数 ops.set_master_cutover_phase が門の記録と証拠を確かめる):
+ *   共通の証拠 { expected_builds: { render: [build_id, ...], minipc: [...] }, manifest_hash, owner_hash }
+ *     + 門の記録 (ops.master_legacy_gate_acks・古い入口の門 = ⑤-3 が起動時と定期に書く) が、各場所に 15 分以内に 1 つ以上あり、
+ *       直近 15 分に記録した全部の実体 (instance_id) の build が expected_builds にあり、manifest_hash・owner_hash が証拠と同じ
+ *   → frozen:        + manual_entries_stopped: [{ id, by, at }, ...] (id の集まり = manifest の手の入口 kind='manual' と完全に同じ)
+ *                    + drain: { done: true, checked_by, checked_at }。owner_hash = いまの持ち主表 (全部 load) のハッシュ
+ *   → company_owner: owner_hash = 新しい持ち主表のハッシュ。門の記録は frozen に入った後・phase_seen = 'frozen'・処理中 0
+ *   → new_open:      owner_hash は company_owner と同じ。門の記録は company_owner に入った後・phase_seen = 'company_owner'・処理中 0
+ *   ops.master_cutover_prereq_problems(from, to) が問題を返したら、どの段階も進めない (後の PR が条件を足す口)
  * 🚨 --to は切替日の手順書の順番でだけ使う (定期実行にしない)。--yes が無ければ何もしない
  * 終了コード: 0 = 成功 / 1 = 失敗 / 2 = 引数不正
  */

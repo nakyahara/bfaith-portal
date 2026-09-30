@@ -116,7 +116,7 @@ await ta('[!] 期待する表がすべてある', async () => {
     // 0046 観測の原価 (13 §3.4・D7b-2)
     'core.sku_cost_observed_loads', 'core.sku_cost_observed',
     // 0050 マスタ入力画面の土台 (14 §6 ⑤-1)
-    'ops.master_cutover_state', 'ops.master_cutover_events', 'ops.master_legacy_gate_acks', 'ops.master_edit_requests', 'ops.sku_component_requests',
+    'ops.master_cutover_state', 'ops.master_cutover_events', 'ops.master_legacy_manifests', 'ops.master_legacy_gate_acks', 'ops.master_edit_requests', 'ops.sku_component_requests',
     'ops.ne_set_observation_runs', 'ops.ne_set_observations', 'ops.sku_component_breaches',
   ];
   const missing = expect.filter((t) => !have.has(t));
@@ -127,7 +127,7 @@ await ta('[!] 期待する表がすべてある', async () => {
   assert.deepEqual(views.map((v) => v.t).sort(), ['mart.v_ad_spend_daily', 'mart.v_cross_mall_diff', 'mart.v_finance_account_fees_monthly', 'mart.v_finance_daily', 'mart.v_listing_360', 'mart.v_order_finance_summary', 'mart.v_order_finance_uncovered', 'mart.v_product_360', 'mart.v_product_dq', 'mart.v_purchase_backorder_by_sku', 'mart.v_purchase_order_open', 'mart.v_sales_daily', 'mart.v_shipments_daily', 'mart.v_shipments_unlinked', 'mart.v_sku_cost_observed_effective', 'mart.v_sku_stock', 'mart.v_warehouse_stock_current']);
 });
 
-await ta('[!] 0050 (14 §6 ⑤-1・#1563 R1): 切替の段階は legacy_open から (門の記録が無い = 進めない)・セットの 2 列は null で足す・記録と観測は追記だけ・原価の期間の重なりの守りは夜間ロードを見ない・段階を進める関数と観測を書く関数は public に実行させない', async () => {
+await ta('[!] 0050 (14 §6 ⑤-1・#1563 R1・R2): 切替の段階は legacy_open から (門の記録が無い = 進めない)・セットの 2 列は null で足す・記録と観測は追記だけ・原価の期間の重なりの守りは夜間ロードを見ない・段階を進める関数と観測を書く関数は public に実行させない', async () => {
   assert.deepEqual((await q('select phase from ops.master_cutover_state'))[0], { phase: 'legacy_open' });
   const cols = await q("select column_name as c, data_type as t, is_nullable as n from information_schema.columns where table_schema = 'core' and table_name = 'skus' and column_name in ('set_sales_class_override', 'handling_own') order by 1");
   assert.deepEqual(cols.map((r) => [r.c, r.t, r.n]), [['handling_own', 'text', 'YES'], ['set_sales_class_override', 'smallint', 'YES']]);
@@ -136,14 +136,18 @@ await ta('[!] 0050 (14 §6 ⑤-1・#1563 R1): 切替の段階は legacy_open か
   for (const t of ['trg_append_only_row', 'trg_sku_costs_no_overlap', 'trg_sku_component_requests_guard', 'trg_master_cutover_state_guard']) assert.ok(trg.some((r) => r.t === t), `trigger ${t} が無い`);
   const fn = await q("select pg_get_functiondef('core.guard_sku_cost_overlap()'::regprocedure) as d");
   assert.match(fn[0].d, /portal_master_edit/);
-  for (const t of ['master_cutover_events', 'master_legacy_gate_acks', 'master_edit_requests', 'ne_set_observation_runs', 'ne_set_observations']) {
+  for (const t of ['master_cutover_events', 'master_legacy_manifests', 'master_legacy_gate_acks', 'master_edit_requests', 'ne_set_observation_runs', 'ne_set_observations']) {
     assert.ok((await q("select 1 from pg_trigger where tgrelid = ('ops.' || $1)::regclass and tgname = 'trg_append_only_row'", [t])).length === 1, `${t} が追記だけでない`);
   }
   const acl = await q(`select p.proname, p.prosecdef, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-    where n.nspname = 'ops' and p.proname in ('set_master_cutover_phase', 'record_ne_set_observations') order by 1`);
-  assert.deepEqual(acl.map((r) => [r.proname, r.prosecdef, r.pub]), [['record_ne_set_observations', false, false], ['set_master_cutover_phase', true, false]]);
-  assert.deepEqual((await q("select ops.master_cutover_required_hosts() as h, ops.master_legacy_gates_required_version() as v"))[0], { h: ['minipc', 'render'], v: 1 });
-  await rejects(() => q(`select ops.set_master_cutover_phase('frozen', 'x', '{"drain":{"done":true,"checked_by":"x","checked_at":"2030-01-01"},"manual_entries_stopped":[{"entry":"NE","stopped_by":"x","stopped_at":"2030-01-01"}]}'::jsonb)`), /acks_missing/);
+    where n.nspname in ('ops', 'core') and p.proname in ('set_master_cutover_phase', 'record_ne_set_observations', 'record_legacy_gate_ack', 'master_cutover_prereq_problems', 'audit_master_change', 'bump_parent_version', 'lock_suppliers_for_share') order by 1`);
+  assert.deepEqual(acl.map((r) => [r.proname, r.prosecdef, r.pub]), [['audit_master_change', true, false], ['bump_parent_version', true, false], ['lock_suppliers_for_share', true, false], ['master_cutover_prereq_problems', true, false],
+    ['record_legacy_gate_ack', true, false], ['record_ne_set_observations', true, false], ['set_master_cutover_phase', true, false]]);
+  assert.deepEqual((await q("select ops.master_cutover_required_hosts() as h, ops.master_cutover_ack_fresh_minutes() as m, ops.master_cutover_prereq_problems('legacy_open', 'frozen') as p"))[0], { h: ['minipc', 'render'], m: 15, p: [] });
+  await rejects(() => q(`select ops.set_master_cutover_phase('frozen', 'x', '{}'::jsonb)`), /manifest_hash/);   // 門の記録も manifest も無い = 進めない
+  // security definer の関数は search_path を固定して最後に pg_temp
+  const cfg = await q("select p.proname, p.proconfig from pg_proc p join pg_namespace n on n.oid = p.pronamespace where p.prosecdef and n.nspname in ('ops', 'core') and p.proname in ('set_master_cutover_phase', 'record_ne_set_observations', 'record_legacy_gate_ack', 'master_cutover_prereq_problems', 'audit_master_change', 'bump_parent_version', 'lock_suppliers_for_share')");
+  for (const r of cfg) assert.match(String(r.proconfig), /search_path=.*pg_temp/, r.proname);
 });
 
 await ta('[!] 0047 (13 §3.2・§3.7・D7b-1a): 財務の行に分けられない部品の 4 列 (既定 0)・日 × 正規化 SKU の関数 mart.finance_daily_sku_range', async () => {
