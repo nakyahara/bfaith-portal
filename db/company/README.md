@@ -1268,6 +1268,76 @@ select valid_from, valid_to, cost_jpy, cost_status, cost_basis from mart.v_sku_c
 
 試験 = `node scripts/test-company-db-sku-cost-observed.mjs` (32 件: 0046 の適用前は ⚠️ / 🛑 安全弁 / 見出しと実際の行の数のずれを直す / 期間の作り方 (JST の翌日・写しの日の例外と推定・同じ changed_at / 同じ日の最後・DELETE と再 INSERT・状態・丸め・まとめる・後で出たコードは推定しない・写しの前の行) / 衝突の隔離と結びつかない数 / 正規の JSON と checksum / 検証 / applied・same・409・stale・入れ替え・見出しは追記だけ / SKU_UNRESOLVED・巻き戻し / 読む口の境目 / HTTP と server.js の配線 / 送り手 = 台帳の世代・変わりなし・応答が失われた (同じ回・回をまたぐ)・409・stale・dry-run は何も書かない・lock / CLI の失敗 = exit 1 / daily-sync・retry・jobs-registry の配線)
 
+## Amazon の利益の mart (0049。D7b-3。Company DB構想 13 §3.3・§3.5・§3.6・§3.7)
+
+設計の正本 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』v26。Company DB に入った Amazon の財務 (0043・0047) に **原価・広告費・Easy Ship** を足し、**日 × 出品の利益** を関数で都度計算する (表は作らない・D-60)。
+🚨 **分からないもの (決済のそろい・原価・広告費・返品数) を 0 として利益を確定しない**: 正式な列は null + 理由のコード。0 と仮定した値は別の名前 (`…_assuming_incomplete_zero_…`) = AI はこれを「利益」と読まない。
+🚨 **決済のそろい (coverage) はまだ無い** (D7b-1b・後の PR) → `core.finance_coverage_complete_to()` が **今は常に null** = 全部の日が `day_finance_status = provisional / missing` = **正式な利益は全部 null** (0 と仮定の値は出る)。D7b-1b がこの関数を差し替えると正式な値が出る (この mart は変えない)。
+
+- **関数**:
+  - `mart.amazon_profit_daily_range(会社, モール, scope, from, to)` = **日 × 出品の寄与の利益** (月の手数料を引く前)。行の鍵 = `listing_id` / `seller_sku_norm` / `listing_resolution` (resolved = 出品あり・seller_sku_norm は null / unresolved = 出品に結びつかない正規化 seller SKU・listing_id は null)。その期間に財務・広告・Easy Ship のどの行も無ければ 0 行
+  - `mart.amazon_profit_day_totals_range(会社, モール, scope, from, to)` = `row_kind` = `day` (取引の無い日も 1 行) / `calendar_month` (期間が暦の月をまるごと含む) / `range_month_subtotal` (期間の端の一部だけの月) / `range_total` (重ならない)。`period_from` / `period_to` (両端を含む)・`economic_date_jst` (day だけ)・`month_start` (月の行だけ)
+  - 契約 = `from <= to`・最大 400 日 (両端を含む)・**今は amazon / jp だけ** (受け取り時の出品の決め方が shop_code を見ない = Amazon のアカウントが 1 つの間だけ正しい)・違えば例外 (22023 `invalid_input`)
+  - 内部の部品 (直に呼ばない): `mart._amazon_profit_finance_days` (日の決済の状態) / `_amazon_profit_ad_days` (広告の日の状態) / `_amazon_profit_ad_children` (広告の子を今のマスタで結び直す) / `_amazon_easy_ship_alloc` (Easy Ship の割り振り) / `_amazon_profit_rows` / `_amazon_profit_totals`
+  - `core.finance_coverage_complete_to(会社, モール, scope, source)` (今は null・D7b-1b が差し替える) / `mart.amazon_profit_composition_audit_since()` (0049 の適用の時刻) / `mart.amazon_account_fee_tax_rate(line_kind)` (月の手数料の税の表)
+- **今のマスタで結び直す (D-64・`master_basis = 'current'`)**: 財務 (`mart.finance_daily_sku_range` の正規化 seller SKU の子) は今の `core.listings` の `listing_norm` の **直接の一致** (0043 の受け口と同じ = 会社 × モールで 1 件のときだけ・0 件 / 2 件以上 = 未解決)。
+  広告は `target_granularity = 'sku'` の行だけ `core.resolve_listing_id` (external_ids の別名も含む)・**asin / none は常に未解決** (ASIN が出品のコードと同じ文字でも)。保存済みの `listing_id` は診断 (`received_listing_ids`) だけ。構成も今の `core.listing_components`
+- **原価** (§3.3) = 構成 × SKU ごとに **その日を覆う 1 行**: `core.sku_costs` と観測の原価 (`mart.v_sku_cost_observed_effective`) から `valid_from DESC, created_at DESC, 行の ID DESC` の最初 (同じ日に 2 回変わった取込の行を二重に数えない)。
+  採る状態 = COMPLETE / OVERRIDDEN だけ (override_zero の 0 円は正しい 0)・PARTIAL / MISSING / 行なし = 原価不明。`cost_basis` = 構成の中の最も弱いもの (missing > estimated > observed > sku_costs)・`missing_cost_sku_ids`・`cost_sku_cost_ids` / `cost_observed_ids`
+- **金額の式** (§3.5b・固定): `cogs_jpy = units_net_sold × Σ(qty × 原価)` (原価が 1 つでも不明なら null・数 0 でも null) / `contribution_before_ad_incl_jpy = profit_before_cogs_jpy − cogs_jpy` /
+  `contribution_before_ad_excl = 上 + taxable_sku_fee_cost_jpy / 11 + promotion_tax_jpy` (課税の 6 手数料) / **`contribution_after_ad_incl = before_incl − ad_cost × 1.1`** (✅ 広告費は税抜 = D-61) / `contribution_after_ad_excl = before_excl − ad_cost`。
+  税抜・広告・0 と仮定・合計は numeric を途中で丸めず、返すときだけ小数 2 桁 (`_jpy` を付けない)
+- **理由のコード** (`profit_incomplete_reasons`・固定の順) と **列ごとの null** (試験で固定):
+
+| コード | 意味 | 行の寄与 (before ad) | 行の広告の後 | 日の合計 before / after ad / after fees |
+|---|---|---|---|---|
+| `finance_incomplete` | 日が complete でない (coverage) | null | null | null / null / null |
+| `finance_unclassified` | 分けられない部品の数 > 0 (SKU の行: unclassified + unmapped の部品・旧い形の版の行)。**金額でなく数** | null | null | null / null / null (手数料の側だけなら after fees だけ null) |
+| `refund_units_unknown` | 返品の単価が無い (unit_price_missing) | null | null | null / null / null |
+| `refund_units_partial_month` | 返品数が月の推定で、月末まで決済がそろっていない | null | null | null / null / null |
+| `listing_unresolved` / `composition_missing` / `cost_missing` | 出品が 1 つに決まらない / 構成 0 件 / 原価不明 | null | null | null / null / null |
+| `ad_not_collected` / `ad_missing` / `ad_legacy_unverified` | 2026-02-05 より前 / 広告の日の記録 (親) が無い / 古い取込の日 | 値 | null | 値 / null / null |
+| `ad_unresolved` | その日に出品に結びつかない広告の行がある | 値 | null | 値 / **値** (ad_spend_days の全額を引く) / 値 |
+
+  - `assumed_zero_reasons` = 上から `refund_units_partial_month` を除いたもの (0 と仮定の値で 0 と置いたもの。partial は推定の返品数を使う)
+  - `master_notes` (情報の印・**値を止めない**・固定の順): `pre_audit_unverifiable` (前日の JST 00:00 が `composition_audit_since` = 0049 の適用より前) / `current_after_recorded_change` (前日の JST 00:00 以降にその出品の構成か識別 (INSERT・DELETE・mall・shop_code・listing_code) の監査の記録) / `listing_changed_since_received`。
+    `composition_basis` = listing_unresolved → missing → pre_audit_unverifiable → current_after_recorded_change → current_no_recorded_change (前の 2 つだけがゲート)。日 / 月 / 期間は `master_note_counts` (jsonb・鍵は 3 つ)
+  - `composition_hash` / `cost_input_hash` = 正規の JSON の SHA-256 (`apps/company-db/canonical-hash.mjs` と同じ規則・ID は 10 進の文字列)
+- **Easy Ship** (D-59) = 注文 × 計上日で正味にしてから同じ注文の SKU の本体売上の割合 (合計 0 以下なら等分) で 1 円単位・端数は小数部の大きい順。**期間に依らない** (本体売上は期間の外の日も含む全部の日)。
+  行の `easy_ship_alloc_jpy` は内訳 (寄与から引かない)・日の合計は月の手数料で引く。売上の行が無い注文は `easy_ship_unallocated_jpy` / `_count`
+- **日の合計**: 月の手数料 `account_fee_cost_jpy = −Σ account_fee_amount_jpy` (8 種類の列も)・税抜は種類ごとに ÷ 1.1 (Amazon の決済の手数料は全部税込)・`profit_after_account_fees_* = contribution_after_ad_* − 手数料`。
+  分けられない金額は 3 区分 (`unknown_line_mapped_jpy` / `unclassified_mapped_jpy` / `unmapped_jpy`)。**保存則** = `net_jpy = profit_before_cogs_jpy + sales_tax_jpy − account_fee_cost_jpy + unknown_line_mapped_jpy + unclassified_mapped_jpy + unmapped_jpy + not_account_fee_mapped_jpy`。
+  不完全な日 = `before_ad_incomplete_days` / `after_ad_incomplete_days` / `after_account_fees_incomplete_days` (と数)
+- **読む口 (Render)**: `GET /apps/company-db/sync/amazon-profit/daily?mall=amazon&scope=jp&from&to` / `GET …/amazon-profit/totals?…` (x-sync-key・statement_timeout 120s・0049 の前は 409 `not_migrated`)。
+  ID と ID の配列は 10 進の文字列・円と個数は数・numeric は小数 2 桁の文字列・日付は YYYY-MM-DD・時刻は UTC の ISO
+- `finance_coverage_generation` / `finance_source_revision` は D7b-1b まで null・`calculation_version = 'amazon_profit_v1'`・`calculated_at` = 1 回の呼び出しで同じ値
+
+**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0049 は関数だけ (表・既存の関数に触らない) = Render は旧いコードのままでも困らない (読む口が 409 `not_migrated` になるだけ)
+
+```
+# 本番で使っていない worktree から (miniPC の PowerShell。.env は本体の 1 つを読む)
+cd C:\Users\bfaith\bfaith-portal
+git fetch origin
+git worktree add C:\tmp\d7b3 origin/master
+cd C:\tmp\d7b3
+npm ci
+$env:DOTENV_CONFIG_PATH = 'C:\Users\bfaith\bfaith-portal\.env'
+node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                 # 0049 だけが出ること
+node -r dotenv/config scripts\company-db\migrate.mjs                           # 0049 (applied=1)
+cd C:\Users\bfaith\bfaith-portal
+git worktree remove C:\tmp\d7b3
+```
+
+```sql
+-- 読むだけの確かめ (本適用の後)。今は正式な値は全部 null (D7b-1b の前) = 0 と仮定の値と理由を見る。所要時間も見る (1 か月・400 日)
+select economic_date_jst, listing_code, day_finance_status, contribution_before_ad_incl_jpy, contribution_after_ad_assuming_incomplete_zero_incl, profit_incomplete_reasons
+  from mart.amazon_profit_daily_range(1::smallint, 'amazon', 'jp', '2026-09-01', '2026-09-07') order by 1, 2 limit 50;
+select row_kind, period_from, period_to, profit_after_account_fees_assuming_incomplete_zero_incl, profit_incomplete_reasons, master_note_counts
+  from mart.amazon_profit_day_totals_range(1::smallint, 'amazon', 'jp', '2026-08-01', '2026-09-30') where row_kind <> 'day';
+```
+
+試験 = `node scripts/test-company-db-amazon-profit.mjs` (28 件: coverage が null なら正式な値は全部 null / 差し替えた後の手で計算した値 (税込・税抜・値引きの税・広告 × 1.1・返品の推定・負の手数料・override_zero と原価不明) / 構成 0 件・候補 2 件・出品なし / 広告の状態 (legacy・missing・not_collected) / 分けられない部品の相殺・旧い形の行・単価の無い返品 / 同じ日に 2 回変わった原価・観測と推定 / hash が JS と一致 / ASIN は未解決・別名は結ぶ・未解決は出品の行だけ止める / Easy Ship (割合・等分・端数・返金・期間に依らない・配れない額) / master_notes (受け取りとの違い・監査の記録・タイトルは数えない) / 理由の順と列ごとの null (3 つの coverage で全行) / 日の合計 (列の組ごとの条件・税の表・保存則・row_kind が重ならない・取引の無い日) / 契約 / HTTP (鍵・400・409・ID は文字列))
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。

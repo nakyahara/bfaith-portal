@@ -362,6 +362,53 @@ router.get('/order-finance/uncovered', requireSyncKey, async (req, res) => {
   });
 });
 
+/**
+ * Amazon の利益の mart (D7b-3・0049。設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.5・§3.6) の読む口:
+ *   GET /apps/company-db/sync/amazon-profit/daily?mall=amazon&scope=jp&from&to    mart.amazon_profit_daily_range      (日 × 出品の寄与の利益。構成と出品の結びつけは今のマスタ = master_basis current)
+ *   GET /apps/company-db/sync/amazon-profit/totals?mall=amazon&scope=jp&from&to   mart.amazon_profit_day_totals_range (日 / 暦の月 / 期間の中の月の小計 / 期間の合計 = row_kind)
+ *   契約 = from <= to・最大 400 日 (両端を含む)・今は amazon / jp だけ (400)・statement_timeout 120s・0049 の前は 409 not_migrated
+ *   JSON: ID と ID の配列 (listing_id・*_ids・世代・版) = 10 進の文字列 / 円 (*_jpy)・個数・件数 = 数 / numeric (税抜・広告・0 と仮定・手数料の後) = 小数 2 桁の文字列 /
+ *         日付 = YYYY-MM-DD / 時刻 = UTC の ISO (ミリ秒)。列は関数の戻りの定義 (pg_proc) から作る = 関数に列を足しても受け口を直さなくてよい
+ *   🚨 決済のそろい (D7b-1b) の前は正式な利益 (contribution_* / profit_after_account_fees_*) は全部 null。0 と仮定の値 (…_assuming_incomplete_zero_…) を「利益」と読まない
+ */
+const PROFIT_ID_COLS = new Set(['listing_id', 'observed_generation', 'finance_coverage_generation', 'finance_source_revision']);
+const PROFIT_FNS = {
+  daily: { fn: 'mart.amazon_profit_daily_range', order: `order by r.economic_date_jst, r.listing_id is null, r.listing_id, r.seller_sku_norm collate "C"` },
+  totals: { fn: 'mart.amazon_profit_day_totals_range', order: `order by case r.row_kind when 'day' then 1 when 'range_total' then 3 else 2 end, r.period_from` },
+};
+/** 関数の戻りの列 (RETURNS TABLE = proargmodes 't') から select の式と JS の直し方を作る */
+const profitSelect = async (client, fn) => {
+  const cols = (await client.query(`select a.name, format_type(a.typ, null) as type
+      from pg_proc p cross join lateral unnest(p.proargnames, p.proallargtypes, p.proargmodes::text[]) with ordinality as a(name, typ, mode, ord)
+     where p.oid = $1::regprocedure and a.mode = 't' order by a.ord`, [`${fn}(smallint,text,text,date,date)`])).rows;
+  if (!cols.length || cols.some((c) => !/^[a-z_][a-z0-9_]*$/.test(c.name))) throw new Error(`unexpected result columns of ${fn}`);
+  const exprs = cols.map(({ name, type }) => {
+    const q = `r."${name}"`;
+    if (type === 'date' || type === 'numeric' || (type === 'bigint' && PROFIT_ID_COLS.has(name))) return `${q}::text as "${name}"`;
+    if (type === 'date[]' || type === 'bigint[]') return `${q}::text[] as "${name}"`;   // bigint[] は全部 ID の配列
+    if (type === 'timestamp with time zone') return `to_char(${q} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "${name}"`;
+    return `${q} as "${name}"`;
+  });
+  const numeric = new Set(cols.filter((c) => c.type === 'integer' || (c.type === 'bigint' && !PROFIT_ID_COLS.has(c.name))).map((c) => c.name));
+  return { list: exprs.join(', '), fix: (row) => Object.fromEntries(Object.entries(row).map(([k, v]) => [k, v != null && numeric.has(k) ? Number(v) : v])) };
+};
+for (const [kind, spec] of Object.entries(PROFIT_FNS)) {
+  router.get(`/amazon-profit/${kind}`, requireSyncKey, async (req, res) => {
+    const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+    if (ms.mall !== 'amazon' || ms.scope !== 'jp') return res.status(400).json({ error: 'only mall=amazon & scope=jp for now (the listing resolution does not look at shop_code)' });
+    const rg = financeRangeOf(req, 400); if (rg.error) return res.status(400).json({ error: rg.error });
+    await withPg(res, async (client) => {
+      if (!(await client.query(`select to_regprocedure($1) is not null as ok`, [`${spec.fn}(smallint,text,text,date,date)`])).rows[0].ok) {
+        return res.status(409).json({ error: 'not_migrated', detail: 'migration 0049 (Amazon profit mart) is not applied' });
+      }
+      const sel = await profitSelect(client, spec.fn);
+      await client.query(`set statement_timeout = '120s'`);
+      const rows = (await client.query(`select ${sel.list} from ${spec.fn}(1::smallint, $1, $2, $3::date, $4::date) r ${spec.order}`, [ms.mall, ms.scope, rg.from, rg.to])).rows;
+      res.json({ mall: ms.mall, scope: ms.scope, from: rg.from, to: rg.to, master_basis: 'current', rows: rows.map(sel.fix) });
+    });
+  });
+}
+
 router.post('/shipments/relink', requireSyncKey, express.json({ limit: '4kb' }), async (req, res) => {
   const after = Number(req.body && req.body.after) || 0, limit = Math.min(Math.max(Number(req.body && req.body.limit) || 20000, 1), 100000);
   await withPg(res, async (client) => {

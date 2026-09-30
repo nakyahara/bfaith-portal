@@ -149,6 +149,26 @@ await ta('[!] 0047 の CHECK は NOT VALID で足し (59 万行の検査を ACCE
   await p2.close();
 });
 
+await ta('[!] 0049 (13 §3.5・§3.6・D7b-3): Amazon の利益の mart = 関数だけ (表は作らない)・決済のそろいの差し込み口は今は null・監査の始まり = 0049 の適用の時刻', async () => {
+  const fns = await q(`select n.nspname || '.' || p.proname as f, l.lanname as lang, pg_get_function_identity_arguments(p.oid) as a
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace join pg_language l on l.oid = p.prolang
+   where (n.nspname = 'mart' and p.proname like any (array['amazon_profit%', '\\_amazon%', 'amazon_account_fee_tax_rate'])) or (n.nspname = 'core' and p.proname = 'finance_coverage_complete_to') order by 1`);
+  assert.deepEqual(fns.map((r) => [r.f, r.lang]), [
+    ['core.finance_coverage_complete_to', 'plpgsql'],
+    ['mart._amazon_easy_ship_alloc', 'sql'], ['mart._amazon_profit_ad_children', 'sql'], ['mart._amazon_profit_ad_days', 'sql'],
+    ['mart._amazon_profit_finance_days', 'sql'], ['mart._amazon_profit_rows', 'sql'], ['mart._amazon_profit_totals', 'sql'],
+    ['mart.amazon_account_fee_tax_rate', 'sql'], ['mart.amazon_profit_assert_args', 'plpgsql'], ['mart.amazon_profit_composition_audit_since', 'sql'],
+    ['mart.amazon_profit_daily_range', 'plpgsql'], ['mart.amazon_profit_day_totals_range', 'plpgsql']]);
+  for (const f of ['mart.amazon_profit_daily_range', 'mart.amazon_profit_day_totals_range']) {
+    assert.equal(fns.find((r) => r.f === f).a, 'p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date', f);
+  }
+  assert.equal((await q(`select core.finance_coverage_complete_to(1::smallint, 'amazon', 'jp', 'amazon_settlement_unified') as d`))[0].d, null);   // D7b-1b が差し替えるまで
+  const [s] = await q(`select mart.amazon_profit_composition_audit_since() as since, (select applied_at from ops.schema_migrations where version = '0049') as applied`);
+  assert.ok(Math.abs(new Date(s.since).getTime() - new Date(s.applied).getTime()) < 600e3, JSON.stringify(s));
+  const tables = await q(`select count(*)::int as n from information_schema.tables where table_name like '%amazon_profit%'`);
+  assert.equal(tables[0].n, 0);
+});
+
 await ta('[!] 03 §10: 円の金額列 (*_jpy) はすべて bigint', async () => {
   const rows = await q("select table_schema, table_name, column_name, data_type from information_schema.columns where column_name like '%\\_jpy%' escape '\\' and table_schema in ('core','snapshots','events','ai','mart') and data_type <> 'bigint'");
   assert.deepEqual(rows, [], JSON.stringify(rows));
