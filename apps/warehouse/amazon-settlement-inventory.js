@@ -70,11 +70,18 @@ export function inventoryWindow(startedAt) {
   return { createdSince: toUtcSeconds(since), createdUntil: toUtcSeconds(until) };
 }
 
+/** 一覧の記録用の要求の時間の上限 (全ページの合計)。超えたら一覧の失敗 = 取込には影響させない (Codex #1555 R1 High) */
+export const INVENTORY_TIMEOUT_MS = 120000;
+/** 一覧の回の所属 (後の coverage の証拠の鎖の鍵)。今は 1 つだけ = 固定で入れる (Codex #1555 R1 M3) */
+export const INVENTORY_SCOPE = Object.freeze({ companyId: 1, mall: 'amazon', scopeKey: 'jp' });
+
 /**
  * getReports をページで読む (nextToken は単独で渡す = SP-API の決まり)。
  * 上限のページに来ても nextToken が残っていたら打ち切るが、**黙らない** = lastPageReached: false を返す。
+ * strict = ページの応答の形を確かめる (null・reports が配列でない・nextToken が文字でない = 例外 = 一覧の失敗。
+ *   「最後まで取れた空のページ」にしない・Codex #1555 R1 M1)。取込の一覧は今までどおり strict にしない (取込を変えない)
  */
-export async function listReportPages(sp, firstQuery, { maxPages = MAX_LIST_PAGES, label = 'list' } = {}) {
+export async function listReportPages(sp, firstQuery, { maxPages = MAX_LIST_PAGES, label = 'list', strict = false } = {}) {
   const reports = [];
   let nextToken = null;
   let pages = 0;
@@ -82,8 +89,12 @@ export async function listReportPages(sp, firstQuery, { maxPages = MAX_LIST_PAGE
     pages++;
     const query = nextToken ? { nextToken } : firstQuery;
     const resp = await sp.callAPI({ operation: 'getReports', endpoint: 'reports', query });
-    if (resp?.reports) reports.push(...resp.reports);
-    nextToken = resp?.nextToken || null;
+    if (strict) {
+      if (resp == null || typeof resp !== 'object' || !Array.isArray(resp.reports)) throw new Error(`${pages} ページ目の応答の形が違う (reports が配列でない)`);
+      if (resp.nextToken != null && (typeof resp.nextToken !== 'string' || resp.nextToken === '')) throw new Error(`${pages} ページ目の nextToken が文字でない`);
+    }
+    if (resp.reports) reports.push(...resp.reports);   // 取込の一覧 = 今までと同じ (resp が null なら例外)
+    nextToken = resp.nextToken || null;
     console.log(`[${label}] page ${pages}: cumulative ${reports.length}, nextToken=${nextToken ? 'yes' : 'no'}`);
     if (nextToken && pages >= maxPages) {
       console.log(`[${label}] ⚠️ ${pages} ページで打ち切り (nextToken が残っている = 一覧の途中まで)`);
@@ -93,9 +104,25 @@ export async function listReportPages(sp, firstQuery, { maxPages = MAX_LIST_PAGE
   return { reports, pages, lastPageReached: !nextToken };
 }
 
-/** 一覧の記録用の要求 (窓を明示して固定)。失敗は投げる (呼び手が ⚠️ にして取込は続ける) */
-export async function listInventoryReports(sp, { reportType, marketplaceId, startedAt, maxPages = MAX_LIST_PAGES }) {
+/** 期限つきの待ち。期限を過ぎたら例外 (元の要求は止められない = 後で失敗しても unhandled にしない) */
+function withDeadline(promise, deadline, timeoutMs) {
+  Promise.resolve(promise).catch(() => {});
+  const ms = deadline - Date.now();
+  const err = () => new Error(`一覧の要求の時間切れ (${timeoutMs} ms)`);
+  if (ms <= 0) return Promise.reject(err());
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(err()), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * 一覧の記録用の要求 (窓を明示して固定)。失敗・時間切れは投げる (呼び手が ⚠️ にして取込は続ける)。
+ * 🚨 呼び手は取込の一覧の要求を **先に** 確定してから呼ぶ (既定の 90 日の窓の「今」をずらさない・レートの枠を先に使わない・Codex #1555 R1 High)
+ */
+export async function listInventoryReports(sp, { reportType, marketplaceId, startedAt, maxPages = MAX_LIST_PAGES, timeoutMs = INVENTORY_TIMEOUT_MS }) {
   const window = inventoryWindow(startedAt);
+  const deadline = Date.now() + timeoutMs;
+  const timedSp = { callAPI: (req) => withDeadline(sp.callAPI(req), deadline, timeoutMs) };
   const firstQuery = {
     reportTypes: [reportType],
     marketplaceIds: [marketplaceId],
@@ -103,7 +130,7 @@ export async function listInventoryReports(sp, { reportType, marketplaceId, star
     createdSince: window.createdSince,
     createdUntil: window.createdUntil,
   };
-  const r = await listReportPages(sp, firstQuery, { maxPages, label: 'inventory' });
+  const r = await listReportPages(timedSp, firstQuery, { maxPages, label: 'inventory', strict: true });
   return { ...r, window };
 }
 
@@ -167,14 +194,15 @@ export function recordInventoryRun(db, { reportType, marketplaceId, window, star
   const errors = [];
   if (listError) errors.push(listError);
   if (missingId) errors.push(`reportId の無い report ${missingId} 件`);
+  // evidence_epoch / coverage_generation / run_token = null (後の初期の印・coordinator が入れる。null の回はどの印の鎖にも属さない)
   const insertRun = db.prepare(`INSERT INTO amazon_settlement_report_inventory_runs (
-      report_type, marketplace_id, query_created_since, query_created_until,
+      company_id, mall, scope_key, report_type, marketplace_id, query_created_since, query_created_until,
       started_at, list_completed_at, completed_at, last_page_reached, page_count, report_count,
-      snapshot_digest, list_error, coverage_generation, run_token, inventory_run_seq, ingest_run_id
+      snapshot_digest, list_error, evidence_epoch, coverage_generation, run_token, inventory_run_seq, ingest_run_id
     ) VALUES (
-      @report_type, @marketplace_id, @query_created_since, @query_created_until,
+      @company_id, @mall, @scope_key, @report_type, @marketplace_id, @query_created_since, @query_created_until,
       @started_at, @list_completed_at, NULL, @last_page_reached, @page_count, @report_count,
-      @snapshot_digest, @list_error, NULL, NULL, @inventory_run_seq, @ingest_run_id
+      @snapshot_digest, @list_error, NULL, NULL, NULL, @inventory_run_seq, @ingest_run_id
     )`);
   const insertRow = db.prepare(`INSERT INTO amazon_settlement_report_inventory (
       inventory_run_id, report_id, report_type, processing_status, created_time,
@@ -186,6 +214,9 @@ export function recordInventoryRun(db, { reportType, marketplaceId, window, star
   const txn = db.transaction(() => {
     const seq = db.prepare(`SELECT COALESCE(MAX(inventory_run_seq), 0) + 1 AS n FROM amazon_settlement_report_inventory_runs`).get().n;
     const runId = Number(insertRun.run({
+      company_id: INVENTORY_SCOPE.companyId,
+      mall: INVENTORY_SCOPE.mall,
+      scope_key: INVENTORY_SCOPE.scopeKey,
       report_type: reportType,
       marketplace_id: marketplaceId ?? null,
       query_created_since: window.createdSince,

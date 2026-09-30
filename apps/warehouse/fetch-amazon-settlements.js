@@ -15,6 +15,8 @@
  *   = amazon_settlement_report_inventory_runs (回) / amazon_settlement_report_inventory (report ごと・取込の結果)。部品 = amazon-settlement-inventory.js
  *   - 一覧の記録用の getReports は **取込の一覧とは別の要求** で、最初の要求に createdUntil = 回の開始の時刻・createdSince = その 85 日前 を明示して固定
  *     (取込の一覧は今までどおり日時の境なし = Amazon の既定の 90 日前〜今 → 取込む report は変わらない)
+ *   - 🚨 取込の一覧の要求を今と同じ位置で **先に** 確定し、一覧の記録の要求はその後 (時間の上限 120 秒・ページの応答の形も確かめる)。
+ *     一覧の記録の失敗・時間切れは取込に影響させない (Codex #1555 R1)
  *   - nextToken が残ったまま上限のページ (21) に来たら last_page_reached = 0 + ⚠️ (取込は続ける)
  *   - 一覧の失敗・記録の失敗でも取込は止めない (⚠️)。--dry-run は表に書かない。--report-id の 1 本だけの回は一覧の回にしない
  *   - 今は記録だけ (読み手 = 後の coverage)。取込む行 (raw_amazon_settlement_*) の中身と数は変えない
@@ -44,7 +46,7 @@ import canonicalize from 'canonicalize';
 import { initDB, getDB } from './db.js';
 import { convertV2TsvToV1Tsv, parseV2Tsv } from './amazon-settlement-v2.js';
 import {
-  MAX_LIST_PAGES, listReportPages, listInventoryReports, inventoryWindow, inventoryEntries, inventorySnapshotDigest,
+  MAX_LIST_PAGES, INVENTORY_TIMEOUT_MS, listReportPages, listInventoryReports, inventoryWindow, inventoryEntries, inventorySnapshotDigest,
   recordInventoryRun, recordImportResult, finishInventoryRun,
 } from './amazon-settlement-inventory.js';
 
@@ -517,12 +519,11 @@ export function ingestSettlement(db, headerRow, lineRows, ctx) {
  * 決済のレポートの一覧 (inventory) を取って記録する (取込の一覧とは別の要求・窓を固定)。
  * 🚨 一覧の失敗・記録の失敗で取込を止めない (⚠️ を出して続ける = 今の取込は今までどおり)。dry-run は表に書かない
  */
-async function takeSettlementInventory(db, sp, { reportType, runId, dryRun, now }) {
-  const startedAt = now();
+async function takeSettlementInventory(db, sp, { reportType, runId, dryRun, now, startedAt, timeoutMs }) {
   const window = inventoryWindow(startedAt);
   const state = { id: null, window, listing: null, listError: null, recordError: null, count: 0 };
   try {
-    state.listing = await listInventoryReports(sp, { reportType, marketplaceId: MARKETPLACE_ID, startedAt });
+    state.listing = await listInventoryReports(sp, { reportType, marketplaceId: MARKETPLACE_ID, startedAt, timeoutMs });
   } catch (e) {
     state.listError = `一覧の要求の失敗: ${e?.message || e}`;
     console.log(`[inventory] ⚠️ ${state.listError} (取込は続ける)`);
@@ -568,26 +569,18 @@ function inventorySummary(inv, args) {
 
 /**
  * 取込の本体 (main から呼ぶ。試験から SP-API を差し替えて呼べるように関数にした)。
- * deps = { db, sp (callAPI を持つ), runId, downloadTsv(reportDocumentId) → TSV の文字 (既定 = SP-API), now() → Date }
+ * deps = { db, sp (callAPI を持つ), runId, downloadTsv(reportDocumentId) → TSV の文字 (既定 = SP-API), now() → Date,
+ *          inventoryTimeoutMs (一覧の記録用の要求の時間の上限) }
  * 返り値 = { totalHeaders, totalLines, dirtyMonths, blocked, inventory }
  * 🚨 取込む report の選び方・取込む行は今までと同じ。足したのは一覧の記録 (別の要求) と、各分岐での取込の結果の記録だけ
  */
-export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = null, now = () => new Date() }) {
+export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = null, now = () => new Date(), inventoryTimeoutMs = INVENTORY_TIMEOUT_MS }) {
   const src = SOURCES[args.source];
   const download = downloadTsv || ((reportDocumentId) => downloadReportTsv(sp, reportDocumentId));
+  const startedAt = now();   // 回の開始の時刻 = 一覧の窓の createdUntil
 
-  // 0. 決済のレポートの一覧 (inventory)。--report-id の 1 本だけの回は一覧の回にしない (設計 §3.1)
-  const inv = args.reportId ? null : await takeSettlementInventory(db, sp, { reportType: src.reportType, runId, dryRun: args.dryRun, now });
-  const rec = (reportId, result, extra) => {
-    if (!inv?.id) return;
-    try { recordImportResult(db, inv.id, reportId, result, extra); }
-    catch (e) {
-      inv.recordError = inv.recordError || `取込の結果を記録できない: ${e?.message || e}`;
-      console.log(`  ⚠️ 一覧に取込の結果を記録できない (取込は続ける): ${e?.message || e}`);
-    }
-  };
-
-  // 1. Settlement 一覧取得
+  // 1. Settlement 一覧取得 (🚨 今と同じ位置・同じ要求で **先に** 確定する。一覧の記録の要求を先に出すと、既定の 90 日の窓の「今」が
+  //    後ろにずれて境の report が外れる / レートの枠を先に使う = 取込む report が変わりうる。Codex #1555 R1 High)
   let reports;
   if (args.reportId) {
     const r = await sp.callAPI({ operation: 'getReport', endpoint: 'reports', path: { reportId: args.reportId } });
@@ -596,6 +589,18 @@ export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = nu
     reports = await listSettlementReports(sp, src.reportType);
   }
   console.log(`[settlements] 対象 reports: ${reports.length}件`);
+
+  // 2. 決済のレポートの一覧 (inventory) = 取込の一覧が決まった後に、時間の上限つきの別の要求で。失敗・時間切れでも取込には影響させない。
+  //    --report-id の 1 本だけの回は一覧の回にしない (設計 §3.1)
+  const inv = args.reportId ? null : await takeSettlementInventory(db, sp, { reportType: src.reportType, runId, dryRun: args.dryRun, now, startedAt, timeoutMs: inventoryTimeoutMs });
+  const rec = (reportId, result, extra) => {
+    if (!inv?.id) return;
+    try { recordImportResult(db, inv.id, reportId, result, extra); }
+    catch (e) {
+      inv.recordError = inv.recordError || `取込の結果を記録できない: ${e?.message || e}`;
+      console.log(`  ⚠️ 一覧に取込の結果を記録できない (取込は続ける): ${e?.message || e}`);
+    }
+  };
 
   let totalHeaders = 0, totalLines = 0;
   const allDirtyMonths = new Set();
@@ -610,9 +615,11 @@ export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = nu
     }
     console.log(`\n[${i + 1}/${reports.length}] reportId=${r.reportId} (${r.dataStartTime?.slice(0, 10)} 〜 ${r.dataEndTime?.slice(0, 10)})`);
 
+    // file hash は try の外に持つ = ダウンロードの後の例外 (parse・正規化・DB の投入) でも failed の行に残す (Codex #1555 R1 M2)
+    const doc = { importedReportDocumentId: r.reportDocumentId, fileHash: null };
     try {
       const tsv = await download(r.reportDocumentId);
-      const doc = { importedReportDocumentId: r.reportDocumentId, fileHash: sha256(tsv) };   // raw の source_file_hash と同じ式 (V2 は並べ直す前の元のファイル)
+      doc.fileHash = sha256(tsv);   // raw の source_file_hash と同じ式 (V2 は並べ直す前の元のファイル)
       if (args.source === 'v2') {
         const v = processV2Report(db, tsv, r.reportId, runId, { dryRun: args.dryRun });
         if (v.prepared) console.log(`  bytes: ${tsv.length}, rows: ${v.prepared.rowCount} (V2 の元の行 ${v.prepared.v2RowCount} → V1 の形), lines=${v.prepared.lineRows.length}`);
@@ -659,7 +666,7 @@ export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = nu
       rec(r.reportId, 'imported', { ...doc, settlementId: headerRow?.source_settlement_id, headerInserted: result.headerInserted, linesInserted: result.lineInserted });
     } catch (e) {
       // 今までどおり例外で回ごと止める (FATAL・終了コード 1)。一覧の行に failed を残し、回の completed_at は null のまま
-      rec(r.reportId, 'failed', { importedReportDocumentId: r.reportDocumentId, note: `例外: ${e?.message || e}` });
+      rec(r.reportId, 'failed', { ...doc, note: `例外: ${e?.message || e}` });
       throw e;
     }
   }

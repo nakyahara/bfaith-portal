@@ -1498,6 +1498,9 @@ function createTables() {
   // 日時は全部 UTC の YYYY-MM-DDTHH:MM:SSZ (API の日時が読めないときだけ元の文字のまま)
   db.exec(`CREATE TABLE IF NOT EXISTS amazon_settlement_report_inventory_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id          INTEGER NOT NULL,          -- 所属 (後の coverage の証拠の鎖の鍵)。今は 1 / 'amazon' / 'jp' 固定
+    mall                TEXT NOT NULL,
+    scope_key           TEXT NOT NULL,
     report_type         TEXT NOT NULL,
     marketplace_id      TEXT,
     query_created_since TEXT NOT NULL,             -- 最初の要求で明示した createdSince (= createdUntil − 85 日)
@@ -1510,6 +1513,7 @@ function createTables() {
     report_count        INTEGER NOT NULL,
     snapshot_digest     TEXT,                      -- 行の {report_id, processing_status, created_time, data_start_time, data_end_time, report_document_id} を report ID の UTF-8 の順の正規の JSON の SHA-256
     list_error          TEXT,
+    evidence_epoch      INTEGER,                   -- 初期の印 (D-65) を作るたびに採番。null = どの印の鎖にも属さない (今の回は全部 null・積み上げに使わない)
     coverage_generation INTEGER,                   -- 後の coordinator が入れる (今は null)
     run_token           TEXT,                      -- 後の coordinator が入れる (今は null)
     inventory_run_seq   INTEGER NOT NULL UNIQUE,   -- 回の連番 (最新の観測の順 = coverage_generation → inventory_run_seq → last_seen_ordinal)

@@ -802,6 +802,15 @@ commit;
   3. 1 か月ずつ `--from 月初 --to 月末` → `--reconcile` (差 0 を見る。差の月は翌朝の build が作り直す) を 2026-01 から当月まで
   4. `--mark-backfilled` (送れない鍵・鍵の分からない行が 0 で、全期間の突き合わせ `--reconcile --all` が一致したときだけ印を付ける) → 翌朝から daily-sync が送る
 - 試験 = `node scripts/test-company-db-amazon-finance.mjs` (二重の実装の一致・送り手の通し (本物の router を HTTP で)・突き合わせ・手数料のやり残し)
+### 決済のレポートの一覧 (miniPC の SQLite・D7b-1b の下ごしらえ・Company DB構想 13 §3.1 / D-65)
+
+- 書き手 = `apps/warehouse/fetch-amazon-settlements.js` (部品 `apps/warehouse/amazon-settlement-inventory.js`)。表 = warehouse.db の `amazon_settlement_report_inventory_runs` (回) / `amazon_settlement_report_inventory` (report ごと)。**今は記録だけ** (読み手 = 後の coverage)。取込む行には関わらない
+- 取込の一覧の要求 (日時の境なし) を先に確定し、その後に別の getReports で一覧を取る (窓 = `createdUntil` = 回の開始の時刻・`createdSince` = その 85 日前・時間の上限 120 秒)。最後のページまで取れない・応答の形が違う・時間切れ = `last_page_reached = 0` / `list_error` (取込は続ける)
+- 回の所属 = `company_id` / `mall` / `scope_key` (今は 1 / `amazon` / `jp` 固定)
+- 🚨 **`evidence_epoch` の規則**: 初期の印 (D-65 = Seller Central の決済の一覧を書き出した印) を作るたびに採番し、その後の回に入れる。**`evidence_epoch` が null の回はどの印の鎖にも属さない = 期待の report の集合の積み上げに使わない** (今の回は全部 null)。印を作り直したら、積み上げは新しい epoch の回だけ
+- 回の完了 = `completed_at` がある・`last_page_reached = 1`・`list_error` が null。これを満たさない回は後の coverage で「失敗した回」として扱う
+- 試験 = `node apps/warehouse/test-settlement-inventory.js` (一時 DB・SP-API は差し替え)
+
 ## 受注・出荷の受け皿 (0013。08 §4.1〜4.3 / §4.7。D4)
 
 受注の raw は Company DB に持ち込まない (年 236 万注文)。miniPC が warehouse.db の追記ログから core の形に整えて §4.7 の契約で push する (取込ジョブ = D5)。**注文 = モールの注文 1 件、出荷 = NE の伝票 1 件**。状態の履歴は持たない (D-36。出荷済み・取消の時刻を列で)。
