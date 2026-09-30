@@ -356,7 +356,7 @@ await t('受け口: 旧い形 = 旧い列の指紋・正規化した行に 4 列
   const vNew = validateFinanceChunk(body(neu, orderFinanceChecksum(validateFinanceRows('F1', neu)), V2)).rows[0];
   assert.deepEqual([vNew.lines[0].unclassified_component_count, vNew.lines[0].unclassified_abs_jpy], [2, 200]);
   assert.throws(() => validateFinanceChunk(body(neu, orderFinanceChecksum(validateFinanceRows('F1', neu), { legacy: true }), V2)), /set_checksum differs/);
-  // router: NOT_MIGRATED / DOWNGRADE (と 0051 の COVERAGE_MISMATCH) は 409
+  // router: NOT_MIGRATED / DOWNGRADE (と 0050 の COVERAGE_MISMATCH) は 409
   const src = fs.readFileSync(new URL('../apps/company-db/router.mjs', import.meta.url), 'utf8');
   assert.match(src, /e\.code === 'NOT_MIGRATED' \|\| e\.code === 'DOWNGRADE' \|\| e\.code === 'COVERAGE_MISMATCH'\) \? 409/);
 });
@@ -536,7 +536,7 @@ await t('🚨 0047 の適用前: 旧い形は受ける・今の形は NOT_MIGRAT
 //   'sku-m' = 'SKU-M' (6/2 1 個 1,000・6/15 返品 −1,000 = 1 個) と 'sku-m' (6/15 A-to-z −300・6 月の売上なし = 単価なし) → 子は unit_price_missing
 //   'sku-zz' = 6/12 返品 −500・売上なし → unit_price_missing / 'sku-f7' = 6/3 3 個 2 円・6/20 返品 −1 円 → 1,000,000 ÷ 666,667 = 1.4999992… → 1 個・丸める前 1.499999
 // 2099-03 (月末まで決済がそろっていない月) = 'sku-p' 3/1 1 個 800・3/2 返品 −800 → estimated_partial_month_unit_price
-// 🆕 0051 (#1561 Codex R2 Medium): partial の判定は「今日」ではなく決済のそろい (core.finance_coverage_state の complete_to) = 下で complete_to 2026-09-29 の complete を置く
+// 🆕 0050 (#1561 Codex R2 Medium): partial の判定は「今日」ではなく決済のそろい (core.finance_coverage_state の complete_to) = 下で complete_to 2026-09-29 の complete を置く
 //    (受け口を通さず表に直接。manifest は形だけ・policy の指紋は今の policy の値)。置かない (complete_to null) と全部の月が partial
 const putCoverage = async (completeTo) => {
   await pg.query(`delete from core.finance_coverage where company_id = 1 and mall = 'amazon' and scope_key = 'jp'`);
@@ -577,7 +577,7 @@ await t('🚨 手で計算: 正規化 SKU にまとめる・受け取りの出�
     [1, -1, 1000, -1000, 'estimated_monthly_unit_price', '1.000000']);
   assert.deepEqual([n10.received_listing_ids.map(Number), n10.received_listing_unresolved_count], [[listingN1], 0]);
 });
-await t('🚨 返品の状態の 4 つ: no_refund / estimated_monthly_unit_price / unit_price_missing (子にまとめると弱い方・推定できない額) / estimated_partial_month_unit_price (月末まで決済がそろっていない = coverage 基準・0051)・丸める前の返品数', async () => {
+await t('🚨 返品の状態の 4 つ: no_refund / estimated_monthly_unit_price / unit_price_missing (子にまとめると弱い方・推定できない額) / estimated_partial_month_unit_price (月末まで決済がそろっていない = coverage 基準・0050)・丸める前の返品数', async () => {
   await apply('M1', 1, [row('2026-06-02', 'SKU-M', { units_ordered: 1, sales_principal_jpy: 1000 }), row('2026-06-15', 'SKU-M', { refund_principal_jpy: -1000, refund_principal_customer_jpy: -1000 })]);
   await apply('M2', 1, [row('2026-06-15', 'sku-m', { refund_principal_jpy: -300, refund_principal_atoz_jpy: -300 })]);
   await apply('Z1', 1, [row('2026-06-12', 'sku-zz', { refund_principal_jpy: -500, refund_principal_customer_jpy: -500 })]);
@@ -596,7 +596,7 @@ await t('🚨 返品の状態の 4 つ: no_refund / estimated_monthly_unit_price
   assert.deepEqual([p.refund_units_status, p.units_refunded_customer, String(p.units_refunded_customer_unrounded)], ['estimated_partial_month_unit_price', 1, '1.000000']);
   const all4 = new Set([...rows, p].map((r) => r.refund_units_status));
   for (const s of ['no_refund', 'estimated_monthly_unit_price', 'unit_price_missing', 'estimated_partial_month_unit_price']) assert.ok(all4.has(s), s);
-  // 🆕 0051: partial = 月末まで決済がそろっていない (complete_to 基準・今日ではない)。6 月の月末 6/30 より前の complete_to / coverage なし = 6 月も partial
+  // 🆕 0050: partial = 月末まで決済がそろっていない (complete_to 基準・今日ではない)。6 月の月末 6/30 より前の complete_to / coverage なし = 6 月も partial
   for (const cov of ['2026-06-29', null]) {
     await putCoverage(cov);
     const f = at(await skuRange('2026-06-01', '2026-06-30'), '2026-06-20', 'sku-f7');

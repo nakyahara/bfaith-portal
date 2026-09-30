@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * test-company-db-finance-coverage.mjs — 決済のそろい (coverage・0051・D7b-1b-2 = Render 側) の受入試験
+ * test-company-db-finance-coverage.mjs — 決済のそろい (coverage・0050・D7b-1b-2 = Render 側) の受入試験
  *
  * 設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』v26 §3.1。PGlite で全部の migration を流して確かめる:
  *   表と CHECK / receipt digest (JS の 1 行ずつ = 全体の正規の JSON・UTF-8 のバイトの順・墓石は除く・cursor の区切り) /
@@ -9,7 +9,7 @@
  *   receipt digest の一致 / 不一致 (数・行の数・digest) / manifest の形 (400) / policy /
  *   財務の chunk を世代に縛る (token 付き = その世代・token の updating のときだけ・complete の後・別の世代・別の token・別の source = 409・遅れた chunk の順序の逆転) /
  *   token の無い chunk (今の送り手) = 受ける・受領記録を変えたら complete → updating (無効の印・同じ世代では complete に戻れない)・same / stale では落とさない /
- *   lock = chunk (token あり / なし)・updating・complete が同じ advisory lock を取引の中で持つ / 0051 の前 (token 付きだけ 409・token 無しは今までどおり) /
+ *   lock = chunk (token あり / なし)・updating・complete が同じ advisory lock を取引の中で持つ / 0050 の前 (token 付きだけ 409・token 無しは今までどおり) /
  *   core.finance_coverage_state の差し替えで 0049 の mart が正式な値を出す (complete のときだけ) / 本物の router を HTTP で
  * 🚨 PGlite は 1 接続 = 「旧い chunk が lock を持ったまま止まる → 新しい世代の updating が待たされる」の 2 接続の待ちは書けない。
  *    代わりに ① 3 つの受け口が同じ lock を取引の中で持つこと (pg_locks) ② lock を取る前で止めた chunk が新しい世代の後に 409 になること を確かめる
@@ -42,7 +42,7 @@ const H = (s) => crypto.createHash('sha256').update(s).digest('hex');
 
 const pg = new PGlite();
 const applied = await applyMigrations(pgliteAdapter(pg), { log: quiet });
-assert.ok(applied.applied.includes('0051'), '0051 が流れていない');
+assert.ok(applied.applied.includes('0050'), '0050 が流れていない');
 const db = pgliteAdapter(pg);
 const one = async (sql, p = []) => (await pg.query(sql, p)).rows[0];
 
@@ -111,7 +111,7 @@ await sendChunk(chunkBody([['T-1', []]]));
 ledger.set('T-1', { mall_order_no: 'T-1', set_checksum: (await receiptOf('T-1')).set_checksum, transform_version: V2, lines: 0 });
 await sendChunk(chunkBody([['OTHER-1', [row('2026-06-06', 'LA', { units_ordered: 1, sales_principal_jpy: 1 })]]], {}, { scope: 'us' }));
 
-console.log('0051: 表と差し込み口');
+console.log('0050: 表と差し込み口');
 await t('表の列 = §3.1 の一覧 (manifest の列は共通の部品 MANIFEST_FIELDS と同じ名前)・主キー = 会社 × モール × scope × source・core.finance_coverage_state は同じ形のまま (plpgsql・戻りの型)', async () => {
   const cols = (await pg.query(`select column_name as c from information_schema.columns where table_schema = 'core' and table_name = 'finance_coverage'`)).rows.map((r) => r.c);
   for (const c of ['company_id', 'mall', 'scope_key', 'source', 'state', 'generation', 'run_token', 'updating_at', 'request_hash', 'completed_at', 'invalidated_at', 'invalidated_reason', ...Object.keys(MANIFEST_FIELDS)]) assert.ok(cols.includes(c), `列 ${c} が無い`);
@@ -476,10 +476,91 @@ await t('🚨 返品の状態の partial = coverage 基準 (0047 の差し替え
   assert.deepEqual(await sku(), { '2026-05-20 mz': M_, '2026-06-07 la': P_ });
 });
 
-console.log('0051 の前 (Render が先に deploy された朝)');
-await t('🚨 0051 の前: token の無い chunk は今までどおり受ける・token 付きの chunk と coverage の要求は 409 NOT_MIGRATED', async () => {
+console.log('月の途中の source の切り替え (#1561 Codex R3 High 1)・policy の読みの競合 (R3 High 2) = 別の DB');
+// 別の PGlite: policy = unified (A) [2026-01-01, 2026-07-15) → flat_v2 (B) [2026-07-15, 無期限)。7 月の単価は A の日 (7/5 の売上) と B の日の行から作られる
+const p3 = new PGlite();
+await applyMigrations(pgliteAdapter(p3), { log: quiet });
+const d3 = pgliteAdapter(p3);
+const one3 = async (sql, p = []) => (await p3.query(sql, p)).rows[0];
+const B = 'amazon_settlement_flat_v2';
+await p3.query(`update core.finance_source_policy set period_to = '2026-07-15' where company_id = 1 and mall = 'amazon' and scope_key = 'jp'`);
+await p3.query(`insert into core.finance_source_policy (company_id, mall, scope_key, period_from, source) values (1, 'amazon', 'jp', '2026-07-15', $1)`, [B]);
+const send3 = (body) => { const c = validateFinanceChunk(body); return ingestOrderFinanceChunk(d3, { ...c, log: quiet }); };
+await send3(chunkBody([['J-1', [row('2026-07-05', 'JZ', { units_ordered: 2, sales_principal_jpy: 2000 })]]]));   // A の日の売上 (単価 1,000)
+await send3(chunkBody([['J-2', [row('2026-07-20', 'JZ', { refund_principal_jpy: -1000, refund_principal_customer_jpy: -1000, source: B })]]]));   // B の日の返品 (1 個)
+const fp3 = async () => (await one3(`select core.finance_policy_fingerprint(1::smallint, 'amazon', 'jp') as f`)).f;
+/** complete の行を表に直接置く (受け口を通さない・manifest は形だけ・指紋は今の policy) */
+const putCov3 = async (source, completeTo) => {
+  await p3.query(`delete from core.finance_coverage where source = $1`, [source]);
+  if (!completeTo) return;
+  await p3.query(`insert into core.finance_coverage (company_id, mall, scope_key, source, state, generation, run_token, updating_at, complete_to, settlements_through, source_revision,
+      headers_count, headers_checksum, receipt_count, receipt_lines, receipt_digest, inventory_snapshot_id, inventory_count, inventory_digest, inventory_completed_at, initial_marker_id, initial_marker_digest,
+      selected_documents_count, selected_documents_digest, evidence_chain_from, evidence_chain_through, expected_report_count, expected_report_digest, inventory_runs_digest, policy_fingerprint, request_hash, completed_at)
+    values (1, 'amazon', 'jp', $1, 'complete', 1, $2, now(), $3::date, (($3::date + 1)::timestamp at time zone 'Asia/Tokyo'), 1,
+      1, $4, 0, 0, $4, '1', 0, $4, now(), '1', $4, 1, $4, '2025-12-01T00:00:00Z', now(), 0, $4, $4, $5, $4, now())`, [source, TOK, completeTo, H('x'), await fp3()]);
+};
+const julyState = async () => {
+  const settled = (await one3(`select core.finance_month_settled(1::smallint, 'amazon', 'jp', '2026-07-01') as s`)).s;
+  const sku = (await one3(`select refund_units_status as s from mart.finance_daily_sku_range(1::smallint, 'amazon', 'jp', '2026-07-01', '2026-07-31') where economic_date_jst = '2026-07-20'`)).s;
+  const m = await one3(`select refund_units_status as s, profit_incomplete_reasons as r from mart.amazon_profit_daily_range(1::smallint, 'amazon', 'jp', '2026-07-01', '2026-07-31') where economic_date_jst = '2026-07-20'`);
+  return [settled, sku, m.s, m.r.includes('refund_units_partial_month')];
+};
+const MONTHLY = [true, 'estimated_monthly_unit_price', 'estimated_monthly_unit_price', false];
+const PARTIAL = [false, 'estimated_partial_month_unit_price', 'estimated_partial_month_unit_price', true];
+await t('🚨 月の途中で A → B: A が未完了・B が完了 → partial (0047 の差し替えと 0049 の mart の両方・正式な値は出ない) / 両方がその日まで完了 → monthly', async () => {
+  await putCov3(U, '2026-07-10'); await putCov3(B, '2026-07-31');   // A は 7/11〜7/14 が未完了 (返品の日の source = B は月末まで完了)
+  assert.deepEqual(await julyState(), PARTIAL, 'A 未完了');
+  await putCov3(U, '2026-07-14');                                  // A の最後の日まで = 月の全部の日がそろった
+  assert.deepEqual(await julyState(), MONTHLY, '両方完了');
+  await putCov3(B, '2026-07-30');                                  // B の 7/31 が未完了
+  assert.deepEqual(await julyState(), PARTIAL, 'B 未完了');
+  await putCov3(B, '2026-07-31'); await putCov3(U, null);          // A の coverage が無い
+  assert.deepEqual(await julyState(), PARTIAL, 'A なし');
+  await putCov3(U, '2026-07-14');
+  await p3.query(`update core.finance_source_policy set period_from = '2026-07-16' where source = $1`, [B]);   // 7/15 に policy が無い日 (指紋も変わる = どちらの complete_to も null)
+  assert.deepEqual(await julyState(), PARTIAL, 'policy の無い日');
+  await p3.query(`update core.finance_source_policy set period_from = '2026-07-15' where source = $1`, [B]);
+  assert.deepEqual(await julyState(), MONTHLY, '戻す');
+});
+await t('🚨 complete の受け口は policy の起点・source の有無・指紋を 1 つの時点で読む: 読んだ後に policy が広がると、新しい指紋の manifest は 409 / 古い指紋の manifest は受けるが complete_to は null (保存した指紋 = 読んだ時点)・policy の lock を持つ', async () => {
+  await putCov3(U, null); await putCov3(B, null);
+  const oldFp = await fp3();
+  // B の起点を 7/15 → 7/01 に広げる変更 (A の終わりも 7/01 に)
+  const widen = async (db) => { await db.query(`update core.finance_source_policy set period_to = '2026-07-01' where source = $1`, [U]); await db.query(`update core.finance_source_policy set period_from = '2026-07-01' where source = $1`, [B]); };
+  const narrow = async () => { await p3.query(`update core.finance_source_policy set period_from = '2026-07-15' where source = $1`, [B]); await p3.query(`update core.finance_source_policy set period_to = '2026-07-15' where source = $1`, [U]); };
+  await widen(d3); const newFp = await fp3(); await narrow();
+  assert.notEqual(newFp, oldFp); assert.equal(await fp3(), oldFp);
+  const rc = (await coverageStatus(d3, { mall: 'amazon', scope: 'jp', source: B, withReceipts: true })).receipts;
+  // 証拠の鎖は 7/10 から = 古い起点 (7/15) なら届いている・新しい起点 (7/01) なら届いていない
+  const man = (fp) => M(rc, { complete_to: '2026-08-01', settlements_through: '2026-08-01T15:00:00Z', inventory_completed_at: '2026-08-02T00:00:00Z',
+    evidence_chain_from: '2026-07-10T00:00:00Z', evidence_chain_through: '2026-08-02T00:00:00Z', policy_fingerprint: fp });
+  await applyCoverage(d3, { state: 'updating', mall: 'amazon', scope: 'jp', source: B, generation: 1, run_token: TOK }, { log: quiet });
+  // ① 送り手は新しい policy (指紋) を読んだ・受け口の読みの直後に policy が広がる → 起点と指紋は同じ時点 (古い) = 409 (古い起点で検査して新しい指紋を保存しない)
+  let locks = null;
+  const heldPolicyLock = async (db) => (await db.query(`select count(*)::int as n from pg_locks where locktype = 'advisory' and granted
+      and classid::text || ':' || objid::text || ':' || objsubid::text
+        = ((hashtext('core.finance_source_policy')::bigint >> 32) & 4294967295)::oid::text || ':' || (hashtext('core.finance_source_policy')::bigint & 4294967295)::oid::text || ':1'`)).rows[0].n;
+  await rejects(() => applyCoverage(d3, { state: 'complete', mall: 'amazon', scope: 'jp', source: B, generation: 1, run_token: TOK, manifest: man(newFp) },
+    { log: quiet, hooks: { afterPolicySnapshot: async (db) => { locks = await heldPolicyLock(db); await widen(db); } } }), 'POLICY_MISMATCH');
+  assert.equal(locks, 1, 'policy の trigger と同じ advisory lock を持って読む');
+  assert.equal(await fp3(), oldFp, '取引ごと戻る (policy の変更も)');
+  assert.equal((await one3(`select state from core.finance_coverage where source = $1`, [B])).state, 'updating');
+  // ② 送り手も受け口も古い policy を読んだ・読みの直後に policy が広がる → 受けるが、保存した指紋は古い = 今の policy と違う = complete_to は null
+  const r = await applyCoverage(d3, { state: 'complete', mall: 'amazon', scope: 'jp', source: B, generation: 1, run_token: TOK, manifest: man(oldFp) },
+    { log: quiet, hooks: { afterPolicySnapshot: async (db) => { await widen(db); } } });
+  assert.equal(r.status, 'applied');
+  assert.equal((await one3(`select policy_fingerprint as f from core.finance_coverage where source = $1`, [B])).f, oldFp);
+  assert.equal(await fp3(), newFp);
+  assert.equal((await one3(`select complete_to from core.finance_coverage_state(1::smallint, 'amazon', 'jp', $1)`, [B])).complete_to, null);
+  await narrow();
+  assert.equal(String((await one3(`select complete_to::text as c from core.finance_coverage_state(1::smallint, 'amazon', 'jp', $1)`, [B])).c), '2026-08-01');
+  await p3.close();
+});
+
+console.log('0050 の前 (Render が先に deploy された朝)');
+await t('🚨 0050 の前: token の無い chunk は今までどおり受ける・token 付きの chunk と coverage の要求は 409 NOT_MIGRATED', async () => {
   const p2 = new PGlite();
-  await applyMigrations(pgliteAdapter(p2), { log: quiet, to: '0050' });
+  await applyMigrations(pgliteAdapter(p2), { log: quiet, to: '0049' });
   const d2 = pgliteAdapter(p2);
   const send = (body) => { const c = validateFinanceChunk(body); return ingestOrderFinanceChunk(d2, { ...c, log: quiet }); };
   const r = await send(chunkBody([['P-1', [row('2026-06-05', '-', { line_kind: 'storage', fba_storage_jpy: -5, account_fee_amount_jpy: -5 })]]]));
@@ -554,9 +635,9 @@ await t('POST /order-finance (chunk) を HTTP で: token 付きの complete の�
   assert.deepEqual([pl.status, pl.json.applied, pl.json.coverage_invalidated], [200, 1, 1]);
   assert.equal((await http('GET', ST)).json.effective.complete_to, null);
 });
-await t('0051 の前は coverage の口が 409 not_migrated (送り手が「未適用」と読める)', async () => {
+await t('0050 の前は coverage の口が 409 not_migrated (送り手が「未適用」と読める)', async () => {
   const p2 = new PGlite();
-  await applyMigrations(pgliteAdapter(p2), { log: quiet, to: '0050' });
+  await applyMigrations(pgliteAdapter(p2), { log: quiet, to: '0049' });
   target = p2;
   try {
     const s = await http('GET', ST);

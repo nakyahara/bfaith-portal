@@ -5,7 +5,7 @@
  *   🚨 集合の指紋は **受け口が内容から計算し直す** (finance/order-finance-checksum.mjs = 送り手と同じ 1 つの関数)。送り手の申告 (header.set_checksum) と違えば その注文は 400
  * 設計 = AI_reference『CompanyDB構想/12_Amazon財務のCompanyDB取込_設計_20260929.md』§3.2 / §4.6
  *
- * 🆕 決済のそろい (coverage・0051・D7b-1b-2。13 §3.1「財務の chunk も coverage の世代に縛る」):
+ * 🆕 決済のそろい (coverage・0050・D7b-1b-2。13 §3.1「財務の chunk も coverage の世代に縛る」):
  *   ・全部の chunk が取引の最初に **coverage の要求と同じ advisory lock** (会社 × モール × scope) を取る (ingest/finance-coverage.mjs の takeFinanceLock)
  *   ・body に coverage_generation と run_token が付いた chunk = その世代・その token の coverage が updating のときだけ適用 (complete の後・別の世代・別の token = 409 COVERAGE_MISMATCH)
  *     置き換え・墓石で消える既存の行の source もその coverage の source と同じこと (違えば消す前に 409・#1561 Codex R1 High 1)
@@ -103,14 +103,14 @@ export async function ingestOrderFinanceChunk(db, { companyId = 1, mall, scope, 
   if (hooks.beforeBegin) await hooks.beforeBegin();
   return ingestChunk(db, {
     ...opts, transformVersion,
-    // 🆕 coverage (0051): lock → (token 付きなら) その世代・token の updating か。0051 の前は token 付きだけ 409 NOT_MIGRATED (token 無しは今までどおり)
+    // 🆕 coverage (0050): lock → (token 付きなら) その世代・token の updating か。0050 の前は token 付きだけ 409 NOT_MIGRATED (token 無しは今までどおり)
     //    hooks.beforeBegin (取引の前 = lock の前) / afterLock = 試験の差し込み口 (止めて順序の逆転を作る・持っている lock を見る)
     afterBegin: async (dbx) => {
       await takeFinanceLock(dbx, { companyId, mall: m, scope: s });
       if (hooks.afterLock) await hooks.afterLock(dbx);
       covReady = await coverageReady(dbx);
       if (!coverage) return;
-      if (!covReady) throw Object.assign(new Error('not_migrated: migration 0051 (core.finance_coverage) is not applied (a chunk with coverage_generation / run_token needs it)'), { code: 'NOT_MIGRATED' });
+      if (!covReady) throw Object.assign(new Error('not_migrated: migration 0050 (core.finance_coverage) is not applied (a chunk with coverage_generation / run_token needs it)'), { code: 'NOT_MIGRATED' });
       const sources = new Set(opts.rows.flatMap((x) => x.lines.map((l) => l.source)));
       await assertChunkCoverage(dbx, { companyId, mall: m, scope: s, generation: coverage.generation, runToken: coverage.runToken, sources, orderNos: opts.rows.map((x) => x.mall_order_no) });
     },

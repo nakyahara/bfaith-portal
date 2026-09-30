@@ -1,5 +1,5 @@
 /**
- * ingest/finance-coverage.mjs — 決済のそろい (coverage) の受け口の本体 (Render 側・D7b-1b-2。受け皿 = migration 0051 core.finance_coverage)
+ * ingest/finance-coverage.mjs — 決済のそろい (coverage) の受け口の本体 (Render 側・D7b-1b-2。受け皿 = migration 0050 core.finance_coverage)
  *   設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』v26 §3.1。送り手 = miniPC の coordinator (D7b-1b-3・後の PR)。
  *
  * 受け口 (router.mjs):
@@ -31,7 +31,7 @@ import { err } from './stock-daily.mjs';
 import { createReceiptDigester, validateCoverageManifest, coverageRequestHash, bigintText, RUN_TOKEN_RE, MANIFEST_FIELDS, COVERAGE_STATES } from '../finance/coverage-manifest.mjs';
 
 export const COMPANY_ID = 1;
-export const COVERAGE_MALLS = MALLS.filter((m) => m !== 'other');   // 0043 / 0051 の mall の CHECK
+export const COVERAGE_MALLS = MALLS.filter((m) => m !== 'other');   // 0043 / 0050 の mall の CHECK
 const bad = (m) => err('BAD_REQUEST', m);
 const BODY_KEYS = new Set(['state', 'mall', 'scope', 'source', 'generation', 'run_token', 'manifest', 'request_hash']);
 export const RECEIPT_FETCH = 10000;
@@ -50,7 +50,7 @@ export async function takeFinanceLock(db, { companyId = COMPANY_ID, mall, scope 
   }
 }
 
-/** 0051 が入っているか */
+/** 0050 が入っているか */
 export async function coverageReady(db) {
   return (await db.query(`select to_regclass('core.finance_coverage') is not null as ok`)).rows[0].ok === true;
 }
@@ -121,12 +121,22 @@ export async function computeReceiptDigest(db, { companyId = COMPANY_ID, mall, s
   return d.finish();
 }
 
-/** policy の起点 (その source の最初の period_from の JST 00:00)。policy が無ければ NO_POLICY (409) */
-async function policyOrigin(db, { companyId, mall, scope, source }) {
-  const r = (await db.query(`select count(*)::int as n, min(period_from)::text as f from core.finance_source_policy
-     where company_id = $1::smallint and mall = $2 and scope_key = $3 and source = $4`, [companyId, mall, scope, source])).rows[0];
+/** policy の更新の trigger (0012 core.check_finance_policy_overlap) と同じ advisory lock の名前 */
+export const POLICY_LOCK_KEY = 'core.finance_source_policy';
+
+/**
+ * policy の 1 つの時点 (#1561 Codex R3 High 2): policy の trigger と同じ lock を取ってから、起点・source の有無・全期間の指紋を **1 つの文** (同じスナップショット) で読む。
+ *   戻り = { origin (その source の最初の period_from の JST 00:00), fingerprint }。その source の policy が無ければ NO_POLICY (409)
+ *   🚨 前は起点と指紋を READ COMMITTED の別々の文で読んでいた = 間に policy が変わると、古い狭い起点で検査して新しい広い指紋を保存できた。
+ *      lock は insert / update の trigger と直列にするため (delete は trigger が無い = 1 つの文で読むことで守る)。保存する指紋はこの時点の値 =
+ *      この後に policy が変われば core.finance_coverage_state が今の指紋と比べて complete_to を返さない
+ */
+async function policySnapshot(db, { companyId, mall, scope, source }) {
+  await db.query(`select pg_advisory_xact_lock(hashtext($1))`, [POLICY_LOCK_KEY]);
+  const r = (await db.query(`select source_policy_count as n, origin_from::text as f, fingerprint from core.finance_policy_snapshot($1::smallint, $2, $3, $4)`,
+    [companyId, mall, scope, source])).rows[0];
   if (!r || Number(r.n) === 0) throw err('NO_POLICY', `${mall}/${scope} の source ${source} は finance_source_policy に無い (決済のそろいは policy の source ごと)`);
-  return `${r.f}T00:00:00+09:00`;
+  return { origin: `${r.f}T00:00:00+09:00`, fingerprint: r.fingerprint };
 }
 
 /** 今の policy の全期間の指紋 (SQL の core.finance_policy_fingerprint = JS の policyFingerprint) */
@@ -141,7 +151,7 @@ const NULL_MANIFEST = [...MANIFEST_COLS, 'request_hash', 'completed_at', 'invali
  * updating / complete を 1 取引で。db = { query, exec } (router の pgAdapter / 試験の PGlite)。
  * @returns {{ status: 'applied'|'same'|'stale', state, generation, current_generation?, complete_to?, receipt? }}
  *   例外: BAD_REQUEST (400) / CONFLICT・RECEIPT_MISMATCH・NO_POLICY・POLICY_MISMATCH・NOT_MIGRATED (409) / LOCKED (503)
- *   hooks.afterLock = 試験の差し込み口 (lock を取った直後)
+ *   hooks.afterLock = 試験の差し込み口 (lock を取った直後) / hooks.afterPolicySnapshot = policy を読んだ直後 (読みの後に policy を変える競合の試験)
  */
 export async function applyCoverage(db, body, { companyId = COMPANY_ID, now = () => new Date(), log = () => {}, hooks = {} } = {}) {
   const v = validateCoverageBody(body, { companyId, now: now() });
@@ -151,8 +161,10 @@ export async function applyCoverage(db, body, { companyId = COMPANY_ID, now = ()
   try {
     await takeFinanceLock(db, key);
     if (hooks.afterLock) await hooks.afterLock(db);
-    if (!(await coverageReady(db))) throw err('NOT_MIGRATED', 'not_migrated: migration 0051 (core.finance_coverage) is not applied');
-    const origin = await policyOrigin(db, key);
+    if (!(await coverageReady(db))) throw err('NOT_MIGRATED', 'not_migrated: migration 0050 (core.finance_coverage) is not applied');
+    const policy = await policySnapshot(db, key);
+    const origin = policy.origin;
+    if (hooks.afterPolicySnapshot) await hooks.afterPolicySnapshot(db);
     const cur = await readCoverage(db, key, { forUpdate: true });
     const cg = cur ? BigInt(cur.generation) : null;
     let out;
@@ -186,7 +198,8 @@ export async function applyCoverage(db, body, { companyId = COMPANY_ID, now = ()
       } else {
         // 🚨 送り手が検査した policy (の指紋) が今の policy と同じこと (#1561 Codex R2 High)。違えば 409 = 回の始めに status で読み直してやり直す。
         //    保存した指紋と今の指紋が後で違えば (policy を後から変えた) core.finance_coverage_state は complete_to を返さない
-        const fp = await currentPolicyFingerprint(db, key);
+        //    起点と同じスナップショットの指紋で比べる (#1561 Codex R3 High 2)
+        const fp = policy.fingerprint;
         if (v.manifest.policy_fingerprint !== fp) throw err('POLICY_MISMATCH', `manifest.policy_fingerprint (${v.manifest.policy_fingerprint.slice(0, 12)}…) が今の policy の指紋 (${fp.slice(0, 12)}…) と違う = 送り手が検査した後に policy が変わった。次の回でやり直す`);
         if (Date.parse(v.manifest.settlements_through) <= Date.parse(origin)) throw bad(`settlements_through (${v.manifest.settlements_through}) が policy の起点 (${origin}) より後でない = 起点を覆う決済が無い`);
         // 🚨 証拠の鎖 (初期の印 + 積み上げた一覧) は policy の起点まで届いていること (#1561 Codex R1 High 2)。比べるのは UTC の瞬間 (起点 = period_from の JST 00:00・§3.1 の期間の型)。
@@ -238,7 +251,7 @@ export async function assertChunkCoverage(db, { companyId = COMPANY_ID, mall, sc
   return hit[0];
 }
 
-/** 無効の印の理由 (0051 の CHECK と同じ) */
+/** 無効の印の理由 (0050 の CHECK と同じ) */
 export const INVALIDATED_REASONS = Object.freeze({ untokened: 'untokened_finance_write', otherCoverage: 'other_coverage_finance_write' });
 
 /**

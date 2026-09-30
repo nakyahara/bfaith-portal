@@ -255,7 +255,7 @@ router.get('/orders/daily', requireSyncKey, async (req, res) => {
  *   GET  /apps/company-db/sync/order-finance/daily?mall&scope&from&to        mart.finance_daily_range (0044 = v_finance_daily と同じ式を期間の月だけで。日 × SKU・突き合わせの材料)
  *   GET  /apps/company-db/sync/order-finance/account-fees?mall&scope&from&to mart.v_finance_account_fees_monthly (月 × 手数料の種類)
  *   GET  /apps/company-db/sync/order-finance/uncovered?mall&scope            mart.v_order_finance_uncovered の件数と例 (policy が無い日・source が違う日)
- *   POST /apps/company-db/sync/order-finance/coverage                       決済のそろい (0051・D7b-1b-2) の updating / complete (下の節)
+ *   POST /apps/company-db/sync/order-finance/coverage                       決済のそろい (0050・D7b-1b-2) の updating / complete (下の節)
  *   GET  /apps/company-db/sync/order-finance/coverage/status?mall&scope&source   決済のそろいの今の状態・世代
  *   🆕 chunk の body に coverage_generation / run_token (両方) = その世代・token の coverage が updating のときだけ適用 (違えば 409 COVERAGE_MISMATCH)。
  *      無い chunk (今の送り手) は今までどおり受けるが、受領記録を変えたら complete を updating に落とす (応答の coverage_invalidated)
@@ -290,9 +290,9 @@ router.post('/order-finance', requireSyncKey, shipmentsJson, shipmentsParserErro
     const r = await ingestOrderFinanceChunk(pgAdapter(client), { ...chunk, host: 'render', log: (m) => console.log(`[company-db order-finance ${chunk.mall}] ${chunk.runId} ${m}`) });
     res.json(r);
   } catch (e) {
-    // NOT_MIGRATED = 新しい形 (分けられない部品の 4 列) の行が 0047 の適用前に届いた・token 付きの chunk が 0051 の適用前に届いた /
+    // NOT_MIGRATED = 新しい形 (分けられない部品の 4 列) の行が 0047 の適用前に届いた・token 付きの chunk が 0050 の適用前に届いた /
     // DOWNGRADE = 今の形の版の注文を旧い版で置き換えようとした (ingest/order-finance.mjs) /
-    // COVERAGE_MISMATCH = token 付きの chunk の世代・token の coverage が updating でない (complete の後・別の世代・別の token) / LOCKED = coverage の要求か別の chunk が lock を持ったまま (0051)
+    // COVERAGE_MISMATCH = token 付きの chunk の世代・token の coverage が updating でない (complete の後・別の世代・別の token) / LOCKED = coverage の要求か別の chunk が lock を持ったまま (0050)
     const status = (e.code === 'CHUNK_DEADLINE' || e.code === 'LOCKED') ? 503
       : (e.code === 'RUN_MISMATCH' || e.code === 'CHUNK_MISMATCH' || e.code === 'RUN_CLOSED' || e.code === 'NOT_MIGRATED' || e.code === 'DOWNGRADE' || e.code === 'COVERAGE_MISMATCH') ? 409
         : e.code === 'BAD_REQUEST' ? 400 : 500;
@@ -302,13 +302,13 @@ router.post('/order-finance', requireSyncKey, shipmentsJson, shipmentsParserErro
 });
 
 /**
- * 決済のそろい (coverage・0051・D7b-1b-2。本体 = ingest/finance-coverage.mjs。設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.1):
+ * 決済のそろい (coverage・0050・D7b-1b-2。本体 = ingest/finance-coverage.mjs。設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.1):
  *   POST /apps/company-db/sync/order-finance/coverage   { state: 'updating' | 'complete', mall, scope, source, generation, run_token, manifest? (complete だけ), request_hash? }
  *     → { status: 'applied' | 'same' | 'stale', state, generation, current_generation?, complete_to?, receipt? }
- *       400 = 形 / 409 = CONFLICT (状態の移り方で受けない)・RECEIPT_MISMATCH (受領記録が manifest と違う = detail.render に Render の数と digest)・NO_POLICY・POLICY_MISMATCH (manifest.policy_fingerprint が今の policy と違う)・not_migrated (0051 の前) / 503 LOCKED (lock が空かない)
+ *       400 = 形 / 409 = CONFLICT (状態の移り方で受けない)・RECEIPT_MISMATCH (受領記録が manifest と違う = detail.render に Render の数と digest)・NO_POLICY・POLICY_MISMATCH (manifest.policy_fingerprint が今の policy と違う)・not_migrated (0050 の前) / 503 LOCKED (lock が空かない)
  *   GET  /apps/company-db/sync/order-finance/coverage/status?mall&scope&source[&receipts=1]
  *     → { mall, scope, source, coverage: 行 | null, effective: { complete_to, generation, source_revision } (core.finance_coverage_state), policy: { fingerprint, rows }, receipts?: { count, lines, digest } }
- *       世代・source_revision = 10 進の文字列。0051 の前は 409 { error: 'not_migrated' }
+ *       世代・source_revision = 10 進の文字列。0050 の前は 409 { error: 'not_migrated' }
  *   🚨 送るのは miniPC の coordinator (D7b-1b-3・後の PR) だけ。今の送り手 (daily-sync) は coverage を送らない = complete が無い間は正式な利益は全部 null のまま
  *   🚨 鍵の検査は server.js の '/apps/company-db/sync/order-finance' の前方一致 (body parser より前) に入る
  */
@@ -327,7 +327,7 @@ router.post('/order-finance/coverage', requireSyncKey, coverageJson, parserError
     const r = await applyCoverage(pgAdapter(client), req.body, { log: (m) => console.log(`[company-db coverage] ${tag} ${m}`) });
     res.json({ ...r, ms: Date.now() - t0 });
   } catch (e) {
-    if (e.code === 'NOT_MIGRATED') return res.status(409).json({ error: 'not_migrated', detail: 'migration 0051 (core.finance_coverage) is not applied', code: e.code });
+    if (e.code === 'NOT_MIGRATED') return res.status(409).json({ error: 'not_migrated', detail: 'migration 0050 (core.finance_coverage) is not applied', code: e.code });
     const status = e.code === 'BAD_REQUEST' ? 400 : (e.code === 'CONFLICT' || e.code === 'RECEIPT_MISMATCH' || e.code === 'NO_POLICY' || e.code === 'POLICY_MISMATCH') ? 409 : e.code === 'LOCKED' ? 503 : 500;
     console.error(`[company-db coverage] ${tag} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
     res.status(status).json({ error: String(e.message).slice(0, 400), code: e.code || null, ...(e.detail ? { detail: e.detail } : {}) });
@@ -339,7 +339,7 @@ router.get('/order-finance/coverage/status', requireSyncKey, async (req, res) =>
   if (!COVERAGE_SOURCES.includes(source)) return res.status(400).json({ error: `source must be one of ${COVERAGE_SOURCES.join(', ')}` });
   await withPg(res, async (client) => {
     const db = pgAdapter(client);
-    if (!(await coverageReady(db))) return res.status(409).json({ error: 'not_migrated', detail: 'migration 0051 (core.finance_coverage) is not applied' });
+    if (!(await coverageReady(db))) return res.status(409).json({ error: 'not_migrated', detail: 'migration 0050 (core.finance_coverage) is not applied' });
     await client.query(`set statement_timeout = '60s'`);
     res.json(await coverageStatus(db, { mall: ms.mall, scope: ms.scope, source, withReceipts: String(req.query.receipts || '') === '1' }));
   });
