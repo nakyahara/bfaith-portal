@@ -29,6 +29,15 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { logEvent } from '../db.js';
 
+/*
+ * 書き込みを伴うトランザクションは `.immediate()` で回す (コード R11)。
+ * better-sqlite3 の既定は DEFERRED で、先頭が SELECT だと書き込みロックを取らない。
+ * 別プロセスと同時に走ると「両方とも既存 job なし」と判断したあと片方が SQLITE_BUSY になり、
+ * 一意制約違反の救済 (isUniqueViolation) では拾えない。
+ * 入れ子の呼び出しは savepoint になるので immediate かどうかは影響しない。
+ * 同じ作法が apps/amazon-pricing/db.js にある。
+ */
+
 export const PACKET_VERSION = 1;
 export const PROMPT_VERSION = 'lp-compose-v1';
 export const LEASE_MIN = 40;
@@ -163,7 +172,7 @@ export function importSpec(db, { kind, title, body, sheetTitles = [], actor } = 
       throw e;
     }
     return { ok: true, spec: db.prepare('SELECT * FROM ph_lp_specs WHERE id = ?').get(id), created: true };
-  })();
+  }).immediate();
 }
 
 /** いまの版 (= 最大 id)。無ければ null */
@@ -286,7 +295,7 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
     }
     logEvent(db, draftId, 'lp_compose_requested', `依頼 ${id} (仕様書 v${specId})`, a);
     return { ok: true, job: db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE id = ?').get(id), created: true };
-  })();
+  }).immediate();
 }
 
 // ─── 実行役 (miniPC) ─────────────────────────────────────
@@ -339,7 +348,7 @@ export function recoverExpired(db, now = Date.now()) {
         : expireJob(db, job.id, 'failed', { code: 'lease_expired', message: '実行役の期限が切れた', nowS });
     }
     return n;
-  })();
+  }).immediate();
 }
 
 /** キューの要約 (実行役の「仕事なし」判定・監視用) */
@@ -356,7 +365,7 @@ export function queueSummary(db, now = Date.now()) {
       daily_cap: dailyCap(),
       oldest_queued: db.prepare(`SELECT MIN(created_at) AS t FROM ph_lp_compose_jobs WHERE status = 'queued'`).get().t,
     };
-  })();
+  }).immediate();
 }
 
 /**
@@ -437,7 +446,7 @@ export function claimJob(db, { runnerRunId, now = Date.now() } = {}) {
     //    壊れた job が並んでいるときに正常な依頼が永遠に拾われない (コード R8 #3)。
     //    実行役はすぐ掛け直し、監視には異常として見える形にする
     return { ok: true, job: null, exhausted: true, error: 'claim を 50 回試しても掴めなかった (壊れた依頼が並んでいる可能性)' };
-  })();
+  }).immediate();
 }
 
 /** lease が有効な running の job を返す。無効なら理由 */
@@ -481,7 +490,7 @@ export function reserveGeneration(db, jobId, { leaseToken, model, promptVersion,
       VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?)`)
       .run(l.job.id, l.job.packet_hash, l.job.lease_token, l.job.runner_run_id, m, pv, day, nowS).lastInsertRowid);
     return { ok: true, generation_id: gid, packet_hash: l.job.packet_hash };
-  })();
+  }).immediate();
 }
 
 /**
@@ -622,7 +631,7 @@ export function submitResult(db, generationId, {
     }
     logEvent(db, job.draft_id, 'lp_compose_rejected', `依頼 ${job.id}: ${trim(reason, 200)}`, 'ph-lp-compose');
     return { ok: true, status: 'failed', already: false, receipt: receiptObj };
-  })();
+  }).immediate();
 }
 
 /**
@@ -640,7 +649,7 @@ export function failJob(db, jobId, { leaseToken, code, message, now = Date.now()
     finishJob(db, l.job.id, 'failed', { code: trim(code, 40) || 'other', message: trim(message, 500), nowS });
     logEvent(db, l.job.draft_id, 'lp_compose_failed', `依頼 ${l.job.id} ${trim(code, 40)}`, 'ph-lp-compose');
     return { ok: true, status: 'failed' };
-  })();
+  }).immediate();
 }
 
 /** 一時障害で手放す (queued に戻す)。**予約の前だけ** — 後に許すと二重に呼べてしまう */
@@ -656,7 +665,7 @@ export function releaseJob(db, jobId, { leaseToken, reason = null, now = Date.no
       .run(nowS, l.job.id);
     if (trim(reason)) logEvent(db, l.job.draft_id, 'lp_compose_released', `依頼 ${l.job.id}: ${trim(reason, 200)}`, 'ph-lp-compose');
     return { ok: true, status: 'queued' };
-  })();
+  }).immediate();
 }
 
 // ─── 画面 ────────────────────────────────────────────────
