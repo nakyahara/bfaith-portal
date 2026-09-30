@@ -178,7 +178,7 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
       db.prepare(`
         INSERT INTO draft_yahoo (draft_id, delivery_label, shipping_override, tax_rate, yahoo_category_id, yahoo_path)
         VALUES (?, ?, ?, ?, ?, ?)
-      `).run(setId, py.delivery_label, py.shipping_override ?? 0, py.tax_rate, py.yahoo_category_id, py.yahoo_path);
+      `).run(setId, py.delivery_label, py.shipping_override ?? 0, ctx.withTax === false ? null : py.tax_rate, py.yahoo_category_id, py.yahoo_path);   // 切替で閉じた後は税率を写さない (PR #1565 R1 H4)
     }
     // 商品ページ表記は**許可リスト**でコピーする (Codex R1 high 2026-08-23)。
     // 全列コピーすると「50ml」の 2 個セットが内容量 50ml のまま出て、法定表示が誤る。

@@ -130,15 +130,18 @@ import {
   suggestShopCategories, canAutoApplyShopCategory, countSelectableShopCategories,
   shopCategoriesNeverSaved, isAutoApplyRequestValid,
 } from './lib/shop-categories.js';
-import { masterLegacyGate } from '../../lib/master-legacy-gate.mjs';
-import { readCdbTaxRate } from './services/cdb-tax-rate.mjs';
+import { masterLegacyGate, legacyBannerHtml } from '../../lib/master-legacy-gate.mjs';
+import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
+import { resolveListingTax } from './services/listing-tax.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 router.use(express.json({ limit: '512kb' }));
-// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #6・14 §5・契約 v3 H1)。税率の手入力 (tax_rate を送る保存) は
-//    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = tax_rate を送った保存は 410 / 503 (何も書かない)。
-//    tax_rate を送らない保存 (ほかの欄) は通る。詳細画面は税率の欄を外して Company DB の税率を見せる (本文を読んだ後に置く)
+// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #6・14 §5・契約 v3 H1・PR #1565 R1 H4/H5)。切替の段階が legacy_open のときだけ今までどおり:
+//    税率の手入力 (tax_rate を送る保存) = frozen 以降・段階が読めない = 410 / 503 (何も書かない)。tax_rate を送らない保存 (ほかの欄) は通る。
+//    Notion の取込 (税率も書く)・古い新商品の作り方 (POST /api/drafts・NE のコードから登録・自動取込を手で回す) = 閉じる (新商品は新しい登録の画面から)。
+//    セットを作る = 作るのは通すが、親の税率は写さない (res.locals.masterLegacyWrite.writable のときだけ)。
+//    詳細画面・利益の試算・楽天の出品は Company DB の税率 (listing-tax.mjs)。本文を読んだ後に置く
 router.use(masterLegacyGate('product-hub'));
 
 const view = (name) => path.join(__dirname, 'views', name);
@@ -248,18 +251,20 @@ router.get('/list', (req, res) => {
 router.get('/new', (req, res) => {
   res.render(view('new.ejs'), {
     title: '新規商品ドラフト',
+    // 切替で古い新商品の作り方を閉じた後だけ帯 (登録のボタンを隠す。POST /api/drafts は門が 410)。閉じる前は空文字 = 今までどおり
+    masterLegacyBanner: legacyBannerHtml(res.locals.masterLegacy, { hideSelectors: ['#create-btn'] }),
     displayName: req.session?.displayName || req.session?.email || '',
   });
 });
 
-// 切替で古い入口を閉じた後 (res.locals.masterLegacy.frozen) だけ、税率の欄の代わりに見せる Company DB の税率を読む。
-// 閉じる前は何もしない (今までどおり次の詳細画面へ)
+// 切替で古い入口を閉じた後 (res.locals.masterLegacy.frozen) だけ、税率の欄・利益の試算に使う Company DB の税率を読む
+// (代表コードは構成の SKU から。混ざる・無い・読めない = 決められない)。閉じる前は何もしない (今までどおり次の詳細画面へ)
 router.get('/detail/:id', async (req, res, next) => {
   if (!res.locals.masterLegacy?.frozen) return next();
   try {
     const id = Number.parseInt(req.params.id, 10);
-    const code = Number.isInteger(id) && id > 0 ? getDB().prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(id)?.ne_code : null;
-    res.locals.cdbTax = code ? await readCdbTaxRate(code) : { ok: false, reason: '商品が無い' };
+    const draft = Number.isInteger(id) && id > 0 ? getDB().prepare('SELECT * FROM product_drafts WHERE id = ?').get(id) : null;
+    res.locals.cdbTax = draft ? await resolveCdbDraftTax(getDB(), draft) : { ok: false, reason: '商品が無い' };
   } catch (e) {
     res.locals.cdbTax = { ok: false, reason: String((e && e.message) || e) };
   }
@@ -336,12 +341,14 @@ router.get('/detail/:id', (req, res) => {
   for (const r of db.prepare('SELECT sku_code, reason FROM draft_sku_catalog_exemptions WHERE draft_id = ?').all(draft.id)) {
     skuExemptions[r.sku_code] = r.reason;
   }
-  const simTaxPercent = (() => {
+  // 切替で閉じた後 = Company DB の税率だけ (決められない = 試算しない)。閉じる前は今までどおり (Yahoo 欄 → NE → 10%)
+  const cdbTaxForSim = res.locals.masterLegacy?.frozen ? (res.locals.cdbTax || { ok: false, reason: '読めません' }) : null;
+  const simTaxPercent = cdbTaxForSim ? (cdbTaxForSim.ok ? cdbTaxForSim.percent : null) : (() => {
     const t = String(yahoo?.tax_rate ?? '').trim().match(/^(\d+)/);
     if (t) return Number(t[1]);
     return neCost?.taxPercent ?? 10;
   })();
-  const profitSim = neCost ? computeProfit({
+  const profitSim = neCost && simTaxPercent != null ? computeProfit({
     price: draft.price, costExTax: neCost.costExTax,
     taxPercent: simTaxPercent, shippingCost: neCost.shippingCost,
   }) : null;
@@ -2135,7 +2142,8 @@ router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
   if (rkRow?.genre_id && /^\d+$/.test(String(rkRow.genre_id).trim())) {
     try { await fetchGenreAttributes(db, String(rkRow.genre_id).trim()); } catch (_) { /* best-effort */ }
   }
-  const built = buildItemPayload(db, draft.id);
+  // 税率: 切替前は今までどおり / 閉じた後は Company DB (決められない = 止める)。PR #1565 R1 H5
+  const built = buildItemPayload(db, draft.id, { tax: await resolveListingTax(db, draft) });
   if (!built.ok) return res.json({ ok: false, reasons: built.reasons });
   res.json({
     ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload,
@@ -3366,7 +3374,8 @@ router.post('/api/drafts/:id/set-drafts', (req, res) => {
     // 権限判定は createSetDraft 内の setStepState (親の「セット商品作成検討」を閉じる操作) が行う。
     // 判断した本人か admin だけが作れる = 誰かのレビュー中に横から作られない
     const me = staffByPortalEmail(req.session?.email);
-    const ctx = { isAdmin: req.session?.role === 'admin', actorStaffId: me?.id ?? null, requireVersion: true };
+    // withTax = 親の税率を写すか (切替で閉じた後は写さない。門 = res.locals.masterLegacyWrite)
+    const ctx = { isAdmin: req.session?.role === 'admin', actorStaffId: me?.id ?? null, requireVersion: true, withTax: res.locals.masterLegacyWrite?.writable === true };
     // ボードのカードから「作る」を押したとき (claim: true) は、未割り当てなら本人が引き受ける。
     // 引き受けは版数を 1 消費するので、createSetDraft へ渡す親工程の版数も進める。
     // 引き受けと作成は 1 トランザクション — 作成が途中で失敗したのに担当だけ付くのを防ぐ

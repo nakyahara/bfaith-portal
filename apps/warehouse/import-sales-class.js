@@ -26,11 +26,13 @@ if (await legacyCliGate('cli:import-sales-class.js')) {
       count++;
     }
   });
-  tx();
-
-  console.log('取り込み完了:', count, '件, スキップ:', skipped, '件');
-  console.log('product_sales_class:', db.prepare('SELECT COUNT(*) as cnt FROM product_sales_class').get().cnt, '件');
-  const dist = db.prepare('SELECT sales_class, COUNT(*) as cnt FROM product_sales_class GROUP BY sales_class').all();
-  for (const d of dist) console.log('  分類' + d.sales_class + ': ' + d.cnt + '件');
+  // 書く直前にもう一度段階を読む (この後は同期で書く)
+  if (await legacyCliGate('cli:import-sales-class.js')) {
+    tx();
+    console.log('取り込み完了:', count, '件, スキップ:', skipped, '件');
+    console.log('product_sales_class:', db.prepare('SELECT COUNT(*) as cnt FROM product_sales_class').get().cnt, '件');
+    const dist = db.prepare('SELECT sales_class, COUNT(*) as cnt FROM product_sales_class GROUP BY sales_class').all();
+    for (const d of dist) console.log('  分類' + d.sales_class + ': ' + d.cnt + '件');
+  }
   db.close();
 }

@@ -732,24 +732,35 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 
 **試験**: `scripts/test-lz-nightly.mjs` (毎晩の本番の miniPC 側) / `scripts/test-lz-cutover-check.mjs` (切替・戻しの確かめ・本物のポータルの状態の機械・戻しの版の sha256 と tag) / `scripts/test-lz-daily.mjs` [1]〜[12] (ロジザードの一覧の見出しは実ファイルの 1 行目のバイト。[11][12] = 成果物をポータルへ送る・入口)・`scripts/test-retry-rerun.mjs` (照合が直ったら作り直す)
 
-### マスタの古い入口の門 (⑤-3。Company DB構想 14 §5・§9 v2 M2・§10 契約 v3 H1)
+### マスタの古い入口の門 (⑤-3。Company DB構想 14 §5・§9 v2 M2・§10 契約 v3 H1・PR #1565 Codex R1)
 
-古い入口 = NE の写しにマスタを書く API・画面・手の CLI (miniPC の `/apps/warehouse/register` と SKU マスタ・会計アプリ 5 つの `POST /register`・fba-profitability の原価・product-hub の税率・profit-calculator の NE 用 CSV と仕入れ先・手の取込)。
+古い入口 = NE の写しにマスタを書く API・画面・手の CLI・人の操作で動く取込 (miniPC の `/apps/warehouse/register` と SKU マスタ・会計アプリ 5 つの `POST /register`・fba-profitability の原価・product-hub の税率と古い新商品の作り方 (`/new`・NE のコードから登録・NE が先の自動取込)・Notion の取込・profit-calculator の NE 用 CSV と仕入れ先・発注アプリの仕入先・売れ筋共有の表示名・手の取込)。
 
-- **一覧 = `config/master-legacy-entries.mjs`** (閉じる入口・閉じないもの (理由つき)・CLI の mode)。一覧がそのまま門の設定。
+- **一覧 = `config/master-legacy-entries.mjs`** (閉じる入口・閉じない口 (写し・閉じ済み・手の入口の 3 種類)・CLI の mode)。一覧がそのまま門の設定。
 - **門 = `lib/master-legacy-gate.mjs`**。切替の段階 (`ops.master_cutover_state`・0050) が `legacy_open` のときだけ今までどおり書ける。
   - `frozen` 以降は、持ち主表 (`config/master-ownership.mjs`) がまだ `load` でも閉じる (持ち主の切替より先に古い入口を閉じる順番のため)。
   - API = 410 `{error:'master_frozen', message, url}`。段階が読めない = 503 `{error:'master_phase_unreadable'}` (閉じる側)。何も書かない。
-  - 画面 = 帯「マスタは新しい画面で直します ↗」+ 書く部品を隠す。product-hub の税率は欄を外して Company DB の税率を見せるだけ。
-  - CLI = データに触る前に終了コード 3。csv-import.js は `product_shipping`・`exception_genka` だけ閉じる (受注・ロジザード・NE の写し・送料の表は止めない)。
+  - 画面 = 帯「マスタは新しい画面で直します ↗」+ 書く部品を隠す。
+  - product-hub: 税率の手入力の欄を外す。詳細画面・利益の試算・楽天の出品 (プレビュー・登録) は Company DB の税率だけ (代表コードは構成の SKU から)。混ざる・無い・読めない = 出品を止める。セットを作るのは通すが、親の税率は写さない。
+  - 発注アプリは仕入先 (`/api/masters/suppliers` ほか) だけ閉じる = 切替の手順で書き込み先を Company DB に替えるまで仕入先は見るだけ。発注条件・資材・先方品番は止めない。
+  - CLI = mode が分かったらすぐ (引数・ファイルの検査より前・DB を開く前) に終了コード 3。書く直前にもう一度読む。csv-import.js は `product_shipping`・`exception_genka` だけ閉じる (受注・ロジザード・NE の写し・送料の表は止めない)。
+  - 定期実行: product-hub の NE が先の自動取込 (intake-cron) は丸ごと止める (閉じている = ok の ping で「止めた」・読めない = fail の ping)。
 - **段階の読み方** (新しい秘密は足さない):
   - miniPC (WarehouseServer・CLI) = `COMPANY_DB_WATCH_URL` (見張りの照会用ロール watcher)。無ければ `COMPANY_DB_URL`。
   - Render = `COMPANY_DB_URL`。
-  - 書き込みは毎回読む。読めないときだけ「5 分以内に読めた `legacy_open`」で通す (一時の途切れで作業を止めない)。frozen 以降を一度読んだら使わない。画面の帯は 30 秒だけ前の結果を使う。
+  - 🚨 書き込み・CLI は**毎回**読む。前に読めた値は使わない (読めない = すぐ 503 / 終了コード 3)。途切れにはプロセスごとの接続 2 本までのプールと 1 回の読み直し (200ms 後) で備える。画面の帯だけ 30 秒前の結果を使う。
+  - 読めなかった回数・断った回数 (410・503)・読むのにかかった時間は読み戻しに出す。1 秒を超えた読みと読めなかった回はログに出す。
+- **drain (書きかけを流し終える)**: 門を通った書き込みは、終わるまでプロセスの中で数える (件数・いちばん古い開始)。CSV の取込は受け取った後・書く前にもう一度段階を読む (受け取っている間に frozen になっても書かない)。
+- **門の記録 (ack)**: 起動のときと、要求が来たついでに 5 分おきに、⑤-1 の書き手の関数で「host・プロセスの名札・build の番号 (Render = `RENDER_GIT_COMMIT`・miniPC = git の HEAD)・manifest_hash (一覧を形を決めた JSON にした sha256。手の入口の id を含む)・持ち主表のハッシュ・見た段階・書きかけの件数といちばん古い開始」を書く。書く前に確かめる (段階を読める = env・表・select の権限 / build の番号が分かる / 書く接続先がある)。だめなら書かずに理由をログと読み戻しに出す。書く接続先 = miniPC は `COMPANY_DB_WATCH_WRITER_URL`・Render は `COMPANY_DB_URL`。新しい定期実行は作らない。
 - 🚨 **配る前に**: 0050 を本適用しておく (表が無い = 読めない = 古い入口が全部閉じる)。miniPC の .env に `COMPANY_DB_WATCH_URL`、Render に `COMPANY_DB_URL` があること。
-- **読み戻し** (切替の手順の「全部の環境で閉じたかを確かめる」): `GET /apps/warehouse/api/master-legacy-gate` (miniPC と Render の両方にある) = その環境が見ている段階・書けるか・門の版 (`LEGACY_GATES_VERSION`)・持ち主表の指紋。
-- **ack** (⑤-1 R1): server.js の起動のときに 1 回、`ops.ack_master_legacy_gate(host, build_id, owner_hash, 版, 段階)` を呼ぶ (関数がまだ無ければ何もしない)。定期実行ではない。
-- 試験: `scripts/test-master-legacy-entries.mjs` (ルートを数える = 一覧に無いマスタの書き込みの口を落とす) / `scripts/test-master-legacy-gate.mjs` (入口ごとに legacy_open・閉じた・読めない)。
+- **読み戻し**: `GET /apps/warehouse/api/master-legacy-gate` (miniPC と Render の両方にある) = その環境・そのプロセスが見ている段階・書けるか・manifest_hash・持ち主表のハッシュ・build の番号・書きかけ (`inflight.count`・`oldest_started_at`)・数・門の記録 (呼ぶと記録も書き直す)。
+- **切替の手順 (legacy_open → frozen → 最後の同期)**:
+  1. 全部の環境に門を配る → 読み戻しで manifest_hash・持ち主表のハッシュ・build の番号がそろい、門の記録が `acked` であることを確かめる。
+  2. NE の画面・GAS など機械で閉じられない入口 (manifest の `manual_entry_ids`) を止め、止めた人と時刻を証拠 (`manual_entries_stopped`) に書く。
+  3. 段階を `frozen` に進める (⑤-1 の関数が門の記録と証拠を確かめる)。
+  4. 🚨 **全部の環境の読み戻しで `writable: false`・`inflight.count` が 0 になるまで待つ**。miniPC で手の取込 (csv-import ほか) が動いていないことも目で確かめる (CLI は別のプロセス = 読み戻しに出ない)。
+  5. そこで初めて最後の同期 (NE → Company DB) に進む。drain を確かめた人・時刻を証拠 (`drain`) に書く。
+- 試験: `scripts/test-master-legacy-entries.mjs` (ルートと関数の呼び出しをたどって、一覧に無いマスタの書き込みの口を落とす) / `scripts/test-master-legacy-gate.mjs` (入口ごとに legacy_open・閉じた・読めない・途中で閉じた・CLI)。
 
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 

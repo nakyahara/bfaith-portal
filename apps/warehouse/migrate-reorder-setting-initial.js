@@ -53,14 +53,15 @@ function detectCol(header, candidates, fallback) {
 }
 
 async function main() {
+  // 🚨 推奨保有月数 (m_reorder_setting) はマスタ = 古い入口の門を通す (Company DB構想 14 §9 M2・契約 v3 H1・PR #1565 R1)。
+  //    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = 引数・ファイルの検査より前・DB を開く前に終了コード 3 (--dry-run も)。
+  //    書く直前にもう一度読む
+  if (!(await legacyCliGate('cli:migrate-reorder-setting-initial.js'))) return;
   const args = process.argv.slice(2);
   const csvPath = args.find(a => a.startsWith('--csv='))?.split('=').slice(1).join('=');
   const dryRun = args.includes('--dry-run');
   if (!csvPath) { console.error('--csv=... が必要です'); process.exit(2); }
   if (!fs.existsSync(csvPath)) { console.error(`CSVが見つかりません: ${csvPath}`); process.exit(2); }
-  // 🚨 推奨保有月数 (m_reorder_setting) はマスタ = 古い入口の門を通す (Company DB構想 14 §9 M2・契約 v3 H1)。
-  //    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = DB を開かずに終了コード 3 (--dry-run も)
-  if (!(await legacyCliGate('cli:migrate-reorder-setting-initial.js'))) return;
 
   // UTF-8(BOM可) / Shift_JIS 自動判定
   //   まず UTF-8 として解釈し、置換文字(U+FFFD)が多ければ cp932 とみなす。
@@ -103,6 +104,7 @@ async function main() {
       imported++;
     }
   });
+  if (!(await legacyCliGate('cli:migrate-reorder-setting-initial.js'))) return;   // 書く直前 (この後は同期で書く)
   apply(records.slice(1));
 
   console.log(`${dryRun ? '[DRY-RUN] ' : ''}投入 ${imported} / スキップ ${skipped} (無効 ${invalid}) / 全 ${records.length - 1} 行`);

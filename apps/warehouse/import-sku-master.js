@@ -214,10 +214,12 @@ export function importSkuMasterCSV(csvPath, opts = {}) {
 
 // ─── CLI ───
 const isMain = process.argv[1]?.endsWith('import-sku-master.js');
-// 🚨 SKU マスタ (Amazon SKU ↔ NE コード) はマスタ = 古い入口の門を通す (Company DB構想 10 §4 #2 D-43・契約 v3 H1)。
-//    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = DB を開かずに終了コード 3 (--dry-run も)。
-//    router から importSkuMasterCSV を使うとき (isMain でない) は門を読まない (router の門 /api/csv/m-sku-master が見る)
-if (isMain && await legacyCliGate('cli:import-sku-master.js')) {
+// 🚨 SKU マスタ (Amazon SKU ↔ NE コード) はマスタ = 古い入口の門を通す (Company DB構想 10 §4 #2 D-43・契約 v3 H1・PR #1565 R1)。
+//    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = 引数の検査より前・DB を開く前に終了コード 3 (--dry-run も)。
+//    書く直前にもう一度読む。router から importSkuMasterCSV を使うとき (isMain でない) は門を読まない (router の門 /api/csv/m-sku-master が見る)
+if (isMain) await cliMain();
+async function cliMain() {
+  if (!(await legacyCliGate('cli:import-sku-master.js'))) return;
   const args = process.argv.slice(2);
   const csvPath = args.find(a => !a.startsWith('--'));
   const dryRun = args.includes('--dry-run');
@@ -234,6 +236,7 @@ if (isMain && await legacyCliGate('cli:import-sku-master.js')) {
   console.log(`[import] encoding: ${encoding}`);
   console.log(`[import] dryRun: ${dryRun}`);
 
+  if (!(await legacyCliGate('cli:import-sku-master.js'))) return;   // 書く直前 (この後は同期で読み・書き)
   const result = importSkuMasterCSV(csvPath, { dryRun, encoding });
 
   console.log('\n=== 結果 ===');
