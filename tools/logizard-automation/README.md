@@ -16,8 +16,8 @@
 | `export-barcode-to.js` | miniPC | バーコード情報の全件を好きな場所へ書き出すだけ (`--out <ファイル>`・`--dry` = 条件の設定まで)。バーコードマスタ.csv・既存のファイルには書かない |
 | `export-shohin-to.js` | miniPC | 商品マスタの全件を好きな場所へ書き出すだけ (`--out <ファイル>`。本番の保存先・Drive・その日の成功の印に触らない)。書き出しの部品の実機の確かめ・③c-1b の少数件の試験 |
 | `run-nyuka-csv-scheduled.bat` | miniPC | 00:20 / 08:40 / 11:45 の定時の入口 (入荷受付 CSV → 毎日の商品マスタの取込 (影) → 商品マスタの書き出し) |
-| `auto-barcode.js` | Stream Deck の PC | 入荷バーコード連携 (① 新商品の取込 → ② バーコード情報の書き出し → ③ 毎日の商品マスタの取込)。**JST 00:00〜01:30 は動かない**・`LOGIZARD_BC_DAILY=auto` で ①② だけ (下の「入荷バーコード連携の決まり」) |
-| `barcode-mode.js` | Stream Deck の PC | auto-barcode.js の起動の決まり (夜の止め・①②③ か ①② か・引数) (③c-1b-3a) |
+| `auto-barcode.js` | Stream Deck の PC | 入荷バーコード連携 (① 新商品の取込 → ② バーコード情報の書き出し)。**JST 00:00〜01:30 は動かない**。③ 毎日の商品マスタの取込は切替で外した (miniPC の自動・下の「入荷バーコード連携の決まり」) |
+| `barcode-mode.js` | Stream Deck の PC | auto-barcode.js の起動の決まり (夜の止め・①② だけ・引数) (③c-1b-3a・切替の PR) |
 | `run-barcode.bat` | Stream Deck の PC | Stream Deck から叩く入口 |
 | `import-state-client.js` | 両方 | ポータルの「ロジザードの取込の状態」の口を呼ぶ・手元の初期化の印の読み書きと照合 (③c-1b-1) |
 | `lz-import-screen.js` | 両方 | インポート画面 [PM07/FM07_01] の操作の部品。`previewImport` = 取込パターンを選んで CSV のプレビューまで (③c-1b-2a。サーバーエラーのモーダルは OK を押さずに止める・画面を残す) / `executeImport` = 実行ボタン → 「ファイルアップロードを開始します」のモーダルの中の OK だけ (本物 = jAlerts の確認の箱 #popup_container > #popup_content.confirm > #popup_message + #popup_panel (#popup_ok・#popup_cancel)。形がぴったりのときだけ枠と認める = お知らせの箱・入力欄つき・ボタン違いは押さない。2026-09-30 の実機の試験で見た形) → 押した後に新しく出た結果の表示 (③c-1b-2b-1b。呼ぶのは中原さんと一緒の試験のランナー = 2b-1c から。影の取込は呼ばない)。画面全体の「最初の OK」は押さない。押すのは、確かめと押すを同じページの中の処理で・click 1 回だけ (mousedown を出さない)・押してよい最後の時刻を過ぎていない・ボタンが一番上 (覆われていない) ときだけ |
@@ -49,7 +49,7 @@ node tools/logizard-automation/deploy.mjs --pc minipc --check   # 写したも�
 
 ## 取込の状態 (③c-1b-1・`apps/logizard-import-state`)
 
-自動の ③ (miniPC) と戻し方の手の ③ (Stream Deck の PC) は、ポータル (Render) の 1 つの状態と鍵を共用する。決まり = `apps/logizard-import-state/README.md`。
+毎晩の自動の ③ (miniPC) と、自動が止まったときの手の取込 (ポータルの画面) は、ポータル (Render) の 1 つの状態と鍵を共用する。決まり = `apps/logizard-import-state/README.md`。
 
 - **token `LZ_LOCK_TOKEN`** (中原さんが入れる・Claude は中身を見ない): Render の env / miniPC = リポジトリ直下の `.env` (取込はリポジトリのスクリプトが読む) / Stream Deck の PC = `C:\tools\logizard-automation\.env` (auto-barcode.js が読む)。
 - 手元の初期化の印: miniPC = `DATA_DIR\lz-import\init.json` / Stream Deck の PC = `C:\tools\logizard-automation\logs\lz-import-init.json`。
@@ -62,11 +62,12 @@ node tools/logizard-automation/deploy.mjs --pc minipc --check   # 写したも�
 
 - **JST 00:00〜01:30 は動かない**。押しても理由を出して何もしない (CSV・鍵・ブラウザに触る前)。ログインの前・①②③ の各ステップの前・実行ボタンの直前でも時刻を見て、止めの中なら押す前に止める。
   - 理由: miniPC がロジザードの毎日の商品マスタを 00:15〜00:55 に同じ共通アカウントで扱う (同じ ID で 2 か所からログインするとセッションを追い出し合う)。専用アカウントは作らない (中原さん 2026-09-28)。
-  - 止まった回の続き = 01:30 を過ぎてからもう一度押す (① ③ は前の成功と同じ中身なら飛ばす)。
-- **どこまで動かすか = この PC の `C:\tools\logizard-automation\.env` の `LOGIZARD_BC_DAILY`**
-  - 無い / `manual` = 今までどおり ①②③ (③ = GAS が作る毎日の商品マスタの CSV)。**切替日まではこのまま**。
-  - `auto` = ①② だけ (③ の CSV を見ない・取り込まない)。切替日に中原さんが入れる (毎日の商品マスタは miniPC の自動が取り込む)。
-- 引数は `--dry` だけ。知らない引数は断る (打ち間違いで本番が動かないように)。戻し方の手の ③ (`--only-daily`) は ③c-1b-3b (まだ無い)。
+  - 止まった回の続き = 01:30 を過ぎてからもう一度押す (① は前の成功と同じ中身なら飛ばす)。
+- **動かすのは ①② だけ** (切替の PR・L-23)。③ 毎日の商品マスタの取込 (GAS の CSV) はこの道具から外した = 設定に依らない。
+  - 毎日の商品マスタは miniPC の自動 (00:20・台帳 `lz-daily-import`) が取り込む。自動が止まったときに人が取り込むのは、ポータルの画面「ロジザードの取込の状態」の手の取込。
+  - 前の設定 `LOGIZARD_BC_DAILY` が .env に残っていても ①② だけ (起動のときに「消してかまいません」と出る)。
+  - GAS の ③ に戻すのはシステム全体を旧方式に戻すときだけ = 固定の版 (tag `lz-gas-rollback-20260930`・台帳 `lz-gas-rollback`) を配る。手順 = `db/company/README.md`「毎晩の本番の切替と GAS への戻し」。
+- 引数は `--dry` だけ。知らない引数は断る (打ち間違いで本番が動かないように)。`--only-daily` = 「③ はこの道具から外した・手の取込はポータルの画面で」と出して止まる。
 
 ## 試験
 

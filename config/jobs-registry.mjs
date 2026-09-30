@@ -558,8 +558,8 @@ export const JOBS_REGISTRY = [
       + '保険として bat が最大10分ロックの解放を待ってから node を起動する (node の acquireLock は失敗時に即終了するため)。'
       + '異常終了で残ったロックは PID の死亡を確認して削除。'
       + '画面採取の正本 = AI_reference『ロジザード作業自動化\入荷状況照会CSV_画面採取_20260901.md』。'
-      + '🆕2026-09-28 から、入荷受付CSV と商品マスタの書き出しの間に「毎日の商品マスタの取込 (影)」(scripts/logizard-import/lz-daily-import.mjs・台帳 lz-daily-import-shadow) が走る '
-      + '(00:20 の回だけ動く・08:40 / 11:45 は何もしない・この bat の終了コードは変えない)。bat の正本 = bfaith-portal の tools/logizard-automation/',
+      + '🆕2026-09-28 から、入荷受付CSV と商品マスタの書き出しの間に「毎日の商品マスタの取込」(scripts/logizard-import/lz-daily-import.mjs) が走る。'
+      + '切替 (2b-2 の切替の PR) から毎晩の本番 = 台帳 lz-daily-import (00:20 の回に取り込む・08:40 / 11:45 は知らせの送り直しだけ・この bat の終了コードは変えない)。bat の正本 = bfaith-portal の tools/logizard-automation/',
   },
   {
     id: 'logizard-shohin-csv',
@@ -1237,39 +1237,33 @@ export const JOBS_REGISTRY = [
       + '送れなかった回の証跡は state = complete のまま portal.ok = false = 影の取込・少数件の試験の計画・切替の判定はその回を使わない (portal_not_stored)',
   },
   {
-    id: 'lz-daily-import-shadow',
+    id: 'lz-daily-import',
     type: 'scheduled_job',
-    importance: 'P3',
+    importance: 'P2',
     owner: 'Claude + 中原さん',
-    purpose: 'ロジザードの毎日の商品マスタの取込の「影」(マスタ正本切替 ③c-1b-2a・scripts/logizard-import/lz-daily-import.mjs)。'
-      + '毎晩 00:20 に、前の日の lz-daily の CSV (Company DB の値) を対象に、ロジザードの商品マスタを書き出し (取込の直前)、CSV の全部の商品が'
-      + 'ロジザードにあり削除されていないかを確かめ、インポート画面で**プレビューまで** (実行ボタンは押さない = 何も登録しない)。'
-      + 'ポータルの取込の状態と各 PC の初期化の印も照合する。止まっても何も困らない (GAS の手の取込のまま) = P3。'
-      + '**毎晩の影は miniPC の .env の LZ_DAILY_IMPORT_SHADOW=on のときだけ動く (既定 = 止めてある = Stream Deck の auto-barcode.js が 00:00〜01:30 に動かない版 (③c-1b-3a) を写してから on)**。止めてある間は、ランナーが動いたことだけ ok の ping (note = 止めてある)。'
-      + '本番の取込 (③c-1b-2b) を始めるときに lz-daily-import (本番) に置き換えて、この項目は RETIRED_JOBS へ (撤去 = lz-daily-import-shadow-retire)',
-    where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\\tools\\logizard-automation\\run-nyuka-csv-scheduled.bat の 1.5 ステップ目 (新しい定期実行ではない。ping は lz-daily-import.mjs が自分で打つ)',
-    schedule: '毎日 00:20 (00:15〜00:55 の回だけ動く・1 日 1 回)',
+    purpose: 'ロジザードの毎日の商品マスタの取込 (毎晩の本番・マスタ正本切替 ③c-1b-2b-2)。毎晩 00:20 に、前の日の lz-daily の成果物 '
+      + '(Company DB の値・判定 pass・ポータルに保存済み) をロジザードに取り込み、取込の直前と直後の商品マスタとバーコードを全部比べて確かめる (決まり = RULES_2B2)。'
+      + 'ok の ping = その夜の取込 (または前の夜の未確かめの確かめのやり直し) が verified かつ未送の知らせ 0 のときだけ。ほか = ping しない (ここの締切で気づく) / 途中の例外 = fail。'
+      + '止まった・確かめられない回はポータルの取込の状態が止まった状態になり、要対応スペース (GCHAT_WEBHOOK_JOBS) に知らせる。'
+      + '止まるとロジザードの商品マスタ (商品名・仕入単価・取引先) が Company DB から遅れる (入荷・出荷の現場は止まらない。'
+      + '急ぐときはポータルの画面「ロジザードの取込の状態」の手の取込で人が取り込む) = P2。'
+      + '切替で影 (lz-daily-import-shadow) を置き換えた (影の ok を本番の ok にしない。契約 v3 H9)',
+    where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\\tools\\logizard-automation\\run-nyuka-csv-scheduled.bat の 1.5 ステップ目 '
+      + '(新しい定期実行ではない。scripts/logizard-import/lz-daily-import.mjs の LZ_DAILY_IMPORT=on → lz-nightly.mjs。ping は自分で打つ)',
+    schedule: '毎日 00:20 (Render の時計で 00:15〜00:50 に始める・00:55 が締め切り)。08:40 / 11:45 の回は知らせの送り直しだけ (ping しない)',
     anchor_hour_jst: 0,
     anchor_minute_jst: 20,
-    grace_hours: 6,
+    grace_hours: 40 / 60,   // 01:00 までに ok が無ければ締切超過 (00:55 の締め切り + 5 分。2b-2 設計 §3「01:00 に気づく」)
     lifecycle: 'permanent',
-    runbook: 'C:\\tools\\logizard-automation\\logs\\scheduled.log の [lz-daily-import] と DATA_DIR\\lz-import\\<日付>\\<実行 ID>\\shadow.json (target・portal・pre・precheck・preview)。'
-      + '⏭️ の理由: target_* = 前の日の lz-daily が無い・完了していない・CSV が合わない (daily-sync の「ロジザード毎日の商品マスタ(影)」を見る) / '
-      + 'init_mismatch・portal_unreachable = ポータルの取込の状態 (tools/logizard-automation/import-state-cli.js status) / '
-      + 'precheck_failed = CSV の商品がロジザードに無い・削除 (shadow.json の missing・deleted) / pre_export_* = 直前の書き出しが壊れた。'
-      + '手で試す = node scripts/logizard-import/lz-daily-import.mjs --force-window [--as-of YYYY-MM-DD] (止めてあっても動く・ping しない・その日の済みの印を書かない・Stream Deck を押さない間に)',
-  },
-  {
-    id: 'lz-daily-import-shadow-retire',
-    type: 'temporary_asset',
-    importance: 'TMP',
-    owner: 'Claude + 中原さん',
-    purpose: '影の取込 (台帳 lz-daily-import-shadow・lz-daily-import.mjs の影のモード) は切替までの一時のもの。'
-      + '切替 (③c-1b-2b の本番の取込の開始) で、lz-daily-import-shadow を RETIRED_JOBS へ移し、本番の lz-daily-import を台帳に載せる (影の ok を本番の ok にしない。契約 v3 H9)',
-    where: 'config/jobs-registry.mjs の lz-daily-import-shadow・scripts/logizard-import/lz-daily-import.mjs',
-    remove_by: '2026-11-30',
-    lifecycle: 'temporary',
-    runbook: '切替の PR で lz-daily-import-shadow を RETIRED_JOBS へ・lz-daily-import を載せる・このエントリを消す。切替が延びるなら remove_by を延ばす (理由を書く)',
+    runbook: 'C:\\tools\\logizard-automation\\logs\\scheduled.log の [lz-daily-import] の行 (✅ verified / ⏭️ しない (理由) / ❌)。'
+      + '1 回の記録 = DATA_DIR\\lz-import\\runs\\<実行 ID lzim_night_…>\\import.json (stages・stamp_window・result・verify)・その夜の済みの印 = DATA_DIR\\lz-import\\<JST の日>\\nightly-done.json。'
+      + 'ポータルの取込の状態 = 画面 /apps/logizard-import-state/admin か miniPC で node C:\\tools\\logizard-automation\\import-state-cli.js status。'
+      + '⏭️ の理由: artifact_missing / artifact_mismatch / not_ready = その朝の lz-daily の成果物が無い・ポータルに送れていない (台帳 lz-daily-build) / '
+      + 'halted = 止めてある (止めた理由は status) / manual_open = 手の取込が開いている / stopped (unknown・partial・verify_failed・imported_unverified) = 前の回が止まった = '
+      + 'ロジザードのインポート履歴を見て import-state-cli.js resolve (手順 = tools/logizard-automation/README.md) / stop_notice_pending = 止まった状態の知らせが届いていない / '
+      + 'window_closed = 振り分けの間に 00:50 を過ぎた / 未送の知らせ = 要対応スペースに送れていない (次の 08:40 / 11:45 で送り直す)。'
+      + '❌: GCHAT_WEBHOOK_JOBS・DATA_DIR が無い / 途中の例外 (理由つき)。'
+      + '手順と戻し方 = db/company/README.md「毎晩の本番の切替と GAS への戻し」',
   },
   {
     id: 'lz-daily-cutover',
@@ -1279,7 +1273,8 @@ export const JOBS_REGISTRY = [
     purpose: 'ロジザードの毎日の商品マスタの取込を GAS から Company DB の自動に切り替える (マスタ正本切替 ③c)。完了の条件 (v3 M6) = '
       + '① daily-sync の「ロジザード毎日の商品マスタ(影)」(証跡 lz-daily) が 3 日続けて合格 **かつ成果物をポータルに送れた** (verdict = pass かつ portal.ok = true・版 lzd-v3 以降。説明できない差・判定できない・形の差・不正 = 0。作る回そのものは lz-daily-build が見る。③c-1b-3b-3) '
       + '② ③c-1b (鍵の口・auto-barcode の起動の分け方・取込の記録) の後に、少数件の実機の取込で ロジザードの照合の鍵・大文字小文字・無効の商品・取り込んだ後の値・対象外の列を確かめる '
-      + '③ 切替日 = Stream Deck を ①② だけにし (この PC の C:\\tools\\logizard-automation\\.env に LOGIZARD_BC_DAILY=auto・③c-1b-3a)、自動の ③ を始める。止まると GAS の手の取込のまま (現場は止まらない) = P3',
+      + '③ 切替日 = 切替の PR (Stream Deck の auto-barcode.js から ③ を外す・台帳 lz-daily-import) を切替の手順の中でマージし、自動の ③ を始める '
+      + '(手順 = db/company/README.md「毎晩の本番の切替と GAS への戻し」・確かめ = scripts/logizard-import/lz-cutover-check.mjs)。止まると GAS の手の取込のまま (現場は止まらない) = P3',
     where: 'miniPC の daily-sync (lz-daily.mjs) の証跡 + 中原さんとの実機の取込。手順 = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」',
     schedule: '一度きり。期限 = 台帳に載ってから 30 日 (見張りは台帳に載った時から数える)',
     period_hours: 30 * 24,
@@ -1287,7 +1282,8 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',   // human_obligation は台帳の決まりで permanent。完了の後に RETIRED_JOBS へ移す
     runbook: '① 毎朝の daily-sync の「ロジザード毎日の商品マスタ(影)」の行と DATA_DIR/company-db-evidence/<日付>/lz-daily.json の verdict と portal.ok を見る (3 日続けて pass かつ portal.ok = true か。送れていない日は数えない) '
       + '② 不合格なら report.json の unexplained / invalid を読み、直すか中原さんに認めてもらう '
-      + '③ ③c-1b の後に中原さんと少数件の実機の取込 (scripts/logizard-import/lz-import-test.mjs plan → 中原さんが一覧を認める → run・手順 = db/company/README.md) → 切替日 → 完了の ping を 1 回 → この項目を RETIRED_JOBS へ移す',
+      + '③ ③c-1b の後に中原さんと少数件の実機の取込 (scripts/logizard-import/lz-import-test.mjs plan → 中原さんが一覧を認める → run・手順 = db/company/README.md) (2026-09-30 済み・verified) '
+      + '→ 戻しの練習 → 切替日 (夜の窓の外) → 次の夜の 00:20 の lz-daily-import が verified → 完了の ping を 1 回 → この項目を RETIRED_JOBS へ移す',
   },
   {
     id: 'lz-shadow-compare',
@@ -1520,6 +1516,14 @@ function isRealYmd(ymd) {
  * 「なぜ・何に置き換わったか」を残す (二度と同じ役目の定期実行を作らないための記録)
  */
 export const RETIRED_JOBS = [
+  {
+    id: 'lz-daily-import-shadow',
+    retired_at: '2026-10-02',   // 🚨切替の日にマージの前に直す (db/company/README.md「切替の手順」6)
+    reason: 'ロジザードの毎日の商品マスタの取込の影 (プレビューまで・押さない) は切替までの一時のもの。切替 (2b-2 の切替の PR) で毎晩の本番 lz-daily-import に置き換えた '
+      + '(影の ok を本番の ok にしない。契約 v3 H9)。影のコード (lz-daily-import.mjs の LZ_DAILY_IMPORT_SHADOW=on) は、本番が off の夜のためにまだ残る '
+      + '(本番が on の夜は影はしない)。撤去の一時物 lz-daily-import-shadow-retire もこの切替で消した',
+    replaced_by: 'lz-daily-import (scripts/logizard-import/lz-nightly.mjs・LZ_DAILY_IMPORT=on)',
+  },
   {
     id: 'inbound-check-notion-cards',
     retired_at: '2026-09-05',

@@ -1,6 +1,8 @@
 /**
- * ロジザード自動化: 入荷バーコード発行の連携3ステップ
+ * ロジザード自動化: 入荷バーコード発行の連携 (① ② の 2 ステップ)
  * v0.1 (2026-07-27 作成。auto-hokyu.js / auto-zaiko.js / auto-nyuka.js を雛形に構成)
+ * マスタ正本切替の切替の PR (L-23): ③ 毎日の商品マスタの取込 (GAS の CSV) を外した。毎日の商品マスタは miniPC の自動 (00:20)。
+ *   GAS の ③ に戻すのは台帳 lz-gas-rollback の固定の版 (tag) を配るときだけ (このファイルに ③ を足し戻さない)。
  *
  * フロー:
  *   ① インポート[PM07/FM07_01]  ファイル種類=商品マスタ / 取込パターン=新商品バーコード登録
@@ -8,11 +10,9 @@
  *   ② エクスポート[PM08/FM08_01] 種類=SKU / 抽出パターン=バーコード情報
  *        対象日=更新日 (N日前〜今日, 既定30日) / 対象データ=有効マスタ+無効マスタ
  *        → G:\共有ドライブ\入荷バーコード発行\バーコードマスタ.csv に上書き (検証NGなら既存温存)
- *   ③ インポート[PM07/FM07_01]  ファイル種類=商品マスタ / 取込パターン=デイリー取込商品マスタ
- *        ← G:\共有ドライブ\入荷バーコード発行\ロジザードアップロード\商品マスタ\logizard_shohinmaster_upload.csv
  *
  * 使い方:
- *   node auto-barcode.js         … 本番実行 (①→②→③。途中で失敗したら以降は実行しない)
+ *   node auto-barcode.js         … 本番実行 (①→②。途中で失敗したら以降は実行しない)
  *   node auto-barcode.js --dry   … 各画面の条件設定まで行い、実行ボタンは一切押さない試走。
  *                                  FM08画面のHTML/状態を captures/ に採取する (初回のセレクタ検証用)
  *   run-barcode.bat              … Stream Deck から叩く入口
@@ -21,7 +21,7 @@
  * マスタ正本切替 ③c-1b-3a (2026-09-28・決まりは barcode-mode.js):
  *   - JST 00:00〜01:30 は動かない (始めない・各ステップと実行ボタンの直前でも時刻を見る)。
  *     miniPC の毎日の商品マスタの取込 (00:15〜00:55) と同じ共通アカウントのため。
- *   - .env の LOGIZARD_BC_DAILY=auto = ①② だけ (③ は miniPC の自動・切替日から)。無い / manual = 今までどおり ①②③。
+ *   - 切替の PR (L-23) から ①② だけ (設定に依らない)。前の設定 LOGIZARD_BC_DAILY が残っていても ③ はしない (消してよいと出す)。
  *
  * 安全設計:
  *   - 取込はフェイルクローズ: 完了確認 (インポート結果モーダルのエラー件数=0) が取れなければ後続に進まない。
@@ -73,12 +73,9 @@ const IMPORT1_CSV = (process.env.LOGIZARD_BC_IMPORT1
   || 'G:\\共有ドライブ\\入荷バーコード発行\\ロジザードアップロード\\logizard_bc_upload.csv').trim();
 const EXPORT_OUT = (process.env.LOGIZARD_BC_OUT
   || 'G:\\共有ドライブ\\入荷バーコード発行\\バーコードマスタ.csv').trim();
-const IMPORT2_CSV = (process.env.LOGIZARD_BC_IMPORT2
-  || 'G:\\共有ドライブ\\入荷バーコード発行\\ロジザードアップロード\\商品マスタ\\logizard_shohinmaster_upload.csv').trim();
 
 const IMPORT_FILETYPE_LABEL = process.env.LOGIZARD_BC_FILETYPE || '商品マスタ';
 const IMPORT1_PATTERN = process.env.LOGIZARD_BC_IMPORT1_PATTERN || '新商品バーコード登録';
-const IMPORT2_PATTERN = process.env.LOGIZARD_BC_IMPORT2_PATTERN || 'デイリー取込商品マスタ';
 const EXPORT_TYPE_LABEL = process.env.LOGIZARD_BC_EXPORT_TYPE || 'SKU';
 const EXPORT_PATTERN = process.env.LOGIZARD_BC_EXPORT_PATTERN || 'バーコード情報';
 
@@ -161,12 +158,10 @@ function precheckImportCsv(fullPath, what, stepKey) {
 const startedAt = Date.now();
 console.log(`===== 入荷バーコード連携 ${DRY_RUN ? '(--dry 試走)' : ''} =====`);
 console.log(`ℹ ${MODE.label}`);
+for (const n of MODE.notes) console.log(`ℹ ${n}`);
 let pre1;
-let pre2 = null;
 try {
   pre1 = precheckImportCsv(IMPORT1_CSV, '①取込CSV (新商品バーコード)', 'import1');
-  // LOGIZARD_BC_DAILY=auto = ③ の CSV は見ない・要求しない (毎日の商品マスタは miniPC の自動)
-  if (MODE.import2) pre2 = precheckImportCsv(IMPORT2_CSV, '③取込CSV (商品マスタ)', 'import2');
 } catch (e) {
   console.error(`❌ ${e.message}`);
   process.exit(1);
@@ -278,7 +273,7 @@ async function selectOptionByText(sel, label, what, timeoutMs = 20000) {
 }
 
 // =====================================================================
-// ステップ①③ 商品マスタCSV取込 [PM07/FM07_01] (セレクタは auto-hokyu.js で本番実証済み)
+// ステップ① 商品マスタCSV取込 [PM07/FM07_01] (③ 毎日の商品マスタは切替の PR で外した) (セレクタは auto-hokyu.js で本番実証済み)
 // =====================================================================
 async function runImport(csvPath, patternLabel, stepName) {
   await page.goto(`${BASE}/PM07/Index`, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -766,7 +761,7 @@ async function withRelogin(stepName, fn) {
 //   ボタンは「次の 00:00 の 2 秒前」までの持ち時間で押す (押せるようになるまでの待ちで 00:00 を越えない)。
 //   00:00 をまたいだ後に残るのは、00:00 より前に始めた処理の結果の待ち (最長 180 秒) と後始末だけ。
 //   miniPC の自動の取込は 00:15 から = 15 分の余白。
-const result = { import1: null, export: null, import2: null };
+const result = { import1: null, export: null };
 try {
   assertOutsideNightBlock('ログインの前');
   await login(page, loginOpts()).catch((err) => { throw asNightError(err, 'ログインのボタンの前'); });
@@ -783,30 +778,18 @@ try {
   }
   assertOutsideNightBlock('②の前');
   result.export = await withRelogin('②', () => runExport());
-  if (!MODE.import2) {
-    // LOGIZARD_BC_DAILY=auto (切替日から): 毎日の商品マスタは miniPC の自動 (00:20) が取り込む
-    result.import2 = { status: 'NOT_HERE', summary: '毎日の商品マスタは miniPC の自動が取り込む (LOGIZARD_BC_DAILY=auto)' };
-  } else if (pre2.alreadyImported) {
-    console.log(`⏭ ③: 前回取込済み (${pre2.importedAt}) のためスキップ`);
-    result.import2 = { status: 'SKIPPED', summary: `前回取込済み ${pre2.importedAt}` };
-  } else {
-    assertOutsideNightBlock('③の前');
-    result.import2 = await withRelogin('③', () => runImport(IMPORT2_CSV, IMPORT2_PATTERN, '③デイリー取込商品マスタ'));
-    if (!DRY_RUN) recordImported('import2', { sha256: pre2.hash, path: IMPORT2_CSV, csvMtime: pre2.mtimeJst, importedAt: jstNow() });
-  }
+  // ③ 毎日の商品マスタの取込は無い (切替の PR・L-23。miniPC の自動 00:20 が取り込む)
 
   assertNoUnexpectedDialog();
   result.status = DRY_RUN ? 'DRY_RUN' : 'SUCCESS';
-  result.daily = MODE.daily;
   result.import1Csv = { path: IMPORT1_CSV, ...pre1 };
-  result.import2Csv = pre2 ? { path: IMPORT2_CSV, ...pre2 } : null;
   result.elapsedSec = Math.round((Date.now() - startedAt) / 1000);
   writeResult('barcode', result);
 
   console.log('\n===== 結果 =====');
   console.log(`① 新商品バーコード取込 : ${result.import1.status}${result.import1.summary ? ` (${result.import1.summary})` : ''}`);
   console.log(`② バーコードマスタ出力 : ${result.export.status}${result.export.rows != null ? ` (${result.export.rows}行)` : ''}`);
-  console.log(`③ 商品マスタ取込       : ${result.import2.status}${result.import2.summary ? ` (${result.import2.summary})` : ''}`);
+  console.log('③ 毎日の商品マスタ     : この道具ではしない (miniPC の自動が毎晩取り込む)');
   console.log(`所要 ${result.elapsedSec}秒`);
   console.log(DRY_RUN ? '🧪 試走完了 (ロジザードには何も登録していません)' : '🎉 完了');
 } catch (e) {
@@ -815,7 +798,6 @@ try {
   const done = [
     result.import1 ? '①済' : '①未',
     result.export ? '②済' : '②未',
-    result.import2 ? '③済' : '③未',
   ].join(' ');
   console.error(`   進行状況: ${done} — 失敗したステップ以降は実行していません。`);
   await errorShot(page, 'bc-fatal');
@@ -823,7 +805,7 @@ try {
   if (night) console.error('   (夜の止め = 押す前に止めた。01:30 を過ぎてからもう一度押せば、済んだステップは同じ中身なら飛ばして続きから)');
   writeResult('barcode', {
     status: e && e.targetLocked ? 'TARGET_LOCKED' : night ? 'NIGHT_BLOCK' : 'FAILED',
-    detail, progress: done, ...result, daily: MODE.daily,
+    detail, progress: done, ...result,
     elapsedSec: Math.round((Date.now() - startedAt) / 1000),
   });
   process.exitCode = 1;

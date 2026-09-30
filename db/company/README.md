@@ -608,7 +608,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 原価 0 を出さないようにした後 (Codex R1): 比べる 4,932・不正 76 (**原価 0 が 74** = メルカリ訳アリ品 50・オオクワガタのセット 20 ほか。NE・ロジザード・Company DB とも 0 / 衝突 2)・許す差 157・説明できない 0・判定できない 0 (NE の道の推測の形も 0)。
 原価 0 をそのまま出すようにした後 (L-9 C): 比べる 5,006 (原価 0 を出す 74・ロジザードに 0 でない原価があるもの 0)・新商品待ち 5・不正 2 (衝突)・許す差 159・説明できない 0・判定できない 0。
 
-**取込 (③c-1b。今は影の取込だけ = 実行ボタンは押さない)**: `scripts/logizard-import/lz-daily-import.mjs` (miniPC の 00:20 の定時 `run-nyuka-csv-scheduled.bat` の 1.5 ステップ目)。
+**取込 (③c-1b)**: `scripts/logizard-import/lz-daily-import.mjs` (miniPC の 00:20 の定時 `run-nyuka-csv-scheduled.bat` の 1.5 ステップ目)。切替 (下の「毎晩の本番の切替と GAS への戻し」) から `LZ_DAILY_IMPORT=on` = 毎晩の本番。それまで (と戻した後) は下の影 (実行ボタンは押さない)。
 - **毎晩の影は `LZ_DAILY_IMPORT_SHADOW=on` (miniPC のリポジトリ直下の .env) のときだけ動く。既定 = 止めてある**。手の道 (Stream Deck の auto-barcode.js) が 00:00〜01:30 に動かない版 (③c-1b-3a) を Stream Deck の PC に写してから on にする (同じ共通アカウントなので、影のログインが手の取込のセッションを切らないように時刻で分ける。専用アカウントは作らない = 中原さん 2026-09-28)。
 - 00:15〜00:55 の回だけ・1 日 1 回。対象 = **前の日の lz-daily の正式な証跡 1 つだけ** (daily-sync の回・complete・CSV の sha256 と行数・期限 = 翌日 01:00)。
 - ポータルの取込の状態 (`apps/logizard-import-state`) と、この PC の初期化の印 (`DATA_DIR/lz-import/init.json`) を照合。
@@ -728,7 +728,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 8. 自動の取込の止めは**解かない** (同じ夜に自動と GAS の ③ が両方取り込まない。GAS の ③ は時刻で分ける = 00:00〜01:30 は動かない)。
    - 台帳 `lz-daily-import` は毎晩の締切で鳴る。戻しが 1 日を超えるなら、台帳を戻す PR を作る (lz-daily-import を外す・理由を書く)。
 
-**台帳**: `lz-daily-build` (scheduled_job・P3・毎日 07:00 + 猶予 7 時間 = 作れた回の ok が来なければ気づく) / `lz-daily-import-shadow` (scheduled_job・P3・00:20 + 猶予 6 時間。切替で RETIRED_JOBS へ = `lz-daily-import-shadow-retire`) / `lz-gas-rollback` (temporary_asset・GAS への戻しの固定の版・2026-11-30 まで) / `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
+**台帳**: `lz-daily-build` (scheduled_job・P3・毎日 07:00 + 猶予 7 時間 = 作れた回の ok が来なければ気づく) / `lz-daily-import` (scheduled_job・P2・00:20 + 猶予 40 分 = 01:00 までに verified の ok が来なければ気づく。切替の PR で影 `lz-daily-import-shadow` を置き換えた = RETIRED_JOBS) / `lz-gas-rollback` (temporary_asset・GAS への戻しの固定の版・2026-11-30 まで) / `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
 
 **試験**: `scripts/test-lz-nightly.mjs` (毎晩の本番の miniPC 側) / `scripts/test-lz-cutover-check.mjs` (切替・戻しの確かめ・本物のポータルの状態の機械・戻しの版の sha256 と tag) / `scripts/test-lz-daily.mjs` [1]〜[12] (ロジザードの一覧の見出しは実ファイルの 1 行目のバイト。[11][12] = 成果物をポータルへ送る・入口)・`scripts/test-retry-rerun.mjs` (照合が直ったら作り直す)
 
