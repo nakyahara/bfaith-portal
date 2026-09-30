@@ -11,6 +11,7 @@
 import Database from 'better-sqlite3';
 import { MIRROR_PRODUCTS_DDL, MIRROR_SET_COMPONENTS_DDL } from './material-tables.js';
 import { createProductScoutTables } from '../product-scout/schema.js';
+import { createSkuMapGenerationTables } from './sku-map-generation.js';
 import path from 'path';
 import fs from 'fs';
 import {
@@ -48,6 +49,10 @@ export let productScoutInitError = null;
 // SKUマップ 2種 (yahoo/aupay) も同様 (価格一括改定ツール PR1、2026-08-28)
 export let skuMapInitError = null;
 
+// Amazon SKU の対 (mirror_sku_master + mirror_sku_resolved) の世代の状態も同様 (PR ⑦-0、2026-10-01)。
+// 作れなくても他の表は続ける。受け手は「表が無い = 一度も有効になっていない」と読み、世代つきの対だけ 503 で断る
+export let skuMapGenerationInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -62,6 +67,7 @@ export function initMirrorDB() {
   logizardStockInitError = null;
   productScoutInitError = null;
   skuMapInitError = null;
+  skuMapGenerationInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -231,6 +237,16 @@ function createTables() {
     synced_at          TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mir_sku_master_updated ON mirror_sku_master(source_updated_at)');
+
+  // mirror_sku_map_state — 上の 2 表 (SKU の対) の世代の状態 (PR ⑦-0。Company DB構想 16 §7 H1 / §8 契約 v3)。
+  //   1 行だけ・消せない・世代は下げられない (trigger)。mirror_sku_resolved に構成の時刻の列 (component_created_at / component_updated_at) も足す。
+  //   定義と受け手の決まりは sku-map-generation.js。fail-soft (2026-07-12 障害の教訓: 新しい表の DDL で他の表を道連れにしない)
+  try {
+    createSkuMapGenerationTables(db);
+  } catch (e) {
+    skuMapGenerationInitError = { message: String(e.message || e), code: e.code || null };
+    console.error('[Mirror] SKU の対の世代の表の初期化に失敗 (他の表は続ける・世代つきの対は 503 で断る):', e.message);
+  }
 
   // mirror_inv_daily_summary — 日次在庫スナップショットの集計結果ミラー
   // 元: ミニPC warehouse.db.inv_daily_summary

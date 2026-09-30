@@ -13,12 +13,15 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError, rakutenReviewInitError, logizardStockInitError, skuMapInitError } from './db.js';
+import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError, rakutenReviewInitError, logizardStockInitError, skuMapInitError, skuMapGenerationInitError } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
 } from '../../lib/rakuten-dd-columns.js';
 import { MATERIAL_ID_RE, MATERIAL_HASH_RE, MATERIAL_COLUMNS, materialDigest, cleanMaterialText, validMaterialSemantics } from '../warehouse/material-lineage.js';
+import {
+  planSkuMapPair, applySkuMapGeneration, SkuMapReject, skuMapRejectBody, readSkuMapState, stateForResponse, SKU_MAP_RECEIVER_CAPABILITY,
+} from './sku-map-generation.js';
 
 // 楽天データダウンロード7種の列合成 (mall-csv-fetcher P1-R3。miniPC側と共有定義)
 const DD_STORE_ALL_COLS = [...STORE_DEVICE_BASE_COLS, ...STORE_BENCH_COLS, ...STORE_DEVICE_OPT_COLS];
@@ -149,6 +152,30 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
     }
   }
 
+  // Amazon SKU の対 (sku_master / sku_resolved) の世代 (PR ⑦-0。Company DB構想 16 §7 H1 / §8 契約 v3)。
+  //   **他の表より先に** 決めて入れる = 断るとき (409 / 422 / 503) はこの body の何も書かない (「HTTP は失敗なのに一部だけ反映」を作らない)。
+  //   有効になる前の世代なしは skuMapPlan.mode = 'legacy' で下の旧い分岐が今までどおり扱う。
+  //   世代つきは 2 表と状態を 1 つの取引で入れる (sku-map-generation.js)。後の表で失敗して 500 になっても、同じ世代の再送は replayed になる
+  const skuMapPlan = planSkuMapPair(db, req.body);
+  let skuMapResult = null;
+  if (skuMapPlan.mode === 'reject') {
+    console.warn(`[Mirror] SKU の対を断った: ${skuMapPlan.code} — ${skuMapPlan.message}`);
+    return res.status(skuMapPlan.status).json(skuMapRejectBody(skuMapPlan));
+  }
+  if (skuMapPlan.mode === 'generation') {
+    try {
+      skuMapResult = applySkuMapGeneration(db, skuMapPlan, { syncedAt: now });
+    } catch (e) {
+      if (e instanceof SkuMapReject) {
+        console.warn(`[Mirror] SKU の対を断った: ${e.code} — ${e.message}`);
+        return res.status(e.status).json(skuMapRejectBody({ code: e.code, message: e.message, extra: e.extra }));
+      }
+      console.error('[Mirror] SKU の対の世代の反映に失敗 (巻き戻した):', e.message);
+      return res.status(500).json({ error: 'sku_map_apply_failed', message: e.message, sku_map: { part: 'sku_map', result: 'failed', capability: SKU_MAP_RECEIVER_CAPABILITY } });
+    }
+    log.push(`sku_map: ${skuMapResult.result} (世代 ${skuMapResult.generation}・親 ${skuMapResult.master_rows}件・構成 ${skuMapResult.component_rows}件)`);
+  }
+
   try {
     // products（全件置換）
     //   Codex PR1 review High #2 反映: seasonality_flag/season_months/new_product_flag/
@@ -211,7 +238,8 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
     //   過去事故 (2026-05-08〜10 Yahoo proxy regression で mirror 全空 / 2026-05-06 worktree 別 DB 分裂) の再発防止。
     const hasResolved = req.body.sku_resolved !== undefined && Array.isArray(req.body.sku_resolved);
     const hasMaster = req.body.sku_master !== undefined && Array.isArray(req.body.sku_master);
-    if (hasResolved || hasMaster) {
+    // 世代つき (⑦-0) は上で入れ済み / 断り済み。ここは有効になる前の世代なし (legacy) だけ
+    if (skuMapPlan.mode === 'legacy' && (hasResolved || hasMaster)) {
       const resolved = hasResolved ? req.body.sku_resolved : null;
       const masterRows = hasMaster ? req.body.sku_master : null;
       const resolvedClear = req.body.meta?.clear_sku_resolved === true;
@@ -754,11 +782,28 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
     try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
 
     console.log('[Mirror] 同期完了:', log.join(', '));
-    res.json({ ok: true, log, synced_at: now, ...(Object.keys(materialRecorded).length ? { material_recorded: materialRecorded } : {}) });
+    res.json({ ok: true, log, synced_at: now, ...(Object.keys(materialRecorded).length ? { material_recorded: materialRecorded } : {}), ...(skuMapResult ? { sku_map: skuMapResult } : {}) });
   } catch (e) {
     console.error('[Mirror] 同期エラー:', e.message);
-    res.status(500).json({ error: e.message });
+    // SKU の対は先に入れ済みなら、それを応答に残す (送り手は同じ世代の再送で replayed を受ける)
+    res.status(500).json({ error: e.message, ...(skuMapResult ? { sku_map: skuMapResult } : {}) });
   }
+});
+
+// ─── GET /api/sync/sku-map/state ───
+// 送り手 (⑦-2) が世代つきで送る前に「受け手が世代を分かるか・今の世代はいくつか」を確かめる口 (HTTP 200 だけに頼らない)。
+//   capability.sku_map_generations = 1 と format が合うときだけ世代つきで送る。state.generation は 10 進の文字列 (bigint)。
+//   Company DB を戻したときの世代の付け直し (max(PG, miniPC, Render) より大きく) にも使う。認証は /api/sync と同じ (x-sync-key)
+router.get('/api/sync/sku-map/state', requireSyncKey, (req, res) => {
+  const db = getMirrorDB();
+  let s;
+  try { s = readSkuMapState(db); } catch (e) {
+    return res.status(503).json({ error: 'sku_map_state_unavailable', message: e.message, capability: SKU_MAP_RECEIVER_CAPABILITY });
+  }
+  if (!s.available) {
+    return res.status(503).json({ error: 'sku_map_state_unavailable', message: '世代の状態の表が無い', init_error: skuMapGenerationInitError, capability: SKU_MAP_RECEIVER_CAPABILITY });
+  }
+  res.json({ ok: true, capability: SKU_MAP_RECEIVER_CAPABILITY, state: stateForResponse(s) });
 });
 
 // ─── Phase 1 #1-4a: POST /api/sync/:entity/chunk (entity-driven contract sync) ───
