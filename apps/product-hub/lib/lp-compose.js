@@ -243,19 +243,20 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
   //    SQLite の非 STRICT 表は文字列も受けるので、検証しないと packet と行で ID が食い違う (コード R1 #4)
   const draftId = posInt(draft?.id);
   if (!draftId) return { code: 'bad_request', error: '商品の ID が不正です' };
-  // 🚨 **同じキーの再送は、材料の検証より先に**既存の job を返す (コード R9)。
-  //    受付のあとに商品情報や仕様書が変わっていると、通信リトライが not_ready / bad_request になり、
-  //    画面は「作れなかった」と見えるのに裏では job が動いている、という食い違いが起きる
-  const prior = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draftId, key);
-  if (prior) return { ok: true, job: prior, created: false };
-  const blocked = requestBlockReason({ draft, productInfo, spec });
-  if (blocked) return { code: 'not_ready', error: blocked };
-  const specId = posInt(spec?.id);
-  if (!specId) return { code: 'bad_request', error: '仕様書の ID が不正です' };
   const a = trim(actor, 120) || 'unknown';
   const nowS = new Date(now).toISOString();
   const deadline = new Date(now + MEASUREMENT_WINDOW_MIN * 60_000).toISOString();
   return db.transaction(() => {
+    // 🚨 **同じキーの再送は、材料の検証より先に**既存の job を返す。しかも
+    //    トランザクションの**冒頭**で見る (コード R9・R10)。外で見ると、その後に別の接続が
+    //    同じキーで作った job を見落とし、再送側が not_ready / bad_request になる。
+    //    画面は「作れなかった」と見えるのに裏では job が動いている、という食い違いが起きる
+    const prior = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draftId, key);
+    if (prior) return { ok: true, job: prior, created: false };
+    const blocked = requestBlockReason({ draft, productInfo, spec });
+    if (blocked) return { code: 'not_ready', error: blocked };
+    const specId = posInt(spec?.id);
+    if (!specId) return { code: 'bad_request', error: '仕様書の ID が不正です' };
     // 渡された spec を信じず、DB から引き直して種類と hash を照合する (コード R1 #4)
     // hash は**必須**。省略を許すと ID と kind だけで通り、照合の意味が無くなる (コード R2 #3)
     const specRow = db.prepare('SELECT * FROM ph_lp_specs WHERE id = ?').get(specId);
@@ -264,8 +265,6 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
     }
     const { packet, hash } = buildPacket({ draft: { ...draft, id: draftId }, productInfo, colorVariations, images, spec: specRow });
     recoverExpired(db, now);
-    const hit = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draftId, key);
-    if (hit) return { ok: true, job: hit, created: false };
     const live = db.prepare(`SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND status IN ('queued','running')`).get(draftId);
     if (live) return { code: 'already_running', error: 'この商品の構成をいま作っています', job: live };
     let id;
