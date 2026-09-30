@@ -1377,7 +1377,7 @@ Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/c
 Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/company-db/sync/amazon-profit/totals?mall=amazon&scope=jp&from=2026-01-01&to=2027-02-04' | Out-Null }
 ```
 
-試験 = `node scripts/test-company-db-amazon-profit.mjs` (32 件: 材料は 1 回だけ計算 (関数の本体を数えて固定) / 受け取り時の出品を集合で比べる (財務・広告) / relink の後は印が付かない (わかる範囲の印の限界を固定) / coverage の関数の世代と版 (合計は source を含めて 1 つのときだけ) / coverage が null なら正式な値は全部 null / 差し替えた後の手で計算した値 (税込・税抜・値引きの税・広告 × 1.1・返品の推定・負の手数料・override_zero と原価不明) / 構成 0 件・候補 2 件・出品なし / 広告の状態 (legacy・missing・not_collected) / 分けられない部品の相殺・旧い形の行・単価の無い返品 / 同じ日に 2 回変わった原価・観測と推定 / hash が JS と一致 / ASIN は未解決・別名は結ぶ・未解決は出品の行だけ止める / Easy Ship (割合・等分・端数・返金・期間に依らない・配れない額) / master_notes (受け取りとの違い・監査の記録・タイトルは数えない) / 理由の順と列ごとの null (3 つの coverage で全行) / 日の合計 (列の組ごとの条件・税の表・保存則・row_kind が重ならない・取引の無い日) / 契約 / HTTP (鍵・400・409・ID は文字列))
+試験 = `node scripts/test-company-db-amazon-profit.mjs` (33 件: 材料は 1 回だけ計算 (関数の本体を数えて固定) / 受け取り時の出品を集合で比べる (財務・広告) / relink の後は印が付かない (わかる範囲の印の限界を固定) / coverage の関数の世代と版 (合計は source を含めて 1 つのときだけ) / coverage が null なら正式な値は全部 null / 差し替えた後の手で計算した値 (税込・税抜・値引きの税・広告 × 1.1・返品の推定・負の手数料・override_zero と原価不明) / 構成 0 件・候補 2 件・出品なし / 広告の状態 (legacy・missing・not_collected) / 分けられない部品の相殺・旧い形の行・単価の無い返品 / 同じ日に 2 回変わった原価・観測と推定 / hash が JS と一致 / ASIN は未解決・別名は結ぶ・未解決は出品の行だけ止める / Easy Ship (割合・等分・端数・返金・期間に依らない・配れない額・負の重み (0 にする)・全部が非正 (等分)・保存則) / master_notes (受け取りとの違い・監査の記録・タイトルは数えない) / 理由の順と列ごとの null (3 つの coverage で全行) / 日の合計 (列の組ごとの条件・税の表・保存則・row_kind が重ならない・取引の無い日) / 契約 / HTTP (鍵・400・409・ID は文字列))
 
 ## 発注の受け皿 (0014。08 §5。D6)
 
