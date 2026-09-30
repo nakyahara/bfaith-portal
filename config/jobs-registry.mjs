@@ -1316,6 +1316,45 @@ export const JOBS_REGISTRY = [
 
   // ─────────────── temporary_asset (期限つきの一時物) ───────────────
   {
+    id: 'lz-gas-rollback',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん + Claude',
+    purpose: 'ロジザードの毎日の商品マスタの取込を、毎晩の自動 (lz-daily-import) から GAS の手の ③ (Stream Deck の auto-barcode.js の ③) に戻すための固定の版 '
+      + '(マスタ正本切替・3b 契約 K3-8・2b-2 契約 v3 N2・N9)。切替の PR (#1558) で auto-barcode.js から ③ を外す。戻すときはこの版を Stream Deck の PC に配る '
+      + '(コードに ③ を足し戻さない)。固定したもの = 下の rollback (tag・commit・配る 11 ファイルの sha256・対応する manifest.json の sha256)。'
+      + 'この版は 2026-09-30 に Stream Deck の PC (中原さんの PC・manifest の streamdeck はこの 1 台) に入っていたものと 11 ファイルとも同じバイト。'
+      + '切替の前の戻しの練習でも使う (切替の PR より先に載せる = 練習の日に固定の版と期限が台帳にある)。'
+      + '期限 (remove_by) の後は使わない (lz-cutover-check.mjs --expect rollback が Render の日付で断る)',
+    where: 'bfaith-portal の tag lz-gas-rollback-20260930 (tools/logizard-automation の streamdeck の版) → Stream Deck の PC の C:\\tools\\logizard-automation',
+    remove_by: '2026-11-30',
+    lifecycle: 'temporary',
+    rollback: Object.freeze({
+      tag: 'lz-gas-rollback-20260930',
+      commit: '69999181aae38bded0ad162cad523e0a4f796c1b',
+      pc: 'streamdeck',
+      manifest_sha256: 'f4ff4459970459c6fae44fedad79b741b633af2d1ba2e83da38a9e2e8c6d9348',
+      // 配るバイト (チェックアウトした形 = .bat は CRLF)。deploy.mjs --check がこの版の作業場所と照らす
+      files: Object.freeze({
+        'logizard-common.js': '120b35c3b34e3dc165ad0d748f9eb916b09a36031cafbfb6ec082c6919ce7857',
+        'csv-util.js': 'cf93a7b3ecd892e04f9890c8fcb93321844aa9eb9e2c5a2f3bad66e3567466d1',
+        'shohin-export.js': 'a1d31b86b0ba320cec9c3653c5cdf04497b22031c67ac94fc380578255ca8e47',
+        'auto-shohin-csv.js': 'a2203fd739ce5856778da2a295f2daaecfca86bd11d0b13c7ff913fa6149604d',
+        'auto-barcode.js': '28b5f992d91f457cda25a4bee5faf38805df9b406b61abdf2490f3aa6c2e7c1a',
+        'barcode-mode.js': '055b12aa2611bda96ec387d4d614154472fa27095d52cb2743dc1a03e438c997',
+        'import-state-cli.js': 'd11af723bbd9ffab1ad6f14ecb7722437c07fd5f4a951b8b9d4e7256598f8442',
+        'import-state-client.js': 'fd35581068967dfdc840ffee008ce7bf8d6583c0ab8de26066966fc973966311',
+        'lz-import-screen.js': '364fd47de64e771846b65157db53a9afc36e9aeb3db838f857d29a56b1eee845',
+        'import-guard.js': '5791684528fa8deb7d7938654eeb2e912d6ce38f03bfb468ab5a744061ee390d',
+        'run-barcode.bat': '700d90c30dc8b06f0cda621f7f4c56d2841ba46a6f2a3646148b83264e7f74ef',
+      }),
+    }),
+    runbook: '戻す順番と練習 = db/company/README.md「毎晩の本番の切替と GAS への戻し」の「GAS への戻し」(止める → LZ_DAILY_IMPORT=off → Render の LZ_MANUAL_V4=off → '
+      + 'lz-cutover-check.mjs --expect rollback (期限もここで見る) → この tag の作業場所から deploy.mjs --pc streamdeck --apply → --check → node auto-barcode.js --dry で ①②③ と出る)。'
+      + '期限の後: 手順書の「GAS への戻し」を閉じる (固定の版を配らない)・tag は消さずに残してよい (git の履歴)・このエントリを消す。'
+      + '切替が延びた・戻しをもっと持つなら remove_by を延ばす (理由を書く)',
+  },
+  {
     id: 'mall-fetch-skip-rakuten-blocked',
     type: 'temporary_asset',
     importance: 'TMP',

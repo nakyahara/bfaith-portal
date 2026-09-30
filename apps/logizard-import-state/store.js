@@ -374,6 +374,9 @@ export function nightlyReadiness(db, { sourceRunId, csvSha256, rows, targetAsOf,
     // ready = 始められるか (口の ok は通信の成功 = 別。Codex #1546 R1 High の直し方 = 名前を分ける。契約 v3 N4 の文言も ready に)
     ready: problems.length === 0, codes: problems.map((p) => p[0]), messages: problems.map((p) => p[1]),
     manual: { v4: v4On() }, cutover_phase: getSettings(db).cutover_phase, clock: nightlyClock(now),   // manual は status と同じ形・設定の読み方は画面と同じ (無い = cutover)
+    // 切替の確かめ (lz-cutover-check.mjs・Codex #1558 R1 Medium): GAS の CSV の手の取込を今受けるか = 手の取込の本当の道と同じ判定 (副作用なし)・
+    // cutover_phase を人が設定したか (無い = 既定の cutover と読むだけ = 切替の手順 4 を飛ばしていないか)
+    gas_upload: (gasUploadProblems(getSettings(db))[0] || ['open'])[0], cutover_phase_explicit: settingOf(db, 'cutover_phase', null) !== null,
     state: r.state, halted: !!r.halted, lock_active: lockActive(r, now), manual_open: !!openSessionOf(db),
     nightly_started: !!db.prepare("SELECT 1 FROM import_runs WHERE mode = 'nightly' AND target_as_of = ?").get(String(targetAsOf ?? '')),
     artifact: a ? { found: true, verdict: a.verdict, same: a.csv_sha256 === csvSha256 && a.rows === rows && a.target_as_of === targetAsOf } : { found: false, verdict: null, same: false },
@@ -772,6 +775,13 @@ export function getArtifact(db, { sourceRunId }) {
   return db.prepare('SELECT source_run_id, target_as_of, verdict, csv_sha256, rows, received_at, received_by FROM daily_artifacts WHERE source_run_id = ?').get(String(sourceRunId ?? '')) || null;
 }
 
+/** GAS の CSV の手の取込を断る理由 (openManualSession と nightly-readiness で共用 = 同じ判定。Codex #1558 R1 Medium)。受けられる = [] */
+function gasUploadProblems(settings) {
+  const out = [];
+  if (settings.cutover_phase !== 'transition') out.push(['gas_closed', 'GAS の CSV は移行の段階 (cutover_phase = transition) の間だけ']);
+  return out;
+}
+
 /** 設定 (無い = cutover_phase は cutover = GAS の CSV を断る・lz_accounts は空 = 手の取込を始められない) */
 export function getSettings(db) {
   return { cutover_phase: settingOf(db, 'cutover_phase', 'cutover'), lz_accounts: settingOf(db, 'lz_accounts', []) };
@@ -825,7 +835,7 @@ export function openManualSession(db, { by, lzAccount, source, expectedHaltRevis
       csvBuf = Buffer.from(a.csv); targetAsOf = a.target_as_of; sourceRunId = a.source_run_id;
       if (sha256(csvBuf) !== a.csv_sha256) fail('artifact_broken', '成果物の中身が識別と違う');
     } else if (source.kind === 'gas_upload') {
-      if (settings.cutover_phase !== 'transition') fail('gas_closed', 'GAS の CSV は移行の段階 (cutover_phase = transition) の間だけ');
+      failFirst(gasUploadProblems(settings));
       const today = jstDate(now), yesterday = jstDate(now - 86400000);
       if (![today, yesterday].includes(source.targetAsOf)) fail('bad_request', 'GAS の CSV の対象の日は今日か昨日 (JST)', 400);
       csvBuf = source.csvBuf; targetAsOf = source.targetAsOf;
