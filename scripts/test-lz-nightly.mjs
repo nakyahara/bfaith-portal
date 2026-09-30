@@ -126,19 +126,21 @@ await ta('[1] 時刻 (N1・F): nightly = JST [00:15, 00:50) に始める・締�
   assert.equal(E.newRunId(new Date(NIGHT), nl).match(S.NIGHTLY_RUN_RE) !== null, true, 'エンジンの実行 ID の形 = Render が照らす形');
 });
 
-await ta('[2] 毎晩の決まりの確かめの列の決まりが無い (2b-2a) = preflight・importOne・verifyAgain が何もせずに断る (鍵・ログイン・ファイル・知らせ = 0)', async () => {
-  assert.equal(E.POLICIES.nightly.rules, null);
-  assert.throws(() => E.assertPolicyReady(E.POLICIES.nightly), /確かめの列の決まりがまだ無い/);
-  assert.throws(() => E.preflight({ policy: E.POLICIES.nightly, now: new Date(NIGHT), capabilities: { exportBarcodes: true } }), /確かめの列の決まりがまだ無い/);
-  const p = portal();
+await ta('[2] 毎晩の決まり = RULES_2B2 (2b-2b・9/30 の実機で決めた・decided) = 動ける / Render の時刻で窓の外 = preflight・importOne・verifyAgain が何もせずに断る (鍵・ログイン・ファイル・知らせ = 0)', async () => {
+  const V = await import('../apps/master-decisions/lz-import-verify.mjs');
+  assert.equal(E.POLICIES.nightly.rules, V.RULES_2B2);
+  assert.equal(E.assertPolicyReady(E.POLICIES.nightly), true);
+  assert.equal(V.compileRules(E.POLICIES.nightly.rules).decided, true);
+  assert.throws(() => E.preflight({ policy: E.POLICIES.nightly, now: new Date(DAY), capabilities: { exportBarcodes: true } }), /JST 00:15〜00:50/);
+  const p = portal({ at: DAY });
   const touched = [];
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzn-none-'));
   const base = { policy: E.POLICIES.nightly, lzMinRows: 1, runsDir: path.join(dataDir, 'runs'), csvBuf: dailyBuf(), csv: { sha256: sha(dailyBuf()), rows: 2, target_as_of: TARGET, source_run_id: RUN_DIR },
-    context: { artifact: { source_run_id: RUN_DIR, target_as_of: TARGET, verdict: 'pass', csv_sha256: sha(dailyBuf()), rows: 2 } }, now: new Date(NIGHT), localInitFile: 'x', client: p.client,
+    context: { artifact: { source_run_id: RUN_DIR, target_as_of: TARGET, verdict: 'pass', csv_sha256: sha(dailyBuf()), rows: 2 } }, now: new Date(DAY), localInitFile: 'x', client: p.client,
     checkInit: async () => { touched.push('checkInit'); return { ok: true }; }, withSession: async () => { touched.push('session'); }, capabilities: { exportBarcodes: true, executeImport: true },
     notify: async () => { touched.push('notify'); return true; }, createGuard: G.createGuard, log: () => {} };
-  await assert.rejects(E.importOne(base), /確かめの列の決まりがまだ無い/);
-  await assert.rejects(E.verifyAgain({ ...base, runId: nightId(NIGHT), locateRun: () => { touched.push('locate'); return dataDir; }, context: {} }), /確かめの列の決まりがまだ無い/);
+  await assert.rejects(E.importOne(base), /JST 00:15〜00:50/);
+  await assert.rejects(E.verifyAgain({ ...base, runId: nightId(NIGHT), locateRun: () => { touched.push('locate'); return dataDir; }, context: {} }), /JST 00:15〜00:50/);
   assert.deepEqual([touched, p.calls, fs.readdirSync(dataDir)], [[], [], []]);
 });
 
@@ -483,11 +485,11 @@ await ta('[15] 対象と成果物: 前の日の証跡が無い・不合格・送
   assert.deepEqual([x.r.state, x.r.runId, p.calls.includes('nightlyReadiness'), x.eng.calls.importOne.length, fs.existsSync(N.nightlyMarker(dd, '2030-01-17'))], ['already_started', runId, false, 0, false]);
 });
 
-await ta('[16] nightlyMain: 送り先 (GCHAT_WEBHOOK_JOBS) → 毎晩の確かめの列の決まり → DATA_DIR の順に見る (どれも何もする前)・決まりが無い = 影の項目に fail / summarize の終了コード', async () => {
+await ta('[16] nightlyMain: 送り先 (GCHAT_WEBHOOK_JOBS) → 毎晩の確かめの列の決まり → DATA_DIR の順に見る (どれも何もする前) / summarize の終了コード', async () => {
   let r = await N.nightlyMain({ env: { DATA_DIR: 'x' }, deps: {} });
   assert.deepEqual([r.code, r.ping, r.job, /GCHAT_WEBHOOK_JOBS/.test(r.line)], [1, 'fail', N.JOB_NIGHTLY, true]);
   r = await N.nightlyMain({ env: { GCHAT_WEBHOOK_JOBS: 'https://chat.example.test/h', DATA_DIR: '' }, deps: {} });
-  assert.deepEqual([r.code, r.ping, r.job, /確かめの列の決まりがまだ無い/.test(r.line)], [1, 'fail', N.JOB_SHADOW, true], '決まりが無い = DATA_DIR より先に断る (何もしない)');
+  assert.deepEqual([r.code, r.ping, r.job, /DATA_DIR が無い/.test(r.line)], [1, 'fail', N.JOB_NIGHTLY, true], '決まりはある (2b-2b) = DATA_DIR が無い = 何もしない');
   assert.deepEqual([N.summarize({ state: 'imported', result: 'verified', ping: 'ok', runId: 'r' }).code, N.summarize({ state: 'notify_only', ping: null }).code, N.summarize({ state: 'running', ping: null }).code,
     N.summarize({ state: 'skipped', reason: 'x', ping: null }).code, N.summarize({ state: 'imported', result: 'partial', ping: null }).code], [0, 0, 0, 3, 3]);
 });
@@ -696,6 +698,149 @@ await ta('[24] 止まった状態でも同じ回の鍵が生きている (前の
   const y = nightlyOpts(p, setupData(), fakeEngine());
   const r2 = await N.runNightly(y.o);
   assert.deepEqual([r2.state, y.sent, r2.notices[0].stop_pending, S.getStatus(p.db, { now: p.clock.now }).notified], ['notify_only', [], false, false]);
+});
+
+// ───────── 2b-2b: 本物の毎晩の決まり (RULES_2B2) を通した端から端まで (偽物の画面 = 9/30 の実機と同じ動き) ─────────
+/**
+ * 偽物のロジザード (9/30 の実機の動き): 取込 = 商品名・検索名称 (ふりがな)・仕入単価 (文字のまま)・商品予備項目００３ を CSV のとおりに・
+ * 変更日時とインポート日時を取込の時刻 (14 桁) に (値が同じ商品も)・登録日時は変えない。結果の文 = 総件数 = 処理件数 (処理不要 0)
+ */
+function realLikeLz({ over = {} } = {}) {
+  const H = LZ_SHOHIN.header, col = (n) => H.indexOf(n);
+  const cells = (id) => { const c = H.map((h) => `${h}-${id}`); Object.assign(c, { [col('商品ID')]: id, [col('削除フラグ')]: '0', [col('登録日時')]: '20300101000000', [col('変更日時')]: '20300110000000', [col('インポート日時')]: '20300110000000' }); return c; };
+  const st = { lz: new Map(['A-1', 'B-2', 'C-3'].map((id) => [id, cells(id)])), bc: [['A-1', 'a', '4900000000001'], ['B-2', 'b', '4900000000002'], ['C-3', 'c', '4900000000003']], calls: [], stamp: '20300117002130' };
+  let exported = 0;
+  const ops = {
+    exportShohin: async () => {
+      st.calls.push('exportShohin'); exported++;
+      if (over.postShohinFailsOnce && st.calls.includes('execute') && !st.failedOnce) { st.failedOnce = true; throw new Error('書き出しに失敗 (通信)'); }
+      return { buf: csvBuf(H, [...st.lz.values()]) };
+    },
+    exportBarcodes: async () => { st.calls.push('exportBarcodes'); return { buf: csvBuf(['商品ID', '商品名', 'バーコード'], st.bc) }; },
+    previewImport: async (p) => { st.calls.push('preview'); st.previewed = p; return { previewed: true }; },
+    executeImport: async ({ guard, onExecuteIssued }) => {
+      guard.check('実行ボタン');
+      onExecuteIssued();
+      st.calls.push('execute');
+      const rows = iconv.decode(fs.readFileSync(st.previewed), 'cp932').split('\r\n').slice(1).map((l) => l.split(',').map((x) => x.replace(/^"|"$/g, '')));
+      for (const r of rows) {
+        const c = st.lz.get(r[0]);
+        c[col('商品名')] = r[1]; c[col('検索名称')] = r[2]; c[col('仕入単価')] = r[3]; c[col('商品予備項目００３')] = r[4];
+        c[col('変更日時')] = st.stamp; c[col('インポート日時')] = over.importStampLag ? '20300117002131' : st.stamp;
+      }
+      if (over.touchBarcode) st.bc[0][2] = '4900000000999';
+      return { executeIssued: true, confirm: 'clicked', reason: null, resultText: `インポート結果 総件数 : ${rows.length} 処理件数 : ${rows.length} 処理不要件数 : 0 エラー件数 : 0` };
+    },
+  };
+  void exported;
+  return { st, withSession: async (fn) => fn(ops) };
+}
+const e2eOpts = (p, dataDir, lz, extra = {}) => {
+  const sent = [];
+  return { sent, o: { dataDir, client: p.client, checkInit: p.checkInit, localInitFile: 'x', withSession: lz.withSession, capabilities: { exportBarcodes: true, executeImport: true },
+    notify: async (t) => { sent.push(t); return true; }, createGuard: G.createGuard, log: () => {}, lzMinRows: 1, ...extra } };
+};
+
+await ta('[25] 2b-2b 端から端まで (本物の nightly の決まり・本物のエンジン・本物の状態の機械・Render の時計): 00:20 = 取り込む → 商品とバーコードの両方が合う = verified = ok の ping / verified の取引で区切りまでの再適用待ちが閉じる / 記録は実行 ID の直のパス', async () => {
+  const p = portal();
+  p.putArtifact();
+  // 手の取込の義務 (A-1 = 今夜の成果物にある = 閉じる・Z-9 = 無い = 残る)
+  for (const pid of ['A-1', 'Z-9']) p.db.prepare('INSERT INTO reapply_obligations (session_id, product_id, created_at) VALUES (?, ?, ?)').run('ms_e2e', pid, NIGHT - 3600000);
+  const dataDir = setupData();
+  const lz = realLikeLz();
+  const { sent, o } = e2eOpts(p, dataDir, lz);
+  const r = await N.runNightly(o);
+  const st = S.getStatus(p.db, { now: p.clock.now });
+  assert.deepEqual([r.state, r.result, st.state, st.run.detail.mode, st.run.detail.verify_detail.rules_version, st.run.detail.verify_detail.decided], ['imported', 'verified', 'verified', 'nightly', 'lzv-2b2', true]);
+  assert.match(r.runId, S.NIGHTLY_RUN_RE);
+  assert.deepEqual(lz.st.calls, ['exportShohin', 'exportBarcodes', 'preview', 'execute', 'exportShohin', 'exportBarcodes']);
+  const runDir = N.nightlyRunDir(dataDir, r.runId);
+  for (const f of ['import.json', 'import.csv', 'pre.csv', 'pre-barcode.csv', 'post.csv', 'post-barcode.csv', 'verify.json']) assert.ok(fs.existsSync(path.join(runDir, f)), f);
+  // 再適用待ち: A-1 は閉じた (reapplied・この回)・Z-9 は残って知らせた
+  assert.deepEqual(S.listPending(p.db).items.map((x) => x.product_id), ['Z-9']);
+  assert.deepEqual(p.db.prepare('SELECT kind, run_id FROM reapply_closures').all(), [{ kind: 'reapplied', run_id: r.runId }]);
+  assert.ok(sent.some((t) => /再適用待ちが 1 件残っている/.test(t)), '残った義務を同じ回で知らせた');
+  // 残った義務を知らせた (未送 0) = ok の ping
+  assert.deepEqual([r.ping, r.unsent], ['ok', 0]);
+  assert.equal(S.getStatus(p.db, { now: p.clock.now }).nightly_last.last_state, 'verified');
+});
+
+await ta('[26] 2b-2b 端から端まで: 商品は合うがバーコードが変わった = verify_failed (両方が合うときだけ verified) / 取込の時刻の印が食い違う = verify_failed / 知らせる・ping しない', async () => {
+  for (const [over, why] of [[{ touchBarcode: true }, 'バーコード'], [{ importStampLag: true }, '変更日時とインポート日時が違う']]) {
+    const p = portal();
+    p.putArtifact();
+    const lz = realLikeLz({ over });
+    const { sent, o } = e2eOpts(p, setupData(), lz);
+    const r = await N.runNightly(o);
+    assert.deepEqual([r.result, S.getStatus(p.db, { now: p.clock.now }).state, r.ping], ['verify_failed', 'verify_failed', null], why);
+    assert.ok(sent.some((t) => /verify_failed/.test(t)), why);
+  }
+});
+
+await ta('[27] 2b-2b 端から端まで: 取込の後の書き出しの一時の失敗 = 未確かめ (imported_unverified) → 次の夜の 00:20 = 確かめのやり直しだけ (本物の verifyAgain・直のパスの記録) = verified / 記録が無い = verify_failed (evidence_missing)', async () => {
+  // 1 夜目: 押した後の商品の書き出しが一時の失敗 = 未確かめ
+  const p = portal();
+  p.putArtifact();
+  const dataDir = setupData();
+  const lz = realLikeLz({ over: { postShohinFailsOnce: true } });
+  let x = e2eOpts(p, dataDir, lz);
+  let r = await N.runNightly(x.o);
+  assert.deepEqual([r.result, S.getStatus(p.db, { now: p.clock.now }).state, r.ping], ['imported_unverified', 'imported_unverified', null]);
+  const runId = r.runId;
+  // 2 夜目 (Render の時刻で次の日の 00:20): 止まった状態の知らせは 1 夜目で知らせ済み → 確かめのやり直しだけ・取り込まない
+  p.clock.now = NIGHT + 86400000;
+  x = e2eOpts(p, dataDir, lz);
+  r = await N.runNightly(x.o);
+  assert.deepEqual([r.state, r.runId, r.result, S.getStatus(p.db, { now: p.clock.now }).state, r.ping], ['verify_again', runId, 'verified', 'verified', 'ok']);
+  assert.equal(lz.st.calls.filter((c) => c === 'execute').length, 1, '2 夜目は押さない');
+  // 記録が無い次の夜 = verify_failed (evidence_missing)
+  const p2 = portal();
+  p2.putArtifact();
+  const d2 = setupData();
+  const lz2 = realLikeLz({ over: { postShohinFailsOnce: true } });
+  r = await N.runNightly(e2eOpts(p2, d2, lz2).o);
+  fs.rmSync(N.nightlyRunDir(d2, r.runId), { recursive: true, force: true });
+  p2.clock.now = NIGHT + 86400000;
+  r = await N.runNightly(e2eOpts(p2, d2, lz2).o);
+  assert.deepEqual([r.state, r.result, r.reason, S.getStatus(p2.db, { now: p2.clock.now }).run.detail.verify_detail.reason], ['verify_again', 'verify_failed', 'evidence_missing', 'evidence_missing']);
+});
+
+await ta('[28] 2b-2b 端から端まで: Render の時計の境目 (00:49:59 = 始める・00:50:00.000 = 知らせだけ・振り分けの間に 00:50 を過ぎた = 静かにしない) / miniPC の壁時計がずれても Render の時計で動く / 試験の決まりの裏口・nightly の決まりの差し替えが無い', async () => {
+  // 境目 (1 秒前 = 始める / ちょうど = 知らせだけ / 振り分けの間に過ぎた = 静かにしない)
+  let p = portal({ at: JST('2030-01-17T00:49:59.000') });
+  p.putArtifact();
+  let lz = realLikeLz();
+  let r = await N.runNightly(e2eOpts(p, setupData(), lz).o);
+  assert.deepEqual([r.state, r.result], ['imported', 'verified']);
+  p = portal({ at: JST('2030-01-17T00:50:00.000') });
+  p.putArtifact();
+  lz = realLikeLz();
+  r = await N.runNightly(e2eOpts(p, setupData(), lz).o);
+  assert.deepEqual([r.state, lz.st.calls], ['notify_only', []]);
+  p = portal({ at: JST('2030-01-17T00:49:59.900') });
+  p.putArtifact();
+  lz = realLikeLz();
+  const { c, perfNow } = perfClock();
+  const y = e2eOpts(p, setupData(), lz, { perfNow });
+  const origR = y.o.client.nightlyReadiness;
+  y.o.client = { ...y.o.client, nightlyReadiness: async (q) => { const res = await origR(q); c.t += 500; return res; } };   // readiness の間に 0.5 秒 = 00:50:00.400
+  r = await N.runNightly(y.o);
+  assert.deepEqual([r.state, r.reason, lz.st.calls, N.summarize(r).code], ['skipped', 'window_closed', [], 3]);
+  // miniPC の壁時計が 3 時間ずれている (Date.now を差し替え) = 判断は Render の時計
+  const realNow = Date.now;
+  Date.now = () => realNow() + 3 * 3600000;
+  try {
+    p = portal();
+    p.putArtifact();
+    lz = realLikeLz();
+    r = await N.runNightly(e2eOpts(p, setupData(), lz).o);
+    assert.deepEqual([r.state, r.result], ['imported', 'verified']);
+  } finally { Date.now = realNow; }
+  // 裏口が無い: 決まりは凍結・nightly の確かめの列の決まりは差し替えられない・POLICIES の外の決まりは断る
+  assert.ok(Object.isFrozen(E.POLICIES) && Object.isFrozen(E.POLICIES.nightly));
+  assert.throws(() => { 'use strict'; E.POLICIES.nightly.rules = null; });
+  const copy = { ...E.POLICIES.nightly, rules: E.POLICIES.test.rules };
+  assert.throws(() => E.assertPolicyReady(copy), /POLICIES に無い/);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

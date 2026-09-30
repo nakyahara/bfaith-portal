@@ -603,8 +603,8 @@ await ta('[27] 共通の仕組み (3b-1): POLICIES の外の決まり (試験の
   assert.ok(Object.isFrozen(E.POLICIES) && Object.values(E.POLICIES).every((x) => Object.isFrozen(x)));
   // 試験以外の決まりは decided:true の確かめの決まりだけ。毎晩の決まりは実機の試験で決めるまで無い (null) = 動かない (③c-1b-2b-2)
   for (const x of Object.values(E.POLICIES)) assert.ok(x.allowUndecided ? x.mode === 'test' : (x.rules === null || V.compileRules(x.rules).decided), x.name);
-  assert.equal(E.POLICIES.nightly.rules, null, '2b-2a = 毎晩の確かめの列の決まりはまだ無い');
-  assert.throws(() => E.assertPolicyReady(E.POLICIES.nightly), /確かめの列の決まりがまだ無い/);
+  assert.equal(E.POLICIES.nightly.rules, V.RULES_2B2, '2b-2b = 毎晩の確かめの列の決まり = 9/30 の実機で決めた RULES_2B2');
+  assert.equal(E.assertPolicyReady(E.POLICIES.nightly), true);
   assert.deepEqual([E.POLICIES.test.holder, E.POLICIES.test.mode, E.POLICIES.test.by, E.POLICIES.test.rules, E.POLICIES.test.barcode], ['auto', 'test', 'lz-import-test', V.RULES_2B1, true]);
   assert.match(T.newRunId(NOW), /^lzim_test_20300116T030000_[0-9a-f]{6}$/);
   for (const k of ['STOP_STATES', 'inNightBlock', 'nextNightStart', 'writeJsonAtomic', 'saveOnce', 'grabPostExports', 'isInvalidExport']) assert.equal(T[k], E[k], k);

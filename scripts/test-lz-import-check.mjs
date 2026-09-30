@@ -305,5 +305,35 @@ await ta('[10] 試験の計画: 退避はバイトも (違うバイトが同じ�
   assert.notEqual(TP.buildTestPlan({ source, pre: renamed, tests: { normal: ['A-1', '__proto__'] } }).planSha256, p.planSha256);
 });
 
+await ta('[5b] 2b-2b の決まり RULES_2B2 (9/30 の実機): ふりがな → 検索名称・仕入単価は文字のまま・取り込んだ商品は import_stamp (登録日時は同じ・変更日時とインポート日時は同じ 14 桁で前より後) / decided: true / 毎晩の決まり = RULES_2B2', async () => {
+  assert.equal(V.RULES_NIGHTLY, V.RULES_2B2);
+  const C = V.compileRules(V.RULES_2B2);
+  assert.deepEqual([C.decided, C.version, C.targets.map((t) => t.mode).filter((m) => m === 'observe').length], [true, 'lzv-2b2', 0]);
+  assert.ok(Object.isFrozen(V.RULES_2B2) && Object.isFrozen(V.RULES_2B2.targets));
+  const R = V.RULES_2B2;
+  const table = [['A-1', '新しい名前', 'しんしい', '5200', '0007']];
+  const PRE = { 登録日時: '20260101000000', 変更日時: '20260929171153', インポート日時: '20260929171153' };
+  const OK = { 商品名: '新しい名前', 検索名称: 'しんしい', 仕入単価: '5200', 商品予備項目００３: '0007', 登録日時: '20260101000000', 変更日時: '20260930143813', インポート日時: '20260930143813' };
+  const pre = lz([lzRow('A-1', PRE), lzRow('B-2', PRE)]);
+  const run = (a1, b2 = PRE) => V.verifyImport({ table, pre, post: lz([lzRow('A-1', a1), lzRow('B-2', b2)]), rules: R });
+  let r = run(OK);
+  assert.deepEqual([r.ok, r.decided, r.rules_version, r.diffs, r.observed.targets, r.observed.imported_system], [true, true, 'lzv-2b2', [], [], []]);
+  const kinds = (a1, b2) => run(a1, b2).diffs.map((d) => `${d.kind}:${d.col || d.why || ''}`);
+  assert.deepEqual(kinds({ ...OK, 検索名称: 'ちがう' }), ['target_mismatch:検索名称'], 'ふりがな = 検索名称');
+  assert.deepEqual(kinds({ ...OK, 検索名称2: 'しんしい' }), ['non_target_changed:検索名称2'], '検索名称2 は変わらない');
+  assert.deepEqual(kinds({ ...OK, 仕入単価: '5200.00' }), ['target_mismatch:仕入単価'], '仕入単価は文字のまま');
+  assert.deepEqual(kinds({ ...OK, 登録日時: '20260930143813' }), ['system_changed:登録日時'], '登録日時は変わらない');
+  assert.deepEqual(kinds({ ...OK, 変更日時: PRE.変更日時, インポート日時: PRE.インポート日時 }), ['import_stamp_bad:not_after_pre'], '時刻が進んでいない = 取り込まれていない');
+  assert.deepEqual(kinds({ ...OK, インポート日時: '20260930143814' }), ['import_stamp_bad:not_equal']);
+  assert.deepEqual(kinds({ ...OK, 変更日時: '2026/09/30 14:38', インポート日時: '2026/09/30 14:38' }), ['import_stamp_bad:not_14_digits']);
+  assert.deepEqual(kinds({ ...OK, 変更日時: '20260928000000', インポート日時: '20260928000000' }), ['import_stamp_bad:not_after_pre'], '前より前');
+  assert.deepEqual(kinds({ ...OK, 変更日時: '20260930143813', インポート日時: '20260929171153' }), ['import_stamp_bad:not_equal']);
+  // 取り込まなかった商品の時刻が変わった = 差 (今までどおり)
+  assert.deepEqual(kinds(OK, { ...PRE, インポート日時: '20260930143813' }), ['untouched_system_changed:インポート日時']);
+  // 前の値が空 (はじめての取込) = 14 桁ならよい
+  const pre0 = lz([lzRow('A-1', { ...PRE, 変更日時: '', インポート日時: '' })]);
+  assert.equal(V.verifyImport({ table, pre: pre0, post: lz([lzRow('A-1', OK)]), rules: R }).ok, true);
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);
