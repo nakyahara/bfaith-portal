@@ -665,12 +665,19 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 
 **戻しの練習** (切替の前に 1 回・昼・N9 = `LZ_MANUAL_V4=off` まで)
 1. 止める: `node C:\tools\logizard-automation\import-state-cli.js halt --by <名前> --reason "戻しの練習"` → `lz-cutover-check.mjs --expect before` が全部 ✅。
-2. Stream Deck の PC で、#1558 の版 (①② だけ) を配る: その版の作業場所で `node tools/logizard-automation/deploy.mjs --pc streamdeck --apply` → `--check` (drift 0)。
+2. Stream Deck の PC で、#1558 の版 (①② だけ) を配る。**配る元を固定する** (古い作業場所から配ると、①②③ の版を配って ①②③ に戻す = 戻しの練習にならない。Codex #1558 R3 Medium)。
+   - レビュー済みの #1558 の head の SHA (= `<head>`) を控える。
+   - `git fetch origin` → `git worktree add --detach C:\tmp\lz-cutover-rehearsal <head>`。
+   - `git -C C:\tmp\lz-cutover-rehearsal rev-parse HEAD` が `<head>` で、`git -C C:\tmp\lz-cutover-rehearsal status --porcelain` が空。
+   - その作業場所で `node tools/logizard-automation/deploy.mjs --pc streamdeck --apply` → `--check` (drift 0)。
+   - **読み戻す**: `node C:\tools\logizard-automation\auto-barcode.js --show-mode` が「① 新商品の取込 → ② バーコード情報の書き出し (③ 毎日の商品マスタは miniPC の自動が取り込む)」を出して exit 0。「知らない引数」なら ①②③ の版のまま = やり直す。
 3. 中原さん: Render の環境変数に `LZ_MANUAL_V4=on` → 反映を待つ → `import-state-cli.js status` の `manual.v4` が true。
 4. 下の「GAS への戻し」の 3〜7 をする (旗 off → `--expect rollback` → 固定の版を配る → `--check` → `--dry`)。
 5. 止めの解除: `status` の `halt_revision` を見て `import-state-cli.js resume --by <名前> --note "戻しの練習の後" --halt-revision <番号>`。
 6. 片付け:
    - 固定の版の作業場所を消す: `git worktree remove C:\tmp\lz-gas-rollback`。本当の戻しで同じ場所に作り直すため。
+   - #1558 の版の作業場所も消す: `git worktree remove C:\tmp\lz-cutover-rehearsal`。
+   - 練習の後に #1558 の `tools/logizard-automation` (streamdeck のファイル) が変わったら、練習をやり直す (`git diff <head> <新しい head> -- tools/logizard-automation`)。
    - 終わりの形は今と同じ (Stream Deck は ①②③ の固定の版・旗 off・毎晩の本番 off)。
    - `cutover_phase` は練習では変えない (一方通行)。
 
@@ -714,6 +721,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
    - その作業場所で `node tools/logizard-automation/deploy.mjs --pc streamdeck --apply` → `--check`。drift 0 なら、台帳 `lz-gas-rollback` の 11 ファイルの sha256 と同じ版。
 7. 旧方式を有効にする。
    - Stream Deck の PC の `C:\tools\logizard-automation\.env` に `LOGIZARD_BC_DAILY=auto` があれば、その行を消す (固定の版は auto だと ③ をしない)。
+   - `node C:\tools\logizard-automation\auto-barcode.js --show-mode` が「知らない引数です: --show-mode」で止まる (= ③ のある固定の版が入っている。①② だけの版なら見出しが出る)。
    - `node C:\tools\logizard-automation\auto-barcode.js --dry` で「→ ③ 毎日の商品マスタの取込」と出て、③ の CSV (GAS の出力) を見る。
    - 終わった後に `C:\tools\logizard-automation\logs\logizard-session.lock` が残っていない (鍵を取って返せた)。
    - `--dry` はロジザードにログインする (押さない)。共通アカウントを使う人がいない時間に (L-16)。
