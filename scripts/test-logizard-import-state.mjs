@@ -643,8 +643,12 @@ await ta('[22] 手の取込の CSV の出どころ: GAS の CSV は移行の段�
   S.halt(db, { by: '中原', reason: '手で取り込む', now: T0 });
   S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: '中原', now: T0 });
   const gas = (targetAsOf, csvBuf = csvOf(['A-1', 'C-3', 'D-4'])) => S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: { kind: 'gas_upload', csvBuf, targetAsOf }, now: T0 });
+  // nightly-readiness の gas_upload = 本当の道 (openManualSession) と同じ判定 (副作用なし)・cutover_phase を人が設定したか (切替の確かめ。Codex #1558 R1 Medium)
+  const gate = () => { const x = S.nightlyReadiness(db, { sourceRunId: 'lzd_x', csvSha256: '0'.repeat(64), rows: 1, targetAsOf: '2030-01-15', now: T0 }); return [x.gas_upload, x.cutover_phase_explicit, x.cutover_phase]; };
   throwsCode(() => gas('2030-01-16'), 'gas_closed');   // 設定が無い = cutover = 断る
+  assert.deepEqual(gate(), ['gas_closed', false, 'cutover'], '設定が無い = 既定で断る・人は設定していない');
   S.setSetting(db, { key: 'cutover_phase', value: 'transition', by: '中原', now: T0 });
+  assert.deepEqual(gate(), ['open', true, 'transition']);
   throwsCode(() => gas('2030-01-14'), 'bad_request');   // JST の今日 = 2030-01-16 / 昨日 = 01-15 だけ
   throwsCode(() => gas('2030-01-16', Buffer.from('abc')), 'bad_csv');
   assert.deepEqual([db.prepare('SELECT COUNT(*) AS n FROM manual_sessions').get().n, S.listPending(db).count], [0, 0]);   // 断った = 何も残さない (同じ取引)
@@ -653,6 +657,7 @@ await ta('[22] 手の取込の CSV の出どころ: GAS の CSV は移行の段�
   S.cancelManualSession(db, { sessionId: m.session_id, note: 'ロジザードに置かなかった', by: '中原', now: T0 });
   S.setSetting(db, { key: 'cutover_phase', value: 'cutover', by: '中原', now: T0 });
   throwsCode(() => gas('2030-01-16'), 'gas_closed');   // 切替の後は口ごと断る
+  assert.deepEqual(gate(), ['gas_closed', true, 'cutover']);
   throwsCode(() => S.setSetting(db, { key: 'cutover_phase', value: 'transition', by: '中原', now: T0 }), 'one_way');   // 切替の後は戻さない (K3-8)
   S.setSetting(db, { key: 'cutover_phase', value: 'cutover', by: '中原', now: T0 });   // 同じ値はよい
   artifact(db, { id: 'lzd_20300115_f', verdict: 'fail' });

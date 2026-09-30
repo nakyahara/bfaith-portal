@@ -640,9 +640,97 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   6. バーコードの書き出しの部品 (`C:\tools\logizard-automation\barcode-export.js`・miniPC に deploy で写す) が無いうちは `run` / `verify` は断る (K4)。書き出すのは SKU のバーコード情報の全件 (登録日で開始日なし・有効 + 無効)。単独で確かめる = `node export-barcode-to.js --out <ファイル>` (2026-09-29 に本物で 5,188 行・12 秒)。
 - 手で試す = `node scripts/logizard-import/lz-daily-import.mjs --force-window [--as-of YYYY-MM-DD]` (止めてあっても動く・ping しない・その日の済みの印を書かない・期限の内だけ。昼に試す = `--as-of` にその朝の日付。Stream Deck を押さない間に)。
 
-**台帳**: `lz-daily-build` (scheduled_job・P3・毎日 07:00 + 猶予 7 時間 = 作れた回の ok が来なければ気づく) / `lz-daily-import-shadow` (scheduled_job・P3・00:20 + 猶予 6 時間。切替で RETIRED_JOBS へ = `lz-daily-import-shadow-retire`) / `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
+#### 毎晩の本番の切替と GAS への戻し (切替の PR #1558・2b-2 契約 v3 N2・N3・N8・N9・3b 契約 K3-8)
 
-**試験**: `scripts/test-lz-nightly.mjs` (毎晩の本番の miniPC 側・16 件) / `scripts/test-lz-daily.mjs` [1]〜[12] (ロジザードの一覧の見出しは実ファイルの 1 行目のバイト。[11][12] = 成果物をポータルへ送る・入口)・`scripts/test-retry-rerun.mjs` (照合が直ったら作り直す)
+**分け方**
+- 準備の PR (この節・確かめのスクリプト・戻しの版の台帳 `lz-gas-rollback`・readiness の GAS の判定) は先にマージしてある。切替の前から miniPC で確かめを使える (Codex #1558 R1 High)。
+- 切替の PR (#1558) は、次を含む。**切替の日の手順の中でマージする。**
+  - Stream Deck の ③ を外す。
+  - 台帳 `lz-daily-import` を載せ、影を退役させる。
+
+**切替の前にそろえるもの**
+- lz-daily が 3 日続けて合格 **かつ** 成果物をポータルに送れた (台帳 `lz-daily-cutover` ①・2026-09-30 が 1 日目)。
+- 少数件の実機の取込が verified (2026-09-30 済み・`lzim_test_20260930T053735_f97c97`)。
+- 戻しの版 = tag `lz-gas-rollback-20260930` (= commit 69999181・③ のある最後の master・台帳 `lz-gas-rollback` に 11 ファイルの sha256)。
+  #1558 をマージするまでに master の `tools/logizard-automation` が変わったら、`git diff lz-gas-rollback-20260930 origin/master -- tools/logizard-automation` を見る。streamdeck のファイルに変更があれば、tag を作り直して台帳を直す。
+- 下の「戻しの練習」を 1 回。
+
+**いつ・どこで**
+- 切替も戻しも**夜の窓の外 (Render の時計で JST 01:30〜23:30)** に行う (N8。00:15〜00:55 は毎晩の取込・影の時間、00:00〜01:30 は Stream Deck の夜の止め)。確かめのスクリプトも、この時刻の外では ❌ になる。
+- miniPC のコマンドは、リポジトリ直下 (`C:\Users\bfaith\bfaith-portal`) の PowerShell 5.1 で打つ。
+- Stream Deck の PC = 中原さんの PC (manifest の `streamdeck` はこの 1 台)。
+- 確かめ = `node scripts\logizard-import\lz-cutover-check.mjs --expect <段階>` (miniPC のリポジトリ直下)。
+  - ポータルと .env を読むだけで、値は出さない。
+  - 全部 ✅ のときだけ exit 0。❌ があれば次の手順に進まない。
+
+**戻しの練習** (切替の前に 1 回・昼・N9 = `LZ_MANUAL_V4=off` まで)
+1. 止める: `node C:\tools\logizard-automation\import-state-cli.js halt --by <名前> --reason "戻しの練習"` → `lz-cutover-check.mjs --expect before` が全部 ✅。
+2. Stream Deck の PC で、#1558 の版 (①② だけ) を配る。**配る元を固定する** (古い作業場所から配ると、①②③ の版を配って ①②③ に戻す = 戻しの練習にならない。Codex #1558 R3 Medium)。
+   - レビュー済みの #1558 の head の SHA (= `<head>`) を控える。
+   - `git fetch origin` → `git worktree add --detach C:\tmp\lz-cutover-rehearsal <head>`。
+   - `git -C C:\tmp\lz-cutover-rehearsal rev-parse HEAD` が `<head>` で、`git -C C:\tmp\lz-cutover-rehearsal status --porcelain` が空。
+   - その作業場所で `node tools/logizard-automation/deploy.mjs --pc streamdeck --apply` → `--check` (drift 0)。
+   - **読み戻す**: `node C:\tools\logizard-automation\auto-barcode.js --show-mode` が「① 新商品の取込 → ② バーコード情報の書き出し (③ 毎日の商品マスタは miniPC の自動が取り込む)」を出して exit 0。「知らない引数」なら ①②③ の版のまま = やり直す。
+3. 中原さん: Render の環境変数に `LZ_MANUAL_V4=on` → 反映を待つ → `import-state-cli.js status` の `manual.v4` が true。
+4. 下の「GAS への戻し」の 3〜7 をする (旗 off → `--expect rollback` → 固定の版を配る → `--check` → `--dry`)。
+5. 止めの解除: `status` の `halt_revision` を見て `import-state-cli.js resume --by <名前> --note "戻しの練習の後" --halt-revision <番号>`。
+6. 片付け:
+   - 固定の版の作業場所を消す: `git worktree remove C:\tmp\lz-gas-rollback`。本当の戻しで同じ場所に作り直すため。
+   - #1558 の版の作業場所も消す: `git worktree remove C:\tmp\lz-cutover-rehearsal`。
+   - 練習の後に #1558 の `tools/logizard-automation` (streamdeck のファイル) が変わったら、練習をやり直す (`git diff <head> <新しい head> -- tools/logizard-automation`)。
+   - 終わりの形は今と同じ (Stream Deck は ①②③ の固定の版・旗 off・毎晩の本番 off)。
+   - `cutover_phase` は練習では変えない (一方通行)。
+
+**切替の手順** (N3。1 つ終わるごとに確かめる)
+1. 自動の取込を止める: `import-state-cli.js halt --by <名前> --reason "切替"`。
+2. `lz-cutover-check.mjs --expect before` = 全部 ✅ (夜の窓の外・止め・生きた鍵なし・手の取込なし・未解決の取込なし・旗 off・`LZ_DAILY_IMPORT` off)。
+3. 中原さん: Render の環境変数 `LZ_MANUAL_V4=on` → 反映 (再起動) を待つ。
+4. ポータルの画面「ロジザードの取込の状態」の設定で `cutover_phase` = cutover を**押す**。
+   - 一方通行 = 元に戻せない。
+   - 既定でも cutover と読むが、人が設定したことを次で確かめる。
+5. `lz-cutover-check.mjs --expect cutover` = 全部 ✅。見るもの:
+   - 旗 on の読み戻し (status と readiness の両方)。
+   - `cutover_phase` を人が cutover に設定した。
+   - GAS の CSV の手の取込を断る = 本当の道と同じ判定で gas_closed。
+   - 成果物の無い毎晩を断る (artifact_missing)。
+   - 旧い手の ③ を断る (manual_daily → retired・DB に何も書かない)。
+   - DATA_DIR がこの miniPC のもの (初期化の印がポータルと同じ)。
+   - 次の夜の済みの印が無い。
+6. #1558 をマージする → Render の反映を待つ (台帳が `lz-daily-import` に・影は RETIRED_JOBS)。
+   - `RETIRED_JOBS` の `lz-daily-import-shadow` の `retired_at` は、マージの日に直してからマージする。
+7. 配る:
+   - miniPC: `git pull --ff-only` → `node tools/logizard-automation/deploy.mjs --pc minipc --apply` → `--check` (bat の見出し・drift 0)。
+   - Stream Deck の PC: master の作業場所から `deploy.mjs --pc streamdeck --apply` → `--check` (drift 0 = ③ の無い版)。
+8. miniPC のリポジトリ直下の .env に `LZ_DAILY_IMPORT=on` を足す (`LZ_DAILY_IMPORT_SHADOW` の行は消す。.env は 1 つだけ)。
+   - → `lz-cutover-check.mjs --expect ready` = 全部 ✅ (cutover の全部 + 毎晩の本番 on + 送り先 `GCHAT_WEBHOOK_JOBS` が本番と同じ判定で使える)。
+9. 止めの解除: `status` の `halt_revision` を見て `import-state-cli.js resume --by <名前> --note "切替" --halt-revision <番号>`。
+10. 次の夜 00:20 の後:
+    - `C:\tools\logizard-automation\logs\scheduled.log` の `[lz-daily-import]` が ✅ verified になり、台帳 `lz-daily-import` の ok が来ている。
+    - → `lz-daily-cutover` の完了の ping を 1 回 → RETIRED_JOBS へ移す PR。
+    - 止まった (⏭️・❌) = 要対応スペースの知らせと台帳 `lz-daily-import` の runbook を見る。
+
+**GAS への戻し** (K3-8・N2。システム全体を旧方式に戻すときだけ。**台帳 `lz-gas-rollback` の期限 (remove_by) の後は使わない** = `--expect rollback` が断る・期限を延ばすなら理由を書いた PR で)
+1. 止める: `import-state-cli.js halt --by <名前> --reason "GAS への戻し"`。
+2. 生きた鍵・開いている手の取込・未解決の取込が無いことを確かめる (未解決があれば、ロジザードのインポート履歴を見て先に resolve)。
+3. miniPC の .env の `LZ_DAILY_IMPORT` の行を消す (off)。
+4. 中原さん: Render の `LZ_MANUAL_V4` を消す (off) → 反映を待つ。
+5. `lz-cutover-check.mjs --expect rollback` = 全部 ✅ (夜の窓の外・止め・鍵なし・手の取込なし・未解決なし・旗 off・`LZ_DAILY_IMPORT` off・戻しの版の期限の内)。
+6. Stream Deck の PC に固定の版を配る。
+   - 作業場所が無ければ作る: `git fetch origin tag lz-gas-rollback-20260930` → `git worktree add --detach C:\tmp\lz-gas-rollback lz-gas-rollback-20260930`。
+   - もうあるなら、`git -C C:\tmp\lz-gas-rollback rev-parse HEAD` が 69999181aae38bded0ad162cad523e0a4f796c1b で、`git -C C:\tmp\lz-gas-rollback status --porcelain` が空のときだけ使う。違えば消して作り直す。
+   - その作業場所で `node tools/logizard-automation/deploy.mjs --pc streamdeck --apply` → `--check`。drift 0 なら、台帳 `lz-gas-rollback` の 11 ファイルの sha256 と同じ版。
+7. 旧方式を有効にする。
+   - Stream Deck の PC の `C:\tools\logizard-automation\.env` に `LOGIZARD_BC_DAILY=auto` があれば、その行を消す (固定の版は auto だと ③ をしない)。
+   - `node C:\tools\logizard-automation\auto-barcode.js --show-mode` が「知らない引数です: --show-mode」で止まる (= ③ のある固定の版が入っている。①② だけの版なら見出しが出る)。
+   - `node C:\tools\logizard-automation\auto-barcode.js --dry` で「→ ③ 毎日の商品マスタの取込」と出て、③ の CSV (GAS の出力) を見る。
+   - 終わった後に `C:\tools\logizard-automation\logs\logizard-session.lock` が残っていない (鍵を取って返せた)。
+   - `--dry` はロジザードにログインする (押さない)。共通アカウントを使う人がいない時間に (L-16)。
+8. 自動の取込の止めは**解かない** (同じ夜に自動と GAS の ③ が両方取り込まない。GAS の ③ は時刻で分ける = 00:00〜01:30 は動かない)。
+   - 台帳 `lz-daily-import` は毎晩の締切で鳴る。戻しが 1 日を超えるなら、台帳を戻す PR を作る (lz-daily-import を外す・理由を書く)。
+
+**台帳**: `lz-daily-build` (scheduled_job・P3・毎日 07:00 + 猶予 7 時間 = 作れた回の ok が来なければ気づく) / `lz-daily-import-shadow` (scheduled_job・P3・00:20 + 猶予 6 時間。切替で RETIRED_JOBS へ = `lz-daily-import-shadow-retire`) / `lz-gas-rollback` (temporary_asset・GAS への戻しの固定の版・2026-11-30 まで) / `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
+
+**試験**: `scripts/test-lz-nightly.mjs` (毎晩の本番の miniPC 側) / `scripts/test-lz-cutover-check.mjs` (切替・戻しの確かめ・本物のポータルの状態の機械・戻しの版の sha256 と tag) / `scripts/test-lz-daily.mjs` [1]〜[12] (ロジザードの一覧の見出しは実ファイルの 1 行目のバイト。[11][12] = 成果物をポータルへ送る・入口)・`scripts/test-retry-rerun.mjs` (照合が直ったら作り直す)
 
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
