@@ -55,22 +55,22 @@ console.log('② 同じ商品で動いている依頼は 1 つだけ');
 const draftId = Number(db.prepare(
   `INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('LP-1', 'ハッカ油スプレー 100ml', 'test')`
 ).run().lastInsertRowid);
-const job1 = Number(insJob.run(draftId, 'key-1', 'queued', specId).lastInsertRowid);
+const job1 = Number(insJob.run(draftId, 'key-0001', 'queued', specId).lastInsertRowid);
 ok(job1 > 0, '1 件目を受け付ける');
-throws('動いている間は 2 件目を受け付けない', () => insJob.run(draftId, 'key-2', 'queued', specId), 'UNIQUE');
+throws('動いている間は 2 件目を受け付けない', () => insJob.run(draftId, 'key-0002', 'queued', specId), 'UNIQUE');
 db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'done', completed_at = '2026-10-01T00:02:00.000Z' WHERE id = ?`).run(job1);
-const job2 = Number(insJob.run(draftId, 'key-2', 'queued', specId).lastInsertRowid);
+const job2 = Number(insJob.run(draftId, 'key-0002', 'queued', specId).lastInsertRowid);
 ok(job2 > job1, '終わった依頼は次を妨げない');
 
 console.log('③ 二重クリック・リトライで job が増えない');
-throws('同じ idempotency_key は 2 回受け付けない', () => insJob.run(draftId, 'key-1', 'failed', specId), 'UNIQUE');
+throws('同じ idempotency_key は 2 回受け付けない', () => insJob.run(draftId, 'key-0001', 'failed', specId), 'UNIQUE');
 
 console.log('④ 測定用の列');
 throws('measurement_deadline_at は必須', () => db.prepare(`INSERT INTO ph_lp_compose_jobs
   (draft_id, idempotency_key, status, packet_json, packet_hash, packet_version, spec_id, spec_hash, requested_by)
-  VALUES (?, 'key-9', 'queued', '{}', 'p', 1, ?, 'h', 'u')`).run(draftId, specId), 'NOT NULL');
-throws('未知の status は入らない', () => insJob.run(draftId + 1, 'key-3', 'weird', specId), 'CHECK');
-throws('存在しない仕様書の版は張れない', () => insJob.run(draftId + 2, 'key-4', 'queued', 99999), 'FOREIGN KEY');
+  VALUES (?, 'key-0009', 'queued', '{}', 'p', 1, ?, 'h', 'u')`).run(draftId, specId), 'NOT NULL');
+throws('未知の status は入らない', () => insJob.run(draftId + 1, 'key-0003', 'weird', specId), 'CHECK');
+throws('存在しない仕様書の版は張れない', () => insJob.run(draftId + 2, 'key-0004', 'queued', 99999), 'FOREIGN KEY');
 const j1 = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE id = ?').get(job1);
 ok(j1.completed_at <= j1.measurement_deadline_at, '期限内に終わったかを completed_at から後で計算できる');
 

@@ -86,8 +86,17 @@ const posInt = (v) => {
   return Number.isSafeInteger(n) && n > 0 ? n : null;
 };
 
-/** 実行役が出す画像の証跡の sha256 (16 進 64 桁ちょうど) */
+/** sha256 (16 進小文字 64 桁ちょうど)。証跡・packet_hash・spec_hash の照合に使う */
 const SHA256_RE = /^[0-9a-f]{64}$/;
+/** 二重クリック対策のキー。画面が UUID などを作る。空白差で別物にならないよう形を固定する */
+const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9_.:-]{8,80}$/;
+
+/**
+ * 識別子・ハッシュは **trim も切り詰めもしない**で形を直接見る (コード R3〜R5)。
+ * 正規化して受けると、送られた値と保存・照合に使う値が食い違い、
+ * 「別の入力」が「同じ結果の再送」に畳まれる。
+ */
+const exact = (v, re) => (typeof v === 'string' && re.test(v) ? v : null);
 
 /**
  * 実行役から来た JSON を保存できる形にする。
@@ -205,8 +214,9 @@ export function requestBlockReason({ draft, productInfo, spec }) {
  */
 export function requestJob(db, { draft, productInfo, colorVariations, images, spec, idempotencyKey, actor, now = Date.now() } = {}) {
   if (!lpComposeEnabled()) return { code: 'disabled', error: 'PH_LP_COMPOSE_ENABLED が無効です' };
-  const key = trim(idempotencyKey, 80);
-  if (!key) return { code: 'bad_request', error: 'idempotency_key が要ります' };
+  // 切り詰めない — 81 文字目以降だけ違うキーを同一視すると、別の依頼を既存 job として返す (コード R5)
+  const key = exact(idempotencyKey, IDEMPOTENCY_KEY_RE);
+  if (!key) return { code: 'bad_request', error: 'idempotency_key の形が不正です (英数記号 8〜80 文字)' };
   const blocked = requestBlockReason({ draft, productInfo, spec });
   if (blocked) return { code: 'not_ready', error: blocked };
   // 🚨 ID は入口で正規化して、packet・検索・INSERT・ログで同じ値だけを使う。
@@ -221,7 +231,7 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
     // 渡された spec を信じず、DB から引き直して種類と hash を照合する (コード R1 #4)
     // hash は**必須**。省略を許すと ID と kind だけで通り、照合の意味が無くなる (コード R2 #3)
     const specRow = db.prepare('SELECT * FROM ph_lp_specs WHERE id = ?').get(specId);
-    if (!specRow || specRow.kind !== 'product_analysis' || trim(spec?.hash, 80) !== specRow.hash) {
+    if (!specRow || specRow.kind !== 'product_analysis' || exact(spec?.hash, SHA256_RE) !== specRow.hash) {
       return { code: 'bad_request', error: '仕様書の版が見つかりません (取り込み直してください)' };
     }
     const { packet, hash } = buildPacket({ draft: { ...draft, id: draftId }, productInfo, colorVariations, images, spec: specRow });
@@ -437,7 +447,11 @@ export function submitResult(db, generationId, {
   }
   // 🚨 実行役から来た値の検査は **payloadHash を作る前**。canonicalJson は循環参照で
   //    スタックを溢れさせるので、先に JSON にできるかを確かめる (コード R1 #5)
-  const rounds = Number.isInteger(reviewRounds) && reviewRounds >= 0 && reviewRounds <= 10 ? reviewRounds : null;
+  // 範囲外を黙って null にしない — 未指定と区別できず、別の再送が同じ payloadHash になる (コード R5)
+  if (reviewRounds != null && (!Number.isInteger(reviewRounds) || reviewRounds < 0 || reviewRounds > 10)) {
+    return { code: 'bad_request', error: 'review_rounds は 0〜10 の整数です' };
+  }
+  const rounds = reviewRounds == null ? null : reviewRounds;
   const lintJson = jsonOrNull(lint, LINT_MAX);
   if (lintJson === false) return { code: 'bad_request', error: `lint が大きすぎるか JSON にできません (${LINT_MAX} 文字まで)` };
   // receipt = 「実際に配った商品画像のバイト列の sha256 と枚数」。証跡なので**黙って直さない** —
@@ -474,7 +488,7 @@ export function submitResult(db, generationId, {
   return db.transaction(() => {
     const gen = db.prepare('SELECT * FROM ph_lp_compose_generations WHERE id = ?').get(posInt(generationId));
     if (!gen) return { code: 'not_found', error: '予約がありません' };
-    if (trim(packetHash, 80) !== gen.packet_hash) {
+    if (exact(packetHash, SHA256_RE) !== gen.packet_hash) {
       return { code: 'packet_mismatch', error: '材料が予約時と違います (受付時に固定した packet ではありません)' };
     }
     if (gen.status !== 'reserved') {

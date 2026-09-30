@@ -51,15 +51,15 @@ eq(lp.latestSpec(db).id, sTabs.spec.id, 'いまの版 = 最大 id');
 
 console.log('② 受付 — packet をここで固定する');
 const dA = mkDraft('LP-A', 'ハッカ油スプレー 100ml');
-ok(lp.requestJob(db, args(dA, sTabs.spec, 'k1', { productInfo: '' })).code === 'not_ready', '商品情報が無ければ受け付けない');
-const r1 = lp.requestJob(db, args(dA, sTabs.spec, 'k1'));
+ok(lp.requestJob(db, args(dA, sTabs.spec, 'key-0001', { productInfo: '' })).code === 'not_ready', '商品情報が無ければ受け付けない');
+const r1 = lp.requestJob(db, args(dA, sTabs.spec, 'key-0001'));
 ok(r1.ok && r1.created, '受け付ける');
 const packet1 = JSON.parse(r1.job.packet_json);
 eq(packet1.spec_id, sTabs.spec.id, 'packet に受付時の仕様書の版が入る');
 eq(packet1.images.length, 1, '画像も packet に固定される');
-const r1b = lp.requestJob(db, args(dA, sTabs.spec, 'k1'));
+const r1b = lp.requestJob(db, args(dA, sTabs.spec, 'key-0001'));
 ok(r1b.ok && !r1b.created && r1b.job.id === r1.job.id, '同じ idempotency_key は同じ依頼を返す (二重クリック)');
-ok(lp.requestJob(db, args(dA, sTabs.spec, 'k2')).code === 'already_running', '動いている間は 2 件目を受け付けない');
+ok(lp.requestJob(db, args(dA, sTabs.spec, 'key-0002')).code === 'already_running', '動いている間は 2 件目を受け付けない');
 ok(r1.job.measurement_deadline_at === new Date(min(3)).toISOString(), '測定の期限 = 受付 + 3 分で固定 (R4 #2)');
 
 console.log('③ claim — 受付時の材料をそのまま返す');
@@ -106,7 +106,7 @@ ok(lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdi
 
 console.log('⑦ 結果 — rejected (lint / 検品が通らなかった)');
 const dB = mkDraft('LP-B', 'ハッカ油スプレー 50ml');
-const r2 = lp.requestJob(db, args(dB, s2.spec, 'k1', { now: min(10) }));
+const r2 = lp.requestJob(db, args(dB, s2.spec, 'key-0001', { now: min(10) }));
 const c3 = lp.claimJob(db, { runnerRunId: 'run-4', now: min(10) });
 const g2 = lp.reserveGeneration(db, c3.job.job_id, { leaseToken: c3.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(10) });
 const sub2 = lp.submitResult(db, g2.generation_id, { packetHash: c3.job.packet_hash, verdict: 'rejected', lint: { missing: ['# 0枚目｜サムネイル'] }, reviewRounds: 2, reason: '2 巡で通らなかった', now: min(11) });
@@ -119,7 +119,7 @@ eq(db.prepare('SELECT status FROM ph_lp_compose_generations WHERE id = ?').get(g
 
 console.log('⑧ 成否不明 (lease 切れ) は needs_review で止まる');
 const dC = mkDraft('LP-C', 'ハッカ油スプレー 200ml');
-lp.requestJob(db, args(dC, s2.spec, 'k1', { now: min(20) }));
+lp.requestJob(db, args(dC, s2.spec, 'key-0001', { now: min(20) }));
 const c4 = lp.claimJob(db, { runnerRunId: 'run-5', now: min(20) });
 lp.reserveGeneration(db, c4.job.job_id, { leaseToken: c4.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(20) });
 lp.recoverExpired(db, min(20 + lp.LEASE_MIN + 1));
@@ -131,14 +131,14 @@ ok(lp.claimJob(db, { runnerRunId: 'run-6', now: min(100) }).job === null, 'needs
 
 console.log('⑨ 予約前の lease 切れは failed (AI 枠は使っていない)');
 const dD = mkDraft('LP-D', 'ハッカ油スプレー 500ml');
-lp.requestJob(db, args(dD, s2.spec, 'k1', { now: min(30) }));
+lp.requestJob(db, args(dD, s2.spec, 'key-0001', { now: min(30) }));
 const c5 = lp.claimJob(db, { runnerRunId: 'run-7', now: min(30) });
 lp.recoverExpired(db, min(30 + lp.LEASE_MIN + 1));
 eq(db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(c5.job.job_id).status, 'failed', '予約前なら failed');
 
 console.log('⑩ 仕様書の版が消えた依頼は claim で止める');
 const dE = mkDraft('LP-E', 'ハッカ油スプレー 1L');
-const r5 = lp.requestJob(db, args(dE, s2.spec, 'k1', { now: min(40) }));
+const r5 = lp.requestJob(db, args(dE, s2.spec, 'key-0001', { now: min(40) }));
 db.prepare('UPDATE ph_lp_compose_jobs SET spec_hash = ? WHERE id = ?').run('すり替わった hash', r5.job.id);
 ok(lp.claimJob(db, { runnerRunId: 'run-8', now: min(41) }).job === null, 'hash が合わなければ claim しない');
 eq(db.prepare('SELECT error_code FROM ph_lp_compose_jobs WHERE id = ?').get(r5.job.id).error_code, 'spec_changed', '理由が残る');
@@ -146,7 +146,7 @@ eq(db.prepare('SELECT error_code FROM ph_lp_compose_jobs WHERE id = ?').get(r5.j
 console.log('⑪ 機能フラグ (fail-closed)');
 process.env.PH_LP_COMPOSE_ENABLED = '0';
 const dF = mkDraft('LP-F', 'ハッカ油スプレー 2L');
-ok(lp.requestJob(db, args(dF, s2.spec, 'k1', { now: min(50) })).code === 'disabled', 'フラグが無ければ受け付けない');
+ok(lp.requestJob(db, args(dF, s2.spec, 'key-0001', { now: min(50) })).code === 'disabled', 'フラグが無ければ受け付けない');
 ok(lp.claimJob(db, { runnerRunId: 'run-9', now: min(50) }).code === 'disabled', 'フラグが無ければ claim もしない');
 process.env.PH_LP_COMPOSE_ENABLED = '1';
 
@@ -161,7 +161,7 @@ eq(stRej.job.output_text, null, 'done 以外は本文を返さない');
 console.log('⑬ コードレビュー R1 の修正');
 // #1 期限切れ処理が正常結果を上書きしない (SELECT と UPDATE の間で done になった job を塗り潰さない)
 const dG = mkDraft('LP-G', 'ハッカ油スプレー 5L');
-lp.requestJob(db, args(dG, s2.spec, 'k1', { now: min(70) }));
+lp.requestJob(db, args(dG, s2.spec, 'key-0001', { now: min(70) }));
 const c6 = lp.claimJob(db, { runnerRunId: 'run-10', now: min(70) });
 const g6 = lp.reserveGeneration(db, c6.job.job_id, { leaseToken: c6.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(70) });
 lp.submitResult(db, g6.generation_id, { packetHash: c6.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, now: min(71) });
@@ -171,7 +171,7 @@ eq(db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(c6.job.j
 
 // #2 終わった job は結果で復活できない。ただし needs_review からの復旧は受ける
 const dH = mkDraft('LP-H', 'ハッカ油スプレー 10L');
-lp.requestJob(db, args(dH, s2.spec, 'k1', { now: min(80) }));
+lp.requestJob(db, args(dH, s2.spec, 'key-0001', { now: min(80) }));
 const c7 = lp.claimJob(db, { runnerRunId: 'run-11', now: min(80) });
 const g7 = lp.reserveGeneration(db, c7.job.job_id, { leaseToken: c7.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(80) });
 db.prepare("UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?").run(c7.job.job_id);
@@ -183,7 +183,7 @@ eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdi
 
 // #5 壊れた実行役が DB を肥らせたり例外を漏らしたりできない
 const dI = mkDraft('LP-I', 'ハッカ油スプレー 20L');
-lp.requestJob(db, args(dI, s2.spec, 'k1', { now: min(90) }));
+lp.requestJob(db, args(dI, s2.spec, 'key-0001', { now: min(90) }));
 const c8 = lp.claimJob(db, { runnerRunId: 'run-12', now: min(90) });
 const g8 = lp.reserveGeneration(db, c8.job.job_id, { leaseToken: c8.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(90) });
 const cyc = {}; cyc.self = cyc;
@@ -217,23 +217,23 @@ eq(lp.submitResult(db, g8.generation_id, {
   receipt: { images: [{ file_id: 'FILEID000001', sha256: 'c'.repeat(64), bytes: 999 }] }, now: min(92),
 }).code, 'already_finalized', '🚨 画像の証跡が違う再送は別物として断る (R2 #1)');
 // posInt: "12abc" のような値を ID として通さない (R2 #2)
-ok(lp.requestJob(db, args({ ...dA, id: '12abc' }, s2.spec, 'kz', { now: min(95) })).code === 'bad_request',
+ok(lp.requestJob(db, args({ ...dA, id: '12abc' }, s2.spec, 'key-000z', { now: min(95) })).code === 'bad_request',
   '🚨 "12abc" を 12 として通さない (R2 #2)');
 // 正規化で別入力を同一視しない (R3)
-ok(lp.requestJob(db, args({ ...dA, id: ' 12' }, s2.spec, 'kw', { now: min(95) })).code === 'bad_request',
+ok(lp.requestJob(db, args({ ...dA, id: ' 12' }, s2.spec, 'key-000w', { now: min(95) })).code === 'bad_request',
   '🚨 " 12" を 12 として通さない (R3)');
 eq(lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT,
   receipt: { images: [{ file_id: 'FILEID000001', sha256: 'B'.repeat(64), bytes: 1 }] }, now: min(93),
 }).code, 'bad_request', '🚨 sha256 の大文字は受けない (R3)');
 // spec.hash を省いた照合の回避を防ぐ (R2 #3)
-ok(lp.requestJob(db, args(mkDraft('LP-K', 'テスト2'), { ...s2.spec, hash: '' }, 'k1', { now: min(95) })).code === 'bad_request',
+ok(lp.requestJob(db, args(mkDraft('LP-K', 'テスト2'), { ...s2.spec, hash: '' }, 'key-0001', { now: min(95) })).code === 'bad_request',
   '🚨 spec.hash を省くと通らない (R2 #3)');
 
 // #4 不正な ID は受け付けない
-ok(lp.requestJob(db, args({ ...dA, id: 'abc' }, s2.spec, 'kx', { now: min(95) })).code === 'bad_request',
+ok(lp.requestJob(db, args({ ...dA, id: 'abc' }, s2.spec, 'key-000x', { now: min(95) })).code === 'bad_request',
   '🚨 商品 ID が数でなければ断る (R1 #4)');
-ok(lp.requestJob(db, args(mkDraft('LP-J', 'テスト'), { ...s2.spec, id: 99999 }, 'k1', { now: min(95) })).code === 'bad_request',
+ok(lp.requestJob(db, args(mkDraft('LP-J', 'テスト'), { ...s2.spec, id: 99999 }, 'key-0001', { now: min(95) })).code === 'bad_request',
   '存在しない仕様書の版は断る');
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);
