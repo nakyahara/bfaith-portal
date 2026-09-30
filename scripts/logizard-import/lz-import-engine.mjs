@@ -328,6 +328,8 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
       // 取込の時刻の窓 (押した時刻 − 余白 〜 結果を読んだ時刻 + 余白・JST の 14 桁)。記録に残す = 次の夜の確かめのやり直しも同じ窓
       rec.result_at = clock();
       rec.stamp_window = { from: jstStamp(rec.execute_at - STAMP_TOLERANCE_MS), to: jstStamp(rec.result_at + STAMP_TOLERANCE_MS) };
+      // ポータルの状態を書く前に窓を記録へ (書いた直後に落ちても、次の夜の確かめのやり直しが同じ窓で照らせる。Codex #1556 R2 Low)
+      stage('result_received', { result_at: rec.result_at, stamp_window: rec.stamp_window });
       const parsed = exec.reason ? { found: false, reason: exec.reason } : parseImportResult(exec.resultText);
       const judged = judgeImportResult(parsed, csv.rows);
       rec.result = { parsed, judged };

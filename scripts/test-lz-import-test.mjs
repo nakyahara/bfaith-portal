@@ -153,7 +153,7 @@ await ta('[2] 取込の正しい流れ: 承認の印 → 鍵 → 直前 (商品�
   const p = await planned(dataDir, lz);
   const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => { throw new Error('知らせない'); } });
   assert.equal(r.state, 'verified');
-  assert.deepEqual(stagesOf(r), ['begin', 'prepared', 'previewed', 'state_importing', 'execute_issued', 'state_imported_unverified', 'verified_checked', 'state_verified', 'released']);
+  assert.deepEqual(stagesOf(r), ['begin', 'prepared', 'previewed', 'state_importing', 'execute_issued', 'result_received', 'state_imported_unverified', 'verified_checked', 'state_verified', 'released']);
   for (const f of ['pre.csv', 'pre-barcode.csv', 'import.csv', 'post.csv', 'post-barcode.csv', 'verify.json', 'import.json']) assert.ok(fs.existsSync(path.join(r.runDir, f)), f);
   assert.equal(sha(fs.readFileSync(path.join(r.runDir, 'import.csv'))), JSON.parse(fs.readFileSync(path.join(p.dir, 'plan.json'))).test_csv.sha256);
   const st = S.getStatus(pt.db);

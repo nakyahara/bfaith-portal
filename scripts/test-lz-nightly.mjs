@@ -953,5 +953,26 @@ await ta('[31] 確かめのやり直しの道も、振り分けの間に 00:50 �
   assert.deepEqual([r.state, r.result, fs.existsSync(N.nightlyMarker(d, '2030-01-18'))], ['verify_again', 'verified', true]);
 });
 
+await ta('[32] 取込の時刻の窓は、ポータルに結果の状態 (imported_unverified など) を書く前に記録 (import.json) へ残る (書いた直後に落ちても次の夜に同じ窓で照らせる。Codex #1556 R2 Low)', async () => {
+  const p = portal();
+  p.putArtifact();
+  const d = setupData();
+  const lz = realLikeLz({ now: () => p.clock.now });
+  const x = e2eOpts(p, d, lz);
+  const seen = [];
+  const origT = x.o.client.transition;
+  x.o.client = { ...x.o.client, transition: async (q) => {
+    if (q.to !== 'importing') {
+      const j = JSON.parse(fs.readFileSync(path.join(N.nightlyRunDir(d, q.run_id), 'import.json'), 'utf8'));
+      seen.push([q.to, !!(j.stamp_window && j.stamp_window.from && j.stamp_window.to), j.stages.some((s) => s.name === 'result_received')]);
+    }
+    return origT(q);
+  } };
+  const r = await N.runNightly(x.o);
+  assert.equal(r.result, 'verified');
+  assert.deepEqual(seen[0], ['imported_unverified', true, true], '結果の状態を書く時点で窓が記録にある');
+  assert.ok(seen.every((s) => s[1]), JSON.stringify(seen));
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);

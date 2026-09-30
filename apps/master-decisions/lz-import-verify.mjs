@@ -22,15 +22,16 @@ import iconv from 'iconv-lite';
 export const SYSTEM_COLS = Object.freeze(['登録日時', '変更日時', 'インポート日時']);
 
 
-/** 2b-1 の決まり (実機の取込の前)。mode: key = 商品ID の文字の一致 / exact = CSV の文字のとおり / observe = 記録だけ (lz = 候補の列) */
+/** 2b-1 の決まり (実機の取込の前)。mode: key = 商品ID の文字の一致 / exact = CSV の文字のとおり / observe = 記録だけ (lz = 候補の列)
+ * 決まりは中の配列まで全部凍結する (実行中に列を書き換える裏口を作らない。Codex #1556 R2 Medium) */
 export const RULES_2B1 = Object.freeze({
   version: 'lzv-2b1-observe',
   targets: Object.freeze([
-    Object.freeze({ csv: '形式/型番', lz: ['商品ID'], mode: 'key' }),
-    Object.freeze({ csv: '商品名', lz: ['商品名'], mode: 'exact' }),
-    Object.freeze({ csv: 'ふりがな', lz: ['検索名称', '検索名称2'], mode: 'observe' }),   // どちらに入るかは実機で決める
-    Object.freeze({ csv: '仕入単価', lz: ['仕入単価'], mode: 'observe' }),                // 書き方 (1200 / 1200.00 など) は実機で決める
-    Object.freeze({ csv: '取引先id', lz: ['商品予備項目００３'], mode: 'exact' }),
+    Object.freeze({ csv: '形式/型番', lz: Object.freeze(['商品ID']), mode: 'key' }),
+    Object.freeze({ csv: '商品名', lz: Object.freeze(['商品名']), mode: 'exact' }),
+    Object.freeze({ csv: 'ふりがな', lz: Object.freeze(['検索名称', '検索名称2']), mode: 'observe' }),   // どちらに入るかは実機で決める
+    Object.freeze({ csv: '仕入単価', lz: Object.freeze(['仕入単価']), mode: 'observe' }),                // 書き方 (1200 / 1200.00 など) は実機で決める
+    Object.freeze({ csv: '取引先id', lz: Object.freeze(['商品予備項目００３']), mode: 'exact' }),
   ]),
   importedSystem: 'observe',   // 取り込んだ商品のシステムの列 (変わるのが正しいかは実機で決める)
 });
@@ -46,11 +47,11 @@ export const RULES_2B1 = Object.freeze({
 export const RULES_2B2 = Object.freeze({
   version: 'lzv-2b2',
   targets: Object.freeze([
-    Object.freeze({ csv: '形式/型番', lz: ['商品ID'], mode: 'key' }),
-    Object.freeze({ csv: '商品名', lz: ['商品名'], mode: 'exact' }),
-    Object.freeze({ csv: 'ふりがな', lz: ['検索名称'], mode: 'exact' }),
-    Object.freeze({ csv: '仕入単価', lz: ['仕入単価'], mode: 'exact' }),
-    Object.freeze({ csv: '取引先id', lz: ['商品予備項目００３'], mode: 'exact' }),
+    Object.freeze({ csv: '形式/型番', lz: Object.freeze(['商品ID']), mode: 'key' }),
+    Object.freeze({ csv: '商品名', lz: Object.freeze(['商品名']), mode: 'exact' }),
+    Object.freeze({ csv: 'ふりがな', lz: Object.freeze(['検索名称']), mode: 'exact' }),
+    Object.freeze({ csv: '仕入単価', lz: Object.freeze(['仕入単価']), mode: 'exact' }),
+    Object.freeze({ csv: '取引先id', lz: Object.freeze(['商品予備項目００３']), mode: 'exact' }),
   ]),
   importedSystem: 'import_stamp',
 });

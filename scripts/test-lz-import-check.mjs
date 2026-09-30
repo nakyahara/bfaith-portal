@@ -310,6 +310,12 @@ await ta('[5b] 2b-2b の決まり RULES_2B2 (9/30 の実機): ふりがな → �
   const C = V.compileRules(V.RULES_2B2);
   assert.deepEqual([C.decided, C.version, C.targets.map((t) => t.mode).filter((m) => m === 'observe').length], [true, 'lzv-2b2', 0]);
   assert.ok(Object.isFrozen(V.RULES_2B2) && Object.isFrozen(V.RULES_2B2.targets));
+  // 中の配列まで全部凍結 = 実行中に照らす列を書き換えられない (Codex #1556 R2 Medium)
+  const unfrozen = (x, at = '') => (x && typeof x === 'object' ? (Object.isFrozen(x) ? [] : [at || '(root)']).concat(...Object.entries(x).map(([k, v]) => unfrozen(v, `${at}.${k}`))) : []);
+  for (const [name, r] of [['RULES_2B1', V.RULES_2B1], ['RULES_2B2', V.RULES_2B2], ['RULES_NIGHTLY', V.RULES_NIGHTLY]]) assert.deepEqual(unfrozen(r), [], name);
+  assert.throws(() => { V.RULES_NIGHTLY.targets[2].lz[0] = '検索名称2'; }, TypeError);
+  assert.throws(() => { V.RULES_NIGHTLY.targets[2].lz.push('検索名称2'); }, TypeError);
+  assert.deepEqual([V.RULES_NIGHTLY.targets[2].lz, V.compileRules(V.RULES_NIGHTLY).decided], [['検索名称'], true]);
   const R = V.RULES_2B2;
   const table = [['A-1', '新しい名前', 'しんしい', '5200', '0007']];
   const PRE = { 登録日時: '20260101000000', 変更日時: '20260929171153', インポート日時: '20260929171153' };
