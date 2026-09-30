@@ -20,6 +20,7 @@ import {
   SKU_MAP_CANON_FORMAT, serializeSkuMap, skuMapDigest, buildSkuMapGeneration, validateSkuMap,
   toCanonicalTimestamp, isCanonicalTimestamp, parseSkuMapGeneration, formatSkuMapGeneration,
   fromMiniPcRows, toMirrorWireRows, fromMirrorWireRows, SKU_MAP_GENERATION_MAX,
+  CANON_TS_RE, SKU_MAP_EDGE_SPACE_CHARS, skuMapKeyProblem,
 } from '../lib/sku-map-canonical.js';
 
 let passed = 0;
@@ -164,6 +165,27 @@ t('[6] 時刻: 決まった形だけ受ける・JST / UTC / Date / マイクロ�
   assert.equal(hashOf(jstRows), GOLDEN_HASH);
 });
 
+t('[6b] isCanonicalTimestamp は Date で作り直して同じか (new Date(v).toISOString() === v) と同じ答え (網の目で照らす)', () => {
+  const ref = (v) => { if (typeof v !== 'string' || !CANON_TS_RE.test(v)) return false; const d = new Date(v); return !Number.isNaN(d.getTime()) && d.toISOString() === v; };
+  const p2 = (n) => String(n).padStart(2, '0');
+  let n = 0, trues = 0;
+  for (const y of ['0000', '0004', '0099', '0100', '0400', '1900', '1970', '2000', '2023', '2024', '2026', '2100', '9999']) {
+    for (let mo = 0; mo <= 13; mo++) {
+      for (let d = 0; d <= 32; d++) {
+        for (const [h, mi, s] of [[0, 0, 0], [23, 59, 59], [24, 0, 0], [12, 60, 0], [12, 0, 60], [99, 99, 99]]) {
+          const v = `${y}-${p2(mo)}-${p2(d)}T${p2(h)}:${p2(mi)}:${p2(s)}.${String((d * 37) % 1000).padStart(3, '0')}Z`;
+          assert.equal(isCanonicalTimestamp(v), ref(v), v);
+          n++; if (ref(v)) trues++;
+        }
+      }
+    }
+  }
+  assert.ok(n > 30000 && trues > 4000, `${n} / ${trues}`);
+  for (const v of ['2026-10-01T00:00:00.000z', ' 2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z ', '2026-1-01T00:00:00.000Z', null, 20261001, '']) {
+    assert.equal(isCanonicalTimestamp(v), ref(v), String(v));
+  }
+});
+
 t('[7] 同じ鍵が 2 行 = 投げる', () => {
   const g = GOLDEN(); g.master.push({ ...g.master[0], name: '別名' });
   assert.throws(() => serializeSkuMap(g), code('SKU_MAP_DUPLICATE_KEY'));
@@ -210,6 +232,36 @@ t('[9] 受ける決まり (validateSkuMap)', () => {
   assert.equal(validateSkuMap({ master: null, components: [] }).length, 1);
   // pr_ の SKU は特別扱いしない (16 §3 #10)
   assert.deepEqual(validateSkuMap({ master: [{ seller_sku: 'pr_x', name: 'x', created_at: T1, updated_at: T1 }], components: [{ seller_sku: 'pr_x', ne_code: 'pr_x', quantity: 1, sort_order: 0, created_at: T1, updated_at: T1 }] }), []);
+});
+
+t('[9b] 空白の決まりは固定の集合 (= JS の trim が削る文字と同じ・SQLite の trim より厳しい)。中の空白・全角の大文字は通す', () => {
+  const ch = (cp) => String.fromCodePoint(cp);
+  // 固定の集合 = 今の JS の trim が削る文字 (BMP 全部で照らす。緩めていない・実行環境で動かない)
+  const trimmed = [];
+  for (let cp = 0; cp <= 0xffff; cp++) if (!(cp >= 0xd800 && cp <= 0xdfff) && ch(cp).trim() === '') trimmed.push(cp);
+  assert.deepEqual([...SKU_MAP_EDGE_SPACE_CHARS].map((c) => c.codePointAt(0)), trimmed);
+  const edge = [0x09, 0x0a, 0x0d, 0x20, 0xa0, 0x2028, 0x3000, 0xfeff];
+  for (const cp of edge) {
+    assert.ok(skuMapKeyProblem(`abc${ch(cp)}`), `末尾 U+${cp.toString(16)}`);
+    assert.ok(skuMapKeyProblem(`${ch(cp)}abc`), `先頭 U+${cp.toString(16)}`);
+  }
+  // 中の全角の空白・NBSP は通す (鍵 = core.norm_code(鍵) までは求めない。正規化の重なりは切替前の片付け)
+  assert.equal(skuMapKeyProblem(`ab${ch(0x3000)}c`), null);
+  assert.equal(skuMapKeyProblem(`ab${ch(0xa0)}c`), null);
+  // 中の TAB は制御文字として断る (前からの決まり)
+  assert.match(skuMapKeyProblem('ab\tc'), /制御文字/);
+  // 大文字は ASCII だけ (SQLite の lower() と同じ範囲)。全角の Ａ・É は通す
+  assert.match(skuMapKeyProblem('abC'), /大文字/);
+  assert.equal(skuMapKeyProblem(`ab${ch(0xff21)}`), null);
+  assert.equal(skuMapKeyProblem(`ab${ch(0xc9)}`), null);
+  assert.match(skuMapKeyProblem('x'.repeat(256)), /255/);
+  assert.equal(skuMapKeyProblem('x'.repeat(255)), null);
+  // 名前: 空白だけ (全角の空白だけも) は空。中の TAB・改行は通す
+  const probs = (mut) => { const g = GOLDEN(); mut(g); return validateSkuMap(g).map((x) => `${x.where}: ${x.problem}`).join(' | '); };
+  assert.match(probs((g) => { g.master[0].name = ch(0x3000).repeat(2); }), /名前が空/);
+  assert.match(probs((g) => { g.master[0].name = ` ${ch(0xa0)}\t`; }), /名前が空/);
+  assert.equal(probs((g) => { g.master[0].name = `a\tb${ch(0x3000)}`; }), '');
+  assert.match(probs((g) => { g.components[0].ne_code = `ne-002${ch(0x3000)}`; }), /前後に空白/);
 });
 
 t('[10] 形の変換: miniPC の行 / Render に送る形 ↔ 決まった形 (行き来してもハッシュが同じ)', () => {
