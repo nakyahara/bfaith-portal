@@ -53,6 +53,26 @@ create or replace function core.finance_version_has_class(p text) returns boolea
   select coalesce(p ~ '^amazon_finance_v[0-9]+(_[0-9A-Za-z_]+)?$' and substring(p from '^amazon_finance_v([0-9]+)')::numeric >= 2, false)
 $$;
 
+-- ─── 今の形の版の行の等式 (#1554 Codex R2 Medium 2)。JS の validateFinanceRows と同じ (送り手の変換 classifyComponent の規則) ───
+--   4 列を 0 と偽って分類の漏れた金額を隠せない (正式な利益の finance_unclassified が fail-open にならない)。旧い版の行 (4 列 = 0) は対象の外
+--   ・unmapped_jpy <> 0 なら unmapped の部品は 1 つ以上
+--   ・SKU の行: 分けられない列 (misc_fee / other_fee / other_amount) の和 = unclassified_mapped・絶対値の合計 ≥ その列の絶対値の和
+--   ・月の手数料の行: net = account_fee_amount (手数料の材料) + unclassified_mapped + unmapped
+--   ・not_account_fee / unknown の行: 分けられない部品は無い (② / ③ で消費済み)
+--   NOT VALID (既存の行の検査は 0048)
+alter table core.order_finance_daily
+  add constraint ck_order_finance_daily_class_form check (
+    not core.finance_version_has_class(transform_version) or (
+      (unmapped_jpy = 0 or unmapped_component_count > 0)
+      and case
+        when line_kind = 'sku' then
+          unclassified_mapped_jpy = misc_fee_jpy + other_fee_jpy + other_amount_jpy
+          and unclassified_abs_jpy >= abs(misc_fee_jpy) + abs(other_fee_jpy) + abs(other_amount_jpy)
+        when line_kind in ('storage', 'long_term_storage', 'removal', 'inbound_defect', 'low_inventory', 'subscription', 'easy_ship', 'other_account_fee') then
+          net_jpy = account_fee_amount_jpy + unclassified_mapped_jpy + unmapped_jpy
+        else unclassified_component_count = 0
+      end)) not valid;
+
 -- ─── ② apply = 0043 と同じ + 4 列 ───
 create or replace function core.apply_order_finance_batch(
   p_company_id smallint, p_mall text, p_scope_key text, p_mall_order_no text,

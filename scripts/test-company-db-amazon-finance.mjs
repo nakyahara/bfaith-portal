@@ -869,6 +869,44 @@ await t('daily-sync: 手数料の build / sync に やり残しの月数を渡�
   assert.match(src, /accountFeesSyncResult\.success && feesPlan\.covered\.length[\s\S]{0,200}attempted: feesPlan\.covered, file: ACCOUNT_FEES_PENDING_FILE/);
 });
 
+await t('🚨 変換が作る payload は全部 JS と SQL の等式を通る (#1554 Codex R2 Medium 2): 乱数の決済の行 400 注文 (取引の種類・price / 手数料の種類・9 つの金額の列・SKU の有無・注文番号なし) → 集約 → 0047 の apply (CHECK)', async () => {
+  const { orderFinanceChecksum } = await import('../apps/company-db/finance/order-finance-checksum.mjs');
+  let seed = 20260930; const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const pick = (a) => a[Math.floor(rnd() * a.length)];
+  const TX = ['Order', 'Order', 'Refund', 'Chargeback Refund', 'A-to-z Guarantee Refund', 'Other', 'SAFE-T Reimbursement', 'WAREHOUSE_DAMAGE', 'WAREHOUSE_LOST', 'REVERSAL_REIMBURSEMENT',
+    'PAYMENT_RETRACTION_ITEMS', 'Storage Fee', 'FBA Inventory Storage Fee', 'StorageRenewalBilling', 'Subscription Fee', 'Amazon Easy Ship Charges', 'Fee Adjustment', 'Inbound Defect Fee - x',
+    'FBA Removal Order: Return Fee', 'FBA Inventory Fee - LowInventoryLevel', 'Current Reserve Amount', 'Goodwill Concession', 'BuyerRecharge', 'Refund_Retrocharge', 'Mystery Fee'];
+  const PT = [null, null, 'Principal', 'Shipping', 'GiftWrap', 'Tax', 'ShippingTax', 'RestockingFee', 'SAFE-T Reimbursement', 'Weird'];
+  const FT = [null, null, 'Commission', 'RefundCommission', 'FBAPerUnitFulfillmentFee', 'ShippingChargeback', 'PointsGranted', 'MFNPostageFee', 'EasyShipFee', 'VariableClosingFee'];
+  const PR = [null, null, 'Principal', 'Shipping', 'TaxDiscount'];
+  const amt = () => (rnd() < 0.3 ? BigInt(Math.floor(rnd() * 1001) - 500) * 1000000n : null);
+  let id = 900000, checked = 0, withClass = 0, feeRows = 0;
+  for (let o = 0; o < 400; o++) {
+    const pseudo = rnd() < 0.3;
+    const date = `2031-0${1 + Math.floor(rnd() * 9)}-1${Math.floor(rnd() * 9)}`;
+    const orderNo = pseudo ? `-:${date}` : `FZ-${o}`;
+    const rows = [];
+    for (let k = 0, n = 1 + Math.floor(rnd() * 8); k < n; k++) {
+      const sku = rnd() < 0.5 ? null : pick(['fz-a', 'fz-b', 'FZ-A']);
+      rows.push({ id: ++id, source_settlement_id: 'SFZ', business_line_key: `fz-${id}`, source_document_id: 'DFZ', source_line_no: id, source_layer: 'sp_api_v2', ingested_at: OLD_INGEST, posted_date_utc: 'x',
+        economic_date: pseudo ? date : (rnd() < 0.8 ? date : `2031-0${1 + Math.floor(rnd() * 9)}-20`), amazon_order_id: pseudo ? null : orderNo, seller_sku_normalized: sku, transaction_type: pick(TX), currency: 'JPY',
+        quantity_purchased: rnd() < 0.3 ? 1n : null, price_type: pick(PT), price_amount_micro: amt(), item_related_fee_type: pick(FT), item_related_fee_amount_micro: amt(),
+        promotion_type: pick(PR), promotion_amount_micro: amt(), shipment_fee_amount_micro: rnd() < 0.1 ? amt() : null, order_fee_amount_micro: rnd() < 0.05 ? amt() : null,
+        misc_fee_amount_micro: amt(), other_fee_amount_micro: amt(), direct_payment_amount_micro: rnd() < 0.05 ? amt() : null, other_amount_micro: amt() });
+    }
+    const { lines } = aggregateOrderFinance(orderNo, rows);   // JS の等式 (validateFinanceRows) はこの中で通る
+    for (const l of lines) { if (l.unclassified_component_count) withClass++; if (l.line_kind !== 'sku' && l.line_kind !== 'not_account_fee' && l.line_kind !== 'unknown') feeRows++; }
+    // 同じ疑似注文 (同じ日) が 2 回出てもよいように世代は注文ごとに進める
+    const r = (await one(`select core.apply_order_finance_batch(1::smallint, 'amazon', 'jp', $1, $5::bigint, $2, $3, $4::jsonb) as r`,
+      [orderNo, orderFinanceChecksum(lines), AMAZON_FINANCE_TRANSFORM_VERSION, JSON.stringify(lines), 900000 + 2 * o + 1])).r;
+    assert.equal(r, 'applied', orderNo);
+    checked++;
+    await one(`select core.apply_order_finance_batch(1::smallint, 'amazon', 'jp', $1, $4::bigint, $2, $3, '[]'::jsonb) as r`, [orderNo, orderFinanceChecksum([]), AMAZON_FINANCE_TRANSFORM_VERSION, 900000 + 2 * o + 2]);
+  }
+  assert.equal(checked, 400);
+  assert.ok(withClass > 50 && feeRows > 50, `分けられない部品のある行 ${withClass}・月の手数料の行 ${feeRows} (場面が薄い)`);
+});
+
 server.close();
 try { wdb.close(); } catch { /* */ }
 fs.rmSync(tmpDir, { recursive: true, force: true });

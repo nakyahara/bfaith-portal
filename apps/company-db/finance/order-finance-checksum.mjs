@@ -130,6 +130,14 @@ export function validateFinanceRows(mallOrderNo, rows) {
         const sum = UNCLASSIFIED_SKU_COLUMNS.reduce((s, c) => s + out[c], 0), absSum = UNCLASSIFIED_SKU_COLUMNS.reduce((s, c) => s + Math.abs(out[c]), 0);
         if (out.unclassified_mapped_jpy !== sum) throw new Error(`rows[${i}]: on a sku row unclassified_mapped_jpy must equal ${UNCLASSIFIED_SKU_COLUMNS.join(' + ')} (${out.unclassified_mapped_jpy} <> ${sum})`);
         if (out.unclassified_abs_jpy < absSum) throw new Error(`rows[${i}]: on a sku row unclassified_abs_jpy must be >= |${UNCLASSIFIED_SKU_COLUMNS.join('| + |')}| (${out.unclassified_abs_jpy} < ${absSum})`);
+      } else if (ACCOUNT_FEE_KINDS.includes(out.line_kind)) {
+        // 月の手数料の行 = 手数料の材料 (account_fee_amount_jpy) ・分けられない部品・unmapped の 3 つで net の全部 (#1554 Codex R2 Medium 2)。
+        //   4 列を 0 と偽って分類の漏れた金額を隠せない (例 misc_fee +3 を数えずに送ると net −97 ≠ −100 + 0 + 0)
+        const want = BigInt(out.account_fee_amount_jpy) + BigInt(out.unclassified_mapped_jpy) + BigInt(out.unmapped_jpy);
+        if (net !== want) throw new Error(`rows[${i}]: on an account fee row net (${net}) must equal account_fee_amount_jpy + unclassified_mapped_jpy + unmapped_jpy (${want})`);
+      } else if (out.unclassified_component_count !== 0) {
+        // not_account_fee / unknown の行 = 部品は全部 ② / ③ で消費済み (損益の外 / unknown_line_mapped) = 分けられない部品は無い
+        throw new Error(`rows[${i}]: a ${out.line_kind} row must not carry unclassified components (they are consumed as ${out.line_kind})`);
       }
     }
     const k = KEY_COLUMNS.map((c) => out[c]).join('\u0000');

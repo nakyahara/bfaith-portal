@@ -79,6 +79,9 @@ export async function ingestOrderFinanceChunk(db, { companyId = 1, mall, scope, 
     ...opts, transformVersion,
     run: { sourceSystem: m, entity: 'order_finance', scopeKey: s },
     rowWord: 'order', labelRow: (x) => ({ mall_order_no: x.mall_order_no }),
+    // 🚨 SQL の apply の downgrade の例外は行の failed に吸収しない = chunk 全体を rollback して 409 DOWNGRADE (#1554 Codex R2 Medium 1)。
+    //    上の事前の照会の後・取引の前に、別の送信が受領記録を今の形の版にした競合でも、旧い版の chunk を一部だけ適用しない
+    fatalRowError: (e) => (/^downgrade:/.test(String(e && e.message)) ? Object.assign(new Error(String(e.message)), { code: 'DOWNGRADE' }) : null),
     apply: async (dbx, row, batchSeq) => (await dbx.query(
       `select core.apply_order_finance_batch($1::smallint, $2, $3, $4, $5::bigint, $6, $7, $8::jsonb) as r`,
       [companyId, row.mall, row.scope_key, row.mall_order_no, batchSeq, row.set_checksum, transformVersion,

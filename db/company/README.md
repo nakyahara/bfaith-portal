@@ -817,8 +817,11 @@ D7b-1 のうち coverage (決済のそろい・coordinator・レポートの一�
   - **今の形の行が 0047 の適用前に届いたら 409 `NOT_MIGRATED`** (0043 の apply は知らない鍵を黙って捨てる = 4 列が落ちたまま受領記録の指紋には入り、送り直しても 'same' で直らない)
   - 変換の版 = `amazon_finance_v2` (全部の注文の payload が変わる = **全部の送り直しが要る**。版が変わると `--incremental` も全部を選ぶ = 下の手順の夜の `--full` を先に済ませる)
   - 🚨 **版と行の形を結び付ける** (#1554 Codex R1 High): 今の形の版 = `amazon_finance_v2` 以上 (`_名前` が付いても同じ・JS `versionHasClass` = SQL `core.finance_version_has_class`) ⇔ 全部の行に 4 列 (null 不可)。違えば 400 (SQL の apply も例外)。空の集合 (墓石) はどちらの版でもよい
-  - 🚨 **旧い版への戻し (downgrade) を拒む**: 受領記録が今の形の版になった注文を旧い版 (4 列なし) で置き換えると 4 列が 0 に戻る (分けられない部品が消えて正式な利益が fail-open) → 受け口が chunk ごと **409 `DOWNGRADE`** (送り手は ❌)・SQL の apply も例外。**miniPC を旧いコード (amazon_finance_v1) に戻さない**
-  - CHECK は 0047 で `NOT VALID` (新しい行には効く)・既存の行の検査は **0048** (`VALIDATE CONSTRAINT` = 読み書きを止めない lock。59 万行の検査を 0047 の ACCESS EXCLUSIVE の中でしない)
+  - 🚨 **旧い版への戻し (downgrade) を拒む**: 受領記録が今の形の版になった注文を旧い版 (4 列なし) で置き換えると 4 列が 0 に戻る (分けられない部品が消えて正式な利益が fail-open) → 受け口が chunk ごと **409 `DOWNGRADE`** (送り手は ❌)・SQL の apply も例外。**miniPC を旧いコード (amazon_finance_v1) に戻さない**。
+    受け口の事前の照会の後に別の送信が受領記録を v2 にした競合でも、SQL の downgrade の例外は行の failed に吸収せず **chunk 全体を rollback して 409** (`ingest/chunk.mjs` の `fatalRowError`。ほかの受け口は今までどおり行ごと)
+  - 🚨 **今の形の版の行の等式** (#1554 Codex R2・JS の形の確かめと表の CHECK `ck_order_finance_daily_class_form` の両方): unmapped の金額 ≠ 0 なら部品 ≥ 1 / SKU の行 = 分けられない 3 列の和 = 符号つき・絶対値 ≥ 3 列の絶対値の和 /
+    **月の手数料の行 = `net = account_fee_amount + unclassified_mapped + unmapped`** (4 列を 0 と偽って分類の漏れた金額を隠せない) / not_account_fee・unknown の行 = 分けられない部品 0。旧い版の行は対象の外
+  - CHECK (3 つ) は 0047 で `NOT VALID` (新しい行には効く)・既存の行の検査は **0048** (`VALIDATE CONSTRAINT` = 読み書きを止めない lock。59 万行の検査を 0047 の ACCESS EXCLUSIVE の中でしない)
 - **`mart.finance_daily_sku_range(会社, モール, scope, from, to)`** = **日 × 正規化 seller SKU (`core.norm_code`) の子の粒度** (§3.2・R13 H1)。D7b-3 の利益の関数が計算のときに **今のマスタ** で出品に結び直してまとめる材料 (D-64)。
   今の `mart.finance_daily_range` (0045) は画面・突き合わせのため残す (戻りの型も変えない)
   - 列 = 0045 の全部の金額と数量の列 + `seller_sku_norm`・`received_listing_ids` (受け取りのときの listing_id・ID の昇順・診断だけ)・`received_listing_unresolved_count` (受け取りのとき未解決だった行の数)・`net_jpy`・`unmapped_jpy`・4 列・`refund_units_status`・`units_refunded_customer_unrounded` / `units_a_to_z_refund_unrounded` (丸める前の返品数・小数 6 桁)・`refund_unestimated_jpy` (推定できない返品の額)
@@ -858,7 +861,7 @@ git worktree remove C:\tmp\d7b1a
 
 ```sql
 -- 送り直しの進み (版ごとの注文の数。lines > 0 が全部 amazon_finance_v2 になれば済み・空の集合の墓石は旧い版のままでよい)
-select transform_version, lines > 0 as has_lines, count(*) from core.order_finance_receipts where mall = 'amazon' and scope_key = 'jp' group by 1, 2 order by 1, 2;
+select transform_version, lines > 0 as has_lines, count(*) from core.order_finance_receipts where company_id = 1 and mall = 'amazon' and scope_key = 'jp' group by 1, 2 order by 1, 2;
 -- 分けられない部品のある SKU の行 (D7b-3 で正式な利益が null になる行)
 select economic_date_jst, seller_sku_norm, unclassified_component_count, unclassified_mapped_jpy, unclassified_abs_jpy, unmapped_component_count
   from mart.finance_daily_sku_range(1::smallint, 'amazon', 'jp', '2026-09-01', '2026-09-30') where unclassified_component_count > 0 or unmapped_component_count > 0;

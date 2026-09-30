@@ -131,21 +131,21 @@ await ta('[!] 0047 (13 §3.2・§3.7・D7b-1a): 財務の行に分けられな�
   const fns = await q("select p.proname as f, pg_get_function_identity_arguments(p.oid) as a from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'mart' and p.proname in ('finance_daily_range', 'finance_daily_sku_range') order by 1");
   assert.deepEqual(fns.map((r) => r.f), ['finance_daily_range', 'finance_daily_sku_range']);   // 今の関数は残す (R20 M4)
   assert.ok(fns.every((r) => /p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date/.test(r.a)), JSON.stringify(fns));
-  const ck = await q("select conname as n, convalidated as v from pg_constraint where conname in ('ck_order_finance_daily_unclassified', 'ck_order_finance_daily_unmapped_count') order by 1");
-  assert.deepEqual(ck.map((r) => [r.n, r.v]), [['ck_order_finance_daily_unclassified', true], ['ck_order_finance_daily_unmapped_count', true]]);   // 0048 で確かめ済み
+  const ck = await q("select conname as n, convalidated as v from pg_constraint where conname in ('ck_order_finance_daily_unclassified', 'ck_order_finance_daily_unmapped_count', 'ck_order_finance_daily_class_form') order by 1");
+  assert.deepEqual(ck.map((r) => [r.n, r.v]), [['ck_order_finance_daily_class_form', true], ['ck_order_finance_daily_unclassified', true], ['ck_order_finance_daily_unmapped_count', true]]);   // 0048 で確かめ済み
 });
 
 await ta('[!] 0047 の CHECK は NOT VALID で足し (59 万行の検査を ACCESS EXCLUSIVE の中でしない)、0048 が既存の行で確かめる (#1554 Codex R1 Medium)', async () => {
   const p2 = new PGlite(); const d2 = pgliteAdapter(p2);
   await applyMigrations(d2, { log: quiet, to: '0047' });
-  const st = async () => (await d2.query("select conname as n, convalidated as v from pg_constraint where conname like 'ck_order_finance_daily_un%' order by 1")).rows.map((r) => [r.n, r.v]);
-  assert.deepEqual(await st(), [['ck_order_finance_daily_unclassified', false], ['ck_order_finance_daily_unmapped_count', false]]);
+  const st = async () => (await d2.query("select conname as n, convalidated as v from pg_constraint where conname in ('ck_order_finance_daily_unclassified', 'ck_order_finance_daily_unmapped_count', 'ck_order_finance_daily_class_form') order by 1")).rows.map((r) => [r.n, r.v]);
+  assert.deepEqual(await st(), [['ck_order_finance_daily_class_form', false], ['ck_order_finance_daily_unclassified', false], ['ck_order_finance_daily_unmapped_count', false]]);
   const src47 = fs.readFileSync(path.join(DEFAULT_DIR, '0047_finance_sku_range.sql'), 'utf8');
   const code47 = src47.split(/\r?\n/).map((l) => l.replace(/--.*$/, '')).join('\n');   // 注釈を除いた SQL
   assert.ok(!/validate\s+constraint/i.test(code47), '0047 で既存の行を検査している');
-  assert.equal((code47.match(/\bnot valid\b/gi) || []).length, 2, '0047 の 2 つの CHECK が NOT VALID でない');
+  assert.equal((code47.match(/\bnot valid\b/gi) || []).length, 3, '0047 の 3 つの CHECK が NOT VALID でない');
   await applyMigrations(d2, { log: quiet });
-  assert.deepEqual(await st(), [['ck_order_finance_daily_unclassified', true], ['ck_order_finance_daily_unmapped_count', true]]);
+  assert.deepEqual(await st(), [['ck_order_finance_daily_class_form', true], ['ck_order_finance_daily_unclassified', true], ['ck_order_finance_daily_unmapped_count', true]]);
   await p2.close();
 });
 
