@@ -81,13 +81,17 @@ const trim = (v, max) => {
 const posInt = (v) => {
   if (typeof v === 'number') return Number.isSafeInteger(v) && v > 0 ? v : null;
   // 🚨 trim してから検査しない — " 12" と "12" を同じ 12 に畳むと、入力と保存値が食い違う (コード R3)
-  if (typeof v !== 'string' || !/^[1-9]\d*$/.test(v)) return null;
+  // test() だと末尾に改行が付いた値まで通ってしまう (コード R6)
+  if (!exact(v, POS_INT_RE)) return null;
   const n = Number(v);
   return Number.isSafeInteger(n) && n > 0 ? n : null;
 };
 
 /** sha256 (16 進小文字 64 桁ちょうど)。証跡・packet_hash・spec_hash の照合に使う */
 const SHA256_RE = /^[0-9a-f]{64}$/;
+const POS_INT_RE = /^[1-9]\d*$/;
+/** Drive の fileId (lib/drive-link.js の DRIVE_FILE_ID_PATTERN と同じ形) */
+const DRIVE_FILE_ID_RE = /^[-\w]{10,200}$/;
 /** 二重クリック対策のキー。画面が UUID などを作る。空白差で別物にならないよう形を固定する */
 const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9_.:-]{8,80}$/;
 
@@ -95,8 +99,16 @@ const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9_.:-]{8,80}$/;
  * 識別子・ハッシュは **trim も切り詰めもしない**で形を直接見る (コード R3〜R5)。
  * 正規化して受けると、送られた値と保存・照合に使う値が食い違い、
  * 「別の入力」が「同じ結果の再送」に畳まれる。
+ *
+ * 🚨 `re.test(v)` では**末尾の改行を弾けない** — JS の `$` は (multiline でなくても)
+ *    文字列末尾の `\n` の直前にも一致するので `"abc\n"` が `/^abc$/` を通る。
+ *    一致した部分が文字列全体と同じかで確かめる (コード R6)。
  */
-const exact = (v, re) => (typeof v === 'string' && re.test(v) ? v : null);
+const exact = (v, re) => {
+  if (typeof v !== 'string') return null;
+  const m = re.exec(v);
+  return m && m[0] === v ? v : null;
+};
 
 /**
  * 実行役から来た JSON を保存できる形にする。
@@ -465,15 +477,15 @@ export function submitResult(db, generationId, {
     imgs = [];
     for (const im of receipt.images) {
       // file_id も trim / 切り詰めしない — 別の入力が同じ証跡に畳まれると provenance にならない (コード R4)
-      const fileId = im?.file_id;
-      if (typeof fileId !== 'string' || !/^[-\w]{10,200}$/.test(fileId)) {
+      const fileId = exact(im?.file_id, DRIVE_FILE_ID_RE);
+      if (!fileId) {
         return { code: 'bad_request', error: 'receipt.images の file_id が Drive の ID の形ではありません' };
       }
       // 🚨 trim / toLowerCase してから検査しない — 大文字や空白混じりを受けて同じ hash に畳むと、
       //    別の入力が同じ payloadHash になり「同じ結果の再送」の判定が狂う (コード R3)
-      const hex = im?.sha256;
+      const hex = exact(im?.sha256, SHA256_RE);
       const bytes = posInt(im?.bytes);
-      if (typeof hex !== 'string' || !SHA256_RE.test(hex) || !bytes) {
+      if (!hex || !bytes) {
         return { code: 'bad_request', error: 'receipt.images は sha256 (16進小文字64桁) と bytes (正の整数) が要ります' };
       }
       imgs.push({ file_id: fileId, sha256: hex, bytes });

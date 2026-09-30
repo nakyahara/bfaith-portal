@@ -204,6 +204,15 @@ eq(lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT,
   receipt: { images: [{ file_id: 'FILEID000001', sha256: 'a'.repeat(64) }] }, now: min(91),
 }).code, 'bad_request', 'bytes が無ければ断る');
+// R6: 末尾の改行を弾く (JS の `$` は multiline でなくても文字列末尾の改行の直前に一致する)
+eq(lp.submitResult(db, g8.generation_id, {
+  packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT,
+  receipt: { images: [{ file_id: 'FILEID000001', sha256: `${'d'.repeat(64)}\n`, bytes: 1 }] }, now: min(91),
+}).code, 'bad_request', '🚨 sha256 の末尾改行を弾く (R6)');
+ok(lp.requestJob(db, args(mkDraft('LP-L', 'テスト3'), s2.spec, 'key-0001\n', { now: min(96) })).code === 'bad_request',
+  '🚨 idempotency_key の末尾改行を弾く (R6)');
+ok(lp.requestJob(db, args({ ...dA, id: '12\n' }, s2.spec, 'key-000v', { now: min(96) })).code === 'bad_request',
+  '🚨 ID の末尾改行を弾く (R6)');
 const subBig = lp.submitResult(db, g8.generation_id, {
   packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1,
   receipt: { images: [{ file_id: 'FILEID000001', sha256: 'b'.repeat(64), bytes: 999, extra: 'x' }] }, now: min(91),
