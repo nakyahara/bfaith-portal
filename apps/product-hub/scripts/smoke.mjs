@@ -5254,6 +5254,8 @@ let wfSetParentId = null;
   const wfp = wfpEarly;
   const express = (await import('express')).default;
   const routerMod = await import('../router.js');
+  // 切替の段階 = legacy_open (マスタの古い入口の門を今までどおり通す。門そのものの試験は scripts/test-master-legacy-gate.mjs)
+  (await import('../../../lib/master-legacy-gate.mjs')).__setLegacyPhaseReader(async () => ({ readable: true, phase: 'legacy_open' }));
   const app = express();
   // セッションを偽装して直接マウント (本番は server.js の requireAppAccess を通る)
   // 一部のテストは一般ユーザーとして叩く (smokeSession を差し替える)

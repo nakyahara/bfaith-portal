@@ -860,8 +860,16 @@ th.attr-unknown { color: #dc2626; }
         </div>
         <div style="flex:1">
           <!-- 税率は基本情報 (2026-08-06 中原さん指示: Yahoo!欄から移動)。楽天・Yahoo!両方の登録で使う -->
+          <% if (typeof masterLegacy !== 'undefined' && masterLegacy && masterLegacy.frozen) { %>
+          <%# 切替で古い入口を閉じた後 (Company DB構想 10 §4 #6): 手入力の欄 (id="y-tax") は出さない = 保存でも即保存でも税率を送らない。Company DB の税率を見せるだけ %>
+          <% const cdbTaxView = (typeof cdbTax !== 'undefined' && cdbTax) ? cdbTax : { ok: false, reason: '読めません' }; %>
+          <label>税率 <span class="muted">(Company DB の税率・見るだけ)</span></label>
+          <input type="text" id="y-tax-cdb" value="<%= cdbTaxView.ok ? cdbTaxView.label : '' %>" placeholder="<%= cdbTaxView.ok ? '' : cdbTaxView.reason %>" readonly disabled>
+          <div class="muted" style="font-size:12px;"><a href="<%= masterLegacy.url %>" target="_blank" rel="noopener">マスタは新しい画面で直します ↗</a></div>
+          <% } else { %>
           <label>税率 <span class="muted">(登録時にNEから初期値)</span><span class="ftag ftag-auto">自動(初期値)</span><span class="ftag ftag-m">手入力</span></label>
           <input type="text" id="y-tax" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="例: 10%">
+          <% } %>
         </div>
       </div>
       <!-- 配送・納期。売価とセットで見たい (利益に効く) ため基本情報タブに配置 (2026-07-29 中原さん要望)。
@@ -3628,7 +3636,8 @@ th.attr-unknown { color: #dc2626; }
         // NE で判定できる商品はキーごと送らない (DB に焼かせない)
         ...hasVariationPayload(),
         // drive_folder_url は画像タブの取込に一本化 (未送信 = サーバーは既存値を保持)
-        tax_rate: document.getElementById('y-tax').value,
+        // 税率の欄が無い (切替で閉じた後) = 送らない (undefined は JSON に載らない)
+        tax_rate: document.getElementById('y-tax')?.value,
         memo: document.getElementById('f-memo').value,
       });
       sendSettled = true;
@@ -5604,7 +5613,7 @@ th.attr-unknown { color: #dc2626; }
         delivery_label: document.getElementById('y-delivery').value,
         // 楽天項目より先に保存しても「別扱い」が落ちないよう、こちらでも現在値を送る
         shipping_override: yahooOverrideOn ? 1 : 0,
-        tax_rate: document.getElementById('y-tax').value,
+        tax_rate: document.getElementById('y-tax')?.value,   // 切替で閉じた後は欄が無い = 送らない
         yahoo_category_id: document.getElementById('y-category-id').value,
         yahoo_path: document.getElementById('y-path').value,
       });

@@ -130,10 +130,16 @@ import {
   suggestShopCategories, canAutoApplyShopCategory, countSelectableShopCategories,
   shopCategoriesNeverSaved, isAutoApplyRequestValid,
 } from './lib/shop-categories.js';
+import { masterLegacyGate } from '../../lib/master-legacy-gate.mjs';
+import { readCdbTaxRate } from './services/cdb-tax-rate.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 router.use(express.json({ limit: '512kb' }));
+// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #6・14 §5・契約 v3 H1)。税率の手入力 (tax_rate を送る保存) は
+//    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = tax_rate を送った保存は 410 / 503 (何も書かない)。
+//    tax_rate を送らない保存 (ほかの欄) は通る。詳細画面は税率の欄を外して Company DB の税率を見せる (本文を読んだ後に置く)
+router.use(masterLegacyGate('product-hub'));
 
 const view = (name) => path.join(__dirname, 'views', name);
 const actorOf = (req) => req.session?.email || req.session?.displayName || null;
@@ -244,6 +250,20 @@ router.get('/new', (req, res) => {
     title: '新規商品ドラフト',
     displayName: req.session?.displayName || req.session?.email || '',
   });
+});
+
+// 切替で古い入口を閉じた後 (res.locals.masterLegacy.frozen) だけ、税率の欄の代わりに見せる Company DB の税率を読む。
+// 閉じる前は何もしない (今までどおり次の詳細画面へ)
+router.get('/detail/:id', async (req, res, next) => {
+  if (!res.locals.masterLegacy?.frozen) return next();
+  try {
+    const id = Number.parseInt(req.params.id, 10);
+    const code = Number.isInteger(id) && id > 0 ? getDB().prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(id)?.ne_code : null;
+    res.locals.cdbTax = code ? await readCdbTaxRate(code) : { ok: false, reason: '商品が無い' };
+  } catch (e) {
+    res.locals.cdbTax = { ok: false, reason: String((e && e.message) || e) };
+  }
+  next();
 });
 
 router.get('/detail/:id', (req, res) => {
