@@ -17,6 +17,8 @@ import fs from 'fs';
 import iconv from 'iconv-lite';
 import { initDB, getDB, saveToFile, updateSyncMeta, clearNeCompleteMarks, neSrc } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
+import { legacyCliGate } from '../../lib/master-legacy-gate.mjs';
+import { cliEntry } from '../../config/master-legacy-entries.mjs';
 
 function now() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
 
@@ -420,6 +422,13 @@ async function main() {
     console.log('  node apps/warehouse/csv-import.js exception_genka <CSVファイル>');
     process.exit(1);
   }
+
+  // 🚨 マスタを書く mode (product_shipping・exception_genka = 全部消して入れ直す) は古い入口の門を通す
+  //    (Company DB構想 10 §4 #10・14 §9 M2・契約 v3 H1。一覧 = config/master-legacy-entries.mjs)。
+  //    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = DB を開かずに終了コード 3。
+  //    受注・ロジザード・NE の写し・送料の表の mode は止めない (ファイル単位ではなく mode 単位)
+  const legacyEntry = cliEntry('apps/warehouse/csv-import.js', command);
+  if (legacyEntry && !(await legacyCliGate(legacyEntry.id))) return;
 
   await initDB();
 

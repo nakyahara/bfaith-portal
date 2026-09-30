@@ -191,6 +191,9 @@ console.log('\n[3] /api/tax_rate の親セット即時反映');
 
 process.env.WAREHOUSE_API_KEY = ''; // 認証スキップ
 const routerModule = await import('../apps/warehouse/router.js');
+// 切替の段階 = legacy_open (マスタの古い入口の門 lib/master-legacy-gate.mjs を今までどおり通す。門そのものの試験は test-master-legacy-gate.mjs)
+const { __setLegacyPhaseReader } = await import('../lib/master-legacy-gate.mjs');
+__setLegacyPhaseReader(async () => ({ readable: true, phase: 'legacy_open' }));
 const router = routerModule.default;
 const { refreshSetTaxRates } = routerModule;
 

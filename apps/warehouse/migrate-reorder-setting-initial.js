@@ -14,6 +14,7 @@
 import fs from 'fs';
 import iconv from 'iconv-lite';
 import { getDB, initDB } from './db.js';
+import { legacyCliGate } from '../../lib/master-legacy-gate.mjs';
 
 const REORDER_MONTHS_MAX = 60;
 function parseMonths(v) {
@@ -57,6 +58,9 @@ async function main() {
   const dryRun = args.includes('--dry-run');
   if (!csvPath) { console.error('--csv=... が必要です'); process.exit(2); }
   if (!fs.existsSync(csvPath)) { console.error(`CSVが見つかりません: ${csvPath}`); process.exit(2); }
+  // 🚨 推奨保有月数 (m_reorder_setting) はマスタ = 古い入口の門を通す (Company DB構想 14 §9 M2・契約 v3 H1)。
+  //    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = DB を開かずに終了コード 3 (--dry-run も)
+  if (!(await legacyCliGate('cli:migrate-reorder-setting-initial.js'))) return;
 
   // UTF-8(BOM可) / Shift_JIS 自動判定
   //   まず UTF-8 として解釈し、置換文字(U+FFFD)が多ければ cp932 とみなす。

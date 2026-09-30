@@ -25,6 +25,7 @@ import fs from 'fs';
 import path from 'path';
 import iconv from 'iconv-lite';
 import { getDB, initDB } from './db.js';
+import { legacyCliGate } from '../../lib/master-legacy-gate.mjs';
 
 /**
  * RFC4180準拠の簡易CSVパーサ
@@ -213,7 +214,10 @@ export function importSkuMasterCSV(csvPath, opts = {}) {
 
 // ─── CLI ───
 const isMain = process.argv[1]?.endsWith('import-sku-master.js');
-if (isMain) {
+// 🚨 SKU マスタ (Amazon SKU ↔ NE コード) はマスタ = 古い入口の門を通す (Company DB構想 10 §4 #2 D-43・契約 v3 H1)。
+//    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = DB を開かずに終了コード 3 (--dry-run も)。
+//    router から importSkuMasterCSV を使うとき (isMain でない) は門を読まない (router の門 /api/csv/m-sku-master が見る)
+if (isMain && await legacyCliGate('cli:import-sku-master.js')) {
   const args = process.argv.slice(2);
   const csvPath = args.find(a => !a.startsWith('--'));
   const dryRun = args.includes('--dry-run');
