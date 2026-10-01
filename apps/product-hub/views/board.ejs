@@ -1266,6 +1266,7 @@
     const moved = [];
     const errors = [];
     const blocked = [];
+    const blockedEls = [];
     for (const c of group) {
       // 落とした列に元からいたカードは工程を動かさない (並び順だけ揃える)
       if (c.dataset.fromCol === to) { moved.push(c); continue; }
@@ -1280,7 +1281,10 @@
         if (j.ok) {
           moved.push(c);
           // 移動はできたが落とした列に止まらなかったカードも知らせる (1 枚ずつのドロップと同じ理由)
-          if (j.reopenBlocked) blocked.push((c.dataset.name || ('#' + c.dataset.draft)) + ': 「' + j.reopenBlocked + '」を開き直せないため先の工程に進みました');
+          if (j.reopenBlocked) {
+            blocked.push((c.dataset.name || ('#' + c.dataset.draft)) + ': 「' + j.reopenBlocked + '」を開き直せないため先の工程に進みました');
+            blockedEls.push(c);
+          }
         } else errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': ' + (j.error || '移動できませんでした'));
       } catch (err) {
         errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': 通信エラー ' + err.message);
@@ -1297,6 +1301,9 @@
         if (after) after.after(c); else if (ref && ref.parentNode === body) ref.after(c); else body.appendChild(c);
         after = c;
       }
+      // 落とした列に止まらないカード (開き直せなかった) は並び順に残さない。
+      // この後すぐ読み直すので、保存の前に列から外すだけでよい (1 枚ずつのドロップと同じ扱い)
+      for (const c of blockedEls) c.remove();
       await saveOrder(col);
     }
     let msg = '';
