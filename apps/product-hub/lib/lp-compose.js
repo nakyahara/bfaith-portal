@@ -429,8 +429,13 @@ export function claimJob(db, { runnerRunId, now = Date.now() } = {}) {
       }
       const token = randomBytes(16).toString('hex');
       const until = new Date(now + LEASE_MIN * 60_000).toISOString();
+      // 🚨 証跡は claim ごとにリセットする (codex exec review P1)。
+      //    残しておくと、前の実行役が画像を落としてから release / 落ちた場合に、
+      //    **次の実行役が画像を一度も見ずに accepted を出せてしまう**。
+      //    「その出力を書いた実行役が実際に見た」を保つのがこの証跡の意味。
       const ch = db.prepare(`UPDATE ph_lp_compose_jobs
-        SET status = 'running', lease_token = ?, lease_until = ?, runner_run_id = ?, claims = claims + 1, updated_at = ?
+        SET status = 'running', lease_token = ?, lease_until = ?, runner_run_id = ?, claims = claims + 1,
+            images_served_json = '[]', updated_at = ?
         WHERE id = ? AND status = 'queued'`)
         .run(token, until, trim(runnerRunId, 80) || null, nowS, job.id).changes;
       if (ch !== 1) continue;   // 誰かに取られた

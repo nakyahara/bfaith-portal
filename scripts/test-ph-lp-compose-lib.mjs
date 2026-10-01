@@ -127,6 +127,22 @@ eq(lp.submitResult(db, gZ.generation_id, { packetHash: cZ.job.packet_hash, verdi
 eq(lp.submitResult(db, gZ.generation_id, { packetHash: cZ.job.packet_hash, verdict: 'rejected', reason: '作れなかった', now: min(6) }).status,
   'failed', 'rejected は証跡が無くてよい (作れなかったので)');
 
+// 🚨 証跡は claim ごとにリセットされる (codex exec review P1)。
+// 前の実行役が画像を落としてから手放した場合に、次の実行役が
+// 画像を一度も見ずに accepted を出せてはいけない
+const dY = mkDraft('LP-Y', 'ハッカ油スプレー 使い回し');
+lp.requestJob(db, args(dY, s2.spec, 'key-0001', { now: min(7) }));
+const cY1 = lp.claimJob(db, { runnerRunId: 'run-y1', now: min(7) });
+serve(cY1.job.job_id);                                    // 1 人目の実行役が画像を見た
+lp.releaseJob(db, cY1.job.job_id, { leaseToken: cY1.job.lease_token, now: min(7.5) });
+const cY2 = lp.claimJob(db, { runnerRunId: 'run-y2', now: min(8) });   // 2 人目が掴む
+const gY = lp.reserveGeneration(db, cY2.job.job_id, { leaseToken: cY2.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(8) });
+eq(lp.submitResult(db, gY.generation_id, { packetHash: cY2.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(8.5) }).code,
+  'bad_request', '🚨 前の実行役の証跡を使い回せない (claim でリセット・codex exec review P1)');
+serve(cY2.job.job_id);
+eq(lp.submitResult(db, gY.generation_id, { packetHash: cY2.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(8.5) }).status,
+  'done', '自分で見たなら通る');
+
 console.log('⑦ 結果 — rejected (lint / 検品が通らなかった)');
 const dB = mkDraft('LP-B', 'ハッカ油スプレー 50ml');
 const r2 = lp.requestJob(db, args(dB, s2.spec, 'key-0001', { now: min(10) }));
