@@ -12,23 +12,31 @@
 --        ・場所はログインで決まる (#1563 仮レビュー Low 3): 書けるのはログインのロール master_gate_render / master_gate_minipc (まとめのロール master_gate のメンバー) だけ。
 --          session_user が 'master_gate_' || host でなければ拒む (gate_host_mismatch・42501)。記録に session_role を残す
 --        ・止まったプロセス: 止めるとき (正しく終わる・人が CLI で「止めた」と書く) は stopped = true + 理由 (stopped_reason) の記録を書く
---        ・段階を進めるとき、ops.master_cutover_ack_silent_hours() (24) 時間以内に記録のあるプロセスごとに、最後の 1 件を見る:
---          止まった記録 = 外す / ops.master_cutover_ack_fresh_minutes() (15) 分より前 = 黙っている = 拒む (止めたなら stopped の記録を書く) /
---          新しい記録 = 全部の場所に 1 件以上・どれも build_id が証拠の expected_builds[場所] の中・manifest_hash と owner_hash が証拠と同じ・見た段階が今の段階。1 つでも外れたら拒む
---          legacy_open → frozen     : + drain (書きかけを流し終えた) + 手の入口 (manifest の kind = manual) を止めた一覧が manifest の手の入口と完全に同じ集合
---          frozen → company_owner   : + 記録が frozen に入った後・書きかけ 0 (新しい持ち主表のハッシュ = 証拠の owner_hash を段階に残す)
---          company_owner → new_open : + 記録が company_owner に入った後・書きかけ 0・owner_hash が company_owner のときと同じ
---        ・差し込み口 ops.master_cutover_prereq_problems(from, to) (既定 = 問題なし)。後の migration (⑤-2a の 0051・⑥ の準備) が create or replace で「まだの項目」を返す = 拒む
+--        ・段階を進めるとき、今までに 1 回でも記録のあるプロセス全部 (記録の表 = 知っている実体の台帳。年齢では外さない・#1563 R3 High 1) の最後の 1 件を見る:
+--          止まった記録 = 外す / ops.master_cutover_ack_fresh_minutes() (15) 分より前 = 黙っている = 拒む (止めたなら stopped の記録を書く。25 時間前でも同じ) /
+--          新しい記録 = 全部の場所に 1 件以上・どれも build_id が証拠の expected_builds[場所] の中・manifest_hash と owner_hash が証拠と同じ・見た段階が今の段階・書きかけ 0。
+--          1 つでも外れたら拒む。🚨 記録の表は消さない (消すと台帳から実体が消える)
+--          legacy_open → frozen     : + drain (書きかけを流し終えた) + 手の入口 (manifest の kind = manual) を止めた一覧が manifest の手の入口と完全に同じ集合。
+--                                     drain.checked_at と手の入口の at は今の段階に入った後・サーバーの今以前
+--          frozen → company_owner   : + 記録が frozen に入った後 (新しい持ち主表のハッシュ = 証拠の owner_hash を段階に残す)
+--          company_owner → new_open : + 記録が company_owner に入った後・owner_hash が company_owner のときと同じ
+--          🚨 一度も記録を書かない実体 (門を持たない古い build) は DB からは見えない = 切替の手順で、各場所で動いている実体の一覧と記録を人が照らす
+--        ・前提の差し込み口 (#1563 R3): 表 ops.master_cutover_prereq_checks に (名前・関数) を足す。ops.master_cutover_prereq_problems(from, to) が足された関数を全部呼び、
+--          問題をつなげて返す (空でなければ進めない)。後の migration (⑤-2a・④a・⑥ の準備) は関数を create or replace せず、表に 1 行足す (前の項目を消さない)
 --        ⑤-1 では誰も門の記録を書かない (書くのは ⑤-3) = ⑤-3 が配られるまで legacy_open から進めない
 --      🚨 読めない = 閉じている (fail-closed。lib/master-cutover.mjs)。新しい画面の保存 = 段階 new_open **かつ** 持ち主表のハッシュが段階の記録と同じ **かつ** 列が company
 --         **かつ** env MASTER_EDIT_OPEN = 1。保存の取引は hashtext('ops.master_cutover') の共有の鍵を持つ = 段階を変える取引 (排他の鍵) と並ぶ
+--      🚨 DB でも守る (#1563 R3 M2): 画面のロール master_edit の書き込みは、同じ取引で ops.begin_master_write (security definer) を呼んだ後だけ (下の 8.)
 --   2. core.skus.set_sales_class_override (1〜4・null) / handling_own ('active' / 'discontinued'・null) = セットに置く人が決めた値。
 --      🚨 sku_kind = 'set' だけ、の CHECK は付けない: 夜間ロードが NE の種類替えを写したときに 1 行の CHECK で夜間ロード全体を止めない
 --   3. ops.master_edit_requests = 保存 1 回 = 1 行。done は保存と同じ取引・failed は巻き戻った後に同じ request_id の鍵を取って (既に結果があれば書かない)。追記だけ
 --   4. セットの構成: core.sku_components = 最後に確かめた構成 (画面は書かない)。ops.sku_component_requests = 依頼 (セットごとに開いているのは 1 つ)。
 --      ops.ne_set_observation_runs / ops.ne_set_observations = NE のセットの構成の観測 (追記だけ)。書くのは ops.record_ne_set_observations (security definer・観測のロール master_observer だけ)。
 --        完全な回 (complete) = 知らない・セットでない・重なる・並びの分からない・知らない構成品の行が 1 つも無い・求めた数 = 取った数 = 残した数・原本のハッシュと取得の世代がある。
---        観測の時刻は未来 (5 分より先) にしない・36 時間より前にしない
+--        観測の時刻は未来 (5 分より先) にしない・36 時間より前にしない。
+--        数は厳密な整数 (#1563 R3 M3): requested / fetched = 0〜1,000,000・qty = 1〜99,999・sort = セットごとに 1〜N (送り手 = 夜間ロードは NE の並びに 1 から番号を振る)。
+--        0.6・1.0・-1 などは形の誤り (完全な回 = 拒む・完全でない回 = そのセットを飛ばす)
+--        書くときに、観測するセットの SKU ごとの鍵を sku_id の順に取る (昇格と同じ鍵 = 古い観測の昇格と新しい観測の書き込みが並ぶ・#1563 R3 M4)
 --      ops.sku_component_breaches = 食い違い (NE でやること): mismatch / stale / unrequested_diff / underivable (NE は依頼どおりだが、依頼の構成では導く値が決まらない)
 --      依頼を上げるのは lib/master-write.mjs の promoteComponentRequest(観測の番号) だけ (夜間ロード = 持ち主のロール)
 --   5. core.sku_costs: 期間の重なりの守り (この画面と昇格の書き込み・持ち主でないロールの書き込み) と、持ち主でないロールは過去の行を消さない・閉じた行を変えない
@@ -44,6 +52,12 @@
 --   7. マスタの書き込みの鍵 core.master_write_lock_key() = 4705310050 (0036 の親子の鍵 4705310036 と同じ作り。#1563 仮レビュー M3):
 --      夜間ロード (apps/company-db/load/engine.mjs) は取引の冒頭 (親子の鍵より前) に排他で取る。この画面の保存・構成の依頼の昇格は段階の共有の鍵の後に共有で取る
 --      (短く待つ = lib/master-write.mjs の MASTER_WRITE_WAIT。待ちきれなければ 409「夜間の取り込み中」)。夜間ロードの長い取引と保存が行の鍵で待ち合う (デッドロック) のを防ぐ
+--   8. 画面のロール master_edit の書き込みの約束 (#1563 R3 M2。列の権限だけでは、段階・持ち主・記録の誰が を飛ばして直接書けた):
+--      ・ops.begin_master_write(request_id, actor_id, reason, 持ち主表) = security definer。段階が new_open かつ持ち主表のハッシュが段階の記録と同じときだけ、
+--        今の取引の番号 (txid_current()) の行を ops.master_write_sessions に書く (画面のロールはこの表を書けない)
+--      ・画面のロールが書ける表 (core.skus・products・supplier_skus・sku_costs・ops.sku_component_requests・sku_component_breaches・master_edit_requests の done) の
+--        BEFORE の trigger: 呼び手が master_edit なら、今の取引の行が無い = 42501・段階が new_open でない = 42501・触った列の持ち主が company でない = 42501
+--      ・変更の記録 (core.audit_master_change) は、呼び手が master_edit なら誰が・request_id・理由をその行から取る (core.actor_* の設定は使わない = 偽れない)
 -- 🚨 この migration は商品の値を何も変えない (列は全部 null で足す・切替の段階は legacy_open から・0026 の関数は同じ記録を書く)
 
 -- 1. 切替の段階と門
@@ -105,14 +119,62 @@ comment on table ops.master_legacy_gate_acks is 'プロセスごとの門の記�
 -- 門の設定 (⑤-3・⑥ で変えるときは create or replace)
 create function ops.master_cutover_required_hosts() returns text[] language sql immutable as $$ select array['minipc', 'render']::text[] $$;
 create function ops.master_cutover_ack_fresh_minutes() returns integer language sql immutable as $$ select 15 $$;
--- この時間より前に最後の記録があるプロセスは、もう居ないとみなす (それより新しい記録のあるプロセスは、新しい記録か止まった記録が要る)
-create function ops.master_cutover_ack_silent_hours() returns integer language sql immutable as $$ select 24 $$;
 
--- 段階を進める前にそろっているべきもの (差し込み口)。既定 = 問題なし。後の migration が create or replace で「まだの項目」を返す (空でなければ段階を進めない)
+-- 段階を進める前にそろっているべきもの (前提の差し込み口・#1563 R3)。後の migration は表に 1 行足す (関数を create or replace しない = 前の項目を消さない):
+--   insert into ops.master_cutover_prereq_checks (name, fn) values ('0051_backfill', 'ops.my_check(text, text)');
+--   関数 = ops の中・この表と同じ持ち主・(p_from text, p_to text) returns text[] (問題の文の配列・無ければ空)。それ以外は足せない (trigger)。書けるのは表の持ち主だけ
+create table ops.master_cutover_prereq_checks (
+  name     text primary key check (name ~ '^[a-z0-9_.:-]{1,80}$'),
+  fn       regprocedure not null,
+  added_at timestamptz not null default now()
+);
+comment on table ops.master_cutover_prereq_checks is '切替の段階を進める前提の関数の一覧 (0050・#1563 R3)。ops.master_cutover_prereq_problems が全部呼ぶ。後の migration は 1 行足す';
+
+-- 関数が前提の関数として使ってよい形か (ops の中・表の持ち主の関数・(text, text) returns text[]・ふつうの関数・自分自身でない)。だめなら理由、よければ null
+create function ops.master_cutover_prereq_fn_problem(p_fn regprocedure) returns text
+  language sql stable set search_path = pg_catalog, pg_temp as $$
+  select case
+    when p.oid is null then '関数が無い'
+    when n.nspname <> 'ops' then format('関数が ops の中に無い (%s)', n.nspname)
+    when p.proowner <> (select c.relowner from pg_catalog.pg_class c where c.oid = 'ops.master_cutover_prereq_checks'::regclass) then '関数の持ち主が表の持ち主でない'
+    when p.prokind <> 'f' or p.pronargs <> 2 or p.proargtypes::text <> '25 25' or p.prorettype <> 'text[]'::regtype then '関数の形が (p_from text, p_to text) returns text[] でない'
+    when p.proname in ('master_cutover_prereq_problems', 'set_master_cutover_phase') then '集める関数・段階の関数そのものは足せない'
+  end
+  from (select p_fn::oid as oid) x
+  left join pg_catalog.pg_proc p on p.oid = x.oid
+  left join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+$$;
+
+create function ops.guard_master_cutover_prereq_checks() returns trigger language plpgsql set search_path = pg_catalog, ops, pg_temp as $$
+declare
+  v_bad text;
+begin
+  if tg_op = 'DELETE' then return old; end if;
+  v_bad := ops.master_cutover_prereq_fn_problem(new.fn);
+  if v_bad is not null then raise exception 'prereq_check_invalid: % (%)', v_bad, new.fn using errcode = '42501'; end if;
+  return new;
+end $$;
+create trigger trg_master_cutover_prereq_checks_guard before insert or update on ops.master_cutover_prereq_checks
+  for each row execute function ops.guard_master_cutover_prereq_checks();
+
+-- 足された前提の関数を名前の順に全部呼び、問題を「名前: 問題」でつなげて返す (空 = 進めてよい)。呼ぶ直前にも形を確かめる (後で持ち主・場所が変わった = 問題として返す = 進めない)
 create function ops.master_cutover_prereq_problems(p_from text, p_to text) returns text[]
   language plpgsql stable security definer set search_path = pg_catalog, ops, pg_temp as $$
+declare
+  r      record;
+  v_out  text[] := '{}';
+  v_bad  text;
+  v_name text;
+  v_res  text[];
 begin
-  return array[]::text[];
+  for r in select c.name, c.fn from ops.master_cutover_prereq_checks c order by c.name loop
+    v_bad := ops.master_cutover_prereq_fn_problem(r.fn);
+    if v_bad is not null then v_out := array_append(v_out, format('%s: 前提の関数が使えない (%s)', r.name, v_bad)); continue; end if;
+    select format('%I.%I', n.nspname, p.proname) into v_name from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where p.oid = r.fn::oid;
+    execute format('select %s($1::text, $2::text)', v_name) into v_res using p_from, p_to;
+    v_out := v_out || coalesce((select array_agg(format('%s: %s', r.name, x) order by o) from unnest(v_res) with ordinality as u(x, o) where x is not null), '{}');
+  end loop;
+  return v_out;
 end $$;
 revoke all on function ops.master_cutover_prereq_problems(text, text) from public;
 
@@ -135,6 +197,15 @@ begin
   return true;
 exception when others then
   return false;
+end $$;
+-- 証拠の時刻が読めて、p_after より後・p_upto 以前か (読めなければ false。順に確かめる = 読めない文字を時刻にしない)
+create function ops.cutover_ts_between(p text, p_after timestamptz, p_upto timestamptz) returns boolean language plpgsql stable set search_path = pg_catalog, ops, pg_temp as $$
+declare
+  v timestamptz;
+begin
+  if not ops.cutover_is_ts(p) then return false; end if;
+  v := p::timestamptz;
+  return v > p_after and v <= p_upto;
 end $$;
 
 -- 古い入口の一覧の形 (entries = 1 つ以上・id は一意・kind = code / manual)。正しければハッシュ、違えば例外
@@ -205,7 +276,6 @@ declare
   v_hash    text;
   v_hosts   text[] := ops.master_cutover_required_hosts();
   v_fresh   interval := make_interval(mins => ops.master_cutover_ack_fresh_minutes());
-  v_silent  interval := make_interval(hours => ops.master_cutover_ack_silent_hours());
   v_now     timestamptz := clock_timestamp();
   v_manifest text;
   v_owner   text;
@@ -257,12 +327,19 @@ begin
     if e is null or jsonb_typeof(e) <> 'object' or (e ->> 'done') is distinct from 'true' or coalesce(length(e ->> 'checked_by'), 0) = 0 or not ops.cutover_is_ts(e ->> 'checked_at') then
       raise exception 'evidence_invalid: drain = { done: true, checked_by, checked_at } が要る' using errcode = '22023';
     end if;
+    -- 証拠の時刻は今の段階に入った後・サーバーの今以前 (#1563 R3 High 1。前の切替の試み・先の日付の書き込みを使い回さない)
+    if not ops.cutover_ts_between(e ->> 'checked_at', v_since, v_now) then
+      raise exception 'evidence_invalid: drain.checked_at (%) は今の段階に入った後 (%)・今 (%) 以前', e ->> 'checked_at', v_since, v_now using errcode = '22023';
+    end if;
     -- 手の入口を止めた一覧 = manifest の手の入口 (kind = manual) と完全に同じ集合
     e := p_evidence -> 'manual_entries_stopped';
     if e is null or jsonb_typeof(e) <> 'array' then raise exception 'evidence_invalid: manual_entries_stopped = [{ id, by, at }, ...] が要る' using errcode = '22023'; end if;
     if exists (select 1 from jsonb_array_elements(e) x
                 where jsonb_typeof(x) <> 'object' or coalesce(length(x ->> 'id'), 0) = 0 or coalesce(length(x ->> 'by'), 0) = 0 or not ops.cutover_is_ts(x ->> 'at')) then
       raise exception 'evidence_invalid: manual_entries_stopped の各行に id・by・at が要る' using errcode = '22023';
+    end if;
+    if exists (select 1 from jsonb_array_elements(e) x where not ops.cutover_ts_between(x ->> 'at', v_since, v_now)) then
+      raise exception 'evidence_invalid: manual_entries_stopped の at は今の段階に入った後 (%)・今 (%) 以前', v_since, v_now using errcode = '22023';
     end if;
     select coalesce(array_agg(x ->> 'id' order by x ->> 'id'), '{}'), count(*) into v_got, v_n from jsonb_array_elements(e) x;
     if v_n <> (select count(distinct x ->> 'id') from jsonb_array_elements(e) x) then raise exception 'evidence_invalid: manual_entries_stopped の id が重なっている' using errcode = '22023'; end if;
@@ -272,13 +349,13 @@ begin
     end if;
   end if;
 
-  -- 門: 場所ごと・プロセスごとの最後の記録 (ops.master_cutover_ack_silent_hours() 時間以内に記録のあるプロセス全部)。
+  -- 門: 場所ごと・今までに記録のある全部のプロセスの最後の記録 (年齢で外さない = 25 時間前に黙ったプロセスも止まった記録が要る。#1563 R3 High 1)。
   --   止まった記録 = 外す / 新しい記録 (fresh 分以内) = 下の検査 / それより前 = 黙っている = 拒む (#1563 仮レビュー Low 3)
   v_problems := '{}';
   foreach v_host in array v_hosts loop
     v_n := 0;
     for a in select distinct on (k.instance_id) k.* from ops.master_legacy_gate_acks k
-               where k.host = v_host and k.acked_at >= v_now - v_silent
+               where k.host = v_host
                order by k.instance_id, k.acked_at desc, k.ack_id desc loop
       if a.stopped then
         v_acks := v_acks || jsonb_build_array(jsonb_build_object('ack_id', a.ack_id, 'host', a.host, 'instance_id', a.instance_id, 'build_id', a.build_id, 'acked_at', a.acked_at, 'stopped', true));
@@ -295,7 +372,7 @@ begin
       if a.owner_hash is distinct from v_owner then v_problems := array_append(v_problems, format('%s/%s: 持ち主表のハッシュが違う', v_host, a.instance_id)); end if;
       if a.phase_seen is distinct from v_from then v_problems := array_append(v_problems, format('%s/%s: 見た段階が %s (今は %s)', v_host, a.instance_id, a.phase_seen, v_from)); end if;
       if p_to <> 'frozen' and a.acked_at <= v_since then v_problems := array_append(v_problems, format('%s/%s: 記録が今の段階に入る前', v_host, a.instance_id)); end if;
-      if p_to <> 'frozen' and a.inflight_count <> 0 then v_problems := array_append(v_problems, format('%s/%s: 書きかけが %s 件ある', v_host, a.instance_id, a.inflight_count)); end if;
+      if a.inflight_count <> 0 then v_problems := array_append(v_problems, format('%s/%s: 書きかけが %s 件ある', v_host, a.instance_id, a.inflight_count)); end if;   -- → frozen も (#1563 R3 High 1)
       v_acks := v_acks || jsonb_build_array(jsonb_build_object('ack_id', a.ack_id, 'host', a.host, 'instance_id', a.instance_id, 'build_id', a.build_id, 'acked_at', a.acked_at));
     end loop;
     if v_n = 0 then v_problems := array_append(v_problems, format('%s: %s 分以内の記録が無い', v_host, ops.master_cutover_ack_fresh_minutes())); end if;
@@ -443,10 +520,40 @@ end $$;
 create trigger trg_sku_component_breaches_guard before update or delete on ops.sku_component_breaches
   for each row execute function ops.guard_sku_component_breaches();
 
+-- 数が厳密な整数か (jsonb の number・小数点や指数の形でない・lo〜hi)。0.6・1.0・-1 = false (#1563 R3 M3)
+create function ops.ne_obs_int_ok(p jsonb, lo integer, hi integer) returns boolean language plpgsql immutable set search_path = pg_catalog, pg_temp as $$
+begin
+  if p is null or jsonb_typeof(p) <> 'number' or (p #>> '{}') !~ '^[0-9]{1,9}$' then return false; end if;
+  return (p #>> '{}')::integer between lo and hi;
+end $$;
+
+-- 1 つのセットの行の形 (どの回でも): 配列・100 行まで・各行 = { code (空でない), qty (1〜99,999 の整数), sort (整数) }・sort はセットの中で 1〜N (送り手が NE の並びに 1 から振る)。
+-- だめなら理由、よければ null。順に確かめる (整数と分かってから数として比べる)
+create function ops.ne_set_rows_problem(p_rows jsonb) returns text language plpgsql immutable set search_path = pg_catalog, ops, pg_temp as $$
+declare
+  v_n integer;
+begin
+  if p_rows is null or jsonb_typeof(p_rows) <> 'array' then return '行が配列でない'; end if;
+  v_n := jsonb_array_length(p_rows);
+  if v_n > 100 then return '行が 100 より多い'; end if;
+  if exists (select 1 from jsonb_array_elements(p_rows) r
+              where jsonb_typeof(r) <> 'object' or coalesce(length(r ->> 'code'), 0) = 0
+                 or not ops.ne_obs_int_ok(r -> 'qty', 1, 99999) or not ops.ne_obs_int_ok(r -> 'sort', 1, 100)) then
+    return '行の形が違う (code・qty = 1〜99,999 の整数・sort = 1 以上の整数)';
+  end if;
+  if (select count(distinct (r ->> 'sort')::integer) <> v_n or max((r ->> 'sort')::integer) <> v_n from jsonb_array_elements(p_rows) r) then
+    return '並び (sort) が 1〜行の数になっていない';
+  end if;
+  return null;
+end $$;
+
 -- NE のセットの構成の観測を 1 回分書く (観測のロール master_observer だけ・⑤-2 で夜間ロードから呼ぶ)。
 -- p = { run_id, observed_at, complete, requested, fetched, raw_hash, source_generation, sets: [{ set_code, rows: [{ code, qty, sort }] }] }
--- 完全な回 (complete = true) は、知らないセット・セットでない SKU・重なるセット・行の形の誤り・重なる構成品・重なる並び・知らない構成品を 1 つも許さない (拒む)。
+-- 完全な回 (complete = true) は、知らないセット・セットでない SKU・重なるセット・行の形の誤り・重なる構成品・知らない構成品を 1 つも許さない (拒む)。
 --   完全でない回は、残せないセットを飛ばして数える (上げる根拠には使わない)。同じ run_id の再送 = 中身が同じなら何もしない・違えば拒む
+--   requested / fetched = 0〜1,000,000 の整数 (完全な回は要る・完全でない回もあれば同じ形)。qty・sort は ops.ne_set_rows_problem (#1563 R3 M3)
+-- 鍵: 回の鍵 → 残すセットの SKU ごとの鍵 (sku_id の順・lib/master-write.mjs の SKU_LOCK_SQL と同じ数) → 書く (#1563 R3 M4。昇格は段階 → マスタの書き込み → SKU → CSV の順で、
+--   ここは SKU の鍵だけを取る = 逆の順にならない。古い観測の昇格が終わるまで新しい観測は書けない / 新しい観測を書いた後の昇格はそれを見る)
 -- 🚨 security definer (呼ぶロールに表の書き込みの権限を渡さない)。一時の表を使わない・search_path の最後に pg_temp
 create function ops.record_ne_set_observations(p jsonb) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, ops, core, pg_temp as $$
@@ -459,10 +566,12 @@ declare
   v_saved    integer := 0;
   v_skip     integer := 0;
   v_seen     bigint[] := '{}';
+  v_ok       jsonb := '[]'::jsonb;   -- 残すセット [{ set_id, rows }]
   s          jsonb;
   v_set      bigint;
   v_rows     jsonb;
   v_bad      text;
+  x          bigint;
 begin
   if v_run is null or v_run !~ '^[A-Za-z0-9_.:-]{1,80}$' then raise exception 'invalid_input: run_id の形が違う: %', v_run using errcode = '22023'; end if;
   if not ops.cutover_is_ts(p ->> 'observed_at') then raise exception 'invalid_input: observed_at が読めない' using errcode = '22023'; end if;
@@ -472,8 +581,12 @@ begin
   if jsonb_typeof(p -> 'complete') is distinct from 'boolean' then raise exception 'invalid_input: complete (true / false) が要る' using errcode = '22023'; end if;
   v_complete := (p ->> 'complete')::boolean;
   if jsonb_typeof(p -> 'sets') is distinct from 'array' then raise exception 'invalid_input: sets が配列でない' using errcode = '22023'; end if;
+  if (p -> 'requested' is not null and jsonb_typeof(p -> 'requested') <> 'null' and not ops.ne_obs_int_ok(p -> 'requested', 0, 1000000))
+     or (p -> 'fetched' is not null and jsonb_typeof(p -> 'fetched') <> 'null' and not ops.ne_obs_int_ok(p -> 'fetched', 0, 1000000)) then
+    raise exception 'invalid_input: requested・fetched は 0〜1,000,000 の整数' using errcode = '22023';
+  end if;
   if v_complete then
-    if jsonb_typeof(p -> 'requested') is distinct from 'number' or jsonb_typeof(p -> 'fetched') is distinct from 'number'
+    if not ops.ne_obs_int_ok(p -> 'requested', 0, 1000000) or not ops.ne_obs_int_ok(p -> 'fetched', 0, 1000000)
        or (p ->> 'requested')::integer <> jsonb_array_length(p -> 'sets') or (p ->> 'fetched')::integer <> jsonb_array_length(p -> 'sets') then
       raise exception 'invalid_input: 完全な回は requested = fetched = sets の数 が要る' using errcode = '22023';
     end if;
@@ -488,19 +601,19 @@ begin
     if v_prev = v_hash then return jsonb_build_object('state', 'unchanged', 'run_id', v_run); end if;
     raise exception 'run_conflict: 同じ回 % の中身が違う', v_run using errcode = '23505';
   end if;
-  -- 先に回の行 (数は後で入れられない = 追記だけ) を作るため、セットを先に確かめて数える
+  -- 先に回の行 (数は後で入れられない = 追記だけ) を作るため、セットを先に確かめて数える (残すセットは v_ok に)
   for s in select * from jsonb_array_elements(p -> 'sets') loop
     v_bad := null;
     select k.sku_id into v_set from core.skus k where k.code_norm = core.norm_code(s ->> 'set_code') and k.sku_kind = 'set';
     if not found then v_bad := format('知らないセット・セットでない %s', s ->> 'set_code');
     elsif v_set = any(v_seen) then v_bad := format('同じセットが 2 回 %s', s ->> 'set_code');
-    elsif jsonb_typeof(s -> 'rows') is distinct from 'array' then v_bad := format('行が配列でない %s', s ->> 'set_code');
-    elsif exists (select 1 from jsonb_array_elements(s -> 'rows') r
-                   where coalesce(length(r ->> 'code'), 0) = 0 or jsonb_typeof(r -> 'qty') is distinct from 'number' or jsonb_typeof(r -> 'sort') is distinct from 'number') then
-      v_bad := format('行の形が違う %s', s ->> 'set_code');
-    elsif v_complete and ((select count(*) <> count(distinct core.norm_code(r ->> 'code')) or count(*) <> count(distinct (r ->> 'sort')::numeric) from jsonb_array_elements(s -> 'rows') r)
-                          or exists (select 1 from jsonb_array_elements(s -> 'rows') r where not exists (select 1 from core.skus k where k.code_norm = core.norm_code(r ->> 'code')))) then
-      v_bad := format('構成品・並びが重なる / 知らない構成品 %s', s ->> 'set_code');
+    else
+      v_bad := ops.ne_set_rows_problem(s -> 'rows');
+      if v_bad is not null then v_bad := format('%s %s', v_bad, s ->> 'set_code');
+      elsif v_complete and ((select count(*) <> count(distinct core.norm_code(r ->> 'code')) from jsonb_array_elements(s -> 'rows') r)
+                            or exists (select 1 from jsonb_array_elements(s -> 'rows') r where not exists (select 1 from core.skus k where k.code_norm = core.norm_code(r ->> 'code')))) then
+        v_bad := format('構成品・並びが重なる / 知らない構成品 %s', s ->> 'set_code');
+      end if;
     end if;
     if v_bad is not null then
       if v_complete then raise exception 'invalid_input: 完全な回に残せないセットがある: %', v_bad using errcode = '22023'; end if;
@@ -508,25 +621,22 @@ begin
       continue;
     end if;
     v_seen := array_append(v_seen, v_set);
+    v_ok := v_ok || jsonb_build_array(jsonb_build_object('set_id', v_set, 'rows', s -> 'rows'));
+  end loop;
+  -- 残すセットの SKU ごとの鍵 (sku_id の小さい順。昇格と同じ鍵 = 古い観測の昇格と並ぶ・#1563 R3 M4)
+  for x in select u.id from unnest(v_seen) as u(id) order by u.id loop
+    perform pg_advisory_xact_lock(hashtextextended('core.sku:' || x::text, 0));
   end loop;
   insert into ops.ne_set_observation_runs (run_id, observed_at, complete, requested_count, fetched_count, saved_count, skipped_count, raw_hash, source_generation, content_hash)
     values (v_run, v_at, v_complete, (p ->> 'requested')::integer, (p ->> 'fetched')::integer, coalesce(array_length(v_seen, 1), 0), v_skip,
             nullif(p ->> 'raw_hash', ''), nullif(p ->> 'source_generation', ''), v_hash);
-  v_seen := '{}';
-  for s in select * from jsonb_array_elements(p -> 'sets') loop
-    select k.sku_id into v_set from core.skus k where k.code_norm = core.norm_code(s ->> 'set_code') and k.sku_kind = 'set';
-    if not found or v_set = any(v_seen) or jsonb_typeof(s -> 'rows') is distinct from 'array'
-       or exists (select 1 from jsonb_array_elements(s -> 'rows') r
-                   where coalesce(length(r ->> 'code'), 0) = 0 or jsonb_typeof(r -> 'qty') is distinct from 'number' or jsonb_typeof(r -> 'sort') is distinct from 'number') then
-      continue;
-    end if;
-    v_seen := array_append(v_seen, v_set);
+  for s in select * from jsonb_array_elements(v_ok) loop
     select coalesce(jsonb_agg(jsonb_build_object('sku_id', k.sku_id, 'code', r ->> 'code', 'qty', (r ->> 'qty')::integer, 'sort', (r ->> 'sort')::integer)
                               order by (r ->> 'sort')::integer, r ->> 'code'), '[]'::jsonb)
       into v_rows
       from jsonb_array_elements(s -> 'rows') r
       left join core.skus k on k.code_norm = core.norm_code(r ->> 'code');
-    insert into ops.ne_set_observations (run_id, set_sku_id, rows) values (v_run, v_set, v_rows);
+    insert into ops.ne_set_observations (run_id, set_sku_id, rows) values (v_run, (s ->> 'set_id')::bigint, v_rows);
     v_saved := v_saved + 1;
   end loop;
   return jsonb_build_object('state', 'written', 'run_id', v_run, 'sets', v_saved, 'skipped', v_skip);
@@ -600,6 +710,14 @@ declare
   c          text;
   k          text;
 begin
+  -- 画面のロールの書き込みは、誰が・request_id・理由を ops.begin_master_write の行から取る (core.actor_* の設定は使わない = 偽れない。#1563 R3 M2)
+  if v_db_user = 'master_edit' then
+    select s.request_id::text, s.actor_id, s.reason, s.source_system into v_req, v_actor_id, v_reason, v_source
+      from ops.master_write_sessions s where s.txid = pg_catalog.txid_current();
+    if not found then raise exception 'master_write_session_required: 画面のロールの書き込みは ops.begin_master_write の後だけ' using errcode = '42501'; end if;
+    v_actor_t := 'human';
+    v_run := null;
+  end if;
   if tg_op in ('UPDATE','DELETE') then v_old := to_jsonb(old); end if;
   if tg_op in ('INSERT','UPDATE') then v_new := to_jsonb(new); end if;
   v_row := coalesce(v_new, v_old);
@@ -666,10 +784,138 @@ revoke all on function core.lock_suppliers_for_share(bigint[]) from public;
 -- 7. マスタの書き込みの鍵 (上の 7.)。夜間ロードは排他・この画面の保存と構成の依頼の昇格は共有。数は 0036 の core.parent_lock_key() と重ならない固定の数
 create function core.master_write_lock_key() returns bigint language sql immutable as $$ select 4705310050::bigint $$;
 
+-- 8. 画面のロール master_edit の書き込みの約束 (上の 8.・#1563 R3 M2)
+create table ops.master_write_sessions (
+  txid          bigint primary key,   -- txid_current() = 書き込みを始めた取引
+  request_id    uuid not null,
+  actor_id      text not null check (length(actor_id) between 1 and 320),
+  reason        text check (reason is null or length(reason) <= 200),
+  source_system text not null check (source_system = 'portal_master_edit'),
+  db_user       text not null,
+  phase         text not null,
+  owner_hash    text not null check (owner_hash ~ '^[0-9a-f]{64}$'),
+  ownership     jsonb not null check (jsonb_typeof(ownership) = 'object'),
+  created_at    timestamptz not null default clock_timestamp()
+);
+select core.make_append_only('ops', 'master_write_sessions');
+comment on table ops.master_write_sessions is '画面のロールの書き込みを始めた取引 (0050・#1563 R3 M2)。書くのは ops.begin_master_write だけ。guard と変更の記録がこの行を見る';
+
+-- 持ち主表のハッシュ (lib/master-cutover.mjs の ownershipHash と同じ = キーの順に [キー, 値] の配列を JSON にした sha256)
+create function ops.ownership_hash(p jsonb) returns text language sql immutable set search_path = pg_catalog, pg_temp as $$
+  select encode(sha256(convert_to('[' || coalesce(string_agg('[' || to_json(t.k)::text || ',' || to_json(t.v)::text || ']', ',' order by t.k collate "C"), '') || ']', 'UTF8')), 'hex')
+    from jsonb_each_text(p) as t(k, v)
+$$;
+
+-- 画面の保存を始める (同じ取引で、画面のロールが書く前に 1 回)。段階が new_open かつ持ち主表 (呼び手が動かしている表) のハッシュが段階の記録と同じときだけ、
+-- 今の取引の行を書く。MASTER_EDIT_OPEN (env) は画面が見る。誰が・理由はここで決まり、変更の記録はこれを使う
+-- 🚨 security definer (画面のロールに ops.master_write_sessions の書き込みを渡さない)。一時の表を使わない・search_path の最後に pg_temp
+create function ops.begin_master_write(p_request_id uuid, p_actor_id text, p_reason text, p_ownership jsonb) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, ops, pg_temp as $$
+declare
+  v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
+  v_phase   text;
+  v_owner   text;
+  v_hash    text;
+  v_tx      bigint := pg_catalog.txid_current();
+begin
+  perform pg_advisory_xact_lock_shared(hashtext('ops.master_cutover'));   -- 段階を変える取引と並ぶ (画面は先に取っている = 同じ鍵)
+  if p_request_id is null then raise exception 'invalid_input: request_id が要る' using errcode = '22023'; end if;
+  if p_actor_id is null or length(btrim(p_actor_id)) = 0 or length(p_actor_id) > 320 or p_actor_id ~ '[[:cntrl:]]' then
+    raise exception 'invalid_input: 保存する人 (actor_id) の形が違う' using errcode = '22023';
+  end if;
+  if p_reason is not null and length(p_reason) > 200 then raise exception 'invalid_input: 理由は 200 字まで' using errcode = '22023'; end if;
+  if p_ownership is null or jsonb_typeof(p_ownership) <> 'object'
+     or exists (select 1 from jsonb_each(p_ownership) e where jsonb_typeof(e.value) <> 'string' or (e.value #>> '{}') not in ('load', 'company')) then
+    raise exception 'invalid_input: 持ち主表 ({ キー: load / company }) が要る' using errcode = '22023';
+  end if;
+  select phase, owner_hash into v_phase, v_owner from ops.master_cutover_state where id = 1;
+  v_hash := ops.ownership_hash(p_ownership);
+  if v_phase is distinct from 'new_open' then
+    raise exception 'before_cutover: 切替の段階が % (new_open でない)', coalesce(v_phase, '読めない') using errcode = 'P0001';
+  end if;
+  if v_owner is distinct from v_hash then raise exception 'before_cutover: 持ち主表が切替のときの記録と違う' using errcode = 'P0001'; end if;
+  if exists (select 1 from ops.master_write_sessions where txid = v_tx) then
+    raise exception 'master_write_session_exists: この取引ではもう書き込みを始めている' using errcode = '55000';
+  end if;
+  insert into ops.master_write_sessions (txid, request_id, actor_id, reason, source_system, db_user, phase, owner_hash, ownership)
+    values (v_tx, p_request_id, p_actor_id, nullif(p_reason, ''), 'portal_master_edit', v_db_user, v_phase, v_hash, p_ownership);
+  return jsonb_build_object('txid', v_tx, 'phase', v_phase);
+end $$;
+revoke all on function ops.begin_master_write(uuid, text, text, jsonb) from public;
+
+-- 画面のロールが触った列 → 持ち主表のキー (lib/master-write.mjs の SINGLE_FIELDS / SET_FIELDS と同じ。⑤-2a の新しい行の INSERT も = 値のある列)
+create function ops.master_edit_owner_keys(p_table text, p_op text, p_old jsonb, p_new jsonb) returns text[]
+  language sql immutable set search_path = pg_catalog, pg_temp as $$
+  select coalesce(array_agg(distinct m.k order by m.k), '{}')
+    from (values
+      ('core.skus', 'name', 'skus.name'), ('core.skus', 'sku_kind', 'skus.sku_kind'), ('core.skus', 'tax_rate', 'skus.tax_rate'), ('core.skus', 'tax_class', 'skus.tax_class'),
+      ('core.skus', 'handling', 'skus.handling'), ('core.skus', 'handling_own', 'skus.handling'), ('core.skus', 'standard_price_jpy', 'skus.standard_price'),
+      ('core.skus', 'shipping_code', 'skus.shipping'), ('core.skus', 'shipping_method', 'skus.shipping'), ('core.skus', 'shipping_cost_jpy', 'skus.shipping'),
+      ('core.skus', 'reorder_months', 'skus.reorder_months'), ('core.skus', 'set_sales_class_override', 'products.sales_class'),
+      ('core.products', 'name', 'products.name'), ('core.products', 'status', 'products.status'), ('core.products', 'sales_class', 'products.sales_class'),
+      ('core.products', 'parent_product_id', 'products.parent'), ('core.products', 'parent_set_by', 'products.parent'),
+      ('core.supplier_skus', '*', 'supplier_skus.is_primary'), ('core.sku_costs', '*', 'sku_costs'),
+      ('ops.sku_component_requests', '*', 'sku_components'), ('ops.sku_component_breaches', '*', 'sku_components')) as m(tbl, col, k)
+   where m.tbl = p_table
+     and (m.col = '*'
+          or (p_op = 'UPDATE' and (p_old -> m.col) is distinct from (p_new -> m.col))
+          or (p_op = 'INSERT' and coalesce(p_new -> m.col, 'null'::jsonb) <> 'null'::jsonb)
+          or (p_op = 'DELETE' and coalesce(p_old -> m.col, 'null'::jsonb) <> 'null'::jsonb))
+$$;
+
+-- 画面のロールが書く表の BEFORE の守り。呼び手 (SET ROLE の役 か ログインした役) が master_edit のときだけ見る (夜間ロード・昇格・ほかの書き手は今までどおり)
+--   ・同じ取引に ops.begin_master_write の行が無い = 42501 (保存の記録の failed だけは無くてよい = 切替前の 409 も残す。done は同じ request_id・人だけ)
+--   ・段階が new_open でない = 42501 / 触った列の持ち主が company でない (始めたときの持ち主表で) = 42501
+-- 🚨 security definer (画面のロールに ops.master_write_sessions を読ませない)。security definer の関数 (0026 の version の付け替え) の中の書き込みも呼び手は master_edit = 同じ取引の行で通る
+create function ops.guard_master_edit_write() returns trigger
+  language plpgsql security definer set search_path = pg_catalog, ops, core, pg_temp as $$
+declare
+  v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
+  v_tbl     text := tg_table_schema || '.' || tg_table_name;
+  v_old     jsonb;
+  v_new     jsonb;
+  v_sess    ops.master_write_sessions%rowtype;
+  v_has     boolean;
+  k         text;
+begin
+  if v_db_user is distinct from 'master_edit' then return case when tg_op = 'DELETE' then old else new end; end if;
+  if tg_op in ('UPDATE', 'DELETE') then v_old := to_jsonb(old); end if;
+  if tg_op in ('INSERT', 'UPDATE') then v_new := to_jsonb(new); end if;
+  select * into v_sess from ops.master_write_sessions where txid = pg_catalog.txid_current();
+  v_has := found;
+  if v_tbl = 'ops.master_edit_requests' then
+    if tg_op = 'INSERT' and (v_new ->> 'status') = 'failed' then return new; end if;
+    if not v_has or tg_op <> 'INSERT' or (v_new ->> 'request_id')::uuid is distinct from v_sess.request_id or (v_new ->> 'actor_id') is distinct from v_sess.actor_id then
+      raise exception 'master_write_session_required: 保存の記録 (done) は、同じ取引で ops.begin_master_write をした request_id と人だけ' using errcode = '42501';
+    end if;
+    return new;
+  end if;
+  if not v_has then
+    raise exception 'master_write_session_required: 画面のロールの書き込み (%) は、同じ取引で ops.begin_master_write を呼んだ後だけ', v_tbl using errcode = '42501';
+  end if;
+  if (select phase from ops.master_cutover_state where id = 1) is distinct from 'new_open' then
+    raise exception 'before_cutover: 切替の段階が new_open でない (%)', v_tbl using errcode = '42501';
+  end if;
+  foreach k in array ops.master_edit_owner_keys(v_tbl, tg_op, v_old, v_new) loop
+    if (v_sess.ownership ->> k) is distinct from 'company' then
+      raise exception 'owner_not_company: % の持ち主が company でない (%)', k, v_tbl using errcode = '42501';
+    end if;
+  end loop;
+  return case when tg_op = 'DELETE' then old else new end;
+end $$;
+revoke all on function ops.guard_master_edit_write() from public;
+create trigger trg_master_edit_guard before insert or update or delete on core.skus for each row execute function ops.guard_master_edit_write();
+create trigger trg_master_edit_guard before insert or update or delete on core.products for each row execute function ops.guard_master_edit_write();
+create trigger trg_master_edit_guard before insert or update or delete on core.supplier_skus for each row execute function ops.guard_master_edit_write();
+create trigger trg_master_edit_guard before insert or update or delete on core.sku_costs for each row execute function ops.guard_master_edit_write();
+create trigger trg_master_edit_guard before insert or update or delete on ops.sku_component_requests for each row execute function ops.guard_master_edit_write();
+create trigger trg_master_edit_guard before insert or update or delete on ops.sku_component_breaches for each row execute function ops.guard_master_edit_write();
+create trigger trg_master_edit_guard before insert on ops.master_edit_requests for each row execute function ops.guard_master_edit_write();
+
 -- 読むだけの見張り (watcher)。書くロール (master_edit・master_ops・master_observer・master_gate) の権限は scripts/company-db/create-master-edit-roles.mjs が付ける
 do $$ begin
   if exists (select 1 from pg_roles where rolname = 'watcher') then
     execute 'grant select on ops.master_cutover_state, ops.master_cutover_events, ops.master_legacy_manifests, ops.master_legacy_gate_acks, ops.master_edit_requests,
-      ops.sku_component_requests, ops.ne_set_observation_runs, ops.ne_set_observations, ops.sku_component_breaches to watcher';
+      ops.sku_component_requests, ops.ne_set_observation_runs, ops.ne_set_observations, ops.sku_component_breaches, ops.master_write_sessions, ops.master_cutover_prereq_checks to watcher';
   end if;
 end $$;

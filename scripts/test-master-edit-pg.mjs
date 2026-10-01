@@ -25,6 +25,8 @@
  *  14 保存を開いていない = ほかの鍵を取る前に 409 (CSV の鍵・夜間ロードの鍵を持つ人がいても待たない。仮レビュー Low 1)
  *  15 夜間ロード × 保存 (仮レビュー M3): ロードが先 = 保存・昇格はマスタの書き込みの鍵で短く待って 409 nightly_load → ロードは最後まで /
  *     保存が先 = ロードは鍵で待ってから最後まで (行の鍵で待ち合わない = デッドロックしない)
+ *  16 NE の観測の書き込み × 古い観測の昇格 (R3 M4): 昇格がセットの鍵を持っている間、新しい観測の書き込みは待つ (昇格の後に書かれる)
+ *  17 画面のロールの直接の書き込み (R3 M2): begin_master_write の前は 42501・偽の core.actor_* は記録に残らない
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-edit-pg.mjs
  *   (この PC では C:/tmp/pg-embed の run-conc.mjs が使い捨ての PostgreSQL を起動して TEST_PG_URL を渡す)
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロール master_* をクラスタに作る)。localhost 以外の URL は拒む (本番を渡さない)。
@@ -58,7 +60,8 @@ const ALL_COMPANY = Object.fromEntries(Object.keys(MASTER_OWNERSHIP).map((k) => 
 const NOW = new Date('2030-01-10T03:00:00Z');
 /** ⑤-3 の manifest の形 ({ entries: [{ id, kind }] }・ASCII の id。手の入口 = ne:item-screen・gas:logizard-sheet-and-sku-map) */
 const MANIFEST = { entries: [{ id: 'warehouse.register.post', kind: 'code' }, { id: 'ne:item-screen', kind: 'manual' }, { id: 'gas:logizard-sheet-and-sku-map', kind: 'manual' }] };
-const MANUAL_STOPPED = [{ id: 'gas:logizard-sheet-and-sku-map', by: 't', at: '2030-01-09' }, { id: 'ne:item-screen', by: 't', at: '2030-01-09' }];
+/** 証拠の時刻は今の段階に入った後・サーバーの今以前 (R3 High 1) = 進める直前に作る */
+const manualStopped = () => [{ id: 'gas:logizard-sheet-and-sku-map', by: 't', at: new Date().toISOString() }, { id: 'ne:item-screen', by: 't', at: new Date().toISOString() }];
 const ROLES = ['master_edit', 'master_gate_render', 'master_gate_minipc', 'master_ops', 'master_observer'];   // ログインできるロール (master_gate はまとめ・ログインなし)
 const PW = Object.fromEntries(ROLES.map((r) => [r, `t_${crypto.randomBytes(12).toString('hex')}`]));
 const dbName = `cdb_me_${crypto.randomBytes(4).toString('hex')}`;
@@ -98,7 +101,7 @@ try {
   const builds = { render: ['r1'], minipc: ['m1'] };
   const acks = async (ownership, phase) => { for (const [host, inst, build] of [['render', 'r-a', 'r1'], ['minipc', 'm-a', 'm1']]) await C.recordLegacyGateAck(dbGate[host], { host, instanceId: inst, buildId: build, manifest: MANIFEST, ownership, phaseSeen: phase }); };
   await acks(MASTER_OWNERSHIP, 'legacy_open');
-  const frozenEvidence = { expected_builds: builds, manifest_hash: mh, owner_hash: legacy, manual_entries_stopped: MANUAL_STOPPED, drain: { done: true, checked_by: 't', checked_at: '2030-01-09' } };
+  const frozenEvidence = { expected_builds: builds, manifest_hash: mh, owner_hash: legacy, manual_entries_stopped: manualStopped(), drain: { done: true, checked_by: 't', checked_at: new Date().toISOString() } };
   await ta('[0] 門の記録の場所はログインで決まる・まとめのロールではログインできない・黙っているプロセスは段階を止める → 止まった記録で外れる (→ frozen)', async () => {
     const ack = (db, host, extra = {}) => C.recordLegacyGateAck(db, { host, instanceId: 'r-x', buildId: 'r1', manifest: MANIFEST, ownership: MASTER_OWNERSHIP, phaseSeen: 'legacy_open', ...extra });
     await assert.rejects(() => ack(dbGate.render, 'minipc'), (e) => { assert.equal(e.code, '42501'); assert.match(e.message, /gate_host_mismatch/); return true; });
@@ -202,16 +205,21 @@ try {
   await ta('[6] 保存の途中で接続が切れた = 何も残らない (処理中の行なし) → 同じ request_id でもう一度保存できる', async () => {
     const X = await openPgClient(roleUrl('master_edit'));
     X.on('error', () => {});
+    try {
     const token = await tokenOf('p002');
     const id = crypto.randomUUID();
     const pid = (await X.query('select pg_backend_pid() as p')).rows[0].p;
-    const x = launch(save(pgAdapter(X), 'p002', { name: '切れる保存' }, { token, requestId: id, beforeCommit: async () => { await O.query('select pg_terminate_backend($1)', [pid]); await sleep(300); } }));
+    let terminated = null;
+    const x = launch(save(pgAdapter(X), 'p002', { name: '切れる保存' }, { token, requestId: id,
+      beforeCommit: async () => { terminated = (await O.query('select pg_terminate_backend($1, 5000) as t', [pid])).rows[0].t; } }));   // 切れるまで待つ (PG14+)
     const rx = await x.promise;
+    assert.equal(terminated, true, '接続を切れた');
     assert.ok(rx.err, '切れた保存は失敗');
     assert.equal(Number((await q('select count(*)::int as n from ops.master_edit_requests where request_id = $1', [id]))[0].n), 0);
     assert.notEqual((await q("select name from core.skus where code = 'p002'"))[0].name, '切れる保存');
     const again = await save(dbA, 'p002', { name: '切れる保存' }, { token: await tokenOf('p002'), requestId: id });
     assert.equal(again.ok, true);
+    } finally { try { await X.end(); } catch { /* 切れている */ } }
   });
 
   await ta('[7] 切替の段階を変える取引 (排他の鍵) の途中は、保存が段階の共有の鍵で待つ', async () => {
@@ -426,6 +434,39 @@ try {
     assert.ok(ra.ok, ra.err?.message);
     const rl = await l.promise;
     assert.equal(rl.ok?.ok, true, rl.err?.stack || JSON.stringify(rl.ok?.error));
+  });
+
+  await ta('[16] NE の観測の書き込み × 古い観測の昇格: 昇格がセットの鍵を持っている間、新しい観測の書き込みは待つ → 昇格の後に書かれ、次の昇格はそれを見る', async () => {
+    const A = [{ code: 'p001', qty: 1, sort: 1 }, { code: 'p002', qty: 1, sort: 2 }];
+    const B = [{ code: 'p001', qty: 2, sort: 1 }, { code: 'p002', qty: 1, sort: 2 }];
+    await save(dbA, 'ps01', { components: A.map(({ code, qty }) => ({ code, qty })) }, { token: await tokenOf('ps01') });
+    const a = await observe(A, new Date(Date.now() + 240000).toISOString());
+    const g = gate();
+    const pa = launch(W.promoteComponentRequest(dbO, a, { ownership: ALL_COMPANY, now: NOW, beforeCommit: g.wait }));
+    await sleep(300);
+    const runB = `ne_pg_${++runSeq}`;
+    const pb = launch(W.recordNeSetObservations(dbV, { run_id: runB, observed_at: new Date(Date.now() + 250000).toISOString(), complete: true, requested: 1, fetched: 1,
+      raw_hash: 'c'.repeat(64), source_generation: runB, sets: [{ set_code: 'ps01', rows: B }] }));
+    await sleep(500);
+    assert.equal(pb.done, false, '観測の書き込みは、昇格が持つセットの鍵で待つ');
+    g.open();
+    assert.equal((await pa.promise).ok?.promoted, true);
+    assert.equal((await pb.promise).ok?.state, 'written');
+    assert.deepEqual(await setComps(), ['p001x1', 'p002x1']);
+    const b = (await q('select observation_id::text as id from ops.ne_set_observations where run_id = $1', [runB]))[0].id;
+    assert.equal((await W.promoteComponentRequest(dbO, a, { ownership: ALL_COMPANY, now: NOW })).reason, 'superseded_observation');
+    assert.equal((await W.promoteComponentRequest(dbO, b, { ownership: ALL_COMPANY, now: NOW })).reason, 'unrequested_diff');   // NE がまた変わった = NE でやること
+  });
+
+  await ta('[17] 画面のロールの直接の書き込み: begin_master_write の前は 42501 (偽の core.actor_* を付けても)・偽の記録は残らない', async () => {
+    await A.query('begin');
+    try {
+      await A.query("select set_config('core.actor_type', 'human', true), set_config('core.actor_id', 'forged@evil', true), set_config('core.source_system', 'portal_master_edit', true)");
+      await assert.rejects(() => A.query("update core.skus set name = '偽' where code = 'p003'"), (e) => e.code === '42501' && /master_write_session_required/.test(e.message));
+    } finally { await A.query('rollback'); }
+    await denied(A, "insert into ops.master_write_sessions (txid, request_id, actor_id, source_system, db_user, phase, owner_hash, ownership) values (txid_current(), gen_random_uuid(), 'x', 'portal_master_edit', 'x', 'new_open', repeat('a', 64), '{}')", 'edit: sessions に直接');
+    assert.equal(Number((await q("select count(*)::int as n from events.master_change_events where actor_id = 'forged@evil'"))[0].n), 0);
+    assert.equal(Number((await q("select count(*)::int as n from ops.master_write_sessions where db_user = 'master_edit'"))[0].n) > 10, true);
   });
 } finally {
   for (const c of clients.reverse()) { try { await c.end(); } catch { /* */ } }

@@ -10,12 +10,13 @@
  *   共通の証拠 { expected_builds: { render: [build_id, ...], minipc: [...] }, manifest_hash, owner_hash }
  *     + 門の記録 (ops.master_legacy_gate_acks・古い入口の門 = ⑤-3 が起動時と定期に書く・ログインは場所ごと) が、各場所に 15 分以内に 1 つ以上あり、
  *       直近 15 分に記録した全部の実体 (instance_id) の build が expected_builds にあり、manifest_hash・owner_hash が証拠と同じ。
- *       24 時間以内に記録があるのに最後の記録が 15 分より前の実体 (黙っている) があれば進めない = 止めた実体は stopped の記録を書く (⑤-3 の CLI・正しく終わるとき)
+ *       今までに記録のある実体で、最後の記録が 15 分より前 (黙っている・何日前でも) のものがあれば進めない = 止めた実体は stopped の記録を書く (⑤-3 の CLI・正しく終わるとき)
  *   → frozen:        + manual_entries_stopped: [{ id, by, at }, ...] (id の集まり = manifest の手の入口 kind='manual' と完全に同じ)
  *                    + drain: { done: true, checked_by, checked_at }。owner_hash = いまの持ち主表 (全部 load) のハッシュ
+ *                    checked_at・at は今の段階に入った後でサーバーの今以前 (先の日付・前の試みの証拠は使えない)。書きかけ 0 も (#1563 R3)
  *   → company_owner: owner_hash = 新しい持ち主表のハッシュ。門の記録は frozen に入った後・phase_seen = 'frozen'・処理中 0
  *   → new_open:      owner_hash は company_owner と同じ。門の記録は company_owner に入った後・phase_seen = 'company_owner'・処理中 0
- *   ops.master_cutover_prereq_problems(from, to) が問題を返したら、どの段階も進めない (後の PR が条件を足す口)
+ *   ops.master_cutover_prereq_problems(from, to) が問題を返したら、どの段階も進めない (後の PR は ops.master_cutover_prereq_checks に関数を 1 行足す)
  * 🚨 --to は切替日の手順書の順番でだけ使う (定期実行にしない)。--yes が無ければ何もしない
  * 終了コード: 0 = 成功 / 1 = 失敗 / 2 = 引数不正
  */

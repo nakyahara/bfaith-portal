@@ -5,6 +5,7 @@
  *
  * master_edit     (Render の apps/master-edit が env COMPANY_DB_MASTER_EDIT_URL で使う。無ければ画面は見るだけ):
  *   読む: 画面が読む表だけ (MASTER_EDIT_SELECT) / 書く: 保存の経路で書く表の列だけ (MASTER_EDIT_WRITE。insert も列を絞る)
+ *   🚨 書けるのは同じ取引で ops.begin_master_write (実行だけ渡す) を呼んだ後だけ (DB の trigger。段階・持ち主表・誰が を DB で守る・#1563 R3 M2)
  *   🚨 渡さない: events.master_change_events の insert (記録は 0026 の関数 = security definer が書く = 偽れない)・core.skus.version・core.sku_components の書き込み・
  *      切替の段階・門の記録・NE の観測の書き込み。core.sku_costs の削除は渡すが、今日より前の行は DB の trigger が拒む (0050)
  *      core.suppliers の update (仕入先の行の共有の鍵は 0050 の関数 core.lock_suppliers_for_share = security definer の実行だけ)
@@ -36,7 +37,7 @@ export const MASTER_LOGIN_ROLES = Object.freeze(['master_edit', 'master_gate_min
 /** まとめのロール (ログインできない・パスワードなし) */
 export const MASTER_GROUP_ROLES = Object.freeze(['master_gate']);
 export const MASTER_EDIT_ROLES = Object.freeze([...MASTER_LOGIN_ROLES, ...MASTER_GROUP_ROLES].sort());
-const CONN_LIMIT = { master_edit: 5, master_ops: 2, master_observer: 2, master_gate_render: 4, master_gate_minipc: 4 };
+const CONN_LIMIT = { master_edit: 5, master_ops: 2, master_observer: 2, master_gate_render: 8, master_gate_minipc: 8 };   // 門: プロセス・CLI が同時に記録を書く (⑤-3)
 /** まとめのロールのメンバー (INHERIT = まとめのロールの権限をそのまま使う) */
 const MEMBER_OF = { master_gate_render: 'master_gate', master_gate_minipc: 'master_gate' };
 /** ロールごとの設定 (master_edit = 画面の接続と同じ値。apps/master-edit/router.mjs の connect) */
@@ -66,6 +67,8 @@ export const CUTOVER_FUNCTION = 'ops.set_master_cutover_phase(text, text, jsonb,
 export const OBSERVE_FUNCTION = 'ops.record_ne_set_observations(jsonb)';
 export const ACK_FUNCTION = 'ops.record_legacy_gate_ack(text, text, text, jsonb, text, text, integer, timestamptz, boolean, text)';
 export const LOCK_SUPPLIERS_FUNCTION = 'core.lock_suppliers_for_share(bigint[])';
+/** 画面の保存を始める (段階・持ち主表を DB で確かめて、取引の行を書く。これの後でないと画面のロールは書けない・#1563 R3 M2) */
+export const BEGIN_WRITE_FUNCTION = 'ops.begin_master_write(uuid, text, text, jsonb)';
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -95,15 +98,16 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   }
   for (const [role, group] of Object.entries(MEMBER_OF)) s.push(`grant ${group} to ${role}`);
   // 前に付けた権限を外してから付け直す (流し直しで広い権限が残らない)
-  for (const t of new Set([...MASTER_EDIT_SELECT, ...MASTER_EDIT_WRITE.map(([, t2]) => t2), 'events.master_change_events', 'ops.master_legacy_gate_acks', 'ops.master_legacy_manifests', 'ops.master_cutover_events'])) {
+  for (const t of new Set([...MASTER_EDIT_SELECT, ...MASTER_EDIT_WRITE.map(([, t2]) => t2), 'events.master_change_events', 'ops.master_legacy_gate_acks', 'ops.master_legacy_manifests', 'ops.master_cutover_events', 'ops.master_write_sessions', 'ops.master_cutover_prereq_checks'])) {
     s.push(`revoke all on ${t} from ${all}`);
   }
-  for (const f of [CUTOVER_FUNCTION, OBSERVE_FUNCTION, ACK_FUNCTION, LOCK_SUPPLIERS_FUNCTION]) s.push(`revoke all on function ${f} from public, ${all}`);
+  for (const f of [CUTOVER_FUNCTION, OBSERVE_FUNCTION, ACK_FUNCTION, LOCK_SUPPLIERS_FUNCTION, BEGIN_WRITE_FUNCTION]) s.push(`revoke all on function ${f} from public, ${all}`);
   // master_edit
   for (const sc of ['core', 'ops', 'events']) s.push(`grant usage on schema ${sc} to master_edit`);
   for (const t of MASTER_EDIT_SELECT) s.push(`grant select on ${t} to master_edit`);
   for (const [priv, t] of MASTER_EDIT_WRITE) s.push(`grant ${priv} on ${t} to master_edit`);
   s.push(`grant execute on function ${LOCK_SUPPLIERS_FUNCTION} to master_edit`);
+  s.push(`grant execute on function ${BEGIN_WRITE_FUNCTION} to master_edit`);
   s.push('grant usage on sequence core.master_version_seq to master_edit');   // version の既定値・0026 の bump_master_version の nextval (呼び手の権限)
   // master_ops
   s.push('grant usage on schema ops to master_ops');

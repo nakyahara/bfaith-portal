@@ -147,7 +147,14 @@ await ta('[!] 0050 (14 §6 ⑤-1・#1563 R1・R2): 切替の段階は legacy_ope
   // #1563 仮レビュー: 門の記録は場所ごとのログイン・止まった記録 (引数 10 個・後ろ 2 つは既定あり)・黙っているプロセスを見る時間・マスタの書き込みの鍵・原価の縮めるだけの UPDATE は見ない
   assert.deepEqual((await q("select pg_get_function_identity_arguments('ops.record_legacy_gate_ack(text, text, text, jsonb, text, text, integer, timestamptz, boolean, text)'::regprocedure) as a"))[0].a.split(', ').map((x) => x.split(' ')[0]),
     ['p_host', 'p_instance_id', 'p_build_id', 'p_manifest', 'p_owner_hash', 'p_phase_seen', 'p_inflight_count', 'p_oldest_inflight_at', 'p_stopped', 'p_stopped_reason']);
-  assert.deepEqual((await q('select ops.master_cutover_ack_silent_hours() as h, core.master_write_lock_key()::text as k'))[0], { h: 24, k: '4705310050' });
+  assert.deepEqual((await q('select core.master_write_lock_key()::text as k'))[0], { k: '4705310050' });
+  // #1563 R3: 黙っているプロセスは年齢で外さない (時間の窓の関数は無い)・前提の差し込み口の表 (空)・画面のロールの書き込みの約束 (begin + 7 つの表の guard)
+  assert.equal((await q("select to_regprocedure('ops.master_cutover_ack_silent_hours()') is null as gone"))[0].gone, true);
+  assert.equal((await q('select count(*)::int as n from ops.master_cutover_prereq_checks'))[0].n, 0);
+  const guards = await q("select c.relnamespace::regnamespace::text || '.' || c.relname as t from pg_trigger g join pg_class c on c.oid = g.tgrelid where g.tgname = 'trg_master_edit_guard' order by 1");
+  assert.deepEqual(guards.map((r) => r.t), ['core.products', 'core.sku_costs', 'core.skus', 'core.supplier_skus', 'ops.master_edit_requests', 'ops.sku_component_breaches', 'ops.sku_component_requests']);
+  const be = (await q("select p.prosecdef, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p where p.oid = 'ops.begin_master_write(uuid, text, text, jsonb)'::regprocedure"))[0];
+  assert.deepEqual([be.prosecdef, be.pub], [true, false]);
   const ackCols = await q("select column_name as c from information_schema.columns where table_schema = 'ops' and table_name = 'master_legacy_gate_acks' and column_name in ('session_role', 'stopped', 'stopped_reason') order by 1");
   assert.deepEqual(ackCols.map((r) => r.c), ['session_role', 'stopped', 'stopped_reason']);
   assert.match(fn[0].d, /tg_op = 'UPDATE' and new\.sku_id = old\.sku_id/);
