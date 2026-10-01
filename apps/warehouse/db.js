@@ -1548,7 +1548,8 @@ function createTables() {
   // ---- 決済の文書の版 (D-66)・生の表の版 source_revision・読み直す注文・coverage の lease・初期の印 (D-65) (2026-10-01・D7b-1b-3) ----
   // 設計 = AI_reference CompanyDB構想/13 §3.1・D-65・D-66。本体 = amazon-settlement-versions.js (表・trigger・view)
   //   生の表 (headers / lines) に report_document_id / normalization_version / document_version_seq / currency_raw を足す。
-  //   過去の行の版は migrate-settlement-document-versions.js (coordinator の回でも自動) が付ける = それまで build・送り手は止まる (黙って行を落とさない)
+  //   過去の行の版は夜に手で migrate-settlement-document-versions.js --commit が付ける (coordinator は版付けを流さない = 版の無い行があれば ❌ で止まる・#1567 Codex R1 Medium)
+  //   = それまで build・送り手は止まる (黙って行を落とさない)。🚨 初回の initDB は生の表に索引を作る (時間はログ) = pull の後の初回は daily-sync・retry と重ねない別の作業 (R4 Medium 2)
   createSettlementVersionSchema(db);
 
   // ---- Phase 1 #1-7a: job_locks (concurrency guard)

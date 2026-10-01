@@ -4,7 +4,7 @@ await temporaryTestRoot(import.meta.url);
  * test-settlement-inventory.js — 決済のレポートの一覧 (inventory) の記録の試験 (D7b-1b の下ごしらえ・2026-09-30)
  *
  * 設計 = AI_reference CompanyDB構想/13 §3.1。SP-API は差し替え (fake の callAPI / download)。本番 DB には触れない (一時 DATA_DIR)。
- *   - 一覧の窓の固定 (最初の要求に createdSince = createdUntil − 85 日・createdUntil = 回の開始の時刻。2 ページ目からは nextToken だけ)
+ *   - 一覧の窓の固定 (最初の要求に createdSince = createdUntil − 85 日・createdUntil = 回の開始の時刻。2 ページ目からは nextToken だけ)。取込の一覧も同じ窓 (#1567 Codex R4)
  *   - 取込の一覧の要求は今までと同じ形 (日時の境なし) = 取込む report は変わらない
  *   - 最後のページまで取れた回 / 取れなかった回 (nextToken が残ったまま上限 = last_page_reached 0・取込は続ける)
  *   - 各分岐の取込の結果 (skipped_not_done / imported / failed / not_processed)・同じ report ID を 2 回見たら最後の状態
@@ -75,24 +75,26 @@ const R = {
   v1: rep('R-V1', 'DONE', 'D-V1'),
   bad: rep('R-BAD', 'DONE', 'D-BAD'),
   onlyInv: rep('R-ONLYINV', 'DONE', 'D-ONLYINV'),          // 一覧にだけ居る (取込の一覧に無い)
-  onlyIng: rep('R-ONLYING', 'DONE', 'D-ONLYING', { createdTime: '2026-07-03T00:00:00+00:00' }),   // 取込の一覧にだけ居る (85〜90 日前に作られた)
+  onlyIng: rep('R-ONLYING', 'DONE', 'D-ONLYING', { createdTime: '2026-07-03T00:00:00+00:00' }),   // 取込の一覧にだけ居る (同じ窓の 2 つの要求の食い違い = 作り物は窓を見ない)
 };
 
 /**
- * fake の SP-API。getReports の最初の要求は createdSince の有無で「一覧の記録用」か「取込用」かを分ける。
- * pages = { inv: [page, ...] | (idx) => page, ing: [...] }・page = { reports, next }
+ * fake の SP-API。getReports の最初の要求は options.timeouts の有無 (一覧の記録用の要求だけが持つ = listInventoryReports) で「一覧の記録用」か「取込用」かを分ける
+ * (#1567 Codex R4 から取込の一覧も同じ窓 = createdSince では分けられない)。
+ * pages = { inv: [page, ...] | (idx, at, query) => page, ing: [...] }・page = { reports, next }
  */
 // opts: failInventory = 一覧の要求が失敗 / hangInventory = 一覧の要求が返らない (長い retry) / invalidInventory = 一覧のページの応答 (そのまま返す)
 //       tokens = getReports の共有のレートの枠 (無くなると QuotaExceeded) / clock = { ms, stepMs } = 呼ぶたびに時計が進む (page 関数に呼んだ時刻を渡す)
 // events = 呼んだ順の記録 (list:ing = 取込の一覧 / list:inv = 一覧の記録 / next:* = 2 ページ目から / dl:文書 = ダウンロード)
 const events = [];
+const isInv = (req) => !!(req.options && req.options.timeouts);
 function fakeSp(pages, { failInventory = false, hangInventory = false, invalidInventory, tokens = Infinity, clock = null, reportById = {} } = {}) {
   const calls = [];
   let left = tokens;
   events.length = 0;
-  const page = (kind, idx, at) => {
+  const page = (kind, idx, at, q) => {
     const src = pages[kind];
-    const p = typeof src === 'function' ? src(idx, at) : src[idx];
+    const p = typeof src === 'function' ? src(idx, at, q) : src[idx];
     return { reports: p.reports, ...(p.next ? { nextToken: `${kind}:${idx + 1}` } : {}) };
   };
   return {
@@ -101,7 +103,7 @@ function fakeSp(pages, { failInventory = false, hangInventory = false, invalidIn
       calls.push(JSON.parse(JSON.stringify(req)));
       if (req.operation === 'getReports') {
         const q = req.query;
-        events.push(q.nextToken ? `next:${q.nextToken.split(':')[0]}` : q.createdSince ? 'list:inv' : 'list:ing');
+        events.push(q.nextToken ? `next:${q.nextToken.split(':')[0]}` : isInv(req) ? 'list:inv' : 'list:ing');
       } else events.push(req.operation);
       const at = clock ? clock.ms : null;
       if (clock) clock.ms += clock.stepMs;
@@ -110,11 +112,11 @@ function fakeSp(pages, { failInventory = false, hangInventory = false, invalidIn
         left--;
         const q = req.query;
         if (q.nextToken) { const [kind, idx] = q.nextToken.split(':'); return page(kind, Number(idx), at); }
-        const kind = q.createdSince ? 'inv' : 'ing';
+        const kind = isInv(req) ? 'inv' : 'ing';
         if (kind === 'inv' && failInventory) throw new Error('QuotaExceeded (作り物)');
         if (kind === 'inv' && hangInventory) return new Promise(() => {});
         if (kind === 'inv' && invalidInventory !== undefined) return invalidInventory;
-        return page(kind, 0, at);
+        return page(kind, 0, at, q);
       }
       if (req.operation === 'getReport') return reportById[req.path.reportId];
       throw new Error(`想定外の呼び出し ${req.operation}`);
@@ -165,12 +167,13 @@ ok(!res.error, `ふつうの回は落ちない ${res.error ? res.error.message :
 
 // 呼ぶ順: 取込の一覧の要求が先 (今と同じ位置・同じ形) → 一覧の記録の要求 (窓を明示・2 ページ目は nextToken だけ)
 const reportsCalls = sp.calls.filter((c) => c.operation === 'getReports');
-eq(reportsCalls[0].query, { reportTypes: [V2T], marketplaceIds: [MKT], pageSize: 100, createdUntil: '2026-09-30T00:00:05Z' },
-  '🚨 最初の getReports = 取込の一覧の要求 = createdUntil は回の開始 (証拠の一覧の窓の終わりと同じ = 一覧に無い新しい report を取込まない・#1567 Codex R3 High 1)・createdSince は Amazon の既定 (90 日前) のまま');
+eq(reportsCalls[0].query, { reportTypes: [V2T], marketplaceIds: [MKT], pageSize: 100, createdSince: '2026-07-07T00:00:05Z', createdUntil: '2026-09-30T00:00:05Z' },
+  '🚨 最初の getReports = 取込の一覧の要求 = 証拠の一覧と同じ固定の窓 (回の開始とその 85 日前 = 一覧に出ない report を取込まない・#1567 Codex R3 High 1・R4 High)');
+ok(!reportsCalls[0].options && reportsCalls[1].options && reportsCalls[1].options.timeouts, '取込の一覧は今までの接続のまま (時間の上限なし)・一覧の記録の要求だけ時間の上限つき');
 eq(reportsCalls[1].query, { reportTypes: [V2T], marketplaceIds: [MKT], pageSize: 100, createdSince: '2026-07-07T00:00:05Z', createdUntil: '2026-09-30T00:00:05Z' }, '一覧の記録の要求は取込の一覧の後 = createdUntil は回の開始の時刻 (秒に切り捨て)・createdSince はその 85 日前');
 eq(reportsCalls[2].query, { nextToken: 'inv:1' }, '一覧の 2 ページ目は nextToken だけ (窓を付け直さない)');
 ok(reportsCalls.length === 3, `getReports は取込 1 + 一覧 2 = 3 回 (${reportsCalls.length})`);
-ok(sp.calls.findIndex((c) => c.operation === 'getReports' && c.query.createdSince) > sp.calls.findIndex((c) => c.operation === 'getReports' && !c.query.createdSince && !c.query.nextToken), '一覧の記録の要求は取込の一覧の要求より後');
+ok(sp.calls.findIndex((c) => c.operation === 'getReports' && isInv(c)) > sp.calls.findIndex((c) => c.operation === 'getReports' && !isInv(c) && !c.query.nextToken), '一覧の記録の要求は取込の一覧の要求より後');
 const lastDl = (ev) => ev.reduce((m, e, i) => (e.startsWith('dl:') ? i : m), -1);
 eq(events, ['list:ing', 'dl:D-IMP', 'dl:D-V1', 'dl:D-BAD', 'dl:D-ONLYING', 'list:inv', 'next:inv'], '🚨 呼ぶ順 = 取込の一覧 → ダウンロード全部 → 一覧の記録 (Codex #1555 R2 High)');
 
@@ -258,13 +261,18 @@ ok(rowOf(run6.id, 'R-IMP').import_result === 'imported' && rowOf(run6.id, 'R-BAD
 const DAY = 86400000;
 const clock = { ms: Date.parse('2026-10-01T00:00:00Z'), stepMs: 30000 };   // SP-API を呼ぶたびに 30 秒進む
 DOCS['D-BORDER'] = v2Tsv('S-BORDER');
-const BORDER = rep('R-BORDER', 'DONE', 'D-BORDER', { createdTime: new Date(clock.ms - 90 * DAY + 10000).toISOString() });   // 既定の窓の境の 10 秒内側
-// 取込の一覧 = Amazon の既定の窓 = 呼んだ時刻の 90 日前より後に作られた report だけ
-const defaultWindow = (idx, at) => ({ reports: [BORDER, R.imp].filter((x) => Date.parse(x.createdTime) >= at - 90 * DAY) });
-sp = fakeSp({ inv: [{ reports: [R.imp] }], ing: defaultWindow }, { clock });
+DOCS['D-OLD88'] = v2Tsv('S-OLD88');
+const BORDER = rep('R-BORDER', 'DONE', 'D-BORDER', { createdTime: new Date(clock.ms - 85 * DAY + 10000).toISOString() });   // 85 日の窓の境の 10 秒内側
+const OLD88 = rep('R-OLD88', 'DONE', 'D-OLD88', { createdTime: new Date(clock.ms - 88 * DAY).toISOString() });   // 88 日前 = Amazon の既定の 90 日の窓の中・85 日の窓の外
+// Amazon = 要求の窓 [createdSince, createdUntil] (無ければ呼んだ時刻の 90 日前〜) に作られた report だけ返す
+const amazonWindow = (idx, at, q) => ({ reports: [OLD88, BORDER, R.imp].filter((x) => { const c = Date.parse(x.createdTime);
+  return c >= (q.createdSince ? Date.parse(q.createdSince) : at - 90 * DAY) && (!q.createdUntil || c <= Date.parse(q.createdUntil)); }) });
+sp = fakeSp({ inv: amazonWindow, ing: amazonWindow }, { clock });
 downloaded.length = 0;
 res = await captured(() => runSettlementFetch(ARGS, { db, sp, runId: 'run-h1', downloadTsv: fakeDownload(), now: () => new Date(clock.ms) }));
-ok(!res.error && downloaded.includes('D-BORDER') && rowOf(runs().at(-1).id, 'R-IMP')?.import_result === 'imported', '🚨 90 日の境の report が今と同じく取込まれる (一覧の記録の要求が先に「今」を進めない)');
+ok(!res.error && downloaded.includes('D-BORDER') && rowOf(runs().at(-1).id, 'R-IMP')?.import_result === 'imported' && rowOf(runs().at(-1).id, 'R-BORDER')?.import_result === 'imported',
+  '🚨 85 日の境の 10 秒内側の report は取込む・一覧にも出る (取込と証拠が同じ固定の窓 = 時計が進んでも窓は回の開始で決まる)');
+ok(!downloaded.includes('D-OLD88') && !rowOf(runs().at(-1).id, 'R-OLD88'), '🚨 88 日前に作られた report (Amazon の既定の 90 日の窓の中・85 日の窓の外) は取込まない = 一覧に出ない決済を入れない (#1567 Codex R4 High)');
 
 // 基準 = 一覧の記録が何も邪魔しない回で、取込が落とした文書と止まった report
 const ingestOutcome = async (opts, runId, deps = {}) => {

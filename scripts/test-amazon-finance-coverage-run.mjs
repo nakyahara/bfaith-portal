@@ -114,9 +114,9 @@ const sp = {
     if (req.operation !== 'getReports') throw new Error(`想定外 ${req.operation}`);
     const q = req.query;
     if (q.nextToken) return SP.invEndless ? { reports: [], nextToken: 'more' } : { reports: [] };
-    if (q.createdSince) return SP.invEndless ? { reports: SP.inv, nextToken: 'more' } : { reports: SP.inv };
-    if (SP.ingQueries) SP.ingQueries.push(q);   // 取込の一覧の要求 (createdUntil を確かめる)
-    return { reports: SP.ing };   // 作り物は createdUntil を見ない (Amazon が窓の後の report を返した場面も作れる)
+    if (req.options && req.options.timeouts) return SP.invEndless ? { reports: SP.inv, nextToken: 'more' } : { reports: SP.inv };   // 証拠の一覧 (専用の接続の時間の上限つき)
+    if (SP.ingQueries) SP.ingQueries.push(q);   // 取込の一覧の要求 (窓を確かめる)
+    return { reports: SP.ing };   // 作り物は窓を見ない (Amazon が窓の外の report を返した場面・前の版のコードが取り込んだ場面も作れる)
   },
 };
 const downloadTsv = async (docId) => { if (!Object.hasOwn(DOCS, docId)) throw new Error(`文書が無い ${docId}`); return DOCS[docId]; };
@@ -635,20 +635,66 @@ await t('🚨 取込の一覧にだけあって証拠の一覧 (固定の窓) �
     assert.equal(f.calls.complete, 0); assert.equal((await cov()).state, 'updating');
     const d = r.push.scanSnapshot.diag;
     assert.deepEqual([d.settlementsThrough, d.frontierAll], ['2026-03-16T10:00:00Z', P7[1]], 'frontier は裏付けのある S5 の end で止まる (S7 を入れると 3/17)');
-    // (b) 取込の一覧の要求の createdUntil = 証拠の一覧の窓の終わり (回の開始)
-    const inv = db.prepare(`SELECT query_created_until u FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get();
-    assert.deepEqual(SP.ingQueries.map((q) => q.createdUntil), [inv.u], '取込の一覧も証拠の一覧と同じ時刻で切る');
+    // (b) 取込の一覧の要求の窓 = 証拠の一覧の窓 (始まりも終わりも同じ固定の窓・#1567 Codex R4)
+    const inv = db.prepare(`SELECT query_created_since s, query_created_until u FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get();
+    assert.deepEqual(SP.ingQueries.map((q) => [q.createdSince, q.createdUntil]), [[inv.s, inv.u]], '取込の一覧も証拠の一覧と同じ固定の窓 (85 日前 〜 回の開始)');
     SP.inv = SP.ing;   // 次の回の一覧に出た
     const r2 = await run({ fetchImpl: spyFetch() });
     assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`);
     assert.deepEqual([(await cov()).state, (await cov()).complete_to], ['complete', '2026-03-16'], 'S7 まで complete (end 3/17 19:00 JST の前日)');
   } finally { SP.ingQueries = null; }
 });
-await t('🚨 一覧の窓の空白 (前の成功した回から 85 日以上あいた) = complete にしない (⚠️ evidence_chain_gap = Seller Central で印を作り直す)', async () => {
-  NOW = Date.parse('2026-07-01T00:00:00Z');
-  const r = await run({ fetchImpl: spyFetch() });
-  assert.equal(r.exitCode, 0, r.summary); assert.ok(codes(r).includes('evidence_chain_gap'), codes(r).join(','));
-  assert.equal((await cov()).state, 'updating');
+await t('🚨 裏付けの無い決済が裏付けのある決済の内側に収まる (frontier は変わらない) = それでも complete にしない (❌ not_in_inventory・今回の窓の中 = API の食い違い待ち = retry) → 一覧に出れば complete (#1567 Codex R4 High・Medium 1)', async () => {
+  const P8 = ['2026-02-01T10:00:00Z', '2026-02-05T10:00:00Z'];   // S2 [1/26, 2/9) の内側
+  DOCS.D8 = settlementTsv('S8', ...P8, [{ kind: 'order', order: 'O-G', sku: 'SKU-G', yen: 60, day: '2026-02-02T01:00:00Z' }]);
+  SP.ing = [...SP.ing, rep('R8', 'DONE', 'D8', P8, '2026-02-06T00:00:00Z')];   // 取込の一覧にだけ居る (同じ窓の 2 つの要求の食い違い)
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f });
+  assert.ok(V.selectedVersionOf(db, 'S8'), '前提: S8 は取り込まれて採った版がある');
+  const d = r.push.scanSnapshot.diag;
+  assert.equal(d.settlementsThrough, d.frontierAll, `前提: 区間を延ばさない = 2 つの frontier は同じ (前の守りだけだと通った) (${d.settlementsThrough})`);
+  assert.equal(r.exitCode, 1, r.summary); assert.deepEqual(codes(r).filter((c) => c.startsWith('not_in_inventory')), ['not_in_inventory'], codes(r).join(','));
+  assert.ok(r.reasons.find((x) => x.code === 'not_in_inventory').detail.includes('S8'), JSON.stringify(r.reasons));
+  assert.equal(f.calls.complete, 0); assert.equal((await cov()).state, 'updating');
+  SP.inv = SP.ing;   // 次の回の一覧に出た
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+});
+await t('🚨 86〜90 日前に作られた report の決済 (前の版の取込が Amazon の既定の 90 日の窓で入れた・一覧の鎖にも印にも無い) = 区間の内側でも complete にしない (⚠️ not_in_inventory_outside_window = 人が印を作り直す・retry しない = exit 0) (#1567 Codex R4 High・Medium 1)', async () => {
+  const NOW0 = NOW;
+  NOW = Date.parse('2026-04-10T00:00:00Z');   // 窓 = 2026-01-15 〜 4/10
+  const P6 = ['2026-01-05T10:00:00Z', '2026-01-09T10:00:00Z'];   // S0 [12/29, 1/12) の内側・end は窓の始まりより前
+  DOCS.D6 = settlementTsv('S6', ...P6, [{ kind: 'order', order: 'O-H', sku: 'SKU-H', yen: 30, day: '2026-01-06T01:00:00Z' }]);
+  const R6 = rep('R6', 'DONE', 'D6', P6, '2026-01-12T00:00:00Z');   // 88 日前に作られた = 85 日の窓の外 (Amazon の既定の 90 日の窓の中)
+  const ingQ = [];
+  try {
+    SP.ing = [...SP.ing, R6]; SP.ingQueries = ingQ;   // 作り物は窓を見ない = 前の版のコード (日時の境なし) が取り込んだ場面
+    const f = spyFetch();
+    const r = await run({ fetchImpl: f });
+    assert.ok(V.selectedVersionOf(db, 'S6'), '前提: S6 は取り込まれて採った版がある');
+    assert.equal(ingQ.at(-1).createdSince, '2026-01-15T00:01:00Z', `前提: 今の取込の一覧の窓は 85 日 (本物の Amazon なら R6 は返らない) (${ingQ.at(-1).createdSince})`);
+    assert.equal(r.exitCode, 0, `${r.summary} ${JSON.stringify(r.reasons)}`);
+    assert.deepEqual(codes(r).filter((c) => c.startsWith('not_in_inventory')), ['not_in_inventory_outside_window'], codes(r).join(','));
+    assert.ok(r.reasons.find((x) => x.code === 'not_in_inventory_outside_window').human, '人が直す理由 (⚠️)');
+    assert.match(r.summary, /^⚠️/);
+    assert.equal(f.calls.complete, 0); assert.equal((await cov()).state, 'updating');
+    // 後片付け (試験だけ): 一覧に出たことにする = 裏付けあり → complete
+    SP.inv = SP.ing;
+    const r2 = await run({ fetchImpl: spyFetch() });
+    assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+  } finally { SP.ingQueries = null; NOW = NOW0; }
+});
+await t('🚨 一覧の窓の空白 (前の成功した回から 85 日以上あいた) = complete にしない (⚠️ evidence_chain_gap = Seller Central で印を作り直す)・長く止まった後の取込の一覧も同じ 85 日の窓 (止まっている間に窓の外に出た report は取込まない・#1567 Codex R4)', async () => {
+  NOW = Date.parse('2026-07-15T00:00:00Z');   // 前の回 (上の試験の 4/10) から 85 日より後
+  const ingQ = [];
+  SP.ingQueries = ingQ;
+  try {
+    const r = await run({ fetchImpl: spyFetch() });
+    assert.equal(r.exitCode, 0, r.summary); assert.ok(codes(r).includes('evidence_chain_gap'), codes(r).join(','));
+    assert.equal((await cov()).state, 'updating');
+    const inv = db.prepare(`SELECT query_created_since s, query_created_until u FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get();
+    assert.deepEqual(ingQ.map((q) => [q.createdSince, q.createdUntil]), [[inv.s, inv.u]], '取込の一覧も同じ 85 日の窓');
+  } finally { SP.ingQueries = null; }
   NOW = Date.parse('2026-03-20T00:00:00Z');
 });
 

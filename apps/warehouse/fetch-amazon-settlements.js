@@ -134,18 +134,20 @@ export function parseArgs(argv = process.argv.slice(2)) {
 
 // ─── SP-API ───
 
-// 取込の一覧 = 今までと同じ要求 (日時の境なし = Amazon の既定の 90 日前〜今・21 ページで打ち切り)。
-// 🚨 取込む report の選び方を変えないため、一覧の記録 (窓を固定) はこれとは別の要求 (amazon-settlement-inventory.js)
+// 取込の一覧 (21 ページで打ち切り)。一覧の記録 (証拠) はこれとは別の要求 (amazon-settlement-inventory.js = 時間の上限つきの専用の接続・失敗しても取込は続ける)
 /**
- * 取込の一覧。createdUntil = 回の開始の時刻 (証拠の一覧 (inventory) の窓の終わりと同じ = 一覧に無い新しい report を取り込まない。#1567 Codex R3 High 1 b)。
- *   createdSince は Amazon の既定 (90 日前) のまま (85 日に揃えると 85〜90 日前に作られた report を取込まなくなる)。窓の後に作られた report は次の回で取る
+ * 取込の一覧。window = { createdSince, createdUntil } = 証拠の一覧 (inventory) と **同じ固定の窓** (回の開始の時刻とその 85 日前。#1567 Codex R3 High 1 b・R4 High)
+ *   = 証拠の一覧に出ない report (窓の後に作られた・85 日より前に作られた) を取り込まない。窓の後に作られた report は次の回で取る。
+ *   85〜90 日前に作られた report (Amazon の既定の窓の端) は取込まない = 毎朝の回なら 85 日の窓の中で取込済み。長く止まって窓の外に出た report は
+ *   一覧の鎖の切れ目 (evidence_chain_gap ⚠️) か、印にも鎖にも無い決済 (not_in_inventory_outside_window ⚠️) = complete にしない側に倒れる
+ *   window を渡さない = 日時の境なし (Amazon の既定の 90 日前〜今。読むだけの比べ道具 check-settlement-v1-v2.js)
  */
-async function listSettlementReports(sp, reportType, { createdUntil = null } = {}) {
+async function listSettlementReports(sp, reportType, { window = null } = {}) {
   const r = await listReportPages(sp, {
     reportTypes: [reportType],
     marketplaceIds: [MARKETPLACE_ID],
     pageSize: 100,
-    ...(createdUntil ? { createdUntil } : {}),
+    ...(window ? { createdSince: window.createdSince, createdUntil: window.createdUntil } : {}),
   }, { maxPages: MAX_LIST_PAGES, label: 'list' });
   return r.reports;
 }
@@ -707,14 +709,14 @@ export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = nu
   const download = downloadTsv || ((reportDocumentId) => downloadReportTsv(sp, reportDocumentId));
   const startedAt = now();   // 回の開始の時刻 = 一覧の窓の createdUntil
 
-  // 1. Settlement 一覧取得 (🚨 今と同じ位置・同じ要求で **先に** 確定する。一覧の記録の要求を先に出すと、既定の 90 日の窓の「今」が
-  //    後ろにずれて境の report が外れる / レートの枠を先に使う = 取込む report が変わりうる。Codex #1555 R1 High)
+  // 1. Settlement 一覧取得 (🚨 今と同じ位置で **先に** 確定する。一覧の記録の要求を先に出すとレートの枠を先に使う = 取込む report が変わりうる。Codex #1555 R1 High。
+  //    窓は証拠の一覧と同じ固定の窓 = 回の開始の時刻 (秒に切り捨て) とその 85 日前。#1567 Codex R4 High)
   let reports;
   if (args.reportId) {
     const r = await sp.callAPI({ operation: 'getReport', endpoint: 'reports', path: { reportId: args.reportId } });
     reports = [r];
   } else {
-    reports = await listSettlementReports(sp, src.reportType, { createdUntil: inventoryWindow(startedAt).createdUntil });
+    reports = await listSettlementReports(sp, src.reportType, { window: inventoryWindow(startedAt) });   // 証拠の一覧と同じ固定の窓 (#1567 Codex R4 High)
   }
   console.log(`[settlements] 対象 reports: ${reports.length}件`);
 

@@ -438,5 +438,21 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
   ok(unified === 2, `表示用の集まり (v_amazon_settlement_unified) も採った版の 2 行だけ (${unified})`);
 }
 
+// ─── 🆕 #1567 Codex R4 Medium 2: 初回の schema の準備 = 生の表の索引の作成の時間 (= 書き込みの lock の長さ) を個別にログに出す・2 回目は作らない ───
+{
+  const got = [];
+  const orig = console.log;
+  console.log = (...a) => got.push(a.join(' '));
+  try {
+    db.exec(`DROP INDEX idx_settle_lines_docver`);
+    V.createSettlementVersionSchema(db);   // 初回 (索引が無い) = 作って時間を出す
+    V.createSettlementVersionSchema(db);   // 2 回目 = 何もしない
+  } finally { console.log = orig; }
+  const lines = got.filter((l) => l.includes('索引 idx_settle_lines_docver を作った'));
+  ok(lines.length === 1 && /: \d+ ms \(この間 warehouse\.db は書き込みの lock/.test(lines[0]) && !got.some((l) => l.includes('idx_settle_headers_docver')),
+    `初回の索引の作成だけ時間をログに出す (${lines.length} 行・あるものは作らない)`);
+  ok(!!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_settle_lines_docver'`).get(), '索引は作り直された');
+}
+
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 文書の版テスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

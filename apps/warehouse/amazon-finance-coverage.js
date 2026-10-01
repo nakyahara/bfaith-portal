@@ -14,7 +14,10 @@
  *      明細の部品の合計 = 見出しの total・終わりが読み取りの時点より後でない・要約が古くない
  *   ② 起点 (policy の period_from の JST 00:00) から途切れずにつながる最後の end = settlements_through (実時刻の半開区間で・重なりは可・隙間で止まる)。
  *      🚨 区間に数えるのは **裏付けのある採った決済だけ** = 初期の印の決済 (一致) か、一覧の鎖の期待の report (imported / satisfied_by_selected_settlement) の決済。
- *      裏付けの無い決済が区間を延ばすなら not_in_inventory (❌・次の回で直る)。取込の一覧にだけあって証拠の一覧に無い report で complete にしない (#1567 Codex R3 High 1)
+ *      🚨 [起点, frontier) に重なる採った決済は **全部** 裏付けが要る (区間を延ばす決済だけでなく、内側に収まる決済も。#1567 Codex R3 High 1・R4 High)。
+ *      1 つでも裏付けが無ければ complete にしない: その report が今回の証拠の一覧の窓の中 (見出しの end ≥ 窓の createdSince = 作成も窓の中) = not_in_inventory
+ *      (❌・API の食い違い待ち = 次の回・retry で直りうる) / 窓より前・手のファイル = not_in_inventory_outside_window (⚠️ 人が直す = 二度と一覧に出ない
+ *      → 印を作り直す。R4 Medium 1)。取込の一覧も証拠の一覧と同じ固定の窓 (fetch-amazon-settlements.js)
  *   ③ 初期の印 (最新の epoch) がある・verified_from ≤ 起点
  *   ④ 一覧の鎖 = その epoch の成功した回 (最後のページまで・一覧 / 取込 / 記録の失敗なし・完了) を積み上げる:
  *      最初の回の窓 [createdSince, createdUntil] に印の captured_at が入る・印の verified_through が最初の回のデータの期間と重なる・
@@ -44,7 +47,7 @@ export const HUMAN_REASONS = new Set([
   'marker_settlement_mismatch', 'marker_report_id_unknown', 'evidence_chain_gap', 'report_cancelled', 'report_fatal', 'report_period_unknown', 'report_selected_differs',
   'header_currency_unverified', 'version_without_settlement', 'header_count', 'header_period_unreadable', 'header_period_reversed', 'header_settlement_mismatch',
   'line_settlement_mismatch', 'header_currency', 'line_currency', 'total_mismatch', 'origin_not_covered', 'report_blocked',
-  'provisional_broken_version', 'version_unresolved_settlement',
+  'provisional_broken_version', 'version_unresolved_settlement', 'not_in_inventory_outside_window',
 ]);
 
 const utc = (s) => { const v = normalizeApiTime(s); return v && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(v) ? v : null; };
@@ -225,17 +228,23 @@ export function evaluateCoverage(db, { generation, runToken, policy, source, now
   }
   items.sort((a, b) => cmpUtf8(a.kind, b.kind) || cmpUtf8(a.id, b.id));
 
-  // ── frontier (裏付けのある決済だけ・#1567 Codex R3 High 1) ──
-  //   全部の採った見出しの frontier (frontierAll) と、裏付けのある決済だけの frontier を比べる。違う = 裏付けの無い決済が区間を延ばしている = complete にしない
-  //   (印・一覧の鎖が無いときは、その理由 (⚠️) で止まっているので not_in_inventory は足さない)
+  // ── frontier (裏付けのある決済だけ・#1567 Codex R3 High 1・R4 High) ──
+  //   [起点, frontierAll) に重なる採った決済は **全部** 裏付けが要る (区間を延ばす決済だけでなく、裏付けのある決済の内側に収まる決済も = 正式な値に入るため)。
+  //   (印・一覧の鎖が無いときは、その理由 (⚠️) で止まっているので足さない。印にある決済 (一致しない・版が無い) は、その理由 (⚠️ marker_settlement_mismatch など) で止まる)
   const frontierAll = origin ? frontierFrom(intervals, origin) : null;
   const settlementsThrough = origin ? frontierFrom(intervals.filter((x) => backed.has(x.sid)), origin) : null;
   if (origin && !frontierAll) add('origin_not_covered', `起点 (${origin}) を覆う採った見出しが無い`);
-  else if (origin && marker && chain.length && thisRun && frontierAll !== settlementsThrough) {
-    const cut = settlementsThrough ? ms(settlementsThrough) : ms(origin);
-    // 印にある決済 (一致しない・版が無い) は、その理由 (⚠️ marker_settlement_mismatch など) で止まっている = 一覧の欠けとして重ねて数えない
-    const onlyInventory = intervals.filter((x) => !backed.has(x.sid) && !markerBySettlement.has(x.sid) && ms(x.start) <= ms(frontierAll) && ms(x.end) > cut);
-    if (onlyInventory.length) add('not_in_inventory', `裏付けの無い採った決済が区間を延ばしている = 初期の印にも一覧の鎖の期待の report にも無い (${onlyInventory.slice(0, 5).map((x) => `${x.sid} (${x.start} 〜 ${x.end})`).join(' / ')}) → frontier は ${settlementsThrough ?? '起点'} で止まる (全部なら ${frontierAll})。次の回の一覧で拾う`);
+  else if (origin && marker && chain.length && thisRun) {
+    const unbacked = intervals.filter((x) => !backed.has(x.sid) && !markerBySettlement.has(x.sid) && ms(x.start) < ms(frontierAll) && ms(x.end) > ms(origin));
+    // 今回の証拠の一覧の窓の中か (R4 Medium 1): 決済の report は期間の終わりの後に作られる = 見出しの end ≥ 窓の createdSince なら作成も窓の中 = 一覧に出るはず
+    //   = API の食い違い待ち (❌・retry)。窓より前 (境目の数日も含む = 分からなければ人の側)・手のファイルの版 = 二度と一覧に出ない = 人が直す (⚠️)
+    const since = ms(thisRun.query_created_since);
+    const inWindow = (x) => { const v = perSettlement.get(x.sid)?.v; return !!(v && v.report_id != null && v.source_layer !== 'manual_csv' && ms(x.end) >= since); };
+    const fmt = (xs) => xs.slice(0, 5).map((x) => `${x.sid} (${x.start} 〜 ${x.end}${perSettlement.get(x.sid)?.v?.report_id ? `・report ${perSettlement.get(x.sid).v.report_id}` : '・手のファイル'})`).join(' / ');
+    const near = unbacked.filter(inWindow), far = unbacked.filter((x) => !inWindow(x));
+    const tail = `→ frontier は ${settlementsThrough ?? '起点'} まで (全部なら ${frontierAll})`;
+    if (near.length) add('not_in_inventory', `裏付けの無い採った決済 ${near.length} (今回の一覧の窓の中なのに一覧に無い = API の食い違い待ち) = 初期の印にも一覧の鎖の期待の report にも無い: ${fmt(near)} ${tail}。次の回の一覧で拾う`);
+    if (far.length) add('not_in_inventory_outside_window', `裏付けの無い採った決済 ${far.length} (今回の一覧の窓 ${thisRun.query_created_since} より前・手のファイル = もう一覧に出ない) = 初期の印にも一覧の鎖の期待の report にも無い: ${fmt(far)} ${tail}。Seller Central で印を作り直す (その決済を入れる)`);
   }
   // 最後の守り: frontier が食い違うのに理由が 1 つも無い (上の数え方で拾えなかった) = complete にしない (fail-closed)
   if (origin && frontierAll && settlementsThrough !== frontierAll && !reasons.length) add('not_in_inventory', `裏付けのある決済だけの frontier (${settlementsThrough ?? '無し'}) が全部の採った見出しの frontier (${frontierAll}) と違う`);

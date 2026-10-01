@@ -107,6 +107,16 @@ const STALE = (r) => `UPDATE amazon_settlement_document_versions SET detail_stal
 /** backfill (版の鍵を null → 値) の UPDATE は数えない */
 const NOT_BACKFILL = `NOT (OLD.document_version_seq IS NULL AND NEW.document_version_seq IS NOT NULL)`;
 
+/** 索引が無ければ作り、かかった時間 (= 書き込みの lock の長さ) をログに出す。あれば何もしない (#1567 Codex R4 Medium 2) */
+function createIndexTimed(db, name, on) {
+  if (db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?`).get(name)) return null;
+  const t0 = Date.now();
+  db.exec(`CREATE INDEX IF NOT EXISTS ${name} ON ${on}`);
+  const msTaken = Date.now() - t0;
+  console.log(`[versions] 索引 ${name} を作った: ${msTaken} ms (この間 warehouse.db は書き込みの lock = 初回の schema の準備。daily-sync・retry と重ねない)`);
+  return msTaken;
+}
+
 export function createSettlementVersionSchema(db) {
   const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
   const addCol = (t, c, type) => { if (!cols(t).includes(c)) db.exec(`ALTER TABLE ${t} ADD COLUMN ${c} ${type}`); };
@@ -117,8 +127,10 @@ export function createSettlementVersionSchema(db) {
     addCol(t, 'currency_raw', 'TEXT');              // 原文の通貨 (空なら null。過去の行 = null = 初期の印で代える。R16 M1)
   }
   addCol('amazon_settlement_report_inventory', 'document_version_seq', 'INTEGER');   // 取込が入れた (or 既にあった) 文書の版
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_docver ON raw_amazon_settlement_lines(document_version_seq)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_headers_docver ON raw_amazon_settlement_headers(document_version_seq)`);
+  // 🚨 初回 (pull の後に最初に initDB した処理) は生の表 (本番 約 440 万行) に索引を作る = その間 warehouse.db は書き込みの lock。
+  //    版付けの「1 取引の最長」には入らないので、ここで個別に測ってログに出す (#1567 Codex R4 Medium 2)。初回の schema の準備は daily-sync・retry と重ねない別の作業
+  createIndexTimed(db, 'idx_settle_lines_docver', 'raw_amazon_settlement_lines(document_version_seq)');
+  createIndexTimed(db, 'idx_settle_headers_docver', 'raw_amazon_settlement_headers(document_version_seq)');
 
   db.exec(`CREATE TABLE IF NOT EXISTS amazon_settlement_document_versions (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,7 +156,7 @@ export function createSettlementVersionSchema(db) {
     line_settlement_count INTEGER,                -- 明細の決済 ID の種類の数 (1 でなければ壊れた文書)
     line_settlement_id    TEXT,
     line_currency_bad     INTEGER,                -- 明細の原文の通貨が JPY でも空でもない行の数
-    header_count          INTEGER,                -- 見出しの数 (business_line_key の種類。1 でなければ壊れた文書)
+    header_count          INTEGER,                -- 見出しの数 (物理の行の数。1 でなければ壊れた文書・#1567 Codex R3 High 2)
     header_id             INTEGER,                -- 見出しの行の ID (最小)
     header_settlement_id  TEXT,
     header_start          TEXT,                   -- 見出しの settlement-start-date (原文)
