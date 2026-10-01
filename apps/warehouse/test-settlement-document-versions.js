@@ -219,6 +219,30 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
   ok(!/文書の版|要約が古い/.test(buildFails()), '流し直した後は build が通る');
 }
 
+// ─── 🆕 #1567 Codex R5 Medium 1: 版付けの「1 取引の最長」= 全部の書き込みの取引 (版の登録・行の版の UPDATE・版の +1・要約の作り直し) の最長 ───
+{
+  const insSlow = (doc, sid) => {
+    const ins = db.prepare(`INSERT INTO raw_amazon_settlement_lines (physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version,
+      source_settlement_id, posted_date_utc, posted_datetime_jst, economic_date, year_month_int, amazon_order_id, seller_sku_normalized, transaction_type, price_type, price_amount_micro, currency, ingested_at)
+      VALUES (?, ?, ?, 'sh', 'p', ?, 'sp_api_v1', 'v1.0.0', ?, 'x', 'x', ?, ?, ?, 'sku-s', 'Order', 'Principal', 1000000, 'JPY', '2026-01-01 00:00:00')`);
+    for (let i = 1; i <= 3; i++) ins.run(`${doc}-${i}`, `${doc}-k${i}`, doc, i, sid, `${YM}-06`, Number(YM.replace('-', '')), `${doc}-O${i}`);
+  };
+  const busy = (ms) => { const until = Date.now() + ms; while (Date.now() < until) { /* 取引の中で時間を使う */ } };
+  // check は取引ごとに 1 回 (登録 1 → 明細 2 → 版の +1 3 → 要約 4)。k 回目の取引だけ 80 ms 使う
+  const slowAt = (k) => { let n = 0; return () => { n++; if (n === k) busy(80); }; };
+  insSlow('SLOW-A', 'S-SLOW-A');
+  const a = V.backfillDocumentVersions(db, { check: slowAt(1) });
+  ok(a.maxTxMs >= 80 && /^版の登録/.test(a.maxTxName) && a.txCount === 4, `🚨 版の登録の取引が一番長い = 最長はその取引 (${a.maxTxMs} ms・${a.maxTxName}・取引 ${a.txCount})`);
+  insSlow('SLOW-B', 'S-SLOW-B');
+  const timer = V.newTxTimer();
+  const b = V.backfillDocumentVersions(db, { check: slowAt(4), txTimer: timer });
+  ok(b.maxTxMs >= 80 && /^要約の作り直し/.test(b.maxTxName) && timer.maxName === b.maxTxName, `🚨 要約の作り直し (1 版の全行を読み並べ digest を作る) の取引が一番長い = 最長はその取引 (${b.maxTxMs} ms・${b.maxTxName})`);
+  insSlow('SLOW-C', 'S-SLOW-C');
+  const c = V.backfillDocumentVersions(db, { check: slowAt(2) });
+  ok(c.maxTxMs >= 80 && /^明細の行の版/.test(c.maxTxName), `行の版の UPDATE の取引が一番長い = 最長はその取引 (${c.maxTxMs} ms・${c.maxTxName})`);
+  ok(V.documentVersionsReady(db), '版付けの後は ready');
+}
+
 // ─── 🆕 #1567 R1 Medium 3: 中身の悪い新しい版は採らない・悪い版しか無い決済は blocked (build と送り手を止める) ───
 {
   const Sbad = 'S-DV-BAD';

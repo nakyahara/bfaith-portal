@@ -144,15 +144,18 @@ export async function runPush({
   afterSend = null,          // 送り終えた後 (lock の中・持ち主の確認の後) に回す処理 (ctx) → 結果。error があれば run は ok = false (Codex D5b-1 R2 #3)
   beforeScan = null, beforeChunk = null, receiptRows = null, beforeAck = null,   // 上の「任意」
   onScanSnapshot = null, chunkExtra = null,                                       // 上の「任意」(D7b-1b-3)
+  measure = false,   // dry-run だけ: 毎朝の実の回に近い時間・メモリを測る = beforeScan (Render の読み取り) を呼び、変わった行を chunk の形に serialize して捨てる (送らない・台帳に書かない。#1567 Codex R5 Medium 2)
 }) {
   if (chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk は 1〜${MAX_CHUNK}`);
+  if (measure && !dryRun) throw new Error('measure は dry-run だけ');
+  if (measure && (!base || !syncKey)) throw new Error('measure は Render を読む = 送り先と MIRROR_SYNC_KEY が要る');
   if (!dryRun) {
     if (!base) throw new Error('送り先が決まらない (RENDER_MIRROR_URL / RENDER_PORTAL_URL を確かめる。https で同じホストのときだけ)');
     if (!syncKey) throw new Error('MIRROR_SYNC_KEY が無い');
   }
   const startedAt = now();
   const r = { ok: false, kind, mode, dryRun, force, runId: null, batchSeq: null, scanned: 0, inScope: 0, unchanged: 0, changed: 0, sent: 0, applied: 0, same: 0, stale: 0, failed: [], staleKeys: [], chunks: 0,
-    transformErrors: [], noSyncedAt: 0, lockedBy: null, example: null, remote: null, ledgerReset: null, ledgerRebuilt: 0, carriedOver: 0, stats, afterSend: null, scanSnapshot: null };
+    transformErrors: [], noSyncedAt: 0, lockedBy: null, example: null, remote: null, ledgerReset: null, ledgerRebuilt: 0, carriedOver: 0, stats, afterSend: null, scanSnapshot: null, measure: null };
   if (!dryRun) {
     const lock = ledger.acquireLock({ owner, pid, now: startedAt, ...(isAlive ? { isAlive } : {}) });
     if (!lock.ok) { r.lockedBy = lock.held; log(`[company-db push ${label}] 別の送り手が走っている (${lock.held.owner} pid ${lock.held.pid} 心拍 ${lock.held.heartbeat_at}) ので見送った`); return r; }
@@ -193,6 +196,22 @@ export async function runPush({
     }
     let pre = null;
     if (beforeScan && !dryRun) { pre = await beforeScan({ fetchImpl, base, syncKey, log, mustOwn }); mustOwn(); }
+    // measure (dry-run) = 実の回と同じく Render を読む (読むだけ・lock は持たない = 持ち主の確かめは無し)
+    else if (beforeScan && measure) { const t0 = Date.now(); pre = await beforeScan({ fetchImpl, base, syncKey, log, mustOwn: () => {} }); r.measure = { beforeScanMs: Date.now() - t0 }; }
+    // 変わった行を実の回の chunk と同じ区切り (行数・明細の行数・バイト) で serialize して捨てる (送らない・outbox に書かない)
+    const mz = measure ? Object.assign(r.measure || (r.measure = {}), { renderKeys: pre && pre.renderKeys ? pre.renderKeys.size : null, rows: 0, rowBytes: 0, chunks: 0, chunkBytes: 0, maxChunkBytes: 0 }) : null;
+    let mzRows = [], mzLines = 0, mzBytes = 0;
+    const mzFlush = () => {
+      if (!mz || !mzRows.length) return;
+      const n = Buffer.byteLength(JSON.stringify({ run_id: 'measure', batch_seq: 0, chunk_index: mz.chunks, last: false, transform_version: transformVersion, rows: mzRows, ...(chunkExtra || {}) }));
+      mz.chunks++; mz.chunkBytes += n; mz.maxChunkBytes = Math.max(mz.maxChunkBytes, n);
+      mzRows = []; mzLines = 0; mzBytes = 0;
+    };
+    const mzAdd = (item) => {
+      const p = JSON.stringify(item.payload), n = Buffer.byteLength(p), lines = item.payload.lines ? item.payload.lines.length : 0;
+      if (mzRows.length && (mzRows.length >= chunkSize || mzLines + lines > MAX_LINES_PER_CHUNK || mzBytes + n > maxBodyBytes)) mzFlush();
+      mzRows.push(JSON.parse(p)); mzLines += lines; mzBytes += n; mz.rows++; mz.rowBytes += n;
+    };
     fps = ledger.loadFingerprints();
     // ── ① raw を 1 つの読み取り取引で流し読み (snapshot はここで閉じる。HTTP の間は持たない。Codex R2 #6) ──
     let buf = [];
@@ -215,12 +234,13 @@ export async function runPush({
         if (!force && fps.get(item.key) === fp) { r.unchanged++; continue; }
         r.changed++;
         if (!r.example) r.example = item.payload;
-        if (dryRun) continue;
+        if (dryRun) { if (mz) mzAdd(item); continue; }
         const payload = JSON.stringify(item.payload);
         buf.push({ key: item.key, fp, payload, n_lines: item.payload.lines.length, n_bytes: Buffer.byteLength(payload) });
         if (buf.length >= 1000) flushBuf();
       }
       flushBuf();
+      mzFlush();
       // 同じ読み取りの取引の中で manifest と生の表の版を計算する (D7b-1b-3)。例外 = run ごと失敗 (送らない)
       if (onScanSnapshot) r.scanSnapshot = onScanSnapshot({ warehouse, stats, ctx, r });
     } finally {
@@ -228,6 +248,7 @@ export async function runPush({
     }
     log(`[company-db push ${label}] ${scopeLabel}: 読んだ ${r.scanned} / 範囲 ${r.inScope} / 変化なし ${r.unchanged} / 変わった ${r.changed} (整形できない ${r.transformErrors.length} / 更新時刻無し ${r.noSyncedAt})${dryRun ? ' [dry-run]' : ''}`);
     for (const t of r.transformErrors.slice(0, 20)) log(`  整形できない: ${t.key}: ${t.error}`);
+    if (mz) log(`[company-db push ${label}] measure: Render の鍵 ${mz.renderKeys ?? '-'} 件 (${mz.beforeScanMs ?? '-'} ms) / 変わった行の serialize ${mz.rows} 行・${Math.round(mz.rowBytes / 1024)} KB / chunk ${mz.chunks} 個・最大 ${Math.round(mz.maxChunkBytes / 1024)} KB (送らない)`);
     if (dryRun) { if (r.example) log(`  例: ${JSON.stringify(r.example).slice(0, 600)}`); r.ok = r.transformErrors.length === 0; return r; }
 
     // ── ② outbox から chunk を取って送る ──

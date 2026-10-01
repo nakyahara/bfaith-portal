@@ -11,9 +11,9 @@
  * この部品は **記録だけ**。読み手 = coverage の判定 (amazon-finance-coverage.js)。
  * 🆕 2026-10-01 (D7b-1b-3): coordinator の回は見出しに coverage_generation・run_token・evidence_epoch (その時の最新の初期の印) を書き、
  *   記録の取引の中で lease を確かめる (params.check)。行には取込が入れた文書の版 (document_version_seq) も書く。
- *   取込む行 (raw_amazon_settlement_lines / headers) の中身と数は変えない:
- *   一覧の記録用の getReports は **取込の一覧とは別の要求** (窓を固定する)。取込は今までどおり日時の境なしの一覧で選ぶ
- *   (日時の境なし = Amazon の既定の createdSince 90 日前〜今。85 日の窓に揃えると 85〜90 日前に作られた report を取込まなくなる)。
+ *   一覧の記録用の getReports は **取込の一覧とは別の要求** (時間の上限つきの専用の接続・失敗しても取込は続ける)。
+ *   🆕 2026-10-01 (#1567 Codex R4): 取込の一覧も **同じ固定の窓** (回の開始とその 85 日前) = 証拠の一覧に出ない report
+ *   (85〜90 日前に作られた・回の開始の後に作られた) は取込まない (前 = 取込は日時の境なし = Amazon の既定の 90 日)。
  *
  * 表 (db.js):
  *   amazon_settlement_report_inventory_runs = 一覧の回の見出し (窓・最後のページまで取れたか・数・snapshot の digest)

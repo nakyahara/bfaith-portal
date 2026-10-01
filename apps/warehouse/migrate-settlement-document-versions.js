@@ -21,7 +21,7 @@
  */
 import 'dotenv/config';
 import { initDB, getDB } from './db.js';
-import { backfillDocumentVersions, refreshStaleVersionDetails, acquireCoverageLease, releaseCoverageLease, assertLease, documentVersionsReady, documentVersionProblems,
+import { backfillDocumentVersions, refreshStaleVersionDetails, newTxTimer, acquireCoverageLease, releaseCoverageLease, assertLease, documentVersionsReady, documentVersionProblems,
   documentVersionWarnings, header0MultiVersionSettlements } from './amazon-settlement-versions.js';
 import { isAliveNodeSince } from './retry-lock.js';
 import { pathToFileURL } from 'node:url';
@@ -55,10 +55,12 @@ export async function runMigrate({ commit = false, allowUnresolved = false, log 
   const lease = got.lease;
   try {
     const check = (dbx) => assertLease(dbx, lease);
-    const out = backfillDocumentVersions(db, { check, log, allowUnresolved });
-    const refreshed = refreshStaleVersionDetails(db, { check, log });
+    // 全部の書き込みの取引 (版の登録・行の版の UPDATE・版の +1・要約の作り直し) の時間を 1 つの計りで測る = 「1 取引の最長」(#1567 Codex R5 Medium 1)
+    const txTimer = newTxTimer();
+    const out = backfillDocumentVersions(db, { check, log, allowUnresolved, txTimer });
+    const refreshed = refreshStaleVersionDetails(db, { check, log, txTimer });
     const problems = documentVersionProblems(db);
-    log(`[versions] ${problems.length ? '⚠️' : '✅'} 版を付けた: 文書 ${out.groups}・版 ${out.versions}・明細 ${out.lines} 行・見出し ${out.headers} 行 / 要約を作り直した版 ${refreshed + (out.refreshed || 0)} / 1 取引の最長 ${out.maxTxMs || 0} ms`);
+    log(`[versions] ${problems.length ? '⚠️' : '✅'} 版を付けた: 文書 ${out.groups}・版 ${out.versions}・明細 ${out.lines} 行・見出し ${out.headers} 行 / 要約を作り直した版 ${refreshed + (out.refreshed || 0)} / 1 取引の最長 ${txTimer.maxMs} ms (${txTimer.maxName ?? '-'}・書き込みの取引 ${txTimer.count})`);
     for (const p of problems) log(`[versions] ❌ ${p.code}: ${p.detail}`);
     if (!problems.length) log('[versions] build と送り手が読める状態 (版の無い行・要約の古い版なし)');
     const warnings = documentVersionWarnings(db);
@@ -66,7 +68,7 @@ export async function runMigrate({ commit = false, allowUnresolved = false, log 
     // 🚨 見出し 0 行の版があり、ほかの版もある決済 (#1567 R2 High 1) = 初回の coordinator の前に 0 件を確かめる
     const h0 = header0MultiVersionSettlements(db);
     log(h0.length ? `[versions] 🚨 見出し 0 行の版があり、ほかの版もある決済 ${h0.length}: ${h0.slice(0, 10).map((x) => `${x.settlement_id} (版 ${x.versions}・見出し 0 行 ${x.header0})`).join(' / ')} = どの版を採るか人が確かめてから初回を流す` : '[versions] 見出し 0 行の版があり、ほかの版もある決済 0 (✅)');
-    return { ready: problems.length === 0, problems, warnings, header0Multi: h0, ...out, refreshed, committed: true };
+    return { ready: problems.length === 0, problems, warnings, header0Multi: h0, ...out, maxTxMs: txTimer.maxMs, maxTxName: txTimer.maxName, txCount: txTimer.count, refreshed, committed: true };
   } finally { releaseCoverageLease(db, lease); }
 }
 

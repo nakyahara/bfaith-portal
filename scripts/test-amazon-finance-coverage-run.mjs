@@ -259,6 +259,36 @@ await t('🚨 dry-run は coverage・台帳・lease・生の表に触れない (
   assert.deepEqual(V.readLease(db), before.lease); assert.deepEqual(rawCounts(), before.raw);
   assert.ok(codes(r).includes('inventory_this_run'), '今回の一覧の回は本番の回でだけ');
 });
+await t('--measure (dry-run) = Render の鍵を読み (GET だけ)・変わった注文を chunk の形に serialize して測る・送らない・書かない / --measure の無い dry-run は Render の鍵を読まない (#1567 Codex R5 Medium 2)', async () => {
+  const { parseArgs: parseCovArgs } = await import('../apps/warehouse/amazon-finance-coverage-run.js');
+  assert.deepEqual([parseCovArgs(['--measure']).dryRun, parseCovArgs(['--measure']).measure, parseCovArgs(['--dry-run']).measure], [true, true, false], '--measure は dry-run を含む');
+  await assert.rejects(() => run({ dryRun: false, measure: true }), /dry-run だけ/);
+  // 変わる注文を 1 つ作る (台帳の指紋をずらす = 実の回なら送り直す注文)。終わったら戻す (後の試験は変わった注文 0 が前提)
+  const setFpOA = (v) => { const l = openLedger(tmpDir, { kind: FINANCE_KIND }); try { l.db.prepare(`update sent set fp = ? where kind = ? and key like '%O-A'`).run(v, FINANCE_KIND); } finally { l.close(); } };
+  const fpOA = () => { const l = openLedger(tmpDir, { kind: FINANCE_KIND }); try { return l.db.prepare(`select fp from sent where kind = ? and key like '%O-A'`).get(FINANCE_KIND).fp; } finally { l.close(); } };
+  const fp0 = fpOA();
+  setFpOA('x');
+  try {
+    const before = { c: await cov(), g: ledgerMeta('coverage_generation'), lease: V.readLease(db), raw: rawCounts(), fp: fpOA() };
+    const gets = [];
+    const f0 = spyFetch();
+    const f = async (url, init = {}) => { if (!init.method || init.method === 'GET') gets.push(String(url)); return f0(url, init); };
+    const r = await run({ fetchImpl: f, dryRun: true, measure: true });
+    assert.equal(r.exitCode, 0, r.summary);
+    assert.equal(f0.calls.updating + f0.calls.complete + f0.calls.chunks, 0, '送らない (POST 0)');
+    assert.ok(gets.some((u) => u.includes('/order-finance/keys')), 'Render の鍵を読む (実の回と同じ beforeScan・GET だけ)');
+    const m = r.push.measure;
+    assert.ok(m && m.renderKeys > 0 && m.rows >= 1 && m.chunks >= 1 && m.rowBytes > 0 && m.maxChunkBytes > m.rowBytes / m.rows, JSON.stringify(m));
+    assert.match(r.summary, /dry-run --measure.*Render の鍵 \d+ 件・変わった \d+ 注文を chunk \d+ 個に serialize/);
+    assert.deepEqual(await cov(), before.c); assert.equal(ledgerMeta('coverage_generation'), before.g);
+    assert.deepEqual(V.readLease(db), before.lease); assert.deepEqual(rawCounts(), before.raw);
+    assert.equal(fpOA(), before.fp, '台帳に書かない (指紋はずらしたまま)');
+    gets.length = 0;
+    const r2 = await run({ fetchImpl: f, dryRun: true });
+    assert.equal(r2.exitCode, 0, r2.summary); assert.equal(r2.push.measure, null);
+    assert.ok(!gets.some((u) => u.includes('/order-finance/keys')), '--measure の無い dry-run は Render の鍵を読まない (今までどおり)');
+  } finally { setFpOA(fp0); }
+});
 await t('Render の世代を追う (台帳の世代が古い = Render の復元の後) → 変わりが無くても新しい世代で complete', async () => {
   setLedgerMeta('coverage_generation', '1');
   const r = await run({ fetchImpl: spyFetch() });

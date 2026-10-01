@@ -33,6 +33,9 @@
  *   node apps/warehouse/amazon-finance-coverage-run.js                 → 1 回 (取込 + 送信 + coverage)
  *   node apps/warehouse/amazon-finance-coverage-run.js --dry-run       → 生の表・lease・台帳・Render に書かない・送らない (送り手は変換と manifest の判定だけ・Render は読むだけ)。
  *      🚨 ただし initDB の表の用意 (初回は列と索引を足す) は走り、SP-API の一覧の取得・レポートのダウンロードもする (レートの枠を使う)
+ *   node apps/warehouse/amazon-finance-coverage-run.js --measure       → --dry-run + 毎朝の実の --full に近い時間・メモリを測る = Render の鍵の一覧 (注文ごとの行数) を読み (GET だけ)、
+ *      変わった注文を実の回と同じ区切りで chunk に serialize して捨てる (送らない・台帳に書かない。#1567 Codex R5 Medium 2)。
+ *      🚨 それでも送信・台帳・受領の記録の書き込みはしない = 定期実行の前のハードゲートは実の回 (README「デプロイの前に本番の DB のコピーで測る」)
  *   node apps/warehouse/amazon-finance-coverage-run.js --source v1     → 旧 V1 レポートで取る (11/11 まで。V1 の一覧では coverage は complete にならない = 必須は V2)
  * 終了コード: 0 = 済んだ (complete / 印が無いなど人が直すまでの ⚠️ / 取込だけ) / 1 = 失敗 (retry) / 3 = 取り込めない V2 がある (規則を足す)
  * env: DATA_DIR (必須)・RENDER_MIRROR_URL / MIRROR_SYNC_KEY・CDB_DB_LIMIT_BYTES (送るとき)・SP-API の鍵
@@ -123,7 +126,9 @@ export async function runCoverage({
   dataDir, source = 'v2', dryRun = false, fetchImpl = fetch, base, syncKey, sp, inventorySp = null, downloadTsv = null, now = () => new Date(),
   isAlive = isAliveNodeSince, log = console.log, capacity = undefined, chunkSize = DEFAULT_CHUNK, sleep = defaultSleep, businessDate = todayJst(), hooks = {},
   pid = process.pid, readonlyTimeoutMs = 60000,
+  measure = false,   // dry-run だけ: Render の鍵の取得 (読むだけ) と変わった注文の chunk の serialize まで測る (送らない・書かない。#1567 Codex R5 Medium 2)
 }) {
+  if (measure && !dryRun) throw new Error('measure は dry-run だけ (--measure は --dry-run を含む)');
   if (!dataDir) throw new Error('DATA_DIR が無い');
   const wallStart = Date.now();   // 所要時間 (記録に残す。回の時計 now() は試験で進めるので使わない)
   if (!Object.hasOwn(SOURCES, source)) throw new Error(`source は v1 か v2: ${source}`);
@@ -147,14 +152,16 @@ export async function runCoverage({
       const policy = status && status.policy ? status.policy : { rows: [{ period_from: '2026-01-01', period_to: null, source: FINANCE_SOURCE }], fingerprint: '0'.repeat(64) };
       const w = openReader();
       try {
-        const r = await pushAmazonFinance({ warehouse: w, ledger, base, syncKey, mode: 'full', dryRun: true, fetchImpl, log, now, chunkSize,
+        const r = await pushAmazonFinance({ warehouse: w, ledger, base, syncKey, mode: 'full', dryRun: true, measure, fetchImpl, log, now, chunkSize,
           coverage: { generation: 0, runToken: 'dry-run-no-token', onScanSnapshot: ({ warehouse, stats, receipts }) => ({ ...evaluateCoverage(warehouse, { generation: 0, runToken: 'dry-run-no-token', policy, source: FINANCE_SOURCE, now: now(), receipts, sourceRevision: stats.sourceRevision }), sourceRevision: stats.sourceRevision }) } });
         out.push = r;
         const snap = r.scanSnapshot;
         out.reasons = snap ? snap.reasons : [];
         log(`[coverage] dry-run の判定: settlements_through ${snap && snap.diag.settlementsThrough} / 期待の集合 ${snap && snap.diag.expectedItems} / 理由 ${out.reasons.map((x) => x.code).join(', ') || 'なし (今回の一覧の回の条件は本番の回でだけ満たす)'}`);
       } finally { w.close(); }
-      out.summary = `✅ Amazon 決済と財務 (dry-run): 書かない・送らない / 変換 ${out.push.scanned} 注文 / coverage の理由 ${out.reasons.length}`;
+      const mz = out.push.measure;
+      out.summary = `✅ Amazon 決済と財務 (dry-run${measure ? ' --measure' : ''}): 書かない・送らない / 変換 ${out.push.scanned} 注文 / coverage の理由 ${out.reasons.length}`
+        + (mz ? ` / Render の鍵 ${mz.renderKeys} 件・変わった ${mz.rows} 注文を chunk ${mz.chunks} 個に serialize` : '');
       return out;
     } finally { ledger.close(); }
   }
@@ -404,10 +411,11 @@ function coverageHooks({ db, lease, generation, policy, fetchImpl, base, syncKey
 }
 
 export function parseArgs(argv) {
-  const out = { dryRun: false, source: 'v2', chunk: null };
+  const out = { dryRun: false, measure: false, source: 'v2', chunk: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') out.dryRun = true;
+    else if (a === '--measure') { out.dryRun = true; out.measure = true; }   // dry-run + Render の鍵の取得・chunk の serialize まで (毎朝の実の --full に近い時間・メモリ)
     else if (a === '--source') out.source = argv[++i];
     else if (a === '--chunk') out.chunk = argv[++i];
     else throw new Error(`知らない引数: ${a}`);
@@ -426,7 +434,7 @@ if (isDirectRun) {
     if (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk が不正: ${chunkSize}`);
     const { sp, inventorySp } = spClients();
     const t0 = Date.now();
-    const r = await runCoverage({ dataDir, source: a.source, dryRun: a.dryRun, base: syncBase(), syncKey: process.env.MIRROR_SYNC_KEY || '', sp, inventorySp, chunkSize });
+    const r = await runCoverage({ dataDir, source: a.source, dryRun: a.dryRun, measure: a.measure, base: syncBase(), syncKey: process.env.MIRROR_SYNC_KEY || '', sp, inventorySp, chunkSize });
     // 所要時間と最大メモリ (初回を夜に手で流すとき、daily-sync の上限 90 分に余裕があるか確かめる・#1567 Codex R1)
     console.log(`[coverage] 所要 ${((Date.now() - t0) / 60000).toFixed(1)} 分・最大メモリ (RSS) ${Math.round(process.resourceUsage().maxRSS / 1024)} MB`);
     console.log(r.summary);

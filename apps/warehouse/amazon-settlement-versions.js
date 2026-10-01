@@ -408,11 +408,27 @@ export function versionDetailValid(d) {
   return String(d.components_sum_micro ?? 0) === String(d.header_total_micro ?? 'x');
 }
 
-/** 古い印の版を全部作り直す (1 版 = 1 取引)。check = 取引の中の確かめ (lease)。戻り = 作り直した数 */
-export function refreshStaleVersionDetails(db, { check = null, log = () => {} } = {}) {
+/**
+ * 書き込みの取引 (BEGIN IMMEDIATE) の時間 = 書き込みの lock を持った時間を測る。最長とその取引の名前を持つ (#1567 Codex R5 Medium 1)。
+ *   版付けの「1 取引の最長」= 版の登録・行の版の UPDATE・版の +1・要約の作り直し (1 版の全行を読み並べ digest を作る) の **全部** の取引の最長
+ */
+export function newTxTimer() {
+  return {
+    maxMs: 0, maxName: null, count: 0,
+    record(name, ms) { this.count++; if (this.maxName == null || ms > this.maxMs) { this.maxMs = ms; this.maxName = name; } },
+  };
+}
+/** 測りながら BEGIN IMMEDIATE の取引を回す (例外でも測る) */
+function timedImmediate(db, timer, name, fn) {
+  const t0 = Date.now();
+  try { return db.transaction(fn).immediate(); } finally { if (timer) timer.record(name, Date.now() - t0); }
+}
+
+/** 古い印の版を全部作り直す (1 版 = 1 取引)。check = 取引の中の確かめ (lease)。txTimer = 取引の時間を測る (newTxTimer)。戻り = 作り直した数 */
+export function refreshStaleVersionDetails(db, { check = null, log = () => {}, txTimer = null } = {}) {
   const seqs = db.prepare(`SELECT seq FROM amazon_settlement_document_versions WHERE detail_stale = 1 ORDER BY seq`).all().map((r) => r.seq);
   for (const seq of seqs) {
-    db.transaction(() => { if (check) check(db); refreshVersionDetail(db, seq); }).immediate();
+    timedImmediate(db, txTimer, `要約の作り直し (版 #${seq})`, () => { if (check) check(db); refreshVersionDetail(db, seq); });
   }
   if (seqs.length) log(`[versions] 版の要約を作り直した: ${seqs.length} 版`);
   return seqs.length;
@@ -513,8 +529,11 @@ export class MultiHeaderDocsError extends Error {
     this.groups = groups;
   }
 }
-export function backfillDocumentVersions(db, { batchIds = 200000, check = null, log = () => {}, now = new Date(), allowUnresolved = false } = {}) {
-  const tx = (fn) => db.transaction(() => { if (check) check(db); return fn(); }).immediate();
+export function backfillDocumentVersions(db, { batchIds = 200000, check = null, log = () => {}, now = new Date(), allowUnresolved = false, txTimer = null } = {}) {
+  // 🚨 全部の書き込みの取引を測る (版の登録・行の版の UPDATE・版の +1・要約の作り直し) = 「1 取引の最長」(#1567 Codex R5 Medium 1)
+  const timer = txTimer || newTxTimer();
+  const tx = (name, fn) => timedImmediate(db, timer, name, () => { if (check) check(db); return fn(); });
+  const done = (o) => Object.assign(o, { maxTxMs: timer.maxMs, maxTxName: timer.maxName, txCount: timer.count });
   // 決済 ID も group で取る (R1 High 1: 版の登録と同じ取引で入れる = 行の UPDATE の後に止まっても決済 ID の無い版を残さない)。
   //   見出しの決済 ID が 1 つならそれ・見出しが無ければ明細の決済 ID が 1 つならそれ・どちらでもなければ null (壊れた文書 = assertDocumentVersionsReady が止める)
   const groups = db.prepare(`
@@ -528,7 +547,7 @@ export function backfillDocumentVersions(db, { batchIds = 200000, check = null, 
       UNION ALL
       SELECT source_layer, source_document_id, source_file_hash, parser_version, ingested_at, source_settlement_id, 1 AS is_header FROM raw_amazon_settlement_headers INDEXED BY idx_settle_headers_docver WHERE document_version_seq IS NULL
     ) GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4`).all();
-  if (!groups.length) return { groups: 0, versions: 0, lines: 0, headers: 0, refreshed: refreshStaleVersionDetails(db, { check, log }) };
+  if (!groups.length) return done({ groups: 0, versions: 0, lines: 0, headers: 0, refreshed: refreshStaleVersionDetails(db, { check, log, txTimer: timer }) });
   // 見出しと明細の決済 ID の和集合が 2 つ以上 = 決まらない → 版を付けずに止まる (明示の allowUnresolved だけ進める = 決済 ID が null の版・version_unresolved_settlement)
   const unresolved = groups.filter((g) => g.u_n > 1);
   if (unresolved.length && !allowUnresolved) throw new UnresolvedSettlementDocsError(unresolved);
@@ -538,7 +557,7 @@ export function backfillDocumentVersions(db, { batchIds = 200000, check = null, 
   if (multiHeader.length) throw new MultiHeaderDocsError(multiHeader);
   log(`[versions] 版の無い文書 ${groups.length} 個に版を付ける`);
   const seqs = [];
-  tx(() => {
+  tx(`版の登録 (文書 ${groups.length})`, () => {
     db.exec(`CREATE TEMP TABLE IF NOT EXISTS _asdv_map (source_layer TEXT, source_document_id TEXT, source_file_hash TEXT, parser_version TEXT, seq INTEGER)`);
     db.exec(`DELETE FROM temp._asdv_map`);
     const ins = db.prepare(`INSERT INTO temp._asdv_map VALUES (?, ?, ?, ?, ?)`);
@@ -566,16 +585,17 @@ export function backfillDocumentVersions(db, { batchIds = 200000, check = null, 
     if (mm.a == null) continue;
     const upd = db.prepare(setSql(t));
     for (let a = mm.a; a <= mm.b; a += batchIds) {
+      const b = Math.min(a + batchIds - 1, mm.b);
       const t0 = Date.now();
-      out[key] += tx(() => upd.run(a, Math.min(a + batchIds - 1, mm.b)).changes);
-      out.maxTxMs = Math.max(out.maxTxMs || 0, Date.now() - t0);
-      if (key === 'lines') log(`[versions]   明細 id ${a}〜${Math.min(a + batchIds - 1, mm.b)}: 累計 ${out.lines} 行 (この取引 ${Date.now() - t0} ms = 書き込みの lock を持った時間)`);
+      out[key] += tx(`${key === 'lines' ? '明細' : '見出し'}の行の版 (id ${a}〜${b})`, () => upd.run(a, b).changes);
+      if (key === 'lines') log(`[versions]   明細 id ${a}〜${b}: 累計 ${out.lines} 行 (この取引 ${Date.now() - t0} ms = 書き込みの lock を持った時間)`);
     }
   }
-  tx(() => { bumpSourceRevision(db); db.exec(`DROP TABLE IF EXISTS temp._asdv_map`); });
+  tx('版の +1', () => { bumpSourceRevision(db); db.exec(`DROP TABLE IF EXISTS temp._asdv_map`); });
   // 要約 (1 版 = 1 取引)。今回の版だけでなく、古い印の版を全部 (前の回が途中で止まった版・行を手で直した版も)
-  out.refreshed = refreshStaleVersionDetails(db, { check, log });
-  log(`[versions] 版を付けた: 文書 ${out.groups} / 版 ${out.versions} / 明細 ${out.lines} 行 / 見出し ${out.headers} 行 / 1 取引の最長 ${out.maxTxMs || 0} ms`);
+  out.refreshed = refreshStaleVersionDetails(db, { check, log, txTimer: timer });
+  done(out);
+  log(`[versions] 版を付けた: 文書 ${out.groups} / 版 ${out.versions} / 明細 ${out.lines} 行 / 見出し ${out.headers} 行 / 1 取引の最長 ${out.maxTxMs} ms (${out.maxTxName ?? '-'}・取引 ${out.txCount})`);
   return out;
 }
 
