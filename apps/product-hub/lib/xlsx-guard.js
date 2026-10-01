@@ -9,9 +9,18 @@
  * 「展開後サイズ」が書いてあり、**1 バイトも展開せずに**合計が分かる。
  * 解凍しないので、どんなに悪い入力でもここでの費用は数十 KB の走査だけ。
  *
- * 嘘のサイズが書かれている可能性はある (中央ディレクトリは自己申告)。
- * それでも「申告が大きい」ものは確実に弾けるので、素朴な爆弾には十分効く。
- * 申告を偽って実際に巨大なものは防げない — それは load 後のセル数・文字数の上限で受ける。
+ * ## 残しているリスク (承知の上・Codex API R4 #2)
+ *
+ * 中央ディレクトリは**自己申告**なので、「小さい」と嘘を書いて実際は巨大、という入力は
+ * ここでは弾けない。その場合 `wb.xlsx.load(buf)` の最中にメモリが尽きるので、
+ * load 後のセル数・文字数の上限にも届かない。
+ * 完全に防ぐにはメモリ・時間の上限付きの別プロセスで展開するしかないが、**入れていない**:
+ *
+ *   - この口は **admin 限定** (router.js の requireAdminJson)。攻撃者は自社の管理者本人になる
+ *   - 社員数十名・開発は実質 1 人の社内ツールで、別プロセスの隔離を保守し続ける費用に見合わない
+ *     (過剰設計で作り切れないことも失敗 — 段階1 の設計方針そのもの)
+ *
+ * もしこの口を admin 以外や社外に開けるなら、**そのときに隔離を入れる**。
  */
 
 const EOCD_SIG = 0x06054b50;      // End of Central Directory
@@ -50,11 +59,14 @@ export function zipExpandedSize(buf) {
   }
   if (cdOffset + cdSize > buf.length) throw new Error('ZIP の中央ディレクトリが壊れています');
 
+  // 🚨 `entries` の数だけ読むのでは**過少申告で迂回できる** (entries=1 と書いて 100 個置く)。
+  //    中央ディレクトリの**終端まで**走り切り、数えた件数が申告と一致することまで見る (Codex API R4 #1)。
+  const cdEnd = cdOffset + cdSize;
   let p = cdOffset;
   let expanded = 0;
   let n = 0;
-  while (n < entries) {
-    if (p + 46 > buf.length || buf.readUInt32LE(p) !== CDH_SIG) {
+  while (p < cdEnd) {
+    if (p + 46 > cdEnd || buf.readUInt32LE(p) !== CDH_SIG) {
       throw new Error('ZIP の中央ディレクトリが壊れています');
     }
     const uncompressed = buf.readUInt32LE(p + 24);
@@ -65,8 +77,13 @@ export function zipExpandedSize(buf) {
     const commentLen = buf.readUInt16LE(p + 32);
     p += 46 + nameLen + extraLen + commentLen;
     n += 1;
+    if (n > 0xffff) throw new Error('ZIP の中央ディレクトリが壊れています');
   }
-  return { entries, expandedBytes: expanded };
+  if (p !== cdEnd) throw new Error('ZIP の中央ディレクトリが壊れています');
+  if (n !== entries) {
+    throw new Error(`ZIP の件数の申告が合いません (申告 ${entries} / 実際 ${n})`);
+  }
+  return { entries: n, expandedBytes: expanded };
 }
 
 /**

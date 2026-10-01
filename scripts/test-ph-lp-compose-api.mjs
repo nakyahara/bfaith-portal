@@ -129,6 +129,17 @@ ok(bombCaught && bombCaught.tooLarge,
 const ratioCaught = expect(() => assertXlsxExpandsSafely(xlsx, { maxRatio: 2 }));
 ok(ratioCaught && ratioCaught.tooLarge, `🚨 圧縮比でも弾ける (${ratioCaught && ratioCaught.message})`);
 ok(expect(() => assertXlsxExpandsSafely(xlsx, { maxEntries: 2 }))?.tooLarge, 'ファイル数でも弾ける');
+// 🚨 件数の過少申告で迂回できない (entries=1 と書いて 100 個置く手・Codex API R4 #1)
+const lieBuf = Buffer.from(xlsx);
+let eocd = -1;
+for (let i = lieBuf.length - 22; i >= 0; i--) {
+  if (lieBuf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+}
+ok(eocd >= 0, 'EOCD が見つかる');
+lieBuf.writeUInt16LE(1, eocd + 10);   // 「1 ファイルだけ」と嘘をつく
+const lieCaught = expect(() => zipExpandedSize(lieBuf));
+ok(lieCaught && /件数の申告が合いません/.test(lieCaught.message),
+  `🚨 件数の過少申告を弾く (${lieCaught && lieCaught.message})`);
 const ExcelJS2 = (await import('exceljs')).default;
 ok((() => { try { zipExpandedSize(Buffer.from('zip でない')); return false; } catch { return true; } })(),
   'ZIP でなければ普通の Error (= 400)');
