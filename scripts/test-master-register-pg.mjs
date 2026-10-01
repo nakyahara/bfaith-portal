@@ -1,12 +1,12 @@
 /**
- * test-master-register-pg.mjs — 新商品の登録・登録の状態・カードの知らせ (0051・lib/master-register.mjs・lib/product-hub-outbox.mjs) の**同時実行**と**ロールの権限**を、
+ * test-master-register-pg.mjs — 新商品の登録・登録の状態・カードの知らせ (0052・lib/master-register.mjs・lib/product-hub-outbox.mjs) の**同時実行**と**ロールの権限**を、
  *   実 PostgreSQL の独立した接続で確かめる (PGlite は 1 接続なので書けない。PR #1566 Codex R1 M7 / 契約 v3 M5・仮レビュー M-A / L7)
  *
  * 接続は本番と同じロールでログインする (⑤-1 の create-master-edit-roles.mjs で作る・パスワードは試験の回ごと):
  *   登録・取り込み (A・B) = master_edit / backfill・段階 (P) = master_ops / 門の記録 (GR・GM) = master_gate_render・master_gate_minipc /
  *   持ち主 (O・O2) = 夜間ロード・migration・ほかの処理の代わり
  * 固定する契約:
- *   0 backfill の前は new_open に進めない (⑤-1 の前提の差し込み口の表に 0051 が 1 行 = 0051_registrations)
+ *   0 backfill の前は new_open に進めない (⑤-1 の前提の差し込み口の表に 0052 が 1 行 = 0052_registrations)
  *   1 同じ新しいコードを 2 人が同時に登録: 後の人はコードの鍵で待ち、前の人の commit の後に 409 code_taken (SKU は 1 つ)
  *   2 夜間ロードと登録: (a) 登録が先 (commit 前) = ロードはマスタの書き込みの鍵で待ってから同じ行に重ね、状態は draft のまま (要確認にしない)
  *                       (b) 夜間ロードのような取引が先に同じコードを入れた (commit 前・鍵なし) = 登録は unique で待ち、commit の後に 409 code_taken (500 にしない)
@@ -18,9 +18,10 @@
  *     知らせの状態の列も書けない (L7)・画面のロールの登録は関数を通して状態を作れる
  *   7 記録の偽造 (仮レビュー M-A): 画面のロールは変更の記録を書けない (42501)・偽の記録があっても前からある SKU は下書きにできない・
  *     同じ取引で直しただけの前からある SKU も下書きにできない (= backfill の計画から外れない)・画面のロールは begin の前は直すこともできない (42501)
- *   8 0050 の画面のロールの書き込みの約束 (#1563 R3 M2・本物のログイン = SET ROLE でない): begin_master_write の前の SKU・知らせの insert = 42501・
- *     下書きの状態の 人 / request_id が begin と違う = 42501・変更の記録と状態の記録は begin の行の人・request_id (core.actor_* の偽の値は使わない)・
- *     登録は begin の行を書く (db_user = master_edit)
+ *   8 登録の関数 ops.register_new_sku と ⑤-1 (0051) の書き込みの約束 (本物のログイン = SET ROLE でない): 画面のロールは SKU・知らせを直接足せない (42501)・
+ *     下書きの状態を作る関数も実行できない・関数の中の書き込みも 0051 の guard が見る (代表の仕入先の業務の約束で断る)・
+ *     変更の記録と状態の記録は登録の約束の人・request_id・理由 (core.actor_* の偽の値は使わない)・関数の外では同じ取引でも登録の約束で書けない・
+ *     登録の約束は db_user = master_edit (ログインした役)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-register-pg.mjs
  *   (この PC では C:/tmp/pg-embed の run-conc.mjs が使い捨ての PostgreSQL を起動して TEST_PG_URL を渡す)
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロール master_* をクラスタに作る)。localhost 以外の URL は拒む (本番を渡さない)。TEST_PG_URL が無ければ飛ばす
@@ -98,8 +99,8 @@ try {
   await acks(ALL_COMPANY, 'company_owner');
   const toNewOpen = () => C.advanceCutoverPhase(dbP, { to: 'new_open', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: h } });
 
-  await ta('[0] backfill の前は new_open に進めない (⑤-1 の前提の差し込み口の表に 0051 が 1 行)', async () => {
-    await assert.rejects(() => toNewOpen(), /prereq_failed: 0051_registrations: backfill_missing/);
+  await ta('[0] backfill の前は new_open に進めない (⑤-1 の前提の差し込み口の表に 0052 が 1 行)', async () => {
+    await assert.rejects(() => toNewOpen(), /prereq_failed: 0052_registrations: backfill_missing/);
     assert.equal((await q('select phase from ops.master_cutover_state'))[0].phase, 'company_owner');
   });
 
@@ -119,7 +120,7 @@ try {
     await O2.query('update core.skus set name = name where sku_id = $1', [id]);
     await assert.rejects(() => O2.query('select ops.create_sku_registration($1, $2)', [id, 't@test']), /not_new_sku/);
     await O2.query('rollback');
-    // 画面のロールは begin_master_write の前は直すことも下書きを作ることもできない (0050 の守り)
+    // 画面のロールは begin_master_write の前は直せない (0051 の守り)・下書きの状態を作る関数は実行できない (登録の関数の中だけ)
     assert.equal(await codeOf(A, 'update core.skus set name = name where sku_id = $1', [id]), '42501');
     assert.equal(await codeOf(A, 'select ops.create_sku_registration($1, $2)', [id, 't@test']), '42501');
     assert.equal(await stateOf('p002'), null);   // 下書きにならない = backfill の計画から外れない
@@ -157,10 +158,8 @@ try {
     await O2.query('select ops.create_sku_registration($1, $2)', [id, 'test@test']);
     await O2.query('commit');
     assert.equal(await stateOf('dt-2'), 'draft');
-    await A.query('begin');
-    await A.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb)', [crypto.randomUUID(), 'naka@test', null, JSON.stringify(ALL_COMPANY)]);
-    await A.query(`insert into core.skus (company_id, sku_kind, code, name, created_by_type, created_by_id) values (1, 'set', 'dt-3', 'x', 'human', 'x')`);
-    await assert.rejects(() => A.query('commit'), /unregistered_sku/);
+    // 画面のロールは SKU を直接足せない (insert の権限なし)。足すのは登録の関数だけ (状態の行も同じ取引で作る)
+    assert.equal(await codeOf(A, `insert into core.skus (company_id, sku_kind, code, name, created_by_type, created_by_id) values (1, 'set', 'dt-3', 'x', 'human', 'x')`), '42501');
   });
 
   await ta('[1] 同じ新しいコードを 2 人 (画面のロール) が同時に登録 = 後の人はコードの鍵で待ち、前の人の commit の後に 409 code_taken', async () => {
@@ -221,7 +220,7 @@ try {
     const r = await reg(dbA, 'lease-1');
     const cards = new Map();
     const applyWith = (who) => async (ev) => {
-      const k = String(ev.payload.cdb_sku_id);
+      const k = String(ev.sku_id);   // SKU は知らせの行の番号 (0052)
       if (cards.has(k)) return { outcome: 'linked', draft_id: cards.get(k).id };
       cards.set(k, { id: cards.size + 1, by: who });
       return { outcome: 'created', draft_id: cards.get(k).id };
@@ -266,32 +265,42 @@ try {
     assert.equal(await stateOf('race-1'), 'cancelled');
   });
 
-  await ta('[8] 画面のロール (本物のログイン) の書き込みの約束 (#1563 R3 M2): begin の前 = 42501・人 / request_id が begin と違う = 42501・記録は begin の行の人', async () => {
+  await ta('[8] 登録の関数 (本物のログイン): 直接の insert = 42501・関数の中も 0051 の guard が見る・記録は登録の約束の人・関数の外では書けない', async () => {
     const p1 = (await q("select sku_id::text as id from core.skus where code = 'p001'"))[0].id;
-    // begin の前: SKU・知らせの insert は 42501
+    // 画面のロールは SKU・知らせを直接足せない・下書きの状態を作る関数も実行できない
     assert.equal(await codeOf(A, `insert into core.skus (company_id, sku_kind, code, name, created_by_type, created_by_id) values (1, 'set', 'g8-0', 'x', 'human', 'x')`), '42501');
     assert.equal(await codeOf(A, `insert into ops.product_hub_outbox (company_id, sku_id, kind, schema_version, payload, payload_hash, request_id, created_by)
       values (1, $1, 'card_create', 'ph-card-v1', '{}'::jsonb, $2, $3::uuid, 'naka@test')`, [p1, 'e'.repeat(64), crypto.randomUUID()]), '42501');
-    // begin の後: 人が違う = 42501 (巻き戻す)
+    assert.equal(await codeOf(A, 'select ops.create_sku_registration($1, $2)', [p1, 'naka@test']), '42501');
+    const entry = (code, over = {}) => ({ kind: 'single', code, started_at: null, product: { name: code, sales_class: 3, expiry_managed: false, inbound_date_managed: null },
+      sku: { name: code, tax_rate: 0.1, tax_class: 'STANDARD_10', handling: 'active', standard_price_jpy: 1000, shipping_code: 'S01', shipping_method: 'ゆうパケット', shipping_cost_jpy: 210,
+        reorder_months: null, set_sales_class_override: null, handling_own: null }, supplier_id: null, cost: null, component_request: null, card: null, result: {}, ...over });
+    const call = (rid, e) => A.query('select ops.register_new_sku($1::uuid, $2, $3, $4::jsonb, $5, $6::jsonb) as r', [rid, 'naka@test', '本物のログインの試験', JSON.stringify(ALL_COMPANY), 'e'.repeat(64), JSON.stringify(e)]);
+    // 関数の中の書き込みも 0051 の guard が見る (取引停止の仕入先を代表にする = 業務の約束で断る)
+    await M.query(`insert into core.suppliers (company_id, code, name, active) values (1, '0099', '止めた仕入先', false) on conflict do nothing`);
+    const stopped = (await q(`select supplier_id::text as id from core.suppliers where code = '0099'`))[0].id;
+    await A.query('begin');
+    await assert.rejects(() => call(crypto.randomUUID(), entry('g8-x', { supplier_id: stopped })), (e) => e.code === '42501' && /master_write_invariant/.test(e.message));
+    await A.query('rollback');
+    // 合っていれば通る・偽の core.actor_id は記録に残らない・関数の外では (同じ取引でも) 登録の約束で書けない
     const rid = crypto.randomUUID();
     await A.query('begin');
-    await A.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb)', [rid, 'naka@test', '本物のログインの試験', JSON.stringify(ALL_COMPANY)]);
-    const sid = (await A.query(`insert into core.skus (company_id, sku_kind, code, name, created_by_type, created_by_id) values (1, 'set', 'g8-1', 'x', 'human', 'naka@test') returning sku_id::text as id`)).rows[0].id;
-    await assert.rejects(() => A.query('select ops.create_sku_registration($1, $2, $3)', [sid, 'evil@x', rid]), (e) => e.code === '42501' && /master_write_session_mismatch/.test(e.message));
-    await A.query('rollback');
-    // 合っていれば通る・偽の core.actor_id は記録に残らない
-    await A.query('begin');
-    await A.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb)', [rid, 'naka@test', '本物のログインの試験', JSON.stringify(ALL_COMPANY)]);
     await A.query(`select set_config('core.actor_id', 'forged@evil', true), set_config('core.actor_type', 'human', true)`);
-    const sid2 = (await A.query(`insert into core.skus (company_id, sku_kind, code, name, created_by_type, created_by_id) values (1, 'set', 'g8-1', 'x', 'human', 'naka@test') returning sku_id::text as id`)).rows[0].id;
-    await A.query('select ops.create_sku_registration($1, $2)', [sid2, 'naka@test']);
+    const r1 = (await call(rid, entry('g8-1'))).rows[0].r;
+    assert.equal(await codeOf(A, 'update core.skus set name = $2 where sku_id = $1', [r1.sku_id, '外で直す']), '42501');
+    await A.query('rollback');
+    await A.query('begin');
+    await A.query(`select set_config('core.actor_id', 'forged@evil', true), set_config('core.actor_type', 'human', true)`);
+    const r2 = (await call(rid, entry('g8-1'))).rows[0].r;
     await A.query('commit');
-    assert.deepEqual(await q(`select distinct actor_id, request_id, reason_text, db_user from events.master_change_events where entity_type = 'sku' and entity_id = $1`, [sid2]),
+    assert.deepEqual(await q(`select distinct actor_id, request_id, reason_text, db_user from events.master_change_events where request_id = $1`, [rid]),
       [{ actor_id: 'naka@test', request_id: rid, reason_text: '本物のログインの試験', db_user: 'master_edit' }]);
-    assert.deepEqual(await q('select actor_id, request_id, reason from ops.master_registration_events where sku_id = $1', [sid2]), [{ actor_id: 'naka@test', request_id: rid, reason: '本物のログインの試験' }]);
-    // 画面の登録は begin の行を書く (db_user = ログインした役)
+    assert.deepEqual(await q('select actor_id, request_id, reason from ops.master_registration_events where sku_id = $1', [r2.sku_id]), [{ actor_id: 'naka@test', request_id: rid, reason: '本物のログインの試験' }]);
+    assert.deepEqual(await q('select operation, status from ops.master_edit_requests where request_id = $1', [rid]), [{ operation: 'sku_create', status: 'done' }]);
+    // 画面の登録も同じ関数 = 登録の約束 (db_user = ログインした役)
     const r = await reg(dbA, 'g8-2');
-    assert.deepEqual(await q('select actor_id, db_user, phase from ops.master_write_sessions where request_id = $1', [r.request_id]), [{ actor_id: 'naka@test', db_user: 'master_edit', phase: 'new_open' }]);
+    assert.deepEqual(await q('select operation, actor_id, db_user, phase from ops.master_write_sessions where request_id = $1', [r.request_id]),
+      [{ operation: 'sku_create', actor_id: 'naka@test', db_user: 'master_edit', phase: 'new_open' }]);
   });
 
 } finally {

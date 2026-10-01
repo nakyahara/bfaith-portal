@@ -47,13 +47,16 @@ export function mapCdbShipping(db, shipping) {
 
 function fail(message) { return Object.assign(new Error(message), { code: 'CDB_CARD_INVALID' }); }
 
-/** payload の最低限の形 (Company DB で確かめ済みの値だが、SQLite に入れる前にもう一度) */
+/**
+ * payload の最低限の形 (Company DB で確かめ済みの値だが、SQLite に入れる前にもう一度)。
+ * SKU = 知らせの行の sku_id (event.sku_id = Company DB が振った番号・lib/product-hub-outbox.mjs の claim が返す)。payload には SKU の番号を入れない (0052)
+ */
 function checkPayload(event) {
   if (!CARD_SCHEMAS.includes(event?.schema_version)) throw fail(`知らない payload の版: ${event?.schema_version}`);
   const p = event.payload || {};
   if (p.schema !== event.schema_version) throw fail('payload の版が知らせの版と違う');
-  const skuId = Number(p.cdb_sku_id);
-  if (!Number.isSafeInteger(skuId) || skuId <= 0) throw fail(`cdb_sku_id が不正: ${p.cdb_sku_id}`);
+  const skuId = Number(event.sku_id);
+  if (!/^[1-9][0-9]{0,15}$/.test(String(event.sku_id ?? '')) || !Number.isSafeInteger(skuId)) throw fail(`知らせの SKU の番号が不正: ${event.sku_id}`);
   const code = String(p.code ?? '').trim();
   if (!/^[a-z0-9_-]{1,30}$/.test(code)) throw fail(`商品コードが不正: ${p.code}`);
   const name = String(p.name ?? '').trim();

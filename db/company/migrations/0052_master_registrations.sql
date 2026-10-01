@@ -1,7 +1,6 @@
--- 0051: 新商品の登録と登録の状態・product-hub のカードの outbox (2026-10-01。Company DB構想 14「マスタ入力画面」§9 v2 H4・§10 契約 v3 H3 / Medium 1・§11 / 10 §2。
---       PR #1566 Codex R1 = High 3 / Medium 4 の直し・仮レビュー (Codex の代わり) の直し)
--- 🚨 前提 = ⑤-1 (feat/sor5-input・PR #1563) の 0050_master_edit.sql だけ (と 0049 までの本流)。ほかの未マージのブランチの 0050 / 0051
---    (#1561 finance-coverage の 0051・#1562 perf の 0050) には寄らない = マージの順番で番号を付け直すときは、このファイルの中身はそのまま動かせる
+-- 0052: 新商品の登録と登録の状態・product-hub のカードの outbox (2026-10-01。Company DB構想 14「マスタ入力画面」§9 v2 H4・§10 契約 v3 H3 / Medium 1・§11 / 10 §2。
+--       PR #1566 Codex R1・R2・仮レビューの直し。⑤-1 (#1563 = 0051_master_edit.sql・マージ済み) の最後の形に合わせた)
+-- 🚨 前提 = 0051_master_edit.sql (⑤-1)。0050 は finance_coverage (関係なし)
 --
 -- なぜ: 新商品を Company DB で作る (画面 D = apps/master-edit/new)。作ったばかりの商品は NE にもロジザードにも無い =
 --   「業務で使ってよい商品か」を SKU ごとの状態で持ち、行が無い商品は使わない (fail-closed)。
@@ -26,25 +25,36 @@
 --        - backfill の前も、表の持ち主 (夜間ロード・migration) とスーパーユーザー以外 (= 画面のロール)
 --      夜間ロードが NE から作った SKU は ops.quarantine_unregistered_skus が同じ取引で quarantined にする (engine.mjs が呼ぶ。backfill の前は何もしない)
 --   4. 切替の門 (R1 H1): new_open に進むのは、backfill がちょうど 1 回済み **かつ** 状態の行の無い SKU が 0 件のときだけ
---      (前提の関数 ops.master_registrations_prereq を 0050 の差し込み口の表 ops.master_cutover_prereq_checks に 1 行足す = set_master_cutover_phase が呼ぶ。
---       集める関数 ops.master_cutover_prereq_problems は上書きしない (#1563 R3)。段階の行の trigger もこの関数を呼ぶ = 下の理由)
+--      (前提の関数 ops.master_registrations_prereq を 0051 の差し込み口の表 ops.master_cutover_prereq_checks に 1 行足す = 0052_registrations。
+--       set_master_cutover_phase が集める関数から呼ぶ。集める関数は上書きしない。段階の行の trigger もこの関数を呼ぶ = 下の理由)
 --   5. ops.v_sku_distributable (distributable・available = 写しに載せてよい) / ops.v_sku_available (available だけ = 業務で使ってよい)。
 --      🚨 今の読み手 (core.skus を直接読む所) はまだ切り替えない (⑤-3 / ⑥)
 --   6. ops.product_hub_outbox = product-hub のカードを作る知らせ。登録と同じ取引で書く。event_id・schema_version・payload・payload_hash は変えない。
+--      SKU は知らせの行の sku_id (DB が振った番号) で結ぶ (payload には入れない = 番号を振る前に payload と hash を作れる)。
 --      消費 (apps/product-hub/services/cdb-card-intake.js) は cdb_sku_id の一意で冪等。状態 = pending → done / failed (再試行) / conflict (同じコードのカードが既にある
 --      = 人が「既存のカードをこの商品に結ぶ」で done にする)。
---      🚨 状態・結果・借りを書くのは security definer の関数 (ops.claim_card_events / ops.finish_card_event = 借りた人だけが結果を書ける) だけ。画面のロールは知らせの insert と読みだけ
---      (仮レビュー L7)。画面のロールの insert は 0050 と同じ守り (trg_master_edit_guard = 同じ取引で ops.begin_master_write の後・段階 new_open) +
---      request_id・作った人が ops.begin_master_write の行と同じ (偽れない)
+--      🚨 知らせを書くのは登録の関数 (下の 8.) だけ・状態・結果・借りを書くのは ops.claim_card_events / ops.finish_card_event (借りた人だけ) だけ。
+--         画面のロールは知らせを読むだけ (insert も渡さない)
 --   7. ops.master_edit_requests.operation に 'sku_create' (新商品の登録の保存 1 回) を足す
---   8. 0050 の画面のロールの書き込みの約束 (#1563 R3 M2) との関係:
---      ・新商品の登録 (lib/master-register.mjs) は、書く前に同じ取引で ops.begin_master_write を呼ぶ。商品・SKU・仕入先・原価・構成の依頼・保存の記録の
---        INSERT は 0050 の trg_master_edit_guard が見る (SKU の INSERT = 値のある列の持ち主 = skus.sku_kind なども company)
---      ・ops.create_sku_registration (security definer) も、呼び手が master_edit なら同じ取引の ops.begin_master_write の行が要る。
---        誰が・request_id・理由はその行から取る (引数と違えば 42501 = 偽れない)。SKU を作った取引の中だけ (not_new_sku) は今までどおり
---      ・ops.claim_card_events / ops.finish_card_event は行を要らない: 商品の値 (core.*) を書かず、知らせの届け先の状態だけ。
---        取り込みは保存とは別の時 (product-hub のボードを開いたとき) に動く = 「保存の取引」が無い。借り (lease) の持ち主だけが結果を書ける
---      ・ops.transition_sku_registration / backfill は運用のロール (master_ops) だけ = 画面のロールの約束の外
+--   8. 新商品の登録 = 登録だけの security definer の関数 ops.register_new_sku (0051 の 8. の「⑤-2a へ」の形):
+--      番号を振る (商品・SKU) → 登録の約束 → 商品・SKU・状態 draft・仕入先・原価・構成の依頼・カードの知らせ → 保存の記録 done を、関数の中の 1 か所で。
+--      画面のロール master_edit には core.products / core.skus / 知らせの INSERT を渡さない (関数の実行だけ)。
+--      🚨 0051 の守り (guard・変更の記録・done の確かめ) はそのまま全部効かせる: 関数の中の書き込みも呼び手は master_edit (security definer でも
+--         SET ROLE の役 / ログインした役は変わらない) = 0051 の約束の表に「登録の約束」(operation = sku_create) を、この関数だけが書く:
+--         ・約束の相手 = 関数が先に振った SKU の番号・商品の番号 (行を入れる前に約束を書く = guard が「約束の相手の行」と見る)
+--         ・ops.begin_master_write は sku_edit のままにする = 画面のロールは登録の約束を作れない (この関数を通るしかない)
+--         ・関数の終わりに約束の設定 (ops.master_write_session) を消す = 関数の外では、同じ取引でも画面のロールは登録の約束で書けない
+--         ・done は関数が約束どおり (request_id・人・SKU・操作 sku_create・保存の中身のハッシュ) に書く = 0051 の deferred の確かめを満たす
+--           (関数の中に例外の受け止め = サブトランザクションを作らない: done の xmin が取引の番号と違ってしまう)
+--      このために 0051 の物を 3 つだけ変える (ほかは触らない):
+--         ・ops.master_write_sessions.operation の CHECK に 'sku_create'
+--         ・ops.master_write_sessions.sku_id の外部キーを遅らせられる形に (名前 fk_mws_sku・ふだんは今までどおりすぐ確かめる。登録の関数だけが
+--           set constraints で commit のときの確かめにする = 約束を先に書き、SKU の行はその後に同じ取引で入れる。復元などほかの書き手は変わらない)
+--         ・ops.master_write_allowed に sku_create の行 (商品・SKU・仕入先・原価・構成の依頼の INSERT と、0026 の version の付け替えの UPDATE)。sku_edit の行は 0051 と同じ
+--      ・ops.create_sku_registration (security definer) は、呼び手が master_edit なら同じ SKU の登録の約束が要る (誰が・request_id・理由はその行から)。画面のロールには渡さない
+--      ・ops.claim_card_events / ops.finish_card_event は約束を要らない: 商品の値 (core.*) を書かず、知らせの届け先の状態だけ。
+--        取り込みは保存とは別の時 (product-hub のボードを開いたとき) に動く。借り (lease) の持ち主だけが結果を書ける
+--      ・新しいコードの決まり (形・Company DB / 名札 / NE の元のコード / 消したコード) は ops.new_sku_code_problem 1 か所 (画面の確かめと登録の関数が同じものを呼ぶ)
 -- 🚨 この migration は商品の値を何も変えない (状態の行は 1 行も作らない = backfill は切替の日に人が流す)
 -- 🚨 security definer の関数 = 一時の表を使わない・search_path = pg_catalog, pg_temp (名前は全部 schema つき)・public の実行権を外す (0034 の約束)
 
@@ -63,7 +73,7 @@ create table ops.master_registrations (
   foreign key (company_id, sku_id) references core.skus (company_id, sku_id)
 );
 create index ix_master_registrations_state on ops.master_registrations (state);
-comment on table ops.master_registrations is 'SKU ごとの登録の状態 (0051)。行が無い = 使えない。書くのは security definer の関数だけ (画面・運用のロールに DML を渡さない)';
+comment on table ops.master_registrations is 'SKU ごとの登録の状態 (0052)。行が無い = 使えない。書くのは security definer の関数だけ (画面・運用のロールに DML を渡さない)';
 
 create table ops.master_registration_events (
   event_id    bigint generated always as identity primary key,
@@ -92,7 +102,7 @@ create table ops.master_registration_backfill (
   done_at       timestamptz not null default now()
 );
 select core.make_append_only('ops', 'master_registration_backfill');
-comment on table ops.master_registration_backfill is '既存の SKU を available にした印 (0051・切替の手順で 1 回だけ)。この後は状態の行の無い SKU を commit できない・new_open の前提';
+comment on table ops.master_registration_backfill is '既存の SKU を available にした印 (0052・切替の手順で 1 回だけ)。この後は状態の行の無い SKU を commit できない・new_open の前提';
 
 -- 関数の中だけ印を立てる (持ち主のロールの手の DML を止める保険。権限の境界は表の権限 = 上の 🚨)。DELETE・TRUNCATE はいつでも拒む
 create function ops.guard_master_registrations() returns trigger language plpgsql as $$
@@ -129,20 +139,21 @@ declare
   v_company smallint;
   v_event   bigint;
   v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
-  v_sess    ops.master_write_sessions%rowtype;
+  v_sess    ops.master_write_sessions;
   v_actor   text := p_actor;
   v_req     text := p_request_id;
   v_reason  text := p_reason;
 begin
   if p_actor is null or length(p_actor) = 0 then raise exception 'invalid_input: 誰が (actor) が要る' using errcode = '22023'; end if;
-  -- 画面のロール = 同じ取引で ops.begin_master_write をした後だけ (0050 の約束と同じ)。誰が・request_id・理由はその行から (引数と違えば 42501)
+  -- 画面のロール = 同じ SKU の登録の約束 (0051 の約束の表・operation = sku_create = ops.register_new_sku だけが書く) の中だけ。
+  --   誰が・request_id・理由はその行から (引数と違えば 42501)
   if v_db_user = 'master_edit' then
-    select * into v_sess from ops.master_write_sessions where txid = pg_catalog.txid_current();
-    if not found then
-      raise exception 'master_write_session_required: 下書きの状態は、同じ取引で ops.begin_master_write をした後だけ作る' using errcode = '42501';
+    v_sess := ops.current_master_write_session();
+    if v_sess.session_id is null or v_sess.operation is distinct from 'sku_create' or v_sess.sku_id is distinct from p_sku_id then
+      raise exception 'master_write_session_required: 下書きの状態は、その SKU の登録の約束 (ops.register_new_sku) の中だけで作る' using errcode = '42501';
     end if;
     if p_actor is distinct from v_sess.actor_id or (p_request_id is not null and p_request_id is distinct from v_sess.request_id::text) then
-      raise exception 'master_write_session_mismatch: 誰が・request_id が ops.begin_master_write のときと違う' using errcode = '42501';
+      raise exception 'master_write_session_mismatch: 誰が・request_id が登録の約束と違う' using errcode = '42501';
     end if;
     v_actor := v_sess.actor_id;
     v_req := v_sess.request_id::text;
@@ -306,8 +317,8 @@ end $$;
 create constraint trigger trg_skus_registered after insert on core.skus deferrable initially deferred
   for each row execute function ops.check_sku_registered();
 
--- 4. 切替の門: new_open に進む前提 (R1 H1)。問題の一覧 (空 = 進んでよい)。0050 の差し込み口の表 ops.master_cutover_prereq_checks に 1 行足す
---    = ops.set_master_cutover_phase が集める関数 (ops.master_cutover_prereq_problems) から呼んで断る (prereq_failed: 0051_registrations: ...)。
+-- 4. 切替の門: new_open に進む前提 (R1 H1)。問題の一覧 (空 = 進んでよい)。0051 の差し込み口の表 ops.master_cutover_prereq_checks に 1 行足す
+--    = ops.set_master_cutover_phase が集める関数 (ops.master_cutover_prereq_problems) から呼んで断る (prereq_failed: 0052_registrations: ...)。
 --    集める関数は上書きしない (#1563 R3 = 後の migration の前提を消さない)。security definer にしない (集める関数が持ち主の権限で呼ぶ)
 create function ops.master_registrations_prereq(p_from text, p_to text) returns text[]
   language plpgsql stable set search_path = pg_catalog, pg_temp as $$
@@ -329,7 +340,7 @@ begin
   return v_problems;
 end $$;
 revoke all on function ops.master_registrations_prereq(text, text) from public;
-insert into ops.master_cutover_prereq_checks (name, fn) values ('0051_registrations', 'ops.master_registrations_prereq(text, text)');
+insert into ops.master_cutover_prereq_checks (name, fn) values ('0052_registrations', 'ops.master_registrations_prereq(text, text)');
 
 -- 保険の trigger (段階の行が変わるときにも同じ前提の関数を見る)。#1563 R3 の差し込み口の表の後も残す理由:
 --   ① ops.set_master_cutover_phase は後の migration (⑤-3・⑥) でも create or replace される = 集める関数を呼び忘れた版・表の行を消した版が入っても new_open に進めない
@@ -357,12 +368,12 @@ create view ops.v_sku_distributable as
   select s.sku_id, s.company_id, s.code, s.code_norm, s.sku_kind, r.state, r.distribution_generation
     from core.skus s join ops.master_registrations r on r.sku_id = s.sku_id
    where r.state in ('distributable', 'available');
-comment on view ops.v_sku_distributable is '古い表への写し (④) に載せてよい SKU (0051)。状態の行が無い SKU は入らない';
+comment on view ops.v_sku_distributable is '古い表への写し (④) に載せてよい SKU (0052)。状態の行が無い SKU は入らない';
 create view ops.v_sku_available as
   select s.sku_id, s.company_id, s.code, s.code_norm, s.sku_kind, r.state
     from core.skus s join ops.master_registrations r on r.sku_id = s.sku_id
    where r.state = 'available';
-comment on view ops.v_sku_available is '業務で使ってよい SKU (0051)。状態の行が無い SKU は入らない (fail-closed)';
+comment on view ops.v_sku_available is '業務で使ってよい SKU (0052)。状態の行が無い SKU は入らない (fail-closed)';
 
 -- 6. product-hub のカードの outbox
 create table ops.product_hub_outbox (
@@ -390,7 +401,7 @@ create table ops.product_hub_outbox (
   foreign key (company_id, sku_id) references core.skus (company_id, sku_id)
 );
 create index ix_product_hub_outbox_open on ops.product_hub_outbox (created_at) where status <> 'done';
-comment on table ops.product_hub_outbox is 'product-hub のカードを作る知らせ (0051)。登録と同じ取引で書く。中身は変えない・消さない。消費は cdb_sku_id の一意で冪等';
+comment on table ops.product_hub_outbox is 'product-hub のカードを作る知らせ (0052)。登録と同じ取引で書く。中身は変えない・消さない。消費は cdb_sku_id の一意で冪等';
 
 create function ops.guard_product_hub_outbox() returns trigger language plpgsql as $$
 begin
@@ -406,22 +417,23 @@ create trigger trg_product_hub_outbox_guard before update or delete on ops.produ
   for each row execute function ops.guard_product_hub_outbox();
 create trigger trg_product_hub_outbox_no_truncate before truncate on ops.product_hub_outbox
   for each statement execute function core.reject_mutation();
--- 画面のロールの insert = 0050 と同じ守り (同じ取引で ops.begin_master_write の後・段階 new_open。#1563 R3 M2) + request_id・作った人が その行と同じ
-create trigger trg_master_edit_guard before insert on ops.product_hub_outbox for each row execute function ops.guard_master_edit_write();
--- 🚨 security definer = 画面のロールに ops.master_write_sessions を読ませない。名前の順 (trg_master_edit_guard の後) に動く
+-- 呼び手が master_edit の知らせの insert = 登録の約束 (sku_create) の中で、その SKU・request_id・人のものだけ (ops.register_new_sku の中だけ)。
+--   画面のロールには知らせの insert を渡さない (表の権限が境界・これは関数の中の書き方の保険)。0051 の guard (trg_master_edit_guard) は付けない
+--   (0051 の guard は知っている表の「約束の相手」しか分からない = 知らせの表は分からない。ここで同じことを見る)
+-- 🚨 security definer = 画面のロールに ops.master_write_sessions を読ませない
 create function ops.guard_product_hub_outbox_session() returns trigger
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
   v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
-  v_sess    ops.master_write_sessions%rowtype;
+  v_sess    ops.master_write_sessions;
 begin
   if v_db_user is distinct from 'master_edit' then return new; end if;
-  select * into v_sess from ops.master_write_sessions where txid = pg_catalog.txid_current();
-  if not found then
-    raise exception 'master_write_session_required: カードの知らせは、同じ取引で ops.begin_master_write をした後だけ' using errcode = '42501';
+  v_sess := ops.current_master_write_session();
+  if v_sess.session_id is null or v_sess.operation is distinct from 'sku_create' then
+    raise exception 'master_write_session_required: カードの知らせは、登録の約束 (ops.register_new_sku) の中だけで書く' using errcode = '42501';
   end if;
-  if new.request_id is distinct from v_sess.request_id or new.created_by is distinct from v_sess.actor_id then
-    raise exception 'master_write_session_mismatch: カードの知らせの request_id・作った人が ops.begin_master_write のときと違う' using errcode = '42501';
+  if new.sku_id is distinct from v_sess.sku_id or new.request_id is distinct from v_sess.request_id or new.created_by is distinct from v_sess.actor_id then
+    raise exception 'master_write_session_mismatch: カードの知らせの SKU・request_id・作った人が登録の約束と違う' using errcode = '42501';
   end if;
   return new;
 end $$;
@@ -474,11 +486,204 @@ revoke all on function ops.finish_card_event(uuid, text, text, jsonb, text) from
 create view ops.v_product_hub_outbox_open as
   select o.status, count(*)::int as n, min(o.created_at) as oldest_at, max(o.attempts) as max_attempts
     from ops.product_hub_outbox o where o.status <> 'done' group by o.status;
-comment on view ops.v_product_hub_outbox_open is 'product-hub のカード作成待ち (0051)。done 以外の知らせの状態ごとの数 (見張り・毎朝のまとめ)';
+comment on view ops.v_product_hub_outbox_open is 'product-hub のカード作成待ち (0052)。done 以外の知らせの状態ごとの数 (見張り・毎朝のまとめ)';
 
 -- 7. 保存の記録に新商品の登録
 alter table ops.master_edit_requests drop constraint master_edit_requests_operation_check;
 alter table ops.master_edit_requests add constraint ck_mer_operation check (operation in ('sku_edit', 'sku_create'));
+
+-- 8. 新商品の登録 (上の 8.)
+-- 8a. 0051 の約束の表に「登録の約束」(sku_create)。書くのは ops.register_new_sku だけ (ops.begin_master_write は sku_edit のまま)
+do $$
+declare v text;
+begin
+  select c.conname into strict v from pg_catalog.pg_constraint c
+   where c.conrelid = 'ops.master_write_sessions'::regclass and c.contype = 'c' and pg_catalog.pg_get_constraintdef(c.oid) like '%operation%';
+  execute format('alter table ops.master_write_sessions drop constraint %I', v);
+  -- 約束の SKU の外部キーを遅らせられる形に (ふだんはすぐ確かめる = initially immediate)。登録の関数だけが set constraints ops.fk_mws_sku deferred にする
+  --   (登録の約束は、SKU の行より先に、関数が振った番号で書く)。initially deferred にしない = 復元 (行を入れた後に trigger を戻す) が「待っている確かめ」で止まらない
+  select c.conname into strict v from pg_catalog.pg_constraint c
+   where c.conrelid = 'ops.master_write_sessions'::regclass and c.contype = 'f' and c.confrelid = 'core.skus'::regclass;
+  execute format('alter table ops.master_write_sessions rename constraint %I to fk_mws_sku', v);
+  alter table ops.master_write_sessions alter constraint fk_mws_sku deferrable initially immediate;
+end $$;
+alter table ops.master_write_sessions add constraint ck_mws_operation check (operation in ('sku_edit', 'sku_create'));
+
+-- 8b. 操作ごとの書いてよい (表・書き方)。sku_edit の行は 0051 と同じ。sku_create = 新しい商品・SKU と、その仕入先・原価・構成の依頼の INSERT と、
+--     0026 の version の付け替え (仕入先・原価を入れると SKU の・SKU を入れると商品の version を上げる UPDATE)。相手の行は 0051 の guard が約束で見る (新しい SKU・商品だけ)
+create or replace function ops.master_write_allowed(p_operation text, p_table text, p_op text) returns boolean language sql immutable set search_path = pg_catalog, pg_temp as $$
+  select exists (select 1 from (values
+      ('sku_edit', 'core.skus', 'UPDATE'), ('sku_edit', 'core.products', 'UPDATE'),
+      ('sku_edit', 'core.supplier_skus', 'INSERT'), ('sku_edit', 'core.supplier_skus', 'UPDATE'),
+      ('sku_edit', 'core.sku_costs', 'INSERT'), ('sku_edit', 'core.sku_costs', 'UPDATE'), ('sku_edit', 'core.sku_costs', 'DELETE'),
+      ('sku_edit', 'ops.sku_component_requests', 'INSERT'), ('sku_edit', 'ops.sku_component_requests', 'UPDATE'),
+      ('sku_edit', 'ops.sku_component_breaches', 'UPDATE'),
+      ('sku_create', 'core.products', 'INSERT'), ('sku_create', 'core.products', 'UPDATE'),
+      ('sku_create', 'core.skus', 'INSERT'), ('sku_create', 'core.skus', 'UPDATE'),
+      ('sku_create', 'core.supplier_skus', 'INSERT'), ('sku_create', 'core.sku_costs', 'INSERT'),
+      ('sku_create', 'ops.sku_component_requests', 'INSERT')) as m(op, tbl, act)
+    where m.op = p_operation and m.tbl = p_table and m.act = p_op)
+$$;
+
+-- 8c. 新しいコードの決まり (画面の確かめ lib/master-register.mjs の checkNewCodeInDb と登録の関数が同じものを呼ぶ)。問題が無ければ null
+--   code_shape = 小文字の英字・数字・- と _ の 1〜30 字・set- で始まらない (lib/master-write.mjs の validateNewSkuCode と同じ)
+--   code_taken = Company DB にある / code_is_rep = 代表 (名札)・商品のコード / code_in_ne = NE の元のコード (0041) / code_used_before = 前に使って消した SKU のコード
+create function ops.new_sku_code_problem(p_code text) returns text
+  language plpgsql stable security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_norm text;
+begin
+  if p_code is null or p_code !~ '^[a-z0-9_-]{1,30}$' or p_code ~ '^set-' then return 'code_shape'; end if;
+  v_norm := core.norm_code(p_code);
+  if exists (select 1 from core.skus where company_id = 1 and code_norm = v_norm) then return 'code_taken'; end if;
+  if exists (select 1 from core.products where company_id = 1 and core.norm_code(display_code) = v_norm) then return 'code_is_rep'; end if;
+  if exists (select 1 from ops.master_ne_codes where code_norm = v_norm) then return 'code_in_ne'; end if;
+  if exists (select 1 from events.master_change_events
+              where entity_type = 'sku' and operation = 'DELETE' and core.norm_code(old_value ->> 'code') = v_norm) then return 'code_used_before'; end if;
+  return null;
+end $$;
+revoke all on function ops.new_sku_code_problem(text) from public;
+
+-- 8d. 新商品を登録する (同じ取引で 1 回。画面 = lib/master-register.mjs が鍵 (request_id → 段階 → マスタの書き込み → 新しいコード → 構成品) と門・値の確かめの後に呼ぶ)
+--   p_entry = { kind: single | set, code, started_at,
+--               product: { name, sales_class, expiry_managed, inbound_date_managed } (単品だけ),
+--               sku: { name, tax_rate, tax_class, handling, standard_price_jpy, shipping_code, shipping_method, shipping_cost_jpy, reorder_months, set_sales_class_override, handling_own },
+--               supplier_id (単品・代表・無くてよい), cost: { jpy, source, status, valid_from, reason } (無くてよい),
+--               component_request: { rows: [{ sku_id, code, qty, sort }], rows_hash, reason } (セットだけ),
+--               card: { schema_version, payload, payload_hash } (カードを作らないなら null), result: 保存の記録に残す結果 (sku_id・card は関数が足す) }
+--   段階 new_open・持ち主表のハッシュ (ops.begin_master_write と同じ確かめ)・backfill がちょうど 1 回・request_id が未使用・コードの決まり (ops.new_sku_code_problem)・
+--   構成品は登録をやめた / 要確認の商品でない、を確かめてから書く。列の持ち主・業務の約束 (代表の仕入先は取引中・構成品はある単品) は 0051 の guard が書くときに見る。
+--   🚨 値の計算 (送料の表・セットの導く値) はアプリ = 0051 の sku_edit と同じく、DB が守るのは約束どおりの相手・操作・持ち主・段階・業務の約束まで
+--   🚨 例外の受け止め (begin ... exception) を使わない: サブトランザクションの中で書いた done は xmin が取引の番号と違い、0051 の commit の確かめに数えられない
+create function ops.register_new_sku(p_request_id uuid, p_actor_id text, p_reason text, p_ownership jsonb, p_payload_hash text, p_entry jsonb) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_db_user  text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
+  v_tx       bigint := pg_catalog.txid_current();
+  v_kind     text := p_entry ->> 'kind';
+  v_code     text := p_entry ->> 'code';
+  v_prod     jsonb := p_entry -> 'product';
+  v_s        jsonb := p_entry -> 'sku';
+  v_cost     jsonb := p_entry -> 'cost';
+  v_req      jsonb := p_entry -> 'component_request';
+  v_card     jsonb := p_entry -> 'card';
+  v_reason   text := nullif(p_reason, '');
+  v_phase    text;
+  v_owner    text;
+  v_hash     text;
+  v_bad      text;
+  v_product  bigint;
+  v_sku      bigint;
+  v_sess     uuid := pg_catalog.gen_random_uuid();
+  v_event    uuid;
+  v_result   jsonb;
+begin
+  perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.master_cutover'));   -- 段階を変える取引と並ぶ (画面は先に取っている = 同じ鍵)
+  perform pg_catalog.pg_advisory_xact_lock_shared(core.master_write_lock_key());                -- 夜間ロードと並ぶ (画面は先に取っている = 同じ鍵)
+  -- 形
+  if p_request_id is null then raise exception 'invalid_input: request_id が要る' using errcode = '22023'; end if;
+  if p_actor_id is null or length(btrim(p_actor_id)) = 0 or length(p_actor_id) > 320 or p_actor_id ~ '[[:cntrl:]]' then
+    raise exception 'invalid_input: 登録する人 (actor_id) の形が違う' using errcode = '22023';
+  end if;
+  if v_reason is not null and length(v_reason) > 200 then raise exception 'invalid_input: 理由は 200 字まで' using errcode = '22023'; end if;
+  if p_ownership is null or jsonb_typeof(p_ownership) <> 'object'
+     or exists (select 1 from jsonb_each(p_ownership) e where jsonb_typeof(e.value) <> 'string' or (e.value #>> '{}') not in ('load', 'company')) then
+    raise exception 'invalid_input: 持ち主表 ({ キー: load / company }) が要る' using errcode = '22023';
+  end if;
+  if coalesce(p_payload_hash, '') !~ '^[0-9a-f]{64}$' then raise exception 'invalid_input: 保存の中身のハッシュ (64 桁の 16 進) が要る' using errcode = '22023'; end if;
+  if p_entry is null or jsonb_typeof(p_entry) <> 'object' or v_kind is null or v_kind not in ('single', 'set') or jsonb_typeof(v_s) is distinct from 'object' then
+    raise exception 'invalid_input: 登録の中身 (kind = single / set・sku) が要る' using errcode = '22023';
+  end if;
+  if (v_kind = 'single') is distinct from (jsonb_typeof(v_prod) = 'object') then
+    raise exception 'invalid_input: 単品は商品 (product) が要り、セットは商品を作らない' using errcode = '22023';
+  end if;
+  if (v_kind = 'set') is distinct from (jsonb_typeof(v_req) = 'object') then
+    raise exception 'invalid_input: セットは構成の依頼 (component_request) が要り、単品は構成を持たない' using errcode = '22023';
+  end if;
+  if v_kind = 'set' and (p_entry -> 'supplier_id') is not null and p_entry -> 'supplier_id' <> 'null'::jsonb then
+    raise exception 'invalid_input: セットに代表の仕入先は付けない' using errcode = '22023';
+  end if;
+  -- 段階・持ち主表 (ops.begin_master_write と同じ)・backfill
+  select phase, owner_hash into v_phase, v_owner from ops.master_cutover_state where id = 1;
+  v_hash := ops.ownership_hash(p_ownership);
+  if v_phase is distinct from 'new_open' then
+    raise exception 'before_cutover: 切替の段階が % (new_open でない)', coalesce(v_phase, '読めない') using errcode = 'P0001';
+  end if;
+  if v_owner is distinct from v_hash then raise exception 'before_cutover: 持ち主表が切替のときの記録と違う' using errcode = 'P0001'; end if;
+  if (select count(*) from ops.master_registration_backfill) <> 1 then
+    raise exception 'backfill_missing: 既存の SKU の登録の状態 (backfill) が済んでいないので、新商品は登録しない' using errcode = 'P0001';
+  end if;
+  if (ops.current_master_write_session()).session_id is not null then
+    raise exception 'master_write_session_exists: この取引ではもう書き込みを始めている' using errcode = '55000';
+  end if;
+  if exists (select 1 from ops.master_edit_requests r where r.request_id = p_request_id) then
+    raise exception 'invalid_input: request_id % はもう使われている (保存の記録がある)', p_request_id using errcode = '22023';
+  end if;
+  -- コード (新しいコードの鍵 = 画面と同じ鍵 → 決まり)
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.new_code:' || coalesce(core.norm_code(v_code), ''), 0));
+  v_bad := ops.new_sku_code_problem(v_code);
+  if v_bad is not null then raise exception '%: 商品コード % は新しい商品に使えない', v_bad, v_code using errcode = 'P0001'; end if;
+  -- 構成品は登録をやめた (cancelled)・要確認 (quarantined) の商品でない (ある単品かは 0051 の guard が見る)
+  if v_kind = 'set' and exists (
+       select 1 from jsonb_array_elements(case when jsonb_typeof(v_req -> 'rows') = 'array' then v_req -> 'rows' else '[]'::jsonb end) e
+         join ops.master_registrations r on r.sku_id = (case when (e ->> 'sku_id') ~ '^[0-9]{1,18}$' then (e ->> 'sku_id')::bigint end)
+        where r.state in ('cancelled', 'quarantined')) then
+    raise exception 'component_unusable: 構成品に、登録をやめた・要確認の商品がある' using errcode = 'P0001';
+  end if;
+  -- 番号を振る (商品 → SKU)
+  if v_kind = 'single' then v_product := pg_catalog.nextval(pg_catalog.pg_get_serial_sequence('core.products', 'product_id')::regclass); end if;
+  v_sku := pg_catalog.nextval(pg_catalog.pg_get_serial_sequence('core.skus', 'sku_id')::regclass);
+  -- 登録の約束 (0051 の約束の表・operation = sku_create)。行を入れる前に書く = 0051 の guard・変更の記録が この約束で見る。編集の印は無い (0 の 64 桁)・版は無い ({})
+  --   約束の SKU の外部キーは、この取引だけ commit のときに確かめる (SKU の行はこの後に入れる)
+  set constraints ops.fk_mws_sku deferred;
+  insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions,
+                                         actor_id, reason, source_system, db_user, phase, owner_hash, ownership)
+    values (v_sess, v_tx, p_request_id, 'sku_create', v_sku, '{}'::bigint[], case when v_product is null then '{}'::bigint[] else array[v_product] end,
+            pg_catalog.repeat('0', 64), p_payload_hash, '{}'::jsonb, p_actor_id, v_reason, 'portal_master_edit', v_db_user, v_phase, v_hash, p_ownership);
+  perform pg_catalog.set_config('ops.master_write_session', v_sess::text, true);
+  -- 行を入れる: 商品 (単品) → SKU → 状態 draft → 仕入先 → 原価 → 構成の依頼 → カードの知らせ
+  if v_kind = 'single' then
+    insert into core.products (product_id, company_id, display_code, name, sales_class, status, expiry_managed, inbound_date_managed, created_by_type, created_by_id)
+      overriding system value
+      values (v_product, 1, v_code, v_prod ->> 'name', (v_prod ->> 'sales_class')::smallint, 'active', coalesce((v_prod ->> 'expiry_managed')::boolean, false),
+              (v_prod ->> 'inbound_date_managed')::boolean, 'human', p_actor_id);
+  end if;
+  insert into core.skus (sku_id, company_id, product_id, sku_kind, code, name, tax_rate, tax_class, handling, standard_price_jpy,
+                         shipping_code, shipping_method, shipping_cost_jpy, reorder_months, set_sales_class_override, handling_own, created_by_type, created_by_id)
+    overriding system value
+    values (v_sku, 1, v_product, v_kind, v_code, v_s ->> 'name', (v_s ->> 'tax_rate')::numeric, v_s ->> 'tax_class', v_s ->> 'handling', (v_s ->> 'standard_price_jpy')::bigint,
+            v_s ->> 'shipping_code', v_s ->> 'shipping_method', (v_s ->> 'shipping_cost_jpy')::bigint, (v_s ->> 'reorder_months')::numeric,
+            (v_s ->> 'set_sales_class_override')::smallint, v_s ->> 'handling_own', 'human', p_actor_id);
+  perform ops.create_sku_registration(v_sku, p_actor_id, p_request_id::text, v_reason);
+  if v_kind = 'single' and (p_entry ->> 'supplier_id') is not null then
+    insert into core.supplier_skus (company_id, supplier_id, sku_id, is_primary, created_by_type, created_by_id)
+      values (1, (p_entry ->> 'supplier_id')::bigint, v_sku, true, 'human', p_actor_id);
+  end if;
+  if jsonb_typeof(v_cost) = 'object' then
+    insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from, reason, created_by_type, created_by_id)
+      values (1, v_sku, (v_cost ->> 'jpy')::numeric, v_cost ->> 'source', v_cost ->> 'status', (v_cost ->> 'valid_from')::date, v_cost ->> 'reason', 'human', p_actor_id);
+  end if;
+  if v_kind = 'set' then
+    insert into ops.sku_component_requests (company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, edit_request_id)
+      values (1, v_sku, v_req -> 'rows', v_req ->> 'rows_hash', '[]'::jsonb, v_req ->> 'reason', p_actor_id, p_request_id);
+  end if;
+  if jsonb_typeof(v_card) = 'object' then
+    insert into ops.product_hub_outbox (company_id, sku_id, kind, schema_version, payload, payload_hash, request_id, created_by)
+      values (1, v_sku, 'card_create', v_card ->> 'schema_version', v_card -> 'payload', v_card ->> 'payload_hash', p_request_id, p_actor_id)
+      returning event_id into v_event;
+  end if;
+  -- 保存の記録 done (約束どおり = 0051 の commit の確かめ)。結果 = 画面の結果 + 振った SKU の番号・カードの知らせ
+  v_result := coalesce(case when jsonb_typeof(p_entry -> 'result') = 'object' then p_entry -> 'result' end, '{}'::jsonb)
+    || jsonb_build_object('sku_id', v_sku::text, 'state', 'draft',
+                          'card', case when v_event is null then null else jsonb_build_object('event_id', v_event::text, 'status', 'pending') end);
+  insert into ops.master_edit_requests (request_id, company_id, operation, target_code, sku_id, actor_id, payload_hash, status, result, started_at)
+    values (p_request_id, 1, 'sku_create', v_code, v_sku, p_actor_id, p_payload_hash, 'done', v_result,
+            coalesce((p_entry ->> 'started_at')::timestamptz, pg_catalog.now()));
+  -- 約束を閉じる = この関数の外では (同じ取引でも) 画面のロールは登録の約束で書けない。約束の行と done は commit の確かめに残る
+  perform pg_catalog.set_config('ops.master_write_session', '', true);
+  return v_result;
+end $$;
+revoke all on function ops.register_new_sku(uuid, text, text, jsonb, text, jsonb) from public;
 
 -- 見張りは読むだけ。画面・運用のロールの権限は scripts/company-db/create-master-edit-roles.mjs (⑤-1 のロールを作る手の操作。migration の後に流し直す)
 do $$ begin

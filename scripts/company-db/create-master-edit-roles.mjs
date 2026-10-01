@@ -10,9 +10,11 @@
  *      切替の段階・門の記録・NE の観測の書き込み。core.sku_costs の削除は渡すが、今日より前の行は DB の trigger が拒む (0051)
  *      core.suppliers の update (仕入先の行の共有の鍵は 0051 の関数 core.lock_suppliers_for_share = security definer の実行だけ)
  *   ロールの設定 = statement_timeout 20s・lock_timeout 10s・idle_in_transaction_session_timeout 60s (画面の接続の設定と同じ。画面が付け忘れても長く持たない)
- *   ⑤-2a (0051・新商品の登録 lib/master-register.mjs・カードの知らせ lib/product-hub-outbox.mjs): 新商品の SKU・商品の insert (列を絞る)・カードの知らせの insert (列を絞る)・
- *   登録の状態を作る関数 (ops.create_sku_registration)・SKU を足した commit の確かめ (ops.sku_registration_problem)・知らせを借りる / 結果を書く関数 (ops.claim_card_events / finish_card_event) の実行。
- *   🚨 渡さない: 登録の状態・履歴・backfill の印の表の書き込み (関数だけ)・知らせの状態 / 結果 / 借りの列の update (関数だけ・仮レビュー L7)
+ *   ⑤-2a (0052・新商品の登録 lib/master-register.mjs・カードの知らせ lib/product-hub-outbox.mjs): 登録の関数 (ops.register_new_sku = 番号 → 登録の約束 →
+ *   商品・SKU・状態・仕入先・原価・構成の依頼・知らせ → done を関数の中で)・新しいコードの決まり (ops.new_sku_code_problem)・SKU を足した commit の確かめ
+ *   (ops.sku_registration_problem = 遅らせた trigger が呼び手の権限で呼ぶ)・知らせを借りる / 結果を書く関数 (ops.claim_card_events / finish_card_event) の実行。
+ *   🚨 渡さない: core.products / core.skus の insert・知らせの insert (登録の関数だけが書く)・ops.create_sku_registration の実行 (登録の関数の中だけ)・
+ *      登録の状態・履歴・backfill の印の表の書き込み (関数だけ)・知らせの状態 / 結果 / 借りの列の update (関数だけ・仮レビュー L7)
  * master_ops      (手の操作 scripts/company-db/master-cutover.mjs が env COMPANY_DB_MASTER_OPS_URL で使う): ops.set_master_cutover_phase の実行と、段階・記録を読むだけ。
  *   ⑤-2a: 切替の日の backfill (ops.registration_backfill_plan / backfill_sku_registrations) と、登録をやめる (ops.transition_sku_registration) の実行・登録の状態を読む
  * master_observer (⑤-2 の夜間ロードが NE のセットの構成の観測を書く env COMPANY_DB_MASTER_OBSERVER_URL): ops.record_ne_set_observations の実行だけ
@@ -28,7 +30,7 @@
  *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs --dry-run   # 流す文だけ見る
  *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs             # 作る / 権限をそろえる (新しいロールのパスワードだけ、この画面に出る)
  *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs --rotate-password master_gate_render   # そのロールのパスワードだけ変える (何回でも付けられる)
- * 🚨 0051 まで migration を流した後に。migration で表を足したら流し直す (権限は表ごとに付ける)
+ * 🚨 0052 まで migration を流した後に。migration で表を足したら流し直す (権限は表ごとに付ける)
  */
 import crypto from 'node:crypto';
 import { openPgClient } from './migrate.mjs';
@@ -56,8 +58,8 @@ export const MASTER_EDIT_SELECT = [
   'events.master_change_events',
   'ops.master_cutover_state', 'ops.master_edit_requests', 'ops.sku_component_requests', 'ops.sku_component_breaches', 'ops.ne_set_observations', 'ops.ne_set_observation_runs',
   'ops.ne_csv_exports', 'ops.ne_csv_export_rows', 'ops.master_decision_candidates', 'ops.master_decision_observations', 'ops.master_compare_runs',
-  // ⑤-2a (0051): 登録の状態 (画面に出す)・backfill の印 (新商品の登録の前提)・カードの知らせ・NE の元のコード (新しいコードの確かめ)
-  'ops.master_registrations', 'ops.master_registration_backfill', 'ops.product_hub_outbox', 'ops.master_ne_codes',
+  // ⑤-2a (0052): 登録の状態 (画面に出す)・backfill の印 (新商品の登録の前提)・カードの知らせ (読むだけ)
+  'ops.master_registrations', 'ops.master_registration_backfill', 'ops.product_hub_outbox',
 ];
 /** 保存の経路で書く表・列 (lib/master-write.mjs の saveSku)。insert も列を絞る */
 export const MASTER_EDIT_WRITE = [
@@ -68,20 +70,18 @@ export const MASTER_EDIT_WRITE = [
   ['insert (request_id, company_id, operation, target_code, sku_id, actor_id, payload_hash, status, result, error, started_at)', 'ops.master_edit_requests'],
   ['insert (company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, edit_request_id), update (status, closed_at, closed_by, close_reason)', 'ops.sku_component_requests'],
   ['update (status, closed_at, closed_by, close_reason)', 'ops.sku_component_breaches'],
-  // ⑤-2a (0051・lib/master-register.mjs): 新商品の商品・SKU・カードの知らせ (状態・結果・借りの列は渡さない = 関数だけ)
-  ['insert (company_id, display_code, name, sales_class, status, expiry_managed, inbound_date_managed, created_by_type, created_by_id)', 'core.products'],
-  ['insert (company_id, product_id, sku_kind, code, name, tax_rate, tax_class, handling, standard_price_jpy, shipping_code, shipping_method, shipping_cost_jpy, reorder_months, set_sales_class_override, handling_own, created_by_type, created_by_id)', 'core.skus'],
-  ['insert (company_id, sku_id, kind, schema_version, payload, payload_hash, request_id, created_by)', 'ops.product_hub_outbox'],
+  // ⑤-2a (0052): 新商品の商品・SKU・カードの知らせの insert は渡さない (登録の関数 ops.register_new_sku だけが書く)
 ];
-/** ⑤-2a (0051): 画面のロールが実行する関数 (security definer) */
-export const REGISTER_EDIT_FUNCTIONS = Object.freeze(['ops.create_sku_registration(bigint, text, text, text)', 'ops.sku_registration_problem(bigint, text)',
+/** ⑤-2a (0052): 画面のロールが実行する関数 (security definer) */
+export const REGISTER_FUNCTION = 'ops.register_new_sku(uuid, text, text, jsonb, text, jsonb)';
+export const REGISTER_EDIT_FUNCTIONS = Object.freeze([REGISTER_FUNCTION, 'ops.new_sku_code_problem(text)', 'ops.sku_registration_problem(bigint, text)',
   'ops.claim_card_events(text, text, uuid, bigint, integer, integer, integer)', 'ops.finish_card_event(uuid, text, text, jsonb, text)']);
-/** ⑤-2a (0051): 運用のロールが実行する関数 (切替の日の backfill・登録をやめる) と読む表 */
+/** ⑤-2a (0052): 運用のロールが実行する関数 (切替の日の backfill・登録をやめる) と読む表 */
 export const REGISTER_OPS_FUNCTIONS = Object.freeze(['ops.registration_backfill_plan()', 'ops.backfill_sku_registrations(integer, text, text, text)',
   'ops.transition_sku_registration(bigint, text, text, text, text, jsonb, text)']);
 export const REGISTER_OPS_SELECT = Object.freeze(['ops.master_registrations', 'ops.master_registration_events', 'ops.master_registration_backfill']);
-/** ⑤-2a (0051): だれにも渡さない (夜間ロード = 持ち主だけ) */
-export const REGISTER_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.quarantine_unregistered_skus(text)']);
+/** ⑤-2a (0052): だれにも渡さない (夜間ロード = 持ち主だけ・状態の行は登録の関数の中だけ) */
+export const REGISTER_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.quarantine_unregistered_skus(text)', 'ops.create_sku_registration(bigint, text, text, text)']);
 export const CUTOVER_FUNCTION = 'ops.set_master_cutover_phase(text, text, jsonb, text)';
 export const OBSERVE_FUNCTION = 'ops.record_ne_set_observations(jsonb)';
 export const ACK_FUNCTION = 'ops.record_legacy_gate_ack(text, text, text, jsonb, text, text, integer, timestamptz, boolean, text)';

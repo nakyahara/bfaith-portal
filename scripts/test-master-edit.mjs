@@ -143,7 +143,7 @@ const gateAck = (E, host, instanceId, buildId, ownership, phaseSeen, inflight = 
   { host, instanceId, buildId, manifest: MANIFEST, ownership, phaseSeen, inflightCount: inflight, oldestInflightAt: inflight ? new Date().toISOString() : null }));
 /** 段階を進める (運用のロール master_ops) */
 const advance = (E, to, evidence, note = null) => asRole(E, 'master_ops', () => C.advanceCutoverPhase(E.db, { to, actor: 'naka@test', evidence, note }));
-/** 0051 (⑤-2a): new_open の前に既存の SKU の登録の状態 (backfill) が要る。運用のロール master_ops で計画を見て流す */
+/** 0052 (⑤-2a): new_open の前に既存の SKU の登録の状態 (backfill) が要る。運用のロール master_ops で計画を見て流す */
 const backfill = (E) => asRole(E, 'master_ops', async () => {
   const p = (await E.db.query('select * from ops.registration_backfill_plan()')).rows[0];
   await E.db.query('select ops.backfill_sku_registrations($1, $2, $3)', [p.sku_count, p.snapshot_hash, 'naka@test']);
@@ -425,7 +425,7 @@ await ta('[2] 場所が足りない・古い記録だけ = 拒む → そろえ�
   const argsCo = await beginArgs(E0, 's001');
   await assert.rejects(() => asEditor(E0, () => pg.query(BEGIN_SQL, argsCo)), /before_cutover: 切替の段階が company_owner/);
   await gateAck(E0, 'render', 'r-a', 'r1', ALL_COMPANY, 'company_owner'); await gateAck(E0, 'minipc', 'm-a', 'm1', ALL_COMPANY, 'company_owner');
-  await assert.rejects(() => advance(E0, 'new_open', ev2), /prereq_failed: 0051_registrations: backfill_missing/);   // 0051 (⑤-2a): backfill の前は new_open に進めない (差し込み口の表の 1 行)
+  await assert.rejects(() => advance(E0, 'new_open', ev2), /prereq_failed: 0052_registrations: backfill_missing/);   // 0052 (⑤-2a): backfill の前は new_open に進めない (差し込み口の表の 1 行)
   await backfill(E0);
   await assert.rejects(() => advance(E0, 'new_open', { ...ev2, owner_hash: 'a'.repeat(64) }), /company_owner のときと違う/);
   await advance(E0, 'new_open', ev2);

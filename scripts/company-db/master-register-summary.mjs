@@ -4,10 +4,10 @@
  *
  * 出すもの (1 行): 登録の状態ごとの数 (下書き・要確認 ほか) と、カード作成待ち (まだ・失敗)・衝突の数・いちばん古い知らせの時刻
  *   例: 📦 新商品の登録: 下書き 3・要確認 1 / カード作成待ち 2 (失敗 1・いちばん古い 10-02 09:10)・衝突 1 → マスタの入力の一覧「カード」で絞る
- * 何も無い日は「なし」の 1 行 (exit 0)。表が無い (0051 の前) = ⏭️ の 1 行 (exit 0)。DB に届かない = ❌ (exit 1)
+ * 何も無い日は「なし」の 1 行 (exit 0)。表が無い (0052 の前) = ⏭️ の 1 行 (exit 0)。DB に届かない = ❌ (exit 1)
  * 使い方 (miniPC・毎朝のまとめに足すときは daily-sync の 1 ステップ = 台帳 config/jobs-registry.mjs の daily-sync の中。🚨 足すのは中原さんの OK の後):
  *   node -r dotenv/config scripts/company-db/master-register-summary.mjs [--json]
- * env: COMPANY_DB_WATCH_URL (見張りの読むだけのロール watcher = 0051 で select を渡してある) / 無ければ COMPANY_DB_URL
+ * env: COMPANY_DB_WATCH_URL (見張りの読むだけのロール watcher = 0052 で select を渡してある) / 無ければ COMPANY_DB_URL
  */
 import { openPgClient } from './migrate.mjs';
 
@@ -16,7 +16,7 @@ export const REG_LABELS = Object.freeze({ draft: '下書き', ne_pending: 'NE登
 /** 1 行を作る (db = { query })。返り値 { line, counts } */
 export async function summarize(db) {
   const has = (await db.query(`select to_regclass('ops.product_hub_outbox') is not null and to_regclass('ops.master_registrations') is not null as ok`)).rows[0].ok;
-  if (!has) return { line: '⏭️ 新商品の登録: 0051 がまだ (表が無い)', counts: null };
+  if (!has) return { line: '⏭️ 新商品の登録: 0052 がまだ (表が無い)', counts: null };
   const reg = Object.fromEntries((await db.query(`select state, count(*)::int as n from ops.master_registrations where state <> 'available' group by state`)).rows.map((r) => [r.state, r.n]));
   const card = Object.fromEntries((await db.query(`select status, n, to_char(oldest_at at time zone 'Asia/Tokyo', 'MM-DD HH24:MI') as oldest from ops.v_product_hub_outbox_open`)).rows.map((r) => [r.status, r]));
   const regText = Object.entries(REG_LABELS).filter(([k]) => reg[k]).map(([k, v]) => `${v} ${reg[k]}`).join('・') || '途中の新商品なし';

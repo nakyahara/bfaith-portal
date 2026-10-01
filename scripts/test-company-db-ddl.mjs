@@ -118,7 +118,7 @@ await ta('[!] 期待する表がすべてある', async () => {
     // 0051 マスタ入力画面の土台 (14 §6 ⑤-1)
     'ops.master_cutover_state', 'ops.master_cutover_events', 'ops.master_legacy_manifests', 'ops.master_legacy_gate_acks', 'ops.master_edit_requests', 'ops.sku_component_requests',
     'ops.ne_set_observation_runs', 'ops.ne_set_observations', 'ops.sku_component_breaches',
-    // 0051 新商品の登録と登録の状態・product-hub のカードの outbox (14 ⑤-2a)
+    // 0052 新商品の登録と登録の状態・product-hub のカードの outbox (14 ⑤-2a)
     'ops.master_registrations', 'ops.master_registration_events', 'ops.master_registration_backfill', 'ops.product_hub_outbox',
   ];
   const missing = expect.filter((t) => !have.has(t));
@@ -152,7 +152,7 @@ await ta('[!] 0051 (14 §6 ⑤-1・#1563 R1・R2): 切替の段階は legacy_ope
   assert.deepEqual((await q('select core.master_write_lock_key()::text as k'))[0], { k: '4705310051' });
   // #1563 R3: 黙っているプロセスは年齢で外さない (時間の窓の関数は無い)・前提の差し込み口の表 (空)・画面のロールの書き込みの約束 (begin + 7 つの表の guard)
   assert.equal((await q("select to_regprocedure('ops.master_cutover_ack_silent_hours()') is null as gone"))[0].gone, true);
-  assert.deepEqual((await q('select name from ops.master_cutover_prereq_checks order by 1')).map((r) => r.name), ['0051_registrations']);   // 0050 は 0 行・0051 (⑤-2a) が 1 行足す
+  assert.deepEqual((await q('select name from ops.master_cutover_prereq_checks order by 1')).map((r) => r.name), ['0052_registrations']);   // 0051 は 0 行・0052 (⑤-2a) が 1 行足す
   const guards = await q("select c.relnamespace::regnamespace::text || '.' || c.relname as t from pg_trigger g join pg_class c on c.oid = g.tgrelid where g.tgname = 'trg_master_edit_guard' order by 1");
   assert.deepEqual(guards.map((r) => r.t), ['core.products', 'core.sku_costs', 'core.skus', 'core.supplier_skus', 'ops.master_edit_requests', 'ops.sku_component_breaches', 'ops.sku_component_requests']);
   const be = (await q("select p.prosecdef, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p where p.oid = 'ops.begin_master_write(uuid, text, text, jsonb, text, bigint, text, text, jsonb)'::regprocedure"))[0];
@@ -175,26 +175,33 @@ await ta('[!] 0051 (14 §6 ⑤-1・#1563 R1・R2): 切替の段階は legacy_ope
   for (const r of cfg) assert.match(String(r.proconfig), /search_path=.*pg_temp/, r.proname);
 });
 
-await ta('[!] 0051 (14 ⑤-2a): 登録の状態は 1 行も作らない (backfill は切替の日に人が)・読む口 2 つ・守りの trigger・保存の記録に sku_create', async () => {
+await ta('[!] 0052 (14 ⑤-2a): 登録の状態は 1 行も作らない (backfill は切替の日に人が)・読む口 2 つ・守りの trigger・保存の記録に sku_create・登録の関数と 0051 の約束の sku_create', async () => {
   assert.equal((await q('select count(*)::int as n from ops.master_registrations'))[0].n, 0);
   assert.equal((await q('select count(*)::int as n from ops.master_registration_backfill'))[0].n, 0);
   const views = await q("select table_name as t from information_schema.views where table_schema = 'ops' and table_name in ('v_sku_available', 'v_sku_distributable') order by 1");
   assert.deepEqual(views.map((v) => v.t), ['v_sku_available', 'v_sku_distributable']);
   const trg = await q("select tgname as t from pg_trigger where tgrelid in ('ops.master_registrations'::regclass, 'ops.product_hub_outbox'::regclass, 'core.skus'::regclass, 'ops.master_registration_events'::regclass, 'ops.master_cutover_state'::regclass) and not tgisinternal order by 1");
   // 登録の状態を書く関数は security definer・search_path 固定・public の実行権なし (PR #1566 R1 H2)
-  const fns = await q("select p.proname as n, p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p join pg_namespace s on s.oid = p.pronamespace where s.nspname = 'ops' and p.proname in ('create_sku_registration', 'transition_sku_registration', 'backfill_sku_registrations', 'quarantine_unregistered_skus', 'registration_backfill_plan', 'sku_registration_problem', 'guard_product_hub_outbox_session', 'claim_card_events', 'finish_card_event') order by 1");
-  assert.equal(fns.length, 9);
+  const fns = await q("select p.proname as n, p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p join pg_namespace s on s.oid = p.pronamespace where s.nspname = 'ops' and p.proname in ('create_sku_registration', 'transition_sku_registration', 'backfill_sku_registrations', 'quarantine_unregistered_skus', 'registration_backfill_plan', 'sku_registration_problem', 'guard_product_hub_outbox_session', 'claim_card_events', 'finish_card_event', 'register_new_sku', 'new_sku_code_problem') order by 1");
+  assert.equal(fns.length, 11);
   for (const f of fns) { assert.equal(f.d, true, f.n); assert.match(f.c, /search_path=pg_catalog, pg_temp/, f.n); assert.equal(f.pub, false, f.n); }
   for (const t of ['trg_master_registrations_guard', 'trg_master_registrations_no_truncate', 'trg_product_hub_outbox_guard', 'trg_skus_registered', 'trg_append_only_row', 'trg_master_cutover_state_prereq',
     'trg_product_hub_outbox_session']) assert.ok(trg.some((r) => r.t === t), `trigger ${t} が無い`);
-  // 画面のロールの知らせの insert = 0050 と同じ守り (#1563 R3 M2)
-  assert.equal((await q("select count(*)::int as n from pg_trigger where tgrelid = 'ops.product_hub_outbox'::regclass and tgname = 'trg_master_edit_guard' and tgfoid = 'ops.guard_master_edit_write()'::regprocedure"))[0].n, 1);
+  // 知らせの insert = 登録の約束の中だけ (0051 の guard は付けない = 知らせの表の相手を知らない。画面のロールには insert も渡さない)
+  assert.equal((await q("select count(*)::int as n from pg_trigger where tgrelid = 'ops.product_hub_outbox'::regclass and tgname = 'trg_master_edit_guard'"))[0].n, 0);
+  // 0051 の約束に「登録の約束」(sku_create・書くのは登録の関数だけ): 操作の CHECK・SKU の外部キーは遅らせられる (ふだんはすぐ・登録の関数だけ commit のとき)・書いてよい (表・書き方)
+  assert.match((await q("select pg_get_constraintdef(oid) as d from pg_constraint where conname = 'ck_mws_operation'"))[0].d, /sku_edit.*sku_create/);
+  assert.deepEqual((await q("select condeferrable as d, condeferred as i from pg_constraint where conrelid = 'ops.master_write_sessions'::regclass and contype = 'f' and confrelid = 'core.skus'::regclass and conname = 'fk_mws_sku'"))[0], { d: true, i: false });
+  assert.deepEqual((await q(`select ops.master_write_allowed('sku_create', 'core.skus', 'INSERT') as a, ops.master_write_allowed('sku_create', 'core.products', 'INSERT') as b,
+      ops.master_write_allowed('sku_create', 'core.sku_costs', 'DELETE') as c, ops.master_write_allowed('sku_create', 'ops.sku_component_breaches', 'UPDATE') as d,
+      ops.master_write_allowed('sku_edit', 'core.skus', 'INSERT') as e, ops.master_write_allowed('sku_edit', 'core.sku_costs', 'DELETE') as f`))[0],
+    { a: true, b: true, c: false, d: false, e: false, f: true });
   // new_open の前提 = ⑤-1 の差し込み口の表に 1 行 (集める関数は上書きしない・#1563 R3)。前提の関数は security definer にしない (集める関数が持ち主で呼ぶ)
-  assert.deepEqual(await q("select name, fn::text as fn from ops.master_cutover_prereq_checks where name = '0051_registrations'"), [{ name: '0051_registrations', fn: 'ops.master_registrations_prereq(text,text)' }]);
+  assert.deepEqual(await q("select name, fn::text as fn from ops.master_cutover_prereq_checks where name = '0052_registrations'"), [{ name: '0052_registrations', fn: 'ops.master_registrations_prereq(text,text)' }]);
   const pre = await q("select p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p where p.oid = 'ops.master_registrations_prereq(text, text)'::regprocedure");
   assert.deepEqual([pre[0].d, pre[0].pub], [false, false]); assert.match(pre[0].c, /search_path=pg_catalog, pg_temp/);
   assert.deepEqual(await q("select ops.master_cutover_prereq_problems('legacy_open', 'frozen') as p"), [{ p: [] }]);
-  assert.match((await q("select ops.master_cutover_prereq_problems('company_owner', 'new_open') as p"))[0].p.join(' '), /^0051_registrations: backfill_missing/);
+  assert.match((await q("select ops.master_cutover_prereq_problems('company_owner', 'new_open') as p"))[0].p.join(' '), /^0052_registrations: backfill_missing/);
   const ck = await q("select pg_get_constraintdef(oid) as d from pg_constraint where conname = 'ck_mer_operation'");
   assert.match(ck[0].d, /sku_create/);
 });

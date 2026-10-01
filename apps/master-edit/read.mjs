@@ -4,7 +4,7 @@
  * 一覧 (画面 A): 検索 (コード・名前・JAN)・区分・状態 (利用可・中止)・未入力 (税率・売上分類・送料・推奨月数・原価)・NE との差あり。
  *   セットの税率と原価 (構成品の合計) と売上分類 (構成品から導く) は「構成品から導いた値」= 画面で * を付ける。
  *   セットの売上分類は保存していない (読むときに lib/master-set-rules.js で導く) ので、売上分類の「未入力」だけは JS で絞る
- *   登録の状態 (0051・⑤-2a) = 下書き・NE 登録待ち・NE 確認済み・配る対象・利用可・要確認・やめた。行が無い = 切替の前の商品 (backfill の前)
+ *   登録の状態 (0052・⑤-2a) = 下書き・NE 登録待ち・NE 確認済み・配る対象・利用可・要確認・やめた。行が無い = 切替の前の商品 (backfill の前)
  */
 import { MASTER_OWNERSHIP } from '../../config/master-ownership.mjs';
 import { normSku } from '../../lib/sku-norm.js';
@@ -18,8 +18,8 @@ export const LIST_LIMIT = 100;
 export const KINDS = Object.freeze({ single: '単品', set: 'セット', exception: '例外' });
 export const MISSING = Object.freeze({ tax: '税率', sales: '売上分類', shipping: '送料', reorder: '推奨月数', cost: '原価' });
 export const STATES = Object.freeze({ available: '利用可', discontinued: '中止' });
-/** 登録の状態 (0051)。none = 状態の行が無い (切替の前の商品。backfill の後は無い = 使えない) */
-/** カードの知らせ (0051) の絞り込み (仮レビュー L6): 作成待ち (まだ・失敗)・衝突 */
+/** 登録の状態 (0052)。none = 状態の行が無い (切替の前の商品。backfill の後は無い = 使えない) */
+/** カードの知らせ (0052) の絞り込み (仮レビュー L6): 作成待ち (まだ・失敗)・衝突 */
 export const CARD_FILTERS = Object.freeze({ waiting: 'カード作成待ち (まだ・失敗)', conflict: 'カードの衝突' });
 export const REG_STATES = Object.freeze({
   draft: '下書き', ne_pending: 'NE登録待ち', ne_confirmed: 'NE確認済み', distributable: '配る対象', available: '登録済み (利用可)',
