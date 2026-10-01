@@ -28,6 +28,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { logEvent } from '../db.js';
+import { lintComposition, lintSummary } from './lp-lint.js';
 
 /*
  * 書き込みを伴うトランザクションは `.immediate()` で回す (コード R11)。
@@ -616,16 +617,34 @@ export function submitResult(db, generationId, {
         };
       }
     }
-    // 🚨 lint が通っていない accepted は受け取らない (codex exec review P1)。
-    //    いまは実行役の自己申告だが、**内容は保存されるので後から出力と突き合わせられる**。
-    //    サーバ側で lint を実行して正本にするのは PR1-c (parser.js の移植とセット)。
+    // 🚨 **lint はサーバが実行する。これが正本** (PR1-c・設計 §6)。
+    //    PR1-b までは実行役の自己申告 (`lint.ok`) を信じていたが、
+    //    それだと**自分で `{"ok":true}` と書けば何でも通せた**。
+    //    実行役が送ってきた lint は参考値として残すだけ (runner_lint)。
+    let serverLint = null;
     if (v === 'accepted') {
-      let lintObj = null;
-      try { lintObj = lintJson ? JSON.parse(lintJson) : null; } catch { lintObj = null; }
-      if (!lintObj || lintObj.ok !== true) {
-        return { code: 'bad_request', error: 'lint を通していない構成は受け取れません (lint.ok が true であること)' };
+      let packetName = null;
+      try { packetName = JSON.parse(job.packet_json).name || null; } catch { packetName = null; }
+      try {
+        serverLint = lintSummary(lintComposition(out, { productName: packetName }));
+      } catch (e) {
+        return { code: 'lint_failed', error: `lint を実行できませんでした: ${String(e?.message || e).slice(0, 200)}` };
+      }
+      if (!serverLint.ok) {
+        // 🚨 これは実行役のバグではなく、**測定結果**。
+        //    渡すときに何が足りないかを全部返す (実行役が直せるように)
+        return {
+          code: 'lint_failed',
+          error: `lint を通っていません (${serverLint.errors.length} 件)`,
+          lint: serverLint,
+        };
       }
     }
+    // 保存する lint = サーバの結果を正本にし、実行役の自己申告を横に残す
+    // (測定のときに「AI は通っているつもりだったか」を読める)
+    let runnerLint = null;
+    try { runnerLint = lintJson ? JSON.parse(lintJson) : null; } catch { runnerLint = null; }
+    const storedLint = v === 'accepted' ? packStoredLint(serverLint, runnerLint) : lintJson;
     const receiptObj = {
       verdict: v, review_rounds: rounds, model: gen.model, prompt_version: gen.prompt_version,
       finalized_at: nowS,
@@ -645,13 +664,13 @@ export function submitResult(db, generationId, {
               error_code = NULL, error = NULL, lease_token = NULL, lease_until = NULL,
               updated_at = ?, completed_at = COALESCE(completed_at, ?), finalized_at = ?
           WHERE id = ? AND status IN ('running', 'needs_review')`)
-        .run(out, sha256(out), lintJson, rounds, nowS, nowS, nowS, job.id).changes
+        .run(out, sha256(out), storedLint, rounds, nowS, nowS, nowS, job.id).changes
       : db.prepare(`UPDATE ph_lp_compose_jobs
           SET status = 'failed', lint_json = ?, review_rounds = ?, error_code = 'rejected', error = ?,
               lease_token = NULL, lease_until = NULL,
               updated_at = ?, completed_at = COALESCE(completed_at, ?), finalized_at = ?
           WHERE id = ? AND status IN ('running', 'needs_review')`)
-        .run(lintJson, rounds, reasonText || '検品で通らなかった', nowS, nowS, nowS, job.id).changes;
+        .run(storedLint, rounds, reasonText || '検品で通らなかった', nowS, nowS, nowS, job.id).changes;
 
     if (genCh !== 1 || jobCh !== 1) {
       throw new Error(`lp-compose: 結果の確定で行が動かなかった (generation=${genCh} job=${jobCh})`);
@@ -720,6 +739,55 @@ export function lpComposeImageRef(db, jobId, { leaseToken, index, now = Date.now
   const im = images[i];
   if (!im?.file_id) return { code: 'not_found', error: 'その番号の商品画像はありません' };
   return { ok: true, file_id: im.file_id, version: im.modified_time || null };
+}
+
+/**
+ * 保存する lint を組み立てる。
+ *
+ * 🚨 **サーバの結果を必ず残す** (codex exec review P2)。
+ *    以前は `jsonOrNull(...) || lintJson` と書いていたので、実行役が
+ *    LINT_MAX 間近の巨大な lint を送ると合計が上限を超え、
+ *    **実行役の自己申告がそのまま正本として保存された**。
+ *    入り切らなければ落とすのは**参考値の方** (runner_lint → 警告 → 詳細)。
+ */
+function packStoredLint(serverLint, runnerLint) {
+  const base = { ...serverLint, source: 'server' };
+  const tries = [
+    { ...base, runner_lint: runnerLint },
+    { ...base, runner_lint: null, runner_lint_dropped: true },
+    { ...base, warnings: [], runner_lint: null, runner_lint_dropped: true, warnings_dropped: true },
+    { ok: base.ok, checks: base.checks, errors: [], warnings: [], source: 'server', truncated: true },
+  ];
+  for (const cand of tries) {
+    const j = jsonOrNull(cand, LINT_MAX);
+    if (j !== false) return j;
+  }
+  // ここまで来ることは無いが、来ても**実行役の申告には戻さない**
+  return JSON.stringify({ ok: !!serverLint.ok, source: 'server', truncated: true });
+}
+
+/**
+ * 構成を lint するだけ (結果は確定しない)。実行役が**出す前に自分で直せる**ように置く。
+ *
+ * これが無いと、実行役は `result --accepted` を出して断られるまで lint 結果を知れず、
+ * その 1 回で generation を使い切ってしまう。**測定の目的は「直せたか」ではなく
+ * 「どこまで書けたか」**なので、lint 自体は何度でも回せてよい (AI 枠を消費しない)。
+ * @returns {{ok:true, lint:object}|{code:string, error:string}}
+ */
+export function lintForJob(db, jobId, { leaseToken, output, now = Date.now() } = {}) {
+  const nowS = new Date(now).toISOString();
+  const l = liveLease(db, posInt(jobId), leaseToken, nowS);
+  if (l.code) return l;
+  const out = String(output == null ? '' : output);
+  if (!out.trim()) return { code: 'bad_request', error: '構成の本文が空です' };
+  if (out.length > OUTPUT_MAX) return { code: 'too_large', error: `構成が大きすぎます (${OUTPUT_MAX} 文字まで)` };
+  let packetName = null;
+  try { packetName = JSON.parse(l.job.packet_json).name || null; } catch { packetName = null; }
+  try {
+    return { ok: true, lint: lintSummary(lintComposition(out, { productName: packetName })) };
+  } catch (e) {
+    return { code: 'lint_failed', error: `lint を実行できませんでした: ${String(e?.message || e).slice(0, 200)}` };
+  }
 }
 
 /**

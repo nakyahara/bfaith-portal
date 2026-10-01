@@ -1,4 +1,5 @@
 import { temporaryTestDataDir } from './test-temp-dir.mjs';
+import { compositionFor, fixture, FIXTURES } from './fixtures/lp-compose/index.mjs';
 await temporaryTestDataDir(import.meta.url, 'test-lp-compose-lib-');
 /**
  * LP 構成の AI 生成 — 依頼・固定 packet・予約・結果 (apps/product-hub/lib/lp-compose.js・段階1)
@@ -90,7 +91,10 @@ ok(lp.releaseJob(db, c2.job.job_id, { leaseToken: c2.job.lease_token, now: min(0
   '🚨 予約後に release は使えない (二重に呼べてしまう)');
 
 console.log('⑥ 結果 — accepted');
-const OUT = '# LP制作システム V2.1\n\n## ⑦ AI画像生成プロンプト\n… 本文 …';
+// 🚨 PR1-c から **lint はサーバが実行してそれが正本**なので、
+// accepted を受け取らせるには **本当に lint を通る本文** が要る (ダミー文字列では通らない)。
+// draft 名は 'ハッカ油スプレー NL' なので、共通の接頭辞を入れておけば検査 17 を通る
+const OUT = compositionFor('ハッカ油スプレー');
 // packet に画像があるので accepted には証跡が要る (codex exec review R2 P2)
 const LINT = { ok: true, checks: {} };
 // 証跡はサーバが配ったときに記録する (実行役からは受け取らない)
@@ -112,7 +116,7 @@ ok(lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdi
   '別の内容では上書きできない');
 
 // 🚨 packet に画像があるのに証跡が無い accepted は受け取らない (codex exec review R2 P2)
-const dZ = mkDraft('LP-Z', 'ハッカ油スプレー 証跡なし');
+const dZ = mkDraft('LP-Z', 'ハッカ油スプレー 30ml');   // 証跡なしの系
 lp.requestJob(db, args(dZ, s2.spec, 'key-0001', { now: min(5) }));
 const cZ = lp.claimJob(db, { runnerRunId: 'run-z', now: min(5) });
 const gZ = lp.reserveGeneration(db, cZ.job.job_id, { leaseToken: cZ.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(5) });
@@ -132,7 +136,7 @@ eq(lp.submitResult(db, gZ.generation_id, { packetHash: cZ.job.packet_hash, verdi
 // 🚨 証跡は claim ごとにリセットされる (codex exec review P1)。
 // 前の実行役が画像を落としてから手放した場合に、次の実行役が
 // 画像を一度も見ずに accepted を出せてはいけない
-const dY = mkDraft('LP-Y', 'ハッカ油スプレー 使い回し');
+const dY = mkDraft('LP-Y', 'ハッカ油スプレー 40ml');   // 証跡の使い回し
 lp.requestJob(db, args(dY, s2.spec, 'key-0001', { now: min(7) }));
 const cY1 = lp.claimJob(db, { runnerRunId: 'run-y1', now: min(7) });
 serve(cY1.job, min(7));                                    // 1 人目の実行役が画像を見た
@@ -148,7 +152,7 @@ eq(lp.submitResult(db, gY.generation_id, { packetHash: cY2.job.packet_hash, verd
 // 🚨 手放した後に、飛んでいた取得が完走しても次の実行役の証跡にならない (codex exec review P2)。
 // lease を見ずに記録していたときは、A の遅い取得が B の証跡になり、
 // B は画像を一度も見ずに accepted を出せた
-const dLap = mkDraft('LP-LAP', 'ハッカ油スプレー 取り直し');
+const dLap = mkDraft('LP-LAP', 'ハッカ油スプレー 60ml'); // lease の取り直し
 lp.requestJob(db, args(dLap, s2.spec, 'key-0001', { now: min(9) }));
 const cLap1 = lp.claimJob(db, { runnerRunId: 'run-lap1', now: min(9) });
 lp.releaseJob(db, cLap1.job.job_id, { leaseToken: cLap1.job.lease_token, now: min(9.2) });
@@ -191,6 +195,38 @@ eq(lp.submitResult(db, gAll.generation_id, { packetHash: cAll.job.packet_hash, v
   'bad_request', '🚨 2 枚中 1 枚しか見ていなければ accepted を受け取らない (codex exec review P1)');
 eq(lp.submitResult(db, gAll.generation_id, { packetHash: cAll.job.packet_hash, verdict: 'rejected', reason: '画像が取れなかった', now: min(10.2) }).status,
   'failed', 'rejected は証跡が揃わなくても出せる (作れなかったという報告)');
+
+// 🚨 巨大な自己申告 lint を送っても、**サーバの結果を追い出せない** (codex exec review P2)。
+// 以前は合計が LINT_MAX を超えると実行役の申告にフォールバックしていた
+const dBig = mkDraft('LP-BIG', 'ハッカ油スプレー 80ml');
+lp.requestJob(db, args(dBig, s2.spec, 'key-0001', { now: min(11) }));
+const cBig = lp.claimJob(db, { runnerRunId: 'run-big', now: min(11) });
+const gBig = lp.reserveGeneration(db, cBig.job.job_id, { leaseToken: cBig.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(11) });
+serve(cBig.job, min(11.1));
+const fatLint = { ok: true, checks: {}, filler: 'x'.repeat(lp.LINT_MAX - 200) };
+eq(lp.submitResult(db, gBig.generation_id, {
+  packetHash: cBig.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: fatLint, now: min(11.2),
+}).status, 'done', '巨大な lint を送っても accepted は通る');
+{
+  const stored = JSON.parse(db.prepare('SELECT lint_json FROM ph_lp_compose_jobs WHERE id = ?').get(cBig.job.job_id).lint_json);
+  eq(stored.source, 'server', '🚨 保存された lint は**サーバの結果** (実行役の申告に戻らない)');
+  eq(stored.ok, true, 'サーバの判定が入る');
+  ok(stored.checks && stored.checks['7'] === true, '検査の内訳も残る');
+  eq(stored.runner_lint_dropped, true, '入り切らなければ落とすのは**参考値の方**');
+  ok(JSON.stringify(stored).length <= lp.LINT_MAX, 'LINT_MAX に収まる');
+}
+// 普通の大きさなら、実行役の申告も横に残る
+{
+  const dSml = mkDraft('LP-SML', 'ハッカ油スプレー 90ml');
+  lp.requestJob(db, args(dSml, s2.spec, 'key-0001', { now: min(12) }));
+  const c = lp.claimJob(db, { runnerRunId: 'run-sml', now: min(12) });
+  const g = lp.reserveGeneration(db, c.job.job_id, { leaseToken: c.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(12) });
+  serve(c.job, min(12.1));
+  lp.submitResult(db, g.generation_id, { packetHash: c.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: { ok: true, mine: 1 }, now: min(12.2) });
+  const stored = JSON.parse(db.prepare('SELECT lint_json FROM ph_lp_compose_jobs WHERE id = ?').get(c.job.job_id).lint_json);
+  eq(stored.source, 'server', '正本はサーバ');
+  eq(stored.runner_lint.mine, 1, '実行役の申告は横に残る (測定で読める)');
+}
 
 console.log('⑧ 成否不明 (lease 切れ) は needs_review で止まる');
 const dC = mkDraft('LP-C', 'ハッカ油スプレー 200ml');
@@ -312,14 +348,18 @@ lp.requestJob(db, args(dN, s2.spec, 'key-0001', { now: min(110) }));
 const cN = lp.claimJob(db, { runnerRunId: 'run-21', now: min(110) });
 const gN = lp.reserveGeneration(db, cN.job.job_id, { leaseToken: cN.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(110) });
 serve(cN.job, min(110));
-eq(lp.submitResult(db, gN.generation_id, {
-  packetHash: cN.job.packet_hash, verdict: 'accepted', output: OUT,
-  receipt: { images: [{ file_id: 'OTHERFILE999', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
-}).code, 'bad_request', '🚨 渡していない画像を証跡に混ぜられない (R7 #2)');
-eq(lp.submitResult(db, gN.generation_id, {
+// 🚨 このテストは PR1-c で書き直した。以前は「OTHERFILE999 を混ぜると bad_request」を
+//    見ているつもりだったが、実際には `lint` を渡していなかったから落ちていただけで、
+//    **証跡の検査は何も見ていなかった** (P1 で証跡をサーバ記録に移したときから)。
+//    いまの保証は「**送られた receipt はそもそも使わない**」なので、そちらを固定する。
+const subN = lp.submitResult(db, gN.generation_id, {
   packetHash: cN.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: LINT,
-  receipt: { images: [{ file_id: 'FILEID000001', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
-}).status, 'done', 'サーバが配っていれば通る (送った receipt は使われない)');
+  receipt: { images: [{ file_id: 'OTHERFILE999', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
+});
+eq(subN.status, 'done', 'サーバが配っていれば通る');
+eq(subN.receipt.images.length, 1, '証跡は 1 枚');
+eq(subN.receipt.images[0].file_id, 'FILEID000001',
+  '🚨 証跡は**サーバが配った記録**。送ってきた OTHERFILE999 は使われない (R7 #2 の今の形)');
 
 console.log('⑯ R9 の修正');
 // #1 同じキーの再送は、材料の検証より先に既存 job を返す
