@@ -31,6 +31,8 @@ export const OWNED_COLUMNS = Object.freeze([
   'suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days',
   // 0027 (②c-2)
   'skus.standard_price', 'skus.shipping', 'skus.reorder_months', 'suppliers.contacts', 'supplier_skus.is_primary',
+  // 0053 (⑤-2b・契約 v3 H6): 商品の JAN (core.external_ids の system = 'jan')
+  'external_ids.jan',
 ]);
 
 export const MASTER_OWNERSHIP = Object.freeze({
@@ -59,6 +61,8 @@ export const MASTER_OWNERSHIP = Object.freeze({
   'skus.reorder_months': 'load',      // 推奨保有月数。商品管理リストの公開 snapshot が使えない日は 'load' でも触らない
   'suppliers.contacts': 'load',       // 連絡先 6 列 (email_to / email_cc / contact_name / fax_number / relay_to / order_memo をまとめて)
   'supplier_skus.is_primary': 'load', // 代表の仕入先 (NE の商品の仕入先コード)。コードが空の商品は触らない
+  // 0053 (⑤-2b) で足した列
+  'external_ids.jan': 'load',         // 商品の JAN。'company' なら夜間ロードは商品の JAN を足さない・外さない (JAN の観測と解決の記録は続ける)
 });
 
 /** 知らないキー・知らない値を落とす (typo で「守ったつもり」を作らない) */

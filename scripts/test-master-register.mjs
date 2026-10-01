@@ -281,14 +281,16 @@ await ta('[S2b] 画面のロールは SKU・商品・カードの知らせを直
   assert.equal(await skuId('edit-direct'), undefined);
 });
 
-await ta('[S3] 根拠の表ができるまで (⑤-2b / ④) は NE 登録待ち・NE 確認済み・配る対象・利用可へ進めない (not_ready)・一方向・やめる = 人の理由だけ (運用のロールも)', async () => {
+await ta('[S3] NE 登録待ち・NE 確認済みの根拠は 0053 (⑤-2b) の記録を関数が自分で読む (呼び手の根拠 = caller_evidence・記録が無い = no_evidence)・配る対象・利用可は ④ まで not_ready・一方向・やめる = 人の理由だけ (運用のロールも)', async () => {
   const d = await skuId('tx-1');
-  await assert.rejects(() => transition(d, 'ne_pending', { evidence: { export_id: 7, sha256: SHA } }), /not_ready/);
+  await assert.rejects(() => transition(d, 'ne_pending', { evidence: { export_id: 7, sha256: SHA } }), /caller_evidence/);
+  await assert.rejects(() => transition(d, 'ne_pending'), /no_evidence/);
   await assert.rejects(() => transition(d, 'ne_confirmed', { evidence: { compare_run_id: RUN, matched: true } }), /one_way/);
   await assert.rejects(() => transition(d, 'available', { evidence: { generation: 'g1', acks: ACKS('g1') } }), /one_way/);
-  // 持ち主が状態を直接作った (試験だけ) としても、根拠の表が無い = 進めない
+  // 持ち主が状態を直接作った (試験だけ) としても、照合の確かめの記録が無い = 進めない
   await forceState(d, 'ne_pending');
-  await assert.rejects(() => transition(d, 'ne_confirmed', { actorType: 'system', actor: 'compare', evidence: { compare_run_id: RUN, matched: true } }), /not_ready/);
+  await assert.rejects(() => transition(d, 'ne_confirmed', { actorType: 'system', actor: 'compare', evidence: { compare_run_id: RUN, matched: true } }), /caller_evidence/);
+  await assert.rejects(() => transition(d, 'ne_confirmed', { actorType: 'system', actor: 'compare' }), /no_evidence/);
   await forceState(d, 'ne_confirmed');
   await assert.rejects(() => transition(d, 'distributable', { actorType: 'system', actor: 'copy', evidence: { generation: 'g1' } }), /not_ready/);
   await forceState(d, 'distributable', 'g1');
