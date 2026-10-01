@@ -300,8 +300,9 @@ router.post('/api/sku/:code/card-link', (req, res) => {
     if (r.ok) return res.json({ ok: true, draft_id: r.draft_id, already: !!r.already, label: CARD_STATUS_LABELS.done, applied: r.applied || [], not_applied: r.not_applied || [] });
     const msg = { no_event: 'この商品にはカードの知らせがありません', not_conflict: '衝突の知らせではありません (「カードをもう一度作る」を使ってください)', leased: 'ほかの処理がちょうど取り込み中です。少し待ってからもう一度',
       already_done: 'カードはもう作ってあります', hash_mismatch: '知らせの中身が壊れています',
-      draft_mismatch: `衝突しているカードが画面を開いたときと違います (今は #${r.draft_id})。何も結んでいません。画面を開き直してください` }[r.reason] || r.reason;
-    res.status(409).json({ ok: false, error: msg, reason: r.reason, draft_id: r.draft_id ?? null });
+      draft_mismatch: `衝突しているカードが画面を開いたときと違います (今は #${r.draft_id})。何も結んでいません。画面を開き直してください`,
+      ambiguous: `同じ商品コードのカードが product-hub に ${(r.draft_ids || []).length} 枚 (${(r.draft_ids || []).map((x) => '#' + x).join('・')}) あります。どれに結ぶか決められないので結んでいません。product-hub で 1 枚に片付けてから「カードをもう一度作る」` }[r.reason] || r.reason;
+    res.status(409).json({ ok: false, error: msg, reason: r.reason, draft_id: r.draft_id ?? null, draft_ids: r.draft_ids ?? null });
   }, 'write');
 });
 

@@ -26,15 +26,25 @@
 --        - backfill の前も、表の持ち主 (夜間ロード・migration) とスーパーユーザー以外 (= 画面のロール)
 --      夜間ロードが NE から作った SKU は ops.quarantine_unregistered_skus が同じ取引で quarantined にする (engine.mjs が呼ぶ。backfill の前は何もしない)
 --   4. 切替の門 (R1 H1): new_open に進むのは、backfill がちょうど 1 回済み **かつ** 状態の行の無い SKU が 0 件のときだけ
---      (0050 の差し込み口 ops.master_cutover_prereq_problems を create or replace。set_master_cutover_phase が呼ぶ + 段階の行の trigger も呼ぶ = 下の理由)
+--      (前提の関数 ops.master_registrations_prereq を 0050 の差し込み口の表 ops.master_cutover_prereq_checks に 1 行足す = set_master_cutover_phase が呼ぶ。
+--       集める関数 ops.master_cutover_prereq_problems は上書きしない (#1563 R3)。段階の行の trigger もこの関数を呼ぶ = 下の理由)
 --   5. ops.v_sku_distributable (distributable・available = 写しに載せてよい) / ops.v_sku_available (available だけ = 業務で使ってよい)。
 --      🚨 今の読み手 (core.skus を直接読む所) はまだ切り替えない (⑤-3 / ⑥)
 --   6. ops.product_hub_outbox = product-hub のカードを作る知らせ。登録と同じ取引で書く。event_id・schema_version・payload・payload_hash は変えない。
 --      消費 (apps/product-hub/services/cdb-card-intake.js) は cdb_sku_id の一意で冪等。状態 = pending → done / failed (再試行) / conflict (同じコードのカードが既にある
 --      = 人が「既存のカードをこの商品に結ぶ」で done にする)。
 --      🚨 状態・結果・借りを書くのは security definer の関数 (ops.claim_card_events / ops.finish_card_event = 借りた人だけが結果を書ける) だけ。画面のロールは知らせの insert と読みだけ
---      (仮レビュー L7)
+--      (仮レビュー L7)。画面のロールの insert は 0050 と同じ守り (trg_master_edit_guard = 同じ取引で ops.begin_master_write の後・段階 new_open) +
+--      request_id・作った人が ops.begin_master_write の行と同じ (偽れない)
 --   7. ops.master_edit_requests.operation に 'sku_create' (新商品の登録の保存 1 回) を足す
+--   8. 0050 の画面のロールの書き込みの約束 (#1563 R3 M2) との関係:
+--      ・新商品の登録 (lib/master-register.mjs) は、書く前に同じ取引で ops.begin_master_write を呼ぶ。商品・SKU・仕入先・原価・構成の依頼・保存の記録の
+--        INSERT は 0050 の trg_master_edit_guard が見る (SKU の INSERT = 値のある列の持ち主 = skus.sku_kind なども company)
+--      ・ops.create_sku_registration (security definer) も、呼び手が master_edit なら同じ取引の ops.begin_master_write の行が要る。
+--        誰が・request_id・理由はその行から取る (引数と違えば 42501 = 偽れない)。SKU を作った取引の中だけ (not_new_sku) は今までどおり
+--      ・ops.claim_card_events / ops.finish_card_event は行を要らない: 商品の値 (core.*) を書かず、知らせの届け先の状態だけ。
+--        取り込みは保存とは別の時 (product-hub のボードを開いたとき) に動く = 「保存の取引」が無い。借り (lease) の持ち主だけが結果を書ける
+--      ・ops.transition_sku_registration / backfill は運用のロール (master_ops) だけ = 画面のロールの約束の外
 -- 🚨 この migration は商品の値を何も変えない (状態の行は 1 行も作らない = backfill は切替の日に人が流す)
 -- 🚨 security definer の関数 = 一時の表を使わない・search_path = pg_catalog, pg_temp (名前は全部 schema つき)・public の実行権を外す (0034 の約束)
 
@@ -118,8 +128,26 @@ create function ops.create_sku_registration(p_sku_id bigint, p_actor text, p_req
 declare
   v_company smallint;
   v_event   bigint;
+  v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
+  v_sess    ops.master_write_sessions%rowtype;
+  v_actor   text := p_actor;
+  v_req     text := p_request_id;
+  v_reason  text := p_reason;
 begin
   if p_actor is null or length(p_actor) = 0 then raise exception 'invalid_input: 誰が (actor) が要る' using errcode = '22023'; end if;
+  -- 画面のロール = 同じ取引で ops.begin_master_write をした後だけ (0050 の約束と同じ)。誰が・request_id・理由はその行から (引数と違えば 42501)
+  if v_db_user = 'master_edit' then
+    select * into v_sess from ops.master_write_sessions where txid = pg_catalog.txid_current();
+    if not found then
+      raise exception 'master_write_session_required: 下書きの状態は、同じ取引で ops.begin_master_write をした後だけ作る' using errcode = '42501';
+    end if;
+    if p_actor is distinct from v_sess.actor_id or (p_request_id is not null and p_request_id is distinct from v_sess.request_id::text) then
+      raise exception 'master_write_session_mismatch: 誰が・request_id が ops.begin_master_write のときと違う' using errcode = '42501';
+    end if;
+    v_actor := v_sess.actor_id;
+    v_req := v_sess.request_id::text;
+    v_reason := coalesce(v_sess.reason, p_reason);
+  end if;
   select company_id into v_company from core.skus where sku_id = p_sku_id;
   if not found then raise exception 'no_sku: SKU % が無い', p_sku_id using errcode = 'P0001'; end if;
   if exists (select 1 from ops.master_registrations where sku_id = p_sku_id) then
@@ -133,10 +161,10 @@ begin
   end if;
   perform pg_catalog.set_config('ops.registration_protocol', '1', true);
   insert into ops.master_registrations (sku_id, company_id, state, origin, created_by, state_changed_by)
-    values (p_sku_id, v_company, 'draft', 'new_entry', p_actor, p_actor);
+    values (p_sku_id, v_company, 'draft', 'new_entry', v_actor, v_actor);
   perform pg_catalog.set_config('ops.registration_protocol', '', true);
   insert into ops.master_registration_events (company_id, sku_id, from_state, to_state, actor_type, actor_id, reason, evidence, request_id)
-    values (v_company, p_sku_id, null, 'draft', 'human', p_actor, p_reason, '{}'::jsonb, p_request_id) returning event_id into v_event;
+    values (v_company, p_sku_id, null, 'draft', 'human', v_actor, v_reason, '{}'::jsonb, v_req) returning event_id into v_event;
   return jsonb_build_object('sku_id', p_sku_id, 'state', 'draft', 'event_id', v_event);
 end $$;
 revoke all on function ops.create_sku_registration(bigint, text, text, text) from public;
@@ -278,10 +306,11 @@ end $$;
 create constraint trigger trg_skus_registered after insert on core.skus deferrable initially deferred
   for each row execute function ops.check_sku_registered();
 
--- 4. 切替の門: new_open に進む前提 (R1 H1)。問題の一覧 (空 = 進んでよい)。0050 の差し込み口 (既定 = 空) をここで上書きする = ops.set_master_cutover_phase が呼んで断る (prereq_failed)。
---    ⑥ の準備でほかの前提を足すときは、この関数の中身に足す (create or replace で上書きし合わない)
-create or replace function ops.master_cutover_prereq_problems(p_from text, p_to text) returns text[]
-  language plpgsql stable security definer set search_path = pg_catalog, pg_temp as $$
+-- 4. 切替の門: new_open に進む前提 (R1 H1)。問題の一覧 (空 = 進んでよい)。0050 の差し込み口の表 ops.master_cutover_prereq_checks に 1 行足す
+--    = ops.set_master_cutover_phase が集める関数 (ops.master_cutover_prereq_problems) から呼んで断る (prereq_failed: 0051_registrations: ...)。
+--    集める関数は上書きしない (#1563 R3 = 後の migration の前提を消さない)。security definer にしない (集める関数が持ち主の権限で呼ぶ)
+create function ops.master_registrations_prereq(p_from text, p_to text) returns text[]
+  language plpgsql stable set search_path = pg_catalog, pg_temp as $$
 declare
   v_problems text[] := '{}';
   v_backfills integer;
@@ -299,19 +328,21 @@ begin
   end if;
   return v_problems;
 end $$;
-revoke all on function ops.master_cutover_prereq_problems(text, text) from public;
+revoke all on function ops.master_registrations_prereq(text, text) from public;
+insert into ops.master_cutover_prereq_checks (name, fn) values ('0051_registrations', 'ops.master_registrations_prereq(text, text)');
 
--- 保険の trigger (段階の行が変わるときにも同じ前提を見る)。残す理由:
---   ① ops.set_master_cutover_phase は後の migration (⑤-3・⑥) でも create or replace される = 差し込み口を呼び忘れた版が入っても new_open に進めない
+-- 保険の trigger (段階の行が変わるときにも同じ前提の関数を見る)。#1563 R3 の差し込み口の表の後も残す理由:
+--   ① ops.set_master_cutover_phase は後の migration (⑤-3・⑥) でも create or replace される = 集める関数を呼び忘れた版・表の行を消した版が入っても new_open に進めない
 --   ② 持ち主のロールが印 (ops.cutover_protocol) を立てて段階の行を直接変えても、前提は外せない
---   (復元は trigger を止めて入れる = 影響しない。段階の関数の中では差し込み口と同じ答え = 二重に断るだけで、通るものは変わらない)
+--   前提の中身は 1 か所 (ops.master_registrations_prereq) = 差し込み口と trigger で答えは同じ (二重に断るだけで、通るものは変わらない)。
+--   (復元は trigger を止めて入れる = 影響しない)
 create function ops.guard_master_cutover_prereq() returns trigger
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
   v_problems text[];
 begin
   if new.phase is distinct from old.phase then
-    v_problems := ops.master_cutover_prereq_problems(old.phase, new.phase);
+    v_problems := ops.master_registrations_prereq(old.phase, new.phase);
     if coalesce(array_length(v_problems, 1), 0) > 0 then
       raise exception 'cutover_prereq: 段階を % から % に進めない: %', old.phase, new.phase, array_to_string(v_problems, ' / ') using errcode = 'P0001';
     end if;
@@ -375,6 +406,28 @@ create trigger trg_product_hub_outbox_guard before update or delete on ops.produ
   for each row execute function ops.guard_product_hub_outbox();
 create trigger trg_product_hub_outbox_no_truncate before truncate on ops.product_hub_outbox
   for each statement execute function core.reject_mutation();
+-- 画面のロールの insert = 0050 と同じ守り (同じ取引で ops.begin_master_write の後・段階 new_open。#1563 R3 M2) + request_id・作った人が その行と同じ
+create trigger trg_master_edit_guard before insert on ops.product_hub_outbox for each row execute function ops.guard_master_edit_write();
+-- 🚨 security definer = 画面のロールに ops.master_write_sessions を読ませない。名前の順 (trg_master_edit_guard の後) に動く
+create function ops.guard_product_hub_outbox_session() returns trigger
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
+  v_sess    ops.master_write_sessions%rowtype;
+begin
+  if v_db_user is distinct from 'master_edit' then return new; end if;
+  select * into v_sess from ops.master_write_sessions where txid = pg_catalog.txid_current();
+  if not found then
+    raise exception 'master_write_session_required: カードの知らせは、同じ取引で ops.begin_master_write をした後だけ' using errcode = '42501';
+  end if;
+  if new.request_id is distinct from v_sess.request_id or new.created_by is distinct from v_sess.actor_id then
+    raise exception 'master_write_session_mismatch: カードの知らせの request_id・作った人が ops.begin_master_write のときと違う' using errcode = '42501';
+  end if;
+  return new;
+end $$;
+revoke all on function ops.guard_product_hub_outbox_session() from public;
+create trigger trg_product_hub_outbox_session before insert on ops.product_hub_outbox
+  for each row execute function ops.guard_product_hub_outbox_session();
 
 -- 取り込む知らせを借りる (lease)。p_mode = auto (まだ・失敗で回数の上限の前) / manual (人が押した = 失敗・衝突も) / link (衝突だけ = 既存のカードに結ぶ)。
 -- 借りた行を返す (for update skip locked = 同時に 2 つは借りない・借りの期限の前はほかが取らない)。試した回数を 1 増やす

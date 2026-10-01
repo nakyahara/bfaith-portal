@@ -74,14 +74,19 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   if (f.missing === 'shipping') where.push('s.shipping_code is null');
   if (f.missing === 'reorder') where.push('s.reorder_months is null');
   if (f.missing === 'cost') where.push(`coalesce(c.cost_status not in ('COMPLETE', 'OVERRIDDEN'), true)`);
+  // 登録の状態とカードは別々の絞り込み (両方 = 両方に合う商品。PR #1566 Codex R2 Low)
   const hasReg = await regclass(db, 'ops.master_registrations');
-  if (f.reg && !hasReg) where.push(f.reg === 'none' ? 'true' : 'false');
+  if (f.reg) {
+    if (!hasReg) where.push(f.reg === 'none' ? 'true' : 'false');
+    else if (f.reg === 'none') where.push('not exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id)');
+    else { params.push(f.reg); where.push(`exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id and mr.state = $${params.length})`); }
+  }
   const hasOutbox = await regclass(db, 'ops.product_hub_outbox');
-  if (f.card && !hasOutbox) where.push('false');
-  else if (f.card === 'waiting') where.push(`exists (select 1 from ops.product_hub_outbox o where o.sku_id = s.sku_id and o.status in ('pending', 'failed'))`);
-  else if (f.card === 'conflict') where.push(`exists (select 1 from ops.product_hub_outbox o where o.sku_id = s.sku_id and o.status = 'conflict')`);
-  else if (f.reg === 'none') where.push('not exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id)');
-  else if (f.reg) { params.push(f.reg); where.push(`exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id and mr.state = $${params.length})`); }
+  if (f.card) {
+    if (!hasOutbox) where.push('false');
+    else if (f.card === 'waiting') where.push(`exists (select 1 from ops.product_hub_outbox o where o.sku_id = s.sku_id and o.status in ('pending', 'failed'))`);
+    else if (f.card === 'conflict') where.push(`exists (select 1 from ops.product_hub_outbox o where o.sku_id = s.sku_id and o.status = 'conflict')`);
+  }
   const diffAvailable = await regclass(db, 'ops.master_decision_candidates');
   const run = diffAvailable ? await latestRun(db) : null;
   if (f.diff) {
