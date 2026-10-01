@@ -21,11 +21,19 @@
  *   - 印がもうある (二度は流さない)
  *   - fba.db が無い (DATA_DIR の間違い。空の fba.db を作らない)
  *   - sku_mapping か fba_sku_attrs の表が無い (違う DB) / sku_mapping が --min-rows より少ない (空の DB) (Codex PR R1 Medium 3)
+ *   - 大小文字だけ違う SKU の衝突がある (下の説明。Codex PR R4 Medium)
  *
  * 🚨 書き手: fba.db の書き手は常駐のサーバ 1 つが決まり (2026-09-20 の事故)。このスクリプトは 1 回だけの 2 人目の書き手になる。
  *   保存は db.js の saveToFile (ファイルの lock + 「外から書かれていたら上書きしない」) を通るので、相手の行は消えない。
  *   ぶつかったときは、こちらは読み直して最大 3 回やり直す。常駐のサーバ側は次の保存で 1 回だけ失敗して読み直す (やり直せば通る)。
  *   → 画面を使っていない時間 (06:00・09:40〜11:40 の定期処理を外す) に流す。miniPC は WarehouseServer を止めてから流すのがいちばん安全
+ *
+ * 🚨 大小文字だけ違う SKU (Codex PR R4 Medium): SKU は LOWER(TRIM()) で突き合わせる (読み手と同じ)。Sheet の `Alpha-1` と attrs の `alpha-1` は同じ SKU
+ *   = attrs に 2 行目を作らない。fba_sku_attrs に大小文字だけ違う行が既に 2 行以上ある鍵、Sheet の中で大小文字だけ違って attrs に無い鍵があれば、
+ *   どちらの FNSKU が正しいか機械では決められないので **断る** (--check にも一覧が出る)。
+ *   直し方 (人が決める): 常駐のサーバを止め、fba.db の fba_sku_attrs で、その鍵の行のうち Amazon の今のレポートと合う 1 行 (ふつうは
+ *   source が restock / planning で updated_at が新しい行) だけを残して他の行を DELETE する → サーバを起動 → このスクリプトを流す。
+ *   自動でまとめないのは、Sheet の backfill の行とレポートの行のどちらも「今の Amazon の値」とは言い切れない場合があるため
  *
  * やり直し: 基本は要らない (入れるのは空いている SKU だけ)。どうしても要るときは、モードを外し、常駐のサーバを止めてから
  *   fba.db の fba_migration_marks から key = 'sku_mapping_to_fba_sku_attrs' の行を消して、このスクリプトをもう一度流す
@@ -62,7 +70,16 @@ function inspect() {
       mark, tables,
       sku_mapping_rows: count('SELECT COUNT(*) AS n FROM sku_mapping'),
       attrs_rows: count('SELECT COUNT(*) AS n FROM fba_sku_attrs'),
-      would_insert: count('SELECT COUNT(*) AS n FROM sku_mapping m WHERE m.amazon_sku NOT IN (SELECT amazon_sku FROM fba_sku_attrs)'),
+      would_insert: count('SELECT COUNT(*) AS n FROM sku_mapping m WHERE LOWER(TRIM(m.amazon_sku)) NOT IN (SELECT LOWER(TRIM(amazon_sku)) FROM fba_sku_attrs)'),
+      // 流した後に大小文字だけ違う SKU が attrs に 2 行以上になる鍵 = 今ある衝突 + Sheet の中の大小文字違いで attrs に無いもの
+      collisions: tables.sku_mapping && tables.fba_sku_attrs ? f.prepare(`
+        WITH u AS (
+          SELECT amazon_sku FROM fba_sku_attrs
+          UNION
+          SELECT m.amazon_sku FROM sku_mapping m WHERE LOWER(TRIM(m.amazon_sku)) NOT IN (SELECT LOWER(TRIM(amazon_sku)) FROM fba_sku_attrs)
+        )
+        SELECT LOWER(TRIM(amazon_sku)) AS norm_key, group_concat(amazon_sku, ' / ') AS skus FROM u
+        GROUP BY LOWER(TRIM(amazon_sku)) HAVING COUNT(*) > 1 ORDER BY norm_key`).all() : [],
     };
   } finally {
     f.close();
@@ -75,6 +92,7 @@ function sourceProblem(before) {
   if (missing.length) return `FBA 補充の fba.db ではない (表 ${missing.join('・')} が無い)。DATA_DIR を確かめる`;
   if (!Number.isFinite(minRows) || minRows < 1) return `--min-rows の値がおかしい (${process.argv[minArg + 1]})`;
   if (before.sku_mapping_rows < minRows) return `sku_mapping が ${before.sku_mapping_rows} 行しかない (下限 ${minRows})。空の・違う fba.db に印を付けない`;
+  if (before.collisions.length) return `大小文字だけ違う SKU が ${before.collisions.length} 組ある (流すと fba_sku_attrs に 2 行以上になる): ${before.collisions.slice(0, 20).map((c) => c.skus).join(' | ')}。説明の手順で 1 行にしてから流す`;
   return null;
 }
 
@@ -94,7 +112,7 @@ async function main() {
   if (problem) return fail(problem);
 
   const db = await import(pathToFileURL(path.join(root, 'apps', 'fba-replenishment', 'db.js')).href);
-  await db.initDb();
+  await db.initDb({ skipStartupBackfill: true });   // 起動時の backfill (大小文字まで同じものだけ見る) は流さない = 2 行目を作らない
   try {
     // initDb() は (印が無くモードも無いので) 起動時の backfill を今までどおり流す。ここで数える入った行は 0 になりやすいので、
     // 流す前に数えた件数も印に残す。保存の競合 (常駐のサーバが書いた) は読み直して 3 回までやり直す (試験 = test-fba-sheetless-mode.mjs)
@@ -105,7 +123,7 @@ async function main() {
     });
     console.log(`[fba-sheetless-backfill] 済んだ: ${JSON.stringify(r)}`);
   } catch (e) {
-    if (e && ['FBA_BACKFILL_ALREADY_DONE', 'FBA_BACKFILL_MODE_ON', 'FBA_BACKFILL_SOURCE_EMPTY', 'FBA_BACKFILL_VERIFY_FAILED'].includes(e.code)) return fail(e.message);
+    if (e && ['FBA_BACKFILL_ALREADY_DONE', 'FBA_BACKFILL_MODE_ON', 'FBA_BACKFILL_SOURCE_EMPTY', 'FBA_BACKFILL_VERIFY_FAILED', 'FBA_BACKFILL_ATTRS_COLLISION'].includes(e.code)) return fail(e.message);
     throw e;
   }
 }

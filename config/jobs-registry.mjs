@@ -1004,6 +1004,7 @@ export const JOBS_REGISTRY = [
       + '手の Sheet 同期の口 (画面の Step3・POST /api/sync-sku-mappings) は 410。画面の Step4 は POST /api/recommendations/recalculate = 「Amazon 仮確定」を計算できて中身が変わっていないときだけ消す (変わっていたら 409)。'
       + 'Render の fba.db に一回限りの移行の印が無いと材料が欠けている扱い (計算しない・fail)。miniPC の印が無いと FNSKU を反映しない (fnsku_ready=false・9:40 は partial)。'
       + 'miniPC が FBA_SHEETLESS_IO=1 なら、頼み方に関わらず FNSKU は fba_sku_attrs から返す (古い Render にも凍結した sku_mapping の FNSKU を渡さない)。IO=1 なのに印が無いと /service-api/fba/sync/latest-planning は 503 (引き取りそのものが失敗する = 印を書いてから IO を入れ直す)。'
+      + 'fba_sku_attrs に大小文字だけ違う SKU の行が 2 つ以上あると、一回限りの移行は断る (--check に一覧)・FNSKU が食い違えば miniPC の引き取りは 503 (FBA_SKU_ATTRS_CONFLICT)。直し方 = scripts/fba-sheetless-backfill-once.mjs の説明 (人が 1 行にする)。'
       + '入れる順番: ① miniPC にコードを配る (?fnsku_source=attrs に答える) ② miniPC で scripts/fba-sheetless-backfill-once.mjs (WarehouseServer を止めて) '
       + '→ miniPC の .env (リポジトリの直下の 1 つ) に FBA_SHEETLESS_IO=1 → WarehouseServer を起動 (miniPC は計算しないので入出力だけ止める = '
       + '/service-api/fba/sync-sku-mappings は 410・FNSKU は fba_sku_attrs だけ・起動時の backfill を流さない) '

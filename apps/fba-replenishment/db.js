@@ -193,6 +193,52 @@ const SKU_MAPPING_BACKFILL_SQL = `
   `;
 
 /**
+ * 一回限りの移行で流す backfill (Codex PR R4 Medium): SKU の突き合わせを LOWER(TRIM()) にする (読み手の normSku と同じ)。
+ * 🚨 起動時の backfill (上の SKU_MAPPING_BACKFILL_SQL) は大小文字まで同じものだけ見る = 今までどおり (モードなしは変えない)。
+ *    そのままだと Sheet の `Alpha-1` が、attrs の `alpha-1` と別の 2 行目として入り、読み手 (正規化して後勝ち) が古い値を拾う
+ */
+const SKU_MAPPING_BACKFILL_NORM_SQL = `
+    INSERT INTO fba_sku_attrs (amazon_sku, asin, fnsku, source)
+    SELECT m.amazon_sku, m.asin, m.fnsku, 'sheet_backfill'
+    FROM sku_mapping m
+    WHERE LOWER(TRIM(m.amazon_sku)) NOT IN (SELECT LOWER(TRIM(amazon_sku)) FROM fba_sku_attrs)
+  `;
+
+/**
+ * fba_sku_attrs で、大小文字・前後の空白だけが違う SKU が 2 行以上ある鍵の一覧 (正規化した鍵・行数・元の SKU)。
+ * 一回限りの移行は、これが 1 件でもあれば印を書かない (どちらの値が正しいか機械では決めない。直し方 = 移行のスクリプトの説明)
+ */
+export function findAttrsCaseCollisions() {
+  return queryAll(`
+    SELECT LOWER(TRIM(amazon_sku)) AS norm_key, COUNT(*) AS n, group_concat(amazon_sku || '=' || COALESCE(fnsku, '(なし)'), ' / ') AS rows
+    FROM fba_sku_attrs GROUP BY LOWER(TRIM(amazon_sku)) HAVING COUNT(*) > 1 ORDER BY norm_key`);
+}
+
+/**
+ * miniPC が Render に渡す FNSKU の一覧 (正規化した鍵ごとに 1 行。Codex PR R4 Medium)。
+ * 同じ鍵の行が複数あって FNSKU が食い違えば conflicts に入れる (呼び手は 503 で渡さない)。同じ値なら更新の新しい行を 1 つだけ
+ * @returns {{ rows: {amazon_sku: string, fnsku: string|null}[], conflicts: {norm_key: string, rows: string[]}[] }}
+ */
+export function getFbaSkuAttrsForSync() {
+  const byKey = new Map();
+  const conflicts = new Map();
+  for (const r of queryAll('SELECT amazon_sku, fnsku, updated_at FROM fba_sku_attrs ORDER BY amazon_sku')) {
+    const k = normSku(r.amazon_sku);
+    if (!k) continue;
+    const prev = byKey.get(k);
+    if (!prev) { byKey.set(k, r); continue; }
+    if ((prev.fnsku || null) !== (r.fnsku || null)) {
+      if (!conflicts.has(k)) conflicts.set(k, [`${prev.amazon_sku}=${prev.fnsku || '(なし)'}`]);
+      conflicts.get(k).push(`${r.amazon_sku}=${r.fnsku || '(なし)'}`);
+    } else if (String(r.updated_at || '') > String(prev.updated_at || '')) byKey.set(k, r);
+  }
+  return {
+    rows: [...byKey.entries()].filter(([k]) => !conflicts.has(k)).map(([, r]) => ({ amazon_sku: r.amazon_sku, fnsku: r.fnsku || null })),
+    conflicts: [...conflicts.entries()].map(([norm_key, rows]) => ({ norm_key, rows })),
+  };
+}
+
+/**
  * 一回限りの移行の印 (fba_migration_marks の 1 行)。無ければ null。
  * 🚨 表は移行のスクリプトだけが作る (起動時には作らない = モードを使わない間は fba.db の形も今のまま)
  */
@@ -225,6 +271,7 @@ function shouldRunStartupBackfill() {
  * 印があれば、以後の起動では backfill を流さない (モードを外しても流さない)。
  * 🚨 断る (投げる): モードを使うつもりのとき (code FBA_BACKFILL_MODE_ON)・印がもうあるとき (code FBA_BACKFILL_ALREADY_DONE)。
  *    やり直す口は作らない (やり直しの手順は scripts/fba-sheetless-backfill-once.mjs の説明)
+ * 🚨 SKU は LOWER(TRIM()) で突き合わせる。流した後に大小文字だけ違う SKU が fba_sku_attrs に残れば断る (code FBA_BACKFILL_ATTRS_COLLISION。Codex PR R4 Medium)
  * 🚨 空の・違う fba.db に印を付けない (Codex PR R1 Medium 3): sku_mapping が minSkuMappingRows 行より少なければ断る (code FBA_BACKFILL_SOURCE_EMPTY)。
  *    流した後に「sku_mapping にあって fba_sku_attrs に無い SKU」を数え、0 でなければ巻き戻して断る (code FBA_BACKFILL_VERIFY_FAILED)。印はその後にだけ書く
  * initDb() の後に呼ぶ。保存は saveToFile (外から書かれていたら例外 = 保存されていない。やり直せば通る)
@@ -250,11 +297,16 @@ export function runSkuMappingBackfillOnce({ now = new Date(), extra = null, minS
       throw Object.assign(new Error(`sku_mapping が ${skuMappingRows} 行しかない (下限 ${minSkuMappingRows})。空の・違う fba.db に印を付けない`), { code: 'FBA_BACKFILL_SOURCE_EMPTY' });
     }
     const attrsBefore = count('fba_sku_attrs');
-    db.run(SKU_MAPPING_BACKFILL_SQL);
+    db.run(SKU_MAPPING_BACKFILL_NORM_SQL);
     if (_testHooks.afterBackfillInsert) _testHooks.afterBackfillInsert((sql) => db.run(sql));
-    const missingAfter = Number(queryOne('SELECT COUNT(*) AS n FROM sku_mapping m WHERE m.amazon_sku NOT IN (SELECT amazon_sku FROM fba_sku_attrs)')?.n || 0);
+    const missingAfter = Number(queryOne('SELECT COUNT(*) AS n FROM sku_mapping m WHERE LOWER(TRIM(m.amazon_sku)) NOT IN (SELECT LOWER(TRIM(amazon_sku)) FROM fba_sku_attrs)')?.n || 0);
     if (missingAfter !== 0) {
       throw Object.assign(new Error(`流した後も fba_sku_attrs に無い SKU が ${missingAfter} 件ある。印を付けない (巻き戻した)`), { code: 'FBA_BACKFILL_VERIFY_FAILED' });
+    }
+    // 🚨 大小文字だけ違う SKU が fba_sku_attrs に 2 行以上ある = 読み手がどちらを拾うか決まらない → 印を付けない (Codex PR R4 Medium)
+    const collisions = findAttrsCaseCollisions();
+    if (collisions.length) {
+      throw Object.assign(new Error(`fba_sku_attrs に大小文字だけ違う SKU が ${collisions.length} 組ある。印を付けない (巻き戻した): ${collisions.slice(0, 20).map((c) => c.rows).join(' | ')}`), { code: 'FBA_BACKFILL_ATTRS_COLLISION', collisions });
     }
     const attrsAfter = count('fba_sku_attrs');
     const detail = { sku_mapping_rows: skuMappingRows, attrs_before: attrsBefore, inserted: attrsAfter - attrsBefore, attrs_after: attrsAfter, missing_after: missingAfter, ...(extra || {}) };
@@ -289,9 +341,9 @@ export function runSkuMappingBackfillOnceRetrying({ attempts = 3, onRetry = () =
  * 読む → 表をそろえる → 保存。最後の保存で「読んだ後に外から書かれた」と分かったら、最初からやり直す (3 回まで)。
  * やり直さないと、起動と重なった 1 回の書き込みで初期化が失敗したままになり、FBA の画面が再起動まで 503 になる (Codex #1376 R1 #6)
  */
-export async function initDb() {
+export async function initDb({ skipStartupBackfill = false } = {}) {
   for (let attempt = 1; ; attempt++) {
-    try { return await initDbOnce(); }
+    try { return await initDbOnce({ skipStartupBackfill }); }
     catch (e) {
       if (!e || e.code !== 'FBA_DB_EXTERNAL_WRITE' || attempt >= 3) throw e;
       console.warn(`[fba-db] 初期化の途中で fba.db が外から書き換えられた → 読み直してやり直す (${attempt}/3)`);
@@ -299,7 +351,9 @@ export async function initDb() {
   }
 }
 
-async function initDbOnce() {
+// skipStartupBackfill = 一回限りの移行のスクリプトだけが true にする (大小文字まで同じものだけ見る起動時の backfill で、
+//   大小文字違いの 2 行目を入れないため。常駐のサーバは渡さない = 今までどおり)
+async function initDbOnce({ skipStartupBackfill = false } = {}) {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
   const SQL = await initSqlJs();
@@ -356,8 +410,10 @@ async function initDbOnce() {
   // 🚨 Sheet なしのモード (⑦-F・Codex 設計 R1 High 3): モードを使うとき・一回限りの移行の印 (fba_migration_marks) があるときは流さない
   //    (流すと、止めた Sheet の古い値が再起動のたびに戻る)。印は scripts/fba-sheetless-backfill-once.mjs だけが書く。
   //    モードを使わず印も無い間は今までどおり毎回流す
-  if (shouldRunStartupBackfill()) {
+  if (!skipStartupBackfill && shouldRunStartupBackfill()) {
     db.run(SKU_MAPPING_BACKFILL_SQL);
+  } else if (skipStartupBackfill) {
+    console.log('[fba-db] 起動時の sku_mapping → fba_sku_attrs の backfill は流さない (一回限りの移行のスクリプト)');
   } else {
     console.log(`[fba-db] 起動時の sku_mapping → fba_sku_attrs の backfill は流さない (${isSheetlessIoRequested() ? 'Sheet なしのモード / 入出力を止めている' : '一回限りの移行の印あり'})`);
   }
@@ -3224,13 +3280,17 @@ export function updateFnskuBatch(items) {
       if (item.sku && item.fnsku) {
         if (writeSheetCopy) db.run('UPDATE sku_mapping SET fnsku = ? WHERE amazon_sku = ?', [item.fnsku, item.sku]);
         // dual-write: mirror モードの正となる fba_sku_attrs にも追従 (falsy は無視 = 旧FNSKU保持)
+        if (writeSheetCopy) {
         db.run(
           `INSERT INTO fba_sku_attrs (amazon_sku, fnsku, source, updated_at)
            VALUES (?, ?, 'restock', datetime('now','localtime'))
            ON CONFLICT(amazon_sku) DO UPDATE SET fnsku=excluded.fnsku, source='restock', updated_at=excluded.updated_at`,
           [item.sku, item.fnsku]
         );
-        if (!writeSheetCopy) writeAttrsAsin(item);
+        } else {
+          upsertAttrsFnskuNormalized(item.sku, item.fnsku, 'restock');
+          writeAttrsAsin(item);
+        }
       }
     }
     db.run('COMMIT');
@@ -3255,13 +3315,17 @@ export function syncFnskuBatch(items) {
       if (!item.sku) continue;
       if (writeSheetCopy) db.run('UPDATE sku_mapping SET fnsku = ? WHERE amazon_sku = ?', [item.fnsku || null, item.sku]);
       // dual-write: null も反映 (FNSKU が外れた商品をクリア)。sku_mapping に無い mirror-only SKU でも upsert。
+      if (writeSheetCopy) {
       db.run(
         `INSERT INTO fba_sku_attrs (amazon_sku, fnsku, source, updated_at)
          VALUES (?, ?, 'planning', datetime('now','localtime'))
          ON CONFLICT(amazon_sku) DO UPDATE SET fnsku=excluded.fnsku, source='planning', updated_at=excluded.updated_at`,
         [item.sku, item.fnsku || null]
       );
-      if (!writeSheetCopy) writeAttrsAsin(item);
+      } else {
+        upsertAttrsFnskuNormalized(item.sku, item.fnsku || null, 'planning');
+        writeAttrsAsin(item);
+      }
     }
     db.run('COMMIT');
     saveToFile();
@@ -3271,11 +3335,22 @@ export function syncFnskuBatch(items) {
   }
 }
 
-/** Sheet なしのモード: レポートの ASIN を fba_sku_attrs に入れる (空なら前の ASIN のまま = COALESCE)。行は直前の upsert で必ずある */
+/**
+ * Sheet なしのモード (入出力の止め): FNSKU を、大小文字・前後の空白だけ違う既存の行に書く (無ければ新しい行)。
+ * 大小文字違いの 2 行目を作らない (Codex PR R4 Medium)。既存の行の amazon_sku (大小文字) は変えない
+ */
+function upsertAttrsFnskuNormalized(sku, fnsku, source) {
+  db.run(`UPDATE fba_sku_attrs SET fnsku = ?, source = ?, updated_at = datetime('now','localtime') WHERE LOWER(TRIM(amazon_sku)) = LOWER(TRIM(?))`, [fnsku, source, sku]);
+  if (db.getRowsModified() === 0) {
+    db.run(`INSERT INTO fba_sku_attrs (amazon_sku, fnsku, source, updated_at) VALUES (?, ?, ?, datetime('now','localtime'))`, [sku, fnsku, source]);
+  }
+}
+
+/** Sheet なしのモード: レポートの ASIN を fba_sku_attrs に入れる (空なら前の ASIN のまま = COALESCE)。行は直前の upsert で必ずある (鍵は正規化して当てる) */
 function writeAttrsAsin(item) {
   const asin = String(item.asin ?? '').trim();
   if (!asin) return;
-  db.run('UPDATE fba_sku_attrs SET asin = COALESCE(?, asin) WHERE amazon_sku = ?', [asin, item.sku]);
+  db.run('UPDATE fba_sku_attrs SET asin = COALESCE(?, asin) WHERE LOWER(TRIM(amazon_sku)) = LOWER(TRIM(?))', [asin, item.sku]);
 }
 
 // ===== Amazon仮確定 =====

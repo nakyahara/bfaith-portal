@@ -527,7 +527,8 @@ await t('miniPC の口: ?fnsku_source=attrs なら fba_sku_attrs の全行を返
   assert.equal(r.body.fnsku_source, 'fba_sku_attrs');
   assert.equal(r.body.fnsku_ready, true, 'この fba.db には ② で移行の印を書いた');
   const attrs = db.getFbaSkuAttrs();
-  assert.deepEqual(r.body.fnskus, attrs.map((a) => ({ sku: a.amazon_sku, fnsku: a.fnsku || null })));
+  const bySku = (a, b) => (a.sku < b.sku ? -1 : 1);
+  assert.deepEqual([...r.body.fnskus].sort(bySku), attrs.map((a) => ({ sku: a.amazon_sku, fnsku: a.fnsku || null })).sort(bySku), '前提: この fba.db には大小文字違いの行が無い = 全行');
   assert.ok(r.body.fnskus.some((f) => f.sku === 'Delta-4'), 'mirror に無い SKU も attrs にあれば返す');
 });
 
@@ -1042,6 +1043,124 @@ await t('Step4 (モードあり): ふつうの計算の失敗 (スナップシ�
   assert.equal(g.status, 200);
   assert.match((g.body.errors || []).join(), /スナップショットがありません/);
   assert.equal(db.getRecentRecommendationRuns(30).length, runs.length + 1);
+});
+
+// =====================================================================================
+console.log('⑫ 大小文字だけ違う SKU (Codex PR R4 Medium)');
+await t('移行: Sheet の `Alpha-1` と attrs の `alpha-1` は同じ SKU = 2 行目を入れない・印を書く / IO の miniPC は ? 無しでも 1 行だけ・attrs の FNSKU を返す', async () => {
+  modeOff();
+  const { dir, mod } = await otherDb('case');
+  await mod.initDb();
+  mod.upsertSkuMappings([{ amazon_sku: 'Alpha-1', asin: 'B0SHEETA', ne_code: 'alpha' }, { amazon_sku: 'Beta-2', asin: 'B0B', ne_code: 'beta' }]);
+  mod.updateFnskuBatch([{ sku: 'alpha-1', fnsku: 'XNEW' }]);   // attrs = alpha-1 / XNEW (Sheet の Alpha-1 には当たらない)
+  // Sheet の Alpha-1 に古い FNSKU を入れる (起動時の backfill を流さずに読み直す = 大小文字まで同じものだけ見る backfill で 2 行目を作らない)
+  await tick();
+  const f = new Database(path.join(dir, 'fba.db'));
+  try { f.exec("UPDATE sku_mapping SET fnsku = 'XOLD' WHERE amazon_sku = 'Alpha-1'"); } finally { f.close(); }
+  await mod.initDb({ skipStartupBackfill: true });
+  const r = mod.runSkuMappingBackfillOnce();
+  assert.deepEqual([r.missing_after, r.inserted], [0, 1], 'Beta-2 だけ入れる');
+  assert.deepEqual(mod.getFbaSkuAttrs().filter((a) => a.amazon_sku.toLowerCase() === 'alpha-1').map((a) => [a.amazon_sku, a.fnsku]), [['alpha-1', 'XNEW']], '大小文字違いの 2 行目を入れた');
+  assert.deepEqual(mod.findAttrsCaseCollisions(), []);
+  // IO の FNSKU の更新も、大小文字違いの既存の行に書く (2 行目を作らない)
+  process.env.FBA_SHEETLESS_IO = '1';
+  try {
+    mod.updateFnskuBatch([{ sku: 'ALPHA-1', fnsku: 'XNEW2', asin: 'B0ASIN' }]);
+    mod.syncFnskuBatch([{ sku: 'Beta-2 ', fnsku: 'XB' }]);
+  } finally { delete process.env.FBA_SHEETLESS_IO; }
+  assert.deepEqual(mod.getFbaSkuAttrs().filter((a) => ['alpha-1', 'beta-2'].includes(a.amazon_sku.trim().toLowerCase())).map((a) => [a.amazon_sku, a.fnsku]).sort(),
+    [['Beta-2', 'XB'], ['alpha-1', 'XNEW2']], 'IO の更新で大小文字違いの 2 行目を作った');
+  assert.equal(mod.getFbaSkuAttrs().find((a) => a.amazon_sku === 'alpha-1').asin, 'B0ASIN');
+  // miniPC (別のプロセス・IO=1・印あり・? 無し) は alpha-1 を 1 行だけ・attrs の FNSKU で返す
+  const code = [
+    "import { pathToFileURL } from 'node:url';", "import path from 'node:path';", "import http from 'node:http';",
+    "const root = process.env.T_ROOT;", "const imp = (p) => import(pathToFileURL(path.join(root, p)).href);",
+    "const db = await imp('apps/fba-replenishment/db.js'); await db.initDb();",
+    "const express = (await imp('node_modules/express/index.js')).default;",
+    "const svc = (await imp('apps/warehouse/fba-service.js')).default;",
+    "const app = express(); app.use('/fba', express.json(), svc);",
+    "const server = http.createServer(app); await new Promise((r) => server.listen(0, '127.0.0.1', r));",
+    "const res = await fetch(`http://127.0.0.1:${server.address().port}/fba/sync/latest-planning`); const b = await res.json();",
+    "server.close(); console.log('@@' + JSON.stringify({ status: res.status, source: b.fnsku_source, error: b.error || null, alpha: (b.fnskus || []).filter((x) => x.sku.toLowerCase() === 'alpha-1') }));",
+    "process.exit(0);",
+  ].join('\n');
+  const runChild = (envDir) => {
+    const env = { ...process.env, DATA_DIR: envDir, T_ROOT: root, FBA_SHEETLESS_IO: '1', FBA_SKU_MAPPING_SOURCE: 'sheet' };
+    delete env.FBA_SHEETLESS_MODE; delete env.FBA_NONFBA_SOURCE;
+    const c = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: root, env, encoding: 'utf8', windowsHide: true, timeout: 120000, maxBuffer: 16 * 1024 * 1024 });
+    const line = String(c.stdout).split('\n').find((l) => l.startsWith('@@'));
+    assert.ok(line, `子のプロセスが答えない: ${String(c.stderr).slice(-600)}`);
+    return JSON.parse(line.slice(2));
+  };
+  const out = runChild(dir);
+  assert.deepEqual(out, { status: 200, source: 'fba_sku_attrs', error: null, alpha: [{ sku: 'alpha-1', fnsku: 'XNEW2' }] }, '1 行だけ・attrs の FNSKU で返していない');
+  // 同じ FNSKU の大小文字違いの行が (外から) 入っていても、正規化した鍵ごとに 1 行だけ返す
+  await tick();
+  const h = new Database(path.join(dir, 'fba.db'));
+  try { h.exec("INSERT INTO fba_sku_attrs (amazon_sku, fnsku, source) VALUES ('ALPHA-1', 'XNEW2', 'planning')"); } finally { h.close(); }
+  const same = runChild(dir);
+  assert.equal(same.status, 200);
+  assert.equal(same.alpha.length, 1, '大小文字違いの行を 2 行とも返した');
+  assert.equal(same.alpha[0].fnsku, 'XNEW2');
+  // FNSKU が食い違う大小文字違いの行が (外から) 入っていたら、miniPC は渡さない (503)
+  await tick();
+  const g = new Database(path.join(dir, 'fba.db'));
+  try { g.exec("INSERT INTO fba_sku_attrs (amazon_sku, fnsku, source) VALUES ('Alpha-1', 'XOLD', 'sheet_backfill')"); } finally { g.close(); }
+  const bad = runChild(dir);
+  assert.deepEqual([bad.status, bad.error], [503, 'FBA_SKU_ATTRS_CONFLICT']);
+});
+await t('移行: fba_sku_attrs に大小文字だけ違う行が既にある・Sheet の中で大小文字だけ違う → 断る (印を付けない・巻き戻す)。スクリプトも fba.db に触らずに断って一覧を出す', async () => {
+  modeOff();
+  // ① attrs に既にある衝突 (今までの起動時の backfill が作ったもの)
+  const a = await otherDb('collide-attrs');
+  await a.mod.initDb();
+  a.mod.upsertSkuMappings([{ amazon_sku: 'Kilo-1', asin: 'B0K', ne_code: 'kilo' }]);
+  a.mod.updateFnskuBatch([{ sku: 'kilo-1', fnsku: 'XK1' }, { sku: 'Kilo-1', fnsku: 'XK2' }]);   // モードなしの更新は大小文字ごとに行を作る (今までどおり)
+  const before = a.mod.getFbaSkuAttrs().filter((x) => x.amazon_sku.toLowerCase() === 'kilo-1').length;
+  assert.equal(before, 2, '前提: 衝突がある');
+  assert.throws(() => a.mod.runSkuMappingBackfillOnce(), (e) => e.code === 'FBA_BACKFILL_ATTRS_COLLISION' && /kilo-1=XK1|Kilo-1=XK2/.test(e.message));
+  assert.equal(a.mod.getBackfillMark(), null);
+  const file = path.join(a.dir, 'fba.db');
+  const st = fs.statSync(file);
+  await tick();
+  const r = cli(['--min-rows', '1'], null, { dir: a.dir });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /大小文字だけ違う SKU が 1 組/);
+  assert.match(r.out, /Kilo-1 \/ kilo-1|kilo-1 \/ Kilo-1/);
+  const st2 = fs.statSync(file);
+  assert.deepEqual([st2.mtimeMs, st2.size], [st.mtimeMs, st.size], '断ったのに fba.db を書いた');
+  // ② Sheet の中で大小文字だけ違い、attrs に無い
+  const b = await otherDb('collide-sheet');
+  await b.mod.initDb();
+  b.mod.upsertSkuMappings([{ amazon_sku: 'Lima-1', asin: 'B0L1', ne_code: 'lima' }, { amazon_sku: 'lima-1', asin: 'B0L2', ne_code: 'lima' }]);
+  assert.throws(() => b.mod.runSkuMappingBackfillOnce(), (e) => e.code === 'FBA_BACKFILL_ATTRS_COLLISION');
+  assert.equal(b.mod.getBackfillMark(), null);
+  assert.deepEqual(b.mod.getFbaSkuAttrs().filter((x) => x.amazon_sku.toLowerCase() === 'lima-1'), [], '巻き戻していない');
+  const r2 = cli(['--min-rows', '1', '--check'], null, { dir: b.dir });
+  assert.equal(r2.code, 0, r2.out);
+  assert.match(r2.out, /このままでは流せない: 大小文字だけ違う SKU が 1 組/);
+});
+await t('移行のスクリプト: Sheet の `Alpha-1` と attrs の `alpha-1` だけの fba.db は流せる (起動時の backfill を流さない = 2 行目を作らずに印を書く)', async () => {
+  modeOff();
+  const { dir, mod } = await otherDb('cli-case');
+  await mod.initDb();
+  mod.upsertSkuMappings([{ amazon_sku: 'Alpha-1', asin: 'B0SHEETA', ne_code: 'alpha' }, { amazon_sku: 'Beta-2', asin: 'B0B', ne_code: 'beta' }]);
+  mod.updateFnskuBatch([{ sku: 'alpha-1', fnsku: 'XNEW' }]);
+  const r = cli(['--min-rows', '1'], null, { dir });
+  assert.equal(r.code, 0, r.out);
+  const f = new Database(path.join(dir, 'fba.db'), { readonly: true });
+  try {
+    assert.deepEqual(f.prepare(`SELECT amazon_sku, fnsku FROM fba_sku_attrs WHERE LOWER(TRIM(amazon_sku)) = 'alpha-1'`).all(), [{ amazon_sku: 'alpha-1', fnsku: 'XNEW' }], '移行で大小文字違いの 2 行目を作った');
+    assert.equal(f.prepare('SELECT COUNT(*) AS n FROM fba_migration_marks').get().n, 1);
+  } finally { f.close(); }
+});
+await t('モードなしの FNSKU の更新は今までどおり (大小文字ごとに行を作る = master と同じ)', async () => {
+  modeOff();
+  const { mod } = await otherDb('case-off');
+  await mod.initDb();
+  mod.updateFnskuBatch([{ sku: 'Mike-1', fnsku: 'XM1' }]);
+  mod.syncFnskuBatch([{ sku: 'MIKE-1', fnsku: 'XM2' }]);
+  assert.deepEqual(mod.getFbaSkuAttrs().map((x) => [x.amazon_sku, x.fnsku]).sort(), [['MIKE-1', 'XM2'], ['Mike-1', 'XM1']]);
 });
 
 server.close();
