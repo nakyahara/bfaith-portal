@@ -5679,6 +5679,29 @@ let wfSetParentId = null;
       !mainSkipErr && stM('desc_review').state === 'todo' && stM('desc_review').assignee_id === regStaffId,
       mainSkipErr?.message || JSON.stringify(stM('desc_review')));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSkipMain);
+
+    // 🚨 移動先が**完了**かつ**他人の担当**のときは、開き直しだけ諦めて移動は成功させる
+    //    (Codex 名指し R3 P1: 前は移動先を触らなかったので通っていた操作を 403 にしない)。
+    //    カードは従来どおりその先の列に出る
+    const idDoneOther = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, official_url, created_by)
+      VALUES ('DRV-DONEOTHER', '完了の他人担当へ前方移動', 'https://example.com/doneother', 'smoke')
+    `).run().lastInsertRowid);
+    wfpEarly.ensureProgress(db, idDoneOther);
+    const stD = (code) => db.prepare('SELECT state, assignee_id FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idDoneOther, code) || {};
+    // 通過する工程は動かす人 (REG) の担当にしておく (通過工程で弾かれると別の理由で 403 になる)。
+    // 「タイトル確認」だけ他人 (大川さん) の担当で完了にしておく = 開き直せない移動先
+    db.prepare('UPDATE draft_step_progress SET assignee_id = ? WHERE draft_id = ?').run(regStaffId, idDoneOther);
+    wfpEarly.setStepState(idDoneOther, 'title_approve', { state: 'done' }, 'admin', ADMIN2);
+    wfpEarly.setStepState(idDoneOther, 'title_approve', { assignee_id: wfOkawaId }, 'admin', ADMIN2);
+    let doneOtherErr = null;
+    try {
+      wfpEarly.moveBoardCard(idDoneOther, { view: 'main', to: 'title_approve', expectedCurrent: 'basic_info' }, 'reg', REG);
+    } catch (e) { doneOtherErr = e; }
+    check('🚨 D&D: 完了で他人担当の移動先は開き直しだけ諦めて移動は成功する (403 で全部巻き戻さない)',
+      !doneOtherErr && stD('basic_info').state === 'done' && stD('title_approve').state === 'done',
+      doneOtherErr?.message || JSON.stringify([stD('basic_info'), stD('title_approve')]));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDoneOther);
     wf.setStaffActive(regStaffId, false);
   }
 
