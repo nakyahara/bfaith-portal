@@ -427,7 +427,14 @@ await t('納品ピッキング PDF: 元の picking 実行の PDF が残ってい
     const html = await (await fetch(`${BASE}/admin`, { headers: { 'x-test-session': 'admin' } })).text();
     assert.ok(html.includes('href="/print/picking/501/pdf"') && html.includes('📄 ピッキングPDF'), '管理画面の納品回一覧にボタン');
     assert.ok(!html.includes('/print/picking/502/pdf'), 'PDF の無い回 (502) には出さない');
-  } finally { fs.rmSync(pdf, { force: true }); }
+    // 取消した回は iPad にも出さない (開いたままの画面が 10 秒ごとに取り直すと消える — Codex #1575 R1 #1)
+    const c = db.createRunFromPicking({ pickingRun: { id: 503, delivery_date: '2026-10-02' }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: pkRows }], createdBy: 't' });
+    fs.writeFileSync(path.join(pdfDir, '503.pdf'), '%PDF-1.4 test');
+    assert.equal((await call('GET', `/api/state?run=${c.runId}`)).j.pickingPdfUrl, '/print/picking/503/pdf');
+    db.getDB().prepare("UPDATE fbx_runs SET status = 'cancelled' WHERE id = ?").run(c.runId);
+    assert.equal((await call('GET', `/api/state?run=${c.runId}`)).j.pickingPdfUrl, null);
+    assert.ok(!(await (await fetch(`${BASE}/admin`, { headers: { 'x-test-session': 'admin' } })).text()).includes('/print/picking/503/pdf'), '管理画面にも出さない');
+  } finally { fs.rmSync(pdf, { force: true }); fs.rmSync(path.join(pdfDir, '503.pdf'), { force: true }); }
 });
 await t('作業を終える: 利用者は 403 / 職員PIN + 未投入あり → 409 incomplete (一覧) / acknowledge で done', async () => {
   const st = await call('GET', `/api/state?run=${pkRunId}`);

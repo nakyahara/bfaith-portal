@@ -81,9 +81,11 @@ export function _setPickingSource(fn) { pickingSource = fn; }
 /**
  * 納品回の元になった picking 実行の「納品プランNo 付き」ピッキング PDF (ロジザード TMP1 に注番したもの) の URL。
  * 公開の /print/picking/:id/pdf をそのまま使う (Notion カードに貼っているのと同じ・見られて困らない — 中原さん 2026-10-01)。
- * PDF は picking-prep 側で直近 40 件だけ残すので、消えた回・PDF の無い回は null (ボタンを出さない)
+ * PDF は picking-prep 側で直近 40 件だけ残すので、消えた回・PDF の無い回は null (ボタンを出さない)。
+ * 取消した回も null — 開いたままの iPad に取消済みの作業指示への入口を残さない (Codex #1575 R1 #1)
  */
 function pickingPdfUrlOf(run) {
+  if (!run || run.status === 'cancelled') return null;
   const src = Number(run?.source_run_id);
   if (!Number.isInteger(src) || src <= 0) return null;
   try { return pickingPdfPath(src) ? `/print/picking/${src}/pdf` : null; } catch { return null; }
