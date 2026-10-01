@@ -579,6 +579,17 @@ export function pendingImagePlanSlots(db, setDraftId) {
  * (親の画像をコピーしてあるので、出品ゲートの TOP 画像も満たせる)。
  * 1 枠でもあれば skip を todo に戻して「依頼」から始める。
  * 🚨 **done は触らない** — 人が進めた工程を巻き戻さない。動かすのは todo ⇄ skip だけ。
+ *
+ * 🚨 **⑧楽天登録 (image_stage='rakuten') は動かさない** (2026-10-01)。
+ * この関数が表しているのは「画像を**作る**仕事が要るか」で、⑧は作った画像を楽天に載せる
+ * 後工程 = **実際に楽天へ出したか**を表す工程 (出品すると自動で完了する)。
+ * 親の画像をそのまま使うセットも楽天には出すので、ここを「対象外」にすると
+ *   ・まだ楽天に出していないのにカードが完了列に入る
+ *   ・人が ⑧楽天登録 の列へ戻しても、画像の計画を保存し直すと黙って対象外に戻る
+ * という食い違いになる (2026-10-01 スタッフ報告「2個セットで楽天未登録なのに
+ * 楽天登録に移動しようとすると A+コンテンツまで飛ばされる」の根っこ)。
+ * ⑨A+登録 も厳密には同じ性格だが、全部そのまま使うセットに毎回 A+ の作業を出すかは
+ * 運用の判断なので、要望が出るまで従来どおり計画に従わせる。
  * @returns {{needsProduction: boolean, changed: number}}
  */
 export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
@@ -591,6 +602,8 @@ export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
     SELECT p.step_code, p.state FROM draft_step_progress p
     JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
     WHERE p.draft_id = ? AND s.track = 'image' AND s.image_kind = 'detail'
+      ${/* 工程コードでなく image_stage で外す (管理画面で改名されても壊れない) */''}
+      AND COALESCE(s.image_stage, '') <> 'rakuten'
   `).all(id);
   const from = needs ? 'skip' : 'todo';
   const to = needs ? 'todo' : 'skip';
@@ -605,7 +618,7 @@ export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
     logEvent(db, id, 'set_image_plan_track',
       needs
         ? '画像の計画に「直して使う/作り直す」が入ったので、画像の制作工程を戻しました'
-        : '画像はすべて親のものを使う計画なので、画像の制作工程を「対象外」にしました',
+        : '画像はすべて親のものを使う計画なので、画像の制作工程を「対象外」にしました (⑧楽天登録は残します)',
       actor);
   }
   return { needsProduction: needs, changed };

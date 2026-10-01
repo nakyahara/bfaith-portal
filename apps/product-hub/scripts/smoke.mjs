@@ -4117,14 +4117,24 @@ let wfSetParentId = null;
     sd.applyReuseImages(db, setId).copied === 0
     && db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(setId).c === 3);
 
-  // ④ 全部そのまま使うなら制作は要らない = 画像の工程は「対象外」で決着
+  // ④ 全部そのまま使うなら制作は要らない = 画像の工程は「対象外」で決着。
+  //    🚨 ただし ⑧楽天登録 は残す (2026-10-01): 画像を作る仕事は無くても楽天には出すので、
+  //       ここを対象外にすると「楽天未登録なのにカードが完了列」になり、人が楽天登録の列へ
+  //       戻しても計画を保存し直すと黙って対象外に戻る
   const detailSteps = () => db.prepare(`
     SELECT p.step_code, p.state FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
     WHERE p.draft_id = ? AND s.track = 'image' AND s.image_kind = 'detail' ORDER BY s.sort
   `).all(setId);
+  const prodSteps = () => detailSteps().filter((x) => x.step_code !== 'imgd_rakuten');
+  const rkStep = () => detailSteps().find((x) => x.step_code === 'imgd_rakuten')?.state;
   check('全部そのまま使う → 画像の制作工程は「対象外」で決着する',
-    detailSteps().length > 0 && detailSteps().every((x) => x.state === 'skip'),
+    prodSteps().length > 0 && prodSteps().every((x) => x.state === 'skip'),
     JSON.stringify(detailSteps().map((x) => x.state)));
+  check('🚨 全部そのまま使っても ⑧楽天登録 は対象外にしない (楽天には出すので)',
+    rkStep() === 'todo', rkStep());
+  check('🚨 全部そのまま使うセットのカードは完了列ではなく ⑧楽天登録 の列に出る',
+    wfp.progressOf(setId, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+    wfp.progressOf(setId, { db }).imageDetail.current?.step_code || '(完了列)');
 
   // ⑤ 1枠でも「直して使う」にすると制作が動き出し、指示が依頼に載る
   const put = (items) => sd.replaceSetImagePlans(db, setId, items, 'smoke');
@@ -4179,8 +4189,9 @@ let wfSetParentId = null;
 
   // ⑦ 戻せば制作工程もまた「対象外」になる (todo のものだけ。人が進めた done は触らない)
   put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
-  check('全部そのまま使うに戻せば、制作工程はまた「対象外」になる',
-    detailSteps().every((x) => x.state === 'skip'), JSON.stringify(detailSteps().map((x) => x.state)));
+  check('全部そのまま使うに戻せば、制作工程はまた「対象外」になる (⑧楽天登録は残る)',
+    prodSteps().every((x) => x.state === 'skip') && rkStep() === 'todo',
+    JSON.stringify(detailSteps().map((x) => x.state)));
   const firstStep = detailSteps()[0].step_code;
   db.prepare(`UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = ?`).run(setId, firstStep);
   put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
@@ -5737,7 +5748,12 @@ let wfSetParentId = null;
       dbmod.upsertImageProduction(db, idV2, { material_status: 'not_required' });
       check('撮影指示書: 撮影不要の商品は 対象外 (仕入れ商品が軒並み まだ にならない)',
         ciOf()?.notRequired === true && ciOf()?.registered === false, JSON.stringify(ciOf()));
-      dbmod.upsertImageProduction(db, idV2, { material_status: 'ready' });
+      // 🚨 撮影不要 + 古い撮影指示URL あり (Notion は撮影・素材と URL を別々に埋めるので作れる)。
+      //    画面は撮影不要を先に見るので「対象外」になる = ここでは両方の印が立つことだけ固定する
+      dbmod.upsertImageProduction(db, idV2, { camera_instruction_url: 'https://docs.google.com/spreadsheets/d/old/edit' });
+      check('撮影指示書: 撮影不要 + 古い URL でも 撮影不要 の印が立つ (画面は対象外を先に出す)',
+        ciOf()?.notRequired === true && ciOf()?.registered === true, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { material_status: 'ready', camera_instruction_url: null });
     }
     // 楽天登録済みの既存商品には詳細 v2 も自動 done で入る
     const idV2Rk = Number(db.prepare(`
@@ -9793,6 +9809,22 @@ renders.push(
     board: wfp.boardData(db, { view: 'image', imageKind: 'top' }),
   }],
   ['board.ejs (自分のボール・担当者未紐付け)', 'board.ejs', { ...boardBase, assigneeParam: 'me' }],
+  // 撮影指示書 (2026-10-01): 撮影不要 + 古い撮影指示URL あり。実データでは作りにくいので
+  // カードの値を直接差し替えて、画面が「対象外」を先に出すことを固定する
+  ['board.ejs (撮影指示書: 撮影不要 + 古いURL)', 'board.ejs', {
+    ...boardBase,
+    board: {
+      ...boardBase.board,
+      columns: boardBase.board.columns.map((c, i) => (i === 0 ? {
+        ...c,
+        cards: c.cards.slice(0, 1).map((card) => ({
+          ...card,
+          image: { ...card.image, cameraInstruction: { registered: true, notRequired: true } },
+        })),
+      } : { ...c, cards: [] })),
+      doneCards: [],
+    },
+  }],
   // 完了列のカードにも画像の状況を出す (2026-09-01)。実データでは完了が 0 件のこともあるので、
   // 進行中のカードを 1 枚借りて必ず描かせる
   ['board.ejs (完了列にカード)', 'board.ejs', {
@@ -10288,6 +10320,14 @@ for (const [name, file, data] of renders) {
   check('ボード: カードの 撮影指示書 行に 済/まだ/対象外 のバッジが付く',
     rowsOk(rows.filter((r) => r.includes('>撮影指示書<'))),
     rows.filter((r) => r.includes('>撮影指示書<')).slice(0, 2).join(' | ') || '(撮影指示書の行が無い)');
+  // 🚨 撮影不要 + 古い撮影指示URL は「対象外」が勝つ (URL を先に見ると「済」に出てしまう)
+  {
+    const bhCi = renderedHtml.get('board.ejs (撮影指示書: 撮影不要 + 古いURL)') || '';
+    const ciRows = krowsOf(bhCi).filter((r) => r.includes('>撮影指示書<'));
+    check('ボード 撮影指示書: 撮影不要 + 古いURL のときは「対象外」(URL より撮影不要を先に見る)',
+      ciRows.length > 0 && ciRows.every((r) => badgeOf(r)?.text === '対象外'),
+      ciRows.slice(0, 2).join(' | ') || '(撮影指示書の行が無い)');
+  }
   // まとめて移動 (2026-09-13 スタッフ要望)。カードごとに選択のチェックがあり、リンクの外に置く (押しても詳細へ飛ばない)
   check('ボード: カードにまとめて移動の選択チェックがあり、リンクの外にある',
     /<label class="kb-pick"[^>]*><input type="checkbox" class="kb-pick-box"[^>]*><\/label>\s*<a class="kb-card-link"/.test(bh));

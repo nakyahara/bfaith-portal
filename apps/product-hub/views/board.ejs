@@ -321,9 +321,11 @@
       // ので、撮影・素材ステータス (商品が届いたか) とは別の行で 済/まだ を出す。
       // 済 = 画像制作の「カメラ撮影指示URL」が入っている / 撮影不要の商品は作らないので対象外
       const ci = (c.image && c.image.cameraInstruction) || null;
+      // 🚨 撮影不要を**先に**見る: Notion 取り込みは撮影・素材と撮影指示URL を別々に埋めるので、
+      // 「撮影依頼不要 + 古い撮影指示URL あり」が作れてしまう。URL を先に見ると「済」に出る
       const camera = !ci ? { state: 'off', text: '—' }
-        : ci.registered ? { state: 'done', text: '済' }
-          : ci.notRequired ? { state: 'off', text: '対象外' } : { state: 'todo', text: 'まだ' };
+        : ci.notRequired ? { state: 'off', text: '対象外' }
+          : ci.registered ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' };
       return [
         {
           name: 'トップ画像',
