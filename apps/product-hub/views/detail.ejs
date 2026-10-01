@@ -5873,7 +5873,10 @@ th.attr-unknown { color: #dc2626; }
     function schedule() { stop(); timer = setTimeout(poll, 5000); }
 
     async function poll() {
-      timer = null;
+      // 🚨 `timer = null` ではなく stop()。null にするだけだと、
+      //    待っている setTimeout を消さずに手放すことになり、
+      //    それが後から発火して**ポーリングが 2 本に増える** (codex exec review P2)
+      stop();
       // タブが裏に回っている間は叩かない (5 秒おきが積み上がらないように)
       if (document.hidden) { schedule(); return; }
       try {
@@ -5919,9 +5922,11 @@ th.attr-unknown { color: #dc2626; }
       catch (e) { textEl.select(); copyResultEl.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }
     });
 
-    // 裏に回って戻ってきたら、待たずに 1 回見る
+    // 裏に回って戻ってきたら、待たずに 1 回見る。
+    // 🚨 待機中の setTimeout を**先に消す**。消さないと表裏を行き来するたびに
+    //    ポーリングが増えていく (codex exec review P2)
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && timer) poll();
+      if (!document.hidden && timer) { stop(); poll(); }
     });
 
     render(state);
