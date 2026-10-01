@@ -257,6 +257,16 @@ try {
     assert.equal(d2.content_hash, d1.content_hash);
     assert.deepEqual(K.validateSkuMap(await A.readCompanyAmazonMapCanon(dbO)), []);
   });
+  await ta('[9] 影運転の先の確かめ (実 PostgreSQL・Codex #1586 R1 M2): 同じ DB を別の名前 (127.0.0.1)・別のユーザーで指しても断る / 同じサーバーの別の DB は通す', async () => {
+    const CLI = await import('./company-db/amazon-map-migrate.mjs');
+    const code = async (p) => { try { await p; return 'ok'; } catch (e) { return `${e.code}: ${e.message}`; } };
+    const prod = u.toString();
+    const alias = new URL(roleUrl('master_edit')); alias.hostname = '127.0.0.1';
+    assert.match(await code(CLI.assertShadowTarget({ targetUrl: alias.toString(), productionUrl: prod })), /^AMAZON_MAP_MIGRATE_PRODUCTION/);
+    const other = new URL(url); other.hostname = '127.0.0.1';   // 同じサーバーの別の DB (postgres)
+    assert.equal(await code(CLI.assertShadowTarget({ targetUrl: other.toString(), productionUrl: prod })), 'ok');
+    assert.match(await code(CLI.assertShadowTarget({ targetUrl: other.toString(), productionUrl: undefined })), /^AMAZON_MAP_MIGRATE_ARGS/);
+  });
 } finally {
   for (const c of clients.reverse()) { try { await c.end(); } catch { /* */ } }
   try { await admin.query(`drop database ${dbName} with (force)`); } catch (e) { console.error(`DB を消せなかった: ${e.message}`); }

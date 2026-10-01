@@ -831,9 +831,15 @@ export async function runInitialLoad(db, plan, opts = {}) {
     //   ③ 持ち主が load (今): 今までどおり (SKU マスタ・Sheet・FBM の完全一致)
     // 出品そのもの・ASIN・FNSKU・タイトル・別名は、どの場合も今までどおり
     const amazonCompsOwned = loadOwns('listing_components.amazon');
-    const mappedListings = (await db.query("select to_regclass('core.amazon_sku_maps') is not null as ok")).rows[0].ok
-      ? new Set((await db.query('select listing_id from core.amazon_sku_maps')).rows.map((r) => Number(r.listing_id)))
-      : new Set();
+    //   消えた対応 (0053 の ops.amazon_map_lost_listings = 変更の記録にあるのに行が無い = trigger を止めて消された) も「対応がある」と同じに扱う
+    //   (墓標が消されても自動の構成を作り直さない。Codex #1586 R1 High の手当て)。報告の conflicts に出す
+    const mappedListings = new Set();
+    if ((await db.query("select to_regclass('core.amazon_sku_maps') is not null as ok")).rows[0].ok) {
+      for (const r of (await db.query('select listing_id from core.amazon_sku_maps')).rows) mappedListings.add(Number(r.listing_id));
+      const lost = (await db.query('select listing_id::text as listing_id, seller_sku from ops.amazon_map_lost_listings() order by listing_id')).rows;
+      for (const r of lost) mappedListings.add(Number(r.listing_id));
+      if (lost.length) report.conflicts.push({ kind: 'amazon_map_lost', count: lost.length, samples: lost.slice(0, 20).map((r) => [r.listing_id, r.seller_sku]) });
+    }
     let amzMapped = 0; let amzOwnedSkip = 0; let amzFbmKept = 0;
     const compsOf = (l) => {
       if (l.mall !== 'amazon') return l.components || [];

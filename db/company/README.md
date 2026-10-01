@@ -275,19 +275,25 @@ Amazon の seller SKU ↔ NE コード (今の正本 = miniPC の `m_sku_master`
 - 表 `core.amazon_sku_maps` (1 行 = 1 つの出品の対応・`state` = active / deleted (墓標)・`origin` = legacy (切替の日の移行) / portal (画面))。構成の正本は `core.listing_components` のまま (`updated_at` を足した = 写しの構成の更新時刻)
 - 書くのは security definer の関数だけ: `ops.save_amazon_sku_map` (登録・直す・墓標から戻す) / `ops.delete_amazon_sku_map` (墓標にする)。画面 = `/apps/master-edit/amazon/` (lib/amazon-map-write.mjs)。門は ⑤ と同じ (段階 new_open・持ち主表のハッシュ・`MASTER_EDIT_OPEN=1`) + 持ち主 `listing_components.amazon` = company
 - 🚨 墓標は消さない: `core.amazon_sku_maps` の DELETE / TRUNCATE は trigger がいつも拒む (持ち主も)。復元 (`apps/company-db/backup/dump.mjs`) はユーザーの trigger を止めて入れ直すので通る
+- 🚨 **残る危うさ (Codex #1586 R1 High・⑥ の go / no-go「夜間ロードのロールを分ける」)**: 夜間ロード・push・migration・復元・ロールの設定は全部同じログイン (`COMPANY_DB_URL` = DB・schema・表の持ち主・CREATEROLE) で動く。
+  持ち主は trigger を止められ・schema の持ち主として表を DROP でき・CREATEROLE で作ったロールの一員に自分でなれる (PostgreSQL 18 で試した) = **この表の持ち主だけを別のロールにしても守りにならない**ので、この PR ではしていない。
+  持ち主のパスワードが漏れた・持ち主の権限で動くコードの誤り (trigger を止めて消す) なら、墓標は消せてしまう。本当の直し = 夜間ロードと push を、持ち主でなく CREATEROLE の無い別のログインにする (今の全部の書き手に効く = ⑥ で決める)。
+  それまでの手当て: **消えた対応** `ops.amazon_map_lost_listings()` (変更の記録 = 追記だけ に対応の行の記録があるのに今の行が無い出品) を、夜間ロードは「対応がある」と同じに扱う (自動の構成を作り直さない・報告の conflicts に `amazon_map_lost`)・切替の段階を company_owner / new_open に進める前提にする (`0053_amazon_map`)。両方の表の trigger を止めて消すまでは、墓標が消えても自動の対応は戻らない
+- 表の CHECK は写しの受け手 (`lib/sku-map-canonical.js`) と同じ空白の決まり: seller SKU の前後の TAB・NBSP・全角の空白・ASCII の大文字・制御文字、名前が空白だけ (TAB・NBSP・全角の空白だけも) は、どの書き手でも断る (Codex #1586 R1 M1)
 - 不変条件 (commit のとき・deferred の constraint trigger): Amazon (日本) の出品・`listing_norm = core.norm_code(seller_sku)`・active は構成 1 行以上で並び 0..N-1・墓標は構成 0 行。対応の無い出品は見ない
 - 構成の書き手: 段階 company_owner / new_open の間、対応のある出品の構成と対応の行は、取引の設定 `core.source_system` が `portal_amazon_map` (画面の関数) か `amazon_map_migration` (切替の日の移行) のときだけ書ける
 - 夜間ロード (`apps/company-db/load/engine.mjs`): 対応 (墓標も) のある出品の構成は持ち主によらず作らない。持ち主 company = SKU マスタ・Sheet の構成は材料にしない・FBM の完全一致は対応の無い出品にだけ
 
 **移行 (影運転・切替の日)** = `scripts/company-db/amazon-map-migrate.mjs` (lib/amazon-map-migrate.mjs)。古い表 (warehouse.db・fba.db) は読むだけで開く
 ```
-# 影運転 (T-7 から毎日)。🚨 試し用の DB だけ (本番の COMPANY_DB_URL と同じ URL は断る)。1 つの取引で移して照らし、必ず巻き戻す
+# 影運転 (T-7 から毎日)。🚨 試し用の DB だけ。本番の URL (COMPANY_DB_URL) が要る = ホスト・ポート・DB 名が同じ (ユーザーは見ない)・つないだ DB の識別が同じか読めない (同じ DB 名) なら断る。1 つの取引で移して照らし、必ず巻き戻す
 node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --shadow --db-url <試し用の DB> --legacy <warehouse.db> --fba-db <fba.db> --json shadow.json
 # 古い表のハッシュ (H0) だけ
 node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --legacy-hash --legacy <warehouse.db>
 # 切替の日 ③ (段階 frozen の間だけ・止める項目 0・H0 と同じときだけ commit。⑥ の手順書の順番でだけ)
-node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect-hash <H0> --legacy <warehouse.db> --actor <人のメール> --yes
+node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect-hash <H0> --legacy <warehouse.db> --fba-db <fba.db> --actor <人のメール> --yes
 ```
+- `--fba-db` は影運転と apply の両方で要る (無い・読めない・`sku_mapping` の表が無い = すぐ断る。Sheet にだけある SKU を 0 件と読まない・Codex #1586 R1 M3)。識別 (system_identifier) が読めない所では、試し用の DB は本番と違う DB 名にする
 - 止める項目 (目標は全部 0・16 §5 の 4): key (受け手の鍵の決まり)・name_blank・timestamp・qty・no_components・sort_gap・orphan_component・not_in_company (NE に無いコード)・component_collision / seller_sku_collision (正規化で重なる)・ne_code_differs (Company DB の SKU のコードから作る NE コードが違う)・sheet_only
 - 同じ構成の行は時刻 (created_at / updated_at) だけそろえる = 変更の記録・出品の version を増やさない (0049 の印を増やさない)。FBM の完全一致など古い表に無い行は消す
 - ⑦-2 (写し・世代・FBA の Sheet 無し・台帳) と ⑥ (段階の戻す道) はこの PR に無い

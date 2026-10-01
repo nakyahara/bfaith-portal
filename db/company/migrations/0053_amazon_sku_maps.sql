@@ -12,6 +12,15 @@
 --   2. 墓標は消さない (契約 v3 High 4): BEFORE DELETE / TRUNCATE の trigger がいつも拒む。画面のロールに DELETE は渡さない
 --      (表の持ち主は復元 (apps/company-db/backup/dump.mjs = ユーザーの trigger を止めて消して入れ直す) のために DELETE の権限を持ったまま = 普通の DELETE は trigger が拒む)。
 --      削除 = active → deleted (理由・人・時刻・構成を全部消す を 1 つの取引で)。同じ SKU の再登録は deleted → active (登録日は新しくなる)
+--      🚨 残る危うさ (Codex #1586 R1 High = ⑥ の go / no-go「夜間ロードのロールを分ける」): 夜間ロード・push・migration・復元・ロールの設定は全部
+--         同じログイン (COMPANY_DB_URL = DB・schema・表の持ち主・CREATEROLE) で動く。持ち主は trigger を止められ (ALTER TABLE … DISABLE TRIGGER)・
+--         schema の持ち主として表を DROP でき・CREATEROLE で作ったロールの一員に自分でなれる = この表の持ち主だけ別のロールにしても守りにならない
+--         (試した: PostgreSQL 18 で、持ち主を NOLOGIN のロールにしても、作った人が自分に SET を付け直して戻れる・schema の持ち主は DROP できる)。
+--         本当の直し = 夜間ロードと push を、持ち主でなく CREATEROLE の無い別のログインにする (今の全部の書き手に効く = ⑥)。
+--         それまでの手当て (下の 9.): 消えた対応 = 変更の記録 (追記だけ) に対応の行の記録があるのに今の行が無い出品 (ops.amazon_map_lost_listings) を
+--           ・夜間ロードは「対応がある」と同じに扱う (墓標を消されても、自動の構成を作り直さない) + 報告に出す
+--           ・切替の段階を company_owner / new_open に進める前提にする (1 件でもあれば進めない)
+--         両方の表の trigger を止めて消す (2 つの間違い) までは、墓標が消えても自動の対応は戻らない
 --   3. 不変条件 (契約 v3 H5・High 4) = commit のときに見る (deferred の constraint trigger)。core.amazon_sku_maps・core.listing_components・
 --      core.listings (mall・shop_code・listing_code) の全部の INSERT / UPDATE / DELETE から、その出品を確かめる:
 --        対応の出品が Amazon (日本) = mall 'amazon'・shop_code 'main@A1VC38T7YXB528' / listing_norm = core.norm_code(seller_sku) /
@@ -37,6 +46,7 @@
 --        ops.master_write_allowed: 前の行は全部そのまま + 2 つの操作の行
 --   8. 「未登録」の一覧の材料 ops.amazon_map_unmapped_recent (直近の Amazon の注文で、出品に構成が無い・出品が無い seller SKU。M11) と
 --      売上の公開のそろい ops.amazon_map_sales_coverage (そろっていない日は画面が「未判定」と出す)
+--   9. 消えた対応 ops.amazon_map_lost_listings (変更の記録にあるのに行が無い = trigger を止めて消された)。夜間ロードは対応があると同じに扱う・切替の前提 (0053_amazon_map)
 -- 🚨 この migration は今のデータを何も変えない (新しい表は空・足した列は null・制約は新しい行と新しい操作にだけ効く)。
 --    切替の前の片付け (16 §5 の 4) は移行の影運転 (scripts/company-db/amazon-map-migrate.mjs) が数える
 -- 🚨 security definer の関数 = 一時の表を使わない・search_path = pg_catalog, pg_temp (名前は全部 schema つき)・public の実行権を外す (0034 の約束)
@@ -79,8 +89,10 @@ create table core.amazon_sku_maps (
   version         bigint not null default nextval('core.master_version_seq') check (version > 0),
   created_at      timestamptz not null default now(),
   updated_at      timestamptz not null default now(),
-  constraint ck_asm_seller_sku check (length(seller_sku) between 1 and 255 and seller_sku = btrim(seller_sku) and seller_sku !~ '[A-Z]' and seller_sku !~ '[\u0001-\u001f\u007f]'),
-  constraint ck_asm_name check (btrim(name) <> ''),
+  -- 鍵と名前は写しの受け手 (lib/sku-map-canonical.js の skuMapKeyProblem・SKU_MAP_EDGE_SPACE_CHARS) と同じ決まり = 前後の TAB・NBSP・全角の空白も断る (Codex #1586 R1 M1)。
+  --   どの書き手 (画面の関数・切替の日の移行・持ち主の手の SQL) にも効く。新しい表 = 今の行は無い
+  constraint ck_asm_seller_sku check (core.amazon_map_key_problem(seller_sku) is null),
+  constraint ck_asm_name check (not core.amazon_map_name_blank(name)),
   constraint ck_asm_deleted check ((state = 'deleted') = (deleted_at is not null) and (state = 'deleted') = (deleted_by is not null) and (state = 'deleted') = (deleted_reason is not null)),
   constraint ck_asm_reason check (deleted_reason is null or length(btrim(deleted_reason)) between 1 and 200),
   foreign key (company_id, listing_id) references core.listings (company_id, listing_id)
@@ -615,8 +627,8 @@ create function ops.amazon_map_ts(p text) returns timestamptz language sql stabl
   select case when p ~ '^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d{1,6})?([+-]\d{2}(:?\d{2})?|Z)?$' then p::timestamptz end
 $$;
 
--- 8. 「未登録」の一覧の材料 (M11): 直近 p_days 日 (東京の日付・p_today を含む) の Amazon (日本) の注文の明細で、SKU に当たらず、
---    出品が無い (コードだけ) か出品に構成が無いもの。seller SKU ごとの数・注文の数・最後の日・対応の状態 (墓標 = deleted)。
+-- 8. 「未登録」の一覧の材料 (M11): 直近 p_days 日 (東京の日付・p_today を含む) の Amazon (日本) の注文の明細 (取り消した注文・全部取り消した明細は除く) で、SKU に当たらず、
+--    出品が無い (コードだけ) か出品に構成が無いもの。数 = 取り消しを引いた数。seller SKU ごとの数・注文の数・最後の日・対応の状態 (墓標 = deleted)。
 --    FBA / FBM は Render の mirror_amazon_sku_fees (SQLite) で画面が分ける。security definer = 画面のロールに注文の表を読ませない
 create function ops.amazon_map_unmapped_recent(p_today date, p_days integer default 7)
   returns table (code text, listing_id bigint, map_state text, units bigint, orders bigint, last_date date)
@@ -628,6 +640,7 @@ create function ops.amazon_map_unmapped_recent(p_today date, p_days integer defa
     left join core.listings l on l.listing_id = ol.listing_id
     left join core.amazon_sku_maps m on m.listing_id = l.listing_id
    where o.company_id = 1 and o.mall = 'amazon' and o.order_date_jst between p_today - (greatest(1, least(p_days, 60)) - 1) and p_today
+     and not o.is_cancelled and ol.qty > ol.cancelled_qty   -- 取り消した注文・全部取り消した明細は「売れた」に数えない (Codex #1586 R1 Low)
      and ol.sku_id is null
      and (ol.listing_id is null or not exists (select 1 from core.listing_components c where c.listing_id = ol.listing_id))
      and coalesce(l.mall, 'amazon') = 'amazon'
@@ -643,6 +656,38 @@ create function ops.amazon_map_sales_coverage(p_today date, p_days integer defau
    where not exists (select 1 from mart.sales_daily_published p where p.company_id = 1 and p.mall = 'amazon' and p.date_jst = g.d::date)
 $$;
 revoke all on function ops.amazon_map_sales_coverage(date, integer) from public;
+
+-- 9. 消えた対応 (Codex #1586 R1 High の手当て・上の 2. の 🚨): 変更の記録 (events.master_change_events・追記だけ) に対応の行 (amazon_sku_map) の記録が
+--    あるのに、今の core.amazon_sku_maps に行が無い出品 = trigger を止めて消された (墓標も)。普通の道では起きない (DELETE は trigger が拒む・復元は記録も一緒に戻す)。
+--    夜間ロード (engine.mjs) はこの出品も「対応がある」と同じに扱う (自動の構成を作り直さない)。最後の記録の seller SKU と時刻を返す
+create function ops.amazon_map_lost_listings() returns table (listing_id bigint, seller_sku text, last_recorded_at timestamptz)
+  language sql stable security definer set search_path = pg_catalog, pg_temp as $$
+  select e.entity_id, (array_agg(coalesce(e.new_value ->> 'seller_sku', e.old_value ->> 'seller_sku') order by e.event_id desc)
+                         filter (where coalesce(e.new_value ->> 'seller_sku', e.old_value ->> 'seller_sku') is not null))[1],
+         max(e.recorded_at)
+    from events.master_change_events e
+   where e.entity_type = 'amazon_sku_map' and e.entity_id is not null
+     and not exists (select 1 from core.amazon_sku_maps m where m.listing_id = e.entity_id)
+   group by e.entity_id
+$$;
+revoke all on function ops.amazon_map_lost_listings() from public;
+
+-- 切替の前提 (0051 の差し込み口に 1 行足す): company_owner / new_open に進むのは、消えた対応が 0 件のときだけ
+create function ops.amazon_map_prereq(p_from text, p_to text) returns text[]
+  language plpgsql stable set search_path = pg_catalog, pg_temp as $$
+declare
+  v_n integer;
+begin
+  if p_to in ('company_owner', 'new_open') then
+    select count(*)::int into v_n from ops.amazon_map_lost_listings();
+    if v_n > 0 then
+      return array[format('amazon_map_lost: 変更の記録にあるのに行が無い Amazon SKU の対応が %s 件ある (trigger を止めて消された。ops.amazon_map_lost_listings() を見て戻す)', v_n)];
+    end if;
+  end if;
+  return '{}'::text[];
+end $$;
+revoke all on function ops.amazon_map_prereq(text, text) from public;
+insert into ops.master_cutover_prereq_checks (name, fn) values ('0053_amazon_map', 'ops.amazon_map_prereq(text, text)');
 
 -- 見張りは読むだけ。画面のロールの権限は scripts/company-db/create-master-edit-roles.mjs (migration の後に流し直す)
 do $$ begin

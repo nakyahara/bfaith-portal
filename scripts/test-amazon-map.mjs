@@ -42,6 +42,7 @@ const C = await import('../lib/master-cutover.mjs');
 const A = await import('../lib/amazon-map-write.mjs');
 const M = await import('../lib/amazon-map-migrate.mjs');
 const K = await import('../lib/sku-map-canonical.js');
+const CLI = await import('./company-db/amazon-map-migrate.mjs');
 const { MasterWriteError } = await import('../lib/master-write.mjs');
 const { default: router, __setPgClientFactory, __setClock, __setOwnership, __setAmazonChannelsProvider } = await import('../apps/master-edit/router.mjs');
 
@@ -208,6 +209,8 @@ async function del(sellerSku, reason, { ownership = ALL_COMPANY, open = true, re
 /** 画面のロールで関数を直接呼ぶ (アプリを通さない) */
 const callFn = (fn, args) => asRole(E, 'master_edit', () => db.query(`select ops.${fn}($1::uuid, $2, $3, $4::jsonb, $5, $6::jsonb) as r`, args));
 const skuIdOf = async (code) => Number((await q('select sku_id from core.skus where code = $1', [code]))[0].sku_id);
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'amazon-map-'));
 
 console.log('\n門 (切替の前)');
 await ta('[2] 切替の前 (legacy_open): 名簿の人でも 409 切替前・何も書かない (失敗の記録だけ)。画面のロールが関数を直接呼んでも DB が断る', async () => {
@@ -552,6 +555,20 @@ await ta('[7] 不変条件 (commit のとき): 構成 0 行の active・並び�
   }), null);
 });
 
+await ta('[7] 表の CHECK (Codex #1586 R1 M1): 持ち主の手の SQL でも、seller SKU の前後の NBSP・全角の空白・TAB、名前が TAB・NBSP・全角の空白だけ = 23514', async () => {
+  const lid = await lidOf('a003');
+  const NB = String.fromCharCode(0xa0); const TAB = String.fromCharCode(9);
+  const cases = [['a003' + NB, '名前', 'ck_asm_seller_sku'], [FW_SPACE + 'a003', '名前', 'ck_asm_seller_sku'], ['a003', TAB + TAB, 'ck_asm_name'], ['a003', NB, 'ck_asm_name'], ['a003', FW_SPACE + ' ', 'ck_asm_name'], ['A003', '名前', 'ck_asm_seller_sku']];
+  for (const [sku, name, con] of cases) {
+    await pg.query('begin');
+    try {
+      await pg.query(`select set_config('core.source_system', 'amazon_map_migration', true)`);
+      const e = await errOf(pg.query(`insert into core.amazon_sku_maps (listing_id, seller_sku, name, state, origin, registered_at, changed_at) values ($1, $2, $3, 'active', 'legacy', now(), now())`, [lid, sku, name]));
+      assert.equal(e?.code, '23514', `${JSON.stringify([sku, name])}: ${e?.code} ${e?.message}`); assert.equal(e.constraint, con);
+    } finally { await pg.query('rollback'); }
+  }
+});
+
 console.log('\n写しの並べ方');
 await ta('[10] Company DB から作る写しの行: 受け手の決まりに合う・session の時間帯 (UTC / 東京) によらず同じハッシュ・墓標は入らない', async () => {
   const canon = await A.readCompanyAmazonMapCanon(db);
@@ -585,8 +602,79 @@ await ta('[6] 復元 (バックアップ): 墓標も含めて戻る (復元は�
   await dst.close();
 });
 
+await ta('[6] 消えた対応 (Codex #1586 R1 High の手当て): 持ち主が trigger を止めて墓標を消しても、夜間ロードは自動の構成を作り直さない・報告に出る・切替の前提が止める', async () => {
+  const E5 = await setupDb();
+  await createRoles(E5.pg, { watcherPw: 'a', writerPw: 'b' });
+  await createMasterEditRoles(E5.pg, {});
+  await load(E5.db);
+  await openCutover(E5, ALL_COMPANY);
+  const v0 = (await A.readAmazonMap(E5.db, 'a004')).versions;
+  await asRole(E5, 'master_edit', () => A.saveAmazonMap(E5.db, { actor: 'naka@test', requestId: uuid(), sellerSku: 'a004', name: '単品 4', components: [{ code: 'a004', qty: 1 }], seen: { versions: v0 } }, { ownership: ALL_COMPANY, open: true }));
+  const v1 = (await A.readAmazonMap(E5.db, 'a004')).versions;
+  await asRole(E5, 'master_edit', () => A.deleteAmazonMap(E5.db, { actor: 'naka@test', requestId: uuid(), sellerSku: 'a004', reason: '墓標', seen: { versions: v1 } }, { ownership: ALL_COMPANY, open: true }));
+  const lid = Number((await E5.db.query("select listing_id from core.amazon_sku_maps where seller_sku = 'a004'")).rows[0].listing_id);
+  assert.deepEqual((await E5.db.query('select * from ops.amazon_map_lost_listings()')).rows, []);
+  // 持ち主の誤り: trigger を止めて墓標を消す (復元のやり方と同じ = 持ち主ならできる = 残る危うさ)
+  await E5.pg.query('begin');
+  await E5.pg.query('alter table core.amazon_sku_maps disable trigger user');
+  await E5.pg.query('delete from core.amazon_sku_maps where listing_id = $1', [lid]);
+  await E5.pg.query('alter table core.amazon_sku_maps enable trigger user');
+  await E5.pg.query('commit');
+  const lost = (await E5.db.query('select listing_id::text as l, seller_sku from ops.amazon_map_lost_listings()')).rows;
+  assert.deepEqual(lost, [{ l: String(lid), seller_sku: 'a004' }]);
+  const r = await load(E5.db, ALL_COMPANY, makePlan(), 'load_lost_1');
+  const comps = (await E5.db.query('select count(*)::int as n from core.listing_components where listing_id = $1', [lid])).rows[0].n;
+  assert.equal(comps, 0, '消えた墓標の出品に FBM の完全一致を作り直した');
+  assert.deepEqual(r.conflicts.filter((c) => c.kind === 'amazon_map_lost').map((c) => [c.count, c.samples]), [[1, [[String(lid), 'a004']]]]);
+  const rl = await load(E5.db, MASTER_OWNERSHIP, makePlan(), 'load_lost_2');   // 持ち主 load でも
+  assert.equal((await E5.db.query('select count(*)::int as n from core.listing_components where listing_id = $1', [lid])).rows[0].n, 0);
+  assert.ok(rl.conflicts.some((c) => c.kind === 'amazon_map_lost'));
+  // 切替の前提: company_owner / new_open に進めない (差し込み口の表に載っている)
+  assert.deepEqual((await E5.db.query("select ops.amazon_map_prereq('company_owner', 'new_open') as p")).rows[0].p.map((x) => x.slice(0, 16)), ['amazon_map_lost:']);
+  assert.deepEqual((await E5.db.query("select ops.amazon_map_prereq('legacy_open', 'frozen') as p")).rows[0].p, []);
+  assert.ok((await E5.db.query("select ops.master_cutover_prereq_problems('company_owner', 'new_open') as p")).rows[0].p.some((x) => x.startsWith('0053_amazon_map: amazon_map_lost')));
+  await E5.pg.close();
+});
+
+await ta('[11] 影運転の先の確かめ (Codex #1586 R1 M2): 本番の URL が無い・同じホスト / ポート / DB 名 (別のユーザーでも)・つないだ DB の識別が同じ・本番に届かない = 断る', async () => {
+  const PROD = 'postgres://owner:pw@db.example.internal:5432/company';
+  assert.equal(CLI.sameDatabaseUrl('postgres://other:x@DB.example.internal/company', PROD), true);   // ユーザー・パスワード・既定のポートは見ない
+  assert.equal(CLI.sameDatabaseUrl('postgres://owner:pw@db.example.internal:5432/company_test', PROD), false);
+  assert.equal(CLI.sameDatabaseUrl('not a url', PROD), true);   // 読めない = 断る側
+  const code = async (p) => { try { await p; return 'ok'; } catch (e) { return e.code; } };
+  const fakeOpen = (ids) => async (url) => ({ query: async (sql) => {
+    const id = ids[url]; if (!id) throw new Error('ECONNREFUSED');
+    if (/pg_control_system/.test(sql)) { if (id.sys == null) throw new Error('permission denied'); return { rows: [{ s: id.sys }] }; }
+    return { rows: [{ db: id.db, addr: id.addr, port: id.port }] };
+  }, end: async () => {} });
+  const T = 'postgres://t:pw@test-host:5432/company';
+  assert.equal(await code(CLI.assertShadowTarget({ targetUrl: T, productionUrl: undefined, openClient: fakeOpen({}) })), 'AMAZON_MAP_MIGRATE_ARGS');
+  assert.equal(await code(CLI.assertShadowTarget({ targetUrl: 'postgres://someone:x@db.example.internal/company', productionUrl: PROD, openClient: fakeOpen({}) })), 'AMAZON_MAP_MIGRATE_PRODUCTION');
+  // 別の名前 (DNS の別名) でも同じ DB = 識別で断る
+  assert.equal(await code(CLI.assertShadowTarget({ targetUrl: T, productionUrl: PROD, openClient: fakeOpen({ [T]: { db: 'company', sys: '7001', addr: '10.0.0.5', port: 5432 }, [PROD]: { db: 'company', sys: '7001', addr: '10.0.0.5', port: 5432 } }) })), 'AMAZON_MAP_MIGRATE_PRODUCTION');
+  assert.equal(await code(CLI.assertShadowTarget({ targetUrl: T, productionUrl: PROD, openClient: fakeOpen({ [T]: { db: 'company', sys: null, addr: '10.0.0.5', port: 5432 }, [PROD]: { db: 'company', sys: null, addr: '10.0.0.5', port: 5432 } }) })), 'AMAZON_MAP_MIGRATE_PRODUCTION');
+  assert.equal(await code(CLI.assertShadowTarget({ targetUrl: T, productionUrl: PROD, openClient: fakeOpen({ [T]: { db: 'company', sys: null, addr: '10.0.0.9', port: 5432 }, [PROD]: { db: 'company', sys: '7001', addr: '10.0.0.5', port: 5432 } }) })), 'AMAZON_MAP_MIGRATE_PRODUCTION');   // 識別が片方読めない + 同じ DB 名 = 断る側
+  // 本番に届かない = 確かめられない = 断る
+  assert.equal(await code(CLI.assertShadowTarget({ targetUrl: T, productionUrl: PROD, openClient: fakeOpen({ [T]: { db: 'company', sys: '9', addr: '10.0.0.9', port: 5432 } }) })), 'AMAZON_MAP_MIGRATE_ARGS');
+  // 別のクラスター (system_identifier が違う)・同じクラスターの別の DB = 通す
+  assert.equal(await code(CLI.assertShadowTarget({ targetUrl: T, productionUrl: PROD, openClient: fakeOpen({ [T]: { db: 'company', sys: '9', addr: '10.0.0.9', port: 5432 }, [PROD]: { db: 'company', sys: '7001', addr: '10.0.0.5', port: 5432 } }) })), 'ok');
+  assert.equal(await code(CLI.assertShadowTarget({ targetUrl: T, productionUrl: PROD, openClient: fakeOpen({ [T]: { db: 'company_shadow', sys: '7001', addr: '10.0.0.5', port: 5432 }, [PROD]: { db: 'company', sys: '7001', addr: '10.0.0.5', port: 5432 } }) })), 'ok');
+});
+
+await ta('[11] fba.db (Codex #1586 R1 M3): 影運転も apply も Sheet にだけある SKU の一覧が要る・--fba-db が無い・ファイルが無い・sku_mapping の表が無い = すぐ断る', async () => {
+  const legacy = { masterRows: [{ seller_sku: 'pr_a001', 商品名: 'x', created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z' }], componentRows: [] };
+  await assert.rejects(() => M.runAmazonMapMigration(db, legacy, { mode: 'shadow' }), (e) => e.code === 'AMAZON_MAP_MIGRATE_INVALID');
+  await assert.rejects(() => M.runAmazonMapMigration(db, legacy, { mode: 'apply', expectHash: M.legacyDigest(legacy).content_hash }), (e) => e.code === 'AMAZON_MAP_MIGRATE_INVALID');
+  assert.throws(() => CLI.sheetOnlyFrom(null, legacy), (e) => e.code === 'AMAZON_MAP_MIGRATE_ARGS');
+  assert.throws(() => CLI.sheetOnlyFrom(path.join(tmp, 'nothing.db'), legacy), (e) => e.code === 'AMAZON_MAP_MIGRATE_ARGS');
+  const empty = path.join(tmp, 'fba-empty.db'); new Database(empty).close();
+  assert.throws(() => CLI.sheetOnlyFrom(empty, legacy), (e) => e.code === 'AMAZON_MAP_MIGRATE_ARGS' && /sku_mapping/.test(e.message));
+  const fba = path.join(tmp, 'fba.db');
+  { const f = new Database(fba); f.exec('create table sku_mapping (amazon_sku text)'); f.prepare('insert into sku_mapping values (?), (?)').run('PR_A001', 'sheet_x'); f.close(); }
+  assert.deepEqual(CLI.sheetOnlyFrom(fba, legacy), ['sheet_x']);   // 正規化で SKU マスタにある = 数えない
+});
+
 console.log('\n移行 (影運転・apply)');
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'amazon-map-'));
 /** miniPC の warehouse.db の SKU マスタ (db.js と同じ形) */
 function makeLegacy(file, masters, comps) {
   const s = new Database(file);
@@ -629,7 +717,7 @@ await ta('[11] 影運転: 止める項目を数える (無い NE コード・並
   assert.equal(Number((await E2.db.query('select count(*)::int as n from core.amazon_sku_maps')).rows[0].n), 0);
   assert.equal(crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'), bytes0);
   // apply は frozen の間だけ・止める項目があれば断る
-  await assert.rejects(() => M.runAmazonMapMigration(E2.db, legacy, { mode: 'apply', expectHash: 'a'.repeat(64) }), /H0/);
+  await assert.rejects(() => M.runAmazonMapMigration(E2.db, legacy, { mode: 'apply', expectHash: 'a'.repeat(64), sheetOnly: [] }), /H0/);
 });
 
 await ta('[11] apply (切替の日 ③): frozen だけ・H0 と同じ・同じ行は時刻だけ (記録・出品の version を増やさない)・FBM の自動の行は消える・作り直したハッシュ = H0・移行の後の夜間ロード 2 回で構成が変わらない', async () => {
@@ -643,17 +731,17 @@ await ta('[11] apply (切替の日 ③): frozen だけ・H0 と同じ・同じ�
   const h0 = M.legacyDigest(legacy).content_hash;
   assert.match(h0, /^[0-9a-f]{64}$/);
   // legacy_open = 断る
-  await assert.rejects(() => M.runAmazonMapMigration(E3.db, legacy, { mode: 'apply', expectHash: h0 }), (e) => e.code === 'AMAZON_MAP_MIGRATE_PHASE');
+  await assert.rejects(() => M.runAmazonMapMigration(E3.db, legacy, { mode: 'apply', expectHash: h0, sheetOnly: [] }), (e) => e.code === 'AMAZON_MAP_MIGRATE_PHASE');
   await openCutover(E3, ALL_COMPANY, 'frozen');
   // 止める項目があれば断る (何も書かない)
   const fileBad = path.join(tmp, 'legacy-bad.db');
   makeLegacy(fileBad, [...CLEAN_MASTERS, ['empty1', '構成なし', T1, T1]], CLEAN_COMPS);
   const legacyBad = M.readLegacyAmazonMaps(fileBad);
-  await assert.rejects(() => M.runAmazonMapMigration(E3.db, legacyBad, { mode: 'apply', expectHash: M.legacyDigest(legacyBad).content_hash }), (e) => e.code === 'AMAZON_MAP_MIGRATE_BLOCKED');
+  await assert.rejects(() => M.runAmazonMapMigration(E3.db, legacyBad, { mode: 'apply', expectHash: M.legacyDigest(legacyBad).content_hash, sheetOnly: [] }), (e) => e.code === 'AMAZON_MAP_MIGRATE_BLOCKED');
   // 本物
   const lidPr = (await E3.db.query("select listing_id::text as id, version::text as v from core.listings where listing_code = 'pr_a001'")).rows[0];
   const evBefore = Number((await E3.db.query('select coalesce(max(event_id), 0)::int as n from events.master_change_events')).rows[0].n);
-  const r = await M.runAmazonMapMigration(E3.db, legacy, { mode: 'apply', expectHash: h0, actor: 'naka@test' });
+  const r = await M.runAmazonMapMigration(E3.db, legacy, { mode: 'apply', expectHash: h0, actor: 'naka@test', sheetOnly: [] });
   assert.equal(r.committed, true); assert.equal(r.subset.match, true); assert.equal(r.subset.company.content_hash, h0);
   // 同じ = pr_a001 の a001・pr_pack2 の a001 (時刻だけ) / 直した = pr_pack2 の a002 (並び 2 → 1)・a003 (FBM の完全一致の行の数量 1 → 2) / 足した = pr_new1 の 2 行
   assert.deepEqual(r.counts, { listings_created: 1, maps: 4, same: 2, time_only: 2, updated: 2, inserted: 2, deleted: 0 });
@@ -668,7 +756,7 @@ await ta('[11] apply (切替の日 ③): frozen だけ・H0 と同じ・同じ�
   assert.equal(K.skuMapDigest(canon).content_hash, h0);
   assert.deepEqual(canon.master.find((m) => m.seller_sku === 'pr_a001'), { seller_sku: 'pr_a001', name: 'SKU マスタの 1', created_at: T1, updated_at: T2 });
   // 2 回目の apply は断る (1 回だけ)
-  await assert.rejects(() => M.runAmazonMapMigration(E3.db, legacy, { mode: 'apply', expectHash: h0 }), (e) => e.code === 'AMAZON_MAP_MIGRATE_EXISTS');
+  await assert.rejects(() => M.runAmazonMapMigration(E3.db, legacy, { mode: 'apply', expectHash: h0, sheetOnly: [] }), (e) => e.code === 'AMAZON_MAP_MIGRATE_EXISTS');
   // 移行の後の夜間ロード (持ち主 load のまま・frozen) 2 回 = 構成が変わらない
   for (const run of ['after_1', 'after_2']) {
     await load(E3.db, MASTER_OWNERSHIP, makePlan(), run);
@@ -786,19 +874,22 @@ await ta('[12] 未登録 (M11): 直近 7 日の Amazon の注文で構成が無�
   // 注文 (出品の無いコード zz_sold (FBA)・zz_fbm (FBM)・構成のある pr_a001・墓標の pr_pack2 (構成なし))
   const lidPr = await lidOf('pr_a001'); const lidPack = await lidOf('pr_pack2');
   let n = 0;
-  const order = async (date, lines) => {
+  const order = async (date, lines, { cancelled = false } = {}) => {
     n++;
-    const o = (await pg.query(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, received_batch_seq, source_updated_at, transform_version, content_hash)
-      values (1, 'amazon', 'amazon', $1, 'mall_api', $2::date, $2::date, 'shipped', 1, now(), 't', 'h') returning order_id`, [`o${n}`, date])).rows[0].order_id;
+    const o = (await pg.query(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, is_cancelled, received_batch_seq, source_updated_at, transform_version, content_hash)
+      values (1, 'amazon', 'amazon', $1, 'mall_api', $2::date, $2::date, $3, $4, 1, now(), 't', 'h') returning order_id`, [`o${n}`, date, cancelled ? 'cancelled' : 'shipped', cancelled])).rows[0].order_id;
     let i = 0;
-    for (const [lid, code, qty] of lines) {
+    for (const [lid, code, qty, cq = 0] of lines) {
       i++;
-      await pg.query(`insert into core.order_lines (company_id, order_id, line_key, listing_id, unresolved_code, qty, received_batch_seq) values (1, $1, $2, $3, $4, $5, 1)`, [o, `l${i}`, lid, code, qty]);
+      await pg.query(`insert into core.order_lines (company_id, order_id, line_key, listing_id, unresolved_code, qty, cancelled_qty, received_batch_seq) values (1, $1, $2, $3, $4, $5, $6, 1)`, [o, `l${i}`, lid, code, qty, cq]);
     }
   };
   await order('2030-01-09', [[null, 'zz_sold', 2], [lidPr, null, 1]]);
   await order('2030-01-10', [[null, 'zz_sold', 1], [null, 'zz_fbm', 4], [lidPack, null, 1]]);
   await order('2029-12-01', [[null, 'zz_old', 1]]);   // 7 日より前
+  // 取り消し (Codex #1586 R1 Low): 全部取り消した明細・取り消した注文は数えない / 一部の取り消しは引いた数
+  await order('2030-01-10', [[null, 'zz_cancel', 2, 2], [null, 'zz_sold', 3, 1]]);
+  await order('2030-01-10', [[null, 'zz_hdr', 1]], { cancelled: true });
   let r = await call('GET', '/amazon/unmapped');
   assert.equal(r.status, 200); checkScripts(r.text, 0);
   assert.ok(r.text.includes('未判定'));   // 売上の日次が公開されていない
@@ -808,7 +899,8 @@ await ta('[12] 未登録 (M11): 直近 7 日の Amazon の注文で構成が無�
   r = await call('GET', '/amazon/unmapped?channel=all');
   assert.ok(r.text.includes('zz_sold') && r.text.includes('zz_fbm') && r.text.includes('削除済み (墓標)'));
   const rows = (await q(`select code, units::int as units, orders::int as orders, map_state from ops.amazon_map_unmapped_recent('2030-01-10', 7) order by code`));
-  assert.deepEqual(rows.map((x) => [x.code, x.units, x.orders, x.map_state]), [['pr_pack2', 1, 1, 'deleted'], ['zz_fbm', 4, 1, null], ['zz_sold', 3, 2, null]]);
+  assert.deepEqual(rows.map((x) => [x.code, x.units, x.orders, x.map_state]), [['pr_pack2', 1, 1, 'deleted'], ['zz_fbm', 4, 1, null], ['zz_sold', 5, 3, null]]);
+  assert.ok(!r.text.includes('zz_cancel') && !r.text.includes('zz_hdr'));
   // 公開がそろえば未判定でない
   await pg.query(`insert into mart.sales_daily_runs (run_id, company_id, mall, scope_key, session_id, started_at, finished_at, n_dates, n_rows, n_orders) values ('r1', 1, 'amazon', 'amazon', 's1', now(), now(), 7, 0, 0)`);
   await pg.query(`insert into mart.sales_daily_published (company_id, mall, scope_key, date_jst, run_id) select 1, 'amazon', 'amazon', d::date, 'r1' from generate_series('2030-01-04'::date, '2030-01-10'::date, interval '1 day') d`);
