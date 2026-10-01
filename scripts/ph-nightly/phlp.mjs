@@ -25,6 +25,7 @@
  *   ./phlp fail    ID --code CODE --message "text"  予約の**前**だけ (生成できない材料)
  *   ./phlp release ID --reason "text"               予約の**前**だけ (一時障害)
  *   ./phlp clean   ID                               その依頼の一時ファイルを消す (rm は使えない)
+ *   (./phlpreview が内部で checkreview / reviewdata を呼ぶ。人や Claude が直接使うものではない)
  *
  * 🚨 予約の **後** に失敗したら `fail` ではなく `result --rejected` を出す (設計 §4.3b)。
  *    job だけ進んで generation が reserved のまま残る経路を作らない。
@@ -40,6 +41,8 @@ const MAX_IMAGES = 6;
 const REASON_MAX = 1000;
 const OUT_MAX = 200_000;
 const LINT_MAX = 100_000;
+const REVIEW_MAX = 400_000;                 // 検品に渡す構成案の上限 (バイト)
+const SEEN_MAX = 20_000;                    // 画像から読み取ったことの上限 (バイト)
 const IMAGE_MAX_BYTES = 8 * 1024 * 1024;
 const FAIL_CODES = ['SPEC_UNREADABLE', 'MATERIAL_TOO_THIN', 'IMAGES_UNAVAILABLE', 'OTHER'];
 
@@ -123,9 +126,25 @@ async function api(method, p, body, { retries = RETRIES, headers = {} } = {}) {
   return last;
 }
 
-/** lease はこの CLI の中だけで持ち回る (Claude には見せない。work/ の lease-<ID>.json に置く) */
-const leaseFile = (id) => path.resolve(process.cwd(), `lease-${id}.json`);
-function saveLease(id, data) { fs.writeFileSync(leaseFile(id), JSON.stringify(data), 'utf8'); }
+/**
+ * lease と packet_hash はこの CLI の中だけで持ち回る。
+ *
+ * 🚨 **作業ディレクトリには置かない** (codex exec review P2)。
+ *    work/ は settings.json で Claude に Read / Write / Edit を許している場所なので、
+ *    そこに置くと「Claude には見せない」が嘘になる (読めるし書き換えられる)。
+ *    bin/ の隣の state/ に置き、settings.json でも Read/Write/Edit を deny する。
+ *    なお **ACL では守れない** — 夜間タスクの claude も phlp もどちらも bfaith として走るので、
+ *    CLI が書けて Claude が読めない、という分け方はファイル権限では作れない。
+ *    効いているのは「作業ディレクトリの外」+「deny ルール」の 2 つ。
+ */
+const STATE_DIR = process.env.PH_LP_STATE_DIR
+  ? path.resolve(process.env.PH_LP_STATE_DIR)
+  : path.resolve(import.meta.dirname, '..', 'state');
+const leaseFile = (id) => path.join(STATE_DIR, `lease-${id}.json`);
+function saveLease(id, data) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.writeFileSync(leaseFile(id), JSON.stringify(data), 'utf8');
+}
 function loadLease(id) {
   try { return JSON.parse(fs.readFileSync(leaseFile(id), 'utf8')); }
   catch { die(`この依頼の lease がありません (先に ./phlp claim してください): ${id}`); }
@@ -149,6 +168,15 @@ async function cmdClaim(opt) {
   // lease と packet_hash は CLI が持つ。Claude には出さない
   saveLease(job.job_id, {
     lease_token: job.lease_token, packet_hash: job.packet_hash, run,
+    // 🚨 検品に渡す材料もここに覚える (codex exec review P1)。
+    //    「材料と食い違っていないか」「材料に無い事実を作っていないか」は、
+    //    材料を一緒に渡さないと Codex には確かめられない。
+    //    work/ 側に置くと Claude が書き換えられるので、材料も state/ で持つ
+    material: {
+      name: job.packet.name, ne_code: job.packet.ne_code,
+      product_info: job.packet.product_info, color_variations: job.packet.color_variations,
+      images: (job.packet.images || []).length,
+    },
     // 証跡に file_id が要る。packet の並びをそのまま覚えておき、
     // images で n 番目 ↔ file_id を紐づける (Claude に手で写させない)
     image_file_ids: (job.packet.images || []).map((im) => im.file_id),
@@ -290,25 +318,75 @@ async function cmdRelease(id, opt) {
 }
 
 /**
- * 検品に渡すファイルが実体かを見る (./phlpreview が先に呼ぶ)。
+ * 作業ディレクトリ直下の決まった名前のファイルを、実体であることを確かめて読む。
  * bash の -f は symlink をたどるので、lstat で見るのはこちらの仕事 (phq.mjs と同じ)。
  */
-function cmdCheckReview(id) {
-  const n = `_lp_review_${id}.md`;
+function readFixed(n, max) {
   const p2 = path.resolve(process.cwd(), n);
   if (path.dirname(p2) !== path.resolve(process.cwd())) die('作業ディレクトリ直下のファイルだけです');
   let st;
   try { st = fs.lstatSync(p2); } catch { die(`ファイルがありません: ${n}`); }
   if (!st.isFile()) die(`通常のファイルではありません: ${n}`);
-  if (st.size > LINT_MAX * 4) die(`検品に渡すファイルが大きすぎます: ${n}`);
-  out({ ok: true, file: n, bytes: st.size });
+  if (st.size > max) die(`ファイルが大きすぎます: ${n} (${max} バイトまで)`);
+  return fs.readFileSync(p2, 'utf8');
+}
+
+/** 検品に渡すファイルが実体かを見る (./phlpreview が先に呼ぶ) */
+function cmdCheckReview(id) {
+  const n = `_lp_review_${id}.md`;
+  const body = readFixed(n, REVIEW_MAX);
+  out({ ok: true, file: n, bytes: Buffer.byteLength(body) });
+}
+
+/**
+ * 検品に渡すデータを**この CLI が**組み立てる (codex exec review P1)。
+ *
+ * 以前は `_lp_review_<ID>.md` (= 構成案だけ) を渡していた。ところが検品の観点には
+ * 「材料にある事実と食い違っていないか」「材料に無い効果・数値・認証を作っていないか」があり、
+ * **材料が入っていないので Codex には確かめようがなかった** — 裏取りできない構成案が
+ * 「critical/high なし」で通ってしまう。材料を一緒に渡す。
+ *
+ * ① 商品の情報 … claim でサーバが渡したもの (state/ にあるので Claude は書き換えられない)
+ * ② 画像から読み取ったこと … 実行役が `seen-<ID>.md` に書く。
+ *    Codex は画像を見られないので、「実行役が何を見たと言っているか」を文字で渡すしかない。
+ *    無ければ組み立てない (見ずに書いた構成案を検品に通さないため)
+ * ③ 構成案 … `_lp_review_<ID>.md`
+ */
+function cmdReviewData(id) {
+  const lease = loadLease(id);
+  const m = lease.material || {};
+  const seen = readFixed(`seen-${id}.md`, SEEN_MAX);
+  if (!seen.trim()) die(`seen-${id}.md が空です (商品画像から読み取ったことを書いてください)`);
+  const review = readFixed(`_lp_review_${id}.md`, REVIEW_MAX);
+  let imgs = [];
+  try { imgs = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), `imgs-${id}.json`), 'utf8')); } catch { imgs = []; }
+  if (!Array.isArray(imgs)) imgs = [];
+  const nz = (v) => (typeof v === 'string' && v.trim() ? v.trim() : '(なし)');
+  out([
+    '===== 材料① 商品の情報 (サーバが claim で渡したもの) =====',
+    `商品名: ${nz(m.name)}`,
+    `NEコード: ${nz(m.ne_code)}`,
+    `商品画像: ${Number(m.images) || 0} 枚 (実行役が取得できたのは ${imgs.length} 枚)`,
+    '',
+    '[商品情報]',
+    nz(m.product_info),
+    '',
+    '[カラーバリエーション]',
+    nz(m.color_variations),
+    '',
+    `===== 材料② 実行役が商品画像から読み取ったこと (seen-${id}.md) =====`,
+    seen.trim(),
+    '',
+    `===== 検品対象 LP 構成案 (_lp_review_${id}.md) =====`,
+    review,
+  ].join('\n'));
 }
 
 /** その依頼の一時ファイルを消す (`rm` は allowlist に無い。9/1 に rm -f a b c が拒否されてゴミが残った) */
 function cmdClean(id) {
   const removed = [];
   const names = [
-    `spec-${id}.md`, `imgs-${id}.json`, `lease-${id}.json`,
+    `spec-${id}.md`, `imgs-${id}.json`, `seen-${id}.md`,
     `out-${id}.md`, `lint-${id}.json`, `reason-${id}.txt`, `_lp_review_${id}.md`,
     ...Array.from({ length: MAX_IMAGES }, (_, i) => `img-${id}-${i + 1}.jpg`),
   ];
@@ -319,6 +397,10 @@ function cmdClean(id) {
       if (st.isFile()) { fs.unlinkSync(p); removed.push(n); }
     } catch { /* 無ければ何もしない */ }
   }
+  // lease は作業ディレクトリの外 (state/) にある
+  try {
+    if (fs.lstatSync(leaseFile(id)).isFile()) { fs.unlinkSync(leaseFile(id)); removed.push(`lease-${id}.json`); }
+  } catch { /* 無ければ何もしない */ }
   out({ removed });
 }
 
@@ -334,6 +416,7 @@ switch (cmd) {
   case 'fail': await cmdFail(jobId(pos[1]), opt); break;
   case 'release': await cmdRelease(jobId(pos[1]), opt); break;
   case 'checkreview': cmdCheckReview(jobId(pos[1])); break;
+  case 'reviewdata': cmdReviewData(jobId(pos[1])); break;
   case 'clean': cmdClean(jobId(pos[1])); break;
   default:
     die('使い方: ./phlp queue | claim --run RUN_ID | images ID | reserve ID | result ID --accepted --file out-ID.md | fail ID --code CODE | release ID | clean ID');

@@ -26,6 +26,10 @@ $Src   = Join-Path $Repo 'scripts\ph-nightly'
 $Root  = 'C:\tools\ph-nightly'
 $Bin   = Join-Path $Root 'bin'
 $Work  = Join-Path $Root 'work'
+# lease / packet_hash / review material. Deliberately OUTSIDE work\ because work\ grants
+# Claude Read+Write+Edit, so state kept there is readable and forgeable by the session
+# (codex exec review P2). ACLs cannot separate them - claude and phlp both run as $Me.
+$State = Join-Path $Root 'state'
 $Cfg   = Join-Path $Work '.claude'
 $SkillsSrc = Join-Path $Repo '.claude\skills\ph-generate'
 $LpSkillsSrc = Join-Path $Repo '.claude\skills\ph-lp-compose'
@@ -97,7 +101,7 @@ $updateError = $null
 $reprotectErrors = @()
 try {
   try {
-    New-Item -ItemType Directory -Force -Path $Bin, $Work, $Cfg, (Join-Path $Root 'logs') | Out-Null
+    New-Item -ItemType Directory -Force -Path $Bin, $Work, $Cfg, $State, (Join-Path $Root 'logs') | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $env:USERPROFILE '.claude\secrets') | Out-Null
 
     # 1) lift denies
@@ -220,6 +224,7 @@ Write-Output "installed:"
 Write-Output ("  bin      : " + $Bin + " (phq.mjs, copy_lint.py, run-ph-generate.ps1, ping.ps1) [write denied for " + $Me + "]")
 Write-Output ("  work     : " + $Work + " (./phq ./phreview [write denied], generated files writable)")
 Write-Output ("  config   : " + $Cfg + " (settings.json + skills copy) [write denied]")
+Write-Output ("  state    : " + $State + " (lease / packet_hash / review material; outside work, denied in settings.json)")
 Write-Output ("  task     : " + $taskName + " daily 02:30 as " + $Me + " (Interactive, Limited) -> bin\run-ph-generate.ps1, state=" + $t.State)
 Write-Output ("  task(LP) : " + $lpTaskName + " every 1 min as " + $Me + " (Interactive, Limited) -> bin\run-lp-compose.ps1, state=" + $lpT.State)
 Write-Output ("  source   : " + $Repo)

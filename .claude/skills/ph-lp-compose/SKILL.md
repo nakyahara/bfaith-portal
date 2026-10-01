@@ -25,6 +25,7 @@ description: product-hub の「構成をAIに作らせる」の実行役 — cla
 ./phlp queue                                  仕事があるか
 ./phlp claim   --run RUN_ID                   1 件 claim (材料 + 仕様書を spec-ID.md に落とす)
 ./phlp images  ID                             商品画像を img-ID-1.jpg … に落とす
+                                              (枚数は claim の packet で決まる。落とせない枚があれば失敗する)
 ./phlp reserve ID                             🚨 **構成を書き始める前に必ず**
 ./phlp result  ID --accepted --file out-ID.md --lint lint-ID.json --rounds N
 ./phlp result  ID --rejected --reason-file reason-ID.txt --lint lint-ID.json --rounds N
@@ -72,6 +73,16 @@ RUN_ID="lp-$RANDOM$RANDOM"
 (仕様書の「商品再現ルール」は、見ていないと書けない)。
 
 画像が 0 枚なら `./phlp fail <ID> --code IMAGES_UNAVAILABLE --message "商品画像がありません"`。
+
+**見たことを `seen-<ID>.md` に書く** (これが検品の材料②になる)。
+Codex は画像を見られないので、**書いていないことは裏取りの無い記述として扱われる**。
+見たままを書く — 形状・色・ラベルの実際の文字・容量表記・点数・バリエーション。
+**推測を混ぜない**。読めない文字は「読めない」と書く。
+
+```
+img-12-1.jpg: 透明の PET ボトル、白ラベル。ラベルに「ハッカ油スプレー 100mL」と緑字。
+ポンプ式キャップ。裏面の成分表記は角度のせいで読めない。
+```
 
 ### 3. 仕様書を読む
 
@@ -134,6 +145,10 @@ RUN_ID="lp-$RANDOM$RANDOM"
 ```bash
 ./phlpreview <ID>
 ```
+
+渡るのはこの 3 つ (ラッパーが組み立てる。自分で貼る必要は無い):
+材料① claim の商品情報 ∕ 材料② `seen-<ID>.md` ∕ 構成案 `_lp_review_<ID>.md`。
+🚨 `seen-<ID>.md` が無いと検品は始まらない (見ずに書いた構成案を通さないため)。
 
 Codex は「**画像生成器として実行できるか**」を見る (具体性・事実との食い違い・作り話・トンマナ・重複)。
 critical / high の指摘があれば `out-<ID>.md` を直して、`_lp_review_<ID>.md` を作り直してもう 1 回。

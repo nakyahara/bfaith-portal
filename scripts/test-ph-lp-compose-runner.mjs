@@ -52,6 +52,10 @@ const BASE = `http://127.0.0.1:${server.address().port}/apps/product-hub/service
 const work = path.join(tmp || process.cwd(), 'work');
 fs.mkdirSync(work, { recursive: true });
 
+// 🚨 lease と材料は work/ の外 (codex exec review P2)。
+//    work/ は Claude に Read/Write/Edit を許しているので、そこに置くと読める・書き換えられる
+const state = path.join(tmp || process.cwd(), 'state');
+
 /**
  * ./phlp <args> を work/ で走らせる (シムと同じ呼び方)。
  * 🚨 spawnSync は使えない — service-api を**同じプロセス**に立てているので、
@@ -60,7 +64,7 @@ fs.mkdirSync(work, { recursive: true });
 const phlp = (...args) => new Promise((resolve) => {
   const child = spawn(process.execPath, [PHLP, ...args], {
     cwd: work,
-    env: { ...process.env, PH_LP_BASE: BASE, PH_SERVICE_TOKEN: 'test-token-lp-runner', PH_LP_RETRIES: '1' },
+    env: { ...process.env, PH_LP_BASE: BASE, PH_SERVICE_TOKEN: 'test-token-lp-runner', PH_LP_RETRIES: '1', PH_LP_STATE_DIR: state },
   });
   let so = '', se = '';
   child.stdout.on('data', (d) => { so += d; });
@@ -73,6 +77,7 @@ const phlp = (...args) => new Promise((resolve) => {
 });
 
 const exists = (n) => fs.existsSync(path.join(work, n));
+const inState = (n) => fs.existsSync(path.join(state, n));
 
 // ── 材料 ──
 const spec = lp.importSpec(db, {
@@ -112,7 +117,8 @@ ok(cl.out.indexOf('lease_token') === -1, '🚨 lease_token を標準出力に出
 ok(cl.out.indexOf('packet_hash') === -1, '🚨 packet_hash も出さない');
 ok(cl.out.indexOf('test-token-lp-runner') === -1, '🚨 service token を出さない');
 ok(exists(`spec-${jid}.md`), '仕様書の全文をファイルに落とす');
-ok(exists(`lease-${jid}.json`), 'lease は CLI が持つファイルに閉じる');
+ok(!exists(`lease-${jid}.json`), '🚨 lease を作業ディレクトリに置かない (Claude が読める・書き換えられる・codex exec review P2)');
+ok(inState(`lease-${jid}.json`), 'lease は work/ の外 (state/) に閉じる');
 ok(fs.readFileSync(path.join(work, `spec-${jid}.md`), 'utf8').includes('取込互換'), '仕様書の中身が入っている');
 eq(cl.json.packet.images, 1, '商品画像の枚数が分かる');
 ok(cl.json.packet.product_info.includes('ハッカ油'), '商品情報が来る');
@@ -168,13 +174,26 @@ eq(good.code, 0, 'サーバが配っていれば通る');
 eq(good.json.status, 'done', 'done になる');
 eq(good.json.receipt.images[0].sha256, 'b'.repeat(64), '🚨 証跡はサーバの記録 (実行役が書いた値ではない)');
 
+console.log('⑥b reviewdata — 検品に渡すデータを CLI が組み立てる (codex exec review P1)');
+fs.writeFileSync(path.join(work, `_lp_review_${jid}.md`), '# LP構成案 全文', 'utf8');
+eq((await phlp('reviewdata', jid)).code, 2, '🚨 seen-ID.md が無ければ検品を始めない (見ずに書いた構成案を通さない)');
+fs.writeFileSync(path.join(work, `seen-${jid}.md`), 'img-1: 透明ボトル、白ラベル「100mL」', 'utf8');
+const rd = await phlp('reviewdata', jid);
+eq(rd.code, 0, 'seen があれば通る');
+ok(rd.out.includes('ハッカ油スプレー 100ml'), '🚨 材料① (商品名) が入る');
+ok(rd.out.includes('天然ハッカ油 100ml'), '🚨 材料① (商品情報) が入る — これが無いと Codex は食い違いを見られない');
+ok(rd.out.includes('白ラベル'), '材料② (画像から読み取ったこと) が入る');
+ok(rd.out.includes('# LP構成案 全文'), '構成案が入る');
+ok(rd.out.indexOf('lease_token') === -1 && rd.out.indexOf('packet_hash') === -1, '🚨 lease は混ざらない');
+
 console.log('⑦ clean — 一時ファイルを全部消す (rm は使えない)');
 fs.writeFileSync(path.join(work, `_lp_review_${jid}.md`), 'レビュー用', 'utf8');
 const cleaned = await phlp('clean', jid);
 eq(cleaned.code, 0, 'clean が通る');
-for (const n of [`spec-${jid}.md`, `lease-${jid}.json`, `out-${jid}.md`, `imgs-${jid}.json`, `lint-${jid}.json`, `_lp_review_${jid}.md`]) {
+for (const n of [`spec-${jid}.md`, `out-${jid}.md`, `imgs-${jid}.json`, `seen-${jid}.md`, `lint-${jid}.json`, `_lp_review_${jid}.md`]) {
   ok(!exists(n), `${n} が消えた`);
 }
+ok(!inState(`lease-${jid}.json`), 'state/ の lease も消える');
 ok(exists('secret.txt'), '🚨 関係ないファイルは消さない');
 
 console.log('⑧ checkreview — 実体ファイルかを見る (phlpreview が先に呼ぶ)');
