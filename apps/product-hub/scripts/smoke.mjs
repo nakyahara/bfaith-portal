@@ -5510,12 +5510,31 @@ let wfSetParentId = null;
     `).run().lastInsertRowid);
     wfpEarly.ensureProgress(db, idSkip);
     const st = (code) => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idSkip, code)?.state;
-    // セット作成と同じ形を作る: 詳細の画像工程をまるごと「対象外」にしてから ③素材待ちだけ開け直す
-    // (= 完了列のカードを人が ③ へ差し戻した状態)
+    // セット作成と同じ形を作る: 詳細の画像工程をまるごと「対象外」にする (applyImagePlanToTrack と同じ)
     for (const code of dbmod.DETAIL_V2_CODES) {
       db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, code);
     }
-    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_material');
+    // 🚨 まず報告どおりの形で確かめる (Codex R4 P1): 親の画像をそのまま使うセットは画像の工程が
+    //    10 段階まるごと「対象外」になるので、カードは**完了列**にいる。そこから ⑧楽天登録 に
+    //    直接落とす = 後方移動。ここで開き直せないと「楽天登録に置けない」が残る
+    {
+      const skipImg0 = wf.createStaff({ name: '完了列から楽天登録スモーク', kind: 'internal' });
+      db.prepare(`INSERT INTO ph_staff_roles (staff_id, role_code) VALUES (?, 'image')`).run(skipImg0);
+      check('D&D 前提: 画像の工程が全部「対象外」のカードは完了列にいる',
+        wfpEarly.progressOf(idSkip, { db }).imageDetail.current === null
+        && wfpEarly.progressOf(idSkip, { db }).imageDetail.done === true);
+      wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: null },
+        'img', { isAdmin: false, actorStaffId: skipImg0 });
+      check('🚨 D&D: 完了列 (全部対象外) のカードを ⑧楽天登録 に直接落とせる (画像登録者でも・報告どおりの形)',
+        st('imgd_rakuten') === 'todo'
+        && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+        `⑧=${st('imgd_rakuten')} / current=${wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code}`);
+      wf.setStaffActive(skipImg0, false);
+      // 以降のテスト (前方移動) の形に戻す: ⑧ を対象外に、③素材待ちを未着手に
+      // (= 完了列のカードを人が ③ へ差し戻した状態)
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, 'imgd_rakuten');
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_material');
+    }
     check('D&D 前提: ⑧楽天登録 が「対象外」で残り、いまの工程は ③素材待ち',
       st('imgd_rakuten') === 'skip' && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_material');
     // 🚨 動かすのは**管理者ではなく画像登録者** (Codex R1 P1: ⑧楽天登録 は役割を置かない
