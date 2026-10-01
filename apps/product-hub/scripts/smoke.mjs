@@ -3620,6 +3620,31 @@ const ms = await import('../lib/mall-status.js');
   check('まだ工程は完了しない (他モールが残る)',
     wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state !== 'done');
 
+  // 🚨 楽天モールを**手で**完了にしたら、画像工程 ⑧楽天登録 も閉じる (2026-10-01)。
+  //    RMS で手で出した商品が、画像ボードの ⑧ の列に残り続けないようにする
+  //    (⑧ は役割なしの工程なので、残ると管理者しか閉じられない)
+  {
+    const idMx = Number(db.prepare(
+      "INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-MALL-RK', '手で楽天に出した商品', 'approved', 'smoke')"
+    ).run().lastInsertRowid);
+    wfp.ensureProgress(db, idMx);
+    const rkStepOf = () => db.prepare(
+      "SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_rakuten'").get(idMx)?.state;
+    check('前提: ⑧楽天登録 は未着手', rkStepOf() === 'todo', rkStepOf());
+    ms.setMallState(idMx, 'yahoo', { state: 'done' }, 'admin', ADMIN);
+    check('他モールを完了にしても ⑧楽天登録 は動かない', rkStepOf() === 'todo', rkStepOf());
+    ms.setMallState(idMx, 'rakuten', { state: 'done' }, 'admin', ADMIN);
+    check('🚨 楽天モールを手で完了にすると ⑧楽天登録 も完了になる', rkStepOf() === 'done', rkStepOf());
+    // 一方向 (モールを戻しても ⑧ は開けない。開くかどうかはボードの D&D で人が決める)
+    ms.setMallState(idMx, 'rakuten', { state: 'todo' }, 'admin', ADMIN);
+    check('楽天モールを戻しても ⑧楽天登録 は開かない (一方向の連動)', rkStepOf() === 'done', rkStepOf());
+    // 「対象外」にしてあった ⑧ は上書きしない (人が決めた予定を消さない)
+    db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idMx);
+    ms.setMallState(idMx, 'rakuten', { state: 'done' }, 'admin', ADMIN);
+    check('⑧楽天登録 が「対象外」なら自動完了で上書きしない', rkStepOf() === 'skip', rkStepOf());
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idMx);
+  }
+
   // URL の検証
   let urlErr = null;
   try { ms.setMallState(id, 'yahoo', { item_url: 'javascript:alert(1)' }, 'admin', ADMIN); } catch (e) { urlErr = e; }
@@ -4192,6 +4217,12 @@ let wfSetParentId = null;
   check('全部そのまま使うに戻せば、制作工程はまた「対象外」になる (⑧楽天登録は残る)',
     prodSteps().every((x) => x.state === 'skip') && rkStep() === 'todo',
     JSON.stringify(detailSteps().map((x) => x.state)));
+  // 🚨 この修正より前に作ったセット (⑧ が対象外のまま) は、計画を保存し直したときに開き直す。
+  //    反映対象から完全に外すと、既存のカードが永久に完了列から出てこない (Codex 名指し R2 P1)
+  db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
+  put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+  check('🚨 対象外で残っていた ⑧楽天登録 は、画像の計画を保存し直すと開き直る (既存セットの収束)',
+    rkStep() === 'todo', rkStep());
   const firstStep = detailSteps()[0].step_code;
   db.prepare(`UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = ?`).run(setId, firstStep);
   put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
@@ -5601,13 +5632,16 @@ let wfSetParentId = null;
       check('D&D の抜け道: 「出品・展開」はそもそも対象外にできない (開き直しの対象にならない)',
         listingSkip?.status === 400, listingSkip?.message || '例外が出ていない');
     }
-    // 完了で残っている工程は開き直さない (済んだ記録を通過だけで消さない)。
-    // ⑧ を「楽天に出した」状態にしてから、その手前を差し戻して前方移動する
+    // 🚨 完了で残っている移動先も開き直す (Codex 名指し R2 P1)。
+    //    「楽天登録済み → ⑤デザイン修正へ差し戻し → 直したので ⑧楽天登録 へ」が通らないと、
+    //    直した版を楽天へ反映する作業が board から消える
     db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('done', idSkip, 'imgd_rakuten');
     db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_design');
     wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_design' }, 'img', SKIP_IMG);
-    check('D&D: 完了で残っている ⑧楽天登録 は開き直さない (済んだ記録を消さない)',
-      st('imgd_rakuten') === 'done', st('imgd_rakuten'));
+    check('🚨 D&D: 完了で残っている ⑧楽天登録 に落とすと開き直る (直した版を楽天へ反映する作業が見える)',
+      st('imgd_rakuten') === 'todo'
+      && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+      st('imgd_rakuten'));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSkip);
     wf.setStaffActive(skipImgStaffId, false);
 
@@ -9405,6 +9439,23 @@ const renders = [
     maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(),
     isAdmin: false, shopCategoryCount: 0, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
   }],
+  // LP構成の仕様書カード (PR1-e) の **オフ / 未取込** の見え方。共通 locals の既定は
+  // 「機能オン・仕様書あり」なので、ここを別に描かないと初回デプロイ・機能オフのときだけ
+  // 壊れる退行を拾えない (Codex 名指し R2 P2)
+  ['index.ejs (LP仕様書: 機能オフ)', 'index.ejs', {
+    title: 't', displayName: 'smoke', drafts: [], counts, statusFilter: null,
+    statuses, statusLabels, maxImportCodes: imp.MAX_IMPORT_CODES,
+    maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(),
+    isAdmin: true, shopCategoryCount: 0, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
+    lpSpec: { enabled: false, spec: null },
+  }],
+  ['index.ejs (LP仕様書: まだ取り込まれていない)', 'index.ejs', {
+    title: 't', displayName: 'smoke', drafts: [], counts, statusFilter: null,
+    statuses, statusLabels, maxImportCodes: imp.MAX_IMPORT_CODES,
+    maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(),
+    isAdmin: true, shopCategoryCount: 0, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
+    lpSpec: { enabled: true, spec: null },
+  }],
   ['new.ejs', 'new.ejs', { title: 't', displayName: 'smoke' }],
   ['detail.ejs (full/own_brand)', 'detail.ejs', {
     title: 't', displayName: 'smoke',
@@ -9757,6 +9808,16 @@ renders.push(
     }]);
     // 確認中 (2026-08-31): 立っているとき = 青い帯 + 経過日数 + 解除ボタン、
     // 立っていないとき = 理由ボタンが並ぶ帯 (既定の detail fixture 側で描かれる)
+    // 🤖 構成をAIに作らせる (PR1-d) の **オフ / 押せない** の見え方。共通 locals の既定は
+    // 「機能オン・押せる」なので、ここを別に描かないと機能オフのときだけ壊れる退行を拾えない
+    // (Codex 名指し R2 P2)
+    renders.push(['detail.ejs (LP構成AI: 機能オフ)', 'detail.ejs', {
+      ...d0[2], lpCompose: { enabled: false, job: null, blocked: null, spec: null },
+    }]);
+    renders.push(['detail.ejs (LP構成AI: 仕様書なしで押せない)', 'detail.ejs', {
+      ...d0[2],
+      lpCompose: { enabled: true, job: null, blocked: '仕様書がまだ取り込まれていません', spec: null },
+    }]);
     renders.push(['detail.ejs (確認中)', 'detail.ejs', {
       ...d0[2],
       draft: {
@@ -10093,15 +10154,16 @@ for (const [name, file, data] of renders) {
         imagePriorities: dbmod.IMAGE_PRIORITIES,
         materialStatuses: dbmod.MATERIAL_STATUSES,
         // 📄 LP構成の仕様書の取り込みカード (段階1・PR1-e)。router は一覧画面に常に渡す。
-        // 既定 = 機能オン・いまの版あり (admin に出る形)。機能オフ・未取込の見え方は fixture 側で上書きする
+        // 既定 = 機能オン・いまの版あり (admin に出る形)。機能オフ・未取込の見え方は
+        // 「index.ejs (LP仕様書: 機能オフ)」「(まだ取り込まれていない)」の fixture で上書きする
         lpSpec: {
           enabled: true,
           spec: { id: 3, title: 'LP制作システム.xlsx', imported_at: '2026-10-01T09:30:00Z', imported_by: 'smoke',
                   hash_short: 'abc123def456', sheet_titles: ['LP制作システム', '出力形式'], chars: 12345 },
         },
         // 🤖 構成をAIに作らせる (段階1・PR1-d)。router は詳細画面に常に渡す。
-        // 既定 = 機能オン・仕様書あり・まだ依頼なし (押せる状態の見え方を既定にして、
-        // 依頼中・できた・失敗の見え方は fixture 側で上書きする)
+        // 既定 = 機能オン・仕様書あり・まだ依頼なし (押せる状態)。機能オフ・押せないの見え方は
+        // 「detail.ejs (LP構成AI: 機能オフ)」「(仕様書なしで押せない)」の fixture で上書きする
         lpCompose: {
           enabled: true, job: null, blocked: null,
           spec: { id: 1, title: 'LP制作システム.xlsx', imported_at: '2026-10-01T00:00:00Z', imported_by: 'smoke',

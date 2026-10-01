@@ -580,7 +580,7 @@ export function pendingImagePlanSlots(db, setDraftId) {
  * 1 枠でもあれば skip を todo に戻して「依頼」から始める。
  * 🚨 **done は触らない** — 人が進めた工程を巻き戻さない。動かすのは todo ⇄ skip だけ。
  *
- * 🚨 **⑧楽天登録 (image_stage='rakuten') は動かさない** (2026-10-01)。
+ * 🚨 **⑧楽天登録 (image_stage='rakuten') は「対象外」にしない** (2026-10-01)。
  * この関数が表しているのは「画像を**作る**仕事が要るか」で、⑧は作った画像を楽天に載せる
  * 後工程 = **実際に楽天へ出したか**を表す工程 (出品すると自動で完了する)。
  * 親の画像をそのまま使うセットも楽天には出すので、ここを「対象外」にすると
@@ -590,6 +590,10 @@ export function pendingImagePlanSlots(db, setDraftId) {
  * 楽天登録に移動しようとすると A+コンテンツまで飛ばされる」の根っこ)。
  * ⑨A+登録 も厳密には同じ性格だが、全部そのまま使うセットに毎回 A+ の作業を出すかは
  * 運用の判断なので、要望が出るまで従来どおり計画に従わせる。
+ *
+ * ただし **「対象外」で残っている ⑧ は、計画を保存し直したときに開き直す** —
+ * 反映対象から完全に外すと、この修正より前に作ったセット (⑧が skip のまま) が
+ * 計画を直しても永久に完了列から出てこない (Codex 名指し R2 P1)。
  * @returns {{needsProduction: boolean, changed: number}}
  */
 export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
@@ -614,6 +618,9 @@ export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
   `);
   let changed = 0;
   for (const r of rows) changed += upd.run(to, id, r.step_code, from).changes;
+  // ⑧楽天登録 は「対象外」にはしないが、**対象外で残っていれば開き直す** (上の 🚨 のとおり)。
+  // 人が進めた done は触らない (todo ⇄ skip だけ、は他の工程と同じ)
+  changed += upd.run('todo', id, 'imgd_rakuten', 'skip').changes;
   if (changed > 0) {
     logEvent(db, id, 'set_image_plan_track',
       needs

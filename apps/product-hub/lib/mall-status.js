@@ -226,6 +226,7 @@ export function setMallState(
     if (info.changes !== 1) return null;
     if (event) logEvent(db, id, 'mall_changed', event, actor);
     const settled = syncListingStep(db, id, actor);
+    syncImageRakutenStep(db, id, code, actor);
     // 楽天モールの done/undone と工程「出品・展開」の開閉は status (listed/expanded) を
     // 左右するので、同じトランザクションで導出し直す (PR4)
     if (stateChanged) recomputeDraftStatus(db, id, { actor });
@@ -237,6 +238,41 @@ export function setMallState(
   const result = run();
   if (!result) throw conflict('別の人がこのモールを先に更新しました。画面を読み直してください');
   return { changed: true, version: result.version, listingCompleted: result.settled };
+}
+
+/**
+ * 楽天モールを完了にしたら、画像工程 ⑧楽天登録 も完了にする (モール → 工程の一方向)。
+ *
+ * ⑧は「このアプリから楽天に出品すると自動で完了する」工程で、アプリ経由の出品では
+ * `afterRakutenRegistered` が閉じている。RMS で手で出した商品はここを通るので、
+ * **同じ根拠 (楽天モール done) で同じように閉じる** (2026-10-01)。
+ * 閉じないと、画像ボードのカードが ⑧楽天登録 の列に残り続け、役割なしの工程なので
+ * 管理者しか閉じられない (setStepState の「楽天登録の根拠」もモール done を認めている)。
+ *
+ * 一方向にする (モールを未着手に戻しても ⑧ は開けない) のは、⑧ を開くかどうかは
+ * 画像の作業の話で、ボードの D&D で人が決める方が実態に合うため。
+ * fail-soft: ここで失敗してもモールの更新は成功しているので throw しない。
+ */
+function syncImageRakutenStep(db, draftId, mall, actor) {
+  if (mall !== 'rakuten') return false;
+  try {
+    const rk = db.prepare(`
+      SELECT state FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'
+    `).get(Number(draftId));
+    if (rk?.state !== 'done') return false;
+    const info = db.prepare(`
+      UPDATE draft_step_progress
+      SET state = 'done', done_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), done_by = ?,
+          version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE draft_id = ? AND step_code = 'imgd_rakuten' AND state NOT IN ('done', 'skip')
+    `).run(actor || 'system', Number(draftId));
+    if (info.changes !== 1) return false;
+    logEvent(db, Number(draftId), 'step_changed', '楽天登録: 楽天モールを完了にしたので画像工程も完了にしました', actor);
+    return true;
+  } catch (e) {
+    console.warn('[product-hub] 画像工程⑧の自動完了に失敗:', e.message);
+    return false;
+  }
 }
 
 /**
