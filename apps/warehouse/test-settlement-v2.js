@@ -117,35 +117,42 @@ ingestSettlement(db, p1.headerRow, p1.lineRows, p1.ctx);
 ok(settlementIngestedByV1(db, S) === true, 'V1 で入れた決済 = 取込済み (V2 では入れない)');
 const unified = () => db.prepare(`SELECT COUNT(*) n, SUM(COALESCE(price_amount_micro,0) + COALESCE(item_related_fee_amount_micro,0) + COALESCE(promotion_amount_micro,0) + COALESCE(other_amount_micro,0)) s FROM v_amazon_settlement_unified WHERE source_settlement_id = ?`).get(S);
 const before = unified();
-ingestSettlement(db, p2.headerRow, p2.lineRows, p2.ctx);   // skip を外して両方入れた場合
+// 🚨 取込は同じ決済を V1 と V2 の両方には入れない (Codex #1582 R1 High)。呼び手の確かめ (processV2Report) を通さずに直接渡しても、取引の中で止まる
+const rSkip = ingestSettlement(db, p2.headerRow, p2.lineRows, p2.ctx);
+ok(rSkip.skipped === 'skipped_v1' && rSkip.headerInserted === 0 && rSkip.lineInserted === 0 && unified().n === before.n,
+  `🚨 V1 で入れた決済は ingestSettlement に V2 を直接渡しても入らない (取引の中で確かめる・skipped_v1) (${rSkip.skipped})`);
+// 下流だけの確かめ: 取込の排他を通さずに両方を生の表へ直接入れる (前に両方入った決済の代わり)。鍵が同じ (= 今の形の決済) なら 1 つになる
+const insertRaw = (p) => {
+  const put = (table, rows) => { if (!rows.length) return; const cols = Object.keys(rows[0]); const st = db.prepare(`INSERT OR IGNORE INTO ${table} (${cols.join(', ')}) VALUES (${cols.map((c) => '@' + c).join(', ')})`); for (const r of rows) st.run(r); };
+  db.transaction(() => { put('raw_amazon_settlement_headers', p.headerRow ? [p.headerRow] : []); put('raw_amazon_settlement_lines', p.lineRows); })();
+};
+insertRaw(p2);
 const after = unified();
-ok(before.n === after.n && before.s === after.s, `V1 と V2 の両方が入っても下流は二重にならない (${before.n} 行 / ${after.n} 行)`);
-ok(db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_layer = 'sp_api_v2'`).get().n === p2.lineRows.length, 'V2 の行は raw に sp_api_v2 で入る');
-const r2 = ingestSettlement(db, p2.headerRow, p2.lineRows, p2.ctx);
-ok(r2.lineInserted === 0, 'V2 の同じレポートを入れ直しても 0 行 (冪等)');
+ok(before.n === after.n && before.s === after.s, `V1 と V2 の両方が生の表にあっても、鍵が同じなら下流は二重にならない (${before.n} 行 / ${after.n} 行)`);
+ok(db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_layer = 'sp_api_v2'`).get().n === p2.lineRows.length, '(前提) V2 の行が生の表に sp_api_v2 で入った');
 
-// 🆕 2026-10-02: 税の取り直し (Order_Retrocharge / Refund_Retrocharge の ItemPrice)。決済 12222191753 (2025-12-29〜2026-01-12・V2 report 1587027020727) が
-//   「規則に無い組み合わせ Order_Retrocharge | ItemPrice ×2」で丸ごと止まった。同じ決済の V1 (report 1587031020727) の 2 行をそのまま写す:
+// 🆕 2026-10-02: 税の取り直し (Order_Retrocharge / Refund_Retrocharge の ItemPrice)。本番の決済 1 つ (2025-12-29〜2026-01-12) が
+//   「規則に無い組み合わせ Order_Retrocharge | ItemPrice ×2」で丸ごと止まった (本物の番号は PR #1582 の本文に)。同じ決済の V1 の 2 行の形を作り物の番号で写す:
 //   取引・注文番号・marketplace・計上日・price-type Tax 53.00 / ShippingTax 0.00 だけ (SKU・品物の番号・個数・fulfillment は空・個数だけの行は無い)。
-//   Refund_Retrocharge (取り消し) は手元の V1 に無い = 同じ形・符号を逆にしたものを仮定
+//   🚨 Refund_Retrocharge (取り消し) は実物を見ていない (手元の V1 にも無い) = 同じ形・符号を逆にしたものの **仮定**。ここは仮定どうしの比べ = 実データとの一致の証明ではない
 {
-  const RS = '12222191753', RO = '249-7742027-2459864';
+  const RS = 'S920', RO = 'O-RETRO-1';
   const RETRO = [   // [取引, 説明 = price-type, 金額, V2 の日時, V1 の日時]
-    ['Order_Retrocharge', 'Tax', '53.00', '2026/01/01 11:14:44 UTC', '2026-01-01T11:14:44+00:00'],
-    ['Order_Retrocharge', 'ShippingTax', '0.00', '2026/01/01 11:14:44 UTC', '2026-01-01T11:14:44+00:00'],
-    ['Refund_Retrocharge', 'Tax', '-53.00', '2026/01/05 02:00:00 UTC', '2026-01-05T02:00:00+00:00'],
-    ['Refund_Retrocharge', 'ShippingTax', '0.00', '2026/01/05 02:00:00 UTC', '2026-01-05T02:00:00+00:00'],
+    ['Order_Retrocharge', 'Tax', '53.00', '2099/02/03 11:14:44 UTC', '2099-02-03T11:14:44+00:00'],
+    ['Order_Retrocharge', 'ShippingTax', '0.00', '2099/02/03 11:14:44 UTC', '2099-02-03T11:14:44+00:00'],
+    ['Refund_Retrocharge', 'Tax', '-53.00', '2099/02/07 02:00:00 UTC', '2099-02-07T02:00:00+00:00'],
+    ['Refund_Retrocharge', 'ShippingTax', '0.00', '2099/02/07 02:00:00 UTC', '2099-02-07T02:00:00+00:00'],
   ];
   const rV2 = tsvOf(V2_COLUMNS, [
-    { 'settlement-id': RS, 'settlement-start-date': '2025/12/29 00:20:08 UTC', 'settlement-end-date': '2026/01/12 00:20:08 UTC', 'deposit-date': '2026/01/14 00:20:08 UTC', 'total-amount': '18369758.00', currency: 'JPY' },
+    { 'settlement-id': RS, 'settlement-start-date': '2099/02/01 00:20:08 UTC', 'settlement-end-date': '2099/02/15 00:20:08 UTC', 'deposit-date': '2099/02/17 00:20:08 UTC', 'total-amount': '12345.00', currency: 'JPY' },
     ...RETRO.map(([tx, d, a, t2]) => ({ 'settlement-id': RS, 'transaction-type': tx, 'order-id': RO, 'marketplace-name': 'Amazon.co.jp', 'amount-type': 'ItemPrice', 'amount-description': d, amount: a, 'posted-date': t2.slice(0, 10), 'posted-date-time': t2 })),
   ]);
   const rV1 = tsvOf(V1_COLUMNS, [
-    { 'settlement-id': RS, 'settlement-start-date': '2025-12-29T00:20:08+00:00', 'settlement-end-date': '2026-01-12T00:20:08+00:00', 'deposit-date': '2026-01-14T00:20:08+00:00', 'total-amount': '18369758.00', currency: 'JPY' },
+    { 'settlement-id': RS, 'settlement-start-date': '2099-02-01T00:20:08+00:00', 'settlement-end-date': '2099-02-15T00:20:08+00:00', 'deposit-date': '2099-02-17T00:20:08+00:00', 'total-amount': '12345.00', currency: 'JPY' },
     ...RETRO.map(([tx, d, a, , t1]) => ({ 'settlement-id': RS, 'transaction-type': tx, 'order-id': RO, 'marketplace-name': 'Amazon.co.jp', 'posted-date': t1, 'price-type': d, 'price-amount': a })),
   ]);
   const rc = convertV2TsvToV1Tsv(rV2);
-  ok(rc.unknown.length === 0 && rc.itemCodeUnresolved === 0, `税の取り直し (Order_Retrocharge / Refund_Retrocharge の ItemPrice) は規則にある (${JSON.stringify(rc.unknown)})`);
+  ok(rc.unknown.length === 0 && rc.itemCodeUnresolved === 0, `税の取り直し (Order_Retrocharge / Refund_Retrocharge の ItemPrice の Tax / ShippingTax) は規則にある (${JSON.stringify(rc.unknown)})`);
   ok(rc.tsv === rV1, '税の取り直しの V2 → V1 の TSV が V1 と 1 文字も違わない (個数だけの行を作らない・SKU・品物の番号・個数は空のまま)');
   const q1 = prepareReportTsv(rV1, 'R-RV1', 'run-r'), q2 = prepareV2ReportTsv(rV2, 'R-RV2', 'run-r');
   // detail_digest (#1567) の材料 = business_line_key・出現順・金額 9 つ・個数・取引・注文・SKU・計上日。ここでは中身の列の全部 + 行番号を比べる (= より強い)。
@@ -162,11 +169,73 @@ ok(r2.lineInserted === 0, 'V2 の同じレポートを入れ直しても 0 行 (
   ok(q2.lineRows.every((r) => r.amazon_order_id === RO && r.seller_sku == null && r.order_item_code == null && r.quantity_purchased == null && r.fulfillment_id == null && r.economic_date != null)
     && q2.lineRows.map((r) => `${r.transaction_type}:${r.price_type}:${r.price_amount_micro}`).join() === 'Order_Retrocharge:Tax:53000000,Order_Retrocharge:ShippingTax:0,Refund_Retrocharge:Tax:-53000000,Refund_Retrocharge:ShippingTax:0',
     '税の取り直し = price-type / price-amount に入り、SKU・品物の番号・個数は空 (V1 と同じ)');
-  // 足したのは ItemPrice だけ (手数料・値引き・ポイントの Retrocharge は公式の RetrochargeEvent に無い = 来たら止める)
-  ok(JSON.stringify(unk([v2({ 'transaction-type': 'Order_Retrocharge', 'order-id': 'O9', 'amount-type': 'ItemFees', 'amount-description': 'Commission', amount: '-1.00' })])) === JSON.stringify(['Order_Retrocharge | ItemFees']), '税の取り直しでも ItemPrice 以外 (ItemFees) は規則に無い = 止める');
+  // 🚨 通すのは ItemPrice の Tax / ShippingTax だけ (Codex #1582 R1 Medium・Low)。公式の RetrochargeEvent は BaseTax / ShippingTax と 米国の源泉だけ = ほかは来たら止める
+  const RETRO_UNKNOWN = [   // [取引, amount-type, 説明, unknown の名前]
+    ['Order_Retrocharge', 'ItemPrice', 'Principal', 'Order_Retrocharge | ItemPrice | Principal'],
+    ['Refund_Retrocharge', 'ItemPrice', 'Principal', 'Refund_Retrocharge | ItemPrice | Principal'],
+    ['Order_Retrocharge', 'ItemPrice', 'Shipping', 'Order_Retrocharge | ItemPrice | Shipping'],
+    ['Order_Retrocharge', 'ItemFees', 'Commission', 'Order_Retrocharge | ItemFees'],
+    ['Refund_Retrocharge', 'ItemFees', 'Commission', 'Refund_Retrocharge | ItemFees'],
+    ['Order_Retrocharge', 'Points', 'PointsGranted', 'Order_Retrocharge | Points'],
+    ['Refund_Retrocharge', 'Points', 'PointsReturned', 'Refund_Retrocharge | Points'],
+    ['Order_Retrocharge', 'Promotion', 'Shipping', 'Order_Retrocharge | Promotion'],
+    ['Refund_Retrocharge', 'Promotion', 'Shipping', 'Refund_Retrocharge | Promotion'],
+    ['Order_Retrocharge', 'ItemWithheldTax', 'MarketplaceFacilitatorTax-Principal', 'Order_Retrocharge | ItemWithheldTax | MarketplaceFacilitatorTax-Principal'],
+    ['Refund_Retrocharge', 'ItemWithheldTax', 'MarketplaceFacilitatorTax-Shipping', 'Refund_Retrocharge | ItemWithheldTax | MarketplaceFacilitatorTax-Shipping'],
+  ];
+  const notStopped = RETRO_UNKNOWN.filter(([tx, at, d, want]) => JSON.stringify(unk([v2({ 'transaction-type': tx, 'order-id': 'O9', 'order-item-code': 'OI9', sku: 'SKU-9', 'amount-type': at, 'amount-description': d, amount: '-1.00' })])) !== JSON.stringify([want]));
+  ok(notStopped.length === 0, `税の取り直しで規則に無いもの ${RETRO_UNKNOWN.length} 通り (Tax / ShippingTax 以外の説明・ItemFees・Points・Promotion・源泉 ItemWithheldTax) は止める${notStopped.length ? ' ' + JSON.stringify(notStopped) : ''}`);
   const rp = processV2Report(db, rV2, 'R-RETRO', 'run-r');
   ok(rp.status === 'ingested' && db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_settlement_id = ? AND transaction_type LIKE '%_Retrocharge'`).get(RS).n === 4,
     `税の取り直しのある決済を止めずに取り込む (${rp.status}${rp.reason ? ': ' + rp.reason : ''})`);
+  const rp2 = processV2Report(db, rV2, 'R-RETRO', 'run-r2');
+  ok(rp2.status === 'ingested' && rp2.result.lineInserted === 0 && rp2.result.headerInserted === 0, `V2 の同じレポートを入れ直しても 0 行 (冪等) (${rp2.result && rp2.result.lineInserted} 行)`);
+}
+
+// 🚨 古い決済は V1 と V2 で行の分け方が違う = 両方入れると二重 → 同じ決済は片方だけ (Codex #1582 R1 High)。
+//   2026-01 の本物の V1 の Easy Ship = 1 注文 2 行 (item-related-fee-type MFNPostageFee / MFNPostageFeeTax・金額は other-amount)。
+//   V2 の並べ直し = 今の V1 の形の 1 行 (Amazon Easy Ship Charges・item-related-fee-amount) = business_line_key が合わない
+{
+  const { runSettlementFetch } = await import('./fetch-amazon-settlements.js');
+  const esV2 = (sid) => tsvOf(V2_COLUMNS, [{ ...V2_ROWS[0], 'settlement-id': sid, 'total-amount': '-165.00' },
+    ...[['Base fee', '-150.00'], ['Tax on fee', '-15.00']].map(([d, a]) => ({ ...v2({ 'transaction-type': 'AmazonFees', 'order-id': 'O-ES', 'shipment-id': 'SH-ES', 'fulfillment-id': 'MFN', 'amount-type': 'Amazon Easy Ship Charges', 'amount-description': d, amount: a }), 'settlement-id': sid }))]);
+  const esV1 = (sid) => tsvOf(V1_COLUMNS, [{ ...V1_ROWS[0], 'settlement-id': sid, 'total-amount': '-165.00' },
+    ...[['MFNPostageFee', '-150.00'], ['MFNPostageFeeTax', '-15.00']].map(([t, a]) => v1({ 'settlement-id': sid, 'transaction-type': 'Amazon Easy Ship Charges', 'order-id': 'O-ES', 'shipment-id': 'SH-ES', 'fulfillment-id': 'MFN', 'item-related-fee-type': t, 'other-amount': a }))]);
+  const sumOf = (sid) => db.prepare(`SELECT COUNT(*) n, SUM(COALESCE(price_amount_micro,0) + COALESCE(item_related_fee_amount_micro,0) + COALESCE(promotion_amount_micro,0) + COALESCE(other_amount_micro,0)) s FROM v_amazon_settlement_unified WHERE source_settlement_id = ?`).get(sid);
+  const layersOf = (sid) => db.prepare(`SELECT GROUP_CONCAT(DISTINCT source_layer) g FROM raw_amazon_settlement_lines WHERE source_settlement_id = ?`).get(sid).g;
+  const ES = -165000000;
+
+  // 前提: 鍵が違う = 取込の排他を通さずに両方を生の表へ入れると 2 倍になる (この試験が意味を持つことの確かめ)
+  insertRaw(prepareV2ReportTsv(esV2('S932'), 'R-ES-RAW2', 'run-es'));
+  insertRaw(prepareReportTsv(esV1('S932'), 'R-ES-RAW1', 'run-es'));
+  ok(sumOf('S932').s === 2 * ES && sumOf('S932').n === 3, `(前提) 古い Easy Ship の V1 (2 行) と V2 (1 行) は鍵が違う = 両方あると 2 倍 (${sumOf('S932').s / 1e6} 円・${sumOf('S932').n} 行)`);
+
+  // ① V2 → V1 (毎朝の V2 で入った決済を、後から --source v1 で取った)
+  const A = 'S930';
+  ok(processV2Report(db, esV2(A), 'R-ES-V2', 'run-es').status === 'ingested' && sumOf(A).s === ES && sumOf(A).n === 1, '(前提) V2 で入れた (Easy Ship 1 行・-165 円)');
+  const a1 = prepareReportTsv(esV1(A), 'R-ES-V1', 'run-es');
+  const rA = ingestSettlement(db, a1.headerRow, a1.lineRows, a1.ctx);
+  ok(rA.skipped === 'skipped_v2' && rA.headerInserted === 0 && rA.lineInserted === 0 && sumOf(A).s === ES && sumOf(A).n === 1 && layersOf(A) === 'sp_api_v2',
+    `🚨 V2 → V1: V2 で入れた決済は V1 を入れない = 金額は増えない (${rA.skipped}・${sumOf(A).s / 1e6} 円・層 ${layersOf(A)})`);
+  // 本番の V1 の道 (runSettlementFetch --source v1・一覧の回): 入れない・blocked にしない (終了コード 3 にしない)・一覧の行は imported (0 行) + 注記 skipped_v2
+  const repA = { reportId: 'R-ES-V1', reportType: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE', processingStatus: 'DONE', reportDocumentId: 'D-ES-V1',
+    createdTime: '2099-01-16T00:00:00+00:00', dataStartTime: '2099-01-01T00:00:00+00:00', dataEndTime: '2099-01-15T00:00:00+00:00' };
+  const fakeSp = { async callAPI(req) { if (req.operation === 'getReports') return { reports: [repA] }; throw new Error(`想定外の呼び出し ${req.operation}`); } };
+  const runA = await runSettlementFetch({ reportId: null, dryRun: false, source: 'v1' }, { db, sp: fakeSp, runId: 'run-es-v1', downloadTsv: async () => esV1(A), now: () => new Date('2099-01-20T00:00:00Z') });
+  const invA = db.prepare(`SELECT import_result r, import_note note, lines_inserted li, header_inserted hi, settlement_id sid FROM amazon_settlement_report_inventory WHERE report_id = 'R-ES-V1' ORDER BY id DESC LIMIT 1`).get();
+  ok(runA.totalLines === 0 && runA.totalHeaders === 0 && runA.blocked.length === 0 && sumOf(A).s === ES && layersOf(A) === 'sp_api_v2'
+    && invA && invA.r === 'imported' && /skipped_v2/.test(invA.note) && invA.li === 0 && invA.hi === 0 && invA.sid === A,
+    `🚨 V1 の取込の回 (--source v1) でも入れない・❌ にしない・一覧の行 = imported (0 行) + skipped_v2 (${JSON.stringify(invA)})`);
+
+  // ② V1 → V2 (前に V1 で入れた決済の V2 が来た)
+  const B = 'S931';
+  const b1 = prepareReportTsv(esV1(B), 'R-ES-V1b', 'run-es');
+  ok(ingestSettlement(db, b1.headerRow, b1.lineRows, b1.ctx).lineInserted === 2 && sumOf(B).s === ES && sumOf(B).n === 2, '(前提) V1 で入れた (Easy Ship 2 行・-165 円)');
+  const prB = processV2Report(db, esV2(B), 'R-ES-V2b', 'run-es');
+  const b2 = prepareV2ReportTsv(esV2(B), 'R-ES-V2b', 'run-es');
+  const rB = ingestSettlement(db, b2.headerRow, b2.lineRows, b2.ctx);   // 呼び手の確かめを通さずに直接
+  ok(prB.status === 'skipped_v1' && rB.skipped === 'skipped_v1' && rB.lineInserted === 0 && sumOf(B).s === ES && sumOf(B).n === 2 && layersOf(B) === 'sp_api_v1',
+    `🚨 V1 → V2: V1 で入れた決済は V2 を入れない (取込の道でも直接でも) = 金額は増えない (${prB.status} / ${rB.skipped}・${sumOf(B).s / 1e6} 円・層 ${layersOf(B)})`);
 }
 
 // main の 1 本ずつの処理 (processV2Report): 規則に無いものがあるレポートは 1 行も入れない / V1 取込済み / dry-run / 取り込む

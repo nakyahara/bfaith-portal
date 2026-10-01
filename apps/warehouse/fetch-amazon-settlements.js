@@ -7,6 +7,8 @@
  *   V2 は形が違う (金額が amount-type / amount-description / amount の縦並び) → amazon-settlement-v2.js で V1 の形の TSV に並べ直してから
  *   今までと同じ正規化に通す (source_layer = 'sp_api_v2')。並べ直しは 6 期間の V1 / V2 で business_line_key が全部一致することを確かめた。
  *   V1 で取込済みの決済 (同じ settlement-id が sp_api_v1 にある) は V2 では入れない (中身は同じ = raw を倍にしない)。
+ *   逆に V2 で取込済みの決済は V1 (--source v1) でも入れない (skipped_v2)。古い決済は V1 と V2 で行の分け方が違い、両方入ると二重になる
+ *   (2026-10-02・Codex #1582 R1 High)。確かめは ingestSettlement の書き込みと同じ取引の中
  *   並べ直しの規則に無い組み合わせ・日時の空・品物の番号を補えない行が 1 つでもあるレポートは **取り込まない** + 終了コード 3
  *   (daily-sync で ❌ = 規則を足す合図。取り込んでから規則を直すと古い行と新しい行が二重になるため。V2 は約 90 日取り直せる = 落ちない。Codex #1508 R1)
  *   V1 が必要なら --source v1 (11/11 まで)
@@ -490,17 +492,37 @@ export function processV2Report(db, v2Tsv, reportId, runId, { dryRun = false } =
   if (p.unknown.length || p.itemCodeUnresolved) return { ...base, status: 'blocked', reason: `規則に無い組み合わせ ${JSON.stringify(p.unknown)} / 品物の番号を補えないポイントの行 ${p.itemCodeUnresolved}` };
   if (!p.headerRow || p.headerRow.source_settlement_id !== settlementId) return { ...base, status: 'blocked', reason: '決済の見出しの行が無い / 明細と決済の番号が違う' };
   if (dryRun) return { ...base, status: 'dry_run' };
-  return { ...base, status: 'ingested', result: ingestSettlement(db, p.headerRow, p.lineRows, p.ctx) };
+  const result = ingestSettlement(db, p.headerRow, p.lineRows, p.ctx);
+  // 上の確かめ (取引の外) の後に V1 が入った = 取引の中の確かめで 1 行も入れていない (Codex #1582 R1 High)
+  if (result.skipped === 'skipped_v1') return { status: 'skipped_v1', settlementId, unknown: [], itemCodeUnresolved: 0 };
+  return { ...base, status: 'ingested', result };
+}
+
+/** その決済の見出し・明細がその層 (source_layer) にあるか */
+export function settlementInLayer(db, settlementId, layer) {
+  if (!settlementId) return false;
+  return !!(db.prepare(`SELECT 1 FROM raw_amazon_settlement_headers WHERE source_settlement_id = ? AND source_layer = ? LIMIT 1`).get(settlementId, layer)
+    || db.prepare(`SELECT 1 FROM raw_amazon_settlement_lines WHERE source_settlement_id = ? AND source_layer = ? LIMIT 1`).get(settlementId, layer));
 }
 
 /** その決済が V1 (sp_api_v1) で取込済みか (V2 で同じ決済を入れ直さない = 中身は同じ・raw を倍にしない) */
 export function settlementIngestedByV1(db, settlementId) {
-  if (!settlementId) return false;
-  return !!db.prepare(`SELECT 1 FROM raw_amazon_settlement_headers WHERE source_settlement_id = ? AND source_layer = 'sp_api_v1' LIMIT 1`).get(settlementId);
+  return settlementInLayer(db, settlementId, 'sp_api_v1');
 }
+
+// 🚨 1 つの決済は V1 (sp_api_v1) と V2 (sp_api_v2) の **どちらか一方だけ** 入れる (Codex #1582 R1 High)。
+//   古い決済は V1 と V2 で行の分け方が違う (2026-01 の Easy Ship = V1 は MFNPostageFee + MFNPostageFeeTax の 2 行・V2 の並べ直しは 1 行)
+//   = business_line_key が合わず、下流 (v_amazon_settlement_unified) の重複除去で 1 つにならない = 両方入ると金額が二重になる。
+//   → もう片方の層に同じ決済の見出し・明細があれば入れない (V2 の取込 = skipped_v1・V1 の取込 = skipped_v2。どちらも取り込んだ側の中身で足りる)
+export const OTHER_SP_API_LAYER = Object.freeze({
+  sp_api_v1: Object.freeze({ layer: 'sp_api_v2', skipped: 'skipped_v2' }),
+  sp_api_v2: Object.freeze({ layer: 'sp_api_v1', skipped: 'skipped_v1' }),
+});
 
 // 🚨 1 回の呼び出し = 1 決済の完全なレポート 1 本 (下流の重複除去は「同じ文書の中の出現順」で数える = db.js の v_amazon_settlement_unified の注記)。
 //   1 つの決済を複数の文書に分けて入れないこと
+//   返り値の skipped = 'skipped_v1' / 'skipped_v2' (もう片方の層で取込済み = 1 行も入れていない) / null
+//   🚨 もう片方の層の確かめは書き込みと **同じ取引の中** (BEGIN IMMEDIATE = 書き込みの鍵を先に取る = 同時に走った取込が確かめと書き込みの間に入れない)
 export function ingestSettlement(db, headerRow, lineRows, ctx) {
   const insertHeader = db.prepare(INSERT_HEADER_SQL);
   const insertLine = db.prepare(INSERT_LINE_SQL);
@@ -512,8 +534,12 @@ export function ingestSettlement(db, headerRow, lineRows, ctx) {
   const dirtyMonths = new Set();
   let headerInserted = 0;
   let lineInserted = 0;
+  const other = ctx && Object.hasOwn(OTHER_SP_API_LAYER, ctx.sourceLayer) ? OTHER_SP_API_LAYER[ctx.sourceLayer] : null;
+  const settlementIds = [...new Set([headerRow?.source_settlement_id, ...lineRows.map((l) => l.source_settlement_id)].filter((x) => x != null && x !== ''))];
+  let skipped = null;
 
   const txn = db.transaction(() => {
+    if (other && settlementIds.some((id) => settlementInLayer(db, id, other.layer))) { skipped = other.skipped; return; }
     if (headerRow) {
       const r = insertHeader.run(headerRow);
       if (r.changes > 0) headerInserted++;
@@ -535,9 +561,9 @@ export function ingestSettlement(db, headerRow, lineRows, ctx) {
       upsertRefresh.run(ym, 'new_ingest', ctx.observedAt);
     }
   });
-  txn();
+  txn.immediate();
 
-  return { headerInserted, lineInserted, dirtyMonths: [...dirtyMonths] };
+  return { headerInserted, lineInserted, dirtyMonths: [...dirtyMonths], skipped, settlementId: settlementIds[0] ?? null };
 }
 
 // ─── Main ───
@@ -685,6 +711,15 @@ export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = nu
         }
 
         const result = ingestSettlement(db, headerRow, lineRows, ctx);
+        if (result.skipped === 'skipped_v2') {
+          // 🚨 V2 で取込済みの決済は V1 (--source v1) で入れない (古い決済は行の分け方が違い、両方入ると二重。Codex #1582 R1 High)。
+          //   skipped_v1 (V2 の側) と同じく [skip] だけ = 終了コードは変えない (中身は V2 で入っている。❌ にすると、規則に無いもので止まった
+          //   V2 の決済を --source v1 で入れる回が、90 日の中のほかの決済で毎回 ❌ になる)。
+          //   一覧の行の結果は 'imported' (0 行) + 注記 skipped_v2 (結果の CHECK は固定の集合 = 足すには表を作り直す。中身が raw にある点は imported と同じ)
+          console.log(`  [skip] settlement-id ${result.settlementId} は V2 (sp_api_v2) で取込済み = V1 では入れない (skipped_v2)`);
+          rec(r.reportId, 'imported', { ...doc, settlementId: result.settlementId, headerInserted: 0, linesInserted: 0, note: 'skipped_v2: 同じ決済を V2 (sp_api_v2) で取込済み = V1 では入れない' });
+          continue;
+        }
         console.log(`  inserted: header=${result.headerInserted}, lines=${result.lineInserted}, dirty_months=${result.dirtyMonths.join(',')}`);
         totalHeaders += result.headerInserted;
         totalLines += result.lineInserted;
