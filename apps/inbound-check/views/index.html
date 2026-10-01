@@ -273,7 +273,7 @@
     .foot { text-align: center; font-size: 0.8em; color: #adb5bd; padding: 20px; }
     .foot a { color: #868e96; }
     /* タグが1つで行の幅を超える (長いメモ・ロケが複数) ときは中で折り返す。はみ出すと「詳細▼」に重なる */
-    .tag { max-width: 100%; overflow-wrap: anywhere; }
+    .tag { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
     /* iPhone の Safari はアドレスバーの分だけ vh が実際より大きい。dvh が使えるならそちらで測る */
     .gate { max-height: 90dvh; }
     @media (max-width: 600px) {
@@ -281,7 +281,6 @@
       /* ⭐iPhone (2026-10-01 中原さん「画面が少しずれる」): 集計の1行が折り返さずにページ全体を横に広げていた。
          1行目 = 題名と作業者、2行目 = 集計 (折り返してよい) にする */
       .stat { white-space: normal; flex-basis: 100%; order: 3; line-height: 1.5; }
-      .tag { white-space: normal; }
       /* 伝票の見出し: 日付を2行目に回す (横に詰めると日付が縦につぶれる) */
       .slip-h { flex-wrap: wrap; gap: 4px 10px; padding: 10px 12px; }
       .slip-h .dates { order: 5; flex-basis: 100%; }
@@ -289,13 +288,13 @@
       .line { gap: 10px; padding: 10px; flex-wrap: wrap; }
       .line .thumb { flex-basis: 48px; width: 48px; height: 48px; }
       .line .body { flex: 1 1 0; }
-      .line .act { flex: 1 1 100%; flex-direction: row; flex-wrap: wrap; align-items: stretch; }
+      .line .act { flex: 1 1 100%; min-width: 0; flex-direction: row; flex-wrap: wrap; align-items: stretch; }
       .line .act > button { flex: 1 1 0; min-width: 0; }
-      .line .act > .pjob, .line .act > .sending { flex-basis: 100%; max-width: none; }
+      .line .act > .pjob, .line .act > .sending { flex: 1 1 100%; min-width: 0; max-width: none; overflow-wrap: anywhere; }
       .detail .big, .detail .big img, .detail .big .ph { flex-basis: 120px; width: 120px; height: 120px; }
       /* 確認ダイアログは iPhone だと縦に収まらない。[やめる][確認して登録] は下に貼りつけて常に見せる */
-      .gate .actions { position: sticky; bottom: -18px; background: #fff; margin: 14px -18px -18px; padding: 10px 18px 18px;
-        border-top: 1px solid #e9ecef; }
+      .gate .actions { position: sticky; bottom: -18px; background: #fff; margin: 14px -18px -18px;
+        padding: 10px 18px calc(18px + env(safe-area-inset-bottom)); border-top: 1px solid #e9ecef; z-index: 1; }
     }
   </style>
 </head>
