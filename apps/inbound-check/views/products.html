@@ -90,6 +90,12 @@
     .opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
     .opts button { padding: 14px 8px; border-radius: 10px; border: 1px solid #ced4da; background: #fff; font-size: 1em; }
     @media (max-width: 700px) { .line { flex-direction: column; } .act { flex-direction: row; flex-wrap: wrap; } }
+    /* ⭐iPhone (2026-10-01 中原さん): 入力欄の文字が16px未満だと、タップした瞬間に画面を拡大してずれる */
+    @media (max-width: 600px) {
+      .filters select, .filters input[type=search], .fld input, .fld select, .fld textarea, .modal .fld input, .modal .fld select { font-size: 16px; }
+      .filters input[type=search] { min-width: 0; }
+      .pjob { overflow-wrap: anywhere; }
+    }
   </style>
 </head>
 <body>

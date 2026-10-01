@@ -53,6 +53,19 @@
       th, td { padding: 8px 8px; }
       td.code { display: none; }
       th.code { display: none; }
+      /* ⭐iPhone (2026-10-01 中原さん): 表のままだと期限・行き先の列に押されて商品名が2〜3文字幅になり縦に伸びる。
+         1行 = 1枚のカード (1段目 商品名 / 2段目 数量・期限・行き先) にする */
+      .slip table, .slip tbody { display: block; }
+      .slip thead { display: none; }
+      .slip tbody tr { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; padding: 9px 10px; border-top: 1px solid #f1f3f5; }
+      .slip tbody td { display: block; padding: 0; border: 0; }
+      .slip tbody td:nth-child(2) { flex-basis: 100%; font-weight: 600; line-height: 1.45; }
+      .slip td.num { text-align: left; }
+      .slip td.num::before { content: '数量 '; color: #868e96; font-size: 0.85em; font-weight: 400; }
+      .slip td.exp:empty { display: none; }
+      .slip tbody td:last-child { margin-left: auto; }
+      /* 入力欄の文字が16px未満だと、iPhone はタップした瞬間に画面を拡大してずれる */
+      .top select { font-size: 16px; }
     }
     /* 紙に出すとき: 操作系を消して、表だけを詰めて出す */
     @media print {
