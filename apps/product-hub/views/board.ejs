@@ -138,7 +138,7 @@
      TOP は工程を廃止した (2026-08-31) ので、出品ゲートと同じ「枠1 (_top) が登録されているか」で見る */
   .kb-imgtracks { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
   .kb-krow { display: flex; align-items: center; gap: 5px; color: #64748b; }
-  .kb-krow .kb-kname { flex: 0 0 62px; font-weight: 700; color: #475569; }   /* 「トップ画像」が折り返さない幅 */
+  .kb-krow .kb-kname { flex: 0 0 74px; font-weight: 700; color: #475569; }   /* 「撮影指示書」(最長) が折り返さない幅 */
   .kb-state { flex: 0 0 auto; font-weight: 700; border-radius: 4px; padding: 1px 7px; border: 1px solid; }
   .kb-state.done { background: #dcfce7; color: #166534; border-color: #86efac; }
   .kb-state.todo { background: #fff7ed; color: #b45309; border-color: #fdba74; }
@@ -312,11 +312,18 @@
             : { state: 'todo', text: 'まだ', note: t.current ? t.current.label : '', stalledDays: t.stalledDays };
       const topDone = !!(c.image && c.image.top && c.image.top.registered);
       // 本番の構成 (2026-09-13 スタッフ要望)。縦列「仮構成」とは別の印なので、素材待ちなど
-      // 別の列にいても 済/まだ が読める。印が無くても ③素材待ちが済んでいれば 済 (composeStateOf)
+      // 別の列にいても 済/まだ が読める。印が無くても ④AI制作が済んでいれば 済 (composeStateOf)
       const cp = (c.image && c.image.compose) || null;
       const compose = !cp ? { state: 'off', text: '—' }
         : cp.excluded ? { state: 'off', text: '対象外' }
           : cp.done ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' };
+      // 撮影指示書 (2026-10-01 スタッフ要望)。「商品を発送していても指示書ができていない場合がある」
+      // ので、撮影・素材ステータス (商品が届いたか) とは別の行で 済/まだ を出す。
+      // 済 = 画像制作の「カメラ撮影指示URL」が入っている / 撮影不要の商品は作らないので対象外
+      const ci = (c.image && c.image.cameraInstruction) || null;
+      const camera = !ci ? { state: 'off', text: '—' }
+        : ci.registered ? { state: 'done', text: '済' }
+          : ci.notRequired ? { state: 'off', text: '対象外' } : { state: 'todo', text: 'まだ' };
       return [
         {
           name: 'トップ画像',
@@ -324,7 +331,14 @@
           ...(topDone ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' }),
         },
         { name: '詳細画像', title: '商品詳細画像 (LP)。楽天登録・A+登録まで来たら「済」', ...detail },
-        { name: '構成', title: '本番の構成ができたか (縦列「仮構成」とは別。詳細画面の画像制作で「構成を済にする」/ ③素材待ちが済んでいれば 済)', ...compose },
+        { name: '構成', title: '本番の構成ができたか (縦列「仮構成」とは別。詳細画面の画像制作で「構成を済にする」/ ④AI制作が済んで ⑤デザイン修正 に移れば 済)', ...compose },
+        {
+          name: '撮影指示書',
+          title: camera.state === 'done' ? '撮影指示書 (カメラ撮影指示URL) が入っています'
+            : camera.state === 'off' && ci ? '撮影不要の商品なので撮影指示書は作りません'
+              : '撮影指示書 (カメラ撮影指示URL) がまだ入っていません。商品を発送していても指示書ができていないことがあります',
+          ...camera,
+        },
       ];
     };
   %>

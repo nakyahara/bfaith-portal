@@ -1490,7 +1490,7 @@ router.post('/api/drafts/:id/compose', (req, res) => {
   if (typeof req.body?.done !== 'boolean') {
     return res.status(400).json({ ok: false, error: 'done は true / false で指定してください' });
   }
-  // 「まだ」も 'todo' として残す (NULL に戻すと ③素材待ちからの推定で 済 に戻ってしまう — Codex R1)
+  // 「まだ」も 'todo' として残す (NULL に戻すと ④AI制作からの推定で 済 に戻ってしまう — Codex R1)
   const status = req.body.done ? 'done' : 'todo';
   const db = getDB();
   const changed = db.transaction(() => {

@@ -639,14 +639,23 @@ export function imageMadeOf(summary) {
  * 縦列 ②仮構成 (imgd_compose) は撮影依頼のために AI が作る仮の構成で、本番の構成は
  * ③素材待ちの間に作ることも、追加素材なしでそのまま作ることもある → 列の位置では表せないので
  * 画像制作カードの「構成を済にする / まだに戻す」(draft_image_production.compose_status) で持つ。
- * 人がまだ決めていない (NULL) 商品は、③素材待ちが決着していれば「済」とみなす (④AI制作は構成 + 素材から作る)。
- * 既存の商品のカードが軒並み「まだ」になるのを避けるため。imageMadeOf と同じく並び順でなく image_stage で見る。
- * 人が決めた値 ('done' / 'todo') は推定より優先する (Codex R1: 推定だけだと、③が済んだ商品で
+ * 人がまだ決めていない (NULL) 商品は、④AI制作が決着していれば「済」とみなす
+ * (= カードが ⑤デザイン修正 に移った時点。既存の商品のカードが軒並み「まだ」になるのを避けるため)。
+ *
+ * 🚨 推定の境目は **③素材待ち ではなく ④AI制作** (2026-10-01 スタッフ要望)。
+ * 「AI制作」に入った時点で構成が決まっているとは限らない — AI で画像を生成したときに
+ * 構成が確定する商品と、既存商品を直して作る (文字を変えるだけで構成は元からある) 商品の
+ * 2 通りがあり、前者は AI制作 の最中にまだ構成ができていない。構成ができていないカードが
+ * 「済」で出ると、構成の残りを拾えなくなる。④が決着する = ⑤デザイン修正 へ移った
+ * = どちらの作り方でも構成は出来上がっている、ので境目をそこへ 1 列ずらす。
+ *
+ * imageMadeOf と同じく並び順でなく image_stage で見る。
+ * 人が決めた値 ('done' / 'todo') は推定より優先する (Codex R1: 推定だけだと、④が済んだ商品で
  * 「まだに戻す」を押しても 済 のまま戻せない)
  * @returns {{excluded: boolean, done: boolean, marked: boolean, implied: boolean}}
  *   marked = 人が決めた値 / implied = 推定で 済
  */
-export const COMPOSE_IMPLIED_STAGE = 'material';
+export const COMPOSE_IMPLIED_STAGE = 'ai';
 export function composeStateOf(summary, composeStatus) {
   if (!summary || summary.excluded) return { excluded: true, done: false, marked: false, implied: false };
   if (composeStatus === 'done' || composeStatus === 'todo') {
@@ -1097,7 +1106,8 @@ export function setStepState(
 /**
  * かんばんカードの D&D 移動 (2026-08-24 中原さん要望)。
  * 「落とした列がその商品のいまやる工程になる」ように工程をまとめて更新する:
- *   - 前方 (右) へ: 現在工程から移動先の手前までを順に done に (移動先は todo のまま = いまやる番)
+ *   - 前方 (右) へ: 現在工程から移動先の手前までを順に done に (移動先は todo のまま = いまやる番)。
+ *     通過するのは**まだ決着していない工程だけ** / 移動先がすでに決着していれば開き直す (2026-10-01)
  *   - 後方 (左) へ: 移動先の工程を todo に開け直す (間の done は触らない = currentOf が移動先を指す)
  *   - to='done' (完了列): 残りの工程を全部 done に。本流は listing の全モール決着チェックが効くので
  *     モール未決着なら失敗する (出品・展開はモール別ステータスが正、のルールを D&D でも維持)
@@ -1202,15 +1212,35 @@ export function moveBoardCard(
       setStepState(id, code, claim ? { assignee_id: actorStaffId, state } : { state }, actor,
         { isAdmin, actorStaffId, boardClaim: claim });
     };
+    const settled = (r) => r.state === 'done' || r.state === 'skip';
     if (tIdx > curIdx) {
       // NE登録を飛び越せないことはここでは見ない。通過する工程は 1 つずつ setStepState を通り、
       // そこで「仮コードのままでは閉じられない」が効く (同じ判断を 2 箇所に持つと、
       // 本コードが確定したあとも D&D だけ 400 になる — Codex R2 medium)
-      for (let i = curIdx; i < tIdx; i++) setWithClaim(rows[i].step_code, 'done');
-      // 移動先 (= いまやる番) も未割り当てなら移動者に付ける (Codex R1: ドラッグ = 「自分が次工程を持っていく」の意思表示。
-      // 付けないと次の操作でまた「自分が担当する」が要る)。完了列 (tIdx = rows.length) には移動先が無い
-      if (tIdx < rows.length && unassignedHuman(rows[tIdx].step_code)) {
-        setStepState(id, rows[tIdx].step_code, { assignee_id: actorStaffId }, actor, { isAdmin, actorStaffId, boardClaim: true });
+      // 🚨 通過するのは **まだ決着していない工程だけ**。すでに done / 対象外 の工程は触らない
+      //    (2026-10-01 スタッフ報告の一因): 「対象外」は人が決めた結果なので、上を通っただけで
+      //    done に書き換えてはいけない。とくに ⑧楽天登録 は出品の根拠なしに done にできないので、
+      //    対象外の ⑧ を通過しようとすると 400 で移動ごと失敗していた
+      for (let i = curIdx; i < tIdx; i++) {
+        if (settled(rows[i])) continue;
+        setWithClaim(rows[i].step_code, 'done');
+      }
+      // 完了列 (tIdx = rows.length) には移動先が無い
+      if (tIdx < rows.length) {
+        const target = rows[tIdx];
+        // 🚨 「落とした列がその商品のいまやる工程になる」のが D&D の約束。移動先がすでに決着して
+        //    いる (対象外 / done) ときは **開き直す** — でないと currentOf が移動先を飛ばして、
+        //    カードは落とした列ではなく**その先の列**に出る。
+        //    2026-10-01 スタッフ報告:「2個セットで楽天未登録なのに、楽天登録に落とすと
+        //    A+コンテンツまで飛ばされる」= 親の画像をそのまま使うセットは作成時に
+        //    画像の工程がまるごと「対象外」になる (applyImagePlanToTrack) ため、
+        //    ⑧楽天登録 が skip のまま残っていた
+        if (settled(target)) setWithClaim(target.step_code, 'todo');
+        // 移動先 (= いまやる番) も未割り当てなら移動者に付ける (Codex R1: ドラッグ = 「自分が次工程を持っていく」の意思表示。
+        // 付けないと次の操作でまた「自分が担当する」が要る)
+        else if (unassignedHuman(target.step_code)) {
+          setStepState(id, target.step_code, { assignee_id: actorStaffId }, actor, { isAdmin, actorStaffId, boardClaim: true });
+        }
       }
     } else {
       setWithClaim(rows[tIdx].step_code, 'todo');
@@ -1589,6 +1619,10 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       (SELECT hold_note FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_hold_note,
       (SELECT material_status FROM draft_image_production ip WHERE ip.draft_id = d.id) AS material_status,
       (SELECT canva_url FROM draft_image_production ip WHERE ip.draft_id = d.id) AS canva_url,
+      ${/* 撮影指示書 (カメラ撮影指示URL) が作られたか (2026-10-01 スタッフ要望。カードの「撮影指示書：まだ／済」)。
+            「商品を発送していても指示書ができていない」を拾うための印なので、
+            撮影・素材ステータスとは別に出す */''}
+      (SELECT CASE WHEN TRIM(COALESCE(camera_instruction_url, '')) = '' THEN 0 ELSE 1 END FROM draft_image_production ip WHERE ip.draft_id = d.id) AS has_camera_instruction,
       (SELECT compose_status FROM draft_image_production ip WHERE ip.draft_id = d.id) AS compose_status,
       (SELECT CASE WHEN TRIM(COALESCE(product_info_text, '')) = '' THEN 0 ELSE 1 END FROM draft_image_production ip WHERE ip.draft_id = d.id) AS has_product_info,
       (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
@@ -1730,6 +1764,13 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       },
     // 本番の構成 (2026-09-13)。どの列にいても カードで 済/まだ が読めるようにする
     compose: composeStateOf(p.imageDetail, d.compose_status),
+    // 撮影指示書 (2026-10-01 スタッフ要望)。「商品を発送していても指示書ができていない」ことが
+    // あるので、撮影・素材ステータスとは別に 済/まだ を出す。済 = カメラ撮影指示URL が入っている。
+    // 撮影不要の商品は作る必要が無いので「対象外」(まだ のまま残すと仕入れ商品が軒並み まだ になる)
+    cameraInstruction: {
+      registered: d.has_camera_instruction === 1,
+      notRequired: d.material_status === 'not_required',
+    },
   });
 
   // 既存ページへのバリエーション追加か (2026-09-25)。カードの札用。まとめて 1 回で引く

@@ -4905,7 +4905,9 @@ let wfSetParentId = null;
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(madeId);
 
       // 本番の構成の 済/まだ (2026-09-13 スタッフ要望)。縦列 ②仮構成 とは別の印で持ち、
-      // 印が無くても ③素材待ちが決着していれば 済 とみなす (既存カードを軒並み まだ にしない)
+      // 印が無くても ④AI制作が決着していれば 済 とみなす (= ⑤デザイン修正 に移った時点。
+      // 2026-10-01 スタッフ要望で ③素材待ち から 1 列ずらした — AI制作 の最中は
+      // まだ構成ができていない商品がある)
       {
         const cId = Number(db.prepare(
           "INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-COMPOSE', '構成 済 判定テスト', 'draft', 'smoke')"
@@ -4913,7 +4915,7 @@ let wfSetParentId = null;
         wfp.ensureProgress(db, cId);
         const composeOf = () => wfp.boardData(db, {}).columns.flatMap((c) => c.cards)
           .find((x) => x.id === cId)?.image?.compose;
-        check('ボード 構成: 印が無く ③素材待ち も終わっていなければ「まだ」', composeOf()?.done === false, JSON.stringify(composeOf()));
+        check('ボード 構成: 印が無く ④AI制作 も終わっていなければ「まだ」', composeOf()?.done === false, JSON.stringify(composeOf()));
         for (const code of ['imgd_request', 'imgd_compose']) wfp.setStepState(cId, code, { state: 'done' }, 'smoke', ADMIN);
         check('ボード 構成: ②仮構成 が終わっても、本番の構成の印が無ければ「まだ」',
           composeOf()?.done === false, JSON.stringify(composeOf()));
@@ -4922,11 +4924,17 @@ let wfSetParentId = null;
           composeOf()?.done === true && composeOf()?.marked === true && composeOf()?.implied === false, JSON.stringify(composeOf()));
         db.prepare('UPDATE draft_image_production SET compose_status = NULL WHERE draft_id = ?').run(cId);
         wfp.setStepState(cId, 'imgd_material', { state: 'done' }, 'smoke', ADMIN);
-        check('ボード 構成: 人が決めていなくても ③素材待ちが決着していれば「済」とみなす',
+        // 🚨 2026-10-01 スタッフ要望の本体: ③素材待ち が決着して ④AI制作 に居るだけでは「まだ」。
+        //    AI で画像を作った時点で構成が確定する商品があるので、ここで 済 にすると
+        //    構成ができていないカードが「済」で出る
+        check('ボード 構成: ③素材待ちが決着して ④AI制作 に居るだけでは「まだ」 (2026-10-01)',
+          composeOf()?.done === false && composeOf()?.implied === false && composeOf()?.marked === false, JSON.stringify(composeOf()));
+        wfp.setStepState(cId, 'imgd_ai', { state: 'done' }, 'smoke', ADMIN);
+        check('ボード 構成: 人が決めていなくても ④AI制作が決着 (= ⑤デザイン修正 に移った) なら「済」とみなす',
           composeOf()?.done === true && composeOf()?.implied === true && composeOf()?.marked === false, JSON.stringify(composeOf()));
         // Codex R1: 推定の 済 でも人が「まだ」にしたらそちらが勝つ (戻せないと誤操作を直せない)
         db.prepare("UPDATE draft_image_production SET compose_status = 'todo' WHERE draft_id = ?").run(cId);
-        check('ボード 構成: 人が「まだ」にしたら ③素材待ちが済んでいても「まだ」 (推定より人の値)',
+        check('ボード 構成: 人が「まだ」にしたら ④AI制作が済んでいても「まだ」 (推定より人の値)',
           composeOf()?.done === false && composeOf()?.marked === true && composeOf()?.implied === false, JSON.stringify(composeOf()));
         db.prepare('UPDATE draft_image_production SET compose_status = NULL WHERE draft_id = ?').run(cId);
         check('ボード 構成: 詳細画像が対象外なら 対象外 (済にしない)', (() => {
@@ -5485,6 +5493,47 @@ let wfSetParentId = null;
   } catch (e) { moveCas = e; }
   check('D&D の CAS: 掴んだ時点の工程と違えば 409', moveCas?.status === 409, moveCas?.message || '例外が出ていない');
 
+  // 🚨 落とした列が「いまやる番」になること (2026-10-01 スタッフ報告:「2個セットで楽天未登録なのに
+  //    『楽天登録』に移動しようとすると『A＋コンテンツ』まで飛ばされる」)。
+  //    原因 = 親の画像をそのまま使うセットは作成時に画像の工程がまるごと「対象外」になる
+  //    (applyImagePlanToTrack) ので、⑧楽天登録 が skip のまま残り、前方移動が移動先を飛ばしていた
+  {
+    const idSkip = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-SKIPTGT', '対象外の列へ落とす', 'smoke')
+    `).run().lastInsertRowid);
+    wfpEarly.ensureProgress(db, idSkip);
+    const st = (code) => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idSkip, code)?.state;
+    // セット作成と同じ形を作る: 詳細の画像工程をまるごと「対象外」にしてから ③素材待ちだけ開け直す
+    // (= 完了列のカードを人が ③ へ差し戻した状態)
+    for (const code of dbmod.DETAIL_V2_CODES) {
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, code);
+    }
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_material');
+    check('D&D 前提: ⑧楽天登録 が「対象外」で残り、いまの工程は ③素材待ち',
+      st('imgd_rakuten') === 'skip' && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_material');
+    wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_material' }, 'smoke', ADMIN2);
+    check('🚨 D&D: 対象外で残っていた ⑧楽天登録 に落とすと、そこが「いまやる番」になる (A+ へ飛ばない)',
+      st('imgd_rakuten') === 'todo'
+      && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+      `⑧=${st('imgd_rakuten')} / current=${wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code}`);
+    check('🚨 D&D: 通過した「対象外」の工程は done に書き換えない (⑤⑥⑦ は対象外のまま)',
+      st('imgd_design') === 'skip' && st('imgd_review_1') === 'skip'
+      && st('imgd_review_2') === 'skip' && st('imgd_amazon') === 'skip',
+      JSON.stringify(['imgd_design', 'imgd_review_1', 'imgd_review_2', 'imgd_amazon'].map(st)));
+    check('D&D: 通過したまだ決着していない工程は done になる (③素材待ち)', st('imgd_material') === 'done');
+    // 対象外の ⑧ を**跨いで** ⑨A+ に落とすのも通る (以前は ⑧ を done にしようとして 400 で丸ごと失敗)
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, 'imgd_rakuten');
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_amazon');
+    let overSkip = null;
+    try {
+      wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'aplus', expectedCurrent: 'imgd_amazon' }, 'smoke', ADMIN2);
+    } catch (e) { overSkip = e; }
+    check('🚨 D&D: 対象外の ⑧楽天登録 を跨いで ⑨A+ に落とせる (⑧ は対象外のまま・400 にならない)',
+      !overSkip && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'done' && st('imgd_aplus') === 'todo',
+      overSkip?.message || JSON.stringify(['imgd_rakuten', 'imgd_amazon', 'imgd_aplus'].map(st)));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSkip);
+  }
+
   // カードは 1 商品 1 枚 (2026-08-31 TOP工程の廃止。「制作件数がぱっと見で分かりにくい」の解消)
   const ib = wfpEarly.boardData(db, { view: 'image' });
   check('画像ビュー: カードは 1 商品 1 枚 (TOP/詳細で分かれない)',
@@ -5582,6 +5631,22 @@ let wfSetParentId = null;
     check('v2: 詳細カードに 撮影・素材 / 商品情報あり が乗る',
       cardV2 && cardV2.materialStatus === 'ready' && cardV2.materialLabel === '素材完了' && cardV2.hasProductInfo === true && cardV2.ownBrand === true,
       JSON.stringify(cardV2 && { m: cardV2.materialStatus, l: cardV2.materialLabel, i: cardV2.hasProductInfo }));
+    // 撮影指示書 (2026-10-01 スタッフ要望)。「商品を発送していても指示書ができていない」を拾う印なので、
+    // 撮影・素材ステータスとは別に持つ。撮影不要の商品だけ「対象外」
+    {
+      const ciOf = () => [...wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' }).columns.flatMap((c) => c.cards)]
+        .find((c) => c.id === idV2)?.image?.cameraInstruction;
+      check('撮影指示書: URL が無ければ まだ (素材完了で商品が届いていても まだ のまま)',
+        ciOf()?.registered === false && ciOf()?.notRequired === false, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { camera_instruction_url: 'https://docs.google.com/spreadsheets/d/x/edit' });
+      check('撮影指示書: カメラ撮影指示URL を入れると 済', ciOf()?.registered === true, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { camera_instruction_url: '   ' });
+      check('撮影指示書: 空白だけの URL は 済 にしない', ciOf()?.registered === false, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { material_status: 'not_required' });
+      check('撮影指示書: 撮影不要の商品は 対象外 (仕入れ商品が軒並み まだ にならない)',
+        ciOf()?.notRequired === true && ciOf()?.registered === false, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { material_status: 'ready' });
+    }
     // 楽天登録済みの既存商品には詳細 v2 も自動 done で入る
     const idV2Rk = Number(db.prepare(`
       INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('DRV-V2-RK', 'v2・登録済み', 'listed', 'smoke')
@@ -10127,6 +10192,10 @@ for (const [name, file, data] of renders) {
   check('ボード: カードの 構成 行に 済/まだ/対象外 のバッジが付く',
     rowsOk(rows.filter((r) => r.includes('>構成<'))),
     rows.filter((r) => r.includes('>構成<')).slice(0, 2).join(' | ') || '(構成の行が無い)');
+  // 撮影指示書 (2026-10-01 スタッフ要望)。トップ画像・詳細画像と同じ形で 済/まだ/対象外 を出す
+  check('ボード: カードの 撮影指示書 行に 済/まだ/対象外 のバッジが付く',
+    rowsOk(rows.filter((r) => r.includes('>撮影指示書<'))),
+    rows.filter((r) => r.includes('>撮影指示書<')).slice(0, 2).join(' | ') || '(撮影指示書の行が無い)');
   // まとめて移動 (2026-09-13 スタッフ要望)。カードごとに選択のチェックがあり、リンクの外に置く (押しても詳細へ飛ばない)
   check('ボード: カードにまとめて移動の選択チェックがあり、リンクの外にある',
     /<label class="kb-pick"[^>]*><input type="checkbox" class="kb-pick-box"[^>]*><\/label>\s*<a class="kb-card-link"/.test(bh));
@@ -10144,8 +10213,9 @@ for (const [name, file, data] of renders) {
     const bhDone = renderedHtml.get('board.ejs (完了列にカード)') || '';
     const doneCol = bhDone.split('data-col="done"')[1] || '';
     const doneRows = krowsOf(doneCol);
-    check('ボード: 完了列のカードにも トップ画像 / 詳細画像 の状況が出る',
-      rowsOk(doneRows.filter((r) => r.includes('>トップ画像<'))) && rowsOk(doneRows.filter((r) => r.includes('>詳細画像<'))),
+    check('ボード: 完了列のカードにも トップ画像 / 詳細画像 / 撮影指示書 の状況が出る',
+      rowsOk(doneRows.filter((r) => r.includes('>トップ画像<'))) && rowsOk(doneRows.filter((r) => r.includes('>詳細画像<')))
+      && rowsOk(doneRows.filter((r) => r.includes('>撮影指示書<'))),
       doneRows.slice(0, 2).join(' | ') || '(完了列に画像の行が無い)');
     // 完了列のカードにも楽天の状態と商品名を持たせる (2026-09-10 監査: 差し戻し時の出品確認が
     // 商品名なし・対象外でも出ていた)
