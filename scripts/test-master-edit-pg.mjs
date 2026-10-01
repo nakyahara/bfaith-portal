@@ -26,7 +26,7 @@
  *  15 夜間ロード × 保存 (仮レビュー M3): ロードが先 = 保存・昇格はマスタの書き込みの鍵で短く待って 409 nightly_load → ロードは最後まで /
  *     保存が先 = ロードは鍵で待ってから最後まで (行の鍵で待ち合わない = デッドロックしない)
  *  16 NE の観測の書き込み × 古い観測の昇格 (R3 M4): 昇格がセットの鍵を持っている間、新しい観測の書き込みは待つ (昇格の後に書かれる)
- *  17 画面のロールの直接の書き込み (R3 M2): begin_master_write の前は 42501・偽の core.actor_* は記録に残らない
+ *  17 画面のロールの直接の書き込み (R3 M2・R4 M2): begin_master_write の前は 42501・約束の相手でない SKU も 42501・偽の core.actor_* は記録に残らない
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-edit-pg.mjs
  *   (この PC では C:/tmp/pg-embed の run-conc.mjs が使い捨ての PostgreSQL を起動して TEST_PG_URL を渡す)
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロール master_* をクラスタに作る)。localhost 以外の URL は拒む (本番を渡さない)。
@@ -117,6 +117,9 @@ try {
     const st = await C.recordLegacyGateAck(dbGate.render, { host: 'render', instanceId: 'r-old', buildId: 'r1', manifest: MANIFEST, ownership: MASTER_OWNERSHIP, phaseSeen: 'legacy_open',
       stopped: true, stoppedReason: 'Render の古い instance を止めた (試験)' });
     assert.equal(st.stopped, true);
+    // 止まった記録は書きかけ 0 のときだけ (R4 High 1)
+    await assert.rejects(() => C.recordLegacyGateAck(dbGate.render, { host: 'render', instanceId: 'r-old', buildId: 'r1', manifest: MANIFEST, ownership: MASTER_OWNERSHIP, phaseSeen: 'legacy_open',
+      stopped: true, stoppedReason: 'x', inflightCount: 1, oldestInflightAt: new Date().toISOString() }), /書きかけ 0 のときだけ/);
     const r = await C.advanceCutoverPhase(dbP, { to: 'frozen', actor: 't@test', evidence: frozenEvidence });
     assert.deepEqual(r.acks.map((a) => [a.host, a.instance_id, a.stopped ?? false]), [['minipc', 'm-a', false], ['render', 'r-a', false], ['render', 'r-old', true]]);
     assert.deepEqual((await q("select session_role, stopped, stopped_reason from ops.master_legacy_gate_acks where instance_id = 'r-old' order by ack_id")).map((x) => [x.session_role, x.stopped, !!x.stopped_reason]),
@@ -463,6 +466,14 @@ try {
     try {
       await A.query("select set_config('core.actor_type', 'human', true), set_config('core.actor_id', 'forged@evil', true), set_config('core.source_system', 'portal_master_edit', true)");
       await assert.rejects(() => A.query("update core.skus set name = '偽' where code = 'p003'"), (e) => e.code === '42501' && /master_write_session_required/.test(e.message));
+    } finally { await A.query('rollback'); }
+    // 直接 begin した後でも、約束の相手 (p003) でない SKU は書けない (R4 M2)
+    const sid3 = (await q("select sku_id::text as id from core.skus where code = 'p003'"))[0].id;
+    const v3 = (await q('select ops.master_edit_versions($1::bigint) as v', [sid3]))[0].v;
+    await A.query('begin');
+    try {
+      await A.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb, $5, $6::bigint, $7, $8, $9::jsonb)', [crypto.randomUUID(), 'naka@test', null, JSON.stringify(ALL_COMPANY), 'sku_edit', sid3, 'b'.repeat(64), 'c'.repeat(64), JSON.stringify(v3)]);
+      await assert.rejects(() => A.query("update core.skus set name = '相手でない' where code = 'p004'"), (e) => e.code === '42501' && /master_write_target/.test(e.message));
     } finally { await A.query('rollback'); }
     await denied(A, "insert into ops.master_write_sessions (txid, request_id, actor_id, source_system, db_user, phase, owner_hash, ownership) values (txid_current(), gen_random_uuid(), 'x', 'portal_master_edit', 'x', 'new_open', repeat('a', 64), '{}')", 'edit: sessions に直接');
     assert.equal(Number((await q("select count(*)::int as n from events.master_change_events where actor_id = 'forged@evil'"))[0].n), 0);

@@ -5,7 +5,7 @@
  *
  * master_edit     (Render の apps/master-edit が env COMPANY_DB_MASTER_EDIT_URL で使う。無ければ画面は見るだけ):
  *   読む: 画面が読む表だけ (MASTER_EDIT_SELECT) / 書く: 保存の経路で書く表の列だけ (MASTER_EDIT_WRITE。insert も列を絞る)
- *   🚨 書けるのは同じ取引で ops.begin_master_write (実行だけ渡す) を呼んだ後だけ (DB の trigger。段階・持ち主表・誰が を DB で守る・#1563 R3 M2)
+ *   🚨 書けるのは同じ取引で ops.begin_master_write (実行だけ渡す) を呼んだ後・その約束の相手 (SKU・含むセット・商品)・操作の書き方だけ (DB の trigger。段階・持ち主表・版・誰が を DB で守る・#1563 R3 M2・R4 M2)
  *   🚨 渡さない: events.master_change_events の insert (記録は 0026 の関数 = security definer が書く = 偽れない)・core.skus.version・core.sku_components の書き込み・
  *      切替の段階・門の記録・NE の観測の書き込み。core.sku_costs の削除は渡すが、今日より前の行は DB の trigger が拒む (0050)
  *      core.suppliers の update (仕入先の行の共有の鍵は 0050 の関数 core.lock_suppliers_for_share = security definer の実行だけ)
@@ -68,7 +68,7 @@ export const OBSERVE_FUNCTION = 'ops.record_ne_set_observations(jsonb)';
 export const ACK_FUNCTION = 'ops.record_legacy_gate_ack(text, text, text, jsonb, text, text, integer, timestamptz, boolean, text)';
 export const LOCK_SUPPLIERS_FUNCTION = 'core.lock_suppliers_for_share(bigint[])';
 /** 画面の保存を始める (段階・持ち主表を DB で確かめて、取引の行を書く。これの後でないと画面のロールは書けない・#1563 R3 M2) */
-export const BEGIN_WRITE_FUNCTION = 'ops.begin_master_write(uuid, text, text, jsonb)';
+export const BEGIN_WRITE_FUNCTION = 'ops.begin_master_write(uuid, text, text, jsonb, text, bigint, text, text, jsonb)';
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;

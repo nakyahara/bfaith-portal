@@ -153,8 +153,13 @@ await ta('[!] 0050 (14 §6 ⑤-1・#1563 R1・R2): 切替の段階は legacy_ope
   assert.equal((await q('select count(*)::int as n from ops.master_cutover_prereq_checks'))[0].n, 0);
   const guards = await q("select c.relnamespace::regnamespace::text || '.' || c.relname as t from pg_trigger g join pg_class c on c.oid = g.tgrelid where g.tgname = 'trg_master_edit_guard' order by 1");
   assert.deepEqual(guards.map((r) => r.t), ['core.products', 'core.sku_costs', 'core.skus', 'core.supplier_skus', 'ops.master_edit_requests', 'ops.sku_component_breaches', 'ops.sku_component_requests']);
-  const be = (await q("select p.prosecdef, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p where p.oid = 'ops.begin_master_write(uuid, text, text, jsonb)'::regprocedure"))[0];
+  const be = (await q("select p.prosecdef, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p where p.oid = 'ops.begin_master_write(uuid, text, text, jsonb, text, bigint, text, text, jsonb)'::regprocedure"))[0];
   assert.deepEqual([be.prosecdef, be.pub], [true, false]);
+  // #1563 R4: 止まった記録は書きかけ 0 (CHECK)・前提の表は追記だけ・約束の表に相手と操作
+  assert.equal((await q("select count(*)::int as n from pg_constraint where conname = 'ck_mlga_stopped_drained'"))[0].n, 1);
+  assert.deepEqual((await q("select tgname as t from pg_trigger where tgrelid = 'ops.master_cutover_prereq_checks'::regclass and not tgisinternal order by 1")).map((r) => r.t), ['trg_append_only_row', 'trg_append_only_stmt', 'trg_master_cutover_prereq_checks_guard']);
+  assert.deepEqual((await q("select column_name as c from information_schema.columns where table_schema = 'ops' and table_name = 'master_write_sessions' and column_name in ('operation', 'sku_id', 'target_sku_ids', 'target_product_ids', 'edit_token', 'payload_hash', 'versions') order by 1")).map((r) => r.c),
+    ['edit_token', 'operation', 'payload_hash', 'sku_id', 'target_product_ids', 'target_sku_ids', 'versions']);
   const ackCols = await q("select column_name as c from information_schema.columns where table_schema = 'ops' and table_name = 'master_legacy_gate_acks' and column_name in ('session_role', 'stopped', 'stopped_reason') order by 1");
   assert.deepEqual(ackCols.map((r) => r.c), ['session_role', 'stopped', 'stopped_reason']);
   assert.match(fn[0].d, /tg_op = 'UPDATE' and new\.sku_id = old\.sku_id/);

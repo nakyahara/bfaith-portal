@@ -216,6 +216,20 @@ async function observeRaw(setCode, rows, at, { E = E0, recordedAgo = '0 seconds'
   return (await E.db.query(`insert into ops.ne_set_observations (run_id, set_sku_id, rows) select $1, sku_id, $3::jsonb from core.skus where code = $2 returning observation_id::text as id`, [runId, setCode, JSON.stringify(resolved)])).rows[0].id;
 }
 const promote = (id, opts = {}) => W.promoteComponentRequest(opts.E ? opts.E.db : db, id, { ownership: ALL_COMPANY, now: NOW, ...opts });
+/** ops.begin_master_write の引数 (直す SKU・版は DB の今の値 か versions)。#1563 R4 M2 */
+const BEGIN_SQL = 'select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb, $5, $6::bigint, $7, $8, $9::jsonb)';
+async function beginArgs(E, code, { requestId = uuid(), actor = 'naka@test', reason = null, ownership = ALL_COMPANY, operation = 'sku_edit', token = 'b'.repeat(64), payloadHash = 'c'.repeat(64), versions } = {}) {
+  const sid = (await E.db.query('select sku_id::text as id from core.skus where code = $1', [code])).rows[0].id;
+  const v = versions ?? (await E.db.query('select ops.master_edit_versions($1::bigint) as v', [sid])).rows[0].v;
+  return [requestId, actor, reason, JSON.stringify(ownership), operation, sid, token, payloadHash, JSON.stringify(v)];
+}
+/** 画面のロールの取引の中で動かして、必ず巻き戻す */
+async function asEditorTx(E, fn) {
+  await E.pg.query('set role master_edit');
+  await E.pg.query('begin');
+  try { return await fn(); } finally { await E.pg.query('rollback'); await E.pg.query('set role deploy'); }
+}
+const errOf = (p) => p.then(() => null, (e) => e);
 
 
 console.log('切替の段階と門');
@@ -237,6 +251,10 @@ await ta('[1] 門の記録の関数: 時刻はサーバー・見た段階が今�
   // 止まった記録は理由が要る・止まっていない記録に理由は付けない
   await assert.rejects(() => asGate(E0, 'render', () => ack('render', { stopped: true })), /stopped_reason/);
   await assert.rejects(() => asGate(E0, 'render', () => ack('render', { stoppedReason: '止めた' })), /止まった記録でない/);
+  // 止まった記録は書きかけ 0 のときだけ (関数も表の CHECK も・#1563 R4 High 1)
+  await assert.rejects(() => asGate(E0, 'render', () => ack('render', { stopped: true, stoppedReason: '止めた', inflightCount: 1, oldestInflightAt: new Date().toISOString() })), /書きかけ 0 のときだけ/);
+  await assert.rejects(() => pg.query(`insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, oldest_inflight_at, session_role, stopped, stopped_reason)
+    select 'render', 'x', 'b', manifest_hash, repeat('a', 64), 'legacy_open', 1, now(), 'master_gate_render', true, '止めた' from ops.master_legacy_manifests limit 1`), /ck_mlga_stopped_drained/);
   await gateAck(E0, 'minipc', 'm-a', 'm1', MASTER_OWNERSHIP, 'legacy_open');
   assert.equal(Number((await q('select count(*)::int as n from ops.master_legacy_manifests'))[0].n), 1);
   assert.deepEqual((await q('select host, session_role, stopped from ops.master_legacy_gate_acks order by ack_id')).map((x) => [x.host, x.session_role, x.stopped]),
@@ -282,6 +300,8 @@ await ta('[1] legacy_open → frozen の門: 証拠の形・manifest・手の入
   await refuse(ev, /持ち主表のハッシュが違う/, [rawAck('minipc', 'm-z', 'm1', { owner: 'f'.repeat(64) })]);
   await refuse(ev, /見た段階が frozen/, [rawAck('minipc', 'm-z', 'm1', { phase: 'frozen' })]);
   await refuse(ev, /minipc\/m-z: 書きかけが 2 件/, [rawAck('minipc', 'm-z', 'm1', { inflight: 2 })]);   // → frozen も書きかけ 0 (#1563 R3 High 1)
+  // 前からある食い違った行 (止まった・書きかけ 1。CHECK の前に入った行のつもりで CHECK を外して入れる) も、止まったプロセスを外す前に書きかけを見て拒む (#1563 R4 High 1)
+  await refuse(ev, /render\/r-z: 書きかけが 1 件/, [['alter table ops.master_legacy_gate_acks drop constraint ck_mlga_stopped_drained', []], rawAck('render', 'r-z', 'r1', { stopped: true, inflight: 1 })]);
   // 黙っているプロセス (今までに記録があり、最後の記録が 15 分より前・止まった記録なし) = 拒む。止まった記録が最後なら外す (#1563 仮レビュー Low 3)。年齢では外さない (R3 High 1)
   await refuse(ev, /render\/r-z: 黙っている/, [rawAck('render', 'r-z', 'r1', { ago: '1 hour' })]);
   await refuse(ev, /minipc\/m-z: 黙っている/, [rawAck('minipc', 'm-z', 'm1', { ago: '20 minutes' }), rawAck('minipc', 'm-z', 'm1', { ago: '30 minutes', stopped: true })]);   // 止まった後にまた動いて黙った
@@ -323,6 +343,18 @@ await ta('[1] legacy_open → frozen の門: 証拠の形・manifest・手の入
     assert.equal(await pgCode(asRole(E0, role, () => pg.query("insert into ops.master_cutover_prereq_checks (name, fn) values ('t_x', 'ops.master_cutover_ack_fresh_minutes()')"))), '42501', role);
   }
   assert.deepEqual((await q('select ops.master_cutover_prereq_problems($1, $2) as p', ['legacy_open', 'frozen']))[0].p, []);   // 巻き戻した = 何も足されていない
+  // 前提の表は追記だけ (変える・消す・truncate = 拒む。前の項目を消さない・#1563 R4 Low 3)。関数の中身を変えるのは create or replace
+  await pg.query('begin');
+  try {
+    await pg.query(prereqFn('t_prereq_c', 'return array[]::text[];')[0]);
+    await pg.query("insert into ops.master_cutover_prereq_checks (name, fn) values ('t_c', 'ops.t_prereq_c(text, text)')");
+    for (const sql of ["update ops.master_cutover_prereq_checks set name = 't_d'", "update ops.master_cutover_prereq_checks set fn = 'ops.t_prereq_c(text, text)'",
+      'delete from ops.master_cutover_prereq_checks', 'truncate ops.master_cutover_prereq_checks']) {
+      await pg.query('savepoint s');
+      await assert.rejects(() => pg.query(sql), /append-only/, sql);
+      await pg.query('rollback to savepoint s');
+    }
+  } finally { await pg.query('rollback'); }
   assert.equal((await C.readCutoverPhase(db)).phase, 'legacy_open');
   // 飛ばす・戻す・知らない段階・直接の UPDATE / DELETE・読めない = 閉じている
   await assert.rejects(() => pg.query('select ops.set_master_cutover_phase($1, $2, $3::jsonb)', ['company_owner', 'naka@test', JSON.stringify(ev)]), /one_way/);
@@ -384,8 +416,8 @@ await ta('[2] 場所が足りない・古い記録だけ = 拒む → そろえ�
   await assert.rejects(() => advance(E0, 'company_owner', { ...ev2, owner_hash: 'x' }), /owner_hash/);
   await advance(E0, 'company_owner', ev2);
   // DB でも段階を見る (#1563 R3 M2): 持ち主表が段階の記録と同じでも、new_open の前は画面のロールの書き込みを始められない
-  await assert.rejects(() => asEditor(E0, () => pg.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb)', [uuid(), 'naka@test', null, JSON.stringify(ALL_COMPANY)])),
-    /before_cutover: 切替の段階が company_owner/);
+  const argsCo = await beginArgs(E0, 's001');
+  await assert.rejects(() => asEditor(E0, () => pg.query(BEGIN_SQL, argsCo)), /before_cutover: 切替の段階が company_owner/);
   await gateAck(E0, 'render', 'r-a', 'r1', ALL_COMPANY, 'company_owner'); await gateAck(E0, 'minipc', 'm-a', 'm1', ALL_COMPANY, 'company_owner');
   await assert.rejects(() => advance(E0, 'new_open', { ...ev2, owner_hash: 'a'.repeat(64) }), /company_owner のときと違う/);
   await advance(E0, 'new_open', ev2);
@@ -1066,12 +1098,11 @@ await ta('[14] master_edit = 画面の読み書きだけ (記録の偽造・過�
   assert.equal(await as('master_edit', "delete from core.sku_costs where valid_from = '2026-01-01'"), '42501');
   assert.equal(await as('master_edit', "update core.sku_costs set valid_to = '2026-02-28' where valid_from = '2026-01-01'"), '42501');
   assert.equal(await as('master_edit', "insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from) select 1, sku_id, 11, 'manual', 'COMPLETE', '2026-01-10' from core.skus where code = 's006'"), '42501');   // 始めていない = 書けない (R3 M2)
-  await pg.query('set role master_edit');
-  await pg.query('begin');
-  try {
-    await pg.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb)', [uuid(), 'naka@test', '重なりの試験', JSON.stringify(ALL_COMPANY)]);
+  const args6 = await beginArgs(E0, 's006', { reason: '重なりの試験' });
+  await asEditorTx(E0, async () => {
+    await pg.query(BEGIN_SQL, args6);
     assert.equal(await pgCode(pg.query("insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from) select 1, sku_id, 11, 'manual', 'COMPLETE', '2026-01-10' from core.skus where code = 's006'")), '23P01');   // 始めた後でも、画面のロールは source を偽っても重なりを拒む
-  } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
+  });
   await pg.query("delete from core.sku_costs where valid_from = '2026-01-01'");
   // master_observer / master_gate: それぞれの関数だけ
   assert.equal(await as('master_observer', 'select 1 from core.skus limit 1'), '42501');
@@ -1119,7 +1150,7 @@ await ta('[14] master_edit = 画面の読み書きだけ (記録の偽造・過�
   assert.ok(Number((await q("select count(*)::int as n from events.master_change_events where db_user = 'master_edit'"))[0].n) > 10);
 });
 
-await ta('[14b] 画面のロールは DB でも守る (#1563 R3 M2): 始める前の直接の書き込み・偽の core.actor_* = 42501 / 始めた後の記録の誰が = begin_master_write の人 (偽の設定を使わない)・持ち主が load の列は 42501', async () => {
+await ta('[14b] 画面のロールは DB でも守る (#1563 R3 M2・R4 M2): 始める前の書き込み・偽の core.actor_* = 42501 / 約束の相手でない行・操作・古い版・違う保存の記録 = 拒む / 保存の流れの記録の誰が = 約束の人・持ち主が load の列は 42501', async () => {
   // 持ち主表のハッシュは JS と DB で同じ (段階の記録と比べる)
   for (const own of [MASTER_OWNERSHIP, ALL_COMPANY, withOwn({ 'skus.name': 'company' })]) {
     assert.equal((await q('select ops.ownership_hash($1::jsonb) as h', [JSON.stringify(own)]))[0].h, C.ownershipHash(own));
@@ -1143,44 +1174,76 @@ await ta('[14b] 画面のロールは DB でも守る (#1563 R3 M2): 始める�
     if (!/master_write_sessions/.test(sql)) assert.match(err.message, /master_write_session_required/, sql);
   }
   assert.equal(await nEvents(), before);
-  // 始めた後: 記録の誰が・request_id・理由は begin_master_write の値 (偽の設定は無視)
+  // 約束は 直す SKU・操作・版・保存の中身 に結びつく (#1563 R4 M2): 直接 begin した後でも、約束の相手でない SKU・商品・原価 = 42501
+  const a4 = await beginArgs(E0, 's004');
+  for (const sql of ["update core.skus set name = '相手でない' where code = 's005'",
+    "update core.products set name = '相手でない' where product_id = (select product_id from core.skus where code = 's005')",
+    "insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from, reason, created_by_type, created_by_id) select 1, sku_id, 1, 'manual', 'COMPLETE', '2031-01-01', 'x', 'human', 'x' from core.skus where code = 's005'",
+    "update core.supplier_skus set is_primary = is_primary where sku_id = (select sku_id from core.skus where code = 's001')"]) {
+    const e = await asEditorTx(E0, async () => { await pg.query(BEGIN_SQL, a4); return errOf(pg.query(sql)); });
+    assert.equal(e?.code, '42501', sql); assert.match(e.message, /master_write_target/, sql);
+  }
+  // 約束の操作で書けない (表・書き方) = 42501。⑤-1 の画面のロールには skus の insert の権限が無い = 試験の取引の中だけ渡して、trigger が拒むことを見る
+  const eOp = await (async () => {
+    await pg.query('begin');
+    try {
+      await pg.query('grant insert on core.skus to master_edit');
+      await pg.query('set role master_edit');
+      await pg.query(BEGIN_SQL, a4);
+      return await errOf(pg.query("insert into core.skus (company_id, sku_kind, code, name) values (1, 'single', 'zz-op', 'x')"));
+    } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
+  })();
+  assert.equal(eOp?.code, '42501'); assert.match(eOp.message, /master_write_operation/);
+  assert.deepEqual((await q("select ops.master_write_allowed('sku_edit', 'core.skus', 'UPDATE') as u, ops.master_write_allowed('sku_edit', 'core.skus', 'INSERT') as i, ops.master_write_allowed('sku_edit', 'core.sku_costs', 'DELETE') as d, ops.master_write_allowed('sku_register', 'core.skus', 'UPDATE') as x"))[0],
+    { u: true, i: false, d: true, x: false });
+  // 知らない操作・同じ取引で 2 回 = 始められない
+  assert.match(String((await asEditorTx(E0, async () => errOf(pg.query(BEGIN_SQL, await beginArgs(E0, 's004', { operation: 'sku_register' })))))?.message), /知らない操作/);
+  assert.equal((await asEditorTx(E0, async () => { await pg.query(BEGIN_SQL, a4); return errOf(pg.query(BEGIN_SQL, a4)); }))?.code, '55000');
+  // 保存の記録 (done) が約束と違う (保存の中身のハッシュ・SKU) = 42501
+  for (const [hash, code] of [[`'d'`, 's004'], [`'c'`, 's005']]) {
+    const e = await asEditorTx(E0, async () => {
+      await pg.query(BEGIN_SQL, a4);
+      return errOf(pg.query(`insert into ops.master_edit_requests (request_id, company_id, operation, target_code, sku_id, actor_id, payload_hash, status, result, started_at)
+        select $1::uuid, 1, 'sku_edit', code, sku_id, 'naka@test', repeat(${hash}, 64), 'done', '{}', now() from core.skus where code = $2`, [a4[0], code]));
+    });
+    assert.equal(e?.code, '42501', code); assert.match(e.message, /master_write_session_mismatch/);
+  }
+  // 古い版 (画面が読んだ後に夜間の処理などが変えた) = 始められない (編集の印を DB でも確かめる)
+  const stale = await beginArgs(E0, 's004');
+  await pg.query("update core.skus set reorder_months = reorder_months + 1 where code = 's004'");   // 持ち主のロール = 版が上がる
+  try {
+    assert.match(String((await asEditorTx(E0, () => errOf(pg.query(BEGIN_SQL, stale))))?.message), /^version_conflict/);
+  } finally { await pg.query("update core.skus set reorder_months = reorder_months - 1 where code = 's004'"); }
+  // DB の版と JS の版 (editVersionsOf) は同じ形 (単品・セット・依頼のあるセット)
+  for (const code of ['s001', 's004', 'set001', 'set004', 'set006']) {
+    const sid = await skuId(code);
+    assert.deepEqual((await q('select ops.master_edit_versions($1::bigint) as v', [sid]))[0].v, W.editVersionsOf(await cur(code)), code);
+  }
+  // 保存の流れ (画面のロール) で、約束の後に偽の core.actor_* を付けても、記録の誰が・request_id・理由は約束の値
   const id = uuid();
-  await pg.query('set role master_edit');
-  await pg.query('begin');
-  try {
-    await pg.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb)', [id, 'naka@test', '始めた後', JSON.stringify(ALL_COMPANY)]);
-    await pg.query(forge);
-    await pg.query("update core.skus set name = '始めた後の直し' where code = 's004'");
-    assert.equal(await pgCode(pg.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb)', [uuid(), 'x@test', null, JSON.stringify(ALL_COMPANY)])), '55000');   // 同じ取引で 2 回は始めない
-  } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
-  await pg.query('set role master_edit');
-  await pg.query('begin');
-  try {
-    await pg.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb)', [id, 'naka@test', '始めた後', JSON.stringify(ALL_COMPANY)]);
-    await pg.query(forge);
-    await pg.query("update core.skus set name = '始めた後の直し' where code = 's004'");
-    await pg.query('commit');
-  } catch (e) { await pg.query('rollback'); throw e; } finally { await pg.query('set role deploy'); }
-  const ev = await q("select actor_type, actor_id, source_system, request_id, reason_text, db_user from events.master_change_events where entity_type = 'sku' and attribute = 'name' order by event_id desc limit 1");
-  assert.deepEqual(ev[0], { actor_type: 'human', actor_id: 'naka@test', source_system: 'portal_master_edit', request_id: id, reason_text: '始めた後', db_user: 'master_edit' });
+  const token4 = await tokenOf('s004');
+  const forgeDb = { query: async (t, p) => { const r = await db.query(t, p); if (/ops\.begin_master_write/.test(t)) await db.query(forge); return r; }, exec: (t) => db.exec(t) };
+  const r = await asEditor(E0, () => W.saveSku(forgeDb, { actor: 'naka@test', requestId: id, code: 's004', reason: '保存の流れ', seen: { token: token4, event_id: null }, values: { name: '保存の流れの直し' } },
+    { ownership: ALL_COMPANY, open: true, now: NOW }));
+  assert.equal(r.ok, true);
+  const ev = await q("select actor_type, actor_id, source_system, request_id, reason_text, db_user from events.master_change_events where entity_type = 'sku' and attribute = 'name' and request_id = $1", [id]);
+  assert.deepEqual(ev, [{ actor_type: 'human', actor_id: 'naka@test', source_system: 'portal_master_edit', request_id: id, reason_text: '保存の流れ', db_user: 'master_edit' }]);
   assert.equal(Number((await q("select count(*)::int as n from events.master_change_events where actor_id = 'forged@evil' or request_id = 'forged'"))[0].n), 0);
-  // 持ち主表が段階の記録と違う・持ち主が load の列 = 拒む
-  await pg.query('set role master_edit');
-  try {
-    assert.equal(await pgCode(pg.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb)', [uuid(), 'naka@test', null, JSON.stringify(MASTER_OWNERSHIP)])), 'P0001');
-  } finally { await pg.query('set role deploy'); }
-  // 持ち主が load の列: 段階の記録を load 入りの表にした別の DB で
+  const sess = (await q('select operation, sku_id::text as sku_id, payload_hash, edit_token from ops.master_write_sessions where request_id = $1', [id]))[0];
+  assert.deepEqual([sess.operation, sess.sku_id, sess.edit_token], ['sku_edit', await skuId('s004'), token4]);
+  assert.equal(sess.payload_hash, (await q('select payload_hash from ops.master_edit_requests where request_id = $1', [id]))[0].payload_hash);
+  // 持ち主表が段階の記録と違う = 始められない
+  assert.equal((await asEditorTx(E0, async () => errOf(pg.query(BEGIN_SQL, await beginArgs(E0, 's004', { ownership: MASTER_OWNERSHIP })))))?.code, 'P0001');
+  // 持ち主が load の列: 段階の記録を load 入りの表にした別の DB で (名前 = company は保存の流れで通る・税率 = load は直接でも拒む)
   const own = withOwn({ 'skus.name': 'company', 'products.name': 'company' });
   const E4 = await setupDb();
   try {
     await openCutover(E4, own);
-    await E4.pg.query('set role master_edit');
-    await E4.pg.query('begin');
-    try {
-      await E4.pg.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb)', [uuid(), 'naka@test', null, JSON.stringify(own)]);
-      await E4.pg.query("update core.skus set name = '名前は company' where code = 's004'");   // 通る
-      assert.equal(await pgCode(E4.pg.query("update core.skus set tax_rate = 0.08 where code = 's004'")), '42501');   // skus.tax_rate は load
-    } finally { await E4.pg.query('rollback'); await E4.pg.query('set role deploy'); }
+    const ok4 = await save('s004', { name: '名前は company' }, { E: E4, ownership: own, token: await tokenIn2(E4, 's004') });
+    assert.equal(ok4.ok, true);
+    const argsE4 = await beginArgs(E4, 's004', { ownership: own });
+    const e = await asEditorTx(E4, async () => { await E4.pg.query(BEGIN_SQL, argsE4); return errOf(E4.pg.query("update core.skus set tax_rate = 0.08 where code = 's004'")); });
+    assert.equal(e?.code, '42501'); assert.match(e.message, /owner_not_company: skus.tax_rate/);
   } finally { await E4.pg.close(); }
 });
 
