@@ -48,7 +48,8 @@ export const MASTER_OWNERSHIP = Object.freeze({
   // 行ごと
   'sku_costs': 'load',                // 原価 (有効期間の付け替え)。'company' なら夜間ロードは原価の行を作らない・閉じない
   'sku_components': 'load',           // セット構成。'company' なら夜間ロードは構成を足さない・直さない・消さない (manual は今も守られる)
-  'listing_components.amazon': 'load',// Amazon SKU ↔ NE コード (FBA のマップ。D-43)。'company' なら Amazon の出品の構成に触らない (出品そのもの・ASIN・FNSKU は続ける)
+  'listing_components.amazon': 'load',// Amazon SKU ↔ NE コード (FBA のマップ。D-43)。'company' なら SKU マスタ・Sheet の構成は材料にしない (FBM の完全一致は対応の無い出品にだけ続ける・
+                                      //   出品そのもの・ASIN・FNSKU は続ける)。対応 (core.amazon_sku_maps・0053) がある出品は持ち主によらず触らない (16 §7 M10・⑦-1)
   // 仕入先 (core.suppliers)
   'suppliers.name': 'load',
   'suppliers.order_method': 'load',

@@ -15,6 +15,9 @@
  *   (ops.sku_registration_problem = 遅らせた trigger が呼び手の権限で呼ぶ)・知らせを借りる / 結果を書く関数 (ops.claim_card_events / finish_card_event) の実行。
  *   🚨 渡さない: core.products / core.skus の insert・知らせの insert (登録の関数だけが書く)・ops.create_sku_registration の実行 (登録の関数の中だけ)・
  *      登録の状態・履歴・backfill の印の表の書き込み (関数だけ)・知らせの状態 / 結果 / 借りの列の update (関数だけ・仮レビュー L7)
+ *   ⑦-1 (0053・Amazon SKU の対応): 保存と削除の関数 (ops.save_amazon_sku_map / ops.delete_amazon_sku_map = 出品・対応・構成・保存の記録 done を関数の中で)・
+ *   「未登録」の一覧と売上の公開のそろいの関数 (注文の表は読ませない) の実行と、対応の表・ASIN (catalog_items) を読むだけ。
+ *   🚨 渡さない: core.amazon_sku_maps / core.listings / core.listing_components の書き込み (DELETE も = 墓標は消さない)・関数の中の部品 (ops.amazon_map_begin ほか)
  * master_ops      (手の操作 scripts/company-db/master-cutover.mjs が env COMPANY_DB_MASTER_OPS_URL で使う): ops.set_master_cutover_phase の実行と、段階・記録を読むだけ。
  *   ⑤-2a: 切替の日の backfill (ops.registration_backfill_plan / backfill_sku_registrations) と、登録をやめる (ops.transition_sku_registration) の実行・登録の状態を読む
  * master_observer (⑤-2 の夜間ロードが NE のセットの構成の観測を書く env COMPANY_DB_MASTER_OBSERVER_URL): ops.record_ne_set_observations の実行だけ
@@ -30,7 +33,7 @@
  *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs --dry-run   # 流す文だけ見る
  *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs             # 作る / 権限をそろえる (新しいロールのパスワードだけ、この画面に出る)
  *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs --rotate-password master_gate_render   # そのロールのパスワードだけ変える (何回でも付けられる)
- * 🚨 0052 まで migration を流した後に。migration で表を足したら流し直す (権限は表ごとに付ける)
+ * 🚨 0053 まで migration を流した後に。migration で表を足したら流し直す (権限は表ごとに付ける)
  */
 import crypto from 'node:crypto';
 import { openPgClient } from './migrate.mjs';
@@ -60,6 +63,8 @@ export const MASTER_EDIT_SELECT = [
   'ops.ne_csv_exports', 'ops.ne_csv_export_rows', 'ops.master_decision_candidates', 'ops.master_decision_observations', 'ops.master_compare_runs',
   // ⑤-2a (0052): 登録の状態 (画面に出す)・backfill の印 (新商品の登録の前提)・カードの知らせ (読むだけ)
   'ops.master_registrations', 'ops.master_registration_backfill', 'ops.product_hub_outbox',
+  // ⑦-1 (0053): Amazon SKU の対応 (読むだけ)・ASIN
+  'core.amazon_sku_maps', 'core.catalog_items',
 ];
 /** 保存の経路で書く表・列 (lib/master-write.mjs の saveSku)。insert も列を絞る */
 export const MASTER_EDIT_WRITE = [
@@ -82,6 +87,12 @@ export const REGISTER_OPS_FUNCTIONS = Object.freeze(['ops.registration_backfill_
 export const REGISTER_OPS_SELECT = Object.freeze(['ops.master_registrations', 'ops.master_registration_events', 'ops.master_registration_backfill']);
 /** ⑤-2a (0052): だれにも渡さない (夜間ロード = 持ち主だけ・状態の行は登録の関数の中だけ) */
 export const REGISTER_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.quarantine_unregistered_skus(text)', 'ops.create_sku_registration(bigint, text, text, text)']);
+/** ⑦-1 (0053): 画面のロールが実行する関数 (Amazon SKU の対応の保存・削除・未登録の一覧・売上の公開のそろい) */
+export const AMAZON_MAP_EDIT_FUNCTIONS = Object.freeze(['ops.save_amazon_sku_map(uuid, text, text, jsonb, text, jsonb)', 'ops.delete_amazon_sku_map(uuid, text, text, jsonb, text, jsonb)',
+  'ops.amazon_map_unmapped_recent(date, integer)', 'ops.amazon_map_sales_coverage(date, integer)']);
+/** ⑦-1 (0053): だれにも渡さない (保存の関数の中の部品・不変条件・守り) */
+export const AMAZON_MAP_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.amazon_map_begin(text, uuid, text, text, jsonb, text, jsonb)', 'ops.amazon_map_components(jsonb)',
+  'core.amazon_map_problem(bigint)', 'core.check_amazon_map_invariant()', 'core.guard_amazon_map_writer()', 'ops.guard_amazon_map_write()', 'ops.guard_master_edit_request_listing()']);
 export const CUTOVER_FUNCTION = 'ops.set_master_cutover_phase(text, text, jsonb, text)';
 export const OBSERVE_FUNCTION = 'ops.record_ne_set_observations(jsonb)';
 export const ACK_FUNCTION = 'ops.record_legacy_gate_ack(text, text, text, jsonb, text, text, integer, timestamptz, boolean, text)';
@@ -121,7 +132,8 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
     'ops.master_write_sessions', 'ops.master_cutover_prereq_checks', ...REGISTER_OPS_SELECT])) {
     s.push(`revoke all on ${t} from ${all}`);
   }
-  for (const f of [CUTOVER_FUNCTION, OBSERVE_FUNCTION, ACK_FUNCTION, LOCK_SUPPLIERS_FUNCTION, BEGIN_WRITE_FUNCTION, ...REGISTER_EDIT_FUNCTIONS, ...REGISTER_OPS_FUNCTIONS, ...REGISTER_OWNER_ONLY_FUNCTIONS]) {
+  for (const f of [CUTOVER_FUNCTION, OBSERVE_FUNCTION, ACK_FUNCTION, LOCK_SUPPLIERS_FUNCTION, BEGIN_WRITE_FUNCTION, ...REGISTER_EDIT_FUNCTIONS, ...REGISTER_OPS_FUNCTIONS, ...REGISTER_OWNER_ONLY_FUNCTIONS,
+    ...AMAZON_MAP_EDIT_FUNCTIONS, ...AMAZON_MAP_OWNER_ONLY_FUNCTIONS]) {
     s.push(`revoke all on function ${f} from public, ${all}`);
   }
   // master_edit
@@ -131,6 +143,7 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   s.push(`grant execute on function ${LOCK_SUPPLIERS_FUNCTION} to master_edit`);
   s.push(`grant execute on function ${BEGIN_WRITE_FUNCTION} to master_edit`);
   for (const f of REGISTER_EDIT_FUNCTIONS) s.push(`grant execute on function ${f} to master_edit`);
+  for (const f of AMAZON_MAP_EDIT_FUNCTIONS) s.push(`grant execute on function ${f} to master_edit`);
   s.push('grant usage on sequence core.master_version_seq to master_edit');   // version の既定値・0026 の bump_master_version の nextval (呼び手の権限)
   // master_ops
   s.push('grant usage on schema ops to master_ops');

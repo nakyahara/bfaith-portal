@@ -823,12 +823,35 @@ export async function runInitialLoad(db, plan, opts = {}) {
     };
 
     // ── 8. listing_components (完全に読めた出品だけ plan に合わせる) + ASIN / FNSKU / 別名の候補 ──
-    // Amazon SKU ↔ NE コードの持ち主が Company DB なら、Amazon の出品の構成には触らない (予定に入れない = 足さない・直さない・消さない)。
-    // 出品そのもの・ASIN・FNSKU・別名は今までどおり
+    // Amazon の出品の構成の自動の候補 (Company DB構想 16 §3 #7・§7 v2 M10。⑦-1):
+    //   ① Amazon SKU の対応 (core.amazon_sku_maps・0053) がある出品 (墓標 = deleted も) = 対応が正。持ち主によらず、自動の候補を入れない (足さない・直さない・消さない)。
+    //      墓標の出品に完全一致を作り直さない (契約 v3 High 4)。対応の表は 0053 の前の DB では無い = 空 (今は 1 行も無い = 今の動きのまま)
+    //   ② 持ち主 listing_components.amazon が company: SKU マスタ (m_sku_master)・Sheet の構成は材料にしない。
+    //      FBM の完全一致 (seller SKU = NE コード・sources.mjs の amazon_fees_fbm) だけ、対応も墓標も無い出品に今までどおり作る
+    //   ③ 持ち主が load (今): 今までどおり (SKU マスタ・Sheet・FBM の完全一致)
+    // 出品そのもの・ASIN・FNSKU・タイトル・別名は、どの場合も今までどおり
     const amazonCompsOwned = loadOwns('listing_components.amazon');
-    const compsOf = (l) => ((l.mall === 'amazon' && !amazonCompsOwned) ? [] : (l.components || []));
+    const mappedListings = (await db.query("select to_regclass('core.amazon_sku_maps') is not null as ok")).rows[0].ok
+      ? new Set((await db.query('select listing_id from core.amazon_sku_maps')).rows.map((r) => Number(r.listing_id)))
+      : new Set();
+    let amzMapped = 0; let amzOwnedSkip = 0; let amzFbmKept = 0;
+    const compsOf = (l) => {
+      if (l.mall !== 'amazon') return l.components || [];
+      const lid = listingIdOf(l);
+      if (lid != null && mappedListings.has(lid)) return [];
+      if (amazonCompsOwned) return l.components || [];
+      return l.evidenceSource === 'amazon_fees_fbm' ? (l.components || []) : [];
+    };
+    for (const l of acceptedListings) {
+      if (l.mall !== 'amazon') continue;
+      const lid = listingIdOf(l); const n = (l.components || []).length;
+      if (lid != null && mappedListings.has(lid)) amzMapped += n;
+      else if (!amazonCompsOwned && l.evidenceSource === 'amazon_fees_fbm') amzFbmKept += n;
+      else if (!amazonCompsOwned) amzOwnedSkip += n;
+    }
     const lcSec = section(report, 'listing_components', acceptedListings.reduce((n, l) => n + compsOf(l).length, 0));
-    if (!amazonCompsOwned) lcSec.notes.push(`Company DB が正: Amazon の構成 ${acceptedListings.filter((l) => l.mall === 'amazon').reduce((n, l) => n + (l.components || []).length, 0)} 行は見送り`);
+    if (!amazonCompsOwned) lcSec.notes.push(`Company DB が正: Amazon の構成 ${amzOwnedSkip} 行は見送り (SKU マスタ・Sheet の構成。FBM の完全一致 ${amzFbmKept} 行は対応の無い出品にだけ続ける)`);
+    if (amzMapped) lcSec.notes.push(`Amazon SKU の対応 (Company DB) がある出品の構成 ${amzMapped} 行は見送り (対応が正)`);
     const lcCand = []; const lcKeys = new Set(); const listingsWithSkip = new Set();
     const asinCands = new Map(); const extRows = []; const fnskuClearLids = [];
     for (const l of acceptedListings) {
