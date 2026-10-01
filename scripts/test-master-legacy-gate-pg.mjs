@@ -23,6 +23,7 @@
  *  15 読む時間を測る (scripts/company-db/master-legacy-latency.mjs・読むだけ)
  *  16 配り直し (古いプロセスの普通の記録が書いている途中に SIGTERM・新しいプロセスが起動): 古いプロセスは途中の記録を待ってから「止めた」を 1 回。
  *     門のログインの接続は 古い 1 本 + 新しい 1 本 = 2 本まで。古いプロセスの最後の記録は stopped (Codex #1565 R2 Medium 3)
+ *  17 場所ごとの門のログインが無く COMPANY_DB_URL だけ = 段階は読める (古い入口は動く) が、門の記録は書けず readiness が落ちる (Codex #1565 R4 Low の 3 つの場合の 2)
  * ロールは ⑤-1 の本物の作り (scripts/company-db/create-master-edit-roles.mjs) だけで作る (試験で足さない)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-legacy-gate-pg.mjs
  *   (cd C:/tmp/pg-embed && node run-conc.mjs scripts/test-master-legacy-gate-pg.mjs C:/tmp/sor53-work)
@@ -345,6 +346,35 @@ try {
       G.__resetLegacyAck();
     }
     assert.ok(peak >= 1 && peak <= 2, `門のログインの接続 ${peak} 本 (古い 1 + 新しい 1 まで)`);
+  });
+  await ta('[17] 門のログインが無く COMPANY_DB_URL だけ = 段階は読める (古い入口は動く)・門の記録は書けない・readiness は落ちる (切替は進められない)', async () => {
+    const saved = { gate: process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL, owner: process.env.COMPANY_DB_URL };
+    await G.closeLegacyGatePool();
+    await sleep(300);
+    delete process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL;
+    process.env.COMPANY_DB_URL = u.toString();   // 表の持ち主 (試験の superuser)
+    try {
+      await setPhase('legacy_open');   // [14] で frozen に進めたので、切替前に戻して「古い入口は動く」を見る
+      G.__resetLegacyAck();
+      const s = await G.checkLegacyGate();
+      assert.deepEqual([s.readable, s.phase, s.writable], [true, 'legacy_open', true], s.error);
+      const who = (await M.query(`select distinct usename from pg_stat_activity where datname = $1 and application_name = 'master-legacy-gate'`, [dbName])).rows.map((r) => r.usename);
+      assert.deepEqual(who, ['postgres'], '門のログインが無い = 表の持ち主で読む');
+      const before = await ackCount();
+      const ack = await quiet(() => G.ackLegacyGates({ host: 'minipc', env: { ...process.env, RENDER_GIT_COMMIT: 'b'.repeat(40) } }));
+      assert.equal(ack.state, 'precheck_failed'); assert.match(ack.detail, /COMPANY_DB_MASTER_GATE_MINIPC_URL/);
+      assert.equal(await ackCount(), before, '門の記録は書けない');
+      const { checkReadiness } = await import('./company-db/master-legacy-readiness.mjs');
+      const r = await checkReadiness({ host: 'minipc', env: { COMPANY_DB_URL: u.toString(), RENDER_GIT_COMMIT: 'b'.repeat(40) } });
+      assert.equal(r.ok, false, '配る前の確かめは落ちる');
+      assert.ok(r.lines.some((l) => /段階を読める/.test(l)), r.lines.join('\n'));
+      assert.ok(r.problems.some((x) => /COMPANY_DB_MASTER_GATE_MINIPC_URL/.test(x)), r.problems.join('\n'));
+    } finally {
+      await G.closeLegacyGatePool();
+      if (saved.gate === undefined) delete process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL; else process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = saved.gate;
+      if (saved.owner === undefined) delete process.env.COMPANY_DB_URL; else process.env.COMPANY_DB_URL = saved.owner;
+      G.__resetLegacyAck();
+    }
   });
 } finally {
   G.__setLegacyPhaseReader(null);

@@ -753,7 +753,11 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   - CLI = mode が分かったらすぐ (引数・ファイルの検査より前・DB を開く前) に終了コード 3。書く間は段階の**共有の鍵** (`pg_advisory_lock_shared(hashtext('ops.master_cutover'))`) を持ち、鍵を取ってから段階を読み直す = 段階を変える側 (排他の鍵) は CLI が書き終わるまで待つ・変えている最中に始めた CLI は待ってから読む。csv-import.js は `product_shipping`・`exception_genka` だけ閉じる (受注・ロジザード・NE の写し・送料の表は止めない)。CLI が書くのは miniPC の warehouse.db だけ = ⑤-1 の夜間ロードの鍵 (`core.master_write_lock_key`) は取らない。
   - 定期実行: product-hub の NE が先の自動取込 (intake-cron) は丸ごと止める (閉じている = ok の ping で「止めた」・読めない = fail の ping)。
 - **段階の読み方**:
-  - 接続先 = この場所の門のログイン (下) → 無ければ `COMPANY_DB_URL` (Render)。🚨 見張りの `COMPANY_DB_WATCH_URL` (watcher・接続 3 本まで) には落ちない = miniPC は門のログインが無いと古い入口が全部 503。
+  - 接続先 = この場所の門のログイン (下) → 無ければ `COMPANY_DB_URL` (表の持ち主)。🚨 見張りの `COMPANY_DB_WATCH_URL` (watcher・接続 3 本まで) には落ちない。
+  - 🚨 **env と 0051 の 3 つの場合** (Codex #1565 R4 Low):
+    1. 0051 が本番に無い・段階を読める接続が無い (門のログインも `COMPANY_DB_URL` も無い・つながらない) = 読めない = 古い入口は全部 503 / CLI は終了コード 3。
+    2. 場所ごとの門のログイン (`COMPANY_DB_MASTER_GATE_*_URL`) が無いが `COMPANY_DB_URL` で段階を読める = **古い入口は legacy_open の間は今までどおり動く**。ただし門の記録は書けない (`precheck_failed`) = readiness が落ちる・⑤-1 の段階の関数は全部の場所の新しい記録を求めるので**切替は進められない**。
+    3. 両方の場所の門のログイン + readiness が両方とも終了コード 0 = 配ってよい (この PR のマージの条件)。
   - 🚨 書き込み・CLI は**毎回**読む。前に読めた値は使わない。プロセスごとに接続 **1 本**のプールを 10 分つないだままにする (miniPC → Render はつなぎ直すと TLS と認証で 0.5〜0.8 秒) と 1 回の読み直し (200ms 後)。門の記録もこの 1 本で書く = プロセスあたり 1 本 (配り直しで古い + 新しいが重なっても 2 本。門のログインの接続の上限は ⑤-1 で 8)。読めない = 503 / 終了コード 3。
   - 画面の帯だけ前の結果を使う (読めた = 30 秒・読めない = 5 秒)。古ければ同時の画面で 1 回の読みを分け合い、1 秒待つ (読み直さない・表示だけ)。1 秒で返らない = その画面だけ 5 分前までの読めた結果を見せる (無ければ読めない扱い)。打ち切りは使い回さず、遅れて返った結果を使い回しに入れる。
   - 読めなかった回数・断った回数 (410・503)・切れた相手・画面の打ち切り・書かない試しを通した回数・読むのにかかった時間は読み戻しに出す。1 秒を超えた読みと読めなかった回はログに出す。
@@ -775,8 +779,50 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   - 止まり方が分からないプロセス (落ちた・電源・2 秒で書けなかった) = ⑤-1 の段階を進める関数は「今までに 1 回でも記録を書いたプロセスで、最後の記録が 15 分より前 (何日前でも) で『止めた』でもない」プロセスがあると進めない (年齢では外れない = 止めたプロセスには必ず「止めた」が要る) → 人が止まったのを確かめて `node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list` / `--stop --host minipc --instance <名札> --reason "…" --yes` (手の操作・定期実行にしない)。🚨 15 分以内に記録があるプロセスは `--force` が無いと拒む (動いているかもしれない)。
 - **読み戻し**: `GET /apps/warehouse/api/master-legacy-gate` (miniPC と Render の両方にある) = その環境・**その 1 つのプロセス**が見ている段階・書けるか・manifest_hash (最後に DB が受け取った一覧)・一覧の数・持ち主表のハッシュ・build の番号・名札・書きかけ (`inflight.count`・`oldest_started_at`)・数・門の記録 (呼ぶと記録も書き直す)。全部のプロセスは `master-legacy-instance.mjs --list` で見る。
 - 🚨 **マージの前に** (PR の本文のチェックリスト。miniPC の PowerShell 5.1 で。まだ流さない → 中原さんの OK の後):
-  - ⚠️ **この PR は後方互換ではない (今の環境のままでは動かない)**: 0051 の本適用・**両方**の門のログインの env (Render の `COMPANY_DB_MASTER_GATE_RENDER_URL`・miniPC の `COMPANY_DB_MASTER_GATE_MINIPC_URL`)・配る前の確かめ (readiness が両方とも終了コード 0) が**そろうまでマージしない**。どれか欠けたまま配る = その場所の古い入口 (/register・会計アプリ・税率・仕入先・手の取込) が全部 503 / 終了コード 3 で止まる。
-  1. 0051 (⑤-1) が本番に本適用済み (表が無い = 読めない = 古い入口が全部 503 で閉じる)。
+  - ⚠️ **この PR は後方互換ではない**: 0051 の本適用・**両方**の門のログインの env (Render の `COMPANY_DB_MASTER_GATE_RENDER_URL`・miniPC の `COMPANY_DB_MASTER_GATE_MINIPC_URL`)・配る前の確かめ (readiness が両方とも終了コード 0) が**そろうまでマージしない**。欠けたまま配ると、上の 3 つの場合の (1) = 0051 が無い・読める接続が無い場所は古い入口 (/register・会計アプリ・税率・仕入先・手の取込) が全部 503 / 終了コード 3 / (2) = 門のログインだけ無い場所は古い入口は動くが門の記録が書けず切替が進められない。
+  - **中原さんの手順 (この PR をマージできる状態にする)**。miniPC の PowerShell 5.1 (`&&` と `cd /d` は使わない)。🚨 印は「まだ流さない」= 中原さんの OK の後:
+    1. 🚨 **0051 を本番の Company DB に入れる** (Claude が SSH で miniPC から。中原さんの OK の後・本番で使っていない worktree から dry-run → 本適用):
+       ```
+       # まだ流さない (中原さんの OK の後に Claude が SSH で)
+       Set-Location C:\Users\bfaith\bfaith-portal
+       git fetch origin
+       git worktree add C:\tmp\sor51-migrate origin/master
+       Set-Location C:\tmp\sor51-migrate
+       npm ci
+       $env:DOTENV_CONFIG_PATH = 'C:\Users\bfaith\bfaith-portal\.env'
+       node -r dotenv/config scripts\company-db\migrate.mjs --dry-run     # 0051_master_edit だけが出ること (0050_finance_coverage がまだなら 0050 も)
+       node -r dotenv/config scripts\company-db\migrate.mjs               # 本適用
+       ```
+    2. 🚨 **ロールを作る** (中原さんが miniPC の画面で。パスワードを含む接続文字列は**この画面にだけ**出る = Claude・チャットに貼らない):
+       ```
+       # まだ流さない (1 の後)
+       Set-Location C:\tmp\sor51-migrate
+       $env:DOTENV_CONFIG_PATH = 'C:\Users\bfaith\bfaith-portal\.env'
+       node -r dotenv/config scripts\company-db\create-master-edit-roles.mjs --dry-run   # 流す文を見る (パスワードは出ない)
+       node -r dotenv/config scripts\company-db\create-master-edit-roles.mjs             # 作る = 初めて作ったロールの接続文字列だけが出る
+       ```
+       出た行の置き場所 (画面からコピーしてそのまま入れる。チャット・メモ・共有ドライブに貼らない): `COMPANY_DB_MASTER_GATE_MINIPC_URL`・`COMPANY_DB_MASTER_OPS_URL`・`COMPANY_DB_MASTER_OBSERVER_URL` = miniPC の `C:\Users\bfaith\bfaith-portal\.env` の末尾に足す (`notepad C:\Users\bfaith\bfaith-portal\.env`) / `COMPANY_DB_MASTER_GATE_RENDER_URL`・`COMPANY_DB_MASTER_EDIT_URL` = Render の bfaith-portal の Environment に足す (Render は保存すると配り直す)。もうあるロールは何も出ない (パスワードは変えない) = 接続文字列が分からないときだけ `--rotate-password master_gate_minipc` (または `master_gate_render`) で変えて、同じ日にその場所の env を書き換える。
+    3. 🚨 **WarehouseServer を再起動** (.env を読み直す。管理者の PowerShell): `Restart-Service WarehouseServer`
+    4. 🚨 **配る前の確かめ** (このブランチの worktree で。読むだけ・何も書かない):
+       ```
+       # まだ流さない (2・3 の後)
+       Set-Location C:\Users\bfaith\bfaith-portal
+       git fetch origin
+       git worktree add C:\tmp\sor53-check origin/feat/sor5-3-close
+       Set-Location C:\tmp\sor53-check
+       npm ci
+       $env:DOTENV_CONFIG_PATH = 'C:\Users\bfaith\bfaith-portal\.env'
+       node -r dotenv/config scripts\company-db\master-legacy-readiness.mjs --host minipc     # 終了コード 0 (✅ そろっている)
+       $env:COMPANY_DB_MASTER_GATE_RENDER_URL = Read-Host 'Render の門のログイン (Render の Environment からコピー)'
+       node -r dotenv/config scripts\company-db\master-legacy-readiness.mjs --host render      # 終了コード 0 (役 = master_gate_render)
+       Remove-Item Env:COMPANY_DB_MASTER_GATE_RENDER_URL
+       node -r dotenv/config scripts\company-db\master-legacy-latency.mjs --host minipc       # p50 / p95 / いちばん遅い を PR に書く (接続文字列は出ない)
+       Set-Location C:\Users\bfaith\bfaith-portal
+       git worktree remove C:\tmp\sor53-check
+       git worktree remove C:\tmp\sor51-migrate
+       ```
+    5. 4 が両方とも終了コード 0 になったら、この PR をマージしてよい (マージの後は下の 4 の `--list`)。
+  1. 0051 (⑤-1) が本番に本適用済み (無い = 段階を読めない = 古い入口が全部 503 で閉じる = 上の 3 つの場合の (1))。
   2. ⑤-1 の `create-master-edit-roles.mjs` を流し、出た `COMPANY_DB_MASTER_GATE_RENDER_URL` を Render の env に、`COMPANY_DB_MASTER_GATE_MINIPC_URL` を miniPC の .env に入れた (miniPC は `Restart-Service WarehouseServer`)。パスワードが出るのはロールを初めて作ったときだけ。もうあって接続文字列が分からない = `--rotate-password master_gate_render` (または `master_gate_minipc`) で変えて、その場所の env を同じ日に書き換える。
   3. **このブランチの miniPC の worktree** で配る前の確かめ (読むだけ・何も書かない。Render の Shell にはマージ前はこのスクリプトが無い):
      - miniPC: `node -r dotenv/config scripts/company-db/master-legacy-readiness.mjs --host minipc` が終了コード 0。
