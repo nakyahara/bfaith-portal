@@ -49,6 +49,21 @@ const draftId = Number(db.prepare(
 ).run().lastInsertRowid);
 db.prepare(`INSERT INTO draft_images (draft_id, sort, drive_file_id, drive_modified_time) VALUES (?, 0, 'FILEIDTOP001', '2026-09-30T00:00:00.000Z')`).run(draftId);
 
+console.log('⓪ 🚨 詳細画面のインライン JS が構文エラーになっていない');
+{
+  // 🚨 これが無いと、文字列の中に生の改行を入れただけで
+  //    **その script ブロックが丸ごと死ぬ** (既存のボタンも動かなくなる)。
+  //    サーバーのテストは HTML しか見ないので気づけない — 実際に踏んだ (codex exec review P1)。
+  const { html } = await getDetail(draftId);
+  const blocks = [...html.matchAll(/<script(?![^>]*\stype=)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+  ok(blocks.length > 0, 'インライン script がある');
+  let bad = 0;
+  blocks.forEach((code, i) => {
+    try { new Function(code); } catch (e) { bad++; console.log(`    script[${i}]: ${e.message}`); }
+  });
+  eq(bad, 0, '🚨 すべての script ブロックが JS として読める');
+}
+
 console.log('① 仕様書も商品情報も無いうちは「押せない理由」が出る');
 {
   const { status, html } = await getDetail(draftId);

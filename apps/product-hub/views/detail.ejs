@@ -5870,12 +5870,9 @@ th.attr-unknown { color: #dc2626; }
       const failing = !!job && job.status === 'failed' && job.lint && job.lint.ok === false;
       failEl.hidden = !failing;
       if (failing) {
-        const errs = (job.lint.errors || []).slice(0, 8).map((e) => '・' + (e.detail || e.label)).join('
-');
-        failEl.textContent = lintLine(job.lint) + (errs ? '
-' + errs : '')
-          + ((job.lint.errors || []).length > 8 ? '
-…ほか ' + ((job.lint.errors || []).length - 8) + ' 件' : '');
+        const errs = (job.lint.errors || []).slice(0, 8).map((e) => '・' + (e.detail || e.label)).join('\n');
+        failEl.textContent = lintLine(job.lint) + (errs ? '\n' + errs : '')
+          + ((job.lint.errors || []).length > 8 ? '\n…ほか ' + ((job.lint.errors || []).length - 8) + ' 件' : '');
         failEl.style.whiteSpace = 'pre-wrap';
       }
 
