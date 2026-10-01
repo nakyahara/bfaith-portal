@@ -4,7 +4,7 @@
  *
  *   A. 門の部品: 段階ごとの可否・読めない = すぐ閉じる (前に読めた値を使わない)・書き込みは毎回読む・画面だけ 30 秒・接続先が無い / つながらない / 返事が無い
  *      (再試行 1 回)・答えの形・道の形と when・帯・drain (書きかけを数える)・route_part・manifest・build の番号・門の記録 (書く前の確かめ・書く中身・5 分おき)
- *   B. Company DB (PGlite・0050 まで流す): 段階を進めると門が閉じる / 見張りのロール watcher でも段階を読める / 0050 の前の DB = 閉じる
+ *   B. Company DB (PGlite・0051 まで流す): 段階を進めると門が閉じる / 見張りのロール watcher でも段階を読める / 0051 の前の DB = 閉じる
  *   C. 入口ごと (本物の router を HTTP で): legacy_open = 今までどおり / frozen・company_owner・new_open = 410 で何も書かない / 読めない = 503 で何も書かない /
  *      画面は帯。miniPC の /register (全部の API)・CSV を受け取っている間に閉じた・会計アプリ 5 つ・fba-profitability・profit-calculator・
  *      product-hub (税率・Notion の取込・古い新商品の作り方・自動取込・代表コードの税率・出品を止める)・発注アプリの仕入先・売れ筋共有の表示名
@@ -738,7 +738,7 @@ await t('miniPC の読み方 = 見張りの照会用ロール watcher で段階�
     assert.equal(s.readable, true, s.error); assert.equal(s.phase, 'new_open');
   } finally { await pg.query('set role deploy'); }
 });
-await t('表が無い (0050 の前の DB) = 読めない = 閉じる', async () => {
+await t('表が無い (0051 の前の DB) = 読めない = 閉じる', async () => {
   const pg2 = new PGlite();
   G.__setLegacyPhaseReader(() => readCutoverPhase(pgliteAdapter(pg2)));
   const s = await quiet(() => G.checkLegacyGate());

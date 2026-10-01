@@ -737,7 +737,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 古い入口 = NE の写しにマスタを書く API・画面・手の CLI・人の操作で動く取込 (miniPC の `/apps/warehouse/register` と SKU マスタ・会計アプリ 5 つの `POST /register`・fba-profitability の原価・product-hub の税率と古い新商品の作り方 (`/new`・NE のコードから登録・NE が先の自動取込・Notion の画像の取込)・Notion の取込・profit-calculator の NE 用 CSV と仕入れ先・発注アプリの仕入先・売れ筋共有の表示名・手の取込)。
 
 - **一覧 = `config/master-legacy-entries.mjs`** (閉じる入口・閉じない口 (写し・閉じ済み・手の入口の 3 種類)・CLI の mode・書かない試しの見分け方 `dry_run`)。一覧がそのまま門の設定。id は英数字と `_.:/-` だけ (⑤-1 の manifest の形)。
-- **門 = `lib/master-legacy-gate.mjs`**。切替の段階 (`ops.master_cutover_state`・0050) を**読めて** `legacy_open` のときだけ今までどおり書ける。
+- **門 = `lib/master-legacy-gate.mjs`**。切替の段階 (`ops.master_cutover_state`・0051) を**読めて** `legacy_open` のときだけ今までどおり書ける。
   - `frozen` 以降は、持ち主表 (`config/master-ownership.mjs`) がまだ `load` でも閉じる (持ち主の切替より先に古い入口を閉じる順番のため)。
   - API = 410 `{error:'master_frozen', message, url}`。段階が読めない = 503 `{error:'master_phase_unreadable'}` (閉じる側)。何も書かない。画面は `message` を出す (`master_frozen` の文字は出さない)。
   - 書かない試し (NE のコードから登録・自動取込を手で回す・Notion の画像の取込・Notion の状態から取込 の dry run) は、段階を読めないときだけ注意つきで通す (応答の見出し `X-Master-Legacy-Warning: phase_unreadable`)。閉じた後は 410 のまま。
@@ -771,12 +771,12 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   - 🚨 止めている途中の確かめは、段階を読む (await) の**後**・切符を出す直前・書く直前の確かめ (`legacyWriteFence`・CSV の `legacyRecheck`・定期実行の `fence`) の全部で見る = 段階を読んでいる間・受け取っている間に止め始めた要求は書かない (受け取ったファイルも消す)。定期実行は `runLegacyJob(id, ({ signal, fence }) => …)` = 待ってから書くときは書く直前に `fence()`。
   - miniPC の WarehouseServer は WinSW のサービス (止めるときは Ctrl+C = Node の SIGINT のはずだが、届いたか・2 秒で書けたかは分からない) → **次の起動で、前の起動のプロセスが居なければ「止めた」を書く** (名札は `DATA_DIR/master-legacy-instance.json`)。前の pid がまだある (使い回しを含む)・別の PC = 書かない (安全側)。Render は止めるとき SIGTERM を送り待つので使わない。
   - 中身: host・プロセスの名札 (`RENDER_INSTANCE_ID` か PC 名 + pid + 起動の乱数)・build の番号 (Render = `RENDER_GIT_COMMIT`・miniPC = git の HEAD)・一覧 (manifest `{ entries: [{ id, kind: code | manual }] }`・ハッシュは DB が計算)・持ち主表・見た段階・書きかけの件数といちばん古い開始。
-  - 書く前に確かめる (場所・build の番号・段階を読める・門のログインがある・関数がある)。書いた後に返事 (`ack_id`・DB が同じ一覧から計算した `manifest_hash`・`acked_at`・`stopped`) を確かめてから `acked`。だめなら書かずに理由をログ (同じ理由は 1 回) と読み戻しに出す (関数が無い = 0050 の前 = 注意 1 回)。書く間に段階が変わった (`stale_phase`) = 読み直して 1 回だけ書き直す。
+  - 書く前に確かめる (場所・build の番号・段階を読める・門のログインがある・関数がある)。書いた後に返事 (`ack_id`・DB が同じ一覧から計算した `manifest_hash`・`acked_at`・`stopped`) を確かめてから `acked`。だめなら書かずに理由をログ (同じ理由は 1 回) と読み戻しに出す (関数が無い = 0051 の前 = 注意 1 回)。書く間に段階が変わった (`stale_phase`) = 読み直して 1 回だけ書き直す。
   - 止まり方が分からないプロセス (落ちた・電源・2 秒で書けなかった) = ⑤-1 の段階を進める関数は「今までに 1 回でも記録を書いたプロセスで、最後の記録が 15 分より前 (何日前でも) で『止めた』でもない」プロセスがあると進めない (年齢では外れない = 止めたプロセスには必ず「止めた」が要る) → 人が止まったのを確かめて `node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list` / `--stop --host minipc --instance <名札> --reason "…" --yes` (手の操作・定期実行にしない)。🚨 15 分以内に記録があるプロセスは `--force` が無いと拒む (動いているかもしれない)。
 - **読み戻し**: `GET /apps/warehouse/api/master-legacy-gate` (miniPC と Render の両方にある) = その環境・**その 1 つのプロセス**が見ている段階・書けるか・manifest_hash (最後に DB が受け取った一覧)・一覧の数・持ち主表のハッシュ・build の番号・名札・書きかけ (`inflight.count`・`oldest_started_at`)・数・門の記録 (呼ぶと記録も書き直す)。全部のプロセスは `master-legacy-instance.mjs --list` で見る。
 - 🚨 **マージの前に** (PR の本文のチェックリスト。miniPC の PowerShell 5.1 で。まだ流さない → 中原さんの OK の後):
-  - ⚠️ **この PR は後方互換ではない (今の環境のままでは動かない)**: 0050 の本適用・**両方**の門のログインの env (Render の `COMPANY_DB_MASTER_GATE_RENDER_URL`・miniPC の `COMPANY_DB_MASTER_GATE_MINIPC_URL`)・配る前の確かめ (readiness が両方とも終了コード 0) が**そろうまでマージしない**。どれか欠けたまま配る = その場所の古い入口 (/register・会計アプリ・税率・仕入先・手の取込) が全部 503 / 終了コード 3 で止まる。
-  1. 0050 (⑤-1) が本番に本適用済み (表が無い = 読めない = 古い入口が全部 503 で閉じる)。
+  - ⚠️ **この PR は後方互換ではない (今の環境のままでは動かない)**: 0051 の本適用・**両方**の門のログインの env (Render の `COMPANY_DB_MASTER_GATE_RENDER_URL`・miniPC の `COMPANY_DB_MASTER_GATE_MINIPC_URL`)・配る前の確かめ (readiness が両方とも終了コード 0) が**そろうまでマージしない**。どれか欠けたまま配る = その場所の古い入口 (/register・会計アプリ・税率・仕入先・手の取込) が全部 503 / 終了コード 3 で止まる。
+  1. 0051 (⑤-1) が本番に本適用済み (表が無い = 読めない = 古い入口が全部 503 で閉じる)。
   2. ⑤-1 の `create-master-edit-roles.mjs` を流し、出た `COMPANY_DB_MASTER_GATE_RENDER_URL` を Render の env に、`COMPANY_DB_MASTER_GATE_MINIPC_URL` を miniPC の .env に入れた (miniPC は `Restart-Service WarehouseServer`)。パスワードが出るのはロールを初めて作ったときだけ。もうあって接続文字列が分からない = `--rotate-password master_gate_render` (または `master_gate_minipc`) で変えて、その場所の env を同じ日に書き換える。
   3. **このブランチの miniPC の worktree** で配る前の確かめ (読むだけ・何も書かない。Render の Shell にはマージ前はこのスクリプトが無い):
      - miniPC: `node -r dotenv/config scripts/company-db/master-legacy-readiness.mjs --host minipc` が終了コード 0。

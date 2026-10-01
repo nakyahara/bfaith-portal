@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
  * master-legacy-readiness.mjs — マスタの古い入口の門 (⑤-3) を配る前・配った後に「足りないもの」を出す (読むだけ。何も書かない・何も変えない)
- * (PR #1565 中間レビュー Medium-5: 0050 の前にマージする・env が無い = 古い入口が全部閉じる、を先に気づく)
+ * (PR #1565 中間レビュー Medium-5: 0051 の前にマージする・env が無い = 古い入口が全部閉じる、を先に気づく)
  *
  * 見るもの:
  *   1. env: 段階を読む接続先 (COMPANY_DB_MASTER_GATE_RENDER_URL / _MINIPC_URL → COMPANY_DB_URL。見張りの watcher は使わない) と、この場所の門のログイン
- *   2. 段階を読める = 0050 が本適用済み・select の権限がある (読めないと古い入口は全部 503)
+ *   2. 段階を読める = 0051 が本適用済み・select の権限がある (読めないと古い入口は全部 503)
  *   3. 門のログイン: ログインの役が master_gate_<場所>・記録の関数 (ops.record_legacy_gate_ack) の実行権がある・一覧 (manifest) を DB が受け取れる形
  *   4. build の番号が分かる (Render = RENDER_GIT_COMMIT・miniPC = git の HEAD)
  *   5. (見るだけ) 黙っているプロセス (今までに記録を書いて、15 分以内の記録も「止めた」も無い = 何日前でも) の数。⑤-1 はこれがあると段階を進めない
@@ -37,7 +37,7 @@ export async function checkReadiness({ host, env = process.env, open = (url) => 
     try {
       c = await open(phaseUrl);
       const s = await readCutoverPhase(pgAdapter(c));
-      if (s.readable) ok(`段階を読める (0050 あり・select の権限あり): ${s.phase}`); else ng(`段階を読めない (0050 の前か select の権限が無い): ${s.error}`);
+      if (s.readable) ok(`段階を読める (0051 あり・select の権限あり): ${s.phase}`); else ng(`段階を読めない (0051 の前か select の権限が無い): ${s.error}`);
     } catch (e) { ng(`段階を読む接続先につながらない: ${String(e && e.message).slice(0, 200)}`); } finally { if (c) { try { await c.end(); } catch { /* */ } } }
   }
   // 3. 門のログイン
@@ -48,7 +48,7 @@ export async function checkReadiness({ host, env = process.env, open = (url) => 
       const who = (await c.query('select session_user::text as u')).rows[0].u;
       if (who === `master_gate_${host}`) ok(`門のログインの役 = ${who}`); else ng(`門のログインの役が ${who} (期待 master_gate_${host}。⑤-1 の記録の関数は場所と役が違えば拒む)`);
       const fn = (await c.query('select to_regprocedure($1)::text as f', [ACK_FUNCTION_SIGNATURE])).rows[0].f;
-      if (!fn) ng(`記録の関数 ${ACK_FUNCTION_SIGNATURE} が無い (0050 の前か、⑤-1 の古い版)`);
+      if (!fn) ng(`記録の関数 ${ACK_FUNCTION_SIGNATURE} が無い (0051 の前か、⑤-1 の古い版)`);
       else {
         const can = (await c.query(`select has_function_privilege(session_user, $1::regprocedure, 'execute') as ok`, [fn])).rows[0].ok;
         if (can) ok('記録の関数を実行できる'); else ng('記録の関数の実行権が無い (⑤-1 の scripts/company-db/create-master-edit-roles.mjs を流す)');

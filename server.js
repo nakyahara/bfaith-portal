@@ -122,7 +122,7 @@ import { dashboardLocals, validateRegistry } from './lib/portal-dashboard.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
-// マスタの古い入口の門の記録 (ack。Company DB構想 14 §10 契約 v3 H1・PR #1565 R1 H2。表と書き手の関数は ⑤-1 の 0050)。Render = 'render' / miniPC (PORTAL_VARIANT=warehouse) = 'minipc'。
+// マスタの古い入口の門の記録 (ack。Company DB構想 14 §10 契約 v3 H1・PR #1565 R1 H2。表と書き手の関数は ⑤-1 の 0051)。Render = 'render' / miniPC (PORTAL_VARIANT=warehouse) = 'minipc'。
 // それ以外 (手元の PC) は書かない。起動のとき (下の listen) と、要求が来たついでに 5 分おきに書き直す (死活の確かめの要求でも回る。新しい定期実行は作らない)。
 // 中身 = build の番号・manifest_hash・持ち主表のハッシュ・見た段階・書きかけの件数。書く前に確かめる (段階を読める・build の番号・書く接続先・関数)。
 // だめなら書かずに理由をログと読み戻し (/apps/warehouse/api/master-legacy-gate) に出す

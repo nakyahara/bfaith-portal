@@ -49,7 +49,7 @@ export async function markStopped({ host, instance, reason, env = process.env, c
   if (!['render', 'minipc'].includes(host)) throw Object.assign(new Error('--host は render か minipc'), { code: 2 });
   if (!instance || !/^[A-Za-z0-9_.:-]{1,100}$/.test(instance)) throw Object.assign(new Error('--instance (名札: 英数字と _.:- で 100 字まで) が要る'), { code: 2 });
   if (!reason || !String(reason).trim()) throw Object.assign(new Error('--reason (なぜ止まったと言えるか) が要る'), { code: 2 });
-  if (String(reason).trim().length > 200) throw Object.assign(new Error('--reason は 200 字まで (0050 の約束)'), { code: 2 });
+  if (String(reason).trim().length > 200) throw Object.assign(new Error('--reason は 200 字まで (0051 の約束)'), { code: 2 });
   if (!connect && !gateUrlFor(host, env)) throw Object.assign(new Error(`${GATE_URL_ENV[host]} が無い (その場所の門のログインで書く)`), { code: 1 });
   if (!force) {
     const last = await latest({ host, instance, env });
