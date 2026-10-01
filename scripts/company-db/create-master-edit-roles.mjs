@@ -101,9 +101,9 @@ export const REG_CSV_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.ne_reg_lock_skus
   'ops.guard_reg_csv_write()', 'ops.guard_reg_csv_live()', 'core.guard_master_edit_jan()',
   'ops.create_supplier(uuid, text, text, jsonb, text, text, text, integer)', 'ops.declare_supplier_in_ne(uuid, text, jsonb, text, text, text)',
   'ops.deactivate_supplier(uuid, text, text, jsonb, text, text)',
-  'ops.record_ne_registration_observations(jsonb)', 'ops.seal_ne_registration_run(text, text, text)', 'ops.record_ne_registration_check(text)']);
+  'ops.snapshot_ne_reg_targets(text)', 'ops.record_ne_registration_observations(jsonb)', 'ops.seal_ne_registration_run(text, text, text)', 'ops.record_ne_registration_check(text)']);
 /** ⑤-2b (0053): 読むだけで、ほかのロールの一覧に入らない表 (流し直しのときに外す) */
-export const REG_CSV_OTHER_TABLES = Object.freeze(['ops.supplier_registration_events', 'ops.v_ne_reg_targets', 'ops.ne_reg_compare_runs', 'ops.ne_reg_compare_observations',
+export const REG_CSV_OTHER_TABLES = Object.freeze(['ops.supplier_registration_events', 'ops.v_ne_reg_targets', 'ops.ne_reg_compare_targets', 'ops.ne_reg_compare_runs', 'ops.ne_reg_compare_observations',
   'ops.ne_reg_compare_receipts', 'ops.master_ne_codes', 'ops.master_ne_code_mark']);
 export const CUTOVER_FUNCTION = 'ops.set_master_cutover_phase(text, text, jsonb, text)';
 export const OBSERVE_FUNCTION = 'ops.record_ne_set_observations(jsonb)';

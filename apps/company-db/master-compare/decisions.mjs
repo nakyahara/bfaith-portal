@@ -60,25 +60,25 @@ export async function writeNeCodes(writer, { compareRunId, entries }) {
   return typeof r === 'string' ? JSON.parse(r) : r;
 }
 
+const jsonOf = (r) => (typeof r === 'string' ? JSON.parse(r) : r);
 /**
- * 新商品の NE 登録の CSV の確かめ待ちの商品 (0052 の ops.v_ne_reg_targets)。照合の読み取りの取引の中 (watcher)。
- * 表が無い (0053 の前) = null (送らない)・読めない = null + reason
+ * 新商品の NE 登録の CSV の確かめ待ちの商品を、照合の回の始まりに DB が回へ写す (0053 の ops.snapshot_ne_reg_targets・#1571 Codex R2 Medium 1)。
+ * 観測はこの写しとちょうど同じ商品だけ (DB が確かめる) = 呼び手は商品を選べない・取得の途中の配る / 申告 / 使わないと競わない。
+ * getWriter = 書く接続 (watch_writer) を返す関数 (無い = not_configured)。関数が無い (0053 の前) = not_applied・失敗 = unreadable (どれも送らない・② は続ける)
  */
-export async function readRegTargets(db) {
-  await db.query('savepoint reg_targets');
+export async function snapshotRegTargets(getWriter, { compareRunId }) {
+  if (!getWriter) return { state: 'not_configured', targets: null };
   try {
-    const exists = (await db.query("select to_regclass('ops.v_ne_reg_targets') is not null as ok")).rows[0].ok;
-    const rows = exists ? (await db.query('select distinct code_norm, sku_kind from ops.v_ne_reg_targets order by code_norm')).rows : null;
-    await db.query('release savepoint reg_targets');
-    return { state: exists ? 'ok' : 'not_applied', targets: rows };
+    const w = await getWriter();
+    if (!(await w.query("select to_regprocedure('ops.snapshot_ne_reg_targets(text)') is not null as ok")).rows[0].ok) return { state: 'not_applied', targets: null };
+    const r = jsonOf((await w.query('select ops.snapshot_ne_reg_targets($1) as r', [compareRunId])).rows[0].r);
+    return { state: 'ok', targets: r.targets, snapshot: { state: r.state, target_hash: r.target_hash, taken_at: r.taken_at } };
   } catch (e) {
-    try { await db.query('rollback to savepoint reg_targets'); } catch { /* */ }
     return { state: 'unreadable', targets: null, reason: String(e && e.message).slice(0, 200) };
   }
 }
-const jsonOf = (r) => (typeof r === 'string' ? JSON.parse(r) : r);
 /**
- * 新商品の NE 登録の CSV の確かめ (0053・#1571 Codex R1 High 2) = 3 段。どれも writer = watch_writer・関数だけ・1 回 = 1 つの取引。
+ * 新商品の NE 登録の CSV の確かめ (0053・#1571 Codex R1 High 2) = 回の始まりの写し (snapshotRegTargets) の後に 3 段。どれも writer = watch_writer・関数だけ・1 回 = 1 つの取引。
  *   1. writeRegistrationObservations = この回の NE の観測 (取得の世代・時刻・原本のハッシュ・確かめ待ちの商品・観測) を DB に残す (回ごとに 1 回・後から足せない)
  *   2. sealRegistrationRun = この回が最後まで終わった受け取り (観測のハッシュ・結果の JSON の sha256)。結果の JSON を書けた後だけ
  *   3. runRegistrationCheck = 回の番号だけを渡す。DB の関数が受け取りと残した観測を自分で読んで確かめる (呼び手の観測の JSON は受けない)

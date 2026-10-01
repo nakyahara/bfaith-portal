@@ -872,22 +872,37 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   // 新商品の NE 登録の CSV (0053・契約 v3 H5): 同じ完全な取得の中の、確かめ待ちの商品の NE の値 (書くのは run.mjs が判断の台帳の後に)
   const regObs = Array.isArray(regTargets) ? registrationObservations(nm, regTargets, {
     collided: collidedNorms, intBlocked, absenceTrusted: !absenceUntrusted && !componentsUntrusted, productsAt: marks.products.at, setsAt: marks.sets.at,
-    // 取得の世代 (#1571 Codex R1 High 2): 材料の世代・NE の完全な取得の版・原本のハッシュ (材料の中身のハッシュと版から)
-    fetch: { generation_id: out.generation.generation_id, products_rev: String(marks.products.rev), sets_rev: String(marks.sets.rev),
-      raw_hash: crypto.createHash('sha256').update(JSON.stringify({ products: expected.products.content_hash, set_components: expected.set_components.content_hash,
-        products_rev: String(marks.products.rev), sets_rev: String(marks.sets.rev), products_at: marks.products.at, sets_at: marks.sets.at })).digest('hex') },
+    // 取得の世代と原本のハッシュ (#1571 Codex R2 Low) = 観測 (nm) を作った NE の完全な取得そのもの (warehouse.db の完了の印と raw の行)。Render の材料の世代・ハッシュではない
+    fetch: { ...neFetchIdentity(marks, ne), products_rev: String(marks.products.rev), sets_rev: String(marks.sets.rev) },
   }) : null;
   out.registrations = regObs ? { targets: regTargets.length, observations: regObs.observations.length, present: regObs.observations.filter((o) => o.present).length } : { state: 'not_applied' };
   return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes, neCodes, regObs };
 }
 
+/**
+ * NE の完全な取得の世代と原本のハッシュ (新規登録の確かめの観測の出どころ・#1571 Codex R2 Low)。
+ *   generation_id = 完了の印 (単品・セットの取得の時刻と版) から決まる名前 (ne_<単品の時刻>_<版>_<セットの時刻>_<版>)
+ *   raw_hash = readNeSide が読んだ raw の行 (nm を作った行そのもの) を列の順の配列にして並べ替えた JSON の sha256 (行の並びに依らない)
+ */
+const NE_RAW_PRODUCT_COLS = ['code', 'name', 'supplier', 'handling', 'cost_src', 'price_src', 'tax_src', 'rep', 'rep_src'];
+const NE_RAW_SET_COLS = ['parent', 'name', 'child', 'price_src', 'qty_src'];
+export function neFetchIdentity(marks, ne) {
+  const digits = (t) => String(t ?? '').replace(/[^0-9]/g, '');
+  const rev = (r) => String(r ?? '').replace(/[^A-Za-z0-9_.:-]/g, '');
+  const rows = (list, cols) => (list || []).map((r) => JSON.stringify(cols.map((c) => (r[c] === undefined ? null : r[c])))).sort();
+  return {
+    generation_id: `ne_${digits(marks.products.at)}_${rev(marks.products.rev)}_${digits(marks.sets.at)}_${rev(marks.sets.rev)}`.slice(0, 120),
+    raw_hash: crypto.createHash('sha256').update(JSON.stringify({ v: 'ne-raw-1', products_at: marks.products.at, products_rev: String(marks.products.rev),
+      sets_at: marks.sets.at, sets_rev: String(marks.sets.rev), products: rows(ne.products, NE_RAW_PRODUCT_COLS), sets: rows(ne.sets, NE_RAW_SET_COLS) })).digest('hex'),
+  };
+}
 /** sync_meta の時刻 ('YYYY-MM-DD HH:MM:SS' = UTC) → ISO */
 const utcTextToIso = (t) => { const ms = Date.parse(`${String(t).replace(' ', 'T')}Z`); return Number.isFinite(ms) ? new Date(ms).toISOString() : null; };
 /** 値の状態 → 送る形 { st: ok | no_value | invalid, v } */
 const stOf = (st) => ({ st: comparability(st) === 'comparable' ? 'ok' : comparability(st) === 'no_value' ? 'no_value' : 'invalid', v: st && st.value !== undefined ? st.value : null });
 /**
  * 新規登録の商品ごとの NE の観測 (ops.record_ne_registration_check に送る形)。nm = nModelOf の結果 (完全な取得の集合)。
- * targets = [{ code_norm, sku_kind }] (ops.v_ne_reg_targets)。trusted = 正規化の衝突・取込の整合の問題が無い
+ * targets = [{ code_norm, sku_kind }] (回の始まりの写し = ops.snapshot_ne_reg_targets)。trusted = 正規化の衝突・取込の整合の問題が無い
  * 単品の列 = 名前・仕入先 (4 桁に揃えた norm)・原価・売価・税率・取扱区分・代表 (親なし = null) / セット = 名前・売価・構成品 (norm と数量)
  */
 export function registrationObservations(nm, targets, { collided = new Set(), intBlocked = new Map(), absenceTrusted = false, productsAt = null, setsAt = null, fetch = null } = {}) {

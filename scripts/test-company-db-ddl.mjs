@@ -215,10 +215,10 @@ await ta('[!] 0052 (14 ⑤-2a): 登録の状態は 1 行も作らない (backfil
 
 await ta('[!] 0053 (14 ⑤-2b): 新規登録の CSV の表 (追記だけ / 守り)・書く関数は security definer で public の実行権なし・0051 の約束に ⑤-2b の操作 (#1571 R1 High 3)・JAN の記録と専用の守り・仕入先の登録の状態と守り', async () => {
   for (const t of ['ne_reg_exports', 'ne_reg_attempts', 'ne_reg_export_items', 'ne_reg_export_rows', 'ne_reg_checks', 'supplier_registrations', 'supplier_registration_events',
-    'ne_reg_compare_runs', 'ne_reg_compare_observations', 'ne_reg_compare_receipts']) {
+    'ne_reg_compare_targets', 'ne_reg_compare_runs', 'ne_reg_compare_observations', 'ne_reg_compare_receipts']) {
     assert.ok((await q("select to_regclass('ops.' || $1) is not null as ok", [t]))[0].ok, `表 ops.${t} が無い`);
   }
-  for (const t of ['ne_reg_attempts', 'ne_reg_export_rows', 'ne_reg_checks', 'supplier_registration_events', 'ne_reg_compare_runs', 'ne_reg_compare_observations', 'ne_reg_compare_receipts']) {
+  for (const t of ['ne_reg_attempts', 'ne_reg_export_rows', 'ne_reg_checks', 'supplier_registration_events', 'ne_reg_compare_targets', 'ne_reg_compare_runs', 'ne_reg_compare_observations', 'ne_reg_compare_receipts']) {
     assert.ok((await q("select 1 from pg_trigger where tgrelid = ('ops.' || $1)::regclass and tgname = 'trg_append_only_row'", [t])).length === 1, `${t} が追記だけでない`);
   }
   // 書く関数・守りは全部 security definer・search_path = pg_catalog, pg_temp・public の実行権なし (0052 の状態の関数も置き換えた)
@@ -228,7 +228,7 @@ await ta('[!] 0053 (14 ⑤-2b): 新規登録の CSV の表 (追記だけ / 守�
     ['ops', 'guard_reg_csv_live'], ['ops', 'guard_reg_csv_write'], ['ops', 'ne_reg_build'], ['ops', 'ne_reg_canonical'], ['ops', 'ne_reg_declare'], ['ops', 'ne_reg_guard_on_save'],
     ['ops', 'ne_reg_issue'], ['ops', 'ne_reg_lock_export'], ['ops', 'ne_reg_lock_skus'], ['ops', 'ne_reg_ne_codes'], ['ops', 'ne_reg_record_verified'], ['ops', 'ne_reg_supersede'],
     ['ops', 'ne_reg_supersede_built'], ['ops', 'open_reg_write'], ['ops', 'record_ne_registration_check'], ['ops', 'record_ne_registration_observations'], ['ops', 'reg_write_gate'],
-    ['ops', 'seal_ne_registration_run'], ['ops', 'transition_sku_registration']];
+    ['ops', 'seal_ne_registration_run'], ['ops', 'snapshot_ne_reg_targets'], ['ops', 'transition_sku_registration']];
   const acl = await q(`select n.nspname as s, p.proname as n, p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub
       from pg_proc p join pg_namespace n on n.oid = p.pronamespace
      where (n.nspname::text, p.proname::text) in (select x ->> 0, x ->> 1 from jsonb_array_elements($1::jsonb) x) order by 1, 2`, [JSON.stringify(want)]);

@@ -1157,6 +1157,15 @@ await ta('[29] 新商品の NE 登録の CSV (⑤-2b): ② が最後まで走っ
   assert.equal((await pg.query('select state from ops.ne_reg_export_items where item_id = $1', [it])).rows[0].state, 'verified');
   const reg = (await pg.query(`select r.state, e.evidence from ops.master_registrations r join ops.master_registration_events e on e.sku_id = r.sku_id and e.to_state = 'ne_confirmed' where r.sku_id = $1`, [sid])).rows[0];
   assert.deepEqual([reg.state, reg.evidence.compare_run_id, reg.evidence.matched], ['ne_confirmed', x.result.compare_run_id, true]);
+  // 回の始まりの写し (#1571 Codex R2 Medium 1)・取得の世代と原本のハッシュ = 観測を作った NE の取得 (warehouse.db の完了の印と raw の行。Render の材料でない・R2 Low)
+  const cr = (await pg.query(`select r.fetch_generation, r.raw_hash, r.target_codes, t.target_codes as snap from ops.ne_reg_compare_runs r join ops.ne_reg_compare_targets t using (compare_run_id)
+     where r.compare_run_id = $1`, [x.result.compare_run_id])).rows[0];
+  const mk = x.result.ne.ne_marks;
+  const digits = (t) => String(t).replace(/[^0-9]/g, '');
+  assert.equal(cr.fetch_generation, `ne_${digits(mk.products.at)}_${mk.products.rev}_${digits(mk.sets.at)}_${mk.sets.rev}`);
+  assert.ok(!cr.fetch_generation.startsWith('mat_'));
+  assert.deepEqual([cr.target_codes, cr.snap], [['h009'], ['h009']]);
+  assert.deepEqual(x.result.ne.registrations.snapshot, { state: 'taken', target_hash: x.result.ne.registrations.snapshot.target_hash, targets: 1 });
 });
 
 await pg.close();

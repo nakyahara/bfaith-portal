@@ -1144,23 +1144,35 @@ begin
 end $$;
 revoke all on function ops.ne_reg_record_verified(uuid, text, jsonb, text, text, text, text, text, bigint) from public;
 
--- 翌朝の照合 ② の新規登録の確かめ (#1571 Codex R1 High 2): 呼び手の JSON を確かめに使わない。3 段 (どれも watch_writer・security definer の関数だけ):
---   1. ops.record_ne_registration_observations = 回ごとに 1 回、取得の世代・時刻・原本のハッシュ・確かめ待ちの商品・観測を残す (DB が観測のハッシュを計算)
+-- 翌朝の照合 ② の新規登録の確かめ (#1571 Codex R1 High 2・R2 Medium 1 / 2): 呼び手の JSON を確かめに使わない。4 段 (どれも watch_writer・security definer の関数だけ):
+--   0. ops.snapshot_ne_reg_targets = 照合の回の始まりに、確かめ待ちの商品 (ops.v_ne_reg_targets) を DB が回に写す (変えない。同じ回の 2 回目 = 写したものを返す)
+--   1. ops.record_ne_registration_observations = 回ごとに 1 回、取得の世代・時刻・原本のハッシュ・観測を残す。観測は 0. の写しとちょうど同じ商品 (今の見え方でなく写し =
+--      取得の途中の配る・申告・使わないと競わない)。DB が観測のハッシュと入力全体のハッシュを計算
 --   2. ops.seal_ne_registration_run = 回が最後まで終わった受け取り (観測のハッシュ = 1. と同じ・結果の JSON の sha256)。受け取りの後は観測を足せない
 --   3. ops.record_ne_registration_check(回の番号) = 受け取りと残した観測を関数が自分で読んで確かめる (観測のハッシュを数え直して受け取りと同じときだけ)
--- 🚨 3 つの表は追記だけ (変えない・消さない)。照合の書き手 (apps/company-db/master-compare/run.mjs) は 1. → (基準・結果の JSON) → 2. → 完了の証跡 → 3. の順
+-- 🚨 4 つの表は追記だけ (変えない・消さない)。照合の書き手 (apps/company-db/master-compare/run.mjs) は 0. → (照合) → 1. → (基準・結果の JSON) → 2. → 完了の証跡 → 3. の順
+create table ops.ne_reg_compare_targets (
+  compare_run_id text primary key check (compare_run_id ~ '^mc_[0-9]{8}T[0-9]{9}Z_[0-9a-f]{6}$'),   -- 照合の回 (回の記録は後で判断の台帳が書く = 外部キーにしない)
+  targets        jsonb not null check (jsonb_typeof(targets) = 'array'),   -- [{ code_norm, sku_kind }] コードの順
+  target_codes   text[] not null,
+  target_hash    text not null check (target_hash ~ '^[0-9a-f]{64}$'),
+  taken_at       timestamptz not null default pg_catalog.clock_timestamp()
+);
+select core.make_append_only('ops', 'ne_reg_compare_targets');
+comment on table ops.ne_reg_compare_targets is '照合の回の始まりに写した確かめ待ちの商品 (0053・#1571 R2 Medium 1)。観測はこれとちょうど同じ商品だけ';
 create table ops.ne_reg_compare_runs (
-  compare_run_id    text primary key references ops.master_compare_runs (compare_run_id),
-  fetch_generation  text not null check (fetch_generation ~ '^[A-Za-z0-9_.:-]{1,120}$'),   -- 材料の世代 (照合が読んだ今朝の世代)
+  compare_run_id    text primary key references ops.master_compare_runs (compare_run_id) references ops.ne_reg_compare_targets (compare_run_id),
+  fetch_generation  text not null check (fetch_generation ~ '^[A-Za-z0-9_.:-]{1,120}$'),   -- NE の完全な取得の世代 (warehouse.db の完了の印の時刻と版)
   products_at       timestamptz not null,   -- NE の完全な取得の時刻 (単品)
   sets_at           timestamptz not null,   -- NE の完全な取得の時刻 (セット)
   products_rev      text not null check (length(products_rev) between 1 and 80),
   sets_rev          text not null check (length(sets_rev) between 1 and 80),
-  raw_hash          text not null check (raw_hash ~ '^[0-9a-f]{64}$'),
+  raw_hash          text not null check (raw_hash ~ '^[0-9a-f]{64}$'),   -- 観測を作った NE の取得の行 (warehouse.db の raw) をそろえたハッシュ
   absence_trusted   boolean not null,       -- 取得で落ちた行が無い = 「無い」を信じてよい
-  target_codes      text[] not null,        -- 確かめ待ちの商品 (照合が読んだ時)
+  target_codes      text[] not null,        -- 確かめ待ちの商品 (0. の写し)
   observation_count integer not null check (observation_count >= 0),
   observation_hash  text not null check (observation_hash ~ '^[0-9a-f]{64}$'),   -- 関数が計算 (観測をコードの順に並べた jsonb の sha256)
+  input_hash        text not null check (input_hash ~ '^[0-9a-f]{64}$'),         -- 関数が計算 (取得・時刻・「無い」を信じるか・写し・観測のハッシュをそろえた形の sha256)
   recorded_at       timestamptz not null default pg_catalog.clock_timestamp()
 );
 select core.make_append_only('ops', 'ne_reg_compare_runs');
@@ -1219,10 +1231,41 @@ begin
 end $$;
 
 /**
+ * 0. 確かめ待ちの商品を回に写す (照合の回の始まり・#1571 R2 Medium 1)。写すのは DB (ops.v_ne_reg_targets の今) = 呼び手は商品を選べない。
+ * 同じ回の 2 回目 = 前に写したものを返す (変えない)。戻り値 { state: taken | existing, targets: [{ code_norm, sku_kind }], target_hash, taken_at }
+ */
+create function ops.snapshot_ne_reg_targets(p_run text) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_prev  ops.ne_reg_compare_targets%rowtype;
+  v_t     jsonb;
+  v_codes text[];
+  v_hash  text;
+begin
+  if p_run is null or p_run !~ '^mc_[0-9]{8}T[0-9]{9}Z_[0-9a-f]{6}$' then raise exception 'invalid_input: compare_run_id の形が違う: %', p_run using errcode = '22023'; end if;
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('ops.ne_reg_compare_run:' || p_run, 0));
+  select * into v_prev from ops.ne_reg_compare_targets t where t.compare_run_id = p_run;
+  if found then
+    return pg_catalog.jsonb_build_object('state', 'existing', 'compare_run_id', p_run, 'targets', v_prev.targets, 'target_hash', v_prev.target_hash, 'taken_at', v_prev.taken_at);
+  end if;
+  select coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('code_norm', x.code_norm, 'sku_kind', x.sku_kind) order by x.code_norm collate "C"), '[]'::jsonb),
+         coalesce(pg_catalog.array_agg(x.code_norm order by x.code_norm collate "C"), '{}')
+    into v_t, v_codes
+    from (select distinct on (t.code_norm) t.code_norm, t.sku_kind from ops.v_ne_reg_targets t order by t.code_norm, t.sku_kind) x;
+  v_hash := ops.reg_hash(v_t);
+  insert into ops.ne_reg_compare_targets (compare_run_id, targets, target_codes, target_hash) values (p_run, v_t, v_codes, v_hash);
+  return pg_catalog.jsonb_build_object('state', 'taken', 'compare_run_id', p_run, 'targets', v_t, 'target_hash', v_hash,
+    'taken_at', (select t.taken_at from ops.ne_reg_compare_targets t where t.compare_run_id = p_run));
+end $$;
+revoke all on function ops.snapshot_ne_reg_targets(text) from public;
+
+/**
  * 1. 観測を残す (照合 ② の回ごとに 1 回)。p = { compare_run_id, fetch: { generation_id, products_rev, sets_rev, raw_hash }, products_at, sets_at,
- *    absence_trusted, targets: [code_norm], observations: [{ code_norm, present, trusted, kind, cols, children }] }
- * 確かめること: 照合の回がある・取得の時刻が照合の回の時刻 (+5 分) より後でない・確かめ待ちの商品は新規登録の CSV の商品で重ならない・観測は確かめ待ちの商品ごとにちょうど 1 つ・形。
- * 同じ回の 2 回目 = 中身 (観測のハッシュと取得) が同じなら何もしない・違えば拒む。戻り値 { state, observation_hash, observations }
+ *    absence_trusted, targets?: [code_norm], observations: [{ code_norm, present, trusted, kind, cols, children }] }
+ * 確かめること: 照合の回がある・回の始まりの写し (0.) がある (回の記録の前後 60 分の中で写した)・取得の時刻が照合の回の時刻 (+5 分) より後でない・
+ *   観測は写しの商品ごとにちょうど 1 つ (targets を送るなら写しと同じ)・形。
+ * 同じ回の 2 回目 = 入力全体のハッシュ (取得・時刻・「無い」を信じるか・写し・観測。#1571 R2 Medium 2) が同じなら何もしない・違えば拒む。
+ * 戻り値 { state, observation_hash, observations }
  */
 create function ops.record_ne_registration_observations(p jsonb) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
@@ -1233,14 +1276,23 @@ declare
   v_sat   timestamptz;
   v_tgts  text[];
   v_runat timestamptz;
+  v_rec   timestamptz;
+  v_snap  ops.ne_reg_compare_targets%rowtype;
   v_prev  ops.ne_reg_compare_runs%rowtype;
   v_hash  text;
+  v_input text;
+  v_given text[];
   v_bad   text;
-  v_n     integer;
 begin
   if v_run is null or v_run !~ '^mc_[0-9]{8}T[0-9]{9}Z_[0-9a-f]{6}$' then raise exception 'invalid_input: compare_run_id の形が違う: %', v_run using errcode = '22023'; end if;
-  select m.observed_at into v_runat from ops.master_compare_runs m where m.compare_run_id = v_run;
+  select m.observed_at, m.recorded_at into v_runat, v_rec from ops.master_compare_runs m where m.compare_run_id = v_run;
   if not found then raise exception 'unknown_run: 照合の回の記録が無い: %', v_run using errcode = '23503'; end if;
+  -- 回の始まりの写し (0.)。回の記録 (判断の台帳が書いた時刻) の前後 60 分の中で写したものだけ (前もって・後から写した写しは使わない)
+  select * into v_snap from ops.ne_reg_compare_targets t where t.compare_run_id = v_run;
+  if not found then raise exception 'no_targets_snapshot: 照合の回 % の始まりに確かめ待ちの商品を写していない (先に ops.snapshot_ne_reg_targets)', v_run using errcode = 'P0001'; end if;
+  if v_snap.taken_at < v_rec - interval '60 minutes' or v_snap.taken_at > v_rec + interval '60 minutes' then
+    raise exception 'stale_targets_snapshot: 照合の回 % の写し (%) が回の記録 (%) から離れている', v_run, v_snap.taken_at, v_rec using errcode = 'P0001';
+  end if;
   if pg_catalog.jsonb_typeof(f) is distinct from 'object' or coalesce(f ->> 'generation_id', '') !~ '^[A-Za-z0-9_.:-]{1,120}$'
      or coalesce(f ->> 'raw_hash', '') !~ '^[0-9a-f]{64}$' or coalesce(pg_catalog.length(f ->> 'products_rev'), 0) not between 1 and 80
      or coalesce(pg_catalog.length(f ->> 'sets_rev'), 0) not between 1 and 80 then
@@ -1254,35 +1306,45 @@ begin
     raise exception 'invalid_input: 取得の時刻が照合の回 (%) より後になっている', v_runat using errcode = '22023';
   end if;
   if pg_catalog.jsonb_typeof(p -> 'absence_trusted') is distinct from 'boolean' then raise exception 'invalid_input: absence_trusted (true / false) が要る' using errcode = '22023'; end if;
-  if pg_catalog.jsonb_typeof(p -> 'targets') is distinct from 'array' or pg_catalog.jsonb_typeof(p -> 'observations') is distinct from 'array'
-     or exists (select 1 from pg_catalog.jsonb_array_elements(p -> 'targets') t where pg_catalog.jsonb_typeof(t) <> 'string' or (t #>> '{}') = '') then
+  if pg_catalog.jsonb_typeof(p -> 'observations') is distinct from 'array'
+     or (p ? 'targets' and (pg_catalog.jsonb_typeof(p -> 'targets') is distinct from 'array'
+         or exists (select 1 from pg_catalog.jsonb_array_elements(p -> 'targets') t where pg_catalog.jsonb_typeof(t) <> 'string' or (t #>> '{}') = ''))) then
     raise exception 'invalid_input: targets・observations が配列でない' using errcode = '22023';
   end if;
-  select coalesce(pg_catalog.array_agg(t order by t collate "C"), '{}'), pg_catalog.count(distinct t) into v_tgts, v_n from pg_catalog.jsonb_array_elements_text(p -> 'targets') t;
-  if v_n <> pg_catalog.cardinality(v_tgts) then raise exception 'invalid_input: targets が重なる' using errcode = '22023'; end if;
-  -- 確かめ待ちの商品 = 新規登録の CSV の商品 (知らないコードの観測を残さない)
-  if exists (select 1 from pg_catalog.unnest(v_tgts) t where not exists (select 1 from ops.ne_reg_export_items i where i.code_norm = t)) then
-    raise exception 'invalid_input: targets に新規登録の CSV の商品でないコードがある' using errcode = '22023';
+  -- 確かめ待ちの商品 = 回の始まりの写し (呼び手の targets は写しと同じときだけ受ける・今の見え方は使わない)
+  v_tgts := v_snap.target_codes;
+  if p ? 'targets' then
+    select coalesce(pg_catalog.array_agg(t order by t collate "C"), '{}') into v_given from pg_catalog.jsonb_array_elements_text(p -> 'targets') t;
+    if v_given is distinct from v_tgts then
+      raise exception 'invalid_input: targets が回の始まりの写し (確かめ待ちの商品 % 件) と違う', pg_catalog.cardinality(v_tgts) using errcode = '22023';
+    end if;
   end if;
-  -- 観測 = 確かめ待ちの商品ごとにちょうど 1 つ・形
+  -- 観測 = 写しの商品ごとにちょうど 1 つ (抜け・余り・重なりを拒む)・形
   if (select coalesce(pg_catalog.array_agg(o ->> 'code_norm' order by o ->> 'code_norm' collate "C"), '{}') from pg_catalog.jsonb_array_elements(p -> 'observations') o) is distinct from v_tgts then
-    raise exception 'invalid_input: 観測が確かめ待ちの商品ごとにちょうど 1 つでない' using errcode = '22023';
+    raise exception 'invalid_input: 観測が回の始まりの写しの商品 (% 件) ごとにちょうど 1 つでない', pg_catalog.cardinality(v_tgts) using errcode = '22023';
   end if;
   select pg_catalog.min(x.problem) into v_bad from (select ops.ne_reg_observation_problem(o) as problem from pg_catalog.jsonb_array_elements(p -> 'observations') o) x;
   if v_bad is not null then raise exception 'invalid_input: 観測の形が違う (%)', v_bad using errcode = '22023'; end if;
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('ops.ne_reg_compare_run:' || v_run, 0));
   v_hash := pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(coalesce((select pg_catalog.jsonb_agg(o order by o ->> 'code_norm' collate "C")
     from pg_catalog.jsonb_array_elements(p -> 'observations') o), '[]'::jsonb)::text, 'UTF8')), 'hex');
+  -- 入力全体のハッシュ (#1571 R2 Medium 2): 時刻は UTC の決まった書き方にそろえる (同じ時刻の別の書き方は同じ)。知らない鍵は入れない
+  v_input := ops.reg_hash(pg_catalog.jsonb_build_object('v', 'nrc-1',
+    'fetch', pg_catalog.jsonb_build_object('generation_id', f ->> 'generation_id', 'products_rev', f ->> 'products_rev', 'sets_rev', f ->> 'sets_rev', 'raw_hash', f ->> 'raw_hash'),
+    'products_at', pg_catalog.to_char(v_pat at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+    'sets_at', pg_catalog.to_char(v_sat at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+    'absence_trusted', (p ->> 'absence_trusted')::boolean, 'targets', pg_catalog.to_jsonb(v_tgts), 'target_hash', v_snap.target_hash, 'observation_hash', v_hash));
   select * into v_prev from ops.ne_reg_compare_runs r where r.compare_run_id = v_run;
   if found then
-    if v_prev.observation_hash = v_hash and v_prev.fetch_generation = (f ->> 'generation_id') and v_prev.raw_hash = (f ->> 'raw_hash') then
+    if v_prev.input_hash = v_input then
       return pg_catalog.jsonb_build_object('state', 'unchanged', 'observation_hash', v_hash, 'observations', v_prev.observation_count);
     end if;
-    raise exception 'run_conflict: 照合の回 % の観測はもう残っていて中身が違う', v_run using errcode = '23505';
+    raise exception 'run_conflict: 照合の回 % の観測はもう残っていて中身 (取得・時刻・「無い」を信じるか・観測) が違う', v_run using errcode = '23505';
   end if;
-  insert into ops.ne_reg_compare_runs (compare_run_id, fetch_generation, products_at, sets_at, products_rev, sets_rev, raw_hash, absence_trusted, target_codes, observation_count, observation_hash)
+  insert into ops.ne_reg_compare_runs (compare_run_id, fetch_generation, products_at, sets_at, products_rev, sets_rev, raw_hash, absence_trusted, target_codes, observation_count,
+                                       observation_hash, input_hash)
     values (v_run, f ->> 'generation_id', v_pat, v_sat, f ->> 'products_rev', f ->> 'sets_rev', f ->> 'raw_hash', (p ->> 'absence_trusted')::boolean, v_tgts,
-            pg_catalog.jsonb_array_length(p -> 'observations'), v_hash);
+            pg_catalog.jsonb_array_length(p -> 'observations'), v_hash, v_input);
   insert into ops.ne_reg_compare_observations (compare_run_id, code_norm, observation)
     select v_run, o ->> 'code_norm', o from pg_catalog.jsonb_array_elements(p -> 'observations') o;
   if ops.ne_reg_observation_hash(v_run) is distinct from v_hash then raise exception 'observation_hash_mismatch: 残した観測のハッシュが違う' using errcode = 'P0001'; end if;
@@ -2079,10 +2141,11 @@ revoke all on function ops.record_ne_set_observations(jsonb) from public;
 do $$ begin
   if exists (select 1 from pg_roles where rolname = 'watcher') then
     execute 'grant select on ops.ne_reg_exports, ops.ne_reg_attempts, ops.ne_reg_export_items, ops.ne_reg_export_rows, ops.ne_reg_checks, ops.v_ne_reg_targets, ops.supplier_registrations, ops.supplier_registration_events,
-      ops.ne_reg_compare_runs, ops.ne_reg_compare_observations, ops.ne_reg_compare_receipts to watcher';
+      ops.ne_reg_compare_targets, ops.ne_reg_compare_runs, ops.ne_reg_compare_observations, ops.ne_reg_compare_receipts to watcher';
   end if;
   if exists (select 1 from pg_roles where rolname = 'watch_writer') then
     execute 'grant usage on schema ops to watch_writer';
-    execute 'grant execute on function ops.record_ne_registration_observations(jsonb), ops.seal_ne_registration_run(text, text, text), ops.record_ne_registration_check(text) to watch_writer';
+    execute 'grant execute on function ops.snapshot_ne_reg_targets(text), ops.record_ne_registration_observations(jsonb), ops.seal_ne_registration_run(text, text, text),
+      ops.record_ne_registration_check(text) to watch_writer';
   end if;
 end $$;

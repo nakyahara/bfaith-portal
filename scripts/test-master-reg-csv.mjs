@@ -200,9 +200,18 @@ async function newRun() {
  * observe / seal / checkRun を別々に呼べる (途中で落ちた回の試験)。check = 3 段を続けて
  */
 const FETCH = (run) => ({ generation_id: `gen_${run}`, products_rev: '7', sets_rev: '8', raw_hash: crypto.createHash('sha256').update(run).digest('hex') });
-const observe = (run, observations, { productsAt = new Date(Date.now() + 60000).toISOString(), setsAt = productsAt, absenceTrusted = true, targets = null, fetch = FETCH(run) } = {}) =>
-  as(E, 'watch_writer', async () => (await pg.query('select ops.record_ne_registration_observations($1::jsonb) as r', [JSON.stringify({ compare_run_id: run, fetch,
-    products_at: productsAt, sets_at: setsAt, absence_trusted: absenceTrusted, targets: targets ?? observations.map((o) => o.code_norm), observations })])).rows[0].r);
+/** 回の始まりの写し (0. = 確かめ待ちの商品を DB が回へ写す・#1571 Codex R2 Medium 1) */
+const snapTargets = (run) => as(E, 'watch_writer', async () => (await pg.query('select ops.snapshot_ne_reg_targets($1) as r', [run])).rows[0].r);
+/** 回ごとの取得の時刻 (既定 = 回で 1 つに決める = 同じ回の 2 回目に同じ入力を送れる) */
+const ATS = new Map();
+const atOf = (run) => { if (!ATS.has(run)) ATS.set(run, new Date(Date.now() + 60000).toISOString()); return ATS.get(run); };
+/** 1. 観測を残す。先に回の始まりの写しを取る (snapshot: false = 取らない)。targets は送るときだけ (既定 = 送らない = 写しで決まる) */
+const observe = async (run, observations, { productsAt = null, setsAt = null, absenceTrusted = true, targets, fetch = FETCH(run), snapshot = true } = {}) => {
+  if (snapshot) await snapTargets(run);
+  const pAt = productsAt ?? atOf(run);
+  return as(E, 'watch_writer', async () => (await pg.query('select ops.record_ne_registration_observations($1::jsonb) as r', [JSON.stringify({ compare_run_id: run, fetch,
+    products_at: pAt, sets_at: setsAt ?? pAt, absence_trusted: absenceTrusted, ...(targets === undefined ? {} : { targets }), observations })])).rows[0].r);
+};
 const seal = (run, hash, evidence = 'e'.repeat(64)) => as(E, 'watch_writer', async () => (await pg.query('select ops.seal_ne_registration_run($1, $2, $3) as r', [run, hash, evidence])).rows[0].r);
 const checkRun = (run) => as(E, 'watch_writer', async () => (await pg.query('select ops.record_ne_registration_check($1) as r', [run])).rows[0].r);
 const check = async (run, observations, o = {}) => { const w = await observe(run, observations, o); await seal(run, w.observation_hash); return checkRun(run); };
@@ -510,6 +519,7 @@ await ta('[C14] 権限の境界: 画面のロールは表を直接書けない�
   await denied("select ops.record_ne_registration_check('mc_20300110T000000000Z_aaaaaa')");
   await denied("select ops.record_ne_registration_observations('{}'::jsonb)");
   await denied("select ops.seal_ne_registration_run('mc_20300110T000000000Z_aaaaaa', repeat('a', 64), repeat('b', 64))");
+  await denied("select ops.snapshot_ne_reg_targets('mc_20300110T000000000Z_aaaaaa')");
   await denied(`select ops.declare_supplier_in_ne(gen_random_uuid(), 'x', '${OWN}'::jsonb, '0001', '0001', null)`);
   // 3. 状態の関数は呼び手の根拠を受けない (持ち主のロールでも)・NE 登録待ちの根拠 = 取り込んだと申告した品目だけ
   await reg('single', 'new-k', single({ name: 'K' }));
@@ -596,7 +606,7 @@ await ta('[C14] 権限の境界: 画面のロールは表を直接書けない�
   const want = ['close_reg_write', 'create_supplier', 'deactivate_supplier', 'declare_supplier_in_ne', 'edit_sku_jan', 'guard_reg_csv_live', 'guard_reg_csv_write',
     'ne_reg_build', 'ne_reg_canonical', 'ne_reg_declare', 'ne_reg_guard_on_save', 'ne_reg_issue', 'ne_reg_lock_export', 'ne_reg_lock_skus', 'ne_reg_ne_codes',
     'ne_reg_record_verified', 'ne_reg_supersede', 'ne_reg_supersede_built', 'open_reg_write', 'record_ne_registration_check', 'record_ne_registration_observations',
-    'reg_write_gate', 'seal_ne_registration_run', 'transition_sku_registration'];
+    'reg_write_gate', 'seal_ne_registration_run', 'snapshot_ne_reg_targets', 'transition_sku_registration'];
   const fns = await q(`select p.proname, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub
      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
     where n.nspname = 'ops' and p.prosecdef and (p.proname like 'ne!_reg!_%' escape '!' or p.proname = any($1::text[])) order by p.proname`, [want]);
@@ -730,7 +740,8 @@ await ta('[C17] 照合の確かめ = 受け取りのある回の残した観測�
   assert.equal((await observe(r1, [obsSingle('new-v', { name: ok('V') })])).state, 'unchanged');
   // 4. 表は直接書けない (watch_writer)・受け取りの後は観測を足せない (持ち主のロールでも)・書き換えられない
   for (const sql of ["insert into ops.ne_reg_compare_receipts (compare_run_id, observation_hash, evidence_sha256) values ('x', repeat('a', 64), repeat('b', 64))",
-    "insert into ops.ne_reg_compare_observations (compare_run_id, code_norm, observation) values ('x', 'y', '{}'::jsonb)"]) {
+    "insert into ops.ne_reg_compare_observations (compare_run_id, code_norm, observation) values ('x', 'y', '{}'::jsonb)",
+    "insert into ops.ne_reg_compare_targets (compare_run_id, targets, target_codes, target_hash) values ('mc_20300109T000000000Z_ffffff', '[]'::jsonb, '{}', repeat('a', 64))"]) {
     const e = await as(E, 'watch_writer', () => pgErr(pg.query(sql)));
     assert.equal(e.code, '42501', sql);
   }
@@ -743,17 +754,73 @@ await ta('[C17] 照合の確かめ = 受け取りのある回の残した観測�
   assert.equal(await regOf('new-v'), 'ne_confirmed');
   const ck = await one("select c.detail from ops.ne_reg_checks c join core.skus s on s.sku_id = c.sku_id where s.code = 'new-v' and c.compare_run_id = $1", [r1]);
   assert.deepEqual([ck.detail.fetch_generation, ck.detail.evidence_sha256], [`gen_${r1}`, 'e'.repeat(64)]);
-  // 6. 形: 知らないコード・確かめ待ちの商品の観測が足りない・照合の回より後の取得・取得の世代が無い・列の形 = 拒む (何も残さない)
+  // 6. 形: 写しに無いコード・確かめ待ちの商品の観測が足りない・照合の回より後の取得・取得の世代が無い・列の形 = 拒む (何も残さない)
+  await reg('single', 'new-v2', single({ name: 'V2' }));
+  const v2 = await build('products', ['new-v2']);
+  await issue(v2.export.export_id);
+  await declare(v2.export.export_id, v2.export.sha256);
   const r2 = await newRun();
-  await pgErr(observe(r2, [obsSingle('zzz-none')]), /新規登録の CSV の商品でない/);
-  await pgErr(observe(r2, [obsSingle('new-v')], { targets: ['new-v', 'new-a'] }), /ちょうど 1 つ/);
-  await pgErr(observe(r2, [obsSingle('new-v')], { productsAt: '2031-01-01T00:00:00Z' }), /照合の回/);
-  await pgErr(observe(r2, [obsSingle('new-v')], { fetch: { generation_id: 'g' } }), /fetch/);
-  await pgErr(observe(r2, [{ ...obsSingle('new-v'), cols: { name: { st: 'yes', v: 'V' } } }]), /観測の形/);
-  await pgErr(observe(r2, [{ ...obsSingle('new-v'), present: 'yes' }]), /観測の形/);
+  await pgErr(observe(r2, [obsSingle('zzz-none')]), /写しの商品/);
+  await pgErr(observe(r2, [obsSingle('new-v2'), obsSingle('zzz-none')]), /写しの商品/);
+  await pgErr(observe(r2, [obsSingle('new-v2')], { targets: ['new-v2', 'new-a'] }), /targets が回の始まりの写し/);
+  await pgErr(observe(r2, [obsSingle('new-v2')], { productsAt: '2031-01-01T00:00:00Z' }), /照合の回/);
+  await pgErr(observe(r2, [obsSingle('new-v2')], { fetch: { generation_id: 'g' } }), /fetch/);
+  await pgErr(observe(r2, [{ ...obsSingle('new-v2'), cols: { name: { st: 'yes', v: 'V' } } }]), /観測の形/);
+  await pgErr(observe(r2, [{ ...obsSingle('new-v2'), present: 'yes' }]), /観測の形/);
   assert.equal(Number((await one('select count(*)::int as n from ops.ne_reg_compare_runs where compare_run_id = $1', [r2])).n), 0);
+  await supersede(v2.export.export_id);
   // 照合の回の記録が無い回 = 拒む
   await pgErr(observe('mc_20300109T999999999Z_cccccc', [obsSingle('new-v')]), /unknown_run/);
+});
+
+await ta('[C18] 観測 = 回の始まりの写しとちょうど同じ商品 (#1571 Codex R2 Medium 1: 2 つのうち 1 つだけ送る = 拒む・写した後の配る / 使わないに依らない)・同じ回の 2 回目は入力全体で比べる (Medium 2: 時刻・版・「無い」を信じるかの違い = run_conflict)', async () => {
+  const live = async (code, name) => {
+    await reg('single', code, single({ name }));
+    const x = await build('products', [code]);
+    await issue(x.export.export_id);
+    await declare(x.export.export_id, x.export.sha256);
+    return x.export.export_id;
+  };
+  const x1 = await live('new-w1', 'W1');
+  const x2 = await live('new-w2', 'W2');
+  // 1. 写し = DB が今の確かめ待ちから決める (呼び手は選べない)。2 つのうち 1 つだけ送る・targets を 1 つにする = 拒む
+  const r1 = await newRun();
+  const s1 = await snapTargets(r1);
+  assert.deepEqual([s1.state, s1.targets.map((t) => [t.code_norm, t.sku_kind])], ['taken', [['new-w1', 'single'], ['new-w2', 'single']]]);
+  const o1 = obsSingle('new-w1', { name: ok('W1') });
+  const o2 = obsSingle('new-w2', { name: ok('W2') });
+  await pgErr(observe(r1, [o1]), /写しの商品 \(2 件\)/);
+  await pgErr(observe(r1, [o1], { targets: ['new-w1'] }), /targets が回の始まりの写し/);
+  await pgErr(observe(r1, [o1, o1]), /写しの商品/);
+  // 2. 写しは変えない: 写した後に配った商品 (W3) は入れない・写した後に使わないにした商品 (W2) も写しのまま (今の見え方でなく写しと比べる)
+  const x3 = await live('new-w3', 'W3');
+  await supersede(x2);
+  const s2 = await snapTargets(r1);
+  assert.deepEqual([s2.state, s2.target_hash], ['existing', s1.target_hash]);
+  await pgErr(observe(r1, [o1, obsSingle('new-w3', { name: ok('W3') })]), /写しの商品/);
+  const w = await observe(r1, [o1, o2]);
+  assert.equal(w.state, 'written');
+  assert.deepEqual((await one('select target_codes from ops.ne_reg_compare_runs where compare_run_id = $1', [r1])).target_codes, ['new-w1', 'new-w2']);
+  // 3. 同じ回の 2 回目 = 入力全体が同じなら何もしない (同じ時刻の別の書き方も同じ)・どれか違えば拒む (「無い」を信じるかを後から変えられない)
+  const P = atOf(r1);
+  assert.equal((await observe(r1, [o2, o1], { productsAt: P.replace('Z', '+00:00') })).state, 'unchanged');
+  const earlier = new Date(Date.parse(P) - 1000).toISOString();
+  for (const o of [{ productsAt: earlier, setsAt: P }, { setsAt: earlier }, { fetch: { ...FETCH(r1), products_rev: '9' } }, { fetch: { ...FETCH(r1), sets_rev: '9' } },
+    { fetch: { ...FETCH(r1), generation_id: 'gen_other' } }, { fetch: { ...FETCH(r1), raw_hash: 'f'.repeat(64) } }, { absenceTrusted: false }]) {
+    await pgErr(observe(r1, [o1, o2], o), /run_conflict/);
+  }
+  // 確かめ = 写しの商品のうち、今も確かめ待ちの商品だけ (W2 は使わないにした = 確かめない・W3 は次の回)
+  await seal(r1, w.observation_hash);
+  assert.deepEqual((await checkRun(r1)).counts, { verified: 1 });
+  assert.deepEqual([await regOf('new-w1'), await regOf('new-w2'), await regOf('new-w3')], ['ne_confirmed', 'ne_pending', 'ne_pending']);
+  // 4. 写しが無い回・回の記録から 60 分より離れた写し = 拒む
+  const r2 = await newRun();
+  await pgErr(observe(r2, [obsSingle('new-w3', { name: ok('W3') })], { snapshot: false }), /no_targets_snapshot/);
+  const r3 = 'mc_20300109T000000999Z_dddddd';
+  await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates, recorded_at) values ($1, '2030-01-09T09:30:00Z', 0, now() - interval '2 hours')`, [r3]);
+  await pgErr(observe(r3, [obsSingle('new-w3', { name: ok('W3') })]), /stale_targets_snapshot/);
+  await supersede(x3);
+  assert.ok(x1);
 });
 
 console.log('\nJAN (H6)');
@@ -1239,6 +1306,17 @@ await ta('[P1] registrationObservations: 完全な取得の集合から、確か
   assert.deepEqual(s.children, [{ code_norm: 's001', st: 'ok', v: 2 }]);
   assert.deepEqual([g.present, g.trusted], [false, true]);
   assert.equal(b.trusted, false);
+  // 取得の世代と原本のハッシュ (#1571 Codex R2 Low) = NE の完全な取得の印と raw の行 (行の並びに依らない・1 つのセルが違えば違う)
+  const marks = { products: { at: '2030-01-10 00:00:00', rev: 7 }, sets: { at: '2030-01-10 00:01:00', rev: 8 } };
+  const ne = { products: [{ code: 'a1', name: 'A', supplier: '1', handling: '取扱中', cost_src: '"1"', price_src: '"2"', tax_src: '"10"', rep: '', rep_src: '""' },
+    { code: 'b1', name: 'B', supplier: '1', handling: '取扱中', cost_src: '"1"', price_src: '"2"', tax_src: '"10"', rep: '', rep_src: '""' }],
+  sets: [{ parent: 's1', name: 'S', child: 'a1', price_src: '"5"', qty_src: '"2"' }] };
+  const id0 = CNE.neFetchIdentity(marks, ne);
+  assert.equal(id0.generation_id, 'ne_20300110000000_7_20300110000100_8');
+  assert.match(id0.raw_hash, /^[0-9a-f]{64}$/);
+  assert.equal(CNE.neFetchIdentity(marks, { ...ne, products: [...ne.products].reverse() }).raw_hash, id0.raw_hash);
+  assert.notEqual(CNE.neFetchIdentity(marks, { ...ne, sets: [{ ...ne.sets[0], qty_src: '"3"' }] }).raw_hash, id0.raw_hash);
+  assert.notEqual(CNE.neFetchIdentity({ ...marks, products: { ...marks.products, rev: 9 } }, ne).raw_hash, id0.raw_hash);
 });
 
 console.log('\n画面 (master-edit)');
