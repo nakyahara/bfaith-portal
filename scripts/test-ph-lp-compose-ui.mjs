@@ -147,6 +147,12 @@ eq(sub.status, 'done', '結果を受け取れる');
   ok(s.job.lint && s.job.lint.source === 'server', '🚨 lint はサーバーの結果 (PR1-c)');
   eq(s.job.review_rounds, 1, '検品の巡回数が出る');
   ok(typeof s.job.elapsed_sec === 'number', '所要時間が出る');
+  // 測定台帳 (設計 §7.1b) に書き写す値が画面に出ていること。
+  //    画面は作らない方針なので、台帳に要る値だけを出す
+  ok(html.includes('id=\"lpc-meas\"'), '🚨 測定用の行の置き場がある');
+  ok(typeof s.job.packet_hash === 'string' && s.job.packet_hash.length === 64, '台帳に要る packet_hash が渡っている');
+  ok(typeof s.job.spec_id === 'number', '台帳に要る spec_id が渡っている');
+  ok(s.job.within_deadline === true || s.job.within_deadline === false, '台帳に要る「期限内」が渡っている');
 
   console.log('⑤b 🚨 AI の本文で HTML が壊れない');
   // 🚨 文字列としての window.__lpcPwned は残る (本文なので当然)。

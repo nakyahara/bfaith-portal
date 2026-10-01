@@ -120,6 +120,8 @@ await ta('[!] 期待する表がすべてある', async () => {
     'ops.ne_set_observation_runs', 'ops.ne_set_observations', 'ops.sku_component_breaches',
     // 0052 新商品の登録と登録の状態・product-hub のカードの outbox (14 ⑤-2a)
     'ops.master_registrations', 'ops.master_registration_events', 'ops.master_registration_backfill', 'ops.product_hub_outbox',
+    // 0053 新商品の NE 登録の CSV・仕入先の登録の状態 (14 ⑤-2b)
+    'ops.ne_reg_exports', 'ops.ne_reg_attempts', 'ops.ne_reg_export_items', 'ops.ne_reg_export_rows', 'ops.ne_reg_checks', 'ops.supplier_registrations', 'ops.supplier_registration_events',
   ];
   const missing = expect.filter((t) => !have.has(t));
   assert.deepEqual(missing, [], `無い表: ${missing.join(', ')}`);
@@ -152,7 +154,7 @@ await ta('[!] 0051 (14 §6 ⑤-1・#1563 R1・R2): 切替の段階は legacy_ope
   assert.deepEqual((await q('select core.master_write_lock_key()::text as k'))[0], { k: '4705310051' });
   // #1563 R3: 黙っているプロセスは年齢で外さない (時間の窓の関数は無い)・前提の差し込み口の表 (空)・画面のロールの書き込みの約束 (begin + 7 つの表の guard)
   assert.equal((await q("select to_regprocedure('ops.master_cutover_ack_silent_hours()') is null as gone"))[0].gone, true);
-  assert.deepEqual((await q('select name from ops.master_cutover_prereq_checks order by 1')).map((r) => r.name), ['0052_registrations']);   // 0051 は 0 行・0052 (⑤-2a) が 1 行足す
+  assert.deepEqual((await q('select name from ops.master_cutover_prereq_checks order by 1')).map((r) => r.name), ['0052_registrations', '0054_amazon_map']);   // 0051 は 0 行・0052 (⑤-2a)・0054 (⑦-1 消えた対応) が 1 行ずつ足す
   const guards = await q("select c.relnamespace::regnamespace::text || '.' || c.relname as t from pg_trigger g join pg_class c on c.oid = g.tgrelid where g.tgname = 'trg_master_edit_guard' order by 1");
   assert.deepEqual(guards.map((r) => r.t), ['core.products', 'core.sku_costs', 'core.skus', 'core.supplier_skus', 'ops.master_edit_requests', 'ops.sku_component_breaches', 'ops.sku_component_requests']);
   const be = (await q("select p.prosecdef, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p where p.oid = 'ops.begin_master_write(uuid, text, text, jsonb, text, bigint, text, text, jsonb)'::regprocedure"))[0];
@@ -209,6 +211,70 @@ await ta('[!] 0052 (14 ⑤-2a): 登録の状態は 1 行も作らない (backfil
   assert.match((await q("select ops.master_cutover_prereq_problems('company_owner', 'new_open') as p"))[0].p.join(' '), /^0052_registrations: backfill_missing/);
   const ck = await q("select pg_get_constraintdef(oid) as d from pg_constraint where conname = 'ck_mer_operation'");
   assert.match(ck[0].d, /sku_create/);
+});
+
+await ta('[!] 0053 (14 ⑤-2b): 新規登録の CSV の表 (追記だけ / 守り)・書く関数は security definer で public の実行権なし・0051 の約束に ⑤-2b の操作 (#1571 R1 High 3)・JAN の記録と専用の守り・仕入先の登録の状態と守り', async () => {
+  for (const t of ['ne_reg_exports', 'ne_reg_attempts', 'ne_reg_export_items', 'ne_reg_export_rows', 'ne_reg_checks', 'supplier_registrations', 'supplier_registration_events',
+    'ne_reg_compare_targets', 'ne_reg_compare_runs', 'ne_reg_compare_observations', 'ne_reg_compare_receipts']) {
+    assert.ok((await q("select to_regclass('ops.' || $1) is not null as ok", [t]))[0].ok, `表 ops.${t} が無い`);
+  }
+  for (const t of ['ne_reg_attempts', 'ne_reg_export_rows', 'ne_reg_checks', 'supplier_registration_events', 'ne_reg_compare_targets', 'ne_reg_compare_runs', 'ne_reg_compare_observations', 'ne_reg_compare_receipts']) {
+    assert.ok((await q("select 1 from pg_trigger where tgrelid = ('ops.' || $1)::regclass and tgname = 'trg_append_only_row'", [t])).length === 1, `${t} が追記だけでない`);
+  }
+  // 書く関数・守りは全部 security definer・search_path = pg_catalog, pg_temp・public の実行権なし (0052 の状態の関数も置き換えた)
+  const want = [
+    ['core', 'bump_jan_owner_version'], ['core', 'guard_master_edit_jan'],
+    ['ops', 'close_reg_write'], ['ops', 'create_supplier'], ['ops', 'deactivate_supplier'], ['ops', 'declare_supplier_in_ne'], ['ops', 'edit_sku_jan'],
+    ['ops', 'guard_reg_csv_live'], ['ops', 'guard_reg_csv_write'], ['ops', 'ne_reg_build'], ['ops', 'ne_reg_canonical'], ['ops', 'ne_reg_declare'], ['ops', 'ne_reg_guard_on_save'],
+    ['ops', 'ne_reg_issue'], ['ops', 'ne_reg_lock_export'], ['ops', 'ne_reg_lock_skus'], ['ops', 'ne_reg_ne_codes'], ['ops', 'ne_reg_record_verified'], ['ops', 'ne_reg_supersede'],
+    ['ops', 'ne_reg_supersede_built'], ['ops', 'open_reg_write'], ['ops', 'record_ne_registration_check'], ['ops', 'record_ne_registration_observations'], ['ops', 'reg_write_gate'],
+    ['ops', 'seal_ne_registration_run'], ['ops', 'snapshot_ne_reg_targets'], ['ops', 'transition_sku_registration']];
+  const acl = await q(`select n.nspname as s, p.proname as n, p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where (n.nspname::text, p.proname::text) in (select x ->> 0, x ->> 1 from jsonb_array_elements($1::jsonb) x) order by 1, 2`, [JSON.stringify(want)]);
+  assert.deepEqual(acl.map((r) => [r.s, r.n]), want);
+  for (const r of acl) assert.deepEqual([r.n, r.d, r.c, r.pub], [r.n, true, 'search_path=pg_catalog, pg_temp', false]);
+  // 前の形の関数は無い (呼び手の約束を見る関数・lib が begin する形・仕入先の状態だけの関数)
+  for (const f of ['ops.reg_write_session(text, uuid)', 'ops.create_supplier_registration(bigint, text)', 'core.guard_master_edit_jan_owner()']) {
+    assert.equal((await q('select to_regprocedure($1) is null as gone', [f]))[0].gone, true, f);
+  }
+  // 確かめの関数は回の番号だけを受ける (#1571 R1 High 2・呼び手の観測の JSON の形は無い)
+  assert.deepEqual((await q("select pg_get_function_identity_arguments(p.oid) as a from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'ops' and p.proname = 'record_ne_registration_check'")).map((r) => r.a), ['p_run text']);
+  // 0051 の約束: 操作の CHECK に ⑤-2b の操作 (sku_edit・sku_create はそのまま)・SKU は sku_edit / sku_create だけ要る・書いてよい (表・書き方)・0051 の guard の表は変えない
+  for (const c of ['ck_mws_operation', 'ck_mer_operation']) {
+    const d = (await q('select pg_get_constraintdef(oid) as d from pg_constraint where conname = $1', [c]))[0].d;
+    for (const op of ['sku_edit', 'sku_create', 'reg_csv_build', 'reg_csv_issue', 'reg_csv_declare', 'reg_csv_supersede', 'reg_csv_verified', 'jan_edit', 'supplier_create', 'supplier_declare', 'supplier_deactivate']) {
+      assert.ok(d.includes(`'${op}'`), `${c}: ${op}`);
+    }
+  }
+  assert.match((await q("select pg_get_constraintdef(oid) as d from pg_constraint where conname = 'ck_mws_sku_needed'"))[0].d, /sku_edit.*sku_create.*sku_id IS NOT NULL/);
+  assert.deepEqual((await q(`select ops.master_write_allowed('reg_csv_build', 'ops.ne_reg_exports', 'INSERT') as a, ops.master_write_allowed('reg_csv_issue', 'ops.ne_reg_exports', 'INSERT') as b,
+      ops.master_write_allowed('jan_edit', 'core.external_ids', 'INSERT') as c, ops.master_write_allowed('jan_edit', 'core.external_ids', 'DELETE') as d,
+      ops.master_write_allowed('sku_edit', 'core.external_ids', 'INSERT') as e, ops.master_write_allowed('supplier_declare', 'core.suppliers', 'UPDATE') as f,
+      ops.master_write_allowed('sku_edit', 'ops.ne_reg_export_items', 'UPDATE') as g, ops.master_write_allowed('sku_create', 'core.skus', 'INSERT') as h`))[0],
+  { a: true, b: false, c: true, d: false, e: false, f: false, g: true, h: true });
+  const trg = await q(`select c.relnamespace::regnamespace::text || '.' || c.relname || ' ' || g.tgname as t from pg_trigger g join pg_class c on c.oid = g.tgrelid
+     where not g.tgisinternal and c.oid in ('core.external_ids'::regclass, 'core.suppliers'::regclass, 'core.supplier_skus'::regclass, 'core.skus'::regclass, 'core.products'::regclass,
+       'core.sku_costs'::regclass, 'ops.sku_component_requests'::regclass, 'ops.ne_reg_exports'::regclass, 'ops.ne_reg_export_items'::regclass, 'ops.ne_reg_export_rows'::regclass,
+       'ops.ne_reg_attempts'::regclass, 'ops.ne_csv_verified'::regclass) order by 1`);
+  const has = new Set(trg.map((r) => r.t));
+  for (const t of ['core.external_ids trg_external_ids_jan_guard', 'core.external_ids trg_external_ids_jan_no_delete', 'core.external_ids trg_external_ids_jan_audit',
+    'core.external_ids trg_external_ids_jan_bump', 'core.external_ids trg_external_ids_writer', 'core.external_ids trg_master_edit_jan', 'core.suppliers trg_suppliers_lifecycle',
+    'core.supplier_skus trg_supplier_skus_primary_registered', 'core.skus trg_reg_csv_live', 'core.products trg_reg_csv_live', 'core.supplier_skus trg_reg_csv_live',
+    'core.sku_costs trg_reg_csv_live', 'ops.sku_component_requests trg_reg_csv_live', 'ops.ne_reg_exports trg_reg_csv_write', 'ops.ne_reg_export_items trg_reg_csv_write',
+    'ops.ne_reg_export_rows trg_reg_csv_write', 'ops.ne_reg_attempts trg_reg_csv_write', 'ops.ne_csv_verified trg_reg_csv_write']) {
+    assert.ok(has.has(t), `trigger ${t} が無い`);
+  }
+  // JAN の行の守りは専用 (0051 の guard は core.external_ids に付けない)
+  assert.ok(!has.has('core.external_ids trg_master_edit_guard'));
+  const ck = await q("select pg_get_constraintdef(oid) as d from pg_constraint where conname = 'master_change_events_entity_type_check'");
+  assert.match(ck[0].d, /external_id/);
+  // NOT VALID で足した (migration の中で前からの行を読まない・Low)。後の手順の VALIDATE が通る
+  assert.equal((await q("select convalidated as v from pg_constraint where conname = 'master_change_events_entity_type_check'"))[0].v, false);
+  await q('alter table events.master_change_events validate constraint master_change_events_entity_type_check');
+  assert.equal((await q("select convalidated as v from pg_constraint where conname = 'master_change_events_entity_type_check'"))[0].v, true);
+  const col = await q("select 1 from information_schema.columns where table_schema = 'ops' and table_name = 'ne_csv_verified' and column_name = 'reg_export_id'");
+  assert.equal(col.length, 1);
 });
 
 await ta('[!] 0047 (13 §3.2・§3.7・D7b-1a): 財務の行に分けられない部品の 4 列 (既定 0)・日 × 正規化 SKU の関数 mart.finance_daily_sku_range', async () => {

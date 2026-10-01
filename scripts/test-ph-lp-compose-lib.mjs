@@ -63,6 +63,33 @@ ok(r1b.ok && !r1b.created && r1b.job.id === r1.job.id, '同じ idempotency_key �
 ok(lp.requestJob(db, args(dA, sTabs.spec, 'key-0002')).code === 'already_running', '動いている間は 2 件目を受け付けない');
 ok(r1.job.measurement_deadline_at === new Date(min(3)).toISOString(), '測定の期限 = 受付 + 3 分で固定 (R4 #2)');
 
+console.log('②b 🚨 指示文はスタッフの定型文と同じもの 1 つだけ (設計 §5)');
+{
+  // 段階1 の測定は「**同じ入力**から作った二つを比べる」のが前提。
+  // 指示文が片方だけ違うと、比べているのが「AI の力の差」なのか
+  // 「指示文の差」なのか分からなくなるので、正本を 1 つに固定する。
+  const pt = await import('../apps/product-hub/lib/prompt-templates.js');
+  const packet = JSON.parse(r1.job.packet_json);
+  ok(!!packet.instruction, 'packet に指示文が入っている');
+  eq(packet.instruction, pt.PRODUCT_ANALYSIS_INSTRUCTION, '🚨 packet の指示文 = 定型文の正本');
+  // スタッフが ChatGPT に貼る文の中に、そのまま入っていること
+  const staff = pt.buildProductAnalysisPrompt({ name: 'ハッカ油スプレー 100ml' }, { product_info_text: '天然ハッカ油' }, '');
+  ok(staff.includes(packet.instruction),
+    '🚨 スタッフの定型文に同じ文がそのまま入っている (二重に持っていない)');
+  eq(packet.packet_version, 2, 'packet の版が上がっている (形が変わった)');
+  // 指示文も packet_hash の中 = 後から差し替えられない
+  const again = lp.buildPacket({
+    draft: dA, productInfo: packet.product_info, colorVariations: packet.color_variations,
+    images: packet.images, spec: sTabs.spec,
+  });
+  eq(again.hash, r1.job.packet_hash, '同じ材料なら hash も同じ');
+  const tampered = lp.buildPacket({
+    draft: dA, productInfo: packet.product_info, colorVariations: packet.color_variations,
+    images: packet.images, spec: { ...sTabs.spec, hash: 'ちがう' },
+  });
+  ok(tampered.hash !== r1.job.packet_hash, '材料が違うなら hash も違う');
+}
+
 console.log('③ claim — 受付時の材料をそのまま返す');
 // 受付のあとに仕様書を更新し、画像も増やす (= 実運用で起きること)
 const s2 = lp.importSpec(db, { kind: 'product_analysis', title: 'LP制作システム', body: '本文 V2.3 (更新後)', actor: 'u@x' });
@@ -432,6 +459,29 @@ ok(lp.requestJob(db, args({ ...dA, id: 'abc' }, s2.spec, 'key-000x', { now: min(
   '🚨 商品 ID が数でなければ断る (R1 #4)');
 ok(lp.requestJob(db, args(mkDraft('LP-J', 'テスト'), { ...s2.spec, id: 99999 }, 'key-0001', { now: min(95) })).code === 'bad_request',
   '存在しない仕様書の版は断る');
+
+console.log('⑳ 🚨 古い版の packet は claim しない (codex exec review P2)');
+{
+  // 版が上がる = 渡す材料の形が変わった。v1 には instruction が無いので、
+  // そのまま渡すと**スタッフと違う指示文で作ったものが測定に混ざる** (設計 §5 / §7.1)。
+  // 先にキューを空にして、試す依頼を 1 件だけにする
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled', completed_at = ? WHERE status = 'queued'`)
+    .run(new Date(min(199)).toISOString());
+  const dOld = mkDraft('LP-OLD', 'ハッカ油スプレー 15ml');
+  const rOld = lp.requestJob(db, args(dOld, s2.spec, 'key-old01', { now: min(200) }));
+  ok(rOld.ok, '依頼は通る');
+  // 受付済みの行を v1 に差し替える (デプロイをまたいだ古い依頼の再現)
+  const old = JSON.parse(db.prepare('SELECT packet_json FROM ph_lp_compose_jobs WHERE id = ?').get(rOld.job.id).packet_json);
+  delete old.instruction;
+  old.packet_version = 1;
+  db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ?, packet_version = 1 WHERE id = ?')
+    .run(JSON.stringify(old), lp.sha256(lp.canonicalJson(old)), rOld.job.id);
+  ok(lp.claimJob(db, { runnerRunId: 'run-old', now: min(201) }).job === null, '🚨 古い版は掏ませない');
+  const row = db.prepare('SELECT status, error_code, error FROM ph_lp_compose_jobs WHERE id = ?').get(rOld.job.id);
+  eq(row.status, 'failed', '理由を残して failed にする');
+  eq(row.error_code, 'packet_outdated', 'error_code が packet_outdated');
+  ok((row.error || '').includes('もう一度依頼'), '人に何をすればよいかを書く');
+}
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);
 process.exit(fail === 0 ? 0 : 1);

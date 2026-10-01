@@ -1612,6 +1612,9 @@ th.attr-unknown { color: #dc2626; }
             <%# 🚨 失敗したときの説明はここ。lint の中身 (lpc-lint) は「できた」ときの箱の中にあるので、
                 失敗したときは見えない (codex exec review P2) %>
             <div id="lpc-fail" hidden class="muted" style="font-size:11px; margin-top:4px; color:#b45309;"></div>
+            <%# 測定台帳 (設計 §7.1b) に書き写す値。画面は作らない方針なので、
+                台帳に要る「機械が知っている事実」だけをここに並べる %>
+            <div id="lpc-meas" hidden class="muted" style="font-size:11px; margin-top:4px; font-family:ui-monospace, monospace; word-break:break-all;"></div>
             <div id="lpc-result" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
               <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px;">
                 <strong style="font-size:13px;">AI が作った構成 (⑦ AI画像生成プロンプト)</strong>
@@ -1641,7 +1644,7 @@ th.attr-unknown { color: #dc2626; }
             <% if (composeState.done) { %><strong style="color:#15803d;">済</strong><% } else { %><strong>まだ</strong><% } %>
             <span class="muted" style="font-size:12px;">
               <% if (composeState.marked) { %><%= String(ip.compose_updated_at || '').slice(0, 16).replace('T', ' ') %> <%= ip.compose_updated_by || '' %>
-              <% } else if (composeState.implied) { %>(③素材待ちが済んでいるので 済 とみなしています)
+              <% } else if (composeState.implied) { %>(④AI制作が済んで ⑤デザイン修正 に移っているので 済 とみなしています)
               <% } else { %>(本番の構成ができたら押す。縦列「仮構成」とは別)<% } %>
             </span>
             <%# 推定の 済 でも「まだに戻す」を出す (人の値が推定より優先 — Codex R1) %>
@@ -5807,6 +5810,7 @@ th.attr-unknown { color: #dc2626; }
     const openEl = document.getElementById('lpc-open');
     const copyResultEl = document.getElementById('lpc-copy-result');
     const failEl = document.getElementById('lpc-fail');
+    const measEl = document.getElementById('lpc-meas');
 
     const RUNNING = ['queued', 'running'];
     let timer = null;
@@ -5874,6 +5878,21 @@ th.attr-unknown { color: #dc2626; }
         failEl.textContent = lintLine(job.lint) + (errs ? '\n' + errs : '')
           + ((job.lint.errors || []).length > 8 ? '\n…ほか ' + ((job.lint.errors || []).length - 8) + ' 件' : '');
         failEl.style.whiteSpace = 'pre-wrap';
+      }
+
+      // 測定台帳 (設計 §7.1b) に書き写す値。終わった job だけ出す
+      const terminal = !!job && ['done', 'failed', 'needs_review', 'cancelled'].includes(job.status);
+      measEl.hidden = !terminal;
+      if (terminal) {
+        measEl.textContent = '測定用 … job_id=' + job.id + ' / spec_id=' + job.spec_id
+          // 🚨 切り詰めない — 台帳に packet_hash を残すのは「この測定がどの材料で作られたか」を
+          // 後から突き合わせるためなので、頭 12 文字だけでは用をなさない (codex exec review P2)
+          + ' / packet_hash=' + String(job.packet_hash || '')
+          + ' / 所要秒=' + (job.elapsed_sec != null ? job.elapsed_sec : '?')
+          + ' / 期限内=' + (job.within_deadline === null ? '?' : (job.within_deadline ? 'はい' : 'いいえ'))
+          + ' / lint=' + (job.lint ? (job.lint.ok ? '通った' : 'ひっかかった') : 'なし')
+          + ' / 検品巡回=' + (job.review_rounds != null ? job.review_rounds : '?')
+          + ' / 状態=' + job.status;
       }
 
       if (running) schedule(); else stop();

@@ -14,7 +14,7 @@
       seller SKU を押すと対応を作れます (保存を開いた後)。FBA / FBM は Amazon の手数料の取得 (fees) の区分です。
     </p></div>
     <% if (data) { %>
-      <% if (data.tableMissing) { %><div class="band warn">Company DB に Amazon SKU の対応の表がまだありません (migration 0053 の前)。</div><% } %>
+      <% if (data.tableMissing) { %><div class="band warn">Company DB に Amazon SKU の対応の表がまだありません (migration 0054 の前)。</div><% } %>
       <% if (data.undecided.length) { %><div class="band warn">未判定: 売上の日次がまだ公開されていない日があります (<%= data.undecided.join('・') %>)。その日の注文が入っていない = 「0 件」とは言えません。</div><% } %>
       <% if (!data.channelsAvailable) { %><div class="band info">FBA / FBM の区分 (fees) が読めないので、全部の区分を出しています。</div><% } %>
       <form method="get" action="" class="row">

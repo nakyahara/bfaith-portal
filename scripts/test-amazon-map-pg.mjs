@@ -1,11 +1,11 @@
 /**
- * test-amazon-map-pg.mjs — Amazon SKU の対応の編集 (0053・lib/amazon-map-write.mjs) の**同時実行**と**ロールの権限**を、実 PostgreSQL の独立した接続で確かめる
+ * test-amazon-map-pg.mjs — Amazon SKU の対応の編集 (0054・lib/amazon-map-write.mjs) の**同時実行**と**ロールの権限**を、実 PostgreSQL の独立した接続で確かめる
  *   (PGlite は 1 接続なので書けない。Company DB構想 16 §7 v2 H5・§8 契約 v3。PR ⑦-1)
  *
  * 接続は本番と同じロールでログインする (create-master-edit-roles.mjs で作る・パスワードは試験の回ごと):
  *   保存 (A・B) = master_edit / 段階 (P) = master_ops / 門 (GR・GM) / 持ち主 (O・O2) = 夜間ロード・migration・ほかの処理の代わり
  * 固定する契約:
- *   1 今のデータのある DB (0052 まで + 夜間ロード) に 0053 を流しても失敗しない・何も変わらない (実 PostgreSQL)
+ *   1 今のデータのある DB (0053 まで + 夜間ロード) に 0054 を流しても失敗しない・何も変わらない (実 PostgreSQL)
  *   2 同じ seller SKU を 2 人が同じ画面から保存: 後の人は出品ごとの鍵で待ち、前の人の commit の後に 409 (版が違う)。両方は書かない
  *   3 同じ request_id が 2 つ並んで来る (押し直し): 後の方は request_id の鍵で待ち、前の結果をそのまま返す (記録は 1 行)
  *   4 夜間ロードが先 = 保存はマスタの書き込みの鍵で短く待って 409 nightly_load → ロードは最後まで (対応の構成は変えない)
@@ -80,14 +80,14 @@ try {
     listings: await q('select listing_code, version::text as v from core.listings order by 1'),
   });
 
-  await ta('[1] 今のデータのある DB (0052 まで + 夜間ロード・並びの隙間・FBM の完全一致) に 0053 を流す: 失敗しない・何も変わらない・その後のロードも同じ', async () => {
-    await applyMigrations(dbO, { log: () => {}, to: '0052' });
+  await ta('[1] 今のデータのある DB (0053 まで + 夜間ロード・並びの隙間・FBM の完全一致) に 0054 を流す: 失敗しない・何も変わらない・その後のロードも同じ', async () => {
+    await applyMigrations(dbO, { log: () => {}, to: '0053' });
     const r = await loadWith(dbO, 'load_pg_0', MASTER_OWNERSHIP);
     assert.equal(r.ok, true, r.error);
     const before = await snap();
     assert.ok(before.comps.some((c) => c.listing_code === 'pm_1' && c.sort_order === 3));
     const res = await applyMigrations(dbO, { log: () => {} });
-    assert.deepEqual(res.applied, ['0053']);
+    assert.deepEqual(res.applied, ['0054']);
     assert.deepEqual(await snap(), before);
     const r2 = await loadWith(dbO, 'load_pg_1', MASTER_OWNERSHIP);
     assert.equal(r2.ok, true, r2.error); assert.equal(r2.summary.listing_components.applied, 0);

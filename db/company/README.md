@@ -267,10 +267,10 @@ node -r dotenv/config -e "fetch(process.env.RENDER_MIRROR_URL + '/api/sync/sku-m
 
 - 試験 = `node scripts/test-sku-map-canonical.mjs` (並べ方・ハッシュ・空白と時刻の決まり) / `node scripts/test-sku-map-receiver.mjs` (受け口の契約) / `node scripts/test-sku-map-receiver-guards.mjs` (今のマスタの部・古い DB・初期化の失敗・状態が読めない・相乗り・有効にする許し・REQUIRE_GENERATION・戻し (鍵の後の読み直し・aborted)・時間・バックアップから戻したとき)
 
-### Amazon SKU の対応の編集 (0053・⑦-1。16 §2・§3・§7 v2・§8 契約 v3)
+### Amazon SKU の対応の編集 (0054・⑦-1。16 §2・§3・§7 v2・§8 契約 v3)
 
 Amazon の seller SKU ↔ NE コード (今の正本 = miniPC の `m_sku_master` + `m_sku_components`) を、切替 (⑥) の後に Company DB で直すための土台。
-**今の動きは変わらない** (新しい表は空・足した列は null・夜間ロードは対応の無い出品を今までどおり作る。試験 [1] = 0052 までの DB と 0053 までの DB で夜間ロードの結果が同じ)。
+**今の動きは変わらない** (新しい表は空・足した列は null・夜間ロードは対応の無い出品を今までどおり作る。試験 [1] = 0053 (⑤-2b) までの DB と 0054 までの DB で夜間ロードの結果が同じ)。
 
 - 表 `core.amazon_sku_maps` (1 行 = 1 つの出品の対応・`state` = active / deleted (墓標)・`origin` = legacy (切替の日の移行) / portal (画面))。構成の正本は `core.listing_components` のまま (`updated_at` を足した = 写しの構成の更新時刻)
 - 書くのは security definer の関数だけ: `ops.save_amazon_sku_map` (登録・直す・墓標から戻す) / `ops.delete_amazon_sku_map` (墓標にする)。画面 = `/apps/master-edit/amazon/` (lib/amazon-map-write.mjs)。門は ⑤ と同じ (段階 new_open・持ち主表のハッシュ・`MASTER_EDIT_OPEN=1`) + 持ち主 `listing_components.amazon` = company
@@ -278,7 +278,7 @@ Amazon の seller SKU ↔ NE コード (今の正本 = miniPC の `m_sku_master`
 - 🚨 **残る危うさ (Codex #1586 R1 High・⑥ の go / no-go「夜間ロードのロールを分ける」)**: 夜間ロード・push・migration・復元・ロールの設定は全部同じログイン (`COMPANY_DB_URL` = DB・schema・表の持ち主・CREATEROLE) で動く。
   持ち主は trigger を止められ・schema の持ち主として表を DROP でき・CREATEROLE で作ったロールの一員に自分でなれる (PostgreSQL 18 で試した) = **この表の持ち主だけを別のロールにしても守りにならない**ので、この PR ではしていない。
   持ち主のパスワードが漏れた・持ち主の権限で動くコードの誤り (trigger を止めて消す) なら、墓標は消せてしまう。本当の直し = 夜間ロードと push を、持ち主でなく CREATEROLE の無い別のログインにする (今の全部の書き手に効く = ⑥ で決める)。
-  それまでの手当て: **消えた対応** `ops.amazon_map_lost_listings()` (変更の記録 = 追記だけ に対応の行の記録があるのに今の行が無い出品) を、夜間ロードは「対応がある」と同じに扱う (自動の構成を作り直さない・報告の conflicts に `amazon_map_lost`)・切替の段階を company_owner / new_open に進める前提にする (`0053_amazon_map`)。両方の表の trigger を止めて消すまでは、墓標が消えても自動の対応は戻らない
+  それまでの手当て: **消えた対応** `ops.amazon_map_lost_listings()` (変更の記録 = 追記だけ に対応の行の記録があるのに今の行が無い出品) を、夜間ロードは「対応がある」と同じに扱う (自動の構成を作り直さない・報告の conflicts に `amazon_map_lost`)・切替の段階を company_owner / new_open に進める前提にする (`0054_amazon_map`)。両方の表の trigger を止めて消すまでは、墓標が消えても自動の対応は戻らない
 - 表の CHECK は写しの受け手 (`lib/sku-map-canonical.js`) と同じ空白の決まり: seller SKU の前後の TAB・NBSP・全角の空白・ASCII の大文字・制御文字、名前が空白だけ (TAB・NBSP・全角の空白だけも) は、どの書き手でも断る (Codex #1586 R1 M1)
 - 不変条件 (commit のとき・deferred の constraint trigger): Amazon (日本) の出品・`listing_norm = core.norm_code(seller_sku)`・active は構成 1 行以上で並び 0..N-1・墓標は構成 0 行。対応の無い出品は見ない
 - 構成の書き手: 段階 company_owner / new_open の間、対応のある出品の構成と対応の行は、取引の設定 `core.source_system` が `portal_amazon_map` (画面の関数) か `amazon_map_migration` (切替の日の移行) のときだけ書ける

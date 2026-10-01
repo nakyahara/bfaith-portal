@@ -1,11 +1,11 @@
 /**
- * test-amazon-map.mjs — Amazon SKU の対応の編集 (0053・lib/amazon-map-write.mjs・lib/amazon-map-migrate.mjs・engine.mjs の構成の意味・画面。
+ * test-amazon-map.mjs — Amazon SKU の対応の編集 (0054・lib/amazon-map-write.mjs・lib/amazon-map-migrate.mjs・engine.mjs の構成の意味・画面。
  *   Company DB構想 16 §3・§7 v2 H5 / M7 / M8 / M10 / M11・§8 契約 v3 = PR ⑦-1)
  *
  * Company DB = PGlite (Render と同じ条件の持ち主のロール deploy で migration)。保存は画面だけのロール master_edit で流す (権限が足りているかも確かめる)。
  * 固定する契約:
- *   1 今の本番は変わらない: 0052 までの DB と 0053 までの DB で、同じ材料の夜間ロード (持ち主は全部 load・段階 legacy_open) の結果 (出品・構成・変更の記録・report) が同じ。
- *     今のデータ (並びの隙間・FBM の完全一致・Sheet の構成) がある DB に 0053 を流しても失敗しない・何も変わらない・その後のロードも同じ
+ *   1 今の本番は変わらない: 0053 (⑤-2b) までの DB と 0054 までの DB で、同じ材料の夜間ロード (持ち主は全部 load・段階 legacy_open) の結果 (出品・構成・変更の記録・report) が同じ。
+ *     今のデータ (並びの隙間・FBM の完全一致・Sheet の構成) がある DB に 0054 を流しても失敗しない・何も変わらない・その後のロードも同じ
  *   2 門: 段階が new_open でない・持ち主表のハッシュが違う・listing_components.amazon が load・MASTER_EDIT_OPEN が無い = 409 切替前 (何も書かない)。
  *     画面のロールが関数を直接呼んでも DB が断る
  *   3 保存: 出品が無ければ作る・対応・構成 (manual・並び 0..N-1)・変更の記録 (人・request_id・理由・portal_amazon_map)・保存の記録 done (出品つき)。
@@ -84,7 +84,7 @@ function makePlan() {
     setComponents: [{ parentCode: 'aset1', childCode: 'a001', qty: 3, source: 'ne' }],
     listings: [
       amazon('pr_a001', 'SKU マスタの 1', [fromMaster('a001', 1, 0)], 'mirror_sku_master'),
-      // 並びに隙間 (0, 2) = 今のデータにありうる形 (CSV の REPLACE)。0053 の不変条件は対応の無い出品を見ない = ロードは止まらない
+      // 並びに隙間 (0, 2) = 今のデータにありうる形 (CSV の REPLACE)。0054 の不変条件は対応の無い出品を見ない = ロードは止まらない
       amazon('pr_pack2', 'SKU マスタの 2 個組', [fromMaster('a001', 2, 0), fromMaster('a002', 1, 2)], 'mirror_sku_master'),
       amazon('a003', '単品 3 (FBM)', fbm('a003'), 'amazon_fees_fbm'),
       amazon('a004', '単品 4 (FBM)', fbm('a004'), 'amazon_fees_fbm'),
@@ -153,11 +153,11 @@ async function openCutover(E, ownership, upTo = 'new_open') {
   await advance(E, 'new_open', { expected_builds: BUILDS, manifest_hash: mh, owner_hash: h });
 }
 
-console.log('今の本番は変わらない (0052 と 0053)');
-await ta('[1] 同じ材料の夜間ロード (全部 load・legacy_open): 0052 までの DB と 0053 までの DB で出品・構成・変更の記録・report が同じ / 0053 を後から流しても何も変わらない・その後のロードも同じ', async () => {
-  const E52 = await setupDb({ to: '0052' });
+console.log('今の本番は変わらない (0053 と 0054)');
+await ta('[1] 同じ材料の夜間ロード (全部 load・legacy_open): 0053 までの DB と 0054 までの DB で出品・構成・変更の記録・report が同じ / 0054 を後から流しても何も変わらない・その後のロードも同じ', async () => {
+  const E52 = await setupDb({ to: '0053' });
   const E53 = await setupDb();
-  assert.equal((await E52.db.query("select count(*)::int as n from ops.schema_migrations where version = '0053'")).rows[0].n, 0);
+  assert.equal((await E52.db.query("select count(*)::int as n from ops.schema_migrations where version = '0054'")).rows[0].n, 0);
   const r52 = await load(E52.db); const r53 = await load(E53.db);
   assert.deepEqual(reportShape(r53), reportShape(r52));
   const s52 = await snapshot(E52.db); const s53 = await snapshot(E53.db);
@@ -169,10 +169,10 @@ await ta('[1] 同じ材料の夜間ロード (全部 load・legacy_open): 0052 �
   const r52b = await load(E52.db, MASTER_OWNERSHIP, makePlan(), 'load_fixed_2'); const r53b = await load(E53.db, MASTER_OWNERSHIP, makePlan(), 'load_fixed_2');
   assert.deepEqual(reportShape(r53b), reportShape(r52b));
   assert.deepEqual(await snapshot(E53.db), await snapshot(E52.db));
-  // 0052 の DB に 0053 を後から流す = 失敗しない・何も変わらない
+  // 0053 の DB に 0054 を後から流す = 失敗しない・何も変わらない
   const before = await snapshot(E52.db);
   const res = await applyMigrations(E52.db, { log: quiet });
-  assert.deepEqual(res.applied, ['0053']);
+  assert.deepEqual(res.applied, ['0054']);
   assert.deepEqual(await snapshot(E52.db), before);
   assert.equal((await E52.db.query('select count(*)::int as n from core.amazon_sku_maps')).rows[0].n, 0);
   assert.equal((await E52.db.query('select count(*)::int as n from core.listing_components where updated_at is not null')).rows[0].n, 0);
@@ -183,6 +183,38 @@ await ta('[1] 同じ材料の夜間ロード (全部 load・legacy_open): 0052 �
   const e = await errOf(E52.db.query(`insert into events.master_change_events (company_id, change_id, operation, entity_type, entity_key, new_value, actor_type, source_system)
     values (1, gen_random_uuid(), 'INSERT', 'nope', '{}', '{}', 'system', 'sql')`));
   assert.equal(e?.code, '23514');
+});
+
+await ta('[1] 0054 は ⑤-1・⑤-2a・⑤-2b (0053) の物を全部残す: 書いてよい (表・書き方) の行・約束 / 保存の記録の操作・変更の記録の種類 (名前も)・SKU が要る操作', async () => {
+  const E53 = await setupDb({ to: '0053' });
+  const E54 = await setupDb();
+  const allowedRows = async (E) => {
+    const src = (await E.db.query(`select pg_get_functiondef('ops.master_write_allowed(text, text, text)'::regprocedure) as d`)).rows[0].d;
+    return [...src.matchAll(/\('([a-z_]+)', '([a-z_.]+)', '(INSERT|UPDATE|DELETE)'\)/g)].map((m) => `${m[1]} ${m[2]} ${m[3]}`).sort();
+  };
+  const r53 = await allowedRows(E53); const r54 = await allowedRows(E54);
+  assert.ok(r53.length > 40, `0053 の行 ${r53.length}`);
+  assert.deepEqual(r53.filter((x) => !r54.includes(x)), [], '0053 の行が 0054 で消えた');
+  assert.deepEqual(r54.filter((x) => !r53.includes(x)).map((x) => x.split(' ')[0]).filter((op) => !op.startsWith('amazon_map_')), [], 'Amazon でない行が増えた');
+  for (const x of r53) { const [op, tbl, act] = x.split(' '); assert.equal((await E54.db.query('select ops.master_write_allowed($1, $2, $3) as ok', [op, tbl, act])).rows[0].ok, true, x); }
+  const checkOf = async (E, table, name) => (await E.db.query(`select pg_get_constraintdef(c.oid) as d from pg_constraint c where c.conrelid = $1::regclass and c.conname = $2`, [table, name])).rows[0]?.d ?? null;
+  const opsOf = (d) => [...String(d).matchAll(/'([a-z_]+)'::text/g)].map((m) => m[1]).sort();
+  for (const [t, n] of [['ops.master_write_sessions', 'ck_mws_operation'], ['ops.master_edit_requests', 'ck_mer_operation'], ['events.master_change_events', 'master_change_events_entity_type_check']]) {
+    const a = opsOf(await checkOf(E53, t, n)); const b = opsOf(await checkOf(E54, t, n));
+    assert.ok(a.length >= 9, `${n} (0053) ${a}`);
+    assert.deepEqual(a.filter((x) => !b.includes(x)), [], `${n}: 0053 の値が 0054 で消えた`);
+    assert.deepEqual(b.filter((x) => !a.includes(x)).sort(), n.startsWith('master_change') ? ['amazon_sku_map'] : ['amazon_map_delete', 'amazon_map_save'], n);
+  }
+  assert.match(await checkOf(E54, 'ops.master_write_sessions', 'ck_mws_sku_needed'), /sku_edit.*sku_create/);
+  // ⑤-2b の約束 (SKU なし・出品なし) が入る / Amazon の約束は出品が要る / sku_edit は SKU が要る
+  const ins = (op, sku, lid, src) => E54.db.query(`insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, listing_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions,
+      actor_id, source_system, db_user, phase, owner_hash, ownership) values (gen_random_uuid(), txid_current(), gen_random_uuid(), $1, $2, $3, '{}', '{}', repeat('a', 64), repeat('a', 64), '{}', 'x', $4, 'x', 'new_open', repeat('a', 64), '{}')`, [op, sku, lid, src]);
+  const codeOf = async (fn) => { await E54.pg.query('begin'); try { await fn(); return 'ok'; } catch (e) { return e.constraint || e.code; } finally { await E54.pg.query('rollback'); } };
+  assert.equal(await codeOf(() => ins('supplier_create', null, null, 'portal_master_edit')), 'ok');
+  assert.equal(await codeOf(() => ins('sku_edit', null, null, 'portal_master_edit')), 'ck_mws_sku_needed');
+  assert.equal(await codeOf(() => ins('amazon_map_save', null, null, 'portal_amazon_map')), 'ck_mws_target');
+  assert.equal(await codeOf(() => ins('supplier_create', null, null, 'portal_amazon_map')), 'ck_mws_source');
+  await E53.pg.close(); await E54.pg.close();
 });
 
 // ── ここからの試験の DB (1 つ) ──
@@ -632,7 +664,7 @@ await ta('[6] 消えた対応 (Codex #1586 R1 High の手当て): 持ち主が t
   // 切替の前提: company_owner / new_open に進めない (差し込み口の表に載っている)
   assert.deepEqual((await E5.db.query("select ops.amazon_map_prereq('company_owner', 'new_open') as p")).rows[0].p.map((x) => x.slice(0, 16)), ['amazon_map_lost:']);
   assert.deepEqual((await E5.db.query("select ops.amazon_map_prereq('legacy_open', 'frozen') as p")).rows[0].p, []);
-  assert.ok((await E5.db.query("select ops.master_cutover_prereq_problems('company_owner', 'new_open') as p")).rows[0].p.some((x) => x.startsWith('0053_amazon_map: amazon_map_lost')));
+  assert.ok((await E5.db.query("select ops.master_cutover_prereq_problems('company_owner', 'new_open') as p")).rows[0].p.some((x) => x.startsWith('0054_amazon_map: amazon_map_lost')));
   await E5.pg.close();
 });
 

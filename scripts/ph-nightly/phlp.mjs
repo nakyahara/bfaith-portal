@@ -202,6 +202,11 @@ async function cmdClaim(opt) {
       color_variations: job.packet.color_variations,
       images: job.packet.images.length,
     },
+    // 🚨 スタッフが ChatGPT に貼る定型文と**同じ指示文** (設計 §5)。
+    //    これに従って書く。自分の言葉で書き換えない —
+    //    指示文がスタッフ側と違うと、段階1 の A/B が「同じ入力の比較」にならない。
+    //    仕様書と齠齬したときは**仕様書が正本** (この文自身がそう言っている)
+    instruction: job.packet.instruction || null,
     next: `./phlp images ${job.job_id}`,
   });
 }

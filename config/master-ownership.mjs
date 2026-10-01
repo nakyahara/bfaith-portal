@@ -31,6 +31,8 @@ export const OWNED_COLUMNS = Object.freeze([
   'suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days',
   // 0027 (②c-2)
   'skus.standard_price', 'skus.shipping', 'skus.reorder_months', 'suppliers.contacts', 'supplier_skus.is_primary',
+  // 0053 (⑤-2b・契約 v3 H6): 商品の JAN (core.external_ids の system = 'jan')
+  'external_ids.jan',
 ]);
 
 export const MASTER_OWNERSHIP = Object.freeze({
@@ -49,7 +51,7 @@ export const MASTER_OWNERSHIP = Object.freeze({
   'sku_costs': 'load',                // 原価 (有効期間の付け替え)。'company' なら夜間ロードは原価の行を作らない・閉じない
   'sku_components': 'load',           // セット構成。'company' なら夜間ロードは構成を足さない・直さない・消さない (manual は今も守られる)
   'listing_components.amazon': 'load',// Amazon SKU ↔ NE コード (FBA のマップ。D-43)。'company' なら SKU マスタ・Sheet の構成は材料にしない (FBM の完全一致は対応の無い出品にだけ続ける・
-                                      //   出品そのもの・ASIN・FNSKU は続ける)。対応 (core.amazon_sku_maps・0053) がある出品は持ち主によらず触らない (16 §7 M10・⑦-1)
+                                      //   出品そのもの・ASIN・FNSKU は続ける)。対応 (core.amazon_sku_maps・0054) がある出品は持ち主によらず触らない (16 §7 M10・⑦-1)
   // 仕入先 (core.suppliers)
   'suppliers.name': 'load',
   'suppliers.order_method': 'load',
@@ -60,6 +62,8 @@ export const MASTER_OWNERSHIP = Object.freeze({
   'skus.reorder_months': 'load',      // 推奨保有月数。商品管理リストの公開 snapshot が使えない日は 'load' でも触らない
   'suppliers.contacts': 'load',       // 連絡先 6 列 (email_to / email_cc / contact_name / fax_number / relay_to / order_memo をまとめて)
   'supplier_skus.is_primary': 'load', // 代表の仕入先 (NE の商品の仕入先コード)。コードが空の商品は触らない
+  // 0053 (⑤-2b) で足した列
+  'external_ids.jan': 'load',         // 商品の JAN。'company' なら夜間ロードは商品の JAN を足さない・外さない (JAN の観測と解決の記録は続ける)
 });
 
 /** 知らないキー・知らない値を落とす (typo で「守ったつもり」を作らない) */

@@ -1,6 +1,10 @@
--- 0053: Amazon SKU の対応 (seller SKU ↔ NE コード) を Company DB で直せるようにする (2026-10-02。Company DB構想 16「Amazon SKU の対応の編集」§2・§3・§7 v2 H5 / M7 / M10・
+-- 0054: Amazon SKU の対応 (seller SKU ↔ NE コード) を Company DB で直せるようにする (2026-10-02。Company DB構想 16「Amazon SKU の対応の編集」§2・§3・§7 v2 H5 / M7 / M10・
 --       §8 契約 v3 (Codex 設計 R1 の High 4 = 墓標の物理削除を拒む・関連の列の全部の書き込みで不変条件を見る)。PR ⑦-1)
--- 🚨 前提 = 0051_master_edit.sql (⑤-1)・0052_master_registrations.sql (⑤-2a)。番号は今 0053 (④a #1564・⑤-2b #1571 も 0053 = 後でマージする方の番号を上げる)
+-- 🚨 前提 = 0051_master_edit.sql (⑤-1)・0052_master_registrations.sql (⑤-2a)・0053_ne_registration_csv.sql (⑤-2b #1571)。④a #1564 も 0053 だった = 後でマージする方の番号を上げる
+-- 🚨 0051 の物を ⑤-2b (0053) も広げている = ここは ⑤-1・⑤-2a・⑤-2b の操作・行・答えを全部残して足す (下の 7.):
+--    約束の表の operation (⑤-2b の 9 つも)・sku_id の null 可と ck_mws_sku_needed (⑤-2b のまま)・保存の記録の operation・commit の確かめ (SKU は null も同じ = ⑤-2b と同じ + 出品)・
+--    ops.master_write_allowed (⑤-2b の行も全部)・変更の記録の種類の CHECK (⑤-2b の external_id も・名前も ⑤-2b と同じ master_change_events_entity_type_check)。
+--    ⑤-2b の ops.record_ne_set_observations・guard の関数は触らない
 --
 -- なぜ: 今の正本は miniPC の m_sku_master + m_sku_components (seller SKU ごとの名前と構成)。切替 (⑥) の後は Company DB を正にして、
 --   人がマスタ入力画面 (apps/master-edit の「Amazon SKU」) で直す。古い表への写し (⑦-2) は、この表から決まった並べ方 (lib/sku-map-canonical.js・sku-map-canon-v1) を作る。
@@ -39,14 +43,14 @@
 --        約束と保存の記録の payload_hash = DB が作った「関数が書いた値」のハッシュ (ops.js_stable_sha256)・結果も DB が作る (画面の要求のハッシュは結果の request_payload_hash)
 --      画面のロール master_edit には表の書き込みを渡さない (関数の実行だけ)。関数の中の書き込みも呼び手は master_edit = 下の守り (ops.guard_amazon_map_write) と 0051 の約束で見る
 --   7. 0051 の約束の表・保存の記録・関数を、必要なところだけ広げる:
---        ops.master_write_sessions: operation に amazon_map_save / amazon_map_delete・sku_id を null 可・listing_id (遅らせられる外部キー fk_mws_listing)・
+--        ops.master_write_sessions: operation に amazon_map_save / amazon_map_delete (⑤-2b の操作も残す)・listing_id (遅らせられる外部キー fk_mws_listing)・
 --          source_system = 操作ごと (portal_master_edit / portal_amazon_map)・相手 = SKU か出品のどちらか 1 つ
 --        ops.master_edit_requests: operation に同じ 2 つ・listing_id
 --        ops.check_master_write_session_done: SKU と出品を「null も同じ」で比べる (sku_edit・sku_create の答えは変わらない)
---        ops.master_write_allowed: 前の行は全部そのまま + 2 つの操作の行
+--        ops.master_write_allowed: 前の行 (⑤-1・⑤-2a・⑤-2b) は全部そのまま + 2 つの操作の行
 --   8. 「未登録」の一覧の材料 ops.amazon_map_unmapped_recent (直近の Amazon の注文で、出品に構成が無い・出品が無い seller SKU。M11) と
 --      売上の公開のそろい ops.amazon_map_sales_coverage (そろっていない日は画面が「未判定」と出す)
---   9. 消えた対応 ops.amazon_map_lost_listings (変更の記録にあるのに行が無い = trigger を止めて消された)。夜間ロードは対応があると同じに扱う・切替の前提 (0053_amazon_map)
+--   9. 消えた対応 ops.amazon_map_lost_listings (変更の記録にあるのに行が無い = trigger を止めて消された)。夜間ロードは対応があると同じに扱う・切替の前提 (0054_amazon_map)
 -- 🚨 この migration は今のデータを何も変えない (新しい表は空・足した列は null・制約は新しい行と新しい操作にだけ効く)。
 --    切替の前の片付け (16 §5 の 4) は移行の影運転 (scripts/company-db/amazon-map-migrate.mjs) が数える
 -- 🚨 security definer の関数 = 一時の表を使わない・search_path = pg_catalog, pg_temp (名前は全部 schema つき)・public の実行権を外す (0034 の約束)
@@ -97,13 +101,15 @@ create table core.amazon_sku_maps (
   constraint ck_asm_reason check (deleted_reason is null or length(btrim(deleted_reason)) between 1 and 200),
   foreign key (company_id, listing_id) references core.listings (company_id, listing_id)
 );
-comment on table core.amazon_sku_maps is 'Amazon SKU の対応 (0053・⑦-1)。1 行 = 1 つの出品の対応。構成は core.listing_components。墓標 (deleted) は消さない。書くのは ops.save_amazon_sku_map / ops.delete_amazon_sku_map と切替の日の移行だけ';
+comment on table core.amazon_sku_maps is 'Amazon SKU の対応 (0054・⑦-1)。1 行 = 1 つの出品の対応。構成は core.listing_components。墓標 (deleted) は消さない。書くのは ops.save_amazon_sku_map / ops.delete_amazon_sku_map と切替の日の移行だけ';
 create trigger trg_amazon_sku_maps_touch before update on core.amazon_sku_maps for each row execute function core.touch_updated_at();
 create trigger trg_amazon_sku_maps_version before insert or update on core.amazon_sku_maps for each row execute function core.bump_master_version();
 create trigger trg_amazon_sku_maps_audit after insert or update or delete on core.amazon_sku_maps for each row execute function core.audit_master_change('amazon_sku_map', 'listing_id');
 create trigger trg_amazon_sku_maps_bump_parent after insert or update or delete on core.amazon_sku_maps for each row execute function core.bump_parent_version('core.listings', 'listing_id', 'listing_id');
 
 -- 変更の記録の種類に amazon_sku_map。🚨 not valid = 前の CHECK (この値を含まない狭い集合) が今の行を守っていた = 大きな記録の表を読み直さない (新しい行には効く)
+--   ⑤-2b (0053) の external_id もそのまま・名前も ⑤-2b と同じ master_change_events_entity_type_check
+--   (⑤-2b の手順の「本番に流した後に別の取引で validate constraint master_change_events_entity_type_check」がそのまま使える)
 do $$
 declare v text;
 begin
@@ -111,8 +117,8 @@ begin
    where c.conrelid = 'events.master_change_events'::regclass and c.contype = 'c' and pg_catalog.pg_get_constraintdef(c.oid) like '%entity_type%';
   execute format('alter table events.master_change_events drop constraint %I', v);
 end $$;
-alter table events.master_change_events add constraint ck_mce_entity_type
-  check (entity_type in ('product','sku','supplier','supplier_sku','sku_component','sku_cost','listing','listing_component','amazon_sku_map')) not valid;
+alter table events.master_change_events add constraint master_change_events_entity_type_check
+  check (entity_type in ('product', 'sku', 'supplier', 'supplier_sku', 'sku_component', 'sku_cost', 'listing', 'listing_component', 'external_id', 'amazon_sku_map')) not valid;
 
 -- 2. 墓標を消さない (契約 v3 High 4)。DELETE も TRUNCATE もいつも拒む (復元はユーザーの trigger を止めてから消す = 影響しない)
 create function core.reject_amazon_map_delete() returns trigger language plpgsql as $$
@@ -125,7 +131,7 @@ revoke delete, truncate on core.amazon_sku_maps from public;
 
 -- 5. 構成の行の「変えた時刻」(写しの構成の updated_at。null = created_at と同じ)。夜間ロードは書かない (対応のある出品の構成は触らない)
 alter table core.listing_components add column updated_at timestamptz;
-comment on column core.listing_components.updated_at is 'Amazon SKU の対応の構成の行を数量・並びで変えた時刻 (0053)。null = created_at と同じ。写し (⑦-2) の構成の updated_at';
+comment on column core.listing_components.updated_at is 'Amazon SKU の対応の構成の行を数量・並びで変えた時刻 (0054)。null = created_at と同じ。写し (⑦-2) の構成の updated_at';
 
 -- 3. 不変条件 (commit のときに出品ごとに見る)。問題があれば理由、無ければ null (対応の無い出品は null)
 create function core.amazon_map_problem(p_listing_id bigint) returns text
@@ -211,9 +217,11 @@ create trigger trg_amazon_sku_maps_writer before insert or update on core.amazon
   for each row execute function core.guard_amazon_map_writer();
 
 -- 7. 0051 の約束の表・保存の記録を広げる
--- 7a. 保存の記録 (追記だけ): 操作に 2 つ・出品
+-- 7a. 保存の記録 (追記だけ): 操作に 2 つ (⑤-1・⑤-2a・⑤-2b の操作はそのまま)・出品
 alter table ops.master_edit_requests drop constraint ck_mer_operation;
-alter table ops.master_edit_requests add constraint ck_mer_operation check (operation in ('sku_edit', 'sku_create', 'amazon_map_save', 'amazon_map_delete'));
+alter table ops.master_edit_requests add constraint ck_mer_operation check (operation in ('sku_edit', 'sku_create',
+  'reg_csv_build', 'reg_csv_issue', 'reg_csv_declare', 'reg_csv_supersede', 'reg_csv_verified', 'jan_edit', 'supplier_create', 'supplier_declare', 'supplier_deactivate',
+  'amazon_map_save', 'amazon_map_delete'));
 alter table ops.master_edit_requests add column listing_id bigint references core.listings (listing_id);
 create index ix_master_edit_requests_listing on ops.master_edit_requests (listing_id, started_at desc) where listing_id is not null;
 
@@ -226,16 +234,19 @@ begin
   execute format('alter table ops.master_write_sessions drop constraint %I', v);
 end $$;
 alter table ops.master_write_sessions drop constraint ck_mws_operation;
-alter table ops.master_write_sessions add constraint ck_mws_operation check (operation in ('sku_edit', 'sku_create', 'amazon_map_save', 'amazon_map_delete'));
-alter table ops.master_write_sessions alter column sku_id drop not null;
+alter table ops.master_write_sessions add constraint ck_mws_operation check (operation in ('sku_edit', 'sku_create',
+  'reg_csv_build', 'reg_csv_issue', 'reg_csv_declare', 'reg_csv_supersede', 'reg_csv_verified', 'jan_edit', 'supplier_create', 'supplier_declare', 'supplier_deactivate',
+  'amazon_map_save', 'amazon_map_delete'));
+-- sku_id の not null は ⑤-2b (0053) が外した・sku_edit / sku_create は ck_mws_sku_needed (0053) が要る = ここでは触らない
 alter table ops.master_write_sessions add column listing_id bigint;
 -- 出品の外部キーは遅らせられる形 (ふだんはすぐ確かめる)。保存の関数だけが、まだ無い出品を作るときに commit のときの確かめにする (0052 の fk_mws_sku と同じ)
 alter table ops.master_write_sessions add constraint fk_mws_listing foreign key (listing_id) references core.listings (listing_id) deferrable initially immediate;
+-- 相手: Amazon の操作 = 出品だけ (SKU なし)・ほかの操作 = 出品なし (SKU が要るかは ⑤-2b の ck_mws_sku_needed のまま = 仕入先・ファイルの操作は SKU なし)
 alter table ops.master_write_sessions add constraint ck_mws_target check (case when operation in ('amazon_map_save', 'amazon_map_delete')
-  then listing_id is not null and sku_id is null else sku_id is not null and listing_id is null end);
+  then listing_id is not null and sku_id is null else listing_id is null end);
 alter table ops.master_write_sessions add constraint ck_mws_source check (source_system = case when operation in ('amazon_map_save', 'amazon_map_delete') then 'portal_amazon_map' else 'portal_master_edit' end);
 
--- 7c. commit のときの確かめ (0051): SKU と出品を「null も同じ」で比べる。sku_edit・sku_create は出品が null どうし = 答えは前と同じ
+-- 7c. commit のときの確かめ (0051・⑤-2b の 0053 で SKU を「null も同じ」に): + 出品も「null も同じ」で比べる。Amazon でない操作は出品が null どうし = 答えは ⑤-2b と同じ
 create or replace function ops.check_master_write_session_done() returns trigger
   language plpgsql security definer set search_path = pg_catalog, ops, pg_temp as $$
 begin
@@ -249,7 +260,7 @@ begin
   return null;
 end $$;
 
--- 7d. 操作ごとの書いてよい (表・書き方)。sku_edit・sku_create の行は 0052 と同じ。
+-- 7d. 操作ごとの書いてよい (表・書き方)。sku_edit・sku_create・⑤-2b の行は 0053 と同じ (全部残す)。
 --     amazon_map_save = 出品 (無ければ作る・0026 の version の付け替え)・対応・構成 / amazon_map_delete = 対応を墓標に・構成を消す・出品の version
 create or replace function ops.master_write_allowed(p_operation text, p_table text, p_op text) returns boolean language sql immutable set search_path = pg_catalog, pg_temp as $$
   select exists (select 1 from (values
@@ -262,6 +273,19 @@ create or replace function ops.master_write_allowed(p_operation text, p_table te
       ('sku_create', 'core.skus', 'INSERT'), ('sku_create', 'core.skus', 'UPDATE'),
       ('sku_create', 'core.supplier_skus', 'INSERT'), ('sku_create', 'core.sku_costs', 'INSERT'),
       ('sku_create', 'ops.sku_component_requests', 'INSERT'),
+      -- 0053 (⑤-2b)
+      ('sku_edit', 'ops.ne_reg_exports', 'UPDATE'), ('sku_edit', 'ops.ne_reg_export_items', 'UPDATE'),
+      ('reg_csv_build', 'ops.ne_reg_exports', 'INSERT'), ('reg_csv_build', 'ops.ne_reg_export_items', 'INSERT'), ('reg_csv_build', 'ops.ne_reg_export_rows', 'INSERT'),
+      ('reg_csv_issue', 'ops.ne_reg_exports', 'UPDATE'), ('reg_csv_issue', 'ops.ne_reg_export_items', 'UPDATE'),
+      ('reg_csv_declare', 'ops.ne_reg_exports', 'UPDATE'), ('reg_csv_declare', 'ops.ne_reg_export_items', 'UPDATE'), ('reg_csv_declare', 'ops.ne_reg_attempts', 'INSERT'),
+      ('reg_csv_supersede', 'ops.ne_reg_exports', 'UPDATE'), ('reg_csv_supersede', 'ops.ne_reg_export_items', 'UPDATE'),
+      ('reg_csv_verified', 'ops.ne_csv_verified', 'INSERT'),
+      ('jan_edit', 'core.external_ids', 'INSERT'), ('jan_edit', 'core.external_ids', 'UPDATE'), ('jan_edit', 'core.skus', 'UPDATE'), ('jan_edit', 'core.products', 'UPDATE'),
+      ('jan_edit', 'ops.ne_reg_exports', 'UPDATE'), ('jan_edit', 'ops.ne_reg_export_items', 'UPDATE'),
+      ('supplier_create', 'core.suppliers', 'INSERT'),
+      ('supplier_deactivate', 'core.suppliers', 'UPDATE'), ('supplier_deactivate', 'core.supplier_skus', 'INSERT'), ('supplier_deactivate', 'core.supplier_skus', 'UPDATE'),
+      ('supplier_deactivate', 'ops.ne_reg_exports', 'UPDATE'), ('supplier_deactivate', 'ops.ne_reg_export_items', 'UPDATE'),
+      -- 0054 (⑦-1)
       ('amazon_map_save', 'core.listings', 'INSERT'), ('amazon_map_save', 'core.listings', 'UPDATE'),
       ('amazon_map_save', 'core.amazon_sku_maps', 'INSERT'), ('amazon_map_save', 'core.amazon_sku_maps', 'UPDATE'),
       ('amazon_map_save', 'core.listing_components', 'INSERT'), ('amazon_map_save', 'core.listing_components', 'UPDATE'), ('amazon_map_save', 'core.listing_components', 'DELETE'),
@@ -687,7 +711,7 @@ begin
   return '{}'::text[];
 end $$;
 revoke all on function ops.amazon_map_prereq(text, text) from public;
-insert into ops.master_cutover_prereq_checks (name, fn) values ('0053_amazon_map', 'ops.amazon_map_prereq(text, text)');
+insert into ops.master_cutover_prereq_checks (name, fn) values ('0054_amazon_map', 'ops.amazon_map_prereq(text, text)');
 
 -- 見張りは読むだけ。画面のロールの権限は scripts/company-db/create-master-edit-roles.mjs (migration の後に流し直す)
 do $$ begin

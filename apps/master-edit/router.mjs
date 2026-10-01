@@ -20,13 +20,22 @@
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
  *   POST /api/sku/:code/card-retry  カードの取り込みをもう一度 (名簿の人・衝突 / 失敗の知らせも試す)
  *   POST /api/sku/:code/card-link   衝突を解く = 既存のカード (同じ商品コード) をこの商品に結ぶ (名簿の人。PR #1566 R1 M6)
- *   ── Amazon SKU の対応 (⑦-1・0053・Company DB構想 16。保存を開く門は上と同じ + 持ち主 listing_components.amazon が 'company') ──
+ *   ── Amazon SKU の対応 (⑦-1・0054・Company DB構想 16。保存を開く門は上と同じ + 持ち主 listing_components.amazon が 'company') ──
  *   GET  /amazon/            一覧 (Company DB の対応・墓標も)。?q=&state=&offset=
  *   GET  /amazon/sku?sku=    1 つの seller SKU (見る・直す・墓標にする・墓標から戻す)。対応が無ければ「新しい対応」(今の構成は夜間ロードの写しとして見せる)
  *   GET  /amazon/sku/history?sku=  変更の記録 (対応・構成・出品)
  *   GET  /amazon/unmapped    未登録 = 直近 7 日に売れたのに構成が無い seller SKU (FBA / FBM で分ける・売上の公開が欠けた日は「未判定」)
  *   POST /api/amazon/save    保存 { request_id, seller_sku, name, components: [{ code, qty }], reason?, seen: { versions } } (lib/amazon-map-write.mjs)
  *   POST /api/amazon/delete  墓標にする { request_id, seller_sku, reason, seen: { versions } }
+ *   NE 登録の CSV (⑤-2b・0053・lib/master-reg-csv.mjs。作る・配る・申告・使わない・実機の確かめは MASTER_DECISION_APPROVERS の名簿の人だけ = マスタの判断の CSV と同じ):
+ *   GET  /reg-csv                   画面
+ *   GET  /api/reg-csv/summary       今日の照合の回・形の確かめ・候補と止まる理由・ファイル
+ *   POST /api/reg-csv/exports       作る { kind: products | sets, codes: [...], request_id }
+ *   POST /api/reg-csv/exports/:id/issue     配る (built → issued)。この後に /file でダウンロード
+ *   GET  /api/reg-csv/exports/:id/file      byte 列 (配った・申告したファイルだけ)
+ *   POST /api/reg-csv/exports/:id/declare   取り込んだと申告 { sha256, result: ok | partial | rejected_all, ne_message?, imported_at?, note? }
+ *   POST /api/reg-csv/exports/:id/supersede 使わない { reason, correction, confirm: true }
+ *   POST /api/reg-csv/verified      実機で確かめた { kind, result: ok | ng, export_id?, note? }
  * Company DB に届かない = 画面は「つながらない (保存できない)」の帯・保存は 503 (何も書かない)。SQLite と NE には書かない
  * env: COMPANY_DB_MASTER_EDIT_URL = この画面だけのロール master_edit (scripts/company-db/create-master-edit-roles.mjs が作る。読む・この画面の書き込みだけ・
  *        切替の段階を進める関数・構成の依頼を上げる / 観測を書く権限は無い)。🚨 保存はこの接続だけ = 無ければ見るだけ (保存は 503・#1563 R1 M8)
@@ -47,6 +56,16 @@ import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/mast
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
 import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, CHANNELS, UNMAPPED_DAYS } from './amazon-read.mjs';
 import { normSku } from '../../lib/sku-norm.js';
+import { approverGate } from '../master-decisions/router.mjs';
+import {
+  regSummary, buildRegExport, issueRegExport, regExportFile, declareRegExport, supersedeRegExport, recordRegVerified,
+  REG_ITEM_STATES, REG_RESULTS,
+} from '../../lib/master-reg-csv.mjs';
+
+/** NE 登録の CSV の画面の言葉 */
+const REG_EXPORT_STATES = Object.freeze({ built: '作った (まだ配っていない)', issued: '配った (取り込み待ち)', declared: '取り込んだと申告', closed: '閉じた' });
+const REG_CLOSE_REASONS = Object.freeze({ superseded: '使わない', rejected_all: '全部だめ', finished: '全部の商品が終わった' });
+const REG_CHECK_OUTCOMES = Object.freeze({ verified: 'NE で確かめた', partial: '違う列がある', failed: '取り込めなかった', waiting: '待ち', in_ne_undeclared: 'NE にある (申告がまだ)' });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const view = (name) => path.join(__dirname, 'views', name);
@@ -262,7 +281,7 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
   if (db && !page) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), message: `商品コード ${req.params.code} は Company DB にありません` });
   const shipping = page ? await shippingRatesProvider() : null;
   res.render(view('sku.ejs'), {
-    ...pageLocals(req, page ? page.phase : null), dbError, page, code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS,
+    ...pageLocals(req, page ? page.phase : null), dbError, page, code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
   });
 }));
@@ -395,6 +414,48 @@ router.post('/api/amazon/delete', (req, res) => {
     }, { open: isOpen(), ownership: ownershipNow() });
     res.json(r);
   }, 'write');
+});
+
+// ─── NE 登録の CSV (⑤-2b) ───
+router.get('/reg-csv', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const summary = db ? await regSummary(db, { nowMs: clock() }) : null;
+  const phase = db ? await readCutoverPhase(db) : null;
+  const gate = approverGate(req);
+  res.render(view('reg-csv.ejs'), {
+    ...pageLocals(req, phase), dbError, summary, canApprove: gate.ok, approveMessage: gate.message || '',
+    REG_STATES, ITEM_STATES: REG_ITEM_STATES, RESULTS: REG_RESULTS, EXPORT_STATES: REG_EXPORT_STATES, CLOSE_REASONS: REG_CLOSE_REASONS, CHECK_OUTCOMES: REG_CHECK_OUTCOMES,
+  });
+}));
+router.get('/api/reg-csv/summary', (req, res) => withPgApi(res, async (db) => res.json({ ok: true, ...(await regSummary(db, { nowMs: clock() })) })));
+/** NE 登録の CSV の書き込み = 名簿 (MASTER_DECISION_APPROVERS) の人だけ・この画面だけのロールで */
+function regWrite(req, res, fn) {
+  const gate = approverGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
+  const actor = String(req.session.email).trim().toLowerCase();
+  const opts = { open: isOpen(), ownership: ownershipNow(), nowMs: clock() };
+  return withPgApi(res, async (db) => res.json({ ok: true, ...(await fn(db, actor, req.body || {}, opts)) }), 'write');
+}
+router.post('/api/reg-csv/exports', (req, res) => regWrite(req, res, (db, actor, b, o) => buildRegExport(db, { actor, kind: b.kind, codes: b.codes, requestId: b.request_id }, o)));
+router.post('/api/reg-csv/exports/:id/issue', (req, res) => regWrite(req, res, (db, actor, b, o) => issueRegExport(db, { actor, exportId: req.params.id, requestId: b.request_id }, o)));
+router.post('/api/reg-csv/exports/:id/declare', (req, res) => regWrite(req, res, (db, actor, b, o) => declareRegExport(db, {
+  actor, exportId: req.params.id, sha256: b.sha256, result: b.result, neMessage: b.ne_message ?? null, importedAt: b.imported_at ?? null, note: b.note ?? null, requestId: b.request_id,
+}, o)));
+router.post('/api/reg-csv/exports/:id/supersede', (req, res) => regWrite(req, res, (db, actor, b, o) => supersedeRegExport(db, {
+  actor, exportId: req.params.id, reason: b.reason, correction: b.correction, confirm: b.confirm === true, requestId: b.request_id,
+}, o)));
+router.post('/api/reg-csv/verified', (req, res) => regWrite(req, res, (db, actor, b, o) => recordRegVerified(db, { actor, kind: b.kind, result: b.result, note: b.note ?? null, exportId: b.export_id ?? null, requestId: b.request_id }, o)));
+router.get('/api/reg-csv/exports/:id/file', (req, res) => {
+  const gate = approverGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
+  return withPgApi(res, async (db) => {
+    const f = await regExportFile(db, req.params.id);
+    if (!f) return res.status(404).json({ ok: false, error: 'ファイルがありません' });
+    if (!f.bytes) return res.status(409).json({ ok: false, error: f.state === 'built' ? '先に「配る」を押してください' : '閉じたファイルは配りません', reason: f.state });
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.set('Content-Disposition', `attachment; filename="${f.file_name}"`);
+    res.set('X-Content-SHA256', f.sha256);
+    res.send(f.bytes);
+  });
 });
 
 router.post('/api/sku/:code', (req, res) => {

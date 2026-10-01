@@ -25,7 +25,7 @@ import { writeEvidence } from '../push/evidence.mjs';
 import { compareLoad, readCdbMaster, LOAD_CTX } from './compare-load.mjs';
 import { compareNe, NE_FORMAT } from './compare-ne.mjs';
 import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs, markWriteFailed } from './pending.mjs';
-import { readDecisionLedger, writeDecisions, writeNeCodes, connectDecisionWriter } from './decisions.mjs';
+import { readDecisionLedger, writeDecisions, writeNeCodes, connectDecisionWriter, snapshotRegTargets, writeRegistrationObservations, sealRegistrationRun, runRegistrationCheck } from './decisions.mjs';
 import { readBaseline, writeBaseline, holdAllDirections } from './baseline.mjs';
 
 export const EVIDENCE_NAME = 'master-compare';
@@ -124,6 +124,10 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
     throw new Error('証跡 (実行中) を書けない = 前の回の結果を無効にできない');
   }
   let result, close = null;
+  // 書く接続 (watch_writer) は 1 本を、回の始まりの写し・判断の台帳・基準・新規登録の確かめで使う (完了の証跡の後の確かめまで開いておく)
+  let wconn = null;
+  const writer = async () => writerDb || (wconn ??= await connectWriter()).db;
+  const closeWriter = async () => { const c = wconn; wconn = null; if (c && c.close) { try { await c.close(); } catch { /* */ } } };
   try {
     if (!db) {
       if (!connect) throw new Error('接続が無い (db か connect が要る)');
@@ -132,7 +136,9 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
     }
     // ② の台帳は排他を取ってから読む (取れなければ台帳を使う判定は blocked = pending_locked。C2 v6-3)
     const release = neCompare ? (() => { try { return acquireLock(pendingDir(dataDir, RESULT_DIR)); } catch { return null; } })() : null;
-    let pendingEntries = null, ledger = null, decisionLedger = null, decisionsDone = [], baselineWrites = [], neCodes = null;
+    let pendingEntries = null, ledger = null, decisionLedger = null, decisionsDone = [], baselineWrites = [], neCodes = null, regObs = null, regRead = null;
+    // 新商品の NE 登録の CSV の確かめ待ち (0053) = 回の始まりに DB が回へ写す (読み取りの取引の前・#1571 Codex R2 Medium 1)。写せない = 送らない (② は続ける)
+    if (neCompare) regRead = await snapshotRegTargets(writerDb || connectWriter ? writer : null, { compareRunId });
     try {
       await db.query('begin transaction isolation level repeatable read read only');
       try {
@@ -149,8 +155,10 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
             decisionLedger = await readDecisionLedger(db);
             // 最後に一致した値 (D2) も同じ取引で (読めない = 方向は全部 held・① と ② は続く)
             const baseline = { ...(await readBaseline(db)), cdbReadAt: readAt };
-            const r2 = neCompare({ dataDir, asOfJst: asOf, syncRunId, loadCtx: ctx, cdb, ledger, loadVerdict: result.verdict, decisionLedger, baseline });
+            const r2 = neCompare({ dataDir, asOfJst: asOf, syncRunId, loadCtx: ctx, cdb, ledger, loadVerdict: result.verdict, decisionLedger, baseline,
+              regTargets: regRead.state === 'ok' ? regRead.targets : null });
             result.ne = r2.result; pendingEntries = r2.pendingEntries; decisionsDone = r2.decisionsDone || []; baselineWrites = r2.baselineWrites || []; neCodes = r2.neCodes || null;
+            regObs = r2.regObs || null;
             if (pendingEntries) result.ne.pending_entries = pendingEntries;   // 台帳の保存に失敗した回の復旧の元 (restore-pending.mjs)
           } catch (e) {
             result.ne = { format: NE_FORMAT, verdict: 'error', error: String(e && e.message).slice(0, 300) };   // ① は残す
@@ -168,9 +176,8 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         }
       }
     } finally { if (release) release(); }
-    // 書く接続 (watch_writer) は 1 本を判断の台帳と基準で使う
-    let wconn = null;
-    const writer = async () => writerDb || (wconn ??= await connectWriter()).db;
+    let j = null;
+    let evidence = null;
     try {
     // 判断の台帳に候補と完了を書く (取引の後・別の接続 = watch_writer。表へ直接は書けない = 関数だけ。D1 契約 v3)
     if (result.ne && result.ne.verdict !== 'error') {
@@ -197,6 +204,22 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         catch (e) { Object.assign(nc, { write: 'failed', write_error: String(e && e.message).slice(0, 200) }); }
       }
     }
+    // 新商品の NE 登録の CSV の確かめ (0053・契約 v3 H5・#1571 Codex R1 High 2) の 1 段目 = NE の観測を DB に残すだけ (状態は変えない)。
+    //   判断の台帳にこの回が書けたときだけ (照合の回の記録 = 外部キー)。② が最後まで走った回 = NE の完全な取得。
+    //   2 段目 (完了の受け取り = receipt) は、この回が最後まで終わって結果の JSON を書いた後。3 段目 (確かめ = 状態を進める) は完了の証跡の後
+    if (result.ne && result.ne.verdict !== 'error') {
+      const rg = result.ne.registrations || (result.ne.registrations = {});
+      if (regRead && regRead.snapshot) rg.snapshot = { state: regRead.snapshot.state, target_hash: regRead.snapshot.target_hash, targets: regRead.targets.length };   // 回の始まりの写し
+      if (regRead && regRead.reason) rg.snapshot_error = regRead.reason;
+      if (!regRead || regRead.state !== 'ok') rg.write = `skipped_${regRead ? regRead.state : 'none'}`;
+      else if (!regObs) rg.write = `skipped_${result.ne.verdict === 'blocked' ? 'blocked' : 'none'}`;
+      else if (!regObs.observations.length) rg.write = 'nothing';
+      else if (result.ne.decisions_write !== 'ok') rg.write = `skipped_decisions_${result.ne.decisions_write ?? 'none'}`;
+      else {
+        try { rg.observed = await writeRegistrationObservations(await writer(), { compareRunId, regObs }); rg.write = 'observed'; }
+        catch (e) { Object.assign(rg, { write: 'failed', write_error: String(e && e.message).slice(0, 200) }); }
+      }
+    }
     // 最後に一致した値 (D2) を書く (取引の後・watch_writer・関数だけ・1 回 = 1 取引。変更ゼロでも札を照らして進める)
     const bs = result.ne && result.ne.baseline;
     if (bs && bs.state !== 'not_applied') {
@@ -214,10 +237,11 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         }
       }
     }
-    } finally { if (wconn && wconn.close) { try { await wconn.close(); } catch { /* */ } } }
     Object.assign(result, { compare_run_id: compareRunId, started_at: startedAt, finished_at: new Date().toISOString() });
-    const j = writeResultJson(dataDir, asOf, compareRunId, result);
-    const evidence = {
+    j = writeResultJson(dataDir, asOf, compareRunId, result);
+    const regEvidence = () => (result.ne && result.ne.registrations ? { targets: result.ne.registrations.targets ?? null, write: result.ne.registrations.write ?? null,
+      seal: result.ne.registrations.seal ?? null, counts: result.ne.registrations.written?.counts ?? null, write_error: result.ne.registrations.write_error ?? null } : null);
+    evidence = {
       state: 'complete', compare_run_id: compareRunId, as_of: asOf, started_at: startedAt, finished_at: result.finished_at,
       json_path: j.rel, sha256: j.sha256, bytes: j.bytes, format: result.format,
       verdict: result.verdict, blocked_reason: result.blocked_reason, counts: result.counts,
@@ -226,16 +250,37 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       ne: result.ne ? { verdict: result.ne.verdict, blocked_reason: result.ne.blocked_reason ?? null, error: result.ne.error ?? null, counts: result.ne.counts ?? null,
         decisions_read: result.ne.decisions_read ?? null, decisions_write: result.ne.decisions_write ?? null,
         ne_codes: result.ne.ne_codes ? { state: result.ne.ne_codes.state, reason: result.ne.ne_codes.reason ?? null, counts: result.ne.ne_codes.counts ?? null, write: result.ne.ne_codes.write ?? null } : null,
+        registrations: regEvidence(),
         baseline: result.ne.baseline ? { state: result.ne.baseline.state, held_reason: result.ne.baseline.held_reason ?? null, write: result.ne.baseline.write ?? null, write_code: result.ne.baseline.write_code ?? null,
           counts: result.ne.baseline.counts ?? null, written: result.ne.baseline.written ?? null } : null } : null,
     };
     if (!write(dataDir, EVIDENCE_NAME, evidence)) throw new Error('証跡 (完了) を書けない');
+    // 新規登録の確かめ (#1571 Codex R1 High 2) の 2 段目 = 回が最後まで終わった受け取り (receipt)。結果の JSON (j.sha256) と完了の証跡を書けた後だけ。
+    //   基準の書き込みが失敗した / 拒まれた回は書かない。3 段目 = 確かめ (状態を進める) は受け取りを書けた回だけ。DB の関数は回の番号だけを受け、受け取りと残した観測を自分で読む。
+    //   どちらが落ちても回は完了のまま (NE 確認済みには進めない = 翌朝の回でもう一度)。途中で落ちた回 (受け取りの前) は確かめない
+    const rg = result.ne && result.ne.registrations;
+    if (rg && rg.write === 'observed') {
+      const bsw = result.ne.baseline && result.ne.baseline.write;
+      if (bsw === 'failed' || bsw === 'rejected') rg.seal = `skipped_baseline_${bsw}`;
+      else {
+        try { rg.sealed = await sealRegistrationRun(await writer(), { compareRunId, observationHash: rg.observed.observation_hash, evidenceSha256: j.sha256 }); rg.seal = 'ok'; }
+        catch (e) { Object.assign(rg, { seal: 'failed', seal_error: String(e && e.message).slice(0, 200) }); }
+      }
+      if (rg.seal === 'ok') {
+        try { rg.written = await runRegistrationCheck(await writer(), { compareRunId }); rg.write = 'ok'; }
+        catch (e) { Object.assign(rg, { write: 'check_failed', write_error: String(e && e.message).slice(0, 200) }); }
+      }
+      evidence.ne.registrations = regEvidence();
+      try { write(dataDir, EVIDENCE_NAME, evidence); } catch { /* 完了の証跡はもう書けている */ }
+    }
+    } finally { await closeWriter(); }
     pruneResults(dataDir, { now });
     return { result, evidence, line: summaryLine(result) };
   } catch (e) {
     write(dataDir, EVIDENCE_NAME, { state: 'failed', compare_run_id: compareRunId, as_of: asOf, started_at: startedAt, error: String(e && e.message).slice(0, 300) });
     throw e;
   } finally {
+    await closeWriter();   // 読み取りの途中で落ちた回も (回の始まりの写しで開いた接続)
     if (close) { try { await close(); } catch { /* */ } }
   }
 }
