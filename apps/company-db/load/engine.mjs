@@ -219,8 +219,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
     // 変更の記録 (events.master_change_events。0026) に「誰が」を残す。is_local = true なので取引を出れば消える (接続を使い回しても漏れない)
     await db.query("select set_config('core.actor_type', 'system', true), set_config('core.actor_id', $1, true), set_config('core.source_system', 'company_db_load', true), set_config('core.run_id', $2, true)",
       [opts.host || 'unknown', runId]);
-    // 0050: マスタの書き込みの鍵を排他で (取引の冒頭・親子の鍵より前)。マスタ入力画面の保存と構成の依頼の昇格は共有で取る (短く待って 409)
-    //   = この長い取引と保存が行の鍵で待ち合わない (#1563 仮レビュー M3)。0050 の前の DB では取らない (今の動きのまま・ほかに持つ人はいない)
+    // 0051: マスタの書き込みの鍵を排他で (取引の冒頭・親子の鍵より前)。マスタ入力画面の保存と構成の依頼の昇格は共有で取る (短く待って 409)
+    //   = この長い取引と保存が行の鍵で待ち合わない (#1563 仮レビュー M3)。0051 の前の DB では取らない (今の動きのまま・ほかに持つ人はいない)
     if ((await db.query(MASTER_WRITE_LOCK_EXISTS_SQL)).rows[0].ok) await db.query(MASTER_WRITE_EXCLUSIVE_LOCK_SQL);
     // D3 (0036): 代表関係 (親子) の帰属と DB の守り。0036 があれば、商品の行を触る前 (取引の冒頭) に親子の鍵を取り、約束の印を付ける
     //   (鍵 → 行の順をすべての書き手でそろえる = ポータルの付け外しと互いに待ち合わない。Codex D3-R1 M2)。鍵は commit まで持つ

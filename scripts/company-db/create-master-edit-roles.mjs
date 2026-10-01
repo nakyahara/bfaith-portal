@@ -7,8 +7,8 @@
  *   読む: 画面が読む表だけ (MASTER_EDIT_SELECT) / 書く: 保存の経路で書く表の列だけ (MASTER_EDIT_WRITE。insert も列を絞る)
  *   🚨 書けるのは同じ取引で ops.begin_master_write (実行だけ渡す) を呼んだ後・その約束の相手 (SKU・含むセット・商品)・操作の書き方だけ (DB の trigger。段階・持ち主表・版・誰が を DB で守る・#1563 R3 M2・R4 M2)
  *   🚨 渡さない: events.master_change_events の insert (記録は 0026 の関数 = security definer が書く = 偽れない)・core.skus.version・core.sku_components の書き込み・
- *      切替の段階・門の記録・NE の観測の書き込み。core.sku_costs の削除は渡すが、今日より前の行は DB の trigger が拒む (0050)
- *      core.suppliers の update (仕入先の行の共有の鍵は 0050 の関数 core.lock_suppliers_for_share = security definer の実行だけ)
+ *      切替の段階・門の記録・NE の観測の書き込み。core.sku_costs の削除は渡すが、今日より前の行は DB の trigger が拒む (0051)
+ *      core.suppliers の update (仕入先の行の共有の鍵は 0051 の関数 core.lock_suppliers_for_share = security definer の実行だけ)
  *   ロールの設定 = statement_timeout 20s・lock_timeout 10s・idle_in_transaction_session_timeout 60s (画面の接続の設定と同じ。画面が付け忘れても長く持たない)
  * master_ops      (手の操作 scripts/company-db/master-cutover.mjs が env COMPANY_DB_MASTER_OPS_URL で使う): ops.set_master_cutover_phase の実行と、段階・記録を読むだけ
  * master_observer (⑤-2 の夜間ロードが NE のセットの構成の観測を書く env COMPANY_DB_MASTER_OBSERVER_URL): ops.record_ne_set_observations の実行だけ
@@ -24,7 +24,7 @@
  *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs --dry-run   # 流す文だけ見る
  *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs             # 作る / 権限をそろえる (新しいロールのパスワードだけ、この画面に出る)
  *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs --rotate-password master_gate_render   # そのロールのパスワードだけ変える (何回でも付けられる)
- * 🚨 0050 まで migration を流した後に。migration で表を足したら流し直す (権限は表ごとに付ける)
+ * 🚨 0051 まで migration を流した後に。migration で表を足したら流し直す (権限は表ごとに付ける)
  */
 import crypto from 'node:crypto';
 import { openPgClient } from './migrate.mjs';

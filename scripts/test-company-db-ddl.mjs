@@ -115,7 +115,7 @@ await ta('[!] 期待する表がすべてある', async () => {
     'ops.load_decisions',
     // 0046 観測の原価 (13 §3.4・D7b-2)
     'core.sku_cost_observed_loads', 'core.sku_cost_observed',
-    // 0050 マスタ入力画面の土台 (14 §6 ⑤-1)
+    // 0051 マスタ入力画面の土台 (14 §6 ⑤-1)
     'ops.master_cutover_state', 'ops.master_cutover_events', 'ops.master_legacy_manifests', 'ops.master_legacy_gate_acks', 'ops.master_edit_requests', 'ops.sku_component_requests',
     'ops.ne_set_observation_runs', 'ops.ne_set_observations', 'ops.sku_component_breaches',
   ];
@@ -127,7 +127,7 @@ await ta('[!] 期待する表がすべてある', async () => {
   assert.deepEqual(views.map((v) => v.t).sort(), ['mart.v_ad_spend_daily', 'mart.v_cross_mall_diff', 'mart.v_finance_account_fees_monthly', 'mart.v_finance_daily', 'mart.v_listing_360', 'mart.v_order_finance_summary', 'mart.v_order_finance_uncovered', 'mart.v_product_360', 'mart.v_product_dq', 'mart.v_purchase_backorder_by_sku', 'mart.v_purchase_order_open', 'mart.v_sales_daily', 'mart.v_shipments_daily', 'mart.v_shipments_unlinked', 'mart.v_sku_cost_observed_effective', 'mart.v_sku_stock', 'mart.v_warehouse_stock_current']);
 });
 
-await ta('[!] 0050 (14 §6 ⑤-1・#1563 R1・R2): 切替の段階は legacy_open から (門の記録が無い = 進めない)・セットの 2 列は null で足す・記録と観測は追記だけ・原価の期間の重なりの守りは夜間ロードを見ない・段階を進める関数と観測を書く関数は public に実行させない', async () => {
+await ta('[!] 0051 (14 §6 ⑤-1・#1563 R1・R2): 切替の段階は legacy_open から (門の記録が無い = 進めない)・セットの 2 列は null で足す・記録と観測は追記だけ・原価の期間の重なりの守りは夜間ロードを見ない・段階を進める関数と観測を書く関数は public に実行させない', async () => {
   assert.deepEqual((await q('select phase from ops.master_cutover_state'))[0], { phase: 'legacy_open' });
   const cols = await q("select column_name as c, data_type as t, is_nullable as n from information_schema.columns where table_schema = 'core' and table_name = 'skus' and column_name in ('set_sales_class_override', 'handling_own') order by 1");
   assert.deepEqual(cols.map((r) => [r.c, r.t, r.n]), [['handling_own', 'text', 'YES'], ['set_sales_class_override', 'smallint', 'YES']]);
@@ -147,7 +147,7 @@ await ta('[!] 0050 (14 §6 ⑤-1・#1563 R1・R2): 切替の段階は legacy_ope
   // #1563 仮レビュー: 門の記録は場所ごとのログイン・止まった記録 (引数 10 個・後ろ 2 つは既定あり)・黙っているプロセスを見る時間・マスタの書き込みの鍵・原価の縮めるだけの UPDATE は見ない
   assert.deepEqual((await q("select pg_get_function_identity_arguments('ops.record_legacy_gate_ack(text, text, text, jsonb, text, text, integer, timestamptz, boolean, text)'::regprocedure) as a"))[0].a.split(', ').map((x) => x.split(' ')[0]),
     ['p_host', 'p_instance_id', 'p_build_id', 'p_manifest', 'p_owner_hash', 'p_phase_seen', 'p_inflight_count', 'p_oldest_inflight_at', 'p_stopped', 'p_stopped_reason']);
-  assert.deepEqual((await q('select core.master_write_lock_key()::text as k'))[0], { k: '4705310050' });
+  assert.deepEqual((await q('select core.master_write_lock_key()::text as k'))[0], { k: '4705310051' });
   // #1563 R3: 黙っているプロセスは年齢で外さない (時間の窓の関数は無い)・前提の差し込み口の表 (空)・画面のロールの書き込みの約束 (begin + 7 つの表の guard)
   assert.equal((await q("select to_regprocedure('ops.master_cutover_ack_silent_hours()') is null as gone"))[0].gone, true);
   assert.equal((await q('select count(*)::int as n from ops.master_cutover_prereq_checks'))[0].n, 0);
@@ -220,6 +220,25 @@ await ta('[!] 0049 (13 §3.5・§3.6・D7b-3): Amazon の利益の mart = 関数
   assert.ok(Math.abs(new Date(s.since).getTime() - new Date(s.applied).getTime()) < 600e3, JSON.stringify(s));
   const tables = await q(`select count(*)::int as n from information_schema.tables where table_name like '%amazon_profit%'`);
   assert.equal(tables[0].n, 0);
+});
+
+await ta('[!] 0050 (13 §3.1・D7b-1b-2): 決済のそろい core.finance_coverage = 会社 × モール × scope × source の 1 行・core.finance_coverage_state は同じ形のまま差し替え (行なし = 全部 null)', async () => {
+  const pk = await q(`select a.attname as c from pg_index i join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
+    where i.indrelid = 'core.finance_coverage'::regclass and i.indisprimary order by array_position(i.indkey, a.attnum)`);
+  assert.deepEqual(pk.map((r) => r.c), ['company_id', 'mall', 'scope_key', 'source']);
+  const ck = await q(`select conname as n from pg_constraint where conrelid = 'core.finance_coverage'::regclass and contype = 'c' and conname like 'ck\\_finance\\_coverage\\_%' order by 1`);
+  assert.deepEqual(ck.map((r) => r.n), ['ck_finance_coverage_complete', 'ck_finance_coverage_complete_to', 'ck_finance_coverage_evidence', 'ck_finance_coverage_invalidated', 'ck_finance_coverage_receipts']);
+  assert.equal((await q(`select pg_get_function_result('core.finance_coverage_state(smallint,text,text,text)'::regprocedure) as r`))[0].r, 'TABLE(complete_to date, generation bigint, source_revision bigint)');
+  assert.deepEqual(await q(`select * from core.finance_coverage_state(1::smallint, 'amazon', 'jp', 'amazon_settlement_unified')`), [{ complete_to: null, generation: null, source_revision: null }]);
+  assert.equal((await q(`select count(*)::int as n from core.finance_coverage`))[0].n, 0);   // 作るだけ (値は coordinator = D7b-1b-3 が送る)
+  // policy の指紋 (#1561 Codex R2 High) と、0047 の関数の差し替え (partial = coverage 基準・同じ引数と戻り・R2 Medium)
+  assert.match((await q(`select core.finance_policy_fingerprint(1::smallint, 'amazon', 'jp') as f`))[0].f, /^[0-9a-f]{64}$/);
+  const src = (await q(`select prosrc as s from pg_proc where oid = 'mart.finance_daily_sku_range(smallint,text,text,date,date)'::regprocedure`))[0].s;
+  assert.ok(src.includes('core.finance_month_settled') && !src.includes('statement_timestamp'), '0047 の partial が今日基準のまま');
+  // 0049 の行の関数の再判定も「月の全部の日」(#1561 Codex R3 High 1)。返品の日の source の complete_to だけの旧い式は残っていない
+  const rows = (await q(`select prosrc as s from pg_proc where proname = '_amazon_profit_rows'`))[0].s;
+  assert.ok(rows.includes('core.finance_month_settled') && !rows.includes('d.complete_to is null or'), '0049 の再判定が返品の日の source だけのまま');
+  assert.deepEqual(await q(`select source_policy_count, origin_from::text as o from core.finance_policy_snapshot(1::smallint, 'amazon', 'jp', 'amazon_settlement_unified')`), [{ source_policy_count: 1, o: '2026-01-01' }]);
 });
 
 await ta('[!] 03 §10: 円の金額列 (*_jpy) はすべて bigint', async () => {

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * master-cutover.mjs — 商品マスタの切替の段階を見る・証拠つきで 1 段進める (手の操作。Company DB構想 10 §8 切替日の手順・0050・lib/master-cutover.mjs)
+ * master-cutover.mjs — 商品マスタの切替の段階を見る・証拠つきで 1 段進める (手の操作。Company DB構想 10 §8 切替日の手順・0051・lib/master-cutover.mjs)
  *
  * 使い方:
  *   node -r dotenv/config scripts/company-db/master-cutover.mjs --status

@@ -4,10 +4,21 @@
  *   rows の要素 = { mall, scope_key, mall_order_no, header: { transform_version, set_checksum }, lines: [財務の行] }。1 run は 1 モール × 1 scope (entity = 'order_finance')
  *   🚨 集合の指紋は **受け口が内容から計算し直す** (finance/order-finance-checksum.mjs = 送り手と同じ 1 つの関数)。送り手の申告 (header.set_checksum) と違えば その注文は 400
  * 設計 = AI_reference『CompanyDB構想/12_Amazon財務のCompanyDB取込_設計_20260929.md』§3.2 / §4.6
+ *
+ * 🆕 決済のそろい (coverage・0050・D7b-1b-2。13 §3.1「財務の chunk も coverage の世代に縛る」):
+ *   ・全部の chunk が取引の最初に **coverage の要求と同じ advisory lock** (会社 × モール × scope) を取る (ingest/finance-coverage.mjs の takeFinanceLock)
+ *   ・body に coverage_generation と run_token が付いた chunk = その世代・その token の coverage が updating のときだけ適用 (complete の後・別の世代・別の token = 409 COVERAGE_MISMATCH)
+ *     置き換え・墓石で消える既存の行の source もその coverage の source と同じこと (違えば消す前に 409・#1561 Codex R1 High 1)
+ *   ・付いていない chunk (今の送り手) = 今までどおり受ける (互換)
+ *   ・どちらも、受領記録を 1 つでも変えたら (applied > 0・墓石と置き換えを含む)、その会社 × モール × scope の complete を全部 updating に落とす (fail-closed。
+ *     token 付きなら落ちるのはほかの source (か別の世代) の complete = 受領記録と receipt digest は source で分かれていない)
+ *   🚨 coordinator (D7b-1b-3・miniPC) ができたら、token の無い chunk は拒む契約にする (今の daily-sync の送り手を止めないために当面は受ける)
  */
 import { ingestChunk, validateChunkBody, bad } from './chunk.mjs';
 import { MALLS, SCOPE_RE, orderKey } from './orders.mjs';
 import { validateFinanceRows, orderFinanceChecksum, financeRowsFormat, assertVersionForm, versionHasClass, isPseudoOrderNo, CLASS_COLUMNS } from '../finance/order-finance-checksum.mjs';
+import { takeFinanceLock, coverageReady, assertChunkCoverage, invalidateCompleteAfterWrite, INVALIDATED_REASONS } from './finance-coverage.mjs';
+import { bigintText, RUN_TOKEN_RE } from '../finance/coverage-manifest.mjs';
 
 export const FINANCE_MALLS = MALLS.filter((m) => m !== 'other');   // 0043 の mall の CHECK
 // 本物の注文番号 / 疑似注文 '-:YYYY-MM-DD'。🚨 返送 (RemovalComplete / FBA Removal Order) の注文番号は + / を含む (例 '+3gubNop3S'・'a+aKPxfQ/X'。
@@ -43,7 +54,19 @@ export function validateFinanceChunk(body) {
     if (r.header.set_checksum !== checksum) throw bad(`rows[${i}] (${no}): set_checksum differs from the content (sent ${r.header.set_checksum}, computed ${checksum})`);
     return { key: orderKey(r.mall, r.scope_key, no), mall: r.mall, scope_key: r.scope_key, mall_order_no: no, pseudo: isPseudoOrderNo(no), set_checksum: checksum, lines };
   });
-  return { ...v, mall, scope };
+  return { ...v, mall, scope, coverage: coverageOfChunk(body) };
+}
+
+/** chunk の coverage の世代と token (両方あるか両方無いか)。無ければ null = 今の送り手 (互換) */
+export function coverageOfChunk(body) {
+  const hasGen = body.coverage_generation !== undefined && body.coverage_generation !== null;
+  const hasTok = body.run_token !== undefined && body.run_token !== null;
+  if (!hasGen && !hasTok) return null;
+  if (hasGen !== hasTok) throw bad('coverage_generation と run_token は両方付けるか両方付けない');
+  let generation;
+  try { generation = bigintText(body.coverage_generation, 'coverage_generation', { min: 1n }); } catch (e) { throw bad(e.message); }
+  if (typeof body.run_token !== 'string' || !RUN_TOKEN_RE.test(body.run_token)) throw bad('run_token は英数と ._:- の 16〜100 文字');
+  return { generation, runToken: body.run_token };
 }
 
 /** 0047 (分けられない部品の 4 列) が Company DB に入っているか */
@@ -54,7 +77,7 @@ export async function classColumnsReady(db) {
 }
 
 /** 1 chunk を適用する (ingest/chunk.mjs)。content_hash / source_updated_at は送り手の値 (行の中身の指紋は集合の checksum で守る) */
-export async function ingestOrderFinanceChunk(db, { companyId = 1, mall, scope, transformVersion, ...opts }) {
+export async function ingestOrderFinanceChunk(db, { companyId = 1, mall, scope, transformVersion, coverage = null, hooks = {}, ...opts }) {
   const m = mall ?? (opts.rows[0] && opts.rows[0].mall), s = scope ?? (opts.rows[0] && opts.rows[0].scope_key);
   if (!FINANCE_MALLS.includes(m) || !s) throw bad('mall / scope are required for an order finance chunk');
   // 🚨 新しい形 (4 列あり) の行を 0047 の前の apply に渡すと 4 列が黙って落ち、受領記録の指紋には入る (= 送り直しても 'same' で直らない) →
@@ -75,8 +98,29 @@ export async function ingestOrderFinanceChunk(db, { companyId = 1, mall, scope, 
         + `transform_version ${transformVersion} would drop the unclassified component counts (do not go back to the old sender)`), { code: 'DOWNGRADE' });
     }
   }
+  let covReady = false;
+  const log = opts.log || (() => {});
+  if (hooks.beforeBegin) await hooks.beforeBegin();
   return ingestChunk(db, {
     ...opts, transformVersion,
+    // 🆕 coverage (0050): lock → (token 付きなら) その世代・token の updating か。0050 の前は token 付きだけ 409 NOT_MIGRATED (token 無しは今までどおり)
+    //    hooks.beforeBegin (取引の前 = lock の前) / afterLock = 試験の差し込み口 (止めて順序の逆転を作る・持っている lock を見る)
+    afterBegin: async (dbx) => {
+      await takeFinanceLock(dbx, { companyId, mall: m, scope: s });
+      if (hooks.afterLock) await hooks.afterLock(dbx);
+      covReady = await coverageReady(dbx);
+      if (!coverage) return;
+      if (!covReady) throw Object.assign(new Error('not_migrated: migration 0050 (core.finance_coverage) is not applied (a chunk with coverage_generation / run_token needs it)'), { code: 'NOT_MIGRATED' });
+      const sources = new Set(opts.rows.flatMap((x) => x.lines.map((l) => l.source)));
+      await assertChunkCoverage(dbx, { companyId, mall: m, scope: s, generation: coverage.generation, runToken: coverage.runToken, sources, orderNos: opts.rows.map((x) => x.mall_order_no) });
+    },
+    // chunk が受領記録を変えた (applied > 0・墓石と置き換えを含む) = その key の complete を全部 updating に落とす (受領記録は source を持たない)。
+    //   token の無い chunk = 全部の source / token 付き = その token の coverage は updating = ほかの source (か別の世代) の complete (#1561 Codex R1 High 1)
+    afterRows: async (dbx, { applied }) => {
+      if (!covReady || applied === 0) return { coverage_invalidated: 0 };
+      const rows = await invalidateCompleteAfterWrite(dbx, { companyId, mall: m, scope: s, reason: coverage ? INVALIDATED_REASONS.otherCoverage : INVALIDATED_REASONS.untokened, log });
+      return { coverage_invalidated: rows.length };
+    },
     run: { sourceSystem: m, entity: 'order_finance', scopeKey: s },
     rowWord: 'order', labelRow: (x) => ({ mall_order_no: x.mall_order_no }),
     // 🚨 SQL の apply の downgrade の例外は行の failed に吸収しない = chunk 全体を rollback して 409 DOWNGRADE (#1554 Codex R2 Medium 1)。

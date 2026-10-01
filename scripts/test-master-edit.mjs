@@ -1,5 +1,5 @@
 /**
- * test-master-edit.mjs — マスタの入力 (apps/master-edit・lib/master-write.mjs・lib/master-cutover.mjs・0050。Company DB構想 14 §6 ⑤-1 / Codex ⑤-R0・R1・PR #1563 R1)
+ * test-master-edit.mjs — マスタの入力 (apps/master-edit・lib/master-write.mjs・lib/master-cutover.mjs・0051。Company DB構想 14 §6 ⑤-1 / Codex ⑤-R0・R1・PR #1563 R1)
  *
  * Company DB = PGlite (Render と同じ条件の持ち主のロール deploy で migration)。保存は画面だけのロール master_edit で流す (権限が足りているかも確かめる)。
  * 本物の router を HTTP 越しにも通す (セッションは x-test-session で模擬)

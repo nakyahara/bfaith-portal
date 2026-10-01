@@ -1,5 +1,5 @@
 /**
- * test-master-edit-pg.mjs — マスタの入力 (lib/master-write.mjs・0050) の**同時実行**と**ロールの権限**を、実 PostgreSQL の独立した接続で確かめる
+ * test-master-edit-pg.mjs — マスタの入力 (lib/master-write.mjs・0051) の**同時実行**と**ロールの権限**を、実 PostgreSQL の独立した接続で確かめる
  *   (PGlite は 1 接続なので書けない。Codex ⑤-R1 H4・PR #1563 R1 H3 / M6・R2 H1 / H2 / M3 / M4 / M5 / M6 / M8 の試験)
  *
  * 接続は本番と同じロールでログインする (create-master-edit-roles.mjs で作る・パスワードは試験の回ごと):

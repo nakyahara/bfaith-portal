@@ -81,8 +81,10 @@ export function payloadChecksum(rows) {
  * throw: code = BAD_REQUEST (400) / RUN_MISMATCH・CHUNK_MISMATCH・RUN_CLOSED (409) / CHUNK_DEADLINE (503) / その他 (500)
  */
 export async function ingestChunk(db, { run, apply, runId, batchSeq, chunkIndex, last, transformVersion, rows, host = 'render', log = () => {}, deadlineMs = DEFAULT_DEADLINE_MS, now = () => Date.now(), statementTimeoutMs = STATEMENT_TIMEOUT_MS, rowWord = 'row', labelRow = () => ({}),
-  fatalRowError = () => null }) {
+  fatalRowError = () => null, afterBegin = null, afterRows = null }) {
   // fatalRowError(e) → null (行の failed に吸収する = 既定・今までどおり) / Error (chunk 全体を rollback してその Error を投げる。#1554 Codex R2 Medium 1 = 財務の downgrade)
+  // afterBegin(db) = 取引を始めた直後 (run の記録・再送の判定より前) に呼ぶ。例外 = chunk 全体を rollback してその例外 (財務 = coverage の lock と世代・token の確かめ。D7b-1b-2)
+  // afterRows(db, { applied, same, stale, failed }) = 行を全部通した後・受領記録を書く前 (同じ取引)。戻りの object は応答 (と再送の応答) に足す (財務 = token の無い書き込みで complete を落とす)
   const started = now();
   const remaining = () => deadlineMs - (now() - started);
   const deadline = (where) => err('CHUNK_DEADLINE', `chunk ${chunkIndex} exceeded ${deadlineMs} ms (${where}; send smaller chunks)`);
@@ -95,6 +97,7 @@ export async function ingestChunk(db, { run, apply, runId, batchSeq, chunkIndex,
   await db.exec('begin');
   try {
     await applyTimeout();
+    if (afterBegin) { await afterBegin(db); await applyTimeout(); }
     await db.query(
       `insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, status, source_tz, checksum, format_version, rows_seen, rows_inserted, rows_skipped)
        values ($1, $2, $3, $4, $5, now(), 'running', 'Asia/Tokyo', $6, $7, 0, 0, 0)
@@ -148,7 +151,9 @@ export async function ingestChunk(db, { run, apply, runId, batchSeq, chunkIndex,
       }
       if (remaining() <= 0) throw deadline(`after ${rowWord} ${applied + same + stale + failed.length} of ${rows.length}`);
     }
-    const result = { applied, same, stale, failed, stale_keys: staleKeys, run_id: runId, chunk_index: chunkIndex, last, finished };
+    let extra = null;
+    if (afterRows) { await applyTimeout(); extra = await afterRows(db, { applied, same, stale, failed }); }
+    const result = { applied, same, stale, failed, stale_keys: staleKeys, run_id: runId, chunk_index: chunkIndex, last, finished, ...(extra || {}) };
     await applyTimeout();
     await db.query(
       `insert into ops.ingest_chunks (ingest_run_id, chunk_index, payload_checksum, rows_seen, rows_applied, rows_same, rows_stale, rows_failed, result)

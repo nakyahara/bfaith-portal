@@ -1,4 +1,4 @@
--- 0050: マスタ入力画面の土台 (2026-09-30。Company DB構想 14「マスタ入力画面」§3・§6 ⑤-1 / 10 §2・§8。Codex 設計レビュー ⑤-R0・R1 の契約・PR #1563 R1・R2)
+-- 0051: マスタ入力画面の土台 (2026-09-30。Company DB構想 14「マスタ入力画面」§3・§6 ⑤-1 / 10 §2・§8。Codex 設計レビュー ⑤-R0・R1 の契約・PR #1563 R1・R2)
 --
 -- なぜ: 既にある商品・セットの値を Company DB で人が直す画面 (apps/master-edit・Render だけ) を作る。書く先は Company DB だけ。
 --   変更の記録と version は 0026 のトリガーが書く。ここで足すのは「切替の段階と、その門」「セットに置く列」「保存 1 回の記録」「セットの構成の依頼・NE の構成の観測・食い違い」
@@ -49,7 +49,7 @@
 --         0049 mart.amazon_profit_* (その日を覆う 1 行)。いまは全部が両端を含む前提で読み・書きしている
 --   6. 0026 の変更の記録の関数 (core.audit_master_change・core.bump_parent_version) を security definer にする (PR #1563 R2 M4)。
 --      画面のロールに events.master_change_events の insert を渡さない = 記録を偽れない。db_user は「SET ROLE の役 か ログインした役」(持ち主の権限で動いても呼び手を残す)
---   7. マスタの書き込みの鍵 core.master_write_lock_key() = 4705310050 (0036 の親子の鍵 4705310036 と同じ作り。#1563 仮レビュー M3):
+--   7. マスタの書き込みの鍵 core.master_write_lock_key() = 4705310051 (0036 の親子の鍵 4705310036 と同じ作り。#1563 仮レビュー M3):
 --      夜間ロード (apps/company-db/load/engine.mjs) は取引の冒頭 (親子の鍵より前) に排他で取る。この画面の保存・構成の依頼の昇格は段階の共有の鍵の後に共有で取る
 --      (短く待つ = lib/master-write.mjs の MASTER_WRITE_WAIT。待ちきれなければ 409「夜間の取り込み中」)。夜間ロードの長い取引と保存が行の鍵で待ち合う (デッドロック) のを防ぐ
 --   8. 画面のロール master_edit の書き込みの約束 (#1563 R3 M2・R4 M2・R5 M1〜M3。列の権限だけでは、段階・持ち主・記録の誰が を飛ばして直接書けた):
@@ -78,8 +78,8 @@ create table ops.master_cutover_state (
   note        text check (note is null or length(note) <= 500),
   constraint ck_mcs_owner_hash check ((phase in ('company_owner', 'new_open')) = (owner_hash is not null))
 );
-insert into ops.master_cutover_state (id, phase, changed_by, note) values (1, 'legacy_open', 'migration_0050', '最初 = 古い入口 (NE・/register) が正');
-comment on table ops.master_cutover_state is '商品マスタの切替の段階 (0050)。legacy_open → frozen → company_owner → new_open の一方向。変えるのは ops.set_master_cutover_phase だけ';
+insert into ops.master_cutover_state (id, phase, changed_by, note) values (1, 'legacy_open', 'migration_0051', '最初 = 古い入口 (NE・/register) が正');
+comment on table ops.master_cutover_state is '商品マスタの切替の段階 (0051)。legacy_open → frozen → company_owner → new_open の一方向。変えるのは ops.set_master_cutover_phase だけ';
 
 create table ops.master_cutover_events (
   event_id    bigint generated always as identity primary key,
@@ -123,7 +123,7 @@ create table ops.master_legacy_gate_acks (
 );
 create index ix_master_legacy_gate_acks_host on ops.master_legacy_gate_acks (host, instance_id, acked_at desc, ack_id desc);
 select core.make_append_only('ops', 'master_legacy_gate_acks');
-comment on table ops.master_legacy_gate_acks is 'プロセスごとの門の記録 (0050。書くのは ⑤-3 = ops.record_legacy_gate_ack だけ・ログイン master_gate_<場所>)。切替の段階を進める門が読む';
+comment on table ops.master_legacy_gate_acks is 'プロセスごとの門の記録 (0051。書くのは ⑤-3 = ops.record_legacy_gate_ack だけ・ログイン master_gate_<場所>)。切替の段階を進める門が読む';
 
 -- 門の設定 (⑤-3・⑥ で変えるときは create or replace)
 create function ops.master_cutover_required_hosts() returns text[] language sql immutable as $$ select array['minipc', 'render']::text[] $$;
@@ -137,7 +137,7 @@ create table ops.master_cutover_prereq_checks (
   fn       regprocedure not null,
   added_at timestamptz not null default now()
 );
-comment on table ops.master_cutover_prereq_checks is '切替の段階を進める前提の関数の一覧 (0050・#1563 R3)。ops.master_cutover_prereq_problems が全部呼ぶ。後の migration は 1 行足す (追記だけ・関数の中身は create or replace)';
+comment on table ops.master_cutover_prereq_checks is '切替の段階を進める前提の関数の一覧 (0051・#1563 R3)。ops.master_cutover_prereq_problems が全部呼ぶ。後の migration は 1 行足す (追記だけ・関数の中身は create or replace)';
 select core.make_append_only('ops', 'master_cutover_prereq_checks');   -- 足すだけ (変える・消す・truncate は拒む。前の項目を消さない・#1563 R4 Low 3)
 
 -- 関数が前提の関数として使ってよい形か (ops の中・表の持ち主の関数・(text, text) returns text[]・ふつうの関数・自分自身でない)。だめなら理由、よければ null
@@ -411,8 +411,8 @@ revoke all on function ops.set_master_cutover_phase(text, text, jsonb, text) fro
 alter table core.skus
   add column set_sales_class_override smallint check (set_sales_class_override between 1 and 4),
   add column handling_own text check (handling_own in ('active', 'discontinued'));
-comment on column core.skus.set_sales_class_override is 'セットの売上分類を人が決めた値 (1〜4)。null = 構成品から導く (lib/master-set-rules.js)。0050';
-comment on column core.skus.handling_own is 'セット自身の取扱区分 (人が決めた値)。skus.handling はセット自身 + 構成品から導いた値。null = まだ人が決めていない。0050';
+comment on column core.skus.set_sales_class_override is 'セットの売上分類を人が決めた値 (1〜4)。null = 構成品から導く (lib/master-set-rules.js)。0051';
+comment on column core.skus.handling_own is 'セット自身の取扱区分 (人が決めた値)。skus.handling はセット自身 + 構成品から導いた値。null = まだ人が決めていない。0051';
 
 -- 3. 保存 1 回の記録 (追記だけ)
 create table ops.master_edit_requests (
@@ -434,7 +434,7 @@ create table ops.master_edit_requests (
 );
 create index ix_master_edit_requests_sku on ops.master_edit_requests (sku_id, started_at desc);
 select core.make_append_only('ops', 'master_edit_requests');
-comment on table ops.master_edit_requests is 'マスタ入力画面の保存 1 回 = 1 行 (0050)。done は保存と同じ取引・failed は巻き戻った後。追記だけ';
+comment on table ops.master_edit_requests is 'マスタ入力画面の保存 1 回 = 1 行 (0051)。done は保存と同じ取引・failed は巻き戻った後。追記だけ';
 
 -- 4. セットの構成: NE の観測 → 依頼 → 食い違い
 create table ops.ne_set_observation_runs (
@@ -463,7 +463,7 @@ create table ops.ne_set_observations (
 );
 create index ix_ne_set_observations_set on ops.ne_set_observations (set_sku_id, observation_id desc);
 select core.make_append_only('ops', 'ne_set_observations');
-comment on table ops.ne_set_observations is 'NE のセットの構成の観測 (0050)。書くのは ops.record_ne_set_observations (観測のロール master_observer だけ)。追記だけ';
+comment on table ops.ne_set_observations is 'NE のセットの構成の観測 (0051)。書くのは ops.record_ne_set_observations (観測のロール master_observer だけ)。追記だけ';
 
 -- 構成の行の形 (依頼の rows・base_rows。#1563 R5 M1): 配列・p_min〜p_max 行・各行 = { sku_id (整数), qty (1〜99,999 の整数), sort (整数), code (文字・あってもよい) } だけ・
 -- sku_id は重ならない・sort は 1〜行の数。順に確かめる (整数と分かってから数として比べる)。表の CHECK で使う = どの書き手も
@@ -510,7 +510,7 @@ create table ops.sku_component_requests (
 );
 create unique index ux_sku_component_requests_open on ops.sku_component_requests (set_sku_id) where status = 'open';
 create index ix_sku_component_requests_set on ops.sku_component_requests (set_sku_id, created_at desc);
-comment on table ops.sku_component_requests is 'セットの構成を変えたい依頼 (0050)。画面は core.sku_components を書かない。NE の観測が同じになったら lib/master-write.mjs の promoteComponentRequest が上げて閉じる';
+comment on table ops.sku_component_requests is 'セットの構成を変えたい依頼 (0051)。画面は core.sku_components を書かない。NE の観測が同じになったら lib/master-write.mjs の promoteComponentRequest が上げて閉じる';
 
 create function ops.guard_sku_component_requests() returns trigger language plpgsql as $$
 begin
@@ -545,7 +545,7 @@ create table ops.sku_component_breaches (
   constraint ck_scb_open check ((status = 'open') = (closed_at is null) and (status = 'open') = (close_reason is null) and (status = 'open') = (closed_by is null))
 );
 create unique index ux_sku_component_breaches_open on ops.sku_component_breaches (set_sku_id, kind) where status = 'open';
-comment on table ops.sku_component_breaches is 'セットの構成の食い違い = NE でやること (0050)。mismatch / stale / unrequested_diff / underivable。閉じ方 = resolved / superseded / dismissed';
+comment on table ops.sku_component_breaches is 'セットの構成の食い違い = NE でやること (0051)。mismatch / stale / unrequested_diff / underivable。閉じ方 = resolved / superseded / dismissed';
 
 create function ops.guard_sku_component_breaches() returns trigger language plpgsql as $$
 begin
@@ -822,7 +822,7 @@ end $$;
 revoke all on function core.lock_suppliers_for_share(bigint[]) from public;
 
 -- 7. マスタの書き込みの鍵 (上の 7.)。夜間ロードは排他・この画面の保存と構成の依頼の昇格は共有。数は 0036 の core.parent_lock_key() と重ならない固定の数
-create function core.master_write_lock_key() returns bigint language sql immutable as $$ select 4705310050::bigint $$;
+create function core.master_write_lock_key() returns bigint language sql immutable as $$ select 4705310051::bigint $$;
 
 -- 8. 画面のロール master_edit の書き込みの約束 (上の 8.・#1563 R3 M2・R4 M2・R5 M1〜M3)
 --    1 回の保存 = 1 つの「書き込みの約束」(ops.master_write_sessions の 1 行)。約束は 直す SKU・操作・画面が読んだ編集の印・保存の中身のハッシュ・
@@ -858,7 +858,7 @@ create table ops.master_write_sessions (
 );
 create index ix_master_write_sessions_txid on ops.master_write_sessions (txid);
 select core.make_append_only('ops', 'master_write_sessions');
-comment on table ops.master_write_sessions is '画面のロールの書き込みの約束 (0050・#1563 R3〜R5)。書くのは ops.begin_master_write だけ。約束の鍵 = txid + session_id (乱数)。actor_id はアプリが言う値';
+comment on table ops.master_write_sessions is '画面のロールの書き込みの約束 (0051・#1563 R3〜R5)。書くのは ops.begin_master_write だけ。約束の鍵 = txid + session_id (乱数)。actor_id はアプリが言う値';
 
 -- 今の取引の約束 (設定の乱数 + 今の取引の番号が一致する行)。無ければ null。security definer の関数 (begin・guard・変更の記録) の中で使う
 create function ops.current_master_write_session() returns ops.master_write_sessions
