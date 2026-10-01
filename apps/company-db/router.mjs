@@ -26,6 +26,8 @@ import { ingestShipmentChunk, validateChunk } from './ingest/shipments.mjs';
 import { ingestOrderChunk, validateChunk as validateOrderChunk, MALLS } from './ingest/orders.mjs';
 import { ingestOrderFinanceChunk, validateFinanceChunk, FINANCE_MALLS } from './ingest/order-finance.mjs';
 import { ingestSkuCostObserved, skuCostObservedStatus, skuCodeNorms } from './ingest/sku-cost-observed.mjs';
+import { applyCoverage, coverageStatus, coverageReady } from './ingest/finance-coverage.mjs';
+import { SOURCES as COVERAGE_SOURCES } from './finance/order-finance-checksum.mjs';
 
 const router = express.Router();
 
@@ -44,14 +46,16 @@ export function __setPgClientFactory(fn) { pgClientFactory = fn || openPgClient;
  * 🚨 body の parse は鍵の検査の後 (server.js の共通 parser はこの path を素通りさせる = 未認可の 12MB を読まない。mirror と同じ流儀)
  */
 const shipmentsJson = express.json({ limit: '12mb', inflate: false });
-function shipmentsParserError(err, req, res, next) {
+/** parser の失敗の応答。上限の文言は受け口ごと (#1561 Codex R1 Low: coverage は 64KB なのに「12MB」と返していた) */
+const parserErrorFor = (limitLabel) => function parserError(err, req, res, next) {
   if (!err) return next();
-  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'payload too large (12MB)' });
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: `payload too large (${limitLabel})` });
   if (err.type === 'encoding.unsupported') return res.status(415).json({ error: 'compressed body is not accepted' });
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'invalid JSON' });
   if (err.type === 'request.aborted') return res.status(400).json({ error: 'request aborted' });
   return next(err);
-}
+};
+const shipmentsParserError = parserErrorFor('12MB');
 
 export function requireSyncKey(req, res, next) {
   const key = process.env.MIRROR_SYNC_KEY;
@@ -251,6 +255,10 @@ router.get('/orders/daily', requireSyncKey, async (req, res) => {
  *   GET  /apps/company-db/sync/order-finance/daily?mall&scope&from&to        mart.finance_daily_range (0044 = v_finance_daily と同じ式を期間の月だけで。日 × SKU・突き合わせの材料)
  *   GET  /apps/company-db/sync/order-finance/account-fees?mall&scope&from&to mart.v_finance_account_fees_monthly (月 × 手数料の種類)
  *   GET  /apps/company-db/sync/order-finance/uncovered?mall&scope            mart.v_order_finance_uncovered の件数と例 (policy が無い日・source が違う日)
+ *   POST /apps/company-db/sync/order-finance/coverage                       決済のそろい (0050・D7b-1b-2) の updating / complete (下の節)
+ *   GET  /apps/company-db/sync/order-finance/coverage/status?mall&scope&source   決済のそろいの今の状態・世代
+ *   🆕 chunk の body に coverage_generation / run_token (両方) = その世代・token の coverage が updating のときだけ適用 (違えば 409 COVERAGE_MISMATCH)。
+ *      無い chunk (今の送り手) は今までどおり受けるが、受領記録を変えたら complete を updating に落とす (応答の coverage_invalidated)
  * 設計 = AI_reference『CompanyDB構想/12_Amazon財務のCompanyDB取込_設計_20260929.md』
  */
 const financeMallScopeOf = (req) => {
@@ -282,11 +290,59 @@ router.post('/order-finance', requireSyncKey, shipmentsJson, shipmentsParserErro
     const r = await ingestOrderFinanceChunk(pgAdapter(client), { ...chunk, host: 'render', log: (m) => console.log(`[company-db order-finance ${chunk.mall}] ${chunk.runId} ${m}`) });
     res.json(r);
   } catch (e) {
-    // NOT_MIGRATED = 新しい形 (分けられない部品の 4 列) の行が 0047 の適用前に届いた / DOWNGRADE = 今の形の版の注文を旧い版で置き換えようとした (ingest/order-finance.mjs)
-    const status = e.code === 'CHUNK_DEADLINE' ? 503 : (e.code === 'RUN_MISMATCH' || e.code === 'CHUNK_MISMATCH' || e.code === 'RUN_CLOSED' || e.code === 'NOT_MIGRATED' || e.code === 'DOWNGRADE') ? 409 : e.code === 'BAD_REQUEST' ? 400 : 500;
+    // NOT_MIGRATED = 新しい形 (分けられない部品の 4 列) の行が 0047 の適用前に届いた・token 付きの chunk が 0050 の適用前に届いた /
+    // DOWNGRADE = 今の形の版の注文を旧い版で置き換えようとした (ingest/order-finance.mjs) /
+    // COVERAGE_MISMATCH = token 付きの chunk の世代・token の coverage が updating でない (complete の後・別の世代・別の token) / LOCKED = coverage の要求か別の chunk が lock を持ったまま (0050)
+    const status = (e.code === 'CHUNK_DEADLINE' || e.code === 'LOCKED') ? 503
+      : (e.code === 'RUN_MISMATCH' || e.code === 'CHUNK_MISMATCH' || e.code === 'RUN_CLOSED' || e.code === 'NOT_MIGRATED' || e.code === 'DOWNGRADE' || e.code === 'COVERAGE_MISMATCH') ? 409
+        : e.code === 'BAD_REQUEST' ? 400 : 500;
     console.error(`[company-db order-finance ${chunk.mall}] ${chunk.runId} chunk ${chunk.chunkIndex} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
     res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null, run_id: chunk.runId, chunk_index: chunk.chunkIndex });
   } finally { if (client) { try { await client.end(); } catch { /* */ } } }
+});
+
+/**
+ * 決済のそろい (coverage・0050・D7b-1b-2。本体 = ingest/finance-coverage.mjs。設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.1):
+ *   POST /apps/company-db/sync/order-finance/coverage   { state: 'updating' | 'complete', mall, scope, source, generation, run_token, manifest? (complete だけ), request_hash? }
+ *     → { status: 'applied' | 'same' | 'stale', state, generation, current_generation?, complete_to?, receipt? }
+ *       400 = 形 / 409 = CONFLICT (状態の移り方で受けない)・RECEIPT_MISMATCH (受領記録が manifest と違う = detail.render に Render の数と digest)・NO_POLICY・POLICY_MISMATCH (manifest.policy_fingerprint が今の policy と違う)・not_migrated (0050 の前) / 503 LOCKED (lock が空かない)
+ *   GET  /apps/company-db/sync/order-finance/coverage/status?mall&scope&source[&receipts=1]
+ *     → { mall, scope, source, coverage: 行 | null, effective: { complete_to, generation, source_revision } (core.finance_coverage_state), policy: { fingerprint, rows }, receipts?: { count, lines, digest } }
+ *       世代・source_revision = 10 進の文字列。0050 の前は 409 { error: 'not_migrated' }
+ *   🚨 送るのは miniPC の coordinator (D7b-1b-3・後の PR) だけ。今の送り手 (daily-sync) は coverage を送らない = complete が無い間は正式な利益は全部 null のまま
+ *   🚨 鍵の検査は server.js の '/apps/company-db/sync/order-finance' の前方一致 (body parser より前) に入る
+ */
+const coverageJson = express.json({ limit: '64kb', inflate: false });
+router.post('/order-finance/coverage', requireSyncKey, coverageJson, parserErrorFor('64KB'), async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let client;
+  const t0 = Date.now();
+  const tag = `${String(req.body && req.body.mall).slice(0, 12)}/${String(req.body && req.body.scope).slice(0, 12)} ${String(req.body && req.body.state).slice(0, 10)} gen ${String(req.body && req.body.generation).slice(0, 20)}`;
+  try {
+    client = await pgClientFactory(url);
+    // complete は受領記録 (約 51 万注文) を 1 回読む。lock は走っている chunk の後に取れるまで待つ (20 秒で 503 LOCKED = 送り手がやり直す。
+    // 設計の complete の送信 = 1 回 30 秒の再試行 → 待ち 20 秒 + digest の計算が 30 秒に入るように)
+    await client.query(`set statement_timeout = '60s'; set lock_timeout = '20s'; set idle_in_transaction_session_timeout = '90s'`);
+    const r = await applyCoverage(pgAdapter(client), req.body, { log: (m) => console.log(`[company-db coverage] ${tag} ${m}`) });
+    res.json({ ...r, ms: Date.now() - t0 });
+  } catch (e) {
+    if (e.code === 'NOT_MIGRATED') return res.status(409).json({ error: 'not_migrated', detail: 'migration 0050 (core.finance_coverage) is not applied', code: e.code });
+    const status = e.code === 'BAD_REQUEST' ? 400 : (e.code === 'CONFLICT' || e.code === 'RECEIPT_MISMATCH' || e.code === 'NO_POLICY' || e.code === 'POLICY_MISMATCH') ? 409 : e.code === 'LOCKED' ? 503 : 500;
+    console.error(`[company-db coverage] ${tag} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 400), code: e.code || null, ...(e.detail ? { detail: e.detail } : {}) });
+  } finally { if (client) { try { await client.end(); } catch { /* 閉じられなくても応答は出す */ } } }
+});
+router.get('/order-finance/coverage/status', requireSyncKey, async (req, res) => {
+  const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  const source = String(req.query.source || '');
+  if (!COVERAGE_SOURCES.includes(source)) return res.status(400).json({ error: `source must be one of ${COVERAGE_SOURCES.join(', ')}` });
+  await withPg(res, async (client) => {
+    const db = pgAdapter(client);
+    if (!(await coverageReady(db))) return res.status(409).json({ error: 'not_migrated', detail: 'migration 0050 (core.finance_coverage) is not applied' });
+    await client.query(`set statement_timeout = '60s'`);
+    res.json(await coverageStatus(db, { mall: ms.mall, scope: ms.scope, source, withReceipts: String(req.query.receipts || '') === '1' }));
+  });
 });
 
 router.get('/order-finance/status', requireSyncKey, async (req, res) => {
@@ -363,54 +419,23 @@ router.get('/order-finance/uncovered', requireSyncKey, async (req, res) => {
 });
 
 /**
- * Amazon の利益の mart (D7b-3・0049。設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.5・§3.6) の読む口:
- *   GET /apps/company-db/sync/amazon-profit/daily?mall=amazon&scope=jp&from&to    mart.amazon_profit_daily_range      (日 × 出品の寄与の利益。構成と出品の結びつけは今のマスタ = master_basis current)
- *   GET /apps/company-db/sync/amazon-profit/totals?mall=amazon&scope=jp&from&to   mart.amazon_profit_day_totals_range (日 / 暦の月 / 期間の中の月の小計 / 期間の合計 = row_kind)
- *   契約 = from <= to・/daily は 1 回 93 日まで (長い期間は日の範囲で区切る)・/totals は 400 日まで (両端を含む)・今は amazon / jp だけ (400)・statement_timeout 120s・0049 の前は 409 not_migrated
- *   🚨 設計書 (13 §4) の `/apps/company-db/api/...` ではなく、Company DB の既存の読む口の流儀 (/sync の下 + x-sync-key) にそろえた (#1559 Codex R1 Medium 4)
- *   JSON: ID と ID の配列 (listing_id・*_ids・世代・版) = 10 進の文字列 / 円 (*_jpy)・個数・件数 = 数 /
- *         金額の numeric (税抜・広告費・0 と仮定・手数料の後) = 小数 2 桁の文字列 / units_*_unrounded (丸める前の返品数) = 小数 最大 6 桁の文字列 (返品なし = "0") /
- *         日付 = YYYY-MM-DD / 時刻 = UTC の ISO (ミリ秒)。列は関数の戻りの定義 (pg_proc) から作る = 関数に列を足しても受け口を直さなくてよい
- *   🚨 決済のそろい (D7b-1b) の前は正式な利益 (contribution_* / profit_after_account_fees_*) は全部 null。0 と仮定の値 (…_assuming_incomplete_zero_…) を「利益」と読まない
+ * Amazon の利益の mart (D7b-3・0049) の読む口 = 🚨 2026-10-01 から 503 (封じ込め)。0049 の関数は呼ばない・DB に接続もしない:
+ *   GET /apps/company-db/sync/amazon-profit/daily   → 503 { ok: false, code: 'PROFIT_ROUTE_DISABLED', error }
+ *   GET /apps/company-db/sync/amazon-profit/totals  → 503 (同じ)
+ *   理由 = 10/1 00:10、93 日分の計算で本番の Postgres (1GB) が落ちた。本番は temp_file_limit = -1 (一時ファイルが無制限) で SET の権限も無い
+ *     = 長い期間の要求 1 本で DB を落とせる。設計 (AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10 D-60 v3.1 =
+ *     保存しないで 1 か月ずつ計算) で作り直すまで、この口を止める。
+ *   🚨 再び有効にする設定 (環境変数など) は作らない。戻すのはコードの変更 (§3.10 の作り直しの PR) で行う。前の実装 = #1559 (c894ca64) の router.mjs
+ *   鍵の検査 (x-sync-key) は残す = 鍵の無い要求は今までどおり 401
  */
-const PROFIT_ID_COLS = new Set(['listing_id', 'observed_generation', 'finance_coverage_generation', 'finance_source_revision']);
-const PROFIT_FNS = {
-  // /daily は行が多い (1 日 数百の出品) = 1 回の要求は 93 日まで (長い期間は日の範囲で区切って何回かに分けて読む・#1559 Codex R1 Medium 1)。
-  // /totals は日 + 月 + 合計だけ (400 日でも 400 行と少し) = 関数の契約どおり 400 日まで
-  daily: { fn: 'mart.amazon_profit_daily_range', maxDays: 93, order: `order by r.economic_date_jst, r.listing_id is null, r.listing_id, r.seller_sku_norm collate "C"` },
-  totals: { fn: 'mart.amazon_profit_day_totals_range', maxDays: 400, order: `order by case r.row_kind when 'day' then 1 when 'range_total' then 3 else 2 end, r.period_from` },
-};
-/** 関数の戻りの列 (RETURNS TABLE = proargmodes 't') から select の式と JS の直し方を作る */
-const profitSelect = async (client, fn) => {
-  const cols = (await client.query(`select a.name, format_type(a.typ, null) as type
-      from pg_proc p cross join lateral unnest(p.proargnames, p.proallargtypes, p.proargmodes::text[]) with ordinality as a(name, typ, mode, ord)
-     where p.oid = $1::regprocedure and a.mode = 't' order by a.ord`, [`${fn}(smallint,text,text,date,date)`])).rows;
-  if (!cols.length || cols.some((c) => !/^[a-z_][a-z0-9_]*$/.test(c.name))) throw new Error(`unexpected result columns of ${fn}`);
-  const exprs = cols.map(({ name, type }) => {
-    const q = `r."${name}"`;
-    if (type === 'date' || type === 'numeric' || (type === 'bigint' && PROFIT_ID_COLS.has(name))) return `${q}::text as "${name}"`;
-    if (type === 'date[]' || type === 'bigint[]') return `${q}::text[] as "${name}"`;   // bigint[] は全部 ID の配列
-    if (type === 'timestamp with time zone') return `to_char(${q} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "${name}"`;
-    return `${q} as "${name}"`;
-  });
-  const numeric = new Set(cols.filter((c) => c.type === 'integer' || (c.type === 'bigint' && !PROFIT_ID_COLS.has(c.name))).map((c) => c.name));
-  return { list: exprs.join(', '), fix: (row) => Object.fromEntries(Object.entries(row).map(([k, v]) => [k, v != null && numeric.has(k) ? Number(v) : v])) };
-};
-for (const [kind, spec] of Object.entries(PROFIT_FNS)) {
-  router.get(`/amazon-profit/${kind}`, requireSyncKey, async (req, res) => {
-    const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
-    if (ms.mall !== 'amazon' || ms.scope !== 'jp') return res.status(400).json({ error: 'only mall=amazon & scope=jp for now (the listing resolution does not look at shop_code)' });
-    const rg = financeRangeOf(req, spec.maxDays); if (rg.error) return res.status(400).json({ error: rg.error });
-    await withPg(res, async (client) => {
-      if (!(await client.query(`select to_regprocedure($1) is not null as ok`, [`${spec.fn}(smallint,text,text,date,date)`])).rows[0].ok) {
-        return res.status(409).json({ error: 'not_migrated', detail: 'migration 0049 (Amazon profit mart) is not applied' });
-      }
-      const sel = await profitSelect(client, spec.fn);
-      await client.query(`set statement_timeout = '120s'`);
-      const rows = (await client.query(`select ${sel.list} from ${spec.fn}(1::smallint, $1, $2, $3::date, $4::date) r ${spec.order}`, [ms.mall, ms.scope, rg.from, rg.to])).rows;
-      res.json({ mall: ms.mall, scope: ms.scope, from: rg.from, to: rg.to, master_basis: 'current', rows: rows.map(sel.fix) });
-    });
-  });
+const PROFIT_ROUTE_DISABLED = Object.freeze({
+  ok: false,
+  code: 'PROFIT_ROUTE_DISABLED',
+  error: 'Amazon の利益の読む口は 2026-10-01 から止めています (封じ込め)。93 日分の計算で本番の Postgres が落ちたため。'
+    + '設計『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10 (D-60 v3.1 = 1 か月ずつ計算) で作り直すまで使えません。',
+});
+for (const kind of ['daily', 'totals']) {
+  router.get(`/amazon-profit/${kind}`, requireSyncKey, (req, res) => res.status(503).json(PROFIT_ROUTE_DISABLED));
 }
 
 router.post('/shipments/relink', requireSyncKey, express.json({ limit: '4kb' }), async (req, res) => {
