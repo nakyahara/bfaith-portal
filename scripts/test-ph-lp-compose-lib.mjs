@@ -92,16 +92,21 @@ ok(lp.releaseJob(db, c2.job.job_id, { leaseToken: c2.job.lease_token, now: min(0
 console.log('⑥ 結果 — accepted');
 const OUT = '# LP制作システム V2.1\n\n## ⑦ AI画像生成プロンプト\n… 本文 …';
 // packet に画像があるので accepted には証跡が要る (codex exec review R2 P2)
-const RCPT = { images: [{ file_id: 'FILEID000001', sha256: '0'.repeat(64), bytes: 999 }] };
-ok(lp.submitResult(db, g1.generation_id, { packetHash: 'ちがう', verdict: 'accepted', output: OUT, receipt: RCPT, now: min(1) }).code === 'packet_mismatch',
+const LINT = { ok: true, checks: {} };
+// 証跡はサーバが配ったときに記録する (実行役からは受け取らない)
+// 🚨 記録は claim の lease に紐づく (codex exec review P2)。lease_token と時刻が要る
+const serve = (job, now) => lp.recordImageServed(db, job.job_id,
+  { leaseToken: job.lease_token, fileId: 'FILEID000001', sha256: '0'.repeat(64), bytes: 999, now });
+serve(c2.job, min(0.6));
+ok(lp.submitResult(db, g1.generation_id, { packetHash: 'ちがう', verdict: 'accepted', output: OUT, lint: LINT, now: min(1) }).code === 'packet_mismatch',
   '材料が予約時と違えば受け取らない');
-const sub1 = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: true }, reviewRounds: 1, receipt: { images: [{ file_id: 'FILEID000001', sha256: 'a'.repeat(64), bytes: 12345 }] }, now: min(1) });
+const sub1 = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, reviewRounds: 1, now: min(1) });
 eq(sub1.status, 'done', '受け取ると done');
 const jDone = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE id = ?').get(c2.job.job_id);
 eq(jDone.output_text, OUT, '本文が保存される');
 ok(!!jDone.completed_at, '🚨 終端では completed_at が必ず入る (R4 #2)');
 ok(jDone.completed_at <= jDone.measurement_deadline_at, '3 分以内に終わったと後から計算できる');
-const sub1b = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: true }, reviewRounds: 1, receipt: { images: [{ file_id: 'FILEID000001', sha256: 'a'.repeat(64), bytes: 12345 }] }, now: min(1.5) });
+const sub1b = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, reviewRounds: 1, now: min(1.5) });
 ok(sub1b.ok && sub1b.already, '同じ結果の再送は保存済みを返す (応答断のリトライ)');
 ok(lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'rejected', reason: 'ちがう内容', now: min(1.5) }).code === 'already_finalized',
   '別の内容では上書きできない');
@@ -111,12 +116,52 @@ const dZ = mkDraft('LP-Z', 'ハッカ油スプレー 証跡なし');
 lp.requestJob(db, args(dZ, s2.spec, 'key-0001', { now: min(5) }));
 const cZ = lp.claimJob(db, { runnerRunId: 'run-z', now: min(5) });
 const gZ = lp.reserveGeneration(db, cZ.job.job_id, { leaseToken: cZ.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(5) });
-for (const [r, label] of [[undefined, '省略'], [{}, '空オブジェクト'], [{ images: [] }, '空配列']]) {
-  eq(lp.submitResult(db, gZ.generation_id, { packetHash: cZ.job.packet_hash, verdict: 'accepted', output: OUT, receipt: r, now: min(6) }).code,
-    'bad_request', `🚨 証跡が ${label} の accepted は受け取らない (review R2 P2)`);
-}
+eq(lp.submitResult(db, gZ.generation_id, { packetHash: cZ.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(6) }).code,
+  'bad_request', '🚨 サーバが画像を配っていなければ accepted を受け取らない');
+eq(lp.submitResult(db, gZ.generation_id, {
+  packetHash: cZ.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT,
+  receipt: { images: [{ file_id: 'FILEID000001', sha256: 'f'.repeat(64), bytes: 1 }] }, now: min(6),
+}).code, 'bad_request', '🚨 実行役が証跡を送ってきても使わない (偽造できた・codex exec review P1)');
+eq(lp.submitResult(db, gZ.generation_id, { packetHash: cZ.job.packet_hash, verdict: 'accepted', output: OUT, now: min(6) }).code,
+  'bad_request', '🚨 lint が無ければ accepted を受け取らない');
+eq(lp.submitResult(db, gZ.generation_id, { packetHash: cZ.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: false }, now: min(6) }).code,
+  'bad_request', '🚨 lint.ok が false でも受け取らない');
 eq(lp.submitResult(db, gZ.generation_id, { packetHash: cZ.job.packet_hash, verdict: 'rejected', reason: '作れなかった', now: min(6) }).status,
   'failed', 'rejected は証跡が無くてよい (作れなかったので)');
+
+// 🚨 証跡は claim ごとにリセットされる (codex exec review P1)。
+// 前の実行役が画像を落としてから手放した場合に、次の実行役が
+// 画像を一度も見ずに accepted を出せてはいけない
+const dY = mkDraft('LP-Y', 'ハッカ油スプレー 使い回し');
+lp.requestJob(db, args(dY, s2.spec, 'key-0001', { now: min(7) }));
+const cY1 = lp.claimJob(db, { runnerRunId: 'run-y1', now: min(7) });
+serve(cY1.job, min(7));                                    // 1 人目の実行役が画像を見た
+lp.releaseJob(db, cY1.job.job_id, { leaseToken: cY1.job.lease_token, now: min(7.5) });
+const cY2 = lp.claimJob(db, { runnerRunId: 'run-y2', now: min(8) });   // 2 人目が掴む
+const gY = lp.reserveGeneration(db, cY2.job.job_id, { leaseToken: cY2.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(8) });
+eq(lp.submitResult(db, gY.generation_id, { packetHash: cY2.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(8.5) }).code,
+  'bad_request', '🚨 前の実行役の証跡を使い回せない (claim でリセット・codex exec review P1)');
+serve(cY2.job, min(8));
+eq(lp.submitResult(db, gY.generation_id, { packetHash: cY2.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(8.5) }).status,
+  'done', '自分で見たなら通る');
+
+// 🚨 手放した後に、飛んでいた取得が完走しても次の実行役の証跡にならない (codex exec review P2)。
+// lease を見ずに記録していたときは、A の遅い取得が B の証跡になり、
+// B は画像を一度も見ずに accepted を出せた
+const dLap = mkDraft('LP-LAP', 'ハッカ油スプレー 取り直し');
+lp.requestJob(db, args(dLap, s2.spec, 'key-0001', { now: min(9) }));
+const cLap1 = lp.claimJob(db, { runnerRunId: 'run-lap1', now: min(9) });
+lp.releaseJob(db, cLap1.job.job_id, { leaseToken: cLap1.job.lease_token, now: min(9.2) });
+const cLap2 = lp.claimJob(db, { runnerRunId: 'run-lap2', now: min(9.3) });
+ok(cLap2.job && cLap2.job.lease_token !== cLap1.job.lease_token, '掴み直すと lease は別物');
+eq(serve(cLap1.job, min(9.4)).code, 'lease_lost',
+  '🚨 古い lease の取得は記録しない (codex exec review P2)');
+const gLap = lp.reserveGeneration(db, cLap2.job.job_id, { leaseToken: cLap2.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(9.5) });
+eq(lp.submitResult(db, gLap.generation_id, { packetHash: cLap2.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(9.6) }).code,
+  'bad_request', '🚨 古い lease の取得では accepted を出せない');
+serve(cLap2.job, min(9.7));
+eq(lp.submitResult(db, gLap.generation_id, { packetHash: cLap2.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: LINT, now: min(9.8) }).status,
+  'done', '自分で見たなら通る');
 
 console.log('⑦ 結果 — rejected (lint / 検品が通らなかった)');
 const dB = mkDraft('LP-B', 'ハッカ油スプレー 50ml');
@@ -130,6 +175,22 @@ eq(jRej.error_code, 'rejected', '理由が残る');
 ok(!!jRej.completed_at, 'rejected でも completed_at が入る');
 eq(db.prepare('SELECT status FROM ph_lp_compose_generations WHERE id = ?').get(g2.generation_id).status, 'rejected',
   '🚨 generation も確定する (reserved のまま残さない)');
+
+// 🚨 packet の画像を**全部**見ていなければ accepted は出せない (codex exec review P1)。
+// 1 枚でも配っていればよいにしていたときは、途中の枚で落ちた実行役が
+// 残りを見ずに accepted を出せた (= 欠けた材料で書いた構成が測定に混ざる)
+const dAll = mkDraft('LP-ALL', 'ハッカ油スプレー 3 枚');
+lp.requestJob(db, args(dAll, s2.spec, 'key-0001', {
+  now: min(10),
+  images: [{ file_id: 'FILEID000001' }, { file_id: 'FILEID000002' }],
+}));
+const cAll = lp.claimJob(db, { runnerRunId: 'run-all', now: min(10) });
+const gAll = lp.reserveGeneration(db, cAll.job.job_id, { leaseToken: cAll.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(10) });
+serve(cAll.job, min(10.1));                                 // 1 枚目だけ見た
+eq(lp.submitResult(db, gAll.generation_id, { packetHash: cAll.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(10.2) }).code,
+  'bad_request', '🚨 2 枚中 1 枚しか見ていなければ accepted を受け取らない (codex exec review P1)');
+eq(lp.submitResult(db, gAll.generation_id, { packetHash: cAll.job.packet_hash, verdict: 'rejected', reason: '画像が取れなかった', now: min(10.2) }).status,
+  'failed', 'rejected は証跡が揃わなくても出せる (作れなかったという報告)');
 
 console.log('⑧ 成否不明 (lease 切れ) は needs_review で止まる');
 const dC = mkDraft('LP-C', 'ハッカ油スプレー 200ml');
@@ -183,7 +244,8 @@ const dG = mkDraft('LP-G', 'ハッカ油スプレー 5L');
 lp.requestJob(db, args(dG, s2.spec, 'key-0001', { now: min(70) }));
 const c6 = lp.claimJob(db, { runnerRunId: 'run-10', now: min(70) });
 const g6 = lp.reserveGeneration(db, c6.job.job_id, { leaseToken: c6.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(70) });
-lp.submitResult(db, g6.generation_id, { packetHash: c6.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, receipt: RCPT, now: min(71) });
+serve(c6.job, min(70));
+lp.submitResult(db, g6.generation_id, { packetHash: c6.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: LINT, now: min(71) });
 lp.recoverExpired(db, min(70 + lp.LEASE_MIN + 5));
 eq(db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(c6.job.job_id).status, 'done',
   '🚨 期限切れ処理は done を上書きしない (R1 #1)');
@@ -193,11 +255,12 @@ const dH = mkDraft('LP-H', 'ハッカ油スプレー 10L');
 lp.requestJob(db, args(dH, s2.spec, 'key-0001', { now: min(80) }));
 const c7 = lp.claimJob(db, { runnerRunId: 'run-11', now: min(80) });
 const g7 = lp.reserveGeneration(db, c7.job.job_id, { leaseToken: c7.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(80) });
+serve(c7.job, min(80));
 db.prepare("UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?").run(c7.job.job_id);
-eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdict: 'accepted', output: OUT, receipt: RCPT, now: min(81) }).code, 'job_finalized',
+eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(81) }).code, 'job_finalized',
   '🚨 cancelled の依頼を結果で done に戻せない (R1 #2)');
 db.prepare("UPDATE ph_lp_compose_jobs SET status = 'needs_review' WHERE id = ?").run(c7.job.job_id);
-eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdict: 'accepted', output: OUT, receipt: RCPT, now: min(82) }).status, 'done',
+eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(82) }).status, 'done',
   'needs_review からの復旧は受ける (AI 枠を使っているので取りこぼさない)');
 
 // #5 壊れた実行役が DB を肥らせたり例外を漏らしたりできない
@@ -205,6 +268,7 @@ const dI = mkDraft('LP-I', 'ハッカ油スプレー 20L');
 lp.requestJob(db, args(dI, s2.spec, 'key-0001', { now: min(90) }));
 const c8 = lp.claimJob(db, { runnerRunId: 'run-12', now: min(90) });
 const g8 = lp.reserveGeneration(db, c8.job.job_id, { leaseToken: c8.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(90) });
+serve(c8.job, min(90));
 const cyc = {}; cyc.self = cyc;
 eq(lp.submitResult(db, g8.generation_id, { packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT, lint: cyc, now: min(91) }).code, 'bad_request',
   '🚨 JSON にできない lint は bad_request (例外を漏らさない・R1 #5)');
@@ -247,14 +311,15 @@ const dN = mkDraft('LP-N', 'ハッカ油スプレー 4L');
 lp.requestJob(db, args(dN, s2.spec, 'key-0001', { now: min(110) }));
 const cN = lp.claimJob(db, { runnerRunId: 'run-21', now: min(110) });
 const gN = lp.reserveGeneration(db, cN.job.job_id, { leaseToken: cN.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(110) });
+serve(cN.job, min(110));
 eq(lp.submitResult(db, gN.generation_id, {
   packetHash: cN.job.packet_hash, verdict: 'accepted', output: OUT,
   receipt: { images: [{ file_id: 'OTHERFILE999', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
 }).code, 'bad_request', '🚨 渡していない画像を証跡に混ぜられない (R7 #2)');
 eq(lp.submitResult(db, gN.generation_id, {
-  packetHash: cN.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1,
+  packetHash: cN.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: LINT,
   receipt: { images: [{ file_id: 'FILEID000001', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
-}).status, 'done', '渡した画像なら通る');
+}).status, 'done', 'サーバが配っていれば通る (送った receipt は使われない)');
 
 console.log('⑯ R9 の修正');
 // #1 同じキーの再送は、材料の検証より先に既存 job を返す
@@ -297,7 +362,7 @@ eq(lp.submitResult(db, gP.generation_id, {
   ] }, now: min(131),
 }).code, 'bad_request', '🚨 同じ画像を 2 回並べられない (R8 #2)');
 const subBig = lp.submitResult(db, g8.generation_id, {
-  packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1,
+  packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: LINT,
   receipt: { images: [{ file_id: 'FILEID000001', sha256: 'b'.repeat(64), bytes: 999, extra: 'x' }] }, now: min(91),
 });
 eq(subBig.status, 'done', '正しい証跡なら受け取れる');

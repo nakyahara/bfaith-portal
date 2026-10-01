@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# phlp shim (lives in work/, write-protected by ACL). Runs the fixed-function CLI from bin/.
+# One of only two shell commands the LP-compose Claude Code session may run (see settings.json).
+here="$(cd "$(dirname "$0")" && pwd)"
+exec node "$here/../bin/phlp.mjs" "$@"

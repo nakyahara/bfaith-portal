@@ -429,8 +429,13 @@ export function claimJob(db, { runnerRunId, now = Date.now() } = {}) {
       }
       const token = randomBytes(16).toString('hex');
       const until = new Date(now + LEASE_MIN * 60_000).toISOString();
+      // 🚨 証跡は claim ごとにリセットする (codex exec review P1)。
+      //    残しておくと、前の実行役が画像を落としてから release / 落ちた場合に、
+      //    **次の実行役が画像を一度も見ずに accepted を出せてしまう**。
+      //    「その出力を書いた実行役が実際に見た」を保つのがこの証跡の意味。
       const ch = db.prepare(`UPDATE ph_lp_compose_jobs
-        SET status = 'running', lease_token = ?, lease_until = ?, runner_run_id = ?, claims = claims + 1, updated_at = ?
+        SET status = 'running', lease_token = ?, lease_until = ?, runner_run_id = ?, claims = claims + 1,
+            images_served_json = '[]', updated_at = ?
         WHERE id = ? AND status = 'queued'`)
         .run(token, until, trim(runnerRunId, 80) || null, nowS, job.id).changes;
       if (ch !== 1) continue;   // 誰かに取られた
@@ -527,8 +532,10 @@ export function submitResult(db, generationId, {
   const rounds = reviewRounds == null ? null : reviewRounds;
   const lintJson = jsonOrNull(lint, LINT_MAX);
   if (lintJson === false) return { code: 'bad_request', error: `lint が大きすぎるか JSON にできません (${LINT_MAX} 文字まで)` };
-  // receipt = 「実際に配った商品画像のバイト列の sha256 と枚数」。証跡なので**黙って直さない** —
-  // 枚数超過も形の違う要素も bad_request にする (切り捨てると証跡として信用できない。コード R2 #4)
+  // 🚨 証跡は**実行役から受け取らない** (codex exec review P1)。
+  //    作業ディレクトリに置いた記録は Claude のセッションが Write できるので、
+  //    「見ていないのに見たことにする」偽造ができた。サーバが配ったときの記録 (images_served_json) を使う。
+  //    receipt が送られてきても無視する (古い実行役との互換のため、形だけは見る)。
   let imgs = null;
   if (receipt?.images != null) {
     if (!Array.isArray(receipt.images)) return { code: 'bad_request', error: 'receipt.images は配列です' };
@@ -560,7 +567,7 @@ export function submitResult(db, generationId, {
   // 🚨 receipt も hash の対象に入れる。入れないと「画像の証跡だけ違う再送」を
   //    同じ結果と見なして保存済みを返してしまう (コード R2 #1)。finalized_at は毎回変わるので入れない
   const payloadHash = sha256(canonicalJson({
-    verdict: v, output: out, lint: lintJson, review_rounds: rounds, reason: reasonText, images: imgs,
+    verdict: v, output: out, lint: lintJson, review_rounds: rounds, reason: reasonText,
   }));
   return db.transaction(() => {
     const gen = db.prepare('SELECT * FROM ph_lp_compose_generations WHERE id = ?').get(posInt(generationId));
@@ -587,32 +594,43 @@ export function submitResult(db, generationId, {
 
     // 🚨 証跡は「渡した材料のうち実際に見たもの」でなければ意味がない。
     //    packet に無い file_id を含む receipt は受け取らない (コード R7 #2)。
-    //    完全一致までは求めない — 取得に失敗した画像があれば、その分は証跡に載らないのが正しい。
     let packetImages = [];
     try { packetImages = JSON.parse(job.packet_json).images || []; } catch { packetImages = []; }
-    if (imgs?.length) {
-      const allowed = new Set(packetImages.map((im) => im.file_id));
-      const stray = imgs.find((im) => !allowed.has(im.file_id));
-      if (stray) {
-        return { code: 'bad_request', error: `receipt.images に渡していない画像があります (${stray.file_id})` };
+    // 証跡はサーバが配ったときの記録。実行役が送ってきた receipt は使わない
+    let served = [];
+    try { served = JSON.parse(job.images_served_json || '[]'); } catch { served = []; }
+    if (!Array.isArray(served)) served = [];
+    // 🚨 **accepted なら packet の画像を全部配っていること** (codex exec review R2 P2 → P1 で全枚に)。
+    //    はじめは「1 枚でも配っていればよい」にしていたが、それだと
+    //    **途中の枚で落ちた実行役が、残りを見ずに accepted を出せてしまう**。
+    //    実行役側 (`./phlp images`) も「1 枚でも取れなければ失敗」に揃えてあるので、
+    //    サーバ側も全枚を求める (段階1 は測定が目的。欠けた材料で書いた構成を混ぜない)。
+    //    rejected は「作れなかった」ので証跡が無くてよい。
+    if (v === 'accepted' && packetImages.length > 0) {
+      const seenIds = new Set(served.map((im) => im && im.file_id).filter(Boolean));
+      const missing = packetImages.filter((im) => im?.file_id && !seenIds.has(im.file_id)).length;
+      if (missing > 0) {
+        return {
+          code: 'bad_request',
+          error: `商品画像 ${packetImages.length} 枚のうち ${missing} 枚を見ていません。全部取得してから構成を書いてください`,
+        };
       }
     }
-    // 🚨 **accepted なら証跡は必須** (codex exec review R2 P2)。
-    //    packet に画像があるのに receipt を省く / 空配列で出すと、「何を見て作ったか」が
-    //    一切残らないまま done になる = 証跡を置いた意味が消える。
-    //    rejected は「作れなかった」ので証跡が無くてよい。
-    if (v === 'accepted' && packetImages.length > 0 && !imgs?.length) {
-      return {
-        code: 'bad_request',
-        error: `この依頼には商品画像が ${packetImages.length} 枚あります。receipt.images に実際に見た画像を出してください`,
-      };
+    // 🚨 lint が通っていない accepted は受け取らない (codex exec review P1)。
+    //    いまは実行役の自己申告だが、**内容は保存されるので後から出力と突き合わせられる**。
+    //    サーバ側で lint を実行して正本にするのは PR1-c (parser.js の移植とセット)。
+    if (v === 'accepted') {
+      let lintObj = null;
+      try { lintObj = lintJson ? JSON.parse(lintJson) : null; } catch { lintObj = null; }
+      if (!lintObj || lintObj.ok !== true) {
+        return { code: 'bad_request', error: 'lint を通していない構成は受け取れません (lint.ok が true であること)' };
+      }
     }
     const receiptObj = {
       verdict: v, review_rounds: rounds, model: gen.model, prompt_version: gen.prompt_version,
       finalized_at: nowS,
-      // 何を見て作ったか (実際に配った商品画像のバイト列の sha256 と枚数)。
-      // Drive の差し替えに対する事前照合は段階2 で入れる (設計 §4.2)
-      images: imgs,
+      // 何を見て作ったか = **サーバが配ったときの記録**。実行役は書き換えられない
+      images: served,
     };
     // 🚨 generation と job の両方が 1 行ずつ動いたことを確かめ、片方でも動かなければ throw して
     //    トランザクションごと戻す (中途半端な状態を残さない。コード R1 #2)
@@ -702,6 +720,44 @@ export function lpComposeImageRef(db, jobId, { leaseToken, index, now = Date.now
   const im = images[i];
   if (!im?.file_id) return { code: 'not_found', error: 'その番号の商品画像はありません' };
   return { ok: true, file_id: im.file_id, version: im.modified_time || null };
+}
+
+/**
+ * 商品画像を 1 枚配ったことを**サーバが**記録する (codex exec review P1)。
+ * 証跡を実行役の作業ディレクトリに置くと、Claude のセッションが Write できてしまい
+ * 「画像を見ていないのに見たことにする」偽造ができる。測定の根拠なのでここで持つ。
+ * 同じ file_id を 2 回配っても 1 行 (枚数を水増しさせない)。
+ *
+ * 🚨 記録は**その時点で生きている lease** に紐づける (codex exec review P2)。
+ *    紐づけないと、A の lease が切れた直後に B が claim して証跡をリセットしたあとに、
+ *    飛んでいた A の取得が完走してここに来て、**B の証跡として入ってしまう**
+ *    = B は画像を一度も見ずに accepted を出せる。
+ */
+export function recordImageServed(db, jobId, { leaseToken, fileId, sha256: hex, bytes, now = Date.now() } = {}) {
+  const id = posInt(jobId);
+  const f = exact(fileId, DRIVE_FILE_ID_RE);
+  const h = exact(hex, SHA256_RE);
+  const b = posInt(bytes);
+  if (!id || !f || !h || !b) return { code: 'bad_request', error: '記録する画像の指定が不正です' };
+  const nowS = new Date(now).toISOString();
+  return db.transaction(() => {
+    const l = liveLease(db, id, leaseToken, nowS);
+    if (l.code) return l;
+    const job = l.job;
+    let list;
+    try { list = JSON.parse(job.images_served_json || '[]'); } catch { list = []; }
+    if (!Array.isArray(list)) list = [];
+    const hit = list.findIndex((im) => im.file_id === f);
+    const row = { file_id: f, sha256: h, bytes: b, served_at: new Date(now).toISOString() };
+    if (hit >= 0) list[hit] = row; else list.push(row);
+    if (list.length > MAX_IMAGES) list.length = MAX_IMAGES;
+    // WHERE にも lease を書く (liveLease で確かめた同じ lease のままであることを DB 側でも固定する)
+    const ch = db.prepare(`UPDATE ph_lp_compose_jobs SET images_served_json = ?, updated_at = ?
+      WHERE id = ? AND status = 'running' AND lease_token = ?`)
+      .run(JSON.stringify(list), nowS, id, String(leaseToken)).changes;
+    if (!ch) return { code: 'lease_lost', error: 'この実行役の lease ではありません (取り直されたか終了済み)' };
+    return { ok: true, count: list.length };
+  }).immediate();
 }
 
 // ─── 画面 ────────────────────────────────────────────────
