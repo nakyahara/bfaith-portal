@@ -356,9 +356,9 @@ await t('受け口: 旧い形 = 旧い列の指紋・正規化した行に 4 列
   const vNew = validateFinanceChunk(body(neu, orderFinanceChecksum(validateFinanceRows('F1', neu)), V2)).rows[0];
   assert.deepEqual([vNew.lines[0].unclassified_component_count, vNew.lines[0].unclassified_abs_jpy], [2, 200]);
   assert.throws(() => validateFinanceChunk(body(neu, orderFinanceChecksum(validateFinanceRows('F1', neu), { legacy: true }), V2)), /set_checksum differs/);
-  // router: NOT_MIGRATED / DOWNGRADE は 409
+  // router: NOT_MIGRATED / DOWNGRADE (と 0050 の COVERAGE_MISMATCH) は 409
   const src = fs.readFileSync(new URL('../apps/company-db/router.mjs', import.meta.url), 'utf8');
-  assert.match(src, /e\.code === 'NOT_MIGRATED' \|\| e\.code === 'DOWNGRADE'\) \? 409/);
+  assert.match(src, /e\.code === 'NOT_MIGRATED' \|\| e\.code === 'DOWNGRADE' \|\| e\.code === 'COVERAGE_MISMATCH'\) \? 409/);
 });
 await t('🚨 版と行の形 (#1554 Codex R1 High): v2 の版で 4 列が無い・null・一部 = 400 / 旧い版で 4 列あり = 400 / 墓石 (空の集合) はどちらでも通る / JS と SQL の版の規則が同じ', async () => {
   const body = (lines, v) => ({ run_id: 'ship_202609301200000_abcdef', batch_seq: 1, chunk_index: 0, last: true, transform_version: v,
@@ -535,7 +535,20 @@ await t('🚨 0047 の適用前: 旧い形は受ける・今の形は NOT_MIGRAT
 //     6/10: N1 の返品 本体 −1,000 (customer) → 'SKU-N1' の 6 月の単価 1,000 → 1 個
 //   'sku-m' = 'SKU-M' (6/2 1 個 1,000・6/15 返品 −1,000 = 1 個) と 'sku-m' (6/15 A-to-z −300・6 月の売上なし = 単価なし) → 子は unit_price_missing
 //   'sku-zz' = 6/12 返品 −500・売上なし → unit_price_missing / 'sku-f7' = 6/3 3 個 2 円・6/20 返品 −1 円 → 1,000,000 ÷ 666,667 = 1.4999992… → 1 個・丸める前 1.499999
-// 2099-03 (まだ終わっていない月) = 'sku-p' 3/1 1 個 800・3/2 返品 −800 → estimated_partial_month_unit_price
+// 2099-03 (月末まで決済がそろっていない月) = 'sku-p' 3/1 1 個 800・3/2 返品 −800 → estimated_partial_month_unit_price
+// 🆕 0050 (#1561 Codex R2 Medium): partial の判定は「今日」ではなく決済のそろい (core.finance_coverage_state の complete_to) = 下で complete_to 2026-09-29 の complete を置く
+//    (受け口を通さず表に直接。manifest は形だけ・policy の指紋は今の policy の値)。置かない (complete_to null) と全部の月が partial
+const putCoverage = async (completeTo) => {
+  await pg.query(`delete from core.finance_coverage where company_id = 1 and mall = 'amazon' and scope_key = 'jp'`);
+  if (!completeTo) return;
+  const h = 'c'.repeat(64);
+  await pg.query(`insert into core.finance_coverage (company_id, mall, scope_key, source, state, generation, run_token, updating_at, complete_to, settlements_through, source_revision,
+      headers_count, headers_checksum, receipt_count, receipt_lines, receipt_digest, inventory_snapshot_id, inventory_count, inventory_digest, inventory_completed_at, initial_marker_id, initial_marker_digest,
+      selected_documents_count, selected_documents_digest, evidence_chain_from, evidence_chain_through, expected_report_count, expected_report_digest, inventory_runs_digest, policy_fingerprint, request_hash, completed_at)
+    values (1, 'amazon', 'jp', $1, 'complete', 1, 'tok-finance-test-000', now(), $2::date, (($2::date + 1)::timestamp at time zone 'Asia/Tokyo'), 1,
+      1, $3, 0, 0, $3, '1', 0, $3, now(), '1', $3, 1, $3, '2025-12-01T00:00:00Z', now(), 0, $3, $3, core.finance_policy_fingerprint(1::smallint, 'amazon', 'jp'), $3, now())`, [U, completeTo, h]);
+};
+await putCoverage('2026-09-29');
 const skuRange = async (from, to) => (await pg.query(`select * from mart.finance_daily_sku_range(1::smallint, 'amazon', 'jp', $1::date, $2::date)`, [from, to])).rows;
 const at = (rows, date, norm) => rows.find((r) => (r.economic_date_jst.toISOString ? r.economic_date_jst.toISOString().slice(0, 10) : String(r.economic_date_jst)) === date && r.seller_sku_norm === norm);
 let listingN1 = null;
@@ -564,7 +577,7 @@ await t('🚨 手で計算: 正規化 SKU にまとめる・受け取りの出�
     [1, -1, 1000, -1000, 'estimated_monthly_unit_price', '1.000000']);
   assert.deepEqual([n10.received_listing_ids.map(Number), n10.received_listing_unresolved_count], [[listingN1], 0]);
 });
-await t('🚨 返品の状態の 4 つ: no_refund / estimated_monthly_unit_price / unit_price_missing (子にまとめると弱い方・推定できない額) / estimated_partial_month_unit_price (月が終わっていない)・丸める前の返品数', async () => {
+await t('🚨 返品の状態の 4 つ: no_refund / estimated_monthly_unit_price / unit_price_missing (子にまとめると弱い方・推定できない額) / estimated_partial_month_unit_price (月末まで決済がそろっていない = coverage 基準・0050)・丸める前の返品数', async () => {
   await apply('M1', 1, [row('2026-06-02', 'SKU-M', { units_ordered: 1, sales_principal_jpy: 1000 }), row('2026-06-15', 'SKU-M', { refund_principal_jpy: -1000, refund_principal_customer_jpy: -1000 })]);
   await apply('M2', 1, [row('2026-06-15', 'sku-m', { refund_principal_jpy: -300, refund_principal_atoz_jpy: -300 })]);
   await apply('Z1', 1, [row('2026-06-12', 'sku-zz', { refund_principal_jpy: -500, refund_principal_customer_jpy: -500 })]);
@@ -583,6 +596,16 @@ await t('🚨 返品の状態の 4 つ: no_refund / estimated_monthly_unit_price
   assert.deepEqual([p.refund_units_status, p.units_refunded_customer, String(p.units_refunded_customer_unrounded)], ['estimated_partial_month_unit_price', 1, '1.000000']);
   const all4 = new Set([...rows, p].map((r) => r.refund_units_status));
   for (const s of ['no_refund', 'estimated_monthly_unit_price', 'unit_price_missing', 'estimated_partial_month_unit_price']) assert.ok(all4.has(s), s);
+  // 🆕 0050: partial = 月末まで決済がそろっていない (complete_to 基準・今日ではない)。6 月の月末 6/30 より前の complete_to / coverage なし = 6 月も partial
+  for (const cov of ['2026-06-29', null]) {
+    await putCoverage(cov);
+    const f = at(await skuRange('2026-06-01', '2026-06-30'), '2026-06-20', 'sku-f7');
+    assert.deepEqual([f.refund_units_status, f.units_refunded_customer, String(f.units_refunded_customer_unrounded)], ['estimated_partial_month_unit_price', 1, '1.499999'], String(cov));   // 推定の数は同じ
+    assert.equal(at(await skuRange('2026-06-01', '2026-06-30'), '2026-06-15', 'sku-m').refund_units_status, 'unit_price_missing');   // 単価なしは partial より弱い
+  }
+  await putCoverage('2026-06-30');   // 月末ちょうどまでそろえば monthly
+  assert.equal(at(await skuRange('2026-06-01', '2026-06-30'), '2026-06-20', 'sku-f7').refund_units_status, 'estimated_monthly_unit_price');
+  await putCoverage('2026-09-29');
 });
 await t('🚨 今の mart.finance_daily_range と同じ期間の金額・数量の合計が一致 (粒度だけ違う。closing_fee は新しい関数だけが持ち、その分だけ利益が小さい)', async () => {
   const cols = ['units_ordered', 'units_refunded_customer', 'units_marketplace_guarantee', 'units_a_to_z_refund', 'units_net_sold', 'sales_principal_jpy', 'sales_shipping_jpy', 'sales_giftwrap_jpy', 'sales_tax_jpy',
