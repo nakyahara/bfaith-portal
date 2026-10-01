@@ -69,6 +69,9 @@ import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariati
 import { existingPageOfDraft, EXISTING_PAGE_CHOICES } from './lib/existing-page.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
+// Company DB の「新商品の登録」から作るカード (2026-10-01・Company DB構想 14 ⑤-2a)。知らせ (outbox) の取り込みと、新規作成の入口の切り替え
+import { applyCdbCardEvent, cdbShippingCheckIds } from './services/cdb-card-intake.js';
+import { sweepCardOutbox, newEntryGate } from '../../lib/product-hub-outbox.mjs';
 import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
@@ -123,7 +126,7 @@ import {
   queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
-  lpComposeImageRef, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
+  lpComposeImageRef, recordImageServed as recordLpComposeImageServed, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
 } from './lib/lp-compose.js';
 import { assertXlsxExpandsSafely, XlsxTooLargeError } from './lib/xlsx-guard.js';
 import { abaConfigured, lookupAbaTerms, lookupAbaTopAsins } from './lib/aba-client.js';
@@ -249,11 +252,24 @@ router.get('/list', (req, res) => {
   });
 });
 
-router.get('/new', (req, res) => {
-  res.render(view('new.ejs'), {
-    title: '新規商品ドラフト',
-    displayName: req.session?.displayName || req.session?.email || '',
-  });
+// 新規作成 (2026-10-01・Company DB構想 14 §11 の 2「新商品の入口を 1 つに」)。
+//   切替の前 (MASTER_EDIT_OPEN が無い・段階 legacy_open) = 今までの画面のまま (Company DB にもつながない)
+//   切替の後 (段階 new_open かつ MASTER_EDIT_OPEN = 1) = 「マスタの入力 → 新商品の登録」へ案内するだけ (保存でカードが自動でできる)
+//   切替の途中・段階が読めない = 登録は止めている、の案内 (古い入口も開けない = fail-closed)
+//   🚨 (PR #1566 R1 M5) 段階が frozen 以降に ⑤-2a のコードがカードを作る道は outbox の取り込み (services/cdb-card-intake.js) だけ。
+//      ここの画面の案内以外の古い作成の道 (POST /api/drafts・NE の一括登録・自動取込 intake-cron) を frozen から閉じるのは ⑤-3
+//   (async は門を読む前段だけ。描画は今までどおり同期の handler = 誤りは Express の誤りの handler へ)
+router.get('/new', (req, res, next) => {
+  newEntryGate()
+    .catch((e) => ({ mode: 'paused', error: String(e && e.message || e) }))
+    .then((gate) => { res.locals.newEntryGate = gate; next(); });
+}, (req, res) => {
+  const gate = res.locals.newEntryGate || { mode: 'paused' };
+  const displayName = req.session?.displayName || req.session?.email || '';
+  if (gate.mode === 'legacy') {
+    return res.render(view('new.ejs'), { title: '新規商品ドラフト', displayName });
+  }
+  res.render(view('new-guide.ejs'), { title: '新商品の登録', displayName, mode: gate.mode, phase: gate.phase || null });
 });
 
 router.get('/detail/:id', (req, res) => {
@@ -2910,7 +2926,21 @@ function workflowError(res, e) {
 // かんばんボード = 「ステータスごとに誰が何をするか」の主画面 (中原さん 2026-08-23)。
 // ボードは 1 枚で、?view= で「本流の工程で並べる / 画像の工程で並べる」を切り替える
 // (2026-08-24: 上下 2 段だと同じ商品が 2 箇所に出て 2 重管理に見える、の対応)
-router.get('/board', (req, res) => {
+/** ボードを開いたときに、Company DB の新商品の登録の知らせを取り込む (MASTER_EDIT_OPEN = 1 の Render だけ・3 秒まで待つ・失敗してもボードは出す) */
+export const CARD_SWEEP_WAIT_MS = 3000;
+async function sweepCdbCards() {
+  let timer;
+  try {
+    await Promise.race([
+      sweepCardOutbox((ev) => applyCdbCardEvent(ev)),
+      new Promise((resolve) => { timer = setTimeout(resolve, CARD_SWEEP_WAIT_MS); }),
+    ]);
+  } catch (e) {
+    console.error(`[product-hub] 新商品のカードの取り込みの失敗: ${e && e.message}`);
+  } finally { clearTimeout(timer); }
+}
+
+router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }, (req, res) => {
   const db = getDB();
   maybeBackfillDerivedStatus(db);
   const me = staffByPortalEmail(req.session?.email);
@@ -2983,6 +3013,8 @@ router.get('/board', (req, res) => {
     rakutenRmsItemUrl,
     // 結果不明 (outcome=unknown) の商品を再実行する「確認済みで再実行」は管理者だけに出す
     isAdmin: req.session?.role === 'admin',
+    // Company DB の新商品の登録で、発送方法 (送料コード) に楽天の配送方法の対応が無かったカード (2026-10-01)
+    cdbShippingCheck: cdbShippingCheckIds(db),
   });
 });
 
@@ -3903,12 +3935,24 @@ serviceApiRouter.post('/lp-compose/jobs/:id/release', (req, res) => {
 serviceApiRouter.get('/lp-compose/jobs/:id/images/:n', async (req, res) => {
   // 🚨 lease_token はヘッダで受ける — クエリに載せるとプロキシやアクセスログに
   //    URL ごと残る (Codex API R1 #3)。資格情報を URL に載せない
+  const lease = rawField(req.get('X-LP-Compose-Lease'), 100);
   const r = lpComposeImageRef(getDB(), lpIdParam(req.params.id), {
-    leaseToken: rawField(req.get('X-LP-Compose-Lease'), 100), index: lpIdParam(req.params.n) - 1,
+    leaseToken: lease, index: lpIdParam(req.params.n) - 1,
   });
   if (!r.ok) return lpComposeFail(res, r);
   try {
     const { buf } = await getDriveThumbnail(r.file_id, LP_COMPOSE_IMAGE_WIDTH, r.version || '');
+    // 🚨 配ったことをここで記録する。証跡を実行役から受け取ると、
+    //    作業ディレクトリに Write できる Claude のセッションが偽造できた (codex exec review P1)。
+    // 🚨 Drive から落としている間に lease が切れて別の実行役が掴み直していたら、
+    //    記録も配布もしない。記録が**次の実行役のもの**になってしまう (codex exec review P2)
+    const rec = recordLpComposeImageServed(getDB(), lpIdParam(req.params.id), {
+      leaseToken: lease,
+      fileId: r.file_id,
+      sha256: crypto.createHash('sha256').update(buf).digest('hex'),
+      bytes: buf.length,
+    });
+    if (!rec.ok) return lpComposeFail(res, rec);
     res.set('Content-Type', 'image/jpeg');
     res.set('X-Content-Type-Options', 'nosniff');
     // 🚨 no-store。URL が同じで lease をヘッダで渡すので、私有キャッシュを許すと

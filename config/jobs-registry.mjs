@@ -313,6 +313,28 @@ export const JOBS_REGISTRY = [
       + '止めるなら Render の AD_KW_AI_ENABLED を外す (受付・claim・予約が止まる。予約済みの結果の再送は受ける)',
   },
   {
+    id: 'ph-lp-compose',
+    // 1 分おきに走るので、時刻 (anchor) ではなく**経過時間**で生死を見る
+    type: 'heartbeat',
+    importance: 'P3',
+    owner: '中原さん',
+    purpose: 'LP 構成の AI 生成 (段階1・2026-10-01)。商品ハブの詳細画面で「🤖 構成をAIに作らせる」を押した商品について、'
+      + 'claim → 商品画像を落として見る → 仕様書 (LP制作システム V2.2) に従って ⑦ AI画像生成プロンプトを書く → lint → Codex 検品 (最大 2 巡) → 書き戻す。'
+      + '**段階1 の目的は機能ではなく測定** (AI の構成がスタッフの ChatGPT 出力と比べて使えるか・10 件で判定)。'
+      + '書き戻した構成は画面に出るだけで、人がコピーして lp-tool に貼る運用は変わらない。画像生成・GAS への送信・撮影依頼書は段階2 以降',
+    where: 'miniPC TaskScheduler [PhLpComposeMinutely] (scripts/ph-nightly/run-lp-compose.ps1 → work の ./phlp + スキル ph-lp-compose)。Render の PH_LP_COMPOSE_ENABLED=1 のときだけ動く',
+    schedule: '1 分おき。**仕事が無い分は HTTP 1 回だけで終わる** (Claude を起動しない)。依頼が無い分・フラグが OFF の分も ok を打つ',
+    // 1 分おきなので、1 時間 ping が途切れたらタスクが止まっている (miniPC のログオフ・タスク無効化)
+    max_age_hours: 1,
+    lifecycle: 'permanent',
+    runbook: 'scripts/ph-nightly/README.md「LP 構成の AI 生成」。C:\tools\ph-nightly\logs\lp-compose.log と *.lp.err.log を見る: '
+      + '"skipped (another Claude job holds the lock)" → 夜間ジョブが動いている間は正常 (次の分で拾う) / '
+      + '"needs_review +N" (partial) → AI を呼んだのに結果が返らなかった = 成否不明。**自動では作り直さない**ので、画面でもう一度依頼する / '
+      + '"nothing moved" (fail) → claude の認証切れ・ツールの deny・仕様書が未取込。*.lp.out.log の permission_denials と Claude の最後の報告を見る / '
+      + '"PH_LP_COMPOSE_ENABLED is off" → Render のフラグが未設定 (段階1 の立ち上げ中は正常)。'
+      + '止めるなら Render の PH_LP_COMPOSE_ENABLED を外すか Disable-ScheduledTask PhLpComposeMinutely',
+  },
+  {
     id: 'mall-csv-fetch-all',
     type: 'scheduled_job',
     importance: 'P1',

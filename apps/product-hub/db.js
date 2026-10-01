@@ -1380,6 +1380,11 @@ export function initProductHubDB() {
       -- 期限内に終わったかは completed_at <= measurement_deadline_at で後から計算する。
       -- どちらも一度書いたら変えないので、集計をあとから都合よく動かせない。
       measurement_deadline_at TEXT NOT NULL,
+      -- 🚨 実行役へ実際に配った商品画像の記録 (file_id / sha256 / bytes)。
+      --    **サーバが配ったときに自分で書く**。実行役の作業ディレクトリに置くと、
+      --    Claude のセッションが Write できてしまい「見ていないのに見たことにする」偽造ができる
+      --    (codex exec review P1)。証跡は測定の根拠なので、セッションが触れない所に持つ。
+      images_served_json TEXT NOT NULL DEFAULT '[]',
       completed_at    TEXT,
       finalized_at    TEXT
     );
@@ -1420,6 +1425,12 @@ export function initProductHubDB() {
     CREATE INDEX IF NOT EXISTS idx_ph_lp_compose_generations_day
       ON ph_lp_compose_generations(reserved_day);
   `);
+
+  // LP 構成: 実行役へ配った画像の記録 (PR1-b で追加。PR1-a でデプロイ済みの DB にも入れる)
+  const lpJobCols = new Set(db.prepare('PRAGMA table_info(ph_lp_compose_jobs)').all().map((c) => c.name));
+  if (lpJobCols.size > 0 && !lpJobCols.has('images_served_json')) {
+    db.exec("ALTER TABLE ph_lp_compose_jobs ADD COLUMN images_served_json TEXT NOT NULL DEFAULT '[]'");
+  }
 
   // 既存 DB へのカラム追加 (warehouse-mirror/db.js の addColumnIfMissing と同方針の冪等 ALTER)
   const draftCols = new Set(db.prepare('PRAGMA table_info(product_drafts)').all().map((c) => c.name));
@@ -1537,6 +1548,29 @@ export function initProductHubDB() {
   if (!draftCols.has('added_to_draft_id')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN added_to_draft_id INTEGER');
   }
+  // Company DB の「新商品の登録」から作ったカード (2026-10-01・Company DB構想 14 ⑤-2a)。cdb_sku_id = Company DB の core.skus.sku_id。
+  // 1 つの SKU にカードは 1 枚 (部分 unique)。取り込み (services/cdb-card-intake.js) はこの一意で冪等。
+  // ph_cdb_card_events = 取り込んだ知らせ (Company DB の ops.product_hub_outbox の event_id) と結果 (作った / 結んであった / 衝突)・
+  // 発送方法 (送料コード) を楽天の配送方法に対応できたか (unmapped = カードに「要確認」)
+  if (!draftCols.has('cdb_sku_id')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN cdb_sku_id INTEGER');
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_product_drafts_cdb_sku ON product_drafts(cdb_sku_id) WHERE cdb_sku_id IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS ph_cdb_card_events (
+      event_id          TEXT PRIMARY KEY,
+      cdb_sku_id        INTEGER NOT NULL,
+      ne_code           TEXT NOT NULL,
+      outcome           TEXT NOT NULL CHECK (outcome IN ('created', 'linked', 'conflict')),
+      draft_id          INTEGER,
+      conflict_draft_id INTEGER,
+      shipping_status   TEXT CHECK (shipping_status IS NULL OR shipping_status IN ('mapped', 'unmapped')),
+      shipping_code     TEXT,
+      shipping_method   TEXT,
+      applied_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_cdb_card_events_draft ON ph_cdb_card_events(draft_id);
+  `);
   // ページ表記の自動保存 (#691): ページロードごとのトークン + 単調増加 seq。
   // 自動保存とpagehideビーコンの到着順が逆転しても「古いリクエストが新しい保存を
   // 上書きしない」ためのリビジョン (同一トークン内でのみ seq を比較する)

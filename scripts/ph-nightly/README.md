@@ -133,6 +133,55 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ph-nightly\install.p
 - 材料の取得失敗 (miniPC 停止・ABA 未取込など) → その job はその晩やめて 12 時間後 (`retry_wait`)。同じ照会が 3 晩失敗したら打ち切り
 - ping の note: `auto=+N (今日/上限)`・`input=` (材料が見つからない = 画面で種を入れて続ける)・`failed=` (失敗で未確認 = 画面で「確認済みにする」まで partial)
 
+## LP 構成の AI 生成 (段階1・2026-10-01)
+
+商品ハブの詳細画面で「🤖 構成をAIに作らせる」を押した商品の **LP 構成 (⑦ AI画像生成プロンプト)** を書く。
+正本 = AI_reference『商品ハブ_LP構成AI生成_段階1設計_20260930.md』。
+
+**段階1 の目的は機能ではなく測定** — 「AI の構成はスタッフの ChatGPT 出力と比べて使えるか」を 10 件で判定する。
+書き戻した構成は画面に出るだけで、**人がコピーして lp-tool に貼る運用は変わらない**。
+画像生成・GAS への送信・撮影依頼書は段階2 以降。
+
+| もの | 場所 (miniPC) |
+|---|---|
+| CLI (書き換え不可) | `bin\phlp.mjs` |
+| シム・検品ラッパー | `work\phlp` / `work\phlpreview` (ACL で書き込み拒否) |
+| スキル (コピー) | `work\.claude\skills\ph-lp-compose` |
+| ランナー | `binun-lp-compose.ps1` + Task Scheduler `PhLpComposeMinutely` |
+| ログ | `logs\lp-compose.log` + 実行ごとの `*.lp.out.log` / `*.lp.err.log` |
+| 監視 | jobs-monitor ping `ph-lp-compose` (heartbeat・max_age 1 時間) |
+
+### なぜ 1 分おきでよいか
+
+**仕事が無い分は HTTP 1 回だけで終わる。** ランナーはまず `bin\phlp.mjs queue` を叩き、
+`claimable` が 0 なら Claude を起動せず終了する (ロックも残骸検査もしない)。
+人がボタンを押して画面を見ている運用なので、拾うのは速いほうがよい。
+
+### 夜間ジョブとの関係
+
+同じサブスク OAuth を `PhGenerateNightly` (02:30) と `ProductKWScout` (05:00) が使う。
+LP のランナーも **Claude 共通ロックを取る**が、期限は **5 秒**。
+夜間ジョブがロックを持っている間は `skipped` を出して**その分をあきらめ、次の分で拾う**
+(1 分おきなので、2 時間の夜間ジョブの後ろに積み上がってはいけない)。
+`ClaudeGuard.ps1` の `$ClaudeResiduePattern` には `phlp.mjs` を入れてある
+(入れないと、残った実行役を「残骸なし」と誤判定して 2 つ目の Claude を起動する)。
+
+### 朝のチェック (jobs-monitor に `ph-lp-compose` が出たら)
+
+`C:	ools\ph-nightly\logs\lp-compose.log` の末尾を見る:
+
+- `skipped (another Claude job holds the lock)` → 夜間ジョブが動いている間は**正常**
+- `needs_review +N` (partial) → AI を呼んだのに結果が返らなかった = **成否不明**。
+  **自動では作り直さない**ので、画面でもう一度依頼する
+- `nothing moved` (fail) → claude の認証切れ・ツールの deny・仕様書が未取込。
+  `*.lp.err.log` と `*.lp.out.log` の `permission_denials` を見る
+- `PH_LP_COMPOSE_ENABLED is off` → Render のフラグが未設定 (立ち上げ中は正常)
+
+### 止めたい
+
+Render の `PH_LP_COMPOSE_ENABLED` を外す (受付・claim・予約が止まる) か、
+`Disable-ScheduledTask PhLpComposeMinutely`。
+
 ## 費用の目安 (API 方式に切り替える場合の参考)
 
 実測 (2026-08-28、48 件): 1 件あたり input ≈ 8,300 / output ≈ 6,620 トークン (生成+検品+修正 40%)。

@@ -319,6 +319,13 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const productIdOf = (code) => (isAcceptedCode(code) ? productIdBySku.get(normSku(code)) : undefined);
     const productIdsInRun = [...new Set(accepted.map((s) => productIdOf(s.code)).filter(Boolean))];
     log(`skus: ${skuSec.applied} (skip ${skuSec.skipped.length}), products: new ${created.length} / updated ${prodUpdated}`);
+    // 0052 (Company DB構想 14 ⑤-2a・契約 v3 H3): 登録の状態。切替の日の backfill の後は、NE から新しく作った SKU を同じ取引で quarantined (要確認) にする
+    //   (自動では「使える」にしない)。backfill の前は何もしない (関数が 0 を返す)。0052 が未適用の DB では見送る (ロードは止めない)
+    const has0052 = (await db.query("select to_regprocedure('ops.quarantine_unregistered_skus(text)') is not null as ok")).rows[0].ok;
+    if (has0052) {
+      const nq = Number((await db.query('select ops.quarantine_unregistered_skus($1) as n', [runId])).rows[0].n);
+      if (nq) skuSec.notes.push(`登録の状態: NE で見つけた知らない商品 ${nq} 件を要確認 (quarantined) にした`);
+    } else report.notes = [...(report.notes || []), '0052 が未適用: 登録の状態 (要確認) は見送り'];
 
     // ── 3.5 バリエーションのまとまり (D-24 = A)。NE の代表商品コードは実在しない「名札」なので、それ用の product を作って色違い・サイズ違いを束ねる ──
     //   代表コードが単品 SKU として実在する → その product を親に (新しく作らない)

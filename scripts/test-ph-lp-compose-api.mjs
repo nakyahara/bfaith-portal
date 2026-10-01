@@ -211,18 +211,31 @@ eq(rv.status, 200, '予約できる');
 eq((await svc('POST', `/lp-compose/jobs/${job.job_id}/fail`, { body: { lease_token: job.lease_token, code: 'x' } })).status, 409,
   '🚨 予約後に fail は使えない');
 const OUT = '# LP制作システム V2.1\n\n## ⑦ AI画像生成プロンプト\n\n### AI画像生成プロンプト 出力テンプレート V2.2\n…';
+// 🚨 証跡は実行役から受け取らない。サーバが画像を配ったときの記録を使う (codex exec review P1)。
+//    Drive が無い環境では配れないので、ここでは記録だけ直接作って通す
+eq((await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
+  body: { packet_hash: job.packet_hash, verdict: 'accepted', output: OUT, review_rounds: 1, lint: { ok: true } },
+})).status, 400, '🚨 サーバが画像を配っていなければ accepted を受け取らない');
+eq((await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
+  body: { packet_hash: job.packet_hash, verdict: 'accepted', output: OUT, review_rounds: 1 },
+})).status, 400, '🚨 lint が無ければ accepted を受け取らない');
+lp.recordImageServed(db, job.job_id, { leaseToken: job.lease_token, fileId: 'FILEIDTOP001', sha256: 'c'.repeat(64), bytes: 2222 });
+// 🚨 packet の画像は 2 枚。全部配っていなければ accepted は通らない (codex exec review P1)
+eq((await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
+  body: { packet_hash: job.packet_hash, verdict: 'accepted', output: OUT, review_rounds: 1, lint: { ok: true } },
+})).status, 400, '🚨 2 枚中 1 枚しか配っていなければ accepted を受け取らない');
+lp.recordImageServed(db, job.job_id, { leaseToken: job.lease_token, fileId: 'FILEIDIMG002', sha256: 'd'.repeat(64), bytes: 3333 });
 const sub = await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
   body: {
     packet_hash: job.packet_hash, verdict: 'accepted', output: OUT, review_rounds: 1,
     lint: { ok: true },
-    receipt: { images: [{ file_id: 'FILEIDTOP001', sha256: 'a'.repeat(64), bytes: 1234 }] },
   },
 });
 eq(sub.status, 200, '結果を受け取れる');
+eq(sub.json.receipt.images[0].sha256, 'c'.repeat(64), '🚨 証跡はサーバの記録');
 eq(sub.json.status, 'done', 'done になる');
 eq((await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
-  body: { packet_hash: job.packet_hash, verdict: 'accepted', output: OUT, review_rounds: 1, lint: { ok: true },
-    receipt: { images: [{ file_id: 'FILEIDTOP001', sha256: 'a'.repeat(64), bytes: 1234 }] } },
+  body: { packet_hash: job.packet_hash, verdict: 'accepted', output: OUT, review_rounds: 1, lint: { ok: true } },
 })).json.already, true, '同じ結果の再送は保存済みを返す');
 
 console.log('⑥ 画面に出る');

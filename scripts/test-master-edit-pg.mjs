@@ -129,6 +129,8 @@ try {
   await acks(ALL_COMPANY, 'frozen');
   await C.advanceCutoverPhase(dbP, { to: 'company_owner', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: h } });
   await acks(ALL_COMPANY, 'company_owner');
+  // 0052 (⑤-2a): new_open の前に既存の SKU の登録の状態 (backfill) が要る (運用のロールで)
+  { const p = (await dbP.query('select * from ops.registration_backfill_plan()')).rows[0]; await dbP.query('select ops.backfill_sku_registrations($1, $2, $3)', [p.sku_count, p.snapshot_hash, 't@test']); }
   await C.advanceCutoverPhase(dbP, { to: 'new_open', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: h } });
   assert.equal((await O.query('select phase from ops.master_cutover_state')).rows[0].phase, 'new_open');
 
