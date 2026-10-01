@@ -591,7 +591,7 @@ __setPgClientFactory(async () => {
   };
 });
 const app = express();
-app.use('/apps/company-db/sync', requireSyncKey);
+// 外側の requireSyncKey は付けない = 受け口の route 自身の鍵の確かめを試す (本番の事前の確かめの対象に amazon-profit は無い・#1570 Codex R1 Low)
 app.use('/apps/company-db/sync', companyDbRouter);
 const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
 const BASE_URL = `http://127.0.0.1:${server.address().port}/apps/company-db/sync`;
