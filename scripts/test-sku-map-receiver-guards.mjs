@@ -11,10 +11,13 @@
  *   [G5] 世代つきに他の表・meta でないものが相乗り → 422 (何も書かない・有効にならない)
  *   [G6] 有効にする許し: env SKU_MAP_ACTIVATION_ALLOWED=1 と activate: true の両方がそろったときだけ有効にする (片方・'true' の文字などは 409・何も書かない)
  *   [G7] 有効になった後に今の送り手のマスタの部が届く = 部ごと 409 (products も入らない) = 間違えて有効にしたときに壊れるもの。対の無い部は入る
- *   [G8] 戻し (sku-map-state-reset.mjs): env が残っていれば断る・誰が / なぜ が要る・見るだけは何も書かない・
+ *   [G8] 戻し (sku-map-state-reset.mjs): env が残っていれば断る・誰が / なぜ / 期待の世代とハッシュ が要る・見るだけは何も書かない・
+ *        鍵を取った後に読み直す (見た後に送り手が世代を入れたら断る = その世代を消さない)・DB で落ちれば控えは aborted (Codex R1 Medium)・
  *        戻すと控え・記録 (消せない) が残り、有効でなくなり、今の送り手のマスタの部がまた入る
  *   [G9] SKU_MAP_REQUIRE_GENERATION=1: 状態の行が無くても (表が無くても) 世代なしの対を断る。世代つきは許しがそろえば有効にして記録する
  *   [G10] 時間 (20k 親 / 40k 構成): 確かめ + ハッシュ・入れる・replayed の時間を出す (上限はゆるく = 落ちにくい)
+ *   [G11] バックアップから戻したとき: 状態の行が無い → 許しを一時的に置いて max より大きい世代で有効にし直す (手順書どおり)。
+ *         古い行が残る → 大きい世代は許しなしで入る (Codex R1 Low)
  * 使い方: node scripts/test-sku-map-receiver-guards.mjs
  */
 import { temporaryTestDataDir } from './test-temp-dir.mjs';
@@ -33,7 +36,7 @@ delete process.env.SKU_MAP_REQUIRE_GENERATION;
 const { toMirrorWireRows, buildSkuMapGeneration } = await import('../lib/sku-map-canonical.js');
 const { buildMaterialGeneration } = await import('../apps/warehouse/material-lineage.js');
 const gen = await import('../apps/warehouse-mirror/sku-map-generation.js');
-const { resetSkuMapState } = await import('../apps/warehouse-mirror/sku-map-state-reset.mjs');
+const { resetSkuMapState, SKU_MAP_RESET_AUDIT_DDL } = await import('../apps/warehouse-mirror/sku-map-state-reset.mjs');
 const Database = (await import('better-sqlite3')).default;
 const express = (await import('express')).default;
 const mirrorRouter = (await import('../apps/warehouse-mirror/router.js')).default;
@@ -322,27 +325,76 @@ await ta('[G7] 有効になった後に今の送り手のマスタの部が届�
   assert.equal(r2.json.material_recorded.products.recorded, true);
 });
 
-await ta('[G8] 戻し: env が残れば断る・誰が / なぜ が要る・見るだけは書かない・戻すと控えと記録が残り今までどおりに戻る', async () => {
+await ta('[G8] 戻し: env が残れば断る・誰が / なぜ / 期待の世代とハッシュが要る・見るだけは書かない・鍵の後に状態が変われば断る・DB で落ちれば控えは aborted・戻すと控えと記録が残り今までどおり', async () => {
   const backupDir = path.join(DATA_DIR, 'sku-map-state-resets');
   const st0 = stateRow();
   const code = (c) => (e) => e.code === c;
-  assert.throws(() => resetSkuMapState(db, { apply: true, by: 'x', reason: 'y', backupDir, env: { SKU_MAP_ACTIVATION_ALLOWED: '1' } }), code('RESET_ENV_STILL_SET'));
-  assert.throws(() => resetSkuMapState(db, { apply: true, by: 'x', reason: 'y', backupDir, env: { SKU_MAP_REQUIRE_GENERATION: '1' } }), code('RESET_ENV_STILL_SET'));
-  assert.throws(() => resetSkuMapState(db, { apply: true, by: ' ', reason: 'y', backupDir, env: {} }), code('RESET_NEEDS_BY_REASON'));
-  assert.throws(() => resetSkuMapState(db, { apply: true, by: 'x', backupDir, env: {} }), code('RESET_NEEDS_BY_REASON'));
+  const files = () => (fs.existsSync(backupDir) ? fs.readdirSync(backupDir).sort() : []);
+  const readJson = (f) => JSON.parse(fs.readFileSync(path.join(backupDir, f), 'utf8'));
+  const auditRows = () => { try { return db.prepare('SELECT * FROM mirror_sku_map_state_resets ORDER BY id').all(); } catch { return []; } };
+  const h6 = st0.content_hash;
+  const ok6 = { apply: true, by: 'x', reason: 'y', expectGeneration: '6', expectContentHash: h6, backupDir };
+  assert.throws(() => resetSkuMapState(db, { ...ok6, env: { SKU_MAP_ACTIVATION_ALLOWED: '1' } }), code('RESET_ENV_STILL_SET'));
+  assert.throws(() => resetSkuMapState(db, { ...ok6, env: { SKU_MAP_REQUIRE_GENERATION: '1' } }), code('RESET_ENV_STILL_SET'));
+  assert.throws(() => resetSkuMapState(db, { ...ok6, by: ' ', env: {} }), code('RESET_NEEDS_BY_REASON'));
+  assert.throws(() => resetSkuMapState(db, { ...ok6, reason: undefined, env: {} }), code('RESET_NEEDS_BY_REASON'));
+  // 期待の世代とハッシュは必須 (見るだけの回に出た値)
+  assert.throws(() => resetSkuMapState(db, { ...ok6, expectGeneration: undefined, env: {} }), code('RESET_NEEDS_EXPECT'));
+  assert.throws(() => resetSkuMapState(db, { ...ok6, expectContentHash: undefined, env: {} }), code('RESET_NEEDS_EXPECT'));
+  assert.throws(() => resetSkuMapState(db, { ...ok6, expectGeneration: '06', env: {} }), code('RESET_NEEDS_EXPECT'));
+  assert.throws(() => resetSkuMapState(db, { ...ok6, expectContentHash: h6.toUpperCase(), env: {} }), code('RESET_NEEDS_EXPECT'));
   const dry = resetSkuMapState(db, { backupDir, env: {} });
   assert.equal(dry.action, 'dry_run');
-  assert.equal(dry.before.generation, '6');
+  assert.deepEqual([dry.before.generation, dry.before.content_hash], ['6', h6]);
   assert.deepEqual(stateRow(), st0);
-  assert.ok(!fs.existsSync(backupDir));
-  const out = resetSkuMapState(db, { apply: true, by: '中原', reason: '試験: 影運転が activate: true で送った', backupDir, env: {}, now: new Date(Date.UTC(2026, 9, 1, 3, 0, 0)) });
+  assert.deepEqual(files(), []);
+  // 見た後・鍵を取る前に送り手が世代 7 を入れた (Codex R1 Medium) → 鍵の中で読み直して断る。世代 7 は消さない・控えも記録も残さない
+  const CANON7 = { ...CANON, master: CANON.master.map((m) => (m.seller_sku === 'b-002' ? { ...m, name: '単品 B (7)' } : m)) };
+  assert.throws(() => resetSkuMapState(db, {
+    ...ok6, env: {}, now: new Date(Date.UTC(2026, 9, 1, 2, 0, 0)),
+    beforeLockForTest: () => {
+      const plan = gen.planSkuMapPair(db, genBody(7, CANON7), { env: {} });
+      assert.equal(plan.mode, 'generation', plan.code);
+      assert.equal(gen.applySkuMapGeneration(db, plan, { syncedAt: 'race' }).result, 'applied');
+    },
+  }), code('RESET_STATE_CHANGED'));
+  const st7 = stateRow();
+  assert.equal(st7.generation, 7n);
+  assert.deepEqual(files(), []);
+  assert.deepEqual(auditRows(), []);
+  // 世代は合うがハッシュが違う / 世代が違う → 断る (何も書かない)
+  assert.throws(() => resetSkuMapState(db, { ...ok6, expectGeneration: '7', env: {} }), code('RESET_STATE_CHANGED'));
+  assert.throws(() => resetSkuMapState(db, { ...ok6, expectContentHash: st7.content_hash, env: {} }), code('RESET_STATE_CHANGED'));
+  assert.deepEqual(files(), []);
+  const ok7 = { ...ok6, expectGeneration: '7', expectContentHash: st7.content_hash, env: {} };
+  // DB で落ちる (記録の表に入れられない) → 何も戻していない。控えは aborted (戻したように読めない)・記録は無い・有効のまま
+  for (const sql of SKU_MAP_RESET_AUDIT_DDL) db.exec(sql);
+  db.exec("CREATE TRIGGER test_fail_audit BEFORE INSERT ON mirror_sku_map_state_resets BEGIN SELECT RAISE(ABORT, 'test: audit fails'); END");
+  try {
+    assert.throws(() => resetSkuMapState(db, { ...ok7, now: new Date(Date.UTC(2026, 9, 1, 2, 30, 0)) }), /test: audit fails/);
+  } finally { db.exec('DROP TRIGGER test_fail_audit'); }
+  assert.equal(files().length, 1);
+  const aborted = readJson(files()[0]);
+  assert.deepEqual([aborted.status, aborted.state.generation], ['aborted', '7']);
+  assert.match(aborted.error, /test: audit fails/);
+  assert.deepEqual(auditRows(), []);
+  assert.deepEqual(stateRow(), st7);
+  // 控えの名前が重なる (同じ時刻) → 書けずに断る。前の回の控え (aborted) は書き換えない・何も戻さない
+  assert.throws(() => resetSkuMapState(db, { ...ok7, now: new Date(Date.UTC(2026, 9, 1, 2, 30, 0)) }), (e) => e.code === 'EEXIST');
+  assert.deepEqual(readJson(files()[0]), aborted);
+  assert.deepEqual(auditRows(), []);
+  assert.deepEqual(stateRow(), st7);
+  // 戻す
+  const out = resetSkuMapState(db, { ...ok7, by: '中原', reason: '試験: 影運転が activate: true で送った', now: new Date(Date.UTC(2026, 9, 1, 3, 0, 0)) });
   assert.equal(out.action, 'reset');
   const saved = JSON.parse(fs.readFileSync(out.backup_file, 'utf8'));
-  assert.deepEqual([saved.reset_by, saved.state.generation, saved.state.activation_generation, saved.tables.mirror_sku_master], ['中原', '6', '5', 3]);
+  assert.deepEqual([saved.status, saved.audit_id, saved.reset_by, saved.state.generation, saved.state.activation_generation, saved.state.content_hash, saved.tables.mirror_sku_master],
+    ['committed', out.audit_id, '中原', '7', '5', st7.content_hash, 3]);
   assert.ok(saved.schema.some((x) => x.name === 'trg_sku_map_state_no_delete_v1'));
-  const audit = db.prepare('SELECT * FROM mirror_sku_map_state_resets').all();
+  const audit = auditRows();
   assert.equal(audit.length, 1);
-  assert.deepEqual([audit[0].reset_by, audit[0].reason, audit[0].backup_file, JSON.parse(audit[0].previous_state).generation], ['中原', '試験: 影運転が activate: true で送った', out.backup_file, '6']);
+  assert.deepEqual([audit[0].id, audit[0].reset_by, audit[0].reason, audit[0].backup_file, JSON.parse(audit[0].previous_state).generation],
+    [out.audit_id, '中原', '試験: 影運転が activate: true で送った', out.backup_file, '7']);
   assert.throws(() => db.exec('DELETE FROM mirror_sku_map_state_resets'), /消せない/);
   assert.throws(() => db.exec("UPDATE mirror_sku_map_state_resets SET reason = 'x'"), /直せない/);
   // 有効でなくなった・trigger は作り直した・今の送り手のマスタの部がまた入る
@@ -352,8 +404,10 @@ await ta('[G8] 戻し: env が残れば断る・誰が / なぜ が要る・見�
   const r = await post(masterPart());
   assert.equal(r.status, 200, JSON.stringify(r.json));
   assert.equal(r.json.sku_map, undefined);
-  // 同じ控えの名前は上書きしない / 有効でなければ戻すものは無い
-  assert.equal(resetSkuMapState(db, { apply: true, by: 'x', reason: 'y', backupDir, env: {} }).action, 'none');
+  // 有効でなければ断る (先に誰かが戻した) / 見るだけは none
+  assert.throws(() => resetSkuMapState(db, { ...ok7, now: new Date(Date.UTC(2026, 9, 1, 4, 0, 0)) }), code('RESET_STATE_CHANGED'));
+  assert.equal(resetSkuMapState(db, { backupDir, env: {} }).action, 'none');
+  assert.equal(files().length, 2);
 });
 
 await ta('[G9] SKU_MAP_REQUIRE_GENERATION=1: 行が無くても (表が無くても) 世代なしの対を断る。世代つきは許しがそろえば有効にする', async () => {
@@ -422,6 +476,47 @@ await ta('[G10] 時間 (20k 親 / 40k 構成): 確かめ + ハッシュ・入れ
     console.log(`      時間: 確かめ + ハッシュ ${tPlan.toFixed(0)}ms / 入れる ${tApply.toFixed(0)}ms / replayed ${tReplay.toFixed(0)}ms (body ${mb}MB。受け口の上限は 12MB)`);
     assert.ok(tPlan + tApply + tReplay < 60000, '1 分を超えた (ゆるい上限)');
   } finally { bdb.close(); }
+});
+
+await ta('[G11] バックアップから戻したとき: 状態の行が無い → 許しを一時的に置いて max より大きい世代で有効にし直す / 古い行が残る → 大きい世代はそのまま入る', async () => {
+  await withEnv({ SKU_MAP_REQUIRE_GENERATION: '1' }, async () => {
+    // [G9] の後 = 世代 7 で有効。Render のディスクを「有効にする前」のバックアップから戻した = 状態の表は空
+    assert.equal(stateRow().generation, 7n);
+    db.exec('DROP TABLE mirror_sku_map_state');
+    reopen();
+    assert.equal(stateRow(), undefined);
+    let s = await getState();
+    assert.deepEqual([s.status, s.json.state, s.json.receiver], [200, { activated: false }, { activation_allowed: false, require_generation: true }]);
+    const w0 = writes();
+    // 世代なしは REQUIRE_GENERATION が断る・世代つきも許しが無ければ断る (何も書かない)
+    let r = await post(masterPart());
+    assert.deepEqual([r.status, r.json.error], [409, 'sku_map_generation_required']);
+    r = await post(genBody(8, CANON, { activate: true }));
+    assert.deepEqual([r.status, r.json.error, r.json.sku_map.missing], [409, 'sku_map_activation_not_allowed', ['env SKU_MAP_ACTIVATION_ALLOWED=1 (Render)']]);
+    assert.deepEqual(writesSince(w0), {});
+    // 手順: 送り手を止める → max(PG, miniPC, Render) = 7 より大きい 8 を決める → 許しを一時的に置く → activate: true の単独の POST → 許しを消す
+    r = await withEnv({ SKU_MAP_ACTIVATION_ALLOWED: '1' }, () => post(genBody(8, CANON, { activate: true })));
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.deepEqual([r.json.sku_map.result, r.json.sku_map.generation], ['activated', '8']);
+    assert.equal(stateRow().activation_generation, 8n);
+    s = await getState();
+    assert.deepEqual([s.json.state.generation, s.json.receiver], ['8', { activation_allowed: false, require_generation: true }]);
+    // 許しを消した後: 次の世代は入る・同じ世代は replayed・古い世代は断る
+    assert.equal((await post(genBody(9, CANON))).json.sku_map.result, 'applied');
+    assert.equal((await post(genBody(9, CANON))).json.sku_map.result, 'replayed');
+    r = await post(genBody(8, CANON));
+    assert.deepEqual([r.status, r.json.error], [409, 'sku_map_generation_stale']);
+    // 古い状態の行が残るバックアップ (世代 5) から戻した → 許しは要らず、大きい世代 (10) はそのまま入る。有効の時刻と最初の世代はバックアップのまま
+    db.exec('DROP TABLE mirror_sku_map_state');
+    reopen();
+    const g5 = buildSkuMapGeneration({ generation: 5, ...CANON });
+    db.prepare(`INSERT INTO mirror_sku_map_state (id, activated, activated_at, activation_generation, generation, format, content_hash, master_rows, component_rows, applied_at)
+      VALUES (1, 1, '2026-09-01T00:00:00.000Z', 5, 5, ?, ?, ?, ?, '2026-09-01T00:00:00.000Z')`).run(g5.format, g5.content_hash, g5.master_rows, g5.component_rows);
+    r = await post(genBody(10, CANON));
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.deepEqual([r.json.sku_map.result, r.json.sku_map.activated_at], ['applied', '2026-09-01T00:00:00.000Z']);
+    assert.deepEqual([stateRow().generation, stateRow().activation_generation], [10n, 5n]);
+  });
 });
 
 server.close();

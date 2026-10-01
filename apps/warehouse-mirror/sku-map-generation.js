@@ -12,6 +12,7 @@
  *     同じ世代で同じハッシュ = 何もしない (replayed)
  *   - SKU_MAP_REQUIRE_GENERATION=1 (切替の後に Render に置く) = 状態の行が無くても有効とみなす (DB ファイルを戻した・DATA_DIR が変わった
  *     ときに、世代なしの対を黙って受けない)。行が無いときの世代つきは、上の 2 つがそろったときだけ有効にして記録する
+ *     (バックアップから戻した後は、送り手を止め、max(Company DB・miniPC・Render) より大きい世代を決め、許しを一時的に置いて有効にし直す = 手順書)
  *   - 世代つきの body は **SKU の対だけの単独の POST** (sku_master・sku_resolved・sku_map_generation・meta だけ)。
  *     ほかの表が同じ body にあれば 422 (何も書かない)。= 対を断ったときにマスタの部 (products など) を道連れにしない・
  *     「対は入ったのに後の表で 500」も作らない
