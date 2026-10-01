@@ -1756,7 +1756,7 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
 - 月パーティションは `snapshots.ensure_month_partitions(from, to)` で作る。作り忘れても default に入って落ちない。**後から作ると default の行をその月に移してから attach する** (同一トランザクション)
 - 実行器: 番号は 0001 からの連番 (欠番は不正)。DB に適用記録があるのにファイルが無い checkout では流さない
 
-## 持ち主の epoch (0053。マスタ正本切替 ④a・Codex #1564 R1 H1)
+## 持ち主の epoch (0053。マスタ正本切替 ④a・Codex #1564 R1 H1・R2 High 3)
 
 列ごとの持ち主 (`config/master-ownership.mjs`) を 3 つに分ける。**config を書き換えてデプロイしただけでは何も変わらない**:
 - **configured** = config/master-ownership.mjs (コードに書いた「こうしたい」)
@@ -1775,7 +1775,7 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
    証拠を集めたときの prepare の時刻を行の鍵の後に比べる = その間に prepare をやり直したら `PREPARED_CHANGED` で断る (やり直しは 3 から))
 - 途中で止める = `master-ownership-epoch.mjs cancel` (prepared を消す。active はそのまま = 毎晩は前の持ち主)。今の状態 = `master-ownership-epoch.mjs status`
 
-**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0053 は表を 2 つ足すだけ (行は作らない = 全部 load のまま = 何も変わらない)。
+**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0053 は表を 2 つと、⑤-1 の切替の段階・画面の保存の門に「持ち主の epoch と同じ」の確かめを足すだけ (行は作らない = 全部 load のまま = 何も変わらない)。
 🚨 **番号**: master 0050 (finance_coverage) → ⑤-1 0051 (master_edit・本番に入っている) → ⑤-2a 0052 → この 0053 の順に積む。⑤-2b も 0053 を使う = 後にマージされる方を 0054 に付け替える (migrate.mjs は欠番・重複を拒む)。
 🚨 **デプロイは Render と miniPC を同じ日に**: 夜間ロードの規則の指紋 (`engine.mjs` の `LOAD_RULE_FILES`) に `apps/company-db/load/ownership-state.mjs` が入った (engine.mjs も変わった)。
 Render (夜間ロード) と miniPC (朝の照合 ①) のコードが違う日は、朝の照合 ① が「規則の指紋がこのコードと違う」で判定できない (blocked) になる。同じ日の夜間ロードの前に両方をそろえる

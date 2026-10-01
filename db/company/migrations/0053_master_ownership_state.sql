@@ -1,4 +1,4 @@
--- 0053 持ち主の設定の epoch (マスタ正本切替 ④a。Codex #1564 R1 H1。2026-10-01)
+-- 0053 持ち主の設定の epoch (マスタ正本切替 ④a。Codex #1564 R1 H1・R2 High 3。2026-10-01)
 -- 積み方: master の 0050 → ⑤-1 の 0051 (切替の段階・前提の差し込み口・画面の保存の門) → ⑤-2a の 0052 → この 0053 (0051 / 0052 だけに寄る。マージの順で番号を付け替える)
 --
 -- なぜ: config/master-ownership.mjs を 'company' に書き換えた夜間ロードの時点で、実際の持ち主が切り替わってしまう (初回の写し・作り直しが失敗しても)。
@@ -10,6 +10,8 @@
 --                  通ったときだけ、人がコマンドで prepared → active にする (master-ownership-epoch.mjs activate。確かめの証拠を残す)
 --   行が無い = active は全部 'load' (今までと同じ)。
 -- 🚨 古い書き込み口 (/register など) を閉じるのは ⑤-3 の切替の手順 (持ち主を変える前に閉じる)。ここでは門を作らない。
+-- 🚨 持ち主の正を 1 つにする (Codex #1564 R2 High 3): ⑤-1 の切替の段階の持ち主表 (ops.master_cutover_state.owner_hash) と画面の保存の持ち主表は、
+--   この表の active (epoch) と同じでなければならない (下の 4 つ。⑤-1 の関数は上書きしない = 差し込み口の表に 1 行足す・⑤-1 の表に trigger を足す)
 -- 🚨 書くのは持ち主のコマンドだけ (DB を作ったユーザー)。watcher は読むだけ (ops の既定の権限)。
 
 create table ops.master_ownership_state (
@@ -50,3 +52,88 @@ create trigger trg_master_ownership_events_append_only before update or delete o
 do $$ begin
   if exists (select 1 from pg_roles where rolname = 'watcher') then execute 'grant select on ops.master_ownership_state, ops.master_ownership_events to watcher'; end if;
 end $$;
+
+-- ─── 持ち主の正を 1 つにする (Codex #1564 R2 High 3) ───
+-- 実際に効く active の持ち主表 (記録に無い列 = 'load' として足す = apps/company-db/load/ownership-state.mjs の checkedMap と同じ)。行が無い = 全部 load = {}
+create function ops.master_ownership_active_map() returns jsonb
+  language sql stable set search_path = pg_catalog, pg_temp as $$
+  select coalesce((select s.active_map from ops.master_ownership_state s where s.id = 1), '{}'::jsonb)
+$$;
+revoke all on function ops.master_ownership_active_map() from public;
+
+-- 持ち主表 p が active と同じか (p のキーごとに: active に書いてあればその値・無ければ 'load' と同じ / active にだけあるキー = 違う)。
+--   ⑤-1 の画面の保存 (ops.begin_master_write が書く ops.master_write_sessions の ownership) と比べる
+create function ops.master_ownership_matches_active(p jsonb) returns boolean
+  language sql stable set search_path = pg_catalog, pg_temp as $$
+  select p is not null and jsonb_typeof(p) = 'object'
+     and not exists (select 1 from jsonb_each_text(p) e where e.value is distinct from coalesce(ops.master_ownership_active_map() ->> e.key, 'load'))
+     and not exists (select 1 from jsonb_object_keys(ops.master_ownership_active_map()) k where not (p ? k))
+$$;
+revoke all on function ops.master_ownership_matches_active(jsonb) from public;
+
+-- 1. 前提 (⑤-1 の差し込み口 ops.master_cutover_prereq_checks に 1 行足す = ops.set_master_cutover_phase が呼ぶ。集める関数は上書きしない):
+--    frozen → company_owner (と、その先 = new_open) は、epoch が active になっている (master-ownership-epoch.mjs activate 済み) ときだけ:
+--    行がある・prepared が残っていない・active に持ち主が C の列がある・記録のハッシュが中身と同じ。
+--    🚨 証拠の owner_hash は前提の関数に渡らない (形が (p_from, p_to)) = owner_hash と active が同じことは 2. の trigger で見る
+create function ops.master_ownership_epoch_prereq(p_from text, p_to text) returns text[]
+  language plpgsql stable set search_path = pg_catalog, pg_temp as $$
+declare
+  v_problems text[] := '{}';
+  r record;
+begin
+  if p_to in ('company_owner', 'new_open') then
+    select active_hash, active_map, prepared_hash into r from ops.master_ownership_state where id = 1;
+    if not found then
+      v_problems := v_problems || 'epoch_missing: 持ち主の epoch の記録が無い (master-ownership-epoch.mjs prepare → 写し → 作り直し → 確かめ → activate が先)'::text;
+    else
+      if r.prepared_hash is not null then v_problems := v_problems || 'epoch_prepared_pending: prepared が残っている (activate か cancel が先)'::text; end if;
+      if not exists (select 1 from jsonb_each_text(r.active_map) e where e.value = 'company') then
+        v_problems := v_problems || 'epoch_all_load: active に持ち主が C の列が無い (activate が先)'::text;
+      end if;
+      if ops.ownership_hash(r.active_map) is distinct from r.active_hash then v_problems := v_problems || 'epoch_broken: active の記録のハッシュが中身と違う'::text; end if;
+    end if;
+  end if;
+  return v_problems;
+end $$;
+revoke all on function ops.master_ownership_epoch_prereq(text, text) from public;
+insert into ops.master_cutover_prereq_checks (name, fn) values ('0053_ownership_epoch', 'ops.master_ownership_epoch_prereq(text, text)');
+
+-- 2. 段階の行の持ち主表 = active (⑤-1 の ops.master_cutover_state に trigger を足す。⑤-1 の関数は上書きしない):
+--    company_owner・new_open に入る・その owner_hash を変える = owner_hash が active の記録のハッシュと同じときだけ (証拠の owner_hash = epoch)。
+--    前提の関数 (1.) と同じ答えの保険も見る (set_master_cutover_phase が後の migration で作り直されて差し込み口を呼び忘れても通さない)
+create function ops.guard_master_cutover_epoch() returns trigger
+  language plpgsql set search_path = pg_catalog, pg_temp as $$
+declare
+  v_problems text[];
+  v_active text;
+begin
+  if new.phase in ('company_owner', 'new_open') and (new.phase is distinct from old.phase or new.owner_hash is distinct from old.owner_hash) then
+    v_problems := ops.master_ownership_epoch_prereq(old.phase, new.phase);
+    select active_hash into v_active from ops.master_ownership_state where id = 1;
+    if new.owner_hash is distinct from v_active then
+      v_problems := v_problems || format('owner_hash_not_active: 段階の持ち主表 (%s) が持ち主の epoch (active %s) と違う', left(coalesce(new.owner_hash, '-'), 12), left(coalesce(v_active, 'なし'), 12));
+    end if;
+    if coalesce(array_length(v_problems, 1), 0) > 0 then
+      raise exception 'cutover_epoch: 段階を % にしない: %', new.phase, array_to_string(v_problems, ' / ') using errcode = 'P0001';
+    end if;
+  end if;
+  return new;
+end $$;
+revoke all on function ops.guard_master_cutover_epoch() from public;
+-- 名前 = ⑤-1 の守り (trg_master_cutover_state_guard)・⑤-2a の前提 (trg_master_cutover_state_prereq) の後に動く (BEFORE の trigger は名前の順 = 直接の UPDATE は今までどおり ⑤-1 の守りで断る)
+create trigger trg_master_cutover_state_prereq_0053 before update on ops.master_cutover_state
+  for each row execute function ops.guard_master_cutover_epoch();
+
+-- 3. 画面の保存の門 = active (⑤-1 の ops.begin_master_write が書く ops.master_write_sessions に trigger を足す。begin_master_write は上書きしない):
+--    保存を始めるときの持ち主表 (画面が動かしている config) が active と同じ (記録に無い列 = load) ときだけ = 段階の記録 (⑤-1 が見る) と epoch の両方に合う
+create function ops.guard_master_write_epoch() returns trigger
+  language plpgsql set search_path = pg_catalog, pg_temp as $$
+begin
+  if not ops.master_ownership_matches_active(new.ownership) then
+    raise exception 'before_cutover: 持ち主表が持ち主の epoch (active) と違う (master-ownership-epoch.mjs status)' using errcode = 'P0001';
+  end if;
+  return new;
+end $$;
+revoke all on function ops.guard_master_write_epoch() from public;
+create trigger trg_master_write_sessions_epoch before insert on ops.master_write_sessions
+  for each row execute function ops.guard_master_write_epoch();

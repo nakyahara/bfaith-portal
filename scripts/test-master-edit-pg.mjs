@@ -127,6 +127,8 @@ try {
   });
   assert.equal((await O.query('select phase from ops.master_cutover_state')).rows[0].phase, 'frozen', '[0] で frozen に進んでいない');
   await acks(ALL_COMPANY, 'frozen');
+  // 0053 (④a): company_owner に進むのは持ち主の epoch が active で段階の持ち主表と同じときだけ = 試験で置く (本番 = ④a の activate)
+  await (await import('./fixtures/master-epoch.mjs')).seedActiveEpoch(dbO, ALL_COMPANY);
   await C.advanceCutoverPhase(dbP, { to: 'company_owner', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: h } });
   await acks(ALL_COMPANY, 'company_owner');
   // 0052 (⑤-2a): new_open の前に既存の SKU の登録の状態 (backfill) が要る (運用のロールで)

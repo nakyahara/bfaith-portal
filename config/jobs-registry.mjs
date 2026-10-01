@@ -1326,6 +1326,8 @@ export const JOBS_REGISTRY = [
       + 'activate が断る理由 (master-ownership-epoch.mjs): build_not_prepared_epoch・generation_before_prepare (prepare より前に読んだ世代)・no_verified_apply_evidence・evidence_not_prepared_epoch・'
       + 'apply_not_verified・applied_mismatch_now・applied_hash_changed・切替の段階 (⑤-1 の ops.master_cutover_state) が frozen でない・段階の表が無い・'
       + 'PREPARED_CHANGED (証拠を集めた後に prepare がやり直された = 写し・作り直し・確かめからやり直す)。'
+      + '持ち主の正は 1 つ (0053・Codex #1564 R2 High 3): ⑤-1 の切替の段階を company_owner・new_open に進めるのは epoch が active (前提 0053_ownership_epoch = epoch_missing・epoch_prepared_pending・epoch_all_load・epoch_broken) で、'
+      + '段階の owner_hash = active のときだけ (trigger trg_master_cutover_state_prereq_0053 = cutover_epoch: owner_hash_not_active)。画面の保存 (ops.begin_master_write) も active と同じ持ち主表だけ (before_cutover: 持ち主表が持ち主の epoch と違う)。'
       + '手で試す = node apps/company-db/publish/fetch.mjs --dry-run (読んで確かめるだけ・書かない・ping なし)',
   },
   {

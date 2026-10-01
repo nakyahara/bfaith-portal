@@ -35,6 +35,8 @@
  *     safe に戻せるのは通った確かめだけ・行が無く持ち主が C = unknown・読めない = unknown・全部 load で行が無い = 流す (今と同じ)・
  *     自動再試行 (RERUN_AFTER も)・商品管理リストの手の更新も同じ門で止まる (M-2・#1564 Codex R2 High 2)
  *  25 記録の後に足した列 (記録した持ち主に無い) = load として足す・知らない列 = 壊れ (M-4)
+ *  27 持ち主の正を 1 つに (0053・Codex #1564 R2 High 3): 0001〜0053 がそろって入る / 切替の段階を company_owner に進める前提 = epoch が active (差し込み口) /
+ *     段階の owner_hash = active (⑤-1 の段階の行の trigger) / 画面の保存の門 (⑤-1 の ops.begin_master_write) = active (記録に無い列 = load)
  *  26 NE と C で種類が違う SKU (NE でセットを単品に) = その SKU だけ NE の値 (⚠️・証跡)・作り直し全部は止めない (M-5) /
  *     C のセットの構成品に NE にしか無い単品 = 値が混ざる = ⚠️・証跡 (L-2)
  * 使い方: node scripts/test-master-publish.mjs
@@ -1344,6 +1346,81 @@ await ta('[26] NE と C で種類が違う SKU = その SKU だけ NE の値 (�
   db.prepare("DELETE FROM raw_ne_products WHERE 商品コード = 's-only'").run();
   FX.markComplete(db, readNeRawRev);
   assert.equal((await rebuild()).ok, true);
+  await nightly();
+});
+
+await ta('[27] 持ち主の正を 1 つに: 0001〜0053 がそろう・company_owner に進む前提 = epoch が active・段階の owner_hash = active・画面の保存の門 = active', async () => {
+  // (a) 積み方 (master 0050 → ⑤-1 0051 → ⑤-2a 0052 → ④a 0053) がそろって入る・前提の差し込み口に 1 行
+  assert.deepEqual((await q("select version from ops.schema_migrations where version in ('0051', '0052', '0053') order by 1")).map((r) => r.version), ['0051', '0052', '0053']);
+  assert.deepEqual((await q('select name from ops.master_cutover_prereq_checks order by 1')).map((r) => r.name), ['0052_registrations', '0053_ownership_epoch']);
+  const own = OWN('sku_costs'), ownHash = OS.ownershipHashOf(own);
+  const put = async (map) => q(`insert into ops.master_ownership_state (id, active_hash, active_map, activated_by) values (1, $1, $2::jsonb, 'test')
+    on conflict (id) do update set active_hash = excluded.active_hash, active_map = excluded.active_map, prepared_hash = null, prepared_map = null, prepared_at = null, prepared_by = null`,
+  [OS.ownershipHashOf(map), JSON.stringify(map)]);
+  // (b) 前提 (⑤-1 の ops.set_master_cutover_phase が集める): company_owner・new_open に進むのは epoch が active のときだけ
+  const probs = async (from = 'frozen', to = 'company_owner') => (await q('select ops.master_cutover_prereq_problems($1, $2) as p', [from, to]))[0].p.filter((x) => x.startsWith('0053_ownership_epoch'));
+  await q('delete from ops.master_ownership_state');
+  assert.match((await probs()).join(), /epoch_missing/);
+  await put(OS.sortedOwnership(MASTER_OWNERSHIP));
+  assert.match((await probs()).join(), /epoch_all_load/);
+  await put(own);
+  assert.deepEqual(await probs(), []);
+  assert.deepEqual(await probs('company_owner', 'new_open'), []);
+  await OS.prepareOwnership(pdb, { map: OWN('sku_costs', 'skus.shipping'), actor: 't' });
+  assert.match((await probs()).join(), /epoch_prepared_pending/);
+  await OS.cancelPrepared(pdb, { actor: 't' });
+  assert.deepEqual(await probs('legacy_open', 'frozen'), []);   // frozen に進むのは前提なし (activate は frozen のときだけ = 先に止める)
+  // (c) 段階の行 (⑤-1): company_owner に入る owner_hash = active の記録のハッシュだけ (証拠の owner_hash と epoch が同じ)
+  await setCutoverPhase('frozen');
+  const toOwner = async (oh) => {
+    await pdb.query('begin');
+    try { await q("select set_config('ops.cutover_protocol', '1', true)"); await q("update ops.master_cutover_state set phase = 'company_owner', owner_hash = $1 where id = 1", [oh]); await pdb.query('commit'); }
+    catch (e) { await pdb.query('rollback'); throw e; }
+  };
+  await assert.rejects(toOwner('b'.repeat(64)), /cutover_epoch: .*owner_hash_not_active/);
+  await put(OS.sortedOwnership(MASTER_OWNERSHIP));
+  await assert.rejects(toOwner(OS.ownershipHashOf(MASTER_OWNERSHIP)), /cutover_epoch: .*epoch_all_load/);
+  await put(own);
+  await toOwner(ownHash);
+  assert.deepEqual((await q('select phase, owner_hash from ops.master_cutover_state where id = 1'))[0], { phase: 'company_owner', owner_hash: ownHash });
+  // (d) 画面の保存の門 (⑤-1 の ops.begin_master_write・本物の 9 つの引数 = 操作 sku_edit・SKU・編集の印・保存の中身のハッシュ・版):
+  //   段階の記録と同じ持ち主表でも、epoch (active) と違えば始めない。取引は巻き戻す (保存の記録 done を書かないので commit はしない)
+  await setCutoverPhase('new_open', ownHash);
+  const skuNe = Number(await skuId('s-ne'));
+  const begin = async () => {
+    await pdb.query('begin');
+    try {
+      const v = (await q('select ops.master_edit_versions($1) as v', [skuNe]))[0].v;
+      return (await q('select ops.begin_master_write($1::uuid, $2, null, $3::jsonb, $4, $5, $6, $7, $8::jsonb) as r',
+        [crypto.randomUUID(), 'tester', JSON.stringify(own), 'sku_edit', skuNe, 'a'.repeat(64), 'b'.repeat(64), JSON.stringify(v)]))[0].r;
+    } finally { await pdb.query('rollback'); }
+  };
+  // ⑤-2a の新商品の登録 (ops.register_new_sku) も同じ約束の表に sku_create の行を書く = 同じ確かめ (操作で分けない)。行の形は登録の関数と同じ
+  const beginCreate = async () => {
+    await pdb.query('begin');
+    try {
+      await q(`insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions,
+          actor_id, reason, source_system, db_user, phase, owner_hash, ownership)
+        values (gen_random_uuid(), txid_current(), gen_random_uuid(), 'sku_create', $1, '{}'::bigint[], '{}'::bigint[], repeat('0', 64), $2, '{}'::jsonb,
+          'tester', null, 'portal_master_edit', 'master_edit', 'new_open', $3, $4::jsonb)`, [skuNe, 'c'.repeat(64), ownHash, JSON.stringify(own)]);
+      return true;
+    } finally { await pdb.query('rollback'); }
+  };
+  assert.equal((await begin()).phase, 'new_open');   // active = 画面の持ち主表 = 始められる
+  assert.equal(await beginCreate(), true);
+  await put(OWN('sku_costs', 'skus.shipping'));
+  await assert.rejects(begin(), /before_cutover: 持ち主表が持ち主の epoch \(active\) と違う/);
+  await assert.rejects(beginCreate(), /before_cutover: 持ち主表が持ち主の epoch \(active\) と違う/);   // 登録も同じ
+  const partial = { ...OS.sortedOwnership(own) }; delete partial['skus.reorder_months'];   // 記録の後に足した列 (画面では load) = load として同じ
+  await put(partial);
+  assert.equal((await begin()).phase, 'new_open');
+  const noCost = { ...OS.sortedOwnership(own) }; delete noCost.sku_costs;   // 画面は company・記録に無い = load = 違う
+  await put(noCost);
+  await assert.rejects(begin(), /before_cutover: 持ち主表が持ち主の epoch/);
+  await q('delete from ops.master_ownership_state');   // epoch の記録が無い = 全部 load = 違う
+  await assert.rejects(begin(), /before_cutover: 持ち主表が持ち主の epoch/);
+  await assert.rejects(beginCreate(), /before_cutover: 持ち主表が持ち主の epoch/);
+  await setCutoverPhase('legacy_open');
   await nightly();
 });
 

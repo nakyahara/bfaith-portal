@@ -404,7 +404,7 @@ try {
   await M.query('commit');
   // 0001〜0053 が本物の PostgreSQL でそろって入る (master 0050 → ⑤-1 0051 → ⑤-2a 0052 → ④a 0053)
   assert.deepEqual((await M.query("select version from ops.schema_migrations where version in ('0051', '0052', '0053') order by 1")).rows.map((r) => r.version), ['0051', '0052', '0053']);
-  assert.deepEqual((await M.query('select name from ops.master_cutover_prereq_checks order by 1')).rows.map((r) => r.name), ['0052_registrations']);
+  assert.deepEqual((await M.query('select name from ops.master_cutover_prereq_checks order by 1')).rows.map((r) => r.name), ['0052_registrations', '0053_ownership_epoch']);
   await ta('[17] 0053 2 人が同時に最初の prepare = 後の人は前の人の commit を待ってから通る (重複で落ちない・init は 1 回)', async () => {
     await A.query('begin');
     await A.query(`insert into ops.master_ownership_state (id, active_hash, active_map, activated_by) values (1, $1, $2::jsonb, 'A') on conflict (id) do nothing`, [allHash, JSON.stringify(OS.sortedOwnership(OS.ALL_LOAD))]);
