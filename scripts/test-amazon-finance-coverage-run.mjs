@@ -959,6 +959,109 @@ await t('🚨 失敗した順番待ち (#1567 Codex R9 High): 初期の印の no
   await completes('保管物を直して入った');
   assert.ok(db.prepare(`SELECT ingested_at FROM amazon_settlement_manual_files WHERE id = ?`).get(idOf(m2)).ingested_at, '直した保管物は入る');
 });
+await t('🆕 失敗した順番待ちの残りの場面 (#1567 Codex R10・R11 Low 1): (a) 古い失敗の手のファイルは、同じ決済の後から積んだ正常なファイルが入れば外れる (前に入ったファイル・別の決済のファイルでは外れない・古い行は残る) / (b) 生きた coordinator の lease の間は --resolve / --resolve-failed を拒む (関数・CLI の子とも・印は付かない) → lease の後は付けられる / (c) R9 より前の表 = 解決の列が足され、既存の失敗の行は blocker のまま (列が無い間も止まる)', async () => {
+  const { resolveFailedMarker, runMarkerCli: markerCli, parseArgs: markerArgs } = await import('../apps/warehouse/amazon-finance-initial-marker.js');
+  const { resolveManualFile } = await import('../apps/warehouse/amazon-settlement-manual-file.js');
+  const { queueProblems } = await import('../apps/warehouse/amazon-finance-coverage.js');
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+  const r0 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r0.exitCode, 0, `${r0.summary} ${JSON.stringify(r0.reasons)}`); assert.equal((await cov()).state, 'complete', '前提: complete');
+  // 振込日だけ変えた別のファイル (別の hash)。S2・S3 は API の版がある決済 = 手のファイルが入っても採られない (値は変わらない)
+  const vtsv = (sid, deposit) => {
+    const lines = settlementTsv(sid, ...P[sid], L[sid]).split('\n');
+    const cols = lines[0].split('\t'), cells = lines[1].split('\t');
+    cells[cols.indexOf('deposit-date')] = deposit;
+    lines[1] = cells.join('\t');
+    return lines.join('\n');
+  };
+  const qf = (sid, deposit, name) => queueManualFile(db, tmpDir, vtsv(sid, deposit), { fileName: name, now: new Date(NOW), isAlive: () => false });
+  const idOf = (q) => db.prepare(`SELECT id FROM amazon_settlement_manual_files WHERE file_hash = ?`).get(q.fileHash).id;
+  const mrow = (id) => db.prepare(`SELECT ingested_at, resolved_at FROM amazon_settlement_manual_files WHERE id = ?`).get(id);
+  const mkrow = (id) => db.prepare(`SELECT failed_at, resolved_at FROM initial_marker_queue WHERE id = ?`).get(id);
+  const once = async () => { const fx = spyFetch(); const r = await run({ fetchImpl: fx }); return { r, fx, c: codes(r) }; };
+
+  // ── (a) 古い失敗の手のファイル → 同じ決済の後から積んだ正常なファイルが入れば外れる ──
+  const prevS2 = db.prepare(`SELECT MAX(id) m FROM amazon_settlement_manual_files WHERE settlement_id = 'S2' AND ingested_at IS NOT NULL`).get().m;
+  assert.ok(prevS2, '前提: S2 には前に入った手のファイルがある (R9 の試験)');
+  const old = qf('S2', '2026/02/13 10:00:00 UTC', 'r10-old-failed.txt');
+  fs.rmSync(old.storedPath);   // 保管物を失くした = 取り込めない
+  let x = await once();
+  assert.ok(x.c.includes('manual_file_not_ingested') && x.fx.calls.complete === 0, `前に入った同じ決済のファイル (#${prevS2}) では外れない: ${x.c}`);
+  const otherS3 = qf('S3', '2026/02/24 10:00:00 UTC', 'r10-other-settlement.txt');
+  x = await once();
+  assert.ok(mrow(idOf(otherS3)).ingested_at, '別の決済 (S3) の正常なファイルは入る');
+  assert.ok(x.c.includes('manual_file_not_ingested') && x.fx.calls.complete === 0, `別の決済のファイルが入っても外れない: ${x.c}`);
+  const fresh = qf('S2', '2026/02/14 10:00:00 UTC', 'r10-fresh.txt');
+  x = await once();
+  assert.equal(x.r.exitCode, 0, `${x.r.summary} ${JSON.stringify(x.r.reasons)}`);
+  assert.ok(!x.c.includes('manual_file_not_ingested'), x.c.join(','));
+  assert.equal(x.fx.calls.complete, 1, '同じ決済の後のファイルが入った = complete'); assert.equal((await cov()).state, 'complete');
+  assert.ok(mrow(idOf(fresh)).ingested_at);
+  assert.deepEqual(mrow(idOf(old)), { ingested_at: null, resolved_at: null }, '古い失敗の行は残る (入っていない・解決の印も無い) = 後のファイルで外れただけ');
+  assert.deepEqual(queueProblems(db), []);
+
+  // ── (b) 生きた coordinator の lease の間は解決の印を付けない ──
+  const bad = qf('S2', '2026/02/15 10:00:00 UTC', 'r10-lease.txt');
+  fs.rmSync(bad.storedPath);
+  const qm = remark();
+  db.prepare(`UPDATE initial_marker_queue SET detail_digest = 'x' WHERE id = ?`).run(qm.queueId);
+  x = await once();
+  assert.ok(x.c.includes('manual_file_not_ingested') && x.c.includes('marker_queue_failed') && x.fx.calls.complete === 0, x.c.join(','));
+  // lease を「生きている coordinator」= この試験の node (pid・今の本当の時刻) が持つ (CLI の子は本物の生きている判定 isAliveNodeSince で見る)
+  const held = V.acquireCoverageLease(db, { isAlive: () => false, pid: process.pid, now: new Date() });
+  assert.ok(held.ok, '前提: lease を取れた');
+  try {
+    assert.throws(() => resolveManualFile(db, idOf(bad), { note: '試験', isAlive: () => true }), /coordinator の回が動いている.*手の決済のファイルの解決の印を積まない/);
+    assert.throws(() => resolveFailedMarker(db, qm.queueId, { note: '試験', isAlive: () => true }), /coordinator の回が動いている.*初期の印の解決の印を積まない/);
+    assert.throws(() => markerCli(db, markerArgs(['--resolve-failed', String(qm.queueId), '--note', '試験']), { log: () => {}, now: new Date(NOW), isAlive: () => true }), /coordinator の回が動いている/);
+    const env = { ...process.env, DATA_DIR: tmpDir };
+    const c1 = spawnSync(process.execPath, ['apps/warehouse/amazon-settlement-manual-file.js', '--resolve', String(idOf(bad)), '--note', '試験 CLI'], { cwd: repoRoot, env, encoding: 'utf8' });
+    assert.notEqual(c1.status, 0, `手のファイルの CLI --resolve は拒む: ${c1.stdout}${c1.stderr}`); assert.match(c1.stdout + c1.stderr, /coordinator の回が動いている/);
+    const c2 = spawnSync(process.execPath, ['apps/warehouse/amazon-finance-initial-marker.js', '--resolve-failed', String(qm.queueId), '--note', '試験 CLI'], { cwd: repoRoot, env, encoding: 'utf8' });
+    assert.notEqual(c2.status, 0, `初期の印の CLI --resolve-failed は拒む: ${c2.stdout}${c2.stderr}`); assert.match(c2.stdout + c2.stderr, /coordinator の回が動いている/);
+    assert.equal(mrow(idOf(bad)).resolved_at, null, '手のファイルに解決の印は付いていない');
+    assert.equal(mkrow(qm.queueId).resolved_at, null, '初期の印に解決の印は付いていない');
+  } finally { assert.ok(V.releaseCoverageLease(db, held.lease), 'lease を放した'); }
+  //   lease を放した後は付けられる (CLI の子でも) → complete
+  const c3 = spawnSync(process.execPath, ['apps/warehouse/amazon-settlement-manual-file.js', '--resolve', String(idOf(bad)), '--note', '試験 CLI: lease の後'], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
+  assert.equal(c3.status, 0, c3.stdout + c3.stderr);
+  resolveFailedMarker(db, qm.queueId, { note: '試験: lease の後', isAlive: () => true });
+  assert.ok(mrow(idOf(bad)).resolved_at && mkrow(qm.queueId).resolved_at);
+  x = await once();
+  assert.equal(x.r.exitCode, 0, `${x.r.summary} ${JSON.stringify(x.r.reasons)}`); assert.equal(x.fx.calls.complete, 1); assert.equal((await cov()).state, 'complete');
+
+  // ── (c) R9 より前の表 (解決の列が無い) = 列が足された後も、既存の失敗の行は blocker のまま ──
+  const prePath = snapOf(db, 'pre-r9.db');
+  const o = new Database(prePath);
+  try {
+    o.exec(`DROP TABLE initial_marker_queue; DROP TABLE amazon_settlement_manual_files;`);
+    // R9 の前 (2f3066e6) の表の形 = resolved_at / resolve_note が無い
+    o.exec(`CREATE TABLE initial_marker_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, queue_key TEXT NOT NULL, source_file_name TEXT, source_file_hash TEXT NOT NULL, norm_json TEXT NOT NULL,
+        detail_digest TEXT NOT NULL, queued_at TEXT NOT NULL, applied_at TEXT, applied_generation INTEGER, marker_id TEXT, evidence_epoch INTEGER, failed_at TEXT, apply_note TEXT);
+      CREATE TABLE amazon_settlement_manual_files (id INTEGER PRIMARY KEY AUTOINCREMENT, file_hash TEXT NOT NULL UNIQUE, file_name TEXT, stored_path TEXT NOT NULL,
+        format TEXT NOT NULL CHECK (format IN ('v1', 'v2')), settlement_id TEXT NOT NULL, queued_at TEXT NOT NULL, ingested_at TEXT, ingest_generation INTEGER, ingest_note TEXT);`);
+    o.prepare(`INSERT INTO initial_marker_queue (queue_key, source_file_hash, norm_json, detail_digest, queued_at, failed_at, apply_note) VALUES ('qk-old', 'h-old', '{}', 'd', '2026-03-01T00:00:00Z', '2026-03-02T00:00:00Z', '試験: R9 の前に失敗した印')`).run();
+    o.prepare(`INSERT INTO amazon_settlement_manual_files (file_hash, file_name, stored_path, format, settlement_id, queued_at, ingest_note) VALUES ('fh-old', 'old.txt', 'C:/nowhere/old.txt', 'v2', 'S-OLD', '2026-03-01T00:00:00Z', '試験: R9 の前に取り込めなかった')`).run();
+    const cols = (tb) => o.prepare(`PRAGMA table_info(${tb})`).all().map((c) => c.name);
+    assert.ok(!cols('initial_marker_queue').includes('resolved_at') && !cols('amazon_settlement_manual_files').includes('resolved_at'), '前提: 解決の列が無い');
+    const qcodes = () => queueProblems(o).map((p) => p.code).sort();
+    assert.deepEqual(qcodes(), ['manual_file_not_ingested', 'marker_queue_failed'], '列が無い間も止まる');
+    V.createSettlementVersionSchema(o);   // R9 の後の initDB と同じ = 列を足す
+    for (const tb of ['initial_marker_queue', 'amazon_settlement_manual_files']) assert.ok(cols(tb).includes('resolved_at') && cols(tb).includes('resolve_note'), `${tb} に解決の列が足された`);
+    assert.deepEqual(o.prepare(`SELECT failed_at IS NOT NULL f, resolved_at FROM initial_marker_queue`).all(), [{ f: 1, resolved_at: null }], '既存の失敗の印は残る');
+    assert.deepEqual(o.prepare(`SELECT ingested_at, resolved_at FROM amazon_settlement_manual_files`).all(), [{ ingested_at: null, resolved_at: null }], '既存の取り込めない手のファイルは残る');
+    assert.deepEqual(qcodes(), ['manual_file_not_ingested', 'marker_queue_failed'], '列を足した後も blocker のまま (足しただけで外れない)');
+    V.createSettlementVersionSchema(o);   // 2 回目の準備でも変わらない (冪等)
+    assert.deepEqual(qcodes(), ['manual_file_not_ingested', 'marker_queue_failed']);
+    //   足した列で解決の印を付ければ外れる
+    resolveFailedMarker(o, o.prepare(`SELECT id FROM initial_marker_queue`).get().id, { note: '試験: R9 の前の失敗を諦める', isAlive: () => false });
+    assert.deepEqual(qcodes(), ['manual_file_not_ingested']);
+    resolveManualFile(o, o.prepare(`SELECT id FROM amazon_settlement_manual_files`).get().id, { note: '試験: R9 の前の失敗を諦める', isAlive: () => false });
+    assert.deepEqual(qcodes(), []);
+  } finally { o.close(); }
+});
 await t('🚨 一覧の窓の空白 (前の成功した回から 85 日以上あいた) = complete にしない (⚠️ evidence_chain_gap = Seller Central で印を作り直す)・長く止まった後の取込の一覧も同じ 85 日の窓 (止まっている間に窓の外に出た report は取込まない・#1567 Codex R4)', async () => {
   NOW = Date.parse('2026-07-15T00:00:00Z');   // 前の回 (上の試験の 4/10) から 85 日より後
   const ingQ = [];
