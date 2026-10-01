@@ -13,6 +13,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
 import { isWarnSummary } from './amazon-fees-outcome.js';
+import { isMonthStartGraceSummary, monthStartEmptyGrace, monthStartGraceDays, prevMonthOf } from './finance-dq-month-mode.js';
 import { waitOtherRunGone, isAliveNodeSince, remainingRetrySlots } from './retry-lock.js';
 import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS } from './amazon-finance-months.js';
 
@@ -244,7 +245,6 @@ function runScript(scriptPath, label, timeoutMs = 600000, { retryLibuvCrash = fa
   }
 }
 
-/** Date を JST (UTC+9) の YYYY-MM-DD に変換 */
 /** coordinator (amazon-finance-coverage-run.js) の最後の回の記録から「この daily-sync の回で財務を送ったか」 */
 export function coordinatorPushedFinance(dataDir, runId) {
   try {
@@ -254,6 +254,17 @@ export function coordinatorPushedFinance(dataDir, runId) {
   } catch { return false; }
 }
 
+// ─── finance DQ の月初の猶予 (PR #1572。判定は finance-dq-month-mode.js の decideMonthStartEmpty) ───
+// この回のモールの取込が ❌ なら DQ に猶予を禁じる (= 当月 0 行は猶予なしで CRITICAL。取込が止まった朝に 0 行を「月初だから」と通さない)
+// 渡した結果が 1 つでも ❌ (か無い) なら禁じる。Yahoo は月初の前月の build / DQ の結果も一緒に渡す (R2)
+function monthStartGraceFlag(...results) { return results.length > 0 && results.every((r) => r && r.success) ? '' : ' --no-month-start-grace'; }
+// 1 行ごとの印: 失敗 ❌ / 見送り ⏸️ / warn つきの成功 ⚠️ (月初の猶予の DQ など。R2) / 成功 ✅
+function resultIcon(r) { return r.skipped ? '⏸️' : (r.success ? (r.warn === true ? '⚠️' : '✅') : '❌'); }
+// 月初の猶予で通した DQ (最後の行が「⚠️ 月初の猶予:」) は warn = 見出しを ⚠️ にし、通知が落ちた朝に lock を残す。
+// ほかの ⚠️ (検査の warn つきの合格「⚠️  DQ gate passed with N warning(s)」) は今までどおり warn にしない
+function dqMonthStartWarn(r) { return r.success && isMonthStartGraceSummary(r.summary); }
+
+/** Date を JST (UTC+9) の YYYY-MM-DD に変換 */
 function toJstDate(d) {
   const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
   return jst.toISOString().slice(0, 10);
@@ -931,10 +942,10 @@ async function main() {
 
     if (rakutenFinanceBuildResult.success) {
       const rakutenFinanceDqResult = runScript(
-        `apps/warehouse/run-rakuten-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
+        `apps/warehouse/run-rakuten-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}${monthStartGraceFlag(rkResult)}`,
         '楽天 finance DQ', 300000
       );
-      results.push({ name: '楽天 finance DQ', ...rakutenFinanceDqResult });
+      results.push({ name: '楽天 finance DQ', ...rakutenFinanceDqResult, warn: dqMonthStartWarn(rakutenFinanceDqResult) });
 
       if (rakutenFinanceDqResult.success) {
         // CHUNK_SIZE は Amazon と共有 (上で 3000 set 済)
@@ -1125,11 +1136,40 @@ async function main() {
     results.push({ name: 'Yahoo finance build', ...yahooFinanceBuildResult });
 
     if (yahooFinanceBuildResult.success) {
+      // 月初の猶予の間は前月も build → DQ → sync する (PR #1572 R1/R2)。Yahoo の build は 1 か月だけ = 前月の終わりの止まり・品質を
+      // 月初に見る機会がほかに無い。当月の DQ (前月の新しさを見る) より先に前月を作り直す。
+      // 前月の build か DQ が ❌ なら、当月の DQ に猶予を禁じる (前月を安全の証拠に使えない朝は 0 行を通さない。R2)。
+      // 前月の DQ が通れば前月も sync する (作り直した前月を Render にも送る = SQLite と Render の前月がずれたままにならない。ほかのモールの 3 か月の sync と同じ)
+      const yahooPrevSteps = [];
+      if (monthStartEmptyGrace(currentMonth, { now: startTime, graceDays: monthStartGraceDays('yahoo', currentMonth) }).grace) {
+        const yahooPrevYm = prevMonthOf(currentMonth);
+        const yahooPrevBuild = runScript(
+          `scripts/yahoo-finance/build-yahoo-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${yahooPrevYm}`,
+          `Yahoo finance build ${yahooPrevYm} (月初の前月)`, 600000
+        );
+        yahooPrevSteps.push(yahooPrevBuild);
+        results.push({ name: `Yahoo finance build ${yahooPrevYm} (月初の前月)`, ...yahooPrevBuild });
+        if (yahooPrevBuild.success) {
+          const yahooPrevDq = runScript(
+            `apps/warehouse/run-yahoo-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${yahooPrevYm}`,
+            `Yahoo finance DQ ${yahooPrevYm} (月初の前月)`, 300000
+          );
+          yahooPrevSteps.push(yahooPrevDq);
+          results.push({ name: `Yahoo finance DQ ${yahooPrevYm} (月初の前月)`, ...yahooPrevDq, warn: dqMonthStartWarn(yahooPrevDq) });
+          if (yahooPrevDq.success) {
+            const yahooPrevSync = runScript(
+              `apps/warehouse/sync-yahoo-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${yahooPrevYm}`,
+              `Yahoo finance sync ${yahooPrevYm} (月初の前月)`, 600000
+            );
+            results.push({ name: `Yahoo finance sync ${yahooPrevYm} (月初の前月)`, ...yahooPrevSync });
+          }
+        }
+      }
       const yahooFinanceDqResult = runScript(
-        `apps/warehouse/run-yahoo-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
+        `apps/warehouse/run-yahoo-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}${monthStartGraceFlag(yahooResult, ...yahooPrevSteps)}`,
         'Yahoo finance DQ', 300000
       );
-      results.push({ name: 'Yahoo finance DQ', ...yahooFinanceDqResult });
+      results.push({ name: 'Yahoo finance DQ', ...yahooFinanceDqResult, warn: dqMonthStartWarn(yahooFinanceDqResult) });
 
       if (yahooFinanceDqResult.success) {
         const yahooFinanceSyncResult = runScript(
@@ -1165,10 +1205,10 @@ async function main() {
       });
       for (const ym of aupayRollingMonths) {
         const aupayFinanceDqResult = runScript(
-          `apps/warehouse/run-aupay-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}`,
+          `apps/warehouse/run-aupay-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}${monthStartGraceFlag(aupayResult)}`,
           `au PAY finance DQ ${ym}`, 300000
         );
-        results.push({ name: `au PAY finance DQ ${ym}`, ...aupayFinanceDqResult });
+        results.push({ name: `au PAY finance DQ ${ym}`, ...aupayFinanceDqResult, warn: dqMonthStartWarn(aupayFinanceDqResult) });
 
         if (aupayFinanceDqResult.success) {
           const aupayFinanceSyncResult = runScript(
@@ -1205,10 +1245,10 @@ async function main() {
       });
       for (const ym of linegiftRollingMonths) {
         const linegiftFinanceDqResult = runScript(
-          `apps/warehouse/run-linegift-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}`,
+          `apps/warehouse/run-linegift-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}${monthStartGraceFlag(linegiftResult)}`,
           `LINEギフト finance DQ ${ym}`, 300000
         );
-        results.push({ name: `LINEギフト finance DQ ${ym}`, ...linegiftFinanceDqResult });
+        results.push({ name: `LINEギフト finance DQ ${ym}`, ...linegiftFinanceDqResult, warn: dqMonthStartWarn(linegiftFinanceDqResult) });
 
         if (linegiftFinanceDqResult.success) {
           const linegiftFinanceSyncResult = runScript(
@@ -1263,10 +1303,10 @@ async function main() {
       });
       for (const ym of qoo10RollingMonths) {
         const qoo10FinanceDqResult = runScript(
-          `apps/warehouse/run-qoo10-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}`,
+          `apps/warehouse/run-qoo10-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}${monthStartGraceFlag(qoo10Result)}`,
           `Qoo10 finance DQ ${ym}`, 300000
         );
-        results.push({ name: `Qoo10 finance DQ ${ym}`, ...qoo10FinanceDqResult });
+        results.push({ name: `Qoo10 finance DQ ${ym}`, ...qoo10FinanceDqResult, warn: dqMonthStartWarn(qoo10FinanceDqResult) });
 
         if (qoo10FinanceDqResult.success) {
           const qoo10FinanceSyncResult = runScript(
@@ -1684,7 +1724,7 @@ async function main() {
   const icon = allOk ? '✅' : '⚠️';
   let msg = `${icon} *Warehouse日次同期 ${dateStr}* (${duration}秒)\n`;
   for (const r of results) {
-    const icon = r.skipped ? '⏸️' : (r.success ? '✅' : '❌');
+    const icon = resultIcon(r);
     msg += `${icon} ${r.name}: ${r.summary}\n`;
   }
   if (retryableFailed.length > 0) {

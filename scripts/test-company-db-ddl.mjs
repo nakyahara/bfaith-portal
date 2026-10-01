@@ -173,6 +173,25 @@ await ta('[!] 0049 (13 §3.5・§3.6・D7b-3): Amazon の利益の mart = 関数
   assert.equal(tables[0].n, 0);
 });
 
+await ta('[!] 0050 (13 §3.1・D7b-1b-2): 決済のそろい core.finance_coverage = 会社 × モール × scope × source の 1 行・core.finance_coverage_state は同じ形のまま差し替え (行なし = 全部 null)', async () => {
+  const pk = await q(`select a.attname as c from pg_index i join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
+    where i.indrelid = 'core.finance_coverage'::regclass and i.indisprimary order by array_position(i.indkey, a.attnum)`);
+  assert.deepEqual(pk.map((r) => r.c), ['company_id', 'mall', 'scope_key', 'source']);
+  const ck = await q(`select conname as n from pg_constraint where conrelid = 'core.finance_coverage'::regclass and contype = 'c' and conname like 'ck\\_finance\\_coverage\\_%' order by 1`);
+  assert.deepEqual(ck.map((r) => r.n), ['ck_finance_coverage_complete', 'ck_finance_coverage_complete_to', 'ck_finance_coverage_evidence', 'ck_finance_coverage_invalidated', 'ck_finance_coverage_receipts']);
+  assert.equal((await q(`select pg_get_function_result('core.finance_coverage_state(smallint,text,text,text)'::regprocedure) as r`))[0].r, 'TABLE(complete_to date, generation bigint, source_revision bigint)');
+  assert.deepEqual(await q(`select * from core.finance_coverage_state(1::smallint, 'amazon', 'jp', 'amazon_settlement_unified')`), [{ complete_to: null, generation: null, source_revision: null }]);
+  assert.equal((await q(`select count(*)::int as n from core.finance_coverage`))[0].n, 0);   // 作るだけ (値は coordinator = D7b-1b-3 が送る)
+  // policy の指紋 (#1561 Codex R2 High) と、0047 の関数の差し替え (partial = coverage 基準・同じ引数と戻り・R2 Medium)
+  assert.match((await q(`select core.finance_policy_fingerprint(1::smallint, 'amazon', 'jp') as f`))[0].f, /^[0-9a-f]{64}$/);
+  const src = (await q(`select prosrc as s from pg_proc where oid = 'mart.finance_daily_sku_range(smallint,text,text,date,date)'::regprocedure`))[0].s;
+  assert.ok(src.includes('core.finance_month_settled') && !src.includes('statement_timestamp'), '0047 の partial が今日基準のまま');
+  // 0049 の行の関数の再判定も「月の全部の日」(#1561 Codex R3 High 1)。返品の日の source の complete_to だけの旧い式は残っていない
+  const rows = (await q(`select prosrc as s from pg_proc where proname = '_amazon_profit_rows'`))[0].s;
+  assert.ok(rows.includes('core.finance_month_settled') && !rows.includes('d.complete_to is null or'), '0049 の再判定が返品の日の source だけのまま');
+  assert.deepEqual(await q(`select source_policy_count, origin_from::text as o from core.finance_policy_snapshot(1::smallint, 'amazon', 'jp', 'amazon_settlement_unified')`), [{ source_policy_count: 1, o: '2026-01-01' }]);
+});
+
 await ta('[!] 03 §10: 円の金額列 (*_jpy) はすべて bigint', async () => {
   const rows = await q("select table_schema, table_name, column_name, data_type from information_schema.columns where column_name like '%\\_jpy%' escape '\\' and table_schema in ('core','snapshots','events','ai','mart') and data_type <> 'bigint'");
   assert.deepEqual(rows, [], JSON.stringify(rows));
