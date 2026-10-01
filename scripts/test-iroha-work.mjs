@@ -2552,6 +2552,21 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
             const ev = db.prepare("SELECT from_value, to_value FROM f_iroha_app_events WHERE action = 'master_edit' ORDER BY id DESC LIMIT 1").get();
             ok(/313ビニール袋/.test(ev.to_value || ''), '🚨操作履歴に資材の中身が残る (あとから戻せる)');
 
+            // 🚨読めない指定は 400 で返す。「変更なし」の 200 で黙って捨てない (Codex 2026-10-01)
+            const verNow = () => db.prepare("SELECT version FROM f_iroha_work_master WHERE code_key = 'size-a'").get().version;
+            const badPer = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+              fields: { materials: [{ code: 'D-8', usage: 'inner_pack', units_per_pack: 100001 }] },
+              worker_id: staffP.id, pin: '4649', expect_version: verNow() } });
+            ok(badPer.status === 400 && badPer.json.error === 'bad_units_per_pack', '小分けの数が大きすぎれば 400');
+            const tooMany = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+              fields: { materials: [{ code: 'A' }, { code: 'B' }, { code: 'C' }] },
+              worker_id: staffP.id, pin: '4649', expect_version: verNow() } });
+            ok(tooMany.status === 400 && tooMany.json.error === 'too_many_materials', '上限を超えたら 400');
+            const badUse = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+              fields: { materials: [{ code: 'A', usage: 'なんとか' }] },
+              worker_id: staffP.id, pin: '4649', expect_version: verNow() } });
+            ok(badUse.status === 400 && badUse.json.error === 'bad_usage', '知らない使い道も 400');
+
             // マスタで「資材なし」にしたら、カードの古い資材が復活しない
             const ver = () => db.prepare("SELECT version FROM f_iroha_work_master WHERE code_key = 'size-a'").get().version;
             const cleared = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
@@ -8712,6 +8727,75 @@ console.log('\n[資材 2 つ] 🧰 小分けの袋も登録できる (2026-10-01
   ok(/x\.usage === 'inner_pack' \? '小分けの袋 ' : '資材 '/.test(html), '足りない資材の申告も資材ごとに選べる');
   const fac = fs.readFileSync(new URL('../apps/iroha-work/views/facility.html', import.meta.url), 'utf8');
   ok(/Array\.isArray\(w\.materials\)/.test(fac) && /小分けの袋/.test(fac), '外部施設の画面にも資材が 2 つとも出る');
+
+  // 小分けの数は整数だけ (parseInt だと "1.5" が 1 になって、作業の指示が黙って変わる — Codex 2026-10-01)
+  api.pickOptEl({ dataset: { code: '袋' } }, 'material');
+  api.matUse(0, 1);
+  // 1e2 は Number() では 100 = 正しい整数なので受ける (parseInt なら 1 に化けていた)
+  for (const bad of ['1.5', '0', '-3', 'あ', '10.0001']) {
+    api.matPer(0, bad);
+    ok(picked()[0].units_per_pack === undefined, `小分けの数に「${bad}」は入れない (未登録のままにする)`);
+  }
+  api.matPer(0, '1e2');
+  ok(picked()[0].units_per_pack === 100, '1e2 は 100 として入る (parseInt なら 1 に化けていた)');
+  api.matPer(0, '10');
+  ok(picked()[0].units_per_pack === 10, '整数なら入る');
+
+  // 画面とサーバーで上限の数がずれていないか (ずれると「API では 3 件入るのに画面は 2 件まで」になる)
+  const libSrc = fs.readFileSync(new URL('../lib/iroha-materials.js', import.meta.url), 'utf8');
+  const libMax = Number((libSrc.match(/export const MAX_MATERIALS = (\d+);/) || [])[1]);
+  const libPer = Number((libSrc.match(/export const MAX_UNITS_PER_PACK = (\d+);/) || [])[1]);
+  const uiMax = Number((html.match(/const MAT_MAX = (\d+);/) || [])[1]);
+  const uiPer = Number((html.match(/const MAT_PER_MAX = (\d+);/) || [])[1]);
+  ok(libMax === uiMax && libMax === 2, `資材の上限は画面とサーバーで同じ (lib ${libMax} / 画面 ${uiMax})`);
+  ok(libPer === uiPer, `小分けの数の上限も同じ (lib ${libPer} / 画面 ${uiPer})`);
+  ok(/2 つまで/.test(html) && /2 つまで/.test(fs.readFileSync(new URL('../apps/iroha-work/views/manual.html', import.meta.url), 'utf8')),
+    'つかいかたにも同じ数が書いてある');
+
+  // 🚨資材の名前は人が登録した文字列。一覧の要約に生のまま入れない (stored XSS — Codex 2026-10-01)
+  {
+    const escSrc = html.match(/const esc = s => [^\n]+/)[0];
+    const sumSrc = html.match(/function masterSummary\(c\) \{[\s\S]*?\n\}/)[0];
+    const f = new Function(escSrc + '\n' + sumSrc + '; return { esc, masterSummary };')();
+    const evil = '<img src=x onerror=alert(1)>';
+    const out = f.esc(f.masterSummary({ master: { materials: [{ code: evil }], storage_container: null } }));
+    ok(!out.includes('<img') && out.includes('&lt;img'), '一覧の要約は資材の名前をエスケープして出す');
+    ok(/esc\(masterSummary\(c\)\)/.test(html), '呼び出し側で esc を通している');
+  }
+
+  // 保存の経路 (実物の saveMaster を取り出して動かす)
+  {
+    const smSrc = html.match(/async function saveMaster\(\) \{[\s\S]*?\n\}/)[0];
+    const run = async ({ loadOk, response }) => {
+      const els = {
+        mvMsg: { textContent: '' }, mvPin: { value: '', focus() {} }, mvPinRow: { style: {} },
+        mvSave: { disabled: false }, mvCancel: { disabled: false },
+        mvMaterial: { value: JSON.stringify([{ code: 'D-8' }, { code: '袋', usage: 'inner_pack', units_per_pack: 10 }]) },
+        mvContainer: { value: '' }, mvUnits: { value: '' }, mvProcess: { value: '' }, mvNote: { value: '' }, mvSeal: { value: '' },
+      };
+      const blank = { materials: '[]', storage_container: '', units_per_container: '', process_count: '', note: '', expiry_seal: '' };
+      let sentBody = null;
+      const save = new Function('mvSaving', 'worker', 'mvCtx', 'can', 'document', '$', 'apiFetch', 'settleForceClose',
+        'closeOverlay', 'loadState', 'state', 'toast', 'renderOpts', 'renderMatPicked', 'mvValues', 'MV_MAP',
+        smSrc + '; return saveMaster;')(
+        false, { id: 1 }, { cardId: 5, code: 'X-1', version: 2, values: { ...blank }, field: 'materials' },
+        () => true,
+        { getElementById: (id) => els[id] || { value: '', textContent: '' } },
+        (sel) => els[String(sel).replace('#', '')] || { textContent: '', value: '', style: {}, focus() {} },
+        async (url, opt) => { sentBody = JSON.parse(opt.body); return response; },
+        () => {}, () => {}, async () => loadOk, { cards: [] }, () => {}, () => {}, () => {}, () => ({ ...blank }),
+        { materials: 'mvMaterial', storage_container: 'mvContainer', units_per_container: 'mvUnits',
+          process_count: 'mvProcess', note: 'mvNote', expiry_seal: 'mvSeal' });
+      await save();
+      return { els, sentBody };
+    };
+    const okCase = await run({ loadOk: true, response: { ok: true } });
+    ok(Array.isArray(okCase.sentBody.fields.materials) && okCase.sentBody.fields.materials[1].units_per_pack === 10,
+      '保存では資材を配列で送る (JSON の文字列のまま送らない)');
+    const conflict = await run({ loadOk: false, response: { ok: false, error: 'conflict', message: '他の人が先に更新しました' } });
+    ok(/読み込めませんでした/.test(conflict.els.mvMsg.textContent),
+      '🚨競合のあと最新を取り直せなかったら「最新にしました」と言わない (古い内容で送り直させない)');
+  }
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

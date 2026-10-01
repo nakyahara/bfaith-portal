@@ -92,7 +92,7 @@ import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task
 import { listInboundPlan } from './inbound-plan.js';
 import { startConsignment, markPrepared, markHanded, cancelConsignment, recordReturn, settleConsignment, getConsignment, updateReturnCounts } from './consign.js';
 import { startStaffUnlock, staffUnlockOf, endStaffUnlock, STAFF_UNLOCK_MS } from './db.js';
-import { materialsOf, withPrimaryCode } from '../../lib/iroha-materials.js';
+import { materialsOf, withPrimaryCode, canonicalizeMaterials } from '../../lib/iroha-materials.js';
 import {
   addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, recordMediaCancel, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
   reportMediaUnavailable, recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
@@ -1549,6 +1549,13 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   }
   const fields = {};
   for (const f of MASTER_FIELDS) if (f in fieldsIn) fields[f] = fieldsIn[f];
+  // 🚨 資材は**ここで一度検証する**。あとの「変更があるか」の判定より前に弾かないと、
+  //    読めない指定が「変更なし」に見えて 200 で返り、入力が黙って消える (Codex 2026-10-01)
+  if ('materials' in fields) {
+    const mv = canonicalizeMaterials(fields.materials);
+    if (!mv.ok) return res.status(400).json({ ok: false, error: mv.error, message: mv.message });
+    fields.materials = mv.materials;   // 以降は正規化した形で見る (比較も保存も同じものを使う)
+  }
   const ignoredFields = DEPRECATED_MASTER_FIELDS.filter((f) => f in fieldsIn);
   if (Object.keys(fields).length === 0) {
     // 廃止した項目しか送ってこない古い画面 (キャッシュの残った iPad) は「変えなかった」で返す。

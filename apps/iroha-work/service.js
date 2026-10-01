@@ -185,7 +185,10 @@ export function classifyMasterEdit(row, fields) {
       // 🚨 すでに資材が入っているカードに 2 件目を足すのは**既存の指示を変える**操作 = 職員のみ (Codex)
       const curList = materialsOf(row);
       const parsed = canonicalizeMaterials(nv);
-      const nextList = parsed.ok ? parsed.materials : [];
+      // 🚨 読めない指定を「空」と見なして「変更なし」にしない。黙って捨てると画面には
+      //    「変更はありませんでした」と出てしまう (Codex 2026-10-01)。変更として扱い、呼び元が 400 にする
+      if (!parsed.ok) { (curList.length === 0 ? fills : overwrites).push(f); continue; }
+      const nextList = parsed.materials;
       if (sameMaterials(curList, nextList)) continue;
       if (curList.length === 0) fills.push(f);
       else overwrites.push(f);

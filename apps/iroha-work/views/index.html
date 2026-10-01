@@ -672,7 +672,9 @@
     padding:8px 6px;font-size:.88rem;font-weight:700;cursor:pointer;font-family:var(--font);min-height:44px}
   .matuse button.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
   .matper{display:flex;align-items:center;gap:8px;margin-top:8px}
+  .matper{flex-wrap:wrap}
   .matper label{margin:0;flex:none}
+  .matper .perhint{flex-basis:100%;font-size:.78rem;color:var(--amber);font-weight:700}
   /* .mfields input{width:100%} より後に効かせる (型つきの方が強い)。数は 3 桁も見えれば十分 */
   .matper input[type=number]{width:110px;flex:none}
   .matpicked .none{color:var(--sub);font-size:.86rem}
@@ -1570,6 +1572,9 @@ async function loadStateOnce() {
     }
     else forceCloseDetail('このカードは一覧から外れました');
   }
+  // 取り直せたことを呼び元に伝える (失敗した経路は上で return 済み = undefined)。
+  // 競合のあとにフォームを組み直してよいかの判断に使う (Codex 2026-10-01)
+  return true;
 }
 
 /** 正本モードで変わる固定文言 (状態変更ダイアログの注意書き・更新ボタン) */
@@ -1723,7 +1728,7 @@ function renderList() {
       boxesText(c) ? '📦 ' + esc(boxesText(c, { short: true })) : null,
       c.plan_hours != null ? '⏱ ' + esc(approxHours(c.plan_hours)) : null,
       c.arrival ? '入庫 ' + esc(c.arrival) : null,
-      masterSummary(c) || null,
+      esc(masterSummary(c)) || null,   // 🚨資材・保管箱の名前は人が登録した文字列。必ずエスケープして入れる
     ].filter(Boolean).join(' ・ ');
     // 在庫日数・売上・外部出し目安は職員の判断材料 → 職員モードのときだけ (利用者の一覧から外す — 監修 F-5)
     const staffUI = isStaffUI();
@@ -4858,7 +4863,8 @@ function optImgFail(el) { if (el.parentNode) el.parentNode.textContent = '📦';
 // 値は #mvMaterial に **JSON の配列** で持つ ([{code, usage, units_per_pack}])。
 // 保存は「開いた時点との差分」なので、文字列で比べられる形にしておく
 // 🚨 画面で選べるのは 2 つまで (現場の要望は「袋をもう 1 つ」)。サーバーは 3 つまで許す = 余裕
-const MAT_MAX = 2;
+const MAT_MAX = 2;           // 🚨 lib/iroha-materials.js の MAX_MATERIALS と同じ数にすること (テストが見張っている)
+const MAT_PER_MAX = 100000;  // 小分けの数の上限 (同じく MAX_UNITS_PER_PACK と合わせる)
 function matList() {
   try { const v = JSON.parse(document.getElementById('mvMaterial').value || '[]'); return Array.isArray(v) ? v : []; }
   catch (e) { return []; }   // 壊れていたら空から選び直してもらう (画面を止めない)
@@ -4888,7 +4894,7 @@ function renderMatPicked() {
       + (inner ? '<div class="matper"><label>この袋に</label>'
           + '<input type="number" min="1" step="1" inputmode="numeric" aria-label="この袋に入れる数"'
           + ' value="' + esc(per) + '" oninput="matPer(' + i + ', this.value)">'
-          + '<label>個ずつ入れる</label></div>' : '')
+          + '<label>個ずつ入れる</label><span class="perhint" id="matPerHint' + i + '"></span></div>' : '')
       + '</div>';
   }).join('');
 }
@@ -4903,10 +4909,16 @@ function matUse(i, innerFlag) {
 function matPer(i, v) {
   const l = matList();
   if (!l[i]) return;
-  const n = parseInt(String(v).trim(), 10);
+  const t = String(v).trim();
+  // 🚨 parseInt は "1.5" を 1、"1e2" を 1 として通してしまう。作業の指示が黙って違う数になるので
+  //    整数として読めない値は**入れない** (未登録のまま = カードに ⚠ が出る) — Codex 2026-10-01
+  const n = Number(t);
+  const good = t !== '' && Number.isInteger(n) && n > 0 && n <= MAT_PER_MAX;
   const next = { code: l[i].code, usage: 'inner_pack' };
-  if (Number.isInteger(n) && n > 0) next.units_per_pack = n;
+  if (good) next.units_per_pack = n;
   l[i] = next;
+  const hint = document.getElementById('matPerHint' + i);
+  if (hint) hint.textContent = (t === '' || good) ? '' : '1 以上の整数で入れてください';
   // 🚨ここでは描き直さない — 数字を打つたびに input を作り直すと、1 文字ごとにフォーカスが飛ぶ
   matWrite(l);
 }
@@ -5175,7 +5187,13 @@ async function saveMaster() {
     // 最新を読み込み、フォームも最新値で組み直す (古い入力のままの再保存で上書きさせない — Codex PR4 #4)
     $('#mvMsg').textContent = '⏳ ' + (j.message || '他の人が先に更新しました') + ' — 最新を読み込んでいます…';
     const keepField = mvCtx.field;   // 開いていた項目を引き継ぐ (落とすと隠れている項目まで送ってしまう)
-    await loadState();
+    const fresh = await loadState();
+    // 🚨取り直せていないのに「最新にしました」と言わない。古い内容のまま送り直すと競合を繰り返す (Codex 2026-10-01)
+    if (!fresh) {
+      $('#mvMsg').textContent = '❌ 他の人が先に更新しましたが、最新を読み込めませんでした。'
+        + 'いったん「やめる」で閉じ、つながってから開き直してください';
+      return;
+    }
     const c2 = state.cards.find(x => x.id === mvCtx.cardId);
     if (c2) {
       const cur2 = mvValues(c2.master);
