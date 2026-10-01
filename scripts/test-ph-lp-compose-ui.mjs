@@ -28,7 +28,8 @@ const ok = (c, l) => { if (c) { pass++; console.log(`  ✓ ${l}`); } else { fail
 const eq = (a, b, l) => ok(JSON.stringify(a) === JSON.stringify(b), `${l} (期待 ${JSON.stringify(b)} / 実際 ${JSON.stringify(a)})`);
 
 const app = express();
-app.use((req, _res, next) => { req.session = { email: 'nakahara@x', role: 'admin' }; next(); });
+// 役割はヘッダで切り替えられるようにする (admin 限定のカードを確かめるため)
+app.use((req, _res, next) => { req.session = { email: 'nakahara@x', role: req.get('X-Test-Role') || 'admin' }; next(); });
 app.use('/apps/product-hub', router);
 const server = app.listen(0);
 await new Promise((r) => server.once('listening', r));
@@ -44,6 +45,21 @@ const embedded = (html) => {
   return m ? JSON.parse(m[1].replace(/\\u003c/g, '<')) : null;
 };
 
+/**
+ * 🚨 描画した HTML の中のインライン script を全部 JS として読む。
+ *    文字列に生の改行を入れただけでそのブロックが丸ごと死ぬのに、
+ *    サーバーのテストは HTML しか見ないので気づけない (codex exec review P1 で実際に踏んだ)。
+ */
+function checkInlineJs(html, where) {
+  const blocks = [...html.matchAll(/<script(?![^>]*\stype=)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+  ok(blocks.length > 0, `${where}: インライン script がある`);
+  let bad = 0;
+  blocks.forEach((code, i) => {
+    try { new Function(code); } catch (e) { bad++; console.log(`    script[${i}]: ${e.message}`); }
+  });
+  eq(bad, 0, `🚨 ${where}: すべての script ブロックが JS として読める`);
+}
+
 const draftId = Number(db.prepare(
   `INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('LP-UI-1', 'ハッカ油スプレー 100ml', 'test')`
 ).run().lastInsertRowid);
@@ -55,13 +71,7 @@ console.log('⓪ 🚨 詳細画面のインライン JS が構文エラーにな
   //    **その script ブロックが丸ごと死ぬ** (既存のボタンも動かなくなる)。
   //    サーバーのテストは HTML しか見ないので気づけない — 実際に踏んだ (codex exec review P1)。
   const { html } = await getDetail(draftId);
-  const blocks = [...html.matchAll(/<script(?![^>]*\stype=)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
-  ok(blocks.length > 0, 'インライン script がある');
-  let bad = 0;
-  blocks.forEach((code, i) => {
-    try { new Function(code); } catch (e) { bad++; console.log(`    script[${i}]: ${e.message}`); }
-  });
-  eq(bad, 0, '🚨 すべての script ブロックが JS として読める');
+  checkInlineJs(html, '詳細画面');
 }
 
 console.log('① 仕様書も商品情報も無いうちは「押せない理由」が出る');
@@ -202,6 +212,26 @@ console.log('⑦ 失敗・成否不明も画面に出る');
   const failAt = html3.indexOf('id="lpc-fail"');
   const resultAt = html3.indexOf('id="lpc-result"');
   ok(failAt > 0 && resultAt > 0 && failAt < resultAt, '🚨 失敗の箱は「できた」の箱より前 (= 外側) にある');
+}
+
+console.log('⑧ 仕様書の取込カード (一覧画面・admin だけ)');
+{
+  const getList = async (role) => {
+    const res = await fetch(`${base}/list`, { headers: { 'X-Test-Role': role } });
+    return { status: res.status, html: await res.text() };
+  };
+  const a2 = await getList('admin');
+  eq(a2.status, 200, '一覧画面が開く');
+  ok(a2.html.includes('id="lpspec-file"'), '🚨 admin には .xlsx を上げる欄がある (これが無いと curl しか無い)');
+  ok(a2.html.includes('id="lpspec-upload-btn"'), '取り込むボタンがある');
+  ok(/いまの版/.test(a2.html), 'いまの版が出る');
+  ok(a2.html.includes('LP制作システム'), '仕様書の名前が出る');
+  checkInlineJs(a2.html, '一覧画面');
+
+  const s2 = await getList('staff');
+  ok(!s2.html.includes('id="lpspec-file"'), '🚨 admin でなければ出さない (仕様書 = AI への指示そのもの)');
+  ok(!s2.html.includes('id="lpspec-upload-btn"'), 'ボタンも出さない');
+  checkInlineJs(s2.html, '一覧画面 (staff)');
 }
 
 server.close();
