@@ -16,7 +16,8 @@
  *     変更の記録と状態の記録は約束の人・request_id・理由 (偽の core.actor_* は使わない)・登録の約束も done が要る (0051 の commit の確かめ)・
  *     DB の守りが見る列の持ち主のキーは NEW_ENTRY_KEYS に全部入っている・DB が段階 / 持ち主表で断った = 409 before_cutover・
  *     関数を直接呼んで値を偽っても DB が確かめる / 作り直す (単品の税率と税区分・名前・売価・発送方法・原価の出どころと日・セットだけの列・
- *     セットの導く値 (DB で導き直す)・構成品のコード・カードの写しの欄・rows_hash / カードの hash / 約束のハッシュは DB が作る。Codex R3 Medium 1)
+ *     セットの導く値 (DB で導き直す)・構成品のコード・カードの写しの欄・rows_hash / カードの hash / 約束のハッシュは DB が作る。Codex R3 Medium 1)・
+ *     保存の記録の結果は DB の値だけで作る (呼び手の result は断る・Codex R4 Medium)・カードの知らせの欄の名前は決まった ASCII だけ (Codex R4 Low)
  *   R 新商品の登録: 門 (段階 new_open・持ち主 company・MASTER_EDIT_OPEN) が閉じている = 409 何も書かない (失敗の記録は残る)・形の検査 400・
  *     コードの検査 409 (Company DB・名札・NE・消したコード)・単品 / セットを 1 つの取引で (SKU・商品・状態 draft・仕入先・原価・構成の依頼・知らせ・記録)・
  *     巻き戻る = 知らせも残らない・同じ request_id = 前の結果・編集の印に登録の状態・やめた商品は直せない
@@ -628,7 +629,7 @@ const regEntry = (code, over = {}) => ({
   product: { name: '直接の単品', sales_class: 3, expiry_managed: false, inbound_date_managed: null },
   sku: { name: '直接の単品', tax_rate: 0.1, tax_class: 'STANDARD_10', handling: 'active', standard_price_jpy: 1000, shipping_code: 'S01', shipping_method: 'ゆうパケット',
     shipping_cost_jpy: 210, reorder_months: null, set_sales_class_override: null, handling_own: null },
-  supplier_id: null, cost: null, component_request: null, card: null, result: { ok: true }, ...over,
+  supplier_id: null, cost: null, component_request: null, card: null, ...over,
 });
 const setEntry = (code, rows) => regEntry(code, { kind: 'set', product: null, sku: { ...regEntry(code).sku, name: '直接のセット', handling_own: 'active' },
   component_request: { rows, rows_hash: 'f'.repeat(64), reason: '直接の試験' } });
@@ -781,6 +782,43 @@ await ta('[G4] 画面のロールが登録の関数を直接呼んで値を偽�
   assert.equal(done.result.request_payload_hash, 'e'.repeat(64));
   assert.deepEqual(await one('select tax_rate::float8 as t, tax_class, handling from core.skus where sku_id = $1', [r.sku_id]), { t: 0.1, tax_class: 'STANDARD_10', handling: 'active' });
   assert.deepEqual(await one('select cost_jpy::int as j, cost_source as s, valid_from::text as f from core.sku_costs where sku_id = $1', [r.sku_id]), { j: 200, s: 'set_calc', f: TODAY });
+});
+
+await ta('[G5] 保存の記録の結果は DB の値だけで作る (呼び手の result は断る・Codex R4 Medium)・カードの知らせの欄の名前は決まった ASCII だけ (Codex R4 Low)', async () => {
+  const s001 = Number(await skuId('s001'));
+  // 呼び手が結果を渡す (ok:false・別のコード / 種類 / request_id / 税率 / 構成品) = 断る
+  for (const forged of [{ ok: false }, { code: 'other', kind: 'set', request_id: uuid(), tax: { rate: 0.08, class: 'REDUCED_8' }, components: [{ code: 'x', qty: 9 }] }, {}]) {
+    const e = await editorTx(() => callReg(uuid(), { ...regEntry('g5-x'), result: forged }));
+    assert.ok(e instanceof Error); assert.match(String(e.message), /^invalid_input: 登録の結果 \(result\) は DB が作る/);
+  }
+  // 通った呼び出しの結果 = DB が書いた値そのもの (保存の記録と関数の答えが同じ)
+  const rid = uuid();
+  const rows = [{ sku_id: s001, code: 's001', qty: 3, sort: 1 }];
+  const entry = { ...setEntry('g5-set', rows), sku: { ...setEntry('g5-set', rows).sku, name: '中止の印のセット_白ビ袋' },
+    cost: { jpy: 300, source: 'set_calc', status: 'COMPLETE', valid_from: TODAY, reason: '構成品から計算' } };
+  const out = await asEditor(async () => {
+    await pg.query('begin');
+    try { const x = (await callReg(rid, entry)).rows[0].r; await pg.query('commit'); return x; } catch (e) { await pg.query('rollback'); throw e; }
+  });
+  const stored = (await one('select result from ops.master_edit_requests where request_id = $1', [rid])).result;
+  assert.deepEqual(stored, out);
+  const k = await one('select sku_id::text as id, code, sku_kind, tax_rate::float8 as t, tax_class, handling, shipping_code, shipping_method, shipping_cost_jpy::int as sc from core.skus where code = $1', ['g5-set']);
+  assert.deepEqual([out.ok, out.code, out.kind, out.sku_id, out.state, out.request_id], [true, 'g5-set', 'set', k.id, 'draft', rid]);
+  assert.deepEqual([out.tax, out.handling, out.cost, out.shipping, out.components], [{ rate: k.t, class: k.tax_class }, k.handling, { jpy: 300, source: 'set_calc' },
+    { code: k.shipping_code, method: k.shipping_method, cost_jpy: k.sc }, [{ code: 's001', qty: 3 }]]);
+  assert.deepEqual(out.warnings, ['名前の末尾に資材の印があります。資材は梱包アプリで登録します (新しい名前には付けない・D-47)']);
+  assert.equal(out.ne_steps.length, 2); assert.equal(out.card, null); assert.equal(out.request_payload_hash, 'e'.repeat(64));
+  // カードの知らせ: 知らない欄・ASCII でない欄の名前は断る (JS と DB で欄の並びが違うかもしれない)
+  const card = (extra) => O.cardEventOf({ ...O.buildCardPayload({ code: 'g5-c', kind: 'single', name: '直接の単品', price: 1000,
+    shipping: { code: 'S01', method: 'ゆうパケット', cost_jpy: 210 }, card: {}, components: [], actor: 'naka@test' }), ...extra });
+  for (const [label, extra] of [['知らない欄', { extra_field: 1 }], ['ASCII でない欄の名前', { '\u{1F600}': 'x' }], ['入れ子の知らない欄', { yahoo: { price: 1, '\uE000': 2 } }],
+    ['入れ子の知らない欄 (セットの判断)', { set_decision: { decision: 'hold', reason_code: null, reason_text: null, note: 'x' } }], ['参考 URL が文字でない', { reference_urls: [1] }]]) {
+    const e = await editorTx(() => callReg(uuid(), regEntry('g5-c', { card: card(extra) })));
+    assert.ok(e instanceof Error, `${label}: 断らなかった`); assert.match(String(e.message), /^invalid_value: カードの知らせ/, label);
+  }
+  // js_stable そのものも ASCII でないキーは断る
+  await assert.rejects(() => pg.query(`select ops.js_stable('{"\u{1F600}": 1, "\uE000": 2}'::jsonb)`), (e) => /JSON のキーは ASCII だけ/.test(e.message));
+  assert.equal((await one(`select ops.js_stable('{"b": 1, "a": [true, null, "x"]}'::jsonb) as s`)).s, W.stable({ b: 1, a: [true, null, 'x'] }));
 });
 
 console.log('\nproduct-hub のカードの知らせ (outbox)');

@@ -275,7 +275,7 @@ try {
     assert.equal(await codeOf(A, 'select ops.create_sku_registration($1, $2)', [p1, 'naka@test']), '42501');
     const entry = (code, over = {}) => ({ kind: 'single', code, started_at: null, product: { name: code, sales_class: 3, expiry_managed: false, inbound_date_managed: null },
       sku: { name: code, tax_rate: 0.1, tax_class: 'STANDARD_10', handling: 'active', standard_price_jpy: 1000, shipping_code: 'S01', shipping_method: 'ゆうパケット', shipping_cost_jpy: 210,
-        reorder_months: null, set_sales_class_override: null, handling_own: null }, supplier_id: null, cost: null, component_request: null, card: null, result: {}, ...over });
+        reorder_months: null, set_sales_class_override: null, handling_own: null }, supplier_id: null, cost: null, component_request: null, card: null, ...over });
     const call = (rid, e) => A.query('select ops.register_new_sku($1::uuid, $2, $3, $4::jsonb, $5, $6::jsonb) as r', [rid, 'naka@test', '本物のログインの試験', JSON.stringify(ALL_COMPANY), 'e'.repeat(64), JSON.stringify(e)]);
     // 関数の中の書き込みも 0051 の guard が見る (取引停止の仕入先を代表にする = 業務の約束で断る)
     await M.query(`insert into core.suppliers (company_id, code, name, active) values (1, '0099', '止めた仕入先', false) on conflict do nothing`);
@@ -300,6 +300,8 @@ try {
       ['セットの税率が構成品と違う', setE('g8-f6', { tax_rate: 0.08, tax_class: 'REDUCED_8' }), /derived_mismatch/],
       ['構成品のコードが違う', setE('g8-f7', {}, [{ sku_id: p1n, code: 'p002', qty: 1, sort: 1 }]), /component_unusable/],
       ['カードの売価が違う', entry('g8-f8', { card: card('g8-f8', 5) }), /invalid_value: カードの知らせ/],
+      ['呼び手の結果 (ok:false)', entry('g8-f9', { result: { ok: false, code: 'other' } }), /invalid_input: 登録の結果/],
+      ['カードの知らない欄', entry('g8-f10', { card: O.cardEventOf({ ...card('g8-f10', 1000).payload, '\uE000': 1 }) }), /invalid_value: カードの知らせ/],
     ]) {
       await A.query('begin');
       await assert.rejects(() => call(crypto.randomUUID(), e), (er) => re.test(er.message), label);
@@ -312,6 +314,8 @@ try {
     await A.query('commit');
     const obH = (await q('select payload, payload_hash from ops.product_hub_outbox where sku_id = $1', [rH.sku_id]))[0];
     assert.equal(obH.payload_hash, O.cardPayloadHash(obH.payload));
+    assert.deepEqual((await q('select result from ops.master_edit_requests where request_id = $1', [ridH]))[0].result, rH);   // 結果 = DB が作った答えそのもの
+    assert.deepEqual([rH.ok, rH.code, rH.kind, rH.request_id, rH.tax], [true, 'g8-h1', 'single', ridH, { rate: 0.1, class: 'STANDARD_10' }]);
     assert.equal((await q('select payload_hash from ops.master_edit_requests where request_id = $1', [ridH]))[0].payload_hash,
       (await q('select payload_hash from ops.master_write_sessions where request_id = $1', [ridH]))[0].payload_hash);
     // 合っていれば通る・偽の core.actor_id は記録に残らない・関数の外では (同じ取引でも) 登録の約束で書けない
