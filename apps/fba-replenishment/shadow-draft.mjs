@@ -31,6 +31,9 @@
  *     ただし前日以前の提案も使えない状態 (superseded) にする (2026-09-24 変更。以前は残していたが、
  *     自動で使う段階では古い数量で送ってしまう。Codex 設計レビュー 2 High 2)
  *   - 毎朝ぜんぶ計算し直すので、前日の**未処理だけ** superseded にする (人が触った行は残す)
+ *   - 🆕 例外: Sheet なしのモード (FBA_SHEETLESS_MODE・⑦-F) で材料が欠けて計算が止まった日 (result.sheetless_blocked) は、
+ *     前の提案に **触らない** (中身も status もそのまま = 人は前の提案を見られる)。代わりに「止めた印」(run 要約行の send_blocked) を残し、
+ *     自動で送る段 (まだ無い) は findSendBlock / sendableProposals で止まる (Codex PR R1 High 2)。印を書けなければ今までどおり superseded にする
  *
  * 記録先:
  *   ai.decisions  ... 1 行 = 1 出品。提案 (proposal) と 提案不能・要対応 (finding)
@@ -481,6 +484,75 @@ async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh,
 }
 
 /**
+ * Sheet なしのモードで計算が止まった日の記録 (⑦-F・Codex PR R1 High 2)。
+ * 🚨 前の提案には触らない (superseded にしない・中身も変えない)。「止めた印」= run 要約行 (finding・send_blocked=true) と
+ *    ops.job_runs の fail を同じ取引で書く。自動で送る段は findSendBlock で止まる。翌日以降に決められた日の run 要約行が新しくなれば止めは外れる
+ *    印を書けなければ (接続が死んでいる等)、自動で古い数を送らない側に倒して今までどおり前の提案を superseded にする
+ */
+async function recordSheetlessBlockedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, errors, jobId, runMeta, ruleVersion = RULE_VERSION }) {
+  const summary = `run=${runId} / 計算できなかった (Sheet なしのモード): ${errors.join(' / ')} / 前の提案はそのまま・自動で送るのは止めた`;
+  try {
+    await db.query('begin');
+    await db.query(
+      `insert into ai.decisions
+         (company_id, domain, decision_kind, subject_type, subject_id, summary, rationale, severity,
+          proposed_action, inputs_ref, model, rule_version, generated_by, autonomy_level, status, dedupe_key, expires_at)
+       values ($1,$2,'finding',null,null,$3,$4,'warn',null,$5,$6,$7,'rule',0,'new',$8,$9)`,
+      [COMPANY_ID, DOMAIN,
+        `${runMeta?.business_date || '日付不明'} は計算できない (Sheet なしのモードの材料が欠けている)`,
+        'Sheet に戻らずに計算を止めた。前の提案は残す (人は見られる) が、自動で送るのは止める (send_blocked)',
+        { run_id: runId, generator: GENERATOR, run_summary: true, sheetless_blocked: true, send_blocked: true, errors, ...(runMeta || {}) },
+        `rule:${ruleVersion}`, ruleVersion, RUN_SUMMARY_KEY,
+        new Date(now.getTime() + EXPIRES_HOURS * 3600 * 1000).toISOString()]);
+    await db.query(
+      `insert into ops.job_runs (job_id, host, started_at, finished_at, status, summary)
+       values ($1,$2,$3,now(),'fail',$4)`,
+      [jobId, host, startedAt, summary.slice(0, 2000)]);
+    await db.query('commit');
+    onFailRecorded();
+    log(`影の下書き: ${summary}`);
+    return { runId, ok: false, engineFailed: true, sheetlessBlocked: true, errors, proposals: 0, blocked: 0, calm: 0, status: 'fail', summary };
+  } catch (e) {
+    try { await db.query('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する */ }
+    // 止めた印を書けない = 自動で送るのを止められない → 今までどおり前の提案を使えない状態にする
+    const superseded = await supersedeOpenRowsSafely(db, { openFresh, log });
+    const s2 = `${summary} / 🚨 止めた印を書けなかった (${e.message}) → 前の提案を${superseded ? '無効にした' : '無効にもできなかった'}`;
+    if (await writeFailedRun(db, { host, startedAt, summary: s2, log, openFresh, jobId })) onFailRecorded();
+    log(`影の下書き: ${s2}`);
+    return { runId, ok: false, engineFailed: true, sheetlessBlocked: true, markWritten: false, errors, proposals: 0, blocked: 0, calm: 0, status: 'fail', summary: s2 };
+  }
+}
+
+/**
+ * 自動で送るのを止めているか (⑦-F・Codex PR R1 High 2)。送る段はまだ無い。作るときは必ず sendableProposals を通す。
+ * いちばん新しい run 要約行が「止めた印」(send_blocked) なら止める。前の提案は new のまま残っている (人は見られる)
+ * @returns {Promise<{ decision_id: number, created_at: string, business_date: string|null, summary: string } | null>}
+ */
+export async function findSendBlock(db) {
+  const { rows } = await db.query(
+    `select decision_id, created_at, summary, inputs_ref->>'business_date' as business_date, inputs_ref->>'send_blocked' as send_blocked
+       from ai.decisions
+      where company_id = $1 and domain = $2 and dedupe_key = $3 and inputs_ref->>'generator' = $4
+      order by created_at desc, decision_id desc limit 1`,
+    [COMPANY_ID, DOMAIN, RUN_SUMMARY_KEY, GENERATOR]);
+  const r = rows[0];
+  return r && r.send_blocked === 'true' ? { decision_id: r.decision_id, created_at: r.created_at, business_date: r.business_date, summary: r.summary } : null;
+}
+
+/** 自動で送ってよい提案 (止めた印があれば 0 件)。この仕組みの提案で status = new・期限内 */
+export async function sendableProposals(db, { now = new Date() } = {}) {
+  if (await findSendBlock(db)) return [];
+  const { rows } = await db.query(
+    `select decision_id, dedupe_key, inputs_ref, expires_at
+       from ai.decisions
+      where company_id = $1 and domain = $2 and status = 'new' and decision_kind = 'proposal' and inputs_ref->>'generator' = $3
+        and (expires_at is null or expires_at > $4)
+      order by decision_id`,
+    [COMPANY_ID, DOMAIN, GENERATOR, now.toISOString()]);
+  return rows;
+}
+
+/**
  * 影の下書きを 1 回ぶん記録する。
  * @param db     { query(sql, params) }
  * @param result 計算エンジンの戻り値 (generateRecommendations(false, inboundOverride))
@@ -505,6 +577,9 @@ export async function recordShadowDraft(db, result, {
   // 🚨 計算そのものが失敗した日 (スナップショットが無い・マッピングが無い) は「今日は何も要らない」ではない。
   //    ただし前日以前の提案を「今日も使える」状態に残してもいけない (自動で使うと古い数量で送る。
   //    Codex 2026-09-24 設計レビュー 2 High 2) → この仕組みの未処理の行は superseded にして、失敗を記録する
+  if (errors.length && result?.sheetless_blocked) {
+    return recordSheetlessBlockedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, errors, jobId, runMeta, ruleVersion });
+  }
   if (errors.length) {
     const superseded = await supersedeOpenRowsSafely(db, { openFresh, log });
     const summary = `run=${runId} / 計算できなかった: ${errors.join(' / ')}${superseded ? '' : ' / 🚨 前日以前の提案を無効にできなかった'}`;

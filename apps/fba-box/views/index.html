@@ -260,6 +260,7 @@
         <button class="chip" id="btn-back">← 回を選ぶ</button>
         <span class="title" id="run-title"></span>
         <span class="sp"></span>
+        <a class="chip hidden" id="btn-picking" target="_blank" rel="noopener" style="text-decoration:none">📄 ピッキング</a>
         <button class="chip" id="btn-summary">📋 まとめ</button>
         <button class="chip" id="btn-worker">👤 作業者を選ぶ</button>
       </div>
@@ -670,6 +671,9 @@
   function render() {
     if (!S) return;
     $('#run-title').textContent = S.run.title;
+    // この回の納品ピッキング PDF (納品プランNo 付き)。残っていない回は出さない
+    if (S.pickingPdfUrl) $('#btn-picking').href = S.pickingPdfUrl;
+    $('#btn-picking').classList.toggle('hidden', !S.pickingPdfUrl);
     $('#btn-worker').textContent = worker ? `👤 ${worker.display_name}` : '👤 作業者を選ぶ';
     $('#btn-worker').classList.toggle('warn', !worker);
     // タブ

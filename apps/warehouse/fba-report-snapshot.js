@@ -37,7 +37,7 @@ export function saveJpReports(db, results, businessDate, { log = console.log, wa
     out.restockDaily = (saved.updated || 0) + (saved.inserted || 0);
     log(`[fba-stock-snapshot] RESTOCK → daily_snapshots: updated=${saved.updated} inserted=${saved.inserted}`);
     try { out.restockLatest = db.saveRestockLatest(normalized).saved || 0; } catch (e) { rethrowIfExternalWrite(e); warn('[fba-stock-snapshot] saveRestockLatest 失敗:', e.message); }
-    const fnskuRows = normalized.filter((r) => r.fnsku && r.amazon_sku).map((r) => ({ sku: r.amazon_sku, fnsku: r.fnsku }));
+    const fnskuRows = normalized.filter((r) => r.fnsku && r.amazon_sku).map((r) => ({ sku: r.amazon_sku, fnsku: r.fnsku, asin: r.asin || null }));   // asin は Sheet なしのモードのときだけ使う (⑦-F)
     if (fnskuRows.length > 0) db.updateFnskuBatch(fnskuRows);
   }
   // ② PLANNING で 販売・価格・days_of_supply などを上書き (在庫の区分は保持)
@@ -47,7 +47,7 @@ export function saveJpReports(db, results, businessDate, { log = console.log, wa
     out.planning = db.savePlanningData(normalized, businessDate);
     log(`[fba-stock-snapshot] PLANNING → daily_snapshots: ${out.planning}件 (3カラムは保持)`);
     try { out.planningLatest = db.savePlanningLatest(normalized).saved || 0; } catch (e) { rethrowIfExternalWrite(e); warn('[fba-stock-snapshot] savePlanningLatest 失敗:', e.message); }
-    const fnskuRows = results.planning.filter((r) => r['sku']).map((r) => ({ sku: r['sku'], fnsku: r['fnsku'] || null }));
+    const fnskuRows = results.planning.filter((r) => r['sku']).map((r) => ({ sku: r['sku'], fnsku: r['fnsku'] || null, asin: r['asin'] || null }));   // asin は Sheet なしのモードのときだけ使う (⑦-F)
     if (fnskuRows.length > 0) db.syncFnskuBatch(fnskuRows);
   }
   if (out.errors.length) warn('[fba-stock-snapshot] errors:', JSON.stringify(out.errors));

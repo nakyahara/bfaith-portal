@@ -3,10 +3,14 @@
  *
  * 判断の API (decide.mjs) と CSV の操作 (ne-csv.mjs) の両方が使う (互いに import し合わないよう、ここに分ける)。
  * 🚨 鍵の順番 = ① CSV の鍵 (取引の advisory lock) → ② 候補の行を指紋の順に for update。どちらの口もこの順 (待ち合いはしてもデッドロックしない)
+ * 🚨 マスタの入力 (lib/master-write.mjs・Company DB構想 14 ⑤-1) は SKU ごとの鍵 (SKU_LOCK_SQL・sku_id の順) → CSV の鍵 → 行 の順。
+ *    CSV の行を作る・予約する口が SKU ごとの鍵も取るなら、必ず CSV の鍵より前に取る (後で取るとマスタの入力と待ち合う)
  */
 
 /** CSV の鍵 (取引の終わりで外れる) */
 export const CSV_LOCK_SQL = `select pg_advisory_xact_lock(hashtext('ops.ne_csv'))`;
+/** SKU ごとの鍵 ($1 = sku_id。取引の終わりで外れる)。CSV の鍵より前に、sku_id の小さい順に取る */
+export const SKU_LOCK_SQL = `select pg_advisory_xact_lock(hashtextextended('core.sku:' || $1::text, 0))`;
 
 /** 0040 (CSV の記録の表) が入っているか。入る前の DB でも判断の API は今までどおり動く */
 export async function csvApplied(db) {
