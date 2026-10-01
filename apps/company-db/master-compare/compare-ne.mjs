@@ -343,7 +343,7 @@ const tValue = (tm, norm, col) => {
  * @param {object} p.ledger          readLedger の結果 ({ state, entries })
  * @param {string} p.loadVerdict     ① の verdict
  */
-export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, cdb, ledger, loadVerdict = null, tmpRoot, decisionLedger = null, baseline = null }) {
+export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, cdb, ledger, loadVerdict = null, tmpRoot, decisionLedger = null, baseline = null, regTargets = null }) {
   const out = { format: NE_FORMAT, verdict: null, blocked_reason: null, prerequisites: {}, generation: null, build: null, ne_marks: null,
     items: [], held: {}, recoverable: [], out_of_scope: {}, decisions: [], raw_diffs: [], counts: {}, pending: { state: ledger?.state ?? null, reason: ledger?.reason ?? null } };
   const pre = out.prerequisites;
@@ -869,5 +869,48 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   const neCodes = resolveNeCodes(ne.spellings);
   out.ne_codes = neCodes.ok ? { state: 'resolved', counts: Object.fromEntries(['ok', 'collided', 'invalid'].map((s) => [s, neCodes.entries.filter((e) => e.state === s).length])) }
     : { state: 'unavailable', reason: neCodes.reason };
-  return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes, neCodes };
+  // 新商品の NE 登録の CSV (0052・契約 v3 H5): 同じ完全な取得の中の、確かめ待ちの商品の NE の値 (書くのは run.mjs が判断の台帳の後に)
+  const regObs = Array.isArray(regTargets) ? registrationObservations(nm, regTargets, {
+    collided: collidedNorms, intBlocked, absenceTrusted: !absenceUntrusted && !componentsUntrusted, productsAt: marks.products.at, setsAt: marks.sets.at,
+    // 取得の世代 (#1571 Codex R1 High 2): 材料の世代・NE の完全な取得の版・原本のハッシュ (材料の中身のハッシュと版から)
+    fetch: { generation_id: out.generation.generation_id, products_rev: String(marks.products.rev), sets_rev: String(marks.sets.rev),
+      raw_hash: crypto.createHash('sha256').update(JSON.stringify({ products: expected.products.content_hash, set_components: expected.set_components.content_hash,
+        products_rev: String(marks.products.rev), sets_rev: String(marks.sets.rev), products_at: marks.products.at, sets_at: marks.sets.at })).digest('hex') },
+  }) : null;
+  out.registrations = regObs ? { targets: regTargets.length, observations: regObs.observations.length, present: regObs.observations.filter((o) => o.present).length } : { state: 'not_applied' };
+  return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes, neCodes, regObs };
+}
+
+/** sync_meta の時刻 ('YYYY-MM-DD HH:MM:SS' = UTC) → ISO */
+const utcTextToIso = (t) => { const ms = Date.parse(`${String(t).replace(' ', 'T')}Z`); return Number.isFinite(ms) ? new Date(ms).toISOString() : null; };
+/** 値の状態 → 送る形 { st: ok | no_value | invalid, v } */
+const stOf = (st) => ({ st: comparability(st) === 'comparable' ? 'ok' : comparability(st) === 'no_value' ? 'no_value' : 'invalid', v: st && st.value !== undefined ? st.value : null });
+/**
+ * 新規登録の商品ごとの NE の観測 (ops.record_ne_registration_check に送る形)。nm = nModelOf の結果 (完全な取得の集合)。
+ * targets = [{ code_norm, sku_kind }] (ops.v_ne_reg_targets)。trusted = 正規化の衝突・取込の整合の問題が無い
+ * 単品の列 = 名前・仕入先 (4 桁に揃えた norm)・原価・売価・税率・取扱区分・代表 (親なし = null) / セット = 名前・売価・構成品 (norm と数量)
+ */
+export function registrationObservations(nm, targets, { collided = new Set(), intBlocked = new Map(), absenceTrusted = false, productsAt = null, setsAt = null, fetch = null } = {}) {
+  const observations = [];
+  const seen = new Set();
+  for (const t of targets) {
+    const norm = normSku(t.code_norm ?? '');
+    if (!norm || seen.has(norm)) continue;
+    seen.add(norm);
+    const n = nm.get(norm) || null;
+    const trusted = !collided.has(norm) && !intBlocked.has(norm);
+    if (!n) { observations.push({ code_norm: norm, present: false, trusted, kind: null }); continue; }
+    const c = n.cols;
+    const o = { code_norm: norm, present: true, trusted, kind: n.kind, ne_code: n.code };
+    if (n.kind === 'single') {
+      o.cols = { name: stOf(c.name), supplier: stOf(c.primary_supplier), cost: stOf(c.cost), price: stOf(c.standard_price_jpy), tax_rate: stOf(c.tax_rate),
+        handling: stOf(c.handling), parent: stOf(c.parent) };
+    } else {
+      o.cols = { name: stOf(c.name), price: stOf(c.standard_price_jpy) };
+      o.children = [...n.children].map(([cn, ch]) => ({ code_norm: cn, ...stOf(ch.st) }));
+    }
+    observations.push(o);
+  }
+  return { fetch, products_at: productsAt ? utcTextToIso(productsAt) : null, sets_at: setsAt ? utcTextToIso(setsAt) : null, absence_trusted: !!absenceTrusted,
+    targets: [...seen], observations };
 }

@@ -60,6 +60,40 @@ export async function writeNeCodes(writer, { compareRunId, entries }) {
   return typeof r === 'string' ? JSON.parse(r) : r;
 }
 
+/**
+ * 新商品の NE 登録の CSV の確かめ待ちの商品 (0052 の ops.v_ne_reg_targets)。照合の読み取りの取引の中 (watcher)。
+ * 表が無い (0052 の前) = null (送らない)・読めない = null + reason
+ */
+export async function readRegTargets(db) {
+  await db.query('savepoint reg_targets');
+  try {
+    const exists = (await db.query("select to_regclass('ops.v_ne_reg_targets') is not null as ok")).rows[0].ok;
+    const rows = exists ? (await db.query('select distinct code_norm, sku_kind from ops.v_ne_reg_targets order by code_norm')).rows : null;
+    await db.query('release savepoint reg_targets');
+    return { state: exists ? 'ok' : 'not_applied', targets: rows };
+  } catch (e) {
+    try { await db.query('rollback to savepoint reg_targets'); } catch { /* */ }
+    return { state: 'unreadable', targets: null, reason: String(e && e.message).slice(0, 200) };
+  }
+}
+const jsonOf = (r) => (typeof r === 'string' ? JSON.parse(r) : r);
+/**
+ * 新商品の NE 登録の CSV の確かめ (0052・#1571 Codex R1 High 2) = 3 段。どれも writer = watch_writer・関数だけ・1 回 = 1 つの取引。
+ *   1. writeRegistrationObservations = この回の NE の観測 (取得の世代・時刻・原本のハッシュ・確かめ待ちの商品・観測) を DB に残す (回ごとに 1 回・後から足せない)
+ *   2. sealRegistrationRun = この回が最後まで終わった受け取り (観測のハッシュ・結果の JSON の sha256)。結果の JSON を書けた後だけ
+ *   3. runRegistrationCheck = 回の番号だけを渡す。DB の関数が受け取りと残した観測を自分で読んで確かめる (呼び手の観測の JSON は受けない)
+ * regObs = compareNe の regObs ({ fetch, products_at, sets_at, absence_trusted, targets, observations })
+ */
+export async function writeRegistrationObservations(writer, { compareRunId, regObs }) {
+  return jsonOf((await writer.query('select ops.record_ne_registration_observations($1::jsonb) as r', [JSON.stringify({ compare_run_id: compareRunId, ...regObs })])).rows[0].r);
+}
+export async function sealRegistrationRun(writer, { compareRunId, observationHash, evidenceSha256 }) {
+  return jsonOf((await writer.query('select ops.seal_ne_registration_run($1, $2, $3) as r', [compareRunId, observationHash, evidenceSha256])).rows[0].r);
+}
+export async function runRegistrationCheck(writer, { compareRunId }) {
+  return jsonOf((await writer.query('select ops.record_ne_registration_check($1) as r', [compareRunId])).rows[0].r);
+}
+
 /** 本番の書く接続 (watch_writer。読み取り専用にはしない)。初期設定に失敗したら閉じてから投げる */
 export async function connectDecisionWriter(url) {
   const client = await openPgClient(url);

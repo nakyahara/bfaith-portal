@@ -63,7 +63,8 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   s.push(`grant usage on all sequences in schema ops to watch_writer`);
   s.push(`alter default privileges for role ${o} in schema ops grant usage on sequences to watch_writer`);
   // 照合の判断の台帳 (0032)・最後に一致した値 (0033) は watch_writer が関数だけで書く (表へ直接は書けない)。watch_writer を作った後に付ける
-  for (const f of secdefFunctions) if (/^ops\.(record_decision_(candidates|done)|record_ne_baseline|record_ne_codes)\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);
+  //   新商品の NE 登録の CSV の確かめ (0052・観測 → 受け取り → 確かめの 3 つの関数・#1571 R1 High 2) も同じ
+  for (const f of secdefFunctions) if (/^ops\.(record_decision_(candidates|done)|record_ne_baseline|record_ne_codes|record_ne_registration_observations|seal_ne_registration_run|record_ne_registration_check)\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);
   return s;
 }
 

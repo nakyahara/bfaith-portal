@@ -650,6 +650,14 @@ export async function runInitialLoad(db, plan, opts = {}) {
     }
     log(`set_components: ${compSec.applied} (same ${compSec.same}, skip ${compSec.skipped.length})`);
 
+    // ── 4b. NE のセットの構成の観測 (0050 の ops.record_ne_set_observations。Company DB構想 14 契約 v3 H2・⑤-2b) ──
+    //   完全に取れた NE の取得 (材料の世代が中身と同じ = matched・完全な取得の時刻がある) の構成を、セットごとに観測として残す。回 = 材料の世代 (同じ材料の 2 回目 = 何もしない)。
+    //   持ち主が 'load' の間は上の 4. が今までどおり core.sku_components を NE に合わせる (観測は残すだけ)。
+    //   持ち主が 'company' になったら 4. は構成に触らない = 観測と、commit の後の依頼の昇格・食い違い (promoteComponentRequest) だけ
+    //   🚨 並び (sort) は材料の行の順 (NE の API の順が rowid で運ばれたもの = NE の取得に並びの列は無い)
+    report.set_observations = await recordSetObservations(db, plan, { runId });
+    if (report.set_observations.note) compSec.notes.push(report.set_observations.note);
+
     // ── 5. sku_costs (有効行と違うときだけ付け替え) ──
     // 持ち主が Company DB なら原価の行を作らない・閉じない (予定 0 件)
     const costOwned = loadOwns('sku_costs');
@@ -1050,8 +1058,11 @@ export async function runInitialLoad(db, plan, opts = {}) {
       winners.push({ entityId: Number(entityId), attribute, scope, obs: win });
     }
     // JAN → external_ids (取り合い・既に別の product が持つ・manual は upsertExternalIds が理由つき skip にする)
-    const janW = winners.filter((w) => w.attribute === 'jan');
+    // 持ち主が Company DB (0052・⑤-2b) なら商品の JAN を足さない・外さない (予定 0 件)。観測と、JAN 以外の解決は続ける
+    const janOwned = loadOwns('external_ids.jan');
+    const janW = janOwned ? winners.filter((w) => w.attribute === 'jan') : [];
     const janSec = section(report, 'jan', janW.length);
+    if (!janOwned) janSec.notes.push(`Company DB が正: JAN ${winners.filter((w) => w.attribute === 'jan').length} 件は見送り`);
     const janRows = [];
     for (const w of janW) {
       if (!/^\d{8}$|^\d{13}$/.test(w.obs.value_text || '')) { janSec.skipped.push({ entity_type: 'product', entity_id: w.entityId, value: w.obs.value_text, reason: 'JAN の形でない' }); continue; }
@@ -1061,10 +1072,11 @@ export async function runInitialLoad(db, plan, opts = {}) {
     janSec.applied = janRes.applied; janSec.same = janRes.same; janSec.skipped.push(...janRes.skipped);
     const janSkippedIds = new Set(janSec.skipped.map((s) => s.entity_id));
     const janAssigned = new Set(janRows.map((r) => r.entity_id).filter((id) => !janSkippedIds.has(id)));
-    // 解決結果は「実際に付与できたもの」だけ (JAN が付かなかった product には書かない = 理由つき skip)
-    const resSec = section(report, 'resolutions', winners.length);
+    // 解決結果は「実際に付与できたもの」だけ (JAN が付かなかった product には書かない = 理由つき skip)。JAN の持ち主が Company DB なら JAN の解決は書かない
+    const resWinners = janOwned ? winners : winners.filter((w) => w.attribute !== 'jan');
+    const resSec = section(report, 'resolutions', resWinners.length);
     const resRows = [];
-    for (const w of winners) {
+    for (const w of resWinners) {
       if (w.attribute === 'jan' && !janAssigned.has(w.entityId)) { resSec.skipped.push({ product_id: w.entityId, attribute: 'jan', reason: 'JAN が付かなかった (取り合い・別の product が保持・形式)' }); continue; }
       resRows.push({ entity_type: 'product', entity_id: w.entityId, attribute: w.attribute, packaging_scope: w.scope, resolved_observation_id: Number(w.obs.observation_id), rule_version: RULE_VERSION });
     }
@@ -1085,7 +1097,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       if (winnerKeys.has(`${pid}|${s.attribute}|${s.packaging_scope}`)) { revSec.same++; continue; }   // 適格な候補で置き換わった
       await db.query('delete from core.attribute_resolutions where entity_type = $1 and entity_id = $2 and attribute = $3 and packaging_scope = $4', ['product', pid, s.attribute, s.packaging_scope]);
       if (colOf[s.attribute]) await db.query(`update core.products set ${colOf[s.attribute]} where product_id = $1`, [pid]);
-      if (s.attribute === 'jan' && s.value_text) await db.query("update core.external_ids set valid_to = now() where entity_type = 'product' and entity_id = $1 and id_kind = 'jan' and resolution <> 'manual' and valid_to is null and external_norm = core.norm_code($2)", [pid, s.value_text]);
+      if (s.attribute === 'jan' && s.value_text && janOwned) await db.query("update core.external_ids set valid_to = now() where entity_type = 'product' and entity_id = $1 and id_kind = 'jan' and resolution <> 'manual' and valid_to is null and external_norm = core.norm_code($2)", [pid, s.value_text]);
       report.conflicts.push({ kind: 'resolution_future_revoked', product_id: pid, attribute: s.attribute, observed_at: new Date(s.observed_at).toISOString(), value: s.value_text });
       revSec.applied++;
     }
@@ -1244,6 +1256,12 @@ export async function runInitialLoad(db, plan, opts = {}) {
     } else report.notes = [...(report.notes || []), '0030 が未適用: ロードの判断 (ops.load_decisions) は記録しない'];
     if (dryRun) { await db.exec('rollback'); log('dry-run: 全部やってから巻き戻した'); }
     else { await db.exec('commit'); log('commit'); }
+    // commit の後: 観測した構成で、構成の依頼を上げる・食い違いを残す (セットごとに別の取引。失敗してもロードは成功のまま = 次の観測でもう一度)
+    if (!dryRun && report.set_observations?.candidates?.length) {
+      const tp = Date.now();
+      report.set_observations.promotions = await promoteObservedSets(db, report.set_observations.candidates, { ownership, now, log });
+      report.set_observations.promotions.ms = Date.now() - tp;
+    }
     return report;
   } catch (e) {
     try { await db.exec('rollback'); } catch { /* 接続が死んでいれば rollback も失敗 */ }
@@ -1251,6 +1269,153 @@ export async function runInitialLoad(db, plan, opts = {}) {
     report.finished_at = new Date().toISOString();
     throw Object.assign(e, { report });
   }
+}
+
+/** sync_meta の時刻 ('YYYY-MM-DD HH:MM:SS' = UTC) / ISO → ISO。読めなければ null */
+function utcIsoOf(v) {
+  const t = String(v ?? '').trim();
+  if (!t) return null;
+  const ms = Date.parse(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(t) ? `${t.replace(' ', 'T')}Z` : t);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+/** 観測に入れられるセットの行の上限 (0050 の ops.ne_set_rows_problem = 100 行まで・並びは 1〜行の数) */
+export const SET_OBSERVATION_MAX_ROWS = 100;
+/** 観測の数量の幅 (0050 の ops.ne_set_rows_problem = 1〜99,999 の厳密な整数・#1563 R3 M3) */
+export const SET_OBSERVATION_MAX_QTY = 99999;
+/** 1 回の観測のセットの数の上限 (0050 の requested / fetched = 0〜1,000,000 の整数) */
+export const SET_OBSERVATION_MAX_SETS = 1000000;
+/** 観測の数量 (NE の数量) → 0050 の決まりの厳密な整数 (1〜99,999)。だめなら null (0.6・-1・100000・'1.0'・null)。材料の数値は n() で数 / 数字だけの文字も受ける */
+export const observationQtyOf = (q) => {
+  const v = typeof q === 'number' ? q : typeof q === 'string' && /^\d{1,5}$/.test(q.trim()) ? Number(q.trim()) : NaN;
+  return Number.isSafeInteger(v) && v >= 1 && v <= SET_OBSERVATION_MAX_QTY ? v : null;
+};
+
+/** 観測の時刻の幅 (0050 の ops.record_ne_set_observations = 36 時間より前・5 分より先は受けない)。ここで先に見て「見送り」にする */
+export const SET_OBSERVATION_MAX_AGE_MS = 35 * 3600000;
+
+/**
+ * NE のセットの構成の観測を書く (ロードの取引の中・0050 の ops.record_ne_set_observations)。
+ * 書くのは材料の set_components が世代と同じ (matched) で、NE の完全な取得の時刻があり、その時刻が新しい (35 時間以内) ときだけ。
+ * 回 = 材料の世代 ID・観測の時刻 = NE の完全な取得の時刻・原本のハッシュ = 材料の中身のハッシュ・取得の世代 = 材料の世代 ID。
+ * 完全な回 (0050: requested = fetched = セットの数・飛ばしたセットが無い) に入れるのは、そのセットの行を全部そのまま残せるセットだけ:
+ *   Company DB のセット・構成品が全部 Company DB にある・コードが空でない / 重ならない・数量が 1〜99,999 の厳密な整数 (0050 #1563 R3 M3)・行が 100 行まで。
+ *   ほかのセットは入れない。= セットごとの構成は NE の完全な取得のまま (入れたセットの行を削らない)。並び (sort) = 材料の行の順に 1 から振る (1〜N)
+ *   🚨 入れられないセット (構成の行が 0 のセット = 商品の材料にあって行の親に無い・知らない / 重なる構成品・数量・行の数・Company DB のセットでない・重なるセット) が
+ *      1 つでもあれば complete = false (requested = fetched = NE のセットの数・入れたのは残せるセットだけ)。完全でない回は構成の依頼を上げない (#1571 Codex R1 Medium 1)
+ *   セットの数が 1,000,000 を超える回は書かない (0050 の requested / fetched の幅)
+ *   上げる候補は集合で 1 回に計算する (観測ごとの相関の副問い合わせをしない・Medium 2)。時間 (ms) を返す
+ * 🚨 ロードの取引の冒頭でマスタの書き込みの鍵 (core.master_write_lock_key) を排他で取った後に呼ぶ。0050 の関数がセットの SKU ごとの鍵を取る (昇格と同じ鍵)
+ * 失敗してもロードは止めない (savepoint で戻して note に残す)。戻り値 = { state, run_id, complete, requested, sets, skipped, excluded: { 理由: 件数 }, candidates: [observation_id], ms, note }
+ */
+async function recordSetObservations(db, plan, { runId }) {
+  const has = (await db.query("select to_regprocedure('ops.record_ne_set_observations(jsonb)') is not null as ok")).rows[0].ok;
+  if (!has) return { state: 'not_applied', note: '構成の観測: 0050 (ops.record_ne_set_observations) が未適用 (見送り)' };
+  const m = plan.material?.set_components;
+  const g = m?.generation;
+  const observedAt = m?.status === 'matched' ? utcIsoOf(g?.source_complete_at) : null;
+  if (!observedAt) return { state: 'skipped', note: `構成の観測: 材料が NE の完全な取得と確かめられない (${m ? m.status : 'no_material'}) = 見送り` };
+  const age = Date.now() - Date.parse(observedAt);
+  if (age > SET_OBSERVATION_MAX_AGE_MS || age < -5 * 60000) {
+    return { state: 'skipped', run_id: g.generation_id, note: `構成の観測: NE の完全な取得の時刻 ${observedAt} が古い / 先 (35 時間より前・5 分より先) = 見送り` };
+  }
+  const rawHash = /^[0-9a-f]{64}$/.test(String(g.content_hash ?? '')) ? g.content_hash : (/^[0-9a-f]{64}$/.test(String(m.content_hash ?? '')) ? m.content_hash : null);
+  if (!rawHash) return { state: 'skipped', run_id: g.generation_id, note: '構成の観測: 材料の中身のハッシュが無い = 見送り' };
+  // NE のセット = 材料の構成の行の親 + 商品の材料のセット (構成の行が 0 のセットは行の親に出ない = 数えないと完全に見える・#1571 Codex R1 Medium 1)
+  const byParent = new Map();
+  for (const c of plan.setComponents || []) {
+    const pc = String(c.parentCode ?? '');
+    if (!byParent.has(pc)) byParent.set(pc, []);
+    byParent.get(pc).push(c);
+  }
+  const normCount = new Map();
+  for (const pc of byParent.keys()) normCount.set(normSku(pc), (normCount.get(normSku(pc)) || 0) + 1);
+  const allSets = new Set([...byParent.keys()].map((pc) => normSku(pc)));
+  const zeroRow = [];
+  for (const s of plan.skus || []) {
+    if (s && s.kind === 'set' && normSku(s.code ?? '') && !allSets.has(normSku(s.code))) { allSets.add(normSku(s.code)); zeroRow.push(String(s.code)); }
+  }
+  // Company DB の SKU の種類 (この取引で入れた行も見える)
+  const codes = new Set();
+  for (const [pc, rows] of byParent) { codes.add(normSku(pc)); for (const r of rows) codes.add(normSku(r.childCode ?? '')); }
+  const kindOf = new Map((await db.query('select code_norm, sku_kind from core.skus where code_norm = any($1::text[])', [[...codes].filter(Boolean)])).rows.map((r) => [r.code_norm, r.sku_kind]));
+  const sets = [];
+  const excluded = zeroRow.map((code) => ({ set_code: code, reason: 'no_rows' }));
+  for (const [pc, rows] of byParent) {
+    const kids = rows.map((r) => normSku(r.childCode ?? ''));
+    const reason = !normSku(pc) ? 'no_code' : normCount.get(normSku(pc)) > 1 ? 'duplicate_set' : kindOf.get(normSku(pc)) !== 'set' ? 'not_a_cdb_set'
+      : rows.length > SET_OBSERVATION_MAX_ROWS ? 'too_many_rows' : !kids.every((k) => k && kindOf.has(k)) ? 'unknown_component'
+        : new Set(kids).size !== kids.length ? 'duplicate_component' : !rows.every((r) => observationQtyOf(r.qty) != null) ? 'bad_qty' : null;
+    if (reason) { excluded.push({ set_code: pc, reason }); continue; }
+    sets.push({ set_code: pc, rows: rows.map((r, i) => ({ code: String(r.childCode), qty: observationQtyOf(r.qty), sort: i + 1 })) });
+  }
+  if (allSets.size > SET_OBSERVATION_MAX_SETS) {
+    return { state: 'skipped', run_id: g.generation_id, note: `構成の観測: セットが ${allSets.size} 件 (${SET_OBSERVATION_MAX_SETS} 件より多い) = 見送り`, candidates: [] };
+  }
+  // 1 つでも入れられないセットがある = 完全な回と言わない (complete = false。0050 = 上げる根拠に使わない)。requested = fetched = NE のセットの数
+  const complete = excluded.length === 0;
+  const byReason = excluded.reduce((a, x) => { a[x.reason] = (a[x.reason] || 0) + 1; return a; }, {});
+  const payload = { run_id: g.generation_id, observed_at: observedAt, complete, requested: allSets.size, fetched: allSets.size, raw_hash: rawHash,
+    source_generation: g.generation_id, sets };
+  const t0 = Date.now();
+  await db.query('savepoint set_observations');
+  try {
+    const r = (await db.query('select ops.record_ne_set_observations($1::jsonb) as r', [JSON.stringify(payload)])).rows[0].r;
+    const t1 = Date.now();
+    // 上げる・食い違いを見る候補 (完全な回だけ) = 開いている依頼・開いている食い違いがあるセット、または観測 (構成品・数量) が今の構成と違うセット。
+    //   集合で 1 回に計算する (観測ごとの相関の副問い合わせをしない・#1571 Codex R1 Medium 2)
+    const cands = !complete ? [] : (await db.query(`
+      with o as (select observation_id, set_sku_id, rows from ops.ne_set_observations where run_id = $1),
+      obs_k as (select o.observation_id, array_agg(t.k order by t.k) as k
+                  from o cross join lateral (select coalesce(x ->> 'sku_id', 'unknown:' || (x ->> 'code')) || '|' || (x ->> 'qty') as k from jsonb_array_elements(o.rows) x) t
+                 group by o.observation_id),
+      cur_k as (select c.parent_sku_id, array_agg(c.child_sku_id::text || '|' || c.qty::text order by c.child_sku_id::text || '|' || c.qty::text) as k
+                  from core.sku_components c where c.parent_sku_id in (select set_sku_id from o) group by c.parent_sku_id),
+      open_sets as (select set_sku_id from ops.sku_component_requests where status = 'open' union select set_sku_id from ops.sku_component_breaches where status = 'open')
+      select o.observation_id::text as id
+        from o left join obs_k on obs_k.observation_id = o.observation_id left join cur_k on cur_k.parent_sku_id = o.set_sku_id
+       where o.set_sku_id in (select set_sku_id from open_sets) or coalesce(obs_k.k, '{}') is distinct from coalesce(cur_k.k, '{}')
+       order by o.observation_id`, [g.generation_id])).rows.map((x) => x.id);
+    await db.query('release savepoint set_observations');
+    return { state: r.state, run_id: g.generation_id, observed_at: observedAt, complete, requested: allSets.size, sets: r.sets ?? sets.length,
+      skipped: excluded.length + Number(r.skipped ?? 0), excluded: byReason, candidates: cands, ms: { record: t1 - t0, candidates: Date.now() - t1 },
+      ...(excluded.length ? { note: `構成の観測: 入れられないセット ${excluded.length} 件 (${Object.entries(byReason).map(([k, v]) => `${k} ${v}`).join('・')}) = 完全な回にしない (構成の依頼を上げない)` } : {}) };
+  } catch (e) {
+    await db.query('rollback to savepoint set_observations');
+    return { state: 'failed', run_id: g.generation_id, error: String(e && e.message).slice(0, 300), note: `構成の観測: 書けなかった (${String(e && e.message).slice(0, 120)}) = ロードは続ける`, candidates: [] };
+  }
+}
+
+/**
+ * 昇格の答え (lib/master-write.mjs の promoteComponentRequest の reason) の分け方。どれも投げない (理由を数えるだけ・ロードは成功のまま)
+ *   breaches = 食い違いを残した (NE でやること) / skipped = 書くことが無い (依頼が無く同じ・もっと新しい観測がある・古い・セットでなくなった ほか) /
+ *   retry = 次の観測でもう一度 (保存・ロードの鍵・関わる SKU が増えた・原価の期間の重なり = 人が見る) / before_cutover = 切替の前
+ */
+export const PROMOTE_OUTCOMES = Object.freeze({
+  breaches: Object.freeze(['mismatch', 'stale', 'unrequested_diff', 'underivable']),
+  skipped: Object.freeze(['no_open_request', 'superseded_observation', 'observation_too_old', 'stale_observation', 'incomplete_observation', 'not_a_set', 'no_observation']),
+  retry: Object.freeze(['nightly_load', 'retry', 'cost_overlap']),
+});
+const promoteOutcomeOf = (r) => (r.promoted ? 'promoted' : r.reason === 'before_cutover' ? 'before_cutover'
+  : Object.keys(PROMOTE_OUTCOMES).find((k) => PROMOTE_OUTCOMES[k].includes(r.reason)) || 'other');
+
+/** commit の後: 観測ごとに構成の依頼を上げる / 食い違いを残す (lib/master-write.mjs の promoteComponentRequest・セットごとに 1 取引)。失敗は数えるだけ */
+async function promoteObservedSets(db, ids, { ownership, now, log }) {
+  const { promoteComponentRequest } = await import('../../../lib/master-write.mjs');   // 読み込みの輪 (sources → engine) を避けて使うときに読む
+  const out = { promoted: 0, breaches: 0, skipped: 0, retry: 0, before_cutover: 0, other: 0, errors: 0, reasons: {}, results: [] };
+  for (const id of ids) {
+    try {
+      const r = await promoteComponentRequest(db, id, { ownership, now });
+      out[promoteOutcomeOf(r)]++;
+      if (!r.promoted && r.reason) out.reasons[r.reason] = (out.reasons[r.reason] || 0) + 1;
+      if (r.reason === 'cost_overlap') log(`構成の依頼を上げなかった (観測 ${id}): 原価の期間が重なる = 人が見る`);
+      if (out.results.length < 200) out.results.push({ observation_id: String(id), promoted: !!r.promoted, reason: r.reason });
+    } catch (e) {
+      out.errors++;
+      if (out.results.length < 200) out.results.push({ observation_id: String(id), error: String(e && e.message).slice(0, 200) });
+      log(`構成の依頼の昇格に失敗 (観測 ${id}): ${e && e.message}`);
+    }
+  }
+  return out;
 }
 
 /**

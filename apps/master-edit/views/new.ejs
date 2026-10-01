@@ -82,6 +82,8 @@
           <% } else { %><span class="tag gray">送料の表が読めません</span><% } %></div>
         <div class="fl"><label class="k">推奨保有月数</label><input type="text" data-field="reorder_months" size="5"<%= dis %>> か月</div>
         <% if (!isSet) { %>
+        <div class="fl"><label class="k">JAN</label><input type="text" data-field="jan" size="36" placeholder="4901234567894 (複数はカンマ区切り)"<%= dis %>>
+          <span class="sub">8 桁か 13 桁 (チェック数字も確かめる)・ほかの商品の JAN は入れられない</span></div>
         <div class="fl"><label class="k">ロジザード</label>
           有効期限の管理 <label><input type="radio" name="expiry_managed" data-field="expiry_managed" value="0" checked<%= dis %>> なし</label>
           <label><input type="radio" name="expiry_managed" data-field="expiry_managed" value="1"<%= dis %>> あり</label>
@@ -237,7 +239,7 @@
   function collect() {
     const values = {};
     const keys = isSet ? ['name', 'standard_price', 'shipping_code', 'reorder_months', 'handling_own', 'set_sales_class_override']
-      : ['name', 'standard_price', 'shipping_code', 'tax_rate', 'sales_class', 'primary_supplier', 'reorder_months', 'expiry_managed', 'inbound_date_managed'];
+      : ['name', 'standard_price', 'shipping_code', 'tax_rate', 'sales_class', 'primary_supplier', 'reorder_months', 'expiry_managed', 'inbound_date_managed', 'jan'];
     for (const k of keys) { const v = fieldValue(k); if (v !== undefined && v !== '') values[k] = v; }
     if (isSet) {
       values.components = Array.from(document.querySelectorAll('#comp-rows tr.comp-row'))

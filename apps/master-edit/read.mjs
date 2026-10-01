@@ -13,6 +13,14 @@ import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
 import { latestRun } from '../master-decisions/decide.mjs';
 import { readCardEvent } from '../../lib/product-hub-outbox.mjs';
+import { regItemsOfSku } from '../../lib/master-reg-csv.mjs';
+
+/** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0052) */
+async function selectableSuppliers(db) {
+  const hasReg = await regclass(db, 'ops.supplier_registrations');
+  return (await db.query(`select s.code, s.name from core.suppliers s where s.company_id = $1 and s.active
+     ${hasReg ? "and not exists (select 1 from ops.supplier_registrations r where r.supplier_id = s.supplier_id and r.state <> 'ne_confirmed')" : ''} order by s.code`, [COMPANY_ID])).rows;
+}
 
 export const LIST_LIMIT = 100;
 export const KINDS = Object.freeze({ single: '単品', set: 'セット', exception: '例外' });
@@ -159,8 +167,7 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
         from core.sku_costs where sku_id = $1 order by valid_from desc, created_at desc, sku_cost_id desc limit 30`, [id])).rows.map((c) => ({ ...c, cost_jpy: Number(c.cost_jpy) }));
     const suppliers = (await db.query(`select s.code, s.name, x.is_primary, x.vendor_code from core.supplier_skus x join core.suppliers s on s.supplier_id = x.supplier_id
        where x.sku_id = $1 order by x.is_primary desc, s.code`, [id])).rows;
-    const activeSuppliers = cur.sku_kind === 'single'
-      ? (await db.query('select code, name from core.suppliers where company_id = $1 and active order by code', [COMPANY_ID])).rows : [];
+    const activeSuppliers = cur.sku_kind === 'single' ? await selectableSuppliers(db) : [];
     const jan = cur.product_id ? (await db.query(`select external_value from core.external_ids where entity_type = 'product' and entity_id = $1 and system = 'jan' and id_kind = 'jan' and valid_to is null order by external_value`, [cur.product_id])).rows.map((r) => r.external_value) : [];
     const usedIn = cur.sku_kind === 'single'
       ? (await db.query(`select p.code, p.name, c.qty from core.sku_components c join core.skus p on p.sku_id = c.parent_sku_id where c.child_sku_id = $1 order by p.code_norm limit 50`, [id])).rows.map((r) => ({ ...r, qty: Number(r.qty) }))
@@ -172,8 +179,9 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
     const csvRows = (await regclass(db, 'ops.ne_csv_export_rows'))
       ? (await db.query('select col, child, source, export_id::text as export_id from ops.ne_csv_export_rows where reserved and code_norm = $1 order by col, child', [cur.code_norm])).rows : [];
     const card = await readCardEvent(db, id);
+    const regItems = await regItemsOfSku(db, id);
     return {
-      cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today, card,
+      cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today, card, regItems,
       state: cur.handling === 'discontinued' ? 'discontinued' : 'available',
       derived: cur.sku_kind === 'set' ? setDerivations(cur) : null,
       fields: fieldOwnership(cur.sku_kind, ownership, open && newEntryWritable(phase, ownership)),
@@ -190,7 +198,7 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
 /** 新商品の登録 (画面 D) に出すもの: 切替の段階・有効な仕入先・backfill 済みか (新商品の登録の前提) */
 export async function readNewPage(db) {
   const phase = await readCutoverPhase(db);
-  const activeSuppliers = (await db.query('select code, name from core.suppliers where company_id = $1 and active order by code', [COMPANY_ID])).rows;
+  const activeSuppliers = await selectableSuppliers(db);
   const backfillDone = (await regclass(db, 'ops.master_registration_backfill'))
     ? Number((await db.query('select count(*)::int as n from ops.master_registration_backfill')).rows[0].n) === 1 : false;
   return { phase, activeSuppliers, backfillDone };
