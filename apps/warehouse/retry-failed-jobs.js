@@ -33,6 +33,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { isWarnSummary } from './amazon-fees-outcome.js';
 import { acquireRetryLock, releaseRetryLock } from './retry-lock.js';
+import { financeCoordinatorEnabled } from './finance-coordinator-switch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -83,12 +84,17 @@ export const JOB_DEFINITIONS = {
   //   Settlement の下流 (アカウントフィー build/sync) は翌朝 daily-sync が再集計する冪等設計のため、ここでは coordinator だけ再試行すれば十分。
   // Amazon Ads: 一過性の SP-API fetch failed で落ちた際の自動復旧 (2026-07-13 に Settlement が「JOB_DEFINITIONS 未登録のため未実行」→手動対応になった実績)。
   // ⚠️'Amazon finance build' は --month 引数が動的 (当月) なため未登録のまま (unhandled 通知で顕在化)
+  //   🚨 env CDB_FINANCE_COORDINATOR=1 のときだけ (daily-sync と同じスイッチ・finance-coordinator-switch.js)。無いとき = 下の今までの 2 つ (Amazon Settlement → CompanyDB財務(Amazon))
   'Amazon決済と財務':     { script: 'apps/warehouse/amazon-finance-coverage-run.js', args: ['--source', 'v2'], timeoutMs: 5400000 },
+  // スイッチが無いとき (今までどおり・master と同じ): 決済の取込 (fetch-amazon-settlements.js は今までどおり書く・coverage の lease を取る)
+  'Amazon Settlement':     { script: 'apps/warehouse/fetch-amazon-settlements.js', args: ['--days', '14'], timeoutMs: 3600000 },
   'Amazon Ads (campaign)': { script: 'apps/warehouse/fetch-amazon-ads-campaign.js', args: [], timeoutMs: 1800000 },
   'Amazon Ads (SKU)':      { script: 'apps/warehouse/fetch-amazon-ads.js',          args: [], timeoutMs: 1800000 },
   // Company DB へ Amazon SP の広告費の日次を送る (Company DB構想 11 の ②)。Render と同じ日は送らない・古い世代は受け口が拒む = 再実行安全。上流 = Amazon Ads (SKU) (UPSTREAM_OF)
   'CompanyDB広告費(Amazon)': { script: 'apps/company-db/push/ad-spend.mjs',     args: ['--mall', 'amazon', '--days', '35'], timeoutMs: 600000 },
-  // (旧 'CompanyDB財務(Amazon)' = Amazon の財務の送り手の単独の retry は 2026-10-01 に 'Amazon決済と財務' (coordinator) にまとめた。突き合わせは今までどおり retry に載せない)
+  // スイッチが無いとき (今までどおり・master と同じ): Company DB へ Amazon の財務を送る (F2b-3)。台帳の指紋 + 読み直す鍵 + Render の世代で冪等。retry は曜日に依らず --full。
+  //   スイッチがあるとき = 'Amazon決済と財務' (coordinator) にまとめる。突き合わせ (CompanyDB財務突合(Amazon)) はどちらでも retry に載せない (差の続いた回数を数えている)
+  'CompanyDB財務(Amazon)': { script: 'apps/company-db/push/amazon-finance.mjs', args: ['--full', '--require-backfilled'], timeoutMs: 1800000 },
   // m_products の変化を履歴に記録 (差分 = 今の m_products と最後の履歴を比べて違う分だけ足す = 再実行安全。--baseline は付けない)。観測の原価の上流 (Codex #1549 R3 M2)
   'm_products_history':  { script: 'apps/warehouse/record-m-products-history.js', args: [], timeoutMs: 600000 },
   // Company DB へ観測の原価を送る (D7b-2)。毎回 m_products_history から全部作り直し、Render と同じ中身なら送らない・応答が失われた回は同じ世代で再送 (same) = 再実行安全。上流 = m_products_history (UPSTREAM_OF)
@@ -128,20 +134,20 @@ export const JOB_DEFINITIONS = {
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'm_products_history', 'CompanyDB観測原価', 'Amazon決済と財務', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'CompanyDB広告費(Amazon)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'DBバックアップ', 'CompanyDB見張り'];
+export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'm_products_history', 'CompanyDB観測原価', 'Amazon決済と財務', 'Amazon Settlement', 'CompanyDB財務(Amazon)', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'CompanyDB広告費(Amazon)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'DBバックアップ', 'CompanyDB見張り'];
 
 /**
  * 上流 (取込) → 下流 (その取込の結果を使うジョブ)。下流は、**同じ回で上流を再試行して失敗したら走らせない** (古い・途中の raw を送らない)。
  *   daily-sync は上流が失敗した朝、下流を「⏭️ skipped」の失敗として retry-state に載せる → 上流の再試行が成功した回に下流も走る。
  *   上流が remaining_jobs に無い (= 朝は成功していて下流だけ失敗した・前の回で復旧済み) なら、下流はそのまま走らせる。
- *   🚨 ここに載せてよいのは、上流そのものが retry の対象 (JOB_DEFINITIONS にある) の組だけ (Qoo10・Amazon Ads (SKU)・m_products_history)。上流が retry されない取込 (楽天・Amazon の注文・au PAY・LINE ギフト・NE) は、
+ *   🚨 ここに載せてよいのは、上流そのものが retry の対象 (JOB_DEFINITIONS にある) の組だけ (Qoo10・Amazon Ads (SKU)・Amazon Settlement (スイッチが無いとき)・m_products_history)。上流が retry されない取込 (楽天・Amazon の注文・au PAY・LINE ギフト・NE) は、
  *      朝に見送った送信を retry に載せない (= 翌朝の daily-sync が台帳の指紋で追いつく)。載せると、取込が失敗したままの raw を送ってしまう
  *   RETRY_ORDER では上流を下流より前に置く (scripts/test-retry-upstream.mjs が確かめる)
  */
 export const UPSTREAM_OF = {
   'CompanyDB注文(Qoo10)': 'Qoo10',
   'CompanyDB広告費(Amazon)': 'Amazon Ads (SKU)',
-  // (旧 'CompanyDB財務(Amazon)': 'Amazon Settlement' = 2026-10-01 に coordinator 'Amazon決済と財務' の 1 工程にまとめた = 上流と下流の組は無い)
+  'CompanyDB財務(Amazon)': 'Amazon Settlement',   // 決済の取込 → Company DB の Amazon 財務 (F2b-3。#1536 Codex R1)。スイッチが無いときだけ走る (あるときは coordinator の 1 工程 = 組は無い)
   'CompanyDB観測原価': 'm_products_history',       // 原価の履歴の記録 → Company DB の観測の原価 (D7b-2。#1549 Codex R3 M2)
 };
 /**
@@ -265,15 +271,22 @@ function toJstDate(d) {
  *   { found: true, state: null, parseError }      破損 (呼び出し側で deleteState を試みる)
  */
 /**
- * 旧い工程の名前 → 新しい名前 (#1567 R1 L4)。マージの前の朝に書かれた retry-state を、マージの後の retry が読んでも走らせる
- *   'Amazon Settlement' / 'CompanyDB財務(Amazon)' = 2026-10-01 に coordinator 'Amazon決済と財務' の 1 工程にまとめた
+ * 工程の名前の読み替え (#1567 R1 L4・スイッチ)。朝の daily-sync と retry の間にスイッチ (env CDB_FINANCE_COORDINATOR) が変わっても、今のスイッチの工程で走らせる
+ *   スイッチがある = 'Amazon Settlement' / 'CompanyDB財務(Amazon)' → coordinator 'Amazon決済と財務' の 1 工程
+ *   スイッチが無い = 'Amazon決済と財務' → 今までの 2 工程 'Amazon Settlement'・'CompanyDB財務(Amazon)' (順もこの順 = 上流が先)
  */
 export const RENAMED_JOBS = Object.freeze({ 'Amazon Settlement': 'Amazon決済と財務', 'CompanyDB財務(Amazon)': 'Amazon決済と財務' });
-/** remaining_jobs の旧い名前を新しい名前に (重複は 1 つに・順は最初に出た位置) */
-export function renameRetryJobs(jobs) {
+export const LEGACY_JOBS_OF = Object.freeze({ 'Amazon決済と財務': Object.freeze(['Amazon Settlement', 'CompanyDB財務(Amazon)']) });
+/** remaining_jobs の名前を今のスイッチの工程に (重複は 1 つに・順は最初に出た位置) */
+export function renameRetryJobs(jobs, { coordinator = financeCoordinatorEnabled() } = {}) {
   if (!Array.isArray(jobs)) return jobs;
   const out = [];
-  for (const j of jobs) { const n = Object.hasOwn(RENAMED_JOBS, j) ? RENAMED_JOBS[j] : j; if (!out.includes(n)) out.push(n); }
+  const add = (n) => { if (!out.includes(n)) out.push(n); };
+  for (const j of jobs) {
+    if (coordinator && Object.hasOwn(RENAMED_JOBS, j)) add(RENAMED_JOBS[j]);
+    else if (!coordinator && Object.hasOwn(LEGACY_JOBS_OF, j)) LEGACY_JOBS_OF[j].forEach(add);
+    else add(j);
+  }
   return out;
 }
 

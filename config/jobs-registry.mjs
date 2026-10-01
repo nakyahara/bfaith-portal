@@ -462,6 +462,9 @@ export const JOBS_REGISTRY = [
       + '「Settlement 重複除去テスト」(apps/warehouse/test-settlement-dedup-occurrence.js。同じ決済の同じ鍵の本物の別々の行を潰さない = 出現順つき。#1511) も走る (どちらも一時 DB だけ・失敗しても後続は止めない。新しい定期実行は無い)。'
       + '🆕 2026-10-01 (D7b-1b-3・設計 = AI_reference CompanyDB構想/13 §3.1・D-65・D-66): 前の「Amazon Settlement」(取込) と「CompanyDB財務(Amazon)」(Company DB Amazon 財務 push) の 2 工程を '
       + '「Amazon決済と財務」(apps/warehouse/amazon-finance-coverage-run.js = coordinator・工程の上限 90 分) の 1 工程にまとめた (新しい定期実行ではない・retry の単位も同じ 1 工程)。'
+      + '🚨 ただし coordinator で回すのは .env に CDB_FINANCE_COORDINATOR=1 があるときだけ (スイッチ = apps/warehouse/finance-coordinator-switch.js・#1567・一時物 cdb-finance-coordinator-switch)。'
+      + '無い朝は今までどおり「Amazon Settlement」(fetch-amazon-settlements.js --days 14 = 書く取込・coverage の lease を取る) → 「CompanyDB財務(Amazon)」(amazon-finance.mjs 日曜 --full・ほか --incremental) の 2 工程 (retry も同じスイッチで名前を読み替える)。'
+      + '足すのは夜に手で実の --full を 1 回流して exit 0・60 分以内・最大メモリ 1,200 MB 以下に合格した後 (中原さんの指示の後)。'
       + 'coordinator は warehouse.db の lease (amazon_finance_coverage_lease の 1 行・持ち主の判定は retry-lock.js と同じ) を持ち、① 過去の決済の行に文書の版が無ければ ❌ で止まる (重い版付けは流さない = 夜に手で migrate-settlement-document-versions.js --commit。#1567 Codex R1) '
       + '② Render の決済のそろい (core.finance_coverage・0050) を新しい世代で updating (失敗なら取込を始めない) ③ 手で積んだ決済のファイル (amazon-settlement-manual-file.js) → SP-API の取込 (V2・一覧を記録。初期の印の順番待ちも updating の後に入れる) '
       + '④ 財務の送信 (全部の chunk に世代・token・coverage の回は --full) ⑤ 完成の判定 (一覧の鎖・初期の印・採った文書の版・receipt digest・source_revision の読み直し) → complete を 1 回として回す。'
@@ -1496,6 +1499,26 @@ export const JOBS_REGISTRY = [
     lifecycle: 'temporary',
     runbook: 'cdb-coverage-legacy-path を消した後、Render の受け口で token の無い chunk を 409 にする PR を作る (人のバックフィルも coordinator の回か token つきで送る形に)。'
       + '消す前に core.finance_coverage の invalidated_reason = untokened_finance_write が 2 週間出ていないことを確かめる。このエントリも消す',
+  },
+  {
+    id: 'cdb-finance-coordinator-switch',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'Amazon の決済と財務を coordinator (amazon-finance-coverage-run.js・PR #1567) で回すかのスイッチ = env CDB_FINANCE_COORDINATOR (=1 のときだけ coordinator)。'
+      + '無い間は daily-sync・retry が今までの 2 工程 (Amazon Settlement → CompanyDB財務(Amazon)) のまま動く = miniPC の本体がほかの PR の deploy で pull されても、'
+      + '定期実行の前のハードゲート (夜に手で実の --full を 1 回: exit 0・60 分以内・最大メモリ 1,200 MB 以下) に合格する前に新しい coordinator が毎朝動き出さない。'
+      + '一時物にした理由 = 設計の終わりの形は「決済の取込と財務の送信は coordinator だけ」(今までの 2 工程は token の無い chunk で Render の complete を毎朝無効にする = 正式な利益が出ない) = '
+      + '合格して足した後はスイッチを残す意味が無い (残すと 2 つの道の試験と保守が続く)',
+    where: 'bfaith-portal リポジトリ apps/warehouse/finance-coordinator-switch.js (スイッチと工程の選び方)・apps/warehouse/daily-sync.js (工程)・apps/warehouse/retry-failed-jobs.js '
+      + '(Amazon Settlement / CompanyDB財務(Amazon) の定義と名前の読み替え)・apps/warehouse/fetch-amazon-settlements.js / apps/company-db/push/amazon-finance.mjs の単独の入口 (無い = 今までどおり書く)・'
+      + 'miniPC の .env の CDB_FINANCE_COORDINATOR',
+    remove_by: '2026-11-30',
+    lifecycle: 'temporary',
+    runbook: '① 夜に手で実の --full を 1 回 (README「デプロイの前に本番の DB のコピーで測る」・PR #1567 の手順) → 合格したら中原さんの指示の後に miniPC の .env に CDB_FINANCE_COORDINATOR=1 を足す '
+      + '(🚨 .env はリポジトリの直下の 1 つだけ・足す 1 行だけ書き、ほかの行を書き直さない = 2026-09-30 に .env を書き直して CDB_DB_LIMIT_BYTES など 4 つが消えた。足した後は Restart-Service と翌朝の daily-sync の「Amazon決済と財務」を見る) '
+      + '② 1 週間 coordinator で回ったら、スイッチ・今までの 2 工程の分岐 (daily-sync / retry の定義 / 単独の入口の書く道)・その試験を消して常に coordinator にする PR を作る。.env の行も消す。このエントリも消す。'
+      + '合格しないまま期限が来たら延ばす前に相談 (今までの 2 工程のままでは正式な利益が出ない)',
   },
   {
     id: 'rclone-own-client-id',

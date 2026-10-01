@@ -65,8 +65,10 @@ import {
   recordInventorySnapshot, inventoryClientOptions,
 } from './amazon-settlement-inventory.js';
 import {
-  documentVersionId, registerDocumentVersion, refreshVersionDetail, selectedVersionOf, dirtyVersionOrders, assertLease,
+  documentVersionId, registerDocumentVersion, refreshVersionDetail, selectedVersionOf, dirtyVersionOrders, assertLease, acquireCoverageLease, releaseCoverageLease,
 } from './amazon-settlement-versions.js';
+import { financeCoordinatorEnabled, FINANCE_COORDINATOR_ENV } from './finance-coordinator-switch.js';
+import { isAliveNodeSince } from './retry-lock.js';
 
 const REGION = 'fe';
 const MARKETPLACE_ID = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
@@ -117,15 +119,20 @@ function getInventoryClient() {
 const nowIso = () => new Date().toISOString();
 const nowSql = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
 
-/** 単独で流すときの引数。🚨 書く取込は coordinator だけ = ここは常に dry-run (--dry-run は互換のために受ける・--commit は拒む) */
-export function parseArgs(argv = process.argv.slice(2)) {
-  const r = { reportId: null, dryRun: true, source: 'v2' };
+/**
+ * 単独で流すときの引数 (スイッチ = env CDB_FINANCE_COORDINATOR・finance-coordinator-switch.js・#1567)。
+ *   スイッチがある = 書く取込は coordinator だけ = ここは常に dry-run (--dry-run は互換のために受ける・--commit は拒む)
+ *   スイッチが無い = 今までどおり (master と同じ) 書く (daily-sync の「Amazon Settlement」= --days 14)。--dry-run で書かない
+ */
+export function parseArgs(argv = process.argv.slice(2), { coordinator = financeCoordinatorEnabled() } = {}) {
+  const r = { reportId: null, dryRun: coordinator, source: 'v2' };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--report-id' && argv[i + 1]) r.reportId = argv[++i];
     else if (argv[i] === '--dry-run') r.dryRun = true;
     else if (argv[i] === '--source' && argv[i + 1]) r.source = argv[++i];
     else if (argv[i] === '--days' && argv[i + 1]) i++;   // 昔から読んでいない (daily-sync の名残)
-    else if (argv[i] === '--commit') throw new Error('書く取込は coordinator (node apps/warehouse/amazon-finance-coverage-run.js) の回の中だけ (lease の世代・token を確かめて書く。設計 13 §3.1)。単独は dry-run / --report-id の調べだけ');
+    else if (argv[i] === '--commit' && coordinator) throw new Error('書く取込は coordinator (node apps/warehouse/amazon-finance-coverage-run.js) の回の中だけ (lease の世代・token を確かめて書く。設計 13 §3.1)。単独は dry-run / --report-id の調べだけ');
+    else if (argv[i] === '--commit') r.dryRun = false;   // スイッチが無いとき = 既定でも書く (明示しただけ)
     else throw new Error(`知らない引数: ${argv[i]}`);
   }
   if (!Object.hasOwn(SOURCES, r.source)) throw new Error(`--source は v1 か v2: ${r.source}`);
@@ -836,16 +843,27 @@ export function spClients({ withInventory = true } = {}) {
 }
 
 async function main() {
-  const args = parseArgs();
+  const coordinator = financeCoordinatorEnabled();
+  const args = parseArgs(process.argv.slice(2), { coordinator });
   const runId = `settlement-${Date.now()}`;
   const src = SOURCES[args.source];
-  console.log(`[settlements] run_id=${runId}, dry-run=${args.dryRun} (単独は書かない・書く取込は amazon-finance-coverage-run.js), source=${args.source} (${src.reportType})`);
+  console.log(`[settlements] run_id=${runId}, dry-run=${args.dryRun} (${coordinator ? '単独は書かない・書く取込は amazon-finance-coverage-run.js' : `${FINANCE_COORDINATOR_ENV} が無い = 今までどおり書く・coverage の lease を取る`}), source=${args.source} (${src.reportType})`);
 
   await initDB();
   const db = getDB();
 
-  // --report-id の回は一覧を取らない = 専用の接続も作らない
-  const { blocked } = await runSettlementFetch(args, { db, sp: getClient(), inventorySp: args.reportId ? null : getInventoryClient(), runId });
+  // スイッチが無いときの書く取込は coverage の lease を取る (手で流す coordinator・版付けと重ならない。生の表は lease の下で書く = coordinator と同じ確かめ)
+  let lease = null;
+  if (!args.dryRun) {
+    const got = acquireCoverageLease(db, { isAlive: isAliveNodeSince });
+    if (!got.ok) throw new Error(`coverage の lease を別の回が持っている (pid ${got.held.pid}・開始 ${got.held.started_at}) = coordinator か版付けが動いている。終わってから流す`);
+    lease = got.lease;
+  }
+  let blocked;
+  try {
+    // --report-id の回は一覧を取らない = 専用の接続も作らない
+    ({ blocked } = await runSettlementFetch(args, { db, sp: getClient(), inventorySp: args.reportId ? null : getInventoryClient(), runId, lease }));
+  } finally { if (lease) releaseCoverageLease(db, lease); }
   if (blocked.length) {
     console.error(`[settlements] ❌ 取り込めない V2 のレポート ${blocked.length} 本: ${JSON.stringify(blocked)}`);
     console.error('[settlements] → apps/warehouse/amazon-settlement-v2.js に規則を足す (V1 の書き方に合わせる。11/11 までは --source v1 でも取れる)');

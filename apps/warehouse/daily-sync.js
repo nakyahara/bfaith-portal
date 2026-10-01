@@ -16,6 +16,7 @@ import { isWarnSummary } from './amazon-fees-outcome.js';
 import { isMonthStartGraceSummary, monthStartEmptyGrace, monthStartGraceDays, prevMonthOf } from './finance-dq-month-mode.js';
 import { waitOtherRunGone, isAliveNodeSince, remainingRetrySlots } from './retry-lock.js';
 import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS } from './amazon-finance-months.js';
+import { financeCoordinatorEnabled, settlementStep, financePushStep, FINANCE_COORDINATOR_ENV } from './finance-coordinator-switch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -85,7 +86,9 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'm_products_history', 'CompanyDB観測原価'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価'];
+// 🚨 Amazon の決済と財務は env CDB_FINANCE_COORDINATOR=1 のときだけ coordinator「Amazon決済と財務」の 1 工程・無ければ今までの 2 工程「Amazon Settlement」→「CompanyDB財務(Amazon)」
+//   (finance-coordinator-switch.js・#1567。走るのはどちらか片方 = retry の対象には両方の名前を載せる)
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -575,8 +578,14 @@ async function main() {
   //   決済の行 → settlement_refresh_queue の月 → 後段の mart rebuild・Amazon finance build が拾う (今までと同じ)。
   //   ⚠️ = 初期の印が無いなど人が直すまで complete にしない (exit 0)・❌ = 失敗 (retry = 同じ coordinator の 1 回)・終了コード 3 = 取り込めない V2 (規則を足す)
   //   引数を必ず渡す (runScript は引数なしだと '7' を足す)
-  const settlementResult = runScript('apps/warehouse/amazon-finance-coverage-run.js --source v2', 'Amazon決済と財務', 5400000);
-  results.push({ name: 'Amazon決済と財務', ...settlementResult, warn: settlementResult.success && isWarnSummary(settlementResult.summary) });
+  // 🚨 スイッチ (#1567・finance-coordinator-switch.js): env CDB_FINANCE_COORDINATOR=1 のときだけ coordinator。無ければ今までどおり
+  //   「Amazon Settlement」(fetch-amazon-settlements.js --days 14 = 書く取込) → 後ろの「CompanyDB財務(Amazon)」(amazon-finance.mjs) の 2 工程。
+  //   足すのは定期実行の前のハードゲート (夜に手で実の --full を 1 回) に合格した後・中原さんの指示の後 (台帳 cdb-finance-coordinator-switch・2026-11-30 までにスイッチを消す)
+  const financeCoordinator = financeCoordinatorEnabled();
+  const settleStep = settlementStep({ coordinator: financeCoordinator });
+  console.log(`[DailySync] Amazon の決済と財務: ${financeCoordinator ? 'coordinator (Amazon決済と財務)' : `今までの 2 工程 (${FINANCE_COORDINATOR_ENV} が無い)`}`);
+  const settlementResult = runScript(settleStep.cmd, settleStep.label, settleStep.timeoutMs);
+  results.push(financeCoordinator ? { name: settleStep.name, ...settlementResult, warn: settlementResult.success && isWarnSummary(settlementResult.summary) } : { name: settleStep.name, ...settlementResult });
 
   // ABA「Amazon検索用語」週次取込 (セラースプライト置換、aba.db 別建て)
   // 取込済み週は即skip・レポート未公開 (集計中) は正常skip の冪等設計なので毎朝呼んでよい。
@@ -909,8 +918,23 @@ async function main() {
       console.log('[DailySync] Amazonアカウントフィー sync は build 失敗のためスキップ');
     }
 
+    // === Company DB の Amazon 財務 (F2b-3。設計 = AI_reference CompanyDB構想/12 §5) ===
+    // スイッチが無い朝 (今までどおり): 決済の行を 注文 × 計上日 × SKU × 行の種類 にまとめて Company DB (0043) へ。
+    //   日曜は --full・ほかは --incremental。バックフィルの完了印の前はどちらも「⏭️ バックフィル前」(exit 0)。送信の失敗・送れない鍵 / 行 = ❌ (retry = --full)。拾われない金額 = ⚠️。
+    //   決済の取込 (Amazon Settlement) が失敗した朝は送らない (途中・古い raw を送らない)。見送りも失敗として retry に載せ、取込の再試行が成功した回に送る
+    //   (retry-failed-jobs.js の UPSTREAM_OF。#1536 Codex R1 Medium)。🚨 token の無い chunk = Render は Amazon 財務の complete を無効にする (coordinator の回で作り直す)
+    const pushStep = financePushStep(businessDate, { coordinator: financeCoordinator });
+    let cdbFinanceResult = null;
+    if (pushStep && settlementResult.success) {
+      cdbFinanceResult = runScript(pushStep.cmd, pushStep.label, pushStep.timeoutMs);
+      results.push({ name: pushStep.name, ...cdbFinanceResult, warn: cdbFinanceResult.success && isWarnSummary(cdbFinanceResult.summary) });
+    } else if (pushStep) {
+      cdbFinanceResult = { success: false, summary: '⏭️ skipped (Amazon Settlement の取込が失敗。取込の再試行が成功したら送る)' };
+      results.push({ name: pushStep.name, ...cdbFinanceResult });
+    }
+
     // === Company DB の Amazon 財務の突き合わせ (F2b-3。設計 = AI_reference CompanyDB構想/12 §5) ===
-    // 🆕 2026-10-01 (D7b-1b-3): 財務の送信は上の「Amazon決済と財務」(coordinator) の中 (前はここの「CompanyDB財務(Amazon)」= 別の工程)。
+    // 🆕 2026-10-01 (D7b-1b-3): スイッチがある朝は、財務の送信は上の「Amazon決済と財務」(coordinator) の中 (無い朝は上の「CompanyDB財務(Amazon)」)。
     //   ここは送った後の SQLite (日次の財務・月の手数料) と Render を比べるだけ。差の月は日次の財務 / 月の手数料のやり残しに登録 (次の朝の build が作り直す)。
     //   差が 1 回目 ⚠️・2 回続けば ❌。突き合わせは retry に載せない (差の続いた回数を数えている = retry のたびに数が進む。送信が retry で通った朝は、翌朝の突き合わせで見る)
     // 突き合わせは実際に送った朝だけ (バックフィル前の「財務 push: ⏭️」・coordinator の失敗の朝は起動しない。#1536 Codex R1 Low)。
@@ -920,7 +944,10 @@ async function main() {
     // 送ったかは coordinator の小さな記録 (DATA_DIR/amazon-finance-coverage-last.json) の構造の値で決める (要約の文字で決めない・#1567 R1 L3)。
     //   同じ daily-sync の回 (DAILY_SYNC_RUN_ID) の記録で finance_pushed = true のときだけ。読めない = 見送る (安全側)
     //   coordinator が coverage の理由で exit 1 でも、財務を送った朝は突き合わせる (#1567 R2 L2)
-    const financeSent = coordinatorPushedFinance(process.env.DATA_DIR, process.env.DAILY_SYNC_RUN_ID);
+    //   スイッチが無い朝は今までどおり = 送り手の工程が成功し、要約が「⏭️」(バックフィル前) でない朝だけ
+    const financeSent = financeCoordinator
+      ? coordinatorPushedFinance(process.env.DATA_DIR, process.env.DAILY_SYNC_RUN_ID)
+      : !!(cdbFinanceResult && cdbFinanceResult.success && !String(cdbFinanceResult.summary || '').trimStart().startsWith('⏭️'));
     if (!financeSqliteFresh) console.log(`[DailySync] Company DB Amazon 財務の突き合わせはスキップ (比べる側の build が失敗: 日次の財務 ${financeBuildFailed.join(', ') || 'OK'} / 月の手数料 ${accountFeesBuildResult.success ? 'OK' : '失敗'})`);
     if (financeSqliteFresh && financeSent) {
       const cdbFinanceRecResult = runScript('apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled', 'Company DB Amazon 財務 突き合わせ', 600000);

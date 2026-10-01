@@ -55,6 +55,7 @@ import { aggregateOrderFinance, financePayload, isRealDate, RAW_COLUMNS, AMAZON_
 import { addPendingMonths, ACCOUNT_FEES_PENDING_FILE, PENDING_FILE } from '../../warehouse/amazon-finance-months.js';
 import { filterSelectedRows } from './amazon-finance-transform.mjs';
 import { selectDocumentVersions, assertDocumentVersionsReady, VERSION_SELECT_SQL } from '../../warehouse/amazon-settlement-versions.js';
+import { financeCoordinatorEnabled, FINANCE_COORDINATOR_ENV } from '../../warehouse/finance-coordinator-switch.js';
 
 export const FINANCE_KIND = `order_finance:${FINANCE_MALL}`;
 export const FINANCE_FLOOR = '2026-01-01';            // policy (0043) の始まり = 決済の行の始まり
@@ -640,10 +641,12 @@ async function main() {
       process.exitCode = rr.level === 'error' ? 1 : 0;
       return;
     }
-    // 🚨 D7b-1b-3: 送る回 (--incremental / --full) は coordinator (amazon-finance-coverage-run.js) の中だけ。単独は dry-run・バックフィル (--from/--to) だけ
-    if (!a.dryRun && (mode === 'incremental' || mode === 'full')) {
-      throw new Error('--incremental / --full で送るのは coordinator (node apps/warehouse/amazon-finance-coverage-run.js) の回の中だけ (決済の取込・coverage の世代と token と一緒)。単独は --dry-run で調べる');
+    // 🚨 D7b-1b-3: スイッチ (env CDB_FINANCE_COORDINATOR=1) があるとき、送る回 (--incremental / --full) は coordinator (amazon-finance-coverage-run.js) の中だけ。単独は dry-run・バックフィル (--from/--to) だけ。
+    //   スイッチが無いとき = 今までどおり (daily-sync の「CompanyDB財務(Amazon)」・retry の --full)。token の無い chunk = Render は Amazon 財務の complete を無効にする
+    if (!a.dryRun && (mode === 'incremental' || mode === 'full') && financeCoordinatorEnabled()) {
+      throw new Error(`--incremental / --full で送るのは coordinator (node apps/warehouse/amazon-finance-coverage-run.js) の回の中だけ (${FINANCE_COORDINATOR_ENV}=1・決済の取込・coverage の世代と token と一緒)。単独は --dry-run で調べる`);
     }
+    if (!a.dryRun && (mode === 'incremental' || mode === 'full')) console.log(`ℹ️ ${FINANCE_COORDINATOR_ENV} が無い = 今までどおり送る (token の無い chunk = Render は Amazon 財務の complete を無効にする)`);
     if (!a.dryRun && mode === 'range') console.log('⚠️ --from/--to の送信は token の無い chunk = Render は Amazon 財務の complete を無効にする (次の coordinator の回で作り直す)');
     const capacity = a.dryRun ? null : capacityFromEnv();
     if (!a.dryRun && !(capacity.limitBytes > 0)) throw new Error('容量の上限 (CDB_DB_LIMIT_BYTES) が無い = D-W5 (Render の Postgres のプラン) を決めるまで送らない。まず --dry-run');

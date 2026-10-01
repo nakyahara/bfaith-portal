@@ -892,25 +892,58 @@ await t('日曜 (JST の業務日) は --full・ほかは --incremental・どち
   assert.deepEqual(amazonFinanceDailyArgs('2026-10-03'), ['--incremental', '--require-backfilled']); // 土曜
   assert.throws(() => amazonFinanceDailyArgs('2026/10/04'), /YYYY-MM-DD/);
 });
-await t('daily-sync (🆕 2026-10-01 D7b-1b-3): 決済の取込と財務の送信は coordinator の 1 工程 (Amazon決済と財務)・送れたときだけ突き合わせ・retry の単位も coordinator・突き合わせは retry に載せない', async () => {
+await t('🚨 daily-sync のスイッチ (#1567): env CDB_FINANCE_COORDINATOR が無い = master (PR #1567 の前) と同じ 2 工程・同じ引数 (Amazon Settlement → CompanyDB財務(Amazon)) / =1 のときだけ coordinator の 1 工程 (Amazon決済と財務)・retry も同じスイッチ', async () => {
+  const { financeCoordinatorEnabled, settlementStep, financePushStep, FINANCE_COORDINATOR_ENV } = await import('../apps/warehouse/finance-coordinator-switch.js');
+  assert.equal(FINANCE_COORDINATOR_ENV, 'CDB_FINANCE_COORDINATOR');
+  const saved = process.env.CDB_FINANCE_COORDINATOR;
+  delete process.env.CDB_FINANCE_COORDINATOR;
+  try {
+    // スイッチが無い (既定) = master の daily-sync と同じ: runScript('apps/warehouse/fetch-amazon-settlements.js --days 14', 'Amazon Settlement', 3600000) /
+    //   runScript(`apps/company-db/push/amazon-finance.mjs ${financeArgs.join(' ')}`, `Company DB Amazon 財務 push (${financeArgs[0]})`, 1800000) (日曜 --full・ほか --incremental)
+    assert.equal(financeCoordinatorEnabled(), false, '既定 (env が無い) は今までの 2 工程');
+    assert.deepEqual(settlementStep(), { name: 'Amazon Settlement', cmd: 'apps/warehouse/fetch-amazon-settlements.js --days 14', label: 'Amazon Settlement', timeoutMs: 3600000 });
+    assert.deepEqual(financePushStep('2026-10-05'), { name: 'CompanyDB財務(Amazon)', cmd: 'apps/company-db/push/amazon-finance.mjs --incremental --require-backfilled', label: 'Company DB Amazon 財務 push (--incremental)', timeoutMs: 1800000 });
+    assert.deepEqual(financePushStep('2026-10-04'), { name: 'CompanyDB財務(Amazon)', cmd: 'apps/company-db/push/amazon-finance.mjs --full --require-backfilled', label: 'Company DB Amazon 財務 push (--full)', timeoutMs: 1800000 });   // 日曜
+    for (const v of ['', '0', 'true', 'yes', ' 2 ']) assert.equal(financeCoordinatorEnabled({ CDB_FINANCE_COORDINATOR: v }), false, `「${v}」は off`);
+    assert.equal(financeCoordinatorEnabled({ CDB_FINANCE_COORDINATOR: ' 1 ' }), true);
+    // スイッチがある = coordinator の 1 工程・送り手の工程は無い
+    process.env.CDB_FINANCE_COORDINATOR = '1';
+    assert.deepEqual(settlementStep(), { name: 'Amazon決済と財務', cmd: 'apps/warehouse/amazon-finance-coverage-run.js --source v2', label: 'Amazon決済と財務', timeoutMs: 5400000 });
+    assert.equal(financePushStep('2026-10-05'), null);
+    // retry (同じスイッチ): 朝と retry の間にスイッチが変わっても今のスイッチの工程で走らせる
+    const { renameRetryJobs, UPSTREAM_OF, JOB_DEFINITIONS, RETRY_ORDER } = await import('../apps/warehouse/retry-failed-jobs.js');
+    assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon Settlement', 'CompanyDB財務(Amazon)']), ['f_sales', 'Amazon決済と財務'], 'スイッチがある = 今までの 2 工程の名前 → coordinator');
+    delete process.env.CDB_FINANCE_COORDINATOR;
+    assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon決済と財務']), ['f_sales', 'Amazon Settlement', 'CompanyDB財務(Amazon)'], 'スイッチが無い = coordinator の名前 → 今までの 2 工程 (上流が先)');
+    assert.deepEqual(renameRetryJobs(['CompanyDB財務(Amazon)', 'Render同期']), ['CompanyDB財務(Amazon)', 'Render同期'], 'スイッチが無い = 今までの名前はそのまま');
+    // retry の定義 = master と同じ (今までの 2 工程) + coordinator
+    assert.deepEqual(JOB_DEFINITIONS['Amazon Settlement'], { script: 'apps/warehouse/fetch-amazon-settlements.js', args: ['--days', '14'], timeoutMs: 3600000 });
+    assert.deepEqual(JOB_DEFINITIONS['CompanyDB財務(Amazon)'], { script: 'apps/company-db/push/amazon-finance.mjs', args: ['--full', '--require-backfilled'], timeoutMs: 1800000 });
+    assert.deepEqual(JOB_DEFINITIONS['Amazon決済と財務'], { script: 'apps/warehouse/amazon-finance-coverage-run.js', args: ['--source', 'v2'], timeoutMs: 5400000 });
+    assert.equal(UPSTREAM_OF['CompanyDB財務(Amazon)'], 'Amazon Settlement', '今までどおり: 決済の取込が失敗した回は送らない');
+    assert.ok(RETRY_ORDER.indexOf('Amazon Settlement') < RETRY_ORDER.indexOf('CompanyDB財務(Amazon)') && RETRY_ORDER.includes('Amazon決済と財務'));
+  } finally { if (saved === undefined) delete process.env.CDB_FINANCE_COORDINATOR; else process.env.CDB_FINANCE_COORDINATOR = saved; }
+  // daily-sync の配線 (import すると main が走るので本文で確かめる): 工程はスイッチの部品から取る・順 = 取込 → 手数料 → 送り手 → 突き合わせ
   const src = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/daily-sync.js'), 'utf8');
-  const iCoord = src.indexOf("runScript('apps/warehouse/amazon-finance-coverage-run.js --source v2', 'Amazon決済と財務'"), iFees = src.indexOf("'Amazonアカウントフィー sync', 300000"), iRec = src.indexOf("'apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled'");
-  assert.ok(iCoord > 0 && iFees > iCoord && iRec > iFees, `${iCoord} ${iFees} ${iRec}`);
-  assert.ok(!src.includes("'apps/warehouse/fetch-amazon-settlements.js --days 14'") && !src.includes('amazon-finance.mjs ${financeArgs'), '旧い 2 工程 (取込・送り手) は無い');
-  // 送ったかは coordinator の記録の構造の値 (要約の文字でない・#1567 R1 L3)。財務 push: ⏭️ (バックフィル前) の朝・失敗の朝は突き合わせない
-  assert.ok(src.includes('const financeSent = coordinatorPushedFinance(process.env.DATA_DIR, process.env.DAILY_SYNC_RUN_ID);'), '突き合わせの条件 (送った朝は coordinator の exit に依らず・#1567 R2 L2)');
-  assert.match(src, /j\.finance_pushed === true && j\.finance_push_ok === true && \(runId == null \|\| j\.daily_sync_run_id === runId\)/);   // 送信の途中の失敗の朝は比べない (#1567 R3 L2)
+  const iSw = src.indexOf('const financeCoordinator = financeCoordinatorEnabled();'), iSettle = src.indexOf('const settlementResult = runScript(settleStep.cmd, settleStep.label, settleStep.timeoutMs);'),
+    iFees = src.indexOf("'Amazonアカウントフィー sync', 300000"), iPush = src.indexOf('cdbFinanceResult = runScript(pushStep.cmd, pushStep.label, pushStep.timeoutMs);'),
+    iRec = src.indexOf("'apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled'");
+  assert.ok(iSw > 0 && iSettle > iSw && iFees > iSettle && iPush > iFees && iRec > iPush, `${iSw} ${iSettle} ${iFees} ${iPush} ${iRec}`);
+  assert.ok(src.includes('const settleStep = settlementStep({ coordinator: financeCoordinator });') && src.includes('const pushStep = financePushStep(businessDate, { coordinator: financeCoordinator });'));
+  // スイッチが無い朝 = master と同じ: 取込の結果の名前 (warn なし)・取込が失敗した朝は送らずに ⏭️ (retry に載せる)
+  assert.match(src, /results\.push\(financeCoordinator \? \{ name: settleStep\.name, \.\.\.settlementResult, warn: settlementResult\.success && isWarnSummary\(settlementResult\.summary\) \} : \{ name: settleStep\.name, \.\.\.settlementResult \}\);/);
+  assert.match(src, /if \(pushStep && settlementResult\.success\) \{[\s\S]{0,300}\} else if \(pushStep\) \{\s*cdbFinanceResult = \{ success: false, summary: '⏭️ skipped \(Amazon Settlement の取込が失敗。取込の再試行が成功したら送る\)' \};/);
+  // 突き合わせの条件: スイッチがある = coordinator の記録の構造の値 (#1567 R1 L3・R2 L2・R3 L2) / 無い = 今までどおり送り手が成功して ⏭️ でない朝
+  assert.match(src, /const financeSent = financeCoordinator\s*\? coordinatorPushedFinance\(process\.env\.DATA_DIR, process\.env\.DAILY_SYNC_RUN_ID\)\s*: !!\(cdbFinanceResult && cdbFinanceResult\.success && !String\(cdbFinanceResult\.summary \|\| ''\)\.trimStart\(\)\.startsWith\('⏭️'\)\);/);
+  assert.match(src, /j\.finance_pushed === true && j\.finance_push_ok === true && \(runId == null \|\| j\.daily_sync_run_id === runId\)/);
   assert.match(src, /if \(financeSqliteFresh && financeSent\) \{\s*const cdbFinanceRecResult/);
   assert.match(src, /const financeSqliteFresh = financeBuildFailed\.length === 0 && accountFeesBuildResult\.success;/);
   assert.match(src, /financeFailed\.push\(month\);\s*financeBuildFailed\.push\(month\);/);   // build の失敗だけを数える (sync の失敗は SQLite に関係しない)
-  const { UPSTREAM_OF, JOB_DEFINITIONS, RETRY_ORDER } = await import('../apps/warehouse/retry-failed-jobs.js');
-  assert.ok(!Object.hasOwn(UPSTREAM_OF, 'CompanyDB財務(Amazon)'));
   const retryable = JSON.parse(`[${/const RETRYABLE_JOBS = \[([^\]]*)\]/.exec(src)[1].replace(/'/g, '"')}]`);
-  assert.ok(retryable.includes('Amazon決済と財務')); assert.ok(!retryable.includes('CompanyDB財務(Amazon)') && !retryable.includes('Amazon Settlement') && !retryable.includes('CompanyDB財務突合(Amazon)'));
-  assert.deepEqual(JOB_DEFINITIONS['Amazon決済と財務'], { script: 'apps/warehouse/amazon-finance-coverage-run.js', args: ['--source', 'v2'], timeoutMs: 5400000 });
-  assert.ok(!Object.hasOwn(JOB_DEFINITIONS, 'CompanyDB財務(Amazon)') && !Object.hasOwn(JOB_DEFINITIONS, 'Amazon Settlement') && RETRY_ORDER.includes('Amazon決済と財務'));
+  assert.ok(['Amazon決済と財務', 'Amazon Settlement', 'CompanyDB財務(Amazon)'].every((x) => retryable.includes(x)) && !retryable.includes('CompanyDB財務突合(Amazon)'), '両方の形の名前が retry の対象・突き合わせは載せない');
   const reg = fs.readFileSync(path.join(repoRoot, 'config/jobs-registry.mjs'), 'utf8');
   assert.ok(reg.includes('Amazon決済と財務') && reg.includes('amazon-finance-coverage-run.js') && reg.includes('Company DB Amazon 財務 突き合わせ'));
+  assert.ok(reg.includes("id: 'cdb-finance-coordinator-switch'") && reg.includes('CDB_FINANCE_COORDINATOR'), '台帳にスイッチの一時物がある');
   // D7b-1a (#1554 Codex R1 Medium): 変換の版 v2 の注意 (migrate の前に pull しない・旧い版に戻さない・手の --full の完了の条件) が台帳にある
   for (const x of [AMAZON_FINANCE_TRANSFORM_VERSION, 'migrate の前に miniPC 本体を pull しない', '旧い版 (amazon_finance_v1) の送り手に戻さない', '手の --full の完了の条件']) assert.ok(reg.includes(x), `台帳に「${x}」が無い`);
 });
@@ -934,8 +967,14 @@ await t('CLI: バックフィルの完了印の前は送らずに「⏭️ バ�
       assert.equal(r.code, 0, r.out); assert.match(r.out.trim().split('\n').pop(), /^⏭️ Company DB Amazon 財務: 初回のバックフィル前/);
     }
     const l = openLedger(dir, { kind: FINANCE_KIND }); l.putMeta(META.backfill, '1'); l.close();
-    const r = cli(['--incremental', '--require-backfilled']);
-    assert.equal(r.code, 1); assert.match(r.out, /coordinator/);   // 🆕 D7b-1b-3: 送る回は coordinator の中だけ (単独は dry-run)
+    // 🆕 D7b-1b-3: スイッチ (CDB_FINANCE_COORDINATOR=1) があるとき、送る回は coordinator の中だけ (単独は dry-run)
+    const envOn = { ...env, CDB_FINANCE_COORDINATOR: '1' };
+    const cliOn = (args) => { try { return { code: 0, out: execFileSync(process.execPath, ['apps/company-db/push/amazon-finance.mjs', ...args], { cwd: repoRoot, env: envOn, encoding: 'utf8' }) }; } catch (e) { return { code: e.status, out: String(e.stdout || '') + String(e.stderr || '') }; } };
+    const r = cliOn(['--incremental', '--require-backfilled']);
+    assert.equal(r.code, 1); assert.match(r.out, /coordinator/);
+    // スイッチが無いとき = 今までどおり送る (master と同じ = 容量の上限が無いので送る前に止まる)
+    const r0 = cli(['--incremental', '--require-backfilled']);
+    assert.equal(r0.code, 1); assert.match(r0.out, /CDB_DB_LIMIT_BYTES/); assert.doesNotMatch(r0.out, /coordinator \(node apps/);
     const rr = cli(['--from', '2026-01-01', '--to', '2026-01-31']);
     assert.equal(rr.code, 1); assert.match(rr.out, /CDB_DB_LIMIT_BYTES/);   // バックフィルの範囲の送信は今までどおり (容量の上限が無ければ送らない)
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }

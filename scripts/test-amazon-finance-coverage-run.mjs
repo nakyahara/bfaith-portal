@@ -748,9 +748,20 @@ await t('🚨 中身の悪い版しか無い決済 (見出しの total ≠ 明�
   assert.deepEqual([last.finance_pushed, last.finance_push_ok, last.exit_code], [true, true, 0]);   // retry の見送りは exit 0 で成り立つ (retryable は書かない・#1567 R3 L1)
   assert.equal(Object.hasOwn(last, 'retryable'), false);
 });
-await t('retry-state の旧い工程の名前 (Amazon Settlement / CompanyDB財務(Amazon)) は新しい名前に読み替える (#1567 R1 L4)', async () => {
-  assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon Settlement', 'CompanyDB財務(Amazon)', 'Render同期']), ['f_sales', 'Amazon決済と財務', 'Render同期']);
-  assert.deepEqual(renameRetryJobs(['Amazon決済と財務', 'Amazon Settlement']), ['Amazon決済と財務']);
+await t('retry-state の工程の名前はスイッチに合わせて読み替える (#1567 R1 L4)・単独の取込はスイッチが無ければ今までどおり書く (lease を取る)', async () => {
+  // スイッチ (CDB_FINANCE_COORDINATOR=1) があるとき = 旧い 2 工程の名前 → coordinator / 無いとき = coordinator → 今までの 2 工程 (#1567)
+  assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon Settlement', 'CompanyDB財務(Amazon)', 'Render同期'], { coordinator: true }), ['f_sales', 'Amazon決済と財務', 'Render同期']);
+  assert.deepEqual(renameRetryJobs(['Amazon決済と財務', 'Amazon Settlement'], { coordinator: true }), ['Amazon決済と財務']);
+  assert.deepEqual(renameRetryJobs(['Amazon決済と財務', 'Amazon Settlement'], { coordinator: false }), ['Amazon Settlement', 'CompanyDB財務(Amazon)']);
+  // 単独の取込の引数: スイッチがある = 常に dry-run・--commit は拒む / 無い = 今までどおり書く (daily-sync の --days 14)・--dry-run で書かない
+  const { parseArgs: parseFetchArgs } = await import('../apps/warehouse/fetch-amazon-settlements.js');
+  assert.equal(parseFetchArgs(['--days', '14'], { coordinator: true }).dryRun, true);
+  assert.throws(() => parseFetchArgs(['--commit'], { coordinator: true }), /coordinator/);
+  assert.equal(parseFetchArgs(['--days', '14'], { coordinator: false }).dryRun, false, 'スイッチが無い = master と同じく書く');
+  assert.equal(parseFetchArgs(['--days', '14', '--dry-run'], { coordinator: false }).dryRun, true);
+  const fsrc = fs.readFileSync(new URL('../apps/warehouse/fetch-amazon-settlements.js', import.meta.url), 'utf8');
+  assert.match(fsrc, /if \(!args\.dryRun\) \{\s*const got = acquireCoverageLease\(db, \{ isAlive: isAliveNodeSince \}\);/, '書く取込は coverage の lease を取る (手で流す coordinator・版付けと重ならない)');
+  assert.match(fsrc, /\} finally \{ if \(lease\) releaseCoverageLease\(db, lease\); \}/);
 });
 
 await t('送信の途中で失敗した朝 (failed chunk) = 記録の finance_push_ok は false = daily-sync は突き合わせを見送る (#1567 R3 L2)', async () => {
