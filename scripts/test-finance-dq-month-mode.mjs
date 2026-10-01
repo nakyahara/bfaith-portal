@@ -14,7 +14,7 @@ import {
   monthStartEmptyGrace, monthStartEmptyNote, parseNowArg, resolveDqNow, prevMonthOf,
   MONTH_START_GRACE, MONTH_START_JANUARY_EXTRA_DAYS, monthStartGraceDays, MONTH_START_GRACE_PREFIX, isMonthStartGraceSummary,
   SKIP_IN_MONTH_START_GRACE, applyMonthStartSkip, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, monthHadRowsBefore, prevMonthFreshness, decideMonthStartEmpty,
-  ensureMonthHighWater, markMonthHighWater, migrateLegacyHighWater, prepareMonthHighWater, isRealYmd,
+  ensureMonthHighWater, markMonthHighWater, migrateLegacyHighWater, prepareMonthHighWater, isRealYmd, highWaterReady, shouldSkipEmptyMonthClear,
 } from '../apps/warehouse/finance-dq-month-mode.js';
 
 let failures = 0;
@@ -141,8 +141,8 @@ check('parseNowArg: +09:00 と Z を受ける / 時差の無い日時・日付�
 
 // ── DB を見る判定 (条件 ②③④。メモリの SQLite) ──
 const DQ_DDL = `CREATE TABLE dq_run_results (run_id TEXT, check_name TEXT, severity TEXT, actual_value REAL, threshold_value REAL, details_json TEXT, checked_at TEXT, PRIMARY KEY (run_id, check_name));`;
-/** DQ の入口と同じく印の表を作った DB (ensure = false なら作らない) */
-function memDb({ ensure = true } = {}) { const d = new Database(':memory:'); d.exec(DQ_DDL); d.exec('CREATE TABLE f_yahoo_finance_sku_daily_v1 (date_jst TEXT, k TEXT)'); if (ensure) ensureMonthHighWater(d); return d; }
+/** DQ の入口と同じく印の表を作り、前の記録の移しも済ませた DB (ensure = false なら作らない / migrate = false なら移さない) */
+function memDb({ ensure = true, migrate = true } = {}) { const d = new Database(':memory:'); d.exec(DQ_DDL); d.exec('CREATE TABLE f_yahoo_finance_sku_daily_v1 (date_jst TEXT, k TEXT)'); if (ensure) ensureMonthHighWater(d); if (ensure && migrate) migrateLegacyHighWater(d, 'test'); return d; }
 const putDq = (d, runId, check, actual, details, checkedAt = '2026-10-01T22:05:00.000Z') => d.prepare('INSERT INTO dq_run_results VALUES (?, ?, ?, ?, NULL, ?, ?)')
   .run(runId, check, 'info', actual, details === undefined ? null : (typeof details === 'string' ? details : JSON.stringify(details)), checkedAt);
 /** 前の PR より前の、全部の検査を流した run を 1 つ置く (row_count_drift + そのモールの検査の名前) */
@@ -186,7 +186,7 @@ const hw = (d, mall, ym) => d.prepare('SELECT * FROM dq_month_high_water WHERE m
 }
 {
   // 前の PR より前の記録を 1 回だけ移す (run_id の形に頼らない)
-  const d = memDb();
+  const d = memDb({ migrate: false });
   putLegacyRun(d, 'dq-yahoo-2026-10-20261001T2205', 'yahoo', { daily_row_count: 0 });
   putLegacyRun(d, 'dq-rakuten-2026-10-20261002T2205', 'rakuten', { daily_row_count: 40 });
   putLegacyRun(d, 'my-manual-check', 'aupay', { daily_row_count: 7 }, '2026-10-02T00:30:00.000Z');          // 手で付けた run_id (JST 10/2 09:30)
@@ -246,6 +246,32 @@ const hw = (d, mall, ym) => d.prepare('SELECT * FROM dq_month_high_water WHERE m
   const d3 = memDb(); d3.prepare('INSERT INTO f_yahoo_finance_sku_daily_v1 VALUES (?, ?)').run('2026-09-99', 'a');
   const ng7 = decideMonthStartEmpty(d3, { mall: 'yahoo', ym: '2026-10', now: day1 });
   check('判定 (R2 Medium 1): 前月の最新の日付が 2026-09-99 (実在しない) → 猶予なし', ng7.grace === false && ng7.reasons.some((r) => r.includes('実在の日でない')), JSON.stringify(ng7.reasons));
+}
+
+{
+  // 🚨 R3 Medium: 前の記録を移すときの例外は「dq_run_results が無い」だけ 0 件扱い。ほかは投げ直し、移し済みの印を付けない
+  const stub = (err) => ({ prepare: (sql) => {
+    if (sql.includes('FROM dq_month_high_water_legacy WHERE id = 1')) return { get: () => undefined };
+    if (sql.includes('FROM dq_run_results r')) return { all: () => { throw new Error(err); } };
+    if (sql.includes('INSERT INTO dq_month_high_water_legacy')) return { run: () => { stub.inserted = true; } };
+    throw new Error('想定外の SQL: ' + sql);
+  } });
+  stub.inserted = false;
+  check('移す (R3): 読み取りの失敗 (disk I/O error) は投げ直す・移し済みの印を付けない', throws(() => migrateLegacyHighWater(stub('disk I/O error'), 'x')) && stub.inserted === false);
+  check('移す (R3): 「no such table: dq_run_results」だけ 0 件扱いで移し済み', migrateLegacyHighWater(stub('no such table: dq_run_results'), 'x') === 0 && stub.inserted === true);
+  check('移す (R3): ほかの表が無いエラー (no such table: dq_run_results_old) は 0 件扱いにしない', throws(() => migrateLegacyHighWater(stub('no such table: dq_run_results_old'), 'x')));
+  // 本物の SQLite: 移し済みの表が別の形 (marked の列が無い) → 移しの INSERT が失敗 → 取引ごと戻る → 猶予なし
+  const d = memDb({ ensure: false });
+  d.exec('CREATE TABLE dq_month_high_water_legacy (id INTEGER PRIMARY KEY, migrated_at TEXT)');
+  d.prepare('INSERT INTO f_yahoo_finance_sku_daily_v1 VALUES (?, ?)').run('2026-09-30', 'a');
+  const p = prepareMonthHighWater(d, { mall: 'yahoo', ym: '2026-09', count: 5, at: 'x' });
+  check('準備 (R3): 移しが失敗すると ok:false・取引ごと戻る (この回の印も付かない)・highWaterReady は false',
+    p.ok === false && highWaterReady(d) === false && (() => { try { return !d.prepare("SELECT 1 FROM dq_month_high_water WHERE mall = 'yahoo'").get(); } catch { return true; } })());
+  const g = decideMonthStartEmpty(d, { mall: 'yahoo', ym: '2026-10', now: jst(2026, 10, 1, 7) });
+  check('判定 (R3): 印を確かめられない DB → 当月 1 日でも猶予なし (理由 = 印を確かめられない)', g.grace === false && g.reasons.some((r) => r.includes('印を確かめられない')), JSON.stringify(g.reasons));
+  check('sync (R3): 印を確かめられない DB → 空の chunk を見送らない (今までどおり送る)', shouldSkipEmptyMonthClear(d, { mall: 'yahoo', ym: '2026-10', now: jst(2026, 10, 1, 7) }) === false);
+  const ok = memDb(); migrateLegacyHighWater(ok, 'x');
+  check('highWaterReady: 表があり移し済み → true / 表が無い → false', highWaterReady(ok) === true && highWaterReady(memDb({ ensure: false })) === false);
 }
 
 // ── 5 本の DQ と 3 本の sync を子プロセスで (一時の DATA_DIR の SQLite・本番の DB には触らない) ──
@@ -387,6 +413,17 @@ for (const { mall, table, script } of MALLS) {
   }
 }
 
+// R3 Medium (子プロセス): 印の準備が失敗する DB → DQ はほかの検査を流しつつ、当月 1 日でも CRITICAL
+for (const { mall, table, script } of MALLS) {
+  const dir = makeDir(mall, table);
+  try {
+    withDb(dir, (d) => { addFactRow(d, table, '2026-09-30'); d.exec('CREATE TABLE dq_month_high_water_legacy (id INTEGER PRIMARY KEY, migrated_at TEXT)'); });
+    const r = runDq(dir, script, '2026-10', DAY(1), 't-hw-broken');
+    check(`${mall} (R3 Medium): 印の準備が失敗する DB → 当月 1 日の 0 行でも exit 1・理由 = 印を確かめられない`,
+      r.code === 1 && /印を確かめられない/.test(r.err) && /印を準備できない/.test(r.err), `code=${r.code} ${r.err.slice(-300)}`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
 // Medium 1: 猶予の中も 全期間・raw の検査は流れる (LINE の monthless_received_rows) / 飛ばすのは行数で比べる検査だけ
 {
   const dir = makeDir('linegift', 'f_linegift_finance_sku_daily_v1');
@@ -425,7 +462,7 @@ for (const mall of ['aupay', 'linegift', 'qoo10']) {
     const sync = (now, opt) => runNode(dir, `apps/warehouse/sync-${mall}-finance-daily.js`, ['--data-dir', dir, '--month', '2026-10', '--dry-run', '--now', now], opt);
     const z = sync(DAY(1));
     check(`sync ${mall}: 印の表がまだ無い (DQ が一度も流れていない) → 判定できない = 今までどおり空の chunk を送る`, z.code === 0 && /empty chunk/.test(z.out), `code=${z.code} ${z.out.slice(-300)}`);
-    withDb(dir, (d) => ensureMonthHighWater(d));
+    withDb(dir, (d) => { ensureMonthHighWater(d); migrateLegacyHighWater(d, 'test'); });   // DQ が一度流れた後と同じ (印の表があり、前の記録の移しが済み)
     const a = sync(DAY(1));
     check(`sync ${mall}: 猶予の中・印なしの 0 行 → 空の chunk を送らない (Render を消さない)・exit 0`, a.code === 0 && /Render のその月を消さない/.test(a.out) && !/empty chunk/.test(a.out), `code=${a.code} ${a.out.slice(-300)} ${a.err.slice(-200)}`);
     const b = sync(DAY(GD(mall, '2026-10') + 1));
@@ -471,6 +508,46 @@ for (const mall of ['aupay', 'linegift', 'qoo10']) {
     const f = new Function('isMonthStartGraceSummary', `${flagSrc}\n${warnSrc}\n${iconSrc}\nreturn { monthStartGraceFlag, dqMonthStartWarn, resultIcon };`)(isMonthStartGraceSummary);
     check('daily-sync: 取込が ✅ → 旗なし / ❌ → --no-month-start-grace', f.monthStartGraceFlag({ success: true }) === '' && f.monthStartGraceFlag({ success: false }) === ' --no-month-start-grace' && f.monthStartGraceFlag(undefined) === ' --no-month-start-grace');
     const ok = { success: true }; const ng = { success: false };
+    // 🚨 R3 High: 取込の設定が足りない朝は取込が ❌ (exit 0 で何もせず抜けない) → daily-sync は猶予を禁じる → 当月 0 行は CRITICAL
+    // 取込のスクリプトは一時のディレクトリで流す (.env を読まない・本番の DATA_DIR を使わない)。設定は空にして、網には出ない
+    const runImport = (rel, envOver) => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dq-import-'));
+      try {
+        const env = { ...process.env, DATA_DIR: tmp, ...envOver };
+        const r = spawnSync(process.execPath, [path.join(repoRoot, rel), '7'], { encoding: 'utf8', env, cwd: tmp, timeout: 60000 });
+        return { code: r.status, out: `${r.stdout}\n${r.stderr}` };
+      } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+    };
+    const au = runImport('apps/warehouse/aupay-orders.js', { AUPAY_PROXY_SECRET: '', AUPAY_API_KEY: '' });
+    check('取込 (R3 High): au PAY の設定 (AUPAY_PROXY_SECRET) が無い → exit 1 (何もせず exit 0 で抜けない)', au.code === 1 && /設定が足りない/.test(au.out), `code=${au.code} ${au.out.slice(-300)}`);
+    for (const [mall, rel, envOver, msg] of [
+      ['rakuten', 'apps/warehouse/rakuten-orders.js', { RAKUTEN_SERVICE_SECRET: '', RAKUTEN_LICENSE_KEY: '' }, /環境変数が不足/],
+      ['yahoo', 'apps/warehouse/yahoo-orders.js', { YAHOO_PROXY_SECRET: '', AUPAY_PROXY_SECRET: '' }, /FATAL: YAHOO_PROXY_SECRET/],
+      ['qoo10', 'apps/warehouse/qoo10-orders.js', { QOO10_CERT_KEY: '' }, /QOO10_CERT_KEY 未設定/],
+    ]) {
+      const r = runImport(rel, envOver);
+      check(`取込 (R3 High): ${mall} の設定が無い → exit 1 (前から ❌。同じ穴は無い)`, r.code === 1 && msg.test(r.out), `code=${r.code} ${r.out.slice(-200)}`);
+    }
+    {
+      // LINE ギフトは取込が repo の data/ に鍵の lock を置くので流さず、設定が無いと投げて exit 1 になる形を読む
+      const lg = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/linegift-orders.js'), 'utf8').replace(/\r\n/g, '\n');
+      check('取込 (R3 High): linegift は設定 (LINEGIFT_ACCESS_TOKEN) が無いと投げ、catch で process.exit(1) (同じ穴は無い)',
+        lg.includes("if (!accessToken) throw new Error('LINEGIFT_ACCESS_TOKEN 未設定") && /\} catch \(e\) \{\n\s+releaseLock\(\);\n\s+console\.error\(`\[linegift\] 致命的エラー[^\n]*\n\s+process\.exit\(1\);/.test(lg));
+    }
+    check('daily-sync (R3 High): 取込は --dry-run を付けずに流す (dry-run は何もせず exit 0 なので)', !/runScript\('apps\/warehouse\/(rakuten|yahoo|aupay|qoo10|linegift)-orders\.js[^']*--dry-run/.test(src));
+    {
+      // 通しで: au PAY の取込 (設定の欠け) → daily-sync の旗 → au PAY の当月 DQ (1 日・前月は新しい・印なし) → exit 1
+      const auResult = { success: au.code === 0 };
+      const flag = f.monthStartGraceFlag(auResult).trim();
+      const dir = makeDir('aupay', 'f_aupay_finance_sku_daily_v1');
+      try {
+        withDb(dir, (d) => addFactRow(d, 'f_aupay_finance_sku_daily_v1', '2026-09-30'));
+        const r = runDq(dir, 'run-aupay-finance-dq.js', '2026-10', DAY(1), 't-au-import-ng', flag ? [flag] : []);
+        const r0 = runDq(dir, 'run-aupay-finance-dq.js', '2026-10', DAY(1), 't-au-import-ok', []);
+        check('通し (R3 High): au PAY の取込が設定の欠けで ❌ の朝 → --no-month-start-grace が渡り、当月 1 日の 0 行は exit 1・CRITICAL (取込 ✅ の朝なら exit 0)',
+          flag === '--no-month-start-grace' && r.code === 1 && /取込が ❌/.test(r.err) && r0.code === 0, `flag=${flag} codes=${r.code},${r0.code}`);
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    }
     check('daily-sync (R2 Medium 2): Yahoo: 取込・前月の build・前月の DQ が全部 ✅ → 旗なし / どれか ❌ → 猶予を禁じる / 月初でない (前月の工程なし) → 取込だけで決まる',
       f.monthStartGraceFlag(ok, ok, ok) === '' && f.monthStartGraceFlag(ok, ng) === ' --no-month-start-grace' && f.monthStartGraceFlag(ok, ok, ng) === ' --no-month-start-grace'
       && f.monthStartGraceFlag(ng, ok, ok) === ' --no-month-start-grace' && f.monthStartGraceFlag(ok, ...[]) === '' && f.monthStartGraceFlag() === ' --no-month-start-grace');

@@ -205,7 +205,12 @@ export function migrateLegacyHighWater(db, at) {
              (SELECT group_concat(c.check_name, ',') FROM dq_run_results c WHERE c.run_id = r.run_id) AS checks
       FROM dq_run_results r WHERE r.check_name IN ('row_count_drift', ?)
     `).all(MONTH_ROW_COUNT_CHECK);
-  } catch { rows = []; }                                        // dq_run_results が無い DB = 移すものが無い
+  } catch (e) {
+    // dq_run_results が無い DB だけ「移すものが無い」(0 件)。ほかの例外 (読み取りの失敗など) は投げ直す = 移し済みの印を付けない
+    // (取引ごと戻る → 印の準備は失敗 → その回の DQ は猶予を使わない。次の回にもう一度移す。PR #1572 R3)
+    if (/no such table: dq_run_results\b/.test(String(e && e.message))) rows = [];
+    else throw e;
+  }
   for (const r of rows) {
     let d = null;
     let broken = false;
@@ -236,11 +241,24 @@ export function migrateLegacyHighWater(db, at) {
 /** DQ の入口 (dq_run_results の DELETE より前): 表を作る → 前の記録を 1 回だけ移す → この回の行数で印を付ける (1 つの取引) */
 export function prepareMonthHighWater(db, { mall, ym, count, at = new Date().toISOString() }) {
   graceSpec(mall);
-  db.transaction(() => {
-    ensureMonthHighWater(db);
-    migrateLegacyHighWater(db, at);
-    markMonthHighWater(db, mall, ym, count, at, 'dq');
-  })();
+  try {
+    db.transaction(() => {
+      ensureMonthHighWater(db);
+      migrateLegacyHighWater(db, at);
+      markMonthHighWater(db, mall, ym, count, at, 'dq');
+    })();
+    return { ok: true };
+  } catch (e) {
+    // 失敗しても DQ のほかの検査は流す。取引ごと戻るので「前の記録の移し済み」は付かない = highWaterReady が false = 猶予を使わない (R3)
+    console.error(`  ⚠️ 月初の猶予の印を準備できない (この回は猶予を使わない): ${e && e.message}`);
+    return { ok: false, error: e };
+  }
+}
+
+/** 印の表が使える状態か (表がある・前の記録の移しが済んでいる)。判定できなければ false (R3) */
+export function highWaterReady(db) {
+  try { return !!db.prepare('SELECT 1 AS ok FROM dq_month_high_water_legacy WHERE id = 1').get(); }
+  catch { return false; }
 }
 
 /**
@@ -302,6 +320,7 @@ export function decideMonthStartEmpty(db, { mall, ym, now = new Date(), noGrace 
   let hadRowsBefore = null;
   let prev = null;
   if (reasons.length === 0) {
+    if (!highWaterReady(db)) reasons.push('月初の猶予の印を確かめられない (印の表か、前の記録の移しが済んでいない)');
     hadRowsBefore = monthHadRowsBefore(db, mall, ym);
     if (hadRowsBefore) reasons.push('この月は前に行があった (一度 0 でなくなった月の 0 行 = 消えた)');
     prev = prevMonthFreshness(db, spec.table, ym, spec.prevMonthFreshDays);
@@ -340,6 +359,7 @@ export function shouldSkipEmptyMonthClear(db, { mall, ym, now = new Date() }) {
   if (!ym || !/^\d{4}-\d{2}$/.test(ym)) return false;
   const calendar = monthStartEmptyGrace(ym, { now, graceDays: monthStartGraceDays(mall, ym) });
   if (!calendar.grace) return false;
+  if (!highWaterReady(db)) return false;                       // 印を確かめられない = 今までどおり送る (R3)
   return !monthHadRowsBefore(db, mall, ym);
 }
 

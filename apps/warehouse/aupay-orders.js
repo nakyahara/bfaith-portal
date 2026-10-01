@@ -29,6 +29,18 @@ const AUPAY_API_KEY = process.env.AUPAY_API_KEY || '';
 const AUPAY_BASE = AUPAY_PROXY_URL ? `${AUPAY_PROXY_URL}/wmshopapi` : 'https://api.manager.wowma.jp/wmshopapi';
 const PAGE_SIZE = 100;
 
+/**
+ * 取込の設定が足りないか (足りなければその理由)。PR #1572 R3:
+ *   足りないのに何もせず exit 0 で抜けると、daily-sync は「au PAY の取込 ✅」と読み、finance DQ の月初の猶予が効いてしまう
+ *   (取込していない朝の当月 0 行が CRITICAL にならない)。楽天・Yahoo・Qoo10・LINE ギフトの取込と同じく exit 1 (❌) にする。
+ *   VPS proxy 経由 (AUPAY_PROXY_URL。既定あり) は AUPAY_PROXY_SECRET が要る (無いと proxy が断る。apps/aupay-unshipped も同じく必須) /
+ *   直接は AUPAY_API_KEY が要る
+ */
+function configProblem() {
+  if (AUPAY_PROXY_URL) return AUPAY_PROXY_SECRET ? null : 'AUPAY_PROXY_SECRET が未設定 (VPS proxy 経由の取込に要る)';
+  return AUPAY_API_KEY ? null : 'AUPAY_PROXY_URL / AUPAY_API_KEY が未設定';
+}
+
 function now() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function ymd(d) { return d.toISOString().slice(0, 10).replace(/-/g, ''); }
@@ -423,7 +435,7 @@ function evaluateFetchResult(label, fetched, inserted, skippedInvalid, totalAvai
 
 // ─── メイン: 日次取得 ───
 async function fetchAuPay(days = 7) {
-  if (!AUPAY_PROXY_URL && !AUPAY_API_KEY) { console.log('[auPay] AUPAY_PROXY_URL / AUPAY_API_KEY 未設定'); return; }
+  { const problem = configProblem(); if (problem) throw new Error(`設定が足りない: ${problem}`); }   // 何もせず成功で抜けない (R3)
   console.log(`[auPay] 受注取得開始 (直近 ${days} 日)`);
   const db = getDB();
   ensureTables();
@@ -480,6 +492,9 @@ async function backfill(startYmdStr, endYmdStr) {
 // ─── エントリポイント ───
 async function main() {
   const args = process.argv.slice(2);
+  // 設定が足りなければ DB に触る前に ❌ (exit 1)。daily-sync は取込が ❌ の朝、finance DQ の月初の猶予を禁じる (R3)
+  const problem = configProblem();
+  if (problem) throw new Error(`FATAL: 設定が足りない: ${problem}`);
   await initDB();
   if (args[0] === 'backfill') {
     const start = args[1] || ymd(new Date(Date.now() - 90 * 86400000));
