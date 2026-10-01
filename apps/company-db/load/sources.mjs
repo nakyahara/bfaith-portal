@@ -317,7 +317,12 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     const fbaMap = new Map();
     if (fba) {
       try {
-        if (hasTable(fba, 'sku_mapping')) {
+        // Sheet なしのモード (FBA 補充 ⑦-F・Codex PR R2 Medium 3): FBA 補充が sku_mapping (Sheet の写し) を凍結した fba.db なら、その値を一切使わない
+        //   = fba_sheet_import の ASIN / FNSKU の候補・Sheet 由来の JAN・Sheet にだけある出品と構成を作らない (fba_sku_attrs は今までどおり)。
+        //   凍結の印 = fba.db の fba_sheetless_state.sheet_frozen = '1' (FBA 補充が起動時に書く)。印が無い fba.db は今までどおり
+        const sheetFrozen = hasTable(fba, 'fba_sheetless_state') && rows(fba, `select value from fba_sheetless_state where key = 'sheet_frozen'`)[0]?.value === '1';
+        if (sheetFrozen) src.fba_sheet_frozen = true;
+        if (!sheetFrozen && hasTable(fba, 'sku_mapping')) {
           for (const r of rows(fba, 'select amazon_sku, asin, jan, fnsku, ne_code, is_set, logizard_code from sku_mapping')) {
             const k = normSku(r.amazon_sku); if (!k) continue;
             fbaMap.set(k, { ...(fbaMap.get(k) || {}), sheet: { asin: s(r.asin), jan: s(r.jan), fnsku: s(r.fnsku), ne_code: s(r.ne_code) || s(r.logizard_code), is_set: !!r.is_set } });

@@ -6,6 +6,12 @@
  */
 import { getDB } from './db.js';
 import { readNeMarks, stagingHash, recordBuild, makeBuildId, acquireRebuildLock, holdsRebuildLock, releaseRebuildLock, ensurePrivateStaging, stagingIsPrivate } from './master-material.js';
+import {
+  TAX_RATES, KNOWN_NE_RATES, KNOWN_DECIMAL_RATES, resolveTaxRate, resolveSetTaxRate,
+  SALES_CLASSES, EXPORT_SALES_CLASS, resolveSetSalesClass,
+  HANDLING_ACTIVE, HANDLING_STOPPED, HANDLING_MAKER_STOPPED, resolveSetHandlingClass,
+  setCostFromComponents,
+} from '../../lib/master-set-rules.js';
 
 // ─── ヘルパー ───
 
@@ -13,144 +19,13 @@ function now() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 
-// 既知税率マスタ (税制変更時はここに1行追加するだけで全箇所追従する)
-//   neRate: NEが返す整数 (raw_ne_products.消費税率)
-//   decimal: m_products / product_tax_rate に格納する小数表現
-//   category: 税区分 (会計上の意味を持つので機械的に生成しない。明示で持つ)
-export const TAX_RATES = [
-  { neRate: 10, decimal: 0.1,  category: 'STANDARD_10' },
-  { neRate: 8,  decimal: 0.08, category: 'REDUCED_8' },
-  // 将来例: { neRate: 12, decimal: 0.12, category: 'STANDARD_12' },
-];
-export const KNOWN_NE_RATES = TAX_RATES.map(t => t.neRate);
-export const KNOWN_DECIMAL_RATES = TAX_RATES.map(t => t.decimal);
-
-// 税率解決: NE側を優先、NE未登録(null/0)時のみ手動登録 (product_tax_rate) を使う
-// neTaxNum: raw_ne_products.消費税率 (整数)
-// manualTaxRate: product_tax_rate.tax_rate (小数)
-// NE が想定外値 (TAX_RATES 未登録) の場合は UNKNOWN を返す (upstream 異常を隠さない)
-export function resolveTaxRate(neTaxNum, manualTaxRate) {
-  const byNe = TAX_RATES.find(t => t.neRate === neTaxNum);
-  if (byNe) return { taxRate: byNe.decimal, taxCategory: byNe.category };
-  // NE 未登録 (null / 0) 時のみ手動値にフォールバック
-  if (neTaxNum == null || neTaxNum === 0) {
-    const byManual = TAX_RATES.find(t => t.decimal === manualTaxRate);
-    if (byManual) return { taxRate: byManual.decimal, taxCategory: byManual.category };
-  }
-  return { taxRate: null, taxCategory: 'UNKNOWN' };
-}
-
-// セット税率解決: 構成品を1つずつ resolveTaxRate に通し、全構成品が解決できたときだけ確定する。
-// 構成品の NE 消費税率だけを直接見ると、NE 未登録(0)を product_tax_rate で救済した構成品を持つ
-// セットが UNKNOWN に落ちる (単品は救済され、セットだけ税率 NULL になる非対称が起きる)。
-// components: [{ neTaxRate, manualTaxRate, componentExists }]
-//   componentExists=false (構成品が NE 商品マスタに存在しない) は上流異常なので、
-//   product_tax_rate に値が残っていても UNKNOWN に倒す (欠損を税率で隠さない)
-// 単一税率 → その税率 / 複数税率 → MIXED (最小値 = 軽減税率優先) / 1つでも未解決 → UNKNOWN
-export function resolveSetTaxRate(components) {
-  const decimals = new Set();
-  for (const c of components) {
-    if (c.componentExists === false) return { taxRate: null, taxCategory: 'UNKNOWN' };
-    const { taxRate } = resolveTaxRate(c.neTaxRate, c.manualTaxRate);
-    if (taxRate === null) return { taxRate: null, taxCategory: 'UNKNOWN' };
-    decimals.add(taxRate);
-  }
-  if (decimals.size === 0) return { taxRate: null, taxCategory: 'UNKNOWN' };
-  if (decimals.size === 1) {
-    const def = TAX_RATES.find(t => t.decimal === [...decimals][0]);
-    return def
-      ? { taxRate: def.decimal, taxCategory: def.category }
-      : { taxRate: null, taxCategory: 'UNKNOWN' };
-  }
-  return { taxRate: Math.min(...decimals), taxCategory: 'MIXED' };
-}
-
-// 売上分類の値域 (1=自社商品 / 2=取引先限定 / 3=仕入れ商品 / 4=輸出)
-export const SALES_CLASSES = [1, 2, 3, 4];
-// 4=輸出 は「仕入区分」ではなく販売チャネル属性で、1〜3 と直交する。
-// amazon-accounting でも 4 は集計対象外 (excluded segment) として別扱いされている。
-export const EXPORT_SALES_CLASS = 4;
-
-// セット売上分類解決の決定表:
-//   構成品がすべて 1〜3      → MIN を採用 (階層論理 1 > 2 > 3)
-//   構成品がすべて 4         → 4
-//   4 と 1〜3 が混在         → null (導出しない)
-//   1つでも未登録 / NE に無い → null (導出しない)
-//
-// MIN の根拠 = amazon-accounting のセット按分と同じ業務ルール。
-// 「自社商品(1)を含むセットは自社商品セットと見なす」という運用に合わせる。
-// 4 混在を MIN で潰すと輸出セットが国内分類に落ちて会計処理を誤るため、
-// ここだけは MIN を適用せず人の判断に回す (= 未登録一覧に出る)。
-//   ※2026-08-07 時点の本番データに 売上分類=4 の商品は 0 件。将来の事故防止の予防線。
-//
-// 原価・税率はセットを構成品から導出しているのに、売上分類だけ手動登録のみだったため、
-// セットの登録漏れが m_products に NULL のまま残り、amazon-accounting 側で
-// 「その他/未分類」に落ちていた (2026-08-07 調査)。ここで同じ導出を入れて揃える。
-//
-// components: [{ salesClass, componentExists }]
-//   1つでも解決できない構成品があれば null を返す (= 未登録一覧に出して人に登録させる)。
-//   欠けた構成品が実は 1(自社) だった場合に MIN が誤って 3 等に確定するのを防ぐため、
-//   「一部だけ分かる」状態では導出しない。componentExists=false (NE 商品マスタに無い)
-//   も上流異常なので、product_sales_class に値が残っていても null に倒す。
-//
-// ネストセット (構成品がそれ自体セット) について:
-//   呼び出し側は構成品の「手動登録値」(product_sales_class) だけを渡す。構成セットの
-//   導出値は伝播しないので、親セットは null = 未登録一覧に出る (誤った値が静かに入らない)。
-//   2026-08-07 時点の本番データにネストセットは 0 件。発生時は rebuild の品質チェックが警告する。
-export function resolveSetSalesClass(components) {
-  if (!Array.isArray(components) || components.length === 0) return null;
-  const classes = [];
-  for (const c of components) {
-    if (c.componentExists === false) return null;
-    const sc = Number(c.salesClass);
-    if (!SALES_CLASSES.includes(sc)) return null;
-    classes.push(sc);
-  }
-  const uniq = new Set(classes);
-  if (uniq.has(EXPORT_SALES_CLASS) && uniq.size > 1) return null; // 輸出と国内分類の混在
-  return Math.min(...classes);
-}
-
-// 取扱区分 (NE の値)。実データにあるのは 取扱中 / 取扱中止 / ﾒｰｶｰ取扱中止 の 3 つ (2026-09-10 実測)
-export const HANDLING_ACTIVE = '取扱中';
-export const HANDLING_STOPPED = '取扱中止';
-export const HANDLING_MAKER_STOPPED = 'ﾒｰｶｰ取扱中止';
-
-// セット取扱区分の決定表 (2026-09-14 中原さん指示):
-//   NE のセット自身が 取扱中 以外 (取扱中止 等)   → その値のまま (NE で人が決めた止め方を上書きしない)
-//   構成品に ﾒｰｶｰ取扱中止 が 1 つでもある        → ﾒｰｶｰ取扱中止 (再開の見込みがない方を優先)
-//   構成品に 取扱中止 が 1 つでもある            → 取扱中止
-//   構成品に それ以外の 取扱中でない値 がある     → その値 (値が増えた日に黙って取りこぼさない)
-//   どれにも当たらない                          → NE のセットの値 (無ければ 取扱中 = 従来どおり)
-//
-// 構成品が 1 つでも止まっていれば、そのセットはもう組めない = 売れない。
-// NE ではセット自身の取扱区分が 取扱中 のまま残っていることが多いので、ここで引き継ぐ。
-//
-// components: [{ handlingClass, componentExists }]
-//   構成品が NE に無い / 取扱区分が空 のものは「分からない」なので、それだけではセットを止めない
-//   (止めた扱いにすると、まだ売っているセットが「もう扱っていない」側に落ちる)。
-//   🚨 ネストセット (構成品がそれ自体セット) は、構成セットの NE の値だけを見る (導出値は伝播しない)。
-//      親 → 子セット → 止まった単品 では、子セットは止まるが親セットは取扱中のまま残る。
-//      本番のネストセットは 0 件 (2026-09-14 実測)。発生したら rebuild の品質チェック (B7b) が警告する。
-//
-// 空白の扱い: 比べるときだけ前後の空白を除く。NE のセット自身の値を返すときは元の値のまま返す
-//   (この関数は NE の値を「引き継ぐかどうか」だけを決め、NE の値そのものは書き換えない)。
-//   空白だけの値は 未登録 (NULL) と同じに扱う (本番に 0 件 = 2026-09-14 実測)。
-export function resolveSetHandlingClass(neSetStatus, components) {
-  const raw = typeof neSetStatus === 'string' && neSetStatus.trim() ? neSetStatus : null;
-  const own = raw ? raw.trim() : '';
-  if (own && own !== HANDLING_ACTIVE) return raw;
-  const stopped = new Set();
-  for (const c of Array.isArray(components) ? components : []) {
-    if (!c || c.componentExists === false) continue;
-    const h = typeof c.handlingClass === 'string' ? c.handlingClass.trim() : '';
-    if (h && h !== HANDLING_ACTIVE) stopped.add(h);
-  }
-  if (stopped.has(HANDLING_MAKER_STOPPED)) return HANDLING_MAKER_STOPPED;
-  if (stopped.has(HANDLING_STOPPED)) return HANDLING_STOPPED;
-  if (stopped.size > 0) return [...stopped].sort()[0];
-  return raw ?? HANDLING_ACTIVE;
-}
+// 税率・売上分類・取扱区分・原価のセットの決め方は lib/master-set-rules.js に移した (マスタ入力画面 apps/master-edit と同じ規則を共用する。Company DB構想 14 §6 ⑤-1)。
+// 今までどおりここからも import できるように、同じ名前で export し直す
+export {
+  TAX_RATES, KNOWN_NE_RATES, KNOWN_DECIMAL_RATES, resolveTaxRate, resolveSetTaxRate,
+  SALES_CLASSES, EXPORT_SALES_CLASS, resolveSetSalesClass,
+  HANDLING_ACTIVE, HANDLING_STOPPED, HANDLING_MAKER_STOPPED, resolveSetHandlingClass,
+};
 
 // ─── 本番反映時の列リスト（Codex PR1 Round 3 High 反映: 明示列INSERT） ───
 // 物理的な列順が異なるDBでも値が正しくマップされるよう、
@@ -464,10 +339,8 @@ async function rebuildMProductsLocked(db, buildId) {
     const neInfo = db.prepare('SELECT * FROM raw_ne_products WHERE 商品コード = ? COLLATE NOCASE').get(setCode);
     const ps = getShipping(setCode, neInfo?.代表商品コード);
 
-    // 原価計算
-    let totalGenka = 0;
-    let hasAllGenka = true;
-    let hasAnyGenka = false;
+    // 原価計算 (構成品の原価 × 数量の合計。決め方は lib/master-set-rules.js の setCostFromComponents = マスタ入力画面と同じ)
+    const componentCostInputs = [];
     // 税率は単品と同じ解決順 (NE値優先 → NE未登録(null/0)時のみ product_tax_rate) を
     // 構成品ごとに適用してから集約する
     const componentTaxInputs = [];
@@ -478,12 +351,7 @@ async function rebuildMProductsLocked(db, buildId) {
 
     for (const comp of components) {
       const compCode = comp.商品コード?.toLowerCase() || '';
-      if (comp.原価 > 0) {
-        totalGenka += comp.原価 * (comp.数量 || 1);
-        hasAnyGenka = true;
-      } else {
-        hasAllGenka = false;
-      }
+      componentCostInputs.push({ cost: comp.原価, qty: comp.数量 });
       componentTaxInputs.push({
         neTaxRate: comp.消費税率,
         manualTaxRate: taxRateMap.get(compCode),
@@ -505,16 +373,17 @@ async function rebuildMProductsLocked(db, buildId) {
       );
     }
 
+    const setCost = setCostFromComponents(componentCostInputs);
     let genka = null, genkaSource = '不明', genkaStatus = 'MISSING';
     if (eg) {
       genka = eg.genka;
       genkaSource = '例外';
       genkaStatus = 'OVERRIDDEN';
-    } else if (hasAllGenka && components.length > 0) {
-      genka = Math.round(totalGenka * 100) / 100;
+    } else if (setCost.status === 'COMPLETE') {
+      genka = setCost.jpy;
       genkaSource = 'セット計算';
       genkaStatus = 'COMPLETE';
-    } else if (hasAnyGenka) {
+    } else if (setCost.status === 'PARTIAL') {
       genkaStatus = 'PARTIAL';
     }
 
