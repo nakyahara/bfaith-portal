@@ -19,7 +19,8 @@
  *  12 入口 (cli): 取れた回は ping なし・受け入れない = fail / 入れた後の確かめが通った回だけ ok・今朝の作り直しでない = fail / 未設定 = ⏭️ + fail / --dry-run は書かない
  *  13 台帳・daily-sync (再構築の直前と直後)・照合 ② が company_owned を知っている
  *  17 持ち主の epoch (0053・Codex #1564 R1 H1): config (configured) を書き換えただけでは何も変わらない / prepare → 明示のロード → 写し → 作り直し → 確かめ → activate の順だけ /
- *     証拠 (今の作り直しの世代・今朝の確かめ・読み直し) が欠ければ active にしない / 証拠の世代の後に夜間ロードが入った = active にしない (R3 High 1) /
+ *     証拠 (今の作り直しの世代・今朝の確かめ・読み直し) が欠ければ active にしない / 証拠の世代の後に夜間ロードが入った = active にしない (R3 High 1・R4 = commit の番号) /
+ *     明示のロードは本番と同じ HTTP の道 (router の startLoad・host = render) = 写しは場所ではなく最後に commit したロードを使う (R4 High) /
  *     行が無い = 全部 load / cancel / 記録は足すだけ
  *  18 NE にしか無いセット (Company DB に無い) = 構成品が C にあっても全部 NE の道 (導いた原価・税・売上分類・取扱区分・構成品の名前と原価)・確かめも NE の値 (Codex #1564 R1 H2)
  *  19 ②b 古い表 (NE に欄が無い列 = 税区分・売上分類・送料・推奨保有月数。Codex #1564 R1 H3): 全部 load = 比べない / 作り直しの直後 = 差 0 (由来 = 作り直し・世代) /
@@ -36,12 +37,15 @@
  *     safe に戻せるのは通った確かめだけ・行が無く持ち主が C = unknown・読めない = unknown・全部 load で行が無い = 流す (今と同じ)・
  *     自動再試行 (RERUN_AFTER も)・商品管理リストの手の更新も同じ門で止まる (M-2・#1564 Codex R2 High 2) /
  *     (R3 High 2) safe は確かめた作り直し・世代・ハッシュを持つ = 後に作り直した・broken を書けなかった (前の safe が残った) = 使わない (unknown・再試行と手の更新も止まる) /
- *     門の表が読めない = unknown (行が無いと同じにしない) / 行が無く全部 load = 今の世代・作り直し・作り直しの世代がそろうときだけ流す
+ *     門の表が読めない = unknown (行が無いと同じにしない) / 行が無く全部 load = 今の世代・作り直し・作り直しの世代がそろうときだけ流す /
+ *     (R4 Medium 1) 作り直しが今の世代を使っていない (写しの後に作り直しが失敗した) = 全部 load でも unknown・確かめが通れば全部 load でも safe を書く
  *  25 記録の後に足した列 (記録した持ち主に無い) = load として足す・知らない列 = 壊れ (M-4)
  *  27 持ち主の正を 1 つに (0053・Codex #1564 R2 High 3): 0001〜0053 がそろって入る / 切替の段階を company_owner に進める前提 = epoch が active (差し込み口) /
  *     段階の owner_hash = active (⑤-1 の段階の行の trigger) / 画面の保存の門 (⑤-1 の ops.begin_master_write) = active (記録に無い列 = load)
  *  28 持ち主表のハッシュは 1 つの式 (load の列は数えない。#1564 Codex R3 Medium): JS = DB / 前の列の組で切り替えた後に列を足しても画面の保存・登録の門は通る・
  *     夜間ロードは足した列を load で動かす
+ *  29 最後に commit したロード = DB が振る番号の順 (0053 の ops.master_load_commits。送り手の時計・場所では決めない・数で並べる)・dry-run は番号なし・
+ *     写しは場所を問わず最後のロード・番号の表は足すだけ (#1564 Codex R4 Medium 2・High)
  *  26 NE と C で種類が違う SKU (NE でセットを単品に) = その SKU だけ NE の値 (⚠️・証跡)・作り直し全部は止めない (M-5) /
  *     C のセットの構成品に NE にしか無い単品 = 値が混ざる = ⚠️・証跡 (L-2)
  * 使い方: node scripts/test-master-publish.mjs
@@ -154,6 +158,44 @@ async function loadNow({ usePrepared = false } = {}) {
   assert.equal(r.ok, true, r.error);
   return r;
 }
+/**
+ * 切替の日の明示のロードを本番と同じ道で流す: HTTP の POST /apps/company-db/sync/load?apply=1&use_prepared=1 (scripts/company-db/remote-load.mjs load --apply --use-prepared)
+ *   → router の startLoad (host = 'render') → runLoadOnce → runInitialLoad。接続は router の差し替え口で PGlite に (#1564 Codex R4 High)。
+ *   終わるまで待ち、失敗なら投げる。戻り値 = { run_id, last (router の状態), commit (0053 の commit の番号の行) }
+ */
+let httpLoad = null;
+async function loadViaHttp({ usePrepared = true } = {}) {
+  if (!httpLoad) {
+    const CR = await import('../apps/company-db/router.mjs');
+    const express = (await import('express')).default;
+    CR.__setPgClientFactory(async () => ({
+      query: async (text, params) => {
+        if (params && params.length) return pg.query(text, params);
+        if (text.includes(';')) { await pg.exec(text); return { rows: [] }; }
+        return pg.query(text);
+      },
+      end: async () => {}, on: () => {},
+    }));
+    const app = express();
+    app.use('/apps/company-db/sync', CR.default);
+    const server = await new Promise((resolve) => { const sv = app.listen(0, '127.0.0.1', () => resolve(sv)); });
+    server.unref();
+    httpLoad = { CR, base: `http://127.0.0.1:${server.address().port}/apps/company-db/sync` };
+  }
+  const saved = { DATA_DIR: process.env.DATA_DIR, COMPANY_DB_URL: process.env.COMPANY_DB_URL, MIRROR_SYNC_KEY: process.env.MIRROR_SYNC_KEY };
+  Object.assign(process.env, { DATA_DIR: mirrorDir, COMPANY_DB_URL: 'postgres://test', MIRROR_SYNC_KEY: 'k-publish' });
+  let res;
+  try {
+    const r = await fetch(`${httpLoad.base}/load?apply=1${usePrepared ? '&use_prepared=1' : ''}`, { method: 'POST', headers: { 'x-sync-key': 'k-publish' } });
+    res = { status: r.status, body: await r.json() };
+  } finally { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+  assert.equal(res.status, 202, JSON.stringify(res.body));
+  for (let i = 0; i < 600 && httpLoad.CR.getLoadState().current; i++) await new Promise((r) => setTimeout(r, 50));
+  const last = httpLoad.CR.getLoadState().last;
+  assert.equal(last && last.run_id, res.body.run_id);
+  if (last.status !== 'done') throw new Error(`明示のロードが失敗: ${last.error}`);
+  return { run_id: last.run_id, last, commit: await OS.latestLoadCommit(pdb) };
+}
 /** 試験の近道: active を直接書く (本番は master-ownership-epoch.mjs の prepare → activate だけ。[17] で確かめる) */
 async function setActive(ownership) {
   const m = OS.sortedOwnership(ownership), h = OS.ownershipHashOf(m);
@@ -251,7 +293,10 @@ await ta('[1] 持ち主が全部 load = PR の前と同じ (業務の表 7 つ�
   assert.equal(MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: MASTER_OWNERSHIP, taxRates: TAX_RATES }).ok, true);
   const va = await F.runVerifyApply({ sqlite: db, dataDir: tmp, ownership: MASTER_OWNERSHIP, write: () => true, taxRates: TAX_RATES });
   assert.equal(va.state, 'verified', JSON.stringify(va.problems));
-  assert.equal(FX.totalChanges(db) - c0, 0);
+  // 書くのは門の 1 行だけ (確かめた作り直しの safe。全部 load でも書く = #1564 Codex R4 Medium 1)。業務の表は 1 行も書かない
+  assert.equal(FX.totalChanges(db) - c0, 1);
+  assert.equal(db.prepare('SELECT state FROM cdb_publish_gate WHERE id = 1').get().state, 'safe');
+  db.prepare('DELETE FROM cdb_publish_gate').run();
   // わざと壊す: 値を変えない UPDATE (無条件の書き換え) でも行の数で見つかる。ハッシュだけでは見えない (だから両方を見る)
   const mut = await quietly(() => FX.noopProbe(db, async () => { const r = await rebuildMProducts(); db.prepare('UPDATE product_tax_rate SET tax_rate = tax_rate').run(); return r; }));
   assert.notEqual(mut.changes, GOLDEN.second.changes);
@@ -557,7 +602,8 @@ await ta('[9] 取扱区分の語 (NE の語が同じ区分なら残す・持ち�
   const own = OWN('skus.handling', 'products.status');
   await nightly(own);
   // 持ち主を替えただけ (C の値 = 材料の値) なら取扱区分は今までと同じ語 (単品の ﾒｰｶｰ取扱中止・セットの導いた ﾒｰｶｰ取扱中止)
-  assert.equal((await fetchGen(own)).state, 'verified');
+  const g9 = await fetchGen(own);
+  assert.equal(g9.state, 'verified', JSON.stringify([g9.problems, g9.evidence && g9.evidence.detail]));
   assert.equal((await rebuild(own)).ok, true);
   assert.deepEqual(['s-maker', 's-stop', 'set-h', 'set-c'].map((c) => mp(c).取扱区分), ['ﾒｰｶｰ取扱中止', '取扱中止', 'ﾒｰｶｰ取扱中止', '取扱中止']);
   // C で s-ne を止める・s-stop を戻す → 単品はその語・構成品に s-ne を持つ set-a は構成品から止まる
@@ -835,14 +881,24 @@ await ta('[17] 持ち主の epoch (0053): config を書き換えただけでは�
   // prepare しても毎晩のロード (明示なし)・写しは active のまま
   lr = await loadNow();
   assert.deepEqual([lr.ownership_epoch.epoch, lr.company_owned], ['active', []]);
+  // 最後に commit したロードが active の持ち主 (番号は合っていても) = activate しない (LOAD_EPOCH_MISMATCH。#1564 Codex R4)
+  await setCutoverPhase('frozen');
+  try {
+    await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: (await OS.readOwnershipState(pdb)).prepared.prepared_at, expectLoadCommitSeq: lr.load_commit_seq, actor: 't', evidence: {} }),
+      (e) => e.code === 'LOAD_EPOCH_MISMATCH' && e.last_load === lr.run_id);
+  } finally { await setCutoverPhase('legacy_open'); }
+  assert.equal((await OS.readOwnershipState(pdb)).active.hash, allHash);
   g = await fetchGen(own);
   assert.deepEqual([g.state, g.evidence.company_owned, g.evidence.epochs.generation.kind, g.evidence.epochs.prepared], ['verified', [], 'active', ownHash]);
   // 証拠が無い = active にしない
   assert.equal(await epochCli(['activate']), 1);
   assert.match(logs.at(-1), /build_not_prepared_epoch/);
   // (d) 切替の日: 明示のロード → 写し = prepared の世代 → 作り直し (持ち主を渡さない = 世代の持ち主) → 確かめ → activate
-  lr = await loadNow({ usePrepared: true });
-  assert.deepEqual([lr.ownership_epoch.epoch, lr.company_owned], ['prepared', ['sku_costs']]);
+  //   明示のロードは本番と同じ HTTP の道 (host = render。毎晩の cron = render-nightly ではない) = 写しは場所ではなく commit の順で選ぶ (#1564 Codex R4 High)
+  const hl = await loadViaHttp({ usePrepared: true });
+  assert.deepEqual([hl.commit.ingest_run_id, hl.commit.epoch, hl.commit.host, hl.commit.ownership_hash], [hl.run_id, 'prepared', 'render', ownHash]);
+  assert.equal((await q("select host from ops.ingest_runs where ingest_run_id = $1", [hl.run_id]))[0].host, 'render');
+  assert.equal((await F.selectPublishLoad(pdb)).ingest_run_id, hl.run_id);   // 写しが使うロード = 最後に commit したロード (毎晩の cron の前の回ではない)
   await putCost('s-ne', 155);
   g = await fetchGen(MASTER_OWNERSHIP);   // config は関係ない
   assert.deepEqual([g.state, g.evidence.company_owned, g.evidence.epochs.generation.kind], ['verified', ['cost'], 'prepared'], JSON.stringify(g.problems));
@@ -863,9 +919,12 @@ await ta('[17] 持ち主の epoch (0053): config を書き換えただけでは�
   // 切替の段階 (⑤-1): 表が無い・legacy_open (古い入口がまだ正)・company_owner・new_open (切り替えた後) = active にしない。frozen だけ (#1564 の見直し M-1)
   //   表が無い (⑤-1 の前の DB) = 段階の表を読む問い合わせが「無い」と答える接続で確かめる (この積み方では ⑤-1 の 0051 がいつもある)
   const noCutover = { query: async (sql, p) => (/to_regclass\('ops\.master_cutover_state'\)/.test(sql) ? { rows: [{ ok: false }] } : pdb.query(sql, p)) };
-  const lastLoad = await OS.latestLoadRunId(pdb);   // 証拠の世代が読んだ夜間ロード (= 今の最後のロード)
-  assert.equal(lastLoad, db.prepare('SELECT load_run_id FROM cdb_publish_generations WHERE generation_no = ?').get(g.generation_no).load_run_id);
-  await assert.rejects(OS.activateOwnership(noCutover, { expectHash: ownHash, expectPreparedAt: (await OS.readOwnershipState(pdb)).prepared.prepared_at, expectLoadRunId: lastLoad, actor: 't', evidence: {} }),
+  const lastCommit = await OS.latestLoadCommit(pdb);   // 証拠の世代が読んだ夜間ロード (= 今の最後のロード = HTTP の明示のロード)
+  const lastLoad = lastCommit.commit_seq;
+  assert.deepEqual(db.prepare('SELECT load_run_id, load_commit_seq FROM cdb_publish_generations WHERE generation_no = ?').get(g.generation_no),
+    { load_run_id: hl.run_id, load_commit_seq: lastLoad });   // 世代に commit の番号
+  assert.deepEqual([evidence().load_run_id, evidence().load_commit_seq], [hl.run_id, lastLoad]);   // 証跡にも
+  await assert.rejects(OS.activateOwnership(noCutover, { expectHash: ownHash, expectPreparedAt: (await OS.readOwnershipState(pdb)).prepared.prepared_at, expectLoadCommitSeq: lastLoad, actor: 't', evidence: {} }),
     (e) => e.code === 'CUTOVER_STATE_MISSING');
   assert.equal((await q("select phase from ops.master_cutover_state where id = 1"))[0].phase, 'legacy_open');   // ⑤-1 の 0051 の最初の段階
   for (const ph of ['legacy_open', 'company_owner', 'new_open']) {
@@ -877,14 +936,14 @@ await ta('[17] 持ち主の epoch (0053): config を書き換えただけでは�
   // 証拠を集めた後に (同じ持ち主で) prepare がやり直された = 前の証拠の時刻では active にしない (行の鍵の後に比べる。#1564 Codex R2 Medium 4)
   const pAt = (await OS.readOwnershipState(pdb)).prepared.prepared_at;
   await q("update ops.master_ownership_state set prepared_at = prepared_at + interval '1 millisecond' where id = 1");
-  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, expectLoadRunId: lastLoad, actor: 't', evidence: {} }), (e) => e.code === 'PREPARED_CHANGED');
-  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectLoadRunId: lastLoad, actor: 't', evidence: {} }), (e) => e.code === 'PREPARED_AT_REQUIRED');
-  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, actor: 't', evidence: {} }), (e) => e.code === 'LOAD_RUN_REQUIRED');
+  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, expectLoadCommitSeq: lastLoad, actor: 't', evidence: {} }), (e) => e.code === 'PREPARED_CHANGED');
+  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectLoadCommitSeq: lastLoad, actor: 't', evidence: {} }), (e) => e.code === 'PREPARED_AT_REQUIRED');
+  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, actor: 't', evidence: {} }), (e) => e.code === 'LOAD_COMMIT_REQUIRED');
   await q("update ops.master_ownership_state set prepared_at = prepared_at - interval '1 millisecond' where id = 1");
   assert.equal((await OS.readOwnershipState(pdb)).prepared.prepared_at, pAt);
   // 証拠の世代の後に夜間ロードが入った (最後のロードが証拠のロードでない) = active にしない (#1564 Codex R3 High 1。並んだときの順は本物の PostgreSQL の試験 [21])
-  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, expectLoadRunId: 'load_before_evidence', actor: 't', evidence: {} }),
-    (e) => e.code === 'LOAD_AFTER_EVIDENCE' && e.last_load === lastLoad);
+  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, expectLoadCommitSeq: lastLoad - 1, actor: 't', evidence: {} }),
+    (e) => e.code === 'LOAD_AFTER_EVIDENCE' && e.last_load === hl.run_id && e.last_commit_seq === lastLoad);
   assert.equal((await OS.readOwnershipState(pdb)).active.hash, allHash);
   // prepare より前に Company DB を読んだ世代 = active にしない (#1564 の見直し L-1)
   await q("update ops.master_ownership_state set prepared_at = now() + interval '1 hour' where id = 1");
@@ -892,6 +951,12 @@ await ta('[17] 持ち主の epoch (0053): config を書き換えただけでは�
   assert.match(logs.at(-1), /generation_before_prepare/);
   await q("update ops.master_ownership_state set prepared_at = prepared_at - interval '2 hours' where id = 1");
   assert.equal((await OS.readOwnershipState(pdb)).active.hash, allHash);   // 断った回は何も変えない
+  // 世代に commit の番号が無い (0053 の前のロードの世代) = active にしない (証拠で断る。#1564 Codex R4 Medium 2)
+  const gNo = snap().build.cdb_publish_generation_no, keepSeq = db.prepare('SELECT load_commit_seq FROM cdb_publish_generations WHERE generation_no = ?').get(gNo).load_commit_seq;
+  db.prepare('UPDATE cdb_publish_generations SET load_commit_seq = NULL WHERE generation_no = ?').run(gNo);
+  assert.equal(await epochCli(['activate']), 1);
+  assert.match(logs.at(-1), /generation_without_load_commit/);
+  db.prepare('UPDATE cdb_publish_generations SET load_commit_seq = ? WHERE generation_no = ?').run(keepSeq, gNo);
   assert.equal(await epochCli(['activate']), 0, logs.at(-1));
   st = await OS.readOwnershipState(pdb);
   assert.deepEqual([st.active.hash, st.prepared], [ownHash, null]);
@@ -907,7 +972,7 @@ await ta('[17] 持ち主の epoch (0053): config を書き換えただけでは�
   assert.equal(await epochCli(['cancel']), 0);
   st = await OS.readOwnershipState(pdb);
   assert.deepEqual([st.active.hash, st.prepared], [ownHash, null]);
-  await assert.rejects(loadNow({ usePrepared: true }), /prepared の持ち主が無い/);
+  await assert.rejects(loadViaHttp({ usePrepared: true }), /prepared の持ち主が無い/);
   // 記録は足すだけ
   assert.deepEqual((await q('select action from ops.master_ownership_events order by event_id')).map((e) => e.action), ['init', 'prepare', 'activate', 'prepare', 'cancel_prepare']);
   await assert.rejects(q('delete from ops.master_ownership_events'), /足すだけ/);
@@ -1222,13 +1287,15 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
     env: { DATA_DIR: tmp, COMPANY_DB_WATCH_URL: 'postgres://test', DAILY_SYNC_RUN_ID: 'ds_test_publish' }, connectFor: () => async () => ({ db: pdb, close: async () => {} }), ...extra });
   const verify = (extra) => quietly(() => F.cli(['--verify-apply', '--daily'], deps(extra)));
   db.prepare('DELETE FROM cdb_publish_gate').run();
-  // (a) 持ち主が全部 load・行が無い = 流す (今と同じ)・確かめが通っても行を書かない
+  // (a) 持ち主が全部 load・行が無い = 流す (今の世代を使った作り直しがある)・確かめが通ったら全部 load でも safe を書く (#1564 Codex R4 Medium 1 =
+  //     作り直しを飛ばした朝も、確かめた作り直しのままなら行で流せる)
   await nightly();
   assert.equal((await fetchGen(MASTER_OWNERSHIP)).state, 'verified');
   assert.equal((await rebuild()).ok, true);
   assert.deepEqual([gate().state, gate().open, gate().source], ['safe', true, 'implicit']);
   assert.equal((await verify()).code, 0);
-  assert.equal(row(), null);
+  assert.deepEqual([row().state, row().build_id, gate().source], ['safe', snap().build.build_id, 'row']);
+  db.prepare('DELETE FROM cdb_publish_gate').run();
   // (b) 持ち主が C: 確かめる前 (行が無い) = unknown = 止める
   const own = OWN('sku_costs');
   await nightly(own);
@@ -1351,6 +1418,21 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   db.prepare("UPDATE cdb_publish_gate SET build_id = 'old_build' WHERE id = 1").run();
   assert.deepEqual([gate().state, gate().open, gate().reason], ['safe', true, 'all_load_safe_row_stale:build_changed']);
   db.prepare('DELETE FROM cdb_publish_gate').run();
+  // (m) 写しが今の世代 N を作った後に作り直しが失敗した・飛ばした (最新の作り直しは前の世代 M のまま) = 全部 load でも「分かる」にしない (#1564 Codex R4 Medium 1)
+  const buildM = snap().build;
+  const gN = await fetchGen(MASTER_OWNERSHIP);
+  assert.equal(gN.state, 'verified');
+  assert.notEqual(gN.generation_no, buildM.cdb_publish_generation_no);
+  const noRowN = gate();
+  assert.deepEqual([noRowN.state, noRowN.open, noRowN.reason], ['unknown', false, 'no_gate_row_unverified:build_not_current_generation']);
+  writeGateForTest(G, db, buildM);
+  db.prepare("UPDATE cdb_publish_gate SET build_id = 'older_build' WHERE id = 1").run();   // 前の safe の行 (今の作り直しを確かめていない)
+  assert.deepEqual([gate().state, gate().open, gate().reason], ['unknown', false, 'safe_row_stale:build_changed']);
+  writeGateForTest(G, db, buildM);   // 今の作り直し M を確かめた safe (作り直しを飛ばした朝 = 遅れ) = 行で流す (m_products は確かめた M のまま)
+  assert.deepEqual([gate().state, gate().open, gate().source], ['safe', true, 'row']);
+  db.prepare('DELETE FROM cdb_publish_gate').run();
+  assert.equal((await rebuild()).ok, true);   // 作り直しが N を使った = 全部 load と分かる
+  assert.deepEqual([gate().state, gate().open, gate().source], ['safe', true, 'implicit']);
   // (h) 読めない (warehouse.db が無い・壊れた) = unknown = 止める
   assert.deepEqual([G.readPublishGate({ dataDir: path.join(tmp, 'no-such-dir') }).state, G.readPublishGate({ dataDir: path.join(tmp, 'no-such-dir') }).open], ['unknown', false]);
   assert.equal(G.readPublishGate({ dataDir: null }).open, false);
@@ -1573,6 +1655,32 @@ await ta('[28] 持ち主表のハッシュは 1 つの式 (load の列は数え�
     await assert.rejects(applyMigrations(pdb2, { log: quiet }), /0053: 切替の段階が company_owner \/ new_open/);
     assert.deepEqual((await pdb2.query("select version from ops.schema_migrations where version = '0053'")).rows, []);
   } finally { await pg2.close(); }
+});
+
+await ta('[29] 最後に commit したロード = DB が振る番号の順 (送り手の時計・場所では決めない)・番号の表は足すだけ・写しは場所を問わず最後のロード (#1564 Codex R4 Medium 2・High)', async () => {
+  const a = await loadNow();
+  const b = await loadNow();
+  assert.equal(b.load_commit_seq, a.load_commit_seq + 1);
+  // b の送り手の時計が遅れていた (時刻は a より前) = 時刻では a が後に見えるが、commit は b が後 = 番号で b
+  await q("update ops.ingest_runs set started_at = started_at - interval '1 day', finished_at = finished_at - interval '1 day' where ingest_run_id = $1", [b.run_id]);
+  const last = await OS.latestLoadCommit(pdb);
+  assert.deepEqual([last.ingest_run_id, last.commit_seq, last.epoch], [b.run_id, b.load_commit_seq, b.ownership_epoch.epoch]);
+  // 番号は数で並べる (文字で並べると '9' が '10' より後になる。この試験では番号が 2 桁を越えている)
+  assert.ok(b.load_commit_seq >= 10, String(b.load_commit_seq));
+  assert.equal(last.commit_seq, Number((await q('select max(commit_seq)::text as m from ops.master_load_commits'))[0].m));
+  assert.equal((await F.selectPublishLoad(pdb)).ingest_run_id, b.run_id);
+  // 場所: 毎晩の cron (render-nightly) より後に別の場所で commit したロード = 写しはそれを使う (照合 ① の毎晩の回は cron のまま)
+  const other = await runInitialLoad(pdb, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: `load_pub_${++loadN}`, host: 'render' });
+  assert.equal(other.ok, true, other.error);
+  assert.deepEqual([(await F.selectPublishLoad(pdb)).ingest_run_id, (await F.selectPublishLoad(pdb)).commit_seq], [other.run_id, b.load_commit_seq + 1]);
+  // dry-run は番号を取らない (巻き戻す)
+  const dry = await runInitialLoad(pdb, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: `load_pub_${++loadN}`, host: 'render-nightly', dryRun: true });
+  assert.equal(dry.load_commit_seq, undefined);
+  assert.equal((await OS.latestLoadCommit(pdb)).ingest_run_id, other.run_id);
+  // 足すだけ
+  await assert.rejects(q("update ops.master_load_commits set host = 'x'"), /足すだけ/);   // 番号そのものは identity (always) = 書き換えられない
+  await assert.rejects(q('delete from ops.master_load_commits'), /足すだけ/);
+  await nightly();
 });
 
 await pg.close();

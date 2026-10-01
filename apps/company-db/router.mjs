@@ -89,7 +89,7 @@ export function startLoad({ dataDir, url, apply, host = 'render', log = (m) => c
   };
   // 202 を先に返してから始める (SQLite の読み取りも応答の後)
   setImmediate(() => {
-    runLoadOnce({ dataDir, url, apply, log, host, runId, usePrepared })   // usePrepared = 切替の日に明示して頼んだロードだけ (毎晩の cron は active)
+    runLoadOnce({ dataDir, url, apply, log, host, runId, usePrepared, connect: (u) => pgClientFactory(u) })   // usePrepared = 切替の日に明示して頼んだロードだけ (毎晩の cron は active)
       .then((report) => done({ status: report.ok ? 'done' : 'failed', summary: report.summary || null, conflicts: (report.conflicts || []).length, unresolved: Object.fromEntries(Object.entries(report.unresolved || {}).map(([k, v]) => [k, v.length])), sources: report.plan_sources || null }))
       .catch((e) => { log(`[company-db load] FAILED ${runId}: ${e.message}`); done({ status: 'failed', error: String(e.message), error_code: e.code || null, summary: e.report?.summary || null }); });
   });

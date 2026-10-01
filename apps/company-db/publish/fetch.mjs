@@ -40,7 +40,7 @@ import {
   costFromCdb, handlingFromCdb, supplierFromCdb, PUBLISH_0027_COLUMNS, PUBLISH_CURRENT_KEY, PUBLISH_KEEP_GENERATIONS, SKU_KINDS, readPublishGeneration,
 } from '../../warehouse/master-publish.js';
 import { latestBuild, publishOfBuild } from '../../warehouse/master-material.js';
-import { readOwnershipState, ALL_LOAD } from '../load/ownership-state.mjs';
+import { readOwnershipState, latestLoadCommit, ALL_LOAD } from '../load/ownership-state.mjs';
 import { readGateRow, writePublishGate } from '../../warehouse/publish-gate.js';
 
 export const EVIDENCE_NAME = 'master-publish';
@@ -83,8 +83,8 @@ export async function readPublishSource(db, { prevWatermark = null } = {}) {
   const top = hasEvents ? (await rowsOf(db, `select ${eventCols} from events.master_change_events order by event_id desc limit 1`))[0] ?? null : null;
   const watermark = top ? top.event_id : null;
   const prevEvent = hasEvents && prevWatermark != null ? (await rowsOf(db, `select ${eventCols} from events.master_change_events where event_id = $1`, [String(prevWatermark)]))[0] ?? null : null;
-  // 最新の夜間ロードが記録した持ち主 (0029 の ops.load_materials.ownership)
-  const load = await selectNightlyLoad(db);
+  // 写しが使う夜間ロード = 最後に commit したロード (0053 の commit の番号。毎晩の cron か --use-prepared の明示のロードかを問わない) と、その記録した持ち主 (0029 の ops.load_materials.ownership)
+  const load = await selectPublishLoad(db);
   let loadOwnership = null;
   if (load && await columnExists(db, 'ops', 'load_materials', 'ownership')) {
     loadOwnership = Object.fromEntries((await rowsOf(db, `select entity, ownership, ownership_hash from ops.load_materials where ingest_run_id = $1 and entity in ('products', 'set_components')`,
@@ -94,6 +94,24 @@ export async function readPublishSource(db, { prevWatermark = null } = {}) {
   const ownershipState = await readOwnershipState(db);
   return { cdbReadAt, has0027, hasVersion, hasEvents, ownershipState, skus, costs, primary, watermark: watermark == null ? null : Number(watermark),
     watermarkFingerprint: eventFingerprint(top), prevEventFingerprint: prevWatermark == null ? undefined : eventFingerprint(prevEvent), load, loadOwnership };
+}
+
+/**
+ * 写しが使う夜間ロード = 最後に commit したロード (#1564 Codex R4 High・Medium 2)。
+ *   0053 の ops.master_load_commits の番号 (DB が commit の直前に振る = commit の順) が一番大きい回。場所 (host) では選ばない:
+ *   切替の日に HTTP (remote-load.mjs load --apply --use-prepared → router の startLoad = host 'render') で流した prepared のロードも、
+ *   毎晩の cron (host 'render-nightly') も、後に commit した方が写しの世代になる (照合 ① の selectNightlyLoad は毎晩の cron だけ = 別の目的)。
+ *   番号の行がまだ無い (0053 の前・0053 の後に一度も本適用のロードが無い) = 今までどおり毎晩の cron の最新 (commit_seq = null)
+ * @returns {{ ingest_run_id, started_at, finished_at, host, commit_seq: number|null, epoch?: string }|null}
+ */
+export async function selectPublishLoad(db) {
+  const last = await latestLoadCommit(db);
+  if (last) {
+    const r = (await rowsOf(db, 'select started_at::text as started_at, finished_at::text as finished_at, host from ops.ingest_runs where ingest_run_id = $1', [last.ingest_run_id]))[0] || {};
+    return { ingest_run_id: last.ingest_run_id, started_at: r.started_at ?? null, finished_at: r.finished_at ?? null, host: last.host ?? r.host ?? null, commit_seq: last.commit_seq, epoch: last.epoch };
+  }
+  const legacy = await selectNightlyLoad(db);
+  return legacy ? { ...legacy, commit_seq: null } : null;
 }
 
 /**
@@ -154,7 +172,7 @@ export function buildGeneration({ source, ownership, now = new Date() }) {
   }
   return {
     generation_id: makeGenerationId(now), cdb_read_at: source.cdbReadAt, version_watermark: source.watermark, watermark_fingerprint: source.watermarkFingerprint ?? null,
-    load_run_id: source.load?.ingest_run_id ?? null, ownership_problems: checkPublishOwnership(ownership),
+    load_run_id: source.load?.ingest_run_id ?? null, load_commit_seq: source.load?.commit_seq ?? null, ownership_problems: checkPublishOwnership(ownership),
     ownership: ownershipSorted(ownership), ownership_hash: ownershipHash(ownership), cols, rows, row_count: rows.length, sku_count: source.skus.length,
     content_hash: publishContentHash(rows), problems,
   };
@@ -274,9 +292,9 @@ export function pruneGenerations(sqlite, keep = PUBLISH_KEEP_GENERATIONS) {
  */
 export function stageGeneration(sqlite, gen, { state = 'verified', reason = null, now = new Date(), beforeCommit = null } = {}) {
   return sqlite.transaction(() => {
-    const info = sqlite.prepare(`INSERT INTO cdb_publish_generations (generation_id, cdb_read_at, version_watermark, watermark_fingerprint, load_run_id, ownership, ownership_hash,
-        row_count, sku_count, content_hash, state, reason, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(gen.generation_id, gen.cdb_read_at, gen.version_watermark ?? null, gen.watermark_fingerprint ?? null, gen.load_run_id ?? null, JSON.stringify(gen.ownership), gen.ownership_hash,
+    const info = sqlite.prepare(`INSERT INTO cdb_publish_generations (generation_id, cdb_read_at, version_watermark, watermark_fingerprint, load_run_id, load_commit_seq, ownership, ownership_hash,
+        row_count, sku_count, content_hash, state, reason, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(gen.generation_id, gen.cdb_read_at, gen.version_watermark ?? null, gen.watermark_fingerprint ?? null, gen.load_run_id ?? null, gen.load_commit_seq ?? null, JSON.stringify(gen.ownership), gen.ownership_hash,
         gen.row_count, gen.sku_count, gen.content_hash, state, reason, now.toISOString());
     const no = Number(info.lastInsertRowid);
     let moved = false;
@@ -371,7 +389,7 @@ export async function runPublish({ db = null, connect = null, sqlite, dataDir, o
     let shadow;
     try { shadow = shadowCounts(sqlite, source); } catch (e) { shadow = { error: String(e && e.message).slice(0, 160) }; }
     const base = {
-      generation_id: gen.generation_id, cdb_read_at: gen.cdb_read_at, version_watermark: gen.version_watermark, load_run_id: gen.load_run_id,
+      generation_id: gen.generation_id, cdb_read_at: gen.cdb_read_at, version_watermark: gen.version_watermark, load_run_id: gen.load_run_id, load_commit_seq: gen.load_commit_seq,
       company_owned: gen.cols, ownership_hash: gen.ownership_hash, row_count: gen.row_count, sku_count: gen.sku_count, content_hash: gen.content_hash,
       prev_generation_no: prev ? prev.generation_no : null, shadow,
       not_in_cdb: detail.not_in_cdb ?? { count: 0, codes: [] },
@@ -460,12 +478,13 @@ export async function runVerifyApply({ sqlite, dataDir, ownership: configured = 
   const epochKind = fetchEv?.epochs?.generation?.kind ?? null;
   // 門 (warehouse.db の cdb_publish_gate = 後の工程を止めるかどうかの正。#1564 Codex R2 High 2) を証跡より先に書く:
   //   違う = broken (門が読めなくても書く) / 通った = safe (broken を戻せるのはこれだけ。確かめた作り直し・世代・入れた値のハッシュ・持ち主と一緒に =
-  //   読み手が今と比べる。持ち主が全部 load で行が無い = 書かない = 今と同じ) / 遅れ・確かめられない = 前の値のまま (行が無く持ち主が C = unknown)
+  //   読み手が今と比べる。持ち主が全部 load でも書く = 作り直しを飛ばした朝 (前の世代のまま) も、確かめた作り直しのままなら流せる。#1564 Codex R4 Medium 1) /
+  //   遅れ・確かめられない = 前の値のまま (行が無く持ち主が C = unknown)
   //   門が読めない (表はあるが SELECT が落ちる) = 「行が無い」と同じにしない (#1564 Codex R3 High 2): 通った = safe を書き直す・それ以外 = unknown を書く
   const pubCols = publishCols(ownership);
   let gateBefore = null, gateReadError = null;
   try { gateBefore = readGateRow(sqlite); } catch (e) { gateReadError = String(e && e.message).slice(0, 200); }
-  const gateNext = broken ? 'broken' : state === 'verified' ? (pubCols.length || gateBefore || gateReadError ? 'safe' : null)
+  const gateNext = broken ? 'broken' : state === 'verified' ? 'safe'
     : (gateReadError || (!gateBefore && pubCols.length) ? 'unknown' : null);
   let gateError = null;
   if (gateNext) {

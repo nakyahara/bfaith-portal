@@ -60,11 +60,12 @@ export function activationEvidence({ sqlite, dataDir, prepared, now = new Date()
   const again = verifyApplied(sqlite, { publication, ownership: prepared.map, taxRates });
   if (!again.ok) problems.push('applied_mismatch_now');
   if (bp && again.applied_hash !== bp.applied_hash) problems.push('applied_hash_changed');
-  // 証拠の世代が読んだ夜間ロード (activate が「その後にロードが入っていない」を鍵の後に DB で見る。#1564 Codex R3 High 1)
-  const loadRunId = bp ? (sqlite.prepare('SELECT load_run_id FROM cdb_publish_generations WHERE generation_no = ?').get(bp.generation_no)?.load_run_id ?? null) : null;
-  if (bp && !loadRunId) problems.push('generation_without_load_run');
+  // 証拠の世代が読んだ夜間ロードと、その commit の番号 (0053。activate が「その後にロードが入っていない」を鍵の後に DB の番号で見る。#1564 Codex R3 High 1・R4 Medium 2)
+  const genLoad = bp ? (sqlite.prepare('SELECT load_run_id, load_commit_seq FROM cdb_publish_generations WHERE generation_no = ?').get(bp.generation_no) || null) : null;
+  const loadCommitSeq = genLoad && genLoad.load_commit_seq != null ? Number(genLoad.load_commit_seq) : null;
+  if (bp && !Number.isSafeInteger(loadCommitSeq)) problems.push('generation_without_load_commit');
   return { ok: problems.length === 0, problems, evidence: build && bp ? { build_id: build.build_id, generation_no: bp.generation_no, generation_id: bp.generation_id,
-    applied_hash: bp.applied_hash, verified_at: ev?.apply?.checked_at ?? null, load_run_id: loadRunId } : null };
+    applied_hash: bp.applied_hash, verified_at: ev?.apply?.checked_at ?? null, load_run_id: genLoad?.load_run_id ?? null, load_commit_seq: loadCommitSeq } : null };
 }
 
 export async function cli(argv, { env = process.env, connect = null, openSqlite = null, log = console.log, ownership = MASTER_OWNERSHIP, now = new Date() } = {}) {
@@ -99,8 +100,8 @@ export async function cli(argv, { env = process.env, connect = null, openSqlite 
     const e = activationEvidence({ sqlite, dataDir, prepared: st.prepared, now, taxRates: TAX_RATES });
     if (!e.ok) { log(`❌ active にしない: 確かめがそろっていない (${e.problems.join('・')})`); return 1; }
     // 証拠を集めたときの prepare (ハッシュと時刻) を渡す = 行の鍵の後に比べる (その間に prepare し直されたら断る)
-    //   + 証拠の世代が読んだ夜間ロード = 鍵の後に「その後にロードが入っていない」を見る (入った = 断る)
-    const r = await activateOwnership(c.db, { expectHash: st.prepared.hash, expectPreparedAt: st.prepared.prepared_at, expectLoadRunId: e.evidence.load_run_id, actor,
+    //   + 証拠の世代が読んだ夜間ロードの commit の番号 = 鍵の後に「その後にロードが入っていない」を DB の番号で見る (入った = 断る)
+    const r = await activateOwnership(c.db, { expectHash: st.prepared.hash, expectPreparedAt: st.prepared.prepared_at, expectLoadCommitSeq: e.evidence.load_commit_seq, actor,
       evidence: { ...e.evidence, prepared_at: st.prepared.prepared_at } });
     log(`✅ active = ${r.active_hash} (作り直し ${e.evidence.build_id}・世代 ${e.evidence.generation_no})。今夜から夜間ロードはこの持ち主`);
     return 0;

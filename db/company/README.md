@@ -1773,10 +1773,10 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
 5. miniPC: `node scripts/company-db/master-ownership-epoch.mjs activate` (最新の作り直しが prepared の世代・その世代が prepare の後に Company DB を読んだ・今朝の確かめが通った・読み直しても同じ、
    かつ **⑤-1 の切替の段階 (`ops.master_cutover_state`) が `frozen`** (古い入口を止めた後・持ち主を C にする前) のときだけ active に。足りなければ理由を出して断る。段階の表が無い = 断る。
    証拠を集めたときの prepare の時刻を行の鍵の後に比べる = その間に prepare をやり直したら `PREPARED_CHANGED` で断る (やり直しは 3 から)。
-   証拠の世代が読んだ夜間ロードが最後のロードでない (証拠の後に毎晩のロードなどが入った) = `LOAD_AFTER_EVIDENCE` で断る (やり直しは 3 から。#1564 Codex R3 High 1))
+   証拠の世代が読んだ夜間ロードが最後のロードでない (証拠の後に毎晩のロードなどが入った。DB の commit の番号で比べる) = `LOAD_AFTER_EVIDENCE` で断る (やり直しは 3 から。#1564 Codex R3 High 1・R4))
 - 途中で止める = `master-ownership-epoch.mjs cancel` (prepared を消す。active はそのまま = 毎晩は前の持ち主)。今の状態 = `master-ownership-epoch.mjs status`
 
-**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0053 は表を 2 つと、⑤-1 の切替の段階・画面の保存の門に「持ち主の epoch と同じ」の確かめを足すだけ (行は作らない = 全部 load のまま = 何も変わらない)。
+**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0053 は表を 3 つ (epoch・その記録・夜間ロードの commit の順) と、⑤-1 の切替の段階・画面の保存の門に「持ち主の epoch と同じ」の確かめを足すだけ (行は作らない = 全部 load のまま = 何も変わらない)。
 あわせて ⑤-1 の `ops.ownership_hash` の式を「load の列は数えない」に作り直す (下の「1 つの式」)。🚨 段階が company_owner / new_open の DB では 0053 は止まる (本番は legacy_open = 当たらない)。
 🚨 **番号**: master 0050 (finance_coverage) → ⑤-1 0051 (master_edit・本番に入っている) → ⑤-2a 0052 → この 0053 の順に積む。⑤-2b も 0053 を使う = 後にマージされる方を 0054 に付け替える (migrate.mjs は欠番・重複を拒む)。
 🚨 **デプロイは Render と miniPC を同じ日に**: 夜間ロードの規則の指紋 (`engine.mjs` の `LOAD_RULE_FILES`) に `apps/company-db/load/ownership-state.mjs` が入った (engine.mjs も変わった)。
@@ -1792,6 +1792,12 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - **epoch の鍵** `ops.master_ownership_lock_key()` = **4705310053** (0036 の親子の鍵 4705310036・0051 のマスタの書き込みの鍵 4705310051 と同じ作り。2^31 より大きい = `hashtext()` の鍵とも重ならない)。
   - 夜間ロード (`engine.mjs`・`--use-prepared` も) = 取引の冒頭に**共有**で取ってから、取引の中で epoch を読む (書き終わるまで持つ)。prepare / activate / cancel (`ownership-state.mjs`) = **排他** = ロードの途中で epoch が変わらない
   - activate は鍵の後に「証拠の世代が読んだ夜間ロード = 最後に commit したロード」を見る (古い active で走ったロードは activate より前に commit している = 証拠の世代に入っていない = 断る)
+- **夜間ロードの commit の順** `ops.master_load_commits` (#1564 Codex R4): 本適用のロード 1 回 = 1 行 (dry-run は無し・足すだけ)。番号 `commit_seq` は DB が commit の直前に振る
+  (epoch の鍵 (共有) とマスタの書き込みの鍵 (排他) を持ったまま = 番号の順 = commit の順)。送り手の時計 (`started_at` / `finished_at`)・場所 (`host`) では並べない。
+  - 写し (`publish/fetch.mjs` の `selectPublishLoad`) = 番号の一番大きいロード (毎晩の cron = `render-nightly` も、切替の日に HTTP で流した `--use-prepared` のロード = `render` も)。
+    行がまだ無い (0053 の後に本適用のロードが無い) = 今までどおり毎晩の cron の最新。照合 ① (`compare-load.mjs` の `selectNightlyLoad`) は毎晩の cron の回のまま (別の目的)
+  - 世代 (warehouse.db の `cdb_publish_generations.load_commit_seq`) と証跡 (`master-publish.load_commit_seq`) に番号を残す。activate はその番号 = 一番大きい番号か
+    (`LOAD_AFTER_EVIDENCE`)・最後のロードの持ち主が prepared か (`LOAD_EPOCH_MISMATCH`) を鍵の後に見る
   - 🚨 **鍵の順** (全部の書き手で同じ = デッドロックしない): epoch (0053) → 切替の段階 (0051 の `hashtext('ops.master_cutover')`) → マスタの書き込み (0051) → 親子 (0036) → 行。
     夜間ロード = epoch 共有 → 書き込み 排他 → 親子 / activate = epoch 排他 → 段階 共有 → 行 / 画面の保存・登録 = 段階 共有 → 書き込み 共有 (epoch は取らない)
 - **持ち主表のハッシュは 1 つの式** = 持ち主が `load` でない列だけを `[キー, 値]` にしてキーの順に並べた JSON の sha256 (= 記録に無い列は load と同じ)。

@@ -87,13 +87,16 @@ export const OWNERSHIP_SHARED_LOCK_SQL = 'select pg_advisory_xact_lock_shared(op
 export const OWNERSHIP_EXCLUSIVE_LOCK_SQL = 'select pg_advisory_xact_lock(ops.master_ownership_lock_key())';
 
 /**
- * 最後に commit した夜間ロード (どの場所からでも。dry-run は巻き戻す = 数えない)。activate が「証拠の世代の後にロードが入っていない」を見る
- * @returns {string|null} ingest_run_id
+ * 最後に commit した夜間ロード = 0053 の ops.master_load_commits の番号 (commit_seq) が一番大きい行 (#1564 Codex R4 Medium 2)。
+ *   番号は DB が commit の直前に振る (epoch の鍵とマスタの書き込みの鍵を持ったまま = 番号の順 = commit の順)。送り手の時計 (started_at / finished_at)・
+ *   場所 (host) では並べない。どの場所から流したロードでも数える (毎晩の cron・--use-prepared の明示のロード)。dry-run は行が無い。
+ *   activate が「証拠の世代の後にロードが入っていない」を見る・写し (publish/fetch.mjs) がどのロードの世代かを決める
+ * @returns {{ commit_seq: number, ingest_run_id: string, epoch: string, ownership_hash: string, host: string|null }|null}  表が無い・行が無い = null
  */
-export async function latestLoadRunId(db) {
-  const r = (await rowsOf(db, `select ingest_run_id from ops.ingest_runs where source_system = 'sqlite_initial_load' and entity = 'products' and status = 'success'
-    order by finished_at desc nulls last, started_at desc, ingest_run_id desc limit 1`))[0];
-  return r ? r.ingest_run_id : null;
+export async function latestLoadCommit(db) {
+  if ((await rowsOf(db, `select to_regclass('ops.master_load_commits') is not null as ok`))[0].ok !== true) return null;
+  const r = (await rowsOf(db, `select c.commit_seq::text as seq, c.ingest_run_id, c.epoch, c.ownership_hash, c.host from ops.master_load_commits c order by c.commit_seq desc limit 1`))[0];
+  return r ? { commit_seq: Number(r.seq), ingest_run_id: r.ingest_run_id, epoch: r.epoch, ownership_hash: r.ownership_hash, host: r.host } : null;   // 数で並べる (文字の列の名前で並べない = '9' > '10' にしない)
 }
 
 /**
@@ -151,15 +154,18 @@ async function readCutoverPhaseInTx(db) {
  * activate: prepared → active (expectHash = 確かめた世代の持ち主のハッシュ・expectPreparedAt = 証拠を集めたときの prepare の時刻。どちらかが違えば投げる)。
  *   確かめの証拠は呼び手が集める。🚨 同じ持ち主でも prepare をやり直した (時刻が変わった) = 前の証拠では active にしない (#1564 Codex R2 Medium 4)。
  *   比べるのは行の鍵を取った後 (証拠を集めた後・activate の前に別の人が prepare し直しても通さない)
- *   expectLoadRunId = 証拠の世代が読んだ夜間ロード。最後に commit したロードがこれでない = 断る (LOAD_AFTER_EVIDENCE。古い active で走ったロードが
- *   証拠の後に C の列を NE の値で書いた = 証拠の世代はもう DB と同じでない。#1564 Codex R3 High 1)
+ *   expectLoadCommitSeq = 証拠の世代が読んだ夜間ロードの commit の番号 (0053 の ops.master_load_commits)。最後に commit したロードがこれでない = 断る
+ *   (LOAD_AFTER_EVIDENCE。古い active で走ったロードが証拠の後に C の列を NE の値で書いた = 証拠の世代はもう DB と同じでない。#1564 Codex R3 High 1・R4 Medium 2)。
+ *   最後のロードの持ち主が prepared でない = 断る (LOAD_EPOCH_MISMATCH)
  * 🚨 切替の段階が frozen (古い入口を止めた後・持ち主を C にする前) のときだけ (#1564 の見直し M-1)。
  *   段階の表が無い (⑤-1 の前) = 断る / legacy_open (古い入口がまだ正) = 断る / company_owner・new_open (もう切り替えた後) = 断る。
  *   持ち主の正を 1 つにする残り (⑤-1 の company_owner に進む条件 = active_hash と owner_hash が同じ・新しい画面が DB の active を読む) は ⑤ / ⑥ で結ぶ
  */
-export async function activateOwnership(db, { expectHash, expectPreparedAt, expectLoadRunId, actor, evidence }) {
+export async function activateOwnership(db, { expectHash, expectPreparedAt, expectLoadCommitSeq, actor, evidence }) {
   if (!expectPreparedAt) throw Object.assign(new Error('証拠を集めたときの prepare の時刻 (expectPreparedAt) が要る'), { code: 'PREPARED_AT_REQUIRED' });
-  if (!expectLoadRunId) throw Object.assign(new Error('証拠の世代が読んだ夜間ロード (expectLoadRunId) が要る'), { code: 'LOAD_RUN_REQUIRED' });
+  if (!Number.isSafeInteger(expectLoadCommitSeq) || expectLoadCommitSeq <= 0) {
+    throw Object.assign(new Error('証拠の世代が読んだ夜間ロードの commit の番号 (expectLoadCommitSeq) が要る'), { code: 'LOAD_COMMIT_REQUIRED' });
+  }
   return inTx(db, async () => {
     const phase = await readCutoverPhaseInTx(db);
     if (phase == null) throw Object.assign(new Error(`切替の段階の表 (${CUTOVER_TABLE}) が無い・行が無い = active にしない (⑤-1 の migration の後・段階 ${ACTIVATE_PHASE} で)`), { code: 'CUTOVER_STATE_MISSING' });
@@ -175,10 +181,13 @@ export async function activateOwnership(db, { expectHash, expectPreparedAt, expe
     if (eff.hash !== expectHash) throw Object.assign(new Error(`確かめた世代の持ち主 (${String(expectHash).slice(0, 12)}) が prepared (${eff.hash.slice(0, 12)}) と違う`), { code: 'PREPARED_MISMATCH' });
     // 証拠の世代の後に夜間ロードが入った = active にしない (#1564 Codex R3 High 1)。epoch の鍵 (排他) の後に見る =
     //   古い active を読んで走っていたロードは、ここより前に commit している (その書き込みは証拠の世代に入っていない = 写しからやり直す)
-    const lastLoad = await latestLoadRunId(db);
-    if (lastLoad !== expectLoadRunId) {
-      throw Object.assign(new Error(`証拠の世代の後に夜間ロード (${lastLoad}) が入った (証拠 = ${expectLoadRunId}) = この証拠では active にしない (--use-prepared のロードからやり直す)`),
-        { code: 'LOAD_AFTER_EVIDENCE', last_load: lastLoad });
+    const last = await latestLoadCommit(db);
+    if (!last || last.commit_seq !== expectLoadCommitSeq) {
+      throw Object.assign(new Error(`証拠の世代の後に夜間ロード (${last ? `${last.ingest_run_id} = 番号 ${last.commit_seq}` : 'なし'}) が入った (証拠 = 番号 ${expectLoadCommitSeq}) = この証拠では active にしない (--use-prepared のロードからやり直す)`),
+        { code: 'LOAD_AFTER_EVIDENCE', last_load: last ? last.ingest_run_id : null, last_commit_seq: last ? last.commit_seq : null });
+    }
+    if (last.ownership_hash !== eff.hash) {
+      throw Object.assign(new Error(`最後に commit したロード (${last.ingest_run_id}) の持ち主が prepared でない (${last.epoch}) = active にしない`), { code: 'LOAD_EPOCH_MISMATCH', last_load: last.ingest_run_id });
     }
     await db.query(`update ops.master_ownership_state set active_hash = prepared_hash, active_map = prepared_map, activated_at = now(), activated_by = $1, activated_evidence = $2::jsonb,
       prepared_hash = null, prepared_map = null, prepared_at = null, prepared_by = null, updated_at = now() where id = 1`, [actor, JSON.stringify(evidence ?? null)]);

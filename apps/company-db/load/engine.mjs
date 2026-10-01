@@ -1260,6 +1260,15 @@ export async function runInitialLoad(db, plan, opts = {}) {
       await db.query(`delete from ops.load_decisions where recorded_at < now() - ($1::int * interval '1 day')`, [LOAD_DECISIONS_KEEP_DAYS]);
       report.decisions = Object.fromEntries(Object.keys(decisions).map((k) => [k, true]));
     } else report.notes = [...(report.notes || []), '0030 が未適用: ロードの判断 (ops.load_decisions) は記録しない'];
+    // 0053: commit の順の番号 (#1564 Codex R4 Medium 2)。取引の最後 = epoch の鍵 (共有) とマスタの書き込みの鍵 (排他) を持ったまま 1 行足す =
+    //   足してから commit までほかのロードは入れない = DB が振る番号の順 = commit の順 (送り手の時計では並べない)。写し・activate がこの番号を使う。
+    //   書き込みの鍵は冒頭で取っている (取り直しても同じ取引の中では待たない = ここでも取って、この順を鍵に頼っていることを明示する)。dry-run は足さない
+    if (!dryRun && (await db.query("select to_regclass('ops.master_load_commits') is not null as ok")).rows[0].ok) {
+      await db.query(MASTER_WRITE_EXCLUSIVE_LOCK_SQL);
+      const c = (await db.query(`insert into ops.master_load_commits (ingest_run_id, epoch, ownership_hash, host) values ($1, $2, $3, $4) returning commit_seq::text as seq`,
+        [runId, report.ownership_epoch?.epoch ?? 'explicit', ownershipHashOf(ownership), opts.host || null])).rows[0];
+      report.load_commit_seq = Number(c.seq);
+    }
     if (dryRun) { await db.exec('rollback'); log('dry-run: 全部やってから巻き戻した'); }
     else { await db.exec('commit'); log('commit'); }
     return report;

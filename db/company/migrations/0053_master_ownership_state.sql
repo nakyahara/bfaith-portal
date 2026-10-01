@@ -63,6 +63,32 @@ end $$;
 -- 🚨 鍵の順 (全部の書き手で同じ): 持ち主の epoch (0053) → 切替の段階 (0051 の hashtext('ops.master_cutover')) → マスタの書き込み (0051) → 親子 (0036) → 行
 create function ops.master_ownership_lock_key() returns bigint language sql immutable as $$ select 4705310053::bigint $$;
 
+-- ─── 夜間ロードの commit の順 (#1564 Codex R4 Medium 2・High) ───
+-- 本適用の夜間ロード 1 回 = 1 行 (dry-run は巻き戻す = 行が無い)。commit_seq = DB が振る番号 = commit の順:
+--   夜間ロードは取引の最後 (commit の直前) に、epoch の鍵 (共有) とマスタの書き込みの鍵 (0051・排他) を持ったまま 1 行足す
+--   = 足してから commit までほかのロードは入れない = 番号の順 = commit の順 (送り手の時計 started_at / finished_at・場所 (host) では決めない)。
+--   写し (publish/fetch.mjs) は「最後に commit したロード」= 番号の一番大きい行を使う (毎晩の cron か、--use-prepared の明示のロードかを問わない)。
+--   activate は鍵 (排他) の後に、証拠の世代が読んだロードの番号 = 一番大きい番号かを見る (その後のロードがあれば断る)。
+--   照合 ① (master-compare/compare-load.mjs) は今までどおり毎晩の cron の回 (host = render-nightly) を見る (別の目的)
+create table ops.master_load_commits (
+  commit_seq     bigint generated always as identity primary key,
+  ingest_run_id  text not null unique references ops.ingest_runs (ingest_run_id),
+  epoch          text not null check (epoch in ('active', 'prepared', 'default', 'explicit')),
+  ownership_hash text not null check (ownership_hash ~ '^[0-9a-f]{64}$'),
+  host           text,
+  committed_at   timestamptz not null default clock_timestamp()
+);
+comment on table ops.master_load_commits is '夜間ロードの commit の順 (④a)。commit_seq = DB が振る番号 = commit の順 (送り手の時計で並べない)。写し・activate が使う';
+create or replace function ops.master_load_commits_append_only() returns trigger language plpgsql as $$
+begin
+  raise exception 'ops.master_load_commits は足すだけ (append-only)';
+end $$;
+create trigger trg_master_load_commits_append_only before update or delete on ops.master_load_commits
+  for each row execute function ops.master_load_commits_append_only();
+do $$ begin
+  if exists (select 1 from pg_roles where rolname = 'watcher') then execute 'grant select on ops.master_load_commits to watcher'; end if;
+end $$;
+
 -- ─── 持ち主表のハッシュを 1 つの式に (#1564 Codex R3 Medium) ───
 -- ⑤-1 (0051) の ops.ownership_hash を作り直す (同じ名前・同じ形・同じ使い方。中身の式だけ):
 --   持ち主が 'load' の列は数えない = [キー, 値] を load でない列だけキーの順に並べた JSON の sha256 (lib/master-cutover.mjs の ownershipHash と同じ)。

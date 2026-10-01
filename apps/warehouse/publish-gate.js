@@ -56,7 +56,8 @@ function latestBuildState(db) {
 }
 /**
  * 持ち主が全部 load と分かるか (行が無い・古い safe の行のときに流してよいか。#1564 Codex R3 High 2)。
- * 分かる = 確かめた今の世代がある・その持ち主が全部 load・最新の作り直しがあり世代を使った・その持ち主も全部 load。どれか欠ける・読めない = 分からない
+ * 分かる = 確かめた今の世代がある・その持ち主が全部 load・最新の作り直しがあり **今の世代** を使った (番号・ID・中身のハッシュが同じ。#1564 Codex R4 Medium 1)・
+ *   その持ち主も全部 load。どれか欠ける・読めない・作り直しが前の世代のまま (写しの後に作り直しが失敗した・飛ばした) = 分からない
  * @returns {{ ok: boolean, why: string|null }}
  */
 export function knownAllLoad(db, st = latestBuildState(db)) {
@@ -68,6 +69,10 @@ export function knownAllLoad(db, st = latestBuildState(db)) {
   if (!st.build) return { ok: false, why: 'no_build' };
   if (!st.bp) return { ok: false, why: 'build_without_generation' };
   if (st.bp.ownership_hash !== ALL_LOAD_HASH) return { ok: false, why: 'company_owner' };
+  const g = head.generation;
+  if (st.bp.generation_no !== g.generation_no || (st.bp.generation_id ?? null) !== (g.generation_id ?? null) || (st.bp.content_hash ?? null) !== (g.content_hash ?? null)) {
+    return { ok: false, why: 'build_not_current_generation' };
+  }
   return { ok: true, why: null };
 }
 /**

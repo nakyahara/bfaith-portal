@@ -46,7 +46,7 @@ function clearRunning(dir, runId) {
   if (cur && cur.run_id === runId) { try { fs.unlinkSync(runningPath(dir)); } catch { /* 無ければよい */ } }
 }
 
-export async function runLoadOnce({ dataDir, url, apply = false, outDir, log = console.log, host, runId: runIdIn, usePrepared = false } = {}) {
+export async function runLoadOnce({ dataDir, url, apply = false, outDir, log = console.log, host, runId: runIdIn, usePrepared = false, connect = openPgClient } = {}) {
   const runId = runIdIn || newLoadRunId();
   const dir = reportDir(dataDir, outDir);
   const l = (m) => log(`[company-db load] ${m}`);
@@ -68,7 +68,7 @@ export async function runLoadOnce({ dataDir, url, apply = false, outDir, log = c
   let plan;
   try { plan = buildPlanFromRender({ dataDir, log: l }); } catch (e) { throw fail('plan', e); }
   let client;
-  try { client = await openPgClient(url); } catch (e) { throw fail('connect', e, { plan_sources: plan.sources }); }
+  try { client = await connect(url); } catch (e) { throw fail('connect', e, { plan_sources: plan.sources }); }   // connect = router の接続の作り方 (試験は差し替える)
   const db = pgAdapter(client);
   let report;
   try {
