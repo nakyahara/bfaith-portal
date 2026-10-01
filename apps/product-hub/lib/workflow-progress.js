@@ -310,8 +310,24 @@ function assertOwnerScope(patch, actorStaffId) {
   }
 }
 
-function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim = false }) {
+function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim = false, boardReopen = false }) {
   if (isAdmin) return;
+
+  // ボードの D&D で「落とした列」を いまやる番 にするために、**対象外で残っていた工程を
+  // 未着手に戻す**とき (2026-10-01)。役割を置かないシステム工程 (⑧楽天登録) でも通す。
+  // 役割がある工程はこの下の通常の判定 (本人 / 画像は役割) でそのまま通るので、ここは
+  // 「システム工程を開き直す」専用の抜け道。
+  // 🚨 開き直すのは **未着手に戻すだけ** で、「システムが進める工程を人が完了にする」は
+  //    依然できない (patch は state='todo' の 1 本だけしか通さない)。
+  //    ⑧楽天登録 は listing_gate=0 で出品ゲートに数えず、楽天に出してよいかの判定は
+  //    draft_mall_status / draft_rakuten が正 (assertRakutenListable) なので、
+  //    ここで変わるのは**カードがどの列に出るか**だけ。
+  //    これを許さないと、報告された「落とした列の先へ飛ばされる」が非管理者では
+  //    403 に変わるだけで直らない (Codex R1 P1)
+  if (boardReopen && !row.role_code && actorStaffId != null && patch?.state === 'todo'
+    && Object.keys(patch).every((k) => k === 'state' || k === 'expected_version' || patch[k] === undefined)) {
+    return;
+  }
 
   // 自分の担当工程
   if (row.assignee_id != null && row.assignee_id === actorStaffId) {
@@ -856,7 +872,7 @@ export function assertStepOperable(db, draftId, stepCode, expectedVersion, { isA
  */
 export function setStepState(
   draftId, stepCode, patch, actor,
-  { isAdmin = false, actorStaffId = null, requireVersion = false, bypassGates = false, systemActor = false, boardClaim = false } = {},
+  { isAdmin = false, actorStaffId = null, requireVersion = false, bypassGates = false, systemActor = false, boardClaim = false, boardReopen = false } = {},
 ) {
   const db = getDB();
   const id = Number(draftId);
@@ -875,7 +891,7 @@ export function setStepState(
   if (row.track === 'image' && patch && Object.keys(patch).some((k) => k !== 'expected_version') && imageHoldOf(db, id).onHold) {
     throw badRequest('画像制作が保留中です。詳細画面の「画像制作」カードで保留を解除してから操作してください');
   }
-  assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim });
+  assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim, boardReopen });
   // TOP画像 (サムネイル) は楽天出品に必須なので、admin でも工程単位の「対象外」にはできない。
   // 詳細画像を作らない商品は setDetailImagesExcluded (商品単位のフラグ) を使う
   if (patch?.state === 'skip' && row.track === 'image' && row.image_kind !== 'detail') {
@@ -1107,7 +1123,7 @@ export function setStepState(
  * かんばんカードの D&D 移動 (2026-08-24 中原さん要望)。
  * 「落とした列がその商品のいまやる工程になる」ように工程をまとめて更新する:
  *   - 前方 (右) へ: 現在工程から移動先の手前までを順に done に (移動先は todo のまま = いまやる番)。
- *     通過するのは**まだ決着していない工程だけ** / 移動先がすでに決着していれば開き直す (2026-10-01)
+ *     通過するのは**まだ決着していない工程だけ** / 移動先が「対象外」で残っていれば開き直す (2026-10-01)
  *   - 後方 (左) へ: 移動先の工程を todo に開け直す (間の done は触らない = currentOf が移動先を指す)
  *   - to='done' (完了列): 残りの工程を全部 done に。本流は listing の全モール決着チェックが効くので
  *     モール未決着なら失敗する (出品・展開はモール別ステータスが正、のルールを D&D でも維持)
@@ -1228,17 +1244,21 @@ export function moveBoardCard(
       // 完了列 (tIdx = rows.length) には移動先が無い
       if (tIdx < rows.length) {
         const target = rows[tIdx];
-        // 🚨 「落とした列がその商品のいまやる工程になる」のが D&D の約束。移動先がすでに決着して
-        //    いる (対象外 / done) ときは **開き直す** — でないと currentOf が移動先を飛ばして、
+        // 🚨 「落とした列がその商品のいまやる工程になる」のが D&D の約束。移動先が
+        //    **対象外で残っている**ときは開き直す — でないと currentOf が移動先を飛ばして、
         //    カードは落とした列ではなく**その先の列**に出る。
         //    2026-10-01 スタッフ報告:「2個セットで楽天未登録なのに、楽天登録に落とすと
         //    A+コンテンツまで飛ばされる」= 親の画像をそのまま使うセットは作成時に
         //    画像の工程がまるごと「対象外」になる (applyImagePlanToTrack) ため、
-        //    ⑧楽天登録 が skip のまま残っていた
-        if (settled(target)) setWithClaim(target.step_code, 'todo');
+        //    ⑧楽天登録 が skip のまま残っていた。
+        //    「対象外」は人が決めた予定なので、落としたこと自体が「ここをやる」の意思表示。
+        //    **done は開き直さない** — done は済んだという記録 (⑧なら「楽天に出した」) で、
+        //    上を通り過ぎるだけの操作で消してよいものではない。意図して戻すなら後方移動 (左へ) がある
+        if (target.state === 'skip') {
+          setStepState(id, target.step_code, { state: 'todo' }, actor, { isAdmin, actorStaffId, boardReopen: true });
         // 移動先 (= いまやる番) も未割り当てなら移動者に付ける (Codex R1: ドラッグ = 「自分が次工程を持っていく」の意思表示。
         // 付けないと次の操作でまた「自分が担当する」が要る)
-        else if (unassignedHuman(target.step_code)) {
+        } else if (unassignedHuman(target.step_code)) {
           setStepState(id, target.step_code, { assignee_id: actorStaffId }, actor, { isAdmin, actorStaffId, boardClaim: true });
         }
       }

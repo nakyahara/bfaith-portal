@@ -5511,8 +5511,13 @@ let wfSetParentId = null;
     db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_material');
     check('D&D 前提: ⑧楽天登録 が「対象外」で残り、いまの工程は ③素材待ち',
       st('imgd_rakuten') === 'skip' && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_material');
-    wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_material' }, 'smoke', ADMIN2);
-    check('🚨 D&D: 対象外で残っていた ⑧楽天登録 に落とすと、そこが「いまやる番」になる (A+ へ飛ばない)',
+    // 🚨 動かすのは**管理者ではなく画像登録者** (Codex R1 P1: ⑧楽天登録 は役割を置かない
+    //    システム工程なので、管理者で試すと「非管理者は 403 で直っていない」を見逃す)
+    const skipImgStaffId = wf.createStaff({ name: '対象外の列スモーク', kind: 'internal' });
+    db.prepare(`INSERT INTO ph_staff_roles (staff_id, role_code) VALUES (?, 'image')`).run(skipImgStaffId);
+    const SKIP_IMG = { isAdmin: false, actorStaffId: skipImgStaffId };
+    wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_material' }, 'img', SKIP_IMG);
+    check('🚨 D&D: 対象外で残っていた ⑧楽天登録 に落とすと、そこが「いまやる番」になる (A+ へ飛ばない・画像登録者でも)',
       st('imgd_rakuten') === 'todo'
       && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
       `⑧=${st('imgd_rakuten')} / current=${wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code}`);
@@ -5526,12 +5531,25 @@ let wfSetParentId = null;
     db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_amazon');
     let overSkip = null;
     try {
-      wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'aplus', expectedCurrent: 'imgd_amazon' }, 'smoke', ADMIN2);
+      wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'aplus', expectedCurrent: 'imgd_amazon' }, 'img', SKIP_IMG);
     } catch (e) { overSkip = e; }
     check('🚨 D&D: 対象外の ⑧楽天登録 を跨いで ⑨A+ に落とせる (⑧ は対象外のまま・400 にならない)',
       !overSkip && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'done' && st('imgd_aplus') === 'todo',
       overSkip?.message || JSON.stringify(['imgd_rakuten', 'imgd_amazon', 'imgd_aplus'].map(st)));
+    // 🚨 抜け道は「対象外 → 未着手」だけ。システム工程を人が**完了**にする道は開けていない
+    let doneSys = null;
+    try { wfpEarly.setStepState(idSkip, 'imgd_rakuten', { state: 'done' }, 'img', SKIP_IMG); } catch (e) { doneSys = e; }
+    check('D&D の抜け道: ⑧楽天登録 を人が「完了」にはできないまま (開き直しだけを許す)',
+      doneSys?.status === 403 || doneSys?.status === 400, doneSys?.message || '例外が出ていない');
+    // 完了で残っている工程は開き直さない (済んだ記録を通過だけで消さない)。
+    // ⑧ を「楽天に出した」状態にしてから、その手前を差し戻して前方移動する
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('done', idSkip, 'imgd_rakuten');
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_design');
+    wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_design' }, 'img', SKIP_IMG);
+    check('D&D: 完了で残っている ⑧楽天登録 は開き直さない (済んだ記録を消さない)',
+      st('imgd_rakuten') === 'done', st('imgd_rakuten'));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSkip);
+    wf.setStaffActive(skipImgStaffId, false);
   }
 
   // カードは 1 商品 1 枚 (2026-08-31 TOP工程の廃止。「制作件数がぱっと見で分かりにくい」の解消)
