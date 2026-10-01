@@ -29,16 +29,20 @@ const eq = (a, b, l) => ok(JSON.stringify(a) === JSON.stringify(b), `${l} (期�
 
 // ── 画面側はセッション認証の中。テストでは擬似セッションを差す ──
 const app = express();
-app.use((req, _res, next) => { req.session = { email: 'nakahara@x', role: 'admin' }; next(); });
+// 役割はヘッダで切り替えられるようにする (admin 限定の口を確かめるため)
+app.use((req, _res, next) => { req.session = { email: 'nakahara@x', role: req.get('X-Test-Role') || 'admin' }; next(); });
 app.use('/apps/product-hub', router);
 app.use('/apps/product-hub/service-api', serviceApiRouter);
 const server = app.listen(0);
 await new Promise((r) => server.once('listening', r));
 const base = `http://127.0.0.1:${server.address().port}/apps/product-hub`;
 
-const api = async (method, path, { body = null, raw = null, token = null, query = '' } = {}) => {
+const api = async (method, path, { body = null, raw = null, token = null, query = '', lease = null, role = null } = {}) => {
   const headers = {};
   if (token) headers.Authorization = `Bearer ${token}`;
+  // 🚨 lease はヘッダ。クエリに載せるとプロキシやアクセスログに URL ごと残る (Codex API R1 #3)
+  if (lease) headers['X-LP-Compose-Lease'] = lease;
+  if (role) headers['X-Test-Role'] = role;
   let payload;
   if (raw) { headers['Content-Type'] = 'application/octet-stream'; payload = raw; }
   else if (body) { headers['Content-Type'] = 'application/json'; payload = JSON.stringify(body); }
@@ -84,6 +88,9 @@ if (haveReal) {
   xlsx = Buffer.from(await wb.xlsx.writeBuffer());
   console.log('  (共有ドライブが無いので代わりの .xlsx を作った)');
 }
+// 仕様書の差し替えは admin 限定 (生成依頼は誰でも押せるが、ここは別権限・Codex API R1 #1)
+eq((await api('POST', '/api/lp-specs', { raw: xlsx, role: 'staff' })).status, 403,
+  '🚨 admin でなければ仕様書を差し替えられない (API R1 #1)');
 const up1 = await api('POST', '/api/lp-specs', { raw: xlsx, query: '?kind=product_analysis&title=LP制作システム' });
 eq(up1.status, 200, '上げられる');
 ok(up1.json.created, '新しい版になる');
@@ -126,12 +133,12 @@ ok((await svc('POST', '/lp-compose/claim', { body: { runner_run_id: 'run-2' } })
   '同じ依頼を 2 つの実行役が掴まない');
 
 console.log('④ 商品画像は packet に固定済みのものだけ');
-const img404 = await svc('GET', `/lp-compose/jobs/${job.job_id}/images/3`, { query: `?lease_token=${job.lease_token}` });
+const img404 = await svc('GET', `/lp-compose/jobs/${job.job_id}/images/3`, { lease: job.lease_token });
 eq(img404.status, 404, '渡していない番号は 404');
-const imgNoLease = await svc('GET', `/lp-compose/jobs/${job.job_id}/images/1`, { query: '?lease_token=ちがう' });
+const imgNoLease = await svc('GET', `/lp-compose/jobs/${job.job_id}/images/1`, { lease: 'wrong-lease-token' });
 eq(imgNoLease.status, 409, '🚨 lease が違えば配らない');
 // Drive を叩くので本番の画像は取れない。「lease が通って Drive まで行った」ことだけ確かめる
-const img1 = await svc('GET', `/lp-compose/jobs/${job.job_id}/images/1`, { query: `?lease_token=${job.lease_token}` });
+const img1 = await svc('GET', `/lp-compose/jobs/${job.job_id}/images/1`, { lease: job.lease_token });
 ok([200, 403, 404, 502].includes(img1.status), `lease が通れば Drive まで行く (status ${img1.status})`);
 
 console.log('⑤ 予約 → 結果');

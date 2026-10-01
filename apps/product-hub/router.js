@@ -3631,6 +3631,13 @@ serviceApiRouter.post('/ad-kw-ai/jobs/:id/release', (req, res) => {
 // スプレッドシートを毎晩直接読む案は不可 (miniPC に G: も Drive 認証も無い + 編集途中を掏む。設計 §4.1)。
 // 追記専用 — 同じ中身なら版を増やさず既存を返す。変わったら新しい版になる。
 const LP_SPEC_MAX_BYTES = 5 * 1024 * 1024;
+// 展開後の上限。xlsx は ZIP なので 5MB のファイルが展開で巨大になりうる (zip bomb)。
+// 完全な防御 (展開前の ZIP 検査・別プロセスへの隔離) は入れていない —
+// この口を **admin 限定**にして攻撃面を絞ったうえで、安い上限だけ置く (Codex API R1 #2 を承知)。
+// 実物の仕様書は 8 タブ・数百行・5 万字程度なので、この枕で十分。
+const LP_SPEC_MAX_SHEETS = 50;
+const LP_SPEC_MAX_ROWS_PER_SHEET = 5000;
+const LP_SPEC_MAX_CELLS = 200000;
 
 /** exceljs の cell.value を素の文字列に潰す (apps/inbound-info/router.js の plainValue と同じ考え方) */
 function lpSpecCellText(v) {
@@ -3656,17 +3663,26 @@ async function lpSpecWorkbookToText(buf) {
   const ExcelJS = (await import('exceljs')).default;
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buf);
+  if (wb.worksheets.length > LP_SPEC_MAX_SHEETS) {
+    throw new Error(`タブが多すぎます (${wb.worksheets.length} / ${LP_SPEC_MAX_SHEETS} まで)`);
+  }
   const titles = [];
   const parts = [];
+  let cells = 0;
   for (const ws of wb.worksheets) {
+    if (ws.rowCount > LP_SPEC_MAX_ROWS_PER_SHEET) {
+      throw new Error(`タブ「${ws.name}」の行が多すぎます (${ws.rowCount} / ${LP_SPEC_MAX_ROWS_PER_SHEET} まで)`);
+    }
     titles.push(ws.name);
     const lines = [];
     ws.eachRow({ includeEmpty: false }, (row) => {
       const vals = [];
       row.eachCell({ includeEmpty: true }, (c) => vals.push(lpSpecCellText(c.value).replace(/\t/g, ' ')));
+      cells += vals.length;
       while (vals.length && vals[vals.length - 1] === '') vals.pop();
       lines.push(vals.join('\t'));
     });
+    if (cells > LP_SPEC_MAX_CELLS) throw new Error(`セルが多すぎます (${LP_SPEC_MAX_CELLS} まで)`);
     parts.push(`## ${ws.name}\n${lines.join('\n')}`);
   }
   return { body: parts.join('\n\n'), sheetTitles: titles };
@@ -3679,6 +3695,9 @@ async function lpSpecWorkbookToText(buf) {
 router.post('/api/lp-specs',
   express.raw({ type: 'application/octet-stream', limit: LP_SPEC_MAX_BYTES + 1024 * 1024 }),
   async (req, res) => {
+    // 🚨 仕様書は **AI への指示そのもの**。差し替える = 全商品の生成内容を変える。
+    //    「誰でも押せる」は生成依頼 (ボタン) の話で、ここは別権限 (Codex API R1 #1)
+    if (!requireAdminJson(req, res)) return;
     if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
       return res.status(400).json({ ok: false, code: 'bad_request', error: '.xlsx の中身が空です' });
     }
@@ -3852,8 +3871,10 @@ serviceApiRouter.post('/lp-compose/jobs/:id/release', (req, res) => {
  *    画面用の THUMB_WIDTHS は触らない。
  */
 serviceApiRouter.get('/lp-compose/jobs/:id/images/:n', async (req, res) => {
+  // 🚨 lease_token はヘッダで受ける — クエリに載せるとプロキシやアクセスログに
+  //    URL ごと残る (Codex API R1 #3)。資格情報を URL に載せない
   const r = lpComposeImageRef(getDB(), intParam(req.params.id), {
-    leaseToken: rawField(req.query?.lease_token, 100), index: intParam(req.params.n) - 1,
+    leaseToken: rawField(req.get('X-LP-Compose-Lease'), 100), index: intParam(req.params.n) - 1,
   });
   if (!r.ok) return lpComposeFail(res, r);
   try {
