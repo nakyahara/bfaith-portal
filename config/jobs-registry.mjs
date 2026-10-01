@@ -1322,6 +1322,7 @@ export const JOBS_REGISTRY = [
       + '止めるかどうかの正 = warehouse.db の門 cdb_publish_gate (safe / broken / unknown。apps/warehouse/publish-gate.js の readPublishGate)。違う = broken (証跡より先に書く = 証跡が書けなくても exit 4)・'
       + '遅れ・確かめられない = 前の値のまま・行が無く持ち主が C = unknown (止める)・全部 load で行が無い = 確かめた今の世代と、それを使った最新の作り直し (今の世代を使った = 番号・ID・中身が同じ) がそろうときだけ流す (無い・作り直しが前の世代 = unknown。#1564 Codex R4 Medium 1)。'
       + '確かめが通った朝は全部 load でも safe を書く (作り直しを飛ばした朝も、確かめた作り直しのままなら行で流せる)。'
+      + '確かめが通らなかった朝 (落ちた・exit 1) = 確かめた safe の行が今も合う (遅れの朝) ときだけ流す。それ以外は unknown を残し (broken はそのまま)、daily-sync もその回の工程を止める (#1564 Codex R5)。'
       + 'safe は確かめた作り直し・世代・入れた値のハッシュを持つ = 後に作り直した・書き換えられた (broken を書けなかった) = その safe は使わない (unknown。全部 load と分かれば流す)・'
       + '門の表が読めない = unknown (#1564 Codex R3 High 2)。daily-sync (exit 4 と門の両方)・自動再試行 (RERUN_AFTER も)・'
       + '商品管理リストの手の更新 (fba-service → pml-fba-refresh.js) が同じ門で止まる。broken を safe に戻せるのは通った確かめだけ = 直したら fetch.mjs --verify-apply (手) で safe。'

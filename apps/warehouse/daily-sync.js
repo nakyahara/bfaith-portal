@@ -14,7 +14,7 @@ import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
 import { isWarnSummary } from './amazon-fees-outcome.js';
 import { isMonthStartGraceSummary, monthStartEmptyGrace, monthStartGraceDays, prevMonthOf } from './finance-dq-month-mode.js';
-import { publishGateDecision, readPublishGate } from './publish-gate.js';
+import { publishGateDecision, readPublishGate, gateAfterVerify } from './publish-gate.js';
 import { waitOtherRunGone, isAliveNodeSince, remainingRetrySlots } from './retry-lock.js';
 import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS, amazonFinanceDailyArgs } from './amazon-finance-months.js';
 
@@ -763,10 +763,12 @@ async function main() {
   const cdbPublishBroken = !cdbPublishApplyResult.success && cdbPublishApplyResult.exitCode === 4;
   // ここから後の m_products・上書き表を読む工程は runScript が止める (publish-gate.js の一覧。⚠️ 見送り・自分で ping を打つ工程は fail の ping)
   //   正 = warehouse.db の門 (cdb_publish_gate。safe / broken / unknown) と exit 4 の両方 (どちらかが「流さない」なら止める。自動再試行・手の更新も同じ門を読む)
+  //   確かめが通らなかった (exit 1・落ちた) のに門が「確かめた safe の行」でない = この回も止める (行が無く全部 load の暗黙の safe で流さない。#1564 Codex R5 Medium)
   const cdbPublishGateNow = readPublishGate({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data') });
-  publishGate.broken = cdbPublishBroken || !cdbPublishGateNow.open;
-  publishGate.state = cdbPublishBroken ? 'broken' : cdbPublishGateNow.state;
-  if (publishGate.broken) console.log(`[DailySync] ⚠️ Company DB の写しの反映の門 = ${publishGate.state} (exit ${cdbPublishApplyResult.exitCode ?? '-'}・${cdbPublishGateNow.reason}) → m_products・上書き表を読む後の工程を見送る (publish-gate.js)`);
+  const cdbPublishGateDecision = gateAfterVerify({ apply: cdbPublishApplyResult, gate: cdbPublishGateNow });
+  publishGate.broken = cdbPublishBroken || cdbPublishGateDecision.broken;
+  publishGate.state = cdbPublishBroken ? 'broken' : cdbPublishGateDecision.state;
+  if (publishGate.broken) console.log(`[DailySync] ⚠️ Company DB の写しの反映の門 = ${publishGate.state} (exit ${cdbPublishApplyResult.exitCode ?? '-'}・${cdbPublishGateDecision.reason}) → m_products・上書き表を読む後の工程を見送る (publish-gate.js)`);
 
   // m_products 変更差分を history に記録 (trigger 廃止 → 差分バッチ化)
   // rebuild-m-products.js の直後に実行 (m_products 確定後の比較)

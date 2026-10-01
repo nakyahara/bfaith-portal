@@ -38,13 +38,16 @@
  *     自動再試行 (RERUN_AFTER も)・商品管理リストの手の更新も同じ門で止まる (M-2・#1564 Codex R2 High 2) /
  *     (R3 High 2) safe は確かめた作り直し・世代・ハッシュを持つ = 後に作り直した・broken を書けなかった (前の safe が残った) = 使わない (unknown・再試行と手の更新も止まる) /
  *     門の表が読めない = unknown (行が無いと同じにしない) / 行が無く全部 load = 今の世代・作り直し・作り直しの世代がそろうときだけ流す /
- *     (R4 Medium 1) 作り直しが今の世代を使っていない (写しの後に作り直しが失敗した) = 全部 load でも unknown・確かめが通れば全部 load でも safe を書く
+ *     (R4 Medium 1) 作り直しが今の世代を使っていない (写しの後に作り直しが失敗した) = 全部 load でも unknown・確かめが通れば全部 load でも safe を書く /
+ *     (R5 Medium) 確かめが通らなかった (落ちた・exit 1) 朝 = 確かめた safe の行が無ければ unknown を残し (再試行・手の更新も止まる)・daily-sync もこの回を止める /
+ *     確かめた safe の行が今も合う遅れの朝 = 流す・broken は unknown に替えない
  *  25 記録の後に足した列 (記録した持ち主に無い) = load として足す・知らない列 = 壊れ (M-4)
  *  27 持ち主の正を 1 つに (0053・Codex #1564 R2 High 3): 0001〜0053 がそろって入る / 切替の段階を company_owner に進める前提 = epoch が active (差し込み口) /
  *     段階の owner_hash = active (⑤-1 の段階の行の trigger) / 画面の保存の門 (⑤-1 の ops.begin_master_write) = active (記録に無い列 = load)
  *  28 持ち主表のハッシュは 1 つの式 (load の列は数えない。#1564 Codex R3 Medium): JS = DB / 前の列の組で切り替えた後に列を足しても画面の保存・登録の門は通る・
  *     夜間ロードは足した列を load で動かす
  *  29 最後に commit したロード = DB が振る番号の順 (0053 の ops.master_load_commits。送り手の時計・場所では決めない・数で並べる)・dry-run は番号なし・
+ *     0053 の前の毎晩のロード (番号の行が無い) = 最初の朝はそれを使う (commit_seq = null。R5 Low)・
  *     写しは場所を問わず最後のロード・番号の表は足すだけ (#1564 Codex R4 Medium 2・High)
  *  26 NE と C で種類が違う SKU (NE でセットを単品に) = その SKU だけ NE の値 (⚠️・証跡)・作り直し全部は止めない (M-5) /
  *     C のセットの構成品に NE にしか無い単品 = 値が混ざる = ⚠️・証跡 (L-2)
@@ -1142,7 +1145,9 @@ await ta('[20] 写しの反映が世代と違う朝 (exit 4) = 後の m_products
   // 自分で ping を打つ工程の台帳の項目がある
   for (const id of Object.values(G.GATED_OWN_PING)) assert.ok(JOBS_REGISTRY.find((j) => j.id === id), id);
   // daily-sync の配線: 反映の確かめの直後 (履歴の記録より前) に立てる・runScript が最初に判断する・通知の前に fail の ping・前の個別の見送りは残っていない
-  const iGate = ds.indexOf('publishGate.broken = cdbPublishBroken || !cdbPublishGateNow.open;');   // exit 4 と門 (cdb_publish_gate) の両方 (#1564 の見直し L-4・Codex R2 High 2)
+  // exit 4 と門 (cdb_publish_gate) の両方・確かめが通らなかった朝は「確かめた safe の行」だけ流す (#1564 の見直し L-4・Codex R2 High 2・R5 Medium)
+  assert.match(ds, /const cdbPublishGateDecision = gateAfterVerify\(\{ apply: cdbPublishApplyResult, gate: cdbPublishGateNow \}\);/);
+  const iGate = ds.indexOf('publishGate.broken = cdbPublishBroken || cdbPublishGateDecision.broken;');
   assert.ok(iGate > iApply && iGate < ds.indexOf("runScript('apps/warehouse/record-m-products-history.js'"));
   assert.match(ds, /function runScript\([^)]*\) \{\s*\/\/[^\n]*\n\s*const gate = publishGateDecision\(scriptPath, publishGate\);\s*if \(gate\.skip\) \{/);
   assert.match(ds, /return \{ success: false, blocked: true, gated: true, summary: gate\.summary \};/);
@@ -1433,6 +1438,50 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   db.prepare('DELETE FROM cdb_publish_gate').run();
   assert.equal((await rebuild()).ok, true);   // 作り直しが N を使った = 全部 load と分かる
   assert.deepEqual([gate().state, gate().open, gate().source], ['safe', true, 'implicit']);
+  // (n) 確かめが通らなかった朝 (#1564 Codex R5 Medium): 行が無く全部 load (暗黙の safe = 最初の朝・warehouse.db を戻した朝) でも
+  //     決める前に落ちた = 門を unknown に残す (自動再試行・商品管理リストの手の更新も止まる)・daily-sync はこの回の 28 工程を止める
+  let vc = await verify({ verify: async () => { throw new Error('落ちた (試験)'); } });
+  assert.equal(vc.code, 1, vc.last);
+  assert.match(vc.last, /落ちた \(試験\) \(門 = unknown\)/);
+  assert.deepEqual([row().state, gate().state, gate().open], ['unknown', 'unknown', false]);
+  assert.match(row().reason, /^verify_apply_crashed: 落ちた/);
+  ran.length = 0; calls.length = 0;
+  R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
+  assert.deepEqual(ran, ['マスタ照合', 'CompanyDB見張り']);
+  await assert.rejects(P.runPmlFbaRefresh(pml(gate)), (e) => e.code === 'PUBLISH_BROKEN');
+  assert.deepEqual(calls, []);
+  //     daily-sync の判断: 確かめが exit 1 で門が暗黙の safe = 止める / 門が確かめた safe の行 = 流す / exit 4 = broken
+  const implicitSafe = { open: true, state: 'safe', source: 'implicit', reason: 'all_load_no_gate_row' };
+  assert.deepEqual([G.gateAfterVerify({ apply: { success: false, exitCode: 1 }, gate: implicitSafe }).broken, G.gateAfterVerify({ apply: { success: false, exitCode: 1 }, gate: implicitSafe }).state],
+    [true, 'unknown']);
+  assert.equal(G.gateAfterVerify({ apply: { success: true, exitCode: 0 }, gate: implicitSafe }).broken, false);
+  assert.equal(G.gateAfterVerify({ apply: { success: false, exitCode: 1 }, gate: { open: true, state: 'safe', source: 'row', reason: 'verified' } }).broken, false);
+  assert.deepEqual(G.gateAfterVerify({ apply: { success: false, exitCode: 4 }, gate: { open: true, state: 'safe', source: 'row', reason: 'verified' } }).state, 'broken');
+  //     決めた失敗 (今朝の写し・作り直しが別の回 = 確かめられない) も、確かめた safe の行が無ければ unknown を残す
+  db.prepare('DELETE FROM cdb_publish_gate').run();
+  vc = await verify({ env: { DATA_DIR: tmp, COMPANY_DB_WATCH_URL: 'postgres://test', DAILY_SYNC_RUN_ID: 'ds_other_run' } });
+  assert.equal(vc.code, 1, vc.last);
+  assert.deepEqual([row().state, gate().open], ['unknown', false]);
+  //     broken は unknown に替えない (戻せるのは通った確かめだけ)
+  db.prepare('DELETE FROM cdb_publish_gate').run();
+  G.writePublishGate(db, { state: 'broken', reason: 'test', checkedAt: new Date().toISOString() });
+  vc = await verify({ verify: async () => { throw new Error('落ちた (試験 2)'); } });
+  assert.match(vc.last, /門 = broken のまま/);
+  assert.equal(row().state, 'broken');
+  // (o) 前の確かめた safe の行が今も合う遅れの朝 (写しだけ新しい世代・作り直しは前のまま) = 流す (行のまま・daily-sync も再試行も止めない)
+  db.prepare('DELETE FROM cdb_publish_gate').run();
+  assert.equal((await verify()).code, 0);
+  assert.deepEqual([row().state, gate().source], ['safe', 'row']);
+  assert.equal((await fetchGen(MASTER_OWNERSHIP)).state, 'verified');   // 写しだけ新しい世代 (作り直しは飛ばした)
+  vc = await verify();
+  assert.equal(vc.code, 1, vc.last);   // 遅れ
+  assert.deepEqual([row().state, gate().state, gate().open, gate().source], ['safe', 'safe', true, 'row']);
+  assert.equal(G.gateAfterVerify({ apply: { success: false, exitCode: 1 }, gate: gate() }).broken, false);
+  ran.length = 0;
+  R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
+  assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  db.prepare('DELETE FROM cdb_publish_gate').run();
+  assert.equal((await rebuild()).ok, true);
   // (h) 読めない (warehouse.db が無い・壊れた) = unknown = 止める
   assert.deepEqual([G.readPublishGate({ dataDir: path.join(tmp, 'no-such-dir') }).state, G.readPublishGate({ dataDir: path.join(tmp, 'no-such-dir') }).open], ['unknown', false]);
   assert.equal(G.readPublishGate({ dataDir: null }).open, false);
@@ -1677,6 +1726,22 @@ await ta('[29] 最後に commit したロード = DB が振る番号の順 (送�
   const dry = await runInitialLoad(pdb, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: `load_pub_${++loadN}`, host: 'render-nightly', dryRun: true });
   assert.equal(dry.load_commit_seq, undefined);
   assert.equal((await OS.latestLoadCommit(pdb)).ingest_run_id, other.run_id);
+  // 0053 の前の毎晩の cron のロード (番号の行が無い) = 0053 の後の最初の朝の写しはそのロードを使う (commit_seq = null。#1564 Codex R5 Low)
+  const pg3 = new PGlite(); const pdb3 = pgliteAdapter(pg3);
+  try {
+    await applyMigrations(pdb3, { log: quiet, to: '0052' });
+    const old = await runInitialLoad(pdb3, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: 'load_before_0053', host: 'render-nightly' });
+    assert.equal(old.ok, true, old.error);
+    assert.equal(old.load_commit_seq, undefined);   // 番号の表が無い = 番号を取らない (ロードは止めない)
+    await applyMigrations(pdb3, { log: quiet });
+    assert.equal((await pdb3.query('select count(*)::int as n from ops.master_load_commits')).rows[0].n, 0);
+    const first = await F.selectPublishLoad(pdb3);
+    assert.deepEqual([first.ingest_run_id, first.commit_seq, first.host], ['load_before_0053', null, 'render-nightly']);
+    // 0053 の後の最初の本適用のロード = 番号 1 = それを使う
+    const next = await runInitialLoad(pdb3, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: 'load_after_0053', host: 'render-nightly' });
+    assert.equal(next.load_commit_seq, 1);
+    assert.deepEqual([(await F.selectPublishLoad(pdb3)).ingest_run_id, (await F.selectPublishLoad(pdb3)).commit_seq], ['load_after_0053', 1]);
+  } finally { await pg3.close(); }
   // 足すだけ
   await assert.rejects(q("update ops.master_load_commits set host = 'x'"), /足すだけ/);   // 番号そのものは identity (always) = 書き換えられない
   await assert.rejects(q('delete from ops.master_load_commits'), /足すだけ/);

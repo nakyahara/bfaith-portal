@@ -18,6 +18,8 @@
  *   読めない (表はあるが SELECT が落ちる・ファイルが開けない) = unknown = 止める (「行が無い」と同じにしない。#1564 Codex R3 High 2)
  * 🚨 safe の行は「確かめた作り直し・世代・入れた値のハッシュ・持ち主」を持つ。読み手は最新の作り直し・その世代・今の古い表から作り直したハッシュと比べ、
  *   違えば (確かめた後に作り直した・書き換えられた・broken を書けなかった) その safe は使わない = 持ち主が全部 load と分かるときだけ流す・それ以外は unknown
+ * 🚨 確かめが通らなかった朝 (落ちた・exit 1。#1564 Codex R5 Medium): 確かめた safe の行が今も合う (遅れの朝) ときだけ流す。それ以外は
+ *   確かめの側が unknown を残す (markGateUnknown。broken はそのまま) = 自動再試行・手の更新も止まる / daily-sync もその回を止める (gateAfterVerify)
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -113,6 +115,39 @@ export function gateOfDb(db) {
   if (all.ok) return { state: 'safe', open: true, broken: false, reason: 'all_load_no_gate_row', checked_at: null, build_id: null, generation_no: null, source: 'implicit' };
   // 持ち主が C なのに一度も確かめていない / 全部 load と分からない (世代・作り直しが無い・読めない) = 止める
   return closed('unknown', all.why === 'company_owner' ? 'no_gate_row_with_company_owner' : `no_gate_row_unverified:${all.why}`);
+}
+/** 門が「確かめた safe の行」(今の作り直し・世代・古い表と合う) か。読めない = いいえ */
+export function validSafeRow(db) {
+  try { const g = gateOfDb(db); return g.open === true && g.source === 'row'; } catch { return false; }
+}
+/**
+ * 確かめ (fetch.mjs --verify-apply) が決める前に落ちた・確かめが通らなかった回に、門を unknown にする (#1564 Codex R5 Medium) =
+ *   自動再試行・商品管理リストの手の更新も止まる (暗黙の safe = 「行が無く全部 load」で流さない)。
+ *   書かない: broken の行 (戻せるのは通った確かめだけ・unknown に替えない) / 確かめた safe の行が今も合う (遅れの朝 = 前の確かめのまま流す)
+ * @returns {{ wrote: boolean, kept: string|null, error: string|null }}
+ */
+export function markGateUnknown(db, { reason, now = new Date() }) {
+  let row = null;
+  try { row = readGateRow(db); } catch { row = null; }
+  if (row && row.state === 'broken') return { wrote: false, kept: 'broken', error: null };
+  if (validSafeRow(db)) return { wrote: false, kept: 'safe', error: null };
+  try {
+    writePublishGate(db, { state: 'unknown', reason, buildId: row?.build_id ?? null, generationNo: row?.generation_no ?? null, checkedAt: now.toISOString(), now });
+    return { wrote: true, kept: null, error: null };
+  } catch (e) { return { wrote: false, kept: null, error: String(e && e.message).slice(0, 200) }; }
+}
+/**
+ * daily-sync: 「写しの反映の確かめ」の後に、m_products・上書き表を読む工程を止めるか (#1564 Codex R1 H4・R2 High 2・R5 Medium)。
+ *   exit 4 = broken / 門が閉じている = その値 / 確かめが通らなかった (exit 1・落ちた) のに門が「確かめた safe の行」でない
+ *   (行が無く全部 load の暗黙の safe・合わなくなった safe) = unknown = この回は止める。確かめた safe の行が今も合う遅れの朝 = 流す
+ * @param {{ success: boolean, exitCode?: number|null }} apply  runScript の結果
+ * @param {{ open: boolean, state: string, reason: string, source: string }} gate  readPublishGate の結果 (確かめの後に読む)
+ */
+export function gateAfterVerify({ apply, gate }) {
+  if (apply && !apply.success && apply.exitCode === 4) return { broken: true, state: 'broken', reason: 'verify_apply_exit_4' };
+  if (!gate || !gate.open) return { broken: true, state: gate ? gate.state : 'unknown', reason: gate ? gate.reason : 'no_gate' };
+  if (apply && !apply.success && gate.source !== 'row') return { broken: true, state: 'unknown', reason: `verify_apply_failed_without_safe_row (${gate.reason})` };
+  return { broken: false, state: gate.state, reason: gate.reason };
 }
 /**
  * 門を読む (db = 開いた warehouse.db / dataDir = DATA_DIR から読み取り専用で開く)。読めない = unknown = 止める

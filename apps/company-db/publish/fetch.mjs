@@ -41,7 +41,7 @@ import {
 } from '../../warehouse/master-publish.js';
 import { latestBuild, publishOfBuild } from '../../warehouse/master-material.js';
 import { readOwnershipState, latestLoadCommit, ALL_LOAD } from '../load/ownership-state.mjs';
-import { readGateRow, writePublishGate } from '../../warehouse/publish-gate.js';
+import { readGateRow, writePublishGate, validSafeRow, markGateUnknown } from '../../warehouse/publish-gate.js';
 
 export const EVIDENCE_NAME = 'master-publish';
 export const JOB_ID = 'cdb-master-publish';   // 台帳 (config/jobs-registry.mjs)
@@ -481,11 +481,12 @@ export async function runVerifyApply({ sqlite, dataDir, ownership: configured = 
   //   読み手が今と比べる。持ち主が全部 load でも書く = 作り直しを飛ばした朝 (前の世代のまま) も、確かめた作り直しのままなら流せる。#1564 Codex R4 Medium 1) /
   //   遅れ・確かめられない = 前の値のまま (行が無く持ち主が C = unknown)
   //   門が読めない (表はあるが SELECT が落ちる) = 「行が無い」と同じにしない (#1564 Codex R3 High 2): 通った = safe を書き直す・それ以外 = unknown を書く
-  const pubCols = publishCols(ownership);
+  //   通らなかった (遅れ・確かめられない) = 確かめた safe の行が今も合えばそのまま (遅れの朝は流す)・broken はそのまま・それ以外 = unknown を書く
+  //   (行が無く全部 load の暗黙の safe で、自動再試行・手の更新を流さない。#1564 Codex R5 Medium)
   let gateBefore = null, gateReadError = null;
   try { gateBefore = readGateRow(sqlite); } catch (e) { gateReadError = String(e && e.message).slice(0, 200); }
   const gateNext = broken ? 'broken' : state === 'verified' ? 'safe'
-    : (gateReadError || (!gateBefore && pubCols.length) ? 'unknown' : null);
+    : gateReadError ? 'unknown' : gateBefore && gateBefore.state === 'broken' ? null : validSafeRow(sqlite) ? null : 'unknown';
   let gateError = null;
   if (gateNext) {
     try {
@@ -573,7 +574,14 @@ export async function cli(argv, { env = process.env, now = new Date(), run = run
     })());
     const url = (env.COMPANY_DB_WATCH_URL || '').trim();
     if (a.verifyApply) {
-      const r = await verify({ sqlite: await open(), dataDir, ownership, now, syncRunId: env.DAILY_SYNC_RUN_ID || null, write: w });
+      const sqlite = await open();
+      let r;
+      try { r = await verify({ sqlite, dataDir, ownership, now, syncRunId: env.DAILY_SYNC_RUN_ID || null, write: w }); }
+      catch (e) {
+        // 決める前に落ちた = 門を unknown に (確かめた safe の行が今も合う・broken ならそのまま)。自動再試行・手の更新も止まる (#1564 Codex R5 Medium)
+        const m = markGateUnknown(sqlite, { reason: `verify_apply_crashed: ${String(e && e.message).slice(0, 200)}`, now });
+        throw Object.assign(e, { message: `${e && e.message}${m.wrote ? ' (門 = unknown)' : m.kept ? ` (門 = ${m.kept} のまま)` : m.error ? ` (門を書けない: ${m.error})` : ''}` });
+      }
       last = r.line; state = r.state;
       code = r.broken ? EXIT.applied_broken : r.state === 'verified' ? EXIT.ok : EXIT.error;   // 違うと分かった回は何があっても exit 4
     } else if (!url) {
