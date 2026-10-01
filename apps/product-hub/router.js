@@ -3638,6 +3638,9 @@ const LP_SPEC_MAX_BYTES = 5 * 1024 * 1024;
 const LP_SPEC_MAX_SHEETS = 50;
 const LP_SPEC_MAX_ROWS_PER_SHEET = 5000;
 const LP_SPEC_MAX_CELLS = 200000;
+// 本文の総文字数。巨大な単一セルをセル数だけでは防げない (Codex API R2)。
+// lib 側の SPEC_BODY_MAX (50 万) と揃える — 実物の仕様書は 5 万字程度
+const LP_SPEC_MAX_CHARS = 500000;
 
 /** exceljs の cell.value を素の文字列に潰す (apps/inbound-info/router.js の plainValue と同じ考え方) */
 function lpSpecCellText(v) {
@@ -3668,7 +3671,19 @@ async function lpSpecWorkbookToText(buf) {
   }
   const titles = [];
   const parts = [];
+  // 🚨 累計は**セルを 1 つ処理するごとに**見る (Codex API R2)。
+  //    タブを 1 枚読み終えてから数えると、疎な巨大範囲で先に大量の走査と文字列生成が起きる。
+  //    セル数だけでは巨大な単一セルを防げないので、本文の総文字数も同時に見る。
+  //    eachRow / eachCell は途中で抜けられないので、上限を超えたら throw して打ち切る
   let cells = 0;
+  let chars = 0;
+  const countCell = (text) => {
+    cells += 1;
+    chars += text.length;
+    if (cells > LP_SPEC_MAX_CELLS) throw new Error(`セルが多すぎます (${LP_SPEC_MAX_CELLS} まで)`);
+    if (chars > LP_SPEC_MAX_CHARS) throw new Error(`中身が大きすぎます (${LP_SPEC_MAX_CHARS} 文字まで)`);
+    return text;
+  };
   for (const ws of wb.worksheets) {
     if (ws.rowCount > LP_SPEC_MAX_ROWS_PER_SHEET) {
       throw new Error(`タブ「${ws.name}」の行が多すぎます (${ws.rowCount} / ${LP_SPEC_MAX_ROWS_PER_SHEET} まで)`);
@@ -3677,12 +3692,10 @@ async function lpSpecWorkbookToText(buf) {
     const lines = [];
     ws.eachRow({ includeEmpty: false }, (row) => {
       const vals = [];
-      row.eachCell({ includeEmpty: true }, (c) => vals.push(lpSpecCellText(c.value).replace(/\t/g, ' ')));
-      cells += vals.length;
+      row.eachCell({ includeEmpty: true }, (c) => vals.push(countCell(lpSpecCellText(c.value).replace(/\t/g, ' '))));
       while (vals.length && vals[vals.length - 1] === '') vals.pop();
       lines.push(vals.join('\t'));
     });
-    if (cells > LP_SPEC_MAX_CELLS) throw new Error(`セルが多すぎます (${LP_SPEC_MAX_CELLS} まで)`);
     parts.push(`## ${ws.name}\n${lines.join('\n')}`);
   }
   return { body: parts.join('\n\n'), sheetTitles: titles };
