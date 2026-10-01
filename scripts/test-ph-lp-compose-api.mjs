@@ -107,6 +107,39 @@ ok(up2.status === 200 && !up2.json.created, '同じ中身を上げ直しても�
 eq((await api('POST', '/api/lp-specs', { raw: Buffer.from('これは xlsx ではない') })).status, 400, '.xlsx でなければ断る');
 eq((await api('POST', '/api/lp-specs', { raw: Buffer.alloc(0) })).status, 400, '空は断る');
 
+console.log('②b zip 爆弾を load の前に弾く (Codex API R1 #2 / R3 #1)');
+const { zipExpandedSize, assertXlsxExpandsSafely } = await import('../apps/product-hub/lib/xlsx-guard.js');
+const real = zipExpandedSize(xlsx);
+ok(real.entries > 0 && real.expandedBytes > 0, `展開せずに中身の大きさが分かる (${real.entries} ファイル / ${Math.round(real.expandedBytes/1024)}KB)`);
+ok(real.expandedBytes / xlsx.length < 200, `実物の圧縮比は普通 (${Math.round(real.expandedBytes/xlsx.length)} 倍)`);
+ok((() => { try { assertXlsxExpandsSafely(xlsx); return true; } catch { return false; } })(), '実物の仕様書は通る');
+// zip 爆弾は exceljs の出力では作れない (同じ文字は共有文字列で重複排除される)。
+// ガードは「中央ディレクトリの申告サイズ」を見るので、そこを書き換えて検査する
+const bombBuf = Buffer.from(xlsx);
+let cdh = -1;
+for (let i = 0; i + 4 <= bombBuf.length; i++) {
+  if (bombBuf.readUInt32LE(i) === 0x02014b50) { cdh = i; break; }
+}
+ok(cdh >= 0, '中央ディレクトリが見つかる');
+bombBuf.writeUInt32LE(900 * 1024 * 1024, cdh + 24);   // 展開後 900MB と申告する
+const expect = (fn) => { try { fn(); return null; } catch (e) { return e; } };
+const bombCaught = expect(() => assertXlsxExpandsSafely(bombBuf));
+ok(bombCaught && bombCaught.tooLarge,
+  `🚨 展開後が大きい申告は load の前に弾く (${bombCaught && bombCaught.message})`);
+const ratioCaught = expect(() => assertXlsxExpandsSafely(xlsx, { maxRatio: 2 }));
+ok(ratioCaught && ratioCaught.tooLarge, `🚨 圧縮比でも弾ける (${ratioCaught && ratioCaught.message})`);
+ok(expect(() => assertXlsxExpandsSafely(xlsx, { maxEntries: 2 }))?.tooLarge, 'ファイル数でも弾ける');
+const ExcelJS2 = (await import('exceljs')).default;
+ok((() => { try { zipExpandedSize(Buffer.from('zip でない')); return false; } catch { return true; } })(),
+  'ZIP でなければ普通の Error (= 400)');
+// セル数・文字数の超過は 413 (「読めない」400 と区別する)
+const bigger = new ExcelJS2.Workbook();
+const gws = bigger.addWorksheet('big');
+gws.addRow(['y'.repeat(600000)]);
+const r413 = await api('POST', '/api/lp-specs', { raw: Buffer.from(await bigger.xlsx.writeBuffer()) });
+eq(r413.status, 413, '🚨 大きすぎるは 413 (bad_xlsx の 400 と区別する・R3 #3)');
+
+
 console.log('③ 押す → claim → 予約 → 結果 (実行役の手順そのまま)');
 const req1 = await api('POST', `/api/drafts/${draftId}/lp-compose`, { body: { idempotency_key: 'key-0001' } });
 eq(req1.status, 200, '押せる');

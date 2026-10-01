@@ -125,6 +125,7 @@ import {
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
   lpComposeImageRef, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
 } from './lib/lp-compose.js';
+import { assertXlsxExpandsSafely, XlsxTooLargeError } from './lib/xlsx-guard.js';
 import { abaConfigured, lookupAbaTerms, lookupAbaTopAsins } from './lib/aba-client.js';
 import { fetchAmazonCatalog } from './lib/catalog-client.js';
 import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
@@ -3641,6 +3642,8 @@ const LP_SPEC_MAX_CELLS = 200000;
 // 本文の総文字数。巨大な単一セルをセル数だけでは防げない (Codex API R2)。
 // lib 側の SPEC_BODY_MAX (50 万) と揃える — 実物の仕様書は 5 万字程度
 const LP_SPEC_MAX_CHARS = 500000;
+// 展開後の合計。実物の仕様書 (45KB) は展開しても数 MB。余裕を見て 80MB
+const LP_SPEC_MAX_EXPANDED_BYTES = 80 * 1024 * 1024;
 
 /** exceljs の cell.value を素の文字列に潰す (apps/inbound-info/router.js の plainValue と同じ考え方) */
 function lpSpecCellText(v) {
@@ -3663,11 +3666,14 @@ function lpSpecCellText(v) {
  * 仕様書は 1 セルに長い文片が入るので、改行をそのまま渡す (タブを TSV の区切りにしているので 	 だけ落とす)。
  */
 async function lpSpecWorkbookToText(buf) {
+  // 🚨 load の **前** に展開後の大きさを見る。exceljs の load は ZIP 全体を展開してから
+  //    メモリに載せるので、load を呼んだ時点で手遅れ (Codex API R3 #1)
+  assertXlsxExpandsSafely(buf, { maxExpandedBytes: LP_SPEC_MAX_EXPANDED_BYTES });
   const ExcelJS = (await import('exceljs')).default;
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buf);
   if (wb.worksheets.length > LP_SPEC_MAX_SHEETS) {
-    throw new Error(`タブが多すぎます (${wb.worksheets.length} / ${LP_SPEC_MAX_SHEETS} まで)`);
+    throw new XlsxTooLargeError(`タブが多すぎます (${wb.worksheets.length} / ${LP_SPEC_MAX_SHEETS} まで)`);
   }
   const titles = [];
   const parts = [];
@@ -3680,13 +3686,13 @@ async function lpSpecWorkbookToText(buf) {
   const countCell = (text) => {
     cells += 1;
     chars += text.length;
-    if (cells > LP_SPEC_MAX_CELLS) throw new Error(`セルが多すぎます (${LP_SPEC_MAX_CELLS} まで)`);
-    if (chars > LP_SPEC_MAX_CHARS) throw new Error(`中身が大きすぎます (${LP_SPEC_MAX_CHARS} 文字まで)`);
+    if (cells > LP_SPEC_MAX_CELLS) throw new XlsxTooLargeError(`セルが多すぎます (${LP_SPEC_MAX_CELLS} まで)`);
+    if (chars > LP_SPEC_MAX_CHARS) throw new XlsxTooLargeError(`中身が大きすぎます (${LP_SPEC_MAX_CHARS} 文字まで)`);
     return text;
   };
   for (const ws of wb.worksheets) {
     if (ws.rowCount > LP_SPEC_MAX_ROWS_PER_SHEET) {
-      throw new Error(`タブ「${ws.name}」の行が多すぎます (${ws.rowCount} / ${LP_SPEC_MAX_ROWS_PER_SHEET} まで)`);
+      throw new XlsxTooLargeError(`タブ「${ws.name}」の行が多すぎます (${ws.rowCount} / ${LP_SPEC_MAX_ROWS_PER_SHEET} まで)`);
     }
     titles.push(ws.name);
     const lines = [];
@@ -3722,6 +3728,11 @@ router.post('/api/lp-specs',
       parsed = await lpSpecWorkbookToText(req.body);
     } catch (e) {
       console.error('[product-hub] lp-spec xlsx の読み込みに失敗:', String(e?.message || e).slice(0, 300));
+      // 🚨 「大きすぎる」と「.xlsx として読めない」を区別する (Codex API R3 #3)。
+      //    上限超過を bad_xlsx にすると、上げた人が「ファイルが壊れている」と誤解する
+      if (e instanceof XlsxTooLargeError || e?.tooLarge) {
+        return res.status(413).json({ ok: false, code: 'too_large', error: e.message });
+      }
       return res.status(400).json({ ok: false, code: 'bad_xlsx', error: '.xlsx として読めません (ダウンロードし直してください)' });
     }
     const db = getDB();
@@ -3894,7 +3905,11 @@ serviceApiRouter.get('/lp-compose/jobs/:id/images/:n', async (req, res) => {
     const { buf } = await getDriveThumbnail(r.file_id, LP_COMPOSE_IMAGE_WIDTH, r.version || '');
     res.set('Content-Type', 'image/jpeg');
     res.set('X-Content-Type-Options', 'nosniff');
-    res.set('Cache-Control', 'private, max-age=120');
+    // 🚨 no-store。URL が同じで lease をヘッダで渡すので、私有キャッシュを許すと
+    //    別の / 失効した lease にも画像を返してしまう (Codex API R3 #2)。
+    //    実行役は 1 回落とすだけなのでキャッシュの利き目は無い (サーバ内の thumbCache は効く)
+    res.set('Cache-Control', 'no-store');
+    res.set('Vary', 'X-LP-Compose-Lease');
     res.send(buf);
   } catch (e) {
     const upstream = e?.code || e?.response?.status;
