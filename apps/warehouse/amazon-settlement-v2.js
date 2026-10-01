@@ -10,6 +10,7 @@
  * 並べ直しの規則 (2026-09-28 に V1 / V2 を 6 期間 突き合わせて決めた = business_line_key が全部一致):
  *   ① 品物の行: amount-type ItemPrice → price-type / ItemFees・Points・Item Fee Adjustment → item-related-fee-type / Promotion → promotion-type
  *      (種類の名前 = amount-description)。個数は V1 では品物の行に付かない
+ *      税の取り直し (Order_Retrocharge / Refund_Retrocharge の Tax・ShippingTax) も同じ規則 (2026-10-02 に V1 の 2026-01 の決済で確かめた)
  *   ② 注文の品物ごとに「個数だけの行」を 1 行作る (V1 は Order の品物ごとに金額の無い行 + quantity-purchased。ItemPrice / Principal の行から)
  *   ③ ポイントの行は V2 で order-item-code が空 → 同じ取引・注文・SKU・時刻の品物の行から補う (1 つに決まるときだけ)
  *   ④ 品物でない行 (補てん・手数料・その他) は other-amount。取引の種類の名前は V1 の書き方に直す:
@@ -69,7 +70,12 @@ const ITEM_TYPES = {
   Promotion: ['promotion-type', 'promotion-amount'],
 };
 // 6 期間 (2026-06-29〜09-21) で確かめた組み合わせ。これ以外は unknown (= そのレポートは取り込まない)
-const KNOWN_ITEM_TX = { ItemPrice: ['Order', 'Refund', 'A-to-z Guarantee Refund', 'Chargeback Refund'], ItemFees: ['Order', 'Refund', 'A-to-z Guarantee Refund', 'Chargeback Refund'], Points: ['Order', 'Refund'], Promotion: ['Order', 'Refund'], 'Item Fee Adjustment': ['Fee Adjustment'] };
+// 🆕 2026-10-02: ItemPrice に Order_Retrocharge / Refund_Retrocharge (税の取り直し・その取り消し)。決済 12222191753 (2025-12-29〜2026-01-12) で
+//   Order_Retrocharge の Tax / ShippingTax が来て、決済が丸ごと止まった。V1 の同じ決済では 取引 = Order_Retrocharge・price-type = Tax / ShippingTax・
+//   注文番号・計上日・marketplace だけ (SKU・品物の番号・個数は空・個数だけの行は無い) = ① の規則 (② は Order の Principal だけ) のままで同じ形になる。
+//   Retrocharge の中身は公式 (Finances API の RetrochargeEvent) で BaseTax / ShippingTax と 米国の代理徴収の源泉 (RetrochargeTaxWithheldList) だけ =
+//   手数料・値引き・ポイントは来ない → ItemPrice だけに足す。源泉 (ItemWithheldTax など) は ITEM_TYPES に無い = 来たら unknown で止まる (足さない)
+const KNOWN_ITEM_TX = { ItemPrice: ['Order', 'Refund', 'A-to-z Guarantee Refund', 'Chargeback Refund', 'Order_Retrocharge', 'Refund_Retrocharge'], ItemFees: ['Order', 'Refund', 'A-to-z Guarantee Refund', 'Chargeback Refund'], Points: ['Order', 'Refund'], Promotion: ['Order', 'Refund'], 'Item Fee Adjustment': ['Fee Adjustment'] };
 // 料金 (本体 + 部分): 取引 → 料金の種類 (amount-type)
 const KNOWN_FEE = { AmazonFees: ['Amazon Easy Ship Charges'], FBAFees: ['FBA Inventory Storage Fee', 'FBA Long Term Storage Fee', 'FBA Removal Order: Return Fee'] };
 const FEE_PARTS = new Set(['Tax on fee', 'Discount on Fee']);   // 「Base fee」の後に続けてまとめる部分

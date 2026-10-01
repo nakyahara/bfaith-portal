@@ -124,6 +124,45 @@ ok(db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_l
 const r2 = ingestSettlement(db, p2.headerRow, p2.lineRows, p2.ctx);
 ok(r2.lineInserted === 0, 'V2 の同じレポートを入れ直しても 0 行 (冪等)');
 
+// 🆕 2026-10-02: 税の取り直し (Order_Retrocharge / Refund_Retrocharge の ItemPrice)。決済 12222191753 (2025-12-29〜2026-01-12・V2 report 1587027020727) が
+//   「規則に無い組み合わせ Order_Retrocharge | ItemPrice ×2」で丸ごと止まった。同じ決済の V1 (report 1587031020727) の 2 行をそのまま写す:
+//   取引・注文番号・marketplace・計上日・price-type Tax 53.00 / ShippingTax 0.00 だけ (SKU・品物の番号・個数・fulfillment は空・個数だけの行は無い)。
+//   Refund_Retrocharge (取り消し) は手元の V1 に無い = 同じ形・符号を逆にしたものを仮定
+{
+  const RS = '12222191753', RO = '249-7742027-2459864';
+  const RETRO = [   // [取引, 説明 = price-type, 金額, V2 の日時, V1 の日時]
+    ['Order_Retrocharge', 'Tax', '53.00', '2026/01/01 11:14:44 UTC', '2026-01-01T11:14:44+00:00'],
+    ['Order_Retrocharge', 'ShippingTax', '0.00', '2026/01/01 11:14:44 UTC', '2026-01-01T11:14:44+00:00'],
+    ['Refund_Retrocharge', 'Tax', '-53.00', '2026/01/05 02:00:00 UTC', '2026-01-05T02:00:00+00:00'],
+    ['Refund_Retrocharge', 'ShippingTax', '0.00', '2026/01/05 02:00:00 UTC', '2026-01-05T02:00:00+00:00'],
+  ];
+  const rV2 = tsvOf(V2_COLUMNS, [
+    { 'settlement-id': RS, 'settlement-start-date': '2025/12/29 00:20:08 UTC', 'settlement-end-date': '2026/01/12 00:20:08 UTC', 'deposit-date': '2026/01/14 00:20:08 UTC', 'total-amount': '18369758.00', currency: 'JPY' },
+    ...RETRO.map(([tx, d, a, t2]) => ({ 'settlement-id': RS, 'transaction-type': tx, 'order-id': RO, 'marketplace-name': 'Amazon.co.jp', 'amount-type': 'ItemPrice', 'amount-description': d, amount: a, 'posted-date': t2.slice(0, 10), 'posted-date-time': t2 })),
+  ]);
+  const rV1 = tsvOf(V1_COLUMNS, [
+    { 'settlement-id': RS, 'settlement-start-date': '2025-12-29T00:20:08+00:00', 'settlement-end-date': '2026-01-12T00:20:08+00:00', 'deposit-date': '2026-01-14T00:20:08+00:00', 'total-amount': '18369758.00', currency: 'JPY' },
+    ...RETRO.map(([tx, d, a, , t1]) => ({ 'settlement-id': RS, 'transaction-type': tx, 'order-id': RO, 'marketplace-name': 'Amazon.co.jp', 'posted-date': t1, 'price-type': d, 'price-amount': a })),
+  ]);
+  const rc = convertV2TsvToV1Tsv(rV2);
+  ok(rc.unknown.length === 0 && rc.itemCodeUnresolved === 0, `税の取り直し (Order_Retrocharge / Refund_Retrocharge の ItemPrice) は規則にある (${JSON.stringify(rc.unknown)})`);
+  ok(rc.tsv === rV1, '税の取り直しの V2 → V1 の TSV が V1 と 1 文字も違わない (個数だけの行を作らない・SKU・品物の番号・個数は空のまま)');
+  const q1 = prepareReportTsv(rV1, 'R-RV1', 'run-r'), q2 = prepareV2ReportTsv(rV2, 'R-RV2', 'run-r');
+  // detail_digest (#1567) の材料 = business_line_key・出現順・金額 9 つ・個数・取引・注文・SKU・計上日。ここでは出どころの列 (文書・層・版・取込の時刻・hash) 以外の全部の列を比べる (= より強い)
+  const SRC_COLS = new Set(['source_document_id', 'source_file_hash', 'source_path', 'source_layer', 'parser_version', 'ingest_run_id', 'observed_at', 'ingested_at', 'physical_line_hash']);
+  const content = (p) => p.lineRows.map((r) => JSON.stringify(Object.keys(r).filter((k) => !SRC_COLS.has(k)).sort().map((k) => [k, r[k]]))).sort();
+  ok(q1.lineRows.length === 4 && q2.lineRows.length === 4 && JSON.stringify(content(q1)) === JSON.stringify(content(q2)) && q1.headerRow.business_line_key === q2.headerRow.business_line_key,
+    `税の取り直しの行が V1 と全部の列で同じ (business_line_key・金額・計上日・行の数 = detail_digest も同じ) (V1 ${q1.lineRows.length} 行 / V2→V1 ${q2.lineRows.length} 行)`);
+  ok(q2.lineRows.every((r) => r.amazon_order_id === RO && r.seller_sku == null && r.order_item_code == null && r.quantity_purchased == null && r.fulfillment_id == null && r.economic_date != null)
+    && q2.lineRows.map((r) => `${r.transaction_type}:${r.price_type}:${r.price_amount_micro}`).join() === 'Order_Retrocharge:Tax:53000000,Order_Retrocharge:ShippingTax:0,Refund_Retrocharge:Tax:-53000000,Refund_Retrocharge:ShippingTax:0',
+    '税の取り直し = price-type / price-amount に入り、SKU・品物の番号・個数は空 (V1 と同じ)');
+  // 足したのは ItemPrice だけ (手数料・値引き・ポイントの Retrocharge は公式の RetrochargeEvent に無い = 来たら止める)
+  ok(JSON.stringify(unk([v2({ 'transaction-type': 'Order_Retrocharge', 'order-id': 'O9', 'amount-type': 'ItemFees', 'amount-description': 'Commission', amount: '-1.00' })])) === JSON.stringify(['Order_Retrocharge | ItemFees']), '税の取り直しでも ItemPrice 以外 (ItemFees) は規則に無い = 止める');
+  const rp = processV2Report(db, rV2, 'R-RETRO', 'run-r');
+  ok(rp.status === 'ingested' && db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_settlement_id = ? AND transaction_type LIKE '%_Retrocharge'`).get(RS).n === 4,
+    `税の取り直しのある決済を止めずに取り込む (${rp.status}${rp.reason ? ': ' + rp.reason : ''})`);
+}
+
 // main の 1 本ずつの処理 (processV2Report): 規則に無いものがあるレポートは 1 行も入れない / V1 取込済み / dry-run / 取り込む
 const S2 = 'S901', v2b = (o) => ({ ...v2(o), 'settlement-id': S2 });
 const hdr2 = { ...V2_ROWS[0], 'settlement-id': S2 };
