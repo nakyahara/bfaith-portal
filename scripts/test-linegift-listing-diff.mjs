@@ -146,7 +146,8 @@ function runDq(dir, month) {
   db.close();
   return { status: r.status, out: `${r.stdout}\n${r.stderr}`, rows, of: (name) => rows.find((x) => x.check_name === name) };
 }
-const CHECKS = ['fact_raw_mismatch_keys', 'fallback_to_item_code_rate_pct', 'fee_rate_drift_pct', 'horizon_frozen_observed_count', 'listing_diff_pct', 'missing_cost_rate_pct', 'monthless_received_rows',
+// month_row_count = 月初の猶予の印 (この月の行数。PR #1572 R1 で全部の run が残す)
+const CHECKS = ['fact_raw_mismatch_keys', 'fallback_to_item_code_rate_pct', 'fee_rate_drift_pct', 'horizon_frozen_observed_count', 'listing_diff_pct', 'missing_cost_rate_pct', 'month_row_count', 'monthless_received_rows',
   'provisional_state_age_days', 'received_missing_received_on_count', 'resolved_but_zero_cost_count', 'row_count_drift', 'shipping_missing_rate_pct', 'unmatched_sku_rate_pct', 'whitelist_coverage_pct'];
 t('🚨 8 月の形 (受取日の月なら 5.5% のずれ) の過去月: 全部の検査を完走して exit 0 = 同期に進める。listing_diff_pct は info・details に両方の数字', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lg-dq-'));

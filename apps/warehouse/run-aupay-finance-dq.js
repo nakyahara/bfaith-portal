@@ -9,7 +9,7 @@
  *   DATA_DIR=C:/Users/bfaith/bfaith-portal/data node apps/warehouse/run-aupay-finance-dq.js --month 2026-05
  *
  * 11 check (severity / threshold):
- *   1. row_count_drift                  (error: rows = 0)
+ *   1. row_count_drift                  (error: rows = 0。当月の月初の 0 行は条件つきで warn = finance-dq-month-mode.js の decideMonthStartEmpty)
  *   2. listing_diff_pct                 (warn 1% / error 5%、当月 5%/15%) — f_sales_by_listing (aupay) vs fact gross
  *   3. missing_cost_rate_pct            (warn 5% / error 10%)
  *   4. shipping_missing_rate_pct        (warn 5% / error 10%)
@@ -26,7 +26,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -39,6 +39,12 @@ const dbPath = path.join(DATA_DIR, 'warehouse.db');
 if (!fs.existsSync(dbPath)) { console.error(`FATAL: warehouse.db not found at ${dbPath}`); process.exit(2); }
 
 const checkedAt = new Date().toISOString();
+// 月の判定の「今」(試験だけ: env FINANCE_DQ_ALLOW_NOW=1 のときだけ --now を受ける。daily-sync は渡さない)
+let now;
+try { now = resolveDqNow(getArg('--now')); }
+catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
+// daily-sync はこの回のモールの取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
+const noMonthStartGrace = args.includes('--no-month-start-grace');
 
 const THRESHOLDS_PAST = {
   row_count_drift:                  { warn: 0,    error: 0 },
@@ -65,7 +71,7 @@ const THRESHOLDS_CURRENT = {
 };
 // 月の判定は共通ヘルパー (当月 / 前月+月初14日以内 / 過去)。前月の月初は出荷完了への遷移ラグで
 // coverage が構造的に低いので whitelist_coverage_pct だけ当月閾値を使う (Qoo10 2026-08 の再発防止と同型)
-const mode = monthMode(monthStr);
+const mode = monthMode(monthStr, { now });
 const isCur = mode === 'current';
 const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST, THRESHOLDS_CURRENT);
 
@@ -73,7 +79,10 @@ const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 const issues = [];
 let hasError = false;
+// 月初の猶予で通すときの判定 (null = 猶予なし)。猶予の中は SKIP_IN_MONTH_START_GRACE の検査を info に落とす (applyMonthStartSkip)
+let monthStartGrace = null;
 function recordResult(name, severity, actual, threshold, details = null) {
+  ({ severity, details } = applyMonthStartSkip(monthStartGrace, name, severity, details));
   db.prepare(`INSERT OR REPLACE INTO dq_run_results (run_id, check_name, severity, actual_value, threshold_value, details_json, checked_at) VALUES (?,?,?,?,?,?,?)`)
     .run(runId, name, severity, actual, threshold, details ? JSON.stringify(details) : null, checkedAt);
   if (severity === 'error') hasError = true;
@@ -81,12 +90,33 @@ function recordResult(name, severity, actual, threshold, details = null) {
 }
 
 console.log(`=== au PAY DQ gate: ${runId} (month=${monthStr}, ${modeLabel(mode)} mode) ===`);
+// 月初の猶予の印 (PR #1572 R2): dq_run_results の DELETE より前に、mall・月ごとの消えない印 (dq_month_high_water) を付ける。
+// 一度 0 でなくなった月は、同じ run_id で流し直しても印が残る (前の記録は初回だけ移す)
+prepareMonthHighWater(db, { mall: 'aupay', ym: monthStr, at: checkedAt,
+  count: db.prepare("SELECT COUNT(*) AS c FROM f_aupay_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ?").get(monthStr).c });
 db.prepare(`DELETE FROM dq_run_results WHERE run_id = ?`).run(runId);
 
 // Check 1: row_count_drift
 const dailyCount = db.prepare("SELECT COUNT(*) AS c FROM f_aupay_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?").get(monthStr).c;
-recordResult('row_count_drift', dailyCount === 0 ? 'error' : 'info', dailyCount, 0, { daily_row_count: dailyCount });
-if (dailyCount === 0) { console.error(`  ⚠️ CRITICAL: f_aupay_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`); printSummary(); process.exit(1); }
+recordResult(MONTH_ROW_COUNT_CHECK, 'info', dailyCount, null, monthRowCountDetails('aupay', monthStr, dailyCount));
+if (dailyCount === 0) {
+  // 月初の猶予 (finance-dq-month-mode.js の decideMonthStartEmpty): 当月・月初の日数の中・この月が一度も 0 でなくなっていない・
+  // 前月の終わりまで新しい・daily-sync が禁じていない、を全部満たすときだけ ⚠️ 警告で続ける。早く終わらずに残りの検査も流す
+  // (行数で比べる検査 = SKIP_IN_MONTH_START_GRACE だけ info に落とす。raw・全期間・原価の検査はそのまま)
+  const g = decideMonthStartEmpty(db, { mall: 'aupay', ym: monthStr, now, noGrace: noMonthStartGrace });
+  if (g.grace) {
+    monthStartGrace = g;
+    recordResult('row_count_drift', 'warn', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace: true, jst_day: g.calendar.dayOfMonth, grace_days: g.graceDays, prev_month_max_date: g.prev?.maxDate ?? null });
+    console.log(`  ${monthStartEmptyNote('f_aupay_finance_sku_daily_v1', monthStr, g)}`);
+  } else {
+    recordResult('row_count_drift', 'error', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace_denied: g.reasons });
+    console.error(`  ⚠️ CRITICAL: f_aupay_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`);
+    if (g.calendar.mode === 'current') console.error(`  → 月初の猶予を使わない理由: ${g.reasons.join(' / ')}`);
+    printSummary();
+    process.exit(1);
+  }
+}
+if (dailyCount > 0) recordResult('row_count_drift', 'info', dailyCount, 0, { daily_row_count: dailyCount });
 
 // Check 2: listing_diff_pct
 const factGross = db.prepare("SELECT SUM(gross_sales_jpy_incl) AS p FROM f_aupay_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?").get(monthStr).p || 0;
@@ -163,5 +193,7 @@ function printSummary() {
   else console.log(`✅ DQ gate passed (no error, no warn)`);
 }
 printSummary();
+// 月初の猶予で通した回は、最後の行を「⚠️ 月初の猶予: …」にする (daily-sync はこの行を要約に出し、warn を立てて見出しを ⚠️ にする)
+if (monthStartGrace && !hasError) console.log(monthStartEmptyNote('f_aupay_finance_sku_daily_v1', monthStr, monthStartGrace));
 db.close();
 process.exit(hasError ? 1 : 0);
