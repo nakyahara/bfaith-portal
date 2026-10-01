@@ -68,10 +68,22 @@ const LEGACY_HEADINGS = [
 export const MIN_IMAGES = 2;
 export const MAX_IMAGES = 10;
 
-/** `# N枚目｜役割名`。パーサーと同じ形 (全角数字・全角/半角の縦棒を許す) */
-const IMAGE_HEADING_RE = /^#{1,6}\s*([0-9０-９]+)\s*枚目\s*[｜|]\s*(.+?)\s*$/;
-/** 画像ブロックの中の `## 見出し` (### 以下は見出しの中の小見出しなので拾わない) */
-const SUB_HEADING_RE = /^##\s*(.+?)\s*$/;
+/**
+ * 🚨 見出しの**階層も見る** (codex exec review P2)。
+ *    `#{1,6}` で見ていたときは、`## 0枚目｜サムネイル` のように階層が違っても
+ *    検査 4〜7 を通ってしまった。仕様書は `# N枚目｜役割名` と階層ごと決めている
+ *    (lp-tool の取込互換のため)。
+ */
+const IMAGE_HEADING_RE = /^#(?!#)\s*([0-9０-９]+)\s*枚目\s*[｜|]\s*(.+?)\s*$/;
+/** `# 共通…` のブロック見出し (H1 ちょうど) */
+const BLOCK_HEADING_RE = /^#(?!#)\s*(.+?)\s*$/;
+/**
+ * 画像ブロックの中の `## 見出し` (H2 ちょうど)。
+ * 🚨 `###` を拾わない — 「詳細レイアウト」の中には
+ *    `### キャンバス構成` のような小見出しが入る (仕様書のテンプレートそのもの)。
+ *    `^##` だけだと `### X` を「## 見出し `# X`」として数えてしまい、検査 7 が誤って落ちる
+ */
+const SUB_HEADING_RE = /^##(?!#)\s*(.+?)\s*$/;
 
 const toHalfWidth = (s) => String(s).replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
 const normalize = (s) => String(s == null ? '' : s).replace(/\r\n?/g, '\n');
@@ -122,8 +134,11 @@ export function lintComposition(output, { productName = null } = {}) {
   const lastImageLine = imageHeads.length ? imageHeads[imageHeads.length - 1].index : -1;
 
   // 3. 共通ブロックが画像より前に、この順で
-  const blockLine = (name, from, to) => lines.findIndex((l, i) =>
-    i >= from && i < to && /^#\s*/.test(l) && sameHeading(l.replace(/^#+\s*/, ''), name));
+  const blockLine = (name, from, to) => lines.findIndex((l, i) => {
+    if (i < from || i >= to) return false;
+    const m = l.match(BLOCK_HEADING_RE);
+    return !!m && sameHeading(m[1], name);
+  });
   const commonAt = COMMON_BLOCKS.map((n) => blockLine(n, 0, firstImageLine));
   if (commonAt.every((i) => i >= 0) && commonAt.every((v, i, a) => i === 0 || a[i - 1] < v)) pass(3);
   else {
@@ -149,7 +164,10 @@ export function lintComposition(output, { productName = null } = {}) {
   // 最後の画像の後ろにある終端ブロックは、画像の中身に数えない
   if (blocks.length) {
     const last = blocks[blocks.length - 1];
-    const tailAt = last.body.findIndex((l) => /^#\s*/.test(l) && TAIL_BLOCKS.some((t) => sameHeading(l.replace(/^#+\s*/, ''), t)));
+    const tailAt = last.body.findIndex((l) => {
+      const m = l.match(BLOCK_HEADING_RE);
+      return !!m && TAIL_BLOCKS.some((t) => sameHeading(m[1], t));
+    });
     if (tailAt >= 0) last.body = last.body.slice(0, tailAt);
   }
   const headingBad = [];
@@ -259,19 +277,35 @@ export function lintComposition(output, { productName = null } = {}) {
 }
 
 /**
- * 商品名の一致。**完全一致は求めない** — 構成側は「ハッカ油スプレー 100ml」のように
- * 容量や型番が付く / 付かないが実運用で揺れる。
- * 片方がもう片方を含んでいれば同じ商品とみなし、**無関係な商品だけを弾く**。
+ * 商品名の一致 (検査 17)。
+ *
+ * 🚨 **部分一致では弾けない** (codex exec review P1)。
+ *    以前は「片方がもう片方を含んでいれば同じ」にしていたが、それだと
+ *    draft が `オイル` のとき `指板メンテナンスオイル` が通ってしまう = **別商品が通る**。
+ *    検査 17 の目的は「別商品の内容が混ざっていないか」なので、そこが抜けると意味が無い。
+ *
+ * かわりに **容量・サイズ・入数だけを落として、残りが同じかを見る**。
+ * 実運用で揺れるのはそこだけ (構成側が「ハッカ油スプレー」、draft が「ハッカ油スプレー 100ml」)。
  */
 export function sameProduct(a, b) {
-  const norm = (s) => String(s)
-    .replace(/[　\s]+/g, '')
-    .replace(/[（）()「」『』【】[\]]/g, '')
+  const x = productIdentity(a), y = productIdentity(b);
+  return !!x && !!y && x === y;
+}
+
+/** 容量・サイズ・入数を落とした「商品の本体」。比較用 */
+export function productIdentity(name) {
+  let t = String(name == null ? '' : name)
+    // 全角英数を半角に
     .replace(/[Ａ-Ｚａ-ｚ０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
-    .toLowerCase();
-  const x = norm(a), y = norm(b);
-  if (!x || !y) return false;
-  return x === y || x.includes(y) || y.includes(x);
+    .toLowerCase()
+    // 括弧は区切りとして扱う (「ハッカ油スプレー（100ml）」)
+    .replace(/[（）()「」『』【】[\]]/g, ' ');
+  // 🚨 末尾の容量・サイズ・入数だけを落とす。**区切りの後ろにあって、単位が付いているものだけ**。
+  //    単位なしの数字まで落とすと「WD-40」と「WD-50」が同じになってしまう
+  const TAIL = /[\s_/・,、]+(?:[x×]\s*)?\d+(?:[.,]\d+)?\s*(?:ml|l|cc|g|kg|mg|oz|mm|cm|m|インチ|inch|個入|本入|枚入|個|本|枚|袋|包|錠|粒|セット|set|pcs|pack|パック|入|p)\s*$/i;
+  let prev;
+  do { prev = t; t = t.replace(TAIL, ''); } while (t !== prev);
+  return t.replace(/[\s　]+/g, '');
 }
 
 /** lint の結果を DB に入れる形にする (lint_json)。errors / warnings は件数と中身を残す */

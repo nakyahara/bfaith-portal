@@ -644,9 +644,7 @@ export function submitResult(db, generationId, {
     // (測定のときに「AI は通っているつもりだったか」を読める)
     let runnerLint = null;
     try { runnerLint = lintJson ? JSON.parse(lintJson) : null; } catch { runnerLint = null; }
-    const storedLint = v === 'accepted'
-      ? jsonOrNull({ ...serverLint, source: 'server', runner_lint: runnerLint }, LINT_MAX) || lintJson
-      : lintJson;
+    const storedLint = v === 'accepted' ? packStoredLint(serverLint, runnerLint) : lintJson;
     const receiptObj = {
       verdict: v, review_rounds: rounds, model: gen.model, prompt_version: gen.prompt_version,
       finalized_at: nowS,
@@ -741,6 +739,31 @@ export function lpComposeImageRef(db, jobId, { leaseToken, index, now = Date.now
   const im = images[i];
   if (!im?.file_id) return { code: 'not_found', error: 'その番号の商品画像はありません' };
   return { ok: true, file_id: im.file_id, version: im.modified_time || null };
+}
+
+/**
+ * 保存する lint を組み立てる。
+ *
+ * 🚨 **サーバの結果を必ず残す** (codex exec review P2)。
+ *    以前は `jsonOrNull(...) || lintJson` と書いていたので、実行役が
+ *    LINT_MAX 間近の巨大な lint を送ると合計が上限を超え、
+ *    **実行役の自己申告がそのまま正本として保存された**。
+ *    入り切らなければ落とすのは**参考値の方** (runner_lint → 警告 → 詳細)。
+ */
+function packStoredLint(serverLint, runnerLint) {
+  const base = { ...serverLint, source: 'server' };
+  const tries = [
+    { ...base, runner_lint: runnerLint },
+    { ...base, runner_lint: null, runner_lint_dropped: true },
+    { ...base, warnings: [], runner_lint: null, runner_lint_dropped: true, warnings_dropped: true },
+    { ok: base.ok, checks: base.checks, errors: [], warnings: [], source: 'server', truncated: true },
+  ];
+  for (const cand of tries) {
+    const j = jsonOrNull(cand, LINT_MAX);
+    if (j !== false) return j;
+  }
+  // ここまで来ることは無いが、来ても**実行役の申告には戻さない**
+  return JSON.stringify({ ok: !!serverLint.ok, source: 'server', truncated: true });
 }
 
 /**
