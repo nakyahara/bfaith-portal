@@ -63,6 +63,33 @@ ok(r1b.ok && !r1b.created && r1b.job.id === r1.job.id, '同じ idempotency_key �
 ok(lp.requestJob(db, args(dA, sTabs.spec, 'key-0002')).code === 'already_running', '動いている間は 2 件目を受け付けない');
 ok(r1.job.measurement_deadline_at === new Date(min(3)).toISOString(), '測定の期限 = 受付 + 3 分で固定 (R4 #2)');
 
+console.log('②b 🚨 指示文はスタッフの定型文と同じもの 1 つだけ (設計 §5)');
+{
+  // 段階1 の測定は「**同じ入力**から作った二つを比べる」のが前提。
+  // 指示文が片方だけ違うと、比べているのが「AI の力の差」なのか
+  // 「指示文の差」なのか分からなくなるので、正本を 1 つに固定する。
+  const pt = await import('../apps/product-hub/lib/prompt-templates.js');
+  const packet = JSON.parse(r1.job.packet_json);
+  ok(!!packet.instruction, 'packet に指示文が入っている');
+  eq(packet.instruction, pt.PRODUCT_ANALYSIS_INSTRUCTION, '🚨 packet の指示文 = 定型文の正本');
+  // スタッフが ChatGPT に貼る文の中に、そのまま入っていること
+  const staff = pt.buildProductAnalysisPrompt({ name: 'ハッカ油スプレー 100ml' }, { product_info_text: '天然ハッカ油' }, '');
+  ok(staff.includes(packet.instruction),
+    '🚨 スタッフの定型文に同じ文がそのまま入っている (二重に持っていない)');
+  eq(packet.packet_version, 2, 'packet の版が上がっている (形が変わった)');
+  // 指示文も packet_hash の中 = 後から差し替えられない
+  const again = lp.buildPacket({
+    draft: dA, productInfo: packet.product_info, colorVariations: packet.color_variations,
+    images: packet.images, spec: sTabs.spec,
+  });
+  eq(again.hash, r1.job.packet_hash, '同じ材料なら hash も同じ');
+  const tampered = lp.buildPacket({
+    draft: dA, productInfo: packet.product_info, colorVariations: packet.color_variations,
+    images: packet.images, spec: { ...sTabs.spec, hash: 'ちがう' },
+  });
+  ok(tampered.hash !== r1.job.packet_hash, '材料が違うなら hash も違う');
+}
+
 console.log('③ claim — 受付時の材料をそのまま返す');
 // 受付のあとに仕様書を更新し、画像も増やす (= 実運用で起きること)
 const s2 = lp.importSpec(db, { kind: 'product_analysis', title: 'LP制作システム', body: '本文 V2.3 (更新後)', actor: 'u@x' });

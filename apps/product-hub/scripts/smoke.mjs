@@ -9916,6 +9916,11 @@ for (const [name, file, data] of renders) {
         promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: '@LP制作システム' },
         // 本番の構成の 済/まだ (2026-09-13)。router が composeStateOf で作って渡す
         composeState: { excluded: false, done: false, marked: false, implied: false },
+        // 🤖 構成をAIに作らせる (段階1・2026-10-01)。
+        // router は detail に lpCompose (状態)、list に lpSpec (いまの仕様書) を渡す。
+        // 🚨 ここを忘れると画面が丸ごと 500 になる (実際に PR1-d/e で落とした)
+        lpCompose: { enabled: true, job: null, blocked: null, spec: { id: 1, title: 'LP制作システム', imported_at: '2026-09-30T00:00:00.000Z', imported_by: 'nakahara@x', hash_short: 'abc123def456', sheet_titles: ['出力形式', 'AIプロンプトV2.2'], chars: 24635 } },
+        lpSpec: { enabled: true, spec: { id: 1, title: 'LP制作システム', imported_at: '2026-09-30T00:00:00.000Z', imported_by: 'nakahara@x', hash_short: 'abc123def456', sheet_titles: ['出力形式', 'AIプロンプトV2.2'], chars: 24635 } },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
         workflow: wfp.progressOf(wfDraftId, { db }),
         workflowStaff: wf.listStaff(),

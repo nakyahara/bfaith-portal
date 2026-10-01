@@ -29,6 +29,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { logEvent } from '../db.js';
 import { lintComposition, lintSummary } from './lp-lint.js';
+import { PRODUCT_ANALYSIS_INSTRUCTION } from './prompt-templates.js';
 
 /*
  * 書き込みを伴うトランザクションは `.immediate()` で回す (コード R11)。
@@ -39,7 +40,8 @@ import { lintComposition, lintSummary } from './lp-lint.js';
  * 同じ作法が apps/amazon-pricing/db.js にある。
  */
 
-export const PACKET_VERSION = 1;
+// 2: スタッフの定型文と**同じ指示文** (instruction) を packet に入れた (設計 §5)
+export const PACKET_VERSION = 2;
 export const PROMPT_VERSION = 'lp-compose-v1';
 export const LEASE_MIN = 40;
 /** 測定の合格ライン (設計 §7.2)。受付時に created_at + これで deadline を固定する */
@@ -221,6 +223,13 @@ export function buildPacket({ draft, productInfo, colorVariations, images = [], 
   }
   const packet = {
     packet_version: PACKET_VERSION,
+    // 🚨 スタッフが ChatGPT に貼る定型文の【実行】と**同じ文**を渡す (設計 §5)。
+    //    正本は lib/prompt-templates.js の PRODUCT_ANALYSIS_INSTRUCTION だけ。
+    //    段階1 の測定は「同じ入力から作った二つを比べる」のが前提。
+    //    指示文が片方だけ違うと、比べているのが「AI の力の差」なのか
+    //    「指示文の差」なのか分からなくなる。
+    //    packet に入れる = 受付時に固定され、packet_hash で守られる
+    instruction: PRODUCT_ANALYSIS_INSTRUCTION,
     draft_id: Number(draft.id),
     ne_code: trim(draft.ne_code, 100),
     name: trim(draft.name, 300),
