@@ -299,6 +299,7 @@ await t('build の番号: Render = RENDER_GIT_COMMIT / miniPC = リポジトリ�
   assert.match(head, /^[0-9a-f]{40}$/);
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'mlg-nogit-'));
   assert.equal(G.resolveBuildId({ env: {}, repoDir: empty, fresh: true }), null);
+  fs.rmSync(empty, { recursive: true, force: true });
   assert.match(G.instanceId({ RENDER_INSTANCE_ID: 'srv@1 x' }), /^srv_1_x:\d+:[0-9a-f]{8}$/, '⑤-1 の形 (英数字と _.:-)');
 });
 /** 偽の接続 (⑤-1 の関数の返事の形を返す)。hashOf = DB の legacy_manifest_hash の代わり */
@@ -335,7 +336,7 @@ await t('門の記録: 書く前に確かめる (場所・build の番号・段�
     for (let i = 0; i < 3; i++) assert.equal((await G.ackLegacyGates({ host: 'minipc', connect: fakeGateDb({ hasFn: false }) })).state, 'no_function');
     assert.equal(logs.filter((x) => /no_function/.test(x[1])).length, 1, '同じ理由は 1 回だけ出す');
     assert.equal(logs.find((x) => /no_function/.test(x[1]))[0], 'warn');
-  } finally { console.warn = w; console.error = e; console.log = l; }
+  } finally { console.warn = w; console.error = e; console.log = l; fs.rmSync(noGit, { recursive: true, force: true }); }
 });
 await t('門の記録: ⑤-1 の関数に場所・名札・build・manifest・持ち主表・見た段階・書きかけを渡し、返事 (ack_id・manifest_hash が DB の計算と同じ・acked_at) を確かめてから「書けた」', async () => {
   const calls = [];
