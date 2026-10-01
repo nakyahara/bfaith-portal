@@ -3903,19 +3903,24 @@ serviceApiRouter.post('/lp-compose/jobs/:id/release', (req, res) => {
 serviceApiRouter.get('/lp-compose/jobs/:id/images/:n', async (req, res) => {
   // 🚨 lease_token はヘッダで受ける — クエリに載せるとプロキシやアクセスログに
   //    URL ごと残る (Codex API R1 #3)。資格情報を URL に載せない
+  const lease = rawField(req.get('X-LP-Compose-Lease'), 100);
   const r = lpComposeImageRef(getDB(), lpIdParam(req.params.id), {
-    leaseToken: rawField(req.get('X-LP-Compose-Lease'), 100), index: lpIdParam(req.params.n) - 1,
+    leaseToken: lease, index: lpIdParam(req.params.n) - 1,
   });
   if (!r.ok) return lpComposeFail(res, r);
   try {
     const { buf } = await getDriveThumbnail(r.file_id, LP_COMPOSE_IMAGE_WIDTH, r.version || '');
     // 🚨 配ったことをここで記録する。証跡を実行役から受け取ると、
-    //    作業ディレクトリに Write できる Claude のセッションが偽造できた (codex exec review P1)
-    recordLpComposeImageServed(getDB(), lpIdParam(req.params.id), {
+    //    作業ディレクトリに Write できる Claude のセッションが偽造できた (codex exec review P1)。
+    // 🚨 Drive から落としている間に lease が切れて別の実行役が掴み直していたら、
+    //    記録も配布もしない。記録が**次の実行役のもの**になってしまう (codex exec review P2)
+    const rec = recordLpComposeImageServed(getDB(), lpIdParam(req.params.id), {
+      leaseToken: lease,
       fileId: r.file_id,
       sha256: crypto.createHash('sha256').update(buf).digest('hex'),
       bytes: buf.length,
     });
+    if (!rec.ok) return lpComposeFail(res, rec);
     res.set('Content-Type', 'image/jpeg');
     res.set('X-Content-Type-Options', 'nosniff');
     // 🚨 no-store。URL が同じで lease をヘッダで渡すので、私有キャッシュを許すと

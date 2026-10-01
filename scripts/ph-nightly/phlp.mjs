@@ -175,8 +175,13 @@ async function cmdClaim(opt) {
 async function cmdImages(id) {
   const lease = loadLease(id);
   const tok = token();
+  // 🚨 枚数は claim のときの packet から決める (codex exec review P2)。
+  //    404 を「ここで終わり」の合図に使うと、Drive 側の 404 (画像が消えた・権限が無い) と
+  //    区別がつかず、**見ていない画像があるのに成功で抜ける**。
+  //    1 枚目で落ちた場合は「0 枚で成功」に化けて、より悪い。
+  const expected = (lease.image_file_ids || []).slice(0, MAX_IMAGES).length;
   const saved = [];
-  for (let n = 1; n <= MAX_IMAGES; n++) {
+  for (let n = 1; n <= expected; n++) {
     let res;
     try {
       res = await fetch(`${BASE}/lp-compose/jobs/${id}/images/${n}`, {
@@ -184,8 +189,12 @@ async function cmdImages(id) {
         signal: AbortSignal.timeout(90_000),
       });
     } catch (e) { out({ saved, error: String(e.message || e) }); return fail(1); }
-    if (res.status === 404) break;             // そこまで。packet の枚数ぶんで終わる
-    if (!res.ok) { out({ saved, status: res.status, error: '画像を取得できませんでした' }); return fail(1); }
+    if (!res.ok) {
+      let code = null;
+      try { code = (await res.json())?.code || null; } catch { /* 本文が JSON でないこともある */ }
+      out({ saved, expected, status: res.status, code, error: `${n} 枚目の商品画像を取得できませんでした` });
+      return fail(1);
+    }
     const buf = Buffer.from(await res.arrayBuffer());
     if (buf.length > IMAGE_MAX_BYTES) { out({ saved, error: '画像が大きすぎます' }); return fail(1); }
     const name = `img-${id}-${n}.jpg`;
@@ -198,7 +207,7 @@ async function cmdImages(id) {
   }
   // 証跡は result のときに要る。CLI が覚えておく (Claude に sha256 を手で写させない)
   fs.writeFileSync(path.resolve(process.cwd(), `imgs-${id}.json`), JSON.stringify(saved), 'utf8');
-  out({ saved: saved.map((s) => ({ file: s.file, bytes: s.bytes })), count: saved.length });
+  out({ saved: saved.map((s) => ({ file: s.file, bytes: s.bytes })), count: saved.length, expected });
 }
 
 async function cmdReserve(id, opt) {

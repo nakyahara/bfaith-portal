@@ -722,16 +722,23 @@ export function lpComposeImageRef(db, jobId, { leaseToken, index, now = Date.now
  * 証跡を実行役の作業ディレクトリに置くと、Claude のセッションが Write できてしまい
  * 「画像を見ていないのに見たことにする」偽造ができる。測定の根拠なのでここで持つ。
  * 同じ file_id を 2 回配っても 1 行 (枚数を水増しさせない)。
+ *
+ * 🚨 記録は**その時点で生きている lease** に紐づける (codex exec review P2)。
+ *    紐づけないと、A の lease が切れた直後に B が claim して証跡をリセットしたあとに、
+ *    飛んでいた A の取得が完走してここに来て、**B の証跡として入ってしまう**
+ *    = B は画像を一度も見ずに accepted を出せる。
  */
-export function recordImageServed(db, jobId, { fileId, sha256: hex, bytes, now = Date.now() } = {}) {
+export function recordImageServed(db, jobId, { leaseToken, fileId, sha256: hex, bytes, now = Date.now() } = {}) {
   const id = posInt(jobId);
   const f = exact(fileId, DRIVE_FILE_ID_RE);
   const h = exact(hex, SHA256_RE);
   const b = posInt(bytes);
   if (!id || !f || !h || !b) return { code: 'bad_request', error: '記録する画像の指定が不正です' };
+  const nowS = new Date(now).toISOString();
   return db.transaction(() => {
-    const job = jobById(db, id);
-    if (!job) return { code: 'not_found', error: '依頼がありません' };
+    const l = liveLease(db, id, leaseToken, nowS);
+    if (l.code) return l;
+    const job = l.job;
     let list;
     try { list = JSON.parse(job.images_served_json || '[]'); } catch { list = []; }
     if (!Array.isArray(list)) list = [];
@@ -739,8 +746,11 @@ export function recordImageServed(db, jobId, { fileId, sha256: hex, bytes, now =
     const row = { file_id: f, sha256: h, bytes: b, served_at: new Date(now).toISOString() };
     if (hit >= 0) list[hit] = row; else list.push(row);
     if (list.length > MAX_IMAGES) list.length = MAX_IMAGES;
-    db.prepare('UPDATE ph_lp_compose_jobs SET images_served_json = ?, updated_at = ? WHERE id = ?')
-      .run(JSON.stringify(list), new Date(now).toISOString(), id);
+    // WHERE にも lease を書く (liveLease で確かめた同じ lease のままであることを DB 側でも固定する)
+    const ch = db.prepare(`UPDATE ph_lp_compose_jobs SET images_served_json = ?, updated_at = ?
+      WHERE id = ? AND status = 'running' AND lease_token = ?`)
+      .run(JSON.stringify(list), nowS, id, String(leaseToken)).changes;
+    if (!ch) return { code: 'lease_lost', error: 'この実行役の lease ではありません (取り直されたか終了済み)' };
     return { ok: true, count: list.length };
   }).immediate();
 }

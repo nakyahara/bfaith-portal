@@ -120,6 +120,9 @@ ok(cl.json.packet.product_info.includes('ハッカ油'), '商品情報が来る'
 console.log('③ images — Drive が無い環境では取れないことが分かる');
 const im = await phlp('images', jid);
 ok(im.code !== 0, 'Drive が無ければ失敗する (0 枚で黙って進まない)');
+// 🚨 404 を「ここで終わり」の合図に使わない (codex exec review P2)。
+//    枚数は packet から決めるので、取れなかった枚があれば必ず失敗する
+eq(im.json.expected, 1, '🚨 packet の枚数を期待値にする');
 
 console.log('④ ファイル引数は決まった名前だけ');
 fs.writeFileSync(path.join(work, `out-${jid}.md`), '# LP制作システム V2.1\n\n## ⑦ AI画像生成プロンプト\n…', 'utf8');
@@ -158,7 +161,8 @@ fs.writeFileSync(path.join(work, `imgs-${jid}.json`), JSON.stringify(
 eq((await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--lint', `lint-${jid}.json`, '--rounds', '1')).code, 1,
   '🚨 証跡を手で置いても通らない (サーバの記録を見る・codex exec review P1)');
 // サーバが実際に配ったときだけ通る
-lp.recordImageServed(db, req.job.id, { fileId: 'FILEIDTOP001', sha256: 'b'.repeat(64), bytes: 4321 });
+const leaseTok = db.prepare('SELECT lease_token FROM ph_lp_compose_jobs WHERE id = ?').get(req.job.id).lease_token;
+lp.recordImageServed(db, req.job.id, { leaseToken: leaseTok, fileId: 'FILEIDTOP001', sha256: 'b'.repeat(64), bytes: 4321 });
 const good = await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--lint', `lint-${jid}.json`, '--rounds', '1');
 eq(good.code, 0, 'サーバが配っていれば通る');
 eq(good.json.status, 'done', 'done になる');

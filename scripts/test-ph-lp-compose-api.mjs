@@ -219,7 +219,7 @@ eq((await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`,
 eq((await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
   body: { packet_hash: job.packet_hash, verdict: 'accepted', output: OUT, review_rounds: 1 },
 })).status, 400, '🚨 lint が無ければ accepted を受け取らない');
-lp.recordImageServed(db, job.job_id, { fileId: 'FILEIDTOP001', sha256: 'c'.repeat(64), bytes: 2222 });
+lp.recordImageServed(db, job.job_id, { leaseToken: job.lease_token, fileId: 'FILEIDTOP001', sha256: 'c'.repeat(64), bytes: 2222 });
 const sub = await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
   body: {
     packet_hash: job.packet_hash, verdict: 'accepted', output: OUT, review_rounds: 1,
