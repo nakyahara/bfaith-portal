@@ -372,9 +372,10 @@ await t('止めるとき: 「止めた」の記録 (理由つき・書きかけ 
   const end = G.beginLegacyWrite('warehouse:POST:/api/shipping');
   try {
     setPhase('legacy_open');
-    const r = await G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM で止めた', env: { RENDER_GIT_COMMIT: 'b'.repeat(40) }, timeoutMs: 2000 }).catch((e) => ({ state: 'x', detail: e.message }));
+    // 書きかけがある (この試験で始めた 1 件) = 終わるまで待つ → 時間内に終わらない = 「止めた」(書きかけ 0) を書かない (Codex #1565 R3 Medium)
+    const r = await G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM で止めた', env: { RENDER_GIT_COMMIT: 'b'.repeat(40) }, timeoutMs: 300 }).catch((e) => ({ state: 'x', detail: e.message }));
     G.__resetLegacyAck();   // 止めている途中の印を戻す (この後の試験のため)
-    assert.equal(r.state, 'precheck_failed', '門のログインが無い = 書かない (止まるのは待たせない)');
+    assert.equal(r.state, 'error'); assert.match(r.detail, /書きかけ \d+ 件が 300ms で終わらない/);
     const r2 = await G.ackLegacyGates({ host: 'minipc', connect: fakeGateDb({ calls }), env: { RENDER_GIT_COMMIT: 'b'.repeat(40) }, stopped: true, stoppedReason: 'SIGTERM で止めた' });
     assert.equal(r2.state, 'stopped', r2.detail);
     const call = calls.find((c) => /select ops\.record_legacy_gate_ack\(/.test(c.sql));
@@ -399,6 +400,111 @@ await t('止めるとき: 「止めた」の記録 (理由つき・書きかけ 
     await assert.rejects(() => markStopped({ host: 'laptop', instance: 'srv-9', reason: 'x', connect: fakeGateDb() }), /host/);
     assert.equal((await quiet(() => G.ackLegacyGates({ host: 'minipc', connect: fakeGateDb(), stopped: true, stoppedReason: ' ' }))).state, 'precheck_failed');
   } finally { end(); }
+  // 書きかけが無い・門のログインが無い = 書かない (止まるのは待たせない)
+  const r0 = await quiet(() => G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM で止めた', env: { RENDER_GIT_COMMIT: 'b'.repeat(40) }, timeoutMs: 2000 }));
+  G.__resetLegacyAck();
+  assert.equal(r0.state, 'precheck_failed');
+});
+await t('Codex #1565 R3 Medium: 止めるときの競り合い = (1) 段階を読んでいる間に止め始めた要求はハンドラに入らない (2) 受け取った後・書く直前の確かめの前に止めた CSV は書かずにファイルを消す (3) 定期実行が終わるまで「止めた」を書かない / 書く直前に止まる', async () => {
+  const wait = (ms) => new Promise((ok) => setTimeout(ok, ms));
+  const until = async (f) => { for (let i = 0; i < 150 && !f(); i++) await wait(20); assert.ok(f()); };
+  const env = { RENDER_GIT_COMMIT: 'a'.repeat(40) };
+  const order = [];
+  const ackDb = () => async () => ({
+    db: {
+      query: async (sql, params) => {
+        if (/to_regprocedure/.test(sql)) return { rows: [{ ok: true }] };
+        if (/legacy_manifest_hash/.test(sql)) return { rows: [{ h: 'f'.repeat(64) }] };
+        if (/record_legacy_gate_ack/.test(sql)) { order.push(params[8] === true ? 'stopped' : 'normal'); return { rows: [{ r: { ack_id: 1, manifest_hash: 'f'.repeat(64), acked_at: 'x', stopped: params[8] === true } }] }; }
+        throw new Error(sql);
+      },
+    },
+    close: async () => {},
+  });
+  const app = express();
+  const rt = express.Router();
+  rt.use(express.json());
+  rt.use(G.masterLegacyGate('warehouse'));
+  let shippingCalled = 0, csvCalled = 0, releaseUpload = null;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mlg-race-'));
+  rt.post('/api/shipping', (req, res) => { shippingCalled++; res.json({ ok: true }); });
+  // 受け取り (multer の代わり) → 書く直前にもう一度読む → 書く
+  rt.post('/api/csv/shipping', async (req, res, next) => {
+    await new Promise((ok) => { releaseUpload = ok; });
+    const p = path.join(tmpDir, 'up.csv');
+    fs.writeFileSync(p, 'x');
+    req.file = { path: p };
+    next();
+  }, G.legacyRecheck('warehouse:POST:/api/csv/shipping'), (req, res) => { csvCalled++; res.json({ ok: true }); });
+  app.use('/', rt);
+  const srv = http.createServer(app);
+  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  const url = (p) => `http://127.0.0.1:${srv.address().port}${p}`;
+  try {
+    // (1) 段階を読んでいる間に止め始めた = 切符を出さない・ハンドラに入らない
+    G.__resetLegacyAck(); order.length = 0;
+    let releaseRead = null;
+    G.__setLegacyPhaseReader(async () => { if (!releaseRead) await new Promise((ok) => { releaseRead = ok; }); return { readable: true, phase: 'legacy_open' }; });   // 最初の読みだけ止める
+    const p1 = fetch(url('/api/shipping'), { method: 'POST' });
+    await until(() => releaseRead);
+    const base = G.legacyInflight().count;
+    const s1 = G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM', env, connect: ackDb(), timeoutMs: 3000 });
+    releaseRead();
+    const r1 = await quiet(() => p1);
+    assert.equal(r1.status, 503); assert.equal((await r1.json()).error, 'master_shutting_down');
+    assert.equal(shippingCalled, 0, 'ハンドラに入らない');
+    assert.equal(G.legacyInflight().count, base);
+    assert.equal((await quiet(() => s1)).state, 'stopped'); assert.deepEqual(order, ['stopped']);
+    // (2) 受け取った後・書く直前の確かめの前に止めた = 書かない・ファイルを消す・「止めた」は切符が返ってから
+    G.__resetLegacyAck(); order.length = 0;
+    setPhase('legacy_open');
+    const p2 = fetch(url('/api/csv/shipping'), { method: 'POST' });
+    await until(() => releaseUpload);
+    assert.equal(G.legacyInflight().count, base + 1, '受け取っている間は数える');
+    const s2 = G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM', env, connect: ackDb(), timeoutMs: 3000 });
+    await wait(150);
+    assert.deepEqual(order, [], '書きかけが返るまで「止めた」を書かない');
+    releaseUpload();
+    const r2 = await quiet(() => p2);
+    assert.equal(r2.status, 503); assert.equal((await r2.json()).error, 'master_shutting_down');
+    assert.equal(csvCalled, 0, '書く段に進まない');
+    assert.equal(fs.existsSync(path.join(tmpDir, 'up.csv')), false, '受け取ったファイルを消す');
+    assert.equal((await quiet(() => s2)).state, 'stopped'); assert.deepEqual(order, ['stopped']);
+    assert.equal(G.legacyInflight().count, base);
+    // (3a) 定期実行の段階の読みの間に止め始めた = 流さない
+    G.__resetLegacyAck(); order.length = 0;
+    let releaseJobRead = null;
+    G.__setLegacyPhaseReader(async () => { if (!releaseJobRead) await new Promise((ok) => { releaseJobRead = ok; }); return { readable: true, phase: 'legacy_open' }; });   // 最初の読みだけ止める
+    let jobRan = false;
+    const j1 = G.runLegacyJob('job:product-hub:intake-cron', async () => { jobRan = true; });
+    await until(() => releaseJobRead);
+    const s3 = G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM', env, connect: ackDb(), timeoutMs: 3000 });
+    releaseJobRead();
+    assert.equal((await j1).ran, false); assert.equal(jobRan, false);
+    assert.equal((await quiet(() => s3)).state, 'stopped');
+    // (3b) 定期実行が外を待っている間に止め始めた = 「止めた」は定期実行が終わってから・書く直前の fence で止まる (書かない)
+    G.__resetLegacyAck(); order.length = 0;
+    setPhase('legacy_open');
+    let releaseWork = null, wroteJob = false, jobErr = null;
+    const j2 = G.runLegacyJob('job:product-hub:intake-cron', async ({ fence }) => {
+      await new Promise((ok) => { releaseWork = ok; });
+      try { await fence(); wroteJob = true; } catch (e) { jobErr = e; }
+    });
+    await until(() => releaseWork);
+    assert.equal(G.legacyInflight().by_entry['job:product-hub:intake-cron'], 1);
+    const s4 = G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM', env, connect: ackDb(), timeoutMs: 3000 });
+    await wait(150);
+    assert.deepEqual(order, [], '定期実行が終わるまで「止めた」を書かない');
+    releaseWork();
+    await j2;
+    assert.equal(wroteJob, false); assert.equal(jobErr && jobErr.reason, 'shutting_down');
+    assert.equal((await quiet(() => s4)).state, 'stopped'); assert.deepEqual(order, ['stopped']);
+  } finally {
+    await new Promise((ok) => srv.close(ok));
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    G.__resetLegacyAck();
+    setPhase('legacy_open');
+  }
 });
 await t('中間レビュー 2 回目 Low: 次の起動で、前の起動のプロセスが「止めた」を書かずに消えていたら書く (miniPC)。前の pid がまだある・別の PC / 場所 = 書かない', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mlg-inst-'));

@@ -14,9 +14,9 @@
  *   8 門の記録: 場所ごとの門のログイン (master_gate_minipc = env COMPANY_DB_MASTER_GATE_MINIPC_URL) で ⑤-1 の本物の関数
  *     ops.record_legacy_gate_ack に書く。返事 (ack_id・DB が計算した manifest_hash・acked_at) を確かめる。段階の読みもこのログイン
  *   9 書く間に段階が変わった (関数が stale_phase で拒む) = 読み直して 1 回書き直す
- *  10 止めるとき (SIGTERM / SIGINT) の「止めた」の記録と、人が別のプロセスを「止めた」にする (scripts/company-db/master-legacy-instance.mjs)
+ *  10 止めるとき (SIGTERM / SIGINT) の「止めた」の記録 (書きかけが終わってから) と、人が別のプロセスを「止めた」にする (scripts/company-db/master-legacy-instance.mjs)
  *  11 配る前の確かめ (scripts/company-db/master-legacy-readiness.mjs): そろっていれば ok・場所と役が違えば「足りない」
- *  12 門のログインの接続は、同時に 20 件の読み + 記録を書いても 2 本まで (プール 1 本 + 記録 1 本)
+ *  12 門のログインの接続は、同時に 20 件の読み + 記録を書いても 1 本 (記録も段階を読むプールの 1 本で書く)
  *  13 env の取り違え (miniPC の env に Render のログイン) = ⑤-1 の関数が gate_host_mismatch で拒む・何も書かない
  *  14 ⑤-3 の記録で ⑤-1 の段階の関数が frozen に進める。黙っているプロセス (今までに記録・最後が 15 分より前 (何日前でも)・止めたでもない) があれば拒む
  *     → scripts/company-db/master-legacy-instance.mjs で「止めた」を書けば進める
@@ -202,9 +202,14 @@ try {
     } finally { G.__setLegacyPhaseReader(null); await setPhase('legacy_open'); }
   });
   await ta('[10] 止めるときの「止めた」(書きかけ 0) と、人が別のプロセスを「止めた」にする (名札を指定)・一覧で見える', async () => {
+    // 書きかけがある間は「止めた」(書きかけ 0) を書かない = 終わってから書く (Codex #1565 R3 Medium)
     const end = G.beginLegacyWrite('warehouse:POST:/api/shipping');
-    let r;
-    try { r = await G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM (試験)', env, timeoutMs: 5000 }); } finally { end(); }
+    const ackBefore = await ackCount();
+    const stopping = G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM (試験)', env, timeoutMs: 5000 });
+    await sleep(300);
+    assert.equal(await ackCount(), ackBefore, '書きかけが終わるまで書かない');
+    end();
+    const r = await stopping;
     assert.equal(r.state, 'stopped', JSON.stringify(r));
     assert.deepEqual(Object.values((await M.query('select inflight_count, stopped, stopped_reason, session_role from ops.master_legacy_gate_acks where ack_id = $1', [r.ack_id])).rows[0]), [0, true, 'SIGTERM (試験)', 'master_gate_minipc']);
     const { markStopped, listInstances } = await import('./company-db/master-legacy-instance.mjs');
