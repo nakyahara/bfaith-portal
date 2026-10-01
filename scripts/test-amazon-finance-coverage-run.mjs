@@ -13,7 +13,8 @@
  *     complete の応答だけ失われた = 同じ中身の再送が same / 窓の空白 (保持期間以上あいた) = ⚠️ / Render に 0050 が無い = 今までの送り方 /
  *     coordinator を通らない単独の送り手 (token の無い chunk) = Render は complete を無効にする / 完成の判定の単体 /
  *     (#1567 Codex R1) coverage で回った後の 404・409・台帳を失くした・updating の失敗 = 取込もしない / 初期の印は順番待ち → updating の後に入る・
- *     manifest の後に印が積まれた・直接変わった = complete にしない / 版の無い過去の行 = coordinator は版付けを流さず ❌
+ *     manifest の後に印が積まれた・直接変わった = complete にしない / 版の無い過去の行 = coordinator は版付けを流さず ❌ /
+ *     (#1567 Codex R2) complete の POST の直前に印・手のファイルを積もうとする = 拒む / lease が切れて積まれた = POST の後に読み直して complete を取り消す
  * 実行: node scripts/test-amazon-finance-coverage-run.mjs
  */
 import assert from 'node:assert/strict';
@@ -308,7 +309,8 @@ await t('🚨 同じ report ID で file hash が変わる (O-C が消えた新�
 console.log('⑤ 一覧・report の状態');
 // 🚨 一覧に 1 度でも出た report は積み上げた期待の集合に残る (設計 R19 H1 = 保持期間で一覧から消えた report の欠けを見逃さない)。
 //   = 未充足の report が出たら、Seller Central で印を作り直す (新しい epoch = 積み上げは新しい印の後の回だけ) のが runbook。試験も同じ手で戻す
-const remark = () => runMarkerCli(db, { file: markerFile, queue: true }, { log: () => {}, now: new Date(NOW) });   // 積むだけ = 次の coverage の回が updating の後に入れる
+// 積むだけ = 次の coverage の回が updating の後に入れる。isAlive = lease の持ち主が生きているか (既定 = 死んでいる = 回の外・止まった回)
+const remark = (o = {}) => runMarkerCli(db, { file: markerFile, queue: true }, { log: () => {}, now: new Date(NOW), isAlive: () => false, ...o });
 const restore = () => { SP.ing = BASE_REPORTS; SP.inv = BASE_REPORTS; SP.invEndless = false; remark(); };
 await t('🚨 一覧の欠け (一覧にある DONE の report を取り込めていない) = complete にしない (❌ report_not_imported)', async () => {
   SP.inv = [...BASE_REPORTS, rep('R-MISS', 'DONE', 'D-MISS', P.S3, '2026-03-11T00:00:00Z')];
@@ -530,7 +532,11 @@ await t('🚨 complete の後に新しい印を積む = 積んだだけでは印
 await t('🚨 manifest を作った後・complete の前に印を積む = complete にしない (❌ marker_pending) → 次の回で入れて complete (#1567 Codex R1 High 2 場面 2)', async () => {
   const n0 = markerCount();
   const f = spyFetch();
-  const r = await run({ fetchImpl: f, hooks: { beforeComplete: () => { assert.equal(remark().queued, true); } } });
+  // 持ち主が生きている = 積めない (R2 High 2 a) / 持ち主が死んでいると見えた (止まった回) = 積める → 判定の読み直しで marker_pending
+  const r = await run({ fetchImpl: f, hooks: { beforeComplete: () => {
+    assert.throws(() => remark({ isAlive: () => true }), /coordinator の回が動いている/);
+    assert.equal(remark().queued, true);
+  } } });
   assert.equal(r.exitCode, 1, r.summary); assert.ok(codes(r).includes('marker_pending'), codes(r).join(','));
   assert.equal(f.calls.complete, 0); assert.equal((await cov()).state, 'updating');
   assert.equal(markerCount(), n0);
@@ -547,6 +553,52 @@ await t('🚨 manifest を作った後・complete の前に印の表が直接変
   const r2 = await run({ fetchImpl: spyFetch() });
   assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
   assert.equal(r2.push.finance.coverage.manifest.initial_marker_id, latestMarkerId());
+});
+await t('🚨 最後の確かめと complete の POST の間 (POST の直前) に印・手のファイルを積もうとする = coordinator が lease を持っている = 積まずに拒む → complete は今の印のまま (#1567 Codex R2 High 2 a)', async () => {
+  const n0 = markerCount(), q0 = db.prepare(`SELECT COUNT(*) n FROM initial_marker_queue`).get().n, mf0 = db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_manual_files`).get().n;
+  let tried = false;
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f, hooks: { beforeCompletePost: (dbx) => {
+    tried = true;
+    assert.equal(f.calls.complete, 0, 'まだ POST していない');
+    const l = V.readLease(dbx);
+    assert.ok(l.run_token && !l.released_at, 'coordinator は POST の前に lease を放していない');
+    assert.throws(() => remark({ isAlive: () => true }), /coordinator の回が動いている.*初期の印を積まない/);
+    assert.throws(() => queueManualFile(dbx, tmpDir, settlementTsv('S2', ...P.S2, L.S2), { fileName: 'late.txt', now: new Date(NOW), isAlive: () => true }), /coordinator の回が動いている.*手の決済のファイルを積まない/);
+  } } });
+  assert.ok(tried);
+  assert.equal(r.exitCode, 0, `${r.summary} ${JSON.stringify(r.reasons)}`); assert.equal((await cov()).state, 'complete');
+  assert.equal(db.prepare(`SELECT COUNT(*) n FROM initial_marker_queue`).get().n, q0, '印は積まれていない');
+  assert.equal(db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_manual_files`).get().n, mf0, '手のファイルも積まれていない');
+  assert.equal(markerCount(), n0);
+  // 回が終わった (lease を放した) 後は、生きている持ち主として見ても積める
+  assert.ok(V.readLease(db).released_at, '回の後は lease を放した');
+  assert.equal(remark({ isAlive: () => true }).queued, true, '回の後は積める');
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal(markerCount(), n0 + 1);
+});
+await t('🚨 lease が POST の途中で切れて印が積まれた = complete の POST の後に読み直して違う → すぐに新しい世代の updating で complete を取り消す (❌ marker_pending・complete_revoked) → 次の回で入れて complete (#1567 Codex R2 High 2 b)', async () => {
+  const n0 = markerCount();
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f, hooks: { beforeCompletePost: (dbx) => {
+    // lease が切れた (放された) 状態を作る → 積める
+    V.releaseCoverageLease(dbx, { runToken: V.readLease(dbx).run_token });
+    assert.equal(remark({ isAlive: () => true }).queued, true, 'lease が切れていれば積める');
+  } } });
+  assert.equal(f.calls.complete, 1, 'complete は送った (Render は SQLite の lease を知らない)');
+  assert.equal(f.calls.updating, 2, '回の始めの updating + 取り消しの updating');
+  assert.equal(r.exitCode, 1, r.summary);
+  assert.ok(codes(r).includes('marker_pending') && codes(r).includes('complete_revoked'), codes(r).join(','));
+  assert.match(r.summary, /^❌ .*complete を取り消した/);
+  const c = await cov();
+  assert.deepEqual([c.state, c.g], ['updating', String(r.generation + 1)], '新しい世代の updating = 古い印の complete を取り消した');
+  assert.equal((await covState()).complete_to, null);
+  assert.equal(ledgerMeta('coverage_generation'), String(r.generation + 1), '取り消しの世代は HTTP の前に台帳へ');
+  assert.equal(markerCount(), n0, '印はまだ入れていない (次の回が updating の後に入れる)');
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.generation, r.generation + 2);
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+  assert.equal(markerCount(), n0 + 1);
 });
 await t('🚨 coordinator を通らない単独の送り手 (token の無い chunk が受領記録を変える) = Render は complete を無効にする', async () => {
   const r0 = await run({ fetchImpl: spyFetch() });

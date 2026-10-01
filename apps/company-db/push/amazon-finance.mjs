@@ -54,7 +54,7 @@ import { pseudoOrderNo, isPseudoOrderNo, PSEUDO_PREFIX } from '../finance/order-
 import { aggregateOrderFinance, financePayload, isRealDate, RAW_COLUMNS, AMAZON_FINANCE_TRANSFORM_VERSION, FINANCE_MALL, FINANCE_SCOPE } from './amazon-finance-transform.mjs';
 import { addPendingMonths, ACCOUNT_FEES_PENDING_FILE, PENDING_FILE } from '../../warehouse/amazon-finance-months.js';
 import { filterSelectedRows } from './amazon-finance-transform.mjs';
-import { selectDocumentVersions, assertDocumentVersionsReady } from '../../warehouse/amazon-settlement-versions.js';
+import { selectDocumentVersions, assertDocumentVersionsReady, VERSION_SELECT_SQL } from '../../warehouse/amazon-settlement-versions.js';
 
 export const FINANCE_KIND = `order_finance:${FINANCE_MALL}`;
 export const FINANCE_FLOOR = '2026-01-01';            // policy (0043) の始まり = 決済の行の始まり
@@ -94,7 +94,8 @@ export const SQL = {
   ingestedSince: `SELECT DISTINCT amazon_order_id AS o, economic_date AS d FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_ingested WHERE ingested_at >= ?`,
   economicRange: `SELECT DISTINCT amazon_order_id AS o, economic_date AS d FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_economic WHERE economic_date BETWEEN ? AND ?`,
   // 🆕 D7b-1b-3: 文書の版 (決済ごとに採る版を JS で決める)・生の表の版 R・読み直す注文
-  versions: `SELECT seq, document_version_id, settlement_id, source_layer, ingested_at, detail_valid FROM amazon_settlement_document_versions`,
+  //   🚨 採る版に要る列は全部 (VERSION_SELECT_COLUMNS。header_count が無いと見出し 0 行の新しい版を採り、SQLite の view と別の版を送っていた = #1567 Codex R2 High 1)
+  versions: VERSION_SELECT_SQL,
   revision: `SELECT revision FROM amazon_settlement_source_revision WHERE id = 1`,
   dirty: `SELECT mall_order_no AS o, revision AS r FROM amazon_settlement_dirty_orders`,
 };

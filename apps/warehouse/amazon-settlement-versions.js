@@ -72,10 +72,24 @@ export function compareVersionOrder(a, b) {
   return cmpUtf8(a.document_version_id, b.document_version_id);
 }
 
+/**
+ * 採る版を決めるのに要る列 (compareVersionOrder と SQL の view が見る列 + 戻りで使う seq)。
+ * 🚨 版の一覧を読む所は **どこもこの列を全部** 渡す (#1567 Codex R2 High 1: 送り手の SQL に header_count が無く、
+ *    見出し 0 行の新しい版を採って SQLite の build・manifest と別の版を Render に送っていた)。足りなければ selectDocumentVersions が throw
+ */
+export const VERSION_SELECT_COLUMNS = Object.freeze(['seq', 'document_version_id', 'settlement_id', 'source_layer', 'ingested_at', 'detail_valid', 'header_count']);
+/** 採る版を決める最小の SQL (送り手が使う。ほかは SELECT * = 全部の列) */
+export const VERSION_SELECT_SQL = `SELECT ${VERSION_SELECT_COLUMNS.join(', ')} FROM amazon_settlement_document_versions`;
+
 /** 決済ごとに採る版 (JS の実装。SQL の view v_amazon_settlement_selected_documents と試験で一致を確かめる)。戻り = Map<settlement_id, 版の行> */
 export function selectDocumentVersions(versions) {
   const out = new Map();
   for (const v of versions) {
+    for (const c of VERSION_SELECT_COLUMNS) {
+      if (!v || typeof v !== 'object' || !Object.hasOwn(v, c)) {
+        throw new Error(`selectDocumentVersions: 版の行に列 ${c} が無い (渡された列 = ${v && typeof v === 'object' ? Object.keys(v).join(', ') : typeof v}) = 採る版が SQLite の view と変わりうる → VERSION_SELECT_COLUMNS を全部読む`);
+      }
+    }
     if (v.settlement_id == null) continue;   // 決済 ID の決まらない版はどの決済にも採られない (SQL の view と同じ)
     const cur = out.get(v.settlement_id);
     if (!cur || compareVersionOrder(v, cur) < 0) out.set(v.settlement_id, v);
@@ -583,6 +597,24 @@ export function setLeaseGeneration(db, lease, generation, now = new Date()) {
     db.prepare(`UPDATE amazon_finance_coverage_lease SET coverage_generation = ?, updated_at = ? WHERE id = 1`).run(generation, now.toISOString());
   }).immediate();
   lease.generation = generation;
+}
+/**
+ * 生きている coverage の lease (放していない・持ち主が生きている)。無ければ null。
+ *   人が積む入口 (初期の印・手のファイルの --queue) が、coordinator の回の途中に積まないために使う (#1567 Codex R2 High 2)。
+ *   取引の中で呼ぶ (BEGIN IMMEDIATE = lease の取り直しと直列)
+ */
+export function liveCoverageLease(db, { isAlive }) {
+  const cur = readLease(db);
+  if (!cur || !cur.run_token || cur.released_at) return null;
+  return isAlive(cur.owner_pid, cur.started_at) ? cur : null;
+}
+/** 生きている lease があれば積まずに throw (what = 積むもの) */
+export function assertNoLiveCoverageLease(db, { isAlive, what }) {
+  const cur = liveCoverageLease(db, { isAlive });
+  if (cur) {
+    throw new Error(`coordinator の回が動いている (lease の持ち主 pid ${cur.owner_pid}・開始 ${cur.started_at}・世代 ${cur.coverage_generation ?? '-'}) = ${what}を積まない`
+      + ` (回の途中に積むと古い中身で complete になりうる・#1567 Codex R2 High 2)。回が終わってから積み直す`);
+  }
 }
 /** 放す (自分の token のときだけ)。戻り = 放したか */
 export function releaseCoverageLease(db, lease, now = new Date()) {

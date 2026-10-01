@@ -27,8 +27,8 @@ import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import companyDbRouter, { requireSyncKey, __setPgClientFactory } from '../apps/company-db/router.mjs';
 import { openLedger } from '../apps/company-db/push/ledger.mjs';
 import { aggregateOrderFinance, dedupSettlementRows, filterSelectedRows, feeKindOf, skuKindOf, AMAZON_FINANCE_TRANSFORM_VERSION } from '../apps/company-db/push/amazon-finance-transform.mjs';
-import { backfillDocumentVersions, clearDirtyOrders } from '../apps/warehouse/amazon-settlement-versions.js';
-import { pushAmazonFinance, reconcileAmazonFinance, readSqliteDaily, readSqliteFees, diffFinanceDaily, diffAccountFees, capacityGuard, parseArgs, sinceOf, META, FINANCE_KIND, financeKey, retryStore }
+import { backfillDocumentVersions, clearDirtyOrders, selectDocumentVersions } from '../apps/warehouse/amazon-settlement-versions.js';
+import { pushAmazonFinance, reconcileAmazonFinance, readSqliteDaily, readSqliteFees, diffFinanceDaily, diffAccountFees, capacityGuard, parseArgs, sinceOf, META, FINANCE_KIND, financeKey, retryStore, SQL as PUSH_SQL }
   from '../apps/company-db/push/amazon-finance.mjs';
 import { classifyAccountFee, classifySkuAccountFee } from '../apps/warehouse/amazon-account-fee-rules.js';
 import { accountFeesMonthsBack, readPendingMonths, ACCOUNT_FEES_PENDING_FILE, PENDING_FILE } from '../apps/warehouse/amazon-finance-months.js';
@@ -146,6 +146,16 @@ raw({ ...O20, qty: 1, blk: 'o20q', doc: 'D-OLD', lineNo: 1 }); raw({ ...O20, pt:
 raw({ ...O20, tt: 'Other', pt: 'Something', oa: 100, blk: 'o20x', doc: 'D-OLD', lineNo: 3 }); raw({ ...O20, tt: 'Other', pt: 'Something', oa: -100, blk: 'o20y', doc: 'D-OLD', lineNo: 4 });
 raw({ ...O20, qty: 1, blk: 'o20q', doc: 'D-NEW', layer: 'sp_api_v2', lineNo: 1, ingested: '2026-01-15 00:00:00' }); raw({ ...O20, pt: 'Principal', pa: 500, blk: 'o20p', doc: 'D-NEW', layer: 'sp_api_v2', lineNo: 2, ingested: '2026-01-15 00:00:00' });
 
+// 🆕 #1567 Codex R2 High 1: 決済 S-H0 に「古い版 = 見出しつき (detail_valid 1・見出し 1 行)」と「新しい版 = 見出し無し (過去の backfill・detail_valid 1・見出し 0 行)」。
+//   採る版 = 見出しのある古い版 (SQLite の view)。送り手の版の SQL に header_count が無いと新しい版 (中身が違う = 売上 650) を採って Render と SQLite がずれた
+const O21 = { order: 'O21', sku: 'sku-o21', date: d(MB, 25), settlement: 'S-H0' };
+raw({ ...O21, qty: 1, blk: 'o21q', doc: 'D-H0-OLD', lineNo: 1 }); raw({ ...O21, pt: 'Principal', pa: 600, blk: 'o21p', doc: 'D-H0-OLD', lineNo: 2 });
+wdb.prepare(`INSERT INTO raw_amazon_settlement_headers (physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version,
+  source_settlement_id, settlement_start_date, settlement_end_date, deposit_date, total_amount_micro, currency, ingest_run_id, observed_at, ingested_at)
+  VALUES ('ph-h0-head', 'h0-head', 'D-H0-OLD', 'h', 'p', 0, 'sp_api_v1', 'v', 'S-H0', ?, ?, ?, ?, 'JPY', 'r', 'o', ?)`)
+  .run(`${d(MB, 20)} 00:00:00 UTC`, `${d(MB, 28)} 00:00:00 UTC`, `${d(MB, 28)} 00:00:00 UTC`, 600 * 1e6, OLD_INGEST);
+raw({ ...O21, qty: 1, blk: 'o21q', doc: 'D-H0-NEW', layer: 'sp_api_v2', lineNo: 1, ingested: '2026-01-20 00:00:00' }); raw({ ...O21, pt: 'Principal', pa: 650, blk: 'o21p', doc: 'D-H0-NEW', layer: 'sp_api_v2', lineNo: 2, ingested: '2026-01-20 00:00:00' });
+
 // 直接入れた行には文書の版が無い = 過去の行と同じ backfill で版を付けてから build・送る (どちらも版の無い行があれば止まる)
 const build = (months = 14) => {
   backfillDocumentVersions(wdb);
@@ -255,6 +265,22 @@ await t('🚨 D-66: 文書が 2 つで中身が違う決済 (S-DIFF) = 新しい
     const s2 = w.prepare(`select sales_principal_jpy p, other_amount_jpy o, units_ordered q from f_amazon_finance_sku_daily_v1 where seller_sku = 'sku-o20' and date_jst = ?`).get(d(MB, 27));
     assert.deepEqual([s2.p, s2.o, s2.q], [500, 0, 1]);
   } finally { w.close(); }
+});
+await t('🚨 #1567 Codex R2 High 1: 古い版 = 見出しつき・新しい版 = 見出し無し (どちらも detail_valid 1) = 送り手の実際の版の SQL で採る版 = SQLite の view (古い版)・Render と SQLite の売上が同じ 600', async () => {
+  const w = reader();
+  try {
+    const vs = w.prepare(`select settlement_id, seq, header_count, detail_valid, ingested_at from amazon_settlement_document_versions where settlement_id = 'S-H0' order by seq`).all();
+    assert.deepEqual(vs.map((v) => [v.header_count, v.detail_valid]), [[1, 1], [0, 1]], '前提: 古い版 = 見出し 1 行・新しい版 = 見出し 0 行・どちらも detail_valid 1');
+    const js = selectDocumentVersions(w.prepare(PUSH_SQL.versions).all());   // 送り手の実際の SQL
+    const view = w.prepare(`select settlement_id, document_version_seq from v_amazon_settlement_selected_documents`).all();
+    assert.equal(js.size, view.length);
+    for (const r of view) assert.equal(js.get(r.settlement_id)?.seq, r.document_version_seq, `決済 ${r.settlement_id}: 送り手 #${js.get(r.settlement_id)?.seq} / view #${r.document_version_seq}`);
+    assert.equal(js.get('S-H0').seq, vs[0].seq, 'S-H0 = 見出しのある古い版');
+    const s = w.prepare(`select sales_principal_jpy p from f_amazon_finance_sku_daily_v1 where seller_sku = 'sku-o21' and date_jst = ?`).get(d(MB, 25));
+    assert.equal(s.p, 600);
+  } finally { w.close(); }
+  const u = await one(`select sales_principal_jpy::int p from core.order_finance_daily where mall_order_no = 'O21' and line_kind = 'sku'`);
+  assert.equal(u.p, 600, 'Render も古い版 (見出しつき) の 600');
 });
 await t('月 × 手数料: mart.v_finance_account_fees_monthly = f_amazon_account_fees_monthly_v1 (金額・行数)', async () => {
   const w = reader();

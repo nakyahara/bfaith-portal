@@ -22,6 +22,7 @@
  *   node apps/warehouse/amazon-finance-initial-marker.js --file marker.csv --verified-from 2026-01-01 --verified-through 2026-09-21 --captured-at 2026-10-01T10:00:00+09:00 [--evidence-kind seller_central_payments_export]
  *   node apps/warehouse/amazon-finance-initial-marker.js --file marker.json --queue         → 順番待ちに積む (次の coordinator の回が Render を updating にした後に新しい epoch で入れる)
  *     🚨 印の表に直接書かない (#1567 Codex R1 High 2: 回の外で印を変えると Render の古い complete が次の回まで残る・manifest と complete の間に印が変わる)
+ *     🚨 coordinator の回が動いている (生きている coverage の lease) 間は積まずに拒む = 回が終わってから積み直す (#1567 Codex R2 High 2)
  *   node apps/warehouse/amazon-finance-initial-marker.js --list                             → 印の一覧
  * env: DATA_DIR (必須)
  */
@@ -31,7 +32,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { canonicalSha256 } from '../company-db/canonical-hash.mjs';
-import { cmpUtf8, selectDocumentVersions, readVersions } from './amazon-settlement-versions.js';
+import { cmpUtf8, selectDocumentVersions, readVersions, assertNoLiveCoverageLease } from './amazon-settlement-versions.js';
+import { isAliveNodeSince } from './retry-lock.js';
 import { jstDayStartUtc, jstDateOfUtc } from './amazon-finance-coverage.js';
 import { normalizeApiTime } from './amazon-settlement-inventory.js';
 
@@ -141,11 +143,14 @@ export function insertMarker(db, norm, opts) {
 /**
  * 印を順番待ちに積む (印の表には書かない)。順番待ちの中に同じ印 (正規化した中身 + 元のファイルの hash) があれば積まない。
  *   入れた後に同じ印を積む = 印の作り直し (新しい epoch = 積み上げをやり直す) なので積める。戻り = { queued, id }
+ *   🚨 coordinator の回が動いている (生きている coverage の lease) 間は積まずに throw (#1567 Codex R2 High 2)。
+ *      同じ BEGIN IMMEDIATE の取引の中で lease を見る = coordinator が complete を送り終えて lease を放すまで積めない
  */
-export function queueMarker(db, norm, { sourceFileName = null, sourceFileHash, now = new Date() }) {
+export function queueMarker(db, norm, { sourceFileName = null, sourceFileHash, now = new Date(), isAlive = isAliveNodeSince }) {
   const normJson = JSON.stringify(norm);
   const queueKey = canonicalSha256({ format: MARKER_FORMAT, norm: JSON.parse(normJson), source_file_hash: sourceFileHash });
   return db.transaction(() => {
+    assertNoLiveCoverageLease(db, { isAlive, what: '初期の印' });
     const same = db.prepare(`SELECT id FROM initial_marker_queue WHERE queue_key = ? AND applied_at IS NULL AND failed_at IS NULL`).get(queueKey);
     if (same) return { queued: false, id: same.id };
     const r = db.prepare(`INSERT INTO initial_marker_queue (queue_key, source_file_name, source_file_hash, norm_json, detail_digest, queued_at) VALUES (?, ?, ?, ?, ?, ?)`)
@@ -213,7 +218,7 @@ export function parseArgs(argv) {
 }
 
 /** CLI の本体 (試験から呼ぶ)。db = warehouse.db (書く接続) */
-export function runMarkerCli(db, a, { log = console.log, now = new Date() } = {}) {
+export function runMarkerCli(db, a, { log = console.log, now = new Date(), isAlive = isAliveNodeSince } = {}) {
   if (a.list) {
     const hs = db.prepare(`SELECT * FROM initial_marker_headers ORDER BY evidence_epoch`).all();
     for (const h of hs) log(`  epoch ${h.evidence_epoch} ${h.marker_id}: [${h.verified_from}, ${h.verified_through}) 撮影 ${h.captured_at}・決済 ${h.settlement_count}・digest ${h.marker_digest.slice(0, 12)}…`);
@@ -235,7 +240,7 @@ export function runMarkerCli(db, a, { log = console.log, now = new Date() } = {}
   const summary = { match: cmp.filter((c) => c.status === 'match').length, missing: cmp.filter((c) => c.status === 'missing_in_sqlite').length, differs: cmp.filter((c) => c.status === 'differs').length };
   log(`[marker] 突き合わせ: 一致 ${summary.match} / SQLite に無い ${summary.missing} (手で取り込む = amazon-settlement-manual-file.js) / 違う ${summary.differs}`);
   if (!a.queue) { log('[marker] dry-run (積まない)。積むなら --queue'); return { queued: false, norm, summary }; }
-  const q = queueMarker(db, norm, { sourceFileName: path.basename(a.file), sourceFileHash: fileHash, now });
+  const q = queueMarker(db, norm, { sourceFileName: path.basename(a.file), sourceFileHash: fileHash, now, isAlive });
   log(q.queued ? `[marker] ✅ 順番待ちに積んだ (#${q.id})。次の coordinator の回が Render の coverage を updating にした後に新しい epoch で入れ、その回から印の後の一覧の回を積み上げる` : `[marker] 同じ印は積んである (#${q.id})`);
   return { queued: q.queued, queueId: q.id, norm, summary };
 }

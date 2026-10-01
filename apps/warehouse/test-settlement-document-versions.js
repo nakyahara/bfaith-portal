@@ -138,7 +138,11 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
   const sql = db.prepare(`SELECT settlement_id, document_version_seq FROM v_amazon_settlement_selected_documents`).all();
   ok(sql.length === js.size && sql.every((r) => js.get(r.settlement_id) && js.get(r.settlement_id).seq === r.document_version_seq), `🚨 採る版: JS の selectDocumentVersions = SQL の view (${sql.length} 決済・層 → 新しい順 → ID のバイトの順)`);
   // 手で: 層 1 が 2 より先 (manual が新しくても) / 同じ層・同じ時刻 = ID の小さい方
-  const pick = (vs) => V.selectDocumentVersions(vs.map((v, i) => ({ settlement_id: 'X', seq: i, detail_valid: 1, ...v }))).get('X')?.seq ?? null;
+  const pick = (vs) => V.selectDocumentVersions(vs.map((v, i) => ({ settlement_id: 'X', seq: i, detail_valid: 1, header_count: 1, ...v }))).get('X')?.seq ?? null;
+  // 🚨 採る版に要る列が欠けた行を渡すと throw (#1567 Codex R2 High 1: 送り手の SQL に header_count が無く、黙って別の版を採っていた)
+  throws(() => V.selectDocumentVersions([{ settlement_id: 'X', seq: 1, document_version_id: 'a', source_layer: 'sp_api_v1', ingested_at: '2026', detail_valid: 1 }]), /header_count/,
+    '🚨 selectDocumentVersions の入口: 列 (header_count) が欠けた版の行は throw (呼び手ごとに列の集まりが違うと採る版が変わる)');
+  ok(V.VERSION_SELECT_COLUMNS.includes('header_count') && V.VERSION_SELECT_COLUMNS.includes('detail_valid'), '採る版に要る列 = detail_valid・header_count を含む');
   ok(pick([{ source_layer: 'manual_csv', ingested_at: '2027', document_version_id: 'a' }, { source_layer: 'sp_api_v2', ingested_at: '2026', document_version_id: 'b' }]) === 1, '層 1 (API) が manual より先 (manual が新しくても)');
   ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'b' }, { source_layer: 'sp_api_v2', ingested_at: '2026', document_version_id: 'a' }]) === 1, 'V1 と V2 は同じ順位 → 同じ時刻なら ID のバイトの順');
   ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'a' }, { source_layer: 'sp_api_v2', ingested_at: '2027', document_version_id: 'b', detail_valid: 0 }]) === 0, '🚨 中身の悪い新しい版 (detail_valid 0) は良い旧い版を押しのけない (#1567 R1 Medium 3)');

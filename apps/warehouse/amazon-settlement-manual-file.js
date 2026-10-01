@@ -12,6 +12,7 @@
  * 使い方:
  *   node apps/warehouse/amazon-settlement-manual-file.js --file 2025-12-29_settlement.txt           → 読んで確かめるだけ (dry-run)
  *   node apps/warehouse/amazon-settlement-manual-file.js --file 2025-12-29_settlement.txt --queue   → 順番待ちに積む (次の coordinator の回で入る)
+ *     🚨 coordinator の回が動いている (生きている coverage の lease) 間は積まずに拒む = 回が終わってから積み直す (#1567 Codex R2 High 2)
  *   node apps/warehouse/amazon-settlement-manual-file.js --list                                     → 順番待ちの一覧
  *   形式は 1 行目の列で決める (amount-type があれば V2)。--format v1|v2 で指定もできる
  * env: DATA_DIR (必須)
@@ -22,7 +23,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { prepareReportTsv, prepareV2ReportTsv, ingestSettlement } from './fetch-amazon-settlements.js';
-import { assertLease } from './amazon-settlement-versions.js';
+import { assertLease, assertNoLiveCoverageLease } from './amazon-settlement-versions.js';
+import { isAliveNodeSince } from './retry-lock.js';
 
 export const MANUAL_DIR = 'amazon-settlement-manual';
 const sha = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
@@ -69,17 +71,23 @@ export function apiVersionsOf(db, settlementId) {
   return db.prepare(`SELECT seq, source_layer, report_id FROM amazon_settlement_document_versions WHERE settlement_id = ? AND source_layer IN ('sp_api_v1', 'sp_api_v2') ORDER BY seq`).all(settlementId);
 }
 
-/** 順番待ちに積む (ファイルを DATA_DIR に写す + 表に 1 行)。同じ file hash は 1 回だけ。戻りの apiVersions があれば呼び手は警告を出す */
-export function queueManualFile(db, dataDir, tsv, { fileName, format = null, now = new Date() }) {
+/**
+ * 順番待ちに積む (ファイルを DATA_DIR に写す + 表に 1 行)。同じ file hash は 1 回だけ。戻りの apiVersions があれば呼び手は警告を出す
+ *   🚨 coordinator の回が動いている (生きている coverage の lease) 間は積まずに throw (初期の印と同じ・#1567 Codex R2 High 2)
+ */
+export function queueManualFile(db, dataDir, tsv, { fileName, format = null, now = new Date(), isAlive = isAliveNodeSince }) {
   const x = inspectManualFile(tsv, { fileName, format });
   if (!x.ok) throw new Error(`取り込めない: ${x.problems.join(' / ')}`);
   x.apiVersions = apiVersionsOf(db, x.settlementId);
   const dir = path.join(dataDir, MANUAL_DIR);
-  fs.mkdirSync(dir, { recursive: true });
   const stored = path.join(dir, `${x.fileHash}.txt`);
-  fs.writeFileSync(stored, tsv.replace(/^﻿/, ''));
-  const r = db.prepare(`INSERT OR IGNORE INTO amazon_settlement_manual_files (file_hash, file_name, stored_path, format, settlement_id, queued_at) VALUES (?, ?, ?, ?, ?, ?)`)
-    .run(x.fileHash, fileName, stored, x.format, x.settlementId, now.toISOString());
+  const r = db.transaction(() => {
+    assertNoLiveCoverageLease(db, { isAlive, what: '手の決済のファイル' });
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(stored, tsv.replace(/^﻿/, ''));
+    return db.prepare(`INSERT OR IGNORE INTO amazon_settlement_manual_files (file_hash, file_name, stored_path, format, settlement_id, queued_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(x.fileHash, fileName, stored, x.format, x.settlementId, now.toISOString());
+  }).immediate();
   return { ...x, queued: r.changes === 1, storedPath: stored };
 }
 

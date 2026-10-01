@@ -24,7 +24,9 @@
  *   ⑤ 送り手 (amazon-finance.mjs) = 渡された世代・token を全部の chunk に付ける。coverage の回は --full (全部の注文を変換 = receipt digest)。
  *      走査の同じ読み取りの取引の中で manifest を計算 (amazon-finance-coverage.js)・送れた注文の「読み直す注文」を R 以下だけ消す
  *   ⑥ 完成の判定 (completionBlockers) → complete の直前に source_revision と初期の印 (id・epoch・digest・順番待ち) を読み直す (manifest と違えば送らない)・lease がまだ自分のものか確かめる → complete
- *      (1 回 30 秒・3 回まで)。一覧・合計・receipt digest・版・採った文書・policy の指紋が全部そろったときだけ
+ *      (1 回 30 秒・3 回まで)。一覧・合計・receipt digest・版・採った文書・policy の指紋が全部そろったときだけ。
+ *      🚨 complete の POST が終わるまで lease を持ち続ける = 人が積む入口 (印・手のファイルの --queue) は生きている lease の間は積まない (#1567 Codex R2 High 2)。
+ *      POST の後にもう一度 印・順番待ち・source_revision を読み直し、変わっていれば新しい世代の updating で complete を取り消す (❌・lease が切れた場合の保険)
  *   途中で落ちる・PC が止まる = Render は updating のまま (fail-closed = 正式な利益は null)
  *
  * 使い方 (daily-sync・retry と同じ):
@@ -115,7 +117,7 @@ const latestEpoch = (db) => db.prepare(`SELECT MAX(evidence_epoch) e FROM initia
 /**
  * 1 回を回す (main と試験から)。戻り = { exitCode, summary, mode, generation, ingest, push, coverage, reasons }
  * deps: dataDir・source ('v2' | 'v1')・dryRun・fetchImpl・base・syncKey・sp / inventorySp / downloadTsv (SP-API)・now・isAlive (lease の持ち主の判定)・log・
- *       capacity (容量の見張り・既定 = env)・chunkSize・sleep・businessDate (legacy の曜日)・hooks { afterUpdating(db), beforeComplete(db) } (試験の差し込み口)
+ *       capacity (容量の見張り・既定 = env)・chunkSize・sleep・businessDate (legacy の曜日)・hooks { afterUpdating(db), beforeComplete(db), beforeCompletePost(db) } (試験の差し込み口)
  */
 export async function runCoverage({
   dataDir, source = 'v2', dryRun = false, fetchImpl = fetch, base, syncKey, sp, inventorySp = null, downloadTsv = null, now = () => new Date(),
@@ -305,7 +307,7 @@ export async function runCoverage({
       const codes = [...new Set(out.reasons.map((x) => x.code))];
       const human = out.reasons.length > 0 && out.reasons.every((x) => x.human) && !cov.error;
       const broken = codes.filter((c) => DATA_BROKEN_CODES.has(c));
-      covPart = `coverage: ${human ? '⚠️' : '❌'} complete にしない (世代 ${generation} は updating のまま = 正式な利益は null) ${broken.length ? `🚨 決済のデータが壊れている疑い (${broken.join(', ')}) = 人が確かめる / ` : ''}理由 ${codes.join(', ')}${cov.error ? ` / ${cov.error}` : ''}`;
+      covPart = `coverage: ${human ? '⚠️' : '❌'} ${cov.revoked ? `complete を取り消した (世代 ${cov.revoked.from} の complete → 世代 ${cov.revoked.to} の updating = 正式な利益は null)` : `complete にしない (世代 ${generation} は updating のまま = 正式な利益は null)`} ${broken.length ? `🚨 決済のデータが壊れている疑い (${broken.join(', ')}) = 人が確かめる / ` : ''}理由 ${codes.join(', ')}${cov.error ? ` / ${cov.error}` : ''}`;
       if (!human) out.exitCode = 1;
       for (const x of out.reasons.slice(0, 15)) log(`  [coverage] ${x.human ? '⚠️' : '❌'} ${x.code}: ${String(x.detail || '').slice(0, 300)}`);
     }
@@ -363,14 +365,37 @@ function coverageHooks({ db, lease, generation, policy, fetchImpl, base, syncKey
       try { manifest = validateCoverageManifest(scanSnapshot.manifest, { now: now() }); } catch (e) { return { complete: false, reasons: [{ code: 'manifest_invalid', detail: e.message, human: false }] }; }
       try { db.transaction(() => check(db)).immediate(); } catch (e) { return { complete: false, reasons: [{ code: 'lease_lost', detail: e.message, human: false }], error: e.message }; }
       const requestHash = coverageRequestHash({ companyId: COMPANY_ID, mall: FINANCE_MALL, scopeKey: FINANCE_SCOPE, source: FINANCE_SOURCE, generation: String(generation), runToken, manifest });
+      // 🚨 ここから complete の POST が終わるまで lease を持ち続ける (放すのは runCoverage の最後)。
+      //    人が積む入口 (印・手のファイルの --queue) は生きている lease の間は積まない = 最後の確かめと POST の間に印は積まれない (#1567 Codex R2 High 2 a)
+      if (hooks.beforeCompletePost) await hooks.beforeCompletePost(db);
+      let resp;
       try {
-        const resp = await postCoverage(fetchImpl, { base, syncKey, sleep, log, body: { state: 'complete', mall: FINANCE_MALL, scope: FINANCE_SCOPE, source: FINANCE_SOURCE, generation: String(generation), run_token: runToken, manifest, request_hash: requestHash } });
-        if (resp.state !== 'complete' || (resp.status !== 'applied' && resp.status !== 'same')) return { complete: false, reasons: [{ code: 'complete_rejected', detail: JSON.stringify(resp).slice(0, 300), human: false }], error: `complete が ${resp.status}` };
-        log(`[coverage] ✅ complete (世代 ${generation}・complete_to ${manifest.complete_to}・${resp.status})`);
-        return { complete: true, complete_to: resp.complete_to ?? manifest.complete_to, status: resp.status, manifest, requestHash, reasons: [] };
+        resp = await postCoverage(fetchImpl, { base, syncKey, sleep, log, body: { state: 'complete', mall: FINANCE_MALL, scope: FINANCE_SCOPE, source: FINANCE_SOURCE, generation: String(generation), run_token: runToken, manifest, request_hash: requestHash } });
       } catch (e) {
         return { complete: false, reasons: [{ code: 'complete_post', detail: e.message, human: false }], error: `complete を送れない: ${String(e.message).slice(0, 200)}` };
       }
+      if (resp.state !== 'complete' || (resp.status !== 'applied' && resp.status !== 'same')) return { complete: false, reasons: [{ code: 'complete_rejected', detail: JSON.stringify(resp).slice(0, 300), human: false }], error: `complete が ${resp.status}` };
+      // 🚨 POST の後にもう一度 印・順番待ち・source_revision を読み直す (lease が POST の途中で切れた・lease を見ない書き手の保険・#1567 Codex R2 High 2 b)。
+      //    変わっていれば、すぐに新しい世代の updating を送って complete を取り消す (Render は同じ世代の complete → updating を受けない)
+      const after = completionBlockers({ r, snapshot: scanSnapshot, retryLeft: 0, dirtyLeft: 0, sourceRevisionNow: V.readSourceRevision(db), unkeyed: 0, pseudoBlocked: 0,
+        markerNow: latestMarker(db), markersPending: pendingMarkerCount(db) });
+      if (after.length) {
+        const g2 = BigInt(generation) + 1n;
+        log(`[coverage] 🚨 complete の後に ${after.map((x) => x.code).join(', ')} = 世代 ${g2} の updating で complete を取り消す`);
+        try {
+          // 世代と token は HTTP の前に台帳へ (③ と同じ規則)。lease は切れているかもしれないので書かない (次の回は台帳と Render の世代の大きい方 + 1)
+          ledger.setMeta({ [LEDGER_META.generation]: String(g2), [LEDGER_META.run]: JSON.stringify({ generation: String(g2), run_token: runToken, started_at: now().toISOString(), state: 'updating', revoked_complete_of: String(generation) }) });
+          const u = await postCoverage(fetchImpl, { base, syncKey, sleep, log, body: { state: 'updating', mall: FINANCE_MALL, scope: FINANCE_SCOPE, source: FINANCE_SOURCE, generation: String(g2), run_token: runToken } });
+          if (u.status !== 'applied' && u.status !== 'same') throw new Error(`updating が ${u.status} (Render の今の世代 ${u.current_generation ?? '-'})`);
+          return { complete: false, revoked: { from: String(generation), to: String(g2) },
+            reasons: [...after, { code: 'complete_revoked', detail: `complete (世代 ${generation}) の後に印・順番待ち・生の表が変わった = 世代 ${g2} の updating で取り消した = 次の回で拾う`, human: false }] };
+        } catch (e) {
+          return { complete: false, reasons: [...after, { code: 'complete_revoke_failed', detail: `🚨 complete (世代 ${generation}) を取り消せない: ${e.message}`, human: false }],
+            error: `🚨 complete の後に中身が変わったのに取り消せない (Render は古い中身の complete のまま): ${String(e.message).slice(0, 200)}` };
+        }
+      }
+      log(`[coverage] ✅ complete (世代 ${generation}・complete_to ${manifest.complete_to}・${resp.status})`);
+      return { complete: true, complete_to: resp.complete_to ?? manifest.complete_to, status: resp.status, manifest, requestHash, reasons: [] };
     },
   };
 }
