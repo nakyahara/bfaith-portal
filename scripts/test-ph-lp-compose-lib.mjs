@@ -1,4 +1,5 @@
 import { temporaryTestDataDir } from './test-temp-dir.mjs';
+import { compositionFor, fixture, FIXTURES } from './fixtures/lp-compose/index.mjs';
 await temporaryTestDataDir(import.meta.url, 'test-lp-compose-lib-');
 /**
  * LP 構成の AI 生成 — 依頼・固定 packet・予約・結果 (apps/product-hub/lib/lp-compose.js・段階1)
@@ -90,7 +91,10 @@ ok(lp.releaseJob(db, c2.job.job_id, { leaseToken: c2.job.lease_token, now: min(0
   '🚨 予約後に release は使えない (二重に呼べてしまう)');
 
 console.log('⑥ 結果 — accepted');
-const OUT = '# LP制作システム V2.1\n\n## ⑦ AI画像生成プロンプト\n… 本文 …';
+// 🚨 PR1-c から **lint はサーバが実行してそれが正本**なので、
+// accepted を受け取らせるには **本当に lint を通る本文** が要る (ダミー文字列では通らない)。
+// draft 名は 'ハッカ油スプレー NL' なので、共通の接頭辞を入れておけば検査 17 を通る
+const OUT = compositionFor('ハッカ油スプレー');
 // packet に画像があるので accepted には証跡が要る (codex exec review R2 P2)
 const LINT = { ok: true, checks: {} };
 // 証跡はサーバが配ったときに記録する (実行役からは受け取らない)
@@ -312,14 +316,18 @@ lp.requestJob(db, args(dN, s2.spec, 'key-0001', { now: min(110) }));
 const cN = lp.claimJob(db, { runnerRunId: 'run-21', now: min(110) });
 const gN = lp.reserveGeneration(db, cN.job.job_id, { leaseToken: cN.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(110) });
 serve(cN.job, min(110));
-eq(lp.submitResult(db, gN.generation_id, {
-  packetHash: cN.job.packet_hash, verdict: 'accepted', output: OUT,
-  receipt: { images: [{ file_id: 'OTHERFILE999', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
-}).code, 'bad_request', '🚨 渡していない画像を証跡に混ぜられない (R7 #2)');
-eq(lp.submitResult(db, gN.generation_id, {
+// 🚨 このテストは PR1-c で書き直した。以前は「OTHERFILE999 を混ぜると bad_request」を
+//    見ているつもりだったが、実際には `lint` を渡していなかったから落ちていただけで、
+//    **証跡の検査は何も見ていなかった** (P1 で証跡をサーバ記録に移したときから)。
+//    いまの保証は「**送られた receipt はそもそも使わない**」なので、そちらを固定する。
+const subN = lp.submitResult(db, gN.generation_id, {
   packetHash: cN.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: LINT,
-  receipt: { images: [{ file_id: 'FILEID000001', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
-}).status, 'done', 'サーバが配っていれば通る (送った receipt は使われない)');
+  receipt: { images: [{ file_id: 'OTHERFILE999', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
+});
+eq(subN.status, 'done', 'サーバが配っていれば通る');
+eq(subN.receipt.images.length, 1, '証跡は 1 枚');
+eq(subN.receipt.images[0].file_id, 'FILEID000001',
+  '🚨 証跡は**サーバが配った記録**。送ってきた OTHERFILE999 は使われない (R7 #2 の今の形)');
 
 console.log('⑯ R9 の修正');
 // #1 同じキーの再送は、材料の検証より先に既存 job を返す

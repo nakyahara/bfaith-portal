@@ -70,7 +70,7 @@
   },
 
   "_notes": {
-    "allow ./phlp": "queue/claim(常に1件)/images/reserve/result/fail/release/checkreview/clean。ファイル引数は work/ 直下の out-*.md / lint-*.json / reason-*.txt だけ。画像は img-<ID>-<n>.jpg 固定で、サーバもその依頼の packet に固定済みのものしか配らない",
+    "allow ./phlp": "queue/claim(常に1件)/images/reserve/lint/result/fail/release/checkreview/reviewdata/clean。ファイル引数は **その依頼の** out-<ID>.md / lint-<ID>.json / reason-<ID>.txt だけ (ID が違うファイルは読まない)。lint の正本はサーバ側 (PR1-c)。画像は img-<ID>-<n>.jpg 固定で、サーバもその依頼の packet に固定済みのものしか配らない",
     "allow ./phlpreview": "Codex 検品 (LP 構成)。引数は依頼 ID だけ。プロンプト固定・渡すデータは phlp reviewdata が組み立てる (材料① 商品の情報 + 材料② seen-<ID>.md + 構成案) ・ラッパーが stdin で渡す・--sandbox read-only 固定・timeout 600 秒",
     "deny state/": "lease と packet_hash と検品用の材料は work/ の外 (C:\\tools\\ph-nightly\\state) に置く。work/ は Read/Write/Edit を許しているので、そこに置くと「Claude には見せない」が嘘になる (codex exec review P2)。ACL では分けられない — claude も phlp も同じ bfaith で走るので、効いているのは「作業ディレクトリの外」+「deny」の 2 つ",
     "allow ./phq": "queue/claim(常に1件)/block/release/submit/fetch/extract/find/lint/search-amazon/clean。ファイル引数は work/ 直下の page-*.html / copy-*.json / reason-*.txt だけ",

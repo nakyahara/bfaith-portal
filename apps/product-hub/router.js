@@ -127,6 +127,7 @@ import {
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
   lpComposeImageRef, recordImageServed as recordLpComposeImageServed, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
+  lintForJob as lintLpComposeForJob,
 } from './lib/lp-compose.js';
 import { assertXlsxExpandsSafely, XlsxTooLargeError } from './lib/xlsx-guard.js';
 import { abaConfigured, lookupAbaTerms, lookupAbaTopAsins } from './lib/aba-client.js';
@@ -3862,7 +3863,7 @@ function lpComposeMaterial(db, draft) {
 //    長さだけ先に見て、形の判定は lib に任せる。
 // lp-compose 固有の code を HTTP に対応づける (ad-kw-ai の表に無いもの)。
 // 🚨 disabled を落とすと「機能が無効」が 400 に見え、実行役が「依頼が壊れている」と誤解する
-const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, already_generated: 409, job_finalized: 409, already_running: 409 };
+const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, already_generated: 409, job_finalized: 409, already_running: 409, lint_failed: 422 };
 const lpComposeFail = (res, r) => res.status(LP_COMPOSE_HTTP[r.code] || 400).json({ ok: false, code: r.code, error: r.error });
 const rawField = (v, maxLen) => (typeof v === 'string' && v.length <= maxLen ? v : null);
 // 🚨 共有の intParam は Number.parseInt なので "12abc" を 12 として通す。
@@ -3914,6 +3915,17 @@ serviceApiRouter.post('/lp-compose/jobs/:id/fail', (req, res) => {
   });
   if (!r.ok) return lpComposeFail(res, r);
   res.json({ ok: true, status: r.status });
+});
+
+// 構成を lint するだけ (結果は確定しない・PR1-c)。
+// 🚨 **AI 枠を消費しない**ので何度でも呼べる。実行役はこれを見て自分で直してから result を出す。
+// これが無いと result で断られて初めて lint 結果を知ることになり、generation を 1 回で使い切る
+serviceApiRouter.post('/lp-compose/jobs/:id/lint', express.json({ limit: '1mb' }), (req, res) => {
+  const r = lintLpComposeForJob(getDB(), lpIdParam(req.params.id), {
+    leaseToken: rawField(req.body?.lease_token, 100), output: req.body?.output,
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json({ ok: true, lint: r.lint });
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/release', (req, res) => {
