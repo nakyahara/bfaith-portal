@@ -226,7 +226,10 @@ export function setMallState(
     if (info.changes !== 1) return null;
     if (event) logEvent(db, id, 'mall_changed', event, actor);
     const settled = syncListingStep(db, id, actor);
-    syncImageRakutenStep(db, id, code, actor);
+    // 🚨 **状態が done に変わったときだけ**。毎回の更新で呼ぶと、すでに done の楽天モールの
+    //    URL やメモを直しただけで ⑧ が閉じ直され、「画像を直して楽天に出し直す」ために
+    //    人が開いた ⑧ が消える (Codex R7 P1)
+    if (stateChanged && params.state === 'done') syncImageRakutenStep(db, id, code, actor);
     // 楽天モールの done/undone と工程「出品・展開」の開閉は status (listed/expanded) を
     // 左右するので、同じトランザクションで導出し直す (PR4)
     if (stateChanged) recomputeDraftStatus(db, id, { actor });
@@ -251,6 +254,8 @@ export function setMallState(
  *
  * 一方向にする (モールを未着手に戻しても ⑧ は開けない) のは、⑧ を開くかどうかは
  * 画像の作業の話で、ボードの D&D で人が決める方が実態に合うため。
+ * 呼ぶのは**モールの状態が done に変わった瞬間だけ** — すでに done の行の URL やメモを
+ * 直したときにも呼ぶと、人が開き直した ⑧ を黙って閉じてしまう。
  * fail-soft: ここで失敗してもモールの更新は成功しているので throw しない。
  */
 function syncImageRakutenStep(db, draftId, mall, actor) {

@@ -3638,8 +3638,19 @@ const ms = await import('../lib/mall-status.js');
     // 一方向 (モールを戻しても ⑧ は開けない。開くかどうかはボードの D&D で人が決める)
     ms.setMallState(idMx, 'rakuten', { state: 'todo' }, 'admin', ADMIN);
     check('楽天モールを戻しても ⑧楽天登録 は開かない (一方向の連動)', rkStepOf() === 'done', rkStepOf());
+    // 🚨 閉じるのは「done に変わった瞬間」だけ (Codex R7 P1)。すでに done の楽天モールの
+    //    URL やメモを直しただけで閉じ直すと、「画像を直して楽天に出し直す」ために人が開いた
+    //    ⑧ が黙って消える
+    ms.setMallState(idMx, 'rakuten', { state: 'done' }, 'admin', ADMIN);
+    db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idMx);
+    ms.setMallState(idMx, 'rakuten', { item_url: 'https://item.rakuten.co.jp/b-faith/wf-mall-rk/' }, 'admin', ADMIN);
+    check('🚨 すでに完了の楽天モールの URL を直しただけでは ⑧楽天登録 を閉じ直さない (出し直しの作業が消えない)',
+      rkStepOf() === 'todo', rkStepOf());
+    ms.setMallState(idMx, 'rakuten', { note: 'メモだけ更新' }, 'admin', ADMIN);
+    check('メモだけの更新でも ⑧楽天登録 を閉じ直さない', rkStepOf() === 'todo', rkStepOf());
     // 「対象外」にしてあった ⑧ は上書きしない (人が決めた予定を消さない)
     db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idMx);
+    ms.setMallState(idMx, 'rakuten', { state: 'todo' }, 'admin', ADMIN);
     ms.setMallState(idMx, 'rakuten', { state: 'done' }, 'admin', ADMIN);
     check('⑧楽天登録 が「対象外」なら自動完了で上書きしない', rkStepOf() === 'skip', rkStepOf());
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idMx);
