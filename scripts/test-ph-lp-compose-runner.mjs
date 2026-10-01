@@ -123,6 +123,10 @@ ok(inState(`lease-${jid}.json`), 'lease は work/ の外 (state/) に閉じる')
 ok(fs.readFileSync(path.join(work, `spec-${jid}.md`), 'utf8').includes('取込互換'), '仕様書の中身が入っている');
 eq(cl.json.packet.images, 1, '商品画像の枚数が分かる');
 ok(cl.json.packet.product_info.includes('ハッカ油'), '商品情報が来る');
+// 🚨 スタッフの定型文と同じ指示文が実行役に届く (設計 §5)。
+//    届かないと、実行役はスキルの言い回しを読むことになり、測定が「同じ入力の比較」にならない
+ok(cl.json.instruction && cl.json.instruction.includes('⑦ AI画像生成プロンプトのみを出力'),
+  '🚨 claim にスタッフと同じ指示文が付いてくる');
 
 console.log('③ images — Drive が無い環境では取れないことが分かる');
 const im = await phlp('images', jid);
