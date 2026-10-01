@@ -513,14 +513,22 @@ router.get('/recommendations-inbound-cache', async (req, res) => {
 
 // ミニPC→Render 同期用: 最新日付のPLANNINGスナップショットとFNSKU一覧（全SKU、null含む）を返す
 router.get('/sync/latest-planning', dbHandler(async (req, res, db) => {
-  const rows = db.getLatestSnapshots();
-  const snapshotDate = rows[0]?.snapshot_date || null;
   // Sheet なしのモードの Render は ?fnsku_source=attrs で頼む (⑦-F): FNSKU は fba_sku_attrs からだけ返す (sku_mapping の値を渡さない)。
-  //   付いていなければ今までどおり
-  const fromAttrs = req.query?.fnsku_source === 'attrs';
+  //   🚨 miniPC が Sheet の入出力を止めている (FBA_SHEETLESS_IO) ときは、頼み方に関わらず fba_sku_attrs から返す
+  //      (sku_mapping はもう FNSKU を書かない = 凍結。古い Render が ? を付けずに頼んでも古い FNSKU を渡さない。Codex PR R3 Medium 1)
+  //   どちらでもなければ今までどおり
+  const ioOn = isSheetlessIoRequested();
+  const fromAttrs = req.query?.fnsku_source === 'attrs' || ioOn;
   // miniPC の fba.db に一回限りの移行の印が無い = 起動のたびに Sheet の値が fba_sku_attrs に入る / 最後の backfill が済んでいない
   //   → fba_sku_attrs をまだ正にできない (fnsku_ready: false。Render は反映しない・9:40 は partial。Codex PR R2 Medium 1)
   const attrsReady = fromAttrs ? !!db.getBackfillMark() : null;
+  // 🚨 入出力を止めたのに印が無い = fba_sku_attrs が欠けているかもしれない → どの Render にも FNSKU を渡さない (503 = 引き取りそのものが失敗)
+  if (ioOn && !attrsReady) {
+    errorResponse(res, { status: 503, error: 'FBA_SHEETLESS_NOT_READY', message: 'miniPC は FBA_SHEETLESS_IO=1 だが fba.db に一回限りの移行の印が無い。scripts/fba-sheetless-backfill-once.mjs を IO を外して流してから入れ直す', requestId: req.requestId });
+    return undefined;
+  }
+  const rows = db.getLatestSnapshots();
+  const snapshotDate = rows[0]?.snapshot_date || null;
   // 全SKU対象（fnsku=nullも含む）。Render側で現状に合わせてupsert（null時はクリア）
   const fnskus = fromAttrs
     ? db.getFbaSkuAttrs().filter(a => a.amazon_sku).map(a => ({ sku: a.amazon_sku, fnsku: a.fnsku || null }))

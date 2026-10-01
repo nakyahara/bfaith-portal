@@ -798,7 +798,7 @@ router.get('/api/recommendation-health', (req, res) => {
  * 中身は GET の今までの処理そのまま (⑦-F で切り出しただけ)
  * @returns {Promise<{ status: number, body: object }>}
  */
-async function recommendationsResponse(req) {
+async function recommendationsResponse(req, { skipPersistOnErrors = false } = {}) {
     const debug = req.query.debug === '1' || req.query.debug === 'true';
     const inboundOverride = await getInboundWorkingData();
     const result = generateRecommendations(debug, inboundOverride);
@@ -834,7 +834,8 @@ async function recommendationsResponse(req) {
       // 保存は「明示的に推奨生成した時(?persist=1)」のみ。画面リロード/タブ操作/補助fetchでは
       // 保存しない → 「前回」が数秒前の同一結果になって一致率検知が無意味化&ログ汚染するのを防ぐ。
       const persist = req.query.persist === '1' || req.query.persist === 'true';
-      if (persist) {
+      // Sheet なしのモードの Step4 (recalculate) は、計算できなかった回 (errors あり) を健全性の記録 (前回) に残さない (Codex PR R3 Medium 2)。GET は今までどおり
+      if (persist && !(skipPersistOnErrors && (result.errors || []).filter(Boolean).length)) {
         saveRecommendationRun({
           working_sku_count: result.health.working_sku_count,
           working_qty_total: result.health.working_qty_total,
@@ -873,7 +874,8 @@ const provisionalFingerprint = () => JSON.stringify(getProvisionalItems());
 /**
  * Sheet なしのモードの Step4 (⑦-F・Codex PR R1 High 1 / R2 Medium 2): 計算と「Amazon 仮確定」の消去を 1 つの POST に。
  *   - モードなしは 400 (使わない。モードなしの画面は今までどおり DELETE /api/provisional → GET /api/recommendations)
- *   - 始めに仮確定の中身を控え、計算できて (止まらず・警告なし) 中身が変わっていないときだけ、応答の直前に消す
+ *   - 始めに仮確定の中身を控え、計算できて (止まらず・errors なし) 中身が変わっていないときだけ、応答の直前に消す
+ *   - 計算できなかった (errors あり) ときは 503 (健全性の記録にも残さない)
  *   - 計算の間に仮確定が変わっていたら消さずに 409 (一覧も返さない = 画面は今のまま)。止まった日は 503 で消さない
  */
 router.post('/api/recommendations/recalculate', async (req, res) => {
@@ -881,14 +883,16 @@ router.post('/api/recommendations/recalculate', async (req, res) => {
   try {
     const before = provisionalFingerprint();
     if (_routerTestHooks.afterRecalcFingerprint) await _routerTestHooks.afterRecalcFingerprint();
-    const out = await recommendationsResponse(req);
+    const out = await recommendationsResponse(req, { skipPersistOnErrors: true });
     if (out.status !== 200) return res.status(out.status).json({ ...out.body, provisional_cleared: false });
-    const ok = !(out.body.errors || []).filter(Boolean).length;
-    if (ok && provisionalFingerprint() !== before) {
+    // ふつうの計算の失敗 (スナップショットが無い など) も 2xx にしない = 画面は一覧・選んだ SKU・数量をそのまま残す (Codex PR R3 Medium 2)
+    const errors = (out.body.errors || []).filter(Boolean);
+    if (errors.length) return res.status(503).json({ error: errors.join(' / '), errors, calc_failed: true, provisional_cleared: false });
+    if (provisionalFingerprint() !== before) {
       return res.status(409).json({ error: '計算している間に「Amazon 仮確定」が変わったので消していない (一覧も出していない)。もう一度 Step4 を押す', provisional_changed: true, provisional_cleared: false });
     }
-    if (ok) clearProvisionalItems();
-    out.body.provisional_cleared = ok;
+    clearProvisionalItems();
+    out.body.provisional_cleared = true;
     res.json(out.body);
   } catch (e) {
     console.error('[FBA] 推奨リスト生成エラー (recalculate):', e);

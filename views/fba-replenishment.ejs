@@ -980,8 +980,10 @@
         const d = await res.json();
         if (d.error) { log('エラー: ' + d.error + (sheetlessSafeOrder ? ' (Amazon仮確定・選んだ SKU・数量は消していません)' : '')); return; }
         if (sheetlessSafeOrder) {
+          // 仮確定を消せた (= 計算できた) ときだけ、選んだ SKU・数量と一覧を入れ替える (Codex PR R3 Medium 2)
+          if (d.provisional_cleared !== true) { log('エラー: 計算できなかった (Amazon仮確定・選んだ SKU・数量・一覧はそのまま)'); return; }
           resetSelection();
-          if (d.provisional_cleared) log('Amazon仮確定データをクリアしました');
+          log('Amazon仮確定データをクリアしました');
         }
         if (d.errors && d.errors.length) { d.errors.forEach(e => log('警告: ' + e)); }
         recData = d.items || [];

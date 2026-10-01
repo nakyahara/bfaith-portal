@@ -802,8 +802,8 @@ await t('Step4 (モードなし): POST の口は 400・GET に clear_provisional
 });
 await t('Step4 の画面: モードありは先に消さず POST で頼み、止まったら選んだ SKU・数量も残す / モードなしは今までどおり DELETE → GET (同じ URL)', async () => {
   const page = async () => { const r = await realFetch(base + '/'); assert.equal(r.status, 200); return r.text(); };
-  /** 画面の calcRecommendations を取り出して、fetch を差し替えて 1 回押す (応答 = 計算が止まった 503) */
-  const press = (html) => {
+  /** 画面の calcRecommendations を取り出して、fetch を差し替えて 1 回押す (既定の応答 = 計算が止まった 503) */
+  const press = (html, recResponse = { error: '止まった', sheetless_blocked: true }) => {
     const start = html.indexOf('async function calcRecommendations()');
     const end = html.indexOf('// 推奨健全性バナー', start);
     assert.ok(start > 0 && end > start, '画面に calcRecommendations が無い');
@@ -813,18 +813,22 @@ await t('Step4 の画面: モードありは先に消さず POST で頼み、止
     const logEl = { dataset: /id="log" data-sheetless="1"/.test(html) ? { sheetless: '1' } : {} };
     const el = () => ({ style: {}, disabled: false, innerHTML: '', textContent: '' });
     const ctx = vm.createContext({
-      confirm: () => true, log: (m) => logs.push(m), BASE: '', selectedSkus, shipQtyMap,
+      confirm: () => true, log: (m) => logs.push(m), BASE: '', selectedSkus, shipQtyMap, recData: ['前の一覧'],
       document: { getElementById: (id) => (id === 'log' ? logEl : el()) },
-      fetch: async (url, opts) => { calls.push(`${(opts && opts.method) || 'GET'} ${url}`); return { json: async () => (String(url).includes('/api/recommendations') ? { error: '止まった', sheetless_blocked: true } : { success: true }) }; },
+      fetch: async (url, opts) => { calls.push(`${(opts && opts.method) || 'GET'} ${url}`); return { json: async () => (String(url).includes('/api/recommendations') ? recResponse : { success: true }) }; },
     });
     vm.runInContext(`${html.slice(start, end)}\nglobalThis.__press = calcRecommendations;`, ctx);
-    return ctx.__press().then(() => ({ calls, logs, selected: [...selectedSkus], qty: { ...shipQtyMap } }));
+    return ctx.__press().then(() => ({ calls, logs, selected: [...selectedSkus], qty: { ...shipQtyMap }, recData: ctx.recData }));
   };
   modeOn();
   const on = await press(await page());
   assert.deepEqual(on.calls, ['POST /api/recommendations/recalculate?debug=1&persist=1']);
   assert.ok(on.logs.some((m) => /Amazon仮確定・選んだ SKU・数量は消していません/.test(m)));
   assert.deepEqual([on.selected, on.qty], [['Alpha-1'], { 'Alpha-1': 3 }], '計算が止まったのに選んだ SKU・数量を消した');
+  // 2xx でも仮確定を消せていない (= 計算できていない) 応答なら、選んだ SKU・数量・一覧を入れ替えない (Codex PR R3 Medium 2)
+  const on2 = await press(await page(), { items: [], errors: ['スナップショットがありません'], provisional_cleared: false });
+  assert.deepEqual([on2.selected, on2.qty, on2.recData], [['Alpha-1'], { 'Alpha-1': 3 }, ['前の一覧']], '計算できていないのに一覧・選んだ SKU を入れ替えた');
+  assert.ok(on2.logs.some((m) => /計算できなかった/.test(m)));
   modeOff();
   const htmlOff = await page();
   assert.equal(htmlOff.includes('data-sheetless'), false, 'モードなしの画面に印が出ている');
@@ -865,8 +869,10 @@ await t('miniPC は FBA_SHEETLESS_IO=1 で入出力だけ止める (別のプロ
       "const server = http.createServer(app); await new Promise((r) => server.listen(0, '127.0.0.1', r));",
       "const res = await fetch(`http://127.0.0.1:${server.address().port}/fba/sync-sku-mappings`, { method: 'POST' });",
       "out.syncStatus = res.status; out.syncBody = await res.json();",
-      "const pl = await (await fetch(`http://127.0.0.1:${server.address().port}/fba/sync/latest-planning?fnsku_source=attrs`)).json();",
-      "out.ready = pl.fnsku_ready; out.notReady = pl.fnsku_not_ready_reason || null; out.fnskuSource = pl.fnsku_source;",
+      "const plRes = await fetch(`http://127.0.0.1:${server.address().port}/fba/sync/latest-planning?fnsku_source=attrs`); const pl = await plRes.json();",
+      "out.plStatus = plRes.status; out.ready = pl.fnsku_ready ?? null; out.notReady = pl.fnsku_not_ready_reason || pl.message || null; out.fnskuSource = pl.fnsku_source ?? null;",
+      "const nqRes = await fetch(`http://127.0.0.1:${server.address().port}/fba/sync/latest-planning`); const nq = await nqRes.json();",
+      "out.noQuery = { status: nqRes.status, source: nq.fnsku_source ?? null, io1: (nq.fnskus || []).find((f) => f.sku === 'Io-1')?.fnsku ?? null, error: nq.error ?? null };",
       "server.close();",
       "console.log('@@' + JSON.stringify(out));",
       "process.exit(0);",
@@ -885,12 +891,18 @@ await t('miniPC は FBA_SHEETLESS_IO=1 で入出力だけ止める (別のプロ
   assert.deepEqual(io.attrs, [['Io-1', 'X0IONEW', 'B0IONEW']], 'attrs だけに書く・起動時の backfill (Io-2) を流さない');
   assert.deepEqual([io.source, io.mappings], ['sheet', ['Io-1', 'Io-2']], '計算の読み方は今のまま (miniPC は計算しない)');
   assert.deepEqual([io.syncStatus, io.syncBody.error], [410, 'SHEETLESS_MODE']);
-  // 移行の印が無い miniPC は fba_sku_attrs をまだ正にできない (Codex PR R2 Medium 1)
-  assert.deepEqual([io.fnskuSource, io.ready], ['fba_sku_attrs', false]);
+  // IO を止めたのに移行の印が無い miniPC は、頼み方に関わらず 503 (欠けているかもしれない fba_sku_attrs をどの Render にも渡さない。Codex PR R3 Medium 1)
+  assert.equal(io.plStatus, 503);
   assert.match(io.notReady, /一回限りの移行の印が無い/);
+  assert.deepEqual([io.noQuery.status, io.noQuery.error], [503, 'FBA_SHEETLESS_NOT_READY']);
   const ready = child(await seed('io-mark', { mark: true }), { FBA_SHEETLESS_IO: '1' });
-  assert.deepEqual([ready.fnskuSource, ready.ready, ready.notReady], ['fba_sku_attrs', true, null]);
+  assert.deepEqual([ready.plStatus, ready.fnskuSource, ready.ready, ready.notReady], [200, 'fba_sku_attrs', true, null]);
+  // 🚨 古い Render (? を付けない) にも、凍結した sku_mapping の FNSKU (X0IOOLD) ではなく fba_sku_attrs の FNSKU を返す
+  assert.deepEqual(ready.noQuery, { status: 200, source: 'fba_sku_attrs', io1: 'X0IONEW', error: null }, '古い Render に sku_mapping の古い FNSKU を渡した');
   const plain = child(await seed('io-off'), {});
+  // IO なしの miniPC は今までどおり: ? 無しは getSkuMappings から (印は付けない) / ? 付きで印が無ければ fnsku_ready: false (200)
+  assert.deepEqual(plain.noQuery, { status: 200, source: null, io1: 'X0IONEW', error: null });
+  assert.deepEqual([plain.plStatus, plain.ready], [200, false]);
   assert.equal(plain.upsert, 'written');
   assert.deepEqual(plain.sheet.find((r) => r[0] === 'Io-1'), ['Io-1', 'X0IONEW'], 'IO なしの miniPC は今までどおり二重書き');
   assert.ok(plain.attrs.some((a) => a[0] === 'Io-2'), 'IO なしの miniPC は今までどおり起動時の backfill');
@@ -1008,6 +1020,28 @@ await t('凍結した fba.db (モードあり) では sku_mapping の値を使�
   }
   await db.initDb();   // 外から書いたファイルを読み直す (表を戻す)
   modeOff();
+});
+
+await t('Step4 (モードあり): ふつうの計算の失敗 (スナップショットが無い) も 503・仮確定を残す・健全性の記録 (前回) を書かない (Codex PR R3 Medium 2)', async () => {
+  modeOn();
+  await db.initDb();
+  db.saveProvisionalItems(PROV);
+  await editFileAndReload(['DELETE FROM restock_latest', 'DELETE FROM daily_snapshots']);
+  assert.equal(generateRecommendations(false, {}, ENGINE_OPTS).sheetless_blocked, undefined, '前提: Sheet なしの止めではない');
+  const runs = db.getRecentRecommendationRuns(30);
+  const r = await call('POST', RECALC);
+  assert.equal(r.status, 503);
+  assert.equal(r.body.calc_failed, true);
+  assert.match(r.body.error, /スナップショットがありません/);
+  assert.equal(r.body.provisional_cleared, false);
+  assert.deepEqual(provRows(), [['Alpha-1', 12]], '計算できなかったのに仮確定を消した');
+  assert.deepEqual(db.getRecentRecommendationRuns(30), runs, '計算できなかった回を健全性の記録に残した');
+  // 対照: GET (モードなしの画面が使う) は今までどおり 200 + errors で、健全性の記録も今までどおり書く
+  modeOff();
+  const g = await call('GET', '/api/recommendations?debug=1&persist=1');
+  assert.equal(g.status, 200);
+  assert.match((g.body.errors || []).join(), /スナップショットがありません/);
+  assert.equal(db.getRecentRecommendationRuns(30).length, runs.length + 1);
 });
 
 server.close();
