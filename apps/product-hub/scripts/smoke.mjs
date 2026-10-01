@@ -9903,6 +9903,14 @@ for (const [name, file, data] of renders) {
         skuJans: {}, skuSelectorValues: {},
         imagePriorities: dbmod.IMAGE_PRIORITIES,
         materialStatuses: dbmod.MATERIAL_STATUSES,
+        // 🤖 構成をAIに作らせる (段階1・PR1-d)。router は詳細画面に常に渡す。
+        // 既定 = 機能オン・仕様書あり・まだ依頼なし (押せる状態の見え方を既定にして、
+        // 依頼中・できた・失敗の見え方は fixture 側で上書きする)
+        lpCompose: {
+          enabled: true, job: null, blocked: null,
+          spec: { id: 1, title: 'LP制作システム.xlsx', imported_at: '2026-10-01T00:00:00Z', imported_by: 'smoke',
+                  hash_short: 'abc123def456', sheet_titles: ['LP制作システム'], chars: 1234 },
+        },
         // 確認中 (2026-08-31)。detail は理由リスト、board は絞り込みの状態を使う
         checkingReasons: dbmod.CHECKING_REASONS,
         checkingNoteMax: dbmod.CHECKING_NOTE_MAX,
