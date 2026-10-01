@@ -5681,8 +5681,15 @@ let wfSetParentId = null;
       `).run(idSkip);
       const mv = wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_amazon' }, 'img', SKIP_IMG);
       check('🚨 D&D: 楽天が「対象外」の商品は ⑧楽天登録 を開かない (移動は成功・理由を返す)',
-        mv.changed === true && !!mv.reopenBlocked && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'done',
-        `reopenBlocked=${mv.reopenBlocked} / ⑧=${st('imgd_rakuten')}`);
+        mv.changed === true && /楽天が「対象外」/.test(mv.reopenBlocked?.message || '')
+        && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'done',
+        `reopenBlocked=${JSON.stringify(mv.reopenBlocked)} / ⑧=${st('imgd_rakuten')}`);
+      // 🚨 管理者の D&D でも開かせない (isAdmin の早期 return より前で弾く — 名指し R6 P1)
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_amazon'").run(idSkip);
+      const mvAdmin = wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_amazon' }, 'admin', ADMIN2);
+      check('🚨 D&D: 楽天が「対象外」なら管理者でも ⑧楽天登録 は開かない',
+        /楽天が「対象外」/.test(mvAdmin.reopenBlocked?.message || '') && st('imgd_rakuten') === 'skip',
+        `reopenBlocked=${JSON.stringify(mvAdmin.reopenBlocked)} / ⑧=${st('imgd_rakuten')}`);
       db.prepare("DELETE FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").run(idSkip);
       db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idSkip);
     }
@@ -5790,8 +5797,9 @@ let wfSetParentId = null;
     check('🚨 D&D: 完了で他人担当の移動先は開き直しだけ諦めて移動は成功する (403 で全部巻き戻さない)',
       !doneOtherErr && stD('basic_info').state === 'done' && stD('title_approve').state === 'done',
       doneOtherErr?.message || JSON.stringify([stD('basic_info'), stD('title_approve')]));
-    check('D&D: 開き直せなかった工程名を戻り値で返す (画面が理由を出せる)',
-      doneOtherMove?.reopenBlocked === 'タイトル確認', JSON.stringify(doneOtherMove));
+    check('D&D: 開き直せなかった工程名と理由を戻り値で返す (画面が理由を出せる)',
+      doneOtherMove?.reopenBlocked?.label === 'タイトル確認'
+      && /担当です/.test(doneOtherMove.reopenBlocked.message || ''), JSON.stringify(doneOtherMove));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDoneOther);
     wf.setStaffActive(regStaffId, false);
   }

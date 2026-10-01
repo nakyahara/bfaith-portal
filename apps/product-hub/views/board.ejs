@@ -1282,7 +1282,8 @@
           moved.push(c);
           // 移動はできたが落とした列に止まらなかったカードも知らせる (1 枚ずつのドロップと同じ理由)
           if (j.reopenBlocked) {
-            blocked.push((c.dataset.name || ('#' + c.dataset.draft)) + ': 「' + j.reopenBlocked + '」を開き直せないため先の工程に進みました');
+            blocked.push((c.dataset.name || ('#' + c.dataset.draft)) + ': 「' + j.reopenBlocked.label + '」を開き直せないため先の工程に進みました ('
+              + j.reopenBlocked.message + ')');
             blockedEls.push(c);
           }
         } else errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': ' + (j.error || '移動できませんでした'));
@@ -1308,7 +1309,7 @@
     }
     let msg = '';
     if (errors.length) msg += moved.length + ' 件を移動しました。移動できなかったカード (' + errors.length + ' 件):\n\n' + errors.join('\n');
-    if (blocked.length) msg += (msg ? '\n\n' : '') + '落とした列に止まらなかったカード (' + blocked.length + ' 件・権限が足りません):\n\n' + blocked.join('\n');
+    if (blocked.length) msg += (msg ? '\n\n' : '') + '落とした列に止まらなかったカード (' + blocked.length + ' 件):\n\n' + blocked.join('\n');
     // 1 枚ずつ落としたときに出る「楽天に出品しますか」は、まとめて移動では出さない (続けて何件も公開しない)
     if (moved.length && BOARD_VIEW !== 'image' && to === 'listing') {
       msg += (msg ? '\n\n' : '') + 'まとめて移動したときは楽天への出品の確認を出しません。出品は 1 枚ずつ「出品・展開」に落とすか、詳細画面から行ってください';
@@ -1437,11 +1438,12 @@
       } catch (err) {
         alert('通信エラー: ' + err.message);
       }
-      // 落とした列の工程を開き直す権限が無くて諦めた = カードは**その先の列**に出る。
-      // 黙っていると、いま直している「落とした列に止まらない」症状と見分けが付かない
+      // 落とした列の工程を開き直せなかった = カードは**その先の列**に出る。
+      // 黙っていると、いま直している「落とした列に止まらない」症状と見分けが付かない。
+      // 理由はサーバーの文面をそのまま出す (権限が足りない / 楽天が「対象外」 など)
       if (moved && reopenBlocked) {
-        alert('移動しました。ただし「' + reopenBlocked + '」はあなたの権限では開き直せないため、'
-          + 'カードはその先の工程に進みます。この工程に止めたい場合は管理者に依頼してください。');
+        alert('移動しました。ただし「' + reopenBlocked.label + '」は開き直せなかったので、'
+          + 'カードはその先の工程に進みます。理由: ' + reopenBlocked.message);
       }
       // 工程が動いたときだけ、落とした位置を並び順として残す (失敗時に位置だけ残ると
       // 読み直しで元の列に戻ったカードが変な順で並ぶ)。

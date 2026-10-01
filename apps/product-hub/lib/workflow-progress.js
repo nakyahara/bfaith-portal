@@ -328,6 +328,16 @@ function rakutenMallSkipped(db, draftId) {
 }
 
 function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim = false, boardMove = false }) {
+  // 🚨 ボードの D&D で「楽天が対象外の商品の ⑧楽天登録」を開くのは**管理者でも**通さない
+  //    (Codex 名指し R6 P1: isAdmin の早期 return より前に置く)。
+  //    楽天に出さない商品の ⑧ を開いても、出品の根拠が無いので閉じられず、
+  //    結局だれかが対象外に戻すことになる = 最初から開かない方がよい。
+  //    詳細画面から管理者が明示的に動かす経路 (boardMove なし) は従来どおり通す
+  if (boardMove && row.track === 'image' && row.image_stage === IMAGE_RAKUTEN_STAGE
+    && patch?.state === 'todo' && rakutenMallSkipped(db, row.draft_id)) {
+    throw forbidden('この商品は楽天が「対象外」なので「楽天登録」は開けません'
+      + ' (楽天に出すなら、詳細画面の「モール別の展開状況」で楽天を未着手に戻してください)');
+  }
   if (isAdmin) return;
 
   // ボードの D&D から ⑧楽天登録 を動かすとき (2026-10-01)。
@@ -349,14 +359,10 @@ function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClai
   //    影響はカードがどの列に出るかだけ: ⑧楽天登録 は listing_gate=0 で出品ゲートに数えず、
   //    楽天に出してよいかの判定は draft_mall_status / draft_rakuten が正 (assertRakutenListable)、
   //    status の導出 (deriveDraftStatus) も imgd_* を見ない
-  //    ・楽天モールが「対象外」の商品は**開かせない** (名指し R5 P1)。楽天に出さない商品の ⑧ を
-  //      開くと、出品の根拠が無いので閉じられず、対象外に戻せるのは管理者だけ = カードが詰まる。
-  //      ここで通さなければ、ボードの移動先としての開き直しは 403 を飲んで諦めるので、
-  //      カードは ⑧ を飛ばしてその先の列に出る (= 楽天に出さない商品の正しい見え方)
+  //    (楽天が「対象外」の商品はこの関数の先頭で誰でも弾いている)
   if (boardMove && row.track === 'image' && row.image_stage === IMAGE_RAKUTEN_STAGE
     && !row.role_code && (patch?.state === 'todo' || patch?.state === 'done')
     && actorStaffId != null && hasRole(db, actorStaffId, IMAGE_TRACK_ROLE)
-    && !(patch.state === 'todo' && rakutenMallSkipped(db, row.draft_id))
     && Object.keys(patch).every((k) => k === 'state' || k === 'expected_version' || patch[k] === undefined)) {
     return;
   }
@@ -1312,7 +1318,9 @@ export function moveBoardCard(
             if (e?.status !== 403) throw e;
             // 飲んだことは戻り値で返す。画面が「落とした列に止まらなかった」理由を出せないと、
             // いま直している症状と見分けが付かない (名指し R5 P2)
-            reopenBlocked = target.label || target.step_code;
+            // 工程名だけだと、画面が「権限が足りません」と決めつけてしまう。
+            // 理由 (権限 / 楽天が対象外 …) はサーバーの文面をそのまま渡す (名指し R6 P2)
+            reopenBlocked = { label: target.label || target.step_code, message: e.message };
           }
         // 移動先 (= いまやる番) も未割り当てなら移動者に付ける (Codex R1: ドラッグ = 「自分が次工程を持っていく」の意思表示。
         // 付けないと次の操作でまた「自分が担当する」が要る)

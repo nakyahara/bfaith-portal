@@ -617,8 +617,10 @@ export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
     SET state = ?, version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     WHERE draft_id = ? AND step_code = ? AND state = ?
   `);
-  let changed = 0;
-  for (const r of rows) changed += upd.run(to, id, r.step_code, from).changes;
+  // 制作工程 (①〜⑦⑨) の変更数と ⑧ の変更数は**別に数える** (Codex 名指し R6 P2:
+  // ⑧ だけ動いたときに「制作工程を戻しました」の汎用イベントが出ると、履歴が実態と食い違う)
+  let productionChanged = 0;
+  for (const r of rows) productionChanged += upd.run(to, id, r.step_code, from).changes;
   // ⑧楽天登録 は「対象外」にはしないが、**対象外で残っていれば開き直す** (上の 🚨 のとおり)。
   // 人が進めた done は触らない (todo ⇄ skip だけ、は他の工程と同じ)。
   // 開き方は楽天の実態で決める (Codex R10 P2 / 名指し R5 P1):
@@ -653,9 +655,9 @@ export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
       done_at: listedRk ? (rkEvidence.registered_at || rkEvidence.listed_at || null) : null,
       done_by: listedRk ? 'system' : null,
     }).changes;
-    changed += rakutenChanged;
   }
-  if (changed > 0) {
+  const changed = productionChanged + rakutenChanged;
+  if (productionChanged > 0) {
     logEvent(db, id, 'set_image_plan_track',
       needs
         ? '画像の計画に「直して使う/作り直す」が入ったので、画像の制作工程を戻しました'
