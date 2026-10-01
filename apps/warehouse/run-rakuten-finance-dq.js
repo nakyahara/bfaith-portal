@@ -13,7 +13,7 @@
  *   DATA_DIR=... node apps/warehouse/run-rakuten-finance-dq.js --month 2026-04 --run-id custom-id
  *
  * 6 つの DQ check (severity / threshold は config inline):
- *   1. row_count_drift               (error: rows = 0)
+ *   1. row_count_drift               (error: rows = 0。当月の月初の 0 行は条件つきで warn = finance-dq-month-mode.js の decideMonthStartEmpty)
  *   2. listing_diff_pct              (warn: > 1%, error: > 5%)
  *   3. missing_cost_rate_pct         (warn: > 5%, error: > 10%)
  *   4. shipping_missing_rate_pct     (warn: > 5%, error: > 10%)
@@ -33,6 +33,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
+import { decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, applyMonthStartSkip, resolveDqNow, jstShifted } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -61,6 +62,12 @@ if (!fs.existsSync(dbPath)) {
 }
 
 const checkedAt = new Date().toISOString();
+// 月の判定の「今」(試験だけ: env FINANCE_DQ_ALLOW_NOW=1 のときだけ --now を受ける。daily-sync は渡さない)
+let now;
+try { now = resolveDqNow(getArg('--now')); }
+catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
+// daily-sync はこの回の楽天の取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
+const noMonthStartGrace = args.includes('--no-month-start-grace');
 
 // ============================================================
 // Threshold config (Phase 1a #R-2 確定値)
@@ -69,8 +76,8 @@ const checkedAt = new Date().toISOString();
 // 当月: build と f_sales_by_listing の sync タイミング差で diff 8% 程度普通に出る (false positive)
 // 前月以前: 月末確定後なので厳密 1%/5% で本物の品質悪化を検出
 function isCurrentMonth(monthStr) {
-  // JST の今日の YYYY-MM (UTC+9)
-  const nowJst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  // JST の今日の YYYY-MM (UTC+9)。「今」は上の now (試験の --now と同じ時刻で月を決める)
+  const nowJst = jstShifted(now);
   const currentMonth = nowJst.toISOString().slice(0, 7);
   return monthStr === currentMonth;
 }
@@ -97,8 +104,11 @@ db.pragma('journal_mode = WAL');
 
 const issues = [];
 let hasError = false;
+// 月初の猶予で通すときの判定 (null = 猶予なし)。猶予の中は SKIP_IN_MONTH_START_GRACE の検査を info に落とす (applyMonthStartSkip)
+let monthStartGrace = null;
 
 function recordResult(checkName, severity, actualValue, thresholdValue, details = null) {
+  ({ severity, details } = applyMonthStartSkip(monthStartGrace, checkName, severity, details));
   db.prepare(`
     INSERT OR REPLACE INTO dq_run_results
       (run_id, check_name, severity, actual_value, threshold_value, details_json, checked_at)
@@ -128,20 +138,26 @@ const dailyCount = db.prepare(`
   WHERE substr(date_jst, 1, 7) = ?
 `).get(monthStr).c;
 
-recordResult(
-  'row_count_drift',
-  dailyCount === 0 ? 'error' : 'info',
-  dailyCount,
-  0,
-  { daily_row_count: dailyCount }
-);
-
+recordResult(MONTH_ROW_COUNT_CHECK, 'info', dailyCount, null, monthRowCountDetails('rakuten', monthStr, dailyCount));
 if (dailyCount === 0) {
-  console.error(`  ⚠️  CRITICAL: f_rakuten_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`);
-  console.error(`  → R-1 build pipeline が動いていない可能性、原因調査必要`);
-  // 続けて他 check は意味ないので exit
-  printSummary();
-  process.exit(1);
+  // 月初の猶予 (finance-dq-month-mode.js の decideMonthStartEmpty): 当月・月初の日数の中・この月が一度も 0 でなくなっていない・
+  // 前月の終わりまで新しい・daily-sync が禁じていない、を全部満たすときだけ ⚠️ 警告で続ける (楽天も毎月 1 日に 0 行で error だった。6/1〜10/1 の実測)
+  const g = decideMonthStartEmpty(db, { mall: 'rakuten', ym: monthStr, now, noGrace: noMonthStartGrace });
+  if (g.grace) {
+    monthStartGrace = g;
+    recordResult('row_count_drift', 'warn', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace: true, jst_day: g.calendar.dayOfMonth, grace_days: g.graceDays, prev_month_max_date: g.prev?.maxDate ?? null });
+    console.log(`  ${monthStartEmptyNote('f_rakuten_finance_sku_daily_v1', monthStr, g)}`);
+  } else {
+    recordResult('row_count_drift', 'error', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace_denied: g.reasons });
+    console.error(`  ⚠️  CRITICAL: f_rakuten_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`);
+    console.error(`  → R-1 build pipeline が動いていない可能性、原因調査必要`);
+    if (g.calendar.mode === 'current') console.error(`  → 月初の猶予を使わない理由: ${g.reasons.join(' / ')}`);
+    // 続けて他 check は意味ないので exit
+    printSummary();
+    process.exit(1);
+  }
+} else {
+  recordResult('row_count_drift', 'info', dailyCount, 0, { daily_row_count: dailyCount });
 }
 
 // ============================================================
@@ -310,6 +326,8 @@ function printSummary() {
 }
 
 printSummary();
+// 月初の猶予で通した回は、最後の行を「⚠️ 月初の猶予: …」にする (daily-sync はこの行を要約に出し、warn を立てて見出しを ⚠️ にする)
+if (monthStartGrace && !hasError) console.log(monthStartEmptyNote('f_rakuten_finance_sku_daily_v1', monthStr, monthStartGrace));
 
 db.close();
 process.exit(hasError ? 1 : 0);

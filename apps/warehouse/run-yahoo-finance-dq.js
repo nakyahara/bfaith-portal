@@ -12,7 +12,7 @@
  *     node apps/warehouse/run-yahoo-finance-dq.js --month 2026-04
  *
  * 8 つの DQ check (severity / threshold):
- *   1. row_count_drift               (error: rows = 0。当月の月初 6 日までの 0 行だけ warn + exit 0 = finance-dq-month-mode.js の monthStartEmptyGrace)
+ *   1. row_count_drift               (error: rows = 0。当月の月初の 0 行は条件つきで warn = finance-dq-month-mode.js の decideMonthStartEmpty)
  *   2. listing_diff_pct              (warn 1% / error 5%、当月は warn 5% / error 15%)
  *   3. missing_cost_rate_pct         (warn 5% / error 10%)
  *   4. shipping_missing_rate_pct     (warn 5% / error 10%)
@@ -37,7 +37,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel, monthStartEmptyGrace, monthStartEmptyNote, MONTH_START_EMPTY_GRACE_DAYS, parseNowArg } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, applyMonthStartSkip, resolveDqNow } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -65,10 +65,12 @@ if (!fs.existsSync(dbPath)) {
 }
 
 const checkedAt = new Date().toISOString();
-// 月の判定の「今」(試験だけ --now で動かす。daily-sync は渡さない)
+// 月の判定の「今」(試験だけ: env FINANCE_DQ_ALLOW_NOW=1 のときだけ --now を受ける。daily-sync は渡さない)
 let now;
-try { now = getArg('--now') ? parseNowArg(getArg('--now')) : new Date(); }
+try { now = resolveDqNow(getArg('--now')); }
 catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
+// daily-sync はこの回のモールの取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
+const noMonthStartGrace = args.includes('--no-month-start-grace');
 
 
 const THRESHOLDS_PAST_MONTH = {
@@ -102,8 +104,11 @@ db.pragma('journal_mode = WAL');
 
 const issues = [];
 let hasError = false;
+// 月初の猶予で通すときの判定 (null = 猶予なし)。猶予の中は SKIP_IN_MONTH_START_GRACE の検査を info に落とす (applyMonthStartSkip)
+let monthStartGrace = null;
 
 function recordResult(checkName, severity, actualValue, thresholdValue, details = null) {
+  ({ severity, details } = applyMonthStartSkip(monthStartGrace, checkName, severity, details));
   db.prepare(`
     INSERT OR REPLACE INTO dq_run_results
       (run_id, check_name, severity, actual_value, threshold_value, details_json, checked_at)
@@ -130,22 +135,25 @@ const dailyCount = db.prepare(`
   WHERE substr(date_jst, 1, 7) = ?
 `).get(monthStr).c;
 
+recordResult(MONTH_ROW_COUNT_CHECK, 'info', dailyCount, null, monthRowCountDetails('yahoo', monthStr, dailyCount));
 if (dailyCount === 0) {
-  // 当月の月初は最初の出荷が取り込まれるまで 0 行が当然 → ⚠️ 警告・exit 0 (2026-10-01)。過去の月・猶予を過ぎた当月は CRITICAL のまま
-  const g = monthStartEmptyGrace(monthStr, { now, graceDays: MONTH_START_EMPTY_GRACE_DAYS.yahoo });
+  // 月初の猶予 (finance-dq-month-mode.js の decideMonthStartEmpty): 当月・月初の日数の中・この月が一度も 0 でなくなっていない・
+  // 前月の終わりまで新しい・daily-sync が禁じていない、を全部満たすときだけ ⚠️ 警告で続ける。早く終わらずに残りの検査も流す
+  // (行数で比べる検査 = SKIP_IN_MONTH_START_GRACE だけ info に落とす。raw・全期間・原価の検査はそのまま)
+  const g = decideMonthStartEmpty(db, { mall: 'yahoo', ym: monthStr, now, noGrace: noMonthStartGrace });
   if (g.grace) {
-    recordResult('row_count_drift', 'warn', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace: true, jst_day: g.dayOfMonth, grace_days: g.graceDays });
+    monthStartGrace = g;
+    recordResult('row_count_drift', 'warn', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace: true, jst_day: g.calendar.dayOfMonth, grace_days: g.graceDays, prev_month_max_date: g.prev?.maxDate ?? null });
+    console.log(`  ${monthStartEmptyNote('f_yahoo_finance_sku_daily_v1', monthStr, g)}`);
+  } else {
+    recordResult('row_count_drift', 'error', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace_denied: g.reasons });
+    console.error(`  ⚠️ CRITICAL: f_yahoo_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`);
+    if (g.calendar.mode === 'current') console.error(`  → 月初の猶予を使わない理由: ${g.reasons.join(' / ')}`);
     printSummary();
-    console.log(monthStartEmptyNote('f_yahoo_finance_sku_daily_v1', monthStr, g));
-    db.close();
-    process.exit(0);
+    process.exit(1);
   }
-  recordResult('row_count_drift', 'error', dailyCount, 0, { daily_row_count: dailyCount });
-  console.error(`  ⚠️  CRITICAL: f_yahoo_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`);
-  printSummary();
-  process.exit(1);
 }
-recordResult('row_count_drift', 'info', dailyCount, 0, { daily_row_count: dailyCount });
+if (dailyCount > 0) recordResult('row_count_drift', 'info', dailyCount, 0, { daily_row_count: dailyCount });
 
 // ============================================================
 // Check 2: listing_diff_pct (estimated vs listing 突合)
@@ -351,6 +359,7 @@ function printSummary() {
 }
 
 printSummary();
-
+// 月初の猶予で通した回は、最後の行を「⚠️ 月初の猶予: …」にする (daily-sync はこの行を要約に出し、warn を立てて見出しを ⚠️ にする)
+if (monthStartGrace && !hasError) console.log(monthStartEmptyNote('f_yahoo_finance_sku_daily_v1', monthStr, monthStartGrace));
 db.close();
 process.exit(hasError ? 1 : 0);

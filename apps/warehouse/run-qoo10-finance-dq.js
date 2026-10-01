@@ -9,7 +9,7 @@
  *   DATA_DIR=C:/Users/bfaith/bfaith-portal/data node apps/warehouse/run-qoo10-finance-dq.js --month 2026-05
  *
  * 16 check (severity / threshold、設計書 v0.11 §8 + 2026-05-19 A-2 patch #16):
- *   1. row_count_drift                        (error: rows=0、当月 ratio<0.5 で warn。当月の月初 9 日までの 0 行だけ warn + exit 0 = monthStartEmptyGrace)
+ *   1. row_count_drift                        (error: rows=0、当月 ratio<0.5 で warn。当月の月初の 0 行は条件つきで warn = finance-dq-month-mode.js の decideMonthStartEmpty)
  *   2. listing_diff_pct                       (info only、Codex R1 #4 反映で gate 解除) — f_sales_by_listing (qoo10) vs net_settlement_api 突合、構造的 diff 前提で監視のみ
  *   3. missing_cost_rate_pct                  (warn 5% / error 10%)
  *   4. shipping_missing_rate_pct              (Phase A 無効化: 'no_shipping_in_api' が常態)
@@ -31,7 +31,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel, monthStartEmptyGrace, monthStartEmptyNote, MONTH_START_EMPTY_GRACE_DAYS, parseNowArg } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, applyMonthStartSkip, resolveDqNow } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -44,10 +44,12 @@ const dbPath = path.join(DATA_DIR, 'warehouse.db');
 if (!fs.existsSync(dbPath)) { console.error(`FATAL: warehouse.db not found at ${dbPath}`); process.exit(2); }
 
 const checkedAt = new Date().toISOString();
-// 月の判定の「今」(試験だけ --now で動かす。daily-sync は渡さない)
+// 月の判定の「今」(試験だけ: env FINANCE_DQ_ALLOW_NOW=1 のときだけ --now を受ける。daily-sync は渡さない)
 let now;
-try { now = getArg('--now') ? parseNowArg(getArg('--now')) : new Date(); }
+try { now = resolveDqNow(getArg('--now')); }
 catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
+// daily-sync はこの回のモールの取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
+const noMonthStartGrace = args.includes('--no-month-start-grace');
 
 const THRESHOLDS_PAST = {
   row_count_drift:                       { warn: 0,    error: 0 },
@@ -84,7 +86,10 @@ const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 const issues = [];
 let hasError = false;
+// 月初の猶予で通すときの判定 (null = 猶予なし)。猶予の中は SKIP_IN_MONTH_START_GRACE の検査を info に落とす (applyMonthStartSkip)
+let monthStartGrace = null;
 function recordResult(name, severity, actual, threshold, details = null) {
+  ({ severity, details } = applyMonthStartSkip(monthStartGrace, name, severity, details));
   db.prepare(`INSERT OR REPLACE INTO dq_run_results (run_id, check_name, severity, actual_value, threshold_value, details_json, checked_at) VALUES (?,?,?,?,?,?,?)`)
     .run(runId, name, severity, actual, threshold, details ? JSON.stringify(details) : null, checkedAt);
   if (severity === 'error') hasError = true;
@@ -96,22 +101,27 @@ db.prepare(`DELETE FROM dq_run_results WHERE run_id = ?`).run(runId);
 
 // Check 1: row_count_drift
 const dailyCount = db.prepare("SELECT COUNT(*) AS c FROM f_qoo10_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?").get(monthStr).c;
+recordResult(MONTH_ROW_COUNT_CHECK, 'info', dailyCount, null, monthRowCountDetails('qoo10', monthStr, dailyCount));
 if (dailyCount === 0) {
-  // 当月の月初は最初の配送完了 (Delivered(5)) が取り込まれるまで 0 行が当然 → ⚠️ 警告・exit 0 (2026-10-01)。過去の月・猶予を過ぎた当月は CRITICAL のまま
-  const g = monthStartEmptyGrace(monthStr, { now, graceDays: MONTH_START_EMPTY_GRACE_DAYS.qoo10 });
+  // 月初の猶予 (finance-dq-month-mode.js の decideMonthStartEmpty): 当月・月初の日数の中・この月が一度も 0 でなくなっていない・
+  // 前月の終わりまで新しい・daily-sync が禁じていない、を全部満たすときだけ ⚠️ 警告で続ける。早く終わらずに残りの検査も流す
+  // (行数で比べる検査 = SKIP_IN_MONTH_START_GRACE だけ info に落とす。raw・全期間・原価の検査はそのまま)
+  const g = decideMonthStartEmpty(db, { mall: 'qoo10', ym: monthStr, now, noGrace: noMonthStartGrace });
   if (g.grace) {
-    recordResult('row_count_drift', 'warn', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace: true, jst_day: g.dayOfMonth, grace_days: g.graceDays });
+    monthStartGrace = g;
+    recordResult('row_count_drift', 'warn', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace: true, jst_day: g.calendar.dayOfMonth, grace_days: g.graceDays, prev_month_max_date: g.prev?.maxDate ?? null });
+    console.log(`  ${monthStartEmptyNote('f_qoo10_finance_sku_daily_v1', monthStr, g)}`);
+  } else {
+    recordResult('row_count_drift', 'error', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace_denied: g.reasons });
+    console.error(`  ⚠️ CRITICAL: f_qoo10_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`);
+    if (g.calendar.mode === 'current') console.error(`  → 月初の猶予を使わない理由: ${g.reasons.join(' / ')}`);
     printSummary();
-    console.log(monthStartEmptyNote('f_qoo10_finance_sku_daily_v1', monthStr, g));
-    db.close();
-    process.exit(0);
+    process.exit(1);
   }
-  recordResult('row_count_drift', 'error', dailyCount, 0, { daily_row_count: dailyCount });
-  console.error(`  ⚠️ CRITICAL: f_qoo10_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`);
-  printSummary();
-  process.exit(1);
 }
-if (isCur) {
+if (monthStartGrace) {
+  // 月初の猶予 (当月 0 行): row_count_drift は上で warn を記録済み。直近 8 日の比べ方は当月の行があるときだけ
+} else if (isCur) {
   // 当月のみ partial ingest 検知 (LINEギフト 同型)
   const recent = db.prepare(`
     WITH RECURSIVE date_spine(d) AS (
@@ -354,5 +364,7 @@ function printSummary() {
   else console.log(`✅ DQ gate passed (no error, no warn)`);
 }
 printSummary();
+// 月初の猶予で通した回は、最後の行を「⚠️ 月初の猶予: …」にする (daily-sync はこの行を要約に出し、warn を立てて見出しを ⚠️ にする)
+if (monthStartGrace && !hasError) console.log(monthStartEmptyNote('f_qoo10_finance_sku_daily_v1', monthStr, monthStartGrace));
 db.close();
 process.exit(hasError ? 1 : 0);
