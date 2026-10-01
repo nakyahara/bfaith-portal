@@ -5467,6 +5467,13 @@ let wfSetParentId = null;
     });
     check('工程API: body の boardClaim は無視され、未割り当て工程の引き受け+完了は 403', r.status === 403
       && stepOf(idM5, 'title_approve') === 'todo' && assigneeOf(idM5, 'title_approve') == null, JSON.stringify(r.json));
+    // boardReopen も同じ: D&D 経路の内部オプションなので body で送っても効かない (2026-10-01)。
+    // AI待ちは役割なしのシステム工程 = 抜け道の対象に見える形で試す
+    r = await call('POST', `/api/drafts/${idM5}/steps/ai_generate`, {
+      state: 'skip', boardReopen: true, expected_version: versionOf(idM5, 'ai_generate'),
+    });
+    check('工程API: body の boardReopen は無視され、システム工程の「対象外」は 403 のまま',
+      r.status === 403 && stepOf(idM5, 'ai_generate') !== 'skip', JSON.stringify(r.json));
   } finally { smokeSession = adminSession; }
 
   // 画像ビュー: 依頼 → 素材待ち へ (依頼・構成が done)、完了列で残りをまとめて閉じる。
@@ -5541,6 +5548,29 @@ let wfSetParentId = null;
     try { wfpEarly.setStepState(idSkip, 'imgd_rakuten', { state: 'done' }, 'img', SKIP_IMG); } catch (e) { doneSys = e; }
     check('D&D の抜け道: ⑧楽天登録 を人が「完了」にはできないまま (開き直しだけを許す)',
       doneSys?.status === 403 || doneSys?.status === 400, doneSys?.message || '例外が出ていない');
+    // 🚨 抜け道は画像登録者だけ (Codex R3 P1)。役割の無い担当者は従来どおり弾く
+    {
+      const noRoleId = wf.createStaff({ name: '役割なし・対象外の列スモーク', kind: 'internal' });
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, 'imgd_rakuten');
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_amazon');
+      let noRoleErr = null;
+      try {
+        wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_amazon' },
+          'norole', { isAdmin: false, actorStaffId: noRoleId });
+      } catch (e) { noRoleErr = e; }
+      check('D&D の抜け道: 画像登録者の役割が無い担当者は ⑧楽天登録 を開き直せない (403・全体ロールバック)',
+        noRoleErr?.status === 403 && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'todo',
+        noRoleErr?.message || '例外が出ていない');
+      wf.setStaffActive(noRoleId, false);
+    }
+    // 🚨 本流のシステム工程 (出品・展開) には効かせない。そもそも「対象外」にできない工程なので、
+    //    画像トラック限定にしておけば、ここから status (expanded) を巻き戻す道は増えない
+    {
+      let listingSkip = null;
+      try { wfpEarly.setStepState(idSkip, 'listing', { state: 'skip' }, 'admin', ADMIN2); } catch (e) { listingSkip = e; }
+      check('D&D の抜け道: 「出品・展開」はそもそも対象外にできない (開き直しの対象にならない)',
+        listingSkip?.status === 400, listingSkip?.message || '例外が出ていない');
+    }
     // 完了で残っている工程は開き直さない (済んだ記録を通過だけで消さない)。
     // ⑧ を「楽天に出した」状態にしてから、その手前を差し戻して前方移動する
     db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('done', idSkip, 'imgd_rakuten');
@@ -5550,6 +5580,31 @@ let wfSetParentId = null;
       st('imgd_rakuten') === 'done', st('imgd_rakuten'));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSkip);
     wf.setStaffActive(skipImgStaffId, false);
+
+    // 🚨 本流で「対象外の未割り当て工程」に落とす場合 (Codex R3 P2)。
+    //    開き直しと引き受けを一緒にやらないと「先に『自分が担当する』を押してから」で 403 になり、
+    //    飛ばされる不具合が 403 に変わるだけになる
+    const idSkipMain = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, official_url, created_by)
+      VALUES ('DRV-SKIPMAIN', '本流の対象外の列へ落とす', 'https://example.com/skipmain', 'smoke')
+    `).run().lastInsertRowid);
+    wfpEarly.ensureProgress(db, idSkipMain);
+    db.prepare('UPDATE draft_step_progress SET assignee_id = NULL WHERE draft_id = ?').run(idSkipMain);
+    const stM = (code) => db.prepare('SELECT state, assignee_id FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idSkipMain, code) || {};
+    // 管理者が「商品説明確認」を対象外にしてから、未着手の基本情報に戻す
+    wfpEarly.setStepState(idSkipMain, 'desc_review', { state: 'skip' }, 'admin', ADMIN2);
+    const regStaffId = wf.createStaff({ name: '商品登録者スモーク', kind: 'internal' });
+    db.prepare(`INSERT INTO ph_staff_roles (staff_id, role_code) VALUES (?, 'registrar')`).run(regStaffId);
+    const REG = { isAdmin: false, actorStaffId: regStaffId };
+    let mainSkipErr = null;
+    try {
+      wfpEarly.moveBoardCard(idSkipMain, { view: 'main', to: 'desc_review', expectedCurrent: 'basic_info' }, 'reg', REG);
+    } catch (e) { mainSkipErr = e; }
+    check('🚨 D&D: 本流で「対象外」の未割り当て工程に落とすと、引き受けつきで開き直る (403 にしない)',
+      !mainSkipErr && stM('desc_review').state === 'todo' && stM('desc_review').assignee_id === regStaffId,
+      mainSkipErr?.message || JSON.stringify(stM('desc_review')));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSkipMain);
+    wf.setStaffActive(regStaffId, false);
   }
 
   // カードは 1 商品 1 枚 (2026-08-31 TOP工程の廃止。「制作件数がぱっと見で分かりにくい」の解消)

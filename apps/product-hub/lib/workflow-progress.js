@@ -23,6 +23,11 @@ const SET_REVIEW_STEP = 'set_review';
 const SET_NE_STEP = SET_NE_STEP_CODE;
 /** セット企画者が担当に関わらず動かせる工程 (出品準備 = 承認は含めない。§4.1 の回答どおり) */
 const SET_PLANNER_STEPS = ['set_compose', SET_NE_STEP, 'set_content'];
+/**
+ * 画像の工程を動かせる役割 (ph_roles の builtin「画像登録者」)。
+ * 役割を置かない ⑧楽天登録 を D&D で開き直せるのは、この役割を持つ人と管理者だけ (2026-10-01)。
+ */
+const IMAGE_TRACK_ROLE = 'image';
 /** 「AI情報入力待ち」。夜間の AI が完了にする工程だが、担当者なら手で抜ける・戻せる (2026-09-25) */
 const AI_STEP = 'ai_generate';
 // モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
@@ -313,18 +318,22 @@ function assertOwnerScope(patch, actorStaffId) {
 function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim = false, boardReopen = false }) {
   if (isAdmin) return;
 
-  // ボードの D&D で「落とした列」を いまやる番 にするために、**対象外で残っていた工程を
-  // 未着手に戻す**とき (2026-10-01)。役割を置かないシステム工程 (⑧楽天登録) でも通す。
-  // 役割がある工程はこの下の通常の判定 (本人 / 画像は役割) でそのまま通るので、ここは
-  // 「システム工程を開き直す」専用の抜け道。
-  // 🚨 開き直すのは **未着手に戻すだけ** で、「システムが進める工程を人が完了にする」は
-  //    依然できない (patch は state='todo' の 1 本だけしか通さない)。
-  //    ⑧楽天登録 は listing_gate=0 で出品ゲートに数えず、楽天に出してよいかの判定は
-  //    draft_mall_status / draft_rakuten が正 (assertRakutenListable) なので、
-  //    ここで変わるのは**カードがどの列に出るか**だけ。
-  //    これを許さないと、報告された「落とした列の先へ飛ばされる」が非管理者では
-  //    403 に変わるだけで直らない (Codex R1 P1)
-  if (boardReopen && !row.role_code && actorStaffId != null && patch?.state === 'todo'
+  // ボードの D&D で「落とした列」を いまやる番 にするために、**対象外で残っていた
+  // ⑧楽天登録 を未着手に戻す**とき (2026-10-01)。
+  // ⑧楽天登録 は役割を置かない (出品すると自動で完了する) 工程なので、下の
+  // 「画像の工程は役割で動かせる」(row.role_code を見る) に乗れず、このままでは
+  // 報告された「落とした列の先へ飛ばされる」が非管理者では 403 に変わるだけで直らない。
+  //
+  // 🚨 抜け道はできるだけ狭くする (Codex R3 P1):
+  //    ・**画像トラックの役割なし工程だけ** (本流の AI情報入力待ち・出品・展開には効かせない。
+  //      AI待ちを手で戻すのは下の AI_STEP の例外が既に担っている)
+  //    ・**画像登録者の役割を持つ人だけ** (= 画像の工程を動かせる人。関係ない担当者は通さない)
+  //    ・**state='todo' の 1 本だけ** — 「システムが進める工程を人が完了にする」は依然できない
+  //    影響はカードがどの列に出るかだけ: ⑧楽天登録 は listing_gate=0 で出品ゲートに数えず、
+  //    楽天に出してよいかの判定は draft_mall_status / draft_rakuten が正 (assertRakutenListable)、
+  //    status の導出 (deriveDraftStatus) も imgd_* を見ない
+  if (boardReopen && row.track === 'image' && !row.role_code && patch?.state === 'todo'
+    && actorStaffId != null && hasRole(db, actorStaffId, IMAGE_TRACK_ROLE)
     && Object.keys(patch).every((k) => k === 'state' || k === 'expected_version' || patch[k] === undefined)) {
     return;
   }
@@ -1223,10 +1232,14 @@ export function moveBoardCard(
       if (r?.track === 'image' && r.role_code && hasRole(db, actorStaffId, r.role_code)) return false;
       return !!(r && r.assignee_id == null && r.role_code);
     };
-    const setWithClaim = (code, state) => {
+    // reopen = 「対象外で残っていた移動先を未着手に戻す」とき。未割り当ての人手工程なら
+    // 他の通過工程と同じく引き受けも一緒にやる (Codex R3 P2: 状態だけ送ると
+    // 「先に『自分が担当する』を押してから操作してください」で 403 になり、
+    // 飛ばされる不具合が 403 に変わるだけになる)
+    const setWithClaim = (code, state, { reopen = false } = {}) => {
       const claim = unassignedHuman(code);
       setStepState(id, code, claim ? { assignee_id: actorStaffId, state } : { state }, actor,
-        { isAdmin, actorStaffId, boardClaim: claim });
+        { isAdmin, actorStaffId, boardClaim: claim, boardReopen: reopen });
     };
     const settled = (r) => r.state === 'done' || r.state === 'skip';
     if (tIdx > curIdx) {
@@ -1255,7 +1268,7 @@ export function moveBoardCard(
         //    **done は開き直さない** — done は済んだという記録 (⑧なら「楽天に出した」) で、
         //    上を通り過ぎるだけの操作で消してよいものではない。意図して戻すなら後方移動 (左へ) がある
         if (target.state === 'skip') {
-          setStepState(id, target.step_code, { state: 'todo' }, actor, { isAdmin, actorStaffId, boardReopen: true });
+          setWithClaim(target.step_code, 'todo', { reopen: true });
         // 移動先 (= いまやる番) も未割り当てなら移動者に付ける (Codex R1: ドラッグ = 「自分が次工程を持っていく」の意思表示。
         // 付けないと次の操作でまた「自分が担当する」が要る)
         } else if (unassignedHuman(target.step_code)) {
