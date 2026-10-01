@@ -36,6 +36,9 @@ export const MAX_LINES_PER_CHUNK = 5000;
 export const HTTP_TIMEOUT_MS = 120000;
 export const RETRIES = 6;                            // 5xx / 通信エラーの再送 (5・10・20・40・80 秒 = 合計 155 秒。master へのマージで Render が再デプロイされる 1〜3 分の 502 をまたぐ)
 export const backoffMs = (attempt) => 5000 * 2 ** (attempt - 1);
+// outbox に書く区切り (行)。🆕 #1567 メモリ: 1,000 → 100 = 書く前の行 (整形した JSON) が若い世代の GC を 2 回生き延びて古い世代に上がり、次の大きな GC まで
+//   ごみとして積もる (送り直し 51 万件の合成で 1 回目の大きな GC の前に 674 MB) のを減らす。取引の数は増える (WAL・1 回ごとの fsync は無い)
+const OUTBOX_FLUSH_ROWS = 100;
 const HEARTBEAT_EVERY = 5000;                        // 走査中の心拍 (行数)
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -144,6 +147,7 @@ export async function runPush({
   afterSend = null,          // 送り終えた後 (lock の中・持ち主の確認の後) に回す処理 (ctx) → 結果。error があれば run は ok = false (Codex D5b-1 R2 #3)
   beforeScan = null, beforeChunk = null, receiptRows = null, beforeAck = null,   // 上の「任意」
   onScanSnapshot = null, chunkExtra = null,                                       // 上の「任意」(D7b-1b-3)
+  lazyFingerprints = false,   // true = 台帳の指紋を Map に全部読まずに 1 つずつ引く (ledger.fingerprintLookup。#1567 メモリ・Amazon 財務だけ)。iterate / build / inScope には get / has の同じ口で渡る
   measure = false,   // dry-run だけ: 毎朝の実の回に近い時間・メモリを測る = beforeScan (Render の読み取り) を呼び、変わった行を chunk の形に serialize して捨てる (送らない・台帳に書かない。#1567 Codex R5 Medium 2)
 }) {
   if (chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk は 1〜${MAX_CHUNK}`);
@@ -213,7 +217,7 @@ export async function runPush({
       if (mzRows.length && (mzRows.length >= chunkSize || mzLines + lines > MAX_LINES_PER_CHUNK || mzBytes + n > maxBodyBytes)) mzFlush();
       mzRows.push(JSON.parse(p)); mzLines += lines; mzBytes += n; mz.rows++; mz.rowBytes += n;
     };
-    fps = ledger.loadFingerprints();
+    fps = lazyFingerprints ? ledger.fingerprintLookup() : ledger.loadFingerprints();
     // ── ① raw を 1 つの読み取り取引で流し読み (snapshot はここで閉じる。HTTP の間は持たない。Codex R2 #6) ──
     let buf = [];
     const flushBuf = () => { if (buf.length) { ledger.pushOutbox(r.runId, buf); buf = []; } };
@@ -238,7 +242,7 @@ export async function runPush({
         if (dryRun) { if (mz) mzAdd(item); continue; }
         const payload = JSON.stringify(item.payload);
         buf.push({ key: item.key, fp, payload, n_lines: item.payload.lines.length, n_bytes: Buffer.byteLength(payload) });
-        if (buf.length >= 1000) flushBuf();
+        if (buf.length >= OUTBOX_FLUSH_ROWS) flushBuf();
       }
       flushBuf();
       mzFlush();

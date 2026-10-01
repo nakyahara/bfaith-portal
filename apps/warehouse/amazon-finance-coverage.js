@@ -289,7 +289,8 @@ export function evaluateCoverage(db, { generation, runToken, policy, source, now
 
   // ── receipt digest ──
   let rc = null;
-  try { rc = receiptDigest(receipts || []); } catch (e) { add('receipt_digest', `受領記録の要約を作れない: ${e.message}`); }
+  // receipts = 配列か、送り手の一時の表 (receiptSpool・summary() が同じ要約を返す。#1567 メモリ)
+  try { rc = receipts && typeof receipts.summary === 'function' ? receipts.summary() : receiptDigest(receipts || []); } catch (e) { add('receipt_digest', `受領記録の要約を作れない: ${e.message}`); }
 
   const results = {};
   for (const it of items) results[it.result] = (results[it.result] || 0) + 1;

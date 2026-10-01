@@ -137,6 +137,13 @@ pr = processV2Report(db, noDate, 'R-ND', 'run-b');
 ok(pr.status === 'blocked' && /日時/.test(pr.reason) && rawCount() === 0, '明細の日時が空なら取り込まない (月の集計から落ちるのを防ぐ)');
 pr = processV2Report(db, good2, 'R-G', 'run-b', { dryRun: true });
 ok(pr.status === 'dry_run' && rawCount() === 0, 'dry-run は書かない');
+// 🆕 #1567 メモリ: dry-run は明細を正規化して数えるだけ (持たない)。止まる所は取り込む回と同じ (規則に無い・日時の空)
+ok(pr.prepared.lineRows === null && pr.prepared.lineCount === 2 && pr.prepared.headerRowCount === 1, `dry-run は明細を持たず数だけ (${pr.prepared.lineCount} 行)`);
+{
+  const d1 = processV2Report(db, bad2, 'R-BAD', 'run-b', { dryRun: true }), d2 = processV2Report(db, noDate, 'R-ND', 'run-b', { dryRun: true });
+  const r1 = processV2Report(db, bad2, 'R-BAD', 'run-b'), r2 = processV2Report(db, noDate, 'R-ND', 'run-b');
+  ok(d1.status === 'blocked' && d1.reason === r1.reason && d2.status === 'blocked' && d2.reason === r2.reason && rawCount() === 0, 'dry-run も取り込む回と同じ理由で止まる (規則に無い・日時の空)');
+}
 pr = processV2Report(db, good2, 'R-G', 'run-b');
 ok(pr.status === 'ingested' && rawCount() === 2, '規則どおりなら取り込む (本体の行 + 個数だけの行)');
 // 🆕 2026-10-01 (D-66・R23 H1): V1 で取込済みの決済でも V2 を版として入れる (skipped_v1 をやめた)。採る版は 1 つ = 下流は二重にならない
@@ -169,6 +176,46 @@ ok(pr.status === 'blocked' && pr.settlementId === S3 && pr.coveredByOtherVersion
     `🚨 V2: 見出しが 2 行の文書は取り込まない (blocked・行も版も作らない) (${pr4.status}: ${pr4.reason})`);
   const { inspectManualFile } = await import('./amazon-settlement-manual-file.js');
   ok(inspectManualFile(twoH, { format: 'v2' }).problems.some((p) => /見出しの行が 2 行/.test(p)), '手のファイル (V2) も見出しが 2 行なら積まない');
+}
+
+// 🆕 #1567 メモリ: prepareV2ReportTsv を 1 行ずつの形にした = 前の形 (V2 を全部並べ直す → V1 の TSV に書く → 読み直して正規化) と **同じ行・同じ行番号・同じ数** を出すこと
+//   (行番号 _source_line_no は行の指紋 = 版の digest に入る。違えば取り込み済みの決済が「中身が変わった」に見える)
+{
+  const { createHash } = await import('node:crypto');
+  const sha = (t) => createHash('sha256').update(t).digest('hex');
+  const strip = (o) => { if (!o || typeof o !== 'object') return o; const x = { ...o }; for (const k of Object.keys(x)) if (/observed|ingested/i.test(k)) delete x[k]; return x; };
+  const oldWay = (t, id) => { const c = convertV2TsvToV1Tsv(t); const p = prepareReportTsv(c.tsv, id, 'run-eq', { source: 'v2', sourceFileHash: sha(t) }); return { ...p, v2RowCount: c.v2Rows, unknown: c.unknown, itemCodeUnresolved: c.itemCodeUnresolved }; };
+  const view = (p) => JSON.stringify({ lines: p.lineRows.map(strip), headers: p.headerRows.map(strip), headerRowCount: p.headerRowCount, rowCount: p.rowCount, ctx: strip(p.ctx), hash: p.sourceFileHash, v2RowCount: p.v2RowCount, unknown: p.unknown, itemCodeUnresolved: p.itemCodeUnresolved });
+  const S5 = 'S904', h5 = { ...V2_ROWS[0], 'settlement-id': S5 }, v2e = (o) => ({ ...v2(o), 'settlement-id': S5 });
+  const ambiguous = [   // ポイントの品物の番号が 2 つに割れる (補えない) + 1 つに決まる + 料金の部分のまとめ + 規則に無い + 単独の税
+    v2e({ 'transaction-type': 'Order', 'order-id': 'Q1', sku: 'SKU-Q', 'order-item-code': 'QI1', 'quantity-purchased': '1', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '100.00' }),
+    v2e({ 'transaction-type': 'Order', 'order-id': 'Q1', sku: 'SKU-Q', 'order-item-code': 'QI2', 'quantity-purchased': '1', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '100.00' }),
+    v2e({ 'transaction-type': 'Order', 'order-id': 'Q1', sku: 'SKU-Q', 'order-item-code': '', 'amount-type': 'Points', 'amount-description': 'PointsGranted', amount: '-2.00' }),
+    v2e({ 'transaction-type': 'Order', 'order-id': 'Q2', sku: 'SKU-R', 'order-item-code': 'QI3', 'quantity-purchased': '1', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '7.00' }),
+    v2e({ 'transaction-type': 'Order', 'order-id': 'Q2', sku: 'SKU-R', 'order-item-code': '', 'amount-type': 'Points', 'amount-description': 'PointsGranted', amount: '-1.00' }),
+    v2e({ 'transaction-type': 'FBAFees', 'order-id': 'Q3', 'amount-type': 'FBA Removal Order: Return Fee', 'amount-description': 'Tax on fee', amount: '-5.00' }),
+    v2e({ 'transaction-type': 'NewThing', 'amount-type': 'Mystery', 'amount-description': 'x', amount: '-7.00' }),
+    v2e({ 'transaction-type': 'Order', 'order-id': 'Q4', sku: 'SKU\rLONE', 'order-item-code': 'QI4', 'quantity-purchased': '3', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '9.00' }),   // 値の中の \r (改行ではない)
+  ];
+  const cases = [
+    ['本番で見た形 (この試験の V2)', V2_TSV],
+    ['補えない・規則に無い・単独の税・値の中の \\r', tsvOf(V2_COLUMNS, [h5, ...ambiguous])],
+    ['CRLF の改行・空の行・空白だけの行', tsvOf(V2_COLUMNS, [h5, ...ambiguous]).replace(/\n/g, '\r\n').replace(/(\r\n)(?=[^\r\n]*QI3)/, '$1\r\n   \r\n')],
+    ['見出しが 2 行', tsvOf(V2_COLUMNS, [h5, { ...h5, 'total-amount': '1.00' }, ambiguous[0]])],
+  ];
+  for (const [label, t] of cases) {
+    const a = view(oldWay(t, 'R-EQ')), b = view(prepareV2ReportTsv(t, 'R-EQ', 'run-eq'));
+    ok(a === b, `🚨 1 行ずつの並べ直し = 前の形と同じ行・行番号・数 (${label})`);
+  }
+  // 行番号が実際に飛ぶ形も確かめる (同じだけでなく、前の形が行番号を持っている = 比べる意味がある)
+  const pB = prepareV2ReportTsv(cases[1][1], 'R-EQ', 'run-eq');
+  ok(pB.lineRows.length > 0 && pB.lineRows.every((r, k) => k === 0 || r.source_line_no > pB.lineRows[k - 1].source_line_no), '行番号は増えていく (比べる値が空でない)');
+  // 前の形と同じく、並べ直しで止まる例外は同じ文で止まる
+  const bad = tsvOf(V2_COLUMNS, [h5, v2e({ 'transaction-type': 'Order', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: 'abc' })]);
+  let e1 = null, e2 = null;
+  try { oldWay(bad, 'R-X'); } catch (e) { e1 = e.message; }
+  try { prepareV2ReportTsv(bad, 'R-X', 'run-eq'); } catch (e) { e2 = e.message; }
+  ok(e1 && e1 === e2, `並べ直しの例外は前の形と同じ (${e2})`);
 }
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== V2 並べ直しテスト ALL PASS ===');

@@ -1040,6 +1040,102 @@ await t('🚨 変換が作る payload は全部 JS と SQL の等式を通る (#
   assert.ok(withClass > 50 && feeRows > 50, `分けられない部品のある行 ${withClass}・月の手数料の行 ${feeRows} (場面が薄い)`);
 });
 
+// ── 🆕 #1567 メモリ (本番の写しの --measure で最大 RSS 1,560 MB): 走査で 51 万件を同時に持たない形が、前の形と同じ値を出すこと ──
+await t('🆕 #1567 メモリ: 受領記録の一時の表 (receiptSpool) の要約 = 配列の receiptDigest (並びの違う番号・疑似注文・lines 0 は除く・何度でも) / 同じ番号 2 回・形の違いは同じく止まる', async () => {
+  const { receiptSpool } = await import('../apps/company-db/push/amazon-finance.mjs');
+  const { receiptDigest } = await import('../apps/company-db/finance/coverage-manifest.mjs');
+  const rc = (no, lines = 2, tv = 'amazon_finance_v2') => ({ mall_order_no: no, set_checksum: (no.length.toString(16) + 'c').repeat(64).slice(0, 64), transform_version: tv, lines });
+  // 送り手の yield の順 (注文の JS の並べ替え → 疑似注文) と UTF-8 のバイトの順が違う番号を混ぜる ('+' < '-:' < '/' < 数字 < 大文字 < 小文字)
+  const items = [rc('503-0000002-0000001', 3), rc('Zz-1'), rc('a.b'), rc('+abc'), rc('/x'), rc('250-0000001-0000001', 5, null), rc('-:2026-01-05', 1), rc('-:2025-12-31', 4), rc('gone', 0)];
+  const sp = receiptSpool();
+  for (const x of items) sp.push(x);
+  const want = receiptDigest(items);
+  assert.deepEqual(sp.summary(), want);
+  assert.deepEqual(sp.summary(), want);   // 何度でも (coordinator の dry-run と本番の判定)
+  assert.equal(sp.length, 8);             // lines 0 (墓石) は入れない
+  // 多めの乱数 (受け口の注文番号の形の文字だけ) でも同じ
+  let seed = 7; const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const CH = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._:+/=-';
+  const many = new Map();
+  for (let i = 0; i < 3000; i++) {
+    const no = rnd() < 0.05 ? `-:2026-0${1 + Math.floor(rnd() * 9)}-1${Math.floor(rnd() * 10)}` : CH[Math.floor(rnd() * 64)] + Array.from({ length: 1 + Math.floor(rnd() * 20) }, () => CH[Math.floor(rnd() * CH.length)]).join('');
+    many.set(no, rc(no, Math.floor(rnd() * 4)));
+  }
+  const sp2 = receiptSpool();
+  for (const x of [...many.values()].sort((a, b) => (a.mall_order_no < b.mall_order_no ? -1 : 1))) sp2.push(x);
+  assert.deepEqual(sp2.summary(), receiptDigest([...many.values()]));
+  sp.close(); sp2.close();
+  assert.throws(() => sp.summary(), /閉じた後/);
+  // 同じ番号が 2 回 = どちらも止まる (coverage の理由 receipt_digest)
+  const dup = [rc('O1'), rc('O1', 3)];
+  const sp3 = receiptSpool(); dup.forEach((x) => sp3.push(x));
+  assert.throws(() => receiptDigest(dup), /UTF-8 のバイトの順でない/);
+  assert.throws(() => sp3.summary(), /UTF-8 のバイトの順でない/);
+  sp3.close();
+  // 形の違い = どちらも止まる (SQLite を通して値が変わる物を黙って通さない)
+  for (const bad of [{ ...rc('O2'), transform_version: undefined }, { ...rc('O2'), lines: 2n }, { ...rc('O2'), mall_order_no: 5 }, { ...rc('O2'), lines: 1.5 }, { ...rc('O2'), lines: -1 }, { ...rc('O2'), mall_order_no: '' }, null]) {
+    const sp4 = receiptSpool(); sp4.push(bad);
+    assert.throws(() => receiptDigest([bad]), undefined, JSON.stringify(bad, (k, v) => (typeof v === 'bigint' ? `${v}n` : v)));
+    assert.throws(() => sp4.summary(), undefined, JSON.stringify(bad, (k, v) => (typeof v === 'bigint' ? `${v}n` : v)));
+    sp4.close();
+  }
+});
+await t('🆕 #1567 メモリ: 台帳の指紋を 1 つずつ引く口 (fingerprintLookup) = loadFingerprints の Map と同じ (get・has・指紋 \'\' の鍵・別の kind は見ない) / 財務の送り手は Map を作らず、結果は Map の形と同じ', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fp-lookup-'));   // 同じファイルの台帳 = 別の kind の行が同じ表にある
+  const l = openLedger(dir, { kind: FINANCE_KIND });
+  const other = openLedger(dir, { kind: 'mall_order' });
+  try {
+    other.markSent([{ key: 'amazon|jp|B', fp: 'other-kind' }, { key: 'amazon|jp|E', fp: '' }], 1);
+    l.trackKeys(['amazon|jp|A', 'amazon|jp|B', 'amazon|jp|C']);
+    l.markSent([{ key: 'amazon|jp|A', fp: 'f1' }, { key: 'amazon|jp|D', fp: 'f4' }], 1);
+    const m = l.loadFingerprints(), z = l.fingerprintLookup();
+    for (const k of ['amazon|jp|A', 'amazon|jp|B', 'amazon|jp|C', 'amazon|jp|D', 'amazon|jp|E', 'amazon|jp|X', 'amazon|jp|A']) { assert.equal(z.get(k), m.get(k), k); assert.equal(z.has(k), m.has(k), k); }
+    assert.equal(z.get('amazon|jp|B'), '');   // 別の kind の同じ鍵 (other-kind) を引かない
+    assert.deepEqual([...z.emptyKeys()].sort(), [...m].filter(([, fp]) => fp === '').map(([k]) => k).sort());
+    assert.deepEqual([...z.emptyKeys()].sort(), ['amazon|jp|B', 'amazon|jp|C']);
+  } finally { l.close(); other.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  // 財務の送り手 (dry-run) = Map を読まない・同じ台帳で Map の形 (lazyFingerprints: false) と同じ結果
+  let loaded = 0; const orig = L0.loadFingerprints; L0.loadFingerprints = () => { loaded++; return orig(); };
+  try {
+    const lazy = await pushClose(L0, { mode: 'full', dryRun: true });
+    assert.equal(loaded, 0, 'Map を読んだ');
+    const map = await pushClose(L0, { mode: 'full', dryRun: true, lazyFingerprints: false });
+    assert.equal(loaded, 1);
+    const pick = (r) => ({ scanned: r.scanned, inScope: r.inScope, unchanged: r.unchanged, changed: r.changed, transformErrors: r.transformErrors.length,
+      unconfirmed: r.finance.unconfirmed, skippedEmpty: r.finance.skippedEmpty, renderOnly: r.finance.renderOnly, receipts: r.finance.receipts, lines: r.finance.lines });
+    assert.deepEqual(pick(lazy), pick(map));
+    assert.ok(lazy.scanned > 5 && lazy.finance.receipts > 0, `場面が薄い (${lazy.scanned} 注文・受領 ${lazy.finance.receipts})`);
+  } finally { L0.loadFingerprints = orig; }
+});
+await t('🆕 #1567 メモリ: 変わった注文の鍵ごとの月・重さの一時の表 (changedSpool) = 前の配列と Map と同じ (同じ鍵は後の値・無い鍵は undefined・入れた順)', async () => {
+  const { changedSpool } = await import('../apps/company-db/push/amazon-finance.mjs');
+  const c = changedSpool();
+  try {
+    const arr = [], map = new Map();
+    for (const [k, ms, w] of [['amazon|jp|B', ['2026-01'], 3], ['amazon|jp|A', ['2025-12', '2026-01'], 7], ['amazon|jp|B', ['2026-02'], 0], ['amazon|jp|C', [], 2]]) {
+      c.put(k, ms.join(','), w); arr.push([k, ms]); map.set(k, w);
+    }
+    for (const k of ['amazon|jp|A', 'amazon|jp|B', 'amazon|jp|C', 'amazon|jp|X']) assert.equal(c.weight(k), map.get(k), k);
+    // 台帳に書く値 = 前の putMany (同じ鍵は後が勝つ) と同じ
+    const last = new Map(arr.map(([k, ms]) => [k, ms.join(',')]));
+    assert.deepEqual(new Map(c.entries()), last);
+    assert.deepEqual([...c.entries()].map(([k]) => k), ['amazon|jp|B', 'amazon|jp|A', 'amazon|jp|C']);
+  } finally { c.close(); c.close(); }
+});
+await t('🆕 #1567 メモリ: 読み直す注文の記録を消す候補 = この読み取りで記録のある注文だけ (前は作れた全部の注文) / 消える記録は前と同じ (作れた・送るものが無い注文の R 以下)', async () => {
+  wdb.prepare(`delete from amazon_settlement_dirty_orders`).run();
+  const R = wdb.prepare(`select revision from amazon_settlement_source_revision where id = 1`).get().revision;
+  const ins = wdb.prepare(`insert into amazon_settlement_dirty_orders (mall_order_no, revision, first_revision, updated_at) values (?, ?, ?, '2026-10-01 00:00:00')`);
+  for (const no of ['O1', 'O2', 'O-NOPE']) ins.run(no, R, R);   // O-NOPE = 行も台帳の指紋も Render の鍵も無い = 送るものが無い
+  let seen = null;
+  const r = await pushClose(L0, { mode: 'full', dirty: { clear: (nos, rev) => { seen = [...nos].sort(); return clearDirtyOrders(wdb, nos, rev); } } });
+  assert.equal(r.ok, true);
+  assert.deepEqual(seen, ['O-NOPE', 'O1', 'O2'], `消す候補 ${JSON.stringify(seen)}`);
+  assert.ok(r.scanned > 5, `作れた注文は候補より多い (${r.scanned})`);
+  assert.equal(r.finance.dirtyCleared, 3);
+  assert.equal(wdb.prepare(`select count(*) n from amazon_settlement_dirty_orders`).get().n, 0);
+});
+
 server.close();
 try { wdb.close(); } catch { /* */ }
 fs.rmSync(tmpDir, { recursive: true, force: true });
