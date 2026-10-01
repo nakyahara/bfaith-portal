@@ -256,28 +256,24 @@ export function setMallState(
  * 画像の作業の話で、ボードの D&D で人が決める方が実態に合うため。
  * 呼ぶのは**モールの状態が done に変わった瞬間だけ** — すでに done の行の URL やメモを
  * 直したときにも呼ぶと、人が開き直した ⑧ を黙って閉じてしまう。
- * fail-soft: ここで失敗してもモールの更新は成功しているので throw しない。
+ *
+ * 🚨 例外は**飲まない** (syncListingStep と同じ)。呼び出し元のトランザクションの中なので、
+ * ここで catch して続けると「トランザクションが中断されているのに続行」になりうる
+ * (SQLITE_BUSY / FULL は自動ロールバックする)。失敗したらモールの更新ごと巻き戻して
+ * 人に見せる方が、工程だけズレた状態より安全。行が無い商品は changes=0 で false。
+ * @returns {boolean} この呼び出しで ⑧ を完了にしたか
  */
 function syncImageRakutenStep(db, draftId, mall, actor) {
   if (mall !== 'rakuten') return false;
-  try {
-    const rk = db.prepare(`
-      SELECT state FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'
-    `).get(Number(draftId));
-    if (rk?.state !== 'done') return false;
-    const info = db.prepare(`
-      UPDATE draft_step_progress
-      SET state = 'done', done_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), done_by = ?,
-          version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      WHERE draft_id = ? AND step_code = 'imgd_rakuten' AND state NOT IN ('done', 'skip')
-    `).run(actor || 'system', Number(draftId));
-    if (info.changes !== 1) return false;
-    logEvent(db, Number(draftId), 'step_changed', '楽天登録: 楽天モールを完了にしたので画像工程も完了にしました', actor);
-    return true;
-  } catch (e) {
-    console.warn('[product-hub] 画像工程⑧の自動完了に失敗:', e.message);
-    return false;
-  }
+  const info = db.prepare(`
+    UPDATE draft_step_progress
+    SET state = 'done', done_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), done_by = ?,
+        version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE draft_id = ? AND step_code = 'imgd_rakuten' AND state NOT IN ('done', 'skip')
+  `).run(actor || 'system', Number(draftId));
+  if (info.changes !== 1) return false;
+  logEvent(db, Number(draftId), 'step_changed', '楽天登録: 楽天モールを完了にしたので画像工程も完了にしました', actor);
+  return true;
 }
 
 /**
