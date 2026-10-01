@@ -972,8 +972,10 @@ export function setStepState(
       }
     }
     // ⑧ 楽天登録 = 出品成功で自動完了する工程。人が (admin でも) 出品なしに done にできない (Codex R2 high)。
-    // 例外 = 楽天登録の根拠 (アプリ経由の登録記録 / モール別状況の楽天 done) がある商品 (アプリ以前に手で出した商品)
-    if (state === 'done' && code === 'imgd_rakuten' && !systemActor) {
+    // 例外 = 楽天登録の根拠 (アプリ経由の登録記録 / モール別状況の楽天 done) がある商品 (アプリ以前に手で出した商品)。
+    // 🚨 見るのは工程コードでなく **image_stage** (2026-10-01)。上の boardMove の権限の例外も
+    //    同じキーで絞っているので、片方だけが当たる工程 (将来 rakuten 段階の工程が増えたとき) を作らない
+    if (state === 'done' && row.track === 'image' && row.image_stage === IMAGE_RAKUTEN_STAGE && !systemActor) {
       const evidence = db.prepare(`
         SELECT 1 WHERE EXISTS (SELECT 1 FROM draft_rakuten WHERE draft_id = @id AND registered_at IS NOT NULL)
            OR EXISTS (SELECT 1 FROM draft_mall_status WHERE draft_id = @id AND mall = 'rakuten' AND state = 'done')
