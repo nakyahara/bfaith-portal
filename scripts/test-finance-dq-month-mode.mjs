@@ -14,6 +14,7 @@ import {
   monthStartEmptyGrace, monthStartEmptyNote, parseNowArg, resolveDqNow, prevMonthOf,
   MONTH_START_GRACE, MONTH_START_JANUARY_EXTRA_DAYS, monthStartGraceDays, MONTH_START_GRACE_PREFIX, isMonthStartGraceSummary,
   SKIP_IN_MONTH_START_GRACE, applyMonthStartSkip, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, monthHadRowsBefore, prevMonthFreshness, decideMonthStartEmpty,
+  ensureMonthHighWater, markMonthHighWater, migrateLegacyHighWater, prepareMonthHighWater, isRealYmd,
 } from '../apps/warehouse/finance-dq-month-mode.js';
 
 let failures = 0;
@@ -140,37 +141,73 @@ check('parseNowArg: +09:00 と Z を受ける / 時差の無い日時・日付�
 
 // ── DB を見る判定 (条件 ②③④。メモリの SQLite) ──
 const DQ_DDL = `CREATE TABLE dq_run_results (run_id TEXT, check_name TEXT, severity TEXT, actual_value REAL, threshold_value REAL, details_json TEXT, checked_at TEXT, PRIMARY KEY (run_id, check_name));`;
-function memDb() { const d = new Database(':memory:'); d.exec(DQ_DDL); d.exec('CREATE TABLE f_yahoo_finance_sku_daily_v1 (date_jst TEXT, k TEXT)'); return d; }
-const putDq = (d, runId, check, actual, details) => d.prepare('INSERT INTO dq_run_results VALUES (?, ?, ?, ?, NULL, ?, ?)').run(runId, check, 'info', actual, details === undefined ? null : (typeof details === 'string' ? details : JSON.stringify(details)), 'x');
+/** DQ の入口と同じく印の表を作った DB (ensure = false なら作らない) */
+function memDb({ ensure = true } = {}) { const d = new Database(':memory:'); d.exec(DQ_DDL); d.exec('CREATE TABLE f_yahoo_finance_sku_daily_v1 (date_jst TEXT, k TEXT)'); if (ensure) ensureMonthHighWater(d); return d; }
+const putDq = (d, runId, check, actual, details, checkedAt = '2026-10-01T22:05:00.000Z') => d.prepare('INSERT INTO dq_run_results VALUES (?, ?, ?, ?, NULL, ?, ?)')
+  .run(runId, check, 'info', actual, details === undefined ? null : (typeof details === 'string' ? details : JSON.stringify(details)), checkedAt);
+/** 前の PR より前の、全部の検査を流した run を 1 つ置く (row_count_drift + そのモールの検査の名前) */
+const LEGACY_CHECKS = {
+  yahoo: ['listing_diff_pct', 'missing_cost_rate_pct', 'shipping_missing_rate_pct', 'unresolved_sku_rate_pct', 'whitelist_coverage_pct', 'resolved_but_zero_cost_count', 'normalized_collision_count'],
+  aupay: ['normalized_collision_count', 'request_price_reconcile_diff_pct', 'allocation_conservation_diff_pct'],
+  linegift: ['fee_rate_drift_pct', 'monthless_received_rows'],
+  qoo10: ['settle_price_formula_match_pct', 'match_tier_distribution'],
+  rakuten: ['listing_diff_pct', 'date_mismatch_units'],
+  amazon: ['monthly_total_diff_pct', 'long_only_skus'],
+};
+function putLegacyRun(d, runId, mall, rowDetails, checkedAt) {
+  putDq(d, runId, 'row_count_drift', rowDetails?.daily_row_count ?? 1, rowDetails, checkedAt);
+  for (const c of LEGACY_CHECKS[mall]) putDq(d, runId, c, 0, {}, checkedAt);
+}
+const hw = (d, mall, ym) => d.prepare('SELECT * FROM dq_month_high_water WHERE mall = ? AND month = ?').get(mall, ym);
 {
   const d = memDb();
-  check('印: 記録が無い → 一度も行が無い (false)', monthHadRowsBefore(d, 'yahoo', '2026-10') === false);
-  putDq(d, 'r1', MONTH_ROW_COUNT_CHECK, 0, monthRowCountDetails('yahoo', '2026-10', 0));
-  check('印: month_row_count = 0 → false', monthHadRowsBefore(d, 'yahoo', '2026-10') === false);
-  putDq(d, 'r2', MONTH_ROW_COUNT_CHECK, 12, monthRowCountDetails('aupay', '2026-10', 12));
-  putDq(d, 'r3', MONTH_ROW_COUNT_CHECK, 12, monthRowCountDetails('yahoo', '2026-09', 12));
+  check('印: 印が無い → 一度も行が無い (false)', monthHadRowsBefore(d, 'yahoo', '2026-10') === false);
+  check('印: 0 行では印を付けない', markMonthHighWater(d, 'yahoo', '2026-10', 0, 'x') === false && monthHadRowsBefore(d, 'yahoo', '2026-10') === false);
+  markMonthHighWater(d, 'aupay', '2026-10', 12, 'x'); markMonthHighWater(d, 'yahoo', '2026-09', 12, 'x');
   check('印: ほかのモール・ほかの月の印は数えない', monthHadRowsBefore(d, 'yahoo', '2026-10') === false);
-  putDq(d, 'manual-run', MONTH_ROW_COUNT_CHECK, 5, monthRowCountDetails('yahoo', '2026-10', 5));
-  check('印: month_row_count > 0 (run_id は手で付けた名前でも) → true', monthHadRowsBefore(d, 'yahoo', '2026-10') === true);
+  markMonthHighWater(d, 'yahoo', '2026-10', 5, '2026-10-02T00:00:00Z');
+  check('印: 行が 1 以上 → true', monthHadRowsBefore(d, 'yahoo', '2026-10') === true);
+  markMonthHighWater(d, 'yahoo', '2026-10', 2, '2026-10-03T00:00:00Z');
+  const h = hw(d, 'yahoo', '2026-10');
+  check('印: 減らない (5 → 2 を付けても 5)・最初に見た時刻は変わらない', h.max_row_count === 5 && h.first_nonzero_at === '2026-10-02T00:00:00Z', JSON.stringify(h));
+  check('印: 表の形で 0 以下の印は入らない (CHECK)', throws(() => d.prepare("INSERT INTO dq_month_high_water VALUES ('yahoo', '2026-11', 'x', 0, 'dq')").run()));
+  check('印: 表が無い DB → true (DQ は猶予を使わない向き)', monthHadRowsBefore(memDb({ ensure: false }), 'yahoo', '2026-10') === true);
+  ensureMonthHighWater(d);
+  check('印: 表を作り直しても (CREATE IF NOT EXISTS) 印は残る', monthHadRowsBefore(d, 'yahoo', '2026-10') === true);
 }
 {
+  // 🚨 R2 High 1: 同じ run_id の再実行で印が消えない (DQ と同じ順: 印を付ける → dq_run_results の DELETE → 0 行の回)
   const d = memDb();
-  putDq(d, 'dq-yahoo-2026-10-20261001T0705', 'row_count_drift', 0, { daily_row_count: 0 });
-  check('印 (前の PR より前の記録): 0 行の run (daily_row_count 0) → false', monthHadRowsBefore(d, 'yahoo', '2026-10') === false);
-  putDq(d, 'dq-yahoo-2026-10-20261002T0705', 'row_count_drift', 40, { daily_row_count: 40 });
-  check('印 (前の記録): daily_row_count > 0 の run → true', monthHadRowsBefore(d, 'yahoo', '2026-10') === true);
+  prepareMonthHighWater(d, { mall: 'yahoo', ym: '2026-10', count: 3, at: 't1' });
+  putDq(d, 'same-run', MONTH_ROW_COUNT_CHECK, 3, monthRowCountDetails('yahoo', '2026-10', 3));
+  d.prepare('DELETE FROM dq_run_results WHERE run_id = ?').run('same-run');
+  prepareMonthHighWater(d, { mall: 'yahoo', ym: '2026-10', count: 0, at: 't2' });
+  check('印 (R2 High 1): 同じ run_id の記録を消して 0 行で流し直しても、印は残る (true)', monthHadRowsBefore(d, 'yahoo', '2026-10') === true && hw(d, 'yahoo', '2026-10').max_row_count === 3);
 }
 {
+  // 前の PR より前の記録を 1 回だけ移す (run_id の形に頼らない)
   const d = memDb();
-  putDq(d, 'dq-qoo10-2026-10-20261003T0705', 'row_count_drift', 0, { expected_latest_date: '2026-10-02', latest_count: 0, ratio: '0.000' });
-  check('印 (前の記録): LINE・Qoo10 の「直近 8 日」の記録 (daily_row_count なし = 当月の行が 1 以上のときだけ出る) → true', monthHadRowsBefore(d, 'qoo10', '2026-10') === true);
-  check('印 (前の記録): 別の月の run_id は数えない', monthHadRowsBefore(d, 'qoo10', '2026-11') === false);
-}
-{
-  const d = memDb();
-  putDq(d, 'dq-yahoo-2026-10-x', 'row_count_drift', 1, 'not json');
-  check('印: 壊れた details (JSON でない) の前の記録 → true (猶予を使わない向き)', monthHadRowsBefore(d, 'yahoo', '2026-10') === true);
-  check('印: 表が無い DB → true (猶予を使わない向き)', monthHadRowsBefore(new Database(':memory:'), 'yahoo', '2026-10') === true);
+  putLegacyRun(d, 'dq-yahoo-2026-10-20261001T2205', 'yahoo', { daily_row_count: 0 });
+  putLegacyRun(d, 'dq-rakuten-2026-10-20261002T2205', 'rakuten', { daily_row_count: 40 });
+  putLegacyRun(d, 'my-manual-check', 'aupay', { daily_row_count: 7 }, '2026-10-02T00:30:00.000Z');          // 手で付けた run_id (JST 10/2 09:30)
+  putLegacyRun(d, 'line-test', 'linegift', { expected_latest_date: '2026-10-01', latest_count: 0, ratio: '0.000' }, '2026-10-02T23:00:00.000Z');   // JST 10/3 = 当月の「直近 8 日」の形
+  putLegacyRun(d, 'qoo10-hand', 'qoo10', { daily_row_count: 0 }, '2026-10-02T00:00:00.000Z');               // 手で付けた・0 行
+  putLegacyRun(d, 'yahoo-broken', 'yahoo', 'not json', '2026-08-15T00:00:00.000Z');                         // 壊れた details = 行があった側 (JST 8/15 = 2026-08)
+  putLegacyRun(d, 'dq-amazon-2026-10-x', 'amazon', { daily_row_count: 9 });                                 // Amazon は対象外
+  putDq(d, 'no-signature', 'row_count_drift', 5, { daily_row_count: 5 }, '2026-10-02T00:00:00.000Z');       // モールが当てられない
+  putDq(d, 'r1-form', MONTH_ROW_COUNT_CHECK, 4, monthRowCountDetails('qoo10', '2026-09', 4));               // R1 の形
+  const n = migrateLegacyHighWater(d, 'now');
+  check('移す: 既定の run_id の 0 行の run → 印なし (Yahoo 2026-10)', !hw(d, 'yahoo', '2026-10'));
+  check('移す: 既定の run_id の行のある run → 印 (楽天 2026-10)', hw(d, 'rakuten', '2026-10')?.max_row_count === 40);
+  check('移す (R2): 手で付けた run_id でも、検査の組み合わせでモール・checked_at の JST の月で印 (au PAY 2026-10)', hw(d, 'aupay', '2026-10')?.max_row_count === 7 && hw(d, 'aupay', '2026-10').source === 'legacy');
+  check('移す: 手で付けた run_id の LINE の「直近 8 日」の形 → 印 (JST 10/3 = 2026-10)', !!hw(d, 'linegift', '2026-10'));
+  check('移す: 手で付けた run_id の 0 行 → 印なし (Qoo10 2026-10)', !hw(d, 'qoo10', '2026-10'));
+  check('移す: 壊れた details → 行があった側に数える (Yahoo 2026-08 の印)', !!hw(d, 'yahoo', '2026-08'));
+  check('移す: R1 の形 (month_row_count) も数える (Qoo10 2026-09)', hw(d, 'qoo10', '2026-09')?.max_row_count === 4);
+  check('移す: Amazon とモールが当てられない run は数えない', d.prepare("SELECT COUNT(*) AS c FROM dq_month_high_water WHERE mall NOT IN ('rakuten','yahoo','aupay','linegift','qoo10')").get().c === 0 && n === 5, `marked=${n}`);
+  putLegacyRun(d, 'dq-qoo10-2026-11-later', 'qoo10', { daily_row_count: 3 });
+  check('移す: 2 回目は何もしない (済みの印)・後から足した記録は移さない', migrateLegacyHighWater(d, 'now2') === null && !hw(d, 'qoo10', '2026-11'));
+  check('移す: dq_run_results が無い DB でも落ちない (移すもの 0)', (() => { const e = new Database(':memory:'); ensureMonthHighWater(e); return migrateLegacyHighWater(e, 'x') === 0; })());
 }
 {
   const d = memDb();
@@ -178,6 +215,9 @@ const putDq = (d, runId, check, actual, details) => d.prepare('INSERT INTO dq_ru
   const a = fr('2026-09-30'); const b = fr('2026-09-25'); const c = fr('2026-09-24'); const e = fr(null);
   check('前月の新しさ: 末日 → ok (0 日) / 5 日前 → ok / 6 日前 → だめ / 前月の行が無い → だめ',
     a.ok && a.gapDays === 0 && b.ok && b.gapDays === 5 && !c.ok && c.gapDays === 6 && !e.ok && e.maxDate === null, JSON.stringify([a, b, c, e]));
+  const bad = ['2026-09-99', '2026-09-31', '2026-09-3', '2026-09-30x'].map((s) => fr(s));
+  check('前月の新しさ (R2): 実在しない日付 (9/99・9/31)・形の違う日付 → だめ (invalid)', bad.every((x) => !x.ok && x.invalid === true), JSON.stringify(bad));
+  check('isRealYmd: 実在の日だけ true (うるう年も見る)', isRealYmd('2028-02-29') && !isRealYmd('2026-02-29') && !isRealYmd('2026-09-31') && !isRealYmd('2026-13-01') && !isRealYmd('2026-9-1') && !isRealYmd(null));
   d.exec('DELETE FROM f_yahoo_finance_sku_daily_v1'); d.prepare('INSERT INTO f_yahoo_finance_sku_daily_v1 VALUES (?, ?)').run('2026-12-28', 'a');
   const j = prevMonthFreshness(d, 'f_yahoo_finance_sku_daily_v1', '2027-01', 5);
   check('前月の新しさ: 年の境界 (1 月に 12/28 まで = 3 日前) → ok', j.ok && j.prevYm === '2026-12' && j.gapDays === 3, JSON.stringify(j));
@@ -195,7 +235,7 @@ const putDq = (d, runId, check, actual, details) => d.prepare('INSERT INTO dq_ru
   check('判定: 猶予を過ぎた → 猶予なし', ng2.grace === false && ng2.reasons.some((r) => r.includes('過ぎた')));
   const ng3 = decideMonthStartEmpty(d, { mall: 'yahoo', ym: '2026-09', now: day1 });
   check('判定: 前月 → 猶予なし', ng3.grace === false && ng3.reasons.includes('当月でない'));
-  putDq(d, 'dq-yahoo-2026-10-a', MONTH_ROW_COUNT_CHECK, 3, monthRowCountDetails('yahoo', '2026-10', 3));
+  markMonthHighWater(d, 'yahoo', '2026-10', 3, 'x');
   const ng4 = decideMonthStartEmpty(d, { mall: 'yahoo', ym: '2026-10', now: jst(2026, 10, 2, 7) });
   check('判定 (High 1): 一度 0 でなくなった月の 0 行 → 猶予なし', ng4.grace === false && ng4.hadRowsBefore === true && ng4.reasons.some((r) => r.includes('前に行があった')));
   const d2 = memDb(); d2.prepare('INSERT INTO f_yahoo_finance_sku_daily_v1 VALUES (?, ?)').run('2026-09-20', 'a');
@@ -203,6 +243,9 @@ const putDq = (d, runId, check, actual, details) => d.prepare('INSERT INTO dq_ru
   check('判定 (High 2): 前月の最新が 9/20 (末日の 10 日前) = 前月の終わりから止まっている → 猶予なし', ng5.grace === false && ng5.reasons.some((r) => r.includes('止まっている疑い')));
   const ng6 = decideMonthStartEmpty(memDb(), { mall: 'yahoo', ym: '2026-10', now: day1 });
   check('判定 (High 2): 前月の行が無い → 猶予なし', ng6.grace === false && ng6.reasons.some((r) => r.includes('行が無い')));
+  const d3 = memDb(); d3.prepare('INSERT INTO f_yahoo_finance_sku_daily_v1 VALUES (?, ?)').run('2026-09-99', 'a');
+  const ng7 = decideMonthStartEmpty(d3, { mall: 'yahoo', ym: '2026-10', now: day1 });
+  check('判定 (R2 Medium 1): 前月の最新の日付が 2026-09-99 (実在しない) → 猶予なし', ng7.grace === false && ng7.reasons.some((r) => r.includes('実在の日でない')), JSON.stringify(ng7.reasons));
 }
 
 // ── 5 本の DQ と 3 本の sync を子プロセスで (一時の DATA_DIR の SQLite・本番の DB には触らない) ──
@@ -301,8 +344,32 @@ for (const { mall, table, script } of MALLS) {
     const h2 = runDq(dir, script, '2026-10', DAY(2), 't-vanished');
     check(`${mall} (High 1): 一度 0 でなくなった月が 0 行に戻った → 猶予の中 (2 日) でも exit 1・CRITICAL・理由 = 前に行があった`,
       h2.code === 1 && /前に行があった/.test(h2.err) && res(dir, 't-vanished').row_count_drift?.severity === 'error', `code=${h2.code} ${h2.err.slice(-300)}`);
+    check(`${mall}: 印 dq_month_high_water に この月の印 (max_row_count 1・source dq) が残っている`,
+      withDb(dir, (d) => d.prepare("SELECT max_row_count, source FROM dq_month_high_water WHERE mall = ? AND month = '2026-10'").get(mall))?.max_row_count === 1);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+  // 🚨 R2 High 1: 同じ run_id で流し直す (行のある回 → 行が消えて同じ run_id でもう一度)
+  const dir3 = makeDir(mall, table);
+  try {
+    withDb(dir3, (d) => { addFactRow(d, table, '2026-09-30'); addFactRow(d, table, '2026-10-01'); });
+    const s1 = runDq(dir3, script, '2026-10', DAY(2), 'same-run-id');
+    withDb(dir3, (d) => d.prepare(`DELETE FROM ${table} WHERE substr(date_jst, 1, 7) = '2026-10'`).run());
+    const s2 = runDq(dir3, script, '2026-10', DAY(2), 'same-run-id');
+    check(`${mall} (R2 High 1): 同じ run_id で 行あり → 0 行 と流し直すと exit 1・CRITICAL (前の記録が消えても印は残る)`,
+      s1.code !== null && s2.code === 1 && /前に行があった/.test(s2.err) && res(dir3, 'same-run-id').row_count_drift?.severity === 'error', `codes=${s1.code},${s2.code} ${s2.err.slice(-300)}`);
+  } finally {
+    fs.rmSync(dir3, { recursive: true, force: true });
+  }
+  // R2 High 1: この PR より前に、手で付けた run_id で「行がある」を見た記録だけがある DB (初回に印へ移す)
+  const dir4 = makeDir(mall, table);
+  try {
+    withDb(dir4, (d) => { addFactRow(d, table, '2026-09-30'); putLegacyRun(d, 'my-own-check', mall, { daily_row_count: 12 }, '2026-10-01T23:00:00.000Z'); });   // JST 10/2 08:00
+    const l = runDq(dir4, script, '2026-10', DAY(2), 't-legacy');
+    check(`${mall} (R2 High 1): PR 前の手で付けた run_id の「行あり」の記録 → 印へ移り、0 行の 2 日は exit 1・CRITICAL`,
+      l.code === 1 && /前に行があった/.test(l.err), `code=${l.code} ${l.err.slice(-300)}`);
+  } finally {
+    fs.rmSync(dir4, { recursive: true, force: true });
   }
   // High 2: 前月の終わりから止まっている (前月の最新が 9/20) → 1 日でも CRITICAL
   const dir2 = makeDir(mall, table);
@@ -310,6 +377,9 @@ for (const { mall, table, script } of MALLS) {
     withDb(dir2, (d) => addFactRow(d, table, '2026-09-20'));
     const s = runDq(dir2, script, '2026-10', DAY(1), 't-stale');
     check(`${mall} (High 2): 前月の最新が 9/20 (末日の 10 日前) → 当月 1 日でも exit 1・CRITICAL`, s.code === 1 && /止まっている疑い/.test(s.err), `code=${s.code} ${s.err.slice(-300)}`);
+    withDb(dir2, (d) => addFactRow(d, table, '2026-09-99', 'k9'));
+    const bd = runDq(dir2, script, '2026-10', DAY(1), 't-bad-date');
+    check(`${mall} (R2 Medium 1): 前月の最新の日付が 2026-09-99 (実在しない) → 当月 1 日でも exit 1・CRITICAL`, bd.code === 1 && /実在の日でない/.test(bd.err), `code=${bd.code} ${bd.err.slice(-300)}`);
     const p = runDq(dir2, script, '2026-08', DAY(1), 't-past-empty');
     check(`${mall}: 前々月 (2026-08) の 0 行 → exit 1・CRITICAL`, p.code === 1 && /のデータが 0 行/.test(p.err), `code=${p.code}`);
   } finally {
@@ -353,11 +423,14 @@ for (const mall of ['aupay', 'linegift', 'qoo10']) {
   const dir = makeDir(mall, table);
   try {
     const sync = (now, opt) => runNode(dir, `apps/warehouse/sync-${mall}-finance-daily.js`, ['--data-dir', dir, '--month', '2026-10', '--dry-run', '--now', now], opt);
+    const z = sync(DAY(1));
+    check(`sync ${mall}: 印の表がまだ無い (DQ が一度も流れていない) → 判定できない = 今までどおり空の chunk を送る`, z.code === 0 && /empty chunk/.test(z.out), `code=${z.code} ${z.out.slice(-300)}`);
+    withDb(dir, (d) => ensureMonthHighWater(d));
     const a = sync(DAY(1));
     check(`sync ${mall}: 猶予の中・印なしの 0 行 → 空の chunk を送らない (Render を消さない)・exit 0`, a.code === 0 && /Render のその月を消さない/.test(a.out) && !/empty chunk/.test(a.out), `code=${a.code} ${a.out.slice(-300)} ${a.err.slice(-200)}`);
     const b = sync(DAY(GD(mall, '2026-10') + 1));
     check(`sync ${mall}: 猶予を過ぎた 0 行 → 今までどおり空の chunk で消す`, b.code === 0 && /empty chunk/.test(b.out) && !/Render のその月を消さない/.test(b.out), `code=${b.code} ${b.out.slice(-300)}`);
-    withDb(dir, (d) => putDq(d, `dq-${mall}-2026-10-x`, MONTH_ROW_COUNT_CHECK, 4, monthRowCountDetails(mall, '2026-10', 4)));
+    withDb(dir, (d) => markMonthHighWater(d, mall, '2026-10', 4, 'x'));
     const c = sync(DAY(2));
     check(`sync ${mall}: 一度 0 でなくなった月の 0 行 → 猶予の中でも今までどおり空の chunk を送る`, c.code === 0 && /empty chunk/.test(c.out), `code=${c.code} ${c.out.slice(-300)}`);
     const e = sync(DAY(1), { allowNow: false });
@@ -378,20 +451,33 @@ for (const mall of ['aupay', 'linegift', 'qoo10']) {
   ];
   for (const [script, imp, v] of calls) {
     check(`daily-sync: ${script} に取込の結果で猶予の禁止 (monthStartGraceFlag(${imp})) を渡し、結果に warn を付ける`,
-      src.includes(`${script} --data-dir \${DATA_DIR_ARG} --month \${`) && new RegExp(`${script.replace(/\./g, '\\.')} --data-dir \\$\\{DATA_DIR_ARG\\} --month \\$\\{\\w+\\}\\$\\{monthStartGraceFlag\\(${imp}\\)\\}`).test(src)
+      src.includes(`${script} --data-dir \${DATA_DIR_ARG} --month \${`) && new RegExp(`${script.replace(/\./g, '\\.')} --data-dir \\$\\{DATA_DIR_ARG\\} --month \\$\\{\\w+\\}\\$\\{monthStartGraceFlag\\(${imp}(, \\.\\.\\.\\w+)?\\)\\}`).test(src)
       && src.includes(`...${v}, warn: dqMonthStartWarn(${v}) }`));
   }
-  check('daily-sync: Yahoo は月初の猶予の間、前月も build → DQ (sync はしない)', /Yahoo finance build \$\{yahooPrevYm\} \(月初の前月\)/.test(src) && /Yahoo finance DQ \$\{yahooPrevYm\} \(月初の前月\)/.test(src) && !/sync-yahoo-finance-daily\.js[^`]*yahooPrevYm/.test(src));
+  check('daily-sync: Yahoo は月初の猶予の間、前月も build → DQ → (DQ が通れば) sync', /Yahoo finance build \$\{yahooPrevYm\} \(月初の前月\)/.test(src) && /Yahoo finance DQ \$\{yahooPrevYm\} \(月初の前月\)/.test(src)
+    && /if \(yahooPrevDq\.success\) \{\n\s+const yahooPrevSync = runScript\(\n\s+`apps\/warehouse\/sync-yahoo-finance-daily\.js --data-dir \$\{DATA_DIR_ARG\} --month \$\{yahooPrevYm\}`/.test(src));
+  check('daily-sync (R2 Medium 2): 前月の build と DQ の結果を当月の DQ の旗に渡す (どちらか ❌ なら猶予を禁じる)',
+    src.includes('yahooPrevSteps.push(yahooPrevBuild);') && src.includes('yahooPrevSteps.push(yahooPrevDq);') && src.includes('monthStartGraceFlag(yahooResult, ...yahooPrevSteps)')
+    && src.indexOf('yahooPrevSteps.push(yahooPrevDq);') < src.indexOf('monthStartGraceFlag(yahooResult, ...yahooPrevSteps)'));
+  check('daily-sync (R2 Low 1): 1 行ごとの印は resultIcon (warn を見る)', src.includes('const icon = resultIcon(r);') && !src.includes("const icon = r.skipped ? '⏸️' : (r.success ? '✅' : '❌');"));
   // 補助の関数を取り出して動かす (見出し allOk の式は daily-sync の本物と同じかも確かめる)
   const fnSrc = (name) => { const m = src.match(new RegExp(`function ${name}\\([^)]*\\) \\{[^\\n]*\\}`)); return m ? m[0] : null; };
-  const flagSrc = fnSrc('monthStartGraceFlag'); const warnSrc = fnSrc('dqMonthStartWarn');
+  const flagSrc = fnSrc('monthStartGraceFlag'); const warnSrc = fnSrc('dqMonthStartWarn'); const iconSrc = fnSrc('resultIcon');
   const allOkSrc = 'const allOk = results.every(r => r.success && r.warn !== true) && urgentWarnings.length === 0 && diskWarnings.length === 0;';
-  check('daily-sync: 補助の関数 2 つと見出しの式がある', !!flagSrc && !!warnSrc && src.includes(allOkSrc));
-  if (flagSrc && warnSrc) {
+  check('daily-sync: 補助の関数 3 つと見出しの式がある', !!flagSrc && !!warnSrc && !!iconSrc && src.includes(allOkSrc));
+  const grace0 = () => ({ success: true, summary: note });
+  if (flagSrc && warnSrc && iconSrc) {
     // eslint-disable-next-line no-new-func
-    const f = new Function('isMonthStartGraceSummary', `${flagSrc}\n${warnSrc}\nreturn { monthStartGraceFlag, dqMonthStartWarn };`)(isMonthStartGraceSummary);
+    const f = new Function('isMonthStartGraceSummary', `${flagSrc}\n${warnSrc}\n${iconSrc}\nreturn { monthStartGraceFlag, dqMonthStartWarn, resultIcon };`)(isMonthStartGraceSummary);
     check('daily-sync: 取込が ✅ → 旗なし / ❌ → --no-month-start-grace', f.monthStartGraceFlag({ success: true }) === '' && f.monthStartGraceFlag({ success: false }) === ' --no-month-start-grace' && f.monthStartGraceFlag(undefined) === ' --no-month-start-grace');
-    const grace = { success: true, summary: note };
+    const ok = { success: true }; const ng = { success: false };
+    check('daily-sync (R2 Medium 2): Yahoo: 取込・前月の build・前月の DQ が全部 ✅ → 旗なし / どれか ❌ → 猶予を禁じる / 月初でない (前月の工程なし) → 取込だけで決まる',
+      f.monthStartGraceFlag(ok, ok, ok) === '' && f.monthStartGraceFlag(ok, ng) === ' --no-month-start-grace' && f.monthStartGraceFlag(ok, ok, ng) === ' --no-month-start-grace'
+      && f.monthStartGraceFlag(ng, ok, ok) === ' --no-month-start-grace' && f.monthStartGraceFlag(ok, ...[]) === '' && f.monthStartGraceFlag() === ' --no-month-start-grace');
+    check('daily-sync (R2 Low 1): 1 行の印: warn つきの成功 ⚠️ / 成功 ✅ / 失敗 ❌ / 見送り ⏸️',
+      f.resultIcon({ success: true, warn: f.dqMonthStartWarn(grace0()) }) === '⚠️' && f.resultIcon({ success: true }) === '✅' && f.resultIcon({ success: true, warn: false }) === '✅'
+      && f.resultIcon({ success: false }) === '❌' && f.resultIcon({ success: false, skipped: true }) === '⏸️' && f.resultIcon({ success: false, warn: true }) === '❌');
+    const grace = grace0();
     const plainWarn = { success: true, summary: '⚠️  DQ gate passed with 1 warning(s)' };
     const results = [{ success: true, summary: 'ok' }, { ...grace, warn: f.dqMonthStartWarn(grace) }];
     const allOk = results.every((r) => r.success && r.warn !== true);

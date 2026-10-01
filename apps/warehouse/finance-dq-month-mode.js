@@ -68,7 +68,7 @@ export function modeLabel(mode, graceDays = RECENT_PAST_GRACE_DAYS) {
  *
  * 猶予の条件 (decideMonthStartEmpty。1 つでも欠けたら今までどおり CRITICAL):
  *   ① 当月 (JST) で、JST の日 ≤ monthStartGraceDays(mall, ym)
- *   ② この mall・月が前に一度も 0 行でなくなっていない (dq_run_results の記録で見る = 一度入った行が消えたのは本物の異常)
+ *   ② この mall・月が前に一度も 0 行でなくなっていない (消えない印 dq_month_high_water で見る = 一度入った行が消えたのは本物の異常)
  *   ③ 前月の fact の最新の日付が、前月の末日から prevMonthFreshDays 日以内 (前月の終わりから取込が止まっていない)
  *   ④ 呼び手が猶予を禁じていない (daily-sync はこの回のモールの取込が ❌ なら --no-month-start-grace を付ける)
  *
@@ -134,57 +134,156 @@ export function prevMonthOf(ym) {
   return new Date(Date.UTC(y, m - 2, 1)).toISOString().slice(0, 7);
 }
 
-/** 毎回の DQ が残す「この月の行数」の記録 (条件 ② の材料)。check_name は MONTH_ROW_COUNT_CHECK */
+/** 毎回の DQ が dq_run_results に残す「この月の行数」(見るための記録。判定には使わない = 同じ run_id の再実行で消えるため。印は dq_month_high_water) */
 export const MONTH_ROW_COUNT_CHECK = 'month_row_count';
 export function monthRowCountDetails(mall, ym, count) {
-  return { mall, month: ym, month_row_count: count, note: '月初の猶予の印 (一度でも 0 でなかった月は猶予を使わない)' };
+  return { mall, month: ym, month_row_count: count, note: 'この月の行数 (見るための記録。月初の猶予の印は dq_month_high_water)' };
 }
 
 /**
- * 条件 ②: この mall・月が前に一度でも 0 行でなくなったか (dq_run_results の記録で見る)。
- *   - 新しい記録: check_name = 'month_row_count' で actual_value > 0 (details の mall / month で引く)
- *   - それより前の記録 (この PR より前の run): run_id が 'dq-<mall>-<YYYY-MM>-' で始まる row_count_drift のうち
- *     details の daily_row_count が 0 でないもの (0 行の run は必ず daily_row_count: 0 を残している。
- *     LINE・Qoo10 の当月の「直近 8 日」の記録は daily_row_count を持たないが、当月の行が 1 以上のときしか出ない)
- *   表が読めないなど判定できないときは true (= 猶予を使わない向き)
+ * 条件 ② の印 = mall・月ごとの「一度でも 0 行でなくなった」記録 (PR #1572 R2)。
+ *   dq_run_results は同じ run_id の再実行で消える (各 DQ が最初に DELETE する) ので頼らない。
+ *   印は一度付いたら消えない・減らない (max_row_count は大きい方を残すだけ。行を消す・0 に戻す処理はどこにも無い)。
+ *   DQ は dq_run_results の DELETE より前に prepareMonthHighWater を呼ぶ (表を作る → 前の記録を 1 回だけ移す → この回の行数で印を付ける)。
+ */
+export const HIGH_WATER_TABLE = 'dq_month_high_water';
+export function ensureMonthHighWater(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS dq_month_high_water (
+      mall             TEXT NOT NULL,
+      month            TEXT NOT NULL CHECK (month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'),
+      first_nonzero_at TEXT NOT NULL,                       -- 初めて 0 行でなくなったのを見た時刻 (前の記録から移したものはその記録の checked_at)
+      max_row_count    INTEGER NOT NULL CHECK (max_row_count > 0),
+      source           TEXT NOT NULL,                       -- 'dq' (DQ が見た) / 'legacy' (この PR より前の dq_run_results から移した)
+      PRIMARY KEY (mall, month)
+    );
+    CREATE TABLE IF NOT EXISTS dq_month_high_water_legacy (
+      id          INTEGER PRIMARY KEY CHECK (id = 1),       -- 前の記録を移したのは 1 回だけ
+      migrated_at TEXT NOT NULL,
+      marked      INTEGER NOT NULL
+    );`);
+}
+/** 印を付ける (count > 0 のときだけ。既にあれば max_row_count を大きい方にするだけ = 減らない・消えない) */
+export function markMonthHighWater(db, mall, ym, count, at, source = 'dq') {
+  if (!(Number.isFinite(count) && count > 0) || !/^\d{4}-\d{2}$/.test(ym)) return false;
+  db.prepare(`
+    INSERT INTO dq_month_high_water (mall, month, first_nonzero_at, max_row_count, source) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (mall, month) DO UPDATE SET max_row_count = MAX(dq_month_high_water.max_row_count, excluded.max_row_count)
+  `).run(mall, ym, at, Math.floor(count), source);
+  return true;
+}
+
+/** この PR より前の run の check の組み合わせから、どのモールの DQ だったかを当てる (run_id を手で付けた run 用) */
+const LEGACY_SIGNATURES = [
+  ['rakuten', (c) => c.has('date_mismatch_units')],
+  ['aupay', (c) => c.has('request_price_reconcile_diff_pct')],
+  ['linegift', (c) => c.has('monthless_received_rows')],
+  ['qoo10', (c) => c.has('settle_price_formula_match_pct')],
+  ['yahoo', (c) => c.has('normalized_collision_count') && !c.has('request_price_reconcile_diff_pct')],
+];
+const LEGACY_RUN_ID_RE = /^dq-(rakuten|yahoo|aupay|linegift|qoo10)-(\d{4}-\d{2})-/;
+function jstMonthOfIso(s) {
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? null : jstShifted(new Date(t)).toISOString().slice(0, 7);
+}
+/**
+ * 前の記録 (dq_run_results の全部の run) から印へ移す。1 回だけ (dq_month_high_water_legacy に済みの行)。
+ *   0 行でなかった run = row_count_drift の details の daily_row_count が 0 でない (無い・壊れている JSON も「行があった」側に数える。
+ *     LINE・Qoo10 の当月の「直近 8 日」の記録は daily_row_count を持たないが、当月の行が 1 以上のときしか出ない)。
+ *     R1 の形の month_row_count (actual > 0・details に mall / month) も数える。
+ *   モールと月: run_id が既定の形 (dq-<mall>-<YYYY-MM>-…) ならそこから。手で付けた run_id なら、モールは同じ run の check の組み合わせ、
+ *     月はその run の checked_at の JST の月 (過去の月を手で流した run だと実際より新しい月に印が付く = 猶予を使わない向きにずれるだけ)。
+ *   モールが当てられない run は数えない (0 行でなかった run は検査を全部流しているので、組み合わせは必ずある)。
+ */
+export function migrateLegacyHighWater(db, at) {
+  if (db.prepare('SELECT 1 FROM dq_month_high_water_legacy WHERE id = 1').get()) return null;
+  let marked = 0;
+  let rows = [];
+  try {
+    rows = db.prepare(`
+      SELECT r.run_id, r.check_name, r.actual_value, r.details_json, r.checked_at,
+             (SELECT group_concat(c.check_name, ',') FROM dq_run_results c WHERE c.run_id = r.run_id) AS checks
+      FROM dq_run_results r WHERE r.check_name IN ('row_count_drift', ?)
+    `).all(MONTH_ROW_COUNT_CHECK);
+  } catch { rows = []; }                                        // dq_run_results が無い DB = 移すものが無い
+  for (const r of rows) {
+    let d = null;
+    let broken = false;
+    if (r.details_json != null) { try { d = JSON.parse(r.details_json); } catch { broken = true; } }
+    if (r.check_name === MONTH_ROW_COUNT_CHECK) {
+      if (d && r.actual_value > 0 && Object.hasOwn(MONTH_START_GRACE, d.mall) && /^\d{4}-\d{2}$/.test(d.month || '')) {
+        if (markMonthHighWater(db, d.mall, d.month, r.actual_value, r.checked_at || at, 'legacy')) marked++;
+      }
+      continue;
+    }
+    const nonzero = broken || !d || typeof d !== 'object' || d.daily_row_count !== 0;
+    if (!nonzero) continue;
+    const m = LEGACY_RUN_ID_RE.exec(r.run_id || '');
+    let mall = m ? m[1] : null;
+    let month = m ? m[2] : null;
+    if (!mall) {
+      const checks = new Set(String(r.checks || '').split(','));
+      mall = (LEGACY_SIGNATURES.find(([, f]) => f(checks)) || [null])[0];
+      month = jstMonthOfIso(r.checked_at);
+    }
+    if (!mall || !month) continue;
+    const count = d && Number.isFinite(d.daily_row_count) && d.daily_row_count > 0 ? d.daily_row_count : 1;
+    if (markMonthHighWater(db, mall, month, count, r.checked_at || at, 'legacy')) marked++;
+  }
+  db.prepare('INSERT INTO dq_month_high_water_legacy (id, migrated_at, marked) VALUES (1, ?, ?)').run(at, marked);
+  return marked;
+}
+/** DQ の入口 (dq_run_results の DELETE より前): 表を作る → 前の記録を 1 回だけ移す → この回の行数で印を付ける (1 つの取引) */
+export function prepareMonthHighWater(db, { mall, ym, count, at = new Date().toISOString() }) {
+  graceSpec(mall);
+  db.transaction(() => {
+    ensureMonthHighWater(db);
+    migrateLegacyHighWater(db, at);
+    markMonthHighWater(db, mall, ym, count, at, 'dq');
+  })();
+}
+
+/**
+ * 条件 ②: この mall・月が前に一度でも 0 行でなくなったか (印 dq_month_high_water を見る)。
+ *   表が無い・読めないなど判定できないときは true (= DQ は猶予を使わない向き / sync は今までどおり空の chunk を送る向き)
  */
 export function monthHadRowsBefore(db, mall, ym) {
   graceSpec(mall);
   if (!/^\d{4}-\d{2}$/.test(ym)) return true;
   try {
-    const hit = db.prepare(`
-      SELECT 1 AS hit FROM dq_run_results
-      WHERE (check_name = ? AND actual_value > 0
-             AND (CASE WHEN details_json IS NOT NULL AND json_valid(details_json)
-                       THEN json_extract(details_json, '$.mall') = ? AND json_extract(details_json, '$.month') = ?
-                       ELSE 0 END))
-         OR (check_name = 'row_count_drift' AND run_id LIKE ?
-             AND (CASE WHEN details_json IS NULL OR NOT json_valid(details_json) THEN -1
-                       ELSE COALESCE(json_extract(details_json, '$.daily_row_count'), -1) END) <> 0)
-      LIMIT 1
-    `).get(MONTH_ROW_COUNT_CHECK, mall, ym, `dq-${mall}-${ym}-%`);
-    return !!hit;
+    const row = db.prepare('SELECT max_row_count FROM dq_month_high_water WHERE mall = ? AND month = ?').get(mall, ym);
+    return !!row && row.max_row_count > 0;
   } catch {
     return true;
   }
 }
 
+/** 'YYYY-MM-DD' が実在の日か (UTC で組み直して元の文字と一致) */
+export function isRealYmd(s) {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const [y, m, d] = s.split('-').map(Number);
+  const t = new Date(Date.UTC(y, m - 1, d));
+  return t.toISOString().slice(0, 10) === s;
+}
+
 /**
  * 条件 ③: 前月の fact の最新の日付が前月の末日から freshDays 日以内か。
- * @returns {{ ok: boolean, prevYm: string, maxDate: string|null, gapDays: number|null }}
+ *   「新しい」のは、最新の日付が実在の日で、前月の中で、0 ≤ 末日からの日数 ≤ freshDays のときだけ (R2: 2026-09-99 のような壊れた日付を新しいと読まない)
+ * @returns {{ ok: boolean, prevYm: string, maxDate: string|null, gapDays: number|null, invalid?: boolean }}
  */
 export function prevMonthFreshness(db, table, ym, freshDays) {
   const prevYm = prevMonthOf(ym);
   if (!/^f_[a-z0-9_]+_finance_sku_daily_v1$/.test(table)) throw new Error(`prevMonthFreshness: 表の名前が違う "${table}"`);
   let maxDate = null;
-  try { maxDate = db.prepare(`SELECT MAX(date_jst) AS d FROM ${table} WHERE substr(date_jst, 1, 7) = ?`).get(prevYm)?.d || null; }
+  try { maxDate = db.prepare(`SELECT MAX(date_jst) AS d FROM ${table} WHERE substr(date_jst, 1, 7) = ?`).get(prevYm)?.d ?? null; }
   catch { maxDate = null; }
-  if (!maxDate || !/^\d{4}-\d{2}-\d{2}/.test(maxDate)) return { ok: false, prevYm, maxDate, gapDays: null };
+  if (maxDate == null || maxDate === '') return { ok: false, prevYm, maxDate: null, gapDays: null };
+  if (!isRealYmd(maxDate) || maxDate.slice(0, 7) !== prevYm) return { ok: false, prevYm, maxDate: String(maxDate), gapDays: null, invalid: true };
   const [y, m] = prevYm.split('-').map(Number);
   const lastDay = Date.UTC(y, m, 0);                                    // 前月の末日 (UTC の 0 時として数える)
-  const d = Date.UTC(...maxDate.slice(0, 10).split('-').map((v, i) => (i === 1 ? Number(v) - 1 : Number(v))));
-  const gapDays = Math.round((lastDay - d) / 86400000);
-  return { ok: gapDays <= freshDays, prevYm, maxDate: maxDate.slice(0, 10), gapDays };
+  const [yy, mm, dd] = maxDate.split('-').map(Number);
+  const gapDays = Math.round((lastDay - Date.UTC(yy, mm - 1, dd)) / 86400000);
+  return { ok: gapDays >= 0 && gapDays <= freshDays, prevYm, maxDate, gapDays };
 }
 
 /**
@@ -206,7 +305,9 @@ export function decideMonthStartEmpty(db, { mall, ym, now = new Date(), noGrace 
     hadRowsBefore = monthHadRowsBefore(db, mall, ym);
     if (hadRowsBefore) reasons.push('この月は前に行があった (一度 0 でなくなった月の 0 行 = 消えた)');
     prev = prevMonthFreshness(db, spec.table, ym, spec.prevMonthFreshDays);
-    if (!prev.ok) reasons.push(prev.maxDate
+    if (!prev.ok) reasons.push(prev.invalid
+      ? `前月 ${prev.prevYm} の最新の日付 "${prev.maxDate}" が実在の日でない (日付が壊れている疑い)`
+      : prev.maxDate
       ? `前月 ${prev.prevYm} の最新の日付が ${prev.maxDate} (末日の ${prev.gapDays} 日前・許すのは ${spec.prevMonthFreshDays} 日まで) = 前月の終わりから止まっている疑い`
       : `前月 ${prev.prevYm} の行が無い`);
   }

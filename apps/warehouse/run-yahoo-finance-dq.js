@@ -37,7 +37,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, applyMonthStartSkip, resolveDqNow } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -125,6 +125,10 @@ if (isCurMonth) {
   console.log(`  ℹ️  当月モード: listing_diff_pct warn ${THRESHOLDS.listing_diff_pct.warn}%/error ${THRESHOLDS.listing_diff_pct.error}% に緩和`);
 }
 
+// 月初の猶予の印 (PR #1572 R2): dq_run_results の DELETE より前に、mall・月ごとの消えない印 (dq_month_high_water) を付ける。
+// 一度 0 でなくなった月は、同じ run_id で流し直しても印が残る (前の記録は初回だけ移す)
+prepareMonthHighWater(db, { mall: 'yahoo', ym: monthStr, at: checkedAt,
+  count: db.prepare("SELECT COUNT(*) AS c FROM f_yahoo_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ?").get(monthStr).c });
 db.prepare(`DELETE FROM dq_run_results WHERE run_id = ?`).run(runId);
 
 // ============================================================
