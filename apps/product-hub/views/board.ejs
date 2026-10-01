@@ -27,6 +27,7 @@
   .kb-tag.ne-confirmed { background: #dcfce7; color: #166534; border-color: #86efac; }
   .kb-tag.ne-needs_action { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
   .kb-tag.decision { background: #e0e7ff; color: #3730a3; border-color: #a5b4fc; }
+  .kb-tag.ship-check { background: #fff7ed; color: #9a3412; border-color: #fdba74; font-weight: 700; }
   .kb-tag.setstep { background: #faf5ff; color: #7e22ce; border-color: #ddd6fe; }
   .kb-tab-n { display:inline-block; min-width:16px; padding:0 4px; border-radius:8px; background:#fecaca; color:#991b1b; font-size:11px; }
   .ne-table td { vertical-align: top; }
@@ -594,6 +595,11 @@
               <%# 📣 広告の段階 (2026-09-28)。未着手は出さない (出品前の商品に札が並ぶだけになる) %>
               <% if (adStages.get(c.id)) { %>
                 <div class="kb-tags"><span class="kb-tag ad-<%= adStages.get(c.id) %>" title="Amazon SP広告の段階 (📣 広告タブで記録)">📣 <%= adOpsDefs.stageJa[adStages.get(c.id)] %></span></div>
+              <% } %>
+              <%# Company DB の新商品の登録から作ったカードで、発送方法 (送料コード) に楽天の配送方法の対応が無かった (2026-10-01)。
+                  推し量らずに空のまま置いている = 人が選ぶ。楽天の配送方法を保存すると札は消える %>
+              <% if (locals.cdbShippingCheck && locals.cdbShippingCheck.has(c.id)) { %>
+                <div class="kb-tags"><span class="kb-tag ship-check" title="新商品の登録の発送方法 (送料コード) に楽天の配送方法の対応がありません。詳細画面で配送方法を選んでください">⚠ 発送方法 要確認</span></div>
               <% } %>
               <% if (c.existingPage) { %>
                 <div class="kb-tags"><span class="kb-tag existing-page" title="<%= c.addedToNeCode ? `出品済みのページ「${c.addedToNeCode}」に NE で色 (SKU) が足されたので出したカードです` : (c.existingPageAuto ? 'NE の同じグループに前からある商品があるので自動で付けました。違うときは商品詳細の基本情報で直せます' : '商品詳細で「既存ページに追加」に設定されています') %>">📄 既存ページ<%= c.addedToNeCode ? `: ${c.addedToNeCode} に色追加` : (c.existingPageAuto ? '' : ' (手動)') %></span></div>

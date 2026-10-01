@@ -4,7 +4,7 @@
  * 一覧 (画面 A): 検索 (コード・名前・JAN)・区分・状態 (利用可・中止)・未入力 (税率・売上分類・送料・推奨月数・原価)・NE との差あり。
  *   セットの税率と原価 (構成品の合計) と売上分類 (構成品から導く) は「構成品から導いた値」= 画面で * を付ける。
  *   セットの売上分類は保存していない (読むときに lib/master-set-rules.js で導く) ので、売上分類の「未入力」だけは JS で絞る
- *   新商品の状態 (下書き・NE 登録待ち…) は ⑤-2 (Codex ⑤-R0 High 3)。⑤-1 は既にある商品だけ
+ *   登録の状態 (0052・⑤-2a) = 下書き・NE 登録待ち・NE 確認済み・配る対象・利用可・要確認・やめた。行が無い = 切替の前の商品 (backfill の前)
  */
 import { MASTER_OWNERSHIP } from '../../config/master-ownership.mjs';
 import { normSku } from '../../lib/sku-norm.js';
@@ -12,11 +12,19 @@ import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership,
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
 import { latestRun } from '../master-decisions/decide.mjs';
+import { readCardEvent } from '../../lib/product-hub-outbox.mjs';
 
 export const LIST_LIMIT = 100;
 export const KINDS = Object.freeze({ single: '単品', set: 'セット', exception: '例外' });
 export const MISSING = Object.freeze({ tax: '税率', sales: '売上分類', shipping: '送料', reorder: '推奨月数', cost: '原価' });
 export const STATES = Object.freeze({ available: '利用可', discontinued: '中止' });
+/** 登録の状態 (0052)。none = 状態の行が無い (切替の前の商品。backfill の後は無い = 使えない) */
+/** カードの知らせ (0052) の絞り込み (仮レビュー L6): 作成待ち (まだ・失敗)・衝突 */
+export const CARD_FILTERS = Object.freeze({ waiting: 'カード作成待ち (まだ・失敗)', conflict: 'カードの衝突' });
+export const REG_STATES = Object.freeze({
+  draft: '下書き', ne_pending: 'NE登録待ち', ne_confirmed: 'NE確認済み', distributable: '配る対象', available: '登録済み (利用可)',
+  quarantined: '要確認 (NEで見つけた)', cancelled: 'やめた', none: '状態なし (切替の前)',
+});
 const KNOWN_COST = new Set(['COMPLETE', 'OVERRIDDEN']);
 const num = (v) => (v == null ? null : Number(v));
 
@@ -33,6 +41,8 @@ export function normalizeFilters(q = {}) {
     kind: pick(String(q.kind ?? ''), KINDS),
     state: pick(String(q.state ?? ''), STATES),
     missing: pick(String(q.missing ?? ''), MISSING),
+    reg: pick(String(q.reg ?? ''), REG_STATES),
+    card: pick(String(q.card ?? ''), CARD_FILTERS),
     diff: q.diff === '1' ? '1' : '',
     offset,
   };
@@ -64,6 +74,19 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   if (f.missing === 'shipping') where.push('s.shipping_code is null');
   if (f.missing === 'reorder') where.push('s.reorder_months is null');
   if (f.missing === 'cost') where.push(`coalesce(c.cost_status not in ('COMPLETE', 'OVERRIDDEN'), true)`);
+  // 登録の状態とカードは別々の絞り込み (両方 = 両方に合う商品。PR #1566 Codex R2 Low)
+  const hasReg = await regclass(db, 'ops.master_registrations');
+  if (f.reg) {
+    if (!hasReg) where.push(f.reg === 'none' ? 'true' : 'false');
+    else if (f.reg === 'none') where.push('not exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id)');
+    else { params.push(f.reg); where.push(`exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id and mr.state = $${params.length})`); }
+  }
+  const hasOutbox = await regclass(db, 'ops.product_hub_outbox');
+  if (f.card) {
+    if (!hasOutbox) where.push('false');
+    else if (f.card === 'waiting') where.push(`exists (select 1 from ops.product_hub_outbox o where o.sku_id = s.sku_id and o.status in ('pending', 'failed'))`);
+    else if (f.card === 'conflict') where.push(`exists (select 1 from ops.product_hub_outbox o where o.sku_id = s.sku_id and o.status = 'conflict')`);
+  }
   const diffAvailable = await regclass(db, 'ops.master_decision_candidates');
   const run = diffAvailable ? await latestRun(db) : null;
   if (f.diff) {
@@ -73,7 +96,8 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   const rows = (await db.query(`select s.sku_id::text as sku_id, s.code, s.code_norm, s.sku_kind, s.name, s.handling, s.tax_rate::text as tax_rate, s.tax_class,
         s.standard_price_jpy::text as standard_price, s.shipping_code, s.reorder_months::text as reorder_months, s.set_sales_class_override,
         p.sales_class, c.cost_jpy::text as cost_jpy, c.cost_source, c.cost_status,
-        (select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id where x.sku_id = s.sku_id and x.is_primary order by sp.code limit 1) as primary_supplier
+        (select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id where x.sku_id = s.sku_id and x.is_primary order by sp.code limit 1) as primary_supplier,
+        ${hasReg ? '(select mr.state from ops.master_registrations mr where mr.sku_id = s.sku_id)' : 'null::text'} as reg_state
       from core.skus s
       left join core.products p on p.product_id = s.product_id
       ${costAsOfJoin('s.sku_id', '$2', 'c')}
@@ -99,6 +123,7 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
       sales_derived: isSet && r.set_sales_class_override == null,
       primary_supplier: r.primary_supplier, shipping_code: r.shipping_code, reorder_months: num(r.reorder_months),
       state: r.handling === 'discontinued' ? 'discontinued' : 'available',
+      reg_state: r.reg_state ?? 'none',
     };
   });
   if (f.missing === 'sales') list = list.filter((r) => r.sales_class == null && r.kind !== 'exception');
@@ -110,7 +135,11 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   if (norms.length && await regclass(db, 'ops.ne_csv_export_rows')) for (const r of (await db.query('select distinct code_norm from ops.ne_csv_export_rows where reserved and code_norm = any($1::text[])', [norms])).rows) csvSet.add(r.code_norm);
   const pageSets = pageRows.filter((r) => r.kind === 'set').map((r) => r.sku_id);
   if (pageSets.length && await regclass(db, 'ops.sku_component_requests')) for (const r of (await db.query(`select set_sku_id::text as id from ops.sku_component_requests where status = 'open' and set_sku_id = any($1::bigint[])`, [pageSets])).rows) reqSet.add(r.id);
-  for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : [])];
+  const cardOf = new Map();
+  if (pageRows.length && hasOutbox) for (const r of (await db.query(`select sku_id::text as id, status from ops.product_hub_outbox where status <> 'done' and sku_id = any($1::bigint[])`, [pageRows.map((x) => x.sku_id)])).rows) cardOf.set(r.id, r.status);
+  const CARD_FLAG = { pending: 'カード作成待ち', failed: 'カード作成待ち (失敗)', conflict: 'カードの衝突' };
+  for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : []),
+    ...(cardOf.has(r.sku_id) ? [CARD_FLAG[cardOf.get(r.sku_id)]] : [])];
   return { rows: pageRows, total: list.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable };
 }
 
@@ -142,8 +171,9 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
       ? (await db.query(`select kind, details, created_at::text as created_at from ops.sku_component_breaches where set_sku_id = $1 and status = 'open' order by breach_id`, [id])).rows : [];
     const csvRows = (await regclass(db, 'ops.ne_csv_export_rows'))
       ? (await db.query('select col, child, source, export_id::text as export_id from ops.ne_csv_export_rows where reserved and code_norm = $1 order by col, child', [cur.code_norm])).rows : [];
+    const card = await readCardEvent(db, id);
     return {
-      cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today,
+      cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today, card,
       state: cur.handling === 'discontinued' ? 'discontinued' : 'available',
       derived: cur.sku_kind === 'set' ? setDerivations(cur) : null,
       fields: fieldOwnership(cur.sku_kind, ownership, open && newEntryWritable(phase, ownership)),
@@ -155,6 +185,15 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
   } finally {
     await db.query('rollback');
   }
+}
+
+/** 新商品の登録 (画面 D) に出すもの: 切替の段階・有効な仕入先・backfill 済みか (新商品の登録の前提) */
+export async function readNewPage(db) {
+  const phase = await readCutoverPhase(db);
+  const activeSuppliers = (await db.query('select code, name from core.suppliers where company_id = $1 and active order by code', [COMPANY_ID])).rows;
+  const backfillDone = (await regclass(db, 'ops.master_registration_backfill'))
+    ? Number((await db.query('select count(*)::int as n from ops.master_registration_backfill')).rows[0].n) === 1 : false;
+  return { phase, activeSuppliers, backfillDone };
 }
 
 /** 構成品を足すときの引き当て (コード → 名前・種類・税率・分類・原価・取扱) */

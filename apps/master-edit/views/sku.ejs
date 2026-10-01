@@ -42,7 +42,30 @@
     <% if (c.sku_kind === 'exception') { %><div class="band info">例外の SKU (NE に無い商品) はこの画面では直せません。</div><% } %>
 
     <h2 style="font-size: 1.15em; margin: 6px 0;"><%= c.code %> <span class="muted" style="font-size: 0.8em;"><%= c.name %></span></h2>
-    <p class="sub"><%= KINDS[c.sku_kind] || c.sku_kind %> ・ 状態: <%= STATES[page.state] || page.state %> ・ version <%= c.version %> ・ <a href="<%= base %>/sku/<%= encodeURIComponent(c.code) %>/history">変更の記録</a></p>
+    <p class="sub"><%= KINDS[c.sku_kind] || c.sku_kind %> ・ 状態: <%= STATES[page.state] || page.state %> ・ 登録: <%= c.registration ? (REG_STATES[c.registration.state] || c.registration.state) : '— (切替の前からある商品)' %> ・ version <%= c.version %> ・ <a href="<%= base %>/sku/<%= encodeURIComponent(c.code) %>/history">変更の記録</a></p>
+    <% if (c.registration && c.registration.state === 'draft') { %><div class="band info">下書きです (新商品の登録)。NE・ロジザードへの登録はまだです。値はこの画面で直せます。</div><% } %>
+    <% if (c.registration && c.registration.state === 'quarantined') { %><div class="band warn">要確認: 切替の後に夜間の処理が NE で見つけた、登録の記録の無い商品です。業務ではまだ使えません。</div><% } %>
+    <% if (page.card) { %>
+      <%# product-hub の出品カード (新商品の登録で作る。Company DB の知らせ = ops.product_hub_outbox) %>
+      <div class="sec" id="card-box" data-base="<%= base %>" data-code="<%= c.code %>"><h3>product-hub の出品カード</h3>
+        <div class="fl">
+          <span class="tag<%= page.card.status === 'done' ? ' gray' : '' %>"><%= CARD_STATUS_LABELS[page.card.status] || page.card.status %></span>
+          <% if (page.card.status === 'done' && page.card.result && page.card.result.draft_id) { %><a href="/apps/product-hub/detail/<%= page.card.result.draft_id %>">カードを開く ↗</a><% } %>
+          <% if (page.card.status === 'conflict' && page.card.result && page.card.result.conflict_draft_id) { %><a href="/apps/product-hub/detail/<%= page.card.result.conflict_draft_id %>">同じコードのカード ↗</a><% } %>
+          <% if (page.card.status === 'conflict' && page.card.result && page.card.result.ambiguous && Array.isArray(page.card.result.conflict_draft_ids)) { %><% page.card.result.conflict_draft_ids.forEach((d) => { %><a href="/apps/product-hub/detail/<%= d %>">#<%= d %> ↗</a> <% }) %><% } %>
+          <span class="sub">試した回数 <%= page.card.attempts %><%= page.card.last_error ? ' ・ ' + page.card.last_error : '' %></span>
+          <% if (page.card.status !== 'done' && canEdit && !dbError) { %><button type="button" class="btn-sm" id="card-retry">カードをもう一度作る</button><% } %>
+          <% if (page.card.status === 'conflict' && page.card.result && page.card.result.conflict_draft_id && canEdit && !dbError) { %><button type="button" class="btn-sm" id="card-link" data-draft="<%= page.card.result.conflict_draft_id %>">既存のカード (#<%= page.card.result.conflict_draft_id %>) をこの商品に結ぶ</button><% } %>
+        </div>
+        <% if (page.card.status !== 'done') { %><div class="sub">カードは登録の後に作ります。うまくいかなかったときは、product-hub のボードを開いたときにも作り直します。</div><% } %>
+        <% if (page.card.status === 'conflict' && page.card.result && page.card.result.ambiguous) { %><div class="sub">同じ商品コードのカードが product-hub に 2 枚以上あります。どれに結ぶか決められないので「結ぶ」は出しません。product-hub で 1 枚に片付けてから「カードをもう一度作る」を押してください。</div>
+        <% } else if (page.card.status === 'conflict') { %><div class="sub">同じ商品コードのカードが product-hub にもうあります。そのカードがこの商品のものなら「結ぶ」を押してください (カードの空の欄だけ、この登録の値で埋めます。入っている欄は変えません)。違う商品なら product-hub でそのカードを片付けてから「もう一度作る」。</div><% } %>
+        <% if (page.card.status === 'done' && page.card.result && page.card.result.outcome === 'linked' && Array.isArray(page.card.result.not_applied) && page.card.result.not_applied.length) { %>
+          <div class="sub">結んだときにカードに入っていたので変えなかった欄: <%= page.card.result.not_applied.map((x) => x.label + ' (カード ' + x.card + ' / 登録 ' + x.entered + ')').join('・') %> ・ product-hub で確かめてください</div>
+        <% } %>
+        <div class="msg" id="card-msg"></div>
+      </div>
+    <% } %>
 
     <form id="f" onsubmit="return false" data-base="<%= base %>" data-code="<%= c.code %>" data-kind="<%= c.sku_kind %>"
           data-token="<%= page.token %>" data-event-id="<%= page.seenEventId %>" data-can-save="<%= canSave ? '1' : '0' %>">
@@ -214,6 +237,38 @@
 
 <script>
 (() => {
+  // product-hub のカードをもう一度作る (名簿の人だけ・衝突 / 失敗の知らせも試す)
+  const cardBtn = document.getElementById('card-retry');
+  if (cardBtn) cardBtn.addEventListener('click', async () => {
+    const box = document.getElementById('card-box');
+    const msg = document.getElementById('card-msg');
+    cardBtn.disabled = true; msg.className = 'msg'; msg.textContent = 'カードを作っています…';
+    try {
+      const r = await fetch(box.dataset.base + '/api/sku/' + encodeURIComponent(box.dataset.code) + '/card-retry', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: '{}' });
+      const j = await r.json().catch(() => ({}));
+      msg.className = 'msg ' + (j.ok ? 'ok' : 'err');
+      msg.textContent = j.ok ? 'カードを作りました。表示し直します…' : ((j.label ? j.label + ': ' : '') + (j.error || ('HTTP ' + r.status)));
+      if (j.ok) setTimeout(() => location.reload(), 800); else cardBtn.disabled = false;
+    } catch (e) { msg.className = 'msg err'; msg.textContent = '通信できませんでした'; cardBtn.disabled = false; }
+  });
+  // 衝突を解く: 既存のカードをこの商品に結ぶ
+  const linkBtn = document.getElementById('card-link');
+  if (linkBtn) linkBtn.addEventListener('click', async () => {
+    const box = document.getElementById('card-box');
+    const msg = document.getElementById('card-msg');
+    if (!window.confirm('product-hub のカード #' + linkBtn.dataset.draft + ' を、この商品のカードにします。よろしいですか')) return;
+    linkBtn.disabled = true; msg.className = 'msg'; msg.textContent = '結んでいます…';
+    try {
+      // 画面が見ていたカードの番号を送る (その間に衝突のカードが変わっていれば結ばない)
+      const r = await fetch(box.dataset.base + '/api/sku/' + encodeURIComponent(box.dataset.code) + '/card-link', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ draft_id: linkBtn.dataset.draft }) });
+      const j = await r.json().catch(() => ({}));
+      msg.className = 'msg ' + (j.ok ? 'ok' : 'err');
+      if (!j.ok) { msg.textContent = j.error || ('HTTP ' + r.status); linkBtn.disabled = false; return; }
+      const na = Array.isArray(j.not_applied) ? j.not_applied : [];
+      msg.textContent = '結びました。' + (j.applied && j.applied.length ? ' 空だった欄に入れた: ' + j.applied.join('・') + '。' : '')
+        + (na.length ? ' カードに入っていたので変えなかった欄: ' + na.map((x) => x.label).join('・') + ' (product-hub で確かめてください)。' : '') + ' 表示し直すには画面を開き直してください';
+    } catch (e) { msg.className = 'msg err'; msg.textContent = '通信できませんでした'; linkBtn.disabled = false; }
+  });
   const form = document.getElementById('f');
   if (!form) return;
   const D = form.dataset;
