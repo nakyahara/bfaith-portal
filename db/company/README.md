@@ -1454,6 +1454,9 @@ complete の行が無い間 (= coordinator の D7b-1b-3 が complete を送る�
   分けられない金額は 3 区分 (`unknown_line_mapped_jpy` / `unclassified_mapped_jpy` / `unmapped_jpy`)。**保存則** = `net_jpy = profit_before_cogs_jpy + sales_tax_jpy − account_fee_cost_jpy + unknown_line_mapped_jpy + unclassified_mapped_jpy + unmapped_jpy + not_account_fee_mapped_jpy`。
   不完全な日 = `before_ad_incomplete_days` / `after_ad_incomplete_days` / `after_account_fees_incomplete_days` (と数)
 - **読む口 (Render)**: `GET /apps/company-db/sync/amazon-profit/daily?mall=amazon&scope=jp&from&to` / `GET …/amazon-profit/totals?…` (x-sync-key・statement_timeout 120s・0049 の前は 409 `not_migrated`)。
+  🚨 **10/1 から 503 (封じ込め・§3.10)** = どちらも 503 `{ ok: false, code: 'PROFIT_ROUTE_DISABLED', error }` を返し、0049 の関数を呼ばない・DB に接続もしない (鍵が無ければ 401 のまま)。
+  理由 = 10/1 00:10 に 93 日分の計算で本番の Postgres (1GB) が落ちた・本番は `temp_file_limit = -1` (一時ファイルが無制限) で SET の権限も無い。
+  設計 (AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10 D-60 v3.1 = 保存しないで 1 か月ずつ計算) で作り直すまで止める。再び有効にする設定は無い (戻すのはコードの変更)。以下のこの口の説明は止める前の形
   🚨 設計書 (13 §4) の `/apps/company-db/api/...` ではなく、**Company DB の既存の読む口の流儀** (`/sync` の下 + x-sync-key。例 `/order-finance/daily`) にそろえた (#1559 Codex R1 Medium 4)。
   **`/daily` は 1 回 93 日まで** (行が多い = メモリに全部を載せて返す。長い期間は日の範囲で区切って何回かに分けて読む)・`/totals` は 400 日まで (日 + 月 + 合計だけ)。
   JSON の形: ID と ID の配列は 10 進の文字列 / 円 (`*_jpy`)・個数・件数は数 / **金額の numeric (税抜・広告費・0 と仮定・手数料の後) は小数 2 桁の文字列** (例 `"225.45"`) /
@@ -1491,6 +1494,7 @@ select row_kind, period_from, period_to, profit_after_account_fees_assuming_inco
 ```
 
 **🚨 受け入れの条件 = 本番の所要時間を読むだけで測る** (#1559 Codex R1 Medium 1・R2 Medium 2。PGlite では本番の件数の時間を測れない):
+🚨 **10/1 からこの節の測り方は流さない** = 10/1 00:10 に 93 日分の計算で本番の Postgres (1GB) が落ちた。読む口は 503 (下の `Invoke-RestMethod` は 503 が返る)。測り方は §3.10 (D-60 v3.1) の初回の校正の手順に従う
 - **0049 を本適用した直後に**、読むだけで次の 3 つの期間を測る = **1 か月** / **93 日** (`/daily` の上限) / **400 日** (`/totals` の上限)。`begin read only` の中で・120 秒で打ち切り・daily-sync の 07:00〜09:10 を避ける
 - 合格 = どれも 120 秒 (読む口の statement_timeout) より十分短い (目安 = 1 か月 数秒・上限の期間で 60 秒以内)
 - **遅ければ、AI・画面 (読む口の使い手) に使う前に直す** (次の番号の migration で計画を直す = 0045 と同じ流儀)。測るまでは読む口を AI・画面から呼ばない
@@ -1517,7 +1521,7 @@ Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/c
 Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/company-db/sync/amazon-profit/totals?mall=amazon&scope=jp&from=2026-01-01&to=2027-02-04' | Out-Null }
 ```
 
-試験 = `node scripts/test-company-db-amazon-profit.mjs` (33 件: 材料は 1 回だけ計算 (関数の本体を数えて固定) / 受け取り時の出品を集合で比べる (財務・広告) / relink の後は印が付かない (わかる範囲の印の限界を固定) / coverage の関数の世代と版 (合計は source を含めて 1 つのときだけ) / coverage が null なら正式な値は全部 null / 差し替えた後の手で計算した値 (税込・税抜・値引きの税・広告 × 1.1・返品の推定・負の手数料・override_zero と原価不明) / 構成 0 件・候補 2 件・出品なし / 広告の状態 (legacy・missing・not_collected) / 分けられない部品の相殺・旧い形の行・単価の無い返品 / 同じ日に 2 回変わった原価・観測と推定 / hash が JS と一致 / ASIN は未解決・別名は結ぶ・未解決は出品の行だけ止める / Easy Ship (割合・等分・端数・返金・期間に依らない・配れない額・負の重み (0 にする)・全部が非正 (等分)・保存則) / master_notes (受け取りとの違い・監査の記録・タイトルは数えない) / 理由の順と列ごとの null (3 つの coverage で全行) / 日の合計 (列の組ごとの条件・税の表・保存則・row_kind が重ならない・取引の無い日) / 契約 / HTTP (鍵・400・409・ID は文字列))
+試験 = `node scripts/test-company-db-amazon-profit.mjs` (32 件: 材料は 1 回だけ計算 (関数の本体を数えて固定) / 受け取り時の出品を集合で比べる (財務・広告) / relink の後は印が付かない (わかる範囲の印の限界を固定) / coverage の関数の世代と版 (合計は source を含めて 1 つのときだけ) / coverage が null なら正式な値は全部 null / 差し替えた後の手で計算した値 (税込・税抜・値引きの税・広告 × 1.1・返品の推定・負の手数料・override_zero と原価不明) / 構成 0 件・候補 2 件・出品なし / 広告の状態 (legacy・missing・not_collected) / 分けられない部品の相殺・旧い形の行・単価の無い返品 / 同じ日に 2 回変わった原価・観測と推定 / hash が JS と一致 / ASIN は未解決・別名は結ぶ・未解決は出品の行だけ止める / Easy Ship (割合・等分・端数・返金・期間に依らない・配れない額・負の重み (0 にする)・全部が非正 (等分)・保存則) / master_notes (受け取りとの違い・監査の記録・タイトルは数えない) / 理由の順と列ごとの null (3 つの coverage で全行) / 日の合計 (列の組ごとの条件・税の表・保存則・row_kind が重ならない・取引の無い日) / 契約 / HTTP (10/1 から 503 `PROFIT_ROUTE_DISABLED`・DB に接続しない (pg の client を作らない)・鍵が無ければ 401))
 
 ## 発注の受け皿 (0014。08 §5。D6)
 

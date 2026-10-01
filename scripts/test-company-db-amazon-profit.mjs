@@ -7,7 +7,7 @@
  *   広告 (ASIN は未解決・別名の SKU は結ぶ・未解決は出品の行だけ止める・legacy・missing・not_collected) / 構成 0 件・候補 2 件 / master_notes は値を止めない /
  *   原価の選び方 (同じ日に 2 回変わった・観測・推定) / hash = JS の canonicalSha256 と同じ / Easy Ship の割り振り (割合・等分・端数・返金・期間に依らない・配れない額) /
  *   日の合計 (row_kind が重ならない・取引の無い日も日の行・列の組ごとの条件・月の手数料と税の表・保存則) / coverage の関数が null なら正式な値は全部 null・差し替えれば出る /
- *   受け口 (本物の router を HTTP で: 鍵・契約・409 not_migrated・ID は文字列)
+ *   受け口 (本物の router を HTTP で: 10/1 から 503 PROFIT_ROUTE_DISABLED・DB に接続しない (pg の client を作らない)・鍵が無ければ 401。設計 13 §3.10)
  * 🚨 試験に無いもの: 本番の件数 (1 日 数百の出品 × 400 日) での所要時間 (statement_timeout 120s の中に入るか = 本適用の後に読むだけで測る)
  * 実行: node scripts/test-company-db-amazon-profit.mjs
  */
@@ -574,20 +574,24 @@ await t('from <= to・最大 400 日 (両端を含む)・amazon / jp だけ・nu
 });
 
 // ─── 受け口 (本物の router を HTTP で) ───
-console.log('受け口 (GET /amazon-profit/daily・/totals)');
+console.log('受け口 (GET /amazon-profit/daily・/totals = 10/1 から 503 の封じ込め・§3.10)');
 process.env.MIRROR_SYNC_KEY = 'k';
-process.env.COMPANY_DB_URL = 'pglite://test';
-const factoryOf = (db) => async () => ({
-  query: async (text, params) => {
-    if (params && params.length) return db.query(text, params);
-    if (text.includes(';')) { await db.exec(text); return { rows: [] }; }
-    return db.query(text);
-  },
-  end: async () => {},
+process.env.COMPANY_DB_URL = 'pglite://test';   // 接続先が「ある」状態にしておく (無いと withPg が別の 503 を返し、DB に行く形に戻っても気づけない)
+// pg の client が作られた回数を数える (作られたら、その要求は DB に行った = 封じ込めが破れている)。接続できる本物を返す = 関数を呼ぶ形に戻すと 200 になって落ちる
+let pgClientsCreated = 0;
+__setPgClientFactory(async () => {
+  pgClientsCreated++;
+  return {
+    query: async (text, params) => {
+      if (params && params.length) return pg.query(text, params);
+      if (text.includes(';')) { await pg.exec(text); return { rows: [] }; }
+      return pg.query(text);
+    },
+    end: async () => {},
+  };
 });
-__setPgClientFactory(factoryOf(pg));
 const app = express();
-app.use('/apps/company-db/sync', requireSyncKey);
+// 外側の requireSyncKey は付けない = 受け口の route 自身の鍵の確かめを試す (本番の事前の確かめの対象に amazon-profit は無い・#1570 Codex R1 Low)
 app.use('/apps/company-db/sync', companyDbRouter);
 const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
 const BASE_URL = `http://127.0.0.1:${server.address().port}/apps/company-db/sync`;
@@ -596,66 +600,33 @@ const http = async (p, key = 'k') => {
   const text = await res.text(); let json = null; try { json = JSON.parse(text); } catch { /* */ }
   return { status: res.status, json };
 };
-await t('鍵が無ければ 401 / 契約の外は 400 (from > to・401 日・実在しない日・amazon / jp 以外)', async () => {
+await t('鍵が無ければ 401 (DB に接続しない)', async () => {
+  pgClientsCreated = 0;
   assert.equal((await http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-01&to=2026-06-01', null)).status, 401);
-  for (const q of ['from=2026-06-02&to=2026-06-01', 'from=2026-01-01&to=2027-02-05', 'from=2026-02-30&to=2026-03-01', 'from=2026-06-01']) {
-    assert.equal((await http(`/amazon-profit/daily?mall=amazon&scope=jp&${q}`)).status, 400, q);
-    assert.equal((await http(`/amazon-profit/totals?mall=amazon&scope=jp&${q}`)).status, 400, q);
-  }
-  assert.equal((await http('/amazon-profit/daily?mall=rakuten&scope=jp&from=2026-06-01&to=2026-06-01')).status, 400);
-  assert.equal((await http('/amazon-profit/daily?mall=amazon&scope=us&from=2026-06-01&to=2026-06-01')).status, 400);
-  // /daily = 1 回 93 日まで (行が多い = 長い期間は日の範囲で区切る) / /totals = 400 日まで (#1559 Codex R1 Medium 1)
-  assert.equal((await http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-01&to=2026-09-01')).status, 200);   // 93 日
-  const d94 = await http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-01&to=2026-09-02');
-  assert.deepEqual([d94.status, /93 days/.test(d94.json.error)], [400, true]);
-  assert.equal((await http('/amazon-profit/totals?mall=amazon&scope=jp&from=2026-01-01&to=2027-02-04')).status, 200);   // 400 日
-  assert.equal((await http('/amazon-profit/totals?mall=amazon&scope=jp&from=2026-01-01&to=2027-02-05')).status, 400);
+  assert.equal((await http('/amazon-profit/totals?mall=amazon&scope=jp&from=2026-06-01&to=2026-06-01', 'wrong')).status, 401);
+  assert.equal(pgClientsCreated, 0);
 });
-await t('🚨 /daily = 関数の行 (ID と ID の配列は 10 進の文字列・円は数・税抜などは小数 2 桁の文字列・日付は YYYY-MM-DD) / /totals = row_kind つき', async () => {
-  const r = await http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-05&to=2026-06-06');
-  assert.equal(r.status, 200, JSON.stringify(r.json));
-  assert.deepEqual([r.json.mall, r.json.scope, r.json.from, r.json.to, r.json.master_basis], ['amazon', 'jp', '2026-06-05', '2026-06-06', 'current']);
-  const la = r.json.rows.find((x) => x.economic_date_jst === '2026-06-05' && x.listing_id === String(LA));
-  assert.ok(la, JSON.stringify(r.json.rows.slice(0, 2)));
-  assert.deepEqual([la.contribution_before_ad_incl_jpy, la.contribution_before_ad_excl, la.contribution_after_ad_incl, la.ad_cost, la.cogs_jpy, la.easy_ship_alloc_jpy],
-    [170, '225.45', '37.45', '120.50', 1200, 330]);
-  assert.deepEqual([la.received_listing_ids, la.ad_received_listing_ids, la.cost_sku_cost_ids, la.missing_cost_sku_ids, la.observed_generation, la.finance_coverage_generation, la.finance_source_revision, la.profit_incomplete_reasons, la.master_basis],
-    [[String(LA)], [String(LA)], [String(C_S1)], [], '7', '5', '42', [], 'current']);
-  assert.deepEqual([la.units_marketplace_guarantee, la.units_refunded_customer_unrounded], [0, '0']);
-  // 形の説明 (README・router の注釈) = 実際の出力 (#1559 Codex R2 Low 2): 金額の numeric は小数 2 桁の文字列・units_*_unrounded は最大 6 桁の文字列
-  const money = ['ad_cost', 'contribution_before_ad_excl', 'contribution_after_ad_incl', 'contribution_after_ad_excl', 'contribution_before_ad_assuming_incomplete_zero_excl',
-    'contribution_after_ad_assuming_incomplete_zero_incl', 'contribution_after_ad_assuming_incomplete_zero_excl'];
-  for (const x of r.json.rows) {
-    for (const c of money) assert.ok(x[c] === null || /^-?\d+\.\d{2}$/.test(x[c]), `${c} = ${JSON.stringify(x[c])}`);
-    for (const c of ['units_refunded_customer_unrounded', 'units_a_to_z_refund_unrounded']) assert.ok(x[c] === null || /^-?\d+(\.\d{1,6})?$/.test(x[c]), `${c} = ${JSON.stringify(x[c])}`);
+await t('🚨 /daily・/totals はどの要求でも 503 PROFIT_ROUTE_DISABLED を返し、DB に接続しない (0049 の関数を呼ばない・10/1 本番の Postgres の落ち)', async () => {
+  pgClientsCreated = 0;
+  const qs = ['mall=amazon&scope=jp&from=2026-06-05&to=2026-06-06', 'mall=amazon&scope=jp&from=2026-06-01&to=2026-09-01' /* 93 日 */,
+    'mall=amazon&scope=jp&from=2026-01-01&to=2027-02-04' /* 400 日 */, 'mall=amazon&scope=jp&from=2026-06-02&to=2026-06-01', 'mall=rakuten&scope=jp&from=2026-06-01&to=2026-06-01', ''];
+  for (const kind of ['daily', 'totals']) {
+    for (const q of qs) {
+      const r = await http(`/amazon-profit/${kind}${q ? `?${q}` : ''}`);
+      assert.equal(r.status, 503, `${kind}?${q} → ${r.status} ${JSON.stringify(r.json)}`);
+      assert.deepEqual([r.json.ok, r.json.code], [false, 'PROFIT_ROUTE_DISABLED'], `${kind}?${q}`);
+      assert.match(r.json.error, /§3\.10/);
+      assert.ok(!('rows' in r.json), `${kind}?${q}`);
+    }
   }
-  assert.ok(r.json.rows.some((x) => x.units_refunded_customer_unrounded === '1.000000'));
-  assert.match(la.calculated_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
-  const le = r.json.rows.find((x) => x.seller_sku_norm === 'le');
-  assert.deepEqual([le.listing_id, le.listing_resolution], [null, 'unresolved']);
-  const tt = await http('/amazon-profit/totals?mall=amazon&scope=jp&from=2026-06-13&to=2026-06-14');
-  assert.equal(tt.status, 200, JSON.stringify(tt.json));
-  assert.deepEqual(tt.json.rows.map((x) => x.row_kind), ['day', 'day', 'range_month_subtotal', 'range_total']);
-  const tot2 = tt.json.rows.find((x) => x.row_kind === 'range_total');
-  assert.deepEqual([tot2.period_from, tot2.period_to, tot2.contribution_before_ad_incl_jpy, tot2.profit_after_account_fees_excl, tot2.before_ad_incomplete_days, tot2.master_note_counts.listing_changed_since_received],
-    ['2026-06-13', '2026-06-14', 1100, '661.00', [], 0]);
-  assert.equal(tt.json.rows[0].economic_date_jst, '2026-06-13');
+  assert.equal(pgClientsCreated, 0, 'pg の client が作られた = 503 の前に DB に接続している');
+  // 受け口のコードに 0049 の関数の名前が無い (呼ぶ形が残っていない)
   const src = fs.readFileSync(new URL('../apps/company-db/router.mjs', import.meta.url), 'utf8');
-  assert.match(src, /daily: \{ fn: 'mart\.amazon_profit_daily_range'/);
-  assert.match(src, /totals: \{ fn: 'mart\.amazon_profit_day_totals_range'/);
-  assert.match(src, /set statement_timeout = '120s'`\);\s+const rows = \(await client\.query\(`select \$\{sel\.list\} from \$\{spec\.fn\}\(1::smallint/);   // 止まらないように時間の上限 (Company DB の読む口の流儀)
-});
-await t('0049 の適用前は 409 not_migrated (関数が無い = 500 にしない)', async () => {
-  const pg2 = new PGlite();
-  await applyMigrations(pgliteAdapter(pg2), { log: quiet, to: '0048' });
-  __setPgClientFactory(factoryOf(pg2));
-  try {
-    const r = await http('/amazon-profit/daily?mall=amazon&scope=jp&from=2026-06-01&to=2026-06-01');
-    assert.deepEqual([r.status, r.json.error], [409, 'not_migrated']);
-    assert.equal((await http('/amazon-profit/totals?mall=amazon&scope=jp&from=2026-06-01&to=2026-06-01')).status, 409);
-  } finally { __setPgClientFactory(factoryOf(pg)); await pg2.close(); }
+  assert.doesNotMatch(src, /mart\.amazon_profit_/);
 });
 await new Promise((resolve) => server.close(resolve));
 
 console.log(`\n${ok} 件 PASS${ng ? ` / ${ng} 件 NG` : ''}`);
-process.exit(ng ? 1 : 0);
+// 🚨 fetch の直後に process.exit() すると Windows の Node で libuv の assertion が出て終了コードが 127 になる = exitCode を置いて自然に終わらせる (保険に unref つきの setTimeout)
+process.exitCode = ng ? 1 : 0;
+setTimeout(() => process.exit(ng ? 1 : 0), 10000).unref();
