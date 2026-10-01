@@ -414,6 +414,21 @@ await t('端末から POST /api/runs/from-picking → active な納品回。二�
   const st = await call('GET', `/api/state?run=${pkRunId}`);
   assert.equal(st.j.run.status, 'active'); assert.equal(st.j.groups[0].display_name, '通常'); assert.equal(st.j.rows.length, 2);
 });
+await t('納品ピッキング PDF: 元の picking 実行の PDF が残っていれば iPad (/api/state) と管理画面に公開 URL、無ければ出さない (中原さん 2026-10-01)', async () => {
+  const pdfDir = path.join(tmp, 'picking-prep-pdf');
+  const pdf = path.join(pdfDir, '501.pdf');
+  // PDF がまだ無い (or 40 件の保持から外れた) 回: null / ボタンなし
+  assert.equal((await call('GET', `/api/state?run=${pkRunId}`)).j.pickingPdfUrl, null);
+  assert.ok(!(await (await fetch(`${BASE}/admin`, { headers: { 'x-test-session': 'admin' } })).text()).includes('/print/picking/501/pdf'));
+  fs.mkdirSync(pdfDir, { recursive: true });
+  fs.writeFileSync(pdf, '%PDF-1.4 test');
+  try {
+    assert.equal((await call('GET', `/api/state?run=${pkRunId}`)).j.pickingPdfUrl, '/print/picking/501/pdf');
+    const html = await (await fetch(`${BASE}/admin`, { headers: { 'x-test-session': 'admin' } })).text();
+    assert.ok(html.includes('href="/print/picking/501/pdf"') && html.includes('📄 ピッキングPDF'), '管理画面の納品回一覧にボタン');
+    assert.ok(!html.includes('/print/picking/502/pdf'), 'PDF の無い回 (502) には出さない');
+  } finally { fs.rmSync(pdf, { force: true }); }
+});
 await t('作業を終える: 利用者は 403 / 職員PIN + 未投入あり → 409 incomplete (一覧) / acknowledge で done', async () => {
   const st = await call('GET', `/api/state?run=${pkRunId}`);
   const gid = st.j.groups[0].id;

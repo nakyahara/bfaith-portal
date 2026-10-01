@@ -88,6 +88,9 @@
             <td><%= (r.created_at || '').slice(0, 16).replace('T', ' ') %><br><small><%= r.created_by || '' %></small></td>
             <td>
               <button class="btn-sm run-detail" data-id="<%= r.id %>">進捗</button>
+              <% if (r.pickingPdfUrl && r.status !== 'cancelled') { %>
+                <a class="btn-sm" href="<%= r.pickingPdfUrl %>" target="_blank" rel="noopener">📄 ピッキングPDF</a>
+              <% } %>
               <% if (r.status === 'setup') { %>
                 <button class="btn-sm run-activate" data-id="<%= r.id %>">✅ 有効化 (iPadに出す)</button>
               <% } %>

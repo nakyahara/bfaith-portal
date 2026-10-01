@@ -42,6 +42,7 @@ import { listStaffForLink } from '../staff/roster-link.js';
 import { buildRunReport } from './report.js';
 import { drainNotifyOutbox } from './notify-outbox.js';
 import { WEBHOOK_ENV } from './notify.js';
+import { pickingPdfPath } from '../fba-replenishment/picking-pdf-store.js';
 
 /** 商品画像の取得を裏で走らせる (best-effort・スロットル付き。応答は待たない) */
 const kickCatalog = (runId) => { ensureRunCatalog(runId).catch((e) => console.warn('[fba-box] catalog', e.message)); };
@@ -77,6 +78,16 @@ let pickingSource = async () => {
   };
 };
 export function _setPickingSource(fn) { pickingSource = fn; }
+/**
+ * 納品回の元になった picking 実行の「納品プランNo 付き」ピッキング PDF (ロジザード TMP1 に注番したもの) の URL。
+ * 公開の /print/picking/:id/pdf をそのまま使う (Notion カードに貼っているのと同じ・見られて困らない — 中原さん 2026-10-01)。
+ * PDF は picking-prep 側で直近 40 件だけ残すので、消えた回・PDF の無い回は null (ボタンを出さない)
+ */
+function pickingPdfUrlOf(run) {
+  const src = Number(run?.source_run_id);
+  if (!Number.isInteger(src) || src <= 0) return null;
+  try { return pickingPdfPath(src) ? `/print/picking/${src}/pdf` : null; } catch { return null; }
+}
 async function loadPickingRuns(limit = 15) {
   try {
     const src = await pickingSource();
@@ -389,6 +400,7 @@ router.get('/api/state', api((req, res) => {
   if (state.run.status === 'active' && state.rows.some((r) => r.expiry_source == null && r.match_state !== 'retired')) kickExpiry(runId);
   res.json({
     ok: true, ...state,
+    pickingPdfUrl: pickingPdfUrlOf(state.run),
     workers: listWorkers(),
     materials: listMaterials(),
     // 箱に「どのサイズか」を出すための名前だけの引き (中原さん 2026-09-18)。
@@ -849,7 +861,7 @@ router.get('/admin', requireSession, api(async (req, res) => {
     displayName: req.session.displayName,
     isAdmin: isAdmin(req),
     base: BASE,
-    runs: listRuns(30),
+    runs: listRuns(30).map((r) => ({ ...r, pickingPdfUrl: pickingPdfUrlOf(r) })),
     pickingRuns, pickingError,
     workers: listWorkers(true),
     staffMaster: isAdmin(req) ? listStaffForLink() : [],   // 紐付け直しの選択肢 (名簿はスタッフマスタの鏡)
