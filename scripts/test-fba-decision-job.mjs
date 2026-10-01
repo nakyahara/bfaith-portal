@@ -570,6 +570,43 @@ await ta('Sheet なしのモードの材料が欠けた日は、倉庫の写し�
   assert.deepEqual(await openRows(), []);
 });
 
+await ta('miniPC が Sheet なしの理由で引き取りを断った日 (FBA_SHEETLESS_NOT_READY / FBA_SKU_ATTRS_CONFLICT) は、11:40 でも止めた印の道 = 前の提案はそのまま・send_blocked・fail (Codex PR R5 Medium 2)', async () => {
+  const dayDeps = (date, prev, o = {}) => makeDeps({
+    freshness: FRESH({
+      restock_source_at: `${prev} 22:42:00`, restock_source_max: `${prev} 22:42:00`,
+      planning_source_at: `${prev} 22:43:00`, planning_source_max: `${prev} 22:43:00`,
+    }),
+    mirror: { rows: FIXTURE.map((x) => ({ ...x, captured_at: `${date}T02:20:00.000Z` })), meta: META({ captured_at: `${date}T02:20:00.000Z`, source_at: `${date}T02:05:00.000Z` }) },
+    ...o,
+  });
+  // 前の日 (10/23) に決めて提案を作る
+  const { deps: d0 } = dayDeps('2026-10-23', '2026-10-22');
+  assert.equal((await runDecisionAttempt(d0, { nowMs: at('2026-10-23T02:40:00Z'), log: quiet })).outcome, 'decided');
+  const openRows = async () => (await q(
+    `select decision_id, status, inputs_ref from ai.decisions
+      where status = 'new' and decision_kind = 'proposal' and inputs_ref->>'generator' = $1 order by decision_id`, [GENERATOR])).rows;
+  const before = await openRows();
+  assert.ok(before.length > 0);
+  for (const [date, code] of [['2026-10-24', 'FBA_SHEETLESS_NOT_READY'], ['2026-10-25', 'FBA_SKU_ATTRS_CONFLICT']]) {
+    const prev = date === '2026-10-24' ? '2026-10-23' : '2026-10-24';
+    const { deps, calls } = dayDeps(date, prev);
+    deps.syncReports = async () => { calls.sync++; throw Object.assign(new Error(`miniPC が断った (${code})`), { code }); };
+    const r = await runDecisionAttempt(deps, { nowMs: at(`${date}T02:40:00Z`), log: quiet });   // 11:40 = 最後の回
+    assert.equal(r.outcome, 'engine_failed', `${code}: ${r.outcome}`);
+    assert.equal(calls.generate, 0, `${code}: 止めたのに計算した`);
+    assert.deepEqual(calls.ping.map((p) => p[0]), ['fail'], code);
+    assert.match(calls.ping[0][1], new RegExp(code));
+    assert.deepEqual(await openRows(), before, `${code}: 前の提案を変えた`);
+    assert.equal((await findSendBlock(pdb))?.business_date, date, `${code}: 止めた印が無い`);
+  }
+  // 対照: ふつうの引き取りの失敗 (code なし) は今までどおり倉庫・レポートの関所 → 最後の回で superseded・partial
+  const { deps: d3, calls: c3 } = dayDeps('2026-10-26', '2026-10-25', { syncThrows: true });
+  const r3 = await runDecisionAttempt(d3, { nowMs: at('2026-10-26T02:40:00Z'), log: quiet });
+  assert.equal(r3.outcome, 'gated_final');
+  assert.deepEqual(c3.ping.map((p) => p[0]), ['partial']);
+  assert.deepEqual(await openRows(), []);
+});
+
 await ta('runDecisionAttemptSafe: 接続できない → 投げずに ping fail / 同じプロセスで重ねない', async () => {
   const { deps, calls } = makeDeps();
   const r = await runDecisionAttemptSafe({ ...deps, openClient: async () => { throw new Error('ECONNREFUSED'); } }, { log: quiet });

@@ -32,6 +32,7 @@ import { buildWarehouseFromMirror, diffWarehouse } from './mirror-warehouse.js';
 import {
   inputGate, recordShadowDraft, pickDraftRows, COMPANY_ID, DOMAIN, GENERATOR, RUN_SUMMARY_KEY, RULE_VERSION_OF,
 } from './shadow-draft.mjs';
+import { MINIPC_SHEETLESS_ERRORS } from './sheetless-mode.js';
 
 export const DECISION_JOB_ID = 'fba-decision-draft';
 /** session advisory lock の鍵 (この仕組み専用の固定値。'FBAD') */
@@ -159,7 +160,11 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
 
     // ① Amazon のレポートを引いて保存し直す (失敗・保存しなかった も理由に残す)
     let sync;
-    try { sync = await deps.syncReports(); } catch (e) { sync = { ok: false, thrown: String(e.message).slice(0, 200) }; }
+    try { sync = await deps.syncReports(); } catch (e) {
+      sync = { ok: false, thrown: String(e.message).slice(0, 200) };
+      // miniPC が Sheet なしの理由で断った (⑦-F・Codex PR R5 Medium 2): 下で止めた印の道にする
+      if (e && MINIPC_SHEETLESS_ERRORS.includes(e.code)) sync.sheetless_code = e.code;
+    }
     // ② 準備中を取り直す (取り直した世代のデータと状態を組で持つ。Codex A2b High 3)
     let inbound;
     try { inbound = await deps.fetchInbound(); } catch (e) {
@@ -185,6 +190,10 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
     let sheetlessBlock = null;
     try { sheetlessBlock = deps.checkSheetless ? deps.checkSheetless() : null; } catch (e) {
       sheetlessBlock = `Sheet なしのモード: 材料を確かめられない (${String(e.message).slice(0, 160)})。計算しない (Sheet には戻らない・前の結果はそのまま)`;
+    }
+    //   miniPC が Sheet なしの理由で引き取りを断った日 (印が無い・FNSKU が食い違う) も同じ止めた印の道 (待って最後の回で superseded にしない)
+    if (!sheetlessBlock && sync?.sheetless_code) {
+      sheetlessBlock = `Sheet なしのモード: miniPC が引き取りを断った (${sync.sheetless_code}: ${sync.thrown})。計算しない (前の結果はそのまま)`;
     }
     if (!wh.ok) {
       extra.push({ code: 'warehouse_mirror_not_ready', detail: wh.reasons.join(' / ').slice(0, 300) });

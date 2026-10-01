@@ -29,6 +29,21 @@ export const SHEETLESS_IO_ENV = 'FBA_SHEETLESS_IO';
 /** 起動時の sku_mapping → fba_sku_attrs の backfill を「済んだ」と記録する印のキー (fba.db の fba_migration_marks) */
 export const BACKFILL_MARK_KEY = 'sku_mapping_to_fba_sku_attrs';
 
+/**
+ * SKU の正規化の決まりは 1 つだけ (Codex PR R5 Medium 1)。JS の trim() (U+3000・NBSP・タブなど Unicode の空白) と toLowerCase() (Unicode の大小文字)。
+ * db.js の normSku・SQL の関数 fba_norm_sku (db.js が sql.js に、移行のスクリプトが better-sqlite3 に登録する) は全部これを使う
+ * (SQLite の LOWER(TRIM()) は ASCII の空白・大小文字しか見ないので、Sheet なしの経路では使わない)
+ */
+export const normSkuKey = (v) => String(v ?? '').trim().toLowerCase();
+/** SQL から normSkuKey を呼ぶ関数の名前 */
+export const SKU_NORM_SQL_FN = 'fba_norm_sku';
+
+/**
+ * miniPC の /service-api/fba/sync/latest-planning が Sheet なしの理由で断る 503 の error (Codex PR R5 Medium 2)。
+ * Render (モードあり) は「つながらない」と区別して、9:40 の自動決定で止めた印の道にする (前の提案を superseded にしない)
+ */
+export const MINIPC_SHEETLESS_ERRORS = Object.freeze(['FBA_SHEETLESS_NOT_READY', 'FBA_SKU_ATTRS_CONFLICT']);
+
 /** 手の Sheet 同期の口が返す 410 の文言 */
 export const SHEET_SYNC_GONE_MESSAGE = 'Sheet なしのモード (FBA_SHEETLESS_MODE=1 / miniPC は FBA_SHEETLESS_IO=1) なので、Google Sheet「商品コード変換テーブル」の同期は止めています。'
   + 'SKU の対応はマスタ (Company DB → 写し) から、他 CH の販売は商品管理リストから読みます。';

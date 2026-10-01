@@ -28,16 +28,21 @@
  *   ぶつかったときは、こちらは読み直して最大 3 回やり直す。常駐のサーバ側は次の保存で 1 回だけ失敗して読み直す (やり直せば通る)。
  *   → 画面を使っていない時間 (06:00・09:40〜11:40 の定期処理を外す) に流す。miniPC は WarehouseServer を止めてから流すのがいちばん安全
  *
- * 🚨 大小文字だけ違う SKU (Codex PR R4 Medium): SKU は LOWER(TRIM()) で突き合わせる (読み手と同じ)。Sheet の `Alpha-1` と attrs の `alpha-1` は同じ SKU
- *   = attrs に 2 行目を作らない。fba_sku_attrs に大小文字だけ違う行が既に 2 行以上ある鍵、Sheet の中で大小文字だけ違って attrs に無い鍵があれば、
+ * 🚨 大小文字・空白だけ違う SKU (Codex PR R4 / R5 Medium): SKU は読み手 (JS の normSku) と同じ正規化 (sheetless-mode.js の normSkuKey =
+ *   trim() で U+3000・NBSP・タブなども落とし、toLowerCase() で Unicode の大小文字もそろえる) で突き合わせる。SQL では関数 fba_norm_sku。
+ *   Sheet の `Alpha-1` と attrs の `alpha-1` (や `alpha-1　`) は同じ SKU = attrs に 2 行目を作らない。
+ *   fba_sku_attrs に正規化すると同じになる行が既に 2 行以上ある鍵、Sheet の中で同じになって attrs に無い鍵があれば、
  *   どちらの FNSKU が正しいか機械では決められないので **断る** (--check にも一覧が出る)。
- *   直し方 (人が決める): 常駐のサーバを止め、fba.db の fba_sku_attrs で、その鍵の行のうち Amazon の今のレポートと合う 1 行 (ふつうは
- *   source が restock / planning で updated_at が新しい行) だけを残して他の行を DELETE する → サーバを起動 → このスクリプトを流す。
- *   自動でまとめないのは、Sheet の backfill の行とレポートの行のどちらも「今の Amazon の値」とは言い切れない場合があるため
+ *   自動でまとめないのは、Sheet の backfill の行とレポートの行のどちらも「今の Amazon の値」とは言い切れない場合があるため。
  *
- * やり直し: 基本は要らない (入れるのは空いている SKU だけ)。どうしても要るときは、モードを外し、常駐のサーバを止めてから
- *   fba.db の fba_migration_marks から key = 'sku_mapping_to_fba_sku_attrs' の行を消して、このスクリプトをもう一度流す
- *   (印を消す口はわざと作らない)。
+ * 直し方 (人が決める。どちらも「1 行に残す行」= Amazon の今のレポートと合う行。ふつうは source が restock / planning で updated_at が新しい行):
+ *   (a) このスクリプトが流す前に断ったとき (印はまだ無い):
+ *       fba.db を控える → 常駐のサーバを止める → fba_sku_attrs のその鍵の行を 1 行にする (残りを DELETE) → サーバを起動 → このスクリプトを流す
+ *   (b) 移行の後に miniPC の /service-api/fba/sync/latest-planning が 503 (FBA_SKU_ATTRS_CONFLICT) になったとき (印はもうある):
+ *       fba.db を控える → 常駐のサーバを止める → fba_sku_attrs のその鍵の行を 1 行にする → **同じ IO の設定のまま** サーバを起動 →
+ *       その口が 200 を返すことを確かめる。🚨 印は消さない・このスクリプトはもう流さない (断る)
+ *
+ * やり直し: 基本は要らない (入れるのは空いている SKU だけ)。印を消す口はわざと作らない。
  */
 import 'dotenv/config';
 import fs from 'node:fs';
@@ -51,7 +56,7 @@ const dbFile = path.join(dataDir, 'fba.db');
 const checkOnly = process.argv.includes('--check');
 const minArg = process.argv.indexOf('--min-rows');
 const minRows = minArg >= 0 ? Number(process.argv[minArg + 1]) : 100;
-const { isSheetlessIoRequested, BACKFILL_MARK_KEY, SHEETLESS_ENV, SHEETLESS_IO_ENV } = await import(pathToFileURL(path.join(root, 'apps', 'fba-replenishment', 'sheetless-mode.js')).href);
+const { isSheetlessIoRequested, BACKFILL_MARK_KEY, SHEETLESS_ENV, SHEETLESS_IO_ENV, normSkuKey, SKU_NORM_SQL_FN } = await import(pathToFileURL(path.join(root, 'apps', 'fba-replenishment', 'sheetless-mode.js')).href);
 
 function fail(msg) {
   console.error(`[fba-sheetless-backfill] 断った: ${msg}`);
@@ -61,6 +66,7 @@ function fail(msg) {
 /** 書かずに見る (better-sqlite3 の読むだけの接続) */
 function inspect() {
   const f = new Database(dbFile, { readonly: true, fileMustExist: true });
+  f.function(SKU_NORM_SQL_FN, { deterministic: true }, (v) => normSkuKey(v));   // 読み手・db.js と同じ正規化 (Codex PR R5 Medium 1)
   try {
     const has = (t) => !!f.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(t);
     const tables = { sku_mapping: has('sku_mapping'), fba_sku_attrs: has('fba_sku_attrs') };
@@ -70,16 +76,16 @@ function inspect() {
       mark, tables,
       sku_mapping_rows: count('SELECT COUNT(*) AS n FROM sku_mapping'),
       attrs_rows: count('SELECT COUNT(*) AS n FROM fba_sku_attrs'),
-      would_insert: count('SELECT COUNT(*) AS n FROM sku_mapping m WHERE LOWER(TRIM(m.amazon_sku)) NOT IN (SELECT LOWER(TRIM(amazon_sku)) FROM fba_sku_attrs)'),
+      would_insert: count('SELECT COUNT(*) AS n FROM sku_mapping m WHERE fba_norm_sku(m.amazon_sku) NOT IN (SELECT fba_norm_sku(amazon_sku) FROM fba_sku_attrs)'),
       // 流した後に大小文字だけ違う SKU が attrs に 2 行以上になる鍵 = 今ある衝突 + Sheet の中の大小文字違いで attrs に無いもの
       collisions: tables.sku_mapping && tables.fba_sku_attrs ? f.prepare(`
         WITH u AS (
           SELECT amazon_sku FROM fba_sku_attrs
           UNION
-          SELECT m.amazon_sku FROM sku_mapping m WHERE LOWER(TRIM(m.amazon_sku)) NOT IN (SELECT LOWER(TRIM(amazon_sku)) FROM fba_sku_attrs)
+          SELECT m.amazon_sku FROM sku_mapping m WHERE fba_norm_sku(m.amazon_sku) NOT IN (SELECT fba_norm_sku(amazon_sku) FROM fba_sku_attrs)
         )
-        SELECT LOWER(TRIM(amazon_sku)) AS norm_key, group_concat(amazon_sku, ' / ') AS skus FROM u
-        GROUP BY LOWER(TRIM(amazon_sku)) HAVING COUNT(*) > 1 ORDER BY norm_key`).all() : [],
+        SELECT fba_norm_sku(amazon_sku) AS norm_key, group_concat(amazon_sku, ' / ') AS skus FROM u
+        GROUP BY fba_norm_sku(amazon_sku) HAVING COUNT(*) > 1 ORDER BY norm_key`).all() : [],
     };
   } finally {
     f.close();
@@ -92,7 +98,7 @@ function sourceProblem(before) {
   if (missing.length) return `FBA 補充の fba.db ではない (表 ${missing.join('・')} が無い)。DATA_DIR を確かめる`;
   if (!Number.isFinite(minRows) || minRows < 1) return `--min-rows の値がおかしい (${process.argv[minArg + 1]})`;
   if (before.sku_mapping_rows < minRows) return `sku_mapping が ${before.sku_mapping_rows} 行しかない (下限 ${minRows})。空の・違う fba.db に印を付けない`;
-  if (before.collisions.length) return `大小文字だけ違う SKU が ${before.collisions.length} 組ある (流すと fba_sku_attrs に 2 行以上になる): ${before.collisions.slice(0, 20).map((c) => c.skus).join(' | ')}。説明の手順で 1 行にしてから流す`;
+  if (before.collisions.length) return `大小文字だけ違う SKU が ${before.collisions.length} 組ある (流すと fba_sku_attrs に 2 行以上になる): ${before.collisions.slice(0, 20).map((c) => JSON.stringify(c.skus)).join(' | ')}。説明の手順 (a) で 1 行にしてから流す`;
   return null;
 }
 
@@ -114,8 +120,8 @@ async function main() {
   const db = await import(pathToFileURL(path.join(root, 'apps', 'fba-replenishment', 'db.js')).href);
   await db.initDb({ skipStartupBackfill: true });   // 起動時の backfill (大小文字まで同じものだけ見る) は流さない = 2 行目を作らない
   try {
-    // initDb() は (印が無くモードも無いので) 起動時の backfill を今までどおり流す。ここで数える入った行は 0 になりやすいので、
-    // 流す前に数えた件数も印に残す。保存の競合 (常駐のサーバが書いた) は読み直して 3 回までやり直す (試験 = test-fba-sheetless-mode.mjs)
+    // initDb({ skipStartupBackfill: true }) は起動時の backfill を流さない (上)。流す前に数えた件数も印に残す (読み直しの間に変わることがあるので両方)。
+    // 保存の競合 (常駐のサーバが書いた) は読み直して 3 回までやり直す (試験 = test-fba-sheetless-mode.mjs)
     const r = db.runSkuMappingBackfillOnceRetrying({
       minSkuMappingRows: minRows,
       extra: { before_init: { attrs_rows: before.attrs_rows, would_insert: before.would_insert } },

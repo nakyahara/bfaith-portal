@@ -14,7 +14,7 @@ import { fileURLToPath } from 'url';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { withSqliteFileLock, lockDbFileOf } from './file-lock.js';
 // Sheet なし (fail-closed) のモード (⑦-F)。env を読むだけ。モードを使わないときは今までと同じ動き
-import { isSheetlessRequested, isSheetlessIoRequested, sheetlessProblems, sheetlessMisconfigError, BACKFILL_MARK_KEY } from './sheetless-mode.js';
+import { isSheetlessRequested, isSheetlessIoRequested, sheetlessProblems, sheetlessMisconfigError, BACKFILL_MARK_KEY, normSkuKey, SKU_NORM_SQL_FN } from './sheetless-mode.js';
 import { findPendingSlips, shipmentSinceJstDate, LEFT_WAREHOUSE_STATUSES } from './self-reserve.js';   // 出力済み NE 受注 CSV (FBA 伝票) のうち、まだ Amazon に出ていないもの
 // SQL の IN 句に埋める「倉庫を出た」状態の一覧 (固定の英大文字だけなので直接埋めてよい)
 const LEFT_STATUS_SQL = `(${LEFT_WAREHOUSE_STATUSES.map(s => `'${s}'`).join(', ')})`;
@@ -64,6 +64,14 @@ function stampOfFile() {
 }
 const sameStamp = (a, b) => (_testHooks.stampAlwaysSame && a !== null && b !== null ? true : a === null || b === null ? a === b : a.mtimeMs === b.mtimeMs && a.size === b.size);
 
+/**
+ * Sheet なしの経路の SQL が使う SKU の正規化 fba_norm_sku (JS の normSku と同じ関数。⑦-F・Codex PR R5 Medium 1)。
+ * 接続ごとの関数 = ファイルには残らない。読み直したとき・export() の後に登録する
+ */
+function registerSqlFunctions(target) {
+  target.create_function(SKU_NORM_SQL_FN, (v) => normSkuKey(v));
+}
+
 /** 取引がもう無いときの ROLLBACK で、元の例外を隠さない (COMMIT の後の保存で失敗した・メモリを読み直した) */
 function rollbackQuiet() {
   try { db.run('ROLLBACK'); } catch { /* no transaction is active */ }
@@ -110,6 +118,7 @@ function loadFromFileLocked() {
   const f = inspectFile();
   if (f && f.torn) throw Object.assign(new Error(`fba.db が書きかけで止まっている (長さ ${f.stamp.size} がヘッダの言う大きさに足りない)。読み込まない = 控えから戻すか、正しいメモリを持つプロセスに保存させる`), { code: 'FBA_DB_FILE_TORN' });
   const fresh = f ? new SQLMod.Database(fs.readFileSync(DB_FILE)) : new SQLMod.Database();
+  registerSqlFunctions(fresh);
   const old = db;
   db = fresh;
   fileStamp = f ? f.stamp : null;
@@ -155,6 +164,7 @@ function saveToFileLocked() {
     db.run('CREATE TABLE IF NOT EXISTS _file_gen (id INTEGER PRIMARY KEY CHECK (id = 1), token TEXT NOT NULL)');
     db.run('INSERT OR REPLACE INTO _file_gen (id, token) VALUES (1, ?)', [token]);
     const data = db.export();
+    registerSqlFunctions(db);   // sql.js の export() は接続を開き直し、登録した関数を消す → 登録し直す (⑦-F)
     fs.writeFileSync(DB_FILE, Buffer.from(data));
     knownToken = token;
     fileStamp = stampOfFile();
@@ -193,7 +203,7 @@ const SKU_MAPPING_BACKFILL_SQL = `
   `;
 
 /**
- * 一回限りの移行で流す backfill (Codex PR R4 Medium): SKU の突き合わせを LOWER(TRIM()) にする (読み手の normSku と同じ)。
+ * 一回限りの移行で流す backfill (Codex PR R4 / R5 Medium): SKU の突き合わせを fba_norm_sku (= 読み手の normSku と同じ関数) にする。
  * 🚨 起動時の backfill (上の SKU_MAPPING_BACKFILL_SQL) は大小文字まで同じものだけ見る = 今までどおり (モードなしは変えない)。
  *    そのままだと Sheet の `Alpha-1` が、attrs の `alpha-1` と別の 2 行目として入り、読み手 (正規化して後勝ち) が古い値を拾う
  */
@@ -201,7 +211,7 @@ const SKU_MAPPING_BACKFILL_NORM_SQL = `
     INSERT INTO fba_sku_attrs (amazon_sku, asin, fnsku, source)
     SELECT m.amazon_sku, m.asin, m.fnsku, 'sheet_backfill'
     FROM sku_mapping m
-    WHERE LOWER(TRIM(m.amazon_sku)) NOT IN (SELECT LOWER(TRIM(amazon_sku)) FROM fba_sku_attrs)
+    WHERE fba_norm_sku(m.amazon_sku) NOT IN (SELECT fba_norm_sku(amazon_sku) FROM fba_sku_attrs)
   `;
 
 /**
@@ -210,8 +220,8 @@ const SKU_MAPPING_BACKFILL_NORM_SQL = `
  */
 export function findAttrsCaseCollisions() {
   return queryAll(`
-    SELECT LOWER(TRIM(amazon_sku)) AS norm_key, COUNT(*) AS n, group_concat(amazon_sku || '=' || COALESCE(fnsku, '(なし)'), ' / ') AS rows
-    FROM fba_sku_attrs GROUP BY LOWER(TRIM(amazon_sku)) HAVING COUNT(*) > 1 ORDER BY norm_key`);
+    SELECT fba_norm_sku(amazon_sku) AS norm_key, COUNT(*) AS n, group_concat(amazon_sku || '=' || COALESCE(fnsku, '(なし)'), ' / ') AS rows
+    FROM fba_sku_attrs GROUP BY fba_norm_sku(amazon_sku) HAVING COUNT(*) > 1 ORDER BY norm_key`);
 }
 
 /**
@@ -271,7 +281,7 @@ function shouldRunStartupBackfill() {
  * 印があれば、以後の起動では backfill を流さない (モードを外しても流さない)。
  * 🚨 断る (投げる): モードを使うつもりのとき (code FBA_BACKFILL_MODE_ON)・印がもうあるとき (code FBA_BACKFILL_ALREADY_DONE)。
  *    やり直す口は作らない (やり直しの手順は scripts/fba-sheetless-backfill-once.mjs の説明)
- * 🚨 SKU は LOWER(TRIM()) で突き合わせる。流した後に大小文字だけ違う SKU が fba_sku_attrs に残れば断る (code FBA_BACKFILL_ATTRS_COLLISION。Codex PR R4 Medium)
+ * 🚨 SKU は fba_norm_sku (読み手と同じ正規化) で突き合わせる。流した後に大小文字だけ違う SKU が fba_sku_attrs に残れば断る (code FBA_BACKFILL_ATTRS_COLLISION。Codex PR R4 Medium)
  * 🚨 空の・違う fba.db に印を付けない (Codex PR R1 Medium 3): sku_mapping が minSkuMappingRows 行より少なければ断る (code FBA_BACKFILL_SOURCE_EMPTY)。
  *    流した後に「sku_mapping にあって fba_sku_attrs に無い SKU」を数え、0 でなければ巻き戻して断る (code FBA_BACKFILL_VERIFY_FAILED)。印はその後にだけ書く
  * initDb() の後に呼ぶ。保存は saveToFile (外から書かれていたら例外 = 保存されていない。やり直せば通る)
@@ -299,7 +309,7 @@ export function runSkuMappingBackfillOnce({ now = new Date(), extra = null, minS
     const attrsBefore = count('fba_sku_attrs');
     db.run(SKU_MAPPING_BACKFILL_NORM_SQL);
     if (_testHooks.afterBackfillInsert) _testHooks.afterBackfillInsert((sql) => db.run(sql));
-    const missingAfter = Number(queryOne('SELECT COUNT(*) AS n FROM sku_mapping m WHERE LOWER(TRIM(m.amazon_sku)) NOT IN (SELECT LOWER(TRIM(amazon_sku)) FROM fba_sku_attrs)')?.n || 0);
+    const missingAfter = Number(queryOne('SELECT COUNT(*) AS n FROM sku_mapping m WHERE fba_norm_sku(m.amazon_sku) NOT IN (SELECT fba_norm_sku(amazon_sku) FROM fba_sku_attrs)')?.n || 0);
     if (missingAfter !== 0) {
       throw Object.assign(new Error(`流した後も fba_sku_attrs に無い SKU が ${missingAfter} 件ある。印を付けない (巻き戻した)`), { code: 'FBA_BACKFILL_VERIFY_FAILED' });
     }
@@ -2361,7 +2371,7 @@ function buildMirrorRow(amazonSku, compRows, attr, nonFba, registeredAt) {
 }
 
 // SKU/コード正規化 (case 非依存の突き合わせ用、PR4)
-const normSku = (v) => String(v ?? '').trim().toLowerCase();
+const normSku = normSkuKey;   // ⑦-F: SQL の fba_norm_sku と同じ関数 (sheetless-mode.js。中身は今までと同じ trim().toLowerCase())
 
 // 案C: mirror は seller_sku を小文字保存するので、amazon_sku の「元ケース」を FBA 側データから復元する
 // (consumer 無改修で動かすため。recData.find / mappingMap など多数の exact 比較を壊さない)。
@@ -2454,7 +2464,8 @@ function getSkuMappingFromMirror(amazonSku) {
   `).all(k);
   if (compRows.length === 0) return null;
   // 補助 join も norm キーで (single も case 非依存に)
-  const attrRows = queryAll('SELECT asin, fnsku FROM fba_sku_attrs WHERE LOWER(TRIM(amazon_sku)) = ?', [k]);
+  // Sheet なしのモードは読み手 (normSku) と同じ正規化で引く (Codex PR R5 Medium 1)。モードなしは今までどおり
+  const attrRows = queryAll(isSheetlessRequested() ? 'SELECT asin, fnsku FROM fba_sku_attrs WHERE fba_norm_sku(amazon_sku) = ?' : 'SELECT asin, fnsku FROM fba_sku_attrs WHERE LOWER(TRIM(amazon_sku)) = ?', [k]);
   // Sheet なしのモードでは sku_mapping を読まない (⑦-F)
   const nfRows = isSheetlessRequested() ? [] : queryAll('SELECT non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping WHERE LOWER(TRIM(amazon_sku)) = ?', [k]);
   let registeredAt = null;
@@ -3204,7 +3215,7 @@ function getReplenishmentExcludedSheetless() {
   const rows = queryAll(`
     SELECT e.amazon_sku, e.reason, e.excluded_at, a.asin AS asin
     FROM replenishment_excluded e
-    LEFT JOIN fba_sku_attrs a ON LOWER(TRIM(e.amazon_sku)) = LOWER(TRIM(a.amazon_sku))
+    LEFT JOIN fba_sku_attrs a ON fba_norm_sku(e.amazon_sku) = fba_norm_sku(a.amazon_sku)
     GROUP BY e.amazon_sku
     ORDER BY e.excluded_at DESC
   `);
@@ -3340,7 +3351,7 @@ export function syncFnskuBatch(items) {
  * 大小文字違いの 2 行目を作らない (Codex PR R4 Medium)。既存の行の amazon_sku (大小文字) は変えない
  */
 function upsertAttrsFnskuNormalized(sku, fnsku, source) {
-  db.run(`UPDATE fba_sku_attrs SET fnsku = ?, source = ?, updated_at = datetime('now','localtime') WHERE LOWER(TRIM(amazon_sku)) = LOWER(TRIM(?))`, [fnsku, source, sku]);
+  db.run(`UPDATE fba_sku_attrs SET fnsku = ?, source = ?, updated_at = datetime('now','localtime') WHERE fba_norm_sku(amazon_sku) = fba_norm_sku(?)`, [fnsku, source, sku]);
   if (db.getRowsModified() === 0) {
     db.run(`INSERT INTO fba_sku_attrs (amazon_sku, fnsku, source, updated_at) VALUES (?, ?, ?, datetime('now','localtime'))`, [sku, fnsku, source]);
   }
@@ -3350,7 +3361,7 @@ function upsertAttrsFnskuNormalized(sku, fnsku, source) {
 function writeAttrsAsin(item) {
   const asin = String(item.asin ?? '').trim();
   if (!asin) return;
-  db.run('UPDATE fba_sku_attrs SET asin = COALESCE(?, asin) WHERE LOWER(TRIM(amazon_sku)) = LOWER(TRIM(?))', [asin, item.sku]);
+  db.run('UPDATE fba_sku_attrs SET asin = COALESCE(?, asin) WHERE fba_norm_sku(amazon_sku) = fba_norm_sku(?)', [asin, item.sku]);
 }
 
 // ===== Amazon仮確定 =====

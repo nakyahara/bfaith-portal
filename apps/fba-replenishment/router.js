@@ -24,7 +24,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          getInboundDailySummary, getInboundMonthlySummary, getInboundShipmentsByDate, getInboundItems,
          getInboundUnreceived, getInboundSyncStatus, getInboundShipmentsWithoutDate,
          importInboundRows, getInboundSyncCursor, checkSheetlessInputs, getSheetlessCalcBlock } from './db.js';
-import { isSheetlessRequested, isSheetlessIoRequested, SHEET_SYNC_GONE_MESSAGE } from './sheetless-mode.js';
+import { isSheetlessRequested, isSheetlessIoRequested, SHEET_SYNC_GONE_MESSAGE, MINIPC_SHEETLESS_ERRORS } from './sheetless-mode.js';
 import { parseCsv, decodeCsvBuffer, buildShiftJisCsv } from './picking-csv.js';
 import { parseWarehouseCsv } from './warehouse-csv.js';
 import * as pp from './picking-prep.js';
@@ -93,6 +93,14 @@ async function callMiniPC(path, { method = 'GET', body, timeout = 60000, retry }
         throw new Error(`認証失敗 HTTP ${res.status} req=${requestId}`);
       }
       if ([502, 503, 504].includes(res.status)) {
+        // Sheet なしのモード (⑦-F・Codex PR R5 Medium 2): miniPC が Sheet なしの理由で断った 503 は「つながらない」ではない
+        //   → やり直さずに、理由の code を持った例外にする (9:40 の自動決定が止めた印の道にする)。モードなしは今までどおり
+        if (res.status === 503 && isSheetlessRequested() && ct.includes('application/json')) {
+          const body = await res.json().catch(() => null);
+          if (body && MINIPC_SHEETLESS_ERRORS.includes(body.error)) {
+            throw Object.assign(new Error(`miniPC が断った (${body.error}): ${String(body.message || '').slice(0, 300)} req=${requestId}`), { code: body.error, sheetlessMiniPC: true });
+          }
+        }
         lastError = new Error(`upstream障害 HTTP ${res.status} (CF tunnel/warehouse側) req=${requestId}`);
         if (attempt < maxAttempts) {
           await new Promise(r => setTimeout(r, Math.min(500 * 2 ** (attempt - 1), 4000) + Math.random() * 300));
@@ -110,6 +118,7 @@ async function callMiniPC(path, { method = 'GET', body, timeout = 60000, retry }
       }
       return await res.json();
     } catch (e) {
+      if (e?.sheetlessMiniPC) throw e;   // 上の Sheet なしの断り = やり直さない
       const msg = e?.message || String(e);
       const isRetryable = e?.name === 'TimeoutError' || /aborted|timeout|ECONNREFUSED|ENOTFOUND|fetch failed|upstream障害/i.test(msg);
       if (isRetryable && attempt < maxAttempts) {

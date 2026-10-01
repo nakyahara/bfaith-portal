@@ -55,7 +55,10 @@ globalThis.fetch = async (url, opts) => {
   const u = String(url);
   if (!u.startsWith('http://minipc.test')) return realFetch(url, opts);
   miniCalls.push(u);
-  return new Response(JSON.stringify(miniHandler(u)), { status: 200, headers: { 'content-type': 'application/json' } });
+  const body = miniHandler(u);
+  const status = (body && body.__status) || 200;   // 試験で miniPC の 503 を返す
+  if (body) delete body.__status;
+  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 };
 
 // ── 画面の口 (Render の router) と miniPC の口 (fba-service) を 1 つの express に載せる ──
@@ -1153,6 +1156,99 @@ await t('移行のスクリプト: Sheet の `Alpha-1` と attrs の `alpha-1` �
     assert.deepEqual(f.prepare(`SELECT amazon_sku, fnsku FROM fba_sku_attrs WHERE LOWER(TRIM(amazon_sku)) = 'alpha-1'`).all(), [{ amazon_sku: 'alpha-1', fnsku: 'XNEW' }], '移行で大小文字違いの 2 行目を作った');
     assert.equal(f.prepare('SELECT COUNT(*) AS n FROM fba_migration_marks').get().n, 1);
   } finally { f.close(); }
+});
+await t('正規化は 1 つ (Codex PR R5 Medium 1): U+3000・NBSP・タブ・Unicode の大小文字も同じ SKU = 移行は 2 行目を入れない・食い違いは無い・IO の更新も同じ行に書く', async () => {
+  modeOff();
+  const { dir, mod } = await otherDb('unicode');
+  await mod.initDb();
+  mod.upsertSkuMappings([
+    { amazon_sku: 'Alpha-1', asin: 'B0A', ne_code: 'alpha' }, { amazon_sku: 'Bravo-2', asin: 'B0B', ne_code: 'bravo' },
+    { amazon_sku: 'Charlie-3', asin: 'B0C', ne_code: 'charlie' }, { amazon_sku: 'ÄPFEL-4', asin: 'B0D', ne_code: 'apfel' },
+  ]);
+  mod.updateFnskuBatch([
+    { sku: 'alpha-1\u3000', fnsku: 'XNEW' }, { sku: '\u00A0bravo-2', fnsku: 'XB' }, { sku: 'charlie-3\t', fnsku: 'XC' }, { sku: 'äpfel-4', fnsku: 'XA' },
+  ]);
+  await tick();
+  const f = new Database(path.join(dir, 'fba.db'));
+  try { f.exec("UPDATE sku_mapping SET fnsku = 'XOLD'"); } finally { f.close(); }
+  await mod.initDb({ skipStartupBackfill: true });
+  const r = mod.runSkuMappingBackfillOnce();
+  assert.deepEqual([r.inserted, r.missing_after], [0, 0], 'Unicode の空白・大小文字の違いを別の SKU とみなして 2 行目を入れた');
+  assert.deepEqual(mod.findAttrsCaseCollisions(), []);
+  const sync = mod.getFbaSkuAttrsForSync();
+  assert.deepEqual(sync.conflicts, [], '読み手 (miniPC の口) が食い違いを見つけた = 移行と読み手の正規化が違う');
+  assert.deepEqual(sync.rows.map((x) => x.fnsku).sort(), ['XA', 'XB', 'XC', 'XNEW']);
+  process.env.FBA_SHEETLESS_IO = '1';
+  try {
+    mod.updateFnskuBatch([{ sku: 'ALPHA-1', fnsku: 'XNEW2', asin: 'B0NEW' }, { sku: 'äPFEL-4', fnsku: 'XA2' }]);
+    mod.syncFnskuBatch([{ sku: 'BRAVO-2', fnsku: 'XB2' }, { sku: ' Charlie-3 ', fnsku: 'XC2' }]);
+  } finally { delete process.env.FBA_SHEETLESS_IO; }
+  const rows = mod.getFbaSkuAttrs();
+  assert.equal(rows.length, 4, 'IO の更新で 2 行目を作った');
+  assert.deepEqual(rows.map((x) => x.fnsku).sort(), ['XA2', 'XB2', 'XC2', 'XNEW2']);
+  assert.equal(rows.find((x) => x.fnsku === 'XNEW2').asin, 'B0NEW');
+});
+await t('正規化は 1 つ: U+3000 だけ違う行が attrs にあれば移行もスクリプトも断る (SQLite の LOWER(TRIM()) では見落とす)', async () => {
+  modeOff();
+  const { dir, mod } = await otherDb('unicode-collide');
+  await mod.initDb();
+  mod.upsertSkuMappings([{ amazon_sku: 'Delta-5', asin: 'B0D5', ne_code: 'delta' }]);
+  mod.updateFnskuBatch([{ sku: 'Delta-5', fnsku: 'X1' }, { sku: 'delta-5\u3000', fnsku: 'X2' }]);
+  assert.throws(() => mod.runSkuMappingBackfillOnce(), (e) => e.code === 'FBA_BACKFILL_ATTRS_COLLISION');
+  assert.equal(mod.getBackfillMark(), null);
+  const c = cli(['--min-rows', '1', '--check'], null, { dir });
+  assert.equal(c.code, 0, c.out);
+  assert.match(c.out, /このままでは流せない: 大小文字だけ違う SKU が 1 組/);
+  const r = cli(['--min-rows', '1'], null, { dir });
+  assert.equal(r.code, 1, r.out);
+});
+await t('Render が miniPC の Sheet なしの 503 を「つながらない」と区別する: やり直さずに code つきの例外 (モードあり) / モードなしは今までどおりやり直して upstream 障害', async () => {
+  modeOn();
+  miniCalls.length = 0;
+  miniHandler = (u) => (u.includes('/sync/latest-planning') ? { __status: 503, ok: false, error: 'FBA_SKU_ATTRS_CONFLICT', message: '食い違い' } : { ok: false });
+  await assert.rejects(routerMod.syncLatestPlanningFromMiniPC(), (e) => e.code === 'FBA_SKU_ATTRS_CONFLICT' && /miniPC が断った/.test(e.message));
+  assert.equal(miniCalls.length, 1, 'やり直した');
+  miniHandler = (u) => (u.includes('/sync/latest-planning') ? { __status: 503, ok: false, error: 'FBA_SHEETLESS_NOT_READY', message: '印が無い' } : { ok: false });
+  await assert.rejects(routerMod.syncLatestPlanningFromMiniPC(), (e) => e.code === 'FBA_SHEETLESS_NOT_READY');
+  // 9:40 の自動決定 (本物の引き取り・11:40 の最後の回): 前の提案を superseded にせず止めた印・fail
+  const CAP = '2026-10-05T02:20:00.000Z';
+  const rows = [{ 商品ID: 'alpha', 商品名: 'A', ブロック略称: 'A', ロケ: 'P-01', 有効期限: '', 在庫数: 200, 引当数: 0, ロケ業務区分: '通販', 最終入荷日: '20260901', ブロック引当順: 1, captured_at: CAP }];
+  const meta = { captured_at: CAP, source_at: '2026-10-05T02:05:00.000Z', rows_read: 1, skipped_rows: 0, row_count: 1 };
+  const queries = [], pings = [], generated = [];
+  const deps = {
+    openClient: async () => ({ db: { query: async (sql) => { queries.push(sql); return { rows: /pg_try_advisory_lock/.test(sql) ? [{ ok: true }] : [] }; } }, close: async () => {} }),
+    syncReports: () => routerMod.syncLatestPlanningFromMiniPC(),
+    fetchInbound: async () => ({ data: {}, state: { source: 'fresh', count: 0, at: 'x' } }),
+    readMirror: () => ({ rows, meta }), readInputFreshness: () => ({}), readManualWarehouseSummary: () => [],
+    generate: (inbound, opts) => { generated.push(opts.rules); return generateRecommendations(false, inbound, { ...opts, ...ENGINE_OPTS }); },
+    readSettings: () => ({}), ping: (st, n) => pings.push([st, n]),
+    checkSheetless: () => db.getSheetlessCalcBlock(),
+  };
+  assert.equal(db.getSheetlessCalcBlock(), null, '前提: Render の材料はそろっている (止めるのは miniPC の断り)');
+  const r = await runDecisionAttempt(deps, { nowMs: () => Date.parse('2026-10-05T02:40:00Z'), log: quiet });
+  assert.equal(r.outcome, 'engine_failed');
+  assert.deepEqual(generated, []);
+  assert.deepEqual(pings.map((p) => p[0]), ['fail']);
+  assert.match(pings[0][1], /FBA_SHEETLESS_NOT_READY/);
+  assert.equal(queries.some((q) => /set status = 'superseded'/i.test(q)), false, '前の提案を superseded にした');
+  assert.equal(queries.filter((q) => /insert into ai\.decisions/i.test(q)).length, 1, '止めた印を書いていない');
+  // モードなしの Render は今までどおり (やり直して upstream 障害)
+  modeOff();
+  miniCalls.length = 0;
+  await assert.rejects(routerMod.syncLatestPlanningFromMiniPC(), (e) => !e.code && /upstream障害 HTTP 503/.test(e.message));
+  assert.equal(miniCalls.length, 3, 'モードなしで今までのやり直しが変わった');
+});
+await t('Sheet なしのモードの読み手 (単票・除外一覧) も同じ正規化で fba_sku_attrs を引く', async () => {
+  modeOff();
+  mdb.prepare(`INSERT INTO mirror_sku_resolved (seller_sku, ne_code, quantity, source, 商品名, source_updated_at, sort_order, synced_at) VALUES ('hotel-9', 'hotel', 1, 'master', 'マスタH', ?, 0, ?)`).run(now, now);
+  db.updateFnskuBatch([{ sku: 'HOTEL-9\u3000', fnsku: 'XH' }]);   // モードなしの更新 = 大小文字・空白ごとに行 (今までどおり)
+  modeOn();
+  db.updateFnskuBatch([{ sku: 'Hotel-9', fnsku: 'XH', asin: 'B0HOTEL' }]);   // IO の更新は同じ行に書く (ASIN も)
+  assert.deepEqual(db.getSkuMapping('Hotel-9') && [db.getSkuMapping('Hotel-9').fnsku, db.getSkuMapping('Hotel-9').asin], ['XH', 'B0HOTEL']);
+  db.excludeReplenishmentSku('Hotel-9', '試験');
+  assert.equal(db.getReplenishmentExcluded().find((e) => e.amazon_sku === 'Hotel-9')?.asin, 'B0HOTEL');
+  db.unexcludeReplenishmentSku('Hotel-9');
+  modeOff();
 });
 await t('モードなしの FNSKU の更新は今までどおり (大小文字ごとに行を作る = master と同じ)', async () => {
   modeOff();

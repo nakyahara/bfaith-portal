@@ -532,7 +532,7 @@ router.get('/sync/latest-planning', dbHandler(async (req, res, db) => {
   // fba_sku_attrs から返すときは、大小文字・前後の空白だけ違う SKU を 1 行にまとめる。FNSKU が食い違えば渡さない (503。Codex PR R4 Medium)
   const attrsSync = fromAttrs ? db.getFbaSkuAttrsForSync() : null;
   if (attrsSync && attrsSync.conflicts.length) {
-    errorResponse(res, { status: 503, error: 'FBA_SKU_ATTRS_CONFLICT', message: `fba_sku_attrs に大小文字だけ違う SKU で FNSKU が食い違う組が ${attrsSync.conflicts.length} 組ある: ${attrsSync.conflicts.slice(0, 10).map((c) => c.rows.join(' ≠ ')).join(' | ')}。scripts/fba-sheetless-backfill-once.mjs の説明の手順で 1 行にする`, requestId: req.requestId });
+    errorResponse(res, { status: 503, error: 'FBA_SKU_ATTRS_CONFLICT', message: `fba_sku_attrs に大小文字だけ違う SKU で FNSKU が食い違う組が ${attrsSync.conflicts.length} 組ある: ${attrsSync.conflicts.slice(0, 10).map((c) => c.rows.join(' ≠ ')).join(' | ')}。scripts/fba-sheetless-backfill-once.mjs の説明の手順 (b) で 1 行にする (印は消さない・スクリプトは流さない)`, requestId: req.requestId });
     return undefined;
   }
   // 全SKU対象（fnsku=nullも含む）。Render側で現状に合わせてupsert（null時はクリア）
