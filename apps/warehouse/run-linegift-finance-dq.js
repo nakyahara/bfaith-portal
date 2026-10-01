@@ -9,7 +9,7 @@
  *   DATA_DIR=C:/Users/bfaith/bfaith-portal/data node apps/warehouse/run-linegift-finance-dq.js --month 2026-05
  *
  * 12 check (severity / threshold、設計書 v0.5 §8):
- *   1. row_count_drift                        (error: rows = 0、当月 < 50% of 7日平均)
+ *   1. row_count_drift                        (error: rows = 0、当月 < 50% of 7日平均。当月の月初 6 日までの 0 行だけ warn + exit 0 = monthStartEmptyGrace)
  *   2. listing_diff_pct                       (warn 1% / error 5%、当月・前月の月初 5%/15%) — f_sales_by_listing (linegift。NE の受注 = 受注日の月) vs raw を fact と同じ条件で **受注日の月** に数えた売上
  *                                              🚨 2026-09-21 まで fact (受取日の月) と比べていた → 月末の受注が翌月の受取に流れて構造的に 4〜5% ずれ、8 月が 5.06% で毎朝 ❌ だった (linegift-listing-diff.js)
  *                                              ※ 重複 3ヶ月期間は受注日 vs 受取日のズレで informational に格下げ (Codex #9)
@@ -33,7 +33,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, monthStartEmptyGrace, monthStartEmptyNote, MONTH_START_EMPTY_GRACE_DAYS, parseNowArg } from './finance-dq-month-mode.js';
 import { linegiftListingDiff, linegiftFactRawMismatch, listingDiffThreshold, listingDiffSeverity } from './linegift-listing-diff.js';
 
 const args = process.argv.slice(2);
@@ -47,6 +47,10 @@ const dbPath = path.join(DATA_DIR, 'warehouse.db');
 if (!fs.existsSync(dbPath)) { console.error(`FATAL: warehouse.db not found at ${dbPath}`); process.exit(2); }
 
 const checkedAt = new Date().toISOString();
+// 月の判定の「今」(試験だけ --now で動かす。daily-sync は渡さない)
+let now;
+try { now = getArg('--now') ? parseNowArg(getArg('--now')) : new Date(); }
+catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
 
 // 重複期間: 既存 linegift_accounting CSV (受注日基準) と新 fact (受取日基準) が並走している月 → listing_diff_pct を informational に格下げ
 // (設計書 §8 #2、Codex #9: 受注日 vs 受取日で 1〜数日ずれて売上が流れるため、構造的に diff が出る)
@@ -85,7 +89,7 @@ const THRESHOLDS_CURRENT = {
 };
 // 月の判定は共通ヘルパー (当月 / 前月+月初14日以内 / 過去)。前月の月初は received への遷移ラグで
 // coverage が構造的に低いので whitelist_coverage_pct だけ当月閾値を使う (Qoo10 2026-08 の再発防止と同型)
-const mode = monthMode(monthStr);
+const mode = monthMode(monthStr, { now });
 const isCur = mode === 'current';
 const isDuplicatePeriod = DUPLICATE_PERIOD_MONTHS.has(monthStr);
 const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST, THRESHOLDS_CURRENT);
@@ -107,6 +111,15 @@ db.prepare(`DELETE FROM dq_run_results WHERE run_id = ?`).run(runId);
 // Check 1: row_count_drift (rows=0 がエラー、当月のみ「直近日次 < 7日平均×0.5」も warn、Codex R1 #1 反映)
 const dailyCount = db.prepare("SELECT COUNT(*) AS c FROM f_linegift_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?").get(monthStr).c;
 if (dailyCount === 0) {
+  // 当月の月初は最初の出荷 (= 受け取り) が取り込まれるまで 0 行が当然 → ⚠️ 警告・exit 0 (2026-10-01)。過去の月・猶予を過ぎた当月は CRITICAL のまま
+  const g = monthStartEmptyGrace(monthStr, { now, graceDays: MONTH_START_EMPTY_GRACE_DAYS.linegift });
+  if (g.grace) {
+    recordResult('row_count_drift', 'warn', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace: true, jst_day: g.dayOfMonth, grace_days: g.graceDays });
+    printSummary();
+    console.log(monthStartEmptyNote('f_linegift_finance_sku_daily_v1', monthStr, g));
+    db.close();
+    process.exit(0);
+  }
   recordResult('row_count_drift', 'error', dailyCount, 0, { daily_row_count: dailyCount });
   console.error(`  ⚠️ CRITICAL: f_linegift_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`);
   printSummary();
