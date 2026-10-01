@@ -148,6 +148,11 @@ console.log('⑥ sameProduct — 表記ゆれは通し、別商品は弾く');
   ok(sameProduct('ハッカ油スプレー100ml', 'ハッカ油スプレー 100ml'), '区切りの有無をまたいで一致');
   // ただし数字の直前が ASCII 英数字のときは落とさない (型番を潰さない)
   ok(!sameProduct('RX100M', 'RX200M'), '🚨 型番の末尾は容量として落とさない');
+  // 英字の商品名でも、**2 文字以上の単位**なら区切りなしで落とす (codex exec review P2)
+  ok(sameProduct('Oil', 'Oil100ml'), '🚨 ASCII の商品名 + 区切りなしの ml も落とす');
+  ok(sameProduct('Oil', 'Oil 100g'), '区切りがあれば 1 文字単位も落とす');
+  ok(!sameProduct('Oil', 'Oil100g'), '区切りなしの 1 文字 ASCII 単位は型番と区別できないので落とさない');
+  ok(sameProduct('ハッカ油スプレー', 'ハッカ油スプレー5L'), '日本語の直後なら 1 文字単位も落とす');
   ok(!sameProduct('', 'ハッカ油'), '空は一致としない');
   ok(!sameProduct('ハッカ油', ''), '空は一致としない (逆)');
 }
