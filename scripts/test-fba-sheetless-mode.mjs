@@ -23,6 +23,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import vm from 'node:vm';
 import Database from 'better-sqlite3';
 import express from 'express';
 
@@ -32,7 +33,7 @@ process.env.DATA_DIR = dataDir;
 process.env.FBA_SKU_MAPPING_SOURCE = 'mirror';
 process.env.FBA_NONFBA_SOURCE = 'pml';
 process.env.WAREHOUSE_URL = 'http://minipc.test';
-for (const k of ['FBA_SHEETLESS_MODE', 'RENDER', 'GOOGLE_SERVICE_ACCOUNT_KEY', 'JOBS_MONITOR_ENABLED']) delete process.env[k];
+for (const k of ['FBA_SHEETLESS_MODE', 'FBA_SHEETLESS_IO', 'RENDER', 'GOOGLE_SERVICE_ACCOUNT_KEY', 'JOBS_MONITOR_ENABLED']) delete process.env[k];
 const dbFile = path.join(dataDir, 'fba.db');
 const imp = (p) => import(pathToFileURL(path.join(root, p)).href);
 
@@ -67,8 +68,12 @@ const fbaService = (await imp('apps/warehouse/fba-service.js')).default;
 const { generateRecommendations } = await imp('apps/fba-replenishment/calculation-engine.js');
 const { runDecisionAttempt } = await imp('apps/fba-replenishment/decision-job.js');
 const sheetless = await imp('apps/fba-replenishment/sheetless-mode.js');
+const usRouter = (await imp('apps/fba-replenishment-us/router.js')).default;
 const app = express();
+app.set('views', path.join(root, 'views'));
+app.set('view engine', 'ejs');
 app.use('/fba-service', express.json(), fbaService);
+app.use('/us', usRouter);
 app.use('/', routerMod.default);
 const server = http.createServer(app);
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -319,9 +324,9 @@ await t('9:40 の自動決定: 計算の失敗 = fail の ping。提案は 1 行
   const CAP = '2026-10-05T00:20:00.000Z';
   const rows = [{ 商品ID: 'alpha', 商品名: 'A', ブロック略称: 'A', ロケ: 'P-01', 有効期限: '', 在庫数: 200, 引当数: 0, ロケ業務区分: '通販', 最終入荷日: '20260901', ブロック引当順: 1, captured_at: CAP }];
   const meta = { captured_at: CAP, source_at: '2026-10-05T00:05:00.000Z', rows_read: 1, skipped_rows: 0, row_count: 1 };
-  const queries = [], pings = [];
+  const queries = [], pings = [], params = [];
   const deps = {
-    openClient: async () => ({ db: { query: async (sql) => { queries.push(sql); return { rows: /pg_try_advisory_lock/.test(sql) ? [{ ok: true }] : [] }; } }, close: async () => {} }),
+    openClient: async () => ({ db: { query: async (sql, p) => { queries.push(sql); params.push(p); return { rows: /pg_try_advisory_lock/.test(sql) ? [{ ok: true }] : [] }; } }, close: async () => {} }),
     syncReports: async () => ({ ok: true, snapshot_date: '2026-10-05' }),
     fetchInbound: async () => ({ data: {}, state: { source: 'fresh', count: 0, at: 'x' } }),
     readMirror: () => ({ rows, meta }),
@@ -331,13 +336,20 @@ await t('9:40 の自動決定: 計算の失敗 = fail の ping。提案は 1 行
     readSettings: () => ({}),
     ping: (s, n) => pings.push([s, n]),
   };
-  const r = await runDecisionAttempt(deps, { nowMs: () => Date.parse('2026-10-05T00:40:00Z'), log: quiet });
-  assert.equal(r.outcome, 'engine_failed');
-  assert.deepEqual(pings.map((p) => p[0]), ['fail']);
-  assert.match(pings[0][1], /Sheet なしのモード/);
-  assert.equal(queries.some((q) => /insert into ai\.decisions/i.test(q)), false, '提案を書いた');
-  assert.ok(queries.some((q) => /insert into ops\.job_runs/i.test(q)), '失敗を記録していない');
-  publishPml();
+  try {
+    const r = await runDecisionAttempt(deps, { nowMs: () => Date.parse('2026-10-05T00:40:00Z'), log: quiet });
+    assert.equal(r.outcome, 'engine_failed');
+    assert.deepEqual(pings.map((p) => p[0]), ['fail']);
+    assert.match(pings[0][1], /Sheet なしのモード/);
+    assert.equal(queries.some((q) => /set status = 'superseded'/i.test(q)), false, '前の提案を superseded にした (Codex PR R1 High 2)');
+    const marks = queries.map((q, i) => [q, params[i]]).filter(([q]) => /insert into ai\.decisions/i.test(q));
+    assert.equal(marks.length, 1, '止めた印 (run 要約行) だけを書く');
+    const ref = marks[0][1].find((x) => x && typeof x === 'object' && 'send_blocked' in x);
+    assert.deepEqual([ref.send_blocked, ref.sheetless_blocked, ref.run_summary, ref.decision_final], [true, true, true, false]);
+    assert.ok(queries.some((q) => /insert into ops\.job_runs/i.test(q)), '失敗を記録していない');
+  } finally {
+    publishPml();
+  }
 });
 await t('SKU の対応 (mirror) が 0 行でも計算しない', async () => {
   modeOn();
@@ -473,11 +485,13 @@ await t('miniPC の口: ?fnsku_source=attrs なら fba_sku_attrs の全行を返
 
 // =====================================================================================
 console.log('⑦ 起動時の backfill と一回限りの移行');
-const cli = (args = [], mode = null) => {
-  const env = { ...process.env, DATA_DIR: dataDir };
+const cli = (args = [], mode = null, { io = null, dir = dataDir } = {}) => {
+  const env = { ...process.env, DATA_DIR: dir };
   delete env.FBA_SHEETLESS_MODE;
+  delete env.FBA_SHEETLESS_IO;
   if (mode !== null) env.FBA_SHEETLESS_MODE = mode;
-  const r = spawnSync(process.execPath, [path.join(root, 'scripts', 'fba-sheetless-backfill-once.mjs'), ...args], { cwd: dataDir, env, encoding: 'utf8', windowsHide: true, timeout: 120000 });
+  if (io !== null) env.FBA_SHEETLESS_IO = io;
+  const r = spawnSync(process.execPath, [path.join(root, 'scripts', 'fba-sheetless-backfill-once.mjs'), ...args], { cwd: dir, env, encoding: 'utf8', windowsHide: true, timeout: 120000 });
   return { code: r.status, out: `${r.stdout}${r.stderr}` };
 };
 await t('モードあり: 起動時の backfill を流さない (Sheet の古い値が attrs に入らない)', async () => {
@@ -509,11 +523,20 @@ await t('移行のスクリプト: モードが入っている間は断る (印�
   assert.deepEqual(fileMark(), []);
   const r2 = cli([], 'yes');
   assert.equal(r2.code, 1, r2.out);
+  const r3 = cli(['--min-rows', '1'], null, { io: '1' });   // miniPC の入出力の止めが入っていても断る
+  assert.equal(r3.code, 1, r3.out);
+  assert.match(r3.out, /FBA_SHEETLESS_IO/);
   const st2 = fs.statSync(dbFile);
   assert.deepEqual([st2.mtimeMs, st2.size], [st.mtimeMs, st.size], '断ったのに fba.db を書いた');
 });
-await t('移行のスクリプト: モードなしで流すと backfill して印を残す (時刻と件数)', async () => {
+await t('移行のスクリプト: 既定の下限 (100 行) より少ない sku_mapping は断る', async () => {
   const r = cli([]);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /下限 100/);
+  assert.deepEqual(fileMark(), []);
+});
+await t('移行のスクリプト: モードなしで流すと backfill して印を残す (時刻と件数)', async () => {
+  const r = cli(['--min-rows', '1']);
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /済んだ/);
   const marks = fileMark();
@@ -521,13 +544,14 @@ await t('移行のスクリプト: モードなしで流すと backfill して�
   assert.equal(marks[0].key, sheetless.BACKFILL_MARK_KEY);
   const detail = JSON.parse(marks[0].detail);
   assert.equal(detail.before_init.would_insert, 1);
+  assert.equal(detail.missing_after, 0);
   assert.ok(Number.isFinite(detail.attrs_after));
   assert.ok(!Number.isNaN(Date.parse(marks[0].done_at)));
 });
 await t('移行のスクリプト: 二度目は断る (fba.db に触らない = 開いて保存もしない)', async () => {
   const st = fs.statSync(dbFile);
   await tick();
-  const r = cli([]);
+  const r = cli(['--min-rows', '1']);
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /二度は流さない/);
   assert.equal(fileMark().length, 1);
@@ -573,7 +597,7 @@ for (const [name, env, re] of [
       assert.equal(st.body.sheetless_misconfig, true);
       assert.match(st.body.error, /Sheet なしのモードの設定がそろっていない/);
       const us = await imp('apps/fba-replenishment-us/router.js');
-      await assert.rejects(us.loadJpInputs(), (e) => e.code === 'FBA_SHEETLESS_MISCONFIG');
+      await assert.rejects(us.loadJpInputs(), (e) => e.code === 'FBA_SHEETLESS_BLOCKED' && /Sheet なしのモード/.test(e.message));
     } finally {
       process.env.FBA_SKU_MAPPING_SOURCE = saved.FBA_SKU_MAPPING_SOURCE;
       process.env.FBA_NONFBA_SOURCE = saved.FBA_NONFBA_SOURCE;
@@ -653,6 +677,190 @@ await t('移行のやり直し: 流している間に常駐のサーバが fba.d
   } finally { f.close(); }
   // もう一度流しても断る (印がある)
   assert.throws(() => B.runSkuMappingBackfillOnceRetrying(), (e) => e.code === 'FBA_BACKFILL_ALREADY_DONE');
+});
+
+// =====================================================================================
+console.log('⑩ Codex PR R1 の直し (仮確定・miniPC の入出力・古い miniPC・空の DB・米国の画面)');
+const dbUrl = pathToFileURL(path.join(root, 'apps', 'fba-replenishment', 'db.js')).href;
+/** 別の fba.db (DATA_DIR) を持つ db.js の実体 (= 別のプロセスの代わり)。import の時点で DATA_DIR を読む */
+async function otherDb(tag) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `fba-sheetless-${tag}-`));
+  process.env.DATA_DIR = dir;
+  try { return { dir, mod: await import(`${dbUrl}?proc=${tag}`) }; } finally { process.env.DATA_DIR = dataDir; }
+}
+const PROV = [{ amazon_sku: 'Alpha-1', product_name: 'A', fnsku: 'X0A', ship_qty: 12, fba_available: 0, units_sold_7d: 1, units_sold_30d: 4, warehouse_raw: 10, recommended_qty: 12, urgency_score: 1, set_components: null, asin: 'B0A', expiry_date: null }];
+
+await t('Step4 (モードあり): 計算が止まった (503) ら Amazon 仮確定は消えない / 計算できたときだけ同じ操作で消える', async () => {
+  modeOn();
+  miniHandler = () => ({ ok: true, count: 0, data: {} });
+  db.saveProvisionalItems(PROV);
+  removePml();
+  try {
+    const r = await call('GET', '/api/recommendations?debug=1&persist=1&clear_provisional=1');
+    assert.equal(r.status, 503);
+    assert.deepEqual(db.getProvisionalItems().items.map((p) => [p.amazon_sku, p.ship_qty]), [['Alpha-1', 12]], '止まった日に仮確定を消した');
+  } finally { publishPml(); }
+  const ok = await call('GET', '/api/recommendations?debug=1&persist=1&clear_provisional=1');
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.provisional_cleared, true);
+  assert.deepEqual(db.getProvisionalItems().items, []);
+});
+await t('Step4 の画面: モードありは先に消さず clear_provisional=1 で頼む / モードなしは今までどおり DELETE → GET (同じ URL)', async () => {
+  const page = async () => { const r = await realFetch(base + '/'); assert.equal(r.status, 200); return r.text(); };
+  /** 画面の calcRecommendations を取り出して、fetch を差し替えて 1 回押す (応答 = 計算が止まった 503) */
+  const press = (html) => {
+    const start = html.indexOf('async function calcRecommendations()');
+    const end = html.indexOf('// 推奨健全性バナー', start);
+    assert.ok(start > 0 && end > start, '画面に calcRecommendations が無い');
+    const calls = [], logs = [];
+    const logEl = { dataset: /id="log" data-sheetless="1"/.test(html) ? { sheetless: '1' } : {} };
+    const el = () => ({ style: {}, disabled: false, innerHTML: '', textContent: '' });
+    const ctx = vm.createContext({
+      confirm: () => true, log: (m) => logs.push(m), BASE: '', selectedSkus: new Set(), shipQtyMap: {},
+      document: { getElementById: (id) => (id === 'log' ? logEl : el()) },
+      fetch: async (url, opts) => { calls.push(`${(opts && opts.method) || 'GET'} ${url}`); return { json: async () => (String(url).includes('/api/recommendations') ? { error: '止まった', sheetless_blocked: true } : { success: true }) }; },
+    });
+    vm.runInContext(`${html.slice(start, end)}\nglobalThis.__press = calcRecommendations;`, ctx);
+    return ctx.__press().then(() => ({ calls, logs }));
+  };
+  modeOn();
+  const on = await press(await page());
+  assert.deepEqual(on.calls, ['GET /api/recommendations?debug=1&persist=1&clear_provisional=1']);
+  assert.ok(on.logs.some((m) => /Amazon仮確定は消していません/.test(m)));
+  modeOff();
+  const htmlOff = await page();
+  assert.equal(htmlOff.includes('data-sheetless'), false, 'モードなしの画面に印が出ている');
+  const off = await press(htmlOff);
+  assert.deepEqual(off.calls, ['DELETE /api/provisional', 'GET /api/recommendations?debug=1&persist=1']);
+});
+
+await t('miniPC は FBA_SHEETLESS_IO=1 で入出力だけ止める (別のプロセス・env は別々): Sheet 同期 410・FNSKU は attrs だけ・起動時の backfill なし・計算の読み方は今のまま', async () => {
+  const seed = async (tag) => {
+    modeOff();
+    const { dir, mod } = await otherDb(tag);
+    await mod.initDb();
+    mod.upsertSkuMappings([{ amazon_sku: 'Io-1', asin: 'B0IO1', ne_code: 'io1' }, { amazon_sku: 'Io-2', asin: 'B0IO2', ne_code: 'io2' }]);
+    mod.updateFnskuBatch([{ sku: 'Io-1', fnsku: 'X0IOOLD' }]);
+    return dir;
+  };
+  const child = (dir, extraEnv) => {
+    const code = [
+      "import { pathToFileURL } from 'node:url';",
+      "import path from 'node:path';",
+      "import http from 'node:http';",
+      "const root = process.env.T_ROOT;",
+      "const imp = (p) => import(pathToFileURL(path.join(root, p)).href);",
+      "const db = await imp('apps/fba-replenishment/db.js');",
+      "await db.initDb();",
+      "const out = {};",
+      "try { db.upsertSkuMappings([{ amazon_sku: 'Io-9' }]); out.upsert = 'written'; } catch (e) { out.upsert = e.code; }",
+      "db.updateFnskuBatch([{ sku: 'Io-1', fnsku: 'X0IONEW', asin: 'B0IONEW' }]);",
+      "out.sheet = db.getSkuMappingsFromSheet().map((r) => [r.amazon_sku, r.fnsku]);",
+      "out.attrs = db.getFbaSkuAttrs().map((a) => [a.amazon_sku, a.fnsku, a.asin]).sort();",
+      "out.source = db.getSkuMappingSourceMode();",
+      "out.mappings = db.getSkuMappings().map((m) => m.amazon_sku).sort();",
+      "const express = (await imp('node_modules/express/index.js')).default;",
+      "const svc = (await imp('apps/warehouse/fba-service.js')).default;",
+      "const app = express(); app.use('/fba', express.json(), svc);",
+      "const server = http.createServer(app); await new Promise((r) => server.listen(0, '127.0.0.1', r));",
+      "const res = await fetch(`http://127.0.0.1:${server.address().port}/fba/sync-sku-mappings`, { method: 'POST' });",
+      "out.syncStatus = res.status; out.syncBody = await res.json();",
+      "server.close();",
+      "console.log('@@' + JSON.stringify(out));",
+      "process.exit(0);",
+    ].join('\n');
+    const env = { ...process.env, DATA_DIR: dir, T_ROOT: root, FBA_SKU_MAPPING_SOURCE: 'sheet', ...extraEnv };
+    for (const k of ['FBA_SHEETLESS_MODE', 'FBA_SHEETLESS_IO', 'FBA_NONFBA_SOURCE']) if (!(k in extraEnv)) delete env[k];
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: root, env, encoding: 'utf8', windowsHide: true, timeout: 120000, maxBuffer: 16 * 1024 * 1024 });
+    const line = String(r.stdout).split('\n').find((l) => l.startsWith('@@'));
+    assert.ok(line, `子のプロセスが答えない: ${String(r.stderr).slice(-800)}`);
+    return JSON.parse(line.slice(2));
+  };
+  modeOn();   // 親 (Render の役) はモードあり。子 (miniPC の役) は自分の env だけを見る
+  const io = child(await seed('io-on'), { FBA_SHEETLESS_IO: '1' });
+  assert.equal(io.upsert, 'FBA_SHEETLESS_GONE');
+  assert.deepEqual(io.sheet, [['Io-1', 'X0IOOLD'], ['Io-2', null]], 'sku_mapping に FNSKU を書いた');
+  assert.deepEqual(io.attrs, [['Io-1', 'X0IONEW', 'B0IONEW']], 'attrs だけに書く・起動時の backfill (Io-2) を流さない');
+  assert.deepEqual([io.source, io.mappings], ['sheet', ['Io-1', 'Io-2']], '計算の読み方は今のまま (miniPC は計算しない)');
+  assert.deepEqual([io.syncStatus, io.syncBody.error], [410, 'SHEETLESS_MODE']);
+  const plain = child(await seed('io-off'), {});
+  assert.equal(plain.upsert, 'written');
+  assert.deepEqual(plain.sheet.find((r) => r[0] === 'Io-1'), ['Io-1', 'X0IONEW'], 'IO なしの miniPC は今までどおり二重書き');
+  assert.ok(plain.attrs.some((a) => a[0] === 'Io-2'), 'IO なしの miniPC は今までどおり起動時の backfill');
+  assert.equal(plain.syncStatus, 500);
+  modeOff();
+});
+
+await t('古い miniPC: モードありで fnsku_source の印が無ければ、FNSKU が 0 件・欄が無いときも見送りの理由を返す', async () => {
+  modeOn();
+  const pull = (o) => (u) => (u.includes('/sync/latest-planning') ? { ok: true, snapshot_date: '2026-09-30', rows: [{ amazon_sku: 'Alpha-1', product_name: 'A', units_sold_30d: 60 }], restock_rows: [], planning_latest_rows: [], ...o } : { ok: false });
+  miniHandler = pull({ fnskus: [] });
+  assert.match((await routerMod.syncLatestPlanningFromMiniPC()).fnsku_skip_reason, /fba_sku_attrs からではない/);
+  miniHandler = pull({});
+  assert.match((await routerMod.syncLatestPlanningFromMiniPC()).fnsku_skip_reason, /fba_sku_attrs からではない/);
+  miniHandler = pull({ fnskus: [], fnsku_source: 'fba_sku_attrs' });
+  assert.equal('fnsku_skip_reason' in (await routerMod.syncLatestPlanningFromMiniPC()), false);
+  modeOff();
+  miniHandler = pull({ fnskus: [] });
+  assert.equal('fnsku_skip_reason' in (await routerMod.syncLatestPlanningFromMiniPC()), false, 'モードなしは今までどおり');
+});
+
+await t('移行のスクリプト: 空の sku_mapping・表が無い・違う DB には印を付けない (fba.db に触らない)', async () => {
+  modeOff();
+  const make = (tag, sqls) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `fba-sheetless-${tag}-`));
+    const f = new Database(path.join(dir, 'fba.db'));
+    try { for (const s of sqls) f.exec(s); } finally { f.close(); }
+    return dir;
+  };
+  const cases = [
+    ['empty', ['CREATE TABLE sku_mapping (id INTEGER PRIMARY KEY, amazon_sku TEXT UNIQUE, asin TEXT, fnsku TEXT)', 'CREATE TABLE fba_sku_attrs (amazon_sku TEXT PRIMARY KEY, asin TEXT, fnsku TEXT, source TEXT, updated_at TEXT)'], /sku_mapping が 0 行しかない/],
+    ['notable', ['CREATE TABLE fba_sku_attrs (amazon_sku TEXT PRIMARY KEY, asin TEXT, fnsku TEXT, source TEXT, updated_at TEXT)'], /表 sku_mapping が無い/],
+    ['wrongdb', ['CREATE TABLE mirror_products (code TEXT)', "INSERT INTO mirror_products VALUES ('x')"], /FBA 補充の fba\.db ではない/],
+  ];
+  for (const [tag, sqls, re] of cases) {
+    const dir = make(tag, sqls);
+    const file = path.join(dir, 'fba.db');
+    const st = fs.statSync(file);
+    await tick();
+    const r = cli(['--min-rows', '1'], null, { dir });
+    assert.equal(r.code, 1, `${tag}: ${r.out}`);
+    assert.match(r.out, re, tag);
+    const st2 = fs.statSync(file);
+    assert.deepEqual([st2.mtimeMs, st2.size], [st.mtimeMs, st.size], `${tag}: 断ったのに fba.db を書いた`);
+  }
+});
+await t('一回限りの移行: 空の sku_mapping は断る・流した後に attrs に無い SKU が残れば巻き戻して印を付けない', async () => {
+  modeOff();
+  const { mod } = await otherDb('verify');
+  await mod.initDb();
+  assert.throws(() => mod.runSkuMappingBackfillOnce(), (e) => e.code === 'FBA_BACKFILL_SOURCE_EMPTY');
+  mod.upsertSkuMappings([{ amazon_sku: 'Ver-1', asin: 'B0V1' }, { amazon_sku: 'Ver-2', asin: 'B0V2' }]);
+  mod._testHooks.afterBackfillInsert = (run) => run("DELETE FROM fba_sku_attrs WHERE amazon_sku = 'Ver-1'");
+  try {
+    assert.throws(() => mod.runSkuMappingBackfillOnce(), (e) => e.code === 'FBA_BACKFILL_VERIFY_FAILED');
+  } finally { mod._testHooks.afterBackfillInsert = null; }
+  assert.equal(mod.getBackfillMark(), null);
+  assert.deepEqual(mod.getFbaSkuAttrs().filter((a) => a.amazon_sku.startsWith('Ver-')), [], '巻き戻していない');
+  assert.throws(() => mod.runSkuMappingBackfillOnce({ minSkuMappingRows: 3 }), (e) => e.code === 'FBA_BACKFILL_SOURCE_EMPTY');
+  const ok = mod.runSkuMappingBackfillOnce();
+  assert.deepEqual([ok.inserted, ok.missing_after], [2, 0]);
+  assert.equal(mod.getBackfillMark().key, sheetless.BACKFILL_MARK_KEY);
+});
+
+await t('米国の画面 (モードあり): 商品管理リストが欠けたら配分を出さない (503・日本の画面と同じ理由)', async () => {
+  modeOn();
+  miniHandler = (u) => (u.includes('/us/reports/latest') ? { ok: true } : { ok: false });
+  removePml();
+  try {
+    const r = await call('GET', '/us/api/allocation');
+    assert.equal(r.status, 503);
+    assert.equal(r.body.error, 'FBA_SHEETLESS_BLOCKED');
+    assert.match(r.body.message, /商品管理リスト/);
+  } finally { publishPml(); }
+  const ok = await call('GET', '/us/api/allocation');
+  assert.notEqual(ok.status, 503, JSON.stringify(ok.body).slice(0, 200));
+  modeOff();
 });
 
 server.close();

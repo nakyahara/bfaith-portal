@@ -195,7 +195,7 @@
     </details>
 
     <!-- ログ -->
-    <div class="log" id="log">FBA在庫補充システム — 準備完了</div>
+    <div class="log" id="log"<% if (locals.sheetless) { %> data-sheetless="1"<% } %>>FBA在庫補充システム — 準備完了</div>
 
     <!-- 推奨リスト -->
     <div class="section" id="recSection" style="display:none;">
@@ -958,17 +958,23 @@
       Object.keys(shipQtyMap).forEach(k => delete shipQtyMap[k]);
 
       // Amazon仮確定データをクリア (Step4クリック時の新規運用)
-      try {
-        await fetch(`${BASE}/api/provisional`, { method: 'DELETE' });
-        log('Amazon仮確定データをクリアしました');
-      } catch (e) {
-        log('仮確定クリア失敗: ' + e.message);
+      // 🚨 Sheet なしのモード (⑦-F) では先に消さない: 計算が止まった日 (503) に仮確定が消えないよう、
+      //    計算できたときだけサーバが消す (clear_provisional=1)。モードなしは今までどおり先に消す
+      const sheetlessSafeOrder = document.getElementById('log')?.dataset?.sheetless === '1';
+      if (!sheetlessSafeOrder) {
+        try {
+          await fetch(`${BASE}/api/provisional`, { method: 'DELETE' });
+          log('Amazon仮確定データをクリアしました');
+        } catch (e) {
+          log('仮確定クリア失敗: ' + e.message);
+        }
       }
 
       try {
-        const res = await fetch(`${BASE}/api/recommendations?debug=1&persist=1`);
+        const res = await fetch(`${BASE}/api/recommendations?debug=1&persist=1${sheetlessSafeOrder ? '&clear_provisional=1' : ''}`);
         const d = await res.json();
-        if (d.error) { log('エラー: ' + d.error); return; }
+        if (d.error) { log('エラー: ' + d.error + (sheetlessSafeOrder ? ' (Amazon仮確定は消していません)' : '')); return; }
+        if (sheetlessSafeOrder && d.provisional_cleared) log('Amazon仮確定データをクリアしました');
         if (d.errors && d.errors.length) { d.errors.forEach(e => log('警告: ' + e)); }
         recData = d.items || [];
         recMeta = d;

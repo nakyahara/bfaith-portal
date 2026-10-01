@@ -24,7 +24,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          getInboundDailySummary, getInboundMonthlySummary, getInboundShipmentsByDate, getInboundItems,
          getInboundUnreceived, getInboundSyncStatus, getInboundShipmentsWithoutDate,
          importInboundRows, getInboundSyncCursor, checkSheetlessInputs } from './db.js';
-import { isSheetlessRequested, SHEET_SYNC_GONE_MESSAGE } from './sheetless-mode.js';
+import { isSheetlessRequested, isSheetlessIoRequested, SHEET_SYNC_GONE_MESSAGE } from './sheetless-mode.js';
 import { parseCsv, decodeCsvBuffer, buildShiftJisCsv } from './picking-csv.js';
 import { parseWarehouseCsv } from './warehouse-csv.js';
 import * as pp from './picking-prep.js';
@@ -320,6 +320,8 @@ router.get('/', (req, res) => {
     title: 'FBA在庫補充',
     username: req.session?.email,
     displayName: req.session?.displayName,
+    // Sheet なしのモード (⑦-F・Codex PR R1 High 1): Step4 は「Amazon 仮確定」を先に消さず、計算できたときだけサーバが消す
+    sheetless: isSheetlessRequested(),
   });
 });
 
@@ -369,8 +371,9 @@ export async function syncLatestPlanningFromMiniPC() {
   const savedRows = savePlanningDataWithHistory(rows, snapshotDate);
   let savedFnskus = 0;
   let fnskuSkipReason = null;
-  if (fnskus.length > 0 && sheetless && pull.fnsku_source !== 'fba_sku_attrs') {
+  if (sheetless && pull.fnsku_source !== 'fba_sku_attrs') {
     // 🚨 miniPC が fba_sku_attrs から返したと言っていない (古いコード) = sku_mapping の値かもしれない → 反映しない (前の FNSKU のまま)
+    //    FNSKU が 0 件・欄が無いときも同じ (古い miniPC を見逃さない。Codex PR R1 Medium 2)
     fnskuSkipReason = `miniPC の FNSKU が fba_sku_attrs からではない (fnsku_source=${pull.fnsku_source ?? 'なし'})。Sheet なしのモードなので反映しない`;
     console.warn(`[FBA] 同期: ${fnskuSkipReason}`);
   } else if (fnskus.length > 0) {
@@ -510,7 +513,7 @@ router.get('/api/sku-mappings', (req, res) => {
 // ===== スプレッドシート同期 =====
 router.post('/api/sync-sku-mappings', async (req, res) => {
   // Sheet なしのモード (⑦-F): 手の Sheet 同期の口は止める (画面の Step3 はこの文言をログに出す)
-  if (isSheetlessRequested()) return res.status(410).json({ error: SHEET_SYNC_GONE_MESSAGE, sheetless: true });
+  if (isSheetlessIoRequested()) return res.status(410).json({ error: SHEET_SYNC_GONE_MESSAGE, sheetless: true });
   try {
     const result = await syncSkuMappings();
     res.json({ success: true, ...result });
@@ -839,6 +842,14 @@ router.get('/api/recommendations', async (req, res) => {
       delete result.health.recommended_skus; // 応答は軽量に
     } catch (e) {
       console.error('[FBA] 推奨健全性チェック失敗(推奨自体は返す):', e.message);
+    }
+    // Sheet なしのモードの画面 (Step4) は clear_provisional=1 を付けて頼む (⑦-F・Codex PR R1 High 1):
+    //   計算できたときだけ、応答の直前に「Amazon 仮確定」を消す (止まった日・失敗した日は前の仮確定がそのまま残る)。
+    //   モードなしの画面は付けない = 今までどおり画面が先に DELETE /api/provisional を呼ぶ
+    if (req.query.clear_provisional === '1') {
+      const ok = !(result.errors || []).filter(Boolean).length;
+      if (ok) clearProvisionalItems();
+      result.provisional_cleared = ok;
     }
     res.json(result);
   } catch (e) {

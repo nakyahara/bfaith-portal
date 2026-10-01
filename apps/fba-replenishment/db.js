@@ -14,7 +14,7 @@ import { fileURLToPath } from 'url';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { withSqliteFileLock, lockDbFileOf } from './file-lock.js';
 // Sheet なし (fail-closed) のモード (⑦-F)。env を読むだけ。モードを使わないときは今までと同じ動き
-import { isSheetlessRequested, sheetlessProblems, sheetlessMisconfigError, BACKFILL_MARK_KEY } from './sheetless-mode.js';
+import { isSheetlessRequested, isSheetlessIoRequested, sheetlessProblems, sheetlessMisconfigError, BACKFILL_MARK_KEY } from './sheetless-mode.js';
 import { findPendingSlips, shipmentSinceJstDate, LEFT_WAREHOUSE_STATUSES } from './self-reserve.js';   // 出力済み NE 受注 CSV (FBA 伝票) のうち、まだ Amazon に出ていないもの
 // SQL の IN 句に埋める「倉庫を出た」状態の一覧 (固定の英大文字だけなので直接埋めてよい)
 const LEFT_STATUS_SQL = `(${LEFT_WAREHOUSE_STATUSES.map(s => `'${s}'`).join(', ')})`;
@@ -170,7 +170,7 @@ export function getDbGeneration() {
 }
 
 /** 試験用: 初期化の「読んだ後・保存の前」に割り込む (起動と重なった外からの書き込みを再現する)。本番では null のまま */
-export const _testHooks = { afterLoad: null, insideSaveLock: null, stampAlwaysSame: false };
+export const _testHooks = { afterLoad: null, insideSaveLock: null, stampAlwaysSame: false, afterBackfillInsert: null };
 
 /**
  * fba.db の保存の競合・読み直し・保存の失敗の例外か (FBA_DB_EXTERNAL_WRITE / FBA_DB_RELOADED / FBA_DB_LOCK_TIMEOUT / FBA_DB_LOCK_ERROR / FBA_DB_SAVE_FAILED / FBA_DB_FILE_TORN) = どれも「その操作は保存されていない」。
@@ -205,9 +205,9 @@ export function getBackfillMark() {
   return { key: r.key, done_at: r.done_at, detail };
 }
 
-/** 起動時に backfill を流すか = モードを使わない かつ 印が無い (今までどおりの間だけ) */
+/** 起動時に backfill を流すか = Sheet の入出力を止めていない (FBA_SHEETLESS_MODE / FBA_SHEETLESS_IO が無い) かつ 印が無い (今までどおりの間だけ) */
 function shouldRunStartupBackfill() {
-  return !isSheetlessRequested() && !getBackfillMark();
+  return !isSheetlessIoRequested() && !getBackfillMark();
 }
 
 /**
@@ -215,16 +215,19 @@ function shouldRunStartupBackfill() {
  * 印があれば、以後の起動では backfill を流さない (モードを外しても流さない)。
  * 🚨 断る (投げる): モードを使うつもりのとき (code FBA_BACKFILL_MODE_ON)・印がもうあるとき (code FBA_BACKFILL_ALREADY_DONE)。
  *    やり直す口は作らない (やり直しの手順は scripts/fba-sheetless-backfill-once.mjs の説明)
+ * 🚨 空の・違う fba.db に印を付けない (Codex PR R1 Medium 3): sku_mapping が minSkuMappingRows 行より少なければ断る (code FBA_BACKFILL_SOURCE_EMPTY)。
+ *    流した後に「sku_mapping にあって fba_sku_attrs に無い SKU」を数え、0 でなければ巻き戻して断る (code FBA_BACKFILL_VERIFY_FAILED)。印はその後にだけ書く
  * initDb() の後に呼ぶ。保存は saveToFile (外から書かれていたら例外 = 保存されていない。やり直せば通る)
  * @param {object} [o]
  * @param {Date} [o.now]
  * @param {object} [o.extra]  印に一緒に残す情報 (移行のスクリプトが initDb() の前に数えた件数など)
- * @returns {{ done_at: string, sku_mapping_rows: number, attrs_before: number, inserted: number, attrs_after: number }}
+ * @param {number} [o.minSkuMappingRows]  sku_mapping の行の下限 (既定 1。移行のスクリプトは既定 100)
+ * @returns {{ done_at: string, sku_mapping_rows: number, attrs_before: number, inserted: number, attrs_after: number, missing_after: number }}
  */
-export function runSkuMappingBackfillOnce({ now = new Date(), extra = null } = {}) {
+export function runSkuMappingBackfillOnce({ now = new Date(), extra = null, minSkuMappingRows = 1 } = {}) {
   if (!db) throw new Error('initDb() の前には流せない');
-  if (isSheetlessRequested()) {
-    throw Object.assign(new Error('Sheet なしのモード (FBA_SHEETLESS_MODE) が入っている間は流さない (sku_mapping の値を使わない約束)。モードを外した状態で流す'), { code: 'FBA_BACKFILL_MODE_ON' });
+  if (isSheetlessIoRequested()) {
+    throw Object.assign(new Error('Sheet なしのモード (FBA_SHEETLESS_MODE / FBA_SHEETLESS_IO) が入っている間は流さない (sku_mapping の値を使わない約束)。外した状態で流す'), { code: 'FBA_BACKFILL_MODE_ON' });
   }
   const mark = getBackfillMark();
   if (mark) throw Object.assign(new Error(`一回限りの移行はもう済んでいる (${mark.done_at})。二度は流さない`), { code: 'FBA_BACKFILL_ALREADY_DONE', mark });
@@ -233,10 +236,18 @@ export function runSkuMappingBackfillOnce({ now = new Date(), extra = null } = {
   try {
     const count = (table) => Number(queryOne(`SELECT COUNT(*) AS n FROM ${table}`)?.n || 0);
     const skuMappingRows = count('sku_mapping');
+    if (skuMappingRows < Math.max(1, Number(minSkuMappingRows) || 1)) {
+      throw Object.assign(new Error(`sku_mapping が ${skuMappingRows} 行しかない (下限 ${minSkuMappingRows})。空の・違う fba.db に印を付けない`), { code: 'FBA_BACKFILL_SOURCE_EMPTY' });
+    }
     const attrsBefore = count('fba_sku_attrs');
     db.run(SKU_MAPPING_BACKFILL_SQL);
+    if (_testHooks.afterBackfillInsert) _testHooks.afterBackfillInsert((sql) => db.run(sql));
+    const missingAfter = Number(queryOne('SELECT COUNT(*) AS n FROM sku_mapping m WHERE m.amazon_sku NOT IN (SELECT amazon_sku FROM fba_sku_attrs)')?.n || 0);
+    if (missingAfter !== 0) {
+      throw Object.assign(new Error(`流した後も fba_sku_attrs に無い SKU が ${missingAfter} 件ある。印を付けない (巻き戻した)`), { code: 'FBA_BACKFILL_VERIFY_FAILED' });
+    }
     const attrsAfter = count('fba_sku_attrs');
-    const detail = { sku_mapping_rows: skuMappingRows, attrs_before: attrsBefore, inserted: attrsAfter - attrsBefore, attrs_after: attrsAfter, ...(extra || {}) };
+    const detail = { sku_mapping_rows: skuMappingRows, attrs_before: attrsBefore, inserted: attrsAfter - attrsBefore, attrs_after: attrsAfter, missing_after: missingAfter, ...(extra || {}) };
     db.run('CREATE TABLE IF NOT EXISTS fba_migration_marks (key TEXT PRIMARY KEY, done_at TEXT NOT NULL, detail TEXT)');
     db.run('INSERT INTO fba_migration_marks (key, done_at, detail) VALUES (?, ?, ?)', [BACKFILL_MARK_KEY, doneAt, JSON.stringify(detail)]);
     db.run('COMMIT');
@@ -338,7 +349,7 @@ async function initDbOnce() {
   if (shouldRunStartupBackfill()) {
     db.run(SKU_MAPPING_BACKFILL_SQL);
   } else {
-    console.log(`[fba-db] 起動時の sku_mapping → fba_sku_attrs の backfill は流さない (${isSheetlessRequested() ? 'Sheet なしのモード' : '一回限りの移行の印あり'})`);
+    console.log(`[fba-db] 起動時の sku_mapping → fba_sku_attrs の backfill は流さない (${isSheetlessIoRequested() ? 'Sheet なしのモード / 入出力を止めている' : '一回限りの移行の印あり'})`);
   }
 
   // --- 2. sku_exceptions: FBA優先送りマスタ ---
@@ -1923,7 +1934,7 @@ export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snap
  */
 export function upsertSkuMappings(mappings) {
   // Sheet なしのモードでは Sheet の写し (sku_mapping) を書かない (手の口・cron は手前で 410 / 見送り。ここは最後の歯止め)
-  if (isSheetlessRequested()) throw Object.assign(new Error('Sheet なしのモードなので sku_mapping (Sheet の写し) には書かない'), { code: 'FBA_SHEETLESS_GONE' });
+  if (isSheetlessIoRequested()) throw Object.assign(new Error('Sheet なしのモード (入出力を止めている) なので sku_mapping (Sheet の写し) には書かない'), { code: 'FBA_SHEETLESS_GONE' });
   db.run('BEGIN TRANSACTION');
   try {
     for (const m of mappings) {
@@ -3189,7 +3200,8 @@ export function updateFnskuBatch(items) {
   // 🚨 Sheet なしのモードでは fba_sku_attrs だけに書く (sku_mapping は凍結。⑦-F・Codex 設計 R1 High 3)
   //    ASIN も fba_sku_attrs に書く (Sheet の backfill が止まるので、新しい SKU の ASIN はレポートからしか入らない)。
   //    item.asin が空なら前の ASIN のまま。モードなしのときは今までどおり ASIN に触らない
-  const writeSheetCopy = !isSheetlessRequested();
+  //    miniPC は計算をしないので FBA_SHEETLESS_IO で同じ書き方にする (Codex PR R1 Medium 1)
+  const writeSheetCopy = !isSheetlessIoRequested();
   db.run('BEGIN TRANSACTION');
   try {
     for (const item of items) {
@@ -3220,7 +3232,7 @@ export function updateFnskuBatch(items) {
  */
 export function syncFnskuBatch(items) {
   // 🚨 Sheet なしのモードでは fba_sku_attrs だけに書く (sku_mapping は凍結。⑦-F・Codex 設計 R1 High 3)。ASIN も (updateFnskuBatch と同じ)
-  const writeSheetCopy = !isSheetlessRequested();
+  const writeSheetCopy = !isSheetlessIoRequested();
   db.run('BEGIN TRANSACTION');
   try {
     for (const item of items) {

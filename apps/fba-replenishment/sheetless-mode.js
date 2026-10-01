@@ -15,24 +15,37 @@
  *   - 06:00 の定期同期は Sheet の同期だけ外す (土台・納品実績は続ける)。手の Sheet 同期の口は 410
  *   - FNSKU の更新は fba_sku_attrs だけに書く (sku_mapping には書かない)
  *
+ * env FBA_SHEETLESS_IO (miniPC 用・Codex PR R1 Medium 1):
+ *   計算をしない miniPC は Sheet の「入出力」だけを止める = Sheet 同期の口は 410・sku_mapping に書かない・起動時の backfill を流さない。
+ *   計算の読み方 (sku_mapping を読む・Sheet に戻る) は変えない。FBA_SHEETLESS_MODE を入れた所は入出力も止まる (MODE ⊃ IO)
+ *   なし / '' / '0' = 止めない。それ以外の値 = 止める (止める側に倒す)
+ *
  * このファイルは env を読むだけ (DB に触らない)。db.js・router.js・sheets-sync.js・miniPC の fba-service.js が使う。
  */
 
 export const SHEETLESS_ENV = 'FBA_SHEETLESS_MODE';
+export const SHEETLESS_IO_ENV = 'FBA_SHEETLESS_IO';
 
 /** 起動時の sku_mapping → fba_sku_attrs の backfill を「済んだ」と記録する印のキー (fba.db の fba_migration_marks) */
 export const BACKFILL_MARK_KEY = 'sku_mapping_to_fba_sku_attrs';
 
 /** 手の Sheet 同期の口が返す 410 の文言 */
-export const SHEET_SYNC_GONE_MESSAGE = 'Sheet なしのモード (FBA_SHEETLESS_MODE=1) なので、Google Sheet「商品コード変換テーブル」の同期は止めています。'
+export const SHEET_SYNC_GONE_MESSAGE = 'Sheet なしのモード (FBA_SHEETLESS_MODE=1 / miniPC は FBA_SHEETLESS_IO=1) なので、Google Sheet「商品コード変換テーブル」の同期は止めています。'
   + 'SKU の対応はマスタ (Company DB → 写し) から、他 CH の販売は商品管理リストから読みます。';
+
+const isOn = (v) => v !== undefined && v !== null && String(v).trim() !== '' && String(v).trim() !== '0';
 
 /** モードを使うつもりか (値が入っていて '0' でない)。🚨 '1' 以外の値も「使うつもり」= 設定の誤りとして止める側に倒す */
 export function isSheetlessRequested(env = process.env) {
-  const v = env[SHEETLESS_ENV];
-  if (v === undefined || v === null) return false;
-  const s = String(v).trim();
-  return s !== '' && s !== '0';
+  return isOn(env[SHEETLESS_ENV]);
+}
+
+/**
+ * Sheet の入出力を止めるか (Sheet 同期の口は 410・sku_mapping に書かない・FNSKU は fba_sku_attrs だけ・起動時の backfill を流さない)。
+ * Render = FBA_SHEETLESS_MODE (計算も Sheet なし) / miniPC = FBA_SHEETLESS_IO (入出力だけ)
+ */
+export function isSheetlessIoRequested(env = process.env) {
+  return isSheetlessRequested(env) || isOn(env[SHEETLESS_IO_ENV]);
 }
 
 /**

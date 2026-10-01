@@ -18,7 +18,7 @@ import {
   runDecisionAttempt, runDecisionAttemptSafe, reportsFromThisMorning, syncReasons, jstClock, isFinalAttempt,
   shouldCatchUpAtStartup, DECISION_JOB_ID, ATTEMPT_TIMEOUT_MS,
 } from '../apps/fba-replenishment/decision-job.js';
-import { inputGate, GENERATOR, RUN_SUMMARY_KEY } from '../apps/fba-replenishment/shadow-draft.mjs';
+import { inputGate, GENERATOR, RUN_SUMMARY_KEY, findSendBlock, sendableProposals } from '../apps/fba-replenishment/shadow-draft.mjs';
 import { judgeInboundFetch, nextInboundCache } from '../apps/fba-replenishment/inbound-state.js';
 
 let passed = 0;
@@ -496,6 +496,48 @@ await ta('Sheet なしのモードで miniPC の FNSKU を反映しなかった�
   const last = (await runSummaries()).at(-1).inputs_ref;
   assert.equal(last.business_date, '2026-10-20');
   assert.equal(last.report_sync.fnsku_skip_reason, reason);
+});
+
+await ta('Sheet なしのモードで計算が止まった日 → 前の提案に触らない (中身・status そのまま)・止めた印で自動で送らない / 次に決めた回で外れる (⑦-F・Codex PR R1 High 2)', async () => {
+  const dayDeps = (o = {}) => makeDeps({
+    freshness: FRESH({
+      restock_source_at: '2026-10-20 22:42:00', restock_source_max: '2026-10-20 22:42:00',
+      planning_source_at: '2026-10-20 22:43:00', planning_source_max: '2026-10-20 22:43:00',
+    }),
+    mirror: { rows: FIXTURE.map((x) => ({ ...x, captured_at: '2026-10-21T00:20:00.000Z' })), meta: META({ captured_at: '2026-10-21T00:20:00.000Z', source_at: '2026-10-21T00:05:00.000Z' }) },
+    ...o,
+  });
+  const openRows = async () => (await q(
+    `select decision_id, status, inputs_ref from ai.decisions
+      where status = 'new' and decision_kind = 'proposal' and inputs_ref->>'generator' = $1 order by decision_id`, [GENERATOR])).rows;
+  const before = await openRows();
+  assert.ok(before.length > 0, '前提: 前の日 (10/20) の提案がある');
+  assert.equal(await findSendBlock(pdb), null);
+  assert.deepEqual((await sendableProposals(pdb, { now: new Date('2026-10-21T00:00:00Z') })).map((x) => x.decision_id), before.map((x) => x.decision_id));
+
+  const blocked = { items: [], errors: ['Sheet なしのモード: 商品管理リストの snapshot (他 CH の販売) が無い・未公開・壊れている。計算しない (Sheet には戻らない・前の結果はそのまま)'], sheetless_blocked: true };
+  const { deps, calls } = dayDeps({ result: blocked });
+  const r = await runDecisionAttempt(deps, { nowMs: at('2026-10-21T00:40:00Z'), log: quiet });
+  assert.equal(r.outcome, 'engine_failed');
+  assert.deepEqual(calls.ping.map((p) => p[0]), ['fail']);
+  assert.deepEqual(await openRows(), before, '前の提案の中身・status を変えた (人が見られなくなる)');
+  const block = await findSendBlock(pdb);
+  assert.ok(block, '止めた印が無い');
+  assert.equal(block.business_date, '2026-10-21');
+  assert.deepEqual(await sendableProposals(pdb, { now: new Date('2026-10-21T01:00:00Z') }), [], '止めた日に自動で送れてしまう');
+  assert.equal((await jobRuns()).at(-1).status, 'fail');
+  const mark = (await runSummaries()).at(-1).inputs_ref;
+  assert.deepEqual([mark.send_blocked, mark.sheetless_blocked, mark.decision_final, mark.business_date], [true, true, false, '2026-10-21']);
+
+  // 10:40 にそろった → 決める (止めた日は decision_final でないので次の回で試す) → 止めは外れ、前の提案は今までどおり superseded
+  const { deps: d2, calls: c2 } = dayDeps();
+  const r2 = await runDecisionAttempt(d2, { nowMs: at('2026-10-21T01:40:00Z'), log: quiet });
+  assert.equal(r2.outcome, 'decided', JSON.stringify(r2.detail));
+  assert.deepEqual(c2.ping.map((p) => p[0]), ['ok']);
+  assert.equal(await findSendBlock(pdb), null);
+  const sendable = await sendableProposals(pdb, { now: new Date('2026-10-21T02:00:00Z') });
+  assert.ok(sendable.length > 0);
+  assert.equal(sendable.some((x) => before.some((b) => b.decision_id === x.decision_id)), false, '前の日の提案がまだ送れる');
 });
 
 await ta('runDecisionAttemptSafe: 接続できない → 投げずに ping fail / 同じプロセスで重ねない', async () => {

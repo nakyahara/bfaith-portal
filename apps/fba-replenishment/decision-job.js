@@ -21,6 +21,8 @@
  *   - 09:40・10:40 は入力がそろっていなければ **待つ** (ai.decisions は書かない。ops.job_runs に「待機」を残す)。
  *     11:40 (以降) の回でもそろわなければ「今日は決められない」を記録して、前日以前の提案を無効にする
  *   - 計算そのものの失敗は、どの回でも記録する (前日以前の提案も無効)。次の回でまた試す
+ *     🆕 Sheet なしのモードで材料が欠けて止まった失敗 (result.sheetless_blocked・⑦-F) だけは前の提案に触らず、
+ *     「止めた印」を残して自動で送るのを止める (shadow-draft.mjs recordSheetlessBlockedRun・findSendBlock)
  *   - ping: 決めた = ok / 11:40 で決められなかった = partial / 例外・計算の失敗 = fail。待機は ping しない
  *
  * 🚨 画面への影響: レポートの取り込み (syncLatestPlanningFromMiniPC) は画面の「レポート全取得」と同じ処理なので、

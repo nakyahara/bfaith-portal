@@ -27,7 +27,7 @@ import {
 } from '../fba-replenishment/inbound-plans.js';
 import { syncInboundHistory } from '../fba-replenishment/inbound-history.js';
 import { syncSkuMappings } from '../fba-replenishment/sheets-sync.js';
-import { isSheetlessRequested, SHEET_SYNC_GONE_MESSAGE } from '../fba-replenishment/sheetless-mode.js';
+import { isSheetlessIoRequested, SHEET_SYNC_GONE_MESSAGE } from '../fba-replenishment/sheetless-mode.js';
 import { generateRecommendations } from '../fba-replenishment/calculation-engine.js';
 import { nextInboundCache } from '../fba-replenishment/inbound-state.js';
 
@@ -402,8 +402,8 @@ router.get('/sku-mappings', dbHandler(async (req, res, db) => {
 }));
 
 router.post('/sync-sku-mappings', async (req, res) => {
-  // Sheet なしのモード (⑦-F): 手の Sheet 同期の口は止める
-  if (isSheetlessRequested()) return errorResponse(res, { status: 410, error: 'SHEETLESS_MODE', message: SHEET_SYNC_GONE_MESSAGE, requestId: req.requestId });
+  // Sheet なしのモード (⑦-F): 手の Sheet 同期の口は止める。miniPC は計算をしないので FBA_SHEETLESS_IO=1 で止める (Codex PR R1 Medium 1)
+  if (isSheetlessIoRequested()) return errorResponse(res, { status: 410, error: 'SHEETLESS_MODE', message: SHEET_SYNC_GONE_MESSAGE, requestId: req.requestId });
   try {
     const result = await syncSkuMappings();
     okResponse(res, { result });

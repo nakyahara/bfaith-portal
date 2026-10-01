@@ -999,9 +999,12 @@ export const JOBS_REGISTRY = [
       + '2026-09-24 までの影の下書きの記録は ops.job_runs (job_id=fba-daily-sync) に残っている。'
       + '【Sheet なしのモード (FBA_SHEETLESS_MODE=1)】ok の基準 = Sheet なしの材料がそろっている (note「Sheetなし 対応=N 他CH=M」)。'
       + '欠けていれば fail (note「Sheetなし 材料が欠けている: 理由」= 09:40 の計算も止まる。Sheet には戻らない)。材料がそろい納品実績が失敗なら partial (今までと同じ)。'
-      + '手の Sheet 同期の口 (画面の Step3・POST /api/sync-sku-mappings・miniPC の /service-api/fba/sync-sku-mappings) は 410。'
-      + 'モードを入れる前に scripts/fba-sheetless-backfill-once.mjs を Render と miniPC の fba.db で 1 回ずつ流す (起動時の sku_mapping → fba_sku_attrs を止める印)。'
-      + 'miniPC は ?fnsku_source=attrs に答えるコードを先に配る (古いままだと Render は FNSKU を反映しない)',
+      + '手の Sheet 同期の口 (画面の Step3・POST /api/sync-sku-mappings) は 410。画面の Step4 は「Amazon 仮確定」を計算できたときだけ消す。'
+      + '入れる順番: ① miniPC にコードを配る (?fnsku_source=attrs に答える) ② miniPC で scripts/fba-sheetless-backfill-once.mjs (WarehouseServer を止めて) '
+      + '→ miniPC の .env (リポジトリの直下の 1 つ) に FBA_SHEETLESS_IO=1 → WarehouseServer を起動 (miniPC は計算しないので入出力だけ止める = '
+      + '/service-api/fba/sync-sku-mappings は 410・FNSKU は fba_sku_attrs だけ・起動時の backfill を流さない) '
+      + '③ Render の shell で同じスクリプト → env FBA_SKU_MAPPING_SOURCE=mirror・FBA_NONFBA_SOURCE=pml・FBA_SHEETLESS_MODE=1。'
+      + 'miniPC のコードが古いと Render は FNSKU を反映しない (9:40 が partial)',
   },
   {
     id: 'fba-decision-draft',
@@ -1031,7 +1034,8 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',
     runbook: 'Render Logs で「FBA-Decision」を検索。ok = その日の提案を記録した / partial = 11:40 でも入力がそろわず「今日は決められない」を記録 (前日以前の提案は superseded) / fail = 計算の失敗・例外。'
       + 'Sheet なしのモード (FBA_SHEETLESS_MODE=1) で SKU の対応・商品管理リスト・env が欠けた日も fail (「Sheet なしのモード: 理由」。Sheet の値には戻らない・fba-daily-sync の note と同じ理由)。'
-      + '同じモードで miniPC の FNSKU を反映しなかった日 (miniPC のコードが古い = ?fnsku_source=attrs に答えない) は、提案を記録したうえで partial '
+      + 'この日は前の提案に触らない (superseded にしない = 人は見られる)。run 要約行に「止めた印」(send_blocked) を残し、自動で送る段は findSendBlock / sendableProposals で止まる。'
+      + '同じモードで miniPC の FNSKU を反映しなかった日 (miniPC のコードが古い = ?fnsku_source=attrs に答えない・FNSKU が 0 件でも) は、提案を記録したうえで partial '
       + '(note「🚨 FNSKU を反映していない」・run 要約行の report_sync.fnsku_skip_reason)。miniPC を配り直す。'
       + '09:40・10:40 で入力がそろわない回は ping せず ops.job_runs (job_id=fba-decision-draft) に「待機 (理由)」を残す。'
       + '理由コード: report_not_this_morning (RESTOCK/PLANNING の元データが今日 05:00 JST より前 = miniPC の daily-sync の Amazon 取得を確認) / '
@@ -1048,13 +1052,14 @@ export const JOBS_REGISTRY = [
     purpose: 'FBA 補充を Google Sheet「商品コード変換テーブル」から切り離すまでの一時のもの (マスタ正本切替 ⑦-F)。'
       + '① 一回限りの移行 scripts/fba-sheetless-backfill-once.mjs (Render と miniPC の fba.db に印 fba_migration_marks を書く) '
       + '② 同じか確かめる道具 scripts/fba-sheetless-parity.mjs (モードなしで master と同じ出力か) '
-      + '③ モードを使わないときの Sheet の経路 (06:00 の Sheet の同期・手の Sheet 同期の口・sku_mapping と fba_sku_attrs の二重書き・起動時の backfill・Sheet の値への戻り) と env FBA_SHEETLESS_MODE の切り替えそのもの。'
+      + '③ モードを使わないときの Sheet の経路 (06:00 の Sheet の同期・手の Sheet 同期の口・sku_mapping と fba_sku_attrs の二重書き・起動時の backfill・Sheet の値への戻り・Step4 の先に消す順番) '
+      + 'と env FBA_SHEETLESS_MODE (Render)・FBA_SHEETLESS_IO (miniPC) の切り替えそのもの。'
       + 'モードを入れて 7 日問題が無ければ、片付けの PR で ①② を消し、③ を外して Sheet なしを既定にする (sku_mapping は読み取り専用で残すか消すかをそこで決める)',
     where: 'scripts/fba-sheetless-backfill-once.mjs・scripts/fba-sheetless-parity.mjs・apps/fba-replenishment/sheetless-mode.js・'
       + 'apps/fba-replenishment/db.js / router.js / sheets-sync.js の Sheet の経路・apps/warehouse/fba-service.js の /sync-sku-mappings と /sync/latest-planning の fnsku_source',
     remove_by: '2027-01-31',
     lifecycle: 'temporary',
-    runbook: 'モードを入れる手順 = fba-daily-sync の runbook (① を Render と miniPC で 1 回ずつ → Render の env)。'
+    runbook: 'モードを入れる手順 = fba-daily-sync の runbook (① を miniPC と Render で 1 回ずつ → miniPC の FBA_SHEETLESS_IO=1 → Render の FBA_SHEETLESS_MODE=1)。'
       + '片付け = モードを 7 日動かして fba-daily-sync・fba-decision-draft が ok なら、①② と Sheet の経路を消す PR を出し、このエントリを消す。'
       + '切替が延びるなら remove_by を延ばす (理由を書く)',
   },
