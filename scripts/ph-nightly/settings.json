@@ -1,7 +1,7 @@
 {
   "_comment": "product-hub 夜間生成 (miniPC) 専用の Claude Code 設定。install.ps1 が C:\\tools\\ph-nightly\\work\\.claude\\settings.json へコピーし、ACL で bfaith に書き込み拒否を掛ける。作業ディレクトリ限定なので他の用途には効かない。",
   "_why_dontAsk": "非対話 (claude -p) には Yes を押す相手がいない。止まる要因は 2 層: ①allowlist 外のツール ②auto mode 分類器。dontAsk は②を通す。bypassPermissions は deny も無効になるので使わない。",
-  "_why_only_two_commands": "Codex R1/R2 critical (2026-08-28): curl/node/python/cat を許すと deny は迂回でき、codex exec * は任意プロンプト実行経路。シェルで許すのは固定機能の ./phq と ./phreview だけ。両シムと bin/ は ACL で Claude (bfaith) から書き換え不可。HTTP・トークン・URL 制限・ファイル名制限は phq.mjs の中で決まる。",
+  "_why_only_two_commands": "Codex R1/R2 critical (2026-08-28): curl/node/python/cat を許すと deny は迂回でき、codex exec * は任意プロンプト実行経路。シェルで許すのは固定機能の ./phq / ./phreview (原稿) と ./phlp / ./phlpreview (LP 構成) だけ。両シムと bin/ は ACL で Claude (bfaith) から書き換え不可。HTTP・トークン・URL 制限・ファイル名制限は phq.mjs の中で決まる。",
 
   "permissions": {
     "defaultMode": "dontAsk",
@@ -9,6 +9,8 @@
     "allow": [
       "Bash(./phq *)",
       "Bash(./phreview *)",
+      "Bash(./phlp *)",
+      "Bash(./phlpreview *)",
       "Bash(ls)",
       "Bash(ls *)",
       "Read",
@@ -65,6 +67,8 @@
   },
 
   "_notes": {
+    "allow ./phlp": "queue/claim(常に1件)/images/reserve/result/fail/release/checkreview/clean。ファイル引数は work/ 直下の out-*.md / lint-*.json / reason-*.txt だけ。画像は img-<ID>-<n>.jpg 固定で、サーバもその依頼の packet に固定済みのものしか配らない",
+    "allow ./phlpreview": "Codex 検品 (LP 構成)。引数は依頼 ID だけ。プロンプト固定・_lp_review_<ID>.md の中身はラッパーが読んで stdin で渡す・--sandbox read-only 固定・timeout 600 秒",
     "allow ./phq": "queue/claim(常に1件)/block/release/submit/fetch/extract/find/lint/search-amazon/clean。ファイル引数は work/ 直下の page-*.html / copy-*.json / reason-*.txt だけ",
     "allow ./phreview": "Codex 検品。引数は draft ID だけ。プロンプト固定・_ph_review_<ID>.md の中身はラッパーが読んで stdin で渡す (Codex は何も実行しない)・--sandbox read-only 固定・timeout 600 秒",
     "deny rm": "一時ファイルの削除は ./phq clean ID に閉じた (2026-09-01)。rm を allow に置くと `rm -f a b c` のようにパターンを外れた形が拒否され、逆に緩いパターンを足すと work 外まで消せる",

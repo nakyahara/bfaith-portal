@@ -28,6 +28,7 @@ $Bin   = Join-Path $Root 'bin'
 $Work  = Join-Path $Root 'work'
 $Cfg   = Join-Path $Work '.claude'
 $SkillsSrc = Join-Path $Repo '.claude\skills\ph-generate'
+$LpSkillsSrc = Join-Path $Repo '.claude\skills\ph-lp-compose'
 $Me = 'bfaith'
 
 if (-not (Test-Path (Join-Path $Src 'phq.mjs'))) { throw "not a ph-nightly source dir: $Src" }
@@ -77,8 +78,12 @@ $targets = @(
   @{ p = $Cfg;                                          d = $true  },
   @{ p = (Join-Path $Work 'phq');                       d = $false },
   @{ p = (Join-Path $Work 'phreview');                  d = $false },
+  @{ p = (Join-Path $Work 'phlp');                      d = $false },
+  @{ p = (Join-Path $Work 'phlpreview');                d = $false },
   @{ p = (Join-Path $Cfg 'settings.json');              d = $false },
   @{ p = (Join-Path $Bin 'phq.mjs');                    d = $false },
+  @{ p = (Join-Path $Bin 'phlp.mjs');                   d = $false },
+  @{ p = (Join-Path $Bin 'run-lp-compose.ps1');         d = $false },
   @{ p = (Join-Path $Bin 'copy_lint.py');               d = $false },
   @{ p = (Join-Path $Bin 'run-ph-generate.ps1');        d = $false },
   @{ p = (Join-Path $Bin 'ping.ps1');                   d = $false },
@@ -100,6 +105,8 @@ try {
 
     # 2) executable code + shims + settings (all as protected copies)
     Copy-Item -Force (Join-Path $Src 'phq.mjs')              (Join-Path $Bin 'phq.mjs')
+    Copy-Item -Force (Join-Path $Src 'phlp.mjs')             (Join-Path $Bin 'phlp.mjs')          # LP compose (stage 1)
+    Copy-Item -Force (Join-Path $Src 'run-lp-compose.ps1')   (Join-Path $Bin 'run-lp-compose.ps1')
     Copy-Item -Force (Join-Path $Src 'copy_lint.py')         (Join-Path $Bin 'copy_lint.py')   # canonical = AI_reference (miniPC has no G:)
     Copy-Item -Force (Join-Path $Src 'run-ph-generate.ps1')  (Join-Path $Bin 'run-ph-generate.ps1')
     Copy-Item -Force (Join-Path $Repo 'scripts\jobs-monitor\ping.ps1') (Join-Path $Bin 'ping.ps1')
@@ -119,8 +126,10 @@ try {
     }
     Copy-Item -Force (Join-Path $Src 'phq')                  (Join-Path $Work 'phq')
     Copy-Item -Force (Join-Path $Src 'phreview')             (Join-Path $Work 'phreview')
+    Copy-Item -Force (Join-Path $Src 'phlp')                 (Join-Path $Work 'phlp')
+    Copy-Item -Force (Join-Path $Src 'phlpreview')           (Join-Path $Work 'phlpreview')
     Copy-Item -Force (Join-Path $Src 'settings.json')        (Join-Path $Cfg 'settings.json')
-    foreach ($f in @('phq', 'phreview')) {
+    foreach ($f in @('phq', 'phreview', 'phlp', 'phlpreview')) {
       $bytes = [IO.File]::ReadAllBytes((Join-Path $Work $f))
       if (@($bytes | Where-Object { $_ -eq 13 }).Count -gt 0) { throw "$f has CRLF line endings (bash shim needs LF; check .gitattributes)" }
     }
@@ -139,6 +148,9 @@ try {
     New-Item -ItemType Directory -Force -Path (Join-Path $skills 'ph-generate') | Out-Null
     Copy-Item -Force -Recurse (Join-Path $SkillsSrc '*') (Join-Path $skills 'ph-generate')
     if (-not (Test-Path (Join-Path $skills 'ph-generate\SKILL.md'))) { throw "skill copy failed: $skills" }
+    New-Item -ItemType Directory -Force -Path (Join-Path $skills 'ph-lp-compose') | Out-Null
+    Copy-Item -Force -Recurse (Join-Path $LpSkillsSrc '*') (Join-Path $skills 'ph-lp-compose')
+    if (-not (Test-Path (Join-Path $skills 'ph-lp-compose\SKILL.md'))) { throw "lp skill copy failed: $skills" }
   } catch {
     $updateError = $_.Exception.Message
   }
@@ -173,6 +185,8 @@ Remove-Item Env:\AD_KW_AI_IMPORT_PATH
 New-Item -ItemType Directory -Force -Path (Join-Path $Root 'ad-kw-ai-data\pending'), (Join-Path $Root 'ad-kw-ai-data\cwd') | Out-Null
 Assert-Denied (Join-Path $Cfg 'settings.json') $false
 Assert-Denied (Join-Path $Cfg 'skills\ph-generate\SKILL.md') $false
+Assert-Denied (Join-Path $Cfg 'skills\ph-lp-compose\SKILL.md') $false
+Assert-Denied (Join-Path $Bin 'phlp.mjs') $false
 
 # 5) scheduled task runs the PROTECTED copy of the runner. bfaith / Interactive (no stored password - same
 #    pattern as MallCsvFetchAll) / RunLevel Limited. Requires bfaith to stay logged on (console).
@@ -187,11 +201,27 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Pr
 $t = Get-ScheduledTask -TaskName $taskName
 if (-not $t) { throw "task $taskName was not registered" }
 
+# 5b) LP compose (stage 1): a person presses a button on the product page and watches the screen, so this
+#     one polls every minute. The poll itself is ONE http call (bin\phlp.mjs queue) - Claude is started
+#     only when there is a request. It takes the shared Claude lock with a SHORT deadline: if a nightly
+#     job holds it, the minute is skipped instead of queuing up behind a 2 h run.
+$lpTaskName = 'PhLpComposeMinutely'
+$lpAction   = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $Bin 'run-lp-compose.ps1') + '"')
+$lpTrigger  = New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
+                -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration ([TimeSpan]::FromDays(3650))
+$lpSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 20) `
+                -MultipleInstances IgnoreNew -RunOnlyIfNetworkAvailable
+Register-ScheduledTask -TaskName $lpTaskName -Action $lpAction -Trigger $lpTrigger -Principal $principal -Settings $lpSettings -Force | Out-Null
+$lpT = Get-ScheduledTask -TaskName $lpTaskName
+if (-not $lpT) { throw "task $lpTaskName was not registered" }
+
 Write-Output "installed:"
 Write-Output ("  bin      : " + $Bin + " (phq.mjs, copy_lint.py, run-ph-generate.ps1, ping.ps1) [write denied for " + $Me + "]")
 Write-Output ("  work     : " + $Work + " (./phq ./phreview [write denied], generated files writable)")
 Write-Output ("  config   : " + $Cfg + " (settings.json + skills copy) [write denied]")
 Write-Output ("  task     : " + $taskName + " daily 02:30 as " + $Me + " (Interactive, Limited) -> bin\run-ph-generate.ps1, state=" + $t.State)
+Write-Output ("  task(LP) : " + $lpTaskName + " every 1 min as " + $Me + " (Interactive, Limited) -> bin\run-lp-compose.ps1, state=" + $lpT.State)
 Write-Output ("  source   : " + $Repo)
 Write-Output ""
 Write-Output "remaining manual steps (once, by a person):"
@@ -204,3 +234,5 @@ Write-Output ("  5. SP-ad KW AI   : billing record bin\ad-kw-ai-config.json = " 
 Write-Output  "                    a person confirms the Claude plan has NO additional (paid) usage, then re-runs:"
 Write-Output  "                    install.ps1 -AttestAdKwBilling '<name>'   (without the record the ad runner claims nothing)"
 Write-Output  "                    then set AD_KW_AI_ENABLED=1 on Render (until then the ad queue pings ok 'disabled')"
+Write-Output  "  6. LP compose    : set PH_LP_COMPOSE_ENABLED=1 on Render, then upload the LP spec (.xlsx) as an admin."
+Write-Output  "                    until both are done run-lp-compose.ps1 exits quietly every minute (server says enabled=false)."
