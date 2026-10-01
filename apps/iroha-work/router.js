@@ -92,7 +92,7 @@ import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task
 import { listInboundPlan } from './inbound-plan.js';
 import { startConsignment, markPrepared, markHanded, cancelConsignment, recordReturn, settleConsignment, getConsignment, updateReturnCounts } from './consign.js';
 import { startStaffUnlock, staffUnlockOf, endStaffUnlock, STAFF_UNLOCK_MS } from './db.js';
-import { materialsOf } from '../../lib/iroha-materials.js';
+import { materialsOf, withPrimaryCode } from '../../lib/iroha-materials.js';
 import {
   addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, recordMediaCancel, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
   reportMediaUnavailable, recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
@@ -1636,9 +1636,13 @@ router.post('/api/master', checkOrigin, api((req, res) => {
           material_code: cardValues.material_code, storage_container: cardValues.storage_container,
           units_per_container: cardValues.units_per_container, process_count: cardValues.process_count, note: cardValues.note,
         };
-        // 🚨 古い画面が material_code だけ送ってきたときは、カード由来の配列でそれを上書きしない
-        //    (配列が勝つと、その場の入力が黙って消える)
-        if ('material_code' in fields) delete seed.materials;
+        // 古い画面は 1 件目だけを送ってくる。カードに資材が載っていれば**それを土台にして 1 件目だけ差し替える**。
+        // 🚨 ここで配列を捨てると、マスタ行が無いカード (取込で消えた等) で 2 件目が消える (Codex 2026-10-01)。
+        //    materials は material_code より強いので、1 件目は送られてきた値になる
+        if ('material_code' in fields) {
+          const base = Array.isArray(cardValues.materials) ? cardValues.materials : [];
+          seed.materials = base.length > 0 ? withPrimaryCode(base, fields.material_code) : undefined;
+        }
         applyFields = { ...Object.fromEntries(Object.entries(seed).filter(([f, v]) => v != null && v !== '' && !(f in fields))), ...fields };
       } else {
         expect = Number(req.body.expect_version);
@@ -1660,7 +1664,11 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   // シードで書いた項目も含め、実際に適用した applyFields を対象に。切り詰めない
   // (入力は各フィールド上限500字までなのでJSON全体でも高々数KB — 途中切断で壊れたJSONを残さない)
   const oldVals = {}; const newVals = {};
-  for (const f of Object.keys(result.applyFields)) { oldVals[f] = row ? row[f] : null; newVals[f] = result.row[f]; }
+  for (const f of Object.keys(result.applyFields)) {
+    // 資材は列ではなく配列。row['materials'] は undefined なので、履歴から消えてしまう (Codex 2026-10-01)
+    if (f === 'materials') { oldVals[f] = materialsOf(row); newVals[f] = materialsOf(result.row); continue; }
+    oldVals[f] = row ? row[f] : null; newVals[f] = result.row[f];
+  }
   safeLog({
     action: 'master_edit', pageId: String(req.body?.page_id || '') || null,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),

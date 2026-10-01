@@ -2533,6 +2533,38 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
             fields: { expiry_seal: '1' }, worker_id: staffP.id, pin: '4649', expect_version: mver() - 1 } });
           ok(sealStale.status === 409, '古い版で送ったら断る (期限シールも他の項目と同じ楽観ロック)');
           ok(sealOf() == null, '断ったので値も変わらない');
+
+          // ── 🧰 資材 2 つ (2026-10-01)。マスタ行が無く、カードのスナップショットにだけ資材が載っている状態で
+          //    **古い画面が material_code だけ送ってきた**とき、2 件目 (小分け袋) を消さない (Codex)
+          {
+            db.prepare("DELETE FROM f_iroha_work_master WHERE code_key = 'size-a'").run();
+            db.prepare('UPDATE f_iroha_tasks SET master_snapshot = ? WHERE id = ?').run(JSON.stringify({
+              materials: [{ code: 'D-8' }, { code: '313ビニール袋', usage: 'inner_pack', units_per_pack: 10 }],
+              material_code: 'D-8', units_per_container: 120,
+            }), t6);
+            clearEnrichCache();
+            const oldStyle = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+              fields: { material_code: 'D-9' }, worker_id: staffP.id, pin: '4649' } });
+            const mats = JSON.parse(db.prepare("SELECT materials_json FROM f_iroha_work_master WHERE code_key = 'size-a'").get().materials_json);
+            ok(oldStyle.status === 200 && mats.length === 2 && mats[0].code === 'D-9'
+              && mats[1].code === '313ビニール袋' && mats[1].units_per_pack === 10,
+              '🚨古い画面が資材 1 件だけ送っても、カードに載っていた小分け袋は残る');
+            const ev = db.prepare("SELECT from_value, to_value FROM f_iroha_app_events WHERE action = 'master_edit' ORDER BY id DESC LIMIT 1").get();
+            ok(/313ビニール袋/.test(ev.to_value || ''), '🚨操作履歴に資材の中身が残る (あとから戻せる)');
+
+            // マスタで「資材なし」にしたら、カードの古い資材が復活しない
+            const ver = () => db.prepare("SELECT version FROM f_iroha_work_master WHERE code_key = 'size-a'").get().version;
+            const cleared = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+              fields: { materials: [] }, worker_id: staffP.id, pin: '4649', expect_version: ver() } });
+            clearEnrichCache();
+            const card = (await call('GET', '/api/task-previews/' + t6, { cookie })).json.card;
+            ok(cleared.status === 200 && card.master.materials.length === 0 && card.master.material_code == null,
+              '🚨「資材なし」にしたら、カードの古い資材は復活しない');
+            ok((card.master.missing || []).includes('資材'), '資材なしは「未登録」として数える');
+            // 🚨マスタ行はこの先のテスト (CHECK 制約) が使うので消さない。カード側だけ元に戻す
+            db.prepare('UPDATE f_iroha_tasks SET master_snapshot = NULL WHERE id = ?').run(t6);
+            clearEnrichCache();
+          }
           let sealErr = null;
           try { db.prepare("UPDATE f_iroha_work_master SET expiry_seal = 2 WHERE code_key = 'size-a'").run(); } catch (e) { sealErr = e; }
           ok(sealErr && /CHECK/.test(sealErr.message), '0/1 以外は DB にも入らない (CHECK)');
@@ -7353,6 +7385,20 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
     const row = rowOf(SV.buildConsignPlan(), r0.consignment.id);
     ok(row.storage_container === '20L（山田さん担当）', '文字列はそのまま出す');
     ok(row.material_code === null, '⭐入れ子の JSON は出さない ([object Object] と描かせない)');
+    ok(Array.isArray(row.materials) && row.materials.length === 0, '⭐入れ子は資材の配列にも入れない');
+  }
+
+  // ③-2 🧰 資材が 2 つ (小分けの袋) のカードを預けるとき、渡す前の画面にも両方出す (2026-10-01)
+  {
+    const t = mk('cp-5b', 92951, 70, JSON.stringify({ units_per_container: 70, process_count: 2,
+      storage_container: '20Lコンテナ',
+      materials: [{ code: 'D-8' }, { code: '313ビニール袋', usage: 'inner_pack', units_per_pack: 10 }] }));
+    const r0 = C.startConsignment({ taskId: t, batchId: B.listBatchesOfTask(db, t)[0].id,
+      facilityCode: 'rashinban', qty: 70, expectVersion: v(t) });
+    const row = rowOf(SV.buildConsignPlan(), r0.consignment.id);
+    ok(row.materials.length === 2 && row.materials[1].units_per_pack === 10,
+      '🚨預ける前の画面に資材が 2 つとも出る (小分けの数も)');
+    ok(row.material_code === 'D-8', '1 件目は今までどおり material_code にも出る');
   }
 
   // ④ ⭐入口に出す件数

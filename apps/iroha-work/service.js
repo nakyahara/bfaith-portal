@@ -17,7 +17,7 @@ import { buildEnrichContext } from '../inbound-check/enrich.js';
 import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
 import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask, finishedSessionsOfTask, listWorkOptions } from './db.js';
-import { materialsOf, primaryMaterialCode, materialsMissing, canonicalizeMaterials, sameMaterials, MAX_MATERIALS } from '../../lib/iroha-materials.js';
+import { materialsOf, primaryMaterialCode, materialsMissing, canonicalizeMaterials, sameMaterials, hasMaterialsDecision, MAX_MATERIALS } from '../../lib/iroha-materials.js';
 import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, BLOCK_REASONS, BLOCK_LABEL, BLOCK_BUTTON, CLOSE_REASONS, CLOSE_LABEL, statusLabel, blockLabel } from './tasks.js';
@@ -145,8 +145,10 @@ function mergeMaster(wm, card) {
   //   カードに載っている資材・入数の表示を消さない)。version はマスタ行の有無で決まる
   // 資材は配列が正本 (materials.js)。マスタが持っていればマスタ、空ならカードの値へ落とす
   // (「マスタ行が動画だけ」でもカードに載っている資材を消さない — 下の項目単位フォールバックと同じ考え)
+  // 🚨 マスタが「資材なし」と答えている ('[]') ときはカードへ落とさない。
+  //    空だからとカードへ落とすと、人が消した資材が古いスナップショットから復活する (Codex 2026-10-01 high)
   const wmMaterials = materialsOf(wm);
-  const materials = wmMaterials.length > 0 ? wmMaterials : materialsOf(card);
+  const materials = (hasMaterialsDecision(wm) || wmMaterials.length > 0) ? wmMaterials : materialsOf(card);
   const m = wm
     ? { source: 'master', version: wm.version,
         material_code: wm.material_code || card.material_code, storage_container: wm.storage_container || card.storage_container,

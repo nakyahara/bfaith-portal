@@ -94,8 +94,9 @@ console.log('\n[4] 1 件目だけの差し替え (withPrimaryCode)');
   const next = M.withPrimaryCode(cur, 'D-9');
   ok(next.length === 2 && next[0].code === 'D-9' && next[1].code === '袋' && next[1].units_per_pack === 10,
     '🚨1 件目を差し替えても 2 件目 (小分け袋) は残る');
-  ok(M.withPrimaryCode(cur, '袋')[0].code === '袋' && M.withPrimaryCode(cur, '袋').length === 1,
-    '2 件目と同じ資材を 1 件目にすると重複を作らずまとまる');
+  const moved = M.withPrimaryCode(cur, '袋');
+  ok(moved.length === 1 && moved[0].code === '袋' && moved[0].usage === 'inner_pack' && moved[0].units_per_pack === 10,
+    '🚨2 件目と同じ資材を 1 件目にすると、その資材の指定 (小分け袋・何個ずつ) ごと先頭へ動く');
   ok(M.withPrimaryCode(cur, '')[0].code === '袋', '1 件目を空にすると 2 件目が繰り上がる');
   ok(M.withPrimaryCode([], 'D-8')[0].code === 'D-8' && M.withPrimaryCode([], 'D-8').length === 1, '0 件から 1 件');
 }
