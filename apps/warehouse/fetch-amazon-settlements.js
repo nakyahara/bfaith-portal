@@ -68,7 +68,7 @@ import {
 import {
   documentVersionId, registerDocumentVersion, refreshVersionDetail, selectedVersionOf, dirtyVersionOrders, assertLease, acquireCoverageLease, releaseCoverageLease,
 } from './amazon-settlement-versions.js';
-import { financeCoordinatorEnabled, FINANCE_COORDINATOR_ENV, assertLegacyAllowed, ledgerMetaReader } from './finance-coordinator-switch.js';
+import { financeCoordinatorEnabled, FINANCE_COORDINATOR_ENV, assertLegacyAllowedRemote, ledgerMetaReader } from './finance-coordinator-switch.js';
 import { isAliveNodeSince } from './retry-lock.js';
 
 const REGION = 'fe';
@@ -123,17 +123,18 @@ const nowSql = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
 /**
  * スイッチが無いときの書く取込 (今までの「Amazon Settlement」・#1567)。
  *   ① coverage の lease を取る (手で流す coordinator・版付けと重ならない。生の表は lease の下で書く = coordinator と同じ確かめ)
- *   ② 🚨 一方向の門 (Codex R6 High): lease の中で、coordinator が coverage の回で回ったことがあれば ❌ (生の表を書く前・SP-API を呼ぶ前)。
+ *   ② 🚨 一方向の門 (Codex R6 High・R7 High 1): lease の中で、coordinator が coverage の回で回ったことがあれば ❌ (生の表を書く前・SP-API を呼ぶ前)。
+ *      証拠 = ローカル (台帳・warehouse.db) と Render の決済のそろいの行の両方。Render を読めない = 判定できない = ❌ (remote = { fetchImpl, env, base, syncKey } 試験の差し替え)
  *      今までの取込は Render を updating にしない = 書いた後に止まると古い complete が残る。勝手に coordinator も起動しない (.env を直す)
  *   ③ 取込 (runSettlementFetch)。終わったら lease を放す
  */
-export async function runLegacyFetch(args, { db, dataDir, sp, inventorySp = null, runId, downloadTsv = null, now = () => new Date(), isAlive = isAliveNodeSince }) {
+export async function runLegacyFetch(args, { db, dataDir, sp, inventorySp = null, runId, downloadTsv = null, now = () => new Date(), isAlive = isAliveNodeSince, remote = {} }) {
   if (args.dryRun) throw new Error('runLegacyFetch は書く取込だけ (dry-run は runSettlementFetch)');
   const got = acquireCoverageLease(db, { isAlive, now: now() });
   if (!got.ok) throw new Error(`coverage の lease を別の回が持っている (pid ${got.held.pid}・開始 ${got.held.started_at}) = coordinator か版付けが動いている。終わってから流す`);
   const lease = got.lease;
   try {
-    assertLegacyAllowed(db, ledgerMetaReader(dataDir), '今までの書く取込 (生の表を書く)');
+    await assertLegacyAllowedRemote(db, ledgerMetaReader(dataDir), '今までの書く取込 (生の表を書く)', remote);
     return await runSettlementFetch(args, { db, sp, inventorySp, runId, downloadTsv, now, lease });
   } finally { releaseCoverageLease(db, lease); }
 }

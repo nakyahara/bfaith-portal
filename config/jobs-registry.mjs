@@ -1510,6 +1510,8 @@ export const JOBS_REGISTRY = [
       + '定期実行の前のハードゲート (夜に手で実の --full を 1 回: exit 0・60 分以内・最大メモリ 1,200 MB 以下) に合格する前に新しい coordinator が毎朝動き出さない。'
       + '🚨 一方向 (#1567 Codex R6 High): 一度 coordinator が coverage の回 (世代) で回った後は、スイッチが無くても今までの 2 工程に戻らない '
       + '(daily-sync・retry・単独の入口が、今までの取込は生の表を書く前・送り手は送る前に ❌ = 古い complete を残さない・勝手に coordinator も起動しない)。'
+      + '証拠 = ローカル (台帳・warehouse.db) と Render の決済のそろいの行の両方 (ローカルを失くした・古いバックアップに戻した・新しい DATA_DIR でも Render で分かる)。'
+      + 'Render を読めない = 判定できない = ❌ (切り替えの前でも Render が落ちた朝は今までの取込も止まる = 可用性の代わりに正しさ)。単独の --from/--to の送信も送る前に同じ門 (#1567 Codex R7)。'
       + '一時物にした理由 = 設計の終わりの形は「決済の取込と財務の送信は coordinator だけ」(今までの 2 工程は token の無い chunk で Render の complete を毎朝無効にする = 正式な利益が出ない) = '
       + '合格して足した後はスイッチを残す意味が無い (残すと 2 つの道の試験と保守が続く)',
     where: 'bfaith-portal リポジトリ apps/warehouse/finance-coordinator-switch.js (スイッチと工程の選び方)・apps/warehouse/daily-sync.js (工程)・apps/warehouse/retry-failed-jobs.js '

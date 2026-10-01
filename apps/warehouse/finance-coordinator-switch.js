@@ -8,6 +8,10 @@
  * 🚨 **一方向** (#1567 Codex R6 High): 一度でも coordinator が coverage の回 (世代) で回った (= coverageEverRan) 後は、スイッチが無くても今までの 2 工程には戻らない =
  *    今までの取込 (生の表を書く前に Render を updating にしない) と送り手は、生の表を書く前・送る前に ❌ で止まる (勝手に coordinator も起動しない = 朝を赤くする)。
  *    手の実の --full (定期実行の前のハードゲート) が通った後に .env に足す前に朝が来た・足した後に .env から消えた、のどちらでも古い complete を残さない
+ *    🚨 証拠はローカル (財務の台帳・warehouse.db) **と Render** (決済のそろいの行 = coordinator が一度でも updating を送った) の両方 (#1567 Codex R7 High 1):
+ *    ローカルの DB を失くした・切り替えの前のバックアップに戻した・新しい DATA_DIR を指した、でも Render に行があれば ❌。
+ *    Render を読めない (網の失敗・404・401・形が違う) = 判定できない = ❌ (fail-closed)。両方とも「無い」と確かに分かったときだけ今までの 2 工程を許す
+ *    (= 切り替えの前の朝に Render が落ちていると今までの取込も止まる = 可用性の代わりに正しさ)
  * 🚨 足すのはハードゲート (夜に手で実の --full を 1 回: exit 0・60 分以内・最大メモリ 1,200 MB 以下) に合格した直後・同じ保守の枠の中・中原さんの指示の後。
  *    .env は miniPC のリポジトリの直下の 1 つだけ (書き直して他の設定を消さない = 2026-09-30 の件)。手順 = db/company/README.md
  * 一時物 = 台帳 config/jobs-registry.mjs の cdb-finance-coordinator-switch (remove_by 2026-11-30 = スイッチを消して常に coordinator にする)
@@ -16,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { amazonFinanceDailyArgs } from './amazon-finance-months.js';
+import { baseOrigin } from '../../scripts/company-db/remote-load.mjs';
 
 export const FINANCE_COORDINATOR_ENV = 'CDB_FINANCE_COORDINATOR';
 
@@ -65,18 +70,89 @@ export function coverageEverRanAt(dataDir) {
   } catch { return null; }
 }
 
-/** 一方向のスイッチを破ろうとした (coordinator で回ったことがあるのに CDB_FINANCE_COORDINATOR が無い) */
+/** 一方向のスイッチを破ろうとした (coordinator で回ったことがある = ローカルか Render に coverage の世代がある) */
 export class FinanceSwitchedBackError extends Error {
-  constructor(what) {
-    super(`🚨 coordinator に切り替え済み (coverage の世代がある) なのに ${FINANCE_COORDINATOR_ENV} が無い = ${what}をしない`
-      + ` (.env に ${FINANCE_COORDINATOR_ENV}=1 をまだ足していない・消えた疑い。今までの 2 工程は生の表を書く前に Render を updating にしない = 古い complete が残りうる)。`
-      + ` .env を確かめて足す (db/company/README.md の手順)。勝手に coordinator を起動しない`);
+  constructor(what, where = 'ローカルの台帳・warehouse.db') {
+    super(`🚨 coordinator に切り替え済み (${where} に coverage の世代がある) = ${what}をしない`
+      + ` (今までの 2 工程・単独の送信は生の表を書く前・送る前に Render を updating にしない = 古い complete が残りうる。`
+      + `.env に ${FINANCE_COORDINATOR_ENV}=1 をまだ足していない・消えた疑い = .env を確かめて足す (db/company/README.md の手順)。勝手に coordinator を起動しない)`);
     this.code = 'FINANCE_SWITCHED_BACK';
   }
 }
-/** 今までの 2 工程 (書く取込・送る送り手) を始める前の門。coordinator で回ったことがあれば throw (#1567 Codex R6 High) */
+/** 切り替え済みかを判定できない (Render の決済のそろいを読めない) = 今までの 2 工程を止める (fail-closed・#1567 Codex R7 High 1) */
+export class FinanceSwitchUnknownError extends Error {
+  constructor(what, why) {
+    super(`🚨 coordinator に切り替え済みかを判定できない (Render の決済のそろいを読めない: ${why}) = ${what}をしない (fail-closed)。`
+      + `Render が戻れば次の回で動く。切り替えの前の朝に Render が落ちていると今までの取込も止まる (可用性の代わりに正しさ)`);
+    this.code = 'FINANCE_SWITCH_UNKNOWN';
+  }
+}
+/** ローカルだけの門 (同期)。coordinator で回ったことがあれば throw (#1567 Codex R6 High)。今までの入口は Render も見る assertLegacyAllowedRemote を使う */
 export function assertLegacyAllowed(db, ledger, what) {
   if (coverageEverRan(db, ledger)) throw new FinanceSwitchedBackError(what);
+}
+
+// ── Render の証拠 (#1567 Codex R7 High 1) ──
+/** Render の決済のそろいの状態の口 (PR #1561 の受け口・読むだけ) = amazon-finance-coverage-run.js の STATUS_PATH と同じ (試験で縛る) */
+export const COVERAGE_STATUS_PATH = '/order-finance/coverage/status?mall=amazon&scope=jp&source=amazon_settlement_unified';
+const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** Render の送り先 (https の origin + /apps/company-db/sync) = push/ne-shipments.mjs の syncBase と同じ規則。無ければ '' */
+export const renderSyncBase = (env = process.env) => { const o = baseOrigin(env); return o ? `${o}/apps/company-db/sync` : ''; };
+/**
+ * Render の決済のそろいに coverage の行 (世代) があるか = coordinator が一度でも updating を送った (行は updating の POST でだけ作られる・状態は問わない)。
+ *   戻り = true (行がある = 切り替え済み) / false (200 で coverage が null = 確かに無い)。
+ *   読めない (網の失敗・時間切れ・404・401・409 not_migrated・5xx・JSON でない・形が違う・送り先か鍵が無い) = throw (判定できない = 呼び手は ❌)
+ *   網の失敗・408・429・5xx だけ間を空けて読み直す (attempts 回まで)
+ */
+export async function renderCoverageEverRan({ fetchImpl = fetch, env = process.env, base = null, syncKey = null, attempts = 3, timeoutMs = 30000, sleep = defaultSleep } = {}) {
+  const b = base ?? renderSyncBase(env);
+  const key = syncKey ?? (env.MIRROR_SYNC_KEY || '');
+  if (!b || !key) throw new Error('Render の送り先 (RENDER_MIRROR_URL / RENDER_PORTAL_URL・https) か MIRROR_SYNC_KEY が無い');
+  let last = null;
+  for (let i = 1; i <= attempts; i++) {
+    let retry = true;
+    try {
+      const res = await fetchImpl(`${b}${COVERAGE_STATUS_PATH}`, { headers: { 'x-sync-key': key }, signal: AbortSignal.timeout(timeoutMs) });
+      const text = await res.text();
+      if (res.ok) {
+        retry = false;
+        let j; try { j = JSON.parse(text); } catch { throw new Error('応答が JSON でない'); }
+        if (!j || typeof j !== 'object' || !Object.hasOwn(j, 'coverage')) throw new Error('応答の形が違う (coverage が無い)');
+        if (j.coverage === null) return false;
+        if (typeof j.coverage === 'object' && j.coverage.generation != null) return true;
+        throw new Error('応答の形が違う (coverage に世代が無い)');
+      }
+      retry = res.status === 408 || res.status === 429 || res.status >= 500;
+      last = new Error(`HTTP ${res.status} ${text.replace(/\s+/g, ' ').slice(0, 120)}`);
+    } catch (e) { last = e; }
+    if (!retry || i >= attempts) break;
+    await sleep(2000 * i);
+  }
+  throw new Error(String(last && last.message || last));
+}
+/**
+ * 今までの 2 工程・単独の送信を始める前の門 (ローカル + Render・#1567 Codex R6 High / R7 High 1・2)。
+ *   ローカルに証拠 / Render に行 = FinanceSwitchedBackError・Render を読めない = FinanceSwitchUnknownError。両方とも確かに無いときだけ通る
+ *   remote = { fetchImpl, env, base, syncKey, sleep } (renderCoverageEverRan に渡す)
+ */
+export async function assertLegacyAllowedRemote(db, ledger, what, remote = {}) {
+  assertLegacyAllowed(db, ledger, what);
+  let has;
+  try { has = await renderCoverageEverRan(remote); } catch (e) { throw new FinanceSwitchUnknownError(what, e.message); }
+  if (has) throw new FinanceSwitchedBackError(what, 'Render の決済のそろい');
+}
+/**
+ * daily-sync・retry 用の門 (DB を読むだけで開く)。戻り = { allowed, code, message }
+ *   ローカルの DB が読めない (無い・壊れた) は「ローカルに証拠が無い」とは言えない = Render だけで決める (Render に行が無いと確かに分かれば通す。
+ *   入口 (fetch / 送り手) は自分の DB で同じ門をもう一度通る)
+ */
+export async function legacyGateCheck({ dataDir, ...remote } = {}) {
+  const local = coverageEverRanAt(dataDir);
+  if (local === true) return { allowed: false, code: 'FINANCE_SWITCHED_BACK', message: new FinanceSwitchedBackError('今までの 2 工程').message };
+  try {
+    if (await renderCoverageEverRan(remote)) return { allowed: false, code: 'FINANCE_SWITCHED_BACK', message: new FinanceSwitchedBackError('今までの 2 工程', 'Render の決済のそろい').message };
+  } catch (e) { return { allowed: false, code: 'FINANCE_SWITCH_UNKNOWN', message: new FinanceSwitchUnknownError('今までの 2 工程', e.message).message }; }
+  return { allowed: true, code: null, message: null, localUnknown: local === null };
 }
 
 /**

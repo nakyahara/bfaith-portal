@@ -33,7 +33,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { isWarnSummary } from './amazon-fees-outcome.js';
 import { acquireRetryLock, releaseRetryLock } from './retry-lock.js';
-import { financeCoordinatorEnabled, coverageEverRanAt, FINANCE_COORDINATOR_ENV } from './finance-coordinator-switch.js';
+import { financeCoordinatorEnabled, legacyGateCheck, FINANCE_COORDINATOR_ENV } from './finance-coordinator-switch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -297,12 +297,6 @@ function loadState() {
   try {
     const json = fs.readFileSync(RETRY_STATE_FILE, 'utf-8');
     const state = JSON.parse(json);
-    if (state && Array.isArray(state.remaining_jobs)) {
-      // 切り替え済みかは warehouse.db と財務の台帳の証拠で (スイッチがあるときは見ない)。読めない = null = 読み替えない (安全側)
-      const coordinator = financeCoordinatorEnabled();
-      const switched = coordinator ? null : coverageEverRanAt(process.env.DATA_DIR || path.join(PROJECT_DIR, 'data'));
-      state.remaining_jobs = renameRetryJobs(state.remaining_jobs, { coordinator, switched });
-    }
     return { found: true, state };
   } catch (e) {
     console.error('[Retry] state file 読み込み失敗:', e.message);
@@ -427,6 +421,18 @@ async function runLocked() {
     return;
   }
   const state = loadResult.state;
+  // 工程の名前を今のスイッチの工程に読み替える (#1567)。coordinator の名前 → 今までの 2 工程は、一度も切り替えていないと確かに分かったときだけ
+  //   (ローカル + Render の門 = legacyGateCheck。切り替え済み・判定できない = 読み替えない = その工程はスイッチが無いので走らせず ❌・Codex R6 High / R7 High 1)
+  if (state && Array.isArray(state.remaining_jobs)) {
+    const coordinator = financeCoordinatorEnabled();
+    let switched = null;
+    if (!coordinator && state.remaining_jobs.some((j) => Object.hasOwn(LEGACY_JOBS_OF, j))) {
+      const gate = await legacyGateCheck({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data') });
+      switched = !gate.allowed;
+      if (!gate.allowed) console.warn(`[Retry] ${gate.message}`);
+    }
+    state.remaining_jobs = renameRetryJobs(state.remaining_jobs, { coordinator, switched });
+  }
 
   const today = toJstDate(new Date());
   if (state.run_date !== today) {

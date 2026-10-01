@@ -934,7 +934,7 @@ await t('🚨 daily-sync のスイッチ (#1567): env CDB_FINANCE_COORDINATOR �
   assert.ok(iSw > 0 && iSettle > iSw && iFees > iSettle && iPush > iFees && iRec > iPush, `${iSw} ${iSettle} ${iFees} ${iPush} ${iRec}`);
   assert.ok(src.includes('const settleStep = settlementStep({ coordinator: financeCoordinator });') && src.includes('const pushStep = financePushStep(businessDate, { coordinator: financeCoordinator });'));
   // 一方向 (#1567 Codex R6 High): 切り替え済みでスイッチが無い朝は今までの 2 工程を起動しない (取込は ❌・送り手はその見送りで ⏭️)
-  assert.match(src, /const switchedBack = !financeCoordinator && coverageEverRanAt\(process\.env\.DATA_DIR \|\| path\.join\(PROJECT_DIR, 'data'\)\) === true;\s*(\/\/[^\n]*\s*)*const settlementResult = switchedBack\s*\? \{ success: false, summary: `❌ coordinator に切り替え済み/);
+  assert.match(src, /const legacyGate = financeCoordinator \? null : await legacyGateCheck\(\{ dataDir: process\.env\.DATA_DIR \|\| path\.join\(PROJECT_DIR, 'data'\) \}\);\s*const settlementResult = legacyGate && !legacyGate\.allowed\s*\? \{ success: false, summary: `❌ \$\{legacyGate\.message\}` \}/, '切り替え済み・判定できない朝は今までの 2 工程を起動しない (ローカル + Render・#1567 Codex R7)');
   // スイッチが無い朝 = master と同じ: 取込の結果の名前 (warn なし)・取込が失敗した朝は送らずに ⏭️ (retry に載せる)
   assert.match(src, /results\.push\(financeCoordinator \? \{ name: settleStep\.name, \.\.\.settlementResult, warn: settlementResult\.success && isWarnSummary\(settlementResult\.summary\) \} : \{ name: settleStep\.name, \.\.\.settlementResult \}\);/);
   assert.match(src, /if \(pushStep && settlementResult\.success\) \{[\s\S]{0,300}\} else if \(pushStep\) \{\s*cdbFinanceResult = \{ success: false, summary: '⏭️ skipped \(Amazon Settlement の取込が失敗。取込の再試行が成功したら送る\)' \};/);
@@ -977,11 +977,11 @@ await t('CLI: バックフィルの完了印の前は送らずに「⏭️ バ�
     const cliOn = (args) => { try { return { code: 0, out: execFileSync(process.execPath, ['apps/company-db/push/amazon-finance.mjs', ...args], { cwd: repoRoot, env: envOn, encoding: 'utf8' }) }; } catch (e) { return { code: e.status, out: String(e.stdout || '') + String(e.stderr || '') }; } };
     const r = cliOn(['--incremental', '--require-backfilled']);
     assert.equal(r.code, 1); assert.match(r.out, /coordinator/);
-    // スイッチが無いとき = 今までどおり送る (master と同じ = 容量の上限が無いので送る前に止まる)
+    // スイッチが無いとき = 今までの送り手の道 (coordinator だけの拒みは出ない) → 送る前の一方向の門 (#1567 Codex R7) = Render (この試験は届かない https) を読めない = 判定できない = 送らずに ❌
     const r0 = cli(['--incremental', '--require-backfilled']);
-    assert.equal(r0.code, 1); assert.match(r0.out, /CDB_DB_LIMIT_BYTES/); assert.doesNotMatch(r0.out, /coordinator \(node apps/);
+    assert.equal(r0.code, 1); assert.match(r0.out, /判定できない[\s\S]*今までの送り手/); assert.doesNotMatch(r0.out, /coordinator \(node apps/);
     const rr = cli(['--from', '2026-01-01', '--to', '2026-01-31']);
-    assert.equal(rr.code, 1); assert.match(rr.out, /CDB_DB_LIMIT_BYTES/);   // バックフィルの範囲の送信は今までどおり (容量の上限が無ければ送らない)
+    assert.equal(rr.code, 1); assert.match(rr.out, /判定できない[\s\S]*単独の --from\/--to の送信/);   // 🆕 #1567 Codex R7 High 2: range も送る前に同じ門 (容量の上限より先)
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 await t('月の手数料のやり残し: 60 か月より古い月は範囲の外 = 消さずに warn・読めないファイルは warn', async () => {

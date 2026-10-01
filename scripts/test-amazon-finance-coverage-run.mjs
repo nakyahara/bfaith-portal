@@ -53,6 +53,12 @@ const log = (m) => logs.push(String(m));
 
 await initDB();
 const db = getDB();
+// 切り替えの前の DB の写し (#1567 Codex R7 High 1 の試験 = ローカルの証拠を失くした・切り替えの前のバックアップに戻した・新しい DATA_DIR)
+const snapDir = path.join(tmpDir, 'snapshots');
+fs.mkdirSync(snapDir);
+const snapOf = (src, name) => { const p = path.join(snapDir, name); src.exec(`VACUUM INTO '${p.replace(/'/g, "''")}'`); return p; };
+const SNAP_EMPTY = snapOf(db, 'empty-warehouse.db');   // initDB が作る空の DB (新しい DATA_DIR)
+let SNAP_PRE = null, SNAP_PRE_LEDGER = null;            // 取込だけの回の後 (coordinator が一度も coverage で回っていない)
 
 // ─── Render (PGlite + 本物の router) ───
 const pg = new PGlite();
@@ -174,12 +180,18 @@ await t('対照 (#1567 Codex R6 High): スイッチが無く coordinator で一�
   const { runLegacyFetch } = await import('../apps/warehouse/fetch-amazon-settlements.js');
   const SW = await import('../apps/warehouse/finance-coordinator-switch.js');
   assert.equal(SW.coverageEverRanAt(tmpDir), false, '取込だけの回 (完了印の前) は世代を作らない');
-  const out = await runLegacyFetch({ reportId: null, dryRun: false, source: 'v2' }, { db, dataDir: tmpDir, sp, inventorySp: sp, runId: 'legacy-never', downloadTsv, now: () => new Date(NOW), isAlive: () => false });
+  assert.equal(await SW.renderCoverageEverRan({ base: BASE, syncKey: 'k' }), false, 'Render にも coverage の行が無い (200 で coverage = null)');
+  const g0 = await SW.legacyGateCheck({ dataDir: tmpDir, base: BASE, syncKey: 'k' });
+  assert.deepEqual([g0.allowed, g0.code], [true, null], 'daily-sync・retry の門も通る');
+  const out = await runLegacyFetch({ reportId: null, dryRun: false, source: 'v2' }, { db, dataDir: tmpDir, sp, inventorySp: sp, runId: 'legacy-never', downloadTsv, now: () => new Date(NOW), isAlive: () => false, remote: { base: BASE, syncKey: 'k' } });
   assert.deepEqual(out.blocked, []);
   assert.ok(V.readLease(db).released_at, 'lease は放した');
   const inv = db.prepare(`SELECT ingest_run_id, coverage_generation, run_token FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get();
   assert.deepEqual([inv.ingest_run_id, inv.coverage_generation], ['legacy-never', null]);
   assert.equal(SW.coverageEverRanAt(tmpDir), false, '今までの取込は切り替えの証拠を作らない');
+  SNAP_PRE = snapOf(db, 'pre-switch-warehouse.db');
+  const L0 = new Database(path.join(tmpDir, 'company-db-push.db'));
+  try { SNAP_PRE_LEDGER = snapOf(L0, 'pre-switch-ledger.db'); } finally { L0.close(); }
 });
 
 console.log('② coverage の回');
@@ -744,7 +756,7 @@ await t('🚨 一方向のスイッチ (#1567 Codex R6 High): (a) 手の実 --fu
   const saved = process.env.CDB_FINANCE_COORDINATOR;
   const dl = [];
   const legacy = () => runLegacyFetch({ reportId: null, dryRun: false, source: 'v2' }, { db, dataDir: tmpDir, sp, inventorySp: sp, runId: `legacy-${NOW}`,
-    downloadTsv: async (id) => { dl.push(id); return downloadTsv(id); }, now: () => new Date(NOW), isAlive: () => false });
+    downloadTsv: async (id) => { dl.push(id); return downloadTsv(id); }, now: () => new Date(NOW), isAlive: () => false, remote: { base: BASE, syncKey: 'k' } });
   const envOff = { ...process.env, DATA_DIR: tmpDir, RENDER_MIRROR_URL: 'https://127.0.0.1:9/none', RENDER_PORTAL_URL: '', MIRROR_SYNC_KEY: 'k', CDB_DB_LIMIT_BYTES: '1000000000000' };
   delete envOff.CDB_FINANCE_COORDINATOR;
   const receipts = async () => one(`select count(*)::int n, coalesce(string_agg(mall_order_no || ':' || set_checksum, ',' order by mall_order_no), '') s from core.order_finance_receipts`);
@@ -784,6 +796,85 @@ await t('🚨 一方向のスイッチ (#1567 Codex R6 High): (a) 手の実 --fu
     assert.equal(cli2.status, 1, cli2.stdout + cli2.stderr); assert.match(cli2.stdout + cli2.stderr, /coordinator に切り替え済み/);
     assert.deepEqual(await cov(), before2.cov);
   } finally { if (saved === undefined) delete process.env.CDB_FINANCE_COORDINATOR; else process.env.CDB_FINANCE_COORDINATOR = saved; }
+});
+await t('🚨 Render の証拠 (#1567 Codex R7 High 1・2): ローカルの台帳・warehouse.db が無い (新しい DATA_DIR) / 切り替えの前のバックアップに戻した、でも Render に coverage の行があれば今までの取込・単独の --from/--to は ❌ (生の表・Render・受領記録は変わらない) / Render を読めない (網の失敗・404・401・409・5xx・形が違う・JSON でない・送り先が無い) = 判定できない = ❌', async () => {
+  const { runLegacyFetch } = await import('../apps/warehouse/fetch-amazon-settlements.js');
+  const SW = await import('../apps/warehouse/finance-coordinator-switch.js');
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+  const receipts = async () => one(`select count(*)::int n, coalesce(string_agg(mall_order_no || ':' || set_checksum, ',' order by mall_order_no), '') s from core.order_finance_receipts`);
+  const rawOf = (d) => d.prepare(`SELECT (SELECT COUNT(*) FROM raw_amazon_settlement_lines) l, (SELECT COUNT(*) FROM raw_amazon_settlement_headers) h, (SELECT COUNT(*) FROM amazon_settlement_document_versions) v`).get();
+  const W = { reportId: null, dryRun: false, source: 'v2' };
+  assert.ok((await cov()) && (await cov()).g, '前提: Render に coverage の行がある (coordinator が回った)');
+  assert.equal(SW.COVERAGE_STATUS_PATH, STATUS_PATH, '状態の口は coordinator と同じ');
+  const setup = (name, { warehouse, ledger }) => {
+    const d = path.join(tmpDir, `r7-${name}`); fs.mkdirSync(d);
+    fs.copyFileSync(warehouse, path.join(d, 'warehouse.db'));
+    if (ledger) fs.copyFileSync(ledger, path.join(d, 'company-db-push.db'));
+    return d;
+  };
+  const cli = (d, args) => {
+    const env = { ...process.env, DATA_DIR: d, RENDER_MIRROR_URL: 'https://127.0.0.1:9/none', RENDER_PORTAL_URL: '', MIRROR_SYNC_KEY: 'k', CDB_DB_LIMIT_BYTES: '1000000000000' };
+    delete env.CDB_FINANCE_COORDINATOR;
+    const r = spawnSync(process.execPath, ['apps/company-db/push/amazon-finance.mjs', ...args], { cwd: repoRoot, env, encoding: 'utf8' });
+    return { code: r.status, out: String(r.stdout || '') + String(r.stderr || '') };
+  };
+  // (1) ローカルに証拠が無い DB (新しい DATA_DIR = initDB が作る空の DB・台帳なし / 切り替えの前のバックアップ = 取込だけの回の後の DB と台帳) + Render に行がある = ❌
+  for (const [name, files] of [['no-local-evidence', { warehouse: SNAP_EMPTY }], ['pre-switch-backup', { warehouse: SNAP_PRE, ledger: SNAP_PRE_LEDGER }]]) {
+    const d = setup(name, files);
+    const db2 = new Database(path.join(d, 'warehouse.db'));
+    try {
+      assert.equal(SW.coverageEverRan(db2, SW.ledgerMetaReader(d)), false, `${name}: ローカルには証拠が無い`);
+      const raw0 = rawOf(db2), cov0 = await cov(), rec0 = await receipts(), dl = [];
+      await assert.rejects(() => runLegacyFetch(W, { db: db2, dataDir: d, sp, inventorySp: sp, runId: `r7-${name}`, downloadTsv: async (id) => { dl.push(id); return downloadTsv(id); },
+        now: () => new Date(NOW), isAlive: () => false, remote: { base: BASE, syncKey: 'k' } }), (e) => e.code === 'FINANCE_SWITCHED_BACK' && /Render の決済のそろい/.test(e.message), name);
+      assert.deepEqual(rawOf(db2), raw0, `${name}: 生の表は変わらない`); assert.equal(dl.length, 0, `${name}: SP-API のダウンロードもしない`);
+      assert.ok(db2.prepare(`SELECT released_at FROM amazon_finance_coverage_lease WHERE id = 1`).get().released_at, `${name}: lease は放した`);
+      const g = await SW.legacyGateCheck({ dataDir: d, base: BASE, syncKey: 'k' });
+      assert.deepEqual([g.allowed, g.code], [false, 'FINANCE_SWITCHED_BACK'], `${name}: daily-sync・retry の門も ❌`);
+      // 単独の --from/--to の送信の門 (Codex R7 High 2) も同じ = 送る前に ❌ (CLI の門と同じ関数)
+      await assert.rejects(() => SW.assertLegacyAllowedRemote(db2, SW.ledgerMetaReader(d), '単独の --from/--to の送信', { base: BASE, syncKey: 'k' }), (e) => e.code === 'FINANCE_SWITCHED_BACK');
+      assert.deepEqual(await cov(), cov0, `${name}: Render は変わらない`); assert.deepEqual(await receipts(), rec0, `${name}: 受領記録は変わらない`);
+    } finally { db2.close(); }
+  }
+  // (2) Render を読めない = 判定できない = ❌ (切り替えの前のバックアップ = ローカルに証拠が無いのに)
+  const d = path.join(tmpDir, 'r7-pre-switch-backup');
+  const db2 = new Database(path.join(d, 'warehouse.db'));
+  try {
+    const bad = [
+      ['網の失敗', async () => { throw new Error('ECONNREFUSED (作り物)'); }],
+      ['404', async () => new Response('not found', { status: 404 })],
+      ['401', async () => new Response('{"error":"unauthorized"}', { status: 401 })],
+      ['409 not_migrated', async () => new Response('{"error":"not_migrated"}', { status: 409 })],
+      ['503 が続く', async () => new Response('busy', { status: 503 })],
+      ['形が違う', async () => new Response('{"ok":true}', { status: 200 })],
+      ['世代の無い行', async () => new Response('{"coverage":{"state":"complete"}}', { status: 200 })],
+      ['JSON でない', async () => new Response('<html>', { status: 200 })],
+    ];
+    for (const [why, f] of bad) {
+      const raw0 = rawOf(db2);
+      await assert.rejects(() => runLegacyFetch(W, { db: db2, dataDir: d, sp, inventorySp: sp, runId: `r7-bad-${why}`, downloadTsv, now: () => new Date(NOW), isAlive: () => false,
+        remote: { fetchImpl: f, base: BASE, syncKey: 'k', sleep: async () => {} } }), (e) => e.code === 'FINANCE_SWITCH_UNKNOWN' && /判定できない/.test(e.message), why);
+      assert.deepEqual(rawOf(db2), raw0, `${why}: 生の表は変わらない`);
+      const g = await SW.legacyGateCheck({ dataDir: d, fetchImpl: f, base: BASE, syncKey: 'k', sleep: async () => {} });
+      assert.deepEqual([g.allowed, g.code], [false, 'FINANCE_SWITCH_UNKNOWN'], why);
+    }
+    await assert.rejects(() => SW.renderCoverageEverRan({ env: {} }), /送り先/, '送り先・鍵が無い = 判定できない');
+    let n = 0;
+    await assert.rejects(() => SW.renderCoverageEverRan({ fetchImpl: async () => { n++; return new Response('x', { status: 503 }); }, base: BASE, syncKey: 'k', sleep: async () => {} }));
+    assert.equal(n, 3, '5xx は 3 回まで読み直す');
+    n = 0;
+    await assert.rejects(() => SW.renderCoverageEverRan({ fetchImpl: async () => { n++; return new Response('x', { status: 404 }); }, base: BASE, syncKey: 'k', sleep: async () => {} }));
+    assert.equal(n, 1, '4xx は読み直さない');
+  } finally { db2.close(); }
+  // (3) 単独の --from/--to の CLI: 切り替え済み (ローカル) = 送る前に ❌ / ローカルに証拠が無くても Render を読めない = 送る前に ❌ (どちらも Render・受領記録は変わらない)
+  const cov1 = await cov(), rec1 = await receipts();
+  const c1 = cli(tmpDir, ['--from', '2026-03-01', '--to', '2026-03-01']);
+  assert.equal(c1.code, 1, c1.out); assert.match(c1.out, /coordinator に切り替え済み[\s\S]*単独の --from\/--to の送信/);
+  const c2 = cli(d, ['--from', '2026-03-01', '--to', '2026-03-01']);
+  assert.equal(c2.code, 1, c2.out); assert.match(c2.out, /判定できない[\s\S]*単独の --from\/--to の送信/);
+  assert.deepEqual(await cov(), cov1); assert.deepEqual(await receipts(), rec1);
 });
 await t('🚨 一覧の窓の空白 (前の成功した回から 85 日以上あいた) = complete にしない (⚠️ evidence_chain_gap = Seller Central で印を作り直す)・長く止まった後の取込の一覧も同じ 85 日の窓 (止まっている間に窓の外に出た report は取込まない・#1567 Codex R4)', async () => {
   NOW = Date.parse('2026-07-15T00:00:00Z');   // 前の回 (上の試験の 4/10) から 85 日より後
@@ -832,8 +923,8 @@ await t('retry-state の工程の名前はスイッチに合わせて読み替�
   assert.equal(parseFetchArgs(['--days', '14'], { coordinator: false }).dryRun, false, 'スイッチが無い = master と同じく書く');
   assert.equal(parseFetchArgs(['--days', '14', '--dry-run'], { coordinator: false }).dryRun, true);
   const fsrc = fs.readFileSync(new URL('../apps/warehouse/fetch-amazon-settlements.js', import.meta.url), 'utf8');
-  // 書く取込 = runLegacyFetch: coverage の lease を取る → その中で一方向の門 (#1567 Codex R6 High) → 取込 → 放す。main の書く回は必ずここを通る
-  assert.match(fsrc, /const got = acquireCoverageLease\(db, \{ isAlive, now: now\(\) \}\);[\s\S]{0,400}try \{\s*assertLegacyAllowed\(db, ledgerMetaReader\(dataDir\), '今までの書く取込 \(生の表を書く\)'\);\s*return await runSettlementFetch\(args, \{[^}]*lease \}\);\s*\} finally \{ releaseCoverageLease\(db, lease\); \}/, '書く取込は lease の中で門を通ってから書く');
+  // 書く取込 = runLegacyFetch: coverage の lease を取る → その中で一方向の門 (ローカル + Render・#1567 Codex R6 High / R7 High 1) → 取込 → 放す。main の書く回は必ずここを通る
+  assert.match(fsrc, /const got = acquireCoverageLease\(db, \{ isAlive, now: now\(\) \}\);[\s\S]{0,400}try \{\s*await assertLegacyAllowedRemote\(db, ledgerMetaReader\(dataDir\), '今までの書く取込 \(生の表を書く\)', remote\);\s*return await runSettlementFetch\(args, \{[^}]*lease \}\);\s*\} finally \{ releaseCoverageLease\(db, lease\); \}/, '書く取込は lease の中で門を通ってから書く');
   assert.match(fsrc, /const \{ blocked \} = args\.dryRun\s*\? await runSettlementFetch\([\s\S]{0,300}?\)\s*: await runLegacyFetch\(/, 'main の書く回は runLegacyFetch だけ');
 });
 
