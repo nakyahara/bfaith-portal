@@ -2,11 +2,11 @@
 /**
  * master-legacy-instance.mjs — 門の記録のプロセス (instance) を見る・止まったプロセスに「止めた」を書く (手の操作。⑤-3・中間レビューの続き)
  *
- * なぜ: 段階を進める DB の関数 (⑤-1) は「24 時間以内に記録があるのに、15 分以内の記録も『止めた』も無いプロセス」があれば進めない
+ * なぜ: 段階を進める DB の関数 (⑤-1) は「今までに記録を書いたプロセスで、15 分以内の記録も『止めた』も無いもの (何日前でも)」があれば進めない
  *   (黙って止まった = 古い版のまま動いているかもしれない)。ふつうは server.js が止まるとき (SIGTERM / SIGINT) に「止めた」を書くが、
  *   落ちた・電源が切れた・2 秒で書けなかったプロセスは残る → 人が確かめて (本当に止まっている) ここで「止めた」を書く。
  * 使い方:
- *   node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list                  # 最後が「止めた」でないプロセス (いつでも) と 24 時間以内のプロセスの、最後の記録・新しいか・止めたか
+ *   node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list                  # 最後が「止めた」でないプロセス (何日前でも = 段階を止めうる) と、24 時間以内に「止めた」を書いたプロセスの、最後の記録・新しいか・止めたか
  *   node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --stop --host minipc --instance <名札> --reason "再起動で消えた" --yes
  *     書くのは、その場所の門のログイン (COMPANY_DB_MASTER_GATE_RENDER_URL / _MINIPC_URL) = ⑤-1 の関数が場所と役が同じかを確かめる
  *     🚨 15 分以内に記録があるプロセス (= 動いているかもしれない) は拒む。本当に止まったのを確かめたときだけ --force (中間レビュー 2 回目 Low)
@@ -20,8 +20,8 @@ import { openPgClient } from './migrate.mjs';
 import { ackLegacyGates, gateUrlFor, GATE_URL_ENV } from '../../lib/master-legacy-gate.mjs';
 
 /**
- * プロセスごとの最後の記録。出すのは「最後が『止めた』でない (いつの記録でも)」か「hours 時間以内」のプロセス
- * (⑤-1 は、記録を書いたことのあるプロセスは全部「新しい記録」か「止めた」を求める方向 = 古くても止めていなければ出す)
+ * プロセスごとの最後の記録。出すのは「最後が『止めた』でない (何日前の記録でも)」か「hours 時間以内」のプロセス
+ * (⑤-1 は、記録を書いたことのあるプロセスは全部「新しい記録」か「止めた」を求める = 年齢では外れない。#1563 R3)
  */
 export async function listInstances(client, { hours = 24 } = {}) {
   return (await client.query(`select * from (
@@ -73,7 +73,7 @@ if (isMain) {
         try {
           const rows = await listInstances(c, { hours: Number(getArg('--hours') || 24) });
           for (const r of rows) console.log(`${r.host}\t${r.instance_id}\t最後 ${r.acked_at}\t${r.stopped ? `止めた (${r.stopped_reason})` : r.fresh ? '新しい' : '⚠️ 黙っている = 15 分より前で「止めた」も無い (段階を進められない。止まったのを確かめて --stop)'}\t段階 ${r.phase_seen}\t書きかけ ${r.inflight_count}\tbuild ${String(r.build_id).slice(0, 12)}`);
-          if (!rows.length) console.log('(止めていないプロセスも、24 時間以内の記録も無い)');
+          if (!rows.length) console.log('(止めていないプロセスも、24 時間以内に止めたプロセスも無い)');
         } finally { await c.end(); }
       }
     } else if (args.includes('--stop')) {

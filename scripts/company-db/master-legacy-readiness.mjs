@@ -8,6 +8,7 @@
  *   2. 段階を読める = 0050 が本適用済み・select の権限がある (読めないと古い入口は全部 503)
  *   3. 門のログイン: ログインの役が master_gate_<場所>・記録の関数 (ops.record_legacy_gate_ack) の実行権がある・一覧 (manifest) を DB が受け取れる形
  *   4. build の番号が分かる (Render = RENDER_GIT_COMMIT・miniPC = git の HEAD)
+ *   5. (見るだけ) 黙っているプロセス (今までに記録を書いて、15 分以内の記録も「止めた」も無い = 何日前でも) の数。⑤-1 はこれがあると段階を進めない
  * 使い方:
  *   node -r dotenv/config scripts/company-db/master-legacy-readiness.mjs --host minipc     # miniPC で
  *   node scripts/company-db/master-legacy-readiness.mjs --host render                      # Render の Shell で
@@ -61,6 +62,19 @@ export async function checkReadiness({ host, env = process.env, open = (url) => 
   // 4. build の番号
   const b = resolveBuildId({ env, fresh: true });
   if (b) ok(`build の番号 = ${b}`); else ng('build の番号が分からない (RENDER_GIT_COMMIT も git の HEAD も読めない) = 門の記録を書けない');
+  // 5. (見るだけ・足りないにはしない) 黙っているプロセス = 今までに記録を書いて、最後が 15 分より前で「止めた」でもない (何日前でも)。
+  //    ⑤-1 の段階を進める関数はこれがあると進めない (#1563 R3: 年齢では外れない)。見る接続先 = COMPANY_DB_MASTER_OPS_URL → COMPANY_DB_WATCH_URL
+  const listUrl = String(env.COMPANY_DB_MASTER_OPS_URL || '').trim() || String(env.COMPANY_DB_WATCH_URL || '').trim();
+  if (listUrl) {
+    let c = null;
+    try {
+      c = await open(listUrl);
+      const { listInstances } = await import('./master-legacy-instance.mjs');
+      const silent = (await listInstances(c)).filter((r) => !r.stopped && !r.fresh);
+      if (silent.length) lines.push(`  ⚠ 黙っているプロセス ${silent.length} 件 (段階を進められない。止まったのを確かめて master-legacy-instance.mjs --stop): ${silent.slice(0, 5).map((r) => `${r.host}/${r.instance_id}`).join(', ')}`);
+      else ok('黙っているプロセスは無い');
+    } catch (e) { lines.push(`  ⚠ 黙っているプロセスを見られない: ${String(e && e.message).slice(0, 200)}`); } finally { if (c) { try { await c.end(); } catch { /* */ } } }
+  }
   return { ok: problems.length === 0, problems, lines };
 }
 

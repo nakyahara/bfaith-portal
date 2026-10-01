@@ -18,7 +18,7 @@
  *  11 配る前の確かめ (scripts/company-db/master-legacy-readiness.mjs): そろっていれば ok・場所と役が違えば「足りない」
  *  12 門のログインの接続は、同時に 20 件の読み + 記録を書いても 2 本まで (プール 1 本 + 記録 1 本)
  *  13 env の取り違え (miniPC の env に Render のログイン) = ⑤-1 の関数が gate_host_mismatch で拒む・何も書かない
- *  14 ⑤-3 の記録で ⑤-1 の段階の関数が frozen に進める。黙っているプロセス (24 時間以内に記録・最後が 15 分より前・止めたでもない) があれば拒む
+ *  14 ⑤-3 の記録で ⑤-1 の段階の関数が frozen に進める。黙っているプロセス (今までに記録・最後が 15 分より前 (何日前でも)・止めたでもない) があれば拒む
  *     → scripts/company-db/master-legacy-instance.mjs で「止めた」を書けば進める
  *  15 読む時間を測る (scripts/company-db/master-legacy-latency.mjs・読むだけ)
  *  16 配り直し (古いプロセスの普通の記録が書いている途中に SIGTERM・新しいプロセスが起動): 古いプロセスは途中の記録を待ってから「止めた」を 1 回。
@@ -227,6 +227,7 @@ try {
     const before = await ackCount();
     let r = await checkReadiness({ host: 'minipc', env });
     assert.equal(r.ok, true, r.lines.join('\n'));
+    assert.ok(r.lines.some((l) => l.includes('黙っているプロセスは無い')), r.lines.join('\n'));
     r = await checkReadiness({ host: 'render', env: { ...env, COMPANY_DB_MASTER_GATE_RENDER_URL: gateUrl('minipc') } });
     assert.equal(r.ok, false); assert.ok(r.problems.some((x) => /master_gate_minipc/.test(x) && /期待 master_gate_render/.test(x)), r.lines.join('\n'));
     r = await checkReadiness({ host: 'minipc', env: { COMPANY_DB_WATCH_URL: process.env.COMPANY_DB_WATCH_URL } });
@@ -265,15 +266,23 @@ try {
     const manifest = G.legacyManifest();
     const mh = await C.manifestHashOf(db, manifest);
     const oh = C.ownershipHash(MASTER_OWNERSHIP);
-    // 1 時間前の記録だけのプロセス (落ちて「止めた」を書けなかった) = 黙っている
+    // 2 日前の記録だけのプロセス (落ちて「止めた」を書けなかった) = 黙っている (年齢では外れない = ⑤-1 #1563 R3)
     await M.query(`insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, session_role, acked_at)
-      values ('minipc', 'old-pc:1:aaaaaaaa', $1, $2, $3, 'legacy_open', 0, 'master_gate_minipc', clock_timestamp() - interval '1 hour')`, ['b'.repeat(40), mh, oh]);
+      values ('minipc', 'old-pc:1:aaaaaaaa', $1, $2, $3, 'legacy_open', 0, 'master_gate_minipc', clock_timestamp() - interval '2 days')`, ['b'.repeat(40), mh, oh]);
+    // 証拠の時刻は今の段階に入った後・サーバーの今以前 (⑤-1 #1563 R3) = サーバーの今を使う
+    const at = (await M.query('select clock_timestamp()::text as t')).rows[0].t;
     const evidence = {
       expected_builds: { render: ['b'.repeat(40)], minipc: ['b'.repeat(40)] }, manifest_hash: mh, owner_hash: oh,
-      manual_entries_stopped: manifest.entries.filter((x) => x.kind === 'manual').map((x) => ({ id: x.id, by: 'test', at: '2026-10-01T00:00:00Z' })),
-      drain: { done: true, checked_by: 'test', checked_at: '2026-10-01T00:00:00Z' },
+      manual_entries_stopped: manifest.entries.filter((x) => x.kind === 'manual').map((x) => ({ id: x.id, by: 'test', at })),
+      drain: { done: true, checked_by: 'test', checked_at: at },
     };
     await assert.rejects(() => C.advanceCutoverPhase(db, { to: 'frozen', actor: 'test', evidence }), /old-pc:1:aaaaaaaa: 黙っている/);
+    // 配る前の確かめにも出る (見るだけ = 足りないにはしない) / --list にも出る (2 日前でも)
+    const { checkReadiness } = await import('./company-db/master-legacy-readiness.mjs');
+    const ready = await checkReadiness({ host: 'minipc', env });
+    assert.equal(ready.ok, true); assert.ok(ready.lines.some((l) => l.includes('黙っているプロセス 1 件') && l.includes('old-pc:1:aaaaaaaa')), ready.lines.join('\n'));
+    const { listInstances } = await import('./company-db/master-legacy-instance.mjs');
+    assert.ok((await listInstances(M)).some((x) => x.instance_id === 'old-pc:1:aaaaaaaa' && !x.stopped && !x.fresh), '2 日前でも止めていなければ一覧に出る');
     const st = await markStopped({ host: 'minipc', instance: 'old-pc:1:aaaaaaaa', reason: '再起動で消えたのを確かめた (試験)', env });
     assert.equal(st.state, 'stopped', JSON.stringify(st));
     const r = await C.advanceCutoverPhase(db, { to: 'frozen', actor: 'test', evidence });

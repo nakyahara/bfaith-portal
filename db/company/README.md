@@ -754,7 +754,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   - 定期実行: product-hub の NE が先の自動取込 (intake-cron) は丸ごと止める (閉じている = ok の ping で「止めた」・読めない = fail の ping)。
 - **段階の読み方**:
   - 接続先 = この場所の門のログイン (下) → 無ければ `COMPANY_DB_URL` (Render)。🚨 見張りの `COMPANY_DB_WATCH_URL` (watcher・接続 3 本まで) には落ちない = miniPC は門のログインが無いと古い入口が全部 503。
-  - 🚨 書き込み・CLI は**毎回**読む。前に読めた値は使わない。プロセスごとに接続 **1 本**のプールを 10 分つないだままにする (miniPC → Render はつなぎ直すと TLS と認証で 0.5〜0.8 秒) と 1 回の読み直し (200ms 後)。門の記録もこの 1 本で書く = プロセスあたり 1 本 (配り直しで古い + 新しいが重なっても 2 本)。読めない = 503 / 終了コード 3。
+  - 🚨 書き込み・CLI は**毎回**読む。前に読めた値は使わない。プロセスごとに接続 **1 本**のプールを 10 分つないだままにする (miniPC → Render はつなぎ直すと TLS と認証で 0.5〜0.8 秒) と 1 回の読み直し (200ms 後)。門の記録もこの 1 本で書く = プロセスあたり 1 本 (配り直しで古い + 新しいが重なっても 2 本。門のログインの接続の上限は ⑤-1 で 8)。読めない = 503 / 終了コード 3。
   - 画面の帯だけ前の結果を使う (読めた = 30 秒・読めない = 5 秒)。古ければ同時の画面で 1 回の読みを分け合い、1 秒待つ (読み直さない・表示だけ)。1 秒で返らない = その画面だけ 5 分前までの読めた結果を見せる (無ければ読めない扱い)。打ち切りは使い回さず、遅れて返った結果を使い回しに入れる。
   - 読めなかった回数・断った回数 (410・503)・切れた相手・画面の打ち切り・書かない試しを通した回数・読むのにかかった時間は読み戻しに出す。1 秒を超えた読みと読めなかった回はログに出す。
   - 読む時間を測る (読むだけ): `node -r dotenv/config scripts/company-db/master-legacy-latency.mjs --host minipc` = つなぎ直し + 読む / つないだまま読む の p50・p95・いちばん遅い。
@@ -771,7 +771,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   - miniPC の WarehouseServer は WinSW のサービス (止めるときは Ctrl+C = Node の SIGINT のはずだが、届いたか・2 秒で書けたかは分からない) → **次の起動で、前の起動のプロセスが居なければ「止めた」を書く** (名札は `DATA_DIR/master-legacy-instance.json`)。前の pid がまだある (使い回しを含む)・別の PC = 書かない (安全側)。Render は止めるとき SIGTERM を送り待つので使わない。
   - 中身: host・プロセスの名札 (`RENDER_INSTANCE_ID` か PC 名 + pid + 起動の乱数)・build の番号 (Render = `RENDER_GIT_COMMIT`・miniPC = git の HEAD)・一覧 (manifest `{ entries: [{ id, kind: code | manual }] }`・ハッシュは DB が計算)・持ち主表・見た段階・書きかけの件数といちばん古い開始。
   - 書く前に確かめる (場所・build の番号・段階を読める・門のログインがある・関数がある)。書いた後に返事 (`ack_id`・DB が同じ一覧から計算した `manifest_hash`・`acked_at`・`stopped`) を確かめてから `acked`。だめなら書かずに理由をログ (同じ理由は 1 回) と読み戻しに出す (関数が無い = 0050 の前 = 注意 1 回)。書く間に段階が変わった (`stale_phase`) = 読み直して 1 回だけ書き直す。
-  - 止まり方が分からないプロセス (落ちた・電源・2 秒で書けなかった) = ⑤-1 の段階を進める関数は「24 時間以内に記録があり、最後の記録が 15 分より前で『止めた』でもない」プロセスがあると進めない → 人が止まったのを確かめて `node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list` / `--stop --host minipc --instance <名札> --reason "…" --yes` (手の操作・定期実行にしない)。🚨 15 分以内に記録があるプロセスは `--force` が無いと拒む (動いているかもしれない)。
+  - 止まり方が分からないプロセス (落ちた・電源・2 秒で書けなかった) = ⑤-1 の段階を進める関数は「今までに 1 回でも記録を書いたプロセスで、最後の記録が 15 分より前 (何日前でも) で『止めた』でもない」プロセスがあると進めない (年齢では外れない = 止めたプロセスには必ず「止めた」が要る) → 人が止まったのを確かめて `node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list` / `--stop --host minipc --instance <名札> --reason "…" --yes` (手の操作・定期実行にしない)。🚨 15 分以内に記録があるプロセスは `--force` が無いと拒む (動いているかもしれない)。
 - **読み戻し**: `GET /apps/warehouse/api/master-legacy-gate` (miniPC と Render の両方にある) = その環境・**その 1 つのプロセス**が見ている段階・書けるか・manifest_hash (最後に DB が受け取った一覧)・一覧の数・持ち主表のハッシュ・build の番号・名札・書きかけ (`inflight.count`・`oldest_started_at`)・数・門の記録 (呼ぶと記録も書き直す)。全部のプロセスは `master-legacy-instance.mjs --list` で見る。
 - 🚨 **マージの前に** (PR の本文のチェックリスト。miniPC の PowerShell 5.1 で。まだ流さない → 中原さんの OK の後):
   - ⚠️ **この PR は後方互換ではない (今の環境のままでは動かない)**: 0050 の本適用・**両方**の門のログインの env (Render の `COMPANY_DB_MASTER_GATE_RENDER_URL`・miniPC の `COMPANY_DB_MASTER_GATE_MINIPC_URL`)・配る前の確かめ (readiness が両方とも終了コード 0) が**そろうまでマージしない**。どれか欠けたまま配る = その場所の古い入口 (/register・会計アプリ・税率・仕入先・手の取込) が全部 503 / 終了コード 3 で止まる。
@@ -781,12 +781,12 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
      - miniPC: `node -r dotenv/config scripts/company-db/master-legacy-readiness.mjs --host minipc` が終了コード 0。
      - Render: Render の門のログインをこの 1 回だけ渡す: `$env:COMPANY_DB_MASTER_GATE_RENDER_URL = '<Render の門のログイン>'; node -r dotenv/config scripts/company-db/master-legacy-readiness.mjs --host render; Remove-Item Env:COMPANY_DB_MASTER_GATE_RENDER_URL` が終了コード 0 (役 = master_gate_render・関数の実行権・一覧の形)。
      - 読む時間: `node -r dotenv/config scripts/company-db/master-legacy-latency.mjs --host minipc` の p95 を PR に残す (つなぎ直しの p95 が 1 秒を超える = 起動の直後などは画面が 5 分前の結果か帯になる。書き込みは待つので止まらない)。
-  4. マージして配った後: `node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list` で、Render と miniPC の**全部のプロセス**が「新しい」・段階 `legacy_open`・書きかけ 0・build = 配った commit。配る前の古いプロセスは「止めた」(または 24 時間より前)。黙っている古いプロセスが残る = 止まったのを確かめて `--stop` (再起動の後は毎回見る)。
+  4. マージして配った後: `node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list` で、Render と miniPC の**全部のプロセス**が「新しい」・段階 `legacy_open`・書きかけ 0・build = 配った commit。配る前の古いプロセスは全部「止めた」(何日前のプロセスでも、止めたが無ければ段階を進められない)。黙っている古いプロセスが残る = 止まったのを確かめて `--stop` (再起動の後は毎回見る)。
   5. **戻し方**: 配った後に古い入口が 503 のまま・門の記録が書けない = このマージを revert する PR → Render は自動で配り直し・miniPC は `git pull` → `Restart-Service WarehouseServer`。DB は何も変えていない (段階は legacy_open のまま・門の記録は追記だけで残っても害が無い)。🚨 **段階を frozen に進めた後は revert しない** (門の無いコードに戻る = 古い入口が開く)。
 - **切替の手順 (legacy_open → frozen → 最後の同期。⑤-1 の関数の求めに合わせる)**:
-  1. 上の 4 がそろっている (全部のプロセスが新しい記録・同じ build と一覧)。
-  2. NE の画面・GAS など機械で閉じられない入口 (manifest の `kind: manual` = `ne:item-screen`・`gas:logizard-sheet-and-sku-map`) を止め、止めた人と時刻を証拠 (`manual_entries_stopped`) に書く。
-  3. miniPC で手の取込 (csv-import ほか) が動いていないのを確かめ、`--list` の書きかけが全部 0 = 証拠の `drain` (`{ done: true, checked_by, checked_at }`。**frozen に進めるときに要る**) を書いて、段階を `frozen` に進める (⑤-1 の関数が、全部の場所・全部のプロセスの新しい記録・build・一覧・持ち主表・黙っているプロセスが無いこと・証拠を確かめる)。
+  1. 上の 4 がそろっている (全部のプロセスが新しい記録・同じ build と一覧。今までに記録を書いて止めたプロセスは全部「止めた」)。
+  2. NE の画面・GAS など機械で閉じられない入口 (manifest の `kind: manual` = `ne:item-screen`・`gas:logizard-sheet-and-sku-map`) を止め、止めた人と時刻を証拠 (`manual_entries_stopped` の `at`) に書く。🚨 `at` は**今の段階に入った後・サーバーの今以前** (先の日付・前の試みの証拠は ⑤-1 の関数が拒む = 進める日に止めて、その時刻を書く)。
+  3. miniPC で手の取込 (csv-import ほか) が動いていないのを確かめ、`--list` で全部のプロセスが「新しい」かつ書きかけ 0 = 証拠の `drain` (`{ done: true, checked_by, checked_at }`。`checked_at` も今の段階に入った後・今以前) を書いて、段階を `frozen` に進める。⑤-1 の関数が確かめるもの: 全部の場所・全部のプロセスの新しい記録・build・一覧・持ち主表・**書きかけ 0 (→ frozen でも)**・黙っているプロセスが無いこと (何日前でも)・証拠。
   4. 🚨 **frozen の後の本当の drain**: `--list` で全部のプロセスに**段階 `frozen` の新しい記録**が来て、書きかけが 0 になるまで待つ (記録は要求のついでに 5 分おき。読み戻しを呼べばすぐ書く)。⑤-1 の関数は frozen → company_owner のときに「frozen に入った後の記録・書きかけ 0」を求める。CLI は書いている間は共有の鍵を持つので、段階を変える側が待つ (段階をまたいで書かない)。
   5. そこで初めて最後の同期 (NE → Company DB) に進み、company_owner に進める。
 - 書き込みの猶予 (legacy_open を最後に読めてから 60 秒などは書かせる) は**入れていない** (約束を変えるので中原さんが決める。案と良し悪しは PR の本文)。
