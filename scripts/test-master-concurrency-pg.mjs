@@ -19,6 +19,10 @@
  *  14 0040 照合の完了 × CSV を作る: 照合が完了を書いている途中は、CSV を作る側が候補の行で待つ → 完了の commit の後は、完了した承認を入れない (候補の行を取った後に読み直す)
  *  15 0040 同じ単位の別の指紋: 画面が別の指紋を却下している途中 (候補の行は重ならない) でも、CSV を作る側は CSV の鍵で待つ → 置き換わった承認を予約しない (H1・H3)
  *  16 0041 NE の元のコード: 照合が元のコードを書いている途中は CSV を作る側が共有の鍵で待ち、書き終えた新しい回の書き方で作る / CSV の操作の途中は照合の書き手が待つ (③b-1b H2)
+ *  17 0053 持ち主の epoch: 2 人が同時に最初の prepare = 後の人は前の人の commit を待ってから通る (重複で落ちない・init は 1 回) (④a・Codex #1564 R1 H1)
+ *  18 0053 activate × cancel: cancel の途中は activate が行の鍵で待ち、cancel の後は「prepared が無い」で断る (active は変わらない)
+ *  19 0053 activate × activate: 同時に 2 回 = 1 回だけ通る (記録も 1 件)・夜間ロードは新しい active を読む・変更の記録は消せない
+ *  20 0053 activate × 同じ持ち主の prepare のやり直し: やり直しの途中は activate が行の鍵で待ち、やり直しの後は前の証拠 (前の prepare の時刻) では断る (#1564 Codex R2 Medium 4)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-concurrency-pg.mjs
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す)。localhost 以外の URL は拒む (本番を渡さない)。package.json の試験には入れない (PostgreSQL が要る)
  */
@@ -387,6 +391,87 @@ try {
       for (const c of [S, D]) { try { await c.end(); } catch { /* */ } }
       for (const n of names) { try { await admin.query(`drop database ${n}`); } catch (e) { console.error(`DB を消せない: ${e.message}`); } }
     }
+  });
+  // ── 0053 持ち主の epoch (④a・Codex #1564 R1 H1) ──
+  const OS = await import('../apps/company-db/load/ownership-state.mjs');
+  const ownOf = (k) => ({ ...OS.ALL_LOAD, [k]: 'company' });
+  const allHash = OS.ownershipHashOf(OS.ALL_LOAD);
+  // activate は切替の段階 (⑤-1 の ops.master_cutover_state) が frozen のときだけ = 最小の形で用意する (⑤-1 の表があれば守りの印を立てて直す)
+  //   (⑤-1 の 0051 の表 = 段階の守りを通さずに置く試験の近道: この取引だけ trigger を止める。本番は ops.set_master_cutover_phase だけ)
+  await M.query('begin');
+  await M.query('set local session_replication_role = replica');
+  await M.query("update ops.master_cutover_state set phase = 'frozen', owner_hash = null where id = 1");
+  await M.query('commit');
+  // 0001〜0053 が本物の PostgreSQL でそろって入る (master 0050 → ⑤-1 0051 → ⑤-2a 0052 → ④a 0053)
+  assert.deepEqual((await M.query("select version from ops.schema_migrations where version in ('0051', '0052', '0053') order by 1")).rows.map((r) => r.version), ['0051', '0052', '0053']);
+  assert.deepEqual((await M.query('select name from ops.master_cutover_prereq_checks order by 1')).rows.map((r) => r.name), ['0052_registrations']);
+  await ta('[17] 0053 2 人が同時に最初の prepare = 後の人は前の人の commit を待ってから通る (重複で落ちない・init は 1 回)', async () => {
+    await A.query('begin');
+    await A.query(`insert into ops.master_ownership_state (id, active_hash, active_map, activated_by) values (1, $1, $2::jsonb, 'A') on conflict (id) do nothing`, [allHash, JSON.stringify(OS.sortedOwnership(OS.ALL_LOAD))]);
+    await A.query(`insert into ops.master_ownership_events (action, ownership_hash, ownership, actor) values ('init', $1, $2::jsonb, 'A')`, [allHash, JSON.stringify(OS.sortedOwnership(OS.ALL_LOAD))]);
+    const b = launch(OS.prepareOwnership(pgAdapter(Bc), { map: ownOf('sku_costs'), actor: 'B' }));
+    await sleep(400);
+    assert.equal(b.done, false, 'B が A の行を待っていない');
+    await A.query('commit');
+    const rb = await b.promise;
+    assert.ok(rb.ok, rb.err && rb.err.message);
+    const st = await OS.readOwnershipState(pgAdapter(M));
+    assert.deepEqual([st.active.hash, st.prepared.hash], [allHash, OS.ownershipHashOf(ownOf('sku_costs'))]);
+    assert.deepEqual((await M.query('select action from ops.master_ownership_events order by event_id')).rows.map((r) => r.action), ['init', 'prepare']);
+  });
+  await ta('[18] 0053 activate × cancel: cancel の途中は activate が待ち、cancel の後は「prepared が無い」で断る (active は変わらない)', async () => {
+    await A.query('begin');
+    await A.query('select 1 from ops.master_ownership_state where id = 1 for update');
+    const pAt = (await OS.readOwnershipState(pgAdapter(M))).prepared.prepared_at;
+    const b = launch(OS.activateOwnership(pgAdapter(Bc), { expectHash: OS.ownershipHashOf(ownOf('sku_costs')), expectPreparedAt: pAt, actor: 'B', evidence: { build_id: 'x' } }));
+    await sleep(400);
+    assert.equal(b.done, false, 'activate が行の鍵で待っていない');
+    await A.query('update ops.master_ownership_state set prepared_hash = null, prepared_map = null, prepared_at = null, prepared_by = null where id = 1');
+    await A.query(`insert into ops.master_ownership_events (action, ownership_hash, ownership, actor) values ('cancel_prepare', $1, $2::jsonb, 'A')`, [OS.ownershipHashOf(ownOf('sku_costs')), JSON.stringify(ownOf('sku_costs'))]);
+    await A.query('commit');
+    const rb = await b.promise;
+    assert.equal(rb.err && rb.err.code, 'NO_PREPARED_OWNERSHIP', rb.err ? rb.err.message : 'activate が通ってしまった');
+    const st = await OS.readOwnershipState(pgAdapter(M));
+    assert.deepEqual([st.active.hash, st.prepared], [allHash, null]);
+  });
+  await ta('[19] 0053 activate × activate: 同時に 2 回 = 1 回だけ通る・夜間ロードは新しい active を読む・変更の記録は消せない', async () => {
+    const want = OS.ownershipHashOf(ownOf('skus.shipping'));
+    await OS.prepareOwnership(pgAdapter(M), { map: ownOf('skus.shipping'), actor: 'M' });
+    const pAt = (await OS.readOwnershipState(pgAdapter(M))).prepared.prepared_at;
+    const a = launch(OS.activateOwnership(pgAdapter(A), { expectHash: want, expectPreparedAt: pAt, actor: 'A', evidence: { build_id: 'a' } }));
+    const b = launch(OS.activateOwnership(pgAdapter(Bc), { expectHash: want, expectPreparedAt: pAt, actor: 'B', evidence: { build_id: 'b' } }));
+    const [ra, rb] = [await a.promise, await b.promise];
+    assert.equal([ra, rb].filter((r) => r.ok).length, 1, JSON.stringify([ra.err && ra.err.message, rb.err && rb.err.message]));
+    assert.equal([ra, rb].find((r) => r.err).err.code, 'NO_PREPARED_OWNERSHIP');
+    const st = await OS.readOwnershipState(pgAdapter(M));
+    assert.deepEqual([st.active.hash, st.prepared], [want, null]);
+    assert.equal((await M.query("select count(*)::int as n from ops.master_ownership_events where action = 'activate'")).rows[0].n, 1);
+    const ep = await OS.resolveLoadOwnership(pgAdapter(M));
+    assert.deepEqual([ep.epoch, ep.hash, ep.ownership['skus.shipping']], ['active', want, 'company']);
+    await assert.rejects(M.query('delete from ops.master_ownership_events'), /足すだけ/);
+    await assert.rejects(M.query("update ops.master_ownership_state set prepared_hash = active_hash, prepared_map = active_map, prepared_at = now() where id = 1"), /ck_master_ownership_prepared_differs/);
+  });
+  await ta('[20] 0053 activate × 同じ持ち主の prepare のやり直し: やり直しの途中は activate が待ち、やり直しの後は前の証拠では断る (active は変わらない)', async () => {
+    const map = ownOf('skus.tax_class');
+    await OS.prepareOwnership(pgAdapter(M), { map, actor: 'M' });
+    const before = (await OS.readOwnershipState(pgAdapter(M)));
+    const oldAt = before.prepared.prepared_at, activeBefore = before.active.hash;
+    // A が同じ持ち主で prepare をやり直している (行の鍵を持ったまま)
+    await A.query('begin');
+    await A.query('select 1 from ops.master_ownership_state where id = 1 for update');
+    await A.query("update ops.master_ownership_state set prepared_at = now() + interval '1 second' where id = 1");
+    const b = launch(OS.activateOwnership(pgAdapter(Bc), { expectHash: OS.ownershipHashOf(map), expectPreparedAt: oldAt, actor: 'B', evidence: { build_id: 'old' } }));
+    await sleep(400);
+    assert.equal(b.done, false, 'activate が行の鍵で待っていない');
+    await A.query('commit');
+    const rb = await b.promise;
+    assert.equal(rb.err && rb.err.code, 'PREPARED_CHANGED', rb.err ? rb.err.message : 'activate が通ってしまった');
+    const st = await OS.readOwnershipState(pgAdapter(M));
+    assert.deepEqual([st.active.hash, st.prepared.hash], [activeBefore, OS.ownershipHashOf(map)]);
+    assert.ok(st.prepared.prepared_at > oldAt);
+    // 新しい時刻で集め直した証拠なら通る
+    const ok = await OS.activateOwnership(pgAdapter(Bc), { expectHash: OS.ownershipHashOf(map), expectPreparedAt: st.prepared.prepared_at, actor: 'B', evidence: { build_id: 'new' } });
+    assert.equal(ok.active_hash, OS.ownershipHashOf(map));
   });
 } finally {
   for (const c of [A, Bc, M]) { try { await c.end(); } catch { /* */ } }

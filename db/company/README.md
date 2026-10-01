@@ -1755,3 +1755,33 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
 - 価格の比較 (v_product_360 の min/max、v_cross_mall_diff) は **単品出品 (構成 1 行・qty=1)** だけ。組合せ出品の価格を単品の価格にしない
 - 月パーティションは `snapshots.ensure_month_partitions(from, to)` で作る。作り忘れても default に入って落ちない。**後から作ると default の行をその月に移してから attach する** (同一トランザクション)
 - 実行器: 番号は 0001 からの連番 (欠番は不正)。DB に適用記録があるのにファイルが無い checkout では流さない
+
+## 持ち主の epoch (0053。マスタ正本切替 ④a・Codex #1564 R1 H1)
+
+列ごとの持ち主 (`config/master-ownership.mjs`) を 3 つに分ける。**config を書き換えてデプロイしただけでは何も変わらない**:
+- **configured** = config/master-ownership.mjs (コードに書いた「こうしたい」)
+- **prepared** = 人が `master-ownership-epoch.mjs prepare` で記録した「次にこれにする」。明示して頼んだロード (`--use-prepared`) と、その後の写しの世代だけが使う
+- **active** = 今使っている持ち主 (`ops.master_ownership_state`)。毎晩の夜間ロード・miniPC の写し (fetch.mjs)・m_products の作り直しはこれ。**行が無い = 全部 load** (今)
+- 変更の記録 = `ops.master_ownership_events` (足すだけ。init / prepare / cancel_prepare / activate と、activate のときの確かめの証拠)
+- 記録の後に足した列 (後の PR で `OWNED_COLUMNS` に足した列 = 記録した持ち主に無い列) = **'load' として足す** (夜間ロード・写しは止まらない。`status` の `filled_as_load` に出る)。知らない列・知らない値・ハッシュが中身と違う = 壊れ (推測しない = 止める)
+
+切替の日の順番 (⑤-3 の切替の手順の中。🚨 **古い書き込み口 (/register など) を閉じるのは ⑤-3 = 持ち主を変える前に閉じる**。0050 では閉じない):
+1. config/master-ownership.mjs を書き換えてデプロイ (ここでは何も変わらない)
+2. miniPC: `node scripts/company-db/master-ownership-epoch.mjs prepare` (一緒に切り替える組・④a が写さない列を確かめて記録)
+3. `node scripts/company-db/remote-load.mjs load --apply --wait --use-prepared` (prepared の持ち主で 1 回だけロード)
+4. miniPC: `node apps/company-db/publish/fetch.mjs` → `node apps/warehouse/rebuild-m-products.js` → `node apps/company-db/publish/fetch.mjs --verify-apply` (prepared の世代を入れて確かめる)
+5. miniPC: `node scripts/company-db/master-ownership-epoch.mjs activate` (最新の作り直しが prepared の世代・その世代が prepare の後に Company DB を読んだ・今朝の確かめが通った・読み直しても同じ、
+   かつ **⑤-1 の切替の段階 (`ops.master_cutover_state`) が `frozen`** (古い入口を止めた後・持ち主を C にする前) のときだけ active に。足りなければ理由を出して断る。段階の表が無い = 断る。
+   証拠を集めたときの prepare の時刻を行の鍵の後に比べる = その間に prepare をやり直したら `PREPARED_CHANGED` で断る (やり直しは 3 から))
+- 途中で止める = `master-ownership-epoch.mjs cancel` (prepared を消す。active はそのまま = 毎晩は前の持ち主)。今の状態 = `master-ownership-epoch.mjs status`
+
+**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0053 は表を 2 つ足すだけ (行は作らない = 全部 load のまま = 何も変わらない)。
+🚨 **番号**: master 0050 (finance_coverage) → ⑤-1 0051 (master_edit・本番に入っている) → ⑤-2a 0052 → この 0053 の順に積む。⑤-2b も 0053 を使う = 後にマージされる方を 0054 に付け替える (migrate.mjs は欠番・重複を拒む)。
+🚨 **デプロイは Render と miniPC を同じ日に**: 夜間ロードの規則の指紋 (`engine.mjs` の `LOAD_RULE_FILES`) に `apps/company-db/load/ownership-state.mjs` が入った (engine.mjs も変わった)。
+Render (夜間ロード) と miniPC (朝の照合 ①) のコードが違う日は、朝の照合 ① が「規則の指紋がこのコードと違う」で判定できない (blocked) になる。同じ日の夜間ロードの前に両方をそろえる
+
+```
+node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                 # 0053 だけが出ること (0052 = ⑤-2a は先に入っている)
+node -r dotenv/config scripts\company-db\migrate.mjs                           # 0053 (applied=1)
+node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     # state = missing (行が無い = 全部 load)
+```

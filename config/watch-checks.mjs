@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v15';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復) / v13 (9/26): Yahoo を ORDER_MALLS に (売上日次を公開しないモール = W9 なし・W8 は件数と取消率・W6 の公開の確認から外す) / v14 (9/27): W14 (広告費の取込の完了と検算。Company DB構想 11 の ③) / v15 (9/28): Yahoo の売上日次を公開 (salesDaily: false を外す = W9 に Yahoo・W8 は売上も・W6 の公開の確認にも入る)
+export const CHECKS_VERSION = 'v16';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復) / v13 (9/26): Yahoo を ORDER_MALLS に (売上日次を公開しないモール = W9 なし・W8 は件数と取消率・W6 の公開の確認から外す) / v14 (9/27): W14 (広告費の取込の完了と検算。Company DB構想 11 の ③) / v15 (9/28): Yahoo の売上日次を公開 (salesDaily: false を外す = W9 に Yahoo・W8 は売上も・W6 の公開の確認にも入る) / v16 (10/1): W13 に評価キー old (②b 古い表。④a)
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -273,10 +273,12 @@ export const CHECKS = [
   { id: 'W12', version: 'v1', title: 'DB の容量', severity: 'warn', depends: [], issuePerItem: false,
     what: `今の DB の大きさ (pg_database_size) と、直近 ${W12_HISTORY_DAYS} 日の日ごとの増え分の中央値から、容量 (${Math.round(W12_DISK_BYTES / 1024 ** 3)} GB) まで ${W12_MIN_REMAINING_DAYS} 日を切る・${Math.round(W12_WARN_BYTES / 1024 ** 3)} GB を超えたら異常。Render の容量の監視の代わりではない。${W12_INFO_UNTIL} までは info`,
     runbook: 'Render のダッシュボードで Postgres のディスクを確かめ、大きい表 (pg_total_relation_size) と整理 (raw の 30 日・日次の整理) を見る。足りなければプラン / ディスクを上げる (中原さん判断)' },
-  { id: 'W13', version: 'v2', title: 'マスタの照合 (ロードの検証・NE との照合)', severity: 'info', depends: [], issuePerItem: true,
+  { id: 'W13', version: 'v3', title: 'マスタの照合 (ロードの検証・NE との照合・古い表)', severity: 'info', depends: [], issuePerItem: true,
     what: '評価キー load = 夜間ロードが実際に読んだ材料 (miniPC の控え) から作り直した「ロードの後にあるべき値」と今の Company DB の差 (SKU が無い / 値 / 原価 / 代表の仕入先 / セット構成)。ロードの時の判断・持ち主・条件で比べる。夜間ロードが今日でない・材料が matched でない・規則の指紋違い・判断の記録が無い・控えが無い は blocked。'
-      + '評価キー ne = Company DB と NE の最後まで取れた回の差 (値・原価・代表の仕入先・構成・有無・種別。分類 = 反映待ち・作り直しの理由・NE に値が無い・ロードが保持・説明できない ほか)。案件ごとに保持 (比べられない・判定できない) と明示の回復 (全部の列が一致したときだけ)。② が判定できない朝は blocked。切替までは全部 info (判断の一覧)',
-    runbook: 'db/company/README.md「マスタの照合」。load: 差の明細の change_candidates (ロードの後の変更の候補) で書き手を見る。ロードの誤りなら engine.mjs / sources.mjs を直す。ne: 全件 JSON の ne.items の列ごとの分類と ne.decisions (判断の一覧) を見る。unexplained は作り直し・ロード・NE のどこで違ったかを n / t_today / t_load / c で追う' },
+      + '評価キー ne = Company DB と NE の最後まで取れた回の差 (値・原価・代表の仕入先・構成・有無・種別。分類 = 反映待ち・作り直しの理由・NE に値が無い・ロードが保持・説明できない ほか)。案件ごとに保持 (比べられない・判定できない) と明示の回復 (全部の列が一致したときだけ)。② が判定できない朝は blocked。切替までは全部 info (判断の一覧)。'
+      + '評価キー old = ②b 持ち主が C で NE に欄が無い列 (税区分・売上分類・送料・推奨保有月数) の Company DB ↔ 古い表 (m_products・product_shipping・m_reorder_setting)。世代にあった値が無い (breach)・翌朝の作り直しでも違う (overdue) を案件に。反映待ちは案件にしない。持ち主が全部 load = 比べない (pass)',
+    runbook: 'db/company/README.md「マスタの照合」。load: 差の明細の change_candidates (ロードの後の変更の候補) で書き手を見る。ロードの誤りなら engine.mjs / sources.mjs を直す。ne: 全件 JSON の ne.items の列ごとの分類と ne.decisions (判断の一覧) を見る。unexplained は作り直し・ロード・NE のどこで違ったかを n / t_today / t_load / c で追う。'
+      + 'old: 全件 JSON の old_tables.items (c = C の今の値・generation_value = 作り直しが使った世代の値・old = 古い表の値)。breach = 作り直しの後に古い画面・手で古い表が書き換えられた? (証跡 master-publish の apply も見る)・overdue = 写し・作り直しが翌朝も入っていない' },
   { id: 'W14', version: 'v1', title: '広告費の取込の完了と検算', severity: 'warn', depends: [], issuePerItem: false,
     what: `今朝の広告費の送信の証跡 (同じ daily-sync の回。「昨日」の日付・世代が読めなければ blocked) で失敗・Render の方が新しい取得で書かなかった日 (stale) が無い・昨日の取得の記録が miniPC にある・Company DB の昨日の日が今朝の取得の世代・Company DB の昨日の合計がキャンペーンの合計と ${W14_CAMPAIGN_TOL_JPY} 円 / ${W14_CAMPAIGN_TOL_SHARE * 100}% の大きい方の差まで (証跡の campaign_check = 送った取得と同じ世代・同じ SKU 別の合計のものだけ使う。結びつかない・キャンペーンの合計が無ければ blocked)・SKU なのに出品が分からない費用が ${W14_MAX_UNRESOLVED_SHARE * 100}% 以下。証跡が無い (取込が失敗して送信を見送った) は blocked。${W14_INFO_UNTIL} までは info`,
     runbook: 'db/company/README.md「広告費の日次」。証跡 ad-spend-amazon と daily-sync のログの「Amazon Ads (SKU)」「Amazon Ads (campaign)」「Company DB 広告費」を見る。取り直し = fetch-amazon-ads.js --from --to → ad-spend.mjs --from --to。出品が分からない = core.ad_spend_daily の listing_id が null の sku の行 (商品マスタに出品を登録すると翌朝の relink で結ばれる)' },
@@ -292,6 +294,13 @@ export const W13_SCOPE = 'load';
 /** ②NE との照合の評価キー (全件 JSON の ne 節。C2b) */
 export const W13_NE_SCOPE = 'ne';
 export const W13_NE_FORMAT = 'mc-ne-v1';
+/**
+ * ②b 古い表 (持ち主が C で NE に欄が無い列 = 税区分・売上分類・送料・推奨保有月数の C ↔ 古い表。apps/company-db/master-compare/compare-old-tables.mjs) の評価キー。
+ * 全件 JSON の old_tables 節。breach・overdue (世代にあった値が無い・翌朝の作り直しでも違う) だけを案件に。反映待ち (lag) は案件にしない (② と同じ日の期限)。
+ * 持ち主が全部 load (比べない = not_applied) = pass (マスタ正本切替 ④a・#1564 の見直し M-3)
+ */
+export const W13_OLD_SCOPE = 'old';
+export const W13_OLD_FORMAT = 'mc-old-v1';
 /**
  * 要約 (朝の 1 行) で別に数える評価キー。切替までの NE との差は数百件の info = 他の見張りの「新・継続」に混ぜると埋もれるので、「NE との差 N 件」として 1 つにまとめる
  */

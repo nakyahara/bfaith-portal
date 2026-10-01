@@ -18,6 +18,8 @@
  *  12 集合は重ならない (items / held / recoverable / out_of_scope)・承認の指紋は作り直しの ID で変わらず c で変わる
  *  26 代表 (親子。D3b): NE で代表が付く = lag → 翌朝一致 / 代表がセット = held_by_load (判断の候補) / 保持の後に親が変わった = unexplained /
  *     人が決めた親 = rule (parent_manual・候補) / 記録の無い空 = incomparable / 自分自身 = 一致 / 最後に一致した値にも代表 / 直す承認の完了は目標の親 (親なしを含む)
+ *  29 持ち主が C の列 (④a で古い表に写す列。Codex ④ 設計 R0 #2・R1 H4): C ≠ NE で写し = C なら rule (company_owned・判断の一覧で NE を C の値に・方向 to_ne) /
+ *     写しの後に C が変わった = rule_lag。列ごとに (名前・取扱区分・税率・標準売価・原価・代表の仕入先) direction_unknown にしない
  * 使い方: node scripts/test-master-compare-ne.mjs
  */
 import assert from 'node:assert/strict';
@@ -155,17 +157,17 @@ function sendToRender(mat, asOf, buildId, status = 'recorded') {
 // ── Company DB ──
 const pg = new PGlite(); const db = pgliteAdapter(pg);
 await applyMigrations(db, { log: quiet });
-const nightly = async (asOf) => { const r = await runInitialLoad(db, buildPlanFromRender({ dataDir: tmp, log: quiet, now: at(asOf, '02:00') }), { log: quiet, runId: `load_${asOf}`, host: 'render-nightly', now: at(asOf, '02:00') }); assert.equal(r.ok, true, r.error); return r; };
+const nightly = async (asOf, ownership = null) => { const r = await runInitialLoad(db, buildPlanFromRender({ dataDir: tmp, log: quiet, now: at(asOf, '02:00') }), { log: quiet, runId: `load_${asOf}`, host: 'render-nightly', now: at(asOf, '02:00'), ...(ownership ? { ownership } : {}) }); assert.equal(r.ok, true, r.error); return r; };
 // 判断の台帳を書く接続は既定で同じ DB (本番の miniPC = watch_writer)。無い回 (not_configured) は [23] で
 const compare = (asOf, extra = {}) => runCompare({ db, dataDir: tmp, asOf, now: at(asOf, '08:40'), syncRunId: `ds_${asOf}`, writerDb: db, cdbReadAt: at(asOf, '08:40'),
   write: (d, n, p) => writeEvidence(d, n, p, { now: at(asOf, '08:40'), warn: quiet }), ...extra });
 /**
  * 1 日を回す。mirrorBeforeLoad = 夜の再送 (ロードの前に mirror を別の材料にする) / beforeLoad = ロードの前に Company DB を書き換える
  */
-async function day(asOf, { ne, material = null, reasons = [], mirrorBeforeLoad = null, beforeLoad = null, status = 'recorded', integrity = {}, spellings = null } = {}) {
+async function day(asOf, { ne, material = null, reasons = [], mirrorBeforeLoad = null, beforeLoad = null, status = 'recorded', integrity = {}, spellings = null, ownership = null } = {}) {
   if (mirrorBeforeLoad) publishToMirror(mirrorBeforeLoad, at(asOf, '01:00'));
   if (beforeLoad) await beforeLoad();
-  await nightly(asOf);
+  await nightly(asOf, ownership);
   const marks = setNe(ne, asOf, integrity);
   // NE のコードの元の書き方 (③b-1b): 取得の世代 (完了の印) に書き方と「集め終えた印」を付ける (ne-api.js と同じ関数)
   if (spellings) { if (spellings.products) WH.writeCodeSpellings('products', marks.at, spellings.products); if (spellings.sets) WH.writeCodeSpellings('sets', marks.at, spellings.sets); }
@@ -1099,6 +1101,83 @@ await ta('[28] NE の元のコード (③b-1b): 書き方を集め終えた印�
   x = await compare('2030-04-04', { writerDb: failDecisions });
   assert.deepEqual([x.result.ne.decisions_write, x.result.ne.ne_codes.write], ['failed', 'skipped_decisions_failed']);
   assert.deepEqual(await mark(), [okRun]);
+});
+
+await ta('[29] 持ち主が C の列 (④a): C ≠ NE で写し = C なら rule (company_owned・NE を C の値に・方向 to_ne) / 写しの後に C が変わった = rule_lag / どの列も direction_unknown にしない', async () => {
+  const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
+  const own = { ...MASTER_OWNERSHIP, ...Object.fromEntries(['skus.name', 'products.name', 'skus.handling', 'products.status', 'skus.tax_rate', 'skus.tax_class', 'skus.standard_price', 'sku_costs', 'supplier_skus.is_primary'].map((k) => [k, 'company'])) };
+  const NE = baseNe();
+  const d0 = '2030-05-01', d1 = '2030-05-02';
+  await day(d0, { ne: NE });   // 持ち主が全部 load の日 = そろえる (最後に一致した値も)
+  // C (Company DB) で a001 の 6 つの列を直す (人の入力画面と同じく、単品の名前・状態は商品側も)。ロードは持ち主が C の列を書かない
+  const cEdit = async () => {
+    await db.query(`update core.skus set name = 'C の名前', handling = 'discontinued', tax_rate = 0.08, tax_class = 'REDUCED_8', standard_price_jpy = 1234 where code = 'a001'`);
+    await db.query(`update core.products set name = 'C の名前', status = 'discontinued' where product_id = (select product_id from core.skus where code = 'a001')`);
+    await db.query(`update core.sku_costs set cost_jpy = 150, cost_source = 'manual', cost_status = 'OVERRIDDEN' where valid_to is null and sku_id = (select sku_id from core.skus where code = 'a001')`);
+    await db.query(`update core.supplier_skus set is_primary = false where sku_id = (select sku_id from core.skus where code = 'a001')`);
+    await db.query(`insert into core.supplier_skus (company_id, supplier_id, sku_id, is_primary) select 1, sup.supplier_id, s.sku_id, true from core.suppliers sup, core.skus s
+      where sup.code = '0002' and s.code = 'a001' on conflict (supplier_id, sku_id) do update set is_primary = true`);
+  };
+  // 今朝の写し (m_products) = C の値 (作り直しが company_owned の理由つきで重ねた)
+  const copyOfC = toMaterial(NE, (m) => { for (const [k, v] of [['商品名', 'C の名前'], ['取扱区分', '取扱中止'], ['消費税率', 0.08], ['税区分', 'REDUCED_8'], ['標準売価', 1234], ['原価', 150], ['原価ソース', '例外'], ['原価状態', 'OVERRIDDEN'], ['仕入先コード', '0002']]) setMat(m, 'a001', k, v); });
+  const co = (col, value, ne_value) => ({ code: 'a001', kind: '単品', col, reason: 'company_owned', owner_key: 'x', cdb_value: null, value, ne_value, generation_no: 1 });
+  const reasons = [co('name', 'C の名前', '単品A'), co('handling', '取扱中止', '取扱中'), co('tax_rate', { 消費税率: 0.08, 税区分: 'REDUCED_8' }, { 消費税率: 0.1, 税区分: 'STANDARD_10' }),
+    co('price', 1234, 1000), { ...co('cost', { 原価: 150 }, { 原価: 100 }), cdb_cost_source: 'manual' }, co('primary_supplier', '0002', '0001')];
+  const x = await day(d1, { ne: NE, material: copyOfC, reasons, beforeLoad: cEdit, ownership: own });
+  assert.equal(x.result.verdict, 'pass', JSON.stringify(x.result.items));   // ① ロードの検証: 持ち主が C の列は比べない
+  const want = [['value:a001', 'name'], ['value:a001', 'handling'], ['value:a001', 'tax_rate'], ['value:a001', 'standard_price_jpy'], ['cost:a001', 'cost'], ['primary_supplier:a001', 'primary_supplier']];
+  for (const [key, c] of want) {
+    const cc = col(x.ne, key, c);
+    assert.equal(cc.length, 1, `${key} ${c} が見えない`);
+    assert.deepEqual([cc[0].cls, cc[0].explained?.reason, cc[0].owner], ['rule', 'company_owned', 'company'], `${key} ${c}: ${JSON.stringify(cc[0])}`);
+  }
+  assert.ok(!x.ne.items.some((i) => i.columns.some((cc) => cc.cls === 'direction_unknown')), '持ち主が C の列が direction_unknown に落ちた');
+  // 判断の一覧: NE を C の値に (持ち主 = company・理由 = company_owned)
+  const dn = x.ne.decisions.find((d) => d.subject_key === 'value:a001' && d.col === 'name');
+  assert.deepEqual([dn.reason_kind, dn.proposal, dn.print.owner], ['company_owned', { op: 'set_ne_value', value: 'C の名前' }, 'company']);
+  // 最後に一致した値の方向 = C 側が変わった (to_ne)
+  assert.equal(col(x.ne, 'value:a001', 'name')[0].direction, 'to_ne');
+  // 写しの後に C が変わった (今朝の写しはまだ前の C の値) = 翌朝の写し待ち (rule_lag)
+  await db.query(`update core.skus set name = 'C の新しい名前' where code = 'a001'`);
+  await db.query(`update core.products set name = 'C の新しい名前' where product_id = (select product_id from core.skus where code = 'a001')`);
+  const y = await compare(d1);
+  const yn = col(y.result.ne, 'value:a001', 'name');
+  assert.deepEqual([yn[0].cls, yn[0].explained?.reason], ['rule_lag', 'company_owned']);
+  assert.ok(!y.result.ne.items.some((i) => i.columns.some((cc) => cc.cls === 'direction_unknown')));
+});
+
+await ta('[30] 持ち主が C の列は NE の値が空・0・null・不正でも company_owned で分ける (incomparable・ne_no_value にしない。NE の状態は残す)・NE も C も空 = 一致 (Codex #1564 R1 M6)', async () => {
+  const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
+  const own = { ...MASTER_OWNERSHIP, ...Object.fromEntries(['skus.name', 'products.name', 'skus.handling', 'products.status', 'skus.tax_rate', 'skus.tax_class', 'skus.standard_price', 'sku_costs', 'supplier_skus.is_primary'].map((k) => [k, 'company'])) };
+  const NE = baseNe();
+  const d0 = '2030-06-01', d1 = '2030-06-02';
+  await day(d0, { ne: NE });   // 持ち主が全部 load の日 = そろえる
+  // NE の c003 の値を列ごとに空・0・null・不正にする (C は前の値のまま = 持ち主が C の列はロードが書かない)
+  const ne1 = clone(NE);
+  Object.assign(ne1.products.find((r) => r.code === 'c003'), { name: '', handling: '廃番X', tax_src: J('0'), price_src: J(null), cost_src: null, supplier: '' });
+  Object.assign(ne1.products.find((r) => r.code === 'd004'), { supplier: '' });
+  // d004 の代表の仕入先を C で外す (NE も空 = 一致)
+  const cEdit = async () => { await db.query(`update core.supplier_skus set is_primary = false where sku_id = (select sku_id from core.skus where code = 'd004')`); };
+  const copyOfC = toMaterial(NE, (m) => setMat(m, 'd004', '仕入先コード', null));   // 今朝の写し = C の値
+  const x = await day(d1, { ne: ne1, material: copyOfC, beforeLoad: cEdit, ownership: own });
+  const want = [['value:c003', 'name', 'empty', 'no_value', '単品C'], ['value:c003', 'handling', 'value', 'incomparable', 'active'], ['value:c003', 'tax_rate', 'zero', 'incomparable', 0.1],
+    ['value:c003', 'standard_price_jpy', 'null', 'no_value', 3000], ['cost:c003', 'cost', 'unknown', 'incomparable', null], ['primary_supplier:c003', 'primary_supplier', 'empty', 'no_value', null]];
+  for (const [key, c, nState, comp] of want) {
+    const cc = col(x.ne, key, c);
+    assert.equal(cc.length, 1, `${key} ${c} が見えない (held = ${x.ne.held[key]})`);
+    assert.deepEqual([cc[0].cls, cc[0].explained?.reason, cc[0].owner, cc[0].n_state, cc[0].n_comparability], ['rule', 'company_owned', 'company', nState, comp], `${key} ${c}: ${JSON.stringify(cc[0])}`);
+    assert.ok(!Object.hasOwn(x.ne.held, key), `${key} が保持 (incomparable) に落ちた`);
+  }
+  assert.equal(col(x.ne, 'value:c003', 'handling')[0].n_validity, 'invalid');   // NE の不正な状態は残す
+  // 判断の一覧 = NE を C の値に (NE の値が無くても・不正でも)
+  const dn = x.ne.decisions.find((d) => d.subject_key === 'value:c003' && d.col === 'name');
+  assert.deepEqual([dn.cls, dn.reason_kind, dn.proposal], ['rule', 'company_owned', { op: 'set_ne_value', value: '単品C' }]);
+  // NE も C も空 (d004 の代表の仕入先) = 一致 = 項目にも保持にも出ない
+  assert.deepEqual([col(x.ne, 'primary_supplier:d004').length, Object.hasOwn(x.ne.held, 'primary_supplier:d004')], [0, false]);
+  // 持ち主が load の列は今までどおり (NE の値が無い = ne_no_value) = 持ち主を全部 load に戻した日
+  const ne2 = clone(NE); ne2.products.find((r) => r.code === 'e005').price_src = J('');
+  const y = await day('2030-06-03', { ne: ne2 });
+  assert.deepEqual(clsOf(y.ne, 'value:e005', 'standard_price_jpy'), ['ne_no_value']);
 });
 
 await pg.close();

@@ -33,12 +33,18 @@ const KNOWN = new Set(KNOWN_DIFF);
 const DECISION_CLASSES = new Set(['rule', 'rule_lag', 'held_by_load', 'spec_undecided', 'ne_no_value']);
 /** 承認の指紋の「意味の版」(理由の種類ごとに手で上げる。C2 v4 §6) */
 export const SEMANTIC_VERSIONS = Object.freeze({ tax_fallback: 1, tax_unresolved: 1, exception_cost: 1, exception_tax_manual: 1, set_name_blank: 1, set_price_from_goods: 1,
-  set_tax_from_components: 1, not_in_latest_fetch: 1, 'load_rule:name_blank_to_code': 1, manual: 1, held_by_load: 1, spec_undecided: 1, ne_no_value: 1, none: 1, parent_manual: 1 });
-/** 作り直しの理由の列 → 照合の列 */
-const BUILD_COL = { cost: 'cost', tax_rate: 'tax_rate', name: 'name', price: 'standard_price_jpy' };
+  set_tax_from_components: 1, not_in_latest_fetch: 1, 'load_rule:name_blank_to_code': 1, manual: 1, held_by_load: 1, spec_undecided: 1, ne_no_value: 1, none: 1, parent_manual: 1,
+  company_owned: 1 });
+/** 作り直しの理由の列 → 照合の列 (company_owned の handling・primary_supplier は同じ名前。sales_class・shipping は照合しない列) */
+const BUILD_COL = { cost: 'cost', tax_rate: 'tax_rate', name: 'name', price: 'standard_price_jpy', handling: 'handling', primary_supplier: 'primary_supplier' };
+/** ④a が持ち主 C の値を m_products に写す、照合の列 (これらの差は「C → NE」の予定の差。compareNe の companyCopied) */
+const COMPANY_COPIED = new Set(['name', 'handling', 'tax_rate', 'standard_price_jpy', 'cost', 'primary_supplier']);
 /** 理由の種類ごとに承認の指紋へ入れる項目 (raw_synced_at など毎朝変わるものは入れない。C2 v4 §6 / Codex C2-R0 M7) */
 const REASON_FIELDS = { tax_fallback: ['source', 'value'], exception_cost: ['value'], exception_tax_manual: ['value'], set_price_from_goods: ['value'],
-  set_tax_from_components: ['value', 'category'], set_name_blank: [], not_in_latest_fetch: [], tax_unresolved: [], 'load_rule:name_blank_to_code': [], parent_manual: [] };
+  set_tax_from_components: ['value', 'category'], set_name_blank: [], not_in_latest_fetch: [], tax_unresolved: [], 'load_rule:name_blank_to_code': [], parent_manual: [],
+  // 作り直しが持ち主が C の列に Company DB の値を入れた (④a。rebuild-m-products.js / master-publish.js の mergeReasons)。
+  //   持ち主のキー・変換の前の C の値・古い表に入れた値・原価の元の出どころ (世代の番号は毎朝変わるので指紋に入れない)
+  company_owned: ['owner_key', 'cdb_value', 'value', 'cdb_cost_source'] };
 
 /** 「ロードは触らない (保持)」= この列の値を材料が持たない (原価が無い・代表の仕入先が空・構成が 0 行)。ABSENT = その SKU が材料に無い */
 export const PRESERVE = '__load_preserves__';
@@ -382,7 +388,10 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     build_date: ne.build ? jstDateOfIso(ne.build.published_at) : null, build_run: ne.build ? ne.build.daily_sync_run_id : null, sync_run_id: syncRunId };
   if (pre.freshness.products_at_jst !== asOfJst || pre.freshness.sets_at_jst !== asOfJst) return block('stale_ne', { raw_diffs: rawDiffs() });
   if (!ne.build || pre.freshness.build_date !== asOfJst || (syncRunId && ne.build.daily_sync_run_id !== syncRunId)) return block('stale_build', { raw_diffs: rawDiffs() });
-  out.build = { build_id: ne.build.build_id, published_at: ne.build.published_at, daily_sync_run_id: ne.build.daily_sync_run_id };
+  out.build = { build_id: ne.build.build_id, published_at: ne.build.published_at, daily_sync_run_id: ne.build.daily_sync_run_id,
+    // 作り直しが使った Company DB の写しの世代 (④a。前の記録 = null)
+    cdb_publish: ne.build.cdb_publish_generation_no == null ? null : { generation_no: ne.build.cdb_publish_generation_no, generation_id: ne.build.cdb_publish_generation_id ?? null,
+      content_hash: ne.build.cdb_publish_content_hash ?? null, applied_hash: ne.build.cdb_publish_applied_hash ?? null } };
   // ── 3. 材料の信用 ──
   const parents = new Set(ne.sets.map((r) => r.parent));
   pre.trust = { products_rows: ne.products.length, sets_rows: ne.sets.length, sets_total: ne.setRowsTotal, parents: parents.size };
@@ -461,6 +470,12 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     const k = ownerKey(col); if (!k || !own) return false;
     if ((SKU_0027_COLUMNS.includes(col) || col === 'primary_supplier') && !loadCtx.has0027) return false;
     return own[k] === 'load';
+  };
+  /** 持ち主が C で、④a が古い表 (m_products) に写す列か (昨夜のロードが記録した持ち主で決める) */
+  const companyCopied = (type, col) => {
+    if (!own || !COMPANY_COPIED.has(col) || !['value', 'cost', 'primary_supplier'].includes(type)) return false;
+    if ((SKU_0027_COLUMNS.includes(col) || col === 'primary_supplier') && !loadCtx.has0027) return false;
+    return own[ownerKey(col)] === 'company';
   };
   // ① の差 (load_mismatch を列・子の行で引く)
   const loadItems = new Map(p4 ? loadCtx.items.map((i) => [i.subject_key || subjectKey(i.type, i.norm), i]) : []);
@@ -551,6 +566,20 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     const prev = unit && ledgerOk ? ledger.entries.get(unit) || null : null;
     if (prev) newPending.set(unit, prev);
     const comp = comparability(nst);
+    // 持ち主が C の列 (④a で古い表に写す列。Codex ④ 設計 R0 #2): 夜間ロードは書かない = 「昨夜の適用」(A) は見ない (見ると not_owned = direction_unknown に落ちる)。
+    //   今朝の写し (作り直しの材料 t_today) が C と同じ = NE との差は「C → NE へ流す」予定の差 (rule・company_owned・判断の一覧で NE を C の値に)。
+    //   写しがまだ C と違う (今朝の写しの後に C が変わった・写しが届かなかった) = 翌朝の写し待ち (rule_lag)。材料に値が無い (PRESERVE) = 写しも空
+    //   🚨 NE の値が空・0・null・不正でも先にここで分ける (Codex #1564 R1 M6。NE の値は C が正の列の判断に使わない = incomparable・ne_no_value にしない)。
+    //     NE に値が無く C も空 = 一致 / それ以外 = NE を C の値に (C が空なら決める)。NE の状態 (n_state・n_validity・比べやすさ) は detail に残す
+    if (companyCopied(type, col)) {
+      const cEmpty = c == null || (Array.isArray(c) && c.length === 0);
+      if (comp === 'comparable' ? eqv(nv, c) : comp === 'no_value' && cEmpty) return { cls: 'match', detail };
+      detail.owner = 'company';
+      if (comp !== 'comparable') detail.n_comparability = comp;
+      const co = reasons.find((r) => r.reason === 'company_owned') || { reason: 'company_owned' };
+      const copy = tt === PRESERVE ? (col === 'primary_supplier' ? [] : null) : tt;
+      return eqv(copy, c) ? { cls: 'rule', detail, explained: co } : { cls: 'rule_lag', detail, explained: co };
+    }
     if (comp === 'incomparable') return { cls: 'incomparable', detail };
     if (comp === 'no_value') return { cls: 'ne_no_value', detail };
     if (eqv(nv, c)) return { cls: 'match', detail };
@@ -754,7 +783,9 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
         : col.cls === 'held_by_load' ? { op: 'fix_load_input', reason_code: reason?.reason_code ?? null }
           : col.cls === 'spec_undecided' ? { op: 'decide_spec' }
             : reasonKind === 'manual' || reasonKind === 'parent_manual' ? { op: 'decide_manual_priority' }
-              : reasonKind === 'set_price_from_goods' || reasonKind === 'load_rule:name_blank_to_code' ? { op: 'set_ne_value', value: col.t_today } : { op: 'decide' };
+              : reasonKind === 'set_price_from_goods' || reasonKind === 'load_rule:name_blank_to_code' ? { op: 'set_ne_value', value: col.t_today }
+                // 持ち主が C の列の差 (④a) = NE を C の値に (C が空 = 決める)
+                : reasonKind === 'company_owned' ? (col.c != null && col.c !== '(無い)' ? { op: 'set_ne_value', value: col.c } : { op: 'decide' }) : { op: 'decide' };
       const owner = col.col === 'exists' ? 'load' : own ? own[ownerKey(col.col)] ?? null : null;   // SKU の INSERT は持ち主で止めない
       const print = decisionPrint({ norm: it.norm, kind: it.kind, col: col.col, child: col.child ?? null, problem: it.type, owner, reasonKind, reason, n_state: col.n_state, n: col.n, c: col.c, proposal });
       const fingerprint = approvalFingerprint(print);

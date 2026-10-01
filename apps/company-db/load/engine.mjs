@@ -40,8 +40,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normSku } from '../../../lib/sku-norm.js';
-import { MASTER_OWNERSHIP, validateOwnership, loadOwns as ownsIn, companyOwned } from '../../../config/master-ownership.mjs';
+import { validateOwnership, loadOwns as ownsIn, companyOwned } from '../../../config/master-ownership.mjs';
 import { MASTER_WRITE_EXCLUSIVE_LOCK_SQL, MASTER_WRITE_LOCK_EXISTS_SQL } from '../../../lib/master-cutover.mjs';
+import { resolveLoadOwnership } from './ownership-state.mjs';
 
 export const COMPANY_ID = 1;
 export const RULE_VERSION = 'v1';
@@ -53,6 +54,7 @@ export const RULE_VERSION = 'v1';
  */
 export const LOAD_RULE_FILES = Object.freeze([
   'apps/company-db/load/sources.mjs', 'apps/company-db/load/engine.mjs', 'apps/warehouse/material-lineage.js', 'lib/sku-norm.js', 'config/master-ownership.mjs',
+  'apps/company-db/load/ownership-state.mjs',   // 持ち主の epoch (0053)。ロードが使う持ち主を決める
   'apps/warehouse-mirror/material-tables.js',   // mirror の表の型 (ロードが読む値・照合が控えを戻す表)
 ]);
 export function loadRuleFingerprint(root = fileURLToPath(new URL('../../../', import.meta.url))) {
@@ -207,10 +209,15 @@ export async function runInitialLoad(db, plan, opts = {}) {
   const futureLimitIso = new Date(futureLimit).toISOString();
   const isFuture = (v) => v != null && ms(v) > futureLimit;
   const isAfterLoad = (v) => v != null && ms(v) > now.getTime();
-  // 列ごとの持ち主 (config/master-ownership.mjs。Company DB構想 10 §5.2)。'company' の列は既にある行を上書きしない。試験は opts.ownership で差し替える
-  const ownership = validateOwnership(opts.ownership || MASTER_OWNERSHIP);
+  // 列ごとの持ち主 (Company DB構想 10 §5.2)。'company' の列は既にある行を上書きしない。試験は opts.ownership で差し替える。
+  //   🚨 config/master-ownership.mjs を直接は使わない (Codex #1564 R1 H1): 0053 の ops.master_ownership_state の active (行が無い = 全部 load)。
+  //   切替の日に明示して頼んだロード (opts.usePrepared) だけが prepared を使う。config を書き換えただけ (configured) では何も変わらない
+  const epoch = opts.ownership ? { ownership: opts.ownership, epoch: 'explicit', state: null } : await resolveLoadOwnership(db, { usePrepared: !!opts.usePrepared });
+  const ownership = validateOwnership(epoch.ownership);
   const loadOwns = (key) => ownsIn(ownership, key);
-  const report = { run_id: runId, dry_run: dryRun, started_at: nowIso, sections: {}, conflicts: [], unresolved: {}, ok: false, company_owned: companyOwned(ownership) };
+  const report = { run_id: runId, dry_run: dryRun, started_at: nowIso, sections: {}, conflicts: [], unresolved: {}, ok: false, company_owned: companyOwned(ownership),
+    ownership_epoch: { epoch: epoch.epoch, state: epoch.state } };
+  if (epoch.epoch === 'default') log('持ち主の epoch の記録が無い (0053 の前 / まだ prepare していない) = 全部 load として動く');
   const decisions = {};   // 判断の記録 (0030 の ops.load_decisions。照合の ①ロードの検証が、ロードの時の判断をそのまま使う)
   const addUnresolved = (k, v) => { (report.unresolved[k] ||= []).push(v); };
 

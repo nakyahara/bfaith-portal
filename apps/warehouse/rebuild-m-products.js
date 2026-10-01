@@ -5,13 +5,16 @@
  * daily-sync.js から呼び出す or 単体実行可能
  */
 import { getDB } from './db.js';
-import { readNeMarks, stagingHash, recordBuild, makeBuildId, acquireRebuildLock, holdsRebuildLock, releaseRebuildLock, ensurePrivateStaging, stagingIsPrivate } from './master-material.js';
+import { readNeMarks, judgeNeMark, stagingHash, recordBuild, makeBuildId, acquireRebuildLock, holdsRebuildLock, releaseRebuildLock, ensurePrivateStaging, stagingIsPrivate, latestBuild, publishOfBuild, MASTER_BUILD_RULE_VERSION } from './master-material.js';
 import {
   TAX_RATES, KNOWN_NE_RATES, KNOWN_DECIMAL_RATES, resolveTaxRate, resolveSetTaxRate,
   SALES_CLASSES, EXPORT_SALES_CLASS, resolveSetSalesClass,
   HANDLING_ACTIVE, HANDLING_STOPPED, HANDLING_MAKER_STOPPED, resolveSetHandlingClass,
   setCostFromComponents,
 } from '../../lib/master-set-rules.js';
+import crypto from 'node:crypto';
+import { ALL_LOAD } from '../company-db/load/ownership-state.mjs';
+import { readCurrentPublish, makePublishResolver, mergeReasons, handlingFromCdb, publishCols, applySideTables, verifyApplied, ownershipHash } from './master-publish.js';
 
 // ─── ヘルパー ───
 
@@ -26,6 +29,45 @@ export {
   SALES_CLASSES, EXPORT_SALES_CLASS, resolveSetSalesClass,
   HANDLING_ACTIVE, HANDLING_STOPPED, HANDLING_MAKER_STOPPED, resolveSetHandlingClass,
 };
+
+/** Company DB の税率 (小数) → NE の整数 (構成品の入力を C の値に替えるとき。resolveTaxRate にそのまま渡せる形) */
+export const neRateOfDecimal = (decimal) => TAX_RATES.find((t) => t.decimal === decimal)?.neRate ?? null;
+
+/**
+ * セットの原価・税率・売上分類・取扱区分を構成品から導く (今までの決め方。上の決定表と原価の合計)。
+ * 構成品の入力を Company DB の値に替えて同じ決め方を通すために 1 つにまとめた (マスタ正本切替 ④a。設計 15 §2)
+ * @param {object} p
+ * @param {{ cost: number|null, qty: number, tax: object, sales: object, handling: object }[]} p.inputs  構成品 (tax / sales / handling は上の resolve* の入力の形)
+ * @param {object|null} p.eg  セット自身の例外原価の行 (あれば構成品より優先)
+ * @param {number|null|undefined} p.manualSalesClass  セット自身の売上分類の手動登録 (あれば構成品より優先)
+ * @param {string|null|undefined} p.neSetStatus  NE のセット自身の取扱区分
+ */
+export function deriveSetValues({ inputs, eg, manualSalesClass, neSetStatus }) {
+  // 原価 (構成品の原価 × 数量の合計。決め方は lib/master-set-rules.js の setCostFromComponents = マスタ入力画面と同じ。⑤-1)
+  const setCost = setCostFromComponents(inputs.map((c) => ({ cost: c.cost, qty: c.qty })));
+  let genka = null, genkaSource = '不明', genkaStatus = 'MISSING';
+  if (eg) {
+    genka = eg.genka;
+    genkaSource = '例外';
+    genkaStatus = 'OVERRIDDEN';
+  } else if (setCost.status === 'COMPLETE') {
+    genka = setCost.jpy;
+    genkaSource = 'セット計算';
+    genkaStatus = 'COMPLETE';
+  } else if (setCost.status === 'PARTIAL') {
+    genkaStatus = 'PARTIAL';
+  }
+  // 税区分 (構成品の税率から導出。MIXED は taxRate に最小値を入れる既存仕様を踏襲)
+  // 構成品が1つでも解決できなければ UNKNOWN に倒し、上流異常を握り潰さない
+  const { taxRate, taxCategory } = resolveSetTaxRate(inputs.map((c) => c.tax));
+  // 売上分類 (手動登録が最優先。無ければ構成品の MIN から導出)
+  //   導出も効かない (構成品が未登録 / NE に無い) セットだけが NULL で残り、register の「分類未登録」に出る。
+  const salesClass = manualSalesClass ?? resolveSetSalesClass(inputs.map((c) => c.sales));
+  // 取扱区分: NE のセット自身の値。それが 取扱中 (または NE に無い) なら構成品の止め方を引き継ぐ
+  //   (2026-09-14 中原さん指示。決定表は resolveSetHandlingClass)
+  const handling = resolveSetHandlingClass(neSetStatus, inputs.map((c) => c.handling));
+  return { genka, genkaSource, genkaStatus, taxRate, taxCategory, salesClass, handling };
+}
 
 // ─── 本番反映時の列リスト（Codex PR1 Round 3 High 反映: 明示列INSERT） ───
 // 物理的な列順が異なるDBでも値が正しくマップされるよう、
@@ -46,6 +88,44 @@ export const MSC_COLS = [
 
 function colList(cols) {
   return cols.map(c => `"${c}"`).join(', ');
+}
+
+/** 表の中身のハッシュ (updated_at を除く・行の順に依らない)。作り直しの「中身が同じ」を見る */
+function contentHashOf(db, table, cols, order) {
+  const h = crypto.createHash('sha256');
+  for (const r of db.prepare(`SELECT ${colList(cols.filter((c) => c !== 'updated_at'))} FROM ${table} ORDER BY ${order}`).raw().iterate()) h.update(`${JSON.stringify(r)}\n`);
+  return h.digest('hex');
+}
+
+/**
+ * 前の作り直しから何も変わっていないか (#1564 Codex R2 Medium 5)。全部そろったときだけ skip = 入れ替えない・記録も足さない (業務の表は 1 行も書かない):
+ *   前の作り直しの記録がある・規則の版が同じ / NE の取得の印 (時刻・番号) が信用でき、前の作り直しと同じ /
+ *   写しの世代 (番号・持ち主) が前の作り直しと同じ / 作った中身 (updated_at を除く) が今の m_products・m_set_components と同じ /
+ *   持ち主が C の列があれば、今の古い表・上書き表が世代のまま (入れた後の確かめが通り、ハッシュが前の作り直しの記録と同じ)
+ * 🚨 毎朝の daily-sync は NE の取得が新しい (印が変わる) = 今までどおり入れ替える (updated_at も新しくなる)。何もしないのは同じ取得・同じ世代のやり直しだけ
+ */
+function unchangedSinceLastBuild(db, { startMarks, pub, ownership }) {
+  let lb = null;
+  try { lb = latestBuild(db); } catch { lb = null; }
+  if (!lb) return { skip: false, why: 'no_build' };
+  if (lb.rule_version !== MASTER_BUILD_RULE_VERSION) return { skip: false, why: 'rule_version' };
+  const now = readNeMarks(db);
+  const mp = judgeNeMark(startMarks.products, now.products), ms = judgeNeMark(startMarks.set_components, now.set_components);
+  if (!mp.value || !ms.value) return { skip: false, why: 'ne_mark_untrusted' };
+  if (mp.value !== lb.ne_products_complete_at || String(mp.rev) !== String(lb.ne_products_complete_rev)
+    || ms.value !== lb.ne_setproducts_complete_at || String(ms.rev) !== String(lb.ne_setproducts_complete_rev)) return { skip: false, why: 'ne_changed' };
+  const genNo = pub.generation ? pub.generation.generation_no : null, genOwner = pub.generation ? pub.generation.ownership_hash : null;
+  if ((lb.cdb_publish_generation_no ?? null) !== genNo || (lb.cdb_publish_ownership_hash ?? null) !== genOwner) return { skip: false, why: 'generation_changed' };
+  if (contentHashOf(db, 'm_products_staging', MP_COLS, '"商品コード"') !== contentHashOf(db, 'main.m_products', MP_COLS, '"商品コード"')) return { skip: false, why: 'products_changed' };
+  if (contentHashOf(db, 'm_set_components_staging', MSC_COLS, '"セット商品コード", "構成商品コード"') !== contentHashOf(db, 'main.m_set_components', MSC_COLS, '"セット商品コード", "構成商品コード"')) {
+    return { skip: false, why: 'components_changed' };
+  }
+  let applied = null;
+  if (pub.active) {
+    applied = verifyApplied(db, { publication: pub.publication, ownership, taxRates: TAX_RATES });
+    if (!applied.ok || applied.applied_hash !== (lb.cdb_publish_applied_hash ?? null)) return { skip: false, why: 'applied_changed' };
+  }
+  return { skip: true, why: 'unchanged', build: lb, applied };
 }
 
 // ─── launch_date 解決ヘルパー（PR ：launch_date 自動検出） ───
@@ -121,15 +201,31 @@ export function applyStagingToProduction(db, { build = null } = {}) {
 
     db.exec('DELETE FROM m_set_components');
     db.exec(`INSERT INTO m_set_components (${mscList}) SELECT ${mscList} FROM m_set_components_staging`);
+    // 上書き表を持ち主が C の列の値にそろえ、入れた後に読み直して世代と比べる (④a。持ち主が全部 load なら何もしない・読むだけ。master-publish.js)。
+    //   違えば投げる = 入れ替えも巻き戻る (C の値が入っていない m_products を残さない)
+    // 同じ NE の取得・同じ世代・同じ中身の作り直しは、ここまで来ない (rebuildMProductsLocked の unchangedSinceLastBuild = 何も書かない。#1564 Codex R2 Medium 5)。
+    //   ここに来た作り直し (NE の取得が新しい・世代が新しい・中身が違う) は今までどおり全部入れ替える。上書き表は値が同じ行は触らない
+    const pub = build ? build.publish : null;
+    const side = pub ? applySideTables(db, pub) : null;
+    const applied = pub ? verifyApplied(db, { publication: pub.publication, ownership: pub.ownership, taxRates: TAX_RATES, expected: pub.active ? pub.expected : null }) : null;
+    if (applied && !applied.ok) {
+      throw Object.assign(new Error(`Company DB の値が m_products に入っていない ${JSON.stringify(applied.problems.slice(0, 3))}`), { code: 'CDB_PUBLISH_VERIFY', applied });
+    }
     // 作り直しの記録 (master-material.js)。入れ替えと同じ取引 = 記録に失敗すれば入れ替えも巻き戻る
-    return build ? recordBuild(db, { buildId: build.buildId, startMarks: build.startMarks, startedAt: build.startedAt, reasons: build.reasons }) : null;
+    return build ? { ...recordBuild(db, { buildId: build.buildId, startMarks: build.startMarks, startedAt: build.startedAt, reasons: build.reasons,
+      publish: pub && pub.generation ? { ...pub.generation, applied_hash: applied.applied_hash } : null }), side_tables: side, applied } : null;
   });
   return tx();
 }
 
 // ─── メイン ───
 
-export async function rebuildMProducts() {
+/**
+ * @param {object} [opts]
+ * @param {object} [opts.ownership]  列ごとの持ち主。試験だけ渡す (渡した持ち主と世代の持ち主が違えば止める)。
+ *   渡さない (本番) = 今の写しの世代の持ち主 (epoch。Company DB の active か、切替の日の prepared。Codex #1564 R1 H1)。config は使わない
+ */
+export async function rebuildMProducts({ ownership = null } = {}) {
   const db = getDB();
   // 作り直しの札 (作り始めから入れ替えまで、別の作り直しを入れない = staging は共有の表。master-material.js。Codex PR #1453 R1 High-1)
   const buildId = makeBuildId();
@@ -138,13 +234,13 @@ export async function rebuildMProducts() {
     return { ok: false, error: 'REBUILD_LOCKED', log: [], checks: ['❌ 別の作り直しが実行中'], warn: [] };
   }
   try {
-    return await rebuildMProductsLocked(db, buildId);
+    return await rebuildMProductsLocked(db, buildId, ownership);
   } finally {
     releaseRebuildLock(db, buildId);
   }
 }
 
-async function rebuildMProductsLocked(db, buildId) {
+async function rebuildMProductsLocked(db, buildId, ownership) {
   const ts = now();
   const log = [];
   const warn = [];
@@ -254,6 +350,41 @@ async function rebuildMProductsLocked(db, buildId) {
     return null;
   }
 
+  // Company DB の写し (マスタ正本切替 ④a。master-publish.js): 持ち主が C の列だけ、今の世代の値を重ねる (同じ取引・記録の前)。
+  //   🚨 持ち主が全部 load なら何もしない (値も理由も今までと同じ・何も書かない)。
+  //   持ち主が C の列があるのに、同じ持ち主 (epoch) の世代が無い・値が欠ける・m_products の 2 つのコードが同じ C の SKU に当たる = 入れ替えない (前の m_products のまま)
+  // 持ち主 (epoch) を決める: 試験で渡した持ち主 / 今の世代の持ち主 / 世代が無い = 全部 load。
+  //   ただし前の作り直しが持ち主が C の列を使った (記録の持ち主のハッシュが全部 load でない) のに世代が無い = 止める
+  //   (warehouse.db を戻した・印が消えた = C の値を NE の値に黙って戻さない)。config (configured) では決めない (Codex #1564 R1 H1)
+  const head = readCurrentPublish(db, { values: false });
+  let epochNote = ownership ? 'explicit' : null;
+  if (!ownership) {
+    if (head.generation && head.generation.state === 'verified') {
+      try { ownership = JSON.parse(head.generation.ownership); epochNote = `generation ${head.generation.generation_no}`; }
+      catch { ownership = null; }
+      if (!ownership) {
+        const msg = `❌ 写しの世代 ${head.generation.generation_no} の持ち主が読めない → 反映中止 (前の m_products のまま)`;
+        console.error(`[m_products] ${msg}`);
+        return { ok: false, error: 'CDB_PUBLISH_UNAVAILABLE', problem: 'generation_ownership_unreadable', log, checks: [msg], warn, total: 0 };
+      }
+    } else if ((() => { const lb = publishOfBuild(latestBuild(db)); return !!(lb && lb.ownership_hash && lb.ownership_hash !== ownershipHash(ALL_LOAD)); })()) {
+      const msg = `❌ 前の作り直しは持ち主が Company DB の列を使ったのに、写しの世代が無い (${head.problem}) → 反映中止 (前の m_products のまま。C の値を NE に戻さない)`;
+      console.error(`[m_products] ${msg}`);
+      return { ok: false, error: 'CDB_PUBLISH_UNAVAILABLE', problem: 'no_generation', log, checks: [msg], warn, total: 0 };
+    } else { ownership = ALL_LOAD; epochNote = `default (${head.problem ?? 'no_generation'})`; }
+  }
+  const needPublish = publishCols(ownership).length > 0;
+  const staged = new Map();   // m_products に入れるコード → 商品区分 (A1〜A3 と同じ決め方)
+  for (const p of neProducts) { const c = p.商品コード?.toLowerCase(); if (c && !setCodeSet.has(c)) staged.set(c, '単品'); }
+  for (const c of setCodeSet) staged.set(c, 'セット');
+  for (const c of exceptionMap.keys()) if (c && !staged.has(c)) staged.set(c, '例外');
+  const pub = makePublishResolver({ ownership, publication: readCurrentPublish(db, { values: needPublish }), staged, taxRates: TAX_RATES });
+  if (pub.problem) {
+    const msg = `❌ 持ち主が Company DB の列 (${pub.cols.join('・')}) があるのに、使える写しが無い (${pub.problem}${pub.problemDetail ? ` ${JSON.stringify(pub.problemDetail).slice(0, 300)}` : ''}) → 反映中止 (前の m_products のまま)`;
+    console.error(`[m_products] ${msg}`);
+    return { ok: false, error: 'CDB_PUBLISH_UNAVAILABLE', problem: pub.problem, log, checks: [msg], warn, total: 0 };
+  }
+
   let countSingle = 0;
   let countSetAsNE = 0;
   let countShipInherited = 0; // 代表コードから送料継承した件数
@@ -284,22 +415,33 @@ async function rebuildMProductsLocked(db, buildId) {
     }
 
     const { taxRate, taxCategory } = resolveTaxRate(p.消費税率, taxRateMap.get(code));
-    if (genkaSource === '例外') reasons.push({ code, kind: '単品', col: 'cost', reason: 'exception_cost', value: genka, ne_value: p.原価 ?? null });
+    const skuReasons = [];   // この SKU の理由 (今までと同じ順。C の値で変わった列だけ後で差し替える)
+    if (genkaSource === '例外') skuReasons.push({ code, kind: '単品', col: 'cost', reason: 'exception_cost', value: genka, ne_value: p.原価 ?? null });
     if (!neRateKnown(p.消費税率)) {
-      reasons.push(taxRate != null
+      skuReasons.push(taxRate != null
         ? { code, kind: '単品', col: 'tax_rate', reason: 'tax_fallback', value: taxRate, source: 'product_tax_rate', ne_value: p.消費税率 ?? null }
         : { code, kind: '単品', col: 'tax_rate', reason: 'tax_unresolved', ne_value: p.消費税率 ?? null });
     }
-    if (startMarks.products.at && p.synced_at !== startMarks.products.at) reasons.push({ code, kind: '単品', col: '*', reason: 'not_in_latest_fetch', raw_synced_at: p.synced_at ?? null });
+    if (startMarks.products.at && p.synced_at !== startMarks.products.at) skuReasons.push({ code, kind: '単品', col: '*', reason: 'not_in_latest_fetch', raw_synced_at: p.synced_at ?? null });
+
+    // 今までの決め方の値 (NE・上書き表)。持ち主が C の列だけ Company DB の値に替える (④a。C が無ければ同じもの)
+    const neV = {
+      name: p.商品名, handling: p.取扱区分, price: p.売価, genka, genkaSource, genkaStatus,
+      shipCost: ps?.ship_cost ?? null, shipCode: ps?.shipping_code ?? null, shipMethod: ps?.ship_method ?? null,
+      taxRate, taxCategory, supplier: p.仕入先コード, salesClass: salesClassMap.get(code) ?? null,
+    };
+    const v = pub.overlay(code, neV);
+    pub.expect(code, neV);
+    reasons.push(...(v === neV ? skuReasons : mergeReasons(code, '単品', neV, v, skuReasons, { cells: pub.peek(code)?.v, generationNo: pub.generation?.generation_no })));
 
     const co = getCarryover(code);
     const launchDate = resolveLaunchDate(co.new_product_launch_date, p.作成日);
     insertStaging.run(
-      code, p.商品名, '単品', p.取扱区分,
-      p.売価, genka, genkaSource, genkaStatus,
-      ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
-      taxRate, taxCategory,
-      p.在庫数, p.引当数, p.仕入先コード, null, salesClassMap.get(code) ?? null,
+      code, v.name, '単品', v.handling,
+      v.price, v.genka, v.genkaSource, v.genkaStatus,
+      v.shipCost, v.shipCode, v.shipMethod,
+      v.taxRate, v.taxCategory,
+      p.在庫数, p.引当数, v.supplier, null, v.salesClass,
       co.seasonality_flag, co.season_months, co.new_product_flag, launchDate,
       ts
     );
@@ -339,89 +481,102 @@ async function rebuildMProductsLocked(db, buildId) {
     const neInfo = db.prepare('SELECT * FROM raw_ne_products WHERE 商品コード = ? COLLATE NOCASE').get(setCode);
     const ps = getShipping(setCode, neInfo?.代表商品コード);
 
-    // 原価計算 (構成品の原価 × 数量の合計。決め方は lib/master-set-rules.js の setCostFromComponents = マスタ入力画面と同じ)
-    const componentCostInputs = [];
-    // 税率は単品と同じ解決順 (NE値優先 → NE未登録(null/0)時のみ product_tax_rate) を
-    // 構成品ごとに適用してから集約する
-    const componentTaxInputs = [];
-    // 売上分類は構成品の登録値 (product_sales_class) を集約する
-    const componentSalesInputs = [];
+    // 構成品の入力 (今までの決め方)。税率は単品と同じ解決順 (NE値優先 → NE未登録(null/0)時のみ product_tax_rate) を
+    // 構成品ごとに適用してから集約する / 売上分類は構成品の登録値 (product_sales_class) を集約する /
     // 取扱区分は構成品の NE の値を集約する (構成品が止まればセットも止まる)
-    const componentHandlingInputs = [];
-
+    const neInputs = [];
+    // セット自身が Company DB にあるか。無い (NE にしか無いセット = 切替の後に NE にだけ足された) = セットは全部 NE の道で作る
+    //   (導いた値も構成品の名前・原価も NE の値。構成品が C にあっても C の値を使わない = 確かめも NE の値を待つ。Codex #1564 R1 H2)
+    const selfC = pub.active ? pub.peek(setCode) : null;
+    // Company DB の値で導き直すときの構成品の入力 (④a。セット自身が C にあるときだけ・持ち主が C の列だけ替える。NE に無い構成品は替えない = 今までどおり上流の異常として扱う)
+    const cInputs = [];
     for (const comp of components) {
       const compCode = comp.商品コード?.toLowerCase() || '';
-      componentCostInputs.push({ cost: comp.原価, qty: comp.数量 });
-      componentTaxInputs.push({
-        neTaxRate: comp.消費税率,
-        manualTaxRate: taxRateMap.get(compCode),
-        componentExists: !!comp.ne_exists,
-      });
-      componentSalesInputs.push({
-        salesClass: salesClassMap.get(compCode),
-        componentExists: !!comp.ne_exists,
-      });
-      componentHandlingInputs.push({
-        handlingClass: comp.取扱区分,
-        componentExists: !!comp.ne_exists,
-      });
+      const exists = !!comp.ne_exists;
+      const ne = {
+        cost: comp.原価, qty: comp.数量,
+        tax: { neTaxRate: comp.消費税率, manualTaxRate: taxRateMap.get(compCode), componentExists: exists },
+        sales: { salesClass: salesClassMap.get(compCode), componentExists: exists },
+        handling: { handlingClass: comp.取扱区分, componentExists: exists },
+      };
+      neInputs.push(ne);
+      let compName = comp.商品名 || '';
+      let compCost = comp.原価 || null;
+      const c = selfC && exists ? pub.of(compCode) : null;
+      if (c) {
+        const x = { ...ne };
+        if (pub.has(c, 'cost')) { x.cost = c.v.cost ? c.v.cost.jpy : null; compCost = x.cost || null; }
+        if (pub.has(c, 'tax_rate')) x.tax = { neTaxRate: neRateOfDecimal(c.v.tax_rate), manualTaxRate: undefined, componentExists: true };
+        if (pub.has(c, 'sales_class')) x.sales = { salesClass: c.v.sales_class, componentExists: true };
+        if (pub.has(c, 'handling')) x.handling = { handlingClass: handlingFromCdb(c.v.handling, comp.取扱区分), componentExists: true };
+        if (pub.has(c, 'name')) compName = c.v.name;
+        cInputs.push(x);
+      } else {
+        cInputs.push(ne);
+      }
 
-      // 構成品staging投入
+      pub.expectComponent(setCode, compCode, { name: comp.商品名 || '', cost: comp.原価 || null }, { fromCdb: !!c });
+      // 構成品staging投入 (構成商品名・構成商品原価は、持ち主が C なら C の値)
       insertComponentStaging.run(
         setCode, compCode, comp.数量 || 1,
-        comp.商品名 || '', comp.原価 || null, ts
+        compName, compCost, ts
       );
     }
 
-    const setCost = setCostFromComponents(componentCostInputs);
-    let genka = null, genkaSource = '不明', genkaStatus = 'MISSING';
-    if (eg) {
-      genka = eg.genka;
-      genkaSource = '例外';
-      genkaStatus = 'OVERRIDDEN';
-    } else if (setCost.status === 'COMPLETE') {
-      genka = setCost.jpy;
-      genkaSource = 'セット計算';
-      genkaStatus = 'COMPLETE';
-    } else if (setCost.status === 'PARTIAL') {
-      genkaStatus = 'PARTIAL';
+    // 原価・税区分・売上分類・取扱区分 (今までの決め方。deriveSetValues)
+    const neD = deriveSetValues({ inputs: neInputs, eg, manualSalesClass: salesClassMap.get(setCode), neSetStatus: neInfo?.取扱区分 });
+
+    const setReasons = [];   // このセットの理由 (今までと同じ順。C の値で変わった列だけ後で差し替える)
+    if (neD.genkaSource === '例外') setReasons.push({ code: setCode, kind: 'セット', col: 'cost', reason: 'exception_cost', value: neD.genka });
+    if (neD.taxCategory === 'MIXED' || neD.taxCategory === 'UNKNOWN') setReasons.push({ code: setCode, kind: 'セット', col: 'tax_rate', reason: 'set_tax_from_components', value: neD.taxRate, category: neD.taxCategory });
+    if (!sh.セット商品名 || !String(sh.セット商品名).trim()) setReasons.push({ code: setCode, kind: 'セット', col: 'name', reason: 'set_name_blank' });
+    if (neInfo && neInfo.売価 != null) setReasons.push({ code: setCode, kind: 'セット', col: 'price', reason: 'set_price_from_goods', value: neInfo.売価, set_master_value: sh.セット販売価格 ?? null });
+
+    const neV = {
+      name: sh.セット商品名, handling: neD.handling, price: neInfo?.売価 ?? sh.セット販売価格 ?? null,
+      genka: neD.genka, genkaSource: neD.genkaSource, genkaStatus: neD.genkaStatus,
+      shipCost: ps?.ship_cost ?? null, shipCode: ps?.shipping_code ?? null, shipMethod: ps?.ship_method ?? null,
+      taxRate: neD.taxRate, taxCategory: neD.taxCategory, supplier: neInfo?.仕入先コード ?? null, salesClass: neD.salesClass,
+    };
+    let v = neV;
+    if (selfC) {
+      // C の構成品の値で同じ決め方を通す (④a)。セット自身が C にあって原価の持ち主が C なら、セットの例外原価の行は使わない
+      //   (C の原価の行が人の決めた原価ならそれを重ねる = overlay の set)。
+      //   取扱区分はセット自身の C の値から。語は今までの決め方の値 (neD) に合わせる (C はセットの導いた値を持つ = 持ち主を替えただけで ﾒｰｶｰ取扱中止 → 取扱中止 にしない)
+      const self = selfC;
+      const cD = deriveSetValues({
+        inputs: cInputs,
+        eg: pub.has(self, 'cost') ? null : eg,
+        // 売上分類の持ち主が C = セットの手動の行 (product_sales_class) は使わない = 構成品の C の値から導くだけ (15 §5 の 2 の推奨・Codex R1 H3)
+        manualSalesClass: pub.owns('sales_class') ? undefined : salesClassMap.get(setCode),
+        neSetStatus: pub.has(self, 'handling') ? handlingFromCdb(self.v.handling, neD.handling) : neInfo?.取扱区分,
+      });
+      v = pub.overlay(setCode, {
+        ...neV, genka: cD.genka, genkaSource: cD.genkaSource, genkaStatus: cD.genkaStatus,
+        taxRate: cD.taxRate, taxCategory: cD.taxCategory, salesClass: cD.salesClass, handling: cD.handling,
+      }, { set: true });
     }
+    pub.expect(setCode, neV);
+    reasons.push(...(v === neV ? setReasons : mergeReasons(setCode, 'セット', neV, v, setReasons, { cells: pub.peek(setCode)?.v, generationNo: pub.generation?.generation_no })));
 
-    // 税区分 (構成品の税率から導出。MIXED は taxRate に最小値を入れる既存仕様を踏襲)
-    // 構成品が1つでも解決できなければ UNKNOWN に倒し、上流異常を握り潰さない
-    const { taxRate, taxCategory } = resolveSetTaxRate(componentTaxInputs);
-
-    // 売上分類 (手動登録が最優先。無ければ構成品の MIN から導出)
-    //   導出も効かない (構成品が未登録 / NE に無い) セットだけが NULL で残り、
-    //   register の「分類未登録」に出る。
-    const setSalesClass = salesClassMap.get(setCode) ?? resolveSetSalesClass(componentSalesInputs);
-    if (salesClassMap.get(setCode) == null && setSalesClass != null) countSetSalesDerived++;
-
-    // 取扱区分: NE のセット自身の値。それが 取扱中 (または NE に無い) なら構成品の止め方を引き継ぐ
-    //   (2026-09-14 中原さん指示。決定表は resolveSetHandlingClass)
-    const status = resolveSetHandlingClass(neInfo?.取扱区分, componentHandlingInputs);
+    if (salesClassMap.get(setCode) == null && v.salesClass != null) countSetSalesDerived++;
     // 件数は「従来の式 (NE の値 || 取扱中) から値が変わったセット」= m_products で実際に変わる件数を数える
     const prevStatus = neInfo?.取扱区分 || HANDLING_ACTIVE;
-    if (status !== prevStatus) {
+    if (v.handling !== prevStatus) {
       countSetHandlingDerived++;
-      if (setHandlingSamples.length < 5) setHandlingSamples.push(`${setCode}=${status}`);
+      if (setHandlingSamples.length < 5) setHandlingSamples.push(`${setCode}=${v.handling}`);
     }
-
-    if (genkaSource === '例外') reasons.push({ code: setCode, kind: 'セット', col: 'cost', reason: 'exception_cost', value: genka });
-    if (taxCategory === 'MIXED' || taxCategory === 'UNKNOWN') reasons.push({ code: setCode, kind: 'セット', col: 'tax_rate', reason: 'set_tax_from_components', value: taxRate, category: taxCategory });
-    if (!sh.セット商品名 || !String(sh.セット商品名).trim()) reasons.push({ code: setCode, kind: 'セット', col: 'name', reason: 'set_name_blank' });
-    if (neInfo && neInfo.売価 != null) reasons.push({ code: setCode, kind: 'セット', col: 'price', reason: 'set_price_from_goods', value: neInfo.売価, set_master_value: sh.セット販売価格 ?? null });
 
     const coSet = getCarryover(setCode);
     const setLaunchDate = resolveLaunchDate(coSet.new_product_launch_date, neInfo?.作成日);
     insertStaging.run(
-      setCode, sh.セット商品名, 'セット', status,
-      neInfo?.売価 ?? sh.セット販売価格 ?? null,
-      genka, genkaSource, genkaStatus,
-      ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
-      taxRate, taxCategory,
-      neInfo?.在庫数 ?? null, neInfo?.引当数 ?? null, neInfo?.仕入先コード ?? null,
-      components.length, setSalesClass,
+      setCode, v.name, 'セット', v.handling,
+      v.price,
+      v.genka, v.genkaSource, v.genkaStatus,
+      v.shipCost, v.shipCode, v.shipMethod,
+      v.taxRate, v.taxCategory,
+      neInfo?.在庫数 ?? null, neInfo?.引当数 ?? null, v.supplier,
+      components.length, v.salesClass,
       coSet.seasonality_flag, coSet.season_months, coSet.new_product_flag, setLaunchDate,
       ts
     );
@@ -442,8 +597,18 @@ async function rebuildMProductsLocked(db, buildId) {
 
     // 例外商品は NE に存在しないので neTaxNum=null。手動登録のみが税率ソース
     const { taxRate: exTaxRate, taxCategory: exTaxCategory } = resolveTaxRate(null, taxRateMap.get(sku));
-    reasons.push({ code: sku, kind: '例外', col: 'cost', reason: 'exception_cost', value: eg.genka });
-    if (exTaxRate != null) reasons.push({ code: sku, kind: '例外', col: 'tax_rate', reason: 'exception_tax_manual', value: exTaxRate });
+    const exReasons = [];   // この商品の理由 (今までと同じ順)
+    exReasons.push({ code: sku, kind: '例外', col: 'cost', reason: 'exception_cost', value: eg.genka });
+    if (exTaxRate != null) exReasons.push({ code: sku, kind: '例外', col: 'tax_rate', reason: 'exception_tax_manual', value: exTaxRate });
+    // 今までの決め方の値。持ち主が C の列だけ Company DB の値に替える (④a)
+    const neV = {
+      name: eg.商品名 || '', handling: '取扱中', price: null, genka: eg.genka, genkaSource: '例外', genkaStatus: 'OVERRIDDEN',
+      shipCost: ps?.ship_cost ?? null, shipCode: ps?.shipping_code ?? null, shipMethod: ps?.ship_method ?? null,
+      taxRate: exTaxRate, taxCategory: exTaxCategory, supplier: null, salesClass: salesClassMap.get(sku) ?? null,
+    };
+    const v = pub.overlay(sku, neV);
+    pub.expect(sku, neV);
+    reasons.push(...(v === neV ? exReasons : mergeReasons(sku, '例外', neV, v, exReasons, { cells: pub.peek(sku)?.v, generationNo: pub.generation?.generation_no })));
 
     const coEx = getCarryover(sku);
     // 例外商品も resolveLaunchDate を通すことで、carryover に既存の不正値
@@ -451,17 +616,34 @@ async function rebuildMProductsLocked(db, buildId) {
     // NE 商品ではないので NE 作成日 のフォールバックはなく、carryover のみを正規化する。
     const exLaunchDate = resolveLaunchDate(coEx.new_product_launch_date, null);
     insertStaging.run(
-      sku, eg.商品名 || '', '例外', '取扱中',
-      null, eg.genka, '例外', 'OVERRIDDEN',
-      ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
-      exTaxRate, exTaxCategory,
-      null, null, null, null, salesClassMap.get(sku) ?? null,
+      sku, v.name, '例外', v.handling,
+      v.price, v.genka, v.genkaSource, v.genkaStatus,
+      v.shipCost, v.shipCode, v.shipMethod,
+      v.taxRate, v.taxCategory,
+      null, null, v.supplier, null, v.salesClass,
       coEx.seasonality_flag, coEx.season_months, coEx.new_product_flag, exLaunchDate,
       ts
     );
     countException++;
   }
   log.push(`例外: ${countException}件`);
+  // Company DB の写し (④a): 使った世代・重ねた SKU・Company DB にしか無い SKU (m_products に足さない = not_in_ne)
+  let publishStats = null;
+  if (pub.active) {
+    publishStats = pub.stats();
+    log.push(`Company DB の写し: 世代 ${pub.generation.generation_no} (列 ${pub.cols.join('・')})・重ねた SKU ${publishStats.used}・`
+      + `Company DB にしか無い ${publishStats.not_in_ne} (足さない)・NE にしか無い ${publishStats.not_in_cdb} (写さない = NE の値のまま)`);
+    if (publishStats.not_in_cdb) {
+      // NE にしか無い SKU = Company DB にまだ無い (夜間ロードの前の新しい商品・切替の後に NE で直接登録された商品)。止めずに NE の値で作り、知らせる
+      warn.push(`Company DB に無い SKU ${publishStats.not_in_cdb} 件は NE の値のまま (写していない): ${publishStats.not_in_cdb_codes.join(', ')}`);
+      console.warn(`[m_products] ⚠️ Company DB に無い SKU ${publishStats.not_in_cdb} 件は NE の値のまま: ${publishStats.not_in_cdb_codes.join(', ')}`);
+    }
+    if (publishStats.kind_mismatch) {
+      // NE と C で種類が違う SKU (NE でセットを単品にした等) = その SKU だけ写さない (NE の値のまま)。止めずに知らせる (#1564 の見直し M-5)
+      warn.push(`NE と Company DB で種類が違う SKU ${publishStats.kind_mismatch} 件は NE の値のまま (写していない): ${publishStats.kind_mismatch_codes.join(', ')}`);
+      console.warn(`[m_products] ⚠️ NE と Company DB で種類が違う SKU ${publishStats.kind_mismatch} 件は NE の値のまま: ${publishStats.kind_mismatch_codes.join(', ')}`);
+    }
+  }
 
   // この作り直しが作った staging のハッシュ (品質チェックの前に取る = チェックした中身と入れ替える中身が同じことを入れ替えの取引で確かめる)
   const myStagingHash = stagingHash(db);
@@ -558,13 +740,44 @@ async function rebuildMProductsLocked(db, buildId) {
     return { ok: false, log, checks, warn, total: totalStaging };
   }
 
+  // ─── 変わらない作り直しは入れ替えない (#1564 Codex R2 Medium 5) ───
+  //   同じ NE の取得・同じ写しの世代・同じ中身・古い表が世代のまま = 業務の表も作り直しの記録も 1 行も書かない (updated_at も変わらない)
+  const same = unchangedSinceLastBuild(db, { startMarks, pub, ownership });
+  if (same.skip) {
+    const finalCount = db.prepare('SELECT COUNT(*) as cnt FROM m_products').get().cnt;
+    const compCount = db.prepare('SELECT COUNT(*) as cnt FROM m_set_components').get().cnt;
+    const msg = `⏭️ 前の作り直し (${same.build.build_id}) から何も変わっていない (同じ NE の取得・同じ写しの世代・同じ中身) = 入れ替えない`;
+    console.log(`[m_products] ${msg}`);
+    log.push(msg);
+    return { ok: true, skipped: 'unchanged', build_id: same.build.build_id, log, checks, warn, total: finalCount, components: compCount,
+      publish: { generation_no: same.build.cdb_publish_generation_no ?? null, epoch: epochNote, active: pub.active, cols: pub.cols, stats: publishStats,
+        side_tables: { exception_genka: { updated: 0, deleted: 0 }, product_shipping: { updated: 0, deleted: 0 }, m_reorder_setting: { updated: 0, inserted: 0, deleted: 0 } }, applied: same.applied } };
+  }
+
   // ─── Phase C: 本番反映 ───
 
   // 本番反映（明示列INSERT、列順破壊耐性あり）+ 作り直しの記録 (m_products_builds。同じ取引)
-  const build = applyStagingToProduction(db, { build: { buildId, startMarks, startedAt, expectedStagingHash: myStagingHash, reasons } });
+  //   + 上書き表の既にある行を持ち主が C の列の値にそろえる (④a。同じ取引・記録の前。持ち主が全部 load なら何もしない)
+  let build;
+  try {
+    build = applyStagingToProduction(db, { build: { buildId, startMarks, startedAt, expectedStagingHash: myStagingHash, reasons, publish: pub } });
+  } catch (e) {
+    if (!e || e.code !== 'CDB_PUBLISH_VERIFY') throw e;
+    const msg = `❌ 入れた後の確かめで Company DB の値と違う → 反映中止 (巻き戻した = 前の m_products のまま): ${String(e.message).slice(0, 300)}`;
+    console.error(`[m_products] ${msg}`);
+    return { ok: false, error: 'CDB_PUBLISH_VERIFY', log, checks: [...checks, msg], warn, total: totalStaging, publish: { applied: e.applied } };
+  }
   const markNote = (m) => (m.value ? m.value : `なし (${m.note})`);
-  console.log(`[m_products] 作り直しの記録: ${build.build_id} (NE の印 単品 ${markNote(build.marks.products)} / セット ${markNote(build.marks.set_components)} / 理由 ${JSON.stringify(build.reason_counts)})`);
+  console.log(`[m_products] 作り直しの記録: ${build.build_id} (NE の印 単品 ${markNote(build.marks.products)} / セット ${markNote(build.marks.set_components)} / 理由 ${JSON.stringify(build.reason_counts)}`
+    + ` / Company DB の写しの世代 ${build.publish?.generation_no ?? 'なし'})`);
   log.push(`作り直しの記録: ${build.build_id}`);
+  if (pub.active) log.push(`上書き表を Company DB の値にそろえた: ${JSON.stringify(build.side_tables)} / 入れた後の確かめ: ${JSON.stringify(build.applied.counts)}`);
+  if (pub.active && build.applied.counts.mixed_sets) {
+    // C にあるセットの構成品に NE にしか無い単品がある = 導いた値 (原価・税・売上分類・取扱区分) に C と NE の値が混ざる。止めずに知らせる (#1564 の見直し L-2)
+    const m = `Company DB にあるセットの構成品に NE にしか無い単品がある ${build.applied.counts.mixed_sets} 件 = 導いた値に C と NE の値が混ざる: ${build.applied.mixed_set_codes.join(', ')}`;
+    warn.push(m);
+    console.warn(`[m_products] ⚠️ ${m}`);
+  }
 
   // WAL肥大化防止
   try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
@@ -575,7 +788,8 @@ async function rebuildMProductsLocked(db, buildId) {
 
   log.push(`反映完了: ${finalCount}件 (構成品: ${compCount}件)`);
 
-  return { ok: true, log, checks, warn, total: finalCount, components: compCount };
+  return { ok: true, log, checks, warn, total: finalCount, components: compCount,
+    publish: { generation_no: build.publish?.generation_no ?? null, epoch: epochNote, active: pub.active, cols: pub.cols, stats: publishStats, side_tables: build.side_tables, applied: build.applied } };
 }
 
 // ─── 単体実行 ───

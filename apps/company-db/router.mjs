@@ -73,7 +73,7 @@ export const getLoadState = () => ({ current: state.current, last: state.last })
  * 開始 (単一飛行のガードはここ)。戻り値 = { started, current, done }
  *   done = 終わったときの current で解決する Promise (HTTP は使わない。夜間の再ロードが結果を待つのに使う)
  */
-export function startLoad({ dataDir, url, apply, host = 'render', log = (m) => console.log(m) }) {
+export function startLoad({ dataDir, url, apply, host = 'render', log = (m) => console.log(m), usePrepared = false }) {
   if (state.current) return { started: false, current: state.current, done: state.current._done || Promise.resolve(state.current) };
   const runId = newLoadRunId();
   const cur = { run_id: runId, dry_run: !apply, status: 'running', started_at: new Date().toISOString(), finished_at: null, summary: null, conflicts: null, unresolved: null, error: null, error_code: null };
@@ -89,7 +89,7 @@ export function startLoad({ dataDir, url, apply, host = 'render', log = (m) => c
   };
   // 202 を先に返してから始める (SQLite の読み取りも応答の後)
   setImmediate(() => {
-    runLoadOnce({ dataDir, url, apply, log, host, runId })
+    runLoadOnce({ dataDir, url, apply, log, host, runId, usePrepared })   // usePrepared = 切替の日に明示して頼んだロードだけ (毎晩の cron は active)
       .then((report) => done({ status: report.ok ? 'done' : 'failed', summary: report.summary || null, conflicts: (report.conflicts || []).length, unresolved: Object.fromEntries(Object.entries(report.unresolved || {}).map(([k, v]) => [k, v.length])), sources: report.plan_sources || null }))
       .catch((e) => { log(`[company-db load] FAILED ${runId}: ${e.message}`); done({ status: 'failed', error: String(e.message), error_code: e.code || null, summary: e.report?.summary || null }); });
   });
@@ -110,9 +110,11 @@ router.post('/load', requireSyncKey, (req, res) => {
   if (!dataDir || !url) return res.status(503).json({ error: 'DATA_DIR / COMPANY_DB_URL not configured' });
   if (!fs.existsSync(path.join(dataDir, 'warehouse-mirror.db'))) return res.status(409).json({ error: 'warehouse-mirror.db not found (run on Render)' });
   const apply = String(req.query.apply || '') === '1';
+  // 切替の日だけ: prepared の持ち主で動かす (0053。master-ownership-epoch.mjs prepare の後に remote-load.mjs load --apply --use-prepared)
+  const usePrepared = String(req.query.use_prepared || '') === '1';
   let interrupted = null;
   try { interrupted = interruptedRecord(dataDir); } catch (e) { interrupted = { error: e.message }; }
-  const r = startLoad({ dataDir, url, apply });
+  const r = startLoad({ dataDir, url, apply, usePrepared });
   if (!r.started) return res.status(409).json({ error: 'load already running', run_id: r.current.run_id, started_at: r.current.started_at });
   res.status(202).json({ accepted: true, run_id: r.current.run_id, dry_run: r.current.dry_run, started_at: r.current.started_at, status_url: '/apps/company-db/sync/status', previous_interrupted: interrupted });
 });

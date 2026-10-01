@@ -46,7 +46,7 @@ function clearRunning(dir, runId) {
   if (cur && cur.run_id === runId) { try { fs.unlinkSync(runningPath(dir)); } catch { /* 無ければよい */ } }
 }
 
-export async function runLoadOnce({ dataDir, url, apply = false, outDir, log = console.log, host, runId: runIdIn } = {}) {
+export async function runLoadOnce({ dataDir, url, apply = false, outDir, log = console.log, host, runId: runIdIn, usePrepared = false } = {}) {
   const runId = runIdIn || newLoadRunId();
   const dir = reportDir(dataDir, outDir);
   const l = (m) => log(`[company-db load] ${m}`);
@@ -72,7 +72,7 @@ export async function runLoadOnce({ dataDir, url, apply = false, outDir, log = c
   const db = pgAdapter(client);
   let report;
   try {
-    report = await runInitialLoad(db, plan, { runId, dryRun: !apply, log: l, host: host || os.hostname() });
+    report = await runInitialLoad(db, plan, { runId, dryRun: !apply, log: l, host: host || os.hostname(), usePrepared });
   } catch (e) {
     report = e.report || { run_id: runId, dry_run: !apply, ok: false, started_at: startedAt, error: String(e.message), sections: {}, conflicts: [], unresolved: {} };
     throw Object.assign(e, { report });
