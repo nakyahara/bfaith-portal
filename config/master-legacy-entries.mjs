@@ -134,10 +134,13 @@ export const LEGACY_ENTRIES = Object.freeze([
  *   replication    = 写しの口 (人の入口ではない)。試験: そのルートの定義に guard (例 requireSyncKey) が付いている
  *   already_closed = 別の門で閉じ済み。試験: guard が router.use で全部の書き込みの前に掛かっている
  *   manual         = 機械では閉じられない入口 (NE の画面・GAS)。コードを持たない (file・method・path を持たない)。切替の証拠 manual_entries_stopped に載せる
+ *   seed_on_read   = 読むとき、ファイルが無い・空なら初期データ (コードの中の値) を書くだけ (人の入力ではない・あるファイルは変えない)。
+ *                    試験: writer_file に guard (初期データを書く呼び出し) と existsSync (無いときだけ) がある
  */
 export const LEGACY_EXEMPT = Object.freeze([
   Object.freeze({ id: 'warehouse-mirror:POST:/api/sync', kind: 'replication', host: 'render', file: 'apps/warehouse-mirror/router.js', method: 'POST', path: '/api/sync', guard: 'requireSyncKey', reason: 'miniPC → Render の写し (人の入口ではない。切替後は ④ の写しが同じ口で Company DB の値を運ぶ)' }),
   Object.freeze({ id: 'warehouse:render-writes', kind: 'already_closed', host: 'render', file: 'apps/warehouse/router.js', guard: 'rejectWritesOnRender', reason: '10 §4 #3 = Render では warehouse の書き込みは全部 409 (切替と関係なく閉じ済み)' }),
+  Object.freeze({ id: 'profit-calculator:GET:/api/suppliers', kind: 'seed_on_read', host: 'render', file: 'apps/profit-calculator/router.js', method: 'GET', path: '/api/suppliers', writer_file: 'apps/profit-calculator/suppliers.js', guard: 'saveSuppliers(DEFAULT_SUPPLIERS)', reason: '仕入れ先の一覧を読むとき、suppliers.json が無い・空なら初期データ (DEFAULT_SUPPLIERS) を書くだけ。人の入力ではない・あるファイルは変えない (仕入れ先の追加・削除は閉じる入口)' }),
   Object.freeze({ id: 'ne:item-screen', kind: 'manual', host: 'ne', reason: '10 §4 #1。機械では閉じられない = 運用で禁止・切替の証拠 (manual_entries_stopped) に担当者と止めた時刻 (契約 v3 H1)' }),
   Object.freeze({ id: 'gas:logizard-sheet-and-sku-map', kind: 'manual', host: 'google', reason: '10 §4 #12・#13。⑥ で順番に止める・切替の証拠 (manual_entries_stopped) に載せる' }),
 ]);
@@ -175,6 +178,13 @@ export const MASTER_WRITE_TARGETS = Object.freeze({
   new_products: Object.freeze([
     Object.freeze({ id: 'product_drafts (新商品の下書き)', match: /INSERT\s+INTO\s+product_drafts\b/i }),
   ]),
+  /**
+   * 外への出口 (GET でも数える = 読むだけに見えて、NE のマスタを書き換えるファイルを作る。Codex #1565 R2 Low 4)。
+   * NE の商品マスタの一括取込の CSV (syohin_code と 原価・売価・仕入先・セットの数量の列) を作るかたまり
+   */
+  exports: Object.freeze([
+    Object.freeze({ id: 'NE の商品マスタ取込の CSV (syohin_code・genka_tnk / baika_tnk / sire_code / suryo)', match: /\b(?:set_)?syohin_code\b[\s\S]*\b(?:genka_tnk|baika_tnk|sire_code|suryo)\b/ }),
+  ]),
   /** 表の名前を変数で渡す書き手 (SQL の文字に表の名前が出ない)。file のかたまりにこの文字があれば「書く」 */
   dynamic: Object.freeze([
     Object.freeze({ id: 'po_suppliers (発注アプリの MASTER_DEFS)', file: 'apps/purchase-orders/router.js', match: Object.freeze(['upsertMasterRow(def, row);', 'upsertMasterRow(MASTER_DEFS[', 'DELETE FROM ${def.table}']) }),
@@ -194,7 +204,7 @@ export const MASTER_WRITE_TARGETS = Object.freeze({
   for (const e of LEGACY_EXEMPT) {
     if (seen.has(e.id)) throw new Error(`master-legacy-entries: id が重なっている: ${e.id}`);
     seen.add(e.id);
-    if (!['replication', 'already_closed', 'manual'].includes(e.kind)) throw new Error(`master-legacy-entries: 閉じない口の知らない kind: ${e.id} ${e.kind}`);
+    if (!['replication', 'already_closed', 'manual', 'seed_on_read'].includes(e.kind)) throw new Error(`master-legacy-entries: 閉じない口の知らない kind: ${e.id} ${e.kind}`);
   }
 }
 

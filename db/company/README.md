@@ -754,24 +754,27 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   - 定期実行: product-hub の NE が先の自動取込 (intake-cron) は丸ごと止める (閉じている = ok の ping で「止めた」・読めない = fail の ping)。
 - **段階の読み方**:
   - 接続先 = この場所の門のログイン (下) → 無ければ `COMPANY_DB_URL` (Render)。🚨 見張りの `COMPANY_DB_WATCH_URL` (watcher・接続 3 本まで) には落ちない = miniPC は門のログインが無いと古い入口が全部 503。
-  - 🚨 書き込み・CLI は**毎回**読む。前に読めた値は使わない。プロセスごとに接続 **1 本**のプールを 10 分つないだままにする (miniPC → Render はつなぎ直すと TLS と認証で 0.5〜0.8 秒) と 1 回の読み直し (200ms 後)。読めない = 503 / 終了コード 3。
+  - 🚨 書き込み・CLI は**毎回**読む。前に読めた値は使わない。プロセスごとに接続 **1 本**のプールを 10 分つないだままにする (miniPC → Render はつなぎ直すと TLS と認証で 0.5〜0.8 秒) と 1 回の読み直し (200ms 後)。門の記録もこの 1 本で書く = プロセスあたり 1 本 (配り直しで古い + 新しいが重なっても 2 本)。読めない = 503 / 終了コード 3。
   - 画面の帯だけ前の結果を使う (読めた = 30 秒・読めない = 5 秒)。古ければ同時の画面で 1 回の読みを分け合い、1 秒待つ (読み直さない・表示だけ)。1 秒で返らない = その画面だけ 5 分前までの読めた結果を見せる (無ければ読めない扱い)。打ち切りは使い回さず、遅れて返った結果を使い回しに入れる。
   - 読めなかった回数・断った回数 (410・503)・切れた相手・画面の打ち切り・書かない試しを通した回数・読むのにかかった時間は読み戻しに出す。1 秒を超えた読みと読めなかった回はログに出す。
   - 読む時間を測る (読むだけ): `node -r dotenv/config scripts/company-db/master-legacy-latency.mjs --host minipc` = つなぎ直し + 読む / つないだまま読む の p50・p95・いちばん遅い。
-- **drain (書きかけを流し終える)**: 門を通った書き込みは、終わるまでプロセスの中で数える (件数・いちばん古い開始)。CSV の取込は受け取った後・書く前にもう一度段階を読む (受け取っている間に frozen になっても書かない・受け取ったファイルも消す)。
+- **drain (書きかけを流し終える)**: 門を通った書き込みは、終わるまでプロセスの中で数える (件数・いちばん古い開始・入口ごと)。CSV の取込は受け取った後・書く前にもう一度段階を読む (受け取っている間に frozen になっても書かない・受け取ったファイルも消す)。
+  - 🚨 終わり = ハンドラが応答を返したとき (`res.end`)。相手が切れた (`close`) では減らさない (async のハンドラは相手が切れても動き続けて書く)。外の API (Notion など) を待ってから書くハンドラは `legacyHandler` で包み (promise が終わるまで数える)、書く直前に `legacyWriteFence(res)` (相手が切れた・段階が変わった・止めている途中 = 書かない)。応答を返さないまま終わらないハンドラは数えが残る = 段階を進められない (安全側・読み戻しの `oldest_started_at` で見える)。
+  - 定期実行 (product-hub の自動取込) は `runLegacyJob` の中 = 段階を毎回読み、取込の間は書きかけに数える (`inflight.by_entry`)。
 - **門の記録 (ack) = ⑤-1 の `ops.record_legacy_gate_ack` (`lib/master-cutover.mjs` の `recordLegacyGateAck`)**:
   - 書くのは**場所ごとの門のログイン** (⑤-1 の `master_gate` の中の LOGIN ロール。関数は `session_user` と場所が違えば拒む):
     - Render = `COMPANY_DB_MASTER_GATE_RENDER_URL` (`master_gate_render`)
     - miniPC = `COMPANY_DB_MASTER_GATE_MINIPC_URL` (`master_gate_minipc`)
     - 🚨 ほかの場所のログインは使わない (miniPC は Render の URL があっても書かない)。ログインと場所が違う = DB が `gate_host_mismatch` (42501) で拒む (env の取り違え)。
     - 場所の判定は server.js と読み戻しの API で同じ (`legacyAckHost()` = Render / miniPC の WarehouseServer (`PORTAL_VARIANT=warehouse`) / それ以外 = 書かない)。
-  - いつ: 起動のとき・要求が来たついでに 5 分おき (新しい定期実行は作らない)・読み戻しを呼んだとき・止めるとき (SIGTERM / SIGINT = 「止めた」と理由 (200 字まで)・書きかけ 0・長くても 2 秒で諦めて止まる。返事の stopped も確かめる)。
+  - いつ: 起動のとき・要求が来たついでに 5 分おき (新しい定期実行は作らない)・読み戻しを呼んだとき・止めるとき (SIGTERM / SIGINT = 受付を閉じる → 記録の書き直しをやめ、新しい書き込みは 503 (`master_shutting_down`)・生きている書き込みの切符を止める → 書いている途中の普通の記録を待つ → 「止めた」と理由 (200 字まで)・書きかけ 0 を **1 回だけ**。全部で長くても 5 秒。途中の普通の記録が終わらない = 「止めた」は書かない (順番を守る = 最後の記録が stopped = false に戻らない)。返事の stopped も確かめる)。
   - miniPC の WarehouseServer は WinSW のサービス (止めるときは Ctrl+C = Node の SIGINT のはずだが、届いたか・2 秒で書けたかは分からない) → **次の起動で、前の起動のプロセスが居なければ「止めた」を書く** (名札は `DATA_DIR/master-legacy-instance.json`)。前の pid がまだある (使い回しを含む)・別の PC = 書かない (安全側)。Render は止めるとき SIGTERM を送り待つので使わない。
   - 中身: host・プロセスの名札 (`RENDER_INSTANCE_ID` か PC 名 + pid + 起動の乱数)・build の番号 (Render = `RENDER_GIT_COMMIT`・miniPC = git の HEAD)・一覧 (manifest `{ entries: [{ id, kind: code | manual }] }`・ハッシュは DB が計算)・持ち主表・見た段階・書きかけの件数といちばん古い開始。
   - 書く前に確かめる (場所・build の番号・段階を読める・門のログインがある・関数がある)。書いた後に返事 (`ack_id`・DB が同じ一覧から計算した `manifest_hash`・`acked_at`・`stopped`) を確かめてから `acked`。だめなら書かずに理由をログ (同じ理由は 1 回) と読み戻しに出す (関数が無い = 0050 の前 = 注意 1 回)。書く間に段階が変わった (`stale_phase`) = 読み直して 1 回だけ書き直す。
   - 止まり方が分からないプロセス (落ちた・電源・2 秒で書けなかった) = ⑤-1 の段階を進める関数は「24 時間以内に記録があり、最後の記録が 15 分より前で『止めた』でもない」プロセスがあると進めない → 人が止まったのを確かめて `node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list` / `--stop --host minipc --instance <名札> --reason "…" --yes` (手の操作・定期実行にしない)。🚨 15 分以内に記録があるプロセスは `--force` が無いと拒む (動いているかもしれない)。
 - **読み戻し**: `GET /apps/warehouse/api/master-legacy-gate` (miniPC と Render の両方にある) = その環境・**その 1 つのプロセス**が見ている段階・書けるか・manifest_hash (最後に DB が受け取った一覧)・一覧の数・持ち主表のハッシュ・build の番号・名札・書きかけ (`inflight.count`・`oldest_started_at`)・数・門の記録 (呼ぶと記録も書き直す)。全部のプロセスは `master-legacy-instance.mjs --list` で見る。
 - 🚨 **マージの前に** (PR の本文のチェックリスト。miniPC の PowerShell 5.1 で。まだ流さない → 中原さんの OK の後):
+  - ⚠️ **この PR は後方互換ではない (今の環境のままでは動かない)**: 0050 の本適用・**両方**の門のログインの env (Render の `COMPANY_DB_MASTER_GATE_RENDER_URL`・miniPC の `COMPANY_DB_MASTER_GATE_MINIPC_URL`)・配る前の確かめ (readiness が両方とも終了コード 0) が**そろうまでマージしない**。どれか欠けたまま配る = その場所の古い入口 (/register・会計アプリ・税率・仕入先・手の取込) が全部 503 / 終了コード 3 で止まる。
   1. 0050 (⑤-1) が本番に本適用済み (表が無い = 読めない = 古い入口が全部 503 で閉じる)。
   2. ⑤-1 の `create-master-edit-roles.mjs` を流し、出た `COMPANY_DB_MASTER_GATE_RENDER_URL` を Render の env に、`COMPANY_DB_MASTER_GATE_MINIPC_URL` を miniPC の .env に入れた (miniPC は `Restart-Service WarehouseServer`)。パスワードが出るのはロールを初めて作ったときだけ。もうあって接続文字列が分からない = `--rotate-password master_gate_render` (または `master_gate_minipc`) で変えて、その場所の env を同じ日に書き換える。
   3. **このブランチの miniPC の worktree** で配る前の確かめ (読むだけ・何も書かない。Render の Shell にはマージ前はこのスクリプトが無い):

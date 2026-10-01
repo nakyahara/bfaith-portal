@@ -143,13 +143,21 @@ const entryKeys = new Set(LEGACY_ENTRIES.filter((e) => e.file && e.method && e.p
 const exemptKeys = new Set(LEGACY_EXEMPT.filter((e) => e.file && e.method && e.path).map(listedKey));
 const routeIndex = new Set();
 const flagged = [];
+/**
+ * GET も見る (Codex #1565 R2 Low 4: GET を丸ごと飛ばすと、読むだけに見えて外に出す口を見落とす)。
+ * GET で数えるのは: マスタの表・列・ファイルに書く (POST と同じ決め方) / NE のマスタを書き換えるファイルを作る (MASTER_WRITE_TARGETS.exports)
+ */
+const exportOf = (b) => {
+  for (const x of MASTER_WRITE_TARGETS.exports) if (x.match.test(b.text)) return `外への出口 (${x.id})`;
+  return null;
+};
+const flaggedGets = [];
 for (const b of blocks) {
   if (!b.route) continue;
   const key = `${b.file} ${b.route.method} ${b.route.path}`;
   routeIndex.add(key);
-  if (b.route.method === 'GET') continue;
-  const why = whyOf(b);
-  if (why) flagged.push({ key, why });
+  const why = b.route.method === 'GET' ? (whyOf(b) || exportOf(b)) : whyOf(b);
+  if (why) { flagged.push({ key, why }); if (b.route.method === 'GET') flaggedGets.push({ key, why }); }
 }
 if (SHOW) for (const x of flagged) console.log(`    · ${x.key} ← ${x.why}`);
 const missing = flagged.filter((x) => !entryKeys.has(x.key) && !exemptKeys.has(x.key));
@@ -159,13 +167,17 @@ ok(missing.length === 0, 'マスタに書くルートは全部 LEGACY_ENTRIES �
 const mustFind = ['apps/product-hub/router.js POST /api/notion-import', 'apps/product-hub/router.js POST /api/register-codes', 'apps/profit-calculator/router.js POST /api/suppliers', 'apps/supplier-sales/router.js POST /api/supplier-name'];
 ok(mustFind.every((k) => flagged.some((x) => x.key === k)), '別のファイルの関数越しに書くルートも見つける (Notion の取込・NE のコードから登録・仕入れ先 JSON・売れ筋共有の表示名)',
   mustFind.filter((k) => !flagged.some((x) => x.key === k)).join(', '));
+// GET の外への出口も決まりで見つける (一覧に手で足したものに頼らない)
+ok(flaggedGets.some((x) => x.key === 'apps/profit-calculator/router.js GET /api/products/csv/ne'), 'GET でも、NE のマスタ取込の CSV を作る口 (profit-calculator の /api/products/csv/ne) を決まりで見つける',
+  flaggedGets.map((x) => `${x.key} ← ${x.why}`).join('\n      ') || '(GET は 1 つも見つからない)');
+if (SHOW) for (const x of flaggedGets) console.log(`    · GET ${x.key} ← ${x.why}`);
 
 console.log('── 2. 一覧がコードと合う・閉じない口の理由を確かめる ──');
 const stale = [...LEGACY_ENTRIES, ...LEGACY_EXEMPT].filter((e) => e.file && e.method && e.path).filter((e) => !routeIndex.has(listedKey(e)));
 ok(stale.length === 0, '一覧のルート・画面がコードにある (古い行が無い)', stale.map((e) => `${e.id} → ${listedKey(e)}`).join('\n      '));
 ok(LEGACY_ENTRIES.every((e) => WHEN_FROZEN[e.when_frozen]), '閉じる入口は全部 when_frozen (閉じたときの動き) を持つ');
 // 閉じる route・route_field・route_part は本当に書く (書かないものを載せて数をごまかさない)
-const notWriting = LEGACY_ENTRIES.filter((e) => ['route', 'route_field', 'route_part'].includes(e.kind) && e.method !== 'GET').filter((e) => !flagged.some((x) => x.key === listedKey(e)));
+const notWriting = LEGACY_ENTRIES.filter((e) => ['route', 'route_field', 'route_part'].includes(e.kind)).filter((e) => !flagged.some((x) => x.key === listedKey(e)));
 ok(notWriting.length === 0, '閉じる API は本当にマスタに書く (見つけた書き込みの口と一致)', notWriting.map((e) => e.id).join(', '));
 for (const e of LEGACY_EXEMPT) {
   if (e.kind === 'replication') {
@@ -179,6 +191,9 @@ for (const e of LEGACY_EXEMPT) {
     ok(useAt >= 0 && (firstWrite < 0 || useAt < firstWrite), `閉じ済み ${e.id}: router.use(${e.guard}) が全部の書き込みのルートより前`);
   } else if (e.kind === 'manual') {
     ok(!e.file && !e.method && !e.path, `手の入口 ${e.id}: コードを持たない (切替の証拠 manual_entries_stopped に載せる)`);
+  } else if (e.kind === 'seed_on_read') {
+    const src = text.get(e.writer_file) || '';
+    ok(e.method === 'GET' && src.includes(e.guard) && src.includes('existsSync('), `初期データだけの口 ${e.id}: ${e.writer_file} は無いときだけ ${e.guard} を書く`);
   }
 }
 
@@ -242,7 +257,8 @@ console.log('── 5. 門が実際に掛かっている ──');
   }
   for (const e of LEGACY_ENTRIES.filter((x) => x.kind === 'job')) {
     const src = text.get(e.file) || '';
-    ok(/const gate = await checkLegacyGate\(\{ purpose: 'write' \}\);\s*\n\s*if \(gate\.writable !== true\) \{[\s\S]{0,600}?return;/.test(src), `${e.id}: 毎回段階を読み、閉じていれば丸ごと止める (ログを残して return)`);
+    // 門の共通の包み (runLegacyJob = 毎回段階を読む・終わるまで書きかけに数える。Codex #1565 R2 Medium 2) を通し、流さなかったら丸ごと止める
+    ok(src.includes(`await runLegacyJob('${e.id}', `) && /if \(!job\.ran\) \{[\s\S]{0,600}?return;/.test(src), `${e.id}: 門の共通の包み (runLegacyJob) で毎回段階を読み・書きかけに数え、閉じていれば丸ごと止める (ログを残して return)`);
   }
   for (const e of LEGACY_ENTRIES.filter((x) => x.kind === 'route_part')) {
     const b = blocks.find((x) => x.route && x.file === e.file && x.route.method === e.method && x.route.path === e.path);

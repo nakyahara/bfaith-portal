@@ -130,7 +130,7 @@ import {
   suggestShopCategories, canAutoApplyShopCategory, countSelectableShopCategories,
   shopCategoriesNeverSaved, isAutoApplyRequestValid,
 } from './lib/shop-categories.js';
-import { masterLegacyGate, legacyBannerHtml, checkLegacyGate } from '../../lib/master-legacy-gate.mjs';
+import { masterLegacyGate, legacyBannerHtml, checkLegacyGate, legacyHandler, legacyWriteFence, respondIfLegacyAborted } from '../../lib/master-legacy-gate.mjs';
 import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
 import { resolveListingTax } from './services/listing-tax.mjs';
 
@@ -2837,7 +2837,8 @@ router.post('/api/intake/run', (req, res) => {
 // 商品コード指定で Notion 既存カードを取り込む。**読み取り専用** (Notion へ書き戻さない)。
 // 取り込んだ行は source='notion_import' で印が付き、notion-card.js の同期経路から外れる。
 
-router.post('/api/notion-import', async (req, res) => {
+// 🚨 Notion を待ってから書く = legacyHandler で包む (終わるまで書きかけに数える) + 書く直前に legacyWriteFence (Codex #1565 R2 High 1)
+router.post('/api/notion-import', legacyHandler(async (req, res) => {
   const codes = parseNeCodes(req.body?.codes);
   if (codes.length === 0) {
     return res.status(400).json({ ok: false, error: '商品コードを1件以上入力してください' });
@@ -2846,33 +2847,35 @@ router.post('/api/notion-import', async (req, res) => {
     return res.status(400).json({ ok: false, error: `一度に取り込めるのは ${MAX_IMPORT_CODES} 件までです (指定: ${codes.length} 件)` });
   }
   try {
-    const { results, summary } = await importFromNotion(codes, { actor: actorOf(req) });
+    const { results, summary } = await importFromNotion(codes, { actor: actorOf(req), beforeWrite: () => legacyWriteFence(res) });
     res.json({ ok: summary.failed === 0, summary, results });
   } catch (e) {
+    if (respondIfLegacyAborted(res, e)) return;
     // Notion env 未設定 (fail-closed) 等。取り込みは検証機能なので落ちても他機能に影響させない。
     // 詳細はサーバーログに残し、クライアントには内部情報を返さない (Codex R1 low-7)
     console.error('[product-hub] notion-import failed:', e);
     res.status(500).json({ ok: false, error: '取り込みに失敗しました (詳細はサーバーログを確認してください)' });
   }
-});
+}));
 
 // ─── API: Notion ステータス①〜⑥の一括移植 (2026-08-25 中原さん指示) ───
 // Status が ①〜⑥ の商品のうち**このアプリにカードが無いものだけ**を取り込む。
 // 既定は dry_run (書き込みなしのプレビュー)。実行は dry_run: false の明示が必要。
 // Notion 画像DB (商品ページ商品画像登録) の対象ステータスを移植 (2026-08-26 中原さん指示)。
 // #922 と同じ admin 限定・dryRun 既定・snapshot 一致必須。要件定義 = AI_reference『Notion画像DB移植_要件定義_20260826.md』
-router.post('/api/notion-image-import', async (req, res) => {
+router.post('/api/notion-image-import', legacyHandler(async (req, res) => {
   if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin のみ実行できます' });
   try {
     const dryRun = req.body?.dry_run !== false; // 安全側デフォルト
     const expectedSnapshot = typeof req.body?.expected_snapshot === 'string' ? req.body.expected_snapshot : null;
-    const r = await importImageDbByStatus({ actor: actorOf(req), dryRun, expectedSnapshot });
+    const r = await importImageDbByStatus({ actor: actorOf(req), dryRun, expectedSnapshot, beforeWrite: () => legacyWriteFence(res) });
     res.json({
       ok: true, dryRun, statuses: r.statuses, missingStatuses: r.missingStatuses, total: r.total,
       summary: r.summary, snapshot: r.snapshot,
       results: r.results.slice(0, 300), truncated: r.results.length > 300,
     });
   } catch (e) {
+    if (respondIfLegacyAborted(res, e)) return;
     if (e && (e.code === 'snapshot_mismatch' || e.code === 'missing_statuses')) {
       return res.status(409).json({ ok: false, error: e.message });
     }
@@ -2882,20 +2885,21 @@ router.post('/api/notion-image-import', async (req, res) => {
     console.error('[product-hub] notion-image-import failed:', e);
     res.status(500).json({ ok: false, error: '移植に失敗しました (詳細はサーバーログを確認してください)' });
   }
-});
+}));
 
-router.post('/api/notion-import-by-status', async (req, res) => {
+router.post('/api/notion-import-by-status', legacyHandler(async (req, res) => {
   if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin のみ実行できます' });
   try {
     const dryRun = req.body?.dry_run !== false; // 安全側デフォルト
     const expectedSnapshot = typeof req.body?.expected_snapshot === 'string' ? req.body.expected_snapshot : null;
-    const r = await importByNotionStatus({ actor: actorOf(req), dryRun, expectedSnapshot });
+    const r = await importByNotionStatus({ actor: actorOf(req), dryRun, expectedSnapshot, beforeWrite: () => legacyWriteFence(res) });
     // 一覧は大きくなりうるので 300 件で打ち切る (全体の件数は summary / total にある)
     res.json({
       ok: true, dryRun, statuses: r.statuses, total: r.total, summary: r.summary, snapshot: r.snapshot,
       results: r.results.slice(0, 300), truncated: r.results.length > 300,
     });
   } catch (e) {
+    if (respondIfLegacyAborted(res, e)) return;
     // プレビュー後に Notion 側が変わった → 書き込まず再プレビューを要求 (Codex R1 high)
     if (e && e.code === 'snapshot_mismatch') {
       return res.status(409).json({ ok: false, error: e.message });
@@ -2903,7 +2907,7 @@ router.post('/api/notion-import-by-status', async (req, res) => {
     console.error('[product-hub] notion-import-by-status failed:', e);
     res.status(500).json({ ok: false, error: '移植に失敗しました (詳細はサーバーログを確認してください)' });
   }
-});
+}));
 
 // 取り込んだテストデータの掃除。**取り込み由来だけ**削除可 (ポータル起点の商品は消させない)。
 // Notion 側のカードには一切触らない (ポータル DB の行を消すだけ)。

@@ -1151,7 +1151,7 @@ app.post('/admin/users/reset-password', requireAdmin, (req, res) => {
 // --- 起動 ---
 bootNote('web', `server.js ロード完了 (Node ${process.version}, PORT=${PORT}, RENDER=${!!process.env.RENDER})`);
 bootStart('web', 'express-listen');
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   bootEnd('web', 'express-listen', `port=${PORT}`);
   console.log(`B-Faith Portal running at http://localhost:${PORT}`);
 
@@ -1275,10 +1275,12 @@ app.listen(PORT, () => {
   startCompanyDbInventoryHourlyCron();
 });
 
-// 止めるとき: マスタの古い入口の門の「止めた」を書いてから終わる (長くても 2 秒。書けなくても止まる = 人が master-legacy-instance.mjs で「止めた」を書ける)
+// 止めるとき: マスタの古い入口の門の「止めた」を書いてから終わる (長くても 5 秒。書けなくても止まる = 次の起動 (miniPC) か人が master-legacy-instance.mjs で「止めた」を書ける)
 function stopLegacyGateThenExit(signal) {
   if (!LEGACY_ACK_HOST) return process.exit(0);
-  ackLegacyGatesStopped({ host: LEGACY_ACK_HOST, reason: `${signal} で止めた`, timeoutMs: 2000 })
+  // 受付を閉じる (新しい要求を受けない) → 書いている途中の門の記録を待つ → 「止めた」を 1 回 (lib が順番を守る・長くても 5 秒)
+  try { httpServer.close(); } catch { /* 閉じ済み */ }
+  ackLegacyGatesStopped({ host: LEGACY_ACK_HOST, reason: `${signal} で止めた`, timeoutMs: 5000 })
     .then((r) => bootNote('web', `門の「止めた」: ${r.state}`))
     .catch(() => {})
     .finally(() => process.exit(0));

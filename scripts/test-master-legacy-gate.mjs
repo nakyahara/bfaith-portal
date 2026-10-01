@@ -145,7 +145,7 @@ await t('一覧: app ごとの入口・知らない app の門は起動時に落
   assert.throws(() => G.masterLegacyGate('no-such-app'));
   assert.equal(E.cliEntry('apps/warehouse/csv-import.js', 'product_shipping').id, 'cli:csv-import.js:product_shipping');
   assert.equal(E.cliEntry('apps/warehouse/csv-import.js', 'orders'), null);
-  assert.ok(E.LEGACY_EXEMPT.every((e) => ['replication', 'already_closed', 'manual'].includes(e.kind)));
+  assert.ok(E.LEGACY_EXEMPT.every((e) => ['replication', 'already_closed', 'manual', 'seed_on_read'].includes(e.kind)));
 });
 await t('CLI の門: legacy_open = 通す / 閉じた・読めない = 理由を出して終了コード 3 (process.exit は呼ばない)', async () => {
   const logs = [];
@@ -372,6 +372,7 @@ await t('止めるとき: 「止めた」の記録 (理由つき・書きかけ 
   try {
     setPhase('legacy_open');
     const r = await G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM で止めた', env: { RENDER_GIT_COMMIT: 'b'.repeat(40) }, timeoutMs: 2000 }).catch((e) => ({ state: 'x', detail: e.message }));
+    G.__resetLegacyAck();   // 止めている途中の印を戻す (この後の試験のため)
     assert.equal(r.state, 'precheck_failed', '門のログインが無い = 書かない (止まるのは待たせない)');
     const r2 = await G.ackLegacyGates({ host: 'minipc', connect: fakeGateDb({ calls }), env: { RENDER_GIT_COMMIT: 'b'.repeat(40) }, stopped: true, stoppedReason: 'SIGTERM で止めた' });
     assert.equal(r2.state, 'stopped', r2.detail);
@@ -446,6 +447,126 @@ await t('中間レビュー 2 回目 Low: 門の記録の場所は server.js と
   assert.ok(router.includes('legacyGateStatus({ host: legacyAckHost() })'));
   const { percentile } = await import('./company-db/master-legacy-latency.mjs');
   assert.deepEqual([percentile([5, 1, 3, 2, 4], 50), percentile(Array.from({ length: 20 }, (_, i) => i + 1), 95), percentile([], 95)], [3, 19, null]);
+});
+await t('Codex #1565 R2 High 1: 相手が切れても、ハンドラが終わるまで書きかけに数える (その間の門の記録は書きかけ 1)・書く直前の確かめで書かない / 段階が変わった = 410 で書かない', async () => {
+  const wait = (ms) => new Promise((ok) => setTimeout(ok, ms));
+  const until = async (f) => { for (let i = 0; i < 100 && !f(); i++) await wait(20); assert.ok(f()); };
+  setPhase('legacy_open');
+  G.__resetLegacyAck();
+  let releaseExt = null, started = false, wrote = 0, fenceErr = null, plainDone = false;
+  const app = express();
+  const r = express.Router();
+  r.use(express.json());
+  r.use(G.masterLegacyGate('warehouse'));
+  // 外の API (Notion など) を待ってから書くハンドラ = legacyHandler で包み、書く直前に legacyWriteFence
+  r.post('/api/shipping', G.legacyHandler(async (req, res) => {
+    started = true;
+    await new Promise((ok) => { releaseExt = ok; });
+    try { await G.legacyWriteFence(res); wrote++; res.json({ ok: true }); } catch (e) { fenceErr = e; if (!G.respondIfLegacyAborted(res, e)) throw e; }
+  }));
+  // 包んでいない async のハンドラも、応答を返すまで数える (相手が切れた 'close' では減らさない)
+  let releasePlain = null;
+  r.post('/api/genka', async (req, res) => { await new Promise((ok) => { releasePlain = ok; }); plainDone = true; res.json({ ok: true }); });
+  app.use('/', r);
+  const srv = http.createServer(app);
+  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  const url = (p) => `http://127.0.0.1:${srv.address().port}${p}`;
+  try {
+    const base = G.legacyInflight().count;
+    const ac = new AbortController();
+    const p1 = fetch(url('/api/shipping'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', signal: ac.signal }).catch(() => 'aborted');
+    await until(() => started);
+    ac.abort(); await p1; await wait(150);
+    assert.equal(G.legacyInflight().count, base + 1, '相手が切れても、ハンドラが終わるまで数えたまま');
+    // その間に門の記録を書く = 書きかけ 1 (「書きかけ 0」の記録で最後の同期に進ませない)
+    const calls = [];
+    const a = await G.ackLegacyGates({ host: 'minipc', connect: fakeGateDb({ calls }), env: { RENDER_GIT_COMMIT: 'a'.repeat(40) } });
+    assert.equal(a.state, 'acked');
+    assert.equal(calls.find((c) => /select ops\.record_legacy_gate_ack\(/.test(c.sql)).params[6], base + 1);
+    releaseExt();
+    await until(() => G.legacyInflight().count === base);
+    assert.equal(wrote, 0, '相手が切れた = 書く直前の確かめで止めた (書かない)');
+    assert.equal(fenceErr && fenceErr.reason, 'client_gone');
+    // 相手は居るが、待っている間に段階が frozen になった = 410 で書かない
+    started = false; fenceErr = null;
+    const p2 = fetch(url('/api/shipping'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    await until(() => started);
+    setPhase('frozen');
+    releaseExt();
+    const r2 = await quiet(() => p2);
+    assert.equal(r2.status, 410); assert.equal((await r2.json()).error, 'master_frozen');
+    assert.equal(wrote, 0); assert.equal(fenceErr.reason, 'phase_closed');
+    assert.equal(G.legacyInflight().count, base);
+    // 包んでいない async のハンドラ: 相手が切れても、応答を返すまで数える
+    setPhase('legacy_open');
+    const ac3 = new AbortController();
+    const p3 = fetch(url('/api/genka'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', signal: ac3.signal }).catch(() => 'aborted');
+    await until(() => releasePlain);
+    ac3.abort(); await p3; await wait(150);
+    assert.equal(G.legacyInflight().count, base + 1);
+    releasePlain();
+    await until(() => G.legacyInflight().count === base);
+    assert.equal(plainDone, true);
+  } finally { await new Promise((ok) => srv.close(ok)); }
+});
+await t('Codex #1565 R2 Medium 3: 止めるとき = 記録の書き直しをやめ、書いている途中の普通の記録を待ってから「止めた」を 1 回だけ・新しい書き込みは 503・途中の記録が終わらない = 「止めた」を書かない', async () => {
+  const wait = (ms) => new Promise((ok) => setTimeout(ok, ms));
+  const until = async (f) => { for (let i = 0; i < 100 && !f(); i++) await wait(20); assert.ok(f()); };
+  G.__resetLegacyAck(); setPhase('legacy_open');
+  const order = [];
+  const releases = [];
+  const slowDb = () => async () => ({
+    db: {
+      query: async (sql, params) => {
+        if (/to_regprocedure/.test(sql)) return { rows: [{ ok: true }] };
+        if (/legacy_manifest_hash/.test(sql)) return { rows: [{ h: 'f'.repeat(64) }] };
+        if (/record_legacy_gate_ack/.test(sql)) {
+          const st = params[8] === true;
+          order.push(st ? 'stopped:start' : 'normal:start');
+          if (!st) await new Promise((ok) => releases.push(ok));
+          order.push(st ? 'stopped:end' : 'normal:end');
+          return { rows: [{ r: { ack_id: 1, manifest_hash: 'f'.repeat(64), acked_at: 'x', stopped: st } }] };
+        }
+        throw new Error(`知らない SQL: ${sql}`);
+      },
+    },
+    close: async () => {},
+  });
+  const env = { RENDER_GIT_COMMIT: 'a'.repeat(40) };
+  G.maybeRefreshLegacyAck({ host: 'minipc', env, force: true, connect: slowDb() });
+  await until(() => order.includes('normal:start'));
+  const stopping = G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM で止めた', env, connect: slowDb(), timeoutMs: 3000 });
+  await wait(100);
+  assert.deepEqual(order, ['normal:start'], '「止めた」は書いている途中の普通の記録を待つ');
+  assert.equal(G.maybeRefreshLegacyAck({ host: 'minipc', env, force: true, connect: slowDb() }), null, '止めている途中は記録を書き直さない');
+  assert.equal(G.legacyShuttingDown(), true);
+  // 新しい書き込みは 503 (止めている途中)
+  const app = express(); const rt = express.Router();
+  rt.use(G.masterLegacyGate('warehouse'));
+  let called = 0;
+  rt.post('/api/shipping', (req, res) => { called++; res.json({ ok: true }); });
+  app.use('/', rt);
+  const srv = http.createServer(app);
+  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  try {
+    const res = await quiet(() => fetch(`http://127.0.0.1:${srv.address().port}/api/shipping`, { method: 'POST' }));
+    assert.equal(res.status, 503); assert.equal((await res.json()).error, 'master_shutting_down'); assert.equal(called, 0);
+  } finally { await new Promise((ok) => srv.close(ok)); }
+  releases.shift()();
+  const r = await stopping;
+  assert.equal(r.state, 'stopped', r.detail);
+  assert.deepEqual(order, ['normal:start', 'normal:end', 'stopped:start', 'stopped:end'], '普通の記録 → 「止めた」の順 (最後の記録は stopped)');
+  assert.equal(G.ackLegacyGatesStopped({ host: 'minipc', reason: 'もう一度', env, connect: slowDb() }), stopping, '「止めた」は 1 回だけ');
+  // 途中の普通の記録が時間内に終わらない = 「止めた」を書かない (順番を守る)
+  G.__resetLegacyAck(); order.length = 0;
+  G.maybeRefreshLegacyAck({ host: 'minipc', env, force: true, connect: slowDb() });
+  await until(() => order.includes('normal:start'));
+  const r2 = await G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM で止めた', env, connect: slowDb(), timeoutMs: 300 });
+  assert.equal(r2.state, 'error'); assert.match(r2.detail, /「止めた」は書かない/);
+  assert.ok(!order.includes('stopped:start'));
+  releases.shift()();
+  await wait(50);
+  G.__resetLegacyAck();
 });
 await t('門の記録は 5 分おき (要求が来たついで)・同時に 2 本走らせない・読み戻しは今すぐ書き直す', async () => {
   let now = Date.parse('2026-10-01T02:00:00Z');
@@ -878,6 +999,20 @@ await t('product-hub (⑤-2a M5): 自動取込 (cron) は閉じたら丸ごと�
     await runProductHubIntake();
     assert.ok(!lines.some((x) => x.includes('古い新商品の取込は閉じている')), lines.join('\n'));
   } finally { console.log = l; console.warn = w; console.error = er; }
+});
+await t('Codex #1565 R2 Medium 2: 自動取込 (cron) は門の共通の包みの中 = 取込の間は書きかけ (inflight.by_entry) に数える・閉じていれば流さない', async () => {
+  const { runProductHubIntake } = await import('../apps/product-hub/intake-cron.js');
+  setPhase('legacy_open');
+  let seen = null;
+  const sync = async () => { await new Promise((ok) => setTimeout(ok, 50)); seen = G.legacyInflight().by_entry['job:product-hub:intake-cron']; return { ok: true, mode: 'intake', created: 0, merged: 0, drafts: [] }; };
+  await quiet(() => runProductHubIntake({ sync }));
+  assert.equal(seen, 1, '取込の間は数える');
+  assert.equal(G.legacyInflight().by_entry['job:product-hub:intake-cron'], undefined, '終わったら数えない');
+  setPhase('frozen');
+  seen = 'not-run';
+  await quiet(() => runProductHubIntake({ sync }));
+  assert.equal(seen, 'not-run', '閉じている = 流さない');
+  setPhase('legacy_open');
 });
 await t('product-hub (R1 H5): 代表コードの税率は構成の SKU から (Company DB)。そろえば決まる・混ざる / 無い / 未解決 / 読めない = 決められない', async () => {
   const draft = phdb.prepare('SELECT * FROM product_drafts WHERE id = ?').get(repDraftId);

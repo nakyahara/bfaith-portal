@@ -240,7 +240,8 @@ function writeChildren(db, draftId, rec) {
  * 1 コードずつ直列に処理する (notion-client 側の rate limiter が pacing する)。
  * 1 件の失敗で全体を止めない — 結果配列で個別に返す。
  */
-export async function importFromNotion(neCodes, { actor = null, finder = findPageByManageNumber } = {}) {
+// beforeWrite = 書く直前の確かめ (古い入口の門: lib/master-legacy-gate.mjs の legacyWriteFence)。投げたら書かずに止める (Codex #1565 R2 High 1)
+export async function importFromNotion(neCodes, { actor = null, finder = findPageByManageNumber, beforeWrite = null } = {}) {
   const codes = parseNeCodes(neCodes);
   if (codes.length === 0) return { results: [], summary: emptySummary() };
   if (codes.length > MAX_IMPORT_CODES) {
@@ -270,6 +271,7 @@ export async function importFromNotion(neCodes, { actor = null, finder = findPag
         });
         continue;
       }
+      if (beforeWrite) await beforeWrite();   // Notion を待っている間に相手が切れた・段階が変わった = 書かない
       const persisted = persist(db, rec, actor);
       results.push({
         ne_code: rec.ne_code,
@@ -279,6 +281,7 @@ export async function importFromNotion(neCodes, { actor = null, finder = findPag
         skipped_fields: rec.skipped_fields,
       });
     } catch (e) {
+      if (e && e.code === 'master_legacy_aborted') throw e;   // 門が止めた = 残りも書かない (呼び手が答えを返す)
       results.push({ ne_code: code, outcome: 'failed', error: truncate(e) });
     }
   }
@@ -299,7 +302,7 @@ export const MAX_MIGRATE_PER_RUN = 300;
 
 export async function importByNotionStatus({
   actor = null, dryRun = true, expectedSnapshot = null, maxPerRun = MAX_MIGRATE_PER_RUN,
-  query = queryDatabaseAll, request = notionRequest, config = getConfig,
+  query = queryDatabaseAll, request = notionRequest, config = getConfig, beforeWrite = null,
 } = {}) {
   const cfg = config();
   const schema = await request(`/databases/${cfg.databaseId}`, { method: 'GET', cfg });
@@ -366,6 +369,7 @@ export async function importByNotionStatus({
       e.code = 'snapshot_mismatch';
       throw e;
     }
+    if (beforeWrite) await beforeWrite();   // Notion を待っている間に相手が切れた・段階が変わった = 書かない (この後は待たずに書く)
     let processed = 0;
     for (const t of toImport) {
       if (processed >= maxPerRun) { t.result.outcome = 'deferred'; continue; }

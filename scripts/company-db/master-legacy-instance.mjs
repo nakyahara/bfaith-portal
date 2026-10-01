@@ -6,7 +6,7 @@
  *   (黙って止まった = 古い版のまま動いているかもしれない)。ふつうは server.js が止まるとき (SIGTERM / SIGINT) に「止めた」を書くが、
  *   落ちた・電源が切れた・2 秒で書けなかったプロセスは残る → 人が確かめて (本当に止まっている) ここで「止めた」を書く。
  * 使い方:
- *   node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list                  # 24 時間以内に記録があるプロセスと、最後の記録・新しいか・止めたか
+ *   node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list                  # 最後が「止めた」でないプロセス (いつでも) と 24 時間以内のプロセスの、最後の記録・新しいか・止めたか
  *   node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --stop --host minipc --instance <名札> --reason "再起動で消えた" --yes
  *     書くのは、その場所の門のログイン (COMPANY_DB_MASTER_GATE_RENDER_URL / _MINIPC_URL) = ⑤-1 の関数が場所と役が同じかを確かめる
  *     🚨 15 分以内に記録があるプロセス (= 動いているかもしれない) は拒む。本当に止まったのを確かめたときだけ --force (中間レビュー 2 回目 Low)
@@ -19,11 +19,18 @@ import { fileURLToPath } from 'node:url';
 import { openPgClient } from './migrate.mjs';
 import { ackLegacyGates, gateUrlFor, GATE_URL_ENV } from '../../lib/master-legacy-gate.mjs';
 
+/**
+ * プロセスごとの最後の記録。出すのは「最後が『止めた』でない (いつの記録でも)」か「hours 時間以内」のプロセス
+ * (⑤-1 は、記録を書いたことのあるプロセスは全部「新しい記録」か「止めた」を求める方向 = 古くても止めていなければ出す)
+ */
 export async function listInstances(client, { hours = 24 } = {}) {
-  return (await client.query(`select distinct on (host, instance_id) host, instance_id, build_id, phase_seen, inflight_count, acked_at::text as acked_at, stopped, stopped_reason, session_role,
-        acked_at >= clock_timestamp() - make_interval(mins => ops.master_cutover_ack_fresh_minutes()) as fresh
-      from ops.master_legacy_gate_acks where acked_at >= clock_timestamp() - make_interval(hours => $1)
-      order by host, instance_id, acked_at desc, ack_id desc`, [hours])).rows;
+  return (await client.query(`select * from (
+      select distinct on (host, instance_id) host, instance_id, build_id, phase_seen, inflight_count, acked_at, acked_at::text as acked_at_text, stopped, stopped_reason, session_role,
+          acked_at >= clock_timestamp() - make_interval(mins => ops.master_cutover_ack_fresh_minutes()) as fresh
+        from ops.master_legacy_gate_acks
+        order by host, instance_id, acked_at desc, ack_id desc) last
+      where not last.stopped or last.acked_at >= clock_timestamp() - make_interval(hours => $1)
+      order by host, instance_id`, [hours])).rows.map(({ acked_at_text, ...r }) => ({ ...r, acked_at: acked_at_text }));
 }
 
 /** そのプロセスの最後の記録 (無ければ null)。見る接続先は --list と同じ */
@@ -66,7 +73,7 @@ if (isMain) {
         try {
           const rows = await listInstances(c, { hours: Number(getArg('--hours') || 24) });
           for (const r of rows) console.log(`${r.host}\t${r.instance_id}\t最後 ${r.acked_at}\t${r.stopped ? `止めた (${r.stopped_reason})` : r.fresh ? '新しい' : '⚠️ 黙っている = 15 分より前で「止めた」も無い (段階を進められない。止まったのを確かめて --stop)'}\t段階 ${r.phase_seen}\t書きかけ ${r.inflight_count}\tbuild ${String(r.build_id).slice(0, 12)}`);
-          if (!rows.length) console.log('(24 時間以内の記録は無い)');
+          if (!rows.length) console.log('(止めていないプロセスも、24 時間以内の記録も無い)');
         } finally { await c.end(); }
       }
     } else if (args.includes('--stop')) {

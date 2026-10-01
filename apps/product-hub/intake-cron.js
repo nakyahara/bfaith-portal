@@ -15,7 +15,7 @@
  */
 import cron from 'node-cron';
 import { syncNewProducts } from './services/new-product-intake.js';
-import { checkLegacyGate } from '../../lib/master-legacy-gate.mjs';
+import { runLegacyJob } from '../../lib/master-legacy-gate.mjs';
 import { attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
 import { recordPing } from '../jobs-monitor/store.js';
 
@@ -31,18 +31,20 @@ const ON = new Set(['1', 'true', 'on', 'yes']);
 /**
  * 1 回分の取込 (cron が呼ぶ。試験も呼ぶ)。切替で古い入口を閉じた後は丸ごと止める (下の門)
  */
-export async function runProductHubIntake() {
+export async function runProductHubIntake({ sync = syncNewProducts } = {}) {
   try {
     // 🚨 切替で古い入口を閉じた後 (段階 frozen 以降・読めない) は取込を丸ごと止める = NE が先の新商品の作り方は古い入口
     //    (新商品は新しい登録の画面から Company DB 経由。Codex ⑤-2a M5)。閉じている = ok で「止めた」と残す (見張りを鳴らさない)・読めない = fail (鳴らす)
-    const gate = await checkLegacyGate({ purpose: 'write' });
-    if (gate.writable !== true) {
+    //    取込は門の共通の包み (runLegacyJob) の中 = 終わるまで書きかけに数える (門の記録の書きかけ・読み戻しの inflight.by_entry。Codex #1565 R2 Medium 2)
+    const job = await runLegacyJob('job:product-hub:intake-cron', () => sync({ actor: 'cron:ne-intake' }));
+    if (!job.ran) {
+      const gate = job.state;
       const why = gate.readable ? `切替の段階 ${gate.phase} = 古い新商品の取込は閉じている` : `切替の段階を読めない (${gate.error}) = 止める`;
       console.log(`[product-hub] intake skipped: ${why}`);
       ping(gate.readable ? 'ok' : 'fail', `skip: ${why}`.slice(0, 180));   // 読めない = 設定・つながりの誤り = 見張りを鳴らす
       return;
     }
-    const r = syncNewProducts({ actor: 'cron:ne-intake' });
+    const r = job.result;
     if (!r.ok) {
       console.warn(`[product-hub] intake skipped: ${r.error}`);
       ping('fail', String(r.error).slice(0, 180));

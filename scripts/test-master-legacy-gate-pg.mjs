@@ -21,6 +21,8 @@
  *  14 ⑤-3 の記録で ⑤-1 の段階の関数が frozen に進める。黙っているプロセス (24 時間以内に記録・最後が 15 分より前・止めたでもない) があれば拒む
  *     → scripts/company-db/master-legacy-instance.mjs で「止めた」を書けば進める
  *  15 読む時間を測る (scripts/company-db/master-legacy-latency.mjs・読むだけ)
+ *  16 配り直し (古いプロセスの普通の記録が書いている途中に SIGTERM・新しいプロセスが起動): 古いプロセスは途中の記録を待ってから「止めた」を 1 回。
+ *     門のログインの接続は 古い 1 本 + 新しい 1 本 = 2 本まで。古いプロセスの最後の記録は stopped (Codex #1565 R2 Medium 3)
  * ロールは ⑤-1 の本物の作り (scripts/company-db/create-master-edit-roles.mjs) だけで作る (試験で足さない)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-legacy-gate-pg.mjs
  *   (cd C:/tmp/pg-embed && node run-conc.mjs scripts/test-master-legacy-gate-pg.mjs C:/tmp/sor53-work)
@@ -232,7 +234,7 @@ try {
     assert.ok(r.problems.some((x) => /段階を読む接続先が無い/.test(x)), 'watcher だけでは段階を読まない');
     assert.equal(await ackCount(), before, '確かめは書かない');
   });
-  await ta('[12] 門のログインの接続は、同時に 20 件の読み + 記録を書いても 2 本まで (プール 1 本 + 記録 1 本)', async () => {
+  await ta('[12] 門のログインの接続は、同時に 20 件の読み + 記録を書いても 1 本 (記録も段階を読むプールの 1 本で書く。Codex #1565 R2 Medium 3)', async () => {
     await sleep(300);   // 前の試験の接続が消えるまで
     let peak = 0;
     let stop = false;
@@ -242,7 +244,7 @@ try {
       const [rs, ack] = await Promise.all([Promise.all(Array.from({ length: 20 }, () => G.checkLegacyGate())), G.ackLegacyGates({ host: 'minipc', env })]);
       assert.ok(rs.every((s) => s.writable === true)); assert.equal(ack.state, 'acked', JSON.stringify(ack));
     } finally { stop = true; await watch; }
-    assert.ok(peak >= 1 && peak <= 2, `門のログインの接続 ${peak} 本`);
+    assert.equal(peak, 1, `門のログインの接続 ${peak} 本`);
   });
   await ta('[13] env の取り違え (miniPC の env に Render のログイン) = ⑤-1 の関数が gate_host_mismatch (42501) で拒む・何も書かない・直し方を出す', async () => {
     const before = await ackCount();
@@ -288,6 +290,47 @@ try {
     assert.equal(r.cold.total.n, 3); assert.equal(r.warm.n, 3);
     assert.ok(r.cold.total.p95 >= r.cold.connect.p50 && r.warm.max >= 0);
     assert.equal(await ackCount(), before, '書かない');
+  });
+  await ta('[16] 配り直し: 古いプロセスの記録が書いている途中に SIGTERM = 待ってから「止めた」を 1 回・新しいプロセスと合わせて接続 2 本まで・古いプロセスの最後の記録は stopped', async () => {
+    await G.closeLegacyGatePool();
+    await sleep(300);
+    const G2 = await import('../lib/master-legacy-gate.mjs?new-process');   // 別のモジュール = 別のプロセスの代わり (プール・名札・記録の状態が別)
+    let peak = 0;
+    let stop = false;
+    const watch = (async () => { while (!stop) { peak = Math.max(peak, await connsOf('usename = $2', ['master_gate_minipc'])); await sleep(5); } })();
+    const L = await openPgClient(u.toString());
+    L.on('error', () => {});
+    try {
+      G.__resetLegacyAck();
+      // 記録の表をつかむ = 古いプロセスの普通の記録が書いている途中で止まる
+      await L.query('begin');
+      await L.query('lock table ops.master_legacy_gate_acks in exclusive mode');
+      const normal = G.maybeRefreshLegacyAck({ host: 'minipc', env, force: true });
+      await sleep(300);
+      const stopping = G.ackLegacyGatesStopped({ host: 'minipc', reason: 'SIGTERM で止めた (試験)', env, timeoutMs: 15000 });
+      // 新しいプロセスが起動して記録を書く・段階を読む
+      const startNew = G2.ackLegacyGates({ host: 'minipc', env });
+      const reads = await Promise.all(Array.from({ length: 10 }, () => G2.checkLegacyGate()));
+      assert.ok(reads.every((s) => s.readable === true));
+      await sleep(300);
+      await L.query('rollback');   // 放す
+      const [n, s, a2] = await Promise.all([normal, stopping, startNew]);
+      assert.equal(n.state, 'acked', JSON.stringify(n)); assert.equal(s.state, 'stopped', JSON.stringify(s)); assert.equal(a2.state, 'acked', JSON.stringify(a2));
+      const oldId = (await M.query('select instance_id from ops.master_legacy_gate_acks where ack_id = $1', [s.ack_id])).rows[0].instance_id;
+      const last = (await M.query('select stopped, ack_id from ops.master_legacy_gate_acks where instance_id = $1 order by acked_at desc, ack_id desc limit 1', [oldId])).rows[0];
+      assert.equal(last.stopped, true, '古いプロセスの最後の記録は「止めた」'); assert.equal(String(last.ack_id), s.ack_id);
+      assert.ok(Number(n.ack_id) < Number(s.ack_id), '普通の記録 → 「止めた」の順');
+      const newId = (await M.query('select instance_id from ops.master_legacy_gate_acks where ack_id = $1', [a2.ack_id])).rows[0].instance_id;
+      assert.notEqual(newId, oldId);
+      assert.equal(G.maybeRefreshLegacyAck({ host: 'minipc', env, force: true }), null, '古いプロセスはもう書き直さない');
+    } finally {
+      stop = true; await watch;
+      try { await L.query('rollback'); } catch { /* */ }
+      await L.end();
+      await G2.closeLegacyGatePool();
+      G.__resetLegacyAck();
+    }
+    assert.ok(peak >= 1 && peak <= 2, `門のログインの接続 ${peak} 本 (古い 1 + 新しい 1 まで)`);
   });
 } finally {
   G.__setLegacyPhaseReader(null);
