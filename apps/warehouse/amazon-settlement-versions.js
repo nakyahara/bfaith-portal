@@ -226,6 +226,24 @@ export function createSettlementVersionSchema(db) {
     db.exec(`CREATE TRIGGER IF NOT EXISTS trg_${t}_no_update BEFORE UPDATE ON ${t} BEGIN SELECT RAISE(ABORT, '${t} は追記だけ (印を直すときは新しい印を作る)'); END`);
     db.exec(`CREATE TRIGGER IF NOT EXISTS trg_${t}_no_delete BEFORE DELETE ON ${t} BEGIN SELECT RAISE(ABORT, '${t} は追記だけ (印を直すときは新しい印を作る)'); END`);
   }
+  // 初期の印の順番待ち (#1567 Codex R1 High 2)。CLI は積むだけ = 印の表に書くのは coordinator の回の中だけ
+  //   (Render の coverage を updating にした後・同じ lease / token の下。手のファイルと同じ = 印を変える前に古い complete を無効にする)
+  db.exec(`CREATE TABLE IF NOT EXISTS initial_marker_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_key          TEXT NOT NULL,          -- 正規化した印 + 元のファイルの hash の SHA-256 (順番待ちの中で同じ印は 1 回だけ。入れた後に同じ印を積む = 印の作り直し = 新しい epoch)
+    source_file_name   TEXT,
+    source_file_hash   TEXT NOT NULL,
+    norm_json          TEXT NOT NULL,          -- 正規化した印 (amazon-finance-initial-marker.js の normalizeMarker の戻り)
+    detail_digest      TEXT NOT NULL,          -- 積んだときの明細の digest (入れるときに作り直して同じか確かめる)
+    queued_at          TEXT NOT NULL,
+    applied_at         TEXT,                   -- 印の表に入れた時刻 (null = 順番待ち)
+    applied_generation INTEGER,                -- 入れた回の coverage の世代 (= coverage で回った証拠にもなる)
+    marker_id          TEXT,
+    evidence_epoch     INTEGER,
+    failed_at          TEXT,                   -- 入れられなかった (中身が積んだときと違う など) = 順番待ちから外す・朝の報告
+    apply_note         TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_initial_marker_queue_key ON initial_marker_queue(queue_key)`);
 
   // 手で取り込む決済のファイル (Seller Central から落とした V1 / V2) の順番待ち。書くのは coordinator の回の中だけ (apps/warehouse/amazon-settlement-manual-file.js が積む)
   db.exec(`CREATE TABLE IF NOT EXISTS amazon_settlement_manual_files (
@@ -403,7 +421,7 @@ export function documentVersionProblems(db) {
   const out = [];
   if (db.prepare(`SELECT 1 FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_docver WHERE document_version_seq IS NULL LIMIT 1`).get()
     || db.prepare(`SELECT 1 FROM raw_amazon_settlement_headers INDEXED BY idx_settle_headers_docver WHERE document_version_seq IS NULL LIMIT 1`).get()) {
-    out.push({ code: 'rows_without_version', detail: '決済の生の行に文書の版 (document_version_seq) の無い行がある = 過去の行の backfill がまだ・途中 → node apps/warehouse/migrate-settlement-document-versions.js --commit (coordinator の回の始めでも流れる)' });
+    out.push({ code: 'rows_without_version', detail: '決済の生の行に文書の版 (document_version_seq) の無い行がある = 過去の行の版付けがまだ・途中 → 夜に手で node apps/warehouse/migrate-settlement-document-versions.js --commit (coordinator は重い版付けを流さない・#1567 Codex R1 Medium)' });
   }
   const bad = db.prepare(`SELECT v.seq, v.settlement_id FROM amazon_settlement_document_versions v
      WHERE v.detail_stale = 1 AND ${HAS_ROWS('v')} ORDER BY v.seq LIMIT 5`).all();

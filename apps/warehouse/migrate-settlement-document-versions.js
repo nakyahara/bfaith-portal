@@ -6,8 +6,8 @@
  *   過去の行 (reportDocumentId を保存していない) = report_document_id null で版を作る。規則 = (source_layer, source_document_id (= report ID),
  *   source_file_hash, parser_version) ごとに 1 つの版 (amazon-settlement-versions.js の backfillDocumentVersions)。
  *   🚨 版の無い行がある間、build (日次の財務・月の手数料・月の mart) と Company DB の送り手は止まる (黙って行を落とさない)。
- *   coordinator (amazon-finance-coverage-run.js) の回の始めでも自動で流れる = ふつうは手で流さなくてよい (夜の daily-sync の最初の回が付ける)。
- *   手で先に流すときはこれ (本番の 440 万行で数分・WAL が大きくなる = daily-sync と重ならない時間に)。
+ *   🚨 coordinator (amazon-finance-coverage-run.js) は流さない (版の無い行があれば ❌ で止まるだけ・#1567 Codex R1 Medium) = **夜に手でこれを流す**
+ *   (本番の 440 万行で数分・WAL が大きくなる = daily-sync と重ならない時間に。最後に所要時間と最大メモリを出す)。
  *   明細の UPDATE は id の範囲 20 万行ごとの取引 = 1 取引ずつ書き込みの lock を持つ (ログに ms)。最後に「build と送り手が読める状態か」の問題を出す
  *
  * 使い方:
@@ -70,5 +70,7 @@ if (isDirectRun) {
   const args = process.argv.slice(2);
   for (const a of args) if (a !== '--commit' && a !== '--allow-unresolved') { console.error(`知らない引数: ${a}`); process.exit(2); }
   if (args.includes('--allow-unresolved') && !args.includes('--commit')) { console.error('--allow-unresolved は --commit と一緒に'); process.exit(2); }
-  runMigrate({ commit: args.includes('--commit'), allowUnresolved: args.includes('--allow-unresolved') }).catch((e) => { console.error(`❌ 決済の文書の版: ${e.message}`); process.exitCode = 1; });
+  const t0 = Date.now();
+  runMigrate({ commit: args.includes('--commit'), allowUnresolved: args.includes('--allow-unresolved') }).catch((e) => { console.error(`❌ 決済の文書の版: ${e.message}`); process.exitCode = 1; })
+    .finally(() => console.log(`[versions] 所要 ${((Date.now() - t0) / 60000).toFixed(1)} 分・最大メモリ (RSS) ${Math.round(process.resourceUsage().maxRSS / 1024)} MB`));
 }

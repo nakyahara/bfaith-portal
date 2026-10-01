@@ -20,7 +20,8 @@
  * 使い方:
  *   node apps/warehouse/amazon-finance-initial-marker.js --file marker.json                 → 読んで確かめるだけ (dry-run・SQLite の採った見出しと突き合わせる)
  *   node apps/warehouse/amazon-finance-initial-marker.js --file marker.csv --verified-from 2026-01-01 --verified-through 2026-09-21 --captured-at 2026-10-01T10:00:00+09:00 [--evidence-kind seller_central_payments_export]
- *   node apps/warehouse/amazon-finance-initial-marker.js --file marker.json --commit        → 新しい印 (新しい epoch) を書く
+ *   node apps/warehouse/amazon-finance-initial-marker.js --file marker.json --queue         → 順番待ちに積む (次の coordinator の回が Render を updating にした後に新しい epoch で入れる)
+ *     🚨 印の表に直接書かない (#1567 Codex R1 High 2: 回の外で印を変えると Render の古い complete が次の回まで残る・manifest と complete の間に印が変わる)
  *   node apps/warehouse/amazon-finance-initial-marker.js --list                             → 印の一覧
  * env: DATA_DIR (必須)
  */
@@ -117,28 +118,88 @@ export function compareWithSqlite(db, settlements) {
   });
 }
 
-/** 新しい印を書く (1 取引・新しい epoch)。戻り = { markerId, epoch, markerDigest } */
-export function insertMarker(db, norm, { sourceFileName = null, sourceFileHash, now = new Date() }) {
+/** 新しい印の行を書く (呼び手の取引の中で・新しい epoch)。戻り = { markerId, epoch, markerDigest } */
+function insertMarkerRows(db, norm, { sourceFileName = null, sourceFileHash, now = new Date() }) {
+  const epoch = (db.prepare(`SELECT COALESCE(MAX(evidence_epoch), 0) + 1 AS n FROM initial_marker_headers`).get().n);
+  const markerId = `im-${epoch}-${norm.header.captured_at.slice(0, 10).replace(/-/g, '')}`;
+  const digest = markerDigest({ markerId, header: norm.header, sourceFileHash, detailDigest: norm.detailDigest });
+  db.prepare(`INSERT INTO initial_marker_headers (marker_id, evidence_epoch, evidence_kind, verified_from, verified_through, captured_at, source_file_name, source_file_hash, settlement_count, detail_digest, marker_digest, created_at, note)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(markerId, epoch, norm.header.evidence_kind, norm.header.verified_from, norm.header.verified_through, norm.header.captured_at,
+    sourceFileName, sourceFileHash, norm.settlements.length, norm.detailDigest, digest, now.toISOString(), norm.header.note);
+  const ins = db.prepare(`INSERT INTO initial_marker_settlements (marker_id, settlement_id, period_start, period_end, period_precision, total_amount_micro, currency, report_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+  for (const s of norm.settlements) ins.run(markerId, s.settlement_id, s.period_start, s.period_end, s.period_precision, BigInt(s.total_amount_micro), s.currency, s.report_id);
+  return { markerId, epoch, markerDigest: digest };
+}
+/**
+ * 印の表に直接書く (1 取引)。🚨 ふつうは使わない = coordinator の回の外で印を変えると Render の古い complete が残る (#1567 Codex R1 High 2)。
+ *   CLI は queueMarker (順番待ち) → coordinator が updating の後に applyQueuedMarkers。ここは試験 (回の外で印が変わった場面) のためだけに残す
+ */
+export function insertMarker(db, norm, opts) {
+  return db.transaction(() => insertMarkerRows(db, norm, opts)).immediate();
+}
+
+/**
+ * 印を順番待ちに積む (印の表には書かない)。順番待ちの中に同じ印 (正規化した中身 + 元のファイルの hash) があれば積まない。
+ *   入れた後に同じ印を積む = 印の作り直し (新しい epoch = 積み上げをやり直す) なので積める。戻り = { queued, id }
+ */
+export function queueMarker(db, norm, { sourceFileName = null, sourceFileHash, now = new Date() }) {
+  const normJson = JSON.stringify(norm);
+  const queueKey = canonicalSha256({ format: MARKER_FORMAT, norm: JSON.parse(normJson), source_file_hash: sourceFileHash });
   return db.transaction(() => {
-    const epoch = (db.prepare(`SELECT COALESCE(MAX(evidence_epoch), 0) + 1 AS n FROM initial_marker_headers`).get().n);
-    const markerId = `im-${epoch}-${norm.header.captured_at.slice(0, 10).replace(/-/g, '')}`;
-    const digest = markerDigest({ markerId, header: norm.header, sourceFileHash, detailDigest: norm.detailDigest });
-    db.prepare(`INSERT INTO initial_marker_headers (marker_id, evidence_epoch, evidence_kind, verified_from, verified_through, captured_at, source_file_name, source_file_hash, settlement_count, detail_digest, marker_digest, created_at, note)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(markerId, epoch, norm.header.evidence_kind, norm.header.verified_from, norm.header.verified_through, norm.header.captured_at,
-      sourceFileName, sourceFileHash, norm.settlements.length, norm.detailDigest, digest, now.toISOString(), norm.header.note);
-    const ins = db.prepare(`INSERT INTO initial_marker_settlements (marker_id, settlement_id, period_start, period_end, period_precision, total_amount_micro, currency, report_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
-    for (const s of norm.settlements) ins.run(markerId, s.settlement_id, s.period_start, s.period_end, s.period_precision, BigInt(s.total_amount_micro), s.currency, s.report_id);
-    return { markerId, epoch, markerDigest: digest };
+    const same = db.prepare(`SELECT id FROM initial_marker_queue WHERE queue_key = ? AND applied_at IS NULL AND failed_at IS NULL`).get(queueKey);
+    if (same) return { queued: false, id: same.id };
+    const r = db.prepare(`INSERT INTO initial_marker_queue (queue_key, source_file_name, source_file_hash, norm_json, detail_digest, queued_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(queueKey, sourceFileName, sourceFileHash, normJson, norm.detailDigest, now.toISOString());
+    return { queued: true, id: Number(r.lastInsertRowid) };
   }).immediate();
+}
+/** 順番待ちの印の数 (入れていない・失敗していない) */
+export const pendingMarkerCount = (db) => db.prepare(`SELECT COUNT(*) n FROM initial_marker_queue WHERE applied_at IS NULL AND failed_at IS NULL`).get().n;
+/** 最新の印 (id・epoch・digest。無ければ null) */
+export const latestMarker = (db) => db.prepare(`SELECT marker_id, evidence_epoch, marker_digest FROM initial_marker_headers ORDER BY evidence_epoch DESC LIMIT 1`).get() || null;
+
+/**
+ * coordinator の回の中で順番待ちの印を入れる (#1567 Codex R1 High 2)。🚨 Render の coverage を updating にした後だけ呼ぶ。
+ *   1 印 = 1 取引・取引の中で lease (世代・token) を確かめる (assertLease)。積んだ後に中身が変わった印は入れない (failed_at・朝の報告)
+ *   戻り = [{ id, status: 'applied' | 'failed', markerId, epoch, note }]
+ */
+export function applyQueuedMarkers(db, { lease, generation, assertLease, log = () => {}, now = new Date() }) {
+  if (typeof assertLease !== 'function') throw new Error('applyQueuedMarkers: assertLease が無い (lease の下でだけ入れる)');
+  const out = [];
+  for (const q of db.prepare(`SELECT * FROM initial_marker_queue WHERE applied_at IS NULL AND failed_at IS NULL ORDER BY id`).all()) {
+    let norm = null, problem = null;
+    try {
+      norm = JSON.parse(q.norm_json);
+      if (!norm || !norm.header || !Array.isArray(norm.settlements)) problem = '中身の形が違う';
+      else if (canonicalSha256(norm.settlements) !== q.detail_digest || norm.detailDigest !== q.detail_digest) problem = '明細の digest が積んだときと違う';
+    } catch (e) { problem = `読めない: ${e.message}`; }
+    if (problem) {
+      db.prepare(`UPDATE initial_marker_queue SET failed_at = ?, apply_note = ? WHERE id = ?`).run(now.toISOString(), problem.slice(0, 300), q.id);
+      log(`[marker] ❌ 順番待ちの印 #${q.id} を入れない: ${problem} → 印を作り直して積み直す`);
+      out.push({ id: q.id, status: 'failed', note: problem });
+      continue;
+    }
+    const w = db.transaction(() => {
+      assertLease(db, lease);
+      const r = insertMarkerRows(db, norm, { sourceFileName: q.source_file_name, sourceFileHash: q.source_file_hash, now });
+      db.prepare(`UPDATE initial_marker_queue SET applied_at = ?, applied_generation = ?, marker_id = ?, evidence_epoch = ?, apply_note = NULL WHERE id = ?`)
+        .run(now.toISOString(), generation, r.markerId, r.epoch, q.id);
+      return r;
+    }).immediate();
+    log(`[marker] ✅ 順番待ちの印 #${q.id} を入れた: ${w.markerId} (epoch ${w.epoch}・世代 ${generation})`);
+    out.push({ id: q.id, status: 'applied', markerId: w.markerId, epoch: w.epoch, note: null });
+  }
+  return out;
 }
 
 export function parseArgs(argv) {
-  const out = { file: null, commit: false, list: false, verifiedFrom: null, verifiedThrough: null, capturedAt: null, evidenceKind: null, note: null };
+  const out = { file: null, queue: false, list: false, verifiedFrom: null, verifiedThrough: null, capturedAt: null, evidenceKind: null, note: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const val = () => { const v = argv[++i]; if (v === undefined || String(v).startsWith('--')) throw new Error(`${a} に値が無い`); return v; };
     if (a === '--file') out.file = val();
-    else if (a === '--commit') out.commit = true;
+    else if (a === '--queue') out.queue = true;
+    else if (a === '--commit') throw new Error('--commit は無くなった = --queue (順番待ちに積む・次の coordinator の回が updating の後に入れる。#1567 Codex R1 High 2)');
     else if (a === '--list') out.list = true;
     else if (a === '--verified-from') out.verifiedFrom = val();
     else if (a === '--verified-through') out.verifiedThrough = val();
@@ -157,7 +218,9 @@ export function runMarkerCli(db, a, { log = console.log, now = new Date() } = {}
     const hs = db.prepare(`SELECT * FROM initial_marker_headers ORDER BY evidence_epoch`).all();
     for (const h of hs) log(`  epoch ${h.evidence_epoch} ${h.marker_id}: [${h.verified_from}, ${h.verified_through}) 撮影 ${h.captured_at}・決済 ${h.settlement_count}・digest ${h.marker_digest.slice(0, 12)}…`);
     if (!hs.length) log('  印はまだ無い (coverage は complete にならない)');
-    return { markers: hs.length };
+    const qs = db.prepare(`SELECT * FROM initial_marker_queue ORDER BY id`).all();
+    for (const q of qs) log(`  順番待ち #${q.id} ${q.source_file_name || '-'}: ${q.applied_at ? `入れた ${q.applied_at} (${q.marker_id}・世代 ${q.applied_generation})` : q.failed_at ? `❌ 入れない (${q.apply_note})` : '順番待ち (次の coordinator の回)'}`);
+    return { markers: hs.length, queue: qs.length };
   }
   const raw = fs.readFileSync(a.file, 'utf8');
   const fileHash = crypto.createHash('sha256').update(raw, 'utf8').digest('hex');
@@ -171,10 +234,10 @@ export function runMarkerCli(db, a, { log = console.log, now = new Date() } = {}
   for (const c of cmp) log(`  ${c.status === 'match' ? '✅' : c.status === 'missing_in_sqlite' ? '⚠️ SQLite に無い' : '❌ 違う'} ${c.settlement_id}${c.sqlite ? ` (SQLite ${c.sqlite.start} 〜 ${c.sqlite.end} ${c.sqlite.total_micro} ${c.sqlite.currency} ${c.sqlite.layer})` : ''}`);
   const summary = { match: cmp.filter((c) => c.status === 'match').length, missing: cmp.filter((c) => c.status === 'missing_in_sqlite').length, differs: cmp.filter((c) => c.status === 'differs').length };
   log(`[marker] 突き合わせ: 一致 ${summary.match} / SQLite に無い ${summary.missing} (手で取り込む = amazon-settlement-manual-file.js) / 違う ${summary.differs}`);
-  if (!a.commit) { log('[marker] dry-run (書かない)。書くなら --commit'); return { committed: false, norm, summary }; }
-  const w = insertMarker(db, norm, { sourceFileName: path.basename(a.file), sourceFileHash: fileHash, now });
-  log(`[marker] ✅ 印を書いた: ${w.markerId} (epoch ${w.epoch}・digest ${w.markerDigest.slice(0, 12)}…)。次の coordinator の回から、この印の後の一覧の回を積み上げる`);
-  return { committed: true, ...w, norm, summary };
+  if (!a.queue) { log('[marker] dry-run (積まない)。積むなら --queue'); return { queued: false, norm, summary }; }
+  const q = queueMarker(db, norm, { sourceFileName: path.basename(a.file), sourceFileHash: fileHash, now });
+  log(q.queued ? `[marker] ✅ 順番待ちに積んだ (#${q.id})。次の coordinator の回が Render の coverage を updating にした後に新しい epoch で入れ、その回から印の後の一覧の回を積み上げる` : `[marker] 同じ印は積んである (#${q.id})`);
+  return { queued: q.queued, queueId: q.id, norm, summary };
 }
 
 const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

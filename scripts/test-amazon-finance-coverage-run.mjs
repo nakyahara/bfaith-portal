@@ -11,7 +11,9 @@
  *     一覧の欠け (一覧にあるのに取り込めていない) / CANCELLED / 期間の分からない report / 一覧が最後のページまで取れない /
  *     lease: 生きている持ち主からは奪わない・死んだら奪う・回の途中で lease を置き換えられた = 古い token の子は書けない /
  *     complete の応答だけ失われた = 同じ中身の再送が same / 窓の空白 (保持期間以上あいた) = ⚠️ / Render に 0050 が無い = 今までの送り方 /
- *     coordinator を通らない単独の送り手 (token の無い chunk) = Render は complete を無効にする / 完成の判定の単体
+ *     coordinator を通らない単独の送り手 (token の無い chunk) = Render は complete を無効にする / 完成の判定の単体 /
+ *     (#1567 Codex R1) coverage で回った後の 404・409・台帳を失くした・updating の失敗 = 取込もしない / 初期の印は順番待ち → updating の後に入る・
+ *     manifest の後に印が積まれた・直接変わった = complete にしない / 版の無い過去の行 = coordinator は版付けを流さず ❌
  * 実行: node scripts/test-amazon-finance-coverage-run.mjs
  */
 import assert from 'node:assert/strict';
@@ -32,7 +34,8 @@ const { initDB, getDB } = await import('../apps/warehouse/db.js');
 process.env.DAILY_SYNC_RUN_ID = 'ds_test_run';
 const { runCoverage, STATUS_PATH, LAST_RUN_FILE } = await import('../apps/warehouse/amazon-finance-coverage-run.js');
 const { completionBlockers, frontierFrom, evaluateCoverage } = await import('../apps/warehouse/amazon-finance-coverage.js');
-const { runMarkerCli, normalizeMarker, yenToMicro } = await import('../apps/warehouse/amazon-finance-initial-marker.js');
+const { runMarkerCli, normalizeMarker, yenToMicro, parseArgs: parseMarkerArgs, insertMarker } = await import('../apps/warehouse/amazon-finance-initial-marker.js');
+const { runMigrate } = await import('../apps/warehouse/migrate-settlement-document-versions.js');
 const { queueManualFile } = await import('../apps/warehouse/amazon-settlement-manual-file.js');
 const { renameRetryJobs } = await import('../apps/warehouse/retry-failed-jobs.js');
 const V = await import('../apps/warehouse/amazon-settlement-versions.js');
@@ -188,26 +191,37 @@ const MARKER = { evidence_kind: 'seller_central_payments_export', verified_from:
   ] };
 const markerFile = path.join(tmpDir, 'marker.json');
 fs.writeFileSync(markerFile, JSON.stringify(MARKER));
-await t('初期の印: dry-run は書かない・SQLite に無い決済を示す / --commit で epoch 1 を書く (追記だけ = UPDATE・DELETE は拒む)', async () => {
-  const d = runMarkerCli(db, { file: markerFile, commit: false }, { log: () => {}, now: new Date(NOW) });
-  assert.equal(d.committed, false); assert.deepEqual(d.summary, { match: 1, missing: 2, differs: 0 });
-  assert.equal(db.prepare(`SELECT COUNT(*) n FROM initial_marker_headers`).get().n, 0);
-  const w = runMarkerCli(db, { file: markerFile, commit: true }, { log: () => {}, now: new Date(NOW) });
-  assert.equal(w.epoch, 1); assert.match(w.markerId, /^im-1-20260315$/);
-  const h = db.prepare(`SELECT * FROM initial_marker_headers`).get();
-  assert.deepEqual([h.verified_from, h.verified_through, h.captured_at], ['2025-12-31T15:00:00Z', '2026-02-09T15:00:00Z', '2026-03-15T01:00:00Z']);
-  assert.throws(() => db.prepare(`UPDATE initial_marker_headers SET note = 'x'`).run(), /追記だけ/);
-  assert.throws(() => db.prepare(`DELETE FROM initial_marker_settlements`).run(), /追記だけ/);
+const markerCount = () => db.prepare(`SELECT COUNT(*) n FROM initial_marker_headers`).get().n;
+const latestMarkerId = () => db.prepare(`SELECT marker_id FROM initial_marker_headers ORDER BY evidence_epoch DESC LIMIT 1`).get()?.marker_id ?? null;
+await t('初期の印: dry-run は積まない・SQLite に無い決済を示す / --queue は順番待ちに積むだけ (印の表に書かない・#1567 Codex R1 High 2) / --commit は拒む', async () => {
+  const d = runMarkerCli(db, { file: markerFile, queue: false }, { log: () => {}, now: new Date(NOW) });
+  assert.equal(d.queued, false); assert.deepEqual(d.summary, { match: 1, missing: 2, differs: 0 });
+  assert.equal(markerCount(), 0);
+  const w = runMarkerCli(db, { file: markerFile, queue: true }, { log: () => {}, now: new Date(NOW) });
+  assert.equal(w.queued, true);
+  assert.equal(markerCount(), 0, '積むだけ = 印の表には書かない (coordinator が updating の後に入れる)');
+  assert.equal(runMarkerCli(db, { file: markerFile, queue: true }, { log: () => {}, now: new Date(NOW) }).queued, false, '順番待ちの中の同じ印は 1 回だけ');
+  assert.throws(() => parseMarkerArgs(['--file', 'x.json', '--commit']), /--queue/);
   assert.equal(yenToMicro('1,500', 'x'), 1500000000n); assert.equal(yenToMicro('-0.5', 'x'), -500000n);
   assert.throws(() => normalizeMarker({ ...MARKER, verified_from: '2026-02-10' }), /verified_from/);
   assert.throws(() => normalizeMarker({ ...MARKER, settlements: [MARKER.settlements[0], MARKER.settlements[0]] }), /2 回/);
   assert.throws(() => normalizeMarker({ ...MARKER, captured_at: '2027-01-01T00:00:00Z' }, { now: new Date(NOW) }), /未来/);
 });
-await t('🚨 印の決済 S0・S1 が SQLite に無い = complete にしない (⚠️ marker_settlement_missing・起点を覆う見出しが無い)', async () => {
-  const r = await run({ fetchImpl: spyFetch() });
+await t('🚨 順番待ちの印は coverage の回が updating にした **後** に入る (epoch 1・入れた世代を記録) / 印の決済 S0・S1 が SQLite に無い = complete にしない (⚠️ marker_settlement_missing・起点を覆う見出しが無い)', async () => {
+  let atUpdating = null;
+  const f = spyFetch({ onCoverage: (b) => { if (b.state === 'updating') atUpdating = markerCount(); return null; } });
+  const r = await run({ fetchImpl: f });
+  assert.equal(atUpdating, 0, 'updating を送った時点では印の表は変わっていない');
   assert.equal(r.exitCode, 0, r.summary);
   assert.ok(codes(r).includes('marker_settlement_missing') && codes(r).includes('origin_not_covered'), codes(r).join(','));
   assert.deepEqual([(await cov()).state, (await cov()).g], ['updating', '2']);
+  assert.deepEqual(r.markers.map((m) => [m.status, m.epoch, m.markerId]), [['applied', 1, 'im-1-20260315']]);
+  const h = db.prepare(`SELECT * FROM initial_marker_headers`).get();
+  assert.deepEqual([h.evidence_epoch, h.verified_from, h.verified_through, h.captured_at], [1, '2025-12-31T15:00:00Z', '2026-02-09T15:00:00Z', '2026-03-15T01:00:00Z']);
+  assert.equal(db.prepare(`SELECT applied_generation g FROM initial_marker_queue ORDER BY id DESC LIMIT 1`).get().g, 2, '入れた回の世代');
+  assert.equal(db.prepare(`SELECT evidence_epoch e FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get().e, 1, '同じ回の一覧は入れた印の epoch を持つ');
+  assert.throws(() => db.prepare(`UPDATE initial_marker_headers SET note = 'x'`).run(), /追記だけ/);
+  assert.throws(() => db.prepare(`DELETE FROM initial_marker_settlements`).run(), /追記だけ/);
 });
 await t('手のファイル (Seller Central の V2) を順番待ちに積む → coordinator の回で manual_csv の版として入る → 🚨 complete (complete_to = 最後の決済の end の JST の前日)', async () => {
   for (const s of ['S0', 'S1']) {
@@ -294,7 +308,7 @@ await t('🚨 同じ report ID で file hash が変わる (O-C が消えた新�
 console.log('⑤ 一覧・report の状態');
 // 🚨 一覧に 1 度でも出た report は積み上げた期待の集合に残る (設計 R19 H1 = 保持期間で一覧から消えた report の欠けを見逃さない)。
 //   = 未充足の report が出たら、Seller Central で印を作り直す (新しい epoch = 積み上げは新しい印の後の回だけ) のが runbook。試験も同じ手で戻す
-const remark = () => runMarkerCli(db, { file: markerFile, commit: true }, { log: () => {}, now: new Date(NOW) });
+const remark = () => runMarkerCli(db, { file: markerFile, queue: true }, { log: () => {}, now: new Date(NOW) });   // 積むだけ = 次の coverage の回が updating の後に入れる
 const restore = () => { SP.ing = BASE_REPORTS; SP.inv = BASE_REPORTS; SP.invEndless = false; remark(); };
 await t('🚨 一覧の欠け (一覧にある DONE の report を取り込めていない) = complete にしない (❌ report_not_imported)', async () => {
   SP.inv = [...BASE_REPORTS, rep('R-MISS', 'DONE', 'D-MISS', P.S3, '2026-03-11T00:00:00Z')];
@@ -354,8 +368,9 @@ await t('🚨 未充足の report は印を作り直すまで期待の集合に�
   assert.ok(codes(r2).includes('report_cancelled'), '前の回の一覧で見た CANCELLED は残る (黙って消さない)');
   const e0 = db.prepare(`SELECT MAX(evidence_epoch) e FROM initial_marker_headers`).get().e;
   remark();
-  assert.equal(db.prepare(`SELECT MAX(evidence_epoch) e FROM initial_marker_headers`).get().e, e0 + 1);
+  assert.equal(db.prepare(`SELECT MAX(evidence_epoch) e FROM initial_marker_headers`).get().e, e0, '積んだだけでは印は変わらない');
   const r3 = await run({ fetchImpl: spyFetch() });
+  assert.equal(db.prepare(`SELECT MAX(evidence_epoch) e FROM initial_marker_headers`).get().e, e0 + 1, '回の中 (updating の後) で新しい epoch');
   assert.equal(r3.exitCode, 0, `${r3.summary} ${JSON.stringify(r3.reasons)}`); assert.equal((await cov()).state, 'complete');
   assert.equal(db.prepare(`SELECT evidence_epoch e FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get().e, e0 + 1, '一覧の回は最新の印の epoch を持つ');
 });
@@ -424,40 +439,114 @@ await t('🚨 complete の応答だけ失われた = 同じ中身で送り直し
   assert.equal(f.calls.complete, 2); assert.equal(r.coverage.status, 'same');
   assert.equal((await cov()).state, 'complete');
 });
-await t('Render の status が 404: 台帳に coverage の世代が一度も無い = 今までの送り方 (deploy の順番がずれた保険) / 一度でも coverage で回った後 = Render が戻った疑い = 取込だけして送らない ❌ (#1567 R1 Medium 4・R2 Medium 3)', async () => {
+const S404 = () => new Response('Cannot GET', { status: 404 });
+const S409 = () => new Response(JSON.stringify({ error: 'not_migrated' }), { status: 409, headers: { 'content-type': 'application/json' } });
+/** 生の表・一覧の回の数 (取込をしたかを見る) */
+const writeState = () => ({ raw: rawCounts(), runs: db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_report_inventory_runs`).get().n });
+/** coverage で回った証拠を全部隠す (台帳の世代・一覧の回・手のファイル・印の順番待ちの世代)。戻り = 戻す関数 */
+function hideEvidence() {
   const g0 = ledgerMeta('coverage_generation');
-  assert.ok(g0, '前提: この台帳は coverage で回ったことがある');
-  const f = spyFetch({ statusOverride: () => new Response('Cannot GET', { status: 404 }) });
-  const r = await run({ fetchImpl: f });
-  assert.equal(r.mode, 'render_404'); assert.equal(r.exitCode, 1, r.summary);
-  assert.match(r.summary, /^❌ .*財務 push: 送らない = Render の決済のそろいの受け口が 404/);
-  assert.equal(f.calls.chunks + f.calls.updating + f.calls.complete, 0, '送らない (fail-open にしない)');
-  assert.ok(r.ingest && r.ingest.inventory, '取込はした');
-  setLedgerMeta('coverage_generation', null);   // 台帳を失くした (台帳には coverage の世代が無い)
-  const ranIds = db.prepare(`SELECT id, coverage_generation g FROM amazon_settlement_report_inventory_runs WHERE coverage_generation IS NOT NULL`).all();
-  try {
-    // 🚨 台帳を失くしても warehouse.db の一覧の回に coverage の世代がある = 回ったことがある = 今までの送り方にしない (#1567 R3 L3)
-    const f3 = spyFetch({ statusOverride: () => new Response('Cannot GET', { status: 404 }) });
-    const r3 = await run({ fetchImpl: f3 });
-    assert.equal(r3.mode, 'render_404', r3.summary); assert.equal(r3.exitCode, 1);
-    assert.equal(f3.calls.chunks, 0);
-    // 台帳にも一覧の回にも証拠が無い (一度も coverage で回っていない) = 今までの送り方
-    db.prepare(`UPDATE amazon_settlement_report_inventory_runs SET coverage_generation = NULL WHERE coverage_generation IS NOT NULL`).run();
-    const f2 = spyFetch({ statusOverride: () => new Response('Cannot GET', { status: 404 }) });
-    const r2 = await run({ fetchImpl: f2 });
-    assert.equal(r2.mode, 'legacy'); assert.equal(r2.exitCode, 0, r2.summary);
-    assert.equal(f2.calls.updating + f2.calls.complete + f2.calls.tokenedChunks, 0);
-  } finally {
+  const saved = [['amazon_settlement_report_inventory_runs', 'coverage_generation'], ['amazon_settlement_manual_files', 'ingest_generation'], ['initial_marker_queue', 'applied_generation']]
+    .map(([tb, c]) => ({ tb, c, rows: db.prepare(`SELECT id, ${c} g FROM ${tb} WHERE ${c} IS NOT NULL`).all() }));
+  setLedgerMeta('coverage_generation', null);
+  for (const s of saved) db.prepare(`UPDATE ${s.tb} SET ${s.c} = NULL WHERE ${s.c} IS NOT NULL`).run();
+  return () => {
     setLedgerMeta('coverage_generation', g0);
-    const back = db.prepare(`UPDATE amazon_settlement_report_inventory_runs SET coverage_generation = ? WHERE id = ?`);
-    for (const x of ranIds) back.run(x.g, x.id);
-  }
+    for (const s of saved) { const u = db.prepare(`UPDATE ${s.tb} SET ${s.c} = ? WHERE id = ?`); for (const x of s.rows) u.run(x.g, x.id); }
+  };
+}
+await t('🚨 Render の status が 404 / 409 not_migrated で、coverage で回ったことがある = **取込も** 送信もしない ❌ (台帳の世代を失くしても warehouse.db の証拠で) / 一度も回っていない (台帳と warehouse.db の両方に証拠が無い) = 今までの送り方 (#1567 Codex R1 High 1・R2 Medium 3・R3 L3)', async () => {
+  assert.ok(ledgerMeta('coverage_generation'), '前提: この台帳は coverage で回ったことがある');
+  const refused = async (statusOverride, mode) => {
+    const b = writeState();
+    const f = spyFetch({ statusOverride });
+    const r = await run({ fetchImpl: f });
+    assert.equal(r.mode, mode, r.summary); assert.equal(r.exitCode, 1, r.summary);
+    assert.match(r.summary, /^❌ .*取込も送信もしない/);
+    assert.equal(r.ingest, null, '取込もしない');
+    assert.deepEqual(writeState(), b, '生の表・一覧の回は変わらない');
+    assert.equal(f.calls.chunks + f.calls.updating + f.calls.complete, 0, '送らない (fail-open にしない)');
+  };
+  await refused(S404, 'render_404');
+  await refused(S409, 'render_not_migrated');
+  // 台帳を失くした (台帳には coverage の世代が無い) = warehouse.db の一覧の回・手のファイル・印の順番待ちの世代で分かる
+  const g0 = ledgerMeta('coverage_generation');
+  setLedgerMeta('coverage_generation', null);
+  try { await refused(S404, 'render_404'); await refused(S409, 'render_not_migrated'); } finally { setLedgerMeta('coverage_generation', g0); }
+  // 台帳にも warehouse.db にも証拠が無い (一度も coverage で回っていない) = 今までの送り方 (deploy の順番がずれた保険)
+  const back = hideEvidence();
+  try {
+    for (const st of [S404, S409]) {
+      const f2 = spyFetch({ statusOverride: st });
+      const r2 = await run({ fetchImpl: f2 });
+      assert.equal(r2.mode, 'legacy', r2.summary); assert.equal(r2.exitCode, 0, r2.summary);
+      assert.match(r2.summary, /^⚠️ .*coverage: Render に 0050 が無い/);
+      assert.ok(r2.ingest && r2.ingest.inventory, '取込はする');
+      assert.equal(f2.calls.updating + f2.calls.complete + f2.calls.tokenedChunks, 0);
+    }
+  } finally { back(); }
 });
-await t('Render に 0050 が無い (status が 409 not_migrated) = 今までの送り方 (token なし・coverage を送らない・⚠️)', async () => {
-  const f = spyFetch({ statusOverride: () => new Response(JSON.stringify({ error: 'not_migrated' }), { status: 409, headers: { 'content-type': 'application/json' } }) });
+await t('🚨 台帳 (company-db-push.db) を失くした = 財務のバックフィルの完了印も世代も無いのに warehouse.db に coverage の証拠 = 取込だけ (ingest_only) にしない = 取込もしない ❌ (#1567 Codex R1 High 1)', async () => {
+  const g0 = ledgerMeta('coverage_generation'), b0 = ledgerMeta(META.backfill);
+  setLedgerMeta('coverage_generation', null); setLedgerMeta(META.backfill, null);
+  try {
+    const b = writeState();
+    const f = spyFetch();
+    const r = await run({ fetchImpl: f });
+    assert.equal(r.mode, 'ledger_lost', r.summary); assert.equal(r.exitCode, 1);
+    assert.match(r.summary, /^❌ .*台帳を失くした.*取込も送信もしない/);
+    assert.equal(r.ingest, null); assert.deepEqual(writeState(), b);
+    assert.equal(f.calls.chunks + f.calls.updating + f.calls.complete, 0);
+    // 証拠も無い (本当に初めて) = 取込だけ
+    const back = hideEvidence();
+    try {
+      const r2 = await run({ fetchImpl: spyFetch() });
+      assert.equal(r2.mode, 'ingest_only', r2.summary); assert.equal(r2.exitCode, 0, r2.summary);
+    } finally { back(); }
+  } finally { setLedgerMeta('coverage_generation', g0); setLedgerMeta(META.backfill, b0); }
+});
+await t('🚨 updating を送れない (Render の 5xx が 3 回) = 取込を始めない ❌ (生の表を書く前に無効にする)', async () => {
+  const b = writeState();
+  const f = spyFetch({ onCoverage: (body) => (body.state === 'updating' ? new Response('boom', { status: 500 }) : null) });
   const r = await run({ fetchImpl: f });
-  assert.equal(r.mode, 'legacy'); assert.equal(r.exitCode, 0, r.summary); assert.match(r.summary, /^⚠️ .*coverage: Render に 0050 が無い/);
-  assert.equal(f.calls.updating + f.calls.complete + f.calls.tokenedChunks, 0);
+  assert.equal(r.exitCode, 1, r.summary); assert.equal(r.ingest, null);
+  assert.deepEqual(writeState(), b); assert.equal(f.calls.updating, 3); assert.equal(f.calls.chunks, 0);
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+});
+await t('🚨 complete の後に新しい印を積む = 積んだだけでは印の表も Render の complete も変わらない → 次の回が updating の **後** に入れる (#1567 Codex R1 High 2 場面 1)', async () => {
+  assert.equal((await cov()).state, 'complete');
+  const n0 = markerCount();
+  remark();
+  assert.equal(markerCount(), n0, '積んだだけ');
+  let atUpdating = null;
+  const f = spyFetch({ onCoverage: (b) => { if (b.state === 'updating') atUpdating = markerCount(); return null; } });
+  const r = await run({ fetchImpl: f });
+  assert.equal(atUpdating, n0, 'updating を送った時点ではまだ入れていない');
+  assert.equal(markerCount(), n0 + 1);
+  assert.equal(r.exitCode, 0, `${r.summary} ${JSON.stringify(r.reasons)}`); assert.equal((await cov()).state, 'complete');
+  assert.equal(r.push.finance.coverage.manifest.initial_marker_id, latestMarkerId(), 'complete の manifest は新しい印');
+});
+await t('🚨 manifest を作った後・complete の前に印を積む = complete にしない (❌ marker_pending) → 次の回で入れて complete (#1567 Codex R1 High 2 場面 2)', async () => {
+  const n0 = markerCount();
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f, hooks: { beforeComplete: () => { assert.equal(remark().queued, true); } } });
+  assert.equal(r.exitCode, 1, r.summary); assert.ok(codes(r).includes('marker_pending'), codes(r).join(','));
+  assert.equal(f.calls.complete, 0); assert.equal((await cov()).state, 'updating');
+  assert.equal(markerCount(), n0);
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+  assert.equal(markerCount(), n0 + 1);
+});
+await t('🚨 manifest を作った後・complete の前に印の表が直接変わる (回の外で書かれた) = 印の id・epoch・digest を読み直して違う = complete にしない (❌ marker_changed) (#1567 Codex R1 High 2 場面 2)', async () => {
+  const norm = normalizeMarker(MARKER, { now: new Date(NOW) });
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f, hooks: { beforeComplete: (dbx) => { insertMarker(dbx, norm, { sourceFileName: 'direct.json', sourceFileHash: 'f'.repeat(64), now: new Date(NOW) }); } } });
+  assert.equal(r.exitCode, 1, r.summary); assert.ok(codes(r).includes('marker_changed'), codes(r).join(','));
+  assert.equal(f.calls.complete, 0); assert.equal((await cov()).state, 'updating');
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+  assert.equal(r2.push.finance.coverage.manifest.initial_marker_id, latestMarkerId());
 });
 await t('🚨 coordinator を通らない単独の送り手 (token の無い chunk が受領記録を変える) = Render は complete を無効にする', async () => {
   const r0 = await run({ fetchImpl: spyFetch() });
@@ -522,6 +611,30 @@ await t('送信の途中で失敗した朝 (failed chunk) = 記録の finance_pu
   assert.equal(last.finance_push_ok, false, JSON.stringify(last));
 });
 
+await t('🚨 版の無い過去の行がある (版付けがまだ) = coordinator は重い版付けを流さず ❌ (取込も Render も触れない)・dry-run も ❌ → 夜に手で migrate --commit の後は回る / 取込が入れた行は取込の取引の中で版が付く (#1567 Codex R1 Medium)', async () => {
+  const nullRows = () => db.prepare(`SELECT (SELECT COUNT(*) FROM raw_amazon_settlement_lines WHERE document_version_seq IS NULL) + (SELECT COUNT(*) FROM raw_amazon_settlement_headers WHERE document_version_seq IS NULL) n`).get().n;
+  assert.equal(nullRows(), 0, 'ここまでの回が取り込んだ行 (SP-API・手のファイル) は全部、取込の取引の中で版を持つ');
+  // 過去の行 (版なし = PR の前に入った行の形) を 1 行足す
+  const cols = db.prepare(`PRAGMA table_info(raw_amazon_settlement_lines)`).all().map((c) => c.name).filter((c) => c !== 'id');
+  const sel = cols.map((c) => (c === 'document_version_seq' ? 'NULL' : c === 'physical_line_hash' ? `physical_line_hash || '-old'` : c === 'source_document_id' ? `'R-OLD'` : c)).join(', ');
+  db.prepare(`INSERT INTO raw_amazon_settlement_lines (${cols.join(', ')}) SELECT ${sel} FROM raw_amazon_settlement_lines WHERE amazon_order_id = 'O-A' ORDER BY id LIMIT 1`).run();
+  assert.equal(nullRows(), 1);
+  const b = writeState();
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f });
+  assert.equal(r.mode, 'unmigrated', r.summary); assert.equal(r.exitCode, 1);
+  assert.match(r.summary, /^❌ .*版付けがまだ.*migrate-settlement-document-versions\.js --commit/);
+  assert.equal(r.ingest, null); assert.deepEqual(writeState(), b);
+  assert.equal(f.calls.chunks + f.calls.updating + f.calls.complete, 0);
+  assert.equal(nullRows(), 1, 'coordinator は版付けを流さない');
+  const d = await run({ fetchImpl: spyFetch(), dryRun: true });
+  assert.equal(d.exitCode, 1, d.summary); assert.match(d.summary, /^❌ .*dry-run.*版/);
+  const m = await runMigrate({ commit: true, log: () => {}, isAlive: () => false });
+  assert.equal(m.ready, true); assert.equal(nullRows(), 0);
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.mode, 'coverage', r2.summary); assert.ok(r2.ingest, '版付けの後は取り込む');
+});
+
 console.log('⑧ 判定の部品 (単体)');
 await t('frontierFrom: 起点を含む区間から・重なりは可・隙間で止まる・起点を覆わなければ null', async () => {
   const o = '2026-01-01T00:00:00Z';
@@ -545,6 +658,13 @@ await t('completionBlockers: range / 送れない注文 / 整形できない / s
   assert.deepEqual(one1({ sourceRevisionNow: 8 }), ['source_revision_changed']);
   assert.deepEqual(one1({ snapshot: { reasons: [{ code: 'x', human: true }], sourceRevision: 7 } }), ['x']);
   assert.deepEqual(one1({ snapshot: null }), ['no_snapshot']);
+  // 初期の印の読み直し (#1567 Codex R1 High 2)
+  const snapM = { reasons: [], sourceRevision: 7, diag: { markerId: 'im-1', markerEpoch: 1, markerDigest: 'd1' }, manifest: { initial_marker_id: 'im-1', initial_marker_digest: 'd1' } };
+  assert.deepEqual(one1({ snapshot: snapM, markerNow: { marker_id: 'im-1', evidence_epoch: 1, marker_digest: 'd1' } }), []);
+  assert.deepEqual(one1({ snapshot: snapM, markerNow: { marker_id: 'im-2', evidence_epoch: 2, marker_digest: 'd2' } }), ['marker_changed']);
+  assert.deepEqual(one1({ snapshot: snapM, markerNow: { marker_id: 'im-1', evidence_epoch: 1, marker_digest: 'dX' } }), ['marker_changed']);
+  assert.deepEqual(one1({ snapshot: snapM, markerNow: null }), ['marker_changed']);
+  assert.deepEqual(one1({ markersPending: 1 }), ['marker_pending']);
 });
 
 console.log(ng ? `\n❌ coordinator (D7b-1b-3): ok ${ok} / NG ${ng}` : `\n✅ coordinator (D7b-1b-3): ok ${ok} / NG 0`);

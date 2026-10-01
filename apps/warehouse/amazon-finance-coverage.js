@@ -227,7 +227,7 @@ export function evaluateCoverage(db, { generation, runToken, policy, source, now
 
   const results = {};
   for (const it of items) results[it.result] = (results[it.result] || 0) + 1;
-  const diag = { origin, settlementsThrough, selectedSettlements: selected.size, versions: versions.length, chainRuns: chain.length, expectedItems: items.length, results, unsatisfied, markerId: marker ? marker.marker_id : null, thisRunSeq: thisRun ? thisRun.inventory_run_seq : null };
+  const diag = { origin, settlementsThrough, selectedSettlements: selected.size, versions: versions.length, chainRuns: chain.length, expectedItems: items.length, results, unsatisfied, markerId: marker ? marker.marker_id : null, markerEpoch: marker ? marker.evidence_epoch : null, markerDigest: marker ? marker.marker_digest : null, thisRunSeq: thisRun ? thisRun.inventory_run_seq : null };
   if (reasons.length) return { ok: false, reasons, manifest: null, diag };
   const manifest = {
     complete_to: addDays(jstDateOfUtc(settlementsThrough), -1),
@@ -257,8 +257,10 @@ export function evaluateCoverage(db, { generation, runToken, policy, source, now
 /**
  * 完成の判定 (pipeline の r.ok は使わない = 鍵の分からない行は runPush の後で r.ok に入る・§3.1)。
  * 入力 = 送り手の回の結果・判定 (evaluateCoverage)・送った後の状態。戻り = 理由の配列 (空 = complete にしてよい)
+ *   markerNow = complete の直前に読み直した最新の初期の印 ({ marker_id, evidence_epoch, marker_digest } / null。undefined = 確かめない = 単体の試験だけ)
+ *   markersPending = 順番待ちの印の数 (回の途中で積まれた = 次の回で入れる・#1567 Codex R1 High 2)
  */
-export function completionBlockers({ r, snapshot, retryLeft, dirtyLeft, sourceRevisionNow, unkeyed, pseudoBlocked }) {
+export function completionBlockers({ r, snapshot, retryLeft, dirtyLeft, sourceRevisionNow, unkeyed, pseudoBlocked, markerNow = undefined, markersPending = 0 }) {
   const out = [];
   const add = (code, detail) => out.push({ code, detail, human: HUMAN_REASONS.has(code) });
   if (!r || r.mode === 'range') add('range', 'range の回は complete にしない (一部の期間だけ)');
@@ -274,6 +276,14 @@ export function completionBlockers({ r, snapshot, retryLeft, dirtyLeft, sourceRe
   else {
     for (const x of snapshot.reasons || []) out.push(x);
     if (sourceRevisionNow == null || String(sourceRevisionNow) !== String(snapshot.sourceRevision)) add('source_revision_changed', `決済の生の表の版が読み取りの後に変わった (${snapshot.sourceRevision} → ${sourceRevisionNow}) = 次の回で拾う`);
+    // 🚨 manifest を作った後に初期の印が変わった = 古い印の manifest で complete にしない (#1567 Codex R1 High 2)
+    if (markerNow !== undefined) {
+      const d = snapshot.diag || {}, m = snapshot.manifest || null;
+      const was = { id: m ? m.initial_marker_id : (d.markerId ?? null), epoch: d.markerEpoch ?? null, digest: m ? m.initial_marker_digest : (d.markerDigest ?? null) };
+      const now = { id: markerNow ? markerNow.marker_id : null, epoch: markerNow ? markerNow.evidence_epoch : null, digest: markerNow ? markerNow.marker_digest : null };
+      if (was.id !== now.id || String(was.epoch) !== String(now.epoch) || was.digest !== now.digest) add('marker_changed', `初期の印が manifest を作った後に変わった (${was.id ?? 'なし'} epoch ${was.epoch ?? '-'} → ${now.id ?? 'なし'} epoch ${now.epoch ?? '-'}) = 次の回で拾う`);
+    }
   }
+  if (markersPending) add('marker_pending', `順番待ちの初期の印が ${markersPending} (回の途中で積まれた) = 古い印のまま complete にしない・次の回で入れる`);
   return out;
 }
