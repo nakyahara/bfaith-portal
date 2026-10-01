@@ -460,5 +460,28 @@ ok(lp.requestJob(db, args({ ...dA, id: 'abc' }, s2.spec, 'key-000x', { now: min(
 ok(lp.requestJob(db, args(mkDraft('LP-J', 'テスト'), { ...s2.spec, id: 99999 }, 'key-0001', { now: min(95) })).code === 'bad_request',
   '存在しない仕様書の版は断る');
 
+console.log('⑳ 🚨 古い版の packet は claim しない (codex exec review P2)');
+{
+  // 版が上がる = 渡す材料の形が変わった。v1 には instruction が無いので、
+  // そのまま渡すと**スタッフと違う指示文で作ったものが測定に混ざる** (設計 §5 / §7.1)。
+  // 先にキューを空にして、試す依頼を 1 件だけにする
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled', completed_at = ? WHERE status = 'queued'`)
+    .run(new Date(min(199)).toISOString());
+  const dOld = mkDraft('LP-OLD', 'ハッカ油スプレー 15ml');
+  const rOld = lp.requestJob(db, args(dOld, s2.spec, 'key-old01', { now: min(200) }));
+  ok(rOld.ok, '依頼は通る');
+  // 受付済みの行を v1 に差し替える (デプロイをまたいだ古い依頼の再現)
+  const old = JSON.parse(db.prepare('SELECT packet_json FROM ph_lp_compose_jobs WHERE id = ?').get(rOld.job.id).packet_json);
+  delete old.instruction;
+  old.packet_version = 1;
+  db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ?, packet_version = 1 WHERE id = ?')
+    .run(JSON.stringify(old), lp.sha256(lp.canonicalJson(old)), rOld.job.id);
+  ok(lp.claimJob(db, { runnerRunId: 'run-old', now: min(201) }).job === null, '🚨 古い版は掏ませない');
+  const row = db.prepare('SELECT status, error_code, error FROM ph_lp_compose_jobs WHERE id = ?').get(rOld.job.id);
+  eq(row.status, 'failed', '理由を残して failed にする');
+  eq(row.error_code, 'packet_outdated', 'error_code が packet_outdated');
+  ok((row.error || '').includes('もう一度依頼'), '人に何をすればよいかを書く');
+}
+
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);
 process.exit(fail === 0 ? 0 : 1);

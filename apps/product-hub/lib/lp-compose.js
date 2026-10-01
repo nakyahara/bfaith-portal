@@ -419,6 +419,18 @@ export function claimJob(db, { runnerRunId, now = Date.now() } = {}) {
           .run('受付時に固定した材料が変わっている (もう一度依頼してください)', nowS, nowS, job.id);
         continue;
       }
+      // 🚨 古い版の packet を渡さない (codex exec review P2)。
+      //    版が上がる = 渡す材料の形が変わった。v1 には instruction が入っていないので、
+      //    そのまま渡すと**スタッフと違う指示文で作ったものが測定に混ざる** (設計 §5 / §7.1)。
+      //    自動で作り直さない — 人がもう一度ボタンを押す (渡した材料を勝手に差し替えない)。
+      if (job.packet_version !== PACKET_VERSION) {
+        db.prepare(`UPDATE ph_lp_compose_jobs
+          SET status = 'failed', error_code = 'packet_outdated', error = ?,
+              updated_at = ?, completed_at = COALESCE(completed_at, ?)
+          WHERE id = ? AND status = 'queued'`)
+          .run(`渡す材料の形が更新されました (版 ${job.packet_version} → ${PACKET_VERSION})。もう一度依頼してください`, nowS, nowS, job.id);
+        continue;
+      }
       const spec = db.prepare('SELECT * FROM ph_lp_specs WHERE id = ?').get(job.spec_id);
       const specOk = spec
         && spec.hash === job.spec_hash
