@@ -578,18 +578,6 @@ export function submitResult(db, generationId, {
     }
     const job = jobById(db, gen.job_id);
     if (!job) return { code: 'not_found', error: '依頼がありません' };
-    // 🚨 証跡は「渡した材料のうち実際に見たもの」でなければ意味がない。
-    //    packet に無い file_id を含む receipt は受け取らない (コード R7 #2)。
-    //    完全一致までは求めない — 取得に失敗した画像があれば、その分は証跡に載らないのが正しい。
-    if (imgs?.length) {
-      let allowed;
-      try { allowed = new Set((JSON.parse(job.packet_json).images || []).map((im) => im.file_id)); }
-      catch { allowed = new Set(); }
-      const stray = imgs.find((im) => !allowed.has(im.file_id));
-      if (stray) {
-        return { code: 'bad_request', error: `receipt.images に渡していない画像があります (${stray.file_id})` };
-      }
-    }
     // 🚨 確定してよいのは running (通常) と needs_review (lease 切れ後の復旧) だけ。
     //    これが無いと、cancelled や別理由で failed になった job を後から done に戻せてしまう
     //    (コード R1 #2)。lease 切れ後の復旧を受けるのは AI 枠を消費済みだから (設計 ④)。
@@ -597,6 +585,28 @@ export function submitResult(db, generationId, {
       return { code: 'job_finalized', error: `この依頼は ${job.status} で終わっています (結果は受け取れません)` };
     }
 
+    // 🚨 証跡は「渡した材料のうち実際に見たもの」でなければ意味がない。
+    //    packet に無い file_id を含む receipt は受け取らない (コード R7 #2)。
+    //    完全一致までは求めない — 取得に失敗した画像があれば、その分は証跡に載らないのが正しい。
+    let packetImages = [];
+    try { packetImages = JSON.parse(job.packet_json).images || []; } catch { packetImages = []; }
+    if (imgs?.length) {
+      const allowed = new Set(packetImages.map((im) => im.file_id));
+      const stray = imgs.find((im) => !allowed.has(im.file_id));
+      if (stray) {
+        return { code: 'bad_request', error: `receipt.images に渡していない画像があります (${stray.file_id})` };
+      }
+    }
+    // 🚨 **accepted なら証跡は必須** (codex exec review R2 P2)。
+    //    packet に画像があるのに receipt を省く / 空配列で出すと、「何を見て作ったか」が
+    //    一切残らないまま done になる = 証跡を置いた意味が消える。
+    //    rejected は「作れなかった」ので証跡が無くてよい。
+    if (v === 'accepted' && packetImages.length > 0 && !imgs?.length) {
+      return {
+        code: 'bad_request',
+        error: `この依頼には商品画像が ${packetImages.length} 枚あります。receipt.images に実際に見た画像を出してください`,
+      };
+    }
     const receiptObj = {
       verdict: v, review_rounds: rounds, model: gen.model, prompt_version: gen.prompt_version,
       finalized_at: nowS,

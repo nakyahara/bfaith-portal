@@ -91,7 +91,9 @@ ok(lp.releaseJob(db, c2.job.job_id, { leaseToken: c2.job.lease_token, now: min(0
 
 console.log('⑥ 結果 — accepted');
 const OUT = '# LP制作システム V2.1\n\n## ⑦ AI画像生成プロンプト\n… 本文 …';
-ok(lp.submitResult(db, g1.generation_id, { packetHash: 'ちがう', verdict: 'accepted', output: OUT, now: min(1) }).code === 'packet_mismatch',
+// packet に画像があるので accepted には証跡が要る (codex exec review R2 P2)
+const RCPT = { images: [{ file_id: 'FILEID000001', sha256: '0'.repeat(64), bytes: 999 }] };
+ok(lp.submitResult(db, g1.generation_id, { packetHash: 'ちがう', verdict: 'accepted', output: OUT, receipt: RCPT, now: min(1) }).code === 'packet_mismatch',
   '材料が予約時と違えば受け取らない');
 const sub1 = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: true }, reviewRounds: 1, receipt: { images: [{ file_id: 'FILEID000001', sha256: 'a'.repeat(64), bytes: 12345 }] }, now: min(1) });
 eq(sub1.status, 'done', '受け取ると done');
@@ -103,6 +105,18 @@ const sub1b = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_
 ok(sub1b.ok && sub1b.already, '同じ結果の再送は保存済みを返す (応答断のリトライ)');
 ok(lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'rejected', reason: 'ちがう内容', now: min(1.5) }).code === 'already_finalized',
   '別の内容では上書きできない');
+
+// 🚨 packet に画像があるのに証跡が無い accepted は受け取らない (codex exec review R2 P2)
+const dZ = mkDraft('LP-Z', 'ハッカ油スプレー 証跡なし');
+lp.requestJob(db, args(dZ, s2.spec, 'key-0001', { now: min(5) }));
+const cZ = lp.claimJob(db, { runnerRunId: 'run-z', now: min(5) });
+const gZ = lp.reserveGeneration(db, cZ.job.job_id, { leaseToken: cZ.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(5) });
+for (const [r, label] of [[undefined, '省略'], [{}, '空オブジェクト'], [{ images: [] }, '空配列']]) {
+  eq(lp.submitResult(db, gZ.generation_id, { packetHash: cZ.job.packet_hash, verdict: 'accepted', output: OUT, receipt: r, now: min(6) }).code,
+    'bad_request', `🚨 証跡が ${label} の accepted は受け取らない (review R2 P2)`);
+}
+eq(lp.submitResult(db, gZ.generation_id, { packetHash: cZ.job.packet_hash, verdict: 'rejected', reason: '作れなかった', now: min(6) }).status,
+  'failed', 'rejected は証跡が無くてよい (作れなかったので)');
 
 console.log('⑦ 結果 — rejected (lint / 検品が通らなかった)');
 const dB = mkDraft('LP-B', 'ハッカ油スプレー 50ml');
@@ -169,7 +183,7 @@ const dG = mkDraft('LP-G', 'ハッカ油スプレー 5L');
 lp.requestJob(db, args(dG, s2.spec, 'key-0001', { now: min(70) }));
 const c6 = lp.claimJob(db, { runnerRunId: 'run-10', now: min(70) });
 const g6 = lp.reserveGeneration(db, c6.job.job_id, { leaseToken: c6.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(70) });
-lp.submitResult(db, g6.generation_id, { packetHash: c6.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, now: min(71) });
+lp.submitResult(db, g6.generation_id, { packetHash: c6.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, receipt: RCPT, now: min(71) });
 lp.recoverExpired(db, min(70 + lp.LEASE_MIN + 5));
 eq(db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(c6.job.job_id).status, 'done',
   '🚨 期限切れ処理は done を上書きしない (R1 #1)');
@@ -180,10 +194,10 @@ lp.requestJob(db, args(dH, s2.spec, 'key-0001', { now: min(80) }));
 const c7 = lp.claimJob(db, { runnerRunId: 'run-11', now: min(80) });
 const g7 = lp.reserveGeneration(db, c7.job.job_id, { leaseToken: c7.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(80) });
 db.prepare("UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?").run(c7.job.job_id);
-eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdict: 'accepted', output: OUT, now: min(81) }).code, 'job_finalized',
+eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdict: 'accepted', output: OUT, receipt: RCPT, now: min(81) }).code, 'job_finalized',
   '🚨 cancelled の依頼を結果で done に戻せない (R1 #2)');
 db.prepare("UPDATE ph_lp_compose_jobs SET status = 'needs_review' WHERE id = ?").run(c7.job.job_id);
-eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdict: 'accepted', output: OUT, now: min(82) }).status, 'done',
+eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdict: 'accepted', output: OUT, receipt: RCPT, now: min(82) }).status, 'done',
   'needs_review からの復旧は受ける (AI 枠を使っているので取りこぼさない)');
 
 // #5 壊れた実行役が DB を肥らせたり例外を漏らしたりできない
