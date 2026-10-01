@@ -46,11 +46,15 @@ const SEEN_MAX = 20_000;                    // 画像から読み取ったこと
 const IMAGE_MAX_BYTES = 8 * 1024 * 1024;
 const FAIL_CODES = ['SPEC_UNREADABLE', 'MATERIAL_TOO_THIN', 'IMAGES_UNAVAILABLE', 'OTHER'];
 
-// 用途別のファイル名 (basename のみ。区切り文字・.. を含む名前は正規表現で弾かれる)
-const NAME = {
-  out: /^out-[A-Za-z0-9_-]{1,40}\.md$/,
-  lint: /^lint-[A-Za-z0-9_-]{1,40}\.json$/,
-  reason: /^reason-[A-Za-z0-9_-]{1,40}\.txt$/,
+// 用途別のファイル名。
+// 🚨 名前の**形**ではなく、**その依頼の ID そのもの**で決める (codex exec review P1)。
+//    形だけを見ていたときは `./phlp result 12 --file out-11.md --lint lint-11.json` が通り、
+//    **11 番の構成を 12 番の商品に書き戻せた** (work に前の依頼のファイルが残っていると起きる)。
+//    ID は jobId() で数字に限っているので、組み立てた名前に区切り文字は入らない
+const FIXED = {
+  out: (id) => `out-${id}.md`,
+  lint: (id) => `lint-${id}.json`,
+  reason: (id) => `reason-${id}.txt`,
 };
 const ID_RE = /^[1-9]\d*$/;
 
@@ -72,10 +76,11 @@ function parseArgs(argv) {
   return { pos, opt };
 }
 
-/** 作業ディレクトリ直下の決まった名前だけ。symlink も拒否 (phq.mjs と同じ) */
-function safePath(name, kind, { mustExist = true } = {}) {
+/** 作業ディレクトリ直下の、**その依頼の**決まった名前だけ。symlink も拒否 */
+function safePath(name, kind, id, { mustExist = true } = {}) {
   const n = String(name || '');
-  if (!NAME[kind] || !NAME[kind].test(n)) die(`ファイル名が不正です (${kind}: ${NAME[kind]})`);
+  const want = FIXED[kind](id);
+  if (n !== want) die(`ファイル名は ${want} です (指定: ${n})`);
   const p = path.resolve(process.cwd(), n);
   if (path.dirname(p) !== path.resolve(process.cwd())) die('作業ディレクトリ直下のファイルだけです');
   if (mustExist) {
@@ -258,20 +263,20 @@ async function cmdResult(id, opt) {
 
   let output = null;
   if (accepted) {
-    const p = safePath(opt.file, 'out');
+    const p = safePath(opt.file, 'out', id);
     output = fs.readFileSync(p, 'utf8');
     if (!output.trim()) die('構成の本文が空です');
     if (output.length > OUT_MAX) die(`構成が大きすぎます (${OUT_MAX} 文字まで)`);
   }
   let reason = null;
   if (rejected) {
-    if (opt['reason-file']) reason = fs.readFileSync(safePath(opt['reason-file'], 'reason'), 'utf8').slice(0, REASON_MAX);
+    if (opt['reason-file']) reason = fs.readFileSync(safePath(opt['reason-file'], 'reason', id), 'utf8').slice(0, REASON_MAX);
     else if (typeof opt.reason === 'string') reason = opt.reason.slice(0, REASON_MAX);
     if (!reason || !reason.trim()) die('--reason-file か --reason が要ります');
   }
   let lint = null;
   if (opt.lint) {
-    const raw = fs.readFileSync(safePath(opt.lint, 'lint'), 'utf8');
+    const raw = fs.readFileSync(safePath(opt.lint, 'lint', id), 'utf8');
     if (raw.length > LINT_MAX) die(`lint が大きすぎます (${LINT_MAX} 文字まで)`);
     try { lint = JSON.parse(raw); } catch { die('lint が JSON ではありません'); }
   }

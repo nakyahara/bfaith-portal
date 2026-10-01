@@ -135,6 +135,16 @@ fs.writeFileSync(path.join(work, `out-${jid}.md`), '# LP制作システム V2.1\
 fs.writeFileSync(path.join(work, 'secret.txt'), 'トークンのつもり', 'utf8');
 eq((await phlp('result', jid, '--accepted', '--file', 'secret.txt')).code, 2, '🚨 別名のファイルは読まない');
 eq((await phlp('result', jid, '--accepted', '--file', `../out-${jid}.md`)).code, 2, '🚨 パス付きは読まない');
+// 🚨 形が合っていても **他の依頼の** ファイルは読まない (codex exec review P1)。
+//    work に前の依頼のファイルが残っていると、別の商品の構成を書き戻せた
+const other = String(Number(jid) + 1);
+fs.writeFileSync(path.join(work, `out-${other}.md`), '別の依頼の構成', 'utf8');
+fs.writeFileSync(path.join(work, `lint-${other}.json`), '{"ok":true}', 'utf8');
+eq((await phlp('result', jid, '--accepted', '--file', `out-${other}.md`, '--lint', `lint-${other}.json`)).code, 2,
+  '🚨 他の依頼の out-*.md は読まない (codex exec review P1)');
+fs.writeFileSync(path.join(work, `reason-${other}.txt`), '別の理由', 'utf8');
+eq((await phlp('result', jid, '--rejected', '--reason-file', `reason-${other}.txt`)).code, 2,
+  '🚨 他の依頼の reason-*.txt も読まない');
 eq((await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`)).code, 2, '予約していなければ result を出せない');
 
 console.log('⑤ 予約の前は fail / release、後は result');
