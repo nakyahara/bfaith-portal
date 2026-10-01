@@ -232,15 +232,26 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
   const sqlSel = db.prepare(`SELECT document_version_seq s FROM v_amazon_settlement_selected_documents WHERE settlement_id = ?`).get(Sbad);
   ok(sqlSel && sqlSel.s === rg.documentVersionSeq, 'SQL の view も同じ (旧い版)');
   ok(V.documentVersionsReady(db), '良い版がある決済は blocked にしない');
-  // 悪い版しか無い決済 (見出しが 2 行)
+  // 🆕 #1567 Codex R3 High 2: 見出しが 2 行の文書 (V1) = parser は 2 行とも返す・取込は拒む (版も行も作らない)
   const S2b = 'S-DV-BAD2';
   const two = prepareReportTsv(tsvOf(V1_COLUMNS, [{ ...HDR1, 'settlement-id': S2b, 'total-amount': '10.00' }, { ...HDR1, 'settlement-id': S2b, 'total-amount': '11.00' }, v1line({ 'settlement-id': S2b, 'order-id': 'OB2', 'price-type': 'Principal', 'price-amount': '10.00' })]), 'R-B2', 'x');
-  // 見出しの行は 1 本しか返らない (prepare は最後の見出し) = 2 本目は直接足す
-  ingestSettlement(db, two.headerRow, two.lineRows, two.ctx);
+  ok(two.headerRowCount === 2 && two.headerRows.length === 2 && String(two.headerRows[0].total_amount_micro) !== String(two.headerRows[1].total_amount_micro), '🚨 parser は見出しを 2 行とも返す (前は最後の 1 行に潰した)');
+  throws(() => ingestSettlement(db, two.headerRow, two.lineRows, two.ctx), /見出しが 2 行/, '🚨 V1: 見出しが 2 行の文書は取り込まない');
+  ok(!db.prepare(`SELECT 1 FROM amazon_settlement_document_versions WHERE settlement_id = ?`).get(S2b) && !db.prepare(`SELECT 1 FROM raw_amazon_settlement_lines WHERE source_settlement_id = ?`).get(S2b),
+    'V1: 版も行も作らない (仮に採る壊れた版にもならない)');
+  const { inspectManualFile } = await import('./amazon-settlement-manual-file.js');
+  ok(inspectManualFile(tsvOf(V1_COLUMNS, [{ ...HDR1, 'settlement-id': S2b, 'total-amount': '10.00' }, { ...HDR1, 'settlement-id': S2b, 'total-amount': '10.00' }, v1line({ 'settlement-id': S2b, 'order-id': 'OB2', 'price-type': 'Principal', 'price-amount': '10.00' })]), { format: 'v1' })
+    .problems.some((p) => /見出しの行が 2 行/.test(p)), '手のファイル (V1) も見出しが 2 行なら積まない');
+  // 悪い版しか無い決済 (見出しの total ≠ 明細の合計)
+  const bad1 = prepareReportTsv(tsvOf(V1_COLUMNS, [{ ...HDR1, 'settlement-id': S2b, 'total-amount': '11.00' }, v1line({ 'settlement-id': S2b, 'order-id': 'OB2', 'price-type': 'Principal', 'price-amount': '10.00' })]), 'R-B2', 'x');
+  const rb1 = ingestSettlement(db, bad1.headerRow, bad1.lineRows, bad1.ctx);
+  // 🚨 版の見出しの数 = 物理の行の数: 同じ鍵 (business_line_key) の見出しを直接もう 1 行 (過去の行の形) = 2 と数える (前は鍵の種類で 1)
   const hsrc = db.prepare(`SELECT * FROM raw_amazon_settlement_headers WHERE source_settlement_id = ?`).get(S2b);
   const { id: _hid, ...hrest } = hsrc;
-  db.prepare(`INSERT INTO raw_amazon_settlement_headers (${Object.keys(hrest).join(',')}) VALUES (${Object.keys(hrest).map((k) => '@' + k).join(',')})`).run({ ...hrest, physical_line_hash: hrest.physical_line_hash + '-2', business_line_key: hrest.business_line_key + '-2', total_amount_micro: 11000000 });
+  db.prepare(`INSERT INTO raw_amazon_settlement_headers (${Object.keys(hrest).join(',')}) VALUES (${Object.keys(hrest).map((k) => '@' + k).join(',')})`).run({ ...hrest, physical_line_hash: hrest.physical_line_hash + '-2' });
   V.refreshStaleVersionDetails(db);
+  const vh = db.prepare(`SELECT header_count, detail_valid FROM amazon_settlement_document_versions WHERE seq = ?`).get(rb1.documentVersionSeq);
+  ok(vh.header_count === 2 && vh.detail_valid === 0, `🚨 版の見出しの数 = 物理の行の数 (同じ鍵の 2 行も 2・detail_valid 0) (${vh.header_count}・${vh.detail_valid})`);
   // 🆕 #1567 R2 Medium 1 (案 C): 良い版が無い決済 = 中身の悪い版を仮に採る (PR の前もその行で build していた)・全部を止めない・朝の報告と coverage の理由に出す
   ok(V.documentVersionsReady(db) && !V.documentVersionProblems(db).length, '🚨 壊れた版しか無い決済があっても build と送り手は止めない (1 つの決済の違反で全部を止めない)');
   const warns = V.documentVersionWarnings(db);
@@ -296,6 +307,30 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
     db.prepare(`DELETE FROM raw_amazon_settlement_headers WHERE source_document_id = ?`).run(doc);
     V.refreshStaleVersionDetails(db);
   }
+}
+
+// ─── 🆕 #1567 Codex R3 High 2: 過去の行の版付け = 見出しの物理の行が 2 行の文書 (同じ鍵でも) は版を付けずに止まる ───
+{
+  const { runMigrate } = await import('./migrate-settlement-document-versions.js');
+  const ym = Number(YM.replace('-', ''));
+  const doc = 'MULTI-H';
+  db.prepare(`INSERT INTO raw_amazon_settlement_lines (physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version,
+    source_settlement_id, posted_date_utc, posted_datetime_jst, economic_date, year_month_int, amazon_order_id, seller_sku_normalized, transaction_type, price_type, price_amount_micro, currency, ingested_at)
+    VALUES ('mh-l0', 'mh-lk0', ?, 'mh', 'p', 2, 'sp_api_v1', 'v1.0.0', 'S-MH', 'x', 'x', ?, ?, 'MH-O', 'sku-mh', 'Order', 'Principal', 1000000, 'JPY', '2026-01-01 00:00:00')`).run(doc, `${YM}-05`, ym);
+  const insH = db.prepare(`INSERT INTO raw_amazon_settlement_headers (physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version,
+    source_settlement_id, settlement_start_date, settlement_end_date, total_amount_micro, currency, ingested_at)
+    VALUES (?, 'mh-hk', ?, 'mh', 'p', 1, 'sp_api_v1', 'v1.0.0', 'S-MH', ?, ?, 1000000, 'JPY', '2026-01-01 00:00:00')`);
+  insH.run('mh-h0', doc, `${YM}-01T00:00:00+00:00`, `${YM}-15T00:00:00+00:00`);
+  insH.run('mh-h1', doc, `${YM}-01T00:00:00+00:00`, `${YM}-15T00:00:00+00:00`);   // 同じ鍵・物理の行は別
+  const logs = [];
+  await runMigrate({ commit: false, log: (m) => logs.push(m) });
+  ok(logs.some((l) => l.includes(`見出しの行が 2 行以上ある文書 1 (${doc} 2 行)`)), '版付けの dry-run で「見出しの行が 2 行以上ある文書」を数える (本番のコピーで 0 件を確かめる)');
+  let threw = null; try { V.backfillDocumentVersions(db); } catch (e) { threw = e; }
+  ok(threw && threw.code === 'MULTI_HEADER_DOCS' && !db.prepare(`SELECT 1 FROM amazon_settlement_document_versions WHERE source_document_id = ?`).get(doc), `🚨 過去の行の版付け: 見出しの物理の行が 2 行 (同じ鍵) = 版を付けずに止まる (${threw && threw.code})`);
+  let mthrew = null; try { await runMigrate({ commit: true, allowUnresolved: true, log: () => {}, isAlive: () => false }); } catch (e) { mthrew = e; }
+  ok(mthrew && mthrew.code === 'MULTI_HEADER_DOCS', `migrate --commit --allow-unresolved でも止まる (${mthrew && mthrew.code})`);
+  db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE source_document_id = ?`).run(doc);   // 片付け
+  db.prepare(`DELETE FROM raw_amazon_settlement_headers WHERE source_document_id = ?`).run(doc);
 }
 
 // ─── 🆕 #1567 R2 High 1: 過去の行で、見出しの無い新しい一部だけの文書が、見出しつきの全部の古い文書を押しのけない ───

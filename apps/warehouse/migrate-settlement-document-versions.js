@@ -13,6 +13,7 @@
  * 使い方:
  *   node apps/warehouse/migrate-settlement-document-versions.js            → 数えるだけ (dry-run・書かない)
  *   node apps/warehouse/migrate-settlement-document-versions.js --commit   → coverage の lease を取って版を付ける (coordinator が動いていれば止まる)
+ *   🚨 見出しの行 (物理の行) が 2 行以上ある過去の文書があれば版を付けずに止まる (#1567 Codex R3 High 2・--allow-unresolved でも進めない = 正しい文書で入れ直す)
  *   🚨 決済 ID が 2 つ以上ある過去の文書があれば版を付けずに止まる (#1567 R3 Medium 1)。文書を確かめた上で進めるときだけ --commit --allow-unresolved
  *      (🚨 その文書の行は SQLite の build から外れ、Render の仮の財務からも消える (墓石)。正しく分けて入れ直せば戻る・#1567 R4 Low 1)
  *      (その版は決済 ID が null = どの決済にも採られない = 行は build に入らない・朝の報告に 🚨 version_unresolved_settlement)
@@ -42,6 +43,10 @@ export async function runMigrate({ commit = false, allowUnresolved = false, log 
         UNION ALL SELECT source_layer, source_document_id, source_settlement_id FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_docver WHERE document_version_seq IS NULL
       ) GROUP BY 1, 2 HAVING COUNT(DISTINCT source_settlement_id) > 1`).all();
     log(multi.length ? `[versions] 🚨 決済 ID が 2 つ以上ある文書 ${multi.length} (${multi.slice(0, 10).map((m) => `${m.source_document_id} ${m.n}`).join(' / ')}) = 版を付けても決済 ID が決まらない` : '[versions] 決済 ID が 2 つ以上ある文書 0');
+    // 見出しの行 (物理の行) が 2 行以上ある文書 = 版付けは止まる (#1567 Codex R3 High 2)
+    const multiH = db.prepare(`SELECT source_layer, source_document_id, COUNT(*) n FROM raw_amazon_settlement_headers INDEXED BY idx_settle_headers_docver WHERE document_version_seq IS NULL
+      GROUP BY source_layer, source_document_id, source_file_hash, parser_version HAVING COUNT(*) > 1`).all();
+    log(multiH.length ? `[versions] 🚨 見出しの行が 2 行以上ある文書 ${multiH.length} (${multiH.slice(0, 10).map((m) => `${m.source_document_id} ${m.n} 行`).join(' / ')}) = 版付けは止まる` : '[versions] 見出しの行が 2 行以上ある文書 0');
     log(`[versions] dry-run (書かない)。付けるなら --commit`);
     return { ready: documentVersionsReady(db), nullLines, nullHeaders, stale, committed: false };
   }

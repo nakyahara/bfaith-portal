@@ -25,7 +25,7 @@ export function compareV2WithSelected(db, v2Tsv, reportId) {
   const sid = p.headerRow ? p.headerRow.source_settlement_id : (p.lineRows[0] && p.lineRows[0].source_settlement_id);
   const d = detailDigestOfRows(p.lineRows);
   const total = p.headerRow && p.headerRow.total_amount_micro != null ? BigInt(p.headerRow.total_amount_micro) : null;
-  const v2Valid = p.unknown.length === 0 && !p.itemCodeUnresolved && total != null && total === d.componentsSumMicro;
+  const v2Valid = p.unknown.length === 0 && !p.itemCodeUnresolved && p.headerRowCount === 1 && total != null && total === d.componentsSumMicro;   // 見出しはちょうど 1 行 (#1567 Codex R3 High 2)
   const vs = db.prepare(`SELECT * FROM amazon_settlement_document_versions WHERE settlement_id = ?`).all(sid);
   const sel = selectDocumentVersions(vs).get(sid) || null;
   const out = { reportId, settlementId: sid, v2: { lineCount: d.lineCount, digest: d.detailDigest, sum: String(d.componentsSumMicro), total: total == null ? null : String(total), valid: v2Valid, unknown: p.unknown.length },

@@ -14,7 +14,8 @@
  *     coordinator を通らない単独の送り手 (token の無い chunk) = Render は complete を無効にする / 完成の判定の単体 /
  *     (#1567 Codex R1) coverage で回った後の 404・409・台帳を失くした・updating の失敗 = 取込もしない / 初期の印は順番待ち → updating の後に入る・
  *     manifest の後に印が積まれた・直接変わった = complete にしない / 版の無い過去の行 = coordinator は版付けを流さず ❌ /
- *     (#1567 Codex R2) complete の POST の直前に印・手のファイルを積もうとする = 拒む / lease が切れて積まれた = POST の後に読み直して complete を取り消す
+ *     (#1567 Codex R2) complete の POST の直前に印・手のファイルを積もうとする = 拒む / lease が切れて積まれた = POST の後に読み直して complete を取り消す /
+ *     (#1567 Codex R3) 取込の一覧にだけあって証拠の一覧に無い report = frontier を延ばさない (not_in_inventory)
  * 実行: node scripts/test-amazon-finance-coverage-run.mjs
  */
 import assert from 'node:assert/strict';
@@ -114,7 +115,8 @@ const sp = {
     const q = req.query;
     if (q.nextToken) return SP.invEndless ? { reports: [], nextToken: 'more' } : { reports: [] };
     if (q.createdSince) return SP.invEndless ? { reports: SP.inv, nextToken: 'more' } : { reports: SP.inv };
-    return { reports: SP.ing };
+    if (SP.ingQueries) SP.ingQueries.push(q);   // 取込の一覧の要求 (createdUntil を確かめる)
+    return { reports: SP.ing };   // 作り物は createdUntil を見ない (Amazon が窓の後の report を返した場面も作れる)
   },
 };
 const downloadTsv = async (docId) => { if (!Object.hasOwn(DOCS, docId)) throw new Error(`文書が無い ${docId}`); return DOCS[docId]; };
@@ -277,6 +279,8 @@ await t('🚨 API の版がある決済に手のファイル (余計な注文 O-
   assert.ok(r.push.finance.skippedEmpty >= 1);
   const last = JSON.parse(fs.readFileSync(path.join(tmpDir, LAST_RUN_FILE), 'utf8'));
   assert.deepEqual([last.mode, last.finance_pushed, last.coverage_complete], ['coverage', true, true]);
+  // 毎朝の --full の回の所要時間と最大メモリが記録に残る (#1567 Codex R3 の補足)
+  assert.ok(Number.isFinite(last.elapsed_minutes) && last.elapsed_minutes >= 0 && Number.isInteger(last.max_rss_mb) && last.max_rss_mb > 0, JSON.stringify(last));
 });
 
 console.log('④ 読み取りの後の変化 (source_revision)');
@@ -617,6 +621,28 @@ await t('🚨 coordinator を通らない単独の送り手 (token の無い chu
   assert.equal((await covState()).complete_to, null);
   const r2 = await run({ fetchImpl: spyFetch() });
   assert.equal(r2.exitCode, 0, r2.summary); assert.equal((await cov()).state, 'complete', '次の coordinator の回 (新しい世代) で complete に戻る');
+});
+await t('🚨 取込の一覧にだけあって証拠の一覧 (固定の窓) に無い report = その決済で frontier を延ばさない = complete にしない (❌ not_in_inventory) → 次の回の一覧に出れば complete / 取込の一覧の createdUntil = 証拠の一覧の窓の終わり (#1567 Codex R3 High 1)', async () => {
+  const P7 = ['2026-03-16T10:00:00Z', '2026-03-17T10:00:00Z'];
+  DOCS.D7 = settlementTsv('S7', ...P7, [{ kind: 'order', order: 'O-F', sku: 'SKU-F', yen: 70, day: '2026-03-16T12:00:00Z' }]);
+  SP.ing = [...SP.ing, rep('R7', 'DONE', 'D7', P7, '2026-03-20T23:59:00Z')];   // 回の開始の後に作られた = 証拠の一覧 (SP.inv) には無い
+  SP.ingQueries = [];
+  try {
+    const f = spyFetch();
+    const r = await run({ fetchImpl: f });
+    assert.ok(V.selectedVersionOf(db, 'S7'), '前提: S7 は取り込まれて採った版がある (作り物の SP-API は createdUntil を無視して返す)');
+    assert.equal(r.exitCode, 1, r.summary); assert.ok(codes(r).includes('not_in_inventory'), codes(r).join(','));
+    assert.equal(f.calls.complete, 0); assert.equal((await cov()).state, 'updating');
+    const d = r.push.scanSnapshot.diag;
+    assert.deepEqual([d.settlementsThrough, d.frontierAll], ['2026-03-16T10:00:00Z', P7[1]], 'frontier は裏付けのある S5 の end で止まる (S7 を入れると 3/17)');
+    // (b) 取込の一覧の要求の createdUntil = 証拠の一覧の窓の終わり (回の開始)
+    const inv = db.prepare(`SELECT query_created_until u FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get();
+    assert.deepEqual(SP.ingQueries.map((q) => q.createdUntil), [inv.u], '取込の一覧も証拠の一覧と同じ時刻で切る');
+    SP.inv = SP.ing;   // 次の回の一覧に出た
+    const r2 = await run({ fetchImpl: spyFetch() });
+    assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`);
+    assert.deepEqual([(await cov()).state, (await cov()).complete_to], ['complete', '2026-03-16'], 'S7 まで complete (end 3/17 19:00 JST の前日)');
+  } finally { SP.ingQueries = null; }
 });
 await t('🚨 一覧の窓の空白 (前の成功した回から 85 日以上あいた) = complete にしない (⚠️ evidence_chain_gap = Seller Central で印を作り直す)', async () => {
   NOW = Date.parse('2026-07-01T00:00:00Z');

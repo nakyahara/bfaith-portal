@@ -51,6 +51,7 @@ export function inspectManualFile(tsv, { fileName = null, format = null } = {}) 
   } else throw new Error(`--format は v1 か v2: ${fmt}`);
   const h = prepared.headerRow;
   if (!h) problems.push('見出しの行が無い');
+  if (prepared.headerRowCount > 1) problems.push(`見出しの行が ${prepared.headerRowCount} 行 (1 行だけ) = 連結・壊れたファイル (#1567 Codex R3 High 2)`);
   const ids = new Set(prepared.lineRows.map((l) => l.source_settlement_id));
   if (h) ids.add(h.source_settlement_id);
   if (ids.size !== 1) problems.push(`決済 ID が 1 つでない (${[...ids].join(', ')})`);

@@ -165,7 +165,8 @@ ok(!res.error, `ふつうの回は落ちない ${res.error ? res.error.message :
 
 // 呼ぶ順: 取込の一覧の要求が先 (今と同じ位置・同じ形) → 一覧の記録の要求 (窓を明示・2 ページ目は nextToken だけ)
 const reportsCalls = sp.calls.filter((c) => c.operation === 'getReports');
-eq(reportsCalls[0].query, { reportTypes: [V2T], marketplaceIds: [MKT], pageSize: 100 }, '🚨 最初の getReports = 取込の一覧の要求 (今までと同じ形・日時の境なし) = 取込む report は変わらない');
+eq(reportsCalls[0].query, { reportTypes: [V2T], marketplaceIds: [MKT], pageSize: 100, createdUntil: '2026-09-30T00:00:05Z' },
+  '🚨 最初の getReports = 取込の一覧の要求 = createdUntil は回の開始 (証拠の一覧の窓の終わりと同じ = 一覧に無い新しい report を取込まない・#1567 Codex R3 High 1)・createdSince は Amazon の既定 (90 日前) のまま');
 eq(reportsCalls[1].query, { reportTypes: [V2T], marketplaceIds: [MKT], pageSize: 100, createdSince: '2026-07-07T00:00:05Z', createdUntil: '2026-09-30T00:00:05Z' }, '一覧の記録の要求は取込の一覧の後 = createdUntil は回の開始の時刻 (秒に切り捨て)・createdSince はその 85 日前');
 eq(reportsCalls[2].query, { nextToken: 'inv:1' }, '一覧の 2 ページ目は nextToken だけ (窓を付け直さない)');
 ok(reportsCalls.length === 3, `getReports は取込 1 + 一覧 2 = 3 回 (${reportsCalls.length})`);

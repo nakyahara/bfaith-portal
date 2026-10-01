@@ -156,5 +156,20 @@ ingestSettlement(db, v1of3.headerRow, v1of3.lineRows, v1of3.ctx);   // --source 
 pr = processV2Report(db, bad3, 'R-B3', 'run-e');
 ok(pr.status === 'blocked' && pr.settlementId === S3 && pr.coveredByOtherVersion === true, '規則に無いもの・日時の空がある V2 は入れない。V1 で取込済みなら coveredByOtherVersion (毎朝 exit 3 にはしない・coverage は満たせない)');
 
+// 🆕 #1567 Codex R3 High 2: V2 で見出しが 2 行 (連結・壊れた文書) = parser は 2 行とも返す・取り込まない (blocked = 一覧に理由つきで残る)
+{
+  const S4 = 'S903', hdr4 = { ...V2_ROWS[0], 'settlement-id': S4 }, v2d = (o) => ({ ...v2(o), 'settlement-id': S4 });
+  const line4 = v2d({ 'transaction-type': 'Order', 'order-id': 'Y1', 'order-item-code': 'YI', sku: 'SKU-Y', 'quantity-purchased': '1', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '300.00' });
+  const twoH = tsvOf(V2_COLUMNS, [{ ...hdr4, 'total-amount': '300.00' }, { ...hdr4, 'total-amount': '999.00' }, line4]);
+  const p4 = prepareV2ReportTsv(twoH, 'R-2H', 'run-2h');
+  ok(p4.headerRowCount === 2 && p4.headerRows.length === 2, `🚨 V2: parser は見出しを 2 行とも返す (${p4.headerRowCount})`);
+  const pr4 = processV2Report(db, twoH, 'R-2H', 'run-2h');
+  const n4 = db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_settlement_id = ?`).get(S4).n;
+  ok(pr4.status === 'blocked' && /見出しが 2 行/.test(pr4.reason) && n4 === 0 && !db.prepare(`SELECT 1 FROM amazon_settlement_document_versions WHERE settlement_id = ?`).get(S4),
+    `🚨 V2: 見出しが 2 行の文書は取り込まない (blocked・行も版も作らない) (${pr4.status}: ${pr4.reason})`);
+  const { inspectManualFile } = await import('./amazon-settlement-manual-file.js');
+  ok(inspectManualFile(twoH, { format: 'v2' }).problems.some((p) => /見出しの行が 2 行/.test(p)), '手のファイル (V2) も見出しが 2 行なら積まない');
+}
+
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== V2 並べ直しテスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

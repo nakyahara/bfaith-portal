@@ -125,6 +125,7 @@ export async function runCoverage({
   pid = process.pid, readonlyTimeoutMs = 60000,
 }) {
   if (!dataDir) throw new Error('DATA_DIR が無い');
+  const wallStart = Date.now();   // 所要時間 (記録に残す。回の時計 now() は試験で進めるので使わない)
   if (!Object.hasOwn(SOURCES, source)) throw new Error(`source は v1 か v2: ${source}`);
   await initDB();
   const db = getDB();
@@ -328,7 +329,9 @@ export async function runCoverage({
     // retry の見送りは終了コード (人が直す理由だけ = exit 0) で成り立つ = この記録は daily-sync の突き合わせのためだけ (#1567 R3 L1)。
     //   finance_push_ok = 送信がそろって終わったか (failed chunk・整形できない・stale があれば false = 突き合わせを見送る。R3 L2)
     writeLastRun(dataDir, { mode: out.mode, exit_code: out.exitCode, finance_pushed: !!out.financePushed, finance_push_ok: !!(out.push && out.push.ok),
-      coverage_complete: !!(out.coverage && out.coverage.complete), generation: out.generation });
+      coverage_complete: !!(out.coverage && out.coverage.complete), generation: out.generation,
+      // 毎朝の回 (coverage の回は --full = 全部の注文を変換) の所要時間と最大メモリ = 上限 90 分・miniPC のメモリの余裕を記録で見る (#1567 Codex R3 の補足)
+      elapsed_minutes: Math.round((Date.now() - wallStart) / 600) / 100, max_rss_mb: Math.round(process.resourceUsage().maxRSS / 1024) });
   }
 }
 

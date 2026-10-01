@@ -12,7 +12,9 @@
  * 判定 (fail-closed。どれか 1 つでも欠ければ complete にしない):
  *   ① 採った版 (決済ごとに 1 つ・D-66) の見出しがちょうど 1 行・期間が読める・逆でない・決済 ID が見出しと明細で同じ・通貨 JPY (原文。過去の行 = 印で代える)・
  *      明細の部品の合計 = 見出しの total・終わりが読み取りの時点より後でない・要約が古くない
- *   ② 起点 (policy の period_from の JST 00:00) から途切れずにつながる最後の end = settlements_through (実時刻の半開区間で・重なりは可・隙間で止まる)
+ *   ② 起点 (policy の period_from の JST 00:00) から途切れずにつながる最後の end = settlements_through (実時刻の半開区間で・重なりは可・隙間で止まる)。
+ *      🚨 区間に数えるのは **裏付けのある採った決済だけ** = 初期の印の決済 (一致) か、一覧の鎖の期待の report (imported / satisfied_by_selected_settlement) の決済。
+ *      裏付けの無い決済が区間を延ばすなら not_in_inventory (❌・次の回で直る)。取込の一覧にだけあって証拠の一覧に無い report で complete にしない (#1567 Codex R3 High 1)
  *   ③ 初期の印 (最新の epoch) がある・verified_from ≤ 起点
  *   ④ 一覧の鎖 = その epoch の成功した回 (最後のページまで・一覧 / 取込 / 記録の失敗なし・完了) を積み上げる:
  *      最初の回の窓 [createdSince, createdUntil] に印の captured_at が入る・印の verified_through が最初の回のデータの期間と重なる・
@@ -136,13 +138,12 @@ export function evaluateCoverage(db, { generation, runToken, policy, source, now
     const c = checkSelected(v, { nowMs, markerMatched: mm });
     for (const r of c.reasons) add(r.code, r.detail);
     perSettlement.set(sid, { v, start: c.start, end: c.end, markerMatched: mm });
-    if (c.ok) intervals.push({ start: c.start, end: c.end });
+    if (c.ok) intervals.push({ sid, start: c.start, end: c.end });
     headerRows.push({ settlement_id: sid, start: c.start ?? v.header_start ?? null, end: c.end ?? v.header_end ?? null, source_layer: v.source_layer, total_amount_micro: big(v.header_total_micro), currency: v.header_currency ?? null });
     docRows.push({ settlement_id: sid, document_version_id: v.document_version_id, report_id: v.report_id ?? null, report_document_id: v.report_document_id ?? null, file_hash: v.file_hash ?? null,
       header_id: big(v.header_id), detail_line_count: v.line_count ?? 0, detail_digest: v.detail_digest ?? null });
   }
-  const settlementsThrough = origin ? frontierFrom(intervals, origin) : null;
-  if (origin && !settlementsThrough) add('origin_not_covered', `起点 (${origin}) を覆う採った見出しが無い`);
+  // frontier (settlements_through) は期待の集合を作った後に決める (裏付けのある決済だけ・#1567 Codex R3 High 1)
 
   // ── 一覧の回 (今回 + 鎖) ──
   const runSel = `SELECT * FROM amazon_settlement_report_inventory_runs WHERE company_id = ? AND mall = ? AND scope_key = ? AND report_type = ?`;
@@ -180,6 +181,7 @@ export function evaluateCoverage(db, { generation, runToken, policy, source, now
     const later = (a, b) => { const ka = key(a), kb = key(b); for (let i = 0; i < 3; i++) if (ka[i] !== kb[i]) return ka[i] > kb[i]; return false; };
     for (const x of rows) { if (x.report_type !== REQUIRED_REPORT_TYPE) continue; const cur = byReport.get(x.report_id); if (!cur || later(x, cur)) byReport.set(x.report_id, x); }
   }
+  const backed = new Set();   // 裏付けのある採った決済 (印の決済の一致 / 一覧の鎖の期待の report で満たした決済)
   const versionsByReportDoc = new Map();
   for (const v of versions) if (v.report_id != null) { const k = `${v.report_id}\u0000${v.report_document_id ?? ''}`; if (!versionsByReportDoc.has(k)) versionsByReportDoc.set(k, []); versionsByReportDoc.get(k).push(v); }
   const unsatisfied = { cancelled: 0, fatal: 0, not_done: 0, period: 0, not_imported: 0, differs: 0 };
@@ -211,15 +213,32 @@ export function evaluateCoverage(db, { generation, runToken, policy, source, now
     } else { unsatisfied.differs++; add('report_selected_differs', `report ${rid} の版 #${v.seq} と決済 ${v.settlement_id} の採った版 #${sel ? sel.seq : '-'} の明細が違う (detail_digest)`); continue; }
     item.document_version_id = v.document_version_id;
     items.push(item);
+    if (v.settlement_id != null) backed.add(v.settlement_id);
   }
   for (const m of [...markerSettlements].sort((a, b) => cmpUtf8(a.settlement_id, b.settlement_id))) {
     const ps = perSettlement.get(m.settlement_id);
     if (!ps) { add('marker_settlement_missing', `印の決済 ${m.settlement_id} (${m.period_start} 〜 ${m.period_end}) が SQLite に無い → 手で取り込む (amazon-settlement-manual-file.js)`); continue; }
     if (!ps.markerMatched) { add('marker_settlement_mismatch', `印の決済 ${m.settlement_id} の期間・金額・通貨が採った見出しと違う (印 ${m.period_start}〜${m.period_end} ${m.total_amount_micro} ${m.currency} / 見出し ${ps.start}〜${ps.end} ${ps.v.header_total_micro} ${ps.v.header_currency})`); continue; }
     if (m.report_id != null && !versions.some((v) => v.settlement_id === m.settlement_id && v.report_id === m.report_id)) { add('marker_report_id_unknown', `印の決済 ${m.settlement_id} の report ID ${m.report_id} の版が無い`); continue; }
+    backed.add(m.settlement_id);
     items.push({ kind: 'marker_settlement', id: m.settlement_id, observation_id: null, result: 'marker_matched', document_version_id: ps.v.document_version_id, period_basis: 'settlement_header', effective_data_from: ps.start, effective_data_to: ps.end });
   }
   items.sort((a, b) => cmpUtf8(a.kind, b.kind) || cmpUtf8(a.id, b.id));
+
+  // ── frontier (裏付けのある決済だけ・#1567 Codex R3 High 1) ──
+  //   全部の採った見出しの frontier (frontierAll) と、裏付けのある決済だけの frontier を比べる。違う = 裏付けの無い決済が区間を延ばしている = complete にしない
+  //   (印・一覧の鎖が無いときは、その理由 (⚠️) で止まっているので not_in_inventory は足さない)
+  const frontierAll = origin ? frontierFrom(intervals, origin) : null;
+  const settlementsThrough = origin ? frontierFrom(intervals.filter((x) => backed.has(x.sid)), origin) : null;
+  if (origin && !frontierAll) add('origin_not_covered', `起点 (${origin}) を覆う採った見出しが無い`);
+  else if (origin && marker && chain.length && thisRun && frontierAll !== settlementsThrough) {
+    const cut = settlementsThrough ? ms(settlementsThrough) : ms(origin);
+    // 印にある決済 (一致しない・版が無い) は、その理由 (⚠️ marker_settlement_mismatch など) で止まっている = 一覧の欠けとして重ねて数えない
+    const onlyInventory = intervals.filter((x) => !backed.has(x.sid) && !markerBySettlement.has(x.sid) && ms(x.start) <= ms(frontierAll) && ms(x.end) > cut);
+    if (onlyInventory.length) add('not_in_inventory', `裏付けの無い採った決済が区間を延ばしている = 初期の印にも一覧の鎖の期待の report にも無い (${onlyInventory.slice(0, 5).map((x) => `${x.sid} (${x.start} 〜 ${x.end})`).join(' / ')}) → frontier は ${settlementsThrough ?? '起点'} で止まる (全部なら ${frontierAll})。次の回の一覧で拾う`);
+  }
+  // 最後の守り: frontier が食い違うのに理由が 1 つも無い (上の数え方で拾えなかった) = complete にしない (fail-closed)
+  if (origin && frontierAll && settlementsThrough !== frontierAll && !reasons.length) add('not_in_inventory', `裏付けのある決済だけの frontier (${settlementsThrough ?? '無し'}) が全部の採った見出しの frontier (${frontierAll}) と違う`);
 
   // ── receipt digest ──
   let rc = null;
@@ -227,7 +246,7 @@ export function evaluateCoverage(db, { generation, runToken, policy, source, now
 
   const results = {};
   for (const it of items) results[it.result] = (results[it.result] || 0) + 1;
-  const diag = { origin, settlementsThrough, selectedSettlements: selected.size, versions: versions.length, chainRuns: chain.length, expectedItems: items.length, results, unsatisfied, markerId: marker ? marker.marker_id : null, markerEpoch: marker ? marker.evidence_epoch : null, markerDigest: marker ? marker.marker_digest : null, thisRunSeq: thisRun ? thisRun.inventory_run_seq : null };
+  const diag = { origin, settlementsThrough, frontierAll, backedSettlements: backed.size, selectedSettlements: selected.size, versions: versions.length, chainRuns: chain.length, expectedItems: items.length, results, unsatisfied, markerId: marker ? marker.marker_id : null, markerEpoch: marker ? marker.evidence_epoch : null, markerDigest: marker ? marker.marker_digest : null, thisRunSeq: thisRun ? thisRun.inventory_run_seq : null };
   if (reasons.length) return { ok: false, reasons, manifest: null, diag };
   const manifest = {
     complete_to: addDays(jstDateOfUtc(settlementsThrough), -1),

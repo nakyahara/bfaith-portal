@@ -136,11 +136,16 @@ export function parseArgs(argv = process.argv.slice(2)) {
 
 // 取込の一覧 = 今までと同じ要求 (日時の境なし = Amazon の既定の 90 日前〜今・21 ページで打ち切り)。
 // 🚨 取込む report の選び方を変えないため、一覧の記録 (窓を固定) はこれとは別の要求 (amazon-settlement-inventory.js)
-async function listSettlementReports(sp, reportType) {
+/**
+ * 取込の一覧。createdUntil = 回の開始の時刻 (証拠の一覧 (inventory) の窓の終わりと同じ = 一覧に無い新しい report を取り込まない。#1567 Codex R3 High 1 b)。
+ *   createdSince は Amazon の既定 (90 日前) のまま (85 日に揃えると 85〜90 日前に作られた report を取込まなくなる)。窓の後に作られた report は次の回で取る
+ */
+async function listSettlementReports(sp, reportType, { createdUntil = null } = {}) {
   const r = await listReportPages(sp, {
     reportTypes: [reportType],
     marketplaceIds: [MARKETPLACE_ID],
     pageSize: 100,
+    ...(createdUntil ? { createdUntil } : {}),
   }, { maxPages: MAX_LIST_PAGES, label: 'list' });
   return r.reports;
 }
@@ -490,16 +495,20 @@ export function prepareReportTsv(tsv, reportId, runId, opts = {}) {
     runId,
     observedAt: nowIso(),
   };
-  let headerRow = null;
+  // 🚨 見出しは全部返す (前は見つけるたびに上書き = 最後の 1 行だけ = 連結・壊れた文書の見出しの数を確かめられなかった。#1567 Codex R3 High 2)。
+  //    2 行以上の文書は取り込まない (processV2Report / V1 の取込 / 手のファイルが理由つきで拒む・ingestSettlement も throw)
+  const headerRows = [];
   const lineRows = [];
   for (const raw of rows) {
     if (isHeaderRow(raw)) {
-      headerRow = normalizeHeaderRow(raw, ctx);
+      headerRows.push(normalizeHeaderRow(raw, ctx));
     } else {
       lineRows.push(normalizeLineRow(raw, ctx));
     }
   }
-  return { headerRow, lineRows, ctx, sourceFileHash, rowCount: rows.length };
+  ctx.headerRowCount = headerRows.length;
+  const headerRow = headerRows[0] ?? null;
+  return { headerRow, headerRows, headerRowCount: headerRows.length, lineRows, ctx, sourceFileHash, rowCount: rows.length };
 }
 
 /** V2 の TSV → V1 の形に並べ直して prepareReportTsv。unknown = 並べ直しの規則に無い組み合わせ / itemCodeUnresolved = 品物の番号を補えなかったポイントの行 */
@@ -528,10 +537,14 @@ export function processV2Report(db, v2Tsv, reportId, runId, { dryRun = false, re
   catch (e) { return { status: 'blocked', settlementId, reason: `並べ直せない: ${e.message}`, unknown: [], itemCodeUnresolved: 0, coveredByOtherVersion: covered }; }
   const base = { prepared: p, settlementId, unknown: p.unknown, itemCodeUnresolved: p.itemCodeUnresolved, coveredByOtherVersion: covered };
   if (p.unknown.length || p.itemCodeUnresolved) return { ...base, status: 'blocked', reason: `規則に無い組み合わせ ${JSON.stringify(p.unknown)} / 品物の番号を補えないポイントの行 ${p.itemCodeUnresolved}` };
+  if (p.headerRowCount > 1) return { ...base, status: 'blocked', reason: multiHeaderReason(p.headerRowCount) };
   if (!p.headerRow || p.headerRow.source_settlement_id !== settlementId) return { ...base, status: 'blocked', reason: '決済の見出しの行が無い / 明細と決済の番号が違う' };
   if (dryRun) return { ...base, status: 'dry_run' };
   return { ...base, status: 'ingested', result: ingestSettlement(db, p.headerRow, p.lineRows, p.ctx, { lease, now }) };
 }
+
+/** 見出しが 2 行以上の文書を拒む理由 (#1567 Codex R3 High 2) */
+export const multiHeaderReason = (n) => `見出しが ${n} 行 (1 つの文書に 1 行だけ) = 連結・壊れた文書 = 取り込まない`;
 
 /** その決済の文書の版が既にあるか (層を問わない) */
 export function settlementHasVersion(db, settlementId) {
@@ -557,6 +570,9 @@ export function ingestSettlement(db, headerRow, lineRows, ctx, { lease = null, n
   const upsertDimFee = db.prepare(UPSERT_DIM_FEE_SQL);
   const upsertRefresh = db.prepare(UPSERT_REFRESH_QUEUE_SQL);
   if (!ctx || !ctx.documentVersionId || !ctx.versionMeta) throw new Error('ingestSettlement: ctx に文書の版が無い (prepareReportTsv の ctx を渡す)');
+  // 🚨 見出しが 2 行以上の文書は入れない (呼び手が先に拒む。ここは最後の守り・#1567 Codex R3 High 2)
+  const headerCount = ctx.headerRowCount ?? (headerRow ? 1 : 0);
+  if (headerCount > 1) throw new Error(multiHeaderReason(headerCount));
   // 1 文書 = 1 決済 (見出しと明細の決済 ID が 1 つ)。違えば入れない (どの決済にも採られない行を作らない)
   const ids = new Set(lineRows.map((l) => l.source_settlement_id));
   if (headerRow) ids.add(headerRow.source_settlement_id);
@@ -698,7 +714,7 @@ export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = nu
     const r = await sp.callAPI({ operation: 'getReport', endpoint: 'reports', path: { reportId: args.reportId } });
     reports = [r];
   } else {
-    reports = await listSettlementReports(sp, src.reportType);
+    reports = await listSettlementReports(sp, src.reportType, { createdUntil: inventoryWindow(startedAt).createdUntil });
   }
   console.log(`[settlements] 対象 reports: ${reports.length}件`);
 
@@ -752,7 +768,14 @@ export async function runSettlementFetch(args, { db, sp, runId, downloadTsv = nu
         const { headerRow, lineRows, ctx, sourceFileHash, rowCount } = prepared;
         console.log(`  bytes: ${tsv.length}, file_hash: ${sourceFileHash.slice(0, 12)}...`);
         console.log(`  rows: ${rowCount}`);
-        console.log(`  parsed: header=${headerRow ? 1 : 0}, lines=${lineRows.length}`);
+        console.log(`  parsed: header=${prepared.headerRowCount}, lines=${lineRows.length}`);
+        if (prepared.headerRowCount > 1) {
+          const sid = headerRow ? headerRow.source_settlement_id : null, covered = settlementHasVersion(db, sid), reason = multiHeaderReason(prepared.headerRowCount);
+          console.log(`  ${covered ? '⚠️' : '❌'} 取り込まない: ${reason}`);
+          (covered ? blockedCovered : blocked).push(covered ? { reportId: r.reportId, settlementId: sid, reason } : { reportId: r.reportId, reason });
+          rec(r.reportId, 'failed', { ...doc, settlementId: sid, note: `blocked: ${reason}` });
+          continue;
+        }
 
         if (args.dryRun) {
           console.log('  [dry-run] DB 投入スキップ');

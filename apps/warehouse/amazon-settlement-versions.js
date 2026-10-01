@@ -359,13 +359,13 @@ export function refreshVersionDetail(db, seq) {
   const det = d.finish();
   const hs = db.prepare(`SELECT id, business_line_key, source_settlement_id, settlement_start_date, settlement_end_date, total_amount_micro, currency, currency_raw
      FROM raw_amazon_settlement_headers INDEXED BY idx_settle_headers_docver WHERE document_version_seq = ? ORDER BY id`).all(seq);
-  const hkeys = new Set(hs.map((h) => h.business_line_key));
+  // 🚨 見出しの数 = **物理の行の数** (前は business_line_key の種類の数 = 同じ鍵の見出しが 2 行あっても 1 と数えた。#1567 Codex R3 High 2)
   const h0 = hs[0] || null;
   const sOne = settlements.size === 1 ? [...settlements][0] : null;
   const out = {
     detail_stale: 0, detail_revision: readSourceRevision(db), raw_line_count: raw, line_count: det.lineCount, detail_digest: det.detailDigest,
     components_sum_micro: det.componentsSumMicro, line_settlement_count: settlements.size, line_settlement_id: sOne, line_currency_bad: badCur,
-    header_count: hkeys.size, header_id: h0 ? h0.id : null, header_settlement_id: h0 ? h0.source_settlement_id : null,
+    header_count: hs.length, header_id: h0 ? h0.id : null, header_settlement_id: h0 ? h0.source_settlement_id : null,
     header_start: h0 ? h0.settlement_start_date : null, header_end: h0 ? h0.settlement_end_date : null, header_total_micro: h0 ? h0.total_amount_micro : null,
     header_currency: h0 ? h0.currency : null, header_currency_raw: h0 ? h0.currency_raw : null,
   };
@@ -492,6 +492,15 @@ export class UnresolvedSettlementDocsError extends Error {
     this.groups = groups;
   }
 }
+/** 見出しの行が 2 行以上ある過去の文書を見つけた (版を付けずに止まる = build と送り手も止まる。#1567 Codex R3 High 2) */
+export class MultiHeaderDocsError extends Error {
+  constructor(groups) {
+    super(`🚨 見出しの行が 2 行以上ある過去の文書 ${groups.length} (${groups.slice(0, 5).map((g) => `${g.source_layer} ${g.source_document_id} = 見出し ${g.h_rows} 行`).join(' / ')}) = 連結・壊れた文書 = 版を付けずに止めた `
+      + '(版を付けると見出しの数で採らない版になり、ほかに版が無い決済では「仮に採った壊れた版」になる)。文書を確かめ、見出しが 1 行の正しい文書で入れ直してから migrate-settlement-document-versions.js --commit を流し直す');
+    this.code = 'MULTI_HEADER_DOCS';
+    this.groups = groups;
+  }
+}
 export function backfillDocumentVersions(db, { batchIds = 200000, check = null, log = () => {}, now = new Date(), allowUnresolved = false } = {}) {
   const tx = (fn) => db.transaction(() => { if (check) check(db); return fn(); }).immediate();
   // 決済 ID も group で取る (R1 High 1: 版の登録と同じ取引で入れる = 行の UPDATE の後に止まっても決済 ID の無い版を残さない)。
@@ -500,7 +509,8 @@ export function backfillDocumentVersions(db, { batchIds = 200000, check = null, 
     SELECT source_layer, source_document_id, source_file_hash, parser_version, MIN(ingested_at) AS ingested_at,
            COUNT(DISTINCT CASE WHEN is_header = 1 THEN source_settlement_id END) AS h_n, MAX(CASE WHEN is_header = 1 THEN source_settlement_id END) AS h_id,
            COUNT(DISTINCT CASE WHEN is_header = 0 THEN source_settlement_id END) AS l_n, MAX(CASE WHEN is_header = 0 THEN source_settlement_id END) AS l_id,
-           COUNT(DISTINCT source_settlement_id) AS u_n, MAX(source_settlement_id) AS u_id
+           COUNT(DISTINCT source_settlement_id) AS u_n, MAX(source_settlement_id) AS u_id,
+           SUM(is_header) AS h_rows
     FROM (
       SELECT source_layer, source_document_id, source_file_hash, parser_version, ingested_at, source_settlement_id, 0 AS is_header FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_docver WHERE document_version_seq IS NULL
       UNION ALL
@@ -510,6 +520,10 @@ export function backfillDocumentVersions(db, { batchIds = 200000, check = null, 
   // 見出しと明細の決済 ID の和集合が 2 つ以上 = 決まらない → 版を付けずに止まる (明示の allowUnresolved だけ進める = 決済 ID が null の版・version_unresolved_settlement)
   const unresolved = groups.filter((g) => g.u_n > 1);
   if (unresolved.length && !allowUnresolved) throw new UnresolvedSettlementDocsError(unresolved);
+  // 見出しの行 (物理の行) が 2 行以上 = 連結・壊れた文書 → 版を付けずに止まる (#1567 Codex R3 High 2・--allow-unresolved でも進めない)
+  //   決済 ID の決まらない文書 (和集合が 2 つ以上) は上で止まる / allowUnresolved の後は決済 ID が null の版 = どの決済にも採られない = ここでは数えない
+  const multiHeader = groups.filter((g) => Number(g.h_rows) > 1 && Number(g.u_n) <= 1);
+  if (multiHeader.length) throw new MultiHeaderDocsError(multiHeader);
   log(`[versions] 版の無い文書 ${groups.length} 個に版を付ける`);
   const seqs = [];
   tx(() => {
