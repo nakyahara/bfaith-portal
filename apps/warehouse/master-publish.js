@@ -27,6 +27,7 @@
 import crypto from 'node:crypto';
 import { normSku } from '../../lib/sku-norm.js';
 import { companyOwned } from '../../config/master-ownership.mjs';
+import { ownershipHash as canonicalOwnershipHash } from '../../lib/master-cutover.mjs';
 import { canonicalSupplierCode, mapHandling } from '../company-db/load/sources.mjs';
 
 /** 写す列 → 持ち主のキー (config/master-ownership.mjs)。④a で写すのはこれだけ (仕入先そのもの = ④b・構成・代表・Amazon SKU = 写さない。15 §2) */
@@ -110,9 +111,10 @@ export function assertPublishOwnership(ownership) {
   if (p.length) throw Object.assign(new Error(`master-publish: 持ち主の設定を ④a で扱えない (${p.join(' / ')})`), { code: 'OWNERSHIP_NOT_SUPPORTED', problems: p });
   return ownership;
 }
-/** 持ち主の設定をキーの順に並べたもの・そのハッシュ (夜間ロードが ops.load_materials に残すのと同じ式。engine.mjs) = 持ち主の epoch */
+/** 持ち主の設定をキーの順に並べたもの・そのハッシュ (夜間ロードが ops.load_materials に残すのと同じ式。engine.mjs) = 持ち主の epoch。
+ *   ハッシュは lib/master-cutover.mjs の ownershipHash の 1 つの式 (load の列は数えない = 記録に無い列は load と同じ。#1564 Codex R3 Medium) */
 export const ownershipSorted = (o) => Object.fromEntries(Object.keys(o || {}).sort().map((k) => [k, o[k]]));
-export const ownershipHash = (o) => crypto.createHash('sha256').update(JSON.stringify(Object.keys(o || {}).sort().map((k) => [k, o[k]]))).digest('hex');
+export const ownershipHash = canonicalOwnershipHash;
 
 const sha256Lines = (lines) => crypto.createHash('sha256').update([...lines].sort().join('\n'), 'utf8').digest('hex');
 /** 世代の中身のハッシュ (行の順に依らない)。rows = [{ code_norm, col, code, sku_kind, value }] (value = JSON の文字列) */

@@ -103,7 +103,9 @@ export async function readPublishSource(db, { prevWatermark = null } = {}) {
  */
 export function generationEpoch(source) {
   const st = source.ownershipState || { state: 'no_table', active: { map: ALL_LOAD, hash: null }, prepared: null };
-  const loadHash = source.loadOwnership?.products?.ownership_hash ?? null;
+  // 夜間ロードが記録した持ち主表から今の式でハッシュを作る (記録したハッシュの式が前の版でも比べられる = 式を 1 つにした日 #1564 Codex R3 Medium)
+  const loadMap = source.loadOwnership?.products?.ownership ?? null;
+  const loadHash = loadMap && typeof loadMap === 'object' ? ownershipHash(loadMap) : null;
   if (st.prepared && loadHash === st.prepared.hash) return { kind: 'prepared', map: st.prepared.map, hash: st.prepared.hash };
   return { kind: st.state === 'ok' ? 'active' : 'default', map: st.active.map, hash: st.active.hash };
 }
@@ -177,7 +179,8 @@ export function verifyGeneration({ prev, next, source, current = null }) {
   else {
     const want = JSON.stringify(next.ownership);
     const got = Object.fromEntries(['products', 'set_components'].map((e) => [e, source.loadOwnership[e]]));
-    if (Object.values(got).some((lo) => JSON.stringify(ownershipSorted(lo.ownership)) !== want || lo.ownership_hash !== next.ownership_hash)) {
+    // ハッシュは記録した持ち主表から今の式で作って比べる (記録したハッシュの式が前の版でも偽の食い違いにしない。#1564 Codex R3 Medium)
+    if (Object.values(got).some((lo) => JSON.stringify(ownershipSorted(lo.ownership)) !== want || ownershipHash(lo.ownership) !== next.ownership_hash)) {
       problems.push('ownership_mismatch');
       detail.ownership = { local: next.ownership_hash, products: got.products.ownership_hash, set_components: got.set_components.ownership_hash, load_run_id: source.load.ingest_run_id };
     }
@@ -456,20 +459,26 @@ export async function runVerifyApply({ sqlite, dataDir, ownership: configured = 
   const broken = appliedChecked && publishCols(ownership).length > 0 && (problems.includes('applied_mismatch') || problems.includes('applied_hash_changed'));
   const epochKind = fetchEv?.epochs?.generation?.kind ?? null;
   // 門 (warehouse.db の cdb_publish_gate = 後の工程を止めるかどうかの正。#1564 Codex R2 High 2) を証跡より先に書く:
-  //   違う = broken / 通った = safe (broken を戻せるのはこれだけ。持ち主が全部 load で行が無い = 書かない = 今と同じ) /
-  //   遅れ・確かめられない = 前の値のまま (行が無く持ち主が C = unknown)
+  //   違う = broken (門が読めなくても書く) / 通った = safe (broken を戻せるのはこれだけ。確かめた作り直し・世代・入れた値のハッシュ・持ち主と一緒に =
+  //   読み手が今と比べる。持ち主が全部 load で行が無い = 書かない = 今と同じ) / 遅れ・確かめられない = 前の値のまま (行が無く持ち主が C = unknown)
+  //   門が読めない (表はあるが SELECT が落ちる) = 「行が無い」と同じにしない (#1564 Codex R3 High 2): 通った = safe を書き直す・それ以外 = unknown を書く
   const pubCols = publishCols(ownership);
-  const gateBefore = readGateRow(sqlite);
-  const gateNext = broken ? 'broken' : state === 'verified' ? (pubCols.length || gateBefore ? 'safe' : null) : (!gateBefore && pubCols.length ? 'unknown' : null);
+  let gateBefore = null, gateReadError = null;
+  try { gateBefore = readGateRow(sqlite); } catch (e) { gateReadError = String(e && e.message).slice(0, 200); }
+  const gateNext = broken ? 'broken' : state === 'verified' ? (pubCols.length || gateBefore || gateReadError ? 'safe' : null)
+    : (gateReadError || (!gateBefore && pubCols.length) ? 'unknown' : null);
   let gateError = null;
   if (gateNext) {
-    try { writePublishGate(sqlite, { state: gateNext, reason: gateNext === 'safe' ? 'verified' : problems.join('・'), buildId: build ? build.build_id : null, generationNo: bp ? bp.generation_no : null, checkedAt: now.toISOString(), now }); }
-    catch (e) { gateError = String(e && e.message).slice(0, 200); }
+    try {
+      writePublishGate(sqlite, { state: gateNext, reason: gateNext === 'safe' ? 'verified' : problems.join('・') || (gateReadError ? 'gate_unreadable' : null), buildId: build ? build.build_id : null,
+        generationNo: bp ? bp.generation_no : null, appliedHash: gateNext === 'safe' ? applied.applied_hash : null, ownershipHash: bp ? bp.ownership_hash : null, checkedAt: now.toISOString(), now });
+    } catch (e) { gateError = String(e && e.message).slice(0, 200); }
   }
   if (gateError) problems.push('gate_write_failed');
   const stateOut = state === 'verified' && gateError ? 'failed' : state;
   const apply = { state: stateOut, broken, problems, checked_at: now.toISOString(),
-    gate: { before: gateBefore ? gateBefore.state : null, after: gateError ? (gateBefore ? gateBefore.state : null) : (gateNext ?? (gateBefore ? gateBefore.state : null)), error: gateError }, epoch: epochKind, configured: ownershipHash(configured), build_id: build ? build.build_id : null, generation_no: bp ? bp.generation_no : null,
+    gate: { before: gateBefore ? gateBefore.state : gateReadError ? 'unreadable' : null, after: gateError ? (gateBefore ? gateBefore.state : gateReadError ? 'unreadable' : null) : (gateNext ?? (gateBefore ? gateBefore.state : null)),
+      error: gateError, read_error: gateReadError }, epoch: epochKind, configured: ownershipHash(configured), build_id: build ? build.build_id : null, generation_no: bp ? bp.generation_no : null,
     current_generation_no: current.generation ? current.generation.generation_no : null, lag: !broken && problems.some((p) => LAG_PROBLEMS.includes(p)),
     generation_id: bp ? bp.generation_id : null, applied_hash: applied.applied_hash, build_applied_hash: bp ? bp.applied_hash : null, counts: applied.counts, samples: applied.problems.slice(0, 10),
     // NE にしか無い SKU (Company DB に無い = 写していない = NE の値のまま)。止めない・ping も fail にしない (朝の要約に出す)

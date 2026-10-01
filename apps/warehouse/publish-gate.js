@@ -14,47 +14,100 @@
  *   (daily-sync のプロセスの中だけの印にしない = 別のプロセスの再試行・手の更新が抜け道にならない。#1564 の見直し M-2)。
  *   書くのは入れた後の確かめ (fetch.mjs --verify-apply) だけ: 違う = broken (証跡より先に書く) / 通った = safe (broken を戻せるのはこれだけ) /
  *   遅れ・確かめられない = 前の値のまま (行が無く持ち主が C = unknown)。証跡 master-publish の apply.broken は人が読む控え (日付で消える・読めない日がある = 正にしない)
- *   行が無い = 持ち主が全部 load (今の世代・最新の作り直しのどちらも C の列なし) のときだけ流してよい (今と同じ)。読めない = unknown = 止める
+ *   行が無い = 持ち主が全部 load と分かる (確かめた今の世代と、世代を使った最新の作り直しが両方あり、どちらの持ち主も全部 load) ときだけ流してよい。
+ *   読めない (表はあるが SELECT が落ちる・ファイルが開けない) = unknown = 止める (「行が無い」と同じにしない。#1564 Codex R3 High 2)
+ * 🚨 safe の行は「確かめた作り直し・世代・入れた値のハッシュ・持ち主」を持つ。読み手は最新の作り直し・その世代・今の古い表から作り直したハッシュと比べ、
+ *   違えば (確かめた後に作り直した・書き換えられた・broken を書けなかった) その safe は使わない = 持ち主が全部 load と分かるときだけ流す・それ以外は unknown
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { readCurrentPublish, publishCols, ownershipHash } from './master-publish.js';
+import { readCurrentPublish, readPublishGeneration, verifyApplied, ownershipHash } from './master-publish.js';
 import { latestBuild, publishOfBuild } from './master-material.js';
 import { ALL_LOAD } from '../company-db/load/ownership-state.mjs';
+import { TAX_RATES } from '../../lib/master-set-rules.js';
 
 export const GATE_STATES = Object.freeze(['safe', 'broken', 'unknown']);
-/** 門の行 (表が無い・行が無い = null) */
+const GATE_COLS = ['state', 'reason', 'build_id', 'generation_no', 'applied_hash', 'ownership_hash', 'checked_at', 'updated_at'];
+/**
+ * 門の行。表が無い・行が無い = null。🚨 表はあるが読めない (SELECT が落ちる・列が無い) = 投げる = 呼び手が unknown (止める) にする
+ *   (読めないを「行が無い」= 持ち主が全部 load なら流す、と同じにしない。#1564 Codex R3 High 2)
+ */
 export function readGateRow(db) {
-  try { return db.prepare('SELECT state, reason, build_id, generation_no, checked_at, updated_at FROM cdb_publish_gate WHERE id = 1').get() || null; } catch { return null; }
+  const has = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'cdb_publish_gate'").get();
+  if (!has) return null;
+  return db.prepare(`SELECT ${GATE_COLS.join(', ')} FROM cdb_publish_gate WHERE id = 1`).get() || null;
 }
-/** 門を書く (入れた後の確かめだけが呼ぶ) */
-export function writePublishGate(db, { state, reason = null, buildId = null, generationNo = null, checkedAt, now = new Date() }) {
+/** 門を書く (入れた後の確かめだけが呼ぶ)。safe は確かめた作り直し・世代・入れた値のハッシュ・持ち主のハッシュと一緒に書く (読み手が今と比べる) */
+export function writePublishGate(db, { state, reason = null, buildId = null, generationNo = null, appliedHash = null, ownershipHash: ownHash = null, checkedAt, now = new Date() }) {
   if (!GATE_STATES.includes(state)) throw new Error(`門の値が不正: ${state}`);
-  db.prepare(`INSERT INTO cdb_publish_gate (id, state, reason, build_id, generation_no, checked_at, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?)
+  if (state === 'safe' && (!buildId || generationNo == null || !appliedHash || !ownHash)) throw new Error('safe は確かめた作り直し・世代・入れた値のハッシュ・持ち主のハッシュと一緒に書く');
+  db.prepare(`INSERT INTO cdb_publish_gate (id, state, reason, build_id, generation_no, applied_hash, ownership_hash, checked_at, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (id) DO UPDATE SET state = excluded.state, reason = excluded.reason, build_id = excluded.build_id, generation_no = excluded.generation_no,
-      checked_at = excluded.checked_at, updated_at = excluded.updated_at`)
-    .run(state, reason == null ? null : String(reason).slice(0, 400), buildId, generationNo, checkedAt, now.toISOString());
+      applied_hash = excluded.applied_hash, ownership_hash = excluded.ownership_hash, checked_at = excluded.checked_at, updated_at = excluded.updated_at`)
+    .run(state, reason == null ? null : String(reason).slice(0, 400), buildId, generationNo, appliedHash, ownHash, checkedAt, now.toISOString());
   return state;
 }
-/** 持ち主が C の列を使っているか (今の世代の持ち主・最新の作り直しが使った持ち主のどちらか)。読めない = 使っているとみなす */
-function usesCompanyOwner(db) {
+const ALL_LOAD_HASH = ownershipHash(ALL_LOAD);
+/** 最新の作り直しと、それが使った世代 (読めない = 投げる) */
+function latestBuildState(db) {
+  const build = latestBuild(db);
+  return { build, bp: publishOfBuild(build) };
+}
+/**
+ * 持ち主が全部 load と分かるか (行が無い・古い safe の行のときに流してよいか。#1564 Codex R3 High 2)。
+ * 分かる = 確かめた今の世代がある・その持ち主が全部 load・最新の作り直しがあり世代を使った・その持ち主も全部 load。どれか欠ける・読めない = 分からない
+ * @returns {{ ok: boolean, why: string|null }}
+ */
+export function knownAllLoad(db, st = latestBuildState(db)) {
   const head = readCurrentPublish(db, { values: false });
-  if (head.generation) { try { if (publishCols(JSON.parse(head.generation.ownership)).length) return true; } catch { return true; } }
-  let lb = null;
-  try { lb = publishOfBuild(latestBuild(db)); } catch { lb = null; }
-  return !!(lb && lb.ownership_hash && lb.ownership_hash !== ownershipHash(ALL_LOAD));
+  if (head.problem || !head.generation) return { ok: false, why: `no_current_generation:${head.problem || 'none'}` };
+  let own;
+  try { own = JSON.parse(head.generation.ownership); } catch { return { ok: false, why: 'generation_ownership_unreadable' }; }
+  if (!own || typeof own !== 'object' || ownershipHash(own) !== ALL_LOAD_HASH) return { ok: false, why: 'company_owner' };
+  if (!st.build) return { ok: false, why: 'no_build' };
+  if (!st.bp) return { ok: false, why: 'build_without_generation' };
+  if (st.bp.ownership_hash !== ALL_LOAD_HASH) return { ok: false, why: 'company_owner' };
+  return { ok: true, why: null };
+}
+/**
+ * safe の行が今の状態を確かめたものか。違う理由 (null = 同じ):
+ *   最新の作り直し・その世代・持ち主・入れた値のハッシュ (記録) が行と同じ + 今の古い表から作り直したハッシュも同じ (作り直しの後に書き換えられていない)
+ */
+export function staleSafeRow(db, row, st = latestBuildState(db), { taxRates = TAX_RATES } = {}) {
+  if (!st.build) return 'no_build';
+  if (row.build_id !== st.build.build_id) return 'build_changed';
+  if (!st.bp) return 'build_without_generation';
+  if (row.generation_no !== st.bp.generation_no) return 'generation_changed';
+  if (!row.applied_hash || row.applied_hash !== st.bp.applied_hash) return 'applied_hash_changed';
+  if (!row.ownership_hash || row.ownership_hash !== st.bp.ownership_hash) return 'ownership_changed';
+  const publication = readPublishGeneration(db, st.bp.generation_no);
+  if (publication.problem) return `generation_${publication.problem}`;
+  let ownership;
+  try { ownership = JSON.parse(publication.generation.ownership); } catch { return 'generation_ownership_unreadable'; }
+  const now = verifyApplied(db, { publication, ownership, taxRates });
+  if (!now.ok || now.applied_hash !== row.applied_hash) return 'applied_changed_now';
+  return null;
 }
 const closed = (state, reason, extra = {}) => ({ state, open: false, broken: true, reason, checked_at: null, build_id: null, generation_no: null, source: 'none', ...extra });
-/** 門の今の値 (開いている = open) */
+/** 門の今の値 (開いている = open)。読めない = 投げる (readPublishGate が unknown にする) */
 export function gateOfDb(db) {
   const row = readGateRow(db);
+  const fromRow = row ? { checked_at: row.checked_at, build_id: row.build_id ?? null, generation_no: row.generation_no ?? null } : {};
+  if (row && row.state !== 'safe') return closed(row.state, row.reason ?? row.state, { ...fromRow, source: 'row' });
+  const st = latestBuildState(db);
   if (row) {
-    const open = row.state === 'safe';
-    return { state: row.state, open, broken: !open, reason: row.reason ?? row.state, checked_at: row.checked_at, build_id: row.build_id ?? null, generation_no: row.generation_no ?? null, source: 'row' };
+    const stale = staleSafeRow(db, row, st);
+    if (!stale) return { state: 'safe', open: true, broken: false, reason: row.reason ?? 'safe', ...fromRow, source: 'row' };
+    // 確かめた後に変わった safe = 使わない。持ち主が全部 load と分かるときだけ流す (写す値が無い = 古い表は NE の値のまま)
+    const all = knownAllLoad(db, st);
+    if (all.ok) return { state: 'safe', open: true, broken: false, reason: `all_load_safe_row_stale:${stale}`, ...fromRow, source: 'implicit' };
+    return closed('unknown', `safe_row_stale:${stale}`, { ...fromRow, source: 'row' });
   }
-  if (usesCompanyOwner(db)) return closed('unknown', 'no_gate_row_with_company_owner');   // 持ち主が C なのに一度も確かめていない
-  return { state: 'safe', open: true, broken: false, reason: 'all_load_no_gate_row', checked_at: null, build_id: null, generation_no: null, source: 'implicit' };
+  const all = knownAllLoad(db, st);
+  if (all.ok) return { state: 'safe', open: true, broken: false, reason: 'all_load_no_gate_row', checked_at: null, build_id: null, generation_no: null, source: 'implicit' };
+  // 持ち主が C なのに一度も確かめていない / 全部 load と分からない (世代・作り直しが無い・読めない) = 止める
+  return closed('unknown', all.why === 'company_owner' ? 'no_gate_row_with_company_owner' : `no_gate_row_unverified:${all.why}`);
 }
 /**
  * 門を読む (db = 開いた warehouse.db / dataDir = DATA_DIR から読み取り専用で開く)。読めない = unknown = 止める

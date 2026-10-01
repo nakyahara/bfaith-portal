@@ -876,16 +876,21 @@ function createTables() {
   // 16b'. 写しの反映の門 (④a・#1564 Codex R2 High 2)。後の工程 (daily-sync・自動再試行・商品管理リストの手の更新) を止めるかどうかの正 = この 1 行。
   //   safe = 流してよい / broken = 古い表が作り直しの世代と違う / unknown = 持ち主が C なのに確かめられていない。
   //   broken を safe に戻せるのは「入れた後の確かめ」が通った回だけ (fetch.mjs --verify-apply)。遅れ・証跡が読めない回は前の値のまま。
-  //   行が無い = 持ち主が全部 load のときだけ「流してよい」(今と同じ)。apps/warehouse/publish-gate.js
+  //   行が無い = 持ち主が全部 load と分かる (確かめた世代と作り直しが両方ある) ときだけ「流してよい」。apps/warehouse/publish-gate.js
+  //   safe は確かめた作り直し・世代・入れた値のハッシュ・持ち主のハッシュを持つ = 読み手が今と比べ、違えば使わない (#1564 Codex R3 High 2)
   db.exec(`CREATE TABLE IF NOT EXISTS cdb_publish_gate (
     id             INTEGER PRIMARY KEY CHECK (id = 1),
     state          TEXT NOT NULL CHECK (state IN ('safe', 'broken', 'unknown')),
     reason         TEXT,
     build_id       TEXT,
     generation_no  INTEGER,
+    applied_hash   TEXT,
+    ownership_hash TEXT,
     checked_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
   )`);
+  addColumnIfMissing('cdb_publish_gate', 'applied_hash', 'TEXT');
+  addColumnIfMissing('cdb_publish_gate', 'ownership_hash', 'TEXT');
   // 16c. raw_ne_products / raw_ne_set_products の通し番号 (sync_meta の ne_raw_<kind>_rev)。書き換えた行 1 つにつき 1 増える (INSERT OR REPLACE も 1)。
   //   どの書き込み口でも同じ取引で増える → NE 取込の完了の印 (ne_api_<kind>_complete_rev) と比べて「印の後に書かれたか」を見分ける (readNeRawRev)
   for (const [table, kind] of [['raw_ne_products', 'products'], ['raw_ne_set_products', 'setproducts']]) {

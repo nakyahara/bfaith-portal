@@ -9,13 +9,16 @@
  * 🚨 読む (resolve) は夜間ロード・写しの両方。書く (prepare / activate / cancel) は scripts/company-db/master-ownership-epoch.mjs だけ (DB を作ったユーザー)
  * 🚨 このファイルは engine.mjs が読む = master-publish.js (warehouse) を import しない (循環を作らない)
  */
-import crypto from 'node:crypto';
 import { OWNED_COLUMNS, validateOwnership } from '../../../config/master-ownership.mjs';
+import { ownershipHash } from '../../../lib/master-cutover.mjs';
 
 /** 全部 'load' (行が無いときの active) */
 export const ALL_LOAD = Object.freeze(Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'load'])));
-/** 持ち主の設定のハッシュ (engine.mjs が ops.load_materials に残すのと同じ式 = epoch) */
-export const ownershipHashOf = (o) => crypto.createHash('sha256').update(JSON.stringify(Object.keys(o || {}).sort().map((k) => [k, o[k]]))).digest('hex');
+/**
+ * 持ち主の設定のハッシュ = lib/master-cutover.mjs の ownershipHash (load の列は数えない = 記録に無い列は load と同じ。#1564 Codex R3 Medium)。
+ *   engine.mjs が ops.load_materials に残す・写しの世代・⑤-1 の段階の記録 (owner_hash)・0053 の ops.ownership_hash と同じ 1 つの式
+ */
+export const ownershipHashOf = ownershipHash;
 export const sortedOwnership = (o) => Object.fromEntries(Object.keys(o || {}).sort().map((k) => [k, o[k]]));
 
 const rowsOf = async (db, sql, params) => (await db.query(sql, params)).rows;
@@ -72,6 +75,28 @@ export async function resolveLoadOwnership(db, { usePrepared = false } = {}) {
 }
 
 /**
+ * 持ち主の epoch の鍵 (0053 の ops.master_ownership_lock_key() = 4705310053。#1564 Codex R3 High 1)。
+ *   夜間ロード (engine.mjs・明示の --use-prepared も) = 取引の冒頭に共有で取ってから、取引の中で epoch を読む (読んだ epoch で書き終わるまで持つ)
+ *   prepare / activate / cancel = 取引の冒頭に排他で取る = ロードの途中で epoch が変わらない (古い epoch を読んだロードが新しい active の後に commit しない)
+ * 🚨 鍵の順 (全部の書き手で同じ = デッドロックしない): 持ち主の epoch (0053) → 切替の段階 (0051 の hashtext('ops.master_cutover')) →
+ *   マスタの書き込み (0051 の core.master_write_lock_key() = 4705310051) → 親子 (0036 の core.parent_lock_key() = 4705310036) → 行。
+ *   夜間ロード = epoch 共有 → 書き込み 排他 → 親子 / activate = epoch 排他 → 段階 共有 → 行 / 画面の保存 = 段階 共有 → 書き込み 共有 (epoch は取らない)
+ */
+export const OWNERSHIP_LOCK_EXISTS_SQL = `select to_regprocedure('ops.master_ownership_lock_key()') is not null as ok`;
+export const OWNERSHIP_SHARED_LOCK_SQL = 'select pg_advisory_xact_lock_shared(ops.master_ownership_lock_key())';
+export const OWNERSHIP_EXCLUSIVE_LOCK_SQL = 'select pg_advisory_xact_lock(ops.master_ownership_lock_key())';
+
+/**
+ * 最後に commit した夜間ロード (どの場所からでも。dry-run は巻き戻す = 数えない)。activate が「証拠の世代の後にロードが入っていない」を見る
+ * @returns {string|null} ingest_run_id
+ */
+export async function latestLoadRunId(db) {
+  const r = (await rowsOf(db, `select ingest_run_id from ops.ingest_runs where source_system = 'sqlite_initial_load' and entity = 'products' and status = 'success'
+    order by finished_at desc nulls last, started_at desc, ingest_run_id desc limit 1`))[0];
+  return r ? r.ingest_run_id : null;
+}
+
+/**
  * 1 行を用意する (無ければ active = 全部 load で作る) → 行の鍵を取る。取引の中で呼ぶ。
  * 2 人が同時に最初の prepare をしても、後の人は前の人の commit を待ってから何もしない (on conflict) = 重複で落ちない・init は 1 回だけ
  */
@@ -82,9 +107,13 @@ async function ensureRow(db, actor) {
   if (made) await db.query(`insert into ops.master_ownership_events (action, ownership_hash, ownership, actor) values ('init', $1, $2::jsonb, $3)`, [h, JSON.stringify(sortedOwnership(ALL_LOAD)), actor]);
   await db.query('select 1 from ops.master_ownership_state where id = 1 for update');
 }
+/** 持ち主のコマンドの取引: 冒頭に epoch の鍵を排他で取る (夜間ロードの取引が終わるまで待つ = ロードの途中で epoch を変えない) */
 const inTx = async (db, fn) => {
   await db.query('begin');
-  try { const r = await fn(); await db.query('commit'); return r; } catch (e) { try { await db.query('rollback'); } catch { /* */ } throw e; }
+  try {
+    if ((await rowsOf(db, OWNERSHIP_LOCK_EXISTS_SQL))[0].ok === true) await db.query(OWNERSHIP_EXCLUSIVE_LOCK_SQL);
+    const r = await fn(); await db.query('commit'); return r;
+  } catch (e) { try { await db.query('rollback'); } catch { /* */ } throw e; }
 };
 
 /** prepare: 「次にこれにする」を記録する (active と同じなら何もしない = 投げる)。ほかの確かめ (一緒に切り替える組など) は呼び手 */
@@ -96,7 +125,8 @@ export async function prepareOwnership(db, { map, actor }) {
     const cur = (await rowsOf(db, 'select active_hash, active_map from ops.master_ownership_state where id = 1'))[0];
     // 実際に効く持ち主 (記録に無い列 = load を足した後) で比べる
     if (checkedMap(cur.active_map, cur.active_hash, 'active').hash === h) throw Object.assign(new Error('今の active と同じ持ち主 (用意するものが無い)'), { code: 'SAME_AS_ACTIVE' });
-    await db.query(`update ops.master_ownership_state set prepared_hash = $1, prepared_map = $2::jsonb, prepared_at = now(), prepared_by = $3, updated_at = now() where id = 1`, [h, JSON.stringify(m), actor]);
+    // prepare の時刻 = epoch の鍵を取った後の今 (取引を始めた時刻ではない = 待っていた夜間ロードの commit より後。activate の「prepare の後に読んだ世代」の基準)
+    await db.query(`update ops.master_ownership_state set prepared_hash = $1, prepared_map = $2::jsonb, prepared_at = clock_timestamp(), prepared_by = $3, updated_at = now() where id = 1`, [h, JSON.stringify(m), actor]);
     await db.query(`insert into ops.master_ownership_events (action, ownership_hash, ownership, actor) values ('prepare', $1, $2::jsonb, $3)`, [h, JSON.stringify(m), actor]);
     return { prepared_hash: h };
   });
@@ -121,12 +151,15 @@ async function readCutoverPhaseInTx(db) {
  * activate: prepared → active (expectHash = 確かめた世代の持ち主のハッシュ・expectPreparedAt = 証拠を集めたときの prepare の時刻。どちらかが違えば投げる)。
  *   確かめの証拠は呼び手が集める。🚨 同じ持ち主でも prepare をやり直した (時刻が変わった) = 前の証拠では active にしない (#1564 Codex R2 Medium 4)。
  *   比べるのは行の鍵を取った後 (証拠を集めた後・activate の前に別の人が prepare し直しても通さない)
+ *   expectLoadRunId = 証拠の世代が読んだ夜間ロード。最後に commit したロードがこれでない = 断る (LOAD_AFTER_EVIDENCE。古い active で走ったロードが
+ *   証拠の後に C の列を NE の値で書いた = 証拠の世代はもう DB と同じでない。#1564 Codex R3 High 1)
  * 🚨 切替の段階が frozen (古い入口を止めた後・持ち主を C にする前) のときだけ (#1564 の見直し M-1)。
  *   段階の表が無い (⑤-1 の前) = 断る / legacy_open (古い入口がまだ正) = 断る / company_owner・new_open (もう切り替えた後) = 断る。
  *   持ち主の正を 1 つにする残り (⑤-1 の company_owner に進む条件 = active_hash と owner_hash が同じ・新しい画面が DB の active を読む) は ⑤ / ⑥ で結ぶ
  */
-export async function activateOwnership(db, { expectHash, expectPreparedAt, actor, evidence }) {
+export async function activateOwnership(db, { expectHash, expectPreparedAt, expectLoadRunId, actor, evidence }) {
   if (!expectPreparedAt) throw Object.assign(new Error('証拠を集めたときの prepare の時刻 (expectPreparedAt) が要る'), { code: 'PREPARED_AT_REQUIRED' });
+  if (!expectLoadRunId) throw Object.assign(new Error('証拠の世代が読んだ夜間ロード (expectLoadRunId) が要る'), { code: 'LOAD_RUN_REQUIRED' });
   return inTx(db, async () => {
     const phase = await readCutoverPhaseInTx(db);
     if (phase == null) throw Object.assign(new Error(`切替の段階の表 (${CUTOVER_TABLE}) が無い・行が無い = active にしない (⑤-1 の migration の後・段階 ${ACTIVATE_PHASE} で)`), { code: 'CUTOVER_STATE_MISSING' });
@@ -140,6 +173,13 @@ export async function activateOwnership(db, { expectHash, expectPreparedAt, acto
     // 確かめた世代の持ち主 (実際に効く持ち主のハッシュ = 記録に無い列は load を足した後) と比べる
     const eff = checkedMap(cur.prepared_map, cur.prepared_hash, 'prepared');
     if (eff.hash !== expectHash) throw Object.assign(new Error(`確かめた世代の持ち主 (${String(expectHash).slice(0, 12)}) が prepared (${eff.hash.slice(0, 12)}) と違う`), { code: 'PREPARED_MISMATCH' });
+    // 証拠の世代の後に夜間ロードが入った = active にしない (#1564 Codex R3 High 1)。epoch の鍵 (排他) の後に見る =
+    //   古い active を読んで走っていたロードは、ここより前に commit している (その書き込みは証拠の世代に入っていない = 写しからやり直す)
+    const lastLoad = await latestLoadRunId(db);
+    if (lastLoad !== expectLoadRunId) {
+      throw Object.assign(new Error(`証拠の世代の後に夜間ロード (${lastLoad}) が入った (証拠 = ${expectLoadRunId}) = この証拠では active にしない (--use-prepared のロードからやり直す)`),
+        { code: 'LOAD_AFTER_EVIDENCE', last_load: lastLoad });
+    }
     await db.query(`update ops.master_ownership_state set active_hash = prepared_hash, active_map = prepared_map, activated_at = now(), activated_by = $1, activated_evidence = $2::jsonb,
       prepared_hash = null, prepared_map = null, prepared_at = null, prepared_by = null, updated_at = now() where id = 1`, [actor, JSON.stringify(evidence ?? null)]);
     await db.query(`insert into ops.master_ownership_events (action, ownership_hash, ownership, actor, evidence) values ('activate', $1, $2, $3, $4::jsonb)`,

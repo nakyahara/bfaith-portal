@@ -11,7 +11,9 @@
 --   行が無い = active は全部 'load' (今までと同じ)。
 -- 🚨 古い書き込み口 (/register など) を閉じるのは ⑤-3 の切替の手順 (持ち主を変える前に閉じる)。ここでは門を作らない。
 -- 🚨 持ち主の正を 1 つにする (Codex #1564 R2 High 3): ⑤-1 の切替の段階の持ち主表 (ops.master_cutover_state.owner_hash) と画面の保存の持ち主表は、
---   この表の active (epoch) と同じでなければならない (下の 4 つ。⑤-1 の関数は上書きしない = 差し込み口の表に 1 行足す・⑤-1 の表に trigger を足す)
+--   この表の active (epoch) と同じでなければならない (下の 4 つ。⑤-1 の関数は上書きしない = 差し込み口の表に 1 行足す・⑤-1 の表に trigger を足す。
+--   例外は 1 つだけ: 持ち主表のハッシュの式 ops.ownership_hash を「load の列は数えない」に作り直す = 下の「1 つの式に」。#1564 Codex R3 Medium)
+-- 🚨 夜間ロードと epoch を変えるコマンドは epoch の鍵 (ops.master_ownership_lock_key()) で並ぶ (#1564 Codex R3 High 1)
 -- 🚨 書くのは持ち主のコマンドだけ (DB を作ったユーザー)。watcher は読むだけ (ops の既定の権限)。
 
 create table ops.master_ownership_state (
@@ -53,21 +55,46 @@ do $$ begin
   if exists (select 1 from pg_roles where rolname = 'watcher') then execute 'grant select on ops.master_ownership_state, ops.master_ownership_events to watcher'; end if;
 end $$;
 
+-- ─── 持ち主の epoch の鍵 (#1564 Codex R3 High 1) ───
+-- 夜間ロード (apps/company-db/load/engine.mjs) は取引の冒頭に共有で取ってから epoch を読む (書き終わるまで持つ)。prepare / activate / cancel
+-- (apps/company-db/load/ownership-state.mjs) は排他で取る = ロードの途中で epoch が変わらない (古い active を読んだロードが新しい active の後に commit しない)。
+-- 数は 0036 の core.parent_lock_key() = 4705310036・0051 の core.master_write_lock_key() = 4705310051 と同じ作り (重ならない固定の数。
+-- 2^31 より大きい = hashtext() の鍵 (ops.master_cutover など) とも重ならない)。
+-- 🚨 鍵の順 (全部の書き手で同じ): 持ち主の epoch (0053) → 切替の段階 (0051 の hashtext('ops.master_cutover')) → マスタの書き込み (0051) → 親子 (0036) → 行
+create function ops.master_ownership_lock_key() returns bigint language sql immutable as $$ select 4705310053::bigint $$;
+
+-- ─── 持ち主表のハッシュを 1 つの式に (#1564 Codex R3 Medium) ───
+-- ⑤-1 (0051) の ops.ownership_hash を作り直す (同じ名前・同じ形・同じ使い方。中身の式だけ):
+--   持ち主が 'load' の列は数えない = [キー, 値] を load でない列だけキーの順に並べた JSON の sha256 (lib/master-cutover.mjs の ownershipHash と同じ)。
+--   なぜ: 記録に無い列は load (④a の epoch はそう読む) なのに、0051 の式は持ち主表の全部の列でハッシュを作っていた = 切替の後に OWNED_COLUMNS に列を
+--   足すと (足した列は load)、画面の持ち主表のハッシュが段階の記録 (owner_hash) と違い、保存・登録が before_cutover で止まる。
+--   この式なら列を足しても (load のまま) ハッシュは変わらない。使うところ = ⑤-1 の ops.begin_master_write・⑤-2a の ops.register_new_sku・下の 1.〜3.
+-- 🚨 前の式で記録したハッシュが残っていると比べられない = 段階が company_owner / new_open (owner_hash を記録した後) の DB では作り直さない (止める)。
+--   本番は legacy_open (owner_hash は記録していない)・門の記録 (ops.legacy_gate_acks) は動いているプロセスが 15 分ごとに今のコード (同じ式) で書き直す
+do $$ begin
+  if exists (select 1 from ops.master_cutover_state where phase in ('company_owner', 'new_open')) then
+    raise exception '0053: 切替の段階が company_owner / new_open = 段階に記録した持ち主表のハッシュが前の式 = ops.ownership_hash の式を変えられない';
+  end if;
+end $$;
+create or replace function ops.ownership_hash(p jsonb) returns text language sql immutable set search_path = pg_catalog, pg_temp as $$
+  select encode(sha256(convert_to('[' || coalesce(string_agg('[' || to_json(t.k)::text || ',' || to_json(t.v)::text || ']', ',' order by t.k collate "C"), '') || ']', 'UTF8')), 'hex')
+    from jsonb_each_text(p) as t(k, v)
+   where t.v is distinct from 'load'
+$$;
+
 -- ─── 持ち主の正を 1 つにする (Codex #1564 R2 High 3) ───
--- 実際に効く active の持ち主表 (記録に無い列 = 'load' として足す = apps/company-db/load/ownership-state.mjs の checkedMap と同じ)。行が無い = 全部 load = {}
+-- active の持ち主表 (記録したまま。記録に無い列 = 'load' = apps/company-db/load/ownership-state.mjs の checkedMap と同じ読み方)。行が無い = 全部 load = {}
 create function ops.master_ownership_active_map() returns jsonb
   language sql stable set search_path = pg_catalog, pg_temp as $$
   select coalesce((select s.active_map from ops.master_ownership_state s where s.id = 1), '{}'::jsonb)
 $$;
 revoke all on function ops.master_ownership_active_map() from public;
 
--- 持ち主表 p が active と同じか (p のキーごとに: active に書いてあればその値・無ければ 'load' と同じ / active にだけあるキー = 違う)。
---   ⑤-1 の画面の保存 (ops.begin_master_write が書く ops.master_write_sessions の ownership) と比べる
+-- 持ち主表 p が active と同じか = 1 つの式のハッシュが同じ (load の列は数えない = どちらかに無い列は load と同じ。#1564 Codex R3 Medium)。
+--   ⑤-1 の画面の保存・⑤-2a の登録 (ops.master_write_sessions の ownership) と比べる
 create function ops.master_ownership_matches_active(p jsonb) returns boolean
   language sql stable set search_path = pg_catalog, pg_temp as $$
-  select p is not null and jsonb_typeof(p) = 'object'
-     and not exists (select 1 from jsonb_each_text(p) e where e.value is distinct from coalesce(ops.master_ownership_active_map() ->> e.key, 'load'))
-     and not exists (select 1 from jsonb_object_keys(ops.master_ownership_active_map()) k where not (p ? k))
+  select p is not null and jsonb_typeof(p) = 'object' and ops.ownership_hash(p) = ops.ownership_hash(ops.master_ownership_active_map())
 $$;
 revoke all on function ops.master_ownership_matches_active(jsonb) from public;
 

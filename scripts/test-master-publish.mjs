@@ -19,7 +19,8 @@
  *  12 入口 (cli): 取れた回は ping なし・受け入れない = fail / 入れた後の確かめが通った回だけ ok・今朝の作り直しでない = fail / 未設定 = ⏭️ + fail / --dry-run は書かない
  *  13 台帳・daily-sync (再構築の直前と直後)・照合 ② が company_owned を知っている
  *  17 持ち主の epoch (0053・Codex #1564 R1 H1): config (configured) を書き換えただけでは何も変わらない / prepare → 明示のロード → 写し → 作り直し → 確かめ → activate の順だけ /
- *     証拠 (今の作り直しの世代・今朝の確かめ・読み直し) が欠ければ active にしない / 行が無い = 全部 load / cancel / 記録は足すだけ
+ *     証拠 (今の作り直しの世代・今朝の確かめ・読み直し) が欠ければ active にしない / 証拠の世代の後に夜間ロードが入った = active にしない (R3 High 1) /
+ *     行が無い = 全部 load / cancel / 記録は足すだけ
  *  18 NE にしか無いセット (Company DB に無い) = 構成品が C にあっても全部 NE の道 (導いた原価・税・売上分類・取扱区分・構成品の名前と原価)・確かめも NE の値 (Codex #1564 R1 H2)
  *  19 ②b 古い表 (NE に欄が無い列 = 税区分・売上分類・送料・推奨保有月数。Codex #1564 R1 H3): 全部 load = 比べない / 作り直しの直後 = 差 0 (由来 = 作り直し・世代) /
  *     写しの後に C を直した = 反映待ち (台帳・始まりは動かない)・翌朝の作り直しで入る / 世代にあった値が無い = breach / 期限の後も違う = overdue /
@@ -33,10 +34,14 @@
  *     (A C の原価を直した朝 / B 何も直さず NE の新しい商品が夜間ロードで C に入った朝。#1564 の見直し H-A)
  *  24 止めるかどうかの正 = warehouse.db の門 (cdb_publish_gate。safe / broken / unknown): 違う = broken (証跡が書けなくても exit 4)・遅れ・証跡が無い・古い = 前の値のまま・
  *     safe に戻せるのは通った確かめだけ・行が無く持ち主が C = unknown・読めない = unknown・全部 load で行が無い = 流す (今と同じ)・
- *     自動再試行 (RERUN_AFTER も)・商品管理リストの手の更新も同じ門で止まる (M-2・#1564 Codex R2 High 2)
+ *     自動再試行 (RERUN_AFTER も)・商品管理リストの手の更新も同じ門で止まる (M-2・#1564 Codex R2 High 2) /
+ *     (R3 High 2) safe は確かめた作り直し・世代・ハッシュを持つ = 後に作り直した・broken を書けなかった (前の safe が残った) = 使わない (unknown・再試行と手の更新も止まる) /
+ *     門の表が読めない = unknown (行が無いと同じにしない) / 行が無く全部 load = 今の世代・作り直し・作り直しの世代がそろうときだけ流す
  *  25 記録の後に足した列 (記録した持ち主に無い) = load として足す・知らない列 = 壊れ (M-4)
  *  27 持ち主の正を 1 つに (0053・Codex #1564 R2 High 3): 0001〜0053 がそろって入る / 切替の段階を company_owner に進める前提 = epoch が active (差し込み口) /
  *     段階の owner_hash = active (⑤-1 の段階の行の trigger) / 画面の保存の門 (⑤-1 の ops.begin_master_write) = active (記録に無い列 = load)
+ *  28 持ち主表のハッシュは 1 つの式 (load の列は数えない。#1564 Codex R3 Medium): JS = DB / 前の列の組で切り替えた後に列を足しても画面の保存・登録の門は通る・
+ *     夜間ロードは足した列を load で動かす
  *  26 NE と C で種類が違う SKU (NE でセットを単品に) = その SKU だけ NE の値 (⚠️・証跡)・作り直し全部は止めない (M-5) /
  *     C のセットの構成品に NE にしか無い単品 = 値が混ざる = ⚠️・証跡 (L-2)
  * 使い方: node scripts/test-master-publish.mjs
@@ -858,7 +863,9 @@ await ta('[17] 持ち主の epoch (0053): config を書き換えただけでは�
   // 切替の段階 (⑤-1): 表が無い・legacy_open (古い入口がまだ正)・company_owner・new_open (切り替えた後) = active にしない。frozen だけ (#1564 の見直し M-1)
   //   表が無い (⑤-1 の前の DB) = 段階の表を読む問い合わせが「無い」と答える接続で確かめる (この積み方では ⑤-1 の 0051 がいつもある)
   const noCutover = { query: async (sql, p) => (/to_regclass\('ops\.master_cutover_state'\)/.test(sql) ? { rows: [{ ok: false }] } : pdb.query(sql, p)) };
-  await assert.rejects(OS.activateOwnership(noCutover, { expectHash: ownHash, expectPreparedAt: (await OS.readOwnershipState(pdb)).prepared.prepared_at, actor: 't', evidence: {} }),
+  const lastLoad = await OS.latestLoadRunId(pdb);   // 証拠の世代が読んだ夜間ロード (= 今の最後のロード)
+  assert.equal(lastLoad, db.prepare('SELECT load_run_id FROM cdb_publish_generations WHERE generation_no = ?').get(g.generation_no).load_run_id);
+  await assert.rejects(OS.activateOwnership(noCutover, { expectHash: ownHash, expectPreparedAt: (await OS.readOwnershipState(pdb)).prepared.prepared_at, expectLoadRunId: lastLoad, actor: 't', evidence: {} }),
     (e) => e.code === 'CUTOVER_STATE_MISSING');
   assert.equal((await q("select phase from ops.master_cutover_state where id = 1"))[0].phase, 'legacy_open');   // ⑤-1 の 0051 の最初の段階
   for (const ph of ['legacy_open', 'company_owner', 'new_open']) {
@@ -870,10 +877,15 @@ await ta('[17] 持ち主の epoch (0053): config を書き換えただけでは�
   // 証拠を集めた後に (同じ持ち主で) prepare がやり直された = 前の証拠の時刻では active にしない (行の鍵の後に比べる。#1564 Codex R2 Medium 4)
   const pAt = (await OS.readOwnershipState(pdb)).prepared.prepared_at;
   await q("update ops.master_ownership_state set prepared_at = prepared_at + interval '1 millisecond' where id = 1");
-  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, actor: 't', evidence: {} }), (e) => e.code === 'PREPARED_CHANGED');
-  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, actor: 't', evidence: {} }), (e) => e.code === 'PREPARED_AT_REQUIRED');
+  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, expectLoadRunId: lastLoad, actor: 't', evidence: {} }), (e) => e.code === 'PREPARED_CHANGED');
+  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectLoadRunId: lastLoad, actor: 't', evidence: {} }), (e) => e.code === 'PREPARED_AT_REQUIRED');
+  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, actor: 't', evidence: {} }), (e) => e.code === 'LOAD_RUN_REQUIRED');
   await q("update ops.master_ownership_state set prepared_at = prepared_at - interval '1 millisecond' where id = 1");
   assert.equal((await OS.readOwnershipState(pdb)).prepared.prepared_at, pAt);
+  // 証拠の世代の後に夜間ロードが入った (最後のロードが証拠のロードでない) = active にしない (#1564 Codex R3 High 1。並んだときの順は本物の PostgreSQL の試験 [21])
+  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, expectLoadRunId: 'load_before_evidence', actor: 't', evidence: {} }),
+    (e) => e.code === 'LOAD_AFTER_EVIDENCE' && e.last_load === lastLoad);
+  assert.equal((await OS.readOwnershipState(pdb)).active.hash, allHash);
   // prepare より前に Company DB を読んだ世代 = active にしない (#1564 の見直し L-1)
   await q("update ops.master_ownership_state set prepared_at = now() + interval '1 hour' where id = 1");
   assert.equal(await epochCli(['activate']), 1);
@@ -1193,6 +1205,12 @@ await ta('[23] 作り直しを飛ばした・止まった朝 (写しだけ新し
   await nightly();
 });
 
+/** 試験だけ: 今の作り直しを確かめた safe の行を直接置く */
+function writeGateForTest(G, sqlite, build) {
+  G.writePublishGate(sqlite, { state: 'safe', reason: 'test', buildId: build.build_id, generationNo: build.cdb_publish_generation_no, appliedHash: build.cdb_publish_applied_hash,
+    ownershipHash: build.cdb_publish_ownership_hash, checkedAt: new Date().toISOString() });
+}
+
 await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken / unknown): 違う = broken (証跡が書けなくても exit 4)・遅れ・証跡が無い = 前の値のまま・safe に戻すのは通った確かめだけ・再試行と手の更新も同じ門', async () => {
   const G = await import('../apps/warehouse/publish-gate.js');
   const R = await import('../apps/warehouse/retry-failed-jobs.js');
@@ -1270,6 +1288,69 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
   assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
   assert.equal((await P.runPmlFbaRefresh(pml(gate))).pml_run_id, 'r');
+  assert.deepEqual([row().build_id, row().generation_no, row().applied_hash, row().ownership_hash],
+    [snap().build.build_id, snap().build.cdb_publish_generation_no, snap().build.cdb_publish_applied_hash, snap().build.cdb_publish_ownership_hash]);   // safe は確かめたものを持つ
+  // ── #1564 Codex R3 High 2 ──
+  // (i) safe の行の後に作り直した (まだ確かめていない) = その safe は使わない・持ち主が C = unknown → 確かめが通れば safe
+  db.prepare("UPDATE raw_ne_products SET 商品名 = 商品名 WHERE 商品コード = 's-ne'").run(); FX.markComplete(db, readNeRawRev);
+  assert.equal((await rebuild()).ok, true);
+  assert.notEqual(snap().build.build_id, row().build_id);
+  assert.deepEqual([row().state, gate().state, gate().open, gate().reason], ['safe', 'unknown', false, 'safe_row_stale:build_changed']);
+  assert.equal((await verify()).code, 0);
+  assert.deepEqual([gate().state, gate().open, gate().source], ['safe', true, 'row']);
+  // (j) 違うと分かったのに broken を書けなかった (門の UPDATE が落ちた) = 前の safe が残る → 読み手は今の古い表から作り直したハッシュと比べて使わない =
+  //     再試行・商品管理リストの手の更新も止まる (exit 4 は daily-sync が止める)
+  const gateWriteFails = new Proxy(db, { get(t, k) {
+    if (k === 'prepare') return (sql) => { if (/INSERT INTO cdb_publish_gate/.test(sql)) throw new Error('門を書けない (試験)'); return t.prepare(sql); };
+    const v = t[k]; return typeof v === 'function' ? v.bind(t) : v;
+  } });
+  const origCost2 = mp('s-ne').原価;
+  db.prepare("UPDATE m_products SET 原価 = 2 WHERE 商品コード = 's-ne'").run();
+  v = await verify({ openSqlite: async () => gateWriteFails });
+  assert.equal(v.code, 4, v.last);
+  assert.match(v.last, /書けない: 門 門を書けない/);
+  assert.equal(row().state, 'safe');   // 前の safe が残った
+  assert.deepEqual([gate().state, gate().open, gate().reason], ['unknown', false, 'safe_row_stale:applied_changed_now']);
+  ran.length = 0; calls.length = 0;
+  R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
+  assert.deepEqual(ran, ['マスタ照合', 'CompanyDB見張り']);
+  await assert.rejects(P.runPmlFbaRefresh(pml(gate)), (e) => e.code === 'PUBLISH_BROKEN');
+  assert.deepEqual(calls, []);
+  db.prepare('UPDATE m_products SET 原価 = ? WHERE 商品コード = ?').run(origCost2, 's-ne');
+  assert.deepEqual([gate().state, gate().open], ['safe', true]);   // 戻した = 確かめたときと同じ
+  // (k) 門の表はあるが読めない (SELECT が落ちる) = unknown (「行が無い」= 全部 load なら流す、と同じにしない)。確かめは通っても unreadable を記録
+  const gateReadFails = new Proxy(db, { get(t, k) {
+    if (k === 'prepare') return (sql) => { if (/FROM cdb_publish_gate WHERE id = 1/.test(sql)) throw new Error('門を読めない (試験)'); return t.prepare(sql); };
+    const v = t[k]; return typeof v === 'function' ? v.bind(t) : v;
+  } });
+  const gr = G.readPublishGate({ db: gateReadFails });
+  assert.deepEqual([gr.state, gr.open], ['unknown', false]);
+  assert.match(gr.reason, /^gate_unreadable: 門を読めない/);
+  v = await verify({ openSqlite: async () => gateReadFails });
+  assert.equal(v.code, 0, v.last);   // 確かめは通った = safe を書き直す
+  assert.deepEqual([evidence().apply.gate.before, evidence().apply.gate.after, row().state], ['unreadable', 'safe', 'safe']);
+  // (l) 行が無い = 全部 load と分かるときだけ流す: 今の世代が無い・作り直しが無い・作り直しが世代を使っていない = unknown
+  db.prepare('DELETE FROM cdb_publish_gate').run();
+  await nightly();
+  assert.equal((await fetchGen(MASTER_OWNERSHIP)).state, 'verified');
+  assert.equal((await rebuild()).ok, true);
+  assert.deepEqual([gate().state, gate().open, gate().source], ['safe', true, 'implicit']);
+  const hide = (re, val) => new Proxy(db, { get(t, k) {
+    if (k === 'prepare') return (sql) => (re.test(sql) ? { get: () => val, all: () => [] } : t.prepare(sql));
+    const vv = t[k]; return typeof vv === 'function' ? vv.bind(t) : vv;
+  } });
+  const noGen = G.readPublishGate({ db: hide(/SELECT value FROM sync_meta WHERE key = \?/, undefined) });
+  assert.deepEqual([noGen.state, noGen.open, noGen.reason], ['unknown', false, 'no_gate_row_unverified:no_current_generation:no_generation']);
+  const noBuild = G.readPublishGate({ db: hide(/FROM m_products_builds ORDER BY/, undefined) });
+  assert.deepEqual([noBuild.state, noBuild.open, noBuild.reason], ['unknown', false, 'no_gate_row_unverified:no_build']);
+  const genless = { ...snap().build, cdb_publish_generation_no: null };
+  const noPub = G.readPublishGate({ db: hide(/FROM m_products_builds ORDER BY/, genless) });
+  assert.deepEqual([noPub.state, noPub.open, noPub.reason], ['unknown', false, 'no_gate_row_unverified:build_without_generation']);
+  // 古い safe の行でも、全部 load と分かれば流す (写す値が無い)
+  writeGateForTest(G, db, snap().build);
+  db.prepare("UPDATE cdb_publish_gate SET build_id = 'old_build' WHERE id = 1").run();
+  assert.deepEqual([gate().state, gate().open, gate().reason], ['safe', true, 'all_load_safe_row_stale:build_changed']);
+  db.prepare('DELETE FROM cdb_publish_gate').run();
   // (h) 読めない (warehouse.db が無い・壊れた) = unknown = 止める
   assert.deepEqual([G.readPublishGate({ dataDir: path.join(tmp, 'no-such-dir') }).state, G.readPublishGate({ dataDir: path.join(tmp, 'no-such-dir') }).open], ['unknown', false]);
   assert.equal(G.readPublishGate({ dataDir: null }).open, false);
@@ -1422,6 +1503,76 @@ await ta('[27] 持ち主の正を 1 つに: 0001〜0053 がそろう・company_o
   await assert.rejects(beginCreate(), /before_cutover: 持ち主表が持ち主の epoch/);
   await setCutoverPhase('legacy_open');
   await nightly();
+});
+
+await ta('[28] 持ち主表のハッシュは 1 つの式 (load の列は数えない): 前の列の組で切り替えた後に列を足しても、画面の保存・登録は止まらない・夜間ロードは足した列を load で動かす (#1564 Codex R3 Medium)', async () => {
+  const C = await import('../lib/master-cutover.mjs');
+  const own = OS.sortedOwnership(OWN('sku_costs'));
+  const older = { ...own }; delete older['skus.reorder_months'];   // 切替のとき (この列を OWNED_COLUMNS に足す前) の持ち主表
+  const put = async (map) => q(`insert into ops.master_ownership_state (id, active_hash, active_map, activated_by) values (1, $1, $2::jsonb, 'test')
+    on conflict (id) do update set active_hash = excluded.active_hash, active_map = excluded.active_map, prepared_hash = null, prepared_map = null, prepared_at = null, prepared_by = null`,
+  [OS.ownershipHashOf(map), JSON.stringify(map)]);
+  // (a) 式は 1 つ: JS (lib/master-cutover.mjs・ownership-state.mjs・master-publish.js) = DB (ops.ownership_hash)。load の列は数えない
+  const sqlHash = async (m) => (await q('select ops.ownership_hash($1::jsonb) as h', [JSON.stringify(m)]))[0].h;
+  assert.equal(C.ownershipHash(own), C.ownershipHash(older));
+  assert.deepEqual([OS.ownershipHashOf(own), MP.ownershipHash(own), await sqlHash(own), await sqlHash(older)], Array(4).fill(C.ownershipHash(own)));
+  assert.notEqual(C.ownershipHash({ ...own, 'skus.reorder_months': 'company' }), C.ownershipHash(own));   // company の列は数える
+  assert.equal(await sqlHash({ ...own, 'skus.reorder_months': 'company' }), C.ownershipHash({ ...own, 'skus.reorder_months': 'company' }));
+  // (b) 前の列の組で切り替える (epoch の active・段階の owner_hash = その時の画面の持ち主表 = older)
+  await put(older);
+  await setCutoverPhase('frozen');
+  await pdb.query('begin');
+  try { await q("select set_config('ops.cutover_protocol', '1', true)"); await q("update ops.master_cutover_state set phase = 'company_owner', owner_hash = $1 where id = 1", [C.ownershipHash(older)]); await pdb.query('commit'); }
+  catch (e) { await pdb.query('rollback'); throw e; }
+  await setCutoverPhase('new_open', C.ownershipHash(older));
+  // (c) 列を足した後の画面 (持ち主表 = own。足した列は load): 段階の記録と同じ = 保存できる (JS の門・DB の ⑤-1 の begin・0053 の約束の門・登録の行)
+  const cut = await C.readCutoverPhase(pdb);
+  assert.equal(C.newEntryWritable(cut, own), true);
+  assert.equal(C.newEntryWritable(cut, { ...own, 'skus.reorder_months': 'company' }), false);   // 足した列を company にした = 違う
+  const skuNe = Number(await skuId('s-ne'));
+  const begin = async (ownership) => {
+    await pdb.query('begin');
+    try {
+      const v = (await q('select ops.master_edit_versions($1) as v', [skuNe]))[0].v;
+      return (await q('select ops.begin_master_write($1::uuid, $2, null, $3::jsonb, $4, $5, $6, $7, $8::jsonb) as r',
+        [crypto.randomUUID(), 'tester', JSON.stringify(ownership), 'sku_edit', skuNe, 'a'.repeat(64), 'b'.repeat(64), JSON.stringify(v)]))[0].r;
+    } finally { await pdb.query('rollback'); }
+  };
+  assert.equal((await begin(own)).phase, 'new_open');
+  assert.equal((await begin(older)).phase, 'new_open');
+  await assert.rejects(begin({ ...own, 'skus.reorder_months': 'company' }), /before_cutover: 持ち主表が切替のときの記録と違う/);
+  assert.equal((await q('select ops.master_ownership_matches_active($1::jsonb) as ok', [JSON.stringify(own)]))[0].ok, true);   // 登録 (sku_create) の約束の門も同じ式
+  // (d) 夜間ロード・写し: 記録に無い列 = load (止まらない)
+  const st = await OS.readOwnershipState(pdb);
+  assert.deepEqual([st.active.map['skus.reorder_months'], st.active.filled, st.active.hash], ['load', ['skus.reorder_months'], C.ownershipHash(own)]);
+  const lr = await loadNow();
+  assert.deepEqual([lr.ownership_epoch.epoch, lr.company_owned], ['active', ['sku_costs']]);
+  // (e) 写し: 夜間ロードが前の式で記録したハッシュ (式を変えた日) でも、記録した持ち主表から今の式で比べる = 偽の食い違いにしない
+  const oldFormat = 'f'.repeat(64);
+  const allMap = OS.sortedOwnership(OS.ALL_LOAD);
+  const v1 = F.verifyGeneration({ prev: null, next: { ownership: allMap, ownership_hash: C.ownershipHash(allMap), cols: [], rows: [], problems: [], version_watermark: 1 },
+    source: { load: { ingest_run_id: 'old_load' }, loadOwnership: { products: { ownership: allMap, ownership_hash: oldFormat }, set_components: { ownership: allMap, ownership_hash: oldFormat } }, skus: [] } });
+  assert.ok(!v1.problems.includes('ownership_mismatch'), JSON.stringify(v1.problems));
+  const v2 = F.verifyGeneration({ prev: null, next: { ownership: own, ownership_hash: C.ownershipHash(own), cols: [], rows: [], problems: [], version_watermark: 1 },
+    source: { load: { ingest_run_id: 'old_load' }, loadOwnership: { products: { ownership: allMap, ownership_hash: C.ownershipHash(own) }, set_components: { ownership: allMap, ownership_hash: C.ownershipHash(own) } }, skus: [] } });
+  assert.ok(v2.problems.includes('ownership_mismatch'), JSON.stringify(v2.problems));   // 記録した持ち主表が違う = 食い違い (ハッシュの列だけでは決めない)
+  const ep = F.generationEpoch({ ownershipState: { state: 'ok', active: { map: allMap, hash: C.ownershipHash(allMap) }, prepared: { map: own, hash: C.ownershipHash(own) } },
+    loadOwnership: { products: { ownership: own, ownership_hash: oldFormat } } });
+  assert.equal(ep.kind, 'prepared');
+  await setCutoverPhase('legacy_open');
+  await q('delete from ops.master_ownership_state');
+  await nightly();
+  // (f) 段階が company_owner / new_open (前の式で owner_hash を記録した後) の DB では 0053 は止まる (式を黙って変えない)
+  const pg2 = new PGlite(); const pdb2 = pgliteAdapter(pg2);
+  try {
+    await applyMigrations(pdb2, { log: quiet, to: '0052' });
+    await pdb2.query('begin');
+    await pdb2.query('set local session_replication_role = replica');
+    await pdb2.query("update ops.master_cutover_state set phase = 'company_owner', owner_hash = $1 where id = 1", ['e'.repeat(64)]);
+    await pdb2.query('commit');
+    await assert.rejects(applyMigrations(pdb2, { log: quiet }), /0053: 切替の段階が company_owner \/ new_open/);
+    assert.deepEqual((await pdb2.query("select version from ops.schema_migrations where version = '0053'")).rows, []);
+  } finally { await pg2.close(); }
 });
 
 await pg.close();

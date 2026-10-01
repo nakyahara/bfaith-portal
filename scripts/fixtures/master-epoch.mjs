@@ -6,10 +6,7 @@
  *   本番は ④a の手順 (master-ownership-epoch.mjs prepare → 写し → 作り直し → 確かめ → activate) で active になる。
  *   ⑤ の試験は切替を進めるときにその手順を流さない = ここで「activate 済み」の状態を直接置く (段階を進める直前に。表が無い DB = 何もしない)
  */
-import crypto from 'node:crypto';
-
-/** 持ち主表のハッシュ (apps/company-db/load/ownership-state.mjs の ownershipHashOf・lib/master-cutover.mjs の ownershipHash と同じ) */
-const hashOf = (o) => crypto.createHash('sha256').update(JSON.stringify(Object.keys(o || {}).sort().map((k) => [k, o[k]]))).digest('hex');
+import { ownershipHash as hashOf } from '../../lib/master-cutover.mjs';   // 持ち主表のハッシュ = 1 つの式 (load の列は数えない。0053 の ops.ownership_hash と同じ)
 const sorted = (o) => Object.fromEntries(Object.keys(o || {}).sort().map((k) => [k, o[k]]));
 
 /** active = ownership (prepared は無し) を置く。db = { query } (pg の adapter / PGlite)。表が無い = false */
