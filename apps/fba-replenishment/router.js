@@ -23,7 +23,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          getLastRecommendationRun, saveRecommendationRun, getRecentRecommendationRuns,
          getInboundDailySummary, getInboundMonthlySummary, getInboundShipmentsByDate, getInboundItems,
          getInboundUnreceived, getInboundSyncStatus, getInboundShipmentsWithoutDate,
-         importInboundRows, getInboundSyncCursor, checkSheetlessInputs } from './db.js';
+         importInboundRows, getInboundSyncCursor, checkSheetlessInputs, getSheetlessCalcBlock } from './db.js';
 import { isSheetlessRequested, isSheetlessIoRequested, SHEET_SYNC_GONE_MESSAGE } from './sheetless-mode.js';
 import { parseCsv, decodeCsvBuffer, buildShiftJisCsv } from './picking-csv.js';
 import { parseWarehouseCsv } from './warehouse-csv.js';
@@ -263,6 +263,8 @@ export async function runDecisionDraftSafe(trigger = 'manual') {
     generate: (inbound, opts) => generateRecommendations(false, inbound, opts),
     readSettings: () => getSettings(),
     ping: (status, note) => pingJob(DECISION_JOB_ID, status, note),
+    // Sheet なしのモード (⑦-F): 倉庫の写しの関所とは別に先に確かめる (Codex PR R2 High 1)。モードなしは null
+    checkSheetless: () => getSheetlessCalcBlock(),
   };
   return runDecisionAttemptSafe(deps, { trigger });
 }
@@ -371,10 +373,13 @@ export async function syncLatestPlanningFromMiniPC() {
   const savedRows = savePlanningDataWithHistory(rows, snapshotDate);
   let savedFnskus = 0;
   let fnskuSkipReason = null;
-  if (sheetless && pull.fnsku_source !== 'fba_sku_attrs') {
+  if (sheetless && (pull.fnsku_source !== 'fba_sku_attrs' || pull.fnsku_ready !== true)) {
     // 🚨 miniPC が fba_sku_attrs から返したと言っていない (古いコード) = sku_mapping の値かもしれない → 反映しない (前の FNSKU のまま)
     //    FNSKU が 0 件・欄が無いときも同じ (古い miniPC を見逃さない。Codex PR R1 Medium 2)
-    fnskuSkipReason = `miniPC の FNSKU が fba_sku_attrs からではない (fnsku_source=${pull.fnsku_source ?? 'なし'})。Sheet なしのモードなので反映しない`;
+    //    miniPC の fba.db に一回限りの移行の印が無い (fnsku_ready が true でない) ときも同じ (Codex PR R2 Medium 1)
+    fnskuSkipReason = pull.fnsku_source !== 'fba_sku_attrs'
+      ? `miniPC の FNSKU が fba_sku_attrs からではない (fnsku_source=${pull.fnsku_source ?? 'なし'})。Sheet なしのモードなので反映しない`
+      : `miniPC の fba_sku_attrs をまだ正にできない (${pull.fnsku_not_ready_reason || 'fnsku_ready が true でない'})。Sheet なしのモードなので反映しない`;
     console.warn(`[FBA] 同期: ${fnskuSkipReason}`);
   } else if (fnskus.length > 0) {
     // syncFnskuBatch は null も反映（FNSKUが外された商品を正しく同期）
@@ -788,13 +793,17 @@ router.get('/api/recommendation-health', (req, res) => {
 
 // ===== ステータス =====
 // ===== 推奨リスト =====
-router.get('/api/recommendations', async (req, res) => {
-  try {
+/**
+ * 推奨リストを作って応答の形にする (GET /api/recommendations と、Sheet なしのモードの POST /api/recommendations/recalculate が使う)。
+ * 中身は GET の今までの処理そのまま (⑦-F で切り出しただけ)
+ * @returns {Promise<{ status: number, body: object }>}
+ */
+async function recommendationsResponse(req) {
     const debug = req.query.debug === '1' || req.query.debug === 'true';
     const inboundOverride = await getInboundWorkingData();
     const result = generateRecommendations(debug, inboundOverride);
     // Sheet なしのモードで材料が欠けた = 計算しなかった (⑦-F)。健全性の記録 (前回) は書かずにエラーを返す = 画面は今の一覧のまま
-    if (result.sheetless_blocked) return res.status(503).json({ error: result.errors.join(' / '), sheetless_blocked: true });
+    if (result.sheetless_blocked) return { status: 503, body: { error: result.errors.join(' / '), sheetless_blocked: true } };
     // PR4: norm キーで join (mirror 小文字 vs item 元ケースでも fnsku/除外が取りこぼれない)
     const normSku = (v) => String(v ?? '').trim().toLowerCase();
     // FNSKU情報を付与
@@ -843,17 +852,46 @@ router.get('/api/recommendations', async (req, res) => {
     } catch (e) {
       console.error('[FBA] 推奨健全性チェック失敗(推奨自体は返す):', e.message);
     }
-    // Sheet なしのモードの画面 (Step4) は clear_provisional=1 を付けて頼む (⑦-F・Codex PR R1 High 1):
-    //   計算できたときだけ、応答の直前に「Amazon 仮確定」を消す (止まった日・失敗した日は前の仮確定がそのまま残る)。
-    //   モードなしの画面は付けない = 今までどおり画面が先に DELETE /api/provisional を呼ぶ
-    if (req.query.clear_provisional === '1') {
-      const ok = !(result.errors || []).filter(Boolean).length;
-      if (ok) clearProvisionalItems();
-      result.provisional_cleared = ok;
-    }
-    res.json(result);
+    return { status: 200, body: result };
+}
+
+router.get('/api/recommendations', async (req, res) => {
+  try {
+    const out = await recommendationsResponse(req);
+    res.status(out.status).json(out.body);
   } catch (e) {
     console.error('[FBA] 推奨リスト生成エラー:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** 試験用の割り込み (本番では null のまま) */
+export const _routerTestHooks = { afterRecalcFingerprint: null };
+/** 「Amazon 仮確定」の今の中身 (行とメタ = 保存した時刻)。計算の前と後で比べる */
+const provisionalFingerprint = () => JSON.stringify(getProvisionalItems());
+
+/**
+ * Sheet なしのモードの Step4 (⑦-F・Codex PR R1 High 1 / R2 Medium 2): 計算と「Amazon 仮確定」の消去を 1 つの POST に。
+ *   - モードなしは 400 (使わない。モードなしの画面は今までどおり DELETE /api/provisional → GET /api/recommendations)
+ *   - 始めに仮確定の中身を控え、計算できて (止まらず・警告なし) 中身が変わっていないときだけ、応答の直前に消す
+ *   - 計算の間に仮確定が変わっていたら消さずに 409 (一覧も返さない = 画面は今のまま)。止まった日は 503 で消さない
+ */
+router.post('/api/recommendations/recalculate', async (req, res) => {
+  if (!isSheetlessRequested()) return res.status(400).json({ error: 'この口は Sheet なしのモード (FBA_SHEETLESS_MODE=1) のときだけ使う' });
+  try {
+    const before = provisionalFingerprint();
+    if (_routerTestHooks.afterRecalcFingerprint) await _routerTestHooks.afterRecalcFingerprint();
+    const out = await recommendationsResponse(req);
+    if (out.status !== 200) return res.status(out.status).json({ ...out.body, provisional_cleared: false });
+    const ok = !(out.body.errors || []).filter(Boolean).length;
+    if (ok && provisionalFingerprint() !== before) {
+      return res.status(409).json({ error: '計算している間に「Amazon 仮確定」が変わったので消していない (一覧も出していない)。もう一度 Step4 を押す', provisional_changed: true, provisional_cleared: false });
+    }
+    if (ok) clearProvisionalItems();
+    out.body.provisional_cleared = ok;
+    res.json(out.body);
+  } catch (e) {
+    console.error('[FBA] 推奨リスト生成エラー (recalculate):', e);
     res.status(500).json({ error: e.message });
   }
 });

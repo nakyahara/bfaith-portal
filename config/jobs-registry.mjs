@@ -912,7 +912,9 @@ export const JOBS_REGISTRY = [
     anchor_minute_jst: 0,
     grace_hours: 6,
     lifecycle: 'permanent',
-    runbook: '見送りが続いて締切超過になったら「前の回が終わっていない」= ロードが固まっている。'
+    runbook: 'FBA 補充の Sheet なしのモード (⑦-F) で Render の fba.db の sku_mapping が凍結されている (fba_sheetless_state.sheet_frozen = 1・FBA 補充が起動時に書く) 間は、'
+      + 'sku_mapping の値 (fba_sheet_import の ASIN / FNSKU・JAN・Sheet にだけある出品) を使わない (計画の sources.fba_sheet_frozen = true)。'
+      + '見送りが続いて締切超過になったら「前の回が終わっていない」= ロードが固まっている。'
       + 'ping の note に「N.N時間前から」が出る。Render を再起動して /status の interrupted と ops.ingest_runs で '
       + '本適用が commit 済みかを確かめる。'
       + '有効化 = Render dashboard → bfaith-portal → Environment に COMPANY_DB_LOAD_CRON_ENABLED=1 '
@@ -999,7 +1001,8 @@ export const JOBS_REGISTRY = [
       + '2026-09-24 までの影の下書きの記録は ops.job_runs (job_id=fba-daily-sync) に残っている。'
       + '【Sheet なしのモード (FBA_SHEETLESS_MODE=1)】ok の基準 = Sheet なしの材料がそろっている (note「Sheetなし 対応=N 他CH=M」)。'
       + '欠けていれば fail (note「Sheetなし 材料が欠けている: 理由」= 09:40 の計算も止まる。Sheet には戻らない)。材料がそろい納品実績が失敗なら partial (今までと同じ)。'
-      + '手の Sheet 同期の口 (画面の Step3・POST /api/sync-sku-mappings) は 410。画面の Step4 は「Amazon 仮確定」を計算できたときだけ消す。'
+      + '手の Sheet 同期の口 (画面の Step3・POST /api/sync-sku-mappings) は 410。画面の Step4 は POST /api/recommendations/recalculate = 「Amazon 仮確定」を計算できて中身が変わっていないときだけ消す (変わっていたら 409)。'
+      + 'Render の fba.db に一回限りの移行の印が無いと材料が欠けている扱い (計算しない・fail)。miniPC の印が無いと FNSKU を反映しない (fnsku_ready=false・9:40 は partial)。'
       + '入れる順番: ① miniPC にコードを配る (?fnsku_source=attrs に答える) ② miniPC で scripts/fba-sheetless-backfill-once.mjs (WarehouseServer を止めて) '
       + '→ miniPC の .env (リポジトリの直下の 1 つ) に FBA_SHEETLESS_IO=1 → WarehouseServer を起動 (miniPC は計算しないので入出力だけ止める = '
       + '/service-api/fba/sync-sku-mappings は 410・FNSKU は fba_sku_attrs だけ・起動時の backfill を流さない) '
@@ -1035,6 +1038,7 @@ export const JOBS_REGISTRY = [
     runbook: 'Render Logs で「FBA-Decision」を検索。ok = その日の提案を記録した / partial = 11:40 でも入力がそろわず「今日は決められない」を記録 (前日以前の提案は superseded) / fail = 計算の失敗・例外。'
       + 'Sheet なしのモード (FBA_SHEETLESS_MODE=1) で SKU の対応・商品管理リスト・env が欠けた日も fail (「Sheet なしのモード: 理由」。Sheet の値には戻らない・fba-daily-sync の note と同じ理由)。'
       + 'この日は前の提案に触らない (superseded にしない = 人は見られる)。run 要約行に「止めた印」(send_blocked) を残し、自動で送る段は findSendBlock / sendableProposals で止まる。'
+      + 'Sheet なしの材料は倉庫の写しの関所とは別に先に確かめる (写しが読めない・古い日でも、材料が欠けていれば最後の回まで止めた印の道。前の提案を superseded にしない)。'
       + '同じモードで miniPC の FNSKU を反映しなかった日 (miniPC のコードが古い = ?fnsku_source=attrs に答えない・FNSKU が 0 件でも) は、提案を記録したうえで partial '
       + '(note「🚨 FNSKU を反映していない」・run 要約行の report_sync.fnsku_skip_reason)。miniPC を配り直す。'
       + '09:40・10:40 で入力がそろわない回は ping せず ops.job_runs (job_id=fba-decision-draft) に「待機 (理由)」を残す。'

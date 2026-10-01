@@ -205,6 +205,16 @@ export function getBackfillMark() {
   return { key: r.key, done_at: r.done_at, detail };
 }
 
+/** fba.db の fba_sheetless_state.sheet_frozen を今の env に合わせる (initDb の中で呼ぶ)。読み手 = Company DB のローダー */
+function writeSheetFrozenState() {
+  const frozen = isSheetlessIoRequested();
+  const has = !!queryOne(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'fba_sheetless_state'`);
+  if (!frozen && !has) return;
+  db.run('CREATE TABLE IF NOT EXISTS fba_sheetless_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)');
+  db.run(`INSERT INTO fba_sheetless_state (key, value, updated_at) VALUES ('sheet_frozen', ?, ?)
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`, [frozen ? '1' : '0', new Date().toISOString()]);
+}
+
 /** 起動時に backfill を流すか = Sheet の入出力を止めていない (FBA_SHEETLESS_MODE / FBA_SHEETLESS_IO が無い) かつ 印が無い (今までどおりの間だけ) */
 function shouldRunStartupBackfill() {
   return !isSheetlessIoRequested() && !getBackfillMark();
@@ -351,6 +361,10 @@ async function initDbOnce() {
   } else {
     console.log(`[fba-db] 起動時の sku_mapping → fba_sku_attrs の backfill は流さない (${isSheetlessIoRequested() ? 'Sheet なしのモード / 入出力を止めている' : '一回限りの移行の印あり'})`);
   }
+  // Sheet なしのモード (⑦-F・Codex PR R2 Medium 3): この fba.db の sku_mapping が凍結されているかを fba.db 自身に残す
+  //   (Company DB の毎晩のロード apps/company-db/load/sources.mjs がこの fba.db を読み、凍結中は sku_mapping の値を使わない)。
+  //   🚨 モードを一度も入れていない (表が無い) 間は何も書かない = fba.db の形も今のまま。一度入れた後は外したら '0' に戻す
+  writeSheetFrozenState();
 
   // --- 2. sku_exceptions: FBA優先送りマスタ ---
   db.run(`
@@ -2073,7 +2087,7 @@ export function _clearNonFbaCache() {
 
 /**
  * Sheet なしのモードの材料がそろっているか (⑦-F)。06:00 の定期同期の ok の基準と、計算の前の確かめに使う。
- *   ① env がそろっている (sheetless-mode.js の sheetlessProblems が空)
+ *   ① env がそろっている (sheetless-mode.js の sheetlessProblems が空)・この fba.db に一回限りの移行の印がある
  *   ② SKU の対応 (warehouse-mirror の mirror_sku_resolved、source='master') が 1 行以上ある
  *   ③ 商品管理リストの snapshot (他 CH の販売) が使える (getNonFbaFromPmlMap と同じ判定 = 公開済み ok・行数が合う)
  * モードを使わないときは { requested: false, ok: true } (何も読まない)
@@ -2082,6 +2096,8 @@ export function _clearNonFbaCache() {
 export function checkSheetlessInputs() {
   if (!isSheetlessRequested()) return { requested: false, ok: true, reasons: [], mapping_rows: null, pml_rows: null };
   const reasons = [...sheetlessProblems()];
+  // 🚨 一回限りの移行の印が無い = 最後の backfill が済んでいない (Codex PR R2 Medium 1)。モードを使う前提にする
+  if (!getBackfillMark()) reasons.push('この fba.db に一回限りの移行の印が無い (モードを入れる前に scripts/fba-sheetless-backfill-once.mjs を流す)');
   let mappingRows = null;
   try {
     mappingRows = Number(getMirrorDB().prepare(`SELECT COUNT(*) AS n FROM mirror_sku_resolved WHERE source = 'master'`).get()?.n || 0);

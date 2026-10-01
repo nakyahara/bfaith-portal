@@ -518,6 +518,9 @@ router.get('/sync/latest-planning', dbHandler(async (req, res, db) => {
   // Sheet なしのモードの Render は ?fnsku_source=attrs で頼む (⑦-F): FNSKU は fba_sku_attrs からだけ返す (sku_mapping の値を渡さない)。
   //   付いていなければ今までどおり
   const fromAttrs = req.query?.fnsku_source === 'attrs';
+  // miniPC の fba.db に一回限りの移行の印が無い = 起動のたびに Sheet の値が fba_sku_attrs に入る / 最後の backfill が済んでいない
+  //   → fba_sku_attrs をまだ正にできない (fnsku_ready: false。Render は反映しない・9:40 は partial。Codex PR R2 Medium 1)
+  const attrsReady = fromAttrs ? !!db.getBackfillMark() : null;
   // 全SKU対象（fnsku=nullも含む）。Render側で現状に合わせてupsert（null時はクリア）
   const fnskus = fromAttrs
     ? db.getFbaSkuAttrs().filter(a => a.amazon_sku).map(a => ({ sku: a.amazon_sku, fnsku: a.fnsku || null }))
@@ -533,7 +536,10 @@ router.get('/sync/latest-planning', dbHandler(async (req, res, db) => {
     fnskus,
     restock_rows: restockRows,
     planning_latest_rows: planningLatestRows,
-    ...(fromAttrs ? { fnsku_source: 'fba_sku_attrs' } : {}),
+    ...(fromAttrs ? {
+      fnsku_source: 'fba_sku_attrs', fnsku_ready: attrsReady,
+      ...(attrsReady ? {} : { fnsku_not_ready_reason: 'miniPC の fba.db に一回限りの移行の印が無い (scripts/fba-sheetless-backfill-once.mjs を流してから FBA_SHEETLESS_IO=1)' }),
+    } : {}),
   };
 }));
 

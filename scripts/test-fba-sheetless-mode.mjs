@@ -233,6 +233,18 @@ await t('モードなし: miniPC の口は FNSKU を今までどおり getSkuMap
 
 // =====================================================================================
 console.log('② モードを使う: sku_mapping が古い / 空 / 無い でも結果が変わらない');
+await t('モードありでも、この fba.db に一回限りの移行の印が無ければ計算しない (Codex PR R2 Medium 1) → 印を書くと計算する', async () => {
+  modeOn();
+  const r = generateRecommendations(false, {}, ENGINE_OPTS);
+  assert.equal(r.sheetless_blocked, true);
+  assert.match(r.errors.join(), /一回限りの移行の印が無い/);
+  modeOff();
+  const done = db.runSkuMappingBackfillOnce();
+  assert.equal(done.missing_after, 0);
+  modeOn();
+  assert.equal(generateRecommendations(false, {}, ENGINE_OPTS).sheetless_blocked, undefined);
+  modeOff();
+});
 let onResult;
 await t('モードあり: 他 CH 販売は商品管理リストだけ・Sheet 由来のスナップショットも使わない', async () => {
   modeOn();
@@ -351,6 +363,41 @@ await t('9:40 の自動決定: 計算の失敗 = fail の ping。提案は 1 行
     publishPml();
   }
 });
+await t('9:40 の自動決定: 倉庫の写しが読めない・古い日でも、Sheet なしの材料が欠けていれば止めた印の道 (最後の回でも前の提案を superseded にしない。Codex PR R2 High 1)', async () => {
+  const src = fs.readFileSync(path.join(root, 'apps', 'fba-replenishment', 'router.js'), 'utf8');
+  assert.match(src, /checkSheetless: \(\) => getSheetlessCalcBlock\(\),/, '本番の自動決定に Sheet なしの確かめを渡していない');
+  const CAP = '2026-10-05T00:20:00.000Z';
+  const staleRows = [{ 商品ID: 'alpha', 商品名: 'A', ブロック略称: 'A', ロケ: 'P-01', 有効期限: '', 在庫数: 200, 引当数: 0, ロケ業務区分: '通販', 最終入荷日: '20260901', ブロック引当順: 1, captured_at: CAP }];
+  const staleMeta = { captured_at: CAP, source_at: '2026-10-04T20:00:00.000Z', rows_read: 1, skipped_rows: 0, row_count: 1 };
+  for (const [name, readMirror] of [
+    ['写しの DB ごと読めない', () => { throw new Error('warehouse-mirror.db を開けない'); }],
+    ['写しが古い', () => ({ rows: staleRows, meta: staleMeta })],
+  ]) {
+    modeOn();
+    removePml();
+    try {
+      const queries = [], pings = [], generated = [];
+      const deps = {
+        openClient: async () => ({ db: { query: async (sql) => { queries.push(sql); return { rows: /pg_try_advisory_lock/.test(sql) ? [{ ok: true }] : [] }; } }, close: async () => {} }),
+        syncReports: async () => ({ ok: true, snapshot_date: '2026-10-05' }),
+        fetchInbound: async () => ({ data: {}, state: { source: 'fresh', count: 0, at: 'x' } }),
+        readMirror, readInputFreshness: () => ({}), readManualWarehouseSummary: () => [],
+        generate: (inbound, opts) => { generated.push(opts.rules); return generateRecommendations(false, inbound, { ...opts, ...ENGINE_OPTS }); },
+        readSettings: () => ({}),
+        ping: (st, n) => pings.push([st, n]),
+        checkSheetless: () => db.getSheetlessCalcBlock(),
+      };
+      const r = await runDecisionAttempt(deps, { nowMs: () => Date.parse('2026-10-05T02:40:00Z'), log: quiet });   // 11:40 = 最後の回
+      assert.equal(r.outcome, 'engine_failed', `${name}: ${r.outcome}`);
+      assert.deepEqual(pings.map((p) => p[0]), ['fail'], name);
+      assert.match(pings[0][1], /Sheet なしのモード/, name);
+      assert.deepEqual(generated, [], `${name}: 止めたのに計算した`);
+      assert.equal(queries.some((q) => /set status = 'superseded'/i.test(q)), false, `${name}: 前の提案を superseded にした`);
+      assert.equal(queries.filter((q) => /insert into ai\.decisions/i.test(q)).length, 1, `${name}: 止めた印を書いていない`);
+    } finally { publishPml(); }
+  }
+  modeOff();
+});
 await t('SKU の対応 (mirror) が 0 行でも計算しない', async () => {
   modeOn();
   const saved = mdb.prepare('SELECT * FROM mirror_sku_resolved').all();
@@ -453,7 +500,7 @@ await t('Render の引き取り: ?fnsku_source=attrs で頼み、miniPC が attr
   miniCalls.length = 0;
   miniHandler = (u) => (u.includes('/sync/latest-planning') ? {
     ok: true, snapshot_date: '2026-09-30', rows: [{ amazon_sku: 'Alpha-1', product_name: 'A', units_sold_30d: 60 }],
-    fnskus: [{ sku: 'Alpha-1', fnsku: 'X0PULLON' }], restock_rows: [], planning_latest_rows: [], fnsku_source: 'fba_sku_attrs',
+    fnskus: [{ sku: 'Alpha-1', fnsku: 'X0PULLON' }], restock_rows: [], planning_latest_rows: [], fnsku_source: 'fba_sku_attrs', fnsku_ready: true,
   } : { ok: false });
   const r = await routerMod.syncLatestPlanningFromMiniPC();
   assert.deepEqual(miniCalls, ['http://minipc.test/service-api/fba/sync/latest-planning?fnsku_source=attrs']);
@@ -478,13 +525,14 @@ await t('miniPC の口: ?fnsku_source=attrs なら fba_sku_attrs の全行を返
   const r = await call('GET', '/fba-service/sync/latest-planning?fnsku_source=attrs');
   assert.equal(r.status, 200);
   assert.equal(r.body.fnsku_source, 'fba_sku_attrs');
+  assert.equal(r.body.fnsku_ready, true, 'この fba.db には ② で移行の印を書いた');
   const attrs = db.getFbaSkuAttrs();
   assert.deepEqual(r.body.fnskus, attrs.map((a) => ({ sku: a.amazon_sku, fnsku: a.fnsku || null })));
   assert.ok(r.body.fnskus.some((f) => f.sku === 'Delta-4'), 'mirror に無い SKU も attrs にあれば返す');
 });
 
 // =====================================================================================
-console.log('⑦ 起動時の backfill と一回限りの移行');
+console.log('⑦ 起動時の backfill と一回限りの移行 (印の無い別の fba.db で)');
 const cli = (args = [], mode = null, { io = null, dir = dataDir } = {}) => {
   const env = { ...process.env, DATA_DIR: dir };
   delete env.FBA_SHEETLESS_MODE;
@@ -494,52 +542,71 @@ const cli = (args = [], mode = null, { io = null, dir = dataDir } = {}) => {
   const r = spawnSync(process.execPath, [path.join(root, 'scripts', 'fba-sheetless-backfill-once.mjs'), ...args], { cwd: dir, env, encoding: 'utf8', windowsHide: true, timeout: 120000 });
   return { code: r.status, out: `${r.stdout}${r.stderr}` };
 };
-await t('モードあり: 起動時の backfill を流さない (Sheet の古い値が attrs に入らない)', async () => {
+// 本体の fba.db は ② で印を書いたので、移行は別の fba.db で試す (module の実体を分ける = 別のプロセスの代わり)
+modeOff();
+const cliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fba-sheetless-cli-'));
+process.env.DATA_DIR = cliDir;
+const C = await import(`${pathToFileURL(path.join(root, 'apps', 'fba-replenishment', 'db.js')).href}?proc=cli`);
+process.env.DATA_DIR = dataDir;
+const cliFile = path.join(cliDir, 'fba.db');
+const cliMark = () => { const f = new Database(cliFile, { readonly: true }); try { return f.prepare(`SELECT 1 FROM sqlite_master WHERE name = 'fba_migration_marks'`).get() ? f.prepare('SELECT * FROM fba_migration_marks').all() : []; } finally { f.close(); } };
+const cliState = () => { const f = new Database(cliFile, { readonly: true }); try { return f.prepare(`SELECT 1 FROM sqlite_master WHERE name = 'fba_sheetless_state'`).get() ? f.prepare(`SELECT value FROM fba_sheetless_state WHERE key = 'sheet_frozen'`).get()?.value ?? null : 'no-table'; } finally { f.close(); } };
+const cAttrs = (sku) => C.getFbaSkuAttrs().find((a) => a.amazon_sku === sku) || null;
+await C.initDb();
+C.upsertSkuMappings([{ amazon_sku: 'Alpha-1', asin: 'B0SHEETA', ne_code: 'alpha' }, { amazon_sku: 'Beta-2', asin: 'B0SHEETB', ne_code: 'beta' }]);
+await C.initDb();   // 今までどおりの起動 = backfill で Alpha-1・Beta-2 が attrs に入る
+await t('モードなしの起動は「凍結」の印を書かない (表を作らない = fba.db の形は今のまま)', async () => {
+  assert.equal(cliState(), 'no-table');
+  assert.ok(cAttrs('Alpha-1'));
+});
+await t('モードあり (印なし): 起動時の backfill を流さない (Sheet の古い値が attrs に入らない)・凍結の印を書く', async () => {
   modeOff();
-  db.upsertSkuMappings([{ amazon_sku: 'Echo-5', asin: 'B0ECHO', ne_code: 'echo' }]);
+  C.upsertSkuMappings([{ amazon_sku: 'Echo-5', asin: 'B0ECHO', ne_code: 'echo' }]);
   modeOn();
-  await db.initDb();
-  assert.equal(attrsOf('Echo-5'), null);
+  await C.initDb();
+  assert.equal(cAttrs('Echo-5'), null);
+  assert.equal(cliState(), '1');
   // 一回限りの移行も、モードが入っている間は流せない (db.js 側の歯止め)
-  assert.throws(() => db.runSkuMappingBackfillOnce(), (e) => e.code === 'FBA_BACKFILL_MODE_ON');
-  assert.equal(attrsOf('Echo-5'), null);
-  assert.equal(db.getBackfillMark(), null);
+  assert.throws(() => C.runSkuMappingBackfillOnce(), (e) => e.code === 'FBA_BACKFILL_MODE_ON');
+  assert.equal(cAttrs('Echo-5'), null);
+  assert.equal(C.getBackfillMark(), null);
+  modeOff();
 });
 await t('移行のスクリプト: --check は書かない', async () => {
-  const st = fs.statSync(dbFile);
-  const r = cli(['--check']);
+  const st = fs.statSync(cliFile);
+  const r = cli(['--check'], null, { dir: cliDir });
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /印=なし/);
   assert.match(r.out, /入れる予定 1 行/);
-  const st2 = fs.statSync(dbFile);
+  const st2 = fs.statSync(cliFile);
   assert.deepEqual([st2.mtimeMs, st2.size], [st.mtimeMs, st.size]);
 });
-await t('移行のスクリプト: モードが入っている間は断る (印を書かない・fba.db に触らない)', async () => {
-  const st = fs.statSync(dbFile);
+await t('移行のスクリプト: モード / IO が入っている間は断る (印を書かない・fba.db に触らない)', async () => {
+  const st = fs.statSync(cliFile);
   await tick();
-  const r = cli([], '1');
+  const r = cli([], '1', { dir: cliDir });
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /断った/);
-  assert.deepEqual(fileMark(), []);
-  const r2 = cli([], 'yes');
+  assert.deepEqual(cliMark(), []);
+  const r2 = cli([], 'yes', { dir: cliDir });
   assert.equal(r2.code, 1, r2.out);
-  const r3 = cli(['--min-rows', '1'], null, { io: '1' });   // miniPC の入出力の止めが入っていても断る
+  const r3 = cli(['--min-rows', '1'], null, { io: '1', dir: cliDir });   // miniPC の入出力の止めが入っていても断る
   assert.equal(r3.code, 1, r3.out);
   assert.match(r3.out, /FBA_SHEETLESS_IO/);
-  const st2 = fs.statSync(dbFile);
+  const st2 = fs.statSync(cliFile);
   assert.deepEqual([st2.mtimeMs, st2.size], [st.mtimeMs, st.size], '断ったのに fba.db を書いた');
 });
 await t('移行のスクリプト: 既定の下限 (100 行) より少ない sku_mapping は断る', async () => {
-  const r = cli([]);
+  const r = cli([], null, { dir: cliDir });
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /下限 100/);
-  assert.deepEqual(fileMark(), []);
+  assert.deepEqual(cliMark(), []);
 });
 await t('移行のスクリプト: モードなしで流すと backfill して印を残す (時刻と件数)', async () => {
-  const r = cli(['--min-rows', '1']);
+  const r = cli(['--min-rows', '1'], null, { dir: cliDir });
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /済んだ/);
-  const marks = fileMark();
+  const marks = cliMark();
   assert.equal(marks.length, 1);
   assert.equal(marks[0].key, sheetless.BACKFILL_MARK_KEY);
   const detail = JSON.parse(marks[0].detail);
@@ -549,24 +616,25 @@ await t('移行のスクリプト: モードなしで流すと backfill して�
   assert.ok(!Number.isNaN(Date.parse(marks[0].done_at)));
 });
 await t('移行のスクリプト: 二度目は断る (fba.db に触らない = 開いて保存もしない)', async () => {
-  const st = fs.statSync(dbFile);
+  const st = fs.statSync(cliFile);
   await tick();
-  const r = cli(['--min-rows', '1']);
+  const r = cli(['--min-rows', '1'], null, { dir: cliDir });
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /二度は流さない/);
-  assert.equal(fileMark().length, 1);
-  const st2 = fs.statSync(dbFile);
+  assert.equal(cliMark().length, 1);
+  const st2 = fs.statSync(cliFile);
   assert.deepEqual([st2.mtimeMs, st2.size], [st.mtimeMs, st.size], '断ったのに fba.db を書いた');
 });
-await t('印があれば、モードを外しても起動時の backfill を流さない', async () => {
+await t('印があれば、モードを外しても起動時の backfill を流さない・凍結の印は 0 に戻る', async () => {
   modeOff();
-  await db.initDb();   // スクリプトが書いたファイルを読み直す
-  assert.deepEqual(attrsOf('Echo-5'), { amazon_sku: 'Echo-5', asin: 'B0ECHO', fnsku: null }, '移行のスクリプトが入れた');
-  assert.equal(db.getBackfillMark().key, sheetless.BACKFILL_MARK_KEY);
-  db.upsertSkuMappings([{ amazon_sku: 'Golf-7', asin: 'B0GOLF', ne_code: 'golf' }]);
-  await db.initDb();
-  assert.equal(attrsOf('Golf-7'), null);
-  assert.throws(() => db.runSkuMappingBackfillOnce(), (e) => e.code === 'FBA_BACKFILL_ALREADY_DONE');
+  await C.initDb();   // スクリプトが書いたファイルを読み直す
+  assert.deepEqual(cAttrs('Echo-5'), { amazon_sku: 'Echo-5', asin: 'B0ECHO', fnsku: null }, '移行のスクリプトが入れた');
+  assert.equal(C.getBackfillMark().key, sheetless.BACKFILL_MARK_KEY);
+  assert.equal(cliState(), '0');
+  C.upsertSkuMappings([{ amazon_sku: 'Golf-7', asin: 'B0GOLF', ne_code: 'golf' }]);
+  await C.initDb();
+  assert.equal(cAttrs('Golf-7'), null);
+  assert.throws(() => C.runSkuMappingBackfillOnce(), (e) => e.code === 'FBA_BACKFILL_ALREADY_DONE');
 });
 
 // =====================================================================================
@@ -637,7 +705,7 @@ await t('モードあり: Render の引き取りで、同じ回の RESTOCK の A
   const pull = (withSource, asin) => (u) => (u.includes('/sync/latest-planning') ? {
     ok: true, snapshot_date: '2026-09-30', rows: [{ amazon_sku: 'Alpha-1', product_name: 'A', units_sold_30d: 60 }],
     fnskus: [{ sku: 'pr_NEW001', fnsku: 'X0PULL' }], restock_rows: [{ amazon_sku: 'PR_new001', asin }], planning_latest_rows: [],
-    ...(withSource ? { fnsku_source: 'fba_sku_attrs' } : {}),
+    ...(withSource ? { fnsku_source: 'fba_sku_attrs', fnsku_ready: true } : {}),
   } : { ok: false });
   modeOn();
   miniHandler = pull(true, 'B0FROMRESTOCK');
@@ -690,22 +758,49 @@ async function otherDb(tag) {
 }
 const PROV = [{ amazon_sku: 'Alpha-1', product_name: 'A', fnsku: 'X0A', ship_qty: 12, fba_available: 0, units_sold_7d: 1, units_sold_30d: 4, warehouse_raw: 10, recommended_qty: 12, urgency_score: 1, set_components: null, asin: 'B0A', expiry_date: null }];
 
-await t('Step4 (モードあり): 計算が止まった (503) ら Amazon 仮確定は消えない / 計算できたときだけ同じ操作で消える', async () => {
+const RECALC = '/api/recommendations/recalculate?debug=1&persist=1';
+const provRows = () => db.getProvisionalItems().items.map((p) => [p.amazon_sku, p.ship_qty]);
+await t('Step4 (モードあり): POST の口。計算が止まった (503) ら Amazon 仮確定は消えない / 計算できたときだけ同じ操作で消える', async () => {
   modeOn();
   miniHandler = () => ({ ok: true, count: 0, data: {} });
   db.saveProvisionalItems(PROV);
   removePml();
   try {
-    const r = await call('GET', '/api/recommendations?debug=1&persist=1&clear_provisional=1');
+    const r = await call('POST', RECALC);
     assert.equal(r.status, 503);
-    assert.deepEqual(db.getProvisionalItems().items.map((p) => [p.amazon_sku, p.ship_qty]), [['Alpha-1', 12]], '止まった日に仮確定を消した');
+    assert.equal(r.body.provisional_cleared, false);
+    assert.deepEqual(provRows(), [['Alpha-1', 12]], '止まった日に仮確定を消した');
   } finally { publishPml(); }
-  const ok = await call('GET', '/api/recommendations?debug=1&persist=1&clear_provisional=1');
+  const ok = await call('POST', RECALC);
   assert.equal(ok.status, 200);
   assert.equal(ok.body.provisional_cleared, true);
   assert.deepEqual(db.getProvisionalItems().items, []);
+  modeOff();
 });
-await t('Step4 の画面: モードありは先に消さず clear_provisional=1 で頼む / モードなしは今までどおり DELETE → GET (同じ URL)', async () => {
+await t('Step4 (モードあり): 計算している間に仮確定が変わったら消さずに 409 (Codex PR R2 Medium 2)', async () => {
+  modeOn();
+  db.saveProvisionalItems(PROV);
+  routerMod._routerTestHooks.afterRecalcFingerprint = async () => { db.saveProvisionalItems([{ ...PROV[0], ship_qty: 30 }]); };
+  try {
+    const r = await call('POST', RECALC);
+    assert.equal(r.status, 409);
+    assert.equal(r.body.provisional_changed, true);
+    assert.match(r.body.error, /消していない/);
+    assert.deepEqual(provRows(), [['Alpha-1', 30]], '計算の間に入れた仮確定を消した');
+  } finally { routerMod._routerTestHooks.afterRecalcFingerprint = null; }
+  modeOff();
+});
+await t('Step4 (モードなし): POST の口は 400・GET に clear_provisional を付けても消さない (今までどおり GET は消さない)', async () => {
+  modeOff();
+  db.saveProvisionalItems(PROV);
+  const r = await call('POST', RECALC);
+  assert.equal(r.status, 400);
+  const g = await call('GET', '/api/recommendations?debug=1&persist=0&clear_provisional=1');
+  assert.equal(g.status, 200);
+  assert.equal('provisional_cleared' in g.body, false);
+  assert.deepEqual(provRows(), [['Alpha-1', 12]]);
+});
+await t('Step4 の画面: モードありは先に消さず POST で頼み、止まったら選んだ SKU・数量も残す / モードなしは今までどおり DELETE → GET (同じ URL)', async () => {
   const page = async () => { const r = await realFetch(base + '/'); assert.equal(r.status, 200); return r.text(); };
   /** 画面の calcRecommendations を取り出して、fetch を差し替えて 1 回押す (応答 = 計算が止まった 503) */
   const press = (html) => {
@@ -713,34 +808,39 @@ await t('Step4 の画面: モードありは先に消さず clear_provisional=1 
     const end = html.indexOf('// 推奨健全性バナー', start);
     assert.ok(start > 0 && end > start, '画面に calcRecommendations が無い');
     const calls = [], logs = [];
+    const selectedSkus = new Set(['Alpha-1']);
+    const shipQtyMap = { 'Alpha-1': 3 };
     const logEl = { dataset: /id="log" data-sheetless="1"/.test(html) ? { sheetless: '1' } : {} };
     const el = () => ({ style: {}, disabled: false, innerHTML: '', textContent: '' });
     const ctx = vm.createContext({
-      confirm: () => true, log: (m) => logs.push(m), BASE: '', selectedSkus: new Set(), shipQtyMap: {},
+      confirm: () => true, log: (m) => logs.push(m), BASE: '', selectedSkus, shipQtyMap,
       document: { getElementById: (id) => (id === 'log' ? logEl : el()) },
       fetch: async (url, opts) => { calls.push(`${(opts && opts.method) || 'GET'} ${url}`); return { json: async () => (String(url).includes('/api/recommendations') ? { error: '止まった', sheetless_blocked: true } : { success: true }) }; },
     });
     vm.runInContext(`${html.slice(start, end)}\nglobalThis.__press = calcRecommendations;`, ctx);
-    return ctx.__press().then(() => ({ calls, logs }));
+    return ctx.__press().then(() => ({ calls, logs, selected: [...selectedSkus], qty: { ...shipQtyMap } }));
   };
   modeOn();
   const on = await press(await page());
-  assert.deepEqual(on.calls, ['GET /api/recommendations?debug=1&persist=1&clear_provisional=1']);
-  assert.ok(on.logs.some((m) => /Amazon仮確定は消していません/.test(m)));
+  assert.deepEqual(on.calls, ['POST /api/recommendations/recalculate?debug=1&persist=1']);
+  assert.ok(on.logs.some((m) => /Amazon仮確定・選んだ SKU・数量は消していません/.test(m)));
+  assert.deepEqual([on.selected, on.qty], [['Alpha-1'], { 'Alpha-1': 3 }], '計算が止まったのに選んだ SKU・数量を消した');
   modeOff();
   const htmlOff = await page();
   assert.equal(htmlOff.includes('data-sheetless'), false, 'モードなしの画面に印が出ている');
   const off = await press(htmlOff);
   assert.deepEqual(off.calls, ['DELETE /api/provisional', 'GET /api/recommendations?debug=1&persist=1']);
+  assert.deepEqual([off.selected, off.qty], [[], {}], 'モードなしは今までどおり先に消す');
 });
 
 await t('miniPC は FBA_SHEETLESS_IO=1 で入出力だけ止める (別のプロセス・env は別々): Sheet 同期 410・FNSKU は attrs だけ・起動時の backfill なし・計算の読み方は今のまま', async () => {
-  const seed = async (tag) => {
+  const seed = async (tag, { mark = false } = {}) => {
     modeOff();
     const { dir, mod } = await otherDb(tag);
     await mod.initDb();
     mod.upsertSkuMappings([{ amazon_sku: 'Io-1', asin: 'B0IO1', ne_code: 'io1' }, { amazon_sku: 'Io-2', asin: 'B0IO2', ne_code: 'io2' }]);
     mod.updateFnskuBatch([{ sku: 'Io-1', fnsku: 'X0IOOLD' }]);
+    if (mark) mod.runSkuMappingBackfillOnce();
     return dir;
   };
   const child = (dir, extraEnv) => {
@@ -765,6 +865,8 @@ await t('miniPC は FBA_SHEETLESS_IO=1 で入出力だけ止める (別のプロ
       "const server = http.createServer(app); await new Promise((r) => server.listen(0, '127.0.0.1', r));",
       "const res = await fetch(`http://127.0.0.1:${server.address().port}/fba/sync-sku-mappings`, { method: 'POST' });",
       "out.syncStatus = res.status; out.syncBody = await res.json();",
+      "const pl = await (await fetch(`http://127.0.0.1:${server.address().port}/fba/sync/latest-planning?fnsku_source=attrs`)).json();",
+      "out.ready = pl.fnsku_ready; out.notReady = pl.fnsku_not_ready_reason || null; out.fnskuSource = pl.fnsku_source;",
       "server.close();",
       "console.log('@@' + JSON.stringify(out));",
       "process.exit(0);",
@@ -783,6 +885,11 @@ await t('miniPC は FBA_SHEETLESS_IO=1 で入出力だけ止める (別のプロ
   assert.deepEqual(io.attrs, [['Io-1', 'X0IONEW', 'B0IONEW']], 'attrs だけに書く・起動時の backfill (Io-2) を流さない');
   assert.deepEqual([io.source, io.mappings], ['sheet', ['Io-1', 'Io-2']], '計算の読み方は今のまま (miniPC は計算しない)');
   assert.deepEqual([io.syncStatus, io.syncBody.error], [410, 'SHEETLESS_MODE']);
+  // 移行の印が無い miniPC は fba_sku_attrs をまだ正にできない (Codex PR R2 Medium 1)
+  assert.deepEqual([io.fnskuSource, io.ready], ['fba_sku_attrs', false]);
+  assert.match(io.notReady, /一回限りの移行の印が無い/);
+  const ready = child(await seed('io-mark', { mark: true }), { FBA_SHEETLESS_IO: '1' });
+  assert.deepEqual([ready.fnskuSource, ready.ready, ready.notReady], ['fba_sku_attrs', true, null]);
   const plain = child(await seed('io-off'), {});
   assert.equal(plain.upsert, 'written');
   assert.deepEqual(plain.sheet.find((r) => r[0] === 'Io-1'), ['Io-1', 'X0IONEW'], 'IO なしの miniPC は今までどおり二重書き');
@@ -798,8 +905,13 @@ await t('古い miniPC: モードありで fnsku_source の印が無ければ、
   assert.match((await routerMod.syncLatestPlanningFromMiniPC()).fnsku_skip_reason, /fba_sku_attrs からではない/);
   miniHandler = pull({});
   assert.match((await routerMod.syncLatestPlanningFromMiniPC()).fnsku_skip_reason, /fba_sku_attrs からではない/);
-  miniHandler = pull({ fnskus: [], fnsku_source: 'fba_sku_attrs' });
+  miniHandler = pull({ fnskus: [], fnsku_source: 'fba_sku_attrs', fnsku_ready: true });
   assert.equal('fnsku_skip_reason' in (await routerMod.syncLatestPlanningFromMiniPC()), false);
+  // 移行の印が無い miniPC (fnsku_ready: false) も見送る (Codex PR R2 Medium 1)
+  miniHandler = pull({ fnskus: [{ sku: 'Alpha-1', fnsku: 'X0NOTREADY' }], fnsku_source: 'fba_sku_attrs', fnsku_ready: false, fnsku_not_ready_reason: 'miniPC の fba.db に一回限りの移行の印が無い' });
+  const nr = await routerMod.syncLatestPlanningFromMiniPC();
+  assert.match(nr.fnsku_skip_reason, /まだ正にできない.*一回限りの移行の印が無い/);
+  assert.notEqual(attrsOf('Alpha-1')?.fnsku, 'X0NOTREADY');
   modeOff();
   miniHandler = pull({ fnskus: [] });
   assert.equal('fnsku_skip_reason' in (await routerMod.syncLatestPlanningFromMiniPC()), false, 'モードなしは今までどおり');
@@ -860,6 +972,41 @@ await t('米国の画面 (モードあり): 商品管理リストが欠けたら
   } finally { publishPml(); }
   const ok = await call('GET', '/us/api/allocation');
   assert.notEqual(ok.status, 503, JSON.stringify(ok.body).slice(0, 200));
+  modeOff();
+});
+
+// =====================================================================================
+console.log('⑪ Company DB の毎晩のロード (Codex PR R2 Medium 3)');
+await t('凍結した fba.db (モードあり) では sku_mapping の値を使わない: fba_sheet_import の候補・JAN・Sheet だけの出品を作らない / 古い・空・無いでも同じ計画 / モードなしは今までどおり', async () => {
+  const { buildPlanFromRender } = await imp('apps/company-db/load/sources.mjs');
+  const NOW = new Date('2026-10-01T00:00:00Z');
+  const planOf = () => JSON.parse(JSON.stringify(buildPlanFromRender({ dataDir, now: NOW })));
+  const amazonOf = (p) => ({ listings: p.listings.filter((l) => l.mall === 'amazon'), obs: p.observations, frozen: p.sources.fba_sheet_frozen ?? null });
+  // 今の Sheet の写しに、Sheet にだけある SKU と JAN を足す
+  modeOff();
+  db.upsertSkuMappings([{ amazon_sku: 'Sheetonly-8', asin: 'B0SHEET8', jan: '4901234567894', ne_code: 'alpha', logizard_code: 'alpha' }]);
+  await db.initDb();   // 凍結の印 = 0
+  const off = amazonOf(planOf());
+  assert.equal(off.frozen, null);
+  assert.ok(JSON.stringify(off).includes('fba_sheet_import'), 'モードなしは今までどおり Sheet の候補を作る');
+  assert.ok(off.listings.some((l) => l.listingCode.toLowerCase() === 'sheetonly-8'), 'モードなしは今までどおり Sheet だけの出品を作る');
+  modeOn();
+  await db.initDb();   // 凍結の印 = 1
+  const on0 = amazonOf(planOf());
+  assert.equal(on0.frozen, true);
+  assert.equal(JSON.stringify(on0).includes('fba_sheet_import'), false, 'モードありで Sheet の値を使った');
+  assert.equal(on0.listings.some((l) => l.listingCode.toLowerCase() === 'sheetonly-8'), false, 'モードありで Sheet だけの出品を作った');
+  for (const [name, sql] of [
+    ['古い', "UPDATE sku_mapping SET asin = 'B0STALE', fnsku = 'X0STALE', jan = '4900000000000', ne_code = 'wrong'"],
+    ['空', 'DELETE FROM sku_mapping'],
+    ['無い', 'DROP TABLE sku_mapping'],
+  ]) {
+    await tick();
+    const f = new Database(dbFile);
+    try { f.exec(sql); } finally { f.close(); }
+    assert.deepEqual(amazonOf(planOf()), on0, `sku_mapping が${name}ときに計画が変わった`);
+  }
+  await db.initDb();   // 外から書いたファイルを読み直す (表を戻す)
   modeOff();
 });
 

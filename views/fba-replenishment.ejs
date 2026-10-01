@@ -953,14 +953,17 @@
       btn.innerHTML = '<span class="spinner"></span>計算中...';
       log('推奨リスト生成中...');
 
-      // ドラフトは保持（復元ボタンで戻せる）
-      selectedSkus.clear();
-      Object.keys(shipQtyMap).forEach(k => delete shipQtyMap[k]);
+      // 🚨 Sheet なしのモード (⑦-F) では先に消さない: 計算が止まった日 (503)・計算の間に仮確定が変わった日 (409) に、
+      //    仮確定・選んだ SKU・数量が消えないよう、計算できたときだけ消す (POST /api/recommendations/recalculate)。モードなしは今までどおり先に消す
+      const sheetlessSafeOrder = document.getElementById('log')?.dataset?.sheetless === '1';
+      const resetSelection = () => {
+        // ドラフトは保持（復元ボタンで戻せる）
+        selectedSkus.clear();
+        Object.keys(shipQtyMap).forEach(k => delete shipQtyMap[k]);
+      };
+      if (!sheetlessSafeOrder) resetSelection();
 
       // Amazon仮確定データをクリア (Step4クリック時の新規運用)
-      // 🚨 Sheet なしのモード (⑦-F) では先に消さない: 計算が止まった日 (503) に仮確定が消えないよう、
-      //    計算できたときだけサーバが消す (clear_provisional=1)。モードなしは今までどおり先に消す
-      const sheetlessSafeOrder = document.getElementById('log')?.dataset?.sheetless === '1';
       if (!sheetlessSafeOrder) {
         try {
           await fetch(`${BASE}/api/provisional`, { method: 'DELETE' });
@@ -971,10 +974,15 @@
       }
 
       try {
-        const res = await fetch(`${BASE}/api/recommendations?debug=1&persist=1${sheetlessSafeOrder ? '&clear_provisional=1' : ''}`);
+        const res = sheetlessSafeOrder
+          ? await fetch(`${BASE}/api/recommendations/recalculate?debug=1&persist=1`, { method: 'POST' })
+          : await fetch(`${BASE}/api/recommendations?debug=1&persist=1`);
         const d = await res.json();
-        if (d.error) { log('エラー: ' + d.error + (sheetlessSafeOrder ? ' (Amazon仮確定は消していません)' : '')); return; }
-        if (sheetlessSafeOrder && d.provisional_cleared) log('Amazon仮確定データをクリアしました');
+        if (d.error) { log('エラー: ' + d.error + (sheetlessSafeOrder ? ' (Amazon仮確定・選んだ SKU・数量は消していません)' : '')); return; }
+        if (sheetlessSafeOrder) {
+          resetSelection();
+          if (d.provisional_cleared) log('Amazon仮確定データをクリアしました');
+        }
         if (d.errors && d.errors.length) { d.errors.forEach(e => log('警告: ' + e)); }
         recData = d.items || [];
         recMeta = d;

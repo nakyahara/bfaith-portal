@@ -540,6 +540,36 @@ await ta('Sheet なしのモードで計算が止まった日 → 前の提案�
   assert.equal(sendable.some((x) => before.some((b) => b.decision_id === x.decision_id)), false, '前の日の提案がまだ送れる');
 });
 
+await ta('Sheet なしのモードの材料が欠けた日は、倉庫の写しが読めなくても (最後の回でも) 止めた印の道 = 前の提案に触らない (Codex PR R2 High 1) / 確かめが無ければ今までどおり superseded', async () => {
+  const day = (o = {}) => makeDeps({
+    freshness: FRESH({
+      restock_source_at: '2026-10-21 22:42:00', restock_source_max: '2026-10-21 22:42:00',
+      planning_source_at: '2026-10-21 22:43:00', planning_source_max: '2026-10-21 22:43:00',
+    }),
+    mirrorThrows: true,   // 写しの DB ごと読めない (商品管理リストも同じ DB = Sheet なしの材料も欠ける)
+    ...o,
+  });
+  const openRows = async () => (await q(
+    `select decision_id, status, inputs_ref from ai.decisions
+      where status = 'new' and decision_kind = 'proposal' and inputs_ref->>'generator' = $1 order by decision_id`, [GENERATOR])).rows;
+  const before = await openRows();
+  assert.ok(before.length > 0, '前提: 前の日 (10/21) の提案がある');
+  const { deps, calls } = day();
+  const r = await runDecisionAttempt({ ...deps, checkSheetless: () => 'Sheet なしのモード: 商品管理リストの snapshot (他 CH の販売) が無い・未公開・壊れている。計算しない' },
+    { nowMs: at('2026-10-22T02:40:00Z'), log: quiet });   // 11:40 = 最後の回
+  assert.equal(r.outcome, 'engine_failed');
+  assert.equal(calls.generate, 0, '止めたのに計算した');
+  assert.deepEqual(calls.ping.map((p) => p[0]), ['fail']);
+  assert.deepEqual(await openRows(), before, '前の提案を変えた');
+  assert.equal((await findSendBlock(pdb))?.business_date, '2026-10-22');
+  // 対照: 確かめが無い (モードなし) と、今までどおり倉庫の関所 → 最後の回で「決められない」= 前の提案は superseded・partial
+  const { deps: d2, calls: c2 } = day();
+  const r2 = await runDecisionAttempt(d2, { nowMs: at('2026-10-22T02:41:00Z'), log: quiet });
+  assert.equal(r2.outcome, 'gated_final');
+  assert.deepEqual(c2.ping.map((p) => p[0]), ['partial']);
+  assert.deepEqual(await openRows(), []);
+});
+
 await ta('runDecisionAttemptSafe: 接続できない → 投げずに ping fail / 同じプロセスで重ねない', async () => {
   const { deps, calls } = makeDeps();
   const r = await runDecisionAttemptSafe({ ...deps, openClient: async () => { throw new Error('ECONNREFUSED'); } }, { log: quiet });

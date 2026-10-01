@@ -22,7 +22,8 @@ const root = path.resolve(process.argv[2] || '.');
 const out = process.argv[3] || 'fba-sheetless-parity.json';
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fba-parity-'));
 process.env.DATA_DIR = dataDir;
-for (const k of ['FBA_SHEETLESS_MODE', 'RENDER', 'GOOGLE_SERVICE_ACCOUNT_KEY', 'JOBS_MONITOR_ENABLED']) delete process.env[k];
+// モードなしで比べる: Render の FBA_SHEETLESS_MODE と miniPC の FBA_SHEETLESS_IO の両方を外す (親の env に入っていても。Codex PR R2 Low 1)
+for (const k of ['FBA_SHEETLESS_MODE', 'FBA_SHEETLESS_IO', 'RENDER', 'GOOGLE_SERVICE_ACCOUNT_KEY', 'JOBS_MONITOR_ENABLED']) delete process.env[k];
 process.env.FBA_SKU_MAPPING_SOURCE = 'mirror';
 process.env.FBA_NONFBA_SOURCE = 'pml';
 const imp = (p) => import(pathToFileURL(path.join(root, p)).href);

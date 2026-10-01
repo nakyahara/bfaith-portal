@@ -129,6 +129,7 @@ async function writeJobRun(db, { startedAt, status, summary }) {
  * @param {(inbound: object, opts: object) => object} deps.generate  generateRecommendations(false, inbound, opts)
  * @param {() => object} deps.readSettings
  * @param {(status: string, note: string) => void} deps.ping
+ * @param {() => string|null} [deps.checkSheetless]  Sheet なしのモードで計算を止める理由 (db.getSheetlessCalcBlock)。無ければ止めない
  * @param {object} [o]
  * @param {() => number} [o.nowMs]
  * @param {string} [o.trigger]  cron / startup / manual (記録に残すだけ)
@@ -178,9 +179,19 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
     let rulesCompare = null;
     const decisionRules = decisionRulesOf(deps);
     let warehouseInfo = { source: 'logizard_mirror', ok: wh.ok, reasons: wh.reasons };
+    // 🚨 Sheet なしのモード (⑦-F・Codex PR R2 High 1): 倉庫の写しの関所とは別に、Sheet なしの材料を先に確かめる。
+    //    欠けていれば (倉庫の写しも読めない・古い日を含めて) 計算せずに「止めた印」の道へ = 前の提案に触らない・send_blocked・fail。
+    //    倉庫の関所だけで最後の回まで行くと、今までどおり前の提案を superseded にしてしまう。モードなし・deps に無いときは null = 今までどおり
+    let sheetlessBlock = null;
+    try { sheetlessBlock = deps.checkSheetless ? deps.checkSheetless() : null; } catch (e) {
+      sheetlessBlock = `Sheet なしのモード: 材料を確かめられない (${String(e.message).slice(0, 160)})。計算しない (Sheet には戻らない・前の結果はそのまま)`;
+    }
     if (!wh.ok) {
       extra.push({ code: 'warehouse_mirror_not_ready', detail: wh.reasons.join(' / ').slice(0, 300) });
-    } else {
+    }
+    if (sheetlessBlock) {
+      result = { items: [], data_quality: {}, errors: [sheetlessBlock], sheetless_blocked: true };
+    } else if (wh.ok) {
       // 計算が投げても「今日は計算できなかった」として記録する (前日以前の提案も無効にする)
       //   決まりの変更 v3-1 (2026-09-26): 同じ入力で v2 (画面と同じ決まり) と v3 (中原さんの方針) を両方計算し、
       //   記録するのは decisionRules (既定 v3) の提案。もう片方との差を SKU ごとに run 要約行へ残す
