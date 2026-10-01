@@ -62,7 +62,7 @@ import {
 } from './lib/set-image-plan.js';
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { importImageDbByStatus } from './services/notion-image-import.js';
-import { buildPromptTemplates, composeColorVariations } from './lib/prompt-templates.js';
+import { buildPromptTemplates, composeColorVariations, composeProductInfo } from './lib/prompt-templates.js';
 // 画像タブの商品情報の自動表示 (2026-09-13 スタッフ要望)
 import { autoProductInfoText, effectiveProductInfo } from './lib/product-info-auto.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
@@ -116,6 +116,15 @@ import {
   reserveGeneration as reserveAdKwAiGeneration, submitGenerationResult as submitAdKwAiResult, failAiJob as failAdKwAiJob, releaseAiJob as releaseAdKwAiJob,
   autoEnqueue as adKwAutoEnqueue, rerunAuto as adKwRerunAuto, collectStep as adKwCollectStep, finalizeAutoJob as adKwFinalizeAuto,
 } from './lib/ad-kw-ai.js';
+// LP 構成の AI 生成 (段階1)。正本 = AI_reference『商品ハブ_LP構成AI生成_段階1設計_20260930.md』
+import {
+  lpComposeEnabled, importSpec as importLpSpec, latestSpec as latestLpSpec, specSummary as lpSpecSummary,
+  requestJob as requestLpComposeJob, requestBlockReason as lpComposeBlockReason,
+  queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
+  reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
+  failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
+  lpComposeImageRef, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
+} from './lib/lp-compose.js';
 import { abaConfigured, lookupAbaTerms, lookupAbaTopAsins } from './lib/aba-client.js';
 import { fetchAmazonCatalog } from './lib/catalog-client.js';
 import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
@@ -3615,6 +3624,250 @@ serviceApiRouter.post('/ad-kw-ai/jobs/:id/release', (req, res) => {
   const r = releaseAdKwAiJob(getDB(), intParam(req.params.id), { leaseToken: cleanText(req.body?.lease_token, 100) });
   if (!r.ok) return adKwAiFail(res, r);
   res.json({ ok: true, status: r.status });
+});
+
+// ─── 管理: LP 仕様書の取込 (段階1・2026-10-01) ───────────────
+// スタッフが「スプレッドシート → ファイル → ダウンロード → Excel」で落とした .xlsx をそのまま上げる。
+// スプレッドシートを毎晩直接読む案は不可 (miniPC に G: も Drive 認証も無い + 編集途中を掏む。設計 §4.1)。
+// 追記専用 — 同じ中身なら版を増やさず既存を返す。変わったら新しい版になる。
+const LP_SPEC_MAX_BYTES = 5 * 1024 * 1024;
+
+/** exceljs の cell.value を素の文字列に潰す (apps/inbound-info/router.js の plainValue と同じ考え方) */
+function lpSpecCellText(v) {
+  if (v == null) return '';
+  if (typeof v === 'object') {
+    if (Array.isArray(v.richText)) return v.richText.map((t) => t.text).join('');
+    if ('result' in v) return lpSpecCellText(v.result);
+    if ('text' in v) return String(v.text);
+    if (v instanceof Date) return v.toISOString();
+    if ('formula' in v) return '=' + v.formula;
+    if ('error' in v) return '';
+    return String(v);
+  }
+  return String(v);
+}
+
+/**
+ * .xlsx を AI に渡すテキストにする。
+ * 全タブを「## タブ名」の見出し付きで TSV に並べる (タブの順をそのまま保つ)。
+ * 仕様書は 1 セルに長い文片が入るので、改行をそのまま渡す (タブを TSV の区切りにしているので 	 だけ落とす)。
+ */
+async function lpSpecWorkbookToText(buf) {
+  const ExcelJS = (await import('exceljs')).default;
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  const titles = [];
+  const parts = [];
+  for (const ws of wb.worksheets) {
+    titles.push(ws.name);
+    const lines = [];
+    ws.eachRow({ includeEmpty: false }, (row) => {
+      const vals = [];
+      row.eachCell({ includeEmpty: true }, (c) => vals.push(lpSpecCellText(c.value).replace(/\t/g, ' ')));
+      while (vals.length && vals[vals.length - 1] === '') vals.pop();
+      lines.push(vals.join('\t'));
+    });
+    parts.push(`## ${ws.name}\n${lines.join('\n')}`);
+  }
+  return { body: parts.join('\n\n'), sheetTitles: titles };
+}
+
+/**
+ * 仕様書を上げる。Content-Type: application/octet-stream で .xlsx の生バイトを送る。
+ * 種類と名前はクエリ (?kind=product_analysis&title=...)。
+ */
+router.post('/api/lp-specs',
+  express.raw({ type: 'application/octet-stream', limit: LP_SPEC_MAX_BYTES + 1024 * 1024 }),
+  async (req, res) => {
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({ ok: false, code: 'bad_request', error: '.xlsx の中身が空です' });
+    }
+    if (req.body.length > LP_SPEC_MAX_BYTES) {
+      return res.status(413).json({ ok: false, code: 'too_large', error: 'ファイルが大きすぎます (5MB まで)' });
+    }
+    let parsed;
+    try {
+      parsed = await lpSpecWorkbookToText(req.body);
+    } catch (e) {
+      console.error('[product-hub] lp-spec xlsx の読み込みに失敗:', String(e?.message || e).slice(0, 300));
+      return res.status(400).json({ ok: false, code: 'bad_xlsx', error: '.xlsx として読めません (ダウンロードし直してください)' });
+    }
+    const db = getDB();
+    const r = importLpSpec(db, {
+      kind: cleanText(req.query?.kind, 40) || 'product_analysis',
+      title: cleanText(req.query?.title, 200) || 'LP制作システム',
+      body: parsed.body, sheetTitles: parsed.sheetTitles, actor: actorOf(req),
+    });
+    if (!r.ok) {
+      const status = r.code === 'too_large' ? 413 : 400;
+      return res.status(status).json({ ok: false, code: r.code, error: r.error });
+    }
+    res.json({ ok: true, created: r.created, spec: lpSpecSummary(db, r.spec.kind) });
+  });
+
+/** いまの版 (画面に「仕様書: ○○ (YYYY-MM-DD 取込)」を出す) */
+router.get('/api/lp-specs', (req, res) => {
+  res.json({ ok: true, enabled: lpComposeEnabled(), spec: lpSpecSummary(getDB(), cleanText(req.query?.kind, 40) || 'product_analysis') });
+});
+
+// ─── 画面: LP 構成を AI に作らせる (段階1・2026-10-01) ──────────
+// 誰でも押せる (中原さん 2026-10-01。既存の定型文ボタンと同じ扱い)。
+// 押す = キューに積んで即 claim 対象にするだけ。構成に 1〜3 分かかるので画面はポーリングする。
+
+/** 依頼する。body: { idempotency_key }。二重クリック・通信リトライで job を増やさない */
+router.post('/api/drafts/:id/lp-compose', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const spec = latestLpSpec(db, 'product_analysis');
+  const { productInfo, colorVariations, images } = lpComposeMaterial(db, draft);
+  const r = requestLpComposeJob(db, {
+    draft, productInfo, colorVariations, images, spec,
+    idempotencyKey: req.body?.idempotency_key, actor: actorOf(req),
+  });
+  if (!r.ok) {
+    const status = r.code === 'disabled' ? 503 : ['already_running', 'not_ready'].includes(r.code) ? 409 : 400;
+    return res.status(status).json({ ok: false, code: r.code, error: r.error });
+  }
+  res.json({ ok: true, created: r.created, ...lpComposeStateFor(db, draft.id) });
+});
+
+/** 状況と結果。画面が 5 秒おきに叩くので軽く保つ (done のときだけ本文を返す) */
+router.get('/api/drafts/:id/lp-compose', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const spec = latestLpSpec(db, 'product_analysis');
+  const { productInfo } = lpComposeMaterial(db, draft);
+  res.json({
+    ok: true,
+    ...lpComposeStateFor(db, draft.id),
+    // 押せるか。押せない理由はそのまま画面に出す
+    blocked: lpComposeBlockReason({ draft, productInfo, spec }),
+    // 「仕様書: ○○ (YYYY-MM-DD 取込)」。古ければ人が上げ直す (設計 §4.1 のアップロード忘れ対策)
+    spec: lpSpecSummary(db, 'product_analysis'),
+  });
+});
+
+/**
+ * LP 構成の AI 生成に渡す材料を組む (段階1)。
+ * 画面の API (lpComposeRouter) と service-api の両方がこれを通る。
+ * 🚨 **定型文 (lib/prompt-templates.js) と同じ組み立てを使う** — 画面の「商品分析を準備」が
+ *    ChatGPT に渡すものと、AI に渡す packet が食い違わないようにする。
+ *    ここで独自に組み直すと、定型文の正本が 2 つになる (設計 §4.2)。
+ */
+function lpComposeMaterial(db, draft) {
+  const ip = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(draft.id) || null;
+  const autoInfo = autoProductInfoText(db, draft.id);
+  const variation = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id });
+  const rakuten = db.prepare('SELECT variant_selector_name FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
+  const selectorValues = {};
+  for (const r of db.prepare('SELECT sku_code, value FROM draft_sku_selector_values WHERE draft_id = ?').all(draft.id)) {
+    selectorValues[r.sku_code] = r.value;
+  }
+  const productInfo = composeProductInfo({
+    ...(ip || {}),
+    product_info_text: effectiveProductInfo(ip?.product_info_text, autoInfo),
+  });
+  const colorVariations = composeColorVariations({
+    variation, hasVariation: effectiveHasVariation(variation, draft),
+    selectorName: rakuten?.variant_selector_name, selectorValues,
+  });
+  // 白抜き (_00) は draft_images に入らないので、ここは TOP から順に最大 MAX_IMAGES 枚
+  const images = db.prepare(`SELECT drive_file_id, drive_modified_time FROM draft_images
+    WHERE draft_id = ? AND drive_file_id IS NOT NULL ORDER BY sort, id LIMIT ?`).all(draft.id, LP_COMPOSE_MAX_IMAGES);
+  return { productInfo, colorVariations, images };
+}
+
+// ─── LP 構成の AI 生成 (段階1・2026-10-01) ───────────────────────
+// 正本 = AI_reference『商品ハブ_LP構成AI生成_段階1設計_20260930.md』§4.3。
+// miniPC の実行役 (scripts/ph-nightly/lp-compose.mjs) が 1 分おきに叩く。
+// 🚨 lease_token / hash / prompt_version は **cleanText を通さない** — trim や切り詰めで形が
+//    変わると、lp-compose.js 側の「正規化せず形を直接見る」検査の意味が無くなる (Codex コード R3〜R6)。
+//    長さだけ先に見て、形の判定は lib に任せる。
+// lp-compose 固有の code を HTTP に対応づける (ad-kw-ai の表に無いもの)。
+// 🚨 disabled を落とすと「機能が無効」が 400 に見え、実行役が「依頼が壊れている」と誤解する
+const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, already_generated: 409, job_finalized: 409, already_running: 409 };
+const lpComposeFail = (res, r) => res.status(LP_COMPOSE_HTTP[r.code] || 400).json({ ok: false, code: r.code, error: r.error });
+const rawField = (v, maxLen) => (typeof v === 'string' && v.length <= maxLen ? v : null);
+
+serviceApiRouter.get('/lp-compose/queue', (req, res) => {
+  res.json({ ok: true, queue: lpComposeQueueSummary(getDB()) });
+});
+
+serviceApiRouter.post('/lp-compose/claim', (req, res) => {
+  const r = claimLpComposeJob(getDB(), { runnerRunId: cleanText(req.body?.runner_run_id, 80) });
+  if (!r.ok) return lpComposeFail(res, r);
+  // exhausted = 壊れた依頼が並んでいて 50 回掴めなかった (「仕事なし」と区別する)
+  res.json({ ok: true, job: r.job, exhausted: r.exhausted || undefined, error: r.error || undefined });
+});
+
+serviceApiRouter.post('/lp-compose/jobs/:id/reserve', (req, res) => {
+  const r = reserveLpComposeGeneration(getDB(), intParam(req.params.id), {
+    leaseToken: rawField(req.body?.lease_token, 100),
+    model: cleanText(req.body?.model, 80),
+    promptVersion: rawField(req.body?.prompt_version, 80),
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json({ ok: true, generation_id: r.generation_id, packet_hash: r.packet_hash });
+});
+
+serviceApiRouter.post('/lp-compose/generations/:gid/result', (req, res) => {
+  const r = submitLpComposeResult(getDB(), intParam(req.params.gid), {
+    packetHash: rawField(req.body?.packet_hash, 100),
+    verdict: cleanText(req.body?.verdict, 20),
+    output: req.body?.output,
+    lint: req.body?.lint,
+    reviewRounds: req.body?.review_rounds,
+    receipt: req.body?.receipt,
+    reason: cleanText(req.body?.reason, 1000),
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json({ ok: true, status: r.status, already: !!r.already, receipt: r.receipt });
+});
+
+serviceApiRouter.post('/lp-compose/jobs/:id/fail', (req, res) => {
+  const r = failLpComposeJob(getDB(), intParam(req.params.id), {
+    leaseToken: rawField(req.body?.lease_token, 100),
+    code: cleanText(req.body?.code, 40), message: cleanText(req.body?.message, 500),
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json({ ok: true, status: r.status });
+});
+
+serviceApiRouter.post('/lp-compose/jobs/:id/release', (req, res) => {
+  const r = releaseLpComposeJob(getDB(), intParam(req.params.id), {
+    leaseToken: rawField(req.body?.lease_token, 100), reason: cleanText(req.body?.reason, 300),
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json({ ok: true, status: r.status });
+});
+
+/**
+ * その依頼に固定した n 枚目 (1 始まり) の商品画像 (JPEG・幅 1024)。
+ * 🚨 fileId を外から受けない — packet に固定済みの images[n] だけを返す。
+ *    任意の ID を覗ける confused-deputy を作らないため (/api/thumb と同じ考え方)。
+ * 🚨 幅は 1024 固定。画面用の /api/thumb は 160/320 しか受けず、320px では AI が
+ *    ラベル文字や商品形状を判断できない (仕様書の「商品再現ルール」を守れない)。
+ *    画面用の THUMB_WIDTHS は触らない。
+ */
+serviceApiRouter.get('/lp-compose/jobs/:id/images/:n', async (req, res) => {
+  const r = lpComposeImageRef(getDB(), intParam(req.params.id), {
+    leaseToken: rawField(req.query?.lease_token, 100), index: intParam(req.params.n) - 1,
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  try {
+    const { buf } = await getDriveThumbnail(r.file_id, LP_COMPOSE_IMAGE_WIDTH, r.version || '');
+    res.set('Content-Type', 'image/jpeg');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Cache-Control', 'private, max-age=120');
+    res.send(buf);
+  } catch (e) {
+    const upstream = e?.code || e?.response?.status;
+    const status = upstream === 404 ? 404 : upstream === 403 ? 403 : 502;
+    console.error(`[product-hub] lp-compose image failed (${status}):`, r.file_id, String(e?.message || e).slice(0, 300));
+    res.status(status).json({ ok: false, code: 'image_unavailable', error: '商品画像を取得できませんでした' });
+  }
 });
 
 // 生成待ち一覧 (AI 生成の材料つき、読み取り専用 = プレビュー用)

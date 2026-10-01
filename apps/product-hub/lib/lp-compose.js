@@ -44,6 +44,9 @@ export const LEASE_MIN = 40;
 /** 測定の合格ライン (設計 §7.2)。受付時に created_at + これで deadline を固定する */
 export const MEASUREMENT_WINDOW_MIN = 3;
 export const MAX_IMAGES = 6;
+/** 実行役へ配る商品画像の幅。画面用の THUMB_WIDTHS (160/320) では AI が
+ *  ラベル文字や商品形状を判断できない (仕様書の「商品再現ルール」を守れない) */
+export const LP_COMPOSE_IMAGE_WIDTH = 1024;
 /** ⑦ の全文。V2.2 は画像 1 枚あたり 15 見出しあるので 10 枚で 8 万字程度。余裕を見る */
 export const OUTPUT_MAX = 200_000;
 export const SPEC_BODY_MAX = 500_000;
@@ -666,6 +669,29 @@ export function releaseJob(db, jobId, { leaseToken, reason = null, now = Date.no
     if (trim(reason)) logEvent(db, l.job.draft_id, 'lp_compose_released', `依頼 ${l.job.id}: ${trim(reason, 200)}`, 'ph-lp-compose');
     return { ok: true, status: 'queued' };
   }).immediate();
+}
+
+/**
+ * 実行役へ渡す商品画像の 1 枚を指す。**fileId を外から受けない** —
+ * その job の packet に固定済みの images[index] だけを返す (設計 §4.3)。
+ * lease が有効な間だけ。`version` は packet に固定した Drive の更新日時
+ * (キャッシュのキーに使う。事前照合は段階2 で入れる — 設計 §4.2)。
+ * @returns {{ok:true, file_id:string, version:string|null}|{code:string, error:string}}
+ */
+export function lpComposeImageRef(db, jobId, { leaseToken, index, now = Date.now() } = {}) {
+  const nowS = new Date(now).toISOString();
+  const l = liveLease(db, jobId, leaseToken, nowS);
+  if (l.code) return l;
+  const i = Number(index);
+  if (!Number.isInteger(i) || i < 0 || i >= MAX_IMAGES) {
+    return { code: 'bad_request', error: `画像の番号は 1〜${MAX_IMAGES} です` };
+  }
+  let images;
+  try { images = JSON.parse(l.job.packet_json).images || []; }
+  catch { return { code: 'bad_request', error: '材料を読めませんでした' }; }
+  const im = images[i];
+  if (!im?.file_id) return { code: 'not_found', error: 'その番号の商品画像はありません' };
+  return { ok: true, file_id: im.file_id, version: im.modified_time || null };
 }
 
 // ─── 画面 ────────────────────────────────────────────────
