@@ -52,16 +52,20 @@
 --   7. マスタの書き込みの鍵 core.master_write_lock_key() = 4705310050 (0036 の親子の鍵 4705310036 と同じ作り。#1563 仮レビュー M3):
 --      夜間ロード (apps/company-db/load/engine.mjs) は取引の冒頭 (親子の鍵より前) に排他で取る。この画面の保存・構成の依頼の昇格は段階の共有の鍵の後に共有で取る
 --      (短く待つ = lib/master-write.mjs の MASTER_WRITE_WAIT。待ちきれなければ 409「夜間の取り込み中」)。夜間ロードの長い取引と保存が行の鍵で待ち合う (デッドロック) のを防ぐ
---   8. 画面のロール master_edit の書き込みの約束 (#1563 R3 M2。列の権限だけでは、段階・持ち主・記録の誰が を飛ばして直接書けた):
+--   8. 画面のロール master_edit の書き込みの約束 (#1563 R3 M2・R4 M2・R5 M1〜M3。列の権限だけでは、段階・持ち主・記録の誰が を飛ばして直接書けた):
 --      ・ops.begin_master_write(request_id, actor_id, reason, 持ち主表, 操作, SKU, 編集の印, 保存の中身のハッシュ, 版) = security definer。
---        段階が new_open・持ち主表のハッシュが段階の記録と同じ・操作 (今は sku_edit) が分かるときだけ、書いてよい行 (直す SKU + 含むセット・その商品) を DB が決めて鍵を取り、
---        版 (ops.master_edit_versions = 編集の印が見ている行の version) が呼び手の言う版と同じか確かめ (#1563 R4 M2 = 編集の印を DB でも確かめる)、
---        今の取引の番号 (txid_current()) の約束の行を ops.master_write_sessions に書く (画面のロールはこの表を書けない)
+--        段階が new_open・持ち主表のハッシュが段階の記録と同じ・操作 (今は sku_edit) が分かる・SKU が単品かセット・request_id がまだ使われていないときだけ、
+--        書いてよい行 (直す SKU・単品なら含むセット (導く値だけ)・直す SKU の商品) を DB が決めて鍵を取り、
+--        版 (ops.master_edit_versions = 編集の印が見ている行の version) が呼び手の言う版と同じか確かめ (= 編集の印を DB でも確かめる)、約束の行を ops.master_write_sessions に書く
+--        (画面のロールはこの表を読み書きできない)。約束の鍵 = 取引の番号 + begin が作る乱数 (取引の中だけの設定 ops.master_write_session・復元した古い行では通らない)
 --      ・画面のロールが書ける表 (core.skus・products・supplier_skus・sku_costs・ops.sku_component_requests・sku_component_breaches・master_edit_requests の done) の
---        BEFORE の trigger: 呼び手が master_edit なら、約束が無い・段階が new_open でない・約束の操作で書けない・約束の相手でない行・触った列の持ち主が company でない = 42501。
+--        BEFORE の trigger: 呼び手が master_edit なら、約束が無い・段階が new_open でない・約束の操作で書けない・約束の相手でない行・含むセットの導く値でない列・
+--        業務の約束 (代表の仕入先は取引中・構成の依頼の構成品はある単品・親子は輪にしない) を破る・触った列の持ち主が company でない = 42501。
 --        保存の記録の done は約束と同じ request_id・人・SKU・操作・保存の中身のハッシュだけ
---      🚨 DB は人を確かめられない: actor_id はアプリ (ログイン・名簿 MASTER_EDITORS) が言う値。DB が守るのは「約束どおりの相手・操作・版・持ち主・段階」と db_user の記録まで
---      ・変更の記録 (core.audit_master_change) は、呼び手が master_edit なら誰が・request_id・理由をその行から取る (core.actor_* の設定は使わない = 偽れない)
+--      ・約束した取引は commit のときに同じ取引の done がちょうど 1 つ要る (deferred の trigger。done を書かずに書いて commit = 取引ごと拒む)
+--      ・構成の依頼の rows・base_rows の形は表の CHECK (ops.component_request_rows_ok = sku_id・qty 1〜99,999・sort 1〜N・重ならない)
+--      🚨 DB は人を確かめられない: actor_id はアプリ (ログイン・名簿 MASTER_EDITORS) が言う値。DB が守るのは「約束どおりの相手・操作・版・持ち主・段階・業務の約束」と db_user の記録まで
+--      ・変更の記録 (core.audit_master_change) は、呼び手が master_edit なら誰が・request_id・理由を約束の行から取る (core.actor_* の設定は使わない = 偽れない)
 -- 🚨 この migration は商品の値を何も変えない (列は全部 null で足す・切替の段階は legacy_open から・0026 の関数は同じ記録を書く)
 
 -- 1. 切替の段階と門
@@ -461,13 +465,37 @@ create index ix_ne_set_observations_set on ops.ne_set_observations (set_sku_id, 
 select core.make_append_only('ops', 'ne_set_observations');
 comment on table ops.ne_set_observations is 'NE のセットの構成の観測 (0050)。書くのは ops.record_ne_set_observations (観測のロール master_observer だけ)。追記だけ';
 
+-- 構成の行の形 (依頼の rows・base_rows。#1563 R5 M1): 配列・p_min〜p_max 行・各行 = { sku_id (整数), qty (1〜99,999 の整数), sort (整数), code (文字・あってもよい) } だけ・
+-- sku_id は重ならない・sort は 1〜行の数。順に確かめる (整数と分かってから数として比べる)。表の CHECK で使う = どの書き手も
+create function ops.component_request_rows_ok(p jsonb, p_min integer, p_max integer) returns boolean language plpgsql immutable set search_path = pg_catalog, pg_temp as $$
+declare
+  v_n integer;
+begin
+  if p is null or jsonb_typeof(p) <> 'array' then return false; end if;
+  v_n := jsonb_array_length(p);
+  if v_n < p_min or v_n > p_max then return false; end if;
+  if v_n = 0 then return true; end if;
+  if exists (select 1 from jsonb_array_elements(p) e where jsonb_typeof(e) <> 'object') then return false; end if;
+  if exists (select 1 from jsonb_array_elements(p) e
+              where exists (select 1 from jsonb_object_keys(e) k where k not in ('sku_id', 'qty', 'sort', 'code'))
+                 or jsonb_typeof(e -> 'sku_id') is distinct from 'number' or (e ->> 'sku_id') !~ '^[0-9]{1,18}$'
+                 or jsonb_typeof(e -> 'qty') is distinct from 'number' or (e ->> 'qty') !~ '^[0-9]{1,5}$'
+                 or jsonb_typeof(e -> 'sort') is distinct from 'number' or (e ->> 'sort') !~ '^[0-9]{1,4}$'
+                 or (e ? 'code' and (jsonb_typeof(e -> 'code') <> 'string' or length(e ->> 'code') not between 1 and 60))) then
+    return false;
+  end if;
+  return coalesce((select min((e ->> 'qty')::integer) >= 1 and count(distinct (e ->> 'sku_id')::bigint) = v_n
+            and count(distinct (e ->> 'sort')::integer) = v_n and coalesce(min((e ->> 'sort')::integer), 1) = 1 and coalesce(max((e ->> 'sort')::integer), 0) = v_n
+            from jsonb_array_elements(p) e), false);
+end $$;
+
 create table ops.sku_component_requests (
   component_request_id bigint generated always as identity primary key,
   company_id      smallint not null default 1 references core.companies,
   set_sku_id      bigint not null references core.skus (sku_id),
-  rows            jsonb not null check (jsonb_typeof(rows) = 'array' and jsonb_array_length(rows) between 1 and 20),   -- [{sku_id, code, qty, sort}] sort = 1〜n
+  rows            jsonb not null check (ops.component_request_rows_ok(rows, 1, 20)),   -- [{sku_id, code, qty, sort}] sort = 1〜n (形は R5 M1)
   rows_hash       text not null check (rows_hash ~ '^[0-9a-f]{64}$'),
-  base_rows       jsonb not null check (jsonb_typeof(base_rows) = 'array'),   -- 依頼したときの core.sku_components [{sku_id, code, qty, sort}]
+  base_rows       jsonb not null check (ops.component_request_rows_ok(base_rows, 0, 100)),   -- 依頼したときの core.sku_components [{sku_id, code, qty, sort}]
   reason          text check (reason is null or length(reason) <= 200),
   requested_by    text not null check (length(requested_by) > 0),
   edit_request_id uuid not null,   -- ops.master_edit_requests の request_id (同じ取引の最後に書くので FK は付けない)
@@ -725,7 +753,7 @@ begin
   -- 画面のロールの書き込みは、誰が・request_id・理由を ops.begin_master_write の行から取る (core.actor_* の設定は使わない = 偽れない。#1563 R3 M2)
   if v_db_user = 'master_edit' then
     select s.request_id::text, s.actor_id, s.reason, s.source_system into v_req, v_actor_id, v_reason, v_source
-      from ops.master_write_sessions s where s.txid = pg_catalog.txid_current();
+      from ops.current_master_write_session() s where s.session_id is not null;   -- 約束 = 設定の乱数 + 今の取引の番号 (R5 M3)
     if not found then raise exception 'master_write_session_required: 画面のロールの書き込みは ops.begin_master_write の後だけ' using errcode = '42501'; end if;
     v_actor_t := 'human';
     v_run := null;
@@ -796,19 +824,28 @@ revoke all on function core.lock_suppliers_for_share(bigint[]) from public;
 -- 7. マスタの書き込みの鍵 (上の 7.)。夜間ロードは排他・この画面の保存と構成の依頼の昇格は共有。数は 0036 の core.parent_lock_key() と重ならない固定の数
 create function core.master_write_lock_key() returns bigint language sql immutable as $$ select 4705310050::bigint $$;
 
--- 8. 画面のロール master_edit の書き込みの約束 (上の 8.・#1563 R3 M2・R4 M2)
---    1 回の保存 = 1 つの「書き込みの約束」(ops.master_write_sessions の 1 行・取引ごと)。約束は 直す SKU・操作・画面が読んだ編集の印・保存の中身のハッシュ・
---    DB で確かめた版 に結びつく。画面のロールはその約束の SKU (と DB が決めた関わる行) にだけ・その操作の書き方でだけ書ける
+-- 8. 画面のロール master_edit の書き込みの約束 (上の 8.・#1563 R3 M2・R4 M2・R5 M1〜M3)
+--    1 回の保存 = 1 つの「書き込みの約束」(ops.master_write_sessions の 1 行)。約束は 直す SKU・操作・画面が読んだ編集の印・保存の中身のハッシュ・
+--    DB で確かめた版 に結びつく。画面のロールは、直す SKU (と、単品なら含むセットの導く値だけ) に・その操作の書き方でだけ書ける
+--    約束の鍵 = 取引の番号 (txid) + begin が作る乱数 (session_id)。begin は乱数を取引の中だけの設定 ops.master_write_session に置く。
+--      guard と変更の記録は「設定の乱数 + 今の取引の番号」が一致する行だけを約束とみなす (乱数は begin だけが書き、画面のロールは表を読めない)。
+--      = 復元で前の DB の約束の行が入り、新しい DB の取引の番号がそれに追いついても、begin していない書き込みは通らない・begin も止まらない (#1563 R5 M3)
+--    約束した取引は、commit のときに同じ取引で書いた保存の記録 done (同じ request_id・人・SKU・操作・保存の中身のハッシュ) がちょうど 1 つ要る (deferred の trigger・R5 M2)
 --    🚨 DB は人を確かめられない: actor_id は画面 (アプリ) が言う値。DB が残すのは db_user (= master_edit) と、約束の中身。人の確かめはアプリのログイン (名簿 MASTER_EDITORS)
+--    🚨 バックアップ (apps/company-db/backup/dump.mjs) はこの表も取る・戻す (記録として残す)。戻した行は乱数が一致しないので、約束としては使えない
+--    ⑤-2a (新商品の登録) へ: まだ無い SKU の登録は、この約束 (既にある SKU を直す sku_edit) を広げないで、登録だけの security definer の関数にする
+--      (番号を振る → 行を入れる → 保存の記録 done を、関数の中の 1 か所で)。広げるなら直す所 = 約束の形 (まだ無い SKU = sku_id が無い)・
+--      入れた行を約束の相手に結ぶ・入れる列の持ち主のキー・画面のロールの列の INSERT の権限と identity の採番・done を作った SKU に結ぶ
 create table ops.master_write_sessions (
-  txid               bigint primary key,   -- txid_current() = 書き込みを始めた取引
+  session_id         uuid primary key,     -- begin が作る乱数 (取引の中だけの設定 ops.master_write_session と同じ)
+  txid               bigint not null,      -- txid_current() = 書き込みを始めた取引
   request_id         uuid not null,
-  operation          text not null check (operation in ('sku_edit')),   -- ⑤-2a などが操作を足すときは、この CHECK・begin・guard の操作の表を一緒に変える
-  sku_id             bigint not null references core.skus (sku_id),   -- 直す SKU (保存の相手)
-  target_sku_ids     bigint[] not null,    -- 書いてよい SKU = 直す SKU + (単品なら) それを含むセット (DB が決める)
+  operation          text not null check (operation in ('sku_edit')),   -- 操作を足すときは、この CHECK・begin・ops.master_write_allowed・guard を一緒に変える
+  sku_id             bigint not null references core.skus (sku_id),   -- 直す SKU (保存の相手。単品かセット)
+  derived_sku_ids    bigint[] not null,    -- 導く値だけ書いてよい SKU = 直す単品を含むセット (DB が決める)。税率・税区分・取扱区分と、計算の原価の行だけ
   target_product_ids bigint[] not null,    -- 書いてよい商品 = 直す SKU の商品 (DB が決める)
   edit_token         text not null check (edit_token ~ '^[0-9a-f]{64}$'),     -- 画面が読んだ編集の印 (記録)
-  payload_hash       text not null check (payload_hash ~ '^[0-9a-f]{64}$'),   -- 保存の中身のハッシュ = 保存の記録 (done) と同じでないと書けない
+  payload_hash       text not null check (payload_hash ~ '^[0-9a-f]{64}$'),   -- 保存の中身のハッシュ = 保存の記録 (done) と同じでないと commit できない
   versions           jsonb not null check (jsonb_typeof(versions) = 'object'),   -- DB で確かめた版 (ops.master_edit_versions)
   actor_id           text not null check (length(actor_id) between 1 and 320),  -- 🚨 アプリが言う人 (DB では確かめられない)
   reason             text check (reason is null or length(reason) <= 200),
@@ -819,8 +856,22 @@ create table ops.master_write_sessions (
   ownership          jsonb not null check (jsonb_typeof(ownership) = 'object'),
   created_at         timestamptz not null default clock_timestamp()
 );
+create index ix_master_write_sessions_txid on ops.master_write_sessions (txid);
 select core.make_append_only('ops', 'master_write_sessions');
-comment on table ops.master_write_sessions is '画面のロールの書き込みの約束 (0050・#1563 R3 M2・R4 M2)。書くのは ops.begin_master_write だけ。guard と変更の記録がこの行を見る。actor_id はアプリが言う値';
+comment on table ops.master_write_sessions is '画面のロールの書き込みの約束 (0050・#1563 R3〜R5)。書くのは ops.begin_master_write だけ。約束の鍵 = txid + session_id (乱数)。actor_id はアプリが言う値';
+
+-- 今の取引の約束 (設定の乱数 + 今の取引の番号が一致する行)。無ければ null。security definer の関数 (begin・guard・変更の記録) の中で使う
+create function ops.current_master_write_session() returns ops.master_write_sessions
+  language plpgsql stable set search_path = pg_catalog, ops, pg_temp as $$
+declare
+  v_id text := nullif(pg_catalog.current_setting('ops.master_write_session', true), '');
+  v    ops.master_write_sessions;
+begin
+  if v_id is null or v_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then return null; end if;
+  select * into v from ops.master_write_sessions s where s.session_id = v_id::uuid and s.txid = pg_catalog.txid_current();
+  return v;   -- 見つからなければ全部の列が null の行
+end $$;
+revoke all on function ops.current_master_write_session() from public;
 
 -- 持ち主表のハッシュ (lib/master-cutover.mjs の ownershipHash と同じ = キーの順に [キー, 値] の配列を JSON にした sha256)
 create function ops.ownership_hash(p jsonb) returns text language sql immutable set search_path = pg_catalog, pg_temp as $$
@@ -857,9 +908,9 @@ create function ops.master_edit_versions(p_sku_id bigint) returns jsonb language
 $$;
 
 -- 画面の保存を始める (同じ取引で、画面のロールが書く前に 1 回)。保存の流れでは、行の鍵を取り編集の印を確かめた後に呼ぶ (lib/master-write.mjs)。
---   段階が new_open・持ち主表 (呼び手が動かしている表) のハッシュが段階の記録と同じ・操作が分かる・SKU がある、を確かめ、
---   書いてよい行 (直す SKU + 含むセット・その商品) を DB が決めて鍵を取り (商品 → SKU の順)、その上で版 (ops.master_edit_versions) が呼び手の言う版と同じか確かめる
---   (編集の印を DB でも確かめる = 画面が読んだ後に変わっていれば 409)。それから今の取引の約束の行を書く
+--   段階が new_open・持ち主表 (呼び手が動かしている表) のハッシュが段階の記録と同じ・操作が分かる・SKU が単品かセット・request_id がまだ使われていない、を確かめ、
+--   書いてよい行 (直す SKU・含むセット (導く値だけ)・直す SKU の商品) を DB が決めて鍵を取り (商品 → SKU の順)、その上で版 (ops.master_edit_versions) が
+--   呼び手の言う版と同じか確かめる (編集の印を DB でも確かめる = 画面が読んだ後に変わっていれば 409)。それから約束の行を書き、乱数を取引の中だけの設定に置く
 -- 🚨 security definer (画面のロールに ops.master_write_sessions の書き込みを渡さない)。一時の表を使わない・search_path の最後に pg_temp
 create function ops.begin_master_write(p_request_id uuid, p_actor_id text, p_reason text, p_ownership jsonb,
                                        p_operation text, p_sku_id bigint, p_edit_token text, p_payload_hash text, p_versions jsonb) returns jsonb
@@ -872,9 +923,11 @@ declare
   v_tx       bigint := pg_catalog.txid_current();
   v_kind     text;
   v_product  bigint;
-  v_skus     bigint[];
+  v_derived  bigint[];
   v_products bigint[];
   v_now      jsonb;
+  v_sess     ops.master_write_sessions;
+  v_id       uuid := gen_random_uuid();
 begin
   perform pg_advisory_xact_lock_shared(hashtext('ops.master_cutover'));      -- 段階を変える取引と並ぶ (画面は先に取っている = 同じ鍵)
   perform pg_advisory_xact_lock_shared(core.master_write_lock_key());         -- 夜間ロードと並ぶ (画面は先に取っている = 同じ鍵)
@@ -898,32 +951,54 @@ begin
     raise exception 'invalid_input: 編集の印・保存の中身のハッシュ (64 桁の 16 進) が要る' using errcode = '22023';
   end if;
   if p_versions is null or jsonb_typeof(p_versions) <> 'object' then raise exception 'invalid_input: 版 (versions) が要る' using errcode = '22023'; end if;
-  if exists (select 1 from ops.master_write_sessions where txid = v_tx) then
+  v_sess := ops.current_master_write_session();
+  if v_sess.session_id is not null then
     raise exception 'master_write_session_exists: この取引ではもう書き込みを始めている' using errcode = '55000';
+  end if;
+  if exists (select 1 from ops.master_edit_requests r where r.request_id = p_request_id) then
+    raise exception 'invalid_input: request_id % はもう使われている (保存の記録がある)', p_request_id using errcode = '22023';
   end if;
   select k.sku_kind, k.product_id into v_kind, v_product from core.skus k where k.sku_id = p_sku_id;
   if not found then raise exception 'invalid_input: SKU % が無い', p_sku_id using errcode = '22023'; end if;
-  -- 書いてよい行 = 直す SKU + (単品など) それを含むセット・直す SKU の商品 (DB が決める。呼び手の言う相手は使わない)
-  select array_agg(x order by x) into v_skus from (
-    select p_sku_id as x
-    union select c.parent_sku_id from core.sku_components c where c.child_sku_id = p_sku_id and v_kind <> 'set') t;
+  if v_kind not in ('single', 'set') then raise exception 'invalid_input: 例外の SKU (%) はこの操作で直せない', v_kind using errcode = '22023'; end if;
+  -- 書いてよい行 = 直す SKU・(単品なら) それを含むセット (導く値だけ)・直す SKU の商品 (DB が決める。呼び手の言う相手は使わない)
+  select coalesce(array_agg(c.parent_sku_id order by c.parent_sku_id), '{}') into v_derived
+    from core.sku_components c where c.child_sku_id = p_sku_id and v_kind = 'single';
   v_products := case when v_product is null then '{}'::bigint[] else array[v_product] end;
   -- 行の鍵 (商品 → SKU の順 = 保存の流れと同じ。保存は先に取っている = 同じ鍵)。鍵の後に版を確かめる = 確かめた後に変わらない
   perform 1 from core.products where product_id = any(v_products) order by product_id for update;
-  perform 1 from core.skus where sku_id = any(v_skus) order by sku_id for update;
+  perform 1 from core.skus where sku_id = any(array_append(v_derived, p_sku_id)) order by sku_id for update;
   v_now := ops.master_edit_versions(p_sku_id);
   if p_versions is distinct from v_now then
     raise exception 'version_conflict: 画面を開いた後にこの商品 (または構成品・仕入先・含むセット・構成の依頼) が変わった (DB の版と違う)' using errcode = 'P0001';
   end if;
-  insert into ops.master_write_sessions (txid, request_id, operation, sku_id, target_sku_ids, target_product_ids, edit_token, payload_hash, versions,
+  insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions,
                                          actor_id, reason, source_system, db_user, phase, owner_hash, ownership)
-    values (v_tx, p_request_id, p_operation, p_sku_id, v_skus, v_products, p_edit_token, p_payload_hash, v_now,
+    values (v_id, v_tx, p_request_id, p_operation, p_sku_id, v_derived, v_products, p_edit_token, p_payload_hash, v_now,
             p_actor_id, nullif(p_reason, ''), 'portal_master_edit', v_db_user, v_phase, v_hash, p_ownership);
-  return jsonb_build_object('txid', v_tx, 'phase', v_phase, 'target_sku_ids', to_jsonb(v_skus), 'target_product_ids', to_jsonb(v_products));
+  perform pg_catalog.set_config('ops.master_write_session', v_id::text, true);   -- 取引の中だけ (commit / rollback で消える)
+  return jsonb_build_object('txid', v_tx, 'phase', v_phase, 'sku_id', p_sku_id, 'derived_sku_ids', to_jsonb(v_derived), 'target_product_ids', to_jsonb(v_products));
 end $$;
 revoke all on function ops.begin_master_write(uuid, text, text, jsonb, text, bigint, text, text, jsonb) from public;
 
--- 画面のロールが触った列 → 持ち主表のキー (lib/master-write.mjs の SINGLE_FIELDS / SET_FIELDS と同じ。⑤-2a の新しい行の INSERT も = 値のある列)
+-- 約束した取引は、commit のときに同じ取引で書いた保存の記録 done (同じ request_id・人・SKU・操作・保存の中身のハッシュ) がちょうど 1 つ要る (#1563 R5 M2)。
+--   保存の流れ: 変わる項目が無い保存も done (no_change) を書く / 失敗した保存は取引ごと巻き戻る (約束も消える) = failed は約束なしの別の取引で書く
+--   = 約束して書いて (または何も書かずに) done を書かずに commit する取引は、commit で取引ごと拒む
+create function ops.check_master_write_session_done() returns trigger
+  language plpgsql security definer set search_path = pg_catalog, ops, pg_temp as $$
+begin
+  if (select count(*) from ops.master_edit_requests r
+       where r.request_id = new.request_id and r.status = 'done' and r.actor_id = new.actor_id and r.sku_id = new.sku_id
+         and r.operation = new.operation and r.payload_hash = new.payload_hash
+         and r.xmin::text = (new.txid % 4294967296)::text) <> 1 then   -- 同じ取引で書いた done (前からある記録は数えない)
+    raise exception 'master_write_session_unfinished: 約束した取引 (request_id %) は、同じ取引で約束どおりの保存の記録 done を書かないと commit できない', new.request_id using errcode = '42501';
+  end if;
+  return null;
+end $$;
+create constraint trigger trg_master_write_session_done after insert on ops.master_write_sessions
+  deferrable initially deferred for each row execute function ops.check_master_write_session_done();
+
+-- 画面のロールが触った列 → 持ち主表のキー (lib/master-write.mjs の SINGLE_FIELDS / SET_FIELDS と同じ)
 create function ops.master_edit_owner_keys(p_table text, p_op text, p_old jsonb, p_new jsonb) returns text[]
   language sql immutable set search_path = pg_catalog, pg_temp as $$
   select coalesce(array_agg(distinct m.k order by m.k), '{}')
@@ -954,11 +1029,16 @@ create function ops.master_write_allowed(p_operation text, p_table text, p_op te
     where m.op = p_operation and m.tbl = p_table and m.act = p_op)
 $$;
 
+-- 含むセット (導く値の計算し直しだけ) で変えてよい列 (lib/master-write.mjs の recomputeSet = 税率・税区分・取扱区分。原価は sku_costs の行)
+create function ops.master_write_derived_columns() returns text[] language sql immutable as $$ select array['tax_rate', 'tax_class', 'handling']::text[] $$;
+
 -- 画面のロールが書く表の BEFORE の守り。呼び手 (SET ROLE の役 か ログインした役) が master_edit のときだけ見る (夜間ロード・昇格・ほかの書き手は今までどおり)
---   ・同じ取引に約束 (ops.begin_master_write の行) が無い = 42501 (保存の記録の failed だけは無くてよい = 切替前の 409 も残す)
+--   ・今の取引の約束 (設定の乱数 + 取引の番号) が無い = 42501 (保存の記録の failed だけは無くてよい = 切替前の 409 も残す)
 --   ・保存の記録の done = 約束と同じ request_id・人・SKU・操作・保存の中身のハッシュだけ
---   ・段階が new_open でない・約束の操作で書けない (表・書き方)・約束の相手でない行 (SKU・商品・SKU の仕入先・原価・セットの依頼と食い違い)・
---     触った列の持ち主が company でない (始めたときの持ち主表で) = 42501
+--   ・段階が new_open でない・約束の操作で書けない (表・書き方)・約束の相手でない行 = 42501
+--   ・含むセット (導く値だけ) = 税率・税区分・取扱区分の列だけ・原価は計算の行 (set_calc) を入れる / 人が決めた行 (manual・override_zero) は触らない
+--   ・業務の約束 (#1563 R5 M1): 代表の仕入先は取引中のもの・構成の依頼の構成品は単品 (セット自身でない)・親子は輪にしない
+--   ・触った列の持ち主が company でない (始めたときの持ち主表で) = 42501
 -- 🚨 security definer (画面のロールに ops.master_write_sessions を読ませない)。security definer の関数 (0026 の version の付け替え) の中の書き込みも呼び手は master_edit = 同じ約束で見る
 create function ops.guard_master_edit_write() returns trigger
   language plpgsql security definer set search_path = pg_catalog, ops, core, pg_temp as $$
@@ -967,19 +1047,21 @@ declare
   v_tbl     text := tg_table_schema || '.' || tg_table_name;
   v_old     jsonb;
   v_new     jsonb;
-  v_sess    ops.master_write_sessions%rowtype;
-  v_has     boolean;
-  v_ok      boolean;
+  v_sess    ops.master_write_sessions;
+  v_sku     bigint;
+  v_role    text;   -- 'edited' (直す SKU) / 'derived' (含むセット) / null (相手でない)
+  v_bad     text;
+  v_loop    boolean;
+  v_depth   integer;
   k         text;
 begin
   if v_db_user is distinct from 'master_edit' then return case when tg_op = 'DELETE' then old else new end; end if;
   if tg_op in ('UPDATE', 'DELETE') then v_old := to_jsonb(old); end if;
   if tg_op in ('INSERT', 'UPDATE') then v_new := to_jsonb(new); end if;
-  select * into v_sess from ops.master_write_sessions where txid = pg_catalog.txid_current();
-  v_has := found;
+  v_sess := ops.current_master_write_session();
   if v_tbl = 'ops.master_edit_requests' then
     if tg_op = 'INSERT' and (v_new ->> 'status') = 'failed' then return new; end if;
-    if not v_has then
+    if v_sess.session_id is null then
       raise exception 'master_write_session_required: 保存の記録 (done) は、同じ取引で ops.begin_master_write をした後だけ' using errcode = '42501';
     end if;
     if tg_op <> 'INSERT' or (v_new ->> 'request_id')::uuid is distinct from v_sess.request_id or (v_new ->> 'actor_id') is distinct from v_sess.actor_id
@@ -989,7 +1071,7 @@ begin
     end if;
     return new;
   end if;
-  if not v_has then
+  if v_sess.session_id is null then
     raise exception 'master_write_session_required: 画面のロールの書き込み (%) は、同じ取引で ops.begin_master_write を呼んだ後だけ', v_tbl using errcode = '42501';
   end if;
   if (select phase from ops.master_cutover_state where id = 1) is distinct from 'new_open' then
@@ -998,17 +1080,58 @@ begin
   if not ops.master_write_allowed(v_sess.operation, v_tbl, tg_op) then
     raise exception 'master_write_operation: 約束の操作 % では % に % できない', v_sess.operation, v_tbl, tg_op using errcode = '42501';
   end if;
-  -- 約束の相手の行か (変える前と後の両方)
-  v_ok := case v_tbl
-    when 'core.skus' then (v_old is null or (v_old ->> 'sku_id')::bigint = any(v_sess.target_sku_ids)) and (v_new is null or (v_new ->> 'sku_id')::bigint = any(v_sess.target_sku_ids))
-    when 'core.sku_costs' then (v_old is null or (v_old ->> 'sku_id')::bigint = any(v_sess.target_sku_ids)) and (v_new is null or (v_new ->> 'sku_id')::bigint = any(v_sess.target_sku_ids))
-    when 'core.products' then (v_old is null or (v_old ->> 'product_id')::bigint = any(v_sess.target_product_ids)) and (v_new is null or (v_new ->> 'product_id')::bigint = any(v_sess.target_product_ids))
-    when 'core.supplier_skus' then (v_old is null or (v_old ->> 'sku_id')::bigint = v_sess.sku_id) and (v_new is null or (v_new ->> 'sku_id')::bigint = v_sess.sku_id)
-    when 'ops.sku_component_requests' then (v_old is null or (v_old ->> 'set_sku_id')::bigint = v_sess.sku_id) and (v_new is null or (v_new ->> 'set_sku_id')::bigint = v_sess.sku_id)
-    when 'ops.sku_component_breaches' then (v_old is null or (v_old ->> 'set_sku_id')::bigint = v_sess.sku_id) and (v_new is null or (v_new ->> 'set_sku_id')::bigint = v_sess.sku_id)
-    else false end;
-  if not v_ok then
+  -- 約束の相手の行か (変える前と後の両方)。SKU と原価は 直す SKU / 含むセット を分ける
+  if v_tbl in ('core.skus', 'core.sku_costs') then
+    if v_old is not null and v_new is not null and (v_old ->> 'sku_id') is distinct from (v_new ->> 'sku_id') then v_role := null;
+    else
+      v_sku := coalesce(v_new ->> 'sku_id', v_old ->> 'sku_id')::bigint;
+      v_role := case when v_sku = v_sess.sku_id then 'edited' when v_sku = any(v_sess.derived_sku_ids) then 'derived' end;
+    end if;
+  elsif v_tbl = 'core.products' then
+    v_role := case when (v_old is null or (v_old ->> 'product_id')::bigint = any(v_sess.target_product_ids))
+                    and (v_new is null or (v_new ->> 'product_id')::bigint = any(v_sess.target_product_ids)) then 'edited' end;
+  elsif v_tbl = 'core.supplier_skus' then
+    v_role := case when (v_old is null or (v_old ->> 'sku_id')::bigint = v_sess.sku_id) and (v_new is null or (v_new ->> 'sku_id')::bigint = v_sess.sku_id) then 'edited' end;
+  elsif v_tbl in ('ops.sku_component_requests', 'ops.sku_component_breaches') then
+    v_role := case when (v_old is null or (v_old ->> 'set_sku_id')::bigint = v_sess.sku_id) and (v_new is null or (v_new ->> 'set_sku_id')::bigint = v_sess.sku_id) then 'edited' end;
+  end if;
+  if v_role is null then
     raise exception 'master_write_target: 約束の相手 (SKU %) の行でない (%)', v_sess.sku_id, v_tbl using errcode = '42501';
+  end if;
+  -- 含むセット = 導く値の計算し直しだけ
+  if v_role = 'derived' then
+    if v_tbl = 'core.skus' then
+      select string_agg(x, ', ' order by x) into v_bad from jsonb_object_keys(v_new) as t(x)
+       where not (x = any(core.master_audit_ignored_columns())) and not (x = any(ops.master_write_derived_columns())) and (v_old -> x) is distinct from (v_new -> x);
+      if v_bad is not null then
+        raise exception 'master_write_derived_only: 含むセット (SKU %) は導く値 (税率・税区分・取扱区分) だけ直せる (変えた列: %)', v_sku, v_bad using errcode = '42501';
+      end if;
+    elsif (tg_op = 'INSERT' and (v_new ->> 'cost_source') is distinct from 'set_calc')
+       or (tg_op in ('UPDATE', 'DELETE') and (v_old ->> 'cost_source') in ('manual', 'override_zero')) then
+      raise exception 'master_write_derived_only: 含むセット (SKU %) の原価は計算の行 (set_calc) だけ (人が決めた原価は触らない)', v_sku using errcode = '42501';
+    end if;
+  end if;
+  -- 業務の約束 (アプリの確かめを DB でも・#1563 R5 M1)
+  if v_tbl = 'core.supplier_skus' and coalesce((v_new ->> 'is_primary')::boolean, false)
+     and not exists (select 1 from core.suppliers s where s.supplier_id = (v_new ->> 'supplier_id')::bigint and s.active) then
+    raise exception 'master_write_invariant: 代表の仕入先 % は取引停止か無い', v_new ->> 'supplier_id' using errcode = '42501';
+  end if;
+  if v_tbl = 'ops.sku_component_requests' and tg_op = 'INSERT' and ops.component_request_rows_ok(v_new -> 'rows', 1, 20)   -- 形の誤りは表の CHECK が拒む
+     and exists (select 1 from jsonb_array_elements(v_new -> 'rows') e
+                  where (e ->> 'sku_id')::bigint = v_sess.sku_id
+                     or not exists (select 1 from core.skus k where k.sku_id = (e ->> 'sku_id')::bigint and k.sku_kind = 'single')) then
+    raise exception 'master_write_invariant: 構成の依頼の構成品は、ある単品だけ (セット自身・セット・例外の SKU・無い SKU は入れない)' using errcode = '42501';
+  end if;
+  if v_tbl = 'core.products' and tg_op = 'UPDATE' and (v_new ->> 'parent_product_id') is not null
+     and (v_old ->> 'parent_product_id') is distinct from (v_new ->> 'parent_product_id') then
+    with recursive up(id, d) as (
+      select (v_new ->> 'parent_product_id')::bigint, 1
+      union all
+      select p.parent_product_id, up.d + 1 from core.products p join up on p.product_id = up.id where p.parent_product_id is not null and up.d < 200)
+    select coalesce(bool_or(id = (v_new ->> 'product_id')::bigint), false), max(d) into v_loop, v_depth from up;
+    if v_loop or v_depth >= 200 then
+      raise exception 'master_write_invariant: 代表 (親) にすると親子が輪になる (商品 %)', v_new ->> 'product_id' using errcode = '42501';
+    end if;
   end if;
   foreach k in array ops.master_edit_owner_keys(v_tbl, tg_op, v_old, v_new) loop
     if (v_sess.ownership ->> k) is distinct from 'company' then

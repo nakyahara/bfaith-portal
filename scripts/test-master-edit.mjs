@@ -1247,6 +1247,96 @@ await ta('[14b] 画面のロールは DB でも守る (#1563 R3 M2・R4 M2): 始
   } finally { await E4.pg.close(); }
 });
 
+await ta('[14c] 約束の後の抜け道 (#1563 R5): 例外の SKU・含むセットの導く値でない列 / 人の原価・取引停止の代表の仕入先・形の違う構成の依頼・親子の輪 = 拒む / done の無い commit = 取引ごと拒む / 復元した約束の行では書けない', async () => {
+  const sid = async (code) => (await q('select sku_id::text as id from core.skus where code = $1', [code]))[0].id;
+  /** 直接 begin した後に sql を流した誤り (無ければ null)。必ず巻き戻す */
+  const afterBegin = (code, sql, params = [], opts = {}) => asEditorTx(E0, async () => { await pg.query(BEGIN_SQL, await beginArgs(E0, code, opts)); return errOf(pg.query(sql, params)); });
+  // (a) 例外の SKU は約束できない
+  await pg.query('begin');
+  try {
+    await pg.query("insert into core.skus (company_id, sku_kind, code, name) values (1, 'exception', 'ex-r5', '例外の SKU')");
+    const args = await beginArgs(E0, 'ex-r5');
+    await pg.query('set role master_edit');
+    assert.match(String((await errOf(pg.query(BEGIN_SQL, args)))?.message), /例外の SKU/);
+  } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
+  // (b) 単品 s001 を直す約束で、含むセット set001 は導く値 (税率・税区分・取扱区分・計算の原価) だけ
+  for (const sql of ["update core.skus set name = '含むセットの名前' where code = 'set001'", "update core.skus set standard_price_jpy = 1 where code = 'set001'",
+    "update core.skus set shipping_code = 'S01' where code = 'set001'"]) {
+    const e = await afterBegin('s001', sql);
+    assert.equal(e?.code, '42501', sql); assert.match(e.message, /master_write_derived_only/, sql);
+  }
+  assert.equal(await afterBegin('s001', "update core.skus set handling = 'discontinued' where code = 'set001'"), null);   // 導く値は通る
+  const eCost = await afterBegin('s001', "insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from, reason, created_by_type, created_by_id) select 1, sku_id, 1, 'manual', 'OVERRIDDEN', '2031-01-01', 'x', 'human', 'x' from core.skus where code = 'set001'");
+  assert.equal(eCost?.code, '42501'); assert.match(eCost.message, /master_write_derived_only/);
+  // (c) 業務の約束: 取引停止の仕入先を代表に・構成の依頼の構成品にセット自身 / セット・形の違う rows (表の CHECK)・親子の輪
+  const eSup = await afterBegin('s002', "insert into core.supplier_skus (company_id, supplier_id, sku_id, is_primary, created_by_type, created_by_id) select 1, supplier_id, (select sku_id from core.skus where code = 's002'), true, 'human', 'x' from core.suppliers where code = '0003'");
+  assert.equal(eSup?.code, '42501'); assert.match(eSup.message, /代表の仕入先 .* は取引停止/);
+  const reqSql = `insert into ops.sku_component_requests (company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, edit_request_id)
+    select 1, sku_id, $1::jsonb, repeat('e', 64), '[]'::jsonb, 'x', 'naka@test', gen_random_uuid() from core.skus where code = 'set004'`;
+  const [s1, s3, set4, set1] = [await sid('s001'), await sid('s003'), await sid('set004'), await sid('set001')];
+  for (const [rows, want, label] of [
+    [[{ sku_id: Number(set4), code: 'set004', qty: 1, sort: 1 }], /master_write_invariant: 構成の依頼の構成品/, 'セット自身'],
+    [[{ sku_id: Number(set1), code: 'set001', qty: 1, sort: 1 }], /master_write_invariant: 構成の依頼の構成品/, 'セット'],
+    [[{ sku_id: 99999999, code: 'nope', qty: 1, sort: 1 }], /master_write_invariant: 構成の依頼の構成品/, '無い SKU'],
+    [[{ sku_id: Number(s1), qty: 0.6, sort: 1 }], /component_request_rows_ok|check constraint/, 'qty 0.6'],
+    [[{ sku_id: Number(s1), qty: 100000, sort: 1 }], /component_request_rows_ok|check constraint/, 'qty 大きすぎ'],
+    [[{ sku_id: Number(s1), qty: 1, sort: 1 }, { sku_id: Number(s1), qty: 2, sort: 2 }], /component_request_rows_ok|check constraint/, '重なる構成品'],
+    [[{ sku_id: Number(s1), qty: 1, sort: 1 }, { sku_id: Number(s3), qty: 1, sort: 3 }], /component_request_rows_ok|check constraint/, '並びの抜け'],
+    [[{ sku_id: String(s1), qty: 1, sort: 1 }], /component_request_rows_ok|check constraint/, 'sku_id が文字'],
+    [[{ sku_id: Number(s1), qty: 1, sort: 1, extra: 'x' }], /component_request_rows_ok|check constraint/, '知らない鍵']]) {
+    const e = await afterBegin('set004', reqSql, [JSON.stringify(rows)]);
+    assert.ok(e && ['42501', '23514'].includes(e.code), `${label}: ${e && e.code} ${e && e.message}`);
+    assert.match(e.message, want, label);
+  }
+  assert.equal(await afterBegin('set004', reqSql, [JSON.stringify([{ sku_id: Number(s1), code: 's001', qty: 1, sort: 1 }, { sku_id: Number(s3), code: 's003', qty: 2, sort: 2 }])]), null);   // 正しい形は通る
+  // 親子の輪: 自分を親に / 子を親に (s003 の商品の親を s001 の商品にしてから、s001 の商品の親を s003 の商品に)
+  const p1 = (await q("select product_id::text as id from core.skus where code = 's001'"))[0].id;
+  const p3 = (await q("select product_id::text as id from core.skus where code = 's003'"))[0].id;
+  const parentSql = "select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())";
+  const eSelf = await asEditorTx(E0, async () => { await pg.query(BEGIN_SQL, await beginArgs(E0, 's001')); await pg.query(parentSql); return errOf(pg.query("update core.products set parent_product_id = $1, parent_set_by = 'manual' where product_id = $1", [p1])); });
+  assert.equal(eSelf?.code, '42501'); assert.match(eSelf.message, /親子が輪/);
+  const args1 = await beginArgs(E0, 's001');
+  await pg.query('begin');
+  try {
+    await pg.query(parentSql);
+    await pg.query("update core.products set parent_product_id = $2, parent_set_by = 'manual' where product_id = $1", [p3, p1]);   // 持ち主のロール: s003 の親 = s001
+    await pg.query('set role master_edit');
+    await pg.query(BEGIN_SQL, args1);
+    const e = await errOf(pg.query("update core.products set parent_product_id = $2, parent_set_by = 'manual' where product_id = $1", [p1, p3]));
+    assert.equal(e?.code, '42501'); assert.match(e.message, /親子が輪/);
+  } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
+  // (R5 M2) 約束した取引は、done を書かずに commit できない (書いても・何も書かなくても)。done は保存の流れが書く
+  for (const [label, sql] of [['書いて done なし', "update core.skus set reorder_months = reorder_months where code = 's004'"], ['何もせず', null]]) {
+    const args = await beginArgs(E0, 's004');
+    await pg.query('set role master_edit');
+    await pg.query('begin');
+    let e = null;
+    try {
+      await pg.query(BEGIN_SQL, args);
+      if (sql) await pg.query(sql);
+      e = await errOf(pg.query('commit'));
+    } finally { try { await pg.query('rollback'); } catch { /* commit が失敗した取引はもう終わっている */ } await pg.query('set role deploy'); }
+    assert.equal(e?.code, '42501', label); assert.match(e.message, /master_write_session_unfinished/, label);
+  }
+  assert.equal(Number((await q("select count(*)::int as n from ops.master_write_sessions s where not exists (select 1 from ops.master_edit_requests r where r.request_id = s.request_id and r.status = 'done')"))[0].n), 0);
+  // (R5 M3) 復元した約束の行 (前の DB の乱数・今の取引の番号) があっても、begin していない書き込みは通らない・begin は止まらない
+  const args4 = await beginArgs(E0, 's004');
+  await pg.query('begin');
+  try {
+    await pg.query(`insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions,
+        actor_id, source_system, db_user, phase, owner_hash, ownership)
+      select gen_random_uuid(), txid_current(), gen_random_uuid(), 'sku_edit', sku_id, '{}', '{}', repeat('a', 64), repeat('b', 64), '{}'::jsonb,
+        'old@restored', 'portal_master_edit', 'master_edit', 'new_open', repeat('c', 64), '{}'::jsonb from core.skus where code = 's004'`);
+    await pg.query('set role master_edit');
+    await pg.query('savepoint s');
+    const e = await errOf(pg.query("update core.skus set name = '復元した行で' where code = 's004'"));
+    assert.equal(e?.code, '42501'); assert.match(e.message, /master_write_session_required/);
+    await pg.query('rollback to savepoint s');
+    await pg.query(BEGIN_SQL, args4);   // session_exists にならない
+    assert.equal(await errOf(pg.query("update core.skus set name = '約束した後' where code = 's004'")), null);
+  } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
+});
+
 console.log('\n画面 (router)');
 
 process.env.COMPANY_DB_URL = 'postgres://owner@localhost:5432/test';

@@ -158,8 +158,12 @@ await ta('[!] 0050 (14 §6 ⑤-1・#1563 R1・R2): 切替の段階は legacy_ope
   // #1563 R4: 止まった記録は書きかけ 0 (CHECK)・前提の表は追記だけ・約束の表に相手と操作
   assert.equal((await q("select count(*)::int as n from pg_constraint where conname = 'ck_mlga_stopped_drained'"))[0].n, 1);
   assert.deepEqual((await q("select tgname as t from pg_trigger where tgrelid = 'ops.master_cutover_prereq_checks'::regclass and not tgisinternal order by 1")).map((r) => r.t), ['trg_append_only_row', 'trg_append_only_stmt', 'trg_master_cutover_prereq_checks_guard']);
-  assert.deepEqual((await q("select column_name as c from information_schema.columns where table_schema = 'ops' and table_name = 'master_write_sessions' and column_name in ('operation', 'sku_id', 'target_sku_ids', 'target_product_ids', 'edit_token', 'payload_hash', 'versions') order by 1")).map((r) => r.c),
-    ['edit_token', 'operation', 'payload_hash', 'sku_id', 'target_product_ids', 'target_sku_ids', 'versions']);
+  assert.deepEqual((await q("select column_name as c from information_schema.columns where table_schema = 'ops' and table_name = 'master_write_sessions' and column_name in ('session_id', 'txid', 'operation', 'sku_id', 'derived_sku_ids', 'target_sku_ids', 'target_product_ids', 'edit_token', 'payload_hash', 'versions') order by 1")).map((r) => r.c),
+    ['derived_sku_ids', 'edit_token', 'operation', 'payload_hash', 'session_id', 'sku_id', 'target_product_ids', 'txid', 'versions']);
+  // #1563 R5: 約束の鍵 = session_id (乱数)・done の無い commit を拒む deferred の trigger・構成の依頼の形の CHECK
+  assert.deepEqual((await q("select a.attname as c from pg_index i join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey) where i.indrelid = 'ops.master_write_sessions'::regclass and i.indisprimary")).map((r) => r.c), ['session_id']);
+  assert.deepEqual((await q("select tgdeferrable as d, tginitdeferred as i from pg_trigger where tgname = 'trg_master_write_session_done'"))[0], { d: true, i: true });
+  assert.equal((await q("select count(*)::int as n from pg_constraint where conrelid = 'ops.sku_component_requests'::regclass and contype = 'c' and pg_get_constraintdef(oid) like '%component_request_rows_ok%'"))[0].n, 2);
   const ackCols = await q("select column_name as c from information_schema.columns where table_schema = 'ops' and table_name = 'master_legacy_gate_acks' and column_name in ('session_role', 'stopped', 'stopped_reason') order by 1");
   assert.deepEqual(ackCols.map((r) => r.c), ['session_role', 'stopped', 'stopped_reason']);
   assert.match(fn[0].d, /tg_op = 'UPDATE' and new\.sku_id = old\.sku_id/);

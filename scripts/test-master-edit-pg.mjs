@@ -475,7 +475,16 @@ try {
       await A.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb, $5, $6::bigint, $7, $8, $9::jsonb)', [crypto.randomUUID(), 'naka@test', null, JSON.stringify(ALL_COMPANY), 'sku_edit', sid3, 'b'.repeat(64), 'c'.repeat(64), JSON.stringify(v3)]);
       await assert.rejects(() => A.query("update core.skus set name = '相手でない' where code = 'p004'"), (e) => e.code === '42501' && /master_write_target/.test(e.message));
     } finally { await A.query('rollback'); }
-    await denied(A, "insert into ops.master_write_sessions (txid, request_id, actor_id, source_system, db_user, phase, owner_hash, ownership) values (txid_current(), gen_random_uuid(), 'x', 'portal_master_edit', 'x', 'new_open', repeat('a', 64), '{}')", 'edit: sessions に直接');
+    // 約束した取引は done を書かずに commit できない (R5 M2)
+    await A.query('begin');
+    let eCommit = null;
+    try {
+      await A.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb, $5, $6::bigint, $7, $8, $9::jsonb)', [crypto.randomUUID(), 'naka@test', null, JSON.stringify(ALL_COMPANY), 'sku_edit', sid3, 'b'.repeat(64), 'c'.repeat(64), JSON.stringify((await q('select ops.master_edit_versions($1::bigint) as v', [sid3]))[0].v)]);
+      await A.query("update core.skus set reorder_months = reorder_months + 1 where code = 'p003'");
+      eCommit = await A.query('commit').then(() => null, (e) => e);
+    } finally { try { await A.query('rollback'); } catch { /* */ } }
+    assert.equal(eCommit?.code, '42501'); assert.match(eCommit.message, /master_write_session_unfinished/);
+    await denied(A, "insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions, actor_id, source_system, db_user, phase, owner_hash, ownership) values (gen_random_uuid(), txid_current(), gen_random_uuid(), 'sku_edit', 1, '{}', '{}', repeat('a', 64), repeat('a', 64), '{}', 'x', 'portal_master_edit', 'x', 'new_open', repeat('a', 64), '{}')", 'edit: sessions に直接');
     assert.equal(Number((await q("select count(*)::int as n from events.master_change_events where actor_id = 'forged@evil'"))[0].n), 0);
     assert.equal(Number((await q("select count(*)::int as n from ops.master_write_sessions where db_user = 'master_edit'"))[0].n) > 10, true);
   });
