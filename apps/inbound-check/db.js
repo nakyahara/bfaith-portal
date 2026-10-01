@@ -554,6 +554,10 @@ function migrateQuantity(db) {
   // 期限シールを貼る商品か (1=あり / 0=なし / NULL=未登録)。あるときだけ画面の上に赤で出す
   // (貼り忘れると出荷できない — 中原さん 2026-09-05)
   addCol(db, 'f_iroha_work_master', 'expiry_seal', 'INTEGER CHECK (expiry_seal IS NULL OR expiry_seal IN (0,1))');
+  // 資材を複数持てるようにする (2026-10-01 中原さん: 10 個ずつ小分けする袋も記録したい)。
+  // ⭐**これが資材の正本** — material_code は 1 件目の写し。NULL = まだ新しい形に移っていない行 /
+  //   '[]' = 資材なし。書き込みは apps/iroha-work/materials.js を必ず通す (二重正本にしない)
+  addCol(db, 'f_iroha_work_master', 'materials_json', 'TEXT');
 
   if (!added) return;   // ここから先は列を足した初回だけ
 
