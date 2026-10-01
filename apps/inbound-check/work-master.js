@@ -14,6 +14,10 @@
  */
 import ExcelJS from 'exceljs';
 import { getDB } from './db.js';
+// 資材の正規化はここに一本化する (materials_json と material_code がずれないように)
+import {
+  canonicalizeMaterials, materialsOf, serializeMaterials, primaryMaterialCode, sameMaterials, withPrimaryCode,
+} from '../../lib/iroha-materials.js';
 
 const utcNow = () => new Date().toISOString();
 export const SHEET_NAME = '作業内容管理マスター';
@@ -159,22 +163,38 @@ export function applyWorkMaster(rows, { user = null } = {}) {
   const ins = db.prepare(`INSERT INTO f_iroha_work_master
     (code_key, 商品コード, material_code, storage_container, units_per_container, process_count, note, version, updated_at, updated_by)
     VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`);
-  const upd = db.prepare(`UPDATE f_iroha_work_master
-    SET 商品コード = ?, material_code = ?, storage_container = ?, units_per_container = ?, process_count = ?, note = ?,
+  // 資材を書き換える版と、資材に触らない版。🚨 触らない版があることが大事 —
+  // 取込で **現場が iPad で足した 2 件目の資材を消さない** (2026-10-01)。
+  // xlsx の「資材」列は 1 件目だけを担当する (資材2 の列は作らない。中原さん「エクセルなんて使ってない」)
+  const updWithMaterials = db.prepare(`UPDATE f_iroha_work_master
+    SET 商品コード = ?, materials_json = ?, material_code = ?, storage_container = ?, units_per_container = ?, process_count = ?, note = ?,
         version = version + 1, updated_at = ?, updated_by = ? WHERE code_key = ?`);
-  const counts = { inserted: 0, updated: 0, unchanged: 0, deleted: 0 };
+  const updKeepMaterials = db.prepare(`UPDATE f_iroha_work_master
+    SET 商品コード = ?, storage_container = ?, units_per_container = ?, process_count = ?, note = ?,
+        version = version + 1, updated_at = ?, updated_by = ? WHERE code_key = ?`);
+  const counts = { inserted: 0, updated: 0, unchanged: 0, deleted: 0, materials_kept: 0 };
   const tx = db.transaction(() => {
     for (const r of rows) {
       const cur = sel.get(r.codeKey);
       if (!cur) {
+        // 新しい行は materials_json を書かない (NULL = 未移行 → 読むときに material_code から 1 件にする)
         ins.run(r.codeKey, r.code, r.material, r.container, r.units, r.processCount, r.note, now, user);
         counts.inserted++;
-      } else if (
-        cur.material_code !== r.material || cur.storage_container !== r.container ||
-        cur.units_per_container !== r.units || cur.process_count !== r.processCount || cur.note !== r.note ||
-        cur.商品コード !== r.code
-      ) {
-        upd.run(r.code, r.material, r.container, r.units, r.processCount, r.note, now, user, r.codeKey);
+        continue;
+      }
+      const curMaterials = materialsOf(cur);
+      // 空欄 = 「消す」ではなく「触らない」。xlsx に無い情報で現場の登録を消さない (安全側は方向で効きめが違う)
+      const nextMaterials = r.material ? withPrimaryCode(curMaterials, r.material) : curMaterials;
+      const materialsChanged = !sameMaterials(curMaterials, nextMaterials);
+      if (curMaterials.length > 1) counts.materials_kept++;
+      const otherChanged = cur.storage_container !== r.container || cur.units_per_container !== r.units
+        || cur.process_count !== r.processCount || cur.note !== r.note || cur.商品コード !== r.code;
+      if (materialsChanged) {
+        updWithMaterials.run(r.code, serializeMaterials(nextMaterials), primaryMaterialCode(nextMaterials),
+          r.container, r.units, r.processCount, r.note, now, user, r.codeKey);
+        counts.updated++;
+      } else if (otherChanged) {
+        updKeepMaterials.run(r.code, r.container, r.units, r.processCount, r.note, now, user, r.codeKey);
         counts.updated++;
       } else {
         counts.unchanged++;
@@ -233,8 +253,30 @@ export function updateWorkMasterRow(key, fields, user, expectVersion) {
   if (!Number.isInteger(ver) || ver < 1) return { ok: false, error: 'version_required', message: 'version が必要です' };
   const sets = [];
   const params = [];
+  // ─── 資材 (materials_json が正本・material_code は 1 件目の写し) ───
+  //   fields.materials … 新しい画面。配列をまるごと差し替える
+  //   fields.material_code … 古い画面・取込。🚨1 件目だけ差し替えて 2 件目以降は残す
+  const curRow = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
+  let nextMaterials = null;   // null = 今回は資材を触らない
+  if ('materials' in fields) {
+    const c = canonicalizeMaterials(fields.materials);
+    if (!c.ok) return { ok: false, error: c.error, message: c.message };
+    nextMaterials = c.materials;
+  } else if ('material_code' in fields) {
+    nextMaterials = withPrimaryCode(materialsOf(curRow), fields.material_code);
+  }
+  let materialsUnchanged = false;
+  if (nextMaterials) {
+    if (sameMaterials(materialsOf(curRow), nextMaterials)) {
+      materialsUnchanged = true;   // 中身が同じなら書かない (version を無駄に進めない)
+    } else {
+      sets.push('materials_json = ?'); params.push(serializeMaterials(nextMaterials));
+      sets.push('material_code = ?'); params.push(primaryMaterialCode(nextMaterials));
+    }
+  }
   for (const f of EDIT_FIELDS) {
     if (!(f in fields)) continue;
+    if (f === 'material_code') continue;   // 上でまとめて書いた
     let v = fields[f];
     if (f === 'units_per_container' || f === 'process_count') {
       const p = parseIntOrNull(v);
@@ -259,6 +301,8 @@ export function updateWorkMasterRow(key, fields, user, expectVersion) {
   if (sets.length === 0) {
     const ignored = DEPRECATED_FIELDS.filter((f) => f in fields);
     if (ignored.length > 0) return { ok: true, unchanged: true, ignored_fields: ignored };
+    // 同じ資材を選び直しただけ = 変更なし (エラーにすると画面には「保存できません」に見える)
+    if (materialsUnchanged) return { ok: true, unchanged: true, row: curRow };
     return { ok: false, error: 'no_fields', message: '更新する項目がありません' };
   }
   const r = db.prepare(`UPDATE f_iroha_work_master

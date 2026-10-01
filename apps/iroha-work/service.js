@@ -17,6 +17,7 @@ import { buildEnrichContext } from '../inbound-check/enrich.js';
 import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
 import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask, finishedSessionsOfTask, listWorkOptions } from './db.js';
+import { materialsOf, primaryMaterialCode, materialsMissing, canonicalizeMaterials, sameMaterials, MAX_MATERIALS } from '../../lib/iroha-materials.js';
 import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, BLOCK_REASONS, BLOCK_LABEL, BLOCK_BUTTON, CLOSE_REASONS, CLOSE_LABEL, statusLabel, blockLabel } from './tasks.js';
@@ -132,6 +133,8 @@ export function masterOf(wm, props) {
 export function masterOfTask(wm, snapshot) {
   const s = snapshot || {};
   return mergeMaster(wm, {
+    // 作成時スナップショットは新しい形 (materials) と古い形 (material_code だけ) の両方がありうる
+    materials: Array.isArray(s.materials) ? s.materials : undefined,
     material_code: s.material_code || null, storage_container: s.storage_container || null,
     units_per_container: s.units_per_container ?? null, process_count: s.process_count ?? null, note: s.note || null,
   });
@@ -140,6 +143,10 @@ export function masterOfTask(wm, snapshot) {
 function mergeMaster(wm, card) {
   // ⭐項目単位でカード値へフォールバックする (Codex PR4 #1: マスタ行が「動画だけ」でも、
   //   カードに載っている資材・入数の表示を消さない)。version はマスタ行の有無で決まる
+  // 資材は配列が正本 (materials.js)。マスタが持っていればマスタ、空ならカードの値へ落とす
+  // (「マスタ行が動画だけ」でもカードに載っている資材を消さない — 下の項目単位フォールバックと同じ考え)
+  const wmMaterials = materialsOf(wm);
+  const materials = wmMaterials.length > 0 ? wmMaterials : materialsOf(card);
   const m = wm
     ? { source: 'master', version: wm.version,
         material_code: wm.material_code || card.material_code, storage_container: wm.storage_container || card.storage_container,
@@ -150,8 +157,10 @@ function mergeMaster(wm, card) {
         video_url: wm.video_url || null,
         expiry_seal: wm.expiry_seal == null ? null : Number(wm.expiry_seal) }
     : { source: 'card', version: null, ...card, video_url: null, expiry_seal: null };
-  const missing = [];
-  if (!m.material_code) missing.push('資材');
+  // 資材は配列で持ち、material_code は 1 件目の写し (古い画面・外部委託の検証がこれを読む)
+  m.materials = materials;
+  m.material_code = primaryMaterialCode(materials);
+  const missing = [...materialsMissing(materials)];   // 資材 0 件 / 小分け袋なのに何個ずつか無い
   if (!m.storage_container) missing.push('保管箱');   // 画面の呼び名は「保管箱」(中原さん 2026-09-03。旧「入れもの」)
   if (m.units_per_container == null) missing.push('入数');
   if (m.process_count == null) missing.push('工程');
@@ -169,6 +178,17 @@ export function classifyMasterEdit(row, fields) {
   const fills = [];
   const overwrites = [];
   for (const [f, nv] of Object.entries(fields)) {
+    if (f === 'materials') {
+      // 資材は配列で比べる (文字列にすると順番や空白の違いだけで「変更」に見える)。
+      // 🚨 すでに資材が入っているカードに 2 件目を足すのは**既存の指示を変える**操作 = 職員のみ (Codex)
+      const curList = materialsOf(row);
+      const parsed = canonicalizeMaterials(nv);
+      const nextList = parsed.ok ? parsed.materials : [];
+      if (sameMaterials(curList, nextList)) continue;
+      if (curList.length === 0) fills.push(f);
+      else overwrites.push(f);
+      continue;
+    }
     const cur = row ? row[f] : null;
     const curEmpty = cur == null || String(cur).trim() === '';
     const next = nv == null ? '' : String(nv).trim();
@@ -797,7 +817,16 @@ export function buildFacilityView(facilityCode) {
       settled_at: r.settled_at || null,
       // ⭐作業のしかた。**決まった形の項目だけ**、しかも**値まで確かめて**出す。自由記述の「備考」は出さない
       work: snap ? {
-        material_code: pickOption(snap.material_code, okMaterial),        // 資材セットID (登録ずみのものだけ)
+        // 資材は複数 (小分け袋を含む)。⭐**登録ずみの候補と完全一致するものだけ**外へ出す
+        //   (自由記述・入れ子をそのまま外部施設の画面へ渡さない)。数も整数の検査を通す
+        materials: materialsOf(snap)
+          .filter((mm) => okMaterial.has(mm.code))
+          .slice(0, MAX_MATERIALS)
+          .map((mm) => {
+            const per = mm.usage === 'inner_pack' ? pickInt(mm.units_per_pack) : null;
+            return per != null ? { code: mm.code, usage: mm.usage, units_per_pack: per } : { code: mm.code, usage: mm.usage };
+          }),
+        material_code: pickOption(snap.material_code, okMaterial),        // 1 件目の写し (古い画面向け)
         storage_container: pickOption(snap.storage_container, okContainer), // 保管箱 (同上)
         units_per_container: pickInt(snap.units_per_container),
         process_count: pickInt(snap.process_count),

@@ -92,6 +92,7 @@ import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task
 import { listInboundPlan } from './inbound-plan.js';
 import { startConsignment, markPrepared, markHanded, cancelConsignment, recordReturn, settleConsignment, getConsignment, updateReturnCounts } from './consign.js';
 import { startStaffUnlock, staffUnlockOf, endStaffUnlock, STAFF_UNLOCK_MS } from './db.js';
+import { materialsOf } from '../../lib/iroha-materials.js';
 import {
   addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, recordMediaCancel, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
   reportMediaUnavailable, recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
@@ -1488,7 +1489,9 @@ router.post('/api/label-waits', checkOrigin, api((req, res) => {
 
 // ⭐size_class (大きさ) は廃止 (中原さん 2026-09-06 — §AA)。大きさは配送方法から見なすので、手で登録する項目は要らない。
 //   DB の列と既存の値は残してあるが、もう読まないし書かない
-const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'expiry_seal'];
+// materials = 資材の配列 (正本。小分け袋と「何個ずつ」もここに入る)。
+// material_code = 古い iPad からの 1 件だけの更新 — 受けるが、2 件目以降は消さない (materials.js)
+const MASTER_FIELDS = ['materials', 'material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'expiry_seal'];
 // 廃止した項目。送られてきても書かないが、**エラーにもしない** (入れ替え途中の iPad が保存に失敗しない — Codex R1 #5)
 const DEPRECATED_MASTER_FIELDS = ['size_class'];
 
@@ -1628,9 +1631,14 @@ router.post('/api/master', checkOrigin, api((req, res) => {
         // カード表示中の値をシード (今回指定されなかった項目だけ)。空欄埋め扱いなので権限は不要。
         // cardValues は上で商品コード一致を確認済み (別商品のカード値を混ぜない)
         const seed = {
+          // 資材は配列で引き継ぐ (小分け袋の指定ごと)
+          materials: Array.isArray(cardValues.materials) && cardValues.materials.length > 0 ? cardValues.materials : undefined,
           material_code: cardValues.material_code, storage_container: cardValues.storage_container,
           units_per_container: cardValues.units_per_container, process_count: cardValues.process_count, note: cardValues.note,
         };
+        // 🚨 古い画面が material_code だけ送ってきたときは、カード由来の配列でそれを上書きしない
+        //    (配列が勝つと、その場の入力が黙って消える)
+        if ('material_code' in fields) delete seed.materials;
         applyFields = { ...Object.fromEntries(Object.entries(seed).filter(([f, v]) => v != null && v !== '' && !(f in fields))), ...fields };
       } else {
         expect = Number(req.body.expect_version);
@@ -1661,7 +1669,8 @@ router.post('/api/master', checkOrigin, api((req, res) => {
     ok: true,
   });
   clearEnrichCache();   // 次の /api/state から新しい作業仕様で出す
-  res.json({ ok: true, row: result.row });
+  // 資材は配列で返す (画面が materials_json の生文字列を読まなくていいように)
+  res.json({ ok: true, row: { ...result.row, materials: materialsOf(result.row) } });
 }));
 
 // ─── 完成写真・動画 ───
