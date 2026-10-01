@@ -23,6 +23,16 @@ const SET_REVIEW_STEP = 'set_review';
 const SET_NE_STEP = SET_NE_STEP_CODE;
 /** セット企画者が担当に関わらず動かせる工程 (出品準備 = 承認は含めない。§4.1 の回答どおり) */
 const SET_PLANNER_STEPS = ['set_compose', SET_NE_STEP, 'set_content'];
+/**
+ * 画像の工程を動かせる役割 (ph_roles の builtin「画像登録者」)。
+ * 役割を置かない ⑧楽天登録 を D&D で開き直せるのは、この役割を持つ人と管理者だけ (2026-10-01)。
+ */
+const IMAGE_TRACK_ROLE = 'image';
+/**
+ * ⑧楽天登録 の段階キー (image_stage)。工程コードでなく段階で見るのは管理画面での改名に強いため。
+ * 「出品すると自動で完了する」唯一の画像工程で、D&D の開き直しの例外もこの段階だけに効かせる。
+ */
+export const IMAGE_RAKUTEN_STAGE = 'rakuten';
 /** 「AI情報入力待ち」。夜間の AI が完了にする工程だが、担当者なら手で抜ける・戻せる (2026-09-25) */
 const AI_STEP = 'ai_generate';
 // モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
@@ -310,8 +320,52 @@ function assertOwnerScope(patch, actorStaffId) {
   }
 }
 
-function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim = false }) {
+/** 楽天モールが「対象外」か (= この商品は楽天に出さない)。⑧楽天登録 を開かせるかの判断に使う */
+function rakutenMallSkipped(db, draftId) {
+  return db.prepare(`
+    SELECT 1 FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten' AND state = 'skip'
+  `).get(Number(draftId)) != null;
+}
+
+function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim = false, boardMove = false }) {
+  // 🚨 ボードの D&D で「楽天が対象外の商品の ⑧楽天登録」を開くのは**管理者でも**通さない
+  //    (Codex 名指し R6 P1: isAdmin の早期 return より前に置く)。
+  //    楽天に出さない商品の ⑧ を開いても、出品の根拠が無いので閉じられず、
+  //    結局だれかが対象外に戻すことになる = 最初から開かない方がよい。
+  //    詳細画面から管理者が明示的に動かす経路 (boardMove なし) は従来どおり通す
+  if (boardMove && row.track === 'image' && row.image_stage === IMAGE_RAKUTEN_STAGE
+    && patch?.state === 'todo' && rakutenMallSkipped(db, row.draft_id)) {
+    throw forbidden('この商品は楽天が「対象外」なので「楽天登録」は開けません'
+      + ' (楽天に出すなら、詳細画面の「モール別の展開状況」で楽天を未着手に戻してください)');
+  }
   if (isAdmin) return;
+
+  // ボードの D&D から ⑧楽天登録 を動かすとき (2026-10-01)。
+  // ⑧楽天登録 は役割を置かない (出品すると自動で完了する) 工程なので、下の
+  // 「画像の工程は役割で動かせる」(row.role_code を見る) に乗れない。このままでは
+  //   ・報告された「落とした列の先へ飛ばされる」が非管理者では 403 に変わるだけで直らない
+  //   ・いったん ⑧ を開き直したら、閉じるのに管理者を呼ぶしかない**片道**になる
+  //
+  // 🚨 抜け道はできるだけ狭くする (Codex R3 P1 / R9 P2 / 名指し R4 F):
+  //    ・**⑧楽天登録 の段階だけ** (image_stage='rakuten')。本流の AI情報入力待ち・出品・展開も、
+  //      管理画面から足した役割なしの画像工程も対象にしない
+  //      (AI待ちを手で戻すのは下の AI_STEP の例外が既に担っている)
+  //    ・**役割を置かない工程のときだけ** (役割があればこの下の通常の判定でそのまま通る)
+  //    ・**画像登録者の役割を持つ人だけ** (= 画像の工程を動かせる人。関係ない担当者は通さない)
+  //    ・**未着手 / 完了 の 2 本だけ**。「対象外」にするのは従来どおり管理者だけ
+  //    ・完了にできるのは**楽天登録の根拠がある商品だけ** — この下の
+  //      「⑧ は楽天に出品すると自動で完了します」のゲートは**この例外を通った後も必ず通る**ので、
+  //      出していない商品を人が「出した」ことにはできない
+  //    影響はカードがどの列に出るかだけ: ⑧楽天登録 は listing_gate=0 で出品ゲートに数えず、
+  //    楽天に出してよいかの判定は draft_mall_status / draft_rakuten が正 (assertRakutenListable)、
+  //    status の導出 (deriveDraftStatus) も imgd_* を見ない
+  //    (楽天が「対象外」の商品はこの関数の先頭で誰でも弾いている)
+  if (boardMove && row.track === 'image' && row.image_stage === IMAGE_RAKUTEN_STAGE
+    && !row.role_code && (patch?.state === 'todo' || patch?.state === 'done')
+    && actorStaffId != null && hasRole(db, actorStaffId, IMAGE_TRACK_ROLE)
+    && Object.keys(patch).every((k) => k === 'state' || k === 'expected_version' || patch[k] === undefined)) {
+    return;
+  }
 
   // 自分の担当工程
   if (row.assignee_id != null && row.assignee_id === actorStaffId) {
@@ -639,14 +693,23 @@ export function imageMadeOf(summary) {
  * 縦列 ②仮構成 (imgd_compose) は撮影依頼のために AI が作る仮の構成で、本番の構成は
  * ③素材待ちの間に作ることも、追加素材なしでそのまま作ることもある → 列の位置では表せないので
  * 画像制作カードの「構成を済にする / まだに戻す」(draft_image_production.compose_status) で持つ。
- * 人がまだ決めていない (NULL) 商品は、③素材待ちが決着していれば「済」とみなす (④AI制作は構成 + 素材から作る)。
- * 既存の商品のカードが軒並み「まだ」になるのを避けるため。imageMadeOf と同じく並び順でなく image_stage で見る。
- * 人が決めた値 ('done' / 'todo') は推定より優先する (Codex R1: 推定だけだと、③が済んだ商品で
+ * 人がまだ決めていない (NULL) 商品は、④AI制作が決着していれば「済」とみなす
+ * (= カードが ⑤デザイン修正 に移った時点。既存の商品のカードが軒並み「まだ」になるのを避けるため)。
+ *
+ * 🚨 推定の境目は **③素材待ち ではなく ④AI制作** (2026-10-01 スタッフ要望)。
+ * 「AI制作」に入った時点で構成が決まっているとは限らない — AI で画像を生成したときに
+ * 構成が確定する商品と、既存商品を直して作る (文字を変えるだけで構成は元からある) 商品の
+ * 2 通りがあり、前者は AI制作 の最中にまだ構成ができていない。構成ができていないカードが
+ * 「済」で出ると、構成の残りを拾えなくなる。④が決着する = ⑤デザイン修正 へ移った
+ * = どちらの作り方でも構成は出来上がっている、ので境目をそこへ 1 列ずらす。
+ *
+ * imageMadeOf と同じく並び順でなく image_stage で見る。
+ * 人が決めた値 ('done' / 'todo') は推定より優先する (Codex R1: 推定だけだと、④が済んだ商品で
  * 「まだに戻す」を押しても 済 のまま戻せない)
  * @returns {{excluded: boolean, done: boolean, marked: boolean, implied: boolean}}
  *   marked = 人が決めた値 / implied = 推定で 済
  */
-export const COMPOSE_IMPLIED_STAGE = 'material';
+export const COMPOSE_IMPLIED_STAGE = 'ai';
 export function composeStateOf(summary, composeStatus) {
   if (!summary || summary.excluded) return { excluded: true, done: false, marked: false, implied: false };
   if (composeStatus === 'done' || composeStatus === 'todo') {
@@ -825,7 +888,7 @@ export function assertStepOperable(db, draftId, stepCode, expectedVersion, { isA
   const code = String(stepCode || '');
   ensureProgress(db, id);
   const row = db.prepare(`
-    SELECT p.*, s.label, s.role_code, s.track, s.image_kind, s.skippable FROM draft_step_progress p
+    SELECT p.*, s.label, s.role_code, s.track, s.image_kind, s.image_stage, s.skippable FROM draft_step_progress p
     JOIN ph_steps s ON s.code = p.step_code
     WHERE p.draft_id = ? AND p.step_code = ?
   `).get(id, code);
@@ -847,7 +910,7 @@ export function assertStepOperable(db, draftId, stepCode, expectedVersion, { isA
  */
 export function setStepState(
   draftId, stepCode, patch, actor,
-  { isAdmin = false, actorStaffId = null, requireVersion = false, bypassGates = false, systemActor = false, boardClaim = false } = {},
+  { isAdmin = false, actorStaffId = null, requireVersion = false, bypassGates = false, systemActor = false, boardClaim = false, boardMove = false } = {},
 ) {
   const db = getDB();
   const id = Number(draftId);
@@ -856,7 +919,7 @@ export function setStepState(
   const row = db.prepare(`
     -- role_code は権限判定に使う (システム工程かどうか)。取り忘れると undefined になり、
     -- 通常の工程まで「システム工程」と誤判定して一般ユーザーが弾かれる
-    SELECT p.*, s.label, s.role_code, s.track, s.image_kind, s.skippable FROM draft_step_progress p
+    SELECT p.*, s.label, s.role_code, s.track, s.image_kind, s.image_stage, s.skippable FROM draft_step_progress p
     JOIN ph_steps s ON s.code = p.step_code
     WHERE p.draft_id = ? AND p.step_code = ?
   `).get(id, code);
@@ -866,7 +929,7 @@ export function setStepState(
   if (row.track === 'image' && patch && Object.keys(patch).some((k) => k !== 'expected_version') && imageHoldOf(db, id).onHold) {
     throw badRequest('画像制作が保留中です。詳細画面の「画像制作」カードで保留を解除してから操作してください');
   }
-  assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim });
+  assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim, boardMove });
   // TOP画像 (サムネイル) は楽天出品に必須なので、admin でも工程単位の「対象外」にはできない。
   // 詳細画像を作らない商品は setDetailImagesExcluded (商品単位のフラグ) を使う
   if (patch?.state === 'skip' && row.track === 'image' && row.image_kind !== 'detail') {
@@ -927,8 +990,10 @@ export function setStepState(
       }
     }
     // ⑧ 楽天登録 = 出品成功で自動完了する工程。人が (admin でも) 出品なしに done にできない (Codex R2 high)。
-    // 例外 = 楽天登録の根拠 (アプリ経由の登録記録 / モール別状況の楽天 done) がある商品 (アプリ以前に手で出した商品)
-    if (state === 'done' && code === 'imgd_rakuten' && !systemActor) {
+    // 例外 = 楽天登録の根拠 (アプリ経由の登録記録 / モール別状況の楽天 done) がある商品 (アプリ以前に手で出した商品)。
+    // 🚨 見るのは工程コードでなく **image_stage** (2026-10-01)。上の boardMove の権限の例外も
+    //    同じキーで絞っているので、片方だけが当たる工程 (将来 rakuten 段階の工程が増えたとき) を作らない
+    if (state === 'done' && row.track === 'image' && row.image_stage === IMAGE_RAKUTEN_STAGE && !systemActor) {
       const evidence = db.prepare(`
         SELECT 1 WHERE EXISTS (SELECT 1 FROM draft_rakuten WHERE draft_id = @id AND registered_at IS NOT NULL)
            OR EXISTS (SELECT 1 FROM draft_mall_status WHERE draft_id = @id AND mall = 'rakuten' AND state = 'done')
@@ -1097,8 +1162,11 @@ export function setStepState(
 /**
  * かんばんカードの D&D 移動 (2026-08-24 中原さん要望)。
  * 「落とした列がその商品のいまやる工程になる」ように工程をまとめて更新する:
- *   - 前方 (右) へ: 現在工程から移動先の手前までを順に done に (移動先は todo のまま = いまやる番)
- *   - 後方 (左) へ: 移動先の工程を todo に開け直す (間の done は触らない = currentOf が移動先を指す)
+ *   - 前方 (右) へ: 現在工程から移動先の手前までを順に done に (移動先は todo のまま = いまやる番)。
+ *     通過するのは**まだ決着していない工程だけ** / 移動先がすでに決着していれば開き直す (2026-10-01。
+ *     開き直す権限が無ければ開き直しだけ諦める = 移動は成功させ、戻り値の reopenBlocked で画面に伝える)
+ *   - 後方 (左) へ: 移動先の工程を todo に開け直す (間の done は触らない = currentOf が移動先を指す)。
+ *     完了列 (全工程が決着) からの差し戻しも同じ経路
  *   - to='done' (完了列): 残りの工程を全部 done に。本流は listing の全モール決着チェックが効くので
  *     モール未決着なら失敗する (出品・展開はモール別ステータスが正、のルールを D&D でも維持)
  * 権限・ゲート (基本情報の材料チェック/システム工程は admin のみ/listing はモール正) は
@@ -1115,14 +1183,15 @@ export function moveBoardCard(
     ensureProgress(db, id);
     const rows = view === 'image'
       ? db.prepare(`
-          SELECT p.step_code, p.state, s.image_stage FROM draft_step_progress p
+          ${/* label は「開き直せなかった工程」を画面に出すのに使う (工程コードでは現場に伝わらない) */''}
+          SELECT p.step_code, p.state, s.label, s.image_stage FROM draft_step_progress p
           JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
           WHERE p.draft_id = ? AND s.track = 'image'
             AND ${kind === 'detail' ? "s.image_kind = 'detail'" : "(s.image_kind IS NULL OR s.image_kind != 'detail')"}
           ORDER BY s.sort, s.code
         `).all(id)
       : db.prepare(`
-          SELECT p.step_code, p.state, NULL AS image_stage FROM draft_step_progress p
+          SELECT p.step_code, p.state, s.label, NULL AS image_stage FROM draft_step_progress p
           JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
           ${/* 本流はドラフトによって main か set のどちらか (セットは専用テンプレート・
                 2026-09-04)。片方に決め打つと、セットは listing だけの 1 行になって動かせない */''}
@@ -1197,25 +1266,78 @@ export function moveBoardCard(
       if (r?.track === 'image' && r.role_code && hasRole(db, actorStaffId, r.role_code)) return false;
       return !!(r && r.assignee_id == null && r.role_code);
     };
+    // D&D からの書き込みは **すべて boardMove** で通す。これで ⑧楽天登録 (役割なし) を
+    // 画像登録者が 開き直す / 出品の根拠があるなら閉じる の両方ができる (名指し R4 F: 片道にしない)。
+    // 未割り当ての人手工程なら引き受けも一緒にやる (Codex R3 P2: 状態だけ送ると
+    // 「先に『自分が担当する』を押してから操作してください」で 403 になり、
+    // 飛ばされる不具合が 403 に変わるだけになる)
     const setWithClaim = (code, state) => {
       const claim = unassignedHuman(code);
       setStepState(id, code, claim ? { assignee_id: actorStaffId, state } : { state }, actor,
-        { isAdmin, actorStaffId, boardClaim: claim });
+        { isAdmin, actorStaffId, boardClaim: claim, boardMove: true });
     };
+    const settled = (r) => r.state === 'done' || r.state === 'skip';
+    // 権限が無くて移動先を開き直せなかった工程の名前 (画面に出す。null = 問題なし)
+    let reopenBlocked = null;
     if (tIdx > curIdx) {
       // NE登録を飛び越せないことはここでは見ない。通過する工程は 1 つずつ setStepState を通り、
       // そこで「仮コードのままでは閉じられない」が効く (同じ判断を 2 箇所に持つと、
       // 本コードが確定したあとも D&D だけ 400 になる — Codex R2 medium)
-      for (let i = curIdx; i < tIdx; i++) setWithClaim(rows[i].step_code, 'done');
-      // 移動先 (= いまやる番) も未割り当てなら移動者に付ける (Codex R1: ドラッグ = 「自分が次工程を持っていく」の意思表示。
-      // 付けないと次の操作でまた「自分が担当する」が要る)。完了列 (tIdx = rows.length) には移動先が無い
-      if (tIdx < rows.length && unassignedHuman(rows[tIdx].step_code)) {
-        setStepState(id, rows[tIdx].step_code, { assignee_id: actorStaffId }, actor, { isAdmin, actorStaffId, boardClaim: true });
+      // 🚨 通過するのは **まだ決着していない工程だけ**。すでに done / 対象外 の工程は触らない
+      //    (2026-10-01 スタッフ報告の一因): 「対象外」は人が決めた結果なので、上を通っただけで
+      //    done に書き換えてはいけない。とくに ⑧楽天登録 は出品の根拠なしに done にできないので、
+      //    対象外の ⑧ を通過しようとすると 400 で移動ごと失敗していた
+      for (let i = curIdx; i < tIdx; i++) {
+        if (settled(rows[i])) continue;
+        setWithClaim(rows[i].step_code, 'done');
+      }
+      // 完了列 (tIdx = rows.length) には移動先が無い
+      if (tIdx < rows.length) {
+        const target = rows[tIdx];
+        // 🚨 「落とした列がその商品のいまやる工程になる」のが D&D の約束。移動先がすでに
+        //    決着している (対象外 / 完了) ときは開き直す — でないと currentOf が移動先を飛ばして、
+        //    カードは落とした列ではなく**その先の列**に出る。
+        //    2026-10-01 スタッフ報告:「2個セットで楽天未登録なのに、楽天登録に落とすと
+        //    A+コンテンツまで飛ばされる」= 親の画像をそのまま使うセットは作成時に
+        //    画像の工程がまるごと「対象外」になる (applyImagePlanToTrack) ため、
+        //    ⑧楽天登録 が skip のまま残っていた。
+        //    完了の移動先も開き直す (Codex 名指し R2 P1): 「楽天登録済み → ⑤デザイン修正へ差し戻し →
+        //    直したので ⑧楽天登録 へ」が通らないと、直した版を楽天へ反映する作業が board から消える。
+        //    ⑧の done は**楽天に出したことの正本ではない** (正本は draft_rakuten.registered_at と
+        //    モール別状況) ので、作業の印として開き直してよい。アプリから出し直せば自動で閉じる
+        if (settled(target)) {
+          // 🚨 開き直しは「落とした列に止める」ための**上乗せ**。移動先が他人の担当や
+          //    自分に無い承認の役割だと、その工程の通常の権限判定で 403 になる。
+          //    前は移動先を触らなかったので通っていた操作なので、**403 なら開き直しだけ諦める**
+          //    (カードは従来どおりその先の列に出る。移動そのものは成功させる — Codex 名指し R3 P1)。
+          //    権限判定は書き込みの前なので、諦めても通過工程の done はそのまま残る。
+          //    403 以外 (ゲートの 400・競合の 409) は従来どおり移動ごとロールバックする
+          try {
+            setWithClaim(target.step_code, 'todo');
+          } catch (e) {
+            if (e?.status !== 403) throw e;
+            // 飲んだことは戻り値で返す。画面が「落とした列に止まらなかった」理由を出せないと、
+            // いま直している症状と見分けが付かない (名指し R5 P2)
+            // 工程名だけだと、画面が「権限が足りません」と決めつけてしまう。
+            // 理由 (権限 / 楽天が対象外 …) はサーバーの文面をそのまま渡す (名指し R6 P2)
+            reopenBlocked = { label: target.label || target.step_code, message: e.message };
+          }
+        // 移動先 (= いまやる番) も未割り当てなら移動者に付ける (Codex R1: ドラッグ = 「自分が次工程を持っていく」の意思表示。
+        // 付けないと次の操作でまた「自分が担当する」が要る)
+        } else if (unassignedHuman(target.step_code)) {
+          setStepState(id, target.step_code, { assignee_id: actorStaffId }, actor, { isAdmin, actorStaffId, boardClaim: true });
+        }
       }
     } else {
+      // 後方移動 (差し戻し)。移動先は必ず決着済み (currentOf より左 = done か skip) なので、
+      // 前方移動と同じ扱いで開き直す。
+      // 🚨 ここが報告された不具合の**本命の経路** (Codex R4 P1): 親の画像をそのまま使うセットは
+      //    画像の工程が 10 段階まるごと「対象外」になるので、カードは最初から**完了列**にいる
+      //    (curIdx === rows.length)。そこから ⑧楽天登録 に直接落とすのはこの後方移動で、
+      //    boardMove を渡さないと役割なしの ⑧ で画像登録者が 403 になる
       setWithClaim(rows[tIdx].step_code, 'todo');
     }
-    return { changed: true };
+    return { changed: true, reopenBlocked };
   });
   return run();
 }
@@ -1589,6 +1711,10 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       (SELECT hold_note FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_hold_note,
       (SELECT material_status FROM draft_image_production ip WHERE ip.draft_id = d.id) AS material_status,
       (SELECT canva_url FROM draft_image_production ip WHERE ip.draft_id = d.id) AS canva_url,
+      ${/* 撮影指示書 (カメラ撮影指示URL) が作られたか (2026-10-01 スタッフ要望。カードの「撮影指示書：まだ／済」)。
+            「商品を発送していても指示書ができていない」を拾うための印なので、
+            撮影・素材ステータスとは別に出す */''}
+      (SELECT CASE WHEN TRIM(COALESCE(camera_instruction_url, '')) = '' THEN 0 ELSE 1 END FROM draft_image_production ip WHERE ip.draft_id = d.id) AS has_camera_instruction,
       (SELECT compose_status FROM draft_image_production ip WHERE ip.draft_id = d.id) AS compose_status,
       (SELECT CASE WHEN TRIM(COALESCE(product_info_text, '')) = '' THEN 0 ELSE 1 END FROM draft_image_production ip WHERE ip.draft_id = d.id) AS has_product_info,
       (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
@@ -1730,6 +1856,13 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       },
     // 本番の構成 (2026-09-13)。どの列にいても カードで 済/まだ が読めるようにする
     compose: composeStateOf(p.imageDetail, d.compose_status),
+    // 撮影指示書 (2026-10-01 スタッフ要望)。「商品を発送していても指示書ができていない」ことが
+    // あるので、撮影・素材ステータスとは別に 済/まだ を出す。済 = カメラ撮影指示URL が入っている。
+    // 撮影不要の商品は作る必要が無いので「対象外」(まだ のまま残すと仕入れ商品が軒並み まだ になる)
+    cameraInstruction: {
+      registered: d.has_camera_instruction === 1,
+      notRequired: d.material_status === 'not_required',
+    },
   });
 
   // 既存ページへのバリエーション追加か (2026-09-25)。カードの札用。まとめて 1 回で引く

@@ -1490,7 +1490,7 @@ router.post('/api/drafts/:id/compose', (req, res) => {
   if (typeof req.body?.done !== 'boolean') {
     return res.status(400).json({ ok: false, error: 'done は true / false で指定してください' });
   }
-  // 「まだ」も 'todo' として残す (NULL に戻すと ③素材待ちからの推定で 済 に戻ってしまう — Codex R1)
+  // 「まだ」も 'todo' として残す (NULL に戻すと ④AI制作からの推定で 済 に戻ってしまう — Codex R1)
   const status = req.body.done ? 'done' : 'todo';
   const db = getDB();
   const changed = db.transaction(() => {
@@ -3147,7 +3147,9 @@ router.post('/api/drafts/:id/board-move', (req, res) => {
       isAdmin: req.session?.role === 'admin',
       actorStaffId: me?.id ?? null,
     });
-    res.json({ ok: true, changed: r.changed });
+    // reopenBlocked = 移動先の工程を開き直す権限が無くて諦めた工程名 (移動自体は成功)。
+    // 画面が「落とした列に止まらなかった」理由を出すのに使う
+    res.json({ ok: true, changed: r.changed, reopenBlocked: r.reopenBlocked || null });
   } catch (e) { workflowError(res, e); }
 });
 
