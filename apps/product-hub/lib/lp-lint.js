@@ -184,10 +184,23 @@ export function lintComposition(output, { productName = null } = {}) {
   if (!headingBad.length && blocks.length) pass(7);
   else fail(7, '画像内の固定見出し', `15 見出しをこの表記・この順で出してください: ${IMAGE_HEADINGS.join('／')} — ${headingBad.join(' / ') || '画像がありません'}`);
 
-  // 8. 終端が 共通NG事項 → 共通生成後チェック (最後の画像より後ろ)
+  // 8. 終端が 共通NG事項 → 共通生成後チェック (最後の画像より後ろ)。
+  //    🚨 **これで文書が終わること**まで見る (codex exec review P2)。
+  //    並びと順だけを見ていたときは、`# 共通生成後チェック` の後ろに
+  //    `# おまけ` のようなブロックが続いても通った。仕様書は「最後まで完全出力」として
+  //    この 2 つを終端に指定しているし、パーサーもその中身を最後の共通ブロックに吸い込む。
   const tailAt = TAIL_BLOCKS.map((n) => blockLine(n, lastImageLine + 1, lines.length));
-  if (lastImageLine >= 0 && tailAt.every((i) => i >= 0) && tailAt[0] < tailAt[1]) pass(8);
-  else fail(8, '終端ブロック', `全画像の後に ${TAIL_BLOCKS.map((b) => `# ${b}`).join(' → ')} をこの順で出してください`);
+  const orderOk = lastImageLine >= 0 && tailAt.every((i) => i >= 0) && tailAt[0] < tailAt[1];
+  // 最後の終端ブロックより後ろに、別の H1 ブロックが無いこと
+  const afterTail = orderOk
+    ? lines.slice(tailAt[1] + 1).map((l) => l.match(BLOCK_HEADING_RE)).filter(Boolean).map((m) => m[1])
+    : [];
+  if (orderOk && afterTail.length === 0) pass(8);
+  else if (orderOk) {
+    fail(8, '終端ブロック', `# ${TAIL_BLOCKS[1]} で終わります。後ろに別のブロックがあります: ${afterTail.map((h) => `# ${h}`).join(' / ')}`);
+  } else {
+    fail(8, '終端ブロック', `全画像の後に ${TAIL_BLOCKS.map((b) => `# ${b}`).join(' → ')} をこの順で出してください`);
+  }
 
   // 9. 旧表記が無い
   const legacy = LEGACY_HEADINGS.filter((h) => h.re.test(text)).map((h) => h.label);

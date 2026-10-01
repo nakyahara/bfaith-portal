@@ -86,6 +86,17 @@ console.log('④ 検査 1〜12 — テキストの検査');
     false, '7: 固定見出しが 1 つ欠ければ落ちる');
   eq(lintOf(t((s) => s.replace('## 目的\n検索結果', '## ねらい\n検索結果'))).checks[7], false, '7: 表記が違っても落ちる');
   eq(lintOf(t((s) => s.replace(/# 共通生成後チェック[\s\S]*$/, ''))).checks[8], false, '8: 終端ブロックが欠ければ落ちる');
+  // 🚨 終端ブロックの**後ろに何か続いても落ちる** (codex exec review P2)。
+  //    以前は並びと順だけを見ていたので、後ろにブロックを足せた
+  eq(lintOf(t((s) => `${s}
+
+# おまけ
+必要に応じて追加してください。`)).checks[8], false,
+    '🚨 8: 終端ブロックの後ろに別の # ブロックがあれば落ちる');
+  ok(lintOf(t((s) => `${s}
+
+補足の文が最後に残っている。`)).checks[8] === true,
+    '8: 見出しの無い文は終端ブロックの中身として扱う (落とさない)');
   eq(lintOf(t((s) => s.replace('## 画像の役割', '## 役割'))).checks[9], false, '9: 旧表記「## 役割」で落ちる');
   eq(lintOf(t((s) => s.replace('## 使用カラー\n#FFFFFF', '## 使用カラー（HEX）\n#FFFFFF'))).checks[9], false, '9: 「使用カラー（HEX）」で落ちる');
   eq(lintOf(t((s) => s.replace('最小限。', '以下同様。'))).checks[10], false, '10: 「以下同様」で落ちる');
