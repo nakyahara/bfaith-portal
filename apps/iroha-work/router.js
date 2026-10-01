@@ -92,6 +92,7 @@ import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task
 import { listInboundPlan } from './inbound-plan.js';
 import { startConsignment, markPrepared, markHanded, cancelConsignment, recordReturn, settleConsignment, getConsignment, updateReturnCounts } from './consign.js';
 import { startStaffUnlock, staffUnlockOf, endStaffUnlock, STAFF_UNLOCK_MS } from './db.js';
+import { materialsOf, withPrimaryCode, canonicalizeMaterials, hasMaterialsDecision } from '../../lib/iroha-materials.js';
 import {
   addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, recordMediaCancel, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
   reportMediaUnavailable, recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
@@ -1488,7 +1489,9 @@ router.post('/api/label-waits', checkOrigin, api((req, res) => {
 
 // ⭐size_class (大きさ) は廃止 (中原さん 2026-09-06 — §AA)。大きさは配送方法から見なすので、手で登録する項目は要らない。
 //   DB の列と既存の値は残してあるが、もう読まないし書かない
-const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'expiry_seal'];
+// materials = 資材の配列 (正本。小分け袋と「何個ずつ」もここに入る)。
+// material_code = 古い iPad からの 1 件だけの更新 — 受けるが、2 件目以降は消さない (materials.js)
+const MASTER_FIELDS = ['materials', 'material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'expiry_seal'];
 // 廃止した項目。送られてきても書かないが、**エラーにもしない** (入れ替え途中の iPad が保存に失敗しない — Codex R1 #5)
 const DEPRECATED_MASTER_FIELDS = ['size_class'];
 
@@ -1546,6 +1549,13 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   }
   const fields = {};
   for (const f of MASTER_FIELDS) if (f in fieldsIn) fields[f] = fieldsIn[f];
+  // 🚨 資材は**ここで一度検証する**。あとの「変更があるか」の判定より前に弾かないと、
+  //    読めない指定が「変更なし」に見えて 200 で返り、入力が黙って消える (Codex 2026-10-01)
+  if ('materials' in fields) {
+    const mv = canonicalizeMaterials(fields.materials, { strict: true });
+    if (!mv.ok) return res.status(400).json({ ok: false, error: mv.error, message: mv.message });
+    fields.materials = mv.materials;   // 以降は正規化した形で見る (比較も保存も同じものを使う)
+  }
   const ignoredFields = DEPRECATED_MASTER_FIELDS.filter((f) => f in fieldsIn);
   if (Object.keys(fields).length === 0) {
     // 廃止した項目しか送ってこない古い画面 (キャッシュの残った iPad) は「変えなかった」で返す。
@@ -1581,7 +1591,12 @@ router.post('/api/master', checkOrigin, api((req, res) => {
 
   // DBが実際に変わるか (書き込み要否・unchanged判定) は**生値**で見る
   const { fills, overwrites } = classifyMasterEdit(row, fields);
-  if (fills.length === 0 && overwrites.length === 0) {
+  // 🚨 例外が 1 つ: **資材を「なし」にする指示**。マスタがまだ資材の答えを持っていない行では
+  //    生値どうしの比較が「空 → 空」に見えるが、書かないとカードに載っている古い資材が画面に残り続ける。
+  //    '[]' を書いて「資材なし」と答えさせる必要がある (Codex 2026-10-01)
+  const clearsCardMaterials = 'materials' in fields && fields.materials.length === 0
+    && !hasMaterialsDecision(row) && materialsOf(cardValues).length > 0;
+  if (fills.length === 0 && overwrites.length === 0 && !clearsCardMaterials) {
     return res.json({ ok: true, unchanged: true, row });
   }
   // 権限は**画面に見えていた実効値** (マスタ+カードのフォールバック合成) で見る (Codex PR4-R3:
@@ -1628,9 +1643,19 @@ router.post('/api/master', checkOrigin, api((req, res) => {
         // カード表示中の値をシード (今回指定されなかった項目だけ)。空欄埋め扱いなので権限は不要。
         // cardValues は上で商品コード一致を確認済み (別商品のカード値を混ぜない)
         const seed = {
+          // 資材は配列で引き継ぐ (小分け袋の指定ごと)。
+          // 🚨 スナップショットは手で直された値が入っていることもあるので、**読み出し用の寛容な正規化を通してから**使う
+          materials: materialsOf(cardValues).length > 0 ? materialsOf(cardValues) : undefined,
           material_code: cardValues.material_code, storage_container: cardValues.storage_container,
           units_per_container: cardValues.units_per_container, process_count: cardValues.process_count, note: cardValues.note,
         };
+        // 古い画面は 1 件目だけを送ってくる。カードに資材が載っていれば**それを土台にして 1 件目だけ差し替える**。
+        // 🚨 ここで配列を捨てると、マスタ行が無いカード (取込で消えた等) で 2 件目が消える (Codex 2026-10-01)。
+        //    materials は material_code より強いので、1 件目は送られてきた値になる
+        if ('material_code' in fields) {
+          const base = materialsOf(cardValues);
+          seed.materials = base.length > 0 ? withPrimaryCode(base, fields.material_code) : undefined;
+        }
         applyFields = { ...Object.fromEntries(Object.entries(seed).filter(([f, v]) => v != null && v !== '' && !(f in fields))), ...fields };
       } else {
         expect = Number(req.body.expect_version);
@@ -1652,7 +1677,11 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   // シードで書いた項目も含め、実際に適用した applyFields を対象に。切り詰めない
   // (入力は各フィールド上限500字までなのでJSON全体でも高々数KB — 途中切断で壊れたJSONを残さない)
   const oldVals = {}; const newVals = {};
-  for (const f of Object.keys(result.applyFields)) { oldVals[f] = row ? row[f] : null; newVals[f] = result.row[f]; }
+  for (const f of Object.keys(result.applyFields)) {
+    // 資材は列ではなく配列。row['materials'] は undefined なので、履歴から消えてしまう (Codex 2026-10-01)
+    if (f === 'materials') { oldVals[f] = materialsOf(row); newVals[f] = materialsOf(result.row); continue; }
+    oldVals[f] = row ? row[f] : null; newVals[f] = result.row[f];
+  }
   safeLog({
     action: 'master_edit', pageId: String(req.body?.page_id || '') || null,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
@@ -1661,7 +1690,8 @@ router.post('/api/master', checkOrigin, api((req, res) => {
     ok: true,
   });
   clearEnrichCache();   // 次の /api/state から新しい作業仕様で出す
-  res.json({ ok: true, row: result.row });
+  // 資材は配列で返す (画面が materials_json の生文字列を読まなくていいように)
+  res.json({ ok: true, row: { ...result.row, materials: materialsOf(result.row) } });
 }));
 
 // ─── 完成写真・動画 ───
