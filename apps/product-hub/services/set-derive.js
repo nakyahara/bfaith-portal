@@ -621,32 +621,57 @@ export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
   for (const r of rows) changed += upd.run(to, id, r.step_code, from).changes;
   // ⑧楽天登録 は「対象外」にはしないが、**対象外で残っていれば開き直す** (上の 🚨 のとおり)。
   // 人が進めた done は触らない (todo ⇄ skip だけ、は他の工程と同じ)。
-  // 🚨 もう楽天に出ている商品は `todo` ではなく **`done`** で開ける (Codex R10 P2)。
-  //    `todo` にすると、モールの done 遷移はもう起きないので閉じる自動の経路が無く、
-  //    出品済みなのに ⑧楽天登録 の列に残り続ける。根拠の見方は setStepState のゲートと同じ
-  const listedRk = !!db.prepare(`
-    SELECT 1 WHERE EXISTS (SELECT 1 FROM draft_rakuten WHERE draft_id = @id AND registered_at IS NOT NULL)
-       OR EXISTS (SELECT 1 FROM draft_mall_status WHERE draft_id = @id AND mall = 'rakuten' AND state = 'done')
-  `).get({ id });
-  changed += db.prepare(`
-    UPDATE draft_step_progress
-    SET state = @state,
-        done_at = CASE WHEN @state = 'done' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE NULL END,
-        done_by = CASE WHEN @state = 'done' THEN @actor ELSE NULL END,
-        version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-    WHERE draft_id = @id AND state = 'skip' AND step_code IN (
-      SELECT code FROM ph_steps WHERE active = 1 AND track = 'image' AND image_kind = 'detail'
-        AND image_stage = '${IMAGE_RAKUTEN_STAGE}'
-    )
-  `).run({ id, state: listedRk ? 'done' : 'todo', actor: actor || 'system' }).changes;
+  // 開き方は楽天の実態で決める (Codex R10 P2 / 名指し R5 P1):
+  //   ・楽天モールが「対象外」= この商品は楽天に出さない → ⑧も対象外のまま置く。
+  //     開くと、出品の根拠が無いので閉じられず、対象外に戻すのは管理者だけ = カードが詰まる
+  //   ・もう出ている (登録記録 / モール done) → **done** で開く。`todo` にすると
+  //     モールの done 遷移はもう起きないので閉じる自動の経路が無く、出品済みなのに列に残る
+  //   ・それ以外 → `todo` (これから出す)
+  const rkEvidence = db.prepare(`
+    SELECT (SELECT registered_at FROM draft_rakuten WHERE draft_id = @id) AS registered_at,
+           (SELECT state FROM draft_mall_status WHERE draft_id = @id AND mall = 'rakuten') AS mall_state,
+           (SELECT listed_at FROM draft_mall_status WHERE draft_id = @id AND mall = 'rakuten') AS listed_at
+  `).get({ id }) || {};
+  const rkSkipped = rkEvidence.mall_state === 'skip';
+  const listedRk = !rkSkipped && (!!rkEvidence.registered_at || rkEvidence.mall_state === 'done');
+  let rakutenChanged = 0;
+  if (!rkSkipped) {
+    rakutenChanged = db.prepare(`
+      UPDATE draft_step_progress
+      SET state = @state, done_at = @done_at, done_by = @done_by,
+          version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE draft_id = @id AND state = 'skip' AND step_code IN (
+        SELECT code FROM ph_steps WHERE active = 1 AND track = 'image' AND image_kind = 'detail'
+          AND image_stage = '${IMAGE_RAKUTEN_STAGE}'
+      )
+    `).run({
+      id,
+      state: listedRk ? 'done' : 'todo',
+      // 🚨 完了の日時・人は**実際に楽天へ出したときのもの**を使う (名指し R5 P2)。
+      //    計画を保存した時刻・人を入れると、工程の所要時間や担当者の集計が狂う。
+      //    どちらも取れないときは時刻を空にして、誰がやったかは下のイベントに残す
+      done_at: listedRk ? (rkEvidence.registered_at || rkEvidence.listed_at || null) : null,
+      done_by: listedRk ? 'system' : null,
+    }).changes;
+    changed += rakutenChanged;
+  }
   if (changed > 0) {
     logEvent(db, id, 'set_image_plan_track',
       needs
         ? '画像の計画に「直して使う/作り直す」が入ったので、画像の制作工程を戻しました'
-        : `画像はすべて親のものを使う計画なので、画像の制作工程を「対象外」にしました (⑧楽天登録は${listedRk ? '出品済みなので完了に' : '残します'})`,
+        : '画像はすべて親のものを使う計画なので、画像の制作工程を「対象外」にしました',
       actor);
   }
-  return { needsProduction: needs, changed };
+  // ⑧を動かしたことは**別のイベント**で残す (制作工程の話と混ぜると、
+  // 「制作工程を戻しました」の 1 行の中に ⑧ の補正が埋もれる — 名指し R5 P2)
+  if (rakutenChanged > 0) {
+    logEvent(db, id, 'set_image_plan_rakuten',
+      listedRk
+        ? `楽天登録(⑧) が「対象外」で残っていたので、出品済みの根拠 (${rkEvidence.registered_at ? 'アプリからの登録記録' : 'モール別の展開状況'}) を見て「完了」にしました`
+        : '楽天登録(⑧) が「対象外」で残っていたので「未着手」に戻しました (セットも楽天には出すため)',
+      actor);
+  }
+  return { needsProduction: needs, changed, rakutenChanged, rakutenSkipped: rkSkipped };
 }
 
 /**

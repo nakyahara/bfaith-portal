@@ -320,6 +320,13 @@ function assertOwnerScope(patch, actorStaffId) {
   }
 }
 
+/** 楽天モールが「対象外」か (= この商品は楽天に出さない)。⑧楽天登録 を開かせるかの判断に使う */
+function rakutenMallSkipped(db, draftId) {
+  return db.prepare(`
+    SELECT 1 FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten' AND state = 'skip'
+  `).get(Number(draftId)) != null;
+}
+
 function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim = false, boardMove = false }) {
   if (isAdmin) return;
 
@@ -342,9 +349,14 @@ function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClai
   //    影響はカードがどの列に出るかだけ: ⑧楽天登録 は listing_gate=0 で出品ゲートに数えず、
   //    楽天に出してよいかの判定は draft_mall_status / draft_rakuten が正 (assertRakutenListable)、
   //    status の導出 (deriveDraftStatus) も imgd_* を見ない
+  //    ・楽天モールが「対象外」の商品は**開かせない** (名指し R5 P1)。楽天に出さない商品の ⑧ を
+  //      開くと、出品の根拠が無いので閉じられず、対象外に戻せるのは管理者だけ = カードが詰まる。
+  //      ここで通さなければ、ボードの移動先としての開き直しは 403 を飲んで諦めるので、
+  //      カードは ⑧ を飛ばしてその先の列に出る (= 楽天に出さない商品の正しい見え方)
   if (boardMove && row.track === 'image' && row.image_stage === IMAGE_RAKUTEN_STAGE
     && !row.role_code && (patch?.state === 'todo' || patch?.state === 'done')
     && actorStaffId != null && hasRole(db, actorStaffId, IMAGE_TRACK_ROLE)
+    && !(patch.state === 'todo' && rakutenMallSkipped(db, row.draft_id))
     && Object.keys(patch).every((k) => k === 'state' || k === 'expected_version' || patch[k] === undefined)) {
     return;
   }
@@ -1146,7 +1158,7 @@ export function setStepState(
  * 「落とした列がその商品のいまやる工程になる」ように工程をまとめて更新する:
  *   - 前方 (右) へ: 現在工程から移動先の手前までを順に done に (移動先は todo のまま = いまやる番)。
  *     通過するのは**まだ決着していない工程だけ** / 移動先がすでに決着していれば開き直す (2026-10-01。
- *     開き直す権限が無ければ開き直しだけ諦める = 移動は成功させる)
+ *     開き直す権限が無ければ開き直しだけ諦める = 移動は成功させ、戻り値の reopenBlocked で画面に伝える)
  *   - 後方 (左) へ: 移動先の工程を todo に開け直す (間の done は触らない = currentOf が移動先を指す)。
  *     完了列 (全工程が決着) からの差し戻しも同じ経路
  *   - to='done' (完了列): 残りの工程を全部 done に。本流は listing の全モール決着チェックが効くので
@@ -1165,14 +1177,15 @@ export function moveBoardCard(
     ensureProgress(db, id);
     const rows = view === 'image'
       ? db.prepare(`
-          SELECT p.step_code, p.state, s.image_stage FROM draft_step_progress p
+          ${/* label は「開き直せなかった工程」を画面に出すのに使う (工程コードでは現場に伝わらない) */''}
+          SELECT p.step_code, p.state, s.label, s.image_stage FROM draft_step_progress p
           JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
           WHERE p.draft_id = ? AND s.track = 'image'
             AND ${kind === 'detail' ? "s.image_kind = 'detail'" : "(s.image_kind IS NULL OR s.image_kind != 'detail')"}
           ORDER BY s.sort, s.code
         `).all(id)
       : db.prepare(`
-          SELECT p.step_code, p.state, NULL AS image_stage FROM draft_step_progress p
+          SELECT p.step_code, p.state, s.label, NULL AS image_stage FROM draft_step_progress p
           JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
           ${/* 本流はドラフトによって main か set のどちらか (セットは専用テンプレート・
                 2026-09-04)。片方に決め打つと、セットは listing だけの 1 行になって動かせない */''}
@@ -1258,6 +1271,8 @@ export function moveBoardCard(
         { isAdmin, actorStaffId, boardClaim: claim, boardMove: true });
     };
     const settled = (r) => r.state === 'done' || r.state === 'skip';
+    // 権限が無くて移動先を開き直せなかった工程の名前 (画面に出す。null = 問題なし)
+    let reopenBlocked = null;
     if (tIdx > curIdx) {
       // NE登録を飛び越せないことはここでは見ない。通過する工程は 1 つずつ setStepState を通り、
       // そこで「仮コードのままでは閉じられない」が効く (同じ判断を 2 箇所に持つと、
@@ -1295,6 +1310,9 @@ export function moveBoardCard(
             setWithClaim(target.step_code, 'todo');
           } catch (e) {
             if (e?.status !== 403) throw e;
+            // 飲んだことは戻り値で返す。画面が「落とした列に止まらなかった」理由を出せないと、
+            // いま直している症状と見分けが付かない (名指し R5 P2)
+            reopenBlocked = target.label || target.step_code;
           }
         // 移動先 (= いまやる番) も未割り当てなら移動者に付ける (Codex R1: ドラッグ = 「自分が次工程を持っていく」の意思表示。
         // 付けないと次の操作でまた「自分が担当する」が要る)
@@ -1311,7 +1329,7 @@ export function moveBoardCard(
       //    boardMove を渡さないと役割なしの ⑧ で画像登録者が 403 になる
       setWithClaim(rows[tIdx].step_code, 'todo');
     }
-    return { changed: true };
+    return { changed: true, reopenBlocked };
   });
   return run();
 }

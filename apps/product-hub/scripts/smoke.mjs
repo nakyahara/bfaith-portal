@@ -4244,6 +4244,22 @@ let wfSetParentId = null;
   put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
   check('🚨 もう楽天に出ている旧セットは ⑧楽天登録 を「完了」で開ける (未着手で残すと閉じられない)',
     rkStep() === 'done', rkStep());
+  // 🚨 完了の日時・人は**実際に楽天へ出したときのもの** (名指し R5 P2)。計画を保存した時刻・人を
+  //    入れると工程の所要時間や担当者の集計が狂う
+  {
+    const rkRow = db.prepare("SELECT done_at, done_by FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_rakuten'").get(setId);
+    const listedAt = db.prepare("SELECT listed_at FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").get(setId)?.listed_at || null;
+    check('🚨 計画の保存で完了にした ⑧ の日時は実際の出品の日時・人は system (計画を保存した人を入れない)',
+      rkRow?.done_by === 'system' && rkRow?.done_at === listedAt, JSON.stringify({ ...rkRow, listedAt }));
+    const ev = db.prepare("SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_image_plan_rakuten' ORDER BY id DESC LIMIT 1").get(setId);
+    check('🚨 ⑧を動かしたことは別のイベントで残る (制作工程の 1 行に埋もれない)',
+      !!ev && /完了/.test(ev.detail), ev?.detail || '(イベントが無い)');
+  }
+  // 🚨 楽天モールが「対象外」のセットは ⑧ を開かない (開くと閉じられず詰まる)
+  db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
+  db.prepare("UPDATE draft_mall_status SET state = 'skip' WHERE draft_id = ? AND mall = 'rakuten'").run(setId);
+  put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+  check('🚨 楽天が「対象外」のセットは ⑧楽天登録 を開かない (対象外のまま)', rkStep() === 'skip', rkStep());
   db.prepare("DELETE FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").run(setId);
   db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
   const firstStep = detailSteps()[0].step_code;
@@ -5653,6 +5669,23 @@ let wfSetParentId = null;
       db.prepare("DELETE FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").run(idSkip);
       db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_aplus'").run(idSkip);
     }
+    // 🚨 楽天モールが「対象外」の商品は ⑧ を開かせない (名指し R5 P1)。
+    //    開くと出品の根拠が無いので閉じられず、対象外に戻せるのは管理者だけ = カードが詰まる。
+    //    移動自体は成功し、カードは ⑧ を飛ばして先の列に出る (= 楽天に出さない商品の正しい見え方)
+    {
+      db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idSkip);
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_amazon'").run(idSkip);
+      db.prepare(`
+        INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'skip')
+        ON CONFLICT(draft_id, mall) DO UPDATE SET state = 'skip'
+      `).run(idSkip);
+      const mv = wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_amazon' }, 'img', SKIP_IMG);
+      check('🚨 D&D: 楽天が「対象外」の商品は ⑧楽天登録 を開かない (移動は成功・理由を返す)',
+        mv.changed === true && !!mv.reopenBlocked && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'done',
+        `reopenBlocked=${mv.reopenBlocked} / ⑧=${st('imgd_rakuten')}`);
+      db.prepare("DELETE FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").run(idSkip);
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idSkip);
+    }
     // 🚨 「対象外」にする道は開けていない (従来どおり管理者だけ)
     let skipSys = null;
     try { wfpEarly.setStepState(idSkip, 'imgd_rakuten', { state: 'skip' }, 'img', SKIP_IMG); } catch (e) { skipSys = e; }
@@ -5750,12 +5783,15 @@ let wfSetParentId = null;
     wfpEarly.setStepState(idDoneOther, 'title_approve', { state: 'done' }, 'admin', ADMIN2);
     wfpEarly.setStepState(idDoneOther, 'title_approve', { assignee_id: wfOkawaId }, 'admin', ADMIN2);
     let doneOtherErr = null;
+    let doneOtherMove = null;
     try {
-      wfpEarly.moveBoardCard(idDoneOther, { view: 'main', to: 'title_approve', expectedCurrent: 'basic_info' }, 'reg', REG);
+      doneOtherMove = wfpEarly.moveBoardCard(idDoneOther, { view: 'main', to: 'title_approve', expectedCurrent: 'basic_info' }, 'reg', REG);
     } catch (e) { doneOtherErr = e; }
     check('🚨 D&D: 完了で他人担当の移動先は開き直しだけ諦めて移動は成功する (403 で全部巻き戻さない)',
       !doneOtherErr && stD('basic_info').state === 'done' && stD('title_approve').state === 'done',
       doneOtherErr?.message || JSON.stringify([stD('basic_info'), stD('title_approve')]));
+    check('D&D: 開き直せなかった工程名を戻り値で返す (画面が理由を出せる)',
+      doneOtherMove?.reopenBlocked === 'タイトル確認', JSON.stringify(doneOtherMove));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDoneOther);
     wf.setStaffActive(regStaffId, false);
   }

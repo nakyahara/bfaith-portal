@@ -3147,7 +3147,9 @@ router.post('/api/drafts/:id/board-move', (req, res) => {
       isAdmin: req.session?.role === 'admin',
       actorStaffId: me?.id ?? null,
     });
-    res.json({ ok: true, changed: r.changed });
+    // reopenBlocked = 移動先の工程を開き直す権限が無くて諦めた工程名 (移動自体は成功)。
+    // 画面が「落とした列に止まらなかった」理由を出すのに使う
+    res.json({ ok: true, changed: r.changed, reopenBlocked: r.reopenBlocked || null });
   } catch (e) { workflowError(res, e); }
 });
 

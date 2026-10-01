@@ -1265,6 +1265,7 @@
     const body = col.querySelector('.kb-body');
     const moved = [];
     const errors = [];
+    const blocked = [];
     for (const c of group) {
       // 落とした列に元からいたカードは工程を動かさない (並び順だけ揃える)
       if (c.dataset.fromCol === to) { moved.push(c); continue; }
@@ -1276,7 +1277,11 @@
           }),
         });
         const j = await res.json();
-        if (j.ok) moved.push(c); else errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': ' + (j.error || '移動できませんでした'));
+        if (j.ok) {
+          moved.push(c);
+          // 移動はできたが落とした列に止まらなかったカードも知らせる (1 枚ずつのドロップと同じ理由)
+          if (j.reopenBlocked) blocked.push((c.dataset.name || ('#' + c.dataset.draft)) + ': 「' + j.reopenBlocked + '」を開き直せないため先の工程に進みました');
+        } else errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': ' + (j.error || '移動できませんでした'));
       } catch (err) {
         errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': 通信エラー ' + err.message);
       }
@@ -1296,6 +1301,7 @@
     }
     let msg = '';
     if (errors.length) msg += moved.length + ' 件を移動しました。移動できなかったカード (' + errors.length + ' 件):\n\n' + errors.join('\n');
+    if (blocked.length) msg += (msg ? '\n\n' : '') + '落とした列に止まらなかったカード (' + blocked.length + ' 件・権限が足りません):\n\n' + blocked.join('\n');
     // 1 枚ずつ落としたときに出る「楽天に出品しますか」は、まとめて移動では出さない (続けて何件も公開しない)
     if (moved.length && BOARD_VIEW !== 'image' && to === 'listing') {
       msg += (msg ? '\n\n' : '') + 'まとめて移動したときは楽天への出品の確認を出しません。出品は 1 枚ずつ「出品・展開」に落とすか、詳細画面から行ってください';
@@ -1408,6 +1414,7 @@
         return;
       }
       let moved = false;
+      let reopenBlocked = null;
       try {
         const res = await fetch('/apps/product-hub/api/drafts/' + card.dataset.draft + '/board-move', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1419,13 +1426,20 @@
           }),
         });
         const j = await res.json();
-        if (j.ok) moved = true; else alert(j.error || '移動できませんでした');
+        if (j.ok) { moved = true; reopenBlocked = j.reopenBlocked || null; } else alert(j.error || '移動できませんでした');
       } catch (err) {
         alert('通信エラー: ' + err.message);
       }
+      // 落とした列の工程を開き直す権限が無くて諦めた = カードは**その先の列**に出る。
+      // 黙っていると、いま直している「落とした列に止まらない」症状と見分けが付かない
+      if (moved && reopenBlocked) {
+        alert('移動しました。ただし「' + reopenBlocked + '」はあなたの権限では開き直せないため、'
+          + 'カードはその先の工程に進みます。この工程に止めたい場合は管理者に依頼してください。');
+      }
       // 工程が動いたときだけ、落とした位置を並び順として残す (失敗時に位置だけ残ると
-      // 読み直しで元の列に戻ったカードが変な順で並ぶ)
-      if (moved) await saveOrder(col);
+      // 読み直しで元の列に戻ったカードが変な順で並ぶ)。
+      // 開き直せなかったときは落とした列に止まらないので、その列の並び順は保存しない
+      if (moved && !reopenBlocked) await saveOrder(col);
       // 「出品・展開」に落とした = 楽天に出す番 (2026-09-01 中原さん要望)。工程移動が済んだあとに
       // 確認を出し、OK なら 画像転送 → 公開で登録 まで続ける。取りやめても工程移動は残る。
       // 楽天が済み/対象外の商品 (他モールの展開で戻ってきた等) には聞かない。
