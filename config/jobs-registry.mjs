@@ -327,7 +327,7 @@ export const JOBS_REGISTRY = [
     // 1 分おきなので、1 時間 ping が途切れたらタスクが止まっている (miniPC のログオフ・タスク無効化)
     max_age_hours: 1,
     lifecycle: 'permanent',
-    runbook: 'scripts/ph-nightly/README.md「LP 構成の AI 生成」。C:\tools\ph-nightly\logs\lp-compose.log と *.lp.err.log を見る: '
+    runbook: 'scripts/ph-nightly/README.md「LP 構成の AI 生成」。C:\\tools\\ph-nightly\\logs\\lp-compose.log と *.lp.err.log を見る: '
       + '"skipped (another Claude job holds the lock)" → 夜間ジョブが動いている間は正常 (次の分で拾う) / '
       + '"needs_review +N" (partial) → AI を呼んだのに結果が返らなかった = 成否不明。**自動では作り直さない**ので、画面でもう一度依頼する / '
       + '"nothing moved" (fail) → claude の認証切れ・ツールの deny・仕様書が未取込。*.lp.out.log の permission_denials と Claude の最後の報告を見る / '
@@ -558,7 +558,7 @@ export const JOBS_REGISTRY = [
       + '取込側 (Render) も 0 件・中身が別物の CSV を断る (#1263) — 二重の歯止め。'
       + '2026-09-08 に 0 行の CSV で Drive を上書き → 取込が「全行が消えた」と判定 → いろはの在庫化カードが一斉に消えた事故の再発防止。'
       + '本当に入荷が無い日は前回の一覧が残るだけで正しい。手動アップロードも同じ歯止めを通る (断られた CSV は、中身を見て確認したときだけ合言葉つきで通せる)',
-    where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\tools\logizard-automation\run-nyuka-csv-scheduled.bat',
+    where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\\tools\\logizard-automation\\run-nyuka-csv-scheduled.bat',
     schedule: '毎日 00:20 / 08:40 / 11:45',
     // 🚨 anchor は **08:40 のまま**にする (2026-09-07 に 00:20 を足したときの判断)。
     //    00:20 に寄せると「深夜が成功していれば朝の 08:40 が壊れていても緑」になり、
@@ -567,7 +567,7 @@ export const JOBS_REGISTRY = [
     anchor_minute_jst: 40,
     grace_hours: 6,
     lifecycle: 'permanent',
-    runbook: 'C:\tools\logizard-automation\logs\scheduled.log の [nyuka-csv] を確認 (手で試すなら node auto-nyuka-csv.js --dry)。'
+    runbook: 'C:\\tools\\logizard-automation\\logs\\scheduled.log の [nyuka-csv] を確認 (手で試すなら node auto-nyuka-csv.js --dry)。'
       + '取込側の状態は /apps/inbound-check/admin (Drive の更新日時・取込履歴・失敗理由。「Drive から今すぐ取り込む」ボタンあり)。'
       + '⭐予定外の納品は定時を待たず iPad / 管理画面の「🚚 いま取りに行く」で同じスクリプトを1回走らせられる '
       + '(miniPC POST /service-api/logizard/nyuka-refresh → apps/warehouse/logizard-export-service.js)。'
@@ -579,7 +579,7 @@ export const JOBS_REGISTRY = [
       + '(00:20 = 在庫CSV 00:00 の20分後。日付が変わってすぐ取り直し、朝いちばんの一覧を当日ぶんにする 2026-09-07 追加)。'
       + '保険として bat が最大10分ロックの解放を待ってから node を起動する (node の acquireLock は失敗時に即終了するため)。'
       + '異常終了で残ったロックは PID の死亡を確認して削除。'
-      + '画面採取の正本 = AI_reference『ロジザード作業自動化\入荷状況照会CSV_画面採取_20260901.md』。'
+      + '画面採取の正本 = AI_reference『ロジザード作業自動化\\入荷状況照会CSV_画面採取_20260901.md』。'
       + '🆕2026-09-28 から、入荷受付CSV と商品マスタの書き出しの間に「毎日の商品マスタの取込 (影)」(scripts/logizard-import/lz-daily-import.mjs・台帳 lz-daily-import-shadow) が走る '
       + '(00:20 の回だけ動く・08:40 / 11:45 は何もしない・この bat の終了コードは変えない)。bat の正本 = bfaith-portal の tools/logizard-automation/',
   },
