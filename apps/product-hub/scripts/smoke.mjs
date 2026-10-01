@@ -5635,6 +5635,23 @@ let wfSetParentId = null;
         noRoleErr?.message || '例外が出ていない');
       wf.setStaffActive(noRoleId, false);
     }
+    // 🚨 抜け道は ⑧楽天登録 の段階だけ (Codex R9 P2)。管理画面から足した「役割なしの画像工程」には
+    //    効かせない (これも従来はシステム工程 = 管理者だけの扱い)
+    {
+      const customCode = wf.createStep({ label: '役割なしのカスタム画像工程', track: 'image', image_kind: 'detail' });
+      db.prepare('UPDATE ph_steps SET role_code = NULL WHERE code = ?').run(customCode);
+      wfpEarly.ensureProgress(db, idSkip);
+      db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = ?").run(idSkip, customCode);
+      const custState = () => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idSkip, customCode)?.state;
+      let custErr = null;
+      try {
+        wfpEarly.setStepState(idSkip, customCode, { state: 'todo' }, 'img', SKIP_IMG);
+      } catch (e) { custErr = e; }
+      check('D&D の抜け道: 役割なしのカスタム画像工程は画像登録者でも開き直せない (⑧楽天登録 の段階だけ)',
+        custErr?.status === 403 && custState() === 'skip', custErr?.message || custState());
+      db.prepare('UPDATE ph_steps SET active = 0 WHERE code = ?').run(customCode);
+      db.prepare('DELETE FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').run(idSkip, customCode);
+    }
     // 🚨 本流のシステム工程 (出品・展開) には効かせない。そもそも「対象外」にできない工程なので、
     //    画像トラック限定にしておけば、ここから status (expanded) を巻き戻す道は増えない
     {

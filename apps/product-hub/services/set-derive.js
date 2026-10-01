@@ -11,7 +11,7 @@
  * buildItemPayload が provisional_code=1 を見て出品を止める (出品直前ゲート)。
  */
 import { getDB, logEvent } from '../db.js';
-import { ensureProgress, setStepState } from '../lib/workflow-progress.js';
+import { ensureProgress, setStepState, IMAGE_RAKUTEN_STAGE } from '../lib/workflow-progress.js';
 import { SET_NE_STEP_CODE } from '../lib/set-decision.js';
 // 画像の引き継ぎ計画 (§4.7)。枠の数え方・語彙・「制作が要るか」の判定は lib 側が正
 import {
@@ -606,8 +606,9 @@ export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
     SELECT p.step_code, p.state FROM draft_step_progress p
     JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
     WHERE p.draft_id = ? AND s.track = 'image' AND s.image_kind = 'detail'
-      ${/* 工程コードでなく image_stage で外す (管理画面で改名されても壊れない) */''}
-      AND COALESCE(s.image_stage, '') <> 'rakuten'
+      ${/* 工程コードでなく image_stage で外す (管理画面で改名されても壊れない)。
+            段階キーは workflow-progress.js の IMAGE_RAKUTEN_STAGE が正 (定数なので SQL に埋める) */''}
+      AND COALESCE(s.image_stage, '') <> '${IMAGE_RAKUTEN_STAGE}'
   `).all(id);
   const from = needs ? 'skip' : 'todo';
   const to = needs ? 'todo' : 'skip';
@@ -620,7 +621,14 @@ export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
   for (const r of rows) changed += upd.run(to, id, r.step_code, from).changes;
   // ⑧楽天登録 は「対象外」にはしないが、**対象外で残っていれば開き直す** (上の 🚨 のとおり)。
   // 人が進めた done は触らない (todo ⇄ skip だけ、は他の工程と同じ)
-  changed += upd.run('todo', id, 'imgd_rakuten', 'skip').changes;
+  changed += db.prepare(`
+    UPDATE draft_step_progress SET state = 'todo', version = version + 1,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE draft_id = ? AND state = 'skip' AND step_code IN (
+      SELECT code FROM ph_steps WHERE active = 1 AND track = 'image' AND image_kind = 'detail'
+        AND image_stage = '${IMAGE_RAKUTEN_STAGE}'
+    )
+  `).run(id).changes;
   if (changed > 0) {
     logEvent(db, id, 'set_image_plan_track',
       needs

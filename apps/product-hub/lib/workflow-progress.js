@@ -28,6 +28,11 @@ const SET_PLANNER_STEPS = ['set_compose', SET_NE_STEP, 'set_content'];
  * 役割を置かない ⑧楽天登録 を D&D で開き直せるのは、この役割を持つ人と管理者だけ (2026-10-01)。
  */
 const IMAGE_TRACK_ROLE = 'image';
+/**
+ * ⑧楽天登録 の段階キー (image_stage)。工程コードでなく段階で見るのは管理画面での改名に強いため。
+ * 「出品すると自動で完了する」唯一の画像工程で、D&D の開き直しの例外もこの段階だけに効かせる。
+ */
+export const IMAGE_RAKUTEN_STAGE = 'rakuten';
 /** 「AI情報入力待ち」。夜間の AI が完了にする工程だが、担当者なら手で抜ける・戻せる (2026-09-25) */
 const AI_STEP = 'ai_generate';
 // モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
@@ -324,15 +329,18 @@ function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClai
   // 「画像の工程は役割で動かせる」(row.role_code を見る) に乗れず、このままでは
   // 報告された「落とした列の先へ飛ばされる」が非管理者では 403 に変わるだけで直らない。
   //
-  // 🚨 抜け道はできるだけ狭くする (Codex R3 P1):
-  //    ・**画像トラックの役割なし工程だけ** (本流の AI情報入力待ち・出品・展開には効かせない。
-  //      AI待ちを手で戻すのは下の AI_STEP の例外が既に担っている)
+  // 🚨 抜け道はできるだけ狭くする (Codex R3 P1 / R9 P2):
+  //    ・**⑧楽天登録 の段階だけ** (image_stage='rakuten')。本流の AI情報入力待ち・出品・展開も、
+  //      管理画面から足した役割なしの画像工程も対象にしない
+  //      (AI待ちを手で戻すのは下の AI_STEP の例外が既に担っている)
+  //    ・**役割を置かない工程のときだけ** (役割があればこの下の通常の判定でそのまま通る)
   //    ・**画像登録者の役割を持つ人だけ** (= 画像の工程を動かせる人。関係ない担当者は通さない)
   //    ・**state='todo' の 1 本だけ** — 「システムが進める工程を人が完了にする」は依然できない
   //    影響はカードがどの列に出るかだけ: ⑧楽天登録 は listing_gate=0 で出品ゲートに数えず、
   //    楽天に出してよいかの判定は draft_mall_status / draft_rakuten が正 (assertRakutenListable)、
   //    status の導出 (deriveDraftStatus) も imgd_* を見ない
-  if (boardReopen && row.track === 'image' && !row.role_code && patch?.state === 'todo'
+  if (boardReopen && row.track === 'image' && row.image_stage === IMAGE_RAKUTEN_STAGE
+    && !row.role_code && patch?.state === 'todo'
     && actorStaffId != null && hasRole(db, actorStaffId, IMAGE_TRACK_ROLE)
     && Object.keys(patch).every((k) => k === 'state' || k === 'expected_version' || patch[k] === undefined)) {
     return;
@@ -859,7 +867,7 @@ export function assertStepOperable(db, draftId, stepCode, expectedVersion, { isA
   const code = String(stepCode || '');
   ensureProgress(db, id);
   const row = db.prepare(`
-    SELECT p.*, s.label, s.role_code, s.track, s.image_kind, s.skippable FROM draft_step_progress p
+    SELECT p.*, s.label, s.role_code, s.track, s.image_kind, s.image_stage, s.skippable FROM draft_step_progress p
     JOIN ph_steps s ON s.code = p.step_code
     WHERE p.draft_id = ? AND p.step_code = ?
   `).get(id, code);
@@ -890,7 +898,7 @@ export function setStepState(
   const row = db.prepare(`
     -- role_code は権限判定に使う (システム工程かどうか)。取り忘れると undefined になり、
     -- 通常の工程まで「システム工程」と誤判定して一般ユーザーが弾かれる
-    SELECT p.*, s.label, s.role_code, s.track, s.image_kind, s.skippable FROM draft_step_progress p
+    SELECT p.*, s.label, s.role_code, s.track, s.image_kind, s.image_stage, s.skippable FROM draft_step_progress p
     JOIN ph_steps s ON s.code = p.step_code
     WHERE p.draft_id = ? AND p.step_code = ?
   `).get(id, code);
