@@ -14,7 +14,9 @@
  *     下書きの状態を作る関数も実行できない・ops.begin_master_write で登録の約束 (sku_create) は作れない = 関数だけが登録の約束を書く・
  *     関数を直接呼んでも DB の決まり (コード・構成品・代表の仕入先・持ち主表・形) で断る・関数の外では登録の約束で書けない・
  *     変更の記録と状態の記録は約束の人・request_id・理由 (偽の core.actor_* は使わない)・登録の約束も done が要る (0051 の commit の確かめ)・
- *     DB の守りが見る列の持ち主のキーは NEW_ENTRY_KEYS に全部入っている・DB が段階 / 持ち主表で断った = 409 before_cutover
+ *     DB の守りが見る列の持ち主のキーは NEW_ENTRY_KEYS に全部入っている・DB が段階 / 持ち主表で断った = 409 before_cutover・
+ *     関数を直接呼んで値を偽っても DB が確かめる / 作り直す (単品の税率と税区分・名前・売価・発送方法・原価の出どころと日・セットだけの列・
+ *     セットの導く値 (DB で導き直す)・構成品のコード・カードの写しの欄・rows_hash / カードの hash / 約束のハッシュは DB が作る。Codex R3 Medium 1)
  *   R 新商品の登録: 門 (段階 new_open・持ち主 company・MASTER_EDIT_OPEN) が閉じている = 409 何も書かない (失敗の記録は残る)・形の検査 400・
  *     コードの検査 409 (Company DB・名札・NE・消したコード)・単品 / セットを 1 つの取引で (SKU・商品・状態 draft・仕入先・原価・構成の依頼・知らせ・記録)・
  *     巻き戻る = 知らせも残らない・同じ request_id = 前の結果・編集の印に登録の状態・やめた商品は直せない
@@ -87,9 +89,10 @@ async function tx(fn) {
 }
 
 const ALL_COMPANY = Object.fromEntries(Object.keys(MASTER_OWNERSHIP).map((k) => [k, 'company']));
-const LOAD_NOW = new Date('2030-01-05T03:00:00Z');
-const NOW = new Date('2030-01-10T03:00:00Z');
-const TODAY = '2030-01-10';
+/** 日付 = 本物の今日 (0052 の登録の関数は原価の始まりを DB の今日 (東京) だけにする = 画面の「今日」と同じでないと断る) */
+const LOAD_NOW = new Date(Date.now() - 5 * 86400e3);
+const NOW = new Date();
+const TODAY = (await pg.query("select (now() at time zone 'Asia/Tokyo')::date::text as d")).rows[0].d;
 const RATES = new Map([['S01', { method: 'ゆうパケット', cost: 210.4 }], ['S02', { method: '宅急便', cost: 520 }], ['S03', { method: '謎の便', cost: 300 }]]);
 const RUN = 'mc_20300109T000000000Z_abcdef';
 const uuid = () => crypto.randomUUID();
@@ -659,7 +662,7 @@ await ta('[G2] 登録の約束 (sku_create) は登録の関数だけが書く: b
     ['単品なのに商品が無い', regEntry('g-x1', { product: null }), /invalid_input: 単品は商品/],
     ['セットなのに構成が無い', regEntry('g-x2', { kind: 'set', product: null }), /invalid_input: セットは構成の依頼/],
     ['構成品が登録をやめた商品', setEntry('g-x3', [{ sku_id: tx2, code: 'tx-2', qty: 1, sort: 1 }]), /^component_unusable/],
-    ['構成品がセット (0051 の業務の約束)', setEntry('g-x4', [{ sku_id: set001, code: 'set001', qty: 1, sort: 1 }]), /master_write_invariant/],
+    ['構成品がセット', setEntry('g-x4', [{ sku_id: set001, code: 'set001', qty: 1, sort: 1 }]), /^component_unusable/],
     ['代表の仕入先が取引停止 (0051 の業務の約束)', regEntry('g-x5', { supplier_id: inactive }), /master_write_invariant/],
     ['持ち主表が切替のときと違う', regEntry('g-x6'), /^before_cutover: 持ち主表/, { ownership: MASTER_OWNERSHIP }],
   ]) {
@@ -718,6 +721,66 @@ await ta('[G3] DB が段階・持ち主表で断った (ops.register_new_sku) = 
   const r = await reg('single', 'g-ok-2', single({ name: '守りの単品' }), { create: false }, { reason: '守りの理由' });
   assert.deepEqual(await one('select operation, actor_id, reason, db_user from ops.master_write_sessions where request_id = $1', [r.request_id]),
     { operation: 'sku_create', actor_id: 'naka@test', reason: '守りの理由', db_user: 'master_edit' });
+});
+
+await ta('[G4] 画面のロールが登録の関数を直接呼んで値を偽っても、DB が確かめる / 作り直す (Codex R3 Medium 1)', async () => {
+  const s001 = Number(await skuId('s001'));
+  const ship = { code: 'S01', method: 'ゆうパケット', cost_jpy: 210 };
+  const cardOf = (code, kind, name, price, comps = []) => O.cardEventOf(O.buildCardPayload({ code, kind, name, price, shipping: ship, card: {}, components: comps, actor: 'naka@test' }));
+  const one1 = (code, over = {}, sku = {}) => { const e = regEntry(code); return { ...e, ...over, sku: { ...e.sku, ...sku } }; };
+  const setRows = [{ sku_id: s001, code: 's001', qty: 2, sort: 1 }];
+  const goodCost = { jpy: 200, source: 'set_calc', status: 'COMPLETE', valid_from: TODAY, reason: '構成品から計算' };
+  const set1 = (code, over = {}, sku = {}) => { const e = setEntry(code, setRows); return { ...e, cost: goodCost, ...over, sku: { ...e.sku, ...sku } }; };
+  // 正しい形は通る (取引は巻き戻す)
+  for (const e of [one1('g4-a', { card: cardOf('g4-a', 'single', '直接の単品', 1000) }), set1('g4-b', { card: cardOf('g4-b', 'set', '直接のセット', 1000, [{ code: 's001', qty: 2 }]) })]) {
+    const r = await editorTx(async () => (await callReg(uuid(), e)).rows[0].r);
+    assert.ok(!(r instanceof Error), `${e.code}: ${r && r.message}`);
+  }
+  const manual = (status, from = TODAY, source = 'manual') => ({ jpy: 10, source, status, valid_from: from, reason: '直接' });
+  for (const [label, entry, re] of [
+    ['単品の税率が無い', one1('g4-1', {}, { tax_rate: null }), /^invalid_value: 単品の税率/],
+    ['税率 8% と STANDARD_10', one1('g4-2', {}, { tax_rate: 0.08, tax_class: 'STANDARD_10' }), /^invalid_value: 税率/],
+    ['名前が空', one1('g4-3', { product: { ...regEntry('g4-3').product, name: '' } }, { name: '' }), /^invalid_value: 名前/],
+    ['商品と SKU の名前が違う', one1('g4-3b', { product: { ...regEntry('g4-3b').product, name: '別の名前' } }), /^invalid_value: 商品の名前/],
+    ['売価 0', one1('g4-4', {}, { standard_price_jpy: 0 }), /^invalid_value: 売価/],
+    ['発送方法が無い', one1('g4-5', {}, { shipping_method: null }), /^invalid_value: 送料コードと発送方法/],
+    ['単品の原価が set_calc', one1('g4-6', { cost: manual('COMPLETE', TODAY, 'set_calc') }), /^invalid_value: 単品の原価/],
+    ['単品の原価が MISSING', one1('g4-7', { cost: manual('MISSING') }), /^invalid_value: 単品の原価/],
+    ['原価の始まりが先の日', one1('g4-8', { cost: manual('COMPLETE', '2099-01-01') }), /^invalid_value: 原価は/],
+    ['原価の始まりが前の日', one1('g4-8b', { cost: manual('COMPLETE', '2020-01-01') }), /^invalid_value: 原価は/],
+    ['単品にセットだけの列', one1('g4-9', {}, { handling_own: 'active' }), /^invalid_value: 単品にセットだけの列/],
+    ['単品の取扱が中止', one1('g4-9b', {}, { handling: 'discontinued' }), /^invalid_value: 新しい単品の取扱/],
+    ['セットの税率が構成品と違う', set1('g4-10', {}, { tax_rate: 0.08, tax_class: 'REDUCED_8' }), /^derived_mismatch/],
+    ['セットの取扱が構成品と違う', set1('g4-11', {}, { handling: 'discontinued' }), /^derived_mismatch/],
+    ['セットの原価が構成品の合計と違う', set1('g4-12', { cost: { ...goodCost, jpy: 1 } }), /^derived_mismatch/],
+    ['セットの原価が MISSING', set1('g4-12b', { cost: { ...goodCost, source: 'manual', status: 'MISSING' } }), /^invalid_value: セットの原価/],
+    ['導けるのに売上分類を上書き', set1('g4-13', {}, { set_sales_class_override: 1 }), /^derived_mismatch/],
+    ['構成品のコードが SKU と違う', { ...set1('g4-14'), component_request: { rows: [{ ...setRows[0], code: 's002' }], rows_hash: 'f'.repeat(64), reason: 'x' } }, /^component_unusable/],
+    ['構成品の並びが 1 からでない', { ...set1('g4-14b'), component_request: { rows: [{ ...setRows[0], sort: 2 }], rows_hash: 'f'.repeat(64), reason: 'x' } }, /^invalid_input: 構成品の行/],
+    ['カードの売価が SKU と違う', one1('g4-15', { card: cardOf('g4-15', 'single', '直接の単品', 999) }), /^invalid_value: カードの知らせ/],
+    ['カードに SKU の番号', one1('g4-16', { card: O.cardEventOf({ ...cardOf('g4-16', 'single', '直接の単品', 1000).payload, cdb_sku_id: '1' }) }), /^invalid_value: カードの知らせ/],
+    ['カードの作った人が違う', one1('g4-17', { card: O.cardEventOf({ ...cardOf('g4-17', 'single', '直接の単品', 1000).payload, created_by: 'evil@x' }) }), /^invalid_value: カードの知らせ/],
+  ]) {
+    const e = await editorTx(() => callReg(uuid(), entry));
+    assert.ok(e instanceof Error, `${label}: 断らなかった`); assert.match(String(e.message), re, label);
+  }
+  // rows_hash・カードの hash・約束のハッシュは DB が作る (入ってきた偽の hash は使わない)。DB の hash = 画面・取り込みと同じ形 (JS の stable)
+  const rid = uuid();
+  const card = { ...cardOf('g4-ok', 'set', '直接のセット', 1000, [{ code: 's001', qty: 2 }]), payload_hash: 'f'.repeat(64) };
+  const r = await asEditor(async () => {
+    await pg.query('begin');
+    try { const x = (await callReg(rid, set1('g4-ok', { card }))).rows[0].r; await pg.query('commit'); return x; } catch (e) { await pg.query('rollback'); throw e; }
+  });
+  const req = await one('select rows, rows_hash from ops.sku_component_requests where set_sku_id = $1', [r.sku_id]);
+  assert.equal(req.rows_hash, W.sha256(W.stable(req.rows))); assert.notEqual(req.rows_hash, 'f'.repeat(64));
+  const ob = await one('select payload, payload_hash from ops.product_hub_outbox where sku_id = $1', [r.sku_id]);
+  assert.equal(ob.payload_hash, O.cardPayloadHash(ob.payload)); assert.notEqual(ob.payload_hash, 'f'.repeat(64));
+  const sess = await one('select payload_hash from ops.master_write_sessions where request_id = $1', [rid]);
+  const done = await one('select payload_hash, result from ops.master_edit_requests where request_id = $1', [rid]);
+  assert.equal(sess.payload_hash, done.payload_hash); assert.notEqual(done.payload_hash, 'e'.repeat(64));
+  assert.equal(done.result.request_payload_hash, 'e'.repeat(64));
+  assert.deepEqual(await one('select tax_rate::float8 as t, tax_class, handling from core.skus where sku_id = $1', [r.sku_id]), { t: 0.1, tax_class: 'STANDARD_10', handling: 'active' });
+  assert.deepEqual(await one('select cost_jpy::int as j, cost_source as s, valid_from::text as f from core.sku_costs where sku_id = $1', [r.sku_id]), { j: 200, s: 'set_calc', f: TODAY });
 });
 
 console.log('\nproduct-hub のカードの知らせ (outbox)');
@@ -983,6 +1046,33 @@ await ta('[O10] 同じ商品コードのカードが 2 枚以上 (一意の inde
   const out3 = await asEditor(() => O.linkCardToExisting(db, link, { skuId: r2.sku_id, actor: 'naka@test', expectedDraftId: first.id }));
   assert.deepEqual([out3.ok, out3.draft_id], [true, first.id]);
   assert.equal((await outboxOf('dup-2')).status, 'done');
+  // 4. SQLite で作った後に Postgres を done にできず (知らせは pending のまま)、その間に同じコードのカードが増えた = 前の答えを使い回さない (Codex R3 Medium 2)
+  const r4 = await reg('single', 'dup-4', single({ name: '作った後に重なる単品' }));
+  const ev4 = await one('select event_id::text as event_id, sku_id::text as sku_id, schema_version, payload from ops.product_hub_outbox where event_id = $1', [r4.card.event_id]);
+  assert.equal(PH.applyCdbCardEvent(ev4).outcome, 'created');   // SQLite だけ済んだ
+  const made = draftOf('dup-4');
+  ph.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('Dup-4 ', '後から増えたカード 4', 'someone')`).run();
+  let res4 = await runCards({ eventId: r4.card.event_id });
+  assert.equal(res4[0].status, 'conflict');
+  ob = await outboxOf('dup-4');
+  assert.deepEqual([ob.status, ob.result.ambiguous, ob.result.conflict_draft_ids.length], ['conflict', true, 2]);
+  assert.match(ob.last_error, /2 枚/);
+  // 片付けて「もう一度」= 作ったカードがただ 1 枚 = 結んであった (done)
+  ph.prepare(`DELETE FROM product_drafts WHERE name = '後から増えたカード 4'`).run();
+  res4 = await runCards({ eventId: r4.card.event_id, manual: true });
+  assert.deepEqual([res4[0].status, res4[0].result.outcome, res4[0].result.draft_id], ['done', 'linked', made.id]);
+  // 5. もう結んである SKU (別の知らせ) でも、同じコードのカードが増えていれば「結んであった」にしない
+  const r5 = await reg('single', 'dup-5', single({ name: '結んだ後に重なる単品' }));
+  assert.equal((await runCards({ eventId: r5.card.event_id }))[0].status, 'done');
+  ph.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DUP-5', '後から増えたカード 5', 'someone')`).run();
+  const ev5 = await one('select sku_id::text as sku_id, schema_version, payload from ops.product_hub_outbox where event_id = $1', [r5.card.event_id]);
+  const again5 = PH.applyCdbCardEvent({ ...ev5, event_id: uuid() });
+  assert.deepEqual([again5.outcome, again5.ambiguous, again5.conflict_draft_ids.length], ['conflict', true, 2]);
+  // 済んだ知らせをもう一度直接渡しても、記録の答えを使い回さない
+  const replay5 = PH.applyCdbCardEvent({ ...ev5, event_id: r5.card.event_id });
+  assert.deepEqual([replay5.outcome, replay5.ambiguous], ['conflict', true]);
+  ph.prepare(`DELETE FROM product_drafts WHERE name = '後から増えたカード 5'`).run();
+  assert.equal(PH.applyCdbCardEvent({ ...ev5, event_id: uuid() }).outcome, 'linked');
   // dup-1 は「決められない」のまま画面の試験 [H5] へ (index は H5 の後で張り直す)
 });
 

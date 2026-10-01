@@ -11,6 +11,8 @@
  *   - 同じ商品コードのカード (cdb_sku_id なし・別の SKU) がもうある = 衝突 (conflict)。増やさない・直さない・記録する (人が決める)
  *     人が決める = 「既存のカードをこの商品に結ぶ」(linkCdbCardToExisting・PR #1566 R1 M6) か、古いカードを片付けて「もう一度」
  *   - 同じ商品コード (LOWER(TRIM(ne_code))) のカードが 2 枚以上 = どれか決められない衝突 (ambiguous)。結ぶ道も出さない (片付けてから「もう一度」)
+ *   - 前に作った・結んだ答え (記録・cdb_sku_id のカード) を使い回すのも、同じコードのカードがそのカード 1 枚だけのときだけ。
+ *     SQLite で作った後に Postgres を done にできず、その間に同じコードのカードが増えた = 使い回さず ambiguous (知らせを done にしない・#1566 Codex R3 Medium 2)
  *     🚨 product-hub の正規化した ne_code の一意 (idx_product_drafts_ne_norm) は、前からの重なりがあると張れない (db.js) = 一意に頼らず、
  *        取引の中で同じコードのカードを全部数える (PR #1566 Codex R2 Medium)
  * 🚨 切替の段階が frozen 以降に、このファイル (と ⑤-2a のコード) でカードを作る道はこの取り込みだけ (知らせは new_open の登録でしか書かれない)。
@@ -73,10 +75,9 @@ function checkPayload(event) {
 export function applyCdbCardEvent(event, { db = getDB() } = {}) {
   const { p, skuId, code, name, eventId } = checkPayload(event);
   return db.transaction(() => {
+    // 同じ商品コードのカードを最初に全部数える (一意の index が無い DB でも 2 枚以上を 1 枚と見ない。前の答えを使い回す前にも見る)
+    const ids = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY id').all(code).map((x) => x.id);
     const seen = db.prepare('SELECT * FROM ph_cdb_card_events WHERE event_id = ?').get(eventId);
-    if (seen && seen.outcome !== 'conflict') {
-      return { outcome: seen.outcome, draft_id: seen.draft_id, shipping_status: seen.shipping_status, replayed: true };
-    }
     const record = (outcome, draftId, conflictId, ship) => db.prepare(`
       INSERT INTO ph_cdb_card_events (event_id, cdb_sku_id, ne_code, outcome, draft_id, conflict_draft_id, shipping_status, shipping_code, shipping_method)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -84,26 +85,37 @@ export function applyCdbCardEvent(event, { db = getDB() } = {}) {
         shipping_status = excluded.shipping_status, shipping_code = excluded.shipping_code, shipping_method = excluded.shipping_method,
         applied_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(eventId, skuId, code, outcome, draftId, conflictId, ship?.status ?? null, ship?.code ?? null, ship?.method ?? null);
-    // もう結んであるカード (同じ SKU)
+    /** どれか決められない衝突 (知らせは done にしない = 人が 1 枚に片付けてから「もう一度」)。mine = この知らせ / SKU のカード (同じコードの中に無ければ足して見せる) */
+    const ambiguous = (mine = null) => {
+      const show = [...new Set([...ids, ...(mine == null ? [] : [mine])])].sort((a, b) => a - b);
+      record('conflict', null, null, null);
+      for (const id of show) logEvent(db, id, 'cdb_card_conflict', `Company DB の新商品 ${code} (SKU ${skuId}) と同じ商品コードのカードが ${ids.length} 枚 (どれか決められない)`, ACTOR);
+      return { outcome: 'conflict', draft_id: null, conflict_draft_id: null, conflict_draft_ids: show, ambiguous: true,
+        message: `同じ商品コード ${code} のカードが product-hub に ${ids.length} 枚 (${ids.map((x) => '#' + x).join('・') || 'なし'}${mine != null && !ids.includes(mine) ? `・この商品のカード #${mine} はコードが違う` : ''}) あります。どれに結ぶか決められないので、増やしても結んでもいません (product-hub で 1 枚に片付けてから「もう一度作る」)` };
+    };
+    // 前に取り込んだ知らせ (作った・結んだ) = そのカードが同じコードのただ 1 枚のときだけ同じ答え
+    if (seen && seen.outcome !== 'conflict') {
+      if (ids.length === 1 && ids[0] === seen.draft_id) {
+        return { outcome: seen.outcome, draft_id: seen.draft_id, shipping_status: seen.shipping_status, replayed: true };
+      }
+      return ambiguous(seen.draft_id);
+    }
+    // もう結んであるカード (同じ SKU) = そのカードが同じコードのただ 1 枚のときだけ「結んであった」
     const linked = db.prepare('SELECT id FROM product_drafts WHERE cdb_sku_id = ?').get(skuId);
     if (linked) {
-      record('linked', linked.id, null, null);
-      return { outcome: 'linked', draft_id: linked.id };
+      if (ids.length === 1 && ids[0] === linked.id) {
+        record('linked', linked.id, null, null);
+        return { outcome: 'linked', draft_id: linked.id };
+      }
+      return ambiguous(linked.id);
     }
-    // 同じ商品コードのカード (別に作られていた) = 増やさない・記録する。全部数える (一意の index が無い DB でも 2 枚以上を 1 枚と見ない)
-    const same = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY id').all(code);
-    if (same.length > 1) {
-      const ids = same.map((x) => x.id);
-      record('conflict', null, null, null);
-      for (const id of ids) logEvent(db, id, 'cdb_card_conflict', `Company DB の新商品 ${code} (SKU ${skuId}) と同じ商品コードのカードが ${ids.length} 枚 (どれか決められない)`, ACTOR);
-      return { outcome: 'conflict', draft_id: null, conflict_draft_id: null, conflict_draft_ids: ids, ambiguous: true,
-        message: `同じ商品コード ${code} のカードが product-hub に ${ids.length} 枚 (${ids.map((x) => '#' + x).join('・')}) あります。どれに結ぶか決められないので、増やしても結んでもいません (product-hub で 1 枚に片付けてから「もう一度作る」)` };
-    }
-    if (same.length === 1) {
-      record('conflict', null, same[0].id, null);
-      logEvent(db, same[0].id, 'cdb_card_conflict', `Company DB の新商品 ${code} (SKU ${skuId}) と同じ商品コードのカード`, ACTOR);
-      return { outcome: 'conflict', draft_id: null, conflict_draft_id: same[0].id,
-        message: `同じ商品コード ${code} のカード (#${same[0].id}) が product-hub にもうあります。増やしていません (どちらを使うか決めてください)` };
+    // 同じ商品コードのカード (別に作られていた) = 増やさない・記録する
+    if (ids.length > 1) return ambiguous();
+    if (ids.length === 1) {
+      record('conflict', null, ids[0], null);
+      logEvent(db, ids[0], 'cdb_card_conflict', `Company DB の新商品 ${code} (SKU ${skuId}) と同じ商品コードのカード`, ACTOR);
+      return { outcome: 'conflict', draft_id: null, conflict_draft_id: ids[0],
+        message: `同じ商品コード ${code} のカード (#${ids[0]}) が product-hub にもうあります。増やしていません (どちらを使うか決めてください)` };
     }
     const ship = mapCdbShipping(db, p.shipping);
     const price = Number.isSafeInteger(Number(p.price)) ? Number(p.price) : null;

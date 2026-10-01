@@ -21,7 +21,8 @@
  *   8 登録の関数 ops.register_new_sku と ⑤-1 (0051) の書き込みの約束 (本物のログイン = SET ROLE でない): 画面のロールは SKU・知らせを直接足せない (42501)・
  *     下書きの状態を作る関数も実行できない・関数の中の書き込みも 0051 の guard が見る (代表の仕入先の業務の約束で断る)・
  *     変更の記録と状態の記録は登録の約束の人・request_id・理由 (core.actor_* の偽の値は使わない)・関数の外では同じ取引でも登録の約束で書けない・
- *     登録の約束は db_user = master_edit (ログインした役)
+ *     登録の約束は db_user = master_edit (ログインした役)・値を偽った直接の呼び出し (税率と税区分・売価・原価の日と出どころ・セットの導く値・
+ *     構成品のコード・カードの写し) は全部断る・rows_hash / カードの hash / 約束のハッシュは DB が作る (Codex R3 Medium 1)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-register-pg.mjs
  *   (この PC では C:/tmp/pg-embed の run-conc.mjs が使い捨ての PostgreSQL を起動して TEST_PG_URL を渡す)
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロール master_* をクラスタに作る)。localhost 以外の URL は拒む (本番を渡さない)。TEST_PG_URL が無ければ飛ばす
@@ -282,6 +283,37 @@ try {
     await A.query('begin');
     await assert.rejects(() => call(crypto.randomUUID(), entry('g8-x', { supplier_id: stopped })), (e) => e.code === '42501' && /master_write_invariant/.test(e.message));
     await A.query('rollback');
+    // 値を偽った直接の呼び出しは全部断る (Codex R3 Medium 1)
+    const today = (await q("select (now() at time zone 'Asia/Tokyo')::date::text as d"))[0].d;
+    const p1n = Number(p1);
+    const sku = entry('x').sku;
+    const setE = (code, skuOver = {}, rows = [{ sku_id: p1n, code: 'p001', qty: 1, sort: 1 }]) => entry(code, { kind: 'set', product: null,
+      sku: { ...sku, name: code, handling_own: 'active', ...skuOver }, component_request: { rows, rows_hash: 'f'.repeat(64), reason: 'x' },
+      cost: { jpy: 1, source: 'manual', status: 'OVERRIDDEN', valid_from: today, reason: '例外' } });
+    const card = (code, price) => O.cardEventOf(O.buildCardPayload({ code, kind: 'single', name: code, price, shipping: { code: 'S01', method: 'ゆうパケット', cost_jpy: 210 }, card: {}, components: [], actor: 'naka@test' }));
+    for (const [label, e, re] of [
+      ['単品の税率が無い', entry('g8-f1', { sku: { ...sku, name: 'g8-f1', tax_rate: null } }), /invalid_value: 単品の税率/],
+      ['税率 8% と STANDARD_10', entry('g8-f2', { sku: { ...sku, name: 'g8-f2', tax_rate: 0.08 } }), /invalid_value: 税率/],
+      ['売価 0', entry('g8-f3', { sku: { ...sku, name: 'g8-f3', standard_price_jpy: 0 } }), /invalid_value: 売価/],
+      ['原価が set_calc', entry('g8-f4', { cost: { jpy: 5, source: 'set_calc', status: 'COMPLETE', valid_from: today, reason: 'x' } }), /invalid_value: 単品の原価/],
+      ['原価の始まりが先の日', entry('g8-f5', { cost: { jpy: 5, source: 'manual', status: 'COMPLETE', valid_from: '2099-01-01', reason: 'x' } }), /invalid_value: 原価は/],
+      ['セットの税率が構成品と違う', setE('g8-f6', { tax_rate: 0.08, tax_class: 'REDUCED_8' }), /derived_mismatch/],
+      ['構成品のコードが違う', setE('g8-f7', {}, [{ sku_id: p1n, code: 'p002', qty: 1, sort: 1 }]), /component_unusable/],
+      ['カードの売価が違う', entry('g8-f8', { card: card('g8-f8', 5) }), /invalid_value: カードの知らせ/],
+    ]) {
+      await A.query('begin');
+      await assert.rejects(() => call(crypto.randomUUID(), e), (er) => re.test(er.message), label);
+      await A.query('rollback');
+    }
+    // 偽の hash を渡しても、DB が作った hash を書く (取り込みの確かめと同じ形)
+    const ridH = crypto.randomUUID();
+    await A.query('begin');
+    const rH = (await call(ridH, entry('g8-h1', { card: { ...card('g8-h1', 1000), payload_hash: 'f'.repeat(64) } }))).rows[0].r;
+    await A.query('commit');
+    const obH = (await q('select payload, payload_hash from ops.product_hub_outbox where sku_id = $1', [rH.sku_id]))[0];
+    assert.equal(obH.payload_hash, O.cardPayloadHash(obH.payload));
+    assert.equal((await q('select payload_hash from ops.master_edit_requests where request_id = $1', [ridH]))[0].payload_hash,
+      (await q('select payload_hash from ops.master_write_sessions where request_id = $1', [ridH]))[0].payload_hash);
     // 合っていれば通る・偽の core.actor_id は記録に残らない・関数の外では (同じ取引でも) 登録の約束で書けない
     const rid = crypto.randomUUID();
     await A.query('begin');

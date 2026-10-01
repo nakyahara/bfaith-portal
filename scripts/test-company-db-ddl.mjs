@@ -196,6 +196,11 @@ await ta('[!] 0052 (14 ⑤-2a): 登録の状態は 1 行も作らない (backfil
       ops.master_write_allowed('sku_create', 'core.sku_costs', 'DELETE') as c, ops.master_write_allowed('sku_create', 'ops.sku_component_breaches', 'UPDATE') as d,
       ops.master_write_allowed('sku_edit', 'core.skus', 'INSERT') as e, ops.master_write_allowed('sku_edit', 'core.sku_costs', 'DELETE') as f`))[0],
     { a: true, b: true, c: false, d: false, e: false, f: true });
+  // 登録の関数の中だけで使う関数 (security definer にしない・public の実行権なし・search_path 固定)。JS の stable と同じ形 (Codex R3 Medium 1)
+  const helpers = await q("select p.proname as n, p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p join pg_namespace s on s.oid = p.pronamespace where s.nspname = 'ops' and p.proname in ('js_stable', 'js_stable_sha256', 'new_set_derivation') order by 1");
+  assert.deepEqual(helpers.map((h) => [h.n, h.d, h.pub]), [['js_stable', false, false], ['js_stable_sha256', false, false], ['new_set_derivation', false, false]]);
+  for (const h of helpers) assert.match(h.c, /search_path=pg_catalog, pg_temp/, h.n);
+  assert.deepEqual((await q(`select ops.js_stable('{"b":[1,{"z":null,"a":"x\\n"}],"a":true}'::jsonb) as s`))[0].s, JSON.stringify({ a: true, b: [1, { a: 'x\n', z: null }] }));
   // new_open の前提 = ⑤-1 の差し込み口の表に 1 行 (集める関数は上書きしない・#1563 R3)。前提の関数は security definer にしない (集める関数が持ち主で呼ぶ)
   assert.deepEqual(await q("select name, fn::text as fn from ops.master_cutover_prereq_checks where name = '0052_registrations'"), [{ name: '0052_registrations', fn: 'ops.master_registrations_prereq(text,text)' }]);
   const pre = await q("select p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p where p.oid = 'ops.master_registrations_prereq(text, text)'::regprocedure");

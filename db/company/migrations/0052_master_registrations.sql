@@ -55,6 +55,11 @@
 --      ・ops.claim_card_events / ops.finish_card_event は約束を要らない: 商品の値 (core.*) を書かず、知らせの届け先の状態だけ。
 --        取り込みは保存とは別の時 (product-hub のボードを開いたとき) に動く。借り (lease) の持ち主だけが結果を書ける
 --      ・新しいコードの決まり (形・Company DB / 名札 / NE の元のコード / 消したコード) は ops.new_sku_code_problem 1 か所 (画面の確かめと登録の関数が同じものを呼ぶ)
+--      ・🚨 画面のロールが関数を直接呼んでも、書く値を DB が確かめる / 作り直す (#1566 Codex R3 Medium 1。アプリの計算を信じない):
+--        単品 = 税率と税区分が合う・名前・売価・送料コードと発送方法・原価は人が入れた原価 (manual / COMPLETE) を DB の今日 (東京) から・セットだけの列は持たない /
+--        セット = 構成品を DB で確かめて鍵を取り、税率・税区分・取扱・売上分類・原価を DB で導き直して (ops.new_set_derivation) 同じときだけ /
+--        構成の rows・rows_hash とカードの知らせの hash は DB が作る (ops.js_stable_sha256 = 画面・取り込みの stable と同じ形)・カードの写しの欄は書く値と同じ /
+--        約束と保存の記録の payload_hash = DB が作った「関数が書いた値」のハッシュ (画面の要求のハッシュは記録の結果 request_payload_hash = 同じ request_id の確かめ)
 -- 🚨 この migration は商品の値を何も変えない (状態の行は 1 行も作らない = backfill は切替の日に人が流す)
 -- 🚨 security definer の関数 = 一時の表を使わない・search_path = pg_catalog, pg_temp (名前は全部 schema つき)・public の実行権を外す (0034 の約束)
 
@@ -544,22 +549,153 @@ begin
 end $$;
 revoke all on function ops.new_sku_code_problem(text) from public;
 
--- 8d. 新商品を登録する (同じ取引で 1 回。画面 = lib/master-register.mjs が鍵 (request_id → 段階 → マスタの書き込み → 新しいコード → 構成品) と門・値の確かめの後に呼ぶ)
+-- 8d. 画面 (JS) の stable() と同じ形の JSON の文字 (キーは文字の順・空白なし・数は整数だけ)。カードの知らせの hash・構成の rows_hash を DB でも作る
+--     (lib/master-write.mjs の stable = 取り込み (apps/product-hub) が sha256(stable(payload)) で確かめる)。整数でない数・2^53 を超える数は拒む (JS と形が合わない)
+create function ops.js_stable(p jsonb) returns text language plpgsql immutable set search_path = pg_catalog, pg_temp as $$
+declare
+  v_t   text := pg_catalog.jsonb_typeof(p);
+  v_out text;
+  v_n   numeric;
+begin
+  if p is null or v_t = 'null' then return 'null'; end if;
+  if v_t = 'object' then
+    select '{' || coalesce(string_agg(pg_catalog.to_json(e.key)::text || ':' || ops.js_stable(e.value), ',' order by e.key collate "C"), '') || '}' into v_out
+      from pg_catalog.jsonb_each(p) e;
+    return v_out;
+  elsif v_t = 'array' then
+    select '[' || coalesce(string_agg(ops.js_stable(e.value), ',' order by e.ord), '') || ']' into v_out
+      from pg_catalog.jsonb_array_elements(p) with ordinality as e(value, ord);
+    return v_out;
+  elsif v_t = 'string' then
+    return pg_catalog.to_json(p #>> '{}')::text;
+  elsif v_t = 'boolean' then
+    return p::text;
+  end if;
+  v_n := (p::text)::numeric;
+  if v_n <> pg_catalog.trunc(v_n) or abs(v_n) > 9007199254740991 then
+    raise exception 'invalid_input: 知らせ・構成の数は整数だけ (%)', p::text using errcode = '22023';
+  end if;
+  return pg_catalog.trunc(v_n)::text;
+end $$;
+revoke all on function ops.js_stable(jsonb) from public;
+create function ops.js_stable_sha256(p jsonb) returns text language sql immutable set search_path = pg_catalog, pg_temp as $$
+  select pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(ops.js_stable(p), 'UTF8')), 'hex')
+$$;
+revoke all on function ops.js_stable_sha256(jsonb) from public;
+
+-- 8e. 新しいセットの構成品を DB で確かめて、導く値を DB で決める (lib/master-set-rules.js の deriveSetCdb と同じ決め方を SQL で。登録の関数だけが呼ぶ)
+--   p_rows = [{ sku_id, code, qty, sort }] (並び = sort = 1〜N の配列の順)・p_today = 原価を見る日 (東京の今日)
+--   確かめる: 1〜20 行・各行は sku_id (整数)・code (文字)・qty (1〜999 の整数)・sort だけ・sku_id は重ならない・ある単品・code が SKU のコードと同じ・
+--             登録をやめた (cancelled)・要確認 (quarantined)・状態の行が無い商品でない。SKU ごとの鍵 (画面と同じ鍵) を sku_id の順に取り、行を for share で読む
+--   決める: 税率 (1 つでも未入力 = 決まらない・混ざれば低い方 + MIXED)・売上分類 (構成品の MIN・輸出 4 と 1〜3 の混在 / 未入力 = 決まらない)・
+--           取扱 (セット自身か構成品が 1 つでも中止 = 中止)・原価 (全部の構成品にその日の原価 (COMPLETE / OVERRIDDEN・> 0) があれば 数量 × 原価 の合計 = COMPLETE)
+--   戻り値 { rows (DB の値で作り直した構成), rows_hash (ops.js_stable_sha256), tax_rate, tax_class, sales_from_components, handling, cost_status, cost_jpy }
+create function ops.new_set_derivation(p_rows jsonb, p_handling_own text, p_today date) returns jsonb
+  language plpgsql set search_path = pg_catalog, pg_temp as $$
+declare
+  v_n       integer;
+  v_ids     bigint[];
+  v_bad     text;
+  v_rows    jsonb;
+  v_rates   numeric[];
+  v_classes integer[];
+  v_tax     numeric;
+  v_tclass  text;
+  v_sales   integer;
+  v_stop    boolean;
+  v_all     boolean;
+  v_any     boolean;
+  v_sum     numeric;
+begin
+  if p_rows is null or pg_catalog.jsonb_typeof(p_rows) <> 'array' then raise exception 'invalid_input: 構成品 (rows) は配列' using errcode = '22023'; end if;
+  v_n := pg_catalog.jsonb_array_length(p_rows);
+  if v_n < 1 or v_n > 20 then raise exception 'invalid_input: 構成品は 1〜20 行 (% 行)', v_n using errcode = '22023'; end if;
+  if exists (select 1 from pg_catalog.jsonb_array_elements(p_rows) with ordinality as e(v, ord)
+              where pg_catalog.jsonb_typeof(e.v) <> 'object'
+                 or exists (select 1 from pg_catalog.jsonb_object_keys(e.v) k where k not in ('sku_id', 'code', 'qty', 'sort'))
+                 or pg_catalog.jsonb_typeof(e.v -> 'sku_id') is distinct from 'number' or (e.v ->> 'sku_id') !~ '^[1-9][0-9]{0,17}$'
+                 or pg_catalog.jsonb_typeof(e.v -> 'code') is distinct from 'string'
+                 or pg_catalog.jsonb_typeof(e.v -> 'qty') is distinct from 'number' or (e.v ->> 'qty') !~ '^[1-9][0-9]{0,2}$'
+                 or pg_catalog.jsonb_typeof(e.v -> 'sort') is distinct from 'number' or (e.v ->> 'sort') is distinct from e.ord::text) then
+    raise exception 'invalid_input: 構成品の行は { sku_id, code, qty (1〜999), sort (1 からの並び) } だけ' using errcode = '22023';
+  end if;
+  select array_agg(distinct (e ->> 'sku_id')::bigint order by (e ->> 'sku_id')::bigint) into v_ids from pg_catalog.jsonb_array_elements(p_rows) e;
+  if pg_catalog.cardinality(v_ids) <> v_n then raise exception 'invalid_input: 構成品が重なっている' using errcode = '22023'; end if;
+  -- SKU ごとの鍵 (画面の lib/master-register.mjs と同じ鍵・sku_id の順) → 行を for share
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.sku:' || x::text, 0)) from unnest(v_ids) as t(x) order by x;
+  perform 1 from core.skus where sku_id = any(v_ids) order by sku_id for share;
+  -- 構成品の値 (その日の原価 = 0049 と同じ選び方: 始まりが遅い → 作った時刻が遅い → 番号が大きい)
+  with r as (
+    select e.ord, (e.v ->> 'sku_id')::bigint as sku_id, e.v ->> 'code' as code, (e.v ->> 'qty')::integer as qty
+      from pg_catalog.jsonb_array_elements(p_rows) with ordinality as e(v, ord)),
+  f as (
+    select r.*, k.code as k_code, k.sku_kind, k.tax_rate, k.handling, p.sales_class, reg.state,
+           (select case when y.cost_status in ('COMPLETE', 'OVERRIDDEN') then y.cost_jpy end
+              from core.sku_costs y where y.sku_id = r.sku_id and y.valid_from <= p_today and (y.valid_to is null or y.valid_to >= p_today)
+             order by y.valid_from desc, y.created_at desc, y.sku_cost_id desc limit 1) as cost_jpy
+      from r left join core.skus k on k.sku_id = r.sku_id left join core.products p on p.product_id = k.product_id
+      left join ops.master_registrations reg on reg.sku_id = r.sku_id)
+  select (select string_agg(format('%s (%s)', f.code, case when f.k_code is null then '無い SKU' when f.k_code <> f.code then 'コードが違う'
+                                                          when f.sku_kind <> 'single' then '単品でない' else coalesce('状態 ' || f.state, '状態の行が無い') end), '・' order by f.ord)
+            from f where f.k_code is null or f.k_code <> f.code or f.sku_kind <> 'single' or f.state is null or f.state in ('cancelled', 'quarantined')),
+         (select jsonb_agg(jsonb_build_object('sku_id', f.sku_id, 'code', f.k_code, 'qty', f.qty, 'sort', f.ord) order by f.ord) from f),
+         (select array_agg(f.tax_rate) from f),
+         (select array_agg(f.sales_class::integer) from f),
+         (select bool_or(f.handling = 'discontinued') from f),
+         (select bool_and(coalesce(f.cost_jpy, 0) > 0) from f),
+         (select bool_or(coalesce(f.cost_jpy, 0) > 0) from f),
+         (select sum(f.cost_jpy * f.qty) from f)
+    into v_bad, v_rows, v_rates, v_classes, v_stop, v_all, v_any, v_sum;
+  if v_bad is not null then raise exception 'component_unusable: 構成品に使えない商品がある: %', v_bad using errcode = 'P0001'; end if;
+  -- 税率
+  if exists (select 1 from unnest(v_rates) x where x is null) then
+    v_tax := null; v_tclass := 'UNKNOWN';
+  elsif (select count(distinct x) from unnest(v_rates) x) = 1 then
+    v_tax := v_rates[1]; v_tclass := case when v_tax = 0.08 then 'REDUCED_8' when v_tax = 0.10 then 'STANDARD_10' else 'UNKNOWN' end;
+    if v_tclass = 'UNKNOWN' then v_tax := null; end if;
+  else
+    select min(x) into v_tax from unnest(v_rates) x; v_tclass := 'MIXED';
+  end if;
+  -- 売上分類 (構成品から)
+  if exists (select 1 from unnest(v_classes) x where x is null or x not between 1 and 4)
+     or (4 = any(v_classes) and exists (select 1 from unnest(v_classes) x where x <> 4)) then
+    v_sales := null;
+  else
+    select min(x) into v_sales from unnest(v_classes) x;
+  end if;
+  return jsonb_build_object('rows', v_rows, 'rows_hash', ops.js_stable_sha256(v_rows), 'tax_rate', v_tax, 'tax_class', v_tclass, 'sales_from_components', v_sales,
+    'handling', case when p_handling_own = 'discontinued' or coalesce(v_stop, false) then 'discontinued' else 'active' end,
+    'cost_status', case when v_all then 'COMPLETE' when v_any then 'PARTIAL' else 'MISSING' end,
+    'cost_jpy', case when v_all then pg_catalog.round(pg_catalog.round(v_sum, 2), 0) end);
+end $$;
+revoke all on function ops.new_set_derivation(jsonb, text, date) from public;
+
+-- 8f. 新商品を登録する (同じ取引で 1 回。画面 = lib/master-register.mjs が鍵 (request_id → 段階 → マスタの書き込み → 新しいコード → 構成品) と門・値の確かめの後に呼ぶ)
 --   p_entry = { kind: single | set, code, started_at,
 --               product: { name, sales_class, expiry_managed, inbound_date_managed } (単品だけ),
 --               sku: { name, tax_rate, tax_class, handling, standard_price_jpy, shipping_code, shipping_method, shipping_cost_jpy, reorder_months, set_sales_class_override, handling_own },
---               supplier_id (単品・代表・無くてよい), cost: { jpy, source, status, valid_from, reason } (無くてよい),
+--               supplier_id (単品・代表・無くてよい), cost: { jpy, source, status, valid_from, reason } (単品は無くてよい・セットは要る),
 --               component_request: { rows: [{ sku_id, code, qty, sort }], rows_hash, reason } (セットだけ),
---               card: { schema_version, payload, payload_hash } (カードを作らないなら null), result: 保存の記録に残す結果 (sku_id・card は関数が足す) }
---   段階 new_open・持ち主表のハッシュ (ops.begin_master_write と同じ確かめ)・backfill がちょうど 1 回・request_id が未使用・コードの決まり (ops.new_sku_code_problem)・
---   構成品は登録をやめた / 要確認の商品でない、を確かめてから書く。列の持ち主・業務の約束 (代表の仕入先は取引中・構成品はある単品) は 0051 の guard が書くときに見る。
---   🚨 値の計算 (送料の表・セットの導く値) はアプリ = 0051 の sku_edit と同じく、DB が守るのは約束どおりの相手・操作・持ち主・段階・業務の約束まで
+--               card: { schema_version, payload, payload_hash } (カードを作らないなら null), result: 保存の記録に残す結果 (sku_id・card・hash は関数が足す) }
+--   🚨 画面のロールが直接呼んでも、書く値を DB が確かめる / 作り直す (#1566 Codex R3 Medium 1。アプリの計算を信じない):
+--      ・段階 new_open・持ち主表のハッシュ (ops.begin_master_write と同じ)・backfill がちょうど 1 回・request_id が未使用・コードの決まり (ops.new_sku_code_problem)
+--      ・共通: 名前 (1〜255 字・制御文字なし・empty でない)・売価 1〜999,999,999 の整数・送料コードと発送方法 (名前) がある・送料 0 以上 (無くてよい)・推奨保有月数 0〜60
+--      ・単品: 税率 8% / 10% と税区分が合う (REDUCED_8 / STANDARD_10)・取扱 active・商品の名前 = SKU の名前・売上分類 1〜4 か無し・
+--        セットだけの列 (売上分類の上書き・セット自身の取扱・構成) は持たない・原価は無いか manual / COMPLETE・0 以上の整数・今日 (東京) から・理由つき
+--      ・セット: 構成品を DB で確かめて鍵を取り、税率・税区分・取扱・売上分類・原価を DB で導いて (ops.new_set_derivation) 入ってきた値と同じときだけ。
+--        売上分類の上書きは構成品から導けないときだけ・導けず上書きも無い = 断る。原価 = 導いた合計 (set_calc / COMPLETE) か、例外原価 (manual / OVERRIDDEN・理由つき) だけ。
+--        仕入先・商品の行は持たない
+--      ・構成の rows・rows_hash = DB で作り直した値を書く。カードの知らせ = payload の写しの欄 (版・コード・種類・名前・売価・送料・構成品・作った人) が書く値と同じで、
+--        SKU の番号を payload に入れない・payload_hash は DB が作る (ops.js_stable_sha256 = 取り込みの確かめと同じ形)
+--      ・約束と保存の記録の payload_hash = DB が作った「関数が書いた値」のハッシュ (アプリの要求のハッシュ p_payload_hash は記録の結果 request_payload_hash に残す = 同じ request_id の確かめ)
+--   列の持ち主・業務の約束 (代表の仕入先は取引中) は 0051 の guard が書くときに見る。
 --   🚨 例外の受け止め (begin ... exception) を使わない: サブトランザクションの中で書いた done は xmin が取引の番号と違い、0051 の commit の確かめに数えられない
 create function ops.register_new_sku(p_request_id uuid, p_actor_id text, p_reason text, p_ownership jsonb, p_payload_hash text, p_entry jsonb) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
   v_db_user  text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
   v_tx       bigint := pg_catalog.txid_current();
+  v_today    date := (pg_catalog.now() at time zone 'Asia/Tokyo')::date;
   v_kind     text := p_entry ->> 'kind';
   v_code     text := p_entry ->> 'code';
   v_prod     jsonb := p_entry -> 'product';
@@ -568,6 +704,30 @@ declare
   v_req      jsonb := p_entry -> 'component_request';
   v_card     jsonb := p_entry -> 'card';
   v_reason   text := nullif(p_reason, '');
+  v_name     text;
+  v_price    bigint;
+  v_tax      numeric;
+  v_tclass   text;
+  v_handling text;
+  v_override smallint;
+  v_own      text;
+  v_sales    smallint;
+  v_ship_c   text;
+  v_ship_m   text;
+  v_ship_y   bigint;
+  v_reorder  numeric;
+  v_supplier bigint;
+  v_cjpy     bigint;
+  v_csrc     text;
+  v_cstat    text;
+  v_creason  text;
+  v_der      jsonb;
+  v_rows     jsonb;
+  v_rhash    text;
+  v_payload  jsonb;
+  v_phash    text;
+  v_written  jsonb;
+  v_whash    text;
   v_phase    text;
   v_owner    text;
   v_hash     text;
@@ -580,17 +740,17 @@ declare
 begin
   perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.master_cutover'));   -- 段階を変える取引と並ぶ (画面は先に取っている = 同じ鍵)
   perform pg_catalog.pg_advisory_xact_lock_shared(core.master_write_lock_key());                -- 夜間ロードと並ぶ (画面は先に取っている = 同じ鍵)
-  -- 形
+  -- 形 (呼び手・持ち主表・要求のハッシュ・中身の外形)
   if p_request_id is null then raise exception 'invalid_input: request_id が要る' using errcode = '22023'; end if;
   if p_actor_id is null or length(btrim(p_actor_id)) = 0 or length(p_actor_id) > 320 or p_actor_id ~ '[[:cntrl:]]' then
     raise exception 'invalid_input: 登録する人 (actor_id) の形が違う' using errcode = '22023';
   end if;
-  if v_reason is not null and length(v_reason) > 200 then raise exception 'invalid_input: 理由は 200 字まで' using errcode = '22023'; end if;
+  if v_reason is not null and (length(v_reason) > 200 or v_reason ~ '[[:cntrl:]]') then raise exception 'invalid_input: 理由は 200 字まで・制御文字なし' using errcode = '22023'; end if;
   if p_ownership is null or jsonb_typeof(p_ownership) <> 'object'
      or exists (select 1 from jsonb_each(p_ownership) e where jsonb_typeof(e.value) <> 'string' or (e.value #>> '{}') not in ('load', 'company')) then
     raise exception 'invalid_input: 持ち主表 ({ キー: load / company }) が要る' using errcode = '22023';
   end if;
-  if coalesce(p_payload_hash, '') !~ '^[0-9a-f]{64}$' then raise exception 'invalid_input: 保存の中身のハッシュ (64 桁の 16 進) が要る' using errcode = '22023'; end if;
+  if coalesce(p_payload_hash, '') !~ '^[0-9a-f]{64}$' then raise exception 'invalid_input: 要求のハッシュ (64 桁の 16 進) が要る' using errcode = '22023'; end if;
   if p_entry is null or jsonb_typeof(p_entry) <> 'object' or v_kind is null or v_kind not in ('single', 'set') or jsonb_typeof(v_s) is distinct from 'object' then
     raise exception 'invalid_input: 登録の中身 (kind = single / set・sku) が要る' using errcode = '22023';
   end if;
@@ -600,9 +760,12 @@ begin
   if (v_kind = 'set') is distinct from (jsonb_typeof(v_req) = 'object') then
     raise exception 'invalid_input: セットは構成の依頼 (component_request) が要り、単品は構成を持たない' using errcode = '22023';
   end if;
-  if v_kind = 'set' and (p_entry -> 'supplier_id') is not null and p_entry -> 'supplier_id' <> 'null'::jsonb then
-    raise exception 'invalid_input: セットに代表の仕入先は付けない' using errcode = '22023';
+  if coalesce(p_entry -> 'supplier_id', 'null'::jsonb) <> 'null'::jsonb
+     and (jsonb_typeof(p_entry -> 'supplier_id') not in ('number', 'string') or (p_entry ->> 'supplier_id') !~ '^[1-9][0-9]{0,17}$') then
+    raise exception 'invalid_input: 代表の仕入先は番号' using errcode = '22023';
   end if;
+  v_supplier := (p_entry ->> 'supplier_id')::bigint;
+  if v_kind = 'set' and v_supplier is not null then raise exception 'invalid_input: セットに代表の仕入先は付けない' using errcode = '22023'; end if;
   -- 段階・持ち主表 (ops.begin_master_write と同じ)・backfill
   select phase, owner_hash into v_phase, v_owner from ops.master_cutover_state where id = 1;
   v_hash := ops.ownership_hash(p_ownership);
@@ -623,13 +786,128 @@ begin
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.new_code:' || coalesce(core.norm_code(v_code), ''), 0));
   v_bad := ops.new_sku_code_problem(v_code);
   if v_bad is not null then raise exception '%: 商品コード % は新しい商品に使えない', v_bad, v_code using errcode = 'P0001'; end if;
-  -- 構成品は登録をやめた (cancelled)・要確認 (quarantined) の商品でない (ある単品かは 0051 の guard が見る)
-  if v_kind = 'set' and exists (
-       select 1 from jsonb_array_elements(case when jsonb_typeof(v_req -> 'rows') = 'array' then v_req -> 'rows' else '[]'::jsonb end) e
-         join ops.master_registrations r on r.sku_id = (case when (e ->> 'sku_id') ~ '^[0-9]{1,18}$' then (e ->> 'sku_id')::bigint end)
-        where r.state in ('cancelled', 'quarantined')) then
-    raise exception 'component_unusable: 構成品に、登録をやめた・要確認の商品がある' using errcode = 'P0001';
+
+  -- 値 (共通): 名前・売価・送料・推奨保有月数
+  v_name := v_s ->> 'name';
+  if jsonb_typeof(v_s -> 'name') is distinct from 'string' or v_name is distinct from btrim(v_name) or length(v_name) not between 1 and 255
+     or v_name ~ '[[:cntrl:]]' or lower(v_name) = 'empty' then
+    raise exception 'invalid_value: 名前は 1〜255 字 (前後の空白・制御文字なし・empty でない)' using errcode = '22023';
   end if;
+  if jsonb_typeof(v_s -> 'standard_price_jpy') is distinct from 'number' or (v_s ->> 'standard_price_jpy') !~ '^[1-9][0-9]{0,8}$' then
+    raise exception 'invalid_value: 売価は 1〜999,999,999 の整数' using errcode = '22023';
+  end if;
+  v_price := (v_s ->> 'standard_price_jpy')::bigint;
+  v_ship_c := v_s ->> 'shipping_code';
+  v_ship_m := v_s ->> 'shipping_method';
+  if jsonb_typeof(v_s -> 'shipping_code') is distinct from 'string' or length(btrim(v_ship_c)) not between 1 and 20 or v_ship_c ~ '[[:cntrl:]]'
+     or jsonb_typeof(v_s -> 'shipping_method') is distinct from 'string' or length(btrim(v_ship_m)) not between 1 and 200 or v_ship_m ~ '[[:cntrl:]]' then
+    raise exception 'invalid_value: 送料コードと発送方法 (名前) が要る' using errcode = '22023';
+  end if;
+  if (v_s -> 'shipping_cost_jpy') is not null and jsonb_typeof(v_s -> 'shipping_cost_jpy') <> 'null'
+     and (jsonb_typeof(v_s -> 'shipping_cost_jpy') <> 'number' or (v_s ->> 'shipping_cost_jpy') !~ '^[0-9]{1,9}$') then
+    raise exception 'invalid_value: 送料は 0 以上の整数か無し' using errcode = '22023';
+  end if;
+  v_ship_y := case when jsonb_typeof(v_s -> 'shipping_cost_jpy') = 'number' then (v_s ->> 'shipping_cost_jpy')::bigint end;
+  if (v_s -> 'reorder_months') is not null and jsonb_typeof(v_s -> 'reorder_months') <> 'null'
+     and (jsonb_typeof(v_s -> 'reorder_months') <> 'number' or (v_s ->> 'reorder_months') !~ '^[0-9]{1,2}(\.[0-9])?$' or (v_s ->> 'reorder_months')::numeric > 60) then
+    raise exception 'invalid_value: 推奨保有月数は 0〜60 (小数は 1 桁まで) か無し' using errcode = '22023';
+  end if;
+  v_reorder := case when jsonb_typeof(v_s -> 'reorder_months') = 'number' then (v_s ->> 'reorder_months')::numeric end;
+  -- 原価の形 (無い / { jpy, source, status, valid_from, reason })
+  if v_cost is not null and jsonb_typeof(v_cost) <> 'null' then
+    if jsonb_typeof(v_cost) <> 'object' or jsonb_typeof(v_cost -> 'jpy') is distinct from 'number' or (v_cost ->> 'jpy') !~ '^[0-9]{1,9}$'
+       or (v_cost ->> 'valid_from') is distinct from v_today::text
+       or jsonb_typeof(v_cost -> 'reason') is distinct from 'string' or length(btrim(v_cost ->> 'reason')) not between 1 and 200 or (v_cost ->> 'reason') ~ '[[:cntrl:]]' then
+      raise exception 'invalid_value: 原価は 0〜999,999,999 の整数・今日 (東京 %) から・理由つき', v_today using errcode = '22023';
+    end if;
+    v_cjpy := (v_cost ->> 'jpy')::bigint; v_csrc := v_cost ->> 'source'; v_cstat := v_cost ->> 'status'; v_creason := v_cost ->> 'reason';
+  end if;
+
+  if v_kind = 'single' then
+    -- 単品: 税率と税区分が合う・取扱 active・セットだけの列は持たない・商品の名前 = SKU の名前・原価は manual / COMPLETE だけ
+    if jsonb_typeof(v_s -> 'tax_rate') is distinct from 'number' or (v_s ->> 'tax_rate')::numeric not in (0.08, 0.10) then
+      raise exception 'invalid_value: 単品の税率は 8%% か 10%%' using errcode = '22023';
+    end if;
+    v_tax := (v_s ->> 'tax_rate')::numeric;
+    v_tclass := case when v_tax = 0.08 then 'REDUCED_8' else 'STANDARD_10' end;
+    if (v_s ->> 'tax_class') is distinct from v_tclass then raise exception 'invalid_value: 税率 % と税区分 % が合わない', v_tax, v_s ->> 'tax_class' using errcode = '22023'; end if;
+    if (v_s ->> 'handling') is distinct from 'active' then raise exception 'invalid_value: 新しい単品の取扱は active' using errcode = '22023'; end if;
+    v_handling := 'active';
+    if coalesce(v_s -> 'set_sales_class_override', 'null'::jsonb) <> 'null'::jsonb or coalesce(v_s -> 'handling_own', 'null'::jsonb) <> 'null'::jsonb then
+      raise exception 'invalid_value: 単品にセットだけの列 (売上分類の上書き・セット自身の取扱) は付けない' using errcode = '22023';
+    end if;
+    if (v_prod ->> 'name') is distinct from v_name then raise exception 'invalid_value: 商品の名前は SKU の名前と同じ' using errcode = '22023'; end if;
+    if coalesce(v_prod -> 'sales_class', 'null'::jsonb) <> 'null'::jsonb
+       and (jsonb_typeof(v_prod -> 'sales_class') <> 'number' or (v_prod ->> 'sales_class') !~ '^[1-4]$') then
+      raise exception 'invalid_value: 売上分類は 1〜4 か無し' using errcode = '22023';
+    end if;
+    v_sales := (v_prod ->> 'sales_class')::smallint;
+    if jsonb_typeof(v_prod -> 'expiry_managed') is distinct from 'boolean'
+       or coalesce(jsonb_typeof(v_prod -> 'inbound_date_managed'), 'null') not in ('boolean', 'null') then
+      raise exception 'invalid_value: 有効期限の管理・入荷日の管理は あり / なし' using errcode = '22023';
+    end if;
+    if v_cjpy is not null and (v_csrc is distinct from 'manual' or v_cstat is distinct from 'COMPLETE') then
+      raise exception 'invalid_value: 単品の原価は人が入れた原価 (manual / COMPLETE) だけ' using errcode = '22023';
+    end if;
+  else
+    -- セット: 構成品を DB で確かめて導く値を DB で決め、入ってきた値と同じときだけ
+    v_own := v_s ->> 'handling_own';
+    if v_own is null or v_own not in ('active', 'discontinued') then raise exception 'invalid_value: セット自身の取扱は active / discontinued' using errcode = '22023'; end if;
+    v_der := ops.new_set_derivation(v_req -> 'rows', v_own, v_today);
+    v_rows := v_der -> 'rows';
+    v_rhash := v_der ->> 'rows_hash';
+    if (v_der ->> 'tax_rate') is null then raise exception 'set_underivable: 構成品の税率が未入力なので、セットの税率が決まらない' using errcode = 'P0001'; end if;
+    v_tax := (v_der ->> 'tax_rate')::numeric; v_tclass := v_der ->> 'tax_class'; v_handling := v_der ->> 'handling';
+    if jsonb_typeof(v_s -> 'tax_rate') is distinct from 'number' or (v_s ->> 'tax_rate')::numeric <> v_tax or (v_s ->> 'tax_class') is distinct from v_tclass
+       or (v_s ->> 'handling') is distinct from v_handling then
+      raise exception 'derived_mismatch: セットの税率・税区分・取扱が構成品から導いた値 (% / % / %) と違う', v_tax, v_tclass, v_handling using errcode = 'P0001';
+    end if;
+    if coalesce(v_s -> 'set_sales_class_override', 'null'::jsonb) <> 'null'::jsonb then
+      if jsonb_typeof(v_s -> 'set_sales_class_override') <> 'number' or (v_s ->> 'set_sales_class_override') !~ '^[1-4]$' then
+        raise exception 'invalid_value: 売上分類の上書きは 1〜4' using errcode = '22023';
+      end if;
+      v_override := (v_s ->> 'set_sales_class_override')::smallint;
+      if (v_der ->> 'sales_from_components') is not null then
+        raise exception 'derived_mismatch: 構成品から売上分類 (%) を導けるので、上書きはできない', v_der ->> 'sales_from_components' using errcode = 'P0001';
+      end if;
+    elsif (v_der ->> 'sales_from_components') is null then
+      raise exception 'set_underivable: 構成品から売上分類を導けない (上書きが要る)' using errcode = 'P0001';
+    end if;
+    if v_cjpy is null then raise exception 'set_underivable: セットの原価が要る (構成品の合計か例外原価)' using errcode = 'P0001'; end if;
+    if v_csrc = 'set_calc' then
+      if v_cstat is distinct from 'COMPLETE' or (v_der ->> 'cost_status') is distinct from 'COMPLETE' or v_cjpy <> (v_der ->> 'cost_jpy')::bigint then
+        raise exception 'derived_mismatch: セットの原価が構成品から導いた値 (% / %) と違う', v_der ->> 'cost_status', v_der ->> 'cost_jpy' using errcode = 'P0001';
+      end if;
+    elsif v_csrc is distinct from 'manual' or v_cstat is distinct from 'OVERRIDDEN' then
+      raise exception 'invalid_value: セットの原価は構成品の合計 (set_calc / COMPLETE) か例外原価 (manual / OVERRIDDEN) だけ' using errcode = '22023';
+    end if;
+  end if;
+
+  -- カードの知らせ: 写しの欄が書く値と同じ・SKU の番号は入れない・hash は DB が作る
+  if v_card is not null and jsonb_typeof(v_card) <> 'null' then
+    v_payload := v_card -> 'payload';
+    if jsonb_typeof(v_card) <> 'object' or (v_card ->> 'schema_version') is distinct from 'ph-card-v1' or jsonb_typeof(v_payload) is distinct from 'object'
+       or v_payload ? 'cdb_sku_id' or (v_payload ->> 'schema') is distinct from (v_card ->> 'schema_version')
+       or (v_payload ->> 'code') is distinct from v_code or (v_payload ->> 'kind') is distinct from v_kind or (v_payload ->> 'name') is distinct from v_name
+       or (v_payload -> 'price') is distinct from to_jsonb(v_price)
+       or (v_payload -> 'shipping') is distinct from jsonb_build_object('code', v_ship_c, 'method', v_ship_m, 'cost_jpy', v_ship_y)
+       or (v_payload -> 'components') is distinct from coalesce((select jsonb_agg(jsonb_build_object('code', e ->> 'code', 'qty', (e -> 'qty')) order by (e ->> 'sort')::integer)
+                                                                  from jsonb_array_elements(v_rows) e), '[]'::jsonb)
+       or (v_payload ->> 'created_by') is distinct from p_actor_id then
+      raise exception 'invalid_value: カードの知らせの写しの欄 (版・コード・種類・名前・売価・送料・構成品・作った人) が書く値と違う' using errcode = '22023';
+    end if;
+    v_phash := ops.js_stable_sha256(v_payload);
+  end if;
+
+  -- 関数が書く値のハッシュ (約束と保存の記録の payload_hash = DB が作る。アプリの要求のハッシュも入れて結ぶ)
+  v_written := jsonb_build_object('request', p_payload_hash, 'kind', v_kind, 'code', v_code, 'name', v_name, 'tax_rate', v_tax, 'tax_class', v_tclass, 'handling', v_handling,
+    'standard_price_jpy', v_price, 'shipping', jsonb_build_array(v_ship_c, v_ship_m, v_ship_y), 'reorder_months', v_reorder, 'set_sales_class_override', v_override,
+    'handling_own', v_own, 'product', case when v_kind = 'single' then jsonb_build_object('sales_class', v_sales, 'expiry_managed', (v_prod -> 'expiry_managed'),
+      'inbound_date_managed', coalesce(v_prod -> 'inbound_date_managed', 'null'::jsonb)) end,
+    'supplier_id', v_supplier, 'cost', case when v_cjpy is not null then jsonb_build_array(v_cjpy, v_csrc, v_cstat, v_today, v_creason) end,
+    'rows', v_rows, 'rows_hash', v_rhash, 'card', v_phash, 'reason', v_reason);
+  v_whash := pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(v_written::text, 'UTF8')), 'hex');
+
   -- 番号を振る (商品 → SKU)
   if v_kind = 'single' then v_product := pg_catalog.nextval(pg_catalog.pg_get_serial_sequence('core.products', 'product_id')::regclass); end if;
   v_sku := pg_catalog.nextval(pg_catalog.pg_get_serial_sequence('core.skus', 'sku_id')::regclass);
@@ -639,46 +917,44 @@ begin
   insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions,
                                          actor_id, reason, source_system, db_user, phase, owner_hash, ownership)
     values (v_sess, v_tx, p_request_id, 'sku_create', v_sku, '{}'::bigint[], case when v_product is null then '{}'::bigint[] else array[v_product] end,
-            pg_catalog.repeat('0', 64), p_payload_hash, '{}'::jsonb, p_actor_id, v_reason, 'portal_master_edit', v_db_user, v_phase, v_hash, p_ownership);
+            pg_catalog.repeat('0', 64), v_whash, '{}'::jsonb, p_actor_id, v_reason, 'portal_master_edit', v_db_user, v_phase, v_hash, p_ownership);
   perform pg_catalog.set_config('ops.master_write_session', v_sess::text, true);
-  -- 行を入れる: 商品 (単品) → SKU → 状態 draft → 仕入先 → 原価 → 構成の依頼 → カードの知らせ
+  -- 行を入れる: 商品 (単品) → SKU → 状態 draft → 仕入先 → 原価 → 構成の依頼 → カードの知らせ (どれも上で確かめた / DB で作った値だけ)
   if v_kind = 'single' then
     insert into core.products (product_id, company_id, display_code, name, sales_class, status, expiry_managed, inbound_date_managed, created_by_type, created_by_id)
       overriding system value
-      values (v_product, 1, v_code, v_prod ->> 'name', (v_prod ->> 'sales_class')::smallint, 'active', coalesce((v_prod ->> 'expiry_managed')::boolean, false),
-              (v_prod ->> 'inbound_date_managed')::boolean, 'human', p_actor_id);
+      values (v_product, 1, v_code, v_name, v_sales, 'active', (v_prod ->> 'expiry_managed')::boolean, (v_prod ->> 'inbound_date_managed')::boolean, 'human', p_actor_id);
   end if;
   insert into core.skus (sku_id, company_id, product_id, sku_kind, code, name, tax_rate, tax_class, handling, standard_price_jpy,
                          shipping_code, shipping_method, shipping_cost_jpy, reorder_months, set_sales_class_override, handling_own, created_by_type, created_by_id)
     overriding system value
-    values (v_sku, 1, v_product, v_kind, v_code, v_s ->> 'name', (v_s ->> 'tax_rate')::numeric, v_s ->> 'tax_class', v_s ->> 'handling', (v_s ->> 'standard_price_jpy')::bigint,
-            v_s ->> 'shipping_code', v_s ->> 'shipping_method', (v_s ->> 'shipping_cost_jpy')::bigint, (v_s ->> 'reorder_months')::numeric,
-            (v_s ->> 'set_sales_class_override')::smallint, v_s ->> 'handling_own', 'human', p_actor_id);
+    values (v_sku, 1, v_product, v_kind, v_code, v_name, v_tax, v_tclass, v_handling, v_price, v_ship_c, v_ship_m, v_ship_y, v_reorder, v_override, v_own, 'human', p_actor_id);
   perform ops.create_sku_registration(v_sku, p_actor_id, p_request_id::text, v_reason);
-  if v_kind = 'single' and (p_entry ->> 'supplier_id') is not null then
-    insert into core.supplier_skus (company_id, supplier_id, sku_id, is_primary, created_by_type, created_by_id)
-      values (1, (p_entry ->> 'supplier_id')::bigint, v_sku, true, 'human', p_actor_id);
+  if v_supplier is not null then
+    insert into core.supplier_skus (company_id, supplier_id, sku_id, is_primary, created_by_type, created_by_id) values (1, v_supplier, v_sku, true, 'human', p_actor_id);
   end if;
-  if jsonb_typeof(v_cost) = 'object' then
+  if v_cjpy is not null then
     insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from, reason, created_by_type, created_by_id)
-      values (1, v_sku, (v_cost ->> 'jpy')::numeric, v_cost ->> 'source', v_cost ->> 'status', (v_cost ->> 'valid_from')::date, v_cost ->> 'reason', 'human', p_actor_id);
+      values (1, v_sku, v_cjpy, v_csrc, v_cstat, v_today, v_creason, 'human', p_actor_id);
   end if;
   if v_kind = 'set' then
     insert into ops.sku_component_requests (company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, edit_request_id)
-      values (1, v_sku, v_req -> 'rows', v_req ->> 'rows_hash', '[]'::jsonb, v_req ->> 'reason', p_actor_id, p_request_id);
+      values (1, v_sku, v_rows, v_rhash, '[]'::jsonb,
+              case when jsonb_typeof(v_req -> 'reason') = 'string' and length(v_req ->> 'reason') between 1 and 200 and (v_req ->> 'reason') !~ '[[:cntrl:]]' then v_req ->> 'reason' end,
+              p_actor_id, p_request_id);
   end if;
-  if jsonb_typeof(v_card) = 'object' then
+  if v_phash is not null then
     insert into ops.product_hub_outbox (company_id, sku_id, kind, schema_version, payload, payload_hash, request_id, created_by)
-      values (1, v_sku, 'card_create', v_card ->> 'schema_version', v_card -> 'payload', v_card ->> 'payload_hash', p_request_id, p_actor_id)
+      values (1, v_sku, 'card_create', 'ph-card-v1', v_payload, v_phash, p_request_id, p_actor_id)
       returning event_id into v_event;
   end if;
-  -- 保存の記録 done (約束どおり = 0051 の commit の確かめ)。結果 = 画面の結果 + 振った SKU の番号・カードの知らせ
+  -- 保存の記録 done (約束どおり = 0051 の commit の確かめ)。結果 = 画面の結果 + 振った SKU の番号・カードの知らせ・要求のハッシュ (同じ request_id の確かめ)
   v_result := coalesce(case when jsonb_typeof(p_entry -> 'result') = 'object' then p_entry -> 'result' end, '{}'::jsonb)
-    || jsonb_build_object('sku_id', v_sku::text, 'state', 'draft',
+    || jsonb_build_object('sku_id', v_sku::text, 'state', 'draft', 'request_payload_hash', p_payload_hash,
                           'card', case when v_event is null then null else jsonb_build_object('event_id', v_event::text, 'status', 'pending') end);
   insert into ops.master_edit_requests (request_id, company_id, operation, target_code, sku_id, actor_id, payload_hash, status, result, started_at)
-    values (p_request_id, 1, 'sku_create', v_code, v_sku, p_actor_id, p_payload_hash, 'done', v_result,
-            coalesce((p_entry ->> 'started_at')::timestamptz, pg_catalog.now()));
+    values (p_request_id, 1, 'sku_create', v_code, v_sku, p_actor_id, v_whash, 'done', v_result,
+            least(coalesce((p_entry ->> 'started_at')::timestamptz, pg_catalog.now()), pg_catalog.clock_timestamp()));
   -- 約束を閉じる = この関数の外では (同じ取引でも) 画面のロールは登録の約束で書けない。約束の行と done は commit の確かめに残る
   perform pg_catalog.set_config('ops.master_write_session', '', true);
   return v_result;
