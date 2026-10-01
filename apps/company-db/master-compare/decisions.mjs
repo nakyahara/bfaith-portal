@@ -62,7 +62,7 @@ export async function writeNeCodes(writer, { compareRunId, entries }) {
 
 /**
  * 新商品の NE 登録の CSV の確かめ待ちの商品 (0052 の ops.v_ne_reg_targets)。照合の読み取りの取引の中 (watcher)。
- * 表が無い (0052 の前) = null (送らない)・読めない = null + reason
+ * 表が無い (0053 の前) = null (送らない)・読めない = null + reason
  */
 export async function readRegTargets(db) {
   await db.query('savepoint reg_targets');
@@ -78,7 +78,7 @@ export async function readRegTargets(db) {
 }
 const jsonOf = (r) => (typeof r === 'string' ? JSON.parse(r) : r);
 /**
- * 新商品の NE 登録の CSV の確かめ (0052・#1571 Codex R1 High 2) = 3 段。どれも writer = watch_writer・関数だけ・1 回 = 1 つの取引。
+ * 新商品の NE 登録の CSV の確かめ (0053・#1571 Codex R1 High 2) = 3 段。どれも writer = watch_writer・関数だけ・1 回 = 1 つの取引。
  *   1. writeRegistrationObservations = この回の NE の観測 (取得の世代・時刻・原本のハッシュ・確かめ待ちの商品・観測) を DB に残す (回ごとに 1 回・後から足せない)
  *   2. sealRegistrationRun = この回が最後まで終わった受け取り (観測のハッシュ・結果の JSON の sha256)。結果の JSON を書けた後だけ
  *   3. runRegistrationCheck = 回の番号だけを渡す。DB の関数が受け取りと残した観測を自分で読んで確かめる (呼び手の観測の JSON は受けない)

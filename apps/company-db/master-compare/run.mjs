@@ -149,7 +149,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
             decisionLedger = await readDecisionLedger(db);
             // 最後に一致した値 (D2) も同じ取引で (読めない = 方向は全部 held・① と ② は続く)
             const baseline = { ...(await readBaseline(db)), cdbReadAt: readAt };
-            // 新商品の NE 登録の CSV の確かめ待ち (0052)。読めない = 送らない (② は続ける)
+            // 新商品の NE 登録の CSV の確かめ待ち (0053)。読めない = 送らない (② は続ける)
             regRead = await readRegTargets(db);
             const r2 = neCompare({ dataDir, asOfJst: asOf, syncRunId, loadCtx: ctx, cdb, ledger, loadVerdict: result.verdict, decisionLedger, baseline,
               regTargets: regRead.state === 'ok' ? regRead.targets : null });
@@ -203,7 +203,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         catch (e) { Object.assign(nc, { write: 'failed', write_error: String(e && e.message).slice(0, 200) }); }
       }
     }
-    // 新商品の NE 登録の CSV の確かめ (0052・契約 v3 H5・#1571 Codex R1 High 2) の 1 段目 = NE の観測を DB に残すだけ (状態は変えない)。
+    // 新商品の NE 登録の CSV の確かめ (0053・契約 v3 H5・#1571 Codex R1 High 2) の 1 段目 = NE の観測を DB に残すだけ (状態は変えない)。
     //   判断の台帳にこの回が書けたときだけ (照合の回の記録 = 外部キー)。② が最後まで走った回 = NE の完全な取得。
     //   2 段目 (完了の受け取り = receipt) は、この回が最後まで終わって結果の JSON を書いた後。3 段目 (確かめ = 状態を進める) は完了の証跡の後
     if (result.ne && result.ne.verdict !== 'error') {

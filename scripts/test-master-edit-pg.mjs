@@ -30,7 +30,7 @@
  *  18 新商品の NE 登録の CSV を作る取引 × 同じ商品の保存 (⑤-2b・0053): 保存は SKU の鍵で待ち、作った後の CSV (まだ配っていない) を「使わない」にしてから保存する
  *  19 JAN を 2 つの商品に同時に付ける (⑤-2b): 後の方は一意の索引で待ち、前の方の commit の後に 409 jan_taken (500 にしない・両方は付かない)
  *  20 同じファイルの「取り込んだ」の申告が 2 つ並ぶ (⑤-2b・DB の関数 ops.ne_reg_declare): 後の方は鍵で待ち「もう一度」・NE 登録待ちへは 1 回だけ・画面のロールは表を直接書けない・
- *     begin (0050 の ops.begin_master_write) の前の ops.ne_reg_* と JAN の書き込みは 42501・申告の人と request_id は begin の行 (0053 D)
+ *     約束を書く部品の関数 (ops.open_reg_write) を呼べない・JAN の行を直接書けない・申告の約束 (reg_csv_declare) は関数が書く (0053・#1571 R1 High 3)
  *  (9・12 は 0053 で: 代表の仕入先に使っている仕入先は止められない = 待った後に supplier_in_use / 付け替えてから止める)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-edit-pg.mjs
  *   (この PC では C:/tmp/pg-embed の run-conc.mjs が使い捨ての PostgreSQL を起動して TEST_PG_URL を渡す)
@@ -307,7 +307,7 @@ try {
     assert.equal(o.done, false, '止める側は保存が持つ仕入先の行の鍵で待つ');
     g.open();
     assert.ok((await a2.promise).ok);
-    // 0052 (⑤-2b・Medium 3): 待った後、代表の仕入先に使われている (p003) と分かって止めない (付け替えてから止める = [12])
+    // 0053 (⑤-2b・Medium 3): 待った後、代表の仕入先に使われている (p003) と分かって止めない (付け替えてから止める = [12])
     const ro = await o.promise;
     assert.match(String(ro.err?.message), /supplier_in_use/, ro.err ? ro.err.message : '止められてしまった');
   });
@@ -509,14 +509,14 @@ try {
     assert.equal(Number((await q("select count(*)::int as n from ops.master_write_sessions where db_user = 'master_edit'"))[0].n) > 10, true);
   });
 
-  // ─── ⑤-2b (0052): 新商品の NE 登録の CSV (書くのは DB の関数 = 画面のロール master_edit で)・JAN ───
+  // ─── ⑤-2b (0053): 新商品の NE 登録の CSV (書くのは DB の関数 = 画面のロール master_edit で)・JAN ───
   const RUN = 'mc_20300110T000000000Z_aaaaaa';
   await O.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, '2030-01-10T00:00:00Z', 0)`, [RUN]);
   await O.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: RUN, entries: ['p001', 'p002', 'p003', 'p004', 'ps01'].map((c) => ({ code_norm: c, kind: 'product', state: 'ok', ne_code: c, spellings: [c] })) })]);
   const rates = new Map([['S01', { method: 'ゆうパケット', cost: 210 }]]);
   await R.registerNewSku(dbA, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: 'pnew', card: { create: false },
     values: { name: '新しい単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', cost: { jpy: '300' } } },
-  { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: rates });
+  { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: rates });   // 原価の始まり = DB の東京の今日 (0052)
 
   await ta('[18] NE 登録の CSV を作る取引の途中は、同じ商品の保存が SKU の鍵で待つ → 作った後に保存 = そのファイル (まだ配っていない) を使わないにして保存する', async () => {
     const g = gate();
@@ -556,7 +556,7 @@ try {
     // 代表の仕入先 = 0003 ([12] で作った・使える。0002 は [9] で止めた)
     await R.registerNewSku(dbA, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: 'pnew2', card: { create: false },
       values: { name: '新しい単品 2', standard_price: '1600', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0003', cost: { jpy: '310' } } },
-    { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: rates });
+    { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: rates });   // 原価の始まり = DB の東京の今日 (0052)
     const o = { ownership: ALL_COMPANY, open: true, nowMs: NOW.getTime() };
     const b0 = await G.buildRegExport(dbA, { actor: 'boss@test', kind: 'products', codes: ['pnew2'], requestId: crypto.randomUUID() }, o);
     await G.issueRegExport(dbA, { actor: 'boss@test', exportId: b0.export.export_id }, o);
@@ -575,13 +575,13 @@ try {
     // 画面のロールは表を直接書けない (本物のログイン)
     await denied(A, `update ops.ne_reg_export_items set state = 'verified' where export_id = ${Number(b0.export.export_id)}`, 'ne_reg_export_items の直接の update');
     await denied(A, `select ops.transition_sku_registration(1, 'ne_confirmed', 'system', 'x', null, '{}'::jsonb, null)`, '状態の関数');
-    // 本物のログインでも、同じ取引で ops.begin_master_write をしていない関数・JAN の書き込みは 42501 (0052 D)。申告の人・request_id は begin の行から
-    await denied(A, `select ops.ne_reg_supersede(${Number(b0.export.export_id)}, 'boss@test', '理由', '直し方')`, 'begin の前の ops.ne_reg_supersede');
+    // 本物のログインでも: 約束を書く部品の関数は呼べない・JAN の行は直接書けない (JAN の約束の関数の中だけ)。申告の約束 (reg_csv_declare) と done は関数が書く
+    await denied(A, "select ops.open_reg_write('reg_csv_supersede', gen_random_uuid(), 'boss@test', null, '{}'::jsonb, null, null, null, repeat('a', 64), '{}'::jsonb)", '約束を書く部品の関数');
     await denied(A, `insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id, evidence)
-      select 1, 'product', product_id, 'jan', 'jan', '4900000000146', 'manual', 'human', 'x', '{}'::jsonb from core.skus where code = 'p003'`, 'begin の前の JAN');
+      select 1, 'product', product_id, 'jan', 'jan', '4900000000146', 'manual', 'human', 'x', '{}'::jsonb from core.skus where code = 'p003'`, 'JAN の直接の書き込み');
     const ev = (await q("select e.actor_id, e.request_id from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code = 'pnew2' and e.to_state = 'ne_pending'"))[0];
-    const sess = await q("select actor_id, db_user, reason from ops.master_write_sessions where request_id::text = $1", [ev.request_id]);
-    assert.deepEqual([ev.actor_id, sess.map((s) => [s.actor_id, s.db_user, s.reason])], ['boss@test', [['boss@test', 'master_edit', G.REG_WRITE_OPERATIONS.reg_csv_declare.label]]]);
+    const sess = await q("select s.actor_id, s.db_user, s.operation, d.status from ops.master_write_sessions s join ops.master_edit_requests d on d.request_id = s.request_id where s.request_id::text = $1", [ev.request_id]);
+    assert.deepEqual([ev.actor_id, sess.map((s) => [s.actor_id, s.db_user, s.operation, s.status])], ['boss@test', [['boss@test', 'master_edit', 'reg_csv_declare', 'done']]]);
   });
 } finally {
   for (const c of clients.reverse()) { try { await c.end(); } catch { /* */ } }

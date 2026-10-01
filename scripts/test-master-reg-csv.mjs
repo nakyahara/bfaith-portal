@@ -1,5 +1,5 @@
 /**
- * test-master-reg-csv.mjs — ⑤-2b (Company DB構想 14 §10 契約 v3 H5・H6・H2・Medium 3 / migration 0052)
+ * test-master-reg-csv.mjs — ⑤-2b (Company DB構想 14 §10 契約 v3 H5・H6・H2・Medium 3 / migration 0053)
  *
  * Company DB = PGlite (持ち主のロール deploy で migration)。書き込みは画面だけのロール master_edit・照合の確かめは watch_writer で流す (権限も確かめる)
  * 固定する契約:
@@ -8,13 +8,14 @@
  *     配る前に直す = 自動で使わない / 配った後に NE に送る欄を直す = 409 (ほかの欄は直せる)・申告 (sha256・誰・いつ・draft → ne_pending)・
  *     翌朝の確かめ (申告の前の取得 = 待ち・違う列 = partial・全部合う = verified + ne_confirmed・無い = failed・信じられない = 待ち・申告の前に NE にある = 記録だけ・同じ回 = 1 回)・
  *     セットは同じ取得の構成品が全部合うときだけ・使わない (理由・直し方・確かめた) ・全部だめ = failed・実機の確かめの門・DB の守り
- *   J JAN: 足す・外すの記録 (誰・request_id・出どころ・理由)・書き換え / 物理の削除は拒む・SKU の version が変わる・一意 (409)・画面 B / D で直せる・
- *     夜間ロードは持ち主 'company' なら商品の JAN に触らない
+ *   J JAN: 足す・外すの記録 (誰・request_id・出どころ・理由)・書き換え / 物理の削除は拒む・SKU の version が変わる・一意 (409)・画面 B で直せる
+ *     (新商品の登録 = 画面 D は JAN を受けない = 登録の後に商品の画面で)・夜間ロードは持ち主 'company' なら商品の JAN に触らない
  *   O セットの構成の観測: 夜間ロードが完全な取得を観測に残す (同じ材料 = 1 回)・持ち主 load = 今までどおり core を NE に合わせる /
  *     company = core を書かない・依頼が無い差 = 食い違い・依頼と同じ = 上げる・数は 0050 の厳密な整数・昇格の答え (もっと新しい観測など) は投げずに数える
  *   S 仕入先: 新しいコードの決まり・状態 ne_pending → 申告で ne_confirmed・申告の前は代表にできない・取引停止 (代表に使っている = 409 / 付け替え)・物理の削除は拒む
- *   D 画面のロールの書き込みの約束 (0050 の ops.begin_master_write): ops.ne_reg_* は同じ取引の begin が要る・誰が / request_id は begin の行と同じ・
- *     JAN の行は begin の後で external_ids.jan が company のときだけ・確かめる前の仕入先は設定に依らず代表にできない・⑤-2b の操作の一覧は 1 か所
+ *   D 書き込みの約束 (0051 の ops.master_write_sessions・#1571 R1 High 3): ⑤-2b の関数ごとに約束 (操作・DB が決めた相手・DB の payload_hash) と done・
+ *     request_id は使い回せない・画面のロールは約束を作れない / CSV の表・JAN の行の守り (約束の操作・相手)・保存の直接の書き込みも配った CSV の欄は拒む・
+ *     確かめる前の仕入先は設定に依らず代表にできない・仕入先の関数は画面のロールに渡さない・⑤-2b の操作の一覧は 1 か所
  *   P 照合 ② の観測 (registrationObservations) の形
  *   H 画面: NE 登録の CSV の画面と JS・名簿・作る → 配る → ダウンロード → 申告・商品の画面の JAN と CSV の箱・新商品の JAN
  * 使い方: node scripts/test-master-reg-csv.mjs
@@ -64,7 +65,9 @@ const jan13 = (b) => { const d = b.split('').map(Number).reverse(); const s = d.
 const J1 = jan13('490000000001'), J2 = jan13('490000000002'), J3 = jan13('490000000003'), J4 = jan13('490000000004');
 
 const ALL_COMPANY = Object.fromEntries(Object.keys(MASTER_OWNERSHIP).map((k) => [k, 'company']));
-const LOAD_NOW = new Date('2030-01-05T03:00:00Z');
+const OWN = JSON.stringify(ALL_COMPANY);
+// 夜間ロードの日 = 本当の今日の 5 日前 (原価の始まり。⑤-2a の登録は DB の東京の今日の構成品の原価を見る = 本当の今日にも画面の今日 2030-01-10 にも原価がある)
+const LOAD_NOW = new Date(Date.now() - 5 * 86400e3);
 const NOW = new Date('2030-01-10T03:00:00Z');   // 画面の今日 (東京 2030-01-10 12:00)
 const NOW_MS = NOW.getTime();
 const TODAY = '2030-01-10';
@@ -164,8 +167,9 @@ async function save(code, values, { ownership = ALL_COMPANY, reason = 'テスト
   const seen = { token: await tokenOf(code) };
   return as(E, 'master_edit', () => W.saveSku(db, { actor: 'naka@test', requestId, code, reason, seen, values }, { ownership, open: true, now: NOW, shippingRates: RATES }));
 }
+/** 新商品の登録 (⑤-2a)。原価の始まりは DB の東京の今日 (0052 の ops.register_new_sku が now() で確かめる) = 本当の今日 (画面の今日 2030-01-10 より前 = その日の原価にも出る) */
 const reg = (kind, code, values, o = {}) => as(E, 'master_edit', () => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind, code, values, card: { create: false } },
-  { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: RATES, ...o }));
+  { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: RATES, ...o }));
 const single = (over = {}) => ({ name: '新しい単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', cost: { jpy: '300' }, ...over });
 const opts = (o = {}) => ({ ownership: ALL_COMPANY, open: true, nowMs: NOW_MS, ...o });
 /** 仕入先の道 (lib/master-supplier.mjs) の持ち主表 = 切替の後 (全部 company) */
@@ -174,18 +178,11 @@ const build = (kind, codes, o = {}) => as(E, 'master_edit', () => G.buildRegExpo
 const issue = (id, o = {}) => as(E, 'master_edit', () => G.issueRegExport(db, { actor: 'boss@test', exportId: id }, opts(o)));
 const declare = (id, sha, result = 'ok', o = {}) => as(E, 'master_edit', () => G.declareRegExport(db, { actor: 'boss@test', exportId: id, sha256: sha, result, neMessage: o.msg ?? '1件成功しました。' }, opts(o)));
 /**
- * 画面のロールで、同じ取引で ops.begin_master_write (0050) をしてから fn (lib を通さずに DB の関数を呼ぶ試験)。
- * 0052 D: 画面のロールの ops.ne_reg_* は、この行が無い = 42501・誰が / request_id が違う = 42501
+ * 画面のロールで lib を通さずに DB の関数を呼ぶ (試験)。⑤-2b の関数は自分で約束 (0051 の ops.master_write_sessions) を書いて閉じる (#1571 R1 High 3) = begin は要らない
  */
-const inSession = (fn, { actor = 'boss@test', requestId = uuid(), ownership = ALL_COMPANY } = {}) => as(E, 'master_edit', async () => {
-  await pg.query('begin');
-  try {
-    await pg.query('select ops.begin_master_write($1::uuid, $2, null, $3::jsonb)', [requestId, actor, JSON.stringify(ownership)]);
-    const r = await fn();
-    await pg.query('commit');
-    return r;
-  } catch (e) { try { await pg.query('rollback'); } catch { /* */ } throw e; }
-});
+const inSession = (fn) => as(E, 'master_edit', fn);
+/** 試験の NE の元のコード (lib の neCodeLookup と同じ形: get は非同期) */
+const ncOf = (m = new Map()) => ({ run: null, get: async (k) => m.get(k) });
 const supersede = (id, x = {}) => as(E, 'master_edit', () => G.supersedeRegExport(db, { actor: 'boss@test', exportId: id, reason: '直したい', correction: 'NE には取り込んでいない', confirm: true, ...x }, opts()));
 const itemsOf = async (id) => (await q('select i.state, s.code, i.failed_reason from ops.ne_reg_export_items i join core.skus s on s.sku_id = i.sku_id where i.export_id = $1 order by i.row_from', [id]));
 const expOf = async (id) => one('select state, close_reason, trial, sha256, schema_version, header, payload_hash, aggregate_token, item_count, row_count from ops.ne_reg_exports where export_id = $1', [id]);
@@ -215,7 +212,8 @@ const obsSingle = (code, over = {}) => ({ code_norm: code, present: true, truste
   name: ok('新しい単品'), supplier: ok('0001'), cost: ok(300), price: ok(1500), tax_rate: ok(0.1), handling: ok('active'), parent: ok(null), ...over } });
 
 // ── 新商品 (下書き) ──
-await reg('single', 'new-a', single({ jan: J1 }));
+await reg('single', 'new-a', single());
+await save('new-a', { jan: J1 });   // 新商品の JAN = 登録の後に商品の画面で (JAN の約束)
 await reg('single', 'new-b', single({ name: '新しい単品 B' }));
 await reg('single', 'new-nocost', single({ cost: undefined }));
 await reg('set', 'new-set', { name: '新しいセット', standard_price: '2500', shipping_code: 'S02', components: [{ code: 's001', qty: 1 }, { code: 's002', qty: 2 }] });
@@ -310,6 +308,10 @@ await ta('[C5] 配る = built → issued・byte 列はその後だけ・配っ�
     const e = await rejectsWith(save('new-a', v), 409, 'reg_csv_issued');
     assert.match(e.message, new RegExp(`#${EXB}`));
   }
+  // JAN の関数も自分で拒む (lib を通さずに呼んでも・#1571 R1 High 3)
+  const aId = await skuId('new-a');
+  await pgErr(as(E, 'master_edit', () => pg.query("select ops.edit_sku_jan(gen_random_uuid(), 'naka@test', null, $1::jsonb, $2::bigint, $3::jsonb, $4::jsonb)",
+    [OWN, aId, JSON.stringify([J1]), JSON.stringify([J2])])), /reg_csv_issued/);
   const ok2 = await save('new-a', { reorder_months: '5' });
   assert.equal(ok2.ok, true);
 });
@@ -508,7 +510,7 @@ await ta('[C14] 権限の境界: 画面のロールは表を直接書けない�
   await denied("select ops.record_ne_registration_check('mc_20300110T000000000Z_aaaaaa')");
   await denied("select ops.record_ne_registration_observations('{}'::jsonb)");
   await denied("select ops.seal_ne_registration_run('mc_20300110T000000000Z_aaaaaa', repeat('a', 64), repeat('b', 64))");
-  await denied("select ops.declare_supplier_in_ne(1, 'x', '0001', null)");
+  await denied(`select ops.declare_supplier_in_ne(gen_random_uuid(), 'x', '${OWN}'::jsonb, '0001', '0001', null)`);
   // 3. 状態の関数は呼び手の根拠を受けない (持ち主のロールでも)・NE 登録待ちの根拠 = 取り込んだと申告した品目だけ
   await reg('single', 'new-k', single({ name: 'K' }));
   const kid = await skuId('new-k');
@@ -540,11 +542,10 @@ await ta('[C14] 権限の境界: 画面のロールは表を直接書けない�
   const expected = { kind: 'single', values: { name: 'M', supplier: '0001', cost: 300, price: 1500, tax_rate: 0.1, handling: 'active', parent: null } };
   const mark = (await one('select compare_run_id from ops.master_ne_code_mark')).compare_run_id;
   const item = (over = {}) => ({ sku_id: mid, expected, rows: [cells], ...over });
-  const pay = (over = {}) => JSON.stringify({ request_id: uuid(), actor: 'boss@test', kind: 'products', schema_version: 'ne-reg-single-v1', header, ne_codes_run: mark,
-    cost_day: TODAY, items: [item()], ...over });
+  const pay = (over = {}) => JSON.stringify({ request_id: uuid(), actor: 'boss@test', ownership: ALL_COMPANY, kind: 'products', schema_version: 'ne-reg-single-v1', header,
+    ne_codes_run: mark, cost_day: TODAY, items: [item()], ...over });
   const bytesOf = (rows) => G.buildRegCsv(G.REG_SCHEMAS.products, rows).bytes;
-  const callBuild = (payload, bytes = bytesOf([cells])) => inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [payload, bytes]),
-    { requestId: JSON.parse(payload).request_id, actor: JSON.parse(payload).actor });
+  const callBuild = (payload, bytes = bytesOf([cells])) => inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [payload, bytes]));
   const kRow = ['new-k', ...cells.slice(1)];
   // 偽造 (#1571 Codex R1 High 1): 行・確かめる値・byte 列をそろえて偽っても、関数が Company DB の今の値から作った行と違えば拒む (翌朝の照合で偽の値が NE と合っても確かめにならない)
   const forge = async (cellIdx, cellVal, valKey, val) => {
@@ -578,20 +579,32 @@ await ta('[C14] 権限の境界: 画面のロールは表を直接書けない�
   await pg.query('update core.skus set name = $2 where sku_id = $1', [mid, name0]);
   const built = (await callBuild(pay())).rows[0].r;
   assert.deepEqual([built.state, built.trial, built.sha256], ['built', true, crypto.createHash('sha256').update(bytesOf([cells])).digest('hex')]);
-  await pgErr(inSession(() => pg.query("select ops.ne_reg_declare($1, 'boss@test', $2, 'ok', null, null, null)", [built.export_id, built.sha256])), /not_issued/);
-  await pgErr(inSession(() => pg.query("select ops.ne_reg_declare($1, 'boss@test', $2, 'ok', null, null, null)", [built.export_id, 'e'.repeat(64)])), /sha256_mismatch/);
-  await pgErr(inSession(() => pg.query("select ops.ne_reg_record_verified('boss@test', 'products', 'ne-reg-single-v1', $1, 'ok', null, $2)", [header, built.export_id])), /not_verified/);
+  const declareSql = "select ops.ne_reg_declare(gen_random_uuid(), 'boss@test', $3::jsonb, $1::bigint, $2, 'ok', null, null, null)";
+  await pgErr(inSession(() => pg.query(declareSql, [built.export_id, built.sha256, OWN])), /not_issued/);
+  await pgErr(inSession(() => pg.query(declareSql, [built.export_id, 'e'.repeat(64), OWN])), /sha256_mismatch/);
+  await pgErr(inSession(() => pg.query("select ops.ne_reg_record_verified(gen_random_uuid(), 'boss@test', $3::jsonb, 'products', 'ne-reg-single-v1', $1, 'ok', null, $2::bigint)",
+    [header, built.export_id, OWN])), /not_verified/);
+  // 持ち主表が段階の記録と違う・切替の前の形 = 関数の門が拒む (lib を通さずに呼んでも)
+  await pgErr(inSession(() => pg.query(declareSql, [built.export_id, built.sha256, JSON.stringify(MASTER_OWNERSHIP)])), /before_cutover/);
+  await pgErr(callBuild(pay({ ownership: MASTER_OWNERSHIP })), /before_cutover/);
   await supersede(String(built.export_id));
   // NE にもうあるコード = 関数も止める (lib の確かめを通さずに呼んでも)
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T020000000Z_dddddd', '2030-01-10T02:00:00Z', 0)`);
   await recordNeCodes(pg, 'mc_20300110T020000000Z_dddddd', ['new-dup', 'new-m']);
   await pgErr(callBuild(pay({ ne_codes_run: 'mc_20300110T020000000Z_dddddd' })), /already_in_ne/);
   // 6. 関数の形: security definer・search_path = pg_catalog, pg_temp・public の実行権なし
+  const want = ['close_reg_write', 'create_supplier', 'deactivate_supplier', 'declare_supplier_in_ne', 'edit_sku_jan', 'guard_reg_csv_live', 'guard_reg_csv_write',
+    'ne_reg_build', 'ne_reg_canonical', 'ne_reg_declare', 'ne_reg_guard_on_save', 'ne_reg_issue', 'ne_reg_lock_export', 'ne_reg_lock_skus', 'ne_reg_ne_codes',
+    'ne_reg_record_verified', 'ne_reg_supersede', 'ne_reg_supersede_built', 'open_reg_write', 'record_ne_registration_check', 'record_ne_registration_observations',
+    'reg_write_gate', 'seal_ne_registration_run', 'transition_sku_registration'];
   const fns = await q(`select p.proname, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub
      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-    where n.nspname = 'ops' and p.prosecdef and (p.proname like 'ne!_reg!_%' escape '!' or p.proname in ('transition_sku_registration', 'record_ne_registration_check', 'record_ne_registration_observations', 'seal_ne_registration_run', 'create_supplier_registration', 'declare_supplier_in_ne'))`);
-  assert.equal(fns.length, 16, fns.map((f) => f.proname).join(' '));
+    where n.nspname = 'ops' and p.prosecdef and (p.proname like 'ne!_reg!_%' escape '!' or p.proname = any($1::text[])) order by p.proname`, [want]);
+  assert.deepEqual(fns.map((f) => f.proname), want);
   for (const f of fns) assert.deepEqual([f.proname, f.c, f.pub], [f.proname, 'search_path=pg_catalog, pg_temp', false]);
+  const jg = await one(`select array_to_string(p.proconfig, ',') as c, p.prosecdef as d, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'core' and p.proname = 'guard_master_edit_jan'`);
+  assert.deepEqual([jg.c, jg.d, jg.pub], ['search_path=pg_catalog, pg_temp', true, false]);
 });
 
 await ta('[C15] 作る関数の門 (lib を通さずに呼んでも): 実機で確かめていない形は 5 行まで (trial_limit)・切替の前 (new_open でない) は作る / 配る / 申告 / 使わないを拒む', async () => {
@@ -599,25 +612,41 @@ await ta('[C15] 作る関数の門 (lib を通さずに呼んでも): 実機で�
   const codes = ['new-t1', 'new-t2', 'new-t3', 'new-t4', 'new-t5', 'new-t6'];
   for (const c of codes) await reg('single', c, single({ name: `T ${c}` }));
   const mats = [];
-  for (const c of codes) mats.push(await G.regMaterialOf(db, await skuId(c), { today: TODAY, nc: { map: new Map() }, live: new Map(), regByIds: new Map(), supRegByIds: new Map() }));
+  for (const c of codes) mats.push(await G.regMaterialOf(db, await skuId(c), { today: TODAY, nc: ncOf(), live: new Map(), regByIds: new Map(), supRegByIds: new Map() }));
   for (const m of mats) assert.deepEqual(m.blockers, []);
   const rows = mats.map((m) => m.cells[0].map(String));
   const mark = (await one('select compare_run_id from ops.master_ne_code_mark')).compare_run_id;
-  const payload = JSON.stringify({ request_id: uuid(), actor: 'boss@test', kind: 'products', schema_version: 'ne-reg-single-v1', header: G.REG_SCHEMAS.products.header.join(','),
-    ne_codes_run: mark, cost_day: TODAY,
+  const payload = JSON.stringify({ request_id: uuid(), actor: 'boss@test', ownership: ALL_COMPANY, kind: 'products', schema_version: 'ne-reg-single-v1',
+    header: G.REG_SCHEMAS.products.header.join(','), ne_codes_run: mark, cost_day: TODAY,
     items: mats.map((m, i) => ({ sku_id: m.cur.sku_id, expected: m.expected, rows: [rows[i]] })) });
-  await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [payload, G.buildRegCsv(G.REG_SCHEMAS.products, rows).bytes]),
-    { requestId: JSON.parse(payload).request_id }), /trial_limit/);
+  await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [payload, G.buildRegCsv(G.REG_SCHEMAS.products, rows).bytes])), /trial_limit/);
   // 切替の前の DB (段階 legacy_open) = 関数が拒む
   const p0 = new PGlite();
   try {
     const d0 = pgliteAdapter(p0);
     await applyMigrations(d0, { log: quiet });
-    for (const sql of ["select ops.ne_reg_issue(1, 'x')", "select ops.ne_reg_supersede(1, 'x', '理由', '直し方')",
-      `select ops.ne_reg_declare(1, 'x', '${'a'.repeat(64)}', 'ok', null, null, null)`]) {
+    for (const sql of ["select ops.ne_reg_issue(gen_random_uuid(), 'x', '{}'::jsonb, 1)", "select ops.ne_reg_supersede(gen_random_uuid(), 'x', '{}'::jsonb, 1, '理由', '直し方')",
+      `select ops.ne_reg_declare(gen_random_uuid(), 'x', '{}'::jsonb, 1, '${'a'.repeat(64)}', 'ok', null, null, null)`,
+      "select ops.create_supplier(gen_random_uuid(), 'x', null, '{}'::jsonb, '0050', '五十商事', null, null)",
+      "select ops.edit_sku_jan(gen_random_uuid(), 'x', null, '{}'::jsonb, 1, '[]'::jsonb, '[]'::jsonb)"]) {
       await pgErr(p0.query(sql), /before_cutover/);
     }
   } finally { await p0.close(); }
+  // 段階が new_open でない (company_owner・持ち主表のハッシュは同じ) = 関数の門が拒む (持ち主が取引の中だけ段階を戻して巻き戻す)
+  const s6 = await skuId('s006');
+  await pg.query('begin');
+  try {
+    await pg.query("select set_config('ops.cutover_protocol', '1', true)");
+    await pg.query("update ops.master_cutover_state set phase = 'company_owner' where id = 1");
+    for (const [sql, params] of [["select ops.edit_sku_jan(gen_random_uuid(), 'naka@test', null, $1::jsonb, $2::bigint, '[]'::jsonb, '[]'::jsonb)", [OWN, s6]],
+      ["select ops.create_supplier(gen_random_uuid(), 'po@test', null, $1::jsonb, '0051', '五十一商事', null, null)", [OWN]],
+      ["select ops.ne_reg_record_verified(gen_random_uuid(), 'boss@test', $1::jsonb, 'products', 'ne-reg-single-v1', $2, 'ng', null, null)", [OWN, G.REG_SCHEMAS.products.header.join(',')]]]) {
+      await pg.query('savepoint t');
+      await pgErr(pg.query(sql, params), /before_cutover/);
+      await pg.query('rollback to savepoint t');
+    }
+  } finally { await pg.query('rollback'); }
+  assert.equal((await one('select phase from ops.master_cutover_state where id = 1')).phase, 'new_open');
 });
 
 await ta('[C16] 状態の関数の根拠の照らし直し (持ち主が状態を戻した・記録を直接作った場合も): 人 / system の取り違え・使わないにした品目・全部だめの試みは根拠にならない', async () => {
@@ -671,15 +700,14 @@ await ta('[C16] 状態の関数の根拠の照らし直し (持ち主が状態�
   const run5 = 'mc_20300110T030000000Z_eeeeee';
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, '2030-01-10T03:00:00Z', 0)`, [run5]);
   await recordNeCodes(pg, run5, ['new-dup', 'new-m', 'new-s1']);
-  const m = await G.regMaterialOf(db, await skuId('new-sd'), { today: TODAY, nc: { map: new Map([['product|new-s1', { state: 'ok', ne_code: 'new-s1' }]]) }, live: new Map(),
+  const m = await G.regMaterialOf(db, await skuId('new-sd'), { today: TODAY, nc: ncOf(new Map([['product|new-s1', { state: 'ok', ne_code: 'new-s1' }]])), live: new Map(),
     regByIds: new Map(), supRegByIds: new Map() });
   assert.ok(m.blockers.some((b) => /new-s1 が NE 確認済みでない/.test(b)), JSON.stringify(m.blockers));
   const rows = m.cells.map((r) => r.map(String));
   assert.deepEqual(rows, [['new-sd', '下書きの構成品のセット', '2000', '10', 'new-s1', '1']]);
-  const pay = JSON.stringify({ request_id: uuid(), actor: 'boss@test', kind: 'sets', schema_version: 'ne-reg-set-v1', header: G.REG_SCHEMAS.sets.header.join(','), ne_codes_run: run5,
-    cost_day: TODAY, items: [{ sku_id: m.cur.sku_id, expected: m.expected, rows }] });
-  await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [pay, G.buildRegCsv(G.REG_SCHEMAS.sets, rows).bytes]),
-    { requestId: JSON.parse(pay).request_id }), /new-s1 が NE 確認済みでない/);
+  const pay = JSON.stringify({ request_id: uuid(), actor: 'boss@test', ownership: ALL_COMPANY, kind: 'sets', schema_version: 'ne-reg-set-v1', header: G.REG_SCHEMAS.sets.header.join(','),
+    ne_codes_run: run5, cost_day: TODAY, items: [{ sku_id: m.cur.sku_id, expected: m.expected, rows }] });
+  await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [pay, G.buildRegCsv(G.REG_SCHEMAS.sets, rows).bytes])), /new-s1 が NE 確認済みでない/);
 });
 
 await ta('[C17] 照合の確かめ = 受け取りのある回の残した観測だけ (#1571 Codex R1 High 2): 観測の後に落ちた回は確かめない・呼び手の JSON は受けない・受け取りの後に観測を足せない・知らないコード / 足りない観測 / 照合の回より後の取得 / 世代なし / 形・ハッシュ違い・同じ回の違う中身を拒む', async () => {
@@ -738,7 +766,7 @@ await ta('[J1] JAN を足す・外す = 変更の記録 (人・request_id・出�
   assert.deepEqual(r.changed.map((c) => [c.field, c.from, c.to]), [['jan', [], [J3]]]);
   const ev = await one("select operation, actor_type, actor_id, source_system, request_id, reason_text, new_value from events.master_change_events where entity_type = 'external_id' order by event_id desc limit 1");
   assert.deepEqual([ev.operation, ev.actor_type, ev.actor_id, ev.source_system, ev.request_id, ev.reason_text, ev.new_value.external_value, ev.new_value.resolution],
-    ['INSERT', 'human', 'naka@test', 'portal_master_edit', rid, 'JAN を入れた', J3, 'manual']);
+    ['INSERT', 'human', 'naka@test', 'portal_master_edit', W.janRequestId(rid), 'JAN を入れた', J3, 'manual']);   // JAN の約束の request_id (保存の request_id から決まる)
   assert.notEqual((await one("select version::text as v from core.skus where code = 's003'")).v, v0);
   assert.notEqual(await tokenOf('s003'), t0);
   const r2 = await save('s003', { jan: J4 });
@@ -761,8 +789,14 @@ await ta('[J2] JAN の守り: 値の書き換え・物理の削除・外した�
   await rejectsWith(save('s004', { jan: '12345' }), 400);
   const e = await rejectsWith(save('s004', { jan: J4 }), 409, 'jan_taken');
   assert.match(e.message, /s003/);
-  await rejectsWith(reg('single', 'new-jan-dup', single({ jan: J4 })), 409, 'jan_taken');
+  await rejectsWith(reg('single', 'new-jan-dup', single({ jan: J4 })), 400);   // 新商品の登録は JAN を受けない (登録の後に商品の画面で)
   assert.equal(await skuId('new-jan-dup'), undefined);
+  // lib を通さずに呼んでも: ほかの商品の有効な JAN = jan_taken・形 = invalid_input (何も書かない)
+  const s4 = await skuId('s004');
+  await pgErr(as(E, 'master_edit', () => pg.query("select ops.edit_sku_jan(gen_random_uuid(), 'naka@test', null, $1::jsonb, $2::bigint, '[]'::jsonb, $3::jsonb)",
+    [OWN, s4, JSON.stringify([J4])])), /jan_taken/);
+  await pgErr(as(E, 'master_edit', () => pg.query("select ops.edit_sku_jan(gen_random_uuid(), 'naka@test', null, $1::jsonb, $2::bigint, '[]'::jsonb, '[\"4900000000001\"]'::jsonb)",
+    [OWN, s4])), /invalid_input/);
 });
 
 await ta('[J3] JAN の持ち主: 画面の保存は external_ids.jan が company のときだけ (ほかが company でも load なら切替前)・夜間ロードは company なら商品の JAN に触らない / load なら付ける', async () => {
@@ -770,7 +804,7 @@ await ta('[J3] JAN の持ち主: 画面の保存は external_ids.jan が company
   assert.deepEqual(W.SINGLE_FIELDS.jan.keys, ['external_ids.jan']);
   assert.ok(W.fieldOwnership('single', { ...ALL_COMPANY, 'external_ids.jan': 'load' }, true).jan.editable === false);
   const plan = makePlan();
-  plan.observations.push({ skuCode: 's005', attribute: 'jan', scope: 'item', valueText: J2, source: 'product_hub', sourceRef: 'test:j3', observedAt: '2030-01-04T00:00:00.000Z' });
+  plan.observations.push({ skuCode: 's005', attribute: 'jan', scope: 'item', valueText: J2, source: 'product_hub', sourceRef: 'test:j3', observedAt: new Date(LOAD_NOW.getTime() - 86400e3).toISOString() });
   const rc = await runInitialLoad(db, plan, { log: quiet, runId: 'load_j3_company', ownership: ALL_COMPANY, now: LOAD_NOW });
   assert.equal(rc.ok, true, rc.error);
   assert.ok(rc.sections.jan.notes.some((n) => /Company DB が正/.test(n)), JSON.stringify(rc.sections.jan));
@@ -782,28 +816,42 @@ await ta('[J3] JAN の持ち主: 画面の保存は external_ids.jan が company
   assert.deepEqual([ev.actor_type, ev.source_system], ['system', 'company_db_load']);
 });
 
-await ta('[J4] 新商品の登録で JAN (画面 D)・NE 登録の CSV の jan_code に入る', async () => {
+await ta('[J4] 新商品の JAN = 登録の後に商品の画面で (登録は JAN を受けない = 400)・NE 登録の CSV の jan_code に入る・JAN の約束 (jan_edit) と done が残る', async () => {
   const jan = jan13('490000000009');
-  const r = await reg('single', 'new-jan', single({ name: 'JAN つき', jan }));
-  assert.deepEqual(r.jan, [jan]);
+  await rejectsWith(reg('single', 'new-jan-x', single({ name: 'JAN つき', jan })), 400);
+  await reg('single', 'new-jan', single({ name: 'JAN つき' }));
+  const rid = uuid();
+  const r = await save('new-jan', { jan }, { requestId: rid });
+  assert.deepEqual([r.changed.map((c) => c.field), r.jan.changed[0].to], [['jan'], [jan]]);
   const x = await one("select e.resolution, e.resolved_by_id from core.external_ids e join core.skus s on s.product_id = e.entity_id where s.code = 'new-jan' and e.system = 'jan' and e.valid_to is null");
   assert.deepEqual([x.resolution, x.resolved_by_id], ['manual', 'naka@test']);
-  const m = await G.regMaterialOf(db, await skuId('new-jan'), { today: TODAY, nc: { map: new Map() }, live: new Map(), regByIds: new Map(), supRegByIds: new Map() });
+  // 保存の約束 (sku_edit) と JAN の約束 (jan_edit) が 1 つずつ・どちらも done がある (同じ取引)
+  const sess = await q("select operation, db_user from ops.master_write_sessions where request_id in ($1, $2) order by operation", [rid, W.janRequestId(rid)]);
+  assert.deepEqual(sess.map((s) => [s.operation, s.db_user]), [['jan_edit', 'master_edit'], ['sku_edit', 'master_edit']]);
+  assert.deepEqual((await q("select operation, status from ops.master_edit_requests where request_id in ($1, $2) order by operation", [rid, W.janRequestId(rid)])).map((d) => [d.operation, d.status]),
+    [['jan_edit', 'done'], ['sku_edit', 'done']]);
+  const m = await G.regMaterialOf(db, await skuId('new-jan'), { today: TODAY, nc: ncOf(), live: new Map(), regByIds: new Map(), supRegByIds: new Map() });
   assert.equal(m.cells[0][8], jan);
 });
 
-await ta('[J5] JAN の行の権限: 画面のロールが書けるのは商品の JAN の行 (足す・外す) だけ・ほかの外部 ID は拒む・値の書き換え / 物理の削除は列 / 表の権限が無い', async () => {
+await ta('[J5] JAN の行の権限: 画面のロールは core.external_ids を直接書けない (JAN の約束の関数の中だけ)・表の持ち主でないロールも商品の JAN の行だけ (trigger)', async () => {
   const pid = (await one("select product_id::text as p from core.skus where code = 's005'")).p;
   await pg.query(`insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id)
     values (1, 'product', $1, 'rakuten', 'item_code', 'j5-item', 'manual', 'system', 'test')`, [pid]);
-  const deny = async (sql, params, re) => { const e = await as(E, 'master_edit', () => pgErr(pg.query(sql, params), re)); assert.equal(e.code, '42501', e.message); };
+  const deny = async (sql, params) => { const e = await as(E, 'master_edit', () => pgErr(pg.query(sql, params))); assert.equal(e.code, '42501', e.message); };
   await deny(`insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id)
-    values (1, 'product', $1, 'rakuten', 'item_code', 'j5-other', 'manual', 'human', 'x')`, [pid], /external_id_writer/);
-  await deny(`insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id)
-    values (1, 'sku', $1, 'jan', 'jan', $2, 'manual', 'human', 'x')`, [await skuId('s005'), jan13('490000000077')], /external_id_writer/);
-  await deny("update core.external_ids set valid_to = now() where external_value = 'j5-item'", [], /external_id_writer/);
-  await deny("update core.external_ids set external_value = '4900000000017' where system = 'jan'", [], /permission denied/);
-  await deny("delete from core.external_ids where external_value = 'j5-item'", [], /permission denied/);
+    values (1, 'product', $1, 'jan', 'jan', $2, 'manual', 'human', 'x')`, [pid, jan13('490000000078')]);
+  await deny("update core.external_ids set valid_to = now() where external_value = 'j5-item'", []);
+  await deny("delete from core.external_ids where external_value = 'j5-item'", []);
+  // 持ち主でないロール (watch_writer に試験だけ列の権限を足す) = 商品の JAN の行だけ (core.guard_external_ids_writer)
+  await pg.query('begin');
+  try {
+    await pg.query('grant usage on schema core to watch_writer');
+    await pg.query('grant insert on core.external_ids to watch_writer');
+    await pg.query('set local role watch_writer');
+    await pgErr(pg.query(`insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id)
+      values (1, 'product', $1, 'rakuten', 'item_code', 'j5-other', 'manual', 'human', 'x')`, [pid]), /external_id_writer/);
+  } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
   assert.equal((await q("select 1 from core.external_ids where external_value = 'j5-item' and valid_to is null")).length, 1);
 });
 
@@ -869,112 +917,189 @@ await ta('[S4] 仕入先の状態は関数だけ: 持ち主のロールでも直
   const old = (await one("select supplier_id::text as id from core.suppliers where code = '0002'")).id;
   await pgErr(pg.query("update ops.supplier_registrations set state = 'ne_pending'"), /でだけ書く/);
   await pgErr(pg.query("insert into ops.supplier_registrations (supplier_id, state, created_by) values ($1, 'ne_pending', 'x')", [old]), /でだけ書く/);
-  await pgErr(pg.query('select ops.create_supplier_registration($1, $2)', [old, 'po@test']), /not_new_supplier/);
+  await pgErr(pg.query("select ops.declare_supplier_in_ne(gen_random_uuid(), 'po@test', $1::jsonb, '0002', '0002', null)", [OWN]), /not_new_supplier/);
   await rejectsWith(SUP.createSupplier(db, { actor: 'po@test', code: '15', name: '十五商事' }), 409, 'before_cutover');   // 持ち主表 = 今の本番 (load)
   await rejectsWith(SUP.declareSupplierInNe(db, { actor: 'po@test', code: '0012', neCode: '0012' }), 409, 'before_cutover');
   await SUP.createSupplier(db, { actor: 'po@test', code: '15', name: '十五商事' }, SOPT);
-  await pgErr(pg.query("select ops.declare_supplier_in_ne((select supplier_id from core.suppliers where code = '0015'), 'po@test', '0016', null)"), /ne_code_mismatch/);
+  await pgErr(pg.query("select ops.declare_supplier_in_ne(gen_random_uuid(), 'po@test', $1::jsonb, '0015', '0016', null)", [OWN]), /ne_code_mismatch/);
   const d = await SUP.declareSupplierInNe(db, { actor: 'po@test', code: '0015', neCode: '15' }, SOPT);
   assert.equal(d.state, 'ne_confirmed');
   assert.equal((await SUP.declareSupplierInNe(db, { actor: 'po@test', code: '0015', neCode: '0015' }, SOPT)).already, true);
 });
 
-console.log('\n画面のロールの書き込みの約束 (0052 D・0050 の ops.begin_master_write)');
+console.log('\n書き込みの約束 (0051 の ops.master_write_sessions に ⑤-2b の操作・#1571 R1 High 3)');
 
-await ta('[D1] 画面のロールの ops.ne_reg_* = 同じ取引の begin が要る (無い = 42501)・誰が / request_id が begin と違う = 42501 (何も変わらない)・lib の 1 回の操作 = begin の行 1 つ・申告の request_id が履歴に残る', async () => {
+/**
+ * 試験だけ: 持ち主のロールが約束の行を直接書き (取引の中だけの設定も)、画面のロールにして fn を流す (関数の中から書く形を作る)。最後は巻き戻す
+ */
+const asFakeSession = async (op, fn, { skuId = null, products = [], versions = {}, ownership = ALL_COMPANY, actor = 'boss@test' } = {}) => {
+  await pg.query('begin');
+  try {
+    const sid = uuid();
+    await pg.query(`insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions,
+        actor_id, reason, source_system, db_user, phase, owner_hash, ownership)
+      values ($1, txid_current(), gen_random_uuid(), $2, $3::bigint, '{}', $4::bigint[], repeat('0', 64), repeat('a', 64), $5::jsonb, $6, null, 'portal_master_edit', 'master_edit',
+              'new_open', repeat('b', 64), $7::jsonb)`, [sid, op, skuId, `{${products.join(',')}}`, JSON.stringify(versions), actor, JSON.stringify(ownership)]);
+    await pg.query("select set_config('ops.master_write_session', $1, true)", [sid]);
+    await pg.query('set local role master_edit');
+    return await fn();
+  } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
+};
+const code42501 = async (p, re) => { const e = await pgErr(p, re); assert.equal(e.code, '42501', e.message); return e; };
+
+await ta('[D1] ⑤-2b の関数ごとに約束 (操作・DB が決めた相手・DB が作った payload_hash) と done が 1 つずつ・request_id は使い回せない・画面のロールは約束を作れない (begin は sku_edit だけ・部品の関数も無い)', async () => {
   await reg('single', 'new-dd', single({ name: 'DD' }));
+  const ddId = await skuId('new-dd');
+  const sessOf = (rid) => one('select operation, sku_id::text as sku_id, versions, db_user, actor_id, payload_hash from ops.master_write_sessions where request_id = $1', [rid]);
+  const doneOf = (rid) => one('select operation, status, payload_hash, sku_id::text as sku_id from ops.master_edit_requests where request_id = $1', [rid]);
   const ridBuild = uuid();
   const b = await build('products', ['new-dd'], { requestId: ridBuild });
   const id = b.export.export_id;
-  assert.deepEqual(await one('select actor_id, reason, db_user from ops.master_write_sessions where request_id = $1', [ridBuild]),
-    { actor_id: 'boss@test', reason: G.REG_WRITE_OPERATIONS.reg_csv_build.label, db_user: 'master_edit' });
-  const header = G.REG_SCHEMAS.products.header.join(',');
-  const noSess = async (sql, params = []) => {
-    const e = await as(E, 'master_edit', () => pgErr(pg.query(sql, params), /master_write_session_required/));
-    assert.equal(e.code, '42501', sql);
-  };
-  await noSess("select ops.ne_reg_issue($1, 'boss@test')", [id]);
-  await noSess("select ops.ne_reg_supersede($1, 'boss@test', '理由', '直し方')", [id]);
-  await noSess("select ops.ne_reg_declare($1, 'boss@test', $2, 'ok', null, null, null)", [id, b.export.sha256]);
-  await noSess("select ops.ne_reg_guard_on_save(array[$1]::bigint[], 'boss@test', '名前')", [await skuId('new-dd')]);
-  await noSess("select ops.ne_reg_record_verified('boss@test', 'products', 'ne-reg-single-v1', $1, 'ng', null, null)", [header]);
-  await noSess('select ops.ne_reg_build($1::jsonb, $2::bytea)', [JSON.stringify({ request_id: uuid(), actor: 'boss@test' }), Buffer.from('x')]);
-  // 誰が・request_id が begin と違う = 42501
-  const mis = async (fn, o = {}) => { const e = await pgErr(inSession(fn, o), /master_write_session_mismatch/); assert.equal(e.code, '42501'); };
-  await mis(() => pg.query("select ops.ne_reg_issue($1, 'other@test')", [id]));
-  await mis(() => pg.query("select ops.ne_reg_supersede($1, 'other@test', '理由', '直し方')", [id]));
-  const ddId = await skuId('new-dd');
-  await mis(() => pg.query("select ops.ne_reg_guard_on_save(array[$1]::bigint[], 'other@test', '名前')", [ddId]));
-  await mis(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea)', [JSON.stringify({ request_id: uuid(), actor: 'boss@test' }), Buffer.from('x')]));   // request_id が begin と違う
-  await mis(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea)', [JSON.stringify({ request_id: ridBuild, actor: 'other@test' }), Buffer.from('x')]), { requestId: ridBuild });
-  assert.equal((await expOf(id)).state, 'built');
-  // begin の後 = 通る (配った人 = begin の人)・申告の request_id = 登録の状態の履歴の request_id
-  await inSession(() => pg.query("select ops.ne_reg_issue($1, 'boss@test')", [id]));
-  assert.deepEqual(await one('select state, issued_by from ops.ne_reg_exports where export_id = $1', [id]), { state: 'issued', issued_by: 'boss@test' });
+  const s1 = await sessOf(ridBuild);
+  assert.deepEqual([s1.operation, s1.sku_id, s1.versions.export_id, s1.versions.sku_ids.map(String), s1.db_user, s1.actor_id],
+    ['reg_csv_build', null, id, [ddId], 'master_edit', 'boss@test']);
+  assert.equal(s1.payload_hash, b.export.payload_hash);   // DB が作った payload_hash
+  assert.deepEqual(await doneOf(ridBuild), { operation: 'reg_csv_build', status: 'done', payload_hash: s1.payload_hash, sku_id: null });
+  // 配る = reg_csv_issue (相手 = このファイル)
+  const ridIssue = uuid();
+  await as(E, 'master_edit', () => G.issueRegExport(db, { actor: 'boss@test', exportId: id, requestId: ridIssue }, opts()));
+  assert.deepEqual([(await sessOf(ridIssue)).operation, (await sessOf(ridIssue)).versions.export_id, (await doneOf(ridIssue)).status], ['reg_csv_issue', id, 'done']);
+  // 同じ request_id = 使い回せない
+  await pgErr(as(E, 'master_edit', () => pg.query("select ops.ne_reg_supersede($1::uuid, 'boss@test', $2::jsonb, $3::bigint, '理由', '直し方')", [ridIssue, OWN, id])), /request_id_reused/);
+  // 画面のロールは ⑤-2b の約束を begin で作れない・部品 (約束を書く・閉じる・門) を呼べない
+  await pgErr(as(E, 'master_edit', () => pg.query(`select ops.begin_master_write(gen_random_uuid(), 'boss@test', null, $1::jsonb, 'reg_csv_issue', $2::bigint, repeat('0', 64), repeat('a', 64), '{}'::jsonb)`,
+    [OWN, ddId])), /知らない操作/);
+  for (const sql of ["select ops.open_reg_write('reg_csv_issue', gen_random_uuid(), 'x', null, '{}'::jsonb, null, null, null, repeat('a', 64), '{}'::jsonb)",
+    "select ops.close_reg_write('{}'::jsonb, 'x')", "select ops.reg_write_gate('{}'::jsonb)", "select ops.ne_reg_supersede_built(array[1]::bigint[], 'x', 'x')"]) {
+    await as(E, 'master_edit', () => code42501(pg.query(sql)));
+  }
+  // 保存の中の ops.ne_reg_guard_on_save = 保存の約束 (sku_edit) の中だけ
+  await as(E, 'master_edit', () => code42501(pg.query("select ops.ne_reg_guard_on_save(array[$1]::bigint[], 'boss@test', '名前')", [ddId]), /master_write_session_required/));
+  // 申告 = reg_csv_declare・その request_id が登録の状態の履歴に残る
   const ridDeclare = uuid();
-  await inSession(() => pg.query("select ops.ne_reg_declare($1, 'boss@test', $2, 'ok', null, null, null)", [id, b.export.sha256]), { requestId: ridDeclare });
-  assert.equal((await one("select e.request_id, e.actor_id from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code = 'new-dd' and e.to_state = 'ne_pending'")).request_id, ridDeclare);
+  await as(E, 'master_edit', () => G.declareRegExport(db, { actor: 'boss@test', exportId: id, sha256: b.export.sha256, result: 'ok', requestId: ridDeclare }, opts()));
+  assert.equal((await one("select e.request_id from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code = 'new-dd' and e.to_state = 'ne_pending'")).request_id, ridDeclare);
+  assert.equal((await doneOf(ridDeclare)).operation, 'reg_csv_declare');
   await supersede(id);
-  // 操作の一覧 (⑤-1 の次の形の ops.master_write_allowed に足す表) は 1 か所
-  assert.deepEqual(Object.keys(G.REG_WRITE_OPERATIONS).sort(),
-    ['reg_csv_build', 'reg_csv_declare', 'reg_csv_issue', 'reg_csv_supersede', 'reg_csv_verified', 'supplier_create', 'supplier_deactivate', 'supplier_declare']);
-  await assert.rejects(() => G.beginRegWrite(db, { operation: 'nope', actor: 'boss@test', ownership: ALL_COMPANY }), /操作が分からない/);
+  // 操作の一覧: lib (REG_WRITE_OPERATIONS) = DB の CHECK から sku_edit・sku_create を除いたもの。sku_edit・sku_create の書いてよい行は 0051 / 0052 のまま
+  const ck = (await one("select pg_get_constraintdef(oid) as d from pg_constraint where conname = 'ck_mws_operation'")).d;
+  for (const op of [...Object.keys(G.REG_WRITE_OPERATIONS), 'sku_edit', 'sku_create']) assert.ok(ck.includes(`'${op}'`), op);
+  const allowed = async (op, t, a) => (await one('select ops.master_write_allowed($1, $2, $3) as x', [op, t, a])).x;
+  assert.deepEqual([await allowed('sku_edit', 'core.skus', 'UPDATE'), await allowed('sku_create', 'core.skus', 'INSERT'), await allowed('sku_edit', 'core.skus', 'INSERT'),
+    await allowed('sku_edit', 'core.external_ids', 'INSERT'), await allowed('jan_edit', 'core.external_ids', 'INSERT'), await allowed('reg_csv_issue', 'core.skus', 'UPDATE')],
+  [true, true, false, false, true, false]);
 });
 
-await ta('[D2] JAN の行: 画面のロールは begin の後だけ (無い = 42501)・始めたときの持ち主表の external_ids.jan が company でない = 42501・確かめる前の仕入先は設定 (source_system) に依らず代表にできない', async () => {
-  const pid = (await one("select product_id::text as p from core.skus where code = 's005'")).p;
-  const J9 = jan13('490000000091');
-  const ins = `insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id, evidence)
-     values (1, 'product', $1, 'jan', 'jan', $2, 'manual', 'human', 'naka@test', '{}'::jsonb)`;
-  const e1 = await as(E, 'master_edit', () => pgErr(pg.query(ins, [pid, J9]), /master_write_session_required/));
-  assert.equal(e1.code, '42501');
-  // 始めたときの持ち主表で external_ids.jan = load (表の持ち主が同じ取引に行を直接書いた = 試験だけ) → 画面のロールの JAN の書き込みは 42501
-  await pg.query('begin');
+await ta('[D2] 新規登録の CSV の表の守り: 画面のロールが関数の中で書く = 約束の操作で書いてよい表・約束のファイルの行だけ / 保存・JAN の約束では「作っただけのファイルを使わないにする」だけ', async () => {
+  await reg('single', 'new-ee', single({ name: 'EE' }));
+  const ee = await build('products', ['new-ee']);
+  const other = await build('products', ['new-dd']);   // [D1] で使わないにした = もう一度作れる
+  const id = ee.export.export_id;
+  await pg.query(`create function ops.zz_t_issue(p bigint) returns void language sql security definer set search_path = pg_catalog, pg_temp as $$
+    update ops.ne_reg_export_items set state = 'issued', state_changed_at = now(), state_changed_by = 't' where export_id = p and state = 'built' $$`);
+  await pg.query(`create function ops.zz_t_supersede(p bigint) returns void language sql security definer set search_path = pg_catalog, pg_temp as $$
+    update ops.ne_reg_export_items set state = 'superseded', superseded_reason = 't', superseded_correction = 't', state_changed_at = now(), state_changed_by = 't' where export_id = p and state = 'built' $$`);
+  await pg.query('grant execute on function ops.zz_t_issue(bigint), ops.zz_t_supersede(bigint) to master_edit');
   try {
-    await pg.query(`insert into ops.master_write_sessions (txid, request_id, actor_id, source_system, db_user, phase, owner_hash, ownership)
-       values (txid_current(), $1, 'naka@test', 'portal_master_edit', 'master_edit', 'new_open', $2, $3::jsonb)`,
-      [uuid(), C.ownershipHash(ALL_COMPANY), JSON.stringify({ ...ALL_COMPANY, 'external_ids.jan': 'load' })]);
-    await pg.query('set local role master_edit');
-    const e2 = await pgErr(pg.query(ins, [pid, J9]), /owner_not_company: external_ids\.jan/);
-    assert.equal(e2.code, '42501');
-  } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
-  // begin の後 = 足せる (記録の誰が = begin の人)
-  const rid = uuid();
-  await inSession(() => pg.query(ins, [pid, J9]), { actor: 'naka@test', requestId: rid });
-  const ev = await one("select actor_id, request_id from events.master_change_events where entity_type = 'external_id' and new_value ->> 'external_value' = $1", [J9]);
-  assert.deepEqual([ev.actor_id, ev.request_id], ['naka@test', rid]);
-  // 確かめる前 (ne_pending) の仕入先を、画面のロールが設定 (core.source_system) を付けずに代表にする = 拒む
+    const call = (fn) => pg.query(`select ops.${fn}($1::bigint)`, [id]);
+    await as(E, 'master_edit', () => code42501(call('zz_t_issue'), /master_write_session_required/));
+    await asFakeSession('reg_csv_issue', () => code42501(call('zz_t_issue'), /master_write_target/), { versions: { export_id: other.export.export_id } });
+    await asFakeSession('reg_csv_issue', () => call('zz_t_issue'), { versions: { export_id: id } });   // 約束のファイル = 通る
+    await asFakeSession('supplier_create', () => code42501(call('zz_t_issue'), /master_write_operation/));
+    const s6 = await skuId('s006');
+    await asFakeSession('sku_edit', () => code42501(call('zz_t_issue'), /master_write_target/), { skuId: s6 });
+    await asFakeSession('sku_edit', () => call('zz_t_supersede'), { skuId: s6 });   // 使わないにするだけ = 通る
+    await asFakeSession('jan_edit', () => code42501(call('zz_t_issue'), /master_write_target/), { skuId: s6 });
+    // 保存の中の「作っただけのファイルを使わないにする」= 保存の約束の人・相手の SKU だけ
+    const eeId = await skuId('new-ee');
+    const guardSql = 'select ops.ne_reg_guard_on_save(array[$1]::bigint[], $2, $3)';
+    await asFakeSession('sku_edit', () => code42501(pg.query(guardSql, [eeId, 'boss@test', '名前']), /master_write_target/), { skuId: s6 });
+    await asFakeSession('sku_edit', () => code42501(pg.query(guardSql, [eeId, 'other@test', '名前']), /master_write_session_mismatch/), { skuId: eeId });
+    await asFakeSession('sku_edit', () => pg.query(guardSql, [eeId, 'boss@test', '名前']), { skuId: eeId });   // 相手の SKU = 通る (巻き戻す)
+    // ⑤-2b の関数は、ほかの約束の中では始めない (1 つの取引に約束は 1 つずつ)
+    await asFakeSession('sku_edit', () => pgErr(pg.query("select ops.ne_reg_issue(gen_random_uuid(), 'boss@test', $1::jsonb, $2::bigint)", [OWN, id]), /master_write_session_exists/), { skuId: s6 });
+    assert.equal((await one('select state from ops.ne_reg_exports where export_id = $1', [id])).state, 'built', '巻き戻した');
+  } finally {
+    await pg.query('drop function ops.zz_t_issue(bigint), ops.zz_t_supersede(bigint)');
+  }
+  await supersede(id);
+  // 1 つの取引で ⑤-2b の関数を 2 つ = 関数ごとに約束と done (前の関数が約束の設定を消す)
+  await as(E, 'master_edit', async () => {
+    await pg.query('begin');
+    try {
+      await pg.query("select ops.ne_reg_issue(gen_random_uuid(), 'boss@test', $1::jsonb, $2::bigint)", [OWN, other.export.export_id]);
+      await pg.query("select ops.ne_reg_supersede(gen_random_uuid(), 'boss@test', $1::jsonb, $2::bigint, '理由', '取り込んでいない')", [OWN, other.export.export_id]);
+      await pg.query('commit');
+    } catch (e) { await pg.query('rollback'); throw e; }
+  });
+  assert.deepEqual(await expOf(other.export.export_id).then((e) => [e.state, e.close_reason]), ['closed', 'superseded']);
+  assert.deepEqual((await q(`select s.operation from ops.master_write_sessions s join ops.master_edit_requests d on d.request_id = s.request_id
+     where s.versions ->> 'export_id' = $1 and s.operation in ('reg_csv_issue', 'reg_csv_supersede') order by s.created_at`, [String(other.export.export_id)])).map((r) => r.operation),
+  ['reg_csv_issue', 'reg_csv_supersede']);
+});
+
+await ta('[D3] JAN の行の守り (専用・core.guard_master_edit_jan): JAN の約束 (jan_edit) の中・約束の商品・external_ids.jan が company・約束の人の manual の行だけ', async () => {
+  const s6 = await skuId('s006');
+  const p6 = (await one('select product_id::text as p from core.skus where sku_id = $1', [s6])).p;
+  const p7 = (await one("select product_id::text as p from core.skus where code = 's007'")).p;
+  const J = jan13('490000000093');
+  await pg.query(`create function core.zz_t_jan(p_product bigint, p_jan text, p_by text) returns void language sql security definer set search_path = pg_catalog, pg_temp as $$
+    insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id)
+      values (1, 'product', p_product, 'jan', 'jan', p_jan, 'manual', 'human', p_by) $$`);
+  await pg.query('grant execute on function core.zz_t_jan(bigint, text, text) to master_edit');
+  try {
+    const call = (by = 'boss@test') => pg.query('select core.zz_t_jan($1::bigint, $2, $3)', [p6, J, by]);
+    await as(E, 'master_edit', () => code42501(call(), /master_write_session_required/));
+    await asFakeSession('sku_edit', () => code42501(call(), /master_write_session_required/), { skuId: s6, products: [p6] });
+    // 約束の商品でない = JAN の守りが拒む (0051 の guard も SKU・商品の version で拒むが、それより前に)
+    await asFakeSession('jan_edit', () => code42501(call(), /master_write_target: JAN の約束の商品の JAN の行でない/), { skuId: s6, products: [p7] });
+    await asFakeSession('jan_edit', () => code42501(call(), /owner_not_company/), { skuId: s6, products: [p6], ownership: { ...ALL_COMPANY, 'external_ids.jan': 'load' } });
+    await asFakeSession('jan_edit', () => code42501(call('other@test'), /master_write_session_mismatch/), { skuId: s6, products: [p6] });
+    await asFakeSession('jan_edit', () => call(), { skuId: s6, products: [p6] });   // 約束どおり = 通る (巻き戻す)
+  } finally {
+    await pg.query('drop function core.zz_t_jan(bigint, text, text)');
+  }
+  assert.equal((await q('select 1 from core.external_ids where external_value = $1', [J])).length, 0);
+  // ops.edit_sku_jan: 画面が見ていた JAN と違う = version_conflict・配った後 = reg_csv_issued
+  await pgErr(as(E, 'master_edit', () => pg.query("select ops.edit_sku_jan(gen_random_uuid(), 'boss@test', null, $1::jsonb, $2::bigint, '[\"4900000000000\"]'::jsonb, '[]'::jsonb)", [OWN, s6])), /version_conflict/);
+});
+
+await ta('[D4] 保存 (sku_edit) の直接の書き込みも、新規登録の CSV が出ている商品の NE に送る欄は DB が拒む (ops.guard_reg_csv_live)・NE に送らない欄は通る / 確かめる前の仕入先は設定に依らず代表にできない', async () => {
+  await reg('single', 'new-ff', single({ name: 'FF' }));
+  const ff = await build('products', ['new-ff']);
+  const fid = await skuId('new-ff');
+  const pff = (await one('select product_id::text as p from core.skus where sku_id = $1', [fid])).p;
+  await asFakeSession('sku_edit', () => code42501(pg.query("update core.skus set name = 'FF2' where sku_id = $1", [fid]), /reg_csv_issued/), { skuId: fid, products: [pff] });
+  await asFakeSession('sku_edit', () => pg.query('update core.skus set reorder_months = 3 where sku_id = $1', [fid]), { skuId: fid, products: [pff] });
+  // 代表の仕入先・原価も同じ (CSV の仕入先・原価の列)
+  const sup2 = (await one("select supplier_id::text as id from core.suppliers where code = '0002'")).id;
+  await asFakeSession('sku_edit', () => code42501(pg.query(`insert into core.supplier_skus (company_id, supplier_id, sku_id, is_primary, created_by_type, created_by_id)
+    values (1, $1, $2, false, 'human', 'boss@test')`, [sup2, fid]).then(() => pg.query('update core.supplier_skus set is_primary = true where supplier_id = $1 and sku_id = $2', [sup2, fid])),
+  /reg_csv_issued/), { skuId: fid, products: [pff] });
+  await asFakeSession('sku_edit', () => code42501(pg.query("update core.sku_costs set valid_to = valid_from where sku_id = $1 and valid_to is null", [fid]), /reg_csv_issued/),
+    { skuId: fid, products: [pff] });
+  await supersede(ff.export.export_id);
+  await asFakeSession('sku_edit', () => pg.query("update core.skus set name = 'FF2' where sku_id = $1", [fid]), { skuId: fid, products: [pff] });   // ファイルが無い = 通る
+  // 確かめる前 (ne_pending) の仕入先 = 画面のロールの書き込みでは代表にできない (core.source_system の設定が無くても)
   await SUP.createSupplier(db, { actor: 'po@test', code: '17', name: '十七商事' }, SOPT);
   const sup = (await one("select supplier_id::text as id from core.suppliers where code = '0017'")).id;
   const s6 = await skuId('s006');
-  await pgErr(inSession(() => pg.query(`insert into core.supplier_skus (company_id, supplier_id, sku_id, is_primary, created_by_type, created_by_id) values (1, $1, $2, true, 'human', 'naka@test')`,
-    [sup, s6]), { actor: 'naka@test' }), /supplier_not_confirmed/);
+  await asFakeSession('sku_edit', () => pgErr(pg.query(`insert into core.supplier_skus (company_id, supplier_id, sku_id, is_primary, created_by_type, created_by_id) values (1, $1, $2, true, 'human', 'boss@test')`,
+    [sup, s6]), /supplier_not_confirmed/), { skuId: s6 });
 });
 
-await ta('[D3] 仕入先の関数も、画面のロールに渡したら (⑥) 同じ取引の begin が要る (試験だけ実行権を足して確かめる)・仕入先の道 (lib) は begin の行を残す・CSV のセルの制御文字 (U+2028 / U+2029 も)', async () => {
-  // lib の仕入先の道 = 門の後に begin (理由 = 操作の名前)
-  await SUP.createSupplier(db, { actor: 'po@test', code: '18', name: '十八商事' }, SOPT);
-  assert.ok((await one("select count(*)::int as n from ops.master_write_sessions where actor_id = 'po@test' and reason = $1", [G.REG_WRITE_OPERATIONS.supplier_create.label])).n >= 1);
-  const sup = (await one("select supplier_id::text as id from core.suppliers where code = '0018'")).id;
-  // 実行権をこの取引だけ足して画面のロールで呼ぶ = begin が無い = 42501 (取り消すと実行権も戻る)
-  const asEditorWithGrant = async (fnSig, run) => {
-    await pg.query('begin');
-    try {
-      const pre = await run.before?.();
-      await pg.query(`grant execute on function ${fnSig} to master_edit`);
-      await pg.query('set local role master_edit');
-      const e = await pgErr(run.call(pre), /master_write_session_required/);
-      assert.equal(e.code, '42501', fnSig);
-    } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
-  };
-  await asEditorWithGrant('ops.declare_supplier_in_ne(bigint, text, text, text)', { call: () => pg.query("select ops.declare_supplier_in_ne($1, 'po@test', '0018', null)", [sup]) });
-  await asEditorWithGrant('ops.create_supplier_registration(bigint, text)', {
-    before: async () => (await pg.query(`insert into core.suppliers (company_id, code, name, created_by_type, created_by_id) values (1, '0019', '十九商事', 'human', 'x') returning supplier_id::text as id`)).rows[0].id,
-    call: (id) => pg.query("select ops.create_supplier_registration($1, 'po@test')", [id]) });
-  for (const f of ['ops.declare_supplier_in_ne(bigint, text, text, text)', 'ops.create_supplier_registration(bigint, text)', 'ops.reg_write_session(text, uuid)']) {
+await ta('[D5] 仕入先の関数 = 約束 (supplier_create / supplier_declare / supplier_deactivate・相手 = 仕入先と付け替える SKU) と done・画面のロールには渡さない・CSV のセルの制御文字 (U+2028 / U+2029 も)', async () => {
+  const rid = uuid();
+  await SUP.createSupplier(db, { actor: 'po@test', code: '18', name: '十八商事', requestId: rid }, SOPT);
+  assert.deepEqual(await one("select s.operation, d.status, s.versions ->> 'supplier_code' as code from ops.master_write_sessions s join ops.master_edit_requests d on d.request_id = s.request_id where s.request_id = $1", [rid]),
+    { operation: 'supplier_create', status: 'done', code: '0018' });
+  const rid2 = uuid();
+  await SUP.declareSupplierInNe(db, { actor: 'po@test', code: '0018', neCode: '18', requestId: rid2 }, SOPT);
+  assert.equal((await one('select operation from ops.master_write_sessions where request_id = $1', [rid2])).operation, 'supplier_declare');
+  for (const f of ['ops.create_supplier(uuid, text, text, jsonb, text, text, text, integer)', 'ops.declare_supplier_in_ne(uuid, text, jsonb, text, text, text)',
+    'ops.deactivate_supplier(uuid, text, text, jsonb, text, text)', 'ops.open_reg_write(text, uuid, text, text, jsonb, bigint, bigint[], bigint[], text, jsonb)']) {
     assert.equal((await one('select has_function_privilege($1, $2, $3) as x', ['master_edit', f, 'execute'])).x, false, f);
   }
-  assert.equal((await one("select count(*)::int as n from core.suppliers where code = '0019'")).n, 0);
   // CSV のセル: 改行・U+2028・U+2029 = 書かない (null) / ふつうの文字・カンマ = 書く (lib の regQuote と同じ決まり)
   const cell = async (s) => (await one('select ops.ne_reg_csv_cell($1) as c', [s])).c;
   for (const cp of [10, 0x2028, 0x2029]) assert.equal(await cell(`a${String.fromCharCode(cp)}b`), null, `U+${cp.toString(16)}`);
@@ -1199,7 +1324,7 @@ try {
     assert.deepEqual([bad.status, bad.j.reason], [409, 'sha256_mismatch']);
     page = await call('GET', '/apps/master-edit/new?kind=single', { session: 'naka@test' });
     checkScripts(page.text, 1);
-    assert.match(page.text, /data-field="jan"/);
+    assert.ok(!/data-field="jan"/.test(page.text), '新商品の登録の画面に JAN の欄は無い (登録の後に商品の画面で)');
     assert.ok(!/0012 テスト商事/.test(page.text), '取引停止の仕入先は選べない');
   });
 } finally {

@@ -18,7 +18,7 @@
  *  12 集合は重ならない (items / held / recoverable / out_of_scope)・承認の指紋は作り直しの ID で変わらず c で変わる
  *  26 代表 (親子。D3b): NE で代表が付く = lag → 翌朝一致 / 代表がセット = held_by_load (判断の候補) / 保持の後に親が変わった = unexplained /
  *     人が決めた親 = rule (parent_manual・候補) / 記録の無い空 = incomparable / 自分自身 = 一致 / 最後に一致した値にも代表 / 直す承認の完了は目標の親 (親なしを含む)
- *  29 新商品の NE 登録の CSV (⑤-2b・0052): ② が最後まで走った回だけ、確かめ待ちの商品の NE の完全な取得の値を送る → 全部の列が合えば verified + NE 確認済み /
+ *  29 新商品の NE 登録の CSV (⑤-2b・0053): ② が最後まで走った回だけ、確かめ待ちの商品の NE の完全な取得の値を送る → 全部の列が合えば verified + NE 確認済み /
  *     ② が判定できない回 (blocked) は送らない
  * 使い方: node scripts/test-master-compare-ne.mjs
  */

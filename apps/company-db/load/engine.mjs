@@ -1058,7 +1058,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       winners.push({ entityId: Number(entityId), attribute, scope, obs: win });
     }
     // JAN → external_ids (取り合い・既に別の product が持つ・manual は upsertExternalIds が理由つき skip にする)
-    // 持ち主が Company DB (0052・⑤-2b) なら商品の JAN を足さない・外さない (予定 0 件)。観測と、JAN 以外の解決は続ける
+    // 持ち主が Company DB (0053・⑤-2b) なら商品の JAN を足さない・外さない (予定 0 件)。観測と、JAN 以外の解決は続ける
     const janOwned = loadOwns('external_ids.jan');
     const janW = janOwned ? winners.filter((w) => w.attribute === 'jan') : [];
     const janSec = section(report, 'jan', janW.length);

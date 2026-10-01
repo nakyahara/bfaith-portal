@@ -1,44 +1,236 @@
--- 0052: 新商品の NE 登録の CSV・JAN の変更の記録・仕入先の登録の状態 (2026-10-01。Company DB構想 14 §10 契約 v3 H5・H6・Medium 3 / §9 v2 M1・M5 / 10 §6.2・§3.2)
--- 🚨 前提 = ⑤-1 (feat/sor5-input) の 0050_master_edit.sql と ⑤-2a (feat/sor5-2-new) の 0051_master_registrations.sql だけ (と 0049 までの本流)。
---    番号: 0051 の次。先に別の migration が main に入ったら番号を付け直す (中身は番号に依らない)
+-- 0053: 新商品の NE 登録の CSV・JAN の変更・仕入先の登録の状態・NE のセットの構成の観測を集合で (2026-10-02。Company DB構想 14 §10 契約 v3 H5・H6・Medium 3 /
+--       §9 v2 M1・M5 / 10 §6.2・§3.2。PR #1571 Codex R1 の直し = 1 段目 High 1・High 2・Medium 1・Medium 2・Low / 2 段目 High 3)
+-- 🚨 前提 = 0051_master_edit.sql (⑤-1・#1563) と 0052_master_registrations.sql (⑤-2a・#1566)。どちらもマージ済み・本番に適用済み。0050 は finance_coverage (関係なし)
+--    番号: ④a (#1564) も 0053 を使う = 後にマージする方を 0054 に付け直す (中身は番号に依らない)
 --
 -- なぜ:
 --   A (H5) 新商品を NE に登録する CSV は、既にある商品の値を直す CSV (0040 の fix_ne / to_ne) と別の物にする。
 --      作ったファイル (export)・商品ごと (item)・CSV の行・取り込みの申告 (attempt)・翌朝の照合の確かめ (check) を分けて持ち、
 --      商品ごとに built (作った) → issued (配った) → import_declared (取り込んだと申告) → verified (NE で全部の列が合った) / partial (NE にあるが違う列がある) /
 --      failed (取り込めなかった = 申告の後の完全な取得に無い・全部だめと申告) / superseded (人が「使わない」にした) と進める。
---      配った (issued) 後は、その商品の NE に送る欄を直せない (lib/master-write.mjs が 409)。直すには人が「使わない」にして、NE で何をしたか (直し方) を書く
---   B (H6) JAN (core.external_ids の system = 'jan') を画面で直せるようにする前に、足す・外す (有効期間の終わり) を変更の記録 (0026 と同じ関数) に残し、
+--      配った後は、その商品の NE に送る欄を直せない (lib/master-write.mjs が 409・DB の trigger ops.guard_reg_csv_live も拒む)。直すには人が「使わない」にして、NE で何をしたかを書く
+--   B (H6) JAN (core.external_ids の system = 'jan') を画面で直す: 足す・外す (有効期間の終わり) を変更の記録 (0026 と同じ関数) に残し、
 --      値の書き換え・物理の削除を拒み、JAN が変わったらその商品の SKU の version も変える (編集の印・CSV の予約が古くなる)
 --   C (M1・M5・契約 v3 Medium 3) 新しい仕入先のコードの決まりと「NE に登録した」の申告の状態。確かめる前の仕入先は代表の仕入先に選べない。
 --      取引停止は active = false (物理の削除はしない)。代表の仕入先に使っている間は止められない (同じ取引で付け替えれば止められる)
 -- なにを:
+--   E. 0051 の「画面のロールの書き込みの約束」(ops.master_write_sessions・保存の記録 done・ops.master_write_allowed) に ⑤-2b の操作を足す (#1571 R1 High 3)。
+--      ⑤-2a の ops.register_new_sku と同じ形 = 操作ごとの security definer の関数が、鍵 (段階の共有 → マスタの書き込みの共有 → 相手の SKU → CSV → 行) の後に
+--      相手 (ファイルの商品と構成品・同じ商品の SKU・仕入先と付け替える SKU) を DB が決めて約束を書き、書いて、done を書き、約束の設定を消す。
+--      payload_hash と結果は DB が作る。ops.begin_master_write は sku_edit のまま = 画面のロールはこれらの約束を作れない
 --   A. ops.ne_reg_exports / ne_reg_attempts / ne_reg_export_items / ne_reg_export_rows / ne_reg_checks (+ 中身は変えない・一方向の trigger)
---      🚨 権限の境界 (⑤-2a と同じ・#1566 R1 H2 / H3): 画面のロール (master_edit) にこれらの表の INSERT / UPDATE / DELETE を渡さない。
---         書くのは下の security definer の関数だけ (search_path = pg_catalog, pg_temp・名前は全部 schema つき・一時の表を使わない・public の実行権なし):
---           ops.ne_reg_build (作る: コード・状態・NE にもう無いこと・構成品・実機の確かめの門・CSV の byte 列を関数が照らし直す。
---             🚨 行と確かめる値は鍵の後に ops.ne_reg_canonical が Company DB の今の値から作り直し、送られたものと完全に同じときだけ作る・
---             印とハッシュ 4 つは関数が計算する (#1571 Codex R1 High 1)) /
---           ops.ne_reg_issue (配る) / ops.ne_reg_declare (取り込んだと申告: sha256 はファイルの記録と同じ・登録の状態 draft → ne_pending) /
---           ops.ne_reg_supersede (使わない) / ops.ne_reg_guard_on_save (保存の取引: 配った後 = 知らせる・作っただけ = 使わない) /
---           ops.ne_reg_record_verified (実機の確かめ = ops.ne_csv_verified に col 'new_registration'・試しのファイルの商品が全部 verified のときだけ ok) /
---           翌朝の照合 = watch_writer の 3 段 (#1571 Codex R1 High 2): ops.record_ne_registration_observations (NE の完全な取得の観測を残す) →
+--      🚨 権限の境界 (⑤-2a と同じ): 画面のロール (master_edit) にこれらの表の INSERT / UPDATE / DELETE を渡さない。書くのは security definer の関数だけ
+--         (search_path = pg_catalog, pg_temp・名前は全部 schema つき・一時の表を使わない・public の実行権なし) + 画面のロールが書いたら約束の操作・ファイルを見る trigger:
+--           ops.ne_reg_build (約束 reg_csv_build。🚨 行と確かめる値は鍵の後に ops.ne_reg_canonical が Company DB の今の値から作り直し、
+--             送られたものと完全に同じときだけ作る・印とハッシュ 4 つは関数が計算する・#1571 R1 High 1) /
+--           ops.ne_reg_issue (配る・reg_csv_issue) / ops.ne_reg_declare (取り込んだと申告・reg_csv_declare: sha256 はファイルの記録と同じ・登録の状態 draft → ne_pending) /
+--           ops.ne_reg_supersede (使わない・reg_csv_supersede) / ops.ne_reg_guard_on_save (保存の約束 sku_edit の中: 配った後 = 知らせる・作っただけ = 使わない) /
+--           ops.ne_reg_record_verified (実機の確かめ・reg_csv_verified: ops.ne_csv_verified に col 'new_registration'・試しのファイルの商品が全部 verified のときだけ ok) /
+--           翌朝の照合 = watch_writer の 3 段 (#1571 R1 High 2): ops.record_ne_registration_observations (NE の完全な取得の観測を残す) →
 --             ops.seal_ne_registration_run (回が最後まで終わった受け取り) → ops.record_ne_registration_check(回の番号) (受け取りと残した観測から verified / partial / failed)
---      ops.transition_sku_registration (0051) を create or replace: ne_pending・ne_confirmed の根拠は関数が自分でこの表から読んで鍵を取る
+--      ops.transition_sku_registration (0052) を create or replace: ne_pending・ne_confirmed の根拠は関数が自分でこの表から読んで鍵を取る
 --        (呼び手の渡す export_id・hash・受け取りの JSON は信じない = 渡したら拒む)。distributable / available は ④ まで not_ready のまま
---   B. events.master_change_events の entity_type に 'external_id' (CHECK は NOT VALID で足す = VALIDATE は後の手順・#1571 R1 Low)。core.external_ids の JAN の行に 記録・守り・SKU の version (security definer) の trigger。
---      表の持ち主でないロール (画面) が書けるのは商品の JAN の行だけ (trigger)
---   C. ops.supplier_registrations (新しい仕入先だけ。行が無い = 前からある仕入先)。状態を書くのは security definer の関数
---      (ops.create_supplier_registration / ops.declare_supplier_in_ne) だけ + 守りの trigger (取引停止・物理の削除・確かめる前の代表)
---   D. 0050 の画面のロールの書き込みの約束 (#1563 R3 M2) との関係:
---      ・上の関数 (ops.ne_reg_* と仕入先の関数) は、呼び手が画面のロール master_edit なら同じ取引の ops.begin_master_write の行が要る (ops.reg_write_session)。
---        誰が (と ops.ne_reg_build の request_id) はその行から取る (引数と違えば 42501 = 偽れない)。ほかのロール (表の持ち主・運用) は引数のまま
---      ・画面のロールが直接書く表は core.external_ids (商品の JAN) だけ: 0050 の trg_master_edit_guard (同じ取引の行・段階 new_open) +
---        trg_master_edit_jan_owner (始めたときの持ち主表で external_ids.jan が company)。変更の記録の誰が・request_id は 0050 の関数がその行から取る
---      ・確かめる前の仕入先を代表にしない守り (core.guard_primary_supplier_registered) は、呼び手が master_edit なら設定 (core.source_system) に依らず見る
---      ・切替の前提 (ops.master_cutover_prereq_checks) は足さない (⑤-2b の表は切替の日に空でよい)
--- 🚨 前提の migration は 0050 (⑤-1) と 0051 (⑤-2a) だけ (と 0049 までの本流)
+--   B. events.master_change_events の entity_type に 'external_id' (CHECK は NOT VALID で足す = VALIDATE は後の手順・#1571 R1 Low)。
+--      core.external_ids の JAN の行に 記録・守り・SKU の version (security definer) の trigger。表の持ち主でないロールが書けるのは商品の JAN の行だけ (trigger)。
+--      画面のロールの JAN の書き込み = ops.edit_sku_jan (約束 jan_edit) の中だけ (専用の守り core.guard_master_edit_jan・0051 の guard は付けない)
+--   C. ops.supplier_registrations (新しい仕入先だけ。行が無い = 前からある仕入先)。仕入先を作る・申告・取引停止 = ops.create_supplier / declare_supplier_in_ne /
+--      deactivate_supplier (約束 supplier_*) + 守りの trigger (取引停止・物理の削除・確かめる前の代表)。今は画面のロールに渡さない (書くロールは ⑥ で決める)
+--   F. 新規登録の CSV が出ている商品の NE に送る欄は、画面のロールの直接の書き込み (保存 sku_edit) でも DB が拒む (ops.guard_reg_csv_live)
+--   G. 0051 の ops.record_ne_set_observations を集合で書く形に置き換える (契約は同じ・#1571 R1 Medium 2 = セットの数の 2 乗の時間をやめる)
+--   ・切替の前提 (ops.master_cutover_prereq_checks) は足さない (⑤-2b の表は切替の日に空でよい)
 -- 🚨 この migration は商品・仕入先の値を何も変えない
+
+-- ═══════════ E. 0051 の書き込みの約束に ⑤-2b の操作を足す (#1571 Codex R1 High 3) ═══════════
+-- 操作 (ops.master_write_sessions.operation / ops.master_edit_requests.operation):
+--   reg_csv_build / reg_csv_issue / reg_csv_declare / reg_csv_supersede / reg_csv_verified = 新商品の NE 登録の CSV (ops.ne_reg_*)
+--   jan_edit = 商品の JAN を足す・外す (ops.edit_sku_jan)
+--   supplier_create / supplier_declare / supplier_deactivate = 新しい仕入先・「NE に登録した」の申告・取引停止 (ops.create_supplier / declare_supplier_in_ne / deactivate_supplier)
+-- どれも ⑤-2a の ops.register_new_sku と同じ形: その操作だけの security definer の関数が、
+--   段階の共有の鍵 → マスタの書き込みの共有の鍵 (ops.reg_write_gate) → 相手の SKU の鍵 (sku_id の順) → CSV の鍵 → 行の鍵 → 約束 (ops.open_reg_write = begin) → 書く →
+--   保存の記録 done (ops.close_reg_write) → 約束の設定を消す。相手 (ファイルの商品と構成品・SKU と同じ商品の SKU・仕入先と付け替える SKU) は DB が決める。
+--   約束と done の payload_hash = DB が確かめた値から DB が作る (アプリは送らない)。結果は DB が作る。
+--   ops.begin_master_write は sku_edit のまま = 画面のロールはこれらの約束を作れない (関数を通るしかない)
+-- 0051 / 0052 の物を変えるのはここだけ:
+--   ・master_write_sessions.sku_id の not null を外す (仕入先の操作・ファイルの操作は 1 つの SKU に結ばない)。sku_edit・sku_create は今までどおり要る (CHECK)
+--   ・master_write_sessions / master_edit_requests の operation の CHECK に上の操作を足す (sku_edit・sku_create はそのまま)
+--   ・ops.check_master_write_session_done の SKU の比べ方を「null も同じとみなす」に (sku_edit・sku_create は sku_id が要る = 今までと同じ答え)
+--   ・ops.master_write_allowed に上の操作の行を足す (sku_edit・sku_create の行はそのまま。sku_edit には「作っただけの CSV を使わないにする」の UPDATE を足す)
+--   ・ops.record_ne_set_observations を集合で書く形に (契約は同じ・下の G.)
+alter table ops.master_write_sessions alter column sku_id drop not null;
+alter table ops.master_write_sessions add constraint ck_mws_sku_needed check (operation not in ('sku_edit', 'sku_create') or sku_id is not null);
+alter table ops.master_write_sessions drop constraint ck_mws_operation;
+alter table ops.master_write_sessions add constraint ck_mws_operation check (operation in ('sku_edit', 'sku_create',
+  'reg_csv_build', 'reg_csv_issue', 'reg_csv_declare', 'reg_csv_supersede', 'reg_csv_verified', 'jan_edit', 'supplier_create', 'supplier_declare', 'supplier_deactivate'));
+alter table ops.master_edit_requests drop constraint ck_mer_operation;
+alter table ops.master_edit_requests add constraint ck_mer_operation check (operation in ('sku_edit', 'sku_create',
+  'reg_csv_build', 'reg_csv_issue', 'reg_csv_declare', 'reg_csv_supersede', 'reg_csv_verified', 'jan_edit', 'supplier_create', 'supplier_declare', 'supplier_deactivate'));
+
+-- 約束した取引の commit の確かめ (0051 と同じ。SKU は null も同じとみなす = ⑤-2b の SKU に結ばない操作も、同じ取引の done がちょうど 1 つ要る)
+create or replace function ops.check_master_write_session_done() returns trigger
+  language plpgsql security definer set search_path = pg_catalog, ops, pg_temp as $$
+begin
+  if (select count(*) from ops.master_edit_requests r
+       where r.request_id = new.request_id and r.status = 'done' and r.actor_id = new.actor_id and r.sku_id is not distinct from new.sku_id
+         and r.operation = new.operation and r.payload_hash = new.payload_hash
+         and r.xmin::text = (new.txid % 4294967296)::text) <> 1 then   -- 同じ取引で書いた done (前からある記録は数えない)
+    raise exception 'master_write_session_unfinished: 約束した取引 (request_id %) は、同じ取引で約束どおりの保存の記録 done を書かないと commit できない', new.request_id using errcode = '42501';
+  end if;
+  return null;
+end $$;
+
+-- 操作ごとに、画面のロールが書いてよい (表・書き方)。sku_edit・sku_create の行は 0051 / 0052 と同じ (足すのは sku_edit の「作っただけの CSV を使わないにする」だけ)
+create or replace function ops.master_write_allowed(p_operation text, p_table text, p_op text) returns boolean language sql immutable set search_path = pg_catalog, pg_temp as $$
+  select exists (select 1 from (values
+      ('sku_edit', 'core.skus', 'UPDATE'), ('sku_edit', 'core.products', 'UPDATE'),
+      ('sku_edit', 'core.supplier_skus', 'INSERT'), ('sku_edit', 'core.supplier_skus', 'UPDATE'),
+      ('sku_edit', 'core.sku_costs', 'INSERT'), ('sku_edit', 'core.sku_costs', 'UPDATE'), ('sku_edit', 'core.sku_costs', 'DELETE'),
+      ('sku_edit', 'ops.sku_component_requests', 'INSERT'), ('sku_edit', 'ops.sku_component_requests', 'UPDATE'),
+      ('sku_edit', 'ops.sku_component_breaches', 'UPDATE'),
+      ('sku_create', 'core.products', 'INSERT'), ('sku_create', 'core.products', 'UPDATE'),
+      ('sku_create', 'core.skus', 'INSERT'), ('sku_create', 'core.skus', 'UPDATE'),
+      ('sku_create', 'core.supplier_skus', 'INSERT'), ('sku_create', 'core.sku_costs', 'INSERT'),
+      ('sku_create', 'ops.sku_component_requests', 'INSERT'),
+      -- 0053 (⑤-2b)
+      ('sku_edit', 'ops.ne_reg_exports', 'UPDATE'), ('sku_edit', 'ops.ne_reg_export_items', 'UPDATE'),
+      ('reg_csv_build', 'ops.ne_reg_exports', 'INSERT'), ('reg_csv_build', 'ops.ne_reg_export_items', 'INSERT'), ('reg_csv_build', 'ops.ne_reg_export_rows', 'INSERT'),
+      ('reg_csv_issue', 'ops.ne_reg_exports', 'UPDATE'), ('reg_csv_issue', 'ops.ne_reg_export_items', 'UPDATE'),
+      ('reg_csv_declare', 'ops.ne_reg_exports', 'UPDATE'), ('reg_csv_declare', 'ops.ne_reg_export_items', 'UPDATE'), ('reg_csv_declare', 'ops.ne_reg_attempts', 'INSERT'),
+      ('reg_csv_supersede', 'ops.ne_reg_exports', 'UPDATE'), ('reg_csv_supersede', 'ops.ne_reg_export_items', 'UPDATE'),
+      ('reg_csv_verified', 'ops.ne_csv_verified', 'INSERT'),
+      ('jan_edit', 'core.external_ids', 'INSERT'), ('jan_edit', 'core.external_ids', 'UPDATE'), ('jan_edit', 'core.skus', 'UPDATE'), ('jan_edit', 'core.products', 'UPDATE'),
+      ('jan_edit', 'ops.ne_reg_exports', 'UPDATE'), ('jan_edit', 'ops.ne_reg_export_items', 'UPDATE'),
+      ('supplier_create', 'core.suppliers', 'INSERT'),
+      ('supplier_deactivate', 'core.suppliers', 'UPDATE'), ('supplier_deactivate', 'core.supplier_skus', 'INSERT'), ('supplier_deactivate', 'core.supplier_skus', 'UPDATE'),
+      ('supplier_deactivate', 'ops.ne_reg_exports', 'UPDATE'), ('supplier_deactivate', 'ops.ne_reg_export_items', 'UPDATE')) as m(op, tbl, act)
+    where m.op = p_operation and m.tbl = p_table and m.act = p_op)
+$$;
+
+/** JSON のハッシュ (jsonb の文字の形の sha256。DB だけが作って残す = アプリは同じものを作らない) */
+create function ops.reg_hash(p jsonb) returns text language sql immutable set search_path = pg_catalog, pg_temp as $$
+  select pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(p::text, 'UTF8')), 'hex')
+$$;
+revoke all on function ops.reg_hash(jsonb) from public;
+
+/**
+ * ⑤-2b の関数の入口 (関数の中だけ): 段階の共有の鍵 → マスタの書き込みの共有の鍵 (夜間ロードと並ぶ) → 持ち主表の形 → 段階 new_open・持ち主表のハッシュが段階の記録と同じ。
+ * p_keys = この操作で書く列の持ち主のキー (全部 company でないと before_cutover)
+ */
+create function ops.reg_write_gate(p_ownership jsonb, p_keys text[] default '{}') returns void
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_phase text;
+  v_owner text;
+  v_bad   text[];
+begin
+  perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.master_cutover'));
+  perform pg_catalog.pg_advisory_xact_lock_shared(core.master_write_lock_key());
+  if p_ownership is null or pg_catalog.jsonb_typeof(p_ownership) <> 'object'
+     or exists (select 1 from pg_catalog.jsonb_each(p_ownership) e where pg_catalog.jsonb_typeof(e.value) <> 'string' or (e.value #>> '{}') not in ('load', 'company')) then
+    raise exception 'invalid_input: 持ち主表 ({ キー: load / company }) が要る' using errcode = '22023';
+  end if;
+  select s.phase, s.owner_hash into v_phase, v_owner from ops.master_cutover_state s where s.id = 1;
+  if v_phase is distinct from 'new_open' then
+    raise exception 'before_cutover: 切替の段階が % (new_open でない)', coalesce(v_phase, '読めない') using errcode = 'P0001';
+  end if;
+  if v_owner is distinct from ops.ownership_hash(p_ownership) then raise exception 'before_cutover: 持ち主表が切替のときの記録と違う' using errcode = 'P0001'; end if;
+  select pg_catalog.array_agg(k order by k) into v_bad from pg_catalog.unnest(coalesce(p_keys, '{}')) k where (p_ownership ->> k) is distinct from 'company';
+  if v_bad is not null then raise exception 'before_cutover: 持ち主が company でない (%)', pg_catalog.array_to_string(v_bad, '・') using errcode = 'P0001'; end if;
+end $$;
+revoke all on function ops.reg_write_gate(jsonb, text[]) from public;
+
+/** 人 (アプリが言う人。DB では確かめられない)・理由の形 */
+create function ops.reg_actor_problem(p_actor text, p_reason text) returns text language sql immutable set search_path = pg_catalog, pg_temp as $$
+  select case when p_actor is null or pg_catalog.length(pg_catalog.btrim(p_actor)) = 0 or pg_catalog.length(p_actor) > 320 or p_actor ~ '[[:cntrl:]]' then 'actor'
+              when p_reason is not null and (pg_catalog.length(p_reason) > 200 or p_reason ~ '[[:cntrl:]]') then 'reason' end
+$$;
+revoke all on function ops.reg_actor_problem(text, text) from public;
+
+/**
+ * ⑤-2b の約束を書く (begin の代わり・関数の中だけ・鍵の後・書く前)。request_id がまだ使われていない・この取引にまだ約束が無いときだけ。
+ * p_targets = DB が決めた相手 (ファイルの番号・SKU・仕入先) を約束の versions に残す (下の守りが見る)。編集の印は無い (0 の 64 桁)
+ */
+create function ops.open_reg_write(p_operation text, p_request_id uuid, p_actor_id text, p_reason text, p_ownership jsonb,
+                                   p_sku_id bigint, p_derived bigint[], p_products bigint[], p_payload_hash text, p_targets jsonb) returns uuid
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
+  v_id      uuid := pg_catalog.gen_random_uuid();
+  v_phase   text;
+begin
+  if p_operation is null or p_operation not in ('reg_csv_build', 'reg_csv_issue', 'reg_csv_declare', 'reg_csv_supersede', 'reg_csv_verified', 'jan_edit',
+                                                'supplier_create', 'supplier_declare', 'supplier_deactivate') then
+    raise exception 'invalid_input: 知らない操作 %', p_operation using errcode = '22023';
+  end if;
+  if p_request_id is null then raise exception 'invalid_input: request_id が要る' using errcode = '22023'; end if;
+  if ops.reg_actor_problem(p_actor_id, p_reason) is not null then raise exception 'invalid_input: 人・理由の形が違う' using errcode = '22023'; end if;
+  if coalesce(p_payload_hash, '') !~ '^[0-9a-f]{64}$' then raise exception 'invalid_input: payload_hash (64 桁) が要る' using errcode = '22023'; end if;
+  if (ops.current_master_write_session()).session_id is not null then
+    raise exception 'master_write_session_exists: この取引ではもう書き込みを始めている' using errcode = '55000';
+  end if;
+  if exists (select 1 from ops.master_edit_requests r where r.request_id = p_request_id) then
+    raise exception 'request_id_reused: request_id % はもう使われている (保存の記録がある)', p_request_id using errcode = '23505';
+  end if;
+  select s.phase into v_phase from ops.master_cutover_state s where s.id = 1;
+  insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions,
+                                         actor_id, reason, source_system, db_user, phase, owner_hash, ownership)
+    values (v_id, pg_catalog.txid_current(), p_request_id, p_operation, p_sku_id, coalesce(p_derived, '{}'), coalesce(p_products, '{}'), pg_catalog.repeat('0', 64),
+            p_payload_hash, coalesce(p_targets, '{}'::jsonb), p_actor_id, nullif(p_reason, ''), 'portal_master_edit', v_db_user, v_phase, ops.ownership_hash(p_ownership), p_ownership);
+  perform pg_catalog.set_config('ops.master_write_session', v_id::text, true);
+  return v_id;
+end $$;
+revoke all on function ops.open_reg_write(text, uuid, text, text, jsonb, bigint, bigint[], bigint[], text, jsonb) from public;
+
+/** ⑤-2b の約束を閉じる (関数の中だけ・書いた後): 約束どおりの保存の記録 done (結果 = DB が作った値) → 約束の設定を消す。例外の受け止めの中で呼ばない (xmin) */
+create function ops.close_reg_write(p_result jsonb, p_target_code text) returns void
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  s ops.master_write_sessions := ops.current_master_write_session();
+begin
+  if s.session_id is null then raise exception 'master_write_session_required: 約束が無い' using errcode = '42501'; end if;
+  insert into ops.master_edit_requests (request_id, company_id, operation, target_code, sku_id, actor_id, payload_hash, status, result, started_at)
+    values (s.request_id, 1, s.operation, pg_catalog.left(coalesce(nullif(p_target_code, ''), s.operation), 60), s.sku_id, s.actor_id, s.payload_hash, 'done', p_result,
+            least(pg_catalog.now(), pg_catalog.clock_timestamp()));
+  perform pg_catalog.set_config('ops.master_write_session', '', true);
+end $$;
+revoke all on function ops.close_reg_write(jsonb, text) from public;
+
+-- 画面のロール (master_edit) が新規登録の CSV の表に書く = ⑤-2b の約束の中で、その操作で書いてよい (表・書き方) だけ・約束のファイルの行だけ (#1571 R1 High 3)。
+--   保存 (sku_edit)・JAN (jan_edit)・取引停止 (supplier_deactivate) の中では「作っただけのファイルを使わないにする」(商品 superseded・ファイル closed) だけ。
+--   表の権限は画面のロールに渡さない (関数の中の書き方の保険・⑤-2a の知らせの守りと同じ)
+-- 🚨 security definer = 画面のロールに ops.master_write_sessions を読ませない
+create function ops.guard_reg_csv_write() returns trigger
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
+  v_tbl     text := tg_table_schema || '.' || tg_table_name;
+  v_sess    ops.master_write_sessions;
+  v_row     jsonb;
+  v_exp     text;
+begin
+  if v_db_user is distinct from 'master_edit' then return case when tg_op = 'DELETE' then old else new end; end if;
+  v_sess := ops.current_master_write_session();
+  if v_sess.session_id is null then
+    raise exception 'master_write_session_required: 新規登録の CSV の表 (%) は ⑤-2b の関数の中だけで書く', v_tbl using errcode = '42501';
+  end if;
+  if (select s.phase from ops.master_cutover_state s where s.id = 1) is distinct from 'new_open' then
+    raise exception 'before_cutover: 切替の段階が new_open でない (%)', v_tbl using errcode = '42501';
+  end if;
+  if not ops.master_write_allowed(v_sess.operation, v_tbl, tg_op) then
+    raise exception 'master_write_operation: 約束の操作 % では % に % できない', v_sess.operation, v_tbl, tg_op using errcode = '42501';
+  end if;
+  v_row := pg_catalog.to_jsonb(case when tg_op = 'DELETE' then old else new end);
+  if v_sess.operation like 'reg_csv_%' then
+    v_exp := case when v_tbl = 'ops.ne_csv_verified' then v_row ->> 'reg_export_id' else v_row ->> 'export_id' end;
+    if v_exp is distinct from (v_sess.versions ->> 'export_id') then
+      raise exception 'master_write_target: 約束のファイル (%) の行でない (%)', v_sess.versions ->> 'export_id', v_tbl using errcode = '42501';
+    end if;
+  elsif not ((v_tbl = 'ops.ne_reg_export_items' and (v_row ->> 'state') = 'superseded')
+             or (v_tbl = 'ops.ne_reg_exports' and (v_row ->> 'state') = 'closed' and (v_row ->> 'close_reason') = 'superseded')) then
+    raise exception 'master_write_target: 操作 % で新規登録の CSV にできるのは「作っただけのファイルを使わないにする」だけ (%)', v_sess.operation, v_tbl using errcode = '42501';
+  end if;
+  return case when tg_op = 'DELETE' then old else new end;
+end $$;
+revoke all on function ops.guard_reg_csv_write() from public;
 
 -- ═══════════ A. 新商品の NE 登録の CSV ═══════════
 create table ops.ne_reg_exports (
@@ -73,7 +265,7 @@ create table ops.ne_reg_exports (
   constraint ck_nre_closed check ((state = 'closed') = (closed_at is not null and closed_by is not null and close_reason is not null))
 );
 create index ix_ne_reg_exports_created on ops.ne_reg_exports (created_at desc);
-comment on table ops.ne_reg_exports is '新商品の NE 登録の CSV のファイル 1 つ = 1 行 (0052)。中身 (byte 列・ハッシュ・印) は変えない・消さない。書くのは ops.ne_reg_* の関数だけ';
+comment on table ops.ne_reg_exports is '新商品の NE 登録の CSV のファイル 1 つ = 1 行 (0053)。中身 (byte 列・ハッシュ・印) は変えない・消さない。書くのは ops.ne_reg_* の関数だけ';
 
 create table ops.ne_reg_attempts (
   attempt_id   bigint generated always as identity primary key,
@@ -121,7 +313,7 @@ create table ops.ne_reg_export_items (
 create unique index ux_ne_reg_items_live on ops.ne_reg_export_items (sku_id) where state in ('built', 'issued', 'import_declared', 'partial');
 create index ix_ne_reg_items_export on ops.ne_reg_export_items (export_id);
 create index ix_ne_reg_items_code on ops.ne_reg_export_items (code_norm);
-comment on table ops.ne_reg_export_items is '新商品の NE 登録の CSV の商品ごと (0052)。built → issued → import_declared → verified / partial / failed、どこからでも superseded (人)';
+comment on table ops.ne_reg_export_items is '新商品の NE 登録の CSV の商品ごと (0053)。built → issued → import_declared → verified / partial / failed、どこからでも superseded (人)';
 
 create table ops.ne_reg_export_rows (
   export_id  bigint not null references ops.ne_reg_exports (export_id),
@@ -144,7 +336,7 @@ create table ops.ne_reg_checks (
   unique (compare_run_id, item_id)
 );
 select core.make_append_only('ops', 'ne_reg_checks');
-comment on table ops.ne_reg_checks is '翌朝の照合 ② の完全な取得で、新規登録の商品を確かめた記録 (0052)。書くのは ops.record_ne_registration_check だけ';
+comment on table ops.ne_reg_checks is '翌朝の照合 ② の完全な取得で、新規登録の商品を確かめた記録 (0053)。書くのは ops.record_ne_registration_check だけ';
 
 -- 実機の確かめ (0040 の ops.ne_csv_verified を広げる): 新規登録の形は col = 'new_registration'・converter_version = 形の版・reg_export_id = 確かめに使った試しのファイル
 alter table ops.ne_csv_verified add column reg_export_id bigint references ops.ne_reg_exports (export_id);
@@ -210,13 +402,19 @@ begin
   return new;
 end $$;
 create trigger trg_ne_reg_attempts_sha before insert on ops.ne_reg_attempts for each row execute function ops.guard_ne_reg_attempts();
+-- 画面のロールの書き込み = ⑤-2b の約束の中で、その操作で書いてよい表・約束のファイルの行だけ (上の E. の ops.guard_reg_csv_write)
+create trigger trg_reg_csv_write before insert or update or delete on ops.ne_reg_exports for each row execute function ops.guard_reg_csv_write();
+create trigger trg_reg_csv_write before insert or update or delete on ops.ne_reg_export_items for each row execute function ops.guard_reg_csv_write();
+create trigger trg_reg_csv_write before insert or update or delete on ops.ne_reg_export_rows for each row execute function ops.guard_reg_csv_write();
+create trigger trg_reg_csv_write before insert or update or delete on ops.ne_reg_attempts for each row execute function ops.guard_reg_csv_write();
+create trigger trg_reg_csv_write before insert or update or delete on ops.ne_csv_verified for each row execute function ops.guard_reg_csv_write();
 
 -- 照合が NE の値を送る商品 (配った・申告した・一部違う = まだ終わっていない)。watcher が読む
 create view ops.v_ne_reg_targets as
   select i.item_id, i.export_id, i.sku_id, i.code_norm, i.sku_kind, i.state
     from ops.ne_reg_export_items i
    where i.state in ('issued', 'import_declared', 'partial');
-comment on view ops.v_ne_reg_targets is '翌朝の照合 ② が NE の完全な取得の値を送る新規登録の商品 (0052)';
+comment on view ops.v_ne_reg_targets is '翌朝の照合 ② が NE の完全な取得の値を送る新規登録の商品 (0053)';
 
 -- CSV のセル 1 つの書き方 (lib/master-reg-csv.mjs の regQuote と同じ: カンマ・引用符・前後の空白 (半角・全角) を含むときだけ引用符で囲む)。
 -- 制御文字 (改行・タブほか) のセルは書かない (呼び手が null を受けて拒む)
@@ -310,45 +508,6 @@ begin
     'not_compared', case when v_kind = 'single' then '["jan"]'::jsonb else '["tax_rate", "order"]'::jsonb end);
 end $$;
 
-/**
- * 呼び手が画面のロール master_edit なら、同じ取引で ops.begin_master_write をした後だけ (0050 の約束・#1563 R3 M2。0051 の ops.create_sku_registration と同じ)。
- * 誰が・request_id はその行から取る: 引数があって違えば 42501 (偽れない)。ほかのロール (表の持ち主・運用) = 引数のまま。
- * 戻り値 { actor, request_id, bound (行から取った = true) }。🚨 security definer = 画面のロールに ops.master_write_sessions を読ませない
- */
-create function ops.reg_write_session(p_actor text, p_request_id uuid default null) returns jsonb
-  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
-declare
-  v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
-  v_sess    ops.master_write_sessions%rowtype;
-begin
-  if v_db_user is distinct from 'master_edit' then
-    return pg_catalog.jsonb_build_object('actor', p_actor, 'request_id', p_request_id, 'bound', false);
-  end if;
-  select * into v_sess from ops.master_write_sessions s where s.txid = pg_catalog.txid_current();
-  if not found then
-    raise exception 'master_write_session_required: 画面のロールの書き込みは、同じ取引で ops.begin_master_write をした後だけ' using errcode = '42501';
-  end if;
-  if (p_actor is not null and p_actor is distinct from v_sess.actor_id) or (p_request_id is not null and p_request_id is distinct from v_sess.request_id) then
-    raise exception 'master_write_session_mismatch: 誰が・request_id が ops.begin_master_write のときと違う' using errcode = '42501';
-  end if;
-  return pg_catalog.jsonb_build_object('actor', v_sess.actor_id, 'request_id', v_sess.request_id, 'bound', true);
-end $$;
-revoke all on function ops.reg_write_session(text, uuid) from public;
-
-/** 切替の段階が new_open でなければ止める (関数の中の保険。画面の門 = 段階・持ち主表のハッシュ・MASTER_EDIT_OPEN は lib が先に見る) */
-create function ops.ne_reg_assert_open() returns void language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
-declare
-  v_phase text;
-begin
-  -- 段階を変える取引 (ops.set_master_cutover_phase = 排他) と並ぶ (lib/master-cutover.mjs の CUTOVER_SHARED_LOCK_SQL と同じ鍵。呼び手が先に取っていれば待たない)
-  perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.master_cutover'));
-  select s.phase into v_phase from ops.master_cutover_state s where s.id = 1;
-  if v_phase is distinct from 'new_open' then
-    raise exception 'before_cutover: 切替の段階が % (new_open でない) = 新商品の NE 登録の CSV はまだ使えない', coalesce(v_phase, '読めない') using errcode = 'P0001';
-  end if;
-end $$;
-revoke all on function ops.ne_reg_assert_open() from public;
-
 /** SKU ごとの鍵 (sku_id の順・lib/master-write.mjs の SKU_LOCK_SQL と同じ鍵) → CSV の鍵。同じ取引で先に取っていれば待たない */
 create function ops.ne_reg_lock_skus(p_sku_ids bigint[]) returns void language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
@@ -360,6 +519,17 @@ begin
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('ops.ne_csv'));
 end $$;
 revoke all on function ops.ne_reg_lock_skus(bigint[]) from public;
+
+/**
+ * 画面 (lib/master-reg-csv.mjs) が NE の元のコード (0041) を要る分だけ読む (画面のロールに ops.master_ne_codes / 印の select は無い = ⑤-2a)。
+ * 戻り値 { run (印の照合の回), entries: [{ code_norm, kind, state, ne_code }] }。1,000 コードまで。読むだけ
+ */
+create function ops.ne_reg_ne_codes(p_codes text[]) returns jsonb language sql stable security definer set search_path = pg_catalog, pg_temp as $$
+  select pg_catalog.jsonb_build_object('run', (select m.compare_run_id from ops.master_ne_code_mark m where m.id = 1),
+    'entries', coalesce((select pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('code_norm', c.code_norm, 'kind', c.kind, 'state', c.state, 'ne_code', c.ne_code) order by c.code_norm, c.kind)
+                           from ops.master_ne_codes c where c.code_norm = any ((coalesce(p_codes, '{}'::text[]))[1:1000])), '[]'::jsonb))
+$$;
+revoke all on function ops.ne_reg_ne_codes(text[]) from public;
 
 /** JAN の形 (8 桁か 13 桁 + チェック数字) = lib/master-write.mjs の janValid と同じ決まり */
 create function ops.jan_check_ok(p text) returns boolean language plpgsql immutable set search_path = pg_catalog, pg_temp as $$
@@ -564,13 +734,13 @@ declare
   v_token    text;
   v_payload  text;
   v_agg      text;
+  v_result   jsonb;
   c          jsonb;
 begin
   if v_actor = '' or pg_catalog.length(v_actor) > 320 then raise exception 'invalid_input: 作る人 (actor) が要る' using errcode = '22023'; end if;
   begin v_rid := (p ->> 'request_id')::uuid; exception when others then raise exception 'invalid_input: request_id の形が違う' using errcode = '22023'; end;
   if v_rid is null then raise exception 'invalid_input: request_id が要る' using errcode = '22023'; end if;
-  -- 画面のロール = 同じ取引で ops.begin_master_write をした後だけ・誰が と request_id はその行と同じ (D)
-  v_actor := ops.reg_write_session(v_actor, v_rid) ->> 'actor';
+  if ops.reg_actor_problem(v_actor, p ->> 'reason') is not null then raise exception 'invalid_input: 作る人・理由の形が違う' using errcode = '22023'; end if;
   if not ((v_kind = 'products' and v_schema ~ '^ne-reg-single-v[0-9]+$' and v_header like 'syohin_code,%')
        or (v_kind = 'sets' and v_schema ~ '^ne-reg-set-v[0-9]+$' and v_header like 'set_syohin_code,%')) then
     raise exception 'invalid_input: 種類・形の版・見出しが合わない (% / % / %)', v_kind, v_schema, v_header using errcode = '22023';
@@ -596,7 +766,7 @@ begin
   if v_day is null or v_day < (pg_catalog.now() at time zone 'Asia/Tokyo')::date - 1 then
     raise exception 'invalid_input: 原価を見る日 (cost_day) が無い / 東京の今日より前' using errcode = '22023';
   end if;
-  perform ops.ne_reg_assert_open();
+  perform ops.reg_write_gate(p -> 'ownership');   -- 段階の共有の鍵 → マスタの書き込みの共有の鍵 → 段階・持ち主表
   -- 同じ request_id = 同じファイル (種類・商品・作る人が違えば拒む)
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('ops.ne_reg_request:' || v_rid::text, 0));
   select e.export_id, e.kind, e.created_by, e.state, e.sha256, e.trial into v_prev from ops.ne_reg_exports e where e.request_id = v_rid;
@@ -700,10 +870,14 @@ begin
   if v_trial and v_nrows > 5 then
     raise exception 'trial_limit: 形 % は実機でまだ確かめていないので、試し用 = 5 行まで (% 行)', v_schema, v_nrows using errcode = 'P0001';
   end if;
-  insert into ops.ne_reg_exports (kind, schema_version, header, encoding, trial, item_count, row_count, aggregate_token, payload_hash, sha256, file_bytes,
+  -- 約束 (reg_csv_build・相手 = これから作るファイルの番号と商品・構成品の SKU = 関数が決めた)。番号を先に振る = 約束に書ける (⑤-2a の登録と同じ)
+  v_export := pg_catalog.nextval(pg_catalog.pg_get_serial_sequence('ops.ne_reg_exports', 'export_id')::regclass);
+  perform ops.open_reg_write('reg_csv_build', v_rid, v_actor, p ->> 'reason', p -> 'ownership', null, null, null, v_payload,
+    pg_catalog.jsonb_build_object('export_id', v_export::text, 'sku_ids', pg_catalog.to_jsonb(v_ids), 'kind', v_kind));
+  insert into ops.ne_reg_exports (export_id, kind, schema_version, header, encoding, trial, item_count, row_count, aggregate_token, payload_hash, sha256, file_bytes,
                                   request_id, ne_codes_run, cost_day, created_by)
-    values (v_kind, v_schema, v_header, 'utf8', v_trial, v_nitems, v_nrows, v_agg, v_payload, v_sha, v_bytes, v_rid, v_mark, v_day, v_actor)
-    returning export_id into v_export;
+    overriding system value
+    values (v_export, v_kind, v_schema, v_header, 'utf8', v_trial, v_nitems, v_nrows, v_agg, v_payload, v_sha, v_bytes, v_rid, v_mark, v_day, v_actor);
   for c in select * from pg_catalog.jsonb_array_elements(v_canons) loop
     v_from := v_row_no + 1;
     insert into ops.ne_reg_export_items (export_id, sku_id, code_norm, ne_code, sku_kind, item_token, expected, snapshot_hash, row_from, row_to, state_changed_by)
@@ -715,8 +889,10 @@ begin
       insert into ops.ne_reg_export_rows (export_id, row_no, item_id, cells) values (v_export, v_row_no, v_item, rw);
     end loop;
   end loop;
-  return pg_catalog.jsonb_build_object('export_id', v_export, 'state', 'built', 'sha256', v_sha, 'trial', v_trial, 'rows', v_nrows, 'items', v_nitems, 'replayed', false,
+  v_result := pg_catalog.jsonb_build_object('export_id', v_export::text, 'state', 'built', 'sha256', v_sha, 'trial', v_trial, 'rows', v_nrows, 'items', v_nitems, 'replayed', false,
     'payload_hash', v_payload, 'aggregate_token', v_agg);
+  perform ops.close_reg_write(v_result, 'reg-csv #' || v_export);
+  return v_result;
 end $$;
 revoke all on function ops.ne_reg_build(jsonb, bytea) from public;
 
@@ -734,41 +910,57 @@ begin
 end $$;
 revoke all on function ops.ne_reg_lock_export(bigint) from public;
 
-/** 配る (built → issued・商品も)。もう配った = そのまま。使わない商品・登録をやめた商品が 1 つでもある = 配らない (残りも使わないにして閉じる = 作り直す) */
-create function ops.ne_reg_issue(p_export_id bigint, p_actor text) returns jsonb
+/** ファイルの商品の SKU (約束の相手) */
+create function ops.ne_reg_export_skus(p_export_id bigint) returns jsonb language sql stable set search_path = pg_catalog, pg_temp as $$
+  select coalesce(pg_catalog.jsonb_agg(i.sku_id order by i.sku_id), '[]'::jsonb) from ops.ne_reg_export_items i where i.export_id = p_export_id
+$$;
+revoke all on function ops.ne_reg_export_skus(bigint) from public;
+
+/**
+ * 配る (built → issued・商品も)。もう配った = そのまま (何も書かない)。使わない商品・登録をやめた商品が 1 つでもある = 配らない (残りも使わないにして閉じる = 作り直す)。
+ * 約束 = reg_csv_issue (相手 = このファイル)。p_request_id = この操作 1 回の番号 (保存の記録)
+ */
+create function ops.ne_reg_issue(p_request_id uuid, p_actor_id text, p_ownership jsonb, p_export_id bigint) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
-  e      ops.ne_reg_exports%rowtype;
-  v_gone text[];
+  e        ops.ne_reg_exports%rowtype;
+  v_gone   text[];
+  v_result jsonb;
 begin
-  if coalesce(pg_catalog.btrim(p_actor), '') = '' then raise exception 'invalid_input: 配る人 (actor) が要る' using errcode = '22023'; end if;
-  p_actor := ops.reg_write_session(p_actor) ->> 'actor';   -- 画面のロール = ops.begin_master_write の行から (D)
-  perform ops.ne_reg_assert_open();
+  if ops.reg_actor_problem(p_actor_id, null) is not null then raise exception 'invalid_input: 配る人 (actor) の形が違う' using errcode = '22023'; end if;
+  perform ops.reg_write_gate(p_ownership);
   e := ops.ne_reg_lock_export(p_export_id);
   if e.state = 'closed' then raise exception 'closed: ファイル % は閉じている (%)', p_export_id, e.close_reason using errcode = 'P0001'; end if;
-  if e.state <> 'built' then return pg_catalog.jsonb_build_object('export_id', p_export_id, 'state', e.state, 'already', true); end if;
+  if e.state <> 'built' then return pg_catalog.jsonb_build_object('export_id', p_export_id::text, 'state', e.state, 'already', true); end if;
   select pg_catalog.array_agg(i.ne_code order by i.item_id) into v_gone
     from ops.ne_reg_export_items i left join ops.master_registrations r on r.sku_id = i.sku_id
    where i.export_id = p_export_id and (i.state <> 'built' or r.state is null or r.state not in ('draft', 'ne_pending'));
+  perform ops.open_reg_write('reg_csv_issue', p_request_id, p_actor_id, null, p_ownership, null, null, null,
+    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'reg_csv_issue', 'export_id', p_export_id, 'sha256', e.sha256)),
+    pg_catalog.jsonb_build_object('export_id', p_export_id::text, 'sku_ids', ops.ne_reg_export_skus(p_export_id)));
   if v_gone is not null then
     update ops.ne_reg_export_items set state = 'superseded', superseded_reason = pg_catalog.left('配る前に使えなくなった商品がある (' || pg_catalog.array_to_string(v_gone, '・') || ')', 500),
-           superseded_correction = 'まだ配っていない (NE には何もしていない)。作り直す', state_changed_at = pg_catalog.now(), state_changed_by = p_actor
+           superseded_correction = 'まだ配っていない (NE には何もしていない)。作り直す', state_changed_at = pg_catalog.now(), state_changed_by = p_actor_id
      where export_id = p_export_id and state = 'built';
-    update ops.ne_reg_exports set state = 'closed', closed_at = pg_catalog.now(), closed_by = p_actor, close_reason = 'superseded' where export_id = p_export_id;
-    return pg_catalog.jsonb_build_object('export_id', p_export_id, 'state', 'closed', 'refused', true, 'reason', 'item_superseded', 'codes', pg_catalog.to_jsonb(v_gone));
+    update ops.ne_reg_exports set state = 'closed', closed_at = pg_catalog.now(), closed_by = p_actor_id, close_reason = 'superseded' where export_id = p_export_id;
+    v_result := pg_catalog.jsonb_build_object('export_id', p_export_id::text, 'state', 'closed', 'refused', true, 'reason', 'item_superseded', 'codes', pg_catalog.to_jsonb(v_gone));
+  else
+    update ops.ne_reg_export_items set state = 'issued', state_changed_at = pg_catalog.now(), state_changed_by = p_actor_id where export_id = p_export_id and state = 'built';
+    update ops.ne_reg_exports set state = 'issued', issued_at = pg_catalog.now(), issued_by = p_actor_id where export_id = p_export_id;
+    v_result := pg_catalog.jsonb_build_object('export_id', p_export_id::text, 'state', 'issued', 'already', false);
   end if;
-  update ops.ne_reg_export_items set state = 'issued', state_changed_at = pg_catalog.now(), state_changed_by = p_actor where export_id = p_export_id and state = 'built';
-  update ops.ne_reg_exports set state = 'issued', issued_at = pg_catalog.now(), issued_by = p_actor where export_id = p_export_id;
-  return pg_catalog.jsonb_build_object('export_id', p_export_id, 'state', 'issued', 'already', false);
+  perform ops.close_reg_write(v_result, 'reg-csv #' || p_export_id);
+  return v_result;
 end $$;
-revoke all on function ops.ne_reg_issue(bigint, text) from public;
+revoke all on function ops.ne_reg_issue(uuid, text, jsonb, bigint) from public;
 
 /**
  * 取り込んだと申告する。sha256 = ファイルの記録と同じ (trigger も見る)・申告した人・時刻 (関数の now)・結果・NE のメッセージ。
  * ok / partial = 商品 issued → import_declared・登録の状態 draft → ne_pending (ops.transition_sku_registration が、この試みの記録を自分で読む) /
- * rejected_all = 商品 failed・ファイルを閉じる。申告したファイルにもう一度 = 試みを足すだけ
+ * rejected_all = 商品 failed・ファイルを閉じる。申告したファイルにもう一度 = 試みを足すだけ。約束 = reg_csv_declare (相手 = このファイル)
  */
-create function ops.ne_reg_declare(p_export_id bigint, p_actor text, p_sha256 text, p_result text, p_ne_message text, p_imported_at timestamptz, p_note text) returns jsonb
+create function ops.ne_reg_declare(p_request_id uuid, p_actor_id text, p_ownership jsonb, p_export_id bigint, p_sha256 text, p_result text,
+                                   p_ne_message text, p_imported_at timestamptz, p_note text) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
   e        ops.ne_reg_exports%rowtype;
@@ -777,15 +969,17 @@ declare
   v_sku    bigint;
   v_moved  text[] := '{}';
   v_code   text;
-  v_sess   jsonb;
+  v_failed integer;
+  v_result jsonb;
 begin
-  if coalesce(pg_catalog.btrim(p_actor), '') = '' then raise exception 'invalid_input: 申告する人 (actor) が要る' using errcode = '22023'; end if;
+  if ops.reg_actor_problem(p_actor_id, null) is not null then raise exception 'invalid_input: 申告する人 (actor) の形が違う' using errcode = '22023'; end if;
   if coalesce(p_sha256, '') !~ '^[0-9a-f]{64}$' then raise exception 'invalid_input: sha256 (64 桁) が要る' using errcode = '22023'; end if;
   if p_result is null or p_result not in ('ok', 'partial', 'rejected_all') then raise exception 'invalid_input: 結果は ok / partial / rejected_all' using errcode = '22023'; end if;
-  -- 画面のロール = ops.begin_master_write の行から 誰が・request_id (D。request_id は登録の状態の履歴に残す)
-  v_sess := ops.reg_write_session(p_actor);
-  p_actor := v_sess ->> 'actor';
-  perform ops.ne_reg_assert_open();
+  if p_ne_message is not null and (pg_catalog.length(p_ne_message) > 1000 or p_ne_message ~ '[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]') then
+    raise exception 'invalid_input: NE のメッセージは 1,000 字まで (制御文字なし)' using errcode = '22023';
+  end if;
+  if p_note is not null and (pg_catalog.length(p_note) > 500 or p_note ~ '[[:cntrl:]]') then raise exception 'invalid_input: メモは 500 字まで' using errcode = '22023'; end if;
+  perform ops.reg_write_gate(p_ownership);
   e := ops.ne_reg_lock_export(p_export_id);
   if e.sha256 <> p_sha256 then raise exception 'sha256_mismatch: sha256 がファイル % の記録と違う', p_export_id using errcode = 'P0001'; end if;
   if e.state = 'built' then raise exception 'not_issued: 先に配る (ダウンロード)' using errcode = 'P0001'; end if;
@@ -793,66 +987,76 @@ begin
   if p_imported_at is not null and (p_imported_at > pg_catalog.now() or p_imported_at < e.issued_at - interval '1 minute') then
     raise exception 'invalid_input: 取り込んだ時刻が配った時刻と今の間でない' using errcode = '22023';
   end if;
+  perform ops.open_reg_write('reg_csv_declare', p_request_id, p_actor_id, null, p_ownership, null, null, null,
+    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'reg_csv_declare', 'export_id', p_export_id, 'sha256', p_sha256, 'result', p_result, 'ne_message', p_ne_message,
+      'imported_at', p_imported_at, 'note', p_note)),
+    pg_catalog.jsonb_build_object('export_id', p_export_id::text, 'sku_ids', ops.ne_reg_export_skus(p_export_id)));
   insert into ops.ne_reg_attempts (export_id, sha256, declared_by, imported_at, result, ne_message, note)
-    values (p_export_id, p_sha256, p_actor, p_imported_at, p_result, p_ne_message, p_note) returning attempt_id, declared_at into v_att, v_at;
+    values (p_export_id, p_sha256, p_actor_id, p_imported_at, p_result, p_ne_message, p_note) returning attempt_id, declared_at into v_att, v_at;
   if e.state = 'declared' then
-    return pg_catalog.jsonb_build_object('state', 'declared', 'attempt_id', v_att, 'first_declared_at', e.declared_at, 'again', true);
-  end if;
-  if p_result = 'rejected_all' then
-    update ops.ne_reg_export_items set state = 'failed', failed_reason = 'rejected_all', state_changed_at = pg_catalog.now(), state_changed_by = p_actor
+    v_result := pg_catalog.jsonb_build_object('state', 'declared', 'attempt_id', v_att::text, 'first_declared_at', e.declared_at, 'again', true);
+  elsif p_result = 'rejected_all' then
+    update ops.ne_reg_export_items set state = 'failed', failed_reason = 'rejected_all', state_changed_at = pg_catalog.now(), state_changed_by = p_actor_id
      where export_id = p_export_id and state = 'issued';
-    update ops.ne_reg_exports set state = 'closed', closed_at = pg_catalog.now(), closed_by = p_actor, close_reason = 'rejected_all' where export_id = p_export_id;
-    return pg_catalog.jsonb_build_object('state', 'closed', 'attempt_id', v_att);
+    get diagnostics v_failed = row_count;
+    update ops.ne_reg_exports set state = 'closed', closed_at = pg_catalog.now(), closed_by = p_actor_id, close_reason = 'rejected_all' where export_id = p_export_id;
+    v_result := pg_catalog.jsonb_build_object('state', 'closed', 'attempt_id', v_att::text, 'failed', v_failed);
+  else
+    update ops.ne_reg_export_items set state = 'import_declared', attempt_id = v_att, state_changed_at = pg_catalog.now(), state_changed_by = p_actor_id
+     where export_id = p_export_id and state = 'issued';
+    update ops.ne_reg_exports set state = 'declared', declared_at = v_at, declared_by = p_actor_id where export_id = p_export_id;
+    for v_sku, v_code in select i.sku_id, i.ne_code from ops.ne_reg_export_items i join ops.master_registrations r on r.sku_id = i.sku_id
+                          where i.export_id = p_export_id and i.state = 'import_declared' and r.state = 'draft' order by i.sku_id loop
+      perform ops.transition_sku_registration(v_sku, 'ne_pending', 'human', p_actor_id, 'NE に新規登録の CSV を取り込んだ', '{}'::jsonb, p_request_id::text);
+      v_moved := v_moved || v_code;
+    end loop;
+    v_result := pg_catalog.jsonb_build_object('state', 'declared', 'attempt_id', v_att::text, 'ne_pending', pg_catalog.to_jsonb(v_moved));
   end if;
-  update ops.ne_reg_export_items set state = 'import_declared', attempt_id = v_att, state_changed_at = pg_catalog.now(), state_changed_by = p_actor
-   where export_id = p_export_id and state = 'issued';
-  update ops.ne_reg_exports set state = 'declared', declared_at = v_at, declared_by = p_actor where export_id = p_export_id;
-  for v_sku, v_code in select i.sku_id, i.ne_code from ops.ne_reg_export_items i join ops.master_registrations r on r.sku_id = i.sku_id
-                        where i.export_id = p_export_id and i.state = 'import_declared' and r.state = 'draft' order by i.sku_id loop
-    perform ops.transition_sku_registration(v_sku, 'ne_pending', 'human', p_actor, 'NE に新規登録の CSV を取り込んだ', '{}'::jsonb, v_sess ->> 'request_id');
-    v_moved := v_moved || v_code;
-  end loop;
-  return pg_catalog.jsonb_build_object('state', 'declared', 'attempt_id', v_att, 'ne_pending', pg_catalog.to_jsonb(v_moved));
+  perform ops.close_reg_write(v_result, 'reg-csv #' || p_export_id);
+  return v_result;
 end $$;
-revoke all on function ops.ne_reg_declare(bigint, text, text, text, text, timestamptz, text) from public;
+revoke all on function ops.ne_reg_declare(uuid, text, jsonb, bigint, text, text, text, timestamptz, text) from public;
 
-/** 使わないにする (人)。理由と NE で何をしたか (直し方) が要る。まだ終わっていない商品を superseded・ファイルを閉じる。登録の状態は変えない */
-create function ops.ne_reg_supersede(p_export_id bigint, p_actor text, p_reason text, p_correction text) returns jsonb
+/** 使わないにする (人)。理由と NE で何をしたか (直し方) が要る。まだ終わっていない商品を superseded・ファイルを閉じる。登録の状態は変えない。約束 = reg_csv_supersede */
+create function ops.ne_reg_supersede(p_request_id uuid, p_actor_id text, p_ownership jsonb, p_export_id bigint, p_reason text, p_correction text) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
-  e    ops.ne_reg_exports%rowtype;
-  v_n  integer;
+  e        ops.ne_reg_exports%rowtype;
+  v_n      integer;
+  v_result jsonb;
 begin
-  if coalesce(pg_catalog.btrim(p_actor), '') = '' then raise exception 'invalid_input: 操作する人 (actor) が要る' using errcode = '22023'; end if;
-  if coalesce(pg_catalog.btrim(p_reason), '') = '' or coalesce(pg_catalog.btrim(p_correction), '') = '' then
-    raise exception 'invalid_input: 理由と NE で何をしたか (直し方) が要る' using errcode = '22023';
+  if ops.reg_actor_problem(p_actor_id, null) is not null then raise exception 'invalid_input: 操作する人 (actor) の形が違う' using errcode = '22023'; end if;
+  if coalesce(pg_catalog.btrim(p_reason), '') = '' or coalesce(pg_catalog.btrim(p_correction), '') = ''
+     or pg_catalog.length(p_reason) > 500 or pg_catalog.length(p_correction) > 500 or p_reason ~ '[[:cntrl:]]' or p_correction ~ '[[:cntrl:]]' then
+    raise exception 'invalid_input: 理由と NE で何をしたか (直し方) が要る (500 字まで・改行なし)' using errcode = '22023';
   end if;
-  p_actor := ops.reg_write_session(p_actor) ->> 'actor';   -- 画面のロール = ops.begin_master_write の行から (D)
-  perform ops.ne_reg_assert_open();
+  perform ops.reg_write_gate(p_ownership);
   e := ops.ne_reg_lock_export(p_export_id);
   if e.state = 'closed' then raise exception 'closed: ファイル % はもう閉じている (%)', p_export_id, e.close_reason using errcode = 'P0001'; end if;
-  update ops.ne_reg_export_items set state = 'superseded', superseded_reason = pg_catalog.left(p_reason, 500), superseded_correction = pg_catalog.left(p_correction, 500),
-         state_changed_at = pg_catalog.now(), state_changed_by = p_actor
+  perform ops.open_reg_write('reg_csv_supersede', p_request_id, p_actor_id, null, p_ownership, null, null, null,
+    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'reg_csv_supersede', 'export_id', p_export_id, 'reason', p_reason, 'correction', p_correction)),
+    pg_catalog.jsonb_build_object('export_id', p_export_id::text, 'sku_ids', ops.ne_reg_export_skus(p_export_id)));
+  update ops.ne_reg_export_items set state = 'superseded', superseded_reason = p_reason, superseded_correction = p_correction,
+         state_changed_at = pg_catalog.now(), state_changed_by = p_actor_id
    where export_id = p_export_id and state in ('built', 'issued', 'import_declared', 'partial');
   get diagnostics v_n = row_count;
-  update ops.ne_reg_exports set state = 'closed', closed_at = pg_catalog.now(), closed_by = p_actor, close_reason = 'superseded' where export_id = p_export_id;
-  return pg_catalog.jsonb_build_object('state', 'closed', 'superseded', v_n);
+  update ops.ne_reg_exports set state = 'closed', closed_at = pg_catalog.now(), closed_by = p_actor_id, close_reason = 'superseded' where export_id = p_export_id;
+  v_result := pg_catalog.jsonb_build_object('state', 'closed', 'superseded', v_n);
+  perform ops.close_reg_write(v_result, 'reg-csv #' || p_export_id);
+  return v_result;
 end $$;
-revoke all on function ops.ne_reg_supersede(bigint, text, text, text) from public;
+revoke all on function ops.ne_reg_supersede(uuid, text, jsonb, bigint, text, text) from public;
 
 /**
- * 保存 (lib/master-write.mjs) の取引の中で呼ぶ (SKU の鍵と CSV の鍵の後): この SKU (と含むセット) の生きている新規登録の CSV。
- * 配った後 (issued / import_declared / partial) が 1 つでもある = 何もしないで知らせる (呼び手が 409) /
- * 作っただけ (built) だけ = そのファイルを閉じる (中の商品は全部 superseded = 作り直す)
+ * (関数の中だけ) この SKU たちの生きている新規登録の CSV: 配った後 (issued / import_declared / partial) が 1 つでもある = 何もしないで知らせる /
+ * 作っただけ (built) だけ = そのファイルを閉じる (中の商品は全部 superseded = 作り直す)。戻り値 { issued: [...], superseded: [export_id] }
  */
-create function ops.ne_reg_guard_on_save(p_sku_ids bigint[], p_actor text, p_what text) returns jsonb
+create function ops.ne_reg_supersede_built(p_sku_ids bigint[], p_actor text, p_what text) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
   v_issued  jsonb;
   v_exports bigint[];
 begin
-  if coalesce(pg_catalog.btrim(p_actor), '') = '' then raise exception 'invalid_input: 保存する人 (actor) が要る' using errcode = '22023'; end if;
-  p_actor := ops.reg_write_session(p_actor) ->> 'actor';   -- 画面のロール = 保存の ops.begin_master_write の行から (D)
   select pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('export_id', i.export_id::text, 'sku_id', i.sku_id::text, 'code', s.code, 'state', i.state) order by i.item_id)
     into v_issued
     from ops.ne_reg_export_items i join core.skus s on s.sku_id = i.sku_id
@@ -866,27 +1070,59 @@ begin
   update ops.ne_reg_exports set state = 'closed', closed_at = pg_catalog.now(), closed_by = p_actor, close_reason = 'superseded' where export_id = any (v_exports) and state = 'built';
   return pg_catalog.jsonb_build_object('issued', '[]'::jsonb, 'superseded', (select pg_catalog.jsonb_agg(x::text order by x) from pg_catalog.unnest(v_exports) x));
 end $$;
+revoke all on function ops.ne_reg_supersede_built(bigint[], text, text) from public;
+
+/**
+ * 保存 (lib/master-write.mjs の saveSku・約束 sku_edit) の取引の中で呼ぶ (SKU の鍵と CSV の鍵の後): ops.ne_reg_supersede_built と同じ。
+ * 画面のロール = 保存の約束 (sku_edit) の中だけ・人は約束の人・SKU は約束の相手 (直す SKU・含むセット・直す単品を開いている構成の依頼に入れたセット) だけ
+ */
+create function ops.ne_reg_guard_on_save(p_sku_ids bigint[], p_actor text, p_what text) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
+  v_sess    ops.master_write_sessions;
+begin
+  if coalesce(pg_catalog.btrim(p_actor), '') = '' then raise exception 'invalid_input: 保存する人 (actor) が要る' using errcode = '22023'; end if;
+  if v_db_user = 'master_edit' then
+    v_sess := ops.current_master_write_session();
+    if v_sess.session_id is null or v_sess.operation is distinct from 'sku_edit' then
+      raise exception 'master_write_session_required: 保存の約束 (sku_edit) の中だけ' using errcode = '42501';
+    end if;
+    if p_actor is distinct from v_sess.actor_id then raise exception 'master_write_session_mismatch: 人が保存の約束と違う' using errcode = '42501'; end if;
+    if exists (select 1 from pg_catalog.unnest(coalesce(p_sku_ids, '{}')) x
+                where not (x = v_sess.sku_id or x = any (v_sess.derived_sku_ids)
+                           or exists (select 1 from ops.sku_component_requests q, pg_catalog.jsonb_array_elements(q.rows) e
+                                       where q.set_sku_id = x and q.status = 'open' and (e ->> 'sku_id')::bigint = v_sess.sku_id))) then
+      raise exception 'master_write_target: 保存の約束の相手でない SKU がある' using errcode = '42501';
+    end if;
+  end if;
+  return ops.ne_reg_supersede_built(p_sku_ids, p_actor, p_what);
+end $$;
 revoke all on function ops.ne_reg_guard_on_save(bigint[], text, text) from public;
 
 /**
- * 実機で確かめた結果を残す (種類 × 形の版 × 見出し)。ok = 同じ形の試しのファイル (p_export_id) の商品が全部 NE で確かめ済み (verified) のときだけ / ng はいつでも
+ * 実機で確かめた結果を残す (種類 × 形の版 × 見出し)。ok = 同じ形の試しのファイル (p_export_id) の商品が全部 NE で確かめ済み (verified) のときだけ / ng はいつでも。
+ * 約束 = reg_csv_verified (相手 = 試しのファイル か 無し)
  */
-create function ops.ne_reg_record_verified(p_actor text, p_kind text, p_schema text, p_header text, p_result text, p_note text, p_export_id bigint) returns jsonb
+create function ops.ne_reg_record_verified(p_request_id uuid, p_actor_id text, p_ownership jsonb, p_kind text, p_schema text, p_header text,
+                                           p_result text, p_note text, p_export_id bigint) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
-  e     ops.ne_reg_exports%rowtype;
-  v_bad integer;
-  v_id  bigint;
+  e        ops.ne_reg_exports%rowtype;
+  v_bad    integer;
+  v_id     bigint;
+  v_result jsonb;
 begin
-  if coalesce(pg_catalog.btrim(p_actor), '') = '' then raise exception 'invalid_input: 確かめた人 (actor) が要る' using errcode = '22023'; end if;
+  if ops.reg_actor_problem(p_actor_id, null) is not null then raise exception 'invalid_input: 確かめた人 (actor) の形が違う' using errcode = '22023'; end if;
   if p_kind is null or p_kind not in ('products', 'sets') then raise exception 'invalid_input: 種類は products / sets' using errcode = '22023'; end if;
   if p_result is null or p_result not in ('ok', 'ng') then raise exception 'invalid_input: 結果は ok / ng' using errcode = '22023'; end if;
   if p_result = 'ok' and p_export_id is null then raise exception 'invalid_input: ok は確かめに使った試しのファイルの番号が要る' using errcode = '22023'; end if;
-  p_actor := ops.reg_write_session(p_actor) ->> 'actor';   -- 画面のロール = ops.begin_master_write の行から (D)
-  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('ops.ne_csv'));
+  if p_note is not null and (pg_catalog.length(p_note) > 500 or p_note ~ '[[:cntrl:]]') then raise exception 'invalid_input: メモは 500 字まで' using errcode = '22023'; end if;
+  perform ops.reg_write_gate(p_ownership);
+  if p_export_id is not null then perform ops.ne_reg_lock_export(p_export_id);
+  else perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('ops.ne_csv')); end if;
   if p_export_id is not null then
-    select * into e from ops.ne_reg_exports x where x.export_id = p_export_id for share;
-    if not found then raise exception 'not_found: ファイル % が無い', p_export_id using errcode = 'P0002'; end if;
+    select * into e from ops.ne_reg_exports x where x.export_id = p_export_id;
     if e.kind <> p_kind or e.schema_version <> p_schema or e.header <> p_header then
       raise exception 'export_mismatch: ファイルの種類・形の版・見出しが今の形と違う' using errcode = 'P0001';
     end if;
@@ -897,11 +1133,16 @@ begin
       end if;
     end if;
   end if;
+  perform ops.open_reg_write('reg_csv_verified', p_request_id, p_actor_id, null, p_ownership, null, null, null,
+    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'reg_csv_verified', 'kind', p_kind, 'schema', p_schema, 'header', p_header, 'result', p_result, 'note', p_note, 'export_id', p_export_id)),
+    pg_catalog.jsonb_build_object('export_id', p_export_id::text));
   insert into ops.ne_csv_verified (export_id, kind, col, encoding, header, converter_version, result, note, verified_by, reg_export_id)
-    values (null, p_kind, 'new_registration', 'utf8', p_header, p_schema, p_result, p_note, p_actor, p_export_id) returning verified_id into v_id;
-  return pg_catalog.jsonb_build_object('verified_id', v_id);
+    values (null, p_kind, 'new_registration', 'utf8', p_header, p_schema, p_result, p_note, p_actor_id, p_export_id) returning verified_id into v_id;
+  v_result := pg_catalog.jsonb_build_object('verified_id', v_id::text, 'kind', p_kind, 'result', p_result);
+  perform ops.close_reg_write(v_result, 'reg-csv verified ' || p_kind);
+  return v_result;
 end $$;
-revoke all on function ops.ne_reg_record_verified(text, text, text, text, text, text, bigint) from public;
+revoke all on function ops.ne_reg_record_verified(uuid, text, jsonb, text, text, text, text, text, bigint) from public;
 
 -- 翌朝の照合 ② の新規登録の確かめ (#1571 Codex R1 High 2): 呼び手の JSON を確かめに使わない。3 段 (どれも watch_writer・security definer の関数だけ):
 --   1. ops.record_ne_registration_observations = 回ごとに 1 回、取得の世代・時刻・原本のハッシュ・確かめ待ちの商品・観測を残す (DB が観測のハッシュを計算)
@@ -937,7 +1178,7 @@ create table ops.ne_reg_compare_receipts (
   sealed_at        timestamptz not null default pg_catalog.clock_timestamp()
 );
 select core.make_append_only('ops', 'ne_reg_compare_receipts');
-comment on table ops.ne_reg_compare_receipts is '照合の回が最後まで終わった受け取り (0052・#1571 R1 High 2)。これがある回だけ ops.record_ne_registration_check が確かめる';
+comment on table ops.ne_reg_compare_receipts is '照合の回が最後まで終わった受け取り (0053・#1571 R1 High 2)。これがある回だけ ops.record_ne_registration_check が確かめる';
 -- 受け取りの後の回には観測を足せない (持ち主のロールでも)
 create function ops.guard_ne_reg_compare_observations() returns trigger language plpgsql set search_path = pg_catalog, pg_temp as $$
 begin
@@ -1156,7 +1397,7 @@ end $$;
 revoke all on function ops.record_ne_registration_check(text) from public;
 
 /**
- * 0051 の状態の関数を置き換える (引数は同じ)。ne_pending・ne_confirmed の根拠は、関数が 0052 の記録から自分で読んで鍵を取る
+ * 0052 の状態の関数を置き換える (引数は同じ)。ne_pending・ne_confirmed の根拠は、関数が 0053 の記録から自分で読んで鍵を取る
  * (呼び手の渡す根拠の JSON は信じない = 渡したら拒む caller_evidence)。distributable / available は ④ まで not_ready のまま。
  *   ne_pending   ← この SKU の新規登録の CSV の品目が import_declared・その試み (結果 ok / partial・sha256 = ファイルの記録) がある (人)
  *   ne_confirmed ← ne_pending から: この SKU の照合の確かめ (ops.ne_reg_checks) が verified・その品目が verified で同じ照合の回・回の記録がある (system)
@@ -1237,7 +1478,7 @@ revoke all on function ops.transition_sku_registration(bigint, text, text, text,
 -- ═══════════ B. JAN の変更の記録 (H6) ═══════════
 -- 🚨 NOT VALID で足す (#1571 Codex R1 Low): 前からの行を全部読んで確かめるのを、この migration の取引 (強い鍵) の中でしない。
 --    前からの行は前の CHECK (external_id を含まない狭い集合) を満たしている = 新しい CHECK も満たす。新しい行は足した時から確かめる。
---    後の手順 (本番に 0052 を流した後・別の取引で・書き込みを止めない SHARE UPDATE EXCLUSIVE の鍵):
+--    後の手順 (本番に 0053 を流した後・別の取引で・書き込みを止めない SHARE UPDATE EXCLUSIVE の鍵):
 --      alter table events.master_change_events validate constraint master_change_events_entity_type_check;
 alter table events.master_change_events drop constraint master_change_events_entity_type_check;
 alter table events.master_change_events add constraint master_change_events_entity_type_check
@@ -1258,7 +1499,7 @@ create trigger trg_external_ids_jan_guard before update on core.external_ids for
 create trigger trg_external_ids_jan_no_delete before delete on core.external_ids for each row when (old.system = 'jan') execute function core.guard_jan_external_ids();
 
 -- 表の持ち主でないロール (画面 = master_edit) が書けるのは商品の JAN の行だけ (列の権限は create-master-edit-roles.mjs が絞る。行はここで絞る)
---   表の持ち主 (夜間ロード・migration) とそのメンバーは今までどおり (0050 の core.guard_sku_cost_overlap と同じ見分け方)。UPDATE は前の行も JAN であること
+--   表の持ち主 (夜間ロード・migration) とそのメンバーは今までどおり (0051 の core.guard_sku_cost_overlap と同じ見分け方)。UPDATE は前の行も JAN であること
 create function core.guard_external_ids_writer() returns trigger language plpgsql as $$
 declare
   v_jan_new boolean;
@@ -1276,36 +1517,130 @@ begin
 end $$;
 create trigger trg_external_ids_writer before insert or update or delete on core.external_ids for each row execute function core.guard_external_ids_writer();
 
--- 画面のロール (master_edit) の JAN の書き込み (D・0050 の約束 #1563 R3 M2): 0050 の守り (同じ取引で ops.begin_master_write の後・段階 new_open) +
--- JAN の持ち主 (始めたときの持ち主表の external_ids.jan) が company。0050 の ops.master_edit_owner_keys は core.external_ids を知らない = 持ち主はここで見る
-create trigger trg_master_edit_guard before insert or update or delete on core.external_ids for each row execute function ops.guard_master_edit_write();
--- 🚨 security definer = 画面のロールに ops.master_write_sessions を読ませない。名前の順 (trg_master_edit_guard の後) に動く
-create function core.guard_master_edit_jan_owner() returns trigger
+-- 画面のロール (master_edit) の JAN の行の書き込み (#1571 R1 High 3・⑤-2a の知らせの守りと同じ作り): JAN の約束 (jan_edit = ops.edit_sku_jan の中) だけ・
+--   約束の商品の JAN の行だけ・段階 new_open・始めたときの持ち主表で external_ids.jan が company・足す行は人が決めた (manual) 約束の人の行だけ。
+--   0051 の guard (trg_master_edit_guard) は core.external_ids の相手を知らない = 付けない (ここで見る)。表の権限は画面のロールに渡さない
+-- 🚨 security definer = 画面のロールに ops.master_write_sessions を読ませない
+create function core.guard_master_edit_jan() returns trigger
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
   v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
-  v_own     jsonb;
+  v_sess    ops.master_write_sessions;
 begin
   if v_db_user is distinct from 'master_edit' then return case when tg_op = 'DELETE' then old else new end; end if;
-  select s.ownership into v_own from ops.master_write_sessions s where s.txid = pg_catalog.txid_current();
-  if not found then
-    raise exception 'master_write_session_required: 画面のロールの JAN の書き込みは、同じ取引で ops.begin_master_write を呼んだ後だけ' using errcode = '42501';
+  v_sess := ops.current_master_write_session();
+  if v_sess.session_id is null or v_sess.operation is distinct from 'jan_edit' then
+    raise exception 'master_write_session_required: 画面のロールの JAN の書き込みは JAN の約束 (ops.edit_sku_jan) の中だけ' using errcode = '42501';
   end if;
-  if (v_own ->> 'external_ids.jan') is distinct from 'company' then
+  if not ops.master_write_allowed(v_sess.operation, 'core.external_ids', tg_op) then
+    raise exception 'master_write_operation: 約束の操作 % では core.external_ids に % できない', v_sess.operation, tg_op using errcode = '42501';
+  end if;
+  if (select s.phase from ops.master_cutover_state s where s.id = 1) is distinct from 'new_open' then
+    raise exception 'before_cutover: 切替の段階が new_open でない (core.external_ids)' using errcode = '42501';
+  end if;
+  if (tg_op <> 'INSERT' and not (old.entity_type = 'product' and old.system = 'jan' and old.entity_id = any (v_sess.target_product_ids)))
+     or (tg_op <> 'DELETE' and not (new.entity_type = 'product' and new.system = 'jan' and new.entity_id = any (v_sess.target_product_ids))) then
+    raise exception 'master_write_target: JAN の約束の商品の JAN の行でない' using errcode = '42501';
+  end if;
+  if (v_sess.ownership ->> 'external_ids.jan') is distinct from 'company' then
     raise exception 'owner_not_company: external_ids.jan の持ち主が company でない (core.external_ids)' using errcode = '42501';
+  end if;
+  if tg_op = 'INSERT' and (new.resolution is distinct from 'manual' or new.resolved_by_type is distinct from 'human' or new.resolved_by_id is distinct from v_sess.actor_id) then
+    raise exception 'master_write_session_mismatch: 足す JAN の行は人が決めた (manual) 約束の人の行だけ' using errcode = '42501';
   end if;
   return case when tg_op = 'DELETE' then old else new end;
 end $$;
-revoke all on function core.guard_master_edit_jan_owner() from public;
-create trigger trg_master_edit_jan_owner before insert or update or delete on core.external_ids for each row execute function core.guard_master_edit_jan_owner();
+revoke all on function core.guard_master_edit_jan() from public;
+create trigger trg_master_edit_jan before insert or update or delete on core.external_ids for each row execute function core.guard_master_edit_jan();
 
--- 記録 (0026 と同じ関数 = 0050 から security definer): 足す = INSERT の 1 行 / 外す = valid_to の UPDATE。誰が・request_id・理由は取引の set_config
--- (画面のロール master_edit は 0050 の関数が ops.begin_master_write の行から取る = 設定では偽れない)
+/**
+ * 商品の JAN を足す・外す (画面 B の保存・#1571 R1 High 3 = JAN だけの security definer の関数・約束 jan_edit)。
+ *   p_seen = 画面が見ていた有効な JAN (並びは問わない)・p_jans = 保存したい有効な JAN (0〜5 つ・8 / 13 桁 + チェック数字・重ならない)
+ * 鍵: 段階の共有 → マスタの書き込みの共有 → 同じ商品の SKU (sku_id の順) → CSV → 商品・SKU の行 → 約束 → 書く → 保存の記録 done
+ * 確かめる: 段階・持ち主表 (external_ids.jan が company)・単品で商品がある・今の有効な JAN が画面が見ていたものと同じ (違えば version_conflict)・
+ *   足す JAN がほかの商品の有効な JAN でない (jan_taken)・その商品の新規登録の CSV を配った後でない (reg_csv_issued。作っただけ = 使わないにする)
+ * 変わらない = 何も書かない (no_change)。外す = valid_to・足す = 人が決めた行 (manual)。変更の記録と SKU・商品の version は trigger (誰が・request_id = 約束)
+ */
+create function ops.edit_sku_jan(p_request_id uuid, p_actor_id text, p_reason text, p_ownership jsonb, p_sku_id bigint, p_seen jsonb, p_jans jsonb) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_sku     record;
+  v_skus    bigint[];
+  v_cur     text[];
+  v_seen    text[];
+  v_want    text[];
+  v_add     text[];
+  v_rem     text[];
+  v_holder  text;
+  v_sup     jsonb;
+  v_result  jsonb;
+  x         text;
+begin
+  if ops.reg_actor_problem(p_actor_id, p_reason) is not null then raise exception 'invalid_input: 人・理由の形が違う' using errcode = '22023'; end if;
+  if p_request_id is null then raise exception 'invalid_input: request_id が要る' using errcode = '22023'; end if;
+  if pg_catalog.jsonb_typeof(p_jans) is distinct from 'array' or pg_catalog.jsonb_typeof(p_seen) is distinct from 'array'
+     or exists (select 1 from pg_catalog.jsonb_array_elements(p_jans) j where pg_catalog.jsonb_typeof(j) <> 'string' or not ops.jan_check_ok(j #>> '{}'))
+     or exists (select 1 from pg_catalog.jsonb_array_elements(p_seen) j where pg_catalog.jsonb_typeof(j) <> 'string') then
+    raise exception 'invalid_input: JAN は 8 桁か 13 桁の数字でチェック数字が合うものの配列 (画面が見ていた JAN も配列)' using errcode = '22023';
+  end if;
+  select coalesce(pg_catalog.array_agg(distinct t order by t), '{}') into v_want from pg_catalog.jsonb_array_elements_text(p_jans) t;
+  if pg_catalog.cardinality(v_want) > 5 then raise exception 'invalid_input: JAN は 5 つまで' using errcode = '22023'; end if;
+  select coalesce(pg_catalog.array_agg(distinct t order by t), '{}') into v_seen from pg_catalog.jsonb_array_elements_text(p_seen) t;
+  perform ops.reg_write_gate(p_ownership, array['external_ids.jan']);
+  select k.sku_id, k.code, k.sku_kind, k.product_id into v_sku from core.skus k where k.sku_id = p_sku_id;
+  if not found then raise exception 'not_found: SKU % が無い', p_sku_id using errcode = 'P0002'; end if;
+  if v_sku.sku_kind is distinct from 'single' or v_sku.product_id is null then raise exception 'invalid_input: JAN は商品のある単品だけ' using errcode = '22023'; end if;
+  -- 鍵: 同じ商品の SKU (sku_id の順) → CSV → 商品・SKU の行 (JAN は商品の値 = 同じ商品の SKU の CSV に入る)
+  select pg_catalog.array_agg(k.sku_id order by k.sku_id) into v_skus from core.skus k where k.product_id = v_sku.product_id;
+  perform ops.ne_reg_lock_skus(v_skus);
+  perform 1 from core.products p where p.product_id = v_sku.product_id for update;
+  perform 1 from core.skus k where k.sku_id = any (v_skus) order by k.sku_id for update;
+  select coalesce(pg_catalog.array_agg(e.external_value order by e.external_value), '{}') into v_cur from core.external_ids e
+   where e.entity_type = 'product' and e.entity_id = v_sku.product_id and e.system = 'jan' and e.id_kind = 'jan' and e.valid_to is null;
+  if v_cur is distinct from v_seen then
+    raise exception 'version_conflict: 画面を開いた後にこの商品の JAN が変わった (今 %)', pg_catalog.array_to_string(v_cur, '・') using errcode = 'P0001';
+  end if;
+  select coalesce(pg_catalog.array_agg(t order by t), '{}') into v_add from pg_catalog.unnest(v_want) t where not (t = any (v_cur));
+  select coalesce(pg_catalog.array_agg(t order by t), '{}') into v_rem from pg_catalog.unnest(v_cur) t where not (t = any (v_want));
+  if pg_catalog.cardinality(v_add) = 0 and pg_catalog.cardinality(v_rem) = 0 then
+    return pg_catalog.jsonb_build_object('ok', true, 'code', v_sku.code, 'no_change', true, 'jan', pg_catalog.to_jsonb(v_cur));
+  end if;
+  foreach x in array v_add loop
+    select coalesce((select s.code from core.skus s where e.entity_type = 'product' and s.product_id = e.entity_id order by s.code_norm limit 1), e.entity_type || ' ' || e.entity_id)
+      into v_holder from core.external_ids e
+     where e.system = 'jan' and e.id_kind = 'jan' and e.external_norm = core.norm_code(x) and e.valid_to is null
+       and not (e.entity_type = 'product' and e.entity_id = v_sku.product_id) limit 1;
+    if v_holder is not null then raise exception 'jan_taken: JAN % はほかの商品 (%) の有効な JAN', x, v_holder using errcode = 'P0001'; end if;
+  end loop;
+  if exists (select 1 from ops.ne_reg_export_items i where i.sku_id = any (v_skus) and i.state in ('issued', 'import_declared', 'partial')) then
+    raise exception 'reg_csv_issued: この商品の NE 登録の CSV を配った後なので JAN は直せない (先にそのファイルを使わないにする)' using errcode = 'P0001';
+  end if;
+  perform ops.open_reg_write('jan_edit', p_request_id, p_actor_id, p_reason, p_ownership, p_sku_id,
+    (select coalesce(pg_catalog.array_agg(s order by s), '{}') from pg_catalog.unnest(v_skus) s where s <> p_sku_id), array[v_sku.product_id],
+    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'jan_edit', 'sku_id', p_sku_id, 'from', v_cur, 'to', v_want, 'reason', p_reason)),
+    pg_catalog.jsonb_build_object('sku_ids', pg_catalog.to_jsonb(v_skus), 'product_id', v_sku.product_id::text));
+  v_sup := ops.ne_reg_supersede_built(v_skus, p_actor_id, 'JAN');
+  update core.external_ids set valid_to = pg_catalog.now()
+   where entity_type = 'product' and entity_id = v_sku.product_id and system = 'jan' and id_kind = 'jan' and valid_to is null and external_value = any (v_rem);
+  insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id, evidence)
+    select 1, 'product', v_sku.product_id, 'jan', 'jan', t, 'manual', 'human', p_actor_id,
+           pg_catalog.jsonb_build_object('request_id', p_request_id::text, 'reason', p_reason, 'source', 'portal_master_edit')
+      from pg_catalog.unnest(v_add) t order by t;
+  v_result := pg_catalog.jsonb_build_object('ok', true, 'code', v_sku.code, 'kind', 'single', 'request_id', p_request_id::text,
+    'changed', pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('field', 'jan', 'label', 'JAN', 'from', pg_catalog.to_jsonb(v_cur), 'to', pg_catalog.to_jsonb(v_want), 'ne', 'manual')),
+    'superseded', v_sup -> 'superseded');
+  perform ops.close_reg_write(v_result, v_sku.code);
+  return v_result;
+end $$;
+revoke all on function ops.edit_sku_jan(uuid, text, text, jsonb, bigint, jsonb, jsonb) from public;
+
+-- 記録 (0026 と同じ関数 = 0051 から security definer): 足す = INSERT の 1 行 / 外す = valid_to の UPDATE。誰が・request_id・理由は取引の set_config
+-- (画面のロール master_edit は 0051 の関数が約束の行 (ops.master_write_sessions = JAN の約束 jan_edit) から取る = 設定では偽れない)
 create trigger trg_external_ids_jan_audit after insert or update on core.external_ids for each row when (new.system = 'jan')
   execute function core.audit_master_change('external_id', 'external_id_row');
 
 -- JAN が変わったら、その商品の SKU (と商品) の version も変える = 編集の印・CSV の予約の版が古くなる。
--- security definer = 画面のロールに skus / products の version の update を渡さない (0050 の core.bump_parent_version と同じ)
+-- security definer = 画面のロールに skus / products の version の update を渡さない (0051 の core.bump_parent_version と同じ)
 create function core.bump_jan_owner_version() returns trigger
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 begin
@@ -1337,7 +1672,7 @@ create table ops.supplier_registrations (
   evidence         jsonb check (evidence is null or jsonb_typeof(evidence) = 'object'),   -- { ne_screen: 'NE の仕入先の画面', ne_code, note }
   constraint ck_sr_declared check ((state = 'ne_confirmed') = (declared_by is not null and declared_at is not null and evidence is not null))
 );
-comment on table ops.supplier_registrations is '新しい仕入先の「NE に登録した」の状態 (0052)。行が無い = 前からある仕入先。ne_pending の仕入先は代表の仕入先に選べない。書くのは関数だけ';
+comment on table ops.supplier_registrations is '新しい仕入先の「NE に登録した」の状態 (0053)。行が無い = 前からある仕入先。ne_pending の仕入先は代表の仕入先に選べない。書くのは関数だけ';
 
 create table ops.supplier_registration_events (
   event_id    bigint generated always as identity primary key,
@@ -1355,7 +1690,7 @@ create function ops.guard_supplier_registrations() returns trigger language plpg
 begin
   if tg_op = 'DELETE' then raise exception '仕入先の登録の状態は消さない' using errcode = 'P0001'; end if;
   if coalesce(pg_catalog.current_setting('ops.supplier_registration_protocol', true), '') is distinct from '1' then
-    raise exception '仕入先の登録の状態は ops の関数 (create_supplier_registration / declare_supplier_in_ne) でだけ書く' using errcode = 'P0001';
+    raise exception '仕入先の登録の状態は ops の関数 (create_supplier / declare_supplier_in_ne) でだけ書く' using errcode = 'P0001';
   end if;
   if tg_op = 'INSERT' then
     if new.state <> 'ne_pending' then raise exception '新しい仕入先の状態は ne_pending で作る' using errcode = 'P0001'; end if;
@@ -1370,51 +1705,163 @@ end $$;
 create trigger trg_supplier_registrations_guard before insert or update or delete on ops.supplier_registrations for each row execute function ops.guard_supplier_registrations();
 create trigger trg_supplier_registrations_no_truncate before truncate on ops.supplier_registrations for each statement execute function core.reject_mutation();
 
-/** 新しい仕入先の状態の行を作る (ne_pending)。仕入先を作ったのと同じ取引の中でだけ (前からある仕入先を「新しい」にしない) */
-create function ops.create_supplier_registration(p_supplier_id bigint, p_actor text) returns jsonb
+/**
+ * 新しい仕入先を作る (状態 ne_pending)。約束 = supplier_create (#1571 R1 High 3)。
+ * コード = 数字 4 桁 (lib/master-supplier.mjs の validateNewSupplierCode が 1〜4 桁を 0 で埋める)・0000 / 9999 は不可・4 桁にそろえて一意。
+ * 名前 = 1〜100 字・【…】の運用メモを混ぜない・制御文字なし。発注方法 = 40 字まで。リードタイム = 0〜365 日。持ち主 = suppliers.* が company
+ */
+create function ops.create_supplier(p_request_id uuid, p_actor_id text, p_reason text, p_ownership jsonb, p_code text, p_name text, p_order_method text, p_lead_time_days integer) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
-  v_company smallint;
+  v_clash  text;
+  v_id     bigint;
+  v_result jsonb;
 begin
-  if coalesce(pg_catalog.btrim(p_actor), '') = '' then raise exception 'invalid_input: 誰が (actor) が要る' using errcode = '22023'; end if;
-  p_actor := ops.reg_write_session(p_actor) ->> 'actor';   -- 画面のロールに渡すとき (⑥) も ops.begin_master_write の行から (D)
-  select s.company_id into v_company from core.suppliers s
-   where s.supplier_id = p_supplier_id and s.xmin = pg_catalog.pg_current_xact_id()::xid and s.created_at = pg_catalog.now();
-  if not found then raise exception 'not_new_supplier: 状態の行は仕入先を作った取引の中でだけ作る (仕入先 %)', p_supplier_id using errcode = 'P0001'; end if;
+  if ops.reg_actor_problem(p_actor_id, p_reason) is not null then raise exception 'invalid_input: 人・理由の形が違う' using errcode = '22023'; end if;
+  if p_code is null or p_code !~ '^[0-9]{4}$' or p_code in ('0000', '9999') then raise exception 'invalid_input: 新しい仕入先のコードは 4 桁の数字 (0000 / 9999 は不可)' using errcode = '22023'; end if;
+  if p_name is null or p_name <> pg_catalog.btrim(p_name) or pg_catalog.length(p_name) not between 1 and 100 or p_name ~ '[[:cntrl:]]' or p_name ~ '[【】]' then
+    raise exception 'invalid_input: 仕入先名は 1〜100 字 (前後の空白・制御文字・【…】の運用メモなし)' using errcode = '22023';
+  end if;
+  if p_order_method is not null and (pg_catalog.length(p_order_method) > 40 or p_order_method ~ '[[:cntrl:]]') then raise exception 'invalid_input: 発注方法は 40 字まで' using errcode = '22023'; end if;
+  if p_lead_time_days is not null and p_lead_time_days not between 0 and 365 then raise exception 'invalid_input: リードタイムは 0〜365 日' using errcode = '22023'; end if;
+  perform ops.reg_write_gate(p_ownership, array['suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days']);
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.new_supplier:' || p_code, 0));
+  select s.code into v_clash from core.suppliers s where s.company_id = 1 and (s.code_norm = core.norm_code(p_code) or core.canonical_supplier_code(s.code) = p_code) limit 1;
+  if v_clash is not null then raise exception 'supplier_code_taken: 仕入先のコード % はもうある (%)', p_code, v_clash using errcode = 'P0001'; end if;
+  perform ops.open_reg_write('supplier_create', p_request_id, p_actor_id, p_reason, p_ownership, null, null, null,
+    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'supplier_create', 'code', p_code, 'name', p_name, 'order_method', p_order_method, 'lead_time_days', p_lead_time_days, 'reason', p_reason)),
+    pg_catalog.jsonb_build_object('supplier_code', p_code));
+  insert into core.suppliers (company_id, code, name, order_method, lead_time_days, created_by_type, created_by_id)
+    values (1, p_code, p_name, p_order_method, p_lead_time_days, 'human', p_actor_id) returning supplier_id into v_id;
   perform pg_catalog.set_config('ops.supplier_registration_protocol', '1', true);
-  insert into ops.supplier_registrations (supplier_id, company_id, state, created_by) values (p_supplier_id, v_company, 'ne_pending', p_actor);
+  insert into ops.supplier_registrations (supplier_id, company_id, state, created_by) values (v_id, 1, 'ne_pending', p_actor_id);
   perform pg_catalog.set_config('ops.supplier_registration_protocol', '', true);
-  insert into ops.supplier_registration_events (supplier_id, from_state, to_state, actor) values (p_supplier_id, null, 'ne_pending', p_actor);
-  return pg_catalog.jsonb_build_object('supplier_id', p_supplier_id, 'state', 'ne_pending');
+  insert into ops.supplier_registration_events (supplier_id, from_state, to_state, actor) values (v_id, null, 'ne_pending', p_actor_id);
+  v_result := pg_catalog.jsonb_build_object('ok', true, 'supplier_id', v_id::text, 'code', p_code, 'state', 'ne_pending');
+  perform ops.close_reg_write(v_result, p_code);
+  return v_result;
 end $$;
-revoke all on function ops.create_supplier_registration(bigint, text) from public;
+revoke all on function ops.create_supplier(uuid, text, text, jsonb, text, text, text, integer) from public;
 
-/** 「NE に登録した」と申告する (ne_pending → ne_confirmed)。NE の仕入先の画面で見たコードが Company DB のコードと同じ (4 桁に揃えて) であること */
-create function ops.declare_supplier_in_ne(p_supplier_id bigint, p_actor text, p_ne_code text, p_note text) returns jsonb
+/**
+ * 「NE に登録した」と申告する (ne_pending → ne_confirmed)。約束 = supplier_declare。
+ * 根拠 = NE の仕入先の画面で見たコードが Company DB のコードと同じ (4 桁にそろえて) + 誰・いつ。もう申告した = そのまま (何も書かない)
+ */
+create function ops.declare_supplier_in_ne(p_request_id uuid, p_actor_id text, p_ownership jsonb, p_code text, p_ne_code text, p_note text) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
-  v_code  text;
-  v_state text;
-  v_ev    jsonb;
+  v_id     bigint;
+  v_code   text;
+  v_state  text;
+  v_ev     jsonb;
+  v_result jsonb;
 begin
-  if coalesce(pg_catalog.btrim(p_actor), '') = '' then raise exception 'invalid_input: 誰が (actor) が要る' using errcode = '22023'; end if;
-  p_actor := ops.reg_write_session(p_actor) ->> 'actor';   -- 画面のロールに渡すとき (⑥) も ops.begin_master_write の行から (D)
-  select s.code into v_code from core.suppliers s where s.supplier_id = p_supplier_id for share;
-  if not found then raise exception 'not_found: 仕入先 % が無い', p_supplier_id using errcode = 'P0002'; end if;
-  select r.state into v_state from ops.supplier_registrations r where r.supplier_id = p_supplier_id for update;
+  if ops.reg_actor_problem(p_actor_id, null) is not null then raise exception 'invalid_input: 人の形が違う' using errcode = '22023'; end if;
+  if coalesce(pg_catalog.btrim(p_ne_code), '') = '' or pg_catalog.length(p_ne_code) > 20 then raise exception 'invalid_input: NE の仕入先の画面で見たコードが要る' using errcode = '22023'; end if;
+  if p_note is not null and (pg_catalog.length(p_note) > 200 or p_note ~ '[[:cntrl:]]') then raise exception 'invalid_input: メモは 200 字まで' using errcode = '22023'; end if;
+  perform ops.reg_write_gate(p_ownership, array['suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days']);
+  select s.supplier_id, s.code into v_id, v_code from core.suppliers s where s.company_id = 1 and s.code_norm = core.norm_code(coalesce(p_code, '')) for share;
+  if not found then raise exception 'not_found: 仕入先 % は Company DB に無い', p_code using errcode = 'P0002'; end if;
+  select r.state into v_state from ops.supplier_registrations r where r.supplier_id = v_id for update;
   if v_state is null then raise exception 'not_new_supplier: 仕入先 % は前からある仕入先 (申告は要らない)', v_code using errcode = 'P0001'; end if;
-  if v_state = 'ne_confirmed' then return pg_catalog.jsonb_build_object('supplier_id', p_supplier_id, 'state', 'ne_confirmed', 'already', true); end if;
-  if core.canonical_supplier_code(pg_catalog.btrim(coalesce(p_ne_code, ''))) is distinct from core.canonical_supplier_code(v_code) then
+  if v_state = 'ne_confirmed' then return pg_catalog.jsonb_build_object('ok', true, 'supplier_id', v_id::text, 'code', v_code, 'state', 'ne_confirmed', 'already', true); end if;
+  if core.canonical_supplier_code(pg_catalog.btrim(p_ne_code)) is distinct from core.canonical_supplier_code(v_code) then
     raise exception 'ne_code_mismatch: NE で見たコード % が Company DB のコード % と違う', p_ne_code, v_code using errcode = '22023';
   end if;
   v_ev := pg_catalog.jsonb_build_object('ne_screen', 'NE の仕入先の画面', 'ne_code', pg_catalog.btrim(p_ne_code), 'note', p_note);
+  perform ops.open_reg_write('supplier_declare', p_request_id, p_actor_id, null, p_ownership, null, null, null,
+    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'supplier_declare', 'supplier_id', v_id, 'evidence', v_ev)),
+    pg_catalog.jsonb_build_object('supplier_id', v_id::text));
   perform pg_catalog.set_config('ops.supplier_registration_protocol', '1', true);
-  update ops.supplier_registrations set state = 'ne_confirmed', declared_by = p_actor, declared_at = pg_catalog.now(), evidence = v_ev where supplier_id = p_supplier_id;
+  update ops.supplier_registrations set state = 'ne_confirmed', declared_by = p_actor_id, declared_at = pg_catalog.now(), evidence = v_ev where supplier_id = v_id;
   perform pg_catalog.set_config('ops.supplier_registration_protocol', '', true);
-  insert into ops.supplier_registration_events (supplier_id, from_state, to_state, actor, evidence) values (p_supplier_id, 'ne_pending', 'ne_confirmed', p_actor, v_ev);
-  return pg_catalog.jsonb_build_object('supplier_id', p_supplier_id, 'state', 'ne_confirmed');
+  insert into ops.supplier_registration_events (supplier_id, from_state, to_state, actor, evidence) values (v_id, 'ne_pending', 'ne_confirmed', p_actor_id, v_ev);
+  v_result := pg_catalog.jsonb_build_object('ok', true, 'supplier_id', v_id::text, 'code', v_code, 'state', 'ne_confirmed');
+  perform ops.close_reg_write(v_result, v_code);
+  return v_result;
 end $$;
-revoke all on function ops.declare_supplier_in_ne(bigint, text, text, text) from public;
+revoke all on function ops.declare_supplier_in_ne(uuid, text, jsonb, text, text, text) from public;
+
+/**
+ * 取引停止 (active = false)。約束 = supplier_deactivate (相手 = 仕入先・付け替える SKU = DB が決める)。
+ * 代表の仕入先に使っている商品があれば止めない (supplier_in_use) / p_reassign_to = 同じ取引で付け替える先 (取引中・申告済み・別の仕入先)。
+ * 付け替えは画面の保存と同じ決まり: NE に取り込む CSV (0040) の primary_supplier が出ている商品 = csv_issued / 新商品の NE 登録の CSV を配った後 = reg_csv_issued
+ * (作っただけのファイルは使わないにする)。鍵: 段階の共有 → マスタの書き込みの共有 → 付け替える SKU (sku_id の順) → CSV → 仕入先の行 → 仕入先ごとの商品の行
+ */
+create function ops.deactivate_supplier(p_request_id uuid, p_actor_id text, p_reason text, p_ownership jsonb, p_code text, p_reassign_to text) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_reassign boolean := coalesce(pg_catalog.btrim(p_reassign_to), '') <> '';
+  v_id       bigint;
+  v_code     text;
+  v_active   boolean;
+  v_planned  bigint[];
+  v_used     bigint[];
+  v_codes    text[];
+  v_to       record;
+  v_to_id    bigint;
+  v_bad      text;
+  v_sup      jsonb := pg_catalog.jsonb_build_object('superseded', '[]'::jsonb);
+  v_result   jsonb;
+begin
+  if ops.reg_actor_problem(p_actor_id, p_reason) is not null or coalesce(pg_catalog.btrim(p_reason), '') = '' then
+    raise exception 'invalid_input: 人・理由 (200 字まで) が要る' using errcode = '22023';
+  end if;
+  perform ops.reg_write_gate(p_ownership, array['suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days']
+    || case when v_reassign then array['supplier_skus.is_primary'] else '{}'::text[] end);
+  select s.supplier_id into v_id from core.suppliers s where s.company_id = 1 and s.code_norm = core.norm_code(coalesce(p_code, ''));
+  if not found then raise exception 'not_found: 仕入先 % は Company DB に無い', p_code using errcode = 'P0002'; end if;
+  select coalesce(pg_catalog.array_agg(x.sku_id order by x.sku_id), '{}') into v_planned from core.supplier_skus x where x.supplier_id = v_id and x.is_primary;
+  if v_reassign then
+    perform ops.ne_reg_lock_skus(v_planned);   -- SKU の鍵 (sku_id の順) → CSV の鍵
+  end if;
+  select s.code, s.active into v_code, v_active from core.suppliers s where s.supplier_id = v_id for update;
+  if not v_active then return pg_catalog.jsonb_build_object('ok', true, 'code', v_code, 'active', false, 'already', true); end if;
+  select coalesce(pg_catalog.array_agg(x.sku_id order by x.sku_id), '{}'), coalesce(pg_catalog.array_agg(k.code order by k.code_norm), '{}') into v_used, v_codes
+    from core.supplier_skus x join core.skus k on k.sku_id = x.sku_id where x.supplier_id = v_id and x.is_primary;
+  perform 1 from core.supplier_skus x where x.supplier_id = v_id and x.is_primary order by x.sku_id for update;
+  if pg_catalog.cardinality(v_used) > 0 then
+    if not v_reassign then
+      raise exception 'supplier_in_use: 仕入先 % は % 件の商品の代表の仕入先 (%)', v_code, pg_catalog.cardinality(v_used), pg_catalog.array_to_string(v_codes[1:10], '・') using errcode = 'P0001';
+    end if;
+    if exists (select 1 from pg_catalog.unnest(v_used) u where not (u = any (v_planned))) then
+      raise exception 'retry: 付け替える商品がちょうど増えた (もう一度押す)' using errcode = 'P0001';
+    end if;
+    select s.supplier_id, s.code, s.active, r.state as reg_state into v_to from core.suppliers s left join ops.supplier_registrations r on r.supplier_id = s.supplier_id
+     where s.company_id = 1 and s.code_norm = core.norm_code(p_reassign_to) for update of s;
+    v_to_id := v_to.supplier_id;
+    if v_to_id is null then raise exception 'invalid_input: 付け替える先の仕入先 % が無い', p_reassign_to using errcode = '22023'; end if;
+    if v_to.supplier_id = v_id then raise exception 'invalid_input: 付け替える先が同じ仕入先' using errcode = '22023'; end if;
+    if not v_to.active then raise exception 'invalid_input: 付け替える先の仕入先 % は取引停止', v_to.code using errcode = '22023'; end if;
+    if v_to.reg_state is not null and v_to.reg_state <> 'ne_confirmed' then
+      raise exception 'supplier_not_confirmed: 付け替える先の仕入先 % は「NE に登録した」の申告がまだ', v_to.code using errcode = 'P0001';
+    end if;
+    select pg_catalog.string_agg(distinct k.code, '・') into v_bad
+      from core.skus k join ops.ne_csv_export_rows r on r.code_norm = k.code_norm join ops.ne_csv_exports e on e.export_id = r.export_id
+     where k.sku_id = any (v_used) and r.col = 'primary_supplier' and (e.state in ('made', 'checked') or (e.state = 'declared' and r.reserved));
+    if v_bad is not null then raise exception 'csv_issued: % の代表の仕入先が入った NE に取り込む CSV が出ている', v_bad using errcode = 'P0001'; end if;
+    select pg_catalog.string_agg(distinct k.code, '・') into v_bad
+      from ops.ne_reg_export_items i join core.skus k on k.sku_id = i.sku_id where i.sku_id = any (v_used) and i.state in ('issued', 'import_declared', 'partial');
+    if v_bad is not null then
+      raise exception 'reg_csv_issued: 付け替える商品 (%) の NE 登録の CSV を配った後なので付け替えない (先にそのファイルを使わないにする)', v_bad using errcode = 'P0001';
+    end if;
+  end if;
+  perform ops.open_reg_write('supplier_deactivate', p_request_id, p_actor_id, p_reason, p_ownership, null, null, null,
+    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'supplier_deactivate', 'supplier_id', v_id, 'reassign_to', v_to_id, 'sku_ids', v_used, 'reason', p_reason)),
+    pg_catalog.jsonb_build_object('supplier_id', v_id::text, 'reassign_to', v_to_id::text, 'sku_ids', pg_catalog.to_jsonb(v_used)));
+  if pg_catalog.cardinality(v_used) > 0 then
+    v_sup := ops.ne_reg_supersede_built(v_used, p_actor_id, '代表の仕入先');
+    update core.supplier_skus set is_primary = false where supplier_id = v_id and sku_id = any (v_used);
+    insert into core.supplier_skus (company_id, supplier_id, sku_id, is_primary, created_by_type, created_by_id)
+      select 1, v_to_id, u, true, 'human', p_actor_id from pg_catalog.unnest(v_used) u order by u
+      on conflict (supplier_id, sku_id) do update set is_primary = true;
+  end if;
+  update core.suppliers set active = false where supplier_id = v_id;
+  v_result := pg_catalog.jsonb_build_object('ok', true, 'code', v_code, 'active', false, 'reassigned', pg_catalog.to_jsonb(v_codes), 'reg_csv_superseded', v_sup -> 'superseded');
+  perform ops.close_reg_write(v_result, v_code);
+  return v_result;
+end $$;
+revoke all on function ops.deactivate_supplier(uuid, text, text, jsonb, text, text) from public;
 
 -- 仕入先: 物理の削除は「同じコード (正規化の後) の行がほかにある = 二重を寄せる (core.merge_duplicate_suppliers)」ときだけ。止めるのは active = false
 -- 取引停止 (active → false) は、代表の仕入先に使っている間は拒む (同じ取引で付け替えた後なら通る)
@@ -1452,6 +1899,181 @@ begin
   return new;
 end $$;
 create trigger trg_supplier_skus_primary_registered before insert or update of is_primary on core.supplier_skus for each row execute function core.guard_primary_supplier_registered();
+
+-- ═══════════ F. 新商品の NE 登録の CSV が出ている商品の NE に送る欄を、画面のロールの直接の書き込みで変えさせない (#1571 R1 High 3) ═══════════
+-- 保存 (sku_edit) の画面のロールの書き込みでも DB が拒む (lib/master-write.mjs の ops.ne_reg_guard_on_save を呼び忘れても): 生きている (作った・配った・申告した・一部違う)
+-- 新規登録の CSV の商品の、CSV に入る欄 = 単品の名前・取扱区分・売価・税率 (と、それを含むセットの CSV の税率)・代表 (親)・代表の仕入先・原価 / セットの名前・売価・税率・構成の依頼。
+-- 作っただけのファイルは、保存の流れが先に ops.ne_reg_guard_on_save で使わないにする (= ここでは残っていない)。夜間ロード・昇格 (持ち主のロール) は見ない
+create function ops.guard_reg_csv_live() returns trigger
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
+  v_tbl     text := tg_table_schema || '.' || tg_table_name;
+  v_old     jsonb;
+  v_new     jsonb;
+  v_row     jsonb;
+  v_skus    bigint[] := '{}';
+  v_kind    text;
+  v_cols    text[];
+  v_codes   text;
+begin
+  if v_db_user is distinct from 'master_edit' then return case when tg_op = 'DELETE' then old else new end; end if;
+  if tg_op in ('UPDATE', 'DELETE') then v_old := pg_catalog.to_jsonb(old); end if;
+  if tg_op in ('INSERT', 'UPDATE') then v_new := pg_catalog.to_jsonb(new); end if;
+  v_row := coalesce(v_new, v_old);
+  if v_tbl = 'core.skus' then
+    if tg_op = 'UPDATE' then
+      v_kind := v_new ->> 'sku_kind';
+      v_cols := case when v_kind = 'set' then array['name', 'standard_price_jpy', 'tax_rate', 'tax_class'] else array['name', 'handling', 'standard_price_jpy', 'tax_rate', 'tax_class'] end;
+      if exists (select 1 from pg_catalog.unnest(v_cols) c where (v_old -> c) is distinct from (v_new -> c)) then
+        v_skus := array[(v_new ->> 'sku_id')::bigint];
+        if v_kind = 'single' and ((v_old -> 'tax_rate') is distinct from (v_new -> 'tax_rate') or (v_old -> 'tax_class') is distinct from (v_new -> 'tax_class')) then
+          v_skus := v_skus || coalesce((select pg_catalog.array_agg(c.parent_sku_id) from core.sku_components c where c.child_sku_id = (v_new ->> 'sku_id')::bigint), '{}')
+                           || coalesce((select pg_catalog.array_agg(q.set_sku_id) from ops.sku_component_requests q, pg_catalog.jsonb_array_elements(q.rows) e
+                                         where q.status = 'open' and (e ->> 'sku_id')::bigint = (v_new ->> 'sku_id')::bigint), '{}');
+        end if;
+      end if;
+    end if;
+  elsif v_tbl = 'core.products' then
+    if tg_op = 'UPDATE' and (v_old -> 'parent_product_id') is distinct from (v_new -> 'parent_product_id') then
+      select coalesce(pg_catalog.array_agg(k.sku_id), '{}') into v_skus from core.skus k where k.product_id = (v_new ->> 'product_id')::bigint;
+    end if;
+  elsif v_tbl = 'core.supplier_skus' then
+    if coalesce((v_old ->> 'is_primary')::boolean, false) or coalesce((v_new ->> 'is_primary')::boolean, false) then
+      if tg_op <> 'UPDATE' or (v_old -> 'is_primary') is distinct from (v_new -> 'is_primary') or (v_old -> 'supplier_id') is distinct from (v_new -> 'supplier_id') then
+        v_skus := array[(v_row ->> 'sku_id')::bigint];
+      end if;
+    end if;
+  elsif v_tbl = 'core.sku_costs' then
+    if exists (select 1 from core.skus k where k.sku_id = (v_row ->> 'sku_id')::bigint and k.sku_kind = 'single') then v_skus := array[(v_row ->> 'sku_id')::bigint]; end if;
+  elsif v_tbl = 'ops.sku_component_requests' then
+    v_skus := array[(v_row ->> 'set_sku_id')::bigint];
+  end if;
+  if pg_catalog.cardinality(v_skus) > 0 then
+    select pg_catalog.string_agg(distinct s.code, '・') into v_codes
+      from ops.ne_reg_export_items i join core.skus s on s.sku_id = i.sku_id
+     where i.sku_id = any (v_skus) and i.state in ('built', 'issued', 'import_declared', 'partial');
+    if v_codes is not null then
+      raise exception 'reg_csv_issued: 新商品の NE 登録の CSV が出ている商品 (%) の NE に送る欄は直せない (先にそのファイルを使わないにする・%)', v_codes, v_tbl using errcode = '42501';
+    end if;
+  end if;
+  return case when tg_op = 'DELETE' then old else new end;
+end $$;
+revoke all on function ops.guard_reg_csv_live() from public;
+create trigger trg_reg_csv_live before update on core.skus for each row execute function ops.guard_reg_csv_live();
+create trigger trg_reg_csv_live before update on core.products for each row execute function ops.guard_reg_csv_live();
+create trigger trg_reg_csv_live before insert or update or delete on core.supplier_skus for each row execute function ops.guard_reg_csv_live();
+create trigger trg_reg_csv_live before insert or update or delete on core.sku_costs for each row execute function ops.guard_reg_csv_live();
+create trigger trg_reg_csv_live before insert or update on ops.sku_component_requests for each row execute function ops.guard_reg_csv_live();
+
+-- ═══════════ G. NE のセットの構成の観測を集合で書く (0051 の ops.record_ne_set_observations を置き換える・#1571 Codex R1 Medium 2) ═══════════
+-- 契約は 0051 と同じ (回の形・観測の時刻の幅・完全な回の決まり・厳密な整数・並び 1〜N・100 行まで・完全な回は知らない / 重なる構成品を拒む・
+--   完全でない回は残せないセットを飛ばして数える・同じ回 = 中身が同じなら何もしない・違えば拒む・残すセットの SKU ごとの鍵を sku_id の順に)。
+-- 変えたのは書き方だけ: セットごとのループ・配列の足し込み (セットの数の 2 乗) をやめ、
+--   セット = jsonb_array_elements with ordinality → core.skus に 1 回 join (重なるセット = 窓関数) /
+--   行 = jsonb_array_elements を 1 回展開 → 構成品の core.skus に 1 回 join → セットごとに group by で形を確かめる /
+--   鍵 = sku_id の順の FOR ループだけ / 観測 = INSERT … SELECT … jsonb_agg の 1 文
+-- 🚨 security definer (呼ぶロールに表の書き込みの権限を渡さない)。一時の表を使わない (中間は jsonb の 1 つの値)・search_path の最後に pg_temp
+create or replace function ops.record_ne_set_observations(p jsonb) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, ops, core, pg_temp as $$
+declare
+  v_run      text := p ->> 'run_id';
+  v_complete boolean;
+  v_at       timestamptz;
+  v_hash     text;
+  v_prev     text;
+  v_sets     jsonb;   -- [{ ord, set_code, sku_id, rows, bad }] (セットの並び)
+  v_bad      text;
+  v_saved    integer;
+  v_skip     integer;
+  x          bigint;
+begin
+  if v_run is null or v_run !~ '^[A-Za-z0-9_.:-]{1,80}$' then raise exception 'invalid_input: run_id の形が違う: %', v_run using errcode = '22023'; end if;
+  if not ops.cutover_is_ts(p ->> 'observed_at') then raise exception 'invalid_input: observed_at が読めない' using errcode = '22023'; end if;
+  v_at := (p ->> 'observed_at')::timestamptz;
+  if v_at > clock_timestamp() + interval '5 minutes' then raise exception 'invalid_input: observed_at が未来' using errcode = '22023'; end if;
+  if v_at < clock_timestamp() - interval '36 hours' then raise exception 'invalid_input: observed_at が古すぎる (36 時間より前)' using errcode = '22023'; end if;
+  if jsonb_typeof(p -> 'complete') is distinct from 'boolean' then raise exception 'invalid_input: complete (true / false) が要る' using errcode = '22023'; end if;
+  v_complete := (p ->> 'complete')::boolean;
+  if jsonb_typeof(p -> 'sets') is distinct from 'array' then raise exception 'invalid_input: sets が配列でない' using errcode = '22023'; end if;
+  if (p -> 'requested' is not null and jsonb_typeof(p -> 'requested') <> 'null' and not ops.ne_obs_int_ok(p -> 'requested', 0, 1000000))
+     or (p -> 'fetched' is not null and jsonb_typeof(p -> 'fetched') <> 'null' and not ops.ne_obs_int_ok(p -> 'fetched', 0, 1000000)) then
+    raise exception 'invalid_input: requested・fetched は 0〜1,000,000 の整数' using errcode = '22023';
+  end if;
+  if v_complete then
+    if not ops.ne_obs_int_ok(p -> 'requested', 0, 1000000) or not ops.ne_obs_int_ok(p -> 'fetched', 0, 1000000)
+       or (p ->> 'requested')::integer <> jsonb_array_length(p -> 'sets') or (p ->> 'fetched')::integer <> jsonb_array_length(p -> 'sets') then
+      raise exception 'invalid_input: 完全な回は requested = fetched = sets の数 が要る' using errcode = '22023';
+    end if;
+    if coalesce(p ->> 'raw_hash', '') !~ '^[0-9a-f]{64}$' or coalesce(length(p ->> 'source_generation'), 0) = 0 then
+      raise exception 'invalid_input: 完全な回は raw_hash (原本のハッシュ) と source_generation (取得の世代) が要る' using errcode = '22023';
+    end if;
+  end if;
+  v_hash := md5(p::text);
+  perform pg_advisory_xact_lock(hashtext('ops.ne_set_observations:' || v_run));
+  select content_hash into v_prev from ops.ne_set_observation_runs where run_id = v_run;
+  if found then
+    if v_prev = v_hash then return jsonb_build_object('state', 'unchanged', 'run_id', v_run); end if;
+    raise exception 'run_conflict: 同じ回 % の中身が違う', v_run using errcode = '23505';
+  end if;
+  -- セットごとの確かめを集合で 1 回 (理由の順は 0051 と同じ: 知らない / セットでない → 重なるセット → 行の形 → 並び → (完全な回) 重なる構成品・知らない構成品)
+  with s as (
+    select t.ord::integer as ord, t.x ->> 'set_code' as set_code, t.x -> 'rows' as rows
+      from jsonb_array_elements(p -> 'sets') with ordinality as t(x, ord)),
+  k as (
+    select s.*, sk.sku_id, min(s.ord) over (partition by sk.sku_id) as first_ord
+      from s left join core.skus sk on sk.code_norm = core.norm_code(s.set_code) and sk.sku_kind = 'set'),
+  r as (
+    select k.ord, e.x,
+           (jsonb_typeof(e.x) = 'object' and coalesce(length(e.x ->> 'code'), 0) > 0
+            and ops.ne_obs_int_ok(e.x -> 'qty', 1, 99999) and ops.ne_obs_int_ok(e.x -> 'sort', 1, 100)) as shape_ok,
+           case when jsonb_typeof(e.x) = 'object' then core.norm_code(e.x ->> 'code') end as cnorm
+      from k cross join lateral jsonb_array_elements(case when jsonb_typeof(k.rows) = 'array' and jsonb_array_length(k.rows) <= 100 then k.rows else '[]'::jsonb end) as e(x)
+     where k.sku_id is not null and k.ord = k.first_ord),
+  a as (
+    select r.ord, count(*) as n, bool_and(r.shape_ok) as shape_ok,
+           count(distinct case when r.shape_ok then (r.x ->> 'sort')::integer end) as n_sort,
+           max(case when r.shape_ok then (r.x ->> 'sort')::integer end) as max_sort,
+           count(distinct r.cnorm) as n_code, bool_and(c.sku_id is not null) as all_known
+      from r left join core.skus c on c.code_norm = r.cnorm
+     group by r.ord)
+  select coalesce(jsonb_agg(jsonb_build_object('ord', k.ord, 'set_code', k.set_code, 'sku_id', k.sku_id, 'rows', k.rows, 'bad',
+           case when k.sku_id is null then format('知らないセット・セットでない %s', k.set_code)
+                when k.ord <> k.first_ord then format('同じセットが 2 回 %s', k.set_code)
+                when jsonb_typeof(k.rows) is distinct from 'array' then format('行が配列でない %s', k.set_code)
+                when jsonb_array_length(k.rows) > 100 then format('行が 100 より多い %s', k.set_code)
+                when not coalesce(a.shape_ok, true) then format('行の形が違う (code・qty = 1〜99,999 の整数・sort = 1 以上の整数) %s', k.set_code)
+                when coalesce(a.n_sort, 0) <> coalesce(a.n, 0) or coalesce(a.max_sort, 0) <> coalesce(a.n, 0) then format('並び (sort) が 1〜行の数になっていない %s', k.set_code)
+                when v_complete and (coalesce(a.n_code, 0) <> coalesce(a.n, 0) or not coalesce(a.all_known, true)) then format('構成品・並びが重なる / 知らない構成品 %s', k.set_code)
+           end) order by k.ord), '[]'::jsonb)
+    into v_sets
+    from k left join a on a.ord = k.ord;
+  select min(e ->> 'bad') filter (where (e ->> 'ord')::integer = (select min((y ->> 'ord')::integer) from jsonb_array_elements(v_sets) y where y ->> 'bad' is not null)),
+         count(*) filter (where e ->> 'bad' is null), count(*) filter (where e ->> 'bad' is not null)
+    into v_bad, v_saved, v_skip
+    from jsonb_array_elements(v_sets) e;
+  if v_complete and v_bad is not null then raise exception 'invalid_input: 完全な回に残せないセットがある: %', v_bad using errcode = '22023'; end if;
+  -- 残すセットの SKU ごとの鍵 (sku_id の小さい順。昇格と同じ鍵 = 古い観測の昇格と並ぶ・#1563 R3 M4)
+  for x in select distinct (e ->> 'sku_id')::bigint as id from jsonb_array_elements(v_sets) e where e ->> 'bad' is null order by 1 loop
+    perform pg_advisory_xact_lock(hashtextextended('core.sku:' || x::text, 0));
+  end loop;
+  insert into ops.ne_set_observation_runs (run_id, observed_at, complete, requested_count, fetched_count, saved_count, skipped_count, raw_hash, source_generation, content_hash)
+    values (v_run, v_at, v_complete, (p ->> 'requested')::integer, (p ->> 'fetched')::integer, v_saved, v_skip,
+            nullif(p ->> 'raw_hash', ''), nullif(p ->> 'source_generation', ''), v_hash);
+  insert into ops.ne_set_observations (run_id, set_sku_id, rows)
+    select v_run, o.sku_id, o.rows
+      from (select (e ->> 'ord')::integer as ord, (e ->> 'sku_id')::bigint as sku_id,
+                   coalesce(jsonb_agg(jsonb_build_object('sku_id', c.sku_id, 'code', rr.x ->> 'code', 'qty', (rr.x ->> 'qty')::integer, 'sort', (rr.x ->> 'sort')::integer)
+                                      order by (rr.x ->> 'sort')::integer, rr.x ->> 'code') filter (where rr.x is not null), '[]'::jsonb) as rows
+              from jsonb_array_elements(v_sets) e
+              left join lateral jsonb_array_elements(e -> 'rows') as rr(x) on true
+              left join core.skus c on c.code_norm = core.norm_code(rr.x ->> 'code')
+             where e ->> 'bad' is null
+             group by 1, 2) o
+     order by o.ord;
+  return jsonb_build_object('state', 'written', 'run_id', v_run, 'sets', v_saved, 'skipped', v_skip);
+end $$;
+revoke all on function ops.record_ne_set_observations(jsonb) from public;
 
 -- 見張りは読むだけ・照合は確かめの関数だけ。画面・運用のロールの権限は scripts/company-db/create-master-edit-roles.mjs (migration の後に流し直す)
 do $$ begin

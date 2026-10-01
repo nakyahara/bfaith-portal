@@ -869,7 +869,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   const neCodes = resolveNeCodes(ne.spellings);
   out.ne_codes = neCodes.ok ? { state: 'resolved', counts: Object.fromEntries(['ok', 'collided', 'invalid'].map((s) => [s, neCodes.entries.filter((e) => e.state === s).length])) }
     : { state: 'unavailable', reason: neCodes.reason };
-  // 新商品の NE 登録の CSV (0052・契約 v3 H5): 同じ完全な取得の中の、確かめ待ちの商品の NE の値 (書くのは run.mjs が判断の台帳の後に)
+  // 新商品の NE 登録の CSV (0053・契約 v3 H5): 同じ完全な取得の中の、確かめ待ちの商品の NE の値 (書くのは run.mjs が判断の台帳の後に)
   const regObs = Array.isArray(regTargets) ? registrationObservations(nm, regTargets, {
     collided: collidedNorms, intBlocked, absenceTrusted: !absenceUntrusted && !componentsUntrusted, productsAt: marks.products.at, setsAt: marks.sets.at,
     // 取得の世代 (#1571 Codex R1 High 2): 材料の世代・NE の完全な取得の版・原本のハッシュ (材料の中身のハッシュと版から)

@@ -15,7 +15,7 @@ import { latestRun } from '../master-decisions/decide.mjs';
 import { readCardEvent } from '../../lib/product-hub-outbox.mjs';
 import { regItemsOfSku } from '../../lib/master-reg-csv.mjs';
 
-/** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0052) */
+/** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0053) */
 async function selectableSuppliers(db) {
   const hasReg = await regclass(db, 'ops.supplier_registrations');
   return (await db.query(`select s.code, s.name from core.suppliers s where s.company_id = $1 and s.active

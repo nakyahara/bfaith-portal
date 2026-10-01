@@ -46,7 +46,7 @@
     <% if (c.registration && c.registration.state === 'draft') { %><div class="band info">下書きです (新商品の登録)。NE・ロジザードへの登録はまだです。値はこの画面で直せます。</div><% } %>
     <% if (c.registration && c.registration.state === 'quarantined') { %><div class="band warn">要確認: 切替の後に夜間の処理が NE で見つけた、登録の記録の無い商品です。業務ではまだ使えません。</div><% } %>
     <% if ((c.registration && ['draft', 'ne_pending'].includes(c.registration.state)) || page.regItems.length) { %>
-      <%# 新商品の NE 登録の CSV (0052)。配った後は NE に送る欄を直せない %>
+      <%# 新商品の NE 登録の CSV (0053)。配った後は NE に送る欄を直せない %>
       <div class="sec"><h3>NE 登録の CSV</h3>
         <% if (!page.regItems.length) { %><div class="sub">まだ作っていません。</div><% } %>
         <% for (const i of page.regItems) { %><div class="fl"><span>ファイル #<%= i.export_id %><%= i.trial ? ' 【試し用】' : '' %></span><span class="tag<%= ['verified', 'failed', 'superseded'].includes(i.state) ? ' gray' : '' %>"><%= REG_ITEM_STATES[i.state] || i.state %></span>

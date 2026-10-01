@@ -29,7 +29,7 @@
     <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
     <% if (closed) { %><div class="band warn">いまは使えません (<%= closedWhy %>)。見るだけです。</div><% } %>
     <% if (!canApprove) { %><div class="band info"><%= approveMessage %></div><% } %>
-    <% if (S && !S.applied) { %><div class="band warn">NE 登録の CSV の表 (migration 0052) がまだ入っていません。</div><% } %>
+    <% if (S && !S.applied) { %><div class="band warn">NE 登録の CSV の表 (migration 0053) がまだ入っていません。</div><% } %>
     <% if (S && S.applied) { %>
     <div class="me-box"><p class="hint">
       新商品 (下書き) を NE の「商品一括登録」で取り込む CSV にします。<b>作る → 配る (ダウンロード) → NE で取り込む → 取り込んだと申告 → 翌朝の照合で NE 確認済み</b>。

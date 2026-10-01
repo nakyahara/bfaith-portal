@@ -1,9 +1,10 @@
 /**
- * test-master-set-observation-perf-pg.mjs — 夜間ロードのセットの構成の観測 (apps/company-db/load/engine.mjs の recordSetObservations・0050 の ops.record_ne_set_observations) の
+ * test-master-set-observation-perf-pg.mjs — 夜間ロードのセットの構成の観測 (apps/company-db/load/engine.mjs の recordSetObservations・0051 の ops.record_ne_set_observations = 0053 で集合の形に置き換えた) の
  * 時間を実 PostgreSQL で測る (#1571 Codex R1 Medium 2)。セット 1,000 / 5,000 (構成品 3 つずつ・単品 300) の DB を作り、ロードを 2 回流す:
  *   1 回目 = 持ち主 load (ロードが構成を NE に合わせる。観測は書く・上げる候補は 0)
  *   2 回目 = 持ち主 company・1 割のセットの構成を変えた材料 (観測 + 上げる候補 = 1 割 + 候補ごとの昇格 = 切替の前なので before_cutover で戻る)
- * 出す時間: ロード全体・観測の関数 (record)・上げる候補の計算 (candidates)・昇格 (promotions)。上限を超えたら落とす (取引の中の観測 + 候補 = 1,000 で 10 秒・5,000 で 60 秒)
+ * 出す時間: ロード全体・観測の関数 (record)・上げる候補の計算 (candidates)・昇格 (promotions)。上限を超えたら落とす (取引の中の観測 + 候補 = 1,000 で 3 秒・5,000 で 10 秒 = 本番の statement_timeout 20 秒の半分。
+ *   0053 の前 (セットごとのループ = セットの数の 2 乗) は 5,000 で 30 秒前後・0053 の後は 1 秒前後 (#1571 R1 の ⑤-1 への頼み)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-set-observation-perf-pg.mjs [1000,5000]
  *   (この PC では C:/tmp/pg-embed の run-conc.mjs が使い捨ての PostgreSQL を起動して TEST_PG_URL を渡す)
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す)。localhost 以外の URL は拒む。package.json の試験には入れない (時間がかかる・PostgreSQL が要る)
@@ -19,7 +20,7 @@ if (!url) { console.log('⏭️ TEST_PG_URL が無い (実 PostgreSQL の時間�
 const u0 = new URL(url);
 if (!['localhost', '127.0.0.1', '::1', '[::1]'].includes(u0.hostname)) { console.error('localhost 以外の PostgreSQL には流さない'); process.exit(2); }
 const SIZES = (process.argv[2] || '1000,5000').split(',').map(Number);
-const LIMIT_MS = { 1000: 10000, 5000: 60000 };
+const LIMIT_MS = { 1000: 3000, 5000: 10000 };
 const ALL_COMPANY = Object.fromEntries(Object.keys(MASTER_OWNERSHIP).map((k) => [k, 'company']));
 const SINGLES = 300;
 

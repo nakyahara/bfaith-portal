@@ -20,7 +20,7 @@
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
  *   POST /api/sku/:code/card-retry  カードの取り込みをもう一度 (名簿の人・衝突 / 失敗の知らせも試す)
  *   POST /api/sku/:code/card-link   衝突を解く = 既存のカード (同じ商品コード) をこの商品に結ぶ (名簿の人。PR #1566 R1 M6)
- *   NE 登録の CSV (⑤-2b・0052・lib/master-reg-csv.mjs。作る・配る・申告・使わない・実機の確かめは MASTER_DECISION_APPROVERS の名簿の人だけ = マスタの判断の CSV と同じ):
+ *   NE 登録の CSV (⑤-2b・0053・lib/master-reg-csv.mjs。作る・配る・申告・使わない・実機の確かめは MASTER_DECISION_APPROVERS の名簿の人だけ = マスタの判断の CSV と同じ):
  *   GET  /reg-csv                   画面
  *   GET  /api/reg-csv/summary       今日の照合の回・形の確かめ・候補と止まる理由・ファイル
  *   POST /api/reg-csv/exports       作る { kind: products | sets, codes: [...], request_id }
@@ -345,14 +345,14 @@ function regWrite(req, res, fn) {
   return withPgApi(res, async (db) => res.json({ ok: true, ...(await fn(db, actor, req.body || {}, opts)) }), 'write');
 }
 router.post('/api/reg-csv/exports', (req, res) => regWrite(req, res, (db, actor, b, o) => buildRegExport(db, { actor, kind: b.kind, codes: b.codes, requestId: b.request_id }, o)));
-router.post('/api/reg-csv/exports/:id/issue', (req, res) => regWrite(req, res, (db, actor, b, o) => issueRegExport(db, { actor, exportId: req.params.id }, o)));
+router.post('/api/reg-csv/exports/:id/issue', (req, res) => regWrite(req, res, (db, actor, b, o) => issueRegExport(db, { actor, exportId: req.params.id, requestId: b.request_id }, o)));
 router.post('/api/reg-csv/exports/:id/declare', (req, res) => regWrite(req, res, (db, actor, b, o) => declareRegExport(db, {
-  actor, exportId: req.params.id, sha256: b.sha256, result: b.result, neMessage: b.ne_message ?? null, importedAt: b.imported_at ?? null, note: b.note ?? null,
+  actor, exportId: req.params.id, sha256: b.sha256, result: b.result, neMessage: b.ne_message ?? null, importedAt: b.imported_at ?? null, note: b.note ?? null, requestId: b.request_id,
 }, o)));
 router.post('/api/reg-csv/exports/:id/supersede', (req, res) => regWrite(req, res, (db, actor, b, o) => supersedeRegExport(db, {
-  actor, exportId: req.params.id, reason: b.reason, correction: b.correction, confirm: b.confirm === true,
+  actor, exportId: req.params.id, reason: b.reason, correction: b.correction, confirm: b.confirm === true, requestId: b.request_id,
 }, o)));
-router.post('/api/reg-csv/verified', (req, res) => regWrite(req, res, (db, actor, b, o) => recordRegVerified(db, { actor, kind: b.kind, result: b.result, note: b.note ?? null, exportId: b.export_id ?? null }, o)));
+router.post('/api/reg-csv/verified', (req, res) => regWrite(req, res, (db, actor, b, o) => recordRegVerified(db, { actor, kind: b.kind, result: b.result, note: b.note ?? null, exportId: b.export_id ?? null, requestId: b.request_id }, o)));
 router.get('/api/reg-csv/exports/:id/file', (req, res) => {
   const gate = approverGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });

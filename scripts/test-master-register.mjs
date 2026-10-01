@@ -281,7 +281,7 @@ await ta('[S2b] 画面のロールは SKU・商品・カードの知らせを直
   assert.equal(await skuId('edit-direct'), undefined);
 });
 
-await ta('[S3] NE 登録待ち・NE 確認済みの根拠は 0052 (⑤-2b) の記録を関数が自分で読む (呼び手の根拠 = caller_evidence・記録が無い = no_evidence)・配る対象・利用可は ④ まで not_ready・一方向・やめる = 人の理由だけ (運用のロールも)', async () => {
+await ta('[S3] NE 登録待ち・NE 確認済みの根拠は 0053 (⑤-2b) の記録を関数が自分で読む (呼び手の根拠 = caller_evidence・記録が無い = no_evidence)・配る対象・利用可は ④ まで not_ready・一方向・やめる = 人の理由だけ (運用のロールも)', async () => {
   const d = await skuId('tx-1');
   await assert.rejects(() => transition(d, 'ne_pending', { evidence: { export_id: 7, sha256: SHA } }), /caller_evidence/);
   await assert.rejects(() => transition(d, 'ne_pending'), /no_evidence/);
