@@ -93,12 +93,30 @@ export function queueManualFile(db, dataDir, tsv, { fileName, format = null, now
 }
 
 /**
+ * 取り込めていない手のファイルに、人が解決の印を付ける (#1567 Codex R9 High)。付くまで (か同じ決済のより新しいファイルが入るまで) complete を止める。
+ *   🚨 coordinator の回が動いている間は付けない (積むときと同じ)。note (理由) は必ず。解決したファイルは次の回から取り込まない。戻り = { id }
+ */
+export function resolveManualFile(db, id, { note, now = new Date(), isAlive = isAliveNodeSince }) {
+  if (!note || !String(note).trim()) throw new Error('--note に理由が要る (なぜ諦める・どう直したか)');
+  return db.transaction(() => {
+    assertNoLiveCoverageLease(db, { isAlive, what: '手の決済のファイルの解決の印' });
+    const q = db.prepare(`SELECT id, ingested_at, resolved_at FROM amazon_settlement_manual_files WHERE id = ?`).get(id);
+    if (!q) throw new Error(`手の決済のファイル #${id} が無い`);
+    if (q.ingested_at) throw new Error(`手の決済のファイル #${id} は入っている (${q.ingested_at}) = 解決の印は要らない`);
+    if (q.resolved_at) throw new Error(`手の決済のファイル #${id} は解決済み (${q.resolved_at})`);
+    db.prepare(`UPDATE amazon_settlement_manual_files SET resolved_at = ?, resolve_note = ? WHERE id = ?`).run(now.toISOString(), String(note).slice(0, 300), id);
+    return { id };
+  }).immediate();
+}
+
+/**
  * coordinator の回の中で順番待ちのファイルを入れる (lease を渡す = 生の表の取引の中で確かめる)。
  * 戻り = [{ id, settlementId, status: 'ingested' | 'failed', note, documentVersionSeq }]
  */
 export function ingestQueuedManualFiles(db, { lease, generation = null, log = () => {}, now = null }) {
   const out = [];
-  for (const q of db.prepare(`SELECT * FROM amazon_settlement_manual_files WHERE ingested_at IS NULL ORDER BY id`).all()) {
+  // 解決の印の付いたファイル (人が諦めた) は入れない (#1567 Codex R9)。失敗したファイルは毎回読み直す (保管物を直せば次の回で入る)
+  for (const q of db.prepare(`SELECT * FROM amazon_settlement_manual_files WHERE ingested_at IS NULL AND resolved_at IS NULL ORDER BY id`).all()) {
     let status = 'failed', note = null, seq = null;
     try {
       const text = fs.readFileSync(q.stored_path, 'utf8');
@@ -127,20 +145,27 @@ const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process
 if (isDirectRun) {
   (async () => {
     const argv = process.argv.slice(2);
-    const a = { file: null, queue: false, list: false, format: null };
+    const a = { file: null, queue: false, list: false, format: null, resolve: null, note: null };
     for (let i = 0; i < argv.length; i++) {
       if (argv[i] === '--file') a.file = argv[++i];
       else if (argv[i] === '--queue') a.queue = true;
       else if (argv[i] === '--list') a.list = true;
       else if (argv[i] === '--format') a.format = argv[++i];
+      else if (argv[i] === '--resolve') { a.resolve = Number(argv[++i]); if (!Number.isInteger(a.resolve) || a.resolve < 1) throw new Error('--resolve は手のファイルの番号 (--list の #)'); }
+      else if (argv[i] === '--note') a.note = argv[++i];
       else throw new Error(`知らない引数: ${argv[i]}`);
     }
     if (!process.env.DATA_DIR) throw new Error('DATA_DIR が無い');
     const { initDB, getDB } = await import('./db.js');
     await initDB();
     const db = getDB();
+    if (a.resolve != null) {
+      const r = resolveManualFile(db, a.resolve, { note: a.note });
+      console.log(`[manual] ✅ 手の決済のファイル #${r.id} に解決の印を付けた (complete を止める理由から外れる・次の回から取り込まない)`);
+      return;
+    }
     if (a.list) {
-      for (const q of db.prepare(`SELECT * FROM amazon_settlement_manual_files ORDER BY id`).all()) console.log(`  #${q.id} 決済 ${q.settlement_id} ${q.format} ${q.file_name}: ${q.ingested_at ? `入れた ${q.ingested_at}` : '順番待ち'}${q.ingest_note ? ` (${q.ingest_note})` : ''}`);
+      for (const q of db.prepare(`SELECT * FROM amazon_settlement_manual_files ORDER BY id`).all()) console.log(`  #${q.id} 決済 ${q.settlement_id} ${q.format} ${q.file_name}: ${q.ingested_at ? `入れた ${q.ingested_at}` : q.resolved_at ? `解決の印 ${q.resolved_at} (${q.resolve_note})` : '順番待ち・取り込めていない = 入るか解決の印を付けるまで complete を止める'}${q.ingest_note ? ` (${q.ingest_note})` : ''}`);
       return;
     }
     if (!a.file) throw new Error('--file か --list');

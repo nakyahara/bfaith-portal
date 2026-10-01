@@ -266,8 +266,10 @@ export function createSettlementVersionSchema(db) {
     applied_generation INTEGER,                -- 入れた回の coverage の世代 (= coverage で回った証拠にもなる)
     marker_id          TEXT,
     evidence_epoch     INTEGER,
-    failed_at          TEXT,                   -- 入れられなかった (中身が積んだときと違う など) = 順番待ちから外す・朝の報告
-    apply_note         TEXT
+    failed_at          TEXT,                   -- 入れられなかった (中身が積んだときと違う など) = 順番待ちから外す・朝の報告。🚨 解決するまで complete を止める (#1567 Codex R9)
+    apply_note         TEXT,
+    resolved_at        TEXT,                   -- 人が解決の印を付けた (--resolve-failed・#1567 Codex R9 High)
+    resolve_note       TEXT
   )`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_initial_marker_queue_key ON initial_marker_queue(queue_key)`);
 
@@ -282,8 +284,12 @@ export function createSettlementVersionSchema(db) {
     queued_at      TEXT NOT NULL,
     ingested_at    TEXT,
     ingest_generation INTEGER,
-    ingest_note    TEXT
+    ingest_note    TEXT,
+    resolved_at    TEXT,                   -- 人が解決の印を付けた (取り込めないファイルを諦める・別の形で直した。--resolve・#1567 Codex R9 High)
+    resolve_note   TEXT
   )`);
+  // 失敗した順番待ちの解決の印 (#1567 Codex R9 High)。付くまで (かより新しいものが入るまで) complete を止める = amazon-finance-coverage.js の queueProblems
+  for (const t of ['initial_marker_queue', 'amazon_settlement_manual_files']) { addCol(t, 'resolved_at', 'TEXT'); addCol(t, 'resolve_note', 'TEXT'); }
 }
 
 // ─── source_revision・読み直す注文 ───

@@ -18,7 +18,8 @@
  *      1 つでも裏付けが無ければ complete にしない: その report が今回の証拠の一覧の窓の中 (見出しの end ≥ 窓の createdSince = 作成も窓の中) = not_in_inventory
  *      (❌・API の食い違い待ち = 次の回・retry で直りうる) / 窓より前・手のファイル = not_in_inventory_outside_window (⚠️ 人が直す = 二度と一覧に出ない
  *      → 印を作り直す。R4 Medium 1)。取込の一覧も証拠の一覧と同じ固定の窓 (fetch-amazon-settlements.js)
- *   ③ 初期の印 (最新の epoch) がある・verified_from ≤ 起点
+ *   ③ 初期の印 (最新の epoch) がある・verified_from ≤ 起点 / 失敗した・取り込めていない順番待ち (failed_at の初期の印・入っていない手のファイル) が無い
+ *      (より新しいものが入るか、人が解決の印を付けるまで止める = 永続の状態を毎回読む・queueProblems・#1567 Codex R9 High)
  *   ④ 一覧の鎖 = その epoch の成功した回 (最後のページまで・一覧 / 取込 / 記録の失敗なし・完了) を積み上げる:
  *      最初の回の窓 [createdSince, createdUntil] に印の captured_at が入る・印の verified_through が最初の回のデータの期間と重なる・
  *      続く回の窓が空白なく重なる (保持期間 85 日以上あかない)・最後の回 = 今回 (同じ世代・token)
@@ -48,7 +49,41 @@ export const HUMAN_REASONS = new Set([
   'header_currency_unverified', 'version_without_settlement', 'header_count', 'header_period_unreadable', 'header_period_reversed', 'header_settlement_mismatch',
   'line_settlement_mismatch', 'header_currency', 'line_currency', 'total_mismatch', 'origin_not_covered', 'report_blocked',
   'provisional_broken_version', 'version_unresolved_settlement', 'not_in_inventory_outside_window',
+  // 失敗した順番待ち (#1567 Codex R9 High) = 人が直す: 印は二度と入れ直されない・手のファイルは毎回読み直すが保管物が壊れていれば直らない (retry しても同じ)
+  'manual_file_not_ingested', 'marker_queue_failed',
 ]);
+
+const tableExistsIn = (db, name) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name);
+const hasCol = (db, t, c) => db.prepare(`PRAGMA table_info(${t})`).all().some((x) => x.name === c);
+/**
+ * 失敗した・取り込めていない順番待ち = complete を止める (永続の状態を毎回読む = 失敗した回を忘れない・#1567 Codex R9 High)。戻り = [{ code, detail }]
+ *   (a) manual_file_not_ingested = 取り込めていない手のファイル (読めない・保管物が無い・hash が違う・形が違う。順番待ちのまま (dry-run) も)。
+ *       外れる = 入った・同じ決済のより新しい手のファイルが入った・人が解決の印を付けた (amazon-settlement-manual-file.js --resolve <id> --note …)
+ *   (b) marker_queue_failed = failed_at の付いた初期の印 (積んだ後に中身が壊れた・digest が違う)。順番待ちから外れる = 二度と入れ直されない。
+ *       外れる = より新しい順番待ちの印が入った・人が解決の印を付けた (amazon-finance-initial-marker.js --resolve-failed <id> --note …)
+ */
+export function queueProblems(db) {
+  const out = [];
+  if (tableExistsIn(db, 'amazon_settlement_manual_files')) {
+    const resolved = hasCol(db, 'amazon_settlement_manual_files', 'resolved_at') ? 'AND m.resolved_at IS NULL' : '';
+    const rows = db.prepare(`SELECT m.id, m.settlement_id, m.file_name, m.ingest_note FROM amazon_settlement_manual_files m
+       WHERE m.ingested_at IS NULL ${resolved}
+         AND NOT EXISTS (SELECT 1 FROM amazon_settlement_manual_files n WHERE n.settlement_id = m.settlement_id AND n.id > m.id AND n.ingested_at IS NOT NULL)
+       ORDER BY m.id`).all();
+    if (rows.length) out.push({ code: 'manual_file_not_ingested', detail: `取り込めていない手の決済のファイル ${rows.length} (${rows.slice(0, 5).map((r) => `#${r.id} 決済 ${r.settlement_id}${r.ingest_note ? `: ${String(r.ingest_note).slice(0, 80)}` : ' (順番待ち)'}`).join(' / ')}) `
+      + '→ 正しいファイルを積み直す (同じ決済のより新しいファイルが入れば外れる) か、諦めるなら amazon-settlement-manual-file.js --resolve <id> --note "理由"' });
+  }
+  if (tableExistsIn(db, 'initial_marker_queue')) {
+    const resolved = hasCol(db, 'initial_marker_queue', 'resolved_at') ? 'AND q.resolved_at IS NULL' : '';
+    const rows = db.prepare(`SELECT q.id, q.failed_at, q.apply_note FROM initial_marker_queue q
+       WHERE q.failed_at IS NOT NULL ${resolved}
+         AND NOT EXISTS (SELECT 1 FROM initial_marker_queue n WHERE n.id > q.id AND n.applied_at IS NOT NULL)
+       ORDER BY q.id`).all();
+    if (rows.length) out.push({ code: 'marker_queue_failed', detail: `入れられなかった初期の印 ${rows.length} (${rows.slice(0, 5).map((r) => `#${r.id}: ${String(r.apply_note || '').slice(0, 80)}`).join(' / ')}) `
+      + '→ Seller Central の決済の一覧から印を作り直して積む (より新しい印が入れば外れる) か、諦めるなら amazon-finance-initial-marker.js --resolve-failed <id> --note "理由"' });
+  }
+  return out;
+}
 
 const utc = (s) => { const v = normalizeApiTime(s); return v && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(v) ? v : null; };
 const ms = (s) => Date.parse(s);
@@ -248,6 +283,9 @@ export function evaluateCoverage(db, { generation, runToken, policy, source, now
   }
   // 最後の守り: frontier が食い違うのに理由が 1 つも無い (上の数え方で拾えなかった) = complete にしない (fail-closed)
   if (origin && frontierAll && settlementsThrough !== frontierAll && !reasons.length) add('not_in_inventory', `裏付けのある決済だけの frontier (${settlementsThrough ?? '無し'}) が全部の採った見出しの frontier (${frontierAll}) と違う`);
+
+  // ── 失敗した・取り込めていない順番待ち (永続の状態・#1567 Codex R9 High) = 古い根拠のまま complete を出し直さない ──
+  for (const p of queueProblems(db)) add(p.code, p.detail);
 
   // ── receipt digest ──
   let rc = null;

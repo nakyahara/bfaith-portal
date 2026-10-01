@@ -158,6 +158,22 @@ export function queueMarker(db, norm, { sourceFileName = null, sourceFileHash, n
     return { queued: true, id: Number(r.lastInsertRowid) };
   }).immediate();
 }
+/**
+ * 入れられなかった (failed_at の付いた) 順番待ちの印に、人が解決の印を付ける (#1567 Codex R9 High)。付くまで (かより新しい印が入るまで) complete を止める。
+ *   🚨 coordinator の回が動いている間は付けない (積むときと同じ)。note (理由) は必ず。戻り = { id }
+ */
+export function resolveFailedMarker(db, id, { note, now = new Date(), isAlive = isAliveNodeSince }) {
+  if (!note || !String(note).trim()) throw new Error('--note に理由が要る (なぜ諦める・どう直したか)');
+  return db.transaction(() => {
+    assertNoLiveCoverageLease(db, { isAlive, what: '初期の印の解決の印' });
+    const q = db.prepare(`SELECT id, failed_at, resolved_at FROM initial_marker_queue WHERE id = ?`).get(id);
+    if (!q) throw new Error(`順番待ちの印 #${id} が無い`);
+    if (!q.failed_at) throw new Error(`順番待ちの印 #${id} は失敗していない (入れた・順番待ち) = 解決の印は要らない`);
+    if (q.resolved_at) throw new Error(`順番待ちの印 #${id} は解決済み (${q.resolved_at})`);
+    db.prepare(`UPDATE initial_marker_queue SET resolved_at = ?, resolve_note = ? WHERE id = ?`).run(now.toISOString(), String(note).slice(0, 300), id);
+    return { id };
+  }).immediate();
+}
 /** 順番待ちの印の数 (入れていない・失敗していない) */
 export const pendingMarkerCount = (db) => db.prepare(`SELECT COUNT(*) n FROM initial_marker_queue WHERE applied_at IS NULL AND failed_at IS NULL`).get().n;
 /** 最新の印 (id・epoch・digest。無ければ null) */
@@ -198,7 +214,7 @@ export function applyQueuedMarkers(db, { lease, generation, assertLease, log = (
 }
 
 export function parseArgs(argv) {
-  const out = { file: null, queue: false, list: false, verifiedFrom: null, verifiedThrough: null, capturedAt: null, evidenceKind: null, note: null };
+  const out = { file: null, queue: false, list: false, verifiedFrom: null, verifiedThrough: null, capturedAt: null, evidenceKind: null, note: null, resolveFailed: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const val = () => { const v = argv[++i]; if (v === undefined || String(v).startsWith('--')) throw new Error(`${a} に値が無い`); return v; };
@@ -206,6 +222,7 @@ export function parseArgs(argv) {
     else if (a === '--queue') out.queue = true;
     else if (a === '--commit') throw new Error('--commit は無くなった = --queue (順番待ちに積む・次の coordinator の回が updating の後に入れる。#1567 Codex R1 High 2)');
     else if (a === '--list') out.list = true;
+    else if (a === '--resolve-failed') { const v = Number(val()); if (!Number.isInteger(v) || v < 1) throw new Error('--resolve-failed は順番待ちの印の番号 (--list の #)'); out.resolveFailed = v; }
     else if (a === '--verified-from') out.verifiedFrom = val();
     else if (a === '--verified-through') out.verifiedThrough = val();
     else if (a === '--captured-at') out.capturedAt = val();
@@ -213,18 +230,23 @@ export function parseArgs(argv) {
     else if (a === '--note') out.note = val();
     else throw new Error(`知らない引数: ${a}`);
   }
-  if (!out.list && !out.file) throw new Error('--file か --list');
+  if (!out.list && !out.file && out.resolveFailed == null) throw new Error('--file か --list か --resolve-failed <番号> --note "理由"');
   return out;
 }
 
 /** CLI の本体 (試験から呼ぶ)。db = warehouse.db (書く接続) */
 export function runMarkerCli(db, a, { log = console.log, now = new Date(), isAlive = isAliveNodeSince } = {}) {
+  if (a.resolveFailed != null) {
+    const r = resolveFailedMarker(db, a.resolveFailed, { note: a.note, now, isAlive });
+    log(`[marker] ✅ 入れられなかった印 #${r.id} に解決の印を付けた (complete を止める理由から外れる。次の coordinator の回で判定)`);
+    return { resolved: r.id };
+  }
   if (a.list) {
     const hs = db.prepare(`SELECT * FROM initial_marker_headers ORDER BY evidence_epoch`).all();
     for (const h of hs) log(`  epoch ${h.evidence_epoch} ${h.marker_id}: [${h.verified_from}, ${h.verified_through}) 撮影 ${h.captured_at}・決済 ${h.settlement_count}・digest ${h.marker_digest.slice(0, 12)}…`);
     if (!hs.length) log('  印はまだ無い (coverage は complete にならない)');
     const qs = db.prepare(`SELECT * FROM initial_marker_queue ORDER BY id`).all();
-    for (const q of qs) log(`  順番待ち #${q.id} ${q.source_file_name || '-'}: ${q.applied_at ? `入れた ${q.applied_at} (${q.marker_id}・世代 ${q.applied_generation})` : q.failed_at ? `❌ 入れない (${q.apply_note})` : '順番待ち (次の coordinator の回)'}`);
+    for (const q of qs) log(`  順番待ち #${q.id} ${q.source_file_name || '-'}: ${q.applied_at ? `入れた ${q.applied_at} (${q.marker_id}・世代 ${q.applied_generation})` : q.failed_at ? `❌ 入れない (${q.apply_note})${q.resolved_at ? ` → 解決の印 ${q.resolved_at} (${q.resolve_note})` : ' = 解決するまで complete を止める'}` : '順番待ち (次の coordinator の回)'}`);
     return { markers: hs.length, queue: qs.length };
   }
   const raw = fs.readFileSync(a.file, 'utf8');
