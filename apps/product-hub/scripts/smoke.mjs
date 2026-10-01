@@ -10092,6 +10092,13 @@ for (const [name, file, data] of renders) {
         skuJans: {}, skuSelectorValues: {},
         imagePriorities: dbmod.IMAGE_PRIORITIES,
         materialStatuses: dbmod.MATERIAL_STATUSES,
+        // 📄 LP構成の仕様書の取り込みカード (段階1・PR1-e)。router は一覧画面に常に渡す。
+        // 既定 = 機能オン・いまの版あり (admin に出る形)。機能オフ・未取込の見え方は fixture 側で上書きする
+        lpSpec: {
+          enabled: true,
+          spec: { id: 3, title: 'LP制作システム.xlsx', imported_at: '2026-10-01T09:30:00Z', imported_by: 'smoke',
+                  hash_short: 'abc123def456', sheet_titles: ['LP制作システム', '出力形式'], chars: 12345 },
+        },
         // 🤖 構成をAIに作らせる (段階1・PR1-d)。router は詳細画面に常に渡す。
         // 既定 = 機能オン・仕様書あり・まだ依頼なし (押せる状態の見え方を既定にして、
         // 依頼中・できた・失敗の見え方は fixture 側で上書きする)
