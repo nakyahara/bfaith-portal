@@ -719,6 +719,8 @@ export function buildConsignPlan(db = getDB()) {
       // ⭐文字列のときだけ出す。作業仕様のスナップショットには {code, note} のような入れ子が入ることがあり、
       //   そのまま渡すと画面に [object Object] と出る (§AB-11 の 6 で外部向けに確かめたのと同じ用心)
       storage_container: textOf(m.storage_container),
+      // 資材は配列 (小分け袋を含む)。materialsOf が入れ子・壊れた値を落としてあるのでそのまま渡せる
+      materials: m.materials,
       material_code: textOf(m.material_code),
       hours: qty == null ? null : planHours(qty, m.process_count),
       missing: m.missing,

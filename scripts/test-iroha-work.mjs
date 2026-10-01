@@ -25,7 +25,7 @@ import path from 'path';
 await temporaryTestDataDir(import.meta.url, 'iroha-work-test-', { reuseProvided: true });
 
 // ⭐画面のキャッシュの版。画面を直した PR ではここだけ直す（以前は同じ文字列を 3 か所に書いていて、毎回 3 か所直していた）
-const SW_CACHE = 'iroha-work-shell-v23';
+const SW_CACHE = 'iroha-work-shell-v24';
 
 let pass = 0, fail = 0;
 function ok(cond, label) {
@@ -4235,7 +4235,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     'ボードのカードでも「途中まで進んでいる」が分かる');
   ok(/'units_per_container'\)/.test(html) && /'storage_container', 'container'/.test(html), '保管箱と入数は別々にタップできる (帯の data-reg が内側で勝つ)');
   // タップした項目だけ出す・ダイアログはスクロールできる・候補は正方形のタイル (中原さん 2026-09-03)
-  ok(/class="mvf" data-f="material_code"/.test(html) && /class="mvf" data-f="storage_container"/.test(html)
+  ok(/class="mvf" data-f="materials"/.test(html) && /class="mvf" data-f="storage_container"/.test(html)
     && /class="mvf" data-f="units_per_container"/.test(html) && /class="mvf" data-f="note"/.test(html), '登録・変更の項目はひとつずつ枠に入っている');
   ok(/el\.hidden = !!mvCtx\.field && el\.dataset\.f !== mvCtx\.field/.test(html), 'タップした項目だけ出す (他は隠す)');
   ok(/\$\('#mvTitle'\)\.textContent = mvCtx\.field/.test(html), '見出しにその項目の名前を出す');
@@ -8595,6 +8595,77 @@ console.log('\n[つかいかた] 📖 マニュアルと実装が食い違って
   const staffSecs = [...man.matchAll(/<section id="(s\d+)"([^>]*)>/g)].filter((m) => /class="staff"/.test(m[2])).map((m) => m[1]);
   ok(staffSecs.includes("s14") && staffSecs.includes("s15"),
     "⭐外部にあずける・分かれたカードの節は職員向けの印が付いている");
+}
+
+console.log('\n[資材 2 つ] 🧰 小分けの袋も登録できる (2026-10-01 中原さん: 10 個ずつ袋に入れる)');
+{
+  const vm = await import('node:vm');
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+
+  // ⭐画面の JS 全体の構文検査。1 つでも壊れると <script> ごと実行されず、ボタンが全部効かなくなる。
+  //   それでも 200 で描画されるのでサーバーのログには出ない (product-hub #1246 と同じ事故の予防)
+  for (const [name, text, isHtml] of [
+    ['index.html', html, true],
+    ['facility.html', fs.readFileSync(new URL('../apps/iroha-work/views/facility.html', import.meta.url), 'utf8'), true],
+    ['sw.js', fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8'), false],
+  ]) {
+    const blocks = isHtml
+      ? [...text.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].filter((m) => !/\bsrc\s*=/.test(m[1])).map((m) => m[2])
+      : [text];
+    let err = null;
+    blocks.forEach((code, i) => {
+      try { new vm.Script(code, { filename: `${name}#${i + 1}` }); } catch (e) { err = err || `${name}#${i + 1}: ${e.message}`; }
+    });
+    ok(blocks.length > 0 && !err, `${name} の JS に構文エラーが無い ${err || ''}`);
+  }
+
+  // 複数選択のふるまい (実物の関数を取り出して動かす)
+  const start = html.indexOf('const MAT_MAX = 2;');
+  const end = html.indexOf('// ── 作業のやり方の登録・修正', start);
+  ok(start > 0 && end > start, '(前提) 資材の選択のコードを取り出せる');
+  const fields = { mvMaterial: { value: '[]' }, mvMsg: { textContent: '' }, matPicked: { innerHTML: '' } };
+  const optKey = (s) => String(s == null ? '' : s).normalize('NFKC').replace(/\s+/g, ' ').trim().toUpperCase();
+  const api = new Function('document', 'esc', 'optKey', 'renderOpts', 'OPT_FIELD',
+    html.slice(start, end) + '; return { matList, matUse, matPer, matDrop, pickOptEl, MAT_MAX };')(
+    { getElementById: (id) => fields[id] || { value: '', textContent: '' } },
+    (s) => String(s == null ? '' : s), optKey, () => {}, { material: 'mvMaterial', container: 'mvContainer' });
+  const picked = () => JSON.parse(fields.mvMaterial.value);
+  const tap = (code) => api.pickOptEl({ dataset: { code } }, 'material');
+
+  tap('D-8');
+  ok(picked().length === 1 && picked()[0].code === 'D-8' && picked()[0].usage === 'normal', 'タップで資材を選べる');
+  tap('313ビニール袋');
+  ok(picked().length === 2, '2 つ目も選べる');
+  tap('ほかの袋');
+  ok(picked().length === 2 && /2 つまで/.test(fields.mvMsg.textContent), `${api.MAT_MAX} つを超えては選べない (理由も出す)`);
+  tap('ｄ－８');
+  ok(picked().length === 1 && picked()[0].code === '313ビニール袋',
+    'もう一度タップすると外れる (全角・小文字でも同じ資材とみなす)');
+  api.matUse(0, 1);
+  ok(picked()[0].usage === 'inner_pack', '小分け袋として使う に変えられる');
+  api.matPer(0, '10');
+  ok(picked()[0].units_per_pack === 10, '何個ずつ入れるかを入れられる');
+  api.matPer(0, '');
+  ok(picked()[0].units_per_pack === undefined, '空にすれば未登録に戻る (0 を入れない)');
+  api.matPer(0, '10');
+  api.matUse(0, 0);
+  ok(picked()[0].usage === 'normal' && picked()[0].units_per_pack === undefined,
+    '🚨ふつうに戻したら「何個ずつ」は消える (古い数が画面に残らない)');
+  api.matDrop(0);
+  ok(picked().length === 0, '「外す」で消せる');
+  tap('D-8'); tap('');
+  ok(picked().length === 0, '「なし」で全部外れる');
+
+  // 画面の組み立て (保存の形・詳細の見た目・不足申告)
+  ok(/materials: JSON\.stringify\(matOfMaster\(m\)\)/.test(html), '開いた時点の資材を JSON で持つ (差分だけ送る仕組みに乗せる)');
+  ok(/if \(f === 'materials'\) \{ try \{ fields\[f\] = JSON\.parse/.test(html), '保存するときは配列に戻して送る');
+  ok(/const MV_MAP = \{ materials: 'mvMaterial'/.test(html), '送る項目名は materials (サーバーの正本と同じ名前)');
+  ok(/matThings\(m\) \+/.test(html) && /inner \? '小分けの袋'/.test(html), '詳細では資材ごとにタイルを出す');
+  ok(/この袋に <b class="num">/.test(html) && /⚠ 何個ずつ入れるかが未登録/.test(html),
+    '小分け袋は「この袋に 10 個ずつ入れる」。未登録なら ⚠ を出す');
+  ok(/x\.usage === 'inner_pack' \? '小分けの袋 ' : '資材 '/.test(html), '足りない資材の申告も資材ごとに選べる');
+  const fac = fs.readFileSync(new URL('../apps/iroha-work/views/facility.html', import.meta.url), 'utf8');
+  ok(/Array\.isArray\(w\.materials\)/.test(fac) && /小分けの袋/.test(fac), '外部施設の画面にも資材が 2 つとも出る');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
