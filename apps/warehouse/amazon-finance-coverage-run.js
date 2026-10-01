@@ -11,10 +11,11 @@
  *   ① 版の無い行 (過去の行の版付けがまだ) があれば ❌ で止める = 重い版付け (約 440 万行) は流さない = 夜に手で migrate-settlement-document-versions.js --commit (#1567 Codex R1 Medium)。
  *      要約の古い版だけ作り直す (軽い)。新しく取り込む行の版は取込の取引の中で付く
  *   ② Company DB の mode を **生の表に書く前に** 決める (#1567 Codex R1 High 1):
- *      coverage = Render の status が読めた / ingest_only (取込だけ) = 財務のバックフィルの完了印が無い / legacy (今までの送り方・後で消す = 台帳 cdb-coverage-legacy-path) =
- *      Render に 0050 が無い (409 not_migrated) か受け口が無い (404 = PR #1561 がまだ deploy されていない)。
- *      🚨 ingest_only・legacy にするのは **coverage で一度も回ったことが無い** と台帳と warehouse.db の両方の証拠で言えるときだけ (coverageEverRan)。
- *      回ったことがあるのに updating にできない (台帳を失くした・Render が 0050 / #1561 の前に戻った) = Render に古い complete が残っているかもしれない = **取込も始めない** (❌)
+ *      coverage = Render の status が読めた / ingest_only (取込だけ) = 財務のバックフィルの完了印が無い。
+ *      🚨 ingest_only にするのは **coverage で一度も回ったことが無い** とローカル (台帳と warehouse.db の coverageEverRan) **と Render** (決済のそろいの status が 200 で
+ *      coverage = null) の両方で言えるときだけ (#1567 Codex R1 High 1・R8 High)。ローカルを切り替えの前に戻した・新しい DATA_DIR でも Render の行で分かる。Render を読めない = ❌。
+ *      🚨 Render の status が 404 / 409 not_migrated = Render が #1561 / 0050 の前に戻った疑い = ❌ (#1561・0050 は本番に入っている = 今までの送り方 (legacy) の保険は消した・R8 High)。
+ *      updating にできない = Render に古い complete が残っているかもしれない = **取込も始めない** (❌)
  *      🚨 Render を読めない (障害)・updating を送れない朝も **取込も始めない** (設計どおり = 生の表を書く前に無効にする)。決済のレポートは 90 日取れる = 翌朝 (か retry) に取り戻せる
  *   ③ (coverage) Render の今の世代を読み、台帳 (company-db-push.db) の世代を少なくともそこまで進め、新しい世代と token を **HTTP の前に台帳と lease に保存**
  *      → Render の coverage を updating (失敗なら取込を始めない = 生の表を書く前に無効にする。R16 H2)
@@ -52,8 +53,7 @@ import { ingestQueuedManualFiles } from './amazon-settlement-manual-file.js';
 import { applyQueuedMarkers, pendingMarkerCount, latestMarker } from './amazon-finance-initial-marker.js';
 import { evaluateCoverage, completionBlockers, policyOrigin } from './amazon-finance-coverage.js';
 import { isAliveNodeSince } from './retry-lock.js';
-import { coverageEverRan, COVERAGE_GENERATION_META } from './finance-coordinator-switch.js';
-import { amazonFinanceDailyArgs } from './amazon-finance-months.js';
+import { coverageEverRan, COVERAGE_GENERATION_META, renderCoverageEverRan } from './finance-coordinator-switch.js';
 import { openLedger } from '../company-db/push/ledger.mjs';
 import { pushAmazonFinance, FINANCE_KIND, META, retryStore, capacityFromEnv } from '../company-db/push/amazon-finance.mjs';
 import { FINANCE_MALL, FINANCE_SCOPE, FINANCE_SOURCE } from '../company-db/push/amazon-finance-transform.mjs';
@@ -104,9 +104,9 @@ export async function postCoverage(fetchImpl, { base, syncKey, body, sleep = def
 }
 
 /**
- * この環境が coverage で回ったことがあるか (404 を今までの送り方にしてよいかの判定・#1567 R2 Medium 3 / R3 L3)。
+ * この環境が coverage で回ったことがあるか (ローカルの証拠・取込だけの回にしてよいかの判定の片方 = もう片方は Render の決済のそろい。#1567 R2 Medium 3 / R3 L3 / R8)。
  *   証拠 = 台帳 (company-db-push.db) の coverage の世代 **か** warehouse.db の一覧の回・手のファイル・初期の印の順番待ちに coverage の世代がある
- *   (台帳を失くした後の fail-open を防ぐ。#1567 Codex R1 High 1 = ingest_only・legacy に入れてよいかもこれで決める)
+ *   (台帳を失くした後の fail-open を防ぐ。#1567 Codex R1 High 1)
  */
 //   本体はスイッチの部品 (finance-coordinator-switch.js) = 今までの 2 工程の入口の一方向の門 (#1567 Codex R6 High) と同じ証拠
 export { coverageEverRan };
@@ -117,7 +117,7 @@ const latestEpoch = (db) => db.prepare(`SELECT MAX(evidence_epoch) e FROM initia
 /**
  * 1 回を回す (main と試験から)。戻り = { exitCode, summary, mode, generation, ingest, push, coverage, reasons }
  * deps: dataDir・source ('v2' | 'v1')・dryRun・fetchImpl・base・syncKey・sp / inventorySp / downloadTsv (SP-API)・now・isAlive (lease の持ち主の判定)・log・
- *       capacity (容量の見張り・既定 = env)・chunkSize・sleep・businessDate (legacy の曜日)・hooks { afterUpdating(db), beforeComplete(db), beforeCompletePost(db) } (試験の差し込み口)
+ *       capacity (容量の見張り・既定 = env)・chunkSize・sleep・businessDate (使わない = 今までの送り方 (legacy) を消した #1567 Codex R8・呼び手の互換のため受ける)・hooks { afterUpdating(db), beforeComplete(db), beforeCompletePost(db) } (試験の差し込み口)
  */
 export async function runCoverage({
   dataDir, source = 'v2', dryRun = false, fetchImpl = fetch, base, syncKey, sp, inventorySp = null, downloadTsv = null, now = () => new Date(),
@@ -199,24 +199,26 @@ export async function runCoverage({
       return out;
     };
     let status = null;
+    if (!base || !syncKey) throw new Error('送り先 (RENDER_MIRROR_URL) か MIRROR_SYNC_KEY が無い');
     if (!backfilled) {
       if (everRan) return refuse('ledger_lost', '台帳 (company-db-push.db) に財務のバックフィルの完了印が無いのに、coverage で回った証拠 (台帳か warehouse.db の世代) がある = 台帳を失くした・取り替えた疑い → 台帳を戻すか、財務のバックフィル (--from/--to と --mark-backfilled) をやり直す');
+      // 🚨 取込だけの回も Render の決済のそろいを確かめる (#1567 Codex R8 High): ローカルに証拠が無くても (台帳・warehouse.db を切り替えの前に戻した・新しい DATA_DIR)
+      //   Render に coverage の行がある = ❌ / 読めない (網の失敗・404・401・409・5xx・形が違う) = 判定できない = ❌。200 で coverage = null のときだけ取込だけの回にする
+      let has;
+      try { has = await renderCoverageEverRan({ fetchImpl, base, syncKey, sleep }); }
+      catch (e) { return refuse('render_unreadable', `Render の決済のそろいを読めない (${String(e.message).slice(0, 200)}) = coverage で回ったことが無いと言えない (判定できない) → Render を確かめる (戻れば次の回・retry で動く)`); }
+      if (has) return refuse('render_has_coverage', 'Render の決済のそろいに coverage の行がある (coordinator が回ったことがある) のに、ローカル (台帳・warehouse.db) には財務のバックフィルの完了印も coverage の世代も無い = 台帳・warehouse.db を切り替えの前に戻した・新しい DATA_DIR を指した疑い → DATA_DIR と台帳を確かめる');
       out.mode = 'ingest_only';
     } else {
-      if (!base || !syncKey) throw new Error('送り先 (RENDER_MIRROR_URL) か MIRROR_SYNC_KEY が無い');
       try { status = await getJson(fetchImpl, `${base}${STATUS_PATH}`, syncKey, 'Render の決済のそろい', getOpts); out.mode = 'coverage'; }
-      // 409 not_migrated = 0050 がまだ / 404 = PR #1561 の受け口がまだ deploy されていない (順番がずれた保険) → 今までの送り方 (token なし)。
-      //   🚨 ただし coverage で一度も回っていないとき (台帳と warehouse.db の両方に世代が無い) だけ (#1567 R2 Medium 3・Codex R1 High 1)。
-      //   回った後の 409 / 404 = Render が 0050 / #1561 の前に戻った疑い = 送ると fail-open・取り込むと古い complete が残る → 取込もしない (❌)
+      // 🚨 409 not_migrated = Render の DB が 0050 の前に戻った疑い / 404 = Render が #1561 の前のコードに戻った疑い = どちらも ❌ (今までの送り方には落ちない)。
+      //   #1561・0050 は本番に入っている = deploy の順番の保険 (legacy) は消した (#1567 Codex R8 High)。送ると complete が落ちない = fail-open・取り込むと古い complete が残る
       catch (e) {
         const m409 = /HTTP 409/.test(e.message) && /not_migrated/.test(e.message), m404 = /HTTP 404/.test(e.message);
         if (!m409 && !m404) throw e;
-        if (everRan) {
-          return m409
-            ? refuse('render_not_migrated', 'Render の決済のそろいが 409 not_migrated (0050 が無い) なのに、この環境は coverage で回ったことがある = Render の DB が 0050 の前に戻った疑い → Render の DB を確かめる')
-            : refuse('render_404', 'Render の決済のそろいの受け口が 404 なのに、この環境は coverage で回ったことがある = Render が #1561 の前のコードに戻った疑い (送ると complete が落ちない = fail-open) → Render の版を確かめる');
-        }
-        out.mode = 'legacy';
+        return m409
+          ? refuse('render_not_migrated', 'Render の決済のそろいが 409 not_migrated (0050 が無い) = Render の DB が 0050 の前に戻った疑い → Render の DB を確かめる')
+          : refuse('render_404', 'Render の決済のそろいの受け口が 404 = Render が #1561 の前のコードに戻った疑い (送ると complete が落ちない = fail-open) → Render の版を確かめる');
       }
     }
     log(`[coverage] mode = ${out.mode}`);
@@ -277,14 +279,14 @@ export async function runCoverage({
     }
     const cap = capacity === undefined ? capacityFromEnv() : capacity;
     if (!(cap && cap.limitBytes > 0)) throw new Error('容量の上限 (CDB_DB_LIMIT_BYTES) が無い = D-W5 (Render の Postgres のプラン) を決めるまで送らない');
-    const pushMode = out.mode === 'coverage' ? 'full' : amazonFinanceDailyArgs(businessDate)[0].replace(/^--/, '');
+    const pushMode = 'full';   // ここに来るのは coverage の回だけ (取込だけの回は上で終わる・今までの送り方 (legacy) は消した = #1567 Codex R8 High)
     const w = openReader();
     let r;
     try {
       r = await pushAmazonFinance({
         warehouse: w, ledger, base, syncKey, mode: pushMode, fetchImpl, log, now, capacity: cap, chunkSize, sleep,
         dirty: { clear: (nos, rev) => V.clearDirtyOrders(db, nos, rev, { check }) },
-        coverage: out.mode === 'coverage' ? coverageHooks({ db, lease, generation, policy, fetchImpl, base, syncKey, sleep, log, now, hooks, check }) : null,
+        coverage: coverageHooks({ db, lease, generation, policy, fetchImpl, base, syncKey, sleep, log, now, hooks, check }),
       });
     } finally { w.close(); }
     out.push = r;
@@ -298,11 +300,6 @@ export async function runCoverage({
     const pushPart = `財務 push (${pushMode}): 変わった ${r.changed} 注文 (applied ${r.applied} / same ${r.same} / stale ${r.stale} / failed ${r.failed.length} / 整形できない ${r.transformErrors.length})・読み直す注文 ${f.dirtyOrders ?? 0} (消した ${f.dirtyCleared ?? 0})`;
     const pushWarn = (f.unmapped && f.unmapped.rows) || r.ledgerReset || r.ledgerRebuilt;
     out.financePushed = true;
-    if (out.mode === 'legacy') {
-      out.exitCode = r.ok ? 0 : 1;
-      out.summary = `${r.ok ? '⚠️' : '❌'} Amazon 決済と財務: ${ingestPart} | ${pushPart} | coverage: Render に 0050 が無い = coverage を送らない (今までの送り方)${warnPart}`;
-      return out;
-    }
     const cov = f.coverage || { complete: false, reasons: [{ code: 'no_finalize', detail: '完成の判定まで進まなかった', human: false }] };
     out.coverage = cov;
     out.reasons = cov.reasons || [];

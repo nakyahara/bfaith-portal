@@ -10,7 +10,7 @@
  *     最後の chunk の送信中に生の行を変える / 同じ report ID で file hash が変わる = 採る版が変わる → 旧い版にだけある注文は墓石・別の決済に残る注文は残る /
  *     一覧の欠け (一覧にあるのに取り込めていない) / CANCELLED / 期間の分からない report / 一覧が最後のページまで取れない /
  *     lease: 生きている持ち主からは奪わない・死んだら奪う・回の途中で lease を置き換えられた = 古い token の子は書けない /
- *     complete の応答だけ失われた = 同じ中身の再送が same / 窓の空白 (保持期間以上あいた) = ⚠️ / Render に 0050 が無い = 今までの送り方 /
+ *     complete の応答だけ失われた = 同じ中身の再送が same / 窓の空白 (保持期間以上あいた) = ⚠️ / Render の status が 404・409 = いつも ❌ (今までの送り方は消した・R8) /
  *     coordinator を通らない単独の送り手 (token の無い chunk) = Render は complete を無効にする / 完成の判定の単体 /
  *     (#1567 Codex R1) coverage で回った後の 404・409・台帳を失くした・updating の失敗 = 取込もしない / 初期の印は順番待ち → updating の後に入る・
  *     manifest の後に印が積まれた・直接変わった = complete にしない / 版の無い過去の行 = coordinator は版付けを流さず ❌ /
@@ -163,7 +163,7 @@ console.log('① 取込だけ (Company DB の財務のバックフィルの完�
 await t('完了印の前 = 取込だけ・Render に触れない・最後の行に「財務 push: ⏭️」(exit 0)', async () => {
   const f = spyFetch();
   const r = await run({ fetchImpl: f });
-  assert.equal(r.exitCode, 0, r.summary); assert.equal(r.mode, 'ingest_only');
+  assert.equal(r.exitCode, 0, r.summary); assert.equal(r.mode, 'ingest_only');   // 対照 (#1567 Codex R8): ローカルにも Render (200・coverage = null) にも行が無い = 取込だけで動く
   assert.match(r.summary, /^✅ Amazon 決済と財務: .*財務 push: ⏭️/);
   assert.equal(f.calls.updating + f.calls.chunks, 0);
   assert.equal(await cov(), null);
@@ -514,15 +514,19 @@ function hideEvidence() {
     for (const s of saved) { const u = db.prepare(`UPDATE ${s.tb} SET ${s.c} = ? WHERE id = ?`); for (const x of s.rows) u.run(x.g, x.id); }
   };
 }
-await t('🚨 Render の status が 404 / 409 not_migrated で、coverage で回ったことがある = **取込も** 送信もしない ❌ (台帳の世代を失くしても warehouse.db の証拠で) / 一度も回っていない (台帳と warehouse.db の両方に証拠が無い) = 今までの送り方 (#1567 Codex R1 High 1・R2 Medium 3・R3 L3)', async () => {
+/** SP-API・ダウンロードを数える (取込が始まらないことを見る) */
+const countingSp = () => { const c = { sp: 0, dl: 0 }; return { c, sp: { callAPI: async (req) => { c.sp++; return sp.callAPI(req); } }, downloadTsv: async (id) => { c.dl++; return downloadTsv(id); } }; };
+await t('🚨 Render の status が 404 / 409 not_migrated (Render が #1561 / 0050 の前に戻った疑い) = いつも **取込も** 送信もしない ❌ = coverage で回ったことがあっても・台帳の世代を失くしても・ローカルの証拠が全部無くても (今までの送り方 (legacy) は消した・#1567 Codex R1 High 1・R2 Medium 3・R3 L3・R8 High)', async () => {
   assert.ok(ledgerMeta('coverage_generation'), '前提: この台帳は coverage で回ったことがある');
   const refused = async (statusOverride, mode) => {
     const b = writeState();
     const f = spyFetch({ statusOverride });
-    const r = await run({ fetchImpl: f });
+    const k = countingSp();
+    const r = await run({ fetchImpl: f, sp: k.sp, inventorySp: k.sp, downloadTsv: k.downloadTsv });
     assert.equal(r.mode, mode, r.summary); assert.equal(r.exitCode, 1, r.summary);
     assert.match(r.summary, /^❌ .*取込も送信もしない/);
     assert.equal(r.ingest, null, '取込もしない');
+    assert.deepEqual([k.c.sp, k.c.dl], [0, 0], 'SP-API の一覧もダウンロードも始めない');
     assert.deepEqual(writeState(), b, '生の表・一覧の回は変わらない');
     assert.equal(f.calls.chunks + f.calls.updating + f.calls.complete, 0, '送らない (fail-open にしない)');
   };
@@ -532,17 +536,13 @@ await t('🚨 Render の status が 404 / 409 not_migrated で、coverage で回
   const g0 = ledgerMeta('coverage_generation');
   setLedgerMeta('coverage_generation', null);
   try { await refused(S404, 'render_404'); await refused(S409, 'render_not_migrated'); } finally { setLedgerMeta('coverage_generation', g0); }
-  // 台帳にも warehouse.db にも証拠が無い (一度も coverage で回っていない) = 今までの送り方 (deploy の順番がずれた保険)
+  // 🆕 #1567 Codex R8 High (2)(3): 台帳にも warehouse.db にも証拠が無い (切り替えの前に戻した・新しい DATA_DIR の形)・財務のバックフィル済み + status 404 / 409
+  //   = 前は「今までの送り方 (legacy)」で token の無い送信をした → いまは ❌ (SP-API・生の表・送信のどれも始まらない)
   const back = hideEvidence();
   try {
-    for (const st of [S404, S409]) {
-      const f2 = spyFetch({ statusOverride: st });
-      const r2 = await run({ fetchImpl: f2 });
-      assert.equal(r2.mode, 'legacy', r2.summary); assert.equal(r2.exitCode, 0, r2.summary);
-      assert.match(r2.summary, /^⚠️ .*coverage: Render に 0050 が無い/);
-      assert.ok(r2.ingest && r2.ingest.inventory, '取込はする');
-      assert.equal(f2.calls.updating + f2.calls.complete + f2.calls.tokenedChunks, 0);
-    }
+    assert.equal(ledgerMeta(META.backfill), '1', '前提: 財務のバックフィル済み');
+    await refused(S404, 'render_404');
+    await refused(S409, 'render_not_migrated');
   } finally { back(); }
 });
 await t('🚨 台帳 (company-db-push.db) を失くした = 財務のバックフィルの完了印も世代も無いのに warehouse.db に coverage の証拠 = 取込だけ (ingest_only) にしない = 取込もしない ❌ (#1567 Codex R1 High 1)', async () => {
@@ -556,11 +556,25 @@ await t('🚨 台帳 (company-db-push.db) を失くした = 財務のバック�
     assert.match(r.summary, /^❌ .*台帳を失くした.*取込も送信もしない/);
     assert.equal(r.ingest, null); assert.deepEqual(writeState(), b);
     assert.equal(f.calls.chunks + f.calls.updating + f.calls.complete, 0);
-    // 証拠も無い (本当に初めて) = 取込だけ
+    // 🆕 #1567 Codex R8 High (1): ローカルに証拠も無い (台帳・warehouse.db を切り替えの前に戻した・新しい DATA_DIR の形)・バックフィルの印も無い
+    //   = 前は Render を読まずに取込だけ (ingest_only) で生の表を書いた → いまは Render の決済のそろいに行があれば ❌・読めなければ ❌ (SP-API・生の表・送信のどれも始まらない)
     const back = hideEvidence();
     try {
-      const r2 = await run({ fetchImpl: spyFetch() });
-      assert.equal(r2.mode, 'ingest_only', r2.summary); assert.equal(r2.exitCode, 0, r2.summary);
+      const refusedLocalNone = async (statusOverride, mode, re) => {
+        const b2 = writeState();
+        const f2 = spyFetch(statusOverride ? { statusOverride } : {});
+        const k = countingSp();
+        const r2 = await run({ fetchImpl: f2, sp: k.sp, inventorySp: k.sp, downloadTsv: k.downloadTsv });
+        assert.equal(r2.mode, mode, r2.summary); assert.equal(r2.exitCode, 1, r2.summary);
+        assert.match(r2.summary, re); assert.match(r2.summary, /取込も送信もしない/);
+        assert.equal(r2.ingest, null); assert.deepEqual([k.c.sp, k.c.dl], [0, 0], 'SP-API の一覧もダウンロードも始めない');
+        assert.deepEqual(writeState(), b2, '生の表・一覧の回は変わらない');
+        assert.equal(f2.calls.chunks + f2.calls.updating + f2.calls.complete, 0, '送らない');
+      };
+      await refusedLocalNone(null, 'render_has_coverage', /^❌ .*Render の決済のそろいに coverage の行がある/);
+      for (const st of [S404, S409, () => new Response('busy', { status: 503 }), () => new Response('{"ok":true}', { status: 200 }), () => { throw new Error('ECONNREFUSED (作り物)'); }]) {
+        await refusedLocalNone(st, 'render_unreadable', /^❌ .*Render の決済のそろいを読めない/);
+      }
     } finally { back(); }
   } finally { setLedgerMeta('coverage_generation', g0); setLedgerMeta(META.backfill, b0); }
 });

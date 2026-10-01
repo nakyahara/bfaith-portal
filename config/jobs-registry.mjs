@@ -490,7 +490,8 @@ export const JOBS_REGISTRY = [
       + 'coordinator は warehouse.db の lease (amazon_finance_coverage_lease の 1 行・持ち主の判定は retry-lock.js と同じ) を持ち、① 過去の決済の行に文書の版が無ければ ❌ で止まる (重い版付けは流さない = 夜に手で migrate-settlement-document-versions.js --commit。#1567 Codex R1) '
       + '② Render の決済のそろい (core.finance_coverage・0050) を新しい世代で updating (失敗なら取込を始めない) ③ 手で積んだ決済のファイル (amazon-settlement-manual-file.js) → SP-API の取込 (V2・一覧を記録。初期の印の順番待ちも updating の後に入れる) '
       + '④ 財務の送信 (全部の chunk に世代・token・coverage の回は --full) ⑤ 完成の判定 (一覧の鎖・初期の印・採った文書の版・receipt digest・source_revision の読み直し) → complete を 1 回として回す。'
-      + '財務のバックフィルの完了印の前 = 取込だけ (最後の行に「財務 push: ⏭️」)・Render に 0050 が無い = 今までの送り方 (⚠️。どちらも coverage で一度も回っていないときだけ・回った後は取込もせず ❌)・初期の印が無いなど人が直すまで complete にしない = ⚠️ (exit 0。正式な利益は null のまま)・'
+      + '財務のバックフィルの完了印の前 = 取込だけ (最後の行に「財務 push: ⏭️」= coverage で一度も回っていないとローカルと Render の両方で言えるときだけ・回った・判定できない = 取込もせず ❌)・'
+      + 'Render の決済のそろいが 404 / 409 = Render が #1561 / 0050 の前に戻った疑い = ❌ (今までの送り方の保険 cdb-coverage-legacy-path は #1567 Codex R8 で消した)・初期の印が無いなど人が直すまで complete にしない = ⚠️ (exit 0。正式な利益は null のまま)・'
       + '失敗 = ❌ (retry)・取り込めない V2 = 終了コード 3。初期の印 = apps/warehouse/amazon-finance-initial-marker.js --queue (Seller Central の過去の決済情報・順番待ちに積むだけ)。冒頭に「Settlement 文書の版テスト」(test-settlement-document-versions.js・一時 DB) も走る。'
       + '(以下は取込の中身の説明) 決済のレポートの一覧は 2026-09-30 (D7b-1b の下ごしらえ) から warehouse.db の amazon_settlement_report_inventory_runs / amazon_settlement_report_inventory に記録する '
       + '(取込のダウンロードのループが全部終わった後に別の getReports・窓 = 回の開始の時刻から 85 日前を明示・時間の上限 120 秒・report ごとの取込の結果と 1 回で書く)。2026-10-01 (#1567 Codex R4) から取込の一覧も同じ固定の窓 = 85〜90 日前に作られた report は取込まない (前 = 日時の境なし)。一覧が最後のページまで取れない・一覧の要求の失敗・記録の失敗 = 完了の行の末尾に ⚠️ (取込の結果・終了コードは変えない)。読み手 = coverage の判定 (Amazon決済と財務)。'
@@ -1493,33 +1494,19 @@ export const JOBS_REGISTRY = [
       + 'settlementIngestedByV1 (調べ用) も同じ PR で消してよい。このエントリも消す',
   },
   {
-    id: 'cdb-coverage-legacy-path',
-    type: 'temporary_asset',
-    importance: 'TMP',
-    owner: '中原さん',
-    purpose: 'Amazon の決済と財務の coordinator (apps/warehouse/amazon-finance-coverage-run.js・D7b-1b-3・PR #1567) の「Render に 0050 (core.finance_coverage・PR #1561) が無いとき '
-      + '(status が 409 not_migrated か 404) は今までの送り方 (token の無い chunk・coverage を送らない) で送る」互換の分岐。'
-      + 'deploy の順番がずれた朝に決済の取込と財務の送信を止めないための保険 (token が無い = Render は complete を作らない = fail-open ではない)。'
-      + '0050 が本番に入り、coordinator が coverage の mode で回るようになったら要らない',
-    where: 'bfaith-portal リポジトリ apps/warehouse/amazon-finance-coverage-run.js (mode = legacy の分岐・amazonFinanceDailyArgs の曜日の incremental / full) と scripts/test-amazon-finance-coverage-run.mjs の「Render に 0050 が無い」の試験',
-    remove_by: '2026-11-30',
-    lifecycle: 'temporary',
-    runbook: '0050 の本適用の後、daily-sync の「Amazon決済と財務」の最後の行に「Render に 0050 が無い」が 1 週間出ていなければ、legacy の分岐と試験を消す PR を作る '
-      + '(Render を読めない朝は今までどおり取込も始めない)。このエントリも消す',
-  },
-  {
     id: 'cdb-finance-untokened-chunk',
     type: 'temporary_asset',
     importance: 'TMP',
     owner: '中原さん',
     purpose: 'Company DB の財務の受け口 (Render apps/company-db/ingest/order-finance.mjs・PR #1561) が、coverage の世代・token の無い chunk (今までの送り手・人のバックフィル --from/--to・'
-      + 'coordinator の legacy の分岐) をまだ受けている互換の道 (受けたら complete を無効にする = fail-closed)。'
+      + 'スイッチ CDB_FINANCE_COORDINATOR が無いときの今までの送り手) をまだ受けている互換の道 (受けたら complete を無効にする = fail-closed。'
+      + 'coordinator の legacy の分岐は #1567 Codex R8 で消した・単独の送信は切り替えの後は送る前に止まる)。'
       + '設計 (AI_reference CompanyDB構想/13 §3.1) の終わりの形 = 送るのは coordinator だけ = token の無い chunk は拒む契約にする (後の PR)',
     where: 'bfaith-portal リポジトリ apps/company-db/ingest/order-finance.mjs (coverageOfChunk が null の chunk を受ける分岐・invalidateCompleteAfterWrite の untokened) と '
       + 'apps/company-db/push/amazon-finance.mjs (--from/--to の単独の送信)',
     remove_by: '2026-11-30',
     lifecycle: 'temporary',
-    runbook: 'cdb-coverage-legacy-path を消した後、Render の受け口で token の無い chunk を 409 にする PR を作る (人のバックフィルも coordinator の回か token つきで送る形に)。'
+    runbook: 'cdb-finance-coordinator-switch (スイッチ) を消して常に coordinator にした後、Render の受け口で token の無い chunk を 409 にする PR を作る (人のバックフィルも coordinator の回か token つきで送る形に)。'
       + '消す前に core.finance_coverage の invalidated_reason = untokened_finance_write が 2 週間出ていないことを確かめる。このエントリも消す',
   },
   {
