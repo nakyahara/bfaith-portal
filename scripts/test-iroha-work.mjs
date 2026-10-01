@@ -2566,6 +2566,32 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
               fields: { materials: [{ code: 'A', usage: 'なんとか' }] },
               worker_id: staffP.id, pin: '4649', expect_version: verNow() } });
             ok(badUse.status === 400 && badUse.json.error === 'bad_usage', '知らない使い道も 400');
+            // 🚨読めない指定を「空」として受け流すと、登録ずみの資材を全部消す指示に化ける (Codex 2026-10-01)
+            for (const bad of [[{}], [{ code: { x: 1 } }], [{ code: '', usage: 'inner_pack', units_per_pack: 10 }]]) {
+              const r = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+                fields: { materials: bad }, worker_id: staffP.id, pin: '4649', expect_version: verNow() } });
+              ok(r.status === 400 && r.json.error === 'bad_material', `読めない資材の指定は 400 (${JSON.stringify(bad)})`);
+            }
+            ok(JSON.parse(db.prepare("SELECT materials_json FROM f_iroha_work_master WHERE code_key = 'size-a'").get().materials_json).length === 2,
+              '断ったので資材はそのまま (全消しになっていない)');
+
+            // 🚨 マスタがまだ資材の答えを持っておらず、カードにだけ資材が載っている状態で「なし」にする
+            {
+              db.prepare("UPDATE f_iroha_work_master SET materials_json = NULL, material_code = NULL WHERE code_key = 'size-a'").run();
+              db.prepare('UPDATE f_iroha_tasks SET master_snapshot = ? WHERE id = ?')
+                .run(JSON.stringify({ materials: [{ code: 'D-8' }], material_code: 'D-8' }), t6);
+              clearEnrichCache();
+              const shown = (await call('GET', '/api/task-previews/' + t6, { cookie })).json.card;
+              ok(shown.master.materials.length === 1, '(前提) マスタが空でもカードの資材が画面に出ている');
+              const clear2 = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+                fields: { materials: [] }, worker_id: staffP.id, pin: '4649', expect_version: verNow() } });
+              clearEnrichCache();
+              const after2 = (await call('GET', '/api/task-previews/' + t6, { cookie })).json.card;
+              ok(clear2.status === 200 && !clear2.json.unchanged
+                && db.prepare("SELECT materials_json FROM f_iroha_work_master WHERE code_key = 'size-a'").get().materials_json === '[]'
+                && after2.master.materials.length === 0,
+                '🚨「なし」が保存され、カードの古い資材が画面から消える (変更なしで黙って終わらない)');
+            }
 
             // マスタで「資材なし」にしたら、カードの古い資材が復活しない
             const ver = () => db.prepare("SELECT version FROM f_iroha_work_master WHERE code_key = 'size-a'").get().version;

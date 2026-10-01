@@ -16,7 +16,7 @@ import ExcelJS from 'exceljs';
 import { getDB } from './db.js';
 // 資材の正規化はここに一本化する (materials_json と material_code がずれないように)
 import {
-  canonicalizeMaterials, materialsOf, serializeMaterials, primaryMaterialCode, sameMaterials, withPrimaryCode,
+  canonicalizeMaterials, materialsOf, serializeMaterials, primaryMaterialCode, sameMaterials, withPrimaryCode, hasMaterialsDecision,
 } from '../../lib/iroha-materials.js';
 
 const utcNow = () => new Date().toISOString();
@@ -258,16 +258,22 @@ export function updateWorkMasterRow(key, fields, user, expectVersion) {
   //   fields.material_code … 古い画面・取込。🚨1 件目だけ差し替えて 2 件目以降は残す
   const curRow = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
   let nextMaterials = null;   // null = 今回は資材を触らない
+  let explicitMaterials = false;
   if ('materials' in fields) {
-    const c = canonicalizeMaterials(fields.materials);
+    // 人の入力を保存する側なので厳格に見る (読めない行を黙って捨てると「全部消す」指示に化ける)
+    const c = canonicalizeMaterials(fields.materials, { strict: true });
     if (!c.ok) return { ok: false, error: c.error, message: c.message };
     nextMaterials = c.materials;
+    explicitMaterials = true;
   } else if ('material_code' in fields) {
     nextMaterials = withPrimaryCode(materialsOf(curRow), fields.material_code);
   }
   let materialsUnchanged = false;
   if (nextMaterials) {
-    if (sameMaterials(materialsOf(curRow), nextMaterials)) {
+    // 🚨 まだ資材の答えを持っていない行 (materials_json が無い) に「資材なし」を書くときは、
+    //    読んだ中身が同じでも書く。書かないとカードに載っている古い資材が画面に残り続ける (Codex 2026-10-01)
+    const needsDecision = explicitMaterials && !hasMaterialsDecision(curRow);
+    if (!needsDecision && sameMaterials(materialsOf(curRow), nextMaterials)) {
       materialsUnchanged = true;   // 中身が同じなら書かない (version を無駄に進めない)
     } else {
       sets.push('materials_json = ?'); params.push(serializeMaterials(nextMaterials));

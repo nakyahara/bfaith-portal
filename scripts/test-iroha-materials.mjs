@@ -88,6 +88,24 @@ console.log('\n[3] 読み出しのフォールバック');
     '1 件目が主資材 (material_code に写る値)');
 }
 
+console.log('\n[3-2] 保存のときは厳格・読むときは寛容 (Codex 2026-10-01)');
+{
+  // 🚨 読めない指定を「空」として受け流すと、登録済みの資材を全部消す指示に化ける
+  for (const junk of [[{}], [{ code: { x: 1 } }], [{ code: '', usage: 'inner_pack', units_per_pack: 10 }], [null], ['']]) {
+    const strict = M.canonicalizeMaterials(junk, { strict: true });
+    ok(strict.ok === false && strict.error === 'bad_material', `保存では読めない指定を拒否 ${JSON.stringify(junk)}`);
+    ok(M.canonicalizeMaterials(junk).ok === true, `読むときは落として進む ${JSON.stringify(junk)}`);
+  }
+  ok(M.canonicalizeMaterials([], { strict: true }).ok === true, '「資材なし」(空の配列) は厳格でも通す');
+  ok(M.canonicalizeMaterials([{ code: 'D-8' }], { strict: true }).materials[0].code === 'D-8', 'まともな指定はそのまま通る');
+
+  ok(M.hasMaterialsDecision({ materials_json: '[]' }) === true, "'[]' は「資材なし」という答え");
+  ok(M.hasMaterialsDecision({ materials_json: '[{"code":"D-8"}]' }) === true, '資材が入っていれば答えあり');
+  ok(M.hasMaterialsDecision({ materials_json: null, material_code: 'D-8' }) === false, '未移行の行はまだ答えていない');
+  ok(M.hasMaterialsDecision({ materials_json: '{壊れた' }) === false, '壊れた JSON も答えとして数えない');
+  ok(M.hasMaterialsDecision(null) === false, '行が無ければ答えなし');
+}
+
 console.log('\n[4] 1 件目だけの差し替え (withPrimaryCode)');
 {
   const cur = M.canonicalizeMaterials([{ code: 'D-8' }, { code: '袋', usage: 'inner_pack', units_per_pack: 10 }]).materials;
@@ -162,6 +180,13 @@ console.log('\n[7] 保存 (materials が正本・material_code は写し)');
   const cleared = updateWorkMasterRow('MAT-1', { materials: [] }, 'test', row2.version);
   ok(cleared.ok && rowOf('MAT-1').materials_json === '[]' && rowOf('MAT-1').material_code === null,
     '資材なしにできる (materials_json は [] ・写しは空)');
+  ok(updateWorkMasterRow('MAT-1', { materials: [{}] }, 'test', rowOf('MAT-1').version).error === 'bad_material',
+    '🚨読めない指定で全消しにしない (保存は厳格)');
+  // まだ答えを持っていない行に「資材なし」を書くときは、読んだ中身が同じでも書く
+  db.prepare("UPDATE f_iroha_work_master SET materials_json = NULL, material_code = NULL WHERE code_key = 'mat-1'").run();
+  const decide = updateWorkMasterRow('MAT-1', { materials: [] }, 'test', rowOf('MAT-1').version);
+  ok(decide.ok && !decide.unchanged && rowOf('MAT-1').materials_json === '[]',
+    '🚨未登録の行に「資材なし」を書くと、中身が同じでも答えとして残す (カードの古い資材が残らない)');
 }
 
 console.log('\n[8] 取込で現場の登録を消さない');

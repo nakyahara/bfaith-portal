@@ -92,7 +92,7 @@ import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task
 import { listInboundPlan } from './inbound-plan.js';
 import { startConsignment, markPrepared, markHanded, cancelConsignment, recordReturn, settleConsignment, getConsignment, updateReturnCounts } from './consign.js';
 import { startStaffUnlock, staffUnlockOf, endStaffUnlock, STAFF_UNLOCK_MS } from './db.js';
-import { materialsOf, withPrimaryCode, canonicalizeMaterials } from '../../lib/iroha-materials.js';
+import { materialsOf, withPrimaryCode, canonicalizeMaterials, hasMaterialsDecision } from '../../lib/iroha-materials.js';
 import {
   addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, recordMediaCancel, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
   reportMediaUnavailable, recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
@@ -1552,7 +1552,7 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   // 🚨 資材は**ここで一度検証する**。あとの「変更があるか」の判定より前に弾かないと、
   //    読めない指定が「変更なし」に見えて 200 で返り、入力が黙って消える (Codex 2026-10-01)
   if ('materials' in fields) {
-    const mv = canonicalizeMaterials(fields.materials);
+    const mv = canonicalizeMaterials(fields.materials, { strict: true });
     if (!mv.ok) return res.status(400).json({ ok: false, error: mv.error, message: mv.message });
     fields.materials = mv.materials;   // 以降は正規化した形で見る (比較も保存も同じものを使う)
   }
@@ -1591,7 +1591,12 @@ router.post('/api/master', checkOrigin, api((req, res) => {
 
   // DBが実際に変わるか (書き込み要否・unchanged判定) は**生値**で見る
   const { fills, overwrites } = classifyMasterEdit(row, fields);
-  if (fills.length === 0 && overwrites.length === 0) {
+  // 🚨 例外が 1 つ: **資材を「なし」にする指示**。マスタがまだ資材の答えを持っていない行では
+  //    生値どうしの比較が「空 → 空」に見えるが、書かないとカードに載っている古い資材が画面に残り続ける。
+  //    '[]' を書いて「資材なし」と答えさせる必要がある (Codex 2026-10-01)
+  const clearsCardMaterials = 'materials' in fields && fields.materials.length === 0
+    && !hasMaterialsDecision(row) && materialsOf(cardValues).length > 0;
+  if (fills.length === 0 && overwrites.length === 0 && !clearsCardMaterials) {
     return res.json({ ok: true, unchanged: true, row });
   }
   // 権限は**画面に見えていた実効値** (マスタ+カードのフォールバック合成) で見る (Codex PR4-R3:
@@ -1638,8 +1643,9 @@ router.post('/api/master', checkOrigin, api((req, res) => {
         // カード表示中の値をシード (今回指定されなかった項目だけ)。空欄埋め扱いなので権限は不要。
         // cardValues は上で商品コード一致を確認済み (別商品のカード値を混ぜない)
         const seed = {
-          // 資材は配列で引き継ぐ (小分け袋の指定ごと)
-          materials: Array.isArray(cardValues.materials) && cardValues.materials.length > 0 ? cardValues.materials : undefined,
+          // 資材は配列で引き継ぐ (小分け袋の指定ごと)。
+          // 🚨 スナップショットは手で直された値が入っていることもあるので、**読み出し用の寛容な正規化を通してから**使う
+          materials: materialsOf(cardValues).length > 0 ? materialsOf(cardValues) : undefined,
           material_code: cardValues.material_code, storage_container: cardValues.storage_container,
           units_per_container: cardValues.units_per_container, process_count: cardValues.process_count, note: cardValues.note,
         };
@@ -1647,7 +1653,7 @@ router.post('/api/master', checkOrigin, api((req, res) => {
         // 🚨 ここで配列を捨てると、マスタ行が無いカード (取込で消えた等) で 2 件目が消える (Codex 2026-10-01)。
         //    materials は material_code より強いので、1 件目は送られてきた値になる
         if ('material_code' in fields) {
-          const base = Array.isArray(cardValues.materials) ? cardValues.materials : [];
+          const base = materialsOf(cardValues);
           seed.materials = base.length > 0 ? withPrimaryCode(base, fields.material_code) : undefined;
         }
         applyFields = { ...Object.fromEntries(Object.entries(seed).filter(([f, v]) => v != null && v !== '' && !(f in fields))), ...fields };
