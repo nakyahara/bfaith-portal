@@ -1609,6 +1609,9 @@ th.attr-unknown { color: #dc2626; }
               <span class="muted" id="lpc-status" style="font-size:12px;"></span>
             </div>
             <div class="muted" id="lpc-spec" style="font-size:11px; margin-top:4px;"></div>
+            <%# 🚨 失敗したときの説明はここ。lint の中身 (lpc-lint) は「できた」ときの箱の中にあるので、
+                失敗したときは見えない (codex exec review P2) %>
+            <div id="lpc-fail" hidden class="muted" style="font-size:11px; margin-top:4px; color:#b45309;"></div>
             <div id="lpc-result" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
               <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px;">
                 <strong style="font-size:13px;">AI が作った構成 (⑦ AI画像生成プロンプト)</strong>
@@ -5803,6 +5806,7 @@ th.attr-unknown { color: #dc2626; }
     const lintEl = document.getElementById('lpc-lint');
     const openEl = document.getElementById('lpc-open');
     const copyResultEl = document.getElementById('lpc-copy-result');
+    const failEl = document.getElementById('lpc-fail');
 
     const RUNNING = ['queued', 'running'];
     let timer = null;
@@ -5861,9 +5865,18 @@ th.attr-unknown { color: #dc2626; }
         const q = new URLSearchParams({ product_code: root.dataset.neCode || '', product_name: root.dataset.name || '' });
         openEl.href = LP_TOOL + '?' + q.toString();
       }
-      // 失敗したときも lint が残っていれば何がひっかかったかを出す (直す手がかり)
-      if (!done && job && job.status === 'failed' && job.lint) {
-        lintEl.textContent = lintLine(job.lint);
+      // 失敗したときも lint が残っていれば何がひっかかったかを出す (直す手がかり)。
+      // 🚨 出す場所は resultEl の**外**。中に書くと「できた」ときしか見えない (codex exec review P2)
+      const failing = !!job && job.status === 'failed' && job.lint && job.lint.ok === false;
+      failEl.hidden = !failing;
+      if (failing) {
+        const errs = (job.lint.errors || []).slice(0, 8).map((e) => '・' + (e.detail || e.label)).join('
+');
+        failEl.textContent = lintLine(job.lint) + (errs ? '
+' + errs : '')
+          + ((job.lint.errors || []).length > 8 ? '
+…ほか ' + ((job.lint.errors || []).length - 8) + ' 件' : '');
+        failEl.style.whiteSpace = 'pre-wrap';
       }
 
       if (running) schedule(); else stop();

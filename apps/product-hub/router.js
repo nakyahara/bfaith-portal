@@ -485,7 +485,7 @@ router.get('/detail/:id', (req, res) => {
     // 「🤖 構成をAIに作らせる」(段階1・PR1-d)。最初の表示をここで作っておく
     // (読み込み直後に 1 回 fetch すると、押せる/押せないが一瞬ちらつく)。
     // 画面はこの後 5 秒おきに GET /api/drafts/:id/lp-compose を叩いて更新する
-    lpCompose: lpComposeInitialState(db, draft, effectiveProductInfo(imageProduction?.product_info_text, autoProductInfo)),
+    lpCompose: lpComposeInitialState(db, draft),
   });
 });
 
@@ -3795,8 +3795,13 @@ router.get('/api/lp-specs', (req, res) => {
  * 詳細画面の最初の表示に渡す「構成をAIに作らせる」の状態。
  * GET /api/drafts/:id/lp-compose と**同じ形**にする (画面が同じ描画関数を使う)。
  */
-function lpComposeInitialState(db, draft, productInfo) {
+function lpComposeInitialState(db, draft) {
   const spec = latestLpSpec(db, 'product_analysis');
+  // 🚨 材料の組み方は **API と全く同じ** lpComposeMaterial を通す (codex exec review P1)。
+  //    カラバリや裏面情報を含めるのは composeProductInfo の中なので、
+  //    ここだけ effectiveProductInfo を渡すと、**裏面情報だけの商品が
+  //    画面ではずっと押せない** (API では押せる) という食い違いになる。
+  const { productInfo } = lpComposeMaterial(db, draft);
   return {
     ...lpComposeStateFor(db, draft.id),
     blocked: lpComposeBlockReason({ draft, productInfo, spec }),

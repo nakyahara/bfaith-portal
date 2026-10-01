@@ -145,6 +145,24 @@ console.log('⑥ 機能フラグが無ければ画面に出さない');
   process.env.PH_LP_COMPOSE_ENABLED = '1';
 }
 
+console.log('⑥b 🚨 裏面情報だけの商品でも押せる (画面と API で判定が食い違わない)');
+{
+  // 最初の表示を API と別の組み方で作っていたときは、裏面情報だけの商品が
+  // **画面ではずっと押せない** (API では押せる) という食い違いになっていた
+  const d3 = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('LP-UI-3', 'ハッカ油スプレー 300ml', 'test')`
+  ).run().lastInsertRowid);
+  // 商品情報は空、裏面情報だけ入れる
+  db.prepare(`INSERT INTO draft_image_production (draft_id, product_info_text, back_info_text) VALUES (?, '', ?)`)
+    .run(d3, '原材料: ハッカ油、エタノール。内容量 300ml。火気厳禁。');
+  const html = (await getDetail(d3)).html;
+  const s3 = embedded(html);
+  eq(s3.blocked, null, '🚨 裏面情報だけでも押せる');
+  // API 側と同じ判定になっていること
+  const viaApi = await (await fetch(`${base}/api/drafts/${d3}/lp-compose`)).json();
+  eq(viaApi.blocked, s3.blocked, '🚨 画面の最初の表示と API の判定が一致する');
+}
+
 console.log('⑦ 失敗・成否不明も画面に出る');
 {
   const d2 = Number(db.prepare(
@@ -163,6 +181,12 @@ console.log('⑦ 失敗・成否不明も画面に出る');
   eq(s.job.status, 'failed', '失敗が出る');
   ok((s.job.error || '').includes('商品情報'), `理由がそのまま出る (${s.job.error})`);
   eq(s.job.output_text, null, '本文は無い');
+  // 🚨 失敗の説明を出す箱は、「できた」ときの箱 (lpc-result) の**外**にある。
+  //    中に置くと失敗時はその箱ごと隠れて見えない (codex exec review P2)
+  const html3 = (await getDetail(d2)).html;
+  const failAt = html3.indexOf('id="lpc-fail"');
+  const resultAt = html3.indexOf('id="lpc-result"');
+  ok(failAt > 0 && resultAt > 0 && failAt < resultAt, '🚨 失敗の箱は「できた」の箱より前 (= 外側) にある');
 }
 
 server.close();
