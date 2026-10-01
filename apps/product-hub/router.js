@@ -123,7 +123,7 @@ import {
   queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
-  lpComposeImageRef, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
+  lpComposeImageRef, recordImageServed as recordLpComposeImageServed, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
 } from './lib/lp-compose.js';
 import { assertXlsxExpandsSafely, XlsxTooLargeError } from './lib/xlsx-guard.js';
 import { abaConfigured, lookupAbaTerms, lookupAbaTopAsins } from './lib/aba-client.js';
@@ -3909,6 +3909,13 @@ serviceApiRouter.get('/lp-compose/jobs/:id/images/:n', async (req, res) => {
   if (!r.ok) return lpComposeFail(res, r);
   try {
     const { buf } = await getDriveThumbnail(r.file_id, LP_COMPOSE_IMAGE_WIDTH, r.version || '');
+    // 🚨 配ったことをここで記録する。証跡を実行役から受け取ると、
+    //    作業ディレクトリに Write できる Claude のセッションが偽造できた (codex exec review P1)
+    recordLpComposeImageServed(getDB(), lpIdParam(req.params.id), {
+      fileId: r.file_id,
+      sha256: crypto.createHash('sha256').update(buf).digest('hex'),
+      bytes: buf.length,
+    });
     res.set('Content-Type', 'image/jpeg');
     res.set('X-Content-Type-Options', 'nosniff');
     // 🚨 no-store。URL が同じで lease をヘッダで渡すので、私有キャッシュを許すと

@@ -238,20 +238,23 @@ async function cmdResult(id, opt) {
     if (raw.length > LINT_MAX) die(`lint が大きすぎます (${LINT_MAX} 文字まで)`);
     try { lint = JSON.parse(raw); } catch { die('lint が JSON ではありません'); }
   }
+  // Ὢ8 lint を通していない accepted は出させない (codex exec review P1)。
+  //    サーバも同じ検査をするが、ここで止めれば AI 枠を無駄にしない
+  if (accepted && (!lint || lint.ok !== true)) {
+    die('--accepted には lint が要ります (--lint lint-ID.json で、中身の ok が true であること)');
+  }
   const rounds = opt.rounds === undefined ? null : Number.parseInt(String(opt.rounds), 10);
   if (rounds !== null && (!Number.isInteger(rounds) || rounds < 0 || rounds > 10)) die('--rounds は 0〜10 です');
 
-  // 証跡は images のときに CLI が記録したものをそのまま出す (Claude に書かせない)
-  let images = null;
-  try { images = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), `imgs-${id}.json`), 'utf8')); } catch { images = null; }
-  const receipt = images && images.length
-    ? { images: images.filter((im) => im.file_id).map((im) => ({ file_id: im.file_id, sha256: im.sha256, bytes: im.bytes })) }
-    : null;
+  // Ὢ8 証跡は**送らない**。サーバが画像を配ったときに自分で記録している。
+  //    作業ディレクトリのファイルは Claude のセッションが Write できるので、
+  //    ここから送ると「見ていないのに見たことにする」偽造ができた (codex exec review P1)。
+  //    imgs-<ID>.json はこの CLI が自分で読むためだけに残す (人がログを見るときの手がかり)
 
   const r = await api('POST', `/lp-compose/generations/${lease.generation_id}/result`, {
     packet_hash: lease.packet_hash,
     verdict: accepted ? 'accepted' : 'rejected',
-    output, lint, review_rounds: rounds, reason, receipt,
+    output, lint, review_rounds: rounds, reason,
   });
   out(r.json);
   if (r.status !== 200) fail(1);

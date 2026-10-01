@@ -141,22 +141,34 @@ eq((await phlp('fail', jid, '--code', 'OTHER', '--message', 'x')).code, 1, '🚨
 eq((await phlp('release', jid, '--reason', 'x')).code, 1, '🚨 予約後に release も通らない');
 eq((await phlp('fail', jid, '--code', 'へんなコード')).code, 2, '知らない code は断る');
 
-console.log('⑥ result — 画像が取れていないので証跡なし。サーバが packet に画像ありと知っている');
-const bad = await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--rounds', '1');
-eq(bad.code, 1, '🚨 証跡が無い accepted はサーバが断る (packet に画像があるため)');
-ok(String(bad.out).includes('receipt.images'), '理由が分かる');
-// 実際の運用では ./phlp images が成功して証跡が残る。ここでは手で置いて通す
+console.log('⑥ result — lint と証跡はサーバが見る');
+// lint を通していない accepted は CLI が止める (AI 枠を無駄にしない)
+eq((await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--rounds', '1')).code, 2,
+  '🚨 lint なしの accepted は CLI が止める');
+fs.writeFileSync(path.join(work, `lint-${jid}.json`), JSON.stringify({ ok: false, checks: {} }), 'utf8');
+eq((await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--lint', `lint-${jid}.json`, '--rounds', '1')).code, 2,
+  '🚨 lint.ok が false でも止める');
+fs.writeFileSync(path.join(work, `lint-${jid}.json`), JSON.stringify({ ok: true, checks: {} }), 'utf8');
+
+const bad = await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--lint', `lint-${jid}.json`, '--rounds', '1');
+eq(bad.code, 1, '🚨 画像を取得していなければサーバが断る (packet に画像があるため)');
+// 🚨 作業ディレクトリに証跡を書いても通らない (偽造できたのを塞いだ)
 fs.writeFileSync(path.join(work, `imgs-${jid}.json`), JSON.stringify(
   [{ file: `img-${jid}-1.jpg`, bytes: 1234, file_id: 'FILEIDTOP001', sha256: 'a'.repeat(64) }]), 'utf8');
-const good = await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--rounds', '1');
-eq(good.code, 0, '証跡があれば通る');
+eq((await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--lint', `lint-${jid}.json`, '--rounds', '1')).code, 1,
+  '🚨 証跡を手で置いても通らない (サーバの記録を見る・codex exec review P1)');
+// サーバが実際に配ったときだけ通る
+lp.recordImageServed(db, req.job.id, { fileId: 'FILEIDTOP001', sha256: 'b'.repeat(64), bytes: 4321 });
+const good = await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--lint', `lint-${jid}.json`, '--rounds', '1');
+eq(good.code, 0, 'サーバが配っていれば通る');
 eq(good.json.status, 'done', 'done になる');
+eq(good.json.receipt.images[0].sha256, 'b'.repeat(64), '🚨 証跡はサーバの記録 (実行役が書いた値ではない)');
 
 console.log('⑦ clean — 一時ファイルを全部消す (rm は使えない)');
 fs.writeFileSync(path.join(work, `_lp_review_${jid}.md`), 'レビュー用', 'utf8');
 const cleaned = await phlp('clean', jid);
 eq(cleaned.code, 0, 'clean が通る');
-for (const n of [`spec-${jid}.md`, `lease-${jid}.json`, `out-${jid}.md`, `imgs-${jid}.json`, `_lp_review_${jid}.md`]) {
+for (const n of [`spec-${jid}.md`, `lease-${jid}.json`, `out-${jid}.md`, `imgs-${jid}.json`, `lint-${jid}.json`, `_lp_review_${jid}.md`]) {
   ok(!exists(n), `${n} が消えた`);
 }
 ok(exists('secret.txt'), '🚨 関係ないファイルは消さない');
