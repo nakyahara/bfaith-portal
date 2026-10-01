@@ -3833,6 +3833,12 @@ function lpComposeMaterial(db, draft) {
 const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, already_generated: 409, job_finalized: 409, already_running: 409 };
 const lpComposeFail = (res, r) => res.status(LP_COMPOSE_HTTP[r.code] || 400).json({ ok: false, code: r.code, error: r.error });
 const rawField = (v, maxLen) => (typeof v === 'string' && v.length <= maxLen ? v : null);
+// 🚨 共有の intParam は Number.parseInt なので "12abc" を 12 として通す。
+//    lib 側の posInt を厳しくしても、router で変換して渡すとそこに届かず、
+//    壊れた URL が **別の正当な job / generation** を指してしまう (codex exec review の P2)。
+//    パスの成分全体を見てから数にする。
+//    共有の intParam はここでは直さない (ad-kw-ai など他の口の挙動をこの PR で変えない)。
+const lpIdParam = (v) => (typeof v === 'string' && /^[1-9]\d*$/.test(v) ? Number(v) : 0);
 
 serviceApiRouter.get('/lp-compose/queue', (req, res) => {
   res.json({ ok: true, queue: lpComposeQueueSummary(getDB()) });
@@ -3846,7 +3852,7 @@ serviceApiRouter.post('/lp-compose/claim', (req, res) => {
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/reserve', (req, res) => {
-  const r = reserveLpComposeGeneration(getDB(), intParam(req.params.id), {
+  const r = reserveLpComposeGeneration(getDB(), lpIdParam(req.params.id), {
     leaseToken: rawField(req.body?.lease_token, 100),
     model: cleanText(req.body?.model, 80),
     promptVersion: rawField(req.body?.prompt_version, 80),
@@ -3856,7 +3862,7 @@ serviceApiRouter.post('/lp-compose/jobs/:id/reserve', (req, res) => {
 });
 
 serviceApiRouter.post('/lp-compose/generations/:gid/result', (req, res) => {
-  const r = submitLpComposeResult(getDB(), intParam(req.params.gid), {
+  const r = submitLpComposeResult(getDB(), lpIdParam(req.params.gid), {
     packetHash: rawField(req.body?.packet_hash, 100),
     verdict: cleanText(req.body?.verdict, 20),
     output: req.body?.output,
@@ -3870,7 +3876,7 @@ serviceApiRouter.post('/lp-compose/generations/:gid/result', (req, res) => {
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/fail', (req, res) => {
-  const r = failLpComposeJob(getDB(), intParam(req.params.id), {
+  const r = failLpComposeJob(getDB(), lpIdParam(req.params.id), {
     leaseToken: rawField(req.body?.lease_token, 100),
     code: cleanText(req.body?.code, 40), message: cleanText(req.body?.message, 500),
   });
@@ -3879,7 +3885,7 @@ serviceApiRouter.post('/lp-compose/jobs/:id/fail', (req, res) => {
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/release', (req, res) => {
-  const r = releaseLpComposeJob(getDB(), intParam(req.params.id), {
+  const r = releaseLpComposeJob(getDB(), lpIdParam(req.params.id), {
     leaseToken: rawField(req.body?.lease_token, 100), reason: cleanText(req.body?.reason, 300),
   });
   if (!r.ok) return lpComposeFail(res, r);
@@ -3897,8 +3903,8 @@ serviceApiRouter.post('/lp-compose/jobs/:id/release', (req, res) => {
 serviceApiRouter.get('/lp-compose/jobs/:id/images/:n', async (req, res) => {
   // 🚨 lease_token はヘッダで受ける — クエリに載せるとプロキシやアクセスログに
   //    URL ごと残る (Codex API R1 #3)。資格情報を URL に載せない
-  const r = lpComposeImageRef(getDB(), intParam(req.params.id), {
-    leaseToken: rawField(req.get('X-LP-Compose-Lease'), 100), index: intParam(req.params.n) - 1,
+  const r = lpComposeImageRef(getDB(), lpIdParam(req.params.id), {
+    leaseToken: rawField(req.get('X-LP-Compose-Lease'), 100), index: lpIdParam(req.params.n) - 1,
   });
   if (!r.ok) return lpComposeFail(res, r);
   try {

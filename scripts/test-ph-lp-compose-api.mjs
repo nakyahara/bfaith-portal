@@ -185,6 +185,21 @@ eq(imgNoLease.status, 409, '🚨 lease が違えば配らない');
 const img1 = await svc('GET', `/lp-compose/jobs/${job.job_id}/images/1`, { lease: job.lease_token });
 ok([200, 403, 404, 502].includes(img1.status), `lease が通れば Drive まで行く (status ${img1.status})`);
 
+console.log('④b 壊れた URL で別の依頼を掴まない (codex exec review の P2)');
+// 共有の intParam は Number.parseInt なので "12abc" を 12 にしていた。
+// lib の posInt を厳しくしても router で変換して渡すとそこに届かず、
+// 壊れた URL が別の正当な job / generation を指してしまっていた
+for (const bad of [`${job.job_id}abc`, ` ${job.job_id}`, `${job.job_id}.0`, '0']) {
+  const r = await svc('POST', `/lp-compose/jobs/${encodeURIComponent(bad)}/reserve`, {
+    body: { lease_token: job.lease_token, model: 'claude-opus-5', prompt_version: lp.PROMPT_VERSION },
+  });
+  ok(r.status === 404 || r.status === 400, `🚨 "${bad}" は別の依頼にならない (status ${r.status})`);
+}
+eq((await svc('GET', `/lp-compose/jobs/${encodeURIComponent(job.job_id + 'abc')}/images/1`, { lease: job.lease_token })).status,
+  404, '🚨 画像の口でも同じ');
+eq((await svc('GET', `/lp-compose/jobs/${job.job_id}/images/1abc`, { lease: job.lease_token })).status,
+  400, '🚨 画像の番号でも同じ');
+
 console.log('⑤ 予約 → 結果');
 eq((await svc('POST', `/lp-compose/jobs/${job.job_id}/reserve`, {
   body: { lease_token: job.lease_token, model: 'claude-opus-5', prompt_version: 'ふるい版' },
