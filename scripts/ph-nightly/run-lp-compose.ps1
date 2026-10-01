@@ -14,7 +14,8 @@
 # If the lock is busy, this run exits quietly and the next minute tries again.
 #
 # Success is decided by the SERVER queue, never by what Claude reports:
-#   claimable_after < claimable_before -> ok (the request left the queue for good)
+#   pending = claimable + running. A merely claimed (leased) request is NOT progress.
+#   pending_after < pending_before     -> ok (the request left the queue for good)
 #   needs_review went up              -> partial (a person has to look; the board shows it)
 #   nothing moved                     -> fail (auth / tool denied / spec missing)
 #
@@ -77,7 +78,13 @@ if (-not (Test-Path $TokenFile)) { Log 'service token file missing'; Send-Ping '
 $before = $null
 try { $before = Get-Queue } catch { Log ('queue check failed: ' + $_.Exception.Message); Send-Ping 'fail' 'queue check failed'; exit 1 }
 if (-not $before) { Log 'queue check returned nothing'; Send-Ping 'fail' 'queue check returned nothing'; exit 1 }
-if (-not $before.enabled) { Log 'PH_LP_COMPOSE_ENABLED is off on the server - nothing to do'; exit 0 }
+if (-not $before.enabled) {
+  # The registry entry is a heartbeat (max_age 1 h): a deliberately disabled feature must still ping,
+  # otherwise the monitor reports the runner dead after an hour (Codex review P2).
+  Log 'PH_LP_COMPOSE_ENABLED is off on the server - nothing to do'
+  Send-Ping 'ok' 'disabled on the server (PH_LP_COMPOSE_ENABLED)'
+  exit 0
+}
 if ([int]$before.claimable -eq 0) {
   # A quiet minute is normal and must not be noisy. Ping ok so the dead-man monitor sees the runner alive.
   Send-Ping 'ok' ('idle (running=' + $before.running + ' needs_review=' + $before.needs_review + ')')
@@ -147,9 +154,14 @@ try {
 Start-Sleep -Seconds 3
 $after = $null
 try { $after = Get-Queue } catch { Log ('queue post-check failed: ' + $_.Exception.Message); Send-Ping 'fail' 'queue post-check failed'; exit 1 }
-$moved = [int]$before.claimable - [int]$after.claimable
+# A merely CLAIMED request is NOT progress: claimable goes down while running goes up, and the request
+# is lost (it only turns into failed when the lease expires 40 min later). Same lesson as the manuscript
+# runner: pending = claimable + leased (Codex review P1).
+$pendingBefore = [int]$before.claimable + [int]$before.running
+$pendingAfter  = [int]$after.claimable + [int]$after.running
+$moved = $pendingBefore - $pendingAfter
 $needsReviewUp = [int]$after.needs_review - [int]$before.needs_review
-$note = 'moved=' + $moved + ' claimable=' + $after.claimable + ' needs_review=' + $after.needs_review + ' exit=' + $claudeExit
+$note = 'moved=' + $moved + ' claimable=' + $after.claimable + ' running=' + $after.running + ' needs_review=' + $after.needs_review + ' exit=' + $claudeExit
 Log ('after: ' + $note)
 
 if ($timedOut) { Send-Ping 'fail' ('timeout; ' + $note); exit 1 }
@@ -159,5 +171,10 @@ if ($needsReviewUp -gt 0) {
   exit 0
 }
 if ($moved -gt 0) { Send-Ping 'ok' $note; exit 0 }
+if ([int]$after.running -gt [int]$before.running) {
+  # claimed but never finished: the lease will expire into failed. Say so now, do not call it ok.
+  Send-Ping 'fail' ('claimed but not finished; ' + $note)
+  exit 1
+}
 Send-Ping 'fail' ('nothing moved; ' + $note)
 exit 1
