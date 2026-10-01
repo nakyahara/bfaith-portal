@@ -14,6 +14,7 @@
 import fs from 'fs';
 import iconv from 'iconv-lite';
 import { getDB, initDB } from './db.js';
+import { legacyCliGate, runWithLegacyCliLock, closeLegacyGatePool } from '../../lib/master-legacy-gate.mjs';
 
 const REORDER_MONTHS_MAX = 60;
 function parseMonths(v) {
@@ -52,11 +53,16 @@ function detectCol(header, candidates, fallback) {
 }
 
 async function main() {
+  // 🚨 推奨保有月数 (m_reorder_setting) はマスタ = 古い入口の門を通す (Company DB構想 14 §9 M2・契約 v3 H1・PR #1565 R1)。
+  //    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = 引数・ファイルの検査より前・DB を開く前に終了コード 3 (--dry-run も)。
+  //    書く直前にもう一度読む
+  if (!(await legacyCliGate('cli:migrate-reorder-setting-initial.js'))) return;
   const args = process.argv.slice(2);
   const csvPath = args.find(a => a.startsWith('--csv='))?.split('=').slice(1).join('=');
   const dryRun = args.includes('--dry-run');
-  if (!csvPath) { console.error('--csv=... が必要です'); process.exit(2); }
-  if (!fs.existsSync(csvPath)) { console.error(`CSVが見つかりません: ${csvPath}`); process.exit(2); }
+  // 🚨 process.exit は使わない (段階を読んだ PostgreSQL の接続の後に呼ぶと Windows で終了コード 127 になることがある。中間レビュー 2 回目 Low)
+  if (!csvPath) { console.error('--csv=... が必要です'); process.exitCode = 2; return; }
+  if (!fs.existsSync(csvPath)) { console.error(`CSVが見つかりません: ${csvPath}`); process.exitCode = 2; return; }
 
   // UTF-8(BOM可) / Shift_JIS 自動判定
   //   まず UTF-8 として解釈し、置換文字(U+FFFD)が多ければ cp932 とみなす。
@@ -72,7 +78,7 @@ async function main() {
   }
 
   const records = parseCsv(text).filter(r => r.some(c => (c || '').trim() !== ''));
-  if (!records.length) { console.error('行がありません'); process.exit(2); }
+  if (!records.length) { console.error('行がありません'); process.exitCode = 2; return; }
 
   const header = records[0].map(h => (h || '').replace(/\s+/g, '').trim());
   const colSku = detectCol(header, ['商品コード'], 0);
@@ -99,10 +105,12 @@ async function main() {
       imported++;
     }
   });
-  apply(records.slice(1));
+  // 書くところ = 段階の鍵を共有で持ったまま読み直し、legacy_open のときだけ書く (段階を変える関数は書き終わるまで待つ)
+  const { ran } = await runWithLegacyCliLock('cli:migrate-reorder-setting-initial.js', () => apply(records.slice(1)));
+  if (!ran) return;
 
   console.log(`${dryRun ? '[DRY-RUN] ' : ''}投入 ${imported} / スキップ ${skipped} (無効 ${invalid}) / 全 ${records.length - 1} 行`);
-  process.exit(0);
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+// 終わり方: 接続を閉じてから自然に終わる (process.exit を呼ばない)。終了コードは process.exitCode
+main().catch(e => { console.error(e); process.exitCode = 1; }).finally(() => closeLegacyGatePool());

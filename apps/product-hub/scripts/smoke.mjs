@@ -17,6 +17,10 @@ if (!process.env.DATA_DIR) {
   process.exit(1);
 }
 fs.mkdirSync(process.env.DATA_DIR, { recursive: true });
+// 切替の段階 = legacy_open (マスタの古い入口の門を今までどおり通す。門そのものの試験は scripts/test-master-legacy-gate.mjs)
+(await import('../../../lib/master-legacy-gate.mjs')).__setLegacyPhaseReader(async () => ({ readable: true, phase: 'legacy_open' }));
+// 出品の税率 = 切替前の決め方 (draft_yahoo.tax_rate。閉じた後の Company DB の税率は test-master-legacy-gate.mjs)
+const LEGACY_TAX = { tax: { mode: 'legacy' } };
 
 let failed = 0;
 function check(name, cond, detail = '') {
@@ -1096,7 +1100,7 @@ check('一括登録: 空入力は弾く', intake.registerByCodes([], {}).error =
     db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'variation_added'`).get(sgsId).c === 1);
   // 楽天出品は止める (商品コードが新しい色の SKU なので、出すと別の新しいページができる)
   const listingEarly = await import('../services/rakuten-listing.js');
-  const built = listingEarly.buildItemPayload(db, card.id);
+  const built = listingEarly.buildItemPayload(db, card.id, LEGACY_TAX);
   check('色追加: カードからは楽天に出品しない (理由に直すページが出る)',
     built.ok === false && built.reasons.some((x) => /既存の楽天ページ「sgs」に追加する商品です/.test(x)), JSON.stringify(built.reasons));
   // 画像フォルダは既存ページのものを使うので自動では作らない
@@ -1116,7 +1120,7 @@ check('一括登録: 空入力は弾く', intake.registerByCodes([], {}).error =
   // 色追加カードは札の設定を「新規ページ」にしても出品を止める (新しい色の SKU で別ページができる — Codex #1450 R1 high)
   const pk = cardOf('sgs-pk');
   db.prepare('UPDATE product_drafts SET existing_page = 0 WHERE id = ?').run(pk.id);
-  const builtPk = listingEarly.buildItemPayload(db, pk.id);
+  const builtPk = listingEarly.buildItemPayload(db, pk.id, LEGACY_TAX);
   check('色追加: 「新規ページ」にしても色追加カードは既存ページのまま・出品は止まる',
     existingPageMod.existingPageOfDraft(db, pk.id).existingPage === true
     && builtPk.reasons.some((x) => /既存の楽天ページ「sgs」/.test(x)), JSON.stringify(builtPk.reasons));
@@ -1167,7 +1171,7 @@ check('parseAttributes: name欠落 → null', listing.parseAttributes('[{"values
 
 // payload builder — 単品ドラフトで組み立て
 const rkId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price) VALUES ('rk-smoke-1', '出品スモーク商品', 1980)`).run().lastInsertRowid);
-let built = listing.buildItemPayload(db, rkId);
+let built = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 不足理由を列挙 (ジャンル/画像)',
   built.ok === false && built.reasons.some((r) => r.includes('ジャンル')) && built.reasons.some((r) => r.includes('画像')),
   JSON.stringify(built.reasons));
@@ -1188,7 +1192,7 @@ db.prepare(`UPDATE draft_step_progress SET state = 'done', done_by = 'smoke'
 // **バナーの無い配送方法 (4 = ゆうパック)** を選ぶ — 下の画像テストは共通3枚だけの並びを見ているため
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '4' WHERE draft_id = ?`).run(rkId);
 
-built = listing.buildItemPayload(db, rkId);
+built = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 組み立て成功', built.ok === true, JSON.stringify(built.reasons || null));
 const pl = built.payload;
 check('payload: hideItem=false (公開で登録 — 2026-08-05 中原さん指示)', pl.hideItem === false);
@@ -1219,14 +1223,14 @@ check('payload: スマホ用説明文 = 販売説明文 + PC説明文',
 
 // 10240字ガード (Codex R1 Low): PC説明文の超過は理由で止める
 db.prepare(`UPDATE draft_ai_outputs SET content = ? WHERE draft_id = ? AND kind = 'desc_features'`).run('あ'.repeat(11000), rkId);
-let bLen = listing.buildItemPayload(db, rkId);
+let bLen = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: PC説明文10240字超は理由で止める',
   bLen.ok === false && bLen.reasons.some((r) => r.includes('PC用商品説明文が長すぎます')), JSON.stringify(bLen.reasons));
 // スマホ用だけが連結で超過するケース (PC・販売は上限内)
 db.prepare(`UPDATE draft_ai_outputs SET content = ? WHERE draft_id = ? AND kind = 'desc_features'`).run('あ'.repeat(6000), rkId);
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'glong')`).run(rkId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'glong', ?)`).run(rkId, '/app-newitems/' + 'x'.repeat(4000) + '.jpg');
-bLen = listing.buildItemPayload(db, rkId);
+bLen = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: スマホ用 (販売+PC連結) だけの超過も止める',
   bLen.ok === false
   && bLen.reasons.some((r) => r.includes('スマホ用商品説明文'))
@@ -1278,12 +1282,12 @@ const salesEmptyLen = listing.buildSalesDescriptionHtml(['']).length;
 const exactLocLen = 10240 - salesLine1Len - 1 - salesEmptyLen; // -1 は行間の '\n'
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gedge')`).run(rkId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gedge', ?)`).run(rkId, '/' + 'x'.repeat(exactLocLen - 1));
-bLen = listing.buildItemPayload(db, rkId);
+bLen = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 販売説明文ちょうど10240字は販売ガードにかからない (連結のスマホ用のみ)',
   bLen.ok === false && !bLen.reasons.some((r) => r.includes('画像HTML')) && bLen.reasons.some((r) => r.includes('スマホ用')),
   JSON.stringify(bLen.reasons));
 db.prepare(`UPDATE draft_cabinet_images SET cabinet_location = ? WHERE draft_id = ? AND drive_file_id = 'gedge'`).run('/' + 'x'.repeat(exactLocLen), rkId);
-bLen = listing.buildItemPayload(db, rkId);
+bLen = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 販売説明文10241字は理由で止める', bLen.ok === false && bLen.reasons.some((r) => r.includes('画像HTML')), JSON.stringify(bLen.reasons));
 db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'gedge'`).run(rkId);
 db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = 'gedge'`).run(rkId);
@@ -1323,25 +1327,25 @@ check('payload: variants は ne_code キー + 属性 + 型番なし例外',
 // (2026-09-02 shaganshi で実証)。型番を入れても articleNumber は免除理由のまま、が正しい
 db.prepare(`UPDATE draft_rakuten SET article_number = 'ABC-100' WHERE draft_id = ?`).run(rkId);
 check('payload: メーカー型番は articleNumber に入れない (IE0228 の再発防止)',
-  listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.exemptionReason === 5
-  && listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.value === undefined,
-  JSON.stringify(listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber));
+  listing.buildItemPayload(db, rkId, LEGACY_TAX).payload.variants['rk-smoke-1'].articleNumber.exemptionReason === 5
+  && listing.buildItemPayload(db, rkId, LEGACY_TAX).payload.variants['rk-smoke-1'].articleNumber.value === undefined,
+  JSON.stringify(listing.buildItemPayload(db, rkId, LEGACY_TAX).payload.variants['rk-smoke-1'].articleNumber));
 
 // カタログIDなしの理由は選んだ値で送る (未選択なら 5)
 db.prepare(`UPDATE draft_rakuten SET catalog_id_exemption_reason = 3 WHERE draft_id = ?`).run(rkId);
 check('payload: カタログIDなしの理由は選んだ値で送る',
-  listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.exemptionReason === 3);
+  listing.buildItemPayload(db, rkId, LEGACY_TAX).payload.variants['rk-smoke-1'].articleNumber.exemptionReason === 3);
 // 1 (セット商品) は articleNumberForSet が要るのでまだ送れない → 止める
 db.prepare(`UPDATE draft_rakuten SET catalog_id_exemption_reason = 1 WHERE draft_id = ?`).run(rkId);
 check('payload: 理由1 (セット商品) は未対応として止める',
-  listing.buildItemPayload(db, rkId).ok === false);
+  listing.buildItemPayload(db, rkId, LEGACY_TAX).ok === false);
 db.prepare(`UPDATE draft_rakuten SET catalog_id_exemption_reason = NULL WHERE draft_id = ?`).run(rkId);
 
 // JAN があればそれをカタログIDとして送る (免除理由より優先)
 db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
 check('payload: JANがあればカタログIDとして value で送る',
-  listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.value === '4901234567894',
-  JSON.stringify(listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber));
+  listing.buildItemPayload(db, rkId, LEGACY_TAX).payload.variants['rk-smoke-1'].articleNumber.value === '4901234567894',
+  JSON.stringify(listing.buildItemPayload(db, rkId, LEGACY_TAX).payload.variants['rk-smoke-1'].articleNumber));
 db.prepare(`UPDATE product_drafts SET jan_code = NULL WHERE id = ?`).run(rkId);
 
 // ─── 2026-07-27 出品仕様: 税率 / JAN / 配送 / 納期 / 白抜き / 画像20枚 ───
@@ -1356,7 +1360,7 @@ check('isValidGtin: チェックデジット不一致/桁数違い/非数字を�
 db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '8%' });
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5', postage_included = 1, normal_delivery_date_id = '1000' WHERE draft_id = ?`).run(rkId);
-built = listing.buildItemPayload(db, rkId);
+built = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 const rkVar = built.payload?.variants?.['rk-smoke-1'] || {};
 // 2026-07-28 本番検証: 属性辞書はジャンルごとで「カタログID」が無いジャンル (111145実測) では
 // IE1002 で登録自体が失敗する → **自動付与しない**。手入力した場合だけ送る (JAN欄との一致検証あり)
@@ -1383,12 +1387,12 @@ check('freshCabinetMap/cabinetKeyOf: ID+更新日時で突合する',
     .run(rkId, imgRow.drive_file_id);
   db.prepare(`UPDATE draft_images SET drive_modified_time = 'NEW' WHERE draft_id = ? AND drive_file_id = ?`)
     .run(rkId, imgRow.drive_file_id);
-  const stale = listing.buildItemPayload(db, rkId);
+  const stale = listing.buildItemPayload(db, rkId, LEGACY_TAX);
   check('payload: Driveで上書きされた画像は「未転送」に落ちて登録が止まる',
     (stale.reasons || []).some((r) => r.includes('未転送')), JSON.stringify(stale.reasons));
   db.prepare(`UPDATE draft_cabinet_images SET drive_modified_time = 'NEW' WHERE draft_id = ? AND drive_file_id = ?`)
     .run(rkId, imgRow.drive_file_id);
-  const okAgain = listing.buildItemPayload(db, rkId);
+  const okAgain = listing.buildItemPayload(db, rkId, LEGACY_TAX);
   check('payload: 再転送 (更新日時が一致) すれば未転送の理由は消える',
     !(okAgain.reasons || []).some((r) => r.includes('未転送')), JSON.stringify(okAgain.reasons));
   // 復元
@@ -1406,12 +1410,12 @@ check('freshCabinetMap/cabinetKeyOf: ID+更新日時で突合する',
 {
   const sortsBefore = db.prepare('SELECT id, sort FROM draft_images WHERE draft_id = ?').all(rkId);
   db.prepare('UPDATE draft_images SET sort = sort + 1 WHERE draft_id = ?').run(rkId);
-  const noTop = listing.buildItemPayload(db, rkId);
+  const noTop = listing.buildItemPayload(db, rkId, LEGACY_TAX);
   check('payload: 枠1 (_top) が空なら登録を止める',
     (noTop.reasons || []).some((r) => r.includes('TOP画像がありません')), JSON.stringify(noTop.reasons));
   const restore = db.prepare('UPDATE draft_images SET sort = ? WHERE id = ?');
   for (const r of sortsBefore) restore.run(r.sort, r.id);
-  const withTop = listing.buildItemPayload(db, rkId);
+  const withTop = listing.buildItemPayload(db, rkId, LEGACY_TAX);
   check('payload: 枠1が埋まっていれば TOP画像の理由は出ない',
     !(withTop.reasons || []).some((r) => r.includes('TOP画像がありません')), JSON.stringify(withTop.reasons));
 }
@@ -1430,7 +1434,7 @@ check('payload: 販売説明文 (画像HTML) にはバナーを入れない (商
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL WHERE draft_id = ?`).run(rkId);
 db.prepare(`INSERT OR REPLACE INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 原価, 送料, 配送方法, 消費税率, updated_at)
   VALUES (99401, 'rk-smoke-1', '出品smoke', '1', '取扱中', 'ok', 660, 120, '定形外', 0.1, '2026-08-03T00:00:00Z')`).run();
-let bNe = listing.buildItemPayload(db, rkId);
+let bNe = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 // 🚨 RMS へ送る配送方法は **セットだけ** NE へフォールバックする (§4.4 決⑥)。
 // 単品まで NE に落とすと、いま店舗デフォルトで出ている商品の配送方法が黙って変わるため。
 // では単品はどうするか → **選んでいないなら出品を止める** (中原さん判断 2026-09-05)。
@@ -1545,7 +1549,7 @@ check('shippingSelectValueOf: ヤフー別扱いのときだけ複合キーへ�
   const leaked = [];
   for (const choice of [...Object.keys(listing.SHIPPING_METHOD_GROUPS), ...Object.keys(listing.YAHOO_OVERRIDE_SHIPPING_GROUPS)]) {
     setGroup.run(choice, rkId);
-    const b = listing.buildItemPayload(db, rkId);
+    const b = listing.buildItemPayload(db, rkId, LEGACY_TAX);
     if ((b.reasons || []).some((r) => r.includes('配送方法'))) blocked.push(choice);
     const sent = b.payload?.variants?.['rk-smoke-1']?.shipping?.shippingMethodGroup;
     if (sent !== undefined && !listing.SHIPPING_METHOD_GROUPS[sent]) leaked.push(`${choice}→${sent}`);
@@ -1556,7 +1560,7 @@ check('shippingSelectValueOf: ヤフー別扱いのときだけ複合キーへ�
     leaked.length === 0, leaked.join(','));
   // 複合を選んだときは楽天=定形外として出る (ページ表記・バナーと同じ扱い)
   setGroup.run('1y5', rkId);
-  const bOv = listing.buildItemPayload(db, rkId);
+  const bOv = listing.buildItemPayload(db, rkId, LEGACY_TAX);
   check('payload: 複合(1y5)は楽天グループ1 (定形外) で送る',
     bOv.ok === true && bOv.payload.variants['rk-smoke-1'].shipping.shippingMethodGroup === '1',
     JSON.stringify(bOv.payload?.variants?.['rk-smoke-1']?.shipping || bOv.reasons));
@@ -1687,7 +1691,7 @@ db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id 
 const capIns = db.prepare('INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, ?)');
 const capCab = db.prepare('INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, ?, ?)');
 for (let i = 1; i <= 16; i++) { capIns.run(rkId, `gcap${i}`); capCab.run(rkId, `gcap${i}`, `/app-newitems/rk-smoke-1-cap${i}.jpg`); }
-let bCap = listing.buildItemPayload(db, rkId); // 商品17枚 + バナー4枚 = 21
+let bCap = listing.buildItemPayload(db, rkId, LEGACY_TAX); // 商品17枚 + バナー4枚 = 21
 check('payload: 商品画像+自動追加バナーで20枚超は理由で止める',
   bCap.ok === false && bCap.reasons.some((r) => r.includes('自動追加バナー')), JSON.stringify(bCap.reasons));
 db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id LIKE 'gcap%'`).run(rkId);
@@ -1695,14 +1699,21 @@ db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_i
 
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
 check('payload: 10% も payment.taxRate 0.1 を明示して送る (2026-08-05〜)',
-  listing.buildItemPayload(db, rkId).payload?.payment?.taxRate === 0.1);
+  listing.buildItemPayload(db, rkId, LEGACY_TAX).payload?.payment?.taxRate === 0.1);
+// 🚨 切替で古い入口を閉じた後 (PR #1565 R1 H5): 税率は Company DB の値だけ (draft_yahoo の 10% は使わない)・決められない = 止める・決め方が無い = 止める
+{ const bCdb = listing.buildItemPayload(db, rkId, { tax: { mode: 'cdb', percent: 8, label: '8%' } });
+  check('payload: 閉じた後は Company DB の税率 (8%) を送る (draft_yahoo は 10%)', bCdb.ok === true && bCdb.payload?.payment?.taxRate === 0.08, JSON.stringify(bCdb.reasons || null)); }
+{ const bBlk = listing.buildItemPayload(db, rkId, { tax: { mode: 'blocked', reason: '税率を Company DB から決められないので出品を止めています: 試験' } });
+  check('payload: 閉じた後に税率を決められない = 出品を止める (理由つき)', bBlk.ok === false && bBlk.reasons.some((r) => r.includes('決められないので出品を止め')), JSON.stringify(bBlk.reasons)); }
+{ const bNone = listing.buildItemPayload(db, rkId);
+  check('payload: 税率の決め方を渡さない呼び方は止める (fail-closed)', bNone.ok === false && bNone.reasons.some((r) => r.includes('税率の決め方')), JSON.stringify(bNone.reasons)); }
 
 // 白抜き背景: 未転送なら理由を返し、転送済みなら whiteBgImage 別枠 (images には入れない)
 db.prepare(`UPDATE draft_rakuten SET white_bg_drive_file_id = 'gwhite', white_bg_drive_url = 'https://drive.google.com/file/d/gwhite/view' WHERE draft_id = ?`).run(rkId);
-let b27 = listing.buildItemPayload(db, rkId);
+let b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 白抜き未転送は理由を返す', b27.ok === false && b27.reasons.some((r) => r.includes('白抜き')), JSON.stringify(b27.reasons));
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gwhite', '/app-newitems/rk-smoke-1-white.jpg')`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: whiteBgImage は images と別枠',
   b27.ok === true
   && b27.payload.whiteBgImage?.location === '/app-newitems/rk-smoke-1-white.jpg'
@@ -1712,7 +1723,7 @@ check('payload: 販売説明文にも白抜き画像は入れない', !b27.paylo
 
 // 不正値は理由で弾く
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '99', normal_delivery_date_id = 'abc' WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 配送方法/納期の不正値を弾く',
   b27.ok === false && b27.reasons.some((r) => r.includes('配送方法')) && b27.reasons.some((r) => r.includes('納期')),
   JSON.stringify(b27.reasons));
@@ -1721,21 +1732,21 @@ db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5', normal_deliver
 
 // 税率の不正値は fail-closed (Codex R1 Medium-1)
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '9.6%' });
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 税率の不正値を弾く (8/10/空欄のみ)', b27.ok === false && b27.reasons.some((r) => r.includes('税率')), JSON.stringify(b27.reasons));
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
 
 // 商品属性の行に「カタログID」を手入力する経路は廃止 (2026-09-02: 入口は基本情報タブだけ)。
 // JAN欄と一致していても弾く (旧データの掃除を促す)
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567894"]}]' WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 属性行のカタログIDは弾く (入口は基本情報タブだけ)',
   b27.ok === false && b27.reasons.some((r) => r.includes('属性の行に「カタログID」')), JSON.stringify(b27.reasons));
 
 // JAN欄の不正値 (チェックデジット違い) は止める
 db.prepare(`UPDATE product_drafts SET jan_code = '4901234567890' WHERE id = ?`).run(rkId);
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["ノーブランド品"]}]' WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: JAN欄の不正値を弾く',
   b27.ok === false && b27.reasons.some((r) => r.includes('JANコード') && r.includes('不正')), JSON.stringify(b27.reasons));
 db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
@@ -1743,18 +1754,18 @@ db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド�
 
 // 転送後に削除した画像は送らない (Codex R1 Medium-2: draft_images との JOIN)
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gstale', '/app-newitems/rk-smoke-1-stale.jpg')`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 削除済み画像 (転送履歴のみ) は送らない',
   b27.ok === true && b27.payload.images.every((i) => !i.location.includes('stale')), JSON.stringify(b27.reasons || b27.payload?.images));
 
 // ─── 商品ページ表記の統合 (Codex R1 high: import だけで未統合だった回帰) ───
 db.prepare(`INSERT INTO draft_page_info (draft_id, product_type, content_volume) VALUES (?, 'cosmetics', '50ml')`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 化粧品の必須記載不足は登録をブロック',
   b27.ok === false && b27.reasons.some((r) => r.includes('商品ページ表記')), JSON.stringify(b27.reasons));
 db.prepare(`UPDATE draft_page_info SET seller_name = 'メーカーA', origin_type = '日本製', category_label = '化粧品' WHERE draft_id = ?`).run(rkId);
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 // 発送方法の行は出さない (2026-08-31 中原さん: 表には不要。配送方法は画像末尾のバナーで見せている)
 check('payload: 充足すると説明文末尾に表を連結 (発送方法の行は出さない)',
   b27.ok === true
@@ -1766,7 +1777,7 @@ check('payload: 充足すると説明文末尾に表を連結 (発送方法の�
 check('payload: 表は説明文の末尾に付く', b27.payload.productDescription.pc.trim().endsWith('</table>'));
 // 仕様表とページ表記の同名ラベルはページ表記が正 (Codex R1 Medium: 重複行を作らない)
 db.prepare(`UPDATE draft_page_info SET size_text = '約W5cm' WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 仕様表とページ表記の同名ラベルはページ表記が正 (サイズ行は1つ)',
   b27.ok === true
   && (b27.payload.productDescription.pc.match(/<b>サイズ<\/b>/g) || []).length === 1
@@ -1777,7 +1788,7 @@ db.prepare(`UPDATE draft_page_info SET size_text = NULL WHERE draft_id = ?`).run
 // 発送方法の行を出さない状態を作る (バナーの付かない配送方法。NULL にすると出品ゲートで止まる)
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '4' WHERE draft_id = ?`).run(rkId);
 db.prepare(`DELETE FROM draft_page_info WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: page_info 未保存でも説明は表形式 (表記の行だけ載らない)',
   b27.ok === true
   && b27.payload.productDescription.pc.includes('<b>説明</b>')
@@ -1786,7 +1797,7 @@ check('payload: page_info 未保存でも説明は表形式 (表記の行だけ�
 
 // 未転送の画像があれば止める
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gnotyet')`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 未転送の商品画像があれば止める', b27.ok === false && b27.reasons.some((r) => r.includes('未転送')), JSON.stringify(b27.reasons));
 db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'gnotyet'`).run(rkId);
 
@@ -1794,7 +1805,7 @@ db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'gno
 const insImg21 = db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, ?)`);
 const insCab = db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, ?, ?)`);
 for (let i = 2; i <= 21; i++) { insImg21.run(rkId, `gfile${i}`); insCab.run(rkId, `gfile${i}`, `/app-newitems/rk-smoke-1-${i}.jpg`); }
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 画像は20枚まで', b27.ok === false && b27.reasons.some((r) => r.includes('20')), JSON.stringify(b27.reasons));
 
 // 公開切替は「アプリから登録済み」のドラフト限定 (registered_at 無しは RMS に接続せず拒否)
@@ -1812,7 +1823,7 @@ db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_l
 // 出品できる状態にする (TOP画像 sort=0 + 詳細画像は対象外) → 残る不足は項目選択肢だけ
 db.prepare('UPDATE draft_images SET sort = 0 WHERE draft_id = ?').run(rkvId);
 db.prepare('UPDATE product_drafts SET detail_images_excluded = 1, jan_code = NULL WHERE id = ?').run(rkvId);
-let bv = listing.buildItemPayload(db, rkvId);
+let bv = listing.buildItemPayload(db, rkvId, LEGACY_TAX);
 check('カラバリ: 項目選択肢の見出しと値が無ければ止める',
   bv.ok === false
   && bv.reasons.some((r) => r.includes('項目名'))
@@ -1827,7 +1838,7 @@ insSel.run(rkvId, 'rkv-b', 'ホワイト');
 db.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(rkvId, 'rkv-a', '4901234567894');
 // SKU別売価 (画面入力) が最優先。NE の標準売価より強い
 db.prepare('INSERT INTO draft_sku_prices (draft_id, sku_code, price) VALUES (?, ?, ?)').run(rkvId, 'rkv-a', 2480);
-bv = listing.buildItemPayload(db, rkvId);
+bv = listing.buildItemPayload(db, rkvId, LEGACY_TAX);
 check('カラバリ: SKU別売価 (画面入力) が NE の標準売価より優先される',
   bv.ok === true && bv.payload.variants['rkv-a'].standardPrice === 2480,
   JSON.stringify(bv.ok ? bv.payload.variants['rkv-a'] : bv.reasons));
@@ -1980,7 +1991,7 @@ db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gd1')
 // (ここの主題はジャンル辞書の検証。画像ゲート自体は専用ブロックで検証している)
 db.prepare(`UPDATE product_drafts SET detail_images_excluded = 1 WHERE id = ?`).run(gdId);
 
-let gb = listing.buildItemPayload(db, gdId);
+let gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: 必須が揃っていれば通り、カタログIDはJAN欄から自動付与 (辞書にあるジャンル)',
   gb.ok === true
   && gb.payload.variants['gd-smoke-1'].attributes.some((a) => a.name === 'カタログID' && a.values[0] === '4999999999999'),
@@ -1988,19 +1999,19 @@ check('genre: 必須が揃っていれば通り、カタログIDはJAN欄から�
 
 // 辞書に無い属性名は登録前に止める (IE1002 の事前検知)
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]},{"name":"存在しない属性","values":["y"]}]' WHERE draft_id = ?`).run(gdId);
-gb = listing.buildItemPayload(db, gdId);
+gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: 辞書に無い属性名を事前に止める (IE1002対策)',
   gb.ok === false && gb.reasons.some((r) => r.includes('存在しない属性') && r.includes('IE1002')), JSON.stringify(gb.reasons));
 
 // 必須属性の欠落を事前に止める
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["x"]}]' WHERE draft_id = ?`).run(gdId);
-gb = listing.buildItemPayload(db, gdId);
+gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: 必須属性の欠落を事前に止める',
   gb.ok === false && gb.reasons.some((r) => r.includes('必須属性「代表カラー」')), JSON.stringify(gb.reasons));
 
 // multiValueLimit / maxLength
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["a","b","c","d"]},{"name":"代表カラー","values":["黒"]}]' WHERE draft_id = ?`).run(gdId);
-gb = listing.buildItemPayload(db, gdId);
+gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: 値の個数上限を事前に止める', gb.ok === false && gb.reasons.some((r) => r.includes('最大 3 個')), JSON.stringify(gb.reasons));
 
 // 数値の属性 (総容量・総重量 など。fixture では「総枚数」= NUMBER・単位 枚) — 2026-09-14 cassisp30 の IE0418
@@ -2012,23 +2023,23 @@ check('genre: 値の個数上限を事前に止める', gb.ok === false && gb.re
   const cases = [['30枚', '30'], ['３０', '30'], ['30', '30'], [' 1,000 枚 ', '1000'], ['2.5', '2.5']];
   for (const [input, want] of cases) {
     put(input);
-    const b = listing.buildItemPayload(db, gdId);
+    const b = listing.buildItemPayload(db, gdId, LEGACY_TAX);
     const a = attrOf(b);
     check(`数値の属性: 「${input}」→ values ['${want}'] + unit '枚'`,
       !!a && a.values.length === 1 && a.values[0] === want && a.unit === '枚', JSON.stringify(b.ok ? a : b.reasons));
   }
   put('三十枚');
-  let b = listing.buildItemPayload(db, gdId);
+  let b = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性: 数値で始まらない値は送る前に止める (単位の例つき)',
     b.ok === false && b.reasons.some((r) => r.includes('総枚数') && r.includes('数値で入れて') && r.includes('30枚')), JSON.stringify(b.reasons));
   put('1234567890');
-  b = listing.buildItemPayload(db, gdId);
+  b = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性: 上限 (999999999) を超える値は止める', b.ok === false && b.reasons.some((r) => r.includes('総枚数') && r.includes('大きすぎる')), JSON.stringify(b.reasons));
   put('1.12345678');
-  b = listing.buildItemPayload(db, gdId);
+  b = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性: 小数 8 桁は止める', b.ok === false && b.reasons.some((r) => r.includes('総枚数') && r.includes('7 桁')), JSON.stringify(b.reasons));
   put('30枚');
-  b = listing.buildItemPayload(db, gdId);
+  b = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性: 文字の属性 (ブランド名) と カタログID は変えない (unit を付けない)',
     b.ok === true && b.payload.variants['gd-smoke-1'].attributes.filter((a) => a.name !== '総枚数').every((a) => !('unit' in a))
     && b.payload.variants['gd-smoke-1'].attributes.find((a) => a.name === 'ブランド名').values[0] === 'x',
@@ -2069,32 +2080,32 @@ check('splitNumberWithUnit: 数値で始まらない・空は ok:false',
   const put2 = (attrs) => db.prepare("UPDATE draft_rakuten SET genre_id = '900002', attributes_json = ? WHERE draft_id = ?").run(JSON.stringify(attrs), gdId);
   const find = (b, name) => (b.ok ? b.payload.variants['gd-smoke-1'].attributes.find((a) => a.name === name) : null);
   put2([{ name: 'ブランド名', values: ['x'] }, { name: '総重量', values: ['1kg', '2kg'] }]);
-  let b2 = listing.buildItemPayload(db, gdId);
+  let b2 = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性 (複数値): 単位がそろっていれば {values:[1,2], unit:kg}',
     JSON.stringify(find(b2, '総重量')) === JSON.stringify({ name: '総重量', values: ['1', '2'], unit: 'kg' }),
     JSON.stringify(b2.ok ? find(b2, '総重量') : b2.reasons));
   for (const mixed of [['1kg', '500g'], ['1kg', '500']]) {
     put2([{ name: 'ブランド名', values: ['x'] }, { name: '総重量', values: mixed }]);
-    b2 = listing.buildItemPayload(db, gdId);
+    b2 = listing.buildItemPayload(db, gdId, LEGACY_TAX);
     check('数値の属性 (複数値): 単位が違えば送る前に止める (' + mixed.join(' / ') + ')',
       b2.ok === false && b2.reasons.some((r) => r.includes('総重量') && r.includes('そろっていません')), JSON.stringify(b2.reasons));
   }
   check('toRmsAttribute: 単位がそろっていない複数値は変えない (換算しない)',
     JSON.stringify(listing.toRmsAttribute({ name: '総重量', values: ['1kg', '500g'] }, dict2[1])) === JSON.stringify({ name: '総重量', values: ['1kg', '500g'] }));
   put2([{ name: 'ブランド名', values: ['x'] }, { name: '個数', values: ['３'] }]);
-  b2 = listing.buildItemPayload(db, gdId);
+  b2 = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性 (単位なし): 数値だけにそろえ unit は付けない',
     JSON.stringify(find(b2, '個数')) === JSON.stringify({ name: '個数', values: ['3'] }), JSON.stringify(b2.ok ? find(b2, '個数') : b2.reasons));
   put2([{ name: 'ブランド名', values: ['x'] }, { name: '個数', values: ['3個'] }]);
-  b2 = listing.buildItemPayload(db, gdId);
+  b2 = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性 (単位なし): 単位を書いたら止める',
     b2.ok === false && b2.reasons.some((r) => r.includes('個数') && r.includes('単位を付けずに')), JSON.stringify(b2.reasons));
   put2([{ name: 'ブランド名', values: ['x'] }, { name: 'メモ', values: ['30g'] }]);
-  b2 = listing.buildItemPayload(db, gdId);
+  b2 = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('文字の属性は辞書に単位があっても変えない',
     JSON.stringify(find(b2, 'メモ')) === JSON.stringify({ name: 'メモ', values: ['30g'] }), JSON.stringify(b2.ok ? find(b2, 'メモ') : b2.reasons));
   put2([{ name: 'ブランド名', values: ['x'] }, { name: '総重量', values: ['999999999'] }, { name: '個数', values: ['1.1234567'] }]);
-  b2 = listing.buildItemPayload(db, gdId);
+  b2 = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性: 上限ちょうど・小数 7 桁は通る',
     b2.ok === true && find(b2, '総重量').values[0] === '999999999' && find(b2, '総重量').unit === 'g' && find(b2, '個数').values[0] === '1.1234567',
     JSON.stringify(b2.ok ? b2.payload.variants['gd-smoke-1'].attributes : b2.reasons));
@@ -2117,7 +2128,7 @@ check('splitNumberWithUnit: 基準単位と別の知っている単位はそろ�
 
 // 辞書が無いジャンルでは検証もカタログID付与もしない (従来どおり RMS に任せる)
 db.prepare(`UPDATE draft_rakuten SET genre_id = '999999', attributes_json = '[{"name":"何でも属性","values":["z"]}]' WHERE draft_id = ?`).run(gdId);
-gb = listing.buildItemPayload(db, gdId);
+gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: 辞書未取得ジャンルは検証スキップ + カタログID付与なし',
   gb.ok === true
   && !gb.payload.variants['gd-smoke-1'].attributes.some((a) => a.name === 'カタログID'),
@@ -2126,7 +2137,7 @@ check('genre: 辞書未取得ジャンルは検証スキップ + カタログID�
 // JAN欄が空 + 辞書のカタログID必須 → 必須欠落として止まる
 db.prepare(`UPDATE draft_rakuten SET genre_id = '900001', attributes_json = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]}]' WHERE draft_id = ?`).run(gdId);
 db.prepare(`UPDATE product_drafts SET jan_code = NULL WHERE id = ?`).run(gdId);
-gb = listing.buildItemPayload(db, gdId);
+gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラーになる',
   gb.ok === false && gb.reasons.some((r) => r.includes('カタログID') && r.includes('「カタログID」の行')), JSON.stringify(gb.reasons));
 
@@ -2146,14 +2157,14 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   insSelV.run(gdvId, 'gdv-a', '黒');
   insSelV.run(gdvId, 'gdv-b', '白');
   db.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(gdvId, 'gdv-a', '4901234567894');
-  let gv = listing.buildItemPayload(db, gdvId);
+  let gv = listing.buildItemPayload(db, gdvId, LEGACY_TAX);
   check('genre×バリエーション: JAN の無い SKU があると SKU 名つきで止まる (ページ代表の jan_code は見ない)',
     gv.ok === false
     && gv.reasons.some((r) => r.includes('gdv-b') && r.includes('カタログID') && r.includes('SKU表'))
     && !gv.reasons.some((r) => r.includes('gdv-a') && r.includes('カタログID')),
     JSON.stringify(gv.reasons));
   db.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(gdvId, 'gdv-b', '4999999999999');
-  gv = listing.buildItemPayload(db, gdvId);
+  gv = listing.buildItemPayload(db, gdvId, LEGACY_TAX);
   const catOf = (sku) => ((gv.ok && gv.payload.variants[sku].attributes) || []).filter((a) => a.name === 'カタログID').map((a) => a.values[0]);
   check('genre×バリエーション: カタログID属性は SKU ごとに自分の JAN (articleNumber と一致)',
     gv.ok === true
@@ -2164,20 +2175,20 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   const insSkuAttr = db.prepare('INSERT INTO draft_sku_attributes (draft_id, sku_code, name, value) VALUES (?, ?, ?, ?)');
   insSkuAttr.run(gdvId, 'gdv-a', '総枚数', '30枚');
   insSkuAttr.run(gdvId, 'gdv-b', '総枚数', '５');
-  gv = listing.buildItemPayload(db, gdvId);
+  gv = listing.buildItemPayload(db, gdvId, LEGACY_TAX);
   const numOf = (sku) => ((gv.ok && gv.payload.variants[sku].attributes) || []).find((a) => a.name === '総枚数') || null;
   check('genre×バリエーション: SKU 表の数値の属性も SKU ごとに {values:[数値], unit}',
     gv.ok === true && JSON.stringify(numOf('gdv-a')) === JSON.stringify({ name: '総枚数', values: ['30'], unit: '枚' })
     && JSON.stringify(numOf('gdv-b')) === JSON.stringify({ name: '総枚数', values: ['5'], unit: '枚' }),
     JSON.stringify(gv.ok ? gv.payload.variants : gv.reasons));
   db.prepare("UPDATE draft_sku_attributes SET value = '五枚' WHERE draft_id = ? AND sku_code = 'gdv-b' AND name = '総枚数'").run(gdvId);
-  gv = listing.buildItemPayload(db, gdvId);
+  gv = listing.buildItemPayload(db, gdvId, LEGACY_TAX);
   check('genre×バリエーション: 数値で読めない SKU の値は SKU 名つきで止める',
     gv.ok === false && gv.reasons.some((r) => r.includes('gdv-b') && r.includes('総枚数') && r.includes('数値で入れて')), JSON.stringify(gv.reasons));
   db.prepare('DELETE FROM draft_sku_attributes WHERE draft_id = ?').run(gdvId);
   // 辞書に無いジャンルでは SKU にもカタログID属性を付けない (IE1002 対策はバリエーションでも同じ)
   db.prepare(`UPDATE draft_rakuten SET genre_id = '999999', attributes_json = '[]' WHERE draft_id = ?`).run(gdvId);
-  gv = listing.buildItemPayload(db, gdvId);
+  gv = listing.buildItemPayload(db, gdvId, LEGACY_TAX);
   check('genre×バリエーション: 辞書未取得ジャンルでは SKU にカタログID属性を付けない',
     gv.ok === true && catOf('gdv-a').length === 0 && gv.payload.variants['gdv-a'].articleNumber.value === '4901234567894',
     JSON.stringify(gv.ok ? gv.payload.variants : gv.reasons));
@@ -2235,7 +2246,7 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
       && g4.legacyModelConflict === true && g4.bySku.get('gsa-a').get(listing.MODEL_ATTR_NAME).join() === 'NEW',
       JSON.stringify({ g3: g3.legacyModels, g4: g4.legacyModels }));
   }
-  let gs = listing.buildItemPayload(db, gsaId);
+  let gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   const attrsOfSku = (sku) => ((gs.ok && gs.payload.variants[sku].attributes) || []).map((a) => a.name + '=' + a.values.join('|')).sort().join(',');
   check('payload×SKU仕様: SKU ごとに違う代表カラー + 共通ブランド名 + SKU 別カタログID (辞書に無いメーカー型番は送らない)',
     gs.ok === true
@@ -2244,7 +2255,7 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
     JSON.stringify(gs.ok ? gs.payload.variants : gs.reasons));
   // '' の行 = 明示的に空 (共通の既定値を打ち消す) → その SKU だけ必須欠落
   insAttr.run(gsaId, 'gsa-a', 'ブランド名', '');
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: 空の行は既定値を打ち消し、その SKU だけ SKU 名つきで必須欠落',
     gs.ok === false
     && gs.reasons.some((r) => r.includes('gsa-a') && r.includes('必須属性「ブランド名」'))
@@ -2253,13 +2264,13 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   db.prepare(`DELETE FROM draft_sku_attributes WHERE draft_id = ? AND sku_code = 'gsa-a' AND name = 'ブランド名'`).run(gsaId);
   // 辞書に無い属性名は SKU 名つきで止める
   insAttr.run(gsaId, 'gsa-b', '存在しない属性', 'z');
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: 辞書に無い属性名は SKU 名つきで止める (IE1002 対策)',
     gs.ok === false && gs.reasons.some((r) => r.includes('gsa-b') && r.includes('存在しない属性') && r.includes('IE1002')), JSON.stringify(gs.reasons));
   db.prepare(`DELETE FROM draft_sku_attributes WHERE draft_id = ? AND name = '存在しない属性'`).run(gsaId);
   // SKU 行に「カタログID」は入れさせない (JAN は専用行)
   insAttr.run(gsaId, 'gsa-a', 'カタログID', '4901234567894');
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: SKU 行の「カタログID」は止める', gs.ok === false && gs.reasons.some((r) => r.includes('gsa-a') && r.includes('「カタログID」の行')), JSON.stringify(gs.reasons));
   db.prepare(`DELETE FROM draft_sku_attributes WHERE draft_id = ? AND name = 'カタログID'`).run(gsaId);
   // SKU ごとの「IDなしの理由」: 辞書の無いジャンルで b の JAN を外し、b だけ理由 3
@@ -2267,45 +2278,45 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   db.prepare(`DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = 'gsa-b'`).run(gsaId);
   db.prepare('INSERT INTO draft_sku_catalog_exemptions (draft_id, sku_code, reason) VALUES (?, ?, 3)').run(gsaId, 'gsa-b');
   db.prepare(`UPDATE draft_rakuten SET catalog_id_exemption_reason = 4 WHERE draft_id = ?`).run(gsaId);
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: カタログIDなしの理由は SKU ごと (無い SKU はページ共通の理由)',
     gs.ok === true
     && gs.payload.variants['gsa-a'].articleNumber.value === '4901234567894'
     && gs.payload.variants['gsa-b'].articleNumber.exemptionReason === 3,
     JSON.stringify(gs.ok ? gs.payload.variants : gs.reasons));
   db.prepare(`DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = 'gsa-a'`).run(gsaId);
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: SKU の理由が無ければページ共通の理由で送る',
     gs.ok === true && gs.payload.variants['gsa-a'].articleNumber.exemptionReason === 4, JSON.stringify(gs.ok ? gs.payload.variants : gs.reasons));
   // 理由 1 (セット商品) は SKU 単位で未対応チェック
   db.prepare(`UPDATE draft_sku_catalog_exemptions SET reason = 1 WHERE draft_id = ? AND sku_code = 'gsa-b'`).run(gsaId);
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: SKU の理由 1 (セット商品) は未対応で止める', gs.ok === false && gs.reasons.some((r) => r.includes('セット商品')), JSON.stringify(gs.reasons));
   db.prepare(`UPDATE draft_sku_catalog_exemptions SET reason = 3 WHERE draft_id = ? AND sku_code = 'gsa-b'`).run(gsaId);
   // 共通の多値属性はそのまま複数値で送る (Codex R1 medium)。辞書 900001 の ブランド名 は multiValueLimit 3
   insJanA.run(gsaId, 'gsa-a', '4901234567894'); insJanA.run(gsaId, 'gsa-b', '4999999999999');
   db.prepare(`UPDATE draft_rakuten SET genre_id = '900001', attributes_json = '[{"name":"ブランド名","values":["A","B"]}]' WHERE draft_id = ?`).run(gsaId);
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: 共通の多値属性は values 配列のまま送る',
     gs.ok === true && (gs.payload.variants['gsa-a'].attributes.find((a) => a.name === 'ブランド名') || {}).values.join(',') === 'A,B',
     JSON.stringify(gs.ok ? gs.payload.variants['gsa-a'].attributes : gs.reasons));
   insAttr.run(gsaId, 'gsa-a', 'ブランド名', 'P | Q | R | S');
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: SKU 行の | 区切りも複数値として上限 (3 個) を検査する',
     gs.ok === false && gs.reasons.some((r) => r.includes('gsa-a') && r.includes('最大 3 個')), JSON.stringify(gs.reasons));
   db.prepare(`DELETE FROM draft_sku_attributes WHERE draft_id = ? AND name = 'ブランド名'`).run(gsaId);
   // 旧データでメーカー型番が食い違っているバリエーション: SKU 表の行が全 SKU に入るまで止める (Codex R1 high)
   db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["A"]},{"name":"メーカー型番","values":["OLD"]}]', article_number = 'NEW' WHERE draft_id = ?`).run(gsaId);
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: 旧メーカー型番の食い違いは SKU 表への入力を促して止める (黙って捨てない)',
     gs.ok === false && gs.reasons.some((r) => r.includes('食い違って') && r.includes('OLD') && r.includes('NEW')), JSON.stringify(gs.reasons));
   insAttr.run(gsaId, 'gsa-a', listing.MODEL_ATTR_NAME, 'M-A');
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: 全 SKU に SKU 表の値が入れば旧データは使わず通る',
     gs.ok === true, JSON.stringify(gs.ok ? gs.payload.variants : gs.reasons));
   // 旧データの「カタログID」属性が残るバリエーションは、警告ボタンでの削除を促して止める (SKU 表には展開しない)
   db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["A"]},{"name":"カタログID","values":["4901234567894"]}]', article_number = 'NEW' WHERE draft_id = ?`).run(gsaId);
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: 旧データの「カタログID」属性は削除を促して止める (SKU ごとの行にはしない)',
     gs.ok === false && gs.reasons.some((r) => r.includes('旧データ') && r.includes('カタログID') && r.includes('削除'))
     && !gs.reasons.some((r) => r.includes('SKU「gsa-a」の商品仕様に「カタログID」')),
@@ -2338,7 +2349,7 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
 
   // ① 欄に入れれば、属性に メーカー型番 が無くても必須欠落にならず、payload には積まれる
   db.prepare(`UPDATE draft_rakuten SET genre_id = '900002', attributes_json = ?, article_number = 'toys3pen' WHERE draft_id = ?`).run(OK_ATTRS, gdId);
-  let bm = listing.buildItemPayload(db, gdId);
+  let bm = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   const attrsOf = (r) => (r.ok ? r.payload.variants['gd-smoke-1'].attributes || [] : []);
   check('メーカー型番: 欄に入れれば属性行が無くても通り、属性として自動で積まれる',
     bm.ok === true && attrsOf(bm).some((a2) => a2.name === MODEL && a2.values[0] === 'toys3pen'),
@@ -2352,7 +2363,7 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
 
   // ② 欄が空なら、辞書必須の メーカー型番 は今までどおり欠落エラー (黙って通さない)
   db.prepare(`UPDATE draft_rakuten SET article_number = NULL WHERE draft_id = ?`).run(gdId);
-  bm = listing.buildItemPayload(db, gdId);
+  bm = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('メーカー型番: 欄が空なら辞書必須の欠落として止まる',
     bm.ok === false && bm.reasons.some((r) => r.includes(MODEL)), JSON.stringify(bm.reasons));
 
@@ -2360,7 +2371,7 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   db.prepare(`UPDATE draft_rakuten SET article_number = 'toys3pen',
     attributes_json = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]},{"name":"メーカー型番","values":["別の型番"]}]'
     WHERE draft_id = ?`).run(gdId);
-  bm = listing.buildItemPayload(db, gdId);
+  bm = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('メーカー型番: 属性側の旧値と欄が食い違ったら止める',
     bm.ok === false && bm.reasons.some((r) => r.includes('一致しません')), JSON.stringify(bm.reasons));
 
@@ -2368,14 +2379,14 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   db.prepare(`UPDATE draft_rakuten SET attributes_json =
     '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]},{"name":"メーカー型番","values":["toys3pen"]}]'
     WHERE draft_id = ?`).run(gdId);
-  bm = listing.buildItemPayload(db, gdId);
+  bm = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('メーカー型番: 属性側と同じ値なら通り、属性は 1 つだけ (二重に積まない)',
     bm.ok === true && attrsOf(bm).filter((a2) => a2.name === MODEL).length === 1,
     JSON.stringify(bm.ok ? attrsOf(bm) : bm.reasons));
 
   // ⑤ 辞書に メーカー型番 が無いジャンルでは属性に積まない (IE1002 になる)
   db.prepare(`UPDATE draft_rakuten SET genre_id = '900001', attributes_json = ?, article_number = 'toys3pen' WHERE draft_id = ?`).run(OK_ATTRS, gdId);
-  bm = listing.buildItemPayload(db, gdId);
+  bm = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('メーカー型番: 辞書に無いジャンルでは属性に積まない (IE1002 対策)',
     bm.ok === true && !attrsOf(bm).some((a2) => a2.name === MODEL),
     JSON.stringify(bm.ok ? attrsOf(bm) : bm.reasons));
@@ -2386,7 +2397,7 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
 db.prepare(`UPDATE product_drafts SET jan_code = '4999999999999' WHERE id = ?`).run(gdId);
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"存在しない属性","values":["z"]}]' WHERE draft_id = ?`).run(gdId);
 db.prepare(`UPDATE ph_genre_attributes SET fetched_at = '2026-01-01T00:00:00.000Z' WHERE genre_id = '900001'`).run();
-gb = listing.buildItemPayload(db, gdId);
+gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: 鮮度切れ辞書は検証スキップ + カタログID付与なし (RMSに任せる)',
   gb.ok === true
   && !gb.payload.variants['gd-smoke-1'].attributes.some((a) => a.name === 'カタログID'),
@@ -3427,7 +3438,7 @@ let wfDraftId = null;
   // TOP画像は工程でなく「画像が登録されているか」で見る (2026-08-31) ので、
   // ここでは画像を入れて**詳細 (LP) の工程が終わっていない**ことだけをゲートの理由にする
   db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'gate-img-1', 0)`).run(idGate);
-  const blocked = listing.buildItemPayload(db, idGate);
+  const blocked = listing.buildItemPayload(db, idGate, LEGACY_TAX);
   check('画像の工程が未完了なら出品を止める',
     (blocked.reasons || []).some((x) => /画像の工程が終わっていません/.test(x)), JSON.stringify(blocked.reasons || []).slice(0, 200));
   check('止める理由にいまの工程が出る',
@@ -3476,8 +3487,8 @@ let wfDraftId = null;
     wfp.setStepState(idGate, s.step_code, { state: 'done' }, 'admin', ADMIN);
   }
   check('詳細対象外なら TOP 承認だけで画像の理由が消える',
-    !(listing.buildItemPayload(db, idGate).reasons || []).some((x) => /画像トラック/.test(x)),
-    JSON.stringify((listing.buildItemPayload(db, idGate).reasons || []).filter((x) => /画像/.test(x))));
+    !(listing.buildItemPayload(db, idGate, LEGACY_TAX).reasons || []).some((x) => /画像トラック/.test(x)),
+    JSON.stringify((listing.buildItemPayload(db, idGate, LEGACY_TAX).reasons || []).filter((x) => /画像/.test(x))));
   // 対象外を解除すると詳細側が未完了なのでまたブロックされる
   wfp.setDetailImagesExcluded(idGate, false, 'admin', ADMIN);
   check('対象外を解除すると詳細側でまたブロック',
@@ -3566,7 +3577,7 @@ let wfDraftId = null;
     if (s.state !== 'done') wfp.setStepState(idGate, s.step_code, { state: s.step_code === 'imgd_rakuten' ? 'skip' : 'done' }, 'admin', ADMIN);
   }
   check('画像承認まで終われば画像の理由は消える',
-    !(listing.buildItemPayload(db, idGate).reasons || []).some((x) => /画像トラック/.test(x)));
+    !(listing.buildItemPayload(db, idGate, LEGACY_TAX).reasons || []).some((x) => /画像トラック/.test(x)));
 
   // 後から足した画像工程: 既に楽天へ登録済みの商品だけ done で入る (承認者に「出品済みの承認」をさせない)
   const idListedRk = Number(db.prepare(
@@ -3968,7 +3979,7 @@ let wfSetParentId = null;
   check('セットからさらにセットは作れない', nestErr?.status === 400);
 
   // 出品ゲート: 仮コードのままでは出品できない
-  const payload = listing.buildItemPayload(db, r.draftId);
+  const payload = listing.buildItemPayload(db, r.draftId, LEGACY_TAX);
   check('仮コードのままでは出品を止める',
     (payload.reasons || []).some((x) => /商品コードが仮のまま/.test(x)),
     JSON.stringify(payload.reasons || []).slice(0, 200));
@@ -3999,7 +4010,7 @@ let wfSetParentId = null;
   const notInNe = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId);
   check('NE未確認なら仮フラグは残る', notInNe.provisional_code === 1);
   check('NE未確認でも出品は止まる',
-    (listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /NE商品マスタに見つかりません/.test(x)));
+    (listing.buildItemPayload(db, r.draftId, LEGACY_TAX).reasons || []).some((x) => /NE商品マスタに見つかりません/.test(x)));
   check('NEに無いうちは自動確定しない', sd.reconcileProvisionalCode(db, { ...notInNe }) === false);
   // NE 商品マスタに現れたら確定する
   db.prepare(`
@@ -4030,19 +4041,19 @@ let wfSetParentId = null;
     && db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`).get(parentId)?.state === 'todo');
   db.prepare(`DELETE FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`).run(parentId);
   check('確定後は出品ゲートが開く',
-    !(listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /商品コード/.test(x)));
+    !(listing.buildItemPayload(db, r.draftId, LEGACY_TAX).reasons || []).some((x) => /商品コード/.test(x)));
 
   // 配送方法 (§4.4 決⑥ + 2026-09-05 中原さん判断)。
   // セットは親からコピーしないので、**NE の配送方法が唯一の出どころ**。
   // NE にも無ければ「決まらない」ので出品を止める — 送らないまま出すと、
   // 商品ページの帯と楽天の設定が食い違ったまま世に出る
   check('セット: NE に配送方法が無ければ出品を止める',
-    (listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /配送方法が決まりません/.test(x)),
-    JSON.stringify(listing.buildItemPayload(db, r.draftId).reasons || []));
+    (listing.buildItemPayload(db, r.draftId, LEGACY_TAX).reasons || []).some((x) => /配送方法が決まりません/.test(x)),
+    JSON.stringify(listing.buildItemPayload(db, r.draftId, LEGACY_TAX).reasons || []));
   db.prepare(`UPDATE mirror_products SET 配送方法 = 'ネコポス' WHERE 商品コード = 'WF-SET-REAL'`).run();
   check('セット: NE に配送方法が載れば、選ばなくても出品できる (単品と違うのはここ)',
-    !(listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /配送方法/.test(x)),
-    JSON.stringify(listing.buildItemPayload(db, r.draftId).reasons || []));
+    !(listing.buildItemPayload(db, r.draftId, LEGACY_TAX).reasons || []).some((x) => /配送方法/.test(x)),
+    JSON.stringify(listing.buildItemPayload(db, r.draftId, LEGACY_TAX).reasons || []));
   // (送る値そのものは payloadShippingGroup の単体テストで見ている。
   //  ここは画像が未登録なので payload まで組み上がらない = 出品ゲートの他の理由が先に立つ)
   check('確定後は Notion カードも作れる',
@@ -4214,15 +4225,15 @@ let wfSetParentId = null;
     check('🚨 制作が done でも、あとから足した「直して使う」の枠は「まだ空」と分かる',
       pend.length === 1 && pend[0].slot === 2, JSON.stringify(pend.map((x) => x.slot)));
     check('🚨 その状態では出品ゲートが止める (工程が done でも)',
-      (listing.buildItemPayload(db, setId).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)),
-      JSON.stringify(listing.buildItemPayload(db, setId).reasons || []));
+      (listing.buildItemPayload(db, setId, LEGACY_TAX).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)),
+      JSON.stringify(listing.buildItemPayload(db, setId, LEGACY_TAX).reasons || []));
     // 画像が届けば止まらない (計画より後に入った画像であること)
     db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, ?, ?)')
       .run(setId, 'made-01', sip.imageSortOfSlot(2));
     check('画像が届けば、計画の枠では止まらなくなる',
       sd.pendingImagePlanSlots(db, setId).length === 0
-      && !(listing.buildItemPayload(db, setId).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)),
-      JSON.stringify(listing.buildItemPayload(db, setId).reasons || []));
+      && !(listing.buildItemPayload(db, setId, LEGACY_TAX).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)),
+      JSON.stringify(listing.buildItemPayload(db, setId, LEGACY_TAX).reasons || []));
 
     // 🚨 指示を変えたら、**前の指示で作った画像では満たされない** (Codex R2 high)。
     // 「2個並べて」の成果物が入っていても、「3個並べて」に変えたら作り直しが要る
@@ -4232,7 +4243,7 @@ let wfSetParentId = null;
       sd.pendingImagePlanSlots(db, setId).map((x) => x.slot).join(',') === '2',
       JSON.stringify(sd.pendingImagePlanSlots(db, setId).map((x) => x.slot)));
     check('🚨 指示を変えたあとは出品も止まる',
-      (listing.buildItemPayload(db, setId).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)));
+      (listing.buildItemPayload(db, setId, LEGACY_TAX).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)));
 
     // 🚨 指定を変えた枠は、変えた先が何であれ前の画像を残さない (Codex R3 high)
     db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, ?, ?)')
@@ -4279,7 +4290,7 @@ let wfSetParentId = null;
         images: db.prepare('SELECT drive_file_id, sort FROM draft_images WHERE draft_id = ?').all(setId),
       }));
     check('🚨 その状態では出品も止まる',
-      (listing.buildItemPayload(db, setId).reasons || []).some((x) => /画像の計画/.test(x)));
+      (listing.buildItemPayload(db, setId, LEGACY_TAX).reasons || []).some((x) => /画像の計画/.test(x)));
     check('使わない枠は空でよい (未達に数えない)',
       !sd.pendingImagePlanSlots(db, setId).some((x) => x.action === 'drop'));
     db.prepare('DELETE FROM draft_images WHERE draft_id = ?').run(setId);
@@ -5254,6 +5265,8 @@ let wfSetParentId = null;
   const wfp = wfpEarly;
   const express = (await import('express')).default;
   const routerMod = await import('../router.js');
+  // 切替の段階 = legacy_open (マスタの古い入口の門を今までどおり通す。門そのものの試験は scripts/test-master-legacy-gate.mjs)
+  (await import('../../../lib/master-legacy-gate.mjs')).__setLegacyPhaseReader(async () => ({ readable: true, phase: 'legacy_open' }));
   const app = express();
   // セッションを偽装して直接マウント (本番は server.js の requireAppAccess を通る)
   // 一部のテストは一般ユーザーとして叩く (smokeSession を差し替える)
@@ -6664,8 +6677,8 @@ let wfSetParentId = null;
     check('配送: ジャンルだけ保存しても配送方法は未選択のまま (勝手に確定しない)',
       r0.status === 200 && !shipOf()?.shipping_method_group, JSON.stringify(shipOf()));
     check('配送: 未選択のままでは出品できない',
-      (listing.buildItemPayload(db, idSh).reasons || []).some((x) => /配送方法を選んでください/.test(x)),
-      JSON.stringify(listing.buildItemPayload(db, idSh).reasons || []));
+      (listing.buildItemPayload(db, idSh, LEGACY_TAX).reasons || []).some((x) => /配送方法を選んでください/.test(x)),
+      JSON.stringify(listing.buildItemPayload(db, idSh, LEGACY_TAX).reasons || []));
 
     // ③ 人が選んで保存すれば入る (「これにする」= NE の値でも、選んだのは人)
     r0 = await call('POST', `/api/drafts/${idSh}/rakuten`, { genre_id: '565004', shipping_method_group: '5' });
@@ -6694,8 +6707,8 @@ let wfSetParentId = null;
       htmlSet.includes('セットは NE の配送方法') && !htmlSet.includes('未選択です（このままでは出品できません）'),
       htmlSet.includes('未選択です（このままでは出品できません）') ? '単品と同じ警告が出ている' : '案内が出ていない');
     check('配送: セットは選んでいなくても配送方法では止まらない',
-      !(listing.buildItemPayload(db, idShSet).reasons || []).some((x) => /配送方法/.test(x)),
-      JSON.stringify(listing.buildItemPayload(db, idShSet).reasons || []));
+      !(listing.buildItemPayload(db, idShSet, LEGACY_TAX).reasons || []).some((x) => /配送方法/.test(x)),
+      JSON.stringify(listing.buildItemPayload(db, idShSet, LEGACY_TAX).reasons || []));
     db.prepare('DELETE FROM mirror_products WHERE product_id = 99451').run();
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idShSet);
 

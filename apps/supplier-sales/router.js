@@ -12,6 +12,7 @@
  *  POST /api/tokens/:id/revoke    トークン失効
  */
 import express from 'express';
+import { masterLegacyGate } from '../../lib/master-legacy-gate.mjs';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { getSupplierReport, getSupplierDailyDetail, getUnresolvedStats, MALL_LABELS } from './aggregate.js';
 import { buildCsv, buildDailyCsv } from './csv.js';
@@ -21,6 +22,8 @@ import {
 } from './share-db.js';
 
 const router = express.Router();
+// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #8・PR #1565 R1 H4)。仕入先の表示名 (POST /api/supplier-name) は切替の段階が legacy_open のときだけ
+router.use(masterLegacyGate('supplier-sales'));
 
 router.get('/', (req, res) => {
   res.render('supplier-sales', {

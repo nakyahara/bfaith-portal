@@ -25,6 +25,7 @@ import { mountSkuMasterApi } from './sku-master-api.js';
 import { isRender } from '../../lib/is-render.js';
 import { importSkuMasterCSV } from './import-sku-master.js';
 import { resolveTaxRate, resolveSetTaxRate, resolveSetSalesClass, KNOWN_DECIMAL_RATES } from './rebuild-m-products.js';
+import { masterLegacyGate, legacyRecheck, legacyBannerHtml, legacyGateStatus, legacyAckHost } from '../../lib/master-legacy-gate.mjs';
 
 const router = Router();
 const upload = multer({ dest: 'data/import/' });
@@ -84,6 +85,11 @@ export function rejectWritesOnRender(req, res, next) {
 
 router.use(rejectWritesOnRender);
 router.use(requireApiKey);
+// 🚨 マスタの古い入口の門 (Company DB構想 14 §5・§10 契約 v3 H1)。config/master-legacy-entries.mjs の warehouse の入口だけを見る:
+//    切替の段階が legacy_open のときだけ今までどおり書ける。frozen 以降・段階が読めない = 410 / 503 (何も書かない)。
+//    画面 (/register と /) は res.locals.masterLegacy で帯を出す。multer の取込 (CSV) より前 = 閉じているときはファイルを受け取らない。
+//    CSV はファイルを受け取った後・書く前にもう一度読む (legacyRecheck。受け取っている間に段階が変わっても書かない)
+router.use(masterLegacyGate('warehouse'));
 router.use(ensureDB);
 
 // ─── ヘルパー ───
@@ -97,6 +103,17 @@ function preparedQuery(sql, params = []) {
   const db = getDB();
   return db.prepare(sql).all(...params);
 }
+
+// ─── GET /api/master-legacy-gate ───
+// 切替の手順の「全部の環境で古い入口が閉じたかを読み戻す」用 (契約 v3 H1)。この環境・このプロセスが見ている段階を毎回読んで返す
+// (段階・書けるか・持ち主表と入口の一覧の指紋)。読むだけ
+router.get('/api/master-legacy-gate', async (req, res) => {
+  try {
+    res.json(await legacyGateStatus({ host: legacyAckHost() }));   // server.js の門の記録と同じ判定 (手元の PC = null = 記録を書かない)
+  } catch (e) {
+    res.status(500).json({ error: '門の状態を読めませんでした', detail: String(e && e.message) });
+  }
+});
 
 // ─── GET /api/stats ───
 
@@ -618,7 +635,7 @@ function parseCsvBuffer(buf) {
 
 // POST /api/csv/shipping — 送料CSV一括登録（追加・更新、既存は消さない）
 // CSV形式: 商品コード, 送料コード, 配送方法, 送料
-router.post('/api/csv/shipping', upload.single('file'), (req, res) => {
+router.post('/api/csv/shipping', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/shipping'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -672,7 +689,7 @@ router.post('/api/csv/shipping', upload.single('file'), (req, res) => {
 
 // POST /api/csv/genka — 原価CSV一括登録
 // CSV形式: 商品コード, 原価, 商品名（任意）
-router.post('/api/csv/genka', upload.single('file'), (req, res) => {
+router.post('/api/csv/genka', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/genka'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -714,7 +731,7 @@ function uploadSkuMasterMw(req, res, next) {
     return res.status(400).json({ error: 'アップロード処理に失敗しました' });
   });
 }
-router.post('/api/csv/m-sku-master', uploadSkuMasterMw, (req, res) => {
+router.post('/api/csv/m-sku-master', uploadSkuMasterMw, legacyRecheck('warehouse:POST:/api/csv/m-sku-master'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const csvPath = req.file.path;
   const dryRun = req.query.dry_run === '1';
@@ -1231,7 +1248,7 @@ router.post('/api/sales_class', (req, res) => {
 // 売上分類CSV一括登録
 // CSV形式: 商品コード, 売上分類(1-4)
 
-router.post('/api/csv/sales_class', upload.single('file'), (req, res) => {
+router.post('/api/csv/sales_class', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/sales_class'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -1368,7 +1385,7 @@ router.get('/api/reorder/unregistered', (req, res) => {
 
 // POST /api/csv/reorder_setting — 推奨保有月数CSV一括登録
 //   CSV形式: 商品コード, 推奨保有月数(0〜60) ／ ヘッダー行は自動スキップ
-router.post('/api/csv/reorder_setting', upload.single('file'), (req, res) => {
+router.post('/api/csv/reorder_setting', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/reorder_setting'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -1455,7 +1472,7 @@ router.post('/api/tax_rate', (req, res) => {
 // 消費税率CSV一括登録
 // CSV形式: 商品コード, 税率(0.08 or 0.1)
 
-router.post('/api/csv/tax_rate', upload.single('file'), (req, res) => {
+router.post('/api/csv/tax_rate', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/tax_rate'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -1640,14 +1657,14 @@ router.get('/register', (req, res) => {
     email: sess.email || '',
     displayName: sess.displayName || '',
     role: sess.role || '',
-  }));
+  }, res.locals.masterLegacy));
 });
 
 // ─── ダッシュボード（HTML）───
 
 router.get('/', (req, res) => {
   const stats = getStats();
-  res.send(renderDashboard(stats));
+  res.send(renderDashboard(stats, res.locals.masterLegacy));
 });
 
 function escapeHtml(s) {
@@ -1671,7 +1688,14 @@ export function renderOnRenderNotice() {
   </div>`;
 }
 
-function renderRegisterPage(shippingRates, session = {}) {
+// 切替で古い入口を閉じたとき (masterLegacy.frozen) に隠す書く部品 (登録・更新・削除・構成の足し引き・CSV の取込)。見る・検索・CSV ダウンロードは残す
+export const REGISTER_WRITE_SELECTORS = Object.freeze([
+  '[data-act^="reg-"]', '[data-act^="update-"]', '[data-act="del"]', '[data-act="add-sku-row"]', '[data-act="remove-sku-row"]',
+  '[data-act="edit-sku-master"]', '#m-sku-master-new-btn', '#sku-modal-submit', '#sku-modal-comps button', '#csv-card',
+]);
+export const DASHBOARD_WRITE_SELECTORS = Object.freeze(['[data-action^="reg-"]', '[data-action^="update-"]', '[data-action="delete"]']);
+
+function renderRegisterPage(shippingRates, session = {}, legacy = null) {
   const ratesJson = jsonForScriptTag(shippingRates);
   const isAdmin = session.role === 'admin';
   const userLabel = session.displayName || session.email || '';
@@ -1745,6 +1769,7 @@ function renderRegisterPage(shippingRates, session = {}) {
 </head>
 <body>
   ${renderOnRenderNotice()}
+  ${legacyBannerHtml(legacy, { hideSelectors: REGISTER_WRITE_SELECTORS })}
   <div class="header">
     <h1>マスタ登録</h1>
     <div class="spacer"></div>
@@ -1816,7 +1841,7 @@ function renderRegisterPage(shippingRates, session = {}) {
     </div>
 
     <!-- CSV一括アップロード -->
-    <div class="card">
+    <div class="card" id="csv-card">
       <h2>CSV一括アップロード</h2>
       <div class="tabs">
         <button class="active" id="csv-tab-shipping" onclick="switchCsvType('shipping',this)">送料</button>
@@ -1873,7 +1898,7 @@ function renderRegisterPage(shippingRates, session = {}) {
 
     async function api(path, opts) {
       const r = await fetch(B + path, opts);
-      if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.error || r.statusText); }
+      if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.message || e.error || r.statusText); }
       return r.json();
     }
 
@@ -2538,7 +2563,7 @@ function renderRegisterPage(shippingRates, session = {}) {
             document.getElementById('c-reorder').textContent = c.reorder || 0;
           } catch {}
         } else {
-          document.getElementById('csv-result').textContent = '❌ エラー: ' + (data.error || '不明');
+          document.getElementById('csv-result').textContent = '❌ エラー: ' + (data.message || data.error || '不明');
           toast('アップロード失敗', true);
         }
       } catch(e) {
@@ -2554,7 +2579,7 @@ function renderRegisterPage(shippingRates, session = {}) {
 </html>`;
 }
 
-function renderDashboard(stats) {
+function renderDashboard(stats, legacy = null) {
   // 未登録データ件数は重いのでダッシュボード初期表示では取得しない（JSで非同期取得）
   const missingCounts = {};
 
@@ -2609,6 +2634,7 @@ function renderDashboard(stats) {
 </head>
 <body>
   ${renderOnRenderNotice()}
+  ${legacyBannerHtml(legacy, { hideSelectors: DASHBOARD_WRITE_SELECTORS })}
   <div class="header">
     <h1>Data Warehouse</h1>
     <nav>
@@ -2748,7 +2774,7 @@ function renderDashboard(stats) {
       const res = await fetch(BASE + path, opts);
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(data.error || ('HTTP ' + res.status));
+        throw new Error(data.message || data.error || ('HTTP ' + res.status));
       }
       return data;
     }

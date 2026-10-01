@@ -130,10 +130,19 @@ import {
   suggestShopCategories, canAutoApplyShopCategory, countSelectableShopCategories,
   shopCategoriesNeverSaved, isAutoApplyRequestValid,
 } from './lib/shop-categories.js';
+import { masterLegacyGate, legacyBannerHtml, checkLegacyGate, legacyHandler, legacyWriteFence, respondIfLegacyAborted } from '../../lib/master-legacy-gate.mjs';
+import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
+import { resolveListingTax } from './services/listing-tax.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 router.use(express.json({ limit: '512kb' }));
+// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #6・14 §5・契約 v3 H1・PR #1565 R1 H4/H5)。切替の段階が legacy_open のときだけ今までどおり:
+//    税率の手入力 (tax_rate を送る保存) = frozen 以降・段階が読めない = 410 / 503 (何も書かない)。tax_rate を送らない保存 (ほかの欄) は通る。
+//    Notion の取込 (税率も書く)・古い新商品の作り方 (POST /api/drafts・NE のコードから登録・自動取込を手で回す) = 閉じる (新商品は新しい登録の画面から)。
+//    セットを作る = 作るのは通すが、親の税率は写さない (res.locals.masterLegacyWrite.writable のときだけ)。
+//    詳細画面・利益の試算・楽天の出品は Company DB の税率 (listing-tax.mjs)。本文を読んだ後に置く
+router.use(masterLegacyGate('product-hub'));
 
 const view = (name) => path.join(__dirname, 'views', name);
 const actorOf = (req) => req.session?.email || req.session?.displayName || null;
@@ -242,8 +251,34 @@ router.get('/list', (req, res) => {
 router.get('/new', (req, res) => {
   res.render(view('new.ejs'), {
     title: '新規商品ドラフト',
+    // 切替で古い新商品の作り方を閉じた後だけ帯 (登録のボタンを隠す。POST /api/drafts は門が 410)。閉じる前は空文字 = 今までどおり
+    masterLegacyBanner: legacyBannerHtml(res.locals.masterLegacy, { hideSelectors: ['#create-btn'] }),
     displayName: req.session?.displayName || req.session?.email || '',
   });
+});
+
+/**
+ * 詳細画面の税率の見せ方 (中間レビュー 2 回目 M-B):
+ *   'cdb'      = 段階を読めて閉じている (frozen 以降) → Company DB の税率を読む (代表コードは構成の SKU から。混ざる・無い・読めない = 決められない)
+ *   'readonly' = 段階を読めない → 今の値 (draft_yahoo) を見るだけ (Company DB を読みに行かない = 詳細を開くたびに接続を作らない・切替前に「出品は止まります」と出さない)
+ *   'legacy'   = 切替前 → 今までどおり (手入力の欄)
+ */
+function taxModeOf(ml) {
+  if (!ml) return 'legacy';
+  if (ml.readable !== true) return 'readonly';
+  return ml.frozen ? 'cdb' : 'legacy';
+}
+router.get('/detail/:id', async (req, res, next) => {
+  res.locals.taxMode = taxModeOf(res.locals.masterLegacy);
+  if (res.locals.taxMode !== 'cdb') return next();
+  try {
+    const id = Number.parseInt(req.params.id, 10);
+    const draft = Number.isInteger(id) && id > 0 ? getDB().prepare('SELECT * FROM product_drafts WHERE id = ?').get(id) : null;
+    res.locals.cdbTax = draft ? await resolveCdbDraftTax(getDB(), draft) : { ok: false, reason: '商品が無い' };
+  } catch (e) {
+    res.locals.cdbTax = { ok: false, reason: String((e && e.message) || e) };
+  }
+  next();
 });
 
 router.get('/detail/:id', (req, res) => {
@@ -316,12 +351,14 @@ router.get('/detail/:id', (req, res) => {
   for (const r of db.prepare('SELECT sku_code, reason FROM draft_sku_catalog_exemptions WHERE draft_id = ?').all(draft.id)) {
     skuExemptions[r.sku_code] = r.reason;
   }
-  const simTaxPercent = (() => {
+  // 切替で閉じた後 = Company DB の税率だけ (決められない = 試算しない)。閉じる前・段階を読めない (見るだけ) は今までどおり (Yahoo 欄 → NE → 10%)
+  const cdbTaxForSim = res.locals.taxMode === 'cdb' ? (res.locals.cdbTax || { ok: false, reason: '読めません' }) : null;
+  const simTaxPercent = cdbTaxForSim ? (cdbTaxForSim.ok ? cdbTaxForSim.percent : null) : (() => {
     const t = String(yahoo?.tax_rate ?? '').trim().match(/^(\d+)/);
     if (t) return Number(t[1]);
     return neCost?.taxPercent ?? 10;
   })();
-  const profitSim = neCost ? computeProfit({
+  const profitSim = neCost && simTaxPercent != null ? computeProfit({
     price: draft.price, costExTax: neCost.costExTax,
     taxPercent: simTaxPercent, shippingCost: neCost.shippingCost,
   }) : null;
@@ -2115,10 +2152,14 @@ router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
   if (rkRow?.genre_id && /^\d+$/.test(String(rkRow.genre_id).trim())) {
     try { await fetchGenreAttributes(db, String(rkRow.genre_id).trim()); } catch (_) { /* best-effort */ }
   }
-  const built = buildItemPayload(db, draft.id);
-  if (!built.ok) return res.json({ ok: false, reasons: built.reasons });
+  // 税率: 切替前は今までどおり / 閉じた後は Company DB (決められない = 止める)。PR #1565 R1 H5
+  // プレビューは送らないので、段階を読めないときは今の税率で見せて注意を添える (登録は止まる。中間レビュー 2 回目 Low)
+  const tax = await resolveListingTax(db, draft, { preview: true });
+  const built = buildItemPayload(db, draft.id, { tax });
+  if (!built.ok) return res.json({ ok: false, reasons: built.reasons, ...(tax.warning ? { warnings: [tax.warning] } : {}) });
   res.json({
     ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload,
+    ...(tax.warning ? { warnings: [tax.warning] } : {}),
     // 店舗内カテゴリは RMS payload に含まれない (item-mappings API で登録成功後に自動反映)。
     // プレビューには参考情報として添える
     shopCategories: selectedShopCategoryPaths(db, draft.id),
@@ -2796,7 +2837,8 @@ router.post('/api/intake/run', (req, res) => {
 // 商品コード指定で Notion 既存カードを取り込む。**読み取り専用** (Notion へ書き戻さない)。
 // 取り込んだ行は source='notion_import' で印が付き、notion-card.js の同期経路から外れる。
 
-router.post('/api/notion-import', async (req, res) => {
+// 🚨 Notion を待ってから書く = legacyHandler で包む (終わるまで書きかけに数える) + 書く直前に legacyWriteFence (Codex #1565 R2 High 1)
+router.post('/api/notion-import', legacyHandler(async (req, res) => {
   const codes = parseNeCodes(req.body?.codes);
   if (codes.length === 0) {
     return res.status(400).json({ ok: false, error: '商品コードを1件以上入力してください' });
@@ -2805,33 +2847,35 @@ router.post('/api/notion-import', async (req, res) => {
     return res.status(400).json({ ok: false, error: `一度に取り込めるのは ${MAX_IMPORT_CODES} 件までです (指定: ${codes.length} 件)` });
   }
   try {
-    const { results, summary } = await importFromNotion(codes, { actor: actorOf(req) });
+    const { results, summary } = await importFromNotion(codes, { actor: actorOf(req), beforeWrite: () => legacyWriteFence(res) });
     res.json({ ok: summary.failed === 0, summary, results });
   } catch (e) {
+    if (respondIfLegacyAborted(res, e)) return;
     // Notion env 未設定 (fail-closed) 等。取り込みは検証機能なので落ちても他機能に影響させない。
     // 詳細はサーバーログに残し、クライアントには内部情報を返さない (Codex R1 low-7)
     console.error('[product-hub] notion-import failed:', e);
     res.status(500).json({ ok: false, error: '取り込みに失敗しました (詳細はサーバーログを確認してください)' });
   }
-});
+}));
 
 // ─── API: Notion ステータス①〜⑥の一括移植 (2026-08-25 中原さん指示) ───
 // Status が ①〜⑥ の商品のうち**このアプリにカードが無いものだけ**を取り込む。
 // 既定は dry_run (書き込みなしのプレビュー)。実行は dry_run: false の明示が必要。
 // Notion 画像DB (商品ページ商品画像登録) の対象ステータスを移植 (2026-08-26 中原さん指示)。
 // #922 と同じ admin 限定・dryRun 既定・snapshot 一致必須。要件定義 = AI_reference『Notion画像DB移植_要件定義_20260826.md』
-router.post('/api/notion-image-import', async (req, res) => {
+router.post('/api/notion-image-import', legacyHandler(async (req, res) => {
   if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin のみ実行できます' });
   try {
     const dryRun = req.body?.dry_run !== false; // 安全側デフォルト
     const expectedSnapshot = typeof req.body?.expected_snapshot === 'string' ? req.body.expected_snapshot : null;
-    const r = await importImageDbByStatus({ actor: actorOf(req), dryRun, expectedSnapshot });
+    const r = await importImageDbByStatus({ actor: actorOf(req), dryRun, expectedSnapshot, beforeWrite: () => legacyWriteFence(res) });
     res.json({
       ok: true, dryRun, statuses: r.statuses, missingStatuses: r.missingStatuses, total: r.total,
       summary: r.summary, snapshot: r.snapshot,
       results: r.results.slice(0, 300), truncated: r.results.length > 300,
     });
   } catch (e) {
+    if (respondIfLegacyAborted(res, e)) return;
     if (e && (e.code === 'snapshot_mismatch' || e.code === 'missing_statuses')) {
       return res.status(409).json({ ok: false, error: e.message });
     }
@@ -2841,20 +2885,21 @@ router.post('/api/notion-image-import', async (req, res) => {
     console.error('[product-hub] notion-image-import failed:', e);
     res.status(500).json({ ok: false, error: '移植に失敗しました (詳細はサーバーログを確認してください)' });
   }
-});
+}));
 
-router.post('/api/notion-import-by-status', async (req, res) => {
+router.post('/api/notion-import-by-status', legacyHandler(async (req, res) => {
   if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin のみ実行できます' });
   try {
     const dryRun = req.body?.dry_run !== false; // 安全側デフォルト
     const expectedSnapshot = typeof req.body?.expected_snapshot === 'string' ? req.body.expected_snapshot : null;
-    const r = await importByNotionStatus({ actor: actorOf(req), dryRun, expectedSnapshot });
+    const r = await importByNotionStatus({ actor: actorOf(req), dryRun, expectedSnapshot, beforeWrite: () => legacyWriteFence(res) });
     // 一覧は大きくなりうるので 300 件で打ち切る (全体の件数は summary / total にある)
     res.json({
       ok: true, dryRun, statuses: r.statuses, total: r.total, summary: r.summary, snapshot: r.snapshot,
       results: r.results.slice(0, 300), truncated: r.results.length > 300,
     });
   } catch (e) {
+    if (respondIfLegacyAborted(res, e)) return;
     // プレビュー後に Notion 側が変わった → 書き込まず再プレビューを要求 (Codex R1 high)
     if (e && e.code === 'snapshot_mismatch') {
       return res.status(409).json({ ok: false, error: e.message });
@@ -2862,7 +2907,7 @@ router.post('/api/notion-import-by-status', async (req, res) => {
     console.error('[product-hub] notion-import-by-status failed:', e);
     res.status(500).json({ ok: false, error: '移植に失敗しました (詳細はサーバーログを確認してください)' });
   }
-});
+}));
 
 // 取り込んだテストデータの掃除。**取り込み由来だけ**削除可 (ポータル起点の商品は消させない)。
 // Notion 側のカードには一切触らない (ポータル DB の行を消すだけ)。
@@ -3346,7 +3391,8 @@ router.post('/api/drafts/:id/set-drafts', (req, res) => {
     // 権限判定は createSetDraft 内の setStepState (親の「セット商品作成検討」を閉じる操作) が行う。
     // 判断した本人か admin だけが作れる = 誰かのレビュー中に横から作られない
     const me = staffByPortalEmail(req.session?.email);
-    const ctx = { isAdmin: req.session?.role === 'admin', actorStaffId: me?.id ?? null, requireVersion: true };
+    // withTax = 親の税率を写すか (切替で閉じた後は写さない。門 = res.locals.masterLegacyWrite)
+    const ctx = { isAdmin: req.session?.role === 'admin', actorStaffId: me?.id ?? null, requireVersion: true, withTax: res.locals.masterLegacyWrite?.writable === true };
     // ボードのカードから「作る」を押したとき (claim: true) は、未割り当てなら本人が引き受ける。
     // 引き受けは版数を 1 消費するので、createSetDraft へ渡す親工程の版数も進める。
     // 引き受けと作成は 1 トランザクション — 作成が途中で失敗したのに担当だけ付くのを防ぐ
@@ -3617,14 +3663,30 @@ serviceApiRouter.post('/ad-kw-ai/jobs/:id/release', (req, res) => {
   res.json({ ok: true, status: r.status });
 });
 
+/**
+ * AI 生成の材料の税率 (draft_yahoo.tax_rate) は、切替前 (段階を読めて legacy_open) だけ渡す。
+ * 閉じた後・段階を読めない = 渡さない (null)。税率の持ち主は Company DB = 古い手入力の値を AI の文に入れない (中間レビュー 2 回目 Low)。
+ * 段階は画面と同じ読み方 (30 秒の使い回し・1 秒で諦める = 生成の材料を待たせない)
+ */
+async function dropLegacyTaxUnlessOpen(drafts) {
+  let g;
+  try { g = await checkLegacyGate({ purpose: 'screen' }); } catch { g = { readable: false, writable: false }; }
+  if (g.readable === true && g.writable === true) return drafts;
+  for (const d of drafts) if (d && d.yahoo) d.yahoo = { ...d.yahoo, tax_rate: null };
+  return drafts;
+}
+
 // 生成待ち一覧 (AI 生成の材料つき、読み取り専用 = プレビュー用)
-serviceApiRouter.get('/generation-queue', (req, res) => {
-  const db = getDB();
-  // キューは status='ready_for_ai' を見るので、切替バックフィル前の古い status のまま
-  // 拾い漏れ・拾い過ぎが起きないよう、AI キューの入口でも自己修復する
-  maybeBackfillDerivedStatus(db);
-  // drafts = 今 claim できるもの (人の確認待ちは含まない)。queue.blocked で人待ちの件数を別枠で返す
-  res.json({ ok: true, drafts: listGenerationQueue(db), queue: generationQueueSummary(db) });
+serviceApiRouter.get('/generation-queue', async (req, res, next) => {
+  try {
+    const db = getDB();
+    // キューは status='ready_for_ai' を見るので、切替バックフィル前の古い status のまま
+    // 拾い漏れ・拾い過ぎが起きないよう、AI キューの入口でも自己修復する
+    maybeBackfillDerivedStatus(db);
+    // drafts = 今 claim できるもの (人の確認待ちは含まない)。queue.blocked で人待ちの件数を別枠で返す
+    const drafts = listGenerationQueue(db);
+    res.json({ ok: true, drafts: await dropLegacyTaxUnlessOpen(drafts), queue: generationQueueSummary(db) });
+  } catch (e) { next(e); }   // async にしたので、誤りは今までどおり Express の誤りの扱いへ
 });
 
 // 生成対象の claim (2026-08-03、Codex設計相談 Critical 対応)。
@@ -3682,7 +3744,7 @@ serviceApiRouter.post('/generation-queue/claim', async (req, res) => {
       for (const d of claimedList) d.sp_keywords_error = kwError;
     }
   }
-  res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: r.claimed, queue: generationQueueSummary(db) });
+  res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: Array.isArray(r.claimed) ? await dropLegacyTaxUnlessOpen(r.claimed) : r.claimed, queue: generationQueueSummary(db) });
 });
 
 // claim の解放 (生成を断念した draft を他の実行がすぐ拾えるように)

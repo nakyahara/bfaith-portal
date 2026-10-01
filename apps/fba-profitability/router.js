@@ -7,9 +7,13 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { masterLegacyGate, legacyBannerHtml } from '../../lib/master-legacy-gate.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
+// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #5・14 §5・契約 v3 H1)。原価の手入力 (POST /api/update-cost = mirror_products) は
+//    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = 410 / 503 (何も書かない)。画面 (/) は帯を出して原価の部品を隠す
+router.use(masterLegacyGate('fba-profitability'));
 
 // 🚨 mirror_products.消費税率 は「小数」で入っている (0.1 = 10%, 0.08 = 8%)。
 //    この画面 (view / 原価登録モーダル) は「%」で扱うので、境界でここに揃える。
@@ -246,6 +250,8 @@ function sendError(res, e, context) {
 router.get('/', (req, res) => {
   res.render('fba-profitability', {
     title: 'FBA収益性分析',
+    // 切替で古い入口を閉じたときだけ中身が入る (空文字 = 今までどおり)
+    masterLegacyBanner: legacyBannerHtml(res.locals.masterLegacy, { hideSelectors: ['button[onclick^="openCostModal"]', '#costModal'] }),
     username: req.session?.email,
     displayName: req.session?.displayName,
   });

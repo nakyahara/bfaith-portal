@@ -67,6 +67,7 @@ import { startNotifyOutbox as startFbaBoxNotifyOutbox } from './apps/fba-box/not
 import staffRouter from './apps/staff/router.js';
 import masterDecisionsRouter from './apps/master-decisions/router.mjs';
 import masterEditRouter from './apps/master-edit/router.mjs';
+import { legacyAckHeartbeat, maybeRefreshLegacyAck, legacyAckState, ackLegacyGatesStopped, legacyAckHost, markPreviousInstanceStopped } from './lib/master-legacy-gate.mjs';
 import { startInboundCheckCron, startInboundCheckPrintQueueWorker } from './apps/inbound-check/sync-job.js';
 // 🆕 新商品のパッケージ裏面ラベル写真を Drive へ送るキュー (プロセス内2分間隔の再試行)
 import { startBackLabelWorker } from './apps/inbound-check/back-label.js';
@@ -120,6 +121,13 @@ import { dashboardLocals, validateRegistry } from './lib/portal-dashboard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+
+// マスタの古い入口の門の記録 (ack。Company DB構想 14 §10 契約 v3 H1・PR #1565 R1 H2。表と書き手の関数は ⑤-1 の 0051)。Render = 'render' / miniPC (PORTAL_VARIANT=warehouse) = 'minipc'。
+// それ以外 (手元の PC) は書かない。起動のとき (下の listen) と、要求が来たついでに 5 分おきに書き直す (死活の確かめの要求でも回る。新しい定期実行は作らない)。
+// 中身 = build の番号・manifest_hash・持ち主表のハッシュ・見た段階・書きかけの件数。書く前に確かめる (段階を読める・build の番号・書く接続先・関数)。
+// だめなら書かずに理由をログと読み戻し (/apps/warehouse/api/master-legacy-gate) に出す
+const LEGACY_ACK_HOST = legacyAckHost();   // 読み戻しの API (apps/warehouse/router.js) と同じ判定
+if (LEGACY_ACK_HOST) app.use(legacyAckHeartbeat(LEGACY_ACK_HOST));
 const SQLiteStore = connectSqlite3(session);
 
 // --- 設定 ---
@@ -1143,7 +1151,7 @@ app.post('/admin/users/reset-password', requireAdmin, (req, res) => {
 // --- 起動 ---
 bootNote('web', `server.js ロード完了 (Node ${process.version}, PORT=${PORT}, RENDER=${!!process.env.RENDER})`);
 bootStart('web', 'express-listen');
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   bootEnd('web', 'express-listen', `port=${PORT}`);
   console.log(`B-Faith Portal running at http://localhost:${PORT}`);
 
@@ -1180,6 +1188,17 @@ app.listen(PORT, () => {
   if (process.env.RENDER) {
     try { startMgmtAutoSyncScheduler(); }
     catch (e) { console.warn('[mgmt-auto-sync] scheduler 起動スキップ:', e.message); }
+  }
+
+  // マスタの古い入口の門の記録 (ack) を起動のときに書く (段階を legacy_open から進めるには、全部の場所・全部のプロセスの
+  // 新しい記録が要る = 確かめは ⑤-1 の DB の関数)。その後は要求が来たついでに 5 分おき (上の legacyAckHeartbeat)。起動は止めない
+  if (LEGACY_ACK_HOST) {
+    Promise.resolve(maybeRefreshLegacyAck({ host: LEGACY_ACK_HOST, force: true }))
+      .then(() => { const a = legacyAckState(); console.log(`[master-legacy-gate] ack ${LEGACY_ACK_HOST}: ${a.state}${a.detail ? ` (${a.detail})` : ''}`); })
+      // miniPC だけ: 前の起動のプロセスが「止めた」を書かずに消えていたら書く (前の pid がまだある = 書かない)
+      .then(() => (LEGACY_ACK_HOST === 'minipc' ? markPreviousInstanceStopped({ host: LEGACY_ACK_HOST }) : null))
+      .then((p) => { if (p) console.log(`[master-legacy-gate] 前の起動: ${p.state} (${p.detail})`); })
+      .catch((e) => console.warn('[master-legacy-gate] ack の誤り:', e && e.message));
   }
 
   // ミニPC warehouse死活監視
@@ -1256,15 +1275,25 @@ app.listen(PORT, () => {
   startCompanyDbInventoryHourlyCron();
 });
 
+// 止めるとき: マスタの古い入口の門の「止めた」を書いてから終わる (長くても 10 秒。書けなくても止まる = 次の起動 (miniPC) か人が master-legacy-instance.mjs で「止めた」を書ける)
+function stopLegacyGateThenExit(signal) {
+  if (!LEGACY_ACK_HOST) return process.exit(0);
+  // 受付を閉じる (新しい要求を受けない) → 書いている途中の門の記録と書きかけ (切符は止める) を待つ → 「止めた」を 1 回 (lib が順番を守る・長くても 10 秒。Render は 30 秒・WinSW は既定 15 秒待つ)
+  try { httpServer.close(); } catch { /* 閉じ済み */ }
+  ackLegacyGatesStopped({ host: LEGACY_ACK_HOST, reason: `${signal} で止めた`, timeoutMs: 10000 })
+    .then((r) => bootNote('web', `門の「止めた」: ${r.state}`))
+    .catch(() => {})
+    .finally(() => process.exit(0));
+}
 process.on('SIGTERM', () => {
   bootNote('web', 'SIGTERM受信 → shutdown');
   stopPythonBackend();
-  process.exit(0);
+  stopLegacyGateThenExit('SIGTERM');
 });
 process.on('SIGINT', () => {
   bootNote('web', 'SIGINT受信 → shutdown');
   stopPythonBackend();
-  process.exit(0);
+  stopLegacyGateThenExit('SIGINT');
 });
 process.on('exit', (code) => {
   bootNote('web', `process.exit code=${code}`);

@@ -22,6 +22,8 @@ const pmlListRouter = (await imp('apps/product-management-list/router.js')).defa
 const { getDB } = await imp('apps/purchase-orders/db.js');
 const { computeProduct, computeAll, stockConstant, evaluateCondition } = await imp('apps/purchase-orders/logic.js');
 const routerMod = await imp('apps/purchase-orders/router.js');
+// 切替の段階 = legacy_open (マスタの古い入口の門 = 仕入先の書き込みを今までどおり通す。門そのものの試験は scripts/test-master-legacy-gate.mjs)
+(await imp('lib/master-legacy-gate.mjs')).__setLegacyPhaseReader(async () => ({ readable: true, phase: 'legacy_open' }));
 const neMod = await imp('apps/purchase-orders/ne-codes.js'); // M6: Company DB の NE の元の書き方の読み手を差し替える
 const express = (await import('express')).default;
 

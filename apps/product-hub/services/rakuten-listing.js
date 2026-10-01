@@ -33,6 +33,7 @@ import { validatePageInfo, mapNeShippingToRakuten } from '../lib/page-info.js';
 import { buildPcDescriptionHtml } from '../lib/product-info-auto.js';
 // URL の検証は miniPC 側と同じものを使う (別に書くと判定がズレる)
 import { parseRakutenItemUrl } from '../../../lib/rakuten-item-page.js';
+import { resolveListingTax } from './listing-tax.mjs';
 // 配送方法の「値の意味」の正本 (定数と変換はこの1ファイルだけが決める)。
 // db.js のマイグレーションからも使うため、循環参照を避けて lib/ に置いてある
 import {
@@ -1331,8 +1332,11 @@ export function skuAttributeGrid(db, draftId, rk, members) {
 
 /**
  * 出品 payload を組み立てる。送れない状態なら reasons を返す (dry_run と live で共通)。
+ * tax = listing-tax.mjs の resolveListingTax の結果 (PR #1565 R1 H5):
+ *   { mode: 'legacy' } = 今までどおり draft_yahoo.tax_rate / { mode: 'cdb', percent } = Company DB の税率 / { mode: 'blocked', reason } = 出品を止める
+ * 🚨 tax を渡さない呼び方は作らない (scripts/test-master-legacy-entries.mjs が呼び手を数える)。渡されなければ止める (fail-closed)
  */
-export function buildItemPayload(db, draftId) {
+export function buildItemPayload(db, draftId, { tax = null } = {}) {
   const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!draft) return { ok: false, reasons: ['ドラフトが見つかりません'] };
   const rk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draftId) || {};
@@ -1424,8 +1428,11 @@ export function buildItemPayload(db, draftId) {
     reasons.push(`楽天の商品画像は最大 ${MAX_RAKUTEN_IMAGES} 枚です (商品画像 ${cabinet.length} 枚 + 自動追加バナー ${trailingBanners.length} 枚 — 商品画像を減らしてください)`);
   }
   if (whiteBgId && !whiteBg) reasons.push('白抜き背景画像が R-Cabinet に未転送です (先に「画像を転送」)');
+  // 税率 (PR #1565 R1 H5): 切替で閉じた後は Company DB の税率だけ。決められない・税率の決め方が渡されていない = 止める
+  if (!tax || !['legacy', 'cdb', 'blocked'].includes(tax.mode)) reasons.push('税率の決め方が分かりません (出品を止めました)');
+  else if (tax.mode === 'blocked') reasons.push(tax.reason);
   // 税率は 8% / 10% / 空欄 (=店舗デフォルト10%) 以外を fail-closed で止める (Codex R1 Medium-1)
-  const taxText = String(yahooRow.tax_rate ?? '').trim();
+  const taxText = tax?.mode === 'cdb' ? `${tax.percent}%` : String(yahooRow.tax_rate ?? '').trim();
   if (taxText && !/^(8|10)\s*%?$/.test(taxText)) {
     reasons.push(`税率「${taxText}」が不正です (8% / 10% / 空欄のみ)`);
   }
@@ -1706,7 +1713,7 @@ export function buildItemPayload(db, draftId) {
   };
   const deliveryDateId = String(rk.normal_delivery_date_id ?? '').trim();
 
-  const payment = taxRateToPayment(yahooRow.tax_rate);
+  const payment = taxRateToPayment(tax?.mode === 'cdb' ? `${tax.percent}%` : yahooRow.tax_rate);
 
   // 商品コード (NE商品コード) は SKU管理番号 (variants キー)・商品番号・システム連携用SKU番号の
   // 3ヶ所に同じ表記で入れる (Codex R1 medium: 正規化を1回にして揃える)。
@@ -1849,7 +1856,9 @@ export async function registerItem(draftId, { actor = null } = {}) {
   }
   // Drive 側で画像が差し替わっていたら「未転送」に落として登録を止める (Codex R3 high)
   await refreshDriveModifiedTimes(draftId);
-  const built = buildItemPayload(db, draftId);
+  // 税率: 切替前は今までどおり / 閉じた後は Company DB (決められない = 止める)。PR #1565 R1 H5
+  const draftRow = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
+  const built = buildItemPayload(db, draftId, { tax: draftRow ? await resolveListingTax(db, draftRow) : null });
   if (!built.ok) return { ok: false, reasons: built.reasons };
   const mn = String(built.draft.ne_code).trim().toLowerCase();
 

@@ -85,6 +85,7 @@
   <link rel="stylesheet" href="/mobile.css">
 </head>
 <body>
+  <%- typeof masterLegacyBanner === 'string' ? masterLegacyBanner : '' %>
   <header class="portal-header">
     <div class="header-left">
       <a href="/" class="back-link">&larr; Portal</a>
@@ -412,7 +413,7 @@
           body: JSON.stringify({ sku: editingSku, cost, taxRate }),
         });
         const data = await res.json();
-        if (!data.ok) throw new Error(data.error);
+        if (!data.ok) throw new Error(data.message || data.error);
 
         // ローカルデータ更新
         const costWithTax = Math.ceil(cost * (1 + taxRate / 100));

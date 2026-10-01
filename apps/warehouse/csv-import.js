@@ -17,6 +17,8 @@ import fs from 'fs';
 import iconv from 'iconv-lite';
 import { initDB, getDB, saveToFile, updateSyncMeta, clearNeCompleteMarks, neSrc } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
+import { legacyCliGate, runWithLegacyCliLock } from '../../lib/master-legacy-gate.mjs';
+import { cliEntry } from '../../config/master-legacy-entries.mjs';
 
 function now() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
 
@@ -409,6 +411,13 @@ async function main() {
   const command = args[0];
   const files = args.slice(1);
 
+  // 🚨 マスタを書く mode (product_shipping・exception_genka = 全部消して入れ直す) は古い入口の門を通す
+  //    (Company DB構想 10 §4 #10・14 §9 M2・契約 v3 H1・PR #1565 R1。一覧 = config/master-legacy-entries.mjs)。
+  //    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = 引数・ファイルの検査より前・DB を開く前に終了コード 3。
+  //    受注・ロジザード・NE の写し・送料の表の mode は止めない (ファイル単位ではなく mode 単位)
+  const legacyEntry = command ? cliEntry('apps/warehouse/csv-import.js', command) : null;
+  if (legacyEntry && !(await legacyCliGate(legacyEntry.id))) return;
+
   if (!command || files.length === 0) {
     console.log('使い方:');
     console.log('  node apps/warehouse/csv-import.js products <CSVファイル>');
@@ -443,7 +452,9 @@ async function main() {
   };
 
   if (handlers[command]) {
-    handlers[command]();
+    // マスタを書く mode = 段階の鍵を共有で持ったまま読み直し、legacy_open のときだけ書く (段階を変える関数は書き終わるまで待つ。PR #1565 中間レビュー M2)
+    if (legacyEntry) await runWithLegacyCliLock(legacyEntry.id, () => handlers[command]());
+    else handlers[command]();
   } else {
     console.error(`不明なコマンド: ${command}`);
     console.log(`有効なコマンド: ${Object.keys(handlers).join(', ')}`);
