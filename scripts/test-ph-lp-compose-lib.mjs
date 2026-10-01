@@ -176,6 +176,22 @@ ok(!!jRej.completed_at, 'rejected でも completed_at が入る');
 eq(db.prepare('SELECT status FROM ph_lp_compose_generations WHERE id = ?').get(g2.generation_id).status, 'rejected',
   '🚨 generation も確定する (reserved のまま残さない)');
 
+// 🚨 packet の画像を**全部**見ていなければ accepted は出せない (codex exec review P1)。
+// 1 枚でも配っていればよいにしていたときは、途中の枚で落ちた実行役が
+// 残りを見ずに accepted を出せた (= 欠けた材料で書いた構成が測定に混ざる)
+const dAll = mkDraft('LP-ALL', 'ハッカ油スプレー 3 枚');
+lp.requestJob(db, args(dAll, s2.spec, 'key-0001', {
+  now: min(10),
+  images: [{ file_id: 'FILEID000001' }, { file_id: 'FILEID000002' }],
+}));
+const cAll = lp.claimJob(db, { runnerRunId: 'run-all', now: min(10) });
+const gAll = lp.reserveGeneration(db, cAll.job.job_id, { leaseToken: cAll.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(10) });
+serve(cAll.job, min(10.1));                                 // 1 枚目だけ見た
+eq(lp.submitResult(db, gAll.generation_id, { packetHash: cAll.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(10.2) }).code,
+  'bad_request', '🚨 2 枚中 1 枚しか見ていなければ accepted を受け取らない (codex exec review P1)');
+eq(lp.submitResult(db, gAll.generation_id, { packetHash: cAll.job.packet_hash, verdict: 'rejected', reason: '画像が取れなかった', now: min(10.2) }).status,
+  'failed', 'rejected は証跡が揃わなくても出せる (作れなかったという報告)');
+
 console.log('⑧ 成否不明 (lease 切れ) は needs_review で止まる');
 const dC = mkDraft('LP-C', 'ハッカ油スプレー 200ml');
 lp.requestJob(db, args(dC, s2.spec, 'key-0001', { now: min(20) }));

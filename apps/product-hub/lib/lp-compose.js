@@ -594,22 +594,27 @@ export function submitResult(db, generationId, {
 
     // 🚨 証跡は「渡した材料のうち実際に見たもの」でなければ意味がない。
     //    packet に無い file_id を含む receipt は受け取らない (コード R7 #2)。
-    //    完全一致までは求めない — 取得に失敗した画像があれば、その分は証跡に載らないのが正しい。
     let packetImages = [];
     try { packetImages = JSON.parse(job.packet_json).images || []; } catch { packetImages = []; }
     // 証跡はサーバが配ったときの記録。実行役が送ってきた receipt は使わない
     let served = [];
     try { served = JSON.parse(job.images_served_json || '[]'); } catch { served = []; }
     if (!Array.isArray(served)) served = [];
-    // 🚨 **accepted なら証跡は必須** (codex exec review R2 P2)。
-    //    packet に画像があるのに receipt を省く / 空配列で出すと、「何を見て作ったか」が
-    //    一切残らないまま done になる = 証跡を置いた意味が消える。
+    // 🚨 **accepted なら packet の画像を全部配っていること** (codex exec review R2 P2 → P1 で全枚に)。
+    //    はじめは「1 枚でも配っていればよい」にしていたが、それだと
+    //    **途中の枚で落ちた実行役が、残りを見ずに accepted を出せてしまう**。
+    //    実行役側 (`./phlp images`) も「1 枚でも取れなければ失敗」に揃えてあるので、
+    //    サーバ側も全枚を求める (段階1 は測定が目的。欠けた材料で書いた構成を混ぜない)。
     //    rejected は「作れなかった」ので証跡が無くてよい。
-    if (v === 'accepted' && packetImages.length > 0 && served.length === 0) {
-      return {
-        code: 'bad_request',
-        error: `この依頼には商品画像が ${packetImages.length} 枚あります。構成を書く前に画像を取得してください`,
-      };
+    if (v === 'accepted' && packetImages.length > 0) {
+      const seenIds = new Set(served.map((im) => im && im.file_id).filter(Boolean));
+      const missing = packetImages.filter((im) => im?.file_id && !seenIds.has(im.file_id)).length;
+      if (missing > 0) {
+        return {
+          code: 'bad_request',
+          error: `商品画像 ${packetImages.length} 枚のうち ${missing} 枚を見ていません。全部取得してから構成を書いてください`,
+        };
+      }
     }
     // 🚨 lint が通っていない accepted は受け取らない (codex exec review P1)。
     //    いまは実行役の自己申告だが、**内容は保存されるので後から出力と突き合わせられる**。
