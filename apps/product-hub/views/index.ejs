@@ -56,6 +56,50 @@
     </details>
   </div>
 
+  <%# LP制作システムの仕様書 (段階1・2026-10-01)。
+      🚨 これは **AI への指示そのもの**。差し替える = 全商品の生成内容が変わるので admin だけ。
+      画面が無いと curl でしか上げられず、運用に乗らないので入れた %>
+  <% if (isAdmin) { %>
+  <div class="card" style="margin-bottom:14px;">
+    <details>
+      <summary style="cursor:pointer; font-size:14px; font-weight:600;">
+        LP構成の仕様書 (AI生成)
+        <% if (!lpSpec.enabled) { %>
+          <span class="muted" style="font-weight:400">／ 機能はまだ無効 (PH_LP_COMPOSE_ENABLED)</span>
+        <% } else if (!lpSpec.spec) { %>
+          <span style="font-weight:400; color:#b45309">／ まだ取り込まれていません</span>
+        <% } else { %>
+          <span class="muted" style="font-weight:400">／ <%= String(lpSpec.spec.imported_at).slice(0, 10) %> 取込</span>
+        <% } %>
+      </summary>
+      <p class="muted" style="margin:10px 0;">
+        商品ハブの「🤖 構成をAIに作らせる」が読む仕様書です。Google スプレッドシートの
+        <strong>「LP制作システム」を .xlsx でダウンロードして、そのまま上げてください</strong>
+        (全タブがテキストになって AI に渡ります)。
+        <br>
+        🚨 <strong>差し替えると、以降に作る全商品の生成内容が変わります。</strong>
+        中身が前と同じなら版は増えません。受付済みの依頼は<strong>受付時の版</strong>を使い続けます。
+      </p>
+      <div id="lpspec-now" class="muted" style="font-size:12px; margin-bottom:8px;">
+        <% if (lpSpec.spec) { %>
+          いまの版: <strong>#<%= lpSpec.spec.id %></strong> <%= lpSpec.spec.title %>
+          ／ <%= String(lpSpec.spec.imported_at).slice(0, 16).replace('T', ' ') %> <%= lpSpec.spec.imported_by %>
+          ／ <%= lpSpec.spec.chars.toLocaleString() %> 文字
+          ／ タブ: <%= lpSpec.spec.sheet_titles.join('・') %>
+          ／ hash <code><%= lpSpec.spec.hash_short %></code>
+        <% } else { %>
+          いまの版: <strong style="color:#b45309">まだありません</strong> — 上げるまでボタンは押せません
+        <% } %>
+      </div>
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <input type="file" id="lpspec-file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="width:auto;">
+        <button class="btn btn-primary btn-sm" id="lpspec-upload-btn">取り込む</button>
+        <span class="muted" id="lpspec-result" style="font-size:12px;"></span>
+      </div>
+    </details>
+  </div>
+  <% } %>
+
   <!-- 検証用: Notion 既存カードの選択取り込み (読み取り専用) -->
   <div class="card" style="margin-bottom:14px;">
     <details>
@@ -251,6 +295,39 @@
 
 <script>
   // ─── NE取込の手動実行 (admin。cron を待たずシード/取込を回す) ───
+  // LP構成の仕様書の取り込み (段階1・admin だけ)。
+  // 🚨 これは **AI への指示そのもの**。差し替える = 以降の全商品の生成内容が変わるので確認を挟む。
+  const lpspecBtn = document.getElementById('lpspec-upload-btn');
+  if (lpspecBtn) {
+    lpspecBtn.addEventListener('click', async () => {
+      const out = document.getElementById('lpspec-result');
+      const fileEl = document.getElementById('lpspec-file');
+      const f = fileEl.files && fileEl.files[0];
+      if (!f) { out.textContent = '.xlsx を選んでください'; return; }
+      if (!/\.xlsx$/i.test(f.name)) { out.textContent = '.xlsx だけです (.xls や .csv は読めません)'; return; }
+      if (!confirm('「' + f.name + '」を LP構成の仕様書として取り込みます。\n\n🚨 以降に作る全商品の AI 生成の内容が変わります。\n(受付済みの依頼は受付時の版を使い続けます)\n\nよろしいですか?')) return;
+      lpspecBtn.disabled = true;
+      out.textContent = '取り込み中…';
+      try {
+        const buf = await f.arrayBuffer();
+        const q = new URLSearchParams({ kind: 'product_analysis', title: f.name.replace(/\.xlsx$/i, '') });
+        const res = await fetch('/apps/product-hub/api/lp-specs?' + q.toString(), {
+          method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: buf,
+        });
+        const j = await res.json();
+        if (!j.ok) { out.textContent = ''; alert(j.error || '取り込めませんでした'); return; }
+        out.textContent = j.created
+          ? '✅ 取り込みました (版 #' + j.spec.id + '・' + j.spec.chars.toLocaleString() + ' 文字・タブ ' + j.spec.sheet_titles.length + ')'
+          : 'ℹ️ 中身が前と同じだったので、版は増えていません (いまの版 #' + j.spec.id + ')';
+        setTimeout(() => location.reload(), 2500);
+      } catch (e) {
+        out.textContent = '通信エラー: ' + e.message;
+      } finally {
+        lpspecBtn.disabled = false;
+      }
+    });
+  }
+
   const intakeBtn = document.getElementById('intake-run-btn');
   if (intakeBtn) {
     intakeBtn.addEventListener('click', async () => {

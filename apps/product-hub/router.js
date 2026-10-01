@@ -248,6 +248,8 @@ router.get('/list', (req, res) => {
     maxRegisterCodes: MAX_REGISTER_CODES,
     intake: intakeStatus(),
     isAdmin: req.session?.role === 'admin',
+    // LP 構成の AI 生成 (段階1) の仕様書。admin にだけ出すカードで使う
+    lpSpec: { enabled: lpComposeEnabled(), spec: lpSpecSummary(db, 'product_analysis') },
     shopCategoryCount: countActiveShopCategories(db),
     maxShopCategoryLines: MAX_SHOP_CATEGORY_LINES,
   });
