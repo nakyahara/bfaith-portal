@@ -148,11 +148,17 @@ ok(r2.lineInserted === 0, 'V2 の同じレポートを入れ直しても 0 行 (
   ok(rc.unknown.length === 0 && rc.itemCodeUnresolved === 0, `税の取り直し (Order_Retrocharge / Refund_Retrocharge の ItemPrice) は規則にある (${JSON.stringify(rc.unknown)})`);
   ok(rc.tsv === rV1, '税の取り直しの V2 → V1 の TSV が V1 と 1 文字も違わない (個数だけの行を作らない・SKU・品物の番号・個数は空のまま)');
   const q1 = prepareReportTsv(rV1, 'R-RV1', 'run-r'), q2 = prepareV2ReportTsv(rV2, 'R-RV2', 'run-r');
-  // detail_digest (#1567) の材料 = business_line_key・出現順・金額 9 つ・個数・取引・注文・SKU・計上日。ここでは出どころの列 (文書・層・版・取込の時刻・hash) 以外の全部の列を比べる (= より強い)
-  const SRC_COLS = new Set(['source_document_id', 'source_file_hash', 'source_path', 'source_layer', 'parser_version', 'ingest_run_id', 'observed_at', 'ingested_at', 'physical_line_hash']);
-  const content = (p) => p.lineRows.map((r) => JSON.stringify(Object.keys(r).filter((k) => !SRC_COLS.has(k)).sort().map((k) => [k, r[k]]))).sort();
-  ok(q1.lineRows.length === 4 && q2.lineRows.length === 4 && JSON.stringify(content(q1)) === JSON.stringify(content(q2)) && q1.headerRow.business_line_key === q2.headerRow.business_line_key,
-    `税の取り直しの行が V1 と全部の列で同じ (business_line_key・金額・計上日・行の数 = detail_digest も同じ) (V1 ${q1.lineRows.length} 行 / V2→V1 ${q2.lineRows.length} 行)`);
+  // detail_digest (#1567) の材料 = business_line_key・出現順・金額 9 つ・個数・取引・注文・SKU・計上日。ここでは中身の列の全部 + 行番号を比べる (= より強い)。
+  //   出どころの列 (文書・層・版・取込の時刻・hash など) は V1 / V2 で違って当たり前 = 比べない (除く列を並べると、列が増えたとき落ちる → 比べる列を並べる)
+  const CONTENT_COLS = ['business_line_key', 'source_line_no', 'source_settlement_id', 'posted_date_utc', 'posted_datetime_jst', 'economic_date', 'year_month_int',
+    'amazon_order_id', 'merchant_order_id', 'shipment_id', 'order_item_code', 'adjustment_id', 'seller_sku', 'seller_sku_normalized', 'transaction_type', 'marketplace_name', 'fulfillment_id',
+    'quantity_purchased', 'price_type', 'price_amount_micro', 'item_related_fee_type', 'item_related_fee_amount_micro', 'promotion_id', 'promotion_type', 'promotion_amount_micro',
+    'shipment_fee_type', 'shipment_fee_amount_micro', 'order_fee_type', 'order_fee_amount_micro', 'misc_fee_amount_micro', 'other_fee_amount_micro', 'other_fee_reason_description',
+    'direct_payment_type', 'direct_payment_amount_micro', 'other_amount_micro', 'currency'];
+  const content = (p) => p.lineRows.map((r) => JSON.stringify(CONTENT_COLS.map((k) => [k, r[k]]))).sort();
+  ok(q1.lineRows.length === 4 && q2.lineRows.length === 4 && [...q1.lineRows, ...q2.lineRows].every((r) => CONTENT_COLS.every((k) => Object.hasOwn(r, k)))   // 列の名前の書き違いで両方 undefined = 素通り、を防ぐ
+    && JSON.stringify(content(q1)) === JSON.stringify(content(q2)) && q1.headerRow.business_line_key === q2.headerRow.business_line_key,
+    `税の取り直しの行が V1 と中身の列で全部同じ (business_line_key・金額・計上日・行番号・行の数 = detail_digest も同じ) (V1 ${q1.lineRows.length} 行 / V2→V1 ${q2.lineRows.length} 行)`);
   ok(q2.lineRows.every((r) => r.amazon_order_id === RO && r.seller_sku == null && r.order_item_code == null && r.quantity_purchased == null && r.fulfillment_id == null && r.economic_date != null)
     && q2.lineRows.map((r) => `${r.transaction_type}:${r.price_type}:${r.price_amount_micro}`).join() === 'Order_Retrocharge:Tax:53000000,Order_Retrocharge:ShippingTax:0,Refund_Retrocharge:Tax:-53000000,Refund_Retrocharge:ShippingTax:0',
     '税の取り直し = price-type / price-amount に入り、SKU・品物の番号・個数は空 (V1 と同じ)');
