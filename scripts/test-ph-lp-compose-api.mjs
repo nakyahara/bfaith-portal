@@ -249,9 +249,13 @@ eq((await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`,
 })).status, 400, '🚨 2 枚中 1 枚しか配っていなければ accepted を受け取らない');
 lp.recordImageServed(db, job.job_id, { leaseToken: job.lease_token, fileId: 'FILEIDIMG002', sha256: 'd'.repeat(64), bytes: 3333 });
 console.log('⑤c サーバの lint が正本 (PR1-c)');
-eq((await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
+const badLint = await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
   body: { packet_hash: job.packet_hash, verdict: 'accepted', output: fixture(FIXTURES.legacyV21), review_rounds: 1, lint: { ok: true } },
-})).status, 422, '🚨 自分で lint.ok=true と書いても、サーバが落とす');
+});
+eq(badLint.status, 422, '🚨 自分で lint.ok=true と書いても、サーバが落とす');
+// 🚨 断るだけでは直しようが無い。何が落ちたかを返す (codex exec review P2)
+ok(badLint.json.lint && badLint.json.lint.errors.length > 0, '🚨 422 に lint の中身が入る');
+ok(badLint.json.lint.errors.some((e) => e.id === 16), '  何番の検査が落ちたか分かる');
 const sub = await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
   body: {
     packet_hash: job.packet_hash, verdict: 'accepted', output: OUT, review_rounds: 1,

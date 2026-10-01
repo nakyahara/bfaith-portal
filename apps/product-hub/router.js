@@ -3864,7 +3864,11 @@ function lpComposeMaterial(db, draft) {
 // lp-compose 固有の code を HTTP に対応づける (ad-kw-ai の表に無いもの)。
 // 🚨 disabled を落とすと「機能が無効」が 400 に見え、実行役が「依頼が壊れている」と誤解する
 const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, already_generated: 409, job_finalized: 409, already_running: 409, lint_failed: 422 };
-const lpComposeFail = (res, r) => res.status(LP_COMPOSE_HTTP[r.code] || 400).json({ ok: false, code: r.code, error: r.error });
+// 🚨 lint で断ったときは**何が落ちたかも返す** (codex exec review P2)。
+//    code と error だけだと、実行役は直すために lint をもう一度呼ぶしか無く、
+//    lease が切れた後はそれもできない (= 直しようが無い)。
+const lpComposeFail = (res, r) => res.status(LP_COMPOSE_HTTP[r.code] || 400)
+  .json({ ok: false, code: r.code, error: r.error, ...(r.lint ? { lint: r.lint } : {}) });
 const rawField = (v, maxLen) => (typeof v === 'string' && v.length <= maxLen ? v : null);
 // 🚨 共有の intParam は Number.parseInt なので "12abc" を 12 として通す。
 //    lib 側の posInt を厳しくしても、router で変換して渡すとそこに届かず、
