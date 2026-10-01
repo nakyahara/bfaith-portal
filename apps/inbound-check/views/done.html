@@ -48,7 +48,8 @@
     .foot { text-align: center; font-size: 0.8em; color: #adb5bd; padding: 20px; }
     .foot a { color: #868e96; }
 
-    @media (max-width: 640px) {
+    /* screen だけ: 印刷は下の @media print の表のまま出す */
+    @media screen and (max-width: 640px) {
       .wrap { padding: 10px; }
       th, td { padding: 8px 8px; }
       td.code { display: none; }
@@ -59,7 +60,8 @@
       .slip thead { display: none; }
       .slip tbody tr { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; padding: 9px 10px; border-top: 1px solid #f1f3f5; }
       .slip tbody td { display: block; padding: 0; border: 0; }
-      .slip tbody td:nth-child(2) { flex-basis: 100%; font-weight: 600; line-height: 1.45; }
+      .slip tbody td.code { display: none; }
+      .slip tbody td:nth-child(2) { flex-basis: 100%; min-width: 0; overflow-wrap: anywhere; font-weight: 600; line-height: 1.45; }
       .slip td.num { text-align: left; }
       .slip td.num::before { content: '数量 '; color: #868e96; font-size: 0.85em; font-weight: 400; }
       .slip td.exp:empty { display: none; }
