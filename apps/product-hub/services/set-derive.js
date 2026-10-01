@@ -620,20 +620,30 @@ export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
   let changed = 0;
   for (const r of rows) changed += upd.run(to, id, r.step_code, from).changes;
   // ⑧楽天登録 は「対象外」にはしないが、**対象外で残っていれば開き直す** (上の 🚨 のとおり)。
-  // 人が進めた done は触らない (todo ⇄ skip だけ、は他の工程と同じ)
+  // 人が進めた done は触らない (todo ⇄ skip だけ、は他の工程と同じ)。
+  // 🚨 もう楽天に出ている商品は `todo` ではなく **`done`** で開ける (Codex R10 P2)。
+  //    `todo` にすると、モールの done 遷移はもう起きないので閉じる自動の経路が無く、
+  //    出品済みなのに ⑧楽天登録 の列に残り続ける。根拠の見方は setStepState のゲートと同じ
+  const listedRk = !!db.prepare(`
+    SELECT 1 WHERE EXISTS (SELECT 1 FROM draft_rakuten WHERE draft_id = @id AND registered_at IS NOT NULL)
+       OR EXISTS (SELECT 1 FROM draft_mall_status WHERE draft_id = @id AND mall = 'rakuten' AND state = 'done')
+  `).get({ id });
   changed += db.prepare(`
-    UPDATE draft_step_progress SET state = 'todo', version = version + 1,
-           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-    WHERE draft_id = ? AND state = 'skip' AND step_code IN (
+    UPDATE draft_step_progress
+    SET state = @state,
+        done_at = CASE WHEN @state = 'done' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE NULL END,
+        done_by = CASE WHEN @state = 'done' THEN @actor ELSE NULL END,
+        version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE draft_id = @id AND state = 'skip' AND step_code IN (
       SELECT code FROM ph_steps WHERE active = 1 AND track = 'image' AND image_kind = 'detail'
         AND image_stage = '${IMAGE_RAKUTEN_STAGE}'
     )
-  `).run(id).changes;
+  `).run({ id, state: listedRk ? 'done' : 'todo', actor: actor || 'system' }).changes;
   if (changed > 0) {
     logEvent(db, id, 'set_image_plan_track',
       needs
         ? '画像の計画に「直して使う/作り直す」が入ったので、画像の制作工程を戻しました'
-        : '画像はすべて親のものを使う計画なので、画像の制作工程を「対象外」にしました (⑧楽天登録は残します)',
+        : `画像はすべて親のものを使う計画なので、画像の制作工程を「対象外」にしました (⑧楽天登録は${listedRk ? '出品済みなので完了に' : '残します'})`,
       actor);
   }
   return { needsProduction: needs, changed };

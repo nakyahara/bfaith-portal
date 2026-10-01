@@ -4234,6 +4234,18 @@ let wfSetParentId = null;
   put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
   check('🚨 対象外で残っていた ⑧楽天登録 は、画像の計画を保存し直すと開き直る (既存セットの収束)',
     rkStep() === 'todo', rkStep());
+  // 🚨 もう楽天に出ている旧セットは `todo` ではなく `done` で開ける (Codex R10 P2)。
+  //    `todo` にすると閉じる自動の経路が無く、出品済みなのに ⑧楽天登録 の列に残り続ける
+  db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
+  db.prepare(`
+    INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'done')
+    ON CONFLICT(draft_id, mall) DO UPDATE SET state = 'done'
+  `).run(setId);
+  put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+  check('🚨 もう楽天に出ている旧セットは ⑧楽天登録 を「完了」で開ける (未着手で残すと閉じられない)',
+    rkStep() === 'done', rkStep());
+  db.prepare("DELETE FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").run(setId);
+  db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
   const firstStep = detailSteps()[0].step_code;
   db.prepare(`UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = ?`).run(setId, firstStep);
   put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
@@ -5520,12 +5532,12 @@ let wfSetParentId = null;
     });
     check('工程API: body の boardClaim は無視され、未割り当て工程の引き受け+完了は 403', r.status === 403
       && stepOf(idM5, 'title_approve') === 'todo' && assigneeOf(idM5, 'title_approve') == null, JSON.stringify(r.json));
-    // boardReopen も同じ: D&D 経路の内部オプションなので body で送っても効かない (2026-10-01)。
+    // boardMove も同じ: D&D 経路の内部オプションなので body で送っても効かない (2026-10-01)。
     // AI待ちは役割なしのシステム工程 = 抜け道の対象に見える形で試す
     r = await call('POST', `/api/drafts/${idM5}/steps/ai_generate`, {
-      state: 'skip', boardReopen: true, expected_version: versionOf(idM5, 'ai_generate'),
+      state: 'skip', boardMove: true, expected_version: versionOf(idM5, 'ai_generate'),
     });
-    check('工程API: body の boardReopen は無視され、システム工程の「対象外」は 403 のまま',
+    check('工程API: body の boardMove は無視され、システム工程の「対象外」は 403 のまま',
       r.status === 403 && stepOf(idM5, 'ai_generate') !== 'skip', JSON.stringify(r.json));
   } finally { smokeSession = adminSession; }
 
@@ -5615,11 +5627,37 @@ let wfSetParentId = null;
     check('🚨 D&D: 対象外の ⑧楽天登録 を跨いで ⑨A+ に落とせる (⑧ は対象外のまま・400 にならない)',
       !overSkip && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'done' && st('imgd_aplus') === 'todo',
       overSkip?.message || JSON.stringify(['imgd_rakuten', 'imgd_amazon', 'imgd_aplus'].map(st)));
-    // 🚨 抜け道は「対象外 → 未着手」だけ。システム工程を人が**完了**にする道は開けていない
-    let doneSys = null;
-    try { wfpEarly.setStepState(idSkip, 'imgd_rakuten', { state: 'done' }, 'img', SKIP_IMG); } catch (e) { doneSys = e; }
-    check('D&D の抜け道: ⑧楽天登録 を人が「完了」にはできないまま (開き直しだけを許す)',
-      doneSys?.status === 403 || doneSys?.status === 400, doneSys?.message || '例外が出ていない');
+    // 🚨 開いた後に閉じられること (名指し R4 F: 片道にしない)。ただし**楽天登録の根拠**は要る
+    {
+      // ⑧ を未着手・⑨を未着手にして、いまの工程を ⑧ にそろえる
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code IN ('imgd_rakuten', 'imgd_aplus')").run(idSkip);
+      check('D&D 前提: いまの工程が ⑧楽天登録',
+        wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+        wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code);
+      let noEvidence = null;
+      try {
+        wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'aplus', expectedCurrent: 'imgd_rakuten' }, 'img', SKIP_IMG);
+      } catch (e) { noEvidence = e; }
+      check('D&D: 出品の根拠が無ければ ⑧楽天登録 は閉じられない (400・移動ごとロールバック)',
+        noEvidence?.status === 400 && /自動で完了/.test(noEvidence.message) && st('imgd_rakuten') === 'todo',
+        noEvidence?.message || '例外が出ていない');
+      // モール別の展開状況で楽天を完了 = 根拠あり → 画像登録者でも閉じられる
+      db.prepare(`
+        INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'done')
+        ON CONFLICT(draft_id, mall) DO UPDATE SET state = 'done'
+      `).run(idSkip);
+      wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'aplus', expectedCurrent: 'imgd_rakuten' }, 'img', SKIP_IMG);
+      check('🚨 D&D: 出品の根拠があれば画像登録者でも ⑧楽天登録 を閉じて先へ進める (片道にしない)',
+        st('imgd_rakuten') === 'done' && st('imgd_aplus') === 'todo',
+        `⑧=${st('imgd_rakuten')} / ⑨=${st('imgd_aplus')}`);
+      db.prepare("DELETE FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").run(idSkip);
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_aplus'").run(idSkip);
+    }
+    // 🚨 「対象外」にする道は開けていない (従来どおり管理者だけ)
+    let skipSys = null;
+    try { wfpEarly.setStepState(idSkip, 'imgd_rakuten', { state: 'skip' }, 'img', SKIP_IMG); } catch (e) { skipSys = e; }
+    check('D&D の抜け道: ⑧楽天登録 を「対象外」にはできない (管理者だけ)',
+      skipSys?.status === 403, skipSys?.message || '例外が出ていない');
     // 🚨 抜け道は画像登録者だけ (Codex R3 P1)。役割の無い担当者は従来どおり弾く
     {
       const noRoleId = wf.createStaff({ name: '役割なし・対象外の列スモーク', kind: 'internal' });

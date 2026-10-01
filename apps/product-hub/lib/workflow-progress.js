@@ -320,27 +320,30 @@ function assertOwnerScope(patch, actorStaffId) {
   }
 }
 
-function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim = false, boardReopen = false }) {
+function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim = false, boardMove = false }) {
   if (isAdmin) return;
 
-  // ボードの D&D で「落とした列」を いまやる番 にするために、**対象外で残っていた
-  // ⑧楽天登録 を未着手に戻す**とき (2026-10-01)。
+  // ボードの D&D から ⑧楽天登録 を動かすとき (2026-10-01)。
   // ⑧楽天登録 は役割を置かない (出品すると自動で完了する) 工程なので、下の
-  // 「画像の工程は役割で動かせる」(row.role_code を見る) に乗れず、このままでは
-  // 報告された「落とした列の先へ飛ばされる」が非管理者では 403 に変わるだけで直らない。
+  // 「画像の工程は役割で動かせる」(row.role_code を見る) に乗れない。このままでは
+  //   ・報告された「落とした列の先へ飛ばされる」が非管理者では 403 に変わるだけで直らない
+  //   ・いったん ⑧ を開き直したら、閉じるのに管理者を呼ぶしかない**片道**になる
   //
-  // 🚨 抜け道はできるだけ狭くする (Codex R3 P1 / R9 P2):
+  // 🚨 抜け道はできるだけ狭くする (Codex R3 P1 / R9 P2 / 名指し R4 F):
   //    ・**⑧楽天登録 の段階だけ** (image_stage='rakuten')。本流の AI情報入力待ち・出品・展開も、
   //      管理画面から足した役割なしの画像工程も対象にしない
   //      (AI待ちを手で戻すのは下の AI_STEP の例外が既に担っている)
   //    ・**役割を置かない工程のときだけ** (役割があればこの下の通常の判定でそのまま通る)
   //    ・**画像登録者の役割を持つ人だけ** (= 画像の工程を動かせる人。関係ない担当者は通さない)
-  //    ・**state='todo' の 1 本だけ** — 「システムが進める工程を人が完了にする」は依然できない
+  //    ・**未着手 / 完了 の 2 本だけ**。「対象外」にするのは従来どおり管理者だけ
+  //    ・完了にできるのは**楽天登録の根拠がある商品だけ** — この下の
+  //      「⑧ は楽天に出品すると自動で完了します」のゲートは**この例外を通った後も必ず通る**ので、
+  //      出していない商品を人が「出した」ことにはできない
   //    影響はカードがどの列に出るかだけ: ⑧楽天登録 は listing_gate=0 で出品ゲートに数えず、
   //    楽天に出してよいかの判定は draft_mall_status / draft_rakuten が正 (assertRakutenListable)、
   //    status の導出 (deriveDraftStatus) も imgd_* を見ない
-  if (boardReopen && row.track === 'image' && row.image_stage === IMAGE_RAKUTEN_STAGE
-    && !row.role_code && patch?.state === 'todo'
+  if (boardMove && row.track === 'image' && row.image_stage === IMAGE_RAKUTEN_STAGE
+    && !row.role_code && (patch?.state === 'todo' || patch?.state === 'done')
     && actorStaffId != null && hasRole(db, actorStaffId, IMAGE_TRACK_ROLE)
     && Object.keys(patch).every((k) => k === 'state' || k === 'expected_version' || patch[k] === undefined)) {
     return;
@@ -889,7 +892,7 @@ export function assertStepOperable(db, draftId, stepCode, expectedVersion, { isA
  */
 export function setStepState(
   draftId, stepCode, patch, actor,
-  { isAdmin = false, actorStaffId = null, requireVersion = false, bypassGates = false, systemActor = false, boardClaim = false, boardReopen = false } = {},
+  { isAdmin = false, actorStaffId = null, requireVersion = false, bypassGates = false, systemActor = false, boardClaim = false, boardMove = false } = {},
 ) {
   const db = getDB();
   const id = Number(draftId);
@@ -908,7 +911,7 @@ export function setStepState(
   if (row.track === 'image' && patch && Object.keys(patch).some((k) => k !== 'expected_version') && imageHoldOf(db, id).onHold) {
     throw badRequest('画像制作が保留中です。詳細画面の「画像制作」カードで保留を解除してから操作してください');
   }
-  assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim, boardReopen });
+  assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim, boardMove });
   // TOP画像 (サムネイル) は楽天出品に必須なので、admin でも工程単位の「対象外」にはできない。
   // 詳細画像を作らない商品は setDetailImagesExcluded (商品単位のフラグ) を使う
   if (patch?.state === 'skip' && row.track === 'image' && row.image_kind !== 'detail') {
@@ -1242,14 +1245,15 @@ export function moveBoardCard(
       if (r?.track === 'image' && r.role_code && hasRole(db, actorStaffId, r.role_code)) return false;
       return !!(r && r.assignee_id == null && r.role_code);
     };
-    // reopen = 「対象外で残っていた移動先を未着手に戻す」とき。未割り当ての人手工程なら
-    // 他の通過工程と同じく引き受けも一緒にやる (Codex R3 P2: 状態だけ送ると
+    // D&D からの書き込みは **すべて boardMove** で通す。これで ⑧楽天登録 (役割なし) を
+    // 画像登録者が 開き直す / 出品の根拠があるなら閉じる の両方ができる (名指し R4 F: 片道にしない)。
+    // 未割り当ての人手工程なら引き受けも一緒にやる (Codex R3 P2: 状態だけ送ると
     // 「先に『自分が担当する』を押してから操作してください」で 403 になり、
     // 飛ばされる不具合が 403 に変わるだけになる)
-    const setWithClaim = (code, state, { reopen = false } = {}) => {
+    const setWithClaim = (code, state) => {
       const claim = unassignedHuman(code);
       setStepState(id, code, claim ? { assignee_id: actorStaffId, state } : { state }, actor,
-        { isAdmin, actorStaffId, boardClaim: claim, boardReopen: reopen });
+        { isAdmin, actorStaffId, boardClaim: claim, boardMove: true });
     };
     const settled = (r) => r.state === 'done' || r.state === 'skip';
     if (tIdx > curIdx) {
@@ -1286,7 +1290,7 @@ export function moveBoardCard(
           //    権限判定は書き込みの前なので、諦めても通過工程の done はそのまま残る。
           //    403 以外 (ゲートの 400・競合の 409) は従来どおり移動ごとロールバックする
           try {
-            setWithClaim(target.step_code, 'todo', { reopen: true });
+            setWithClaim(target.step_code, 'todo');
           } catch (e) {
             if (e?.status !== 403) throw e;
           }
@@ -1302,8 +1306,8 @@ export function moveBoardCard(
       // 🚨 ここが報告された不具合の**本命の経路** (Codex R4 P1): 親の画像をそのまま使うセットは
       //    画像の工程が 10 段階まるごと「対象外」になるので、カードは最初から**完了列**にいる
       //    (curIdx === rows.length)。そこから ⑧楽天登録 に直接落とすのはこの後方移動で、
-      //    boardReopen を渡さないと役割なしの ⑧ で画像登録者が 403 になる
-      setWithClaim(rows[tIdx].step_code, 'todo', { reopen: true });
+      //    boardMove を渡さないと役割なしの ⑧ で画像登録者が 403 になる
+      setWithClaim(rows[tIdx].step_code, 'todo');
     }
     return { changed: true };
   });
