@@ -1523,6 +1523,7 @@ export const JOBS_REGISTRY = [
       + 'Restart-Service は要らない = daily-sync・Retry1〜3 は Task Scheduler が毎回新しい node で起こし .env を読む。翌朝の daily-sync の「Amazon決済と財務」を見る。'
       + '足す前に朝が来た・足した後に消えた朝は「Amazon Settlement」が ❌ (一方向の門) = .env を確かめて足す) '
       + '② 1 週間 coordinator で回ったら、スイッチ・今までの 2 工程の分岐 (daily-sync / retry の定義 / 単独の入口の書く道)・その試験を消して常に coordinator にする PR を作る。.env の行も消す。このエントリも消す。'
+      + '🚨 不合格でも一方向 = 実の回が coverage の世代を作った後は今までの 2 工程に戻らない = 足さないと翌朝から「Amazon Settlement」が ❌ で止まる (取込も止まる) → その日のうちに相談 (直して実の回をもう一度 か 上限の中なら足して coordinator で回す)。'
       + '合格しないまま期限が来たら延ばす前に相談 (今までの 2 工程のままでは正式な利益が出ない)',
   },
   {
