@@ -33,7 +33,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { isWarnSummary } from './amazon-fees-outcome.js';
 import { acquireRetryLock, releaseRetryLock } from './retry-lock.js';
-import { financeCoordinatorEnabled } from './finance-coordinator-switch.js';
+import { financeCoordinatorEnabled, coverageEverRanAt, FINANCE_COORDINATOR_ENV } from './finance-coordinator-switch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -273,18 +273,20 @@ function toJstDate(d) {
 /**
  * 工程の名前の読み替え (#1567 R1 L4・スイッチ)。朝の daily-sync と retry の間にスイッチ (env CDB_FINANCE_COORDINATOR) が変わっても、今のスイッチの工程で走らせる
  *   スイッチがある = 'Amazon Settlement' / 'CompanyDB財務(Amazon)' → coordinator 'Amazon決済と財務' の 1 工程
- *   スイッチが無い = 'Amazon決済と財務' → 今までの 2 工程 'Amazon Settlement'・'CompanyDB財務(Amazon)' (順もこの順 = 上流が先)
+ *   スイッチが無い = 'Amazon決済と財務' → 今までの 2 工程 'Amazon Settlement'・'CompanyDB財務(Amazon)' (順もこの順 = 上流が先)。
+ *     🚨 ただし coordinator に切り替え済み (switched = coverage の世代がある) か分からない (null) なら読み替えない = 一方向 (#1567 Codex R6 High)。
+ *     その 'Amazon決済と財務' はスイッチが無いので走らせず ❌ (runJobs) = .env を直す
  */
 export const RENAMED_JOBS = Object.freeze({ 'Amazon Settlement': 'Amazon決済と財務', 'CompanyDB財務(Amazon)': 'Amazon決済と財務' });
 export const LEGACY_JOBS_OF = Object.freeze({ 'Amazon決済と財務': Object.freeze(['Amazon Settlement', 'CompanyDB財務(Amazon)']) });
 /** remaining_jobs の名前を今のスイッチの工程に (重複は 1 つに・順は最初に出た位置) */
-export function renameRetryJobs(jobs, { coordinator = financeCoordinatorEnabled() } = {}) {
+export function renameRetryJobs(jobs, { coordinator = financeCoordinatorEnabled(), switched = null } = {}) {
   if (!Array.isArray(jobs)) return jobs;
   const out = [];
   const add = (n) => { if (!out.includes(n)) out.push(n); };
   for (const j of jobs) {
     if (coordinator && Object.hasOwn(RENAMED_JOBS, j)) add(RENAMED_JOBS[j]);
-    else if (!coordinator && Object.hasOwn(LEGACY_JOBS_OF, j)) LEGACY_JOBS_OF[j].forEach(add);
+    else if (!coordinator && switched === false && Object.hasOwn(LEGACY_JOBS_OF, j)) LEGACY_JOBS_OF[j].forEach(add);
     else add(j);
   }
   return out;
@@ -295,7 +297,12 @@ function loadState() {
   try {
     const json = fs.readFileSync(RETRY_STATE_FILE, 'utf-8');
     const state = JSON.parse(json);
-    if (state && Array.isArray(state.remaining_jobs)) state.remaining_jobs = renameRetryJobs(state.remaining_jobs);
+    if (state && Array.isArray(state.remaining_jobs)) {
+      // 切り替え済みかは warehouse.db と財務の台帳の証拠で (スイッチがあるときは見ない)。読めない = null = 読み替えない (安全側)
+      const coordinator = financeCoordinatorEnabled();
+      const switched = coordinator ? null : coverageEverRanAt(process.env.DATA_DIR || path.join(PROJECT_DIR, 'data'));
+      state.remaining_jobs = renameRetryJobs(state.remaining_jobs, { coordinator, switched });
+    }
     return { found: true, state };
   } catch (e) {
     console.error('[Retry] state file 読み込み失敗:', e.message);
@@ -371,6 +378,12 @@ export function runRetryRound(remainingJobs, { run = runScript, log = console.lo
       continue;
     }
 
+    // coordinator の工程は env CDB_FINANCE_COORDINATOR=1 のときだけ (勝手に起動しない。切り替え済みでスイッチが消えた = .env を直す・#1567 Codex R6 High)
+    if (jobName === 'Amazon決済と財務' && !financeCoordinatorEnabled()) {
+      log(`[Retry] ${jobName} スキップ (${FINANCE_COORDINATOR_ENV} が無い)`);
+      results.push({ name: jobName, success: false, summary: `❌ ${FINANCE_COORDINATOR_ENV} が無い = coordinator を走らせない (coordinator に切り替え済みなら .env の ${FINANCE_COORDINATOR_ENV}=1 が消えた疑い = 今までの 2 工程にも戻さない。.env を確かめる)` });
+      continue;
+    }
     const def = JOB_DEFINITIONS[jobName];
     const result = run(def.script, jobName, def.timeoutMs, def.args);
     results.push({ name: jobName, ...result });

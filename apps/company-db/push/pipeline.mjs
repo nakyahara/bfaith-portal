@@ -155,7 +155,8 @@ export async function runPush({
   }
   const startedAt = now();
   const r = { ok: false, kind, mode, dryRun, force, runId: null, batchSeq: null, scanned: 0, inScope: 0, unchanged: 0, changed: 0, sent: 0, applied: 0, same: 0, stale: 0, failed: [], staleKeys: [], chunks: 0,
-    transformErrors: [], noSyncedAt: 0, lockedBy: null, example: null, remote: null, ledgerReset: null, ledgerRebuilt: 0, carriedOver: 0, stats, afterSend: null, scanSnapshot: null, measure: null };
+    transformErrors: [], noSyncedAt: 0, lockedBy: null, example: null, remote: null, ledgerReset: null, ledgerRebuilt: 0, carriedOver: 0, stats, afterSend: null, scanSnapshot: null, measure: null,
+    coverageInvalidated: 0 };   // 受け口が無効にした決済のそろい (complete → updating) の数の合計 (応答の coverage_invalidated。#1567 Codex R6 Medium 1)
   if (!dryRun) {
     const lock = ledger.acquireLock({ owner, pid, now: startedAt, ...(isAlive ? { isAlive } : {}) });
     if (!lock.ok) { r.lockedBy = lock.held; log(`[company-db push ${label}] 別の送り手が走っている (${lock.held.owner} pid ${lock.held.pid} 心拍 ${lock.held.heartbeat_at}) ので見送った`); return r; }
@@ -272,6 +273,7 @@ export async function runPush({
         return;
       }
       for (const k of ['applied', 'same', 'stale']) { if (!Number.isInteger(res[k])) throw new Error(`応答に ${k} が無い`); r[k] += res[k]; }
+      if (Number.isInteger(res.coverage_invalidated) && res.coverage_invalidated > 0) r.coverageInvalidated += res.coverage_invalidated;   // 捨てない (Codex R6 Medium 1)
       const staleKeys = res.stale_keys ?? res.stale_slips;
       if (!Array.isArray(res.failed) || !Array.isArray(staleKeys)) throw new Error('応答に failed / stale_keys が無い');
       if (res.applied + res.same + res.stale + res.failed.length !== rows.length) throw new Error(`chunk ${body.chunk_index}: 送った ${rows.length} と応答の合計 ${res.applied + res.same + res.stale + res.failed.length} が合わない`);

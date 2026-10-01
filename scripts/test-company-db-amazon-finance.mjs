@@ -905,7 +905,8 @@ await t('🚨 daily-sync のスイッチ (#1567): env CDB_FINANCE_COORDINATOR �
     assert.deepEqual(financePushStep('2026-10-05'), { name: 'CompanyDB財務(Amazon)', cmd: 'apps/company-db/push/amazon-finance.mjs --incremental --require-backfilled', label: 'Company DB Amazon 財務 push (--incremental)', timeoutMs: 1800000 });
     assert.deepEqual(financePushStep('2026-10-04'), { name: 'CompanyDB財務(Amazon)', cmd: 'apps/company-db/push/amazon-finance.mjs --full --require-backfilled', label: 'Company DB Amazon 財務 push (--full)', timeoutMs: 1800000 });   // 日曜
     for (const v of ['', '0', 'true', 'yes', ' 2 ']) assert.equal(financeCoordinatorEnabled({ CDB_FINANCE_COORDINATOR: v }), false, `「${v}」は off`);
-    assert.equal(financeCoordinatorEnabled({ CDB_FINANCE_COORDINATOR: ' 1 ' }), true);
+    assert.equal(financeCoordinatorEnabled({ CDB_FINANCE_COORDINATOR: ' 1 ' }), false, '前後の空白も許さない (ちょうど 1・Codex R6 Low 1)');
+    assert.equal(financeCoordinatorEnabled({ CDB_FINANCE_COORDINATOR: '1' }), true);
     // スイッチがある = coordinator の 1 工程・送り手の工程は無い
     process.env.CDB_FINANCE_COORDINATOR = '1';
     assert.deepEqual(settlementStep(), { name: 'Amazon決済と財務', cmd: 'apps/warehouse/amazon-finance-coverage-run.js --source v2', label: 'Amazon決済と財務', timeoutMs: 5400000 });
@@ -914,7 +915,9 @@ await t('🚨 daily-sync のスイッチ (#1567): env CDB_FINANCE_COORDINATOR �
     const { renameRetryJobs, UPSTREAM_OF, JOB_DEFINITIONS, RETRY_ORDER } = await import('../apps/warehouse/retry-failed-jobs.js');
     assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon Settlement', 'CompanyDB財務(Amazon)']), ['f_sales', 'Amazon決済と財務'], 'スイッチがある = 今までの 2 工程の名前 → coordinator');
     delete process.env.CDB_FINANCE_COORDINATOR;
-    assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon決済と財務']), ['f_sales', 'Amazon Settlement', 'CompanyDB財務(Amazon)'], 'スイッチが無い = coordinator の名前 → 今までの 2 工程 (上流が先)');
+    assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon決済と財務'], { switched: false }), ['f_sales', 'Amazon Settlement', 'CompanyDB財務(Amazon)'], 'スイッチが無く一度も coordinator で回っていない = coordinator の名前 → 今までの 2 工程 (上流が先)');
+    assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon決済と財務']), ['f_sales', 'Amazon決済と財務'], '切り替え済みか分からない (既定) = 読み替えない (一方向・Codex R6 High)');
+    assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon決済と財務'], { switched: true }), ['f_sales', 'Amazon決済と財務'], '切り替え済み = 読み替えない');
     assert.deepEqual(renameRetryJobs(['CompanyDB財務(Amazon)', 'Render同期']), ['CompanyDB財務(Amazon)', 'Render同期'], 'スイッチが無い = 今までの名前はそのまま');
     // retry の定義 = master と同じ (今までの 2 工程) + coordinator
     assert.deepEqual(JOB_DEFINITIONS['Amazon Settlement'], { script: 'apps/warehouse/fetch-amazon-settlements.js', args: ['--days', '14'], timeoutMs: 3600000 });
@@ -925,11 +928,13 @@ await t('🚨 daily-sync のスイッチ (#1567): env CDB_FINANCE_COORDINATOR �
   } finally { if (saved === undefined) delete process.env.CDB_FINANCE_COORDINATOR; else process.env.CDB_FINANCE_COORDINATOR = saved; }
   // daily-sync の配線 (import すると main が走るので本文で確かめる): 工程はスイッチの部品から取る・順 = 取込 → 手数料 → 送り手 → 突き合わせ
   const src = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/daily-sync.js'), 'utf8');
-  const iSw = src.indexOf('const financeCoordinator = financeCoordinatorEnabled();'), iSettle = src.indexOf('const settlementResult = runScript(settleStep.cmd, settleStep.label, settleStep.timeoutMs);'),
+  const iSw = src.indexOf('const financeCoordinator = financeCoordinatorEnabled();'), iSettle = src.indexOf(': runScript(settleStep.cmd, settleStep.label, settleStep.timeoutMs);'),
     iFees = src.indexOf("'Amazonアカウントフィー sync', 300000"), iPush = src.indexOf('cdbFinanceResult = runScript(pushStep.cmd, pushStep.label, pushStep.timeoutMs);'),
     iRec = src.indexOf("'apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled'");
   assert.ok(iSw > 0 && iSettle > iSw && iFees > iSettle && iPush > iFees && iRec > iPush, `${iSw} ${iSettle} ${iFees} ${iPush} ${iRec}`);
   assert.ok(src.includes('const settleStep = settlementStep({ coordinator: financeCoordinator });') && src.includes('const pushStep = financePushStep(businessDate, { coordinator: financeCoordinator });'));
+  // 一方向 (#1567 Codex R6 High): 切り替え済みでスイッチが無い朝は今までの 2 工程を起動しない (取込は ❌・送り手はその見送りで ⏭️)
+  assert.match(src, /const switchedBack = !financeCoordinator && coverageEverRanAt\(process\.env\.DATA_DIR \|\| path\.join\(PROJECT_DIR, 'data'\)\) === true;\s*(\/\/[^\n]*\s*)*const settlementResult = switchedBack\s*\? \{ success: false, summary: `❌ coordinator に切り替え済み/);
   // スイッチが無い朝 = master と同じ: 取込の結果の名前 (warn なし)・取込が失敗した朝は送らずに ⏭️ (retry に載せる)
   assert.match(src, /results\.push\(financeCoordinator \? \{ name: settleStep\.name, \.\.\.settlementResult, warn: settlementResult\.success && isWarnSummary\(settlementResult\.summary\) \} : \{ name: settleStep\.name, \.\.\.settlementResult \}\);/);
   assert.match(src, /if \(pushStep && settlementResult\.success\) \{[\s\S]{0,300}\} else if \(pushStep\) \{\s*cdbFinanceResult = \{ success: false, summary: '⏭️ skipped \(Amazon Settlement の取込が失敗。取込の再試行が成功したら送る\)' \};/);

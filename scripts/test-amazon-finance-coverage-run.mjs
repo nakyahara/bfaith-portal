@@ -170,6 +170,17 @@ await t('完了印の前 = 取込だけ・Render に触れない・最後の行�
   assert.deepEqual([last.mode, last.finance_pushed, last.exit_code, last.daily_sync_run_id], ['ingest_only', false, 0, 'ds_test_run']);
 });
 setLedgerMeta(META.backfill, '1');
+await t('対照 (#1567 Codex R6 High): スイッチが無く coordinator で一度も回っていない = 今までの書く取込は門を通って書く (lease の下・一覧の回は世代なし)', async () => {
+  const { runLegacyFetch } = await import('../apps/warehouse/fetch-amazon-settlements.js');
+  const SW = await import('../apps/warehouse/finance-coordinator-switch.js');
+  assert.equal(SW.coverageEverRanAt(tmpDir), false, '取込だけの回 (完了印の前) は世代を作らない');
+  const out = await runLegacyFetch({ reportId: null, dryRun: false, source: 'v2' }, { db, dataDir: tmpDir, sp, inventorySp: sp, runId: 'legacy-never', downloadTsv, now: () => new Date(NOW), isAlive: () => false });
+  assert.deepEqual(out.blocked, []);
+  assert.ok(V.readLease(db).released_at, 'lease は放した');
+  const inv = db.prepare(`SELECT ingest_run_id, coverage_generation, run_token FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get();
+  assert.deepEqual([inv.ingest_run_id, inv.coverage_generation], ['legacy-never', null]);
+  assert.equal(SW.coverageEverRanAt(tmpDir), false, '今までの取込は切り替えの証拠を作らない');
+});
 
 console.log('② coverage の回');
 await t('🚨 初期の印が無い = complete にしない (⚠️ exit 0)・Render は updating (世代 1)・全部の chunk に世代と token', async () => {
@@ -645,6 +656,15 @@ await t('🚨 coordinator を通らない単独の送り手 (token の無い chu
     L1.db.prepare(`update sent set fp = 'x' where kind = ? and key like '%O-D'`).run(FINANCE_KIND);
     const r = await pushAmazonFinance({ warehouse: w, ledger: L1, base: BASE, syncKey: 'k', mode: 'range', from: '2026-03-01', to: '2026-03-01', log: () => {}, sleep: async () => {}, capacity: BIG });
     assert.ok(r.applied >= 1, `applied ${r.applied}`);
+    // 🆕 #1567 Codex R6 Medium 1: 受け口の coverage_invalidated を捨てない = 要約は少なくとも ⚠️・切り替え済みの環境の CLI は ❌ exit 1
+    const { summarizeFinance, financeCliOutcome } = await import('../apps/company-db/push/amazon-finance.mjs');
+    assert.ok(r.coverageInvalidated >= 1, `coverage_invalidated ${r.coverageInvalidated}`);
+    assert.ok(r.ok, '送信そのものは成功');
+    assert.match(summarizeFinance(r), /^⚠️ .*決済のそろい \(complete\) を \d+ 件無効にした/);
+    const o0 = financeCliOutcome(r, { switched: false }), o1 = financeCliOutcome(r, { switched: true });
+    assert.deepEqual([o0.exitCode, o0.summary.slice(0, 2)], [0, '⚠️']);
+    assert.equal(o1.exitCode, 1); assert.match(o1.summary, /^❌ .*切り替え済みの環境で complete を無効にした/);
+    assert.equal(financeCliOutcome({ ...r, coverageInvalidated: 0 }, { switched: true }).exitCode, 0, '無効にしていなければ切り替え済みでも ❌ にしない');
   } finally { w.close(); L1.close(); }
   const c = await cov();
   assert.deepEqual([c.state, c.invalidated_reason], ['updating', 'untokened_finance_write']);
@@ -714,6 +734,57 @@ await t('🚨 86〜90 日前に作られた report の決済 (前の版の取込
     assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
   } finally { SP.ingQueries = null; NOW = NOW0; }
 });
+await t('🚨 一方向のスイッチ (#1567 Codex R6 High): (a) 手の実 --full が通った (complete) → .env にまだ足していない / (b) 足した後に消えた = 今までの取込は生の表を書く前・SP-API を呼ぶ前に ❌・今までの送り手は送る前に ❌・Render の complete は古くならない・retry は 2 工程に読み替えず coordinator も走らせない', async () => {
+  const { runLegacyFetch } = await import('../apps/warehouse/fetch-amazon-settlements.js');
+  const SW = await import('../apps/warehouse/finance-coordinator-switch.js');
+  const { runRetryRound, renameRetryJobs: rename } = await import('../apps/warehouse/retry-failed-jobs.js');
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+  const saved = process.env.CDB_FINANCE_COORDINATOR;
+  const dl = [];
+  const legacy = () => runLegacyFetch({ reportId: null, dryRun: false, source: 'v2' }, { db, dataDir: tmpDir, sp, inventorySp: sp, runId: `legacy-${NOW}`,
+    downloadTsv: async (id) => { dl.push(id); return downloadTsv(id); }, now: () => new Date(NOW), isAlive: () => false });
+  const envOff = { ...process.env, DATA_DIR: tmpDir, RENDER_MIRROR_URL: 'https://127.0.0.1:9/none', RENDER_PORTAL_URL: '', MIRROR_SYNC_KEY: 'k', CDB_DB_LIMIT_BYTES: '1000000000000' };
+  delete envOff.CDB_FINANCE_COORDINATOR;
+  const receipts = async () => one(`select count(*)::int n, coalesce(string_agg(mall_order_no || ':' || set_checksum, ',' order by mall_order_no), '') s from core.order_finance_receipts`);
+  try {
+    // (a) 手の実 --full (coordinator は env に依らず手で流せる) が通った → env をまだ足していない
+    delete process.env.CDB_FINANCE_COORDINATOR;
+    const r0 = await run({ fetchImpl: spyFetch() });
+    assert.equal(r0.exitCode, 0, r0.summary); assert.equal((await cov()).state, 'complete');
+    assert.equal(SW.financeCoordinatorEnabled(), false); assert.equal(SW.coverageEverRanAt(tmpDir), true, '一度 coordinator が coverage の回で回った = 切り替え済み');
+    const P10 = ['2026-03-17T10:00:00Z', '2026-03-18T10:00:00Z'];
+    DOCS.D10 = settlementTsv('S10', ...P10, [{ kind: 'order', order: 'O-J', sku: 'SKU-J', yen: 90, day: '2026-03-17T12:00:00Z' }]);
+    SP.ing = [...SP.ing, rep('R10', 'DONE', 'D10', P10, '2026-03-19T00:00:00Z')];   // 新しい report = 今までの取込が書けば生の表が変わる
+    const before = { raw: rawCounts(), cov: await cov(), rec: await receipts() };
+    await assert.rejects(legacy, (e) => e.code === 'FINANCE_SWITCHED_BACK' && /今までの書く取込/.test(e.message) && /CDB_FINANCE_COORDINATOR/.test(e.message));
+    assert.deepEqual(rawCounts(), before.raw, '生の表は変わらない'); assert.equal(dl.length, 0, 'SP-API のダウンロードもしない');
+    assert.ok(V.readLease(db).released_at, 'lease は放した (次の回を止めない)');
+    const cli = spawnSync(process.execPath, ['apps/company-db/push/amazon-finance.mjs', '--incremental', '--require-backfilled'], { cwd: repoRoot, env: envOff, encoding: 'utf8' });
+    assert.equal(cli.status, 1, cli.stdout + cli.stderr); assert.match(cli.stdout + cli.stderr, /coordinator に切り替え済み[\s\S]*今までの送り手/);
+    assert.deepEqual(await cov(), before.cov, 'Render の complete はそのまま (生の表も受領記録も変わっていない = 古くならない)');
+    assert.deepEqual(await receipts(), before.rec, 'token の無い chunk を送らない');
+    // retry: 切り替え済み (か分からない) なら coordinator → 2 工程に読み替えない・スイッチが無ければ coordinator の工程も走らせない
+    assert.deepEqual(rename(['Amazon決済と財務'], { coordinator: false, switched: SW.coverageEverRanAt(tmpDir) }), ['Amazon決済と財務']);
+    assert.deepEqual(rename(['Amazon決済と財務'], { coordinator: false, switched: null }), ['Amazon決済と財務'], '分からない = 読み替えない');
+    const ran = [];
+    const rr = runRetryRound(['Amazon決済と財務'], { run: (...x) => { ran.push(x); return { success: true, summary: '✅' }; }, log: () => {} });
+    assert.equal(ran.length, 0, '勝手に coordinator を起動しない'); assert.match(rr[0].summary, /^❌ CDB_FINANCE_COORDINATOR が無い/); assert.equal(rr[0].success, false);
+    // (b) 足した後 (env = 1) に coordinator が回る → env が消えた = 同じく ❌
+    process.env.CDB_FINANCE_COORDINATOR = '1';
+    SP.inv = SP.ing;   // R10 も一覧に出た
+    const r1 = await run({ fetchImpl: spyFetch() });
+    assert.equal(r1.exitCode, 0, `${r1.summary} ${JSON.stringify(r1.reasons)}`); assert.equal((await cov()).state, 'complete');
+    delete process.env.CDB_FINANCE_COORDINATOR;
+    const before2 = { raw: rawCounts(), cov: await cov() };
+    await assert.rejects(legacy, (e) => e.code === 'FINANCE_SWITCHED_BACK');
+    assert.deepEqual(rawCounts(), before2.raw); assert.deepEqual(await cov(), before2.cov);
+    const cli2 = spawnSync(process.execPath, ['apps/company-db/push/amazon-finance.mjs', '--full', '--require-backfilled'], { cwd: repoRoot, env: envOff, encoding: 'utf8' });
+    assert.equal(cli2.status, 1, cli2.stdout + cli2.stderr); assert.match(cli2.stdout + cli2.stderr, /coordinator に切り替え済み/);
+    assert.deepEqual(await cov(), before2.cov);
+  } finally { if (saved === undefined) delete process.env.CDB_FINANCE_COORDINATOR; else process.env.CDB_FINANCE_COORDINATOR = saved; }
+});
 await t('🚨 一覧の窓の空白 (前の成功した回から 85 日以上あいた) = complete にしない (⚠️ evidence_chain_gap = Seller Central で印を作り直す)・長く止まった後の取込の一覧も同じ 85 日の窓 (止まっている間に窓の外に出た report は取込まない・#1567 Codex R4)', async () => {
   NOW = Date.parse('2026-07-15T00:00:00Z');   // 前の回 (上の試験の 4/10) から 85 日より後
   const ingQ = [];
@@ -752,7 +823,8 @@ await t('retry-state の工程の名前はスイッチに合わせて読み替�
   // スイッチ (CDB_FINANCE_COORDINATOR=1) があるとき = 旧い 2 工程の名前 → coordinator / 無いとき = coordinator → 今までの 2 工程 (#1567)
   assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon Settlement', 'CompanyDB財務(Amazon)', 'Render同期'], { coordinator: true }), ['f_sales', 'Amazon決済と財務', 'Render同期']);
   assert.deepEqual(renameRetryJobs(['Amazon決済と財務', 'Amazon Settlement'], { coordinator: true }), ['Amazon決済と財務']);
-  assert.deepEqual(renameRetryJobs(['Amazon決済と財務', 'Amazon Settlement'], { coordinator: false }), ['Amazon Settlement', 'CompanyDB財務(Amazon)']);
+  assert.deepEqual(renameRetryJobs(['Amazon決済と財務', 'Amazon Settlement'], { coordinator: false, switched: false }), ['Amazon Settlement', 'CompanyDB財務(Amazon)']);
+  assert.deepEqual(renameRetryJobs(['Amazon決済と財務', 'Amazon Settlement'], { coordinator: false, switched: true }), ['Amazon決済と財務', 'Amazon Settlement'], '切り替え済み = coordinator の名前は読み替えない (一方向)');
   // 単独の取込の引数: スイッチがある = 常に dry-run・--commit は拒む / 無い = 今までどおり書く (daily-sync の --days 14)・--dry-run で書かない
   const { parseArgs: parseFetchArgs } = await import('../apps/warehouse/fetch-amazon-settlements.js');
   assert.equal(parseFetchArgs(['--days', '14'], { coordinator: true }).dryRun, true);
@@ -760,8 +832,9 @@ await t('retry-state の工程の名前はスイッチに合わせて読み替�
   assert.equal(parseFetchArgs(['--days', '14'], { coordinator: false }).dryRun, false, 'スイッチが無い = master と同じく書く');
   assert.equal(parseFetchArgs(['--days', '14', '--dry-run'], { coordinator: false }).dryRun, true);
   const fsrc = fs.readFileSync(new URL('../apps/warehouse/fetch-amazon-settlements.js', import.meta.url), 'utf8');
-  assert.match(fsrc, /if \(!args\.dryRun\) \{\s*const got = acquireCoverageLease\(db, \{ isAlive: isAliveNodeSince \}\);/, '書く取込は coverage の lease を取る (手で流す coordinator・版付けと重ならない)');
-  assert.match(fsrc, /\} finally \{ if \(lease\) releaseCoverageLease\(db, lease\); \}/);
+  // 書く取込 = runLegacyFetch: coverage の lease を取る → その中で一方向の門 (#1567 Codex R6 High) → 取込 → 放す。main の書く回は必ずここを通る
+  assert.match(fsrc, /const got = acquireCoverageLease\(db, \{ isAlive, now: now\(\) \}\);[\s\S]{0,400}try \{\s*assertLegacyAllowed\(db, ledgerMetaReader\(dataDir\), '今までの書く取込 \(生の表を書く\)'\);\s*return await runSettlementFetch\(args, \{[^}]*lease \}\);\s*\} finally \{ releaseCoverageLease\(db, lease\); \}/, '書く取込は lease の中で門を通ってから書く');
+  assert.match(fsrc, /const \{ blocked \} = args\.dryRun\s*\? await runSettlementFetch\([\s\S]{0,300}?\)\s*: await runLegacyFetch\(/, 'main の書く回は runLegacyFetch だけ');
 });
 
 await t('送信の途中で失敗した朝 (failed chunk) = 記録の finance_push_ok は false = daily-sync は突き合わせを見送る (#1567 R3 L2)', async () => {

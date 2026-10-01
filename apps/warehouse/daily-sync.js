@@ -16,7 +16,7 @@ import { isWarnSummary } from './amazon-fees-outcome.js';
 import { isMonthStartGraceSummary, monthStartEmptyGrace, monthStartGraceDays, prevMonthOf } from './finance-dq-month-mode.js';
 import { waitOtherRunGone, isAliveNodeSince, remainingRetrySlots } from './retry-lock.js';
 import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS } from './amazon-finance-months.js';
-import { financeCoordinatorEnabled, settlementStep, financePushStep, FINANCE_COORDINATOR_ENV } from './finance-coordinator-switch.js';
+import { financeCoordinatorEnabled, settlementStep, financePushStep, FINANCE_COORDINATOR_ENV, coverageEverRanAt } from './finance-coordinator-switch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -584,7 +584,12 @@ async function main() {
   const financeCoordinator = financeCoordinatorEnabled();
   const settleStep = settlementStep({ coordinator: financeCoordinator });
   console.log(`[DailySync] Amazon の決済と財務: ${financeCoordinator ? 'coordinator (Amazon決済と財務)' : `今までの 2 工程 (${FINANCE_COORDINATOR_ENV} が無い)`}`);
-  const settlementResult = runScript(settleStep.cmd, settleStep.label, settleStep.timeoutMs);
+  // 🚨 一方向 (#1567 Codex R6 High): coordinator に切り替え済み (coverage の世代がある) なのにスイッチが無い朝は、今までの 2 工程を起動しない = ❌ (.env を直す・勝手に coordinator も起動しない)。
+  //   入口 (fetch-amazon-settlements.js / amazon-finance.mjs) も同じ門で止まる (retry・手で流したときも) = ここは朝の要約を分かりやすくするだけ
+  const switchedBack = !financeCoordinator && coverageEverRanAt(process.env.DATA_DIR || path.join(PROJECT_DIR, 'data')) === true;
+  const settlementResult = switchedBack
+    ? { success: false, summary: `❌ coordinator に切り替え済み (coverage の世代がある) なのに ${FINANCE_COORDINATOR_ENV} が無い = 今までの取込・送り手を動かさない (.env の ${FINANCE_COORDINATOR_ENV}=1 が消えた・まだ足していない疑い = .env を確かめて足す)` }
+    : runScript(settleStep.cmd, settleStep.label, settleStep.timeoutMs);
   results.push(financeCoordinator ? { name: settleStep.name, ...settlementResult, warn: settlementResult.success && isWarnSummary(settlementResult.summary) } : { name: settleStep.name, ...settlementResult });
 
   // ABA「Amazon検索用語」週次取込 (セラースプライト置換、aba.db 別建て)

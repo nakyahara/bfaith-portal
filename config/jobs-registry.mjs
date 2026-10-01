@@ -1508,6 +1508,8 @@ export const JOBS_REGISTRY = [
     purpose: 'Amazon の決済と財務を coordinator (amazon-finance-coverage-run.js・PR #1567) で回すかのスイッチ = env CDB_FINANCE_COORDINATOR (=1 のときだけ coordinator)。'
       + '無い間は daily-sync・retry が今までの 2 工程 (Amazon Settlement → CompanyDB財務(Amazon)) のまま動く = miniPC の本体がほかの PR の deploy で pull されても、'
       + '定期実行の前のハードゲート (夜に手で実の --full を 1 回: exit 0・60 分以内・最大メモリ 1,200 MB 以下) に合格する前に新しい coordinator が毎朝動き出さない。'
+      + '🚨 一方向 (#1567 Codex R6 High): 一度 coordinator が coverage の回 (世代) で回った後は、スイッチが無くても今までの 2 工程に戻らない '
+      + '(daily-sync・retry・単独の入口が、今までの取込は生の表を書く前・送り手は送る前に ❌ = 古い complete を残さない・勝手に coordinator も起動しない)。'
       + '一時物にした理由 = 設計の終わりの形は「決済の取込と財務の送信は coordinator だけ」(今までの 2 工程は token の無い chunk で Render の complete を毎朝無効にする = 正式な利益が出ない) = '
       + '合格して足した後はスイッチを残す意味が無い (残すと 2 つの道の試験と保守が続く)',
     where: 'bfaith-portal リポジトリ apps/warehouse/finance-coordinator-switch.js (スイッチと工程の選び方)・apps/warehouse/daily-sync.js (工程)・apps/warehouse/retry-failed-jobs.js '
@@ -1515,8 +1517,11 @@ export const JOBS_REGISTRY = [
       + 'miniPC の .env の CDB_FINANCE_COORDINATOR',
     remove_by: '2026-11-30',
     lifecycle: 'temporary',
-    runbook: '① 夜に手で実の --full を 1 回 (README「デプロイの前に本番の DB のコピーで測る」・PR #1567 の手順) → 合格したら中原さんの指示の後に miniPC の .env に CDB_FINANCE_COORDINATOR=1 を足す '
-      + '(🚨 .env はリポジトリの直下の 1 つだけ・足す 1 行だけ書き、ほかの行を書き直さない = 2026-09-30 に .env を書き直して CDB_DB_LIMIT_BYTES など 4 つが消えた。足した後は Restart-Service と翌朝の daily-sync の「Amazon決済と財務」を見る) '
+    runbook: '① 夜に手で実の --full を 1 回 (README「デプロイの前に本番の DB のコピーで測る」・PR #1567 の手順) → 合格したら中原さんの指示の後に **同じ保守の枠の中ですぐ** miniPC の .env に CDB_FINANCE_COORDINATOR=1 を足す '
+      + '(手順とコマンド = db/company/README.md「.env に CDB_FINANCE_COORDINATOR=1 を足す手順」= 足す前にキーが 0 行・足した後にちょうど 1 行・新しい node から 1 と読める・ほかの必須の鍵が残っている (値は出さない)。'
+      + '🚨 .env はリポジトリの直下の 1 つだけ・足す 1 行だけ書き、ほかの行を書き直さない = 2026-09-30 に .env を書き直して CDB_DB_LIMIT_BYTES など 4 つが消えた。'
+      + 'Restart-Service は要らない = daily-sync・Retry1〜3 は Task Scheduler が毎回新しい node で起こし .env を読む。翌朝の daily-sync の「Amazon決済と財務」を見る。'
+      + '足す前に朝が来た・足した後に消えた朝は「Amazon Settlement」が ❌ (一方向の門) = .env を確かめて足す) '
       + '② 1 週間 coordinator で回ったら、スイッチ・今までの 2 工程の分岐 (daily-sync / retry の定義 / 単独の入口の書く道)・その試験を消して常に coordinator にする PR を作る。.env の行も消す。このエントリも消す。'
       + '合格しないまま期限が来たら延ばす前に相談 (今までの 2 工程のままでは正式な利益が出ない)',
   },

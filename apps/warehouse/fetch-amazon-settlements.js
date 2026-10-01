@@ -57,6 +57,7 @@ import 'dotenv/config';
 import SellingPartner from 'amazon-sp-api';
 import zlib from 'zlib';
 import crypto from 'crypto';
+import path from 'node:path';
 import canonicalize from 'canonicalize';
 import { initDB, getDB } from './db.js';
 import { convertV2TsvToV1Tsv, parseV2Tsv } from './amazon-settlement-v2.js';
@@ -67,7 +68,7 @@ import {
 import {
   documentVersionId, registerDocumentVersion, refreshVersionDetail, selectedVersionOf, dirtyVersionOrders, assertLease, acquireCoverageLease, releaseCoverageLease,
 } from './amazon-settlement-versions.js';
-import { financeCoordinatorEnabled, FINANCE_COORDINATOR_ENV } from './finance-coordinator-switch.js';
+import { financeCoordinatorEnabled, FINANCE_COORDINATOR_ENV, assertLegacyAllowed, ledgerMetaReader } from './finance-coordinator-switch.js';
 import { isAliveNodeSince } from './retry-lock.js';
 
 const REGION = 'fe';
@@ -118,6 +119,24 @@ function getInventoryClient() {
 
 const nowIso = () => new Date().toISOString();
 const nowSql = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+/**
+ * スイッチが無いときの書く取込 (今までの「Amazon Settlement」・#1567)。
+ *   ① coverage の lease を取る (手で流す coordinator・版付けと重ならない。生の表は lease の下で書く = coordinator と同じ確かめ)
+ *   ② 🚨 一方向の門 (Codex R6 High): lease の中で、coordinator が coverage の回で回ったことがあれば ❌ (生の表を書く前・SP-API を呼ぶ前)。
+ *      今までの取込は Render を updating にしない = 書いた後に止まると古い complete が残る。勝手に coordinator も起動しない (.env を直す)
+ *   ③ 取込 (runSettlementFetch)。終わったら lease を放す
+ */
+export async function runLegacyFetch(args, { db, dataDir, sp, inventorySp = null, runId, downloadTsv = null, now = () => new Date(), isAlive = isAliveNodeSince }) {
+  if (args.dryRun) throw new Error('runLegacyFetch は書く取込だけ (dry-run は runSettlementFetch)');
+  const got = acquireCoverageLease(db, { isAlive, now: now() });
+  if (!got.ok) throw new Error(`coverage の lease を別の回が持っている (pid ${got.held.pid}・開始 ${got.held.started_at}) = coordinator か版付けが動いている。終わってから流す`);
+  const lease = got.lease;
+  try {
+    assertLegacyAllowed(db, ledgerMetaReader(dataDir), '今までの書く取込 (生の表を書く)');
+    return await runSettlementFetch(args, { db, sp, inventorySp, runId, downloadTsv, now, lease });
+  } finally { releaseCoverageLease(db, lease); }
+}
 
 /**
  * 単独で流すときの引数 (スイッチ = env CDB_FINANCE_COORDINATOR・finance-coordinator-switch.js・#1567)。
@@ -852,18 +871,10 @@ async function main() {
   await initDB();
   const db = getDB();
 
-  // スイッチが無いときの書く取込は coverage の lease を取る (手で流す coordinator・版付けと重ならない。生の表は lease の下で書く = coordinator と同じ確かめ)
-  let lease = null;
-  if (!args.dryRun) {
-    const got = acquireCoverageLease(db, { isAlive: isAliveNodeSince });
-    if (!got.ok) throw new Error(`coverage の lease を別の回が持っている (pid ${got.held.pid}・開始 ${got.held.started_at}) = coordinator か版付けが動いている。終わってから流す`);
-    lease = got.lease;
-  }
-  let blocked;
-  try {
-    // --report-id の回は一覧を取らない = 専用の接続も作らない
-    ({ blocked } = await runSettlementFetch(args, { db, sp: getClient(), inventorySp: args.reportId ? null : getInventoryClient(), runId, lease }));
-  } finally { if (lease) releaseCoverageLease(db, lease); }
+  // --report-id の回は一覧を取らない = 専用の接続も作らない。書く取込 (スイッチが無いとき) は lease と一方向の門の中 (runLegacyFetch)
+  const { blocked } = args.dryRun
+    ? await runSettlementFetch(args, { db, sp: getClient(), inventorySp: args.reportId ? null : getInventoryClient(), runId })
+    : await runLegacyFetch(args, { db, dataDir: process.env.DATA_DIR || path.join(process.cwd(), 'data'), sp: getClient(), inventorySp: args.reportId ? null : getInventoryClient(), runId });
   if (blocked.length) {
     console.error(`[settlements] ❌ 取り込めない V2 のレポート ${blocked.length} 本: ${JSON.stringify(blocked)}`);
     console.error('[settlements] → apps/warehouse/amazon-settlement-v2.js に規則を足す (V1 の書き方に合わせる。11/11 までは --source v1 でも取れる)');

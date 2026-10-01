@@ -55,7 +55,7 @@ import { aggregateOrderFinance, financePayload, isRealDate, RAW_COLUMNS, AMAZON_
 import { addPendingMonths, ACCOUNT_FEES_PENDING_FILE, PENDING_FILE } from '../../warehouse/amazon-finance-months.js';
 import { filterSelectedRows } from './amazon-finance-transform.mjs';
 import { selectDocumentVersions, assertDocumentVersionsReady, VERSION_SELECT_SQL } from '../../warehouse/amazon-settlement-versions.js';
-import { financeCoordinatorEnabled, FINANCE_COORDINATOR_ENV } from '../../warehouse/finance-coordinator-switch.js';
+import { financeCoordinatorEnabled, FINANCE_COORDINATOR_ENV, assertLegacyAllowed, coverageEverRan } from '../../warehouse/finance-coordinator-switch.js';
 
 export const FINANCE_KIND = `order_finance:${FINANCE_MALL}`;
 export const FINANCE_FLOOR = '2026-01-01';            // policy (0043) の始まり = 決済の行の始まり
@@ -551,6 +551,18 @@ export function summarizeReconcile(rr, { all = false } = {}) {
     + ` → 差の月を build のやり残しに登録した (${rr.streak} 回続けて差${rr.streak >= 2 ? ' = ❌' : ' = 1 回目は ⚠️'})`;
 }
 
+/**
+ * CLI の最後の行と終了コード。complete を無効にした送信 (r.coverageInvalidated > 0・--from/--to のバックフィルなど) = 要約の頭は少なくとも ⚠️ (summarizeFinance)・
+ *   coordinator に切り替え済みの環境 (switched) なら ❌ で exit 1 (正式な利益が止まった = 次の coordinator の回まで null。#1567 Codex R6 Medium 1)
+ */
+export function financeCliOutcome(r, { switched = false } = {}) {
+  const base = summarizeFinance(r);
+  const invalidatedSwitched = !r.dryRun && !r.lockedBy && switched && r.coverageInvalidated > 0;
+  const summary = invalidatedSwitched ? `${base.replace(/^(✅|⚠️) /, '❌ ')} = coordinator に切り替え済みの環境で complete を無効にした (次の coordinator の回で作り直す)` : base;
+  const exitCode = r.lockedBy ? 1 : (r.dryRun ? (r.transformErrors.length || r.finance.unkeyed.length ? 1 : 0) : (r.ok && !invalidatedSwitched ? 0 : 1));
+  return { summary, exitCode };
+}
+
 export function summarizeFinance(r) {
   const f = r.finance || {};
   const lines = `注文 ${f.selectedOrders ?? 0} + 疑似注文 ${f.selectedPseudo ?? 0}${f.renderOnly ? ` + Render にだけある ${f.renderOnly}` : ''} を集約 (決済の行 ${f.rawRows ?? 0} → 重複除去 ${f.dedupRows ?? 0} → 財務の行 ${f.lines ?? 0})・1 注文の最大 ${f.maxLines ?? 0} 行 (${f.maxLinesKey ?? '-'})・最大の JSON ${Math.round((f.maxBytes || 0) / 1024)} KB`;
@@ -563,10 +575,12 @@ export function summarizeFinance(r) {
   if (r.lockedBy) return `⏸️ Company DB Amazon 財務 push: 別の送り手が走っているので見送り (${r.lockedBy.owner} pid ${r.lockedBy.pid})`;
   if (r.dryRun) return `${r.transformErrors.length || (f.unkeyed && f.unkeyed.length) ? '❌' : f.unmapped && f.unmapped.rows ? '⚠️' : '✅'} dry-run: ${lines} / 変わった ${r.changed} / 整形できない ${r.transformErrors.length}${warn ? ` / ${warn}` : ''}`;
   // 最後の行の頭 = daily-sync の判定 (isWarnSummary は頭の ⚠️ だけを見る)。Render の復元・台帳の取り戻しも ⚠️ (✅ で始めると全部 OK に数えられる。#1536 Codex R1 Medium)
-  const head = !r.ok ? '❌' : ((f.unmapped && f.unmapped.rows) || r.ledgerReset || r.ledgerRebuilt) ? '⚠️' : '✅';
+  // Render の決済のそろい (complete) を無効にした (token の無い chunk が受領記録を変えた) = 正式な利益が止まった = 少なくとも ⚠️ (切替済みの環境は main が ❌。#1567 Codex R6 Medium 1)
+  const head = !r.ok ? '❌' : ((f.unmapped && f.unmapped.rows) || r.ledgerReset || r.ledgerRebuilt || r.coverageInvalidated > 0) ? '⚠️' : '✅';
   return `${head} Company DB Amazon 財務 push: 変わった ${r.changed} 注文を送った (applied ${r.applied} / same ${r.same} / stale ${r.stale} / failed ${r.failed.length} / 整形できない ${r.transformErrors.length}) 世代 ${r.batchSeq ?? '-'} chunk ${r.chunks} / ${lines}`
     + (warn ? ` / ${warn}` : '') + (r.ledgerReset ? ` / ⚠️Render が復元されていたので台帳の指紋を空にして送り直した (${r.ledgerReset})` : '')
-    + (r.ledgerRebuilt ? ` / ⚠️台帳が空だったので Render から ${r.ledgerRebuilt} 注文を取り戻した` : '');
+    + (r.ledgerRebuilt ? ` / ⚠️台帳が空だったので Render から ${r.ledgerRebuilt} 注文を取り戻した` : '')
+    + (r.coverageInvalidated > 0 ? ` / ⚠️Render の決済のそろい (complete) を ${r.coverageInvalidated} 件無効にした (token の無い送信 = 正式な利益は次の coordinator の回まで null)` : '');
 }
 
 export function parseArgs(argv) {
@@ -646,19 +660,24 @@ async function main() {
     if (!a.dryRun && (mode === 'incremental' || mode === 'full') && financeCoordinatorEnabled()) {
       throw new Error(`--incremental / --full で送るのは coordinator (node apps/warehouse/amazon-finance-coverage-run.js) の回の中だけ (${FINANCE_COORDINATOR_ENV}=1・決済の取込・coverage の世代と token と一緒)。単独は --dry-run で調べる`);
     }
-    if (!a.dryRun && (mode === 'incremental' || mode === 'full')) console.log(`ℹ️ ${FINANCE_COORDINATOR_ENV} が無い = 今までどおり送る (token の無い chunk = Render は Amazon 財務の complete を無効にする)`);
+    // 🚨 一方向の門 (#1567 Codex R6 High): coordinator が coverage の回で回ったことがあれば、今までの送り手は送る前に ❌ (勝手に coordinator も起動しない = .env を直す)
+    if (!a.dryRun && (mode === 'incremental' || mode === 'full')) {
+      assertLegacyAllowed(warehouse, ledger, '今までの送り手 (token の無い chunk を送る)');
+      console.log(`ℹ️ ${FINANCE_COORDINATOR_ENV} が無い = 今までどおり送る (token の無い chunk = Render は Amazon 財務の complete を無効にする)`);
+    }
     if (!a.dryRun && mode === 'range') console.log('⚠️ --from/--to の送信は token の無い chunk = Render は Amazon 財務の complete を無効にする (次の coordinator の回で作り直す)');
     const capacity = a.dryRun ? null : capacityFromEnv();
     if (!a.dryRun && !(capacity.limitBytes > 0)) throw new Error('容量の上限 (CDB_DB_LIMIT_BYTES) が無い = D-W5 (Render の Postgres のプラン) を決めるまで送らない。まず --dry-run');
     const startedAt = new Date();
     const r = await pushAmazonFinance({ warehouse, ledger, base, syncKey, mode, from: a.from, to: a.to, dryRun: a.dryRun, force: a.force, chunkSize, capacity });
-    console.log(summarizeFinance(r));
+    const out = financeCliOutcome(r, { switched: !a.dryRun && r.coverageInvalidated > 0 && coverageEverRan(warehouse, ledger) });
+    console.log(out.summary);
     if ((mode === 'incremental' || mode === 'full') && !a.dryRun) {
       writeEvidence(dataDir, 'finance-amazon', { kind: 'order_finance', mall: FINANCE_MALL, scope: FINANCE_SCOPE, mode, ok: !!r.ok, run_id: r.runId ?? null, batch_seq: r.batchSeq ?? null,
         started_at: startedAt.toISOString(), changed: r.changed, applied: r.applied, same: r.same, stale: r.stale, failed: r.failed.length, transform_errors: r.transformErrors.length,
         unkeyed: (r.finance.unkeyed || []).length, unmapped_rows: r.finance.unmapped.rows });
     }
-    process.exitCode = r.lockedBy ? 1 : (r.dryRun ? (r.transformErrors.length || r.finance.unkeyed.length ? 1 : 0) : (r.ok ? 0 : 1));
+    process.exitCode = out.exitCode;
   } finally { ledger.close(); warehouse.close(); }
 }
 

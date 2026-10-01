@@ -52,6 +52,7 @@ import { ingestQueuedManualFiles } from './amazon-settlement-manual-file.js';
 import { applyQueuedMarkers, pendingMarkerCount, latestMarker } from './amazon-finance-initial-marker.js';
 import { evaluateCoverage, completionBlockers, policyOrigin } from './amazon-finance-coverage.js';
 import { isAliveNodeSince } from './retry-lock.js';
+import { coverageEverRan, COVERAGE_GENERATION_META } from './finance-coordinator-switch.js';
 import { amazonFinanceDailyArgs } from './amazon-finance-months.js';
 import { openLedger } from '../company-db/push/ledger.mjs';
 import { pushAmazonFinance, FINANCE_KIND, META, retryStore, capacityFromEnv } from '../company-db/push/amazon-finance.mjs';
@@ -64,7 +65,7 @@ import { validateCoverageManifest, coverageRequestHash } from '../company-db/fin
 export const COMPANY_ID = 1;
 export const STATUS_PATH = `/order-finance/coverage/status?mall=${FINANCE_MALL}&scope=${FINANCE_SCOPE}&source=${FINANCE_SOURCE}`;
 export const COVERAGE_PATH = '/order-finance/coverage';
-export const LEDGER_META = { generation: 'coverage_generation', run: 'coverage_run' };
+export const LEDGER_META = { generation: COVERAGE_GENERATION_META, run: 'coverage_run' };   // generation = 一方向のスイッチの証拠 (finance-coordinator-switch.js と同じ鍵)
 export const COVERAGE_POST_TIMEOUT_MS = 120000;   // complete は Render が受領記録 (約 51 万注文) を読む = 30 秒では足りないことがある (R1 L2)
 /** daily-sync が「財務を送った回か」を読む小さな記録 (要約の文字でなく構造の値で決める・R1 L3) */
 export const LAST_RUN_FILE = 'amazon-finance-coverage-last.json';
@@ -107,12 +108,8 @@ export async function postCoverage(fetchImpl, { base, syncKey, body, sleep = def
  *   証拠 = 台帳 (company-db-push.db) の coverage の世代 **か** warehouse.db の一覧の回・手のファイル・初期の印の順番待ちに coverage の世代がある
  *   (台帳を失くした後の fail-open を防ぐ。#1567 Codex R1 High 1 = ingest_only・legacy に入れてよいかもこれで決める)
  */
-export function coverageEverRan(db, ledger) {
-  if (ledger.getMeta(LEDGER_META.generation) != null) return true;
-  return !!db.prepare(`SELECT 1 FROM amazon_settlement_report_inventory_runs WHERE coverage_generation IS NOT NULL
-    UNION ALL SELECT 1 FROM amazon_settlement_manual_files WHERE ingest_generation IS NOT NULL
-    UNION ALL SELECT 1 FROM initial_marker_queue WHERE applied_generation IS NOT NULL LIMIT 1`).get();
-}
+//   本体はスイッチの部品 (finance-coordinator-switch.js) = 今までの 2 工程の入口の一方向の門 (#1567 Codex R6 High) と同じ証拠
+export { coverageEverRan };
 
 /** 最新の初期の印の epoch (無ければ null) */
 const latestEpoch = (db) => db.prepare(`SELECT MAX(evidence_epoch) e FROM initial_marker_headers`).get().e ?? null;
