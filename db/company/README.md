@@ -204,6 +204,69 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - 控え (DATA_DIR/cdb-material) は**世代の時刻から 35 日**残す (個数ではない。retry で世代が増えても照合に要る控えが消えない)
 - 試験 = `node scripts/test-master-build-lineage.mjs` (作り直しの記録・由来・到達の証跡) / `node scripts/test-material-lineage.mjs` (0029・35 日)
 
+### Amazon SKU の対の世代の受け口 (Render・⑦-0。16 §7 H1・§8 契約 v3)
+
+Render の `/apps/mirror/api/sync` が Amazon SKU ↔ NE コードの対 (`sku_master` / `sku_resolved`) を**世代つき**で受ける口 (送り手は ⑦-2)。コード = `apps/warehouse-mirror/sku-map-generation.js`・並べ方とハッシュ = `lib/sku-map-canonical.js`。
+**今の送り手 (sync-to-render.js) は世代を付けないので、今の動きは変わらない** (PR #1568 で、前の master (c894ca64) と同じ世代なしの body 16 通りを流し、応答と mirror の全部の表が同じことを確かめた。試験は [G1])。
+🚨 SKU の対の部も受け口の上限 (12MB・server.js) に入ること。合成の 2 万 SKU / 4 万構成で 13.7MB = 1 回では送れない (⑦-2 の送り手は `assertPartFits` で見る)。
+
+**決まり**
+- 世代つきの body = **SKU の対だけの単独の POST**。置いてよい鍵は `sku_master`・`sku_resolved`・`sku_map_generation`・`meta` (オブジェクト) だけ。ほかの表があれば 422 `sku_map_body_not_standalone` (何も書かない)。2 表・状態・同期の印 (last_sync・meta) は 1 つの取引
+- **最初に有効にするのは 2 つがそろったときだけ**: Render の env `SKU_MAP_ACTIVATION_ALLOWED=1` と、世代の印の `activate: true`。どちらか無ければ 409 `sku_map_activation_not_allowed` (`missing` に足りない方)。形・ハッシュを確かめた後に見るので、この 409 は「受けられる形だった・何も書いていない」
+- 有効になった後 (**戻せない**・状態は `mirror_sku_map_state` の 1 行): 世代なし・古い世代・同じ世代で違うハッシュ = 409 / 空にする・片方だけ・形・ハッシュ・行数違い = 422 / 同じ世代・同じハッシュ = `replayed`。🚨 **今の送り手のマスタの部 (対が入っている) は部ごと 409** (products なども入らない)
+- `SKU_MAP_REQUIRE_GENERATION=1` = 状態の行が無くても (表が無くても) 有効とみなし、世代なしの対を断る。**有効は DB ファイルごと** (Render のディスクを戻した・DATA_DIR を変えた = 行が消えて世代なしを黙って受ける) なので、**切替の後に Render に置く**。行が無いときの世代つきは、上の 2 つがそろったときだけ有効にして記録する (下の「バックアップから戻したとき」)
+- 初期化 (表・trigger・列) が途中で落ちた = 確かめる口が 503 (capability を出さない)・世代つきも 503。世代なしは今までどおり (有効になった後なら 409 のまま)。再起動で直らなければ 503 の `init_error` を見る
+- 状態が読めない (表が無いのとは別の失敗) = 世代なしの対も 503 (有効かどうか分からないまま入れない)。対の無い部は今までどおり
+- trigger は名前に版 (`trg_sku_map_state_*_v1`)。`CREATE TRIGGER IF NOT EXISTS` は今ある定義を直さないので、**定義を変えるときは名前の版を上げ、前の名前を `RETIRED_STATE_TRIGGERS` (`apps/warehouse-mirror/sku-map-state-schema.js`) に足す** (新しいのを作った後に DROP)。起動のたびに sqlite_master の定義と照らし、違えば上の「初期化の失敗」
+
+**確かめる口** (`GET /api/sync/sku-map/state`・x-sync-key)。200 = `capability`・`state` (activated・generation は 10 進の文字・content_hash・行数)・`receiver` (今の env)。503 = capability なし (世代つきで送らない)
+```
+# miniPC の PowerShell (リポジトリ直下。RENDER_MIRROR_URL は末尾に /apps/mirror が付いている)
+node -r dotenv/config -e "fetch(process.env.RENDER_MIRROR_URL + '/api/sync/sku-map/state', { headers: { 'x-sync-key': process.env.MIRROR_SYNC_KEY } }).then(async (r) => console.log(r.status, await r.text()))"
+```
+
+**受け手が miniPC (SQLite) より厳しいところ** (⑦-2 の影運転で `validateSkuMap` / `skuMapKeyProblem` をそのまま使って数え、切替の前に 0 にする)
+- 鍵 (seller_sku・ne_code): 前後に U+0020 以外の空白 (TAB・改行・VT・FF・NBSP U+00A0・全角の空白 U+3000・BOM U+FEFF・U+1680・U+2000〜U+200A・U+2028・U+2029・U+202F・U+205F) / どこかに制御文字 (U+0000〜U+001F・U+007F) / 256 文字以上。miniPC の CHECK (`lower(x) = x AND trim(x) = x`) は SQLite の trim が U+0020 しか削らないので通してしまう (Company DB の `btrim` も同じ)
+- 名前: 空白だけ (全角の空白だけなど) / NUL を含む
+- 時刻: `YYYY-MM-DDTHH:MM:SS.sssZ` 以外 (miniPC の既定値はこの形。CSV・API で別の形が入った行)
+- 構成: 構成が 0 行の親 / sort_order が SKU ごとに 0..N-1 でない (隙間・重なり。CSV の REPLACE で起きうる) / 数量が 1 以上の整数でない
+- 同じところ: ASCII の大文字は両方とも断る。全角の大文字・鍵の中の空白は両方とも通す (鍵 = `core.norm_code(鍵)` までは求めない。正規化で重なる鍵は切替前の片付け = 16 §3 #4)
+
+**⑦-2 で本当に有効にするとき**
+1. 前提: ⑦-2 の送り手が **SKU の対を別の部 (単独の POST) で送り、マスタの部から対を外した** 版が miniPC に配られていること (でないと有効にした次の朝にマスタの部が 409 = 下の「壊れるもの」)。ほかに (Codex R1 の申し送り):
+   - 影運転で上の「厳しいところ」が **0 件** (legacy_reopen の送り手も同じ決まりで断られるので、有効にする条件にする)
+   - 対の部が受け口の上限 (12MB) に入る。超える件数なら、送り手で分けるだけでは足りない (1 回の POST が 2 表をそろえて持つ決まり) = 受け口の側に staging → chunk → finalize の契約を作るか、上限を上げる
+   - 同じ世代の再送 (replayed) は `synced_at` を進めない = `recent-missing-candidates` (GAS) は 26 時間で止まる。切替の後も GAS を並べて動かすなら、状態の表に「受け取った時刻」を足す
+2. Render → Environment に `SKU_MAP_ACTIVATION_ALLOWED=1` (再起動を待つ) → 送り手が `activate: true` で 1 回送る → 応答が `result: activated`
+3. `SKU_MAP_ACTIVATION_ALLOWED` を消し、`SKU_MAP_REQUIRE_GENERATION=1` を置く → 確かめる口の `receiver` が `{ activation_allowed: false, require_generation: true }`
+
+**間違えて有効にしてしまったとき** (影運転が本番に `activate: true` で送った・env を消し忘れた など)
+- 気づき方: 毎朝の Render 同期が `マスタ: HTTP 409 {"error":"sku_map_generation_required"...}` で失敗する。確かめる口で `state.activated: true`・`activated_at`・`activation_generation` (いつ・どの世代で有効になったか)
+- 壊れるもの: マスタの部 (products・set_components・手数料・楽天 SKU・在庫の集計・材料の世代・SKU の対) が**部ごと** 409 = mirror が前の日のまま。送り手は 409 で止まるので**後の部** (出荷サマリ・在庫の明細・月末在庫・月次・日次・商品管理リスト…) も送られない。材料の世代の証跡は `unconfirmed`・夜間ロード・FBA 補充・分析の画面が古い値
+- 戻し方 (記録つき。手で SQL を打たない):
+  1. Render → Environment から `SKU_MAP_ACTIVATION_ALLOWED` (と `SKU_MAP_REQUIRE_GENERATION`) を消す → 再起動を待つ。間違えて送った送り手を止める
+  2. **送り手を止めた後、処理中の要求が無いことを確かめる** (Render のログで `/apps/mirror/api/sync` の最後の要求が終わっている・確かめる口の `state.generation` が 1 分ほど変わらない)
+  3. Render の Shell で見るだけ: `node apps/warehouse-mirror/sku-map-state-reset.mjs` (今の状態・控えに書く中身と、次に打つ `--expect-generation` / `--expect-content-hash` が出る。何も書かない)
+  4. 全体の控えも取るなら、空きを確かめてから (`df -h $DATA_DIR`・DB の大きさの 2 倍以上の空きがあるときだけ): `node -e "new (require('better-sqlite3'))(process.env.DATA_DIR + '/warehouse-mirror.db', { readonly: true }).backup(process.env.DATA_DIR + '/warehouse-mirror.before-sku-map-reset.db').then(() => console.log('ok'))"`
+  5. 戻す: `node apps/warehouse-mirror/sku-map-state-reset.mjs --apply --by "名前" --reason "いつ・どの送り手が・なぜ" --expect-generation <3 で出た世代> --expect-content-hash <3 で出たハッシュ>`
+     - 全部 1 つの取引 (BEGIN IMMEDIATE)。**鍵を取った後に状態を読み直し、期待と違えば何もしないで断る** (`RESET_STATE_CHANGED` = 見た後に送り手が新しい世代を入れた・誰かが先に戻した → 2 からやり直す)。控えと記録は鍵の中で読んだ状態から作る
+     - 控え = `DATA_DIR/sku-map-state-resets/sku-map-state-reset-<時刻>.json` (前の状態の行・表と trigger の定義・2 表の行数とハッシュ。上書きしない)。`status` = `committed` (戻した・`audit_id` つき) / `aborted` (DB で落ちた = 何も戻していない・`error` つき) / `pending` (途中で止まった = 記録の表と照らす)
+     - 記録 = 表 `mirror_sku_map_state_resets` (消せない・直せない) に 誰が・いつ・なぜ・控えの場所・前の状態
+     - `mirror_sku_map_state` を DROP → 空で作り直す (有効でない)。2 表の中身は触らない (次の世代なしの同期が入れ替える)。env が残っていれば断る
+  6. 確かめる: 確かめる口が `activated: false`。miniPC の Render 同期を流し直す (か翌朝) → マスタの部が 200
+  7. AI_reference のインシデントのメモに 誰が・いつ・なぜ・控えの場所 を残す
+
+**Render のディスクをバックアップから戻したとき** (有効にした後。状態はバックアップの時点に戻る = 行が無い・古い世代のどちらか)
+1. 送り手 (⑦-2 の写し・daily-sync の Render 同期) を止め、処理中の要求が無いことを確かめる。`SKU_MAP_REQUIRE_GENERATION=1` は残す (世代なしの対を断り続ける)
+2. 確かめる口で今の状態を見る (`state.activated`・`state.generation`)
+3. 次に送る世代を決める: **max(Company DB の世代・miniPC の世代・Render の今の世代) より大きい値** (受け口は戻した後の状態しか知らないので、行が無ければ小さい世代でも受けてしまう。付け直しは ⑦-2 の世代の付け直しと同じ道で)
+4. 行が無い (`activated: false`) とき: Render → Environment に `SKU_MAP_ACTIVATION_ALLOWED=1` を一時的に置く (再起動を待つ) → 送り手が 3 の世代で `activate: true` の単独の POST を 1 回 → 応答が `result: activated` → **すぐ `SKU_MAP_ACTIVATION_ALLOWED` を消す** (再起動を待つ)
+   古い世代の行がある (`activated: true`) とき: 許しは要らない。3 の世代で送れば `result: applied` (有効の時刻と最初の世代はバックアップのまま)
+5. 確かめる口で `state.activated: true`・`state.generation` = 3 の世代・`state.content_hash` = 送った中身・`receiver` = `{ activation_allowed: false, require_generation: true }`
+6. 送り手を戻す。試験 = guards の [G11]
+
+- 試験 = `node scripts/test-sku-map-canonical.mjs` (並べ方・ハッシュ・空白と時刻の決まり) / `node scripts/test-sku-map-receiver.mjs` (受け口の契約) / `node scripts/test-sku-map-receiver-guards.mjs` (今のマスタの部・古い DB・初期化の失敗・状態が読めない・相乗り・有効にする許し・REQUIRE_GENERATION・戻し (鍵の後の読み直し・aborted)・時間・バックアップから戻したとき)
+
 ### マスタの照合 ①ロードの検証 (0030・W13。10 §6.1.1 B)
 
 毎朝 daily-sync の「マスタ照合」(`apps/company-db/master-compare/run.mjs --daily`・見張りの前) が、最新の夜間ロード (Render・02:00) を検証する。

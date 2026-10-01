@@ -8,7 +8,7 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
          getWarehouseSummary, getDailySnapshots, getAllNonFbaMax60d,
          getWarehouseLocationsByCode,
          getRestockLatest, getPlanningLatestMap,
-         getReplenishmentExcluded, getSelfShipSalesByCode, getPendingFbaSlips, getTrialInputs } from './db.js';
+         getReplenishmentExcluded, getSelfShipSalesByCode, getPendingFbaSlips, getTrialInputs, getSheetlessCalcBlock } from './db.js';
 import { allocateWarehouse } from './self-reserve.js';
 import { readUsReserved } from '../fba-replenishment-us/ledger.js';
 // v3-2 のならしの枠を「記録される提案」と同じ判定で数えるため (shadow-draft.mjs は依存の無い純粋な関数だけ)
@@ -51,6 +51,10 @@ function computeRecommendations(debug = false, inboundWorkingOverride = null, op
   // 決まりの版。画面・手動の推奨は v2 (今までどおり)。9:40 の自動決定だけ v3 も計算して比べる (決まりの変更 v3-1。2026-09-26)
   //   🚨 v3 の数字は v3_* の設定だけで持ち、既存の設定は書き換えない (画面・米国補充に効かせない。Codex v3 設計レビュー High 1)
   const rules = opts.rules === 'v3' ? 'v3' : 'v2';
+  // 🚨 Sheet なしのモード (FBA_SHEETLESS_MODE=1・⑦-F): 設定・SKU の対応・商品管理リストのどれかが欠けたら計算しない。
+  //    Sheet の値には戻らない。何も作らずに失敗を返す = 前の結果 (画面の一覧・健全性の記録) はそのまま、9:40 の自動決定は fail の ping
+  const sheetlessBlock = getSheetlessCalcBlock();
+  if (sheetlessBlock) return { items: [], errors: [sheetlessBlock], sheetless_blocked: true };
   const settings = rulesSettings(getSettings(), rules);
   const feeGuard = rules === 'v3' ? feeGuardDays(settings) : null;
   const mappings = getSkuMappings();
