@@ -1,5 +1,5 @@
--- 0053 持ち主の設定の epoch (マスタ正本切替 ④a。Codex #1564 R1 H1・R2 High 3。2026-10-01)
--- 積み方: master の 0050 → ⑤-1 の 0051 (切替の段階・前提の差し込み口・画面の保存の門) → ⑤-2a の 0052 → この 0053 (0051 / 0052 だけに寄る。マージの順で番号を付け替える)
+-- 0055 持ち主の設定の epoch (マスタ正本切替 ④a。Codex #1564 R1 H1・R2 High 3。2026-10-01)
+-- 積み方: master の 0050 → ⑤-1 の 0051 (切替の段階・前提の差し込み口・画面の保存の門) → ⑤-2a の 0052 → ⑤-2b の 0053 → ⑦-1 の 0054 → この 0055 (0051〜0054 に寄る。マージの順で番号を付け替える)
 --
 -- なぜ: config/master-ownership.mjs を 'company' に書き換えた夜間ロードの時点で、実際の持ち主が切り替わってしまう (初回の写し・作り直しが失敗しても)。
 --   → 持ち主の設定を 3 つに分ける:
@@ -60,8 +60,8 @@ end $$;
 -- (apps/company-db/load/ownership-state.mjs) は排他で取る = ロードの途中で epoch が変わらない (古い active を読んだロードが新しい active の後に commit しない)。
 -- 数は 0036 の core.parent_lock_key() = 4705310036・0051 の core.master_write_lock_key() = 4705310051 と同じ作り (重ならない固定の数。
 -- 2^31 より大きい = hashtext() の鍵 (ops.master_cutover など) とも重ならない)。
--- 🚨 鍵の順 (全部の書き手で同じ): 持ち主の epoch (0053) → 切替の段階 (0051 の hashtext('ops.master_cutover')) → マスタの書き込み (0051) → 親子 (0036) → 行
-create function ops.master_ownership_lock_key() returns bigint language sql immutable as $$ select 4705310053::bigint $$;
+-- 🚨 鍵の順 (全部の書き手で同じ): 持ち主の epoch (0055) → 切替の段階 (0051 の hashtext('ops.master_cutover')) → マスタの書き込み (0051) → 親子 (0036) → 行
+create function ops.master_ownership_lock_key() returns bigint language sql immutable as $$ select 4705310055::bigint $$;
 
 -- ─── 夜間ロードの commit の順 (#1564 Codex R4 Medium 2・High) ───
 -- 本適用の夜間ロード 1 回 = 1 行 (dry-run は巻き戻す = 行が無い)。commit_seq = DB が振る番号 = commit の順:
@@ -94,12 +94,13 @@ end $$;
 --   持ち主が 'load' の列は数えない = [キー, 値] を load でない列だけキーの順に並べた JSON の sha256 (lib/master-cutover.mjs の ownershipHash と同じ)。
 --   なぜ: 記録に無い列は load (④a の epoch はそう読む) なのに、0051 の式は持ち主表の全部の列でハッシュを作っていた = 切替の後に OWNED_COLUMNS に列を
 --   足すと (足した列は load)、画面の持ち主表のハッシュが段階の記録 (owner_hash) と違い、保存・登録が before_cutover で止まる。
---   この式なら列を足しても (load のまま) ハッシュは変わらない。使うところ = ⑤-1 の ops.begin_master_write・⑤-2a の ops.register_new_sku・下の 1.〜3.
+--   この式なら列を足しても (load のまま) ハッシュは変わらない。使うところ = ⑤-1 の ops.begin_master_write・⑤-2a の ops.register_new_sku・
+--   ⑤-2b (0053) の ops.reg_write_gate / ops.open_reg_write・⑦-1 (0054) の ops.amazon_map_begin (どれも段階の記録と画面の持ち主表を比べる = 同じ式で比べる)・下の 1.〜3.
 -- 🚨 前の式で記録したハッシュが残っていると比べられない = 段階が company_owner / new_open (owner_hash を記録した後) の DB では作り直さない (止める)。
 --   本番は legacy_open (owner_hash は記録していない)・門の記録 (ops.legacy_gate_acks) は動いているプロセスが 15 分ごとに今のコード (同じ式) で書き直す
 do $$ begin
   if exists (select 1 from ops.master_cutover_state where phase in ('company_owner', 'new_open')) then
-    raise exception '0053: 切替の段階が company_owner / new_open = 段階に記録した持ち主表のハッシュが前の式 = ops.ownership_hash の式を変えられない';
+    raise exception '0055: 切替の段階が company_owner / new_open = 段階に記録した持ち主表のハッシュが前の式 = ops.ownership_hash の式を変えられない';
   end if;
 end $$;
 create or replace function ops.ownership_hash(p jsonb) returns text language sql immutable set search_path = pg_catalog, pg_temp as $$
@@ -149,7 +150,7 @@ begin
   return v_problems;
 end $$;
 revoke all on function ops.master_ownership_epoch_prereq(text, text) from public;
-insert into ops.master_cutover_prereq_checks (name, fn) values ('0053_ownership_epoch', 'ops.master_ownership_epoch_prereq(text, text)');
+insert into ops.master_cutover_prereq_checks (name, fn) values ('0055_ownership_epoch', 'ops.master_ownership_epoch_prereq(text, text)');
 
 -- 2. 段階の行の持ち主表 = active (⑤-1 の ops.master_cutover_state に trigger を足す。⑤-1 の関数は上書きしない):
 --    company_owner・new_open に入る・その owner_hash を変える = owner_hash が active の記録のハッシュと同じときだけ (証拠の owner_hash = epoch)。
@@ -174,7 +175,7 @@ begin
 end $$;
 revoke all on function ops.guard_master_cutover_epoch() from public;
 -- 名前 = ⑤-1 の守り (trg_master_cutover_state_guard)・⑤-2a の前提 (trg_master_cutover_state_prereq) の後に動く (BEFORE の trigger は名前の順 = 直接の UPDATE は今までどおり ⑤-1 の守りで断る)
-create trigger trg_master_cutover_state_prereq_0053 before update on ops.master_cutover_state
+create trigger trg_master_cutover_state_prereq_0055 before update on ops.master_cutover_state
   for each row execute function ops.guard_master_cutover_epoch();
 
 -- 3. 画面の保存の門 = active (⑤-1 の ops.begin_master_write が書く ops.master_write_sessions に trigger を足す。begin_master_write は上書きしない):

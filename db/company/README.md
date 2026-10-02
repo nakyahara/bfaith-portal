@@ -267,6 +267,37 @@ node -r dotenv/config -e "fetch(process.env.RENDER_MIRROR_URL + '/api/sync/sku-m
 
 - 試験 = `node scripts/test-sku-map-canonical.mjs` (並べ方・ハッシュ・空白と時刻の決まり) / `node scripts/test-sku-map-receiver.mjs` (受け口の契約) / `node scripts/test-sku-map-receiver-guards.mjs` (今のマスタの部・古い DB・初期化の失敗・状態が読めない・相乗り・有効にする許し・REQUIRE_GENERATION・戻し (鍵の後の読み直し・aborted)・時間・バックアップから戻したとき)
 
+### Amazon SKU の対応の編集 (0054・⑦-1。16 §2・§3・§7 v2・§8 契約 v3)
+
+Amazon の seller SKU ↔ NE コード (今の正本 = miniPC の `m_sku_master` + `m_sku_components`) を、切替 (⑥) の後に Company DB で直すための土台。
+**今の動きは変わらない** (新しい表は空・足した列は null・夜間ロードは対応の無い出品を今までどおり作る。試験 [1] = 0053 (⑤-2b) までの DB と 0054 までの DB で夜間ロードの結果が同じ)。
+
+- 表 `core.amazon_sku_maps` (1 行 = 1 つの出品の対応・`state` = active / deleted (墓標)・`origin` = legacy (切替の日の移行) / portal (画面))。構成の正本は `core.listing_components` のまま (`updated_at` を足した = 写しの構成の更新時刻)
+- 書くのは security definer の関数だけ: `ops.save_amazon_sku_map` (登録・直す・墓標から戻す) / `ops.delete_amazon_sku_map` (墓標にする)。画面 = `/apps/master-edit/amazon/` (lib/amazon-map-write.mjs)。門は ⑤ と同じ (段階 new_open・持ち主表のハッシュ・`MASTER_EDIT_OPEN=1`) + 持ち主 `listing_components.amazon` = company
+- 🚨 墓標は消さない: `core.amazon_sku_maps` の DELETE / TRUNCATE は trigger がいつも拒む (持ち主も)。復元 (`apps/company-db/backup/dump.mjs`) はユーザーの trigger を止めて入れ直すので通る
+- 🚨 **残る危うさ (Codex #1586 R1 High・⑥ の go / no-go「夜間ロードのロールを分ける」)**: 夜間ロード・push・migration・復元・ロールの設定は全部同じログイン (`COMPANY_DB_URL` = DB・schema・表の持ち主・CREATEROLE) で動く。
+  持ち主は trigger を止められ・schema の持ち主として表を DROP でき・CREATEROLE で作ったロールの一員に自分でなれる (PostgreSQL 18 で試した) = **この表の持ち主だけを別のロールにしても守りにならない**ので、この PR ではしていない。
+  持ち主のパスワードが漏れた・持ち主の権限で動くコードの誤り (trigger を止めて消す) なら、墓標は消せてしまう。本当の直し = 夜間ロードと push を、持ち主でなく CREATEROLE の無い別のログインにする (今の全部の書き手に効く = ⑥ で決める)。
+  それまでの手当て: **消えた対応** `ops.amazon_map_lost_listings()` (変更の記録 = 追記だけ に対応の行の記録があるのに今の行が無い出品) を、夜間ロードは「対応がある」と同じに扱う (自動の構成を作り直さない・報告の conflicts に `amazon_map_lost`)・切替の段階を company_owner / new_open に進める前提にする (`0054_amazon_map`)。両方の表の trigger を止めて消すまでは、墓標が消えても自動の対応は戻らない
+- 表の CHECK は写しの受け手 (`lib/sku-map-canonical.js`) と同じ空白の決まり: seller SKU の前後の TAB・NBSP・全角の空白・ASCII の大文字・制御文字、名前が空白だけ (TAB・NBSP・全角の空白だけも) は、どの書き手でも断る (Codex #1586 R1 M1)
+- 不変条件 (commit のとき・deferred の constraint trigger): Amazon (日本) の出品・`listing_norm = core.norm_code(seller_sku)`・active は構成 1 行以上で並び 0..N-1・墓標は構成 0 行。対応の無い出品は見ない
+- 構成の書き手: 段階 company_owner / new_open の間、対応のある出品の構成と対応の行は、取引の設定 `core.source_system` が `portal_amazon_map` (画面の関数) か `amazon_map_migration` (切替の日の移行) のときだけ書ける
+- 夜間ロード (`apps/company-db/load/engine.mjs`): 対応 (墓標も) のある出品の構成は持ち主によらず作らない。持ち主 company = SKU マスタ・Sheet の構成は材料にしない・FBM の完全一致は対応の無い出品にだけ
+
+**移行 (影運転・切替の日)** = `scripts/company-db/amazon-map-migrate.mjs` (lib/amazon-map-migrate.mjs)。古い表 (warehouse.db・fba.db) は読むだけで開く
+```
+# 影運転 (T-7 から毎日)。🚨 試し用の DB だけ。本番の URL (COMPANY_DB_URL) が要る = ホスト・ポート・DB 名が同じ (ユーザーは見ない)・つないだ DB の識別が同じか読めない (同じ DB 名) なら断る。1 つの取引で移して照らし、必ず巻き戻す
+node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --shadow --db-url <試し用の DB> --legacy <warehouse.db> --fba-db <fba.db> --json shadow.json
+# 古い表のハッシュ (H0) だけ
+node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --legacy-hash --legacy <warehouse.db>
+# 切替の日 ③ (段階 frozen の間だけ・止める項目 0・H0 と同じときだけ commit。⑥ の手順書の順番でだけ)
+node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect-hash <H0> --legacy <warehouse.db> --fba-db <fba.db> --actor <人のメール> --yes
+```
+- `--fba-db` は影運転と apply の両方で要る (無い・読めない・`sku_mapping` の表が無い = すぐ断る。Sheet にだけある SKU を 0 件と読まない・Codex #1586 R1 M3)。識別 (system_identifier) が読めない所では、試し用の DB は本番と違う DB 名にする
+- 止める項目 (目標は全部 0・16 §5 の 4): key (受け手の鍵の決まり)・name_blank・timestamp・qty・no_components・sort_gap・orphan_component・not_in_company (NE に無いコード)・component_collision / seller_sku_collision (正規化で重なる)・ne_code_differs (Company DB の SKU のコードから作る NE コードが違う)・sheet_only
+- 同じ構成の行は時刻 (created_at / updated_at) だけそろえる = 変更の記録・出品の version を増やさない (0049 の印を増やさない)。FBM の完全一致など古い表に無い行は消す
+- ⑦-2 (写し・世代・FBA の Sheet 無し・台帳) と ⑥ (段階の戻す道) はこの PR に無い
+
 ### マスタの照合 ①ロードの検証 (0030・W13。10 §6.1.1 B)
 
 毎朝 daily-sync の「マスタ照合」(`apps/company-db/master-compare/run.mjs --daily`・見張りの前) が、最新の夜間ロード (Render・02:00) を検証する。
@@ -1756,7 +1787,7 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
 - 月パーティションは `snapshots.ensure_month_partitions(from, to)` で作る。作り忘れても default に入って落ちない。**後から作ると default の行をその月に移してから attach する** (同一トランザクション)
 - 実行器: 番号は 0001 からの連番 (欠番は不正)。DB に適用記録があるのにファイルが無い checkout では流さない
 
-## 持ち主の epoch (0053。マスタ正本切替 ④a・Codex #1564 R1 H1・R2 High 3)
+## 持ち主の epoch (0055。マスタ正本切替 ④a・Codex #1564 R1 H1・R2 High 3)
 
 列ごとの持ち主 (`config/master-ownership.mjs`) を 3 つに分ける。**config を書き換えてデプロイしただけでは何も変わらない**:
 - **configured** = config/master-ownership.mjs (コードに書いた「こうしたい」)
@@ -1776,32 +1807,32 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
    証拠の世代が読んだ夜間ロードが最後のロードでない (証拠の後に毎晩のロードなどが入った。DB の commit の番号で比べる) = `LOAD_AFTER_EVIDENCE` で断る (やり直しは 3 から。#1564 Codex R3 High 1・R4))
 - 途中で止める = `master-ownership-epoch.mjs cancel` (prepared を消す。active はそのまま = 毎晩は前の持ち主)。今の状態 = `master-ownership-epoch.mjs status`
 
-**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0053 は表を 3 つ (epoch・その記録・夜間ロードの commit の順) と、⑤-1 の切替の段階・画面の保存の門に「持ち主の epoch と同じ」の確かめを足すだけ (行は作らない = 全部 load のまま = 何も変わらない)。
-あわせて ⑤-1 の `ops.ownership_hash` の式を「load の列は数えない」に作り直す (下の「1 つの式」)。🚨 段階が company_owner / new_open の DB では 0053 は止まる (本番は legacy_open = 当たらない)。
-🚨 **番号**: master 0050 (finance_coverage) → ⑤-1 0051 (master_edit・本番に入っている) → ⑤-2a 0052 → この 0053 の順に積む。⑤-2b も 0053 を使う = 後にマージされる方を 0054 に付け替える (migrate.mjs は欠番・重複を拒む)。
+**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0055 は表を 3 つ (epoch・その記録・夜間ロードの commit の順) と、⑤-1 の切替の段階・画面の保存の門に「持ち主の epoch と同じ」の確かめを足すだけ (行は作らない = 全部 load のまま = 何も変わらない)。
+あわせて ⑤-1 の `ops.ownership_hash` の式を「load の列は数えない」に作り直す (下の「1 つの式」)。🚨 段階が company_owner / new_open の DB では 0055 は止まる (本番は legacy_open = 当たらない)。
+🚨 **番号**: master 0050 (finance_coverage) → ⑤-1 0051 (master_edit) → ⑤-2a 0052 (master_registrations) → ⑤-2b 0053 (ne_registration_csv) → ⑦-1 0054 (amazon_sku_maps) → この 0055 の順に積む (migrate.mjs は欠番・重複を拒む)。
 🚨 **デプロイは Render と miniPC を同じ日に**: 夜間ロードの規則の指紋 (`engine.mjs` の `LOAD_RULE_FILES`) に `apps/company-db/load/ownership-state.mjs` が入った (engine.mjs も変わった)。
 Render (夜間ロード) と miniPC (朝の照合 ①) のコードが違う日は、朝の照合 ① が「規則の指紋がこのコードと違う」で判定できない (blocked) になる。同じ日の夜間ロードの前に両方をそろえる
 
 ```
-node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                 # 0053 だけが出ること (0052 = ⑤-2a は先に入っている)
-node -r dotenv/config scripts\company-db\migrate.mjs                           # 0053 (applied=1)
+node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                 # 0055 だけが出ること (0051〜0054 は先に入っている)
+node -r dotenv/config scripts\company-db\migrate.mjs                           # 0055 (applied=1)
 node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     # state = missing (行が無い = 全部 load)
 ```
 
 ### epoch の鍵・持ち主表のハッシュの 1 つの式 (#1564 Codex R3)
-- **epoch の鍵** `ops.master_ownership_lock_key()` = **4705310053** (0036 の親子の鍵 4705310036・0051 のマスタの書き込みの鍵 4705310051 と同じ作り。2^31 より大きい = `hashtext()` の鍵とも重ならない)。
+- **epoch の鍵** `ops.master_ownership_lock_key()` = **4705310055** (0036 の親子の鍵 4705310036・0051 のマスタの書き込みの鍵 4705310051 と同じ作り。2^31 より大きい = `hashtext()` の鍵とも重ならない)。
   - 夜間ロード (`engine.mjs`・`--use-prepared` も) = 取引の冒頭に**共有**で取ってから、取引の中で epoch を読む (書き終わるまで持つ)。prepare / activate / cancel (`ownership-state.mjs`) = **排他** = ロードの途中で epoch が変わらない
   - activate は鍵の後に「証拠の世代が読んだ夜間ロード = 最後に commit したロード」を見る (古い active で走ったロードは activate より前に commit している = 証拠の世代に入っていない = 断る)
 - **夜間ロードの commit の順** `ops.master_load_commits` (#1564 Codex R4): 本適用のロード 1 回 = 1 行 (dry-run は無し・足すだけ)。番号 `commit_seq` は DB が commit の直前に振る
   (epoch の鍵 (共有) とマスタの書き込みの鍵 (排他) を持ったまま = 番号の順 = commit の順)。送り手の時計 (`started_at` / `finished_at`)・場所 (`host`) では並べない。
   - 写し (`publish/fetch.mjs` の `selectPublishLoad`) = 番号の一番大きいロード (毎晩の cron = `render-nightly` も、切替の日に HTTP で流した `--use-prepared` のロード = `render` も)。
-    行がまだ無い (0053 の後に本適用のロードが無い) = 今までどおり毎晩の cron の最新。照合 ① (`compare-load.mjs` の `selectNightlyLoad`) は毎晩の cron の回のまま (別の目的)
+    行がまだ無い (0055 の後に本適用のロードが無い) = 今までどおり毎晩の cron の最新。照合 ① (`compare-load.mjs` の `selectNightlyLoad`) は毎晩の cron の回のまま (別の目的)
   - 世代 (warehouse.db の `cdb_publish_generations.load_commit_seq`) と証跡 (`master-publish.load_commit_seq`) に番号を残す。activate はその番号 = 一番大きい番号か
     (`LOAD_AFTER_EVIDENCE`)・最後のロードの持ち主が prepared か (`LOAD_EPOCH_MISMATCH`) を鍵の後に見る
-  - 🚨 **鍵の順** (全部の書き手で同じ = デッドロックしない): epoch (0053) → 切替の段階 (0051 の `hashtext('ops.master_cutover')`) → マスタの書き込み (0051) → 親子 (0036) → 行。
+  - 🚨 **鍵の順** (全部の書き手で同じ = デッドロックしない): epoch (0055) → 切替の段階 (0051 の `hashtext('ops.master_cutover')`) → マスタの書き込み (0051) → 親子 (0036) → 行。
     夜間ロード = epoch 共有 → 書き込み 排他 → 親子 / activate = epoch 排他 → 段階 共有 → 行 / 画面の保存・登録 = 段階 共有 → 書き込み 共有 (epoch は取らない)
 - **持ち主表のハッシュは 1 つの式** = 持ち主が `load` でない列だけを `[キー, 値]` にしてキーの順に並べた JSON の sha256 (= 記録に無い列は load と同じ)。
   `lib/master-cutover.mjs` の `ownershipHash` (画面・門の記録)・`ownership-state.mjs` の `ownershipHashOf` (epoch)・`master-publish.js` の `ownershipHash` (写しの世代・作り直しの記録)・
-  夜間ロードの記録 (`ops.load_materials.ownership_hash`)・DB の `ops.ownership_hash` (0053 で作り直し) が全部これ。
+  夜間ロードの記録 (`ops.load_materials.ownership_hash`)・DB の `ops.ownership_hash` (0055 で作り直し) が全部これ。
   切替の後に `OWNED_COLUMNS` に列を足しても (足した列は load)、段階の記録 (`owner_hash`)・epoch・画面の保存のハッシュは変わらない (保存・登録が `before_cutover` にならない)。
   写しは夜間ロードが記録した持ち主表から今の式でハッシュを作って比べる (式を変えた日に前の式で記録したロードがあっても偽の食い違いにしない)

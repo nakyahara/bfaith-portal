@@ -1,11 +1,11 @@
 /**
- * ownership-state.mjs — 持ち主の設定の epoch (0053 の ops.master_ownership_state。マスタ正本切替 ④a・Codex #1564 R1 H1)
+ * ownership-state.mjs — 持ち主の設定の epoch (0055 の ops.master_ownership_state。マスタ正本切替 ④a・Codex #1564 R1 H1)
  *
  *   configured = config/master-ownership.mjs (コードに書いた「こうしたい」。これだけでは何も変わらない)
  *   prepared   = 人が prepare で記録した「次にこれにする」。明示して頼んだロード (usePrepared) と、そのロードの後の写しの世代だけが使う
  *   active     = 今使っている持ち主。夜間ロード (engine.mjs)・miniPC の写し (publish/fetch.mjs) はこれ。
  *                prepared の世代で miniPC の作り直し + 入れた後の確かめが通ったときだけ activate で prepared → active
- *   行が無い (0053 の前・まだ誰も prepare していない) = active は全部 'load' (今までと同じ)
+ *   行が無い (0055 の前・まだ誰も prepare していない) = active は全部 'load' (今までと同じ)
  * 🚨 読む (resolve) は夜間ロード・写しの両方。書く (prepare / activate / cancel) は scripts/company-db/master-ownership-epoch.mjs だけ (DB を作ったユーザー)
  * 🚨 このファイルは engine.mjs が読む = master-publish.js (warehouse) を import しない (循環を作らない)
  */
@@ -16,13 +16,13 @@ import { ownershipHash } from '../../../lib/master-cutover.mjs';
 export const ALL_LOAD = Object.freeze(Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'load'])));
 /**
  * 持ち主の設定のハッシュ = lib/master-cutover.mjs の ownershipHash (load の列は数えない = 記録に無い列は load と同じ。#1564 Codex R3 Medium)。
- *   engine.mjs が ops.load_materials に残す・写しの世代・⑤-1 の段階の記録 (owner_hash)・0053 の ops.ownership_hash と同じ 1 つの式
+ *   engine.mjs が ops.load_materials に残す・写しの世代・⑤-1 の段階の記録 (owner_hash)・0055 の ops.ownership_hash と同じ 1 つの式
  */
 export const ownershipHashOf = ownershipHash;
 export const sortedOwnership = (o) => Object.fromEntries(Object.keys(o || {}).sort().map((k) => [k, o[k]]));
 
 const rowsOf = async (db, sql, params) => (await db.query(sql, params)).rows;
-/** 表があるか (0053 の前 = 無い) */
+/** 表があるか (0055 の前 = 無い) */
 async function hasStateTable(db) {
   return (await rowsOf(db, `select to_regclass('ops.master_ownership_state') is not null as ok`))[0].ok === true;
 }
@@ -75,10 +75,10 @@ export async function resolveLoadOwnership(db, { usePrepared = false } = {}) {
 }
 
 /**
- * 持ち主の epoch の鍵 (0053 の ops.master_ownership_lock_key() = 4705310053。#1564 Codex R3 High 1)。
+ * 持ち主の epoch の鍵 (0055 の ops.master_ownership_lock_key() = 4705310055。#1564 Codex R3 High 1)。
  *   夜間ロード (engine.mjs・明示の --use-prepared も) = 取引の冒頭に共有で取ってから、取引の中で epoch を読む (読んだ epoch で書き終わるまで持つ)
  *   prepare / activate / cancel = 取引の冒頭に排他で取る = ロードの途中で epoch が変わらない (古い epoch を読んだロードが新しい active の後に commit しない)
- * 🚨 鍵の順 (全部の書き手で同じ = デッドロックしない): 持ち主の epoch (0053) → 切替の段階 (0051 の hashtext('ops.master_cutover')) →
+ * 🚨 鍵の順 (全部の書き手で同じ = デッドロックしない): 持ち主の epoch (0055) → 切替の段階 (0051 の hashtext('ops.master_cutover')) →
  *   マスタの書き込み (0051 の core.master_write_lock_key() = 4705310051) → 親子 (0036 の core.parent_lock_key() = 4705310036) → 行。
  *   夜間ロード = epoch 共有 → 書き込み 排他 → 親子 / activate = epoch 排他 → 段階 共有 → 行 / 画面の保存 = 段階 共有 → 書き込み 共有 (epoch は取らない)
  */
@@ -87,7 +87,7 @@ export const OWNERSHIP_SHARED_LOCK_SQL = 'select pg_advisory_xact_lock_shared(op
 export const OWNERSHIP_EXCLUSIVE_LOCK_SQL = 'select pg_advisory_xact_lock(ops.master_ownership_lock_key())';
 
 /**
- * 最後に commit した夜間ロード = 0053 の ops.master_load_commits の番号 (commit_seq) が一番大きい行 (#1564 Codex R4 Medium 2)。
+ * 最後に commit した夜間ロード = 0055 の ops.master_load_commits の番号 (commit_seq) が一番大きい行 (#1564 Codex R4 Medium 2)。
  *   番号は DB が commit の直前に振る (epoch の鍵とマスタの書き込みの鍵を持ったまま = 番号の順 = commit の順)。送り手の時計 (started_at / finished_at)・
  *   場所 (host) では並べない。どの場所から流したロードでも数える (毎晩の cron・--use-prepared の明示のロード)。dry-run は行が無い。
  *   activate が「証拠の世代の後にロードが入っていない」を見る・写し (publish/fetch.mjs) がどのロードの世代かを決める
@@ -154,7 +154,7 @@ async function readCutoverPhaseInTx(db) {
  * activate: prepared → active (expectHash = 確かめた世代の持ち主のハッシュ・expectPreparedAt = 証拠を集めたときの prepare の時刻。どちらかが違えば投げる)。
  *   確かめの証拠は呼び手が集める。🚨 同じ持ち主でも prepare をやり直した (時刻が変わった) = 前の証拠では active にしない (#1564 Codex R2 Medium 4)。
  *   比べるのは行の鍵を取った後 (証拠を集めた後・activate の前に別の人が prepare し直しても通さない)
- *   expectLoadCommitSeq = 証拠の世代が読んだ夜間ロードの commit の番号 (0053 の ops.master_load_commits)。最後に commit したロードがこれでない = 断る
+ *   expectLoadCommitSeq = 証拠の世代が読んだ夜間ロードの commit の番号 (0055 の ops.master_load_commits)。最後に commit したロードがこれでない = 断る
  *   (LOAD_AFTER_EVIDENCE。古い active で走ったロードが証拠の後に C の列を NE の値で書いた = 証拠の世代はもう DB と同じでない。#1564 Codex R3 High 1・R4 Medium 2)。
  *   最後のロードの持ち主が prepared でない = 断る (LOAD_EPOCH_MISMATCH)
  * 🚨 切替の段階が frozen (古い入口を止めた後・持ち主を C にする前) のときだけ (#1564 の見直し M-1)。

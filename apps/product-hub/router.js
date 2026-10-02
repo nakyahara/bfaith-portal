@@ -127,6 +127,7 @@ import {
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
   lpComposeImageRef, recordImageServed as recordLpComposeImageServed, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
+  lintForJob as lintLpComposeForJob,
 } from './lib/lp-compose.js';
 import { assertXlsxExpandsSafely, XlsxTooLargeError } from './lib/xlsx-guard.js';
 import { abaConfigured, lookupAbaTerms, lookupAbaTopAsins } from './lib/aba-client.js';
@@ -247,6 +248,8 @@ router.get('/list', (req, res) => {
     maxRegisterCodes: MAX_REGISTER_CODES,
     intake: intakeStatus(),
     isAdmin: req.session?.role === 'admin',
+    // LP 構成の AI 生成 (段階1) の仕様書。admin にだけ出すカードで使う
+    lpSpec: { enabled: lpComposeEnabled(), spec: lpSpecSummary(db, 'product_analysis') },
     shopCategoryCount: countActiveShopCategories(db),
     maxShopCategoryLines: MAX_SHOP_CATEGORY_LINES,
   });
@@ -481,6 +484,10 @@ router.get('/detail/:id', (req, res) => {
       ...(imageProduction || {}),
       product_info_text: effectiveProductInfo(imageProduction?.product_info_text, autoProductInfo),
     }, promptVariations),
+    // 「🤖 構成をAIに作らせる」(段階1・PR1-d)。最初の表示をここで作っておく
+    // (読み込み直後に 1 回 fetch すると、押せる/押せないが一瞬ちらつく)。
+    // 画面はこの後 5 秒おきに GET /api/drafts/:id/lp-compose を叩いて更新する
+    lpCompose: lpComposeInitialState(db, draft),
   });
 });
 
@@ -1483,7 +1490,7 @@ router.post('/api/drafts/:id/compose', (req, res) => {
   if (typeof req.body?.done !== 'boolean') {
     return res.status(400).json({ ok: false, error: 'done は true / false で指定してください' });
   }
-  // 「まだ」も 'todo' として残す (NULL に戻すと ③素材待ちからの推定で 済 に戻ってしまう — Codex R1)
+  // 「まだ」も 'todo' として残す (NULL に戻すと ④AI制作からの推定で 済 に戻ってしまう — Codex R1)
   const status = req.body.done ? 'done' : 'todo';
   const db = getDB();
   const changed = db.transaction(() => {
@@ -3140,7 +3147,9 @@ router.post('/api/drafts/:id/board-move', (req, res) => {
       isAdmin: req.session?.role === 'admin',
       actorStaffId: me?.id ?? null,
     });
-    res.json({ ok: true, changed: r.changed });
+    // reopenBlocked = 移動先の工程を開き直す権限が無くて諦めた工程名 (移動自体は成功)。
+    // 画面が「落とした列に止まらなかった」理由を出すのに使う
+    res.json({ ok: true, changed: r.changed, reopenBlocked: r.reopenBlocked || null });
   } catch (e) { workflowError(res, e); }
 });
 
@@ -3786,6 +3795,24 @@ router.get('/api/lp-specs', (req, res) => {
 });
 
 // ─── 画面: LP 構成を AI に作らせる (段階1・2026-10-01) ──────────
+/**
+ * 詳細画面の最初の表示に渡す「構成をAIに作らせる」の状態。
+ * GET /api/drafts/:id/lp-compose と**同じ形**にする (画面が同じ描画関数を使う)。
+ */
+function lpComposeInitialState(db, draft) {
+  const spec = latestLpSpec(db, 'product_analysis');
+  // 🚨 材料の組み方は **API と全く同じ** lpComposeMaterial を通す (codex exec review P1)。
+  //    カラバリや裏面情報を含めるのは composeProductInfo の中なので、
+  //    ここだけ effectiveProductInfo を渡すと、**裏面情報だけの商品が
+  //    画面ではずっと押せない** (API では押せる) という食い違いになる。
+  const { productInfo } = lpComposeMaterial(db, draft);
+  return {
+    ...lpComposeStateFor(db, draft.id),
+    blocked: lpComposeBlockReason({ draft, productInfo, spec }),
+    spec: lpSpecSummary(db, 'product_analysis'),
+  };
+}
+
 // 誰でも押せる (中原さん 2026-10-01。既存の定型文ボタンと同じ扱い)。
 // 押す = キューに積んで即 claim 対象にするだけ。構成に 1〜3 分かかるので画面はポーリングする。
 
@@ -3862,8 +3889,12 @@ function lpComposeMaterial(db, draft) {
 //    長さだけ先に見て、形の判定は lib に任せる。
 // lp-compose 固有の code を HTTP に対応づける (ad-kw-ai の表に無いもの)。
 // 🚨 disabled を落とすと「機能が無効」が 400 に見え、実行役が「依頼が壊れている」と誤解する
-const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, already_generated: 409, job_finalized: 409, already_running: 409 };
-const lpComposeFail = (res, r) => res.status(LP_COMPOSE_HTTP[r.code] || 400).json({ ok: false, code: r.code, error: r.error });
+const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, already_generated: 409, job_finalized: 409, already_running: 409, lint_failed: 422 };
+// 🚨 lint で断ったときは**何が落ちたかも返す** (codex exec review P2)。
+//    code と error だけだと、実行役は直すために lint をもう一度呼ぶしか無く、
+//    lease が切れた後はそれもできない (= 直しようが無い)。
+const lpComposeFail = (res, r) => res.status(LP_COMPOSE_HTTP[r.code] || 400)
+  .json({ ok: false, code: r.code, error: r.error, ...(r.lint ? { lint: r.lint } : {}) });
 const rawField = (v, maxLen) => (typeof v === 'string' && v.length <= maxLen ? v : null);
 // 🚨 共有の intParam は Number.parseInt なので "12abc" を 12 として通す。
 //    lib 側の posInt を厳しくしても、router で変換して渡すとそこに届かず、
@@ -3914,6 +3945,17 @@ serviceApiRouter.post('/lp-compose/jobs/:id/fail', (req, res) => {
   });
   if (!r.ok) return lpComposeFail(res, r);
   res.json({ ok: true, status: r.status });
+});
+
+// 構成を lint するだけ (結果は確定しない・PR1-c)。
+// 🚨 **AI 枠を消費しない**ので何度でも呼べる。実行役はこれを見て自分で直してから result を出す。
+// これが無いと result で断られて初めて lint 結果を知ることになり、generation を 1 回で使い切る
+serviceApiRouter.post('/lp-compose/jobs/:id/lint', express.json({ limit: '1mb' }), (req, res) => {
+  const r = lintLpComposeForJob(getDB(), lpIdParam(req.params.id), {
+    leaseToken: rawField(req.body?.lease_token, 100), output: req.body?.output,
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json({ ok: true, lint: r.lint });
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/release', (req, res) => {

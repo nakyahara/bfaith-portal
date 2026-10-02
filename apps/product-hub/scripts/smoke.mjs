@@ -3620,6 +3620,42 @@ const ms = await import('../lib/mall-status.js');
   check('まだ工程は完了しない (他モールが残る)',
     wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state !== 'done');
 
+  // 🚨 楽天モールを**手で**完了にしたら、画像工程 ⑧楽天登録 も閉じる (2026-10-01)。
+  //    RMS で手で出した商品が、画像ボードの ⑧ の列に残り続けないようにする
+  //    (⑧ は役割なしの工程なので、残ると管理者しか閉じられない)
+  {
+    const idMx = Number(db.prepare(
+      "INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-MALL-RK', '手で楽天に出した商品', 'approved', 'smoke')"
+    ).run().lastInsertRowid);
+    wfp.ensureProgress(db, idMx);
+    const rkStepOf = () => db.prepare(
+      "SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_rakuten'").get(idMx)?.state;
+    check('前提: ⑧楽天登録 は未着手', rkStepOf() === 'todo', rkStepOf());
+    ms.setMallState(idMx, 'yahoo', { state: 'done' }, 'admin', ADMIN);
+    check('他モールを完了にしても ⑧楽天登録 は動かない', rkStepOf() === 'todo', rkStepOf());
+    ms.setMallState(idMx, 'rakuten', { state: 'done' }, 'admin', ADMIN);
+    check('🚨 楽天モールを手で完了にすると ⑧楽天登録 も完了になる', rkStepOf() === 'done', rkStepOf());
+    // 一方向 (モールを戻しても ⑧ は開けない。開くかどうかはボードの D&D で人が決める)
+    ms.setMallState(idMx, 'rakuten', { state: 'todo' }, 'admin', ADMIN);
+    check('楽天モールを戻しても ⑧楽天登録 は開かない (一方向の連動)', rkStepOf() === 'done', rkStepOf());
+    // 🚨 閉じるのは「done に変わった瞬間」だけ (Codex R7 P1)。すでに done の楽天モールの
+    //    URL やメモを直しただけで閉じ直すと、「画像を直して楽天に出し直す」ために人が開いた
+    //    ⑧ が黙って消える
+    ms.setMallState(idMx, 'rakuten', { state: 'done' }, 'admin', ADMIN);
+    db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idMx);
+    ms.setMallState(idMx, 'rakuten', { item_url: 'https://item.rakuten.co.jp/b-faith/wf-mall-rk/' }, 'admin', ADMIN);
+    check('🚨 すでに完了の楽天モールの URL を直しただけでは ⑧楽天登録 を閉じ直さない (出し直しの作業が消えない)',
+      rkStepOf() === 'todo', rkStepOf());
+    ms.setMallState(idMx, 'rakuten', { note: 'メモだけ更新' }, 'admin', ADMIN);
+    check('メモだけの更新でも ⑧楽天登録 を閉じ直さない', rkStepOf() === 'todo', rkStepOf());
+    // 「対象外」にしてあった ⑧ は上書きしない (人が決めた予定を消さない)
+    db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idMx);
+    ms.setMallState(idMx, 'rakuten', { state: 'todo' }, 'admin', ADMIN);
+    ms.setMallState(idMx, 'rakuten', { state: 'done' }, 'admin', ADMIN);
+    check('⑧楽天登録 が「対象外」なら自動完了で上書きしない', rkStepOf() === 'skip', rkStepOf());
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idMx);
+  }
+
   // URL の検証
   let urlErr = null;
   try { ms.setMallState(id, 'yahoo', { item_url: 'javascript:alert(1)' }, 'admin', ADMIN); } catch (e) { urlErr = e; }
@@ -4117,14 +4153,24 @@ let wfSetParentId = null;
     sd.applyReuseImages(db, setId).copied === 0
     && db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(setId).c === 3);
 
-  // ④ 全部そのまま使うなら制作は要らない = 画像の工程は「対象外」で決着
+  // ④ 全部そのまま使うなら制作は要らない = 画像の工程は「対象外」で決着。
+  //    🚨 ただし ⑧楽天登録 は残す (2026-10-01): 画像を作る仕事は無くても楽天には出すので、
+  //       ここを対象外にすると「楽天未登録なのにカードが完了列」になり、人が楽天登録の列へ
+  //       戻しても計画を保存し直すと黙って対象外に戻る
   const detailSteps = () => db.prepare(`
     SELECT p.step_code, p.state FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
     WHERE p.draft_id = ? AND s.track = 'image' AND s.image_kind = 'detail' ORDER BY s.sort
   `).all(setId);
+  const prodSteps = () => detailSteps().filter((x) => x.step_code !== 'imgd_rakuten');
+  const rkStep = () => detailSteps().find((x) => x.step_code === 'imgd_rakuten')?.state;
   check('全部そのまま使う → 画像の制作工程は「対象外」で決着する',
-    detailSteps().length > 0 && detailSteps().every((x) => x.state === 'skip'),
+    prodSteps().length > 0 && prodSteps().every((x) => x.state === 'skip'),
     JSON.stringify(detailSteps().map((x) => x.state)));
+  check('🚨 全部そのまま使っても ⑧楽天登録 は対象外にしない (楽天には出すので)',
+    rkStep() === 'todo', rkStep());
+  check('🚨 全部そのまま使うセットのカードは完了列ではなく ⑧楽天登録 の列に出る',
+    wfp.progressOf(setId, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+    wfp.progressOf(setId, { db }).imageDetail.current?.step_code || '(完了列)');
 
   // ⑤ 1枠でも「直して使う」にすると制作が動き出し、指示が依頼に載る
   const put = (items) => sd.replaceSetImagePlans(db, setId, items, 'smoke');
@@ -4179,8 +4225,43 @@ let wfSetParentId = null;
 
   // ⑦ 戻せば制作工程もまた「対象外」になる (todo のものだけ。人が進めた done は触らない)
   put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
-  check('全部そのまま使うに戻せば、制作工程はまた「対象外」になる',
-    detailSteps().every((x) => x.state === 'skip'), JSON.stringify(detailSteps().map((x) => x.state)));
+  check('全部そのまま使うに戻せば、制作工程はまた「対象外」になる (⑧楽天登録は残る)',
+    prodSteps().every((x) => x.state === 'skip') && rkStep() === 'todo',
+    JSON.stringify(detailSteps().map((x) => x.state)));
+  // 🚨 この修正より前に作ったセット (⑧ が対象外のまま) は、計画を保存し直したときに開き直す。
+  //    反映対象から完全に外すと、既存のカードが永久に完了列から出てこない (Codex 名指し R2 P1)
+  db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
+  put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+  check('🚨 対象外で残っていた ⑧楽天登録 は、画像の計画を保存し直すと開き直る (既存セットの収束)',
+    rkStep() === 'todo', rkStep());
+  // 🚨 もう楽天に出ている旧セットは `todo` ではなく `done` で開ける (Codex R10 P2)。
+  //    `todo` にすると閉じる自動の経路が無く、出品済みなのに ⑧楽天登録 の列に残り続ける
+  db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
+  db.prepare(`
+    INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'done')
+    ON CONFLICT(draft_id, mall) DO UPDATE SET state = 'done'
+  `).run(setId);
+  put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+  check('🚨 もう楽天に出ている旧セットは ⑧楽天登録 を「完了」で開ける (未着手で残すと閉じられない)',
+    rkStep() === 'done', rkStep());
+  // 🚨 完了の日時・人は**実際に楽天へ出したときのもの** (名指し R5 P2)。計画を保存した時刻・人を
+  //    入れると工程の所要時間や担当者の集計が狂う
+  {
+    const rkRow = db.prepare("SELECT done_at, done_by FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_rakuten'").get(setId);
+    const listedAt = db.prepare("SELECT listed_at FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").get(setId)?.listed_at || null;
+    check('🚨 計画の保存で完了にした ⑧ の日時は実際の出品の日時・人は system (計画を保存した人を入れない)',
+      rkRow?.done_by === 'system' && rkRow?.done_at === listedAt, JSON.stringify({ ...rkRow, listedAt }));
+    const ev = db.prepare("SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_image_plan_rakuten' ORDER BY id DESC LIMIT 1").get(setId);
+    check('🚨 ⑧を動かしたことは別のイベントで残る (制作工程の 1 行に埋もれない)',
+      !!ev && /完了/.test(ev.detail), ev?.detail || '(イベントが無い)');
+  }
+  // 🚨 楽天モールが「対象外」のセットは ⑧ を開かない (開くと閉じられず詰まる)
+  db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
+  db.prepare("UPDATE draft_mall_status SET state = 'skip' WHERE draft_id = ? AND mall = 'rakuten'").run(setId);
+  put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+  check('🚨 楽天が「対象外」のセットは ⑧楽天登録 を開かない (対象外のまま)', rkStep() === 'skip', rkStep());
+  db.prepare("DELETE FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").run(setId);
+  db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
   const firstStep = detailSteps()[0].step_code;
   db.prepare(`UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = ?`).run(setId, firstStep);
   put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
@@ -4905,7 +4986,9 @@ let wfSetParentId = null;
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(madeId);
 
       // 本番の構成の 済/まだ (2026-09-13 スタッフ要望)。縦列 ②仮構成 とは別の印で持ち、
-      // 印が無くても ③素材待ちが決着していれば 済 とみなす (既存カードを軒並み まだ にしない)
+      // 印が無くても ④AI制作が決着していれば 済 とみなす (= ⑤デザイン修正 に移った時点。
+      // 2026-10-01 スタッフ要望で ③素材待ち から 1 列ずらした — AI制作 の最中は
+      // まだ構成ができていない商品がある)
       {
         const cId = Number(db.prepare(
           "INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-COMPOSE', '構成 済 判定テスト', 'draft', 'smoke')"
@@ -4913,7 +4996,7 @@ let wfSetParentId = null;
         wfp.ensureProgress(db, cId);
         const composeOf = () => wfp.boardData(db, {}).columns.flatMap((c) => c.cards)
           .find((x) => x.id === cId)?.image?.compose;
-        check('ボード 構成: 印が無く ③素材待ち も終わっていなければ「まだ」', composeOf()?.done === false, JSON.stringify(composeOf()));
+        check('ボード 構成: 印が無く ④AI制作 も終わっていなければ「まだ」', composeOf()?.done === false, JSON.stringify(composeOf()));
         for (const code of ['imgd_request', 'imgd_compose']) wfp.setStepState(cId, code, { state: 'done' }, 'smoke', ADMIN);
         check('ボード 構成: ②仮構成 が終わっても、本番の構成の印が無ければ「まだ」',
           composeOf()?.done === false, JSON.stringify(composeOf()));
@@ -4922,11 +5005,17 @@ let wfSetParentId = null;
           composeOf()?.done === true && composeOf()?.marked === true && composeOf()?.implied === false, JSON.stringify(composeOf()));
         db.prepare('UPDATE draft_image_production SET compose_status = NULL WHERE draft_id = ?').run(cId);
         wfp.setStepState(cId, 'imgd_material', { state: 'done' }, 'smoke', ADMIN);
-        check('ボード 構成: 人が決めていなくても ③素材待ちが決着していれば「済」とみなす',
+        // 🚨 2026-10-01 スタッフ要望の本体: ③素材待ち が決着して ④AI制作 に居るだけでは「まだ」。
+        //    AI で画像を作った時点で構成が確定する商品があるので、ここで 済 にすると
+        //    構成ができていないカードが「済」で出る
+        check('ボード 構成: ③素材待ちが決着して ④AI制作 に居るだけでは「まだ」 (2026-10-01)',
+          composeOf()?.done === false && composeOf()?.implied === false && composeOf()?.marked === false, JSON.stringify(composeOf()));
+        wfp.setStepState(cId, 'imgd_ai', { state: 'done' }, 'smoke', ADMIN);
+        check('ボード 構成: 人が決めていなくても ④AI制作が決着 (= ⑤デザイン修正 に移った) なら「済」とみなす',
           composeOf()?.done === true && composeOf()?.implied === true && composeOf()?.marked === false, JSON.stringify(composeOf()));
         // Codex R1: 推定の 済 でも人が「まだ」にしたらそちらが勝つ (戻せないと誤操作を直せない)
         db.prepare("UPDATE draft_image_production SET compose_status = 'todo' WHERE draft_id = ?").run(cId);
-        check('ボード 構成: 人が「まだ」にしたら ③素材待ちが済んでいても「まだ」 (推定より人の値)',
+        check('ボード 構成: 人が「まだ」にしたら ④AI制作が済んでいても「まだ」 (推定より人の値)',
           composeOf()?.done === false && composeOf()?.marked === true && composeOf()?.implied === false, JSON.stringify(composeOf()));
         db.prepare('UPDATE draft_image_production SET compose_status = NULL WHERE draft_id = ?').run(cId);
         check('ボード 構成: 詳細画像が対象外なら 対象外 (済にしない)', (() => {
@@ -5459,6 +5548,13 @@ let wfSetParentId = null;
     });
     check('工程API: body の boardClaim は無視され、未割り当て工程の引き受け+完了は 403', r.status === 403
       && stepOf(idM5, 'title_approve') === 'todo' && assigneeOf(idM5, 'title_approve') == null, JSON.stringify(r.json));
+    // boardMove も同じ: D&D 経路の内部オプションなので body で送っても効かない (2026-10-01)。
+    // AI待ちは役割なしのシステム工程 = 抜け道の対象に見える形で試す
+    r = await call('POST', `/api/drafts/${idM5}/steps/ai_generate`, {
+      state: 'skip', boardMove: true, expected_version: versionOf(idM5, 'ai_generate'),
+    });
+    check('工程API: body の boardMove は無視され、システム工程の「対象外」は 403 のまま',
+      r.status === 403 && stepOf(idM5, 'ai_generate') !== 'skip', JSON.stringify(r.json));
   } finally { smokeSession = adminSession; }
 
   // 画像ビュー: 依頼 → 素材待ち へ (依頼・構成が done)、完了列で残りをまとめて閉じる。
@@ -5484,6 +5580,229 @@ let wfSetParentId = null;
     wfpEarly.moveBoardCard(idM3, { view: 'image', kind: 'detail', to: 'compose', expectedCurrent: 'imgd_aplus' }, 'smoke', ADMIN2);
   } catch (e) { moveCas = e; }
   check('D&D の CAS: 掴んだ時点の工程と違えば 409', moveCas?.status === 409, moveCas?.message || '例外が出ていない');
+
+  // 🚨 落とした列が「いまやる番」になること (2026-10-01 スタッフ報告:「2個セットで楽天未登録なのに
+  //    『楽天登録』に移動しようとすると『A＋コンテンツ』まで飛ばされる」)。
+  //    原因 = 親の画像をそのまま使うセットは作成時に画像の工程がまるごと「対象外」になる
+  //    (applyImagePlanToTrack) ので、⑧楽天登録 が skip のまま残り、前方移動が移動先を飛ばしていた
+  {
+    const idSkip = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-SKIPTGT', '対象外の列へ落とす', 'smoke')
+    `).run().lastInsertRowid);
+    wfpEarly.ensureProgress(db, idSkip);
+    const st = (code) => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idSkip, code)?.state;
+    // セット作成と同じ形を作る: 詳細の画像工程をまるごと「対象外」にする (applyImagePlanToTrack と同じ)
+    for (const code of dbmod.DETAIL_V2_CODES) {
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, code);
+    }
+    // 🚨 まず報告どおりの形で確かめる (Codex R4 P1): 親の画像をそのまま使うセットは画像の工程が
+    //    10 段階まるごと「対象外」になるので、カードは**完了列**にいる。そこから ⑧楽天登録 に
+    //    直接落とす = 後方移動。ここで開き直せないと「楽天登録に置けない」が残る
+    {
+      const skipImg0 = wf.createStaff({ name: '完了列から楽天登録スモーク', kind: 'internal' });
+      db.prepare(`INSERT INTO ph_staff_roles (staff_id, role_code) VALUES (?, 'image')`).run(skipImg0);
+      check('D&D 前提: 画像の工程が全部「対象外」のカードは完了列にいる',
+        wfpEarly.progressOf(idSkip, { db }).imageDetail.current === null
+        && wfpEarly.progressOf(idSkip, { db }).imageDetail.done === true);
+      wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: null },
+        'img', { isAdmin: false, actorStaffId: skipImg0 });
+      check('🚨 D&D: 完了列 (全部対象外) のカードを ⑧楽天登録 に直接落とせる (画像登録者でも・報告どおりの形)',
+        st('imgd_rakuten') === 'todo'
+        && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+        `⑧=${st('imgd_rakuten')} / current=${wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code}`);
+      wf.setStaffActive(skipImg0, false);
+      // 以降のテスト (前方移動) の形に戻す: ⑧ を対象外に、③素材待ちを未着手に
+      // (= 完了列のカードを人が ③ へ差し戻した状態)
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, 'imgd_rakuten');
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_material');
+    }
+    check('D&D 前提: ⑧楽天登録 が「対象外」で残り、いまの工程は ③素材待ち',
+      st('imgd_rakuten') === 'skip' && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_material');
+    // 🚨 動かすのは**管理者ではなく画像登録者** (Codex R1 P1: ⑧楽天登録 は役割を置かない
+    //    システム工程なので、管理者で試すと「非管理者は 403 で直っていない」を見逃す)
+    const skipImgStaffId = wf.createStaff({ name: '対象外の列スモーク', kind: 'internal' });
+    db.prepare(`INSERT INTO ph_staff_roles (staff_id, role_code) VALUES (?, 'image')`).run(skipImgStaffId);
+    const SKIP_IMG = { isAdmin: false, actorStaffId: skipImgStaffId };
+    wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_material' }, 'img', SKIP_IMG);
+    check('🚨 D&D: 対象外で残っていた ⑧楽天登録 に落とすと、そこが「いまやる番」になる (A+ へ飛ばない・画像登録者でも)',
+      st('imgd_rakuten') === 'todo'
+      && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+      `⑧=${st('imgd_rakuten')} / current=${wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code}`);
+    check('🚨 D&D: 通過した「対象外」の工程は done に書き換えない (⑤⑥⑦ は対象外のまま)',
+      st('imgd_design') === 'skip' && st('imgd_review_1') === 'skip'
+      && st('imgd_review_2') === 'skip' && st('imgd_amazon') === 'skip',
+      JSON.stringify(['imgd_design', 'imgd_review_1', 'imgd_review_2', 'imgd_amazon'].map(st)));
+    check('D&D: 通過したまだ決着していない工程は done になる (③素材待ち)', st('imgd_material') === 'done');
+    // 対象外の ⑧ を**跨いで** ⑨A+ に落とすのも通る (以前は ⑧ を done にしようとして 400 で丸ごと失敗)
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, 'imgd_rakuten');
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_amazon');
+    let overSkip = null;
+    try {
+      wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'aplus', expectedCurrent: 'imgd_amazon' }, 'img', SKIP_IMG);
+    } catch (e) { overSkip = e; }
+    check('🚨 D&D: 対象外の ⑧楽天登録 を跨いで ⑨A+ に落とせる (⑧ は対象外のまま・400 にならない)',
+      !overSkip && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'done' && st('imgd_aplus') === 'todo',
+      overSkip?.message || JSON.stringify(['imgd_rakuten', 'imgd_amazon', 'imgd_aplus'].map(st)));
+    // 🚨 開いた後に閉じられること (名指し R4 F: 片道にしない)。ただし**楽天登録の根拠**は要る
+    {
+      // ⑧ を未着手・⑨を未着手にして、いまの工程を ⑧ にそろえる
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code IN ('imgd_rakuten', 'imgd_aplus')").run(idSkip);
+      check('D&D 前提: いまの工程が ⑧楽天登録',
+        wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+        wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code);
+      let noEvidence = null;
+      try {
+        wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'aplus', expectedCurrent: 'imgd_rakuten' }, 'img', SKIP_IMG);
+      } catch (e) { noEvidence = e; }
+      check('D&D: 出品の根拠が無ければ ⑧楽天登録 は閉じられない (400・移動ごとロールバック)',
+        noEvidence?.status === 400 && /自動で完了/.test(noEvidence.message) && st('imgd_rakuten') === 'todo',
+        noEvidence?.message || '例外が出ていない');
+      // モール別の展開状況で楽天を完了 = 根拠あり → 画像登録者でも閉じられる
+      db.prepare(`
+        INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'done')
+        ON CONFLICT(draft_id, mall) DO UPDATE SET state = 'done'
+      `).run(idSkip);
+      wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'aplus', expectedCurrent: 'imgd_rakuten' }, 'img', SKIP_IMG);
+      check('🚨 D&D: 出品の根拠があれば画像登録者でも ⑧楽天登録 を閉じて先へ進める (片道にしない)',
+        st('imgd_rakuten') === 'done' && st('imgd_aplus') === 'todo',
+        `⑧=${st('imgd_rakuten')} / ⑨=${st('imgd_aplus')}`);
+      db.prepare("DELETE FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").run(idSkip);
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_aplus'").run(idSkip);
+    }
+    // 🚨 楽天モールが「対象外」の商品は ⑧ を開かせない (名指し R5 P1)。
+    //    開くと出品の根拠が無いので閉じられず、対象外に戻せるのは管理者だけ = カードが詰まる。
+    //    移動自体は成功し、カードは ⑧ を飛ばして先の列に出る (= 楽天に出さない商品の正しい見え方)
+    {
+      db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idSkip);
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_amazon'").run(idSkip);
+      db.prepare(`
+        INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'skip')
+        ON CONFLICT(draft_id, mall) DO UPDATE SET state = 'skip'
+      `).run(idSkip);
+      const mv = wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_amazon' }, 'img', SKIP_IMG);
+      check('🚨 D&D: 楽天が「対象外」の商品は ⑧楽天登録 を開かない (移動は成功・理由を返す)',
+        mv.changed === true && /楽天が「対象外」/.test(mv.reopenBlocked?.message || '')
+        && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'done',
+        `reopenBlocked=${JSON.stringify(mv.reopenBlocked)} / ⑧=${st('imgd_rakuten')}`);
+      // 🚨 管理者の D&D でも開かせない (isAdmin の早期 return より前で弾く — 名指し R6 P1)
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_amazon'").run(idSkip);
+      const mvAdmin = wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_amazon' }, 'admin', ADMIN2);
+      check('🚨 D&D: 楽天が「対象外」なら管理者でも ⑧楽天登録 は開かない',
+        /楽天が「対象外」/.test(mvAdmin.reopenBlocked?.message || '') && st('imgd_rakuten') === 'skip',
+        `reopenBlocked=${JSON.stringify(mvAdmin.reopenBlocked)} / ⑧=${st('imgd_rakuten')}`);
+      db.prepare("DELETE FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").run(idSkip);
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idSkip);
+    }
+    // 🚨 「対象外」にする道は開けていない (従来どおり管理者だけ)
+    let skipSys = null;
+    try { wfpEarly.setStepState(idSkip, 'imgd_rakuten', { state: 'skip' }, 'img', SKIP_IMG); } catch (e) { skipSys = e; }
+    check('D&D の抜け道: ⑧楽天登録 を「対象外」にはできない (管理者だけ)',
+      skipSys?.status === 403, skipSys?.message || '例外が出ていない');
+    // 🚨 抜け道は画像登録者だけ (Codex R3 P1)。役割の無い担当者は従来どおり弾く
+    {
+      const noRoleId = wf.createStaff({ name: '役割なし・対象外の列スモーク', kind: 'internal' });
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, 'imgd_rakuten');
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_amazon');
+      let noRoleErr = null;
+      try {
+        wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_amazon' },
+          'norole', { isAdmin: false, actorStaffId: noRoleId });
+      } catch (e) { noRoleErr = e; }
+      check('D&D の抜け道: 画像登録者の役割が無い担当者は ⑧楽天登録 を開き直せない (403・全体ロールバック)',
+        noRoleErr?.status === 403 && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'todo',
+        noRoleErr?.message || '例外が出ていない');
+      wf.setStaffActive(noRoleId, false);
+    }
+    // 🚨 抜け道は ⑧楽天登録 の段階だけ (Codex R9 P2)。管理画面から足した「役割なしの画像工程」には
+    //    効かせない (これも従来はシステム工程 = 管理者だけの扱い)
+    {
+      const customCode = wf.createStep({ label: '役割なしのカスタム画像工程', track: 'image', image_kind: 'detail' });
+      db.prepare('UPDATE ph_steps SET role_code = NULL WHERE code = ?').run(customCode);
+      wfpEarly.ensureProgress(db, idSkip);
+      db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = ?").run(idSkip, customCode);
+      const custState = () => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idSkip, customCode)?.state;
+      let custErr = null;
+      try {
+        wfpEarly.setStepState(idSkip, customCode, { state: 'todo' }, 'img', SKIP_IMG);
+      } catch (e) { custErr = e; }
+      check('D&D の抜け道: 役割なしのカスタム画像工程は画像登録者でも開き直せない (⑧楽天登録 の段階だけ)',
+        custErr?.status === 403 && custState() === 'skip', custErr?.message || custState());
+      db.prepare('UPDATE ph_steps SET active = 0 WHERE code = ?').run(customCode);
+      db.prepare('DELETE FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').run(idSkip, customCode);
+    }
+    // 🚨 本流のシステム工程 (出品・展開) には効かせない。そもそも「対象外」にできない工程なので、
+    //    画像トラック限定にしておけば、ここから status (expanded) を巻き戻す道は増えない
+    {
+      let listingSkip = null;
+      try { wfpEarly.setStepState(idSkip, 'listing', { state: 'skip' }, 'admin', ADMIN2); } catch (e) { listingSkip = e; }
+      check('D&D の抜け道: 「出品・展開」はそもそも対象外にできない (開き直しの対象にならない)',
+        listingSkip?.status === 400, listingSkip?.message || '例外が出ていない');
+    }
+    // 🚨 完了で残っている移動先も開き直す (Codex 名指し R2 P1)。
+    //    「楽天登録済み → ⑤デザイン修正へ差し戻し → 直したので ⑧楽天登録 へ」が通らないと、
+    //    直した版を楽天へ反映する作業が board から消える
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('done', idSkip, 'imgd_rakuten');
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_design');
+    wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_design' }, 'img', SKIP_IMG);
+    check('🚨 D&D: 完了で残っている ⑧楽天登録 に落とすと開き直る (直した版を楽天へ反映する作業が見える)',
+      st('imgd_rakuten') === 'todo'
+      && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+      st('imgd_rakuten'));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSkip);
+    wf.setStaffActive(skipImgStaffId, false);
+
+    // 🚨 本流で「対象外の未割り当て工程」に落とす場合 (Codex R3 P2)。
+    //    開き直しと引き受けを一緒にやらないと「先に『自分が担当する』を押してから」で 403 になり、
+    //    飛ばされる不具合が 403 に変わるだけになる
+    const idSkipMain = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, official_url, created_by)
+      VALUES ('DRV-SKIPMAIN', '本流の対象外の列へ落とす', 'https://example.com/skipmain', 'smoke')
+    `).run().lastInsertRowid);
+    wfpEarly.ensureProgress(db, idSkipMain);
+    db.prepare('UPDATE draft_step_progress SET assignee_id = NULL WHERE draft_id = ?').run(idSkipMain);
+    const stM = (code) => db.prepare('SELECT state, assignee_id FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idSkipMain, code) || {};
+    // 管理者が「商品説明確認」を対象外にしてから、未着手の基本情報に戻す
+    wfpEarly.setStepState(idSkipMain, 'desc_review', { state: 'skip' }, 'admin', ADMIN2);
+    const regStaffId = wf.createStaff({ name: '商品登録者スモーク', kind: 'internal' });
+    db.prepare(`INSERT INTO ph_staff_roles (staff_id, role_code) VALUES (?, 'registrar')`).run(regStaffId);
+    const REG = { isAdmin: false, actorStaffId: regStaffId };
+    let mainSkipErr = null;
+    try {
+      wfpEarly.moveBoardCard(idSkipMain, { view: 'main', to: 'desc_review', expectedCurrent: 'basic_info' }, 'reg', REG);
+    } catch (e) { mainSkipErr = e; }
+    check('🚨 D&D: 本流で「対象外」の未割り当て工程に落とすと、引き受けつきで開き直る (403 にしない)',
+      !mainSkipErr && stM('desc_review').state === 'todo' && stM('desc_review').assignee_id === regStaffId,
+      mainSkipErr?.message || JSON.stringify(stM('desc_review')));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSkipMain);
+
+    // 🚨 移動先が**完了**かつ**他人の担当**のときは、開き直しだけ諦めて移動は成功させる
+    //    (Codex 名指し R3 P1: 前は移動先を触らなかったので通っていた操作を 403 にしない)。
+    //    カードは従来どおりその先の列に出る
+    const idDoneOther = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, official_url, created_by)
+      VALUES ('DRV-DONEOTHER', '完了の他人担当へ前方移動', 'https://example.com/doneother', 'smoke')
+    `).run().lastInsertRowid);
+    wfpEarly.ensureProgress(db, idDoneOther);
+    const stD = (code) => db.prepare('SELECT state, assignee_id FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idDoneOther, code) || {};
+    // 通過する工程は動かす人 (REG) の担当にしておく (通過工程で弾かれると別の理由で 403 になる)。
+    // 「タイトル確認」だけ他人 (大川さん) の担当で完了にしておく = 開き直せない移動先
+    db.prepare('UPDATE draft_step_progress SET assignee_id = ? WHERE draft_id = ?').run(regStaffId, idDoneOther);
+    wfpEarly.setStepState(idDoneOther, 'title_approve', { state: 'done' }, 'admin', ADMIN2);
+    wfpEarly.setStepState(idDoneOther, 'title_approve', { assignee_id: wfOkawaId }, 'admin', ADMIN2);
+    let doneOtherErr = null;
+    let doneOtherMove = null;
+    try {
+      doneOtherMove = wfpEarly.moveBoardCard(idDoneOther, { view: 'main', to: 'title_approve', expectedCurrent: 'basic_info' }, 'reg', REG);
+    } catch (e) { doneOtherErr = e; }
+    check('🚨 D&D: 完了で他人担当の移動先は開き直しだけ諦めて移動は成功する (403 で全部巻き戻さない)',
+      !doneOtherErr && stD('basic_info').state === 'done' && stD('title_approve').state === 'done',
+      doneOtherErr?.message || JSON.stringify([stD('basic_info'), stD('title_approve')]));
+    check('D&D: 開き直せなかった工程名と理由を戻り値で返す (画面が理由を出せる)',
+      doneOtherMove?.reopenBlocked?.label === 'タイトル確認'
+      && /担当です/.test(doneOtherMove.reopenBlocked.message || ''), JSON.stringify(doneOtherMove));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDoneOther);
+    wf.setStaffActive(regStaffId, false);
+  }
 
   // カードは 1 商品 1 枚 (2026-08-31 TOP工程の廃止。「制作件数がぱっと見で分かりにくい」の解消)
   const ib = wfpEarly.boardData(db, { view: 'image' });
@@ -5582,6 +5901,27 @@ let wfSetParentId = null;
     check('v2: 詳細カードに 撮影・素材 / 商品情報あり が乗る',
       cardV2 && cardV2.materialStatus === 'ready' && cardV2.materialLabel === '素材完了' && cardV2.hasProductInfo === true && cardV2.ownBrand === true,
       JSON.stringify(cardV2 && { m: cardV2.materialStatus, l: cardV2.materialLabel, i: cardV2.hasProductInfo }));
+    // 撮影指示書 (2026-10-01 スタッフ要望)。「商品を発送していても指示書ができていない」を拾う印なので、
+    // 撮影・素材ステータスとは別に持つ。撮影不要の商品だけ「対象外」
+    {
+      const ciOf = () => [...wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' }).columns.flatMap((c) => c.cards)]
+        .find((c) => c.id === idV2)?.image?.cameraInstruction;
+      check('撮影指示書: URL が無ければ まだ (素材完了で商品が届いていても まだ のまま)',
+        ciOf()?.registered === false && ciOf()?.notRequired === false, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { camera_instruction_url: 'https://docs.google.com/spreadsheets/d/x/edit' });
+      check('撮影指示書: カメラ撮影指示URL を入れると 済', ciOf()?.registered === true, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { camera_instruction_url: '   ' });
+      check('撮影指示書: 空白だけの URL は 済 にしない', ciOf()?.registered === false, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { material_status: 'not_required' });
+      check('撮影指示書: 撮影不要の商品は 対象外 (仕入れ商品が軒並み まだ にならない)',
+        ciOf()?.notRequired === true && ciOf()?.registered === false, JSON.stringify(ciOf()));
+      // 🚨 撮影不要 + 古い撮影指示URL あり (Notion は撮影・素材と URL を別々に埋めるので作れる)。
+      //    画面は撮影不要を先に見るので「対象外」になる = ここでは両方の印が立つことだけ固定する
+      dbmod.upsertImageProduction(db, idV2, { camera_instruction_url: 'https://docs.google.com/spreadsheets/d/old/edit' });
+      check('撮影指示書: 撮影不要 + 古い URL でも 撮影不要 の印が立つ (画面は対象外を先に出す)',
+        ciOf()?.notRequired === true && ciOf()?.registered === true, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { material_status: 'ready', camera_instruction_url: null });
+    }
     // 楽天登録済みの既存商品には詳細 v2 も自動 done で入る
     const idV2Rk = Number(db.prepare(`
       INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('DRV-V2-RK', 'v2・登録済み', 'listed', 'smoke')
@@ -9232,6 +9572,23 @@ const renders = [
     maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(),
     isAdmin: false, shopCategoryCount: 0, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
   }],
+  // LP構成の仕様書カード (PR1-e) の **オフ / 未取込** の見え方。共通 locals の既定は
+  // 「機能オン・仕様書あり」なので、ここを別に描かないと初回デプロイ・機能オフのときだけ
+  // 壊れる退行を拾えない (Codex 名指し R2 P2)
+  ['index.ejs (LP仕様書: 機能オフ)', 'index.ejs', {
+    title: 't', displayName: 'smoke', drafts: [], counts, statusFilter: null,
+    statuses, statusLabels, maxImportCodes: imp.MAX_IMPORT_CODES,
+    maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(),
+    isAdmin: true, shopCategoryCount: 0, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
+    lpSpec: { enabled: false, spec: null },
+  }],
+  ['index.ejs (LP仕様書: まだ取り込まれていない)', 'index.ejs', {
+    title: 't', displayName: 'smoke', drafts: [], counts, statusFilter: null,
+    statuses, statusLabels, maxImportCodes: imp.MAX_IMPORT_CODES,
+    maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(),
+    isAdmin: true, shopCategoryCount: 0, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
+    lpSpec: { enabled: true, spec: null },
+  }],
   ['new.ejs', 'new.ejs', { title: 't', displayName: 'smoke' }],
   ['detail.ejs (full/own_brand)', 'detail.ejs', {
     title: 't', displayName: 'smoke',
@@ -9584,6 +9941,16 @@ renders.push(
     }]);
     // 確認中 (2026-08-31): 立っているとき = 青い帯 + 経過日数 + 解除ボタン、
     // 立っていないとき = 理由ボタンが並ぶ帯 (既定の detail fixture 側で描かれる)
+    // 🤖 構成をAIに作らせる (PR1-d) の **オフ / 押せない** の見え方。共通 locals の既定は
+    // 「機能オン・押せる」なので、ここを別に描かないと機能オフのときだけ壊れる退行を拾えない
+    // (Codex 名指し R2 P2)
+    renders.push(['detail.ejs (LP構成AI: 機能オフ)', 'detail.ejs', {
+      ...d0[2], lpCompose: { enabled: false, job: null, blocked: null, spec: null },
+    }]);
+    renders.push(['detail.ejs (LP構成AI: 仕様書なしで押せない)', 'detail.ejs', {
+      ...d0[2],
+      lpCompose: { enabled: true, job: null, blocked: '仕様書がまだ取り込まれていません', spec: null },
+    }]);
     renders.push(['detail.ejs (確認中)', 'detail.ejs', {
       ...d0[2],
       draft: {
@@ -9636,6 +10003,22 @@ renders.push(
     board: wfp.boardData(db, { view: 'image', imageKind: 'top' }),
   }],
   ['board.ejs (自分のボール・担当者未紐付け)', 'board.ejs', { ...boardBase, assigneeParam: 'me' }],
+  // 撮影指示書 (2026-10-01): 撮影不要 + 古い撮影指示URL あり。実データでは作りにくいので
+  // カードの値を直接差し替えて、画面が「対象外」を先に出すことを固定する
+  ['board.ejs (撮影指示書: 撮影不要 + 古いURL)', 'board.ejs', {
+    ...boardBase,
+    board: {
+      ...boardBase.board,
+      columns: boardBase.board.columns.map((c, i) => (i === 0 ? {
+        ...c,
+        cards: c.cards.slice(0, 1).map((card) => ({
+          ...card,
+          image: { ...card.image, cameraInstruction: { registered: true, notRequired: true } },
+        })),
+      } : { ...c, cards: [] })),
+      doneCards: [],
+    },
+  }],
   // 完了列のカードにも画像の状況を出す (2026-09-01)。実データでは完了が 0 件のこともあるので、
   // 進行中のカードを 1 枚借りて必ず描かせる
   ['board.ejs (完了列にカード)', 'board.ejs', {
@@ -9903,6 +10286,22 @@ for (const [name, file, data] of renders) {
         skuJans: {}, skuSelectorValues: {},
         imagePriorities: dbmod.IMAGE_PRIORITIES,
         materialStatuses: dbmod.MATERIAL_STATUSES,
+        // 📄 LP構成の仕様書の取り込みカード (段階1・PR1-e)。router は一覧画面に常に渡す。
+        // 既定 = 機能オン・いまの版あり (admin に出る形)。機能オフ・未取込の見え方は
+        // 「index.ejs (LP仕様書: 機能オフ)」「(まだ取り込まれていない)」の fixture で上書きする
+        lpSpec: {
+          enabled: true,
+          spec: { id: 3, title: 'LP制作システム.xlsx', imported_at: '2026-10-01T09:30:00Z', imported_by: 'smoke',
+                  hash_short: 'abc123def456', sheet_titles: ['LP制作システム', '出力形式'], chars: 12345 },
+        },
+        // 🤖 構成をAIに作らせる (段階1・PR1-d)。router は詳細画面に常に渡す。
+        // 既定 = 機能オン・仕様書あり・まだ依頼なし (押せる状態)。機能オフ・押せないの見え方は
+        // 「detail.ejs (LP構成AI: 機能オフ)」「(仕様書なしで押せない)」の fixture で上書きする
+        lpCompose: {
+          enabled: true, job: null, blocked: null,
+          spec: { id: 1, title: 'LP制作システム.xlsx', imported_at: '2026-10-01T00:00:00Z', imported_by: 'smoke',
+                  hash_short: 'abc123def456', sheet_titles: ['LP制作システム'], chars: 1234 },
+        },
         // 確認中 (2026-08-31)。detail は理由リスト、board は絞り込みの状態を使う
         checkingReasons: dbmod.CHECKING_REASONS,
         checkingNoteMax: dbmod.CHECKING_NOTE_MAX,
@@ -9916,6 +10315,11 @@ for (const [name, file, data] of renders) {
         promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: '@LP制作システム' },
         // 本番の構成の 済/まだ (2026-09-13)。router が composeStateOf で作って渡す
         composeState: { excluded: false, done: false, marked: false, implied: false },
+        // 🤖 構成をAIに作らせる (段階1・2026-10-01)。
+        // router は detail に lpCompose (状態)、list に lpSpec (いまの仕様書) を渡す。
+        // 🚨 ここを忘れると画面が丸ごと 500 になる (実際に PR1-d/e で落とした)
+        lpCompose: { enabled: true, job: null, blocked: null, spec: { id: 1, title: 'LP制作システム', imported_at: '2026-09-30T00:00:00.000Z', imported_by: 'nakahara@x', hash_short: 'abc123def456', sheet_titles: ['出力形式', 'AIプロンプトV2.2'], chars: 24635 } },
+        lpSpec: { enabled: true, spec: { id: 1, title: 'LP制作システム', imported_at: '2026-09-30T00:00:00.000Z', imported_by: 'nakahara@x', hash_short: 'abc123def456', sheet_titles: ['出力形式', 'AIプロンプトV2.2'], chars: 24635 } },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
         workflow: wfp.progressOf(wfDraftId, { db }),
         workflowStaff: wf.listStaff(),
@@ -10114,6 +10518,18 @@ for (const [name, file, data] of renders) {
   check('ボード: カードの 構成 行に 済/まだ/対象外 のバッジが付く',
     rowsOk(rows.filter((r) => r.includes('>構成<'))),
     rows.filter((r) => r.includes('>構成<')).slice(0, 2).join(' | ') || '(構成の行が無い)');
+  // 撮影指示書 (2026-10-01 スタッフ要望)。トップ画像・詳細画像と同じ形で 済/まだ/対象外 を出す
+  check('ボード: カードの 撮影指示書 行に 済/まだ/対象外 のバッジが付く',
+    rowsOk(rows.filter((r) => r.includes('>撮影指示書<'))),
+    rows.filter((r) => r.includes('>撮影指示書<')).slice(0, 2).join(' | ') || '(撮影指示書の行が無い)');
+  // 🚨 撮影不要 + 古い撮影指示URL は「対象外」が勝つ (URL を先に見ると「済」に出てしまう)
+  {
+    const bhCi = renderedHtml.get('board.ejs (撮影指示書: 撮影不要 + 古いURL)') || '';
+    const ciRows = krowsOf(bhCi).filter((r) => r.includes('>撮影指示書<'));
+    check('ボード 撮影指示書: 撮影不要 + 古いURL のときは「対象外」(URL より撮影不要を先に見る)',
+      ciRows.length > 0 && ciRows.every((r) => badgeOf(r)?.text === '対象外'),
+      ciRows.slice(0, 2).join(' | ') || '(撮影指示書の行が無い)');
+  }
   // まとめて移動 (2026-09-13 スタッフ要望)。カードごとに選択のチェックがあり、リンクの外に置く (押しても詳細へ飛ばない)
   check('ボード: カードにまとめて移動の選択チェックがあり、リンクの外にある',
     /<label class="kb-pick"[^>]*><input type="checkbox" class="kb-pick-box"[^>]*><\/label>\s*<a class="kb-card-link"/.test(bh));
@@ -10131,8 +10547,9 @@ for (const [name, file, data] of renders) {
     const bhDone = renderedHtml.get('board.ejs (完了列にカード)') || '';
     const doneCol = bhDone.split('data-col="done"')[1] || '';
     const doneRows = krowsOf(doneCol);
-    check('ボード: 完了列のカードにも トップ画像 / 詳細画像 の状況が出る',
-      rowsOk(doneRows.filter((r) => r.includes('>トップ画像<'))) && rowsOk(doneRows.filter((r) => r.includes('>詳細画像<'))),
+    check('ボード: 完了列のカードにも トップ画像 / 詳細画像 / 撮影指示書 の状況が出る',
+      rowsOk(doneRows.filter((r) => r.includes('>トップ画像<'))) && rowsOk(doneRows.filter((r) => r.includes('>詳細画像<')))
+      && rowsOk(doneRows.filter((r) => r.includes('>撮影指示書<'))),
       doneRows.slice(0, 2).join(' | ') || '(完了列に画像の行が無い)');
     // 完了列のカードにも楽天の状態と商品名を持たせる (2026-09-10 監査: 差し戻し時の出品確認が
     // 商品名なし・対象外でも出ていた)

@@ -18,7 +18,7 @@
  *  11 世代は 14 個残す (今の世代は消さない)・印は前にしか進まない
  *  12 入口 (cli): 取れた回は ping なし・受け入れない = fail / 入れた後の確かめが通った回だけ ok・今朝の作り直しでない = fail / 未設定 = ⏭️ + fail / --dry-run は書かない
  *  13 台帳・daily-sync (再構築の直前と直後)・照合 ② が company_owned を知っている
- *  17 持ち主の epoch (0053・Codex #1564 R1 H1): config (configured) を書き換えただけでは何も変わらない / prepare → 明示のロード → 写し → 作り直し → 確かめ → activate の順だけ /
+ *  17 持ち主の epoch (0055・Codex #1564 R1 H1): config (configured) を書き換えただけでは何も変わらない / prepare → 明示のロード → 写し → 作り直し → 確かめ → activate の順だけ /
  *     証拠 (今の作り直しの世代・今朝の確かめ・読み直し) が欠ければ active にしない / 証拠の世代の後に夜間ロードが入った = active にしない (R3 High 1・R4 = commit の番号) /
  *     明示のロードは本番と同じ HTTP の道 (router の startLoad・host = render) = 写しは場所ではなく最後に commit したロードを使う (R4 High) /
  *     行が無い = 全部 load / cancel / 記録は足すだけ
@@ -44,12 +44,12 @@
  *     (R6 Medium) 写しが取れない・NE と作り直しは通った朝 (前の世代で新しい作り直し) = 古い表が作り直しの世代と同じなら safe を書く (exit 1 のまま)・daily-sync・再試行・手の更新は流す /
  *     (R6 Low) warehouse.db を開けない・門を書けない (SQLITE_BUSY) 回 = 止めの印 (DATA_DIR のファイル) を残す = 故障が直っても通った確かめまで止まる
  *  25 記録の後に足した列 (記録した持ち主に無い) = load として足す・知らない列 = 壊れ (M-4)
- *  27 持ち主の正を 1 つに (0053・Codex #1564 R2 High 3): 0001〜0053 がそろって入る / 切替の段階を company_owner に進める前提 = epoch が active (差し込み口) /
+ *  27 持ち主の正を 1 つに (0055・Codex #1564 R2 High 3): 0001〜0055 がそろって入る / 切替の段階を company_owner に進める前提 = epoch が active (差し込み口) /
  *     段階の owner_hash = active (⑤-1 の段階の行の trigger) / 画面の保存の門 (⑤-1 の ops.begin_master_write) = active (記録に無い列 = load)
  *  28 持ち主表のハッシュは 1 つの式 (load の列は数えない。#1564 Codex R3 Medium): JS = DB / 前の列の組で切り替えた後に列を足しても画面の保存・登録の門は通る・
  *     夜間ロードは足した列を load で動かす
- *  29 最後に commit したロード = DB が振る番号の順 (0053 の ops.master_load_commits。送り手の時計・場所では決めない・数で並べる)・dry-run は番号なし・
- *     0053 の前の毎晩のロード (番号の行が無い) = 最初の朝はそれを使う (commit_seq = null。R5 Low)・
+ *  29 最後に commit したロード = DB が振る番号の順 (0055 の ops.master_load_commits。送り手の時計・場所では決めない・数で並べる)・dry-run は番号なし・
+ *     0055 の前の毎晩のロード (番号の行が無い) = 最初の朝はそれを使う (commit_seq = null。R5 Low)・
  *     写しは場所を問わず最後のロード・番号の表は足すだけ (#1564 Codex R4 Medium 2・High)
  *  26 NE と C で種類が違う SKU (NE でセットを単品に) = その SKU だけ NE の値 (⚠️・証跡)・作り直し全部は止めない (M-5) /
  *     C のセットの構成品に NE にしか無い単品 = 値が混ざる = ⚠️・証跡 (L-2)
@@ -166,7 +166,7 @@ async function loadNow({ usePrepared = false } = {}) {
 /**
  * 切替の日の明示のロードを本番と同じ道で流す: HTTP の POST /apps/company-db/sync/load?apply=1&use_prepared=1 (scripts/company-db/remote-load.mjs load --apply --use-prepared)
  *   → router の startLoad (host = 'render') → runLoadOnce → runInitialLoad。接続は router の差し替え口で PGlite に (#1564 Codex R4 High)。
- *   終わるまで待ち、失敗なら投げる。戻り値 = { run_id, last (router の状態), commit (0053 の commit の番号の行) }
+ *   終わるまで待ち、失敗なら投げる。戻り値 = { run_id, last (router の状態), commit (0055 の commit の番号の行) }
  */
 let httpLoad = null;
 async function loadViaHttp({ usePrepared = true } = {}) {
@@ -209,7 +209,7 @@ async function setActive(ownership) {
   [h, JSON.stringify(m)]);
 }
 /**
- * 試験の近道: 切替の段階 (⑤-1 の 0051 の ops.master_cutover_state) を直接置く。段階の守り (⑤-1・⑤-2a・0053 の trigger) を通さない
+ * 試験の近道: 切替の段階 (⑤-1 の 0051 の ops.master_cutover_state) を直接置く。段階の守り (⑤-1・⑤-2a・0055 の trigger) を通さない
  *   (session_replication_role = replica = この取引だけ trigger を止める)。本番は ops.set_master_cutover_phase だけ。守りそのものは [27] で確かめる
  */
 async function setCutoverPhase(phase, ownerHash = 'a'.repeat(64)) {
@@ -857,14 +857,14 @@ await ta('[16] 切替の後に NE にだけある SKU (Company DB に無い) = �
   db.prepare("DELETE FROM raw_ne_products WHERE 商品コード = 's-new'").run(); FX.markComplete(db, readNeRawRev);
 });
 
-await ta('[17] 持ち主の epoch (0053): config を書き換えただけでは何も変わらない・prepare → 明示のロード → 写し → 作り直し → 確かめ → activate の順だけ・証拠が欠ければ active にしない・行が無い = 全部 load', async () => {
+await ta('[17] 持ち主の epoch (0055): config を書き換えただけでは何も変わらない・prepare → 明示のロード → 写し → 作り直し → 確かめ → activate の順だけ・証拠が欠ければ active にしない・行が無い = 全部 load', async () => {
   const own = OWN('sku_costs');
   const logs = [];
   const epochCli = (argv, extra = {}) => quietly(() => EP.cli(argv, { env: { DATA_DIR: tmp }, connect: async () => ({ db: pdb, close: async () => {} }), openSqlite: async () => db,
     log: (m) => logs.push(m), ...extra }));
   const allHash = OS.ownershipHashOf(MASTER_OWNERSHIP), ownHash = MP.ownershipHash(own);
   assert.equal(ownHash, OS.ownershipHashOf(own));   // 夜間ロード・写し・作り直しで同じハッシュの式
-  // (a) 行が無い (0053 の前・まだ誰も prepare していない) = 全部 load
+  // (a) 行が無い (0055 の前・まだ誰も prepare していない) = 全部 load
   await q('delete from ops.master_ownership_state');
   let lr = await loadNow();
   assert.deepEqual([lr.ownership_epoch.epoch, lr.company_owned], ['default', []]);
@@ -956,7 +956,7 @@ await ta('[17] 持ち主の epoch (0053): config を書き換えただけでは�
   assert.match(logs.at(-1), /generation_before_prepare/);
   await q("update ops.master_ownership_state set prepared_at = prepared_at - interval '2 hours' where id = 1");
   assert.equal((await OS.readOwnershipState(pdb)).active.hash, allHash);   // 断った回は何も変えない
-  // 世代に commit の番号が無い (0053 の前のロードの世代) = active にしない (証拠で断る。#1564 Codex R4 Medium 2)
+  // 世代に commit の番号が無い (0055 の前のロードの世代) = active にしない (証拠で断る。#1564 Codex R4 Medium 2)
   const gNo = snap().build.cdb_publish_generation_no, keepSeq = db.prepare('SELECT load_commit_seq FROM cdb_publish_generations WHERE generation_no = ?').get(gNo).load_commit_seq;
   db.prepare('UPDATE cdb_publish_generations SET load_commit_seq = NULL WHERE generation_no = ?').run(gNo);
   assert.equal(await epochCli(['activate']), 1);
@@ -1650,16 +1650,18 @@ await ta('[26] NE と C で種類が違う SKU = その SKU だけ NE の値 (�
   await nightly();
 });
 
-await ta('[27] 持ち主の正を 1 つに: 0001〜0053 がそろう・company_owner に進む前提 = epoch が active・段階の owner_hash = active・画面の保存の門 = active', async () => {
-  // (a) 積み方 (master 0050 → ⑤-1 0051 → ⑤-2a 0052 → ④a 0053) がそろって入る・前提の差し込み口に 1 行
-  assert.deepEqual((await q("select version from ops.schema_migrations where version in ('0051', '0052', '0053') order by 1")).map((r) => r.version), ['0051', '0052', '0053']);
-  assert.deepEqual((await q('select name from ops.master_cutover_prereq_checks order by 1')).map((r) => r.name), ['0052_registrations', '0053_ownership_epoch']);
+await ta('[27] 持ち主の正を 1 つに: 0001〜0055 がそろう・company_owner に進む前提 = epoch が active・段階の owner_hash = active・画面の保存の門 = active', async () => {
+  // (a) 積み方 (master 0050 → ⑤-1 0051 → ⑤-2a 0052 → ⑤-2b 0053 → ⑦-1 0054 → ④a 0055) がそろって入る・前提の差し込み口に 1 行
+  assert.deepEqual((await q("select version from ops.schema_migrations where version in ('0051', '0052', '0053', '0054', '0055') order by 1")).map((r) => r.version), ['0051', '0052', '0053', '0054', '0055']);
+  assert.deepEqual((await q('select name from ops.master_cutover_prereq_checks order by 1')).map((r) => r.name), ['0052_registrations', '0054_amazon_map', '0055_ownership_epoch']);
+  // epoch の鍵 = 4705310055 (番号にそろえる)・ほかの鍵 (0036 の親子・0051 のマスタの書き込み) と重ならない
+  assert.deepEqual(Object.values((await q('select ops.master_ownership_lock_key()::text as e, core.master_write_lock_key()::text as w, core.parent_lock_key()::text as p'))[0]), ['4705310055', '4705310051', '4705310036']);
   const own = OWN('sku_costs'), ownHash = OS.ownershipHashOf(own);
   const put = async (map) => q(`insert into ops.master_ownership_state (id, active_hash, active_map, activated_by) values (1, $1, $2::jsonb, 'test')
     on conflict (id) do update set active_hash = excluded.active_hash, active_map = excluded.active_map, prepared_hash = null, prepared_map = null, prepared_at = null, prepared_by = null`,
   [OS.ownershipHashOf(map), JSON.stringify(map)]);
   // (b) 前提 (⑤-1 の ops.set_master_cutover_phase が集める): company_owner・new_open に進むのは epoch が active のときだけ
-  const probs = async (from = 'frozen', to = 'company_owner') => (await q('select ops.master_cutover_prereq_problems($1, $2) as p', [from, to]))[0].p.filter((x) => x.startsWith('0053_ownership_epoch'));
+  const probs = async (from = 'frozen', to = 'company_owner') => (await q('select ops.master_cutover_prereq_problems($1, $2) as p', [from, to]))[0].p.filter((x) => x.startsWith('0055_ownership_epoch'));
   await q('delete from ops.master_ownership_state');
   assert.match((await probs()).join(), /epoch_missing/);
   await put(OS.sortedOwnership(MASTER_OWNERSHIP));
@@ -1707,11 +1709,28 @@ await ta('[27] 持ち主の正を 1 つに: 0001〜0053 がそろう・company_o
       return true;
     } finally { await pdb.query('rollback'); }
   };
+  // ⑤-2b (0053) の約束 (仕入先・ファイル = SKU なし) と ⑦-1 (0054) の Amazon の約束 (出品だけ = SKU なし) も同じ確かめ (操作で分けない・SKU の無い約束も)
+  const beginOther = async (operation) => {
+    const amazon = operation.startsWith('amazon_map_');
+    await pdb.query('begin');
+    try {
+      // Amazon の約束の相手 = 出品 (試験の DB には無い = 取引の中だけ作る・巻き戻す)
+      const listingId = amazon ? (await q("insert into core.listings (company_id, mall, listing_code) values (1, 'amazon', 'test-0055-map') returning listing_id::text as id"))[0].id : null;
+      await q(`insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, listing_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions,
+          actor_id, reason, source_system, db_user, phase, owner_hash, ownership)
+        values (gen_random_uuid(), txid_current(), gen_random_uuid(), $1, null, $2::bigint, '{}'::bigint[], '{}'::bigint[], repeat('0', 64), $3, '{}'::jsonb,
+          'tester', null, $4, 'master_edit', 'new_open', $5, $6::jsonb)`, [operation, listingId, 'c'.repeat(64), amazon ? 'portal_amazon_map' : 'portal_master_edit', ownHash, JSON.stringify(own)]);
+      return true;
+    } finally { await pdb.query('rollback'); }
+  };
+  const OTHER_OPS = ['supplier_create', 'reg_csv_build', 'jan_edit', 'amazon_map_save', 'amazon_map_delete'];
   assert.equal((await begin()).phase, 'new_open');   // active = 画面の持ち主表 = 始められる
   assert.equal(await beginCreate(), true);
+  for (const op of OTHER_OPS) assert.equal(await beginOther(op), true, op);
   await put(OWN('sku_costs', 'skus.shipping'));
   await assert.rejects(begin(), /before_cutover: 持ち主表が持ち主の epoch \(active\) と違う/);
   await assert.rejects(beginCreate(), /before_cutover: 持ち主表が持ち主の epoch \(active\) と違う/);   // 登録も同じ
+  for (const op of OTHER_OPS) await assert.rejects(beginOther(op), /before_cutover: 持ち主表が持ち主の epoch \(active\) と違う/, op);
   const partial = { ...OS.sortedOwnership(own) }; delete partial['skus.reorder_months'];   // 記録の後に足した列 (画面では load) = load として同じ
   await put(partial);
   assert.equal((await begin()).phase, 'new_open');
@@ -1745,7 +1764,7 @@ await ta('[28] 持ち主表のハッシュは 1 つの式 (load の列は数え�
   try { await q("select set_config('ops.cutover_protocol', '1', true)"); await q("update ops.master_cutover_state set phase = 'company_owner', owner_hash = $1 where id = 1", [C.ownershipHash(older)]); await pdb.query('commit'); }
   catch (e) { await pdb.query('rollback'); throw e; }
   await setCutoverPhase('new_open', C.ownershipHash(older));
-  // (c) 列を足した後の画面 (持ち主表 = own。足した列は load): 段階の記録と同じ = 保存できる (JS の門・DB の ⑤-1 の begin・0053 の約束の門・登録の行)
+  // (c) 列を足した後の画面 (持ち主表 = own。足した列は load): 段階の記録と同じ = 保存できる (JS の門・DB の ⑤-1 の begin・0055 の約束の門・登録の行)
   const cut = await C.readCutoverPhase(pdb);
   assert.equal(C.newEntryWritable(cut, own), true);
   assert.equal(C.newEntryWritable(cut, { ...own, 'skus.reorder_months': 'company' }), false);   // 足した列を company にした = 違う
@@ -1782,7 +1801,7 @@ await ta('[28] 持ち主表のハッシュは 1 つの式 (load の列は数え�
   await setCutoverPhase('legacy_open');
   await q('delete from ops.master_ownership_state');
   await nightly();
-  // (f) 段階が company_owner / new_open (前の式で owner_hash を記録した後) の DB では 0053 は止まる (式を黙って変えない)
+  // (f) 段階が company_owner / new_open (前の式で owner_hash を記録した後) の DB では 0055 は止まる (式を黙って変えない)
   const pg2 = new PGlite(); const pdb2 = pgliteAdapter(pg2);
   try {
     await applyMigrations(pdb2, { log: quiet, to: '0052' });
@@ -1790,8 +1809,8 @@ await ta('[28] 持ち主表のハッシュは 1 つの式 (load の列は数え�
     await pdb2.query('set local session_replication_role = replica');
     await pdb2.query("update ops.master_cutover_state set phase = 'company_owner', owner_hash = $1 where id = 1", ['e'.repeat(64)]);
     await pdb2.query('commit');
-    await assert.rejects(applyMigrations(pdb2, { log: quiet }), /0053: 切替の段階が company_owner \/ new_open/);
-    assert.deepEqual((await pdb2.query("select version from ops.schema_migrations where version = '0053'")).rows, []);
+    await assert.rejects(applyMigrations(pdb2, { log: quiet }), /0055: 切替の段階が company_owner \/ new_open/);
+    assert.deepEqual((await pdb2.query("select version from ops.schema_migrations where version = '0055'")).rows, []);
   } finally { await pg2.close(); }
 });
 
@@ -1815,21 +1834,21 @@ await ta('[29] 最後に commit したロード = DB が振る番号の順 (送�
   const dry = await runInitialLoad(pdb, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: `load_pub_${++loadN}`, host: 'render-nightly', dryRun: true });
   assert.equal(dry.load_commit_seq, undefined);
   assert.equal((await OS.latestLoadCommit(pdb)).ingest_run_id, other.run_id);
-  // 0053 の前の毎晩の cron のロード (番号の行が無い) = 0053 の後の最初の朝の写しはそのロードを使う (commit_seq = null。#1564 Codex R5 Low)
+  // 0055 の前の毎晩の cron のロード (番号の行が無い) = 0055 の後の最初の朝の写しはそのロードを使う (commit_seq = null。#1564 Codex R5 Low)
   const pg3 = new PGlite(); const pdb3 = pgliteAdapter(pg3);
   try {
     await applyMigrations(pdb3, { log: quiet, to: '0052' });
-    const old = await runInitialLoad(pdb3, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: 'load_before_0053', host: 'render-nightly' });
+    const old = await runInitialLoad(pdb3, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: 'load_before_0055', host: 'render-nightly' });
     assert.equal(old.ok, true, old.error);
     assert.equal(old.load_commit_seq, undefined);   // 番号の表が無い = 番号を取らない (ロードは止めない)
     await applyMigrations(pdb3, { log: quiet });
     assert.equal((await pdb3.query('select count(*)::int as n from ops.master_load_commits')).rows[0].n, 0);
     const first = await F.selectPublishLoad(pdb3);
-    assert.deepEqual([first.ingest_run_id, first.commit_seq, first.host], ['load_before_0053', null, 'render-nightly']);
-    // 0053 の後の最初の本適用のロード = 番号 1 = それを使う
-    const next = await runInitialLoad(pdb3, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: 'load_after_0053', host: 'render-nightly' });
+    assert.deepEqual([first.ingest_run_id, first.commit_seq, first.host], ['load_before_0055', null, 'render-nightly']);
+    // 0055 の後の最初の本適用のロード = 番号 1 = それを使う
+    const next = await runInitialLoad(pdb3, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: 'load_after_0055', host: 'render-nightly' });
     assert.equal(next.load_commit_seq, 1);
-    assert.deepEqual([(await F.selectPublishLoad(pdb3)).ingest_run_id, (await F.selectPublishLoad(pdb3)).commit_seq], ['load_after_0053', 1]);
+    assert.deepEqual([(await F.selectPublishLoad(pdb3)).ingest_run_id, (await F.selectPublishLoad(pdb3)).commit_seq], ['load_after_0055', 1]);
   } finally { await pg3.close(); }
   // 足すだけ
   await assert.rejects(q("update ops.master_load_commits set host = 'x'"), /足すだけ/);   // 番号そのものは identity (always) = 書き換えられない

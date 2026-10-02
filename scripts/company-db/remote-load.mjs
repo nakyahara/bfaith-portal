@@ -4,7 +4,7 @@
  *
  *   node scripts/company-db/remote-load.mjs status [--counts]         GET /status (既定は counts=0 = Postgres に繋がない)
  *   node scripts/company-db/remote-load.mjs load [--apply] [--wait] [--use-prepared]   POST /load (既定 dry-run)。--wait で終わるまで 10 秒おきに見る。
- *     --use-prepared = 切替の日だけ: prepared の持ち主 (0053。master-ownership-epoch.mjs prepare) でロードする (毎晩の cron は active)
+ *     --use-prepared = 切替の日だけ: prepared の持ち主 (0055。master-ownership-epoch.mjs prepare) でロードする (毎晩の cron は active)
  *   node scripts/company-db/remote-load.mjs wait [run_id]             その run (省略時は直近) が終わるまで待つ (最大 30 分)。失敗・中断・結果不明は終了コード 1
  *   node scripts/company-db/remote-load.mjs reports                   GET /reports (report の一覧)
  *   node scripts/company-db/remote-load.mjs report <run_id> [--md] [--out <file>]   GET /report/:run_id (明細)。--out でファイルに保存

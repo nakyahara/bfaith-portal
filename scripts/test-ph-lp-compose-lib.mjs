@@ -1,4 +1,5 @@
 import { temporaryTestDataDir } from './test-temp-dir.mjs';
+import { compositionFor, fixture, FIXTURES } from './fixtures/lp-compose/index.mjs';
 await temporaryTestDataDir(import.meta.url, 'test-lp-compose-lib-');
 /**
  * LP 構成の AI 生成 — 依頼・固定 packet・予約・結果 (apps/product-hub/lib/lp-compose.js・段階1)
@@ -62,6 +63,33 @@ ok(r1b.ok && !r1b.created && r1b.job.id === r1.job.id, '同じ idempotency_key �
 ok(lp.requestJob(db, args(dA, sTabs.spec, 'key-0002')).code === 'already_running', '動いている間は 2 件目を受け付けない');
 ok(r1.job.measurement_deadline_at === new Date(min(3)).toISOString(), '測定の期限 = 受付 + 3 分で固定 (R4 #2)');
 
+console.log('②b 🚨 指示文はスタッフの定型文と同じもの 1 つだけ (設計 §5)');
+{
+  // 段階1 の測定は「**同じ入力**から作った二つを比べる」のが前提。
+  // 指示文が片方だけ違うと、比べているのが「AI の力の差」なのか
+  // 「指示文の差」なのか分からなくなるので、正本を 1 つに固定する。
+  const pt = await import('../apps/product-hub/lib/prompt-templates.js');
+  const packet = JSON.parse(r1.job.packet_json);
+  ok(!!packet.instruction, 'packet に指示文が入っている');
+  eq(packet.instruction, pt.PRODUCT_ANALYSIS_INSTRUCTION, '🚨 packet の指示文 = 定型文の正本');
+  // スタッフが ChatGPT に貼る文の中に、そのまま入っていること
+  const staff = pt.buildProductAnalysisPrompt({ name: 'ハッカ油スプレー 100ml' }, { product_info_text: '天然ハッカ油' }, '');
+  ok(staff.includes(packet.instruction),
+    '🚨 スタッフの定型文に同じ文がそのまま入っている (二重に持っていない)');
+  eq(packet.packet_version, 2, 'packet の版が上がっている (形が変わった)');
+  // 指示文も packet_hash の中 = 後から差し替えられない
+  const again = lp.buildPacket({
+    draft: dA, productInfo: packet.product_info, colorVariations: packet.color_variations,
+    images: packet.images, spec: sTabs.spec,
+  });
+  eq(again.hash, r1.job.packet_hash, '同じ材料なら hash も同じ');
+  const tampered = lp.buildPacket({
+    draft: dA, productInfo: packet.product_info, colorVariations: packet.color_variations,
+    images: packet.images, spec: { ...sTabs.spec, hash: 'ちがう' },
+  });
+  ok(tampered.hash !== r1.job.packet_hash, '材料が違うなら hash も違う');
+}
+
 console.log('③ claim — 受付時の材料をそのまま返す');
 // 受付のあとに仕様書を更新し、画像も増やす (= 実運用で起きること)
 const s2 = lp.importSpec(db, { kind: 'product_analysis', title: 'LP制作システム', body: '本文 V2.3 (更新後)', actor: 'u@x' });
@@ -90,7 +118,10 @@ ok(lp.releaseJob(db, c2.job.job_id, { leaseToken: c2.job.lease_token, now: min(0
   '🚨 予約後に release は使えない (二重に呼べてしまう)');
 
 console.log('⑥ 結果 — accepted');
-const OUT = '# LP制作システム V2.1\n\n## ⑦ AI画像生成プロンプト\n… 本文 …';
+// 🚨 PR1-c から **lint はサーバが実行してそれが正本**なので、
+// accepted を受け取らせるには **本当に lint を通る本文** が要る (ダミー文字列では通らない)。
+// draft 名は 'ハッカ油スプレー NL' なので、共通の接頭辞を入れておけば検査 17 を通る
+const OUT = compositionFor('ハッカ油スプレー');
 // packet に画像があるので accepted には証跡が要る (codex exec review R2 P2)
 const LINT = { ok: true, checks: {} };
 // 証跡はサーバが配ったときに記録する (実行役からは受け取らない)
@@ -112,7 +143,7 @@ ok(lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdi
   '別の内容では上書きできない');
 
 // 🚨 packet に画像があるのに証跡が無い accepted は受け取らない (codex exec review R2 P2)
-const dZ = mkDraft('LP-Z', 'ハッカ油スプレー 証跡なし');
+const dZ = mkDraft('LP-Z', 'ハッカ油スプレー 30ml');   // 証跡なしの系
 lp.requestJob(db, args(dZ, s2.spec, 'key-0001', { now: min(5) }));
 const cZ = lp.claimJob(db, { runnerRunId: 'run-z', now: min(5) });
 const gZ = lp.reserveGeneration(db, cZ.job.job_id, { leaseToken: cZ.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(5) });
@@ -132,7 +163,7 @@ eq(lp.submitResult(db, gZ.generation_id, { packetHash: cZ.job.packet_hash, verdi
 // 🚨 証跡は claim ごとにリセットされる (codex exec review P1)。
 // 前の実行役が画像を落としてから手放した場合に、次の実行役が
 // 画像を一度も見ずに accepted を出せてはいけない
-const dY = mkDraft('LP-Y', 'ハッカ油スプレー 使い回し');
+const dY = mkDraft('LP-Y', 'ハッカ油スプレー 40ml');   // 証跡の使い回し
 lp.requestJob(db, args(dY, s2.spec, 'key-0001', { now: min(7) }));
 const cY1 = lp.claimJob(db, { runnerRunId: 'run-y1', now: min(7) });
 serve(cY1.job, min(7));                                    // 1 人目の実行役が画像を見た
@@ -148,7 +179,7 @@ eq(lp.submitResult(db, gY.generation_id, { packetHash: cY2.job.packet_hash, verd
 // 🚨 手放した後に、飛んでいた取得が完走しても次の実行役の証跡にならない (codex exec review P2)。
 // lease を見ずに記録していたときは、A の遅い取得が B の証跡になり、
 // B は画像を一度も見ずに accepted を出せた
-const dLap = mkDraft('LP-LAP', 'ハッカ油スプレー 取り直し');
+const dLap = mkDraft('LP-LAP', 'ハッカ油スプレー 60ml'); // lease の取り直し
 lp.requestJob(db, args(dLap, s2.spec, 'key-0001', { now: min(9) }));
 const cLap1 = lp.claimJob(db, { runnerRunId: 'run-lap1', now: min(9) });
 lp.releaseJob(db, cLap1.job.job_id, { leaseToken: cLap1.job.lease_token, now: min(9.2) });
@@ -191,6 +222,38 @@ eq(lp.submitResult(db, gAll.generation_id, { packetHash: cAll.job.packet_hash, v
   'bad_request', '🚨 2 枚中 1 枚しか見ていなければ accepted を受け取らない (codex exec review P1)');
 eq(lp.submitResult(db, gAll.generation_id, { packetHash: cAll.job.packet_hash, verdict: 'rejected', reason: '画像が取れなかった', now: min(10.2) }).status,
   'failed', 'rejected は証跡が揃わなくても出せる (作れなかったという報告)');
+
+// 🚨 巨大な自己申告 lint を送っても、**サーバの結果を追い出せない** (codex exec review P2)。
+// 以前は合計が LINT_MAX を超えると実行役の申告にフォールバックしていた
+const dBig = mkDraft('LP-BIG', 'ハッカ油スプレー 80ml');
+lp.requestJob(db, args(dBig, s2.spec, 'key-0001', { now: min(11) }));
+const cBig = lp.claimJob(db, { runnerRunId: 'run-big', now: min(11) });
+const gBig = lp.reserveGeneration(db, cBig.job.job_id, { leaseToken: cBig.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(11) });
+serve(cBig.job, min(11.1));
+const fatLint = { ok: true, checks: {}, filler: 'x'.repeat(lp.LINT_MAX - 200) };
+eq(lp.submitResult(db, gBig.generation_id, {
+  packetHash: cBig.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: fatLint, now: min(11.2),
+}).status, 'done', '巨大な lint を送っても accepted は通る');
+{
+  const stored = JSON.parse(db.prepare('SELECT lint_json FROM ph_lp_compose_jobs WHERE id = ?').get(cBig.job.job_id).lint_json);
+  eq(stored.source, 'server', '🚨 保存された lint は**サーバの結果** (実行役の申告に戻らない)');
+  eq(stored.ok, true, 'サーバの判定が入る');
+  ok(stored.checks && stored.checks['7'] === true, '検査の内訳も残る');
+  eq(stored.runner_lint_dropped, true, '入り切らなければ落とすのは**参考値の方**');
+  ok(JSON.stringify(stored).length <= lp.LINT_MAX, 'LINT_MAX に収まる');
+}
+// 普通の大きさなら、実行役の申告も横に残る
+{
+  const dSml = mkDraft('LP-SML', 'ハッカ油スプレー 90ml');
+  lp.requestJob(db, args(dSml, s2.spec, 'key-0001', { now: min(12) }));
+  const c = lp.claimJob(db, { runnerRunId: 'run-sml', now: min(12) });
+  const g = lp.reserveGeneration(db, c.job.job_id, { leaseToken: c.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(12) });
+  serve(c.job, min(12.1));
+  lp.submitResult(db, g.generation_id, { packetHash: c.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: { ok: true, mine: 1 }, now: min(12.2) });
+  const stored = JSON.parse(db.prepare('SELECT lint_json FROM ph_lp_compose_jobs WHERE id = ?').get(c.job.job_id).lint_json);
+  eq(stored.source, 'server', '正本はサーバ');
+  eq(stored.runner_lint.mine, 1, '実行役の申告は横に残る (測定で読める)');
+}
 
 console.log('⑧ 成否不明 (lease 切れ) は needs_review で止まる');
 const dC = mkDraft('LP-C', 'ハッカ油スプレー 200ml');
@@ -312,14 +375,18 @@ lp.requestJob(db, args(dN, s2.spec, 'key-0001', { now: min(110) }));
 const cN = lp.claimJob(db, { runnerRunId: 'run-21', now: min(110) });
 const gN = lp.reserveGeneration(db, cN.job.job_id, { leaseToken: cN.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(110) });
 serve(cN.job, min(110));
-eq(lp.submitResult(db, gN.generation_id, {
-  packetHash: cN.job.packet_hash, verdict: 'accepted', output: OUT,
-  receipt: { images: [{ file_id: 'OTHERFILE999', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
-}).code, 'bad_request', '🚨 渡していない画像を証跡に混ぜられない (R7 #2)');
-eq(lp.submitResult(db, gN.generation_id, {
+// 🚨 このテストは PR1-c で書き直した。以前は「OTHERFILE999 を混ぜると bad_request」を
+//    見ているつもりだったが、実際には `lint` を渡していなかったから落ちていただけで、
+//    **証跡の検査は何も見ていなかった** (P1 で証跡をサーバ記録に移したときから)。
+//    いまの保証は「**送られた receipt はそもそも使わない**」なので、そちらを固定する。
+const subN = lp.submitResult(db, gN.generation_id, {
   packetHash: cN.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: LINT,
-  receipt: { images: [{ file_id: 'FILEID000001', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
-}).status, 'done', 'サーバが配っていれば通る (送った receipt は使われない)');
+  receipt: { images: [{ file_id: 'OTHERFILE999', sha256: 'e'.repeat(64), bytes: 1 }] }, now: min(111),
+});
+eq(subN.status, 'done', 'サーバが配っていれば通る');
+eq(subN.receipt.images.length, 1, '証跡は 1 枚');
+eq(subN.receipt.images[0].file_id, 'FILEID000001',
+  '🚨 証跡は**サーバが配った記録**。送ってきた OTHERFILE999 は使われない (R7 #2 の今の形)');
 
 console.log('⑯ R9 の修正');
 // #1 同じキーの再送は、材料の検証より先に既存 job を返す
@@ -392,6 +459,29 @@ ok(lp.requestJob(db, args({ ...dA, id: 'abc' }, s2.spec, 'key-000x', { now: min(
   '🚨 商品 ID が数でなければ断る (R1 #4)');
 ok(lp.requestJob(db, args(mkDraft('LP-J', 'テスト'), { ...s2.spec, id: 99999 }, 'key-0001', { now: min(95) })).code === 'bad_request',
   '存在しない仕様書の版は断る');
+
+console.log('⑳ 🚨 古い版の packet は claim しない (codex exec review P2)');
+{
+  // 版が上がる = 渡す材料の形が変わった。v1 には instruction が無いので、
+  // そのまま渡すと**スタッフと違う指示文で作ったものが測定に混ざる** (設計 §5 / §7.1)。
+  // 先にキューを空にして、試す依頼を 1 件だけにする
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled', completed_at = ? WHERE status = 'queued'`)
+    .run(new Date(min(199)).toISOString());
+  const dOld = mkDraft('LP-OLD', 'ハッカ油スプレー 15ml');
+  const rOld = lp.requestJob(db, args(dOld, s2.spec, 'key-old01', { now: min(200) }));
+  ok(rOld.ok, '依頼は通る');
+  // 受付済みの行を v1 に差し替える (デプロイをまたいだ古い依頼の再現)
+  const old = JSON.parse(db.prepare('SELECT packet_json FROM ph_lp_compose_jobs WHERE id = ?').get(rOld.job.id).packet_json);
+  delete old.instruction;
+  old.packet_version = 1;
+  db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ?, packet_version = 1 WHERE id = ?')
+    .run(JSON.stringify(old), lp.sha256(lp.canonicalJson(old)), rOld.job.id);
+  ok(lp.claimJob(db, { runnerRunId: 'run-old', now: min(201) }).job === null, '🚨 古い版は掏ませない');
+  const row = db.prepare('SELECT status, error_code, error FROM ph_lp_compose_jobs WHERE id = ?').get(rOld.job.id);
+  eq(row.status, 'failed', '理由を残して failed にする');
+  eq(row.error_code, 'packet_outdated', 'error_code が packet_outdated');
+  ok((row.error || '').includes('もう一度依頼'), '人に何をすればよいかを書く');
+}
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);
 process.exit(fail === 0 ? 0 : 1);

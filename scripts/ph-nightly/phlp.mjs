@@ -20,8 +20,10 @@
  *   ./phlp claim   --run RUN_ID                     1 件 claim (材料 + 仕様書の全文)
  *   ./phlp images  ID                               その依頼の商品画像を img-ID-1.jpg … に落とす
  *   ./phlp reserve ID --model MODEL                 **AI を呼ぶ前に必ず**予約する
+ *   ./phlp lint    ID --file out-ID.md              構成を lint する (サーバが正本・何度でも呼べる)
  *   ./phlp result  ID --accepted --file out-ID.md [--lint lint-ID.json] [--rounds N]
  *   ./phlp result  ID --rejected --reason-file reason-ID.txt [--lint lint-ID.json] [--rounds N]
+ *     (--lint は参考値。受け取るかどうかは**サーバ側の lint** で決まる)
  *   ./phlp fail    ID --code CODE --message "text"  予約の**前**だけ (生成できない材料)
  *   ./phlp release ID --reason "text"               予約の**前**だけ (一時障害)
  *   ./phlp clean   ID                               その依頼の一時ファイルを消す (rm は使えない)
@@ -200,6 +202,11 @@ async function cmdClaim(opt) {
       color_variations: job.packet.color_variations,
       images: job.packet.images.length,
     },
+    // 🚨 スタッフが ChatGPT に貼る定型文と**同じ指示文** (設計 §5)。
+    //    これに従って書く。自分の言葉で書き換えない —
+    //    指示文がスタッフ側と違うと、段階1 の A/B が「同じ入力の比較」にならない。
+    //    仕様書と齠齬したときは**仕様書が正本** (この文自身がそう言っている)
+    instruction: job.packet.instruction || null,
     next: `./phlp images ${job.job_id}`,
   });
 }
@@ -254,6 +261,21 @@ async function cmdReserve(id, opt) {
   out({ generation_id: r.json.generation_id, note: 'ここから先の失敗は fail ではなく result --rejected' });
 }
 
+/**
+ * 構成を lint するだけ (結果は確定しない・PR1-c)。
+ * 🚨 **正本はサーバ側**。自分で `{"ok":true}` と書いても通らない。
+ *    AI 枠を消費しないので、通るまで何度でも呼んでよい。
+ */
+async function cmdLint(id, opt) {
+  const lease = loadLease(id);
+  const output = fs.readFileSync(safePath(opt.file, 'out', id), 'utf8');
+  if (output.length > OUT_MAX) die(`構成が大きすぎます (${OUT_MAX} 文字まで)`);
+  const r = await api('POST', `/lp-compose/jobs/${id}/lint`, { lease_token: lease.lease_token, output });
+  out(r.json);
+  // lint が通っていない = コマンドとしても失敗 (通ったつもりで先へ進ませない)
+  if (r.status !== 200 || r.json?.lint?.ok !== true) fail(1);
+}
+
 async function cmdResult(id, opt) {
   const lease = loadLease(id);
   if (!lease.generation_id) die('先に ./phlp reserve してください');
@@ -285,6 +307,9 @@ async function cmdResult(id, opt) {
   if (accepted && (!lint || lint.ok !== true)) {
     die('--accepted には lint が要ります (--lint lint-ID.json で、中身の ok が true であること)');
   }
+  // 🚨 ここで止めているのは「自分で確かめずに出さない」ためだけ。
+  //    **受け取るかどうかの正本はサーバ側の lint** (PR1-c)。
+  //    自分で {"ok":true} と書いてもサーバが 422 で断る
   const rounds = opt.rounds === undefined ? null : Number.parseInt(String(opt.rounds), 10);
   if (rounds !== null && (!Number.isInteger(rounds) || rounds < 0 || rounds > 10)) die('--rounds は 0〜10 です');
 
@@ -420,6 +445,7 @@ switch (cmd) {
   case 'result': await cmdResult(jobId(pos[1]), opt); break;
   case 'fail': await cmdFail(jobId(pos[1]), opt); break;
   case 'release': await cmdRelease(jobId(pos[1]), opt); break;
+  case 'lint': await cmdLint(jobId(pos[1]), opt); break;
   case 'checkreview': cmdCheckReview(jobId(pos[1])); break;
   case 'reviewdata': cmdReviewData(jobId(pos[1])); break;
   case 'clean': cmdClean(jobId(pos[1])); break;

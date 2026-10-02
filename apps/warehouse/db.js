@@ -892,7 +892,7 @@ function createTables() {
   )`);
   addColumnIfMissing('cdb_publish_gate', 'applied_hash', 'TEXT');
   addColumnIfMissing('cdb_publish_gate', 'ownership_hash', 'TEXT');
-  addColumnIfMissing('cdb_publish_generations', 'load_commit_seq', 'INTEGER');   // 世代が読んだ夜間ロードの commit の番号 (0053。activate が比べる。#1564 Codex R4 Medium 2)
+  addColumnIfMissing('cdb_publish_generations', 'load_commit_seq', 'INTEGER');   // 世代が読んだ夜間ロードの commit の番号 (0055。activate が比べる。#1564 Codex R4 Medium 2)
   // 16c. raw_ne_products / raw_ne_set_products の通し番号 (sync_meta の ne_raw_<kind>_rev)。書き換えた行 1 つにつき 1 増える (INSERT OR REPLACE も 1)。
   //   どの書き込み口でも同じ取引で増える → NE 取込の完了の印 (ne_api_<kind>_complete_rev) と比べて「印の後に書かれたか」を見分ける (readNeRawRev)
   for (const [table, kind] of [['raw_ne_products', 'products'], ['raw_ne_set_products', 'setproducts']]) {

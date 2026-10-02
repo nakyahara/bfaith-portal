@@ -174,7 +174,7 @@ await ta('[8] 完了の観測は承認の目標と照らす: 空・側違い・�
   assert.equal((await call(ok)).rows[0].ok, true);
 });
 
-await ta('[9] 権限: 呼び手 (watch_writer) の一時の型 (domain) の CHECK から 4 つの関数 (0041 の record_ne_codes も) の持ち主の権限で書けない / watch_writer が実行できる security definer の関数は全部 search_path の最後に pg_temp (Codex #1481 R3 High)', async () => {
+await ta('[9] 権限: 呼び手 (watch_writer) の一時の型 (domain) の CHECK から 8 つの関数 (0041 の record_ne_codes・0053 の回の始まりの写し / 観測 / 受け取り / 確かめも) の持ち主の権限で書けない / watch_writer が実行できる security definer の関数は全部 search_path の最後に pg_temp (Codex #1481 R3 High)', async () => {
   // 関数をまだ一度も呼んでいない新しい DB で (同じ接続で先に呼ぶと関数の中の式の解釈がキャッシュされ、攻撃が再現しない。本番の照合は毎朝新しい接続)
   const p3 = new PGlite();
   try {
@@ -208,6 +208,14 @@ await ta('[9] 権限: 呼び手 (watch_writer) の一時の型 (domain) の CHEC
       // NE の元のコード (0041・③b-1b): jsonb_to_recordset の列の型・%rowtype も pg_catalog / ops で解く
       assert.equal((await p3.query('select ops.record_ne_codes($1::pg_catalog.jsonb) as r', [JSON.stringify({ compare_run_id: run(10),
         entries: [{ code_norm: 'x1', kind: 'product', state: 'ok', ne_code: 'X1', spellings: ['X1'] }] })])).rows[0].r.state, 'written');
+      // 新商品の NE 登録の CSV の確かめ (0053・⑤-2b・#1571 R1 High 2・R2 Medium 1 = 回の始まりの写し → 観測 → 受け取り → 確かめの 4 つ)
+      assert.equal((await p3.query('select ops.snapshot_ne_reg_targets($1::pg_catalog.text) as r', [run(10)])).rows[0].r.state, 'taken');
+      const w = (await p3.query('select ops.record_ne_registration_observations($1::pg_catalog.jsonb) as r', [JSON.stringify({ compare_run_id: run(10),
+        fetch: { generation_id: 'g1', products_rev: '1', sets_rev: '1', raw_hash: 'a'.repeat(64) }, products_at: '2030-01-10T00:00:00Z', sets_at: '2030-01-10T00:00:00Z',
+        absence_trusted: true, observations: [] })])).rows[0].r;
+      assert.equal(w.state, 'written');
+      assert.equal((await p3.query('select ops.seal_ne_registration_run($1::pg_catalog.text, $2::pg_catalog.text, $3::pg_catalog.text) as r', [run(10), w.observation_hash, 'b'.repeat(64)])).rows[0].r.state, 'sealed');
+      assert.deepEqual((await p3.query('select ops.record_ne_registration_check($1::pg_catalog.text) as r', [run(10)])).rows[0].r.counts, {});
     } finally { await p3.query('reset role'); await p3.query('set role deploy'); }
     assert.equal(Number((await p3.query(`select count(*)::int as n from ops.master_compare_runs where compare_run_id = $1`, [probe])).rows[0].n), 0, '呼び手の一時の型の CHECK が持ち主の権限で書いた');
     // 保存の結果も見る (完了・照合の回・基準)
@@ -216,8 +224,10 @@ await ta('[9] 権限: 呼び手 (watch_writer) の一時の型 (domain) の CHEC
     assert.equal((await p3.query(`select value from ops.master_ne_baseline where code_norm = 'x1' and col = 'name'`)).rows[0].value, 'X');
     assert.deepEqual((await p3.query(`select ne_code from ops.master_ne_codes`)).rows, [{ ne_code: 'X1' }]);
     const rows = (await p3.query(`select p.proname, p.proconfig from pg_proc p where p.prosecdef and has_function_privilege('watch_writer', p.oid, 'execute')`)).rows;
-    assert.deepEqual(rows.map((r) => r.proname).sort(), ['record_decision_candidates', 'record_decision_done', 'record_ne_baseline', 'record_ne_codes']);
-    for (const r of rows) assert.deepEqual(r.proconfig, ['search_path=pg_catalog, ops, pg_temp'], `${r.proname} の search_path が決まりと違う (先頭に別の schema を足しても見つける)`);
+    assert.deepEqual(rows.map((r) => r.proname).sort(), ['record_decision_candidates', 'record_decision_done', 'record_ne_baseline', 'record_ne_codes', 'record_ne_registration_check', 'record_ne_registration_observations', 'seal_ne_registration_run', 'snapshot_ne_reg_targets']);
+    // 0053 (⑤-2b) の確かめの関数は ops も外す (名前は全部 schema つき = ⑤-2a の約束)。ほかは 0034〜0041 の決まり (最後に pg_temp)
+    const want = Object.fromEntries(['record_ne_registration_check', 'record_ne_registration_observations', 'seal_ne_registration_run', 'snapshot_ne_reg_targets'].map((n) => [n, ['search_path=pg_catalog, pg_temp']]));
+    for (const r of rows) assert.deepEqual(r.proconfig, want[r.proname] ?? ['search_path=pg_catalog, ops, pg_temp'], `${r.proname} の search_path が決まりと違う (先頭に別の schema を足しても見つける)`);
   } finally { await p3.close(); }
 });
 

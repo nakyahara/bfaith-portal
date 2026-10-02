@@ -19,13 +19,13 @@
  *  14 0040 照合の完了 × CSV を作る: 照合が完了を書いている途中は、CSV を作る側が候補の行で待つ → 完了の commit の後は、完了した承認を入れない (候補の行を取った後に読み直す)
  *  15 0040 同じ単位の別の指紋: 画面が別の指紋を却下している途中 (候補の行は重ならない) でも、CSV を作る側は CSV の鍵で待つ → 置き換わった承認を予約しない (H1・H3)
  *  16 0041 NE の元のコード: 照合が元のコードを書いている途中は CSV を作る側が共有の鍵で待ち、書き終えた新しい回の書き方で作る / CSV の操作の途中は照合の書き手が待つ (③b-1b H2)
- *  17 0053 持ち主の epoch: 2 人が同時に最初の prepare = 後の人は前の人の commit を待ってから通る (重複で落ちない・init は 1 回) (④a・Codex #1564 R1 H1)
- *  18 0053 activate × cancel: cancel の途中は activate が行の鍵で待ち、cancel の後は「prepared が無い」で断る (active は変わらない)
- *  19 0053 activate × activate: 同時に 2 回 = 1 回だけ通る (記録も 1 件)・夜間ロードは新しい active を読む・変更の記録は消せない
- *  20 0053 activate × 同じ持ち主の prepare のやり直し: やり直しの途中は activate が行の鍵で待ち、やり直しの後は前の証拠 (前の prepare の時刻) では断る (#1564 Codex R2 Medium 4)
- *  21 0053 古い active を読んだ夜間ロードの途中に activate = ロードの commit まで待ち、その後「証拠の後にロードが入った」で断る (#1564 Codex R3 High 1)
- *  22 0053 --use-prepared のロードの途中に cancel = ロードの commit まで待つ / 23 ロードの途中に prepare のやり直し = ロードの commit まで待つ
- *     (activate の証拠 = prepared の明示のロードの commit の番号 (0053 の ops.master_load_commits)。[21] の後のロードは番号が 1 つ後。#1564 Codex R4 Medium 2)
+ *  17 0055 持ち主の epoch: 2 人が同時に最初の prepare = 後の人は前の人の commit を待ってから通る (重複で落ちない・init は 1 回) (④a・Codex #1564 R1 H1)
+ *  18 0055 activate × cancel: cancel の途中は activate が行の鍵で待ち、cancel の後は「prepared が無い」で断る (active は変わらない)
+ *  19 0055 activate × activate: 同時に 2 回 = 1 回だけ通る (記録も 1 件)・夜間ロードは新しい active を読む・変更の記録は消せない
+ *  20 0055 activate × 同じ持ち主の prepare のやり直し: やり直しの途中は activate が行の鍵で待ち、やり直しの後は前の証拠 (前の prepare の時刻) では断る (#1564 Codex R2 Medium 4)
+ *  21 0055 古い active を読んだ夜間ロードの途中に activate = ロードの commit まで待ち、その後「証拠の後にロードが入った」で断る (#1564 Codex R3 High 1)
+ *  22 0055 --use-prepared のロードの途中に cancel = ロードの commit まで待つ / 23 ロードの途中に prepare のやり直し = ロードの commit まで待つ
+ *     (activate の証拠 = prepared の明示のロードの commit の番号 (0055 の ops.master_load_commits)。[21] の後のロードは番号が 1 つ後。#1564 Codex R4 Medium 2)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-concurrency-pg.mjs
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す)。localhost 以外の URL は拒む (本番を渡さない)。package.json の試験には入れない (PostgreSQL が要る)
  */
@@ -395,11 +395,11 @@ try {
       for (const n of names) { try { await admin.query(`drop database ${n}`); } catch (e) { console.error(`DB を消せない: ${e.message}`); } }
     }
   });
-  // ── 0053 持ち主の epoch (④a・Codex #1564 R1 H1) ──
+  // ── 0055 持ち主の epoch (④a・Codex #1564 R1 H1) ──
   const OS = await import('../apps/company-db/load/ownership-state.mjs');
   const ownOf = (k) => ({ ...OS.ALL_LOAD, [k]: 'company' });
   const allHash = OS.ownershipHashOf(OS.ALL_LOAD);
-  // 証拠の世代が読んだ夜間ロードの commit の番号 (0053 の ops.master_load_commits。試験では今の最後のロード)
+  // 証拠の世代が読んだ夜間ロードの commit の番号 (0055 の ops.master_load_commits。試験では今の最後のロード)
   const lastSeq = async () => (await OS.latestLoadCommit(pgAdapter(M)))?.commit_seq ?? null;
   const epPlan = (name) => ({ skus: [{ code: 'ep1', name, kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: null, representativeCode: null, representativeState: 'unknown', cost: null }],
     variationGroups: [], setComponents: [], listings: [], observations: [], physicals: [], compliance: [], suppliers: [], supplierSkus: [], workers: [], primarySuppliers: [], reorder: { available: false, reason: '試験' }, sources: {} });
@@ -411,10 +411,10 @@ try {
   await M.query('set local session_replication_role = replica');
   await M.query("update ops.master_cutover_state set phase = 'frozen', owner_hash = null where id = 1");
   await M.query('commit');
-  // 0001〜0053 が本物の PostgreSQL でそろって入る (master 0050 → ⑤-1 0051 → ⑤-2a 0052 → ④a 0053)
-  assert.deepEqual((await M.query("select version from ops.schema_migrations where version in ('0051', '0052', '0053') order by 1")).rows.map((r) => r.version), ['0051', '0052', '0053']);
-  assert.deepEqual((await M.query('select name from ops.master_cutover_prereq_checks order by 1')).rows.map((r) => r.name), ['0052_registrations', '0053_ownership_epoch']);
-  await ta('[17] 0053 2 人が同時に最初の prepare = 後の人は前の人の commit を待ってから通る (重複で落ちない・init は 1 回)', async () => {
+  // 0001〜0055 が本物の PostgreSQL でそろって入る (master 0050 → ⑤-1 0051 → ⑤-2a 0052 → ⑤-2b 0053 → ⑦-1 0054 → ④a 0055)
+  assert.deepEqual((await M.query("select version from ops.schema_migrations where version in ('0051', '0052', '0053', '0054', '0055') order by 1")).rows.map((r) => r.version), ['0051', '0052', '0053', '0054', '0055']);
+  assert.deepEqual((await M.query('select name from ops.master_cutover_prereq_checks order by 1')).rows.map((r) => r.name), ['0052_registrations', '0054_amazon_map', '0055_ownership_epoch']);
+  await ta('[17] 0055 2 人が同時に最初の prepare = 後の人は前の人の commit を待ってから通る (重複で落ちない・init は 1 回)', async () => {
     await A.query('begin');
     await A.query(`insert into ops.master_ownership_state (id, active_hash, active_map, activated_by) values (1, $1, $2::jsonb, 'A') on conflict (id) do nothing`, [allHash, JSON.stringify(OS.sortedOwnership(OS.ALL_LOAD))]);
     await A.query(`insert into ops.master_ownership_events (action, ownership_hash, ownership, actor) values ('init', $1, $2::jsonb, 'A')`, [allHash, JSON.stringify(OS.sortedOwnership(OS.ALL_LOAD))]);
@@ -428,7 +428,7 @@ try {
     assert.deepEqual([st.active.hash, st.prepared.hash], [allHash, OS.ownershipHashOf(ownOf('sku_costs'))]);
     assert.deepEqual((await M.query('select action from ops.master_ownership_events order by event_id')).rows.map((r) => r.action), ['init', 'prepare']);
   });
-  await ta('[18] 0053 activate × cancel: cancel の途中は activate が待ち、cancel の後は「prepared が無い」で断る (active は変わらない)', async () => {
+  await ta('[18] 0055 activate × cancel: cancel の途中は activate が待ち、cancel の後は「prepared が無い」で断る (active は変わらない)', async () => {
     await A.query('begin');
     await A.query('select 1 from ops.master_ownership_state where id = 1 for update');
     const pAt = (await OS.readOwnershipState(pgAdapter(M))).prepared.prepared_at;
@@ -443,7 +443,7 @@ try {
     const st = await OS.readOwnershipState(pgAdapter(M));
     assert.deepEqual([st.active.hash, st.prepared], [allHash, null]);
   });
-  await ta('[19] 0053 activate × activate: 同時に 2 回 = 1 回だけ通る・夜間ロードは新しい active を読む・変更の記録は消せない', async () => {
+  await ta('[19] 0055 activate × activate: 同時に 2 回 = 1 回だけ通る・夜間ロードは新しい active を読む・変更の記録は消せない', async () => {
     const want = OS.ownershipHashOf(ownOf('skus.shipping'));
     await OS.prepareOwnership(pgAdapter(M), { map: ownOf('skus.shipping'), actor: 'M' });
     const pAt = (await OS.readOwnershipState(pgAdapter(M))).prepared.prepared_at;
@@ -462,7 +462,7 @@ try {
     await assert.rejects(M.query('delete from ops.master_ownership_events'), /足すだけ/);
     await assert.rejects(M.query("update ops.master_ownership_state set prepared_hash = active_hash, prepared_map = active_map, prepared_at = now() where id = 1"), /ck_master_ownership_prepared_differs/);
   });
-  await ta('[20] 0053 activate × 同じ持ち主の prepare のやり直し: やり直しの途中は activate が待ち、やり直しの後は前の証拠では断る (active は変わらない)', async () => {
+  await ta('[20] 0055 activate × 同じ持ち主の prepare のやり直し: やり直しの途中は activate が待ち、やり直しの後は前の証拠では断る (active は変わらない)', async () => {
     const map = ownOf('skus.tax_class');
     await OS.prepareOwnership(pgAdapter(M), { map, actor: 'M' });
     const before = (await OS.readOwnershipState(pgAdapter(M)));
@@ -496,7 +496,7 @@ try {
     return { load, atPause, release };
   };
   const otherMap = ownOf('skus.standard_price');
-  await ta('[21] 0053 古い active を読んだロードの途中に activate = activate はロードの commit まで待ち、その後「証拠の後にロードが入った」で断る (新しい active の後に古い epoch のロードが commit しない・C の列を NE で上書きしない)', async () => {
+  await ta('[21] 0055 古い active を読んだロードの途中に activate = activate はロードの commit まで待ち、その後「証拠の後にロードが入った」で断る (新しい active の後に古い epoch のロードが commit しない・C の列を NE で上書きしない)', async () => {
     const before = await OS.readOwnershipState(pgAdapter(M));
     await OS.prepareOwnership(pgAdapter(M), { map: otherMap, actor: 'M' });
     await preparedLoad('load_pg_p21');
@@ -527,7 +527,7 @@ try {
     const r2 = await L2.load.promise;
     assert.deepEqual(r2.ok && r2.ok.company_owned, ['skus.standard_price'], r2.err?.message);
   });
-  await ta('[22] 0053 --use-prepared のロードの途中に cancel = cancel はロードの commit まで待つ (ロードは読んだ prepared のまま書き終わる・その後 prepared が消える)', async () => {
+  await ta('[22] 0055 --use-prepared のロードの途中に cancel = cancel はロードの commit まで待つ (ロードは読んだ prepared のまま書き終わる・その後 prepared が消える)', async () => {
     const pm = ownOf('skus.shipping');
     await OS.prepareOwnership(pgAdapter(M), { map: pm, actor: 'M' });
     const L3 = pausedLoad('load_pg_ep3', { usePrepared: true });
@@ -542,7 +542,7 @@ try {
     assert.deepEqual(rc.ok, { cancelled: true }, rc.err?.message);
     assert.equal((await OS.readOwnershipState(pgAdapter(M))).prepared, null);
   });
-  await ta('[23] 0053 ロードの途中に prepare のやり直し = prepare はロードの commit まで待つ (ロードは読んだ epoch のまま・prepare は後で通る = 時刻はロードの後)', async () => {
+  await ta('[23] 0055 ロードの途中に prepare のやり直し = prepare はロードの commit まで待つ (ロードは読んだ epoch のまま・prepare は後で通る = 時刻はロードの後)', async () => {
     const L4 = pausedLoad('load_pg_ep4');
     assert.equal((await L4.atPause).epoch, 'active');
     const p = launch(OS.prepareOwnership(pgAdapter(Bc), { map: ownOf('skus.name'), actor: 'B' }));

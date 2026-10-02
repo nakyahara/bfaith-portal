@@ -110,7 +110,7 @@ router.post('/load', requireSyncKey, (req, res) => {
   if (!dataDir || !url) return res.status(503).json({ error: 'DATA_DIR / COMPANY_DB_URL not configured' });
   if (!fs.existsSync(path.join(dataDir, 'warehouse-mirror.db'))) return res.status(409).json({ error: 'warehouse-mirror.db not found (run on Render)' });
   const apply = String(req.query.apply || '') === '1';
-  // 切替の日だけ: prepared の持ち主で動かす (0053。master-ownership-epoch.mjs prepare の後に remote-load.mjs load --apply --use-prepared)
+  // 切替の日だけ: prepared の持ち主で動かす (0055。master-ownership-epoch.mjs prepare の後に remote-load.mjs load --apply --use-prepared)
   const usePrepared = String(req.query.use_prepared || '') === '1';
   let interrupted = null;
   try { interrupted = interruptedRecord(dataDir); } catch (e) { interrupted = { error: e.message }; }

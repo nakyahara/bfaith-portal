@@ -6,7 +6,7 @@
  *   すぐ後の m_products 再構築 (rebuild-m-products.js) が今の世代を読み、持ち主が C の列だけ C の値を重ねる (master-publish.js)。
  * 受け入れる条件 (全部そろったときだけ。15 §3・Codex ④ 設計 R0):
  *   時刻が今の世代より新しい / 変更の記録 (0026 の events.master_change_events = 足すだけの表) の最大の番号が下がっていない (下がった = 復元を疑う) /
- *   値の範囲 / 正規化したコードに重なりが無い / 持ち主の設定が 3 か所 (Company DB に記録した epoch (0053。active、切替の日は prepared)・最新の夜間ロードが記録した products と set_components の持ち主) で同じ /
+ *   値の範囲 / 正規化したコードに重なりが無い / 持ち主の設定が 3 か所 (Company DB に記録した epoch (0055。active、切替の日は prepared)・最新の夜間ロードが記録した products と set_components の持ち主) で同じ /
  *   🚨 config/master-ownership.mjs (configured) は世代の持ち主に使わない (Codex #1564 R1 H1。書き換えてデプロイしただけでは何も変わらない。証跡に出すだけ)
  *   値の行数 (同じ持ち主 = 同じ epoch のときだけ)・SKU の数が前の世代の 90% 以上 / 単品の商品名・状態が SKU の名前・取扱区分と同じ (その列の持ち主が C のとき) /
  *   入れた後に読み直したハッシュが同じ
@@ -83,14 +83,14 @@ export async function readPublishSource(db, { prevWatermark = null } = {}) {
   const top = hasEvents ? (await rowsOf(db, `select ${eventCols} from events.master_change_events order by event_id desc limit 1`))[0] ?? null : null;
   const watermark = top ? top.event_id : null;
   const prevEvent = hasEvents && prevWatermark != null ? (await rowsOf(db, `select ${eventCols} from events.master_change_events where event_id = $1`, [String(prevWatermark)]))[0] ?? null : null;
-  // 写しが使う夜間ロード = 最後に commit したロード (0053 の commit の番号。毎晩の cron か --use-prepared の明示のロードかを問わない) と、その記録した持ち主 (0029 の ops.load_materials.ownership)
+  // 写しが使う夜間ロード = 最後に commit したロード (0055 の commit の番号。毎晩の cron か --use-prepared の明示のロードかを問わない) と、その記録した持ち主 (0029 の ops.load_materials.ownership)
   const load = await selectPublishLoad(db);
   let loadOwnership = null;
   if (load && await columnExists(db, 'ops', 'load_materials', 'ownership')) {
     loadOwnership = Object.fromEntries((await rowsOf(db, `select entity, ownership, ownership_hash from ops.load_materials where ingest_run_id = $1 and entity in ('products', 'set_components')`,
       [load.ingest_run_id])).map((r) => [r.entity, { ownership: r.ownership, ownership_hash: r.ownership_hash }]));
   }
-  // 持ち主の epoch (0053。Codex #1564 R1 H1)。壊れていれば投げる (推測で持ち主を決めない)
+  // 持ち主の epoch (0055。Codex #1564 R1 H1)。壊れていれば投げる (推測で持ち主を決めない)
   const ownershipState = await readOwnershipState(db);
   return { cdbReadAt, has0027, hasVersion, hasEvents, ownershipState, skus, costs, primary, watermark: watermark == null ? null : Number(watermark),
     watermarkFingerprint: eventFingerprint(top), prevEventFingerprint: prevWatermark == null ? undefined : eventFingerprint(prevEvent), load, loadOwnership };
@@ -98,10 +98,10 @@ export async function readPublishSource(db, { prevWatermark = null } = {}) {
 
 /**
  * 写しが使う夜間ロード = 最後に commit したロード (#1564 Codex R4 High・Medium 2)。
- *   0053 の ops.master_load_commits の番号 (DB が commit の直前に振る = commit の順) が一番大きい回。場所 (host) では選ばない:
+ *   0055 の ops.master_load_commits の番号 (DB が commit の直前に振る = commit の順) が一番大きい回。場所 (host) では選ばない:
  *   切替の日に HTTP (remote-load.mjs load --apply --use-prepared → router の startLoad = host 'render') で流した prepared のロードも、
  *   毎晩の cron (host 'render-nightly') も、後に commit した方が写しの世代になる (照合 ① の selectNightlyLoad は毎晩の cron だけ = 別の目的)。
- *   番号の行がまだ無い (0053 の前・0053 の後に一度も本適用のロードが無い) = 今までどおり毎晩の cron の最新 (commit_seq = null)
+ *   番号の行がまだ無い (0055 の前・0055 の後に一度も本適用のロードが無い) = 今までどおり毎晩の cron の最新 (commit_seq = null)
  * @returns {{ ingest_run_id, started_at, finished_at, host, commit_seq: number|null, epoch?: string }|null}
  */
 export async function selectPublishLoad(db) {
@@ -115,7 +115,7 @@ export async function selectPublishLoad(db) {
 }
 
 /**
- * この写しの世代の持ち主 (epoch)。config (configured) ではなく Company DB の記録 (0053) で決める (Codex #1564 R1 H1):
+ * この写しの世代の持ち主 (epoch)。config (configured) ではなく Company DB の記録 (0055) で決める (Codex #1564 R1 H1):
  *   prepared があり、最新の夜間ロードが prepared の持ち主で動いた (切替の日に明示して頼んだロード) = prepared の世代 (作り直しと確かめが通れば人が activate)
  *   それ以外 = active の世代 (記録が無い = 全部 load)
  */

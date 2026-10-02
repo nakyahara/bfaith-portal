@@ -40,7 +40,7 @@ const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
 const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
 const W = await import('../lib/master-write.mjs');
 const C = await import('../lib/master-cutover.mjs');
-// 0053 (④a): company_owner・new_open に進むのは持ち主の epoch が active で段階の持ち主表と同じときだけ = 進める直前に試験で置く
+// 0055 (④a): company_owner・new_open に進むのは持ち主の epoch が active で段階の持ち主表と同じときだけ = 進める直前に試験で置く
 const EPOCH = (await import('./fixtures/master-epoch.mjs')).epochSeeder();
 const R = await import('../apps/master-edit/read.mjs');
 const { default: router, __setPgClientFactory, __setClock, __setOwnership, __setShippingRatesProvider } = await import('../apps/master-edit/router.mjs');
@@ -1335,7 +1335,7 @@ await ta('[14c] 約束の後の抜け道 (#1563 R5): 例外の SKU・含むセ�
   }
   assert.equal(Number((await q("select count(*)::int as n from ops.master_write_sessions s where not exists (select 1 from ops.master_edit_requests r where r.request_id = s.request_id and r.status = 'done')"))[0].n), 0);
   // (R5 M3) 復元した約束の行 (前の DB の乱数・今の取引の番号) があっても、begin していない書き込みは通らない・begin は止まらない
-  // 持ち主表は今の epoch (active) と同じにする (0053 の入れる時の確かめ = 違う持ち主表の行はそもそも入らない)
+  // 持ち主表は今の epoch (active) と同じにする (0055 の入れる時の確かめ = 違う持ち主表の行はそもそも入らない)
   const args4 = await beginArgs(E0, 's004');
   await pg.query('begin');
   try {

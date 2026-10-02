@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * master-ownership-epoch.mjs — 持ち主の設定の epoch を人が進めるコマンド (0053。マスタ正本切替 ④a・Codex #1564 R1 H1)
+ * master-ownership-epoch.mjs — 持ち主の設定の epoch を人が進めるコマンド (0055。マスタ正本切替 ④a・Codex #1564 R1 H1)
  *
  * 切替の日の順番 (⑤-3 の切替の手順の中。🚨 古い書き込み口 (/register など) を閉じるのはその手順 = 持ち主を変える前に閉じる。ここでは閉じない):
  *   1. config/master-ownership.mjs を書き換えてデプロイ (= configured。これだけでは何も変わらない。夜間ロード・写し・作り直しは active のまま)
@@ -60,7 +60,7 @@ export function activationEvidence({ sqlite, dataDir, prepared, now = new Date()
   const again = verifyApplied(sqlite, { publication, ownership: prepared.map, taxRates });
   if (!again.ok) problems.push('applied_mismatch_now');
   if (bp && again.applied_hash !== bp.applied_hash) problems.push('applied_hash_changed');
-  // 証拠の世代が読んだ夜間ロードと、その commit の番号 (0053。activate が「その後にロードが入っていない」を鍵の後に DB の番号で見る。#1564 Codex R3 High 1・R4 Medium 2)
+  // 証拠の世代が読んだ夜間ロードと、その commit の番号 (0055。activate が「その後にロードが入っていない」を鍵の後に DB の番号で見る。#1564 Codex R3 High 1・R4 Medium 2)
   const genLoad = bp ? (sqlite.prepare('SELECT load_run_id, load_commit_seq FROM cdb_publish_generations WHERE generation_no = ?').get(bp.generation_no) || null) : null;
   const loadCommitSeq = genLoad && genLoad.load_commit_seq != null ? Number(genLoad.load_commit_seq) : null;
   if (bp && !Number.isSafeInteger(loadCommitSeq)) problems.push('generation_without_load_commit');

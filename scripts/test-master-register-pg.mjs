@@ -96,7 +96,7 @@ try {
   await acks(MASTER_OWNERSHIP, 'legacy_open');
   await C.advanceCutoverPhase(dbP, { to: 'frozen', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: legacy, manual_entries_stopped: manualStopped(), drain: { done: true, checked_by: 't', checked_at: new Date().toISOString() } } });
   await acks(ALL_COMPANY, 'frozen');
-  // 0053 (④a): company_owner に進むのは持ち主の epoch が active で段階の持ち主表と同じときだけ = 試験で置く (本番 = ④a の activate)
+  // 0055 (④a): company_owner に進むのは持ち主の epoch が active で段階の持ち主表と同じときだけ = 試験で置く (本番 = ④a の activate)
   await (await import('./fixtures/master-epoch.mjs')).seedActiveEpoch(dbM, ALL_COMPANY);
   await C.advanceCutoverPhase(dbP, { to: 'company_owner', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: h } });
   await acks(ALL_COMPANY, 'company_owner');
