@@ -191,15 +191,20 @@ await ta('[6] 影の取込は実行ボタンを押さない (押すのは画面�
   assert.ok(!/(?<!\r)\n/.test(bat.toString('latin1')), 'CRLF');
   const b = bat.toString('latin1');
   const iNyuka = b.indexOf('node auto-nyuka-csv.js'), iImp = b.indexOf('node C:\\Users\\bfaith\\bfaith-portal\\scripts\\logizard-import\\lz-daily-import.mjs >> logs\\scheduled.log 2>&1'), iShohin = b.indexOf('node auto-shohin-csv.js --once-per-day');
-  assert.ok(iNyuka > 0 && iImp > iNyuka && iShohin > iImp, '入荷受付 → 取込 (影) → 商品マスタ の順');
+  assert.ok(iNyuka > 0 && iImp > iNyuka && iShohin > iImp, '入荷受付 → 取込 (毎晩の本番 / 影) → 商品マスタ の順');
   // 影のステップの直前に DATA_DIR (夜の定時のタスクは DATA_DIR を持たない = 2026-09-29 00:21 に「DATA_DIR が無い」で失敗)
-  const iData = b.indexOf('set "DATA_DIR=C:\\Users\\bfaith\\bfaith-portal\\data"'), iEcho = b.indexOf('==== lz-daily-import (shadow');
-  assert.ok(iEcho > 0 && iData > iEcho && iData < iImp, 'DATA_DIR は影のステップの直前');
+  const iData = b.indexOf('set "DATA_DIR=C:\\Users\\bfaith\\bfaith-portal\\data"'), iEcho = b.indexOf('==== lz-daily-import (nightly import at 00:20');
+  assert.ok(iEcho > 0 && iData > iEcho && iData < iImp, 'DATA_DIR は取込のステップの直前');
   assert.ok(!/set "RC=/.test(b.slice(iImp, iShohin)), '取込の終了コードで bat の RC を変えない');
   assert.match(b.slice(b.lastIndexOf('exit /b')), /exit \/b %RC%/);
   const { JOBS_REGISTRY, validateRegistry } = await import('../config/jobs-registry.mjs');
-  const job = JOBS_REGISTRY.find((e) => e.id === RUN.JOB_SHADOW), retire = JOBS_REGISTRY.find((e) => e.id === 'lz-daily-import-shadow-retire');
-  assert.deepEqual([job.type, job.anchor_hour_jst, job.anchor_minute_jst, retire.type, validateRegistry([job, retire])], ['scheduled_job', 0, 20, 'temporary_asset', []]);
+  // 切替の PR: 本番 lz-daily-import (P2・00:20・01:00 までに気づく) を台帳に・影は RETIRED_JOBS へ・影の撤去の一時物は消した・戻しの版 lz-gas-rollback
+  const { RETIRED_JOBS } = await import('../config/jobs-registry.mjs');
+  const job = JOBS_REGISTRY.find((e) => e.id === RUN.JOB_NIGHTLY);
+  assert.deepEqual([job.type, job.importance, job.anchor_hour_jst, job.anchor_minute_jst, Math.round(job.grace_hours * 60), validateRegistry([job])], ['scheduled_job', 'P2', 0, 20, 40, []]);
+  assert.deepEqual([JOBS_REGISTRY.some((e) => e.id === RUN.JOB_SHADOW || e.id === 'lz-daily-import-shadow-retire'), RETIRED_JOBS.some((e) => e.id === RUN.JOB_SHADOW)], [false, true]);
+  const rb = JOBS_REGISTRY.find((e) => e.id === 'lz-gas-rollback');
+  assert.deepEqual([rb.type, validateRegistry([rb]), rb.rollback.tag, rb.rollback.pc], ['temporary_asset', [], 'lz-gas-rollback-20260930', 'streamdeck']);
   const m = JSON.parse(fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'manifest.json'), 'utf8'));
   for (const pc of ['minipc', 'streamdeck']) assert.ok(m.pcs[pc].includes('lz-import-screen.js'), pc);
 });

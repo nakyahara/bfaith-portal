@@ -1,13 +1,14 @@
 /**
  * lz-daily-import.mjs — ロジザードの毎日の商品マスタの取込 (miniPC・00:20 の定時 `Logizard-NyukaCSV` の 1 ステップ。マスタ正本切替 ③c-1b-2a)
  *
- * **今は「影の取込」だけ** (実行ボタンは押さない。本番の取込は ③c-1b-2b):
+ * **LZ_DAILY_IMPORT=on (切替の後) = 毎晩の本番** (下の env・lz-nightly.mjs・台帳 lz-daily-import)。
+ * on でないとき = 「影の取込」(実行ボタンは押さない・LZ_DAILY_IMPORT_SHADOW=on のときだけ・台帳の影は切替で退役):
  *   1. 00:15〜00:55 (JST) の回だけ動く。その日にもう影の取込ができていれば何もしない (08:40 / 11:45 の回)
  *   2. 対象 = 前の日の lz-daily の正式な証跡 1 つだけ (complete・CSV の sha256 と行数が合う・期限の内。合否は記録する)
  *   3. ポータルの取込の状態と、この PC の初期化の印を照合 (契約 v3 H5)
  *   4. miniPC のロジザードのセッションの鍵 → 共通アカウントでログイン → **直前の書き出し** (pre.csv) →
  *      CSV の全部の商品 ID が直前の書き出しにあり・削除されていないか → インポート画面で**プレビューまで**
- *   5. 記録 (DATA_DIR/lz-import/<日付>/<実行 ID>/pre.csv・shadow.json) と ping (台帳 lz-daily-import-shadow)
+ *   5. 記録 (DATA_DIR/lz-import/<日付>/<実行 ID>/pre.csv・shadow.json) と ping (影の項目 lz-daily-import-shadow = 切替で RETIRED_JOBS・送っても黙って受ける)
  *
  * 使い方: node scripts/logizard-import/lz-daily-import.mjs [--force-window [--as-of YYYY-MM-DD]] [--data-dir D]
  *   --force-window = 時刻の窓の外でも動く (手の試し。ping は打たない・その日の「済み」の印も書かない)。
