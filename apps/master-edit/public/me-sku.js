@@ -371,6 +371,7 @@
       + (j.derived && j.derived.length ? '<div class="sec2">構成品から計算し直した値</div><ul>' + li(j.derived.map(function (d) { var hf = d.col === 'handling'; return esc(d.code) + ' の ' + esc(COL[d.col] || d.col) + ': ' + esc(show(hf ? HANDLING[d.from] || d.from : d.from)) + ' → ' + esc(show(hf ? HANDLING[d.to] || d.to : d.to)); })) + '</ul>' : '')
       + (j.ne_steps && j.ne_steps.length ? '<div class="sec2">NE でやること</div><ul>' + li(j.ne_steps.map(esc)) + '</ul>' : '')
       + (j.warnings && j.warnings.length ? '<div class="sec2">気をつけること</div><ul>' + li(j.warnings.map(esc)) + '</ul>' : '')
+      + '<div class="sec2">続けて直すときは「表示し直す」を押してください (保存の後は入力の場所を閉じています)</div>'
       + '<button type="button" class="btn soft sm" id="reload">表示し直す</button></div>';
     $('#reload').addEventListener('click', function () { location.reload(); });
     $('#reload').focus();
@@ -398,6 +399,21 @@
     }
     return reopen;
   }
+  /** 今の値を基準にし直す (変わった項目が無かった保存の後) */
+  function rebase() { tracked().forEach(function (el) { initial.set(el, valueOf(el)); }); }
+  /**
+   * 保存が通った後: 画面の値と編集の印はもう古い = 入力の場所を閉じる (inert + disabled)。続けて直すときは「表示し直す」(#1589 Codex R3 M1)。
+   * 閉じないと、保存の後に打った値は未保存に数えず (saved)、保存も離れるときの確認も効かないまま黙って消える
+   */
+  function lockAfterSave() {
+    var main = form.firstElementChild;
+    [main, $('.handling-top'), $('#sku-sticky')].forEach(function (el) {
+      if (!el) return;
+      el.setAttribute('inert', '');
+      $$('input, select, textarea, button', el).forEach(function (x) { x.disabled = true; });
+    });
+    ['#reason', '#revert'].forEach(function (s) { var x = $(s); if (x) x.disabled = true; });
+  }
   function doSave() {
     if (!saveBtn || saveBtn.disabled || busy) return;
     // JAN の欄に打ったままなら、先に札にする (Ctrl+S は欄を離れない = blur が来ない)。札にできなければ保存しない (#1589 Codex R2 M1)
@@ -413,8 +429,9 @@
       .then(function (x) {
         busy = false;
         if (x.r.ok && x.j.ok) {
-          if (x.j.no_change) { requestId = uuid(); msg(''); showResult(x.j); update(); return; }
-          saved = true; msg(''); showResult(x.j); update(); ME.toast('保存しました');
+          // 変わった項目が無い (5 と 5.0 など) = 今の値を「開いたときの値」にそろえる = 未保存を消す (#1589 Codex R3 L3)
+          if (x.j.no_change) { requestId = uuid(); rebase(); msg(''); showResult(x.j); update(); return; }
+          saved = true; msg(''); lockAfterSave(); showResult(x.j); update(); ME.toast('保存しました');
           return;
         }
         msg('', 'err');

@@ -8,7 +8,7 @@
  */
 import { MASTER_OWNERSHIP } from '../../config/master-ownership.mjs';
 import { normSku } from '../../lib/sku-norm.js';
-import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv } from '../../lib/master-write.mjs';
+import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
 import { latestRun } from '../master-decisions/decide.mjs';
@@ -288,8 +288,8 @@ async function readFieldLocks(db, cur) {
   return { fields, regExports, taxParentCodes };
 }
 
-/** 例外原価の出どころ (lib/master-write.mjs の OVERRIDE_SOURCES と同じ。セットの合計で上書きしない原価) */
-const OVERRIDE_COST_SOURCES = new Set(['manual', 'override_zero']);
+/** 例外原価の出どころ = lib/master-write.mjs の OVERRIDE_SOURCES そのもの (写さない = サーバーの判定とずれない。#1589 Codex R3 L4) */
+const OVERRIDE_COST_SOURCES = OVERRIDE_SOURCES;
 /**
  * 先の日付から始まる原価があって、今日からの原価を入れられない (保存すると 409。#1589 Codex R2 M2)。画面は該当する原価の欄だけを理由つきで閉じる。
  *   own     = この SKU の続いている原価 (valid_to が空) が今日より先に始まる → 単品の原価・セットの例外原価は 409 cost_future (checkCostToday)

@@ -13,6 +13,9 @@
  *   8 JAN の欄に打ったまま (Enter を押さずに) ほかの欄も変えて Ctrl+S = JAN も保存する / 形の違う JAN なら保存しない (#1589 Codex R2 M1)
  *   9 画面を開いた後に登録をやめた (cancelled_sku) = 開き直しが要る (欄を触っても保存のボタンが戻らない)・やめた商品は初めから見るだけ (M3)
  *  10 先の日付の原価がある = 該当する原価の欄だけ閉じる (ほかの欄は保存できる) (M2)
+ *  11 保存が通った後は入力の場所を閉じ「表示し直す」へ (保存の後に打てない = 黙って消える値を作らない)・離れても聞かない (#1589 Codex R3 M1)
+ *  12 変わった項目が無い保存 (5 と 5.0) の後は未保存が残らない (R3 L3)
+ *  13 登録をやめた商品はカードの操作 (もう一度作る・結ぶ) も出さない (R3 M2・画面だけ。API の拒否は master からある穴 = 別 PR)
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -316,6 +319,48 @@ await ta('[10] 先の日付の原価 (使っているセット) = 原価の欄�
     await pg.query("delete from core.sku_costs where valid_from = $1::date and sku_id = (select sku_id from core.skus where code = 'set001')", [fut]);
     await pg.query("update core.sku_costs set valid_to = null where valid_to = $1::date - 1 and sku_id = (select sku_id from core.skus where code = 'set001')", [fut]);
   }
+});
+
+await ta('[11] 保存が通った後は入力の場所を閉じる (打てない・Ctrl+S でも何もしない)・フォーカスは「表示し直す」・離れても聞かない', async (p) => {
+  await p.goto(B + '/sku/s003');
+  await p.fill('#f-reorder_months', '6');
+  await p.click('#save');
+  await p.waitForSelector('.result.ok');
+  assert.equal(await active(p), 'reload', '「表示し直す」へ');
+  for (const sel of ['#f-name', '#f-reorder_months', '#jan-in', '#reason', '.handling-top .seg button']) assert.equal(await p.locator(sel).first().isDisabled(), true, `${sel} は閉じる`);
+  assert.equal(await p.evaluate(() => document.getElementById('f').firstElementChild.hasAttribute('inert')), true);
+  await p.keyboard.press('Control+s');
+  await p.waitForTimeout(200);
+  assert.equal((await row('s003')).months, 6);
+  await Promise.all([p.waitForNavigation(), p.click('.rail a[aria-label="つかいかた"]')]);
+  assert.match(p.url(), /manual$/);
+});
+
+await ta('[12] 変わった項目が無い保存 (6 → 6.0) の後は未保存が残らない (保存のボタン・離れるときの確認も)', async (p) => {
+  await p.goto(B + '/sku/s003');
+  await p.fill('#f-reorder_months', '6.0');
+  assert.equal(await dirty(p), 1);
+  await p.click('#save');
+  await p.waitForSelector('.result');
+  assert.match(await p.textContent('.result'), /変わった項目がありません/);
+  assert.equal(await dirty(p), 0);
+  assert.equal(await p.isDisabled('#save'), true);
+  await Promise.all([p.waitForNavigation(), p.click('.rail a[aria-label="つかいかた"]')]);
+});
+
+await ta('[13] 登録をやめた商品は、カードの操作 (もう一度作る) も出さない', async (p) => {
+  const MR = await import('../lib/master-register.mjs');
+  await as('master_edit', () => MR.registerNewSku(db, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: 'ui-card-1',
+    values: { name: 'カードの試験', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001' }, card: { create: true } },
+  { ownership: ALL, open: true, shippingRates: RATES }));
+  await p.goto(B + '/sku/ui-card-1');
+  assert.equal(await p.locator('#card-retry').count(), 1, '下書きのうちは出す (名簿の人)');
+  const id = (await pg.query("select sku_id::text as id from core.skus where code = 'ui-card-1'")).rows[0].id;
+  await pg.query('select ops.transition_sku_registration($1, $2, $3, $4, $5)', [id, 'cancelled', 'human', 'naka@test', '試験でやめた']);
+  await p.goto(B + '/sku/ui-card-1');
+  assert.equal(await p.locator('#cancelled-band').count(), 1);
+  assert.equal(await p.locator('#card-retry').count(), 0, 'やめた商品にカードの操作を出さない');
+  assert.equal(await p.locator('#card-link').count(), 0);
 });
 
 // 拡大 125% / 150% = 画面の CSS の幅が 1/1.25・1/1.5 になる。MASTER_EDIT_UI_SHOTS=フォルダ を付けると、そのフォルダに写しを残す (目で見る用)

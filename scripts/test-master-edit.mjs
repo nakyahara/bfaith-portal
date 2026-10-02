@@ -1554,6 +1554,12 @@ await ta('[15] 先の日付の原価: 画面が閉じる原価の欄 = サーバ
     // 先の原価の無い単品 (s002) は原価の欄が開いている (閉じすぎない)
     r = await call('GET', '/sku/s002');
     assert.ok(r.text.includes('id="cost-jpy"') && !r.text.includes('id="cost-future"'));
+    // 使っているセットの先の原価が例外原価 (manual・override_zero) なら、セットの合計は計算し直さない = 単品の原価は閉じない (サーバーの OVERRIDE_SOURCES と同じ)
+    for (const src of ['manual', 'override_zero']) {
+      await q("update core.sku_costs set cost_source = $2 where valid_from = $1::date and sku_id = (select sku_id from core.skus where code = 'set006')", [FUT, src]);
+      r = await call('GET', '/sku/s006');
+      assert.ok(r.text.includes('id="cost-jpy"') && !r.text.includes('id="cost-future"'), `${src} の先の原価では閉じない`);
+    }
   } finally {
     await q("delete from core.sku_costs where valid_from = $1::date and sku_id = (select sku_id from core.skus where code = 'set006')", [FUT]);
     await q("update core.sku_costs set valid_to = null where valid_to = $1::date - 1 and sku_id = (select sku_id from core.skus where code = 'set006')", [FUT]);
