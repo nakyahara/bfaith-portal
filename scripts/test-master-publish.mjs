@@ -40,7 +40,9 @@
  *     門の表が読めない = unknown (行が無いと同じにしない) / 行が無く全部 load = 今の世代・作り直し・作り直しの世代がそろうときだけ流す /
  *     (R4 Medium 1) 作り直しが今の世代を使っていない (写しの後に作り直しが失敗した) = 全部 load でも unknown・確かめが通れば全部 load でも safe を書く /
  *     (R5 Medium) 確かめが通らなかった (落ちた・exit 1) 朝 = 確かめた safe の行が無ければ unknown を残し (再試行・手の更新も止まる)・daily-sync もこの回を止める /
- *     確かめた safe の行が今も合う遅れの朝 = 流す・broken は unknown に替えない
+ *     確かめた safe の行が今も合う遅れの朝 = 流す・broken は unknown に替えない /
+ *     (R6 Medium) 写しが取れない・NE と作り直しは通った朝 (前の世代で新しい作り直し) = 古い表が作り直しの世代と同じなら safe を書く (exit 1 のまま)・daily-sync・再試行・手の更新は流す /
+ *     (R6 Low) warehouse.db を開けない・門を書けない (SQLITE_BUSY) 回 = 止めの印 (DATA_DIR のファイル) を残す = 故障が直っても通った確かめまで止まる
  *  25 記録の後に足した列 (記録した持ち主に無い) = load として足す・知らない列 = 壊れ (M-4)
  *  27 持ち主の正を 1 つに (0053・Codex #1564 R2 High 3): 0001〜0053 がそろって入る / 切替の段階を company_owner に進める前提 = epoch が active (差し込み口) /
  *     段階の owner_hash = active (⑤-1 の段階の行の trigger) / 画面の保存の門 (⑤-1 の ops.begin_master_write) = active (記録に無い列 = load)
@@ -1382,14 +1384,21 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.equal(v.code, 4, v.last);
   assert.match(v.last, /書けない: 門 門を書けない/);
   assert.equal(row().state, 'safe');   // 前の safe が残った
-  assert.deepEqual([gate().state, gate().open, gate().reason], ['unknown', false, 'safe_row_stale:applied_changed_now']);
+  //   止めの印 (DATA_DIR のファイル。#1564 Codex R6 Low) が先に止める (broken)・印が無くても、行は今の古い表から作り直したハッシュで使わない
+  assert.deepEqual([gate().state, gate().open, gate().source], ['broken', false, 'stop_mark']);
+  assert.match(gate().reason, /^stop_mark: applied_mismatch.*門を書けない \(試験\)/);
+  assert.ok(fs.existsSync(path.join(tmp, G.GATE_STOP_MARK)));
+  assert.deepEqual([G.gateOfDb(db).state, G.gateOfDb(db).reason], ['unknown', 'safe_row_stale:applied_changed_now']);
   ran.length = 0; calls.length = 0;
   R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
   assert.deepEqual(ran, ['マスタ照合', 'CompanyDB見張り']);
   await assert.rejects(P.runPmlFbaRefresh(pml(gate)), (e) => e.code === 'PUBLISH_BROKEN');
   assert.deepEqual(calls, []);
   db.prepare('UPDATE m_products SET 原価 = ? WHERE 商品コード = ?').run(origCost2, 's-ne');
-  assert.deepEqual([gate().state, gate().open], ['safe', true]);   // 戻した = 確かめたときと同じ
+  assert.equal(G.gateOfDb(db).open, true);   // 行は確かめたときと同じに戻った
+  assert.equal(gate().open, false);          // 止めの印は残る = 通った確かめまで止まったまま
+  assert.equal((await verify()).code, 0);
+  assert.deepEqual([gate().state, gate().open, gate().source, fs.existsSync(path.join(tmp, G.GATE_STOP_MARK))], ['safe', true, 'row', false]);   // safe を書けた = 印を消した
   // (k) 門の表はあるが読めない (SELECT が落ちる) = unknown (「行が無い」= 全部 load なら流す、と同じにしない)。確かめは通っても unreadable を記録
   const gateReadFails = new Proxy(db, { get(t, k) {
     if (k === 'prepare') return (sql) => { if (/FROM cdb_publish_gate WHERE id = 1/.test(sql)) throw new Error('門を読めない (試験)'); return t.prepare(sql); };
@@ -1457,11 +1466,24 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.equal(G.gateAfterVerify({ apply: { success: true, exitCode: 0 }, gate: implicitSafe }).broken, false);
   assert.equal(G.gateAfterVerify({ apply: { success: false, exitCode: 1 }, gate: { open: true, state: 'safe', source: 'row', reason: 'verified' } }).broken, false);
   assert.deepEqual(G.gateAfterVerify({ apply: { success: false, exitCode: 4 }, gate: { open: true, state: 'safe', source: 'row', reason: 'verified' } }).state, 'broken');
-  //     決めた失敗 (今朝の写し・作り直しが別の回 = 確かめられない) も、確かめた safe の行が無ければ unknown を残す
+  //     遅れだけの決めた失敗 (今朝の写し・作り直しが別の回) で古い表が作り直しの世代と同じ = その作り直しの safe を書く (exit 1 のまま。#1564 Codex R6 Medium)
   db.prepare('DELETE FROM cdb_publish_gate').run();
   vc = await verify({ env: { DATA_DIR: tmp, COMPANY_DB_WATCH_URL: 'postgres://test', DAILY_SYNC_RUN_ID: 'ds_other_run' } });
   assert.equal(vc.code, 1, vc.last);
-  assert.deepEqual([row().state, gate().open], ['unknown', false]);
+  assert.deepEqual([row().state, row().build_id, gate().open, gate().source], ['safe', snap().build.build_id, true, 'row']);
+  assert.match(row().reason, /^lag_verified: /);
+  //     遅れでない決めた失敗 (作り直しが使った世代の持ち主が読めない) = 確かめた safe の行が無ければ unknown を残す
+  db.prepare('DELETE FROM cdb_publish_gate').run();
+  const bpNo = snap().build.cdb_publish_generation_no;
+  const ownSaved = db.prepare('SELECT ownership FROM cdb_publish_generations WHERE generation_no = ?').get(bpNo).ownership;
+  db.prepare("UPDATE cdb_publish_generations SET ownership = '{壊れた' WHERE generation_no = ?").run(bpNo);
+  try {
+    vc = await verify();
+    assert.equal(vc.code, 1, vc.last);
+    assert.match(vc.last, /generation_ownership_unreadable/);
+    assert.equal(row().state, 'unknown');
+  } finally { db.prepare('UPDATE cdb_publish_generations SET ownership = ? WHERE generation_no = ?').run(ownSaved, bpNo); }
+  assert.equal(gate().open, false);
   //     broken は unknown に替えない (戻せるのは通った確かめだけ)
   db.prepare('DELETE FROM cdb_publish_gate').run();
   G.writePublishGate(db, { state: 'broken', reason: 'test', checkedAt: new Date().toISOString() });
@@ -1482,6 +1504,73 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
   db.prepare('DELETE FROM cdb_publish_gate').run();
   assert.equal((await rebuild()).ok, true);
+  // (p) 写しが取れない朝 (Company DB に届かない)・NE と作り直しは通った (前の世代で新しい作り直し B1)・確かめは exit 1 (fetch_not_verified) =
+  //     古い表は B1 の世代と同じ = B1 の safe を書く = daily-sync・再試行・商品管理リストの手の更新は流す (今の全部 load の本番のふつうの朝。#1564 Codex R6 Medium)
+  assert.equal((await verify()).code, 0);   // 前の朝 = B0 の safe
+  const b0 = row().build_id;
+  process.env.DAILY_SYNC_RUN_ID = 'ds_day2';
+  try {
+    const env2 = { DATA_DIR: tmp, COMPANY_DB_WATCH_URL: 'postgres://test', DAILY_SYNC_RUN_ID: 'ds_day2' };
+    const genBefore = pointer();
+    const f2 = await quietly(() => F.cli(['--daily'], deps({ env: env2, connectFor: () => async () => { throw new Error('Company DB に届かない (試験)'); } })));
+    assert.equal(f2.code, 1, f2.last);
+    assert.equal(pointer(), genBefore);   // 写しの印は動かない
+    db.prepare("UPDATE raw_ne_products SET 商品名 = 商品名 WHERE 商品コード = 's-ne'").run(); FX.markComplete(db, readNeRawRev);   // NE は通った (取得の印が新しい)
+    assert.equal((await rebuild()).ok, true);
+    const b1 = snap().build;
+    assert.deepEqual([b1.build_id !== b0, b1.cdb_publish_generation_no, b1.daily_sync_run_id], [true, genBefore, 'ds_day2']);   // 前の世代で新しい作り直し
+    assert.deepEqual([G.readPublishGate({ dataDir: tmp }).open, G.readPublishGate({ dataDir: tmp }).reason], [true, 'all_load_safe_row_stale:build_changed']);
+    pings.length = 0;
+    const v2 = await quietly(() => F.cli(['--verify-apply', '--daily'], deps({ env: env2 })));
+    assert.equal(v2.code, 1, v2.last);   // 確かめは通っていない (今朝の写しが無い) = exit 1・fail の ping のまま
+    assert.deepEqual(pings, ['fail']);
+    assert.match(v2.last, /fetch_not_verified.*門 safe \(後の工程は流す\)/);
+    assert.deepEqual([row().state, row().build_id, row().reason], ['safe', b1.build_id, 'lag_verified: fetch_not_verified']);
+    const g2 = G.readPublishGate({ dataDir: tmp });
+    assert.deepEqual([g2.state, g2.open, g2.source], ['safe', true, 'row']);
+    assert.equal(G.gateAfterVerify({ apply: { success: false, exitCode: v2.code }, gate: g2 }).broken, false);   // daily-sync は流す
+    ran.length = 0; calls.length = 0;
+    R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: G.readPublishGate({ dataDir: tmp }) });
+    assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+    assert.equal((await P.runPmlFbaRefresh(pml(gate))).pml_run_id, 'r');
+  } finally { process.env.DAILY_SYNC_RUN_ID = 'ds_test_publish'; }
+  // (q) 止めの印 (#1564 Codex R6 Low): warehouse.db を開けない最初の朝 = 印を残す → 開けるようになっても (行が無く全部 load の暗黙の safe でも) 止まったまま →
+  //     通った確かめで消える / 門の書き込みが SQLITE_BUSY (落ちた回の unknown も書けない) → 故障が直っても止まったまま → 通った確かめで消える
+  const stopFile = path.join(tmp, G.GATE_STOP_MARK);
+  const busyErr = () => Object.assign(new Error('database is locked (試験)'), { code: 'SQLITE_BUSY' });
+  const stopped = async () => {
+    assert.deepEqual([gate().state, gate().open, gate().source], ['unknown', false, 'stop_mark']);
+    assert.equal(G.readPublishGate({ dataDir: tmp }).open, false);
+    assert.equal(G.gateAfterVerify({ apply: { success: true, exitCode: 0 }, gate: G.readPublishGate({ dataDir: tmp }) }).broken, true);
+    ran.length = 0; calls.length = 0;
+    R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: G.readPublishGate({ dataDir: tmp }) });
+    assert.deepEqual(ran, ['マスタ照合', 'CompanyDB見張り']);
+    await assert.rejects(P.runPmlFbaRefresh(pml(gate)), (e) => e.code === 'PUBLISH_BROKEN');
+    assert.deepEqual(calls, []);
+  };
+  db.prepare('DELETE FROM cdb_publish_gate').run();
+  assert.equal((await fetchGen(MASTER_OWNERSHIP)).state, 'verified');   // 今朝の写し (この回) → 作り直し = 後で確かめが通る朝
+  assert.equal((await rebuild()).ok, true);
+  assert.deepEqual([gate().source, gate().open, fs.existsSync(stopFile)], ['implicit', true, false]);   // 前提: 行が無く全部 load と分かる・印なし
+  vc = await verify({ openSqlite: async () => { throw busyErr(); } });
+  assert.equal(vc.code, 1, vc.last);
+  assert.match(vc.last, /database is locked \(試験\) \(止めの印を残した\)/);
+  assert.ok(fs.existsSync(stopFile));
+  await stopped();   // 開けるようになった後も止まったまま
+  assert.equal((await verify()).code, 0);
+  assert.deepEqual([gate().open, gate().source, fs.existsSync(stopFile)], [true, 'row', false]);   // 通った確かめ = 印を消した
+  db.prepare('DELETE FROM cdb_publish_gate').run();
+  const busy = new Proxy(db, { get(t, k) {
+    if (k === 'prepare') return (sql) => { if (/INSERT INTO cdb_publish_gate/.test(sql)) throw busyErr(); return t.prepare(sql); };
+    const v = t[k]; return typeof v === 'function' ? v.bind(t) : v;
+  } });
+  vc = await verify({ openSqlite: async () => busy, verify: async () => { throw new Error('落ちた (試験 3)'); } });
+  assert.match(vc.last, /落ちた \(試験 3\) \(門を書けない: database is locked \(試験\)・止めの印を残した\)/);
+  assert.equal(row(), null);   // 門には何も書けていない
+  await stopped();             // 故障が直った (db を普通に読む) 後も止まったまま
+  assert.equal((await verify()).code, 0);
+  assert.deepEqual([gate().open, gate().source, fs.existsSync(stopFile)], [true, 'row', false]);
+  db.prepare('DELETE FROM cdb_publish_gate').run();
   // (h) 読めない (warehouse.db が無い・壊れた) = unknown = 止める
   assert.deepEqual([G.readPublishGate({ dataDir: path.join(tmp, 'no-such-dir') }).state, G.readPublishGate({ dataDir: path.join(tmp, 'no-such-dir') }).open], ['unknown', false]);
   assert.equal(G.readPublishGate({ dataDir: null }).open, false);

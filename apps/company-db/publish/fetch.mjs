@@ -41,7 +41,7 @@ import {
 } from '../../warehouse/master-publish.js';
 import { latestBuild, publishOfBuild } from '../../warehouse/master-material.js';
 import { readOwnershipState, latestLoadCommit, ALL_LOAD } from '../load/ownership-state.mjs';
-import { readGateRow, writePublishGate, validSafeRow, markGateUnknown } from '../../warehouse/publish-gate.js';
+import { readGateRow, writePublishGate, validSafeRow, markGateUnknown, writeStopMark, clearStopMark } from '../../warehouse/publish-gate.js';
 
 export const EVIDENCE_NAME = 'master-publish';
 export const JOB_ID = 'cdb-master-publish';   // 台帳 (config/jobs-registry.mjs)
@@ -483,22 +483,38 @@ export async function runVerifyApply({ sqlite, dataDir, ownership: configured = 
   //   門が読めない (表はあるが SELECT が落ちる) = 「行が無い」と同じにしない (#1564 Codex R3 High 2): 通った = safe を書き直す・それ以外 = unknown を書く
   //   通らなかった (遅れ・確かめられない) = 確かめた safe の行が今も合えばそのまま (遅れの朝は流す)・broken はそのまま・それ以外 = unknown を書く
   //   (行が無く全部 load の暗黙の safe で、自動再試行・手の更新を流さない。#1564 Codex R5 Medium)
+  //   ただし遅れだけ (今朝の写しが取れない・作り直しが前の世代・写しだけ新しい世代) で、古い表が作り直しの世代と合う
+  //   (作り直しが使った世代を読めた・読み直した値が同じ・ハッシュ = 作り直しの記録・持ち主 = 世代) = その作り直しの safe を書く (後の工程は流す。
+  //   確かめは exit 1・fail の ping のまま)。= 「写しが取れない・NE と作り直しは通った」ふつうの朝に止めない (#1564 Codex R6 Medium)。broken の行は替えない
   let gateBefore = null, gateReadError = null;
   try { gateBefore = readGateRow(sqlite); } catch (e) { gateReadError = String(e && e.message).slice(0, 200); }
-  const gateNext = broken ? 'broken' : state === 'verified' ? 'safe'
+  const lagOnlyMatch = !broken && state === 'failed' && appliedChecked && applied.ok && bp.applied_hash === applied.applied_hash
+    && !!publication.generation && bp.ownership_hash === publication.generation.ownership_hash && problems.every((p) => LAG_PROBLEMS.includes(p))
+    && !(gateBefore && gateBefore.state === 'broken');
+  const gateNext = broken ? 'broken' : state === 'verified' || lagOnlyMatch ? 'safe'
     : gateReadError ? 'unknown' : gateBefore && gateBefore.state === 'broken' ? null : validSafeRow(sqlite) ? null : 'unknown';
   let gateError = null;
   if (gateNext) {
     try {
-      writePublishGate(sqlite, { state: gateNext, reason: gateNext === 'safe' ? 'verified' : problems.join('・') || (gateReadError ? 'gate_unreadable' : null), buildId: build ? build.build_id : null,
+      writePublishGate(sqlite, { state: gateNext, reason: gateNext === 'safe' ? (lagOnlyMatch ? `lag_verified: ${problems.join('・')}` : 'verified') : problems.join('・') || (gateReadError ? 'gate_unreadable' : null), buildId: build ? build.build_id : null,
         generationNo: bp ? bp.generation_no : null, appliedHash: gateNext === 'safe' ? applied.applied_hash : null, ownershipHash: bp ? bp.ownership_hash : null, checkedAt: now.toISOString(), now });
     } catch (e) { gateError = String(e && e.message).slice(0, 200); }
   }
   if (gateError) problems.push('gate_write_failed');
+  // 止めの印 (DATA_DIR のファイル。#1564 Codex R6 Low): 止める値 (broken / unknown) を門に書けなかった = 印を残す (故障が直った後も止まったまま) /
+  //   safe を書けた = 印を消す (消せるのはここだけ)。safe を書けなかった = 印はそのまま (前の値のまま)
+  let stopMark = null;
+  if (gateNext && gateNext !== 'safe' && gateError) {
+    stopMark = writeStopMark({ db: sqlite, dataDir }, { state: gateNext, reason: `${problems.join('・')} / ${gateError}`, now });
+    if (!stopMark.ok) problems.push('stop_mark_write_failed');
+  } else if (gateNext === 'safe' && !gateError) {
+    stopMark = clearStopMark({ db: sqlite, dataDir });
+    if (!stopMark.ok) problems.push('stop_mark_clear_failed');
+  }
   const stateOut = state === 'verified' && gateError ? 'failed' : state;
   const apply = { state: stateOut, broken, problems, checked_at: now.toISOString(),
     gate: { before: gateBefore ? gateBefore.state : gateReadError ? 'unreadable' : null, after: gateError ? (gateBefore ? gateBefore.state : gateReadError ? 'unreadable' : null) : (gateNext ?? (gateBefore ? gateBefore.state : null)),
-      error: gateError, read_error: gateReadError }, epoch: epochKind, configured: ownershipHash(configured), build_id: build ? build.build_id : null, generation_no: bp ? bp.generation_no : null,
+      error: gateError, read_error: gateReadError, lag_safe: lagOnlyMatch && gateNext === 'safe' && !gateError, stop_mark: stopMark }, epoch: epochKind, configured: ownershipHash(configured), build_id: build ? build.build_id : null, generation_no: bp ? bp.generation_no : null,
     current_generation_no: current.generation ? current.generation.generation_no : null, lag: !broken && problems.some((p) => LAG_PROBLEMS.includes(p)),
     generation_id: bp ? bp.generation_id : null, applied_hash: applied.applied_hash, build_applied_hash: bp ? bp.applied_hash : null, counts: applied.counts, samples: applied.problems.slice(0, 10),
     // NE にしか無い SKU (Company DB に無い = 写していない = NE の値のまま)。止めない・ping も fail にしない (朝の要約に出す)
@@ -524,7 +540,7 @@ export async function runVerifyApply({ sqlite, dataDir, ownership: configured = 
       + (mix ? ` / NE にしか無い構成品を持つセット ${mix} 件は C と NE の値が混ざる (${applied.mixed_set_codes.join(', ')})` : '')
       + (epochKind === 'prepared' ? ' / prepared の持ち主の世代が入った = master-ownership-epoch.mjs activate で active にできる' : '')
     : broken ? `❌ Company DB の写しの反映: 古い表が作り直しの世代 ${bp.generation_no} と違う = 後の工程を止める (${problems.join('・')})`
-      : `❌ Company DB の写しの反映: 確かめられない (${problems.join('・')})${apply.lag ? ` = 遅れ (m_products は世代 ${bp ? bp.generation_no : '?'} のまま・今の世代 ${apply.current_generation_no ?? '?'} は翌朝の作り直しで入る。後の工程は止めない)` : ''}`;
+      : `❌ Company DB の写しの反映: 確かめられない (${problems.join('・')})${apply.lag ? ` = 遅れ (m_products は世代 ${bp ? bp.generation_no : '?'} のまま・今の世代 ${apply.current_generation_no ?? '?'} は翌朝の作り直しで入る。後の工程は止めない)` : ''}${apply.gate.lag_safe ? ' / 古い表は作り直しの世代と同じ = 門 safe (後の工程は流す)' : ''}`;
   return { state: stateFinal, broken, problems, evidence, line: evidenceError || gateError ? `${line} / 書けない: ${[gateError && `門 ${gateError}`, evidenceError && `証跡 ${evidenceError}`].filter(Boolean).join('・')}` : line };
 }
 
@@ -574,13 +590,19 @@ export async function cli(argv, { env = process.env, now = new Date(), run = run
     })());
     const url = (env.COMPANY_DB_WATCH_URL || '').trim();
     if (a.verifyApply) {
-      const sqlite = await open();
+      let sqlite;
+      try { sqlite = await open(); }
+      catch (e) {
+        // warehouse.db を開けない = 門に書けない = 止めの印を残す (自動再試行・手の更新も止まる。通った確かめまで消えない。#1564 Codex R6 Low)
+        const mk = writeStopMark({ dataDir }, { state: 'unknown', reason: `verify_apply_open_failed: ${String(e && e.message).slice(0, 200)}`, now });
+        throw Object.assign(e, { message: `${e && e.message}${mk.ok ? ' (止めの印を残した)' : ` (止めの印も書けない: ${mk.error})`}` });
+      }
       let r;
       try { r = await verify({ sqlite, dataDir, ownership, now, syncRunId: env.DAILY_SYNC_RUN_ID || null, write: w }); }
       catch (e) {
         // 決める前に落ちた = 門を unknown に (確かめた safe の行が今も合う・broken ならそのまま)。自動再試行・手の更新も止まる (#1564 Codex R5 Medium)
-        const m = markGateUnknown(sqlite, { reason: `verify_apply_crashed: ${String(e && e.message).slice(0, 200)}`, now });
-        throw Object.assign(e, { message: `${e && e.message}${m.wrote ? ' (門 = unknown)' : m.kept ? ` (門 = ${m.kept} のまま)` : m.error ? ` (門を書けない: ${m.error})` : ''}` });
+        const m = markGateUnknown(sqlite, { reason: `verify_apply_crashed: ${String(e && e.message).slice(0, 200)}`, now, dataDir });
+        throw Object.assign(e, { message: `${e && e.message}${m.wrote ? ' (門 = unknown)' : m.kept ? ` (門 = ${m.kept} のまま)` : m.error ? ` (門を書けない: ${m.error}${m.mark && m.mark.ok ? '・止めの印を残した' : ''})` : ''}` });
       }
       last = r.line; state = r.state;
       code = r.broken ? EXIT.applied_broken : r.state === 'verified' ? EXIT.ok : EXIT.error;   // 違うと分かった回は何があっても exit 4

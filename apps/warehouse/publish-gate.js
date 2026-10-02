@@ -20,6 +20,10 @@
  *   違えば (確かめた後に作り直した・書き換えられた・broken を書けなかった) その safe は使わない = 持ち主が全部 load と分かるときだけ流す・それ以外は unknown
  * 🚨 確かめが通らなかった朝 (落ちた・exit 1。#1564 Codex R5 Medium): 確かめた safe の行が今も合う (遅れの朝) ときだけ流す。それ以外は
  *   確かめの側が unknown を残す (markGateUnknown。broken はそのまま) = 自動再試行・手の更新も止まる / daily-sync もその回を止める (gateAfterVerify)
+ *   遅れだけ (今朝の写しが取れない・作り直しが前の世代) で古い表が作り直しの世代と合う朝は、確かめの側がその作り直しの safe を書く (#1564 Codex R6 Medium)
+ * 🚨 止めの印 (#1564 Codex R6 Low) = DATA_DIR の cdb-publish-gate.stop.json (warehouse.db の隣・書くときは別名で書いて名前を替える = 書きかけを残さない)。
+ *   warehouse.db を開けない・門を書けない (SQLITE_BUSY など) 回に、確かめの側が残す。印がある間は readPublishGate が止める (行・暗黙の safe より先)。
+ *   消すのは確かめの側が safe の行を書けた回だけ (= 故障が直った後も、通った確かめまで止まったまま)
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -30,6 +34,43 @@ import { ALL_LOAD } from '../company-db/load/ownership-state.mjs';
 import { TAX_RATES } from '../../lib/master-set-rules.js';
 
 export const GATE_STATES = Object.freeze(['safe', 'broken', 'unknown']);
+/** 止めの印のファイルの名前 (DATA_DIR の中・warehouse.db の隣) */
+export const GATE_STOP_MARK = 'cdb-publish-gate.stop.json';
+/** 印のファイルの場所 (dataDir か、開いた warehouse.db の場所から)。分からない = null */
+export function stopMarkPath({ db = null, dataDir = null } = {}) {
+  if (dataDir) return path.join(dataDir, GATE_STOP_MARK);
+  const name = db && typeof db.name === 'string' ? db.name : '';
+  return name && name !== ':memory:' ? path.join(path.dirname(name), GATE_STOP_MARK) : null;
+}
+/** 止めの印を書く (別名で書いてから名前を替える = 書きかけを読ませない)。@returns {{ ok: boolean, file: string|null, error: string|null }} */
+export function writeStopMark(target, { state = 'unknown', reason, now = new Date() }) {
+  const file = stopMarkPath(target);
+  if (!file) return { ok: false, file: null, error: 'no_data_dir' };
+  const tmpFile = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmpFile, JSON.stringify({ state: state === 'broken' ? 'broken' : 'unknown', reason: String(reason ?? '').slice(0, 400), at: now.toISOString() }));
+    fs.renameSync(tmpFile, file);
+    return { ok: true, file, error: null };
+  } catch (e) {
+    try { fs.rmSync(tmpFile, { force: true }); } catch { /* */ }
+    return { ok: false, file, error: String(e && e.message).slice(0, 200) };
+  }
+}
+/** 止めの印を読む。無い = null / 読めない・壊れた = 止める (unknown) */
+export function readStopMark(target) {
+  const file = stopMarkPath(target);
+  if (!file || !fs.existsSync(file)) return null;
+  try {
+    const m = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return { state: m && m.state === 'broken' ? 'broken' : 'unknown', reason: String((m && m.reason) || 'stop_mark'), at: (m && m.at) || null };
+  } catch (e) { return { state: 'unknown', reason: `stop_mark_unreadable: ${String(e && e.message).slice(0, 120)}`, at: null }; }
+}
+/** 止めの印を消す (確かめの側が safe の行を書けた回だけ)。@returns {{ ok: boolean, removed: boolean, error: string|null }} */
+export function clearStopMark(target) {
+  const file = stopMarkPath(target);
+  if (!file || !fs.existsSync(file)) return { ok: true, removed: false, error: null };
+  try { fs.rmSync(file); return { ok: true, removed: true, error: null }; } catch (e) { return { ok: false, removed: false, error: String(e && e.message).slice(0, 200) }; }
+}
 const GATE_COLS = ['state', 'reason', 'build_id', 'generation_no', 'applied_hash', 'ownership_hash', 'checked_at', 'updated_at'];
 /**
  * 門の行。表が無い・行が無い = null。🚨 表はあるが読めない (SELECT が落ちる・列が無い) = 投げる = 呼び手が unknown (止める) にする
@@ -126,15 +167,19 @@ export function validSafeRow(db) {
  *   書かない: broken の行 (戻せるのは通った確かめだけ・unknown に替えない) / 確かめた safe の行が今も合う (遅れの朝 = 前の確かめのまま流す)
  * @returns {{ wrote: boolean, kept: string|null, error: string|null }}
  */
-export function markGateUnknown(db, { reason, now = new Date() }) {
+export function markGateUnknown(db, { reason, now = new Date(), dataDir = null }) {
   let row = null;
   try { row = readGateRow(db); } catch { row = null; }
-  if (row && row.state === 'broken') return { wrote: false, kept: 'broken', error: null };
-  if (validSafeRow(db)) return { wrote: false, kept: 'safe', error: null };
+  if (row && row.state === 'broken') return { wrote: false, kept: 'broken', error: null, mark: null };
+  if (validSafeRow(db)) return { wrote: false, kept: 'safe', error: null, mark: null };
   try {
     writePublishGate(db, { state: 'unknown', reason, buildId: row?.build_id ?? null, generationNo: row?.generation_no ?? null, checkedAt: now.toISOString(), now });
-    return { wrote: true, kept: null, error: null };
-  } catch (e) { return { wrote: false, kept: null, error: String(e && e.message).slice(0, 200) }; }
+    return { wrote: true, kept: null, error: null, mark: null };
+  } catch (e) {
+    // 門を書けない (SQLITE_BUSY など) = 止めの印を残す (故障が直った後も、通った確かめまで止まったまま。#1564 Codex R6 Low)
+    const mark = writeStopMark({ db, dataDir }, { state: 'unknown', reason: `${reason} / gate_write_failed: ${String(e && e.message).slice(0, 120)}`, now });
+    return { wrote: false, kept: null, error: String(e && e.message).slice(0, 200), mark };
+  }
 }
 /**
  * daily-sync: 「写しの反映の確かめ」の後に、m_products・上書き表を読む工程を止めるか (#1564 Codex R1 H4・R2 High 2・R5 Medium)。
@@ -154,6 +199,13 @@ export function gateAfterVerify({ apply, gate }) {
  * @returns {{ state: 'safe'|'broken'|'unknown', open: boolean, broken: boolean, reason: string, checked_at: string|null, build_id: string|null, generation_no: number|null, source: string }}
  */
 export function readPublishGate({ db = null, dataDir = null } = {}) {
+  const g = gateFromDbOrDir({ db, dataDir });
+  // 止めの印 (門を書けなかった・warehouse.db を開けなかった回) = 行・暗黙の safe より先に止める (通った確かめが消すまで)
+  const mark = readStopMark({ db, dataDir });
+  if (mark) return closed(mark.state === 'broken' || g.state === 'broken' ? 'broken' : 'unknown', `stop_mark: ${mark.reason}`, { checked_at: mark.at, source: 'stop_mark' });
+  return g;
+}
+function gateFromDbOrDir({ db = null, dataDir = null } = {}) {
   if (db) { try { return gateOfDb(db); } catch (e) { return closed('unknown', `gate_unreadable: ${String(e && e.message).slice(0, 120)}`); } }
   const file = dataDir ? path.join(dataDir, 'warehouse.db') : null;
   if (!file || !fs.existsSync(file)) return closed('unknown', 'no_warehouse_db');
