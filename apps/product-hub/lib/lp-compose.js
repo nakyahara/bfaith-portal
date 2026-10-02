@@ -226,7 +226,12 @@ export function specSummary(db, kind = 'product_analysis') {
  * **文字列はすべて画面と同じ組み立て済みのものを受け取る** — `lib/prompt-templates.js` の
  * composeProductInfo / composeColorVariations が正本で、ここで組み直さない (二重に持たない)。
  */
-export function buildPacket({ draft, productInfo, colorVariations, images = [], spec }) {
+/**
+ * packet に入る商品画像 (空の ID・重複を除いた最大 MAX_IMAGES 枚)。
+ * 受付の判定 (requestBlockReason) も**この結果の枚数**で見る — 配列の長さで見ると
+ * `[{}]` や空の ID が通り、packet の画像は 0 枚になる (codex exec review #1591 Low)
+ */
+function normalizeImages(images) {
   // file_id は重複させない (コード R9)。証跡 (receipt.images) 側は重複を禁じているので、
   // packet に同じ画像が 2 回あると「渡した材料」と「見た証跡」が 1 対 1 で対応しなくなる
   const seen = new Set();
@@ -242,6 +247,11 @@ export function buildPacket({ draft, productInfo, colorVariations, images = [], 
     });
     if (imgs.length >= MAX_IMAGES) break;
   }
+  return imgs;
+}
+
+export function buildPacket({ draft, productInfo, colorVariations, images = [], spec }) {
+  const imgs = normalizeImages(images);
   const packet = {
     packet_version: PACKET_VERSION,
     // 🚨 スタッフが ChatGPT に貼る定型文の【実行】と**同じ文**を渡す (設計 §5)。
@@ -272,7 +282,7 @@ export function requestBlockReason({ draft, productInfo, spec, images }) {
   // 🚨 画像が無いと AI は必ず IMAGES_UNAVAILABLE で止まる (スキルの決まり: 見ずに書かない)。
   //    受け付けると 4 分待たせてから失敗する (2026-10-02 の 1 件目 = draft 188)。押す前に止める。
   //    呼び手は必ず images を渡す (渡し忘れ = 配列でない も「無い」と同じに扱う)
-  if (!Array.isArray(images) || images.length === 0) return '商品画像がありません (画像タブに商品画像を入れると使えます)';
+  if (normalizeImages(images).length === 0) return '商品画像がありません (画像タブに商品画像を入れると使えます)';
   return null;
 }
 
@@ -528,11 +538,13 @@ export function reserveGeneration(db, jobId, { leaseToken, model, promptVersion,
   if (!m) return { code: 'bad_request', error: 'model が要ります' };
   // 🚨 段階1 は 1 つの prompt を測るのが目的。実行役が旧版や打ち間違いを送ってきたら、
   //    AI 枠を使う前に断る (通すと「別の条件で作ったもの」が測定結果に混ざる。コード R1 #6)
-  if (pv !== PROMPT_VERSION) {
+  // trim 前の値で比べる (識別子は正規化せず形を直接見る。コード R3〜R5 と同じ作法・codex exec review #1591 Low)
+  if (promptVersion !== PROMPT_VERSION) {
     return { code: 'bad_prompt_version', error: `prompt_version は ${PROMPT_VERSION} です (実行役が古い可能性)` };
   }
   // 同じ理由でモデルも固定する。ランナーは queue で受け取った値で claude を起動し、同じ値を送る
-  // trim 前の値で比べる (識別子は正規化せず形を直接見る。コード R3〜R5 と同じ作法)
+  // 🚨 これは「頼んだモデル」の記録。実際に本回答を書いたモデルはランナーが後から
+  //    recordModelCheck で付ける (Claude の申告は使わない・codex exec review #1591 High)
   if (model !== lpComposeModel()) {
     return { code: 'bad_model', error: `model は ${lpComposeModel()} です (実行役が古いか、設定が途中で変わった)` };
   }
@@ -882,6 +894,55 @@ export function recordImageServed(db, jobId, { leaseToken, fileId, sha256: hex, 
   }).immediate();
 }
 
+/** ランナーが決める run id (PH_LP_RUN_ID)。claim で job に、reserve で generation に写る */
+const RUN_ID_RE = /^[A-Za-z0-9_.:-]{1,80}$/;
+/** 本回答のモデル (stream-json の assistant.message.model)。[1m] は付かない */
+const ACTUAL_MODEL_RE = /^claude-[a-z0-9]+(?:-[a-z0-9]+){1,6}$/;
+const baseModel = (m) => String(m || '').replace(/\[1m\]$/, '');
+export const MODEL_CHECKS = ['match', 'mismatch', 'unknown'];
+
+/**
+ * **実際に本回答を書いたモデル**を generation に付ける (codex exec review #1591 High)。
+ * reserve に入るのは「頼んだモデル」だけで、別のモデルが書いても done のまま測定に入っていた。
+ *
+ * 🚨 呼べるのは miniPC のランナー (service token を持つ PowerShell) だけ。`./phlp` にはこれを呼ぶ
+ *    コマンドを**作らない** — Claude の権限は ./phlp と ./phlpreview だけなので、Claude からは届かない。
+ *    相手の generation は run id (ランナーが PH_LP_RUN_ID で決めて claim に渡した値) で引く。
+ * 🚨 一度付けたら書き換えない (後から「一致」に塗り替えられない)。
+ *
+ * @param actualModels 本回答 (サブエージェントでない assistant) のモデルの一覧。読めなければ []
+ * @returns {{ok:true, updated:number, checks:Array<{generation_id:number, model_check:string}>}|{code, error}}
+ */
+export function recordModelCheck(db, { runnerRunId, actualModels, now = Date.now() } = {}) {
+  const run = exact(runnerRunId, RUN_ID_RE);
+  if (!run) return { code: 'bad_request', error: 'runner_run_id の形が不正です' };
+  if (!Array.isArray(actualModels) || actualModels.length > 10) {
+    return { code: 'bad_request', error: 'actual_models は 10 個までの配列です' };
+  }
+  const actual = [];
+  for (const a of actualModels) {
+    if (!exact(a, ACTUAL_MODEL_RE)) return { code: 'bad_request', error: 'actual_models に形の違う値があります' };
+    if (!actual.includes(a)) actual.push(a);
+  }
+  const nowS = new Date(now).toISOString();
+  return db.transaction(() => {
+    const gens = db.prepare(`SELECT id, model FROM ph_lp_compose_generations
+      WHERE runner_run_id = ? AND model_check IS NULL ORDER BY id`).all(run);
+    const checks = [];
+    for (const g of gens) {
+      // 全部が頼んだモデルで「一致」。1 つでも違えば「不一致」。読めなければ「未確認」(一致とは扱わない)
+      const check = actual.length === 0 ? 'unknown'
+        : actual.every((a) => a === baseModel(g.model)) ? 'match' : 'mismatch';
+      const ch = db.prepare(`UPDATE ph_lp_compose_generations
+        SET actual_model = ?, model_check = ?, model_checked_at = ?
+        WHERE id = ? AND model_check IS NULL`)
+        .run(actual.length ? actual.join(',') : null, check, nowS, g.id).changes;
+      if (ch === 1) checks.push({ generation_id: g.id, model_check: check });
+    }
+    return { ok: true, updated: checks.length, checks };
+  }).immediate();
+}
+
 // ─── 画面 ────────────────────────────────────────────────
 
 /**
@@ -895,7 +956,8 @@ export function jobStateFor(db, draftId, { now = Date.now() } = {}) {
   const current = { enabled: lpComposeEnabled(), model: lpComposeModel(), model_label: modelLabel(lpComposeModel()) };
   if (!job) return { ...current, job: null };
   // この依頼で**実際に予約された**モデル。予約前 (待ち・画像なしで止まった等) は null
-  const gen = db.prepare('SELECT model FROM ph_lp_compose_generations WHERE job_id = ? ORDER BY id DESC LIMIT 1').get(job.id);
+  const gen = db.prepare(`SELECT model, actual_model, model_check FROM ph_lp_compose_generations
+    WHERE job_id = ? ORDER BY id DESC LIMIT 1`).get(job.id);
   const elapsed = Math.max(0, Math.round((Date.parse(job.completed_at || new Date(now).toISOString()) - Date.parse(job.created_at)) / 1000));
   return {
     ...current,
@@ -903,6 +965,10 @@ export function jobStateFor(db, draftId, { now = Date.now() } = {}) {
       id: job.id,
       model: gen?.model || null,
       model_label: gen?.model ? modelLabel(gen.model) : null,
+      // 実際に本回答を書いたモデル (ランナーが後から付ける)。
+      // model_check: match / mismatch / unknown。予約済みでまだ付いていなければ null (= 確認中)
+      actual_model: gen?.actual_model || null,
+      model_check: gen?.model_check || null,
       status: job.status,
       created_at: job.created_at,
       completed_at: job.completed_at,

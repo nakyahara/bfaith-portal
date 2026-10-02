@@ -160,9 +160,16 @@ console.log('⑤ 予約の前は fail / release、後は result');
 const rel = await phlp('release', jid, '--reason', '一時障害');
 eq(rel.code, 0, '予約前は手放せる');
 eq(rel.json.status, 'queued', 'キューに戻る');
-const cl2 = await phlp('claim', '--run', 'lp-test-2');
+// ランナーが決めた run id (PH_LP_RUN_ID) が job に写る。Claude が --run に何を書いても変わらない
+// (ランナーはこの id で「実際に本回答を書いたモデル」を付ける・codex #1591 High)
+const cl2 = await phlpWith({ PH_LP_RUN_ID: 'lpr-20261002-160000-abcdef' }, 'claim', '--run', 'lp-test-2');
 eq(cl2.json.job_id, req.job.id, 'もう一度掴める');
+eq(db.prepare('SELECT runner_run_id FROM ph_lp_compose_jobs WHERE id = ?').get(req.job.id).runner_run_id, 'lpr-20261002-160000-abcdef',
+  '🚨 run id はランナーの PH_LP_RUN_ID (Claude の --run ではない)');
 // モデルはランナーが PH_LP_MODEL で渡す (claude --model と同じ値)。Claude の申告は使わない (2026-10-02)
+const rvNoEnv = await phlp('reserve', jid);
+ok(rvNoEnv.code !== 0 && /PH_LP_MODEL/.test(rvNoEnv.err + rvNoEnv.out),
+  '🚨 PH_LP_MODEL が無ければ予約しない (claim の応答のモデルで代わりに予約しない・codex #1591 Medium)');
 const rvBad = await phlpWith({ PH_LP_MODEL: 'claude-opus-5' }, 'reserve', jid);
 eq(rvBad.code, 1, '🚨 サーバの設定と違うモデルでは予約できない');
 eq(rvBad.json?.code, 'bad_model', 'bad_model で断られる');

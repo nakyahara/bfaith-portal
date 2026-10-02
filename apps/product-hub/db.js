@@ -1431,6 +1431,19 @@ export function initProductHubDB() {
   if (lpJobCols.size > 0 && !lpJobCols.has('images_served_json')) {
     db.exec("ALTER TABLE ph_lp_compose_jobs ADD COLUMN images_served_json TEXT NOT NULL DEFAULT '[]'");
   }
+  // LP 構成: 実際に本回答を書いたモデル (2026-10-02・codex exec review #1591 High)。
+  // model = 頼んだモデル (reserve)。こちらはランナーが stream-json の assistant.message.model を読んで後から付ける。
+  // model_check: match / mismatch / unknown (NULL = まだ付いていない)。一度付けたら書き換えない
+  const lpGenCols = new Set(db.prepare('PRAGMA table_info(ph_lp_compose_generations)').all().map((c) => c.name));
+  if (lpGenCols.size > 0 && !lpGenCols.has('actual_model')) {
+    db.exec('ALTER TABLE ph_lp_compose_generations ADD COLUMN actual_model TEXT');
+  }
+  if (lpGenCols.size > 0 && !lpGenCols.has('model_check')) {
+    db.exec("ALTER TABLE ph_lp_compose_generations ADD COLUMN model_check TEXT CHECK (model_check IN ('match','mismatch','unknown'))");
+  }
+  if (lpGenCols.size > 0 && !lpGenCols.has('model_checked_at')) {
+    db.exec('ALTER TABLE ph_lp_compose_generations ADD COLUMN model_checked_at TEXT');
+  }
 
   // 既存 DB へのカラム追加 (warehouse-mirror/db.js の addColumnIfMissing と同方針の冪等 ALTER)
   const draftCols = new Set(db.prepare('PRAGMA table_info(product_drafts)').all().map((c) => c.name));

@@ -66,6 +66,43 @@ function Get-Queue {
   }
 }
 
+# Which model wrote the MAIN answer (codex exec review #1591 High). Read from claude --output-format stream-json:
+# assistant events with no parent_tool_use_id (= not a sub-agent). modelUsage is NOT evidence - it also lists
+# auxiliary calls (Haiku). Same rule as product-idea-scout/ai/cli.cjs parseResponse.
+# Returns @{ Models = @(...); Unreadable = $bool; IsError = $bool; ErrorText = '...'; HasResult = $bool }
+function Read-ClaudeStream([string]$path) {
+  $r = @{ Models = @(); Unreadable = $false; IsError = $false; ErrorText = ''; HasResult = $false }
+  if (-not (Test-Path -LiteralPath $path)) { $r.Unreadable = $true; return $r }
+  foreach ($line in Get-Content -LiteralPath $path -Encoding UTF8) {
+    # only the two event types we need (tool results can be large; do not parse them)
+    # (inside a JSON string the quotes are escaped, so this matches real keys only; key order is not assumed)
+    if ($line -notmatch '"type":"(assistant|result)"') { continue }
+    try { $e = $line | ConvertFrom-Json } catch { $r.Unreadable = $true; continue }
+    if ($e.type -eq 'assistant' -and -not $e.parent_tool_use_id) {
+      $m = [string]$e.message.model
+      # \z, not $ (see above). A model string of another shape is "cannot verify", never "match".
+      if ($m -cmatch '^claude-[a-z0-9]+(-[a-z0-9]+){1,6}\z') { if ($r.Models -notcontains $m) { $r.Models += $m } }
+      else { $r.Unreadable = $true }
+    } elseif ($e.type -eq 'result') {
+      $r.HasResult = $true
+      if ($e.is_error) { $r.IsError = $true; $r.ErrorText = [string]$e.result }
+    }
+  }
+  return $r
+}
+
+# Attach the main-answer model to this run's generation on the server. ONLY this runner calls it: ./phlp has no
+# command for it and Claude may only run ./phlp and ./phlpreview, so Claude cannot reach it. The server decides
+# match / mismatch / unknown and never overwrites an earlier check.
+function Send-ModelCheck([string]$runId, [string[]]$models) {
+  $tok = (Get-Content -Raw -LiteralPath $TokenFile).Trim()
+  # models are already shape-checked above (no quotes or backslashes can reach the JSON)
+  $arr = if (@($models).Count -gt 0) { '["' + (@($models) -join '","') + '"]' } else { '[]' }
+  $body = '{"runner_run_id":"' + $runId + '","actual_models":' + $arr + '}'
+  return Invoke-RestMethod -Method Post -Uri ($Base + '/lp-compose/model-check') -Headers @{ Authorization = ('Bearer ' + $tok) } `
+    -ContentType 'application/json' -Body $body -TimeoutSec 60
+}
+
 if (-not (Test-Path $Phlp) -or -not (Test-Path (Join-Path $WorkDir 'phlp'))) {
   Log 'phlp not installed (run install.ps1)'
   Send-Ping 'fail' 'phlp not installed'
@@ -141,13 +178,15 @@ try {
   $prompt = 'Process ONE LP compose request. Follow the ph-lp-compose skill in this workspace exactly: claim one request with ./phlp, download the product images and LOOK AT them, write what you saw into seen-<ID>.md, read the spec file, reserve BEFORE writing, write the section 7 output following the instruction that came with the claim, check it with ./phlp lint until it passes, review with ./phlpreview, then send the result with ./phlp result and clean up. After reserve, a failure must be reported as result --rejected, never as fail. Never read the service token and never touch files outside this workspace. Finish with one line: job=N status=done or rejected or failed'
   $timedOut = $false
   $claudeExit = -1
-  $modelMismatch = $false
-  $usedNote = ''
-  $env:PH_LP_MODEL = $Model   # inherited by claude -> ./phlp (reserve records it)
+  # This run's id. ./phlp claim puts it on the job (whatever --run Claude writes), reserve copies it to the
+  # generation, and Send-ModelCheck finds the generation by it.
+  $RunId = 'lpr-' + $Stamp + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
+  $env:PH_LP_MODEL = $Model   # inherited by claude -> ./phlp (reserve records the REQUESTED model)
+  $env:PH_LP_RUN_ID = $RunId
   try {
     $p = Start-Process -FilePath $Claude -WorkingDirectory $WorkDir -NoNewWindow -PassThru `
            -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog `
-           -ArgumentList @('-p', ('"' + $prompt + '"'), '--model', $Model, '--output-format', 'json')
+           -ArgumentList @('-p', ('"' + $prompt + '"'), '--model', $Model, '--output-format', 'stream-json', '--verbose')
     # PS 5.1: with -NoNewWindow + redirection, ExitCode stays empty unless the handle is taken right away
     $null = $p.Handle
     if (-not $p.WaitForExit($TimeoutMin * 60 * 1000)) {
@@ -164,23 +203,13 @@ try {
     exit 1
   }
   Remove-Item Env:PH_LP_MODEL -ErrorAction SilentlyContinue
-  Log ('claude exit=' + $claudeExit + ' timedOut=' + $timedOut)
-  # What actually ran, from claude --output-format json. Without this a refused model or a login problem looks
-  # like "nothing moved" (2026-10-02: Claude Code 2.1.252 refused Opus 5.5 with API 400 - needs 2.1.280+).
-  try {
-    $j = Get-Content -Raw -LiteralPath $OutLog -Encoding UTF8 | ConvertFrom-Json
-    $used = @($j.modelUsage.PSObject.Properties | ForEach-Object { ($_.Name -replace '\[1m\]\z', '') })
-    $usedNote = ' used=' + ($used -join ',')
-    # only for a run that worked: an early error (login, refused model) uses no main model and must stay a fail
-    if (-not $j.is_error -and $used -notcontains ($Model -replace '\[1m\]\z', '')) {
-      $modelMismatch = $true
-      Log ('model mismatch: asked ' + $Model + ' but modelUsage has ' + ($used -join ','))
-    }
-    if ($j.is_error) {
-      $msg = [string]$j.result
-      Log ('claude reported an error: ' + $msg.Substring(0, [Math]::Min(300, $msg.Length)))
-    }
-  } catch { Log ('could not read the claude output: ' + $_.Exception.Message) }
+  Remove-Item Env:PH_LP_RUN_ID -ErrorAction SilentlyContinue
+  Log ('claude exit=' + $claudeExit + ' timedOut=' + $timedOut + ' run=' + $RunId)
+  # Without this a refused model or a login problem looks like "nothing moved"
+  # (2026-10-02: Claude Code 2.1.252 refused Opus 5.5 with API 400 - needs 2.1.280+).
+  $stream = Read-ClaudeStream $OutLog
+  Log ('main model(s)=' + ($stream.Models -join ',') + ' unreadable=' + $stream.Unreadable + ' result=' + $stream.HasResult + ' is_error=' + $stream.IsError)
+  if ($stream.IsError) { Log ('claude reported an error: ' + $stream.ErrorText.Substring(0, [Math]::Min(300, $stream.ErrorText.Length))) }
   $null = Wait-NoClaudeResidue -DeadlineUtc ((Get-Date).ToUniversalTime().AddMinutes(2)) -PollSec 5
 } finally {
   Exit-ClaudeLock
@@ -197,12 +226,29 @@ $pendingBefore = [int]$before.claimable + [int]$before.running
 $pendingAfter  = [int]$after.claimable + [int]$after.running
 $moved = $pendingBefore - $pendingAfter
 $needsReviewUp = [int]$after.needs_review - [int]$before.needs_review
-$note = 'moved=' + $moved + ' claimable=' + $after.claimable + ' running=' + $after.running + ' needs_review=' + $after.needs_review + ' exit=' + $claudeExit + ' model=' + $Model + $usedNote
+
+# Attach the main-answer model to the generation of THIS run (if Claude reserved one). Always sent, also after
+# an error or a timeout: the server records "unknown" when no main model could be read, never "match".
+# A model string of another shape is not sent as evidence (Unreadable -> the list is sent empty = unknown).
+$checkNote = 'not sent'
+$modelVerified = $true
+try {
+  $send = if ($stream.Unreadable) { @() } else { $stream.Models }
+  $mc = Send-ModelCheck $RunId $send
+  $checks = @($mc.checks | ForEach-Object { [string]$_.model_check })
+  $checkNote = if ($checks.Count) { $checks -join ',' } else { 'no generation' }
+  if ($checks | Where-Object { $_ -ne 'match' }) { $modelVerified = $false }
+} catch {
+  $checkNote = 'send failed: ' + $_.Exception.Message
+  $modelVerified = $false
+}
+$note = 'moved=' + $moved + ' claimable=' + $after.claimable + ' running=' + $after.running + ' needs_review=' + $after.needs_review + ' exit=' + $claudeExit + ' model=' + $Model + ' main=' + ($stream.Models -join ',') + ' check=' + $checkNote
 Log ('after: ' + $note)
 
 if ($timedOut) { Send-Ping 'fail' ('timeout; ' + $note); exit 1 }
-# A result written by another model must not pass as ok (the measurement compares one model)
-if ($modelMismatch -and ($moved -gt 0 -or $needsReviewUp -gt 0)) { Send-Ping 'partial' ('model mismatch; ' + $note); exit 0 }
+# A result whose model is not verified (another model, unreadable, or the check not stored) must not pass as ok:
+# the measurement compares ONE model. The screen shows the same check next to the result.
+if (-not $modelVerified -and ($moved -gt 0 -or $needsReviewUp -gt 0)) { Send-Ping 'partial' ('model not verified; ' + $note); exit 0 }
 if ($needsReviewUp -gt 0) {
   # reserved but no result came back = outcome unknown. A person decides; we never retry it automatically.
   Send-Ping 'partial' ('needs_review +' + $needsReviewUp + '; ' + $note)

@@ -166,7 +166,9 @@ async function cmdQueue() {
 }
 
 async function cmdClaim(opt) {
-  const run = String(opt.run || '').trim();
+  // 🚨 ランナーが決めた run id (PH_LP_RUN_ID) を優先する。ランナーはこの id で「実際に本回答を書いたモデル」を
+  //    サーバに付ける (model-check)。Claude が --run に別の値を書いても、ランナーの id が job に写る
+  const run = String(process.env.PH_LP_RUN_ID || opt.run || '').trim();
   if (!run) die('--run RUN_ID が要ります');
   const r = await api('POST', '/lp-compose/claim', { runner_run_id: run.slice(0, 80) });
   if (r.status !== 200) { out(r.json); return fail(1); }
@@ -175,8 +177,6 @@ async function cmdClaim(opt) {
   // lease と packet_hash は CLI が持つ。Claude には出さない
   saveLease(job.job_id, {
     lease_token: job.lease_token, packet_hash: job.packet_hash, run,
-    // サーバが決めたモデル (Render の PH_LP_COMPOSE_MODEL)。PH_LP_MODEL が無いとき (人が手で回したとき) だけ使う
-    model: job.model || null,
     // 🚨 検品に渡す材料もここに覚える (codex exec review P1)。
     //    「材料と食い違っていないか」「材料に無い事実を作っていないか」は、
     //    材料を一緒に渡さないと Codex には確かめられない。
@@ -257,8 +257,10 @@ async function cmdReserve(id, opt) {
   // 🚨 モデルは Claude に申告させない (以前は --model の既定 'claude-opus-5' が実際と無関係に記録されていた)。
   //    ランナーが claude --model に渡したのと同じ値を PH_LP_MODEL で受け取る。Claude は環境変数を書き換えられない
   //    (allow は ./phlp で始まるコマンドだけ)。サーバは自分の設定と違えば bad_model で断る
-  const model = process.env.PH_LP_MODEL || lease.model;
-  if (!model) die('モデルが分かりません (ランナーの PH_LP_MODEL も claim の応答の model も無い)');
+  //    claim の応答のモデルで代わりに予約しない — claude --model を付けずに起動した (古い) ランナーでも
+  //    サーバの設定どおりのモデルで動いたことになってしまう (codex exec review #1591 Medium)
+  const model = process.env.PH_LP_MODEL;
+  if (!model) die('PH_LP_MODEL がありません (ランナー run-lp-compose.ps1 から起動してください)');
   const r = await api('POST', `/lp-compose/jobs/${id}/reserve`, {
     lease_token: lease.lease_token, model, prompt_version: PROMPT_VERSION,
   });

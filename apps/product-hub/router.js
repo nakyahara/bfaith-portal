@@ -126,7 +126,7 @@ import {
   queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
-  lpComposeImageRef, recordImageServed as recordLpComposeImageServed, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
+  lpComposeImageRef, recordImageServed as recordLpComposeImageServed, recordModelCheck as recordLpComposeModelCheck, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
   lintForJob as lintLpComposeForJob,
 } from './lib/lp-compose.js';
 import { assertXlsxExpandsSafely, XlsxTooLargeError } from './lib/xlsx-guard.js';
@@ -3917,11 +3917,26 @@ serviceApiRouter.post('/lp-compose/claim', (req, res) => {
 serviceApiRouter.post('/lp-compose/jobs/:id/reserve', (req, res) => {
   const r = reserveLpComposeGeneration(getDB(), lpIdParam(req.params.id), {
     leaseToken: rawField(req.body?.lease_token, 100),
-    model: cleanText(req.body?.model, 80),
+    // 🚨 cleanText (trim) を通さない — 空白付きを同じモデルに畳まない (codex exec review #1591 Low)
+    model: rawField(req.body?.model, 80),
     promptVersion: rawField(req.body?.prompt_version, 80),
   });
   if (!r.ok) return lpComposeFail(res, r);
   res.json({ ok: true, generation_id: r.generation_id, packet_hash: r.packet_hash });
+});
+
+/**
+ * 実際に本回答を書いたモデルを付ける (codex exec review #1591 High)。
+ * 🚨 **miniPC のランナー (PowerShell) だけが呼ぶ**。./phlp にはこの口を呼ぶコマンドが無いので、
+ *    Claude (権限は ./phlp と ./phlpreview だけ) からは届かない。body: { runner_run_id, actual_models: [] }
+ */
+serviceApiRouter.post('/lp-compose/model-check', (req, res) => {
+  const r = recordLpComposeModelCheck(getDB(), {
+    runnerRunId: rawField(req.body?.runner_run_id, 100),
+    actualModels: req.body?.actual_models,
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json(r);
 });
 
 serviceApiRouter.post('/lp-compose/generations/:gid/result', (req, res) => {

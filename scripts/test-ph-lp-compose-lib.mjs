@@ -76,6 +76,8 @@ ok(lp.requestJob(db, args(dA, sTabs.spec, 'key-0001', { productInfo: '' })).code
 ok(lp.requestJob(db, args(dA, sTabs.spec, 'key-0001', { images: [] })).code === 'not_ready', '🚨 商品画像が無ければ受け付けない');
 ok(lp.requestJob(db, args(dA, sTabs.spec, 'key-0001', { images: undefined })).code === 'not_ready', '🚨 images の渡し忘れも「無い」と同じ (受け付けない)');
 ok(lp.requestBlockReason({ draft: dA, productInfo: 'x', spec: sTabs.spec, images: [] }).includes('商品画像がありません'), '押せない理由を画面に出せる');
+ok(lp.requestJob(db, args(dA, sTabs.spec, 'key-0001', { images: [{}, { file_id: '' }, { file_id: '   ' }] })).code === 'not_ready',
+  '🚨 空の ID しか無い画像も「無い」(packet に入る枚数で見る・codex #1591 Low)');
 const r1 = lp.requestJob(db, args(dA, sTabs.spec, 'key-0001'));
 ok(r1.ok && r1.created, '受け付ける');
 const packet1 = JSON.parse(r1.job.packet_json);
@@ -144,6 +146,7 @@ const g1 = lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_to
 ok(g1.ok && g1.generation_id > 0, '予約できる');
 ok(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(0.8) }).code === 'already_reserved', '1 依頼 1 回');
 ok(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: 'ふるい版', now: min(0.8) }).code === 'bad_prompt_version', '🚨 実行役の prompt 版が違えば AI を呼ぶ前に断る (コード R1 #6)');
+ok(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION + ' ', now: min(0.8) }).code === 'bad_prompt_version', '🚨 prompt_version も空白付きを同じに畳まない (codex #1591 Low)');
 ok(lp.failJob(db, c2.job.job_id, { leaseToken: c2.job.lease_token, code: 'x', now: min(0.9) }).code === 'already_reserved',
   '🚨 予約後に fail は使えない (result で rejected を出す・§4.3b)');
 ok(lp.releaseJob(db, c2.job.job_id, { leaseToken: c2.job.lease_token, now: min(0.9) }).code === 'already_reserved',
@@ -513,6 +516,47 @@ console.log('⑳ 🚨 古い版の packet は claim しない (codex exec review
   eq(row.status, 'failed', '理由を残して failed にする');
   eq(row.error_code, 'packet_outdated', 'error_code が packet_outdated');
   ok((row.error || '').includes('もう一度依頼'), '人に何をすればよいかを書く');
+}
+
+console.log('⑩ 実際に本回答を書いたモデル (ランナーが後から付ける・codex #1591 High)');
+{
+  const spec = lp.latestSpec(db);
+  const mk = (ne, run, t) => {
+    const d = mkDraft(ne, 'モデル確認 ' + ne);
+    const r = lp.requestJob(db, args(d, spec, 'key-mc-' + ne, { now: min(t) }));
+    const c = lp.claimJob(db, { runnerRunId: run, now: min(t + 0.1) });
+    ok(r.ok && c.job && c.job.job_id === r.job.id, `${ne}: 受付と claim`);
+    const g = lp.reserveGeneration(db, c.job.job_id, { leaseToken: c.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(t + 0.2) });
+    ok(g.ok, `${ne}: 予約`);
+    return { draft: d, gid: g.generation_id };
+  };
+  const a = mk('MC-A', 'lpr-20261002-150000-aaaaaa', 200);
+  for (const bad of ['', 'lpr x', 'lpr-1\n', 'x'.repeat(81), 12]) {
+    eq(lp.recordModelCheck(db, { runnerRunId: bad, actualModels: [] }).code, 'bad_request', `run id の形が違えば断る: ${JSON.stringify(bad)}`);
+  }
+  for (const bad of ['claude-opus-5-5', null, {}]) {
+    eq(lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150000-aaaaaa', actualModels: bad }).code, 'bad_request', `actual_models は配列: ${JSON.stringify(bad)}`);
+  }
+  for (const bad of [['claude-opus-5-5[1m]'], ['claude-opus-5-5 '], ['gpt-5.6-sol'], ['claude-opus-5-5\n'], Array(11).fill('claude-opus-5-5')]) {
+    eq(lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150000-aaaaaa', actualModels: bad }).code, 'bad_request', `形の違うモデルは断る: ${JSON.stringify(bad).slice(0, 60)}`);
+  }
+  eq(db.prepare('SELECT model_check FROM ph_lp_compose_generations WHERE id = ?').get(a.gid).model_check, null, '断った呼び出しでは何も付かない');
+  eq(lp.jobStateFor(db, a.draft.id).job.model_check, null, '付くまでは null (画面は「確認中」)');
+  eq(lp.recordModelCheck(db, { runnerRunId: 'lpr-other', actualModels: ['claude-opus-5-5'] }).updated, 0, '別の run id の generation には付かない');
+  const ra = lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150000-aaaaaa', actualModels: ['claude-opus-5-5'] });
+  ok(ra.ok && ra.updated === 1 && ra.checks[0].model_check === 'match', '🚨 [1m] を除いて頼んだモデルと同じなら一致');
+  eq(lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150000-aaaaaa', actualModels: ['claude-sonnet-5'] }).updated, 0, '🚨 一度付けたら書き換えない');
+  const sa = lp.jobStateFor(db, a.draft.id).job;
+  ok(sa.model_check === 'match' && sa.actual_model === 'claude-opus-5-5', '画面の状態に出る (一致・実モデル)');
+
+  const b = mk('MC-B', 'lpr-20261002-150100-bbbbbb', 210);
+  const rb = lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150100-bbbbbb', actualModels: ['claude-opus-5-5', 'claude-sonnet-5', 'claude-opus-5-5'] });
+  eq(rb.checks[0].model_check, 'mismatch', '🚨 1 つでも違うモデルが本回答を書いていれば不一致');
+  eq(lp.jobStateFor(db, b.draft.id).job.actual_model, 'claude-opus-5-5,claude-sonnet-5', '実モデルは重ねずに全部残す');
+
+  const c = mk('MC-C', 'lpr-20261002-150200-cccccc', 220);
+  eq(lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150200-cccccc', actualModels: [] }).checks[0].model_check, 'unknown', '🚨 読めなければ未確認 (一致とは扱わない)');
+  eq(lp.jobStateFor(db, c.draft.id).job.actual_model, null, '未確認なら実モデルは空');
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);

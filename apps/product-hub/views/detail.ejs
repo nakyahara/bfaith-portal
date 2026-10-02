@@ -5834,6 +5834,20 @@ th.attr-unknown { color: #dc2626; }
       return 'lint: 通っています' + (warn ? ' (警告 ' + warn + ' 件 — 仕様書とパーサーのズレ。構成そのものは問題ありません)' : '');
     }
 
+    // 実際に本回答を書いたモデルの確認 (ランナーが終わった後に付ける・codex exec review #1591 High)。
+    // 頼んだモデル (job.model) と違えば測定に数えない
+    const MODEL_CHECK_TEXT = { match: '一致', mismatch: '不一致', unknown: '未確認' };
+    function modelNote(job) {
+      if (!job.model) return '';
+      if (job.model_check === 'match') return job.model_label + '・モデル確認済み';
+      if (job.model_check === 'mismatch') return '⚠️ 頼んだ ' + job.model_label + ' と違うモデル (' + (job.actual_model || '?') + ') で作られました・測定に数えません';
+      if (job.model_check === 'unknown') return job.model_label + '・モデル未確認 (測定に数えません)';
+      return job.model_label + '・モデル確認中…';
+    }
+    // 終わってからモデルの確認が付くまで (ランナーの後片付けで最大 2〜3 分)。付かないまま 10 分たったら見に行くのをやめる
+    const checkingModel = (job) => !!job && !!job.model && !job.model_check && ['done', 'failed', 'needs_review'].includes(job.status)
+      && (Date.now() - Date.parse(job.completed_at || 0)) < 600000;
+
     function render(s) {
       state = s;
       const job = s.job;
@@ -5854,7 +5868,8 @@ th.attr-unknown { color: #dc2626; }
         statusEl.textContent = 'AI が構成を作っています… (2分ほどかかります・' + (job.elapsed_sec || 0) + ' 秒経過)';
       } else if (job.status === 'done') {
         // ここは「この依頼で実際に予約されたモデル」(設定がその後に変わっても、作ったモデルを出す)
-        statusEl.textContent = 'できました (' + (job.model_label ? job.model_label + '・' : '') + (job.elapsed_sec || 0) + ' 秒'
+        const mn = modelNote(job);
+        statusEl.textContent = 'できました (' + (mn ? mn + '・' : '') + (job.elapsed_sec || 0) + ' 秒'
           + (job.review_rounds != null ? '・検品 ' + job.review_rounds + ' 巡' : '') + ')';
       } else if (job.status === 'needs_review') {
         // 🚨 成否不明。自動では作り直さない (AI 枠を使ったかもしれないので人が見る)
@@ -5897,10 +5912,12 @@ th.attr-unknown { color: #dc2626; }
           + ' / lint=' + (job.lint ? (job.lint.ok ? '通った' : 'ひっかかった') : 'なし')
           + ' / 検品巡回=' + (job.review_rounds != null ? job.review_rounds : '?')
           + ' / モデル=' + (job.model || 'なし (AI を呼ぶ前に止まった)')
+          + (job.model ? ' / 実モデル=' + (job.actual_model || '-')
+            + ' / モデル確認=' + (MODEL_CHECK_TEXT[job.model_check] || '確認中') : '')
           + ' / 状態=' + job.status;
       }
 
-      if (running) schedule(); else stop();
+      if (running || checkingModel(job)) schedule(); else stop();
     }
 
     function stop() { if (timer) { clearTimeout(timer); timer = null; } }

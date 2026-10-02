@@ -205,10 +205,28 @@ console.log('⑤ 予約 → 結果');
 eq((await svc('POST', `/lp-compose/jobs/${job.job_id}/reserve`, {
   body: { lease_token: job.lease_token, model: lp.DEFAULT_MODEL, prompt_version: 'ふるい版' },
 })).status, 400, '🚨 prompt の版が違えば AI を呼ぶ前に断る');
+for (const m of [lp.DEFAULT_MODEL + ' ', ' ' + lp.DEFAULT_MODEL, lp.DEFAULT_MODEL + '\n', 'claude-opus-5']) {
+  const r = await svc('POST', `/lp-compose/jobs/${job.job_id}/reserve`, {
+    body: { lease_token: job.lease_token, model: m, prompt_version: lp.PROMPT_VERSION },
+  });
+  ok(r.status === 409 && r.json.code === 'bad_model', `🚨 HTTP でも設定と違うモデルは断る (空白付きも畳まない・codex #1591 Low): ${JSON.stringify(m)}`);
+}
 const rv = await svc('POST', `/lp-compose/jobs/${job.job_id}/reserve`, {
   body: { lease_token: job.lease_token, model: lp.DEFAULT_MODEL, prompt_version: lp.PROMPT_VERSION },
 });
 eq(rv.status, 200, '予約できる');
+
+console.log('⑤a 実モデルの口 (ランナーだけが呼ぶ・codex #1591 High)');
+{
+  eq((await api('POST', '/service-api/lp-compose/model-check', { body: { runner_run_id: 'run-1', actual_models: ['claude-opus-5-5'] } })).status,
+    401, '🚨 service token が無ければ呼べない');
+  eq((await svc('POST', '/lp-compose/model-check', { body: { runner_run_id: 'run-1', actual_models: 'claude-opus-5-5' } })).status,
+    400, 'actual_models は配列');
+  const mc = await svc('POST', '/lp-compose/model-check', { body: { runner_run_id: 'run-1', actual_models: ['claude-opus-5-5'] } });
+  ok(mc.status === 200 && mc.json.updated === 1 && mc.json.checks[0].model_check === 'match', 'claim の run id で generation を引いて「一致」を付ける');
+  const again = await svc('POST', '/lp-compose/model-check', { body: { runner_run_id: 'run-1', actual_models: ['claude-sonnet-5'] } });
+  eq(again.json.updated, 0, '🚨 一度付けたら書き換えない');
+}
 eq((await svc('POST', `/lp-compose/jobs/${job.job_id}/fail`, { body: { lease_token: job.lease_token, code: 'x' } })).status, 409,
   '🚨 予約後に fail は使えない');
 // 🚨 lint はサーバが実行する (PR1-c)。accepted には本当に通る本文が要る
