@@ -592,7 +592,7 @@ async function main() {
   }
 
   // Amazon SKU手数料取得 (v2: batch API + TTL/差分更新)
-  // SP-API getMyFeesEstimates (20件/call、0.5 RPS) で fetch、未キャッシュ + TTL>7日 + 価格乖離大 のみ refresh
+  // SP-API getMyFeesEstimates (20件/call、0.5 RPS) で fetch、未キャッシュ + 期限 (SKU ごとの 6 日周期の枠の日・132 時間の境) + 価格乖離大 のみ refresh
   // 旧版の単発APIで37分タイムアウトしてた問題を解消、通常2-3分で完了 (fetch-amazon-fees.js v2 に rewrite 済)
   // SP-API 失敗時はスキップ (依存関係)、後続は継続
   if (spResult.success) {

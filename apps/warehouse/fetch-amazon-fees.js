@@ -7,8 +7,17 @@
  * v2 改修 (2026-05-15、Codex+Claude 議論結果):
  *   - 旧版は単発 API (1件1秒、1RPS) で 2,245 SKU = 37 分 → 30分タイムアウトで daily cron 落ち
  *   - v2 は batch API: 20件/call × 2sec sleep = 113 call × 2s = ~4分で完了 (理論値)
- *   - TTL/差分更新: 未キャッシュ + fetched_at > 7日 + asin/channel 変更 + 価格乖離 >20% のみ refresh
+ *   - TTL/差分更新: 未キャッシュ + 期限 (下の「期限での取り直し」) + asin/channel 変更 + 価格乖離 >20% のみ refresh
  *   - `amazon_sku_fees` は最新キャッシュ用途と割り切る (履歴は持たない、PK=seller_sku 1行)
+ *
+ * 期限での取り直し (2026-10-02 改修):
+ *   - 🚨 旧版は「168 時間 以上」で取り直していた。監視 (monitor-fee-coverage.js) も同じ 168 時間で鮮度切れと数えるので、
+ *     7 日前の 07 時台に取った SKU は、取り直しの時点では 167.9 時間 = 見送り・1.5 時間後の監視では 168.x 時間 = 鮮度切れ。
+ *     取り直しは実質 8 日ごとになり、同じ朝に取ったかたまり (10/1 = 1,567 件) が毎週 1 回監視に引っかかっていた。
+ *   - いまは SKU ごとに決まった「枠の日」(JST の日付で REFRESH_CYCLE_DAYS = 6 日周期のどれか 1 日。sha256(seller_sku) で決まる) に取り直す
+ *     = 同じ朝に取ったかたまりも次の周期で 6 日に散り、毎朝の取り直しは対象の約 1/6 で平らになる。
+ *   - 枠の日に取れなかったとき (その朝の失敗など) の保険が境 REFRESH_HARD_HOURS = 132 時間 (5.5 日)。監視の 168 時間より 1 日以上手前。
+ *   - 監視の 168 時間は変えない (監視は「本当に古い」を見る役)。根拠の計算と模擬 = scripts/test-amazon-fees-refresh-ttl.mjs (--table で表を出す)
  *
  * 更新モード:
  *   --full          全アクティブSKUを対象 (TTL/差分フィルタ後、月1 full sweep 用、推奨)
@@ -31,6 +40,7 @@
  *   node apps/warehouse/fetch-amazon-fees.js --sku SOME-SKU    (新規/特定 SKU)
  */
 import 'dotenv/config';
+import { createHash } from 'node:crypto';
 import SellingPartner from 'amazon-sp-api';
 import { initDB, getDB } from './db.js';
 import { splitErrors, summarizeFeeOutcome, scopeBatchErrors } from './amazon-fees-outcome.js';
@@ -57,7 +67,10 @@ const MARKETPLACE_ID = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
 const BATCH_SIZE = 20;                   // SP-API getMyFeesEstimates の batch 上限
 const BATCH_SLEEP_MS = 2100;             // restore_rate=2 (0.5 RPS) + 100ms 余裕
 const MAX_RETRIES = 3;
-const TTL_HOURS = 7 * 24;                // キャッシュ有効期限 (Codex Round 1 #4: 整数切捨を避けるため hour 単位、7日 = 168時間)
+// 期限での取り直し (2026-10-02。冒頭の「期限での取り直し」)。hour 単位 (Codex Round 1 #4: 整数切捨を避ける)
+export const REFRESH_CYCLE_DAYS = 6;            // 枠の日の周期。対象 (直近 30 日に売れた SKU 約 3,000 件) ÷ 6 = 1 日 約 500 件 = 26 batch ≒ 1 分強
+export const REFRESH_HARD_HOURS = 132;          // 境 (5.5 日)。枠の日に取れなかった SKU も、これを過ぎた朝に取り直す。毎朝の時刻が ±12 時間ずれても 6 日目の朝に当たる
+export const REFRESH_SLOT_MIN_AGE_HOURS = 12;   // 枠の日でも、これより新しい SKU は取り直さない (同じ日の再試行 08:30〜11:30 = 朝の取得から 4.5 時間以内で二度取りしない)
 const PRICE_DIFF_THRESHOLD = 0.20;       // 価格乖離 20% 超で refresh
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -155,21 +168,50 @@ function getSpecificSku(db, sku) {
 // ─── TTL/差分フィルタ (v2 新規) ───
 
 /**
+ * SKU の「枠の日」= JST の日付の通し番号を REFRESH_CYCLE_DAYS で割った余りのどれか。sha256(seller_sku を小文字に) で決まる (乱数を使わない = 毎回同じ)。
+ * 小文字にするのは、表どうしを COLLATE NOCASE で結んでいるため (大文字小文字だけ違う SKU を同じ枠にする)
+ */
+export function refreshSlotOf(sellerSku, cycleDays = REFRESH_CYCLE_DAYS) {
+  return createHash('sha256').update(String(sellerSku).toLowerCase()).digest().readUInt32BE(0) % cycleDays;
+}
+
+/** JST の日付の通し番号 (1970-01-01 JST = 0)。朝 07 時台の取得も 08:30〜11:30 の再試行も同じ日になる */
+export function jstDayIndex(nowMs) {
+  return Math.floor((nowMs + 9 * 3600 * 1000) / 86400000);
+}
+
+/**
+ * 期限で取り直すかどうか。取り直すなら理由 (ttl_… / slot_…)、取り直さないなら null。純粋関数 (試験が直接呼ぶ)
+ *   - 経過 ≥ REFRESH_HARD_HOURS (132 時間) → ttl_<経過>h
+ *   - 今日 (JST) が この SKU の枠の日 で、経過 ≥ REFRESH_SLOT_MIN_AGE_HOURS (12 時間) → slot_<経過>h
+ *   経過が読めない (fetched_at が空・日時でない) ときは、旧版と同じく期限では取り直さない
+ */
+export function ttlRefreshReason(sellerSku, ageHours, nowMs) {
+  if (ageHours == null || !Number.isFinite(ageHours)) return null;
+  if (ageHours >= REFRESH_HARD_HOURS) return `ttl_${ageHours.toFixed(1)}h`;
+  if (ageHours >= REFRESH_SLOT_MIN_AGE_HOURS && jstDayIndex(nowMs) % REFRESH_CYCLE_DAYS === refreshSlotOf(sellerSku)) return `slot_${ageHours.toFixed(1)}h`;
+  return null;
+}
+
+/**
  * 対象 SKU から「実際に SP-API call が必要なもの」だけ抽出。
  * refresh 条件 (どれか 1 つでも該当):
  *   1. キャッシュ無し (新規 SKU)
- *   2. fetched_at > TTL_DAYS (デフォルト 7日)
+ *   2. 期限 (ttlRefreshReason: 132 時間の境 / 6 日周期の枠の日)
  *   3. asin が変わった
  *   4. fulfillment_channel が変わった
  *   5. price_used と最新価格の乖離 > PRICE_DIFF_THRESHOLD (デフォルト 20%)
+ * nowMs は試験・模擬が差し替える (本番は今の時刻)
  */
-function filterByTTLAndDiff(db, items) {
+export function filterByTTLAndDiff(db, items, nowMs = Date.now()) {
   if (items.length === 0) return { needRefresh: [], skipped: [], skipReasons: {} };
 
   // Codex Round 1 #4 反映: julianday の小数値 × 24 で hour 単位比較 (整数切捨で 7.9日が 7扱いされない)
+  // 今の時刻は julianday('now') と同じ UTC の文字列で渡す (fetched_at も UTC で書いている = saveFees の now())
+  const nowUtc = new Date(nowMs).toISOString().replace('T', ' ').replace('Z', '');
   const cacheStmt = db.prepare(`
     SELECT seller_sku, asin, fulfillment_channel, price_used, fetched_at,
-      (julianday('now') - julianday(fetched_at)) * 24.0 AS age_hours
+      (julianday(?) - julianday(fetched_at)) * 24.0 AS age_hours
     FROM amazon_sku_fees WHERE seller_sku = ? COLLATE NOCASE
   `);
 
@@ -178,14 +220,15 @@ function filterByTTLAndDiff(db, items) {
   const skipReasons = { ttl_fresh: 0 };
 
   for (const item of items) {
-    const cache = cacheStmt.get(item.seller_sku);
+    const cache = cacheStmt.get(nowUtc, item.seller_sku);
     if (!cache) {
       item.refresh_reason = 'not_cached';
       needRefresh.push(item);
       continue;
     }
-    if (cache.age_hours >= TTL_HOURS) {
-      item.refresh_reason = `ttl_${cache.age_hours.toFixed(1)}h`;
+    const ttlReason = ttlRefreshReason(item.seller_sku, cache.age_hours, nowMs);
+    if (ttlReason) {
+      item.refresh_reason = ttlReason;
       needRefresh.push(item);
       continue;
     }
@@ -350,8 +393,8 @@ function saveFees(db, rows) {
 // ─── メイン処理 ───
 
 export async function fetchAmazonFees(mode = 'recent', param = 30, options = {}) {
-  // db / fetchBatch / sleepFn は試験が差し替える (本番は既定のまま = warehouse.db・SP-API・実時間)
-  const { force = false, db = getDB(), fetchBatch = fetchFeesBatch, sleepFn = sleep } = options;
+  // db / fetchBatch / sleepFn / nowMs は試験が差し替える (本番は既定のまま = warehouse.db・SP-API・実時間)
+  const { force = false, db = getDB(), fetchBatch = fetchFeesBatch, sleepFn = sleep, nowMs = Date.now() } = options;
   let targetSkus;
 
   switch (mode) {
@@ -379,7 +422,7 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
     skipReasons = {};
     console.log(`[FetchFees v2] --force 指定: TTL/差分フィルタを無効化、全 ${withAsin.length} 件 refresh`);
   } else {
-    ({ needRefresh, skipped, skipReasons } = filterByTTLAndDiff(db, withAsin));
+    ({ needRefresh, skipped, skipReasons } = filterByTTLAndDiff(db, withAsin, nowMs));
     const reasonCnt = needRefresh.reduce((acc, x) => { acc[x.refresh_reason.replace(/\d+/g, 'N')] = (acc[x.refresh_reason.replace(/\d+/g, 'N')] || 0) + 1; return acc; }, {});
     console.log(`[FetchFees v2] TTL/差分フィルタ後: refresh必要=${needRefresh.length} / skip=${skipped.length} (TTL内${skipReasons.ttl_fresh})`);
     console.log(`[FetchFees v2]   refresh理由: ${JSON.stringify(reasonCnt)}`);
