@@ -139,6 +139,12 @@ const sub = lp.submitResult(db, gen.generation_id, {
 });
 eq(sub.status, 'done', '結果を受け取れる');
 {
+  // 🚨 本文は、ランナーが「実モデル = 頼んだモデル」を付けるまで出さない (codex #1591 R2 High)
+  const pre = embedded((await getDetail(draftId)).html);
+  ok(pre.job.status === 'done' && pre.job.model_check === null && pre.job.output_text === null, '🚨 実モデルの確認前は本文を画面に出さない (確認中)');
+  lp.recordModelCheck(db, { runnerRunId: 'ui-run-1', actualModels: ['claude-opus-5-5'] });
+}
+{
   const { html } = await getDetail(draftId);
   const s = embedded(html);
   eq(s.job.status, 'done', '状態が done');
@@ -160,10 +166,7 @@ eq(sub.status, 'done', '結果を受け取れる');
   ok(html.includes('🤖 構成をAIに作らせる (Opus 5.5)</button>'), '🚨 最初の表示 (EJS) のボタンにもモデル名が出る');
   eq(s.job.model, lp.DEFAULT_MODEL, 'この依頼で予約されたモデルが渡っている (台帳に書き写す)');
   eq(s.job.model_label, 'Opus 5.5', '結果に出す名前');
-  eq(s.job.model_check, null, '実モデルが付くまでは null (画面は「モデル確認中…」でポーリングを続ける)');
-  lp.recordModelCheck(db, { runnerRunId: 'ui-run-1', actualModels: ['claude-opus-5-5'] });
-  const s2 = embedded((await getDetail(draftId)).html);
-  ok(s2.job.model_check === 'match' && s2.job.actual_model === 'claude-opus-5-5', 'ランナーが付けた確認が画面に渡る (一致・実モデル)');
+  ok(s.job.model_check === 'match' && s.job.actual_model === 'claude-opus-5-5', 'ランナーが付けた確認が画面に渡る (一致・実モデル)');
   ok(html.includes("'モデル確認済み'") || html.includes('モデル確認済み'), '画面に確認の文言がある');
 
   console.log('⑤b 🚨 AI の本文で HTML が壊れない');

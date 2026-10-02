@@ -3889,7 +3889,7 @@ function lpComposeMaterial(db, draft) {
 //    長さだけ先に見て、形の判定は lib に任せる。
 // lp-compose 固有の code を HTTP に対応づける (ad-kw-ai の表に無いもの)。
 // 🚨 disabled を落とすと「機能が無効」が 400 に見え、実行役が「依頼が壊れている」と誤解する
-const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, bad_model: 409, already_generated: 409, job_finalized: 409, already_running: 409, lint_failed: 422 };
+const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, bad_config: 503, bad_model: 409, already_generated: 409, job_finalized: 409, already_running: 409, lint_failed: 422 };
 // 🚨 lint で断ったときは**何が落ちたかも返す** (codex exec review P2)。
 //    code と error だけだと、実行役は直すために lint をもう一度呼ぶしか無く、
 //    lease が切れた後はそれもできない (= 直しようが無い)。

@@ -75,9 +75,18 @@ export function lpComposeEnabled() { return process.env.PH_LP_COMPOSE_ENABLED ==
  */
 export const DEFAULT_MODEL = 'claude-opus-5-5[1m]';
 const MODEL_RE = /^claude-[a-z0-9]+(?:-[a-z0-9]+){1,6}(?:\[1m\])?$/;
+/**
+ * 未設定 (または空) なら DEFAULT_MODEL。**設定してあるのに読めない値なら null** (fail-closed)。
+ * 🚨 読めない値を黙って既定に戻すと、queue・reserve・model-check がすべて既定で揃って「一致」になり、
+ *    設定の誤りに気づかないまま別のモデルで測ってしまう (codex exec review #1591 R2 Medium)。
+ *    null のときはボタンを押せず (requestBlockReason)、claim も reserve も断る
+ */
 export function lpComposeModel() {
-  return exact(process.env.PH_LP_COMPOSE_MODEL, MODEL_RE) || DEFAULT_MODEL;
+  const v = process.env.PH_LP_COMPOSE_MODEL;
+  if (v == null || v === '') return DEFAULT_MODEL;
+  return exact(v, MODEL_RE);
 }
+export const MODEL_CONFIG_ERROR = 'AI のモデルの設定 (Render の PH_LP_COMPOSE_MODEL) が読めません。管理者が直すまで使えません';
 /** 'claude-opus-5-5[1m]' → 'Opus 5.5' / 'claude-haiku-4-5-20251001' → 'Haiku 4.5'。読めない形はそのまま返す */
 export function modelLabel(id) {
   const m = /^claude-([a-z]+)((?:-\d{1,2})+)(?:-\d{8})?(?:\[1m\])?$/.exec(String(id || ''));
@@ -276,6 +285,7 @@ export function buildPacket({ draft, productInfo, colorVariations, images = [], 
 
 /** 受け付けられる材料が揃っているか (画面のボタンの活性条件と同じ) */
 export function requestBlockReason({ draft, productInfo, spec, images }) {
+  if (!lpComposeModel()) return MODEL_CONFIG_ERROR;
   if (!spec) return '仕様書がまだ取り込まれていません (管理画面から取り込んでください)';
   if (!trim(draft?.name)) return '商品名が未入力です';
   if (!trim(productInfo)) return '「商品情報」か「裏面情報」を入力して保存すると使えます';
@@ -395,6 +405,7 @@ export function recoverExpired(db, now = Date.now()) {
         })
         : expireJob(db, job.id, 'failed', { code: 'lease_expired', message: '実行役の期限が切れた', nowS });
     }
+    closeUncheckedModels(db, now);
     return n;
   }).immediate();
 }
@@ -426,6 +437,8 @@ export function queueSummary(db, now = Date.now()) {
  */
 export function claimJob(db, { runnerRunId, now = Date.now() } = {}) {
   if (!lpComposeEnabled()) return { code: 'disabled', error: 'PH_LP_COMPOSE_ENABLED が無効です' };
+  // モデルの設定が読めなければ掴まない (掴むと AI を呼ぶ手前の reserve で断られ、依頼が無駄に失敗する)
+  if (!lpComposeModel()) return { code: 'bad_config', error: MODEL_CONFIG_ERROR };
   const nowS = new Date(now).toISOString();
   return db.transaction(() => {
     recoverExpired(db, now);
@@ -545,6 +558,7 @@ export function reserveGeneration(db, jobId, { leaseToken, model, promptVersion,
   // 同じ理由でモデルも固定する。ランナーは queue で受け取った値で claude を起動し、同じ値を送る
   // 🚨 これは「頼んだモデル」の記録。実際に本回答を書いたモデルはランナーが後から
   //    recordModelCheck で付ける (Claude の申告は使わない・codex exec review #1591 High)
+  if (!lpComposeModel()) return { code: 'bad_config', error: MODEL_CONFIG_ERROR };
   if (model !== lpComposeModel()) {
     return { code: 'bad_model', error: `model は ${lpComposeModel()} です (実行役が古いか、設定が途中で変わった)` };
   }
@@ -741,9 +755,13 @@ export function submitResult(db, generationId, {
     if (genCh !== 1 || jobCh !== 1) {
       throw new Error(`lp-compose: 結果の確定で行が動かなかった (generation=${genCh} job=${jobCh})`);
     }
+    // 実モデルの確認が結果より先に付いていた (ふつうは起きない) ときも、一致でなければ使わない
+    if (v === 'accepted' && gen.model_check && gen.model_check !== 'match') {
+      demoteForModel(db, job.id, gen.model_check, gen.actual_model, gen.model, nowS);
+    }
     if (v === 'accepted') {
       logEvent(db, job.draft_id, 'lp_compose_done', `依頼 ${job.id} (${rounds ?? '?'} 巡)`, 'ph-lp-compose');
-      return { ok: true, status: 'done', already: false, receipt: receiptObj };
+      return { ok: true, status: gen.model_check && gen.model_check !== 'match' ? 'needs_review' : 'done', already: false, receipt: receiptObj };
     }
     logEvent(db, job.draft_id, 'lp_compose_rejected', `依頼 ${job.id}: ${trim(reason, 200)}`, 'ph-lp-compose');
     return { ok: true, status: 'failed', already: false, receipt: receiptObj };
@@ -926,21 +944,72 @@ export function recordModelCheck(db, { runnerRunId, actualModels, now = Date.now
   }
   const nowS = new Date(now).toISOString();
   return db.transaction(() => {
-    const gens = db.prepare(`SELECT id, model FROM ph_lp_compose_generations
+    const gens = db.prepare(`SELECT id, job_id, model FROM ph_lp_compose_generations
       WHERE runner_run_id = ? AND model_check IS NULL ORDER BY id`).all(run);
     const checks = [];
     for (const g of gens) {
       // 全部が頼んだモデルで「一致」。1 つでも違えば「不一致」。読めなければ「未確認」(一致とは扱わない)
       const check = actual.length === 0 ? 'unknown'
         : actual.every((a) => a === baseModel(g.model)) ? 'match' : 'mismatch';
-      const ch = db.prepare(`UPDATE ph_lp_compose_generations
-        SET actual_model = ?, model_check = ?, model_checked_at = ?
-        WHERE id = ? AND model_check IS NULL`)
-        .run(actual.length ? actual.join(',') : null, check, nowS, g.id).changes;
-      if (ch === 1) checks.push({ generation_id: g.id, model_check: check });
+      if (applyModelCheck(db, g, check, actual.length ? actual.join(',') : null, nowS)) {
+        checks.push({ generation_id: g.id, model_check: check });
+      }
     }
-    return { ok: true, updated: checks.length, checks };
+    if (checks.length === 0) {
+      // 🚨 再送 (応答が途中で消えた・ランナーの未送信の送り直し) には、付いている結果をそのまま返す
+      //    (codex exec review #1591 R2 Medium)。ランナーはこれを見て未送信の控えを消す
+      const done = db.prepare(`SELECT id, model_check FROM ph_lp_compose_generations
+        WHERE runner_run_id = ? AND model_check IS NOT NULL ORDER BY id`).all(run);
+      return { ok: true, updated: 0, already: done.length > 0, checks: done.map((g) => ({ generation_id: g.id, model_check: g.model_check })) };
+    }
+    return { ok: true, updated: checks.length, already: false, checks };
   }).immediate();
+}
+
+/** 終わってからこれだけ待っても実モデルが付かなければ「未確認」で閉じる (ランナーは毎分再送する) */
+export const MODEL_CHECK_WAIT_MIN = 15;
+
+/**
+ * generation に確認を付け、**一致でなければ job を needs_review に落とす** (codex exec review #1591 R2 High)。
+ * done のまま「測定に数えません」と画面に書くだけだと、status を見る集計や人の操作では使われてしまう。
+ * 本文は残す (後から何が起きたか読める) が、画面は model_check = match の done にしか本文を出さない。
+ * 呼び手がトランザクションを持つ。一度付けたら書き換えない (WHERE model_check IS NULL)。
+ * @returns {boolean} 付けたか
+ */
+function applyModelCheck(db, gen, check, actualModel, nowS) {
+  const ch = db.prepare(`UPDATE ph_lp_compose_generations
+    SET actual_model = ?, model_check = ?, model_checked_at = ?
+    WHERE id = ? AND model_check IS NULL`)
+    .run(actualModel, check, nowS, gen.id).changes;
+  if (ch !== 1) return false;
+  if (check !== 'match') demoteForModel(db, gen.job_id, check, actualModel, gen.model, nowS);
+  return true;
+}
+
+/** できた (done) 依頼を、モデルが確かめられないので needs_review に落とす。done 以外 (失敗など) はそのまま */
+function demoteForModel(db, jobId, check, actualModel, requested, nowS) {
+  const message = check === 'mismatch'
+    ? `頼んだモデル (${requested}) と違うモデル (${actualModel || '?'}) で作られたので使いません。もう一度依頼してください`
+    : `本回答を書いたモデルを確かめられなかったので使いません。もう一度依頼してください`;
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'needs_review', error_code = ?, error = ?, updated_at = ?
+    WHERE id = ? AND status = 'done'`)
+    .run(check === 'mismatch' ? 'model_mismatch' : 'model_unverified', message, nowS, jobId);
+}
+
+/**
+ * 実モデルが付かないまま MODEL_CHECK_WAIT_MIN 分たった generation を「未確認」で閉じる。
+ * ランナーが落ちた・送れないまま、など。閉じないと画面は「確認中」のまま本文も出ない。
+ * recoverExpired (画面のポーリング・queue) から呼ばれる。呼び手がトランザクションを持つ
+ */
+function closeUncheckedModels(db, now) {
+  const nowS = new Date(now).toISOString();
+  const limit = new Date(now - MODEL_CHECK_WAIT_MIN * 60_000).toISOString();
+  let n = 0;
+  for (const g of db.prepare(`SELECT id, job_id, model FROM ph_lp_compose_generations
+    WHERE model_check IS NULL AND finalized_at IS NOT NULL AND finalized_at < ?`).all(limit)) {
+    if (applyModelCheck(db, g, 'unknown', null, nowS)) n++;
+  }
+  return n;
 }
 
 // ─── 画面 ────────────────────────────────────────────────
@@ -953,7 +1022,8 @@ export function jobStateFor(db, draftId, { now = Date.now() } = {}) {
   recoverExpired(db, now);
   const job = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(posInt(draftId));
   // いま押したら使われるモデル (ボタンに出す)
-  const current = { enabled: lpComposeEnabled(), model: lpComposeModel(), model_label: modelLabel(lpComposeModel()) };
+  const cfg = lpComposeModel();   // 読めない設定なら null (ボタンは requestBlockReason で押せない)
+  const current = { enabled: lpComposeEnabled(), model: cfg, model_label: cfg ? modelLabel(cfg) : null };
   if (!job) return { ...current, job: null };
   // この依頼で**実際に予約された**モデル。予約前 (待ち・画像なしで止まった等) は null
   const gen = db.prepare(`SELECT model, actual_model, model_check FROM ph_lp_compose_generations
@@ -981,7 +1051,9 @@ export function jobStateFor(db, draftId, { now = Date.now() } = {}) {
       error_code: job.error_code,
       error: job.error,
       lint: job.lint_json ? JSON.parse(job.lint_json) : null,
-      output_text: job.status === 'done' ? job.output_text : null,
+      // 🚨 本文を出すのは「実モデルが頼んだモデルと一致」した done だけ (codex exec review #1591 R2 High)。
+      //    確認中 (null) は出さない — 確認の前にコピーされて使われると、不一致でも取り返せない
+      output_text: job.status === 'done' && gen?.model_check === 'match' ? job.output_text : null,
       packet_hash: job.packet_hash,
     },
   };

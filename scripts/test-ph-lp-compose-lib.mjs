@@ -46,10 +46,19 @@ console.log('⓪ モデル (決める場所は Render の PH_LP_COMPOSE_MODEL �
   eq(lp.lpComposeModel(), 'claude-opus-5-5[1m]', '既定は Opus 5.5 (1M)');
   process.env.PH_LP_COMPOSE_MODEL = 'claude-sonnet-5';
   eq(lp.lpComposeModel(), 'claude-sonnet-5', '環境変数で変えられる');
-  for (const bad of ['claude-opus-5-5[1m]\n', ' claude-opus-5', 'gpt-5.6-sol', 'claude-opus-5 --dangerously-skip-permissions', 'claude-opus-5-5[2m]', '']) {
+  process.env.PH_LP_COMPOSE_MODEL = '';
+  eq(lp.lpComposeModel(), lp.DEFAULT_MODEL, '空は未設定と同じ (既定)');
+  for (const bad of ['claude-opus-5-5[1m]\n', ' claude-opus-5', 'claude-opus-5-5 ', 'gpt-5.6-sol', 'claude-opus-5 --dangerously-skip-permissions', 'claude-opus-5-5[2m]', ' ']) {
     process.env.PH_LP_COMPOSE_MODEL = bad;
-    eq(lp.lpComposeModel(), lp.DEFAULT_MODEL, `🚨 形の違う値は使わない (claude --model に渡るので): ${JSON.stringify(bad)}`);
+    // 🚨 黙って既定に戻さない (戻すと queue・reserve・model-check が既定で揃って「一致」になる・codex #1591 R2 Medium)
+    eq(lp.lpComposeModel(), null, `🚨 設定してあるのに読めない値は使わない (止める): ${JSON.stringify(bad)}`);
   }
+  // 読めない設定では押せない・掴まない・予約しない
+  ok(lp.requestBlockReason({ draft: { name: 'x' }, productInfo: 'x', spec: { id: 1 }, images: [{ file_id: 'FILEID000001' }] }) === lp.MODEL_CONFIG_ERROR, '🚨 ボタンは押せない (理由を出す)');
+  eq(lp.claimJob(db, { runnerRunId: 'run-cfg' }).code, 'bad_config', '🚨 claim しない');
+  eq(lp.queueSummary(db).model, null, 'queue のモデルは null (ランナーは「使えるモデルが来ない」で止まる)');
+  eq(lp.reserveGeneration(db, 1, { leaseToken: 'x', model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION }).code, 'bad_config', '🚨 予約しない');
+  eq(lp.jobStateFor(db, 999999).model_label, null, '画面のモデル名は出さない');
   if (saved === undefined) delete process.env.PH_LP_COMPOSE_MODEL; else process.env.PH_LP_COMPOSE_MODEL = saved;
   eq(lp.modelLabel('claude-opus-5-5[1m]'), 'Opus 5.5', '表示名: Opus 5.5');
   eq(lp.modelLabel('claude-opus-5'), 'Opus 5', '表示名: Opus 5');
@@ -171,6 +180,14 @@ eq(sub1.status, 'done', '受け取ると done');
 const jDone = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE id = ?').get(c2.job.job_id);
 eq(jDone.output_text, OUT, '本文が保存される');
 ok(!!jDone.completed_at, '🚨 終端では completed_at が必ず入る (R4 #2)');
+// 🚨 本文を画面に出すのは、ランナーが「実モデル = 頼んだモデル」を付けてから (codex #1591 R2 High)
+{
+  const pre = lp.jobStateFor(db, dA.id, { now: min(1.1) }).job;
+  ok(pre.status === 'done' && pre.model_check === null && pre.output_text === null, '🚨 実モデルの確認前は本文を出さない (確認中)');
+  lp.recordModelCheck(db, { runnerRunId: 'run-3', actualModels: ['claude-opus-5-5'], now: min(1.2) });
+  const post = lp.jobStateFor(db, dA.id, { now: min(1.3) }).job;
+  ok(post.status === 'done' && post.model_check === 'match' && post.output_text === OUT, '一致が付いたら本文を出す');
+}
 ok(jDone.completed_at <= jDone.measurement_deadline_at, '3 分以内に終わったと後から計算できる');
 const sub1b = lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, reviewRounds: 1, now: min(1.5) });
 ok(sub1b.ok && sub1b.already, '同じ結果の再送は保存済みを返す (応答断のリトライ)');
@@ -344,6 +361,8 @@ const c6 = lp.claimJob(db, { runnerRunId: 'run-10', now: min(70) });
 const g6 = lp.reserveGeneration(db, c6.job.job_id, { leaseToken: c6.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(70) });
 serve(c6.job, min(70));
 lp.submitResult(db, g6.generation_id, { packetHash: c6.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: LINT, now: min(71) });
+// 実モデルの確認 (一致) も付けておく。付けないと 15 分後に「未確認」で needs_review に落ちる (それは ⑩ で見る)
+lp.recordModelCheck(db, { runnerRunId: 'run-10', actualModels: ['claude-opus-5-5'], now: min(71.5) });
 lp.recoverExpired(db, min(70 + lp.LEASE_MIN + 5));
 eq(db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(c6.job.job_id).status, 'done',
   '🚨 期限切れ処理は done を上書きしない (R1 #1)');
@@ -522,13 +541,13 @@ console.log('⑩ 実際に本回答を書いたモデル (ランナーが後か�
 {
   const spec = lp.latestSpec(db);
   const mk = (ne, run, t) => {
-    const d = mkDraft(ne, 'モデル確認 ' + ne);
+    const d = mkDraft(ne, 'ハッカ油スプレー ' + ne);   // lint (検査 17) は商品名の接頭辞を見る
     const r = lp.requestJob(db, args(d, spec, 'key-mc-' + ne, { now: min(t) }));
     const c = lp.claimJob(db, { runnerRunId: run, now: min(t + 0.1) });
     ok(r.ok && c.job && c.job.job_id === r.job.id, `${ne}: 受付と claim`);
     const g = lp.reserveGeneration(db, c.job.job_id, { leaseToken: c.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(t + 0.2) });
     ok(g.ok, `${ne}: 予約`);
-    return { draft: d, gid: g.generation_id };
+    return { draft: d, gid: g.generation_id, job: c.job };
   };
   const a = mk('MC-A', 'lpr-20261002-150000-aaaaaa', 200);
   for (const bad of ['', 'lpr x', 'lpr-1\n', 'x'.repeat(81), 12]) {
@@ -541,22 +560,48 @@ console.log('⑩ 実際に本回答を書いたモデル (ランナーが後か�
     eq(lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150000-aaaaaa', actualModels: bad }).code, 'bad_request', `形の違うモデルは断る: ${JSON.stringify(bad).slice(0, 60)}`);
   }
   eq(db.prepare('SELECT model_check FROM ph_lp_compose_generations WHERE id = ?').get(a.gid).model_check, null, '断った呼び出しでは何も付かない');
-  eq(lp.jobStateFor(db, a.draft.id).job.model_check, null, '付くまでは null (画面は「確認中」)');
+  eq(lp.jobStateFor(db, a.draft.id, { now: min(200.5) }).job.model_check, null, '付くまでは null (画面は「確認中」)');
   eq(lp.recordModelCheck(db, { runnerRunId: 'lpr-other', actualModels: ['claude-opus-5-5'] }).updated, 0, '別の run id の generation には付かない');
   const ra = lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150000-aaaaaa', actualModels: ['claude-opus-5-5'] });
   ok(ra.ok && ra.updated === 1 && ra.checks[0].model_check === 'match', '🚨 [1m] を除いて頼んだモデルと同じなら一致');
   eq(lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150000-aaaaaa', actualModels: ['claude-sonnet-5'] }).updated, 0, '🚨 一度付けたら書き換えない');
-  const sa = lp.jobStateFor(db, a.draft.id).job;
+  const sa = lp.jobStateFor(db, a.draft.id, { now: min(200.6) }).job;
   ok(sa.model_check === 'match' && sa.actual_model === 'claude-opus-5-5', '画面の状態に出る (一致・実モデル)');
 
   const b = mk('MC-B', 'lpr-20261002-150100-bbbbbb', 210);
   const rb = lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150100-bbbbbb', actualModels: ['claude-opus-5-5', 'claude-sonnet-5', 'claude-opus-5-5'] });
   eq(rb.checks[0].model_check, 'mismatch', '🚨 1 つでも違うモデルが本回答を書いていれば不一致');
-  eq(lp.jobStateFor(db, b.draft.id).job.actual_model, 'claude-opus-5-5,claude-sonnet-5', '実モデルは重ねずに全部残す');
+  eq(lp.jobStateFor(db, b.draft.id, { now: min(210.5) }).job.actual_model, 'claude-opus-5-5,claude-sonnet-5', '実モデルは重ねずに全部残す');
 
   const c = mk('MC-C', 'lpr-20261002-150200-cccccc', 220);
   eq(lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150200-cccccc', actualModels: [] }).checks[0].model_check, 'unknown', '🚨 読めなければ未確認 (一致とは扱わない)');
-  eq(lp.jobStateFor(db, c.draft.id).job.actual_model, null, '未確認なら実モデルは空');
+  eq(lp.jobStateFor(db, c.draft.id, { now: min(220.5) }).job.actual_model, null, '未確認なら実モデルは空');
+
+  // 結果と確認の順番によらず、一致でなければ使わない (codex #1591 R2 High)
+  const submit = (x, t) => {
+    serve(x.job, min(t));
+    return lp.submitResult(db, x.gid, { packetHash: x.job.packet_hash, verdict: 'accepted', output: compositionFor(x.draft.name), lint: LINT, reviewRounds: 1, now: min(t + 0.1) });
+  };
+  const sb = submit(b, 211);
+  eq(sb.status, 'needs_review', '🚨 先に不一致が付いていた依頼は、結果が届いても done にしない');
+  const stB = lp.jobStateFor(db, b.draft.id, { now: min(212) }).job;
+  ok(stB.status === 'needs_review' && stB.error_code === 'model_mismatch' && stB.output_text === null, '🚨 不一致は needs_review・本文を出さない');
+  ok((stB.error || '').includes('claude-sonnet-5'), `理由に実モデルが出る (${stB.error})`);
+
+  const d = mk('MC-D', 'lpr-20261002-150300-dddddd', 230);
+  eq(submit(d, 231).status, 'done', '確認前の結果はいったん done');
+  eq(lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150300-dddddd', actualModels: ['claude-sonnet-5'], now: min(232) }).checks[0].model_check, 'mismatch', '後から不一致');
+  const stD = lp.jobStateFor(db, d.draft.id, { now: min(233) }).job;
+  ok(stD.status === 'needs_review' && stD.error_code === 'model_mismatch' && stD.output_text === null, '🚨 done の後に不一致が付いたら needs_review に落ちて本文を出さない');
+  const reD = lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150300-dddddd', actualModels: ['claude-opus-5-5'], now: min(234) });
+  ok(reD.ok && reD.updated === 0 && reD.already === true && reD.checks[0].model_check === 'mismatch', '🚨 再送には付いている結果を返す (一致に塗り替えない・codex #1591 R2 Medium)');
+
+  const e = mk('MC-E', 'lpr-20261002-150400-eeeeee', 240);
+  eq(submit(e, 241).status, 'done', '確認が来ない依頼もいったん done');
+  eq(lp.jobStateFor(db, e.draft.id, { now: min(241 + lp.MODEL_CHECK_WAIT_MIN - 1) }).job.status, 'done', `${lp.MODEL_CHECK_WAIT_MIN} 分たつまでは待つ (確認中)`);
+  const stE = lp.jobStateFor(db, e.draft.id, { now: min(241.2 + lp.MODEL_CHECK_WAIT_MIN) }).job;
+  ok(stE.status === 'needs_review' && stE.error_code === 'model_unverified' && stE.model_check === 'unknown' && stE.output_text === null,
+    `🚨 ${lp.MODEL_CHECK_WAIT_MIN} 分たっても確認が来なければ未確認で閉じる (確認中のまま残さない)`);
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);

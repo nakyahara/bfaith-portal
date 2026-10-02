@@ -5837,16 +5837,16 @@ th.attr-unknown { color: #dc2626; }
     // 実際に本回答を書いたモデルの確認 (ランナーが終わった後に付ける・codex exec review #1591 High)。
     // 頼んだモデル (job.model) と違えば測定に数えない
     const MODEL_CHECK_TEXT = { match: '一致', mismatch: '不一致', unknown: '未確認' };
+    // 🚨 本文は「一致」した done にしか来ない (サーバが出さない)。不一致・未確認は needs_review に落ちて理由が error に入る
     function modelNote(job) {
       if (!job.model) return '';
       if (job.model_check === 'match') return job.model_label + '・モデル確認済み';
-      if (job.model_check === 'mismatch') return '⚠️ 頼んだ ' + job.model_label + ' と違うモデル (' + (job.actual_model || '?') + ') で作られました・測定に数えません';
-      if (job.model_check === 'unknown') return job.model_label + '・モデル未確認 (測定に数えません)';
-      return job.model_label + '・モデル確認中…';
+      return job.model_label;
     }
-    // 終わってからモデルの確認が付くまで (ランナーの後片付けで最大 2〜3 分)。付かないまま 10 分たったら見に行くのをやめる
-    const checkingModel = (job) => !!job && !!job.model && !job.model_check && ['done', 'failed', 'needs_review'].includes(job.status)
-      && (Date.now() - Date.parse(job.completed_at || 0)) < 600000;
+    // できてから実モデルの確認が付くまで (ふつうは数十秒〜2 分)。サーバは 15 分付かなければ「未確認」で閉じる
+    // (= needs_review になってポーリングも止まる)。ここは 16 分を上限に見に行く
+    const checkingModel = (job) => !!job && !!job.model && !job.model_check && job.status === 'done'
+      && (Date.now() - Date.parse(job.completed_at || 0)) < 960000;
 
     function render(s) {
       state = s;
@@ -5868,9 +5868,16 @@ th.attr-unknown { color: #dc2626; }
         statusEl.textContent = 'AI が構成を作っています… (2分ほどかかります・' + (job.elapsed_sec || 0) + ' 秒経過)';
       } else if (job.status === 'done') {
         // ここは「この依頼で実際に予約されたモデル」(設定がその後に変わっても、作ったモデルを出す)
-        const mn = modelNote(job);
-        statusEl.textContent = 'できました (' + (mn ? mn + '・' : '') + (job.elapsed_sec || 0) + ' 秒'
-          + (job.review_rounds != null ? '・検品 ' + job.review_rounds + ' 巡' : '') + ')';
+        if (job.model && !job.model_check) {
+          statusEl.textContent = 'できました。作ったモデル (' + job.model_label + ') を確かめています… 確かめたら本文を出します';
+        } else {
+          const mn = modelNote(job);
+          statusEl.textContent = 'できました (' + (mn ? mn + '・' : '') + (job.elapsed_sec || 0) + ' 秒'
+            + (job.review_rounds != null ? '・検品 ' + job.review_rounds + ' 巡' : '') + ')';
+        }
+      } else if (job.status === 'needs_review' && String(job.error_code || '').startsWith('model_')) {
+        // 実モデルが頼んだモデルと違う・確かめられなかった。本文は出さない (測定に数えない)
+        statusEl.textContent = '⚠️ ' + (job.error || '作ったモデルを確かめられませんでした。もう一度依頼してください');
       } else if (job.status === 'needs_review') {
         // 🚨 成否不明。自動では作り直さない (AI 枠を使ったかもしれないので人が見る)
         statusEl.textContent = '結果を受け取れませんでした。もう一度依頼してください';
