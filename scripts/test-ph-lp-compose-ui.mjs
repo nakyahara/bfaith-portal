@@ -225,6 +225,28 @@ console.log('⑥c 🚨 商品画像が無ければ押す前に止める (2026-10
   });
   eq(post4.status, 409, '🚨 画面を通さずに POST しても受け付けない');
   eq(db.prepare('SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE draft_id = ?').get(d4).n, 0, '依頼は作られない');
+
+  console.log('⑥d 白抜きだけでも押せる・白抜きが先頭 (2026-10-02 fukidashiseal: 白抜きしか無くて押せなかった)');
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, white_bg_drive_file_id, white_bg_modified_time) VALUES (?, 'FILEIDWHITE01', '2026-10-01T00:00:00.000Z')`).run(d4);
+  const s4w = embedded((await getDetail(d4)).html);
+  eq(s4w.blocked, null, '🚨 白抜きがあれば押せる');
+  const post4w = await fetch(`${base}/api/drafts/${d4}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0004w' }),
+  });
+  eq(post4w.status, 200, '依頼できる');
+  const pk = JSON.parse(db.prepare('SELECT packet_json FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(d4).packet_json);
+  eq(pk.images.map((im) => im.file_id), ['FILEIDWHITE01'], 'packet の画像 = 白抜き');
+  // 商品画像も入れると、白抜きが先頭・続けて TOP から (同じファイルは 1 回だけ)
+  db.prepare(`INSERT INTO draft_images (draft_id, sort, drive_file_id, drive_modified_time) VALUES (?, 0, 'FILEIDTOP004', '2026-10-01T00:00:00.000Z')`).run(d4);
+  db.prepare(`INSERT INTO draft_images (draft_id, sort, drive_file_id, drive_modified_time) VALUES (?, 1, 'FILEIDWHITE01', '2026-10-01T00:00:00.000Z')`).run(d4);
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ?`).run(d4);
+  const post4b = await fetch(`${base}/api/drafts/${d4}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0004b' }),
+  });
+  eq(post4b.status, 200, 'もう一度依頼できる');
+  const pk2 = JSON.parse(db.prepare('SELECT packet_json FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(d4).packet_json);
+  eq(pk2.images.map((im) => im.file_id), ['FILEIDWHITE01', 'FILEIDTOP004'], '白抜きが先頭・続けて TOP・重複は 1 回');
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ?`).run(d4);
 }
 
 console.log('⑦ 失敗・成否不明も画面に出る');

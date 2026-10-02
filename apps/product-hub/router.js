@@ -3875,9 +3875,17 @@ function lpComposeMaterial(db, draft) {
     variation, hasVariation: effectiveHasVariation(variation, draft),
     selectorName: rakuten?.variant_selector_name, selectorValues,
   });
-  // 白抜き (_00) は draft_images に入らないので、ここは TOP から順に最大 MAX_IMAGES 枚
-  const images = db.prepare(`SELECT drive_file_id, drive_modified_time FROM draft_images
+  // 白抜き (_00) は draft_images に入らず draft_rakuten にある。**白抜きを先頭に入れる** (2026-10-02):
+  // 商品だけが写っているので、仕様書の「商品再現ルール」(形・ラベル・色) のいちばんの手がかりになる。
+  // 入荷直後の新商品は白抜きしか無いことが多く、入れないと「商品画像がありません」で押せなかった (fukidashiseal)。
+  // 続けて TOP から順に、合わせて最大 MAX_IMAGES 枚 (重複は buildPacket が除く)
+  const wb = db.prepare('SELECT white_bg_drive_file_id, white_bg_modified_time FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
+  const rows = db.prepare(`SELECT drive_file_id, drive_modified_time FROM draft_images
     WHERE draft_id = ? AND drive_file_id IS NOT NULL ORDER BY sort, id LIMIT ?`).all(draft.id, LP_COMPOSE_MAX_IMAGES);
+  const images = [
+    ...(wb?.white_bg_drive_file_id ? [{ drive_file_id: wb.white_bg_drive_file_id, drive_modified_time: wb.white_bg_modified_time }] : []),
+    ...rows,
+  ];
   return { productInfo, colorVariations, images };
 }
 

@@ -292,7 +292,7 @@ export function requestBlockReason({ draft, productInfo, spec, images }) {
   // 🚨 画像が無いと AI は必ず IMAGES_UNAVAILABLE で止まる (スキルの決まり: 見ずに書かない)。
   //    受け付けると 4 分待たせてから失敗する (2026-10-02 の 1 件目 = draft 188)。押す前に止める。
   //    呼び手は必ず images を渡す (渡し忘れ = 配列でない も「無い」と同じに扱う)
-  if (normalizeImages(images).length === 0) return '商品画像がありません (画像タブに商品画像を入れると使えます)';
+  if (normalizeImages(images).length === 0) return '商品画像がありません (画像タブに白抜きか商品画像を入れると使えます)';
   return null;
 }
 
