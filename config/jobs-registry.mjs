@@ -459,6 +459,8 @@ export const JOBS_REGISTRY = [
       + 'Company DB構想 11 の ② / 0035。取込の取得の記録 (ads_fetch_days) がある日だけ・Render に日ごとの世代と指紋を聞いて違う日だけ・1 日 = 1 要求 = 1 取引・古い世代は受け口が拒む・送った後に出品の結び直し。'
       + '取込が失敗した朝は見送って retry に載せ、取込の再試行が成功した回に送る (UPSTREAM_OF)。止まると mart.v_ad_spend_daily が古びる。手で流す・初回 = README「広告費の日次」。新しい定期実行は無い)。'
       + '全部の push の後・見張りの前に「マスタ照合」(apps/company-db/master-compare/run.mjs --daily。①ロードの検証 + ②NE との照合 (C2・反映待ちの台帳 = DATA_DIR/cdb-master-compare/pending/)。設計 = AI_reference CompanyDB構想/10 §6.1.1 B・C2。'
+      + '②b = 持ち主が C で NE に欄が無い列 (税区分・売上分類・送料・推奨保有月数) の Company DB ↔ 古い表 (m_products・product_shipping・m_reorder_setting)。反映待ちの台帳 = DATA_DIR/cdb-master-compare/old-tables/pending/・'
+      + '世代にあった値が無い / 翌朝の作り直しでも違う = ⚠️ (要約の先頭)。今は持ち主が全部 load = 比べない (④a・Codex #1564 R1 H3)。'
       + '最新の夜間ロード (Render・02:00) が実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直し、Company DB (watcher で読むだけ) と比べる = ロードの検証。'
       + '全件 JSON = DATA_DIR/cdb-master-compare/<日付>/ (35 日)・証跡 master-compare (始めに実行中で前の結果を無効に)。見張りの W13 が読む。差がある・判定できないは ⚠️ (exit 0)・照合そのものの失敗だけ ❌。'
       + 'retry: Render同期 が retry で直ったら マスタ照合 → 見張り も走らせ直す (retry-failed-jobs.js の RERUN_AFTER)。新しい定期実行ではない) が走る。'
@@ -480,6 +482,12 @@ export const JOBS_REGISTRY = [
       + 'ロジザードの全件の一覧 (logizard-shohin-csv の 00:20 の成功した書き出し)。欠ける = ⏭️ (exit 3 = 失敗として retry に載る)・差や不正 = ⚠️ (exit 0)・作ること自体の失敗 = ❌ (retry。マスタ照合が retry で直ったら作り直す = RERUN_AFTER)。'
       + '作れた回だけ自分で ok の ping (台帳 lz-daily-build)。'
       + '出すもの = DATA_DIR/lz-daily/<日付>/<実行ID>/ と証跡 lz-daily。新しい定期実行は無い)。'
+      + '「m_products 再構築」の直前に「Company DB の写し」(apps/company-db/publish/fetch.mjs --daily。マスタ正本切替 ④a。設計 = AI_reference CompanyDB構想/15。'
+      + '持ち主が C の列の値を watcher で読み、確かめて warehouse.db の世代の表に入れる = m_products 再構築が持ち主が C の列だけ C の値を重ねる (入れた後に読み直して違えば巻き戻す)。'
+      + '今は持ち主が全部 load = 値 0 行 = m_products は変わらない。NE が失敗した朝も取る。受け入れない・取れない = ❌ (作り直しは前の世代)・retry には載せない) と、'
+      + '直後に「Company DB の写しの反映」(同じ fetch.mjs の --verify-apply。今朝の写しが今朝の作り直しで m_products と上書き表に入ったかを読み直す。'
+      + '古い表が世代と違う (exit 4) = その後の m_products・上書き表を読む工程を全部見送る (⚠️・blocked。一覧 = apps/warehouse/publish-gate.js)。'
+      + '確かめられた回だけ自分で ok の ping (台帳 cdb-master-publish)。証跡 master-publish の apply。新しい定期実行は無い)。'
       + '冒頭の「Settlement冪等性テスト」の後に「Settlement V2 並べ直しテスト」(apps/warehouse/test-settlement-v2.js。2026-09-28 に決済の取込を V2 に切り替えた = #1508) と '
       + '「Settlement 重複除去テスト」(apps/warehouse/test-settlement-dedup-occurrence.js。同じ決済の同じ鍵の本物の別々の行を潰さない = 出現順つき。#1511) も走る (どちらも一時 DB だけ・失敗しても後続は止めない。新しい定期実行は無い)。'
       + '「Amazon Settlement」(fetch-amazon-settlements.js) は 2026-09-30 (D7b-1b の下ごしらえ・設計 = AI_reference CompanyDB構想/13 §3.1) から決済のレポートの一覧も warehouse.db の amazon_settlement_report_inventory_runs / amazon_settlement_report_inventory に記録する '
@@ -1268,6 +1276,70 @@ export const JOBS_REGISTRY = [
       + '⑤ ①で**交換した当日のうちに** ok ping を打つ (④まで済ませてから)。'
       + '🚨当日に打てなかったら、ping だけ後から打たない。①から交換し直して、その当日に打つ (旧シークレットは交換から 7 日間使える)。'
       + 'ping の後、翌朝の daily-sync ログの [fba-stock-snapshot:us] が errors=0 になっていることも見る',
+  },
+  {
+    id: 'cdb-master-publish',
+    type: 'scheduled_job',
+    importance: 'P3',
+    owner: 'Claude + 中原さん',
+    purpose: 'Company DB の写し (マスタ正本切替 ④a。apps/company-db/publish/fetch.mjs。設計 = AI_reference CompanyDB構想/15 + Codex ④ 設計 R0・R1 = 契約)。daily-sync の 2 工程: '
+      + '①「Company DB の写し」(m_products 再構築の直前) = 持ち主が C (Company DB) の列の値を watcher で読むだけの 1 つの取引で読み、確かめて '
+      + '(持ち主の設定が ④a で扱える (一緒に切り替える組・写さない列) ・時刻が今の世代より新しい・変更の記録 events.master_change_events の最大の番号が下がらず前の水位の出来事が同じ中身・'
+      + '値の範囲・正規化したコードに重なりが無い・持ち主の設定が Company DB の epoch (0055 の ops.master_ownership_state の active。切替の日は prepared) と最新の夜間ロードの記録で同じ・今の m_products のコード × 要る列の欄が全部ある・'
+      + '行数 (同じ持ち主のとき) と SKU 数が前の世代の 90% 以上・単品の商品名と状態が SKU と同じ・入れた後に読み直したハッシュが同じ) '
+      + 'warehouse.db の世代の表 (cdb_publish_generations / cdb_publish_values・sync_meta の cdb_publish_current = 前にしか進まない・14 世代残す) に 1 取引で入れる。'
+      + 'm_products 再構築が今の世代を読み、持ち主が C の列だけ C の値を重ねる (1 つの取引で 重ねる → 入れ替え → 上書き表をそろえる → 全部の確かめ (持ち主が load の列は今までの値のまま) → 記録。'
+      + '違えば巻き戻す)。上書き表 = exception_genka / product_shipping は既にある行だけ直す・空なら行を消す / m_reorder_setting はこの作り直しの SKU を入れる・直す・消す / '
+      + 'Company DB にしか無い SKU は足さない。持ち主が C の列があるのに同じ持ち主 (epoch) の世代が無い・欠けがある朝は作り直しを止める (前の m_products のまま)。'
+      + '②「Company DB の写しの反映」(m_products 再構築の直後。--verify-apply) = 今朝の写し・今朝の作り直し・今の世代・今使っている epoch・読み直した m_products と上書き表がそろったときだけ ok の ping。'
+      + '古い表が世代と違う (exit 4) = その後の m_products・上書き表を読む工程を全部止める (apps/warehouse/publish-gate.js の一覧 = 履歴・観測の原価・f_sales・販売速度・商品管理リスト・各モールの財務の日次・Render同期・ロジザードの商品マスタ (影) ほか。'
+      + '⚠️ 見送り・retry に載せない・lz-daily-build は fail の ping)。'
+      + '持ち主の epoch (0055): config/master-ownership.mjs を書き換えただけでは何も変わらない (夜間ロード・写し・作り直しは Company DB の active)。'
+      + '切替の日 = scripts/company-db/master-ownership-epoch.mjs prepare → remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → --verify-apply → master-ownership-epoch.mjs activate '
+      + '(今の作り直しが prepared の世代・今朝の確かめが通った・読み直しても同じ ときだけ)。🚨 古い書き込み口 (/register など) を閉じるのは ⑤-3 の切替の手順 (持ち主を変える前) = ここでは閉じない。'
+      + '今は持ち主が全部 load = 値 0 行の世代 = しくみが毎日通ることの確かめ (m_products は変わらない) = 止まっても今は何も困らない = P3。'
+      + '切替の後は、止まると C の変更が古い表 (m_products・mirror) に届かない',
+    where: 'miniPC TaskScheduler [WarehouseDailySync] の 2 ステップ (新しい定期実行ではない。ping は fetch.mjs が自分で打つ = --daily の回だけ。ok は ② の確かめが通った回だけ・① の失敗は fail。retry には載せない)',
+    schedule: '毎日 07:00 の daily-sync の m_products 再構築の直前 (①) と直後 (②)',
+    anchor_hour_jst: 7,
+    anchor_minute_jst: 0,
+    grace_hours: 7,   // daily-sync と同じ締切 (14:00)。retry には載せないので、落ちた朝は締切で気づく
+    lifecycle: 'permanent',
+    runbook: 'logs/daily-sync-*.log の「Company DB の写し」「Company DB の写しの反映」の行と DATA_DIR/company-db-evidence/<日付>/master-publish.json (state・problems・detail・generation_no・epochs・shadow・apply)。'
+      + '① の ❌ の理由: ownership_not_supported (config/master-ownership.mjs の一緒に切り替える組 products.name+skus.name / products.status+skus.handling / skus.tax_rate+skus.tax_class の片方だけ・'
+      + '④a が写さない列を company にした) / not_newer (今の世代より古い読み) / watermark_backward・watermark_fork (変更の記録の番号が下がった・前の水位の出来事が無い・違う = Company DB の復元・別の DB を疑う) / '
+      + 'ownership_mismatch (Company DB の epoch (active・prepared) と最新の夜間ロードが記録した持ち主が違う = 切替の日は「prepare → remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → 確かめ → activate」の順。'
+      + 'status = node scripts/company-db/master-ownership-epoch.mjs status) / '
+      + 'no_nightly_load・no_load_ownership (夜間ロードの記録が無い) / incomplete (C にある SKU なのに持ち主が C の欄が無い = 種類の違いなど) / '
+      + '⚠️ だけ (止めない・ok の ping): Company DB に無い SKU (NE にしか無い) = NE の値のまま作る = 証跡の not_in_cdb (件数とコード)・夜間ロードが入れた翌朝から C の値 / '
+      + 'value_out_of_range・norm_mismatch・norm_collision・target_norm_collision (Company DB の値・コード・m_products の 2 つのコードが同じ SKU) / '
+      + 'product_name_mismatch・product_status_mismatch・single_without_product・product_shared (単品の商品と SKU が食い違う) / '
+      + 'shrunk (前の世代の 90% 未満 = 読み落としを疑う) / no_0027・no_version (Company DB の migrate の不足) / stage_failed (warehouse.db に入れられない)。'
+      + '落ちた朝は印が動かない = 作り直しは前の世代 (持ち主が C の列があれば m_products 再構築が ❌ CDB_PUBLISH_UNAVAILABLE / CDB_PUBLISH_VERIFY = 前の m_products のまま)。'
+      + '② の ❌ の理由: 遅れ (exit 1・後の工程は止めない・翌朝の作り直しで届く) = fetch_not_verified (① が通らなかった)・build_not_this_run (NE の失敗で作り直しを飛ばした・作り直しが止まった)・'
+      + 'build_generation_not_today・generation_moved (写しだけ新しい世代に進んだ) / build_epoch_mismatch / '
+      + 'applied_mismatch・applied_hash_changed (m_products・上書き表が「作り直しが使った世代」の値と違う = 作り直しの後に /register などで書き換えられた? = exit 4 = broken)。'
+      + '止めるかどうかの正 = warehouse.db の門 cdb_publish_gate (safe / broken / unknown。apps/warehouse/publish-gate.js の readPublishGate)。違う = broken (証跡より先に書く = 証跡が書けなくても exit 4)・'
+      + '遅れ・確かめられない = 前の値のまま・行が無く持ち主が C = unknown (止める)・全部 load で行が無い = 確かめた今の世代と、それを使った最新の作り直し (今の世代を使った = 番号・ID・中身が同じ) がそろうときだけ流す (無い・作り直しが前の世代 = unknown。#1564 Codex R4 Medium 1)。'
+      + '確かめが通った朝は全部 load でも safe を書く (作り直しを飛ばした朝も、確かめた作り直しのままなら行で流せる)。'
+      + '確かめが通らなかった朝 (落ちた・exit 1) = 確かめた safe の行が今も合う (遅れの朝) ときだけ流す。それ以外は unknown を残し (broken はそのまま)、daily-sync もその回の工程を止める (#1564 Codex R5)。'
+      + '遅れだけ (写しが取れない・作り直しが前の世代) で古い表が作り直しの世代と同じ朝 = 確かめは exit 1・fail の ping のまま、その作り直しの safe を書く = 後の工程は流す (#1564 Codex R6)。'
+      + '止めの印 = DATA_DIR/cdb-publish-gate.stop.json (warehouse.db を開けない・門を書けない (SQLITE_BUSY など) 回に残す)。ある間は門の行・暗黙の safe より先に止める。'
+      + '消すのは safe を書けた確かめだけ = 故障を直したら node apps/company-db/publish/fetch.mjs --verify-apply (手) で消える (ファイルを手で消さない)。'
+      + 'safe は確かめた作り直し・世代・入れた値のハッシュを持つ = 後に作り直した・書き換えられた (broken を書けなかった) = その safe は使わない (unknown。全部 load と分かれば流す)・'
+      + '門の表が読めない = unknown (#1564 Codex R3 High 2)。daily-sync (exit 4 と門の両方)・自動再試行 (RERUN_AFTER も)・'
+      + '商品管理リストの手の更新 (fba-service → pml-fba-refresh.js) が同じ門で止まる。broken を safe に戻せるのは通った確かめだけ = 直したら fetch.mjs --verify-apply (手) で safe。'
+      + '確かめ: sqlite3 warehouse.db "select * from cdb_publish_gate" (証跡 master-publish の apply.broken・gate は人が読む控え)。'
+      + 'activate が断る理由 (master-ownership-epoch.mjs): build_not_prepared_epoch・generation_before_prepare (prepare より前に読んだ世代)・no_verified_apply_evidence・evidence_not_prepared_epoch・'
+      + 'apply_not_verified・applied_mismatch_now・applied_hash_changed・切替の段階 (⑤-1 の ops.master_cutover_state) が frozen でない・段階の表が無い・'
+      + 'PREPARED_CHANGED (証拠を集めた後に prepare がやり直された = 写し・作り直し・確かめからやり直す)・'
+      + 'LOAD_AFTER_EVIDENCE (証拠の世代の後に夜間ロードが入った = --use-prepared のロードからやり直す。夜間ロードと prepare / activate / cancel は epoch の鍵 4705310055 で並ぶ。#1564 Codex R3 High 1)・'
+      + 'LOAD_EPOCH_MISMATCH (最後に commit したロードの持ち主が prepared でない)・generation_without_load_commit (世代に commit の番号が無い = 0055 の後のロードから写し直す)。'
+      + '「最後のロード」= 0055 の ops.master_load_commits の番号 (DB が commit の直前に振る = commit の順。時計・場所では決めない)。写しも同じ番号で選ぶ (HTTP の --use-prepared のロード = host render も入る。#1564 Codex R4)。'
+      + '持ち主の正は 1 つ (0055・Codex #1564 R2 High 3): ⑤-1 の切替の段階を company_owner・new_open に進めるのは epoch が active (前提 0055_ownership_epoch = epoch_missing・epoch_prepared_pending・epoch_all_load・epoch_broken) で、'
+      + '段階の owner_hash = active のときだけ (trigger trg_master_cutover_state_prereq_0055 = cutover_epoch: owner_hash_not_active)。画面の保存 (ops.begin_master_write) も active と同じ持ち主表だけ (before_cutover: 持ち主表が持ち主の epoch と違う)。'
+      + '持ち主表のハッシュは 1 つの式 = load の列は数えない (0055 の ops.ownership_hash・lib/master-cutover.mjs の ownershipHash。列を足しても保存は止まらない。#1564 Codex R3 Medium)。'
+      + '手で試す = node apps/company-db/publish/fetch.mjs --dry-run (読んで確かめるだけ・書かない・ping なし)',
   },
   {
     id: 'lz-daily-build',

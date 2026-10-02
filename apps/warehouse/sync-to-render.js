@@ -150,6 +150,8 @@ export function masterReceiptEvidence({ generation, lineage, masterPart, respons
     generation_id: generation ? generation.generation_id : null,
     build_id: lineage && lineage.build_id ? lineage.build_id : null,
     lineage_reason: lineage && !lineage.build_id ? lineage.reason ?? null : null,
+    // 作り直しが使った Company DB の写しの世代 (④a。由来が分かるときだけ)
+    cdb_publish: lineage && lineage.build_id ? lineage.cdb_publish ?? null : null,
     send_error: error ? String(error.message || error).slice(0, 300) : null,
     entities,
   };

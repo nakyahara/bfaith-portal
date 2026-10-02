@@ -37,6 +37,8 @@ import { acquireLock, releaseLock, heartbeatLock } from './job-locks.js';
 import { refreshFbaLive } from './refresh-fba-live.js';
 import { buildProductManagementSnapshot } from './build-product-management-snapshot.js';
 import { syncPmlSnapshotOnly } from './sync-to-render.js';
+import { runPmlFbaRefresh } from './pml-fba-refresh.js';
+import { readPublishGate } from './publish-gate.js';
 
 // db.jsは default export + named exports の混在なので動的importで対応
 let db;
@@ -256,27 +258,9 @@ router.post('/pml/fba-refresh', rateLimitMiddleware('sp-api'), async (req, res) 
     job = createJob('pml-fba-refresh', async (updateProgress) => {
       const hb = setInterval(() => { try { heartbeatLock(wdb, lock); } catch {} }, 60 * 1000);
       try {
-        updateProgress({ step: 'fetch-restock', message: 'AmazonからRESTOCK在庫を取得中…(数分かかります)' });
-        const live = await refreshFbaLive();
-
-        updateProgress({ step: 'build', message: `スナップショット再生成中 (FBA ${live.row_count}件)…` });
-        const built = await buildProductManagementSnapshot({ fbaSource: 'live' });
-        if (!built.ok) {
-          throw new Error(`snapshot生成に失敗 (status=${built.status}): ${(built.reasons || []).join('; ')}`);
-        }
-
-        updateProgress({ step: 'sync', message: 'Renderへ反映中…' });
-        const synced = await syncPmlSnapshotOnly();
-        if (synced.state !== 'sent') {
-          throw new Error(`Render同期に失敗/スキップ: ${synced.reason || synced.state}`);
-        }
-
-        return {
-          fba_fetched_at: live.fetched_at,
-          fba_row_count: live.row_count,
-          pml_run_id: built.run_id,
-          synced_count: synced.count,
-        };
+        // Company DB の写しの反映が世代と違う朝は作らない・送らない (daily-sync・再試行と同じ証跡 = publish-gate.js。#1564 の見直し M-2)
+        return await runPmlFbaRefresh({ updateProgress, refresh: refreshFbaLive, build: buildProductManagementSnapshot, sync: syncPmlSnapshotOnly,
+          gate: () => readPublishGate({ db: wdb }) });
       } finally {
         clearInterval(hb);
         releaseLock(wdb, lock);

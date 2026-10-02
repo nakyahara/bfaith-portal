@@ -122,6 +122,8 @@ async function asGate(host, fn) {
 /** 切替の段階を 1 つ進める (⑤-1 の本物の関数: 門の記録 → 運用のロール master_ops が証拠つきで)。持ち主表 = company_owner から ALL_COMPANY */
 async function toPhase(to) {
   const seen = { frozen: 'legacy_open', company_owner: 'frozen', new_open: 'company_owner' }[to];
+  // 0055 (④a): company_owner・new_open に進むのは持ち主の epoch が active で段階の持ち主表と同じときだけ = 試験で置く (本番 = ④a の activate)
+  if (to !== 'frozen') await (await import('./fixtures/master-epoch.mjs')).seedActiveEpoch(db, ALL_COMPANY);
   const own = to === 'frozen' ? MASTER_OWNERSHIP : ALL_COMPANY;
   for (const [host, inst, build] of [['render', 'r-a', 'r1'], ['minipc', 'm-a', 'm1']]) {
     await asGate(host, () => C.recordLegacyGateAck(db, { host, instanceId: inst, buildId: build, manifest: MANIFEST, ownership: own, phaseSeen: seen }));
@@ -704,10 +706,11 @@ await ta('[G2] 登録の約束 (sku_create) は登録の関数だけが書く: b
   assert.deepEqual(await q('select operation, status, sku_id::text as sku_id from ops.master_edit_requests where request_id = $1', [rid2]), [{ operation: 'sku_create', status: 'done', sku_id: r2.sku_id }]);
   assert.equal(Number((await one(`select count(*)::int as n from events.master_change_events where actor_id = 'forged@evil'`)).n), 0);
   // 登録の約束も done が要る (0051 の commit の確かめは操作を問わない): 持ち主が約束の行だけ書いて commit = 断る
+  //   持ち主表は今の epoch (active) と同じにする (0055 の入れる時の確かめ = 違う持ち主表の行はそもそも入らない)
   const sid = await skuId('s001');
   await assert.rejects(() => tx(() => pg.query(`insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, derived_sku_ids, target_product_ids, edit_token, payload_hash,
       versions, actor_id, source_system, db_user, phase, owner_hash, ownership) values (gen_random_uuid(), txid_current(), gen_random_uuid(), 'sku_create', $1, '{}', '{}', repeat('0', 64), repeat('e', 64),
-      '{}', 'x', 'portal_master_edit', 'deploy', 'new_open', repeat('a', 64), '{}')`, [sid])), /master_write_session_unfinished/);
+      '{}', 'x', 'portal_master_edit', 'deploy', 'new_open', repeat('a', 64), ops.master_ownership_active_map())`, [sid])), /master_write_session_unfinished/);
   assert.equal(await skuId('g-ok-0'), undefined);
 });
 
@@ -1359,6 +1362,7 @@ await ta('[X1] 別の DB: 段階の門 (trigger) を止めて new_open にして
     const db2 = pgliteAdapter(pg2);
     await applyMigrations(db2, { log: quiet });
     await pg2.query('alter table ops.master_cutover_state disable trigger trg_master_cutover_state_prereq');
+    await (await import('./fixtures/master-epoch.mjs')).seedActiveEpoch(db2, ALL_COMPANY);   // 0055 (④a): 段階の持ち主表 = 持ち主の epoch (本番 = ④a の activate)
     await pg2.query('begin');
     await pg2.query(`select set_config('ops.cutover_protocol', '1', true)`);
     await pg2.query(`update ops.master_cutover_state set phase = 'new_open', owner_hash = $1`, [C.ownershipHash(ALL_COMPANY)]);
@@ -1410,6 +1414,7 @@ await ta('[X2] 復元 (夜間のバックアップ): backfill の後の DB は�
     const p5 = (await db5.query('select * from ops.registration_backfill_plan()')).rows[0];
     assert.equal(p5.sku_count, c5.s);
     await db5.query('select ops.backfill_sku_registrations($1, $2, $3)', [p5.sku_count, p5.snapshot_hash, 'naka@test']);
+    await (await import('./fixtures/master-epoch.mjs')).seedActiveEpoch(db5, ALL_COMPANY);   // 0055 (④a): 切替の手順の持ち主の epoch (本番 = ④a の activate)
     assert.deepEqual((await db5.query('select ops.master_cutover_prereq_problems($1, $2) as p', ['company_owner', 'new_open'])).rows[0].p, []);
   } finally { await pg4.close(); await pg5.close(); }
 });

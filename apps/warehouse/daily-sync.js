@@ -14,6 +14,7 @@ import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
 import { isWarnSummary } from './amazon-fees-outcome.js';
 import { isMonthStartGraceSummary, monthStartEmptyGrace, monthStartGraceDays, prevMonthOf } from './finance-dq-month-mode.js';
+import { publishGateDecision, readPublishGate, gateAfterVerify } from './publish-gate.js';
 import { waitOtherRunGone, isAliveNodeSince, remainingRetrySlots } from './retry-lock.js';
 import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS, amazonFinanceDailyArgs } from './amazon-finance-months.js';
 
@@ -166,7 +167,27 @@ function sleepSync(ms) {
  * @param {object} [opts]
  * @param {boolean} [opts.retryLibuvCrash=false] - true で一過性 libuv クラッシュ時のみ1回再実行
  */
+// Company DB の写しの反映が世代と違う朝 (fetch.mjs --verify-apply の exit 4) = true。その後の m_products・上書き表を読む工程を止める (publish-gate.js。④a・Codex #1564 R1 H4)
+const publishGate = { broken: false };
+// 止めた工程のうち自分で ping を打つもの (台帳の項目) = 通知の前にまとめて fail の ping を打つ
+const publishGatePings = [];
+async function flushPublishGatePings() {
+  if (!publishGatePings.length) return;
+  // 送れなくても daily-sync の通知は止めない (ok が進まない = 監視の締切で気づく)
+  try {
+    const { sendPing } = await import('../../scripts/company-db/lz-daily.mjs');
+    for (const p of publishGatePings.splice(0)) { try { await sendPing(p.jobId, { status: 'fail', note: p.note }); } catch (e) { console.warn(`[DailySync] 止めた工程の ping を送れない (${p.jobId}): ${e.message}`); } }
+  } catch (e) { console.warn(`[DailySync] 止めた工程の ping の送り手を読めない: ${e.message}`); }
+}
+
 function runScript(scriptPath, label, timeoutMs = 600000, { retryLibuvCrash = false } = {}) {
+  // 写しの反映が世代と違う朝は、m_products・上書き表を読む工程を動かさない (⚠️ 見送り・再試行に載せない)
+  const gate = publishGateDecision(scriptPath, publishGate);
+  if (gate.skip) {
+    console.log(`\n=== ${label} ===\n${gate.summary}`);
+    if (gate.pingJobId) publishGatePings.push({ jobId: gate.pingJobId, note: gate.summary.slice(0, 180) });
+    return { success: false, blocked: true, gated: true, summary: gate.summary };
+  }
   const parts = scriptPath.split(' ').filter(Boolean);
   const filePath = path.join(PROJECT_DIR, parts[0]);
   const scriptArgs = parts.slice(1);
@@ -714,6 +735,14 @@ async function main() {
     console.log('[DailySync] LINEギフト 失敗のため Company DB 注文 push (LINE ギフト) をスキップ');
   }
 
+  // ─── Company DB の写し (マスタ正本切替 ④a。設計 = AI_reference CompanyDB構想/15) ───
+  // 持ち主が C (Company DB) の列の値を watcher で読むだけの 1 つの取引で読み、確かめてから warehouse.db の世代の表に入れる (今の世代の印は前にしか進まない)。
+  // すぐ後の m_products 再構築が今の世代を読み、持ち主が C の列だけ C の値を重ねる。今は持ち主が全部 load = 値 0 行の世代 (しくみが毎日通ることの確かめ・m_products は変わらない)。
+  // NE が失敗した朝も取る (次の作り直しで使う)。受け入れない・取れない = ❌ + fail の ping (印は動かない = 作り直しは前の世代。持ち主が C の列があれば作り直しは止まる)。
+  // retry には載せない (m_products の作り直しも retry しない)。ok の ping は m_products 再構築の後の「反映の確かめ」だけ (台帳 cdb-master-publish)
+  const cdbPublishResult = runScript('apps/company-db/publish/fetch.mjs --daily', 'Company DB の写し', 300000);
+  results.push({ name: 'CompanyDB写し', ...cdbPublishResult, warn: cdbPublishResult.success && isWarnSummary(cdbPublishResult.summary) });
+
   // 統合商品マスタ再構築
   // NE 失敗時はスキップ: raw_ne_* が部分状態の可能性がある中で rebuild すると、
   // セット構成の欠落等が staging 件数ゲートを素通りして m_products に固定される (構造監査 H-1)。
@@ -726,6 +755,20 @@ async function main() {
     mProductResult = { success: false, summary: '⏭️ skipped (NE失敗のため、前日データ維持)' };
   }
   results.push({ name: 'm_products', ...mProductResult });
+  // Company DB の写しの反映の確かめ (④a。Codex ④ 設計 R0 #4・R1 H2): 今朝の写しの世代が今朝の作り直しで m_products・上書き表に入ったかを読み直して確かめる。
+  // 確かめられた回だけ ok の ping (台帳 cdb-master-publish)。作り直しを飛ばした朝・写しが受け入れられなかった朝 = ❌ + fail の ping (retry しない)。
+  // 🚨 exit 4 = 古い表の値が世代と違う (持ち主が C の列があるときだけ起きる) = その後の m_products・上書き表を読む工程を全部止める (違う値を配らない。publish-gate.js)
+  const cdbPublishApplyResult = runScript('apps/company-db/publish/fetch.mjs --verify-apply --daily', 'Company DB の写しの反映', 120000);
+  results.push({ name: 'CompanyDB写し反映', ...cdbPublishApplyResult, warn: cdbPublishApplyResult.success && isWarnSummary(cdbPublishApplyResult.summary) });   // ⚠️ = Company DB に無い SKU がある (NE の値のまま)
+  const cdbPublishBroken = !cdbPublishApplyResult.success && cdbPublishApplyResult.exitCode === 4;
+  // ここから後の m_products・上書き表を読む工程は runScript が止める (publish-gate.js の一覧。⚠️ 見送り・自分で ping を打つ工程は fail の ping)
+  //   正 = warehouse.db の門 (cdb_publish_gate。safe / broken / unknown) と exit 4 の両方 (どちらかが「流さない」なら止める。自動再試行・手の更新も同じ門を読む)
+  //   確かめが通らなかった (exit 1・落ちた) のに門が「確かめた safe の行」でない = この回も止める (行が無く全部 load の暗黙の safe で流さない。#1564 Codex R5 Medium)
+  const cdbPublishGateNow = readPublishGate({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data') });
+  const cdbPublishGateDecision = gateAfterVerify({ apply: cdbPublishApplyResult, gate: cdbPublishGateNow });
+  publishGate.broken = cdbPublishBroken || cdbPublishGateDecision.broken;
+  publishGate.state = cdbPublishBroken ? 'broken' : cdbPublishGateDecision.state;
+  if (publishGate.broken) console.log(`[DailySync] ⚠️ Company DB の写しの反映の門 = ${publishGate.state} (exit ${cdbPublishApplyResult.exitCode ?? '-'}・${cdbPublishGateDecision.reason}) → m_products・上書き表を読む後の工程を見送る (publish-gate.js)`);
 
   // m_products 変更差分を history に記録 (trigger 廃止 → 差分バッチ化)
   // rebuild-m-products.js の直後に実行 (m_products 確定後の比較)
@@ -737,7 +780,9 @@ async function main() {
   //   送信の失敗も ❌ = retry に載る (世代と中身で冪等。新しい定期実行は作らない)
   const cdbObservedResult = historyResult.success
     ? runScript('apps/company-db/push/sku-cost-observed.mjs --send', 'Company DB 観測の原価', 600000)
-    : { success: false, summary: '⏭️ 見送り: m_products 履歴記録が失敗 = retry で記録してから送る' };
+    // 写しの反映が世代と違う朝 (履歴の記録を止めた) = 観測の原価も runScript が止める (⚠️ 見送り。「履歴が失敗」とは言わない。publish-gate.js)
+    : historyResult.gated ? runScript('apps/company-db/push/sku-cost-observed.mjs --send', 'Company DB 観測の原価', 600000)
+      : { success: false, summary: '⏭️ 見送り: m_products 履歴記録が失敗 = retry で記録してから送る' };
   results.push({ name: 'CompanyDB観測原価', ...cdbObservedResult, warn: cdbObservedResult.success && isWarnSummary(cdbObservedResult.summary) });
 
   // 販売集計テーブル再構築
@@ -751,7 +796,7 @@ async function main() {
 
   // 商品管理リスト スナップショット生成 (在庫集計 + velocity の後)
   // m_products 起点で在庫/販売/利益/発注パラメータを1表に確定し published_run_id を切替。
-  const pmlSnapResult = runScript('apps/warehouse/build-product-management-snapshot.js', '商品管理リスト snapshot');
+  const pmlSnapResult = runScript('apps/warehouse/build-product-management-snapshot.js', '商品管理リスト snapshot');   // 写しの反映が世代と違う朝は runScript が止める
   results.push({ name: 'pml_snapshot', ...pmlSnapResult });
 
   // Amazon Settlement mart 再構築 (Phase 3.5)
@@ -1364,7 +1409,9 @@ async function main() {
   let syncResult;
   const fSalesOk = fSalesResult.success;
   const skuMapOk = rakutenSkuMapResult.success;
-  if (fSalesOk && skuMapOk) {
+  if (publishGate.broken) {
+    syncResult = runScript('apps/warehouse/sync-to-render.js', 'Render同期');   // runScript が止める (⚠️ 見送り。publish-gate.js)
+  } else if (fSalesOk && skuMapOk) {
     syncResult = runScript('apps/warehouse/sync-to-render.js', 'Render同期');
   } else {
     const reasons = [];
@@ -1755,6 +1802,7 @@ async function main() {
   if (notifyMsg.length > GCHAT_MAX) {
     notifyMsg = notifyMsg.slice(0, GCHAT_MAX) + `\n…[本文を切り詰めました。全文は daily-sync ログ参照]`;
   }
+  await flushPublishGatePings();   // 写しの反映が世代と違う朝に止めた工程の fail の ping (自分で ping を打つ工程だけ)
   const notifyOk = await notify(notifyMsg);
 
   console.log(`[DailySync] 完了: ${endTime.toISOString()}`);

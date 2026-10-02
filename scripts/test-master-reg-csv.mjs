@@ -144,6 +144,7 @@ async function toPhase(E, to) {
     await asGate(E, host, () => C.recordLegacyGateAck(E.db, { host, instanceId: inst, buildId, manifest: MANIFEST, ownership: own, phaseSeen: seen }));
   }
   const mh = await C.manifestHashOf(E.db, MANIFEST);
+  if (to !== 'frozen') await (await import('./fixtures/master-epoch.mjs')).seedActiveEpoch(E.db, ALL_COMPANY);   // 0055 (④a): 段階の持ち主表 = 持ち主の epoch (本番 = ④a の activate)
   const evidence = to === 'frozen' ? { expected_builds: BUILDS, manifest_hash: mh, owner_hash: C.ownershipHash(MASTER_OWNERSHIP), manual_entries_stopped: manualStopped(), drain: drain() }
     : { expected_builds: BUILDS, manifest_hash: mh, owner_hash: C.ownershipHash(ALL_COMPANY) };
   return as(E, 'master_ops', () => C.advanceCutoverPhase(E.db, { to, actor: 'naka@test', evidence }));
@@ -1002,6 +1003,8 @@ console.log('\n書き込みの約束 (0051 の ops.master_write_sessions に ⑤
 const asFakeSession = async (op, fn, { skuId = null, products = [], versions = {}, ownership = ALL_COMPANY, actor = 'boss@test' } = {}) => {
   await pg.query('begin');
   try {
+    // 0055 (④a): 約束の持ち主表は持ち主の epoch (active) と同じでないと入らない = 違う持ち主表の約束を作る試験は、取引の中だけ epoch もそれにする (巻き戻す)
+    if (ownership !== ALL_COMPANY) await (await import('./fixtures/master-epoch.mjs')).seedActiveEpoch(pg, ownership);
     const sid = uuid();
     await pg.query(`insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions,
         actor_id, reason, source_system, db_user, phase, owner_hash, ownership)
