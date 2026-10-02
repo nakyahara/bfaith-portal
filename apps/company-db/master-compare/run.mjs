@@ -2,6 +2,8 @@
  * run.mjs — 毎朝のマスタ照合 ①ロードの検証 + ②外との照合 (daily-sync の 1 ステップ。見張りの前。設計 = AI_reference CompanyDB構想/10 §6.1.1 B・C2)
  *   ② (compare-ne.mjs) は ① の後に同じ読み取りの取引で、別の try で流す = ② が落ちても ① の結果・証跡は残る (ne.verdict = error)。
  *   反映待ちの台帳 (pending.mjs) は排他を取ってから読み、② が最後まで走った回だけ新しい版を書いて HEAD を進める
+ *   ②b (compare-old-tables.mjs) = 持ち主が C で NE に欄が無い列 (税区分・売上分類・送料・推奨保有月数) の C ↔ 古い表。② の後に同じ取引で、別の try で流す (④a・Codex #1564 R1 H3)。
+ *     今は持ち主が全部 load = 比べない (not_applied・要約に出さない)
  *
  * 使い方 (miniPC):
  *   node apps/company-db/master-compare/run.mjs --daily [--data-dir D] [--as-of YYYY-MM-DD] [--json]
@@ -27,6 +29,7 @@ import { compareNe, NE_FORMAT } from './compare-ne.mjs';
 import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs, markWriteFailed } from './pending.mjs';
 import { readDecisionLedger, writeDecisions, writeNeCodes, connectDecisionWriter, snapshotRegTargets, writeRegistrationObservations, sealRegistrationRun, runRegistrationCheck } from './decisions.mjs';
 import { readBaseline, writeBaseline, holdAllDirections } from './baseline.mjs';
+import { compareOldTables, oldTablesSummary, oldTablesBad, OLD_FORMAT } from './compare-old-tables.mjs';
 
 export const EVIDENCE_NAME = 'master-compare';
 export const RESULT_DIR = 'cdb-master-compare';
@@ -62,8 +65,14 @@ export function pruneResults(dataDir, { now = new Date(), keepDays = RESULT_KEEP
   for (const d of names) if (/^\d{4}-\d{2}-\d{2}$/.test(d) && d < cutoff) { try { fs.rmSync(path.join(root, d), { recursive: true, force: true }); } catch { /* */ } }
 }
 
-/** 最後の 1 行 (daily-sync の朝の要約に載る) */
+/** 最後の 1 行 (daily-sync の朝の要約に載る)。②b (古い表) は比べた朝だけ足す (⚠️ なら先頭) */
 export function summaryLine(r) {
+  const base = summaryLine12(r);
+  const old = oldTablesSummary(r.old_tables);
+  if (!old) return base;
+  return oldTablesBad(r.old_tables) ? `${old} / ${base}` : `${base} / ${old}`;
+}
+function summaryLine12(r) {
   const one = (() => {
     if (r.verdict === 'blocked') return `⚠️ マスタ照合 ①: 判定できない (${r.blocked_reason})`;
     const c = r.counts || {};
@@ -118,7 +127,7 @@ export function neSummary(ne) {
  * @returns {{ result: object, evidence: object, line: string }}
  */
 export async function runCompare({ db = null, connect = null, dataDir, asOf, now = new Date(), compareRunId = makeCompareRunId(now), compare = compareLoad, write = writeEvidence,
-  neCompare = compareNe, syncRunId = process.env.DAILY_SYNC_RUN_ID || null, writerDb = null, connectWriter = null, cdbReadAt = null }) {
+  neCompare = compareNe, syncRunId = process.env.DAILY_SYNC_RUN_ID || null, writerDb = null, connectWriter = null, cdbReadAt = null, oldCompare = compareOldTables }) {
   const startedAt = now.toISOString();
   if (!write(dataDir, EVIDENCE_NAME, { state: 'running', compare_run_id: compareRunId, as_of: asOf, started_at: startedAt })) {
     throw new Error('証跡 (実行中) を書けない = 前の回の結果を無効にできない');
@@ -163,6 +172,11 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
           } catch (e) {
             result.ne = { format: NE_FORMAT, verdict: 'error', error: String(e && e.message).slice(0, 300) };   // ① は残す
           }
+        }
+        // ②b 古い表 (同じ取引の C を読む。落ちても ①・② は残す)
+        if (oldCompare) {
+          try { result.old_tables = await oldCompare({ db, dataDir, asOfJst: asOf, syncRunId, cdbReadAt: readAt, compareRunId, now }); }
+          catch (e) { result.old_tables = { format: OLD_FORMAT, verdict: 'error', error: String(e && e.message).slice(0, 300) }; }
         }
       } finally { try { await db.query('rollback'); } catch { /* */ } }
       // 台帳 = ② が最後まで走った回 (判定・blocked) で、台帳が信用できるときだけ新しい版 → HEAD
@@ -253,6 +267,9 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         registrations: regEvidence(),
         baseline: result.ne.baseline ? { state: result.ne.baseline.state, held_reason: result.ne.baseline.held_reason ?? null, write: result.ne.baseline.write ?? null, write_code: result.ne.baseline.write_code ?? null,
           counts: result.ne.baseline.counts ?? null, written: result.ne.baseline.written ?? null } : null } : null,
+      // ②b 古い表 (由来 = 作り直しの ID・写しの世代。比べない朝は not_applied と理由だけ)
+      old_tables: result.old_tables ? { verdict: result.old_tables.verdict, reason: result.old_tables.reason ?? null, error: result.old_tables.error ?? null, cols: result.old_tables.cols ?? [],
+        counts: result.old_tables.counts ?? null, build: result.old_tables.build ?? null, publish: result.old_tables.publish ?? null, pending: result.old_tables.pending ?? null } : null,
     };
     if (!write(dataDir, EVIDENCE_NAME, evidence)) throw new Error('証跡 (完了) を書けない');
     // 新規登録の確かめ (#1571 Codex R1 High 2) の 2 段目 = 回が最後まで終わった受け取り (receipt)。結果の JSON (j.sha256) と完了の証跡を書けた後だけ。

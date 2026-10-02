@@ -87,7 +87,7 @@ try {
     const before = await snap();
     assert.ok(before.comps.some((c) => c.listing_code === 'pm_1' && c.sort_order === 3));
     const res = await applyMigrations(dbO, { log: () => {} });
-    assert.deepEqual(res.applied, ['0054']);
+    assert.deepEqual(res.applied, ['0054', '0055']);   // 0055 = ④a の持ち主の epoch (表を足すだけ = ここも何も変えない)
     assert.deepEqual(await snap(), before);
     const r2 = await loadWith(dbO, 'load_pg_1', MASTER_OWNERSHIP);
     assert.equal(r2.ok, true, r2.error); assert.equal(r2.summary.listing_components.applied, 0);
@@ -109,6 +109,7 @@ try {
   await C.advanceCutoverPhase(dbP, { to: 'frozen', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: legacy,
     manual_entries_stopped: [{ id: 'gas:logizard-sheet-and-sku-map', by: 't', at: stamp() }, { id: 'ne:item-screen', by: 't', at: stamp() }], drain: { done: true, checked_by: 't', checked_at: stamp() } } });
   await acks(ALL_COMPANY, 'frozen');
+  await (await import('./fixtures/master-epoch.mjs')).seedActiveEpoch(dbO, ALL_COMPANY);   // 0055 (④a): 段階の持ち主表 = 持ち主の epoch (本番 = ④a の activate)
   await C.advanceCutoverPhase(dbP, { to: 'company_owner', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: h } });
   await acks(ALL_COMPANY, 'company_owner');
   { const p = (await dbP.query('select * from ops.registration_backfill_plan()')).rows[0]; await dbP.query('select ops.backfill_sku_registrations($1, $2, $3)', [p.sku_count, p.snapshot_hash, 't@test']); }

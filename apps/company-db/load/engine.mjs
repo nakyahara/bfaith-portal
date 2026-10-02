@@ -40,8 +40,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normSku } from '../../../lib/sku-norm.js';
-import { MASTER_OWNERSHIP, validateOwnership, loadOwns as ownsIn, companyOwned } from '../../../config/master-ownership.mjs';
+import { validateOwnership, loadOwns as ownsIn, companyOwned } from '../../../config/master-ownership.mjs';
 import { MASTER_WRITE_EXCLUSIVE_LOCK_SQL, MASTER_WRITE_LOCK_EXISTS_SQL } from '../../../lib/master-cutover.mjs';
+import { resolveLoadOwnership, ownershipHashOf, OWNERSHIP_LOCK_EXISTS_SQL, OWNERSHIP_SHARED_LOCK_SQL } from './ownership-state.mjs';
 
 export const COMPANY_ID = 1;
 export const RULE_VERSION = 'v1';
@@ -53,6 +54,7 @@ export const RULE_VERSION = 'v1';
  */
 export const LOAD_RULE_FILES = Object.freeze([
   'apps/company-db/load/sources.mjs', 'apps/company-db/load/engine.mjs', 'apps/warehouse/material-lineage.js', 'lib/sku-norm.js', 'config/master-ownership.mjs',
+  'apps/company-db/load/ownership-state.mjs',   // 持ち主の epoch (0055)。ロードが使う持ち主を決める
   'apps/warehouse-mirror/material-tables.js',   // mirror の表の型 (ロードが読む値・照合が控えを戻す表)
 ]);
 export function loadRuleFingerprint(root = fileURLToPath(new URL('../../../', import.meta.url))) {
@@ -207,10 +209,14 @@ export async function runInitialLoad(db, plan, opts = {}) {
   const futureLimitIso = new Date(futureLimit).toISOString();
   const isFuture = (v) => v != null && ms(v) > futureLimit;
   const isAfterLoad = (v) => v != null && ms(v) > now.getTime();
-  // 列ごとの持ち主 (config/master-ownership.mjs。Company DB構想 10 §5.2)。'company' の列は既にある行を上書きしない。試験は opts.ownership で差し替える
-  const ownership = validateOwnership(opts.ownership || MASTER_OWNERSHIP);
+  // 列ごとの持ち主 (Company DB構想 10 §5.2)。'company' の列は既にある行を上書きしない。試験は opts.ownership で差し替える。
+  //   🚨 config/master-ownership.mjs を直接は使わない (Codex #1564 R1 H1): 0055 の ops.master_ownership_state の active (行が無い = 全部 load)。
+  //   切替の日に明示して頼んだロード (opts.usePrepared) だけが prepared を使う。config を書き換えただけ (configured) では何も変わらない
+  //   🚨 epoch は取引の中で、epoch の鍵 (共有) を取った後に読む (#1564 Codex R3 High 1。下の begin の後)。試験の差し替え (opts.ownership) は取引の前に確かめる (不正 = ロードも始めない)
+  let ownership = opts.ownership ? validateOwnership(opts.ownership) : null;
   const loadOwns = (key) => ownsIn(ownership, key);
-  const report = { run_id: runId, dry_run: dryRun, started_at: nowIso, sections: {}, conflicts: [], unresolved: {}, ok: false, company_owned: companyOwned(ownership) };
+  const report = { run_id: runId, dry_run: dryRun, started_at: nowIso, sections: {}, conflicts: [], unresolved: {}, ok: false, company_owned: ownership ? companyOwned(ownership) : [],
+    ownership_epoch: opts.ownership ? { epoch: 'explicit', state: null } : null };
   const decisions = {};   // 判断の記録 (0030 の ops.load_decisions。照合の ①ロードの検証が、ロードの時の判断をそのまま使う)
   const addUnresolved = (k, v) => { (report.unresolved[k] ||= []).push(v); };
 
@@ -219,6 +225,18 @@ export async function runInitialLoad(db, plan, opts = {}) {
     // 変更の記録 (events.master_change_events。0026) に「誰が」を残す。is_local = true なので取引を出れば消える (接続を使い回しても漏れない)
     await db.query("select set_config('core.actor_type', 'system', true), set_config('core.actor_id', $1, true), set_config('core.source_system', 'company_db_load', true), set_config('core.run_id', $2, true)",
       [opts.host || 'unknown', runId]);
+    // 0055: 持ち主の epoch の鍵を共有で取ってから epoch を読む (#1564 Codex R3 High 1)。prepare / activate / cancel (排他) はこの取引が終わるまで待つ =
+    //   この回が読んだ epoch のまま書き終わる (古い active を読んだロードが新しい active の後に commit して C の列を NE の値で書かない)。
+    //   鍵の順 = epoch (0055) → マスタの書き込み (0051) → 親子 (0036) → 行 (ownership-state.mjs)。0055 の前の DB では取らない
+    if ((await db.query(OWNERSHIP_LOCK_EXISTS_SQL)).rows[0].ok) await db.query(OWNERSHIP_SHARED_LOCK_SQL);
+    if (!opts.ownership) {
+      const epoch = await resolveLoadOwnership(db, { usePrepared: !!opts.usePrepared });
+      ownership = validateOwnership(epoch.ownership);
+      report.company_owned = companyOwned(ownership);
+      report.ownership_epoch = { epoch: epoch.epoch, state: epoch.state };
+      if (epoch.epoch === 'default') log('持ち主の epoch の記録が無い (0055 の前 / まだ prepare していない) = 全部 load として動く');
+    }
+    if (opts.afterEpochRead) await opts.afterEpochRead(report.ownership_epoch);   // 試験だけ: epoch を読んだ後・書く前で止める (本物の PostgreSQL の同時実行の試験)
     // 0051: マスタの書き込みの鍵を排他で (取引の冒頭・親子の鍵より前)。マスタ入力画面の保存と構成の依頼の昇格は共有で取る (短く待って 409)
     //   = この長い取引と保存が行の鍵で待ち合わない (#1563 仮レビュー M3)。0051 の前の DB では取らない (今の動きのまま・ほかに持つ人はいない)
     if ((await db.query(MASTER_WRITE_LOCK_EXISTS_SQL)).rows[0].ok) await db.query(MASTER_WRITE_EXCLUSIVE_LOCK_SQL);
@@ -1246,7 +1264,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const hasLoadMaterials = (await db.query("select 1 from information_schema.tables where table_schema = 'ops' and table_name = 'load_materials'")).rows.length > 0;
     if (hasLoadMaterials) {
       const ownershipSorted = Object.fromEntries(Object.keys(ownership).sort().map((k) => [k, ownership[k]]));
-      const ownershipHash = crypto.createHash('sha256').update(JSON.stringify(Object.keys(ownership).sort().map((k) => [k, ownership[k]]))).digest('hex');
+      const ownershipHash = ownershipHashOf(ownership);   // 1 つの式 (load の列は数えない = lib/master-cutover.mjs の ownershipHash。#1564 Codex R3 Medium)
       // 0029: 規則の指紋・持ち主の設定・ロードの分岐に効く条件 (照合の ①ロードの検証が、ロードした回と同じ規則・持ち主で判定するため)。未適用なら書かない
       const has0029 = (await db.query("select 1 from information_schema.columns where table_schema = 'ops' and table_name = 'load_materials' and column_name = 'rule_fingerprint'")).rows.length > 0;
       const loadConditions = has0029 ? {
@@ -1283,6 +1301,15 @@ export async function runInitialLoad(db, plan, opts = {}) {
       await db.query(`delete from ops.load_decisions where recorded_at < now() - ($1::int * interval '1 day')`, [LOAD_DECISIONS_KEEP_DAYS]);
       report.decisions = Object.fromEntries(Object.keys(decisions).map((k) => [k, true]));
     } else report.notes = [...(report.notes || []), '0030 が未適用: ロードの判断 (ops.load_decisions) は記録しない'];
+    // 0055: commit の順の番号 (#1564 Codex R4 Medium 2)。取引の最後 = epoch の鍵 (共有) とマスタの書き込みの鍵 (排他) を持ったまま 1 行足す =
+    //   足してから commit までほかのロードは入れない = DB が振る番号の順 = commit の順 (送り手の時計では並べない)。写し・activate がこの番号を使う。
+    //   書き込みの鍵は冒頭で取っている (取り直しても同じ取引の中では待たない = ここでも取って、この順を鍵に頼っていることを明示する)。dry-run は足さない
+    if (!dryRun && (await db.query("select to_regclass('ops.master_load_commits') is not null as ok")).rows[0].ok) {
+      await db.query(MASTER_WRITE_EXCLUSIVE_LOCK_SQL);
+      const c = (await db.query(`insert into ops.master_load_commits (ingest_run_id, epoch, ownership_hash, host) values ($1, $2, $3, $4) returning commit_seq::text as seq`,
+        [runId, report.ownership_epoch?.epoch ?? 'explicit', ownershipHashOf(ownership), opts.host || null])).rows[0];
+      report.load_commit_seq = Number(c.seq);
+    }
     if (dryRun) { await db.exec('rollback'); log('dry-run: 全部やってから巻き戻した'); }
     else { await db.exec('commit'); log('commit'); }
     // commit の後: 観測した構成で、構成の依頼を上げる・食い違いを残す (セットごとに別の取引。失敗してもロードは成功のまま = 次の観測でもう一度)

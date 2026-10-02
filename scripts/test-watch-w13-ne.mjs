@@ -8,6 +8,8 @@
  *   3 ② が判定できない・落ちた・② の節が無い = W13:ne は blocked (案件は全部保持)・W13:load は ① で判定する
  *   4 証跡と全件 JSON の ② の判定が食い違う・件数が食い違う = blocked
  *   5 朝の要約: W13:ne の案件は「新・継続」に混ぜず「NE との差 N 件 (新 M)」にまとめる (他の見張りの知らせを埋もれさせない)
+ *   8 W13:old (②b 古い表。④a・#1564 の見直し M-3): breach・overdue = 案件 (old_<列>:<norm>) / 反映待ちだけ = pass (理由つき) / 比べない = pass /
+ *     判定できない・落ちた・節が無い・形が違う・件数が食い違う = blocked (案件は保持) / 翌朝に消えた = 回復
  * 使い方: node scripts/test-watch-w13-ne.mjs
  */
 import assert from 'node:assert/strict';
@@ -32,21 +34,24 @@ const CONFIG = { ...REAL, CHECKS: [REAL.checkById('W13')] };
 
 let seq = 0;
 /** 照合の実行口が書くのと同じ形 (mc-v2) の全件 JSON と証跡。ne = null なら ② の節なし */
-function evidenceFor(asOf, { ne = {}, neVerdictInEvidence, corruptCount = false, evidenceCount } = {}) {
+const OLD_NA = { format: 'mc-old-v1', verdict: 'not_applied', reason: 'load_owned', cols: [], counts: { keys: 0, checked: 0, breach: 0, overdue: 0, lag: 0, held: 0 }, items: [] };
+function evidenceFor(asOf, { ne = {}, neVerdictInEvidence, corruptCount = false, evidenceCount, old = OLD_NA, oldInEvidence } = {}) {
   const runId = `mc_20260926T000000${String(++seq).padStart(3, '0')}Z_abcdef`;
   const neItems = ne ? (ne.items || []) : [];
   const neSec = ne ? { format: ne.format ?? 'mc-ne-v1', verdict: ne.verdict ?? (neItems.length ? 'breach' : 'pass'), blocked_reason: ne.blocked_reason ?? null, error: ne.error ?? null,
     items: neItems, held: ne.held ?? {}, recoverable: ne.recoverable ?? [], out_of_scope: ne.out_of_scope ?? {},
     counts: { items: corruptCount ? neItems.length + 1 : neItems.length, ne_skus: 100, by_class: { lag: neItems.length }, decisions: 0 } } : undefined;
   const res = { format: ne ? 'mc-v2' : 'mc-v1', as_of: asOf, compare_run_id: runId, verdict: 'pass', blocked_reason: null, load: { ingest_run_id: 'load_n1', started_at: `${asOf}T17:00:00Z` },
-    counts: { items: 0, by_type: {}, compared: { value: 1000 } }, items: [], compared: {}, exclusions: {}, finished_at: `${asOf}T22:11:00Z`, ...(neSec ? { ne: neSec } : {}) };
+    counts: { items: 0, by_type: {}, compared: { value: 1000 } }, items: [], compared: {}, exclusions: {}, finished_at: `${asOf}T22:11:00Z`, ...(neSec ? { ne: neSec } : {}),
+    ...(old ? { old_tables: old } : {}) };
   const rel = `cdb-master-compare/${asOf}/${runId}.json`;
   fs.mkdirSync(path.join(DIR, 'cdb-master-compare', asOf), { recursive: true });
   const buf = Buffer.from(JSON.stringify(res), 'utf8');
   fs.writeFileSync(path.join(DIR, rel), buf);
   return { name: 'master-compare', state: 'complete', compare_run_id: runId, as_of: asOf, json_path: rel, sha256: crypto.createHash('sha256').update(buf).digest('hex'),
     verdict: 'pass', blocked_reason: null, counts: res.counts, load: { ingest_run_id: 'load_n1' }, sync_run_id: SYNC,
-    ...(neSec ? { ne: { verdict: neVerdictInEvidence ?? neSec.verdict, blocked_reason: neSec.blocked_reason, counts: evidenceCount != null ? { ...neSec.counts, items: evidenceCount } : neSec.counts } } : {}) };
+    ...(neSec ? { ne: { verdict: neVerdictInEvidence ?? neSec.verdict, blocked_reason: neSec.blocked_reason, counts: evidenceCount != null ? { ...neSec.counts, items: evidenceCount } : neSec.counts } } : {}),
+    ...(old ? { old_tables: oldInEvidence ?? { verdict: old.verdict, reason: old.reason ?? null, counts: old.counts ?? null } } : {}) };
 }
 const item = (type, norm, cls = 'lag') => ({ type, code: norm, norm, kind: 'single', subject_key: `${type}:${norm}`, classes: [cls], columns: [{ col: 'name', cls, n: 'x', c: 'y' }] });
 const pg = new PGlite(); const db = pgliteAdapter(pg);
@@ -58,7 +63,7 @@ const res = (r, scope) => r.results.find((x) => x.checkId === 'W13' && x.scopeKe
 const issues = async (state) => (await db.query("select subject_key from ops.watch_issues where check_id = 'W13' and scope_key = 'ne' and state = $1 order by subject_key", [state])).rows.map((x) => x.subject_key);
 
 await ta('[1] 評価キーは load と ne。ne の差 = breach (info)・案件は scope ne で開く / W13:load は ① で pass', async () => {
-  assert.deepEqual(plannedKeys(CONFIG).map((k) => k.scopeKey), ['load', 'ne']);
+  assert.deepEqual(plannedKeys(CONFIG).map((k) => k.scopeKey), ['load', 'ne', 'old']);
   const r = await run('2026-09-27', evidenceFor('2026-09-27', { ne: { items: [item('value', 'a'), item('value', 'b', 'incomparable'), item('components', 'c'), item('kind', 'd')] } }), '2026-09-26T23:00:00Z');
   assert.deepEqual([res(r, 'load').verdict, res(r, 'ne').verdict, res(r, 'ne').severity], ['pass', 'breach', 'info']);
   assert.deepEqual(await issues('open'), ['components:c', 'kind:d', 'value:a', 'value:b']);
@@ -143,6 +148,47 @@ await ta('[7] 要約: 他の見張りの新しい案件・明細は残り、NE �
   assert.match(onlyNe.lastLine, /^⚠️ .*異常 1 \(新 0 \/ 継続 0\)/);
   const err = summarize({ asOf: d0, planned: [{}], results: [{ checkId: 'W13', scopeKey: 'ne', verdict: 'execution_error', reason: 'x' }], notes: { new: [], continued: [], recovered: [], outOfWindow: [], held: [] }, deadlineHit: false, separate: sep });
   assert.equal(err.icon, '❌');
+});
+
+await ta('[8] W13:old (②b 古い表): breach・overdue = 案件 / 反映待ちだけ・比べない = pass / 判定できない・節が無い・件数の食い違い = blocked (保持) / 消えた = 回復', async () => {
+  const d = '2026-10-04';
+  const oitem = (col, norm, cls, extra = {}) => ({ code: norm, norm, col, c: 1, generation_value: 1, old: 2, class: cls, why: cls === 'overdue' ? 'past_next_build' : 'generation_had_value', start_at: null, ...extra });
+  const oldOf = (items, extra = {}) => {
+    const n = (c) => items.filter((i) => i.class === c).length;
+    return { format: 'mc-old-v1', verdict: n('breach') + n('overdue') ? 'breach' : n('lag') ? 'lag' : 'pass', reason: null, cols: ['tax_class', 'reorder_months'],
+      counts: { keys: 3000, checked: 6000, breach: n('breach'), overdue: n('overdue'), lag: n('lag'), held: 0 }, items, build: { build_id: 'mpb_x' }, publish: { generation_no: 7 }, ...extra };
+  };
+  const oldIssues = async (state) => (await db.query("select subject_key from ops.watch_issues where check_id = 'W13' and scope_key = 'old' and state = $1 order by subject_key", [state])).rows.map((x) => x.subject_key);
+  let r = await run(d, evidenceFor(d, { old: oldOf([oitem('tax_class', 's-a', 'breach'), oitem('reorder_months', 's-b', 'overdue'), oitem('tax_class', 's-c', 'lag')]) }), '2026-10-03T23:00:00Z');
+  assert.deepEqual([res(r, 'old').verdict, res(r, 'old').severity, res(r, 'load').verdict], ['breach', 'info', 'pass']);
+  assert.match(res(r, 'old').reason, /古い表に C の値が入っていない 2 件 \(世代 7・作り直し mpb_x\)/);
+  assert.deepEqual(await oldIssues('open'), ['old_reorder_months:s-b', 'old_tax_class:s-a']);   // 反映待ち (s-c) は案件にしない
+  // 反映待ちだけ = pass (理由つき)・前の案件は回復
+  r = await run(d, evidenceFor(d, { old: oldOf([oitem('tax_class', 's-c', 'lag')]) }), '2026-10-03T23:10:00Z');
+  assert.deepEqual([res(r, 'old').verdict, res(r, 'old').reason], ['pass', '反映待ち 1 件 (写しの後に C を直した = 翌朝の作り直しで入る)']);
+  assert.deepEqual(await oldIssues('recovered'), ['old_reorder_months:s-b', 'old_tax_class:s-a']);
+  // 判定できない・落ちた・節が無い・形が違う・件数が食い違う・証跡と食い違う = blocked (案件は保持)
+  await run(d, evidenceFor(d, { old: oldOf([oitem('tax_class', 's-d', 'breach')]) }), '2026-10-03T23:20:00Z');
+  const cases = [
+    [{ old: oldOf([], { verdict: 'blocked', reason: 'stale_build' }) }, /判定できない \(stale_build\)/],
+    [{ old: { ...oldOf([]), verdict: 'error', error: 'boom' } }, /落ちた \(boom\)/],
+    [{ old: null }, /節が無い/],
+    [{ old: { ...oldOf([]), format: 'mc-old-v0' } }, /形が違う/],
+    [{ old: { ...oldOf([oitem('tax_class', 's-d', 'breach')]), counts: { breach: 2, overdue: 0, lag: 0 } } }, /件数が食い違う/],
+    [{ old: oldOf([oitem('tax_class', 's-d', 'breach')]), oldInEvidence: { verdict: 'breach', counts: { breach: 0, overdue: 0 } } }, /件数が証跡と食い違う/],
+    [{ old: oldOf([oitem('tax_class', 's-d', 'breach')]), oldInEvidence: { verdict: 'pass', counts: { breach: 1 } } }, /判定が証跡と食い違う/],
+  ];
+  let i = 0;
+  for (const [opt, re] of cases) {
+    r = await run(d, evidenceFor(d, opt), `2026-10-03T23:${30 + i++}:00Z`);
+    assert.equal(res(r, 'old').verdict, 'blocked', JSON.stringify(res(r, 'old')));
+    assert.match(res(r, 'old').reason, re);
+    assert.deepEqual(await oldIssues('open'), ['old_tax_class:s-d']);   // 回復にしない
+  }
+  // 比べない (持ち主が全部 load に戻った) = pass
+  r = await run(d, evidenceFor(d, {}), '2026-10-03T23:50:00Z');
+  assert.deepEqual([res(r, 'old').verdict], ['pass']);
+  assert.match(res(r, 'old').reason, /比べない \(load_owned\)/);
 });
 
 await pg.close();

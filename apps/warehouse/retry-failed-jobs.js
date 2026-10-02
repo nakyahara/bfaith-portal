@@ -34,6 +34,7 @@ import { fileURLToPath } from 'url';
 import { isWarnSummary } from './amazon-fees-outcome.js';
 import { acquireRetryLock, releaseRetryLock } from './retry-lock.js';
 import { financeCoordinatorEnabled, legacyGateCheck, FINANCE_COORDINATOR_ENV } from './finance-coordinator-switch.js';
+import { publishGateDecision, readPublishGate } from './publish-gate.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -338,13 +339,22 @@ function deleteState() {
  * 1 回ぶんの再試行 (実行ループ)。remaining_jobs のうち RETRY_ORDER にあるものを順に走らせ、結果 [{name, success, summary}] を返す。
  * main() から切り出しただけで動きは同じ (試験が run を差し替えて、上流の規則が実際のループで効いていることを確かめられるように。Codex #1369 R1 #2)
  */
-export function runRetryRound(remainingJobs, { run = runScript, log = console.log, rerunAfter = RERUN_AFTER } = {}) {
+export function runRetryRound(remainingJobs, { run = runScript, log = console.log, rerunAfter = RERUN_AFTER, publishGate = { broken: false } } = {}) {
   const results = []; // {name, success, summary}
   const rerun = new Set();   // この回で上流が成功したので走らせ直す下流 (RERUN_AFTER)
 
   for (const jobName of RETRY_ORDER) {
     if (!remainingJobs.includes(jobName) && !rerun.has(jobName)) continue;
     if (!remainingJobs.includes(jobName)) log(`[Retry] ${jobName} を走らせ直す (上流がこの回で成功)`);
+
+    // Company DB の写しの反映が世代と違う (証跡 master-publish の apply.broken) = m_products・上書き表を読む工程は再試行でも動かさない
+    //   (daily-sync と同じ一覧 = publish-gate.js。RERUN_AFTER の走らせ直しも同じ。ほかの見送りの理由より先に見る。#1564 の見直し M-2)
+    const gate = Object.hasOwn(JOB_DEFINITIONS, jobName) ? publishGateDecision(JOB_DEFINITIONS[jobName].script, publishGate) : { skip: false };
+    if (gate.skip) {
+      log(`[Retry] ${jobName} ${gate.summary}`);
+      results.push({ name: jobName, success: false, blocked: true, gated: true, pingJobId: gate.pingJobId, summary: gate.summary });
+      continue;
+    }
 
     // Render同期 fail-fast: 今回 f_sales / 楽天sku_map を試行して失敗した場合スキップ。
     //   どちらかが remaining_jobs に無い (= 既に成功済み) なら同方向はクリア扱い、
@@ -466,7 +476,14 @@ async function runLocked() {
   const startedAt = new Date();
   console.log(`[Retry] 試行 ${retryCount}/${MAX_RETRY_COUNT}: ${state.remaining_jobs.join(', ')}`);
 
-  const results = runRetryRound(state.remaining_jobs);
+  const publishGate = readPublishGate({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data') });
+  if (publishGate.broken) console.log(`[Retry] ⚠️ Company DB の写しの反映の門 = ${publishGate.state} (${publishGate.reason}) → m_products・上書き表を読む工程は動かさない`);
+  const results = runRetryRound(state.remaining_jobs, { publishGate });
+  // 止めた工程のうち自分で ping を打つもの = fail の ping (送れなくても再試行は続ける)
+  for (const r of results.filter((x) => x.gated && x.pingJobId)) {
+    try { const { sendPing } = await import('../../scripts/company-db/lz-daily.mjs'); await sendPing(r.pingJobId, { status: 'fail', note: String(r.summary).slice(0, 180) }); }
+    catch (e) { console.warn(`[Retry] 止めた工程の ping を送れない (${r.pingJobId}): ${e.message}`); }
+  }
 
   // fail-closed: remaining_jobs のうち runner に定義が無いジョブ (daily-sync の RETRYABLE_JOBS には
   // あるが JOB_DEFINITIONS/RETRY_ORDER 未登録、例: Amazon finance build) は上の

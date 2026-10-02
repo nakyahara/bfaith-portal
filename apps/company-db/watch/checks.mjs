@@ -35,7 +35,11 @@ export function plannedKeys(config) {
     else if (c.id === 'W7' || c.id === 'W8' || c.id === 'W11') for (const m of config.ORDER_MALLS) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(m.mall, m.scope) });
     else if (c.id === 'W6') keys.push({ checkId: c.id, scopeKey: scopeKeyOf('all', config.W6_SCOPE.scope) });
     else if (c.id === 'W12') keys.push({ checkId: c.id, scopeKey: 'db/company' });
-    else if (c.id === 'W13') { keys.push({ checkId: c.id, scopeKey: config.W13_SCOPE }); if (config.W13_NE_SCOPE) keys.push({ checkId: c.id, scopeKey: config.W13_NE_SCOPE }); }
+    else if (c.id === 'W13') {
+      keys.push({ checkId: c.id, scopeKey: config.W13_SCOPE });
+      if (config.W13_NE_SCOPE) keys.push({ checkId: c.id, scopeKey: config.W13_NE_SCOPE });
+      if (config.W13_OLD_SCOPE) keys.push({ checkId: c.id, scopeKey: config.W13_OLD_SCOPE });
+    }
     else if (c.id === 'W10') { for (const k of config.W10_KINDS) keys.push({ checkId: c.id, scopeKey: w10KindKey(k) }); keys.push({ checkId: c.id, scopeKey: W10_OTHER }); }
     else if (c.id === 'W14') for (const s of config.AD_SPEND_SCOPES || []) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(s.mall, s.scope) });
   }
@@ -845,6 +849,41 @@ function evalW13Ne(config, check, res, ev, base0) {
   }
   return r;
 }
+/**
+ * W13:old (②b 古い表。④a・#1564 の見直し M-3)。全件 JSON の old_tables 節から breach・overdue を案件に (subject key = old_<列>:<code_norm>)。
+ * ② と同じ日の期限: 反映待ち (lag) は案件にしない (翌朝の作り直しで入る)・翌朝も違えば overdue = 案件。比べない (not_applied) = pass
+ */
+function evalW13Old(config, check, res, ev, base0) {
+  const r = base0();
+  const o = res.old_tables;
+  const hold = (reason) => { r.verdict = 'blocked'; r.reason = reason; return r; };
+  if (!o || typeof o !== 'object') return hold('照合 ②b の節が無い (②b の前の照合)');
+  r.observed = { verdict: o.verdict, reason: o.reason ?? null, cols: o.cols ?? [], counts: o.counts ?? null, build: o.build?.build_id ?? null, generation_no: o.publish?.generation_no ?? null,
+    pending: o.pending ? { state: o.pending.state, reason: o.pending.reason ?? null } : null };
+  if ((ev.old_tables && ev.old_tables.verdict) !== o.verdict) return hold('照合 ②b の判定が証跡と食い違う');
+  if (o.verdict === 'error') return hold(`照合 ②b が落ちた (${String(o.error || '').slice(0, 160)})`);
+  if (o.format !== config.W13_OLD_FORMAT) return hold(`照合 ②b の形が違う (${o.format})`);
+  if (o.verdict === 'blocked') return hold(`照合 ②b が判定できない (${o.reason})`);
+  if (o.verdict === 'not_applied') { r.verdict = 'pass'; r.reason = `比べない (${o.reason}) = 持ち主が C で NE に欄が無い列が無い`; return r; }
+  const bad = (Array.isArray(o.items) ? o.items : []).filter((i) => i && (i.class === 'breach' || i.class === 'overdue'));
+  const want = (o.counts?.breach ?? 0) + (o.counts?.overdue ?? 0);
+  if (bad.length !== want) return hold('照合 ②b の件数が食い違う (breach・overdue の明細が全部無い)');
+  const evc = ev.old_tables && ev.old_tables.counts;
+  if (!evc || (evc.breach ?? 0) + (evc.overdue ?? 0) !== want) return hold('照合 ②b の件数が証跡と食い違う');
+  const seen = new Set();
+  for (const i of bad) {
+    const key = `old_${i.col}:${i.norm ?? i.code}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    r.items.push({ subjectType: 'sku_problem', subjectKey: key, payload: { code: i.code, col: i.col, class: i.class, why: i.why, c: i.c, generation_value: i.generation_value ?? null, old: i.old, since: i.start_at ?? null } });
+  }
+  r.itemTotal = r.items.length;
+  r.sampleSize = o.counts?.keys ?? null;
+  r.verdict = r.items.length ? 'breach' : 'pass';
+  r.reason = r.items.length ? `古い表に C の値が入っていない ${r.items.length} 件 (世代 ${o.publish?.generation_no ?? '?'}・作り直し ${o.build?.build_id ?? '?'})`
+    : (o.counts?.lag ? `反映待ち ${o.counts.lag} 件 (写しの後に C を直した = 翌朝の作り直しで入る)` : null);
+  return r;
+}
 /** 証跡・全件 JSON の置き場所 = 実行口が決めた値 (--data-dir が先)、無ければ env DATA_DIR (Codex #1456 R2 Medium) */
 export const w13DataDir = (dataDir) => String(dataDir || process.env.DATA_DIR || '').trim();
 /**
@@ -864,10 +903,16 @@ export async function evalW13(ctx, check) {
   const r = base(check, scopeKey, { periodFrom: asOf, periodTo: asOf });
   // ② (評価キー ne) は同じ証跡・全件 JSON を読む。JSON そのものが使えなければ両方 blocked
   const neBase = () => base(check, config.W13_NE_SCOPE, { periodFrom: asOf, periodTo: asOf });
+  const oldBase = () => base(check, config.W13_OLD_SCOPE, { periodFrom: asOf, periodTo: asOf });
+  // JSON そのものが使えない = ② と ②b の評価キーも blocked (① と同じ理由)
   const withNe = (list) => {
-    if (!config.W13_NE_SCOPE) return list;
-    if (list.length === 2) return list;
-    const n = neBase(); n.verdict = 'blocked'; n.reason = r.reason; n.inputGeneration = r.inputGeneration; return [...list, n];
+    const out = [...list];
+    const have = new Set(out.map((x) => x.scopeKey));
+    for (const [scope, mk] of [[config.W13_NE_SCOPE, neBase], [config.W13_OLD_SCOPE, oldBase]]) {
+      if (!scope || have.has(scope)) continue;
+      const n = mk(); n.verdict = 'blocked'; n.reason = r.reason; n.inputGeneration = r.inputGeneration; out.push(n);
+    }
+    return out;
   };
   const hold = (reason) => { r.verdict = 'blocked'; r.reason = reason; return withNe([r]); };
   const ev = readW13Evidence(config, asOf, evidence, ctx.dataDir);
@@ -894,7 +939,10 @@ export async function evalW13(ctx, check) {
     blocked_reason: res.blocked_reason, counts: res.counts, observed_at: res.finished_at ?? null };
   // ② は ① が判定できなくても評価する (② の前提は ② が自分で持つ)
   const neResult = config.W13_NE_SCOPE ? (() => { const x = evalW13Ne(config, check, res, ev, neBase); x.inputGeneration = r.inputGeneration; return x; })() : null;
-  if (res.verdict === 'blocked') { r.verdict = 'blocked'; r.reason = `照合が判定できない (${res.blocked_reason})`; return neResult ? [r, neResult] : [r]; }
+  // ②b も ① が判定できなくても評価する (②b の前提は ②b が自分で持つ)
+  const oldResult = config.W13_OLD_SCOPE ? (() => { const x = evalW13Old(config, check, res, ev, oldBase); x.inputGeneration = r.inputGeneration; return x; })() : null;
+  const others = [neResult, oldResult].filter(Boolean);
+  if (res.verdict === 'blocked') { r.verdict = 'blocked'; r.reason = `照合が判定できない (${res.blocked_reason})`; return [r, ...others]; }
   // 全案件 (保存の段で間引く)。同じ subject key は 1 つ
   const seen = new Set();
   for (const i of items) {
@@ -920,7 +968,7 @@ export async function evalW13(ctx, check) {
     const t = res.counts?.by_type || {};
     r.reason = `ロードの後にあるべき値と違う ${r.items.length} 件 (無い ${t.missing ?? 0} / 値 ${t.value ?? 0} / 原価 ${t.cost ?? 0} / 代表の仕入先 ${t.primary_supplier ?? 0} / 構成 ${t.components ?? 0} / 代表の親子 ${t.parent ?? 0})`;
   }
-  return neResult ? [r, neResult] : [r];
+  return [r, ...others];
 }
 
 // ── W14 広告費の取込の完了と検算 (Company DB構想 11 の ③)

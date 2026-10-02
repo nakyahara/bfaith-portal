@@ -836,6 +836,71 @@ function createTables() {
   // 作り直しが信用した NE の印の通し番号 (C1。照合 ② は「作り直しの材料 = 比べる NE」を時刻と番号の組で確かめる)。信用しなかった回・前の記録は NULL
   addColumnIfMissing('m_products_builds', 'ne_products_complete_rev', 'INTEGER');
   addColumnIfMissing('m_products_builds', 'ne_setproducts_complete_rev', 'INTEGER');
+  // 作り直しが使った Company DB の写しの世代 (④a。持ち主が全部 load の日は、持ち主が同じ今の世代 = 値 0 行)。前の記録・世代が無い回は NULL。
+  //   applied_hash = 入れた後に読み直した「持ち主が C の列の値」のハッシュ (次の工程 fetch.mjs --verify-apply が読み直して同じか確かめる)
+  addColumnIfMissing('m_products_builds', 'cdb_publish_generation_no', 'INTEGER');
+  addColumnIfMissing('m_products_builds', 'cdb_publish_generation_id', 'TEXT');
+  addColumnIfMissing('m_products_builds', 'cdb_publish_content_hash', 'TEXT');
+  addColumnIfMissing('m_products_builds', 'cdb_publish_applied_hash', 'TEXT');
+  // 使った世代の持ち主の設定のハッシュ = 今使っている epoch (この記録は作り直しの取引が通ったときだけ入る = 通らなければ epoch は進まない。Codex R1 H1)
+  addColumnIfMissing('m_products_builds', 'cdb_publish_ownership_hash', 'TEXT');
+  // 16b-2. Company DB の写し (マスタ正本切替 ④a。設計 = AI_reference CompanyDB構想/15 §3。apps/warehouse/master-publish.js)
+  //   書くのは apps/company-db/publish/fetch.mjs (daily-sync の「Company DB の写し」)。持ち主が C の列の値を、確かめてから 1 取引で世代ごとに入れる。
+  //   今の世代 = sync_meta 'cdb_publish_current' (verified のときだけ・前にしか進まない)。読むのは rebuild-m-products.js。14 世代残す (今の世代は消さない)
+  db.exec(`CREATE TABLE IF NOT EXISTS cdb_publish_generations (
+    generation_no      INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation_id      TEXT NOT NULL UNIQUE,
+    cdb_read_at        TEXT NOT NULL,
+    version_watermark  INTEGER,
+    watermark_fingerprint TEXT,
+    load_run_id        TEXT,
+    load_commit_seq    INTEGER,
+    ownership          TEXT NOT NULL,
+    ownership_hash     TEXT NOT NULL,
+    row_count          INTEGER NOT NULL,
+    sku_count          INTEGER NOT NULL,
+    content_hash       TEXT NOT NULL,
+    state              TEXT NOT NULL CHECK (state IN ('verified', 'rejected')),
+    reason             TEXT,
+    created_at         TEXT NOT NULL
+  )`);
+  //   value = JSON の文字列。'null' = Company DB でわざと空にした値。col = '_sku' = その SKU が Company DB にあることの行 (持ち主が C の列があるときだけ。
+  //   「C にある SKU の欄が欠けた」(止める) と「C に無い SKU」(NE の値で作る) を分ける)
+  db.exec(`CREATE TABLE IF NOT EXISTS cdb_publish_values (
+    generation_no  INTEGER NOT NULL REFERENCES cdb_publish_generations (generation_no) ON DELETE CASCADE,
+    code_norm      TEXT NOT NULL,
+    col            TEXT NOT NULL CHECK (col IN ('_sku', 'name', 'cost', 'standard_price', 'tax_rate', 'tax_class', 'sales_class', 'shipping', 'reorder_months', 'handling', 'primary_supplier')),
+    code           TEXT NOT NULL,
+    sku_kind       TEXT NOT NULL CHECK (sku_kind IN ('single', 'set', 'exception')),
+    value          TEXT NOT NULL,
+    PRIMARY KEY (generation_no, code_norm, col)
+  )`);
+  // 16b'. 写しの反映の門 (④a・#1564 Codex R2 High 2)。後の工程 (daily-sync・自動再試行・商品管理リストの手の更新) を止めるかどうかの正 = この 1 行。
+  //   safe = 流してよい / broken = 古い表が作り直しの世代と違う / unknown = 持ち主が C なのに確かめられていない。
+  //   broken を safe に戻せるのは「入れた後の確かめ」が通った回だけ (fetch.mjs --verify-apply)。遅れ・証跡が読めない回は前の値のまま。
+  //   行が無い = 持ち主が全部 load と分かる (確かめた世代と作り直しが両方ある) ときだけ「流してよい」。apps/warehouse/publish-gate.js
+  //   safe は確かめた作り直し・世代・入れた値のハッシュ・持ち主のハッシュを持つ = 読み手が今と比べ、違えば使わない (#1564 Codex R3 High 2)
+  db.exec(`CREATE TABLE IF NOT EXISTS cdb_publish_gate (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    state          TEXT NOT NULL CHECK (state IN ('safe', 'broken', 'unknown')),
+    reason         TEXT,
+    build_id       TEXT,
+    generation_no  INTEGER,
+    applied_hash   TEXT,
+    ownership_hash TEXT,
+    checked_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+  )`);
+  addColumnIfMissing('cdb_publish_gate', 'applied_hash', 'TEXT');
+  addColumnIfMissing('cdb_publish_gate', 'ownership_hash', 'TEXT');
+  addColumnIfMissing('cdb_publish_generations', 'load_commit_seq', 'INTEGER');
+  // 16b''. C にあるセットの導き方の入力・構成品の行 (#1564 Codex R7 High)。書くのは作り直しの取引 (m_products と一緒に入れ替える)。
+  //   入れた後の確かめ (master-publish.js の verifyApplied) が同じ決め方で導き直して m_products・m_set_components と比べる (持ち主が全部 load = 行が無い)
+  db.exec(`CREATE TABLE IF NOT EXISTS m_set_publish_expect (
+    set_code        TEXT PRIMARY KEY,
+    args_json       TEXT NOT NULL,
+    components_json TEXT NOT NULL
+  )`);   // 世代が読んだ夜間ロードの commit の番号 (0055。activate が比べる。#1564 Codex R4 Medium 2)
   // 16c. raw_ne_products / raw_ne_set_products の通し番号 (sync_meta の ne_raw_<kind>_rev)。書き換えた行 1 つにつき 1 増える (INSERT OR REPLACE も 1)。
   //   どの書き込み口でも同じ取引で増える → NE 取込の完了の印 (ne_api_<kind>_complete_rev) と比べて「印の後に書かれたか」を見分ける (readNeRawRev)
   for (const [table, kind] of [['raw_ne_products', 'products'], ['raw_ne_set_products', 'setproducts']]) {

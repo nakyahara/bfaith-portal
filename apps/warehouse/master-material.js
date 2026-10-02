@@ -15,8 +15,11 @@
 import crypto from 'node:crypto';
 import { materialDigest, contentHash } from './material-lineage.js';
 
-/** 作り直しの規則の版 (rebuild-m-products.js の値の決め方を変えたら上げる。ロードの規則の指紋とは別) */
-export const MASTER_BUILD_RULE_VERSION = 'mpb-v1';
+/**
+ * 作り直しの規則の版 (rebuild-m-products.js の値の決め方を変えたら上げる。ロードの規則の指紋とは別)。
+ * mpb-v2 = 持ち主が C の列に Company DB の写しの値を重ねる (④a。持ち主が全部 load の間は値は v1 と同じ)
+ */
+export const MASTER_BUILD_RULE_VERSION = 'mpb-v2';
 export const BUILD_KEEP_DAYS = 60;
 export const BUILD_ID_RE = /^mpb_\d{8}T\d{9}Z_[0-9a-f]{6}$/;
 export const REBUILD_LOCK_KEY = 'm_products_rebuild_lock';
@@ -130,8 +133,10 @@ export function releaseRebuildLock(db, owner) {
  * @param {string} p.buildId 作り直しの札の持ち主と同じ ID
  * @param {ReturnType<typeof readNeMarks>} p.startMarks 作り始めに読んだ NE の印と通し番号
  * @param {object[]} p.reasons 作り直しが値を決めたその場で集めた SKU ごとの理由 (後から raw を読み直して推定しない。Codex PR #1453 R1 Medium-3)
+ * @param {{ generation_no, generation_id, content_hash, ownership_hash, applied_hash }|null} [p.publish] 作り直しが使った Company DB の写しの世代・持ち主 (epoch)・
+ *   入れた後の確かめのハッシュ (④a。master-publish.js)。無ければ null。この記録が入った (取引が通った) = その持ち主が「今使っている epoch」
  */
-export function recordBuild(db, { buildId = makeBuildId(), startMarks, startedAt, reasons = [], dailySyncRunId = process.env.DAILY_SYNC_RUN_ID || null, now = new Date() }) {
+export function recordBuild(db, { buildId = makeBuildId(), startMarks, startedAt, reasons = [], dailySyncRunId = process.env.DAILY_SYNC_RUN_ID || null, now = new Date(), publish = null }) {
   const endMarks = readNeMarks(db);
   const mp = judgeNeMark(startMarks.products, endMarks.products);
   const ms = judgeNeMark(startMarks.set_components, endMarks.set_components);
@@ -147,19 +152,28 @@ export function recordBuild(db, { buildId = makeBuildId(), startMarks, startedAt
       build_id, daily_sync_run_id, started_at, published_at,
       ne_products_complete_at, ne_products_mark_note, ne_setproducts_complete_at, ne_setproducts_mark_note,
       products_rows, products_hash, set_components_rows, set_components_hash, rule_version, reason_counts, reasons,
-      ne_products_complete_rev, ne_setproducts_complete_rev
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      ne_products_complete_rev, ne_setproducts_complete_rev, cdb_publish_generation_no, cdb_publish_generation_id, cdb_publish_content_hash, cdb_publish_applied_hash,
+      cdb_publish_ownership_hash
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(buildId, dailySyncRunId, startedAt, publishedAt, mp.value, mp.note, ms.value, ms.note,
       pd.row_count, pd.content_hash, sd.row_count, sd.content_hash, MASTER_BUILD_RULE_VERSION, JSON.stringify(counts), JSON.stringify(kept),
-      mp.rev, ms.rev);
+      mp.rev, ms.rev, publish ? publish.generation_no : null, publish ? publish.generation_id : null, publish ? publish.content_hash : null, publish ? publish.applied_hash ?? null : null,
+      publish ? publish.ownership_hash ?? null : null);
   const cutoff = new Date(now.getTime() - BUILD_KEEP_DAYS * 86400000).toISOString();
   db.prepare('DELETE FROM m_products_builds WHERE published_at < ?').run(cutoff);
-  return { build_id: buildId, products: pd, set_components: sd, marks: { products: mp, set_components: ms }, reason_counts: counts };
+  return { build_id: buildId, products: pd, set_components: sd, marks: { products: mp, set_components: ms }, reason_counts: counts, publish };
 }
 
-/** 最新の作り直しの記録 (入れ替えた時刻の新しい順で 1 行) */
+/** 作り直しの記録の Company DB の写しの世代 (④a)。無ければ null */
+export function publishOfBuild(build) {
+  if (!build || build.cdb_publish_generation_no == null) return null;
+  return { generation_no: build.cdb_publish_generation_no, generation_id: build.cdb_publish_generation_id ?? null,
+    content_hash: build.cdb_publish_content_hash ?? null, applied_hash: build.cdb_publish_applied_hash ?? null, ownership_hash: build.cdb_publish_ownership_hash ?? null };
+}
+
+/** 最新の作り直しの記録 (入れ替えた時刻の新しい順で 1 行。同じ時刻 = 後に入れた行 = rowid。build_id の乱数で決めない = #1564 Codex R2 の「何も変わらない作り直し」が前の記録と比べる) */
 export function latestBuild(db) {
-  return db.prepare('SELECT * FROM m_products_builds ORDER BY published_at DESC, build_id DESC LIMIT 1').get() || null;
+  return db.prepare('SELECT * FROM m_products_builds ORDER BY published_at DESC, rowid DESC LIMIT 1').get() || null;
 }
 
 /**
@@ -189,6 +203,8 @@ export function readMaterialWithLineage(db) {
         build_id: build.build_id, rule_version: build.rule_version, published_at: build.published_at, daily_sync_run_id: build.daily_sync_run_id,
         ne_products_complete_at: build.ne_products_complete_at, ne_products_complete_rev: build.ne_products_complete_rev ?? null, ne_products_mark_note: build.ne_products_mark_note,
         ne_setproducts_complete_at: build.ne_setproducts_complete_at, ne_setproducts_complete_rev: build.ne_setproducts_complete_rev ?? null, ne_setproducts_mark_note: build.ne_setproducts_mark_note,
+        // 作り直しが使った Company DB の写しの世代 (④a。前の記録・世代が無い = null)。材料の世代 (build)・Render 到達の証跡・照合 ② に渡る
+        cdb_publish: publishOfBuild(build),
       };
   }
   return { products, set_components, semantics, lineage };

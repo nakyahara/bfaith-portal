@@ -143,6 +143,7 @@ async function openCutover(E, ownership, upTo = 'new_open') {
     manual_entries_stopped: [{ id: 'gas:logizard-sheet-and-sku-map', by: 't', at: stamp() }, { id: 'ne:item-screen', by: 't', at: stamp() }], drain: { done: true, checked_by: 't', checked_at: stamp() } });
   if (upTo === 'frozen') return;
   await acks(ownership, 'frozen');
+  await (await import('./fixtures/master-epoch.mjs')).seedActiveEpoch(E.db, ownership);   // 0055 (④a): 段階の持ち主表 = 持ち主の epoch (本番 = ④a の activate)
   await advance(E, 'company_owner', { expected_builds: BUILDS, manifest_hash: mh, owner_hash: h });
   if (upTo === 'company_owner') return;
   await acks(ownership, 'company_owner');
@@ -171,7 +172,7 @@ await ta('[1] 同じ材料の夜間ロード (全部 load・legacy_open): 0053 �
   assert.deepEqual(await snapshot(E53.db), await snapshot(E52.db));
   // 0053 の DB に 0054 を後から流す = 失敗しない・何も変わらない
   const before = await snapshot(E52.db);
-  const res = await applyMigrations(E52.db, { log: quiet });
+  const res = await applyMigrations(E52.db, { log: quiet, to: '0054' });   // 0054 だけ (0055 = ④a は別の話)
   assert.deepEqual(res.applied, ['0054']);
   assert.deepEqual(await snapshot(E52.db), before);
   assert.equal((await E52.db.query('select count(*)::int as n from core.amazon_sku_maps')).rows[0].n, 0);

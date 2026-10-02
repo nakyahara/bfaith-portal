@@ -40,6 +40,8 @@ const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
 const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
 const W = await import('../lib/master-write.mjs');
 const C = await import('../lib/master-cutover.mjs');
+// 0055 (④a): company_owner・new_open に進むのは持ち主の epoch が active で段階の持ち主表と同じときだけ = 進める直前に試験で置く
+const EPOCH = (await import('./fixtures/master-epoch.mjs')).epochSeeder();
 const R = await import('../apps/master-edit/read.mjs');
 const { default: router, __setPgClientFactory, __setClock, __setOwnership, __setShippingRatesProvider } = await import('../apps/master-edit/router.mjs');
 
@@ -58,6 +60,7 @@ const rejectsWith = async (p, status, reason) => {
 const pgCode = async (p) => { try { await p; return 'ok'; } catch (e) { return e.code || e.message; } };
 
 const ALL_COMPANY = Object.fromEntries(Object.keys(MASTER_OWNERSHIP).map((k) => [k, 'company']));
+EPOCH.remember(ALL_COMPANY);
 const withOwn = (over) => ({ ...MASTER_OWNERSHIP, ...over });
 const LOAD_NOW = new Date('2030-01-05T03:00:00Z');   // 夜間ロードの日 (東京 2030-01-05)
 const NOW = new Date('2030-01-10T03:00:00Z');        // 画面の今日 (東京 2030-01-10)
@@ -142,7 +145,10 @@ async function asGate(E, host, fn) {
 const gateAck = (E, host, instanceId, buildId, ownership, phaseSeen, inflight = 0) => asGate(E, host, () => C.recordLegacyGateAck(E.db,
   { host, instanceId, buildId, manifest: MANIFEST, ownership, phaseSeen, inflightCount: inflight, oldestInflightAt: inflight ? new Date().toISOString() : null }));
 /** 段階を進める (運用のロール master_ops) */
-const advance = (E, to, evidence, note = null) => asRole(E, 'master_ops', () => C.advanceCutoverPhase(E.db, { to, actor: 'naka@test', evidence, note }));
+const advance = async (E, to, evidence, note = null) => {
+  if (to === 'company_owner' || to === 'new_open') await EPOCH.seedFor(E.db, evidence && evidence.owner_hash);   // 本番 = ④a の activate
+  return asRole(E, 'master_ops', () => C.advanceCutoverPhase(E.db, { to, actor: 'naka@test', evidence, note }));
+};
 /** 0052 (⑤-2a): new_open の前に既存の SKU の登録の状態 (backfill) が要る。運用のロール master_ops で計画を見て流す */
 const backfill = (E) => asRole(E, 'master_ops', async () => {
   const p = (await E.db.query('select * from ops.registration_backfill_plan()')).rows[0];
@@ -150,6 +156,7 @@ const backfill = (E) => asRole(E, 'master_ops', async () => {
 });
 /** 試験だけの切替: 門の記録を足しながら、証拠つきで new_open まで進める (本番の関数そのまま・門は弱めない)。プロセス r-a (render)・m-a (minipc) */
 async function openCutover(E, ownership) {
+  EPOCH.remember(ownership);
   const h = C.ownershipHash(ownership);
   const mh = await C.manifestHashOf(E.db, MANIFEST);
   for (const [host, inst, build] of [['render', 'r-a', 'r1'], ['minipc', 'm-a', 'm1']]) await gateAck(E, host, inst, build, MASTER_OWNERSHIP, 'legacy_open');
@@ -1328,13 +1335,14 @@ await ta('[14c] 約束の後の抜け道 (#1563 R5): 例外の SKU・含むセ�
   }
   assert.equal(Number((await q("select count(*)::int as n from ops.master_write_sessions s where not exists (select 1 from ops.master_edit_requests r where r.request_id = s.request_id and r.status = 'done')"))[0].n), 0);
   // (R5 M3) 復元した約束の行 (前の DB の乱数・今の取引の番号) があっても、begin していない書き込みは通らない・begin は止まらない
+  // 持ち主表は今の epoch (active) と同じにする (0055 の入れる時の確かめ = 違う持ち主表の行はそもそも入らない)
   const args4 = await beginArgs(E0, 's004');
   await pg.query('begin');
   try {
     await pg.query(`insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions,
         actor_id, source_system, db_user, phase, owner_hash, ownership)
       select gen_random_uuid(), txid_current(), gen_random_uuid(), 'sku_edit', sku_id, '{}', '{}', repeat('a', 64), repeat('b', 64), '{}'::jsonb,
-        'old@restored', 'portal_master_edit', 'master_edit', 'new_open', repeat('c', 64), '{}'::jsonb from core.skus where code = 's004'`);
+        'old@restored', 'portal_master_edit', 'master_edit', 'new_open', repeat('c', 64), ops.master_ownership_active_map() from core.skus where code = 's004'`);
     await pg.query('set role master_edit');
     await pg.query('savepoint s');
     const e = await errOf(pg.query("update core.skus set name = '復元した行で' where code = 's004'"));
