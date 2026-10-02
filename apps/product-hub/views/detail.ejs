@@ -5853,7 +5853,8 @@ th.attr-unknown { color: #dc2626; }
       const job = s.job;
       const blocked = s.blocked;
       const running = !!job && RUNNING.includes(job.status);
-      btn.disabled = !!blocked || running || posting;
+      // 確認待ちの間も押させない (サーバも already_running で断る・codex #1591 R4 Medium)
+      btn.disabled = !!blocked || running || checkingModel(job) || posting;
       // モデル名をボタンに出す。ここは「いま押したら使われるモデル」(サーバの設定)
       const ml = s.model_label ? ' (' + s.model_label + ')' : '';
       btn.textContent = running ? '🤖 AI' + ml + ' が作っています…' : '🤖 構成をAIに作らせる' + ml;

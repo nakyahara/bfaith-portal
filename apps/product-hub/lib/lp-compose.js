@@ -334,6 +334,13 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
     recoverExpired(db, now);
     const live = db.prepare(`SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND status IN ('queued','running')`).get(draftId);
     if (live) return { code: 'already_running', error: 'この商品の構成をいま作っています', job: live };
+    // 🚨 できたが実モデルの確認を待っている依頼も「動いている」扱い (codex #1591 R4 Medium)。
+    //    受けると AI 枠を二重に使い、画面は新しい依頼しか出さないので、先の結果 (一致すれば使える) が見えなくなる。
+    //    確認は 15 分で必ず閉じる (recoverExpired) ので、ずっと押せなくなることはない
+    const checking = db.prepare(`SELECT j.* FROM ph_lp_compose_jobs j
+      JOIN ph_lp_compose_generations g ON g.job_id = j.id
+      WHERE j.draft_id = ? AND j.status = 'done' AND g.model_check IS NULL LIMIT 1`).get(draftId);
+    if (checking) return { code: 'already_running', error: 'この商品の構成を作ったモデルをいま確かめています', job: checking };
     let id;
     try {
       id = Number(db.prepare(`INSERT INTO ph_lp_compose_jobs

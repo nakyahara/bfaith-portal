@@ -598,10 +598,18 @@ console.log('⑩ 実際に本回答を書いたモデル (ランナーが後か�
 
   const e = mk('MC-E', 'lpr-20261002-150400-eeeeee', 240);
   eq(submit(e, 241).status, 'done', '確認が来ない依頼もいったん done');
+  eq(lp.requestJob(db, args(e.draft, spec, 'key-mc-E-again', { now: min(242) })).code, 'already_running',
+    '🚨 確認待ちの間は再依頼を受けない (AI 枠の二重使用・先の結果が見えなくなるのを防ぐ・codex #1591 R4 Medium)');
   eq(lp.jobStateFor(db, e.draft.id, { now: min(241 + lp.MODEL_CHECK_WAIT_MIN - 1) }).job.status, 'done', `${lp.MODEL_CHECK_WAIT_MIN} 分たつまでは待つ (確認中)`);
   const stE = lp.jobStateFor(db, e.draft.id, { now: min(241.2 + lp.MODEL_CHECK_WAIT_MIN) }).job;
   ok(stE.status === 'needs_review' && stE.error_code === 'model_unverified' && stE.model_check === 'unknown' && stE.output_text === null,
     `🚨 ${lp.MODEL_CHECK_WAIT_MIN} 分たっても確認が来なければ未確認で閉じる (確認中のまま残さない)`);
+  ok(lp.requestJob(db, args(e.draft, spec, 'key-mc-E-again2', { now: min(258) })).ok, '閉じた後は再依頼できる (ずっと押せなくはならない)');
+  {
+    // 後の試験 (F) の claim がこれを掴まないように片付ける
+    const ce = lp.claimJob(db, { runnerRunId: 'run-e-again', now: min(258.1) });
+    lp.failJob(db, ce.job.job_id, { leaseToken: ce.job.lease_token, code: 'other', message: '試験の片付け', now: min(258.2) });
+  }
 
   // 🚨 ランナーが止まっていて、15 分を過ぎてから再送が**最初に**届いても「一致」にしない (codex #1591 R3 Medium)
   const fx = mk('MC-F', 'lpr-20261002-150500-ffffff', 260);
