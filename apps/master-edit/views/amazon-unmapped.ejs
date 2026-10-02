@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <div class="me-wrap">
+    <p class="muted" style="font-size: 0.85em;"><a href="<%= base %>/amazon/">← Amazon SKU の一覧へ</a></p>
+    <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
+    <h2 style="font-size: 1.1em;">未登録 = 直近 <%= UNMAPPED_DAYS %> 日に売れたのに構成が無い seller SKU</h2>
+    <div class="me-box"><p class="hint">
+      Amazon の注文の明細のうち、Company DB の出品が無い (コードだけ) か、出品に構成 (NE コード × 数量) が無いものです。売上の日次で商品に展開できていません。
+      seller SKU を押すと対応を作れます (保存を開いた後)。FBA / FBM は Amazon の手数料の取得 (fees) の区分です。
+    </p></div>
+    <% if (data) { %>
+      <% if (data.tableMissing) { %><div class="band warn">Company DB に Amazon SKU の対応の表がまだありません (migration 0054 の前)。</div><% } %>
+      <% if (data.undecided.length) { %><div class="band warn">未判定: 売上の日次がまだ公開されていない日があります (<%= data.undecided.join('・') %>)。その日の注文が入っていない = 「0 件」とは言えません。</div><% } %>
+      <% if (!data.channelsAvailable) { %><div class="band info">FBA / FBM の区分 (fees) が読めないので、全部の区分を出しています。</div><% } %>
+      <form method="get" action="" class="row">
+        <label>区分 <select name="channel"><option value="FBA"<%= channel === 'FBA' ? ' selected' : '' %>>FBA</option><option value="FBM"<%= channel === 'FBM' ? ' selected' : '' %>>FBM (自社発送)</option><option value="all"<%= channel === '' ? ' selected' : '' %>>全部</option></select></label>
+        <button class="btn-sm" type="submit">表示</button>
+        <span class="muted"><%= data.rows.length %> 件 (全部の区分で <%= data.total_all %> 件) ・ 今日 (東京) <%= data.today %></span>
+      </form>
+      <div class="tbox">
+        <table class="me">
+          <thead><tr><th>seller SKU</th><th>区分</th><th>個数</th><th>注文</th><th>最後に売れた日</th><th>対応</th></tr></thead>
+          <tbody>
+            <% if (!data.rows.length) { %><tr><td colspan="6" class="muted"><%= data.undecided.length ? '未判定 (上の帯)' : '当てはまる SKU はありません' %></td></tr><% } %>
+            <% for (const r of data.rows) { %>
+            <tr>
+              <td><a href="sku?sku=<%= encodeURIComponent(String(r.code).trim().toLowerCase()) %>"><%= r.code %></a></td>
+              <td><%= r.channel ? (CHANNELS[r.channel] || r.channel) : '—' %></td>
+              <td class="n"><%= r.units %></td>
+              <td class="n"><%= r.orders %></td>
+              <td><%= r.last_date %></td>
+              <td><%= r.map_state ? (MAP_STATES[r.map_state] || r.map_state) : (r.listing_id ? '出品はある (構成なし)' : '出品なし') %></td>
+            </tr>
+            <% } %>
+          </tbody>
+        </table>
+      </div>
+    <% } %>
+  </div>
+</body>
+</html>
