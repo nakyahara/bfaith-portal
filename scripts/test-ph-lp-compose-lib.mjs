@@ -39,6 +39,25 @@ const args = (draft, spec, key, extra = {}) => ({
   ...extra,
 });
 
+console.log('⓪ モデル (決める場所は Render の PH_LP_COMPOSE_MODEL だけ・2026-10-02)');
+{
+  const saved = process.env.PH_LP_COMPOSE_MODEL;
+  delete process.env.PH_LP_COMPOSE_MODEL;
+  eq(lp.lpComposeModel(), 'claude-opus-5-5[1m]', '既定は Opus 5.5 (1M)');
+  process.env.PH_LP_COMPOSE_MODEL = 'claude-sonnet-5';
+  eq(lp.lpComposeModel(), 'claude-sonnet-5', '環境変数で変えられる');
+  for (const bad of ['claude-opus-5-5[1m]\n', ' claude-opus-5', 'gpt-5.6-sol', 'claude-opus-5 --dangerously-skip-permissions', 'claude-opus-5-5[2m]', '']) {
+    process.env.PH_LP_COMPOSE_MODEL = bad;
+    eq(lp.lpComposeModel(), lp.DEFAULT_MODEL, `🚨 形の違う値は使わない (claude --model に渡るので): ${JSON.stringify(bad)}`);
+  }
+  if (saved === undefined) delete process.env.PH_LP_COMPOSE_MODEL; else process.env.PH_LP_COMPOSE_MODEL = saved;
+  eq(lp.modelLabel('claude-opus-5-5[1m]'), 'Opus 5.5', '表示名: Opus 5.5');
+  eq(lp.modelLabel('claude-opus-5'), 'Opus 5', '表示名: Opus 5');
+  eq(lp.modelLabel('claude-sonnet-5'), 'Sonnet 5', '表示名: Sonnet 5');
+  eq(lp.modelLabel('claude-haiku-4-5-20251001'), 'Haiku 4.5', '表示名: 日付は落とす');
+  eq(lp.modelLabel('なにか'), 'なにか', '読めない形はそのまま');
+}
+
 console.log('① 仕様書の取り込み (追記専用・同じ中身は版を増やさない)');
 const s1 = lp.importSpec(db, { kind: 'product_analysis', title: 'LP制作システム', body: '本文 V2.2', sheetTitles: ['出力形式'], actor: 'u@x' });
 ok(s1.ok && s1.created, '取り込める');
@@ -53,6 +72,10 @@ eq(lp.latestSpec(db).id, sTabs.spec.id, 'いまの版 = 最大 id');
 console.log('② 受付 — packet をここで固定する');
 const dA = mkDraft('LP-A', 'ハッカ油スプレー 100ml');
 ok(lp.requestJob(db, args(dA, sTabs.spec, 'key-0001', { productInfo: '' })).code === 'not_ready', '商品情報が無ければ受け付けない');
+// 🚨 画像が無いと AI は必ず IMAGES_UNAVAILABLE で止まる (2026-10-02 の 1 件目)。押す前に止める
+ok(lp.requestJob(db, args(dA, sTabs.spec, 'key-0001', { images: [] })).code === 'not_ready', '🚨 商品画像が無ければ受け付けない');
+ok(lp.requestJob(db, args(dA, sTabs.spec, 'key-0001', { images: undefined })).code === 'not_ready', '🚨 images の渡し忘れも「無い」と同じ (受け付けない)');
+ok(lp.requestBlockReason({ draft: dA, productInfo: 'x', spec: sTabs.spec, images: [] }).includes('商品画像がありません'), '押せない理由を画面に出せる');
 const r1 = lp.requestJob(db, args(dA, sTabs.spec, 'key-0001'));
 ok(r1.ok && r1.created, '受け付ける');
 const packet1 = JSON.parse(r1.job.packet_json);
@@ -108,10 +131,19 @@ const c2 = lp.claimJob(db, { runnerRunId: 'run-3', now: min(0.6) });
 ok(c2.ok && c2.job.job_id === c1.job.job_id, '戻った依頼をまた掴める');
 
 console.log('⑤ 予約 — AI を呼ぶ前に必ず通す');
-const g1 = lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(0.8) });
+// モデルはサーバの設定 (PH_LP_COMPOSE_MODEL) だけで決まる。claim がそれを返し、違うモデルの予約は断る
+eq(c2.job.model, lp.DEFAULT_MODEL, 'claim の応答にモデルが入る');
+eq(lp.queueSummary(db, min(0.7)).model, lp.DEFAULT_MODEL, 'queue の応答にもモデルが入る (ランナーは claude 起動前に知る)');
+eq(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(0.8) }).code,
+  'bad_model', '🚨 設定と違うモデルの予約は断る (別の条件で作ったものが測定に混ざらない)');
+eq(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: lp.DEFAULT_MODEL + ' ', promptVersion: lp.PROMPT_VERSION, now: min(0.8) }).code,
+  'bad_model', '🚨 空白付きは同じモデルに畳まない (識別子は形を直接見る)');
+eq(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, promptVersion: lp.PROMPT_VERSION, now: min(0.8) }).code,
+  'bad_request', 'モデル無しは断る');
+const g1 = lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(0.8) });
 ok(g1.ok && g1.generation_id > 0, '予約できる');
-ok(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(0.8) }).code === 'already_reserved', '1 依頼 1 回');
-ok(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: 'claude-opus-5', promptVersion: 'ふるい版', now: min(0.8) }).code === 'bad_prompt_version', '🚨 実行役の prompt 版が違えば AI を呼ぶ前に断る (コード R1 #6)');
+ok(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(0.8) }).code === 'already_reserved', '1 依頼 1 回');
+ok(lp.reserveGeneration(db, c2.job.job_id, { leaseToken: c2.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: 'ふるい版', now: min(0.8) }).code === 'bad_prompt_version', '🚨 実行役の prompt 版が違えば AI を呼ぶ前に断る (コード R1 #6)');
 ok(lp.failJob(db, c2.job.job_id, { leaseToken: c2.job.lease_token, code: 'x', now: min(0.9) }).code === 'already_reserved',
   '🚨 予約後に fail は使えない (result で rejected を出す・§4.3b)');
 ok(lp.releaseJob(db, c2.job.job_id, { leaseToken: c2.job.lease_token, now: min(0.9) }).code === 'already_reserved',
@@ -146,7 +178,7 @@ ok(lp.submitResult(db, g1.generation_id, { packetHash: c2.job.packet_hash, verdi
 const dZ = mkDraft('LP-Z', 'ハッカ油スプレー 30ml');   // 証跡なしの系
 lp.requestJob(db, args(dZ, s2.spec, 'key-0001', { now: min(5) }));
 const cZ = lp.claimJob(db, { runnerRunId: 'run-z', now: min(5) });
-const gZ = lp.reserveGeneration(db, cZ.job.job_id, { leaseToken: cZ.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(5) });
+const gZ = lp.reserveGeneration(db, cZ.job.job_id, { leaseToken: cZ.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(5) });
 eq(lp.submitResult(db, gZ.generation_id, { packetHash: cZ.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(6) }).code,
   'bad_request', '🚨 サーバが画像を配っていなければ accepted を受け取らない');
 eq(lp.submitResult(db, gZ.generation_id, {
@@ -169,7 +201,7 @@ const cY1 = lp.claimJob(db, { runnerRunId: 'run-y1', now: min(7) });
 serve(cY1.job, min(7));                                    // 1 人目の実行役が画像を見た
 lp.releaseJob(db, cY1.job.job_id, { leaseToken: cY1.job.lease_token, now: min(7.5) });
 const cY2 = lp.claimJob(db, { runnerRunId: 'run-y2', now: min(8) });   // 2 人目が掴む
-const gY = lp.reserveGeneration(db, cY2.job.job_id, { leaseToken: cY2.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(8) });
+const gY = lp.reserveGeneration(db, cY2.job.job_id, { leaseToken: cY2.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(8) });
 eq(lp.submitResult(db, gY.generation_id, { packetHash: cY2.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(8.5) }).code,
   'bad_request', '🚨 前の実行役の証跡を使い回せない (claim でリセット・codex exec review P1)');
 serve(cY2.job, min(8));
@@ -187,7 +219,7 @@ const cLap2 = lp.claimJob(db, { runnerRunId: 'run-lap2', now: min(9.3) });
 ok(cLap2.job && cLap2.job.lease_token !== cLap1.job.lease_token, '掴み直すと lease は別物');
 eq(serve(cLap1.job, min(9.4)).code, 'lease_lost',
   '🚨 古い lease の取得は記録しない (codex exec review P2)');
-const gLap = lp.reserveGeneration(db, cLap2.job.job_id, { leaseToken: cLap2.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(9.5) });
+const gLap = lp.reserveGeneration(db, cLap2.job.job_id, { leaseToken: cLap2.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(9.5) });
 eq(lp.submitResult(db, gLap.generation_id, { packetHash: cLap2.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(9.6) }).code,
   'bad_request', '🚨 古い lease の取得では accepted を出せない');
 serve(cLap2.job, min(9.7));
@@ -198,7 +230,7 @@ console.log('⑦ 結果 — rejected (lint / 検品が通らなかった)');
 const dB = mkDraft('LP-B', 'ハッカ油スプレー 50ml');
 const r2 = lp.requestJob(db, args(dB, s2.spec, 'key-0001', { now: min(10) }));
 const c3 = lp.claimJob(db, { runnerRunId: 'run-4', now: min(10) });
-const g2 = lp.reserveGeneration(db, c3.job.job_id, { leaseToken: c3.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(10) });
+const g2 = lp.reserveGeneration(db, c3.job.job_id, { leaseToken: c3.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(10) });
 const sub2 = lp.submitResult(db, g2.generation_id, { packetHash: c3.job.packet_hash, verdict: 'rejected', lint: { missing: ['# 0枚目｜サムネイル'] }, reviewRounds: 2, reason: '2 巡で通らなかった', now: min(11) });
 eq(sub2.status, 'failed', '通らなければ failed');
 const jRej = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE id = ?').get(c3.job.job_id);
@@ -216,7 +248,7 @@ lp.requestJob(db, args(dAll, s2.spec, 'key-0001', {
   images: [{ file_id: 'FILEID000001' }, { file_id: 'FILEID000002' }],
 }));
 const cAll = lp.claimJob(db, { runnerRunId: 'run-all', now: min(10) });
-const gAll = lp.reserveGeneration(db, cAll.job.job_id, { leaseToken: cAll.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(10) });
+const gAll = lp.reserveGeneration(db, cAll.job.job_id, { leaseToken: cAll.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(10) });
 serve(cAll.job, min(10.1));                                 // 1 枚目だけ見た
 eq(lp.submitResult(db, gAll.generation_id, { packetHash: cAll.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(10.2) }).code,
   'bad_request', '🚨 2 枚中 1 枚しか見ていなければ accepted を受け取らない (codex exec review P1)');
@@ -228,7 +260,7 @@ eq(lp.submitResult(db, gAll.generation_id, { packetHash: cAll.job.packet_hash, v
 const dBig = mkDraft('LP-BIG', 'ハッカ油スプレー 80ml');
 lp.requestJob(db, args(dBig, s2.spec, 'key-0001', { now: min(11) }));
 const cBig = lp.claimJob(db, { runnerRunId: 'run-big', now: min(11) });
-const gBig = lp.reserveGeneration(db, cBig.job.job_id, { leaseToken: cBig.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(11) });
+const gBig = lp.reserveGeneration(db, cBig.job.job_id, { leaseToken: cBig.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(11) });
 serve(cBig.job, min(11.1));
 const fatLint = { ok: true, checks: {}, filler: 'x'.repeat(lp.LINT_MAX - 200) };
 eq(lp.submitResult(db, gBig.generation_id, {
@@ -247,7 +279,7 @@ eq(lp.submitResult(db, gBig.generation_id, {
   const dSml = mkDraft('LP-SML', 'ハッカ油スプレー 90ml');
   lp.requestJob(db, args(dSml, s2.spec, 'key-0001', { now: min(12) }));
   const c = lp.claimJob(db, { runnerRunId: 'run-sml', now: min(12) });
-  const g = lp.reserveGeneration(db, c.job.job_id, { leaseToken: c.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(12) });
+  const g = lp.reserveGeneration(db, c.job.job_id, { leaseToken: c.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(12) });
   serve(c.job, min(12.1));
   lp.submitResult(db, g.generation_id, { packetHash: c.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: { ok: true, mine: 1 }, now: min(12.2) });
   const stored = JSON.parse(db.prepare('SELECT lint_json FROM ph_lp_compose_jobs WHERE id = ?').get(c.job.job_id).lint_json);
@@ -259,7 +291,7 @@ console.log('⑧ 成否不明 (lease 切れ) は needs_review で止まる');
 const dC = mkDraft('LP-C', 'ハッカ油スプレー 200ml');
 lp.requestJob(db, args(dC, s2.spec, 'key-0001', { now: min(20) }));
 const c4 = lp.claimJob(db, { runnerRunId: 'run-5', now: min(20) });
-lp.reserveGeneration(db, c4.job.job_id, { leaseToken: c4.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(20) });
+lp.reserveGeneration(db, c4.job.job_id, { leaseToken: c4.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(20) });
 lp.recoverExpired(db, min(20 + lp.LEASE_MIN + 1));
 const jNr = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE id = ?').get(c4.job.job_id);
 eq(jNr.status, 'needs_review', '🚨 予約後に結果が来なければ needs_review (自動で作り直さない)');
@@ -306,7 +338,7 @@ console.log('⑬ コードレビュー R1 の修正');
 const dG = mkDraft('LP-G', 'ハッカ油スプレー 5L');
 lp.requestJob(db, args(dG, s2.spec, 'key-0001', { now: min(70) }));
 const c6 = lp.claimJob(db, { runnerRunId: 'run-10', now: min(70) });
-const g6 = lp.reserveGeneration(db, c6.job.job_id, { leaseToken: c6.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(70) });
+const g6 = lp.reserveGeneration(db, c6.job.job_id, { leaseToken: c6.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(70) });
 serve(c6.job, min(70));
 lp.submitResult(db, g6.generation_id, { packetHash: c6.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: LINT, now: min(71) });
 lp.recoverExpired(db, min(70 + lp.LEASE_MIN + 5));
@@ -317,7 +349,7 @@ eq(db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(c6.job.j
 const dH = mkDraft('LP-H', 'ハッカ油スプレー 10L');
 lp.requestJob(db, args(dH, s2.spec, 'key-0001', { now: min(80) }));
 const c7 = lp.claimJob(db, { runnerRunId: 'run-11', now: min(80) });
-const g7 = lp.reserveGeneration(db, c7.job.job_id, { leaseToken: c7.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(80) });
+const g7 = lp.reserveGeneration(db, c7.job.job_id, { leaseToken: c7.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(80) });
 serve(c7.job, min(80));
 db.prepare("UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?").run(c7.job.job_id);
 eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdict: 'accepted', output: OUT, lint: LINT, now: min(81) }).code, 'job_finalized',
@@ -330,7 +362,7 @@ eq(lp.submitResult(db, g7.generation_id, { packetHash: c7.job.packet_hash, verdi
 const dI = mkDraft('LP-I', 'ハッカ油スプレー 20L');
 lp.requestJob(db, args(dI, s2.spec, 'key-0001', { now: min(90) }));
 const c8 = lp.claimJob(db, { runnerRunId: 'run-12', now: min(90) });
-const g8 = lp.reserveGeneration(db, c8.job.job_id, { leaseToken: c8.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(90) });
+const g8 = lp.reserveGeneration(db, c8.job.job_id, { leaseToken: c8.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(90) });
 serve(c8.job, min(90));
 const cyc = {}; cyc.self = cyc;
 eq(lp.submitResult(db, g8.generation_id, { packetHash: c8.job.packet_hash, verdict: 'accepted', output: OUT, lint: cyc, now: min(91) }).code, 'bad_request',
@@ -373,7 +405,7 @@ eq(db.prepare('SELECT error_code FROM ph_lp_compose_jobs WHERE id = ?').get(rM.j
 const dN = mkDraft('LP-N', 'ハッカ油スプレー 4L');
 lp.requestJob(db, args(dN, s2.spec, 'key-0001', { now: min(110) }));
 const cN = lp.claimJob(db, { runnerRunId: 'run-21', now: min(110) });
-const gN = lp.reserveGeneration(db, cN.job.job_id, { leaseToken: cN.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(110) });
+const gN = lp.reserveGeneration(db, cN.job.job_id, { leaseToken: cN.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(110) });
 serve(cN.job, min(110));
 // 🚨 このテストは PR1-c で書き直した。以前は「OTHERFILE999 を混ぜると bad_request」を
 //    見ているつもりだったが、実際には `lint` を渡していなかったから落ちていただけで、
@@ -420,7 +452,7 @@ eq(db.prepare('SELECT error_code FROM ph_lp_compose_jobs WHERE id = ?').get(rO.j
 const dP = mkDraft('LP-P', 'ハッカ油スプレー 7L');
 lp.requestJob(db, args(dP, s2.spec, 'key-0001', { now: min(130) }));
 const cP = lp.claimJob(db, { runnerRunId: 'run-31', now: min(130) });
-const gP = lp.reserveGeneration(db, cP.job.job_id, { leaseToken: cP.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION, now: min(130) });
+const gP = lp.reserveGeneration(db, cP.job.job_id, { leaseToken: cP.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(130) });
 eq(lp.submitResult(db, gP.generation_id, {
   packetHash: cP.job.packet_hash, verdict: 'accepted', output: OUT,
   receipt: { images: [

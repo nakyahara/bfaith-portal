@@ -62,10 +62,10 @@ const state = path.join(tmp || process.cwd(), 'state');
  * 🚨 spawnSync は使えない — service-api を**同じプロセス**に立てているので、
  *    親が同期で止まると子の HTTP が返ってこない (行き詰まる)。
  */
-const phlp = (...args) => new Promise((resolve) => {
+const phlpWith = (extraEnv, ...args) => new Promise((resolve) => {
   const child = spawn(process.execPath, [PHLP, ...args], {
     cwd: work,
-    env: { ...process.env, PH_LP_BASE: BASE, PH_SERVICE_TOKEN: 'test-token-lp-runner', PH_LP_RETRIES: '1', PH_LP_STATE_DIR: state },
+    env: { ...process.env, PH_LP_BASE: BASE, PH_SERVICE_TOKEN: 'test-token-lp-runner', PH_LP_RETRIES: '1', PH_LP_STATE_DIR: state, ...extraEnv },
   });
   let so = '', se = '';
   child.stdout.on('data', (d) => { so += d; });
@@ -76,6 +76,8 @@ const phlp = (...args) => new Promise((resolve) => {
     resolve({ code, out: so, err: se, json });
   });
 });
+
+const phlp = (...args) => phlpWith({}, ...args);
 
 const exists = (n) => fs.existsSync(path.join(work, n));
 const inState = (n) => fs.existsSync(path.join(state, n));
@@ -160,9 +162,15 @@ eq(rel.code, 0, '予約前は手放せる');
 eq(rel.json.status, 'queued', 'キューに戻る');
 const cl2 = await phlp('claim', '--run', 'lp-test-2');
 eq(cl2.json.job_id, req.job.id, 'もう一度掴める');
-const rv = await phlp('reserve', jid);
+// モデルはランナーが PH_LP_MODEL で渡す (claude --model と同じ値)。Claude の申告は使わない (2026-10-02)
+const rvBad = await phlpWith({ PH_LP_MODEL: 'claude-opus-5' }, 'reserve', jid);
+eq(rvBad.code, 1, '🚨 サーバの設定と違うモデルでは予約できない');
+eq(rvBad.json?.code, 'bad_model', 'bad_model で断られる');
+const rv = await phlpWith({ PH_LP_MODEL: lp.DEFAULT_MODEL }, 'reserve', jid, '--model', 'claude-opus-5');
 eq(rv.code, 0, '予約できる');
 ok(rv.json.generation_id > 0, 'generation_id が返る');
+eq(db.prepare('SELECT model FROM ph_lp_compose_generations WHERE id = ?').get(rv.json.generation_id).model, lp.DEFAULT_MODEL,
+  '🚨 記録されるのはランナーが渡したモデル (--model を書いても使わない)');
 eq((await phlp('fail', jid, '--code', 'OTHER', '--message', 'x')).code, 1, '🚨 予約後に fail は通らない');
 eq((await phlp('release', jid, '--reason', 'x')).code, 1, '🚨 予約後に release も通らない');
 eq((await phlp('fail', jid, '--code', 'へんなコード')).code, 2, '知らない code は断る');

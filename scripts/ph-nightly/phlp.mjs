@@ -19,7 +19,7 @@
  *   ./phlp queue                                    キューの内訳 (仕事があるか)
  *   ./phlp claim   --run RUN_ID                     1 件 claim (材料 + 仕様書の全文)
  *   ./phlp images  ID                               その依頼の商品画像を img-ID-1.jpg … に落とす
- *   ./phlp reserve ID --model MODEL                 **AI を呼ぶ前に必ず**予約する
+ *   ./phlp reserve ID                               **AI を呼ぶ前に必ず**予約する (モデルはランナーが決める)
  *   ./phlp lint    ID --file out-ID.md              構成を lint する (サーバが正本・何度でも呼べる)
  *   ./phlp result  ID --accepted --file out-ID.md [--lint lint-ID.json] [--rounds N]
  *   ./phlp result  ID --rejected --reason-file reason-ID.txt [--lint lint-ID.json] [--rounds N]
@@ -175,6 +175,8 @@ async function cmdClaim(opt) {
   // lease と packet_hash は CLI が持つ。Claude には出さない
   saveLease(job.job_id, {
     lease_token: job.lease_token, packet_hash: job.packet_hash, run,
+    // サーバが決めたモデル (Render の PH_LP_COMPOSE_MODEL)。PH_LP_MODEL が無いとき (人が手で回したとき) だけ使う
+    model: job.model || null,
     // 🚨 検品に渡す材料もここに覚える (codex exec review P1)。
     //    「材料と食い違っていないか」「材料に無い事実を作っていないか」は、
     //    材料を一緒に渡さないと Codex には確かめられない。
@@ -252,7 +254,11 @@ async function cmdImages(id) {
 
 async function cmdReserve(id, opt) {
   const lease = loadLease(id);
-  const model = String(opt.model || 'claude-opus-5').trim();
+  // 🚨 モデルは Claude に申告させない (以前は --model の既定 'claude-opus-5' が実際と無関係に記録されていた)。
+  //    ランナーが claude --model に渡したのと同じ値を PH_LP_MODEL で受け取る。Claude は環境変数を書き換えられない
+  //    (allow は ./phlp で始まるコマンドだけ)。サーバは自分の設定と違えば bad_model で断る
+  const model = process.env.PH_LP_MODEL || lease.model;
+  if (!model) die('モデルが分かりません (ランナーの PH_LP_MODEL も claim の応答の model も無い)');
   const r = await api('POST', `/lp-compose/jobs/${id}/reserve`, {
     lease_token: lease.lease_token, model, prompt_version: PROMPT_VERSION,
   });

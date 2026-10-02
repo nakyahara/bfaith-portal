@@ -3805,10 +3805,10 @@ function lpComposeInitialState(db, draft) {
   //    カラバリや裏面情報を含めるのは composeProductInfo の中なので、
   //    ここだけ effectiveProductInfo を渡すと、**裏面情報だけの商品が
   //    画面ではずっと押せない** (API では押せる) という食い違いになる。
-  const { productInfo } = lpComposeMaterial(db, draft);
+  const { productInfo, images } = lpComposeMaterial(db, draft);
   return {
     ...lpComposeStateFor(db, draft.id),
-    blocked: lpComposeBlockReason({ draft, productInfo, spec }),
+    blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
     spec: lpSpecSummary(db, 'product_analysis'),
   };
 }
@@ -3840,12 +3840,12 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
   if (!draft) return;
   const db = getDB();
   const spec = latestLpSpec(db, 'product_analysis');
-  const { productInfo } = lpComposeMaterial(db, draft);
+  const { productInfo, images } = lpComposeMaterial(db, draft);
   res.json({
     ok: true,
     ...lpComposeStateFor(db, draft.id),
     // 押せるか。押せない理由はそのまま画面に出す
-    blocked: lpComposeBlockReason({ draft, productInfo, spec }),
+    blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
     // 「仕様書: ○○ (YYYY-MM-DD 取込)」。古ければ人が上げ直す (設計 §4.1 のアップロード忘れ対策)
     spec: lpSpecSummary(db, 'product_analysis'),
   });
@@ -3889,7 +3889,7 @@ function lpComposeMaterial(db, draft) {
 //    長さだけ先に見て、形の判定は lib に任せる。
 // lp-compose 固有の code を HTTP に対応づける (ad-kw-ai の表に無いもの)。
 // 🚨 disabled を落とすと「機能が無効」が 400 に見え、実行役が「依頼が壊れている」と誤解する
-const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, already_generated: 409, job_finalized: 409, already_running: 409, lint_failed: 422 };
+const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, bad_model: 409, already_generated: 409, job_finalized: 409, already_running: 409, lint_failed: 422 };
 // 🚨 lint で断ったときは**何が落ちたかも返す** (codex exec review P2)。
 //    code と error だけだと、実行役は直すために lint をもう一度呼ぶしか無く、
 //    lease が切れた後はそれもできない (= 直しようが無い)。

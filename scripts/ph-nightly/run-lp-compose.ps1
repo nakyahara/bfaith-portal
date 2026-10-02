@@ -90,7 +90,16 @@ if ([int]$before.claimable -eq 0) {
   Send-Ping 'ok' ('idle (running=' + $before.running + ' needs_review=' + $before.needs_review + ')')
   exit 0
 }
-Log ('work found: claimable=' + $before.claimable + ' running=' + $before.running + ' needs_review=' + $before.needs_review)
+# The model is decided on the SERVER (Render PH_LP_COMPOSE_MODEL, also shown on the button) - never by Claude.
+# The same value goes to claude --model and, via PH_LP_MODEL, to ./phlp reserve; the server refuses any other.
+# \z, not $: .NET $ also matches before a trailing newline.
+$Model = [string]$before.model
+if ($Model -cnotmatch '^claude-[a-z0-9]+(-[a-z0-9]+){1,6}(\[1m\])?\z') {
+  Log ('server sent no usable model: [' + $Model + '] (server older than this runner?)')
+  Send-Ping 'fail' 'server sent no usable model'
+  exit 1
+}
+Log ('work found: claimable=' + $before.claimable + ' running=' + $before.running + ' needs_review=' + $before.needs_review + ' model=' + $Model)
 
 # --- 2. one Claude at a time ------------------------------------------------------
 $Guard = Join-Path $PSScriptRoot 'ClaudeGuard.ps1'
@@ -132,10 +141,13 @@ try {
   $prompt = 'Process ONE LP compose request. Follow the ph-lp-compose skill in this workspace exactly: claim one request with ./phlp, download the product images and LOOK AT them, write what you saw into seen-<ID>.md, read the spec file, reserve BEFORE writing, write the section 7 output following the instruction that came with the claim, check it with ./phlp lint until it passes, review with ./phlpreview, then send the result with ./phlp result and clean up. After reserve, a failure must be reported as result --rejected, never as fail. Never read the service token and never touch files outside this workspace. Finish with one line: job=N status=done or rejected or failed'
   $timedOut = $false
   $claudeExit = -1
+  $modelMismatch = $false
+  $usedNote = ''
+  $env:PH_LP_MODEL = $Model   # inherited by claude -> ./phlp (reserve records it)
   try {
     $p = Start-Process -FilePath $Claude -WorkingDirectory $WorkDir -NoNewWindow -PassThru `
            -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog `
-           -ArgumentList @('-p', ('"' + $prompt + '"'), '--output-format', 'json')
+           -ArgumentList @('-p', ('"' + $prompt + '"'), '--model', $Model, '--output-format', 'json')
     # PS 5.1: with -NoNewWindow + redirection, ExitCode stays empty unless the handle is taken right away
     $null = $p.Handle
     if (-not $p.WaitForExit($TimeoutMin * 60 * 1000)) {
@@ -151,7 +163,24 @@ try {
     Send-Ping 'fail' 'failed to start claude'
     exit 1
   }
+  Remove-Item Env:PH_LP_MODEL -ErrorAction SilentlyContinue
   Log ('claude exit=' + $claudeExit + ' timedOut=' + $timedOut)
+  # What actually ran, from claude --output-format json. Without this a refused model or a login problem looks
+  # like "nothing moved" (2026-10-02: Claude Code 2.1.252 refused Opus 5.5 with API 400 - needs 2.1.280+).
+  try {
+    $j = Get-Content -Raw -LiteralPath $OutLog -Encoding UTF8 | ConvertFrom-Json
+    $used = @($j.modelUsage.PSObject.Properties | ForEach-Object { ($_.Name -replace '\[1m\]\z', '') })
+    $usedNote = ' used=' + ($used -join ',')
+    # only for a run that worked: an early error (login, refused model) uses no main model and must stay a fail
+    if (-not $j.is_error -and $used -notcontains ($Model -replace '\[1m\]\z', '')) {
+      $modelMismatch = $true
+      Log ('model mismatch: asked ' + $Model + ' but modelUsage has ' + ($used -join ','))
+    }
+    if ($j.is_error) {
+      $msg = [string]$j.result
+      Log ('claude reported an error: ' + $msg.Substring(0, [Math]::Min(300, $msg.Length)))
+    }
+  } catch { Log ('could not read the claude output: ' + $_.Exception.Message) }
   $null = Wait-NoClaudeResidue -DeadlineUtc ((Get-Date).ToUniversalTime().AddMinutes(2)) -PollSec 5
 } finally {
   Exit-ClaudeLock
@@ -168,10 +197,12 @@ $pendingBefore = [int]$before.claimable + [int]$before.running
 $pendingAfter  = [int]$after.claimable + [int]$after.running
 $moved = $pendingBefore - $pendingAfter
 $needsReviewUp = [int]$after.needs_review - [int]$before.needs_review
-$note = 'moved=' + $moved + ' claimable=' + $after.claimable + ' running=' + $after.running + ' needs_review=' + $after.needs_review + ' exit=' + $claudeExit
+$note = 'moved=' + $moved + ' claimable=' + $after.claimable + ' running=' + $after.running + ' needs_review=' + $after.needs_review + ' exit=' + $claudeExit + ' model=' + $Model + $usedNote
 Log ('after: ' + $note)
 
 if ($timedOut) { Send-Ping 'fail' ('timeout; ' + $note); exit 1 }
+# A result written by another model must not pass as ok (the measurement compares one model)
+if ($modelMismatch -and ($moved -gt 0 -or $needsReviewUp -gt 0)) { Send-Ping 'partial' ('model mismatch; ' + $note); exit 0 }
 if ($needsReviewUp -gt 0) {
   # reserved but no result came back = outcome unknown. A person decides; we never retry it automatically.
   Send-Ping 'partial' ('needs_review +' + $needsReviewUp + '; ' + $note)

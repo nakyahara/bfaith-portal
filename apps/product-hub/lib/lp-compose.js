@@ -64,6 +64,27 @@ export const TERMINAL_STATUSES = ['done', 'needs_review', 'failed', 'cancelled']
 
 export function lpComposeEnabled() { return process.env.PH_LP_COMPOSE_ENABLED === '1'; }
 
+/**
+ * 構成を書く Claude のモデル。**決める場所は Render の PH_LP_COMPOSE_MODEL だけ** (2026-10-02 中原さん)。
+ * queue / claim がこの値を返し、miniPC のランナーはそれを `claude --model` に渡す。
+ * reserve はこれと違うモデルを断る (別の条件で作ったものが測定に混ざらないように。prompt_version と同じ扱い)。
+ * 画面のボタンにも出す。
+ * 🚨 以前は実行役の自己申告 (既定値 'claude-opus-5' の決め打ち) を記録していて、実際に動いたモデルと関係が無かった。
+ * 🚨 Opus 5.5 は Claude Code 2.1.280 以上が要る (miniPC は 2026-10-02 に 2.1.280 へ上げた)。
+ *    [1m] = 1M コンテキスト。仕様書の全文 + 画像 6 枚 + ⑦ の全文で 20 万トークンを超えうる
+ */
+export const DEFAULT_MODEL = 'claude-opus-5-5[1m]';
+const MODEL_RE = /^claude-[a-z0-9]+(?:-[a-z0-9]+){1,6}(?:\[1m\])?$/;
+export function lpComposeModel() {
+  return exact(process.env.PH_LP_COMPOSE_MODEL, MODEL_RE) || DEFAULT_MODEL;
+}
+/** 'claude-opus-5-5[1m]' → 'Opus 5.5' / 'claude-haiku-4-5-20251001' → 'Haiku 4.5'。読めない形はそのまま返す */
+export function modelLabel(id) {
+  const m = /^claude-([a-z]+)((?:-\d{1,2})+)(?:-\d{8})?(?:\[1m\])?$/.exec(String(id || ''));
+  if (!m) return String(id || '');
+  return m[1].charAt(0).toUpperCase() + m[1].slice(1) + ' ' + m[2].slice(1).split('-').join('.');
+}
+
 export function dailyCap() {
   const n = Number.parseInt(process.env.PH_LP_COMPOSE_DAILY_CAP || '', 10);
   return Number.isInteger(n) && n > 0 && n <= 200 ? n : DEFAULT_DAILY_CAP;
@@ -244,10 +265,14 @@ export function buildPacket({ draft, productInfo, colorVariations, images = [], 
 }
 
 /** 受け付けられる材料が揃っているか (画面のボタンの活性条件と同じ) */
-export function requestBlockReason({ draft, productInfo, spec }) {
+export function requestBlockReason({ draft, productInfo, spec, images }) {
   if (!spec) return '仕様書がまだ取り込まれていません (管理画面から取り込んでください)';
   if (!trim(draft?.name)) return '商品名が未入力です';
   if (!trim(productInfo)) return '「商品情報」か「裏面情報」を入力して保存すると使えます';
+  // 🚨 画像が無いと AI は必ず IMAGES_UNAVAILABLE で止まる (スキルの決まり: 見ずに書かない)。
+  //    受け付けると 4 分待たせてから失敗する (2026-10-02 の 1 件目 = draft 188)。押す前に止める。
+  //    呼び手は必ず images を渡す (渡し忘れ = 配列でない も「無い」と同じに扱う)
+  if (!Array.isArray(images) || images.length === 0) return '商品画像がありません (画像タブに商品画像を入れると使えます)';
   return null;
 }
 
@@ -275,7 +300,7 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
     //    画面は「作れなかった」と見えるのに裏では job が動いている、という食い違いが起きる
     const prior = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draftId, key);
     if (prior) return { ok: true, job: prior, created: false };
-    const blocked = requestBlockReason({ draft, productInfo, spec });
+    const blocked = requestBlockReason({ draft, productInfo, spec, images });
     if (blocked) return { code: 'not_ready', error: blocked };
     const specId = posInt(spec?.id);
     if (!specId) return { code: 'bad_request', error: '仕様書の ID が不正です' };
@@ -371,6 +396,8 @@ export function queueSummary(db, now = Date.now()) {
     const c = (sql, ...a) => db.prepare(sql).get(...a).n;
     return {
       enabled: lpComposeEnabled(),
+      // ランナーはこれを claude --model に渡す (claude を起動する前に知る必要がある)
+      model: lpComposeModel(),
       claimable: c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'queued'`),
       running: c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'running'`),
       needs_review: c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'needs_review'`),
@@ -468,6 +495,7 @@ export function claimJob(db, { runnerRunId, now = Date.now() } = {}) {
           lease_token: token, lease_until: until,
           packet: JSON.parse(job.packet_json), packet_hash: job.packet_hash,
           prompt_version: PROMPT_VERSION,
+          model: lpComposeModel(),
           spec: { id: spec.id, kind: spec.kind, title: spec.title, hash: spec.hash, body: spec.body },
         },
       };
@@ -502,6 +530,11 @@ export function reserveGeneration(db, jobId, { leaseToken, model, promptVersion,
   //    AI 枠を使う前に断る (通すと「別の条件で作ったもの」が測定結果に混ざる。コード R1 #6)
   if (pv !== PROMPT_VERSION) {
     return { code: 'bad_prompt_version', error: `prompt_version は ${PROMPT_VERSION} です (実行役が古い可能性)` };
+  }
+  // 同じ理由でモデルも固定する。ランナーは queue で受け取った値で claude を起動し、同じ値を送る
+  // trim 前の値で比べる (識別子は正規化せず形を直接見る。コード R3〜R5 と同じ作法)
+  if (model !== lpComposeModel()) {
+    return { code: 'bad_model', error: `model は ${lpComposeModel()} です (実行役が古いか、設定が途中で変わった)` };
   }
   const nowS = new Date(now).toISOString();
   return db.transaction(() => {
@@ -858,12 +891,18 @@ export function recordImageServed(db, jobId, { leaseToken, fileId, sha256: hex, 
 export function jobStateFor(db, draftId, { now = Date.now() } = {}) {
   recoverExpired(db, now);
   const job = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(posInt(draftId));
-  if (!job) return { enabled: lpComposeEnabled(), job: null };
+  // いま押したら使われるモデル (ボタンに出す)
+  const current = { enabled: lpComposeEnabled(), model: lpComposeModel(), model_label: modelLabel(lpComposeModel()) };
+  if (!job) return { ...current, job: null };
+  // この依頼で**実際に予約された**モデル。予約前 (待ち・画像なしで止まった等) は null
+  const gen = db.prepare('SELECT model FROM ph_lp_compose_generations WHERE job_id = ? ORDER BY id DESC LIMIT 1').get(job.id);
   const elapsed = Math.max(0, Math.round((Date.parse(job.completed_at || new Date(now).toISOString()) - Date.parse(job.created_at)) / 1000));
   return {
-    enabled: lpComposeEnabled(),
+    ...current,
     job: {
       id: job.id,
+      model: gen?.model || null,
+      model_label: gen?.model ? modelLabel(gen.model) : null,
       status: job.status,
       created_at: job.created_at,
       completed_at: job.completed_at,

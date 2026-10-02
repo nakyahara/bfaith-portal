@@ -1605,7 +1605,8 @@ th.attr-unknown { color: #dc2626; }
           <div id="lpc" class="field" style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;"
                data-draft-id="<%= draft.id %>" data-ne-code="<%= draft.ne_code || '' %>" data-name="<%= draft.name || '' %>">
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-              <button type="button" class="btn" id="lpc-btn">🤖 構成をAIに作らせる</button>
+              <%# モデル名をボタンに出す (2026-10-02 中原さん)。決める場所は Render の PH_LP_COMPOSE_MODEL だけ %>
+              <button type="button" class="btn" id="lpc-btn">🤖 構成をAIに作らせる<%= lpCompose.model_label ? ' (' + lpCompose.model_label + ')' : '' %></button>
               <span class="muted" id="lpc-status" style="font-size:12px;"></span>
             </div>
             <div class="muted" id="lpc-spec" style="font-size:11px; margin-top:4px;"></div>
@@ -5839,7 +5840,9 @@ th.attr-unknown { color: #dc2626; }
       const blocked = s.blocked;
       const running = !!job && RUNNING.includes(job.status);
       btn.disabled = !!blocked || running || posting;
-      btn.textContent = running ? '🤖 AI が作っています…' : '🤖 構成をAIに作らせる';
+      // モデル名をボタンに出す。ここは「いま押したら使われるモデル」(サーバの設定)
+      const ml = s.model_label ? ' (' + s.model_label + ')' : '';
+      btn.textContent = running ? '🤖 AI' + ml + ' が作っています…' : '🤖 構成をAIに作らせる' + ml;
 
       specEl.textContent = s.spec
         ? '仕様書: ' + s.spec.title + ' (' + String(s.spec.imported_at || '').slice(0, 10) + ' 取込)'
@@ -5850,7 +5853,8 @@ th.attr-unknown { color: #dc2626; }
       else if (running) {
         statusEl.textContent = 'AI が構成を作っています… (2分ほどかかります・' + (job.elapsed_sec || 0) + ' 秒経過)';
       } else if (job.status === 'done') {
-        statusEl.textContent = 'できました (' + (job.elapsed_sec || 0) + ' 秒'
+        // ここは「この依頼で実際に予約されたモデル」(設定がその後に変わっても、作ったモデルを出す)
+        statusEl.textContent = 'できました (' + (job.model_label ? job.model_label + '・' : '') + (job.elapsed_sec || 0) + ' 秒'
           + (job.review_rounds != null ? '・検品 ' + job.review_rounds + ' 巡' : '') + ')';
       } else if (job.status === 'needs_review') {
         // 🚨 成否不明。自動では作り直さない (AI 枠を使ったかもしれないので人が見る)
@@ -5892,6 +5896,7 @@ th.attr-unknown { color: #dc2626; }
           + ' / 期限内=' + (job.within_deadline === null ? '?' : (job.within_deadline ? 'はい' : 'いいえ'))
           + ' / lint=' + (job.lint ? (job.lint.ok ? '通った' : 'ひっかかった') : 'なし')
           + ' / 検品巡回=' + (job.review_rounds != null ? job.review_rounds : '?')
+          + ' / モデル=' + (job.model || 'なし (AI を呼ぶ前に止まった)')
           + ' / 状態=' + job.status;
       }
 

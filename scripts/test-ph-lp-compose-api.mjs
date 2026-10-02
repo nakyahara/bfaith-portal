@@ -192,7 +192,7 @@ console.log('④b 壊れた URL で別の依頼を掴まない (codex exec revie
 // 壊れた URL が別の正当な job / generation を指してしまっていた
 for (const bad of [`${job.job_id}abc`, ` ${job.job_id}`, `${job.job_id}.0`, '0']) {
   const r = await svc('POST', `/lp-compose/jobs/${encodeURIComponent(bad)}/reserve`, {
-    body: { lease_token: job.lease_token, model: 'claude-opus-5', prompt_version: lp.PROMPT_VERSION },
+    body: { lease_token: job.lease_token, model: lp.DEFAULT_MODEL, prompt_version: lp.PROMPT_VERSION },
   });
   ok(r.status === 404 || r.status === 400, `🚨 "${bad}" は別の依頼にならない (status ${r.status})`);
 }
@@ -203,10 +203,10 @@ eq((await svc('GET', `/lp-compose/jobs/${job.job_id}/images/1abc`, { lease: job.
 
 console.log('⑤ 予約 → 結果');
 eq((await svc('POST', `/lp-compose/jobs/${job.job_id}/reserve`, {
-  body: { lease_token: job.lease_token, model: 'claude-opus-5', prompt_version: 'ふるい版' },
+  body: { lease_token: job.lease_token, model: lp.DEFAULT_MODEL, prompt_version: 'ふるい版' },
 })).status, 400, '🚨 prompt の版が違えば AI を呼ぶ前に断る');
 const rv = await svc('POST', `/lp-compose/jobs/${job.job_id}/reserve`, {
-  body: { lease_token: job.lease_token, model: 'claude-opus-5', prompt_version: lp.PROMPT_VERSION },
+  body: { lease_token: job.lease_token, model: lp.DEFAULT_MODEL, prompt_version: lp.PROMPT_VERSION },
 });
 eq(rv.status, 200, '予約できる');
 eq((await svc('POST', `/lp-compose/jobs/${job.job_id}/fail`, { body: { lease_token: job.lease_token, code: 'x' } })).status, 409,
