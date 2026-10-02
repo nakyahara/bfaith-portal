@@ -113,9 +113,13 @@ try {
     Send-Ping 'fail' ('claude guard: ' + $residue)
     exit 1
   }
-  if (-not (Test-ClaudeStartable)) {
-    Log ('claude not started: oauth_refresh.lock kept (' + (Format-ClaudeResidue) + ')')
-    Send-Ping 'fail' 'oauth_refresh.lock kept'
+  # Test-ReadyToStartClaude comes from ClaudeGuard.ps1. (Test-ClaudeStartable is a LOCAL helper of
+  # run-ph-generate.ps1: calling it here was CommandNotFound, which left the try via finally and skipped
+  # Claude every minute while the request sat in the queue - 2026-10-02. test-runner-commands.ps1 guards this.)
+  $ready = Test-ReadyToStartClaude
+  if (-not $ready.Ok) {
+    Log ('claude not started: oauth_refresh.lock ' + $ready.Status + ' (' + (Format-ClaudeResidue) + ')')
+    Send-Ping 'fail' ('oauth_refresh.lock ' + $ready.Status)
     exit 1
   }
 
