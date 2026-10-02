@@ -3833,7 +3833,10 @@ router.post('/api/drafts/:id/lp-compose', (req, res) => {
     const status = r.code === 'disabled' ? 503 : ['already_running', 'not_ready'].includes(r.code) ? 409 : 400;
     return res.status(status).json({ ok: false, code: r.code, error: r.error });
   }
-  res.json({ ok: true, created: r.created, ...lpComposeStateFor(db, draft.id) });
+  // 🚨 応答は初期表示・GET と同じ形 (押せない理由・仕様書・画像の並びも) にする。
+  //    同じキーの再送で終わった依頼が返ると画面はポーリングを止めるので、ここで欠けると
+  //    「もう一度押すと渡す画像」が再読み込みまで出ない (codex #1592 R3 Medium)
+  res.json({ ok: true, created: r.created, ...lpComposeInitialState(db, draft) });
 });
 
 /** 状況と結果。画面が 5 秒おきに叩くので軽く保つ (done のときだけ本文を返す) */

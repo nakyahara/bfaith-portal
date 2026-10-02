@@ -277,6 +277,16 @@ console.log('⑥c 🚨 商品画像が無ければ押す前に止める (2026-10
   const sj = embedded((await getDetail(d4)).html);
   eq(sj.job.images.map((im) => im.label), ['白抜き', '1 TOP', '2', '3', '4', '5'], '依頼の後は「この依頼で渡した画像」(受付時に固定) が画面に渡る');
   eq(sj.job.images[0].file_id, 'FILEIDWHITE01', '測定行に書く file_id も渡る');
+  // POST の応答も初期表示と同じ形 (同じキーの再送に終わった依頼が返る場合・codex #1592 R3 Medium)
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ?`).run(d4);
+  const again = await (await fetch(`${base}/api/drafts/${d4}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0004c' }),
+  })).json();
+  ok(again.ok && again.created === false && again.job.status === 'cancelled', '同じキーの再送は終わった依頼を返す');
+  eq((again.image_plan || []).map((im) => im.label), ['白抜き', '1 TOP', '2', '3', '4', '5'], '🚨 POST の応答にも画像の並びがある');
+  ok('blocked' in again && 'spec' in again, 'POST の応答にも押せない理由・仕様書がある');
+  ok(lpcImagesText(again, false).includes('もう一度押すと渡す画像: 白抜き → 1 TOP'), '🚨 POST の応答をそのまま描いても「もう一度押すと渡す画像」が出る');
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'queued' WHERE draft_id = ? AND idempotency_key = 'ui-key-0004c'`).run(d4);
   const tj = lpcImagesText(sj, true);
   ok(tj.startsWith('この依頼で AI に渡した画像: 白抜き → 1 TOP → 2 → 3 → 4 → 5') && !tj.includes('もう一度押すと'), '作っている間はその依頼の並びだけ');
   const html6 = (await getDetail(d4)).html;
