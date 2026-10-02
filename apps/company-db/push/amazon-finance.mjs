@@ -90,8 +90,9 @@ export const SQL = {
   maxIngested: `SELECT MAX(ingested_at) AS m FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_ingested`,
   byOrder: `SELECT ${COLS} FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_order WHERE amazon_order_id = ?`,
   byPseudo: `SELECT ${COLS} FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_economic WHERE economic_date = ? AND (amazon_order_id IS NULL OR amazon_order_id = '')`,
-  // 注文番号の無い行の計上日 (読めない日付を見つける = §4.5b)。疑似注文の鍵の元
-  pseudoDates: `SELECT economic_date AS d, COUNT(*) AS n, MIN(id) AS example_id FROM raw_amazon_settlement_lines WHERE amazon_order_id IS NULL OR amazon_order_id = '' GROUP BY economic_date`,
+  // 注文番号の無い行の計上日 (読めない日付を見つける = §4.5b)。疑似注文の鍵の元。決済・版ごとに分ける (読めない日付は採った版の行だけで数える = #1567 Codex R13 Medium 1)
+  pseudoDates: `SELECT economic_date AS d, source_settlement_id AS s, document_version_seq AS v, COUNT(*) AS n, MIN(id) AS example_id FROM raw_amazon_settlement_lines
+    WHERE amazon_order_id IS NULL OR amazon_order_id = '' GROUP BY economic_date, source_settlement_id, document_version_seq ORDER BY economic_date`,
   allOrders: `SELECT DISTINCT amazon_order_id AS o FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_order WHERE amazon_order_id IS NOT NULL AND amazon_order_id <> ''`,
   ingestedSince: `SELECT DISTINCT amazon_order_id AS o, economic_date AS d FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_ingested WHERE ingested_at >= ?`,
   economicRange: `SELECT DISTINCT amazon_order_id AS o, economic_date AS d FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_economic WHERE economic_date BETWEEN ? AND ?`,
@@ -228,12 +229,21 @@ export function makeIterate(sel, run) {
     stats.selectedVersions = selectedVersions; stats.versionCount = versions.length;
     const pick = (rows) => filterSelectedRows(rows, selected);
     // ① 注文番号の無い行の計上日 = 疑似注文の鍵。読めない日付は「鍵の分からない不正な行」(§4.5b)
+    //   🆕 #1567 Codex R13 Medium 1: 読めない日付 (unkeyed = 疑似注文を全部止め・complete にしない) は **採った版の行だけ** で数える
+    //   (前は全部の版 = 採らない版 (退避の V1 など) の不正な行で、正しい採った版がそろっても complete にならなかった)。
+    //   本物の日付は今までどおり全部の版から拾う (= 旧い版にだけある疑似注文の日も読み直す = 墓石の候補)。版の分からない行は採った版と同じに数える (止める側)
     const valid = new Set();
-    stats.unkeyed = [];
+    const unkeyed = new Map();
     for (const r of warehouse.prepare(SQL.pseudoDates).all()) {
-      if (isRealDate(r.d)) valid.add(r.d);
-      else stats.unkeyed.push({ economic_date: r.d, n: r.n, example_id: r.example_id });
+      if (isRealDate(r.d)) { valid.add(r.d); continue; }
+      const sv = selected.get(r.s);
+      if (r.v != null && sv != null && Number(r.v) !== Number(sv)) continue;   // 採らない版の行 = 送らない = 止めない
+      if (r.v != null && sv == null && r.s != null) continue;                  // どの版も採られない決済 (決済 ID の決まらない版など) = 送らない
+      const u = unkeyed.get(r.d) || { economic_date: r.d, n: 0, example_id: r.example_id };
+      u.n += r.n; if (r.example_id < u.example_id) u.example_id = r.example_id;
+      unkeyed.set(r.d, u);
     }
+    stats.unkeyed = [...unkeyed.values()];
     // ② 選ぶ
     const orders = new Set(), dates = new Set();
     const addRow = (o, d) => { if (o == null || o === '') { if (valid.has(d)) dates.add(d); } else orders.add(o); };

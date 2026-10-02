@@ -1127,6 +1127,59 @@ await t('🆕 古い V1 の版 → 中身の違う新しい V2 の版 (#1567 Cod
     assert.equal(await checksum('O-R12E'), e1New, 'O-R12E は V2 のまま'); assert.equal((await receipt('O-R12OLD')).lines, 0, 'O-R12OLD は墓石のまま');
   } finally { SP.ing = saved.ing; SP.inv = saved.inv; }
 });
+await t('🆕 読めない日付 (unkeyed) は採った版の行だけで数える (#1567 Codex R13 Medium 1): 不正な日付の行を持つ旧い V1 の版 + 正常な採った V2 の版 = complete・送る中身は V2 だけ・旧い版にだけある疑似注文の日は今までどおり読み直して墓石 / 採った版 (V2) の行の日付が読めない = 今までどおり止まる (版の中身の確かさ versionDetailValid は日付を見ない = 採る版は替わらない)', async () => {
+  const { prepareReportTsv, ingestSettlement } = await import('../apps/warehouse/fetch-amazon-settlements.js');
+  const { convertV2TsvToV1Tsv } = await import('../apps/warehouse/amazon-settlement-v2.js');
+  const saved = { ing: SP.ing, inv: SP.inv };
+  const P13 = ['2026-03-12T10:00:00Z', '2026-03-14T10:00:00Z'];
+  // 旧い V1: 注文 1 つ + 注文番号の無い保管料 2 行 (3/13・後で 1 行だけ日付を壊す) / 新しい V2: 注文 1 つ + 保管料 1 行 (3/12)
+  const V1TSV = convertV2TsvToV1Tsv(settlementTsv('S13R', ...P13, [{ kind: 'order', order: 'O-R13A', sku: 'SKU-R', yen: 400, day: '2026-03-12T12:00:00Z' },
+    { kind: 'storage', yen: -300, day: '2026-03-13T01:00:00Z' }, { kind: 'storage', yen: -50, day: '2026-03-13T02:00:00Z' }])).tsv;
+  DOCS.D13R = settlementTsv('S13R', ...P13, [{ kind: 'order', order: 'O-R13A', sku: 'SKU-R', yen: 400, day: '2026-03-12T12:00:00Z' }, { kind: 'storage', yen: -10, day: '2026-03-12T05:00:00Z' }]);
+  const seqOf = (layer) => db.prepare(`SELECT seq FROM amazon_settlement_document_versions WHERE settlement_id = 'S13R' AND source_layer = ? ORDER BY seq DESC LIMIT 1`).get(layer).seq;
+  const selectedLayer = () => db.prepare(`SELECT source_layer FROM v_amazon_settlement_selected_documents WHERE settlement_id = 'S13R'`).get()?.source_layer;
+  const pseudoRow = (seq, micro) => db.prepare(`SELECT id, economic_date FROM raw_amazon_settlement_lines WHERE source_settlement_id = 'S13R' AND document_version_seq = ? AND (amazon_order_id IS NULL OR amazon_order_id = '') AND other_amount_micro = ?`).get(seq, micro);
+  const PD = '-:2026-03-13';
+  try {
+    // (0) 旧い V1 の版を入れて一度送る (V1 が採られる = 疑似注文 3/13 が Company DB に入る)
+    const p1 = prepareReportTsv(V1TSV, 'R13R-V1', 'run-r13-v1', { reportDocumentId: 'D13R-V1' });
+    ingestSettlement(db, p1.headerRow, p1.lineRows, p1.ctx, { now: () => new Date(NOW - 7 * 86400e3) });
+    await run({ fetchImpl: spyFetch() });   // S13R の裏付けが無い回 = complete にならなくてよい・送る
+    assert.ok((await receipt(PD))?.lines > 0, `前提: 旧い V1 の版の疑似注文 ${PD} が Company DB に入った`);
+    // (1) 旧い V1 の版の保管料 1 行の日付を読めなくする (V2 が来た後は採らない版の行。同じ日のもう 1 行は本物の日付のまま = 墓石の候補)
+    const v1seq = seqOf('sp_api_v1');
+    const bad = pseudoRow(v1seq, -50000000);
+    db.prepare(`UPDATE raw_amazon_settlement_lines SET economic_date = '2026-13-40' WHERE id = ?`).run(bad.id);
+    // (2) 正常な V2 の report が一覧に出る → V2 が採られる → V1 の不正な行は採らない版 = 止めない → complete
+    SP.ing = [...SP.ing, rep('R13R', 'DONE', 'D13R', P13, '2026-03-15T00:00:00Z')]; SP.inv = SP.ing;
+    const sentNos = [];
+    const fx = spyFetch({ onChunk: (b) => { for (const x of b.rows) sentNos.push(x.mall_order_no); } });
+    const r2 = await run({ fetchImpl: fx });
+    assert.equal(selectedLayer(), 'sp_api_v2', 'V2 が採られる');
+    assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`);
+    assert.ok(!codes(r2).includes('unkeyed'), `採らない版の読めない日付では止めない: ${codes(r2)}`);
+    assert.equal(fx.calls.complete, 1); assert.equal((await cov()).state, 'complete');
+    assert.equal((await receipt(PD)).lines, 0, `旧い版にだけある疑似注文の日 ${PD} = 今までどおり読み直して墓石`);
+    assert.ok((await receipt('O-R13A'))?.lines > 0, '注文 O-R13A は V1 と V2 で同じ中身 = 変化なし (送り直さなくてよい)');
+    assert.ok(sentNos.includes(PD) && sentNos.includes('-:2026-03-12'), `送った = 採った V2 の疑似注文と旧い日の墓石 (${sentNos.filter((n) => /R13|2026-03-1[23]/.test(n))})`);
+    assert.ok((await receipt('-:2026-03-12'))?.lines > 0, '採った V2 の疑似注文 (3/12) は送った');
+    // (3) 採った版 (V2) の行の日付が読めない = 今までどおり止まる (採る版は V2 のまま = 中身の確かさは日付を見ない)
+    const v2seq = seqOf('sp_api_v2');
+    const v2bad = pseudoRow(v2seq, -10000000);
+    db.prepare(`UPDATE raw_amazon_settlement_lines SET economic_date = '2026-13-41' WHERE id = ?`).run(v2bad.id);
+    const fx3 = spyFetch();
+    const r3 = await run({ fetchImpl: fx3 });
+    assert.equal(selectedLayer(), 'sp_api_v2', '採る版は V2 のまま');
+    assert.equal(fx3.calls.complete, 0, '採った版の読めない日付 = complete を送らない');
+    assert.ok(codes(r3).includes('unkeyed'), `unkeyed で止まる: ${codes(r3)}`);
+    assert.notEqual((await cov()).state, 'complete');
+    // 直せば戻る
+    db.prepare(`UPDATE raw_amazon_settlement_lines SET economic_date = ? WHERE id = ?`).run(v2bad.economic_date, v2bad.id);
+    const fx4 = spyFetch();
+    const r4 = await run({ fetchImpl: fx4 });
+    assert.equal(r4.exitCode, 0, `${r4.summary} ${JSON.stringify(r4.reasons)}`); assert.equal(fx4.calls.complete, 1); assert.equal((await cov()).state, 'complete');
+  } finally { SP.ing = saved.ing; SP.inv = saved.inv; }
+});
 await t('🚨 一覧の窓の空白 (前の成功した回から 85 日以上あいた) = complete にしない (⚠️ evidence_chain_gap = Seller Central で印を作り直す)・長く止まった後の取込の一覧も同じ 85 日の窓 (止まっている間に窓の外に出た report は取込まない・#1567 Codex R4)', async () => {
   NOW = Date.parse('2026-07-15T00:00:00Z');   // 前の回 (上の試験の 4/10) から 85 日より後
   const ingQ = [];
