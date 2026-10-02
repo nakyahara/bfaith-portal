@@ -87,7 +87,7 @@ try {
     const before = await snap();
     assert.ok(before.comps.some((c) => c.listing_code === 'pm_1' && c.sort_order === 3));
     const res = await applyMigrations(dbO, { log: () => {} });
-    assert.deepEqual(res.applied, ['0054']);
+    assert.deepEqual(res.applied, ['0054', '0055']);   // 0055 = ④a の持ち主の epoch (表を足すだけ = ここも何も変えない)
     assert.deepEqual(await snap(), before);
     const r2 = await loadWith(dbO, 'load_pg_1', MASTER_OWNERSHIP);
     assert.equal(r2.ok, true, r2.error); assert.equal(r2.summary.listing_components.applied, 0);
