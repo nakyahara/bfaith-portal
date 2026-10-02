@@ -19,7 +19,7 @@
  *   ./phlp queue                                    キューの内訳 (仕事があるか)
  *   ./phlp claim   --run RUN_ID                     1 件 claim (材料 + 仕様書の全文)
  *   ./phlp images  ID                               その依頼の商品画像を img-ID-1.jpg … に落とす
- *   ./phlp reserve ID --model MODEL                 **AI を呼ぶ前に必ず**予約する
+ *   ./phlp reserve ID                               **AI を呼ぶ前に必ず**予約する (モデルはランナーが決める)
  *   ./phlp lint    ID --file out-ID.md              構成を lint する (サーバが正本・何度でも呼べる)
  *   ./phlp result  ID --accepted --file out-ID.md [--lint lint-ID.json] [--rounds N]
  *   ./phlp result  ID --rejected --reason-file reason-ID.txt [--lint lint-ID.json] [--rounds N]
@@ -166,7 +166,9 @@ async function cmdQueue() {
 }
 
 async function cmdClaim(opt) {
-  const run = String(opt.run || '').trim();
+  // 🚨 ランナーが決めた run id (PH_LP_RUN_ID) を優先する。ランナーはこの id で「実際に本回答を書いたモデル」を
+  //    サーバに付ける (model-check)。Claude が --run に別の値を書いても、ランナーの id が job に写る
+  const run = String(process.env.PH_LP_RUN_ID || opt.run || '').trim();
   if (!run) die('--run RUN_ID が要ります');
   const r = await api('POST', '/lp-compose/claim', { runner_run_id: run.slice(0, 80) });
   if (r.status !== 200) { out(r.json); return fail(1); }
@@ -252,7 +254,13 @@ async function cmdImages(id) {
 
 async function cmdReserve(id, opt) {
   const lease = loadLease(id);
-  const model = String(opt.model || 'claude-opus-5').trim();
+  // 🚨 モデルは Claude に申告させない (以前は --model の既定 'claude-opus-5' が実際と無関係に記録されていた)。
+  //    ランナーが claude --model に渡したのと同じ値を PH_LP_MODEL で受け取る。Claude は環境変数を書き換えられない
+  //    (allow は ./phlp で始まるコマンドだけ)。サーバは自分の設定と違えば bad_model で断る
+  //    claim の応答のモデルで代わりに予約しない — claude --model を付けずに起動した (古い) ランナーでも
+  //    サーバの設定どおりのモデルで動いたことになってしまう (codex exec review #1591 Medium)
+  const model = process.env.PH_LP_MODEL;
+  if (!model) die('PH_LP_MODEL がありません (ランナー run-lp-compose.ps1 から起動してください)');
   const r = await api('POST', `/lp-compose/jobs/${id}/reserve`, {
     lease_token: lease.lease_token, model, prompt_version: PROMPT_VERSION,
   });

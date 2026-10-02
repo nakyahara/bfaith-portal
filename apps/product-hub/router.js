@@ -126,7 +126,7 @@ import {
   queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
-  lpComposeImageRef, recordImageServed as recordLpComposeImageServed, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
+  lpComposeImageRef, recordImageServed as recordLpComposeImageServed, recordModelCheck as recordLpComposeModelCheck, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
   lintForJob as lintLpComposeForJob,
 } from './lib/lp-compose.js';
 import { assertXlsxExpandsSafely, XlsxTooLargeError } from './lib/xlsx-guard.js';
@@ -3805,10 +3805,10 @@ function lpComposeInitialState(db, draft) {
   //    カラバリや裏面情報を含めるのは composeProductInfo の中なので、
   //    ここだけ effectiveProductInfo を渡すと、**裏面情報だけの商品が
   //    画面ではずっと押せない** (API では押せる) という食い違いになる。
-  const { productInfo } = lpComposeMaterial(db, draft);
+  const { productInfo, images } = lpComposeMaterial(db, draft);
   return {
     ...lpComposeStateFor(db, draft.id),
-    blocked: lpComposeBlockReason({ draft, productInfo, spec }),
+    blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
     spec: lpSpecSummary(db, 'product_analysis'),
   };
 }
@@ -3840,12 +3840,12 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
   if (!draft) return;
   const db = getDB();
   const spec = latestLpSpec(db, 'product_analysis');
-  const { productInfo } = lpComposeMaterial(db, draft);
+  const { productInfo, images } = lpComposeMaterial(db, draft);
   res.json({
     ok: true,
     ...lpComposeStateFor(db, draft.id),
     // 押せるか。押せない理由はそのまま画面に出す
-    blocked: lpComposeBlockReason({ draft, productInfo, spec }),
+    blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
     // 「仕様書: ○○ (YYYY-MM-DD 取込)」。古ければ人が上げ直す (設計 §4.1 のアップロード忘れ対策)
     spec: lpSpecSummary(db, 'product_analysis'),
   });
@@ -3889,7 +3889,7 @@ function lpComposeMaterial(db, draft) {
 //    長さだけ先に見て、形の判定は lib に任せる。
 // lp-compose 固有の code を HTTP に対応づける (ad-kw-ai の表に無いもの)。
 // 🚨 disabled を落とすと「機能が無効」が 400 に見え、実行役が「依頼が壊れている」と誤解する
-const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, already_generated: 409, job_finalized: 409, already_running: 409, lint_failed: 422 };
+const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, bad_config: 503, bad_model: 409, already_generated: 409, job_finalized: 409, already_running: 409, lint_failed: 422 };
 // 🚨 lint で断ったときは**何が落ちたかも返す** (codex exec review P2)。
 //    code と error だけだと、実行役は直すために lint をもう一度呼ぶしか無く、
 //    lease が切れた後はそれもできない (= 直しようが無い)。
@@ -3917,11 +3917,26 @@ serviceApiRouter.post('/lp-compose/claim', (req, res) => {
 serviceApiRouter.post('/lp-compose/jobs/:id/reserve', (req, res) => {
   const r = reserveLpComposeGeneration(getDB(), lpIdParam(req.params.id), {
     leaseToken: rawField(req.body?.lease_token, 100),
-    model: cleanText(req.body?.model, 80),
+    // 🚨 cleanText (trim) を通さない — 空白付きを同じモデルに畳まない (codex exec review #1591 Low)
+    model: rawField(req.body?.model, 80),
     promptVersion: rawField(req.body?.prompt_version, 80),
   });
   if (!r.ok) return lpComposeFail(res, r);
   res.json({ ok: true, generation_id: r.generation_id, packet_hash: r.packet_hash });
+});
+
+/**
+ * 実際に本回答を書いたモデルを付ける (codex exec review #1591 High)。
+ * 🚨 **miniPC のランナー (PowerShell) だけが呼ぶ**。./phlp にはこの口を呼ぶコマンドが無いので、
+ *    Claude (権限は ./phlp と ./phlpreview だけ) からは届かない。body: { runner_run_id, actual_models: [] }
+ */
+serviceApiRouter.post('/lp-compose/model-check', (req, res) => {
+  const r = recordLpComposeModelCheck(getDB(), {
+    runnerRunId: rawField(req.body?.runner_run_id, 100),
+    actualModels: req.body?.actual_models,
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json(r);
 });
 
 serviceApiRouter.post('/lp-compose/generations/:gid/result', (req, res) => {

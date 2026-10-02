@@ -42,6 +42,9 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $OutLog = Join-Path $LogDir "$Stamp.lp.out.log"
 $ErrLog = Join-Path $LogDir "$Stamp.lp.err.log"
 $RunLog = Join-Path $LogDir 'lp-compose.log'
+# Outside work\ (Claude may read and write work\). install.ps1 creates it; settings.json denies it to Claude.
+$StateDir = Join-Path $Root 'state'
+New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 
 function Log([string]$msg) {
   $line = '[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $msg
@@ -66,12 +69,71 @@ function Get-Queue {
   }
 }
 
+# Which model wrote the MAIN answer (codex exec review #1591 High). Read from claude --output-format stream-json:
+# assistant events with no parent_tool_use_id (= not a sub-agent). modelUsage is NOT evidence - it also lists
+# auxiliary calls (Haiku). Same rule as product-idea-scout/ai/cli.cjs parseResponse.
+# Returns @{ Models = @(...); Unreadable = $bool; IsError = $bool; ErrorText = '...'; HasResult = $bool }
+function Read-ClaudeStream([string]$path) {
+  $r = @{ Models = @(); Unreadable = $false; IsError = $false; ErrorText = ''; HasResult = $false }
+  if (-not (Test-Path -LiteralPath $path)) { $r.Unreadable = $true; return $r }
+  foreach ($line in Get-Content -LiteralPath $path -Encoding UTF8) {
+    # only the two event types we need (tool results can be large; do not parse them)
+    # (inside a JSON string the quotes are escaped, so this matches real keys only; key order is not assumed)
+    if ($line -notmatch '"type":"(assistant|result)"') { continue }
+    try { $e = $line | ConvertFrom-Json } catch { $r.Unreadable = $true; continue }
+    if ($e.type -eq 'assistant' -and -not $e.parent_tool_use_id) {
+      $m = [string]$e.message.model
+      # \z, not $ (see above). A model string of another shape is "cannot verify", never "match".
+      if ($m -cmatch '^claude-[a-z0-9]+(-[a-z0-9]+){1,6}\z') { if ($r.Models -notcontains $m) { $r.Models += $m } }
+      else { $r.Unreadable = $true }
+    } elseif ($e.type -eq 'result') {
+      $r.HasResult = $true
+      if ($e.is_error) { $r.IsError = $true; $r.ErrorText = [string]$e.result }
+    }
+  }
+  return $r
+}
+
+# Attach the main-answer model to this run's generation on the server. ONLY this runner calls it: ./phlp has no
+# command for it and Claude may only run ./phlp and ./phlpreview, so Claude cannot reach it. The server decides
+# match / mismatch / unknown and never overwrites an earlier check.
+function New-ModelCheckBody([string]$runId, [string[]]$models) {
+  # models are already shape-checked in Read-ClaudeStream (no quotes or backslashes can reach the JSON)
+  $arr = if (@($models).Count -gt 0) { '["' + (@($models) -join '","') + '"]' } else { '[]' }
+  return '{"runner_run_id":"' + $runId + '","actual_models":' + $arr + '}'
+}
+function Send-ModelCheckBody([string]$body) {
+  $tok = (Get-Content -Raw -LiteralPath $TokenFile).Trim()
+  return Invoke-RestMethod -Method Post -Uri ($Base + '/lp-compose/model-check') -Headers @{ Authorization = ('Bearer ' + $tok) } `
+    -ContentType 'application/json' -Body $body -TimeoutSec 60
+}
+# A check that could not be sent is kept in state\ (outside work\, Claude cannot read or write it) and re-sent
+# at the start of every run - also when the queue is empty - until the server answers (codex #1591 R2 Medium).
+# The server returns the stored check for a re-send, and closes a generation as "unknown" after 15 min anyway.
+function Send-PendingModelChecks {
+  foreach ($f in @(Get-ChildItem -LiteralPath $StateDir -Filter 'lp-model-check-*.json' -ErrorAction SilentlyContinue)) {
+    if ($f.LastWriteTime -lt (Get-Date).AddDays(-1)) {
+      Log ('model check dropped after 1 day (the server has closed it as unknown): ' + $f.Name)
+      Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+      continue
+    }
+    try {
+      $r = Send-ModelCheckBody (Get-Content -Raw -LiteralPath $f.FullName)
+      Log ('model check re-sent: ' + $f.Name + ' -> ' + ((@($r.checks) | ForEach-Object { [string]$_.model_check }) -join ','))
+      Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+    } catch { Log ('model check re-send failed (kept): ' + $f.Name + ': ' + $_.Exception.Message) }
+  }
+}
+
 if (-not (Test-Path $Phlp) -or -not (Test-Path (Join-Path $WorkDir 'phlp'))) {
   Log 'phlp not installed (run install.ps1)'
   Send-Ping 'fail' 'phlp not installed'
   exit 1
 }
 if (-not (Test-Path $TokenFile)) { Log 'service token file missing'; Send-Ping 'fail' 'service token missing'; exit 1 }
+
+# --- 0. model checks that earlier runs could not send (cheap: usually no file) ----
+Send-PendingModelChecks
 
 # --- 1. cheap poll: is there anything to do? --------------------------------------
 # No Claude, no lock, no residue check when the queue is empty. This is the common case (most minutes).
@@ -90,7 +152,16 @@ if ([int]$before.claimable -eq 0) {
   Send-Ping 'ok' ('idle (running=' + $before.running + ' needs_review=' + $before.needs_review + ')')
   exit 0
 }
-Log ('work found: claimable=' + $before.claimable + ' running=' + $before.running + ' needs_review=' + $before.needs_review)
+# The model is decided on the SERVER (Render PH_LP_COMPOSE_MODEL, also shown on the button) - never by Claude.
+# The same value goes to claude --model and, via PH_LP_MODEL, to ./phlp reserve; the server refuses any other.
+# \z, not $: .NET $ also matches before a trailing newline.
+$Model = [string]$before.model
+if ($Model -cnotmatch '^claude-[a-z0-9]+(-[a-z0-9]+){1,6}(\[1m\])?\z') {
+  Log ('server sent no usable model: [' + $Model + '] (server older than this runner?)')
+  Send-Ping 'fail' 'server sent no usable model'
+  exit 1
+}
+Log ('work found: claimable=' + $before.claimable + ' running=' + $before.running + ' needs_review=' + $before.needs_review + ' model=' + $Model)
 
 # --- 2. one Claude at a time ------------------------------------------------------
 $Guard = Join-Path $PSScriptRoot 'ClaudeGuard.ps1'
@@ -132,10 +203,15 @@ try {
   $prompt = 'Process ONE LP compose request. Follow the ph-lp-compose skill in this workspace exactly: claim one request with ./phlp, download the product images and LOOK AT them, write what you saw into seen-<ID>.md, read the spec file, reserve BEFORE writing, write the section 7 output following the instruction that came with the claim, check it with ./phlp lint until it passes, review with ./phlpreview, then send the result with ./phlp result and clean up. After reserve, a failure must be reported as result --rejected, never as fail. Never read the service token and never touch files outside this workspace. Finish with one line: job=N status=done or rejected or failed'
   $timedOut = $false
   $claudeExit = -1
+  # This run's id. ./phlp claim puts it on the job (whatever --run Claude writes), reserve copies it to the
+  # generation, and the model check (section 4) finds the generation by it.
+  $RunId = 'lpr-' + $Stamp + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
+  $env:PH_LP_MODEL = $Model   # inherited by claude -> ./phlp (reserve records the REQUESTED model)
+  $env:PH_LP_RUN_ID = $RunId
   try {
     $p = Start-Process -FilePath $Claude -WorkingDirectory $WorkDir -NoNewWindow -PassThru `
            -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog `
-           -ArgumentList @('-p', ('"' + $prompt + '"'), '--output-format', 'json')
+           -ArgumentList @('-p', ('"' + $prompt + '"'), '--model', $Model, '--output-format', 'stream-json', '--verbose')
     # PS 5.1: with -NoNewWindow + redirection, ExitCode stays empty unless the handle is taken right away
     $null = $p.Handle
     if (-not $p.WaitForExit($TimeoutMin * 60 * 1000)) {
@@ -151,16 +227,45 @@ try {
     Send-Ping 'fail' 'failed to start claude'
     exit 1
   }
-  Log ('claude exit=' + $claudeExit + ' timedOut=' + $timedOut)
+  Remove-Item Env:PH_LP_MODEL -ErrorAction SilentlyContinue
+  Remove-Item Env:PH_LP_RUN_ID -ErrorAction SilentlyContinue
+  Log ('claude exit=' + $claudeExit + ' timedOut=' + $timedOut + ' run=' + $RunId)
+  # Without this a refused model or a login problem looks like "nothing moved"
+  # (2026-10-02: Claude Code 2.1.252 refused Opus 5.5 with API 400 - needs 2.1.280+).
+  $stream = Read-ClaudeStream $OutLog
+  Log ('main model(s)=' + ($stream.Models -join ',') + ' unreadable=' + $stream.Unreadable + ' result=' + $stream.HasResult + ' is_error=' + $stream.IsError)
+  if ($stream.IsError) { Log ('claude reported an error: ' + $stream.ErrorText.Substring(0, [Math]::Min(300, $stream.ErrorText.Length))) }
   $null = Wait-NoClaudeResidue -DeadlineUtc ((Get-Date).ToUniversalTime().AddMinutes(2)) -PollSec 5
 } finally {
   Exit-ClaudeLock
 }
 
-# --- 4. the SERVER decides whether anything happened ------------------------------
+# --- 4. attach the main-answer model, then let the SERVER decide what happened -----
+# FIRST, before the queue post-check (a failed post-check must not lose the model check - codex #1591 R2 Medium).
+# Always sent, also after an error or a timeout: the server records "unknown" when no main model could be read,
+# never "match", and moves a done request to needs_review unless it is a match (the text is then not shown).
+# A model string of another shape is not sent as evidence (Unreadable -> the list is sent empty = unknown).
+# The body is written to state\ first and removed only after the server answered; otherwise the next runs re-send it.
+$checkNote = 'not sent'
+$modelVerified = $true
+$pendingFile = Join-Path $StateDir ('lp-model-check-' + $RunId + '.json')
+try {
+  $send = if ($stream.Unreadable) { @() } else { $stream.Models }
+  $mcBody = New-ModelCheckBody $RunId $send
+  [IO.File]::WriteAllText($pendingFile, $mcBody, (New-Object Text.UTF8Encoding($false)))
+  $mc = Send-ModelCheckBody $mcBody
+  Remove-Item -LiteralPath $pendingFile -Force -ErrorAction SilentlyContinue
+  $checks = @($mc.checks | ForEach-Object { [string]$_.model_check })
+  $checkNote = if ($checks.Count) { $checks -join ',' } else { 'no generation' }
+  if ($checks | Where-Object { $_ -ne 'match' }) { $modelVerified = $false }
+} catch {
+  $checkNote = 'send failed (kept for re-send): ' + $_.Exception.Message
+  $modelVerified = $false
+}
+
 Start-Sleep -Seconds 3
 $after = $null
-try { $after = Get-Queue } catch { Log ('queue post-check failed: ' + $_.Exception.Message); Send-Ping 'fail' 'queue post-check failed'; exit 1 }
+try { $after = Get-Queue } catch { Log ('queue post-check failed: ' + $_.Exception.Message + ' check=' + $checkNote); Send-Ping 'fail' 'queue post-check failed'; exit 1 }
 # A merely CLAIMED request is NOT progress: claimable goes down while running goes up, and the request
 # is lost (it only turns into failed when the lease expires 40 min later). Same lesson as the manuscript
 # runner: pending = claimable + leased (Codex review P1).
@@ -168,10 +273,13 @@ $pendingBefore = [int]$before.claimable + [int]$before.running
 $pendingAfter  = [int]$after.claimable + [int]$after.running
 $moved = $pendingBefore - $pendingAfter
 $needsReviewUp = [int]$after.needs_review - [int]$before.needs_review
-$note = 'moved=' + $moved + ' claimable=' + $after.claimable + ' running=' + $after.running + ' needs_review=' + $after.needs_review + ' exit=' + $claudeExit
+$note = 'moved=' + $moved + ' claimable=' + $after.claimable + ' running=' + $after.running + ' needs_review=' + $after.needs_review + ' exit=' + $claudeExit + ' model=' + $Model + ' main=' + ($stream.Models -join ',') + ' check=' + $checkNote
 Log ('after: ' + $note)
 
 if ($timedOut) { Send-Ping 'fail' ('timeout; ' + $note); exit 1 }
+# A result whose model is not verified (another model, unreadable, or the check not stored) must not pass as ok:
+# the measurement compares ONE model. The screen shows the same check next to the result.
+if (-not $modelVerified -and ($moved -gt 0 -or $needsReviewUp -gt 0)) { Send-Ping 'partial' ('model not verified; ' + $note); exit 0 }
 if ($needsReviewUp -gt 0) {
   # reserved but no result came back = outcome unknown. A person decides; we never retry it automatically.
   Send-Ping 'partial' ('needs_review +' + $needsReviewUp + '; ' + $note)

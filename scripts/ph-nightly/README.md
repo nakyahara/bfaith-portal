@@ -147,7 +147,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ph-nightly\install.p
 | CLI (書き換え不可) | `bin\phlp.mjs` |
 | シム・検品ラッパー | `work\phlp` / `work\phlpreview` (ACL で書き込み拒否) |
 | スキル (コピー) | `work\.claude\skills\ph-lp-compose` |
-| ランナー | `binun-lp-compose.ps1` + Task Scheduler `PhLpComposeMinutely` |
+| ランナー | `bin\run-lp-compose.ps1` + Task Scheduler `PhLpComposeMinutely` |
 | ログ | `logs\lp-compose.log` + 実行ごとの `*.lp.out.log` / `*.lp.err.log` |
 | 監視 | jobs-monitor ping `ph-lp-compose` (heartbeat・max_age 1 時間) |
 
@@ -168,7 +168,7 @@ LP のランナーも **Claude 共通ロックを取る**が、期限は **5 秒
 
 ### 朝のチェック (jobs-monitor に `ph-lp-compose` が出たら)
 
-`C:	ools\ph-nightly\logs\lp-compose.log` の末尾を見る:
+`C:\tools\ph-nightly\logs\lp-compose.log` の末尾を見る:
 
 - `skipped (another Claude job holds the lock)` → 夜間ジョブが動いている間は**正常**
 - `needs_review +N` (partial) → AI を呼んだのに結果が返らなかった = **成否不明**。
@@ -176,6 +176,26 @@ LP のランナーも **Claude 共通ロックを取る**が、期限は **5 秒
 - `nothing moved` (fail) → claude の認証切れ・ツールの deny・仕様書が未取込。
   `*.lp.err.log` と `*.lp.out.log` の `permission_denials` を見る
 - `PH_LP_COMPOSE_ENABLED is off` → Render のフラグが未設定 (立ち上げ中は正常)
+- `server sent no usable model` (fail) → Render の `PH_LP_COMPOSE_MODEL` が読めない値 (下の「モデル」)
+- `model not verified` (partial) → 本回答を書いたモデルが頼んだモデルと違った・読めなかった・確認を送れなかった。
+  その依頼は needs_review になり、画面は本文を出さず理由を出す。もう一度依頼する。
+  `main model(s)=` の行に実際のモデル、`check=` にサーバの判定 (match / mismatch / unknown / send failed) が出る
+- `model check re-send failed (kept)` → 確認を送れず `state\lp-model-check-*.json` に控えてある。
+  毎分送り直す (キューが空でも)。サーバは 15 分付かなければ「未確認」で閉じるので、放っておいても画面は止まらない
+- `claude reported an error: API Error: 400 ... version 2.1.280 or newer is required` → Claude Code が古い (下の「モデル」)
+
+### モデル (2026-10-02〜)
+
+- 決める場所は **Render の `PH_LP_COMPOSE_MODEL` だけ** (未設定なら `claude-opus-5-5[1m]` = Opus 5.5・1M)。
+  ボタンにも「🤖 構成をAIに作らせる (Opus 5.5)」と出る。**設定してあるのに読めない値**ならボタンは押せず、claim もしない (黙って既定に戻さない)
+- ランナーは queue で受け取った値を `claude --model` と `PH_LP_MODEL` (`./phlp reserve` が送る) に渡す。サーバは違うモデルの予約を断る
+- 終わったらランナーが stream-json の `assistant.message.model` (サブエージェント以外) を読み、ランナーだけが呼ぶ
+  `POST /lp-compose/model-check` で「実際に書いたモデル」を付ける。**一致した done にだけ本文を出す**
+- 🚨 Opus 5.5 は **Claude Code 2.1.280 以上**が要る。miniPC は 2026-10-02 に 2.1.252 → 2.1.280 に上げた (決め打ち・自動更新なし)。
+  上げ下げするときは夜間の `PhGenerateNightly`・`ProductKWScout` も同じ Claude Code を使うので、
+  商品スカウトの引数 (`product-idea-scout/ai/cli.cjs` の `invocationArgs`) が `claude --help` に残っているかを見る
+- モデルを変えるとき・配置するとき: Render の `PH_LP_COMPOSE_ENABLED` を外す → Render の反映 → miniPC で `install.ps1` → フラグを戻す
+  (サーバとランナーの版が食い違う数分に依頼を受けない)
 
 ### 止めたい
 

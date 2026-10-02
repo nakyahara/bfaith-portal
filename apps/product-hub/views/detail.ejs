@@ -1605,7 +1605,8 @@ th.attr-unknown { color: #dc2626; }
           <div id="lpc" class="field" style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;"
                data-draft-id="<%= draft.id %>" data-ne-code="<%= draft.ne_code || '' %>" data-name="<%= draft.name || '' %>">
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-              <button type="button" class="btn" id="lpc-btn">🤖 構成をAIに作らせる</button>
+              <%# モデル名をボタンに出す (2026-10-02 中原さん)。決める場所は Render の PH_LP_COMPOSE_MODEL だけ %>
+              <button type="button" class="btn" id="lpc-btn">🤖 構成をAIに作らせる<%= lpCompose.model_label ? ' (' + lpCompose.model_label + ')' : '' %></button>
               <span class="muted" id="lpc-status" style="font-size:12px;"></span>
             </div>
             <div class="muted" id="lpc-spec" style="font-size:11px; margin-top:4px;"></div>
@@ -5833,13 +5834,30 @@ th.attr-unknown { color: #dc2626; }
       return 'lint: 通っています' + (warn ? ' (警告 ' + warn + ' 件 — 仕様書とパーサーのズレ。構成そのものは問題ありません)' : '');
     }
 
+    // 実際に本回答を書いたモデルの確認 (ランナーが終わった後に付ける・codex exec review #1591 High)。
+    // 頼んだモデル (job.model) と違えば測定に数えない
+    const MODEL_CHECK_TEXT = { match: '一致', mismatch: '不一致', unknown: '未確認' };
+    // 🚨 本文は「一致」した done にしか来ない (サーバが出さない)。不一致・未確認は needs_review に落ちて理由が error に入る
+    function modelNote(job) {
+      if (!job.model) return '';
+      if (job.model_check === 'match') return job.model_label + '・モデル確認済み';
+      return job.model_label;
+    }
+    // できてから実モデルの確認が付くまで (ふつうは数十秒〜2 分) 見に行く。上限は置かない —
+    // サーバが 15 分付かなければ「未確認」で閉じる (= needs_review になってポーリングも止まる)。
+    // 🚨 completed_at を基準にしない: lease 切れの後に結果が届いた依頼は completed_at が古いまま (codex #1591 R3 Low)
+    const checkingModel = (job) => !!job && !!job.model && !job.model_check && job.status === 'done';
+
     function render(s) {
       state = s;
       const job = s.job;
       const blocked = s.blocked;
       const running = !!job && RUNNING.includes(job.status);
-      btn.disabled = !!blocked || running || posting;
-      btn.textContent = running ? '🤖 AI が作っています…' : '🤖 構成をAIに作らせる';
+      // 確認待ちの間も押させない (サーバも already_running で断る・codex #1591 R4 Medium)
+      btn.disabled = !!blocked || running || checkingModel(job) || posting;
+      // モデル名をボタンに出す。ここは「いま押したら使われるモデル」(サーバの設定)
+      const ml = s.model_label ? ' (' + s.model_label + ')' : '';
+      btn.textContent = running ? '🤖 AI' + ml + ' が作っています…' : '🤖 構成をAIに作らせる' + ml;
 
       specEl.textContent = s.spec
         ? '仕様書: ' + s.spec.title + ' (' + String(s.spec.imported_at || '').slice(0, 10) + ' 取込)'
@@ -5850,8 +5868,17 @@ th.attr-unknown { color: #dc2626; }
       else if (running) {
         statusEl.textContent = 'AI が構成を作っています… (2分ほどかかります・' + (job.elapsed_sec || 0) + ' 秒経過)';
       } else if (job.status === 'done') {
-        statusEl.textContent = 'できました (' + (job.elapsed_sec || 0) + ' 秒'
-          + (job.review_rounds != null ? '・検品 ' + job.review_rounds + ' 巡' : '') + ')';
+        // ここは「この依頼で実際に予約されたモデル」(設定がその後に変わっても、作ったモデルを出す)
+        if (job.model && !job.model_check) {
+          statusEl.textContent = 'できました。作ったモデル (' + job.model_label + ') を確かめています… 確かめたら本文を出します';
+        } else {
+          const mn = modelNote(job);
+          statusEl.textContent = 'できました (' + (mn ? mn + '・' : '') + (job.elapsed_sec || 0) + ' 秒'
+            + (job.review_rounds != null ? '・検品 ' + job.review_rounds + ' 巡' : '') + ')';
+        }
+      } else if (job.status === 'needs_review' && String(job.error_code || '').startsWith('model_')) {
+        // 実モデルが頼んだモデルと違う・確かめられなかった。本文は出さない (測定に数えない)
+        statusEl.textContent = '⚠️ ' + (job.error || '作ったモデルを確かめられませんでした。もう一度依頼してください');
       } else if (job.status === 'needs_review') {
         // 🚨 成否不明。自動では作り直さない (AI 枠を使ったかもしれないので人が見る)
         statusEl.textContent = '結果を受け取れませんでした。もう一度依頼してください';
@@ -5892,10 +5919,13 @@ th.attr-unknown { color: #dc2626; }
           + ' / 期限内=' + (job.within_deadline === null ? '?' : (job.within_deadline ? 'はい' : 'いいえ'))
           + ' / lint=' + (job.lint ? (job.lint.ok ? '通った' : 'ひっかかった') : 'なし')
           + ' / 検品巡回=' + (job.review_rounds != null ? job.review_rounds : '?')
+          + ' / モデル=' + (job.model || 'なし (AI を呼ぶ前に止まった)')
+          + (job.model ? ' / 実モデル=' + (job.actual_model || '-')
+            + ' / モデル確認=' + (MODEL_CHECK_TEXT[job.model_check] || '確認中') : '')
           + ' / 状態=' + job.status;
       }
 
-      if (running) schedule(); else stop();
+      if (running || checkingModel(job)) schedule(); else stop();
     }
 
     function stop() { if (timer) { clearTimeout(timer); timer = null; } }

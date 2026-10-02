@@ -331,7 +331,12 @@ export const JOBS_REGISTRY = [
       + '"skipped (another Claude job holds the lock)" → 夜間ジョブが動いている間は正常 (次の分で拾う) / '
       + '"needs_review +N" (partial) → AI を呼んだのに結果が返らなかった = 成否不明。**自動では作り直さない**ので、画面でもう一度依頼する / '
       + '"nothing moved" (fail) → claude の認証切れ・ツールの deny・仕様書が未取込。*.lp.out.log の permission_denials と Claude の最後の報告を見る / '
-      + '"PH_LP_COMPOSE_ENABLED is off" → Render のフラグが未設定 (段階1 の立ち上げ中は正常)。'
+      + '"PH_LP_COMPOSE_ENABLED is off" → Render のフラグが未設定 (段階1 の立ち上げ中は正常) / '
+      // モデル (2026-10-02・#1591): 決める場所は Render の PH_LP_COMPOSE_MODEL だけ。Opus 5.5 は Claude Code 2.1.280 以上
+      + '"server sent no usable model" (fail) → Render の PH_LP_COMPOSE_MODEL が読めない値 (読めなければ止める・既定に戻さない) / '
+      + '"model not verified" (partial) → 本回答のモデルが頼んだモデルと違う・読めない・確認を送れなかった。その依頼は needs_review で本文は出ない。もう一度依頼する / '
+      + '"model check re-send failed (kept)" → state\\lp-model-check-*.json に控えて毎分再送 (サーバは 15 分で未確認として閉じる) / '
+      + '"API Error: 400 ... 2.1.280 or newer" → miniPC の Claude Code が古い (上げるときは夜間の原稿生成・商品スカウトの引数も確認)。'
       + '止めるなら Render の PH_LP_COMPOSE_ENABLED を外すか Disable-ScheduledTask PhLpComposeMinutely',
   },
   {
