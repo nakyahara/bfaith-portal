@@ -1610,6 +1610,9 @@ th.attr-unknown { color: #dc2626; }
               <span class="muted" id="lpc-status" style="font-size:12px;"></span>
             </div>
             <div class="muted" id="lpc-spec" style="font-size:11px; margin-top:4px;"></div>
+            <%# AI に渡す (渡した) 画像の並び。測定で比べるときはスタッフ版 (ChatGPT) にも同じ画像を同じ順に添付する
+                (codex #1592 High: 同じ材料から作った 2 つを比べるのが測定の前提) %>
+            <div class="muted" id="lpc-images" style="font-size:11px; margin-top:2px;"></div>
             <%# 🚨 失敗したときの説明はここ。lint の中身 (lpc-lint) は「できた」ときの箱の中にあるので、
                 失敗したときは見えない (codex exec review P2) %>
             <div id="lpc-fail" hidden class="muted" style="font-size:11px; margin-top:4px; color:#b45309;"></div>
@@ -5812,6 +5815,7 @@ th.attr-unknown { color: #dc2626; }
     const copyResultEl = document.getElementById('lpc-copy-result');
     const failEl = document.getElementById('lpc-fail');
     const measEl = document.getElementById('lpc-meas');
+    const imagesEl = document.getElementById('lpc-images');
 
     const RUNNING = ['queued', 'running'];
     let timer = null;
@@ -5848,6 +5852,22 @@ th.attr-unknown { color: #dc2626; }
     // 🚨 completed_at を基準にしない: lease 切れの後に結果が届いた依頼は completed_at が古いまま (codex #1591 R3 Low)
     const checkingModel = (job) => !!job && !!job.model && !job.model_check && job.status === 'done';
 
+    // lpc-images-text:start (試験がここを切り出して動かす・scripts/test-ph-lp-compose-ui.mjs)
+    // AI に渡す画像の並び。作っている間・確認待ちの間はその依頼で渡した画像だけ。終わった後は
+    // 「この依頼で渡した画像」(測定はこちら) と「もう一度押すと渡す画像」(いまの画像タブ) の両方
+    // (codex #1592 R2 High: 終わった依頼の並びだけを出すと、画像を差し替えて押し直したときに食い違う)
+    function lpcImagesText(s, inProgress) {
+      const line = (imgs) => imgs.map((im) => im.label).join(' → ');
+      const jobImgs = s.job && Array.isArray(s.job.images) && s.job.images.length ? s.job.images : null;
+      const plan = Array.isArray(s.image_plan) ? s.image_plan : [];
+      const lines = [];
+      if (jobImgs) lines.push('この依頼で AI に渡した画像: ' + line(jobImgs));
+      if (!inProgress && !s.blocked && plan.length) lines.push((jobImgs ? 'もう一度押すと渡す画像: ' : '押すと AI に渡す画像: ') + line(plan));
+      if (!lines.length) return '';
+      return lines.join('\n') + '\n— 測定で比べるときは「📝 商品分析を準備」の ChatGPT 版にも、その依頼で AI に渡した画像を同じ順に添付してください';
+    }
+    // lpc-images-text:end
+
     function render(s) {
       state = s;
       const job = s.job;
@@ -5858,6 +5878,9 @@ th.attr-unknown { color: #dc2626; }
       // モデル名をボタンに出す。ここは「いま押したら使われるモデル」(サーバの設定)
       const ml = s.model_label ? ' (' + s.model_label + ')' : '';
       btn.textContent = running ? '🤖 AI' + ml + ' が作っています…' : '🤖 構成をAIに作らせる' + ml;
+
+      imagesEl.textContent = lpcImagesText(s, running || checkingModel(job));
+      imagesEl.style.whiteSpace = 'pre-wrap';
 
       specEl.textContent = s.spec
         ? '仕様書: ' + s.spec.title + ' (' + String(s.spec.imported_at || '').slice(0, 10) + ' 取込)'
@@ -5922,6 +5945,7 @@ th.attr-unknown { color: #dc2626; }
           + ' / モデル=' + (job.model || 'なし (AI を呼ぶ前に止まった)')
           + (job.model ? ' / 実モデル=' + (job.actual_model || '-')
             + ' / モデル確認=' + (MODEL_CHECK_TEXT[job.model_check] || '確認中') : '')
+          + ' / 画像=' + (job.images || []).map((im) => im.label + ':' + im.file_id).join(',')
           + ' / 状態=' + job.status;
       }
 

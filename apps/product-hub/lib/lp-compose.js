@@ -41,7 +41,9 @@ import { PRODUCT_ANALYSIS_INSTRUCTION } from './prompt-templates.js';
  */
 
 // 2: スタッフの定型文と**同じ指示文** (instruction) を packet に入れた (設計 §5)
-export const PACKET_VERSION = 2;
+// 3: 画像に役割 (role = white_bg / slot:N) を入れた。白抜きを先頭に渡すようにした (2026-10-02・codex #1592 Medium)。
+//    画像の選び方が変わったので、測定は版ごとに分けて数えられる
+export const PACKET_VERSION = 3;
 export const PROMPT_VERSION = 'lp-compose-v1';
 export const LEASE_MIN = 40;
 /** 測定の合格ライン (設計 §7.2)。受付時に created_at + これで deadline を固定する */
@@ -253,10 +255,27 @@ function normalizeImages(images) {
       file_id: fileId,
       // Drive の更新日時。何を見て作ったかを後から辿るために packet に残す (設計 §4.2)
       modified_time: trim(im?.modified_time || im?.drive_modified_time, 40) || null,
+      // 何の画像か (white_bg = 白抜き / slot:N = 画像タブの N 番目・1 が TOP)。
+      // スタッフ版 (ChatGPT) に同じ画像を同じ順で添付するために画面と測定行に出す (codex #1592 High)
+      role: imageRole(im?.role),
     });
     if (imgs.length >= MAX_IMAGES) break;
   }
   return imgs;
+}
+
+const ROLE_RE = /^(?:white_bg|slot:[1-9]\d?)$/;
+const imageRole = (v) => (typeof v === 'string' && ROLE_RE.test(v) ? v : null);
+/** 'white_bg' → '白抜き' / 'slot:1' → '1 TOP' / 'slot:3' → '3'。分からなければ '?' */
+export function imageRoleLabel(role) {
+  if (role === 'white_bg') return '白抜き';
+  const m = /^slot:(\d+)$/.exec(String(role || ''));
+  if (!m) return '?';
+  return m[1] === '1' ? '1 TOP' : m[1];
+}
+/** AI に渡す (渡した) 画像の並び。画面と測定行に出す */
+export function imagePlan(images) {
+  return normalizeImages(images).map((im) => ({ file_id: im.file_id, role: im.role, label: imageRoleLabel(im.role) }));
 }
 
 export function buildPacket({ draft, productInfo, colorVariations, images = [], spec }) {
@@ -292,7 +311,7 @@ export function requestBlockReason({ draft, productInfo, spec, images }) {
   // 🚨 画像が無いと AI は必ず IMAGES_UNAVAILABLE で止まる (スキルの決まり: 見ずに書かない)。
   //    受け付けると 4 分待たせてから失敗する (2026-10-02 の 1 件目 = draft 188)。押す前に止める。
   //    呼び手は必ず images を渡す (渡し忘れ = 配列でない も「無い」と同じに扱う)
-  if (normalizeImages(images).length === 0) return '商品画像がありません (画像タブに商品画像を入れると使えます)';
+  if (normalizeImages(images).length === 0) return '商品画像がありません (画像タブに白抜きか商品画像を入れると使えます)';
   return null;
 }
 
@@ -1083,6 +1102,8 @@ export function jobStateFor(db, draftId, { now = Date.now() } = {}) {
       //    確認中 (null) は出さない — 確認の前にコピーされて使われると、不一致でも取り返せない
       output_text: job.status === 'done' && gen?.model_check === 'match' ? job.output_text : null,
       packet_hash: job.packet_hash,
+      // この依頼で AI に渡した画像の並び (受付時に固定)。スタッフ版に同じ画像を同じ順で添付し、測定行にも残す
+      images: (() => { try { return imagePlan(JSON.parse(job.packet_json).images); } catch { return []; } })(),
     },
   };
 }
