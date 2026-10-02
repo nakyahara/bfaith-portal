@@ -148,7 +148,7 @@ function withDeadline(promise, deadline, timeoutMs) {
 
 /**
  * 一覧の記録用の要求 (窓を明示して固定)。失敗・時間切れは投げる (呼び手が ⚠️ にして取込は続ける)。
- * 🚨 呼び手は取込の一覧の要求を **先に** 確定してから呼ぶ (既定の 90 日の窓の「今」をずらさない・レートの枠を先に使わない・Codex #1555 R1 High)
+ * 🚨 呼び手は取込の一覧の要求を **先に** 確定してから呼ぶ (取込の一覧の窓 (回の開始の時刻とその 85 日前・#1567 Codex R4) を先に決める・レートの枠を先に使わない・Codex #1555 R1 High)
  */
 export async function listInventoryReports(sp, { reportType, marketplaceId, startedAt, maxPages = MAX_LIST_PAGES, timeoutMs = INVENTORY_TIMEOUT_MS }) {
   const window = inventoryWindow(startedAt);

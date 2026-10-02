@@ -16,7 +16,7 @@
  *      coverage = null) の両方で言えるときだけ (#1567 Codex R1 High 1・R8 High)。ローカルを切り替えの前に戻した・新しい DATA_DIR でも Render の行で分かる。Render を読めない = ❌。
  *      🚨 Render の status が 404 / 409 not_migrated = Render が #1561 / 0050 の前に戻った疑い = ❌ (#1561・0050 は本番に入っている = 今までの送り方 (legacy) の保険は消した・R8 High)。
  *      updating にできない = Render に古い complete が残っているかもしれない = **取込も始めない** (❌)
- *      🚨 Render を読めない (障害)・updating を送れない朝も **取込も始めない** (設計どおり = 生の表を書く前に無効にする)。決済のレポートは 90 日取れる = 翌朝 (か retry) に取り戻せる
+ *      🚨 Render を読めない (障害)・updating を送れない朝も **取込も始めない** (設計どおり = 生の表を書く前に無効にする)。取込は 85 日の固定の窓 (report の作成の時刻) = 翌朝 (か retry) に取り戻せる (長く止まって窓の外に出た report は一覧の鎖の切れ目 ⚠️)
  *   ③ (coverage) Render の今の世代を読み、台帳 (company-db-push.db) の世代を少なくともそこまで進め、新しい世代と token を **HTTP の前に台帳と lease に保存**
  *      → Render の coverage を updating (失敗なら取込を始めない = 生の表を書く前に無効にする。R16 H2)
  *   ④ 順番待ちの初期の印 (amazon-finance-initial-marker.js --queue) を入れる (coverage の回だけ・updating の後・lease の下。#1567 Codex R1 High 2) →

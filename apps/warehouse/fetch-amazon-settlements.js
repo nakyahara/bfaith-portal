@@ -11,13 +11,13 @@
  *   決済ごとに全部の文書を版として保存し、下流 (v_amazon_settlement_unified・月の mart・手数料・日次の財務・送り手) は採った版 1 つの行だけを使う =
  *   V1 と V2 の両方の版があっても二重にならない。排他を残すと V2 の版が保存されず、coverage の期待の report が満たせない (report_not_imported)
  *   並べ直しの規則に無い組み合わせ・日時の空・品物の番号を補えない行が 1 つでもあるレポートは **取り込まない** + 終了コード 3
- *   (daily-sync で ❌ = 規則を足す合図。取り込んでから規則を直すと古い行と新しい行が二重になるため。V2 は約 90 日取り直せる = 落ちない。Codex #1508 R1)
+ *   (daily-sync で ❌ = 規則を足す合図。取り込んでから規則を直すと古い行と新しい行が二重になるため。85 日の固定の窓の間は毎朝読み直す = 規則を足してから入れれば落ちない。Codex #1508 R1)
  *   V1 が必要なら --source v1 (11/11 まで)
  *
  * 🆕 2026-09-30 (D7b-1b の下ごしらえ・設計 = AI_reference CompanyDB構想/13 §3.1): 決済のレポートの一覧 (inventory) を記録する
  *   = amazon_settlement_report_inventory_runs (回) / amazon_settlement_report_inventory (report ごと・取込の結果)。部品 = amazon-settlement-inventory.js
  *   - 一覧の記録用の getReports は **取込の一覧とは別の要求** で、最初の要求に createdUntil = 回の開始の時刻・createdSince = その 85 日前 を明示して固定
- *     (取込の一覧は今までどおり日時の境なし = Amazon の既定の 90 日前〜今 → 取込む report は変わらない)
+ *     (🆕 #1567 Codex R4: 取込の一覧も同じ固定の窓 = 回の開始の時刻とその 85 日前 = 一覧の記録と同じ report の集合。前は日時の境なし = Amazon の既定の 90 日)
  *   - 🚨 呼ぶ順 = 取込の一覧の要求 (今と同じ位置・同じ形) → 取込のダウンロードのループ (結果は report ごとにメモリ) →
  *     **ループが全部終わった後** に一覧の記録の要求 (時間の上限 120 秒・ページの応答の形も確かめる) → 一覧・取込の結果・完了を 1 つの取引で書く
  *     (一覧の要求が取込の時間やレートの枠を食わない。Codex #1555 R1 High・R2 High)
@@ -29,10 +29,10 @@
  *   - 取込が例外で止まった回も一覧を記録する (completed_at null・ingest_error)。kill された回は記録が無い = coverage に使えない (安全側)
  *   - --dry-run は表に書かない。--report-id の 1 本だけの回は一覧の回にしない
  *   - 今は記録だけ (読み手 = 後の coverage)。取込む行 (raw_amazon_settlement_*) の中身と数は変えない
- *   - 🚨 daily-sync が渡す --days 14 はこのスクリプトでは読んでいない (昔から。取込の一覧は既定の 90 日)
+ *   - 🚨 daily-sync が渡す --days 14 はこのスクリプトでは読んでいない (昔から。取込の一覧は 85 日の固定の窓・#1567)
  *
  * 機能:
- *   - SP-API getReports で過去 Settlement 一覧取得 (最大90日)
+ *   - SP-API getReports で過去 Settlement 一覧取得 (85 日の固定の窓 = report の作成の時刻で切る。Amazon の保持は 90 日)
  *   - getReportDocument → TSV DL
  *   - TSV パース、micro INTEGER 化、UTC/JST 変換
  *   - physical_line_hash + business_line_key 計算
@@ -49,7 +49,7 @@
  *   - 原文の通貨 (空なら null) を currency_raw に残す (currency は今までどおり空なら JPY。R16 M1)
  *
  * 使い方 (単独 = 書かない):
- *   node apps/warehouse/fetch-amazon-settlements.js              # 直近90日全件を読んで数えるだけ (dry-run・生の表にも一覧にも書かない。
+ *   node apps/warehouse/fetch-amazon-settlements.js              # 直近 85 日 (固定の窓) の全件を読んで数えるだけ (dry-run・生の表にも一覧にも書かない。
  *                                                                #   ただし initDB の表の用意は走り・SP-API の一覧とダウンロードはする = レートの枠を使う)
  *   node apps/warehouse/fetch-amazon-settlements.js --report-id 1487945020577   # 特定 reportId の調べ (dry-run)
  *   node apps/warehouse/fetch-amazon-settlements.js --source v1  # 旧 V1 レポートで読む (2026-11-11 まで)

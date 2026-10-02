@@ -24,7 +24,7 @@
  *   🚨 通すのは 6 期間で確かめた組み合わせだけ (KNOWN_* の一覧)。それ以外・料金の部分が本体の前に来る・日時が空 / 暦に無い は unknown に数える。
  *      呼び手 (fetch-amazon-settlements.js) は unknown が 1 つでもあるレポートを **取り込まない** (Codex #1508 R1 High:
  *      取り込んだ後で規則を直して入れ直すと business_line_key が変わり、古い行と新しい行が二重になる)。
- *      V2 のレポートは約 90 日取り直せる = 規則を足してから入れれば落ちない
+ *      取込は 85 日の固定の窓の間は毎朝読み直す (Amazon の保持は約 90 日) = 規則を足してから入れれば落ちない
  *   説明をそのまま取引の種類にする型 (other-transaction の FBA Inventory Reimbursement・other-transaction・Inbound Defect Fee) は
  *   説明の値を問わず通す (9 種類の説明で同じ規則を確かめた = 新しい補てんの種類で取込を止めない)
  */

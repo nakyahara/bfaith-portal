@@ -2,8 +2,10 @@
 /**
  * check-settlement-v1-v2.js — 各決済の「今採っている版 (過去の V1)」と「V2 のレポート」の明細の要約 (detail_digest) が一致するかを **読むだけ** で確かめる (#1567 R1 Medium 3)
  *
- * なぜ: coordinator の初回の回で、直近 90 日の決済の V2 が版として入り、採る版が V1 から V2 に替わる。
- *   中身が同じなら値は変わらない (satisfied_by_selected_settlement)。違えば coverage は complete にならない・値が動く = 替わる前に知っておく。
+ * なぜ: マージの後の最初の取込 (今までの取込・coordinator のどちらも 85 日の固定の窓 = report の作成の時刻で切る) で、窓の中の V2 の report が版として入り、
+ *   採る版が V1 から V2 に替わる (層の順 = V2 → V1・#1567 Codex R12)。中身が同じなら値は変わらない。
+ *   違えば **値が動く** (Easy Ship の分け方など・決済の合計は同じ) = 替わる前に知っておく。🚨 違っても coverage は止めない (#1567 Codex R14):
+ *   窓の中の V2 の report は自分の版が採られる = imported (report_selected_differs は、採られない別の版で満たそうとしたときだけ)
  *
  * 🚨 書かない: warehouse.db は読むだけで開く (readonly)。SP-API は一覧とダウンロードだけ (読む)。V2 の中身はメモリで正規化して要約を作る。
  *   過去の行に版が付いている (migrate-settlement-document-versions.js --commit の後) DB で流す = **本番の DB のコピー** で:
@@ -57,7 +59,7 @@ async function main() {
         + (s ? ` | 採っている版 #${s.seq} ${s.layer} ${s.reportId} 見出し ${s.headerCount} 行 ${s.lineCount} 行 ${String(s.digest).slice(0, 12)}…${s.valid ? '' : ' ⚠️'}` : '')
         + ` | この決済の版 ${c.versions}${c.header0Versions ? ` (🚨 見出し 0 行の版 ${c.header0Versions})` : ''}`);
     }
-    console.log(bad ? `❌ 違う決済 ${bad} = coordinator の初回で採る版が替わると値が動く / coverage は complete にならない (report_selected_differs)。中身を確かめてから流す` : '✅ V2 と採っている版の明細は全部一致 (または SQLite に無い決済)');
+    console.log(bad ? `❌ 違う決済 ${bad} = マージの後の最初の取込で採る版が V2 に替わると値が動く (費目の分け方など・決済の合計は同じ・二重にはならない)。coverage は止めない (窓の中の V2 の report は自分の版が採られる = imported)。動いてよいか中身を確かめてから流す` : '✅ V2 と採っている版の明細は全部一致 (または SQLite に無い決済)');
     process.exitCode = bad ? 1 : 0;
   } finally { db.close(); }
 }
