@@ -110,7 +110,7 @@ console.log('②b 🚨 指示文はスタッフの定型文と同じもの 1 つ
   const staff = pt.buildProductAnalysisPrompt({ name: 'ハッカ油スプレー 100ml' }, { product_info_text: '天然ハッカ油' }, '');
   ok(staff.includes(packet.instruction),
     '🚨 スタッフの定型文に同じ文がそのまま入っている (二重に持っていない)');
-  eq(packet.packet_version, 3, 'packet の版が上がっている (形が変わった・3 = 画像に役割)');
+  eq(packet.packet_version, 4, 'packet の版が上がっている (形が変わった・4 = 素材画像)');
   // 指示文も packet_hash の中 = 後から差し替えられない
   const again = lp.buildPacket({
     draft: dA, productInfo: packet.product_info, colorVariations: packet.color_variations,
@@ -414,6 +414,7 @@ ok(lp.requestJob(db, args(mkDraft('LP-L', 'テスト3'), s2.spec, 'key-0001\n', 
 ok(lp.requestJob(db, args({ ...dA, id: '12\n' }, s2.spec, 'key-000v', { now: min(96) })).code === 'bad_request',
   '🚨 ID の末尾改行を弾く (R6)');
 
+const eqj = (x, y, l) => eq(JSON.stringify(x), JSON.stringify(y), l);
 console.log('⑭ 材料固定を中身から確かめる (R7)');
 // #1 claim は保存済みの hash を信じず、packet と仕様書を中身から計算し直して照合する
 const dM = mkDraft('LP-M', 'ハッカ油スプレー 3L');
@@ -647,6 +648,73 @@ console.log('⑩ 実際に本回答を書いたモデル (ランナーが後か�
   const subW2 = lp.submitResult(db, gW.generation_id, { packetHash: cW.job.packet_hash, verdict: 'accepted', output: compositionFor(dW.name), lint: LINT, reviewRounds: 1, now: min(3000.6) });
   ok(subW2.ok && subW2.status === 'done', '白抜きも配って見ていれば受け取る');
   ok(subW2.receipt.images.map((im) => im.file_id).sort().join(',') === 'FILEID000001,FILEIDWHITE01', '証跡に白抜きも載る');
+}
+
+console.log('⑭ 素材画像 = 画像フォルダの下のフォルダの画像 (2026-10-02 中原さん「商品 6 + 素材 10」)');
+{
+  eq(lp.MAX_PRODUCT_IMAGES, 6, '商品画像は 6 枚まで');
+  eq(lp.MAX_MATERIAL_IMAGES, 10, '素材画像は 10 枚まで');
+  eq(lp.MAX_IMAGES, 16, '配るのは合わせて 16 枚まで');
+  const products = Array.from({ length: 7 }, (_, i) => ({ file_id: 'FILEIDPROD0' + i, role: i === 0 ? 'white_bg' : 'slot:' + i }));
+  const materials = Array.from({ length: 12 }, (_, i) => ({ file_id: 'FILEIDMATE' + String(i).padStart(2, '0'), role: 'material', name: `m${i}.jpg`, folder: i < 6 ? '素材' : '素材/使用イメージ' }));
+  const dM = mkDraft('MAT-1', 'ハッカ油スプレー MAT');
+  const rM = lp.requestJob(db, args(dM, lp.latestSpec(db), 'key-mat-1', { now: min(4000), images: [...products, ...materials, { file_id: 'FILEIDPROD00', role: 'material', name: 'dup.jpg' }] }));
+  ok(rM.ok, '受け付ける');
+  const pM = JSON.parse(rM.job.packet_json);
+  eq(pM.packet_version, 4, 'packet の版 = 4 (素材が入った)');
+  eq(pM.images.length, 16, '🚨 商品 6 + 素材 10 = 16 枚');
+  eqj(pM.images.slice(0, 6).map((im) => im.role), ['white_bg', 'slot:1', 'slot:2', 'slot:3', 'slot:4', 'slot:5'], '先に商品画像 (6 枚まで・7 枚目は入らない)');
+  eqj(pM.images.slice(6).map((im) => im.role), Array.from({ length: 10 }, (_, i) => 'material:' + (i + 1)), '続けて素材 (material:1〜10 を振り直す)');
+  ok(pM.images[6].name === 'm0.jpg' && pM.images[6].folder === '素材', '素材は名前と場所つき');
+  eq(pM.materials_omitted, 2, '🚨 上限で入らなかった素材の数が残る (12 − 10)');
+  ok(!pM.images.some((im) => im.name === 'dup.jpg'), '商品画像と同じファイルの素材は入れない (重複)');
+  eqj(lp.imagePlan(pM.images).slice(5, 8).map((im) => im.label), ['5', '素材1', '素材2'], '画面に出す名前: 素材N');
+  ok(lp.imagePlan(pM.images)[6].folder === '素材' && lp.imagePlan(pM.images)[6].name === 'm0.jpg', '画面の並びにも名前と場所');
+  ok(lp.isMaterialRole('material') && lp.isMaterialRole('material:10') && !lp.isMaterialRole('material:0') && !lp.isMaterialRole('materialx'), '素材の役割の形');
+  const dM2 = mkDraft('MAT-2', 'ハッカ油スプレー MAT2');
+  eq(lp.requestJob(db, args(dM2, lp.latestSpec(db), 'key-mat-2', { now: min(4001), images: materials })).code, 'not_ready',
+    '🚨 素材だけで商品画像が無ければ受け付けない (商品を再現できない)');
+}
+
+console.log('⑮ 素材の一覧 (Drive の画像フォルダのサブフォルダを何階層下まで辿る)');
+{
+  const { listDriveFolderMaterialImages } = await import('../apps/product-hub/services/rakuten-listing.js');
+  // 作り物の Drive: ROOT の直下 = 商品画像 (素材ではない)。サブフォルダの下が素材
+  const FOLDER = 'application/vnd.google-apps.folder';
+  const tree = {
+    ROOT00000001: [{ id: 'IMGROOT00001', name: 'top.jpg', mimeType: 'image/jpeg' }, { id: 'FOLDERA00001', name: '素材', mimeType: FOLDER }, { id: 'FOLDERB00001', name: 'イメージ', mimeType: FOLDER }],
+    FOLDERA00001: [{ id: 'IMGA00000002', name: 'b.jpg', mimeType: 'image/jpeg' }, { id: 'IMGA00000001', name: 'a.jpg', mimeType: 'image/jpeg' }, { id: 'FOLDERA10001', name: '深い', mimeType: FOLDER }, { id: 'TXT000000001', name: 'メモ.txt', mimeType: 'text/plain' }],
+    FOLDERA10001: [{ id: 'IMGDEEP00001', name: 'x.png', mimeType: 'image/png' }, { id: 'ROOT00000001', name: 'ループ', mimeType: FOLDER }],
+    FOLDERB00001: [{ id: 'IMGB00000001', name: 'c.jpg', mimeType: 'image/jpeg' }],
+  };
+  const fakeDrive = {
+    calls: 0,
+    files: {
+      list: async ({ q }) => {
+        fakeDrive.calls++;
+        const parent = /'([^']+)' in parents/.exec(q)[1];
+        const kids = tree[parent] || [];
+        const files = q.includes(`mimeType = '${FOLDER}'`) ? kids.filter((k) => k.mimeType === FOLDER)
+          : q.includes("mimeType contains 'image/'") ? kids.filter((k) => k.mimeType.startsWith('image/')) : kids;
+        return { data: { files: files.map((f) => ({ ...f, modifiedTime: '2026-10-01T00:00:00Z' })) } };
+      },
+    },
+  };
+  const got = await listDriveFolderMaterialImages('ROOT00000001', { drive: fakeDrive });
+  eqj(got.map((g) => g.folder + '/' + g.name).sort(), ['イメージ/c.jpg', '素材/a.jpg', '素材/b.jpg', '素材/深い/x.png'].sort(), '🚨 サブフォルダの画像を何階層下まで拾う (根の画像・画像でないものは入らない)');
+  ok(!got.some((g) => g.id === 'IMGROOT00001'), '🚨 根 (商品の画像フォルダの直下) の画像は素材にしない');
+  const keys = got.map((g) => g.folder + '\u0000' + g.name);
+  eqj(keys, [...keys].sort(), '並びは「フォルダ → 名前」順 (同じ材料なら毎回同じ)');
+  ok(got.every((g) => g.modifiedTime && g.id), '更新日時と ID がある');
+  // 歯止め: 一部だけの一覧を「全部」として渡さない (throw する)
+  let e1 = null; try { await listDriveFolderMaterialImages('ROOT00000001', { drive: fakeDrive, limits: { maxDepth: 6, maxFolders: 2, maxImages: 500 } }); } catch (e) { e1 = e; }
+  ok(e1 && /サブフォルダが 2 個/.test(e1.message), `🚨 フォルダが多すぎれば止める (${e1?.message})`);
+  let e2 = null; try { await listDriveFolderMaterialImages('ROOT00000001', { drive: fakeDrive, limits: { maxDepth: 1, maxFolders: 60, maxImages: 500 } }); } catch (e) { e2 = e; }
+  ok(e2 && /1 階層より深く/.test(e2.message), `🚨 深すぎれば止める (${e2?.message})`);
+  let e3 = null; try { await listDriveFolderMaterialImages('ROOT00000001', { drive: fakeDrive, limits: { maxDepth: 6, maxFolders: 60, maxImages: 2 } }); } catch (e) { e3 = e; }
+  ok(e3 && /2 (枚|件)を超えて/.test(e3.message), `🚨 画像が多すぎれば止める (${e3?.message})`);
+  let e4 = null; try { await listDriveFolderMaterialImages("x' or '1'='1", { drive: fakeDrive }); } catch (e) { e4 = e; }
+  ok(e4 && /ID の形/.test(e4.message), '🚨 フォルダ ID の形を確かめる (Drive の検索式に混ぜない)');
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);

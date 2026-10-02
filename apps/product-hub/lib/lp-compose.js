@@ -43,12 +43,19 @@ import { PRODUCT_ANALYSIS_INSTRUCTION } from './prompt-templates.js';
 // 2: スタッフの定型文と**同じ指示文** (instruction) を packet に入れた (設計 §5)
 // 3: 画像に役割 (role = white_bg / slot:N) を入れた。白抜きを先頭に渡すようにした (2026-10-02・codex #1592 Medium)。
 //    画像の選び方が変わったので、測定は版ごとに分けて数えられる
-export const PACKET_VERSION = 3;
+// 4: 素材画像 (商品の画像フォルダのサブフォルダの画像・role = material:N・name / folder つき) と
+//    materials_omitted を入れた (2026-10-02 中原さん)
+export const PACKET_VERSION = 4;
 export const PROMPT_VERSION = 'lp-compose-v1';
 export const LEASE_MIN = 40;
 /** 測定の合格ライン (設計 §7.2)。受付時に created_at + これで deadline を固定する */
 export const MEASUREMENT_WINDOW_MIN = 3;
-export const MAX_IMAGES = 6;
+/** 商品画像 (白抜き → 1 TOP → 2 …) の上限 */
+export const MAX_PRODUCT_IMAGES = 6;
+/** 素材画像 (画像フォルダのサブフォルダ・何階層下でも) の上限 (2026-10-02 中原さん「商品 6 + 素材 10」) */
+export const MAX_MATERIAL_IMAGES = 10;
+/** 1 依頼で配る画像の上限 (配る口の番号・証跡の上限) */
+export const MAX_IMAGES = MAX_PRODUCT_IMAGES + MAX_MATERIAL_IMAGES;
 /** 実行役へ配る商品画像の幅。画面用の THUMB_WIDTHS (160/320) では AI が
  *  ラベル文字や商品形状を判断できない (仕様書の「商品再現ルール」を守れない) */
 export const LP_COMPOSE_IMAGE_WIDTH = 1024;
@@ -238,48 +245,72 @@ export function specSummary(db, kind = 'product_analysis') {
  * composeProductInfo / composeColorVariations が正本で、ここで組み直さない (二重に持たない)。
  */
 /**
- * packet に入る商品画像 (空の ID・重複を除いた最大 MAX_IMAGES 枚)。
+ * packet に入る画像 = 商品画像 (最大 MAX_PRODUCT_IMAGES 枚) → 素材画像 (最大 MAX_MATERIAL_IMAGES 枚) の順。
+ * 空の ID・重複は除く。素材は入力の role が 'material' (または packet から読み直した 'material:N') のもので、
+ * 並び順に 'material:1' から振り直す。上限で入らなかった素材の数を materialsOmitted で返す。
  * 受付の判定 (requestBlockReason) も**この結果の枚数**で見る — 配列の長さで見ると
  * `[{}]` や空の ID が通り、packet の画像は 0 枚になる (codex exec review #1591 Low)
+ * @returns {{images: object[], materialsOmitted: number}}
  */
-function normalizeImages(images) {
+function normalizeImagesDetail(images) {
   // file_id は重複させない (コード R9)。証跡 (receipt.images) 側は重複を禁じているので、
   // packet に同じ画像が 2 回あると「渡した材料」と「見た証跡」が 1 対 1 で対応しなくなる
   const seen = new Set();
-  const imgs = [];
+  const products = [];
+  const materials = [];
+  let materialsOmitted = 0;
   for (const im of Array.isArray(images) ? images : []) {
     const fileId = trim(im?.file_id || im?.drive_file_id, 200);
     if (!fileId || seen.has(fileId)) continue;
+    // Drive の更新日時。何を見て作ったかを後から辿るために packet に残す (設計 §4.2)
+    const modified = trim(im?.modified_time || im?.drive_modified_time, 40) || null;
+    if (isMaterialRole(im?.role)) {
+      if (materials.length >= MAX_MATERIAL_IMAGES) { materialsOmitted++; continue; }
+      seen.add(fileId);
+      materials.push({
+        file_id: fileId, modified_time: modified, role: 'material:' + (materials.length + 1),
+        // AI が「使用素材」に書く名前と、スタッフが同じ素材を探すための場所 (サブフォルダの道筋)
+        name: trim(im?.name, 200) || null,
+        folder: trim(im?.folder, 300) || null,
+      });
+      continue;
+    }
+    if (products.length >= MAX_PRODUCT_IMAGES) continue;
     seen.add(fileId);
-    imgs.push({
-      file_id: fileId,
-      // Drive の更新日時。何を見て作ったかを後から辿るために packet に残す (設計 §4.2)
-      modified_time: trim(im?.modified_time || im?.drive_modified_time, 40) || null,
+    products.push({
+      file_id: fileId, modified_time: modified,
       // 何の画像か (white_bg = 白抜き / slot:N = 画像タブの N 番目・1 が TOP)。
       // スタッフ版 (ChatGPT) に同じ画像を同じ順で添付するために画面と測定行に出す (codex #1592 High)
       role: imageRole(im?.role),
     });
-    if (imgs.length >= MAX_IMAGES) break;
   }
-  return imgs;
+  return { images: [...products, ...materials], materialsOmitted };
 }
+function normalizeImages(images) { return normalizeImagesDetail(images).images; }
 
 const ROLE_RE = /^(?:white_bg|slot:[1-9]\d?)$/;
 const imageRole = (v) => (typeof v === 'string' && ROLE_RE.test(v) ? v : null);
-/** 'white_bg' → '白抜き' / 'slot:1' → '1 TOP' / 'slot:3' → '3'。分からなければ '?' */
+const MATERIAL_ROLE_RE = /^material(?::[1-9]\d?)?$/;
+export const isMaterialRole = (v) => typeof v === 'string' && MATERIAL_ROLE_RE.test(v);
+/** 'white_bg' → '白抜き' / 'slot:1' → '1 TOP' / 'slot:3' → '3' / 'material:2' → '素材2'。分からなければ '?' */
 export function imageRoleLabel(role) {
   if (role === 'white_bg') return '白抜き';
+  const mm = /^material:(\d+)$/.exec(String(role || ''));
+  if (mm) return '素材' + mm[1];
   const m = /^slot:(\d+)$/.exec(String(role || ''));
   if (!m) return '?';
   return m[1] === '1' ? '1 TOP' : m[1];
 }
-/** AI に渡す (渡した) 画像の並び。画面と測定行に出す */
+/** AI に渡す (渡した) 画像の並び。画面と測定行に出す。素材は名前と場所つき */
 export function imagePlan(images) {
-  return normalizeImages(images).map((im) => ({ file_id: im.file_id, role: im.role, label: imageRoleLabel(im.role) }));
+  return normalizeImages(images).map((im) => ({
+    file_id: im.file_id, role: im.role, label: imageRoleLabel(im.role),
+    ...(isMaterialRole(im.role) ? { name: im.name || null, folder: im.folder || null } : {}),
+  }));
 }
 
 export function buildPacket({ draft, productInfo, colorVariations, images = [], spec }) {
-  const imgs = normalizeImages(images);
+  const { images: imgs, materialsOmitted } = normalizeImagesDetail(images);
   const packet = {
     packet_version: PACKET_VERSION,
     // 🚨 スタッフが ChatGPT に貼る定型文の【実行】と**同じ文**を渡す (設計 §5)。
@@ -295,6 +326,8 @@ export function buildPacket({ draft, productInfo, colorVariations, images = [], 
     product_info: trim(productInfo, 20_000),
     color_variations: trim(colorVariations, 4_000),
     images: imgs,
+    // 上限 (素材 10 枚) で入らなかった素材の数。画面に「入らなかった素材 N 枚」と出す
+    materials_omitted: materialsOmitted,
     spec_kind: spec.kind,
     spec_id: Number(spec.id),
     spec_hash: spec.hash,
@@ -311,7 +344,8 @@ export function requestBlockReason({ draft, productInfo, spec, images }) {
   // 🚨 画像が無いと AI は必ず IMAGES_UNAVAILABLE で止まる (スキルの決まり: 見ずに書かない)。
   //    受け付けると 4 分待たせてから失敗する (2026-10-02 の 1 件目 = draft 188)。押す前に止める。
   //    呼び手は必ず images を渡す (渡し忘れ = 配列でない も「無い」と同じに扱う)
-  if (normalizeImages(images).length === 0) return '商品画像がありません (画像タブに白抜きか商品画像を入れると使えます)';
+  // 素材だけでは商品の形・ラベルを再現できない (商品再現ルール)。商品画像 (白抜きか 1〜) が 1 枚は要る
+  if (normalizeImages(images).filter((im) => !isMaterialRole(im.role)).length === 0) return '商品画像がありません (画像タブに白抜きか商品画像を入れると使えます)';
   return null;
 }
 
@@ -1104,6 +1138,8 @@ export function jobStateFor(db, draftId, { now = Date.now() } = {}) {
       packet_hash: job.packet_hash,
       // この依頼で AI に渡した画像の並び (受付時に固定)。スタッフ版に同じ画像を同じ順で添付し、測定行にも残す
       images: (() => { try { return imagePlan(JSON.parse(job.packet_json).images); } catch { return []; } })(),
+      // 上限で入らなかった素材の数 (受付時に固定)
+      materials_omitted: (() => { try { return Number(JSON.parse(job.packet_json).materials_omitted) || 0; } catch { return 0; } })(),
     },
   };
 }

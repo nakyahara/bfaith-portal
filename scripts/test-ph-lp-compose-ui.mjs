@@ -247,7 +247,7 @@ console.log('⑥c 🚨 商品画像が無ければ押す前に止める (2026-10
   const pk2 = JSON.parse(db.prepare('SELECT packet_json FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(d4).packet_json);
   eq(pk2.images.map((im) => im.file_id), ['FILEIDWHITE01', 'FILEIDTOP004'], '白抜きが先頭・続けて TOP・重複は 1 回');
   eq(pk2.images.map((im) => im.role), ['white_bg', 'slot:1'], '🚨 画像に役割が残る (白抜き / 画像タブの番号・codex #1592 Medium)');
-  eq(pk2.packet_version, 3, 'packet の版 = 3');
+  eq(pk2.packet_version, 4, 'packet の版 = 4');
   db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ?`).run(d4);
 
   console.log('⑥e 白抜き + 商品画像 6 枚 → 白抜き + 1〜5 (合わせて 6 枚)・画面に並びが出る (codex #1592 High・Low)');
@@ -292,6 +292,46 @@ console.log('⑥c 🚨 商品画像が無ければ押す前に止める (2026-10
   const html6 = (await getDetail(d4)).html;
   ok(html6.includes('id="lpc-images"'), '画像の並びを出す置き場がある');
   db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ?`).run(d4);
+
+  console.log('⑥f 素材画像 (画像フォルダの下のフォルダ・2026-10-02 中原さん)');
+  // 画像フォルダの URL がある商品は、押したときに Drive からサブフォルダの画像を読む
+  db.prepare('UPDATE product_drafts SET drive_folder_url = ? WHERE id = ?').run('https://drive.google.com/drive/folders/1MtcKdnRZPf1iqKiNxMJ1ODDPJE3vX9JR', d4);
+  const sF = embedded((await getDetail(d4)).html);
+  eq(sF.materials_folder, true, '画像フォルダがあれば「押したときに素材を読む」が画面に渡る');
+  ok(lpcImagesText(sF, false).includes('+ 素材 (画像フォルダの下のフォルダから最大 10 枚・押したときに読む)'), '押す前の案内に素材のことが出る');
+  // 🚨 Drive が読めなければ依頼を作らない (素材なしで作った結果を素材ありと同じ測定に混ぜない)
+  const savedKey = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  const nBefore = db.prepare('SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE draft_id = ?').get(d4).n;
+  const postF = await fetch(`${base}/api/drafts/${d4}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0004f' }),
+  });
+  const jF = await postF.json();
+  ok(postF.status === 502 && jF.code === 'materials_unavailable' && /もう一度押してください/.test(jF.error), `🚨 Drive が読めなければ 502・理由を出す (${jF.error})`);
+  eq(db.prepare('SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE draft_id = ?').get(d4).n, nBefore, '🚨 依頼は作られない');
+  // 同じキーの再送 (前の依頼がある) は Drive を読まずに前の依頼を返す
+  const postRe = await fetch(`${base}/api/drafts/${d4}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0004c' }),
+  });
+  ok(postRe.status === 200 && (await postRe.json()).created === false, '同じキーの再送は Drive を読まずに前の依頼を返す (Drive が落ちていても通る)');
+  if (savedKey !== undefined) process.env.GOOGLE_SERVICE_ACCOUNT_KEY = savedKey;
+  // 素材つきの依頼の並び (場所と名前・入らなかった数)
+  const withMat = {
+    blocked: null, materials_folder: true, image_plan: sF.image_plan,
+    job: {
+      status: 'done', materials_omitted: 3,
+      images: [
+        { role: 'white_bg', label: '白抜き', file_id: 'FILEIDWHITE01' },
+        { role: 'material:1', label: '素材1', file_id: 'FILEIDMAT001', folder: '素材/使用イメージ', name: '玄関.jpg' },
+        { role: 'material:2', label: '素材2', file_id: 'FILEIDMAT002', folder: '素材', name: 'パーツ.png' },
+      ],
+    },
+  };
+  const tM = lpcImagesText(withMat, false);
+  ok(tM.includes('この依頼で AI に渡した画像: 白抜き\n'), `商品画像の並びに素材を混ぜない (${JSON.stringify(tM)})`);
+  ok(tM.includes('素材 (2 枚): 素材1 素材/使用イメージ/玄関.jpg / 素材2 素材/パーツ.png'), '素材は場所と名前つきで別の行');
+  ok(tM.includes('⚠️ 上限 (素材 10 枚) で入らなかった素材 3 枚'), '🚨 入らなかった素材の数を出す');
+  db.prepare('UPDATE product_drafts SET drive_folder_url = NULL WHERE id = ?').run(d4);
 }
 
 console.log('⑦ 失敗・成否不明も画面に出る');

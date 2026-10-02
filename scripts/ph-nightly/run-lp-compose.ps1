@@ -34,7 +34,7 @@ $PingPs1   = Join-Path $PSScriptRoot 'ping.ps1'
 $Phlp      = Join-Path $Root 'bin\phlp.mjs'
 if (-not $TokenFile) { $TokenFile = Join-Path $env:USERPROFILE '.claude\secrets\ph-service-token.txt' }
 $PingId      = 'ph-lp-compose'
-$TimeoutMin  = 12     # one request: read spec + look at images + write + lint + Codex review (<= 2 rounds)
+$TimeoutMin  = 15     # one request: read spec + look at up to 16 images (6 product + 10 material) + write + lint + Codex review (<= 2 rounds)
 $LockWaitSec = 5      # SHORT: at 1 run/min we must not pile up behind the nightly jobs
 $Stamp     = Get-Date -Format 'yyyyMMdd-HHmmss'
 $LogDir    = Join-Path $Root 'logs'

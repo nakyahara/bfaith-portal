@@ -89,7 +89,7 @@ import { photoSource, driveDownload } from '../inbound-check/back-label.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility,
-  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl, rakutenRmsItemUrl,
+  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, listDriveFolderMaterialImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl, rakutenRmsItemUrl,
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
   isValidGtin, MODEL_ATTR_NAME, skuAttributeGrid, genreIdFromItemUrl,
@@ -126,7 +126,7 @@ import {
   queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
-  lpComposeImageRef, recordImageServed as recordLpComposeImageServed, imagePlan as lpComposeImagePlan, recordModelCheck as recordLpComposeModelCheck, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
+  lpComposeImageRef, recordImageServed as recordLpComposeImageServed, imagePlan as lpComposeImagePlan, recordModelCheck as recordLpComposeModelCheck, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_PRODUCT_IMAGES as LP_COMPOSE_MAX_PRODUCT_IMAGES,
   lintForJob as lintLpComposeForJob,
 } from './lib/lp-compose.js';
 import { assertXlsxExpandsSafely, XlsxTooLargeError } from './lib/xlsx-guard.js';
@@ -3811,6 +3811,8 @@ function lpComposeInitialState(db, draft) {
     blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
     // いま押したら AI に渡す画像の並び (白抜き → 1 TOP → …)。スタッフ版にも同じ画像を添付する (codex #1592 High)
     image_plan: lpComposeImagePlan(images),
+    // 押したときに素材 (画像フォルダの下のフォルダ) を読むか。読むのは押したときだけ (ここでは Drive を読まない)
+    materials_folder: parseDriveLink(draft.drive_folder_url)?.type === 'folder',
     spec: lpSpecSummary(db, 'product_analysis'),
   };
 }
@@ -3819,14 +3821,36 @@ function lpComposeInitialState(db, draft) {
 // 押す = キューに積んで即 claim 対象にするだけ。構成に 1〜3 分かかるので画面はポーリングする。
 
 /** 依頼する。body: { idempotency_key }。二重クリック・通信リトライで job を増やさない */
-router.post('/api/drafts/:id/lp-compose', (req, res) => {
+router.post('/api/drafts/:id/lp-compose', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   const db = getDB();
   const spec = latestLpSpec(db, 'product_analysis');
   const { productInfo, colorVariations, images } = lpComposeMaterial(db, draft);
+  // 素材画像 = 商品の画像フォルダの**サブフォルダ (何階層下でも)** の画像 (2026-10-02 中原さん)。
+  // 押したときに 1 回だけ Drive を読み、packet に固定する (画面のポーリング GET では読まない)。
+  // 同じキーの再送は前の依頼を返すだけなので読まない (Drive が一時的に落ちていても再送は通る)。
+  // 🚨 読めなければ依頼を作らない (素材が無いまま作った結果を、素材ありと同じ測定に混ぜない)
+  let materials = [];
+  const key = req.body?.idempotency_key;
+  const prior = typeof key === 'string'
+    && db.prepare('SELECT 1 FROM ph_lp_compose_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draft.id, key);
+  const folder = parseDriveLink(draft.drive_folder_url);
+  if (!prior && folder && folder.type === 'folder') {
+    try {
+      materials = (await listDriveFolderMaterialImages(folder.id)).map((m) => ({
+        file_id: m.id, drive_modified_time: m.modifiedTime, role: 'material', name: m.name, folder: m.folder,
+      }));
+    } catch (e) {
+      console.error('[product-hub] lp-compose materials failed:', draft.id, String(e?.message || e).slice(0, 300));
+      return res.status(502).json({
+        ok: false, code: 'materials_unavailable',
+        error: '素材画像 (画像フォルダの下のフォルダ) を Drive から読めませんでした: ' + String(e?.message || e).slice(0, 160) + ' — もう一度押してください',
+      });
+    }
+  }
   const r = requestLpComposeJob(db, {
-    draft, productInfo, colorVariations, images, spec,
+    draft, productInfo, colorVariations, images: [...images, ...materials], spec,
     idempotencyKey: req.body?.idempotency_key, actor: actorOf(req),
   });
   if (!r.ok) {
@@ -3853,6 +3877,8 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
     blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
     // いま押したら AI に渡す画像の並び (白抜き → 1 TOP → …)。スタッフ版にも同じ画像を添付する (codex #1592 High)
     image_plan: lpComposeImagePlan(images),
+    // 押したときに素材 (画像フォルダの下のフォルダ) を読むか。読むのは押したときだけ (ここでは Drive を読まない)
+    materials_folder: parseDriveLink(draft.drive_folder_url)?.type === 'folder',
     // 「仕様書: ○○ (YYYY-MM-DD 取込)」。古ければ人が上げ直す (設計 §4.1 のアップロード忘れ対策)
     spec: lpSpecSummary(db, 'product_analysis'),
   });
@@ -3889,7 +3915,7 @@ function lpComposeMaterial(db, draft) {
   const wb = db.prepare('SELECT white_bg_drive_file_id, white_bg_modified_time FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
   // role = 何の画像か (white_bg / slot:N・N は画像タブの番号で 1 が TOP = sort + 1)。packet に残して画面と測定行に出す
   const rows = db.prepare(`SELECT drive_file_id, drive_modified_time, sort FROM draft_images
-    WHERE draft_id = ? AND drive_file_id IS NOT NULL ORDER BY sort, id LIMIT ?`).all(draft.id, LP_COMPOSE_MAX_IMAGES + 1);
+    WHERE draft_id = ? AND drive_file_id IS NOT NULL ORDER BY sort, id LIMIT ?`).all(draft.id, LP_COMPOSE_MAX_PRODUCT_IMAGES + 1);
   const images = [
     ...(wb?.white_bg_drive_file_id
       ? [{ drive_file_id: wb.white_bg_drive_file_id, drive_modified_time: wb.white_bg_modified_time, role: 'white_bg' }] : []),

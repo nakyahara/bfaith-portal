@@ -142,6 +142,63 @@ export async function listDriveFolderImages(folderId) {
   return files;
 }
 
+/** 素材画像の一覧の歯止め (商品の画像フォルダの下を辿るだけなので、これを超えるなら別の物を指している) */
+export const MATERIAL_SCAN_LIMITS = Object.freeze({ maxDepth: 6, maxFolders: 60, maxImages: 500 });
+const FOLDER_ID_RE = /^[-\w]{10,200}$/;
+
+/**
+ * 商品の画像フォルダの**サブフォルダ (何階層下でも)** にある画像 = 素材画像の一覧 (LP 構成 AI・2026-10-02 中原さん)。
+ * **フォルダ直下の画像は含めない** (直下は商品画像 = 白抜き・TOP・2〜20。listDriveFolderImages が読む)。
+ * 並びは「フォルダの道筋 → ファイル名」の順 (同じ材料なら毎回同じ並びになる)。
+ * 🚨 途中で歯止めに当たったら **throw する** (一部だけの一覧を「全部」として渡さない)。
+ * @param {string} folderId 商品の画像フォルダの ID
+ * @param {object} [opts] { drive (試験用), limits }
+ * @returns {Promise<Array<{id:string, name:string, modifiedTime:string|null, folder:string}>>} folder = 'サブ/サブのサブ'
+ */
+export async function listDriveFolderMaterialImages(folderId, { drive = null, limits = MATERIAL_SCAN_LIMITS } = {}) {
+  if (!FOLDER_ID_RE.test(String(folderId || ''))) throw new Error('フォルダの ID の形が不正です');
+  const client = drive || getDriveClient();
+  const listAll = async (q, fields) => {
+    const out = [];
+    let pageToken;
+    do {
+      const res = await client.files.list({
+        q, fields: `nextPageToken, files(${fields})`, pageSize: 200, orderBy: 'name',
+        supportsAllDrives: true, includeItemsFromAllDrives: true, pageToken,
+      });
+      out.push(...(res.data.files || []));
+      pageToken = res.data.nextPageToken;
+      if (out.length > limits.maxImages) throw new Error(`素材フォルダの中身が ${limits.maxImages} 件を超えています (商品の画像フォルダか確認してください)`);
+    } while (pageToken);
+    return out;
+  };
+  const subfolders = (id) => listAll(`'${id}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'`, 'id, name');
+  const images = [];
+  const seenFolders = new Set([folderId]);
+  // 幅優先。根 (商品の画像フォルダ) の画像は読まない — サブフォルダから
+  let queue = (await subfolders(folderId)).map((f) => ({ id: f.id, path: String(f.name || '') , depth: 1 }));
+  let visited = 0;
+  while (queue.length) {
+    const next = [];
+    for (const f of queue) {
+      if (!FOLDER_ID_RE.test(String(f.id || '')) || seenFolders.has(f.id)) continue;   // ショートカットの循環など
+      seenFolders.add(f.id);
+      if (++visited > limits.maxFolders) throw new Error(`サブフォルダが ${limits.maxFolders} 個を超えています (商品の画像フォルダか確認してください)`);
+      const files = await listAll(`'${f.id}' in parents and trashed = false and mimeType contains 'image/'`, 'id, name, mimeType, modifiedTime');
+      for (const im of files) images.push({ id: im.id, name: String(im.name || ''), modifiedTime: im.modifiedTime || null, folder: f.path });
+      if (images.length > limits.maxImages) throw new Error(`素材画像が ${limits.maxImages} 枚を超えています (商品の画像フォルダか確認してください)`);
+      if (f.depth < limits.maxDepth) {
+        for (const c of await subfolders(f.id)) next.push({ id: c.id, path: f.path + '/' + String(c.name || ''), depth: f.depth + 1 });
+      } else if ((await subfolders(f.id)).length > 0) {
+        throw new Error(`サブフォルダが ${limits.maxDepth} 階層より深くあります (商品の画像フォルダか確認してください)`);
+      }
+    }
+    queue = next;
+  }
+  const key = (x) => x.folder + '\u0000' + x.name;
+  return images.sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
+}
+
 // ─── サムネイル取得 (アプリ内プロキシ /api/thumb 用) ───
 // drive.google.com/thumbnail 直リンクは「閲覧者の Google セッション」をサードパーティ
 // Cookie として送れる前提で、Cookie ブロックや複数アカウント (authuser 不一致) で 403 になる。

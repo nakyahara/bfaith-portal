@@ -5857,12 +5857,24 @@ th.attr-unknown { color: #dc2626; }
     // 「この依頼で渡した画像」(測定はこちら) と「もう一度押すと渡す画像」(いまの画像タブ) の両方
     // (codex #1592 R2 High: 終わった依頼の並びだけを出すと、画像を差し替えて押し直したときに食い違う)
     function lpcImagesText(s, inProgress) {
-      const line = (imgs) => imgs.map((im) => im.label).join(' → ');
+      // 素材 (role = material:N) は画像フォルダの下のフォルダの画像。商品画像の並びとは分けて、場所と名前つきで出す
+      const isMat = (im) => /^material:/.test(String(im.role || ''));
+      const line = (imgs) => imgs.filter((im) => !isMat(im)).map((im) => im.label).join(' → ');
+      const matLine = (im) => im.label + ' ' + (im.folder ? im.folder + '/' : '') + (im.name || '');
       const jobImgs = s.job && Array.isArray(s.job.images) && s.job.images.length ? s.job.images : null;
       const plan = Array.isArray(s.image_plan) ? s.image_plan : [];
       const lines = [];
-      if (jobImgs) lines.push('この依頼で AI に渡した画像: ' + line(jobImgs));
-      if (!inProgress && !s.blocked && plan.length) lines.push((jobImgs ? 'もう一度押すと渡す画像: ' : '押すと AI に渡す画像: ') + line(plan));
+      if (jobImgs) {
+        lines.push('この依頼で AI に渡した画像: ' + line(jobImgs));
+        const mats = jobImgs.filter(isMat);
+        const omitted = Number(s.job.materials_omitted) || 0;
+        if (mats.length) lines.push('素材 (' + mats.length + ' 枚): ' + mats.map(matLine).join(' / '));
+        if (omitted) lines.push('⚠️ 上限 (素材 10 枚) で入らなかった素材 ' + omitted + ' 枚');
+      }
+      if (!inProgress && !s.blocked && plan.length) {
+        lines.push((jobImgs ? 'もう一度押すと渡す画像: ' : '押すと AI に渡す画像: ') + line(plan)
+          + (s.materials_folder ? ' + 素材 (画像フォルダの下のフォルダから最大 10 枚・押したときに読む)' : ''));
+      }
       if (!lines.length) return '';
       return lines.join('\n') + '\n— 測定で比べるときは「📝 商品分析を準備」の ChatGPT 版にも、その依頼で AI に渡した画像を同じ順に添付してください';
     }

@@ -253,6 +253,40 @@ for (const bad2 of ['0', '1abc', '-1', 'abc']) {
   eq((await phlp('reserve', bad2)).code, 2, `"${bad2}" は断る`);
 }
 
+console.log('⑩ 素材画像 — 何番が素材かを Claude に伝え、検品にも素材の一覧を渡す (2026-10-02)');
+{
+  const dM = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('LP-RUN-M', 'ハッカ油スプレー 200ml', 'test')`).run().lastInsertRowid);
+  const draftM = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(dM);
+  const reqM = lp.requestJob(db, {
+    draft: draftM, spec, productInfo: '天然ハッカ油 200ml。', colorVariations: '',
+    images: [
+      { file_id: 'FILEIDTOPM01', role: 'slot:1' },
+      { file_id: 'FILEIDMATM01', role: 'material', folder: '素材/使用イメージ', name: '玄関.jpg' },
+      { file_id: 'FILEIDMATM02', role: 'material', folder: '素材', name: 'パーツ.png' },
+    ],
+    idempotencyKey: 'runner-test-mat-1', actor: 'nakahara@x',
+  });
+  ok(reqM.ok, '素材つきの依頼を受け付けた');
+  const mid = String(reqM.job.id);
+  const clM = await phlpWith({ PH_LP_RUN_ID: 'lpr-20261002-170000-mmmmmm' }, 'claim', '--run', 'lp-test-m');
+  eq(clM.json.job_id, reqM.job.id, '素材つきの依頼が来る');
+  const list = clM.json.packet.image_list || [];
+  ok(list.length === 3 && list[0].kind === 'product' && list[0].file === `img-${mid}-1.jpg`, '1 番は商品画像 (img-ID-1.jpg)');
+  ok(list[1].kind === 'material' && list[1].folder === '素材/使用イメージ' && list[1].name === '玄関.jpg' && list[1].file === `img-${mid}-2.jpg`,
+    '🚨 2 番は素材 (場所と名前つき) — Claude が「使用素材」に書く名前');
+  ok(list[2].kind === 'material' && list[2].role === 'material:2', '3 番も素材');
+  eq(clM.json.packet.materials_omitted, 0, '入らなかった素材の数も出る');
+  ok(clM.out.indexOf('FILEIDMATM01') === -1, '🚨 素材の file_id も Claude に見せない (証跡は CLI が持つ)');
+  fs.writeFileSync(path.join(work, `seen-${mid}.md`), 'img-1: 透明ボトル。img-2: 玄関でスプレー。img-3: キャップの部品。', 'utf8');
+  fs.writeFileSync(path.join(work, `_lp_review_${mid}.md`), '# 構成案\n' + 'x'.repeat(100), 'utf8');
+  const rdM = await phlp('reviewdata', mid);
+  ok(rdM.code === 0 && rdM.out.includes('うち素材 2 枚'), `検品の材料① に素材の枚数 (${rdM.out.split('\n').find((l) => l.includes('画像:'))})`);
+  ok(rdM.out.includes('[素材の一覧 (n = img-ID-n.jpg)]') && rdM.out.includes('2: 素材/使用イメージ/玄関.jpg') && rdM.out.includes('3: 素材/パーツ.png'),
+    '🚨 検品の材料① に素材の一覧 (使用素材に無い素材を書いていないかを見るため)');
+  eq((await phlp('release', mid, '--reason', '試験の片付け')).code, 0, '片付け (予約前なので手放せる)');
+  await phlp('clean', mid);
+}
+
 server.close();
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);
 process.exit(fail === 0 ? 0 : 1);
