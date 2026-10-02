@@ -155,6 +155,9 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
 /**
  * 一覧の札の数 (会社全体・絞り込みとは別。1 回の集計)。売上分類の未入力はセットを JS で導くので数えない (札は数なしで出す)。
  * 表が無い DB (0052 の前など) の札は null (= 数を出さない)
+ * 🚨 その日の原価は SKU ごとの lateral (costAsOfJoin) にしない = sku_costs を SKU の数だけ走査する (#1589 Codex R1 M1)。
+ *    原価の表を 1 回だけ走査して DISTINCT ON (sku_id) で「その日の原価」を作り、SKU に join する。並びは costAsOfJoin と同じ
+ *    (valid_from が新しい → created_at が新しい → sku_cost_id が大きい) = 同じ行を選ぶ。ほかの札も SKU ごとの exists にしない (1 回の集合)
  */
 export async function listCounts(db, { now = new Date() } = {}) {
   const today = jstDate(now);
@@ -164,18 +167,30 @@ export async function listCounts(db, { now = new Date() } = {}) {
   const run = diffAvailable ? await latestRun(db) : null;
   const params = [COMPANY_ID, today];
   if (run) params.push(run.compare_run_id);
-  const r = (await db.query(`select count(*)::int as n_all,
+  const r = (await db.query(`with c as (
+        select distinct on (y.sku_id) y.sku_id, y.cost_status
+          from core.sku_costs y
+         where y.valid_from <= $2::date and (y.valid_to is null or y.valid_to >= $2::date)
+         order by y.sku_id, y.valid_from desc, y.created_at desc, y.sku_cost_id desc)
+      ${hasReg ? ", rd as (select distinct sku_id from ops.master_registrations where state = 'draft')" : ''}
+      ${hasOutbox ? ", ow as (select distinct sku_id from ops.product_hub_outbox where status in ('pending', 'failed')), oc as (select distinct sku_id from ops.product_hub_outbox where status = 'conflict')" : ''}
+      ${run ? ', dc as (select distinct code_norm from ops.master_decision_candidates where last_seen_run = $3)' : ''}
+      select count(*)::int as n_all,
         count(*) filter (where s.sku_kind = 'single')::int as n_single, count(*) filter (where s.sku_kind = 'set')::int as n_set,
         count(*) filter (where s.sku_kind = 'exception')::int as n_exception,
         count(*) filter (where s.handling = 'discontinued')::int as discontinued,
         count(*) filter (where s.tax_rate is null)::int as miss_tax, count(*) filter (where s.shipping_code is null)::int as miss_shipping,
         count(*) filter (where s.reorder_months is null)::int as miss_reorder,
         count(*) filter (where coalesce(c.cost_status not in ('COMPLETE', 'OVERRIDDEN'), true))::int as miss_cost,
-        ${hasReg ? "count(*) filter (where exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id and mr.state = 'draft'))::int" : 'null::int'} as reg_draft,
-        ${hasOutbox ? "count(*) filter (where exists (select 1 from ops.product_hub_outbox o where o.sku_id = s.sku_id and o.status in ('pending', 'failed')))::int" : 'null::int'} as card_waiting,
-        ${hasOutbox ? "count(*) filter (where exists (select 1 from ops.product_hub_outbox o where o.sku_id = s.sku_id and o.status = 'conflict'))::int" : 'null::int'} as card_conflict,
-        ${run ? 'count(*) filter (where s.code_norm in (select code_norm from ops.master_decision_candidates where last_seen_run = $3))::int' : 'null::int'} as diff
-      from core.skus s ${costAsOfJoin('s.sku_id', '$2', 'c')}
+        ${hasReg ? 'count(rd.sku_id)::int' : 'null::int'} as reg_draft,
+        ${hasOutbox ? 'count(ow.sku_id)::int' : 'null::int'} as card_waiting,
+        ${hasOutbox ? 'count(oc.sku_id)::int' : 'null::int'} as card_conflict,
+        ${run ? 'count(dc.code_norm)::int' : 'null::int'} as diff
+      from core.skus s
+      left join c on c.sku_id = s.sku_id
+      ${hasReg ? 'left join rd on rd.sku_id = s.sku_id' : ''}
+      ${hasOutbox ? 'left join ow on ow.sku_id = s.sku_id left join oc on oc.sku_id = s.sku_id' : ''}
+      ${run ? 'left join dc on dc.code_norm = s.code_norm' : ''}
      where s.company_id = $1`, params)).rows[0];
   return r;
 }

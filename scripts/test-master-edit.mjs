@@ -1521,6 +1521,9 @@ await ta('[15] 見せ方 (PR 画面の作り直し 1): 変更の記録は人の�
   assert.equal(tl.hasFuture, true); assert.equal(tl.months.length, 6);
   assert.ok(tl.segs.every((s) => s.left >= 0 && s.left + s.width <= 100.0001));
   // Amazon の未判定の日 (node-postgres の date = その日の 0 時の Date) を YYYY-MM-DD に (前は「Sat Sep 26 2026 00:00:00 GMT+0900」が出た)
+  // 札の数 (listCounts = 原価の表を 1 回だけ走査する形・#1589 R1 M1) は一覧の絞り込みと同じ数 (原価・税率・区分・中止)
+  const cnt = await R.listCounts(db, { now: NOW });
+  for (const [k, f] of [['miss_cost', { missing: 'cost' }], ['miss_tax', { missing: 'tax' }], ['n_set', { kind: 'set' }], ['n_single', { kind: 'single' }], ['discontinued', { state: 'discontinued' }], ['n_all', {}]]) assert.equal(cnt[k], (await R.listSkus(db, f, { now: NOW })).total, k);
   const { dateOnly } = await import('../apps/master-edit/amazon-read.mjs');
   assert.equal(dateOnly(new Date(2026, 8, 26)), '2026-09-26');
   assert.equal(dateOnly('2026-09-26'), '2026-09-26');

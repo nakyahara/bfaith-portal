@@ -158,13 +158,15 @@
     if (nr) { nr.hidden = !need.length; $('#needreason-t').textContent = need.map(function (x) { return x.t; }).join(' / '); }
     var rl = $('#reason-lab');
     if (rl) { var stop = keys.indexOf(isSet ? 'handling_own' : 'handling') >= 0 && valueOf(firstEl(isSet ? 'handling_own' : 'handling')) === 'discontinued'; rl.textContent = stop ? '理由 (中止のときは必要)' : '理由 (なくてもよい)'; }
-    if (saveBtn) saveBtn.disabled = saved || busy || items.length === 0 || need.length > 0;
+    // mustReload = 開き直しが要る 409 の後。欄や理由を触っても、古い編集の印のまま保存のボタンを戻さない (#1589 Codex R1 M2)
+    if (saveBtn) saveBtn.disabled = saved || busy || mustReload || items.length === 0 || need.length > 0;
     if (revertBtn) revertBtn.disabled = saved || items.length === 0;
     ME.setUnsaved(items.length);
     lastState = { n: items.length, items: items.map(function (it) { return it.label + ': ' + (it.from ? it.from + ' → ' : '') + it.to; }), impacts: imp.map(function (x) { return x[1]; }), need: need };
   }
   var lastState = { n: 0, items: [], impacts: [], need: [] };
   var busy = false;
+  var mustReload = false;
   ME.dirty = function () { return { n: lastState.n, items: lastState.items, impacts: lastState.impacts }; };
   scope.addEventListener('input', update);
   scope.addEventListener('change', update);
@@ -232,7 +234,17 @@
     if (v === 'edit') { var first = $('#comp-rows .c-code:not([disabled])'); if (first) first.focus(); }
   });
   var rowsEl = $('#comp-rows');
-  function renumber() { $$('#comp-rows tr.comp-row').forEach(function (tr, i) { $('.no', tr).textContent = String(i + 1); }); update(); }
+  /** 行番号と読み上げの名前を今の並び・コードに合わせ直す (並べ替え・足す・外す・コードを変えたとき。#1589 Codex R1 L5) */
+  function relabel(tr, i) {
+    var code = $('.c-code', tr).value.trim();
+    var who = (i + 1) + ' 行目' + (code ? ' (' + code + ')' : '');
+    $('.no', tr).textContent = String(i + 1);
+    $('.c-code', tr).setAttribute('aria-label', (i + 1) + ' 行目の構成品のコード');
+    $('.c-qty', tr).setAttribute('aria-label', who + ' の数');
+    var acts = { up: 'を上へ', down: 'を下へ', del: 'を外す' };
+    $$('button[data-act]', tr).forEach(function (b) { b.setAttribute('aria-label', who + ' ' + acts[b.getAttribute('data-act')]); });
+  }
+  function renumber() { $$('#comp-rows tr.comp-row').forEach(relabel); update(); }
   function lookup(tr) {
     var code = $('.c-code', tr).value.trim();
     var set = function (cls, v, bad) { var el = $(cls, tr); el.textContent = v; if (cls === '.c-name') el.classList.toggle('bad', !!bad); };
@@ -259,7 +271,7 @@
       if (act === 'down' && tr.nextElementSibling) { tr.parentNode.insertBefore(tr.nextElementSibling, tr); b.focus(); }
       renumber();
     });
-    rowsEl.addEventListener('change', function (e) { if (e.target.classList.contains('c-code')) lookup(e.target.closest('tr')); });
+    rowsEl.addEventListener('change', function (e) { if (e.target.classList.contains('c-code')) { var tr = e.target.closest('tr'); relabel(tr, $$('#comp-rows tr.comp-row').indexOf(tr)); lookup(tr); } });
     $('#comp-add').addEventListener('click', function () {
       if ($$('#comp-rows tr.comp-row').length >= (P.maxComponents || 20)) { ME.toast('構成品は ' + (P.maxComponents || 20) + ' 品までです'); return; }
       rowsEl.appendChild($('#comp-tpl').content.firstElementChild.cloneNode(true));
@@ -356,6 +368,7 @@
     $('#reload').addEventListener('click', function () { location.reload(); });
     $('#reload').focus();
   }
+  var REOPEN = ['version_conflict', 'request_id_reused', 'retry', 'processing', 'abandoned', 'reg_csv_issued', 'csv_issued', 'before_cutover', 'cost_future', 'set_cost_future'];
   function showError(j, status) {
     var r = $('#result');
     var h = '<div class="result err" role="alert"><div class="rt">' + esc(j.error || ('HTTP ' + status)) + '</div>';
@@ -364,7 +377,8 @@
     if (j.reason === 'version_conflict' && Array.isArray(j.events)) {
       h += '<div class="sec2">その間の変更</div><ul>' + li(j.events.map(function (e) { return esc(jst(e.recorded_at)) + ' ' + esc((ENT[e.entity_type] || '') + (e.attribute ? (ATTR[e.attribute] || e.attribute) : ({ INSERT: '追加', DELETE: '削除' }[e.operation] || e.operation))) + ': ' + esc(show(e.old_value)) + ' → ' + esc(show(e.new_value)) + ' <span class="muted">(' + esc(e.actor_id || e.actor_type) + ')</span>'; })) + '</ul>';
     }
-    var reopen = ['version_conflict', 'request_id_reused', 'retry', 'processing', 'abandoned'].indexOf(j.reason) >= 0;
+    // 開き直しが要る = 画面が読んだ値・鍵・段階が古い (その間の変更・CSV を配った・CSV が出た・切替前に戻った・先の日付の原価が入った) か、保存の番号の扱いが決まらない
+    var reopen = REOPEN.indexOf(j.reason) >= 0;
     if (reopen) h += '<button type="button" class="btn sm" id="reload">画面を開き直す</button>';
     r.innerHTML = h + '</div>';
     var b = $('#reload'); if (b) b.addEventListener('click', function () { saved = true; update(); location.reload(); });
@@ -392,8 +406,8 @@
         msg('', 'err');
         var reopen = showError(x.j, x.r.status);
         requestId = uuid();   // 返事が来た = この番号の保存は終わった。直してもう一度保存するときは新しい番号
-        if (reopen) { saveBtn.disabled = true; } else update();
-        if (reopen) saveBtn.disabled = true;
+        if (reopen) mustReload = true;
+        update();
       })
       .catch(function () { busy = false; update(); msg('通信できませんでした。もう一度「保存する」を押してください (同じ保存は 2 回入りません)', 'err'); });
   }
@@ -416,6 +430,7 @@
   ME.onSave = canSave ? function () {
     if (saveBtn && !saveBtn.disabled) { doSave(); return; }
     if (lastState.need && lastState.need.length) { review(); ME.toast(lastState.need[0].t); return; }
+    if (mustReload) { ME.toast('この画面は古くなりました。「画面を開き直す」を押してください'); var rb = $('#reload'); if (rb) rb.focus(); return; }
     ME.toast(saved ? 'もう保存しました。「表示し直す」で最新の値を読みます' : '保存する変更がありません');
   } : null;
 

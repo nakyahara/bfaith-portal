@@ -589,3 +589,6 @@ button:focus-visible, a:focus-visible, summary:focus-visible, select:focus-visib
 #comp td { white-space: nowrap; }
 #comp td:nth-child(2) { white-space: normal; min-width: 260px; }
 #comp .c-name { display: inline-block; vertical-align: middle; max-width: 220px; }
+/* 横に収まらない表 (セットの構成 3 つ) は囲いの中で横に送る = 右の保存の箱へはみ出さない (#1589 Codex R1 M3) */
+.scrollx { overflow-x: auto; max-width: 100%; }
+.scrollx > table.comp { min-width: 640px; }
