@@ -82,7 +82,9 @@ const financeCheck = () => {
   runNode(['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM]);
   return db.prepare(`SELECT units_ordered q, sales_principal_jpy p, refund_principal_jpy r FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-a'`).get();
 };
+const { refreshStaleVersionDetails } = await import('./amazon-settlement-versions.js');
 const expectAll = (label) => {
+  refreshStaleVersionDetails(db);   // 行を直接足した (残骸) = 版の要約が古い = build は止まる → coordinator の回と同じく作り直してから (2026-10-01 #1567 R1 High 1)
   const v = viewSum();
   ok(v.n === 9 && v.a === TOTAL_MICRO && v.q === 3, `${label}: 表示用の集まり (v_amazon_settlement_unified) = 9 行・振込額 1,800 円・個数 3 (${v.n} 行 / ${v.a / 1e6} 円 / ${v.q} 個)`);
   const m = martCheck();
@@ -104,19 +106,11 @@ ok(snap.u === 100 && snap.d === '2026-01-01' && snap.q === 3, `作り直して�
 ok(snap.c === 100 * (snap.q - snap.rq - snap.aq), `原価の合計 = 残った snapshot 100 円 × 新しい個数 (注文 ${snap.q} − 返金の推定 ${snap.rq + snap.aq}) = ${snap.c} 円`);
 ok(snap.pr === snap.sp - snap.rp - snap.c, `利益も新しい数で直る = 本体 ${snap.sp} − 返金 ${snap.rp} − 原価の合計 ${snap.c} = ${snap.pr} 円 (この試験ではほかの金額は 0)`);
 // ① V1 を 1 本 (V2 の後に V1 も入った)
-// 🆕 2026-10-02 (Codex #1582 R1 High): 取込 (ingestSettlement) は V2 で入れた決済に V1 を入れない (skipped_v2 = 古い決済は行の分け方が違い二重になる)。
-//   ここは下流の重複除去 (同じ鍵 = 1 つ) を見る試験 = 取込の排他を通さずに生の表へ直接入れる (前に両方入った決済・同じ決済の文書が 2 本の代わり)
-const insertRaw = (p) => {
-  const put = (table, rows) => { if (!rows.length) return; const cols = Object.keys(rows[0]); const st = db.prepare(`INSERT OR IGNORE INTO ${table} (${cols.join(', ')}) VALUES (${cols.map((c) => '@' + c).join(', ')})`); for (const r of rows) st.run(r); };
-  db.transaction(() => { put('raw_amazon_settlement_headers', p.headerRow ? [p.headerRow] : []); put('raw_amazon_settlement_lines', p.lineRows); })();
-};
-const pV1a = prepareReportTsv(V1_TSV, 'R-V1-a', 'run1');
-const skipV1 = ingest(pV1a);
-ok(skipV1.skipped === 'skipped_v2' && skipV1.lineInserted === 0 && viewSum().n === 9, `🚨 V2 で入れた決済は V1 の取込では入れない (${skipV1.skipped})`);
-insertRaw(pV1a);
+//   (#1582 の「V2 で入れた決済に V1 を入れない (skipped_v2)」は #1567 では採らない = 版として入り、下流は決済ごとに採った版 1 つ。test-settlement-v2.js の古い Easy Ship の試験)
+ingest(prepareReportTsv(V1_TSV, 'R-V1-a', 'run1'));
 expectAll('V2 + V1');
 // ② 同じ決済のレポートがもう 1 本 (同じ期間の V1 が 2 本)
-insertRaw(prepareReportTsv(V1_TSV, 'R-V1-b', 'run2'));
+ingest(prepareReportTsv(V1_TSV, 'R-V1-b', 'run2'));
 expectAll('V2 + 同じ決済の V1 が 2 本');
 
 // ④ 過去の膨張の残骸 (同じ文書の同じ行が別の physical_line_hash で 2 行目)

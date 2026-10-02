@@ -48,7 +48,8 @@ const size = async () => {
 };
 
 // ① 集合を作る (送り手と同じ = dry-run の iterate / build)
-const run = { stats: { lines: 0, rawRows: 0, dedupRows: 0, maxLines: 0, maxLinesKey: null, maxBytes: 0, maxBytesKey: null, unmapped: { rows: 0, columns: {}, exampleIds: [] } }, noteChanged: () => {}, persistBeforeSend: () => {}, buildFailed: [] };
+const run = { stats: { lines: 0, rawRows: 0, dedupRows: 0, maxLines: 0, maxLinesKey: null, maxBytes: 0, maxBytesKey: null, unmapped: { rows: 0, columns: {}, exampleIds: [] } }, noteChanged: () => {}, persistBeforeSend: () => {}, buildFailed: [],
+  built: new Set(), receipts: { push: () => 0 } };   // makeBuild が使う (作れた注文・受領記録)。ここでは使わない (#1567 で足した入れ物が無いと全部の注文が「整形できない」になった)
 const sel = all ? { mode: 'full', extraKeys: [] } : { mode: 'range', from, to, extraKeys: [] };
 const stats = {};
 const build = makeBuild(run);

@@ -20,6 +20,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import { FEE_TYPE_RULES, NOT_ACCOUNT_FEE, CONFIRMED_NAMES, SKU_ACCOUNT_FEE_TYPES } from './amazon-account-fee-rules.js';
+import { assertDocumentVersionsReady } from './amazon-settlement-versions.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -75,6 +76,8 @@ const FEE_CASE_SQL = `CASE ${FEE_TYPE_RULES.map(([t, e, p]) => `WHEN ${t === 'lo
 //   🚨 SKU_ACCOUNT_FEE_TYPES か納品不備の名前の決めを変えたら、索引の名前も変える (IF NOT EXISTS は古い定義のまま残る → INDEXED BY がエラーで止まって気づく)
 const SKU_FEE_SQL = `TRIM(seller_sku_normalized) <> '' AND (${FEE_TYPE_RULES.filter(([t]) => SKU_ACCOUNT_FEE_TYPES.includes(t)).map(([, e, p]) => matchSql(e, p)).join(' OR ')})`;
 db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_skufee_econ ON raw_amazon_settlement_lines(economic_date) WHERE ${SKU_FEE_SQL}`);
+// 🆕 2026-10-01 (D-66): 採った文書の版の行だけから作る = 版の無い行 (過去の行の backfill 前) があれば止める (黙って行を落とさない)
+try { assertDocumentVersionsReady(db); } catch (e) { console.error(`FATAL: ${e.message}`); db.close(); process.exit(1); }
 const builtAt = new Date().toISOString();
 const result = db.transaction(() => {
   db.prepare(`DELETE FROM f_amazon_account_fees_monthly_v1 WHERE month_start_jst >= ?`).run(fromDate);
@@ -82,20 +85,22 @@ const result = db.transaction(() => {
     INSERT INTO f_amazon_account_fees_monthly_v1 (month_start_jst, fee_type, amount_jpy, row_count, built_at)
     WITH src AS (
       -- SKU 無し行 (手数料の分け方に当たる行)
-      SELECT source_settlement_id, business_line_key, source_document_id, source_line_no, source_layer, ingested_at,
+      SELECT id, source_settlement_id, business_line_key, document_version_seq, source_line_no, source_layer, ingested_at,
         economic_date, transaction_type, other_amount_micro, item_related_fee_amount_micro
       FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_nosku_econ
       WHERE economic_date >= ?
         AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '')
         AND (${FEE_FILTER_SQL})
+        AND (document_version_seq, source_settlement_id) IN (SELECT document_version_seq, settlement_id FROM v_amazon_settlement_selected_documents)
       UNION ALL
       -- SKU 付き行のうち月の手数料に入れる種類 (納品不備・2026-09-30 D-63)。ほかの SKU 付き行 (保管料・調整など) は
       -- 日次の財務の側 = ここに入れると二重になる。納品不備は日次の財務の silver から外している
-      SELECT source_settlement_id, business_line_key, source_document_id, source_line_no, source_layer, ingested_at,
+      SELECT id, source_settlement_id, business_line_key, document_version_seq, source_line_no, source_layer, ingested_at,
         economic_date, transaction_type, other_amount_micro, item_related_fee_amount_micro
       FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_skufee_econ
       WHERE economic_date >= ?
         AND ${SKU_FEE_SQL}
+        AND (document_version_seq, source_settlement_id) IN (SELECT document_version_seq, settlement_id FROM v_amazon_settlement_selected_documents)
     ),
     occ AS (
       -- 同一 settlement が sp_api_v1 / manual_csv の両 layer で raw に存在し得るため、
@@ -103,23 +108,17 @@ const result = db.transaction(() => {
       -- (Codex High 指摘: dedup 無しだと保管料/LTSF が二重計上)
       -- 🚨 同じ文書の中の出現順 (occ) を鍵に足す (本物の同じ鍵の別々の行を潰さない。db.js の v_amazon_settlement_unified と同じ形。2026-09-28)
       --   business_line_key は SKU と取引の種類を含む = SKU 無しの行と SKU 付きの行が同じ鍵になることはない (合わせてから数えても別々に数えても同じ)
-      SELECT source_settlement_id, business_line_key, source_document_id, source_layer, ingested_at,
+      -- 🆕 2026-10-01 (D-66): 決済ごとに採った文書の版の行だけ (上の src で絞った)。同じ (鍵, 出現順) の 2 行目以降 = 過去の膨張の残骸
+      SELECT id, source_settlement_id, business_line_key, document_version_seq, source_layer, ingested_at,
         economic_date, transaction_type, other_amount_micro, item_related_fee_amount_micro,
-        DENSE_RANK() OVER (PARTITION BY source_settlement_id, business_line_key, source_document_id ORDER BY source_line_no) AS occ
+        DENSE_RANK() OVER (PARTITION BY source_settlement_id, business_line_key, document_version_seq ORDER BY source_line_no) AS occ
       FROM src
     ),
     dedup AS (
       SELECT economic_date, transaction_type, other_amount_micro, item_related_fee_amount_micro,
         ROW_NUMBER() OVER (
           PARTITION BY source_settlement_id, business_line_key, occ
-          ORDER BY CASE source_layer
-                     WHEN 'sp_api_v1' THEN 1
-                     WHEN 'sp_api_v2' THEN 1
-                     WHEN 'manual_csv' THEN 2
-                     ELSE 3
-                   END,
-                   ingested_at DESC,
-                   source_document_id
+          ORDER BY ingested_at DESC, id
         ) AS rn
       FROM occ
     )
@@ -142,6 +141,7 @@ const unconfirmedTx = db.prepare(`
   SELECT transaction_type t, ${FEE_CASE_SQL} f, COUNT(*) n, SUM(COALESCE(other_amount_micro, 0) + COALESCE(item_related_fee_amount_micro, 0)) / 1000000.0 a, GROUP_CONCAT(DISTINCT substr(economic_date, 1, 7)) ms
     FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_nosku_econ
    WHERE economic_date >= ? AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '') AND (${FEE_FILTER_SQL}) AND NOT ${CONFIRMED_SQL}
+     AND (document_version_seq, source_settlement_id) IN (SELECT document_version_seq, settlement_id FROM v_amazon_settlement_selected_documents)
    GROUP BY 1 ORDER BY 1`).all(fromDate);
 // ⚠️ ② 分けられない SKU なしの取引 (手数料の分け方にも、入れない一覧にも無い名前) = 名前が変わった手数料の疑い (金額は入らない)
 const unknownTx = db.prepare(`
@@ -150,6 +150,7 @@ const unknownTx = db.prepare(`
     FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_nosku_econ
    WHERE economic_date >= ? AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '')
      AND NOT (${FEE_FILTER_SQL}) AND transaction_type NOT IN (${NOT_ACCOUNT_FEE.map(q).join(', ')})
+     AND (document_version_seq, source_settlement_id) IN (SELECT document_version_seq, settlement_id FROM v_amazon_settlement_selected_documents)
    GROUP BY 1 ORDER BY 1`).all(fromDate);
 const rows = db.prepare(`
   SELECT month_start_jst, fee_type, ROUND(amount_jpy) amount, row_count

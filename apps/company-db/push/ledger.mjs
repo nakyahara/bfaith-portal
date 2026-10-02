@@ -97,6 +97,8 @@ export function openLedger(fileOrDataDir, { memory = false, kind = 'shipment', b
       ? db.prepare(`insert into shipments_sent (ne_slip_no, fp, batch_seq, sent_at) values (?, '', 0, ?) on conflict (ne_slip_no) do nothing`)
       : db.prepare(`insert into sent (kind, key, fp, batch_seq, sent_at) values ('${kind}', ?, '', 0, ?) on conflict (kind, key) do nothing`),
     loadFps: db.prepare(`select ${keyCol} as key, fp from ${sentTable} where 1 = 1${kindWhere}`),
+    getFp: db.prepare(`select fp from ${sentTable} where ${keyCol} = ?${kindWhere}`),
+    emptyFpKeys: db.prepare(`select ${keyCol} as key from ${sentTable} where fp = ''${kindWhere}`),
     countTracked: db.prepare(`select count(*) as n from ${sentTable} where 1 = 1${kindWhere}`),
     countConfirmed: db.prepare(`select count(*) as n from ${sentTable} where fp <> ''${kindWhere}`),
     resetFps: db.prepare(`update ${sentTable} set fp = '' where 1 = 1${kindWhere}`),
@@ -173,6 +175,16 @@ export function openLedger(fileOrDataDir, { memory = false, kind = 'shipment', b
     markInitialized: (at = new Date()) => { putMeta('initialized', '1', at); },
     /** 送付済み・追跡中の指紋を全部 (鍵 → fp。'' = 追跡するだけ) */
     loadFingerprints: () => { const m = new Map(); for (const r of stmt.loadFps.iterate()) m.set(r.key, r.fp); return m; },
+    /**
+     * 指紋を 1 つずつ引く口 (#1567 メモリ: 51 万件の鍵 → 指紋の Map (約 90 MB) を持たない)。loadFingerprints の Map と同じ get(鍵) / has(鍵) + emptyKeys() (指紋 '' の鍵を 1 つずつ)。
+     *   🚨 Map と同じ値になる理由: 走査の間にこの kind の指紋 (sent) を書く手は無い (書くのは lock の持ち主が送り終えた後の markSent と、lock の中で走査の前に済む作り直しだけ)。
+     *      dry-run は lock を持たない = 前の Map も「読んだ時点の写し」でしかなく、dry-run の結果は台帳にも Render にも書かない
+     */
+    fingerprintLookup: () => {
+      let lastKey, lastFp;   // 直前の 1 件だけ覚える (build と pipeline が同じ鍵を続けて引く)
+      const get = (k) => { if (k !== lastKey) { const r = stmt.getFp.get(k); lastFp = r ? r.fp : undefined; lastKey = k; } return lastFp; };
+      return { lazy: true, get, has: (k) => get(k) !== undefined, *emptyKeys() { for (const r of stmt.emptyFpKeys.iterate()) yield r.key; } };
+    },
     countTracked: () => stmt.countTracked.get().n,
     countConfirmed: () => stmt.countConfirmed.get().n,
     /** applied / same が返った行を書く (1 取引) */

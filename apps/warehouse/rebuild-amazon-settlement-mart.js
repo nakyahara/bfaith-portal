@@ -22,6 +22,7 @@
  */
 
 import { initDB, getDB } from './db.js';
+import { assertDocumentVersionsReady } from './amazon-settlement-versions.js';
 
 const args = process.argv.slice(2);
 const isDryRun = args.includes('--dry-run');
@@ -55,24 +56,19 @@ function rebuildLong(db, ym, generatedAt) {
     CREATE TEMP TABLE _silver_month AS
     -- 🚨 同じ文書の中の出現順 (occ) を鍵に足す (本物の同じ鍵の別々の行を潰さない。db.js の v_amazon_settlement_unified と同じ形。2026-09-28)
     --   絞り込み (月・SKU) は鍵に含まれる列 = 同じ鍵の行は全部残る → 出現順は崩れない
+    -- 🆕 2026-10-01 (D-66): 決済ごとに採った文書の版の行だけ (v_amazon_settlement_selected_documents)。同じ (鍵, 出現順) の 2 行目以降 = 残骸
     WITH occ AS (
       SELECT l.*,
-             DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.source_document_id ORDER BY l.source_line_no) AS occ
+             DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.document_version_seq ORDER BY l.source_line_no) AS occ
       FROM raw_amazon_settlement_lines l
       WHERE l.year_month_int = ? AND l.seller_sku_normalized IS NOT NULL
+        AND (l.document_version_seq, l.source_settlement_id) IN (SELECT document_version_seq, settlement_id FROM v_amazon_settlement_selected_documents)
     ),
     dedup AS (
       SELECT l.*,
              ROW_NUMBER() OVER (
                PARTITION BY l.source_settlement_id, l.business_line_key, l.occ
-               ORDER BY CASE l.source_layer
-                          WHEN 'sp_api_v1' THEN 1
-                          WHEN 'sp_api_v2' THEN 1
-                          WHEN 'manual_csv' THEN 2
-                          ELSE 3
-                        END,
-                        l.ingested_at DESC,
-                        l.source_document_id
+               ORDER BY l.ingested_at DESC, l.id
              ) AS rn
       FROM occ l
     )
@@ -173,6 +169,8 @@ function ensureSkuUnitPriceTemp(db) {
                        THEN quantity_purchased ELSE 0 END) AS qty
       FROM raw_amazon_settlement_lines
       WHERE transaction_type='Order' AND seller_sku_normalized IS NOT NULL
+        -- 2026-10-01 (D-66): 採った文書の版の行だけ (V1 と V2 の両方を持つ決済を二重に数えない)
+        AND (document_version_seq, source_settlement_id) IN (SELECT document_version_seq, settlement_id FROM v_amazon_settlement_selected_documents)
       GROUP BY seller_sku_normalized
     )
     SELECT seller_sku_normalized,
@@ -283,6 +281,8 @@ async function main() {
   const db = getDB();
   db.pragma('busy_timeout = 10000');
 
+  // 🆕 2026-10-01 (D-66): 採った文書の版の行だけから作る = 版の無い行 (過去の行の backfill 前) があれば止める
+  assertDocumentVersionsReady(db);
   const yms = pickTargetYms(db);
   if (yms.length === 0) {
     console.log('対象月なし (queue が空、--all/--ym 指定もなし)');

@@ -1,0 +1,1306 @@
+#!/usr/bin/env node
+/**
+ * test-amazon-finance-coverage-run.mjs — 決済のそろい (coverage) の miniPC 側 = coordinator (D7b-1b-3) の受入試験
+ *
+ * 設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』v27 §3.1・D-65・D-66。
+ *   Render = 本物の router (PR #1561 の受け口・0050) を PGlite で。SP-API = 作り物 (一覧・取込の一覧・文書)。一時 DATA_DIR。本番には触れない。
+ *   場面:
+ *     取込だけ (財務のバックフィル前) / 初期の印が無い = ⚠️ complete にしない / 印の決済が SQLite に無い = ⚠️ / 手のファイル (順番待ち) → complete /
+ *     dry-run は何も変えない / Render の世代を追う (台帳が古い) / 読み直しと complete の隙間 (complete の直前に生の行を変える) /
+ *     最後の chunk の送信中に生の行を変える / 同じ report ID で file hash が変わる = 採る版が変わる → 旧い版にだけある注文は墓石・別の決済に残る注文は残る /
+ *     一覧の欠け (一覧にあるのに取り込めていない) / CANCELLED / 期間の分からない report / 一覧が最後のページまで取れない /
+ *     lease: 生きている持ち主からは奪わない・死んだら奪う・回の途中で lease を置き換えられた = 古い token の子は書けない /
+ *     complete の応答だけ失われた = 同じ中身の再送が same / 窓の空白 (保持期間以上あいた) = ⚠️ / Render の status が 404・409 = いつも ❌ (今までの送り方は消した・R8) /
+ *     coordinator を通らない単独の送り手 (token の無い chunk) = Render は complete を無効にする / 完成の判定の単体 /
+ *     (#1567 Codex R1) coverage で回った後の 404・409・台帳を失くした・updating の失敗 = 取込もしない / 初期の印は順番待ち → updating の後に入る・
+ *     manifest の後に印が積まれた・直接変わった = complete にしない / 版の無い過去の行 = coordinator は版付けを流さず ❌ /
+ *     (#1567 Codex R2) complete の POST の直前に印・手のファイルを積もうとする = 拒む / lease が切れて積まれた = POST の後に読み直して complete を取り消す /
+ *     (#1567 Codex R3) 取込の一覧にだけあって証拠の一覧に無い report = frontier を延ばさない (not_in_inventory)
+ * 実行: node scripts/test-amazon-finance-coverage-run.mjs
+ */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import Database from 'better-sqlite3';
+import express from 'express';
+import { PGlite } from '@electric-sql/pglite';
+import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
+
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cov-run-test-'));
+process.env.DATA_DIR = tmpDir;
+process.env.MIRROR_SYNC_KEY = 'k';
+process.env.COMPANY_DB_URL = 'postgres://pglite';
+const { initDB, getDB } = await import('../apps/warehouse/db.js');
+process.env.DAILY_SYNC_RUN_ID = 'ds_test_run';
+const { runCoverage, STATUS_PATH, LAST_RUN_FILE } = await import('../apps/warehouse/amazon-finance-coverage-run.js');
+const { completionBlockers, frontierFrom, evaluateCoverage } = await import('../apps/warehouse/amazon-finance-coverage.js');
+const { runMarkerCli, normalizeMarker, yenToMicro, parseArgs: parseMarkerArgs, insertMarker } = await import('../apps/warehouse/amazon-finance-initial-marker.js');
+const { runMigrate } = await import('../apps/warehouse/migrate-settlement-document-versions.js');
+const { queueManualFile } = await import('../apps/warehouse/amazon-settlement-manual-file.js');
+const { renameRetryJobs } = await import('../apps/warehouse/retry-failed-jobs.js');
+const V = await import('../apps/warehouse/amazon-settlement-versions.js');
+const { V2_COLUMNS } = await import('../apps/warehouse/amazon-settlement-v2.js');
+const { openLedger } = await import('../apps/company-db/push/ledger.mjs');
+const { pushAmazonFinance, FINANCE_KIND, META } = await import('../apps/company-db/push/amazon-finance.mjs');
+const { default: companyDbRouter, requireSyncKey, __setPgClientFactory } = await import('../apps/company-db/router.mjs');
+
+let ok = 0, ng = 0;
+const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
+const logs = [];
+const log = (m) => logs.push(String(m));
+
+await initDB();
+const db = getDB();
+// 切り替えの前の DB の写し (#1567 Codex R7 High 1 の試験 = ローカルの証拠を失くした・切り替えの前のバックアップに戻した・新しい DATA_DIR)
+const snapDir = path.join(tmpDir, 'snapshots');
+fs.mkdirSync(snapDir);
+const snapOf = (src, name) => { const p = path.join(snapDir, name); src.exec(`VACUUM INTO '${p.replace(/'/g, "''")}'`); return p; };
+const SNAP_EMPTY = snapOf(db, 'empty-warehouse.db');   // initDB が作る空の DB (新しい DATA_DIR)
+let SNAP_PRE = null, SNAP_PRE_LEDGER = null;            // 取込だけの回の後 (coordinator が一度も coverage で回っていない)
+
+// ─── Render (PGlite + 本物の router) ───
+const pg = new PGlite();
+const applied = await applyMigrations(pgliteAdapter(pg), { log: () => {} });
+assert.ok(applied.applied.includes('0050'), '0050 (PR #1561) が流れていない = PR #1561 の部品を取り込んでから流す');
+const one = async (sql, p = []) => (await pg.query(sql, p)).rows[0];
+__setPgClientFactory(async () => ({
+  query: async (text, params) => {
+    if (params && params.length) return pg.query(text, params);
+    if (text.includes(';')) { await pg.exec(text); return { rows: [] }; }
+    return pg.query(text);
+  },
+  end: async () => {},
+}));
+const app = express();
+app.use('/apps/company-db/sync', requireSyncKey);
+app.use('/apps/company-db/sync', companyDbRouter);
+const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+const BASE = `http://127.0.0.1:${server.address().port}/apps/company-db/sync`;
+const cov = async () => (await one(`select state, generation::text g, run_token, complete_to::text complete_to, source_revision::text rev, invalidated_reason from core.finance_coverage where mall = 'amazon' and scope_key = 'jp'`)) || null;
+const covState = async () => (await one(`select complete_to::text complete_to, generation::text g from core.finance_coverage_state(1::smallint, 'amazon', 'jp', 'amazon_settlement_unified')`));
+const receipt = async (no) => (await one(`select lines from core.order_finance_receipts where mall_order_no = $1`, [no])) || null;
+
+// ─── 作り物の決済 (V2) ───
+const tsvOf = (cols, rows) => [cols.join('\t'), ...rows.map((r) => cols.map((c) => r[c] ?? '').join('\t'))].join('\n') + '\n';
+const v2t = (iso) => `${iso.slice(0, 10).replace(/-/g, '/')} ${iso.slice(11, 19)} UTC`;
+/** 決済 1 つの V2 のファイル。lines = [{ kind: 'order' | 'refund' | 'storage', order, sku, yen, day (ISO の日時) }] */
+function settlementTsv(sid, startIso, endIso, lines) {
+  const total = lines.reduce((s, l) => s + l.yen * 100, 0) / 100;
+  const hdr = { 'settlement-id': sid, 'settlement-start-date': v2t(startIso), 'settlement-end-date': v2t(endIso), 'deposit-date': v2t(endIso), 'total-amount': total.toFixed(2), currency: 'JPY' };
+  const rows = [hdr, ...lines.map((l, i) => {
+    const at = v2t(l.day);
+    const base = { 'settlement-id': sid, 'marketplace-name': 'Amazon.co.jp', 'posted-date': at.slice(0, 10), 'posted-date-time': at };
+    if (l.kind === 'storage') return { ...base, 'marketplace-name': '', 'transaction-type': 'other-transaction', 'amount-type': 'other-transaction', 'amount-description': 'Storage Fee', amount: l.yen.toFixed(2) };
+    if (l.kind === 'refund') return { ...base, 'transaction-type': 'Refund', 'order-id': l.order, 'merchant-order-id': l.order, 'adjustment-id': `AJ-${sid}-${i}`, 'order-item-code': `OI-${l.order}`, sku: l.sku, 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: l.yen.toFixed(2) };
+    return { ...base, 'transaction-type': 'Order', 'order-id': l.order, 'merchant-order-id': l.order, 'shipment-id': `SH-${l.order}`, 'fulfillment-id': 'AFN', 'order-item-code': `OI-${l.order}`, sku: l.sku, 'quantity-purchased': '1', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: l.yen.toFixed(2) };
+  })];
+  return tsvOf(V2_COLUMNS, rows);
+}
+// 期間 (実時刻 UTC)。起点 = 2026-01-01 JST 00:00 = 2025-12-31T15:00:00Z
+const P = {
+  S0: ['2025-12-29T10:00:00Z', '2026-01-12T10:00:00Z'], S1: ['2026-01-12T10:00:00Z', '2026-01-26T10:00:00Z'], S2: ['2026-01-26T10:00:00Z', '2026-02-09T10:00:00Z'],
+  S3: ['2026-02-09T10:00:00Z', '2026-02-23T10:00:00Z'], S4: ['2026-02-23T10:00:00Z', '2026-03-09T10:00:00Z'],
+};
+const L = {
+  S0: [{ kind: 'order', order: 'O-0', sku: 'SKU-A', yen: 800, day: '2026-01-05T01:00:00Z' }],
+  S1: [{ kind: 'order', order: 'O-1', sku: 'SKU-A', yen: 900, day: '2026-01-15T01:00:00Z' }],
+  S2: [{ kind: 'order', order: 'O-A', sku: 'SKU-A', yen: 1000, day: '2026-01-28T01:00:00Z' }, { kind: 'order', order: 'O-B', sku: 'SKU-B', yen: 500, day: '2026-02-01T01:00:00Z' }],
+  S3: [{ kind: 'refund', order: 'O-B', sku: 'SKU-B', yen: -500, day: '2026-02-12T01:00:00Z' }, { kind: 'order', order: 'O-C', sku: 'SKU-C', yen: 700, day: '2026-02-15T01:00:00Z' }],
+  S4: [{ kind: 'storage', yen: -300, day: '2026-02-25T01:00:00Z' }, { kind: 'order', order: 'O-D', sku: 'SKU-D', yen: 200, day: '2026-03-01T01:00:00Z' }],
+};
+const DOCS = { D2: settlementTsv('S2', ...P.S2, L.S2), D3: settlementTsv('S3', ...P.S3, L.S3), D4: settlementTsv('S4', ...P.S4, L.S4) };
+const V2T = 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2';
+const rep = (id, status, doc, [s, e], created, over = {}) => ({ reportId: id, reportType: V2T, processingStatus: status, createdTime: created, dataStartTime: s, dataEndTime: e, ...(doc ? { reportDocumentId: doc } : {}), ...over });
+const BASE_REPORTS = [rep('R2', 'DONE', 'D2', P.S2, '2026-02-10T00:00:00Z'), rep('R3', 'DONE', 'D3', P.S3, '2026-02-24T00:00:00Z'), rep('R4', 'DONE', 'D4', P.S4, '2026-03-10T00:00:00Z')];
+const SP = { ing: BASE_REPORTS, inv: BASE_REPORTS, invEndless: false };
+const sp = {
+  async callAPI(req) {
+    if (req.operation !== 'getReports') throw new Error(`想定外 ${req.operation}`);
+    const q = req.query;
+    if (q.nextToken) return SP.invEndless ? { reports: [], nextToken: 'more' } : { reports: [] };
+    if (req.options && req.options.timeouts) return SP.invEndless ? { reports: SP.inv, nextToken: 'more' } : { reports: SP.inv };   // 証拠の一覧 (専用の接続の時間の上限つき)
+    if (SP.ingQueries) SP.ingQueries.push(q);   // 取込の一覧の要求 (窓を確かめる)
+    return { reports: SP.ing };   // 作り物は窓を見ない (Amazon が窓の外の report を返した場面・前の版のコードが取り込んだ場面も作れる)
+  },
+};
+const downloadTsv = async (docId) => { if (!Object.hasOwn(DOCS, docId)) throw new Error(`文書が無い ${docId}`); return DOCS[docId]; };
+
+// ─── coordinator の呼び方 ───
+let NOW = Date.parse('2026-03-20T00:00:00Z');
+const BIG = { limitBytes: 1e15, rowBytes: 1000, replaceFactor: 2, walAllowanceBytes: 0, marginBytes: 0, orderBytes: 300 };
+let aliveFn = () => false;
+// 回ごとに時計を 1 分進める (採る版の「新しい順」= 版の ingested_at が回ごとに違う・本番と同じ)
+const run = (x = {}) => { NOW += 60000; return runCoverage({ dataDir: tmpDir, fetchImpl: x.fetchImpl || fetch, base: BASE, syncKey: 'k', sp, inventorySp: sp, downloadTsv, now: () => new Date(NOW), isAlive: (...a) => aliveFn(...a),
+  log, capacity: BIG, sleep: async () => {}, businessDate: '2026-03-20', pid: 4242, ...x }); };
+const codes = (r) => [...new Set((r.reasons || []).map((x) => x.code))].sort();
+const rawCounts = () => db.prepare(`SELECT (SELECT COUNT(*) FROM raw_amazon_settlement_lines) l, (SELECT COUNT(*) FROM amazon_settlement_document_versions) v, (SELECT revision FROM amazon_settlement_source_revision) r`).get();
+const ledgerMeta = (k) => { const l = openLedger(tmpDir, { kind: FINANCE_KIND }); try { return l.getMeta(k); } finally { l.close(); } };
+const setLedgerMeta = (k, v) => { const l = openLedger(tmpDir, { kind: FINANCE_KIND }); try { l.putMeta(k, v); } finally { l.close(); } };
+/** Render の POST を数える・差し込む fetch */
+function spyFetch({ onChunk = null, onCoverage = null, statusOverride = null } = {}) {
+  const calls = { updating: 0, complete: 0, chunks: 0, tokenedChunks: 0 };
+  const f = async (url, init = {}) => {
+    const u = String(url);
+    if (statusOverride && init.method !== 'POST' && u.includes('/order-finance/coverage/status')) return statusOverride();
+    if (init.method === 'POST' && u.endsWith('/order-finance/coverage')) {
+      const b = JSON.parse(init.body);
+      calls[b.state]++;
+      if (onCoverage) { const o = await onCoverage(b, () => fetch(url, init)); if (o) return o; }
+    } else if (init.method === 'POST' && u.endsWith('/order-finance')) {
+      const b = JSON.parse(init.body);
+      calls.chunks++; if (b.coverage_generation && b.run_token) calls.tokenedChunks++;
+      if (onChunk) await onChunk(b);
+    }
+    return fetch(url, init);
+  };
+  f.calls = calls;
+  return f;
+}
+
+console.log('① 取込だけ (Company DB の財務のバックフィルの完了印の前)');
+await t('完了印の前 = 取込だけ・Render に触れない・最後の行に「財務 push: ⏭️」(exit 0)', async () => {
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f });
+  assert.equal(r.exitCode, 0, r.summary); assert.equal(r.mode, 'ingest_only');   // 対照 (#1567 Codex R8): ローカルにも Render (200・coverage = null) にも行が無い = 取込だけで動く
+  assert.match(r.summary, /^✅ Amazon 決済と財務: .*財務 push: ⏭️/);
+  assert.equal(f.calls.updating + f.calls.chunks, 0);
+  assert.equal(await cov(), null);
+  assert.equal(db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_document_versions WHERE report_id IN ('R2','R3','R4')`).get().n, 3);
+  const inv = db.prepare(`SELECT * FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get();
+  assert.ok(inv.completed_at && inv.coverage_generation === null && inv.run_token && inv.evidence_epoch === null, '一覧の回 (世代なし・token = lease)');
+  assert.equal(V.readLease(db).released_at != null, true, 'lease を放した');
+  // 🆕 #1567 R1 L3: daily-sync は要約の文字でなく、この記録の構造の値で「送った回か」を決める
+  const last = JSON.parse(fs.readFileSync(path.join(tmpDir, LAST_RUN_FILE), 'utf8'));
+  assert.deepEqual([last.mode, last.finance_pushed, last.exit_code, last.daily_sync_run_id], ['ingest_only', false, 0, 'ds_test_run']);
+});
+setLedgerMeta(META.backfill, '1');
+await t('対照 (#1567 Codex R6 High): スイッチが無く coordinator で一度も回っていない = 今までの書く取込は門を通って書く (lease の下・一覧の回は世代なし)', async () => {
+  const { runLegacyFetch } = await import('../apps/warehouse/fetch-amazon-settlements.js');
+  const SW = await import('../apps/warehouse/finance-coordinator-switch.js');
+  assert.equal(SW.coverageEverRanAt(tmpDir), false, '取込だけの回 (完了印の前) は世代を作らない');
+  assert.equal(await SW.renderCoverageEverRan({ base: BASE, syncKey: 'k' }), false, 'Render にも coverage の行が無い (200 で coverage = null)');
+  const g0 = await SW.legacyGateCheck({ dataDir: tmpDir, base: BASE, syncKey: 'k' });
+  assert.deepEqual([g0.allowed, g0.code], [true, null], 'daily-sync・retry の門も通る');
+  const out = await runLegacyFetch({ reportId: null, dryRun: false, source: 'v2' }, { db, dataDir: tmpDir, sp, inventorySp: sp, runId: 'legacy-never', downloadTsv, now: () => new Date(NOW), isAlive: () => false, remote: { base: BASE, syncKey: 'k' } });
+  assert.deepEqual(out.blocked, []);
+  assert.ok(V.readLease(db).released_at, 'lease は放した');
+  const inv = db.prepare(`SELECT ingest_run_id, coverage_generation, run_token FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get();
+  assert.deepEqual([inv.ingest_run_id, inv.coverage_generation], ['legacy-never', null]);
+  assert.equal(SW.coverageEverRanAt(tmpDir), false, '今までの取込は切り替えの証拠を作らない');
+  SNAP_PRE = snapOf(db, 'pre-switch-warehouse.db');
+  const L0 = new Database(path.join(tmpDir, 'company-db-push.db'));
+  try { SNAP_PRE_LEDGER = snapOf(L0, 'pre-switch-ledger.db'); } finally { L0.close(); }
+});
+
+console.log('② coverage の回');
+await t('🚨 初期の印が無い = complete にしない (⚠️ exit 0)・Render は updating (世代 1)・全部の chunk に世代と token', async () => {
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f });
+  assert.equal(r.mode, 'coverage'); assert.equal(r.generation, 1); assert.equal(r.exitCode, 0, r.summary);
+  assert.ok(codes(r).includes('initial_marker_missing'), codes(r).join(','));
+  assert.match(r.summary, /^⚠️ .*coverage: ⚠️ complete にしない/);
+  assert.equal(f.calls.updating, 1); assert.equal(f.calls.complete, 0);
+  assert.ok(f.calls.chunks > 0 && f.calls.tokenedChunks === f.calls.chunks, `chunk ${f.calls.chunks} / token 付き ${f.calls.tokenedChunks}`);
+  const c = await cov();
+  assert.deepEqual([c.state, c.g], ['updating', '1']);
+  assert.equal((await covState()).complete_to, null);
+  assert.equal(ledgerMeta('coverage_generation'), '1');
+});
+// 初期の印 (Seller Central の過去の決済情報 = S0・S1・S2)
+const MARKER = { evidence_kind: 'seller_central_payments_export', verified_from: '2026-01-01', verified_through: '2026-02-09', captured_at: '2026-03-15T10:00:00+09:00',
+  settlements: [
+    { settlement_id: 'S0', start: '2025-12-29', end: '2026-01-12', total: '800', currency: 'JPY' },
+    { settlement_id: 'S1', start: '2025-01-12'.replace('2025', '2026'), end: '2026-01-26', total: '900.00', currency: 'jpy' },
+    { settlement_id: 'S2', start: '2026-01-26', end: '2026-02-09', total: '1,500', currency: 'JPY', report_id: 'R2' },
+  ] };
+const markerFile = path.join(tmpDir, 'marker.json');
+fs.writeFileSync(markerFile, JSON.stringify(MARKER));
+const markerCount = () => db.prepare(`SELECT COUNT(*) n FROM initial_marker_headers`).get().n;
+const latestMarkerId = () => db.prepare(`SELECT marker_id FROM initial_marker_headers ORDER BY evidence_epoch DESC LIMIT 1`).get()?.marker_id ?? null;
+await t('初期の印: dry-run は積まない・SQLite に無い決済を示す / --queue は順番待ちに積むだけ (印の表に書かない・#1567 Codex R1 High 2) / --commit は拒む', async () => {
+  const d = runMarkerCli(db, { file: markerFile, queue: false }, { log: () => {}, now: new Date(NOW) });
+  assert.equal(d.queued, false); assert.deepEqual(d.summary, { match: 1, missing: 2, differs: 0 });
+  assert.equal(markerCount(), 0);
+  const w = runMarkerCli(db, { file: markerFile, queue: true }, { log: () => {}, now: new Date(NOW) });
+  assert.equal(w.queued, true);
+  assert.equal(markerCount(), 0, '積むだけ = 印の表には書かない (coordinator が updating の後に入れる)');
+  assert.equal(runMarkerCli(db, { file: markerFile, queue: true }, { log: () => {}, now: new Date(NOW) }).queued, false, '順番待ちの中の同じ印は 1 回だけ');
+  assert.throws(() => parseMarkerArgs(['--file', 'x.json', '--commit']), /--queue/);
+  assert.equal(yenToMicro('1,500', 'x'), 1500000000n); assert.equal(yenToMicro('-0.5', 'x'), -500000n);
+  assert.throws(() => normalizeMarker({ ...MARKER, verified_from: '2026-02-10' }), /verified_from/);
+  assert.throws(() => normalizeMarker({ ...MARKER, settlements: [MARKER.settlements[0], MARKER.settlements[0]] }), /2 回/);
+  assert.throws(() => normalizeMarker({ ...MARKER, captured_at: '2027-01-01T00:00:00Z' }, { now: new Date(NOW) }), /未来/);
+});
+await t('🚨 順番待ちの印は coverage の回が updating にした **後** に入る (epoch 1・入れた世代を記録) / 印の決済 S0・S1 が SQLite に無い = complete にしない (⚠️ marker_settlement_missing・起点を覆う見出しが無い)', async () => {
+  let atUpdating = null;
+  const f = spyFetch({ onCoverage: (b) => { if (b.state === 'updating') atUpdating = markerCount(); return null; } });
+  const r = await run({ fetchImpl: f });
+  assert.equal(atUpdating, 0, 'updating を送った時点では印の表は変わっていない');
+  assert.equal(r.exitCode, 0, r.summary);
+  assert.ok(codes(r).includes('marker_settlement_missing') && codes(r).includes('origin_not_covered'), codes(r).join(','));
+  assert.deepEqual([(await cov()).state, (await cov()).g], ['updating', '2']);
+  assert.deepEqual(r.markers.map((m) => [m.status, m.epoch, m.markerId]), [['applied', 1, 'im-1-20260315']]);
+  const h = db.prepare(`SELECT * FROM initial_marker_headers`).get();
+  assert.deepEqual([h.evidence_epoch, h.verified_from, h.verified_through, h.captured_at], [1, '2025-12-31T15:00:00Z', '2026-02-09T15:00:00Z', '2026-03-15T01:00:00Z']);
+  assert.equal(db.prepare(`SELECT applied_generation g FROM initial_marker_queue ORDER BY id DESC LIMIT 1`).get().g, 2, '入れた回の世代');
+  assert.equal(db.prepare(`SELECT evidence_epoch e FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get().e, 1, '同じ回の一覧は入れた印の epoch を持つ');
+  assert.throws(() => db.prepare(`UPDATE initial_marker_headers SET note = 'x'`).run(), /追記だけ/);
+  assert.throws(() => db.prepare(`DELETE FROM initial_marker_settlements`).run(), /追記だけ/);
+});
+await t('手のファイル (Seller Central の V2) を順番待ちに積む → coordinator の回で manual_csv の版として入る → 🚨 complete (complete_to = 最後の決済の end の JST の前日)', async () => {
+  for (const s of ['S0', 'S1']) {
+    const q = queueManualFile(db, tmpDir, settlementTsv(s, ...P[s], L[s]), { fileName: `${s}.txt`, now: new Date(NOW) });
+    assert.equal(q.queued, true); assert.equal(q.ok, true);
+  }
+  assert.equal(db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_settlement_id IN ('S0','S1')`).get().n, 0, '積むだけでは生の表に書かない');
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f });
+  assert.equal(r.exitCode, 0, `${r.summary}\n${JSON.stringify(r.reasons)}`);
+  assert.deepEqual(codes(r), []);
+  assert.match(r.summary, /^✅ .*coverage: ✅ complete \(世代 3・complete_to 2026-03-08/);
+  const c = await cov();
+  assert.deepEqual([c.state, c.g, c.complete_to], ['complete', '3', '2026-03-08']);
+  assert.equal((await covState()).complete_to, '2026-03-08');
+  assert.equal(c.rev, String(V.readSourceRevision(db)));
+  assert.deepEqual(r.manual.map((m) => m.status), ['ingested', 'ingested']);
+  assert.equal(db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_document_versions WHERE source_layer = 'manual_csv' AND report_id IS NULL AND report_document_id IS NULL`).get().n, 2);
+  assert.equal(f.calls.updating, 1); assert.equal(f.calls.complete, 1);
+  assert.equal(db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_dirty_orders`).get().n, 0, '送れた注文の読み直す記録は消えた');
+  assert.equal(V.readLease(db).coverage_generation, 3);
+});
+
+console.log('③ dry-run・世代');
+await t('🚨 dry-run は coverage・台帳・lease・生の表に触れない (manifest の判定だけ)', async () => {
+  const before = { c: await cov(), g: ledgerMeta('coverage_generation'), lease: V.readLease(db), raw: rawCounts() };
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f, dryRun: true });
+  assert.equal(r.exitCode, 0, r.summary);
+  assert.equal(f.calls.updating + f.calls.complete + f.calls.chunks, 0);
+  assert.deepEqual(await cov(), before.c); assert.equal(ledgerMeta('coverage_generation'), before.g);
+  assert.deepEqual(V.readLease(db), before.lease); assert.deepEqual(rawCounts(), before.raw);
+  assert.ok(codes(r).includes('inventory_this_run'), '今回の一覧の回は本番の回でだけ');
+});
+await t('--measure (dry-run) = Render の鍵を読み (GET だけ)・変わった注文を chunk の形に serialize して測る・送らない・書かない / --measure の無い dry-run は Render の鍵を読まない (#1567 Codex R5 Medium 2)', async () => {
+  const { parseArgs: parseCovArgs } = await import('../apps/warehouse/amazon-finance-coverage-run.js');
+  assert.deepEqual([parseCovArgs(['--measure']).dryRun, parseCovArgs(['--measure']).measure, parseCovArgs(['--dry-run']).measure], [true, true, false], '--measure は dry-run を含む');
+  await assert.rejects(() => run({ dryRun: false, measure: true }), /dry-run だけ/);
+  // 変わる注文を 1 つ作る (台帳の指紋をずらす = 実の回なら送り直す注文)。終わったら戻す (後の試験は変わった注文 0 が前提)
+  const setFpOA = (v) => { const l = openLedger(tmpDir, { kind: FINANCE_KIND }); try { l.db.prepare(`update sent set fp = ? where kind = ? and key like '%O-A'`).run(v, FINANCE_KIND); } finally { l.close(); } };
+  const fpOA = () => { const l = openLedger(tmpDir, { kind: FINANCE_KIND }); try { return l.db.prepare(`select fp from sent where kind = ? and key like '%O-A'`).get(FINANCE_KIND).fp; } finally { l.close(); } };
+  const fp0 = fpOA();
+  setFpOA('x');
+  try {
+    const before = { c: await cov(), g: ledgerMeta('coverage_generation'), lease: V.readLease(db), raw: rawCounts(), fp: fpOA() };
+    const gets = [];
+    const f0 = spyFetch();
+    const f = async (url, init = {}) => { if (!init.method || init.method === 'GET') gets.push(String(url)); return f0(url, init); };
+    const r = await run({ fetchImpl: f, dryRun: true, measure: true });
+    assert.equal(r.exitCode, 0, r.summary);
+    assert.equal(f0.calls.updating + f0.calls.complete + f0.calls.chunks, 0, '送らない (POST 0)');
+    assert.ok(gets.some((u) => u.includes('/order-finance/keys')), 'Render の鍵を読む (実の回と同じ beforeScan・GET だけ)');
+    const m = r.push.measure;
+    assert.ok(m && m.renderKeys > 0 && m.rows >= 1 && m.chunks >= 1 && m.rowBytes > 0 && m.maxChunkBytes > m.rowBytes / m.rows, JSON.stringify(m));
+    assert.match(r.summary, /dry-run --measure.*Render の鍵 \d+ 件・変わった \d+ 注文を chunk \d+ 個に serialize/);
+    assert.deepEqual(await cov(), before.c); assert.equal(ledgerMeta('coverage_generation'), before.g);
+    assert.deepEqual(V.readLease(db), before.lease); assert.deepEqual(rawCounts(), before.raw);
+    assert.equal(fpOA(), before.fp, '台帳に書かない (指紋はずらしたまま)');
+    gets.length = 0;
+    const r2 = await run({ fetchImpl: f, dryRun: true });
+    assert.equal(r2.exitCode, 0, r2.summary); assert.equal(r2.push.measure, null);
+    assert.ok(!gets.some((u) => u.includes('/order-finance/keys')), '--measure の無い dry-run は Render の鍵を読まない (今までどおり)');
+  } finally { setFpOA(fp0); }
+});
+await t('Render の世代を追う (台帳の世代が古い = Render の復元の後) → 変わりが無くても新しい世代で complete', async () => {
+  setLedgerMeta('coverage_generation', '1');
+  const r = await run({ fetchImpl: spyFetch() });
+  assert.equal(r.exitCode, 0, r.summary); assert.equal(r.generation, 4);
+  assert.equal(r.push.changed, 0);
+  assert.deepEqual([(await cov()).state, (await cov()).g], ['complete', '4']);
+});
+
+await t('🚨 API の版がある決済に手のファイル (余計な注文 O-X つき) を積む = 警告 (apiVersions)・O-X は送るものが無い = 読み直す注文から消える = dirty_left で止まらず complete (#1567 R1 Medium 1)', async () => {
+  const q = queueManualFile(db, tmpDir, settlementTsv('S2', ...P.S2, [...L.S2, { kind: 'order', order: 'O-X', sku: 'SKU-X', yen: 50, day: '2026-02-02T01:00:00Z' }]), { fileName: 'S2-manual.txt', now: new Date(NOW) });
+  assert.ok(q.queued && q.apiVersions.length >= 1, '積むときに API の版があると返す (CLI は ⚠️ を出す)');
+  const r = await run({ fetchImpl: spyFetch() });
+  assert.equal(r.exitCode, 0, `${r.summary} ${JSON.stringify(r.reasons)}`);
+  assert.equal((await cov()).state, 'complete');
+  assert.equal(V.selectedVersionOf(db, 'S2').source_layer, 'sp_api_v2', '採る版は API の版のまま');
+  assert.equal(db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_dirty_orders WHERE mall_order_no = 'O-X'`).get().n, 0, 'O-X の記録は消えた');
+  assert.equal(await receipt('O-X'), null, 'O-X は送らない (採った版に無い・Render に無い)');
+  assert.ok(r.push.finance.skippedEmpty >= 1);
+  const last = JSON.parse(fs.readFileSync(path.join(tmpDir, LAST_RUN_FILE), 'utf8'));
+  assert.deepEqual([last.mode, last.finance_pushed, last.coverage_complete], ['coverage', true, true]);
+  // 毎朝の --full の回の所要時間と最大メモリが記録に残る (#1567 Codex R3 の補足)
+  assert.ok(Number.isFinite(last.elapsed_minutes) && last.elapsed_minutes >= 0 && Number.isInteger(last.max_rss_mb) && last.max_rss_mb > 0, JSON.stringify(last));
+});
+
+console.log('④ 読み取りの後の変化 (source_revision)');
+await t('🚨 読み直しと complete の隙間: complete の直前に生の行を変える = complete にしない (❌ source_revision_changed)・Render は updating → 次の回で complete', async () => {
+  const g0 = Number((await cov()).g);
+  const r = await run({ fetchImpl: spyFetch(), hooks: { beforeComplete: (dbx) => dbx.prepare(`UPDATE raw_amazon_settlement_lines SET marketplace_name = 'Amazon.co.jp ' WHERE amazon_order_id = 'O-A'`).run() } });
+  assert.equal(r.exitCode, 1, r.summary); assert.ok(codes(r).includes('source_revision_changed'), codes(r).join(','));
+  assert.deepEqual([(await cov()).state, (await cov()).g], ['updating', String(g0 + 1)]);
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, r2.summary);
+  assert.deepEqual([(await cov()).state, (await cov()).g], ['complete', String(g0 + 2)]);
+});
+await t('🚨 同じ report ID で file hash が変わる (O-C が消えた新しい文書) + 最後の chunk の送信中に生の行を変える = complete にしない → 次の回で complete・O-C は墓石・O-B は S2 に残る', async () => {
+  DOCS.D3 = settlementTsv('S3', ...P.S3, [L.S3[0]]);   // O-C の行が無い
+  let touched = false;
+  const f = spyFetch({ onChunk: (b) => { if (b.last && !touched) { touched = true; db.prepare(`UPDATE raw_amazon_settlement_lines SET marketplace_name = 'Amazon.co.jp' WHERE amazon_order_id = 'O-A'`).run(); } } });
+  const r = await run({ fetchImpl: f });
+  assert.ok(touched, 'chunk の送信中に変えた');
+  assert.equal(r.exitCode, 1, r.summary); assert.ok(codes(r).includes('source_revision_changed'), codes(r).join(','));
+  assert.equal((await cov()).state, 'updating');
+  const sel = V.selectedVersionOf(db, 'S3');
+  assert.equal(sel.report_id, 'R3'); assert.equal(sel.line_count, 1, '採る版 = 新しい文書 (O-C が無い)');
+  assert.equal((await receipt('O-C')).lines, 0, 'O-C は旧い版にだけある = 墓石');
+  assert.ok((await receipt('O-B')).lines > 0, 'O-B は S2 に残る = 墓石にしない');
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`);
+  assert.equal((await cov()).state, 'complete');
+});
+
+console.log('⑤ 一覧・report の状態');
+// 🚨 一覧に 1 度でも出た report は積み上げた期待の集合に残る (設計 R19 H1 = 保持期間で一覧から消えた report の欠けを見逃さない)。
+//   = 未充足の report が出たら、Seller Central で印を作り直す (新しい epoch = 積み上げは新しい印の後の回だけ) のが runbook。試験も同じ手で戻す
+// 積むだけ = 次の coverage の回が updating の後に入れる。isAlive = lease の持ち主が生きているか (既定 = 死んでいる = 回の外・止まった回)
+const remark = (o = {}) => runMarkerCli(db, { file: markerFile, queue: true }, { log: () => {}, now: new Date(NOW), isAlive: () => false, ...o });
+const restore = () => { SP.ing = BASE_REPORTS; SP.inv = BASE_REPORTS; SP.invEndless = false; remark(); };
+await t('🚨 一覧の欠け (一覧にある DONE の report を取り込めていない) = complete にしない (❌ report_not_imported)', async () => {
+  SP.inv = [...BASE_REPORTS, rep('R-MISS', 'DONE', 'D-MISS', P.S3, '2026-03-11T00:00:00Z')];
+  try {
+    const r = await run({ fetchImpl: spyFetch() });
+    assert.equal(r.exitCode, 1, r.summary); assert.ok(codes(r).includes('report_not_imported'), codes(r).join(','));
+    assert.equal((await cov()).state, 'updating');
+  } finally { restore(); }
+});
+await t('🚨 CANCELLED = 未充足 (⚠️ report_cancelled・satisfied_empty は作らない)', async () => {
+  SP.inv = [...BASE_REPORTS, rep('R-CXL', 'CANCELLED', null, P.S4, '2026-03-11T00:00:00Z')];
+  try {
+    const r = await run({ fetchImpl: spyFetch() });
+    assert.equal(r.exitCode, 0, r.summary); assert.ok(codes(r).includes('report_cancelled'), codes(r).join(','));
+    assert.equal((await cov()).state, 'updating');
+  } finally { restore(); }
+});
+await t('並べ直しの規則に無い V2 で、その決済にほかの版がある = 終了コード 3 にしない・coverage は満たせない (⚠️ report_blocked = 規則を足す)', async () => {
+  const badRow = tsvOf(V2_COLUMNS, [{ 'settlement-id': 'S3', 'transaction-type': 'NewThing', 'marketplace-name': 'Amazon.co.jp', 'posted-date': '2026/02/13', 'posted-date-time': '2026/02/13 01:00:00 UTC', 'amount-type': 'Mystery', 'amount-description': 'x', amount: '-7.00' }]).split('\n')[1];
+  DOCS['D3-BAD'] = DOCS.D3 + badRow + '\n';
+  SP.ing = [...BASE_REPORTS, rep('R3-BAD', 'DONE', 'D3-BAD', P.S3, '2026-03-11T00:00:00Z')]; SP.inv = SP.ing;
+  try {
+    const r = await run({ fetchImpl: spyFetch() });
+    assert.notEqual(r.exitCode, 3, r.summary); assert.equal(r.exitCode, 0, r.summary);
+    assert.ok(codes(r).includes('report_blocked'), codes(r).join(','));
+    assert.match(r.summary, /取り込めない V2 1 本 \(ほかの版あり\)/);
+    assert.equal((await cov()).state, 'updating');
+  } finally { restore(); }
+});
+await t('🚨 期間の分からない report を対象の外にしない: IN_QUEUE で期間 null / DONE で期間 null / 期間が逆 = ⚠️ report_period_unknown', async () => {
+  for (const bad of [rep('R-Q', 'IN_QUEUE', null, [undefined, undefined], '2026-03-19T00:00:00Z'), rep('R-N', 'DONE', 'D4', [null, null], '2026-03-19T00:00:00Z'), rep('R-X', 'DONE', 'D4', [P.S4[1], P.S4[0]], '2026-03-19T00:00:00Z')]) {
+    SP.inv = [...BASE_REPORTS, bad];
+    try {
+      const r = await run({ fetchImpl: spyFetch() });
+      assert.ok(codes(r).includes('report_period_unknown'), `${bad.reportId}: ${codes(r).join(',')}`);
+      assert.equal((await cov()).state, 'updating');
+    } finally { restore(); }
+  }
+});
+await t('🚨 一覧が最後のページまで取れない (nextToken が残ったまま上限) = 回の失敗 = complete にしない (❌ inventory_this_run)', async () => {
+  SP.invEndless = true;
+  try {
+    const r = await run({ fetchImpl: spyFetch() });
+    assert.equal(r.exitCode, 1, r.summary); assert.ok(codes(r).includes('inventory_this_run'), codes(r).join(','));
+    const inv = db.prepare(`SELECT last_page_reached p FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get();
+    assert.equal(inv.p, 0);
+  } finally { restore(); }
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+});
+await t('🚨 未充足の report は印を作り直すまで期待の集合に残る (一覧から消えても) → 新しい印 (新しい epoch) の後の回だけを積み上げる', async () => {
+  SP.inv = [...BASE_REPORTS, rep('R-CXL2', 'CANCELLED', null, P.S4, '2026-03-11T00:00:00Z')];
+  const r1 = await run({ fetchImpl: spyFetch() });
+  assert.ok(codes(r1).includes('report_cancelled'));
+  SP.inv = BASE_REPORTS;   // 次の一覧には居ない
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.ok(codes(r2).includes('report_cancelled'), '前の回の一覧で見た CANCELLED は残る (黙って消さない)');
+  const e0 = db.prepare(`SELECT MAX(evidence_epoch) e FROM initial_marker_headers`).get().e;
+  remark();
+  assert.equal(db.prepare(`SELECT MAX(evidence_epoch) e FROM initial_marker_headers`).get().e, e0, '積んだだけでは印は変わらない');
+  const r3 = await run({ fetchImpl: spyFetch() });
+  assert.equal(db.prepare(`SELECT MAX(evidence_epoch) e FROM initial_marker_headers`).get().e, e0 + 1, '回の中 (updating の後) で新しい epoch');
+  assert.equal(r3.exitCode, 0, `${r3.summary} ${JSON.stringify(r3.reasons)}`); assert.equal((await cov()).state, 'complete');
+  assert.equal(db.prepare(`SELECT evidence_epoch e FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get().e, e0 + 1, '一覧の回は最新の印の epoch を持つ');
+});
+
+await t('🚨 同じ決済に別の report の文書 (中身が同じ) が後から来た = 旧い report は採った版で満たす (satisfied_by_selected_settlement・detail_digest の完全な一致) / 中身が違う = 満たさない (⚠️)', async () => {
+  DOCS.D4b = DOCS.D4 + '\n';   // 行の集合は同じ・file hash だけ違う
+  SP.ing = [...BASE_REPORTS, rep('R4b', 'DONE', 'D4b', P.S4, '2026-03-12T00:00:00Z')]; SP.inv = SP.ing;
+  const r = await run({ fetchImpl: spyFetch() });
+  assert.equal(r.exitCode, 0, `${r.summary} ${JSON.stringify(r.reasons)}`); assert.equal((await cov()).state, 'complete');
+  assert.equal(V.selectedVersionOf(db, 'S4').report_id, 'R4b', '採る版 = 新しい文書');
+  assert.ok(r.push.scanSnapshot.diag.results.satisfied_by_selected_settlement >= 1, JSON.stringify(r.push.scanSnapshot.diag.results));
+  // 中身が違う文書 (O-D が 250 円) がさらに後から = 採る版は R4c・R4 と R4b は満たさない
+  DOCS.D4c = settlementTsv('S4', ...P.S4, [L.S4[0], { ...L.S4[1], yen: 250 }]);
+  SP.ing = [...SP.ing, rep('R4c', 'DONE', 'D4c', P.S4, '2026-03-13T00:00:00Z')]; SP.inv = SP.ing;
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.ok(codes(r2).includes('report_selected_differs'), codes(r2).join(','));
+  assert.equal((await cov()).state, 'updating');
+  assert.equal((await receipt('O-D')).lines, 1);
+  // 戻す = 同じ中身の文書 (R4d) をさらに後から + 印を作り直す (積み上げた R4c を消すのは人の判断)
+  DOCS.D4d = DOCS.D4 + '\n\n';
+  SP.ing = [...BASE_REPORTS, rep('R4d', 'DONE', 'D4d', P.S4, '2026-03-14T00:00:00Z')]; SP.inv = SP.ing; remark();
+  const r3 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r3.exitCode, 0, `${r3.summary} ${JSON.stringify(r3.reasons)}`); assert.equal((await cov()).state, 'complete', `${r3.summary} ${JSON.stringify(r3.reasons)}`);
+  restore();
+});
+
+console.log('⑥ lease');
+await t('🚨 lease を生きている持ち主が持つ = 見送る (❌・Render に触れない) / 持ち主が死んだ = 奪って回す', async () => {
+  aliveFn = () => true;
+  const held = V.acquireCoverageLease(db, { isAlive: () => false, pid: 999, now: new Date(NOW) });
+  assert.ok(held.ok);
+  const g0 = (await cov()).g;
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f });
+  assert.equal(r.exitCode, 1); assert.match(r.summary, /lease を持っている \(pid 999/);
+  assert.equal(f.calls.updating, 0); assert.equal((await cov()).g, g0);
+  aliveFn = () => false;
+  logs.length = 0;
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, r2.summary);
+  assert.ok(logs.some((l) => /pid 999・.*死んでいた = lease を取った/.test(l)), logs.filter((l) => /lease/.test(l)).join(' | '));
+});
+await t('🚨 回の途中で lease を置き換えられた (別の回が取った) = 古い token の子の取込は書けない (❌)・生の表は変わらない・Render は updating のまま', async () => {
+  DOCS.D5 = settlementTsv('S5', '2026-03-09T10:00:00Z', '2026-03-16T10:00:00Z', [{ kind: 'order', order: 'O-E', sku: 'SKU-E', yen: 50, day: '2026-03-10T01:00:00Z' }]);
+  SP.ing = [...BASE_REPORTS, rep('R5', 'DONE', 'D5', ['2026-03-09T10:00:00Z', '2026-03-16T10:00:00Z'], '2026-03-17T00:00:00Z')];
+  SP.inv = SP.ing;
+  try {
+    const before = db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_settlement_id = 'S5'`).get().n;
+    const r = await run({ fetchImpl: spyFetch(), hooks: { afterUpdating: (dbx) => { V.releaseCoverageLease(dbx, V.readLease(dbx).run_token ? { runToken: V.readLease(dbx).run_token } : null); V.acquireCoverageLease(dbx, { isAlive: () => false, pid: 777 }); } } });
+    assert.equal(r.exitCode, 1, r.summary); assert.match(r.summary, /lease/);
+    assert.equal(db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_settlement_id = 'S5'`).get().n, before, '古い token の子は書けない');
+    assert.equal((await cov()).state, 'updating');
+    // 置き換えた回 (pid 777) が死んだ後の次の回は取れる = S5 が入って complete
+    const r2 = await run({ fetchImpl: spyFetch() });
+    assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`);
+    assert.equal((await cov()).state, 'complete'); assert.equal((await cov()).complete_to, '2026-03-15');
+  } finally { /* R5 は残す (以降の回も同じ一覧) */ }
+});
+
+console.log('⑦ complete の応答・窓の空白・0050 の前・単独の送り手');
+await t('🚨 complete の応答だけ失われた = 同じ中身で送り直して same (complete のまま)', async () => {
+  let lost = false;
+  const f = spyFetch({ onCoverage: async (b, real) => { if (b.state === 'complete' && !lost) { lost = true; await real(); throw new Error('socket hang up (作り物)'); } return null; } });
+  const r = await run({ fetchImpl: f });
+  assert.equal(r.exitCode, 0, `${r.summary} ${JSON.stringify(r.reasons)}`);
+  assert.equal(f.calls.complete, 2); assert.equal(r.coverage.status, 'same');
+  assert.equal((await cov()).state, 'complete');
+});
+const S404 = () => new Response('Cannot GET', { status: 404 });
+const S409 = () => new Response(JSON.stringify({ error: 'not_migrated' }), { status: 409, headers: { 'content-type': 'application/json' } });
+/** 生の表・一覧の回の数 (取込をしたかを見る) */
+const writeState = () => ({ raw: rawCounts(), runs: db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_report_inventory_runs`).get().n });
+/** coverage で回った証拠を全部隠す (台帳の世代・一覧の回・手のファイル・印の順番待ちの世代)。戻り = 戻す関数 */
+function hideEvidence() {
+  const g0 = ledgerMeta('coverage_generation');
+  const saved = [['amazon_settlement_report_inventory_runs', 'coverage_generation'], ['amazon_settlement_manual_files', 'ingest_generation'], ['initial_marker_queue', 'applied_generation']]
+    .map(([tb, c]) => ({ tb, c, rows: db.prepare(`SELECT id, ${c} g FROM ${tb} WHERE ${c} IS NOT NULL`).all() }));
+  setLedgerMeta('coverage_generation', null);
+  for (const s of saved) db.prepare(`UPDATE ${s.tb} SET ${s.c} = NULL WHERE ${s.c} IS NOT NULL`).run();
+  return () => {
+    setLedgerMeta('coverage_generation', g0);
+    for (const s of saved) { const u = db.prepare(`UPDATE ${s.tb} SET ${s.c} = ? WHERE id = ?`); for (const x of s.rows) u.run(x.g, x.id); }
+  };
+}
+/** SP-API・ダウンロードを数える (取込が始まらないことを見る) */
+const countingSp = () => { const c = { sp: 0, dl: 0 }; return { c, sp: { callAPI: async (req) => { c.sp++; return sp.callAPI(req); } }, downloadTsv: async (id) => { c.dl++; return downloadTsv(id); } }; };
+await t('🚨 Render の status が 404 / 409 not_migrated (Render が #1561 / 0050 の前に戻った疑い) = いつも **取込も** 送信もしない ❌ = coverage で回ったことがあっても・台帳の世代を失くしても・ローカルの証拠が全部無くても (今までの送り方 (legacy) は消した・#1567 Codex R1 High 1・R2 Medium 3・R3 L3・R8 High)', async () => {
+  assert.ok(ledgerMeta('coverage_generation'), '前提: この台帳は coverage で回ったことがある');
+  const refused = async (statusOverride, mode) => {
+    const b = writeState();
+    const f = spyFetch({ statusOverride });
+    const k = countingSp();
+    const r = await run({ fetchImpl: f, sp: k.sp, inventorySp: k.sp, downloadTsv: k.downloadTsv });
+    assert.equal(r.mode, mode, r.summary); assert.equal(r.exitCode, 1, r.summary);
+    assert.match(r.summary, /^❌ .*取込も送信もしない/);
+    assert.equal(r.ingest, null, '取込もしない');
+    assert.deepEqual([k.c.sp, k.c.dl], [0, 0], 'SP-API の一覧もダウンロードも始めない');
+    assert.deepEqual(writeState(), b, '生の表・一覧の回は変わらない');
+    assert.equal(f.calls.chunks + f.calls.updating + f.calls.complete, 0, '送らない (fail-open にしない)');
+  };
+  await refused(S404, 'render_404');
+  await refused(S409, 'render_not_migrated');
+  // 台帳を失くした (台帳には coverage の世代が無い) = warehouse.db の一覧の回・手のファイル・印の順番待ちの世代で分かる
+  const g0 = ledgerMeta('coverage_generation');
+  setLedgerMeta('coverage_generation', null);
+  try { await refused(S404, 'render_404'); await refused(S409, 'render_not_migrated'); } finally { setLedgerMeta('coverage_generation', g0); }
+  // 🆕 #1567 Codex R8 High (2)(3): 台帳にも warehouse.db にも証拠が無い (切り替えの前に戻した・新しい DATA_DIR の形)・財務のバックフィル済み + status 404 / 409
+  //   = 前は「今までの送り方 (legacy)」で token の無い送信をした → いまは ❌ (SP-API・生の表・送信のどれも始まらない)
+  const back = hideEvidence();
+  try {
+    assert.equal(ledgerMeta(META.backfill), '1', '前提: 財務のバックフィル済み');
+    await refused(S404, 'render_404');
+    await refused(S409, 'render_not_migrated');
+  } finally { back(); }
+});
+await t('🚨 台帳 (company-db-push.db) を失くした = 財務のバックフィルの完了印も世代も無いのに warehouse.db に coverage の証拠 = 取込だけ (ingest_only) にしない = 取込もしない ❌ (#1567 Codex R1 High 1)', async () => {
+  const g0 = ledgerMeta('coverage_generation'), b0 = ledgerMeta(META.backfill);
+  setLedgerMeta('coverage_generation', null); setLedgerMeta(META.backfill, null);
+  try {
+    const b = writeState();
+    const f = spyFetch();
+    const r = await run({ fetchImpl: f });
+    assert.equal(r.mode, 'ledger_lost', r.summary); assert.equal(r.exitCode, 1);
+    assert.match(r.summary, /^❌ .*台帳を失くした.*取込も送信もしない/);
+    assert.equal(r.ingest, null); assert.deepEqual(writeState(), b);
+    assert.equal(f.calls.chunks + f.calls.updating + f.calls.complete, 0);
+    // 🆕 #1567 Codex R8 High (1): ローカルに証拠も無い (台帳・warehouse.db を切り替えの前に戻した・新しい DATA_DIR の形)・バックフィルの印も無い
+    //   = 前は Render を読まずに取込だけ (ingest_only) で生の表を書いた → いまは Render の決済のそろいに行があれば ❌・読めなければ ❌ (SP-API・生の表・送信のどれも始まらない)
+    const back = hideEvidence();
+    try {
+      const refusedLocalNone = async (statusOverride, mode, re) => {
+        const b2 = writeState();
+        const f2 = spyFetch(statusOverride ? { statusOverride } : {});
+        const k = countingSp();
+        const r2 = await run({ fetchImpl: f2, sp: k.sp, inventorySp: k.sp, downloadTsv: k.downloadTsv });
+        assert.equal(r2.mode, mode, r2.summary); assert.equal(r2.exitCode, 1, r2.summary);
+        assert.match(r2.summary, re); assert.match(r2.summary, /取込も送信もしない/);
+        assert.equal(r2.ingest, null); assert.deepEqual([k.c.sp, k.c.dl], [0, 0], 'SP-API の一覧もダウンロードも始めない');
+        assert.deepEqual(writeState(), b2, '生の表・一覧の回は変わらない');
+        assert.equal(f2.calls.chunks + f2.calls.updating + f2.calls.complete, 0, '送らない');
+      };
+      await refusedLocalNone(null, 'render_has_coverage', /^❌ .*Render の決済のそろいに coverage の行がある/);
+      for (const st of [S404, S409, () => new Response('busy', { status: 503 }), () => new Response('{"ok":true}', { status: 200 }), () => { throw new Error('ECONNREFUSED (作り物)'); }]) {
+        await refusedLocalNone(st, 'render_unreadable', /^❌ .*Render の決済のそろいを読めない/);
+      }
+    } finally { back(); }
+  } finally { setLedgerMeta('coverage_generation', g0); setLedgerMeta(META.backfill, b0); }
+});
+await t('🚨 updating を送れない (Render の 5xx が 3 回) = 取込を始めない ❌ (生の表を書く前に無効にする)', async () => {
+  const b = writeState();
+  const f = spyFetch({ onCoverage: (body) => (body.state === 'updating' ? new Response('boom', { status: 500 }) : null) });
+  const r = await run({ fetchImpl: f });
+  assert.equal(r.exitCode, 1, r.summary); assert.equal(r.ingest, null);
+  assert.deepEqual(writeState(), b); assert.equal(f.calls.updating, 3); assert.equal(f.calls.chunks, 0);
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+});
+await t('🚨 complete の後に新しい印を積む = 積んだだけでは印の表も Render の complete も変わらない → 次の回が updating の **後** に入れる (#1567 Codex R1 High 2 場面 1)', async () => {
+  assert.equal((await cov()).state, 'complete');
+  const n0 = markerCount();
+  remark();
+  assert.equal(markerCount(), n0, '積んだだけ');
+  let atUpdating = null;
+  const f = spyFetch({ onCoverage: (b) => { if (b.state === 'updating') atUpdating = markerCount(); return null; } });
+  const r = await run({ fetchImpl: f });
+  assert.equal(atUpdating, n0, 'updating を送った時点ではまだ入れていない');
+  assert.equal(markerCount(), n0 + 1);
+  assert.equal(r.exitCode, 0, `${r.summary} ${JSON.stringify(r.reasons)}`); assert.equal((await cov()).state, 'complete');
+  assert.equal(r.push.finance.coverage.manifest.initial_marker_id, latestMarkerId(), 'complete の manifest は新しい印');
+});
+await t('🚨 manifest を作った後・complete の前に印を積む = complete にしない (❌ marker_pending) → 次の回で入れて complete (#1567 Codex R1 High 2 場面 2)', async () => {
+  const n0 = markerCount();
+  const f = spyFetch();
+  // 持ち主が生きている = 積めない (R2 High 2 a) / 持ち主が死んでいると見えた (止まった回) = 積める → 判定の読み直しで marker_pending
+  const r = await run({ fetchImpl: f, hooks: { beforeComplete: () => {
+    assert.throws(() => remark({ isAlive: () => true }), /coordinator の回が動いている/);
+    assert.equal(remark().queued, true);
+  } } });
+  assert.equal(r.exitCode, 1, r.summary); assert.ok(codes(r).includes('marker_pending'), codes(r).join(','));
+  assert.equal(f.calls.complete, 0); assert.equal((await cov()).state, 'updating');
+  assert.equal(markerCount(), n0);
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+  assert.equal(markerCount(), n0 + 1);
+});
+await t('🚨 manifest を作った後・complete の前に印の表が直接変わる (回の外で書かれた) = 印の id・epoch・digest を読み直して違う = complete にしない (❌ marker_changed) (#1567 Codex R1 High 2 場面 2)', async () => {
+  const norm = normalizeMarker(MARKER, { now: new Date(NOW) });
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f, hooks: { beforeComplete: (dbx) => { insertMarker(dbx, norm, { sourceFileName: 'direct.json', sourceFileHash: 'f'.repeat(64), now: new Date(NOW) }); } } });
+  assert.equal(r.exitCode, 1, r.summary); assert.ok(codes(r).includes('marker_changed'), codes(r).join(','));
+  assert.equal(f.calls.complete, 0); assert.equal((await cov()).state, 'updating');
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+  assert.equal(r2.push.finance.coverage.manifest.initial_marker_id, latestMarkerId());
+});
+await t('🚨 最後の確かめと complete の POST の間 (POST の直前) に印・手のファイルを積もうとする = coordinator が lease を持っている = 積まずに拒む → complete は今の印のまま (#1567 Codex R2 High 2 a)', async () => {
+  const n0 = markerCount(), q0 = db.prepare(`SELECT COUNT(*) n FROM initial_marker_queue`).get().n, mf0 = db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_manual_files`).get().n;
+  let tried = false;
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f, hooks: { beforeCompletePost: (dbx) => {
+    tried = true;
+    assert.equal(f.calls.complete, 0, 'まだ POST していない');
+    const l = V.readLease(dbx);
+    assert.ok(l.run_token && !l.released_at, 'coordinator は POST の前に lease を放していない');
+    assert.throws(() => remark({ isAlive: () => true }), /coordinator の回が動いている.*初期の印を積まない/);
+    assert.throws(() => queueManualFile(dbx, tmpDir, settlementTsv('S2', ...P.S2, L.S2), { fileName: 'late.txt', now: new Date(NOW), isAlive: () => true }), /coordinator の回が動いている.*手の決済のファイルを積まない/);
+  } } });
+  assert.ok(tried);
+  assert.equal(r.exitCode, 0, `${r.summary} ${JSON.stringify(r.reasons)}`); assert.equal((await cov()).state, 'complete');
+  assert.equal(db.prepare(`SELECT COUNT(*) n FROM initial_marker_queue`).get().n, q0, '印は積まれていない');
+  assert.equal(db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_manual_files`).get().n, mf0, '手のファイルも積まれていない');
+  assert.equal(markerCount(), n0);
+  // 回が終わった (lease を放した) 後は、生きている持ち主として見ても積める
+  assert.ok(V.readLease(db).released_at, '回の後は lease を放した');
+  assert.equal(remark({ isAlive: () => true }).queued, true, '回の後は積める');
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal(markerCount(), n0 + 1);
+});
+await t('🚨 lease が POST の途中で切れて印が積まれた = complete の POST の後に読み直して違う → すぐに新しい世代の updating で complete を取り消す (❌ marker_pending・complete_revoked) → 次の回で入れて complete (#1567 Codex R2 High 2 b)', async () => {
+  const n0 = markerCount();
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f, hooks: { beforeCompletePost: (dbx) => {
+    // lease が切れた (放された) 状態を作る → 積める
+    V.releaseCoverageLease(dbx, { runToken: V.readLease(dbx).run_token });
+    assert.equal(remark({ isAlive: () => true }).queued, true, 'lease が切れていれば積める');
+  } } });
+  assert.equal(f.calls.complete, 1, 'complete は送った (Render は SQLite の lease を知らない)');
+  assert.equal(f.calls.updating, 2, '回の始めの updating + 取り消しの updating');
+  assert.equal(r.exitCode, 1, r.summary);
+  assert.ok(codes(r).includes('marker_pending') && codes(r).includes('complete_revoked'), codes(r).join(','));
+  assert.match(r.summary, /^❌ .*complete を取り消した/);
+  const c = await cov();
+  assert.deepEqual([c.state, c.g], ['updating', String(r.generation + 1)], '新しい世代の updating = 古い印の complete を取り消した');
+  assert.equal((await covState()).complete_to, null);
+  assert.equal(ledgerMeta('coverage_generation'), String(r.generation + 1), '取り消しの世代は HTTP の前に台帳へ');
+  assert.equal(markerCount(), n0, '印はまだ入れていない (次の回が updating の後に入れる)');
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.generation, r.generation + 2);
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+  assert.equal(markerCount(), n0 + 1);
+});
+await t('🚨 coordinator を通らない単独の送り手 (token の無い chunk が受領記録を変える) = Render は complete を無効にする', async () => {
+  const r0 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r0.exitCode, 0, r0.summary); assert.equal((await cov()).state, 'complete');
+  // 台帳の指紋を 1 つ消して (変わった注文として) 単独で送る = token なし
+  const L1 = openLedger(tmpDir, { kind: FINANCE_KIND });
+  const w = new Database(path.join(tmpDir, 'warehouse.db'), { readonly: true });
+  try {
+    await pg.query(`update core.order_finance_receipts set set_checksum = 'x' where mall_order_no = 'O-D'`);   // Render の受領記録をずらす (送り直すと applied = 受領記録が変わる)
+    L1.db.prepare(`update sent set fp = 'x' where kind = ? and key like '%O-D'`).run(FINANCE_KIND);
+    const r = await pushAmazonFinance({ warehouse: w, ledger: L1, base: BASE, syncKey: 'k', mode: 'range', from: '2026-03-01', to: '2026-03-01', log: () => {}, sleep: async () => {}, capacity: BIG });
+    assert.ok(r.applied >= 1, `applied ${r.applied}`);
+    // 🆕 #1567 Codex R6 Medium 1: 受け口の coverage_invalidated を捨てない = 要約は少なくとも ⚠️・切り替え済みの環境の CLI は ❌ exit 1
+    const { summarizeFinance, financeCliOutcome } = await import('../apps/company-db/push/amazon-finance.mjs');
+    assert.ok(r.coverageInvalidated >= 1, `coverage_invalidated ${r.coverageInvalidated}`);
+    assert.ok(r.ok, '送信そのものは成功');
+    assert.match(summarizeFinance(r), /^⚠️ .*決済のそろい \(complete\) を \d+ 件無効にした/);
+    const o0 = financeCliOutcome(r, { switched: false }), o1 = financeCliOutcome(r, { switched: true });
+    assert.deepEqual([o0.exitCode, o0.summary.slice(0, 2)], [0, '⚠️']);
+    assert.equal(o1.exitCode, 1); assert.match(o1.summary, /^❌ .*切り替え済みの環境で complete を無効にした/);
+    assert.equal(financeCliOutcome({ ...r, coverageInvalidated: 0 }, { switched: true }).exitCode, 0, '無効にしていなければ切り替え済みでも ❌ にしない');
+  } finally { w.close(); L1.close(); }
+  const c = await cov();
+  assert.deepEqual([c.state, c.invalidated_reason], ['updating', 'untokened_finance_write']);
+  assert.equal((await covState()).complete_to, null);
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, r2.summary); assert.equal((await cov()).state, 'complete', '次の coordinator の回 (新しい世代) で complete に戻る');
+});
+await t('🚨 取込の一覧にだけあって証拠の一覧 (固定の窓) に無い report = その決済で frontier を延ばさない = complete にしない (❌ not_in_inventory) → 次の回の一覧に出れば complete / 取込の一覧の createdUntil = 証拠の一覧の窓の終わり (#1567 Codex R3 High 1)', async () => {
+  const P7 = ['2026-03-16T10:00:00Z', '2026-03-17T10:00:00Z'];
+  DOCS.D7 = settlementTsv('S7', ...P7, [{ kind: 'order', order: 'O-F', sku: 'SKU-F', yen: 70, day: '2026-03-16T12:00:00Z' }]);
+  SP.ing = [...SP.ing, rep('R7', 'DONE', 'D7', P7, '2026-03-20T23:59:00Z')];   // 回の開始の後に作られた = 証拠の一覧 (SP.inv) には無い
+  SP.ingQueries = [];
+  try {
+    const f = spyFetch();
+    const r = await run({ fetchImpl: f });
+    assert.ok(V.selectedVersionOf(db, 'S7'), '前提: S7 は取り込まれて採った版がある (作り物の SP-API は createdUntil を無視して返す)');
+    assert.equal(r.exitCode, 1, r.summary); assert.ok(codes(r).includes('not_in_inventory'), codes(r).join(','));
+    assert.equal(f.calls.complete, 0); assert.equal((await cov()).state, 'updating');
+    const d = r.push.scanSnapshot.diag;
+    assert.deepEqual([d.settlementsThrough, d.frontierAll], ['2026-03-16T10:00:00Z', P7[1]], 'frontier は裏付けのある S5 の end で止まる (S7 を入れると 3/17)');
+    // (b) 取込の一覧の要求の窓 = 証拠の一覧の窓 (始まりも終わりも同じ固定の窓・#1567 Codex R4)
+    const inv = db.prepare(`SELECT query_created_since s, query_created_until u FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get();
+    assert.deepEqual(SP.ingQueries.map((q) => [q.createdSince, q.createdUntil]), [[inv.s, inv.u]], '取込の一覧も証拠の一覧と同じ固定の窓 (85 日前 〜 回の開始)');
+    SP.inv = SP.ing;   // 次の回の一覧に出た
+    const r2 = await run({ fetchImpl: spyFetch() });
+    assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`);
+    assert.deepEqual([(await cov()).state, (await cov()).complete_to], ['complete', '2026-03-16'], 'S7 まで complete (end 3/17 19:00 JST の前日)');
+  } finally { SP.ingQueries = null; }
+});
+await t('🚨 裏付けの無い決済が裏付けのある決済の内側に収まる (frontier は変わらない) = それでも complete にしない (❌ not_in_inventory・今回の窓の中 = API の食い違い待ち = retry) → 一覧に出れば complete (#1567 Codex R4 High・Medium 1)', async () => {
+  const P8 = ['2026-02-01T10:00:00Z', '2026-02-05T10:00:00Z'];   // S2 [1/26, 2/9) の内側
+  DOCS.D8 = settlementTsv('S8', ...P8, [{ kind: 'order', order: 'O-G', sku: 'SKU-G', yen: 60, day: '2026-02-02T01:00:00Z' }]);
+  SP.ing = [...SP.ing, rep('R8', 'DONE', 'D8', P8, '2026-02-06T00:00:00Z')];   // 取込の一覧にだけ居る (同じ窓の 2 つの要求の食い違い)
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f });
+  assert.ok(V.selectedVersionOf(db, 'S8'), '前提: S8 は取り込まれて採った版がある');
+  const d = r.push.scanSnapshot.diag;
+  assert.equal(d.settlementsThrough, d.frontierAll, `前提: 区間を延ばさない = 2 つの frontier は同じ (前の守りだけだと通った) (${d.settlementsThrough})`);
+  assert.equal(r.exitCode, 1, r.summary); assert.deepEqual(codes(r).filter((c) => c.startsWith('not_in_inventory')), ['not_in_inventory'], codes(r).join(','));
+  assert.ok(r.reasons.find((x) => x.code === 'not_in_inventory').detail.includes('S8'), JSON.stringify(r.reasons));
+  assert.equal(f.calls.complete, 0); assert.equal((await cov()).state, 'updating');
+  SP.inv = SP.ing;   // 次の回の一覧に出た
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+});
+await t('🚨 86〜90 日前に作られた report の決済 (前の版の取込が Amazon の既定の 90 日の窓で入れた・一覧の鎖にも印にも無い) = 区間の内側でも complete にしない (⚠️ not_in_inventory_outside_window = 人が印を作り直す・retry しない = exit 0) (#1567 Codex R4 High・Medium 1)', async () => {
+  const NOW0 = NOW;
+  NOW = Date.parse('2026-04-10T00:00:00Z');   // 窓 = 2026-01-15 〜 4/10
+  const P6 = ['2026-01-05T10:00:00Z', '2026-01-09T10:00:00Z'];   // S0 [12/29, 1/12) の内側・end は窓の始まりより前
+  DOCS.D6 = settlementTsv('S6', ...P6, [{ kind: 'order', order: 'O-H', sku: 'SKU-H', yen: 30, day: '2026-01-06T01:00:00Z' }]);
+  const R6 = rep('R6', 'DONE', 'D6', P6, '2026-01-12T00:00:00Z');   // 88 日前に作られた = 85 日の窓の外 (Amazon の既定の 90 日の窓の中)
+  const ingQ = [];
+  try {
+    SP.ing = [...SP.ing, R6]; SP.ingQueries = ingQ;   // 作り物は窓を見ない = 前の版のコード (日時の境なし) が取り込んだ場面
+    const f = spyFetch();
+    const r = await run({ fetchImpl: f });
+    assert.ok(V.selectedVersionOf(db, 'S6'), '前提: S6 は取り込まれて採った版がある');
+    assert.equal(ingQ.at(-1).createdSince, '2026-01-15T00:01:00Z', `前提: 今の取込の一覧の窓は 85 日 (本物の Amazon なら R6 は返らない) (${ingQ.at(-1).createdSince})`);
+    assert.equal(r.exitCode, 0, `${r.summary} ${JSON.stringify(r.reasons)}`);
+    assert.deepEqual(codes(r).filter((c) => c.startsWith('not_in_inventory')), ['not_in_inventory_outside_window'], codes(r).join(','));
+    assert.ok(r.reasons.find((x) => x.code === 'not_in_inventory_outside_window').human, '人が直す理由 (⚠️)');
+    assert.match(r.summary, /^⚠️/);
+    assert.equal(f.calls.complete, 0); assert.equal((await cov()).state, 'updating');
+    // 後片付け (試験だけ): 一覧に出たことにする = 裏付けあり → complete
+    SP.inv = SP.ing;
+    const r2 = await run({ fetchImpl: spyFetch() });
+    assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`); assert.equal((await cov()).state, 'complete');
+  } finally { SP.ingQueries = null; NOW = NOW0; }
+});
+await t('🚨 一方向のスイッチ (#1567 Codex R6 High): (a) 手の実 --full が通った (complete) → .env にまだ足していない / (b) 足した後に消えた = 今までの取込は生の表を書く前・SP-API を呼ぶ前に ❌・今までの送り手は送る前に ❌・Render の complete は古くならない・retry は 2 工程に読み替えず coordinator も走らせない', async () => {
+  const { runLegacyFetch } = await import('../apps/warehouse/fetch-amazon-settlements.js');
+  const SW = await import('../apps/warehouse/finance-coordinator-switch.js');
+  const { runRetryRound, renameRetryJobs: rename } = await import('../apps/warehouse/retry-failed-jobs.js');
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+  const saved = process.env.CDB_FINANCE_COORDINATOR;
+  const dl = [];
+  const legacy = () => runLegacyFetch({ reportId: null, dryRun: false, source: 'v2' }, { db, dataDir: tmpDir, sp, inventorySp: sp, runId: `legacy-${NOW}`,
+    downloadTsv: async (id) => { dl.push(id); return downloadTsv(id); }, now: () => new Date(NOW), isAlive: () => false, remote: { base: BASE, syncKey: 'k' } });
+  const envOff = { ...process.env, DATA_DIR: tmpDir, RENDER_MIRROR_URL: 'https://127.0.0.1:9/none', RENDER_PORTAL_URL: '', MIRROR_SYNC_KEY: 'k', CDB_DB_LIMIT_BYTES: '1000000000000' };
+  delete envOff.CDB_FINANCE_COORDINATOR;
+  const receipts = async () => one(`select count(*)::int n, coalesce(string_agg(mall_order_no || ':' || set_checksum, ',' order by mall_order_no), '') s from core.order_finance_receipts`);
+  try {
+    // (a) 手の実 --full (coordinator は env に依らず手で流せる) が通った → env をまだ足していない
+    delete process.env.CDB_FINANCE_COORDINATOR;
+    const r0 = await run({ fetchImpl: spyFetch() });
+    assert.equal(r0.exitCode, 0, r0.summary); assert.equal((await cov()).state, 'complete');
+    assert.equal(SW.financeCoordinatorEnabled(), false); assert.equal(SW.coverageEverRanAt(tmpDir), true, '一度 coordinator が coverage の回で回った = 切り替え済み');
+    const P10 = ['2026-03-17T10:00:00Z', '2026-03-18T10:00:00Z'];
+    DOCS.D10 = settlementTsv('S10', ...P10, [{ kind: 'order', order: 'O-J', sku: 'SKU-J', yen: 90, day: '2026-03-17T12:00:00Z' }]);
+    SP.ing = [...SP.ing, rep('R10', 'DONE', 'D10', P10, '2026-03-19T00:00:00Z')];   // 新しい report = 今までの取込が書けば生の表が変わる
+    const before = { raw: rawCounts(), cov: await cov(), rec: await receipts() };
+    await assert.rejects(legacy, (e) => e.code === 'FINANCE_SWITCHED_BACK' && /今までの書く取込/.test(e.message) && /CDB_FINANCE_COORDINATOR/.test(e.message));
+    assert.deepEqual(rawCounts(), before.raw, '生の表は変わらない'); assert.equal(dl.length, 0, 'SP-API のダウンロードもしない');
+    assert.ok(V.readLease(db).released_at, 'lease は放した (次の回を止めない)');
+    const cli = spawnSync(process.execPath, ['apps/company-db/push/amazon-finance.mjs', '--incremental', '--require-backfilled'], { cwd: repoRoot, env: envOff, encoding: 'utf8' });
+    assert.equal(cli.status, 1, cli.stdout + cli.stderr); assert.match(cli.stdout + cli.stderr, /coordinator に切り替え済み[\s\S]*今までの送り手/);
+    assert.deepEqual(await cov(), before.cov, 'Render の complete はそのまま (生の表も受領記録も変わっていない = 古くならない)');
+    assert.deepEqual(await receipts(), before.rec, 'token の無い chunk を送らない');
+    // retry: 切り替え済み (か分からない) なら coordinator → 2 工程に読み替えない・スイッチが無ければ coordinator の工程も走らせない
+    assert.deepEqual(rename(['Amazon決済と財務'], { coordinator: false, switched: SW.coverageEverRanAt(tmpDir) }), ['Amazon決済と財務']);
+    assert.deepEqual(rename(['Amazon決済と財務'], { coordinator: false, switched: null }), ['Amazon決済と財務'], '分からない = 読み替えない');
+    const ran = [];
+    const rr = runRetryRound(['Amazon決済と財務'], { run: (...x) => { ran.push(x); return { success: true, summary: '✅' }; }, log: () => {} });
+    assert.equal(ran.length, 0, '勝手に coordinator を起動しない'); assert.match(rr[0].summary, /^❌ CDB_FINANCE_COORDINATOR が無い/); assert.equal(rr[0].success, false);
+    // (b) 足した後 (env = 1) に coordinator が回る → env が消えた = 同じく ❌
+    process.env.CDB_FINANCE_COORDINATOR = '1';
+    SP.inv = SP.ing;   // R10 も一覧に出た
+    const r1 = await run({ fetchImpl: spyFetch() });
+    assert.equal(r1.exitCode, 0, `${r1.summary} ${JSON.stringify(r1.reasons)}`); assert.equal((await cov()).state, 'complete');
+    delete process.env.CDB_FINANCE_COORDINATOR;
+    const before2 = { raw: rawCounts(), cov: await cov() };
+    await assert.rejects(legacy, (e) => e.code === 'FINANCE_SWITCHED_BACK');
+    assert.deepEqual(rawCounts(), before2.raw); assert.deepEqual(await cov(), before2.cov);
+    const cli2 = spawnSync(process.execPath, ['apps/company-db/push/amazon-finance.mjs', '--full', '--require-backfilled'], { cwd: repoRoot, env: envOff, encoding: 'utf8' });
+    assert.equal(cli2.status, 1, cli2.stdout + cli2.stderr); assert.match(cli2.stdout + cli2.stderr, /coordinator に切り替え済み/);
+    assert.deepEqual(await cov(), before2.cov);
+  } finally { if (saved === undefined) delete process.env.CDB_FINANCE_COORDINATOR; else process.env.CDB_FINANCE_COORDINATOR = saved; }
+});
+await t('🚨 Render の証拠 (#1567 Codex R7 High 1・2): ローカルの台帳・warehouse.db が無い (新しい DATA_DIR) / 切り替えの前のバックアップに戻した、でも Render に coverage の行があれば今までの取込・単独の --from/--to は ❌ (生の表・Render・受領記録は変わらない) / Render を読めない (網の失敗・404・401・409・5xx・形が違う・JSON でない・送り先が無い) = 判定できない = ❌', async () => {
+  const { runLegacyFetch } = await import('../apps/warehouse/fetch-amazon-settlements.js');
+  const SW = await import('../apps/warehouse/finance-coordinator-switch.js');
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+  const receipts = async () => one(`select count(*)::int n, coalesce(string_agg(mall_order_no || ':' || set_checksum, ',' order by mall_order_no), '') s from core.order_finance_receipts`);
+  const rawOf = (d) => d.prepare(`SELECT (SELECT COUNT(*) FROM raw_amazon_settlement_lines) l, (SELECT COUNT(*) FROM raw_amazon_settlement_headers) h, (SELECT COUNT(*) FROM amazon_settlement_document_versions) v`).get();
+  const W = { reportId: null, dryRun: false, source: 'v2' };
+  assert.ok((await cov()) && (await cov()).g, '前提: Render に coverage の行がある (coordinator が回った)');
+  assert.equal(SW.COVERAGE_STATUS_PATH, STATUS_PATH, '状態の口は coordinator と同じ');
+  const setup = (name, { warehouse, ledger }) => {
+    const d = path.join(tmpDir, `r7-${name}`); fs.mkdirSync(d);
+    fs.copyFileSync(warehouse, path.join(d, 'warehouse.db'));
+    if (ledger) fs.copyFileSync(ledger, path.join(d, 'company-db-push.db'));
+    return d;
+  };
+  const cli = (d, args) => {
+    const env = { ...process.env, DATA_DIR: d, RENDER_MIRROR_URL: 'https://127.0.0.1:9/none', RENDER_PORTAL_URL: '', MIRROR_SYNC_KEY: 'k', CDB_DB_LIMIT_BYTES: '1000000000000' };
+    delete env.CDB_FINANCE_COORDINATOR;
+    const r = spawnSync(process.execPath, ['apps/company-db/push/amazon-finance.mjs', ...args], { cwd: repoRoot, env, encoding: 'utf8' });
+    return { code: r.status, out: String(r.stdout || '') + String(r.stderr || '') };
+  };
+  // (1) ローカルに証拠が無い DB (新しい DATA_DIR = initDB が作る空の DB・台帳なし / 切り替えの前のバックアップ = 取込だけの回の後の DB と台帳) + Render に行がある = ❌
+  for (const [name, files] of [['no-local-evidence', { warehouse: SNAP_EMPTY }], ['pre-switch-backup', { warehouse: SNAP_PRE, ledger: SNAP_PRE_LEDGER }]]) {
+    const d = setup(name, files);
+    const db2 = new Database(path.join(d, 'warehouse.db'));
+    try {
+      assert.equal(SW.coverageEverRan(db2, SW.ledgerMetaReader(d)), false, `${name}: ローカルには証拠が無い`);
+      const raw0 = rawOf(db2), cov0 = await cov(), rec0 = await receipts(), dl = [];
+      await assert.rejects(() => runLegacyFetch(W, { db: db2, dataDir: d, sp, inventorySp: sp, runId: `r7-${name}`, downloadTsv: async (id) => { dl.push(id); return downloadTsv(id); },
+        now: () => new Date(NOW), isAlive: () => false, remote: { base: BASE, syncKey: 'k' } }), (e) => e.code === 'FINANCE_SWITCHED_BACK' && /Render の決済のそろい/.test(e.message), name);
+      assert.deepEqual(rawOf(db2), raw0, `${name}: 生の表は変わらない`); assert.equal(dl.length, 0, `${name}: SP-API のダウンロードもしない`);
+      assert.ok(db2.prepare(`SELECT released_at FROM amazon_finance_coverage_lease WHERE id = 1`).get().released_at, `${name}: lease は放した`);
+      const g = await SW.legacyGateCheck({ dataDir: d, base: BASE, syncKey: 'k' });
+      assert.deepEqual([g.allowed, g.code], [false, 'FINANCE_SWITCHED_BACK'], `${name}: daily-sync・retry の門も ❌`);
+      // 単独の --from/--to の送信の門 (Codex R7 High 2) も同じ = 送る前に ❌ (CLI の門と同じ関数)
+      await assert.rejects(() => SW.assertLegacyAllowedRemote(db2, SW.ledgerMetaReader(d), '単独の --from/--to の送信', { base: BASE, syncKey: 'k' }), (e) => e.code === 'FINANCE_SWITCHED_BACK');
+      assert.deepEqual(await cov(), cov0, `${name}: Render は変わらない`); assert.deepEqual(await receipts(), rec0, `${name}: 受領記録は変わらない`);
+    } finally { db2.close(); }
+  }
+  // (2) Render を読めない = 判定できない = ❌ (切り替えの前のバックアップ = ローカルに証拠が無いのに)
+  const d = path.join(tmpDir, 'r7-pre-switch-backup');
+  const db2 = new Database(path.join(d, 'warehouse.db'));
+  try {
+    const bad = [
+      ['網の失敗', async () => { throw new Error('ECONNREFUSED (作り物)'); }],
+      ['404', async () => new Response('not found', { status: 404 })],
+      ['401', async () => new Response('{"error":"unauthorized"}', { status: 401 })],
+      ['409 not_migrated', async () => new Response('{"error":"not_migrated"}', { status: 409 })],
+      ['503 が続く', async () => new Response('busy', { status: 503 })],
+      ['形が違う', async () => new Response('{"ok":true}', { status: 200 })],
+      ['世代の無い行', async () => new Response('{"coverage":{"state":"complete"}}', { status: 200 })],
+      ['JSON でない', async () => new Response('<html>', { status: 200 })],
+    ];
+    for (const [why, f] of bad) {
+      const raw0 = rawOf(db2);
+      await assert.rejects(() => runLegacyFetch(W, { db: db2, dataDir: d, sp, inventorySp: sp, runId: `r7-bad-${why}`, downloadTsv, now: () => new Date(NOW), isAlive: () => false,
+        remote: { fetchImpl: f, base: BASE, syncKey: 'k', sleep: async () => {} } }), (e) => e.code === 'FINANCE_SWITCH_UNKNOWN' && /判定できない/.test(e.message), why);
+      assert.deepEqual(rawOf(db2), raw0, `${why}: 生の表は変わらない`);
+      const g = await SW.legacyGateCheck({ dataDir: d, fetchImpl: f, base: BASE, syncKey: 'k', sleep: async () => {} });
+      assert.deepEqual([g.allowed, g.code], [false, 'FINANCE_SWITCH_UNKNOWN'], why);
+    }
+    await assert.rejects(() => SW.renderCoverageEverRan({ env: {} }), /送り先/, '送り先・鍵が無い = 判定できない');
+    let n = 0;
+    await assert.rejects(() => SW.renderCoverageEverRan({ fetchImpl: async () => { n++; return new Response('x', { status: 503 }); }, base: BASE, syncKey: 'k', sleep: async () => {} }));
+    assert.equal(n, 3, '5xx は 3 回まで読み直す');
+    n = 0;
+    await assert.rejects(() => SW.renderCoverageEverRan({ fetchImpl: async () => { n++; return new Response('x', { status: 404 }); }, base: BASE, syncKey: 'k', sleep: async () => {} }));
+    assert.equal(n, 1, '4xx は読み直さない');
+  } finally { db2.close(); }
+  // (3) 単独の --from/--to の CLI: 切り替え済み (ローカル) = 送る前に ❌ / ローカルに証拠が無くても Render を読めない = 送る前に ❌ (どちらも Render・受領記録は変わらない)
+  const cov1 = await cov(), rec1 = await receipts();
+  const c1 = cli(tmpDir, ['--from', '2026-03-01', '--to', '2026-03-01']);
+  assert.equal(c1.code, 1, c1.out); assert.match(c1.out, /coordinator に切り替え済み[\s\S]*単独の --from\/--to の送信/);
+  const c2 = cli(d, ['--from', '2026-03-01', '--to', '2026-03-01']);
+  assert.equal(c2.code, 1, c2.out); assert.match(c2.out, /判定できない[\s\S]*単独の --from\/--to の送信/);
+  assert.deepEqual(await cov(), cov1); assert.deepEqual(await receipts(), rec1);
+});
+await t('🚨 失敗した順番待ち (#1567 Codex R9 High): 初期の印の norm_json の破損・digest の不一致 / 手のファイルの保管物が無い・hash が違う = complete を出し直さない (POST 0・Render は updating のまま・⚠️ 人が直す)・次の回でも止まり続ける → 新しい印が入る・解決の印・保管物を直す で complete に戻れる', async () => {
+  const { resolveFailedMarker, runMarkerCli: markerCli, parseArgs: markerArgs } = await import('../apps/warehouse/amazon-finance-initial-marker.js');
+  const { resolveManualFile } = await import('../apps/warehouse/amazon-settlement-manual-file.js');
+  const r0 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r0.exitCode, 0, `${r0.summary} ${JSON.stringify(r0.reasons)}`); assert.equal((await cov()).state, 'complete', '前提: complete');
+  /** 2 回続けて回す = どちらも complete を送らない・Render は updating のまま (失敗した回を忘れない) */
+  const blocked = async (code, label) => {
+    for (let i = 1; i <= 2; i++) {
+      const fx = spyFetch();
+      const r = await run({ fetchImpl: fx });
+      assert.equal(fx.calls.complete, 0, `${label} ${i} 回目: complete を送らない`);
+      assert.ok(codes(r).includes(code), `${label} ${i} 回目: ${codes(r).join(',')}`);
+      assert.equal(r.exitCode, 0, `${label} ${i} 回目: 人が直す理由だけ = exit 0 (${r.summary})`); assert.match(r.summary, /^⚠️/);
+      assert.ok(r.reasons.find((x) => x.code === code).human, `${label}: 人が直す理由 (⚠️)`);
+      assert.equal((await cov()).state, 'updating', `${label} ${i} 回目: Render は updating のまま`); assert.equal((await covState()).complete_to, null);
+    }
+  };
+  const completes = async (label) => {
+    const fx = spyFetch();
+    const r = await run({ fetchImpl: fx });
+    assert.equal(r.exitCode, 0, `${label}: ${r.summary} ${JSON.stringify(r.reasons)}`);
+    assert.ok(!codes(r).some((c) => c === 'marker_queue_failed' || c === 'manual_file_not_ingested'), codes(r).join(','));
+    assert.equal(fx.calls.complete, 1, `${label}: complete を送る`); assert.equal((await cov()).state, 'complete');
+  };
+  // (1) 初期の印の norm_json の破損 → 入れない (failed_at) → 止まる・止まり続ける
+  const q1 = remark();
+  db.prepare(`UPDATE initial_marker_queue SET norm_json = '{壊れた' WHERE id = ?`).run(q1.queueId);
+  await blocked('marker_queue_failed', '印の norm_json の破損');
+  assert.ok(db.prepare(`SELECT failed_at FROM initial_marker_queue WHERE id = ?`).get(q1.queueId).failed_at, '失敗の印が残る');
+  //   対照: 印を作り直して積む = より新しい印が入る = 外れる → complete
+  remark();
+  await completes('新しい印が入った');
+  // (2) 初期の印の digest の不一致 → 止まる・止まり続ける → 解決の印 (CLI と同じ関数) で外れる
+  const q2 = remark();
+  db.prepare(`UPDATE initial_marker_queue SET detail_digest = 'x' WHERE id = ?`).run(q2.queueId);
+  await blocked('marker_queue_failed', '印の digest の不一致');
+  assert.throws(() => resolveFailedMarker(db, q2.queueId, { note: ' ', isAlive: () => false }), /理由/);
+  assert.throws(() => markerArgs(['--resolve-failed', 'x']), /番号/);
+  markerCli(db, markerArgs(['--resolve-failed', String(q2.queueId), '--note', '試験: 作り直さずに諦める']), { log: () => {}, now: new Date(NOW), isAlive: () => false });
+  assert.ok(db.prepare(`SELECT resolved_at FROM initial_marker_queue WHERE id = ?`).get(q2.queueId).resolved_at);
+  assert.throws(() => resolveFailedMarker(db, q2.queueId, { note: 'もう一度', isAlive: () => false }), /解決済み/);
+  await completes('印に解決の印');
+  // 手のファイル = S2 (API の版がある決済 = 入っても採られない) の V2 を、振込日だけ変えて別のファイル (別の hash) にする
+  const s2tsv = (deposit) => {
+    const lines = settlementTsv('S2', ...P.S2, L.S2).split('\n');
+    const cols = lines[0].split('\t'), cells = lines[1].split('\t');
+    cells[cols.indexOf('deposit-date')] = deposit;
+    lines[1] = cells.join('\t');
+    return lines.join('\n');
+  };
+  const idOf = (q) => db.prepare(`SELECT id FROM amazon_settlement_manual_files WHERE file_hash = ?`).get(q.fileHash).id;
+  // (3) 手のファイルの保管物が無い → 止まる・止まり続ける → 解決の印で外れる (次の回から取り込まない)
+  const m1 = queueManualFile(db, tmpDir, s2tsv('2026/02/10 10:00:00 UTC'), { fileName: 'r9-missing.txt', now: new Date(NOW), isAlive: () => false });
+  fs.rmSync(m1.storedPath);
+  await blocked('manual_file_not_ingested', '手のファイルの保管物が無い');
+  assert.throws(() => resolveManualFile(db, idOf(m1), { note: '', isAlive: () => false }), /理由/);
+  resolveManualFile(db, idOf(m1), { note: '試験: 保管物を失くした・諦める', isAlive: () => false });
+  await completes('手のファイルに解決の印');
+  assert.equal(db.prepare(`SELECT ingested_at FROM amazon_settlement_manual_files WHERE id = ?`).get(idOf(m1)).ingested_at, null, '解決の印の付いたファイルは取り込まない');
+  // (4) 手のファイルの hash が積んだときと違う (保管物が書き換わった) → 止まる・止まり続ける → 保管物を元に戻すと次の回で入る → complete
+  const good = s2tsv('2026/02/11 10:00:00 UTC');
+  const m2 = queueManualFile(db, tmpDir, good, { fileName: 'r9-hash.txt', now: new Date(NOW), isAlive: () => false });
+  fs.writeFileSync(m2.storedPath, s2tsv('2026/02/12 10:00:00 UTC'));
+  await blocked('manual_file_not_ingested', '手のファイルの hash の不一致');
+  assert.match(db.prepare(`SELECT ingest_note FROM amazon_settlement_manual_files WHERE id = ?`).get(idOf(m2)).ingest_note, /hash が積んだときと違う/);
+  fs.writeFileSync(m2.storedPath, good.replace(/^\uFEFF/, ''));
+  await completes('保管物を直して入った');
+  assert.ok(db.prepare(`SELECT ingested_at FROM amazon_settlement_manual_files WHERE id = ?`).get(idOf(m2)).ingested_at, '直した保管物は入る');
+});
+await t('🆕 失敗した順番待ちの残りの場面 (#1567 Codex R10・R11 Low 1): (a) 古い失敗の手のファイルは、同じ決済の後から積んだ正常なファイルが入れば外れる (前に入ったファイル・別の決済のファイルでは外れない・古い行は残る) / (b) 生きた coordinator の lease の間は --resolve / --resolve-failed を拒む (関数・CLI の子とも・印は付かない) → lease の後は付けられる / (c) R9 より前の表 = 解決の列が足され、既存の失敗の行は blocker のまま (列が無い間も止まる)', async () => {
+  const { resolveFailedMarker, runMarkerCli: markerCli, parseArgs: markerArgs } = await import('../apps/warehouse/amazon-finance-initial-marker.js');
+  const { resolveManualFile } = await import('../apps/warehouse/amazon-settlement-manual-file.js');
+  const { queueProblems } = await import('../apps/warehouse/amazon-finance-coverage.js');
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+  const r0 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r0.exitCode, 0, `${r0.summary} ${JSON.stringify(r0.reasons)}`); assert.equal((await cov()).state, 'complete', '前提: complete');
+  // 振込日だけ変えた別のファイル (別の hash)。S2・S3 は API の版がある決済 = 手のファイルが入っても採られない (値は変わらない)
+  const vtsv = (sid, deposit) => {
+    const lines = settlementTsv(sid, ...P[sid], L[sid]).split('\n');
+    const cols = lines[0].split('\t'), cells = lines[1].split('\t');
+    cells[cols.indexOf('deposit-date')] = deposit;
+    lines[1] = cells.join('\t');
+    return lines.join('\n');
+  };
+  const qf = (sid, deposit, name) => queueManualFile(db, tmpDir, vtsv(sid, deposit), { fileName: name, now: new Date(NOW), isAlive: () => false });
+  const idOf = (q) => db.prepare(`SELECT id FROM amazon_settlement_manual_files WHERE file_hash = ?`).get(q.fileHash).id;
+  const mrow = (id) => db.prepare(`SELECT ingested_at, resolved_at FROM amazon_settlement_manual_files WHERE id = ?`).get(id);
+  const mkrow = (id) => db.prepare(`SELECT failed_at, resolved_at FROM initial_marker_queue WHERE id = ?`).get(id);
+  const once = async () => { const fx = spyFetch(); const r = await run({ fetchImpl: fx }); return { r, fx, c: codes(r) }; };
+
+  // ── (a) 古い失敗の手のファイル → 同じ決済の後から積んだ正常なファイルが入れば外れる ──
+  const prevS2 = db.prepare(`SELECT MAX(id) m FROM amazon_settlement_manual_files WHERE settlement_id = 'S2' AND ingested_at IS NOT NULL`).get().m;
+  assert.ok(prevS2, '前提: S2 には前に入った手のファイルがある (R9 の試験)');
+  const old = qf('S2', '2026/02/13 10:00:00 UTC', 'r10-old-failed.txt');
+  fs.rmSync(old.storedPath);   // 保管物を失くした = 取り込めない
+  let x = await once();
+  assert.ok(x.c.includes('manual_file_not_ingested') && x.fx.calls.complete === 0, `前に入った同じ決済のファイル (#${prevS2}) では外れない: ${x.c}`);
+  const otherS3 = qf('S3', '2026/02/24 10:00:00 UTC', 'r10-other-settlement.txt');
+  x = await once();
+  assert.ok(mrow(idOf(otherS3)).ingested_at, '別の決済 (S3) の正常なファイルは入る');
+  assert.ok(x.c.includes('manual_file_not_ingested') && x.fx.calls.complete === 0, `別の決済のファイルが入っても外れない: ${x.c}`);
+  const fresh = qf('S2', '2026/02/14 10:00:00 UTC', 'r10-fresh.txt');
+  x = await once();
+  assert.equal(x.r.exitCode, 0, `${x.r.summary} ${JSON.stringify(x.r.reasons)}`);
+  assert.ok(!x.c.includes('manual_file_not_ingested'), x.c.join(','));
+  assert.equal(x.fx.calls.complete, 1, '同じ決済の後のファイルが入った = complete'); assert.equal((await cov()).state, 'complete');
+  assert.ok(mrow(idOf(fresh)).ingested_at);
+  assert.deepEqual(mrow(idOf(old)), { ingested_at: null, resolved_at: null }, '古い失敗の行は残る (入っていない・解決の印も無い) = 後のファイルで外れただけ');
+  assert.deepEqual(queueProblems(db), []);
+
+  // ── (b) 生きた coordinator の lease の間は解決の印を付けない ──
+  const bad = qf('S2', '2026/02/15 10:00:00 UTC', 'r10-lease.txt');
+  fs.rmSync(bad.storedPath);
+  const qm = remark();
+  db.prepare(`UPDATE initial_marker_queue SET detail_digest = 'x' WHERE id = ?`).run(qm.queueId);
+  x = await once();
+  assert.ok(x.c.includes('manual_file_not_ingested') && x.c.includes('marker_queue_failed') && x.fx.calls.complete === 0, x.c.join(','));
+  // lease を「生きている coordinator」= この試験の node (pid・今の本当の時刻) が持つ (CLI の子は本物の生きている判定 isAliveNodeSince で見る)
+  const held = V.acquireCoverageLease(db, { isAlive: () => false, pid: process.pid, now: new Date() });
+  assert.ok(held.ok, '前提: lease を取れた');
+  try {
+    assert.throws(() => resolveManualFile(db, idOf(bad), { note: '試験', isAlive: () => true }), /coordinator の回が動いている.*手の決済のファイルの解決の印を積まない/);
+    assert.throws(() => resolveFailedMarker(db, qm.queueId, { note: '試験', isAlive: () => true }), /coordinator の回が動いている.*初期の印の解決の印を積まない/);
+    assert.throws(() => markerCli(db, markerArgs(['--resolve-failed', String(qm.queueId), '--note', '試験']), { log: () => {}, now: new Date(NOW), isAlive: () => true }), /coordinator の回が動いている/);
+    const env = { ...process.env, DATA_DIR: tmpDir };
+    const c1 = spawnSync(process.execPath, ['apps/warehouse/amazon-settlement-manual-file.js', '--resolve', String(idOf(bad)), '--note', '試験 CLI'], { cwd: repoRoot, env, encoding: 'utf8' });
+    assert.notEqual(c1.status, 0, `手のファイルの CLI --resolve は拒む: ${c1.stdout}${c1.stderr}`); assert.match(c1.stdout + c1.stderr, /coordinator の回が動いている/);
+    const c2 = spawnSync(process.execPath, ['apps/warehouse/amazon-finance-initial-marker.js', '--resolve-failed', String(qm.queueId), '--note', '試験 CLI'], { cwd: repoRoot, env, encoding: 'utf8' });
+    assert.notEqual(c2.status, 0, `初期の印の CLI --resolve-failed は拒む: ${c2.stdout}${c2.stderr}`); assert.match(c2.stdout + c2.stderr, /coordinator の回が動いている/);
+    assert.equal(mrow(idOf(bad)).resolved_at, null, '手のファイルに解決の印は付いていない');
+    assert.equal(mkrow(qm.queueId).resolved_at, null, '初期の印に解決の印は付いていない');
+  } finally { assert.ok(V.releaseCoverageLease(db, held.lease), 'lease を放した'); }
+  //   lease を放した後は付けられる (CLI の子でも) → complete
+  const c3 = spawnSync(process.execPath, ['apps/warehouse/amazon-settlement-manual-file.js', '--resolve', String(idOf(bad)), '--note', '試験 CLI: lease の後'], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
+  assert.equal(c3.status, 0, c3.stdout + c3.stderr);
+  resolveFailedMarker(db, qm.queueId, { note: '試験: lease の後', isAlive: () => true });
+  assert.ok(mrow(idOf(bad)).resolved_at && mkrow(qm.queueId).resolved_at);
+  x = await once();
+  assert.equal(x.r.exitCode, 0, `${x.r.summary} ${JSON.stringify(x.r.reasons)}`); assert.equal(x.fx.calls.complete, 1); assert.equal((await cov()).state, 'complete');
+
+  // ── (c) R9 より前の表 (解決の列が無い) = 列が足された後も、既存の失敗の行は blocker のまま ──
+  const prePath = snapOf(db, 'pre-r9.db');
+  const o = new Database(prePath);
+  try {
+    o.exec(`DROP TABLE initial_marker_queue; DROP TABLE amazon_settlement_manual_files;`);
+    // R9 の前 (2f3066e6) の表の形 = resolved_at / resolve_note が無い
+    o.exec(`CREATE TABLE initial_marker_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, queue_key TEXT NOT NULL, source_file_name TEXT, source_file_hash TEXT NOT NULL, norm_json TEXT NOT NULL,
+        detail_digest TEXT NOT NULL, queued_at TEXT NOT NULL, applied_at TEXT, applied_generation INTEGER, marker_id TEXT, evidence_epoch INTEGER, failed_at TEXT, apply_note TEXT);
+      CREATE TABLE amazon_settlement_manual_files (id INTEGER PRIMARY KEY AUTOINCREMENT, file_hash TEXT NOT NULL UNIQUE, file_name TEXT, stored_path TEXT NOT NULL,
+        format TEXT NOT NULL CHECK (format IN ('v1', 'v2')), settlement_id TEXT NOT NULL, queued_at TEXT NOT NULL, ingested_at TEXT, ingest_generation INTEGER, ingest_note TEXT);`);
+    o.prepare(`INSERT INTO initial_marker_queue (queue_key, source_file_hash, norm_json, detail_digest, queued_at, failed_at, apply_note) VALUES ('qk-old', 'h-old', '{}', 'd', '2026-03-01T00:00:00Z', '2026-03-02T00:00:00Z', '試験: R9 の前に失敗した印')`).run();
+    o.prepare(`INSERT INTO amazon_settlement_manual_files (file_hash, file_name, stored_path, format, settlement_id, queued_at, ingest_note) VALUES ('fh-old', 'old.txt', 'C:/nowhere/old.txt', 'v2', 'S-OLD', '2026-03-01T00:00:00Z', '試験: R9 の前に取り込めなかった')`).run();
+    const cols = (tb) => o.prepare(`PRAGMA table_info(${tb})`).all().map((c) => c.name);
+    assert.ok(!cols('initial_marker_queue').includes('resolved_at') && !cols('amazon_settlement_manual_files').includes('resolved_at'), '前提: 解決の列が無い');
+    const qcodes = () => queueProblems(o).map((p) => p.code).sort();
+    assert.deepEqual(qcodes(), ['manual_file_not_ingested', 'marker_queue_failed'], '列が無い間も止まる');
+    V.createSettlementVersionSchema(o);   // R9 の後の initDB と同じ = 列を足す
+    for (const tb of ['initial_marker_queue', 'amazon_settlement_manual_files']) assert.ok(cols(tb).includes('resolved_at') && cols(tb).includes('resolve_note'), `${tb} に解決の列が足された`);
+    assert.deepEqual(o.prepare(`SELECT failed_at IS NOT NULL f, resolved_at FROM initial_marker_queue`).all(), [{ f: 1, resolved_at: null }], '既存の失敗の印は残る');
+    assert.deepEqual(o.prepare(`SELECT ingested_at, resolved_at FROM amazon_settlement_manual_files`).all(), [{ ingested_at: null, resolved_at: null }], '既存の取り込めない手のファイルは残る');
+    assert.deepEqual(qcodes(), ['manual_file_not_ingested', 'marker_queue_failed'], '列を足した後も blocker のまま (足しただけで外れない)');
+    V.createSettlementVersionSchema(o);   // 2 回目の準備でも変わらない (冪等)
+    assert.deepEqual(qcodes(), ['manual_file_not_ingested', 'marker_queue_failed']);
+    //   足した列で解決の印を付ければ外れる
+    resolveFailedMarker(o, o.prepare(`SELECT id FROM initial_marker_queue`).get().id, { note: '試験: R9 の前の失敗を諦める', isAlive: () => false });
+    assert.deepEqual(qcodes(), ['manual_file_not_ingested']);
+    resolveManualFile(o, o.prepare(`SELECT id FROM amazon_settlement_manual_files`).get().id, { note: '試験: R9 の前の失敗を諦める', isAlive: () => false });
+    assert.deepEqual(qcodes(), []);
+  } finally { o.close(); }
+});
+await t('🆕 古い V1 の版 → 中身の違う新しい V2 の版 (#1567 Codex R12 Low・Medium 1): V2 が採られる・coverage は imported (report_selected_differs にならない)・旧い版と新しい版の両方の注文が読み直す注文になり Company DB には採った V2 だけ (旧い版にだけある注文は墓石) / その後に退避の --source v1 で V1 を入れても有効な V2 の版のまま = V2 の運転で complete のまま', async () => {
+  const { V1_COLUMNS } = await import('../apps/warehouse/amazon-settlement-v2.js');
+  const { prepareReportTsv, ingestSettlement, runSettlementFetch } = await import('../apps/warehouse/fetch-amazon-settlements.js');
+  const saved = { ing: SP.ing, inv: SP.inv };
+  const P5 = ['2026-03-09T10:00:00Z', '2026-03-11T10:00:00Z'];
+  const tsvRow = (cols, o) => cols.map((c) => o[c] ?? '').join('\t');
+  const setTotal = (lines, cols, total) => { const c = lines[1].split('\t'); c[cols.indexOf('total-amount')] = total; lines[1] = c.join('\t'); };
+  // 旧い形の V1 (2026-01 までの Easy Ship = MFNPostageFee + MFNPostageFeeTax の 2 行) + V1 にだけある注文 O-R12OLD
+  const v1Lines = (await import('../apps/warehouse/amazon-settlement-v2.js')).convertV2TsvToV1Tsv(settlementTsv('S12R', ...P5, [
+    { kind: 'order', order: 'O-R12E', sku: 'SKU-E', yen: 400, day: '2026-03-10T01:00:00Z' }, { kind: 'order', order: 'O-R12OLD', sku: 'SKU-E', yen: 100, day: '2026-03-10T01:30:00Z' }])).tsv.trimEnd().split('\n');
+  setTotal(v1Lines, V1_COLUMNS, '335.00');
+  for (const [t, a] of [['MFNPostageFee', '-150.00'], ['MFNPostageFeeTax', '-15.00']]) v1Lines.push(tsvRow(V1_COLUMNS, { 'settlement-id': 'S12R', 'transaction-type': 'Amazon Easy Ship Charges', 'order-id': 'O-R12E', 'merchant-order-id': 'O-R12E',
+    'shipment-id': 'SH-O-R12E', 'marketplace-name': 'Amazon.co.jp', 'fulfillment-id': 'MFN', 'posted-date': '2026-03-10T02:00:00+00:00', 'item-related-fee-type': t, 'other-amount': a }));
+  const V1TSV = v1Lines.join('\n') + '\n';
+  // 新しい形の V2 (Easy Ship = Amazon Easy Ship Charges の本体 + 税 = 並べ直すと 1 行)・O-R12OLD は無い
+  const v2Lines = settlementTsv('S12R', ...P5, [{ kind: 'order', order: 'O-R12E', sku: 'SKU-E', yen: 400, day: '2026-03-10T01:00:00Z' }]).trimEnd().split('\n');
+  setTotal(v2Lines, V2_COLUMNS, '235.00');
+  for (const [d, a] of [['Base fee', '-150.00'], ['Tax on fee', '-15.00']]) v2Lines.push(tsvRow(V2_COLUMNS, { 'settlement-id': 'S12R', 'transaction-type': 'AmazonFees', 'order-id': 'O-R12E', 'merchant-order-id': 'O-R12E',
+    'shipment-id': 'SH-O-R12E', 'marketplace-name': 'Amazon.co.jp', 'fulfillment-id': 'MFN', 'posted-date': '2026/03/10', 'posted-date-time': '2026/03/10 02:00:00 UTC', 'amount-type': 'Amazon Easy Ship Charges', 'amount-description': d, amount: a }));
+  DOCS.D12R = v2Lines.join('\n') + '\n';
+  const versions = () => db.prepare(`SELECT seq, source_layer, ingested_at, detail_digest FROM amazon_settlement_document_versions WHERE settlement_id = 'S12R' ORDER BY seq`).all();
+  const selectedLayer = () => db.prepare(`SELECT source_layer FROM v_amazon_settlement_selected_documents WHERE settlement_id = 'S12R'`).get()?.source_layer;
+  const checksum = async (no) => (await one(`select set_checksum from core.order_finance_receipts where mall_order_no = $1`, [no]))?.set_checksum ?? null;
+  try {
+    // (0) 旧い V1 の版 (1 週間前) を入れて、一度送る (旧い版の注文が Company DB に入った状態 = 本番の 12222191753)
+    const p1 = prepareReportTsv(V1TSV, 'R12R-V1', 'run-r5-v1', { reportDocumentId: 'D12R-V1' });
+    ingestSettlement(db, p1.headerRow, p1.lineRows, p1.ctx, { now: () => new Date(NOW - 7 * 86400e3) });
+    await run({ fetchImpl: spyFetch() });   // この回は S12R の裏付けが無い (一覧に無い) = complete にならなくてよい・送る
+    assert.ok((await receipt('O-R12OLD'))?.lines > 0 && (await receipt('O-R12E'))?.lines > 0, '前提: 旧い V1 の版の注文が Company DB に入った');
+    const e1Old = await checksum('O-R12E');
+    // (1) 中身の違う V2 の report が一覧に出る → coordinator が版として入れる
+    SP.ing = [...SP.ing, rep('R12R', 'DONE', 'D12R', P5, '2026-03-12T00:00:00Z')]; SP.inv = SP.ing;
+    let dirtySeen = null;
+    const fx = spyFetch({ onChunk: () => { if (!dirtySeen) dirtySeen = db.prepare(`SELECT mall_order_no FROM amazon_settlement_dirty_orders`).all().map((x) => x.mall_order_no); } });
+    const r1 = await run({ fetchImpl: fx });
+    const vs = versions();
+    assert.deepEqual(vs.map((v) => v.source_layer), ['sp_api_v1', 'sp_api_v2'], '版は 2 つ (V1 も残る)');
+    assert.notEqual(vs[0].detail_digest, vs[1].detail_digest, '前提: V1 と V2 の中身 (detail_digest) が違う');
+    assert.ok(vs[1].ingested_at > vs[0].ingested_at, '前提: V2 の版の方が新しい');
+    assert.equal(selectedLayer(), 'sp_api_v2', 'V2 が採られる');
+    assert.equal(r1.exitCode, 0, `${r1.summary} ${JSON.stringify(r1.reasons)}`);
+    assert.ok(!codes(r1).includes('report_selected_differs'), codes(r1).join(','));
+    assert.equal(fx.calls.complete, 1); assert.equal((await cov()).state, 'complete');
+    assert.ok(dirtySeen && dirtySeen.includes('O-R12E') && dirtySeen.includes('O-R12OLD'), `旧い版と新しい版の両方の注文が読み直す注文 (${dirtySeen})`);
+    assert.equal((await receipt('O-R12OLD')).lines, 0, 'V2 にだけない注文 (旧い版にだけある) = Company DB では墓石');
+    const e1New = await checksum('O-R12E');
+    assert.notEqual(e1New, e1Old, 'O-R12E は採った V2 の中身で送り直した (Easy Ship の形が違う)');
+    assert.equal(db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_dirty_orders WHERE mall_order_no IN ('O-R12E', 'O-R12OLD')`).get().n, 0, '送った後は読み直す注文の記録を消した');
+    // (2) 退避: --source v1 の取込 (一時の逃げ道) が同じ決済の V1 を **V2 より新しく** 入れる → 有効な V2 の版のまま (採る版は替わらない)
+    const repV1 = { reportId: 'R12R-V1b', reportType: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE', processingStatus: 'DONE', reportDocumentId: 'D12R-V1b', createdTime: '2026-03-12T00:00:00Z', dataStartTime: P5[0], dataEndTime: P5[1] };
+    const spV1 = { async callAPI(req) { if (req.operation === 'getReport') return repV1; throw new Error(`想定外 ${req.operation}`); } };
+    await runSettlementFetch({ reportId: 'R12R-V1b', dryRun: false, source: 'v1' }, { db, sp: spV1, runId: 'run-r5-fallback', downloadTsv: async () => V1TSV, now: () => new Date(NOW + 3600e3) });
+    const vs2 = versions();
+    assert.equal(vs2.length, 3, '退避の V1 も版として保存した');
+    assert.ok(vs2[2].source_layer === 'sp_api_v1' && vs2[2].ingested_at > vs2[1].ingested_at, '前提: 退避の V1 の版は V2 の版より新しい');
+    assert.equal(selectedLayer(), 'sp_api_v2', '🚨 有効な V2 の版がある決済は、新しい V1 を入れても V2 のまま (#1567 Codex R12 Medium 1)');
+    // (3) V2 の運転に戻る = 次の回も complete のまま・Company DB の中身は変わらない
+    const fx3 = spyFetch();
+    const r3 = await run({ fetchImpl: fx3 });
+    assert.equal(r3.exitCode, 0, `${r3.summary} ${JSON.stringify(r3.reasons)}`);
+    assert.ok(!codes(r3).includes('report_selected_differs'), codes(r3).join(','));
+    assert.equal(fx3.calls.complete, 1); assert.equal((await cov()).state, 'complete');
+    assert.equal(await checksum('O-R12E'), e1New, 'O-R12E は V2 のまま'); assert.equal((await receipt('O-R12OLD')).lines, 0, 'O-R12OLD は墓石のまま');
+  } finally { SP.ing = saved.ing; SP.inv = saved.inv; }
+});
+await t('🆕 読めない日付 (unkeyed) は採った版の行だけで数える (#1567 Codex R13 Medium 1): 不正な日付の行を持つ旧い V1 の版 + 正常な採った V2 の版 = complete・送る中身は V2 だけ・旧い版にだけある疑似注文の日は今までどおり読み直して墓石 / 採った版 (V2) の行の日付が読めない = 今までどおり止まる (版の中身の確かさ versionDetailValid は日付を見ない = 採る版は替わらない)', async () => {
+  const { prepareReportTsv, ingestSettlement } = await import('../apps/warehouse/fetch-amazon-settlements.js');
+  const { convertV2TsvToV1Tsv } = await import('../apps/warehouse/amazon-settlement-v2.js');
+  const saved = { ing: SP.ing, inv: SP.inv };
+  const P13 = ['2026-03-12T10:00:00Z', '2026-03-14T10:00:00Z'];
+  // 旧い V1: 注文 1 つ + 注文番号の無い保管料 2 行 (3/13・後で 1 行だけ日付を壊す) / 新しい V2: 注文 1 つ + 保管料 1 行 (3/12)
+  const V1TSV = convertV2TsvToV1Tsv(settlementTsv('S13R', ...P13, [{ kind: 'order', order: 'O-R13A', sku: 'SKU-R', yen: 400, day: '2026-03-12T12:00:00Z' },
+    { kind: 'storage', yen: -300, day: '2026-03-13T01:00:00Z' }, { kind: 'storage', yen: -50, day: '2026-03-13T02:00:00Z' }])).tsv;
+  DOCS.D13R = settlementTsv('S13R', ...P13, [{ kind: 'order', order: 'O-R13A', sku: 'SKU-R', yen: 400, day: '2026-03-12T12:00:00Z' }, { kind: 'storage', yen: -10, day: '2026-03-12T05:00:00Z' }]);
+  const seqOf = (layer) => db.prepare(`SELECT seq FROM amazon_settlement_document_versions WHERE settlement_id = 'S13R' AND source_layer = ? ORDER BY seq DESC LIMIT 1`).get(layer).seq;
+  const selectedLayer = () => db.prepare(`SELECT source_layer FROM v_amazon_settlement_selected_documents WHERE settlement_id = 'S13R'`).get()?.source_layer;
+  const pseudoRow = (seq, micro) => db.prepare(`SELECT id, economic_date FROM raw_amazon_settlement_lines WHERE source_settlement_id = 'S13R' AND document_version_seq = ? AND (amazon_order_id IS NULL OR amazon_order_id = '') AND other_amount_micro = ?`).get(seq, micro);
+  const PD = '-:2026-03-13';
+  try {
+    // (0) 旧い V1 の版を入れて一度送る (V1 が採られる = 疑似注文 3/13 が Company DB に入る)
+    const p1 = prepareReportTsv(V1TSV, 'R13R-V1', 'run-r13-v1', { reportDocumentId: 'D13R-V1' });
+    ingestSettlement(db, p1.headerRow, p1.lineRows, p1.ctx, { now: () => new Date(NOW - 7 * 86400e3) });
+    await run({ fetchImpl: spyFetch() });   // S13R の裏付けが無い回 = complete にならなくてよい・送る
+    assert.ok((await receipt(PD))?.lines > 0, `前提: 旧い V1 の版の疑似注文 ${PD} が Company DB に入った`);
+    // (1) 旧い V1 の版の保管料 1 行の日付を読めなくする (V2 が来た後は採らない版の行。同じ日のもう 1 行は本物の日付のまま = 墓石の候補)
+    const v1seq = seqOf('sp_api_v1');
+    const bad = pseudoRow(v1seq, -50000000);
+    db.prepare(`UPDATE raw_amazon_settlement_lines SET economic_date = '2026-13-40' WHERE id = ?`).run(bad.id);
+    // (2) 正常な V2 の report が一覧に出る → V2 が採られる → V1 の不正な行は採らない版 = 止めない → complete
+    SP.ing = [...SP.ing, rep('R13R', 'DONE', 'D13R', P13, '2026-03-15T00:00:00Z')]; SP.inv = SP.ing;
+    const sentNos = [];
+    const fx = spyFetch({ onChunk: (b) => { for (const x of b.rows) sentNos.push(x.mall_order_no); } });
+    const r2 = await run({ fetchImpl: fx });
+    assert.equal(selectedLayer(), 'sp_api_v2', 'V2 が採られる');
+    assert.equal(r2.exitCode, 0, `${r2.summary} ${JSON.stringify(r2.reasons)}`);
+    assert.ok(!codes(r2).includes('unkeyed'), `採らない版の読めない日付では止めない: ${codes(r2)}`);
+    assert.equal(fx.calls.complete, 1); assert.equal((await cov()).state, 'complete');
+    assert.equal((await receipt(PD)).lines, 0, `旧い版にだけある疑似注文の日 ${PD} = 今までどおり読み直して墓石`);
+    assert.ok((await receipt('O-R13A'))?.lines > 0, '注文 O-R13A は V1 と V2 で同じ中身 = 変化なし (送り直さなくてよい)');
+    assert.ok(sentNos.includes(PD) && sentNos.includes('-:2026-03-12'), `送った = 採った V2 の疑似注文と旧い日の墓石 (${sentNos.filter((n) => /R13|2026-03-1[23]/.test(n))})`);
+    assert.ok((await receipt('-:2026-03-12'))?.lines > 0, '採った V2 の疑似注文 (3/12) は送った');
+    // (3) 採った版 (V2) の行の日付が読めない = 今までどおり止まる (採る版は V2 のまま = 中身の確かさは日付を見ない)
+    const v2seq = seqOf('sp_api_v2');
+    const v2bad = pseudoRow(v2seq, -10000000);
+    db.prepare(`UPDATE raw_amazon_settlement_lines SET economic_date = '2026-13-41' WHERE id = ?`).run(v2bad.id);
+    const fx3 = spyFetch();
+    const r3 = await run({ fetchImpl: fx3 });
+    assert.equal(selectedLayer(), 'sp_api_v2', '採る版は V2 のまま');
+    assert.equal(fx3.calls.complete, 0, '採った版の読めない日付 = complete を送らない');
+    assert.ok(codes(r3).includes('unkeyed'), `unkeyed で止まる: ${codes(r3)}`);
+    assert.notEqual((await cov()).state, 'complete');
+    // 直せば戻る
+    db.prepare(`UPDATE raw_amazon_settlement_lines SET economic_date = ? WHERE id = ?`).run(v2bad.economic_date, v2bad.id);
+    const fx4 = spyFetch();
+    const r4 = await run({ fetchImpl: fx4 });
+    assert.equal(r4.exitCode, 0, `${r4.summary} ${JSON.stringify(r4.reasons)}`); assert.equal(fx4.calls.complete, 1); assert.equal((await cov()).state, 'complete');
+  } finally { SP.ing = saved.ing; SP.inv = saved.inv; }
+});
+await t('🚨 一覧の窓の空白 (前の成功した回から 85 日以上あいた) = complete にしない (⚠️ evidence_chain_gap = Seller Central で印を作り直す)・長く止まった後の取込の一覧も同じ 85 日の窓 (止まっている間に窓の外に出た report は取込まない・#1567 Codex R4)', async () => {
+  NOW = Date.parse('2026-07-15T00:00:00Z');   // 前の回 (上の試験の 4/10) から 85 日より後
+  const ingQ = [];
+  SP.ingQueries = ingQ;
+  try {
+    const r = await run({ fetchImpl: spyFetch() });
+    assert.equal(r.exitCode, 0, r.summary); assert.ok(codes(r).includes('evidence_chain_gap'), codes(r).join(','));
+    assert.equal((await cov()).state, 'updating');
+    const inv = db.prepare(`SELECT query_created_since s, query_created_until u FROM amazon_settlement_report_inventory_runs ORDER BY id DESC LIMIT 1`).get();
+    assert.deepEqual(ingQ.map((q) => [q.createdSince, q.createdUntil]), [[inv.s, inv.u]], '取込の一覧も同じ 85 日の窓');
+  } finally { SP.ingQueries = null; }
+  NOW = Date.parse('2026-03-20T00:00:00Z');
+});
+
+await t('🚨 中身の悪い版しか無い決済 (見出しの total ≠ 明細の合計) = 仮に採って送る・全部を止めない・⚠️🚨 で retry しない (exit 0)・正式な値は null (coverage は complete にしない) (#1567 R2 Medium 1 案 C / L3)', async () => {
+  const good = settlementTsv('S9', '2026-03-16T10:00:00Z', '2026-03-18T10:00:00Z', [{ kind: 'order', order: 'O-9', sku: 'SKU-9', yen: 40, day: '2026-03-17T01:00:00Z' }]);
+  DOCS.D9 = good.replace('\t40.00\tJPY', '\t41.00\tJPY');   // 見出しの total だけ 41 (途中で切れたファイルの形)
+  assert.notEqual(DOCS.D9, good);
+  SP.ing = [...SP.ing, rep('R9', 'DONE', 'D9', ['2026-03-16T10:00:00Z', '2026-03-18T10:00:00Z'], '2026-03-19T00:00:00Z')]; SP.inv = SP.ing;
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f });
+  assert.equal(r.exitCode, 0, r.summary);
+  assert.match(r.summary, /^⚠️🚨 Amazon 決済と財務: .*仮に採った壊れた版/);
+  assert.ok(codes(r).includes('provisional_broken_version'), codes(r).join(','));
+  assert.ok(f.calls.chunks > 0, '送る (ほかの決済も止めない)');
+  const sel = V.selectedVersionOf(db, 'S9');
+  assert.ok(sel && sel.detail_valid === 0, '壊れた版を仮に採る');
+  assert.ok((await receipt('O-9')).lines > 0, 'O-9 は仮の財務として Render に入る (墓石にしない = 案 B はとらない)');
+  assert.equal((await cov()).state, 'updating', '正式な値は出さない (見出しの検算・frontier で落ちる)');
+  assert.equal((await covState()).complete_to, null);
+  const last = JSON.parse(fs.readFileSync(path.join(tmpDir, LAST_RUN_FILE), 'utf8'));
+  assert.deepEqual([last.finance_pushed, last.finance_push_ok, last.exit_code], [true, true, 0]);   // retry の見送りは exit 0 で成り立つ (retryable は書かない・#1567 R3 L1)
+  assert.equal(Object.hasOwn(last, 'retryable'), false);
+});
+await t('retry-state の工程の名前はスイッチに合わせて読み替える (#1567 R1 L4)・単独の取込はスイッチが無ければ今までどおり書く (lease を取る)', async () => {
+  // スイッチ (CDB_FINANCE_COORDINATOR=1) があるとき = 旧い 2 工程の名前 → coordinator / 無いとき = coordinator → 今までの 2 工程 (#1567)
+  assert.deepEqual(renameRetryJobs(['f_sales', 'Amazon Settlement', 'CompanyDB財務(Amazon)', 'Render同期'], { coordinator: true }), ['f_sales', 'Amazon決済と財務', 'Render同期']);
+  assert.deepEqual(renameRetryJobs(['Amazon決済と財務', 'Amazon Settlement'], { coordinator: true }), ['Amazon決済と財務']);
+  assert.deepEqual(renameRetryJobs(['Amazon決済と財務', 'Amazon Settlement'], { coordinator: false, switched: false }), ['Amazon Settlement', 'CompanyDB財務(Amazon)']);
+  assert.deepEqual(renameRetryJobs(['Amazon決済と財務', 'Amazon Settlement'], { coordinator: false, switched: true }), ['Amazon決済と財務', 'Amazon Settlement'], '切り替え済み = coordinator の名前は読み替えない (一方向)');
+  // 単独の取込の引数: スイッチがある = 常に dry-run・--commit は拒む / 無い = 今までどおり書く (daily-sync の --days 14)・--dry-run で書かない
+  const { parseArgs: parseFetchArgs } = await import('../apps/warehouse/fetch-amazon-settlements.js');
+  assert.equal(parseFetchArgs(['--days', '14'], { coordinator: true }).dryRun, true);
+  assert.throws(() => parseFetchArgs(['--commit'], { coordinator: true }), /coordinator/);
+  assert.equal(parseFetchArgs(['--days', '14'], { coordinator: false }).dryRun, false, 'スイッチが無い = master と同じく書く');
+  assert.equal(parseFetchArgs(['--days', '14', '--dry-run'], { coordinator: false }).dryRun, true);
+  const fsrc = fs.readFileSync(new URL('../apps/warehouse/fetch-amazon-settlements.js', import.meta.url), 'utf8');
+  // 書く取込 = runLegacyFetch: coverage の lease を取る → その中で一方向の門 (ローカル + Render・#1567 Codex R6 High / R7 High 1) → 取込 → 放す。main の書く回は必ずここを通る
+  assert.match(fsrc, /const got = acquireCoverageLease\(db, \{ isAlive, now: now\(\) \}\);[\s\S]{0,400}try \{\s*await assertLegacyAllowedRemote\(db, ledgerMetaReader\(dataDir\), '今までの書く取込 \(生の表を書く\)', remote\);\s*return await runSettlementFetch\(args, \{[^}]*lease \}\);\s*\} finally \{ releaseCoverageLease\(db, lease\); \}/, '書く取込は lease の中で門を通ってから書く');
+  assert.match(fsrc, /const \{ blocked \} = args\.dryRun\s*\? await runSettlementFetch\([\s\S]{0,300}?\)\s*: await runLegacyFetch\(/, 'main の書く回は runLegacyFetch だけ');
+});
+
+await t('送信の途中で失敗した朝 (failed chunk) = 記録の finance_push_ok は false = daily-sync は突き合わせを見送る (#1567 R3 L2)', async () => {
+  // chunk の送信を毎回落とす (送り直し 6 回も全部失敗 = 送信の途中の失敗)
+  const g = spyFetch({ onChunk: () => { throw new Error('socket hang up (作り物・毎回)'); } });
+  // 変わる注文を 1 つ作る (台帳の指紋を空に)
+  const L1 = openLedger(tmpDir, { kind: FINANCE_KIND });
+  try { L1.db.prepare(`update sent set fp = 'x' where kind = ? and key like '%O-A'`).run(FINANCE_KIND); } finally { L1.close(); }
+  const r = await run({ fetchImpl: g });
+  assert.equal(r.exitCode, 1, r.summary);
+  const last = JSON.parse(fs.readFileSync(path.join(tmpDir, LAST_RUN_FILE), 'utf8'));
+  assert.equal(last.finance_push_ok, false, JSON.stringify(last));
+});
+
+await t('🚨 版の無い過去の行がある (版付けがまだ) = coordinator は重い版付けを流さず ❌ (取込も Render も触れない)・dry-run も ❌ → 夜に手で migrate --commit の後は回る / 取込が入れた行は取込の取引の中で版が付く (#1567 Codex R1 Medium)', async () => {
+  const nullRows = () => db.prepare(`SELECT (SELECT COUNT(*) FROM raw_amazon_settlement_lines WHERE document_version_seq IS NULL) + (SELECT COUNT(*) FROM raw_amazon_settlement_headers WHERE document_version_seq IS NULL) n`).get().n;
+  assert.equal(nullRows(), 0, 'ここまでの回が取り込んだ行 (SP-API・手のファイル) は全部、取込の取引の中で版を持つ');
+  // 過去の行 (版なし = PR の前に入った行の形) を 1 行足す
+  const cols = db.prepare(`PRAGMA table_info(raw_amazon_settlement_lines)`).all().map((c) => c.name).filter((c) => c !== 'id');
+  const sel = cols.map((c) => (c === 'document_version_seq' ? 'NULL' : c === 'physical_line_hash' ? `physical_line_hash || '-old'` : c === 'source_document_id' ? `'R-OLD'` : c)).join(', ');
+  db.prepare(`INSERT INTO raw_amazon_settlement_lines (${cols.join(', ')}) SELECT ${sel} FROM raw_amazon_settlement_lines WHERE amazon_order_id = 'O-A' ORDER BY id LIMIT 1`).run();
+  assert.equal(nullRows(), 1);
+  const b = writeState();
+  const f = spyFetch();
+  const r = await run({ fetchImpl: f });
+  assert.equal(r.mode, 'unmigrated', r.summary); assert.equal(r.exitCode, 1);
+  assert.match(r.summary, /^❌ .*版付けがまだ.*migrate-settlement-document-versions\.js --commit/);
+  assert.equal(r.ingest, null); assert.deepEqual(writeState(), b);
+  assert.equal(f.calls.chunks + f.calls.updating + f.calls.complete, 0);
+  assert.equal(nullRows(), 1, 'coordinator は版付けを流さない');
+  const d = await run({ fetchImpl: spyFetch(), dryRun: true });
+  assert.equal(d.exitCode, 1, d.summary); assert.match(d.summary, /^❌ .*dry-run.*版/);
+  const m = await runMigrate({ commit: true, log: () => {}, isAlive: () => false });
+  assert.equal(m.ready, true); assert.equal(nullRows(), 0);
+  const r2 = await run({ fetchImpl: spyFetch() });
+  assert.equal(r2.mode, 'coverage', r2.summary); assert.ok(r2.ingest, '版付けの後は取り込む');
+});
+
+console.log('⑧ 判定の部品 (単体)');
+await t('frontierFrom: 起点を含む区間から・重なりは可・隙間で止まる・起点を覆わなければ null', async () => {
+  const o = '2026-01-01T00:00:00Z';
+  assert.equal(frontierFrom([{ start: '2025-12-30T00:00:00Z', end: '2026-01-10T00:00:00Z' }, { start: '2026-01-09T00:00:00Z', end: '2026-01-20T00:00:00Z' }], o), '2026-01-20T00:00:00Z');
+  assert.equal(frontierFrom([{ start: '2025-12-30T00:00:00Z', end: '2026-01-10T00:00:00Z' }, { start: '2026-01-11T00:00:00Z', end: '2026-01-20T00:00:00Z' }], o), '2026-01-10T00:00:00Z');
+  assert.equal(frontierFrom([{ start: '2026-01-02T00:00:00Z', end: '2026-01-10T00:00:00Z' }], o), null);
+});
+await t('completionBlockers: range / 送れない注文 / 整形できない / stale / 読み直す鍵 / 鍵の分からない行 / 送れなかった疑似注文 / 読み直す注文 / 版の変化 / 判定の理由 = どれも complete にしない', async () => {
+  const r = { mode: 'full', dryRun: false, failed: [], transformErrors: [], stale: 0 };
+  const snap = { reasons: [], sourceRevision: 7 };
+  assert.deepEqual(completionBlockers({ r, snapshot: snap, retryLeft: 0, dirtyLeft: 0, sourceRevisionNow: 7, unkeyed: 0, pseudoBlocked: 0 }), []);
+  const one1 = (x) => completionBlockers({ r, snapshot: snap, retryLeft: 0, dirtyLeft: 0, sourceRevisionNow: 7, unkeyed: 0, pseudoBlocked: 0, ...x }).map((y) => y.code);
+  assert.deepEqual(one1({ r: { ...r, mode: 'range' } }), ['range']);
+  assert.deepEqual(one1({ r: { ...r, failed: [{}] } }), ['send_failed']);
+  assert.deepEqual(one1({ r: { ...r, transformErrors: [{}] } }), ['transform_errors']);
+  assert.deepEqual(one1({ r: { ...r, stale: 1 } }), ['stale']);
+  assert.deepEqual(one1({ retryLeft: 2 }), ['retry_keys']);
+  assert.deepEqual(one1({ unkeyed: 1 }), ['unkeyed']);
+  assert.deepEqual(one1({ pseudoBlocked: 1 }), ['pseudo_blocked']);
+  assert.deepEqual(one1({ dirtyLeft: 1 }), ['dirty_left']);
+  assert.deepEqual(one1({ sourceRevisionNow: 8 }), ['source_revision_changed']);
+  assert.deepEqual(one1({ snapshot: { reasons: [{ code: 'x', human: true }], sourceRevision: 7 } }), ['x']);
+  assert.deepEqual(one1({ snapshot: null }), ['no_snapshot']);
+  // 初期の印の読み直し (#1567 Codex R1 High 2)
+  const snapM = { reasons: [], sourceRevision: 7, diag: { markerId: 'im-1', markerEpoch: 1, markerDigest: 'd1' }, manifest: { initial_marker_id: 'im-1', initial_marker_digest: 'd1' } };
+  assert.deepEqual(one1({ snapshot: snapM, markerNow: { marker_id: 'im-1', evidence_epoch: 1, marker_digest: 'd1' } }), []);
+  assert.deepEqual(one1({ snapshot: snapM, markerNow: { marker_id: 'im-2', evidence_epoch: 2, marker_digest: 'd2' } }), ['marker_changed']);
+  assert.deepEqual(one1({ snapshot: snapM, markerNow: { marker_id: 'im-1', evidence_epoch: 1, marker_digest: 'dX' } }), ['marker_changed']);
+  assert.deepEqual(one1({ snapshot: snapM, markerNow: null }), ['marker_changed']);
+  assert.deepEqual(one1({ markersPending: 1 }), ['marker_pending']);
+});
+
+console.log(ng ? `\n❌ coordinator (D7b-1b-3): ok ${ok} / NG ${ng}` : `\n✅ coordinator (D7b-1b-3): ok ${ok} / NG 0`);
+server.close();
+await pg.close();
+process.exit(ng ? 1 : 0);

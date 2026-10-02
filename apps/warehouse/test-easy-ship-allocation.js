@@ -24,6 +24,7 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'easyship-alloc-test-'));
 process.env.DATA_DIR = tmpDir;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const { initDB, getDB } = await import('./db.js');
+const { backfillDocumentVersions } = await import('./amazon-settlement-versions.js');   // 直接入れた行に文書の版を付ける (build は版の無い行があれば止まる)
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -55,7 +56,7 @@ line({ day: 7, o: 'O3', tx: 'Amazon Easy Ship Charges', fee: -300, feeType: 'Ama
 line({ day: 7, o: 'O4', tx: 'Amazon Easy Ship Charges', fee: -200, feeType: 'Amazon Easy Ship Charges' });            // 売上の行が無い注文
 line({ day: 7, o: 'O5', tx: 'Amazon Easy Ship Charges', fee: -100, feeType: 'Amazon Easy Ship Charges' });            // 3 SKU に 100 円
 
-const run = (args) => execFileSync(process.execPath, args, { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
+const run = (args) => { backfillDocumentVersions(db); return execFileSync(process.execPath, args, { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' }); };
 const build = () => run(['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM]);
 build();
 const fact = (sku, day) => db.prepare(`SELECT easy_ship_jpy e, profit_amount p, sales_principal_jpy s, source_layer_summary l FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = ? AND date_jst = ?`).get(sku, `${YM}-${String(day).padStart(2, '0')}`);

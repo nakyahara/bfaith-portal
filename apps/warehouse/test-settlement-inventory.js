@@ -4,10 +4,11 @@ await temporaryTestRoot(import.meta.url);
  * test-settlement-inventory.js — 決済のレポートの一覧 (inventory) の記録の試験 (D7b-1b の下ごしらえ・2026-09-30)
  *
  * 設計 = AI_reference CompanyDB構想/13 §3.1。SP-API は差し替え (fake の callAPI / download)。本番 DB には触れない (一時 DATA_DIR)。
- *   - 一覧の窓の固定 (最初の要求に createdSince = createdUntil − 85 日・createdUntil = 回の開始の時刻。2 ページ目からは nextToken だけ)
+ *   - 一覧の窓の固定 (最初の要求に createdSince = createdUntil − 85 日・createdUntil = 回の開始の時刻。2 ページ目からは nextToken だけ)。取込の一覧も同じ窓 (#1567 Codex R4)
  *   - 取込の一覧の要求は今までと同じ形 (日時の境なし) = 取込む report は変わらない
  *   - 最後のページまで取れた回 / 取れなかった回 (nextToken が残ったまま上限 = last_page_reached 0・取込は続ける)
- *   - 各分岐の取込の結果 (skipped_not_done / imported / skipped_v1 / failed / not_processed)・同じ report ID を 2 回見たら最後の状態
+ *   - 各分岐の取込の結果 (skipped_not_done / imported / failed / not_processed)・同じ report ID を 2 回見たら最後の状態
+ *     (2026-10-01 D-66: V1 で取込済みの決済の V2 も版として入れる = imported。前の skipped_v1 はもう出ない)
  *   - dry-run は表に書かない / --report-id は一覧の回にしない / 一覧の失敗でも取込は続ける / 例外で落ちた回は completed_at が null
  *   - 取込む行は変わらない (正規化した行の physical_line_hash の集まりと一致・一覧の有無で生の表が同じ)
  *   - digest の再現性 (並びに依らない・UTF-8 のバイトの順・保存した行から作り直して一致・式の固定)
@@ -74,24 +75,26 @@ const R = {
   v1: rep('R-V1', 'DONE', 'D-V1'),
   bad: rep('R-BAD', 'DONE', 'D-BAD'),
   onlyInv: rep('R-ONLYINV', 'DONE', 'D-ONLYINV'),          // 一覧にだけ居る (取込の一覧に無い)
-  onlyIng: rep('R-ONLYING', 'DONE', 'D-ONLYING', { createdTime: '2026-07-03T00:00:00+00:00' }),   // 取込の一覧にだけ居る (85〜90 日前に作られた)
+  onlyIng: rep('R-ONLYING', 'DONE', 'D-ONLYING', { createdTime: '2026-07-03T00:00:00+00:00' }),   // 取込の一覧にだけ居る (同じ窓の 2 つの要求の食い違い = 作り物は窓を見ない)
 };
 
 /**
- * fake の SP-API。getReports の最初の要求は createdSince の有無で「一覧の記録用」か「取込用」かを分ける。
- * pages = { inv: [page, ...] | (idx) => page, ing: [...] }・page = { reports, next }
+ * fake の SP-API。getReports の最初の要求は options.timeouts の有無 (一覧の記録用の要求だけが持つ = listInventoryReports) で「一覧の記録用」か「取込用」かを分ける
+ * (#1567 Codex R4 から取込の一覧も同じ窓 = createdSince では分けられない)。
+ * pages = { inv: [page, ...] | (idx, at, query) => page, ing: [...] }・page = { reports, next }
  */
 // opts: failInventory = 一覧の要求が失敗 / hangInventory = 一覧の要求が返らない (長い retry) / invalidInventory = 一覧のページの応答 (そのまま返す)
 //       tokens = getReports の共有のレートの枠 (無くなると QuotaExceeded) / clock = { ms, stepMs } = 呼ぶたびに時計が進む (page 関数に呼んだ時刻を渡す)
 // events = 呼んだ順の記録 (list:ing = 取込の一覧 / list:inv = 一覧の記録 / next:* = 2 ページ目から / dl:文書 = ダウンロード)
 const events = [];
+const isInv = (req) => !!(req.options && req.options.timeouts);
 function fakeSp(pages, { failInventory = false, hangInventory = false, invalidInventory, tokens = Infinity, clock = null, reportById = {} } = {}) {
   const calls = [];
   let left = tokens;
   events.length = 0;
-  const page = (kind, idx, at) => {
+  const page = (kind, idx, at, q) => {
     const src = pages[kind];
-    const p = typeof src === 'function' ? src(idx, at) : src[idx];
+    const p = typeof src === 'function' ? src(idx, at, q) : src[idx];
     return { reports: p.reports, ...(p.next ? { nextToken: `${kind}:${idx + 1}` } : {}) };
   };
   return {
@@ -100,7 +103,7 @@ function fakeSp(pages, { failInventory = false, hangInventory = false, invalidIn
       calls.push(JSON.parse(JSON.stringify(req)));
       if (req.operation === 'getReports') {
         const q = req.query;
-        events.push(q.nextToken ? `next:${q.nextToken.split(':')[0]}` : q.createdSince ? 'list:inv' : 'list:ing');
+        events.push(q.nextToken ? `next:${q.nextToken.split(':')[0]}` : isInv(req) ? 'list:inv' : 'list:ing');
       } else events.push(req.operation);
       const at = clock ? clock.ms : null;
       if (clock) clock.ms += clock.stepMs;
@@ -109,11 +112,11 @@ function fakeSp(pages, { failInventory = false, hangInventory = false, invalidIn
         left--;
         const q = req.query;
         if (q.nextToken) { const [kind, idx] = q.nextToken.split(':'); return page(kind, Number(idx), at); }
-        const kind = q.createdSince ? 'inv' : 'ing';
+        const kind = isInv(req) ? 'inv' : 'ing';
         if (kind === 'inv' && failInventory) throw new Error('QuotaExceeded (作り物)');
         if (kind === 'inv' && hangInventory) return new Promise(() => {});
         if (kind === 'inv' && invalidInventory !== undefined) return invalidInventory;
-        return page(kind, 0, at);
+        return page(kind, 0, at, q);
       }
       if (req.operation === 'getReport') return reportById[req.path.reportId];
       throw new Error(`想定外の呼び出し ${req.operation}`);
@@ -136,12 +139,12 @@ const nowFn = () => new Date(NOW.getTime() + (tick++) * 1000);
 await initDB();
 const db = getDB();
 
-// 前提: S-V1 は V1 で取込済み (V2 では入れない = skipped_v1)
+// 前提: S-V1 は V1 で取込済み (2026-10-01 から V2 も版として入れる = imported・採る版は新しい V2)
 const v1Prep = prepareReportTsv(tsvOf(V1_COLUMNS, [
   { 'settlement-id': 'S-V1', 'settlement-start-date': '2099-01-01T00:20:09+00:00', 'settlement-end-date': '2099-01-15T00:20:09+00:00', 'deposit-date': '2099-01-17T00:20:09+00:00', 'total-amount': '300.00', currency: 'JPY' },
   { 'settlement-id': 'S-V1', 'marketplace-name': 'Amazon.co.jp', 'posted-date': '2099-01-05T01:00:00+00:00', 'transaction-type': 'Order', 'order-id': 'O9', sku: 'SKU-Y', 'price-type': 'Principal', 'price-amount': '300.00' },
 ]), 'R-V1-OLD', 'seed');
-ingestSettlement(db, v1Prep.headerRow, v1Prep.lineRows, v1Prep.ctx);
+ingestSettlement(db, v1Prep.headerRow, v1Prep.lineRows, v1Prep.ctx, { now: () => new Date('2026-09-01T00:00:00Z') });   // 版の ingested_at = 回の時計 (下の回より前)
 
 const runs = () => db.prepare(`SELECT * FROM amazon_settlement_report_inventory_runs ORDER BY id`).all();
 const rows = (runId) => db.prepare(`SELECT * FROM amazon_settlement_report_inventory WHERE inventory_run_id = ? ORDER BY report_id`).all(runId);
@@ -164,11 +167,13 @@ ok(!res.error, `ふつうの回は落ちない ${res.error ? res.error.message :
 
 // 呼ぶ順: 取込の一覧の要求が先 (今と同じ位置・同じ形) → 一覧の記録の要求 (窓を明示・2 ページ目は nextToken だけ)
 const reportsCalls = sp.calls.filter((c) => c.operation === 'getReports');
-eq(reportsCalls[0].query, { reportTypes: [V2T], marketplaceIds: [MKT], pageSize: 100 }, '🚨 最初の getReports = 取込の一覧の要求 (今までと同じ形・日時の境なし) = 取込む report は変わらない');
+eq(reportsCalls[0].query, { reportTypes: [V2T], marketplaceIds: [MKT], pageSize: 100, createdSince: '2026-07-07T00:00:05Z', createdUntil: '2026-09-30T00:00:05Z' },
+  '🚨 最初の getReports = 取込の一覧の要求 = 証拠の一覧と同じ固定の窓 (回の開始とその 85 日前 = 一覧に出ない report を取込まない・#1567 Codex R3 High 1・R4 High)');
+ok(!reportsCalls[0].options && reportsCalls[1].options && reportsCalls[1].options.timeouts, '取込の一覧は今までの接続のまま (時間の上限なし)・一覧の記録の要求だけ時間の上限つき');
 eq(reportsCalls[1].query, { reportTypes: [V2T], marketplaceIds: [MKT], pageSize: 100, createdSince: '2026-07-07T00:00:05Z', createdUntil: '2026-09-30T00:00:05Z' }, '一覧の記録の要求は取込の一覧の後 = createdUntil は回の開始の時刻 (秒に切り捨て)・createdSince はその 85 日前');
 eq(reportsCalls[2].query, { nextToken: 'inv:1' }, '一覧の 2 ページ目は nextToken だけ (窓を付け直さない)');
 ok(reportsCalls.length === 3, `getReports は取込 1 + 一覧 2 = 3 回 (${reportsCalls.length})`);
-ok(sp.calls.findIndex((c) => c.operation === 'getReports' && c.query.createdSince) > sp.calls.findIndex((c) => c.operation === 'getReports' && !c.query.createdSince && !c.query.nextToken), '一覧の記録の要求は取込の一覧の要求より後');
+ok(sp.calls.findIndex((c) => c.operation === 'getReports' && isInv(c)) > sp.calls.findIndex((c) => c.operation === 'getReports' && !isInv(c) && !c.query.nextToken), '一覧の記録の要求は取込の一覧の要求より後');
 const lastDl = (ev) => ev.reduce((m, e, i) => (e.startsWith('dl:') ? i : m), -1);
 eq(events, ['list:ing', 'dl:D-IMP', 'dl:D-V1', 'dl:D-BAD', 'dl:D-ONLYING', 'list:inv', 'next:inv'], '🚨 呼ぶ順 = 取込の一覧 → ダウンロード全部 → 一覧の記録 (Codex #1555 R2 High)');
 
@@ -182,13 +187,14 @@ eq([run1.company_id, run1.mall, run1.scope_key, run1.evidence_epoch], [1, 'amazo
 ok(run1.inventory_run_seq === 1 && run1.ingest_run_id === 'run-1', '回の連番 1・取込の回の ID');
 
 // 各分岐の取込の結果
-eq(rows(run1.id).map((r) => [r.report_id, r.import_result]), [['R-BAD', 'failed'], ['R-IMP', 'imported'], ['R-NOTDONE', 'skipped_not_done'], ['R-ONLYINV', 'not_processed'], ['R-V1', 'skipped_v1']], '各分岐の取込の結果 (取込の一覧にだけ居る R-ONLYING は一覧の行にしない)');
+eq(rows(run1.id).map((r) => [r.report_id, r.import_result]), [['R-BAD', 'failed'], ['R-IMP', 'imported'], ['R-NOTDONE', 'skipped_not_done'], ['R-ONLYINV', 'not_processed'], ['R-V1', 'imported']], '各分岐の取込の結果 (取込の一覧にだけ居る R-ONLYING は一覧の行にしない)');
 const imp = rowOf(run1.id, 'R-IMP');
 ok(imp.source_file_hash === sha256(DOCS['D-IMP']) && imp.settlement_id === 'S-IMP' && imp.header_inserted === 1 && imp.lines_inserted === 2 && imp.imported_report_document_id === 'D-IMP', 'imported: file hash・決済 ID・入れた行の数・落とした文書 ID');
 const rawHash = db.prepare(`SELECT DISTINCT source_file_hash h FROM raw_amazon_settlement_lines WHERE source_document_id = 'R-IMP'`).all().map((r) => r.h);
 eq(rawHash, [imp.source_file_hash], 'imported の file hash = 生の表の source_file_hash と同じ式');
 const v1row = rowOf(run1.id, 'R-V1');
-ok(v1row.settlement_id === 'S-V1' && v1row.source_file_hash === sha256(DOCS['D-V1']) && v1row.processing_status === 'DONE' && v1row.report_document_id === 'D-V1' && v1row.last_seen_ordinal === 6, `skipped_v1: 決済 ID・file hash / 同じ report ID を 2 回見たら最後の状態と位置 (last_seen_ordinal ${v1row.last_seen_ordinal})`);
+ok(v1row.settlement_id === 'S-V1' && v1row.source_file_hash === sha256(DOCS['D-V1']) && v1row.processing_status === 'DONE' && v1row.report_document_id === 'D-V1' && v1row.last_seen_ordinal === 6
+  && v1row.document_version_seq != null && db.prepare(`SELECT document_version_seq s FROM v_amazon_settlement_selected_documents WHERE settlement_id = 'S-V1'`).get().s === v1row.document_version_seq, `V1 取込済みの決済の V2 = imported・採る版は V2: 決済 ID・file hash / 同じ report ID を 2 回見たら最後の状態と位置 (last_seen_ordinal ${v1row.last_seen_ordinal})`);
 const badRow = rowOf(run1.id, 'R-BAD');
 ok(/^blocked: /.test(badRow.import_note) && badRow.source_file_hash === sha256(DOCS['D-BAD']), `failed (blocked): 理由と file hash (${badRow.import_note})`);
 const nd = rowOf(run1.id, 'R-NOTDONE');
@@ -198,8 +204,10 @@ ok(res.value.blocked.length === 1 && res.value.blocked[0].reportId === 'R-BAD', 
 ok(/決済の一覧 5 本を記録$/.test(res.logs.find((l) => l.includes('[settlements] 完了')) || ''), '完了の行の末尾 = 一覧の本数 (daily-sync の朝の報告)');
 
 // 取込む行は変わらない = 正規化した行の集まりとちょうど同じ
-const expected = [...prepareV2ReportTsv(DOCS['D-IMP'], 'R-IMP', 'x').lineRows, ...prepareV2ReportTsv(DOCS['D-ONLYING'], 'R-ONLYING', 'x').lineRows].map((r) => r.physical_line_hash).sort();
-eq(rawLines(), expected, '🚨 生の表 (V2) = 取込む report (R-IMP・R-ONLYING) の正規化した行とちょうど同じ (一覧にだけ居る R-ONLYINV は入れない)');
+// 🆕 2026-10-01: 文書の版 (文書 ID を含む) は物理の行の hash に入る = 取込と同じ文書 ID で作る。V1 取込済みの S-V1 の V2 (R-V1) も入る
+const expected = [...prepareV2ReportTsv(DOCS['D-IMP'], 'R-IMP', 'x', { reportDocumentId: 'D-IMP' }).lineRows, ...prepareV2ReportTsv(DOCS['D-V1'], 'R-V1', 'x', { reportDocumentId: 'D-V1' }).lineRows,
+  ...prepareV2ReportTsv(DOCS['D-ONLYING'], 'R-ONLYING', 'x', { reportDocumentId: 'D-ONLYING' }).lineRows].map((r) => r.physical_line_hash).sort();
+eq(rawLines(), expected, '🚨 生の表 (V2) = 取込む report (R-IMP・R-V1・R-ONLYING) の正規化した行とちょうど同じ (一覧にだけ居る R-ONLYINV は入れない)');
 const afterRun1 = rawCounts();
 
 // digest = 保存した行から作り直して一致
@@ -253,13 +261,18 @@ ok(rowOf(run6.id, 'R-IMP').import_result === 'imported' && rowOf(run6.id, 'R-BAD
 const DAY = 86400000;
 const clock = { ms: Date.parse('2026-10-01T00:00:00Z'), stepMs: 30000 };   // SP-API を呼ぶたびに 30 秒進む
 DOCS['D-BORDER'] = v2Tsv('S-BORDER');
-const BORDER = rep('R-BORDER', 'DONE', 'D-BORDER', { createdTime: new Date(clock.ms - 90 * DAY + 10000).toISOString() });   // 既定の窓の境の 10 秒内側
-// 取込の一覧 = Amazon の既定の窓 = 呼んだ時刻の 90 日前より後に作られた report だけ
-const defaultWindow = (idx, at) => ({ reports: [BORDER, R.imp].filter((x) => Date.parse(x.createdTime) >= at - 90 * DAY) });
-sp = fakeSp({ inv: [{ reports: [R.imp] }], ing: defaultWindow }, { clock });
+DOCS['D-OLD88'] = v2Tsv('S-OLD88');
+const BORDER = rep('R-BORDER', 'DONE', 'D-BORDER', { createdTime: new Date(clock.ms - 85 * DAY + 10000).toISOString() });   // 85 日の窓の境の 10 秒内側
+const OLD88 = rep('R-OLD88', 'DONE', 'D-OLD88', { createdTime: new Date(clock.ms - 88 * DAY).toISOString() });   // 88 日前 = Amazon の既定の 90 日の窓の中・85 日の窓の外
+// Amazon = 要求の窓 [createdSince, createdUntil] (無ければ呼んだ時刻の 90 日前〜) に作られた report だけ返す
+const amazonWindow = (idx, at, q) => ({ reports: [OLD88, BORDER, R.imp].filter((x) => { const c = Date.parse(x.createdTime);
+  return c >= (q.createdSince ? Date.parse(q.createdSince) : at - 90 * DAY) && (!q.createdUntil || c <= Date.parse(q.createdUntil)); }) });
+sp = fakeSp({ inv: amazonWindow, ing: amazonWindow }, { clock });
 downloaded.length = 0;
 res = await captured(() => runSettlementFetch(ARGS, { db, sp, runId: 'run-h1', downloadTsv: fakeDownload(), now: () => new Date(clock.ms) }));
-ok(!res.error && downloaded.includes('D-BORDER') && rowOf(runs().at(-1).id, 'R-IMP')?.import_result === 'imported', '🚨 90 日の境の report が今と同じく取込まれる (一覧の記録の要求が先に「今」を進めない)');
+ok(!res.error && downloaded.includes('D-BORDER') && rowOf(runs().at(-1).id, 'R-IMP')?.import_result === 'imported' && rowOf(runs().at(-1).id, 'R-BORDER')?.import_result === 'imported',
+  '🚨 85 日の境の 10 秒内側の report は取込む・一覧にも出る (取込と証拠が同じ固定の窓 = 時計が進んでも窓は回の開始で決まる)');
+ok(!downloaded.includes('D-OLD88') && !rowOf(runs().at(-1).id, 'R-OLD88'), '🚨 88 日前に作られた report (Amazon の既定の 90 日の窓の中・85 日の窓の外) は取込まない = 一覧に出ない決済を入れない (#1567 Codex R4 High)');
 
 // 基準 = 一覧の記録が何も邪魔しない回で、取込が落とした文書と止まった report
 const ingestOutcome = async (opts, runId, deps = {}) => {
@@ -295,7 +308,7 @@ ok(!rf1.out.error && rf1.run.ingest_run_id === 'run-rf-ins' && rf1.run.completed
   `一覧の行の INSERT の失敗 = 見出しだけ・completed_at null・record_error (${rf1.run.record_error})`);
 ok(JSON.stringify(rf1.downloads) === JSON.stringify(base.downloads) && JSON.stringify(rf1.blocked) === JSON.stringify(base.blocked) && JSON.stringify(rf1.after) === JSON.stringify(rf1.before) && /⚠️ 決済の一覧を記録できなかった/.test(rf1.out.logs.find((l) => l.includes('[settlements] 完了')) || ''),
   '記録の失敗でも取込の結果・生の行は同じ (⚠️ だけ)');
-const rf2 = await recFail(`CREATE TRIGGER trg_test_inventory_fail BEFORE UPDATE ON amazon_settlement_report_inventory WHEN NEW.import_result = 'skipped_v1' BEGIN SELECT RAISE(ABORT, 'わざとの取込の結果の UPDATE の失敗'); END`, 'run-rf-upd');
+const rf2 = await recFail(`CREATE TRIGGER trg_test_inventory_fail BEFORE UPDATE ON amazon_settlement_report_inventory WHEN NEW.import_result = 'imported' AND NEW.report_id = 'R-V1' BEGIN SELECT RAISE(ABORT, 'わざとの取込の結果の UPDATE の失敗'); END`, 'run-rf-upd');
 ok(!rf2.out.error && rf2.run.ingest_run_id === 'run-rf-upd' && rf2.run.completed_at === null && /UPDATE の失敗/.test(rf2.run.record_error || '') && rows(rf2.run.id).length === 0 && JSON.stringify(rf2.after) === JSON.stringify(rf2.before),
   `取込の結果の UPDATE の失敗 = 取引ごと戻して見出しだけ・completed_at null・record_error (${rf2.run.record_error})`);
 const runsBefore = runs().length;
