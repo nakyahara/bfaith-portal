@@ -5,7 +5,7 @@ await temporaryTestRoot(import.meta.url);
  *
  * 設計 = AI_reference システム設計/CompanyDB構想/13_Amazon利益のmart_設計_20260930.md §3.1・D-66
  *   ① 版の ID の形 (6 つの鍵・null は null・manual は file hash で区別) / 取込が版を登録し行が版を参照する / 要約 (件数・detail_digest・見出し・部品の合計)
- *   ② 採る版の規則 = JS (selectDocumentVersions) と SQL の view が一致 (層 → ingested_at の新しい順 → document_version_id のバイトの順・乱数 300 版)
+ *   ② 採る版の規則 = JS (selectDocumentVersions) と SQL の view が一致 (層 (V2 → V1 → 手 → ほか) → ingested_at の新しい順 → document_version_id のバイトの順・乱数 300 版)
  *   ③ V1 と V2 (並べ直した後) の中身が同じ = detail_digest と行の数が一致 / 相殺の +100 −100 だけ違う = 合計は同じでも digest が違う
  *   ④ 採る版が変わった取引 = 旧い版と新しい版の全部の注文を「読み直す注文」に (旧い版にだけある注文も) / 同じ report ID で file hash が変わる = 別の版
  *   ⑤ trigger: INSERT / UPDATE (OLD と NEW の両方) / DELETE で source_revision が増え、読み直す注文を記録 / backfill (版の鍵の null → 値) は数えない
@@ -144,7 +144,11 @@ ok(aggA.lines.length === 1 && aggA.lines[0].sales_principal_jpy === 1000 && aggA
     '🚨 selectDocumentVersions の入口: 列 (header_count) が欠けた版の行は throw (呼び手ごとに列の集まりが違うと採る版が変わる)');
   ok(V.VERSION_SELECT_COLUMNS.includes('header_count') && V.VERSION_SELECT_COLUMNS.includes('detail_valid'), '採る版に要る列 = detail_valid・header_count を含む');
   ok(pick([{ source_layer: 'manual_csv', ingested_at: '2027', document_version_id: 'a' }, { source_layer: 'sp_api_v2', ingested_at: '2026', document_version_id: 'b' }]) === 1, '層 1 (API) が manual より先 (manual が新しくても)');
-  ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'b' }, { source_layer: 'sp_api_v2', ingested_at: '2026', document_version_id: 'a' }]) === 1, 'V1 と V2 は同じ順位 → 同じ時刻なら ID のバイトの順');
+  // 🆕 #1567 Codex R12 Medium 1: V2 が V1 より先 (V1 が新しくても = 退避の --source v1 が有効な V2 の版を追い出さない)・V2 が壊れていれば V1
+  ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2027', document_version_id: 'a' }, { source_layer: 'sp_api_v2', ingested_at: '2026', document_version_id: 'b' }]) === 1, '🚨 V2 が V1 より先 (V1 の方が新しくても・#1567 Codex R12 Medium 1)');
+  ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'a' }, { source_layer: 'sp_api_v2', ingested_at: '2027', document_version_id: 'b', header_count: 0 }]) === 0, '見出しの壊れた V2 の版 (見出し 0 行) より有効な V1 の版');
+  ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'a' }, { source_layer: 'manual_csv', ingested_at: '2027', document_version_id: 'b' }]) === 0, 'V1 は手のファイルより先 (手が新しくても)');
+  ok(pick([{ source_layer: 'sp_api_v2', ingested_at: '2026', document_version_id: 'b' }, { source_layer: 'sp_api_v2', ingested_at: '2026', document_version_id: 'a' }]) === 1, '同じ層・同じ時刻なら ID のバイトの順');
   ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'a' }, { source_layer: 'sp_api_v2', ingested_at: '2027', document_version_id: 'b', detail_valid: 0 }]) === 0, '🚨 中身の悪い新しい版 (detail_valid 0) は良い旧い版を押しのけない (#1567 R1 Medium 3)');
   ok(pick([{ source_layer: 'sp_api_v2', ingested_at: '2027', document_version_id: 'b', detail_valid: 0 }]) === 0, '中身の悪い版しか無い = その中で一番の版を仮に採る (#1567 R2 Medium 1・全部を止めない)');
   ok(pick([{ source_layer: 'sp_api_v1', ingested_at: '2026', document_version_id: 'a', header_count: 1 }, { source_layer: 'sp_api_v1', ingested_at: '2027', document_version_id: 'b', header_count: 0 }]) === 0,

@@ -11,7 +11,7 @@
  *     🚨 設計書は「document_version_id を参照する」。64 文字の hash を 440 万行に持つと約 +600MB (索引を含む) = 整数の鍵で参照する (版の表で 1 対 1)
  *   - 決済ごとに採る版を 1 つ (selectDocumentVersions = SQL の view v_amazon_settlement_selected_documents と同じ規則):
  *       **中身の確かな版 (detail_valid = 1) が先** → **見出しがちょうど 1 行の版が先** (#1567 R1 Medium 3・R2 High 1・Medium 1) →
- *       層の順 (sp_api_v1 と sp_api_v2 が同じ 1 → manual_csv 2 → ほか 3) → ingested_at の新しい順 → document_version_id の UTF-8 のバイトの順
+ *       層の順 (sp_api_v2 1 → sp_api_v1 2 → manual_csv 3 → ほか 4。🆕 #1567 Codex R12 Medium 1 = 前は V1 と V2 が同じ 1) → ingested_at の新しい順 → document_version_id の UTF-8 のバイトの順
  *     detail_valid = 見出しがちょうど 1 行・明細の部品の合計 = 見出しの total・明細の決済 ID が 1 つで見出しと同じ・通貨 JPY
  *       (例外 = 過去の行の backfill の版で見出しが 0 行 = 明細の決済 ID が 1 つなら 1。ただし並びで見出し 1 行の版より後 = ほかに候補が無いときだけ採る。
  *        coverage は見出し 1 行を要る = complete にはならない)
@@ -44,9 +44,15 @@ export const REPORT_TYPES = Object.freeze({
 });
 /** 層 → レポートの種類 (過去の行の backfill で使う。manual_csv は形式が分からない = null) */
 export const REPORT_TYPE_OF_LAYER = Object.freeze({ sp_api_v1: REPORT_TYPES.v1, sp_api_v2: REPORT_TYPES.v2 });
-/** 採る版の層の順 (SQL の view と同じ) */
-export const layerRank = (l) => (l === 'sp_api_v1' || l === 'sp_api_v2' ? 1 : l === 'manual_csv' ? 2 : 3);
-const LAYER_RANK_SQL = `CASE v.source_layer WHEN 'sp_api_v1' THEN 1 WHEN 'sp_api_v2' THEN 1 WHEN 'manual_csv' THEN 2 ELSE 3 END`;
+/**
+ * 採る版の層の順 (SQL の view と同じ)。🆕 #1567 Codex R12 Medium 1: **V2 (sp_api_v2) を V1 (sp_api_v1) より先** にした (前は同じ順位 → 新しい順)。
+ *   なぜ: V1 は 2026-11-11 の廃止までの一時の逃げ道 (--source v1・台帳 settlement-v1-fallback)。同じ順位だと、有効な V2 の版がある決済で退避の V1 を入れると
+ *   新しい V1 が採られ、V2 の取込に戻しても同じ V2 の文書は入れ直しで版の ingested_at が変わらない = V2 に戻らない (中身が違う決済は coverage が
+ *   report_selected_differs で complete できないまま)。順位は「中身の確か (detail_valid)」「見出し 1 行」の **後** = V2 の版が壊れていれば V1 が採られる
+ *   (= 有効な V2 の版があるときだけ退避の V1 を採らない。V1 は保存はする)
+ */
+export const layerRank = (l) => (l === 'sp_api_v2' ? 1 : l === 'sp_api_v1' ? 2 : l === 'manual_csv' ? 3 : 4);
+const LAYER_RANK_SQL = `CASE v.source_layer WHEN 'sp_api_v2' THEN 1 WHEN 'sp_api_v1' THEN 2 WHEN 'manual_csv' THEN 3 ELSE 4 END`;
 export const cmpUtf8 = (a, b) => Buffer.compare(Buffer.from(String(a), 'utf8'), Buffer.from(String(b), 'utf8'));
 const nowSql = (d = new Date()) => d.toISOString().replace('T', ' ').slice(0, 19);
 

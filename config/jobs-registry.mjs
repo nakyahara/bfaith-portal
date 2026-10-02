@@ -1490,7 +1490,9 @@ export const JOBS_REGISTRY = [
     where: 'bfaith-portal リポジトリ apps/warehouse/fetch-amazon-settlements.js (SOURCES.v1・settlementIngestedByV1) と apps/warehouse/amazon-finance-coverage-run.js (--source)',
     remove_by: '2026-11-30',
     lifecycle: 'temporary',
-    runbook: '11/11 以降、毎朝の Amazon決済と財務 (V2) が問題なく動いていたら --source v1 の分岐を消す。'
+    runbook: '退避で --source v1 を使っても、有効な V2 の版がある決済は V2 のまま採られる (採る版の層の順 = V2 → V1・#1567 Codex R12 Medium 1)。V1 が採られるのは V2 の版が無い・壊れた決済だけ = '
+      + 'V2 の取込に戻せば次の回から V2 の版が入り採られる (手で版を選び直す作業は要らない)。'
+      + '11/11 以降、毎朝の Amazon決済と財務 (V2) が問題なく動いていたら --source v1 の分岐を消す。'
       + 'settlementIngestedByV1 (調べ用) も同じ PR で消してよい。このエントリも消す',
   },
   {

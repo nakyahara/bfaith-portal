@@ -1062,6 +1062,71 @@ await t('🆕 失敗した順番待ちの残りの場面 (#1567 Codex R10・R11 
     assert.deepEqual(qcodes(), []);
   } finally { o.close(); }
 });
+await t('🆕 古い V1 の版 → 中身の違う新しい V2 の版 (#1567 Codex R12 Low・Medium 1): V2 が採られる・coverage は imported (report_selected_differs にならない)・旧い版と新しい版の両方の注文が読み直す注文になり Company DB には採った V2 だけ (旧い版にだけある注文は墓石) / その後に退避の --source v1 で V1 を入れても有効な V2 の版のまま = V2 の運転で complete のまま', async () => {
+  const { V1_COLUMNS } = await import('../apps/warehouse/amazon-settlement-v2.js');
+  const { prepareReportTsv, ingestSettlement, runSettlementFetch } = await import('../apps/warehouse/fetch-amazon-settlements.js');
+  const saved = { ing: SP.ing, inv: SP.inv };
+  const P5 = ['2026-03-09T10:00:00Z', '2026-03-11T10:00:00Z'];
+  const tsvRow = (cols, o) => cols.map((c) => o[c] ?? '').join('\t');
+  const setTotal = (lines, cols, total) => { const c = lines[1].split('\t'); c[cols.indexOf('total-amount')] = total; lines[1] = c.join('\t'); };
+  // 旧い形の V1 (2026-01 までの Easy Ship = MFNPostageFee + MFNPostageFeeTax の 2 行) + V1 にだけある注文 O-R12OLD
+  const v1Lines = (await import('../apps/warehouse/amazon-settlement-v2.js')).convertV2TsvToV1Tsv(settlementTsv('S12R', ...P5, [
+    { kind: 'order', order: 'O-R12E', sku: 'SKU-E', yen: 400, day: '2026-03-10T01:00:00Z' }, { kind: 'order', order: 'O-R12OLD', sku: 'SKU-E', yen: 100, day: '2026-03-10T01:30:00Z' }])).tsv.trimEnd().split('\n');
+  setTotal(v1Lines, V1_COLUMNS, '335.00');
+  for (const [t, a] of [['MFNPostageFee', '-150.00'], ['MFNPostageFeeTax', '-15.00']]) v1Lines.push(tsvRow(V1_COLUMNS, { 'settlement-id': 'S12R', 'transaction-type': 'Amazon Easy Ship Charges', 'order-id': 'O-R12E', 'merchant-order-id': 'O-R12E',
+    'shipment-id': 'SH-O-R12E', 'marketplace-name': 'Amazon.co.jp', 'fulfillment-id': 'MFN', 'posted-date': '2026-03-10T02:00:00+00:00', 'item-related-fee-type': t, 'other-amount': a }));
+  const V1TSV = v1Lines.join('\n') + '\n';
+  // 新しい形の V2 (Easy Ship = Amazon Easy Ship Charges の本体 + 税 = 並べ直すと 1 行)・O-R12OLD は無い
+  const v2Lines = settlementTsv('S12R', ...P5, [{ kind: 'order', order: 'O-R12E', sku: 'SKU-E', yen: 400, day: '2026-03-10T01:00:00Z' }]).trimEnd().split('\n');
+  setTotal(v2Lines, V2_COLUMNS, '235.00');
+  for (const [d, a] of [['Base fee', '-150.00'], ['Tax on fee', '-15.00']]) v2Lines.push(tsvRow(V2_COLUMNS, { 'settlement-id': 'S12R', 'transaction-type': 'AmazonFees', 'order-id': 'O-R12E', 'merchant-order-id': 'O-R12E',
+    'shipment-id': 'SH-O-R12E', 'marketplace-name': 'Amazon.co.jp', 'fulfillment-id': 'MFN', 'posted-date': '2026/03/10', 'posted-date-time': '2026/03/10 02:00:00 UTC', 'amount-type': 'Amazon Easy Ship Charges', 'amount-description': d, amount: a }));
+  DOCS.D12R = v2Lines.join('\n') + '\n';
+  const versions = () => db.prepare(`SELECT seq, source_layer, ingested_at, detail_digest FROM amazon_settlement_document_versions WHERE settlement_id = 'S12R' ORDER BY seq`).all();
+  const selectedLayer = () => db.prepare(`SELECT source_layer FROM v_amazon_settlement_selected_documents WHERE settlement_id = 'S12R'`).get()?.source_layer;
+  const checksum = async (no) => (await one(`select set_checksum from core.order_finance_receipts where mall_order_no = $1`, [no]))?.set_checksum ?? null;
+  try {
+    // (0) 旧い V1 の版 (1 週間前) を入れて、一度送る (旧い版の注文が Company DB に入った状態 = 本番の 12222191753)
+    const p1 = prepareReportTsv(V1TSV, 'R12R-V1', 'run-r5-v1', { reportDocumentId: 'D12R-V1' });
+    ingestSettlement(db, p1.headerRow, p1.lineRows, p1.ctx, { now: () => new Date(NOW - 7 * 86400e3) });
+    await run({ fetchImpl: spyFetch() });   // この回は S12R の裏付けが無い (一覧に無い) = complete にならなくてよい・送る
+    assert.ok((await receipt('O-R12OLD'))?.lines > 0 && (await receipt('O-R12E'))?.lines > 0, '前提: 旧い V1 の版の注文が Company DB に入った');
+    const e1Old = await checksum('O-R12E');
+    // (1) 中身の違う V2 の report が一覧に出る → coordinator が版として入れる
+    SP.ing = [...SP.ing, rep('R12R', 'DONE', 'D12R', P5, '2026-03-12T00:00:00Z')]; SP.inv = SP.ing;
+    let dirtySeen = null;
+    const fx = spyFetch({ onChunk: () => { if (!dirtySeen) dirtySeen = db.prepare(`SELECT mall_order_no FROM amazon_settlement_dirty_orders`).all().map((x) => x.mall_order_no); } });
+    const r1 = await run({ fetchImpl: fx });
+    const vs = versions();
+    assert.deepEqual(vs.map((v) => v.source_layer), ['sp_api_v1', 'sp_api_v2'], '版は 2 つ (V1 も残る)');
+    assert.notEqual(vs[0].detail_digest, vs[1].detail_digest, '前提: V1 と V2 の中身 (detail_digest) が違う');
+    assert.ok(vs[1].ingested_at > vs[0].ingested_at, '前提: V2 の版の方が新しい');
+    assert.equal(selectedLayer(), 'sp_api_v2', 'V2 が採られる');
+    assert.equal(r1.exitCode, 0, `${r1.summary} ${JSON.stringify(r1.reasons)}`);
+    assert.ok(!codes(r1).includes('report_selected_differs'), codes(r1).join(','));
+    assert.equal(fx.calls.complete, 1); assert.equal((await cov()).state, 'complete');
+    assert.ok(dirtySeen && dirtySeen.includes('O-R12E') && dirtySeen.includes('O-R12OLD'), `旧い版と新しい版の両方の注文が読み直す注文 (${dirtySeen})`);
+    assert.equal((await receipt('O-R12OLD')).lines, 0, 'V2 にだけない注文 (旧い版にだけある) = Company DB では墓石');
+    const e1New = await checksum('O-R12E');
+    assert.notEqual(e1New, e1Old, 'O-R12E は採った V2 の中身で送り直した (Easy Ship の形が違う)');
+    assert.equal(db.prepare(`SELECT COUNT(*) n FROM amazon_settlement_dirty_orders WHERE mall_order_no IN ('O-R12E', 'O-R12OLD')`).get().n, 0, '送った後は読み直す注文の記録を消した');
+    // (2) 退避: --source v1 の取込 (一時の逃げ道) が同じ決済の V1 を **V2 より新しく** 入れる → 有効な V2 の版のまま (採る版は替わらない)
+    const repV1 = { reportId: 'R12R-V1b', reportType: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE', processingStatus: 'DONE', reportDocumentId: 'D12R-V1b', createdTime: '2026-03-12T00:00:00Z', dataStartTime: P5[0], dataEndTime: P5[1] };
+    const spV1 = { async callAPI(req) { if (req.operation === 'getReport') return repV1; throw new Error(`想定外 ${req.operation}`); } };
+    await runSettlementFetch({ reportId: 'R12R-V1b', dryRun: false, source: 'v1' }, { db, sp: spV1, runId: 'run-r5-fallback', downloadTsv: async () => V1TSV, now: () => new Date(NOW + 3600e3) });
+    const vs2 = versions();
+    assert.equal(vs2.length, 3, '退避の V1 も版として保存した');
+    assert.ok(vs2[2].source_layer === 'sp_api_v1' && vs2[2].ingested_at > vs2[1].ingested_at, '前提: 退避の V1 の版は V2 の版より新しい');
+    assert.equal(selectedLayer(), 'sp_api_v2', '🚨 有効な V2 の版がある決済は、新しい V1 を入れても V2 のまま (#1567 Codex R12 Medium 1)');
+    // (3) V2 の運転に戻る = 次の回も complete のまま・Company DB の中身は変わらない
+    const fx3 = spyFetch();
+    const r3 = await run({ fetchImpl: fx3 });
+    assert.equal(r3.exitCode, 0, `${r3.summary} ${JSON.stringify(r3.reasons)}`);
+    assert.ok(!codes(r3).includes('report_selected_differs'), codes(r3).join(','));
+    assert.equal(fx3.calls.complete, 1); assert.equal((await cov()).state, 'complete');
+    assert.equal(await checksum('O-R12E'), e1New, 'O-R12E は V2 のまま'); assert.equal((await receipt('O-R12OLD')).lines, 0, 'O-R12OLD は墓石のまま');
+  } finally { SP.ing = saved.ing; SP.inv = saved.inv; }
+});
 await t('🚨 一覧の窓の空白 (前の成功した回から 85 日以上あいた) = complete にしない (⚠️ evidence_chain_gap = Seller Central で印を作り直す)・長く止まった後の取込の一覧も同じ 85 日の窓 (止まっている間に窓の外に出た report は取込まない・#1567 Codex R4)', async () => {
   NOW = Date.parse('2026-07-15T00:00:00Z');   // 前の回 (上の試験の 4/10) から 85 日より後
   const ingQ = [];
