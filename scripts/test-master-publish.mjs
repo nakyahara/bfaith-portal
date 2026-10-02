@@ -48,6 +48,8 @@
  *     段階の owner_hash = active (⑤-1 の段階の行の trigger) / 画面の保存の門 (⑤-1 の ops.begin_master_write) = active (記録に無い列 = load)
  *  28 持ち主表のハッシュは 1 つの式 (load の列は数えない。#1564 Codex R3 Medium): JS = DB / 前の列の組で切り替えた後に列を足しても画面の保存・登録の門は通る・
  *     夜間ロードは足した列を load で動かす
+ *  30 セットの導いた値・構成品の行 (コード・数量・C の名前・原価) も入れた後の確かめで比べる (同じ決め方で導き直す・ハッシュに入る) = 書き換え = broken (R7 High)・印を消せない確かめは通らない (R7 Medium 1)
+ *  31 JAN だけ company の prepare は通る (写さない列)・Amazon の構成は断る (R7 Medium 2)
  *  29 最後に commit したロード = DB が振る番号の順 (0055 の ops.master_load_commits。送り手の時計・場所では決めない・数で並べる)・dry-run は番号なし・
  *     0055 の前の毎晩のロード (番号の行が無い) = 最初の朝はそれを使う (commit_seq = null。R5 Low)・
  *     写しは場所を問わず最後のロード・番号の表は足すだけ (#1564 Codex R4 Medium 2・High)
@@ -1854,6 +1856,92 @@ await ta('[29] 最後に commit したロード = DB が振る番号の順 (送�
   await assert.rejects(q("update ops.master_load_commits set host = 'x'"), /足すだけ/);   // 番号そのものは identity (always) = 書き換えられない
   await assert.rejects(q('delete from ops.master_load_commits'), /足すだけ/);
   await nightly();
+});
+
+await ta('[30] セットの導いた値 (原価・税率・税区分・売上分類・取扱区分) と構成品の行 (コード・数量・C の名前・C の原価) も入れた後の確かめで比べる = 作り直しの後に書き換えられた = broken (exit 4)・ハッシュも変わる / 印を消せない確かめは通らない (#1564 Codex R7 High・Medium 1)', async () => {
+  const G = await import('../apps/warehouse/publish-gate.js');
+  const own = OWN('sku_costs', 'skus.tax_rate', 'skus.tax_class', 'products.sales_class', 'skus.handling', 'products.status', 'skus.name', 'products.name');
+  const deps = (extra = {}) => ({ now: new Date(), log: quiet, ping: async () => {}, openSqlite: async () => db,
+    env: { DATA_DIR: tmp, COMPANY_DB_WATCH_URL: 'postgres://test', DAILY_SYNC_RUN_ID: 'ds_test_publish' }, connectFor: () => async () => ({ db: pdb, close: async () => {} }), ...extra });
+  const verify = (extra) => quietly(() => F.cli(['--verify-apply', '--daily'], deps(extra)));
+  db.prepare('DELETE FROM cdb_publish_gate').run();
+  await nightly(own);
+  assert.equal((await fetchGen(own)).state, 'verified');
+  const r = await rebuild();
+  assert.equal(r.ok, true, JSON.stringify(r.checks));
+  // 作り直しが C にあるセットの導き方の入力・構成品の行を残した
+  const ex = db.prepare("SELECT args_json, components_json FROM m_set_publish_expect WHERE set_code = 'set-a'").get();
+  assert.ok(ex, 'set-a の導き方の入力が無い');
+  assert.deepEqual(JSON.parse(ex.components_json).map((x) => [x.c, x.from_cdb]).sort(), [['s-exc', true], ['s-ne', true]]);
+  let v = await verify();
+  assert.equal(v.code, 0, v.last);
+  const base = snap().build.cdb_publish_applied_hash;
+  const row0 = { mp: { ...mp('set-a') }, comps: db.prepare("SELECT * FROM m_set_components WHERE セット商品コード = 'set-a' ORDER BY 構成商品コード").all() };
+  const restore = () => {
+    db.prepare('UPDATE m_products SET 原価 = ?, 原価ソース = ?, 原価状態 = ?, 消費税率 = ?, 税区分 = ?, 売上分類 = ?, 取扱区分 = ? WHERE 商品コード = ?')
+      .run(row0.mp.原価, row0.mp.原価ソース, row0.mp.原価状態, row0.mp.消費税率, row0.mp.税区分, row0.mp.売上分類, row0.mp.取扱区分, 'set-a');
+    for (const c of row0.comps) db.prepare('UPDATE m_set_components SET 数量 = ?, 構成商品名 = ?, 構成商品原価 = ? WHERE セット商品コード = ? AND 構成商品コード = ?').run(c.数量, c.構成商品名, c.構成商品原価, 'set-a', c.構成商品コード);
+  };
+  const cases = [
+    ['原価', "UPDATE m_products SET 原価 = 999 WHERE 商品コード = 'set-a'", /set_derived:cost/],
+    ['原価状態', "UPDATE m_products SET 原価状態 = 'PARTIAL' WHERE 商品コード = 'set-a'", /set_derived:cost/],
+    ['税率・税区分', "UPDATE m_products SET 消費税率 = 0.08, 税区分 = 'REDUCED_8' WHERE 商品コード = 'set-a'", /set_derived:tax/],
+    ['売上分類', "UPDATE m_products SET 売上分類 = 3 WHERE 商品コード = 'set-a'", /set_derived:sales_class/],
+    ['取扱区分', "UPDATE m_products SET 取扱区分 = '取扱中止' WHERE 商品コード = 'set-a'", /set_derived:handling/],
+    ['構成品の名前 (C)', "UPDATE m_set_components SET 構成商品名 = 'WRONG NAME' WHERE セット商品コード = 'set-a' AND 構成商品コード = 's-ne'", /set_components/],
+    ['構成品の原価 (C)', "UPDATE m_set_components SET 構成商品原価 = 999 WHERE セット商品コード = 'set-a' AND 構成商品コード = 's-ne'", /set_components/],
+    ['構成品の数量', "UPDATE m_set_components SET 数量 = 5 WHERE セット商品コード = 'set-a' AND 構成商品コード = 's-ne'", /set_components/],
+  ];
+  for (const [label, sql, re] of cases) {
+    db.prepare(sql).run();
+    const a = MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: OS.sortedOwnership(own), taxRates: TAX_RATES });
+    assert.equal(a.ok, false, label);
+    assert.ok(a.problems.some((p) => re.test(p.col)), `${label}: ${JSON.stringify(a.problems)}`);
+    assert.notEqual(a.applied_hash, base, label);   // ハッシュも変わる
+    v = await verify();
+    assert.equal(v.code, 4, `${label}: ${v.last}`);
+    assert.deepEqual([G.readGateRow(db).state, G.readPublishGate({ db }).open], ['broken', false], label);
+    restore();
+    v = await verify();
+    assert.equal(v.code, 0, `${label} (戻した): ${v.last}`);
+    assert.equal(G.readGateRow(db).state, 'safe', label);
+  }
+  // 導き方の入力が無い (別の作り直しの名残・消えた) = 確かめられない = broken
+  const exAll = db.prepare('SELECT * FROM m_set_publish_expect').all();
+  db.prepare("DELETE FROM m_set_publish_expect WHERE set_code = 'set-a'").run();
+  v = await verify();
+  assert.equal(v.code, 4, v.last);
+  assert.match(v.last, /applied_mismatch/);
+  const insEx = db.prepare('INSERT OR REPLACE INTO m_set_publish_expect (set_code, args_json, components_json) VALUES (?, ?, ?)');
+  for (const x of exAll) insEx.run(x.set_code, x.args_json, x.components_json);
+  assert.equal((await verify()).code, 0);
+  // 印を消せない確かめ = 通っていない (exit 1・safe の行にしない。#1564 Codex R7 Medium 1)
+  const stopFile = path.join(tmp, G.GATE_STOP_MARK);
+  G.writeStopMark({ dataDir: tmp }, { state: 'unknown', reason: '試験', now: new Date() });
+  const va = await F.runVerifyApply({ sqlite: db, dataDir: tmp, taxRates: TAX_RATES, clearMark: () => ({ ok: false, removed: false, error: '消せない (試験)' }) });
+  assert.equal(va.state, 'failed', JSON.stringify(va.problems));
+  assert.ok(va.problems.includes('stop_mark_clear_failed'));
+  assert.deepEqual([G.readGateRow(db).state, fs.existsSync(stopFile), G.readPublishGate({ db }).open], ['unknown', true, false]);
+  const okv = await verify();   // 消せるようになった = 通る・印も消える
+  assert.equal(okv.code, 0, okv.last);
+  assert.deepEqual([G.readGateRow(db).state, fs.existsSync(stopFile)], ['safe', false]);
+  db.prepare('DELETE FROM cdb_publish_gate').run();
+  await nightly();
+});
+
+await ta('[31] JAN (external_ids.jan・⑤-2b) だけ company の prepare は通る (古い表に置き場所が無い = 写さない列)・Amazon の構成 (listing_components.amazon) は ⑦-2 まで断る (#1564 Codex R7 Medium 2)', async () => {
+  assert.deepEqual(MP.checkPublishOwnership(OWN('external_ids.jan')), []);
+  assert.deepEqual(MP.publishCols(OWN('external_ids.jan')), []);   // 写す列は無い
+  assert.deepEqual(MP.checkPublishOwnership(OWN('listing_components.amazon')), ['not_copied:listing_components.amazon']);
+  const logs = [];
+  const epochCli = (argv, extra = {}) => quietly(() => EP.cli(argv, { env: {}, connect: async () => ({ db: pdb, close: async () => {} }), log: (m) => logs.push(m), ...extra }));
+  await q('delete from ops.master_ownership_state');
+  assert.equal(await epochCli(['prepare'], { ownership: OWN('external_ids.jan') }), 0, logs.at(-1));
+  assert.equal((await OS.readOwnershipState(pdb)).prepared.map['external_ids.jan'], 'company');
+  assert.equal(await epochCli(['prepare'], { ownership: OWN('listing_components.amazon') }), 1);
+  assert.match(logs.at(-1), /not_copied:listing_components\.amazon/);
+  assert.equal(await epochCli(['cancel']), 0);
+  await q('delete from ops.master_ownership_state');
 });
 
 await pg.close();

@@ -29,6 +29,7 @@ import { normSku } from '../../lib/sku-norm.js';
 import { companyOwned } from '../../config/master-ownership.mjs';
 import { ownershipHash as canonicalOwnershipHash } from '../../lib/master-cutover.mjs';
 import { canonicalSupplierCode, mapHandling } from '../company-db/load/sources.mjs';
+import { deriveSetValues } from '../../lib/master-set-rules.js';
 
 /** 写す列 → 持ち主のキー (config/master-ownership.mjs)。④a で写すのはこれだけ (仕入先そのもの = ④b・構成・代表・Amazon SKU = 写さない。15 §2) */
 export const PUBLISH_COLUMNS = Object.freeze({
@@ -47,6 +48,9 @@ export const PUBLISH_COLUMNS = Object.freeze({
 export const NO_OLD_TABLE_COPY = Object.freeze({
   'products.name': 'skus.name と一緒に切り替える (m_products の商品名は skus.name から)',
   'products.status': 'skus.handling と一緒に切り替える (m_products の取扱区分は skus.handling から)',
+  // ⑤-2b (0053): JAN は古い表 (m_products・横の表) に置き場所が無い = 写すものが無い。JAN の正は Company DB の external_ids と
+  //   ⑤-2b の JAN の記録・NE 登録の CSV の道 (#1564 Codex R7 Medium 2)。listing_components.amazon は ⑦-2 まで止める (ここに足さない)
+  'external_ids.jan': '古い表に JAN の置き場所が無い (正 = Company DB の external_ids・⑤-2b の JAN の記録と NE 登録の CSV)',
 });
 /** 一緒に切り替える組 (持ち主が違うと、同じものの 2 つの値の片方だけが C になる) */
 export const CO_SWITCH_GROUPS = Object.freeze([['products.name', 'skus.name'], ['products.status', 'skus.handling'], ['skus.tax_rate', 'skus.tax_class']]);
@@ -468,6 +472,25 @@ export function applySideTables(db, pub, { now = new Date() } = {}) {
  * NE にしか無い SKU (C に無い = 写していない) は比べない (そのまま) = not_in_cdb に数え、コードの一部を not_in_cdb_codes に
  * @returns {{ ok: boolean, problems: object[], counts: { keys, checked, derived, not_in_ne, not_in_cdb, unchanged }, not_in_cdb_codes: string[], applied_hash: string }}
  */
+/**
+ * C にあるセットの導き方の入力・構成品の行を入れ替える (作り直しの取引の中で m_products と一緒に。#1564 Codex R7 High)。
+ * rows = [{ code, args: deriveSetValues の引数, components: [{ c, qty, name, cost, from_cdb }] }]
+ */
+export function writeSetPublishExpect(db, rows) {
+  db.exec('DELETE FROM m_set_publish_expect');
+  const ins = db.prepare('INSERT INTO m_set_publish_expect (set_code, args_json, components_json) VALUES (?, ?, ?)');
+  for (const r of rows) ins.run(r.code, JSON.stringify(r.args), JSON.stringify(r.components));
+}
+/** 作り直しが残したセットの導き方の入力・構成品の行 (表が無い = 空) */
+function readSetPublishExpect(db) {
+  try {
+    return new Map(db.prepare('SELECT set_code, args_json, components_json FROM m_set_publish_expect').all()
+      .map((r) => [r.set_code, { args: JSON.parse(r.args_json), components: JSON.parse(r.components_json) }]));
+  } catch (e) {
+    if (/no such table/.test(String(e && e.message))) return new Map();
+    throw e;
+  }
+}
 export function verifyApplied(db, { publication, ownership, taxRates = [], expected = null, maxProblems = 20 }) {
   const cols = publishCols(ownership);
   const out = { ok: true, problems: [], counts: { keys: 0, checked: 0, derived: 0, not_in_ne: 0, not_in_cdb: 0, unchanged: 0, kind_mismatch: 0, mixed_sets: 0 }, not_in_cdb_codes: [],
@@ -486,6 +509,13 @@ export function verifyApplied(db, { publication, ownership, taxRates = [], expec
   const eg = ownSet.has('cost') ? group('SELECT sku, genka FROM exception_genka') : new Map();
   const ps = ownSet.has('shipping') ? group('SELECT sku, shipping_code, ship_method, ship_cost FROM product_shipping') : new Map();
   const codes = new Map(rows.map((m) => [m.商品コード, m.商品区分]));
+  // C にあるセット: 作り直しが残した導き方の入力 (同じ決め方 = lib/master-set-rules.js の deriveSetValues で導き直す) と構成品の行 (#1564 Codex R7 High)
+  const setExpect = readSetPublishExpect(db);
+  const setCompRows = new Map();
+  for (const r of db.prepare('SELECT セット商品コード AS s, 構成商品コード AS c, 数量 AS qty, 構成商品名 AS name, 構成商品原価 AS cost FROM m_set_components').all()) {
+    const k = lower(r.s); if (!setCompRows.has(k)) setCompRows.set(k, []); setCompRows.get(k).push(r);
+  }
+  const SET_DERIVED_COLS = ['cost', 'tax_rate', 'tax_class', 'sales_class', 'handling'];
   const comp = completeness(codes, allEntries, cols);
   for (const list of comp.collided) bad(list.join(','), '*', 'one_code_per_sku', 'norm_collision');
   for (const [code, col] of comp.missing) bad(code, col, 'value', 'missing');
@@ -516,6 +546,31 @@ export function verifyApplied(db, { publication, ownership, taxRates = [], expec
     if (!e || collidedCodes.has(code)) continue;
     matched.add(k); out.counts.keys++;
     const kind = m.商品区分; const isSet = kind === 'セット';
+    // C にあるセット = 導いた値 (原価・税率・税区分・売上分類・取扱区分) を同じ決め方で導き直して m_products と比べる・構成品の行 (コード・数量・名前・原価) を比べる。
+    //   どちらもハッシュに入れる (作り直しの後に書き換えられた = applied_hash が変わる)
+    if (isSet && (cols.some((c) => SET_DERIVED_COLS.includes(c)) || cols.includes('name'))) {
+      const ex = setExpect.get(code);
+      if (!ex) bad(code, 'set_expect', 'row', 'missing');
+      else {
+        const d = deriveSetValues(ex.args);
+        const selfCost = Object.hasOwn(e.v, 'cost') && e.v.cost && e.v.cost.source !== 'set_calc';   // セット自身の人の決めた原価 = 下の cost で C と比べる
+        if (ownSet.has('cost') && !selfCost) check('set_derived:cost', [d.genka, d.genkaSource, d.genkaStatus], [m.原価, m.原価ソース, m.原価状態]);
+        if (ownSet.has('tax_rate') || ownSet.has('tax_class')) check('set_derived:tax', [d.taxRate, d.taxCategory], [m.消費税率, m.税区分]);
+        if (ownSet.has('sales_class')) check('set_derived:sales_class', d.salesClass ?? null, m.売上分類 ?? null);
+        if (ownSet.has('handling')) check('set_derived:handling', d.handling, m.取扱区分);
+        const want = [...ex.components].sort((a, b) => (a.c < b.c ? -1 : a.c > b.c ? 1 : 0)).map((x) => [x.c, x.qty, x.name, x.cost]);
+        const got = (setCompRows.get(lower(code)) || []).map((r) => [lower(r.c), r.qty, r.name, r.cost]).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+        check('set_components', want, got);
+        // 構成品の名前・原価が C の値のもの (作り直しで C から取った) = 世代の C の値と同じか (残した行も C と合う)
+        for (const x of ex.components) {
+          if (!x.from_cdb) continue;
+          const ce = entries.get(normSku(x.c));
+          if (!ce) { bad(`${code}/${x.c}`, 'set_component_cdb', 'entry', 'missing'); continue; }
+          if (ownSet.has('name') && Object.hasOwn(ce.v, 'name') && !same(ce.v.name, x.name)) bad(`${code}/${x.c}`, 'set_component_name', ce.v.name, x.name);
+          if (ownSet.has('cost') && Object.hasOwn(ce.v, 'cost') && !same(ce.v.cost ? (ce.v.cost.jpy || null) : null, x.cost)) bad(`${code}/${x.c}`, 'set_component_cost', ce.v.cost, x.cost);
+        }
+      }
+    }
     for (const col of cols) {
       if (!Object.hasOwn(e.v, col)) continue;   // 要る欄が無い = 上の完全さで数えた
       const c = e.v[col];

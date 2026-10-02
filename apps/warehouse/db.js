@@ -892,7 +892,14 @@ function createTables() {
   )`);
   addColumnIfMissing('cdb_publish_gate', 'applied_hash', 'TEXT');
   addColumnIfMissing('cdb_publish_gate', 'ownership_hash', 'TEXT');
-  addColumnIfMissing('cdb_publish_generations', 'load_commit_seq', 'INTEGER');   // 世代が読んだ夜間ロードの commit の番号 (0055。activate が比べる。#1564 Codex R4 Medium 2)
+  addColumnIfMissing('cdb_publish_generations', 'load_commit_seq', 'INTEGER');
+  // 16b''. C にあるセットの導き方の入力・構成品の行 (#1564 Codex R7 High)。書くのは作り直しの取引 (m_products と一緒に入れ替える)。
+  //   入れた後の確かめ (master-publish.js の verifyApplied) が同じ決め方で導き直して m_products・m_set_components と比べる (持ち主が全部 load = 行が無い)
+  db.exec(`CREATE TABLE IF NOT EXISTS m_set_publish_expect (
+    set_code        TEXT PRIMARY KEY,
+    args_json       TEXT NOT NULL,
+    components_json TEXT NOT NULL
+  )`);   // 世代が読んだ夜間ロードの commit の番号 (0055。activate が比べる。#1564 Codex R4 Medium 2)
   // 16c. raw_ne_products / raw_ne_set_products の通し番号 (sync_meta の ne_raw_<kind>_rev)。書き換えた行 1 つにつき 1 増える (INSERT OR REPLACE も 1)。
   //   どの書き込み口でも同じ取引で増える → NE 取込の完了の印 (ne_api_<kind>_complete_rev) と比べて「印の後に書かれたか」を見分ける (readNeRawRev)
   for (const [table, kind] of [['raw_ne_products', 'products'], ['raw_ne_set_products', 'setproducts']]) {

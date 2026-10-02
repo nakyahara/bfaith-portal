@@ -10,11 +10,11 @@ import {
   TAX_RATES, KNOWN_NE_RATES, KNOWN_DECIMAL_RATES, resolveTaxRate, resolveSetTaxRate,
   SALES_CLASSES, EXPORT_SALES_CLASS, resolveSetSalesClass,
   HANDLING_ACTIVE, HANDLING_STOPPED, HANDLING_MAKER_STOPPED, resolveSetHandlingClass,
-  setCostFromComponents,
+  setCostFromComponents, deriveSetValues,
 } from '../../lib/master-set-rules.js';
 import crypto from 'node:crypto';
 import { ALL_LOAD } from '../company-db/load/ownership-state.mjs';
-import { readCurrentPublish, makePublishResolver, mergeReasons, handlingFromCdb, publishCols, applySideTables, verifyApplied, ownershipHash } from './master-publish.js';
+import { readCurrentPublish, makePublishResolver, mergeReasons, handlingFromCdb, publishCols, applySideTables, verifyApplied, ownershipHash, writeSetPublishExpect } from './master-publish.js';
 
 // ─── ヘルパー ───
 
@@ -25,6 +25,7 @@ function now() {
 // 税率・売上分類・取扱区分・原価のセットの決め方は lib/master-set-rules.js に移した (マスタ入力画面 apps/master-edit と同じ規則を共用する。Company DB構想 14 §6 ⑤-1)。
 // 今までどおりここからも import できるように、同じ名前で export し直す
 export {
+  deriveSetValues,
   TAX_RATES, KNOWN_NE_RATES, KNOWN_DECIMAL_RATES, resolveTaxRate, resolveSetTaxRate,
   SALES_CLASSES, EXPORT_SALES_CLASS, resolveSetSalesClass,
   HANDLING_ACTIVE, HANDLING_STOPPED, HANDLING_MAKER_STOPPED, resolveSetHandlingClass,
@@ -33,41 +34,6 @@ export {
 /** Company DB の税率 (小数) → NE の整数 (構成品の入力を C の値に替えるとき。resolveTaxRate にそのまま渡せる形) */
 export const neRateOfDecimal = (decimal) => TAX_RATES.find((t) => t.decimal === decimal)?.neRate ?? null;
 
-/**
- * セットの原価・税率・売上分類・取扱区分を構成品から導く (今までの決め方。上の決定表と原価の合計)。
- * 構成品の入力を Company DB の値に替えて同じ決め方を通すために 1 つにまとめた (マスタ正本切替 ④a。設計 15 §2)
- * @param {object} p
- * @param {{ cost: number|null, qty: number, tax: object, sales: object, handling: object }[]} p.inputs  構成品 (tax / sales / handling は上の resolve* の入力の形)
- * @param {object|null} p.eg  セット自身の例外原価の行 (あれば構成品より優先)
- * @param {number|null|undefined} p.manualSalesClass  セット自身の売上分類の手動登録 (あれば構成品より優先)
- * @param {string|null|undefined} p.neSetStatus  NE のセット自身の取扱区分
- */
-export function deriveSetValues({ inputs, eg, manualSalesClass, neSetStatus }) {
-  // 原価 (構成品の原価 × 数量の合計。決め方は lib/master-set-rules.js の setCostFromComponents = マスタ入力画面と同じ。⑤-1)
-  const setCost = setCostFromComponents(inputs.map((c) => ({ cost: c.cost, qty: c.qty })));
-  let genka = null, genkaSource = '不明', genkaStatus = 'MISSING';
-  if (eg) {
-    genka = eg.genka;
-    genkaSource = '例外';
-    genkaStatus = 'OVERRIDDEN';
-  } else if (setCost.status === 'COMPLETE') {
-    genka = setCost.jpy;
-    genkaSource = 'セット計算';
-    genkaStatus = 'COMPLETE';
-  } else if (setCost.status === 'PARTIAL') {
-    genkaStatus = 'PARTIAL';
-  }
-  // 税区分 (構成品の税率から導出。MIXED は taxRate に最小値を入れる既存仕様を踏襲)
-  // 構成品が1つでも解決できなければ UNKNOWN に倒し、上流異常を握り潰さない
-  const { taxRate, taxCategory } = resolveSetTaxRate(inputs.map((c) => c.tax));
-  // 売上分類 (手動登録が最優先。無ければ構成品の MIN から導出)
-  //   導出も効かない (構成品が未登録 / NE に無い) セットだけが NULL で残り、register の「分類未登録」に出る。
-  const salesClass = manualSalesClass ?? resolveSetSalesClass(inputs.map((c) => c.sales));
-  // 取扱区分: NE のセット自身の値。それが 取扱中 (または NE に無い) なら構成品の止め方を引き継ぐ
-  //   (2026-09-14 中原さん指示。決定表は resolveSetHandlingClass)
-  const handling = resolveSetHandlingClass(neSetStatus, inputs.map((c) => c.handling));
-  return { genka, genkaSource, genkaStatus, taxRate, taxCategory, salesClass, handling };
-}
 
 // ─── 本番反映時の列リスト（Codex PR1 Round 3 High 反映: 明示列INSERT） ───
 // 物理的な列順が異なるDBでも値が正しくマップされるよう、
@@ -206,6 +172,8 @@ export function applyStagingToProduction(db, { build = null } = {}) {
     // 同じ NE の取得・同じ世代・同じ中身の作り直しは、ここまで来ない (rebuildMProductsLocked の unchangedSinceLastBuild = 何も書かない。#1564 Codex R2 Medium 5)。
     //   ここに来た作り直し (NE の取得が新しい・世代が新しい・中身が違う) は今までどおり全部入れ替える。上書き表は値が同じ行は触らない
     const pub = build ? build.publish : null;
+    // C にあるセットの導き方の入力・構成品の行 (#1564 Codex R7 High)。m_products と同じ取引で入れ替える = 入れた後の確かめ (今・次の工程) が同じ決め方で導き直して比べる
+    if (build) writeSetPublishExpect(db, build.setExpect || []);
     const side = pub ? applySideTables(db, pub) : null;
     const applied = pub ? verifyApplied(db, { publication: pub.publication, ownership: pub.ownership, taxRates: TAX_RATES, expected: pub.active ? pub.expected : null }) : null;
     if (applied && !applied.ok) {
@@ -468,6 +436,7 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
     VALUES (?, ?, ?, ?, ?, ?)
   `);
 
+  const setExpect = [];   // C にあるセットの導き方の入力・構成品の行 (#1564 Codex R7 High)
   let countSet = 0;
   let countSetSalesDerived = 0; // 売上分類を構成品から導出したセット件数
   let countSetHandlingDerived = 0; // 取扱区分を構成品から引き継いだセット件数
@@ -490,6 +459,7 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
     const selfC = pub.active ? pub.peek(setCode) : null;
     // Company DB の値で導き直すときの構成品の入力 (④a。セット自身が C にあるときだけ・持ち主が C の列だけ替える。NE に無い構成品は替えない = 今までどおり上流の異常として扱う)
     const cInputs = [];
+    const expectComps = [];   // C にあるセットの構成品の行 (入れた後の確かめが m_set_components と比べる。#1564 Codex R7 High)
     for (const comp of components) {
       const compCode = comp.商品コード?.toLowerCase() || '';
       const exists = !!comp.ne_exists;
@@ -516,6 +486,7 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
       }
 
       pub.expectComponent(setCode, compCode, { name: comp.商品名 || '', cost: comp.原価 || null }, { fromCdb: !!c });
+      expectComps.push({ c: compCode, qty: comp.数量 || 1, name: compName, cost: compCost, from_cdb: !!c });
       // 構成品staging投入 (構成商品名・構成商品原価は、持ち主が C なら C の値)
       insertComponentStaging.run(
         setCode, compCode, comp.数量 || 1,
@@ -544,13 +515,16 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
       //   (C の原価の行が人の決めた原価ならそれを重ねる = overlay の set)。
       //   取扱区分はセット自身の C の値から。語は今までの決め方の値 (neD) に合わせる (C はセットの導いた値を持つ = 持ち主を替えただけで ﾒｰｶｰ取扱中止 → 取扱中止 にしない)
       const self = selfC;
-      const cD = deriveSetValues({
+      const cArgs = {
         inputs: cInputs,
         eg: pub.has(self, 'cost') ? null : eg,
         // 売上分類の持ち主が C = セットの手動の行 (product_sales_class) は使わない = 構成品の C の値から導くだけ (15 §5 の 2 の推奨・Codex R1 H3)
         manualSalesClass: pub.owns('sales_class') ? undefined : salesClassMap.get(setCode),
         neSetStatus: pub.has(self, 'handling') ? handlingFromCdb(self.v.handling, neD.handling) : neInfo?.取扱区分,
-      });
+      };
+      const cD = deriveSetValues(cArgs);
+      // 導き方の入力と構成品の行を残す (作り直しの取引で m_set_publish_expect に入れる = 入れた後の確かめが同じ決め方で導き直して m_products と比べる)
+      setExpect.push({ code: setCode, args: cArgs, components: expectComps });
       v = pub.overlay(setCode, {
         ...neV, genka: cD.genka, genkaSource: cD.genkaSource, genkaStatus: cD.genkaStatus,
         taxRate: cD.taxRate, taxCategory: cD.taxCategory, salesClass: cD.salesClass, handling: cD.handling,
@@ -760,7 +734,7 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
   //   + 上書き表の既にある行を持ち主が C の列の値にそろえる (④a。同じ取引・記録の前。持ち主が全部 load なら何もしない)
   let build;
   try {
-    build = applyStagingToProduction(db, { build: { buildId, startMarks, startedAt, expectedStagingHash: myStagingHash, reasons, publish: pub } });
+    build = applyStagingToProduction(db, { build: { buildId, startMarks, startedAt, expectedStagingHash: myStagingHash, reasons, publish: pub, setExpect } });
   } catch (e) {
     if (!e || e.code !== 'CDB_PUBLISH_VERIFY') throw e;
     const msg = `❌ 入れた後の確かめで Company DB の値と違う → 反映中止 (巻き戻した = 前の m_products のまま): ${String(e.message).slice(0, 300)}`;

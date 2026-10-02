@@ -445,7 +445,7 @@ export async function runPublish({ db = null, connect = null, sqlite, dataDir, o
  * @returns {{ state: 'verified'|'failed', problems: string[], evidence, line }}
  */
 export async function runVerifyApply({ sqlite, dataDir, ownership: configured = MASTER_OWNERSHIP, now = new Date(), syncRunId = process.env.DAILY_SYNC_RUN_ID || null,
-  write = (d, n, p) => writeEvidence(d, n, p, { now }), read = readEvidence, taxRates = null }) {
+  write = (d, n, p) => writeEvidence(d, n, p, { now }), read = readEvidence, taxRates = null, clearMark = clearStopMark }) {
   const rates = taxRates || (await import('../../warehouse/rebuild-m-products.js')).TAX_RATES;
   const evKey = syncRunId ? EVIDENCE_NAME : `${EVIDENCE_NAME}.manual`;   // writeEvidence は実行 ID の無い回を .manual に書く
   const fetchEv = read(dataDir, jstDateStr(now))[evKey] ?? null;
@@ -508,10 +508,16 @@ export async function runVerifyApply({ sqlite, dataDir, ownership: configured = 
     stopMark = writeStopMark({ db: sqlite, dataDir }, { state: gateNext, reason: `${problems.join('・')} / ${gateError}`, now });
     if (!stopMark.ok) problems.push('stop_mark_write_failed');
   } else if (gateNext === 'safe' && !gateError) {
-    stopMark = clearStopMark({ db: sqlite, dataDir });
-    if (!stopMark.ok) problems.push('stop_mark_clear_failed');
+    stopMark = clearMark({ db: sqlite, dataDir });
+    if (!stopMark.ok) {
+      // 印を消せない = 後の工程は止まったまま = 確かめは通っていない (exit 1・fail の ping)。門の行も safe のままにしない (#1564 Codex R7 Medium 1)
+      problems.push('stop_mark_clear_failed');
+      try { writePublishGate(sqlite, { state: 'unknown', reason: `stop_mark_clear_failed: ${stopMark.error}`, buildId: build ? build.build_id : null, generationNo: bp ? bp.generation_no : null, checkedAt: now.toISOString(), now }); }
+      catch (e) { problems.push('gate_write_failed'); }
+    }
   }
-  const stateOut = state === 'verified' && gateError ? 'failed' : state;
+  const markClearFailed = problems.includes('stop_mark_clear_failed');
+  const stateOut = state === 'verified' && (gateError || markClearFailed) ? 'failed' : state;
   const apply = { state: stateOut, broken, problems, checked_at: now.toISOString(),
     gate: { before: gateBefore ? gateBefore.state : gateReadError ? 'unreadable' : null, after: gateError ? (gateBefore ? gateBefore.state : gateReadError ? 'unreadable' : null) : (gateNext ?? (gateBefore ? gateBefore.state : null)),
       error: gateError, read_error: gateReadError, lag_safe: lagOnlyMatch && gateNext === 'safe' && !gateError, stop_mark: stopMark }, epoch: epochKind, configured: ownershipHash(configured), build_id: build ? build.build_id : null, generation_no: bp ? bp.generation_no : null,
