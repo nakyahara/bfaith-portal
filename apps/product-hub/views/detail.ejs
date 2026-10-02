@@ -5852,6 +5852,22 @@ th.attr-unknown { color: #dc2626; }
     // 🚨 completed_at を基準にしない: lease 切れの後に結果が届いた依頼は completed_at が古いまま (codex #1591 R3 Low)
     const checkingModel = (job) => !!job && !!job.model && !job.model_check && job.status === 'done';
 
+    // lpc-images-text:start (試験がここを切り出して動かす・scripts/test-ph-lp-compose-ui.mjs)
+    // AI に渡す画像の並び。作っている間・確認待ちの間はその依頼で渡した画像だけ。終わった後は
+    // 「この依頼で渡した画像」(測定はこちら) と「もう一度押すと渡す画像」(いまの画像タブ) の両方
+    // (codex #1592 R2 High: 終わった依頼の並びだけを出すと、画像を差し替えて押し直したときに食い違う)
+    function lpcImagesText(s, inProgress) {
+      const line = (imgs) => imgs.map((im) => im.label).join(' → ');
+      const jobImgs = s.job && Array.isArray(s.job.images) && s.job.images.length ? s.job.images : null;
+      const plan = Array.isArray(s.image_plan) ? s.image_plan : [];
+      const lines = [];
+      if (jobImgs) lines.push('この依頼で AI に渡した画像: ' + line(jobImgs));
+      if (!inProgress && !s.blocked && plan.length) lines.push((jobImgs ? 'もう一度押すと渡す画像: ' : '押すと AI に渡す画像: ') + line(plan));
+      if (!lines.length) return '';
+      return lines.join('\n') + '\n— 測定で比べるときは「📝 商品分析を準備」の ChatGPT 版にも、その依頼で AI に渡した画像を同じ順に添付してください';
+    }
+    // lpc-images-text:end
+
     function render(s) {
       state = s;
       const job = s.job;
@@ -5863,13 +5879,8 @@ th.attr-unknown { color: #dc2626; }
       const ml = s.model_label ? ' (' + s.model_label + ')' : '';
       btn.textContent = running ? '🤖 AI' + ml + ' が作っています…' : '🤖 構成をAIに作らせる' + ml;
 
-      // 依頼があればその依頼で渡した画像 (受付時に固定)、無ければ押したときに渡す画像
-      const jobImgs = job && Array.isArray(job.images) && job.images.length ? job.images : null;
-      const imgs = jobImgs || (Array.isArray(s.image_plan) ? s.image_plan : []);
-      imagesEl.textContent = imgs.length
-        ? (jobImgs ? 'この依頼で AI に渡した画像: ' : '押すと AI に渡す画像: ') + imgs.map((im) => im.label).join(' → ')
-          + ' — 測定で比べるときは「📝 商品分析を準備」の ChatGPT 版にも同じ画像を同じ順に添付してください'
-        : '';
+      imagesEl.textContent = lpcImagesText(s, running || checkingModel(job));
+      imagesEl.style.whiteSpace = 'pre-wrap';
 
       specEl.textContent = s.spec
         ? '仕様書: ' + s.spec.title + ' (' + String(s.spec.imported_at || '').slice(0, 10) + ' 取込)'

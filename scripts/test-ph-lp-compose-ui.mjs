@@ -257,6 +257,16 @@ console.log('⑥c 🚨 商品画像が無ければ押す前に止める (2026-10
   }
   const s6 = embedded((await getDetail(d4)).html);
   eq((s6.image_plan || []).map((im) => im.label), ['白抜き', '1 TOP', '2', '3', '4', '5'], '🚨 押す前に「AI に渡す画像」の並びが画面に渡る');
+  // 画面の JS (lpcImagesText) を描画済みの HTML から切り出して実際に動かす (codex #1592 R2 High)
+  const html6pre = (await getDetail(d4)).html;
+  const src = html6pre.slice(html6pre.indexOf('// lpc-images-text:start'), html6pre.indexOf('// lpc-images-text:end'));
+  ok(src.includes('function lpcImagesText'), '画面の JS から切り出せる');
+  const lpcImagesText = new Function(src + '\nreturn lpcImagesText;')();
+  const t6 = lpcImagesText(s6, false);
+  ok(t6.includes('この依頼で AI に渡した画像: 白抜き → 1 TOP\n'), `終わった前回の依頼の並び (${JSON.stringify(t6)})`);
+  ok(t6.includes('もう一度押すと渡す画像: 白抜き → 1 TOP → 2 → 3 → 4 → 5'), '🚨 押し直したときに渡すいまの並びも出す (前回の並びだけを出さない)');
+  eq(lpcImagesText({ job: null, image_plan: s6.image_plan, blocked: null }, false).split('\n')[0], '押すと AI に渡す画像: 白抜き → 1 TOP → 2 → 3 → 4 → 5', '依頼が無ければいまの並びだけ');
+  eq(lpcImagesText({ job: null, image_plan: [], blocked: '商品画像がありません' }, false), '', '押せないときは出さない');
   const post6 = await fetch(`${base}/api/drafts/${d4}/lp-compose`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0004c' }),
   });
@@ -267,6 +277,8 @@ console.log('⑥c 🚨 商品画像が無ければ押す前に止める (2026-10
   const sj = embedded((await getDetail(d4)).html);
   eq(sj.job.images.map((im) => im.label), ['白抜き', '1 TOP', '2', '3', '4', '5'], '依頼の後は「この依頼で渡した画像」(受付時に固定) が画面に渡る');
   eq(sj.job.images[0].file_id, 'FILEIDWHITE01', '測定行に書く file_id も渡る');
+  const tj = lpcImagesText(sj, true);
+  ok(tj.startsWith('この依頼で AI に渡した画像: 白抜き → 1 TOP → 2 → 3 → 4 → 5') && !tj.includes('もう一度押すと'), '作っている間はその依頼の並びだけ');
   const html6 = (await getDetail(d4)).html;
   ok(html6.includes('id="lpc-images"'), '画像の並びを出す置き場がある');
   db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ?`).run(d4);
