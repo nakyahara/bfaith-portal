@@ -5843,10 +5843,10 @@ th.attr-unknown { color: #dc2626; }
       if (job.model_check === 'match') return job.model_label + '・モデル確認済み';
       return job.model_label;
     }
-    // できてから実モデルの確認が付くまで (ふつうは数十秒〜2 分)。サーバは 15 分付かなければ「未確認」で閉じる
-    // (= needs_review になってポーリングも止まる)。ここは 16 分を上限に見に行く
-    const checkingModel = (job) => !!job && !!job.model && !job.model_check && job.status === 'done'
-      && (Date.now() - Date.parse(job.completed_at || 0)) < 960000;
+    // できてから実モデルの確認が付くまで (ふつうは数十秒〜2 分) 見に行く。上限は置かない —
+    // サーバが 15 分付かなければ「未確認」で閉じる (= needs_review になってポーリングも止まる)。
+    // 🚨 completed_at を基準にしない: lease 切れの後に結果が届いた依頼は completed_at が古いまま (codex #1591 R3 Low)
+    const checkingModel = (job) => !!job && !!job.model && !job.model_check && job.status === 'done';
 
     function render(s) {
       state = s;

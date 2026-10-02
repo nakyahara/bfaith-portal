@@ -760,7 +760,13 @@ export function submitResult(db, generationId, {
       demoteForModel(db, job.id, gen.model_check, gen.actual_model, gen.model, nowS);
     }
     if (v === 'accepted') {
-      logEvent(db, job.draft_id, 'lp_compose_done', `依頼 ${job.id} (${rounds ?? '?'} 巡)`, 'ph-lp-compose');
+      // 🚨 「完了」(lp_compose_done) は実モデルが一致してから記録する (codex #1591 R3 Low)。
+      //    ここで記録すると、後から不一致・未確認で needs_review に落ちても商品の履歴は「完了」のまま残る
+      if (gen.model_check === 'match') {
+        logEvent(db, job.draft_id, 'lp_compose_done', `依頼 ${job.id} (${rounds ?? '?'} 巡)`, 'ph-lp-compose');
+      } else if (!gen.model_check) {
+        logEvent(db, job.draft_id, 'lp_compose_result', `依頼 ${job.id} (${rounds ?? '?'} 巡・モデル確認待ち)`, 'ph-lp-compose');
+      }
       return { ok: true, status: gen.model_check && gen.model_check !== 'match' ? 'needs_review' : 'done', already: false, receipt: receiptObj };
     }
     logEvent(db, job.draft_id, 'lp_compose_rejected', `依頼 ${job.id}: ${trim(reason, 200)}`, 'ph-lp-compose');
@@ -944,6 +950,9 @@ export function recordModelCheck(db, { runnerRunId, actualModels, now = Date.now
   }
   const nowS = new Date(now).toISOString();
   return db.transaction(() => {
+    // 🚨 先に 15 分を過ぎたものを「未確認」で閉じる。閉じる処理は queue や画面から呼ばれるので、
+    //    ランナーが止まっていた後の再送が先に届くと、期限切れのものに「一致」が付いて本文が出てしまう (codex #1591 R3 Medium)
+    closeUncheckedModels(db, now);
     const gens = db.prepare(`SELECT id, job_id, model FROM ph_lp_compose_generations
       WHERE runner_run_id = ? AND model_check IS NULL ORDER BY id`).all(run);
     const checks = [];
@@ -982,7 +991,14 @@ function applyModelCheck(db, gen, check, actualModel, nowS) {
     WHERE id = ? AND model_check IS NULL`)
     .run(actualModel, check, nowS, gen.id).changes;
   if (ch !== 1) return false;
-  if (check !== 'match') demoteForModel(db, gen.job_id, check, actualModel, gen.model, nowS);
+  if (check !== 'match') {
+    demoteForModel(db, gen.job_id, check, actualModel, gen.model, nowS);
+  } else {
+    const job = db.prepare('SELECT id, draft_id, status, review_rounds FROM ph_lp_compose_jobs WHERE id = ?').get(gen.job_id);
+    if (job?.status === 'done') {
+      logEvent(db, job.draft_id, 'lp_compose_done', `依頼 ${job.id} (${job.review_rounds ?? '?'} 巡・${actualModel})`, 'ph-lp-compose');
+    }
+  }
   return true;
 }
 
@@ -991,9 +1007,14 @@ function demoteForModel(db, jobId, check, actualModel, requested, nowS) {
   const message = check === 'mismatch'
     ? `頼んだモデル (${requested}) と違うモデル (${actualModel || '?'}) で作られたので使いません。もう一度依頼してください`
     : `本回答を書いたモデルを確かめられなかったので使いません。もう一度依頼してください`;
-  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'needs_review', error_code = ?, error = ?, updated_at = ?
+  const code = check === 'mismatch' ? 'model_mismatch' : 'model_unverified';
+  const ch = db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'needs_review', error_code = ?, error = ?, updated_at = ?
     WHERE id = ? AND status = 'done'`)
-    .run(check === 'mismatch' ? 'model_mismatch' : 'model_unverified', message, nowS, jobId);
+    .run(code, message, nowS, jobId).changes;
+  if (ch === 1) {
+    const job = db.prepare('SELECT draft_id FROM ph_lp_compose_jobs WHERE id = ?').get(jobId);
+    logEvent(db, job.draft_id, 'lp_compose_' + code, `依頼 ${jobId}: ${message}`, 'ph-lp-compose');
+  }
 }
 
 /**

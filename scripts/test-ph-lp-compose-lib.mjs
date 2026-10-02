@@ -602,6 +602,23 @@ console.log('⑩ 実際に本回答を書いたモデル (ランナーが後か�
   const stE = lp.jobStateFor(db, e.draft.id, { now: min(241.2 + lp.MODEL_CHECK_WAIT_MIN) }).job;
   ok(stE.status === 'needs_review' && stE.error_code === 'model_unverified' && stE.model_check === 'unknown' && stE.output_text === null,
     `🚨 ${lp.MODEL_CHECK_WAIT_MIN} 分たっても確認が来なければ未確認で閉じる (確認中のまま残さない)`);
+
+  // 🚨 ランナーが止まっていて、15 分を過ぎてから再送が**最初に**届いても「一致」にしない (codex #1591 R3 Medium)
+  const fx = mk('MC-F', 'lpr-20261002-150500-ffffff', 260);
+  eq(submit(fx, 261).status, 'done', 'F: いったん done');
+  const late = lp.recordModelCheck(db, { runnerRunId: 'lpr-20261002-150500-ffffff', actualModels: ['claude-opus-5-5'], now: min(261.2 + lp.MODEL_CHECK_WAIT_MIN + 1) });
+  ok(late.ok && late.updated === 0 && late.already === true && late.checks[0].model_check === 'unknown',
+    `🚨 ${lp.MODEL_CHECK_WAIT_MIN} 分を過ぎた再送は先に閉じてから見る (一致にしない・付いている「未確認」を返す)`);
+  const stF = lp.jobStateFor(db, fx.draft.id, { now: min(280) }).job;
+  ok(stF.status === 'needs_review' && stF.output_text === null, '本文は出ない');
+
+  // 「完了」の記録は一致してから (codex #1591 R3 Low)
+  const evs = (draftId) => db.prepare('SELECT event FROM draft_events WHERE draft_id = ? ORDER BY id').all(draftId).map((r) => r.event);
+  ok(evs(dA.id).includes('lp_compose_result') && evs(dA.id).includes('lp_compose_done'), '一致した依頼: 結果を受け取った → 完了 の順に残る');
+  ok(evs(dA.id).indexOf('lp_compose_result') < evs(dA.id).indexOf('lp_compose_done'), '完了は一致の後');
+  ok(!evs(d.draft.id).includes('lp_compose_done') && evs(d.draft.id).includes('lp_compose_model_mismatch'), '🚨 後から不一致: 完了は残らず、不一致が残る');
+  ok(!evs(b.draft.id).includes('lp_compose_done') && evs(b.draft.id).includes('lp_compose_model_mismatch'), '🚨 先に不一致: 完了は残らず、不一致が残る');
+  ok(!evs(e.draft.id).includes('lp_compose_done') && evs(e.draft.id).includes('lp_compose_model_unverified'), '🚨 未確認で閉じた: 完了は残らず、未確認が残る');
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);
