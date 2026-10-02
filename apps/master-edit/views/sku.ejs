@@ -8,7 +8,9 @@
   const c = page ? page.cur : null;
   const F = page ? page.fields : {};
   const isSet = !!c && c.sku_kind === 'set';
-  const canSave = !!page && canEdit && !dbError && !closed && c.sku_kind !== 'exception';
+  // 登録をやめた商品 (cancelled) はサーバーが必ず断る (400 cancelled_sku) = 見るだけ (#1589 Codex R2 M3)
+  const cancelled = !!c && !!c.registration && c.registration.state === 'cancelled';
+  const canSave = !!page && canEdit && !dbError && !closed && c.sku_kind !== 'exception' && !cancelled;
   const L = page ? page.locks.fields : {};
   const SALES = { 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' };
   const HANDLING = { active: '取扱中', discontinued: '中止', unknown: '不明' };
@@ -48,7 +50,11 @@
   // 最近の変更 (人の言葉にできる行だけ)
   const recent = page ? page.recent.filter((e) => !(e.entity_type === 'sku_cost' && e.attribute === 'valid_to')).map((e) => ({ e, w: ui.eventWords(e) })).filter((x) => x.w) : [];
   const last = page && page.recent.length ? page.recent[0] : null;
-  const futureCost = !!c && !isSet && !!c.open_cost && c.open_cost.valid_from > page.today;
+  // 先の日付の原価 (read.mjs readFutureCostLocks = サーバーの cost_future / set_cost_future と同じ条件)。該当する原価の欄だけ理由つきで閉じる
+  const FC = page ? page.locks.futureCost : { own: null, parents: [] };
+  const futureCost = !!c && !isSet && (!!FC.own || FC.parents.length > 0);
+  const futureWhy = !FC ? '' : FC.own ? ui.fmtDay(FC.own.valid_from, page.today) + ' から始まる原価 (' + yen(FC.own.cost_jpy) + ' 円) がもう入っているので、今日からの原価はここでは入れられません'
+    : FC.parents.length ? 'この商品を使うセット ' + FC.parents.map((x) => x.code + ' (' + ui.fmtDay(x.valid_from, page.today) + ' から)').join('・') + ' に先の日付の原価が入っているので、セットの原価を今日から計算し直せません = この商品の原価はここでは変えられません' : '';
   const reg = c && c.registration ? c.registration.state : null;
   const REG_BADGE = { draft: 'warn', ne_pending: 'info', ne_confirmed: 'info', distributable: 'info', available: 'ok', quarantined: 'err', cancelled: 'mute' };
   const dv = isSet ? page.derived : null;
@@ -103,6 +109,7 @@
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
     <% if (c.sku_kind === 'exception') { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">例外の SKU (NE に無い商品) はこの画面では直せません。</div></div><% } %>
     <% if (reg === 'draft' && !page.locks.regExports.length) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">下書きです (新商品の登録)</div><div class="hint">NE・ロジザードへの登録はまだです。値はこの画面で直せます。NE への登録は「NE 登録の CSV」で行います。</div></div><a class="btn sm" href="<%= base %>/reg-csv">NE 登録の CSV を開く</a></div><% } %>
+    <% if (cancelled) { %><div class="callout warn" id="cancelled-band"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">この商品は登録をやめました (やめた)</div><div class="hint">登録をやめた商品は直せません (見るだけです)。使うときは、新しい商品として登録し直してください。</div></div></div><% } %>
     <% if (reg === 'quarantined') { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">要確認</div><div class="hint">切替の後に夜間の処理が NE で見つけた、登録の記録の無い商品です。業務ではまだ使えません。</div></div></div><% } %>
     <% if (page.locks.regExports.length) { %>
       <div class="callout lock"><svg class="ic l" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow">
@@ -141,7 +148,7 @@
                 </div><div class="tl-axis"><% for (const m of tl.months) { %><span style="left:<%= m.left.toFixed(3) %>%"><%= m.label %></span><% } %></div></div>
                 <div class="tl-legend" aria-hidden="true"><span><i class="past"></i>これまで</span><span><i class="now"></i>いま</span><% if (tl.hasFuture) { %><span><i class="fut"></i>先の日付から</span><% } %></div>
               <% } %>
-              <% if (futureCost) { %><div class="callout warn" style="margin:6px 0 10px"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><%= ui.fmtDay(c.open_cost.valid_from, page.today) %> から始まる原価 (<%= yen(c.open_cost.cost_jpy) %> 円) がもう入っているので、今日からの原価はここでは入れられません。</div></div><% } %>
+              <% if (futureCost) { %><div class="callout warn" id="cost-future" style="margin:6px 0 10px"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><%= futureWhy %>。</div></div><% } %>
               <% if (editable('cost') && !futureCost) { %>
               <div class="cost-add" id="cost-add" hidden>
                 <div class="ttl"><svg class="ic" style="color:var(--accent)" aria-hidden="true"><use href="#i-clock"/></svg>原価を変える (<%= ui.fmtDay(page.today) %> 今日から)</div>
@@ -309,7 +316,8 @@
           <div class="body">
             <%- row('set_sales_class_override', '売上分類の上書き', '<select class="in w-m" id="f-set_sales_class_override" ' + meta('set_sales_class_override') + '><option value=""' + (c.set_sales_class_override == null ? ' selected' : '') + '>— 構成品から' + (dv.current.salesFromComponents != null ? ' (いまは ' + dv.current.salesFromComponents + ')' : '') + '</option>' + Object.entries(SALES).map(([k, v]) => '<option value="' + k + '"' + (String(c.set_sales_class_override) === k ? ' selected' : '') + '>' + v + '</option>').join('') + '</select>', c.set_sales_class_override == null ? '構成品から' : SALES[c.set_sales_class_override], { forId: 'f-set_sales_class_override', hint: '構成品から決まらないとき (未入力の構成品・輸出 4 が混ざる) だけ' }) %>
             <div class="f" data-row="exception_cost"><div class="lab">例外原価</div><div class="ctl"><span class="muted">いま: <%= c.open_cost ? yen(c.open_cost.cost_jpy) + ' 円 (' + (SRC[c.open_cost.cost_source] || c.open_cost.cost_source) + ' · ' + ui.fmtDay(c.open_cost.valid_from, page.today) + ' から)' : '未入力' %></span></div></div>
-            <% if (editable('exception_cost')) { %>
+            <% if (FC.own) { %><div class="f"><div class="lab">新しい例外原価</div><div class="ctl"><%- lockval('入れられません') %><span class="lockwhy" id="xcost-future"><%= futureWhy %></span></div></div>
+            <% } else if (editable('exception_cost')) { %>
               <div class="f"><label class="lab" for="xcost-jpy">新しい例外原価</label><div class="ctl"><span class="yen"><input class="in w-s" id="xcost-jpy" inputmode="numeric" autocomplete="off" placeholder="0" <%- meta('exception_cost') %> data-unit=" 円"></span><span class="unit">円</span><span class="hint">今日 (<%= ui.fmtDay(page.today) %>) から</span></div></div>
               <div class="f"><label class="lab" for="xcost-reason">理由 <span class="req">必須</span></label><div class="ctl"><input class="in w-full" id="xcost-reason" maxlength="200"></div></div>
               <div class="f"><div class="lab">合計に戻す</div><div class="ctl"><label style="display:inline-flex;gap:8px;align-items:center"><input type="checkbox" id="xcost-clear" data-field="exception_cost" data-dirty-field="exception_cost" data-label="例外原価" data-ne="<%= neOf('exception_cost') %>"> 例外原価をやめる (構成品の合計に戻す)</label></div></div>

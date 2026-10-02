@@ -10,7 +10,10 @@
  *   5 開き直しが要る 409 (その間の変更) の後は、欄を触っても保存のボタンが戻らない
  *   6 構成の行を並べ替えると、読み上げの名前が今の行番号・コードになる
  *   7 1280×720 の 100 / 125 / 150% (= 幅 1280 / 1024 / 853) と 1024×768 で、ページが横にはみ出さない (セットの構成の表は囲いの中で横に送る)
- * Playwright か Chromium が無い環境では飛ばす (TEST_PG_URL の試験と同じ扱い・⏭️ を出して 0 で終わる)
+ *   8 JAN の欄に打ったまま (Enter を押さずに) ほかの欄も変えて Ctrl+S = JAN も保存する / 形の違う JAN なら保存しない (#1589 Codex R2 M1)
+ *   9 画面を開いた後に登録をやめた (cancelled_sku) = 開き直しが要る (欄を触っても保存のボタンが戻らない)・やめた商品は初めから見るだけ (M3)
+ *  10 先の日付の原価がある = 該当する原価の欄だけ閉じる (ほかの欄は保存できる) (M2)
+ * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
 import assert from 'node:assert/strict';
@@ -18,12 +21,15 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import express from 'express';
 
+if (process.env.MASTER_EDIT_UI_SKIP === '1') { console.log('⏭️ MASTER_EDIT_UI_SKIP=1 = 画面の JS の試験 (test-master-edit-ui) を飛ばす'); process.exit(0); }
 let chromium;
-try { ({ chromium } = await import('playwright')); } catch (e) { console.log(`⏭️ Playwright が読めない (画面の JS の試験は飛ばす): ${e.message}`); process.exit(0); }
 let browser;
-try { browser = await chromium.launch(); } catch (e) {
-  if (/Executable doesn't exist|install|ENOENT/i.test(String(e.message))) { console.log('⏭️ Chromium が入っていない (npx playwright install chromium で入る)。画面の JS の試験は飛ばす'); process.exit(0); }
-  throw e;
+try {
+  ({ chromium } = await import('playwright'));
+  browser = await chromium.launch();
+} catch (e) {
+  console.error(`NG 画面の JS の試験を動かせない (Playwright / Chromium): ${e.message}\n   入れる = npx playwright install chromium / この試験だけ飛ばす = MASTER_EDIT_UI_SKIP=1`);
+  process.exit(1);
 }
 
 const { PGlite } = await import('@electric-sql/pglite');
@@ -240,6 +246,76 @@ await ta('[6] 構成の行を並べ替えると、読み上げの名前が今の
   assert.equal(await rows.nth(0).locator('button[data-act="del"]').getAttribute('aria-label'), '1 行目 (s002) を外す');
   assert.equal(await rows.nth(1).locator('button[data-act="up"]').getAttribute('aria-label'), '2 行目 (s001) を上へ');
   assert.equal(await dirty(p), 1, '並びも依頼の中身');
+});
+
+const jan13 = (b) => { const d = b.split('').map(Number).reverse(); const sum = d.reduce((a, x, i) => a + x * (i % 2 === 0 ? 3 : 1), 0); return b + ((10 - (sum % 10)) % 10); };
+const jansOf = async (code) => (await pg.query(`select e.external_value as v from core.external_ids e join core.skus s on s.product_id = e.entity_id
+   where s.code = $1 and e.entity_type = 'product' and e.system = 'jan' and e.valid_to is null order by 1`, [code])).rows.map((r) => r.v);
+
+await ta('[8] JAN の欄に打ったまま (Enter なし) ほかの欄も変えて Ctrl+S = JAN も保存する / 形の違う JAN なら何も保存しない', async (p) => {
+  const good = jan13('490000000777');
+  await p.goto(B + '/sku/s003');
+  await p.fill('#f-reorder_months', '7');
+  await p.fill('#jan-in', '1234567');
+  assert.equal(await dirty(p), 2, '打ったままの JAN も未保存に数える');
+  await p.keyboard.press('Control+s');
+  await p.waitForTimeout(300);
+  assert.match(await p.textContent('#msg'), /JAN の欄を直してから保存/);
+  assert.equal(await active(p), 'jan-in');
+  assert.equal((await row('s003')).months, 5, '形の違う JAN のときは何も保存しない');
+  await p.fill('#jan-in', good);
+  await p.keyboard.press('Control+s');
+  await p.waitForSelector('.result.ok');
+  assert.equal((await row('s003')).months, 7);
+  assert.deepEqual(await jansOf('s003'), [good], 'JAN も保存した');
+  assert.equal(await dirty(p), 0);
+});
+
+/** 試験だけ: 登録の状態を直に変える (本番は ops.transition_sku_registration の決まった進み方だけ。表の守りの印を同じ取引の中で立てる) */
+async function setReg(code, state) {
+  await pg.query('begin');
+  try {
+    await pg.query("select pg_catalog.set_config('ops.registration_protocol', '1', true)");
+    await pg.query('update ops.master_registrations set state = $2, state_changed_at = now() where sku_id = (select sku_id from core.skus where code = $1)', [code, state]);
+    await pg.query('commit');
+  } catch (e) { await pg.query('rollback'); throw e; }
+}
+
+await ta('[9] 開いた後に登録をやめた = cancelled_sku は開き直しが要る / やめた商品は初めから見るだけ (帯・保存のボタンなし)', async (p) => {
+  await p.goto(B + '/sku/s001');
+  await setReg('s001', 'cancelled');
+  try {
+    await p.fill('#f-reorder_months', '9');
+    await p.click('#save');
+    await p.waitForSelector('.result.err');
+    assert.equal(await p.locator('#reload').count(), 1, '開き直すボタン');
+    await p.fill('#reason', '触った');
+    assert.equal(await p.isDisabled('#save'), true, '欄を触っても保存のボタンが戻らない');
+    await Promise.all([p.waitForNavigation(), p.click('#reload')]);
+    assert.equal(await p.locator('#cancelled-band').count(), 1, 'やめた = 理由の帯');
+    assert.equal(await p.locator('#save').count(), 0, 'やめた = 保存のボタンを出さない');
+    assert.equal(await p.locator('#f-name').count(), 0, 'やめた = 入力欄を出さない');
+  } finally {
+    await setReg('s001', 'available');
+  }
+});
+
+await ta('[10] 先の日付の原価 (使っているセット) = 原価の欄だけ閉じる・ほかの欄は保存できる', async (p) => {
+  const fut = new Date(Date.now() + 40 * 86400e3 + 9 * 3600e3).toISOString().slice(0, 10);
+  await pg.query("update core.sku_costs set valid_to = $1::date - 1 where valid_to is null and sku_id = (select sku_id from core.skus where code = 'set001')", [fut]);
+  await pg.query("insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from) select 1, sku_id, 999, 'set_calc', 'COMPLETE', $1::date from core.skus where code = 'set001'", [fut]);
+  try {
+    await p.goto(B + '/sku/s002');
+    assert.equal(await p.locator('#btn-cost-open').count(), 0, '原価を変えるボタンを出さない');
+    assert.match(await p.textContent('#cost-future'), /set001/);
+    await p.fill('#f-reorder_months', '8');
+    await p.click('#save');
+    await p.waitForSelector('.result.ok');
+    assert.equal((await row('s002')).months, 8);
+  } finally {
+    await pg.query("delete from core.sku_costs where valid_from = $1::date and sku_id = (select sku_id from core.skus where code = 'set001')", [fut]);
+    await pg.query("update core.sku_costs set valid_to = null where valid_to = $1::date - 1 and sku_id = (select sku_id from core.skus where code = 'set001')", [fut]);
+  }
 });
 
 // 拡大 125% / 150% = 画面の CSS の幅が 1/1.25・1/1.5 になる。MASTER_EDIT_UI_SHOTS=フォルダ を付けると、そのフォルダに写しを残す (目で見る用)

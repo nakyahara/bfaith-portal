@@ -1461,8 +1461,12 @@ await ta('[15] 単品・セットの画面: 描画・画面の JS・編集の印
   assert.match(r.text, /data-can-save="1"/);
   assert.match(r.text, /id="lab-jan">JAN</); assert.match(r.text, /ロジザードが正/);
   // 未保存に数えるのは保存する欄だけ (data-dirty-field)。保存の理由・全体から探す・一覧の絞る欄には付けない
-  for (const f of ['name', 'handling', 'parent_code', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'cost']) assert.match(r.text, new RegExp(`data-dirty-field="${f}"`), f);
+  for (const f of ['name', 'handling', 'parent_code', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan']) assert.match(r.text, new RegExp(`data-dirty-field="${f}"`), f);
   assert.ok(!/id="reason"[^>]*data-dirty-field|data-dirty-field[^>]*id="reason"/.test(r.text), '保存の理由を数えない');
+  // s001 を使うセット set005 は、前の試験 ([9] 日の境目) で原価が 2030-01-11 (画面の今日の翌日) から始まる = s001 の原価はここでは閉じる (サーバーも set_cost_future)
+  assert.ok(r.text.includes('id="cost-future"') && r.text.includes('set005') && !r.text.includes('data-dirty-field="cost"'), '先の日付の原価のあるセットを使う単品の原価は閉じる');
+  const futRes = await call('POST', '/api/sku/s001', { body: { request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) }, values: { cost: { jpy: '130', reason: '試験' } } } });
+  assert.deepEqual([futRes.status, futRes.j.reason], [409, 'set_cost_future']);
   assert.match(r.text, /<span class="b mute">単品<\/span>/);
   assert.match(r.text, /<h2 id="h-save">保存すると変わること<\/h2>/);
   assert.match(r.text, /最後に直した人 /);   // 変更の記録から (日本時間)
@@ -1527,6 +1531,33 @@ await ta('[15] 見せ方 (PR 画面の作り直し 1): 変更の記録は人の�
   const { dateOnly } = await import('../apps/master-edit/amazon-read.mjs');
   assert.equal(dateOnly(new Date(2026, 8, 26)), '2026-09-26');
   assert.equal(dateOnly('2026-09-26'), '2026-09-26');
+});
+
+await ta('[15] 先の日付の原価: 画面が閉じる原価の欄 = サーバーが断る (セット自身 = cost_future・使っているセット = set_cost_future)・ほかの欄は開いたまま (#1589 R2 M2)', async () => {
+  const FUT = '2030-02-01';   // 画面の今日 2030-01-10 より先
+  await q("update core.sku_costs set valid_to = $1::date - 1 where valid_to is null and sku_id = (select sku_id from core.skus where code = 'set006')", [FUT]);
+  await q("insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from) select 1, sku_id, 777, 'set_calc', 'COMPLETE', $1::date from core.skus where code = 'set006'", [FUT]);
+  try {
+    // 単品 s006 (set006 だけの構成品): 原価の欄は閉じる・理由に set006・ほかの欄 (名前) は直せる → 原価を送るとサーバーも断る
+    let r = await call('GET', '/sku/s006');
+    assert.equal(r.status, 200);
+    assert.ok(r.text.includes('id="cost-future"') && /セット set006 \(2\/1 \(金\) から\)/.test(r.text), '使っているセットの先の原価を理由に出す');
+    assert.ok(!r.text.includes('id="btn-cost-open"') && !r.text.includes('id="cost-jpy"'), '原価の欄を出さない');
+    assert.ok(r.text.includes('data-field="name"'), 'ほかの欄は直せる');
+    let res = await call('POST', '/api/sku/s006', { body: { request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) }, values: { cost: { jpy: '120', reason: '試験' } } } });
+    assert.deepEqual([res.status, res.j.reason], [409, 'set_cost_future']);
+    // セット set006: 例外原価の欄は閉じる・サーバーも cost_future
+    r = await call('GET', '/sku/set006');
+    assert.ok(r.text.includes('id="xcost-future"') && !r.text.includes('id="xcost-jpy"'), '例外原価の欄を出さない');
+    res = await call('POST', '/api/sku/set006', { body: { request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) }, values: { exception_cost: { jpy: '500', reason: '試験' } } } });
+    assert.deepEqual([res.status, res.j.reason], [400, 'cost_future']);
+    // 先の原価の無い単品 (s002) は原価の欄が開いている (閉じすぎない)
+    r = await call('GET', '/sku/s002');
+    assert.ok(r.text.includes('id="cost-jpy"') && !r.text.includes('id="cost-future"'));
+  } finally {
+    await q("delete from core.sku_costs where valid_from = $1::date and sku_id = (select sku_id from core.skus where code = 'set006')", [FUT]);
+    await q("update core.sku_costs set valid_to = null where valid_to = $1::date - 1 and sku_id = (select sku_id from core.skus where code = 'set006')", [FUT]);
+  }
 });
 
 await ta('[15] 保存の API: 画面と同じ形で通る (画面のロールで書く)・名簿・Origin・Content-Type・押し直し・印の違い', async () => {

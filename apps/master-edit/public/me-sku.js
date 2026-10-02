@@ -50,6 +50,8 @@
       if (keys.indexOf(k) >= 0) return;
       if (initial.has(el) && valueOf(el) !== initial.get(el)) keys.push(k);
     });
+    // JAN の欄に打ったまま (Enter・カンマ・欄を離れる前) も未保存に数える = 保存の前に札にする (#1589 Codex R2 M1)
+    if (janPending() && keys.indexOf('jan') < 0) keys.push('jan');
     return keys;
   }
   function firstEl(k) { return tracked().filter(function (el) { return el.getAttribute('data-dirty-field') === k; })[0]; }
@@ -78,7 +80,7 @@
         return { k: k, label: '例外原価 (今日から)', from: P.xcostNow == null ? '未入力' : yen(P.xcostNow) + ' 円', to: clear ? 'やめる (構成品の合計に戻す)' : yen(half($('#xcost-jpy').value)) + ' 円', ne: ne };
       }
       if (k === 'jan') {
-        var a = janList(initial.get(el)), b = janList(el.value);
+        var a = janList(initial.get(el)), b = janList(el.value).concat(janList(janPending()));
         var add = b.filter(function (x) { return a.indexOf(x) < 0; }), rm = a.filter(function (x) { return b.indexOf(x) < 0; });
         return { k: k, label: 'JAN', from: '', to: [add.length ? '足す ' + add.join('・') : '', rm.length ? '外す ' + rm.join('・') : ''].filter(Boolean).join(' / ') || '並びだけ', ne: ne };
       }
@@ -202,15 +204,21 @@
     s.innerHTML = '<svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>' + esc(j) + '<button type="button" aria-label="JAN ' + esc(j) + ' を外す">×</button>';
     return s;
   }
+  /** 欄に打ったまま (まだ札にしていない) JAN */
+  function janPending() { return janIn && janIn.value.trim() ? janIn.value.trim() : ''; }
+  /** 打った JAN を札にする。札にできない (形が違う・5 つを超える) = false (欄は残す = 黙って捨てない) */
   function janAdd(raw) {
     var list = String(raw || '').split(/[\s,、，]+/).map(function (x) { return half(x).trim(); }).filter(Boolean);
-    if (!list.length) return;
+    if (!list.length) return true;
     var bad = list.filter(function (x) { return !janValid(x); });
-    if (bad.length) { janSay('JAN ' + bad.join('・') + ' は 8 桁か 13 桁で、チェック数字が合いません', 'err'); return; }
+    if (bad.length) { janSay('JAN ' + bad.join('・') + ' は 8 桁か 13 桁で、チェック数字が合いません', 'err'); return false; }
     var now = janNow();
-    list.forEach(function (j) { if (now.indexOf(j) < 0 && now.length < 5) { janTokens.insertBefore(janTok(j, true), janIn); now.push(j); } });
-    if (now.length >= 5 && list.some(function (j) { return now.indexOf(j) < 0; })) janSay('JAN は 5 つまでです', 'warn'); else janSay('足しました (保存すると入ります)', 'ok');
+    var adds = list.filter(function (j, i) { return now.indexOf(j) < 0 && list.indexOf(j) === i; });
+    if (now.length + adds.length > 5) { janSay('JAN は 5 つまでです (いま ' + now.length + ' つ)', 'err'); return false; }
+    adds.forEach(function (j) { janTokens.insertBefore(janTok(j, true), janIn); });
+    janSay('足しました (保存すると入ります)', 'ok');
     janIn.value = ''; janSync();
+    return true;
   }
   if (janTokens && janIn && janHidden) {
     janIn.addEventListener('keydown', function (e) {
@@ -218,7 +226,6 @@
       else if (e.key === 'Backspace' && !janIn.value) { var toks = $$('.tok', janTokens); if (toks.length) { toks[toks.length - 1].querySelector('button').focus(); } }
     });
     janIn.addEventListener('blur', function () { if (janIn.value.trim()) janAdd(janIn.value); });
-    janIn.addEventListener('input', function (e) { e.stopPropagation(); });
     janTokens.addEventListener('click', function (e) {
       var b = e.target.closest('.tok button'); if (!b) return;
       var tok = b.closest('.tok'); var j = tok.getAttribute('data-jan'); tok.remove(); janSay('JAN ' + j + ' を外しました (保存すると外れます)', 'warn'); janSync(); janIn.focus();
@@ -293,7 +300,7 @@
       else el.value = v;
     });
     if (initialCompHtml != null && $('#comp-rows')) $('#comp-rows').innerHTML = initialCompHtml;
-    if (janTokens) { $$('.tok', janTokens).forEach(function (t) { t.remove(); }); janList(janHidden.value).forEach(function (j) { janTokens.insertBefore(janTok(j, false), janIn); }); janSay(''); }
+    if (janTokens) { $$('.tok', janTokens).forEach(function (t) { t.remove(); }); janList(janHidden.value).forEach(function (j) { janTokens.insertBefore(janTok(j, false), janIn); }); janIn.value = ''; janSay(''); }
     if ($('#cost-reason')) $('#cost-reason').value = '';
     if ($('#xcost-reason')) $('#xcost-reason').value = '';
     if (costBox) { costBox.hidden = true; if (costOpen) costOpen.setAttribute('aria-expanded', 'false'); costDelta(); }
@@ -368,7 +375,9 @@
     $('#reload').addEventListener('click', function () { location.reload(); });
     $('#reload').focus();
   }
-  var REOPEN = ['version_conflict', 'request_id_reused', 'retry', 'processing', 'abandoned', 'reg_csv_issued', 'csv_issued', 'before_cutover', 'cost_future', 'set_cost_future'];
+  // 先の日付の原価 (cost_future / set_cost_future) は入れない = 画面を開いたときに分かっている状態で、該当する原価の欄を閉じてある。
+  // その間に入った = 編集の印が変わる = version_conflict で返る (#1589 Codex R2 M2)。登録をその間にやめた = cancelled_sku (M3)
+  var REOPEN = ['version_conflict', 'request_id_reused', 'retry', 'processing', 'abandoned', 'reg_csv_issued', 'csv_issued', 'before_cutover', 'cancelled_sku'];
   function showError(j, status) {
     var r = $('#result');
     var h = '<div class="result err" role="alert"><div class="rt">' + esc(j.error || ('HTTP ' + status)) + '</div>';
@@ -391,6 +400,11 @@
   }
   function doSave() {
     if (!saveBtn || saveBtn.disabled || busy) return;
+    // JAN の欄に打ったままなら、先に札にする (Ctrl+S は欄を離れない = blur が来ない)。札にできなければ保存しない (#1589 Codex R2 M1)
+    if (janPending()) {
+      if (!janAdd(janIn.value)) { msg('JAN の欄を直してから保存してください (何も保存していません)', 'err'); janIn.focus(); return; }
+      if (saveBtn.disabled) return;
+    }
     var body = { request_id: requestId, reason: $('#reason').value, seen: { token: D.token, event_id: D.eventId }, values: collect() };
     busy = true; update(); msg('保存しています…'); $('#result').innerHTML = '';
     $$('.f.err', scope).forEach(function (f) { f.classList.remove('err'); });

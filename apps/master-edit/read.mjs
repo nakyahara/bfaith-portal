@@ -227,6 +227,7 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
     // 最近の変更 (画面の右の「最近の変更」と見出しの「最後に直した人」)。新しい順
     const recent = (await changesSince(db, { skuId: id, productId: cur.product_id, sinceEventId: null, limit: 30 })).reverse();
     const locks = await readFieldLocks(db, cur);
+    locks.futureCost = await readFutureCostLocks(db, cur, today);
     return {
       cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today, card, regItems, recent, locks,
       state: cur.handling === 'discontinued' ? 'discontinued' : 'available',
@@ -285,6 +286,25 @@ async function readFieldLocks(db, cur) {
     }
   }
   return { fields, regExports, taxParentCodes };
+}
+
+/** 例外原価の出どころ (lib/master-write.mjs の OVERRIDE_SOURCES と同じ。セットの合計で上書きしない原価) */
+const OVERRIDE_COST_SOURCES = new Set(['manual', 'override_zero']);
+/**
+ * 先の日付から始まる原価があって、今日からの原価を入れられない (保存すると 409。#1589 Codex R2 M2)。画面は該当する原価の欄だけを理由つきで閉じる。
+ *   own     = この SKU の続いている原価 (valid_to が空) が今日より先に始まる → 単品の原価・セットの例外原価は 409 cost_future (checkCostToday)
+ *   parents = 単品の原価を変えるとセットの合計を今日から計算し直すが、そのセット (今の構成) の続いている原価が今日より先に始まり、
+ *             例外原価でない → 409 set_cost_future (recomputeSetCost)。開き直しても同じなので、開き直しではなく欄を閉じる
+ */
+async function readFutureCostLocks(db, cur, today) {
+  const own = cur.open_cost && cur.open_cost.valid_from > today ? { valid_from: cur.open_cost.valid_from, cost_jpy: cur.open_cost.cost_jpy } : null;
+  let parents = [];
+  if (cur.sku_kind === 'single' && cur.parent_set_ids.length) {
+    parents = (await db.query(`select k.code, c.valid_from::text as valid_from, c.cost_source from core.sku_costs c join core.skus k on k.sku_id = c.sku_id
+       where c.sku_id = any($1::bigint[]) and c.valid_to is null and c.valid_from > $2::date order by k.code_norm`, [cur.parent_set_ids, today])).rows
+      .filter((r) => !OVERRIDE_COST_SOURCES.has(r.cost_source)).map((r) => ({ code: r.code, valid_from: r.valid_from }));
+  }
+  return { own, parents };
 }
 
 /** 新商品の登録 (画面 D) に出すもの: 切替の段階・有効な仕入先・backfill 済みか (新商品の登録の前提) */
