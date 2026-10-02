@@ -110,7 +110,7 @@ console.log('②b 🚨 指示文はスタッフの定型文と同じもの 1 つ
   const staff = pt.buildProductAnalysisPrompt({ name: 'ハッカ油スプレー 100ml' }, { product_info_text: '天然ハッカ油' }, '');
   ok(staff.includes(packet.instruction),
     '🚨 スタッフの定型文に同じ文がそのまま入っている (二重に持っていない)');
-  eq(packet.packet_version, 2, 'packet の版が上がっている (形が変わった)');
+  eq(packet.packet_version, 3, 'packet の版が上がっている (形が変わった・3 = 画像に役割)');
   // 指示文も packet_hash の中 = 後から差し替えられない
   const again = lp.buildPacket({
     draft: dA, productInfo: packet.product_info, colorVariations: packet.color_variations,
@@ -627,6 +627,26 @@ console.log('⑩ 実際に本回答を書いたモデル (ランナーが後か�
   ok(!evs(d.draft.id).includes('lp_compose_done') && evs(d.draft.id).includes('lp_compose_model_mismatch'), '🚨 後から不一致: 完了は残らず、不一致が残る');
   ok(!evs(b.draft.id).includes('lp_compose_done') && evs(b.draft.id).includes('lp_compose_model_mismatch'), '🚨 先に不一致: 完了は残らず、不一致が残る');
   ok(!evs(e.draft.id).includes('lp_compose_done') && evs(e.draft.id).includes('lp_compose_model_unverified'), '🚨 未確認で閉じた: 完了は残らず、未確認が残る');
+
+  // 白抜きも証跡の対象 (配って見ていなければ accepted にしない・codex #1592 Low)
+  const dW = mkDraft('MC-W', 'ハッカ油スプレー MC-W');
+  const rW = lp.requestJob(db, args(dW, spec, 'key-mc-W', {
+    now: min(3000),
+    images: [{ file_id: 'FILEIDWHITE01', role: 'white_bg' }, { file_id: 'FILEID000001', role: 'slot:1' }, { file_id: 'FILEIDWHITE01', role: 'slot:2' }],
+  }));
+  const pW = JSON.parse(rW.job.packet_json);
+  ok(pW.images.length === 2 && pW.images[0].role === 'white_bg' && pW.images[1].role === 'slot:1', '白抜きが先頭・同じファイルのスロットは 1 回 (役割は先に来た白抜き)');
+  eq(lp.imagePlan(pW.images).map((im) => im.label).join(' → '), '白抜き → 1 TOP', '画面に出す並び');
+  eq(lp.buildPacket({ draft: dW, productInfo: 'x', colorVariations: '', images: [{ file_id: 'FILEIDX00001', role: 'evil' }], spec }).packet.images[0].role, null, '知らない役割は残さない');
+  const cW = lp.claimJob(db, { runnerRunId: 'lpr-20261002-150600-wwwwww', now: min(3000.1) });
+  const gW = lp.reserveGeneration(db, cW.job.job_id, { leaseToken: cW.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(3000.2) });
+  lp.recordImageServed(db, cW.job.job_id, { leaseToken: cW.job.lease_token, fileId: 'FILEID000001', sha256: '1'.repeat(64), bytes: 10, now: min(3000.3) });
+  const subW1 = lp.submitResult(db, gW.generation_id, { packetHash: cW.job.packet_hash, verdict: 'accepted', output: compositionFor(dW.name), lint: LINT, reviewRounds: 1, now: min(3000.4) });
+  ok(!subW1.ok && /見ていません/.test(subW1.error || ""), `🚨 白抜きを配っていなければ accepted にしない (${subW1.error})`);
+  lp.recordImageServed(db, cW.job.job_id, { leaseToken: cW.job.lease_token, fileId: 'FILEIDWHITE01', sha256: '2'.repeat(64), bytes: 10, now: min(3000.5) });
+  const subW2 = lp.submitResult(db, gW.generation_id, { packetHash: cW.job.packet_hash, verdict: 'accepted', output: compositionFor(dW.name), lint: LINT, reviewRounds: 1, now: min(3000.6) });
+  ok(subW2.ok && subW2.status === 'done', '白抜きも配って見ていれば受け取る');
+  ok(subW2.receipt.images.map((im) => im.file_id).sort().join(',') === 'FILEID000001,FILEIDWHITE01', '証跡に白抜きも載る');
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);

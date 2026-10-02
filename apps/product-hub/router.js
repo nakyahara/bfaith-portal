@@ -126,7 +126,7 @@ import {
   queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
-  lpComposeImageRef, recordImageServed as recordLpComposeImageServed, recordModelCheck as recordLpComposeModelCheck, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
+  lpComposeImageRef, recordImageServed as recordLpComposeImageServed, imagePlan as lpComposeImagePlan, recordModelCheck as recordLpComposeModelCheck, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_IMAGES as LP_COMPOSE_MAX_IMAGES,
   lintForJob as lintLpComposeForJob,
 } from './lib/lp-compose.js';
 import { assertXlsxExpandsSafely, XlsxTooLargeError } from './lib/xlsx-guard.js';
@@ -3809,6 +3809,8 @@ function lpComposeInitialState(db, draft) {
   return {
     ...lpComposeStateFor(db, draft.id),
     blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
+    // いま押したら AI に渡す画像の並び (白抜き → 1 TOP → …)。スタッフ版にも同じ画像を添付する (codex #1592 High)
+    image_plan: lpComposeImagePlan(images),
     spec: lpSpecSummary(db, 'product_analysis'),
   };
 }
@@ -3846,6 +3848,8 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
     ...lpComposeStateFor(db, draft.id),
     // 押せるか。押せない理由はそのまま画面に出す
     blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
+    // いま押したら AI に渡す画像の並び (白抜き → 1 TOP → …)。スタッフ版にも同じ画像を添付する (codex #1592 High)
+    image_plan: lpComposeImagePlan(images),
     // 「仕様書: ○○ (YYYY-MM-DD 取込)」。古ければ人が上げ直す (設計 §4.1 のアップロード忘れ対策)
     spec: lpSpecSummary(db, 'product_analysis'),
   });
@@ -3880,11 +3884,13 @@ function lpComposeMaterial(db, draft) {
   // 入荷直後の新商品は白抜きしか無いことが多く、入れないと「商品画像がありません」で押せなかった (fukidashiseal)。
   // 続けて TOP から順に、合わせて最大 MAX_IMAGES 枚 (重複は buildPacket が除く)
   const wb = db.prepare('SELECT white_bg_drive_file_id, white_bg_modified_time FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
-  const rows = db.prepare(`SELECT drive_file_id, drive_modified_time FROM draft_images
-    WHERE draft_id = ? AND drive_file_id IS NOT NULL ORDER BY sort, id LIMIT ?`).all(draft.id, LP_COMPOSE_MAX_IMAGES);
+  // role = 何の画像か (white_bg / slot:N・N は画像タブの番号で 1 が TOP = sort + 1)。packet に残して画面と測定行に出す
+  const rows = db.prepare(`SELECT drive_file_id, drive_modified_time, sort FROM draft_images
+    WHERE draft_id = ? AND drive_file_id IS NOT NULL ORDER BY sort, id LIMIT ?`).all(draft.id, LP_COMPOSE_MAX_IMAGES + 1);
   const images = [
-    ...(wb?.white_bg_drive_file_id ? [{ drive_file_id: wb.white_bg_drive_file_id, drive_modified_time: wb.white_bg_modified_time }] : []),
-    ...rows,
+    ...(wb?.white_bg_drive_file_id
+      ? [{ drive_file_id: wb.white_bg_drive_file_id, drive_modified_time: wb.white_bg_modified_time, role: 'white_bg' }] : []),
+    ...rows.map((r) => ({ drive_file_id: r.drive_file_id, drive_modified_time: r.drive_modified_time, role: 'slot:' + (Number(r.sort) + 1) })),
   ];
   return { productInfo, colorVariations, images };
 }
