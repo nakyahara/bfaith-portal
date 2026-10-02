@@ -1,7 +1,7 @@
 /**
  * amazon-settlement-versions.js — 決済の文書の版 (D-66)・生の表の版 source_revision・読み直す注文・coverage の lease (D7b-1b-3)
  *
- * 設計 = AI_reference システム設計/CompanyDB構想/13_Amazon利益のmart_設計_20260930.md v26 §3.1・D-65・D-66
+ * 設計 = AI_reference システム設計/CompanyDB構想/13_Amazon利益のmart_設計_20260930.md v27 §3.1・D-65・D-66
  *
  * ① 文書の版 (D-66)
  *   - 決済のレポート 1 本 (= 1 つの決済の全部の行) を「文書の版」として amazon_settlement_document_versions に 1 行で持つ。

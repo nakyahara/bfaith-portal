@@ -1,7 +1,7 @@
 /**
  * amazon-finance-coverage.js — 決済のそろい (coverage) の判定と manifest (miniPC 側・D7b-1b-3)
  *
- * 設計 = AI_reference システム設計/CompanyDB構想/13_Amazon利益のmart_設計_20260930.md v26 §3.1・D-65・D-66
+ * 設計 = AI_reference システム設計/CompanyDB構想/13_Amazon利益のmart_設計_20260930.md v27 §3.1・D-65・D-66
  *   Render の受け口 (PR #1561 ingest/finance-coverage.mjs) は manifest の形・receipt digest・policy の指紋・鎖の端しか確かめられない。
  *   一覧・初期の印・文書の版・期待の report の集合はここ (SQLite の 1 つの読み取りの取引の中) で確かめる。
  *

@@ -2,7 +2,7 @@
 /**
  * amazon-finance-coverage-run.js — Amazon の決済の取込と Company DB の財務の送信と「決済のそろい」(coverage) を 1 回として回す coordinator (D7b-1b-3)
  *
- * 設計 = AI_reference システム設計/CompanyDB構想/13_Amazon利益のmart_設計_20260930.md v26 §3.1 (coordinator・lease・source_revision・一覧の窓の連続・
+ * 設計 = AI_reference システム設計/CompanyDB構想/13_Amazon利益のmart_設計_20260930.md v27 §3.1 (coordinator・lease・source_revision・一覧の窓の連続・
  *   最新の観測・CANCELLED・期間の型・receipt digest・manifest)・D-65 (初期の印)・D-66 (決済ごとに採る文書の版を 1 つ)
  *   Render 側 = PR #1561 (POST /apps/company-db/sync/order-finance/coverage・GET …/coverage/status・財務の chunk の coverage_generation / run_token)
  *
@@ -25,7 +25,7 @@
  *   ⑤ 送り手 (amazon-finance.mjs) = 渡された世代・token を全部の chunk に付ける。coverage の回は --full (全部の注文を変換 = receipt digest)。
  *      走査の同じ読み取りの取引の中で manifest を計算 (amazon-finance-coverage.js)・送れた注文の「読み直す注文」を R 以下だけ消す
  *   ⑥ 完成の判定 (completionBlockers) → complete の直前に source_revision と初期の印 (id・epoch・digest・順番待ち) を読み直す (manifest と違えば送らない)・lease がまだ自分のものか確かめる → complete
- *      (1 回 30 秒・3 回まで)。一覧・合計・receipt digest・版・採った文書・policy の指紋が全部そろったときだけ。
+ *      (1 回 120 秒・3 回まで)。一覧・合計・receipt digest・版・採った文書・policy の指紋が全部そろったときだけ。
  *      🚨 complete の POST が終わるまで lease を持ち続ける = 人が積む入口 (印・手のファイルの --queue) は生きている lease の間は積まない (#1567 Codex R2 High 2)。
  *      POST の後にもう一度 印・順番待ち・source_revision を読み直し、変わっていれば新しい世代の updating で complete を取り消す (❌・lease が切れた場合の保険)
  *   途中で落ちる・PC が止まる = Render は updating のまま (fail-closed = 正式な利益は null)
@@ -83,7 +83,7 @@ export const COVERAGE_POST_ATTEMPTS = 3;
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const todayJst = () => new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
 
-/** coverage の POST (updating / complete)。1 回 30 秒・3 回まで (5xx・通信の失敗・503 LOCKED は間を空けて送り直す・4xx は止める) */
+/** coverage の POST (updating / complete)。1 回 120 秒 (COVERAGE_POST_TIMEOUT_MS)・3 回まで (5xx・通信の失敗・503 LOCKED は間を空けて送り直す・4xx は止める) */
 export async function postCoverage(fetchImpl, { base, syncKey, body, sleep = defaultSleep, log = () => {}, attempts = COVERAGE_POST_ATTEMPTS, timeoutMs = COVERAGE_POST_TIMEOUT_MS }) {
   let last = null;
   for (let i = 1; i <= attempts; i++) {

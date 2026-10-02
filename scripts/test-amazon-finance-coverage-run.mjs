@@ -2,7 +2,7 @@
 /**
  * test-amazon-finance-coverage-run.mjs — 決済のそろい (coverage) の miniPC 側 = coordinator (D7b-1b-3) の受入試験
  *
- * 設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』v26 §3.1・D-65・D-66。
+ * 設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』v27 §3.1・D-65・D-66。
  *   Render = 本物の router (PR #1561 の受け口・0050) を PGlite で。SP-API = 作り物 (一覧・取込の一覧・文書)。一時 DATA_DIR。本番には触れない。
  *   場面:
  *     取込だけ (財務のバックフィル前) / 初期の印が無い = ⚠️ complete にしない / 印の決済が SQLite に無い = ⚠️ / 手のファイル (順番待ち) → complete /
