@@ -122,7 +122,10 @@ try {
   # --- 3. one request ------------------------------------------------------------
   # Permissions come from work\.claude\settings.json (defaultMode dontAsk; only ./phlp and ./phlpreview).
   # ASCII, no quotes, no cmd metacharacters (& | < > ^ %). ONE request per run: the person is watching.
-  $prompt = 'Process ONE LP compose request. Follow the ph-lp-compose skill in this workspace exactly: claim one request with ./phlp, download and LOOK AT the product images, read the spec file, reserve BEFORE writing, write the section 7 output, lint it, review with ./phlpreview, then send the result with ./phlp result and clean up. After reserve, a failure must be reported as result --rejected, never as fail. Never read the service token and never touch files outside this workspace. Finish with one line: job=N status=done or rejected or failed'
+  # The skill is the authority; this prompt only has to get the session into it without a false start.
+  # It names seen-<ID>.md and ./phlp lint on purpose: ./phlpreview refuses to run without the
+  # seen file, and the server lint is what decides whether an accepted result is taken.
+  $prompt = 'Process ONE LP compose request. Follow the ph-lp-compose skill in this workspace exactly: claim one request with ./phlp, download the product images and LOOK AT them, write what you saw into seen-<ID>.md, read the spec file, reserve BEFORE writing, write the section 7 output following the instruction that came with the claim, check it with ./phlp lint until it passes, review with ./phlpreview, then send the result with ./phlp result and clean up. After reserve, a failure must be reported as result --rejected, never as fail. Never read the service token and never touch files outside this workspace. Finish with one line: job=N status=done or rejected or failed'
   $timedOut = $false
   $claudeExit = -1
   try {

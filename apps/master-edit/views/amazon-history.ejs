@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    const ENT = { amazon_sku_map: '対応', listing_component: '構成', listing: '出品' };
+    const OP = { INSERT: '追加', UPDATE: '変更', DELETE: '削除' };
+    const WHO = { portal_amazon_map: 'マスタの入力 (Amazon SKU)', amazon_map_migration: '切替の日の移行', company_db_load: '夜間ロード', sql: 'SQL' };
+    const val = (v) => (v === null || v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v));
+  %>
+  <div class="me-wrap">
+    <p class="muted" style="font-size: 0.85em;"><a href="<%= base %>/amazon/">← Amazon SKU の一覧へ</a> ・ <a href="<%= base %>/amazon/sku?sku=<%= encodeURIComponent(sku) %>">← <%= sku %> へ</a></p>
+    <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
+    <% if (h) { %>
+    <h2 style="font-size: 1.1em;"><%= sku %> の変更の記録 <span class="muted" style="font-size: 0.8em;"><%= h.cur.map ? h.cur.map.name : (h.cur.listing.title || '') %></span></h2>
+    <p class="muted" style="font-size: 0.85em;">新しい順に 200 件まで。対応・構成 (NE コードは SKU の番号)・出品の変更を、DB のトリガーが同じ取引で残しています。</p>
+    <div class="tbox">
+      <table class="me">
+        <thead><tr><th>時刻</th><th>対象</th><th>操作</th><th>項目</th><th>前</th><th>後</th><th>誰が</th><th>どこから</th><th>理由</th></tr></thead>
+        <tbody>
+          <% if (!h.events.length) { %><tr><td colspan="9" class="muted">記録はまだありません</td></tr><% } %>
+          <% for (const e of h.events) { %>
+          <tr>
+            <td style="white-space: nowrap;"><%= String(e.recorded_at).slice(0, 19) %></td>
+            <td><%= ENT[e.entity_type] || e.entity_type %></td>
+            <td><%= OP[e.operation] || e.operation %></td>
+            <td><%= e.attribute || '' %></td>
+            <td style="max-width: 260px; word-break: break-all;"><%= val(e.old_value) %></td>
+            <td style="max-width: 260px; word-break: break-all;"><%= val(e.new_value) %></td>
+            <td><%= e.actor_id || e.actor_type %></td>
+            <td><%= WHO[e.source_system] || e.source_system %></td>
+            <td><%= e.reason_text || '' %></td>
+          </tr>
+          <% } %>
+        </tbody>
+      </table>
+    </div>
+    <% } %>
+  </div>
+</body>
+</html>

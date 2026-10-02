@@ -25,7 +25,7 @@
 import 'dotenv/config';
 import { initDB, getDB } from './db.js';
 
-const TTL_HOURS = 7 * 24;                        // 鮮度しきい値 168h (fetch-amazon-fees と揃える、Codex #4 hour 単位)
+const TTL_HOURS = 7 * 24;                        // 鮮度しきい値 168h (Codex #4 hour 単位)。🚨 fetch-amazon-fees とは揃えない: 取り直しはそちらが 6 日周期の枠の日・132 時間の境で手前に行う。ここは「本当に古い」を見る役 (2026-10-02)
 const WARN_WEIGHTED_COVERAGE_PCT = 98;
 const CRITICAL_WEIGHTED_COVERAGE_PCT = 95;
 const TOP_N_UNCOVERED = 20;

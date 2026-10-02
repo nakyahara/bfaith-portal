@@ -7,6 +7,9 @@
  *   V2 は形が違う (金額が amount-type / amount-description / amount の縦並び) → amazon-settlement-v2.js で V1 の形の TSV に並べ直してから
  *   今までと同じ正規化に通す (source_layer = 'sp_api_v2')。並べ直しは 6 期間の V1 / V2 で business_line_key が全部一致することを確かめた。
  *   (旧) V1 で取込済みの決済は V2 では入れなかった → 2026-10-01 に廃止 (V2 も必ず版として保存・下の 🆕)。
+ *   (#1582 = V1 / V2 のもう片方の層があれば入れない排他・skipped_v2) は採らない: この PR では取込はどの道 (coordinator・スイッチの無い今までの取込) も
+ *   決済ごとに全部の文書を版として保存し、下流 (v_amazon_settlement_unified・月の mart・手数料・日次の財務・送り手) は採った版 1 つの行だけを使う =
+ *   V1 と V2 の両方の版があっても二重にならない。排他を残すと V2 の版が保存されず、coverage の期待の report が満たせない (report_not_imported)
  *   並べ直しの規則に無い組み合わせ・日時の空・品物の番号を補えない行が 1 つでもあるレポートは **取り込まない** + 終了コード 3
  *   (daily-sync で ❌ = 規則を足す合図。取り込んでから規則を直すと古い行と新しい行が二重になるため。V2 は約 90 日取り直せる = 落ちない。Codex #1508 R1)
  *   V1 が必要なら --source v1 (11/11 まで)
@@ -614,6 +617,13 @@ export function processV2Report(db, v2Tsv, reportId, runId, { dryRun = false, re
   return { ...base, status: 'ingested', result: ingestSettlement(db, p.headerRow, p.lineRows, p.ctx, { lease, now }) };
 }
 
+/** その決済の見出し・明細がその層 (source_layer) にあるか (#1582 から。調べの表示用) */
+export function settlementInLayer(db, settlementId, layer) {
+  if (!settlementId) return false;
+  return !!(db.prepare(`SELECT 1 FROM raw_amazon_settlement_headers WHERE source_settlement_id = ? AND source_layer = ? LIMIT 1`).get(settlementId, layer)
+    || db.prepare(`SELECT 1 FROM raw_amazon_settlement_lines WHERE source_settlement_id = ? AND source_layer = ? LIMIT 1`).get(settlementId, layer));
+}
+
 /** 見出しが 2 行以上の文書を拒む理由 (#1567 Codex R3 High 2) */
 export const multiHeaderReason = (n) => `見出しが ${n} 行 (1 つの文書に 1 行だけ) = 連結・壊れた文書 = 取り込まない`;
 
@@ -624,8 +634,7 @@ export function settlementHasVersion(db, settlementId) {
 }
 /** その決済が V1 (sp_api_v1) で取込済みか (旧い関数・調べの表示用。取込は V2 を必ず保存する) */
 export function settlementIngestedByV1(db, settlementId) {
-  if (!settlementId) return false;
-  return !!db.prepare(`SELECT 1 FROM raw_amazon_settlement_headers WHERE source_settlement_id = ? AND source_layer = 'sp_api_v1' LIMIT 1`).get(settlementId);
+  return settlementInLayer(db, settlementId, 'sp_api_v1');
 }
 
 // 🚨 1 回の呼び出し = 1 決済の完全なレポート 1 本 = 文書の版 1 つ (D-66)。1 つの決済を複数の文書に分けて入れない (決済ごとに採る版は 1 つ)

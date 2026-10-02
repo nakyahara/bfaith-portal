@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    const pageHref = (offset) => '?' + new URLSearchParams({ ...Object.fromEntries(Object.entries(filters).filter(([k, v]) => v && k !== 'offset')), ...(offset ? { offset: String(offset) } : {}) }).toString();
+  %>
+  <div class="me-wrap">
+    <p class="muted" style="font-size: 0.85em;"><a href="<%= base %>/">商品・セット</a> ・ <b>Amazon SKU</b></p>
+    <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
+    <% if (amazonClosed) { %><div class="band warn">いまは保存できません (<%= amazonClosedWhy %>)。この画面は見るだけです。切替日までは Amazon SKU の対応の正は miniPC の SKU マスタ (/apps/warehouse の「SKUマスタ」) です。</div><% } %>
+    <% if (!canEdit) { %><div class="band info"><%= gateMessage %></div><% } %>
+    <div class="me-box">
+      <p class="hint">
+        Amazon の seller SKU が、どの NE の商品 (コード × 数量) でできているか = Amazon SKU の対応です。Company DB の対応の一覧です (削除した対応 = 墓標も出ます)。
+        古い表 (miniPC の SKU マスタ・Render) と FBA 補充に届くのは、毎朝 07:00 の写しの後です。
+        <a href="unmapped">⚠ 未登録 (売れたのに構成が無い SKU)</a> ・ <a href="<%= base %>/manual#amazon">📖 つかいかた</a>
+      </p>
+    </div>
+
+    <form method="get" action="" class="row">
+      <input name="q" value="<%= filters.q %>" placeholder="seller SKU・名前・NE コードで検索" size="30">
+      <label>状態 <select name="state"><option value="">全部</option><% for (const [k, v] of Object.entries(MAP_STATES)) { %><option value="<%= k %>"<%= filters.state === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
+      <button class="btn-sm" type="submit">表示</button>
+      <span class="muted"><%= data.total.toLocaleString('ja-JP') %> 件</span>
+    </form>
+    <form method="get" action="sku" class="row">
+      <input name="sku" placeholder="seller SKU を開く (無ければ新しい対応)" size="30" required>
+      <button class="btn-sm" type="submit">開く</button>
+    </form>
+
+    <% if (data.tableMissing) { %><div class="band warn">Company DB に Amazon SKU の対応の表がまだありません (migration 0054 の前)。</div><% } %>
+    <div class="tbox">
+      <table class="me">
+        <thead><tr><th>seller SKU</th><th>名前</th><th>構成 (NE コード × 数量)</th><th>状態</th><th>FBA / FBM</th><th>ASIN</th><th>変えた時刻 (UTC)</th><th>変えた人</th></tr></thead>
+        <tbody>
+          <% if (!data.rows.length) { %><tr><td colspan="8" class="muted"><%= dbError ? '読めません' : (filters.q || filters.state ? '当てはまる対応がありません' : 'まだ対応がありません (切替の日の移行の前は 0 件です。今の正は miniPC の SKU マスタ)') %></td></tr><% } %>
+          <% for (const r of data.rows) { %>
+          <tr>
+            <td><a href="sku?sku=<%= encodeURIComponent(r.seller_sku) %>"><%= r.seller_sku %></a></td>
+            <td><%= r.name %></td>
+            <td><%= r.comps || '—' %></td>
+            <td><%= MAP_STATES[r.state] || r.state %><% if (r.origin === 'legacy') { %> <span class="tag gray">移行</span><% } %></td>
+            <td><%= r.channel ? (CHANNELS[r.channel] || r.channel) : '—' %></td>
+            <td><%= r.asin || '' %></td>
+            <td style="white-space: nowrap;"><%= String(r.changed_at || '').slice(0, 19).replace('T', ' ') %></td>
+            <td><%= r.changed_by || '' %></td>
+          </tr>
+          <% } %>
+        </tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <% if (data.offset > 0) { %><a href="<%= pageHref(Math.max(0, data.offset - data.limit)) %>">← 前の <%= data.limit %> 件</a><% } %>
+      <% if (data.total > data.offset + data.rows.length) { %><a href="<%= pageHref(data.offset + data.limit) %>">次の <%= data.limit %> 件 →</a><% } %>
+      <% if (data.total) { %><span class="muted"><%= data.offset + 1 %>〜<%= data.offset + data.rows.length %> 件目</span><% } %>
+    </div>
+  </div>
+</body>
+</html>

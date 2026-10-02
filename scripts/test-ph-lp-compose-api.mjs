@@ -1,4 +1,5 @@
 import { temporaryTestDataDir } from './test-temp-dir.mjs';
+import { compositionFor, fixture, FIXTURES } from './fixtures/lp-compose/index.mjs';
 await temporaryTestDataDir(import.meta.url, 'test-lp-compose-api-');
 /**
  * LP 構成の AI 生成 — 画面 API・service-api・仕様書の取込 (apps/product-hub/router.js・段階1)
@@ -210,7 +211,29 @@ const rv = await svc('POST', `/lp-compose/jobs/${job.job_id}/reserve`, {
 eq(rv.status, 200, '予約できる');
 eq((await svc('POST', `/lp-compose/jobs/${job.job_id}/fail`, { body: { lease_token: job.lease_token, code: 'x' } })).status, 409,
   '🚨 予約後に fail は使えない');
-const OUT = '# LP制作システム V2.1\n\n## ⑦ AI画像生成プロンプト\n\n### AI画像生成プロンプト 出力テンプレート V2.2\n…';
+// 🚨 lint はサーバが実行する (PR1-c)。accepted には本当に通る本文が要る
+const OUT = compositionFor('ハッカ油スプレー 100ml');
+
+console.log('⑤b lint の口 — 出す前に自分で直せる (PR1-c)');
+{
+  const good = await svc('POST', `/lp-compose/jobs/${job.job_id}/lint`, { body: { lease_token: job.lease_token, output: OUT } });
+  eq(good.status, 200, 'lint を呼べる');
+  eq(good.json.lint.ok, true, '通る本文は ok');
+  const bad = await svc('POST', `/lp-compose/jobs/${job.job_id}/lint`, {
+    body: { lease_token: job.lease_token, output: fixture(FIXTURES.legacyV21) },
+  });
+  eq(bad.status, 200, '通らなくても 200 (lint の結果を返すのが仕事)');
+  eq(bad.json.lint.ok, false, '旧版は ok じゃない');
+  ok(bad.json.lint.errors.length > 0, '何が足りないかを返す (実行役が直せるように)');
+  eq((await svc('POST', `/lp-compose/jobs/${job.job_id}/lint`, { body: { lease_token: 'wrong', output: OUT } })).status, 409,
+    '🚨 lease が違えば lint もさせない');
+  eq((await svc('POST', `/lp-compose/jobs/${job.job_id}/lint`, { body: { lease_token: job.lease_token, output: '' } })).status, 400,
+    '空の本文は断る');
+  // 🚨 AI 枠を消費しない = 何度でも呼べる
+  eq((await svc('POST', `/lp-compose/jobs/${job.job_id}/lint`, { body: { lease_token: job.lease_token, output: OUT } })).json.lint.ok,
+    true, '🚨 何度でも呼べる (generation を消費しない)');
+}
+
 // 🚨 証跡は実行役から受け取らない。サーバが画像を配ったときの記録を使う (codex exec review P1)。
 //    Drive が無い環境では配れないので、ここでは記録だけ直接作って通す
 eq((await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
@@ -225,6 +248,14 @@ eq((await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`,
   body: { packet_hash: job.packet_hash, verdict: 'accepted', output: OUT, review_rounds: 1, lint: { ok: true } },
 })).status, 400, '🚨 2 枚中 1 枚しか配っていなければ accepted を受け取らない');
 lp.recordImageServed(db, job.job_id, { leaseToken: job.lease_token, fileId: 'FILEIDIMG002', sha256: 'd'.repeat(64), bytes: 3333 });
+console.log('⑤c サーバの lint が正本 (PR1-c)');
+const badLint = await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
+  body: { packet_hash: job.packet_hash, verdict: 'accepted', output: fixture(FIXTURES.legacyV21), review_rounds: 1, lint: { ok: true } },
+});
+eq(badLint.status, 422, '🚨 自分で lint.ok=true と書いても、サーバが落とす');
+// 🚨 断るだけでは直しようが無い。何が落ちたかを返す (codex exec review P2)
+ok(badLint.json.lint && badLint.json.lint.errors.length > 0, '🚨 422 に lint の中身が入る');
+ok(badLint.json.lint.errors.some((e) => e.id === 16), '  何番の検査が落ちたか分かる');
 const sub = await svc('POST', `/lp-compose/generations/${rv.json.generation_id}/result`, {
   body: {
     packet_hash: job.packet_hash, verdict: 'accepted', output: OUT, review_rounds: 1,

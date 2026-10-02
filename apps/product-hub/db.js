@@ -1894,7 +1894,7 @@ export function initProductHubDB() {
     ['workflow_state', "ALTER TABLE draft_image_production ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'active' CHECK (workflow_state IN ('active', 'on_hold'))"],
     ['hold_note', 'ALTER TABLE draft_image_production ADD COLUMN hold_note TEXT'],
     // 2026-09-13 スタッフ要望: 本番の構成の 済/まだ。縦列 ②仮構成 とは別に持つ。
-    //   NULL = 人がまだ決めていない (③素材待ちが決着していれば 済 とみなす) / 'done' / 'todo' = 人が決めた値 (推定より優先)
+    //   NULL = 人がまだ決めていない (④AI制作が決着していれば 済 とみなす) / 'done' / 'todo' = 人が決めた値 (推定より優先)
     ['compose_status', "ALTER TABLE draft_image_production ADD COLUMN compose_status TEXT CHECK (compose_status IN ('done', 'todo'))"],
     ['compose_updated_at', 'ALTER TABLE draft_image_production ADD COLUMN compose_updated_at TEXT'],
     ['compose_updated_by', 'ALTER TABLE draft_image_production ADD COLUMN compose_updated_by TEXT'],

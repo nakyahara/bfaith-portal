@@ -106,6 +106,7 @@ ok(snap.u === 100 && snap.d === '2026-01-01' && snap.q === 3, `作り直して�
 ok(snap.c === 100 * (snap.q - snap.rq - snap.aq), `原価の合計 = 残った snapshot 100 円 × 新しい個数 (注文 ${snap.q} − 返金の推定 ${snap.rq + snap.aq}) = ${snap.c} 円`);
 ok(snap.pr === snap.sp - snap.rp - snap.c, `利益も新しい数で直る = 本体 ${snap.sp} − 返金 ${snap.rp} − 原価の合計 ${snap.c} = ${snap.pr} 円 (この試験ではほかの金額は 0)`);
 // ① V1 を 1 本 (V2 の後に V1 も入った)
+//   (#1582 の「V2 で入れた決済に V1 を入れない (skipped_v2)」は #1567 では採らない = 版として入り、下流は決済ごとに採った版 1 つ。test-settlement-v2.js の古い Easy Ship の試験)
 ingest(prepareReportTsv(V1_TSV, 'R-V1-a', 'run1'));
 expectAll('V2 + V1');
 // ② 同じ決済のレポートがもう 1 本 (同じ期間の V1 が 2 本)

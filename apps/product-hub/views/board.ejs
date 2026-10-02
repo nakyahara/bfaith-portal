@@ -138,7 +138,7 @@
      TOP は工程を廃止した (2026-08-31) ので、出品ゲートと同じ「枠1 (_top) が登録されているか」で見る */
   .kb-imgtracks { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
   .kb-krow { display: flex; align-items: center; gap: 5px; color: #64748b; }
-  .kb-krow .kb-kname { flex: 0 0 62px; font-weight: 700; color: #475569; }   /* 「トップ画像」が折り返さない幅 */
+  .kb-krow .kb-kname { flex: 0 0 62px; font-weight: 700; color: #475569; }   /* 「トップ画像」「撮影指示書」(全角5文字) が折り返さない幅 */
   .kb-state { flex: 0 0 auto; font-weight: 700; border-radius: 4px; padding: 1px 7px; border: 1px solid; }
   .kb-state.done { background: #dcfce7; color: #166534; border-color: #86efac; }
   .kb-state.todo { background: #fff7ed; color: #b45309; border-color: #fdba74; }
@@ -312,11 +312,20 @@
             : { state: 'todo', text: 'まだ', note: t.current ? t.current.label : '', stalledDays: t.stalledDays };
       const topDone = !!(c.image && c.image.top && c.image.top.registered);
       // 本番の構成 (2026-09-13 スタッフ要望)。縦列「仮構成」とは別の印なので、素材待ちなど
-      // 別の列にいても 済/まだ が読める。印が無くても ③素材待ちが済んでいれば 済 (composeStateOf)
+      // 別の列にいても 済/まだ が読める。印が無くても ④AI制作が済んでいれば 済 (composeStateOf)
       const cp = (c.image && c.image.compose) || null;
       const compose = !cp ? { state: 'off', text: '—' }
         : cp.excluded ? { state: 'off', text: '対象外' }
           : cp.done ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' };
+      // 撮影指示書 (2026-10-01 スタッフ要望)。「商品を発送していても指示書ができていない場合がある」
+      // ので、撮影・素材ステータス (商品が届いたか) とは別の行で 済/まだ を出す。
+      // 済 = 画像制作の「カメラ撮影指示URL」が入っている / 撮影不要の商品は作らないので対象外
+      const ci = (c.image && c.image.cameraInstruction) || null;
+      // 🚨 撮影不要を**先に**見る: Notion 取り込みは撮影・素材と撮影指示URL を別々に埋めるので、
+      // 「撮影依頼不要 + 古い撮影指示URL あり」が作れてしまう。URL を先に見ると「済」に出る
+      const camera = !ci ? { state: 'off', text: '—' }
+        : ci.notRequired ? { state: 'off', text: '対象外' }
+          : ci.registered ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' };
       return [
         {
           name: 'トップ画像',
@@ -324,7 +333,14 @@
           ...(topDone ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' }),
         },
         { name: '詳細画像', title: '商品詳細画像 (LP)。楽天登録・A+登録まで来たら「済」', ...detail },
-        { name: '構成', title: '本番の構成ができたか (縦列「仮構成」とは別。詳細画面の画像制作で「構成を済にする」/ ③素材待ちが済んでいれば 済)', ...compose },
+        { name: '構成', title: '本番の構成ができたか (縦列「仮構成」とは別。詳細画面の画像制作で「構成を済にする」/ ④AI制作が済んで ⑤デザイン修正 に移れば 済)', ...compose },
+        {
+          name: '撮影指示書',
+          title: camera.state === 'done' ? '撮影指示書 (カメラ撮影指示URL) が入っています'
+            : camera.state === 'off' && ci ? '撮影不要の商品なので撮影指示書は作りません'
+              : '撮影指示書 (カメラ撮影指示URL) がまだ入っていません。商品を発送していても指示書ができていないことがあります',
+          ...camera,
+        },
       ];
     };
   %>
@@ -1249,6 +1265,8 @@
     const body = col.querySelector('.kb-body');
     const moved = [];
     const errors = [];
+    const blocked = [];
+    const blockedEls = [];
     for (const c of group) {
       // 落とした列に元からいたカードは工程を動かさない (並び順だけ揃える)
       if (c.dataset.fromCol === to) { moved.push(c); continue; }
@@ -1260,7 +1278,15 @@
           }),
         });
         const j = await res.json();
-        if (j.ok) moved.push(c); else errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': ' + (j.error || '移動できませんでした'));
+        if (j.ok) {
+          moved.push(c);
+          // 移動はできたが落とした列に止まらなかったカードも知らせる (1 枚ずつのドロップと同じ理由)
+          if (j.reopenBlocked) {
+            blocked.push((c.dataset.name || ('#' + c.dataset.draft)) + ': 「' + j.reopenBlocked.label + '」を開き直せないため先の工程に進みました ('
+              + j.reopenBlocked.message + ')');
+            blockedEls.push(c);
+          }
+        } else errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': ' + (j.error || '移動できませんでした'));
       } catch (err) {
         errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': 通信エラー ' + err.message);
       }
@@ -1276,10 +1302,14 @@
         if (after) after.after(c); else if (ref && ref.parentNode === body) ref.after(c); else body.appendChild(c);
         after = c;
       }
+      // 落とした列に止まらないカード (開き直せなかった) は並び順に残さない。
+      // この後すぐ読み直すので、保存の前に列から外すだけでよい (1 枚ずつのドロップと同じ扱い)
+      for (const c of blockedEls) c.remove();
       await saveOrder(col);
     }
     let msg = '';
     if (errors.length) msg += moved.length + ' 件を移動しました。移動できなかったカード (' + errors.length + ' 件):\n\n' + errors.join('\n');
+    if (blocked.length) msg += (msg ? '\n\n' : '') + '落とした列に止まらなかったカード (' + blocked.length + ' 件):\n\n' + blocked.join('\n');
     // 1 枚ずつ落としたときに出る「楽天に出品しますか」は、まとめて移動では出さない (続けて何件も公開しない)
     if (moved.length && BOARD_VIEW !== 'image' && to === 'listing') {
       msg += (msg ? '\n\n' : '') + 'まとめて移動したときは楽天への出品の確認を出しません。出品は 1 枚ずつ「出品・展開」に落とすか、詳細画面から行ってください';
@@ -1392,6 +1422,7 @@
         return;
       }
       let moved = false;
+      let reopenBlocked = null;
       try {
         const res = await fetch('/apps/product-hub/api/drafts/' + card.dataset.draft + '/board-move', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1403,13 +1434,21 @@
           }),
         });
         const j = await res.json();
-        if (j.ok) moved = true; else alert(j.error || '移動できませんでした');
+        if (j.ok) { moved = true; reopenBlocked = j.reopenBlocked || null; } else alert(j.error || '移動できませんでした');
       } catch (err) {
         alert('通信エラー: ' + err.message);
       }
+      // 落とした列の工程を開き直せなかった = カードは**その先の列**に出る。
+      // 黙っていると、いま直している「落とした列に止まらない」症状と見分けが付かない。
+      // 理由はサーバーの文面をそのまま出す (権限が足りない / 楽天が「対象外」 など)
+      if (moved && reopenBlocked) {
+        alert('移動しました。ただし「' + reopenBlocked.label + '」は開き直せなかったので、'
+          + 'カードはその先の工程に進みます。理由: ' + reopenBlocked.message);
+      }
       // 工程が動いたときだけ、落とした位置を並び順として残す (失敗時に位置だけ残ると
-      // 読み直しで元の列に戻ったカードが変な順で並ぶ)
-      if (moved) await saveOrder(col);
+      // 読み直しで元の列に戻ったカードが変な順で並ぶ)。
+      // 開き直せなかったときは落とした列に止まらないので、その列の並び順は保存しない
+      if (moved && !reopenBlocked) await saveOrder(col);
       // 「出品・展開」に落とした = 楽天に出す番 (2026-09-01 中原さん要望)。工程移動が済んだあとに
       // 確認を出し、OK なら 画像転送 → 公開で登録 まで続ける。取りやめても工程移動は残る。
       // 楽天が済み/対象外の商品 (他モールの展開で戻ってきた等) には聞かない。

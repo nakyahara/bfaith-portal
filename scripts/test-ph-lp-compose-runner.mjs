@@ -1,4 +1,5 @@
 import { temporaryTestDataDir } from './test-temp-dir.mjs';
+import { compositionFor, fixture, FIXTURES } from './fixtures/lp-compose/index.mjs';
 const tmp = await temporaryTestDataDir(import.meta.url, 'test-lp-runner-');
 /**
  * LP 構成の実行役 — 固定機能 CLI (scripts/ph-nightly/phlp.mjs) の通し (段階1・PR1-b)
@@ -122,6 +123,10 @@ ok(inState(`lease-${jid}.json`), 'lease は work/ の外 (state/) に閉じる')
 ok(fs.readFileSync(path.join(work, `spec-${jid}.md`), 'utf8').includes('取込互換'), '仕様書の中身が入っている');
 eq(cl.json.packet.images, 1, '商品画像の枚数が分かる');
 ok(cl.json.packet.product_info.includes('ハッカ油'), '商品情報が来る');
+// 🚨 スタッフの定型文と同じ指示文が実行役に届く (設計 §5)。
+//    届かないと、実行役はスキルの言い回しを読むことになり、測定が「同じ入力の比較」にならない
+ok(cl.json.instruction && cl.json.instruction.includes('⑦ AI画像生成プロンプトのみを出力'),
+  '🚨 claim にスタッフと同じ指示文が付いてくる');
 
 console.log('③ images — Drive が無い環境では取れないことが分かる');
 const im = await phlp('images', jid);
@@ -131,7 +136,9 @@ ok(im.code !== 0, 'Drive が無ければ失敗する (0 枚で黙って進まな
 eq(im.json.expected, 1, '🚨 packet の枚数を期待値にする');
 
 console.log('④ ファイル引数は決まった名前だけ');
-fs.writeFileSync(path.join(work, `out-${jid}.md`), '# LP制作システム V2.1\n\n## ⑦ AI画像生成プロンプト\n…', 'utf8');
+// 🚨 PR1-c から **lint はサーバが実行してそれが正本**。
+//    ダミー文字列では accepted を受け取ってもらえないので、本当に通る本文を置く
+fs.writeFileSync(path.join(work, `out-${jid}.md`), compositionFor('ハッカ油スプレー 100ml'), 'utf8');
 fs.writeFileSync(path.join(work, 'secret.txt'), 'トークンのつもり', 'utf8');
 eq((await phlp('result', jid, '--accepted', '--file', 'secret.txt')).code, 2, '🚨 別名のファイルは読まない');
 eq((await phlp('result', jid, '--accepted', '--file', `../out-${jid}.md`)).code, 2, '🚨 パス付きは読まない');
@@ -159,6 +166,21 @@ ok(rv.json.generation_id > 0, 'generation_id が返る');
 eq((await phlp('fail', jid, '--code', 'OTHER', '--message', 'x')).code, 1, '🚨 予約後に fail は通らない');
 eq((await phlp('release', jid, '--reason', 'x')).code, 1, '🚨 予約後に release も通らない');
 eq((await phlp('fail', jid, '--code', 'へんなコード')).code, 2, '知らない code は断る');
+
+console.log('⑤b lint — サーバが正本。出す前に自分で直せる (PR1-c)');
+{
+  const good = await phlp('lint', jid, '--file', `out-${jid}.md`);
+  eq(good.code, 0, 'lint を呼べる');
+  eq(good.json.lint.ok, true, '通る本文は ok');
+  // 通らない本文に入れ替えると、**コマンドとしても失敗する** (通ったつもりで先へ進ませない)
+  fs.writeFileSync(path.join(work, `out-${jid}.md`), fixture(FIXTURES.legacyV21), 'utf8');
+  const bad = await phlp('lint', jid, '--file', `out-${jid}.md`);
+  eq(bad.code, 1, '🚨 lint が通らなければ exit 1');
+  eq(bad.json.lint.ok, false, '何が足りないかを出す');
+  ok(bad.out.indexOf('lease_token') === -1, '🚨 lint の出力にも lease を混ぜない');
+  eq((await phlp('lint', jid, '--file', `out-${other}.md`)).code, 2, '🚨 他の依頼の本文は lint しない');
+  fs.writeFileSync(path.join(work, `out-${jid}.md`), compositionFor('ハッカ油スプレー 100ml'), 'utf8');
+}
 
 console.log('⑥ result — lint と証跡はサーバが見る');
 // lint を通していない accepted は CLI が止める (AI 枠を無駄にしない)

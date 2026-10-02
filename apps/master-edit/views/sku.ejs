@@ -45,6 +45,15 @@
     <p class="sub"><%= KINDS[c.sku_kind] || c.sku_kind %> ・ 状態: <%= STATES[page.state] || page.state %> ・ 登録: <%= c.registration ? (REG_STATES[c.registration.state] || c.registration.state) : '— (切替の前からある商品)' %> ・ version <%= c.version %> ・ <a href="<%= base %>/sku/<%= encodeURIComponent(c.code) %>/history">変更の記録</a></p>
     <% if (c.registration && c.registration.state === 'draft') { %><div class="band info">下書きです (新商品の登録)。NE・ロジザードへの登録はまだです。値はこの画面で直せます。</div><% } %>
     <% if (c.registration && c.registration.state === 'quarantined') { %><div class="band warn">要確認: 切替の後に夜間の処理が NE で見つけた、登録の記録の無い商品です。業務ではまだ使えません。</div><% } %>
+    <% if ((c.registration && ['draft', 'ne_pending'].includes(c.registration.state)) || page.regItems.length) { %>
+      <%# 新商品の NE 登録の CSV (0053)。配った後は NE に送る欄を直せない %>
+      <div class="sec"><h3>NE 登録の CSV</h3>
+        <% if (!page.regItems.length) { %><div class="sub">まだ作っていません。</div><% } %>
+        <% for (const i of page.regItems) { %><div class="fl"><span>ファイル #<%= i.export_id %><%= i.trial ? ' 【試し用】' : '' %></span><span class="tag<%= ['verified', 'failed', 'superseded'].includes(i.state) ? ' gray' : '' %>"><%= REG_ITEM_STATES[i.state] || i.state %></span>
+          <% if (['issued', 'import_declared', 'partial'].includes(i.state)) { %><span class="sub">配った後なので、NE に送る欄 (名前・売価・原価・税率・仕入先・取扱区分・代表・JAN・構成) は直せません</span><% } %></div><% } %>
+        <div class="sub"><a href="<%= base %>/reg-csv">📤 NE 登録の CSV を開く</a> (作る・配る・申告・使わない)</div>
+      </div>
+    <% } %>
     <% if (page.card) { %>
       <%# product-hub の出品カード (新商品の登録で作る。Company DB の知らせ = ops.product_hub_outbox) %>
       <div class="sec" id="card-box" data-base="<%= base %>" data-code="<%= c.code %>"><h3>product-hub の出品カード</h3>
@@ -213,7 +222,8 @@
           <span class="sub">今: <%= c.shipping_method || '—' %> / <%= c.shipping_cost == null ? '—' : fmt.yen(c.shipping_cost) + ' 円' %> (方法と金額は表から)</span><%- cut('shipping_code') %></div>
         <div class="fl"><label class="k">推奨保有月数</label><input type="text" data-field="reorder_months" value="<%= c.reorder_months ?? '' %>" size="5"<%= dis('reorder_months') %>> か月<%- cut('reorder_months') %></div>
         <% if (!isSet) { %>
-        <div class="fl"><label class="k">JAN</label><span><%= page.jan.length ? page.jan.join(' / ') : '—' %></span><span class="tag gray">見るだけ</span></div>
+        <div class="fl"><label class="k">JAN</label><input type="text" data-field="jan" value="<%= page.jan.join(', ') %>" size="36" placeholder="4901234567894 (複数はカンマ区切り・空 = JAN なし)"<%= dis('jan') %>>
+          <span class="sub">8 桁か 13 桁・ほかの商品の JAN は入れられない ・ ロジザード・product-hub にも使う</span><%- cut('jan') %></div>
         <div class="fl"><label class="k">ロジザード</label><span class="sub">有効期限の管理 <%= c.expiry_managed ? 'あり' : 'なし' %> ・ 入荷日の管理 <%= c.inbound_date_managed == null ? '不明' : (c.inbound_date_managed ? 'あり' : 'なし') %> (ロジザードが正・見るだけ)</span></div>
         <% } %>
       </div>
@@ -288,7 +298,7 @@
   // 保存 1 回に 1 つ (通信が切れて押し直しても 2 回入らない)。返事が来た後にもう一度保存するときは新しい番号
   let requestId = uuid();
   const FIELDS = isSet ? ['name', 'standard_price', 'set_sales_class_override', 'handling_own', 'shipping_code', 'reorder_months']
-    : ['name', 'handling', 'parent_code', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months'];
+    : ['name', 'handling', 'parent_code', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan'];
   function els(name) { return Array.from(form.querySelectorAll('[data-field="' + name + '"]')); }
   function fieldValue(name) {
     const list = els(name);
