@@ -294,6 +294,7 @@ null の規則 (nul):
 - 🆕 `unclassified_component_count + unmapped_component_count + finance_legacy_rows > 0` ⇔ 理由 `finance_unclassified` (0050 の g_uncl・#1602 Codex R2)
 - 🆕 理由 `cost_missing` ⇔ 解決した行 かつ 構成あり (`composition_basis` ≠ `missing`) かつ `cost_basis = missing` = `listing_unresolved`・`composition_missing` と排他 (0050 の g_unres・g_comp・g_cost・#1602 Codex R3)
 - 🆕 **日で決まる値は同じ日の行で全部同じ**: `day_finance_status`・`finance_coverage_generation`・`finance_source_revision` (0050 の days を日だけで結ぶ)・`ad_status` (ad_days を日だけで結ぶ)・理由 `ad_unresolved` (ad_u = その日の出品の無い広告の行の数) (#1602 Codex R3 の突き合わせ)
+- 🆕 **要求全体で固定の値は全部の行で同じ** (#1602 Codex R4): 0050 の最後の SELECT で要求全体に固定の列 = `company_id` (p_company_id・1 以上)・`observed_generation` (同じ snapshot の max(generation)・月をまたいでも同じ)・`composition_audit_since` (引数なしの immutable の関数) は行の間でそろえる。`mall`・`scope_key`・`master_basis`・`calculation_version`・`calculated_at` は上 (要求) の値と照合する。/totals は期間の 1 行なので行の間の照合は無く、`master_basis`・`calculation_version`・`calculated_at` を上と照合する
 - `day_finance_status` が complete でない ⇔ 理由 `finance_incomplete` / `ad_status` = `not_collected` ⇔ `ad_not_collected`・`missing` ⇔ `ad_missing`・`legacy_incomplete` ⇔ `ad_legacy_unverified`
 - `assumed_zero_reasons` = `profit_incomplete_reasons` から `refund_units_partial_month` を除いたもの
 

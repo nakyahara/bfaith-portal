@@ -502,7 +502,29 @@ function dailyErrors(body) {
     prev = key;
   });
   errs.push(...dayLevelErrors(body.rows));
+  errs.push(...requestLevelErrors(body.rows));
   return errs;
+}
+/**
+ * 要求全体で固定の値は全部の行で同じ (#1602 Codex R4 M1)。0050 の最後の SELECT で要求全体に固定の列 =
+ *   p_company_id・p_mall・p_scope_key・'current'・'amazon_profit_v1'・observed_generation (同じ snapshot の max(generation))・
+ *   mart.amazon_profit_composition_audit_since() (引数なしの immutable)・statement_timestamp()
+ *   → mall・scope_key・master_basis・calculation_version・calculated_at は上 (要求) の値と照合済み。残りの 3 つを行の間でそろえる
+ *   (月ごとの計算も同じ REPEATABLE READ の snapshot = observed_generation も月をまたいで同じ)
+ */
+export const REQUEST_LEVEL_FIELDS = Object.freeze(['company_id', 'observed_generation', 'composition_audit_since']);
+function requestLevelErrors(rows) {
+  const e = [];
+  const okRows = rows.map((r, i) => [r, i]).filter(([r]) => isObj(r));
+  if (!okRows.length) return e;
+  const [r0, i0] = okRows[0];
+  for (const [r, i] of okRows.slice(1)) {
+    for (const k of REQUEST_LEVEL_FIELDS) {
+      if (JSON.stringify(r[k]) !== JSON.stringify(r0[k])) e.push(`$.rows[${i}].${k}: 行 ${i0} と違う (要求全体で固定の値)`);
+    }
+  }
+  if (!Number.isSafeInteger(r0.company_id) || r0.company_id < 1) e.push(`$.rows[${i0}].company_id: 1 以上の整数でない`);
+  return e;
 }
 /**
  * 日で決まる値は同じ日の行で全部同じ (#1602 Codex R3 M1 の「ほかの理由の漏れ」の突き合わせ)。0050 では

@@ -23,7 +23,7 @@ import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import {
   CONTRACT_VERSION, PROFIT_503_CODES, REQUIRED_HEADERS, REASON_ORDER, TOTALS_REASONS, ASSUMED_ZERO_REASONS, MASTER_NOTE_KEYS, TOTALS_COLUMNS, TOTALS_RULES, DAILY_COLUMNS,
   MONTH_KEYS, validateTotalsResponse, validateDailyResponse, validate503Body, monthsOf, PROFIT_503_ERRORS, PROFIT_503_REASONS, METRICS_REASONS, FAILURE_PATHS,
-  build503Body, SECRET_PATTERNS, DAILY_NUL_RULES, MAX_MONTHS,
+  build503Body, SECRET_PATTERNS, DAILY_NUL_RULES, MAX_MONTHS, REQUEST_LEVEL_FIELDS,
 } from '../apps/company-db/profit/response-contract.mjs';
 import { combineTotals, combineDaily, sumDecimals, round2 } from './fixtures/amazon-profit-response/reference-combine.mjs';
 import companyDbRouter, { __setPgClientFactory } from '../apps/company-db/router.mjs';
@@ -302,6 +302,13 @@ const breakDaily = [
   ['同じ日の行で ad_status が違う (行の中は整合)', (x) => { x.rows[4].ad_status = 'complete'; }],
   ['ad_unresolved が同じ日の 1 行だけ (行の中は整合)', (x) => { const r = x.rows[0]; r.profit_incomplete_reasons = ['ad_unresolved']; r.assumed_zero_reasons = ['ad_unresolved']; r.contribution_after_ad_incl = null; r.contribution_after_ad_excl = null; }],
   ['同じ日の行で coverage の世代が違う', (x) => { x.rows[1].finance_coverage_generation = '13'; }],
+  // 🆕 #1602 Codex R4 M1: 要求全体で固定の値 (company_id・observed_generation・composition_audit_since) は全部の行で同じ
+  ['2 行目だけ company_id が違う (別の会社の行が混ざる)', (x) => { x.rows[1].company_id = 2; }],
+  ['最後の行だけ company_id が違う (別の月・別の日)', (x) => { x.rows[4].company_id = 2; }],
+  ['2 行目だけ observed_generation が違う', (x) => { x.rows[1].observed_generation = '999'; }],
+  ['別の日の行だけ observed_generation が null', (x) => { x.rows[3].observed_generation = null; }],
+  ['2 行目だけ composition_audit_since が違う', (x) => { x.rows[1].composition_audit_since = '2026-10-01T15:00:00.000Z'; }],
+  ['company_id が 0', (x) => { for (const r of x.rows) r.company_id = 0; }],
 ];
 await t(`/daily: 契約を破った ${breakDaily.length} 通りを全部拒む`, async () => {
   for (const [name, f] of breakDaily) {
@@ -334,6 +341,13 @@ await t('/daily: 受け取るべき形 (R3): 構成なしの行は composition_m
     r.contribution_after_ad_incl = null; r.contribution_after_ad_excl = null;
   }
   assert.deepEqual(validateDailyResponse(b).errors, []);
+});
+await t('/daily: 要求全体で固定の値 (R4): 全部の行でそろえて変えるのは受け取る (company_id・observed_generation・composition_audit_since)', async () => {
+  for (const [k, v] of [['company_id', 2], ['observed_generation', '999'], ['observed_generation', null], ['composition_audit_since', '2026-10-01T15:00:00.000Z']]) {
+    const x = clone(dailyExp); for (const r of x.rows) r[k] = v;
+    assert.deepEqual(validateDailyResponse(x).errors, [], `${k}=${v}`);
+  }
+  assert.deepEqual([...REQUEST_LEVEL_FIELDS], ['company_id', 'observed_generation', 'composition_audit_since']);
 });
 await t('/daily: maybe の列は null でも値でもよい (世代・監査の時刻・coverage)', async () => {
   for (const c of DAILY_COLUMNS.filter((c) => c.nul === 'maybe')) {
