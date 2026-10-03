@@ -70,7 +70,7 @@ export const RULES_NIGHTLY = RULES_2B2;
  * 変える = ロジザードの登録を変えるのと同時に、ここ 1 か所だけ。
  */
 export const LZ_SENTINEL_ID = 'zzzzzzzzzz';
-/** 見張りの商品のバーコード (1 本だけ・今あるどれとも重ならない英数字・8 / 13 桁の数字にしない = 入荷検品のバーコードマスタ・Company DB の JAN に入らない)。ID と同じく、ここ 1 か所 */
+/** 見張りの商品のバーコード (1 本だけ・今あるどれとも重ならない英数字・8 / 13 桁の数字にしない = Company DB の JAN のロードに入らない。入荷検品のバーコードマスタには fnsku として入るが、mirror_products に無いので検索・表示の対象外)。ロジザードには必ずこの値を登録する。ID と同じく、ここ 1 か所 */
 export const LZ_SENTINEL_BARCODE = 'LZGUARD0001';
 
 /**
