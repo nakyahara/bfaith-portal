@@ -31,7 +31,7 @@ const db = pgliteAdapter(pg);
 const q = async (sql, p) => (await pg.query(sql, p)).rows;
 const FILE_0056 = path.join(DEFAULT_DIR, '0056_amazon_profit_fn_revoke.sql');
 const REVOKE = revokeSigs();
-const KEEP = manifestUpTo('0056').filter((e) => e.cls !== 'revoke').map((e) => e.sig);   // 0057 以降で作る関数 (manifest の migration) は 0055 の DB に無い
+const KEEP = manifestUpTo('0056').filter((e) => e.cls !== 'revoke').map((e) => e.sig);   // 0056 より後の migration で作る関数 (manifest の migration) は 0055 の DB に無い
 
 // 本番と同じ順: watcher は 0047 / 0049 / 0050 より前からある (create-watch-roles.mjs が作った) = その migration が watcher に EXECUTE を付けた。
 // profit_reader はまだ本番に無いが、あれば外すことを見る (0055 の後に明示の GRANT を付けておく)
@@ -116,8 +116,8 @@ await t('TEMP の権限は監査を出すだけ (0056 の前と後で同じ・PU
   for (const s of ['core.relink_shipments_bulk', 'core.reresolve_order_lines', 'core.merge_duplicate_suppliers']) assert.ok(a.tempFunctions.some((x) => x.startsWith(s + '(')), `${s} が一時の表を作る関数に無い`);
 });
 
-console.log('重い入口の棚卸し (heavy_entry_manifest と pg_proc の突き合わせ・0057 以降も流した今の姿で)');
-await applyMigrations(db, { log: quiet });   // 0057 (reresolve の batch・D-60 1b-0r) から後 = manifest の全部の行の関数がある
+console.log('重い入口の棚卸し (heavy_entry_manifest と pg_proc の突き合わせ・0056 より後も全部流した今の姿で)');
+await applyMigrations(db, { log: quiet });   // 0056 より後 (reresolve の batch・D-60 1b-0r ほか) も全部 = manifest の全部の行の関数がある
 const inTx = async (sql, fn) => { await pg.exec('begin'); try { await pg.exec(sql); return await fn(); } finally { await pg.exec('rollback'); } };
 await t('規則にかかる関数は全部 manifest にあり、manifest の関数は全部 DB にある (mart.finance_daily_range・ad_efficiency・sku_activity は guard_later)', async () => {
   const cands = await heavyCandidates(db);

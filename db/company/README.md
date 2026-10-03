@@ -1760,7 +1760,7 @@ cd C:\Users\bfaith\bfaith-portal
 git worktree remove C:\tmp\d60-revoke
 ```
 
-### 注文明細の解き直しの batch (0057・D-60 PR 1b-0r。Company DB構想 13 §3.10「reresolve の batch の契約」v3.12・Codex R-D60-v3-13 の L1・L2)
+### 注文明細の解き直しの batch (0057・D-60 PR 1b-0r。Company DB構想 13 §3.10「reresolve の batch の契約」v3.14・Codex R-D60-v3-13 の L1・L2・PR #1607 の R1)
 
 **0057 は新しい関数と表を足すだけ。夜間ロードの動きは変えない** = engine (8b) は今までどおり旧い 3 引数 `core.reresolve_order_lines(smallint, text, date)` (0024) を
 `to_regprocedure` で見つけて呼ぶ。新しい署名に切り替えるのは **PR 1b-0e** (本番の件数を読むだけの SQL で確かめた後)・旧い 3 引数を消すのは PR 1b。
@@ -1779,26 +1779,33 @@ git worktree remove C:\tmp\d60-revoke
   `ops.reresolve_retry_cursor` (retry の cursor と周回の high-water・CHECK 3 つ = 周回の外なら cursor 0 / cursor ≦ high-water / **high-water があれば `cycle_started_at` が要る**)。
 - 一時の表は使わない (配列の変数と窓の注文の materialized の CTE だけ)。明細の更新は候補と結合しない (1 つの UPDATE の WHERE で行の今のコードを解く = 統計に依らない)。
   `search_path = pg_catalog, pg_temp`・`work_mem = 4MB`・`hash_mem_multiplier = 2` を関数に固定 (SECURITY INVOKER のまま)。
-- 権限 = 3 つの関数 (部品 `core._reresolve_order_batch` を含む) は PUBLIC の EXECUTE を外した (持ち主だけ)・watcher は 3 つの表の SELECT だけ。
-  runtime を持ち主から分ける PR 1b で、runtime に 3 つの関数の EXECUTE と 3 つの表の DML を付ける (設計の `RUNTIME_DML_DENY` には入れない)。
-  `heavy-entry-manifest.mjs` = 3 つとも `guard_later` (`public: false`・`migration: '0057'`)。設計の分けは Gw (門は PR 3a)。
+- 権限 = 3 つの関数 (部品 `core._reresolve_order_batch(smallint, text, bigint[], boolean, integer)` を含む) は PUBLIC の EXECUTE を外した (持ち主だけ)・watcher は 3 つの表の SELECT だけ。
+  runtime を持ち主から分ける PR 1b で、runtime に **3 つの関数の EXECUTE** (2 つの関数は SECURITY INVOKER = 部品の EXECUTE も要る = 部品も直の入口になる) と 3 つの表の DML を付ける (設計の `RUNTIME_DML_DENY` には入れない)。
+  🚨 部品も自分で上限を守る (Codex R1 の Medium 2) = 注文の配列 ≦ 5,000・昇順・重なりなし (違えば `22023`)・`p_max_lines` (1〜20,000) を **注文の lock の後の今の明細の数** で再検査し、
+  累計が上限を超える手前で切る (lock を取れた 1 つ目の注文は必ず含める・切った後ろは処理も skip もしない = 呼び手の次の batch)。外の 2 つの関数は lock の前の数で同じ上限の手前まで渡す = ふつうは切らない
+  (lock の前と後の間に明細が増えたときだけ切る = `stop_reason = max_lines`・`has_more`)。直に呼んでも「注文 5,000 × 明細 500」を一度に処理しない。
+  `heavy-entry-manifest.mjs` = 3 つとも `guard_later` (`public: false`・`migration: RERESOLVE_BATCH_MIGRATION` = 番号はこの定数の 1 か所)。設計の分けは Gw (門は PR 3a)。
 - **夜の回し方の部品 = `apps/company-db/load/reresolve-batch.mjs`** (1b-0e で engine が使う・今は engine から呼ばない): ⓪ `reserveNight` (本体の前の短い取引で今夜の窓 `[今日 − 35, 明日)` と cursor の行を予約) →
   `runNightBody` (本体の取引の中) ① retry = 保存した cursor から・周回の high-water まで・予算 R (既定 5) まで・表が空なら呼ばない・周回を終えた晩は新しい周回を始めない ②
   持ち越しの窓を古い順に・1 晩の上限 N (既定 20) の残りまで・止まった窓は cursor を残す。R は 1〜N − 1 (違えば何も流さずに止まる)。order_id は全部 BigInt。
-  報告 = `readRetryState` + `estimateCycleNights` (最悪 ⌈Q ÷ R⌉・式 ⌈B ÷ R⌉・実測 ⌈Q ÷ (R × e)⌉ = 読んだ時点の表についての見込み) + `retryWarnings` (⚠️ 4 つ = 見込み > 7 晩 / attempts ≧ 7 /
-  7 日より前の skip / 周回の途中で周回の始まりが 7 日より前・失敗にはしない)。
+  報告 (設計 13 v3.14) = 夜の本体の **前** に `readRetryState` (repeatable read の read only・cursor と集計を 1 つの文) = Q・L・Lmax は **今の周の残りの集合**
+  (周回の中 = `cursor < order_id ≦ high-water` / 周回の外 = 表の全部 = 次の周の始めの Q₀)・表の全部の行の数・⚠️ ② ③ は表の全部・今の周の経過の晩の数 (JST の日の差) →
+  `estimateCycleNights` = **完了までの晩の数の上限** ⌈Q ÷ R⌉ (読んだ集合について・周回の途中に入る distinct な order_id A を足した ⌈(Q₀ + A) ÷ R⌉ が実際に参加した集合の上限 = 前もっての予測ではない) と
+  **運用の見込み** = max(式 ⌈B ÷ R⌉, 実測 ⌈Q ÷ (R × e)⌉) (今の残りの集合による・毎晩数え直す) → `retryWarnings` (⚠️ 4 つ = ① 経過の晩の数 + 残りの見込み > 7 晩 / ② attempts ≧ 7 /
+  ③ 7 日より前の skip / ④ 周回の途中で周回の始まりが 7 日より前・失敗にはしない) → `retryReportLine`。
 - **人の全履歴の解き直し** (1b-0e の後・旧い 3 引数の `null` = 全部 の代わり。deployer で・夜間ロードと重ならない時間に): 31 日ずつ古い方へ窓を作り、各窓を
   `p_after_order_id = next_after_order_id` で `has_more` が false になるまで呼ぶ (1 走査・流し直さない) → 最後に retry の関数を `has_more` が false になるまで。
   その後 `node apps/company-db/push/mall-orders.mjs --mall <モール> --refresh-sales --all` (今までと同じ)。
 
-試験 = `node scripts/test-company-db-reresolve-batch-pg.mjs` (本物の PG・26 件・試験が自分で使い捨てのクラスタを起動して最後に消す・`npm run test:company-db` に入っている):
+試験 = `node scripts/test-company-db-reresolve-batch-pg.mjs` (本物の PG・31 件・試験が自分で使い捨てのクラスタを起動して最後に消す・`npm run test:company-db` に入っている):
 引数 / `[p_since, p_until)` / **旧い 3 引数と同じ結果** (上限の中・小さい上限で cursor を回しても) / stop_reason と cursor / 含めなかった次の注文は lock されていても数えない /
 skip → retry の表 → attempts → 処理して消す・消えた注文・2 つの接続 / **夜: skip → 20 batch の上限 → 日付をまたぐ → 翌晩に処理 (どの注文もちょうど 1 回)・lock された先頭の群 + 後ろ + 窓・
-増え続ける末尾で周回が終わる・空なら呼ばない・巻き戻り・予算 ≧ N** / bigint の最大値 / CHECK / 1 注文 500 明細で見込みが過小にならない / ⚠️ 4 つ / 権限 /
+増え続ける末尾で周回が終わる・空なら呼ばない・巻き戻り・予算 ≧ N** / bigint の最大値 / CHECK / 1 注文 500 明細で見込みが過小にならない / **見込みは今の周の残り (cursor の前・high-water の後の行を外す)・経過 6 晩 + 残り 2 晩で ⚠️ ①・v3.14 の報告の文言** / ⚠️ 4 つ /
+**部品を直に呼んでも明細の上限で切る・引数の誤りは 22023** / 権限 /
 **TEMP の無い役割で新しい関数は動き旧い関数は 42501** / engine は旧い署名のまま / manifest / dump → restore。
 
-**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に miniPC で dry-run → 本適用)**。0057 は表 3 つと関数 3 つを足すだけ (既存の表・関数・夜間ロードの動きは変えない)。
-Render のコードは変わらない = Render の deploy と順番は無い。🚨 番号: PR #1605 (0057 = relink / merge の一時の表なし) が先にマージされたら、この migration は 0058 に付け替えてからマージする (ファイル名・`heavy-entry-manifest.mjs` の `migration`・この節。試験が「manifest の番号 = 関数を作るファイルの番号」を見る)。`--verify` は DB の適用済みの版で見る (それより後の migration で作る関数は「見ていない N 個」と出して ✅)。
+**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に miniPC で dry-run → 本適用)**。この migration は表 3 つと関数 3 つを足すだけ (既存の表・関数・夜間ロードの動きは変えない)。
+Render のコードは変わらない = Render の deploy と順番は無い。🚨 番号: PR #1605 (0057 = relink / merge の一時の表なし) が先にマージされたら、この migration は 0058 に付け替えてからマージする (ファイル名 `git mv`・`heavy-entry-manifest.mjs` の `RERESOLVE_BATCH_MIGRATION` の 1 か所・この節の見出しと「0057 は新しい関数と表を足すだけ」の 2 か所。migration の本文と試験には番号を書いていない = 試験は関数を作るファイルの実際の番号を読み、manifest の定数と突き合わせる)。`--verify` は DB の適用済みの版で見る (それより後の migration で作る関数は「見ていない N 個」と出して ✅)。
 
 ## 発注の受け皿 (0014。08 §5。D6)
 

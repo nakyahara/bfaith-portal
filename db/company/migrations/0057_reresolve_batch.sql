@@ -1,5 +1,6 @@
--- 0057: 注文明細の解き直し (reresolve) を「上限つきの batch + cursor + skip した注文の retry の表」にする (D-60 PR 1b-0r・2026-10-04)
---   設計 = AI_reference CompanyDB構想/13 §3.10「reresolve の batch の契約」(v3.12・Codex R-D60-v3-7〜12 / 判定 R-D60-v3-13 = 1b-0r の実装 Go・
+-- このファイルの番号 (ファイル名の 4 桁) は PR #1605 の後に付け替える = 本文に番号を書かない (付け替えの手順 = PR #1607 の本文)。
+-- 注文明細の解き直し (reresolve) を「上限つきの batch + cursor + skip した注文の retry の表」にする (D-60 PR 1b-0r・2026-10-04)
+--   設計 = AI_reference CompanyDB構想/13 §3.10「reresolve の batch の契約」(v3.14・Codex R-D60-v3-7〜14 / 判定 R-D60-v3-13・v3-14 = 1b-0r の実装 Go・
 --   条件 = L1 (high-water + 1 の bigint の上限) と L2 (cursor の行の CHECK (cycle_through_order_id is null or cycle_started_at is not null)))
 --
 -- なぜ: 0024 の core.reresolve_order_lines(smallint, text, date) は ① 期間の終わりが無い (p_since = null で全履歴) ② 件数の上限が無い
@@ -18,7 +19,7 @@
 --      ops.reresolve_retry_cursor    = retry の表の cursor と周回の high-water (夜をまたいで持つ・CHECK 3 つ)
 --   2. core.reresolve_order_lines(p_company, p_mall, p_since, p_until, p_after_order_id, p_max_orders, p_max_lines) = 窓 [p_since, p_until) の 1 batch
 --      core.reresolve_order_lines_retry(p_company, p_mall, p_after_order_id, p_before_order_id, p_max_orders, p_max_lines) = retry の表の 1 batch
---      core._reresolve_order_batch(p_company, p_mall, p_order_ids, p_retry) = 上の 2 つの共通の部品 (lock → 解く → touch → retry の表)
+--      core._reresolve_order_batch(p_company, p_mall, p_order_ids, p_retry, p_max_lines) = 上の 2 つの共通の部品 (lock → lock の後の今の明細の数で p_max_lines の手前まで → 解く → touch → retry の表)
 --   戻り (2 つとも同じ) = 今の 4 列 (candidates・resolved・orders_touched・orders_skipped_locked = 名前と意味は 0024 と同じ) +
 --     has_more・next_after_order_id・orders_examined・stop_reason ('done' / 'max_orders' / 'max_lines')・skipped_order_ids (昇順)
 --
@@ -40,11 +41,13 @@
 --   - 一時の表は使わない。中間は配列の変数 (要素は p_max_orders + 1 ≦ 5,001 個の bigint / integer) と、窓の注文の materialized の CTE
 --     (窓 ≦ 62 日の注文の id = work_mem を超えたら一時のファイル = temp_file_limit が縛る)
 --   - 明細の更新は候補の CTE と結合しない (1 つの UPDATE の WHERE で行の今のコードを解く) = 表の統計に依らず、読むのは lock した注文の明細だけ
---   - search_path = pg_catalog, pg_temp に固定し、表と関数は schema で修飾する (SECURITY INVOKER のまま)。work_mem = 4MB・hash_mem_multiplier = 2 (0057 の
---     relink / merge (PR #1605) と同じ枠・関数の中だけ・出るときに戻る)。関数の SET は中で発火する trigger (core.touch_updated_at_unless_seq_only・FK) にも効く
+--   - search_path = pg_catalog, pg_temp に固定し、表と関数は schema で修飾する (SECURITY INVOKER のまま)。work_mem = 4MB・hash_mem_multiplier = 2 (PR #1605 の
+--     relink / merge と同じ枠・関数の中だけ・出るときに戻る)。関数の SET は中で発火する trigger (core.touch_updated_at_unless_seq_only・FK) にも効く
 --     = trigger の本体は pg_catalog の関数 (to_jsonb・current_setting・now) だけ = 影響なし
 --   - 権限 = 3 つの関数は PUBLIC の EXECUTE を外す (作った同じ取引で・0056 の約束「これから作る重い関数は作った直後に REVOKE」)。持ち主は持ち主として呼べる。
---     runtime を持ち主から分けるのは PR 1b (そのとき runtime に EXECUTE と 3 つの表の DML を付ける・設計の RUNTIME_DML_DENY には入れない)。
+--     runtime を持ち主から分けるのは PR 1b (そのとき runtime に 3 つの関数の EXECUTE と 3 つの表の DML を付ける・設計の RUNTIME_DML_DENY には入れない)。
+--     🚨 部品 core._reresolve_order_batch も EXECUTE が要る (2 つの関数は SECURITY INVOKER = 呼び手の権限で部品を呼ぶ) = 部品は直の入口になる
+--     → 部品も自分で上限を守る (注文の配列 ≦ 5,000・昇順・lock の後の今の明細の累計 ≦ p_max_lines ≦ 20,000 (lock を取れた 1 つ目の注文を除く) = Codex R1 (PR #1607) の Medium 2)
 --     watcher は 3 つの表の SELECT だけ (関数は呼べない)
 --   - heavy-entry-manifest.mjs = 新しい 2 つと部品を guard_later (public: false) に足す (設計の分け = Gw・門は PR 3a)
 --
@@ -90,24 +93,43 @@ create table ops.reresolve_retry_cursor (
   constraint ck_reresolve_cursor_within_cycle check (cycle_through_order_id is null or after_order_id <= cycle_through_order_id),
   constraint ck_reresolve_cursor_cycle_started check (cycle_through_order_id is null or cycle_started_at is not null)   -- R-D60-v3-13 L2 (⚠️ ④ を fail-open にしない)
 );
-comment on table ops.reresolve_retry_cursor is 'reresolve の retry の表の cursor と周回の high-water (D-60 1b-0r・v3.12)。夜の本体の取引の中で for update で読んで更新する';
+comment on table ops.reresolve_retry_cursor is 'reresolve の retry の表の cursor と周回の high-water (D-60 1b-0r・v3.12〜v3.14)。夜の本体の取引の中で for update で読んで更新する';
 
 -- ─── 2. 共通の部品: 注文の batch を lock して解く ───
---   p_order_ids = 昇順・重なりなし・≦ 5,000 (呼ぶのは下の 2 つの関数だけ)。p_retry = retry の関数から (skip で attempts + 1) か窓の関数から (skip で upsert)
---   戻り = candidates (lock を取れた注文の未解決の明細の数)・resolved・orders_touched・skipped_order_ids (lock を取れなかった注文・昇順)・gone_order_ids (core.orders に無い)
-create function core._reresolve_order_batch(p_company smallint, p_mall text, p_order_ids bigint[], p_retry boolean)
-returns table (candidates integer, resolved integer, orders_touched integer, skipped_order_ids bigint[], gone_order_ids bigint[])
+--   p_order_ids = 昇順・重なりなし・null なし・≦ 5,000 (違えば 22023)。p_retry = retry の関数から (skip で attempts + 1) か窓の関数から (skip で upsert)
+--   🚨 p_max_lines (1〜20,000・Codex R1 (PR #1607) の Medium 2) = 部品も自分で明細の上限を守る = 直に呼ばれても (PR 1b で runtime に EXECUTE を付けると
+--      SECURITY INVOKER の 2 つの関数から呼ぶために部品の EXECUTE も要る = 直の入口になる)「注文 ≦ 5,000 × 明細 ≦ 500」を一度に処理しない。
+--      注文の lock の **後** に、lock を取れた注文の今の未解決の明細を配列の順に数え、累計が p_max_lines を超える手前で切る (lock を取れた 1 つ目の注文は
+--      明細の数に関わらず必ず含める = 必ず前に進む)。切った所より後ろの注文は処理しない・skip にも retry の表にも数えない (呼び手の次の batch の最初)。
+--      外の 2 つの関数は lock の前の数で同じ上限の手前まで渡す = ふつうは切らない (lock の前と後の間に明細が増えたときだけ切る)。
+--      切った所より後ろで lock を取った注文は取引の終わりまで lock のまま (処理はしない・次の batch で同じ取引がもう一度 lock を取れる)。
+--      数えるのは切る所までの lock を取れた注文の明細 (≦ p_max_lines + 1 注文の明細 500) だけ
+--   戻り = candidates (処理した注文の未解決の明細の数)・resolved・orders_touched・orders_examined (配列の先頭から含めた注文の数 = 処理 + skip + 消えた)・
+--     cut_by_lines (lock の後の数で切った)・skipped_order_ids (含めた中で lock を取れなかった注文・昇順)・gone_order_ids (含めた中で core.orders に無い)
+create function core._reresolve_order_batch(p_company smallint, p_mall text, p_order_ids bigint[], p_retry boolean, p_max_lines integer)
+returns table (candidates integer, resolved integer, orders_touched integer, orders_examined integer, cut_by_lines boolean, skipped_order_ids bigint[], gone_order_ids bigint[])
 language plpgsql volatile
 set search_path = pg_catalog, pg_temp set work_mem = '4MB' set hash_mem_multiplier = 2
 as $$
 declare
   v_locked bigint[];
+  v_take   bigint[];
+  v_prefix bigint[];
   v_done   bigint[];
+  v_t      integer := 0;    -- 含めた lock を取れた注文の数 (= v_locked の先頭から)
+  v_k      integer := 0;    -- 配列の先頭から含めた注文の数
+  v_lines  bigint := 0;
+  v_cnt    integer;
 begin
-  if p_company is null or p_mall is null or p_retry is null or p_order_ids is null or array_ndims(p_order_ids) > 1 or cardinality(p_order_ids) > 5000 then
-    raise exception 'reresolve_bad_batch: 会社・モール・注文の配列 (1 次元・≦ 5,000) が要る' using errcode = '22023';
+  if p_company is null or p_mall is null or p_retry is null or p_order_ids is null or p_max_lines is null
+     or array_ndims(p_order_ids) > 1 or cardinality(p_order_ids) > 5000 or p_max_lines not between 1 and 20000 then
+    raise exception 'reresolve_bad_batch: 会社・モール・注文の配列 (1 次元・≦ 5,000)・p_max_lines (1〜20000) が要る' using errcode = '22023';
   end if;
-  candidates := 0; resolved := 0; orders_touched := 0; skipped_order_ids := '{}'; gone_order_ids := '{}';
+  if array_position(p_order_ids, null) is not null
+     or p_order_ids is distinct from (select coalesce(array_agg(distinct x order by x), '{}') from unnest(p_order_ids) x) then
+    raise exception 'reresolve_bad_batch: 注文の配列は昇順・重なりなし・null なし' using errcode = '22023';
+  end if;
+  candidates := 0; resolved := 0; orders_touched := 0; orders_examined := 0; cut_by_lines := false; skipped_order_ids := '{}'; gone_order_ids := '{}';
   if cardinality(p_order_ids) = 0 then return next; return; end if;
 
   -- ① 注文を order_id の順に lock (skip locked = 受け口の chunk が持つ注文は待たない = deadlock にしない)
@@ -116,43 +138,56 @@ begin
            where o.order_id = any(p_order_ids) and o.company_id = p_company and o.mall = p_mall
            order by o.order_id
              for update of o skip locked) x;
-  -- ② 取れなかった注文 = 今もある (別の書き手が持っている = skip) か、消えた (gone = skip に数えない)
+  -- ② lock の後の今の明細の数で、配列の先頭から含める所を決める (どちらの配列も昇順 = 先頭から突き合わせる)
+  for i in 1 .. cardinality(p_order_ids) loop
+    if v_t < cardinality(v_locked) and v_locked[v_t + 1] = p_order_ids[i] then
+      select count(*)::integer into v_cnt from core.order_lines l
+       where l.order_id = p_order_ids[i] and l.removed_at is null and l.listing_id is null and l.sku_id is null and l.unresolved_code is not null;
+      if v_t > 0 and v_lines + v_cnt > p_max_lines then cut_by_lines := true; exit; end if;
+      v_t := v_t + 1; v_lines := v_lines + v_cnt;
+    end if;
+    v_k := i;
+  end loop;
+  v_take := v_locked[1:v_t];
+  v_prefix := p_order_ids[1:v_k];
+  orders_examined := v_k;
+  -- ③ 含めた中で取れなかった注文 = 今もある (別の書き手が持っている = skip) か、消えた (gone = skip に数えない)
   select coalesce(array_agg(u.id order by u.id) filter (where e.ok), '{}'), coalesce(array_agg(u.id order by u.id) filter (where not e.ok), '{}')
     into skipped_order_ids, gone_order_ids
-    from unnest(p_order_ids) u(id)
+    from unnest(v_prefix) u(id)
     cross join lateral (select exists (select 1 from core.orders o where o.order_id = u.id and o.company_id = p_company and o.mall = p_mall) as ok) e
-   where u.id <> all (v_locked);
+   where u.id <> all (v_take);
 
-  if cardinality(v_locked) > 0 then
-    -- ③ 明細を order_line_id の順に lock してから候補を確定 (注文の lock を持っている = 受け口はこの注文の明細に触れない)
+  if cardinality(v_take) > 0 then
+    -- ④ 明細を order_line_id の順に lock してから候補を確定 (注文の lock を持っている = 受け口はこの注文の明細に触れない)
     perform 1 from core.order_lines l
-      where l.order_id = any(v_locked) and l.removed_at is null and l.listing_id is null and l.sku_id is null and l.unresolved_code is not null
+      where l.order_id = any(v_take) and l.removed_at is null and l.listing_id is null and l.sku_id is null and l.unresolved_code is not null
       order by l.order_line_id
         for update of l;
     select count(*)::integer into candidates from core.order_lines l
-     where l.order_id = any(v_locked) and l.removed_at is null and l.listing_id is null and l.sku_id is null and l.unresolved_code is not null;
-    -- ④ 当たった明細だけ更新。🚨 候補の CTE と明細を結合しない = 1 つの UPDATE の WHERE で行そのものの今のコードを解く
+     where l.order_id = any(v_take) and l.removed_at is null and l.listing_id is null and l.sku_id is null and l.unresolved_code is not null;
+    -- ⑤ 当たった明細だけ更新。🚨 候補の CTE と明細を結合しない = 1 つの UPDATE の WHERE で行そのものの今のコードを解く
     --    (CTE の列には統計が無い・統計の古い明細の表では入れ子のループ × 全表 = 件数の 2 乗になりうる = 使い捨ての PG で 1 batch 20 秒を見た。
     --     読むのは lock した注文の明細だけ (ix_order_lines_current の order_id = any)。lock を持っている = 行の今の値 = 0024 の「まだ未解決で元のコードが同じ」の再確認と同じ)
     --    resolve_listing_id (STABLE) は当たった行で 2 回呼ぶ (WHERE と SET・同じ文の中では同じ値)
     with upd as (
       update core.order_lines l
          set listing_id = core.resolve_listing_id(p_company, p_mall, l.unresolved_code), unresolved_code = null
-       where l.order_id = any(v_locked) and l.removed_at is null and l.listing_id is null and l.sku_id is null and l.unresolved_code is not null
+       where l.order_id = any(v_take) and l.removed_at is null and l.listing_id is null and l.sku_id is null and l.unresolved_code is not null
          and core.resolve_listing_id(p_company, p_mall, l.unresolved_code) is not null
       returning l.order_id
     )
     select count(*)::integer, coalesce(array_agg(distinct u.order_id), '{}') into resolved, v_done from upd u;
-    -- ⑤ 実際に更新した明細の注文だけ updated_at を進める (翌朝の売上日次の作り直しに乗る・0024 と同じ保守経路)
+    -- ⑥ 実際に更新した明細の注文だけ updated_at を進める (翌朝の売上日次の作り直しに乗る・0024 と同じ保守経路)
     perform set_config('core.touch_force', 'on', true);
     update core.orders o set updated_at = now() where o.order_id = any(v_done);
     get diagnostics orders_touched = row_count;
     perform set_config('core.touch_force', 'off', true);
   end if;
 
-  -- ⑥ retry の表: lock を取れた注文と消えた注文の行は消す / 取れなかった注文は書く (呼び手は書かない)
+  -- ⑦ retry の表: 含めた中で lock を取れた注文と消えた注文の行は消す / 取れなかった注文は書く (呼び手は書かない)
   delete from ops.reresolve_retry_orders t
-   where t.company_id = p_company and t.mall = p_mall and t.order_id = any(v_locked || gone_order_ids);
+   where t.company_id = p_company and t.mall = p_mall and t.order_id = any(v_take || gone_order_ids);
   if cardinality(skipped_order_ids) > 0 then
     if p_retry then
       update ops.reresolve_retry_orders t set attempts = t.attempts + 1, last_skipped_at = now()
@@ -165,7 +200,7 @@ begin
   end if;
   return next;
 end $$;
-comment on function core._reresolve_order_batch(smallint, text, bigint[], boolean) is 'reresolve の 1 batch の共通の部品 (D-60 1b-0r)。注文 (skip locked) → 明細 → 解く → touch → retry の表。呼ぶのは core.reresolve_order_lines (7 引数) と core.reresolve_order_lines_retry だけ';
+comment on function core._reresolve_order_batch(smallint, text, bigint[], boolean, integer) is 'reresolve の 1 batch の共通の部品 (D-60 1b-0r)。注文 (skip locked) → lock の後の今の明細の数で p_max_lines (≦ 20000) の手前まで → 明細 → 解く → touch → retry の表。呼び手は core.reresolve_order_lines (7 引数) と core.reresolve_order_lines_retry。直に呼ばれても上限を守る';
 
 -- ─── 3. 窓の 1 batch ───
 create function core.reresolve_order_lines(p_company smallint, p_mall text, p_since date, p_until date,
@@ -219,11 +254,13 @@ begin
   end loop;
   v_batch := v_ids[1:v_n];
 
-  select * into h from core._reresolve_order_batch(p_company, p_mall, v_batch, false);
+  -- 部品も lock の後の今の明細の数で p_max_lines を守る (lock の前と後の間に明細が増えたときだけ手前で切る = max_lines・切った後ろは次の batch)
+  select * into h from core._reresolve_order_batch(p_company, p_mall, v_batch, false, p_max_lines);
   candidates := h.candidates; resolved := h.resolved; orders_touched := h.orders_touched;
   orders_skipped_locked := cardinality(h.skipped_order_ids); skipped_order_ids := h.skipped_order_ids;
-  orders_examined := v_n;
-  next_after_order_id := case when v_n > 0 then v_batch[v_n] else p_after_order_id end;
+  orders_examined := h.orders_examined;
+  next_after_order_id := case when h.orders_examined > 0 then v_batch[h.orders_examined] else p_after_order_id end;
+  if h.cut_by_lines then v_reason := 'max_lines'; end if;
   stop_reason := v_reason; has_more := (v_reason <> 'done');
   return next;
 end $$;
@@ -275,11 +312,13 @@ begin
   end loop;
   v_batch := v_ids[1:v_n];
 
-  select * into h from core._reresolve_order_batch(p_company, p_mall, v_batch, true);
+  -- 部品も lock の後の今の明細の数で p_max_lines を守る (lock の前と後の間に明細が増えたときだけ手前で切る = max_lines・切った後ろは次の batch)
+  select * into h from core._reresolve_order_batch(p_company, p_mall, v_batch, true, p_max_lines);
   candidates := h.candidates; resolved := h.resolved; orders_touched := h.orders_touched;
   orders_skipped_locked := cardinality(h.skipped_order_ids); skipped_order_ids := h.skipped_order_ids;
-  orders_examined := v_n;
-  next_after_order_id := case when v_n > 0 then v_batch[v_n] else p_after_order_id end;
+  orders_examined := h.orders_examined;
+  next_after_order_id := case when h.orders_examined > 0 then v_batch[h.orders_examined] else p_after_order_id end;
+  if h.cut_by_lines then v_reason := 'max_lines'; end if;
   stop_reason := v_reason; has_more := (v_reason <> 'done');
   return next;
 end $$;
@@ -287,7 +326,7 @@ comment on function core.reresolve_order_lines_retry(smallint, text, bigint, big
   'reresolve の retry の表 (skip した注文) を order_id の順に 1 batch だけ流す (D-60 1b-0r)。p_before_order_id = 周回の high-water + 1 (high-water が bigint の最大値なら null)。窓の外の古い注文も流す';
 
 -- ─── 5. 権限 ───
-revoke execute on function core._reresolve_order_batch(smallint, text, bigint[], boolean) from public;
+revoke execute on function core._reresolve_order_batch(smallint, text, bigint[], boolean, integer) from public;
 revoke execute on function core.reresolve_order_lines(smallint, text, date, date, bigint, integer, integer) from public;
 revoke execute on function core.reresolve_order_lines_retry(smallint, text, bigint, bigint, integer, integer) from public;
 do $$

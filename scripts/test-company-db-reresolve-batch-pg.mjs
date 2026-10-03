@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 /**
- * test-company-db-reresolve-batch-pg.mjs — 0057 (reresolve の batch・D-60 PR 1b-0r) を本物の PostgreSQL で確かめる
+ * test-company-db-reresolve-batch-pg.mjs — reresolve の batch (db/company/migrations/*_reresolve_batch.sql・D-60 PR 1b-0r) を本物の PostgreSQL で確かめる
+ *   🚨 migration の番号は書かない = 関数を作るファイルの実際の番号を読む (MIG)・manifest の RERESOLVE_BATCH_MIGRATION と突き合わせる (PR #1605 の後の付け替えを機械で)
  *
- * 設計 = AI_reference CompanyDB構想/13 §3.10「reresolve の batch の契約」(v3.12) と Codex R-D60-v3-13 の L1 (bigint の上限)・L2 (cursor の行の CHECK)。
+ * 設計 = AI_reference CompanyDB構想/13 §3.10「reresolve の batch の契約」(v3.14) と Codex R-D60-v3-13 の L1 (bigint の上限)・L2 (cursor の行の CHECK)・PR #1607 の R1。
  * 持ち主は本番と同じ形 = superuser でない login の役割 (CREATEROLE あり) が DB を持ち、全部の migration を流す。
  * 夜の回し方は apps/company-db/load/reresolve-batch.mjs (1b-0e で engine が使う部品・この PR では engine から呼ばない) で流す。
  *
@@ -14,7 +15,9 @@
  *   E 夜: skip → retry → 20 batch の上限 → 日付をまたぐ → 翌晩に処理 (どの注文もちょうど 1 回) / lock された先頭の群 + 後ろ + 窓で何晩も前に進む /
  *     増え続ける末尾で high-water の周回が終わり低い id が再訪される / 空なら呼ばない / 巻き戻り / 予算 ≧ N は流す前に止まる / cycle_started_at
  *   F bigint の最大値 (high-water + 1 は null・精度) / CHECK
- *   G 1 周の見込みの晩の数 (1 注文 500 明細で過小にならない・ばらばらの明細の数で B ≧ 実際) / ⚠️ の 4 つ
+ *   G 1 周の見込みの晩の数 (1 注文 500 明細で過小にならない・ばらばらの明細の数で B ≧ 実際) / 今の周の残りの集合 (cursor の前・high-water の後を外す)・
+ *     経過の晩の数 + 残りの見込み > 7 で ⚠️ ①・v3.14 の報告の文言 (完了までの晩の数の上限と運用の見込み) / ⚠️ の 4 つ
+ *   P 部品 (core._reresolve_order_batch) を直に呼んでも lock の後の明細の数で p_max_lines の手前で切る・引数の誤りは 22023 (R1 の Medium 2)
  *   H 権限 (PUBLIC・watcher)・一時の表なし (TEMP の無い役割で新しい関数は動き、旧い関数は動かない)・engine は旧い署名のまま・manifest・dump / restore
  * 使い方: node scripts/test-company-db-reresolve-batch-pg.mjs   (npm run test:company-db にも入っている = 飛ばさない)
  *   🚨 試験が自分で使い捨てのクラスタを起動する (embedded-postgres・OS の一時フォルダ・ランダムのポート・最後に止めて消す)。外の PostgreSQL には一切つながない。
@@ -30,7 +33,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { openPgClient, pgAdapter, applyMigrations } from './company-db/migrate.mjs';
-import { heavyEntryFindings, tempPrivilegeAudit, HEAVY_ENTRY_MANIFEST } from './company-db/heavy-entry-manifest.mjs';
+import { heavyEntryFindings, tempPrivilegeAudit, HEAVY_ENTRY_MANIFEST, RERESOLVE_BATCH_MIGRATION } from './company-db/heavy-entry-manifest.mjs';
 import { dumpCompanyDb, restoreCompanyDb, listTables, listSequences } from '../apps/company-db/backup/dump.mjs';
 import {
   runReresolveNight, runNightBody, reserveNight, readRetryState, estimateCycleNights, retryWarnings, retryReportLine, beforeOrderIdFor, nightWindow,
@@ -38,6 +41,12 @@ import {
 } from '../apps/company-db/load/reresolve-batch.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const MIG_DIR = path.join(ROOT, 'db/company/migrations');
+/** その文を含む migration のファイルの番号 (4 桁) の一覧 = 番号を試験に書かない (付け替えても試験は直さない) */
+const migrationsMatching = (re) => fs.readdirSync(MIG_DIR).filter((f) => /^\d{4}_.*\.sql$/.test(f) && re.test(fs.readFileSync(path.join(MIG_DIR, f), 'utf8'))).map((f) => f.slice(0, 4));
+const MIG_FILES = migrationsMatching(/create function core\._reresolve_order_batch\(/);
+if (MIG_FILES.length !== 1) { console.error('❌ core._reresolve_order_batch を作る migration が 1 つでない: ' + JSON.stringify(MIG_FILES)); process.exit(1); }
+const MIG = MIG_FILES[0];   // この PR の migration の実際の番号
 const PINNED_EMBEDDED_PG = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).devDependencies['embedded-postgres'];
 async function loadEmbeddedPostgres() {
   const bases = [path.join(ROOT, 'package.json'), ...(process.env.EMBEDDED_PG_DIR ? [path.join(process.env.EMBEDDED_PG_DIR, 'package.json')] : []), 'C:/tmp/pg-embed/package.json'];
@@ -105,7 +114,8 @@ try {
     const O = await open(OWNER);
     const odb = pgAdapter(O);
     const migrated = await applyMigrations(odb, { log: quiet });
-    assert.ok(migrated.applied.includes('0057'), '0057 が流れていない');
+    assert.ok(migrated.applied.includes(MIG), MIG + ' (reresolve の batch) が流れていない');
+    assert.equal(RERESOLVE_BATCH_MIGRATION, MIG, 'manifest の RERESOLVE_BATCH_MIGRATION = 関数を作るファイルの実際の番号');
     // create-watch-roles.mjs と同じ: watcher は schema の USAGE と表の SELECT
     await O.query(`grant usage on schema core, ops, mart to watcher, ${PROBE}, ${NOTEMP}; grant select on all tables in schema core to watcher`);
     // 試験の記録: touch (core.touch_force = on の update) と明細の解決を数える (関数の search_path = pg_catalog, pg_temp でも動くよう schema で修飾)
@@ -538,7 +548,7 @@ try {
       const batches = nights.flatMap((x) => x.retryBatchLog);
       assert.deepEqual([st.Q, st.L, st.Lmax], [300, 150000, 500]);
       assert.equal(n, 3);
-      assert.ok(est5.formula >= n && est5.worst >= n && Math.ceil(300 / (5 * 2000)) < n, JSON.stringify(est5));
+      assert.ok(est5.formula >= n && est5.bound >= n && Math.ceil(300 / (5 * 2000)) < n, JSON.stringify(est5));   // bound = 完了までの晩の数の上限 ⌈Q₀ ÷ R⌉ (v3.14・旧「最悪」)
       const e = Math.min(...batches.filter((b) => b.hasMore).map((b) => b.examined));
       const measured = estimateCycleNights({ Q: 300, L: 150000, Lmax: 500, R: 5, maxOrders: 2000, maxLines: 10000, recentBatches: batches });
       assert.deepEqual([e, measured.e, measured.measured], [20, 20, 3]);
@@ -563,7 +573,7 @@ try {
       assert.ok(checks.every((x) => x.B >= x.actual), JSON.stringify(checks));
       assert.equal(checks.find((x) => x.pl === 300).B, 60);
     });
-    await t('⚠️ の 4 つ: ① 見込み > 7 晩 ② attempts ≧ 7 ③ first_skipped_at < 7 日前 (attempts 0 でも・3 でも) ④ 周回の途中で cycle_started_at < 7 日前 (周回の外では出さない) / 対照は出ない / 報告の 1 行', async () => {
+    await t('⚠️ の 4 つ: ① 経過の晩の数 + 残りの見込み > 7 晩 ② attempts ≧ 7 ③ first_skipped_at < 7 日前 (attempts 0 でも・3 でも) ④ 周回の途中で cycle_started_at < 7 日前 (周回の外では出さない) / 対照は出ない / 報告の 1 行', async () => {
       const mk = async (c, attempts, firstAgo) => { const id = await addOrder(c, addDays(T0, -60), ['NX']); await putRetry(c, [id], { attempts, firstAgo }); return id; };
       await mk(31, 0, '8 days'); await mk(32, 3, '7 days 1 hour'); await mk(33, 7, '1 minute'); const id34 = await mk(34, 6, '6 days');
       const opt = { R: 5, maxOrders: 2000, maxLines: 10000 };
@@ -572,7 +582,9 @@ try {
       assert.deepEqual(w[31], ['first_skipped']); assert.deepEqual(w[32], ['first_skipped']); assert.deepEqual(w[33], ['attempts']); assert.deepEqual(w[34], []);
       await O.query(`insert into ops.reresolve_retry_cursor (company_id, mall, after_order_id, cycle_through_order_id, cycle_started_at) values (34, $1, 0, $2, now() - interval '8 days')`, [MALL, String(id34)]);
       const s34 = await readRetryState(O, { company: 34, mall: MALL });
-      assert.deepEqual(retryWarnings(s34, estimateCycleNights({ ...s34, ...opt })).map((x) => x.kind), ['cycle_started']);
+      assert.deepEqual([s34.inCycle, s34.elapsedNights], [true, 8]);
+      // 周回を 8 晩前に始めた = ① 経過 8 晩 + 残り 1 晩 > 7 (v3.13 / v3.14) と ④ の両方 (旧 v3.12 の ① = 「1 周の見込み > 7」は出なかった)
+      assert.deepEqual(retryWarnings(s34, estimateCycleNights({ ...s34, ...opt })).map((x) => x.kind), ['cycle_nights', 'cycle_started']);
       const line = retryReportLine(MALL, s34, estimateCycleNights({ ...s34, ...opt }), retryWarnings(s34, estimateCycleNights({ ...s34, ...opt })));
       assert.match(line, /retry の表の残り 1 注文/); assert.match(line, /high-water/); assert.match(line, /⚠️/);
       await O.query(`update ops.reresolve_retry_cursor set cycle_through_order_id = null where company_id = 34`);
@@ -581,9 +593,113 @@ try {
       assert.deepEqual(retryWarnings({ att7: 0, old7: 0, cycleOld: false }, estimateCycleNights({ Q: 0, L: 0, Lmax: 0, ...opt })), []);
     });
 
+    await t('🚨 見込みは今の周の残りの集合 (R1 Medium 1・v3.13): 周回の中 = cursor < id ≦ high-water だけで Q・L・Lmax (cursor の前・high-water の後の行は外す)・周回の外 = 表の全部 / ⚠️ ② ③ と total は表の全部 / repeatable read の 1 つの文', async () => {
+      const c = 35; const ids = [];
+      for (let i = 0; i < 6; i++) ids.push(await addOrder(c, addDays(T0, -60), Array(i + 1).fill('NX')));   // 明細 1〜6
+      await putRetry(c, [ids[0]], { attempts: 7 });                 // cursor の前 (attempts ≧ 7)
+      await putRetry(c, [ids[1], ids[2], ids[3]]);
+      await putRetry(c, [ids[4]]);
+      await putRetry(c, [ids[5]], { firstAgo: '8 days' });          // high-water の後 (7 日より前の skip)
+      await O.query(`insert into ops.reresolve_retry_cursor (company_id, mall, after_order_id, cycle_through_order_id, cycle_started_at) values ($1, $2, $3, $4, now() - interval '2 days')`, [c, MALL, String(ids[1]), String(ids[3])]);
+      const sql = []; const spy = { query: (q, p) => { sql.push(q.trim().split(/\s+/).slice(0, 7).join(' ')); return O.query(q, p); } };
+      const st = await readRetryState(spy, { company: c, mall: MALL });
+      assert.deepEqual([st.inCycle, st.Q, st.L, st.Lmax, st.total, st.att7, st.old7, st.elapsedNights], [true, 2, 3 + 4, 4, 6, 1, 1, 2]);   // ids[2] (3 明細)・ids[3] (4 明細) だけ
+      assert.deepEqual([st.cursor.after, st.cursor.through], [ids[1], ids[3]]);
+      assert.equal(sql.length, 4, sql.join(' | '));   // begin / set local / 1 つの select / commit (cursor と集計を同じ時点で)
+      assert.match(sql[0], /^begin isolation level repeatable read read only$/);
+      assert.match(sql[3], /^commit$/);
+      // 旧い数え方 (表の全部 = 6 注文・21 明細) なら見込みは膨らむ
+      const est = estimateCycleNights({ ...st, R: 1, maxOrders: 1, maxLines: 10000 });
+      assert.deepEqual([est.B, est.formula, est.bound], [2, 2, 2]);
+      await O.query(`update ops.reresolve_retry_cursor set after_order_id = 0, cycle_through_order_id = null where company_id = $1`, [c]);
+      const out = await readRetryState(O, { company: c, mall: MALL });
+      assert.deepEqual([out.inCycle, out.Q, out.L, out.Lmax, out.total, out.elapsedNights], [false, 6, 21, 6, 6, 0]);   // 周回の外 = 次に始める周 = 表の全部 (Q₀)
+      await O.query(`delete from ops.reresolve_retry_cursor where company_id = $1`, [c]);
+      const none = await readRetryState(O, { company: c, mall: MALL });
+      assert.deepEqual([none.inCycle, none.Q, none.cursor, none.elapsedNights], [false, 6, null, 0]);   // cursor の行が無い (まだ流していない) も表の全部
+    });
+    await t('🚨 ⚠️ ① = 今の周の経過の晩の数 + 残りの見込み > 7 (R1 Medium 1): 経過 6 晩 + 残り 2 晩 = 8 で出る (見込みだけなら 2 ≦ 7 = 旧い条件は出ない)・経過 5 晩 + 2 = 7 は出ない・周回の外は経過 0', async () => {
+      const c = 36;
+      const ids = [await addOrder(c, addDays(T0, -60), ['NX']), await addOrder(c, addDays(T0, -60), ['NX'])];
+      await putRetry(c, ids);
+      const opt = { R: 1, maxOrders: 1, maxLines: 10000 };
+      const kinds = async () => { const st = await readRetryState(O, { company: c, mall: MALL }); const e = estimateCycleNights({ ...st, ...opt }); return { st, e, w: retryWarnings(st, e) }; };
+      await O.query(`insert into ops.reresolve_retry_cursor (company_id, mall, after_order_id, cycle_through_order_id, cycle_started_at) values ($1, $2, 0, $3, now() - interval '6 days')`, [c, MALL, String(ids[1])]);
+      const a = await kinds();
+      assert.deepEqual([a.st.elapsedNights, a.e.est, a.w.map((x) => x.kind)], [6, 2, ['cycle_nights']]);
+      assert.ok(!(a.e.est > 7), '旧い条件 (見込み > 7) では出ない');
+      assert.match(a.w[0].text, /経過 6 晩 \+ 残りの見込み 2 晩 = 8 晩 > 7 晩/);
+      await O.query(`update ops.reresolve_retry_cursor set cycle_started_at = now() - interval '5 days' where company_id = $1`, [c]);
+      const b = await kinds();
+      assert.deepEqual([b.st.elapsedNights, b.e.est, b.w], [5, 2, []]);
+      await O.query(`update ops.reresolve_retry_cursor set after_order_id = 0, cycle_through_order_id = null where company_id = $1`, [c]);   // 周回の外 (cycle_started_at は 5 日前のまま)
+      const d = await kinds();
+      assert.deepEqual([d.st.inCycle, d.st.elapsedNights, d.w], [false, 0, []]);
+      // 純粋な関数 (経過の晩の数が無い古い呼び手は 0 として数える)
+      assert.deepEqual(retryWarnings({ elapsedNights: 6, att7: 0, old7: 0, cycleOld: false }, { est: 2 }).map((x) => x.kind), ['cycle_nights']);
+      assert.deepEqual(retryWarnings({ elapsedNights: 5, att7: 0, old7: 0, cycleOld: false }, { est: 2 }), []);
+      assert.deepEqual(retryWarnings({ att7: 0, old7: 0, cycleOld: false }, { est: 8 }).map((x) => x.kind), ['cycle_nights']);
+    });
+    await t('報告の文言 (v3.14・R1 Medium 1): 「完了までの晩の数の上限」(周回の外 = ⌈Q₀ ÷ R⌉・周回の中 = 今の残り・A は含まない) と「運用の見込み」を分ける・「最悪」「保証」は出さない', async () => {
+      const c = 37;
+      const ids = []; for (let i = 0; i < 3; i++) ids.push(await addOrder(c, addDays(T0, -60), ['NX']));
+      await putRetry(c, ids);
+      const opt = { R: 1, maxOrders: 2000, maxLines: 10000 };
+      const lineOf = async () => { const st = await readRetryState(O, { company: c, mall: MALL }); const e = estimateCycleNights({ ...st, ...opt }); return retryReportLine(MALL, st, e, retryWarnings(st, e)); };
+      const outLine = await lineOf();
+      assert.match(outLine, /retry の表の残り 3 注文/); assert.match(outLine, /次の周の始めの集合 Q₀ = 3 注文/);
+      assert.match(outLine, /運用の見込み 1 晩/); assert.match(outLine, /完了までの晩の数の上限 ⌈Q₀ ÷ R⌉ = 3 晩/); assert.match(outLine, /⌈\(Q₀ \+ A\) ÷ R⌉/);
+      assert.ok(!/最悪|保証/.test(outLine), outLine);
+      await O.query(`insert into ops.reresolve_retry_cursor (company_id, mall, after_order_id, cycle_through_order_id, cycle_started_at) values ($1, $2, $3, $4, now() - interval '1 day')`, [c, MALL, String(ids[0]), String(ids[2])]);
+      const inLine = await lineOf();
+      assert.match(inLine, /retry の表の残り 3 注文/); assert.match(inLine, /今の周の残り 2 注文 \(経過 1 晩\)/);
+      assert.match(inLine, /今の残りについての完了までの晩の数の上限 ⌈Q ÷ R⌉ = 2 晩/); assert.match(inLine, /運用の見込み/); assert.match(inLine, /high-water/);
+      assert.ok(!/最悪|保証/.test(inLine), inLine);
+    });
+
+    console.log('P 部品を直に呼ぶ (R1 Medium 2)');
+    const helper = async (conn, c, ids, retry, ml) => (await conn.query(`select * from core._reresolve_order_batch($1::smallint, $2, $3::bigint[], $4::boolean, $5::integer)`, [c, MALL, ids.map(String), retry, ml])).rows[0];
+    await t('🚨 部品を直に呼んでも lock の後の今の明細の数で p_max_lines の手前で切る (lock を取れた 1 つ目は必ず)・切った後ろは処理も skip も retry の表もしない・外の関数は今までどおり', async () => {
+      const c = 38;
+      const ids = []; for (let i = 0; i < 5; i++) ids.push(await addOrder(c, T0, Array(10).fill('S1')));
+      const h1 = await helper(O, c, ids, false, 25);   // 10 + 10 = 20 ≦ 25・+ 10 = 30 > 25 で切る
+      assert.deepEqual([h1.orders_examined, h1.cut_by_lines, h1.candidates, h1.resolved, h1.orders_touched, h1.skipped_order_ids, h1.gone_order_ids], [2, true, 20, 20, 2, [], []]);
+      assert.deepEqual(await unresolvedOf(ids), ids.slice(2));
+      const h2 = await helper(O, c, ids.slice(2), false, 5);   // 1 つ目の注文は明細の数 (10) が上限 (5) を超えても必ず含める
+      assert.deepEqual([h2.orders_examined, h2.cut_by_lines, h2.candidates, h2.resolved], [1, true, 10, 10]);
+      const h3 = await helper(O, c, ids.slice(3), false, 20000);   // 上限の中 = 切らない
+      assert.deepEqual([h3.orders_examined, h3.cut_by_lines, h3.candidates], [2, false, 20]);
+      assert.deepEqual(await unresolvedOf(ids), []);
+      // lock された注文が先頭 = skip に数える (含めた中)・lock を取れた 1 つ目は必ず・切った後ろの注文は retry の表に入らない
+      const j = []; for (let i = 0; i < 4; i++) j.push(await addOrder(c, addDays(T0, 1), Array(10).fill('S2')));
+      await lockOrders(LB1, [j[0], j[3]]);
+      try {
+        const h4 = await helper(O, c, j, false, 15);
+        assert.deepEqual([h4.orders_examined, h4.cut_by_lines, h4.skipped_order_ids.map(B), h4.candidates, h4.resolved], [2, true, [j[0]], 10, 10]);
+        assert.deepEqual([...(await retryRows(c)).keys()], [String(j[0])]);   // 切った後ろの j[3] (lock 中) は入らない
+        assert.deepEqual(await unresolvedOf(j), [j[0], j[2], j[3]]);
+      } finally { await LB1.query('rollback'); }
+      // 外の関数 (窓) は今までどおり lock の前の数で同じ上限の手前まで = 部品は切らない
+      const w = []; for (let i = 0; i < 3; i++) w.push(await addOrder(c, addDays(T0, 2), Array(10).fill('S3')));
+      const r = await win(O, c, addDays(T0, 2), addDays(T0, 3), 0n, 100, 25);
+      assert.deepEqual([r.orders_examined, r.stop_reason, r.has_more, B(r.next_after_order_id), r.candidates], [2, 'max_lines', true, w[1], 20]);
+    });
+    await t('部品の引数の誤りは 22023: p_max_lines (null・0・20001)・配列 (null・昇順でない・重なり・null の要素・5,001 個・2 次元)・会社 / モール / p_retry の null', async () => {
+      const c = 39; const a = await addOrder(c, T0, ['NX']), b = await addOrder(c, T0, ['NX']);
+      const call = `select * from core._reresolve_order_batch($1::smallint, $2::text, $3::bigint[], $4::boolean, $5::integer)`;
+      const ok = [c, MALL, [String(a), String(b)], false, 10];
+      assert.equal(await codeOf(O, call, ok), 'ok');
+      for (const ml of [null, 0, 20001]) assert.equal(await codeOf(O, call, [c, MALL, ok[2], false, ml]), '22023', `p_max_lines ${ml}`);
+      for (const [i, v] of [[0, null], [1, null], [3, null], [2, null]]) { const x = [...ok]; x[i] = v; assert.equal(await codeOf(O, call, x), '22023', `null ${i}`); }
+      for (const arr of [[String(b), String(a)], [String(a), String(a)], [String(a), null]]) assert.equal(await codeOf(O, call, [c, MALL, arr, false, 10]), '22023', JSON.stringify(arr));
+      assert.equal(await codeOf(O, call, [c, MALL, Array.from({ length: 5001 }, (_, i) => String(i + 1)), false, 10]), '22023', '5,001 個');
+      assert.equal(await codeOf(O, `select * from core._reresolve_order_batch(${c}::smallint, '${MALL}', array[[1,2],[3,4]]::bigint[], false, 10)`), '22023', '2 次元');
+      assert.equal(await codeOf(O, call, [c, MALL, [], false, 10]), 'ok', '空の配列');
+    });
+
     console.log('H 権限・一時の表・engine・manifest・バックアップ');
     await t('権限: 3 つの関数は PUBLIC・watcher から呼べない (42501)・持ち主は呼べる / watcher は 3 つの表を SELECT だけ / 旧い 3 引数の権限は変えていない / search_path と work_mem の固定', async () => {
-      const sigs = ['core.reresolve_order_lines(smallint, text, date, date, bigint, integer, integer)', 'core.reresolve_order_lines_retry(smallint, text, bigint, bigint, integer, integer)', 'core._reresolve_order_batch(smallint, text, bigint[], boolean)'];
+      const sigs = ['core.reresolve_order_lines(smallint, text, date, date, bigint, integer, integer)', 'core.reresolve_order_lines_retry(smallint, text, bigint, bigint, integer, integer)', 'core._reresolve_order_batch(smallint, text, bigint[], boolean, integer)'];
       for (const s of sigs) {
         const r = (await O.query(`select has_function_privilege('public', $1::regprocedure, 'execute') as pub, has_function_privilege('watcher', $1::regprocedure, 'execute') as w, has_function_privilege(current_user, $1::regprocedure, 'execute') as own, array_to_string(proconfig, ',') as cfg, prosecdef from pg_proc where oid = $1::regprocedure`, [s])).rows[0];
         assert.deepEqual([r.pub, r.w, r.own, r.prosecdef], [false, false, true, false], s);
@@ -608,7 +724,7 @@ try {
           grant select, insert, update, delete on ops.reresolve_retry_orders, ops.reresolve_backlog_windows, ops.reresolve_retry_cursor to ${NOTEMP};
           grant usage on schema t to ${NOTEMP}; grant insert on t.touch_log to ${NOTEMP};
           grant execute on function core.reresolve_order_lines(smallint, text, date, date, bigint, integer, integer), core.reresolve_order_lines_retry(smallint, text, bigint, bigint, integer, integer),
-            core._reresolve_order_batch(smallint, text, bigint[], boolean) to ${NOTEMP}`);
+            core._reresolve_order_batch(smallint, text, bigint[], boolean, integer) to ${NOTEMP}`);
         assert.equal((await N.query(`select has_database_privilege(current_user, current_database(), 'temp') as x`)).rows[0].x, false);
         const ids = [await addOrder(28, T0, ['S1']), await addOrder(28, T0, ['S2', 'NX'])];
         const r = await win(N, 28, T0, addDays(T0, 1), 0n, 100, 100);
@@ -640,15 +756,14 @@ try {
     await t('manifest: 規則にかかる関数は全部分けてある (新しい署名は guard_later・PUBLIC なし)・問題 0 件', async () => {
       assert.deepEqual(await heavyEntryFindings(odb), []);
       // manifest の migration = その関数を作る migration のファイルの番号 (番号を付け替えたら manifest も = 付け忘れると --verify が適用の前後で誤る)
-      const dir = path.join(ROOT, 'db/company/migrations');
-      const fileOf = (re) => fs.readdirSync(dir).filter((f) => /^\d{4}_.*\.sql$/.test(f) && re.test(fs.readFileSync(path.join(dir, f), 'utf8'))).map((f) => f.slice(0, 4));
+      const fileOf = migrationsMatching;
       for (const [sig, re] of [['core.reresolve_order_lines(smallint, text, date, date, bigint, integer, integer)', /create function core\.reresolve_order_lines\(p_company smallint, p_mall text, p_since date, p_until date/],
         ['core.reresolve_order_lines_retry(smallint, text, bigint, bigint, integer, integer)', /create function core\.reresolve_order_lines_retry\(/],
-        ['core._reresolve_order_batch(smallint, text, bigint[], boolean)', /create function core\._reresolve_order_batch\(/]]) {
+        ['core._reresolve_order_batch(smallint, text, bigint[], boolean, integer)', /create function core\._reresolve_order_batch\(/]]) {
         const e = HEAVY_ENTRY_MANIFEST.find((x) => x.sig === sig);
         assert.deepEqual([e.cls, e.public, [e.migration]], ['guard_later', false, fileOf(re)], sig);
       }
-      // --verify (本適用の確かめ) は DB の適用済みの版で見る = 0057 の前の DB では新しい行を見ない (❌ にしない)・後では見る
+      // --verify (本適用の確かめ) は DB の適用済みの版で見る = この migration の前の DB では新しい行を見ない (❌ にしない)・後では見る
       const x = new URL(url); x.username = OWNER; x.password = PW; x.pathname = `/${DB1}`;
       const v = spawnSync(process.execPath, ['scripts/company-db/heavy-entry-manifest.mjs', '--verify'], { cwd: ROOT, env: { ...process.env, COMPANY_DB_URL: x.toString() }, encoding: 'utf8', timeout: 60000 });
       assert.equal(v.status, 0, v.stdout + v.stderr); assert.ok(!/見ていない/.test(v.stdout), v.stdout);

@@ -79,7 +79,7 @@ const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + n
 const quiet = () => {};
 const H = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const CLOSED_FUNCTIONS = revokeSigs();
-const KEEP = manifestUpTo('0056').filter((e) => e.cls !== 'revoke').map((e) => e.sig);   // 0057 以降で作る関数 (manifest の migration) は 0055 の DB に無い
+const KEEP = manifestUpTo('0056').filter((e) => e.cls !== 'revoke').map((e) => e.sig);   // 0056 より後の migration で作る関数 (manifest の migration) は 0055 の DB に無い
 const FILE_0056 = path.join(DEFAULT_DIR, '0056_amazon_profit_fn_revoke.sql');
 const SQL_0056 = fs.readFileSync(FILE_0056, 'utf8');
 
@@ -247,7 +247,7 @@ const aclOf = async (c, sig) => (await c.query(`select proacl::text as acl, proa
   });
 
   await t('本適用の手順の --verify (heavy-entry-manifest.mjs・持ち主の URL・読むだけ) = ✅ と TEMP の監査を出して exit 0', async () => {
-    await applyMigrations(odb, { log: quiet });   // 0057 (reresolve の batch・D-60 1b-0r) から後も流した今の姿 (manifest の全部の行の関数がある・superuser でない持ち主で流れる)
+    await applyMigrations(odb, { log: quiet });   // 0056 より後 (reresolve の batch・D-60 1b-0r ほか) も全部流した今の姿 (manifest の全部の行の関数がある・superuser でない持ち主で流れる)
     const x = new URL(url); x.username = OWNER; x.password = PW; x.pathname = `/${DB1}`;
     const r = spawnSync(process.execPath, ['scripts/company-db/heavy-entry-manifest.mjs', '--verify'], { cwd: ROOT, env: { ...process.env, COMPANY_DB_URL: x.toString() }, encoding: 'utf8', timeout: 60000 });
     assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -276,11 +276,11 @@ const aclOf = async (c, sig) => (await c.query(`select proacl::text as acl, proa
     assert.equal(v0.status, 1, '0056 の前の --verify は ❌ (exit 1)'); assert.match(v0.stdout, /❌ 重い入口/);
     // 本適用の手順の dry-run (0055 までの DB) = 0056 だけが出る・何も流さない
     const dry = await applyMigrations(pgAdapter(O2), { dryRun: true, log: quiet, to: '0056' });
-    assert.deepEqual([dry.applied, dry.pending.filter((v) => v <= '0056')], [[], ['0056']]);   // 0057 以降は to で止める (この試験は 0056 だけを見る)
+    assert.deepEqual([dry.applied, dry.pending.filter((v) => v <= '0056')], [[], ['0056']]);   // 0056 より後は to で止める (この試験は 0056 だけを見る)
     assert.deepEqual(await aclOf(O2, CLOSED_FUNCTIONS[0]), before);
     assert.deepEqual((await applyMigrations(pgAdapter(O2), { log: quiet, to: '0056' })).applied, ['0056']);
     assert.deepEqual(await heavyEntryFindings(pgAdapter(O2), { upTo: '0056' }), []);
-    // 0056 まで適用・0057 以降は未適用の DB (本番の適用の途中の姿) でも --verify は ✅ (DB の版より後の migration で作る関数は見ない・D-60 1b-0r)
+    // 0056 まで適用・それより後は未適用の DB (本番の適用の途中の姿) でも --verify は ✅ (DB の版より後の migration で作る関数は見ない・D-60 1b-0r)
     const v1 = spawnSync(process.execPath, ['scripts/company-db/heavy-entry-manifest.mjs', '--verify'], { cwd: ROOT, env: { ...process.env, COMPANY_DB_URL: x2.toString() }, encoding: 'utf8', timeout: 60000 });
     assert.equal(v1.status, 0, v1.stdout + v1.stderr); assert.match(v1.stdout, /0056 まで = それより後の migration で作る関数 \d+ 個は見ていない/);
   });

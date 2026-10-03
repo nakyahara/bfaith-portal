@@ -23,6 +23,9 @@
  */
 import { openPgClient } from './migrate.mjs';
 
+/** reresolve の batch (D-60 PR 1b-0r) を作る migration の番号 = 1 か所だけ。🚨 PR #1605 の後に付け替えるときはここと migration のファイル名だけ
+ *  (試験 test-company-db-reresolve-batch-pg.mjs が「ここ = 関数を作るファイルの実際の番号」を見る・付け替えの手順 = PR #1607 の本文) */
+export const RERESOLVE_BATCH_MIGRATION = '0057';
 const D60 = 'D-60 の利益の重い計算 (2026-10-01 に 93 日分で本番の Postgres を落とした)';
 export const HEAVY_ENTRY_MANIFEST = Object.freeze([
   // ─── revoke (0056) ───
@@ -50,11 +53,11 @@ export const HEAVY_ENTRY_MANIFEST = Object.freeze([
   { sig: 'mart.purge_sales_daily(smallint, integer)', cls: 'guard_later', public: true, reason: '売上日次の古い版の削除 (0021)。受け口 (router) が使う' },
   { sig: 'core.relink_shipments_bulk(smallint, bigint, integer)', cls: 'guard_later', public: true, reason: '伝票 → 注文の結び直し (最大 10 万件・一時の表 = TEMP・0017)。受け口 (router)・注文の送り手が使う' },
   { sig: 'core.reresolve_order_lines(smallint, text, date)', cls: 'guard_later', public: true, reason: '注文の行の SKU の解き直し (since = null で全部・一時の表 4 つ = TEMP・0024)。夜間ロード (load/engine) が使う' },
-  // 🆕 0057 (D-60 PR 1b-0r) = 上限つきの batch の新しい署名。設計 13 の分け = Gw (門は PR 3a)・それまでは guard_later。PUBLIC の EXECUTE は作った取引で外した (持ち主だけ)。
+  // 🆕 RERESOLVE_BATCH_MIGRATION (D-60 PR 1b-0r) = 上限つきの batch の新しい署名。設計 13 の分け = Gw (門は PR 3a)・それまでは guard_later。PUBLIC の EXECUTE は作った取引で外した (持ち主だけ)。
   //   夜間ロードは 1b-0e まで旧い 3 引数を呼ぶ = 今は呼び手が無い (試験と apps/company-db/load/reresolve-batch.mjs の部品だけ)。migration = その版で作る (それより前の DB の試験は upTo で外す)
-  { sig: 'core.reresolve_order_lines(smallint, text, date, date, bigint, integer, integer)', cls: 'guard_later', public: false, migration: '0057', reason: '注文の行の SKU の解き直しの窓の 1 batch (0057・窓 ≦ 62 日・注文 ≦ 5,000・未解決の明細 ≦ 20,000・一時の表なし)。夜間ロードが 1b-0e で使う (Gw)' },
-  { sig: 'core.reresolve_order_lines_retry(smallint, text, bigint, bigint, integer, integer)', cls: 'guard_later', public: false, migration: '0057', reason: 'reresolve の retry の表 (skip した注文) の 1 batch (0057・注文 ≦ 5,000・未解決の明細 ≦ 20,000・一時の表なし)。夜間ロードが 1b-0e で使う (Gw)' },
-  { sig: 'core._reresolve_order_batch(smallint, text, bigint[], boolean)', cls: 'guard_later', public: false, migration: '0057', reason: 'reresolve の 1 batch の共通の部品 (0057・注文の配列 ≦ 5,000)。上の 2 つの中だけで呼ぶ (規則にはかからないが手で足した)' },
+  { sig: 'core.reresolve_order_lines(smallint, text, date, date, bigint, integer, integer)', cls: 'guard_later', public: false, migration: RERESOLVE_BATCH_MIGRATION, reason: '注文の行の SKU の解き直しの窓の 1 batch (1b-0r・窓 ≦ 62 日・注文 ≦ 5,000・未解決の明細 ≦ 20,000・一時の表なし)。夜間ロードが 1b-0e で使う (Gw)' },
+  { sig: 'core.reresolve_order_lines_retry(smallint, text, bigint, bigint, integer, integer)', cls: 'guard_later', public: false, migration: RERESOLVE_BATCH_MIGRATION, reason: 'reresolve の retry の表 (skip した注文) の 1 batch (1b-0r・注文 ≦ 5,000・未解決の明細 ≦ 20,000・一時の表なし)。夜間ロードが 1b-0e で使う (Gw)' },
+  { sig: 'core._reresolve_order_batch(smallint, text, bigint[], boolean, integer)', cls: 'guard_later', public: false, migration: RERESOLVE_BATCH_MIGRATION, reason: 'reresolve の 1 batch の共通の部品 (1b-0r・注文の配列 ≦ 5,000・lock の後の今の明細の累計 ≦ p_max_lines ≦ 20,000 = 直に呼ばれても上限を守る)。上の 2 つが呼ぶ (SECURITY INVOKER = PR 1b で runtime に部品の EXECUTE も要る・規則にはかからないが手で足した)' },
   { sig: 'core.merge_duplicate_suppliers()', cls: 'guard_later', public: true, reason: '仕入先の二重の寄せ (全部の仕入先・一時の表 = TEMP・0025 / 0027)。migration と試験が呼ぶ・人の保守の道具' },
   { sig: 'core.relink_shipments(smallint)', cls: 'guard_later', public: true, reason: '伝票 → 注文の全件の結び直し (0013)。アプリの呼び手は無い (試験と人の復旧の道具)。外すかは後の PR で決める' },
   { sig: 'core.relink_ad_spend_listings(smallint)', cls: 'guard_later', public: true, reason: '広告費の出品の結び直し (全件・0035)。広告費の取込 (ingest/ad-spend) が使う' },

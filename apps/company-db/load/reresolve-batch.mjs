@@ -1,8 +1,8 @@
 /**
- * reresolve-batch.mjs — 注文明細の解き直しの夜の回し方 (D-60 PR 1b-0r の部品・設計 13 §3.10「reresolve の batch の契約」v3.12)
+ * reresolve-batch.mjs — 注文明細の解き直しの夜の回し方 (D-60 PR 1b-0r の部品・設計 13 §3.10「reresolve の batch の契約」v3.14)
  *
  * 🚨 夜間ロード (engine.mjs 8b) からはまだ呼ばない。engine は旧い 3 引数 core.reresolve_order_lines(smallint, text, date) のまま (切り替えは PR 1b-0e・
- *    本番の件数を読むだけの SQL で確かめた後)。この部品は 0057 の関数を使う「夜の手順」を 1 か所に固め、試験 (scripts/test-company-db-reresolve-batch-pg.mjs) で守る。
+ *    本番の件数を読むだけの SQL で確かめた後)。この部品は db/company/migrations/*_reresolve_batch.sql の関数を使う「夜の手順」を 1 か所に固め、試験 (scripts/test-company-db-reresolve-batch-pg.mjs) で守る。
  *
  * 夜の手順 (会社 × モールごと):
  *   ⓪ reserveNight  = 本体の取引の **前に別の短い取引で** 今夜の窓 [今日 − 35, 明日) を ops.reresolve_backlog_windows に予約 (cursor 0・on conflict do nothing) し、
@@ -15,9 +15,15 @@
  *   ② 同じ取引で 持ち越しの窓を古い順に (今夜の予約を含む・保存した cursor から)・1 晩の上限 N の残りまで。流し終えた窓の行は消す・上限で止まった窓は cursor を残す
  *   retry の予算 R は 1〜N − 1 (窓に最低 1 batch を残す)。違えば何も流さずに例外
  *
- * 報告 (readRetryState + estimateCycleNights + retryWarnings): retry の表の残り Q 注文・cursor・high-water・cycle_started_at・1 周の見込みの晩の数
- *   (最悪の保証 ⌈Q ÷ R⌉ / 式 ⌈B ÷ R⌉ / 実測 ⌈Q ÷ (R × e)⌉)・⚠️ 4 つ (失敗にはしない)。🚨 ⌈Q ÷ R⌉ と B は「読んだ時点の retry の表」についての見込み
- *   (周回の途中で high-water 以下・cursor より後ろに行が入ると、その周回の対象は増える = R-D60-v3-13 M1。保証は「1 batch は少なくとも 1 注文進む」まで)
+ * 報告 (readRetryState → estimateCycleNights → retryWarnings → retryReportLine・設計 13 v3.14 の「1 周の晩の数」と「報告と ⚠️」):
+ *   🚨 夜の本体 (runNightBody) の **前** に読む = その晩の始めの「今の周の残りの集合」(v3.13 = R-D60-v3-13 M1・Codex R1 (PR #1607) の Medium 1)
+ *     周回の中 (high-water あり) = cursor < order_id ≦ high-water の行 / 周回の外 = 次に始める周 = retry の表の全部 (= 周回の始めの Q₀)
+ *     で Q (注文)・L (未解決の明細の合計)・Lmax (1 注文の最大) を毎晩数え直す。retry の表の全部の行の数 total・⚠️ ② ③ は表の全部で数える
+ *   ① 完了までの晩の数の上限 (v3.14 = 旧「最悪の保証」) = ⌈Q ÷ R⌉ = 読んだ集合 (周回の外なら Q₀ = 周回の始めの distinct な order_id) についての上限。
+ *      周回の途中に cursor < order_id ≦ high-water へ入る distinct な order_id A は前もって分からない = 実際に参加した集合の上限は ⌈(Q₀ + A) ÷ R⌉
+ *      (前もっての予測ではない・1 batch は少なくとも 1 注文進む・A は有限 = 周回は必ず終わる)
+ *   ② 運用の見込み = max(式 ⌈B ÷ R⌉, 実測 ⌈Q ÷ (R × e)⌉) = 今の残りの集合による見込み (これから入る行は含まない = 毎晩数え直す)
+ *   ⚠️ 4 つ (失敗にはしない): ① 今の周の経過の晩の数 + 残りの見込みの晩の数 > 7 ② attempts ≧ 7 ③ first_skipped_at < 7 日前 ④ 周回の途中で cycle_started_at < 7 日前
  *
  * order_id は全部 BigInt で持つ (pg は int8 を文字で返す・Number にすると 2^53 を超えて精度を失う = R-D60-v3-13 L1)。
  * db = { query(text, params) → { rows } } (pg の Client / migrate.mjs の pgAdapter)。
@@ -175,30 +181,51 @@ export async function runReresolveNight(db, opts) {
 }
 
 /**
- * retry の表の状態 (報告の材料・読むだけ)。自分で read only の取引を開く (statement_timeout 5 秒) = 呼び手は取引の外で呼ぶ
- *   戻り = { Q, L, Lmax, att7, old7, cursor: { after, through, startedAt, cyclesCompleted } | null, cycleOld }
+ * retry の表の状態 (報告の材料・読むだけ)。自分で取引を開く = 呼び手は取引の外で、夜の本体の **前** に呼ぶ
+ *   🚨 repeatable read の read only (statement_timeout 5 秒) + cursor と集計を 1 つの文 = cursor と残りの集合が同じ時点 (Codex R1 (PR #1607) の Low)
+ *   Q・L・Lmax = 今の周の残りの集合 (周回の中 = after < order_id ≦ through / 周回の外 (cursor の行が無い・through が null) = 表の全部)
+ *   total = 表の全部の行・att7 / old7 (⚠️ ② ③) = 表の全部で数える (周回の範囲の外の行でも出す)
+ *   elapsedNights = 今の周の経過の晩の数 = JST の今日 − JST の周回の始まりの日 (周回の外は 0 = 今夜から新しい周)。夜の本体の前に読む前提 = 今夜は残りに入る
+ *   戻り = { Q, L, Lmax, total, att7, old7, inCycle, elapsedNights, cursor: { after, through, startedAt, cyclesCompleted } | null, cycleOld }
  */
 export async function readRetryState(db, { company, mall, statementTimeout = '5s' }) {
-  await db.query('begin read only');
+  await db.query('begin isolation level repeatable read read only');
   try {
     await db.query(`set local statement_timeout = '${String(statementTimeout).replace(/[^0-9a-z ]/gi, '')}'`);
-    const a = (await db.query(`with q as (
-        select t.order_id, t.attempts, t.first_skipped_at,
+    const a = (await db.query(`with c as (
+        select after_order_id, cycle_through_order_id, cycle_started_at, cycles_completed
+          from ops.reresolve_retry_cursor where company_id = $1::smallint and mall = $2),
+      t as (
+        select r.order_id, r.attempts, r.first_skipped_at,
+               (c.cycle_through_order_id is null or (r.order_id > c.after_order_id and r.order_id <= c.cycle_through_order_id)) as in_set
+          from ops.reresolve_retry_orders r left join c on true
+         where r.company_id = $1::smallint and r.mall = $2),
+      q as (
+        select t.order_id,
                (select count(*)::integer from core.order_lines l
                  where l.order_id = t.order_id and l.removed_at is null and l.listing_id is null and l.sku_id is null and l.unresolved_code is not null) as n
-          from ops.reresolve_retry_orders t where t.company_id = $1::smallint and t.mall = $2)
-      select count(*)::integer as q, coalesce(sum(n), 0)::bigint as l, coalesce(max(n), 0)::integer as lmax,
-             count(*) filter (where attempts >= $3)::integer as att7,
-             count(*) filter (where first_skipped_at < now() - make_interval(days => $4))::integer as old7
-        from q`, [company, mall, WARN_ATTEMPTS, WARN_DAYS])).rows[0];
-    const c = (await db.query(`select after_order_id, cycle_through_order_id, cycle_started_at, cycles_completed,
-        (cycle_through_order_id is not null and cycle_started_at < now() - make_interval(days => $3)) as cycle_old
-      from ops.reresolve_retry_cursor where company_id = $1::smallint and mall = $2`, [company, mall, WARN_DAYS])).rows[0];
+          from t where t.in_set)
+      select (select count(*)::integer from q) as q,
+             (select coalesce(sum(n), 0)::bigint from q) as l,
+             (select coalesce(max(n), 0)::integer from q) as lmax,
+             (select count(*)::integer from t) as total,
+             (select count(*)::integer from t where t.attempts >= $3) as att7,
+             (select count(*)::integer from t where t.first_skipped_at < now() - make_interval(days => $4)) as old7,
+             (select count(*)::integer from c) as has_cursor,
+             (select after_order_id from c) as after_order_id,
+             (select cycle_through_order_id from c) as cycle_through_order_id,
+             (select cycle_started_at from c) as cycle_started_at,
+             (select cycles_completed from c) as cycles_completed,
+             (select (cycle_through_order_id is not null and cycle_started_at < now() - make_interval(days => $4)) from c) as cycle_old,
+             (select case when cycle_through_order_id is null then 0
+                          else ((now() at time zone 'Asia/Tokyo')::date - (cycle_started_at at time zone 'Asia/Tokyo')::date) end from c) as elapsed`,
+      [company, mall, WARN_ATTEMPTS, WARN_DAYS])).rows[0];
     await db.query('commit');
+    const c = a.has_cursor ? { after: toBig(a.after_order_id), through: toBig(a.cycle_through_order_id), startedAt: a.cycle_started_at, cyclesCompleted: Number(a.cycles_completed) } : null;
     return {
-      Q: Number(a.q), L: Number(a.l), Lmax: Number(a.lmax), att7: Number(a.att7), old7: Number(a.old7),
-      cursor: c ? { after: toBig(c.after_order_id), through: toBig(c.cycle_through_order_id), startedAt: c.cycle_started_at, cyclesCompleted: Number(c.cycles_completed) } : null,
-      cycleOld: !!(c && c.cycle_old),
+      Q: Number(a.q), L: Number(a.l), Lmax: Number(a.lmax), total: Number(a.total), att7: Number(a.att7), old7: Number(a.old7),
+      inCycle: !!(c && c.through !== null), elapsedNights: Math.max(0, Number(a.elapsed ?? 0)),
+      cursor: c, cycleOld: !!a.cycle_old,
     };
   } catch (e) {
     try { await db.query('rollback'); } catch { /* */ }
@@ -207,8 +234,10 @@ export async function readRetryState(db, { company, mall, statementTimeout = '5s
 }
 
 /**
- * 1 周の見込みの晩の数 (純粋な計算)
- *   最悪の保証 worst = ⌈Q ÷ R⌉ (1 batch は少なくとも 1 注文)
+ * 今の周の残り (周回の外なら次に始める周 = Q₀) の晩の数 (純粋な計算・設計 13 v3.14)
+ *   完了までの晩の数の上限 bound = ⌈Q ÷ R⌉ (1 batch は少なくとも 1 注文) = 読んだ集合についての上限。周回の途中に入る distinct な order_id A を
+ *     足した ⌈(Q₀ + A) ÷ R⌉ が実際に参加した集合の上限 (A は前もって分からない = この値は予測ではない)
+ *   運用の見込み est = max(式, 実測) = 今の残りの集合による見込み:
  *   式 formula = ⌈B ÷ R⌉・B = min(Q, ⌊Q ÷ maxOrders⌋ + ⌊L ÷ d⌋ + 1)・d = maxLines − Lmax + 1 (d ≦ 0 なら B = Q・Q = 0 なら B = 0)
  *   実測 measured = ⌈Q ÷ (R × e)⌉・e = 直近の retry の batch のうち has_more で止まった batch の orders_examined の最小 (無ければ null)
  *   見込み est = max(formula, measured)
@@ -217,18 +246,19 @@ export function estimateCycleNights({ Q, L, Lmax, R, maxOrders, maxLines, recent
   if (!(isInt(R) && R >= 1)) throw new Error(`R は 1 以上 (${R})`);
   const d = maxLines - Lmax + 1;
   const B = Q === 0 ? 0 : (d <= 0 ? Q : Math.min(Q, Math.floor(Q / maxOrders) + Math.floor(L / d) + 1));
-  const worst = Math.ceil(Q / R);
+  const bound = Math.ceil(Q / R);
   const formula = Math.ceil(B / R);
   const full = recentBatches.filter((b) => b.hasMore).map((b) => b.examined).filter((x) => x > 0);
   const e = full.length ? Math.min(...full) : null;
   const measured = e ? Math.ceil(Q / (R * e)) : null;
-  return { Q, L, Lmax, B, d, worst, formula, e, measured, est: Math.max(formula, measured ?? 0) };
+  return { Q, L, Lmax, B, d, bound, formula, e, measured, est: Math.max(formula, measured ?? 0) };
 }
 
-/** ⚠️ の 4 つ (どれか 1 つで出す・失敗にはしない) */
+/** ⚠️ の 4 つ (どれか 1 つで出す・失敗にはしない)。① = 今の周の経過の晩の数 + 残りの運用の見込み > 7 晩 (v3.13・周回の外は経過 0) */
 export function retryWarnings(state, estimate) {
   const w = [];
-  if (estimate.est > WARN_DAYS) w.push({ kind: 'cycle_nights', text: `1 周の見込み ${estimate.est} 晩 > ${WARN_DAYS} 晩 (R か N を見直す)` });
+  const elapsed = state.elapsedNights ?? 0;
+  if (elapsed + estimate.est > WARN_DAYS) w.push({ kind: 'cycle_nights', text: `今の周の経過 ${elapsed} 晩 + 残りの見込み ${estimate.est} 晩 = ${elapsed + estimate.est} 晩 > ${WARN_DAYS} 晩 (R か N を見直す)` });
   if (state.att7 > 0) w.push({ kind: 'attempts', text: `attempts ≧ ${WARN_ATTEMPTS} の注文 ${state.att7} (別の書き手が長く持っている印)` });
   if (state.old7 > 0) w.push({ kind: 'first_skipped', text: `${WARN_DAYS} 日より前に skip された注文 ${state.old7}` });
   if (state.cycleOld) w.push({ kind: 'cycle_started', text: `周回の始まりが ${WARN_DAYS} 日より前 (周回の途中)` });
@@ -239,6 +269,10 @@ export function retryWarnings(state, estimate) {
 export function retryReportLine(mall, state, estimate, warnings) {
   const c = state.cursor;
   const pos = c ? `cursor ${c.after}${c.through === null ? ' (周回の外)' : ` / high-water ${c.through} / 周回の始まり ${c.startedAt ? new Date(c.startedAt).toISOString() : '-'}`}` : 'cursor なし';
-  return `${mall}: retry の表の残り ${state.Q} 注文 (未解決の明細 ${state.L}) / ${pos} / 1 周の見込み ${estimate.est} 晩 (式 ${estimate.formula}・実測 ${estimate.measured ?? '-'}・最悪 ${estimate.worst})`
+  const set = state.inCycle ? `今の周の残り ${state.Q} 注文 (経過 ${state.elapsedNights} 晩)` : `次の周の始めの集合 Q₀ = ${state.Q} 注文`;
+  const boundText = state.inCycle
+    ? `今の残りについての完了までの晩の数の上限 ⌈Q ÷ R⌉ = ${estimate.bound} 晩 (これから周に入る A 注文は含まない = ⌈(Q + A) ÷ R⌉)`
+    : `完了までの晩の数の上限 ⌈Q₀ ÷ R⌉ = ${estimate.bound} 晩 (周回の途中に入る A 注文は含まない = ⌈(Q₀ + A) ÷ R⌉)`;
+  return `${mall}: retry の表の残り ${state.total ?? state.Q} 注文 / ${set}・未解決の明細 ${state.L} / ${pos} / 運用の見込み ${estimate.est} 晩 (式 ${estimate.formula}・実測 ${estimate.measured ?? '-'}) / ${boundText}`
     + (warnings.length ? ` / ⚠️ ${warnings.map((x) => x.text).join('・')}` : '');
 }
