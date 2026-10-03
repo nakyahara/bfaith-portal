@@ -9084,7 +9084,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "70ae5ff3f350561ce9adb8ca909e1f4eecfeddafc66f7c3d6a3fcc45e2f0edb9",
+  "sha256": "53173b3437bd9e0f0eed0b708e073b518de37993ee94575991559d469fe43bf0",
   "body": {
    "months": [
     {
@@ -9210,7 +9210,7 @@
     "low_inventory": "低在庫レベル手数料",
     "subscription": "月額登録料",
     "easy_ship": "Easy Ship 配送料",
-    "other_account_fee": "その他 (手数料の調整など)"
+    "other_account_fee": "その他 (手数料の調整・納品の運賃など)"
    }
   }
  },
@@ -9218,7 +9218,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "15bda63106b857f053aa874e598144fe51b8def0a01973af147907c57f4d8eb8",
+  "sha256": "6356bed2e6980c15a15ce22d1b31ed2d07025d11d59880dcd2c46cfb79d780a9",
   "body": {
    "months": [
     {
@@ -9362,7 +9362,7 @@
     "low_inventory": "低在庫レベル手数料",
     "subscription": "月額登録料",
     "easy_ship": "Easy Ship 配送料",
-    "other_account_fee": "その他 (手数料の調整など)"
+    "other_account_fee": "その他 (手数料の調整・納品の運賃など)"
    }
   }
  },
@@ -9370,7 +9370,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "94ab8f6edd67b6878e41cf41e94f50d57bc70cef7d8534e447528982dc8bac44",
+  "sha256": "c8ab14b6a0f8202cc445d805918224faf9e9da9b91b62c4ebbdf62492ec60164",
   "body": {
    "months": [],
    "labels": {
@@ -9381,7 +9381,7 @@
     "low_inventory": "低在庫レベル手数料",
     "subscription": "月額登録料",
     "easy_ship": "Easy Ship 配送料",
-    "other_account_fee": "その他 (手数料の調整など)"
+    "other_account_fee": "その他 (手数料の調整・納品の運賃など)"
    }
   }
  },
