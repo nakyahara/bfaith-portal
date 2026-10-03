@@ -153,7 +153,7 @@ const aclOf = async (c, sig) => (await c.query(`select proacl::text as acl, proa
 
   console.log('0056 (持ち主が実行器で流す)');
   await t('実行器で流れる (0056 だけ・superuser でない持ち主で)', async () => {
-    assert.deepEqual((await applyMigrations(odb, { log: quiet })).applied, ['0056']);
+    assert.deepEqual((await applyMigrations(odb, { log: quiet, to: '0056' })).applied, ['0056']);
   });
   await t('🚨 持ち主・watcher・profit_reader・PUBLIC だけの役割の全部が、10 の関数で 42501 (permission denied for function)', async () => {
     assert.equal(CLOSED_FUNCTIONS.length, 10);
@@ -242,7 +242,7 @@ const aclOf = async (c, sig) => (await c.query(`select proacl::text as acl, proa
   await t('2 回流しても同じ (0056 の本文を持ち主がもう一度 = 例外なし・権限の表は空 / 実行器は 0 本)', async () => {
     await O.query(SQL_0056);
     for (const s of CLOSED_FUNCTIONS) assert.equal(Number((await aclOf(O, s)).n), 0, s);
-    assert.equal((await applyMigrations(odb, { log: quiet })).applied.length, 0);
+    assert.equal((await applyMigrations(odb, { log: quiet, to: '0056' })).applied.length, 0);
     assert.deepEqual(await heavyEntryFindings(odb), []);
   });
 
@@ -274,10 +274,10 @@ const aclOf = async (c, sig) => (await c.query(`select proacl::text as acl, proa
     const v0 = spawnSync(process.execPath, ['scripts/company-db/heavy-entry-manifest.mjs', '--verify'], { cwd: ROOT, env: { ...process.env, COMPANY_DB_URL: x2.toString() }, encoding: 'utf8', timeout: 60000 });
     assert.equal(v0.status, 1, '0056 の前の --verify は ❌ (exit 1)'); assert.match(v0.stdout, /❌ 重い入口/);
     // 本適用の手順の dry-run (0055 までの DB) = 0056 だけが出る・何も流さない
-    const dry = await applyMigrations(pgAdapter(O2), { dryRun: true, log: quiet });
-    assert.deepEqual([dry.applied, dry.pending], [[], ['0056']]);
+    const dry = await applyMigrations(pgAdapter(O2), { dryRun: true, log: quiet, to: '0056' });
+    assert.deepEqual([dry.applied, dry.pending.filter((v) => v <= '0056')], [[], ['0056']]);   // 0057 以降は to で止める (この試験は 0056 だけを見る)
     assert.deepEqual(await aclOf(O2, CLOSED_FUNCTIONS[0]), before);
-    assert.deepEqual((await applyMigrations(pgAdapter(O2), { log: quiet })).applied, ['0056']);
+    assert.deepEqual((await applyMigrations(pgAdapter(O2), { log: quiet, to: '0056' })).applied, ['0056']);
     assert.deepEqual(await heavyEntryFindings(pgAdapter(O2)), []);
   });
 }

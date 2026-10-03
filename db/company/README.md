@@ -1698,7 +1698,7 @@ Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/c
     (0047 / 0050 の watcher の GRANT も外した)。PUBLIC・watcher・profit_reader (あれば)・持ち主・表に載っていた全部の役割から外し、最後に空を確かめる (違えば例外 = 取引ごと巻き戻す。持ち主でない役割で流すと `d60_revoke_incomplete`)
   - `guard_later` = 重いが正当な呼び手がいる (か、外すかを人が決める) = **権限は変えない** (後の PR で共通の lock `company_db_heavy` に参加させるか外す)。
     `mart.finance_daily_range` (受け口 `GET /order-finance/daily`・watcher にも明示の GRANT)・`mart.ad_efficiency` / `_coverage`・`mart.sku_activity` / `_gaps`・`mart.sales_expanded_to_skus`・`mart.listings_to_skus` (人・AI が読む)・
-    `mart.sales_daily_check` / `refresh_sales_daily` / `build_sales_daily_dates` / `purge_sales_daily` (受け口)・`core.relink_shipments_bulk` / `reresolve_order_lines` / `merge_duplicate_suppliers` (一時の表 = TEMP)・
+    `mart.sales_daily_check` / `refresh_sales_daily` / `build_sales_daily_dates` / `purge_sales_daily` (受け口)・`core.relink_shipments_bulk` / `reresolve_order_lines` / `merge_duplicate_suppliers` (一時の表 = TEMP。relink と merge は 0057 で一時の表なし)・
     `core.relink_shipments`・`core.relink_ad_spend_listings`・`raw.purge_superseded_observations`・`ops.amazon_map_sales_coverage` / `unmapped_recent` (理由は manifest)。
     🚨 **これらは今も DB に直接つなげば呼べる** (「repo の中から呼んでいない」は直呼びを防いだ証明ではない)
   - `light` = 規則にかかるが重くない (定数・policy の表だけ・DDL の補助・coverage の 1 行など)。権限は変えない
@@ -1716,7 +1716,7 @@ Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/c
 - **持ち主自身から外しても効く** (PostgreSQL 18.4 で確かめた)。ただし持ち主は **付け直せる** (持ち主は常に GRANT の権限を持つ) = この封鎖は「うっかり・ほかの接続から呼べない」まで。
   SECURITY DEFINER の関数 (定義者 = 持ち主) の中から呼んでも 42501 = 抜け道にならない。superuser は権限を見ない (PGlite の試験の接続は superuser = ほかの試験は今までどおり呼べる)。
 - **PR 1a でしないこと** (PR 1b = 別の管理主体が要る): 役割 (`profit_definer`・migration の deployer) を作らない・持ち主を移さない・全体の既定の権限を変えない・**TEMP の権限を外さない**
-  (持ち主の relink・reresolve_order_lines・merge_duplicate_suppliers が一時の表を使う)。TEMP は `--verify` が **監査の結果を出すだけ** (PUBLIC・役割ごとの TEMP・一時の表を作る関数)。
+  (持ち主の relink・reresolve_order_lines・merge_duplicate_suppliers が一時の表を使う = 0057 の後は reresolve_order_lines だけ)。TEMP は `--verify` が **監査の結果を出すだけ** (PUBLIC・役割ごとの TEMP・一時の表を作る関数)。
   PG 16 以降、CREATEROLE の役割が作った役割には ADMIN だけが付き SET が無い = `alter function … owner to` は `must be able to SET ROLE` で止まる (実機で確かめた)。
 - 🚨 **約束 1 (revoke の関数を直す)**: 持ち主にも EXECUTE が無いので、`create or replace` は関数の検査 (validator) が 42501 で止まる。直す migration は **同じ取引で**
   `grant execute on function <署名> to current_user` → `create or replace` → 0056 と同じに全員から外す (`revoke … from public` / `from current_user`) → 権限の表が空を確かめる。
@@ -1758,6 +1758,44 @@ node -r dotenv/config scripts\company-db\migrate.mjs                            
 node -r dotenv/config scripts\company-db\heavy-entry-manifest.mjs --verify      # 後: ✅
 cd C:\Users\bfaith\bfaith-portal
 git worktree remove C:\tmp\d60-revoke
+```
+
+### 一時の表を使わない relink と仕入先の寄せ (0057・D-60 v3.6 の PR 1b-0 の一部。Codex R-D60-v3-7)
+
+なぜ: `temp_file_limit` は明示の一時の表 (TEMP) を縛らない = PR 1b で TEMP の権限を superuser でない全部の LOGIN の役割から外す。その前に、正当な呼び手が使う関数から一時の表を無くす。
+Codex R-D60-v3-7 = 「`relink_shipments_bulk` と `merge_duplicate_suppliers` は着手してよい・`reresolve_order_lines` は止める (上限の単位・cursor・期間の端・戻り値を直してから)」。
+
+- `core.relink_shipments_bulk(smallint, bigint, integer)` = 0017 の一時の表 `_relink_cand2` → **件数の上限つきの配列の変数** (p_limit ≦ 100,000 は今までどおり関数の中で強制)。
+  文の分け方は 0017 と同じ (① 候補を shipment_id の順に for update で取る ② 別の文で orders と **列どうしの等結合** = 0017 の教訓のまま)。署名・戻り値 (linked・examined・last_id)・結果は同じ
+- `core.merge_duplicate_suppliers()` = 0027 の一時の表 3 つ → 配列の変数 (寄せる行・残す行) と jsonb の変数 (まとめた後の仕入先ごとの商品・文書の紐付け)。文の順番は 0027 と同じ
+  (消してから足す = 代表の印の部分 unique と trigger の前提をそのまま守る)。🆕 **仕入先 (全部の行) ≦ 5,000** を最初に確かめる (超えたら 54000 で止まる・何も変えない。本番は約 40〜80 行)
+- どちらも `search_path = pg_catalog, pg_temp`・表と関数は schema で修飾・SECURITY INVOKER のまま。CREATE OR REPLACE = 持ち主・EXECUTE の権限の表は変わらない
+- 🚨 **変えないこと**: `core.reresolve_order_lines` (0024・一時の表 4 つ) には触らない / TEMP の権限は外さない (PR 1b) / EXECUTE の権限も変えない
+  (`merge_duplicate_suppliers` を PUBLIC・watcher・runtime から外すのは PR 1b = 設計 13 §3.10 の「重い入口の分け」)。`--verify` の「一時の表を作る関数」は 3 → 1 (`reresolve_order_lines` だけ) になる
+
+試験 = `node scripts/test-company-db-no-temp-pg.mjs` (本物の PG・試験が自分で使い捨てのクラスタを起動して最後に消す = profit-fn-revoke-pg と同じ作り。`npm run test:company-db` に入っている)。
+0056 まで流した雛形 (旧い関数) と 0057 の後の雛形 (新しい関数) から回ごとに DB を作り、同じ fixture を入れて同じ順で呼ぶ → 戻り値 (例外の SQLSTATE と文言も)・全部の表・全部の通し番号が同じ
+(境目 = 候補 0 件・p_limit ちょうど / ±1・100,000 / 100,001・候補 100,001 件・p_after = null・同じ取引で続けて・仕入先の 3 つの連鎖・会社をまたぐ同じコード・代表の印・文書の重なり・乱数の fixture 6 回ずつ)。
+🚨 1 つの文の中で行を処理する順は契約ではない (旧い関数でも実行計画しだい) = `version` は「version を除いた行 + version の値の集まり」、監査 (`events.master_change_events`) は
+「change_id のまとまりごとの出来事 + event_id の順の 操作|対象 + event_id の集まり」で比べる。新しい関数は呼んだ取引の中で一時の表が 0 個・TEMP の権限を外した DB で通る (旧い関数は 42501)。
+
+**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に miniPC で dry-run → 本適用)**。0057 は関数の差し替えだけ (表・データ・権限は変えない)。
+0056 が未適用なら、先に上の 0056 の手順を済ませてから (dry-run に 0056 が出たら止める)。夜間ロード (02:00) の最中は避ける (いつもの migrate と同じ)。
+
+```
+# 本番で使っていない worktree から (miniPC の PowerShell 5.1。.env は本体の 1 つを読む)
+cd C:\Users\bfaith\bfaith-portal
+git fetch origin
+git worktree add C:\tmp\d60-notemp origin/master
+cd C:\tmp\d60-notemp
+npm ci --omit=dev
+$env:DOTENV_CONFIG_PATH = 'C:\Users\bfaith\bfaith-portal\.env'
+node -r dotenv/config scripts\company-db\heavy-entry-manifest.mjs --verify      # 前: 一時の表を作る関数 3 を控える
+node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                  # 0057 だけが出ること (0056 も出たら止めて 0056 の手順から)
+node -r dotenv/config scripts\company-db\migrate.mjs                            # applied に 0057
+node -r dotenv/config scripts\company-db\heavy-entry-manifest.mjs --verify      # 後: ✅ と「一時の表を作る関数 1: core.reresolve_order_lines(...)」
+cd C:\Users\bfaith\bfaith-portal
+git worktree remove C:\tmp\d60-notemp
 ```
 
 ## 発注の受け皿 (0014。08 §5。D6)
