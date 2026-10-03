@@ -12,6 +12,8 @@ import Database from 'better-sqlite3';
 import { MIRROR_PRODUCTS_DDL, MIRROR_SET_COMPONENTS_DDL } from './material-tables.js';
 import { createProductScoutTables } from '../product-scout/schema.js';
 import { createSkuMapGenerationTables } from './sku-map-state-schema.js';   // import を持たない部品 (amazon-pricing の書き込む経路の試験がたどる)
+// 統合の view (v_mall_finance_daily_unified) の Amazon の枝が読む表の名前 = 共通の読み口 (F4-1・consumer 'mall-finance-unified-view')。import を持たない部品
+import { financeDailyTable } from '../../lib/amazon-finance-read.js';
 import path from 'path';
 import fs from 'fs';
 import {
@@ -2616,7 +2618,7 @@ function createTables() {
       CASE WHEN COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) > 0 THEN 1 ELSE 0 END AS is_fba,
       sales_principal_jpy,
       synced_at
-    FROM mirror_amazon_finance_sku_daily
+    FROM ${financeDailyTable('mall-finance-unified-view')}
     UNION ALL
     SELECT
       date_jst, 'rakuten',

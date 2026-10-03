@@ -20,6 +20,8 @@
  *
  * 入力の単位: 価格はすべて税込・整数円。原価 (cost_incl_tax) は税込換算済み。手数料率は 0.10 のような小数。
  */
+// 判定の監査に残す「販売数の出どころ」の表の名前 (Amazon の財務の共通の読み口・入出力なし。F4-1 2026-10-03)
+import { financeDailyTable } from '../../lib/amazon-finance-read.js';
 
 export const RULE_VERSION = 'rule:ap-v1';
 
@@ -477,7 +479,7 @@ export function describeInputs(row, policy, snapshotDate) {
       buybox: 'mirror_amazon_price_snapshot_daily.buybox_price / buybox_is_mine',
       fees: 'mirror_amazon_sku_fees',
       cost: 'mirror_sku_resolved × mirror_products (原価 × (1+消費税率) × 数量)',
-      sales: 'mirror_amazon_finance_sku_daily (直近30日, 確定分)',
+      sales: `${financeDailyTable('amazon-pricing')} (直近30日, 確定分)`,   // 表の名前は読み口から (F4-1)
       policy: 'ap_policies',
     },
     snapshot_date_jst: snapshotDate ?? null,

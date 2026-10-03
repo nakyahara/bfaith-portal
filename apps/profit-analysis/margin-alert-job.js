@@ -95,7 +95,7 @@ export function collectMarginRows(db, from, to, opts = {}) {
     let total = Infinity;
     let noSettled = false;
     while (offset < total) {
-      const res = getSkuProfit(from, to, { limit: pageSize, offset, sort: 'seller_sku', dir: 'asc' });
+      const res = getSkuProfit(from, to, { limit: pageSize, offset, sort: 'seller_sku', dir: 'asc', consumer: 'margin-alert' });   // 読み口の profile = margin-alert (F4-1)
       // 2026-09-29 (Codex #1528 R1): Amazon 分析は決済のそろった日 (最後の日の前日) までで切る。
       //   期間の中に決済のそろった日が 1 日も無い (決済がまだ届いていない・止まっている) と SKU が 0 件で返る
       //   → 今までは「割れの商品はありません」と通知し、前回までの Amazon の警告の記録 (state) も消していた。
