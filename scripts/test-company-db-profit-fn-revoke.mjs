@@ -19,7 +19,7 @@ import path from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
 import express from 'express';
 import { applyMigrations, pgliteAdapter, DEFAULT_DIR } from './company-db/migrate.mjs';
-import { HEAVY_ENTRY_MANIFEST, revokeSigs, heavyEntryFindings, heavyCandidates, tempPrivilegeAudit } from './company-db/heavy-entry-manifest.mjs';
+import { HEAVY_ENTRY_MANIFEST, HEAVY_VIEWS, APP_HEAVY_ENTRIES, revokeSigs, heavyEntryFindings, heavyCandidates, tempPrivilegeAudit } from './company-db/heavy-entry-manifest.mjs';
 import companyDbRouter, { __setPgClientFactory } from '../apps/company-db/router.mjs';
 
 let ok = 0, ng = 0;
@@ -117,6 +117,7 @@ await t('TEMP の権限は監査を出すだけ (0056 の前と後で同じ・PU
 });
 
 console.log('重い入口の棚卸し (heavy_entry_manifest と pg_proc の突き合わせ)');
+const inTx = async (sql, fn) => { await pg.exec('begin'); try { await pg.exec(sql); return await fn(); } finally { await pg.exec('rollback'); } };
 await t('規則にかかる関数は全部 manifest にあり、manifest の関数は全部 DB にある (mart.finance_daily_range・ad_efficiency・sku_activity は guard_later)', async () => {
   const cands = await heavyCandidates(db);
   const inManifest = new Set();
@@ -125,8 +126,18 @@ await t('規則にかかる関数は全部 manifest にあり、manifest の関�
   const cls = Object.fromEntries(HEAVY_ENTRY_MANIFEST.map((e) => [e.sig.slice(0, e.sig.indexOf('(')), e.cls]));
   for (const n of ['mart.finance_daily_range', 'mart.ad_efficiency', 'mart.ad_efficiency_coverage', 'mart.sku_activity', 'mart.sku_activity_gaps', 'mart.sales_expanded_to_skus']) assert.equal(cls[n], 'guard_later', n);
   for (const e of HEAVY_ENTRY_MANIFEST) assert.ok(e.reason && e.reason.length > 4, `理由: ${e.sig}`);
+  // 期間の形でない既知の入口 (規則にはかからない) も手で guard_later に (#1601 Codex R1 M1)
+  for (const n of ['core.apply_order_finance_batch', 'core.apply_order_batch', 'core.apply_shipment_batch']) assert.equal(cls[n], 'guard_later', n);
 });
-const inTx = async (sql, fn) => { await pg.exec('begin'); try { await pg.exec(sql); return await fn(); } finally { await pg.exec('rollback'); } };
+await t('view の一覧 = mart / ops の全部の view (重い / 軽いと理由)・権限は 0056 で変えない / アプリの側の重い処理の一覧のファイルがある', async () => {
+  const views = (await q(`select n.nspname || '.' || c.relname as v from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('v', 'm') and n.nspname in ('mart', 'ops') order by 1`)).map((r) => r.v);
+  assert.deepEqual([...HEAVY_VIEWS.map((v) => v.view)].sort(), views);
+  for (const v of ['mart.v_finance_daily', 'mart.v_order_finance_summary', 'mart.v_sales_daily']) assert.equal(HEAVY_VIEWS.find((x) => x.view === v).cls, 'heavy', v);
+  assert.equal((await q(`select has_table_privilege('watcher', 'mart.v_finance_daily', 'select') as x`))[0].x, true);   // view の権限は変えていない (0043 の GRANT のまま)
+  for (const a of APP_HEAVY_ENTRIES) assert.ok(fs.existsSync(new URL(`../${a.file}`, import.meta.url)), a.file);
+  const f = await inTx(`create view mart.v_new_heavy as select 1 as x`, () => heavyEntryFindings(db));
+  assert.equal(f.length, 1, f.join(' / ')); assert.match(f[0], /view の一覧で分けていない view: mart.v_new_heavy/);
+});
 await t('🚨 mart の新しい関数 (包む関数など) は、作った取引で REVOKE しても「分けていない」で落ちる (manifest に足すまで)', async () => {
   const f = await inTx(`create function mart.amazon_profit_month_daily(p date) returns int language sql as $$ select 1 $$;
     revoke execute on function mart.amazon_profit_month_daily(date) from public`, () => heavyEntryFindings(db));

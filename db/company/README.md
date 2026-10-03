@@ -1695,6 +1695,12 @@ Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/c
     `core.relink_shipments`・`core.relink_ad_spend_listings`・`raw.purge_superseded_observations`・`ops.amazon_map_sales_coverage` / `unmapped_recent` (理由は manifest)。
     🚨 **これらは今も DB に直接つなげば呼べる** (「repo の中から呼んでいない」は直呼びを防いだ証明ではない)
   - `light` = 規則にかかるが重くない (定数・policy の表だけ・DDL の補助・coverage の 1 行など)。権限は変えない
+  - 期間の形でない既知の入口も手で `guard_later` に足した = `core.apply_order_finance_batch` (POST /order-finance の chunk)・`core.apply_order_batch` (POST /orders)・`core.apply_shipment_batch` (POST /shipments) (jsonb の大きさに SQL の上限は無い)
+- 🚨 **保証の範囲** (#1601 Codex R1 M1) = 「Company DB の全部の重い入口」**ではない**。機械で漏れを止めるのは 3 つだけ:
+  (a) 関数 = 下の見つける規則 (期間の集計の関数・mart の関数・D-60 の関数に依る関数) + 手で足した既知の入口 /
+  (b) view = **mart / ops の全部の view** (`HEAVY_VIEWS` に heavy / light と理由・pg_class と突き合わせる。heavy = `mart.v_finance_daily`・`v_finance_account_fees_monthly`・`v_order_finance_summary`・`v_order_finance_uncovered`・`v_sales_daily`・`v_shipments_daily`・`v_shipments_unlinked`・`v_ad_spend_daily`・`v_cross_mall_diff`。権限は変えない) /
+  (c) アプリの側の重い処理 (`APP_HEAVY_ENTRIES` = POST /order-finance の chunk・coverage の complete の計算・バックアップ・見張り・夜間ロード。ファイルがあることだけ試験)。
+  規則にかからない関数 (jsonb の batch を受ける ops の SECURITY DEFINER など) は、重くても機械では見つけない = 足すときは手で。D-60 の共通の lock に参加させる相手の正本は後の PR (PR 4) で、この 3 つの一覧から始める
 - **見つける規則** (試験と `--verify` が pg_proc と突き合わせる): core / mart / ops / raw / snapshots / events の関数 (trigger を除く) で、① schema が mart ② 入力の引数が期間・件数・保持の形
   (名前 `p_from` / `p_to` / `p_since` / `p_after` / `p_upto` × 日付・時刻の型、`p_days` / `p_limit` / `p_keep_days` × 整数、`p_dates` × date[]) ③ 本体が revoke の関数を名前で呼ぶ、のどれか
   = manifest に無ければ「分けていない」で落ちる。revoke の関数にあとから GRANT しても・guard_later / light の PUBLIC の可否が manifest と違っても落ちる。
@@ -1709,16 +1715,19 @@ Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/c
   `grant execute on function <署名> to current_user` → `create or replace` → 0056 と同じに全員から外す (`revoke … from public` / `from current_user`) → 権限の表が空を確かめる。
 - 🚨 **約束 2 (これから作る関数)**: 関数の既定は PUBLIC EXECUTE。`alter default privileges … in schema mart revoke … from public` は **効かない** (schema ごとの既定は全体の既定に足すだけ・実機で確かめた)。
   → 重い入口の規則にかかる関数は **作った取引で署名ごとに REVOKE** (閉じるなら) し、manifest に分け方と理由を足す (足さないと試験が落ちる)。
-- 🚨 `create-watch-roles.mjs` は SECURITY DEFINER の関数の全部に **持ち主の EXECUTE を付け直す** (`grant execute … to <owner>`)。今の revoke の関数は SECURITY INVOKER なので当たらないが、
-  revoke の関数を SECURITY DEFINER にするとき (後の PR) はスクリプトから外す (流し直すと封鎖が外れる)。
+- 🚨 `create-watch-roles.mjs` は SECURITY DEFINER の関数の全部に **持ち主の EXECUTE を付け直す** (`grant execute … to <owner>`)。今の revoke の関数は SECURITY INVOKER なので当たらない (PR 1a の今の形では問題なし)。
+  **後の PR で D-60 の関数を SECURITY DEFINER にするときは、① スクリプトの対象から D-60 の関数を外す処理 ② 流し直しても revoke の関数の権限の表が空のままの回帰の試験 の 2 つが必須** (#1601 Codex R1 Low。
+  コメントだけでは防げない: 持ち主が runtime のままなら封鎖が開き、専用の持ち主に移した後ならスクリプト全体が権限の誤りで巻き戻る)。
 
 本番の確かめ (読むだけ・カタログの SELECT だけで重い関数は呼ばない): `node -r dotenv/config scripts/company-db/heavy-entry-manifest.mjs --verify` (問題があれば exit 1・TEMP の監査も出す)。
 
-試験 = `node scripts/test-company-db-profit-fn-revoke.mjs` (PGlite・13 件: 0055 までの姿で watcher・profit_reader・PUBLIC が呼べる前提 / 0056 の後は revoke の 10 の権限の表が空・3 つの役割は 42501 /
-guard_later・light の権限の表は前と 1 文字も同じ / 2 回流しても同じ / TEMP の監査は前と同じ / 棚卸しの突き合わせと漏れ止め 3 つ / 受け口は 503 で DB に接続しない) +
-`scripts/test-company-db-profit-fn-revoke-pg.mjs` (本物の PG・`TEST_PG_URL` が無ければ飛ばす・11 件: 持ち主 = superuser でない CREATEROLE の login の役割で全部の migration を流す /
+試験 = `node scripts/test-company-db-profit-fn-revoke.mjs` (PGlite・14 件: 0055 までの姿で watcher・profit_reader・PUBLIC が呼べる前提 / 0056 の後は revoke の 10 の権限の表が空・3 つの役割は 42501 /
+guard_later・light の権限の表は前と 1 文字も同じ / 2 回流しても同じ / TEMP の監査は前と同じ / 棚卸しの突き合わせ (関数・view・アプリ) と漏れ止め 4 つ / 受け口は 503 で DB に接続しない) +
+`scripts/test-company-db-profit-fn-revoke-pg.mjs` (本物の PG・11 件。**試験が自分で使い捨てのクラスタを起動して最後に消す** = 外の PostgreSQL にはつながない・watcher / profit_reader が既にあれば止まる・
+embedded-postgres が見つからなければ **失敗 (飛ばさない)**。embedded-postgres は依存に入れていない (OS ごとの本体が大きい・Render の npm ci に載せない) = リポジトリ → 環境変数 `EMBEDDED_PG_DIR` → `C:/tmp/pg-embed` の順に探す。
+どちらも `npm run test:company-db` に入っている = この試験が通らない PC では test:company-db が赤になる。**マージの前に必ず流す**: 持ち主 = superuser でない CREATEROLE の login の役割で全部の migration を流す /
 持ち主・watcher・profit_reader・PUBLIC だけの役割の全部が 42501 / guard_later・light と持ち主と TEMP は変わらない / coverage の complete の道と `finance_daily_range` は今までどおり /
-SECURITY DEFINER の中からも 42501 / create or replace の約束 / 2 回流しても同じ / `--verify` が前 ❌・後 ✅ / 持ち主でない役割で流すと止まる)。この PC では使い捨ての PG (embedded-postgres) で流す。
+SECURITY DEFINER の中からも 42501 / create or replace の約束 / 2 回流しても同じ / `--verify` が前 ❌・後 ✅ / 持ち主でない役割で流すと止まる)。
 
 **マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に miniPC で dry-run → 本適用)**。0056 は権限だけ (表・関数の中身は変えない・利益の値は計算しない)。
 Render のコードは変わらない (受け口は 503 のまま) = Render の deploy と順番は無い。
