@@ -11,7 +11,7 @@ db.exec(`
 CREATE TABLE mirror_products (商品コード TEXT, 商品名 TEXT, 標準売価 REAL, 仕入先コード TEXT, 取扱区分 TEXT);
 CREATE TABLE mirror_set_components (セット商品コード TEXT, 構成商品コード TEXT, 数量 INTEGER);
 CREATE TABLE mirror_sku_resolved (seller_sku TEXT, ne_code TEXT, quantity INTEGER);
-CREATE TABLE mirror_amazon_finance_sku_daily (date_jst TEXT, seller_sku TEXT, asin_norm TEXT, product_name TEXT, units_net_sold REAL, sales_principal_jpy REAL, fba_fulfillment_jpy REAL, fba_storage_jpy REAL);
+CREATE TABLE mirror_amazon_finance_sku_daily (date_jst TEXT, seller_sku TEXT, asin_norm TEXT, product_name TEXT, units_net_sold REAL, sales_principal_jpy REAL, sales_shipping_jpy REAL, sales_giftwrap_jpy REAL, sales_tax_jpy REAL, fba_fulfillment_jpy REAL, fba_storage_jpy REAL);
 CREATE TABLE mirror_rakuten_finance_sku_daily (date_jst TEXT, rakuten_code TEXT, ne_code TEXT, product_name TEXT, units_net_sold REAL, gross_sales_jpy_incl REAL);
 CREATE TABLE mirror_yahoo_finance_sku_daily (date_jst TEXT, yahoo_sku_key TEXT, ne_code TEXT, product_name TEXT, units_net_sold REAL, gross_sales_jpy_incl REAL);
 CREATE TABLE mirror_aupay_finance_sku_daily (date_jst TEXT, aupay_sku_key TEXT, ne_code TEXT, product_name TEXT, units_net_sold REAL, gross_sales_jpy_incl REAL);

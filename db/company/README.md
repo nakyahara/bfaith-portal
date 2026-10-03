@@ -719,6 +719,13 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
     - importing が残っている: 鍵が生きている = 動いている (何もしない) / 鍵が無い = mark-unknown → どの結末でも読み直して報告して**終わる** (この起動では取込に進まない・ロジザードに入らない)。
     - 前の夜の毎晩の回が未確かめ (imported_unverified) = **その夜は確かめのやり直しだけ** (L-25・記録 = `DATA_DIR/lz-import/runs/<実行 ID>/`)。止まった状態の知らせが知らせ済みになるまでは確かめない (知らせが届かないまま verified になって故障が隠れない)。
     - 同じ対象の日がもう始まった (`nightly_last`) = 何もしない。対象 = 前の日の lz-daily (合格・ポータルに送れた) → ポータルの成果物の識別と同じか → `nightly-readiness` (副作用なし) → 済みの印 → 取込 (エンジン・商品とバーコードの両方を比べる = L-24)。
+      - **見張りの商品 (K4)**: 毎晩の CSV はほぼ全商品 = 書き出しの最後の商品 (商品ID の順の最後・2026-10-03 = `zuko5`) が毎晩入り、「比べる商品が最後の商品 = 確かめられない (本物の書き出しは行の間に改行・末尾に改行なし = 最後の商品の 2 本目以降の行の切れ目 (改行の前) で切れても分からない)」に当たる (10/3 00:20 の本番の最初の夜は押す前に止まった・`lzim_night_20261002T152040_dbcb19`)。
+        ロジザードにだけ見張りの商品 `LZ_SENTINEL_ID` (`apps/master-decisions/lz-import-verify.mjs` の 1 か所 = `zzzzzzzzzz`・バーコード 1 本・Company DB / NE には登録しない) を置き、毎晩 (`POLICIES.nightly.sentinel`) は直前・直後の商品マスタとバーコードの書き出しの**最後の行が見張り**・見張りは取り込む CSV に無い、を確かめる (直前 = 押さない / 直後・確かめのやり直し = verify_failed)。試験 (`POLICIES.test`) は見張りを使わない (最後の商品を試験から外す = 今までどおり)。
+        見張りの商品が無い夜 = 「見張りの商品 … がロジザードの書き出しに無い (見張りの商品の登録が要る)」で押さない (ロジザードに書かない・状態は動かない)。
+        見張りの商品の条件: 商品ID = `zzzzzzzzzz`・削除フラグ 0・バーコード 1 本 (今あるどれとも重ならない英数字だけ・8 桁 / 13 桁の数字にしない・JAN / FNSKU (X00…) に似せない。**必ず `LZGUARD0001`** = コードがこの値 1 本だけを求める。違う値・2 本以上は毎晩押さない。入荷検品のバーコードマスタには fnsku として入るが、mirror_products に無いので検索・表示の対象外。Company DB の JAN のロード (barcode_type = jan だけ) の対象外)・商品名は Shift_JIS で戻せる文字だけ (案「【システム用・触らない】取込の見張り」)・在庫 0 (入荷・出荷しない)・NE / Company DB には登録しない・登録や直しは JST 00:00〜01:30 を避ける。
+        ほかの仕組み (lz-daily の比べ・lz-shadow・見張り W4 / W13・入荷検品・在庫の写し・Stream Deck の ①②) は、今の「ロジザードにだけある商品」と同じく黙って対象外 (除外の手当ては要らない)。
+        毎晩の確かめ (押す前 = 押さない / 押した後・確かめのやり直し = verify_failed): 最後の行が見張り・商品マスタとバーコードの商品ID のかたまりが **CP932 のバイト順で厳密に増えていく** (本物の 10/3 の書き出しで確かめた順。同じ ID の 2 つ目のかたまりも崩れ)・見張りのバーコードが `LZ_SENTINEL_BARCODE` (`LZGUARD0001`・ID と同じ 1 か所) の 1 本だけでほかの商品と重ならない・見張りは取り込む CSV に無い。
+        **残るリスク**: ロジザードの商品ID の長さの上限・使える文字・書き出しの並び順の**正式な記述が無い** (リポジトリにも AI_reference にも無い。見張りが最後に来るのは本物の書き出しで確かめたバイト順と、今の ID の文字 (`+ - . 0-9 A-Z _ a-z`・最長 29 文字) からの推定)。`zzzzzzzzzz` で始まるもっと長い ID・`z` より後ろのバイトの文字で始まる ID が登録された・並び順が変わった、は崩れが書き出しに見えれば止まる (安全側) が、「並びの前提が崩れた」と「見張りの直後で切れた」が同じ回に重なると崩れが見えない。そのとき比べる商品が隠れれば precheck (直前) と商品マスタの確かめ (直後) が「無い」で止めるが、比べる商品でない商品の変化は見えない。
   - ping `lz-daily-import` の ok = その夜の取込 (か確かめのやり直し) が verified **かつ** 前後どの回にも未送・知らせ済みにできない止まった状態が無いときだけ。on を見た後の途中の失敗の fail も `lz-daily-import` へ。ほか = ping しない (dead-man が拾う)・途中の例外 = fail。台帳への登録は切替の PR。
   - 本物のロジザードの包みは試験・毎晩・影で共用 (`scripts/logizard-import/lz-real-session.mjs`・1 つの鍵とページの中で 商品 → バーコード → プレビュー → 実行 → 商品 → バーコード・影は押す部品を渡さない)。
   - 確かめのやり直し (試験も毎晩も): 鍵を取ってから記録を読む (無い = evidence_missing・壊れた = evidence_broken・違う回 = evidence_mismatch = どれも verify_failed = 人が見る)・鍵を 30 秒ごとに延ばす・書き出しの前ごと・結果を書く前に締め切り (試験 = 次の 00:00 の前・毎晩 = 00:55) を見る (過ぎた・鍵を失った = 未確かめのまま)。取込の後の直後の書き出しと確かめの結果も同じ。
@@ -1678,6 +1685,80 @@ Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/c
 ```
 
 試験 = `node scripts/test-company-db-amazon-profit.mjs` (32 件: 材料は 1 回だけ計算 (関数の本体を数えて固定) / 受け取り時の出品を集合で比べる (財務・広告) / relink の後は印が付かない (わかる範囲の印の限界を固定) / coverage の関数の世代と版 (合計は source を含めて 1 つのときだけ) / coverage が null なら正式な値は全部 null / 差し替えた後の手で計算した値 (税込・税抜・値引きの税・広告 × 1.1・返品の推定・負の手数料・override_zero と原価不明) / 構成 0 件・候補 2 件・出品なし / 広告の状態 (legacy・missing・not_collected) / 分けられない部品の相殺・旧い形の行・単価の無い返品 / 同じ日に 2 回変わった原価・観測と推定 / hash が JS と一致 / ASIN は未解決・別名は結ぶ・未解決は出品の行だけ止める / Easy Ship (割合・等分・端数・返金・期間に依らない・配れない額・負の重み (0 にする)・全部が非正 (等分)・保存則) / master_notes (受け取りとの違い・監査の記録・タイトルは数えない) / 理由の順と列ごとの null (3 つの coverage で全行) / 日の合計 (列の組ごとの条件・税の表・保存則・row_kind が重ならない・取引の無い日) / 契約 / HTTP (10/1 から 503 `PROFIT_ROUTE_DISABLED`・DB に接続しない (pg の client を作らない)・鍵が無ければ 401))
+
+### 重い関数の権限と重い入口の棚卸し (0056・D-60 の緊急の封鎖 = PR 1a。Codex R-D60-v3-4 H2 / R-D60-v3-5)
+
+🚨 **0056 から、D-60 の重い関数 10 個は誰も直接呼べない** (持ち主・watcher・profit_reader・PUBLIC のどれでも `permission denied for function` = 42501)。
+受け口の 503 (#1570) は HTTP だけの封じ込めで、DB に直接つなげば (持ち主の `COMPANY_DB_URL`・watcher・PUBLIC) 呼べた = 10/1 の停止をもう一度起こせた。受け口は 503 のまま (この PR で 1 文字も変えない)。
+上の「受け入れの条件」「読むだけの確かめ」の SQL も **本番では 42501 で止まる** (流さない)。校正は使い捨ての同じ条件の DB で (§3.10)。
+
+- **重い入口の棚卸し = `scripts/company-db/heavy-entry-manifest.mjs` (`HEAVY_ENTRY_MANIFEST`)**。署名つきの固定の一覧で、0056 の migration とは別に持つ。分け方:
+  - `revoke` (10) = 0056 で権限の表 (`proacl`) を **空** にした = `mart.amazon_profit_daily_range`・`mart.amazon_profit_day_totals_range`・`mart._amazon_profit_totals`・`mart._amazon_profit_rows`・
+    `mart._amazon_profit_finance_days`・`mart._amazon_profit_ad_days`・`mart._amazon_profit_ad_children`・`mart._amazon_easy_ship_alloc`・`mart.amazon_profit_assert_args`・`mart.finance_daily_sku_range`
+    (0047 / 0050 の watcher の GRANT も外した)。PUBLIC・watcher・profit_reader (あれば)・持ち主・表に載っていた全部の役割から外し、最後に空を確かめる (違えば例外 = 取引ごと巻き戻す。持ち主でない役割で流すと `d60_revoke_incomplete`)
+  - `guard_later` = 重いが正当な呼び手がいる (か、外すかを人が決める) = **権限は変えない** (後の PR で共通の lock `company_db_heavy` に参加させるか外す)。
+    `mart.finance_daily_range` (受け口 `GET /order-finance/daily`・watcher にも明示の GRANT)・`mart.ad_efficiency` / `_coverage`・`mart.sku_activity` / `_gaps`・`mart.sales_expanded_to_skus`・`mart.listings_to_skus` (人・AI が読む)・
+    `mart.sales_daily_check` / `refresh_sales_daily` / `build_sales_daily_dates` / `purge_sales_daily` (受け口)・`core.relink_shipments_bulk` / `reresolve_order_lines` / `merge_duplicate_suppliers` (一時の表 = TEMP)・
+    `core.relink_shipments`・`core.relink_ad_spend_listings`・`raw.purge_superseded_observations`・`ops.amazon_map_sales_coverage` / `unmapped_recent` (理由は manifest)。
+    🚨 **これらは今も DB に直接つなげば呼べる** (「repo の中から呼んでいない」は直呼びを防いだ証明ではない)
+  - `light` = 規則にかかるが重くない (定数・policy の表だけ・DDL の補助・coverage の 1 行など)。権限は変えない
+  - 期間の形でない既知の入口も手で `guard_later` に足した = `core.apply_order_finance_batch` (POST /order-finance の chunk)・`core.apply_order_batch` (POST /orders)・`core.apply_shipment_batch` (POST /shipments) (jsonb の大きさに SQL の上限は無い)
+- 🚨 **保証の範囲** (#1601 Codex R1 M1) = 「Company DB の全部の重い入口」**ではない**。機械で漏れを止めるのは 3 つだけ:
+  (a) 関数 = 下の見つける規則 (期間の集計の関数・mart の関数・D-60 の関数に依る関数) + 手で足した既知の入口 /
+  (b) view = **mart / ops の全部の view** (`HEAVY_VIEWS` に heavy / light と理由・pg_class と突き合わせる。heavy = `mart.v_finance_daily`・`v_finance_account_fees_monthly`・`v_order_finance_summary`・`v_order_finance_uncovered`・`v_sales_daily`・`v_shipments_daily`・`v_shipments_unlinked`・`v_ad_spend_daily`・`v_cross_mall_diff`。権限は変えない) /
+  (c) アプリの側の重い処理 (`APP_HEAVY_ENTRIES` = POST /order-finance の chunk・coverage の complete の計算・バックアップ・見張り・夜間ロード。ファイルがあることだけ試験)。
+  規則にかからない関数 (jsonb の batch を受ける ops の SECURITY DEFINER など) は、重くても機械では見つけない = 足すときは手で。D-60 の共通の lock に参加させる相手の正本は後の PR (PR 4) で、この 3 つの一覧から始める
+- **見つける規則** (試験と `--verify` が pg_proc と突き合わせる): core / mart / ops / raw / snapshots / events の関数 (trigger を除く) で、① schema が mart ② 入力の引数が期間・件数・保持の形
+  (名前 `p_from` / `p_to` / `p_since` / `p_after` / `p_upto` × 日付・時刻の型、`p_days` / `p_limit` / `p_keep_days` × 整数、`p_dates` × date[]) ③ 本体が revoke の関数を名前で呼ぶ、のどれか
+  = manifest に無ければ「分けていない」で落ちる。revoke の関数にあとから GRANT しても・guard_later / light の PUBLIC の可否が manifest と違っても落ちる。
+- **呼び手の調べ (10/3)** = アプリ (router・ingest・watch・miniPC の送り手・measure-amazon-finance) で revoke の関数を呼ぶ所は無い。revoke の関数を呼ぶ関数は revoke の関数だけ・SECURITY DEFINER の呼び手も無い。
+  coverage の complete の道 (財務の chunk → updating → complete → `finance_coverage_state`) は revoke の関数を使わない (本物の PG の試験で通す)。
+- **持ち主自身から外しても効く** (PostgreSQL 18.4 で確かめた)。ただし持ち主は **付け直せる** (持ち主は常に GRANT の権限を持つ) = この封鎖は「うっかり・ほかの接続から呼べない」まで。
+  SECURITY DEFINER の関数 (定義者 = 持ち主) の中から呼んでも 42501 = 抜け道にならない。superuser は権限を見ない (PGlite の試験の接続は superuser = ほかの試験は今までどおり呼べる)。
+- **PR 1a でしないこと** (PR 1b = 別の管理主体が要る): 役割 (`profit_definer`・migration の deployer) を作らない・持ち主を移さない・全体の既定の権限を変えない・**TEMP の権限を外さない**
+  (持ち主の relink・reresolve_order_lines・merge_duplicate_suppliers が一時の表を使う)。TEMP は `--verify` が **監査の結果を出すだけ** (PUBLIC・役割ごとの TEMP・一時の表を作る関数)。
+  PG 16 以降、CREATEROLE の役割が作った役割には ADMIN だけが付き SET が無い = `alter function … owner to` は `must be able to SET ROLE` で止まる (実機で確かめた)。
+- 🚨 **約束 1 (revoke の関数を直す)**: 持ち主にも EXECUTE が無いので、`create or replace` は関数の検査 (validator) が 42501 で止まる。直す migration は **同じ取引で**
+  `grant execute on function <署名> to current_user` → `create or replace` → 0056 と同じに全員から外す (`revoke … from public` / `from current_user`) → 権限の表が空を確かめる。
+- 🚨 **約束 2 (これから作る関数)**: 関数の既定は PUBLIC EXECUTE。`alter default privileges … in schema mart revoke … from public` は **効かない** (schema ごとの既定は全体の既定に足すだけ・実機で確かめた)。
+  → 重い入口の規則にかかる関数は **作った取引で署名ごとに REVOKE** (閉じるなら) し、manifest に分け方と理由を足す (足さないと試験が落ちる)。
+- 🚨 `create-watch-roles.mjs` は SECURITY DEFINER の関数の全部に **持ち主の EXECUTE を付け直す** (`grant execute … to <owner>`)。今の revoke の関数は SECURITY INVOKER なので当たらない (PR 1a の今の形では問題なし)。
+  **後の PR で D-60 の関数を SECURITY DEFINER にするときは、① スクリプトの対象から D-60 の関数を外す処理 ② 流し直しても revoke の関数の権限の表が空のままの回帰の試験 の 2 つが必須** (#1601 Codex R1 Low。
+  コメントだけでは防げない: 持ち主が runtime のままなら封鎖が開き、専用の持ち主に移した後ならスクリプト全体が権限の誤りで巻き戻る)。
+
+本番の確かめ (読むだけ・カタログの SELECT だけで重い関数は呼ばない): `node -r dotenv/config scripts/company-db/heavy-entry-manifest.mjs --verify` (問題があれば exit 1・TEMP の監査も出す)。
+
+試験 = `node scripts/test-company-db-profit-fn-revoke.mjs` (PGlite・14 件: 0055 までの姿で watcher・profit_reader・PUBLIC が呼べる前提 / 0056 の後は revoke の 10 の権限の表が空・3 つの役割は 42501 /
+guard_later・light の権限の表は前と 1 文字も同じ / 2 回流しても同じ / TEMP の監査は前と同じ / 棚卸しの突き合わせ (関数・view・アプリ) と漏れ止め 4 つ / 受け口は 503 で DB に接続しない) +
+`scripts/test-company-db-profit-fn-revoke-pg.mjs` (本物の PG・11 件。**試験が自分で使い捨てのクラスタを起動して最後に必ず止めて消す** = 外の PostgreSQL にはつながない・watcher / profit_reader が既にあれば止まる・
+`persistent: false` + 起動の後の全部 (役割・DB・接続の準備・試験) を外側の try/finally で覆う = どこで落ちてもクラスタを消す・フォルダが残れば失敗。
+**embedded-postgres は devDependencies に正確な版 (`18.4.0-beta.17`) で入っている** (lockfile で固定・#1601 Codex R2 M) = clean な checkout + `npm ci` だけで流れる。
+Render の Dockerfile は `npm ci --production` = dev の依存は入らない (容量・起動は変わらない)。miniPC の本適用の手順も `npm ci --omit=dev` でよい (migrate.mjs と --verify は `pg`・`dotenv` = 本番の依存だけ)。
+外の置き場 (環境変数 `EMBEDDED_PG_DIR` → `C:/tmp/pg-embed`) は **版が同じときだけ** 使う (node_modules を別の作業の木へのジャンクションにした worktree で npm ci をし直さずに流すため。違う版は使わない = 同じコミットで同じ版)。
+見つからない・版が違う・起動できない = **失敗 (飛ばさない)**。
+🚨 終わりは `process.exit` を明示: embedded-postgres が入れる async-exit-hook が beforeExit で `process.exit(0)` を呼び `process.exitCode = 1` を上書きする (失敗しても exit 0 になっていた・10/3 に見つけた)。
+どちらも `npm run test:company-db` に入っている (飛ばさない)。**マージの前に必ず流す**: 持ち主 = superuser でない CREATEROLE の login の役割で全部の migration を流す /
+持ち主・watcher・profit_reader・PUBLIC だけの役割の全部が 42501 / guard_later・light と持ち主と TEMP は変わらない / coverage の complete の道と `finance_daily_range` は今までどおり /
+SECURITY DEFINER の中からも 42501 / create or replace の約束 / 2 回流しても同じ / `--verify` が前 ❌・後 ✅ / 持ち主でない役割で流すと止まる)。
+
+**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に miniPC で dry-run → 本適用)**。0056 は権限だけ (表・関数の中身は変えない・利益の値は計算しない)。
+Render のコードは変わらない (受け口は 503 のまま) = Render の deploy と順番は無い。
+
+```
+# 本番で使っていない worktree から (miniPC の PowerShell 5.1。.env は本体の 1 つを読む)
+cd C:\Users\bfaith\bfaith-portal
+git fetch origin
+git worktree add C:\tmp\d60-revoke origin/master
+cd C:\tmp\d60-revoke
+npm ci --omit=dev                                                                # 本適用には dev の依存 (embedded-postgres・PGlite・playwright) は要らない
+$env:DOTENV_CONFIG_PATH = 'C:\Users\bfaith\bfaith-portal\.env'
+node -r dotenv/config scripts\company-db\heavy-entry-manifest.mjs --verify      # 前: ❌ (revoke の関数を watcher・PUBLIC・持ち主が呼べる) が出ること。TEMP の監査を控える
+node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                  # 0056 だけが出ること
+node -r dotenv/config scripts\company-db\migrate.mjs                            # 0056 (applied=1)
+node -r dotenv/config scripts\company-db\heavy-entry-manifest.mjs --verify      # 後: ✅
+cd C:\Users\bfaith\bfaith-portal
+git worktree remove C:\tmp\d60-revoke
+```
 
 ## 発注の受け皿 (0014。08 §5。D6)
 
