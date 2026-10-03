@@ -1794,8 +1794,24 @@ Codex R-D60-v3-7 = 「`relink_shipments_bulk` と `merge_duplicate_suppliers` �
   `MERGE` は BEFORE INSERT の trigger を本当に足す行だけに発火する (`INSERT … ON CONFLICT` は直す行にも BEFORE INSERT を発火する = version の通し番号を余計に進める → 使わない)。
   文の順番は 0027 と同じ (仕入先を補う → 仕入先ごとの商品 → 発注・外部 ID → 文書の紐付け → 寄せた仕入先を消す → コードを揃える → 二重が残れば raise)。上限 = 仕入先 ≦ 5,000 (超えたら 54000・何も変えない。本番は約 40〜80 行)
   - `MERGE` の足すとき、文の snapshot の後に別の取引が同じ (残す行, 商品) / (文書, 残す行) を足して commit していたら 23505 になる (R2 Medium) → **その文だけ例外の塊 (subtransaction) で巻き戻し、新しい snapshot でやり直す** (3 回まで。ほかの 23505 は 3 回目で同じ誤りを返す)。
-    仕入先ごとの商品は、別の取引が残す仕入先に行を足すと FK の検査 (残す仕入先の KEY SHARE) が merge の最初の文 (残す仕入先を直す) の lock とぶつかって merge の commit まで待つ = 窓は開かない (試験で確かめた・やり直しは保険)。
-    文書の紐付けは仕入先への FK が無い = 窓が開く → やり直しで吸収する (試験で固定)
+    文書の紐付けは仕入先への FK が無い = 窓が開く → やり直しで吸収する (試験で固定 = 違い ④)。
+  - 🚨 **仕入先ごとの商品は今の表では窓が開かない** (Codex R3 Medium に試験で答えた)。別の取引が残す仕入先に行を足すと、FK の検査 (残す仕入先の行を `FOR KEY SHARE`) が
+    merge の最初の文 (残す仕入先を直す UPDATE) の行の lock とぶつかって merge の commit まで待つ。その UPDATE は鍵の列を変えないが **`FOR NO KEY UPDATE` ではなく鍵の lock (`FOR UPDATE` 相当)** になる:
+    core.suppliers に BEFORE UPDATE の行 trigger (`trg_suppliers_touch`・`trg_suppliers_version`・`trg_suppliers_lifecycle`) があり、一意の鍵 `(company_id, code_norm)` の `code_norm` が生成列 (stored)
+    = PostgreSQL は trigger が何を変えるか分からないので生成列を全部「変える列」に数え、鍵を変える UPDATE として trigger の前に行を lock する (0027 も同じ文で同じ lock)。
+    Codex R3 の前提 (「鍵の列を変えない UPDATE = FOR NO KEY UPDATE 相当 = KEY SHARE と両立」) はふつうの表の話で、この表では成り立たない。試験で固定したこと:
+    (a) 前提 = 試験の DB で `update core.suppliers set name = name` (merge の最初の文と同じく鍵でない列だけ・値も同じ) を持つと、残す仕入先への商品の行の INSERT は待つ。
+    `select … for no key update` なら待たない。BEFORE UPDATE の trigger を外すと同じ UPDATE でも待たない (= 理由は trigger + 生成列。崩れたら試験が落ちる = 見直す)
+    (b) Codex R3 の競合 (barrier つき) = ① B が寄せる行の商品の行を (値を変えずに) 更新して lock を持つ ② A が merge を始め、商品の行の文で B を待つ ③ B が残す行に同じ SKU を足す
+    → B は A を待つ (FK) = deadlock・毎回 1 本だけ 40P01 (小さい fixture と決まった fixture で 3 回ずつ)・負けた側ごとの最後の表・A が待つ lock が旧と新で同じ。
+    前の版の README・0057 の「最初の文の lock で待つ」は結果は合っていたが、理由 (なぜ KEY SHARE とぶつかるか) と試験 (merge が全部終わってから足す = 一意の検査で待つだけ) が足りなかった
+  - 🚨 **違い ⑤ (潜在)**: 上の前提が崩れたとき (trigger を外す・PostgreSQL の版で lock の決め方が変わる) だけ仕入先ごとの商品にも ④ と同じ窓が開き、やり直しで吸収する。
+    そのとき **巻き戻した MERGE が使った version の通し番号 (`core.master_version_seq`) は戻らない** (sequence は巻き戻しで戻らない。直す 1・足す 2 = 既定値と BEFORE INSERT) = 0027 より余計に進む。
+    試験の DB で BEFORE UPDATE の trigger を外して固定: 相手の値が違う = 旧は相手の値を寄せる行の値で上書き・新は相手の行を残す行としてまとめる / 監査は 1 行の変更ごとに 1 回 (巻き戻した分は出ない = 二重にならない) /
+    直した行の version は 1 つ (新は旧 +2) / 通し番号の最後は新が +2 (小さい fixture)・+17 (決まった fixture の実測。失敗した MERGE がそれまでに直す / 足した行の数と順しだい = 試験は 2 以上を固定)。相手の値が同じ = 表・監査・各行の version は旧と同じで、通し番号の最後だけ +2。
+    **許す** (推し): version は「読んだ時と同じか」(違えば 409) だけに使う = 番号の飛びは害が無い (sequence はもともと巻き戻し・失敗した取引で飛ぶ)。
+    23505 を起こさない形にしない理由 = MERGE の ON は文の snapshot で残す行を見る (後から commit された行は見えない = ON では吸収できない)。待っている相手が足す行を先に止める lock
+    (残す仕入先を明示の `FOR UPDATE` など) は、前提が崩れた DB で 0027 が通る同じ競合を deadlock (片方の取引が 40P01) に変える = 番号の飛びより悪い。今の表ではその lock は既にある (上の前提)
   - 監査 (AFTER の行 trigger) は文の終わりに発火する。0027 は消す・直す・足すが別の文 = 監査の並びは 消す…直す…足す。この形は 消す… の後、直すと足すが `MERGE` の行の順に混ざりうる
     (今の計画 = Hash Right Join は 直す行が先・足す行が後 = 0027 と同じ並び。計画しだいなので試験は同じ対象の UPDATE / INSERT が続く所だけ並べ替えて比べる。1 行の変更の中の並び = 列の名前の順は同じ)
   - 計画 (R2 の後に見直した): 2 つの文とも 設定あり / なしで同じ計画 (消す = hash join・まとめる = 並べ替え + 窓 + GroupAggregate・`MERGE` = Hash Right Join)。
@@ -1805,7 +1821,7 @@ Codex R-D60-v3-7 = 「`relink_shipments_bulk` と `merge_duplicate_suppliers` �
   core.supplier_skus (version・監査・touch・`guard_master_edit_write`・`guard_reg_csv_live`・`guard_primary_supplier_registered`・FK) / docs.document_links (FK) / core.purchase_orders (touch・発行の guard 3 つ・FK) /
   core.external_ids (writer・JAN の guard 3 つ・JAN の監査と version・FK)。結合があるのは `ops.guard_master_edit_write` (商品の親の輪) と `ops.guard_reg_csv_live` (SKU 数個) だけ =
   どちらも画面のロール master_edit のときだけ (ほかの呼び手は最初の行で返る)。ほかは 1 つの表を引くか早く返すだけ = 設定で計画は変わらない。**一覧は試験で固定** (増えたら試験が落ちる = 見直す)
-- 🚨 **旧と違うのは同時に動くときの 4 つだけ** (試験で固定): relink ① lock の文の後に commit されて (p_after, 最後の番号] に入った未結合の伝票も結ぶ (0017 は結ばずに cursor を越える = 次の先頭からの走査
+- 🚨 **旧と違うのは同時に動くときの 4 つ + 潜在の 1 つ (⑤ = 上の節・今の表では起きない) だけ** (試験で固定): relink ① lock の文の後に commit されて (p_after, 最後の番号] に入った未結合の伝票も結ぶ (0017 は結ばずに cursor を越える = 次の先頭からの走査
   (`relink_rescan`) まで残る。linked に入り examined には入らない) ② 店舗 (ne_shops) は結ぶ文の版を使う (0017 は lock の文の版を一時の表に写していた) /
   merge ③ 消した行そのもの (lock を待った後の最新の版) の値でまとめる = 寄せる行を別の取引が直して commit した直後でも、直した後の値を残す行に移す (0027 は直す前の値で上書きすることがあった)
   ④ 文書の紐付けの文の snapshot の後に別の取引が残す行に同じ文書の紐付けを足して commit → やり直し = 相手の行を残す行としてまとめる (0027 は相手の役割を寄せる行の値で上書きした)。
@@ -1831,7 +1847,8 @@ backend の private のピークの増え分 (MB)。列 = 版 (呼び手の work
 
 - **新は 12 通りとも +27 MB 以下**。最大の幅で文字を 10 倍 (2,000 → 20,000) にしても +12 → +17 MB (旧と R2 は +54 → +400 MB = まとまりの値を全部配列にする `array_agg` の分だけ比例して増えた = R2 High はこれ)。
   件数 (×20)・文字の長さ (×10〜60)・呼び手の work_mem (4MB / 32MB) に比例して増えない。**残るもの** = 1 行の値の大きさ (窓・集約・MERGE が 1 行ずつ持つ) と、AFTER の行 trigger の待ち行列
-  (変えた行の数に比例・1 行 数十バイト。0027 も文ごとに同じ) = 「件数・文字の長さに依らず一定」ではない (測った範囲で +27 MB 以下)
+  (変えた行の数に比例・1 行 数十バイト。0027 も文ごとに同じ) = 「件数・文字の長さに依らず一定」ではない (測った範囲で +27 MB 以下)。
+  🚨 **+17 MB・+27 MB は実測で、形式の上限ではない** (Codex R3): work_mem = 4MB は演算の節ごとの枠 = MERGE の hash・窓の並べ替え・trigger が同時にそれぞれ使う
 - 一時のファイル (MB): relink 短 = 旧 11 / R2 26 / 新 13・relink 長 = 288 / 616 / 294・merge 小 = 11 / 20 / 20・merge 大 = **336 / 852 / 638**・最大の幅 2,000 = 0 / 3 / 3・20,000 = 10 / 15 / 15
   (32MB: 旧 0 / 200 / 0 / 292 / 0 / 0・新は 4MB と同じ = 関数の中は 4MB)。旧の一時の表 (`_ss_merged` など) は temp_bytes に入らない (表のファイル = local buffers) = 旧の本当のディスクはこれより多い。
   新の merge 大が多いのは、窓のための並べ替え (残す行と消した行の全部の列) と MERGE の hash (対象の表の比べる列) が一時のファイルに逃げるため (R2 の 852 MB よりは減った)。
@@ -1851,17 +1868,20 @@ backend の private のピークの増え分 (MB)。列 = 版 (呼び手の work
 event_id の順の 操作|対象 (同じ対象の UPDATE と INSERT が続く所だけ並べ替える = MERGE) + event_id の集まり」で比べる。新しい関数は呼んだ取引の中で一時の表が 0 個・TEMP の権限を外した DB で通る (旧い関数は 42501)。
 本文に恒真の条件と `array_agg(…)[1]` が無いこと・関数の設定・中で発火する trigger の一覧 (と結合を持つ trigger の関数) も固定。
 同時の試験 (2 接続。待つ側が lock を待っていることを `pg_blocking_pids` で確かめてから相手を commit) = relink 2 本 (同じ cursor)・lock_timeout (55P03)・relink 中の伝票 / 注文 (鍵でない列・
-足した注文・鍵を変えた / 消した注文) の更新・merge 2 本・merge 中の商品の行 / 文書の紐付けの足し・直し・消し (FK の 23503 も)・残す仕入先への商品の行の足し (merge の commit まで待つ)・
-deadlock (何回か回して 40P01 の数と最後の表) → 戻り値・SQLSTATE・最後の表が旧と同じ (違うのは上の 4 つだけ・説明つきで固定)。
+足した注文・鍵を変えた / 消した注文) の更新・merge 2 本・merge 中の商品の行 / 文書の紐付けの足し・直し・消し (FK の 23503 も)・merge の後 (commit の前) の残す仕入先への商品の行の足し (一意の検査で待つ)・**Codex R3 の競合 (merge の商品の行の文が待つ間に残す仕入先へ足す = FK で merge を待つ = deadlock) と その前提 (仕入先の UPDATE の lock の強さ・理由)**・
+deadlock (何回か回して 40P01 の数と最後の表) → 戻り値・SQLSTATE・最後の表が旧と同じ (違うのは上の 4 つ + 潜在の ⑤ だけ・説明つきで固定。⑤ は試験の DB で仕入先の BEFORE UPDATE の trigger を外して、最後の表・監査・各行の version・通し番号の最後を旧と比べる)。
 
 **マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に miniPC で dry-run → 本適用)**。0057 は関数の差し替えだけ (表・データ・権限は変えない)。
 🚨 **`temp_file_limit` が有限になるまで本番に当てない (Codex R2)**。新は中間の結果を一時のファイルに逃がす (上の表 = merge 大で 638 MB・旧 336 MB + 旧の一時の表)。
-本番は今 `temp_file_limit = -1` (無制限) = 逃げた分が disk を食い尽くしても取引を止める安全弁が無い (同時の接続の数だけ掛かる)。上限の値と disk の予算 (同時の接続を含む) を決めて有限にしてから当てる
+本番は今 `temp_file_limit = -1` (無制限) = 逃げた分が disk を食い尽くしても取引を止める安全弁が無い (同時の接続の数だけ掛かる)。上限の値と disk の予算 (同時の接続を含む) を決めて有限にしてから当てる。
+🚨 **有限にするだけでは足りない (Codex R3)**: `temp_file_limit` は 1 つの接続 (process) ごとの上限 = **上限 × 同時に動く接続の数が disk の予算の中**に収まる値にし、
+**本番相当のデータで 0057 の 2 つの関数がその値を超えないこと**を確かめてから当てる (上の表の一時のファイル = merge 大 638 MB は `temp_bytes` の増え分 = 同時のピークではないが、大きな I/O の証拠)。
 (設定は Render の DB の設定 = この PR では変えない)。
 0056 が未適用なら、先に上の 0056 の手順を済ませてから (dry-run に 0056 が出たら止める)。夜間ロード (02:00) の最中は避ける (いつもの migrate と同じ)。
 
 ```
 # 0) 先に: Render の DB で show temp_file_limit が -1 でない (有限) ことを確かめる。-1 なら止める
+#    有限でも: 上限 × 同時の接続の数が disk の予算の中・本番相当のデータで 0057 の関数がその上限を超えないことを確かめた記録が無ければ止める (Codex R3)
 # 本番で使っていない worktree から (miniPC の PowerShell 5.1。.env は本体の 1 つを読む)
 cd C:\Users\bfaith\bfaith-portal
 git fetch origin

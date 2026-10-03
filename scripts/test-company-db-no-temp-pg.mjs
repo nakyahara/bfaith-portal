@@ -18,10 +18,13 @@
  *     (enable_nestloop = off・enable_mergejoin = off。off は完全な禁止ではない)・work_mem = 4MB・hash_mem_multiplier = 2・関数の中で発火する trigger の一覧 (設定が効く範囲) が決まった形・
  *     本文に恒真の条件 ((select count(*) from …) >= 0) と array_agg(…)[1] が無い
  *   5 同時に動くとき (2 接続。待つ側が lock を待っていることを pg_blocking_pids で確かめてから相手を commit): 戻り値・SQLSTATE (lock_timeout・23503)・最後の表が旧と同じ。
- *     deadlock は何回か回して、どちらが 40P01 になったかの数と最後の表を旧と新で比べる。旧と違うのは 4 つだけ (説明つきで固定):
+ *     deadlock は何回か回して、どちらが 40P01 になったかの数と最後の表を旧と新で比べる。旧と違うのは 4 つ + 潜在の 1 つだけ (説明つきで固定):
  *     relink ① 文 1 (lock) の後に commit されて範囲に入った未結合の伝票も結ぶ ② 店舗 (ne_shops) は文 2 (結ぶ文) の版 /
  *     merge ③ 待った相手が直した寄せる行の値を (直す前でなく) 直した後の値で移す ④ 文の snapshot の後に相手が残す行に同じ商品 / 文書の行を足して commit → 23505 を
  *     その文だけ巻き戻して新しい snapshot でやり直す (相手の行を残す行として まとめる。旧は相手の値を寄せる行の値で上書き)
+ *     ⑤ (潜在・Codex R3 Medium) 仕入先ごとの商品で ④ と同じ窓 = 今の表では開かない (merge の最初の文 = 仕入先の UPDATE が BEFORE UPDATE の trigger + 一意の鍵の生成列のために
+ *     行を鍵の lock で取る = 足す側の FK の検査が merge の commit まで待つ = Codex R3 の競合は旧と同じ deadlock。前提 (lock の強さと理由) も固定)。
+ *     前提が崩れた DB (試験で trigger を外す) では ④ と同じやり直しになり、巻き戻した MERGE が使った version の通し番号は戻らない (新が余計に進む)
  * 使い方: node scripts/test-company-db-no-temp-pg.mjs   (npm run test:company-db にも入っている)
  *   🚨 試験が自分で使い捨てのクラスタを起動する (test-company-db-profit-fn-revoke-pg.mjs と同じ = embedded-postgres・OS の一時フォルダ・ランダムのポート・最後に止めて消す)。
  *      外の PostgreSQL には一切つながない。見つからない・版が違う・起動できない・フォルダが消えない = 失敗 (exit 1)
@@ -694,7 +697,9 @@ try {
     assert.deepEqual(b.out, a.out); assert.deepEqual(diff, []);
     assert.deepEqual(b.out.v, { vendor_code: 'K-B', stock_units_per_order_unit: 7, unit_cost_jpy: '50', lead_time_days: 3, order_multiple: 2 });   // 文の始めの残す行の値 + 寄せる行
   });
-  await t('merge の後に別の取引が残す仕入先に商品の行を足そうとする (Codex R2 Medium の窓): 足す側は merge の最初の文 (残す仕入先を直す) の lock と FK の KEY SHARE がぶつかって commit まで待つ = merge の文の snapshot の後に足されることは起きない (旧と同じ・足す側は 23505)', async () => {
+  // 🚨 Codex R3 Medium: この試験は「merge の文の途中で足される窓が閉じている」の証明ではない (A の merge が全部終わってから B が足す)。
+  //   B が待つのは A が足した (まだ commit していない) 同じ鍵の行の一意の検査 (索引への挿入 = AFTER の FK の検査より先)。窓が閉じている理由と証明は下の「前提」と「Codex R3 の競合」
+  await t('merge が終わった後 (commit の前) に別の取引が残す仕入先に同じ商品の行を足そうとする: 足す側は merge が足した行の一意の検査で commit まで待ち 23505 (旧と同じ)', async () => {
     const { a, b, diff } = await concCompare(mergeFixed(), async ({ A, B }) => {
       await A.c.query('begin'); const a1 = await A.q(MERGE);
       await B.c.query('begin'); const pb = B.q(ss(1, '0001', 'skd', { vendor: 'B-D', cost: 77 })); const waitB = await waitBlocked(B.pid, pb);
@@ -704,7 +709,7 @@ try {
     assert.deepEqual(b.out, a.out); assert.deepEqual(diff, []);
     assert.equal(b.out.b1, '23505');
   });
-  // 文書の紐付けは仕入先への FK が無い (entity_id は汎用の番号) = 上の lock で止まらない → merge の文の snapshot の後に足されうる
+  // 文書の紐付けは仕入先への FK が無い (entity_id は汎用の番号) = 下の「前提」の lock で止まらない → merge の文の snapshot の後に足されうる
   await t('🚨 違い ④ (説明つき・Codex R2 Medium): merge の文書の紐付けの文の snapshot の後に、待った相手が残す行 0001 に同じ文書 d1 の紐付けを足して commit → 旧は相手の役割を寄せる行の値で上書き・新は MERGE の 23505 をその文だけ巻き戻して新しい snapshot でやり直す (相手の行を残す行としてまとめる・誤りにならない)', async () => {
     const D1 = `(select document_id from docs.documents where external_ref = 'd1')`;
     const { a, b, diff } = await concCompare(mergeFixed(), async ({ A, B, one }) => {
@@ -718,7 +723,134 @@ try {
     assert.deepEqual(b.out.a1, a.out.a1);
     assert.ok(b.out.a1.ok, JSON.stringify(b.out.a1));
     assert.deepEqual([a.out.v, b.out.v], ['evidence', 'B-ROLE']);
-    assert.deepEqual(diff, ['docs.document_links']);   // 違うのはその 1 行の役割だけ
+    assert.deepEqual(diff, ['docs.document_links']);   // 違うのはその 1 行の役割だけ (文書の紐付けには通し番号が無い = やり直しで進む番号も無い)
+  });
+
+  // ─── Codex R3 Medium: 仕入先ごとの商品で merge の文の途中に残す行へ足される窓 ───
+  // Codex R3 の前提 = 「merge の最初の文 (残す仕入先を直す UPDATE) は鍵の列を変えない = FOR NO KEY UPDATE 相当 = 足す側の FK の検査 (FOR KEY SHARE) と両立 = 窓が開く」。
+  // 🚨 試した結果、この表では成り立たない: core.suppliers には BEFORE UPDATE の行 trigger (touch・version・lifecycle) があり、一意の鍵 (company_id, code_norm) の code_norm は生成列 (stored)。
+  //   PostgreSQL は BEFORE UPDATE の trigger が何を変えるか分からないので生成列を全部「変える列」に数える → 鍵の列を変える UPDATE とみなし、trigger のために行を
+  //   鍵の lock (FOR UPDATE 相当) で取る = FOR KEY SHARE とぶつかる。0027 も同じ文で同じ lock = 足す側は merge の commit まで待つ (旧と同じ)
+  //   → 下の「前提」で lock の強さとその理由 (trigger を外すと止めない) を固定し、「Codex R3 の競合」で旧と同じ (deadlock) を固定。
+  //   前提が崩れたとき (trigger を外す・PostgreSQL の版で変わる) だけ窓が開く = 違い ⑤ (潜在) を trigger を外した DB で固定
+  const SUP_DROP_BEFORE_UPD = `do $x$ declare r record; begin
+      for r in select tgname from pg_trigger where tgrelid = 'core.suppliers'::regclass and not tgisinternal and (tgtype & 1) = 1 and (tgtype & 2) = 2 and (tgtype & 16) = 16 loop
+        execute format('drop trigger %I on core.suppliers', r.tgname);
+      end loop; end $x$;\n`;
+  /** pending が lock を待つか (true) / 待たずに終わるか (false) */
+  const blocks = async (pid, pending) => {
+    let done = false; pending.then(() => { done = true; });
+    for (let i = 0; i < 500; i++) {
+      if (done) return false;
+      if ((await su.query('select cardinality(pg_blocking_pids($1)) > 0 as b', [pid])).rows[0].b) return true;
+      await sleep(20);
+    }
+    throw new Error(`pid ${pid} が 10 秒たっても待たず終わりもしない`);
+  };
+  const RACE_FX = sup(1, '0001', '0001') + sup(1, '01', '01') + sku(1, 'r1') + ss(1, '01', 'r1', { vendor: 'D-R1', unit: 'case', cost: 10 });
+  await t('🚨 前提 (Codex R3 Medium への答え): 仕入先の UPDATE は鍵の列を変えなくても行を鍵の lock で取る = 残す仕入先に商品の行を足す FK の検査を commit まで止める。理由 = BEFORE UPDATE の trigger + 一意の鍵の生成列 (trigger を外すと止めない・FOR NO KEY UPDATE も止めない)', async () => {
+    const before = (await concRun(T_NEW, RACE_FX, async ({ one }) => (await one(`select string_agg(tgname, ',' order by tgname) as x from pg_trigger where tgrelid = 'core.suppliers'::regclass and not tgisinternal and (tgtype & 1) = 1 and (tgtype & 2) = 2 and (tgtype & 16) = 16`))[0].x)).out;
+    assert.equal(before, 'trg_suppliers_lifecycle,trg_suppliers_touch,trg_suppliers_version');
+    const got = {};
+    for (const [fx, label] of [[RACE_FX, 'trigger あり'], [RACE_FX + SUP_DROP_BEFORE_UPD, 'BEFORE UPDATE の trigger なし']]) {
+      for (const lockSql of [`update core.suppliers set name = name where code = '0001'`, `update core.suppliers set order_memo = 'm' where code = '0001'`,
+        `select 1 from core.suppliers where code = '0001' for no key update`, `select 1 from core.suppliers where code = '0001' for update`]) {
+        await concRun(T_NEW, fx, async ({ A, B }) => {
+          await A.c.query('begin'); await A.c.query(lockSql);
+          await B.c.query('begin'); const pb = B.q(ss(1, '0001', 'r1', { vendor: 'x' }));
+          got[`${label} | ${lockSql}`] = await blocks(B.pid, pb);
+          await A.c.query('rollback'); const b1 = await pb; assert.ok(b1.ok, JSON.stringify(b1)); await B.c.query('rollback');
+        });
+      }
+    }
+    assert.deepEqual(got, {
+      "trigger あり | update core.suppliers set name = name where code = '0001'": true,          // merge の最初の文と同じ (鍵でない列だけ・値も同じ) でも止める
+      "trigger あり | update core.suppliers set order_memo = 'm' where code = '0001'": true,
+      "trigger あり | select 1 from core.suppliers where code = '0001' for no key update": false,  // Codex R3 の前提の lock なら止めない
+      "trigger あり | select 1 from core.suppliers where code = '0001' for update": true,
+      "BEFORE UPDATE の trigger なし | update core.suppliers set name = name where code = '0001'": false,   // 理由が trigger (+ 生成列) であること
+      "BEFORE UPDATE の trigger なし | update core.suppliers set order_memo = 'm' where code = '0001'": false,
+      "BEFORE UPDATE の trigger なし | select 1 from core.suppliers where code = '0001' for no key update": false,
+      "BEFORE UPDATE の trigger なし | select 1 from core.suppliers where code = '0001' for update": true,
+    });
+  });
+  /** Codex R3 の競合: ① B が寄せる行の商品の行を (値を変えずに) 更新して lock を持つ ② A が merge を始め、商品の行の文 (旧 = DELETE・新 = DELETE … MERGE の 1 つの文) で B を待つ
+   *  ③ B が残す行 0001 に同じ SKU の行を足す。bBlocked = B の足すが A を待ったか (前提どおりなら待つ = deadlock。待たない = 前提が崩れた DB = ④ commit → A が続く) */
+  const raceSkuInsert = (dropCode, skuCode, ins) => async ({ A, B, one }) => {
+    await B.c.query('begin');
+    await B.c.query(`update core.supplier_skus set vendor_code = vendor_code where supplier_id = ${SID(dropCode)} and sku_id = ${KID(skuCode)}`);   // 値を変えない = ③ を混ぜない
+    await A.c.query('begin'); const pa = A.q(MERGE); const waitA = await waitBlocked(A.pid, pa);
+    const pb = B.q(ss(1, '0001', skuCode, ins));
+    const bBlocked = await blocks(B.pid, pb);
+    if (bBlocked) {   // 前提どおり = B は A を待ち、A は B を待つ = deadlock (どちらかが 40P01)
+      const [ra, rb] = await Promise.all([pa, pb]);
+      await endTx(A, ra); await endTx(B, rb);
+      return { ra, rb, waitA, bBlocked };
+    }
+    const bi = await pb;
+    await B.c.query('commit'); const a1 = await pa; await endTx(A, a1);
+    const row = (await one(`select vendor_code, order_unit, unit_cost_jpy, active, is_primary, version::text as version from core.supplier_skus where supplier_id = ${SID('0001')} and sku_id = ${KID(skuCode)}`))[0];
+    const seqv = (await one(`select last_value::text as v from core.master_version_seq`))[0].v;
+    // 監査 = その SKU の 1 行の変更 (change_id) ごとに「操作:残す / 寄せる:出来事の数」を event_id の順に (fixture の足すも入る)
+    const audit = (await one(`select string_agg(x, ',' order by e) as ops from (
+        select min(event_id) as e, operation || ':' || case when (entity_key ->> 'supplier_id')::bigint = ${SID('0001')} then 'keep' else 'drop' end || ':' || count(*) as x
+          from events.master_change_events where entity_type = 'supplier_sku' and (entity_key ->> 'sku_id')::bigint = ${KID(skuCode)}
+         group by change_id, operation, entity_key) s`))[0].ops;
+    return { a1, bi: bi.err || 'ok', waitA, bBlocked, row, seq: Number(seqv), audit };
+  };
+  for (const [fxName, fx, dropCode, skuCode] of [['小さい fixture (r1)', RACE_FX, '01', 'r1'], ['決まった fixture (skd)', mergeFixed(), '01', 'skd']]) {
+    await t(`Codex R3 の競合 (barrier・${fxName}): A の merge が寄せる行の商品の行を待つ間に B が残す行へ同じ SKU を足す → B は A の仕入先の lock を FK の検査で待つ (窓は開かない) = deadlock・毎回 1 本だけ 40P01・負けた側ごとの最後の表と A が待つ lock が旧と新で同じ`, async () => {
+      const tally = await deadlockRounds(fx, async (ctx) => {
+        const r = await raceSkuInsert(dropCode, skuCode, { vendor: 'B-NEW', cost: 77 })(ctx);
+        assert.equal(r.bBlocked, true, 'B の足すが A を待たなかった (前提が崩れた = 下の違い ⑤ が起きる)');
+        return r;
+      });
+      for (const label of ['旧', '新']) assert.equal(tally[label].A + tally[label].B, 3);
+    });
+  }
+  // ─── 🚨 違い ⑤ (潜在・Codex R3 Medium): 前提が崩れたとき (試験の DB で仕入先の BEFORE UPDATE の trigger を外す) だけ窓が開く ───
+  //   ③ で B の足すは A を待たずに commit → ④ 新 = MERGE の足すが 23505 → その文だけ巻き戻して新しい snapshot でやり直す (旧 = 次の文 (直す) の新しい snapshot で見えて直す / 同じなら何もしない)
+  //   🚨 version の通し番号 (core.master_version_seq) は巻き戻しで戻らない = 新は失敗した MERGE がそれまでに直す / 足した行の分 (直す 1・足す 2 = 既定値の nextval + BEFORE INSERT の nextval) だけ余計に進む。
+  //   監査 (AFTER の行 trigger = 文の終わり) は巻き戻った文の分は出ない = 二重にならない。各行の最後の version は 1 つ
+  const NOTRG = SUP_DROP_BEFORE_UPD;
+  await t('🚨 違い ⑤ (潜在・説明つき): trigger を外した DB で Codex R3 の競合 (相手の値が違う) → 新は 23505 を巻き戻してやり直し 相手の値を残す・旧は寄せる行の値で上書き。監査は二重にならず・通し番号と直した行の version は新が 2 つ先', async () => {
+    const { a, b, diff } = await concCompare(RACE_FX + NOTRG, raceSkuInsert('01', 'r1', { vendor: 'B-R1', cost: 77 }));
+    for (const x of [a, b]) { assert.equal(x.out.bBlocked, false); assert.ok(x.out.a1.ok, JSON.stringify(x.out.a1)); assert.equal(x.out.bi, 'ok'); }
+    assert.deepEqual(b.out.a1, a.out.a1);
+    assert.equal(b.out.waitA, a.out.waitA);   // どちらも寄せる行の lock を待つ
+    const vals = (r) => [r.vendor_code, r.order_unit, r.unit_cost_jpy, r.active, r.is_primary];
+    assert.deepEqual(vals(a.out.row), ['D-R1', 'case', '10', true, false]);   // 旧 = 相手の値を寄せる行の値で上書き
+    assert.deepEqual(vals(b.out.row), ['B-R1', 'case', '77', true, false]);   // 新 = 相手の行を残す行として まとめる (空の列だけ寄せる行から)
+    assert.deepEqual([a.out.audit, b.out.audit], ['INSERT:drop:1,INSERT:keep:1,DELETE:drop:1,UPDATE:keep:3', 'INSERT:drop:1,INSERT:keep:1,DELETE:drop:1,UPDATE:keep:1']);
+    //   ↑ 相手の足す・寄せる行を消す・残す行を直す が 1 回ずつ (やり直しの分は出ない)。直す列の数だけが違う (旧 = 発注先コード・発注単位・原価の 3 列 / 新 = 発注単位の 1 列)
+    assert.equal(b.out.seq - a.out.seq, 2, `通し番号の最後: 旧 ${a.out.seq} / 新 ${b.out.seq}`);
+    assert.equal(Number(b.out.row.version) - Number(a.out.row.version), 2, `直した行の version: 旧 ${a.out.row.version} / 新 ${b.out.row.version}`);
+    // 監査の出来事の数が違う (旧は上書きした 3 列ぶん) = event_id の並びも違う
+    assert.deepEqual(diff, ['(sequences)', 'core.supplier_skus', 'events.master_change_events', 'events.master_change_events (event_id の順の 操作|対象)', 'events.master_change_events (event_id)']);
+    console.log(`      (旧: 直した行の version ${a.out.row.version}・通し番号の最後 ${a.out.seq} / 新: ${b.out.row.version}・${b.out.seq})`);
+  });
+  await t('🚨 違い ⑤ (潜在・説明つき): trigger を外した DB で同じ競合・相手の値が寄せる行と同じ → 旧は直す文で何もしない・新はやり直しても何もしない = 表・監査・各行の version は旧と同じ・違うのは通し番号の最後 (+2) だけ', async () => {
+    const { a, b, diff } = await concCompare(RACE_FX + NOTRG, raceSkuInsert('01', 'r1', { vendor: 'D-R1', unit: 'case', cost: 10 }));
+    for (const x of [a, b]) { assert.equal(x.out.bBlocked, false); assert.ok(x.out.a1.ok, JSON.stringify(x.out.a1)); assert.equal(x.out.bi, 'ok'); }
+    assert.deepEqual(b.out.row, a.out.row);   // version も同じ (相手が足したときの値のまま)
+    assert.deepEqual([a.out.audit, b.out.audit], ['INSERT:drop:1,INSERT:keep:1,DELETE:drop:1', 'INSERT:drop:1,INSERT:keep:1,DELETE:drop:1']);
+    assert.equal(b.out.seq - a.out.seq, 2, `通し番号の最後: 旧 ${a.out.seq} / 新 ${b.out.seq}`);
+    assert.deepEqual(diff, ['(sequences)']);
+    console.log(`      (旧: 行の version ${a.out.row.version}・通し番号の最後 ${a.out.seq} / 新: ${b.out.row.version}・${b.out.seq})`);
+  });
+  await t('🚨 違い ⑤ (潜在・決まった fixture): trigger を外した DB で 寄せる行 01 の skd を lock → 残す行 0001 に skd を足して commit → 新はやり直して相手の値を残す・通し番号は 2 以上 (失敗した MERGE がそれまでに直す / 足した行の数しだい) 余計に進む', async () => {
+    const { a, b, diff } = await concCompare(mergeFixed() + NOTRG, raceSkuInsert('01', 'skd', { vendor: 'B-D', cost: 77 }));
+    for (const x of [a, b]) { assert.equal(x.out.bBlocked, false); assert.ok(x.out.a1.ok, JSON.stringify(x.out.a1)); assert.equal(x.out.bi, 'ok'); }
+    assert.deepEqual(b.out.a1, a.out.a1);
+    const vals = (r) => [r.vendor_code, r.unit_cost_jpy, r.order_unit, r.active];
+    assert.deepEqual(vals(a.out.row), ['V-D', null, 'case', false]);   // 旧 = 寄せる行 (V-D・無効) で上書き (相手の原価 77 も消える)
+    assert.deepEqual(vals(b.out.row), ['B-D', '77', 'case', true]);    // 新 = 相手の値 + 空の列だけ寄せる行・有効はどれかが有効
+    const extra = b.out.seq - a.out.seq;
+    assert.ok(extra >= 2 && extra <= 2 * 30, `通し番号の余分 ${extra} (失敗した MERGE が 1 行あたり 直す 1・足す 2 を使う)`);
+    assert.deepEqual([a.out.audit, b.out.audit], ['INSERT:drop:1,INSERT:keep:1,DELETE:drop:1,UPDATE:keep:4', 'INSERT:drop:1,INSERT:keep:1,DELETE:drop:1,UPDATE:keep:1']);   // 1 行の変更は 1 回ずつ (旧は 4 列を上書き・新は空の発注単位だけ)
+    // 監査の出来事の数が違う (旧は上書きした 4 列ぶん) = event_id の並びも違う。値の違いはこの 1 行の直すだけ
+    assert.deepEqual(diff, ['(sequences)', 'core.supplier_skus', 'events.master_change_events', 'events.master_change_events (event_id の順の 操作|対象)', 'events.master_change_events (event_id)']);
+    console.log(`      (通し番号の最後: 旧 ${a.out.seq} / 新 ${b.out.seq} = 新が ${extra} 余計)`);
   });
   await t('merge と商品の行の更新の deadlock (A が残す仕入先を lock して寄せる行の商品を待つ・B が商品の行を持って残す仕入先を待つ): 毎回 1 本だけ 40P01・負けた側ごとの最後の表と A が待つ lock が旧と新で同じ', async () => {
     await deadlockRounds(mergeFixed(), async ({ A, B }) => {
