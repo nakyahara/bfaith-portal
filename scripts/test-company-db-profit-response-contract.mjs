@@ -334,6 +334,7 @@ await t('/daily: 全部の列 × 全部の行で、null の規則 (nul) を逆�
 await t('/daily: 受け取るべき形 (R3): 構成なしの行は composition_missing だけ・ad_unresolved は同じ日の全部の行に付く', async () => {
   const a = clone(dailyExp); const r = a.rows[4];
   r.composition_basis = 'missing'; r.composition_hash = null; r.profit_incomplete_reasons = ['composition_missing']; r.assumed_zero_reasons = ['composition_missing'];
+  r.missing_cost_sku_ids = [];   // 構成なしの行は 0050 の uc の行が無い = missing_ids は空 (R5)
   assert.deepEqual(validateDailyResponse(a).errors, []);
   const b = clone(dailyExp);
   for (const r of b.rows.filter((r) => r.economic_date_jst === '2026-07-30')) {
@@ -348,6 +349,44 @@ await t('/daily: 要求全体で固定の値 (R4): 全部の行でそろえて�
     assert.deepEqual(validateDailyResponse(x).errors, [], `${k}=${v}`);
   }
   assert.deepEqual([...REQUEST_LEVEL_FIELDS], ['company_id', 'observed_generation', 'composition_audit_since']);
+});
+const ID_ARRAYS = ['received_listing_ids', 'ad_received_listing_ids', 'missing_cost_sku_ids', 'cost_sku_cost_ids', 'cost_observed_ids'];
+await t('/daily: ID の配列 5 つは ID (BigInt) の厳密な昇順・重複なし・1 以上 (R5 Low)・fixture は 2 要素以上', async () => {
+  assert.deepEqual(DAILY_COLUMNS.filter((c) => c.type === 'bigint[]').map((c) => c.name), ID_ARRAYS);
+  for (const k of ID_ARRAYS) {
+    assert.ok(DAILY_COLUMNS.find((c) => c.name === k).idsAscending, k);
+    const i = dailyExp.rows.findIndex((r) => r[k].length >= 2);
+    assert.ok(i >= 0, `${k}: fixture に 2 要素以上の行が無い`);
+    const bad = [[...dailyExp.rows[i][k]].reverse(), [dailyExp.rows[i][k][0], dailyExp.rows[i][k][0]], ['10', '9'], ['0', '5'], ['9007199254740993', '9007199254740992'], ['-1']];
+    for (const v of bad) {
+      const x = clone(dailyExp); x.rows[i][k] = v;
+      assert.ok(validateDailyResponse(x).errors.some((e) => e.includes(`.${k}: ID の厳密な昇順`)), `${k} = ${JSON.stringify(v)}`);
+    }
+    // 数の順 (文字の順でない)・2^53 の近くも BigInt で比べる (Number なら 2 つが同じになる)
+    for (const v of [['9', '10'], ['9007199254740992', '9007199254740993']]) {
+      const x = clone(dailyExp); x.rows[i][k] = v;
+      assert.ok(!validateDailyResponse(x).errors.some((e) => e.includes(`.${k}: ID の厳密な昇順`)), `${k} = ${JSON.stringify(v)}`);
+    }
+  }
+});
+await t('/daily: 原価の無い SKU (missing_cost_sku_ids) がある ⇔ 理由 cost_missing (R5 の突き合わせ)', async () => {
+  const a = clone(dailyExp); a.rows[0].missing_cost_sku_ids = ['99'];
+  assert.ok(validateDailyResponse(a).errors.some((e) => e.includes('missing_cost_sku_ids) がある ⇔ 理由 cost_missing')));
+  const b = clone(dailyExp); b.rows[4].missing_cost_sku_ids = [];
+  assert.ok(validateDailyResponse(b).errors.some((e) => e.includes('missing_cost_sku_ids) がある ⇔ 理由 cost_missing')));
+});
+await t('0050 の ID の配列の作り方 = 昇順 (distinct つき・または主キー (listing_id, sku_id) で重複が出ない)', async () => {
+  const def = async (sig) => (await pg.query('select pg_get_functiondef($1::regprocedure) as d', [sig])).rows[0].d;
+  const sku = await def('mart.finance_daily_sku_range(smallint,text,text,date,date)');
+  const lineWith = (text, needle) => text.split('\n').find((l) => l.includes(needle)) || '';
+  assert.ok(lineWith(sku, 'as received_listing_ids').includes('array_agg(distinct listing_id order by listing_id)'), 'received_listing_ids');
+  const rows = await def('mart._amazon_profit_rows(smallint,text,text,date,date,mart.amazon_profit_finance_day[],mart.amazon_profit_ad_day[],mart.amazon_profit_ad_child[],mart.amazon_easy_ship_alloc_row[])');
+  assert.ok(lineWith(rows, 'ad_rcv as (') !== '' && rows.includes('array_agg(distinct x.rid order by x.rid) as ids'), 'ad_received_listing_ids');
+  assert.ok(lineWith(rows, 'as missing_ids').includes('array_agg(cc.sku_id order by cc.sku_id) filter (where not cc.known)'), 'missing_cost_sku_ids');
+  assert.ok(lineWith(rows, 'as sc_ids').includes('array_agg(cc.row_id order by cc.row_id)'), 'cost_sku_cost_ids');
+  assert.ok(lineWith(rows, 'as ob_ids').includes('array_agg(cc.row_id order by cc.row_id)'), 'cost_observed_ids');
+  const pk = (await pg.query(`select pg_get_constraintdef(c.oid) as d from pg_constraint c where c.conrelid = 'core.listing_components'::regclass and c.contype = 'p'`)).rows[0].d;
+  assert.equal(pk, 'PRIMARY KEY (listing_id, sku_id)');   // 1 つの出品の構成の SKU は重ならない = sku_id・原価の行の ID も重ならない
 });
 await t('/daily: maybe の列は null でも値でもよい (世代・監査の時刻・coverage)', async () => {
   for (const c of DAILY_COLUMNS.filter((c) => c.nul === 'maybe')) {

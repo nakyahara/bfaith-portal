@@ -31,10 +31,15 @@
           "listing_resolution": "resolved",
           "listing_code": "AB-001",
           "received_listing_ids": [
+            "15",
             "9007199254740993"
           ],
           "received_listing_unresolved_count": 0,
-          "ad_received_listing_ids": [],
+          "ad_received_listing_ids": [
+            "9",
+            "10",
+            "9007199254740993"
+          ],
           "ad_received_unresolved_rows": 0,
           "units_ordered": 3,
           "units_refunded_customer": 1,
@@ -85,7 +90,8 @@
           "composition_basis": "pre_audit_unverifiable",
           "missing_cost_sku_ids": [],
           "cost_sku_cost_ids": [
-            "77"
+            "77",
+            "100"
           ],
           "cost_observed_ids": [],
           "ad_status": "complete",
@@ -104,7 +110,8 @@
           "assumed_zero_reasons": [],
           "master_basis": "current",
           "master_notes": [
-            "pre_audit_unverifiable"
+            "pre_audit_unverifiable",
+            "listing_changed_since_received"
           ],
           "composition_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "cost_input_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -272,7 +279,8 @@
           "missing_cost_sku_ids": [],
           "cost_sku_cost_ids": [],
           "cost_observed_ids": [
-            "5"
+            "5",
+            "12"
           ],
           "ad_status": "verified_legacy",
           "ad_cost": "0.00",
@@ -460,6 +468,7 @@
           "cost_basis": "missing",
           "composition_basis": "current_no_recorded_change",
           "missing_cost_sku_ids": [
+            "99",
             "101"
           ],
           "cost_sku_cost_ids": [],

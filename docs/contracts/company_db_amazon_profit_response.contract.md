@@ -205,9 +205,9 @@ null の規則 (nul):
 | `seller_sku_norm` | text | `iff_resolved` | 文字 |  |
 | `listing_resolution` | text | `never` | 文字 | 列挙 (resolved / unresolved) |
 | `listing_code` | text | `iff_unresolved` | 文字 |  |
-| `received_listing_ids` | bigint[] | `never` | 配列 (文字列) |  |
+| `received_listing_ids` | bigint[] | `never` | 配列 (文字列) | ID (BigInt) の厳密な昇順・重複なし・1 以上 |
 | `received_listing_unresolved_count` | integer | `never` | 数 | ≥ 0 |
-| `ad_received_listing_ids` | bigint[] | `never` | 配列 (文字列) |  |
+| `ad_received_listing_ids` | bigint[] | `never` | 配列 (文字列) | ID (BigInt) の厳密な昇順・重複なし・1 以上 |
 | `ad_received_unresolved_rows` | integer | `never` | 数 | ≥ 0 |
 | `units_ordered` | integer | `never` | 数 |  |
 | `units_refunded_customer` | integer | `never` | 数 |  |
@@ -256,9 +256,9 @@ null の規則 (nul):
 | `cogs_jpy` | bigint | `iff_cost_unknown` | 文字列 |  |
 | `cost_basis` | text | `never` | 文字 | 列挙 (sku_costs / observed / estimated / missing) |
 | `composition_basis` | text | `never` | 文字 | 列挙 (listing_unresolved / missing / pre_audit_unverifiable / current_after_recorded_change / current_no_recorded_change) |
-| `missing_cost_sku_ids` | bigint[] | `never` | 配列 (文字列) |  |
-| `cost_sku_cost_ids` | bigint[] | `never` | 配列 (文字列) |  |
-| `cost_observed_ids` | bigint[] | `never` | 配列 (文字列) |  |
+| `missing_cost_sku_ids` | bigint[] | `never` | 配列 (文字列) | ID (BigInt) の厳密な昇順・重複なし・1 以上 |
+| `cost_sku_cost_ids` | bigint[] | `never` | 配列 (文字列) | ID (BigInt) の厳密な昇順・重複なし・1 以上 |
+| `cost_observed_ids` | bigint[] | `never` | 配列 (文字列) | ID (BigInt) の厳密な昇順・重複なし・1 以上 |
 | `ad_status` | text | `never` | 文字 | 列挙 (complete / verified_legacy / legacy_incomplete / missing / not_collected) |
 | `ad_cost` | numeric | `iff_ad_uncollected` | 文字列 (小数 2 桁) |  |
 | `ad_rows` | integer | `never` | 数 | ≥ 0 |
@@ -295,6 +295,8 @@ null の規則 (nul):
 - 🆕 理由 `cost_missing` ⇔ 解決した行 かつ 構成あり (`composition_basis` ≠ `missing`) かつ `cost_basis = missing` = `listing_unresolved`・`composition_missing` と排他 (0050 の g_unres・g_comp・g_cost・#1602 Codex R3)
 - 🆕 **日で決まる値は同じ日の行で全部同じ**: `day_finance_status`・`finance_coverage_generation`・`finance_source_revision` (0050 の days を日だけで結ぶ)・`ad_status` (ad_days を日だけで結ぶ)・理由 `ad_unresolved` (ad_u = その日の出品の無い広告の行の数) (#1602 Codex R3 の突き合わせ)
 - 🆕 **要求全体で固定の値は全部の行で同じ** (#1602 Codex R4): 0050 の最後の SELECT で要求全体に固定の列 = `company_id` (p_company_id・1 以上)・`observed_generation` (同じ snapshot の max(generation)・月をまたいでも同じ)・`composition_audit_since` (引数なしの immutable の関数) は行の間でそろえる。`mall`・`scope_key`・`master_basis`・`calculation_version`・`calculated_at` は上 (要求) の値と照合する。/totals は期間の 1 行なので行の間の照合は無く、`master_basis`・`calculation_version`・`calculated_at` を上と照合する
+- 🆕 **ID の配列 5 つ** (`received_listing_ids`・`ad_received_listing_ids`・`missing_cost_sku_ids`・`cost_sku_cost_ids`・`cost_observed_ids`) は **ID (BigInt) の厳密な昇順 = 重複なし・1 以上** (0050 の `array_agg(distinct … order by …)` / `array_agg(… order by …)` と `core.listing_components` の主キー (listing_id, sku_id)・#1602 Codex R5)。文字の順でなく数の順 (`"9"` < `"10"`)
+- 🆕 `missing_cost_sku_ids` が空でない ⇔ 理由 `cost_missing` (0050 の missing_ids は原価が分からない部品・未解決 / 構成なしの行は空)
 - `day_finance_status` が complete でない ⇔ 理由 `finance_incomplete` / `ad_status` = `not_collected` ⇔ `ad_not_collected`・`missing` ⇔ `ad_missing`・`legacy_incomplete` ⇔ `ad_legacy_unverified`
 - `assumed_zero_reasons` = `profit_incomplete_reasons` から `refund_units_partial_month` を除いたもの
 

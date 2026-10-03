@@ -188,7 +188,7 @@ export const INCOMPLETE_DAY_PAIRS = Object.freeze([
  *     iff_ad_uncollected        = ad_status が not_collected・missing のときだけ null
  *     iff_not_ok_before         = 理由に「広告の前」の理由 (BEFORE_AD_REASONS) があるときだけ null (正式な値)
  *     iff_not_ok_after          = 理由が 1 つでもあるときだけ null (正式な値)
- *   min = 下限 (件数は 0 以上) / max = 上限 / enum = 値の一覧 / hex64 = 64 桁の小文字の 16 進 / sixDp = 小数 0 か 6 桁
+ *   min = 下限 (件数は 0 以上) / max = 上限 / enum = 値の一覧 / hex64 = 64 桁の小文字の 16 進 / sixDp = 小数 0 か 6 桁 / idsAscending = ID の厳密な昇順 (BigInt)
  */
 export const LISTING_RESOLUTIONS = Object.freeze(['resolved', 'unresolved']);
 export const REFUND_UNITS_STATUSES = Object.freeze(['no_refund', 'estimated_monthly_unit_price', 'estimated_partial_month_unit_price', 'unit_price_missing']);
@@ -198,11 +198,13 @@ export const COMPOSITION_BASES = Object.freeze(['listing_unresolved', 'missing',
 export const BEFORE_AD_REASONS = Object.freeze(['finance_incomplete', 'finance_unclassified', 'refund_units_unknown', 'refund_units_partial_month',
   'listing_unresolved', 'composition_missing', 'cost_missing']);
 const N0 = Object.freeze({ min: 0 });
+/** ID の配列は ID (BigInt) の厳密な昇順 = 重複なし・1 以上 (0050 の array_agg(distinct … order by …) / array_agg(… order by …) と主キー (listing_id, sku_id)・#1602 Codex R5 Low) */
+const IDS_ASC = Object.freeze({ idsAscending: true });
 export const DAILY_COLUMNS = Object.freeze([
   ['company_id', 'smallint', 'never'], ['mall', 'text', 'never'], ['scope_key', 'text', 'never'], ['economic_date_jst', 'date', 'never'],
   ['listing_id', 'bigint', 'iff_unresolved'], ['seller_sku_norm', 'text', 'iff_resolved'], ['listing_resolution', 'text', 'never', { enum: LISTING_RESOLUTIONS }],
   ['listing_code', 'text', 'iff_unresolved'],
-  ['received_listing_ids', 'bigint[]', 'never'], ['received_listing_unresolved_count', 'integer', 'never', N0], ['ad_received_listing_ids', 'bigint[]', 'never'],
+  ['received_listing_ids', 'bigint[]', 'never', IDS_ASC], ['received_listing_unresolved_count', 'integer', 'never', N0], ['ad_received_listing_ids', 'bigint[]', 'never', IDS_ASC],
   ['ad_received_unresolved_rows', 'integer', 'never', N0],
   ['units_ordered', 'integer', 'never'], ['units_refunded_customer', 'integer', 'never'], ['units_marketplace_guarantee', 'integer', 'never'],
   ['units_a_to_z_refund', 'integer', 'never'], ['units_net_sold', 'integer', 'never'],
@@ -222,7 +224,7 @@ export const DAILY_COLUMNS = Object.freeze([
   ['refund_incomplete_child_count', 'integer', 'never', { min: 0, max: 1 }], ['refund_unestimated_jpy', 'bigint', 'never'],
   ['component_unit_cost_jpy', 'bigint', 'iff_cost_unknown'], ['cogs_jpy', 'bigint', 'iff_cost_unknown'], ['cost_basis', 'text', 'never', { enum: COST_BASES }],
   ['composition_basis', 'text', 'never', { enum: COMPOSITION_BASES }],
-  ['missing_cost_sku_ids', 'bigint[]', 'never'], ['cost_sku_cost_ids', 'bigint[]', 'never'], ['cost_observed_ids', 'bigint[]', 'never'],
+  ['missing_cost_sku_ids', 'bigint[]', 'never', IDS_ASC], ['cost_sku_cost_ids', 'bigint[]', 'never', IDS_ASC], ['cost_observed_ids', 'bigint[]', 'never', IDS_ASC],
   ['ad_status', 'text', 'never', { enum: AD_STATUS_RANK }], ['ad_cost', 'numeric', 'iff_ad_uncollected'], ['ad_rows', 'integer', 'never', N0],
   ['easy_ship_alloc_jpy', 'bigint', 'never'],
   ['contribution_before_ad_incl_jpy', 'bigint', 'iff_not_ok_before'], ['contribution_before_ad_excl', 'numeric', 'iff_not_ok_before'],
@@ -438,6 +440,8 @@ function dailyRowRuleErrors(r, p) {
   // 0050 の g_unres・g_comp・g_cost は排他 (g_cost = 出品あり かつ 構成あり かつ 原価が分からない・#1602 Codex R3 M1)
   iff(has(reasons, 'cost_missing'), r.listing_resolution === 'resolved' && r.composition_basis !== 'missing' && r.cost_basis === 'missing',
     '理由 cost_missing ⇔ 解決した行 かつ 構成あり (composition_basis ≠ missing) かつ cost_basis = missing (listing_unresolved・composition_missing と排他)');
+  // 0050 の missing_ids = 原価が分からない部品の SKU (uc は解決・構成ありの行だけ) = 空でない ⇔ g_cost (#1602 Codex R5 の突き合わせ)
+  iff(Array.isArray(r.missing_cost_sku_ids) && r.missing_cost_sku_ids.length > 0, has(reasons, 'cost_missing'), '原価の無い SKU (missing_cost_sku_ids) がある ⇔ 理由 cost_missing');
   if (r.listing_resolution === 'resolved' && !has(reasons, 'composition_missing')) {
     const pre = has(notes, 'pre_audit_unverifiable'), after = has(notes, 'current_after_recorded_change');
     const want = pre ? 'pre_audit_unverifiable' : after ? 'current_after_recorded_change' : 'current_no_recorded_change';
@@ -486,6 +490,7 @@ function dailyErrors(body) {
       if (c.max != null && v > c.max) errs.push(`${p}.${c.name}: ${c.max} より大きい`);
       if (c.enum && !c.enum.includes(v)) errs.push(`${p}.${c.name}: 知らない値 (${JSON.stringify(v)})`);
       if (c.hex64 && !HEX64.test(v)) errs.push(`${p}.${c.name}: 64 桁の 16 進でない`);
+      if (c.idsAscending && v.some((x, k) => BigInt(x) < 1n || (k > 0 && BigInt(x) <= BigInt(v[k - 1])))) errs.push(`${p}.${c.name}: ID の厳密な昇順 (BigInt・重複なし・1 以上) でない`);
     }
     if (r.mall !== body.mall || r.scope_key !== body.scope) errs.push(`${p}: mall / scope が上と違う`);
     if (typeof r.economic_date_jst === 'string' && (r.economic_date_jst < body.from || r.economic_date_jst > body.to)) errs.push(`${p}.economic_date_jst: 期間の外`);
