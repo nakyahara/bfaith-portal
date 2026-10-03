@@ -5,9 +5,11 @@
  *   1. consumer ごとの profile が閉じた一覧のとおり・全部 legacy (今の写し) を読む
  *   2. 一覧に無い consumer・宣言していない dataset は例外 (黙って既定の表を返さない)
  *   3. 壊れた profile の組 (cdb を選ぶ・consumer が足りない / 余計・知らない dataset・空・間接の読み手の行き先が無い) は止まる
+ *      (consumer ごとの dataset の集合も閉じている = 差し替え・足し・抜けは止まる)
  *   4. env を読まない (AMAZON_FINANCE_READ_PROFILE / AMAZON_FINANCE_READ_SOURCE を入れても legacy のまま) = F4-1 では切り替えられない
- *   5. 読み手のソースに旧い写しの表の名前を直に書いていない (読み口・書き込み側・miniPC・試験を除く)。
- *      読み口の呼び出しの consumer は一覧にあり、一覧の consumer は必ずどこかで使われている
+ *   5. 旧い写しの表の名前を直に書いてよいのは「書き込み側の決まった使い方」(DDL・索引・受け口の INSERT・同期の登録・表の作り直し) の行だけ。
+ *      ファイル丸ごとは許さない。試験のファイルを除くのは本番から import されていないときだけ。読む形 (FROM / JOIN) を足すと落ちる
+ *   6. どの関数がどの consumer で読むかの表 (用途ごとの割り当て) と、実際の呼び出しが合う。間違えた割り当ては落ちる
  *
  * 値が変わらないこと (before/after の応答の一致) は scripts/test-amazon-finance-read-parity.mjs。
  * 実行: node scripts/test-amazon-finance-read.mjs
@@ -93,7 +95,11 @@ console.log('\n── 3. 壊れた profile の組は止まる ──');
   check('consumer が 1 つ足りないと止まる', (s) => { delete s['site-products']; }, /足りない: site-products/);
   check('一覧に無い consumer があると止まる', (s) => { s['new-reader'] = { finance_daily: 'legacy' }; }, /余計: new-reader/);
   check('知らない dataset があると止まる', (s) => { s['amazon-dashboard:trend'].profit = 'legacy'; }, /知らない dataset 'profit'/);
-  check('何も読まない consumer は止まる', (s) => { s['margin-alert'] = {}; }, /何も読まない/);
+  check('何も読まない consumer は止まる (dataset の抜け)', (s) => { s['margin-alert'] = {}; }, /何も読まない/);
+  // consumer ごとの dataset の集合も閉じている (Codex #1599 R1 M1)
+  check('dataset の差し替えは止まる (supplier-sales を月の手数料に)', (s) => { s['supplier-sales'] = { account_fees: 'legacy' }; }, /'supplier-sales' の dataset が閉じた一覧と違う/);
+  check('dataset の足しは止まる (supplier-sales に月の手数料も)', (s) => { s['supplier-sales'].account_fees = 'legacy'; }, /'supplier-sales' の dataset が閉じた一覧と違う/);
+  check('dataset の差し替えは止まる (月の手数料の consumer を日次の財務に)', (s) => { s['amazon-dashboard:account-fees'] = { finance_daily: 'legacy' }; }, /'amazon-dashboard:account-fees' の dataset が閉じた一覧と違う/);
   ok(throws(() => R.validateProfileSet('cdb'), /'cdb' は無い/), '無い組の名前は止まる');
   ok(throws(() => R.validateProfileSet('toString'), /'toString' は無い/), "'toString' のような名前も止まる");
 }
@@ -105,14 +111,17 @@ console.log('\n── 4. env を読まない (F4-1 では切り替えられな�
   const r = spawnSync(process.execPath, ['--input-type=module', '-e',
     `const m = await import(${JSON.stringify(pathToFileURL(LIB).href)}); console.log(JSON.stringify([m.ACTIVE_PROFILE_SET, m.financeDailyTable('supplier-sales'), m.accountFeesTable('amazon-dashboard:account-fees')]));`],
   { env: { ...process.env, AMAZON_FINANCE_READ_PROFILE: 'cdb', AMAZON_FINANCE_READ_SOURCE: 'cdb' }, encoding: 'utf8' });
-  ok(r.status === 0 && r.stdout.trim() === JSON.stringify(['legacy', FIN, FEES]), 'env に cdb を入れても legacy のまま', { status: r.status, out: r.stdout, err: r.stderr.slice(0, 300) });
+  // 子のプロセスが起動できない (EPERM など) ときは stdout / stderr が無い = 原因 (r.error) を出して落ちる (Codex #1599 R1 Low)
+  ok(!r.error && r.status === 0 && String(r.stdout || '').trim() === JSON.stringify(['legacy', FIN, FEES]), 'env に cdb を入れても legacy のまま',
+    { status: r.status, error: r.error ? String(r.error.message || r.error) : null, out: String(r.stdout || '').slice(0, 300), err: String(r.stderr || '').slice(0, 300) });
 }
 
-console.log('\n── 5. 読み手が旧い写しの表の名前を直に書いていない ──');
+// ─────────── ソースを読む試験の道具 ───────────
+// コメント (/* */・行の // ・SQL の --) を除く (行の数は保つ = 行の番号がずれない)
+const strip = (s) => s.replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' ')).replace(/(^|[\s;,(){}])\/\/.*$/gm, '$1').replace(/--.*$/gm, '');
+const rel = (f) => path.relative(REPO, f).split(path.sep).join('/');
+const files = [];
 {
-  // コメント (/* */・行の // ・SQL の --) を除いてから探す
-  const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[\s;,(){}])\/\/.*$/gm, '$1').replace(/--.*$/gm, '');
-  const files = [];
   const walk = (d) => {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
       const p = path.join(d, e.name);
@@ -121,49 +130,191 @@ console.log('\n── 5. 読み手が旧い写しの表の名前を直に書い�
   };
   for (const d of ['apps', 'lib', 'mcp', 'tools', 'scripts']) if (fs.existsSync(path.join(REPO, d))) walk(path.join(REPO, d));
   files.push(path.join(REPO, 'server.js'));
-  const rel = (f) => path.relative(REPO, f).split(path.sep).join('/');
-  // 直に書いてよい所 = 読み口・写しへの書き込み (受け口・表の DDL)・miniPC の送り手・試験
-  const allowed = (r) => r === 'lib/amazon-finance-read.js'
-    || r === 'apps/warehouse-mirror/db.js' || r === 'apps/warehouse-mirror/router.js'
-    || r.startsWith('apps/warehouse/')
-    || /(^|\/)test-[^/]*$/.test(r) || /smoke[^/]*$/.test(r);
-  const LITERAL = /mirror_amazon_finance_sku_daily|mirror_amazon_account_fees_monthly/;
-  const offenders = [];
-  const calls = [];
-  for (const f of files) {
-    const r = rel(f);
-    const src = fs.readFileSync(f, 'utf8');
-    const code = strip(src);
-    if (LITERAL.test(code) && !allowed(r)) offenders.push(r);
-    if (r !== 'lib/amazon-finance-read.js' && !/(^|\/)test-[^/]*$/.test(r)) {
-      for (const m of code.matchAll(/\b(financeDailyTable|accountFeesTable)\(\s*'([^']+)'\s*\)/g)) calls.push({ file: r, fn: m[1], consumer: m[2] });
-      for (const m of code.matchAll(/\bconsumer:\s*'([^']+)'/g)) calls.push({ file: r, fn: 'opts.consumer', consumer: m[1] });
+}
+const isTestName = (r) => /(^|\/)test-[^/]*$/.test(r) || /(^|\/)[^/]*smoke[^/]*$/.test(r);
+const SRC = new Map(files.map((f) => [rel(f), strip(fs.readFileSync(f, 'utf8'))]));
+
+console.log('\n── 5. 旧い写しの表の名前を直に書いてよいのは「書き込み側の決まった使い方」だけ (Codex #1599 R1 M3) ──');
+const LITERAL = /mirror_amazon_finance_sku_daily|mirror_amazon_account_fees_monthly/;
+const T = '(mirror_amazon_finance_sku_daily|mirror_amazon_account_fees_monthly)';
+// ファイル × 行の形で許す (ファイル丸ごとは許さない)。読む (SELECT … FROM / JOIN) 形は 1 つだけ = 月の手数料の表の作り直しの写し
+const WRITE_SIDE_ALLOW = [
+  { file: 'lib/amazon-finance-read.js', re: new RegExp(`^\\s*(finance_daily|account_fees): '${T}',$`), why: '読み口の legacy の表の名前' },
+  { file: 'apps/warehouse-mirror/db.js', re: /^\s*db\.exec\(`CREATE TABLE IF NOT EXISTS mirror_amazon_finance_sku_daily \($/, why: '表の DDL' },
+  { file: 'apps/warehouse-mirror/db.js', re: /^\s*const have = new Set\(db\.prepare\(`PRAGMA table_info\(mirror_amazon_finance_sku_daily\)`\)/, why: '列の有無 (列を足す前)' },
+  { file: 'apps/warehouse-mirror/db.js', re: /^\s*if \(!have\.has\('\w+'\)\) db\.exec\(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN \w+ [^`]*`\);$/, why: '列を足す' },
+  { file: 'apps/warehouse-mirror/db.js', re: new RegExp(`^\\s*db\\.exec\\('CREATE INDEX IF NOT EXISTS \\w+ ON ${T}\\([^']*\\)'\\);$`), why: '索引' },
+  { file: 'apps/warehouse-mirror/db.js', re: /^\s*const maafmCur = db\.prepare\(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mirror_amazon_account_fees_monthly'`\)\.get\(\);$/, why: '表の定義を見る (作り直しの要否)' },
+  { file: 'apps/warehouse-mirror/db.js', re: /^\s*const maafmDeps = maafmCur \? db\.prepare\(`SELECT type, name FROM sqlite_master WHERE type IN \('view', 'trigger'\) AND sql LIKE '%mirror_amazon_account_fees_monthly%'`\)/, why: '依存する view / trigger を見る' },
+  { file: 'apps/warehouse-mirror/db.js', re: /^\s*console\.(error|log)\(['`]\[warehouse-mirror\] [^`']*mirror_amazon_account_fees_monthly/, why: 'ログの文字' },
+  { file: 'apps/warehouse-mirror/db.js', re: /^\s*db\.exec\(MAAFM_SQL\('mirror_amazon_account_fees_monthly(_new)?'\)\);$/, why: '表の DDL (作り直し)' },
+  { file: 'apps/warehouse-mirror/db.js', re: /^\s*db\.exec\(`INSERT INTO mirror_amazon_account_fees_monthly_new \(\$\{cols\}\) SELECT \$\{cols\} FROM mirror_amazon_account_fees_monthly`\);$/, why: '作り直しの写し (旧 → _new・同じ表)', readsOk: true },
+  { file: 'apps/warehouse-mirror/db.js', re: /^\s*db\.exec\('DROP TABLE mirror_amazon_account_fees_monthly'\);$/, why: '作り直し' },
+  { file: 'apps/warehouse-mirror/db.js', re: /^\s*db\.exec\('ALTER TABLE mirror_amazon_account_fees_monthly_new RENAME TO mirror_amazon_account_fees_monthly'\);$/, why: '作り直し' },
+  { file: 'apps/warehouse-mirror/router.js', re: new RegExp(`^\\s*INSERT OR REPLACE INTO ${T} \\($`), why: '受け口 (写しへの書き込み)' },
+  { file: 'apps/warehouse-mirror/router.js', re: new RegExp(`^\\s*mirror_table: '${T}',$`), why: '同期の entity の登録 (書き込み先)' },
+  { file: 'apps/warehouse/db.js', re: /^\s*'f_amazon_account_fees_monthly_v1', 'mirror_amazon_account_fees_monthly',$/, why: 'miniPC の同期の契約 (送り先の表)' },
+];
+const READS_OLD = new RegExp(`\\b(FROM|JOIN)\\s+${T}\\b`, 'i');
+/** 1 ファイルの違反の一覧 (許しに当たらない行・許しに当たっても読む形の行) */
+function literalViolations(file, code, hits) {
+  const out = [];
+  code.split('\n').forEach((raw, i) => {
+    const line = raw.replace(/\s+$/, '');   // 行の終わりの空白 (コメントを除いた跡) は見ない
+    if (!LITERAL.test(line)) return;
+    const a = WRITE_SIDE_ALLOW.find((x) => x.file === file && x.re.test(line));
+    if (!a) { out.push(`${file}:${i + 1}: ${line.trim().slice(0, 120)}`); return; }
+    if (READS_OLD.test(line) && !a.readsOk) { out.push(`${file}:${i + 1} (読む形): ${line.trim().slice(0, 120)}`); return; }
+    if (hits) hits.add(a);
+  });
+  return out;
+}
+{
+  // 試験のファイルを除いてよいのは「本番のコードから import されていない」ときだけ
+  const importedByProd = new Set();
+  for (const [r, code] of SRC) {
+    if (isTestName(r)) continue;
+    for (const m of code.matchAll(/(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)['"](\.{1,2}\/[^'"]+)['"]/g)) {
+      importedByProd.add(rel(path.resolve(path.dirname(path.join(REPO, r)), m[1])));
     }
   }
-  ok(offenders.length === 0, `読み口を通さずに旧い写しの表の名前を書いている所 = 0 (${files.length} 本を見た)`, offenders);
+  const testImportedByProd = [...importedByProd].filter((r) => isTestName(r) && SRC.has(r));
+  ok(testImportedByProd.length === 0, '本番のコードから import されている試験のファイルが無い (= 除いた試験は読み手になれない)', testImportedByProd);
 
-  // 統合の view の Amazon の枝は読み口を通す (db.js は DDL があるので丸ごとは許しているが、view の中は別に見る)
-  const db = fs.readFileSync(path.join(REPO, 'apps/warehouse-mirror/db.js'), 'utf8');
-  const start = db.indexOf('CREATE VIEW v_mall_finance_daily_unified AS');
-  const branch = start >= 0 ? db.slice(start, db.indexOf('UNION ALL', start)) : '';
-  ok(branch.includes("financeDailyTable('mall-finance-unified-view')") && !LITERAL.test(branch), "統合の view の Amazon の枝 = financeDailyTable('mall-finance-unified-view')");
-
-  // 呼び出しの consumer は一覧にある・dataset を宣言している
-  const bad = calls.filter((c) => {
-    const p = R.PROFILE_SETS.legacy[c.consumer];
-    if (!p) return true;
-    if (c.fn === 'financeDailyTable' || c.fn === 'opts.consumer') return !('finance_daily' in p);
-    return !('account_fees' in p);
-  });
-  ok(calls.length >= 15 && bad.length === 0, `読み口の呼び出し ${calls.length} か所の consumer が全部一覧にある`, bad);
-  // 一覧の consumer は必ずどこかで使われている (使われない profile を残さない)
-  const used = new Set(calls.map((c) => c.consumer));
-  // settledBySku(db, from, to, 'amazon-dashboard:xxx') のように引数で渡す所も数える
-  for (const f of files.filter((x) => rel(x) === 'apps/amazon-dashboard/queries.js')) {
-    for (const m of strip(fs.readFileSync(f, 'utf8')).matchAll(/'(amazon-dashboard:[a-z-]+)'/g)) used.add(m[1]);
+  const hits = new Set();
+  const viol = [];
+  for (const [r, code] of SRC) {
+    if (isTestName(r) && !importedByProd.has(r)) continue;
+    viol.push(...literalViolations(r, code, hits));
   }
-  const unused = Object.keys(EXPECTED).filter((c) => !used.has(c));
-  ok(unused.length === 0, '一覧の consumer は全部どこかで使われている', unused);
+  ok(viol.length === 0, `旧い写しの表の名前は書き込み側の決まった ${WRITE_SIDE_ALLOW.length} 形だけ (${SRC.size} 本を見た)`, viol);
+  const stale = WRITE_SIDE_ALLOW.filter((a) => !hits.has(a)).map((a) => `${a.file}: ${a.why}`);
+  ok(stale.length === 0, '許しは全部使われている (古い許しを残さない)', stale);
+
+  // 書き込み側のファイルに読む形を足すと落ちる (検査そのものの試験)
+  const inject = [
+    ['apps/warehouse-mirror/db.js', "  const n = db.prepare('SELECT COUNT(*) AS n FROM mirror_amazon_finance_sku_daily').get().n;"],
+    ['apps/warehouse-mirror/db.js', '      FROM mirror_amazon_finance_sku_daily'],
+    ['apps/warehouse-mirror/db.js', '    db.exec(`INSERT INTO mirror_amazon_account_fees_monthly_new (${cols}) SELECT ${cols} FROM mirror_amazon_finance_sku_daily`);'],
+    ['apps/warehouse-mirror/router.js', '    LEFT JOIN mirror_amazon_account_fees_monthly f ON f.date_jst = x.date_jst'],
+    ['apps/warehouse-mirror/router.js', "    const t = 'mirror_amazon_finance_sku_daily';"],
+    ['apps/warehouse/db.js', '  SELECT MAX(date_jst) FROM mirror_amazon_account_fees_monthly'],
+    ['lib/amazon-finance-read.js', "    cdb_daily: 'mirror_amazon_finance_sku_daily',"],
+    ['apps/amazon-dashboard/queries.js', '    FROM mirror_amazon_finance_sku_daily'],
+  ];
+  for (const [file, line] of inject) {
+    const code = `${SRC.get(file) || ''}\n${line}\n`;
+    ok(literalViolations(file, code).length === 1, `足すと落ちる: ${file} に「${line.trim().slice(0, 70)}」`);
+  }
+}
+
+console.log('\n── 6. どの関数がどの consumer で読むか (用途ごとの割り当てを固定・Codex #1599 R1 M2) ──');
+// 読み口を呼ぶ所を出てくる順に「種類:consumer」で並べた期待の表。🚨 読み手を足す・consumer を変えるときはここも直す
+//   financeDailyTable / accountFeesTable = 表の名前をもらう所 / settledBySku = 共通の SKU 集計に consumer を渡す所
+//   default = getSkuProfit の既定 / opts.consumer = getSkuProfit を consumer つきで呼ぶ所 / $consumer = 引数で受けた consumer をそのまま渡す所
+const D = (x) => `amazon-dashboard:${x}`;
+const ASSIGN = {
+  'apps/amazon-dashboard/queries.js': {
+    settledSummary: [`financeDailyTable:${D('overview')}`],                                   // 概要のタイル
+    getAccountFees: [`accountFeesTable:${D('account-fees')}`],                                // 月の手数料の表
+    accountFeesCostForMonth: [`accountFeesTable:${D('account-fees')}`],                       // 月のタイルの最終利益
+    getTrend: [`financeDailyTable:${D('trend')}`],                                            // 傾向
+    settledBySku: ['financeDailyTable:$consumer'],                                            // 共通の SKU 集計 (呼び手の consumer)
+    getWaterfall: [`financeDailyTable:${D('waterfall')}`, `settledBySku:${D('waterfall')}`],  // 滝の合計 / SKU 指定の広告の割り振り
+    getSkuProfit: [`default:${D('sku-profit')}`, 'settledBySku:$consumer', 'financeDailyTable:$consumer'],   // SKU の利益 (画面 / margin-alert)
+    lastSettledDate: [`financeDailyTable:${D('settled-boundary')}`],                          // 決済のそろった日
+    getAdsAnalysis: [`settledBySku:${D('ads')}`, `financeDailyTable:${D('ads')}`],            // 広告の SKU / 月の TACoS
+    getBestsellers: [`settledBySku:${D('bestsellers')}`, `settledBySku:${D('bestsellers')}`, `financeDailyTable:${D('bestsellers')}`],   // 今期 / 前期 / スパーク
+    getDiagnosis: [`settledBySku:${D('diagnosis')}`, `settledBySku:${D('diagnosis')}`, `settledBySku:${D('diagnosis')}`, `settledBySku:${D('diagnosis')}`,
+      `financeDailyTable:${D('diagnosis')}`, `financeDailyTable:${D('diagnosis')}`],          // 前月 / 前々月 / 赤字の月 / 広告垂れ流し / 30 日の売上 / 価格ミス
+  },
+  'apps/profit-analysis/margin-alert-job.js': { collectMarginRows: ['opts.consumer:margin-alert'] },
+  'apps/amazon-pricing/read-model.js': { '*': ['financeDailyTable:amazon-pricing'] },          // FINANCE_DAILY (360 行・必要な表・指紋・鮮度が使う)
+  'apps/amazon-pricing/engine.js': { describeInputs: ['financeDailyTable:amazon-pricing'] },   // 判定の監査の出どころ
+  'apps/supplier-sales/aggregate.js': { '*': ['financeDailyTable:supplier-sales'] },           // AMAZON_FINANCE_DAILY (4 つの SQL が使う)
+  'apps/site-products/router.js': { loadIndexes: ['financeDailyTable:site-products', 'financeDailyTable:site-products'] },
+  'apps/warehouse-mirror/db.js': { createTables: ['financeDailyTable:mall-finance-unified-view'] },
+};
+/** 読み口を呼ぶ所を出てくる順に (位置, 「種類:consumer」) */
+function readCalls(code) {
+  const res = [];
+  const lit = (q, id) => (q !== undefined ? q : `$${id}`);
+  for (const m of code.matchAll(/\b(financeDailyTable|accountFeesTable)\(\s*(?:'([^']*)'|([A-Za-z_$][\w$]*))\s*\)/g)) res.push([m.index, `${m[1]}:${lit(m[2], m[3])}`]);
+  for (const m of code.matchAll(/(?<!function\s)\bsettledBySku\(((?:[^()]|\([^()]*\))*)\)/g)) {
+    const last = m[1].split(',').pop().trim();
+    const q = /^'([^']*)'$/.exec(last);
+    res.push([m.index, `settledBySku:${q ? q[1] : `$${last}`}`]);
+  }
+  for (const m of code.matchAll(/\bopts\.consumer\s*\?\?\s*'([^']*)'/g)) res.push([m.index, `default:${m[1]}`]);
+  for (const m of code.matchAll(/\bconsumer:\s*'([^']*)'/g)) res.push([m.index, `opts.consumer:${m[1]}`]);
+  return res.sort((a, b) => a[0] - b[0]);
+}
+/** 関数の本体の [始まり, 終わり) (引数の既定値の {} を飛ばして本体の { から括弧を数える) */
+function functionRange(code, name) {
+  const m = new RegExp(`(^|\\n)[ \\t]*(?:export\\s+)?(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(code);
+  if (!m) return null;
+  let i = m.index + m[0].length, depth = 1;
+  while (i < code.length && depth) { if (code[i] === '(') depth++; else if (code[i] === ')') depth--; i++; }
+  const open = code.indexOf('{', i);
+  depth = 0;
+  for (let j = open; j < code.length; j++) {
+    if (code[j] === '{') depth++;
+    else if (code[j] === '}' && --depth === 0) return [open, j + 1];
+  }
+  return null;
+}
+function assignmentProblems(file, code, expect) {
+  const problems = [];
+  const calls = readCalls(code);
+  const claimed = new Set();
+  for (const [fn, want] of Object.entries(expect)) {
+    let inFn;
+    if (fn === '*') inFn = calls;
+    else {
+      const r = functionRange(code, fn);
+      if (!r) { problems.push(`${file}: 関数 ${fn} が見つからない`); continue; }
+      if (/\n[ \t]*(?:export\s+)?function\s/.test(code.slice(r[0], r[1]))) { problems.push(`${file}: ${fn} の本体を取り出せない (括弧の数え違い)`); continue; }
+      inFn = calls.filter(([p]) => p >= r[0] && p < r[1]);
+    }
+    for (const c of inFn) claimed.add(c);
+    const got = inFn.map(([, t]) => t);
+    if (JSON.stringify(got) !== JSON.stringify(want)) problems.push(`${file} ${fn}: 期待 ${JSON.stringify(want)} / 実際 ${JSON.stringify(got)}`);
+  }
+  const stray = calls.filter((c) => !claimed.has(c)).map(([, t]) => t);
+  if (stray.length) problems.push(`${file}: 表に無い所で読み口を呼んでいる ${JSON.stringify(stray)}`);
+  return problems;
+}
+{
+  // 読み口を import している本番のファイル = 表のファイル (読み手を足したら表に足さないと落ちる)
+  //   + getSkuProfit に consumer を渡して読むファイル (margin-alert-job.js は読み口を import せずに opts.consumer で読む)
+  const readers = [...SRC].filter(([r, code]) => !isTestName(r) && r !== 'lib/amazon-finance-read.js'
+    && (/amazon-finance-read\.js['"]/.test(code) || /\bconsumer:\s*'/.test(code))).map(([r]) => r).sort();
+  ok(JSON.stringify(readers) === JSON.stringify(Object.keys(ASSIGN).sort()), `読み口を使う本番のファイル ${readers.length} 本 = 割り当ての表のファイル`, readers);
+  const problems = Object.entries(ASSIGN).flatMap(([file, expect]) => assignmentProblems(file, SRC.get(file) || '', expect));
+  ok(problems.length === 0, '関数ごとの consumer の割り当てが表のとおり', problems);
+  // 表の consumer は全部一覧にあり、一覧の consumer は全部どこかに割り当てられている。dataset も合う
+  const tokens = Object.values(ASSIGN).flatMap((e) => Object.values(e).flat());
+  const bad = tokens.filter((t) => {
+    const [kind, ...rest] = t.split(':'); const c = rest.join(':');
+    if (c.startsWith('$')) return false;
+    const p = R.PROFILE_SETS.legacy[c];
+    if (!p) return true;
+    return kind === 'accountFeesTable' ? !('account_fees' in p) : !('finance_daily' in p);
+  });
+  ok(bad.length === 0, '表の consumer は全部一覧にあり、読む dataset を宣言している', bad);
+  const assigned = new Set(tokens.map((t) => t.split(':').slice(1).join(':')));
+  const unused = Object.keys(EXPECTED).filter((c) => !assigned.has(c));
+  ok(unused.length === 0, '一覧の consumer は全部どこかの関数に割り当てられている', unused);
+  // getSkuProfit が受ける consumer は 2 つだけ
+  const q = SRC.get('apps/amazon-dashboard/queries.js') || '';
+  ok(/const SKU_PROFIT_CONSUMERS = \['amazon-dashboard:sku-profit', 'margin-alert'\];/.test(q), "getSkuProfit が受ける consumer = 'amazon-dashboard:sku-profit'・'margin-alert' だけ");
+
+  // 検査そのものの試験: 割り当てを 1 つ間違えると落ちる (diagnosis の settledBySku を ads に)
+  const wrong = q.replace("settledBySku(db, adFrom, today, 'amazon-dashboard:diagnosis')", "settledBySku(db, adFrom, today, 'amazon-dashboard:ads')");
+  ok(wrong !== q && assignmentProblems('apps/amazon-dashboard/queries.js', wrong, ASSIGN['apps/amazon-dashboard/queries.js']).some((p) => p.includes('getDiagnosis')),
+    '割り当てを間違えると落ちる (getDiagnosis の settledBySku を amazon-dashboard:ads にした)');
+  const moved = q.replace("FROM ${financeDailyTable('amazon-dashboard:trend')}", "FROM ${financeDailyTable('amazon-dashboard:overview')}");
+  ok(moved !== q && assignmentProblems('apps/amazon-dashboard/queries.js', moved, ASSIGN['apps/amazon-dashboard/queries.js']).length > 0, '割り当てを間違えると落ちる (getTrend を overview にした)');
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件 OK / ${fail} 件 NG`);
