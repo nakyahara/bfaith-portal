@@ -435,6 +435,9 @@ function dailyRowRuleErrors(r, p) {
   iff(r.listing_resolution === 'resolved' && r.composition_basis === 'missing', has(reasons, 'composition_missing'), '構成が無い (composition_basis = missing) ⇔ 理由 composition_missing');
   if (r.listing_resolution === 'resolved' && r.composition_basis === 'listing_unresolved') e.push(`${p}.composition_basis: 解決した行に listing_unresolved`);
   iff(r.cost_basis === 'missing', ['listing_unresolved', 'composition_missing', 'cost_missing'].some((x) => has(reasons, x)), '原価が分からない ⇔ cost_basis = missing');
+  // 0050 の g_unres・g_comp・g_cost は排他 (g_cost = 出品あり かつ 構成あり かつ 原価が分からない・#1602 Codex R3 M1)
+  iff(has(reasons, 'cost_missing'), r.listing_resolution === 'resolved' && r.composition_basis !== 'missing' && r.cost_basis === 'missing',
+    '理由 cost_missing ⇔ 解決した行 かつ 構成あり (composition_basis ≠ missing) かつ cost_basis = missing (listing_unresolved・composition_missing と排他)');
   if (r.listing_resolution === 'resolved' && !has(reasons, 'composition_missing')) {
     const pre = has(notes, 'pre_audit_unverifiable'), after = has(notes, 'current_after_recorded_change');
     const want = pre ? 'pre_audit_unverifiable' : after ? 'current_after_recorded_change' : 'current_no_recorded_change';
@@ -498,7 +501,25 @@ function dailyErrors(body) {
     if (prev && cmpKey(prev, key) >= 0) errs.push(`${p}: 並び (日 → 出品 → SKU) が違う・行の鍵が重なる`);
     prev = key;
   });
+  errs.push(...dayLevelErrors(body.rows));
   return errs;
+}
+/**
+ * 日で決まる値は同じ日の行で全部同じ (#1602 Codex R3 M1 の「ほかの理由の漏れ」の突き合わせ)。0050 では
+ *   day_finance_status・finance_coverage_generation・finance_source_revision = days (日だけで結ぶ) / ad_status = ad_days (日だけで結ぶ) /
+ *   理由 ad_unresolved = ad_u (その日の出品の無い広告の行の数 > 0) = 行ではなく日の値
+ */
+export const DAY_LEVEL_FIELDS = Object.freeze(['day_finance_status', 'ad_status', 'finance_coverage_generation', 'finance_source_revision']);
+function dayLevelErrors(rows) {
+  const e = [], first = new Map();
+  rows.forEach((r, i) => {
+    if (!isObj(r)) return;
+    const sig = JSON.stringify([...DAY_LEVEL_FIELDS.map((k) => r[k]), has(r.profit_incomplete_reasons, 'ad_unresolved')]);
+    const d = String(r.economic_date_jst);
+    if (!first.has(d)) first.set(d, { sig, i });
+    else if (first.get(d).sig !== sig) e.push(`$.rows[${i}]: 同じ日 (${d}) の行 ${first.get(d).i} と、日で決まる値 (${DAY_LEVEL_FIELDS.join('・')}・理由 ad_unresolved) が違う`);
+  });
+  return e;
 }
 const cmpKey = (a, b) => {
   for (let i = 0; i < a.length; i++) {

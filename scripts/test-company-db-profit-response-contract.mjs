@@ -140,7 +140,8 @@ await t('/daily: 月の行をつなぐだけ (足さない) = daily-2months.expe
   assert.equal(r.status, 200);
   assert.deepEqual(r.body, dailyExp);
   assert.deepEqual(validateDailyResponse(dailyExp).errors, []);
-  assert.equal(dailyExp.rows.length, 4);
+  assert.equal(dailyExp.rows.length, 5);
+  assert.deepEqual([dailyExp.rows[4].cost_basis, dailyExp.rows[4].composition_basis, dailyExp.rows[4].profit_incomplete_reasons], ['missing', 'current_no_recorded_change', ['cost_missing']]);   // 本当の原価不足の行 (R3 M1)
   assert.deepEqual([dailyExp.rows[3].unclassified_component_count, dailyExp.rows[3].unmapped_component_count, dailyExp.rows[3].finance_legacy_rows, dailyExp.rows[3].profit_incomplete_reasons], [1, 1, 2, ['finance_unclassified']]);   // 件数が 0 でない行 (R2 M1)
   assert.deepEqual(dailyExp.months.map((m) => [m.month_start, m.has_finance_rows]), [['2026-07-01', true], ['2026-08-01', false]]);
   assert.deepEqual([...new Set([dailyExp.calculated_at, dailyExp.master_as_of, ...dailyExp.rows.map((x) => x.calculated_at), ...dailyExp.months.map((m) => m.calculated_at)])], [dailyIn.request.calculated_at]);
@@ -291,6 +292,16 @@ const breakDaily = [
   ['unclassified_component_count だけ 1・理由なし', (x) => { x.rows[0].unclassified_component_count = 1; }],
   ['unmapped_component_count だけ 1・理由なし', (x) => { x.rows[0].unmapped_component_count = 1; }],
   ['finance_legacy_rows だけ 1・理由なし', (x) => { x.rows[0].finance_legacy_rows = 1; }],
+  // 🆕 #1602 Codex R3 M1: cost_missing は listing_unresolved・composition_missing と排他 (0050 の g_unres・g_comp・g_cost)
+  ['未解決の行に cost_missing', (x) => { x.rows[1].profit_incomplete_reasons = ['listing_unresolved', 'cost_missing']; x.rows[1].assumed_zero_reasons = ['listing_unresolved', 'cost_missing']; }],
+  ['構成なしの行に cost_missing', (x) => { const r = x.rows[4]; r.composition_basis = 'missing'; r.composition_hash = null; r.profit_incomplete_reasons = ['composition_missing', 'cost_missing']; r.assumed_zero_reasons = ['composition_missing', 'cost_missing']; }],
+  ['本当の原価不足の行から cost_missing を落とす', (x) => { x.rows[4].profit_incomplete_reasons = []; x.rows[4].assumed_zero_reasons = []; }],
+  ['原価が分かる行に cost_missing (正式な値も null に)', (x) => { const r = x.rows[0]; r.profit_incomplete_reasons = ['cost_missing']; r.assumed_zero_reasons = ['cost_missing']; for (const k of ['contribution_before_ad_incl_jpy', 'contribution_before_ad_excl', 'contribution_after_ad_incl', 'contribution_after_ad_excl']) r[k] = null; }],
+  // 🆕 R3 の突き合わせ: 日で決まる値 (day_finance_status・ad_status・coverage の世代と版・理由 ad_unresolved) は同じ日の行で同じ
+  ['同じ日の行で day_finance_status が違う (行の中は整合)', (x) => { const r = x.rows[3]; r.day_finance_status = 'provisional'; r.profit_incomplete_reasons = ['finance_incomplete', 'finance_unclassified']; r.assumed_zero_reasons = ['finance_incomplete', 'finance_unclassified']; }],
+  ['同じ日の行で ad_status が違う (行の中は整合)', (x) => { x.rows[4].ad_status = 'complete'; }],
+  ['ad_unresolved が同じ日の 1 行だけ (行の中は整合)', (x) => { const r = x.rows[0]; r.profit_incomplete_reasons = ['ad_unresolved']; r.assumed_zero_reasons = ['ad_unresolved']; r.contribution_after_ad_incl = null; r.contribution_after_ad_excl = null; }],
+  ['同じ日の行で coverage の世代が違う', (x) => { x.rows[1].finance_coverage_generation = '13'; }],
 ];
 await t(`/daily: 契約を破った ${breakDaily.length} 通りを全部拒む`, async () => {
   for (const [name, f] of breakDaily) {
@@ -313,9 +324,20 @@ await t('/daily: 全部の列 × 全部の行で、null の規則 (nul) を逆�
   }
   assert.ok(n > 200, `${n}`);
 });
+await t('/daily: 受け取るべき形 (R3): 構成なしの行は composition_missing だけ・ad_unresolved は同じ日の全部の行に付く', async () => {
+  const a = clone(dailyExp); const r = a.rows[4];
+  r.composition_basis = 'missing'; r.composition_hash = null; r.profit_incomplete_reasons = ['composition_missing']; r.assumed_zero_reasons = ['composition_missing'];
+  assert.deepEqual(validateDailyResponse(a).errors, []);
+  const b = clone(dailyExp);
+  for (const r of b.rows.filter((r) => r.economic_date_jst === '2026-07-30')) {
+    r.profit_incomplete_reasons = [...r.profit_incomplete_reasons, 'ad_unresolved']; r.assumed_zero_reasons = [...r.assumed_zero_reasons, 'ad_unresolved'];
+    r.contribution_after_ad_incl = null; r.contribution_after_ad_excl = null;
+  }
+  assert.deepEqual(validateDailyResponse(b).errors, []);
+});
 await t('/daily: maybe の列は null でも値でもよい (世代・監査の時刻・coverage)', async () => {
   for (const c of DAILY_COLUMNS.filter((c) => c.nul === 'maybe')) {
-    const x = clone(dailyExp); x.rows[0][c.name] = null;
+    const x = clone(dailyExp); for (const r of x.rows) r[c.name] = null;   // 日で決まる列 (coverage) は同じ日の全部の行で同じ
     assert.deepEqual(validateDailyResponse(x).errors, [], c.name);
   }
 });

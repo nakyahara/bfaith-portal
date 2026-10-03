@@ -292,6 +292,8 @@ null の規則 (nul):
 - 構成が分かる解決した行の `composition_basis` = 印から決まる (`pre_audit_unverifiable` があればそれ・次に `current_after_recorded_change`・どちらも無ければ `current_no_recorded_change`)
 - `refund_units_status` = `unit_price_missing` ⇔ 理由 `refund_units_unknown` / `estimated_partial_month_unit_price` ⇔ 理由 `refund_units_partial_month` / この 2 つのときだけ `refund_incomplete_child_count = 1` (ほかは 0)
 - 🆕 `unclassified_component_count + unmapped_component_count + finance_legacy_rows > 0` ⇔ 理由 `finance_unclassified` (0050 の g_uncl・#1602 Codex R2)
+- 🆕 理由 `cost_missing` ⇔ 解決した行 かつ 構成あり (`composition_basis` ≠ `missing`) かつ `cost_basis = missing` = `listing_unresolved`・`composition_missing` と排他 (0050 の g_unres・g_comp・g_cost・#1602 Codex R3)
+- 🆕 **日で決まる値は同じ日の行で全部同じ**: `day_finance_status`・`finance_coverage_generation`・`finance_source_revision` (0050 の days を日だけで結ぶ)・`ad_status` (ad_days を日だけで結ぶ)・理由 `ad_unresolved` (ad_u = その日の出品の無い広告の行の数) (#1602 Codex R3 の突き合わせ)
 - `day_finance_status` が complete でない ⇔ 理由 `finance_incomplete` / `ad_status` = `not_collected` ⇔ `ad_not_collected`・`missing` ⇔ `ad_missing`・`legacy_incomplete` ⇔ `ad_legacy_unverified`
 - `assumed_zero_reasons` = `profit_incomplete_reasons` から `refund_units_partial_month` を除いたもの
 
