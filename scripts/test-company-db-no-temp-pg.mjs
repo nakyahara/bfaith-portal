@@ -248,10 +248,12 @@ try {
   const sid = (co, code) => `(select supplier_id from core.suppliers where company_id = ${co} and code = ${lit(code)})`;
   const sku = (co, code) => `insert into core.skus (company_id, sku_kind, code, name) values (${co}, 'set', ${lit(code)}, ${lit(code)});\n`;
   const kid = (co, code) => `(select sku_id from core.skus where company_id = ${co} and code = ${lit(code)})`;
-  const ss = (co, scode, kcode, o = {}) => `insert into core.supplier_skus (company_id, supplier_id, sku_id, vendor_code, order_unit, stock_units_per_order_unit, min_order_qty, order_multiple, unit_cost_jpy, lead_time_days, active, is_primary, created_by_type, created_by_id)
-    values (${co}, ${sid(co, scode)}, ${kid(co, kcode)}, ${lit(o.vendor)}, ${lit(o.unit)}, ${lit(o.units)}, ${lit(o.moq)}, ${lit(o.mult)}, ${lit(o.cost)}, ${lit(o.lt)}, ${o.active === false ? 'false' : 'true'}, ${o.primary ? 'true' : 'false'}, ${lit(o.by || 'system')}, ${lit(o.byId)});\n`;
+  /** 時刻: null = now() / 数 = 決まった時刻 + その秒数 + マイクロ秒 (時差 +09 つき = jsonb の変数を行き来しても 1 マイクロ秒も変わらないかを見る) */
+  const ts = (sec) => (sec == null ? 'now()' : `timestamptz '2026-03-04 05:06:07.123456+09' + interval '${sec} seconds' + interval '${(sec * 7919) % 1000000} microseconds'`);
+  const ss = (co, scode, kcode, o = {}) => `insert into core.supplier_skus (company_id, supplier_id, sku_id, vendor_code, order_unit, stock_units_per_order_unit, min_order_qty, order_multiple, unit_cost_jpy, lead_time_days, active, is_primary, created_by_type, created_by_id, created_at)
+    values (${co}, ${sid(co, scode)}, ${kid(co, kcode)}, ${lit(o.vendor)}, ${lit(o.unit)}, ${lit(o.units)}, ${lit(o.moq)}, ${lit(o.mult)}, ${lit(o.cost)}, ${lit(o.lt)}, ${o.active === false ? 'false' : 'true'}, ${o.primary ? 'true' : 'false'}, ${lit(o.by || 'system')}, ${lit(o.byId)}, ${ts(o.at)});\n`;
   const doc = (ref) => `insert into docs.documents (company_id, document_type, storage, external_ref, title) values (1, 'contract', 'url', ${lit(ref)}, ${lit(ref)});\n`;
-  const link = (ref, co, scode, role) => `insert into docs.document_links (document_id, entity_type, entity_id, link_role) values ((select document_id from docs.documents where external_ref = ${lit(ref)}), 'supplier', ${sid(co, scode)}, ${lit(role)});\n`;
+  const link = (ref, co, scode, role, when = null) => `insert into docs.document_links (document_id, entity_type, entity_id, link_role, created_at) values ((select document_id from docs.documents where external_ref = ${lit(ref)}), 'supplier', ${sid(co, scode)}, ${lit(role)}, ${ts(when)});\n`;
   const po = (ref, co, scode) => `insert into core.purchase_orders (company_id, source_ref, supplier_id, supplier_code, supplier_name, status, source_updated_at) values (${co}, ${lit(ref)}, ${sid(co, scode)}, ${lit(scode)}, 'x', 'draft', now());\n`;
   const ext = (co, scode, value) => `insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id) values (${co}, 'supplier', ${sid(co, scode)}, 'purchase_orders', 'supplier_code', ${lit(value)}, 'imported', 'system', 'test');\n`;
   const MERGE = 'select * from core.merge_duplicate_suppliers()';
@@ -264,7 +266,8 @@ try {
       + sup(2, '1', 'いろは側の 1') + sup(2, '0001', 'いろは側の 0001');                 // 会社をまたぐ同じコード = 会社の中だけでまとめる
     for (const k of ['ska', 'skb', 'skb2', 'skc', 'skd', 'ske', 'skp', 'skq']) s += sku(1, k);
     s += sku(2, 'skz');
-    s += ss(1, '0001', 'ska') + ss(1, '0001', 'skb') + ss(1, '1', 'ska', { vendor: 'V-A', units: 12, cost: 100, by: 'human', byId: 'u1' }) + ss(1, '1', 'skc', { vendor: 'V-C', moq: 2 })
+    s += ss(1, '0001', 'ska') + ss(1, '0001', 'skb', { vendor: 'K-B', cost: 50, lt: 3 }) + ss(1, '1', 'skb', { vendor: 'D-B1', units: 7, cost: 60 }) + ss(1, '01', 'skb', { vendor: 'D-B2', lt: 9, mult: 2 })   // 残す行と寄せる行の両方に値 = 残す行が先
+      + ss(1, '1', 'ska', { vendor: 'V-A', units: 12, cost: 100, by: 'human', byId: 'u1' }) + ss(1, '1', 'skc', { vendor: 'V-C', moq: 2 })
       + ss(1, '01', 'skc', { vendor: 'V-C2', mult: 3, lt: 5 }) + ss(1, '01', 'skd', { vendor: 'V-D', unit: 'case', active: false }) + ss(1, '900', 'ska', { vendor: 'T-A' })
       + ss(1, '0001', 'skb2') + ss(1, '1', 'skb2', { vendor: 'V-B1' }) + ss(1, '01', 'skb2', { units: 24 }) + ss(1, '1', 'ske') + ss(1, '01', 'ske', { vendor: 'V-E2', units: 6 })
       + ss(1, '0001', 'skp') + ss(1, '01', 'skp', { primary: true, vendor: 'P' })        // 代表の印は寄せる行にだけ = 消してから残す行に付く
@@ -281,7 +284,7 @@ try {
     const codes = { 1: new Set(), 2: new Set() };
     const forms = (n) => [String(n), String(n).padStart(2, '0'), String(n).padStart(4, '0'), String(n).padStart(6, '0'), `A-${String(n).padStart(2, '0')}`];
     for (let i = 0; i < 3 + Math.floor(r() * 40); i++) {
-      const co = r() < 0.85 ? 1 : 2; const code = pick(forms(1 + Math.floor(r() * 12)));
+      const co = r() < 0.85 ? 1 : 2; const code = pick(forms(1 + Math.floor(r() * 6)));   // 6 つの番号に 5 つの形 = 二重の連鎖が多い
       if (codes[co].has(code)) continue; codes[co].add(code);
       s += sup(co, code, r() < 0.35 ? code : `仕入先${seed}_${i}`, { om: maybe(0.4, pick(['email', 'fax', 'web'])), lt: maybe(0.4, Math.floor(r() * 30)), active: r() < 0.85,
         email_to: maybe(0.3, `to${i}@example.invalid`), email_cc: maybe(0.2, `cc${i}@example.invalid`), contact_name: maybe(0.3, `担当${i}`), fax: maybe(0.2, `06-${i}`), relay_to: maybe(0.1, `relay${i}`), memo: maybe(0.2, `memo${i}`) });
@@ -292,15 +295,15 @@ try {
     for (const co of [1, 2]) {
       const list = [...codes[co]];
       for (const sc of list) for (const k of skus[co]) {
-        if (r() > 0.3) continue;
+        if (r() > 0.5) continue;
         const primary = !primaryTaken.has(`${co}/${k}`) && r() < 0.3; if (primary) primaryTaken.add(`${co}/${k}`);
         s += ss(co, sc, k, { vendor: maybe(0.5, `V${Math.floor(r() * 99)}`), unit: maybe(0.3, pick(['case', 'inner', 'each'])), units: maybe(0.4, 1 + Math.floor(r() * 48)),
           moq: maybe(0.3, 1 + Math.floor(r() * 10)), mult: maybe(0.3, 1 + Math.floor(r() * 6)), cost: maybe(0.5, Math.floor(r() * 5000)), lt: maybe(0.3, Math.floor(r() * 20)),
-          active: r() < 0.85, primary, by: pick(['system', 'human', 'ai']), byId: maybe(0.5, `by${Math.floor(r() * 5)}`) });
+          active: r() < 0.85, primary, by: pick(['system', 'human', 'ai']), byId: maybe(0.5, `by${Math.floor(r() * 5)}`), at: maybe(0.6, Math.floor(r() * 9e6)) });
       }
       for (let d = 0; d < 3; d++) {
         const ref = `doc${seed}_${co}_${d}`; s += doc(ref);
-        for (const sc of list) if (r() < 0.3) s += link(ref, co, sc, maybe(0.5, pick(['evidence', 'attachment', 'main_image'])));
+        for (const sc of list) if (r() < 0.3) s += link(ref, co, sc, maybe(0.5, pick(['evidence', 'attachment', 'main_image'])), maybe(0.6, Math.floor(r() * 9e6)));
       }
       list.forEach((sc, i) => { if (r() < 0.3) s += po(`po${seed}_${co}_${i}`, co, sc); if (r() < 0.3) s += ext(co, sc, `x${seed}_${co}_${i}`); });
     }
@@ -352,6 +355,9 @@ try {
   await t('決まった fixture: 3 つの連鎖・会社をまたぐ同じコード・連絡先・有効・代表の印・文書の重なり・発注・外部 ID・コードの書き換え / 2 回目は何もしない', async () => {
     const { b } = await compare('決まった', mergeFixed(), [MERGE, MERGE], { oldUsesTemp: true });
     assert.equal(JSON.parse(b.results[0].ok[0]).merged_suppliers, 6);
+    // 残す行と寄せる行の両方に値がある列は残す行の値・残す行が空の列は寄せる行 (supplier_id の順) の値 (0025 / 0027 の契約)
+    const skb = b.snap['core.supplier_skus'].map((j) => JSON.parse(j)).filter((x) => x.vendor_code === 'K-B');
+    assert.deepEqual(skb.map((x) => [x.stock_units_per_order_unit, x.unit_cost_jpy, x.lead_time_days, x.order_multiple]), [[7, 50, 3, 2]]);
     assert.deepEqual(JSON.parse(b.results[1].ok[0]).merged_suppliers, 0);
   });
   await t('二重の無い仕入先だけ (コードの書き換えだけ)', async () => {
