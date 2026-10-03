@@ -70,7 +70,9 @@ const url = `postgres://postgres:${SU_PW}@127.0.0.1:${port}/postgres`;
 console.log('使い捨てのクラスタ: embedded-postgres ' + PINNED_EMBEDDED_PG + ' (' + loaded.from + ')');
 
 let ok = 0, ng = 0;
-const t = async (name, fn) => { const t0 = Date.now(); try { await fn(); ok++; console.log('  ok  ' + name + ' (' + (Date.now() - t0) + ' ms)'); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
+const t = async (name, fn) => { const t0 = Date.now(); try { await fn(); ok++; console.log('  ok  ' + name + ' (' + (Date.now() - t0) + ' ms)'); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); await afterFail(); } };
+// 落ちた試験が接続を取引の途中 (aborted) や lock を持ったままにしても、次の試験に連鎖させない (接続ができた後に中身を入れる)
+let afterFail = async () => {};
 const quiet = () => {};
 const hex = crypto.randomBytes(4).toString('hex');
 const OWNER = `cdb_rro_${hex}`, PROBE = `cdb_rrp_${hex}`, NOTEMP = `cdb_rrn_${hex}`, PW = `t_${crypto.randomBytes(12).toString('hex')}`;
@@ -114,6 +116,7 @@ try {
       create trigger trg_t_touch_log after update on core.orders for each row execute function t.log_touch();`);
     const W1 = await open('watcher'), P = await open(PROBE), N = await open(NOTEMP);
     const LB1 = await open(OWNER), LB2 = await open(OWNER), LB3 = await open(OWNER);   // 別の書き手 (lock を持つ)
+    afterFail = async () => { for (const c of [O, N, W1, P, LB1, LB2, LB3]) await c.query('rollback').catch(() => {}); };
 
     // ─── fixture ───
     let orderNo = 0;
