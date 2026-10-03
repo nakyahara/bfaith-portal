@@ -573,11 +573,15 @@ export function claimJob(db, { runnerRunId, maxImages, now = Date.now() } = {}) 
       if (!job) {
         return skipped.length
           ? { ok: true, job: null, too_many_images: skipped.length,
-            error: `画像が ${cap} 枚より多い依頼を、この実行役は落とせません (miniPC で install.ps1 を流して phlp を新しくしてください)` }
+            error: `この実行役は扱えない依頼があります (画像が ${cap} 枚より多い / 素材つき)。miniPC で install.ps1 を流して phlp を新しくしてください` }
           : { ok: true, job: null };
       }
       try {
-        if ((JSON.parse(job.packet_json).images || []).length > cap) { skipped.push(job.id); continue; }
+        const imgs = JSON.parse(job.packet_json).images || [];
+        // 🚨 枚数を言わない古い phlp には、6 枚以下でも素材つきの依頼を掴ませない (codex #1593 R2 Medium)。
+        //    古い phlp とスキルは素材も添付画像の説明も知らないので、素材を商品の手本として扱ってしまう
+        const legacy = !posInt(maxImages);
+        if (imgs.length > cap || (legacy && imgs.some((im) => isMaterialRole(im?.role)))) { skipped.push(job.id); continue; }
       } catch { /* 壊れた packet は下の照合で failed にする */ }
       // 🚨 claim は「材料を AI に渡す瞬間」= 材料固定という設計の芯が試される所。
       //    保存済みの hash を信じず、**中身から計算し直して**照合する (コード R7 #1)。

@@ -695,6 +695,19 @@ console.log('⑭ 素材画像 = 画像フォルダの下のフォルダの画像
   ok(!cOld2.job || cOld2.job.job_id !== rM.job.id, '6 枚と言う実行役も掴まない');
   if (cOld2.job) lp.releaseJob(db, cOld2.job.job_id, { leaseToken: cOld2.job.lease_token, now: min(4000.75) });
   eq(db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(rM.job.id).status, 'queued', '掴まれなかった依頼は queued のまま (新しい phlp が拾う)');
+  // 🚨 6 枚以下でも素材つきなら、枚数を言わない古い phlp には掴ませない (古いスキルは素材を知らない・codex #1593 R2 Medium)
+  const dS = mkDraft('MAT-S', 'ハッカ油スプレー MATS');
+  const rS = lp.requestJob(db, args(dS, lp.latestSpec(db), 'key-mat-s', { now: min(4000.61), images: [{ file_id: 'FILEIDSMALL1', role: 'slot:1' }, { file_id: 'FILEIDSMALLM', role: 'material', name: 's.jpg', folder: '素材' }] }));
+  ok(rS.ok, '商品 1 + 素材 1 の依頼');
+  for (let i = 0; i < 20; i++) {
+    const c = lp.claimJob(db, { runnerRunId: 'run-old-phlp-s', now: min(4000.62) });
+    ok(!c.job || c.job.job_id !== rS.job.id, i === 0 ? '🚨 枚数を言わない古い phlp は、素材つきなら 2 枚でも掴まない' : '(続き)');
+    if (!c.job) { ok(c.too_many_images >= 1 && /素材つき/.test(c.error || ''), `掴めない理由を返す (${c.error})`); break; }
+    lp.releaseJob(db, c.job.job_id, { leaseToken: c.job.lease_token, now: min(4000.62) });
+    db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?`).run(c.job.job_id);
+  }
+  eq(db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(rS.job.id).status, 'queued', '素材つきの依頼は queued のまま');
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?`).run(rS.job.id);   // 下の claim が拾わないように
   let cNew = null;
   for (let i = 0; i < 20; i++) {
     cNew = lp.claimJob(db, { runnerRunId: 'lpr-20261003-090000-nnnnnn', maxImages: 16, now: min(4000.8) });
