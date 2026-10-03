@@ -15,14 +15,21 @@
  * 原価は「構成品の原価 × (1+消費税率) × 数量」の合計。★構成品に原価の無いものが 1 つでもあれば
  * 合計を NULL にする (SUM が NULL を無視して「安い合計」を出すのを防ぐ。原価不明を 0 円として扱わない)。
  * SKU の突合は fact 側 (fees / finance / resolved) を LOWER(TRIM()) で片側正規化 (lib/sku-norm.js の規約)。
+ *
+ * Amazon の財務の表の名前は共通の読み口 (lib/amazon-finance-read.js・consumer 'amazon-pricing') からもらう (F4-1・2026-10-03)。
+ * 今は legacy = mirror_amazon_finance_sku_daily。SQL の中身は変えていない。
  */
+import { financeDailyTable } from '../../lib/amazon-finance-read.js';
+
+/** 販売実績 (直近 30 日の数量・売上) の表 */
+const FINANCE_DAILY = financeDailyTable('amazon-pricing');
 
 export const REQUIRED_MIRROR_TABLES = [
   'mirror_amazon_sku_fees',
   'mirror_amazon_price_snapshot_daily',
   'mirror_sku_resolved',
   'mirror_products',
-  'mirror_amazon_finance_sku_daily',
+  FINANCE_DAILY,
   'mirror_inv_daily_detail',
 ];
 
@@ -61,7 +68,7 @@ sales AS (
   SELECT LOWER(TRIM(seller_sku)) AS sku_norm,
          SUM(units_net_sold) AS units_30d,
          SUM(sales_principal_jpy) AS sales_30d
-    FROM mirror_amazon_finance_sku_daily
+    FROM ${FINANCE_DAILY}
    WHERE date_jst > date((SELECT d FROM latest), '-30 days')
    GROUP BY LOWER(TRIM(seller_sku))
 )
@@ -153,7 +160,7 @@ export function inputFingerprint(db) {
   const res = db.prepare('SELECT COUNT(*) AS n, MAX(synced_at) AS t FROM mirror_sku_resolved').get();
   const prod = db.prepare('SELECT COUNT(*) AS n, MAX(updated_at) AS t FROM mirror_products').get();
   // 販売実績 (units_30d と NO_SALES_30D の旗の材料) も入力なので指紋に含める (Codex R7)
-  const fin = db.prepare('SELECT COUNT(*) AS n, MAX(date_jst) AS d, MAX(synced_at) AS t FROM mirror_amazon_finance_sku_daily').get();
+  const fin = db.prepare(`SELECT COUNT(*) AS n, MAX(date_jst) AS d, MAX(synced_at) AS t FROM ${FINANCE_DAILY}`).get();
   return {
     snapshotDate: snap?.d ?? null,
     fingerprint: [snap?.d ?? '-', snap?.n ?? 0, snap?.t ?? '-', fees?.n ?? 0, fees?.t ?? '-', res?.n ?? 0, res?.t ?? '-', prod?.n ?? 0, prod?.t ?? '-',
@@ -165,7 +172,7 @@ export function inputFingerprint(db) {
 export function dataFreshness(db) {
   const snap = db.prepare('SELECT MAX(date_jst) AS d, COUNT(*) AS n FROM mirror_amazon_price_snapshot_daily WHERE date_jst = (SELECT MAX(date_jst) FROM mirror_amazon_price_snapshot_daily)').get();
   const fees = db.prepare('SELECT MAX(fetched_at) AS t, COUNT(*) AS n FROM mirror_amazon_sku_fees').get();
-  const fin = db.prepare('SELECT MAX(date_jst) AS d FROM mirror_amazon_finance_sku_daily').get();
+  const fin = db.prepare(`SELECT MAX(date_jst) AS d FROM ${FINANCE_DAILY}`).get();
   return {
     snapshot_date_jst: snap?.d ?? null, snapshot_rows: snap?.n ?? 0,
     fees_fetched_at: fees?.t ?? null, fees_rows: fees?.n ?? 0,

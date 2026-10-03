@@ -3,6 +3,8 @@
  *
  * 使用テーブル (mirror_* = miniPC 同期、amzdash_* = 本アプリ専用):
  *   mirror_amazon_finance_sku_daily   確定利益 (settlement 起点、税抜、日次×SKU)
+ *                                     ※ この表と mirror_amazon_account_fees_monthly の名前は SQL に直に書かない =
+ *                                       lib/amazon-finance-read.js の読み口から consumer ごとにもらう (F4-1・2026-10-03)
  *   mirror_f_sales_by_listing         速報売上 (受注ベース、税込、mall='amazon')
  *   mirror_amazon_ads_sku_daily       広告費 SKU/ASIN 別 (PR-A で同期)
  *   mirror_amazon_ads_campaign_daily  広告費 キャンペーン単位 全額 (PR-A で同期)
@@ -18,6 +20,8 @@
  *   の 3 種を API レスポンスの precision フィールドで常に区別する。
  */
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+// Amazon の財務の表の名前は共通の読み口から (F4-1・2026-10-03)。consumer ごとの profile = lib/amazon-finance-read.js (今は全部 legacy = 下の mirror_* の表)
+import { financeDailyTable, accountFeesTable } from '../../lib/amazon-finance-read.js';
 
 // 消費税率 (速報→税抜の概算換算用。軽減税率 SKU は過大控除になるが「推定」ラベル前提)
 const TAX_RATE = 1.1;
@@ -202,7 +206,7 @@ function settledSummary(db, from, to) {
       COALESCE(SUM(cogs_amount),0) AS cogs,
       COUNT(DISTINCT date_jst) AS days_with_data,
       ${PROMO_TAX_MISSING_DAYS_SQL} AS promo_tax_missing_days
-    FROM mirror_amazon_finance_sku_daily
+    FROM ${financeDailyTable('amazon-dashboard:overview')}
     WHERE date_jst >= ? AND date_jst <= ?
   `).get(from, to);
 }
@@ -253,7 +257,7 @@ export function getAccountFees(monthsBack = 13) {
   const fromMonth = monthStart(addMonths(monthOf(jstToday()), -(monthsBack - 1)));
   const raw = db.prepare(`
     SELECT date_jst, fee_type, amount_jpy, row_count
-    FROM mirror_amazon_account_fees_monthly
+    FROM ${accountFeesTable('amazon-dashboard:account-fees')}
     WHERE date_jst >= ? ORDER BY date_jst, fee_type
   `).all(fromMonth);
   const byMonth = new Map();
@@ -274,7 +278,7 @@ export const ACCOUNT_FEE_TAX_RATE = 0.10;
 function accountFeesCostForMonth(db, ym, { incl = false } = {}) {
   const r = db.prepare(`
     SELECT COALESCE(SUM(amount_jpy), 0) AS net
-    FROM mirror_amazon_account_fees_monthly WHERE date_jst = ?
+    FROM ${accountFeesTable('amazon-dashboard:account-fees')} WHERE date_jst = ?
   `).get(`${ym}-01`);
   return incl ? Math.round(-r.net) : Math.round(-r.net / (1 + ACCOUNT_FEE_TAX_RATE));   // incl = 税込で引く計算 (2026-09-29)
 }
@@ -381,7 +385,7 @@ export function getTrend(from, to, granularity) {
            SUM(${PROFIT_EX_SQL}) AS profit_before_ads,
            SUM(profit_amount) AS profit_before_ads_incl,
            SUM(refund_principal_jpy) AS refunds
-    FROM mirror_amazon_finance_sku_daily
+    FROM ${financeDailyTable('amazon-dashboard:trend')}
     WHERE date_jst >= ? AND date_jst <= ?
     GROUP BY bucket ORDER BY bucket
   `).all(from, to);
@@ -535,7 +539,8 @@ function attachProductNames(db, rows, skuField = 'seller_sku') {
 }
 
 // ─── SKU 別 確定集計 (利益分析/広告/売れ筋/診断の共通ベース) ───
-function settledBySku(db, from, to) {
+// consumer = 呼び手の画面 (読み口の profile のキー。F4-1)
+function settledBySku(db, from, to, consumer) {
   return attachProductNames(db, db.prepare(`
     SELECT seller_sku, MAX(asin_norm) AS asin_norm, MAX(product_name) AS product_name,
       SUM(units_net_sold) AS units_net,
@@ -558,7 +563,7 @@ function settledBySku(db, from, to) {
       SUM(easy_ship_jpy) AS easy_ship_incl,   -- 2026-09-28: SKU に割り振った Easy Ship の配送料 (決済の額 = 税込)。profit_amount には入っていない
       MAX(cost_status) AS cost_status_sample,
       MIN(is_cost_complete) AS all_cost_complete
-    FROM mirror_amazon_finance_sku_daily
+    FROM ${financeDailyTable(consumer)}
     WHERE date_jst >= ? AND date_jst <= ?
     GROUP BY seller_sku
   `).all(from, to));
@@ -595,14 +600,14 @@ export function getWaterfall(from, toReq, sku) {
       COALESCE(SUM(${PROFIT_EX_SQL}),0) AS profit_before_ads,
       COALESCE(SUM(profit_amount),0) AS profit_before_ads_incl,
       ${PROMO_TAX_MISSING_DAYS_SQL} AS promo_tax_missing_days
-    FROM mirror_amazon_finance_sku_daily
+    FROM ${financeDailyTable('amazon-dashboard:waterfall')}
     WHERE date_jst >= ? AND date_jst <= ? ${skuCond}
   `).get(...params);
 
   // 広告費: 全体 = campaign 正本 / SKU 指定 = direct + 按分
   let adCostValue;
   if (sku) {
-    const skuRows = settledBySku(db, from, to);
+    const skuRows = settledBySku(db, from, to, 'amazon-dashboard:waterfall');
     const { alloc } = allocateAdCost(db, from, to, skuRows);
     const a = alloc.get(sku) || { direct: 0, allocated: 0 };
     adCostValue = a.direct + a.allocated;
@@ -635,10 +640,15 @@ export function getWaterfall(from, toReq, sku) {
 }
 
 // ─── 利益分析タブ: SKU テーブル ───
+// opts.consumer = 読み口の profile のキー (画面 = 既定 'amazon-dashboard:sku-profit'・夜の通知 = 'margin-alert'。F4-1)。
+//   画面の口 (router.js) は opts.consumer を渡さない (query から取らない)
+const SKU_PROFIT_CONSUMERS = ['amazon-dashboard:sku-profit', 'margin-alert'];
 export function getSkuProfit(from, to, opts = {}) {
+  const consumer = opts.consumer ?? 'amazon-dashboard:sku-profit';
+  if (!SKU_PROFIT_CONSUMERS.includes(consumer)) throw new Error(`getSkuProfit: consumer '${consumer}' は使えない (${SKU_PROFIT_CONSUMERS.join(' / ')})`);
   const db = getMirrorDB();
   const win = settledWindow(db, from, to);   // 決済と広告費を同じ日の範囲で (#1499 の続き)
-  const skuRows = settledBySku(db, from, win.effective_to);
+  const skuRows = settledBySku(db, from, win.effective_to, consumer);
   const { alloc, campaignTotal, unallocated } = allocateAdCost(db, from, win.effective_to, skuRows);
 
   let rows = skuRows.map(r => {
@@ -695,7 +705,7 @@ export function getSkuProfit(from, to, opts = {}) {
   const total = rows.length;
   const limit = Math.min(Number(opts.limit) || 100, 20000);
   const offset = Math.max(Number(opts.offset) || 0, 0);
-  const promoTaxMissing = db.prepare(`SELECT ${PROMO_TAX_MISSING_DAYS_SQL} AS n FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(from, win.effective_to).n || 0;
+  const promoTaxMissing = db.prepare(`SELECT ${PROMO_TAX_MISSING_DAYS_SQL} AS n FROM ${financeDailyTable(consumer)} WHERE date_jst >= ? AND date_jst <= ?`).get(from, win.effective_to).n || 0;
   return {
     from, to, total, settled: win,
     promo_tax_missing_days: promoTaxMissing,
@@ -722,7 +732,7 @@ export const NOT_EASY_SHIP_ONLY_ROW = `NOT (units_ordered = 0 AND units_refunded
   AND warehouse_damage_jpy = 0 AND warehouse_lost_jpy = 0 AND safe_t_jpy = 0 AND refund_principal_jpy = 0 AND reversal_reimbursement_jpy = 0
   AND misc_fee_jpy = 0 AND other_fee_jpy = 0 AND other_amount_jpy = 0)`;
 export function lastSettledDate(db) {
-  const r = db.prepare(`SELECT MAX(date_jst) AS d FROM mirror_amazon_finance_sku_daily WHERE ${NOT_EASY_SHIP_ONLY_ROW}`).get();
+  const r = db.prepare(`SELECT MAX(date_jst) AS d FROM ${financeDailyTable('amazon-dashboard:settled-boundary')} WHERE ${NOT_EASY_SHIP_ONLY_ROW}`).get();
   return r && r.d ? r.d : null;
 }
 /**
@@ -751,7 +761,7 @@ export function getAdsAnalysis(from, to) {
   const settings = getSettings();
   const win = settledWindow(db, from, to);
   const lastSettled = win.last_date, complete = win.complete_to, effTo = win.effective_to;
-  const skuRows = settledBySku(db, from, effTo);
+  const skuRows = settledBySku(db, from, effTo, 'amazon-dashboard:ads');
   const { alloc, campaignTotal, directTotal, unallocated } = allocateAdCost(db, from, effTo, skuRows);
 
   // fee 参考値 + 原価 (損益分岐 ACOS 用)
@@ -819,7 +829,7 @@ export function getAdsAnalysis(from, to) {
     ), rev AS (
       SELECT substr(date_jst,1,7) AS ym,
              SUM(sales_principal_jpy + sales_shipping_jpy + sales_giftwrap_jpy) AS revenue
-      FROM mirror_amazon_finance_sku_daily WHERE (? IS NULL OR date_jst <= ?) GROUP BY ym
+      FROM ${financeDailyTable('amazon-dashboard:ads')} WHERE (? IS NULL OR date_jst <= ?) GROUP BY ym
     )
     SELECT rev.ym, rev.revenue, COALESCE(ad.ad_cost,0) AS ad_cost,
            CASE WHEN rev.revenue > 0 THEN ROUND(COALESCE(ad.ad_cost,0)/rev.revenue*1000)/10.0 END AS tacos_pct
@@ -853,8 +863,8 @@ export function getBestsellers(from, toReq, axis) {
   const prevTo = addDays(from, -1);
   const prevFrom = addDays(prevTo, -(days - 1));
 
-  const cur = settledBySku(db, from, to);
-  const prevMap = new Map(settledBySku(db, prevFrom, prevTo).map(r => [r.seller_sku, r]));
+  const cur = settledBySku(db, from, to, 'amazon-dashboard:bestsellers');
+  const prevMap = new Map(settledBySku(db, prevFrom, prevTo, 'amazon-dashboard:bestsellers').map(r => [r.seller_sku, r]));
   const { alloc } = allocateAdCost(db, from, to, cur);
 
   // FBA/FBM 内訳 (速報系、channel 列)
@@ -938,7 +948,7 @@ export function getBestsellers(from, toReq, axis) {
     const ph = topSkus.map(() => '?').join(',');
     const sparkRows = db.prepare(`
       SELECT seller_sku, date_jst, SUM(units_net_sold) AS units
-      FROM mirror_amazon_finance_sku_daily
+      FROM ${financeDailyTable('amazon-dashboard:bestsellers')}
       WHERE date_jst >= ? AND date_jst <= ? AND seller_sku IN (${ph})
       GROUP BY seller_sku, date_jst ORDER BY date_jst
     `).all(from, to, ...topSkus);
@@ -967,8 +977,8 @@ export function getDiagnosis() {
   const m1 = addMonths(ym, -1);   // 前月 (確定済み想定)
   const m2 = addMonths(ym, -2);   // 前々月
 
-  const cur = settledBySku(db, monthStart(m1), monthEnd(m1));
-  const prev = settledBySku(db, monthStart(m2), monthEnd(m2));
+  const cur = settledBySku(db, monthStart(m1), monthEnd(m1), 'amazon-dashboard:diagnosis');
+  const prev = settledBySku(db, monthStart(m2), monthEnd(m2), 'amazon-dashboard:diagnosis');
   const prevMap = new Map(prev.map(r => [r.seller_sku, r]));
   const { alloc: allocCur } = allocateAdCost(db, monthStart(m1), monthEnd(m1), cur);
   const { alloc: allocPrev } = allocateAdCost(db, monthStart(m2), monthEnd(m2), prev);
@@ -988,7 +998,7 @@ export function getDiagnosis() {
     if (i === 0) { skuAgg = cur; alloc = allocCur; }
     else if (i === 1) { skuAgg = prev; alloc = allocPrev; }
     else {
-      skuAgg = settledBySku(db, monthStart(targetYm), monthEnd(targetYm));
+      skuAgg = settledBySku(db, monthStart(targetYm), monthEnd(targetYm), 'amazon-dashboard:diagnosis');
       alloc = allocateAdCost(db, monthStart(targetYm), monthEnd(targetYm), skuAgg).alloc;
     }
     monthlyProfit.push({ ym: targetYm, map: new Map(skuAgg.map(r => [r.seller_sku, profitAfter(r, alloc)])) });
@@ -1040,7 +1050,7 @@ export function getDiagnosis() {
   // 日次連続性ではなく期間合算での判定 (仕様、Codex R2 Medium #2 で明確化)。
   // 単日ノイズ排除のため期間広告費 ¥1,000 未満は対象外。
   const adFrom = addDays(today, -(settings.ad_bleed_days - 1));
-  const recent = settledBySku(db, adFrom, today);
+  const recent = settledBySku(db, adFrom, today, 'amazon-dashboard:diagnosis');
   const { alloc: allocRecent } = allocateAdCost(db, adFrom, today, recent);
   const feeMap = new Map(db.prepare(`SELECT LOWER(seller_sku) AS sku, total_fee FROM mirror_amazon_sku_fees`).all().map(r => [r.sku, r.total_fee]));
   const costMap = new Map(db.prepare(`
@@ -1094,7 +1104,7 @@ export function getDiagnosis() {
     // ad_bleed_days 設定に連動させず 30 日固定 (Codex R1 Medium)
     const recentRevMap = new Map(db.prepare(`
       SELECT seller_sku, SUM(sales_principal_jpy + sales_shipping_jpy + sales_giftwrap_jpy) AS rev
-      FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? GROUP BY seller_sku
+      FROM ${financeDailyTable('amazon-dashboard:diagnosis')} WHERE date_jst >= ? GROUP BY seller_sku
     `).all(addDays(today, -29)).map(r => [r.seller_sku.toLowerCase(), Math.round(r.rev)]));
     for (const s of snaps) {
       // buybox_is_mine が明示的に 0 (他社保有) のときだけ検知対象。
@@ -1145,7 +1155,7 @@ export function getDiagnosis() {
     WITH sold AS (
       SELECT seller_sku, SUM(sales_principal_jpy) AS principal, SUM(units_net_sold) AS units,
              MAX(product_name) AS product_name
-      FROM mirror_amazon_finance_sku_daily
+      FROM ${financeDailyTable('amazon-dashboard:diagnosis')}
       WHERE date_jst >= ? AND date_jst <= ?
       GROUP BY seller_sku HAVING SUM(units_net_sold) >= 3
     )

@@ -20,6 +20,8 @@
 import express from 'express';
 import crypto from 'node:crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+// Amazon の財務の表の名前は共通の読み口から (F4-1・consumer 'site-products'・今は legacy = mirror_amazon_finance_sku_daily)
+import { financeDailyTable } from '../../lib/amazon-finance-read.js';
 
 const router = express.Router();
 
@@ -144,8 +146,8 @@ function loadIndexes(db, degraded) {
     asinFinance: q(
       'asinFinance',
       `SELECT f.seller_sku, f.asin_norm AS asin, f.date_jst AS date
-       FROM mirror_amazon_finance_sku_daily f
-       JOIN (SELECT seller_sku, MAX(date_jst) AS d FROM mirror_amazon_finance_sku_daily
+       FROM ${financeDailyTable('site-products')} f
+       JOIN (SELECT seller_sku, MAX(date_jst) AS d FROM ${financeDailyTable('site-products')}
              WHERE TRIM(asin_norm) <> '' GROUP BY seller_sku) l
          ON l.seller_sku = f.seller_sku AND l.d = f.date_jst
        WHERE TRIM(f.asin_norm) <> ''`,

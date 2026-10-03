@@ -28,9 +28,14 @@
  *  【集計対象日】稼働中モール（14日以内に同期のあるモール）全てが確定済みの日 - 2日（D-2）まで。
  *     直近日はモール側の確定遅延で揺れるため締める。
  *  【FBA/FBM】Amazon は fba_fulfillment_jpy / fba_storage_jpy の発生有無で出品単位に判別（推定）。
+ *
+ *  Amazon の財務の表の名前は共通の読み口 (lib/amazon-finance-read.js・consumer 'supplier-sales') からもらう
+ *  (F4-1・2026-10-03。今は legacy = mirror_amazon_finance_sku_daily。SQL の中身は変えていない)。
  */
-
 import { AMAZON_SALES_GROSS_INCL_SQL } from '../warehouse-mirror/db.js';
+import { financeDailyTable } from '../../lib/amazon-finance-read.js';
+
+const AMAZON_FINANCE_DAILY = financeDailyTable('supplier-sales');
 
 export const MALL_LABELS = {
   amazon: 'Amazon', rakuten: '楽天', yahoo: 'Yahoo!',
@@ -63,7 +68,7 @@ function daysBetween(a, b) {
 
 // 各モール fact の最新 date_jst（データのある table のみ）。
 function tableMaxDates(db) {
-  const tables = ['mirror_amazon_finance_sku_daily', ...NON_AMAZON_MALLS.map(c => c.table)];
+  const tables = [AMAZON_FINANCE_DAILY, ...NON_AMAZON_MALLS.map(c => c.table)];
   const maxes = [];
   for (const t of tables) {
     const row = db.prepare(`SELECT MAX(date_jst) AS d FROM ${t}`).get();
@@ -262,7 +267,7 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
       SELECT date_jst d, LOWER(TRIM(seller_sku)) k, asin_norm asin, product_name name,
              CAST(units_net_sold AS REAL) u, ${AMAZON_SALES_GROSS_INCL_SQL} sales,
              (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
-      FROM mirror_amazon_finance_sku_daily
+      FROM ${AMAZON_FINANCE_DAILY}
       WHERE date_jst BETWEEN @start AND @end
         AND LOWER(TRIM(seller_sku)) IN (
           SELECT LOWER(TRIM(seller_sku)) FROM mirror_sku_resolved
@@ -453,7 +458,7 @@ export function getSupplierDailyDetail(db, supplierCode, opts = {}) {
     SELECT date_jst, seller_sku, asin_norm, product_name,
            CAST(units_net_sold AS REAL) u, ${AMAZON_SALES_GROSS_INCL_SQL} sales,
            (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
-    FROM mirror_amazon_finance_sku_daily
+    FROM ${AMAZON_FINANCE_DAILY}
     WHERE date_jst BETWEEN @start AND @end
       AND seller_sku IN (
         SELECT seller_sku FROM mirror_sku_resolved
@@ -501,7 +506,7 @@ export function getUnresolvedStats(db) {
   const amz = db.prepare(`
     SELECT SUM(${AMAZON_SALES_GROSS_INCL_SQL}) AS total,
            SUM(CASE WHEN r.seller_sku IS NULL THEN ${AMAZON_SALES_GROSS_INCL_SQL} ELSE 0 END) AS unresolved
-    FROM mirror_amazon_finance_sku_daily a
+    FROM ${AMAZON_FINANCE_DAILY} a
     LEFT JOIN (SELECT DISTINCT seller_sku FROM mirror_sku_resolved) r ON r.seller_sku = a.seller_sku
     WHERE a.date_jst BETWEEN @w30start AND @cutoff
   `).get(p);
