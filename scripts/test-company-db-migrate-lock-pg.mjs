@@ -24,10 +24,11 @@
  *   C9 drop index concurrently の migration
  *   P1 PGlite の adapter = concurrently を外してふつうの取引で流し、属性の検証は同じ (PG 18 で作った expect.json に PGlite でも一致)
  *   A1 属性の比べ方 = 空白・大文字が違っても同じ / 部分 index の条件・演算子のクラス・並びが違えば違う
- *   O0 migration の file は役割を切り替える文を持たない (grep の縛り) / O1〜O4 持ち主の mode (Codex R-D60-v3-10 H2) = ① PR 1b の前 (印なし = 接続の役割) / ② PR 1b 自身 (owner-transition = 接続の役割で移し、記録は印の役割・
+ *   O0 migration の file は許さない役割の切り替えを持たない (grep の縛り・拒む形と許す形の一覧) / O1〜O4 持ち主の mode (Codex R-D60-v3-10 H2) = ① PR 1b の前 (印なし = 接続の役割) / ② PR 1b 自身 (owner-transition = 接続の役割で移し、記録は印の役割・
  *     同じ回の後の file は owner mode) / ③ PR 1b の後 (SET ROLE で流す・接続の役割は記録表に書けない・失敗しても役割が戻り lock が外れる・SET できなければ止まる) /
  *     印を作ってよいのは owner-transition の file だけ・owner-transition が印を作らなければ巻き戻す・2 回目の owner-transition は流さない
- *   O5 印と owner-transition の適用を両方向で確かめる (印が消えた・印だけある → 止まる) / O6 本文が役割を戻しても記録は印の役割で入る
+ *   O5 印と owner-transition の適用を両方向で確かめる (印が消えた・印だけある → 止まる) / O6 本文が役割を戻しても記録は印の役割で入る (INSERT の時の current_user を trigger で読む)
+ *   O7 owner の状態の file の SET LOCAL ROLE = 許す一覧は通る・一覧の外は止まる (設計 13 v3.11 ③)
  * 使い方: node scripts/test-company-db-migrate-lock-pg.mjs   (npm run test:company-db にも入っている)
  *   使い捨てのクラスタを embedded-postgres で起動し、最後に止めて消す (test-company-db-profit-fn-revoke-pg.mjs と同じ作り)。
  *   見つからない・版が違う・起動できない・フォルダが消えない = 失敗 (exit 1)
@@ -43,7 +44,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 import {
   openPgClient, pgAdapter, pgliteAdapter, applyMigrations, migrateWithLock, withMigrateLock, listMigrationFiles, buildIndexExpect, readIndexAttrs, attrDiff,
-  splitSqlStatements, parseConcurrentIndexStatement, planConcurrentIndexFile, estimateIndexBytes, roleSwitchStatements, MIGRATE_LOCK_NAME, DISK_ESTIMATE, DEFAULT_DIR,
+  splitSqlStatements, parseConcurrentIndexStatement, planConcurrentIndexFile, estimateIndexBytes, roleSwitchStatements, ALLOWED_SET_LOCAL_ROLES, MIGRATE_LOCK_NAME, DISK_ESTIMATE, DEFAULT_DIR,
 } from './company-db/migrate.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -170,7 +171,7 @@ try {
     fs.mkdirSync(path.join(parent, 'migrations', 'pending'));
     fs.writeFileSync(path.join(parent, 'migrations', '0001_base.sql'), BASE);
     fs.writeFileSync(path.join(parent, 'migrations-pending', '0002_f4_2a.sql'), 'create table app.pending_should_not_run (x int);\n');
-    fs.writeFileSync(path.join(parent, 'migrations-pending', 'f4_2a.sql'), 'create table app.pending2 (x int);\n');
+    fs.writeFileSync(path.join(parent, 'migrations-pending', 'f4-2a_amazon_finance_copy.sql'), 'create table app.pending2 (x int);\n');   // 設計 19 §6.0 の 3b の 1 の名前
     fs.writeFileSync(path.join(parent, 'migrations', 'pending', '0002_sub.sql'), 'create table app.pending3 (x int);\n');
     fs.writeFileSync(path.join(parent, 'migrations', 'f4_2a_draft.sql'), 'create table app.pending4 (x int);\n');   // 番号の無い file も読まない
     assert.deepEqual(listMigrationFiles(path.join(parent, 'migrations')).map((f) => f.file), ['0001_base.sql']);
@@ -179,6 +180,15 @@ try {
     const r = await migrate(c, { dir: path.join(parent, 'migrations') });
     assert.deepEqual(r.applied, ['0001']);
     assert.equal((await c.query(`select count(*)::int as n from pg_class where relname like 'pending%'`)).rows[0].n, 0);
+    // --list・--dry-run も数えない
+    const list = runCli(['--url', urlOf(dbName), '--dir', path.join(parent, 'migrations'), '--list']);
+    assert.equal(list.status, 0, list.stderr);
+    assert.deepEqual(list.stdout.split('\n').filter((l) => /^\d{4} /.test(l)).map((l) => l.slice(0, 4)), ['0001']);
+    const dry = runCli(['--url', urlOf(dbName), '--dir', path.join(parent, 'migrations'), '--dry-run']);
+    assert.equal(dry.status, 0, dry.stderr); assert.match(dry.stdout, /applied=0 skipped=1 pending=0/);
+    // PGlite の道も
+    const pgl = new PGlite();
+    try { assert.deepEqual((await applyMigrations(pgliteAdapter(pgl), { dir: path.join(parent, 'migrations'), log: quiet })).applied, ['0001']); } finally { await pgl.close(); }
     // リポジトリの本物の置き場: migrations-pending があっても、DEFAULT_DIR の一覧に入らない
     const pend = path.join(ROOT, 'db', 'company', 'migrations-pending');
     if (fs.existsSync(pend)) { const names = new Set(listMigrationFiles().map((f) => f.file)); for (const x of fs.readdirSync(pend)) assert.equal(names.has(x), false, x); }
@@ -575,7 +585,7 @@ try {
   console.log('持ち主の mode (Codex R-D60-v3-10 H2: ① PR 1b の前 / ② PR 1b 自身 / ③ PR 1b の後)');
   let roleSeq = 0;
   /** PR 1b の形の owner-transition の file (持ち主の役割を作り・表と記録表の持ち主を移し・印を作る)。makeMarker = false なら印を作らない (壊れた形) */
-  const transitionSql = (dbName, role, { makeMarker = true, header = true } = {}) => `${header ? '-- migrate:owner-transition\n' : ''}-- PR 1b の試験の形
+  const transitionSql = (dbName, role, { makeMarker = true, header = true, tail = '' } = {}) => `${header ? '-- migrate:owner-transition\n' : ''}-- PR 1b の試験の形
 create role ${role} nologin;
 grant ${role} to ${OWNER} with inherit false, set true;
 grant create on database ${dbName} to ${role};
@@ -590,20 +600,21 @@ grant select on ops.migrate_owner to ${RUNTIME};
 alter table ops.migrate_owner owner to ${role};` : ''}
 alter schema app owner to ${role};
 alter schema ops owner to ${role};
-`;
+${tail}`;
   /** 持ち主 (catalog だけ = schema の USAGE が無くても読める) */
   const ownerOf = async (c, rel) => { const [sc, nm] = rel.split('.'); return (await c.query('select pg_get_userbyid(c.relowner)::text as o from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = $1 and c.relname = $2', [sc, nm])).rows[0].o; };
   const whoami = async (c) => (await c.query('select current_user::text as cu, session_user::text as su')).rows[0];
 
-  await t('O0 migration の file は全部、役割を切り替える文 (reset role・set role・session authorization) を持たない (owner mode で記録が別の役割で走らない・grep の縛り)', async () => {
+  await t('O0 migration の file は全部、許さない役割の切り替えを持たない (grep の縛り) / 拒む形 = RESET ROLE・session の SET ROLE・SET SESSION ROLE・ROLE NONE・SESSION AUTHORIZATION・set_config(role)・DISCARD・一覧の外の SET LOCAL ROLE / 許す = 一覧の SET LOCAL ROLE (設計 13 v3.11 ③)', async () => {
     for (const f of listMigrationFiles()) assert.deepEqual(roleSwitchStatements(f.text), [], f.file);
+    assert.deepEqual(ALLOWED_SET_LOCAL_ROLES, ['cdb_owner', 'profit_definer', 'heavy_guard_definer', 'heavy_read_definer', 'd60_calib_definer', 'finance_revision_definer']);
     assert.deepEqual(roleSwitchStatements(["-- reset role", "select 'set role x'; /* set local role y */ select $$reset role$$;"].join(String.fromCharCode(10))), []);
-    assert.deepEqual(roleSwitchStatements('reset role'), ['reset role / session authorization']);
-    assert.deepEqual(roleSwitchStatements('SET LOCAL ROLE a'), ['set role']);
-    assert.deepEqual(roleSwitchStatements('set session role a'), ['set role']);
-    assert.deepEqual(roleSwitchStatements('set session authorization default'), ['set session authorization']);
-    assert.deepEqual(roleSwitchStatements('reset session authorization'), ['reset role / session authorization']);
-    assert.deepEqual(roleSwitchStatements("select set_config('role', 'x', true)"), [], '(set_config は検出しない = 迷った所)');
+    const rejected = ['reset role', 'RESET ROLE;', 'SET ROLE cdb_owner', 'set session role cdb_owner', 'set local role none', 'SET LOCAL ROLE NONE;', 'set local role watcher', 'SET LOCAL ROLE postgres',
+      'set session authorization default', 'reset session authorization', "select set_config('role', 'x', true)", "SELECT SET_CONFIG('role', 'none', true)", 'discard all', 'DISCARD PLANS'];
+    for (const x of rejected) assert.ok(roleSwitchStatements(x).length > 0, `拒まない: ${x}`);
+    const allowed = ['set local role cdb_owner', 'SET LOCAL ROLE profit_definer;', 'set local role heavy_guard_definer', 'set local role heavy_read_definer', 'set local role d60_calib_definer', 'set local role finance_revision_definer',
+      'SET LOCAL ROLE "profit_definer"', "set local role 'cdb_owner'", 'reset all', "select set_config('search_path', 'pg_catalog', true)", "do $$ begin perform set_config('role', 'none', true); end $$"];
+    for (const x of allowed) assert.deepEqual(roleSwitchStatements(x), [], `拒んだ: ${x}`);
   });
 
   await t('O1 ① PR 1b の前 (印が無い) = legacy = 接続の役割のまま流す (今までどおり)・記録表の持ち主は接続の役割', async () => {
@@ -679,7 +690,7 @@ create table app.r2 (x int);
 `]) {
       const d = mkDir({ ...base, '0003_more.sql': `create table app.more (x int);
 `, '0004_idx.sql': CI_SQL, '0004_idx.expect.json': JSON.stringify(EXPECT), '0005_role.sql': body });
-      await assert.rejects(migrate(c, { dir: d }), (e) => e.code === 'OWNER_MODE_INVALID' && /役割を切り替える文/.test(e.message), body);
+      await assert.rejects(migrate(c, { dir: d }), (e) => e.code === 'OWNER_MODE_INVALID' && /許さない役割の切り替え/.test(e.message), body);
     }
     assert.equal((await c.query(`select count(*)::int as n from pg_class where relname = 'r1'`)).rows[0].n, 0);
     // owner-transition をもう一度 = 流さない (前の検査で止まる)
@@ -739,21 +750,44 @@ create table app.r2 (x int);
     assert.deepEqual(await lockHolders(db2), []);
   });
 
-  await t('O6 owner mode で本文が (grep を逃れる形で) 役割を戻しても、記録の INSERT は印の役割で入る (Codex R-D60-v3-11 M-new-3 = INSERT の直前の SET LOCAL ROLE)', async () => {
+  await t('O6 記録の INSERT は必ず印の役割 (Codex R-D60-v3-11 M-new-3・設計 13 v3.11 ②) = owner-transition の本文が RESET ROLE しても・owner の状態の本文が (字句の検査を逃れる DO の中で) set_config(role) しても、INSERT の時の current_user = 印の役割', async () => {
+    const dbName = await newDb();
+    const c = await open(dbName);
+    const role = `cdb_owner_${hex}_${++roleSeq}`;
+    await migrate(c, { dir: mkDir({ '0001_base.sql': BASE }) });
+    // 試験の trigger = 記録の INSERT の時の current_user を残す (superuser が作る)
+    const dbSu = new URL(suUrl); dbSu.pathname = `/${dbName}`;
+    const s2 = await openPgClient(dbSu.toString()); s2.on('error', () => {}); clients.push(s2);
+    await s2.query(`create table ops.mig_who (version text, who text);
+      grant insert on ops.mig_who to public;
+      create function ops.mig_who_f() returns trigger language plpgsql as $f$ begin insert into ops.mig_who values (new.version, current_user::text); return new; end $f$;
+      create trigger mig_who before insert on ops.schema_migrations for each row execute function ops.mig_who_f();`);
+    // DO の中の set_config('role', 'none', true) = SET LOCAL ROLE NONE と同じ (ドルの引用の中 = 字句の検査は見つけない)。接続の役割は記録表に書けない = 直前の SET LOCAL ROLE が無ければ 42501
+    const evade = "do $$ begin perform set_config('role', 'none', true); end $$;\n";
+    assert.deepEqual(roleSwitchStatements(evade), []);
+    const r = await migrate(c, { dir: mkDir({ '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role, { tail: 'reset role;\n' }), '0003_evade.sql': evade }) });
+    assert.deepEqual(r.applied, ['0002', '0003']);
+    const who = Object.fromEntries((await s2.query('select version, who from ops.mig_who')).rows.map((x) => [x.version, x.who]));
+    assert.deepEqual(who, { '0002': role, '0003': role });
+    assert.deepEqual(await whoami(c), { cu: OWNER, su: OWNER });
+  });
+
+  await t('O7 owner の状態の file の SET LOCAL ROLE = 許す一覧の役割は通る (記録は印の役割) / 一覧の外の役割は流す前に止まる (設計 13 v3.11 ③)', async () => {
     const dbName = await newDb();
     const c = await open(dbName);
     const role = `cdb_owner_${hex}_${++roleSeq}`;
     const base = { '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role) };
     await migrate(c, { dir: mkDir(base) });
-    // set_config('role', 'none', true) = SET LOCAL ROLE NONE と同じ (字句の検査は見つけない)。接続の役割は記録表に書けない = 直前の SET LOCAL ROLE が無ければ 42501
-    const body = "select set_config('role', 'none', true) as r;\n";
-    assert.deepEqual(roleSwitchStatements(body), []);
-    const r = await migrate(c, { dir: mkDir({ ...base, '0003_evade.sql': body }) });
+    // NOLOGIN の持ち主 (一覧の 1 つ) を作り、印の役割から SET できるようにする (クラスタに 1 回)
+    if (!(await su.query(`select 1 from pg_roles where rolname = 'profit_definer'`)).rows.length) await su.query('create role profit_definer nologin');
+    await su.query(`grant profit_definer to ${role} with inherit false, set true`);
+    const ok1 = 'set local role profit_definer;\nselect 1;\n';
+    const r = await migrate(c, { dir: mkDir({ ...base, '0003_definer.sql': ok1 }) });
     assert.deepEqual(r.applied, ['0003']);
-    const dbSu = new URL(suUrl); dbSu.pathname = `/${dbName}`;
-    const s2 = await openPgClient(dbSu.toString()); s2.on('error', () => {}); clients.push(s2);
-    assert.equal((await s2.query(`select count(*)::int as n from ops.schema_migrations where version = '0003'`)).rows[0].n, 1);
     assert.deepEqual(await whoami(c), { cu: OWNER, su: OWNER });
+    await assert.rejects(migrate(c, { dir: mkDir({ ...base, '0003_definer.sql': ok1, '0004_watcher.sql': 'set local role watcher;\nselect 1;\n' }) }),
+      (e) => e.code === 'OWNER_MODE_INVALID' && /set local role watcher \(許す一覧の外\)/.test(e.message));
+    assert.deepEqual(await lockHolders(dbName), []);
   });
 
   await t('X1 --index-expect は使い捨ての DB から expect.json の中身を出す (試験で作ったものと同じ)', async () => {

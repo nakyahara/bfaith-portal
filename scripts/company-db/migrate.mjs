@@ -24,6 +24,8 @@
  *     PGlite など対応しない adapter は、同じ文から concurrently を外した `create index if not exists` をふつうの取引で流し、属性の検証は同じに通す
  *   - **持ち主の mode** (Codex R-D60-v3-10 H2) = 印の表 ops.migrate_owner が無い = legacy (接続の役割のまま・PR 1b の前) / 1 行目が
  *     `-- migrate:owner-transition` の file (PR 1b 自身) だけが印を作れる / 印がある = owner (SET ROLE <印の役割> で流す・PR 1b の後)。下の readOwnerMode
+ *     起動時に印と owner-transition の適用を両方向で確かめる (M-new-2)・記録の INSERT の直前に必ず SET LOCAL ROLE <印の役割> (M-new-3)・
+ *     owner の状態の file は許す一覧 (ALLOWED_SET_LOCAL_ROLES) の SET LOCAL ROLE だけを許す (設計 13 v3.11 ③)
  *   - **空き容量** (concurrent-index の create の各文の前) = 予想の index の大きさ = reltuples × (列の pg_stats.avg_width の和 + 式の列は 64 + 16) × 1.3。
  *     空き (Render のメトリクスの Disk Capacity − Disk Usage) が 予想 × 3 + 2GB に満たない・メトリクスが読めない = 流さない (fail-closed)
  *
@@ -378,29 +380,55 @@ function rejectUnmarkedConcurrently(f) {
 }
 
 /**
- * 役割を切り替える文 (reset role・set [local|session] role・set / reset session authorization) があるか (コメント・文字列・ドルの引用の中は数えない)。
- * owner mode の file では禁止 (設計 13 v3.10): 本文が RESET ROLE すると、後の記録の INSERT が接続の役割で走る (runner は INSERT の直前に SET LOCAL ROLE をもう一度出すが、file の中の DDL は違う役割で走ってしまう)
+ * owner の状態の file で `SET LOCAL ROLE <名前>` を許す役割の一覧 (設計 13 v3.11 ③・正本はこの定数)。
+ * 印の役割 cdb_owner と NOLOGIN の持ち主 5 つ (「以後の更新」の専用の持ち主の関数・設計 19 の F4-2a が file の中で使う)
  */
-export function roleSwitchStatements(text) {
-  const toks = lexSql(text);   // 読めない = 例外 (owner mode では止まる)
-  const w = toks.map((tk) => (tk.t === 'word' ? tk.v.toLowerCase() : tk.t === 'punct' && tk.v === ';' ? ';' : null));
+export const ALLOWED_SET_LOCAL_ROLES = Object.freeze(['cdb_owner', 'profit_definer', 'heavy_guard_definer', 'heavy_read_definer', 'd60_calib_definer', 'finance_revision_definer']);
+
+/**
+ * 役割を切り替える文のうち、owner の状態の file で許さないもの (コメント・文字列・ドルの引用の外の文だけを見る)。戻り = 理由の一覧 ([] = 無い)。
+ * 拒む (設計 13 v3.11 ③) = RESET ROLE・SET ROLE (LOCAL の無い = session)・SET SESSION ROLE・SET [LOCAL] ROLE NONE・SET / RESET SESSION AUTHORIZATION・
+ *   set_config('role', …)・DISCARD・SET LOCAL ROLE <一覧の外の役割>。許す = SET LOCAL ROLE <ALLOWED_SET_LOCAL_ROLES のどれか> だけ。
+ * 🚨 字句の検査は補助 = 守りの本体は「記録の INSERT の直前の SET LOCAL ROLE <印の役割>」(動的 SQL で役割を変えられても記録は印の役割)
+ */
+export function roleSwitchStatements(text, allowed = ALLOWED_SET_LOCAL_ROLES) {
+  const toks = lexSql(text);   // 読めない = 例外 (owner の状態では止まる)
+  const lw = (tk) => (tk && tk.t === 'word' ? tk.v.toLowerCase() : null);
+  const isPunct = (tk, ch) => tk && tk.t === 'punct' && tk.v === ch;
+  const nameOf = (tk) => {   // 役割の名前の字句 (引用しない名前・"…"・'…') → 名前 (Postgres と同じく引用しない名前は小文字)
+    if (!tk) return null;
+    if (tk.t === 'word') return tk.v.toLowerCase();
+    if (tk.t === 'qid') return tk.v.slice(1, -1).replace(/""/g, '"');
+    if (tk.t === 'str' && tk.v.startsWith("'")) return tk.v.slice(1, -1).replace(/''/g, "'");
+    return null;
+  };
   const hits = [];
-  for (let i = 0; i < w.length; i++) {
-    const at = (k, off) => w[i + off] === k;
-    if (at('reset', 0) && (at('role', 1) || (at('session', 1) && at('authorization', 2)))) hits.push('reset role / session authorization');
-    if (at('set', 0)) {
-      let j = 1;
-      if (at('local', j) || at('session', j)) { if (at('session', j) && at('authorization', j + 1)) { hits.push('set session authorization'); continue; } j++; }
-      if (at('role', j)) hits.push('set role');
-      if (at('session', j) && at('authorization', j + 1)) hits.push('set session authorization');
+  for (let i = 0; i < toks.length; i++) {
+    const w0 = lw(toks[i]), w1 = lw(toks[i + 1]), w2 = lw(toks[i + 2]);
+    if (w0 === 'reset' && (w1 === 'role' || (w1 === 'session' && w2 === 'authorization'))) hits.push(`reset ${w1 === 'role' ? 'role' : 'session authorization'}`);
+    if (w0 === 'discard' && ['all', 'plans', 'sequences', 'temp', 'temporary'].includes(w1)) hits.push(`discard ${w1}`);
+    if (w0 === 'set_config' && isPunct(toks[i + 1], '(') && toks[i + 2] && toks[i + 2].t === 'str' && /^e?'role'$/i.test(toks[i + 2].v)) hits.push("set_config('role', …)");
+    if (w0 === 'set') {
+      if (w1 === 'session' && w2 === 'authorization') { hits.push('set session authorization'); continue; }
+      if (w1 === 'role') { hits.push('set role (session)'); continue; }
+      if (w1 === 'session' && w2 === 'role') { hits.push('set session role'); continue; }
+      if (w1 === 'local' && w2 === 'role') {
+        const name = nameOf(toks[i + 3]);
+        const after = toks[i + 4];
+        if (name == null) hits.push('set local role (名前が読めない)');
+        else if (toks[i + 3].t === 'word' && name === 'none') hits.push('set local role none');
+        else if (!allowed.includes(name)) hits.push(`set local role ${name} (許す一覧の外)`);
+        else if (after && !isPunct(after, ';')) hits.push(`set local role ${name} の後ろに「${after.v}」`);
+      }
+      if (w1 === 'local' && w2 === 'session' && lw(toks[i + 3]) === 'authorization') hits.push('set local session authorization');
     }
   }
   return hits;
 }
 function rejectRoleSwitchInOwnerMode(f) {
   let hits;
-  try { hits = roleSwitchStatements(f.text); } catch (e) { throw Object.assign(new Error(`${f.file}: owner mode の file を字句に読めない (${e.message}) = 役割を切り替える文が無いと言えないので流さない`), { code: 'OWNER_MODE_INVALID', version: f.version }); }
-  if (hits.length) throw Object.assign(new Error(`${f.file}: owner mode の file に役割を切り替える文がある (${[...new Set(hits)].join('・')}) = 流さない (持ち主の役割は runner が SET LOCAL ROLE で決める)`), { code: 'OWNER_MODE_INVALID', version: f.version });
+  try { hits = roleSwitchStatements(f.text); } catch (e) { throw Object.assign(new Error(`${f.file}: owner の状態の file を字句に読めない (${e.message}) = 役割を切り替える文が無いと言えないので流さない`), { code: 'OWNER_MODE_INVALID', version: f.version }); }
+  if (hits.length) throw Object.assign(new Error(`${f.file}: owner の状態の file に許さない役割の切り替えがある (${[...new Set(hits)].join('・')}) = 流さない (許すのは SET LOCAL ROLE ${ALLOWED_SET_LOCAL_ROLES.join(' / ')} だけ)`), { code: 'OWNER_MODE_INVALID', version: f.version });
 }
 
 // ─── catalog の属性 (定義の検証) ───
