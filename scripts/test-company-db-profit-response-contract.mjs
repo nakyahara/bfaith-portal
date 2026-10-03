@@ -1,0 +1,295 @@
+#!/usr/bin/env node
+/**
+ * test-company-db-profit-response-contract.mjs — Amazon の利益の受け口の **最終の JSON の契約** (D-60 v3.4 の PR 2b) の試験
+ *
+ * 設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10「応答の契約」「長い期間の応答の列ごとの規則」(Codex R-D60-v3-4 M5・v3-5 Low)
+ * 契約 = apps/company-db/profit/response-contract.mjs / 文書 = docs/contracts/company_db_amazon_profit_response.contract.md / fixture = scripts/fixtures/amazon-profit-response/
+ *   - 列の分類が DB の関数の戻りの全部の列と一致 (PGlite で 0001〜 を流して pg_proc から読む = 列が増えたら落ちる)
+ *   - 理由の決まった順が 0049 / 0050 の関数の本文の順と一致
+ *   - Decimal の足し算と丸め = PostgreSQL の round(sum(numeric), 2) と一致 (PGlite で突き合わせる)
+ *   - fixture (月ごとの入力 → 最終の応答) が列ごとの規則どおり・最終の応答が契約を満たす (BigInt / Decimal は文字列・null の伝わり方・理由の順・raw の列なし・months[]・calculated_at は 1 つの値)
+ *   - 契約を破った応答 (raw の列・数の bigint・3 桁の小数・-0.00・理由の順・calculated_at の違い・months の欠け ほか) を全部拒む
+ *   - 503 の code の一覧・今の router の 503 (PROFIT_ROUTE_DISABLED) も同じ形 (DB に接続しない)
+ * 🚨 DB の実装はしない。利益の受け口は 503 のまま
+ * 実行: node scripts/test-company-db-profit-response-contract.mjs
+ */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { PGlite } from '@electric-sql/pglite';
+import express from 'express';
+import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
+import {
+  CONTRACT_VERSION, PROFIT_503_CODES, REQUIRED_HEADERS, REASON_ORDER, TOTALS_REASONS, ASSUMED_ZERO_REASONS, MASTER_NOTE_KEYS, TOTALS_COLUMNS, TOTALS_RULES, DAILY_COLUMNS,
+  MONTH_KEYS, validateTotalsResponse, validateDailyResponse, validate503Body, monthsOf,
+} from '../apps/company-db/profit/response-contract.mjs';
+import { combineTotals, combineDaily, sumDecimals, round2 } from './fixtures/amazon-profit-response/reference-combine.mjs';
+import companyDbRouter, { __setPgClientFactory } from '../apps/company-db/router.mjs';
+
+let ok = 0, ng = 0;
+const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
+const FIX = new URL('./fixtures/amazon-profit-response/', import.meta.url);
+const readFix = (f) => JSON.parse(fs.readFileSync(new URL(f, FIX), 'utf8'));
+const clone = (x) => JSON.parse(JSON.stringify(x));
+const totalsIn = readFix('totals-3months.input.json'), totalsExp = readFix('totals-3months.expected.json');
+const dailyIn = readFix('daily-2months.input.json'), dailyExp = readFix('daily-2months.expected.json');
+const vectors = readFix('rounding-vectors.json').cases, errors503 = readFix('errors-503.json').bodies;
+
+const pg = new PGlite();
+await applyMigrations(pgliteAdapter(pg), { log: () => {} });
+const fnCols = async (sig) => (await pg.query(`select a.name, format_type(a.typ, null) as type
+    from pg_proc p cross join lateral unnest(p.proargnames, p.proallargtypes, p.proargmodes::text[]) with ordinality as a(name, typ, mode, ord)
+   where p.oid = $1::regprocedure and a.mode = 't' order by a.ord`, [sig])).rows;
+
+console.log('列の分類 = DB の関数の戻りの全部の列');
+await t('/totals の分類の表 = mart.amazon_profit_day_totals_range の戻りの列 (名前・型・並び) と同じ・規則は型に合う', async () => {
+  const cols = await fnCols('mart.amazon_profit_day_totals_range(smallint,text,text,date,date)');
+  assert.ok(cols.length > 60, `${cols.length}`);
+  assert.deepEqual(TOTALS_COLUMNS.map((c) => [c.name, c.type]), cols.map((c) => [c.name, c.type]));
+  for (const c of TOTALS_COLUMNS) {
+    assert.ok(TOTALS_RULES.includes(c.rule), c.name);
+    if (/^decimal_sum/.test(c.rule)) assert.equal(c.type, 'numeric', c.name);
+    if (/^bigint_sum/.test(c.rule)) assert.equal(c.type, 'bigint', c.name);
+    if (c.rule === 'int_sum') assert.equal(c.type, 'integer', c.name);
+    if (c.type === 'numeric') assert.match(c.rule, /^decimal_sum/, `numeric の列は Decimal で足す: ${c.name}`);
+    if (c.type === 'bigint') assert.match(c.rule, /^(bigint_sum|null_in_period)/, `bigint の列は BigInt で足すか期間で null: ${c.name}`);
+  }
+  // 正式な値の列 = 1 か月でも null なら null
+  for (const n of ['cogs_jpy', 'contribution_before_ad_incl_jpy', 'contribution_before_ad_excl', 'contribution_after_ad_incl', 'contribution_after_ad_excl',
+    'profit_after_account_fees_incl', 'profit_after_account_fees_excl', 'ad_cost_total']) assert.match(TOTALS_COLUMNS.find((c) => c.name === n).rule, /_null$/, n);
+  for (const n of ['day_finance_status', 'finance_coverage_generation', 'finance_source_revision']) assert.equal(TOTALS_COLUMNS.find((c) => c.name === n).rule, 'null_in_period', n);
+});
+await t('/daily の列の表 = mart.amazon_profit_daily_range の戻りの列 (名前・型・並び) と同じ', async () => {
+  const cols = await fnCols('mart.amazon_profit_daily_range(smallint,text,text,date,date)');
+  assert.ok(cols.length > 80, `${cols.length}`);
+  assert.deepEqual(DAILY_COLUMNS.map((c) => [c.name, c.type]), cols.map((c) => [c.name, c.type]));
+});
+await t('理由・印の決まった順 = 0049 / 0050 の関数の本文の array_remove(array[…]) の順', async () => {
+  const def = async (sig) => (await pg.query(`select pg_get_functiondef($1::regprocedure) as d`, [sig])).rows[0].d;
+  const seqs = (d) => [...d.matchAll(/array_remove\(array\[([\s\S]*?)\]::text\[\], null\)/g)].map((m) => [...m[1].matchAll(/then '([a-z_]+)' end/g)].map((x) => x[1]));
+  const rows = seqs(await def('mart._amazon_profit_rows(smallint,text,text,date,date,mart.amazon_profit_finance_day[],mart.amazon_profit_ad_day[],mart.amazon_profit_ad_child[],mart.amazon_easy_ship_alloc_row[])'));
+  assert.deepEqual(rows, [[...REASON_ORDER], [...ASSUMED_ZERO_REASONS], [...MASTER_NOTE_KEYS]]);
+  const totals = seqs(await def('mart._amazon_profit_totals(smallint,text,text,date,date)'));
+  assert.deepEqual(totals, [[...TOTALS_REASONS]]);
+});
+
+console.log('Decimal の足し算と丸め = PostgreSQL の round(sum(numeric), 2)');
+await t(`丸めの例 ${vectors.length} 件: 参照の組み立て = fixture の期待 = PGlite の round`, async () => {
+  for (const v of vectors) {
+    assert.equal(round2(sumDecimals(v.raws)), v.expected, JSON.stringify(v.raws));
+    const r = (await pg.query(`select round(sum(x::numeric), 2)::text as s from unnest($1::text[]) x`, [v.raws])).rows[0].s;
+    assert.equal(r, v.expected, `PG: ${JSON.stringify(v.raws)} → ${r}`);
+  }
+  // 月ごとに丸めてから足すと違う例がある (= 丸めは最後に 1 回)
+  const v = vectors.find((x) => x.expected === '300.01');
+  assert.equal(round2(sumDecimals(v.raws.map((x) => round2(sumDecimals([x]))))), '300.00');
+});
+
+console.log('fixture (月ごとの計算 → 最終の応答)');
+await t('/totals: 列ごとの規則で作った応答 = totals-3months.expected.json・契約を満たす', async () => {
+  const r = combineTotals(clone(totalsIn));
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, totalsExp);
+  const v = validateTotalsResponse(totalsExp);
+  assert.deepEqual(v.errors, []);
+});
+await t('/totals の期待の値 (手で確かめた値): 最後に 1 回丸める・負の半分は 0 から遠い方へ・2^53 を超える BigInt・1 か月でも null なら null・状態は一番弱い・理由は和集合を決まった順に', async () => {
+  const x = totalsExp.total;
+  assert.equal(x.ad_cost_allocated, '300.01');                         // 月ごとに丸めると 300.00
+  assert.equal(x.profit_after_account_fees_assuming_incomplete_zero_incl, '-1500.01');   // -1500.005
+  assert.equal(x.net_jpy, '9007199254740992');                         // Number で足すと …991
+  assert.notEqual(String(Number('9007199254740993') + Number('-1')), x.net_jpy);
+  assert.equal(x.cogs_jpy, null);
+  for (const n of ['contribution_before_ad_incl_jpy', 'contribution_before_ad_excl', 'contribution_after_ad_incl', 'contribution_after_ad_excl', 'profit_after_account_fees_incl', 'profit_after_account_fees_excl', 'ad_cost_total']) assert.equal(x[n], null, n);
+  assert.equal(x.ad_status, 'missing');
+  assert.deepEqual(x.profit_incomplete_reasons, ['finance_incomplete', 'finance_unclassified', 'cost_missing', 'ad_missing']);
+  assert.deepEqual(x.master_note_counts, { pre_audit_unverifiable: 7, current_after_recorded_change: 1, listing_changed_since_received: 7 });
+  assert.equal(x.day_count, 57);
+  assert.equal(x.before_ad_incomplete_day_count, x.before_ad_incomplete_days.length);
+  assert.deepEqual([x.day_finance_status, x.finance_coverage_generation, x.finance_source_revision], [null, null, null]);
+  assert.deepEqual([x.period_from, x.period_to], ['2026-06-15', '2026-08-10']);
+});
+await t('/totals の Decimal の列の全部 = PGlite の round(sum(月の raw), 2) (参照の組み立てと別の計算で)', async () => {
+  for (const c of TOTALS_COLUMNS.filter((c) => /^decimal_sum/.test(c.rule))) {
+    const raws = totalsIn.months.map((m) => m.totals[`${c.name}_raw`]);
+    const want = raws.some((v) => v === null) ? null : (await pg.query(`select round(sum(x::numeric), 2)::text as s from unnest($1::text[]) x`, [raws])).rows[0].s;
+    assert.equal(totalsExp.total[c.name], want, c.name);
+  }
+});
+await t('/totals の months[]: 触れる暦月が全部 (財務の行が 0 の 8 月も)・世代と版は月ごと・calculated_at は全部同じ 1 つの値 (月の計算の値は捨てる)', async () => {
+  assert.deepEqual(totalsExp.months.map((m) => [m.month_start, m.period_from, m.period_to]),
+    [['2026-06-01', '2026-06-15', '2026-06-30'], ['2026-07-01', '2026-07-01', '2026-07-31'], ['2026-08-01', '2026-08-01', '2026-08-10']]);
+  assert.deepEqual(totalsExp.months.map((m) => [m.finance_status, m.has_finance_rows, m.finance_month_settled, m.finance_coverage_generation, m.finance_source_revision]),
+    [['complete', true, true, '12', '345'], ['provisional', true, false, '12', null], ['missing', false, false, null, null]]);
+  const all = [totalsExp.calculated_at, totalsExp.master_as_of, totalsExp.total.calculated_at, ...totalsExp.months.map((m) => m.calculated_at)];
+  assert.deepEqual([...new Set(all)], [totalsIn.request.calculated_at]);
+  assert.ok(new Set(totalsIn.months.map((m) => m.totals.calculated_at)).size === 3, '入力は月ごとに違う時刻 (置き換えを試す)');
+  for (const m of totalsExp.months) assert.deepEqual(Object.keys(m), [...MONTH_KEYS]);
+});
+await t('/totals: raw の列・旧 totals の行の種類の列が応答に無い (入力にはある)', async () => {
+  assert.match(JSON.stringify(totalsIn), /_raw"/);
+  assert.match(JSON.stringify(totalsIn), /"row_kind"/);
+  const text = JSON.stringify(totalsExp);
+  assert.doesNotMatch(text, /_raw"|"row_kind"|"month_start":"2026-06-01","economic|range_total|"economic_date_jst"/);
+  assert.ok(!('month_start' in totalsExp.total) && !('economic_date_jst' in totalsExp.total));
+});
+await t('/daily: 月の行をつなぐだけ (足さない) = daily-2months.expected.json・契約を満たす・0 行の月も months[] にある・calculated_at は 1 つ', async () => {
+  const r = combineDaily(clone(dailyIn));
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, dailyExp);
+  assert.deepEqual(validateDailyResponse(dailyExp).errors, []);
+  assert.equal(dailyExp.rows.length, 3);
+  assert.deepEqual(dailyExp.months.map((m) => [m.month_start, m.has_finance_rows]), [['2026-07-01', true], ['2026-08-01', false]]);
+  assert.deepEqual([...new Set([dailyExp.calculated_at, dailyExp.master_as_of, ...dailyExp.rows.map((x) => x.calculated_at), ...dailyExp.months.map((m) => m.calculated_at)])], [dailyIn.request.calculated_at]);
+  assert.equal(dailyExp.rows[0].listing_id, '9007199254740993');   // bigint の ID は文字列のまま (Number なら …992)
+  assert.equal(dailyExp.rows[1].listing_id, null);                 // 出品の無い行は日の中で後ろ
+});
+await t('calculation_version / master_basis が月で違えば 503 PROFIT_VERSION_MISMATCH (部分の値を返さない)', async () => {
+  const a = clone(totalsIn); a.months[1].totals.calculation_version = 'amazon_profit_v2';
+  const b = clone(totalsIn); b.months[2].meta.calculation_version = 'amazon_profit_v2';
+  const c = clone(totalsIn); c.months[0].totals.master_basis = 'received';
+  const d = clone(dailyIn); d.months[0].rows[2].calculation_version = 'amazon_profit_v2';
+  for (const r of [combineTotals(a), combineTotals(b), combineTotals(c), combineDaily(d)]) {
+    assert.equal(r.status, 503);
+    assert.equal(r.body.code, 'PROFIT_VERSION_MISMATCH');
+    assert.deepEqual(validate503Body(r.body).errors, []);
+  }
+});
+
+console.log('契約を破った応答を拒む');
+const breakTotals = [
+  ['total に raw の列', (x) => { x.total.ad_cost_allocated_raw = '300.012'; }],
+  ['months に raw の列', (x) => { x.months[0].range_total_raw = '1'; }],
+  ['上に raw', (x) => { x.raw = {}; }],
+  ['旧 totals の row_kind', (x) => { x.total.row_kind = 'range_total'; }],
+  ['旧 totals の month_start', (x) => { x.total.month_start = '2026-06-01'; }],
+  ['bigint が数', (x) => { x.total.net_jpy = 9007199254740992; }],
+  ['bigint が -0', (x) => { x.total.unmapped_jpy = '-0'; }],
+  ['bigint に小数', (x) => { x.total.units_ordered = '1523.0'; }],
+  ['Decimal が 3 桁', (x) => { x.total.ad_cost_allocated = '300.012'; }],
+  ['Decimal が 1 桁', (x) => { x.total.ad_cost_allocated = '300.0'; }],
+  ['Decimal が -0.00', (x) => { x.total.account_fee_cost_excl = '-0.00'; }],
+  ['Decimal が数', (x) => { x.total.ad_cost_allocated = 300.01; }],
+  ['null にならない Decimal が null', (x) => { x.total.contribution_after_ad_assuming_incomplete_zero_incl = null; }],
+  ['null にならない bigint が null', (x) => { x.total.net_jpy = null; }],
+  ['integer が文字', (x) => { x.total.day_count = '57'; }],
+  ['理由の順が違う', (x) => { x.total.profit_incomplete_reasons = ['finance_unclassified', 'finance_incomplete']; }],
+  ['理由の重複', (x) => { x.total.profit_incomplete_reasons = ['finance_incomplete', 'finance_incomplete']; }],
+  ['totals に ad_unresolved', (x) => { x.total.profit_incomplete_reasons = ['ad_unresolved']; }],
+  ['知らない理由', (x) => { x.total.profit_incomplete_reasons = ['something']; }],
+  ['知らない状態', (x) => { x.total.ad_status = 'partial'; }],
+  ['期間の行で day_finance_status', (x) => { x.total.day_finance_status = 'complete'; }],
+  ['期間の行で世代', (x) => { x.total.finance_coverage_generation = '12'; }],
+  ['total.calculated_at が違う', (x) => { x.total.calculated_at = '2026-10-03T03:00:12.004Z'; }],
+  ['months の calculated_at が違う', (x) => { x.months[2].calculated_at = '2026-10-03T03:00:20.777Z'; }],
+  ['master_as_of が違う', (x) => { x.master_as_of = '2026-10-03T03:00:00.000Z'; }],
+  ['calculated_at がミリ秒なし', (x) => { x.calculated_at = '2026-10-03T03:00:00Z'; x.master_as_of = x.calculated_at; x.total.calculated_at = x.calculated_at; for (const m of x.months) m.calculated_at = x.calculated_at; }],
+  ['months の月が欠ける (0 行の月を落とした)', (x) => { x.months.pop(); }],
+  ['months の順が違う', (x) => { x.months.reverse(); }],
+  ['months の calculation_version が違う', (x) => { x.months[1].calculation_version = 'amazon_profit_v2'; }],
+  ['months の世代が数', (x) => { x.months[0].finance_coverage_generation = 12; }],
+  ['months の知らない状態', (x) => { x.months[0].finance_status = 'settled'; }],
+  ['months に知らない列', (x) => { x.months[0].ad_cost_total = '1.00'; }],
+  ['total に知らない列', (x) => { x.total.extra = 1; }],
+  ['total の列が欠ける', (x) => { delete x.total.cogs_jpy; }],
+  ['不完全な日の数が違う', (x) => { x.total.before_ad_incomplete_day_count = 1; }],
+  ['不完全な日の順が違う', (x) => { x.total.before_ad_incomplete_days.reverse(); }],
+  ['不完全な日が期間の外', (x) => { x.total.after_account_fees_incomplete_days[0] = '2026-06-01'; }],
+  ['master_note_counts のキーが違う', (x) => { x.total.master_note_counts = { pre_audit_unverifiable: 1 }; }],
+  ['period_from が要求と違う', (x) => { x.total.period_from = '2026-06-01'; }],
+  ['contract の版が違う', (x) => { x.contract = 'amazon_profit_response_v0'; }],
+  ['ok が false', (x) => { x.ok = false; }],
+  ['kind が違う', (x) => { x.kind = 'daily'; }],
+];
+await t(`/totals: 契約を破った ${breakTotals.length} 通りを全部拒む`, async () => {
+  for (const [name, f] of breakTotals) {
+    const x = clone(totalsExp); f(x);
+    assert.equal(validateTotalsResponse(x).ok, false, name);
+  }
+});
+const breakDaily = [
+  ['行に raw の列', (x) => { x.rows[0].ad_cost_raw = '120.5'; }],
+  ['行の calculated_at が違う', (x) => { x.rows[2].calculated_at = '2026-10-03T03:00:00.130Z'; }],
+  ['ID が数', (x) => { x.rows[0].listing_id = 9007199254740993; }],
+  ['ID の配列に数', (x) => { x.rows[0].received_listing_ids = [1]; }],
+  ['返品数が 2 桁', (x) => { x.rows[2].units_refunded_customer_unrounded = '0.50'; }],
+  ['金額の numeric が 6 桁', (x) => { x.rows[0].ad_cost = '120.500000'; }],
+  ['null にならない列が null', (x) => { x.rows[0].profit_incomplete_reasons = null; }],
+  ['理由の順', (x) => { x.rows[1].profit_incomplete_reasons = ['composition_missing', 'listing_unresolved']; }],
+  ['0 と仮定の理由に refund_units_partial_month', (x) => { x.rows[2].assumed_zero_reasons = ['refund_units_partial_month']; }],
+  ['master_notes の順', (x) => { x.rows[0].master_notes = ['listing_changed_since_received', 'pre_audit_unverifiable']; }],
+  ['並び (出品の無い行が前)', (x) => { [x.rows[0], x.rows[1]] = [x.rows[1], x.rows[0]]; }],
+  ['同じ行が 2 つ', (x) => { x.rows.push(clone(x.rows[2])); }],
+  ['期間の外の日', (x) => { x.rows[2].economic_date_jst = '2026-08-03'; }],
+  ['日付の形', (x) => { x.rows[0].economic_date_jst = '2026-07-30T00:00:00Z'; }],
+  ['列が欠ける', (x) => { delete x.rows[0].cogs_jpy; }],
+  ['知らない列', (x) => { x.rows[0].row_total = '1'; }],
+  ['0 行の月を落とした', (x) => { x.months.pop(); }],
+  ['旧 totals の行の種類', (x) => { x.rows[0].row_kind = 'day'; }],
+];
+await t(`/daily: 契約を破った ${breakDaily.length} 通りを全部拒む`, async () => {
+  for (const [name, f] of breakDaily) {
+    const x = clone(dailyExp); f(x);
+    assert.equal(validateDailyResponse(x).ok, false, name);
+  }
+});
+
+console.log('503');
+await t('503 の code の一覧 = fixture の本文 (code ごとに 1 つ)・全部が契約を満たす・header は no-store', async () => {
+  assert.deepEqual(errors503.map((b) => b.code), [...PROFIT_503_CODES]);
+  for (const b of errors503) assert.deepEqual(validate503Body(b).errors, [], b.code);
+  assert.deepEqual({ ...REQUIRED_HEADERS }, { 'cache-control': 'no-store' });
+});
+await t('503 の契約を破った本文を拒む (知らない code・rows・Render の本文・小文字の reason・ok が true)', async () => {
+  const bad = [{ ok: false, code: 'PROFIT_UNKNOWN', error: 'x' }, { ok: false, code: 'PROFIT_BUSY', error: 'x', rows: [] },
+    { ok: false, code: 'PROFIT_METRICS_UNAVAILABLE', error: 'x', upstream: { message: 'invalid key' } }, { ok: false, code: 'PROFIT_BUSY', error: 'x', reason: 'busy' },
+    { ok: true, code: 'PROFIT_BUSY', error: 'x' }, { ok: false, code: 'PROFIT_BUSY' }, { ok: false, code: 'PROFIT_BUSY', error: 'x', total: {} }, null];
+  for (const b of bad) assert.equal(validate503Body(b).ok, false, JSON.stringify(b));
+});
+await t('今の router の 503 (PROFIT_ROUTE_DISABLED) も同じ形・DB に接続しない (封じ込めのまま)', async () => {
+  process.env.MIRROR_SYNC_KEY = 'k';
+  process.env.COMPANY_DB_URL = 'pglite://test';
+  let created = 0;
+  __setPgClientFactory(async () => { created++; throw new Error('DB に接続した'); });
+  const app = express();
+  app.use('/apps/company-db/sync', companyDbRouter);
+  const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+  try {
+    for (const kind of ['daily', 'totals']) {
+      const res = await fetch(`http://127.0.0.1:${server.address().port}/apps/company-db/sync/amazon-profit/${kind}?mall=amazon&scope=jp&from=2026-06-01&to=2026-06-30`, { headers: { 'x-sync-key': 'k' } });
+      const body = await res.json();
+      assert.equal(res.status, 503);
+      assert.equal(body.code, 'PROFIT_ROUTE_DISABLED');
+      assert.deepEqual(validate503Body(body).errors, []);
+    }
+  } finally { await new Promise((resolve) => server.close(resolve)); }
+  assert.equal(created, 0);
+  const src = fs.readFileSync(new URL('../apps/company-db/router.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(src, /response-contract/);   // 使う所はまだ無い (PR 6 で)
+});
+
+console.log('そのほか');
+await t('monthsOf: 月の境・年の境・1 日・うるう年', async () => {
+  assert.deepEqual(monthsOf('2026-12-31', '2027-01-01'), [{ month_start: '2026-12-01', period_from: '2026-12-31', period_to: '2026-12-31' }, { month_start: '2027-01-01', period_from: '2027-01-01', period_to: '2027-01-01' }]);
+  assert.deepEqual(monthsOf('2028-02-10', '2028-02-29'), [{ month_start: '2028-02-01', period_from: '2028-02-10', period_to: '2028-02-29' }]);
+  assert.equal(monthsOf('2026-01-01', '2026-12-31').length, 12);
+});
+await t('文書 (docs/contracts) の付録の表 = 契約の部品の分類 (列・型・規則 / null) と同じ・503 の code の表も同じ', async () => {
+  const doc = fs.readFileSync(new URL('../docs/contracts/company_db_amazon_profit_response.contract.md', import.meta.url), 'utf8');
+  const section = (h) => { const s = doc.indexOf(h); assert.ok(s >= 0, h); const e = doc.indexOf('\n## ', s + 1); return doc.slice(s, e < 0 ? undefined : e); };
+  const rows = (text) => [...text.matchAll(/^\| `([a-z_]+)` \| ([^|]+) \| ([^|]+) \|/gm)].map((m) => [m[1], m[2].trim(), m[3].trim()]);
+  assert.deepEqual(rows(section('## 5. 付録 A')), TOTALS_COLUMNS.map((c) => [c.name, c.type, `\`${c.rule}\``]));
+  assert.deepEqual(rows(section('## 6. 付録 B')).map((r) => [r[0], r[1]]), DAILY_COLUMNS.map((c) => [c.name, c.type]));
+  assert.deepEqual([...section('## 4. 503').matchAll(/^\| `(PROFIT_[A-Z_]+)` \|/gm)].map((m) => m[1]), [...PROFIT_503_CODES]);
+});
+await t('fixture に秘密らしい文字が無い (鍵・接続の文字列・Bearer)', async () => {
+  for (const f of fs.readdirSync(FIX)) {
+    const text = fs.readFileSync(new URL(f, FIX), 'utf8');
+    assert.doesNotMatch(text, /rnd_[A-Za-z0-9]{8,}|RENDER_API_KEY|postgres(ql)?:\/\/|Bearer |x-sync-key/i, f);
+  }
+  assert.equal(CONTRACT_VERSION, 'amazon_profit_response_v1');
+});
+
+console.log(`\n${ok} 件 PASS${ng ? ` / ${ng} 件 NG` : ''}`);
+// 🚨 fetch の直後に process.exit() すると Windows の Node で libuv の assertion が出て終了コードが 127 になる = exitCode を置いて自然に終わらせる (保険に unref つきの setTimeout)
+process.exitCode = ng ? 1 : 0;
+setTimeout(() => process.exit(ng ? 1 : 0), 10000).unref();
