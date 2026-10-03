@@ -29,7 +29,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { openPgClient, pgAdapter, applyMigrations, DEFAULT_DIR } from './company-db/migrate.mjs';
-import { HEAVY_ENTRY_MANIFEST, revokeSigs, heavyEntryFindings, tempPrivilegeAudit } from './company-db/heavy-entry-manifest.mjs';
+import { HEAVY_ENTRY_MANIFEST, revokeSigs, heavyEntryFindings, tempPrivilegeAudit, manifestUpTo } from './company-db/heavy-entry-manifest.mjs';
 import { validateFinanceRows, orderFinanceChecksum } from '../apps/company-db/finance/order-finance-checksum.mjs';
 import { receiptDigest } from '../apps/company-db/finance/coverage-manifest.mjs';
 import { applyCoverage } from '../apps/company-db/ingest/finance-coverage.mjs';
@@ -79,7 +79,7 @@ const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + n
 const quiet = () => {};
 const H = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const CLOSED_FUNCTIONS = revokeSigs();
-const KEEP = HEAVY_ENTRY_MANIFEST.filter((e) => e.cls !== 'revoke').map((e) => e.sig);
+const KEEP = manifestUpTo('0056').filter((e) => e.cls !== 'revoke').map((e) => e.sig);   // 0056 より後の migration で作る関数 (manifest の migration) は 0055 の DB に無い
 const FILE_0056 = path.join(DEFAULT_DIR, '0056_amazon_profit_fn_revoke.sql');
 const SQL_0056 = fs.readFileSync(FILE_0056, 'utf8');
 
@@ -153,7 +153,7 @@ const aclOf = async (c, sig) => (await c.query(`select proacl::text as acl, proa
 
   console.log('0056 (持ち主が実行器で流す)');
   await t('実行器で流れる (0056 だけ・superuser でない持ち主で)', async () => {
-    assert.deepEqual((await applyMigrations(odb, { log: quiet })).applied, ['0056']);
+    assert.deepEqual((await applyMigrations(odb, { log: quiet, to: '0056' })).applied, ['0056']);
   });
   await t('🚨 持ち主・watcher・profit_reader・PUBLIC だけの役割の全部が、10 の関数で 42501 (permission denied for function)', async () => {
     assert.equal(CLOSED_FUNCTIONS.length, 10);
@@ -170,7 +170,7 @@ const aclOf = async (c, sig) => (await c.query(`select proacl::text as acl, proa
   });
   await t('🚨 権限の表が空・superuser でない役割は全部 false (持ち主も)・確かめの関数の問題は 0 件', async () => {
     for (const s of CLOSED_FUNCTIONS) { const a = await aclOf(O, s); assert.deepEqual([s, a.dflt, Number(a.n)], [s, false, 0]); }
-    assert.deepEqual(await heavyEntryFindings(odb), []);
+    assert.deepEqual(await heavyEntryFindings(odb, { upTo: '0056' }), []);
     assert.equal((await O.query(`select has_function_privilege(current_user, 'mart.finance_daily_sku_range(smallint, text, text, date, date)'::regprocedure, 'execute') as x`)).rows[0].x, false);
   });
 
@@ -237,16 +237,17 @@ const aclOf = async (c, sig) => (await c.query(`select proacl::text as acl, proa
     const a = await aclOf(O, sig);
     assert.deepEqual([a.dflt, Number(a.n)], [false, 0]);
     assert.equal((await O.query(`select pg_get_functiondef($1::regprocedure) as d`, [sig])).rows[0].d, def);
-    assert.deepEqual(await heavyEntryFindings(odb), []);
+    assert.deepEqual(await heavyEntryFindings(odb, { upTo: '0056' }), []);
   });
   await t('2 回流しても同じ (0056 の本文を持ち主がもう一度 = 例外なし・権限の表は空 / 実行器は 0 本)', async () => {
     await O.query(SQL_0056);
     for (const s of CLOSED_FUNCTIONS) assert.equal(Number((await aclOf(O, s)).n), 0, s);
-    assert.equal((await applyMigrations(odb, { log: quiet })).applied.length, 0);
-    assert.deepEqual(await heavyEntryFindings(odb), []);
+    assert.equal((await applyMigrations(odb, { log: quiet, to: '0056' })).applied.length, 0);
+    assert.deepEqual(await heavyEntryFindings(odb, { upTo: '0056' }), []);
   });
 
   await t('本適用の手順の --verify (heavy-entry-manifest.mjs・持ち主の URL・読むだけ) = ✅ と TEMP の監査を出して exit 0', async () => {
+    await applyMigrations(odb, { log: quiet });   // 0056 より後 (reresolve の batch・D-60 1b-0r ほか) も全部流した今の姿 (manifest の全部の行の関数がある・superuser でない持ち主で流れる)
     const x = new URL(url); x.username = OWNER; x.password = PW; x.pathname = `/${DB1}`;
     const r = spawnSync(process.execPath, ['scripts/company-db/heavy-entry-manifest.mjs', '--verify'], { cwd: ROOT, env: { ...process.env, COMPANY_DB_URL: x.toString() }, encoding: 'utf8', timeout: 60000 });
     assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -274,11 +275,14 @@ const aclOf = async (c, sig) => (await c.query(`select proacl::text as acl, proa
     const v0 = spawnSync(process.execPath, ['scripts/company-db/heavy-entry-manifest.mjs', '--verify'], { cwd: ROOT, env: { ...process.env, COMPANY_DB_URL: x2.toString() }, encoding: 'utf8', timeout: 60000 });
     assert.equal(v0.status, 1, '0056 の前の --verify は ❌ (exit 1)'); assert.match(v0.stdout, /❌ 重い入口/);
     // 本適用の手順の dry-run (0055 までの DB) = 0056 だけが出る・何も流さない
-    const dry = await applyMigrations(pgAdapter(O2), { dryRun: true, log: quiet });
-    assert.deepEqual([dry.applied, dry.pending], [[], ['0056']]);
+    const dry = await applyMigrations(pgAdapter(O2), { dryRun: true, log: quiet, to: '0056' });
+    assert.deepEqual([dry.applied, dry.pending.filter((v) => v <= '0056')], [[], ['0056']]);   // 0056 より後は to で止める (この試験は 0056 だけを見る)
     assert.deepEqual(await aclOf(O2, CLOSED_FUNCTIONS[0]), before);
-    assert.deepEqual((await applyMigrations(pgAdapter(O2), { log: quiet })).applied, ['0056']);
-    assert.deepEqual(await heavyEntryFindings(pgAdapter(O2)), []);
+    assert.deepEqual((await applyMigrations(pgAdapter(O2), { log: quiet, to: '0056' })).applied, ['0056']);
+    assert.deepEqual(await heavyEntryFindings(pgAdapter(O2), { upTo: '0056' }), []);
+    // 0056 まで適用・それより後は未適用の DB (本番の適用の途中の姿) でも --verify は ✅ (DB の版より後の migration で作る関数は見ない・D-60 1b-0r)
+    const v1 = spawnSync(process.execPath, ['scripts/company-db/heavy-entry-manifest.mjs', '--verify'], { cwd: ROOT, env: { ...process.env, COMPANY_DB_URL: x2.toString() }, encoding: 'utf8', timeout: 60000 });
+    assert.equal(v1.status, 0, v1.stdout + v1.stderr); assert.match(v1.stdout, /0056 まで = それより後の migration で作る関数 \d+ 個は見ていない/);
   });
 }
 } finally { await su.end().catch(() => {}); }

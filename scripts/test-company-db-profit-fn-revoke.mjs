@@ -19,7 +19,7 @@ import path from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
 import express from 'express';
 import { applyMigrations, pgliteAdapter, DEFAULT_DIR } from './company-db/migrate.mjs';
-import { HEAVY_ENTRY_MANIFEST, HEAVY_VIEWS, APP_HEAVY_ENTRIES, revokeSigs, heavyEntryFindings, heavyCandidates, tempPrivilegeAudit } from './company-db/heavy-entry-manifest.mjs';
+import { HEAVY_ENTRY_MANIFEST, HEAVY_VIEWS, APP_HEAVY_ENTRIES, revokeSigs, heavyEntryFindings, heavyCandidates, tempPrivilegeAudit, manifestUpTo } from './company-db/heavy-entry-manifest.mjs';
 import companyDbRouter, { __setPgClientFactory } from '../apps/company-db/router.mjs';
 
 let ok = 0, ng = 0;
@@ -31,7 +31,7 @@ const db = pgliteAdapter(pg);
 const q = async (sql, p) => (await pg.query(sql, p)).rows;
 const FILE_0056 = path.join(DEFAULT_DIR, '0056_amazon_profit_fn_revoke.sql');
 const REVOKE = revokeSigs();
-const KEEP = HEAVY_ENTRY_MANIFEST.filter((e) => e.cls !== 'revoke').map((e) => e.sig);
+const KEEP = manifestUpTo('0056').filter((e) => e.cls !== 'revoke').map((e) => e.sig);   // 0056 より後の migration で作る関数 (manifest の migration) は 0055 の DB に無い
 
 // 本番と同じ順: watcher は 0047 / 0049 / 0050 より前からある (create-watch-roles.mjs が作った) = その migration が watcher に EXECUTE を付けた。
 // profit_reader はまだ本番に無いが、あれば外すことを見る (0055 の後に明示の GRANT を付けておく)
@@ -77,7 +77,7 @@ await t('watcher は公開の関数と finance_daily_sku_range・profit_reader �
 
 console.log('0056');
 await t('実行器で流れる (0056 だけ)', async () => {
-  assert.deepEqual((await applyMigrations(db, { log: quiet })).applied, ['0056']);
+  assert.deepEqual((await applyMigrations(db, { log: quiet, to: '0056' })).applied, ['0056']);
 });
 await t('🚨 revoke の 10 の関数は権限の表が空 (null = 既定 でもない)・PUBLIC・watcher・profit_reader は false・棚卸しの問題は 0 件', async () => {
   assert.equal(REVOKE.length, 10);
@@ -86,7 +86,7 @@ await t('🚨 revoke の 10 の関数は権限の表が空 (null = 既定 でも
     assert.deepEqual([s, r.dflt, Number(r.n)], [s, false, 0]);
     for (const role of ['public', 'watcher', 'profit_reader']) assert.equal(await priv(role, s), false, `${role}: ${s}`);
   }
-  assert.deepEqual(await heavyEntryFindings(db), []);
+  assert.deepEqual(await heavyEntryFindings(db, { upTo: '0056' }), []);
 });
 await t('🚨 superuser でない役割から呼ぶと permission denied for function (watcher・profit_reader・PUBLIC だけの役割 × 10 の関数)', async () => {
   for (const s of REVOKE) for (const role of ['watcher', 'profit_reader', 'd60_public_only']) assert.equal(await callAs(role, s), 'fn_denied', `${role}: ${s}`);
@@ -103,11 +103,11 @@ await t('superuser (PGlite の接続 = 試験の持ち主) は今も呼べる = 
   assert.equal((await q(`select count(*)::int as n from mart.amazon_profit_daily_range(1::smallint, 'amazon', 'jp', '2026-06-01', '2026-06-01')`))[0].n, 0);
 });
 await t('2 回流しても同じ (0056 の本文をもう一度 = 例外なし・全部の manifest の関数の権限の表が同じ / 実行器は 0 本)', async () => {
-  const before = {}; for (const e of HEAVY_ENTRY_MANIFEST) before[e.sig] = await aclText(e.sig);
+  const before = {}; for (const e of manifestUpTo('0056')) before[e.sig] = await aclText(e.sig);
   await pg.exec(fs.readFileSync(FILE_0056, 'utf8'));
-  for (const e of HEAVY_ENTRY_MANIFEST) assert.equal(await aclText(e.sig), before[e.sig], e.sig);
-  assert.equal((await applyMigrations(db, { log: quiet })).applied.length, 0);
-  assert.deepEqual(await heavyEntryFindings(db), []);
+  for (const e of manifestUpTo('0056')) assert.equal(await aclText(e.sig), before[e.sig], e.sig);
+  assert.equal((await applyMigrations(db, { log: quiet, to: '0056' })).applied.length, 0);
+  assert.deepEqual(await heavyEntryFindings(db, { upTo: '0056' }), []);
 });
 await t('TEMP の権限は監査を出すだけ (0056 の前と後で同じ・PUBLIC は TEMP あり = PR 1b で外す)・一時の表を作る関数を数える', async () => {
   const a = await tempPrivilegeAudit(db);
@@ -116,7 +116,8 @@ await t('TEMP の権限は監査を出すだけ (0056 の前と後で同じ・PU
   for (const s of ['core.relink_shipments_bulk', 'core.reresolve_order_lines', 'core.merge_duplicate_suppliers']) assert.ok(a.tempFunctions.some((x) => x.startsWith(s + '(')), `${s} が一時の表を作る関数に無い`);
 });
 
-console.log('重い入口の棚卸し (heavy_entry_manifest と pg_proc の突き合わせ)');
+console.log('重い入口の棚卸し (heavy_entry_manifest と pg_proc の突き合わせ・0056 より後も全部流した今の姿で)');
+await applyMigrations(db, { log: quiet });   // 0056 より後 (reresolve の batch・D-60 1b-0r ほか) も全部 = manifest の全部の行の関数がある
 const inTx = async (sql, fn) => { await pg.exec('begin'); try { await pg.exec(sql); return await fn(); } finally { await pg.exec('rollback'); } };
 await t('規則にかかる関数は全部 manifest にあり、manifest の関数は全部 DB にある (mart.finance_daily_range・ad_efficiency・sku_activity は guard_later)', async () => {
   const cands = await heavyCandidates(db);
