@@ -161,7 +161,7 @@ const MAX_JSON_DEPTH = 32;
  * 整数の字句 (小数点・指数なし) かつ safe integer のときだけ数にする (ほかは NOT_INTEGER = binary64 に丸めた後で判定しない)。
  *   🚨 JSON.parse の reviver の第 3 引数 (context.source・TC39 の source text access) は本番の Docker (node:20-slim) では渡らない = 使わない
  *   - 文字列は 1 つずつ字句を切り出して JSON.parse に渡す (escape の解釈は標準のまま)
- *   - 同じ key が 2 つ・深さ 32 を超える・末尾の余り・文法の違反は例外 (= METRICS_SHAPE)
+ *   - 同じ key が 2 つ・container ([ と {) の入れ子が 32 を超える (32 段は受け取り 33 段は拒む)・末尾の余り・文法の違反は例外 (= METRICS_SHAPE)
  *   - object は prototype の無い object に入れる (key が "__proto__" でも prototype を変えない)
  */
 export function parseJsonIntegersOnly(text) {
@@ -172,11 +172,12 @@ export function parseJsonIntegersOnly(text) {
   const ws = () => { while (i < text.length && (text[i] === ' ' || text[i] === '\t' || text[i] === '\n' || text[i] === '\r')) i++; };
   const bad = () => { throw new Reject('METRICS_SHAPE'); };
   const lex = (re) => { re.lastIndex = i; const m = re.exec(text); if (!m) bad(); i = re.lastIndex; return m[0]; };
+  // depth = この値を囲む container ([ と {) の数。container を開くとき、入れ子の数 (depth + 1) が 32 を超えたら拒む (#1600 R3 Low)
   const value = (depth) => {
-    if (depth > MAX_JSON_DEPTH) bad();
     ws();
     const c = text[i];
     if (c === '{') {
+      if (depth + 1 > MAX_JSON_DEPTH) bad();
       i++; const obj = Object.create(null); ws();
       if (text[i] === '}') { i++; return obj; }
       for (;;) {
@@ -192,6 +193,7 @@ export function parseJsonIntegersOnly(text) {
       }
     }
     if (c === '[') {
+      if (depth + 1 > MAX_JSON_DEPTH) bad();
       i++; const arr = []; ws();
       if (text[i] === ']') { i++; return arr; }
       for (;;) {

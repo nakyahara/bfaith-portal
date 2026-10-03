@@ -298,8 +298,17 @@ await t('文法の違反・同じ key・深すぎる・末尾の余り → METRI
   assert.equal(({}).polluted, undefined);
   assert.deepEqual(o.a, [true, false, null, 'xé\n']);
   assert.deepEqual(JSON.parse(JSON.stringify(parseJsonIntegersOnly(' \r\n\t{ "k" : [ 1 , "2" ] } \n'))), { k: [1, '2'] });
-  // 深さ 32 までは読める
-  assert.ok(Array.isArray(parseJsonIntegersOnly(`${'['.repeat(32)}${']'.repeat(32)}`)));
+});
+await t('深さの境界 (R3 Low): container ([ と {) の入れ子は 32 段まで受け取り 33 段から拒む (配列・object・混ぜた形・一番下に値がある形)', async () => {
+  const arr = (n, inner = '') => `${'['.repeat(n)}${inner}${']'.repeat(n)}`;
+  const obj = (n, inner = '1') => `${'{"a":'.repeat(n)}${inner}${'}'.repeat(n)}`;
+  const mix = (n) => { let s = '7'; for (let k = 0; k < n; k++) s = k % 2 ? `{"k":${s}}` : `[${s}]`; return s; };
+  for (const [name, make] of [['配列', (n) => arr(n)], ['配列 + 値', (n) => arr(n, '5')], ['object', (n) => obj(n)], ['object + {}', (n) => obj(n - 1, '{}')], ['混ぜた形', mix]]) {
+    for (const n of [1, 31, 32]) assert.doesNotThrow(() => parseJsonIntegersOnly(make(n)), `${name} ${n} 段`);
+    for (const n of [33, 34, 40]) assert.throws(() => parseJsonIntegersOnly(make(n)), (e) => e && e.reason === 'METRICS_SHAPE', `${name} ${n} 段`);
+  }
+  assert.equal(parseJsonIntegersOnly(arr(32, '5')).flat(Infinity)[0], 5);
+  assert.equal(parseJsonIntegersOnly('5'), 5);   // container の無い値は 0 段
 });
 
 console.log('時刻 = RFC 3339 の暦の要素を全部確かめる (Date.parse に直させない)');
