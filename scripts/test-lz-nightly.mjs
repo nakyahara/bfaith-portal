@@ -722,10 +722,14 @@ function realLikeLz({ over = {}, ids = ['A-1', 'B-2', 'C-3'], same = {}, now = n
     if (same[id]) { const [n, f, p, s] = same[id]; Object.assign(c, { [col('商品名')]: n, [col('検索名称')]: f, [col('仕入単価')]: p, [col('商品予備項目００３')]: s }); }
     return c;
   };
-  const st = { lz: new Map(ids.map((id) => [id, cells(id)])), bc: ids.map((id, i) => [id, id.toLowerCase(), String(4900000000000 + i)]), calls: [] };
+  const st = { lz: new Map(ids.map((id) => [id, cells(id)])), bc: ids.map((id, i) => [id, id.toLowerCase(), id === SENT ? VF.LZ_SENTINEL_BARCODE : String(4900000000000 + i)]), calls: [] };
   const lastReal = realIds[realIds.length - 1];
   if (over.lastTwo) st.bc.splice(st.bc.findIndex((r) => r[0] === lastReal) + 1, 0, [lastReal, lastReal.toLowerCase(), '4900000000500']);
-  const byteSort = (rows, key) => [...rows].sort((a, b) => Buffer.compare(Buffer.from(key(a)), Buffer.from(key(b))));
+  // 書き出しの並び: 本物と同じ商品ID のバイト順 / over.disorderAfterSentinel = 並びの前提が崩れた (見張りの後ろに置く商品 ID の一覧・{ pre, post } で片側だけ)
+  if (over.sentinelBarcode0) st.bc.find((r) => r[0] === SENT)[2] = over.sentinelBarcode0;   // 前から見張りのバーコードが違う
+  const byteSort0 = (rows, key) => [...rows].sort((a, b) => Buffer.compare(Buffer.from(key(a)), Buffer.from(key(b))));
+  const byteSort = (rows, key) => { const s0 = byteSort0(rows, key); const dl = over.disorderAfterSentinel; const late = new Set(Array.isArray(dl) ? dl : (dl && dl[phase()]) || []); return [...s0.filter((r) => !late.has(key(r))), ...s0.filter((r) => late.has(key(r)))]; };
+  const cutShohin = (rows) => { const n = over.cutShohinTail && over.cutShohinTail[phase()]; return n ? rows.slice(0, rows.length - n) : rows; };
   const phase = () => (st.calls.includes('execute') ? 'post' : 'pre');
   const cutTail = (rows) => { const n = over.cutBarcodeTail && over.cutBarcodeTail[phase()]; return n ? rows.slice(0, rows.length - n) : rows; };
   // 印 = ロジザードの取込の時刻 (JST 14 桁)。Render の時刻 (now) があればそこから・商品ごとに秒が進む (長い取込)
@@ -736,7 +740,7 @@ function realLikeLz({ over = {}, ids = ['A-1', 'B-2', 'C-3'], same = {}, now = n
     exportShohin: async () => {
       st.calls.push('exportShohin'); exported++;
       if (over.postShohinFailsOnce && st.calls.includes('execute') && !st.failedOnce) { st.failedOnce = true; throw new Error('書き出しに失敗 (通信)'); }
-      return { buf: csvBuf(H, byteSort([...st.lz.values()], (c) => c[col('商品ID')])) };
+      return { buf: csvBuf(H, cutShohin(byteSort([...st.lz.values()], (c) => c[col('商品ID')]))) };
     },
     exportBarcodes: async () => { const ph = phase(); st.calls.push('exportBarcodes'); void ph; return { buf: csvBuf(['商品ID', '商品名', 'バーコード'], cutTail(byteSort(st.bc, (r) => r[0]))) }; },
     previewImport: async (p) => { st.calls.push('preview'); st.previewed = p; return { previewed: true }; },
@@ -758,6 +762,7 @@ function realLikeLz({ over = {}, ids = ['A-1', 'B-2', 'C-3'], same = {}, now = n
       if (over.execAddLast) st.bc.push([lastReal, lastReal.toLowerCase(), '4900000000777']);
       if (over.execRemoveLast) st.bc.splice(st.bc.findIndex((r) => r[2] === '4900000000500'), 1);
       if (over.execReplaceLast) st.bc.find((r) => r[2] === '4900000000500')[2] = '4900000000501';
+      if (over.execSentinelBarcode) st.bc.find((r) => r[0] === SENT)[2] = over.execSentinelBarcode;   // 見張りのバーコードが変わった
       if (over.postExtraAfterSentinel) { st.lz.set(`${SENT}z`, cells(`${SENT}z`)); st.bc.push([`${SENT}z`, 'x', '4900000000888']); }
       return { executeIssued: true, confirm: 'clicked', reason: null, resultText: `インポート結果 総件数 : ${rows.length} 処理件数 : ${rows.length} 処理不要件数 : 0 エラー件数 : 0` };
     },
@@ -1072,6 +1077,45 @@ await ta('[34] 見張りの商品 (Codex #1595 R1 Medium・Low): 最後の本物
       assert.ok(vk.includes('sentinel_not_last_barcode_post'), vk.join(','));
     }
   }
+});
+
+await ta('[35] 並びの前提の崩れ・見張りのバーコード (Codex #1597 R1): 崩れが見える = 前なら押さない・後なら verify_failed / 崩れ + 見張りの直後で切れた (比べる商品が隠れる) = precheck・verifyImport が止める / 見張りのバーコードが変わった = verify_failed', async () => {
+  const run = async (over, ids = ['A-1', 'B-2']) => {
+    const p = portal();
+    p.putArtifact();
+    const d = setupData();
+    const lz = realLikeLz({ ids, over, now: () => p.clock.now });
+    const r = await N.runNightly(e2eOpts(p, d, lz).o);
+    const runDir = r.runId ? N.nightlyRunDir(d, r.runId) : null;
+    const vpath = runDir && path.join(runDir, 'verify.json');
+    const v = vpath && fs.existsSync(vpath) ? JSON.parse(fs.readFileSync(vpath, 'utf8')) : null;
+    const rec = runDir ? JSON.parse(fs.readFileSync(path.join(runDir, 'import.json'), 'utf8')) : null;
+    return { r, lz, v, rec, st: S.getStatus(p.db, { now: p.clock.now }) };
+  };
+  // 崩れが見える (前の書き出しから): 見張りの後ろに B-2 = 押さない
+  let x = await run({ disorderAfterSentinel: ['B-2'] });
+  assert.deepEqual([x.r.result, x.lz.st.calls.includes('execute')], ['not_started', false]);
+  assert.match(x.rec.error, /sentinel_not_last_shohin_pre.*order_broken_shohin_pre|order_broken/);
+  // 崩れ + 見張りの直後で切れた (実体 [A-1, 見張り, B-2] → 見える [A-1, 見張り]): 比べる商品 B-2 が直前の一覧に無い = precheck (L-7) が押さない
+  x = await run({ disorderAfterSentinel: ['B-2'], cutShohinTail: { pre: 1 }, cutBarcodeTail: { pre: 1 } });
+  assert.deepEqual([x.r.result, x.lz.st.calls.includes('execute')], ['not_started', false]);
+  assert.match(x.rec.error, /CSV の商品がロジザードに無い/);
+  // 直後だけ崩れ + 見張りの直後で切れた: B-2 が直後の一覧に無い = verifyImport の差 = verify_failed
+  x = await run({ disorderAfterSentinel: { post: ['B-2'] }, cutShohinTail: { post: 1 }, cutBarcodeTail: { post: 1 } });
+  assert.equal(x.r.result, 'verify_failed');
+  // 直後の並びの崩れだけ (切れなし) = verify_failed (order_broken_*_post)
+  x = await run({ disorderAfterSentinel: { post: ['A-1'] } });
+  assert.equal(x.r.result, 'verify_failed');
+  const vk = x.v.barcode.diffs.map((y) => y.kind);
+  assert.ok(vk.includes('order_broken_barcode_post') && vk.includes('order_broken_shohin_post'), vk.join(','));
+  // 見張りのバーコードが取込で変わった = verify_failed / 前から違う = 押さない
+  x = await run({ execSentinelBarcode: 'LZGUARD0002' });
+  assert.deepEqual([x.r.result, x.v.barcode.diffs.map((y) => y.kind)], ['verify_failed', ['sentinel_barcode_post']]);
+  x = await run({ sentinelBarcode0: 'LZGUARD0002' });
+  assert.deepEqual([x.r.result, x.lz.st.calls.includes('execute')], ['not_started', false]);
+  assert.match(x.rec.error, /sentinel_barcode_pre/);
+  x = await run({});
+  assert.equal(x.r.result, 'verified');
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
