@@ -43,15 +43,18 @@
  */
 import express from 'express';
 import path from 'node:path';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { MASTER_OWNERSHIP, validateOwnership } from '../../config/master-ownership.mjs';
-import { saveSku, MasterWriteError, MAX_COMPONENTS } from '../../lib/master-write.mjs';
+import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
 import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
-import { listSkus, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS } from './read.mjs';
+import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS } from './read.mjs';
+import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
 import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, CHANNELS, UNMAPPED_DAYS } from './amazon-read.mjs';
@@ -70,6 +73,18 @@ const REG_CHECK_OUTCOMES = Object.freeze({ verified: 'NE で確かめた', parti
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const view = (name) => path.join(__dirname, 'views', name);
 const router = express.Router();
+
+/**
+ * 画面の見た目の部品 (新しいデザイン = 一覧・1 つの商品・つかいかた・誤り。CSS 1 つ + 画面の JS)。public/ の中だけを配る (読むだけ)。
+ * 版 (assetV) = 中身のハッシュ = 配り直した日に古い CSS / JS が 1 時間残らない
+ */
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const assetV = (() => {
+  const h = crypto.createHash('sha256');
+  try { for (const f of fs.readdirSync(PUBLIC_DIR).sort()) h.update(f).update(fs.readFileSync(path.join(PUBLIC_DIR, f))); } catch { /* 無ければ空の版 */ }
+  return h.digest('hex').slice(0, 12);
+})();
+router.use('/public', express.static(PUBLIC_DIR, { maxAge: '1h', index: false }));
 
 /** Postgres の接続の作り方 (試験は PGlite に差し替える。本番では触らない) */
 let pgClientFactory = openPgClient;
@@ -200,7 +215,7 @@ async function withPgPage(req, res, fn) {
     await fn(c.client ? pgAdapter(c.client) : null, c.error || null);
   } catch (e) {
     console.error(`[master-edit] ${e && e.stack || e}`);
-    if (!res.headersSent) res.status(500).render(view('error.ejs'), { ...pageLocals(req), message: 'サーバーエラーが発生しました' });
+    if (!res.headersSent) res.status(500).render(view('error.ejs'), { ...pageLocals(req), ui2: true, message: 'サーバーエラーが発生しました' });
   } finally { if (c.client) { try { await c.client.end(); } catch { /* */ } } }
 }
 /** API: つながらない = 503 (書き込み用の接続が無い = no_write_role) */
@@ -236,6 +251,8 @@ const pageLocals = (req, phase = null) => {
     open: isOpen(), phaseText,
     closed: !!why, closedWhy: why,
     amazonClosed: !!amazonWhy, amazonClosedWhy: amazonWhy,
+    // 新しいデザインの画面 (ui2) だけが使う: 見せ方の道具・部品の版・左の列でいまどこか
+    ui, assetV, ui2: false, nav: '', nowMs: clock(),
   };
 };
 const fmt = {
@@ -250,10 +267,11 @@ router.get('/', (req, res) => {
     const filters = normalizeFilters(req.query);
     const data = db ? await listSkus(db, filters, { now: new Date(clock()) }) : { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false };
     const phase = db ? await readCutoverPhase(db) : null;
-    res.render(view('index.ejs'), { ...pageLocals(req, phase), dbError, data, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, fmt });
+    const counts = db ? await listCounts(db, { now: new Date(clock()) }) : null;
+    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, fmt });
   });
 });
-router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), MAX_COMPONENTS }));
+router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), ui2: true, nav: 'manual', MAX_COMPONENTS }));
 
 // 新商品の登録 (画面 D)。つながらないときも画面は出す (帯・保存のボタンは出さない)
 router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
@@ -278,10 +296,10 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
 router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) => {
   const now = new Date(clock());
   const page = db ? await readSkuPage(db, req.params.code, { now, ownership: ownershipNow(), open: isOpen() }) : null;
-  if (db && !page) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), message: `商品コード ${req.params.code} は Company DB にありません` });
+  if (db && !page) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), ui2: true, nav: 'list', message: `商品コード ${req.params.code} は Company DB にありません` });
   const shipping = page ? await shippingRatesProvider() : null;
   res.render(view('sku.ejs'), {
-    ...pageLocals(req, page ? page.phase : null), dbError, page, code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,
+    ...pageLocals(req, page ? page.phase : null), ui2: true, nav: 'list', dbError, page, FIELD_DEFS: page ? fieldsOf(page.cur.sku_kind) : {}, REG_FIELDS: page ? (REG_CSV_FIELDS[page.cur.sku_kind] || []) : [], code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
   });
 }));

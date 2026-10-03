@@ -873,7 +873,7 @@ await ta('[12] 一覧・1 つ・変更の記録・つかいかた・末尾の / 
   const m = await call('GET', '/manual');
   for (const word of ['Amazon SKU の対応を直す', '墓標', '未登録', '07:00', 'NE確認済み']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
   const idx = await call('GET', '/');
-  assert.ok(idx.text.includes('href="amazon/"'));
+  assert.ok(idx.text.includes('href="/apps/master-edit/amazon/"'));
 });
 
 await ta('[12] 保存・削除の API: 名簿の人だけ・Origin が要る・保存の結果・削除 (理由)・閉じていれば 409', async () => {

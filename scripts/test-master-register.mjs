@@ -1164,8 +1164,10 @@ async function call(method, url, { body, session = 'editor', origin = true } = {
 /** 画面の JS が文法として読めること・EJS の出力が JS に混ざっていないこと (属性つきの script も数える) */
 function checkScripts(html, expected) {
   const opens = [...html.matchAll(/<script\b/gi)].length;
-  const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].filter((m) => !/\bsrc=/.test(m[1])).map((m) => m[2]);
-  assert.equal([...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].length, opens, 'script の開きと閉じの数が合わない');
+  const all = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
+  for (const m of all.filter((x) => /type="application\/json"/.test(x[1]))) JSON.parse(m[2]);   // 画面の JS に渡す値
+  const scripts = all.filter((m) => !/\bsrc=/.test(m[1]) && !/type="application\/json"/.test(m[1])).map((m) => m[2]);
+  assert.equal(all.length, opens, 'script の開きと閉じの数が合わない');
   if (expected != null) assert.equal(scripts.length, expected, `<script> の数 ${scripts.length}`);
   for (const s of scripts) { new vm.Script(s); assert.ok(!/<%|%>/.test(s), 'EJS のタグが JS に残っている'); }
   return scripts;
@@ -1226,8 +1228,8 @@ await ta('[H3] カードが作れなかった登録: 登録は成功・「カー
   assert.deepEqual([r.j.card.status, r.j.card_label, r.j.card.error], ['failed', 'カード作成待ち (失敗)', 'SQLite に書けない']);
   let page = await call('GET', '/apps/master-edit/sku/web-2');
   assert.equal(page.status, 200);
-  checkScripts(page.text, 1);
-  assert.match(page.text, /カード作成待ち \(失敗\)/); assert.match(page.text, /id="card-retry"/); assert.match(page.text, /登録: 下書き/);
+  checkScripts(page.text, 0);
+  assert.match(page.text, /カード作成待ち \(失敗\)/); assert.match(page.text, /id="card-retry"/); assert.match(page.text, /<span class="b warn">下書き<\/span>/);
   assert.equal((await call('POST', '/apps/master-edit/api/sku/web-2/card-retry', { body: {}, session: 'viewer' })).status, 403);
   applierMode = 'real';
   const retry = await call('POST', '/apps/master-edit/api/sku/web-2/card-retry', { body: {} });
@@ -1267,7 +1269,7 @@ await ta('[H5] 衝突の画面: 「既存のカードをこの商品に結ぶ」
   const r = await call('POST', '/apps/master-edit/api/new', { body });
   assert.deepEqual([r.status, r.j.card.status], [200, 'conflict']);
   let page = await call('GET', '/apps/master-edit/sku/web-9');
-  checkScripts(page.text, 1);
+  checkScripts(page.text, 0);
   assert.match(page.text, /id="card-link" data-draft="\d+"/); assert.match(page.text, /カードの衝突/);
   assert.equal((await call('POST', '/apps/master-edit/api/sku/web-9/card-link', { body: { draft_id: String(old.id) }, session: 'viewer' })).status, 403);
   assert.equal((await call('POST', '/apps/master-edit/api/sku/web-9/card-link', { body: {} })).status, 400);
@@ -1283,7 +1285,7 @@ await ta('[H5] 衝突の画面: 「既存のカードをこの商品に結ぶ」
   // 同じコードのカードが 2 枚以上 ([O10] の dup-1) = 「結ぶ」を出さない・押しても 409 ambiguous (何も結ばない)
   page = await call('GET', '/apps/master-edit/sku/dup-1');
   assert.equal(page.status, 200);
-  checkScripts(page.text, 1);
+  checkScripts(page.text, 0);
   assert.ok(!/id="card-link"/.test(page.text)); assert.match(page.text, /2 枚以上あります/);
   const dupIds = ph.prepare(`SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = 'dup-1' ORDER BY id`).all().map((x) => x.id);
   for (const d of dupIds) assert.ok(page.text.includes(`/apps/product-hub/detail/${d}"`), `#${d} へのリンク`);

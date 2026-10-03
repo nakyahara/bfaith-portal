@@ -7,62 +7,132 @@
   <%- include('_header') %>
   <%
     const SALES = { 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' };
-    const pageHref = (offset) => '?' + new URLSearchParams({ ...Object.fromEntries(Object.entries(filters).filter(([k, v]) => v && k !== 'offset')), ...(offset ? { offset: String(offset) } : {}) }).toString();
+    const REG_BADGE = { draft: 'warn', ne_pending: 'info', ne_confirmed: 'info', distributable: 'info', quarantined: 'err', cancelled: 'mute' };
+    const FLAG_BADGE = { 'NEとの差': 'err', 'CSV待ち': 'info', '構成の依頼': 'warn', 'カード作成待ち': 'warn', 'カード作成待ち (失敗)': 'err', 'カードの衝突': 'err' };
+    // 今の絞り込み (offset を除く) を土台に、1 つだけ変えた URL
+    const keep = Object.fromEntries(Object.entries(filters).filter(([k, v]) => v && k !== 'offset'));
+    const hrefWith = (over) => {
+      const p = { ...keep };
+      for (const [k, v] of Object.entries(over)) { if (v) p[k] = v; else delete p[k]; }
+      const s = new URLSearchParams(p).toString();
+      return s ? '?' + s : './';
+    };
+    const pageHref = (offset) => { const s = new URLSearchParams({ ...keep, ...(offset ? { offset: String(offset) } : {}) }).toString(); return s ? '?' + s : './'; };
+    const nOf = (v) => (v == null ? null : Number(v));
+    // 札: [ラベル, 絞り込みの名前, 値, 数, 色]。数 0 = 押せない (いま絞っている札だけは外せるように押せる)
+    const chip = (label, key, value, n, tone, icon) => {
+      const on = filters[key] === value || (key === 'kind' && value === '' && !filters.kind);
+      const zero = n === 0 && !on;
+      const href = key === 'kind' ? hrefWith({ kind: value }) : hrefWith({ [key]: on ? '' : value });
+      const num = n == null ? '' : '<span class="n">' + Number(n).toLocaleString('ja-JP') + '</span>';
+      const ic = icon ? '<svg class="ic s" aria-hidden="true"><use href="#' + icon + '"/></svg>' : '';
+      const cls = 'chip' + (on ? ' on' : '') + (tone ? ' t-' + tone : '') + (zero ? ' zero' : '');
+      if (zero) return '<span class="' + cls + '" aria-disabled="true" aria-label="' + label + ' いま 0 件">' + ic + label + ' ' + num + '</span>';
+      return '<a class="' + cls + '" href="' + href + '"' + (on ? ' aria-current="true"' : '') + '>' + ic + label + ' ' + num + '</a>';
+    };
+    const c = counts || {};
+    // 札で出せない絞り込み (状態 = 取扱中・登録の下書き以外・札の無い未入力) のときは「もっと絞る」を開いておく
+    const moreOn = (filters.state && filters.state !== 'discontinued') || (filters.reg && filters.reg !== 'draft') || (filters.missing && !['cost', 'sales', 'tax'].includes(filters.missing));
   %>
-  <div class="me-wrap">
-    <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
-    <% if (closed) { %><div class="band warn">いまは保存できません (<%= closedWhy %>)。この画面は見るだけです。切替日までは商品マスタの正は NE・/register です。</div><% } %>
-    <% if (!canEdit) { %><div class="band info"><%= gateMessage %></div><% } %>
-    <div class="me-box">
-      <p class="hint">
-        Company DB の商品・セットの一覧です。コードを押すと 1 つずつ見て直せます。<b>*</b> = 構成品から導いた値 (セットの税率・原価の合計・売上分類)。
-        「未入力」で、まだ入っていない項目の商品だけを出せます (今の /register の「未登録」の代わり)。
-        <a href="manual">📖 つかいかた</a> ・ <a href="amazon/">🛒 Amazon SKU の対応</a> ・ <a href="/apps/master-decisions/">⚖️ マスタの判断 (NE との差)</a>
-        ・ <a href="new?kind=single">＋ 新商品 (単品)</a> ・ <a href="new?kind=set">＋ 新商品 (セット)</a> ・ <a href="reg-csv">📤 NE 登録の CSV</a>
-      </p>
+  <div class="page" id="list-page">
+    <div class="ph">
+      <div>
+        <h1>商品・セット</h1>
+        <div class="meta"><span>Company DB の商品マスタ</span><span class="dotsep"></span><span>NE との照合 <%= data.latestRun ? ui.fmtJst(data.latestRun.observed_at, { nowMs }) : 'まだありません' %></span></div>
+      </div>
+      <div class="ph-actions">
+        <a class="btn" href="new?kind=set"><svg class="ic" aria-hidden="true"><use href="#i-box"/></svg>新しいセット</a>
+        <a class="btn pri" href="new?kind=single"><svg class="ic" aria-hidden="true"><use href="#i-plus"/></svg>新しい単品</a>
+      </div>
     </div>
 
-    <form method="get" action="" class="row">
-      <input name="q" value="<%= filters.q %>" placeholder="コード・名前・JAN で検索" size="26">
-      <label>区分 <select name="kind"><option value="">全部</option><% for (const [k, v] of Object.entries(KINDS)) { %><option value="<%= k %>"<%= filters.kind === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
-      <label>状態 <select name="state"><option value="">全部</option><% for (const [k, v] of Object.entries(STATES)) { %><option value="<%= k %>"<%= filters.state === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
-      <label>カード <select name="card"><option value="">全部</option><% for (const [k, v] of Object.entries(CARD_FILTERS)) { %><option value="<%= k %>"<%= filters.card === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
-      <label>登録 <select name="reg"><option value="">全部</option><% for (const [k, v] of Object.entries(REG_STATES)) { %><option value="<%= k %>"<%= filters.reg === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
-      <label>未入力 <select name="missing"><option value="">—</option><% for (const [k, v] of Object.entries(MISSING)) { %><option value="<%= k %>"<%= filters.missing === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
-      <label><input type="checkbox" name="diff" value="1"<%= filters.diff ? ' checked' : '' %><%= data.diffAvailable ? '' : ' disabled' %>> NEとの差あり</label>
-      <button class="btn-sm" type="submit">表示</button>
-      <span class="muted"><%= data.total.toLocaleString('ja-JP') %> 件<% if (data.latestRun) { %> ・ 最新の照合 <%= String(data.latestRun.observed_at || '').slice(0, 16) %><% } %></span>
-    </form>
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
+    <% if (closed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= closedWhy %>)</div><div class="hint">この画面は見るだけです。切替日までは商品マスタの正は NE・/register です。</div></div></div><% } %>
+    <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
 
-    <div class="tbox">
-      <table class="me">
-        <thead><tr><th>コード</th><th>名前</th><th>区分</th><th>状態</th><th>登録</th><th>税</th><th>売価</th><th>原価</th><th>分類</th><th>仕入先</th><th>⚠</th></tr></thead>
-        <tbody>
-          <% if (!data.rows.length) { %><tr><td colspan="11" class="muted"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
-          <% for (const r of data.rows) { %>
-          <tr>
-            <td><a href="sku/<%= encodeURIComponent(r.code) %>"><%= r.code %></a></td>
-            <td><%= r.name %></td>
-            <td><%= KINDS[r.kind] || r.kind %></td>
-            <td><%= STATES[r.state] || r.state %></td>
-            <td><%= r.reg_state === 'none' ? '—' : (REG_STATES[r.reg_state] || r.reg_state) %></td>
-            <td class="n"><%= r.tax_rate == null ? '' : fmt.tax(r.tax_rate) %><%= r.tax_derived ? '*' : '' %></td>
-            <td class="n"><%= fmt.yen(r.standard_price) %></td>
-            <td class="n"><%= fmt.yen(r.cost) %><%= r.cost_derived ? '*' : '' %></td>
-            <td><%= r.sales_class == null ? '' : r.sales_class %><%= r.sales_derived && r.sales_class != null ? '*' : '' %></td>
-            <td><%= r.kind === 'set' ? '—' : (r.primary_supplier || '') %></td>
-            <td><% for (const f of r.flags) { %><span class="flag"><%= f %></span><% } %></td>
-          </tr>
-          <% } %>
-        </tbody>
-      </table>
+    <div class="panel hud">
+      <form method="get" action="" role="search" class="bigsearch" id="list-search">
+        <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+        <input id="q" name="q" value="<%= filters.q %>" autocomplete="off" aria-keyshortcuts="/" aria-label="商品・セットを絞る (コード・名前・JAN)" placeholder="商品・セットを絞る (コード・名前・JAN)　例: はちみつ / 4901234567894">
+        <% for (const [k, v] of Object.entries(keep)) { if (k === 'q') continue; %><input type="hidden" name="<%= k %>" value="<%= v %>"><% } %>
+        <button class="btn soft sm go" type="submit">絞る</button>
+        <span class="kbd" aria-hidden="true">/</span>
+      </form>
+      <div class="filters">
+        <div class="chips" role="group" aria-label="区分">
+          <span class="chip-lab" aria-hidden="true">区分</span>
+          <%- chip('全部', 'kind', '', nOf(c.n_all)) %>
+          <%- chip('単品', 'kind', 'single', nOf(c.n_single)) %>
+          <%- chip('セット', 'kind', 'set', nOf(c.n_set)) %>
+          <% if (nOf(c.n_exception) || filters.kind === 'exception') { %><%- chip('例外', 'kind', 'exception', nOf(c.n_exception)) %><% } %>
+          <span class="vsep" aria-hidden="true"></span>
+          <%- chip('取扱を中止した商品', 'state', 'discontinued', nOf(c.discontinued)) %>
+        </div>
+        <div class="chips" role="group" aria-label="やること">
+          <span class="chip-lab" aria-hidden="true">やること</span>
+          <%- chip('原価が未入力', 'missing', 'cost', nOf(c.miss_cost), 'err') %>
+          <%- chip('売上分類が未入力', 'missing', 'sales', null, 'warn') %>
+          <%- chip('税率が未入力', 'missing', 'tax', nOf(c.miss_tax), 'warn') %>
+          <% if (c.reg_draft != null) { %><%- chip('登録が下書き', 'reg', 'draft', nOf(c.reg_draft), 'warn') %><% } %>
+          <% if (c.card_waiting != null) { %><%- chip('カード作成待ち', 'card', 'waiting', nOf(c.card_waiting), 'warn') %><% } %>
+          <% if (c.card_conflict) { %><%- chip('カードの衝突', 'card', 'conflict', nOf(c.card_conflict), 'err') %><% } %>
+          <% if (data.diffAvailable) { %><%- chip('NE との差', 'diff', '1', nOf(c.diff), 'err') %><% } %>
+        </div>
+        <details class="more filters-more"<%= moreOn ? ' open' : '' %>>
+          <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>もっと絞る (状態・登録・カード・未入力の項目)</summary>
+          <form method="get" action="" class="row2">
+            <% if (filters.q) { %><input type="hidden" name="q" value="<%= filters.q %>"><% } %>
+            <label>区分 <select class="in" name="kind"><option value="">全部</option><% for (const [k, v] of Object.entries(KINDS)) { %><option value="<%= k %>"<%= filters.kind === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
+            <label>状態 <select class="in" name="state"><option value="">全部</option><% for (const [k, v] of Object.entries(STATES)) { %><option value="<%= k %>"<%= filters.state === k ? ' selected' : '' %>><%= k === 'available' ? '取扱中' : v %></option><% } %></select></label>
+            <label>登録 <select class="in" name="reg"><option value="">全部</option><% for (const [k, v] of Object.entries(REG_STATES)) { %><option value="<%= k %>"<%= filters.reg === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
+            <label>カード <select class="in" name="card"><option value="">全部</option><% for (const [k, v] of Object.entries(CARD_FILTERS)) { %><option value="<%= k %>"<%= filters.card === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
+            <label>未入力 <select class="in" name="missing"><option value="">—</option><% for (const [k, v] of Object.entries(MISSING)) { %><option value="<%= k %>"<%= filters.missing === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
+            <label><input type="checkbox" name="diff" value="1"<%= filters.diff ? ' checked' : '' %><%= data.diffAvailable ? '' : ' disabled' %>> NE との差あり</label>
+            <button class="btn sm" type="submit">この条件で表示</button>
+            <% if (Object.keys(keep).length) { %><a class="btn ghost sm" href="./">条件を全部外す</a><% } %>
+          </form>
+        </details>
+      </div>
     </div>
-    <div class="pager">
-      <% if (data.offset > 0) { %><a href="<%= pageHref(Math.max(0, data.offset - data.limit)) %>">← 前の <%= data.limit %> 件</a><% } %>
-      <% if (data.total > data.offset + data.rows.length) { %><a href="<%= pageHref(data.offset + data.limit) %>">次の <%= data.limit %> 件 →</a><% } %>
-      <% if (data.total) { %><span class="muted"><%= data.offset + 1 %>〜<%= data.offset + data.rows.length %> 件目</span><% } %>
+
+    <div class="panel">
+      <div class="tbl-top">
+        <span><b><%= data.total.toLocaleString('ja-JP') %></b> 件</span><span class="dotsep" aria-hidden="true"></span>
+        <span>コードを押すか <span class="kbd">↑</span><span class="kbd">↓</span> で選んで <span class="kbd">Enter</span> で開く</span>
+        <span class="right"><span><span class="fx">計算</span> = 構成品から計算した値</span></span>
+      </div>
+      <div class="tblwrap">
+        <table class="tbl click" id="list-tbl">
+          <caption class="sr">商品・セットの一覧 (<%= data.total %> 件)</caption>
+          <thead><tr><th scope="col" style="width:130px">コード</th><th scope="col" style="min-width:260px">名前</th><th scope="col" style="width:150px">状態</th><th scope="col" class="n" style="width:84px">売価</th><th scope="col" class="n" style="width:112px">原価</th><th scope="col" class="n" style="width:74px">税</th><th scope="col" style="width:120px">売上分類</th><th scope="col" style="width:150px">対応が必要</th></tr></thead>
+          <tbody>
+            <% if (!data.rows.length) { %><tr><td colspan="8" class="muted" style="text-align:center;padding:30px"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
+            <% for (const r of data.rows) { const isSet = r.kind === 'set'; %>
+            <tr>
+              <td><a class="rowlink" href="sku/<%= encodeURIComponent(r.code) %>"><%= r.code %></a></td>
+              <td><span class="nm"><%= r.name %></span><span class="sub"><% if (isSet) { %><svg class="ic s" aria-hidden="true" style="vertical-align:-2px"><use href="#i-box"/></svg> セット · 構成 <%= r.comp_count %> 品<% } else if (r.kind === 'exception') { %>例外の SKU (NE に無い)<% } else { %><%= r.primary_supplier ? '仕入先 ' + r.primary_supplier : '代表の仕入先なし' %><% } %></span></td>
+              <td>
+                <% if (r.state === 'discontinued') { %><span class="b mute">中止</span><% } else { %><span class="b ok"><span class="dot" aria-hidden="true"></span>取扱中</span><% } %>
+                <% if (r.reg_state !== 'none' && r.reg_state !== 'available') { %><span class="b <%= REG_BADGE[r.reg_state] || 'mute' %>" style="margin-top:4px"><%= REG_STATES[r.reg_state] || r.reg_state %></span><% } %>
+              </td>
+              <td class="n"><%= fmt.yen(r.standard_price) %></td>
+              <td class="n"><% if (r.cost == null) { %><span class="b err">未入力</span><% } else { %><%= fmt.yen(r.cost) %><% if (r.cost_derived) { %><span class="fx">計算</span><% } %><% } %></td>
+              <td class="n"><% if (r.tax_rate == null) { %><span class="b warn">未入力</span><% } else { %><%= fmt.tax(r.tax_rate) %>%<% if (r.tax_derived) { %><span class="fx">計算</span><% } %><% } %></td>
+              <td><% if (r.sales_class == null) { %><% if (r.kind !== 'exception') { %><span class="b warn">未入力</span><% } %><% } else { %><%= SALES[r.sales_class] || r.sales_class %><% if (r.sales_derived) { %><span class="fx">計算</span><% } %><% } %></td>
+              <td><div class="flags"><% for (const f of r.flags) { %><span class="b <%= FLAG_BADGE[f] || 'mute' %>"><%= f %></span><% } %></div></td>
+            </tr>
+            <% } %>
+          </tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <% if (data.offset > 0) { %><a class="btn sm" href="<%= pageHref(Math.max(0, data.offset - data.limit)) %>">← 前の <%= data.limit %> 件</a><% } %>
+        <% if (data.total) { %><span><%= (data.offset + 1).toLocaleString('ja-JP') %>〜<%= (data.offset + data.rows.length).toLocaleString('ja-JP') %> 件目</span><% } %>
+        <% if (data.total > data.offset + data.rows.length) { %><a class="btn sm" href="<%= pageHref(data.offset + data.limit) %>">次の <%= data.limit %> 件 →</a><% } %>
+      </div>
     </div>
-    <p class="muted" style="font-size: 0.82em;">売上分類: <%= Object.values(SALES).join(' / ') %> ・ 登録 = 新商品の登録の進み (— = 切替の前からある商品) ・ Amazon SKU の対応は「🛒 Amazon SKU の対応」の画面で見ます。</p>
+    <p class="hint">登録の札 = 新商品の登録の進み (札が無い = 登録済み・切替の前からある商品)。Amazon SKU の対応は左の「Amazon SKU」で見ます。</p>
   </div>
+  <%- include('_footer') %>
 </body>
 </html>

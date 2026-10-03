@@ -16,6 +16,18 @@ export const UNMAPPED_DAYS = 7;
 export const CHANNELS = Object.freeze({ FBA: 'FBA', FBM: 'FBM (自社発送)' });
 const TS = (col) => `to_char((${col}) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
 
+/**
+ * date の値 → 'YYYY-MM-DD'。node-postgres は date を「その日のサーバーの 0 時」の Date にする = String() だと
+ * 「Sat Sep 26 2026 00:00:00 GMT+0900」が画面に出た。Date はサーバーの時計の年月日で読む (作ったときと同じ時間帯)・文字はそのまま先頭 10 文字
+ */
+export function dateOnly(v) {
+  if (v instanceof Date) {
+    if (Number.isNaN(v.getTime())) return '';
+    return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`;
+  }
+  return String(v ?? '').slice(0, 10);
+}
+
 async function regclass(db, name) {
   return (await db.query('select to_regclass($1) is not null as ok', [name])).rows[0].ok;
 }
@@ -90,5 +102,5 @@ export async function amazonUnmapped(db, { now = new Date(), channel = 'FBA', ch
     [today, UNMAPPED_DAYS])).rows;
   for (const r of all) r.channel = channels ? (channels.get(normSku(r.code)) ?? null) : null;
   const rows = channel && channels ? all.filter((r) => r.channel === channel) : all;
-  return { rows, total_all: all.length, today, undecided: missing.map(String), tableMissing: false, channel, channelsAvailable: !!channels, shopCode: AMAZON_JP_SHOP_CODE, companyId: COMPANY_ID };
+  return { rows, total_all: all.length, today, undecided: missing.map(dateOnly), tableMissing: false, channel, channelsAvailable: !!channels, shopCode: AMAZON_JP_SHOP_CODE, companyId: COMPANY_ID };
 }

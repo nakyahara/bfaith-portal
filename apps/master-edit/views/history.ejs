@@ -6,32 +6,28 @@
 <body>
   <%- include('_header') %>
   <%
-    const ENT = { sku: 'SKU', product: '商品', sku_component: '構成', sku_cost: '原価', supplier_sku: '仕入先ごとの商品' };
-    const OP = { INSERT: '追加', UPDATE: '変更', DELETE: '削除' };
-    const WHO = { portal_master_edit: 'マスタの入力', company_db_load: '夜間ロード', sql: 'SQL' };
-    const val = (v) => (v === null || v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v));
+    // 人の言葉 (列の名前・JSON を出さない)・時刻は日本時間 (apps/master-edit/ui-format.mjs)。見て分かる項目が無い行 (version だけ など) は数えない
+    const rows = h ? h.events.map((e) => ({ e, w: ui.eventWords(e) })).filter((x) => x.w) : [];
   %>
   <div class="me-wrap">
     <p class="muted" style="font-size: 0.85em;"><a href="<%= base %>/">← 一覧へ</a><% if (h) { %> ・ <a href="<%= base %>/sku/<%= encodeURIComponent(h.sku.code) %>">← <%= h.sku.code %> へ</a><% } %></p>
     <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
     <% if (h) { %>
     <h2 style="font-size: 1.1em;"><%= h.sku.code %> の変更の記録 <span class="muted" style="font-size: 0.8em;"><%= h.sku.name %></span></h2>
-    <p class="muted" style="font-size: 0.85em;">新しい順に 200 件まで。誰が (人のメール / 夜間ロード) ・どこから・なぜ、を DB のトリガーが同じ取引で残しています。</p>
+    <p class="muted" style="font-size: 0.85em;">新しい順に 200 件まで。時刻は日本時間。誰が (人のメール / 夜間の取り込み) ・どこから・なぜ、を DB のトリガーが同じ取引で残しています。</p>
     <div class="tbox">
       <table class="me">
-        <thead><tr><th>時刻</th><th>対象</th><th>操作</th><th>項目</th><th>前</th><th>後</th><th>誰が</th><th>どこから</th><th>理由</th></tr></thead>
+        <thead><tr><th>時刻 (日本時間)</th><th>何を</th><th>前</th><th>後</th><th>誰が</th><th>どこから</th><th>理由</th></tr></thead>
         <tbody>
-          <% if (!h.events.length) { %><tr><td colspan="9" class="muted">記録はまだありません</td></tr><% } %>
-          <% for (const e of h.events) { %>
+          <% if (!rows.length) { %><tr><td colspan="7" class="muted">記録はまだありません</td></tr><% } %>
+          <% for (const { e, w } of rows) { %>
           <tr>
-            <td style="white-space: nowrap;"><%= String(e.recorded_at).slice(0, 19) %></td>
-            <td><%= ENT[e.entity_type] || e.entity_type %></td>
-            <td><%= OP[e.operation] || e.operation %></td>
-            <td><%= e.attribute || '' %></td>
-            <td style="max-width: 260px; word-break: break-all;"><%= val(e.old_value) %></td>
-            <td style="max-width: 260px; word-break: break-all;"><%= val(e.new_value) %></td>
-            <td><%= e.actor_id || e.actor_type %></td>
-            <td><%= WHO[e.source_system] || e.source_system %></td>
+            <td style="white-space: nowrap;"><%= ui.fmtJst(e.recorded_at, { nowMs }) %></td>
+            <td><%= w.what %></td>
+            <td style="max-width: 260px; word-break: break-all;"><%= w.from %></td>
+            <td style="max-width: 260px; word-break: break-all;"><%= w.to %></td>
+            <td><%= ui.actorWords(e) %></td>
+            <td><%= ui.sourceWords(e.source_system) %></td>
             <td><%= e.reason_text || '' %></td>
           </tr>
           <% } %>
@@ -46,12 +42,12 @@
         <tbody>
           <% for (const r of h.requests) { %>
           <tr>
-            <td style="white-space: nowrap;"><%= String(r.created_at).slice(0, 19) %></td>
+            <td style="white-space: nowrap;"><%= ui.fmtJst(r.created_at, { nowMs }) %></td>
             <td><%= (r.rows || []).map((x) => x.code + '×' + x.qty).join(', ') %></td>
             <td><%= r.status === 'open' ? '依頼中' : r.status === 'applied' ? 'NE に入った (閉じた)' : (r.close_reason === 'withdrawn' ? '取り下げ' : '次の依頼で置き換え') %></td>
             <td><%= r.requested_by %></td>
             <td><%= r.reason || '' %></td>
-            <td><%= r.closed_at ? String(r.closed_at).slice(0, 19) : '' %></td>
+            <td><%= r.closed_at ? ui.fmtJst(r.closed_at, { nowMs }) : '' %></td>
           </tr>
           <% } %>
         </tbody>
