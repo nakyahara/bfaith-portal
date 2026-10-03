@@ -50,6 +50,11 @@ export const HEAVY_ENTRY_MANIFEST = Object.freeze([
   { sig: 'mart.purge_sales_daily(smallint, integer)', cls: 'guard_later', public: true, reason: '売上日次の古い版の削除 (0021)。受け口 (router) が使う' },
   { sig: 'core.relink_shipments_bulk(smallint, bigint, integer)', cls: 'guard_later', public: true, reason: '伝票 → 注文の結び直し (最大 10 万件・一時の表 = TEMP・0017)。受け口 (router)・注文の送り手が使う' },
   { sig: 'core.reresolve_order_lines(smallint, text, date)', cls: 'guard_later', public: true, reason: '注文の行の SKU の解き直し (since = null で全部・一時の表 4 つ = TEMP・0024)。夜間ロード (load/engine) が使う' },
+  // 🆕 0057 (D-60 PR 1b-0r) = 上限つきの batch の新しい署名。設計 13 の分け = Gw (門は PR 3a)・それまでは guard_later。PUBLIC の EXECUTE は作った取引で外した (持ち主だけ)。
+  //   夜間ロードは 1b-0e まで旧い 3 引数を呼ぶ = 今は呼び手が無い (試験と apps/company-db/load/reresolve-batch.mjs の部品だけ)。migration = その版で作る (それより前の DB の試験は upTo で外す)
+  { sig: 'core.reresolve_order_lines(smallint, text, date, date, bigint, integer, integer)', cls: 'guard_later', public: false, migration: '0057', reason: '注文の行の SKU の解き直しの窓の 1 batch (0057・窓 ≦ 62 日・注文 ≦ 5,000・未解決の明細 ≦ 20,000・一時の表なし)。夜間ロードが 1b-0e で使う (Gw)' },
+  { sig: 'core.reresolve_order_lines_retry(smallint, text, bigint, bigint, integer, integer)', cls: 'guard_later', public: false, migration: '0057', reason: 'reresolve の retry の表 (skip した注文) の 1 batch (0057・注文 ≦ 5,000・未解決の明細 ≦ 20,000・一時の表なし)。夜間ロードが 1b-0e で使う (Gw)' },
+  { sig: 'core._reresolve_order_batch(smallint, text, bigint[], boolean)', cls: 'guard_later', public: false, migration: '0057', reason: 'reresolve の 1 batch の共通の部品 (0057・注文の配列 ≦ 5,000)。上の 2 つの中だけで呼ぶ (規則にはかからないが手で足した)' },
   { sig: 'core.merge_duplicate_suppliers()', cls: 'guard_later', public: true, reason: '仕入先の二重の寄せ (全部の仕入先・一時の表 = TEMP・0025 / 0027)。migration と試験が呼ぶ・人の保守の道具' },
   { sig: 'core.relink_shipments(smallint)', cls: 'guard_later', public: true, reason: '伝票 → 注文の全件の結び直し (0013)。アプリの呼び手は無い (試験と人の復旧の道具)。外すかは後の PR で決める' },
   { sig: 'core.relink_ad_spend_listings(smallint)', cls: 'guard_later', public: true, reason: '広告費の出品の結び直し (全件・0035)。広告費の取込 (ingest/ad-spend) が使う' },
@@ -117,6 +122,8 @@ export const RANGE_ARGS = Object.freeze({
 });
 export const SCAN_SCHEMAS = Object.freeze(['core', 'mart', 'ops', 'raw', 'snapshots', 'events']);
 export const revokeSigs = () => HEAVY_ENTRY_MANIFEST.filter((e) => e.cls === 'revoke').map((e) => e.sig);
+/** その版までに作った関数の行 (migration の無い行 = 0056 より前からある)。upTo = null なら全部 */
+export const manifestUpTo = (upTo) => (upTo ? HEAVY_ENTRY_MANIFEST.filter((e) => !e.migration || e.migration <= upTo) : HEAVY_ENTRY_MANIFEST);
 
 /** 見つける規則にかかる関数 (pg_proc から。trigger を除く)。戻り = [{ oid, sig }] */
 export async function heavyCandidates(db) {
@@ -141,13 +148,14 @@ export async function heavyCandidates(db) {
  *   ② revoke = 権限の表が空 (null = 既定 = 持ち主 + PUBLIC も不可)・PUBLIC と superuser でない全部の役割で has_function_privilege が false
  *   ③ guard_later / light = PUBLIC が呼べるかが manifest のとおり (この PR で変えていない・あとから閉じたら manifest を直す)
  *   ④ 見つける規則にかかる関数が全部 manifest にある
+ *   upTo (試験だけ) = その版までの DB を見る (manifest の migration がそれより後の行 = まだ作っていない関数は外す)。本番の --verify は付けない (全部の行)
  */
-export async function heavyEntryFindings(db) {
+export async function heavyEntryFindings(db, { upTo = null } = {}) {
   const findings = [];
   const q = async (sql, p) => (await db.query(sql, p)).rows;
   const seen = new Set();
   const oidOf = new Map();
-  for (const e of HEAVY_ENTRY_MANIFEST) {
+  for (const e of manifestUpTo(upTo)) {
     if (!MANIFEST_CLASSES.includes(e.cls)) findings.push(`manifest の分け方が不正: ${e.sig} (${e.cls})`);
     if (!e.reason) findings.push(`manifest の理由が無い: ${e.sig}`);
     if (e.cls !== 'revoke' && typeof e.public !== 'boolean') findings.push(`manifest に PUBLIC の期待が無い: ${e.sig}`);
@@ -156,7 +164,7 @@ export async function heavyEntryFindings(db) {
     if (seen.has(o)) findings.push(`manifest に同じ関数が 2 回: ${e.sig}`);
     seen.add(o); oidOf.set(e.sig, o);
   }
-  for (const e of HEAVY_ENTRY_MANIFEST) {
+  for (const e of manifestUpTo(upTo)) {
     const o = oidOf.get(e.sig); if (o == null) continue;
     const r = (await q(`select p.proacl::text as acl, p.proacl is null as dflt, coalesce(cardinality(p.proacl), 0) as n, has_function_privilege('public', p.oid, 'execute') as pub
       from pg_proc p where p.oid = $1::oid`, [o]))[0];
@@ -205,10 +213,14 @@ async function main() {
   try {
     await c.query('begin read only');
     await c.query(`set local statement_timeout = '10s'`);
-    const f = await heavyEntryFindings(c);
+    // 🆕 DB に適用済みの最後の migration まで (manifest の migration がそれより後の行 = まだ作っていない関数は見ない = repo が DB より新しいときに ❌ にしない)
+    const upTo = (await c.query('select max(version) as v from ops.schema_migrations')).rows[0].v || null;
+    const f = await heavyEntryFindings(c, { upTo });
     const t = await tempPrivilegeAudit(c);
     await c.query('rollback');
-    const n = (cls) => HEAVY_ENTRY_MANIFEST.filter((e) => e.cls === cls).length;
+    const n = (cls) => manifestUpTo(upTo).filter((e) => e.cls === cls).length;
+    const later = HEAVY_ENTRY_MANIFEST.length - manifestUpTo(upTo).length;
+    if (later) console.log(`(DB の migration は ${upTo} まで = それより後の migration で作る関数 ${later} 個は見ていない)`);
     console.log(`TEMP の権限の監査 (出すだけ・PR 1b で外す): db=${t.db} PUBLIC=${t.publicTemp ? 'TEMP あり' : 'なし'} / ${t.roles.map((r) => `${r.rolname}${r.login ? '' : '(nologin)'}=${r.temp ? 'TEMP' : '-'}`).join(' ')} / 一時の表を作る関数 ${t.tempFunctions.length}: ${t.tempFunctions.join(', ')}`);
     if (f.length) { console.log(`❌ 重い入口: ${f.length} 件`); for (const x of f) console.log(`   - ${x}`); process.exitCode = 1; return; }
     console.log(`✅ 重い入口: revoke ${n('revoke')} 個は誰も呼べない (権限の表が空・superuser でない役割は全部 false) / guard_later ${n('guard_later')} 個・light ${n('light')} 個は manifest のまま / 規則にかかる関数と mart・ops の view (${HEAVY_VIEWS.length}) は全部一覧にある`);
