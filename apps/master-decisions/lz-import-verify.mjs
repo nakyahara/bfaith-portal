@@ -62,6 +62,30 @@ export const RULES_2B2 = Object.freeze({
  */
 export const RULES_NIGHTLY = RULES_2B2;
 
+/**
+ * 見張りの商品 (毎晩の取込の K4。2026-10-03 00:20 の本番の最初の夜に、書き出しの最後の商品 zuko5 が CSV にあって押せなかった)。
+ * ロジザードにだけ登録する商品 (Company DB・NE には無い = 取り込む CSV に入らない)・バーコード 1 本・商品ID の順 (バイト順) で全商品の最後に来る ID。
+ * 商品マスタとバーコードの書き出しの前後すべてで、この商品が最後の行 = その前の全商品の行がそろっている (後ろから切れていない) と言える
+ * = 取り込む全商品が「後ろに別の商品の行がある商品」になり、K4 (比べる商品が最後の商品なら確かめられない) を弱めずに毎晩押せる。
+ * 変える = ロジザードの登録を変えるのと同時に、ここ 1 か所だけ。
+ */
+export const LZ_SENTINEL_ID = 'zzzzzzzzzz';
+
+/**
+ * 見張りの商品が書き出しの最後の行か (side = pre / post)。shohin = readLzShohinMaster (ok)・barcode = readBarcodeExport (ok)。渡さない側は見ない。
+ * @returns {Array<{ id, kind: string, last: string|null, present: boolean }>}  無い・最後でない = 差 (present = その書き出しにあるか)
+ */
+export function sentinelDiffs({ sentinel, side, shohin = null, barcode = null }) {
+  const diffs = [];
+  if (shohin) {
+    let last = null;
+    for (const id of shohin.byId.keys()) last = id;   // 書き出しの行の順 (readLzShohinMaster は重複を断る = Map の順 = 行の順)
+    if (last !== sentinel) diffs.push({ id: sentinel, kind: `sentinel_not_last_shohin_${side}`, last, present: shohin.byId.has(sentinel) });
+  }
+  if (barcode && barcode.lastId !== sentinel) diffs.push({ id: sentinel, kind: `sentinel_not_last_barcode_${side}`, last: barcode.lastId ?? null, present: barcode.byId.has(sentinel) });
+  return diffs;
+}
+
 /** 取込の時刻の印 (ロジザードの 変更日時・インポート日時 = YYYYMMDDHHMMSS の 14 桁・JST。2026-09-30 の実機) */
 const STAMP_RE = /^\d{14}$/;
 /** 実在する JST の日時の 14 桁か (2030-02-30・25 時などは違う) */
@@ -228,7 +252,7 @@ export function barcodeMissing(lz, bc) {
   return [...lz.byId.keys()].filter((id) => !bc.byId.has(id));
 }
 
-export function compareBarcodes({ pre, post, ids, cover = null }) {
+export function compareBarcodes({ pre, post, ids, cover = null, sentinel = null }) {
   if (!pre || !pre.ok || !post || !post.ok) throw new Error('バーコードの前と後 (ok) が要る');
   const diffs = [];
   const pos = (h) => [h.indexOf('商品ID'), h.indexOf('バーコード')].join(',');
@@ -245,6 +269,12 @@ export function compareBarcodes({ pre, post, ids, cover = null }) {
       if (x.grouped === false) diffs.push({ id: null, kind: `barcode_not_grouped_${side}` });
       for (const id of new Set(ids)) if (x.lastId === id) diffs.push({ id, kind: `target_is_last_${side}` });
     }
+  }
+  // 見張りの商品 (毎晩): 前後のバーコードと商品マスタ (cover) の最後の行が見張り・見張りは比べる商品でない。
+  // 片側だけ最後の商品の途中で切れた (+ 増えた / 消えた が隠れる)・両側が同じ所で切れた、のどれも見張りが最後に無い = 差 (Codex #1595 R1 Medium)
+  if (sentinel) {
+    if (new Set(ids).has(sentinel)) diffs.push({ id: sentinel, kind: 'sentinel_is_target' });
+    for (const [side, x] of [['pre', pre], ['post', post]]) diffs.push(...sentinelDiffs({ sentinel, side, barcode: x, shohin: cover && cover[side] ? cover[side] : null }));
   }
   if (post.rows < pre.rows) diffs.push({ id: null, kind: 'rows_decreased', pre: pre.rows, post: post.rows });
   for (const id of new Set(ids)) {

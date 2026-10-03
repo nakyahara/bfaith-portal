@@ -182,6 +182,40 @@ await ta('[7] バーコード: 見出しに 商品ID・バーコード・列の�
   const split = bc([['A-1', 'a', '4900000000001', '1'], ['B-2', 'b', '4900000000003', '1'], ['A-1', 'a', '4900000000002', '1'], ['C-3', 'c', '4900000000004', '1']]);
   assert.deepEqual([split.grouped, split.lastId], [false, 'C-3']);
   assert.deepEqual(V.compareBarcodes({ pre: split, post: split, ids: ['A-1'], cover: { pre: L2, post: L2 } }).diffs.map((d) => d.kind), ['barcode_not_grouped_pre', 'barcode_not_grouped_post']);
+  // 見張りの商品 (毎晩の K4・Codex #1595 R1 Medium): 本物の書き出しは行の間に改行・末尾に改行なし = 「改行の前」で切れると末尾の改行・列の数では分からない。
+  // 見張り (商品ID の順の最後・CSV に無い) が前後の書き出しの最後の行 = その前の全商品の行がそろっている。最後の本物の商品 B-2 は比べる商品のまま確かめられる
+  const S0 = V.LZ_SENTINEL_ID;
+  const cut = (rows, n) => bc(rows.slice(0, rows.length - n));   // 後ろの n 行が落ちた (行の切れ目・改行の前で切れた) 書き出し
+  const rowsPre = [['A-1', 'a', '4900000000001', '1'], ['B-2', 'b', '4900000000003', '1'], ['B-2', 'b', '4900000000004', '1'], [S0, 's', '4900000009999', '1']];
+  const LS = lz([lzRow('A-1'), lzRow('B-2'), lzRow(S0)]);
+  const sp = bc(rowsPre);
+  const fullBuf = csvOf(rowsPre, { header: BH }), crlf = Buffer.from('\r\n');
+  assert.deepEqual([V.readBarcodeExport(fullBuf.subarray(0, fullBuf.lastIndexOf(crlf))).ok, V.readBarcodeExport(fullBuf.subarray(0, fullBuf.lastIndexOf(crlf) + 2)).reason], [true, 'barcode_truncated'], '改行の前で切れた = 読める (切れが分からない) / 改行の後 = 切れと分かる');
+  assert.deepEqual(V.compareBarcodes({ pre: sp, post: sp, ids: ['A-1', 'B-2'], cover: { pre: LS, post: LS }, sentinel: S0 }), { ok: true, diffs: [] });
+  const sk = (r) => r.diffs.map((d) => d.kind);
+  // 片側 (後) だけ切れ + 増えた: 後の実体 = B-2 に 4900000000005 が増えた・増えた行と見張りの前で切れる = B-2 は前後同じに見える → 見張りが最後に無い = 差
+  const rowsPostAdd = [...rowsPre.slice(0, 3), ['B-2', 'b', '4900000000005', '1'], rowsPre[3]];
+  let r = V.compareBarcodes({ pre: sp, post: cut(rowsPostAdd, 2), ids: ['A-1', 'B-2'], cover: { pre: LS, post: LS }, sentinel: S0 });
+  assert.deepEqual(r.diffs.filter((d) => d.id === 'B-2' && (d.kind === 'added' || d.kind === 'removed')), [], 'B-2 のバーコードだけ見ると同じ (見張りが無いと見逃す)');
+  assert.ok(!r.ok && sk(r).includes('sentinel_not_last_barcode_post') && sk(r).includes('missing_in_post_barcode'), sk(r).join(','));
+  // 片側 (前) だけ切れ + 消えた: 前が 2 本目の前で切れる・取込で 2 本目が消えた = B-2 は前後同じに見える → 差
+  r = V.compareBarcodes({ pre: cut(rowsPre, 2), post: bc([rowsPre[0], rowsPre[1], rowsPre[3]]), ids: ['A-1', 'B-2'], cover: { pre: LS, post: LS }, sentinel: S0 });
+  assert.ok(!r.ok && sk(r).includes('sentinel_not_last_barcode_pre') && !sk(r).includes('sentinel_not_last_barcode_post'), sk(r).join(','));
+  // 両側が同じ所で切れ + 置き換え (4900000000004 → 4900000000006): 前後とも [4900000000003] に見える → 差
+  const rowsPostRep = [rowsPre[0], rowsPre[1], ['B-2', 'b', '4900000000006', '1'], rowsPre[3]];
+  r = V.compareBarcodes({ pre: cut(rowsPre, 2), post: cut(rowsPostRep, 2), ids: ['A-1', 'B-2'], cover: { pre: LS, post: LS }, sentinel: S0 });
+  assert.deepEqual(sk(r).filter((k) => k.startsWith('sentinel_')), ['sentinel_not_last_barcode_pre', 'sentinel_not_last_barcode_post']);
+  // 見張りより後ろの商品 (見張りが最後でない)・見張りを比べる商品にした・商品マスタの最後が見張りでない = 差
+  r = V.compareBarcodes({ pre: sp, post: bc([...rowsPre, [`${S0}z`, 'x', '4900000008888', '1']]), ids: ['B-2'], cover: { pre: LS, post: LS }, sentinel: S0 });
+  assert.deepEqual(sk(r), ['sentinel_not_last_barcode_post']);
+  assert.deepEqual(sk(V.compareBarcodes({ pre: sp, post: sp, ids: ['B-2', S0], cover: { pre: LS, post: LS }, sentinel: S0 })), ['target_is_last_pre', 'target_is_last_post', 'sentinel_is_target']);
+  const LS2 = lz([lzRow('A-1'), lzRow('B-2')]);
+  assert.deepEqual(V.sentinelDiffs({ sentinel: S0, side: 'post', shohin: LS2 }), [{ id: S0, kind: 'sentinel_not_last_shohin_post', last: 'B-2', present: false }]);
+  assert.deepEqual(V.sentinelDiffs({ sentinel: S0, side: 'pre', shohin: LS, barcode: sp }), []);
+  // 見張りを使わない比べ (試験の決まり) は今までどおり (最後の本物の商品を比べる = 確かめられない)
+  assert.deepEqual(sk(V.compareBarcodes({ pre, post: pre, ids: ['B-2'], cover: { pre: L2, post: L2 } })), ['target_is_last_pre', 'target_is_last_post']);
+  // 見張りの ID = 商品ID の順 (バイト順) で、本物の商品ID に使われている文字 (+ - . 0-9 A-Z _ a-z) のどれより後ろ
+  assert.ok(/^z+$/.test(S0) && S0.length >= 10);
   assert.equal(bc([['A-1', '1', '2']], ['商品ID', 'バーコード', 'バーコード']).reason, 'barcode_header');
 });
 
