@@ -16,6 +16,14 @@
  *  【売上】= その出品ページが実際に売れた金額（税込）。複数商品が混ざるセットの場合のみ、
  *     構成品の「標準売価 × 構成数量」比で按分（二重計上回避）。単品/同一商品nパックは全額。
  *     ※ 原価は一切扱わない（仕入先非開示）。
+ *     定義 (2026-10-03 そろえた) = 各モールの税込の総売上 (商品代金・送料等)。
+ *       店負担のクーポン / 値引き・ポイント・返金・モールの手数料は原則として引く前 (各モールの gross_sales_jpy_incl)。
+ *       モールごとの細かい違いは残る (下の通り。公開ページでも「全モール同じ」「お客さまの支払額」とは書かない)。
+ *       - 楽天 = 本体 + 送料 / Yahoo! = 本体 (送料無料) / au PAY = 本体 + 送料 (ギフト包装は別の列で入れない) /
+ *         LINEギフト = 本体 (送料込みの価格) / Qoo10 = customer_paid_jpy_incl (統合 view と同じ)
+ *       - Amazon = AMAZON_SALES_GROSS_INCL_SQL (本体 + 送料 + ギフト包装 + 決済の消費税の実額・統合 view と同じ式)。
+ *         前は本体 (sales_principal_jpy = 税抜・送料とギフト包装なし) だけを足していて、Amazon だけ
+ *         税込でなかった (公開の口で「税込」と説明しながらモールをまたいで足していた・Codex R-F4-1 High 6)。
  *
  *  【集計対象日】稼働中モール（14日以内に同期のあるモール）全てが確定済みの日 - 2日（D-2）まで。
  *     直近日はモール側の確定遅延で揺れるため締める。
@@ -24,6 +32,7 @@
  *  Amazon の財務の表の名前は共通の読み口 (lib/amazon-finance-read.js・consumer 'supplier-sales') からもらう
  *  (F4-1・2026-10-03。今は legacy = mirror_amazon_finance_sku_daily。SQL の中身は変えていない)。
  */
+import { AMAZON_SALES_GROSS_INCL_SQL } from '../warehouse-mirror/db.js';
 import { financeDailyTable } from '../../lib/amazon-finance-read.js';
 
 const AMAZON_FINANCE_DAILY = financeDailyTable('supplier-sales');
@@ -256,7 +265,7 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
     // Amazon: seller_sku を構成品へ展開
     const amzRows = db.prepare(`
       SELECT date_jst d, LOWER(TRIM(seller_sku)) k, asin_norm asin, product_name name,
-             CAST(units_net_sold AS REAL) u, sales_principal_jpy sales,
+             CAST(units_net_sold AS REAL) u, ${AMAZON_SALES_GROSS_INCL_SQL} sales,
              (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
       FROM ${AMAZON_FINANCE_DAILY}
       WHERE date_jst BETWEEN @start AND @end
@@ -447,7 +456,7 @@ export function getSupplierDailyDetail(db, supplierCode, opts = {}) {
   // Amazon: 日次 × seller_sku（FBA/FBM 判別、構成品展開）
   const amz = db.prepare(`
     SELECT date_jst, seller_sku, asin_norm, product_name,
-           CAST(units_net_sold AS REAL) u, sales_principal_jpy sales,
+           CAST(units_net_sold AS REAL) u, ${AMAZON_SALES_GROSS_INCL_SQL} sales,
            (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
     FROM ${AMAZON_FINANCE_DAILY}
     WHERE date_jst BETWEEN @start AND @end
@@ -495,8 +504,8 @@ export function getUnresolvedStats(db) {
 
   // Amazon: seller_sku が mirror_sku_resolved で解決できない売上を未解決とみなす
   const amz = db.prepare(`
-    SELECT SUM(a.sales_principal_jpy) AS total,
-           SUM(CASE WHEN r.seller_sku IS NULL THEN a.sales_principal_jpy ELSE 0 END) AS unresolved
+    SELECT SUM(${AMAZON_SALES_GROSS_INCL_SQL}) AS total,
+           SUM(CASE WHEN r.seller_sku IS NULL THEN ${AMAZON_SALES_GROSS_INCL_SQL} ELSE 0 END) AS unresolved
     FROM ${AMAZON_FINANCE_DAILY} a
     LEFT JOIN (SELECT DISTINCT seller_sku FROM mirror_sku_resolved) r ON r.seller_sku = a.seller_sku
     WHERE a.date_jst BETWEEN @w30start AND @cutoff
