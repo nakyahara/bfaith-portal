@@ -9,11 +9,14 @@
  *     仕入先の二重の連鎖 ('0001' / '1' / '01')・会社をまたぐ同じコード・NULL の列・代表の印・文書の紐付けの重なり・2 回目は何もしない。乱数の fixture を数回
  *     (now() は同じ取引の中で 1 つの値 = '<now>' に置き換える。uuid は表の中で初めて出た順の番号に置き換える)
  *     🚨 1 つの文の中で行を処理する順は契約ではない (旧い関数でも実行計画しだい) = 順で決まる値だけは順に依らない形で比べる:
- *        version の列 = version を除いた行 + version の値の集まり / 監査 (events.master_change_events) = change_id のまとまりごとの出来事 + event_id の順の「操作|対象」+ event_id の集まり
+ *        version の列 = version を除いた行 + version の値の集まり / 監査 (events.master_change_events) = change_id のまとまり (中の出来事の順はそのまま) の集まり + event_id の順の「操作|対象」+ event_id の集まり
  *   2 新しい関数は一時の表を作らない = 呼んだ取引の中で pg_class の relpersistence = 't' が 0 (旧い関数は 0 より多い = 確かめ方が効いている)・
  *     TEMP の権限を外した DB で呼んで通る (旧い関数は 42501)・pg_get_functiondef に一時の表を作る文が無い・tempPrivilegeAudit の一時の表を作る関数は reresolve_order_lines だけ
  *   3 新しい merge_duplicate_suppliers は仕入先 5,000 行までは旧いのと同じ・5,001 行で 54000 (何も変えない)
- *   4 0057 は 2 回流しても同じ・署名・戻り値の型・持ち主・EXECUTE の権限の表は変わらない・search_path は pg_catalog, pg_temp
+ *   4 0057 は 2 回流しても同じ・署名・戻り値の型・持ち主・EXECUTE の権限の表は変わらない・search_path は pg_catalog, pg_temp・結合は hash だけ (enable_nestloop = off・enable_mergejoin = off)・work_mem = 4MB・hash_mem_multiplier = 2
+ *   5 同時に動くとき (2 接続。待つ側が lock を待っていることを pg_blocking_pids で確かめてから相手を commit): 戻り値・SQLSTATE (lock_timeout・23503)・最後の表が旧と同じ。
+ *     deadlock は何回か回して、どちらが 40P01 になったかの数と最後の表を旧と新で比べる。旧と違うのは 2 つだけ (説明つきで固定):
+ *     relink = 待った相手が同じ取引で足した注文を見ない (次の走査で結ぶ) / merge = 待った相手が直した寄せる行の値を (直す前でなく) 直した後の値で移す
  * 使い方: node scripts/test-company-db-no-temp-pg.mjs   (npm run test:company-db にも入っている)
  *   🚨 試験が自分で使い捨てのクラスタを起動する (test-company-db-profit-fn-revoke-pg.mjs と同じ = embedded-postgres・OS の一時フォルダ・ランダムのポート・最後に止めて消す)。
  *      外の PostgreSQL には一切つながない。見つからない・版が違う・起動できない・フォルダが消えない = 失敗 (exit 1)
@@ -60,7 +63,8 @@ const url = `postgres://postgres:${SU_PW}@127.0.0.1:${port}/postgres`;
 console.log('使い捨てのクラスタ: embedded-postgres ' + PINNED_EMBEDDED_PG + ' (' + loaded.from + ')');
 
 let ok = 0, ng = 0;
-const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
+const ONLY = process.env.D60_ONLY ? new RegExp(process.env.D60_ONLY) : null;   // 開発用の絞り込み (npm の試験では使わない)
+const t = async (name, fn) => { if (ONLY && !ONLY.test(name)) return; try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
 const quiet = () => {};
 const hex = crypto.randomBytes(4).toString('hex');
 const OWNER = `cdb_nt_o_${hex}`, PW = `t_${crypto.randomBytes(12).toString('hex')}`;
@@ -144,8 +148,10 @@ try {
     }
   };
   /** 全部の表 (分割の子は親で読む・ops.schema_migrations を除く) と通し番号。now() は '<now>'、uuid は表の中で初めて出た順の番号に */
-  const snapshot = async (c) => {
+  const snapshot = async (c, { recentSince = null } = {}) => {
     const now = (await c.query(`select to_jsonb(now())::text as n`)).rows[0].n;
+    // 同時の試験 = 取引が複数 (fixture・A・B) で now() が違う → この回が始まった後の時刻は全部 '<now>' (決まった時刻の fixture (2026-03-04) はそのまま)
+    const recent = (j) => (recentSince == null ? j : j.replace(/"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?[+-]\d\d:\d\d)"/g, (m, iso) => (Date.parse(iso) >= recentSince ? '"<now>"' : m)));
     const tables = (await c.query(`select c.oid::regclass::text as t,
         exists (select 1 from pg_attribute a where a.attrelid = c.oid and a.attname = 'version' and not a.attisdropped) as has_version,
         (select string_agg(quote_ident(a.attname), ', ' order by k.i) from pg_index x cross join unnest(x.indkey) with ordinality k(attnum, i)
@@ -157,7 +163,7 @@ try {
     for (const { t: tbl, pk, has_version: hasVersion } of tables) {
       const raw = (await c.query(`select to_jsonb(x)::text as j from ${tbl} x order by ${pk || 'to_jsonb(x)::text'}`)).rows;
       const uuids = new Map();
-      let rows = raw.map((r) => r.j.split(now).join('"<now>"')
+      let rows = raw.map((r) => recent(r.j.split(now).join('"<now>"'))
         .replace(/"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"/g, (u) => { if (!uuids.has(u)) uuids.set(u, `"uuid#${uuids.size}"`); return uuids.get(u); }));
       // 🚨 1 つの文の中で行を処理する順は契約ではない (旧い関数でも実行計画しだい = 一時の表の統計・結合の形で変わる)。順に依る値だけを順に依らない形にして比べる:
       //   version (trigger が行ごとに通し番号を振る) = 行は version を除いて比べ、version の値の集まりを別に比べる (= 上げた回数と値は同じ)
@@ -166,9 +172,10 @@ try {
         const objs = rows.map((j) => JSON.parse(j));
         out[`${tbl} (event_id の順の 操作|対象)`] = objs.map((o) => `${o.operation}|${o.entity_type}`);
         out[`${tbl} (event_id)`] = objs.map((o) => String(o.event_id));
+        // まとまり (= 1 行の変更) の中の出来事の順 (event_id の順 = 列の名前の順) はそのまま比べる。順に依らない形にするのはまとまりどうしの並びだけ (Codex R1 Low)
         const groups = new Map();
         for (const { event_id: _e, change_id: cid, ...rest } of objs) { if (!groups.has(cid)) groups.set(cid, []); groups.get(cid).push(JSON.stringify(rest)); }
-        rows = [...groups.values()].map((g) => JSON.stringify(g.sort())).sort();
+        rows = [...groups.values()].map((g) => JSON.stringify(g)).sort();
       } else if (hasVersion) {
         const objs = rows.map((j) => JSON.parse(j));
         out[`${tbl} (version の値)`] = objs.map((o) => Number(o.version)).sort((p, q) => p - q).map(String);
@@ -248,7 +255,7 @@ try {
   const sid = (co, code) => `(select supplier_id from core.suppliers where company_id = ${co} and code = ${lit(code)})`;
   const sku = (co, code) => `insert into core.skus (company_id, sku_kind, code, name) values (${co}, 'set', ${lit(code)}, ${lit(code)});\n`;
   const kid = (co, code) => `(select sku_id from core.skus where company_id = ${co} and code = ${lit(code)})`;
-  /** 時刻: null = now() / 数 = 決まった時刻 + その秒数 + マイクロ秒 (時差 +09 つき = jsonb の変数を行き来しても 1 マイクロ秒も変わらないかを見る) */
+  /** 時刻: null = now() / 数 = 決まった時刻 + その秒数 + マイクロ秒 (時差 +09 つき = 消した行の RETURNING・CTE を通っても 1 マイクロ秒も変わらないかを見る) */
   const ts = (sec) => (sec == null ? 'now()' : `timestamptz '2026-03-04 05:06:07.123456+09' + interval '${sec} seconds' + interval '${(sec * 7919) % 1000000} microseconds'`);
   const ss = (co, scode, kcode, o = {}) => `insert into core.supplier_skus (company_id, supplier_id, sku_id, vendor_code, order_unit, stock_units_per_order_unit, min_order_qty, order_multiple, unit_cost_jpy, lead_time_days, active, is_primary, created_by_type, created_by_id, created_at)
     values (${co}, ${sid(co, scode)}, ${kid(co, kcode)}, ${lit(o.vendor)}, ${lit(o.unit)}, ${lit(o.units)}, ${lit(o.moq)}, ${lit(o.mult)}, ${lit(o.cost)}, ${lit(o.lt)}, ${o.active === false ? 'false' : 'true'}, ${o.primary ? 'true' : 'false'}, ${lit(o.by || 'system')}, ${lit(o.byId)}, ${ts(o.at)});\n`;
@@ -379,6 +386,228 @@ try {
     assert.equal(JSON.parse(o.results[0].ok[0]).merged_suppliers, 1);   // 旧い関数は上限なし (= この PR で足した上限)
   });
 
+  // ─── 2 接続の同時の試験 (Codex R1 Medium): 接続を lock で止め (pg_blocking_pids で待っていることを確かめてから) 相手を commit → 戻り値・SQLSTATE・最後の表を旧と新で比べる ───
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // 数は数に (bigint は文字で返る)
+  const wrapQ = (p) => p.then((r) => ({ ok: r.rows.map((x) => JSON.stringify(Object.fromEntries(Object.entries(x).map(([k, v]) => [k, typeof v === 'string' && /^-?\d+$/.test(v) ? Number(v) : v])))) }), (e) => { if (process.env.D60_DEBUG && e.code === "40P01") console.log("      [debug] " + e.detail); return { err: `${e.code} ${e.message}` }; });
+  /** pid の backend が誰かの lock を待つまで待つ。待たずに終わった = 同時の試験が成り立っていない = 失敗 */
+  const waitBlocked = async (pid, pending) => {
+    let done = false; pending.then(() => { done = true; });
+    for (let i = 0; i < 500; i++) {
+      if ((await su.query('select cardinality(pg_blocking_pids($1)) > 0 as b', [pid])).rows[0].b) {
+        // 何を待っているか (lock の種類・mode・表) = 旧と新で同じ所で待つかを比べる
+        return (await su.query(`select string_agg(l.locktype || ' ' || l.mode || coalesce(' ' || l.relation::regclass::text, ''), ', ' order by 1) as w from pg_locks l where l.pid = $1 and not l.granted`, [pid])).rows[0].w;
+      }
+      if (done) throw new Error(`pid ${pid} が lock を待たずに終わった (同時の試験が成り立っていない)`);
+      await sleep(20);
+    }
+    throw new Error(`pid ${pid} が 10 秒たっても lock を待たない`);
+  };
+  /** 雛形から DB を作り fixture を commit → 接続 A・B で scenario → 最後の表 (この回の後の時刻は '<now>' = 取引ごとの now() の違いを消す) */
+  const concRun = async (tmpl, fixtureSql, scenario) => {
+    const name = `cdb_nt_cc_${hex}_${++seq}`;
+    await su.query(`create database ${name} template ${tmpl} owner ${OWNER}`);
+    // deadlock の検査は待ち始めて deadlock_timeout の後に 1 回だけ = 後から待ち始めた側が deadlock_timeout より遅れて待ち始めると、先の側の検査が空振りし
+    // 負ける側が入れ替わる (機械が重いとき。旧でも新でも起きた)。3 秒にしてぶれにくくする (それでも数は必須にせず、負けた側ごとの最後の表を比べる)
+    await su.query(`alter database ${name} set deadlock_timeout = '3s'`);
+    const since = Date.now() - 1000;
+    const mine = [];
+    try {
+      { const l = await open(name); try { await l.query(fixtureSql); } finally { await close(l); } }
+      const mk = async () => { const c = await open(name); mine.push(c); return { c, pid: (await c.query('select pg_backend_pid() as p')).rows[0].p, q: (sql) => wrapQ(c.query(sql)) }; };
+      const A = await mk(), B = await mk();
+      const one = async (sql) => { const s = await open(name); try { return (await s.query(sql)).rows; } finally { await close(s); } };
+      const out = await scenario({ A, B, one });
+      const s = await open(name);
+      let snap; try { snap = await snapshot(s, { recentSince: since }); } finally { await close(s); }
+      return { out, snap };
+    } finally {
+      for (const c of mine) await close(c);
+      await su.query(`drop database ${name}`);
+    }
+  };
+  const diffTables = (x, y) => [...new Set([...Object.keys(x), ...Object.keys(y)])].filter((n) => JSON.stringify(x[n] || []) !== JSON.stringify(y[n] || [])).sort();
+  const concCompare = async (fixtureSql, scenario) => {
+    const a = await concRun(T_OLD, fixtureSql, scenario);
+    const b = await concRun(T_NEW, fixtureSql, scenario);
+    return { a, b, diff: diffTables(a.snap, b.snap) };
+  };
+  const RL = relinkCall(1, 0, 100000);
+  const endTx = async (x, r) => { await x.c.query(r && r.err ? 'rollback' : 'commit'); };
+  /** deadlock: 何回か回して、どちらが 40P01 になったか・最後の表・A が待つ lock を旧と新で数える。
+   *  必須 = 毎回ちょうど 1 本が 40P01 (ほかの誤りなし)・負けた側が同じ回の最後の表が旧と新で同じ・A が待つ lock が旧と新で同じ。
+   *  どちらが負けるかの数は表示だけ (deadlock の検査の時刻で入れ替わる = 版に依らない。上の concRun の説明) */
+  const deadlockRounds = async (fixtureSql, scenario, rounds = 3) => {
+    const tally = {};
+    for (const [label, tmpl] of [['旧', T_OLD], ['新', T_NEW]]) {
+      tally[label] = { A: 0, B: 0, none: 0, both: 0, snaps: new Map(), waits: new Set() };
+      for (let i = 0; i < rounds; i++) {
+        const { out, snap } = await concRun(tmpl, fixtureSql, scenario);
+        tally[label].waits.add(out.waitA);
+        const a = out.ra.err ? out.ra.err.slice(0, 5) : 'ok', b = out.rb.err ? out.rb.err.slice(0, 5) : 'ok';
+        const who = a === '40P01' && b === '40P01' ? 'both' : a === '40P01' ? 'A' : b === '40P01' ? 'B' : 'none';
+        tally[label][who]++;
+        tally[label].snaps.set(who, JSON.stringify(snap));
+        assert.ok(['ok', '40P01'].includes(a) && ['ok', '40P01'].includes(b), `${label}: deadlock 以外の誤り ${out.ra.err || ''} / ${out.rb.err || ''}`);
+      }
+    }
+    for (const who of ['A', 'B']) if (tally['旧'].snaps.has(who) && tally['新'].snaps.has(who)) assert.equal(tally['新'].snaps.get(who), tally['旧'].snaps.get(who), `${who} が負けた回の最後の表が旧と新で違う`);
+    for (const label of ['旧', '新']) assert.equal(tally[label].none + tally[label].both, 0, `${label}: deadlock が 1 本だけでない`);
+    assert.deepEqual([...tally['新'].waits], [...tally['旧'].waits], 'A が待つ lock が旧と新で違う');
+    const fmt = (t) => `A が 40P01 ${t.A} 回・B が 40P01 ${t.B} 回・deadlock なし ${t.none} 回`;
+    console.log(`      (deadlock ${rounds} 回ずつ: 旧 = ${fmt(tally['旧'])} / 新 = ${fmt(tally['新'])}・A が待つ lock = ${[...tally['新'].waits].join(' / ')})`);
+    return tally;
+  };
+
+  console.log('同時に動くとき (2 接続を lock で止めて比べる)');
+  await t('relink を同じ会社・同じ cursor で 2 本: B は A の lock を待ち、A の commit の後に残りを見る (戻り値・最後の表が同じ)', async () => {
+    const { a, b, diff } = await concCompare(relinkFixed(), async ({ A, B }) => {
+      await A.c.query('begin'); const a1 = await A.q(RL);
+      await B.c.query('begin'); const pb = B.q(RL); await waitBlocked(B.pid, pb);
+      await A.c.query('commit'); const b1 = await pb; await endTx(B, b1);
+      return { a1, b1 };
+    });
+    assert.deepEqual(b.out, a.out); assert.deepEqual(diff, []);
+    assert.deepEqual(JSON.parse(b.out.a1.ok[0]), { linked: 6, examined: 10, last_id: 14 });
+    assert.deepEqual(JSON.parse(b.out.b1.ok[0]), { linked: 0, examined: 4, last_id: 10 });
+  });
+  await t('relink の 2 本目が lock_timeout (55P03) で止まる = 旧と同じ誤り・何も変えない', async () => {
+    const { a, b, diff } = await concCompare(relinkFixed(), async ({ A, B }) => {
+      await A.c.query('begin'); const a1 = await A.q(RL);
+      await B.c.query('begin'); await B.c.query(`set local lock_timeout = '300ms'`); const b1 = await B.q(RL); await endTx(B, b1);
+      await A.c.query('commit');
+      return { a1, b1 };
+    });
+    assert.deepEqual(b.out, a.out); assert.deepEqual(diff, []);
+    assert.match(b.out.b1.err, /^55P03 /);
+  });
+  await t('relink 中に伝票が直される (待った相手が 注文番号を直す・手で結ぶ): lock の後の版で数え・結ぶ (旧と同じ)', async () => {
+    const { a, b, diff } = await concCompare(relinkFixed(), async ({ A, B }) => {
+      await B.c.query('begin');
+      await B.c.query(`update core.shipments set ne_order_no = '1002' where ne_slip_no = 'A09'`);   // 注文なし → ある注文番号
+      await B.c.query(`update core.shipments set order_id = (select order_id from core.orders where company_id = 1 and mall_order_no = '1003') where ne_slip_no = 'A01'`);   // 手で結ぶ = 候補から外れる
+      await A.c.query('begin'); const pa = A.q(RL); await waitBlocked(A.pid, pa);
+      await B.c.query('commit'); const a1 = await pa; await endTx(A, a1);
+      return { a1 };
+    });
+    assert.deepEqual(b.out, a.out); assert.deepEqual(diff, []);
+    assert.deepEqual(JSON.parse(b.out.a1.ok[0]), { linked: 6, examined: 9, last_id: 14 });   // A01 が外れ (9 件)・A09 が 1002 に結ばれる
+  });
+  await t('relink 中に店舗 (ne_shops)・注文 (鍵でない列)・伝票が同じ取引で直される: 旧と同じ (店舗は文の始めの版・注文は lock しない)', async () => {
+    const { a, b, diff } = await concCompare(relinkFixed(), async ({ A, B }) => {
+      await B.c.query('begin');
+      await B.c.query(`update core.ne_shops set order_no_prefix = 'zz-' where company_id = 1 and shop_code = 'S2'`);
+      await B.c.query(`update core.orders set status = 'shipped' where company_id = 1 and mall_order_no = '1001'`);
+      await B.c.query(`update core.shipments set status = 'confirmed' where ne_slip_no in ('A01', 'A03')`);
+      await A.c.query('begin'); const pa = A.q(RL); await waitBlocked(A.pid, pa);
+      await B.c.query('commit'); const a1 = await pa; await endTx(A, a1);
+      return { a1 };
+    });
+    assert.deepEqual(b.out, a.out); assert.deepEqual(diff, []);
+  });
+  await t('🚨 違い (説明つき): 待った相手が同じ取引で伝票を直し 注文を足した → 旧は結ぶ・新は結ばない (文の始めの注文で結ぶ)。次の走査で同じ表になる', async () => {
+    const { a, b, diff } = await concCompare(relinkFixed(), async ({ A, B, one }) => {
+      await B.c.query('begin');
+      await B.c.query(`update core.shipments set ne_order_no = '7777' where ne_slip_no = 'A09'`);
+      await B.c.query(order(1, 'rakuten', 'rk', '7777'));
+      await A.c.query('begin'); const pa = A.q(RL); await waitBlocked(A.pid, pa);
+      await B.c.query('commit'); const a1 = await pa; await endTx(A, a1);
+      const linkedA09 = (await one(`select order_id is not null as x from core.shipments where ne_slip_no = 'A09'`))[0].x;
+      const a2 = await A.q(RL);   // 次の走査 (注文を送った後の先頭からの走査 = relink_rescan)
+      return { a1, linkedA09, a2 };
+    });
+    assert.deepEqual(JSON.parse(a.out.a1.ok[0]), { linked: 7, examined: 10, last_id: 14 });
+    assert.deepEqual(JSON.parse(b.out.a1.ok[0]), { linked: 6, examined: 10, last_id: 14 });
+    assert.deepEqual([a.out.linkedA09, b.out.linkedA09], [true, false]);
+    assert.deepEqual(JSON.parse(a.out.a2.ok[0]), { linked: 0, examined: 3, last_id: 10 });
+    assert.deepEqual(JSON.parse(b.out.a2.ok[0]), { linked: 1, examined: 4, last_id: 10 });
+    assert.deepEqual(diff, []);   // 次の走査の後は同じ
+  });
+  await t('relink と伝票の更新の deadlock (A が候補 1〜4 を lock して 5 を待つ・B が 5 を持って 2 を待つ): 毎回 1 本だけ 40P01・負けた側ごとの最後の表と A が待つ lock が旧と新で同じ', async () => {
+    await deadlockRounds(relinkFixed(), async ({ A, B }) => {
+      await B.c.query('begin'); await B.c.query(`update core.shipments set status = 'confirmed' where ne_slip_no = 'A05'`);
+      await A.c.query('begin'); const pa = A.q(RL); const waitA = await waitBlocked(A.pid, pa);
+      const pb = B.q(`update core.shipments set status = 'confirmed' where ne_slip_no = 'A02'`);
+      const [ra, rb] = await Promise.all([pa, pb]);
+      await endTx(A, ra); await endTx(B, rb);
+      return { ra, rb, waitA };
+    });
+  });
+
+  const SID = (code) => sid(1, code), KID = (code) => kid(1, code);
+  await t('merge を 2 本: B は A の lock (残す仕入先) を待ち、A の commit の後は何もしない (戻り値・最後の表が同じ)', async () => {
+    const { a, b, diff } = await concCompare(mergeFixed(), async ({ A, B }) => {
+      await A.c.query('begin'); const a1 = await A.q(MERGE);
+      await B.c.query('begin'); const pb = B.q(MERGE); await waitBlocked(B.pid, pb);
+      await A.c.query('commit'); const b1 = await pb; await endTx(B, b1);
+      return { a1, b1 };
+    });
+    assert.deepEqual(b.out, a.out); assert.deepEqual(diff, []);
+    assert.equal(JSON.parse(b.out.a1.ok[0]).merged_suppliers, 6);
+  });
+  await t('merge 中に残す行の商品の行が直される (待った相手 = 残す行): 旧と同じ (文の始めの値で直し戻す)', async () => {
+    const { a, b, diff } = await concCompare(mergeFixed(), async ({ A, B }) => {
+      await B.c.query('begin'); await B.c.query(`update core.supplier_skus set vendor_code = 'X-K' where supplier_id = ${SID('0001')} and sku_id = ${KID('ska')}`);
+      await A.c.query('begin'); const pa = A.q(MERGE); await waitBlocked(A.pid, pa);
+      await B.c.query('commit'); const a1 = await pa; await endTx(A, a1);
+      return { a1 };
+    });
+    assert.deepEqual(b.out, a.out); assert.deepEqual(diff, []);
+  });
+  await t('merge 中に寄せる行へ商品の行が足される (待った相手が FK の lock): 旧と同じ 23503 で何も変えない', async () => {
+    const { a, b, diff } = await concCompare(mergeFixed(), async ({ A, B }) => {
+      await B.c.query('begin'); await B.c.query(ss(1, '01', 'ska', { vendor: 'X-INS' }));
+      await A.c.query('begin'); const pa = A.q(MERGE); await waitBlocked(A.pid, pa);
+      await B.c.query('commit'); const a1 = await pa; await endTx(A, a1);
+      return { a1 };
+    });
+    assert.deepEqual(b.out, a.out); assert.deepEqual(diff, []);
+    assert.match(b.out.a1.err, /^23503 /);
+  });
+  await t('merge 中に寄せる行へ文書の紐付けが足され・残す仕入先が直される: 旧と同じ (足された紐付けも寄せる)', async () => {
+    const { a, b, diff } = await concCompare(mergeFixed(), async ({ A, B }) => {
+      await B.c.query('begin'); await B.c.query(link('d2', 1, '01', 'X-INS')); await B.c.query(`update core.suppliers set order_memo = 'B のメモ' where supplier_id = ${SID('0001')}`);
+      await A.c.query('begin'); const pa = A.q(MERGE); await waitBlocked(A.pid, pa);
+      await B.c.query('commit'); const a1 = await pa; await endTx(A, a1);
+      return { a1 };
+    });
+    assert.deepEqual(b.out, a.out); assert.deepEqual(diff, []);
+  });
+  for (const [what, upd, check, oldV, newV] of [
+    ['商品の行 (寄せる行 01 の skd の発注先コード)', `update core.supplier_skus set vendor_code = 'X-NEW' where supplier_id = ${SID('01')} and sku_id = ${KID('skd')}`,
+      `select vendor_code as v from core.supplier_skus where supplier_id = ${SID('0001')} and sku_id = ${KID('skd')}`, 'V-D', 'X-NEW', ['core.supplier_skus', 'events.master_change_events']],
+    ['文書の紐付け (寄せる行 01 の d1 の役割)', `update docs.document_links set link_role = 'X-ROLE' where entity_type = 'supplier' and entity_id = ${SID('01')} and document_id = (select document_id from docs.documents where external_ref = 'd1')`,
+      `select link_role as v from docs.document_links where entity_type = 'supplier' and entity_id = ${SID('0001')} and document_id = (select document_id from docs.documents where external_ref = 'd1')`, 'evidence', 'X-ROLE', ['docs.document_links']],
+  ]) {
+    await t(`🚨 違い (説明つき): merge 中に${what}が直され commit → 旧は直す前の値・新は直した後の値を残す行に移す (ほかは同じ)`, async () => {
+      const { a, b, diff } = await concCompare(mergeFixed(), async ({ A, B, one }) => {
+        await B.c.query('begin'); await B.c.query(upd);
+        await A.c.query('begin'); const pa = A.q(MERGE); await waitBlocked(A.pid, pa);
+        await B.c.query('commit'); const a1 = await pa; await endTx(A, a1);
+        return { a1, v: (await one(check))[0].v };
+      });
+      assert.deepEqual(b.out.a1, a.out.a1);
+      assert.deepEqual([a.out.v, b.out.v], [oldV, newV]);
+      const expectDiff = what.startsWith('商品') ? ['core.supplier_skus', 'events.master_change_events'] : ['docs.document_links'];
+      assert.deepEqual(diff, expectDiff);
+      for (const n of expectDiff) {   // 違う行は「旧だけの行の値 (oldV) を newV に置き換えると新だけの行」= 違うのはその値だけ (監査は残す行に足した行の INSERT の new_value)
+        const onlyA = a.snap[n].filter((r) => !b.snap[n].includes(r)), onlyB = b.snap[n].filter((r) => !a.snap[n].includes(r));
+        assert.ok(onlyA.length > 0 && onlyA.length === onlyB.length, `${n}: 違う行の数 旧 ${onlyA.length} / 新 ${onlyB.length}`);
+        assert.deepEqual(onlyA.map((r) => r.split(oldV).join(newV)).sort(), [...onlyB].sort(), `${n} が値のほかでも違う`);
+      }
+    });
+  }
+  await t('merge と商品の行の更新の deadlock (A が残す仕入先を lock して寄せる行の商品を待つ・B が商品の行を持って残す仕入先を待つ): 毎回 1 本だけ 40P01・負けた側ごとの最後の表と A が待つ lock が旧と新で同じ', async () => {
+    await deadlockRounds(mergeFixed(), async ({ A, B }) => {
+      await B.c.query('begin'); await B.c.query(`update core.supplier_skus set order_unit = 'Y' where supplier_id = ${SID('01')} and sku_id = ${KID('skc')}`);
+      await A.c.query('begin'); const pa = A.q(MERGE); const waitA = await waitBlocked(A.pid, pa);
+      const pb = B.q(`update core.suppliers set order_memo = 'Y' where supplier_id = ${SID('0001')}`);
+      const [ra, rb] = await Promise.all([pa, pb]);
+      await endTx(A, ra); await endTx(B, rb);
+      return { ra, rb, waitA };
+    });
+  });
+
   console.log('一時の表を使わない');
   await t('🚨 TEMP の権限を外した DB (PUBLIC と持ち主から): 新しい 2 つの関数は通る・旧い関数は 42501 (permission denied to create temporary tables)', async () => {
     const fx = relinkFixed() + mergeFixed();
@@ -405,14 +634,15 @@ try {
         ['core.merge_duplicate_suppliers', 'core.relink_shipments_bulk', 'core.reresolve_order_lines']);
     } finally { await close(o); }
   });
-  await t('0057 は署名・戻り値の型・持ち主・EXECUTE の権限の表を変えない・search_path は pg_catalog, pg_temp・もう一度流しても同じ', async () => {
+  await t('0057 は署名・戻り値の型・持ち主・EXECUTE の権限の表を変えない・search_path は pg_catalog, pg_temp・結合は hash だけ・もう一度流しても同じ', async () => {
     const c = await open(T_NEW);
     try {
       const q = `select p.oid::regprocedure::text as sig, p.proacl::text as acl, pg_get_userbyid(p.proowner) as owner, pg_get_function_result(p.oid) as res
         from pg_proc p where p.oid in ($1::regprocedure, $2::regprocedure) order by 1`;
       assert.deepEqual((await c.query(q, [SIG_RELINK, SIG_MERGE])).rows, aclBefore);
       const cfg = (await c.query(`select p.oid::regprocedure::text as sig, p.proconfig as cfg, p.prosecdef as secdef from pg_proc p where p.oid in ($1::regprocedure, $2::regprocedure) order by 1`, [SIG_RELINK, SIG_MERGE])).rows;
-      for (const r of cfg) { assert.deepEqual(r.cfg, ['search_path=pg_catalog, pg_temp'], r.sig); assert.equal(r.secdef, false, r.sig); }
+      // どちらも結合は hash だけ (enable_nestloop = off・enable_mergejoin = off = CTE の件数・列の分布を planner に渡せない = 一部の鍵の結合で件数の 2 乗にならない)・work_mem 4MB (heap の枠を呼び手に依らず決める)
+      for (const r of cfg) { assert.deepEqual(r.cfg, ['search_path=pg_catalog, pg_temp', 'enable_nestloop=off', 'enable_mergejoin=off', 'work_mem=4MB', 'hash_mem_multiplier=2'], r.sig); assert.equal(r.secdef, false, r.sig); }
       const defBefore = (await c.query(`select pg_get_functiondef($1::regprocedure) || pg_get_functiondef($2::regprocedure) as d`, [SIG_RELINK, SIG_MERGE])).rows[0].d;
       await c.query('begin'); await c.query(SQL_0057); await c.query('commit');
       assert.equal((await c.query(`select pg_get_functiondef($1::regprocedure) || pg_get_functiondef($2::regprocedure) as d`, [SIG_RELINK, SIG_MERGE])).rows[0].d, defBefore);
