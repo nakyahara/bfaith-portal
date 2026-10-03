@@ -24,6 +24,18 @@ const DB_FILE = path.join(DATA_DIR, 'warehouse-mirror.db');
 
 let db = null;
 
+// Amazon の「税込の売上」= mirror_amazon_finance_sku_daily の 1 行の式 (他モールの gross_sales_jpy_incl と同じ意味)。
+//   本体 + 送料 + ギフト包装 (どれも決済の額 = 税抜) + 決済の消費税の実額 (Tax + ShippingTax + GiftWrapTax)。
+//   × 1.10 の推定ではない (軽減税率 8% の商品も正しい)。値引き (promotion)・ポイント・返金・手数料は引かない
+//   (= 楽天・Yahoo!・au PAY の gross_sales_jpy_incl も店のクーポン・ポイント・返金の前)。
+//   🚨 sales_tax_jpy は返金の行の税 (−) も足した正味 = 返金のあった日はその税の分だけ少なく出る (本体の返金は引かない)。
+//   列は表の別名なしで書く (FROM が mirror_amazon_finance_sku_daily 1 つの所・別名の表に同じ名前の列が無い所で使う)。
+//   使う所: v_mall_finance_daily_unified の Amazon の枝 / supplier-sales (仕入先別の売上・公開の口あり)。
+//   2026-10-03 Codex R-F4-1 High 6 (supplier-sales が Amazon だけ本体の税抜を足していた)。
+export const AMAZON_SALES_GROSS_INCL_SQL =
+  '(COALESCE(sales_principal_jpy,0) + COALESCE(sales_shipping_jpy,0)'
+  + ' + COALESCE(sales_giftwrap_jpy,0) + COALESCE(sales_tax_jpy,0))';
+
 // Yahoo!表の初期化失敗を保持 (mirror本体は継続する fail-soft。router が sync 応答に載せる)。
 // 2026-07-12 の本番障害 (#476→#477 revert) の再発防御: 新規表のDDLで落ちても既存モールを道連れにしない
 export let yahooInitError = null;
@@ -2601,8 +2613,7 @@ function createTables() {
       NULL AS ne_code,
       product_name,
       CAST(units_net_sold AS INTEGER) AS units_net_sold,
-      COALESCE(sales_principal_jpy,0) + COALESCE(sales_shipping_jpy,0)
-        + COALESCE(sales_giftwrap_jpy,0) + COALESCE(sales_tax_jpy,0) AS sales_gross_jpy_incl,
+      ${AMAZON_SALES_GROSS_INCL_SQL} AS sales_gross_jpy_incl,
       -- 🚨 apps/amazon-dashboard/queries.js の PROFIT_EX_SQL と同じ式 (手数料は決済の額 = 税込 → 1/11 を戻す)。変えるときは両方
       profit_amount
         + (COALESCE(commission_jpy,0) + COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) + COALESCE(closing_fee_jpy,0)
