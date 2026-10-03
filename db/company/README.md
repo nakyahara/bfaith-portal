@@ -47,6 +47,42 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
 - 適用済みファイルの内容を変えると `checksum 不一致` で止まる。**直すときは次の番号のファイルを足す**
 - 秘密情報 (接続文字列) は `.env` / Render の環境変数に置く。リポジトリに書かない
 
+### 実行器の全体の排他と concurrent-index の migration (D-60 PR 3a-i)
+
+設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10「migrate の runner の契約 (3a-i)」。試験 = `scripts/test-company-db-migrate-lock-pg.mjs` (使い捨ての PG 18・`npm run test:company-db` に入っている)。
+
+- **全体の排他** = `migrate.mjs` は Postgres の接続で、記録表の bootstrap → 未適用の判定 → DDL → 検証 → `ops.schema_migrations` の記録 までを **session の advisory lock** (`hashtextextended('company_db_migrate', 0)`) の中で同じ接続のまま行う (ふつうの migration も)。取れなければ **待たずに** `FAILED (MIGRATE_LOCKED): 別の migrate が動いている` で exit 1 (持っている pid が見えれば出す)。失敗したときは ROLLBACK を終えてから `pg_advisory_unlock`。接続が切れれば Postgres が外す
+  - `--list` は読むだけ = lock を取らない (流している最中でも見られる)。`--dry-run` は lock を取る (別の migrate が動いていれば止まる)
+  - この鍵は `company_db_heavy` (取引の lock だけにする共通の鍵) とは別。アプリ・夜間ロードは取らない = 止めない
+  - PGlite (試験) の adapter は lock を取らない (1 つの接続の中の DB)
+- **concurrent-index の migration** = 1 行目が `-- migrate:concurrent-index` のファイルは **取引の外で 1 文ずつ** 流す
+  - 許す文は `create [unique] index concurrently if not exists <名前> on [only] <schema>.<表> [using btree] (…) [include (…)] [where …]` と `drop index concurrently if exists <schema>.<名前>` だけ。名前・schema・表は引用しない名前。ドルの引用・`begin` / `set`・ほかの DDL・ふつうの `create index`・`with (…)` は **その回に流す全部のファイルを流す前に** 拒む (前の番号のふつうの migration も流さない)。印の無いファイルに `concurrently` があっても止まる
+  - 1 ファイル = 1 つの表を推す (失敗の範囲を小さく)
+  - 期待の属性 = 横の `<番号>_<名前>.expect.json` (必須・**手で書かない**)。使い捨ての PG 18 でそのファイルを流してから `node scripts/company-db/migrate.mjs --url <使い捨ての DB> --index-expect <番号> > db/company/migrations/<番号>_<名前>.expect.json` で作る。中身は `pg_index` / `pg_class` の正規化した属性 (表・access method・unique・key の数・列ごとの列名か式・演算子のクラス・collation・`indoption`・`pg_get_expr` の式と部分 index の条件。`search_path = pg_catalog` で読む = source の空白・大文字に依らない)
+  - 各文の前 = ① PostgreSQL の major が 18 (expect.json の `pg_major` とも同じ) ② 同じ表の index の作りが別の接続で動いていない (`pg_stat_progress_create_index`。見えない行も「ある」とみなす) ③ 同じ名前があれば: invalid なら `drop index concurrently` してから作る / valid で属性が同じなら飛ばす / 違えば止まる (人が見る) / index でない物が名前を取っていれば止まる
+  - session の設定 = `lock_timeout = 5min`・`statement_timeout = 30min`・`client_connection_check_interval = 1s` (Linux の server だけ。Windows の試験の server では使えないと出して続ける)。ファイルが終われば戻す
+  - **記録** = 全部の文が通り、作った index が全部 `indisvalid and indisready and indislive` で属性が期待どおり・消した index が無いときだけ (autocommit の 1 文)。途中で落ちたら記録しない = 次に流すと続きから
+  - 🚨 見張りで migrate の lock の長さを知らせるなら、閾値は 1 文の上限 (lock の待ち 5 分 + 文 30 分) より長い **45 分以上** にする (同時に鳴らさない)。CIC は古いスナップショットを待つ = **夜間のバックアップ (REPEATABLE READ の長い取引) の間は流さない**
+- **空き容量** (concurrent-index のファイルだけ・dry-run も同じ) = 見込み = Σ (作る index ごとに) `pg_table_size(表)` × 3 (index そのもの + 並べ替えの一時ファイル + WAL)。`今の大きさ (接続できる DB の pg_database_size の和) + WAL (pg_ls_waldir が読めなければ CDB_WAL_ALLOWANCE_BYTES・既定 1GB) + 見込み + 余裕 (CDB_CAPACITY_MARGIN_BYTES・既定 512MB) ≦ CDB_DB_LIMIT_BYTES × 0.8` のときだけ流す。`CDB_DB_LIMIT_BYTES` が無い・大きさが読めない = **流さない** (`DISK_CHECK_FAILED`)。env の名前と既定は Amazon 財務の送り手の容量の見張りと同じ
+- PGlite (試験) の adapter は concurrent-index に対応しない = そのファイルがあれば既定で止まる (`CONCURRENT_INDEX_UNSUPPORTED`・何も流さない)。試験で飛ばすなら `applyMigrations(db, { onUnsupportedConcurrentIndex: 'skip' })` (明示・記録しない・文の検査は飛ばさない)
+
+#### concurrent-index の migration が途中で止まったとき (回収の手順)
+
+1. `select indexrelid::regclass, indisvalid, indisready from pg_index where not indisvalid;` で invalid を見る
+2. `pg_stat_progress_create_index` と `pg_stat_activity` (`application_name = 'company-db-migrate'`) で前の作りが動いていないかを見る。動いていれば終わるのを待つ (止めるなら人が `pg_cancel_backend`)
+3. runner をもう一度流す (同じ名前の invalid を `drop index concurrently` してから作り直す)。🚨 手で `DROP INDEX` (CONCURRENTLY なし) はしない (表に強い lock)
+
+#### 配り方 = runner を先に配る (古い runner と並ばない)
+
+- 古い runner (lock なし) と新しい runner が同時に流れると排他は効かない (古いほうが lock を取らない)。ふつうの migration は `ops.schema_migrations` の主キーで片方が巻き戻り、concurrent-index は古い runner では `CREATE INDEX CONCURRENTLY cannot run inside a transaction block` で失敗する = 黙って二重にはならないが、**concurrent-index の migration を足す PR より先に、この runner を miniPC に配る** (pull するだけ・migrate は流さない)。migrate は miniPC のリポジトリ直下からだけ流す (別の PC・古い作業の木から流さない)
+- miniPC (PowerShell 5.1) で配った後に確かめる (読むだけ):
+
+```
+cd C:\Users\bfaith\bfaith-portal
+git pull
+node -r dotenv/config scripts\company-db\migrate.mjs --list      # 全部 applied・pending 0 のまま (lock は取らない)
+```
+
 ## 初期ロード (既存の SQLite → Company DB)。PR-B
 
 読み込み元は Render の `DATA_DIR` にある SQLite (`apps/company-db/load/sources.mjs`): mirror_products / mirror_set_components / mirror_sku_master + resolved / mirror_rakuten_sku_map / mirror_qoo10_items / mirror_amazon_sku_fees / product_drafts + draft_page_info + draft_sku_jans / バーコードマスタ / f_inbound_info / po_suppliers + po_vendor_code_map / fba.db (ASIN・JAN・FNSKU) / rakuten-yahoo-sync.db (Yahoo の出品・Notion の JAN) / postage.db (実測重量) / fba-box.db (SP-API 重量・実測) / staff.db。

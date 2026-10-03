@@ -8,14 +8,32 @@
  *   - 🚨 適用済みファイルは書き換えない (checksum が違えば止まる)。直したいときは次の番号で足す
  *   - SQLite の「起動時に CREATE IF NOT EXISTS」方式は持ち込まない。適用は人が (または配布手順が) このコマンドで行う
  *
+ * 🆕 D-60 PR 3a-i (設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10「migrate の runner の契約 (3a-i)」):
+ *   - **全体の排他** = Postgres の接続 (adapter の caps.sessionLock) では、記録表の bootstrap → 未適用の判定 → DDL → 検証 → 記録 を
+ *     session の専用の advisory lock (hashtextextended('company_db_migrate', 0)) の中で同じ接続のまま行う (ふつうの migration も)。
+ *     取れなければ待たずに MIGRATE_LOCKED で止まる (CLI は exit 1・「別の migrate が動いている」)。
+ *     失敗したときは ROLLBACK を終えてから pg_advisory_unlock (接続が切れれば Postgres が外す)。
+ *     🚨 この鍵は `company_db_heavy` (取引の lock だけにする共通の鍵) とは別 = 人が流す短い道具の session の lock
+ *   - **concurrent-index の migration** = 1 行目が `-- migrate:concurrent-index` のファイルは取引の外で 1 文ずつ流す。
+ *     許す文は `create [unique] index concurrently if not exists …` と `drop index concurrently if exists <schema>.<名前>` だけ
+ *     (流す前に、この回に流す全部のファイルの全部の文を検査し、ほかがあれば何も流さずに止まる)。
+ *     流した後に pg_index の indisvalid・indisready・indislive と、正規化した catalog の属性 (expect.json) が一致したときだけ記録する
+ *   - **空き容量** = concurrent-index のファイルは、表の大きさから見積もった index の作りの大きさ (下の INDEX_DISK_FACTOR) を足しても
+ *     ディスクの上限 (env CDB_DB_LIMIT_BYTES) の 80% に収まるときだけ流す。上限が読めなければ流さない
+ *   - PGlite (試験用) の adapter は session の lock と concurrent-index に対応しない = lock は取らない (1 つの接続の中の DB) /
+ *     concurrent-index のファイルは既定で止まる (opts.onUnsupportedConcurrentIndex = 'skip' のときだけ明示で飛ばす)
+ *
  * 使い方:
  *   COMPANY_DB_URL=postgres://... node scripts/company-db/migrate.mjs            # 未適用を全部
  *   node scripts/company-db/migrate.mjs --url postgres://... --to 0004          # 0004 まで
- *   node scripts/company-db/migrate.mjs --url ... --list                         # 適用状況だけ
- *   node scripts/company-db/migrate.mjs --url ... --dry-run                      # 何を流すかだけ
+ *   node scripts/company-db/migrate.mjs --url ... --list                         # 適用状況だけ (lock は取らない・読むだけ)
+ *   node scripts/company-db/migrate.mjs --url ... --dry-run                      # 何を流すかだけ (lock を取る・concurrent-index は検査と容量の見積もりまで)
+ *   node scripts/company-db/migrate.mjs --url <使い捨ての DB> --index-expect 0057 # そのファイルの index の属性 (expect.json の中身) を出す
+ *   (--dir <フォルダ> で migrations のフォルダを変えられる。試験用)
  *
  * テストは PGlite (WASM の Postgres) で同じ applyMigrations() を通す (scripts/test-company-db-ddl.mjs)。
- * 終了コード: 0 = 成功 / 1 = 失敗 (途中のファイルで止まる。適用済みぶんはそのまま) / 2 = 引数不正
+ * 本物の PG の試験 = scripts/test-company-db-migrate-lock-pg.mjs (lock・concurrent-index・容量)
+ * 終了コード: 0 = 成功 / 1 = 失敗 (途中のファイルで止まる。適用済みぶんはそのまま。別の migrate が動いている も 1) / 2 = 引数不正
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -26,9 +44,37 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_DIR = path.resolve(__dirname, '../../db/company/migrations');
 const FILE_RE = /^(\d{4})_([A-Za-z0-9_-]+)\.sql$/;
 
+/** 全体の排他の鍵の名前 (session の advisory lock・hashtextextended(name, 0))。設計 13 §3.10 の値 = 変えない */
+export const MIGRATE_LOCK_NAME = 'company_db_migrate';
+/** concurrent-index のファイルの 1 行目 */
+export const CONCURRENT_INDEX_MARKER = '-- migrate:concurrent-index';
+/** expect.json の属性は PostgreSQL の版で表し方が変わりうる = 本番と同じ major でだけ流す */
+export const EXPECTED_PG_MAJOR = 18;
+/**
+ * concurrent-index の session の設定 (設計 13 §3.10)。CIC は古いスナップショットを待つ = 長い。
+ * 🚨 見張りで migrate の lock の長さを知らせるなら、閾値は「lock の待ち 5 分 + 1 文 30 分」より長く (README の 45 分以上) = 同時に鳴らさない
+ */
+export const CONCURRENT_INDEX_SETTINGS = Object.freeze({ lockTimeout: '5min', statementTimeout: '30min', clientConnectionCheckInterval: '1s' });
+/**
+ * 空き容量の見積もり (concurrent-index のファイル):
+ *   見込み = Σ (作る index ごとに) 表の大きさ (pg_table_size) × INDEX_DISK_FACTOR
+ *     (index そのもの ≦ 表 1 倍 + 並べ替えの一時ファイル ≦ 1 倍 + WAL ≦ 1 倍 = 3 倍。btree の key は表の行より小さい = 上に倒した値)
+ *   流せる = 今の大きさ (接続できる DB の pg_database_size の和) + WAL (pg_ls_waldir が読めなければ予約) + 見込み + 余裕 ≦ 上限 × ratio
+ *   上限 (CDB_DB_LIMIT_BYTES = Render の Postgres のディスクの大きさ) が無い・大きさが読めない = 流さない
+ *   (WAL の予約・余裕・ratio は apps/company-db/push/amazon-finance.mjs の容量の見張りと同じ env と既定)
+ */
+export const INDEX_DISK_FACTOR = 3;
+export const DISK_DEFAULTS = Object.freeze({ walAllowanceBytes: 1024 ** 3, marginBytes: 512 * 1024 ** 2, ratio: 0.8 });
+
 /** ファイル内容の checksum (改行コードの違いを吸収。CRLF で checkout されても同じ値) */
 export function checksumOf(text) {
   return crypto.createHash('sha256').update(text.replace(/\r\n/g, '\n'), 'utf-8').digest('hex');
+}
+
+/** 1 行目が concurrent-index の印か (BOM・行末の空白・CR は無視) */
+export function isConcurrentIndexText(text) {
+  const first = text.replace(/^\uFEFF/, '').split('\n', 1)[0].replace(/\s+$/, '');
+  return first === CONCURRENT_INDEX_MARKER;
 }
 
 /** migrations ディレクトリの一覧 (番号順)。番号の重複・欠番 (0001 から連番でない) は不正 */
@@ -44,20 +90,503 @@ export function listMigrationFiles(dir = DEFAULT_DIR) {
     if (version !== expected) throw Object.assign(new Error(`マイグレーション番号に欠番: ${expected} が無く ${version} がある`), { code: 'BAD_MIGRATIONS' });
     seen.add(version);
     const text = fs.readFileSync(path.join(dir, f), 'utf-8');
-    out.push({ version, name: m[2], file: f, text, checksum: checksumOf(text) });
+    out.push({ version, name: m[2], file: f, text, checksum: checksumOf(text), concurrentIndex: isConcurrentIndexText(text) });
   }
   return out;
 }
 
+// ─── SQL の字句 (concurrent-index の文の検査に使う・実行には使わない) ───
+const sqlErr = (msg) => Object.assign(new Error(msg), { code: 'SQL_LEX' });
 /**
- * db = { query(text, params) → {rows}, exec(text) }  (pg の Client / PGlite の両方をこの形に包む。下の adapters)
- * 戻り値 { applied: [version...], skipped: [version...], pending: [version...] }
+ * SQL を字句に分ける。コメント (-- と入れ子の /* *\/) は捨てる。
+ * 字句 = { t: 'word' | 'str' | 'qid' | 'dollar' | 'num' | 'punct', v, start, end }
+ *   str = '…' と E'…' (E は \ の escape あり)・qid = "…"・dollar = $tag$…$tag$ (中身は 1 つの字句)
+ * 閉じていない文字列・コメント・ドルの引用は SQL_LEX で止まる
+ */
+export function lexSql(text) {
+  const toks = [];
+  const n = text.length;
+  let i = 0;
+  const isIdStart = (c) => /[A-Za-z_\u0080-\uffff]/.test(c);
+  const isId = (c) => /[A-Za-z0-9_$\u0080-\uffff]/.test(c);
+  const scanString = (q, escape) => {   // q = 開きの ' の位置。戻り = 閉じの次
+    let j = q + 1;
+    while (j < n) {
+      if (escape && text[j] === '\\') { j += 2; continue; }
+      if (text[j] === "'") { if (text[j + 1] === "'") { j += 2; continue; } return j + 1; }
+      j++;
+    }
+    throw sqlErr('閉じていない文字列 (\') がある');
+  };
+  while (i < n) {
+    const c = text[i], d = text[i + 1];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === '-' && d === '-') { const j = text.indexOf('\n', i); i = j < 0 ? n : j + 1; continue; }
+    if (c === '/' && d === '*') {
+      let depth = 1, j = i + 2;
+      while (j < n && depth) {
+        if (text[j] === '/' && text[j + 1] === '*') { depth++; j += 2; } else if (text[j] === '*' && text[j + 1] === '/') { depth--; j += 2; } else j++;
+      }
+      if (depth) throw sqlErr('閉じていないコメント (/*) がある');
+      i = j; continue;
+    }
+    if ((c === 'E' || c === 'e') && d === "'" && !(i > 0 && isId(text[i - 1]))) {
+      const j = scanString(i + 1, true); toks.push({ t: 'str', v: text.slice(i, j), start: i, end: j }); i = j; continue;
+    }
+    if (c === "'") { const j = scanString(i, false); toks.push({ t: 'str', v: text.slice(i, j), start: i, end: j }); i = j; continue; }
+    if (c === '"') {
+      let j = i + 1;
+      for (;;) {
+        const k = text.indexOf('"', j);
+        if (k < 0) throw sqlErr('閉じていない引用の名前 (") がある');
+        if (text[k + 1] === '"') { j = k + 2; continue; }
+        j = k + 1; break;
+      }
+      toks.push({ t: 'qid', v: text.slice(i, j), start: i, end: j }); i = j; continue;
+    }
+    if (c === '$') {
+      const m = /\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/y;
+      m.lastIndex = i;
+      const mm = m.exec(text);
+      if (mm) {
+        const tag = mm[0];
+        const k = text.indexOf(tag, i + tag.length);
+        if (k < 0) throw sqlErr(`閉じていないドルの引用 (${tag}) がある`);
+        toks.push({ t: 'dollar', v: text.slice(i, k + tag.length), start: i, end: k + tag.length }); i = k + tag.length; continue;
+      }
+      toks.push({ t: 'punct', v: '$', start: i, end: i + 1 }); i++; continue;
+    }
+    if (isIdStart(c)) {
+      let j = i + 1; while (j < n && isId(text[j])) j++;
+      toks.push({ t: 'word', v: text.slice(i, j), start: i, end: j }); i = j; continue;
+    }
+    if (/[0-9]/.test(c)) {
+      let j = i + 1; while (j < n && /[0-9A-Za-z_.]/.test(text[j])) j++;
+      toks.push({ t: 'num', v: text.slice(i, j), start: i, end: j }); i = j; continue;
+    }
+    toks.push({ t: 'punct', v: c, start: i, end: i + 1 }); i++;
+  }
+  return toks;
+}
+
+/** 字句を引用の外の ; で文に分ける。戻り = [{ toks, sql }] (空の文は捨てる) */
+export function splitSqlStatements(text) {
+  const toks = lexSql(text);
+  const out = [];
+  let cur = [];
+  const flush = () => { if (cur.length) out.push({ toks: cur, sql: text.slice(cur[0].start, cur[cur.length - 1].end) }); cur = []; };
+  for (const tk of toks) { if (tk.t === 'punct' && tk.v === ';') flush(); else cur.push(tk); }
+  flush();
+  return out;
+}
+
+const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const rejectCi = (file, msg) => Object.assign(new Error(`${file}: concurrent-index の migration に許さない形がある = 何も流さずに止めた: ${msg}`), { code: 'CONCURRENT_INDEX_REJECTED' });
+
+/**
+ * concurrent-index の 1 文を読む (許す 2 つの形だけ)。戻り = { kind: 'create' | 'drop', schema, name, table?, unique?, sql }
+ *   create [unique] index concurrently if not exists <名前> on [only] <schema>.<表> [using btree] (…) [include (…)] [where …]
+ *   drop index concurrently if exists <schema>.<名前>
+ * 名前・schema・表は引用しない名前だけ (Postgres と同じく小文字にする)・63 文字まで。ドルの引用はどこにも置かない
+ */
+export function parseConcurrentIndexStatement(stmt, file = '') {
+  const toks = stmt.toks;
+  let p = 0;
+  const fail = (msg) => { throw rejectCi(file, `${msg} (文: ${stmt.sql.replace(/\s+/g, ' ').slice(0, 160)})`); };
+  if (toks.some((tk) => tk.t === 'dollar')) fail('ドルの引用は使わない');
+  const isWord = (k) => toks[p] && toks[p].t === 'word' && toks[p].v.toLowerCase() === k;
+  const want = (k) => { if (!isWord(k)) fail(`「${k}」が要る位置に「${toks[p] ? toks[p].v : '(文の終わり)'}」`); p++; };
+  const ident = (what) => {
+    const tk = toks[p];
+    if (!tk || tk.t !== 'word' || !IDENT_RE.test(tk.v)) fail(`${what} は引用しない名前 (英数字と _) にする`);
+    if (tk.v.length > 63) fail(`${what} が 63 文字を超える (Postgres が切り詰める)`);
+    p++; return tk.v.toLowerCase();
+  };
+  const punct = (ch) => toks[p] && toks[p].t === 'punct' && toks[p].v === ch;
+  const group = (what) => {   // ( … ) の釣り合い。中身は空でない
+    if (!punct('(')) fail(`${what} の「(」が要る`);
+    let depth = 0; const start = p;
+    for (; p < toks.length; p++) {
+      if (punct('(')) depth++;
+      else if (punct(')')) { depth--; if (depth === 0) { p++; if (p - start <= 2) fail(`${what} が空`); return; } }
+    }
+    fail(`${what} の「)」が閉じていない`);
+  };
+  const allowedOnly = () => fail('許す文は create [unique] index concurrently if not exists … と drop index concurrently if exists … だけ');
+  if (isWord('create')) {
+    p++;
+    if (!isWord('unique') && !isWord('index')) allowedOnly();
+    let unique = false;
+    if (isWord('unique')) { unique = true; p++; }
+    want('index'); want('concurrently'); want('if'); want('not'); want('exists');
+    const name = ident('index の名前');
+    want('on');
+    if (isWord('only')) p++;
+    const schema = ident('schema');
+    if (!punct('.')) fail('表は <schema>.<表> で書く');
+    p++;
+    const table = ident('表');
+    if (isWord('using')) { p++; want('btree'); }
+    group('key の列');
+    if (isWord('include')) { p++; group('include の列'); }
+    if (isWord('where')) { p++; if (p >= toks.length) fail('where の条件が空'); p = toks.length; }
+    if (p !== toks.length) fail(`許さない句「${toks[p].v}」(許すのは using btree・include・where だけ)`);
+    return { kind: 'create', unique, schema, name, table, sql: stmt.sql };
+  }
+  if (isWord('drop')) {
+    p++;
+    if (!isWord('index')) allowedOnly();
+    want('index'); want('concurrently'); want('if'); want('exists');
+    const schema = ident('schema');
+    if (!punct('.')) fail('drop は <schema>.<名前> で書く');
+    p++;
+    const name = ident('index の名前');
+    if (p !== toks.length) fail(`drop の後ろに「${toks[p].v}」(cascade などは許さない)`);
+    return { kind: 'drop', schema, name, sql: stmt.sql };
+  }
+  allowedOnly();
+}
+
+/** expect.json の置き場 = migration の横の <番号>_<名前>.expect.json */
+export const expectPathOf = (dir, f) => path.join(dir, `${f.version}_${f.name}.expect.json`);
+export const EXPECT_FORMAT = 'company-db-index-expect/1';
+
+/**
+ * concurrent-index のファイルの計画 (流す前の検査を全部)。止めるときは CONCURRENT_INDEX_REJECTED。
+ * 戻り = { statements, expect, creates: Map<'schema.name', stmt> (最後の create), drops: Set<'schema.name'> }
+ */
+export function planConcurrentIndexFile(f, dir = DEFAULT_DIR) {
+  let stmts;
+  try { stmts = splitSqlStatements(f.text); } catch (e) { throw rejectCi(f.file, e.message); }
+  if (!stmts.length) throw rejectCi(f.file, '文が 1 つも無い');
+  const statements = stmts.map((s) => parseConcurrentIndexStatement(s, f.file));
+  const creates = new Map(), drops = new Set();
+  for (const s of statements) {
+    const key = `${s.schema}.${s.name}`;
+    if (s.kind === 'create') { creates.set(key, s); drops.delete(key); } else { drops.add(key); creates.delete(key); }
+  }
+  const ep = expectPathOf(dir, f);
+  let expect = null;
+  if (statements.some((s) => s.kind === 'create')) {
+    if (!fs.existsSync(ep)) throw rejectCi(f.file, `期待の属性 ${path.basename(ep)} が無い (使い捨ての PG ${EXPECTED_PG_MAJOR} で流して --index-expect で作る・手で書かない)`);
+    try { expect = JSON.parse(fs.readFileSync(ep, 'utf-8')); } catch (e) { throw rejectCi(f.file, `${path.basename(ep)} が JSON として読めない: ${e.message}`); }
+    if (!expect || expect.format !== EXPECT_FORMAT || !expect.indexes || typeof expect.indexes !== 'object') throw rejectCi(f.file, `${path.basename(ep)} の形が違う (format = ${EXPECT_FORMAT}・indexes)`);
+    if (!Number.isInteger(expect.pg_major)) throw rejectCi(f.file, `${path.basename(ep)} に pg_major が無い`);
+    for (const key of creates.keys()) if (!Object.hasOwn(expect.indexes, key)) throw rejectCi(f.file, `${path.basename(ep)} に ${key} の属性が無い`);
+    for (const key of Object.keys(expect.indexes)) if (!creates.has(key)) throw rejectCi(f.file, `${path.basename(ep)} の ${key} はこのファイルで作らない`);
+    for (const [key, s] of creates) {
+      const want = `${s.schema}.${s.table}`;
+      if (expect.indexes[key].table !== want) throw rejectCi(f.file, `${path.basename(ep)} の ${key} の表が ${expect.indexes[key].table} (文は ${want})`);
+    }
+  }
+  return { statements, expect, creates, drops };
+}
+
+/** 印の無いファイルに concurrently がある = 取引の中で落ちる前に分かりやすく止める (字句に読めないファイルは今までどおり Postgres に任せる) */
+function rejectUnmarkedConcurrently(f) {
+  let toks;
+  try { toks = lexSql(f.text); } catch { return; }
+  if (toks.some((tk) => tk.t === 'word' && tk.v.toLowerCase() === 'concurrently')) {
+    throw Object.assign(new Error(`${f.file}: concurrently があるのに 1 行目が「${CONCURRENT_INDEX_MARKER}」でない = 何も流さずに止めた (取引の中では CIC は流せない)`), { code: 'CONCURRENT_INDEX_REJECTED', version: f.version });
+  }
+}
+
+// ─── catalog の属性 (定義の検証) ───
+/**
+ * index の正規化した属性を読む (無ければ null)。search_path = pg_catalog の取引で読む = 式の中の名前は全部 schema つきで出る (source の空白・大文字に依らない)
+ * 戻り = { valid, ready, live, attrs } (attrs が expect.json の 1 つの index の中身)
+ */
+export async function readIndexAttrs(db, schema, name) {
+  await db.exec('begin');
+  try {
+    await db.exec("set local search_path = pg_catalog, pg_temp");
+    const { rows } = await db.query(`
+      select c.relkind::text as relkind, i.indisvalid as valid, i.indisready as ready, i.indislive as live,
+        case when i.indexrelid is null then null else json_build_object(
+          'table', tn.nspname || '.' || t.relname,
+          'access_method', am.amname,
+          'unique', i.indisunique,
+          'nulls_not_distinct', i.indnullsnotdistinct,
+          'key_columns', i.indnkeyatts::int,
+          'all_columns', i.indnatts::int,
+          'columns', (select json_agg(json_build_object(
+              'column', case when kk.v = 0 then null else (select a.attname::text from pg_attribute a where a.attrelid = i.indrelid and a.attnum = kk.v) end,
+              'definition', pg_get_indexdef(i.indexrelid, s.n, false),
+              'key', s.n <= i.indnkeyatts,
+              'opclass', (select ons.nspname || '.' || oc.opcname from pg_opclass oc join pg_namespace ons on ons.oid = oc.opcnamespace where oc.oid = cl.v),
+              'collation', (select cns.nspname || '.' || co.collname from pg_collation co join pg_namespace cns on cns.oid = co.collnamespace where co.oid = cc.v),
+              'option', op.v) order by s.n)
+            from generate_series(1, i.indnatts::int) s(n)
+            left join lateral (select x.v from unnest(i.indkey::int2[]) with ordinality x(v, o) where x.o = s.n) kk on true
+            left join lateral (select x.v from unnest(i.indclass::oid[]) with ordinality x(v, o) where x.o = s.n) cl on true
+            left join lateral (select x.v from unnest(i.indcollation::oid[]) with ordinality x(v, o) where x.o = s.n) cc on true
+            left join lateral (select x.v::int as v from unnest(i.indoption::int2[]) with ordinality x(v, o) where x.o = s.n) op on true),
+          'expressions', pg_get_expr(i.indexprs, i.indrelid, false),
+          'predicate', pg_get_expr(i.indpred, i.indrelid, false)
+        ) end as attrs
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+      left join pg_index i on i.indexrelid = c.oid
+      left join pg_class t on t.oid = i.indrelid
+      left join pg_namespace tn on tn.oid = t.relnamespace
+      left join pg_am am on am.oid = c.relam
+      where n.nspname = $1 and c.relname = $2`, [schema, name]);
+    await db.exec('commit');
+    if (!rows.length) return null;
+    const r = rows[0];
+    if (!['i', 'I'].includes(r.relkind)) return { notIndex: true, relkind: r.relkind };
+    return { valid: r.valid, ready: r.ready, live: r.live, attrs: typeof r.attrs === 'string' ? JSON.parse(r.attrs) : r.attrs };
+  } catch (e) {
+    try { await db.exec('rollback'); } catch { /* */ }
+    throw e;
+  }
+}
+
+/** キーの順に依らない JSON (比べる用) */
+export function stableJson(v) {
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(',')}]`;
+  if (v && typeof v === 'object') return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stableJson(v[k])}`).join(',')}}`;
+  return JSON.stringify(v === undefined ? null : v);
+}
+/** 属性の違い (同じなら []) */
+export function attrDiff(actual, expected) {
+  const keys = [...new Set([...Object.keys(actual || {}), ...Object.keys(expected || {})])].sort();
+  return keys.filter((k) => stableJson(actual?.[k]) !== stableJson(expected?.[k]))
+    .map((k) => `${k}: 今 ${stableJson(actual?.[k])} / 期待 ${stableJson(expected?.[k])}`);
+}
+
+async function serverMajor(db) {
+  const { rows } = await db.query('select current_setting(\'server_version_num\')::int as v');
+  return Math.floor(Number(rows[0].v) / 10000);
+}
+
+/** 同じ表の index の作りが (別の backend で) 動いていないか。見えない (relid が null = 別の役割) のも「ある」とみなす */
+async function buildsInProgress(db, qualifiedTable) {
+  const { rows } = await db.query(`
+    select p.pid, p.relid::regclass::text as rel, p.phase
+      from pg_stat_progress_create_index p
+     where p.datid = (select oid from pg_database where datname = current_database())
+       and p.pid <> pg_backend_pid()
+       and (p.relid is null or $1::text is null or p.relid = to_regclass($1::text))`, [qualifiedTable]);
+  return rows;
+}
+
+/** 容量を読む。戻り = { usedBytes, walBytes (読めなければ null) } */
+export async function readDiskUsage(db) {
+  const { rows } = await db.query(`select coalesce(sum(pg_database_size(d.oid)), 0)::text as b
+    from pg_database d where d.datallowconn and has_database_privilege(d.oid, 'CONNECT')`);
+  const usedBytes = Number(rows[0].b);
+  let walBytes = null;
+  try { walBytes = Number((await db.query('select coalesce(sum(size), 0)::text as b from pg_ls_waldir()')).rows[0].b); } catch { /* pg_monitor が無い = 予約を使う */ }
+  return { usedBytes, walBytes };
+}
+
+/**
+ * concurrent-index のファイルの容量の関門。通らなければ DISK_CHECK_FAILED (何も流さない)。
+ * disk = { limitBytes, walAllowanceBytes, marginBytes, ratio, factor }
+ */
+export async function concurrentIndexDiskCheck(db, plan, disk = {}, log = () => {}) {
+  const cfg = { ...DISK_DEFAULTS, factor: INDEX_DISK_FACTOR, ...Object.fromEntries(Object.entries(disk || {}).filter(([, v]) => v != null)) };
+  const fail = (msg, extra = {}) => Object.assign(new Error(`容量: ${msg} = 流さずに止めた`), { code: 'DISK_CHECK_FAILED', ...extra });
+  const tables = [...plan.creates.values()].map((s) => `${s.schema}.${s.table}`);
+  let estimate = 0;
+  for (const t of tables) {
+    const { rows } = await db.query('select pg_table_size(to_regclass($1::text))::text as b, to_regclass($1::text) is not null as found', [t]);
+    if (!rows[0].found) throw fail(`表 ${t} が無い`);
+    estimate += Number(rows[0].b) * cfg.factor;
+  }
+  if (!tables.length) return { ok: true, estimateBytes: 0 };
+  if (!(Number(cfg.limitBytes) > 0)) throw fail('ディスクの上限 (CDB_DB_LIMIT_BYTES) が無い = 空きが読めない');
+  for (const k of ['walAllowanceBytes', 'marginBytes', 'ratio', 'factor']) if (!(Number(cfg[k]) >= 0) || !Number.isFinite(Number(cfg[k]))) throw fail(`設定 ${k} が不正 (${cfg[k]})`);
+  if (!(cfg.ratio > 0 && cfg.ratio <= 1)) throw fail(`ratio は 0 より大きく 1 以下 (${cfg.ratio})`);
+  let usage;
+  try { usage = await readDiskUsage(db); } catch (e) { throw fail(`DB の大きさが読めない (${e.message})`); }
+  if (!Number.isFinite(usage.usedBytes) || usage.usedBytes <= 0) throw fail('DB の大きさが読めない');
+  const wal = usage.walBytes != null && Number.isFinite(usage.walBytes) ? usage.walBytes : Number(cfg.walAllowanceBytes);
+  const projected = usage.usedBytes + wal + estimate + Number(cfg.marginBytes);
+  const allowed = Number(cfg.limitBytes) * cfg.ratio;
+  const info = { usedBytes: usage.usedBytes, walBytes: wal, walMeasured: usage.walBytes != null, estimateBytes: estimate, marginBytes: Number(cfg.marginBytes), projectedBytes: projected, allowedBytes: allowed, limitBytes: Number(cfg.limitBytes) };
+  log(`容量: 今 ${mb(usage.usedBytes)} + WAL ${mb(wal)}${usage.walBytes == null ? ' (予約)' : ''} + index の見込み ${mb(estimate)} (表 × ${cfg.factor}) + 余裕 ${mb(cfg.marginBytes)} = ${mb(projected)} / 上限 ${mb(cfg.limitBytes)} の ${Math.round(cfg.ratio * 100)}% = ${mb(allowed)}`);
+  if (projected > allowed) throw fail(`見込み ${mb(projected)} が上限 ${mb(cfg.limitBytes)} の ${Math.round(cfg.ratio * 100)}% (${mb(allowed)}) を超える`, { disk: info });
+  return { ok: true, ...info };
+}
+const mb = (b) => `${Math.round(Number(b) / 1048576).toLocaleString()} MB`;
+
+// ─── 全体の排他 ───
+/** lock を持っている backend (見えれば) */
+async function describeLockHolder(db) {
+  const { rows } = await db.query(`
+    select l.pid, a.application_name, a.usename::text as usename, a.backend_start, a.state
+      from pg_locks l left join pg_stat_activity a on a.pid = l.pid
+     where l.locktype = 'advisory' and l.granted and l.objsubid = 1
+       and l.database = (select oid from pg_database where datname = current_database())
+       and ((l.classid::bigint << 32) | l.objid::bigint) = hashtextextended($1, 0)`, [MIGRATE_LOCK_NAME]);
+  return rows;
+}
+
+/**
+ * fn を migrate の session の lock の中で動かす (Postgres の adapter だけ)。取れなければ MIGRATE_LOCKED (待たない)。
+ * fn が失敗したら ROLLBACK を終えてから unlock (取引が開いていなければ ROLLBACK は警告だけ)。接続が切れていれば unlock も失敗する = Postgres が外す
+ */
+export async function withMigrateLock(db, fn, { log = () => {} } = {}) {
+  if (!adapterCaps(db).sessionLock) throw Object.assign(new Error('この adapter は session の lock に対応しない (Postgres の接続だけ)'), { code: 'LOCK_UNSUPPORTED' });
+  const got = (await db.query('select pg_try_advisory_lock(hashtextextended($1, 0)) as got', [MIGRATE_LOCK_NAME])).rows[0].got;
+  if (!got) {
+    let who = '';
+    try { const h = await describeLockHolder(db); if (h.length) who = ' / 持っている接続: ' + h.map((r) => `pid ${r.pid}${r.application_name ? ` (${r.application_name}${r.usename ? `・${r.usename}` : ''})` : ''}${r.backend_start ? ` 開始 ${new Date(r.backend_start).toISOString()}` : ''}`).join(', '); } catch { /* 見えなくても止まる理由は同じ */ }
+    throw Object.assign(new Error(`別の migrate が動いている (lock ${MIGRATE_LOCK_NAME} を取れない) = 何もせずに止めた。終わってからもう一度流す${who}`), { code: 'MIGRATE_LOCKED' });
+  }
+  log(`lock ${MIGRATE_LOCK_NAME} を取った`);
+  let failure = null;
+  try {
+    return await fn();
+  } catch (e) {
+    failure = e;
+    try { await db.exec('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する */ }
+    throw e;
+  } finally {
+    let unlockError = null;
+    try {
+      const ok = (await db.query('select pg_advisory_unlock(hashtextextended($1, 0)) as ok', [MIGRATE_LOCK_NAME])).rows[0].ok;
+      if (!ok) unlockError = new Error('pg_advisory_unlock が false (持っていなかった)');
+    } catch (e) { unlockError = e; }
+    if (unlockError) {
+      if (failure) failure.unlockError = unlockError.message;
+      // 成功の後に外せない = 接続を閉じれば外れる (CLI は必ず閉じる)。黙って成功にしない
+      else throw Object.assign(new Error(`migrate は済んだが lock を外せない (接続を閉じれば外れる): ${unlockError.message}`), { code: 'MIGRATE_UNLOCK_FAILED' });   // eslint-disable-line no-unsafe-finally
+    } else log(`lock ${MIGRATE_LOCK_NAME} を外した`);
+  }
+}
+
+/** adapter の対応 (無い = PGlite など。lock も concurrent-index も無し) */
+export function adapterCaps(db) {
+  const c = (db && db.caps) || {};
+  return { sessionLock: c.sessionLock === true, concurrentIndex: c.concurrentIndex === true };
+}
+
+// ─── concurrent-index のファイルを流す ───
+async function setSession(db, s, log) {
+  await db.exec(`set lock_timeout = '${s.lockTimeout}'`);
+  await db.exec(`set statement_timeout = '${s.statementTimeout}'`);
+  try {
+    await db.exec(`set client_connection_check_interval = '${s.clientConnectionCheckInterval}'`);
+  } catch (e) {
+    // 🚨 この設定は Linux (POLLRDHUP) の server だけ。Windows の server (試験の embedded-postgres) は 0 以外を拒む = 使えないと出して続ける (Render は Linux)
+    if (!/client_connection_check_interval/.test(e.message)) throw e;
+    log(`この server では client_connection_check_interval を使えない (${e.message}) = 切れた接続の検出は TCP に任せる`);
+  }
+}
+async function resetSession(db) {
+  for (const k of ['lock_timeout', 'statement_timeout', 'client_connection_check_interval']) { try { await db.exec(`reset ${k}`); } catch { /* 接続が死んでいる */ } }
+}
+const SETTING_RE = /^\d+(ms|s|min|h)?$/;
+
+/** 流す前の検査 (版・容量)。dry-run でも同じ */
+async function concurrentIndexPrechecks(db, f, plan, opts, log) {
+  const major = await serverMajor(db);
+  const want = opts.expectedPgMajor ?? EXPECTED_PG_MAJOR;
+  if (major !== want) throw Object.assign(new Error(`${f.file}: PostgreSQL の major が ${major} (期待 ${want}) = 式の表し方が版で変わりうるので流さない`), { code: 'PG_MAJOR_MISMATCH' });
+  if (plan.expect && plan.expect.pg_major !== major) throw Object.assign(new Error(`${f.file}: expect.json の pg_major ${plan.expect.pg_major} が今の ${major} と違う (同じ版で作り直す)`), { code: 'PG_MAJOR_MISMATCH' });
+  try { return await concurrentIndexDiskCheck(db, plan, opts.disk, log); } catch (e) { e.message = `${f.file}: ${e.message}`; e.version = f.version; throw e; }
+}
+
+/** invalid が残ったときの回収の手順 (README と同じ) */
+export const CONCURRENT_INDEX_RUNBOOK = [
+  '① select indexrelid::regclass, indisvalid, indisready from pg_index where not indisvalid; で invalid を見る',
+  "② pg_stat_progress_create_index と pg_stat_activity (application_name = 'company-db-migrate') で前の作りが動いていないかを見る (動いていれば終わるのを待つ・止めるなら人が pg_cancel_backend)",
+  '③ この runner をもう一度流す (同じ名前の invalid を drop index concurrently してから作り直す)。手で DROP INDEX (CONCURRENTLY なし) はしない (表に強い lock)',
+  '詳しくは db/company/README.md「concurrent-index の migration (D-60 PR 3a-i)」',
+].join('\n  ');
+
+async function applyConcurrentIndexFile(db, f, plan, opts, log, appliedBy) {
+  const s = { ...CONCURRENT_INDEX_SETTINGS, ...(opts.concurrentIndexSettings || {}) };
+  for (const [k, v] of Object.entries(s)) if (!SETTING_RE.test(String(v))) throw Object.assign(new Error(`concurrent-index の設定 ${k} が不正: ${v}`), { code: 'BAD_SETTINGS' });
+  await concurrentIndexPrechecks(db, f, plan, opts, log);
+  log(`apply ${f.file} (concurrent-index・取引の外で ${plan.statements.length} 文・lock_timeout ${s.lockTimeout}・statement_timeout ${s.statementTimeout}) ...`);
+  const fail = (msg, extra = {}) => Object.assign(new Error(`${f.file} で失敗 (記録しない・次に流すと続きから): ${msg}`), { code: 'MIGRATION_FAILED', version: f.version, ...extra });
+  await setSession(db, s, log);
+  try {
+    for (const st of plan.statements) {
+      const key = `${st.schema}.${st.name}`;
+      if (st.kind === 'create') {
+        const running = await buildsInProgress(db, `${st.schema}.${st.table}`);
+        if (running.length) throw fail(`${st.schema}.${st.table} の index の作りが別の接続で動いている (pid ${running.map((r) => r.pid).join(', ')}) = 終わるか止まるのを待つ\n  ${CONCURRENT_INDEX_RUNBOOK}`, { reason: 'BUILD_IN_PROGRESS' });
+        const cur = await readIndexAttrs(db, st.schema, st.name);
+        if (cur && cur.notIndex) throw fail(`${key} は index でない (relkind ${cur.relkind}) = 名前が取られている`, { reason: 'NAME_TAKEN' });
+        if (cur) {
+          if (!(cur.valid && cur.ready && cur.live)) {
+            log(`${key} は invalid (valid=${cur.valid} ready=${cur.ready} live=${cur.live}) = drop index concurrently してから作り直す`);
+            await db.exec(`drop index concurrently if exists ${st.schema}.${st.name}`);
+          } else {
+            const diff = attrDiff(cur.attrs, plan.expect.indexes[key]);
+            if (diff.length) throw fail(`${key} は同じ名前で定義が違う (人が見る・このファイルは流さない)\n  ${diff.join('\n  ')}`, { reason: 'DEFINITION_MISMATCH', diff });
+            log(`${key} は作り済み (valid・属性が期待どおり) = 飛ばす`);
+            continue;
+          }
+        }
+      } else {
+        const running = await buildsInProgress(db, null);
+        if (running.length) throw fail(`index の作りが別の接続で動いている (pid ${running.map((r) => r.pid).join(', ')}) = 終わるのを待つ`, { reason: 'BUILD_IN_PROGRESS' });
+      }
+      log(`  ${st.kind} ${key}`);
+      try {
+        await db.exec(st.sql);
+      } catch (e) {
+        const hint = /lock timeout/i.test(e.message) ? ` [lock_timeout ${s.lockTimeout}: 長い取引 (夜間のバックアップなど) が終わってからもう一度流す]` : '';
+        throw fail(`${key}: ${e.message}${hint}`, { cause: e });
+      }
+    }
+    // 検証 = 作った index が全部 valid・ready・live で属性が期待どおり / 消した index が無い
+    for (const [key, st] of plan.creates) {
+      const cur = await readIndexAttrs(db, st.schema, st.name);
+      if (!cur || cur.notIndex) throw fail(`${key} が無い`, { reason: 'MISSING' });
+      if (!(cur.valid && cur.ready && cur.live)) throw fail(`${key} が invalid のまま (valid=${cur.valid} ready=${cur.ready} live=${cur.live})`, { reason: 'INVALID' });
+      const diff = attrDiff(cur.attrs, plan.expect.indexes[key]);
+      if (diff.length) throw fail(`${key} の属性が期待と違う\n  ${diff.join('\n  ')}`, { reason: 'DEFINITION_MISMATCH', diff });
+    }
+    for (const key of plan.drops) {
+      const [sc, nm] = key.split('.');
+      if (await readIndexAttrs(db, sc, nm)) throw fail(`${key} が消えていない`, { reason: 'NOT_DROPPED' });
+    }
+    await db.query('insert into ops.schema_migrations (version, name, checksum, applied_by) values ($1, $2, $3, $4)', [f.version, f.name, f.checksum, appliedBy]);
+  } catch (e) {
+    if (e.code === 'MIGRATION_FAILED' || e.code === 'DISK_CHECK_FAILED' || e.code === 'PG_MAJOR_MISMATCH') {
+      // invalid が残っていれば回収の手順を添える
+      try {
+        const left = [];
+        for (const st of plan.creates.values()) { const cur = await readIndexAttrs(db, st.schema, st.name); if (cur && !cur.notIndex && !cur.valid) left.push(`${st.schema}.${st.name}`); }
+        if (left.length) { e.invalidIndexes = left; if (!e.message.includes('回収')) e.message += `\n  invalid の index が残っている: ${left.join(', ')} = 回収の手順:\n  ${CONCURRENT_INDEX_RUNBOOK}`; }
+      } catch { /* 読めなくても元の誤りを出す */ }
+      throw e;
+    }
+    throw fail(e.message, { cause: e });
+  } finally {
+    await resetSession(db);
+  }
+}
+
+/**
+ * db = { query(text, params) → {rows}, exec(text), caps? }  (pg の Client / PGlite の両方をこの形に包む。下の adapters)
+ * 戻り値 { applied: [version...], skipped: [version...], pending: [version...], unsupported: [version...] }
+ * opts: dir / to / dryRun / log / appliedBy / lockTimeout / statementTimeout (ふつうの migration)
+ *       disk (concurrent-index の容量の関門・{ limitBytes, walAllowanceBytes, marginBytes, ratio, factor })
+ *       concurrentIndexSettings ({ lockTimeout, statementTimeout, clientConnectionCheckInterval }) / expectedPgMajor
+ *       onUnsupportedConcurrentIndex = 'error' (既定) | 'skip' (adapter が concurrent-index に対応しないとき = PGlite)
  */
 export async function applyMigrations(db, opts = {}) {
-  const dir = opts.dir || DEFAULT_DIR;
   const log = opts.log || ((m) => console.log(`[company-db] ${m}`));
+  // 🆕 Postgres の接続なら全体を session の lock で囲む (同じ session で入れ子に取っても外れない = Postgres の lock は数を数える)
+  if (adapterCaps(db).sessionLock) return withMigrateLock(db, () => applyMigrationsLocked(db, opts, log), { log: opts.lockLog || (() => {}) });
+  return applyMigrationsLocked(db, opts, log);
+}
+
+async function applyMigrationsLocked(db, opts, log) {
+  const dir = opts.dir || DEFAULT_DIR;
   const to = opts.to || null;
   const dryRun = !!opts.dryRun;
+  const caps = adapterCaps(db);
+  const onUnsupported = opts.onUnsupportedConcurrentIndex || 'error';
+  if (!['error', 'skip'].includes(onUnsupported)) throw Object.assign(new Error(`onUnsupportedConcurrentIndex は error か skip: ${onUnsupported}`), { code: 'BAD_OPTIONS' });
   const appliedBy = opts.appliedBy || `${process.env.COMPUTERNAME || process.env.HOSTNAME || 'unknown'}/${process.env.USERNAME || process.env.USER || 'unknown'}`;
   // 🚨 既存表への ALTER は ACCESS EXCLUSIVE を取る。別の接続が取引を開いたままだと無期限に待ち、後続の読み手まで待機列に入る (PR #1312 Codex R4)
   //    → 各ファイルの取引に lock_timeout / statement_timeout を入れ、待ち切れなければそのファイルだけ巻き戻して失敗にする (少し待ってもう一度流す)
@@ -85,7 +614,9 @@ export async function applyMigrations(db, opts = {}) {
   if (orphan.length) {
     throw Object.assign(new Error(`DB に適用記録があるのにファイルが無い: ${orphan.join(', ')} (このディレクトリは DB より古い、またはファイルを消した)`), { code: 'ORPHAN_MIGRATIONS', versions: orphan });
   }
-  const result = { applied: [], skipped: [], pending: [] };
+  const result = { applied: [], skipped: [], pending: [], unsupported: [] };
+  // 1 周目 = 判定と流す前の検査を全部 (concurrent-index の文・expect.json・adapter の対応)。ここで止まれば何も流さない
+  const todo = [];
   for (const f of files) {
     if (applied.has(f.version)) {
       if (applied.get(f.version) !== f.checksum) {
@@ -95,7 +626,35 @@ export async function applyMigrations(db, opts = {}) {
       continue;
     }
     if (to && f.version > to) { result.pending.push(f.version); continue; }
-    if (dryRun) { log(`dry-run: ${f.file} を流す予定`); result.pending.push(f.version); continue; }
+    if (f.concurrentIndex) {
+      f.plan = planConcurrentIndexFile(f, dir);
+      if (!caps.concurrentIndex) {
+        if (onUnsupported === 'skip') f.unsupportedSkip = true;
+        else throw Object.assign(new Error(`${f.file} は concurrent-index の migration = この adapter (PGlite など) では流せない (何も流さずに止めた・試験で飛ばすなら onUnsupportedConcurrentIndex: 'skip')`), { code: 'CONCURRENT_INDEX_UNSUPPORTED', version: f.version });
+      }
+    } else rejectUnmarkedConcurrently(f);
+    todo.push(f);
+  }
+  // 2 周目 = 流す
+  for (const f of todo) {
+    if (f.unsupportedSkip) {
+      log(`skip ${f.file} (concurrent-index・この adapter は対応しない = 明示で飛ばした・記録しない)`);
+      result.unsupported.push(f.version); result.pending.push(f.version);
+      continue;
+    }
+    if (dryRun) {
+      if (f.concurrentIndex) {
+        const d = await concurrentIndexPrechecks(db, f, f.plan, opts, log);
+        log(`dry-run: ${f.file} を流す予定 (concurrent-index・${f.plan.statements.length} 文・取引の外・index の見込み ${mb(d.estimateBytes || 0)})`);
+      } else log(`dry-run: ${f.file} を流す予定`);
+      result.pending.push(f.version);
+      continue;
+    }
+    if (f.concurrentIndex) {
+      await applyConcurrentIndexFile(db, f, f.plan, opts, log, appliedBy);
+      result.applied.push(f.version);
+      continue;
+    }
     log(`apply ${f.file} ...`);
     await db.exec('begin');
     try {
@@ -114,7 +673,7 @@ export async function applyMigrations(db, opts = {}) {
   return result;
 }
 
-/** 適用状況の一覧 (ファイル × 記録) */
+/** 適用状況の一覧 (ファイル × 記録)。読むだけ = lock は取らない */
 export async function migrationStatus(db, opts = {}) {
   const dir = opts.dir || DEFAULT_DIR;
   const files = listMigrationFiles(dir);
@@ -126,26 +685,48 @@ export async function migrationStatus(db, opts = {}) {
   return files.map((f) => {
     const a = applied.get(f.version);
     return {
-      version: f.version, name: f.name,
+      version: f.version, name: f.name, concurrentIndex: f.concurrentIndex,
       state: !a ? 'pending' : (a.checksum === f.checksum ? 'applied' : 'CHANGED'),
       applied_at: a?.applied_at || null, applied_by: a?.applied_by || null,
     };
   });
 }
 
+/**
+ * そのファイルで作る index の属性を今の DB から読んで expect.json の中身を作る (使い捨ての PG で流した後に使う・手で書かない)。
+ * 全部 valid でなければ止まる
+ */
+export async function buildIndexExpect(db, f, dir = DEFAULT_DIR) {
+  if (!f.concurrentIndex) throw Object.assign(new Error(`${f.file} は concurrent-index の migration でない`), { code: 'BAD_OPTIONS' });
+  let stmts;
+  try { stmts = splitSqlStatements(f.text); } catch (e) { throw rejectCi(f.file, e.message); }
+  const creates = new Map();
+  for (const st of stmts.map((s) => parseConcurrentIndexStatement(s, f.file))) { const key = `${st.schema}.${st.name}`; if (st.kind === 'create') creates.set(key, st); else creates.delete(key); }
+  const indexes = {};
+  for (const [key, st] of creates) {
+    const cur = await readIndexAttrs(db, st.schema, st.name);
+    if (!cur || cur.notIndex) throw new Error(`${key} が無い (先に使い捨ての DB でこのファイルを流す)`);
+    if (!(cur.valid && cur.ready && cur.live)) throw new Error(`${key} が invalid`);
+    indexes[key] = cur.attrs;
+  }
+  return { format: EXPECT_FORMAT, pg_major: await serverMajor(db), indexes };
+}
+
 // ─── adapters ───
-/** node-postgres の Client を { query, exec } に包む */
+/** node-postgres の Client を { query, exec } に包む。🆕 caps = session の lock と concurrent-index に対応 */
 export function pgAdapter(client) {
   return {
     query: (text, params) => client.query(text, params),
     exec: (text) => client.query(text),          // 複数文は simple query protocol で流れる (params 無し)
+    caps: { sessionLock: true, concurrentIndex: true },
   };
 }
-/** PGlite を { query, exec } に包む (テスト用) */
+/** PGlite を { query, exec } に包む (テスト用)。🆕 caps = 無し (1 つの接続の中の DB = lock は取らない・concurrent-index は止めるか明示で飛ばす) */
 export function pgliteAdapter(pglite) {
   return {
     query: (text, params) => pglite.query(text, params),
     exec: (text) => pglite.exec(text),
+    caps: { sessionLock: false, concurrentIndex: false },
   };
 }
 
@@ -188,6 +769,12 @@ export async function openPgClient(url, extra = {}) {
   return client;
 }
 
+/** CLI の容量の設定 (env)。名前と既定は apps/company-db/push/amazon-finance.mjs の容量の見張りと同じ */
+export function diskFromEnv(env = process.env) {
+  const n = (k) => (env[k] != null && String(env[k]).trim() !== '' ? Number(env[k]) : null);
+  return { limitBytes: n('CDB_DB_LIMIT_BYTES'), walAllowanceBytes: n('CDB_WAL_ALLOWANCE_BYTES'), marginBytes: n('CDB_CAPACITY_MARGIN_BYTES') };
+}
+
 // ─── CLI ───
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
@@ -198,19 +785,29 @@ if (isMain) {
   if (!/^postgres(ql)?:\/\//.test(url)) { console.error('--url は postgres:// で始まる接続文字列'); process.exit(2); }
   const to = getArg('--to');
   if (to && !/^\d{4}$/.test(to)) { console.error('--to は 4 桁の番号'); process.exit(2); }
+  const dir = getArg('--dir') ? path.resolve(getArg('--dir')) : DEFAULT_DIR;
+  const expectOf = getArg('--index-expect');
+  if (args.includes('--index-expect') && !/^\d{4}$/.test(expectOf || '')) { console.error('--index-expect は 4 桁の番号'); process.exit(2); }
   (async () => {
     const client = await openPgClient(url);
+    client.on('error', () => {});   // 落ちた接続の誤りは query の失敗として受ける
     const db = pgAdapter(client);
     try {
       if (args.includes('--list')) {
-        for (const s of await migrationStatus(db)) console.log(`${s.version} ${s.state.padEnd(8)} ${s.name}${s.applied_at ? `  (${new Date(s.applied_at).toISOString()} by ${s.applied_by})` : ''}`);
+        for (const s of await migrationStatus(db, { dir })) console.log(`${s.version} ${s.state.padEnd(8)} ${s.name}${s.concurrentIndex ? ' [concurrent-index]' : ''}${s.applied_at ? `  (${new Date(s.applied_at).toISOString()} by ${s.applied_by})` : ''}`);
         return 0;
       }
-      const r = await applyMigrations(db, { to, dryRun: args.includes('--dry-run') });
+      if (expectOf) {
+        const f = listMigrationFiles(dir).find((x) => x.version === expectOf);
+        if (!f) { console.error(`${expectOf} のファイルが無い`); return 2; }
+        console.log(JSON.stringify(await buildIndexExpect(db, f, dir), null, 2));
+        return 0;
+      }
+      const r = await applyMigrations(db, { dir, to, dryRun: args.includes('--dry-run'), disk: diskFromEnv(), lockLog: (m) => console.log(`[company-db] ${m}`) });
       console.log(`[company-db] applied=${r.applied.length} skipped=${r.skipped.length} pending=${r.pending.length}`);
       return 0;
     } finally {
-      await client.end();
+      await client.end().catch(() => {});
     }
-  })().then((c) => process.exit(c)).catch((e) => { console.error(`[company-db] FAILED: ${e.message}`); process.exit(1); });
+  })().then((c) => process.exit(c)).catch((e) => { console.error(`[company-db] FAILED${e.code ? ` (${e.code})` : ''}: ${e.message}`); process.exit(1); });
 }
