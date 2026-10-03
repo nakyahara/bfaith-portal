@@ -26,6 +26,7 @@ const S = await import('../apps/logizard-import-state/store.js');
 const G = await import('../tools/logizard-automation/import-guard.js');
 const TP = await import('../apps/master-decisions/lz-import-test-plan.mjs');
 const { LZ_SHOHIN } = await import('../apps/master-decisions/lz-cdb.mjs');
+const VF = await import('../apps/master-decisions/lz-import-verify.mjs');
 const { writeEvidence } = await import('../apps/company-db/push/evidence.mjs');
 
 let passed = 0;
@@ -705,7 +706,14 @@ await ta('[24] 止まった状態でも同じ回の鍵が生きている (前の
  * 偽物のロジザード (9/30 の実機の動き): 取込 = 商品名・検索名称 (ふりがな)・仕入単価 (文字のまま)・商品予備項目００３ を CSV のとおりに・
  * 変更日時とインポート日時を取込の時刻 (14 桁) に (値が同じ商品も)・登録日時は変えない。結果の文 = 総件数 = 処理件数 (処理不要 0)
  */
+// 見張りの商品 (毎晩の K4): 本物と同じく書き出しの最後に置く (over.noSentinel = 見張りがまだ登録されていない)。書き出しは本物と同じく商品ID の順 (バイト順)
+// 切れの再現 (本物の書き出しは行の間に改行・末尾に改行なし = 行の切れ目の「改行の前」で切れると末尾の改行の確かめでは分からない):
+//   cutBarcodeTail = { pre?: n, post?: n } = その書き出しの後ろの n 行を落とす / lastTwo = 最後の本物の商品にバーコード 2 本
+//   execAddLast / execRemoveLast / execReplaceLast = 取込で最後の本物の商品のバーコードを足す / 消す / 置き換える / postExtraAfterSentinel = 直後に見張りより後ろの商品が出る
 function realLikeLz({ over = {}, ids = ['A-1', 'B-2', 'C-3'], same = {}, now = null } = {}) {
+  const SENT = VF.LZ_SENTINEL_ID;
+  const realIds = ids;
+  ids = over.noSentinel ? [...ids] : [...ids, SENT];
   const H = LZ_SHOHIN.header, col = (n) => H.indexOf(n);
   const cells = (id) => {
     const c = H.map((h) => `${h}-${id}`);
@@ -714,7 +722,16 @@ function realLikeLz({ over = {}, ids = ['A-1', 'B-2', 'C-3'], same = {}, now = n
     if (same[id]) { const [n, f, p, s] = same[id]; Object.assign(c, { [col('商品名')]: n, [col('検索名称')]: f, [col('仕入単価')]: p, [col('商品予備項目００３')]: s }); }
     return c;
   };
-  const st = { lz: new Map(ids.map((id) => [id, cells(id)])), bc: ids.map((id, i) => [id, id.toLowerCase(), String(4900000000000 + i)]), calls: [] };
+  const st = { lz: new Map(ids.map((id) => [id, cells(id)])), bc: ids.map((id, i) => [id, id.toLowerCase(), id === SENT ? VF.LZ_SENTINEL_BARCODE : String(4900000000000 + i)]), calls: [] };
+  const lastReal = realIds[realIds.length - 1];
+  if (over.lastTwo) st.bc.splice(st.bc.findIndex((r) => r[0] === lastReal) + 1, 0, [lastReal, lastReal.toLowerCase(), '4900000000500']);
+  // 書き出しの並び: 本物と同じ商品ID のバイト順 / over.disorderAfterSentinel = 並びの前提が崩れた (見張りの後ろに置く商品 ID の一覧・{ pre, post } で片側だけ)
+  if (over.sentinelBarcode0) st.bc.find((r) => r[0] === SENT)[2] = over.sentinelBarcode0;   // 前から見張りのバーコードが違う
+  const byteSort0 = (rows, key) => [...rows].sort((a, b) => Buffer.compare(Buffer.from(key(a)), Buffer.from(key(b))));
+  const byteSort = (rows, key) => { const s0 = byteSort0(rows, key); const dl = over.disorderAfterSentinel; const late = new Set(Array.isArray(dl) ? dl : (dl && dl[phase()]) || []); return [...s0.filter((r) => !late.has(key(r))), ...s0.filter((r) => late.has(key(r)))]; };
+  const cutShohin = (rows) => { const n = over.cutShohinTail && over.cutShohinTail[phase()]; return n ? rows.slice(0, rows.length - n) : rows; };
+  const phase = () => (st.calls.includes('execute') ? 'post' : 'pre');
+  const cutTail = (rows) => { const n = over.cutBarcodeTail && over.cutBarcodeTail[phase()]; return n ? rows.slice(0, rows.length - n) : rows; };
   // 印 = ロジザードの取込の時刻 (JST 14 桁)。Render の時刻 (now) があればそこから・商品ごとに秒が進む (長い取込)
   const V = { jstStamp: (ms) => new Date(Number(ms) + 9 * 3600 * 1000).toISOString().replace(/[-:T]/g, '').slice(0, 14) };
   const stampOf = (i) => (now ? V.jstStamp(now() + (over.stampOffsetMs ?? 5000) + Math.floor(i / 50) * 1000) : '20300117002130');   // stampOffsetMs = 窓の外の印 (別の時刻の取込)
@@ -723,9 +740,9 @@ function realLikeLz({ over = {}, ids = ['A-1', 'B-2', 'C-3'], same = {}, now = n
     exportShohin: async () => {
       st.calls.push('exportShohin'); exported++;
       if (over.postShohinFailsOnce && st.calls.includes('execute') && !st.failedOnce) { st.failedOnce = true; throw new Error('書き出しに失敗 (通信)'); }
-      return { buf: csvBuf(H, [...st.lz.values()]) };
+      return { buf: csvBuf(H, cutShohin(byteSort([...st.lz.values()], (c) => c[col('商品ID')]))) };
     },
-    exportBarcodes: async () => { st.calls.push('exportBarcodes'); return { buf: csvBuf(['商品ID', '商品名', 'バーコード'], st.bc) }; },
+    exportBarcodes: async () => { const ph = phase(); st.calls.push('exportBarcodes'); void ph; return { buf: csvBuf(['商品ID', '商品名', 'バーコード'], cutTail(byteSort(st.bc, (r) => r[0]))) }; },
     previewImport: async (p) => { st.calls.push('preview'); st.previewed = p; return { previewed: true }; },
     executeImport: async ({ guard, onExecuteIssued }) => {
       guard.check('実行ボタン');
@@ -742,6 +759,11 @@ function realLikeLz({ over = {}, ids = ['A-1', 'B-2', 'C-3'], same = {}, now = n
         c[col('変更日時')] = s; c[col('インポート日時')] = over.importStampLag && i === rows.length - 1 ? stampOf(i + 60) : s;
       });
       if (over.touchBarcode) st.bc[0][2] = '4900000000999';
+      if (over.execAddLast) st.bc.push([lastReal, lastReal.toLowerCase(), '4900000000777']);
+      if (over.execRemoveLast) st.bc.splice(st.bc.findIndex((r) => r[2] === '4900000000500'), 1);
+      if (over.execReplaceLast) st.bc.find((r) => r[2] === '4900000000500')[2] = '4900000000501';
+      if (over.execSentinelBarcode) st.bc.find((r) => r[0] === SENT)[2] = over.execSentinelBarcode;   // 見張りのバーコードが変わった
+      if (over.postExtraAfterSentinel) { st.lz.set(`${SENT}z`, cells(`${SENT}z`)); st.bc.push([`${SENT}z`, 'x', '4900000000888']); }
       return { executeIssued: true, confirm: 'clicked', reason: null, resultText: `インポート結果 総件数 : ${rows.length} 処理件数 : ${rows.length} 処理不要件数 : 0 エラー件数 : 0` };
     },
   };
@@ -972,6 +994,128 @@ await ta('[32] 取込の時刻の窓は、ポータルに結果の状態 (import
   assert.equal(r.result, 'verified');
   assert.deepEqual(seen[0], ['imported_unverified', true, true], '結果の状態を書く時点で窓が記録にある');
   assert.ok(seen.every((s) => s[1]), JSON.stringify(seen));
+});
+
+await ta('[33] 見張りの商品 (K4・2026-10-03 00:20 の本番の最初の夜に書き出しの最後の商品 zuko5 が CSV にあって押せなかった): 書き出しの最後の本物の商品が CSV にある夜 / 無い夜 / 入れ替わる夜 = verified / 見張りが無い・CSV に見張り = 押さない / 試験の決まりは見張りなし', async () => {
+  const SENT = VF.LZ_SENTINEL_ID;
+  assert.deepEqual([E.POLICIES.test.sentinel, E.POLICIES.nightly.sentinel], [null, SENT]);
+  const night = async ({ ids, over = {}, rows } = {}) => {
+    const p = portal();
+    if (rows) { const buf = csvBuf(['形式/型番', '商品名', 'ふりがな', '仕入単価', '取引先id'], rows); p.putArtifact({ csvBuf: buf, sha256: sha(buf), rows: rows.length }); } else p.putArtifact();
+    const d = setupData(rows ? { rows } : {});
+    const lz = realLikeLz({ ids, over, now: () => p.clock.now });
+    const r = await N.runNightly(e2eOpts(p, d, lz).o);
+    return { p, d, lz, r, st: S.getStatus(p.db, { now: p.clock.now }) };
+  };
+  // 書き出しの最後の本物の商品 (B-2) が CSV にある夜 (本番の zuko5 と同じ) = 見張りが後ろにある = verified
+  let x = await night({ ids: ['A-1', 'B-2'] });
+  assert.deepEqual([x.r.result, x.st.state, x.r.ping], ['verified', 'verified', 'ok']);
+  // 最後の本物の商品 (C-3) が CSV に無い夜 = verified
+  x = await night({ ids: ['A-1', 'B-2', 'C-3'] });
+  assert.deepEqual([x.r.result, x.st.state], ['verified', 'verified']);
+  // 入れ替わる夜 (昼に商品が増えて最後の本物の商品が変わる: B-2 → Y-9 → B-2) = どの夜も verified (見張りが最後なら、最後の本物の商品は関係ない)
+  for (const ids of [['A-1', 'B-2'], ['A-1', 'B-2', 'Y-9'], ['A-1', 'B-2']]) { x = await night({ ids }); assert.equal(x.r.result, 'verified', ids.join(',')); }
+  // 見張りがまだ登録されていない = 押さない (ロジザードに何も書かない・状態は動かない)
+  x = await night({ ids: ['A-1', 'B-2'], over: { noSentinel: true } });
+  assert.deepEqual([x.r.result, x.st.state, x.lz.st.calls.includes('preview'), x.lz.st.calls.includes('execute')], ['not_started', 'idle', false, false]);
+  const rec = JSON.parse(fs.readFileSync(path.join(x.d, 'lz-import', 'runs', fs.readdirSync(path.join(x.d, 'lz-import', 'runs'))[0], 'import.json'), 'utf8'));
+  assert.match(rec.error, new RegExp(`見張りの商品 ${SENT} がロジザードの書き出しに無い \\(見張りの商品の登録が要る\\)`));
+  // 取り込む CSV に見張り (Company DB に見張りが入った) = 押さない
+  x = await night({ ids: ['A-1', 'B-2'], rows: [...DAILY, [SENT, '見張り', '見張り', '0', '0001']] });
+  assert.deepEqual([x.r.result, x.lz.st.calls.includes('execute')], ['not_started', false]);
+});
+
+await ta('[34] 見張りの商品 (Codex #1595 R1 Medium・Low): 最後の本物の商品の行の切れ目 (改行の前) で切れた書き出し = 見張りが最後に無い = 前なら押さない・後なら verify_failed (片側切れ + 追加 / 片側切れ + 削除 / 両側同じ所で切れ + 置き換え / 見張りより後ろの商品) / 確かめのやり直しも同じ', async () => {
+  const run = async (over) => {
+    const p = portal();
+    p.putArtifact();
+    const d = setupData();
+    const lz = realLikeLz({ ids: ['A-1', 'B-2'], over: { lastTwo: true, ...over }, now: () => p.clock.now });
+    const r = await N.runNightly(e2eOpts(p, d, lz).o);
+    return { p, d, lz, r, st: S.getStatus(p.db, { now: p.clock.now }) };
+  };
+  const kinds = (x) => JSON.parse(fs.readFileSync(path.join(N.nightlyRunDir(x.d, x.r.runId), 'verify.json'), 'utf8')).barcode.diffs.map((d) => d.kind);
+  // 切れの無い夜 (最後の本物の商品にバーコード 2 本) = verified
+  let x = await run({});
+  assert.equal(x.r.result, 'verified');
+  // 片側 (後) だけ切れ + 取込で最後の本物の商品にバーコードが増えた: 後の書き出しは増えた行の前で切れる (後ろの 2 行 = 増えた行と見張りが落ちる) = 前後の B-2 は同じに見えるが、見張りが最後に無い = verify_failed
+  x = await run({ execAddLast: true, cutBarcodeTail: { post: 2 } });
+  assert.deepEqual([x.r.result, x.st.state, x.r.ping], ['verify_failed', 'verify_failed', null]);
+  assert.ok(kinds(x).includes('sentinel_not_last_barcode_post'), kinds(x).join(','));
+  // 片側 (前) だけ切れ + 取込で削除: 前の書き出しが 2 本目の前で切れる = 押す前に止まる (ロジザードに書かない)
+  x = await run({ execRemoveLast: true, cutBarcodeTail: { pre: 2 } });
+  assert.deepEqual([x.r.result, x.st.state, x.lz.st.calls.includes('execute')], ['not_started', 'idle', false]);
+  // 両側が同じ所で切れ + 置き換え = 前で止まる
+  x = await run({ execReplaceLast: true, cutBarcodeTail: { pre: 2, post: 2 } });
+  assert.deepEqual([x.r.result, x.lz.st.calls.includes('execute')], ['not_started', false]);
+  // 後だけ見張りの行だけ落ちた (増減なし) でも verify_failed
+  x = await run({ cutBarcodeTail: { post: 1 } });
+  assert.equal(x.r.result, 'verify_failed');
+  assert.ok(kinds(x).includes('sentinel_not_last_barcode_post'));
+  // 直後に見張りより後ろの商品が出た (見張りが最後でない) = verify_failed
+  x = await run({ postExtraAfterSentinel: true });
+  assert.equal(x.r.result, 'verify_failed');
+  assert.ok(kinds(x).includes('sentinel_not_last_barcode_post') && kinds(x).includes('sentinel_not_last_shohin_post'), kinds(x).join(','));
+  // 確かめのやり直し (verifyAgain): 1 夜目は直後の書き出しの失敗で未確かめ → 2 夜目の書き出しが切れた = verify_failed / 切れない = verified
+  for (const [cut, want] of [[{ post: 2 }, 'verify_failed'], [null, 'verified']]) {
+    const p = portal();
+    p.putArtifact();
+    const d = setupData();
+    const ov = { lastTwo: true, postShohinFailsOnce: true };
+    const lz = realLikeLz({ ids: ['A-1', 'B-2'], over: ov, now: () => p.clock.now });
+    let r = await N.runNightly(e2eOpts(p, d, lz).o);
+    assert.equal(r.result, 'imported_unverified');
+    if (cut) ov.cutBarcodeTail = cut;   // 2 夜目の確かめの書き出し (押した後) が切れる
+    p.clock.now = NIGHT + 86400000;
+    r = await N.runNightly(e2eOpts(p, d, lz).o);
+    assert.deepEqual([r.state, r.result, S.getStatus(p.db, { now: p.clock.now }).state], ['verify_again', want, want], JSON.stringify(cut));
+    if (cut) {
+      const runDir = N.nightlyRunDir(d, r.runId);
+      const vf = fs.readdirSync(runDir).filter((n) => /^verify-.*.json$/.test(n));
+      assert.equal(vf.length, 1);
+      const vk = JSON.parse(fs.readFileSync(path.join(runDir, vf[0]), 'utf8')).barcode.diffs.map((x) => x.kind);
+      assert.ok(vk.includes('sentinel_not_last_barcode_post'), vk.join(','));
+    }
+  }
+});
+
+await ta('[35] 並びの前提の崩れ・見張りのバーコード (Codex #1597 R1): 崩れが見える = 前なら押さない・後なら verify_failed / 崩れ + 見張りの直後で切れた (比べる商品が隠れる) = precheck・verifyImport が止める / 見張りのバーコードが変わった = verify_failed', async () => {
+  const run = async (over, ids = ['A-1', 'B-2']) => {
+    const p = portal();
+    p.putArtifact();
+    const d = setupData();
+    const lz = realLikeLz({ ids, over, now: () => p.clock.now });
+    const r = await N.runNightly(e2eOpts(p, d, lz).o);
+    const runDir = r.runId ? N.nightlyRunDir(d, r.runId) : null;
+    const vpath = runDir && path.join(runDir, 'verify.json');
+    const v = vpath && fs.existsSync(vpath) ? JSON.parse(fs.readFileSync(vpath, 'utf8')) : null;
+    const rec = runDir ? JSON.parse(fs.readFileSync(path.join(runDir, 'import.json'), 'utf8')) : null;
+    return { r, lz, v, rec, st: S.getStatus(p.db, { now: p.clock.now }) };
+  };
+  // 崩れが見える (前の書き出しから): 見張りの後ろに B-2 = 押さない
+  let x = await run({ disorderAfterSentinel: ['B-2'] });
+  assert.deepEqual([x.r.result, x.lz.st.calls.includes('execute')], ['not_started', false]);
+  assert.match(x.rec.error, /sentinel_not_last_shohin_pre.*order_broken_shohin_pre|order_broken/);
+  // 崩れ + 見張りの直後で切れた (実体 [A-1, 見張り, B-2] → 見える [A-1, 見張り]): 比べる商品 B-2 が直前の一覧に無い = precheck (L-7) が押さない
+  x = await run({ disorderAfterSentinel: ['B-2'], cutShohinTail: { pre: 1 }, cutBarcodeTail: { pre: 1 } });
+  assert.deepEqual([x.r.result, x.lz.st.calls.includes('execute')], ['not_started', false]);
+  assert.match(x.rec.error, /CSV の商品がロジザードに無い/);
+  // 直後だけ崩れ + 見張りの直後で切れた: B-2 が直後の一覧に無い = verifyImport の差 = verify_failed
+  x = await run({ disorderAfterSentinel: { post: ['B-2'] }, cutShohinTail: { post: 1 }, cutBarcodeTail: { post: 1 } });
+  assert.equal(x.r.result, 'verify_failed');
+  // 直後の並びの崩れだけ (切れなし) = verify_failed (order_broken_*_post)
+  x = await run({ disorderAfterSentinel: { post: ['A-1'] } });
+  assert.equal(x.r.result, 'verify_failed');
+  const vk = x.v.barcode.diffs.map((y) => y.kind);
+  assert.ok(vk.includes('order_broken_barcode_post') && vk.includes('order_broken_shohin_post'), vk.join(','));
+  // 見張りのバーコードが取込で変わった = verify_failed / 前から違う = 押さない
+  x = await run({ execSentinelBarcode: 'LZGUARD0002' });
+  assert.deepEqual([x.r.result, x.v.barcode.diffs.map((y) => y.kind)], ['verify_failed', ['sentinel_barcode_post']]);
+  x = await run({ sentinelBarcode0: 'LZGUARD0002' });
+  assert.deepEqual([x.r.result, x.lz.st.calls.includes('execute')], ['not_started', false]);
+  assert.match(x.rec.error, /sentinel_barcode_pre/);
+  x = await run({});
+  assert.equal(x.r.result, 'verified');
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

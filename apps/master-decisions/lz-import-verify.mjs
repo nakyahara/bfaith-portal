@@ -62,6 +62,55 @@ export const RULES_2B2 = Object.freeze({
  */
 export const RULES_NIGHTLY = RULES_2B2;
 
+/**
+ * 見張りの商品 (毎晩の取込の K4。2026-10-03 00:20 の本番の最初の夜に、書き出しの最後の商品 zuko5 が CSV にあって押せなかった)。
+ * ロジザードにだけ登録する商品 (Company DB・NE には無い = 取り込む CSV に入らない)・バーコード 1 本・商品ID の順 (バイト順) で全商品の最後に来る ID。
+ * 商品マスタとバーコードの書き出しの前後すべてで、この商品が最後の行 = その前の全商品の行がそろっている (後ろから切れていない) と言える
+ * = 取り込む全商品が「後ろに別の商品の行がある商品」になり、K4 (比べる商品が最後の商品なら確かめられない) を弱めずに毎晩押せる。
+ * 変える = ロジザードの登録を変えるのと同時に、ここ 1 か所だけ。
+ */
+export const LZ_SENTINEL_ID = 'zzzzzzzzzz';
+/** 見張りの商品のバーコード (1 本だけ・今あるどれとも重ならない英数字・8 / 13 桁の数字にしない = Company DB の JAN のロードに入らない。入荷検品のバーコードマスタには fnsku として入るが、mirror_products に無いので検索・表示の対象外)。ロジザードには必ずこの値を登録する。ID と同じく、ここ 1 か所 */
+export const LZ_SENTINEL_BARCODE = 'LZGUARD0001';
+
+/**
+ * 商品ID のかたまりが、書き出しの行の順に CP932 のバイト順で厳密に増えていくか (本物の書き出しの順。2026-10-03 の商品マスタ 5,085 行・バーコード 5,203 行で確かめた)。
+ * 同じ ID の 2 つ目のかたまり・順の崩れ = false (見張りが最後にあっても、順の前提が崩れた夜は「その前の全商品がそろっている」と言えない。Codex #1597 R1 Medium)
+ * @param {Buffer[]} idBytes  かたまりごとの商品ID の生のバイト (行の順)
+ */
+export function idsAscending(idBytes) {
+  for (let i = 1; i < idBytes.length; i++) if (Buffer.compare(idBytes[i - 1], idBytes[i]) >= 0) return false;
+  return true;
+}
+
+/**
+ * 見張りの商品の確かめ (side = pre / post)。shohin = readLzShohinMaster (ok)・barcode = readBarcodeExport (ok)。渡さない側は見ない。
+ *   - 最後の行が見張り (sentinel_not_last_*)
+ *   - 商品ID のかたまりがバイト順で厳密に増えていく (order_broken_*。同じ ID の 2 つ目のかたまりも)
+ *   - 見張りのバーコードが sentinelBarcode の 1 本だけ・ほかの商品に同じバーコードが無い (sentinel_barcode_* / sentinel_barcode_shared_*)
+ * @returns {Array<{ id, kind: string, last?: string|null, present?: boolean, got?: string[], others?: string[] }>}  present = その書き出しに見張りがあるか
+ */
+export function sentinelDiffs({ sentinel, side, shohin = null, barcode = null, sentinelBarcode = LZ_SENTINEL_BARCODE }) {
+  const diffs = [];
+  if (shohin) {
+    let last = null;
+    const raw = [];
+    for (const [id, v] of shohin.byId) { last = id; raw.push(v.raw[LZ_SHOHIN.cols.id]); }   // 書き出しの行の順 (readLzShohinMaster は重複を断る = Map の順 = 行の順)
+    if (last !== sentinel) diffs.push({ id: sentinel, kind: `sentinel_not_last_shohin_${side}`, last, present: shohin.byId.has(sentinel) });
+    if (!idsAscending(raw)) diffs.push({ id: null, kind: `order_broken_shohin_${side}` });
+  }
+  if (barcode) {
+    if (barcode.lastId !== sentinel) diffs.push({ id: sentinel, kind: `sentinel_not_last_barcode_${side}`, last: barcode.lastId ?? null, present: barcode.byId.has(sentinel) });
+    if (barcode.ordered !== true) diffs.push({ id: null, kind: `order_broken_barcode_${side}` });
+    const got = barcode.byId.get(sentinel) || [];
+    if (barcode.byId.has(sentinel) && !(got.length === 1 && got[0] === sentinelBarcode)) diffs.push({ id: sentinel, kind: `sentinel_barcode_${side}`, got: got.slice(0, 10) });
+    const others = [];
+    for (const [id, list] of barcode.byId) if (id !== sentinel && list.includes(sentinelBarcode)) others.push(id);
+    if (others.length) diffs.push({ id: sentinel, kind: `sentinel_barcode_shared_${side}`, others: others.slice(0, 10) });
+  }
+  return diffs;
+}
+
 /** 取込の時刻の印 (ロジザードの 変更日時・インポート日時 = YYYYMMDDHHMMSS の 14 桁・JST。2026-09-30 の実機) */
 const STAMP_RE = /^\d{14}$/;
 /** 実在する JST の日時の 14 桁か (2030-02-30・25 時などは違う) */
@@ -205,8 +254,10 @@ export function readBarcodeExport(buf) {
   if (body.some((r) => r.length !== header.length)) return bad('barcode_row_width');
   const byId = new Map();
   let grouped = true, prev = null;   // 商品ごとの行がひとまとまりか (本物の書き出しは商品ID の順 = ひとまとまり。9/29)
-  for (const r of body) {
+  const blockBytes = [];   // かたまりごとの商品ID の生のバイト (CP932・行の順) = ordered (バイト順で厳密に増えていく。Codex #1597 R1 Medium)
+  for (const [k, r] of body.entries()) {
     const id = r[idIdx];
+    if (id !== prev) blockBytes.push(Buffer.from(P.records[k + 1].cells[idIdx]));
     if (id !== prev && byId.has(id)) grouped = false;
     prev = id;
     if (!byId.has(id)) byId.set(id, []);
@@ -214,7 +265,7 @@ export function readBarcodeExport(buf) {
   }
   for (const list of byId.values()) list.sort();
   // lastId = 最後の行の商品 (途中で切れるのは後ろから = ひとまとまりなら、後ろに別の商品の行がある商品の行は全部そろっている。Codex #1530 R3 High)
-  return { ok: true, reason: null, header, rows: body.length, byId, grouped, lastId: prev };
+  return { ok: true, reason: null, header, rows: body.length, byId, grouped, lastId: prev, ordered: idsAscending(blockBytes) };
 }
 
 /** 商品マスタ (readLzShohinMaster) にあってバーコードの書き出しに無い商品ID (途中で切れた疑い) */
@@ -228,7 +279,7 @@ export function barcodeMissing(lz, bc) {
   return [...lz.byId.keys()].filter((id) => !bc.byId.has(id));
 }
 
-export function compareBarcodes({ pre, post, ids, cover = null }) {
+export function compareBarcodes({ pre, post, ids, cover = null, sentinel = null, sentinelBarcode = LZ_SENTINEL_BARCODE }) {
   if (!pre || !pre.ok || !post || !post.ok) throw new Error('バーコードの前と後 (ok) が要る');
   const diffs = [];
   const pos = (h) => [h.indexOf('商品ID'), h.indexOf('バーコード')].join(',');
@@ -245,6 +296,12 @@ export function compareBarcodes({ pre, post, ids, cover = null }) {
       if (x.grouped === false) diffs.push({ id: null, kind: `barcode_not_grouped_${side}` });
       for (const id of new Set(ids)) if (x.lastId === id) diffs.push({ id, kind: `target_is_last_${side}` });
     }
+  }
+  // 見張りの商品 (毎晩): 前後のバーコードと商品マスタ (cover) の最後の行が見張り・見張りは比べる商品でない。
+  // 片側だけ最後の商品の途中で切れた (+ 増えた / 消えた が隠れる)・両側が同じ所で切れた、のどれも見張りが最後に無い = 差 (Codex #1595 R1 Medium)
+  if (sentinel) {
+    if (new Set(ids).has(sentinel)) diffs.push({ id: sentinel, kind: 'sentinel_is_target' });
+    for (const [side, x] of [['pre', pre], ['post', post]]) diffs.push(...sentinelDiffs({ sentinel, sentinelBarcode, side, barcode: x, shohin: cover && cover[side] ? cover[side] : null }));
   }
   if (post.rows < pre.rows) diffs.push({ id: null, kind: 'rows_decreased', pre: pre.rows, post: post.rows });
   for (const id of new Set(ids)) {
