@@ -283,8 +283,29 @@ console.log('⑩ 素材画像 — 何番が素材かを Claude に伝え、検�
   ok(rdM.code === 0 && rdM.out.includes('うち素材 2 枚'), `検品の材料① に素材の枚数 (${rdM.out.split('\n').find((l) => l.includes('画像:'))})`);
   ok(rdM.out.includes('[素材の一覧 (n = img-ID-n.jpg)]') && rdM.out.includes('2: 素材/使用イメージ/玄関.jpg') && rdM.out.includes('3: 素材/パーツ.png'),
     '🚨 検品の材料① に素材の一覧 (使用素材に無い素材を書いていないかを見るため)');
+  ok(String(clM.json.packet.image_guide || '').includes('2枚目: 素材画像 (素材1・素材/使用イメージ/玄関.jpg)'),
+    '🚨 claim に添付画像の説明 (スタッフの ChatGPT 版と同じ文) が出る');
   eq((await phlp('release', mid, '--reason', '試験の片付け')).code, 0, '片付け (予約前なので手放せる)');
   await phlp('clean', mid);
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?`).run(reqM.job.id);   // 次の claim が拾わないように
+
+  // 商品 6 + 素材 10 = 16 枚の依頼: 新しい phlp は 16 枚と言って掴み、16 枚を落としにいく (codex #1593 Low)
+  const d16 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('LP-RUN-16', 'ハッカ油スプレー 16', 'test')`).run().lastInsertRowid);
+  const r16 = lp.requestJob(db, {
+    draft: db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(d16), spec, productInfo: '天然ハッカ油。', colorVariations: '',
+    images: [
+      ...Array.from({ length: 6 }, (_, i) => ({ file_id: 'FILEIDP16X0' + i, role: i === 0 ? 'white_bg' : 'slot:' + i })),
+      ...Array.from({ length: 10 }, (_, i) => ({ file_id: 'FILEIDM16X' + String(i).padStart(2, '0'), role: 'material', folder: '素材', name: `m${i}.jpg` })),
+    ],
+    idempotencyKey: 'runner-test-16-1', actor: 'nakahara@x',
+  });
+  ok(r16.ok && JSON.parse(r16.job.packet_json).images.length === 16, '16 枚の依頼を受け付けた');
+  const cl16 = await phlpWith({ PH_LP_RUN_ID: 'lpr-20261003-090100-sixtee' }, 'claim', '--run', 'lp-test-16');
+  eq(cl16.json.job_id, r16.job.id, '🚨 新しい phlp (16 枚と言う) は 16 枚の依頼を掴む');
+  const im16 = await phlp('images', String(r16.job.id));
+  eq(im16.json?.expected, 16, '🚨 16 枚を落としにいく (6 枚で止めない・この試験は Drive が無いので 1 枚目で失敗する)');
+  await phlp('release', String(r16.job.id), '--reason', '試験の片付け');
+  await phlp('clean', String(r16.job.id));
 }
 
 server.close();

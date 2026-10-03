@@ -1613,6 +1613,19 @@ th.attr-unknown { color: #dc2626; }
             <%# AI に渡す (渡した) 画像の並び。測定で比べるときはスタッフ版 (ChatGPT) にも同じ画像を同じ順に添付する
                 (codex #1592 High: 同じ材料から作った 2 つを比べるのが測定の前提) %>
             <div class="muted" id="lpc-images" style="font-size:11px; margin-top:2px;"></div>
+            <%# 添付画像の説明 = AI に渡したのと同じ文。くらべっこ (測定) を公平にするため、スタッフの ChatGPT 版にも貼る
+                (codex #1593 High・中原さん 2026-10-03「A」) %>
+            <div id="lpc-guide" hidden style="margin-top:6px; background:#fff; border:1px dashed #cbd5e1; border-radius:8px; padding:6px 8px;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <strong style="font-size:12px;">ChatGPT 版に貼る文 (添付画像の説明)</strong>
+                <button type="button" class="btn btn-sm" id="lpc-guide-copy">コピー</button>
+                <span class="muted" id="lpc-guide-result" style="font-size:12px;"></span>
+              </div>
+              <div class="muted" style="font-size:11px; margin:2px 0 4px;">
+                くらべるとき: 「📝 商品分析を準備」の文の最後にこれを貼り、画像をこの順に添付してください (AI にも同じ文を渡しています)
+              </div>
+              <textarea id="lpc-guide-text" rows="6" readonly style="width:100%; font-size:12px;"></textarea>
+            </div>
             <%# 🚨 失敗したときの説明はここ。lint の中身 (lpc-lint) は「できた」ときの箱の中にあるので、
                 失敗したときは見えない (codex exec review P2) %>
             <div id="lpc-fail" hidden class="muted" style="font-size:11px; margin-top:4px; color:#b45309;"></div>
@@ -5816,6 +5829,8 @@ th.attr-unknown { color: #dc2626; }
     const failEl = document.getElementById('lpc-fail');
     const measEl = document.getElementById('lpc-meas');
     const imagesEl = document.getElementById('lpc-images');
+    const guideEl = document.getElementById('lpc-guide');
+    const guideTextEl = document.getElementById('lpc-guide-text');
 
     const RUNNING = ['queued', 'running'];
     let timer = null;
@@ -5876,7 +5891,7 @@ th.attr-unknown { color: #dc2626; }
           + (s.materials_folder ? ' + 素材 (画像フォルダの下のフォルダから最大 10 枚・押したときに読む)' : ''));
       }
       if (!lines.length) return '';
-      return lines.join('\n') + '\n— 測定で比べるときは「📝 商品分析を準備」の ChatGPT 版にも、その依頼で AI に渡した画像を同じ順に添付してください';
+      return lines.join('\n') + '\n— くらべるときは「📝 商品分析を準備」の ChatGPT 版にも、その依頼で AI に渡した画像を同じ順に添付し、下の「ChatGPT 版に貼る文」を貼ってください';
     }
     // lpc-images-text:end
 
@@ -5892,6 +5907,9 @@ th.attr-unknown { color: #dc2626; }
       btn.textContent = running ? '🤖 AI' + ml + ' が作っています…' : '🤖 構成をAIに作らせる' + ml;
 
       imagesEl.textContent = lpcImagesText(s, running || checkingModel(job));
+      const guide = job && typeof job.image_guide === 'string' ? job.image_guide : '';
+      guideEl.hidden = !guide;
+      if (guide && guideTextEl.value !== guide) guideTextEl.value = guide;
       imagesEl.style.whiteSpace = 'pre-wrap';
 
       specEl.textContent = s.spec
@@ -6012,6 +6030,11 @@ th.attr-unknown { color: #dc2626; }
       }
     });
 
+    document.getElementById('lpc-guide-copy').addEventListener('click', async () => {
+      const r = document.getElementById('lpc-guide-result');
+      try { await navigator.clipboard.writeText(guideTextEl.value); r.textContent = 'コピーしました。ChatGPT 版の定型文の最後に貼ってください'; }
+      catch (e) { guideTextEl.select(); r.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }
+    });
     document.getElementById('lpc-copy').addEventListener('click', async () => {
       try { await navigator.clipboard.writeText(textEl.value); copyResultEl.textContent = 'コピーしました。lp-tool に貼ってください'; }
       catch (e) { textEl.select(); copyResultEl.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }

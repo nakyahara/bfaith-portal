@@ -674,6 +674,61 @@ console.log('⑭ 素材画像 = 画像フォルダの下のフォルダの画像
   const dM2 = mkDraft('MAT-2', 'ハッカ油スプレー MAT2');
   eq(lp.requestJob(db, args(dM2, lp.latestSpec(db), 'key-mat-2', { now: min(4001), images: materials })).code, 'not_ready',
     '🚨 素材だけで商品画像が無ければ受け付けない (商品を再現できない)');
+
+  // 添付画像の説明 = AI にもスタッフにも同じ文 (くらべっこを公平にする・codex #1593 High・中原さん「A」)
+  const g = pM.image_guide;
+  ok(typeof g === 'string' && g.startsWith('【添付画像の説明】'), 'packet に添付画像の説明が入る (受付時に固定・hash で守られる)');
+  ok(g.includes('1枚目: 商品画像 (白抜き)') && g.includes('2枚目: 商品画像 (1 TOP)'), '何枚目が商品画像か');
+  ok(g.includes('7枚目: 素材画像 (素材1・素材/m0.jpg)') && g.includes('16枚目: 素材画像 (素材10・'), '何枚目が素材か (場所と名前つき)');
+  ok(g.includes('「使用素材」') && g.includes('上の一覧に無い素材を作ったり'), '素材の使い方の決まりが入る');
+  ok(g.includes('ほかに 2 枚ありましたが添付していません'), '入らなかった素材の数');
+  eq(lp.jobStateFor(db, dM.id, { now: min(4000.5) }).job.image_guide, g, '🚨 画面 (スタッフのコピー用) にも同じ文が渡る');
+  const g0 = lp.buildImageGuide([{ file_id: 'X', role: 'white_bg' }]);
+  ok(g0.includes('1枚目: 商品画像 (白抜き)') && g0.includes('素材画像はありません') && !g0.includes('使用素材'), '素材が無ければ素材の決まりは書かない');
+  eq(lp.buildImageGuide([]), '', '画像が無ければ空');
+
+  // 実行役が落とせる枚数 (codex #1593 Medium): 言わない古い phlp (6 枚まで) には 16 枚の依頼を掴ませない
+  const cOld = lp.claimJob(db, { runnerRunId: 'run-old-phlp', now: min(4000.6) });
+  ok(!cOld.job || cOld.job.job_id !== rM.job.id, '🚨 枚数を言わない実行役は 16 枚の依頼を掴まない');
+  if (cOld.job) lp.releaseJob(db, cOld.job.job_id, { leaseToken: cOld.job.lease_token, now: min(4000.65) });
+  const cOld2 = lp.claimJob(db, { runnerRunId: 'run-old-phlp', maxImages: 6, now: min(4000.7) });
+  ok(!cOld2.job || cOld2.job.job_id !== rM.job.id, '6 枚と言う実行役も掴まない');
+  if (cOld2.job) lp.releaseJob(db, cOld2.job.job_id, { leaseToken: cOld2.job.lease_token, now: min(4000.75) });
+  eq(db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(rM.job.id).status, 'queued', '掴まれなかった依頼は queued のまま (新しい phlp が拾う)');
+  let cNew = null;
+  for (let i = 0; i < 20; i++) {
+    cNew = lp.claimJob(db, { runnerRunId: 'lpr-20261003-090000-nnnnnn', maxImages: 16, now: min(4000.8) });
+    if (!cNew.job || cNew.job.job_id === rM.job.id) break;
+    lp.releaseJob(db, cNew.job.job_id, { leaseToken: cNew.job.lease_token, now: min(4000.8) });
+    db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?`).run(cNew.job.job_id);
+  }
+  eq(cNew.job?.job_id, rM.job.id, '16 枚と言う実行役は掴む');
+
+  // 16 枚の配布 → 証跡 → accepted (codex #1593 Low)
+  const gM = lp.reserveGeneration(db, cNew.job.job_id, { leaseToken: cNew.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(4000.9) });
+  ok(gM.ok, '予約できる');
+  pM.images.forEach((im, i) => {
+    if (i < 15) lp.recordImageServed(db, cNew.job.job_id, { leaseToken: cNew.job.lease_token, fileId: im.file_id, sha256: String(i % 10).repeat(64), bytes: 10 + i, now: min(4001) });
+  });
+  const s15 = lp.submitResult(db, gM.generation_id, { packetHash: cNew.job.packet_hash, verdict: 'accepted', output: compositionFor(dM.name), lint: LINT, reviewRounds: 1, now: min(4001.1) });
+  ok(!s15.ok && /16 枚のうち 1 枚を見ていません/.test(s15.error || ''), `🚨 15 枚しか配っていなければ受け取らない (${s15.error})`);
+  const r16 = lp.recordImageServed(db, cNew.job.job_id, { leaseToken: cNew.job.lease_token, fileId: pM.images[15].file_id, sha256: 'e'.repeat(64), bytes: 99, now: min(4001.2) });
+  ok(r16.ok && r16.count === 16, '16 枚目 (素材10) の配布も記録される (6 枚で切らない)');
+  const s16 = lp.submitResult(db, gM.generation_id, { packetHash: cNew.job.packet_hash, verdict: 'accepted', output: compositionFor(dM.name), lint: LINT, reviewRounds: 1, now: min(4001.3) });
+  ok(s16.ok && s16.receipt.images.length === 16, '16 枚全部配っていれば受け取る・証跡も 16 枚');
+
+  // 先の検査 (Drive を読む前・codex #1593 Medium)
+  const dP = mkDraft('MAT-P', 'ハッカ油スプレー MATP');
+  const pre = (extra) => lp.requestPrecheck(db, { draft: dP, productInfo: 'x', spec: lp.latestSpec(db), images: [{ file_id: 'FILEIDPRE001', role: 'slot:1' }], idempotencyKey: 'key-pre-0001', now: min(4002), ...extra });
+  eq(pre(), null, '受け付けられるなら null (このあと Drive を読む)');
+  eq(pre({ idempotencyKey: 'x' }).code, 'bad_request', 'キーの形が違えば Drive を読まずに断る');
+  eq(pre({ images: [] }).code, 'not_ready', '押せない理由があれば Drive を読まずに断る');
+  ok(lp.requestJob(db, args(dP, lp.latestSpec(db), 'key-pre-0001', { now: min(4002), images: [{ file_id: 'FILEIDPRE001', role: 'slot:1' }] })).ok, '依頼する');
+  ok(pre().prior === true, '同じキーの再送は prior (Drive を読まずに前の依頼を返す)');
+  eq(pre({ idempotencyKey: 'key-pre-0002' }).code, 'already_running', '動いている依頼があれば Drive を読まずに断る');
+  process.env.PH_LP_COMPOSE_ENABLED = '0';
+  eq(pre({ idempotencyKey: 'key-pre-0003' }).code, 'disabled', '機能 OFF なら Drive を読まずに断る');
+  process.env.PH_LP_COMPOSE_ENABLED = '1';
 }
 
 console.log('⑮ 素材の一覧 (Drive の画像フォルダのサブフォルダを何階層下まで辿る)');
@@ -715,6 +770,17 @@ console.log('⑮ 素材の一覧 (Drive の画像フォルダのサブフォル�
   ok(e3 && /2 (枚|件)を超えて/.test(e3.message), `🚨 画像が多すぎれば止める (${e3?.message})`);
   let e4 = null; try { await listDriveFolderMaterialImages("x' or '1'='1", { drive: fakeDrive }); } catch (e) { e4 = e; }
   ok(e4 && /ID の形/.test(e4.message), '🚨 フォルダ ID の形を確かめる (Drive の検索式に混ぜない)');
+  // 時間・回数・ページの進み方・形のおかしい ID (codex #1593 Medium / Low)
+  let e5 = null; try { await listDriveFolderMaterialImages('ROOT00000001', { drive: fakeDrive, limits: { deadlineMs: 0 } }); } catch (e) { e5 = e; }
+  ok(e5 && /秒で読み終わりませんでした/.test(e5.message), `🚨 時間の上限で止める (${e5?.message})`);
+  let e6 = null; try { await listDriveFolderMaterialImages('ROOT00000001', { drive: fakeDrive, limits: { maxRequests: 3 } }); } catch (e) { e6 = e; }
+  ok(e6 && /3 回より多く/.test(e6.message), `🚨 呼び出し回数の上限で止める (${e6?.message})`);
+  const loopDrive = { files: { list: async () => ({ data: { files: [], nextPageToken: 'SAME' } }) } };
+  let e7 = null; try { await listDriveFolderMaterialImages('ROOT00000001', { drive: loopDrive }); } catch (e) { e7 = e; }
+  ok(e7 && /ページが進みません/.test(e7.message), `🚨 同じ次ページが続けば止める (${e7?.message})`);
+  const badIdDrive = { files: { list: async ({ q }) => ({ data: { files: q.includes("vnd.google-apps.folder") && q.includes('ROOT00000001') ? [{ id: "bad id'", name: 'x' }] : [] } }) } };
+  let e8 = null; try { await listDriveFolderMaterialImages('ROOT00000001', { drive: badIdDrive }); } catch (e) { e8 = e; }
+  ok(e8 && /形のおかしいフォルダ ID/.test(e8.message), `🚨 形のおかしい子フォルダ ID は飛ばさず止める (${e8?.message})`);
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);

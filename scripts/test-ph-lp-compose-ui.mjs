@@ -332,6 +332,29 @@ console.log('⑥c 🚨 商品画像が無ければ押す前に止める (2026-10
   ok(tM.includes('素材 (2 枚): 素材1 素材/使用イメージ/玄関.jpg / 素材2 素材/パーツ.png'), '素材は場所と名前つきで別の行');
   ok(tM.includes('⚠️ 上限 (素材 10 枚) で入らなかった素材 3 枚'), '🚨 入らなかった素材の数を出す');
   db.prepare('UPDATE product_drafts SET drive_folder_url = NULL WHERE id = ?').run(d4);
+
+  // 押せない商品は Drive を読まずに断る (Drive の鍵が無くても 502 にならず 409・codex #1593 Medium)
+  const d5 = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, drive_folder_url, created_by) VALUES ('LP-UI-5', '商品情報なし', 'https://drive.google.com/drive/folders/1MtcKdnRZPf1iqKiNxMJ1ODDPJE3vX9JR', 'test')`
+  ).run().lastInsertRowid);
+  const saved2 = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  const post5 = await fetch(`${base}/api/drafts/${d5}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0005' }),
+  });
+  eq([post5.status, (await post5.json()).code], [409, 'not_ready'], '🚨 押せない商品は Drive を読む前に断る (502 にならない)');
+  const post5b = await fetch(`${base}/api/drafts/${d5}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'x' }),
+  });
+  eq(post5b.status, 400, 'キーの形が違えば Drive を読む前に断る');
+  if (saved2 !== undefined) process.env.GOOGLE_SERVICE_ACCOUNT_KEY = saved2;
+
+  // 添付画像の説明 = AI にもスタッフにも同じ文 (くらべっこを公平にする・中原さん「A」)
+  ok(String(sj.job.image_guide || '').startsWith('【添付画像の説明】') && sj.job.image_guide.includes('1枚目: 商品画像 (白抜き)'),
+    '依頼の後は「ChatGPT 版に貼る文」が画面に渡る');
+  const htmlG = (await getDetail(d4)).html;
+  ok(htmlG.includes('id="lpc-guide"') && htmlG.includes('id="lpc-guide-copy"') && htmlG.includes('ChatGPT 版に貼る文 (添付画像の説明)'), '🚨 貼る文のコピー欄がある');
+  ok(htmlG.includes('「📝 商品分析を準備」の文の最後にこれを貼り'), 'どこに貼るかの案内がある');
 }
 
 console.log('⑦ 失敗・成否不明も画面に出る');

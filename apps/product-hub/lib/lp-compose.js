@@ -309,6 +309,37 @@ export function imagePlan(images) {
   }));
 }
 
+/**
+ * 「添付画像の説明」= **AI にもスタッフの ChatGPT にも同じ文を渡す** (codex #1593 High・中原さん 2026-10-03「A」)。
+ * 段階1 は AI とスタッフのくらべっこなので、素材の扱い方を AI にだけ教えると公平にならない。
+ * packet に入れて受付時に固定する (packet_hash で守られる)。スタッフは画面のコピーボタンで
+ * 「📝 商品分析を準備」の定型文の最後に貼り、画像をこの順に添付する。AI (スキル) もこれに従う
+ */
+export function buildImageGuide(images, materialsOmitted = 0) {
+  const imgs = Array.isArray(images) ? images : [];
+  if (!imgs.length) return '';
+  const lines = ['【添付画像の説明】', `添付した画像は次の ${imgs.length} 枚です (この順に添付しています)。`];
+  imgs.forEach((im, i) => {
+    const label = imageRoleLabel(im.role);
+    lines.push(isMaterialRole(im.role)
+      ? `${i + 1}枚目: 素材画像 (${label}・${im.folder ? im.folder + '/' : ''}${im.name || '名前なし'})`
+      : `${i + 1}枚目: 商品画像 (${label})`);
+  });
+  const hasMaterial = imgs.some((im) => isMaterialRole(im.role));
+  lines.push('', '【画像の使い方】', '- 商品画像は、商品の形・ラベル・色・容量表記を再現する手本です。');
+  if (hasMaterial) {
+    lines.push(
+      '- 素材画像は、LP の各画像で使う素材の候補です (商品の画像フォルダの中のフォルダにあった画像)。商品そのものの手本にはしないでください。',
+      '- 各画像の「使用素材」には、商品画像を使うなら「提供された実物商品画像」、素材画像を使うなら上の場所と名前 (例: 素材/使用イメージ/玄関.jpg) を書いてください。',
+      '- 上の一覧に無い素材を作ったり、ほかから持ってきたりしないでください。合う素材が無い画像は、素材を使わない構成にしてください。',
+    );
+    if (materialsOmitted > 0) lines.push(`- (素材は上限の 10 枚まで。ほかに ${materialsOmitted} 枚ありましたが添付していません)`);
+  } else {
+    lines.push('- 素材画像はありません。');
+  }
+  return lines.join('\n');
+}
+
 export function buildPacket({ draft, productInfo, colorVariations, images = [], spec }) {
   const { images: imgs, materialsOmitted } = normalizeImagesDetail(images);
   const packet = {
@@ -328,6 +359,8 @@ export function buildPacket({ draft, productInfo, colorVariations, images = [], 
     images: imgs,
     // 上限 (素材 10 枚) で入らなかった素材の数。画面に「入らなかった素材 N 枚」と出す
     materials_omitted: materialsOmitted,
+    // AI にもスタッフにも同じ文 (くらべっこを公平にする・codex #1593 High)
+    image_guide: buildImageGuide(imgs, materialsOmitted),
     spec_kind: spec.kind,
     spec_id: Number(spec.id),
     spec_hash: spec.hash,
@@ -346,6 +379,33 @@ export function requestBlockReason({ draft, productInfo, spec, images }) {
   //    呼び手は必ず images を渡す (渡し忘れ = 配列でない も「無い」と同じに扱う)
   // 素材だけでは商品の形・ラベルを再現できない (商品再現ルール)。商品画像 (白抜きか 1〜) が 1 枚は要る
   if (normalizeImages(images).filter((im) => !isMaterialRole(im.role)).length === 0) return '商品画像がありません (画像タブに白抜きか商品画像を入れると使えます)';
+  return null;
+}
+
+/**
+ * Drive を読む (素材画像の一覧・数十回の API 呼び出し) **前に**、手軽な受付の検査だけ先に済ませる (codex #1593 Medium)。
+ * 機能 OFF・キーの形・押せない理由・動いている依頼があれば、Drive を読まずに断る。
+ * 同じキーの再送 (前の依頼がある) なら { prior: true } — Drive を読まずに requestJob で前の依頼を返す。
+ * 判定は requestJob と同じ (requestJob もトランザクションの中でもう一度全部見る。ここは前さばきだけ)
+ * @returns {null|{prior:true}|{code:string, error:string}}
+ */
+export function requestPrecheck(db, { draft, productInfo, spec, images, idempotencyKey, now = Date.now() } = {}) {
+  if (!lpComposeEnabled()) return { code: 'disabled', error: 'PH_LP_COMPOSE_ENABLED が無効です' };
+  const key = exact(idempotencyKey, IDEMPOTENCY_KEY_RE);
+  if (!key) return { code: 'bad_request', error: 'idempotency_key の形が不正です (英数記号 8〜80 文字)' };
+  const draftId = posInt(draft?.id);
+  if (!draftId) return { code: 'bad_request', error: '商品の ID が不正です' };
+  if (db.prepare('SELECT 1 FROM ph_lp_compose_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draftId, key)) return { prior: true };
+  const blocked = requestBlockReason({ draft, productInfo, spec, images });
+  if (blocked) return { code: 'not_ready', error: blocked };
+  recoverExpired(db, now);
+  if (db.prepare(`SELECT 1 FROM ph_lp_compose_jobs WHERE draft_id = ? AND status IN ('queued','running')`).get(draftId)) {
+    return { code: 'already_running', error: 'この商品の構成をいま作っています' };
+  }
+  if (db.prepare(`SELECT 1 FROM ph_lp_compose_jobs j JOIN ph_lp_compose_generations g ON g.job_id = j.id
+    WHERE j.draft_id = ? AND j.status = 'done' AND g.model_check IS NULL LIMIT 1`).get(draftId)) {
+    return { code: 'already_running', error: 'この商品の構成を作ったモデルをいま確かめています' };
+  }
   return null;
 }
 
@@ -495,16 +555,30 @@ export function queueSummary(db, now = Date.now()) {
  *    合わなければ job を failed にして次へ (Codex R3 #3)。
  * @returns {{ok:true, job:object|null}|{code:string, error:string}}
  */
-export function claimJob(db, { runnerRunId, now = Date.now() } = {}) {
+export function claimJob(db, { runnerRunId, maxImages, now = Date.now() } = {}) {
   if (!lpComposeEnabled()) return { code: 'disabled', error: 'PH_LP_COMPOSE_ENABLED が無効です' };
   // モデルの設定が読めなければ掴まない (掴むと AI を呼ぶ手前の reserve で断られ、依頼が無駄に失敗する)
   if (!lpComposeModel()) return { code: 'bad_config', error: MODEL_CONFIG_ERROR };
+  // 🚨 実行役が落とせる画像の枚数。言わない実行役 (素材より前の phlp) は 6 枚まで (codex #1593 Medium)。
+  //    それより多い依頼を掴ませると、6 枚目までしか見ずに AI 枠を使い、証跡が足りず受け取れない (needs_review)。
+  //    掴まずに queued のまま残す (新しい phlp を置けば次の分で拾う)
+  const cap = Math.min(posInt(maxImages) || MAX_PRODUCT_IMAGES, MAX_IMAGES);
   const nowS = new Date(now).toISOString();
   return db.transaction(() => {
     recoverExpired(db, now);
+    const skipped = [];
     for (let guard = 0; guard < 50; guard++) {
-      const job = db.prepare(`SELECT * FROM ph_lp_compose_jobs WHERE status = 'queued' ORDER BY id LIMIT 1`).get();
-      if (!job) return { ok: true, job: null };
+      const job = db.prepare(`SELECT * FROM ph_lp_compose_jobs WHERE status = 'queued'
+        AND id NOT IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT 1`).get(JSON.stringify(skipped));
+      if (!job) {
+        return skipped.length
+          ? { ok: true, job: null, too_many_images: skipped.length,
+            error: `画像が ${cap} 枚より多い依頼を、この実行役は落とせません (miniPC で install.ps1 を流して phlp を新しくしてください)` }
+          : { ok: true, job: null };
+      }
+      try {
+        if ((JSON.parse(job.packet_json).images || []).length > cap) { skipped.push(job.id); continue; }
+      } catch { /* 壊れた packet は下の照合で failed にする */ }
       // 🚨 claim は「材料を AI に渡す瞬間」= 材料固定という設計の芯が試される所。
       //    保存済みの hash を信じず、**中身から計算し直して**照合する (コード R7 #1)。
       //    追記専用トリガーや app の経路だけでは、DB を直接いじられたときに気づけない。
@@ -1140,6 +1214,8 @@ export function jobStateFor(db, draftId, { now = Date.now() } = {}) {
       images: (() => { try { return imagePlan(JSON.parse(job.packet_json).images); } catch { return []; } })(),
       // 上限で入らなかった素材の数 (受付時に固定)
       materials_omitted: (() => { try { return Number(JSON.parse(job.packet_json).materials_omitted) || 0; } catch { return 0; } })(),
+      // スタッフが ChatGPT 版の定型文の最後に貼る文 (AI に渡したのと同じ・受付時に固定)
+      image_guide: (() => { try { return String(JSON.parse(job.packet_json).image_guide || ''); } catch { return ''; } })(),
     },
   };
 }

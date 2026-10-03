@@ -143,7 +143,8 @@ export async function listDriveFolderImages(folderId) {
 }
 
 /** 素材画像の一覧の歯止め (商品の画像フォルダの下を辿るだけなので、これを超えるなら別の物を指している) */
-export const MATERIAL_SCAN_LIMITS = Object.freeze({ maxDepth: 6, maxFolders: 60, maxImages: 500 });
+// deadlineMs / maxRequests = 全体の時間と API 呼び出し回数の上限。Drive が止まっていても押した画面をぶら下げない (codex #1593 Medium)
+export const MATERIAL_SCAN_LIMITS = Object.freeze({ maxDepth: 6, maxFolders: 60, maxImages: 500, deadlineMs: 25_000, maxRequests: 200 });
 const FOLDER_ID_RE = /^[-\w]{10,200}$/;
 
 /**
@@ -158,17 +159,27 @@ const FOLDER_ID_RE = /^[-\w]{10,200}$/;
 export async function listDriveFolderMaterialImages(folderId, { drive = null, limits = MATERIAL_SCAN_LIMITS } = {}) {
   if (!FOLDER_ID_RE.test(String(folderId || ''))) throw new Error('フォルダの ID の形が不正です');
   const client = drive || getDriveClient();
+  const L = { ...MATERIAL_SCAN_LIMITS, ...limits };
+  const deadline = Date.now() + L.deadlineMs;
+  let requests = 0;
   const listAll = async (q, fields) => {
     const out = [];
+    const seenTokens = new Set();
     let pageToken;
     do {
+      const left = deadline - Date.now();
+      if (left <= 0) throw new Error(`素材の一覧が ${Math.round(L.deadlineMs / 1000)} 秒で読み終わりませんでした (Drive が混んでいる可能性)`);
+      if (++requests > L.maxRequests) throw new Error(`素材の一覧で Drive を ${L.maxRequests} 回より多く呼びました (商品の画像フォルダか確認してください)`);
       const res = await client.files.list({
         q, fields: `nextPageToken, files(${fields})`, pageSize: 200, orderBy: 'name',
         supportsAllDrives: true, includeItemsFromAllDrives: true, pageToken,
-      });
+      }, { timeout: left });
       out.push(...(res.data.files || []));
       pageToken = res.data.nextPageToken;
-      if (out.length > limits.maxImages) throw new Error(`素材フォルダの中身が ${limits.maxImages} 件を超えています (商品の画像フォルダか確認してください)`);
+      // 同じ次ページを 2 回返されたら進んでいない (止める・一部の一覧で進まない)
+      if (pageToken && seenTokens.has(pageToken)) throw new Error('Drive の一覧のページが進みません');
+      if (pageToken) seenTokens.add(pageToken);
+      if (out.length > L.maxImages) throw new Error(`素材フォルダの中身が ${L.maxImages} 件を超えています (商品の画像フォルダか確認してください)`);
     } while (pageToken);
     return out;
   };
@@ -181,16 +192,19 @@ export async function listDriveFolderMaterialImages(folderId, { drive = null, li
   while (queue.length) {
     const next = [];
     for (const f of queue) {
-      if (!FOLDER_ID_RE.test(String(f.id || '')) || seenFolders.has(f.id)) continue;   // ショートカットの循環など
+      // 形のおかしい ID は止める (飛ばすと一部だけの一覧を「全部」として渡す・codex #1593 Low)。
+      // 一度見たフォルダ (ショートカットの循環など) だけ飛ばす
+      if (!FOLDER_ID_RE.test(String(f.id || ''))) throw new Error('Drive が形のおかしいフォルダ ID を返しました');
+      if (seenFolders.has(f.id)) continue;
       seenFolders.add(f.id);
-      if (++visited > limits.maxFolders) throw new Error(`サブフォルダが ${limits.maxFolders} 個を超えています (商品の画像フォルダか確認してください)`);
+      if (++visited > L.maxFolders) throw new Error(`サブフォルダが ${L.maxFolders} 個を超えています (商品の画像フォルダか確認してください)`);
       const files = await listAll(`'${f.id}' in parents and trashed = false and mimeType contains 'image/'`, 'id, name, mimeType, modifiedTime');
       for (const im of files) images.push({ id: im.id, name: String(im.name || ''), modifiedTime: im.modifiedTime || null, folder: f.path });
-      if (images.length > limits.maxImages) throw new Error(`素材画像が ${limits.maxImages} 枚を超えています (商品の画像フォルダか確認してください)`);
-      if (f.depth < limits.maxDepth) {
+      if (images.length > L.maxImages) throw new Error(`素材画像が ${L.maxImages} 枚を超えています (商品の画像フォルダか確認してください)`);
+      if (f.depth < L.maxDepth) {
         for (const c of await subfolders(f.id)) next.push({ id: c.id, path: f.path + '/' + String(c.name || ''), depth: f.depth + 1 });
       } else if ((await subfolders(f.id)).length > 0) {
-        throw new Error(`サブフォルダが ${limits.maxDepth} 階層より深くあります (商品の画像フォルダか確認してください)`);
+        throw new Error(`サブフォルダが ${L.maxDepth} 階層より深くあります (商品の画像フォルダか確認してください)`);
       }
     }
     queue = next;

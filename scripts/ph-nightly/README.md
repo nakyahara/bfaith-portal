@@ -194,8 +194,18 @@ LP のランナーも **Claude 共通ロックを取る**が、期限は **5 秒
 - 🚨 Opus 5.5 は **Claude Code 2.1.280 以上**が要る。miniPC は 2026-10-02 に 2.1.252 → 2.1.280 に上げた (決め打ち・自動更新なし)。
   上げ下げするときは夜間の `PhGenerateNightly`・`ProductKWScout` も同じ Claude Code を使うので、
   商品スカウトの引数 (`product-idea-scout/ai/cli.cjs` の `invocationArgs`) が `claude --help` に残っているかを見る
-- モデルを変えるとき・配置するとき: Render の `PH_LP_COMPOSE_ENABLED` を外す → Render の反映 → miniPC で `install.ps1` → フラグを戻す
-  (サーバとランナーの版が食い違う数分に依頼を受けない)
+- モデルを変えるとき・配置するとき: Render の `PH_LP_COMPOSE_ENABLED` を外す → **queue の `running` が 0 になったのを確かめる** →
+  Render の反映 → miniPC で `install.ps1` → フラグを戻す (サーバとランナーの版が食い違う数分に依頼を受けない)
+
+### 素材画像 (2026-10-02〜)
+
+- 商品の画像フォルダ (`drive_folder_url`) の**中のフォルダ (何階層下でも)** の画像 = 素材画像。**直下**の画像は商品画像 (白抜き・1 TOP・2〜)
+- **押したときに 1 回だけ** Drive を読んで packet に固定する (商品 6 + 素材 10 = 16 枚まで)。読めなければ依頼を作らない。
+  歯止め = 6 階層・60 フォルダ・500 件・25 秒・API 200 回
+- 実行役は claim で `max_images` (この phlp は 16) を送る。**送らない古い phlp は 6 枚まで扱い**で、素材つきの依頼は掴まない (queued のまま)。
+  ランナーのログに `too_many_images` が出たら miniPC で `install.ps1`
+- 「添付画像の説明」(`packet.image_guide`) は **AI にもスタッフにも同じ文**。くらべるときは画面の「ChatGPT 版に貼る文」を
+  「📝 商品分析を準備」の文の最後に貼り、画像を同じ順に添付する
 
 ### 止めたい
 

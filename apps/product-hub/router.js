@@ -122,7 +122,7 @@ import {
 // LP 構成の AI 生成 (段階1)。正本 = AI_reference『商品ハブ_LP構成AI生成_段階1設計_20260930.md』
 import {
   lpComposeEnabled, importSpec as importLpSpec, latestSpec as latestLpSpec, specSummary as lpSpecSummary,
-  requestJob as requestLpComposeJob, requestBlockReason as lpComposeBlockReason,
+  requestJob as requestLpComposeJob, requestBlockReason as lpComposeBlockReason, requestPrecheck as lpComposeRequestPrecheck,
   queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
@@ -3831,12 +3831,13 @@ router.post('/api/drafts/:id/lp-compose', async (req, res) => {
   // 押したときに 1 回だけ Drive を読み、packet に固定する (画面のポーリング GET では読まない)。
   // 同じキーの再送は前の依頼を返すだけなので読まない (Drive が一時的に落ちていても再送は通る)。
   // 🚨 読めなければ依頼を作らない (素材が無いまま作った結果を、素材ありと同じ測定に混ぜない)
+  // 🚨 Drive を読む前に、手軽な受付の検査を済ませる (機能 OFF・押せない・動いている依頼なら読まない・codex #1593 Medium)
+  const lpReqStatus = (code) => (code === 'disabled' ? 503 : ['already_running', 'not_ready'].includes(code) ? 409 : 400);
+  const pre = lpComposeRequestPrecheck(db, { draft, productInfo, spec, images, idempotencyKey: req.body?.idempotency_key });
+  if (pre?.code) return res.status(lpReqStatus(pre.code)).json({ ok: false, code: pre.code, error: pre.error });
   let materials = [];
-  const key = req.body?.idempotency_key;
-  const prior = typeof key === 'string'
-    && db.prepare('SELECT 1 FROM ph_lp_compose_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draft.id, key);
   const folder = parseDriveLink(draft.drive_folder_url);
-  if (!prior && folder && folder.type === 'folder') {
+  if (!pre?.prior && folder && folder.type === 'folder') {
     try {
       materials = (await listDriveFolderMaterialImages(folder.id)).map((m) => ({
         file_id: m.id, drive_modified_time: m.modifiedTime, role: 'material', name: m.name, folder: m.folder,
@@ -3853,10 +3854,7 @@ router.post('/api/drafts/:id/lp-compose', async (req, res) => {
     draft, productInfo, colorVariations, images: [...images, ...materials], spec,
     idempotencyKey: req.body?.idempotency_key, actor: actorOf(req),
   });
-  if (!r.ok) {
-    const status = r.code === 'disabled' ? 503 : ['already_running', 'not_ready'].includes(r.code) ? 409 : 400;
-    return res.status(status).json({ ok: false, code: r.code, error: r.error });
-  }
+  if (!r.ok) return res.status(lpReqStatus(r.code)).json({ ok: false, code: r.code, error: r.error });
   // 🚨 応答は初期表示・GET と同じ形 (押せない理由・仕様書・画像の並びも) にする。
   //    同じキーの再送で終わった依頼が返ると画面はポーリングを止めるので、ここで欠けると
   //    「もう一度押すと渡す画像」が再読み込みまで出ない (codex #1592 R3 Medium)
@@ -3951,10 +3949,11 @@ serviceApiRouter.get('/lp-compose/queue', (req, res) => {
 });
 
 serviceApiRouter.post('/lp-compose/claim', (req, res) => {
-  const r = claimLpComposeJob(getDB(), { runnerRunId: cleanText(req.body?.runner_run_id, 80) });
+  // max_images = 実行役が落とせる画像の枚数 (言わない古い phlp は 6 枚まで扱い・codex #1593 Medium)
+  const r = claimLpComposeJob(getDB(), { runnerRunId: cleanText(req.body?.runner_run_id, 80), maxImages: req.body?.max_images });
   if (!r.ok) return lpComposeFail(res, r);
   // exhausted = 壊れた依頼が並んでいて 50 回掴めなかった (「仕事なし」と区別する)
-  res.json({ ok: true, job: r.job, exhausted: r.exhausted || undefined, error: r.error || undefined });
+  res.json({ ok: true, job: r.job, exhausted: r.exhausted || undefined, too_many_images: r.too_many_images || undefined, error: r.error || undefined });
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/reserve', (req, res) => {

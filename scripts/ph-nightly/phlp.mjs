@@ -184,10 +184,14 @@ async function cmdClaim(opt) {
   //    サーバに付ける (model-check)。Claude が --run に別の値を書いても、ランナーの id が job に写る
   const run = String(process.env.PH_LP_RUN_ID || opt.run || '').trim();
   if (!run) die('--run RUN_ID が要ります');
-  const r = await api('POST', '/lp-compose/claim', { runner_run_id: run.slice(0, 80) });
+  // max_images = この CLI が落とせる枚数。サーバはそれより多い依頼を掴ませない (古い phlp は送らない = 6 枚扱い)
+  const r = await api('POST', '/lp-compose/claim', { runner_run_id: run.slice(0, 80), max_images: MAX_IMAGES });
   if (r.status !== 200) { out(r.json); return fail(1); }
   const job = r.json.job;
-  if (!job) { out({ job: null, exhausted: r.json.exhausted || false, note: '仕事はありません' }); return; }
+  if (!job) {
+    out({ job: null, exhausted: r.json.exhausted || false, too_many_images: r.json.too_many_images || 0, note: r.json.error || '仕事はありません' });
+    return;
+  }
   // lease と packet_hash は CLI が持つ。Claude には出さない
   saveLease(job.job_id, {
     lease_token: job.lease_token, packet_hash: job.packet_hash, run,
@@ -224,6 +228,8 @@ async function cmdClaim(opt) {
       // product = 商品の再現用 (形・ラベル・色)。material = 使用素材の候補 (画像フォルダの下のフォルダの画像)
       image_list: imageList(job),
       materials_omitted: Number(job.packet.materials_omitted) || 0,
+      // 🚨 添付画像の説明 = スタッフの ChatGPT 版にも同じ文を貼る (くらべっこを公平にする)。素材の扱いはこれに従う
+      image_guide: job.packet.image_guide || null,
     },
     // 🚨 スタッフが ChatGPT に貼る定型文と**同じ指示文** (設計 §5)。
     //    これに従って書く。自分の言葉で書き換えない —
