@@ -388,7 +388,9 @@ function totalsErrors(body) {
             break;
           case 'bigint_sum_null': case 'decimal_sum_null': if (v === null) break; // fallthrough
           // eslint-disable-next-line no-fallthrough
-          default: if (v === null || !checkValue(c.type, v)) errs.push(`${p}: ${c.type} の形でない (${JSON.stringify(v)})`);
+          default:
+            if (v === null || !checkValue(c.type, v)) errs.push(`${p}: ${c.type} の形でない (${JSON.stringify(v)})`);
+            else if (c.rule === 'int_sum' && v < 0) errs.push(`${p}: 件数が負 (int_sum の列は日数・行数・件数 = 0 以上・#1602 Codex R2 Low)`);
         }
       }
       for (const [days, n] of INCOMPLETE_DAY_PAIRS) if (Array.isArray(t[days]) && t[n] !== t[days].length) errs.push(`$.total.${n}: 日付の数と違う`);
@@ -443,6 +445,9 @@ function dailyRowRuleErrors(r, p) {
   const incomplete = r.refund_units_status === 'unit_price_missing' || r.refund_units_status === 'estimated_partial_month_unit_price';
   if (r.refund_incomplete_child_count !== (incomplete ? 1 : 0)) e.push(`${p}.refund_incomplete_child_count: 返品の状態からは ${incomplete ? 1 : 0}`);
   iff(r.day_finance_status !== 'complete', has(reasons, 'finance_incomplete'), '日の財務が complete でない ⇔ 理由 finance_incomplete');
+  // 0050 の g_uncl = (unclassified_component_count + unmapped_component_count + legacy_n) > 0 (#1602 Codex R2 M1)
+  const unclassified = [r.unclassified_component_count, r.unmapped_component_count, r.finance_legacy_rows].reduce((a, v) => a + (Number.isSafeInteger(v) ? v : 0), 0);
+  iff(unclassified > 0, has(reasons, 'finance_unclassified'), '分けられない部品・対応の無い部品・旧い形の行の件数の合計 > 0 ⇔ 理由 finance_unclassified');
   iff(r.ad_status === 'not_collected', has(reasons, 'ad_not_collected'), '広告 not_collected ⇔ 理由 ad_not_collected');
   iff(r.ad_status === 'missing', has(reasons, 'ad_missing'), '広告 missing ⇔ 理由 ad_missing');
   iff(r.ad_status === 'legacy_incomplete', has(reasons, 'ad_legacy_unverified'), '広告 legacy_incomplete ⇔ 理由 ad_legacy_unverified');

@@ -140,7 +140,8 @@ await t('/daily: 月の行をつなぐだけ (足さない) = daily-2months.expe
   assert.equal(r.status, 200);
   assert.deepEqual(r.body, dailyExp);
   assert.deepEqual(validateDailyResponse(dailyExp).errors, []);
-  assert.equal(dailyExp.rows.length, 3);
+  assert.equal(dailyExp.rows.length, 4);
+  assert.deepEqual([dailyExp.rows[3].unclassified_component_count, dailyExp.rows[3].unmapped_component_count, dailyExp.rows[3].finance_legacy_rows, dailyExp.rows[3].profit_incomplete_reasons], [1, 1, 2, ['finance_unclassified']]);   // 件数が 0 でない行 (R2 M1)
   assert.deepEqual(dailyExp.months.map((m) => [m.month_start, m.has_finance_rows]), [['2026-07-01', true], ['2026-08-01', false]]);
   assert.deepEqual([...new Set([dailyExp.calculated_at, dailyExp.master_as_of, ...dailyExp.rows.map((x) => x.calculated_at), ...dailyExp.months.map((m) => m.calculated_at)])], [dailyIn.request.calculated_at]);
   assert.equal(dailyExp.rows[0].listing_id, '9007199254740993');   // bigint の ID は文字列のまま (Number なら …992)
@@ -202,12 +203,27 @@ const breakTotals = [
   ['contract の版が違う', (x) => { x.contract = 'amazon_profit_response_v0'; }],
   ['ok が false', (x) => { x.ok = false; }],
   ['kind が違う', (x) => { x.kind = 'daily'; }],
+  // 🆕 #1602 Codex R2 Low: int_sum の件数の列は 0 以上
+  ['day_count が負', (x) => { x.total.day_count = -1; }],
+  ['resolved_rows が負', (x) => { x.total.resolved_rows = -1; }],
+  ['unknown_line_rows が負', (x) => { x.total.unknown_line_rows = -1; }],
+  ['easy_ship_unallocated_count が負', (x) => { x.total.easy_ship_unallocated_count = -3; }],
 ];
 await t(`/totals: 契約を破った ${breakTotals.length} 通りを全部拒む`, async () => {
   for (const [name, f] of breakTotals) {
     const x = clone(totalsExp); f(x);
     assert.equal(validateTotalsResponse(x).ok, false, name);
   }
+});
+await t('/totals: int_sum の全部の列 (日数・行数・件数) を -1 にすると拒む・0 は通る (R2 Low)', async () => {
+  const cols = TOTALS_COLUMNS.filter((c) => c.rule === 'int_sum');
+  assert.ok(cols.length >= 15, `${cols.length}`);
+  for (const c of cols) {
+    const x = clone(totalsExp); x.total[c.name] = -1;
+    assert.ok(validateTotalsResponse(x).errors.some((e) => e.includes(`$.total.${c.name}: 件数が負`)), c.name);
+  }
+  const z = clone(totalsExp); z.total.unknown_line_rows = 0;
+  assert.deepEqual(validateTotalsResponse(z).errors, []);
 });
 const breakDaily = [
   ['行に raw の列', (x) => { x.rows[0].ad_cost_raw = '120.5'; }],
@@ -268,6 +284,13 @@ const breakDaily = [
   ['0 と仮定の理由が理由と合わない', (x) => { x.rows[1].assumed_zero_reasons = []; }],
   ['composition_basis が印と合わない', (x) => { x.rows[0].composition_basis = 'current_no_recorded_change'; }],
   ['composition_audit_since が null', (x) => { x.rows[0].composition_audit_since = null; }],
+  // 🆕 #1602 Codex R2 M1: 件数の合計 > 0 ⇔ 理由 finance_unclassified (正式な値も止まる)
+  ['件数があるのに理由 finance_unclassified を落とした (正式な値は null のまま)', (x) => { x.rows[3].profit_incomplete_reasons = []; x.rows[3].assumed_zero_reasons = []; }],
+  ['件数があるのに理由を落とし正式な値を出した', (x) => { const r = x.rows[3]; r.profit_incomplete_reasons = []; r.assumed_zero_reasons = []; r.contribution_before_ad_incl_jpy = '1500'; r.contribution_before_ad_excl = '1363.64'; r.contribution_after_ad_incl = '1489.00'; r.contribution_after_ad_excl = '1353.64'; }],
+  ['件数が 0 なのに理由 finance_unclassified', (x) => { const r = x.rows[3]; r.unclassified_component_count = 0; r.unmapped_component_count = 0; r.finance_legacy_rows = 0; }],
+  ['unclassified_component_count だけ 1・理由なし', (x) => { x.rows[0].unclassified_component_count = 1; }],
+  ['unmapped_component_count だけ 1・理由なし', (x) => { x.rows[0].unmapped_component_count = 1; }],
+  ['finance_legacy_rows だけ 1・理由なし', (x) => { x.rows[0].finance_legacy_rows = 1; }],
 ];
 await t(`/daily: 契約を破った ${breakDaily.length} 通りを全部拒む`, async () => {
   for (const [name, f] of breakDaily) {

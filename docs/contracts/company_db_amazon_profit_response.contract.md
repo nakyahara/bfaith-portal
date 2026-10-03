@@ -107,11 +107,11 @@
 | `period_to` | date | `request_bound` | 要求の from / to |
 | `economic_date_jst` | date | `omit` | 出さない (旧 totals の行の種類の列) |
 | `month_start` | date | `omit` | 出さない (旧 totals の行の種類の列) |
-| `day_count` | integer | `int_sum` | integer を足す (JSON の数) |
+| `day_count` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
 | `day_finance_status` | text | `null_in_period` | 期間の行では常に null (月ごとは months[]) |
-| `complete_days` | integer | `int_sum` | integer を足す (JSON の数) |
-| `resolved_rows` | integer | `int_sum` | integer を足す (JSON の数) |
-| `unresolved_rows` | integer | `int_sum` | integer を足す (JSON の数) |
+| `complete_days` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
+| `resolved_rows` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
+| `unresolved_rows` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
 | `units_ordered` | bigint | `bigint_sum` | BigInt で足す (文字列) |
 | `units_net_sold` | bigint | `bigint_sum` | BigInt で足す (文字列) |
 | `sales_principal_jpy` | bigint | `bigint_sum` | BigInt で足す (文字列) |
@@ -120,12 +120,12 @@
 | `cogs_jpy` | bigint | `bigint_sum_null` | BigInt で足す・1 か月でも null なら null |
 | `easy_ship_alloc_jpy` | bigint | `bigint_sum` | BigInt で足す (文字列) |
 | `easy_ship_unallocated_jpy` | bigint | `bigint_sum` | BigInt で足す (文字列) |
-| `easy_ship_unallocated_count` | integer | `int_sum` | integer を足す (JSON の数) |
+| `easy_ship_unallocated_count` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
 | `ad_status` | text | `state_rank` | 一番弱い状態 (順位の表) |
 | `ad_cost_total` | numeric | `decimal_sum_null` | 同じ・1 か月でも null なら null |
 | `ad_cost_allocated` | numeric | `decimal_sum` | 月の raw を Decimal で足して最後に 1 回 小数 2 桁に丸める |
 | `ad_cost_unresolved` | numeric | `decimal_sum` | 月の raw を Decimal で足して最後に 1 回 小数 2 桁に丸める |
-| `ad_unresolved_rows` | integer | `int_sum` | integer を足す (JSON の数) |
+| `ad_unresolved_rows` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
 | `account_fee_cost_jpy` | bigint | `bigint_sum` | BigInt で足す (文字列) |
 | `account_fee_cost_excl` | numeric | `decimal_sum` | 月の raw を Decimal で足して最後に 1 回 小数 2 桁に丸める |
 | `account_fee_storage_cost_jpy` | bigint | `bigint_sum` | BigInt で足す (文字列) |
@@ -141,12 +141,12 @@
 | `unknown_line_mapped_jpy` | bigint | `bigint_sum` | BigInt で足す (文字列) |
 | `unclassified_mapped_jpy` | bigint | `bigint_sum` | BigInt で足す (文字列) |
 | `unmapped_jpy` | bigint | `bigint_sum` | BigInt で足す (文字列) |
-| `unknown_line_rows` | integer | `int_sum` | integer を足す (JSON の数) |
-| `unclassified_component_count` | integer | `int_sum` | integer を足す (JSON の数) |
-| `unmapped_component_count` | integer | `int_sum` | integer を足す (JSON の数) |
-| `sku_unclassified_component_count` | integer | `int_sum` | integer を足す (JSON の数) |
-| `sku_unmapped_component_count` | integer | `int_sum` | integer を足す (JSON の数) |
-| `finance_legacy_rows` | integer | `int_sum` | integer を足す (JSON の数) |
+| `unknown_line_rows` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
+| `unclassified_component_count` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
+| `unmapped_component_count` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
+| `sku_unclassified_component_count` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
+| `sku_unmapped_component_count` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
+| `finance_legacy_rows` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
 | `contribution_before_ad_incl_jpy` | bigint | `bigint_sum_null` | BigInt で足す・1 か月でも null なら null |
 | `contribution_before_ad_excl` | numeric | `decimal_sum_null` | 同じ・1 か月でも null なら null |
 | `contribution_after_ad_incl` | numeric | `decimal_sum_null` | 同じ・1 か月でも null なら null |
@@ -158,11 +158,11 @@
 | `profit_after_account_fees_assuming_incomplete_zero_incl` | numeric | `decimal_sum` | 月の raw を Decimal で足して最後に 1 回 小数 2 桁に丸める |
 | `profit_after_account_fees_assuming_incomplete_zero_excl` | numeric | `decimal_sum` | 月の raw を Decimal で足して最後に 1 回 小数 2 桁に丸める |
 | `before_ad_incomplete_days` | date[] | `dates_concat` | 日付の順につなぐ |
-| `before_ad_incomplete_day_count` | integer | `int_sum` | integer を足す (JSON の数) |
+| `before_ad_incomplete_day_count` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
 | `after_ad_incomplete_days` | date[] | `dates_concat` | 日付の順につなぐ |
-| `after_ad_incomplete_day_count` | integer | `int_sum` | integer を足す (JSON の数) |
+| `after_ad_incomplete_day_count` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
 | `after_account_fees_incomplete_days` | date[] | `dates_concat` | 日付の順につなぐ |
-| `after_account_fees_incomplete_day_count` | integer | `int_sum` | integer を足す (JSON の数) |
+| `after_account_fees_incomplete_day_count` | integer | `int_sum` | integer を足す (JSON の数・件数なので 0 以上) |
 | `profit_incomplete_reasons` | text[] | `reasons_union` | 和集合を決まった順に |
 | `master_basis` | text | `same_all` | 全部の月で同じか (違えば 503 PROFIT_VERSION_MISMATCH) |
 | `master_note_counts` | jsonb | `jsonb_key_sum` | JSON のキーごとに足す |
@@ -172,6 +172,7 @@
 | `calculated_at` | timestamp with time zone | `calculated_at` | 要求の 1 つの値 |
 
 - 不完全な日の数 (`*_incomplete_day_count`) = 不完全な日の配列の長さ
+- `int_sum` の列 (日数・行数・件数) は 0 以上 (#1602 Codex R2 Low)
 
 ## 6. 付録 B: /daily の行の全部の列 (#1602 Codex R1 M1 = 0050 の式どおりの null・値域・列挙)
 
@@ -290,6 +291,7 @@ null の規則 (nul):
 - `cost_basis = missing` ⇔ 原価が分からない (理由 `listing_unresolved` / `composition_missing` / `cost_missing`)
 - 構成が分かる解決した行の `composition_basis` = 印から決まる (`pre_audit_unverifiable` があればそれ・次に `current_after_recorded_change`・どちらも無ければ `current_no_recorded_change`)
 - `refund_units_status` = `unit_price_missing` ⇔ 理由 `refund_units_unknown` / `estimated_partial_month_unit_price` ⇔ 理由 `refund_units_partial_month` / この 2 つのときだけ `refund_incomplete_child_count = 1` (ほかは 0)
+- 🆕 `unclassified_component_count + unmapped_component_count + finance_legacy_rows > 0` ⇔ 理由 `finance_unclassified` (0050 の g_uncl・#1602 Codex R2)
 - `day_finance_status` が complete でない ⇔ 理由 `finance_incomplete` / `ad_status` = `not_collected` ⇔ `ad_not_collected`・`missing` ⇔ `ad_missing`・`legacy_incomplete` ⇔ `ad_legacy_unverified`
 - `assumed_zero_reasons` = `profit_incomplete_reasons` から `refund_units_partial_month` を除いたもの
 
