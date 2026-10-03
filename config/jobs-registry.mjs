@@ -331,7 +331,12 @@ export const JOBS_REGISTRY = [
       + '"skipped (another Claude job holds the lock)" → 夜間ジョブが動いている間は正常 (次の分で拾う) / '
       + '"needs_review +N" (partial) → AI を呼んだのに結果が返らなかった = 成否不明。**自動では作り直さない**ので、画面でもう一度依頼する / '
       + '"nothing moved" (fail) → claude の認証切れ・ツールの deny・仕様書が未取込。*.lp.out.log の permission_denials と Claude の最後の報告を見る / '
-      + '"PH_LP_COMPOSE_ENABLED is off" → Render のフラグが未設定 (段階1 の立ち上げ中は正常)。'
+      + '"PH_LP_COMPOSE_ENABLED is off" → Render のフラグが未設定 (段階1 の立ち上げ中は正常) / '
+      // モデル (2026-10-02・#1591): 決める場所は Render の PH_LP_COMPOSE_MODEL だけ。Opus 5.5 は Claude Code 2.1.280 以上
+      + '"server sent no usable model" (fail) → Render の PH_LP_COMPOSE_MODEL が読めない値 (読めなければ止める・既定に戻さない) / '
+      + '"model not verified" (partial) → 本回答のモデルが頼んだモデルと違う・読めない・確認を送れなかった。その依頼は needs_review で本文は出ない。もう一度依頼する / '
+      + '"model check re-send failed (kept)" → state\\lp-model-check-*.json に控えて毎分再送 (サーバは 15 分で未確認として閉じる) / '
+      + '"API Error: 400 ... 2.1.280 or newer" → miniPC の Claude Code が古い (上げるときは夜間の原稿生成・商品スカウトの引数も確認)。'
       + '止めるなら Render の PH_LP_COMPOSE_ENABLED を外すか Disable-ScheduledTask PhLpComposeMinutely',
   },
   {
@@ -490,8 +495,19 @@ export const JOBS_REGISTRY = [
       + '確かめられた回だけ自分で ok の ping (台帳 cdb-master-publish)。証跡 master-publish の apply。新しい定期実行は無い)。'
       + '冒頭の「Settlement冪等性テスト」の後に「Settlement V2 並べ直しテスト」(apps/warehouse/test-settlement-v2.js。2026-09-28 に決済の取込を V2 に切り替えた = #1508) と '
       + '「Settlement 重複除去テスト」(apps/warehouse/test-settlement-dedup-occurrence.js。同じ決済の同じ鍵の本物の別々の行を潰さない = 出現順つき。#1511) も走る (どちらも一時 DB だけ・失敗しても後続は止めない。新しい定期実行は無い)。'
-      + '「Amazon Settlement」(fetch-amazon-settlements.js) は 2026-09-30 (D7b-1b の下ごしらえ・設計 = AI_reference CompanyDB構想/13 §3.1) から決済のレポートの一覧も warehouse.db の amazon_settlement_report_inventory_runs / amazon_settlement_report_inventory に記録する '
-      + '(取込のダウンロードのループが全部終わった後に別の getReports・窓 = 回の開始の時刻から 85 日前を明示・時間の上限 120 秒・report ごとの取込の結果と 1 回で書く。取込む行は変わらない)。一覧が最後のページまで取れない・一覧の要求の失敗・記録の失敗 = 完了の行の末尾に ⚠️ (取込の結果・終了コードは変えない)。今は記録だけ (読み手は後の coverage)。'
+      + '🆕 2026-10-01 (D7b-1b-3・設計 = AI_reference CompanyDB構想/13 §3.1・D-65・D-66): 前の「Amazon Settlement」(取込) と「CompanyDB財務(Amazon)」(Company DB Amazon 財務 push) の 2 工程を '
+      + '「Amazon決済と財務」(apps/warehouse/amazon-finance-coverage-run.js = coordinator・工程の上限 90 分) の 1 工程にまとめた (新しい定期実行ではない・retry の単位も同じ 1 工程)。'
+      + '🚨 ただし coordinator で回すのは .env に CDB_FINANCE_COORDINATOR=1 があるときだけ (スイッチ = apps/warehouse/finance-coordinator-switch.js・#1567・一時物 cdb-finance-coordinator-switch)。'
+      + '無い朝は今までどおり「Amazon Settlement」(fetch-amazon-settlements.js --days 14 = 書く取込・coverage の lease を取る) → 「CompanyDB財務(Amazon)」(amazon-finance.mjs 日曜 --full・ほか --incremental) の 2 工程 (retry も同じスイッチで名前を読み替える)。'
+      + '足すのは夜に手で実の --full を 1 回流して exit 0・60 分以内・最大メモリ 1,200 MB 以下に合格した後 (中原さんの指示の後)。'
+      + 'coordinator は warehouse.db の lease (amazon_finance_coverage_lease の 1 行・持ち主の判定は retry-lock.js と同じ) を持ち、① 過去の決済の行に文書の版が無ければ ❌ で止まる (重い版付けは流さない = 夜に手で migrate-settlement-document-versions.js --commit。#1567 Codex R1) '
+      + '② Render の決済のそろい (core.finance_coverage・0050) を新しい世代で updating (失敗なら取込を始めない) ③ 手で積んだ決済のファイル (amazon-settlement-manual-file.js) → SP-API の取込 (V2・一覧を記録。初期の印の順番待ちも updating の後に入れる) '
+      + '④ 財務の送信 (全部の chunk に世代・token・coverage の回は --full) ⑤ 完成の判定 (一覧の鎖・初期の印・採った文書の版・receipt digest・source_revision の読み直し) → complete を 1 回として回す。'
+      + '財務のバックフィルの完了印の前 = 取込だけ (最後の行に「財務 push: ⏭️」= coverage で一度も回っていないとローカルと Render の両方で言えるときだけ・回った・判定できない = 取込もせず ❌)・'
+      + 'Render の決済のそろいが 404 / 409 = Render が #1561 / 0050 の前に戻った疑い = ❌ (今までの送り方の保険 cdb-coverage-legacy-path は #1567 Codex R8 で消した)・初期の印が無いなど人が直すまで complete にしない = ⚠️ (exit 0。正式な利益は null のまま)・'
+      + '失敗 = ❌ (retry)・取り込めない V2 = 終了コード 3。初期の印 = apps/warehouse/amazon-finance-initial-marker.js --queue (Seller Central の過去の決済情報・順番待ちに積むだけ)。冒頭に「Settlement 文書の版テスト」(test-settlement-document-versions.js・一時 DB) も走る。'
+      + '(以下は取込の中身の説明) 決済のレポートの一覧は 2026-09-30 (D7b-1b の下ごしらえ) から warehouse.db の amazon_settlement_report_inventory_runs / amazon_settlement_report_inventory に記録する '
+      + '(取込のダウンロードのループが全部終わった後に別の getReports・窓 = 回の開始の時刻から 85 日前を明示・時間の上限 120 秒・report ごとの取込の結果と 1 回で書く)。2026-10-01 (#1567 Codex R4) から取込の一覧も同じ固定の窓 = 85〜90 日前に作られた report は取込まない (前 = 日時の境なし)。一覧が最後のページまで取れない・一覧の要求の失敗・記録の失敗 = 完了の行の末尾に ⚠️ (取込の結果・終了コードは変えない)。読み手 = coverage の判定 (Amazon決済と財務)。'
       + '冒頭に「Settlement 一覧テスト」(apps/warehouse/test-settlement-inventory.js・一時 DB・SP-API は差し替え) も走る。新しい定期実行は無い。'
       + '「Amazon finance build / sync」(日次の財務 f_amazon_finance_sku_daily_v1 を作って Render へ) は 2026-09-28 から **当月 + 直近 35 日に決済の行が入った月** を全部作り直す '
       + '(apps/warehouse/amazon-finance-months.js。旧 = 当月 + 20 日までは前月 = 月末をまたぐ決済が遅れると前月の後半が欠けた (5 月が半分欠けていた))。当月以外は名前に月が付く (例: Amazon finance build (2026-08))。'
@@ -502,10 +518,10 @@ export const JOBS_REGISTRY = [
       + '2026-09-29 (F2b-2・#1534) から「Amazonアカウントフィー build / sync」はふだん 14 か月・DATA_DIR/amazon-account-fees-pending.json (月の手数料のやり残し = Company DB の Amazon 財務との突き合わせで差が出た月) があれば '
       + 'その一番古い月まで (最大 60 か月) さかのぼって作り直す (--from-month で始まりの月を明示 = 途中で月をまたいでも範囲がずれない)。やり残しは build と sync の両方が通った後にだけ消す。'
       + 'やり残しのファイルが読めない・60 か月より古い = ⚠️ (Amazonアカウントフィー やり残し)。さかのぼる回は所要時間が延びる (1 か月あたり数秒〜十数秒の見込み)。新しい定期実行は無い。'
-      + '「Amazonアカウントフィー build / sync」の後に「Company DB Amazon 財務 push」(apps/company-db/push/amazon-finance.mjs。F2b-3・設計 = AI_reference CompanyDB構想/12 §5。'
+      + '「Amazonアカウントフィー build / sync」の後に (2026-10-01 まで) 「Company DB Amazon 財務 push」(apps/company-db/push/amazon-finance.mjs。F2b-3・設計 = AI_reference CompanyDB構想/12 §5。🆕 送信は「Amazon決済と財務」の中に移った・突き合わせだけここに残る。'
       + '決済の行を 注文 × 計上日 × SKU × 行の種類 にまとめて Company DB (0043) へ。日曜は --full = 全部を集約し直す + Render にだけある鍵に空の集合・ほかは --incremental。'
       + 'バックフィルの完了印 (台帳 DATA_DIR/company-db-push.db の order_finance:amazon) の前は「⏭️ バックフィル前」で送らない。容量の上限 CDB_DB_LIMIT_BYTES が無ければ送らない (D-W5)。'
-      + '送信の失敗・送れない鍵 = ❌ (retry = --full)・拾われない金額 = ⚠️) → 送れたら「Company DB Amazon 財務 突き合わせ」(--reconcile。直近 45 日 + 未照合の月の 日 × SKU と月の手数料を SQLite と。'
+      + '送信の失敗・送れない鍵 = ❌ (retry = Amazon決済と財務)・拾われない金額 = ⚠️) → 送れた朝 (最後の行に「財務 push (」がある) だけ「Company DB Amazon 財務 突き合わせ」(--reconcile。直近 45 日 + 未照合の月の 日 × SKU と月の手数料を SQLite と。'
       + '差の月は amazon-finance-pending.json / amazon-account-fees-pending.json に登録 = 次の朝の build が作り直す。差が 1 回目 ⚠️・2 回続けば ❌・retry には載せない)。新しい定期実行は無い。'
       + '🚨 2026-09-30 (D7b-1a・PR #1554・受け皿 0047 / 0048) から財務の送り手の変換の版は amazon_finance_v2 (行に「分けられない決済の部品」の 4 列)。'
       + '版が変わると --incremental も全部 (約 51 万注文) を選ぶ = 手で --full を済ませる前の朝の daily-sync は 1 工程 30 分の上限に当たりうる → マージの夜に手で --full を済ませる。'
@@ -588,8 +604,8 @@ export const JOBS_REGISTRY = [
       + '保険として bat が最大10分ロックの解放を待ってから node を起動する (node の acquireLock は失敗時に即終了するため)。'
       + '異常終了で残ったロックは PID の死亡を確認して削除。'
       + '画面採取の正本 = AI_reference『ロジザード作業自動化\入荷状況照会CSV_画面採取_20260901.md』。'
-      + '🆕2026-09-28 から、入荷受付CSV と商品マスタの書き出しの間に「毎日の商品マスタの取込 (影)」(scripts/logizard-import/lz-daily-import.mjs・台帳 lz-daily-import-shadow) が走る '
-      + '(00:20 の回だけ動く・08:40 / 11:45 は何もしない・この bat の終了コードは変えない)。bat の正本 = bfaith-portal の tools/logizard-automation/',
+      + '🆕2026-09-28 から、入荷受付CSV と商品マスタの書き出しの間に「毎日の商品マスタの取込」(scripts/logizard-import/lz-daily-import.mjs) が走る。'
+      + '切替 (2b-2 の切替の PR) から毎晩の本番 = 台帳 lz-daily-import (00:20 の回に取り込む・08:40 / 11:45 は知らせの送り直しだけ・この bat の終了コードは変えない)。bat の正本 = bfaith-portal の tools/logizard-automation/',
   },
   {
     id: 'logizard-shohin-csv',
@@ -1371,39 +1387,33 @@ export const JOBS_REGISTRY = [
       + '送れなかった回の証跡は state = complete のまま portal.ok = false = 影の取込・少数件の試験の計画・切替の判定はその回を使わない (portal_not_stored)',
   },
   {
-    id: 'lz-daily-import-shadow',
+    id: 'lz-daily-import',
     type: 'scheduled_job',
-    importance: 'P3',
+    importance: 'P2',
     owner: 'Claude + 中原さん',
-    purpose: 'ロジザードの毎日の商品マスタの取込の「影」(マスタ正本切替 ③c-1b-2a・scripts/logizard-import/lz-daily-import.mjs)。'
-      + '毎晩 00:20 に、前の日の lz-daily の CSV (Company DB の値) を対象に、ロジザードの商品マスタを書き出し (取込の直前)、CSV の全部の商品が'
-      + 'ロジザードにあり削除されていないかを確かめ、インポート画面で**プレビューまで** (実行ボタンは押さない = 何も登録しない)。'
-      + 'ポータルの取込の状態と各 PC の初期化の印も照合する。止まっても何も困らない (GAS の手の取込のまま) = P3。'
-      + '**毎晩の影は miniPC の .env の LZ_DAILY_IMPORT_SHADOW=on のときだけ動く (既定 = 止めてある = Stream Deck の auto-barcode.js が 00:00〜01:30 に動かない版 (③c-1b-3a) を写してから on)**。止めてある間は、ランナーが動いたことだけ ok の ping (note = 止めてある)。'
-      + '本番の取込 (③c-1b-2b) を始めるときに lz-daily-import (本番) に置き換えて、この項目は RETIRED_JOBS へ (撤去 = lz-daily-import-shadow-retire)',
-    where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\\tools\\logizard-automation\\run-nyuka-csv-scheduled.bat の 1.5 ステップ目 (新しい定期実行ではない。ping は lz-daily-import.mjs が自分で打つ)',
-    schedule: '毎日 00:20 (00:15〜00:55 の回だけ動く・1 日 1 回)',
+    purpose: 'ロジザードの毎日の商品マスタの取込 (毎晩の本番・マスタ正本切替 ③c-1b-2b-2)。毎晩 00:20 に、前の日の lz-daily の成果物 '
+      + '(Company DB の値・判定 pass・ポータルに保存済み) をロジザードに取り込み、取込の直前と直後の商品マスタとバーコードを全部比べて確かめる (決まり = RULES_2B2)。'
+      + 'ok の ping = その夜の取込 (または前の夜の未確かめの確かめのやり直し) が verified かつ未送の知らせ 0 のときだけ。ほか = ping しない (ここの締切で気づく) / 途中の例外 = fail。'
+      + '止まった・確かめられない回はポータルの取込の状態が止まった状態になり、要対応スペース (GCHAT_WEBHOOK_JOBS) に知らせる。'
+      + '止まるとロジザードの商品マスタ (商品名・仕入単価・取引先) が Company DB から遅れる (入荷・出荷の現場は止まらない。'
+      + '急ぐときはポータルの画面「ロジザードの取込の状態」の手の取込で人が取り込む) = P2。'
+      + '切替で影 (lz-daily-import-shadow) を置き換えた (影の ok を本番の ok にしない。契約 v3 H9)',
+    where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\\tools\\logizard-automation\\run-nyuka-csv-scheduled.bat の 1.5 ステップ目 '
+      + '(新しい定期実行ではない。scripts/logizard-import/lz-daily-import.mjs の LZ_DAILY_IMPORT=on → lz-nightly.mjs。ping は自分で打つ)',
+    schedule: '毎日 00:20 (Render の時計で 00:15〜00:50 に始める・00:55 が締め切り)。08:40 / 11:45 の回は知らせの送り直しだけ (ping しない)',
     anchor_hour_jst: 0,
     anchor_minute_jst: 20,
-    grace_hours: 6,
+    grace_hours: 40 / 60,   // 01:00 までに ok が無ければ締切超過 (00:55 の締め切り + 5 分。2b-2 設計 §3「01:00 に気づく」)
     lifecycle: 'permanent',
-    runbook: 'C:\\tools\\logizard-automation\\logs\\scheduled.log の [lz-daily-import] と DATA_DIR\\lz-import\\<日付>\\<実行 ID>\\shadow.json (target・portal・pre・precheck・preview)。'
-      + '⏭️ の理由: target_* = 前の日の lz-daily が無い・完了していない・CSV が合わない (daily-sync の「ロジザード毎日の商品マスタ(影)」を見る) / '
-      + 'init_mismatch・portal_unreachable = ポータルの取込の状態 (tools/logizard-automation/import-state-cli.js status) / '
-      + 'precheck_failed = CSV の商品がロジザードに無い・削除 (shadow.json の missing・deleted) / pre_export_* = 直前の書き出しが壊れた。'
-      + '手で試す = node scripts/logizard-import/lz-daily-import.mjs --force-window [--as-of YYYY-MM-DD] (止めてあっても動く・ping しない・その日の済みの印を書かない・Stream Deck を押さない間に)',
-  },
-  {
-    id: 'lz-daily-import-shadow-retire',
-    type: 'temporary_asset',
-    importance: 'TMP',
-    owner: 'Claude + 中原さん',
-    purpose: '影の取込 (台帳 lz-daily-import-shadow・lz-daily-import.mjs の影のモード) は切替までの一時のもの。'
-      + '切替 (③c-1b-2b の本番の取込の開始) で、lz-daily-import-shadow を RETIRED_JOBS へ移し、本番の lz-daily-import を台帳に載せる (影の ok を本番の ok にしない。契約 v3 H9)',
-    where: 'config/jobs-registry.mjs の lz-daily-import-shadow・scripts/logizard-import/lz-daily-import.mjs',
-    remove_by: '2026-11-30',
-    lifecycle: 'temporary',
-    runbook: '切替の PR で lz-daily-import-shadow を RETIRED_JOBS へ・lz-daily-import を載せる・このエントリを消す。切替が延びるなら remove_by を延ばす (理由を書く)',
+    runbook: 'C:\\tools\\logizard-automation\\logs\\scheduled.log の [lz-daily-import] の行 (✅ verified / ⏭️ しない (理由) / ❌)。'
+      + '1 回の記録 = DATA_DIR\\lz-import\\runs\\<実行 ID lzim_night_…>\\import.json (stages・stamp_window・result・verify)・その夜の済みの印 = DATA_DIR\\lz-import\\<JST の日>\\nightly-done.json。'
+      + 'ポータルの取込の状態 = 画面 /apps/logizard-import-state/admin か miniPC で node C:\\tools\\logizard-automation\\import-state-cli.js status。'
+      + '⏭️ の理由: artifact_missing / artifact_mismatch / not_ready = その朝の lz-daily の成果物が無い・ポータルに送れていない (台帳 lz-daily-build) / '
+      + 'halted = 止めてある (止めた理由は status) / manual_open = 手の取込が開いている / stopped (unknown・partial・verify_failed・imported_unverified) = 前の回が止まった = '
+      + 'ロジザードのインポート履歴を見て import-state-cli.js resolve (手順 = tools/logizard-automation/README.md) / stop_notice_pending = 止まった状態の知らせが届いていない / '
+      + 'window_closed = 振り分けの間に 00:50 を過ぎた / 未送の知らせ = 要対応スペースに送れていない (次の 08:40 / 11:45 で送り直す)。'
+      + '❌: GCHAT_WEBHOOK_JOBS・DATA_DIR が無い / 途中の例外 (理由つき)。'
+      + '手順と戻し方 = db/company/README.md「毎晩の本番の切替と GAS への戻し」',
   },
   {
     id: 'lz-daily-cutover',
@@ -1413,7 +1423,8 @@ export const JOBS_REGISTRY = [
     purpose: 'ロジザードの毎日の商品マスタの取込を GAS から Company DB の自動に切り替える (マスタ正本切替 ③c)。完了の条件 (v3 M6) = '
       + '① daily-sync の「ロジザード毎日の商品マスタ(影)」(証跡 lz-daily) が 3 日続けて合格 **かつ成果物をポータルに送れた** (verdict = pass かつ portal.ok = true・版 lzd-v3 以降。説明できない差・判定できない・形の差・不正 = 0。作る回そのものは lz-daily-build が見る。③c-1b-3b-3) '
       + '② ③c-1b (鍵の口・auto-barcode の起動の分け方・取込の記録) の後に、少数件の実機の取込で ロジザードの照合の鍵・大文字小文字・無効の商品・取り込んだ後の値・対象外の列を確かめる '
-      + '③ 切替日 = Stream Deck を ①② だけにし (この PC の C:\\tools\\logizard-automation\\.env に LOGIZARD_BC_DAILY=auto・③c-1b-3a)、自動の ③ を始める。止まると GAS の手の取込のまま (現場は止まらない) = P3',
+      + '③ 切替日 = 切替の PR (Stream Deck の auto-barcode.js から ③ を外す・台帳 lz-daily-import) を切替の手順の中でマージし、自動の ③ を始める '
+      + '(手順 = db/company/README.md「毎晩の本番の切替と GAS への戻し」・確かめ = scripts/logizard-import/lz-cutover-check.mjs)。切替の前に止まる = GAS の手の取込のまま・切替の後に毎晩の取込が止まる = ポータルの画面の手の取込 (どちらも現場は止まらない) = P3',
     where: 'miniPC の daily-sync (lz-daily.mjs) の証跡 + 中原さんとの実機の取込。手順 = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」',
     schedule: '一度きり。期限 = 台帳に載ってから 30 日 (見張りは台帳に載った時から数える)',
     period_hours: 30 * 24,
@@ -1421,7 +1432,8 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',   // human_obligation は台帳の決まりで permanent。完了の後に RETIRED_JOBS へ移す
     runbook: '① 毎朝の daily-sync の「ロジザード毎日の商品マスタ(影)」の行と DATA_DIR/company-db-evidence/<日付>/lz-daily.json の verdict と portal.ok を見る (3 日続けて pass かつ portal.ok = true か。送れていない日は数えない) '
       + '② 不合格なら report.json の unexplained / invalid を読み、直すか中原さんに認めてもらう '
-      + '③ ③c-1b の後に中原さんと少数件の実機の取込 (scripts/logizard-import/lz-import-test.mjs plan → 中原さんが一覧を認める → run・手順 = db/company/README.md) → 切替日 → 完了の ping を 1 回 → この項目を RETIRED_JOBS へ移す',
+      + '③ ③c-1b の後に中原さんと少数件の実機の取込 (scripts/logizard-import/lz-import-test.mjs plan → 中原さんが一覧を認める → run・手順 = db/company/README.md) (2026-09-30 済み・verified) '
+      + '→ 戻しの練習 → 切替日 (夜の窓の外) → 次の夜の 00:20 の lz-daily-import が verified → 完了の ping を 1 回 → この項目を RETIRED_JOBS へ移す',
   },
   {
     id: 'lz-shadow-compare',
@@ -1545,13 +1557,60 @@ export const JOBS_REGISTRY = [
     importance: 'TMP',
     owner: '中原さん',
     purpose: 'Amazon 決済レポートの取込 (fetch-amazon-settlements.js) を 2026-09-28 に V2 (GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2) に切り替えた。'
-      + 'V1 (GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE) に戻す逃げ道 --source v1 と、V2 で V1 取込済みの決済を入れない判定 (settlementIngestedByV1) を残してある。'
+      + 'V1 (GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE) に戻す逃げ道 --source v1 (coordinator amazon-finance-coverage-run.js の引数) を残してある。'
+      + '(2026-10-01 D-66: V2 で V1 取込済みの決済を入れない判定 (settlementIngestedByV1) は取込では使わなくなった = V2 も必ず文書の版として保存。関数は調べ用に残る)。'
       + 'V1 は 2026-11-11 に Amazon 側で廃止 = その後は使えない',
-    where: 'bfaith-portal リポジトリ apps/warehouse/fetch-amazon-settlements.js (SOURCES.v1・--source・settlementIngestedByV1)',
+    where: 'bfaith-portal リポジトリ apps/warehouse/fetch-amazon-settlements.js (SOURCES.v1・settlementIngestedByV1) と apps/warehouse/amazon-finance-coverage-run.js (--source)',
     remove_by: '2026-11-30',
     lifecycle: 'temporary',
-    runbook: '11/11 以降、毎朝の Amazon Settlement (V2) が問題なく動いていたら --source v1 の分岐を消す。'
-      + 'settlementIngestedByV1 は V1 で入れた決済が 98 日の取得窓から外れる (2027-02 ごろ) まで残してよい (消す PR で判断)。このエントリも消す',
+    runbook: '退避で --source v1 を使っても、有効な V2 の版がある決済は V2 のまま採られる (採る版の層の順 = V2 → V1・#1567 Codex R12 Medium 1)。V1 が採られるのは V2 の版が無い・壊れた決済だけ = '
+      + 'V2 の取込に戻せば次の回から V2 の版が入り採られる (手で版を選び直す作業は要らない)。'
+      + '11/11 以降、毎朝の Amazon決済と財務 (V2) が問題なく動いていたら --source v1 の分岐を消す。'
+      + 'settlementIngestedByV1 (調べ用) も同じ PR で消してよい。このエントリも消す',
+  },
+  {
+    id: 'cdb-finance-untokened-chunk',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'Company DB の財務の受け口 (Render apps/company-db/ingest/order-finance.mjs・PR #1561) が、coverage の世代・token の無い chunk (今までの送り手・人のバックフィル --from/--to・'
+      + 'スイッチ CDB_FINANCE_COORDINATOR が無いときの今までの送り手) をまだ受けている互換の道 (受けたら complete を無効にする = fail-closed。'
+      + 'coordinator の legacy の分岐は #1567 Codex R8 で消した・単独の送信は切り替えの後は送る前に止まる)。'
+      + '設計 (AI_reference CompanyDB構想/13 §3.1) の終わりの形 = 送るのは coordinator だけ = token の無い chunk は拒む契約にする (後の PR)',
+    where: 'bfaith-portal リポジトリ apps/company-db/ingest/order-finance.mjs (coverageOfChunk が null の chunk を受ける分岐・invalidateCompleteAfterWrite の untokened) と '
+      + 'apps/company-db/push/amazon-finance.mjs (--from/--to の単独の送信)',
+    remove_by: '2026-11-30',
+    lifecycle: 'temporary',
+    runbook: 'cdb-finance-coordinator-switch (スイッチ) を消して常に coordinator にした後、Render の受け口で token の無い chunk を 409 にする PR を作る (人のバックフィルも coordinator の回か token つきで送る形に)。'
+      + '消す前に core.finance_coverage の invalidated_reason = untokened_finance_write が 2 週間出ていないことを確かめる。このエントリも消す',
+  },
+  {
+    id: 'cdb-finance-coordinator-switch',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'Amazon の決済と財務を coordinator (amazon-finance-coverage-run.js・PR #1567) で回すかのスイッチ = env CDB_FINANCE_COORDINATOR (=1 のときだけ coordinator)。'
+      + '無い間は daily-sync・retry が今までの 2 工程 (Amazon Settlement → CompanyDB財務(Amazon)) のまま動く = miniPC の本体がほかの PR の deploy で pull されても、'
+      + '定期実行の前のハードゲート (夜に手で実の --full を 1 回: exit 0・60 分以内・最大メモリ 1,200 MB 以下) に合格する前に新しい coordinator が毎朝動き出さない。'
+      + '🚨 一方向 (#1567 Codex R6 High): 一度 coordinator が coverage の回 (世代) で回った後は、スイッチが無くても今までの 2 工程に戻らない '
+      + '(daily-sync・retry・単独の入口が、今までの取込は生の表を書く前・送り手は送る前に ❌ = 古い complete を残さない・勝手に coordinator も起動しない)。'
+      + '証拠 = ローカル (台帳・warehouse.db) と Render の決済のそろいの行の両方 (ローカルを失くした・古いバックアップに戻した・新しい DATA_DIR でも Render で分かる)。'
+      + 'Render を読めない = 判定できない = ❌ (切り替えの前でも Render が落ちた朝は今までの取込も止まる = 可用性の代わりに正しさ)。単独の --from/--to の送信も送る前に同じ門 (#1567 Codex R7)。'
+      + '一時物にした理由 = 設計の終わりの形は「決済の取込と財務の送信は coordinator だけ」(今までの 2 工程は token の無い chunk で Render の complete を毎朝無効にする = 正式な利益が出ない) = '
+      + '合格して足した後はスイッチを残す意味が無い (残すと 2 つの道の試験と保守が続く)',
+    where: 'bfaith-portal リポジトリ apps/warehouse/finance-coordinator-switch.js (スイッチと工程の選び方)・apps/warehouse/daily-sync.js (工程)・apps/warehouse/retry-failed-jobs.js '
+      + '(Amazon Settlement / CompanyDB財務(Amazon) の定義と名前の読み替え)・apps/warehouse/fetch-amazon-settlements.js / apps/company-db/push/amazon-finance.mjs の単独の入口 (無い = 今までどおり書く)・'
+      + 'miniPC の .env の CDB_FINANCE_COORDINATOR',
+    remove_by: '2026-11-30',
+    lifecycle: 'temporary',
+    runbook: '① 夜に手で実の --full を 1 回 (README「デプロイの前に本番の DB のコピーで測る」・PR #1567 の手順) → 合格したら中原さんの指示の後に **同じ保守の枠の中ですぐ** miniPC の .env に CDB_FINANCE_COORDINATOR=1 を足す '
+      + '(手順とコマンド = db/company/README.md「.env に CDB_FINANCE_COORDINATOR=1 を足す手順」= 足す前にキーが 0 行・足した後にちょうど 1 行・新しい node から 1 と読める・ほかの必須の鍵が残っている (値は出さない)。'
+      + '🚨 .env はリポジトリの直下の 1 つだけ・足す 1 行だけ書き、ほかの行を書き直さない = 2026-09-30 に .env を書き直して CDB_DB_LIMIT_BYTES など 4 つが消えた。'
+      + 'Restart-Service は要らない = daily-sync・Retry1〜3 は Task Scheduler が毎回新しい node で起こし .env を読む。翌朝の daily-sync の「Amazon決済と財務」を見る。'
+      + '足す前に朝が来た・足した後に消えた朝は「Amazon Settlement」が ❌ (一方向の門) = .env を確かめて足す) '
+      + '② 1 週間 coordinator で回ったら、スイッチ・今までの 2 工程の分岐 (daily-sync / retry の定義 / 単独の入口の書く道)・その試験を消して常に coordinator にする PR を作る。.env の行も消す。このエントリも消す。'
+      + '🚨 不合格でも一方向 = 実の回が coverage の世代を作った後は今までの 2 工程に戻らない = 足さないと翌朝から「Amazon Settlement」が ❌ で止まる (取込も止まる) → その日のうちに相談 (直して実の回をもう一度 か 上限の中なら足して coordinator で回す)。'
+      + '合格しないまま期限が来たら延ばす前に相談 (今までの 2 工程のままでは正式な利益が出ない)',
   },
   {
     id: 'rclone-own-client-id',
@@ -1654,6 +1713,14 @@ function isRealYmd(ymd) {
  * 「なぜ・何に置き換わったか」を残す (二度と同じ役目の定期実行を作らないための記録)
  */
 export const RETIRED_JOBS = [
+  {
+    id: 'lz-daily-import-shadow',
+    retired_at: '2026-10-02',   // 🚨切替の日にマージの前に直す (db/company/README.md「切替の手順」6)
+    reason: 'ロジザードの毎日の商品マスタの取込の影 (プレビューまで・押さない) は切替までの一時のもの。切替 (2b-2 の切替の PR) で毎晩の本番 lz-daily-import に置き換えた '
+      + '(影の ok を本番の ok にしない。契約 v3 H9)。影のコード (lz-daily-import.mjs の LZ_DAILY_IMPORT_SHADOW=on) は、本番が off の夜のためにまだ残る '
+      + '(本番が on の夜は影はしない)。撤去の一時物 lz-daily-import-shadow-retire もこの切替で消した',
+    replaced_by: 'lz-daily-import (scripts/logizard-import/lz-nightly.mjs・LZ_DAILY_IMPORT=on)',
+  },
   {
     id: 'inbound-check-notion-cards',
     retired_at: '2026-09-05',

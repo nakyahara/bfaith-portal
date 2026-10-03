@@ -22,6 +22,7 @@ t('表の整合: 上流も下流も retry の定義と順序にあり、上流�
     for (const j of [down, up]) { assert.ok(Object.hasOwn(JOB_DEFINITIONS, j), `${j} が JOB_DEFINITIONS に無い`); assert.ok(RETRY_ORDER.includes(j), `${j} が RETRY_ORDER に無い`); assert.ok(retryable.includes(j), `${j} が daily-sync の RETRYABLE_JOBS に無い`); }
     assert.ok(RETRY_ORDER.indexOf(up) < RETRY_ORDER.indexOf(down), `${up} が ${down} より後に走る`);
   }
+  // 決済の取込 → 財務の送り手の組 (F2b-3) は、スイッチ CDB_FINANCE_COORDINATOR が無いとき (今までの 2 工程) の組 (#1567)。あるときは coordinator 'Amazon決済と財務' の 1 工程 = この組は走らない
   assert.deepEqual(UPSTREAM_OF, { 'CompanyDB注文(Qoo10)': 'Qoo10', 'CompanyDB広告費(Amazon)': 'Amazon Ads (SKU)', 'CompanyDB財務(Amazon)': 'Amazon Settlement', 'CompanyDB観測原価': 'm_products_history' });
 });
 t('定義と順序の食い違いが無い (定義にあるのに順序に無いジョブは、retry-state に載っても永久に走らない)', () => {

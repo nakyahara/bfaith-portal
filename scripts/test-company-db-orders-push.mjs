@@ -659,6 +659,83 @@ await t('結び直しは HTTP 成功のたびに続きの位置を台帳に書�
   assert.equal(await num(`select count(*) as n from core.shipments where ne_slip_no in ('S-RK', 'S-YH', 'S-LATE', 'S-LOST') and order_id is not null`), 4);
   l.close();
 });
+await t('共通の pipeline: outbox に書く区切り (100 行・#1567) を跨ぐ 250 件 = 抜け・重なり無しで全部送る / 応答を失った chunk の再送は same / 途中の chunk が失敗した残り 190 件 (区切りを跨ぐ) は次の run が引き継いで送る / 変化なしは送らない / 150 件の変更 (区切りを跨ぐ) は次の世代で送る (#1567 Codex R11 Low 2)', async () => {
+  const { runPush } = await import('../apps/company-db/push/pipeline.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pipe-outbox-'));
+  const L = openLedger(dir, { kind: 'pipe_test' });
+  const W0 = new Database(':memory:');   // 走査の読み取りの取引を張るだけ (行は iterate が出す)
+  const flushes = [];
+  const pushOutbox = L.pushOutbox;
+  L.pushOutbox = (runId, rows) => { flushes.push(rows.length); return pushOutbox(runId, rows); };
+  // 作り物の受け口: 鍵ごとに中身を覚える (同じ中身 = same)。受領記録 (run・chunk → payload の checksum)・件数・世代
+  const store = new Map(), receipts = new Map();
+  let maxSeq = null, posts = [], inject = () => null;
+  const res = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json' } });
+  const fetchImpl = async (url, init = {}) => {
+    const u = new URL(String(url));
+    if (init.method === 'POST') {
+      const b = JSON.parse(init.body);
+      const act = inject(b);
+      if (act === 'fatal') return res({ error: '試験: この chunk は受け取らない' }, 400);
+      posts.push({ chunk: b.chunk_index, keys: b.rows.map((x) => `pt|${x.id}`) });
+      let applied = 0, same = 0;
+      for (const x of b.rows) { const k = `pt|${x.id}`, c = x.header.content_hash; if (store.get(k) === c) same++; else { store.set(k, c); applied++; } }
+      receipts.set(`${b.run_id}#${b.chunk_index}`, payloadChecksum(b.rows));
+      maxSeq = Math.max(maxSeq ?? 0, b.batch_seq);
+      if (act === 'lose') throw new TypeError('fetch failed (試験: 受け口は適用したが応答を失った)');
+      return res({ applied, same, stale: 0, failed: [], stale_keys: [] });
+    }
+    if (u.pathname.endsWith('/status')) return res({ count: store.size, max_batch_seq: maxSeq });
+    if (u.pathname.endsWith('/receipt')) { const c = receipts.get(`${u.searchParams.get('run_id')}#${u.searchParams.get('chunk_index')}`); return res({ found: c != null, payload_checksum: c ?? null }); }
+    if (u.pathname.endsWith('/keys')) return res({ keys: [...store.keys()], next: null });
+    return res({ error: 'no' }, 404);
+  };
+  let ver = new Map();   // id → 中身の版
+  const N = 250, ids = Array.from({ length: N }, (_, i) => `K${String(i).padStart(3, '0')}`);
+  const push = () => runPush({
+    kind: 'pipe_test', label: '試験', warehouse: W0, ledger: L, fetchImpl, base: 'https://render.example/sync', syncKey: 'k',
+    paths: { post: '/post', status: '/status', receipt: '/receipt', keys: '/keys' },
+    countOf: (j) => ({ count: j.count, maxBatchSeq: j.max_batch_seq }), keysOf: (j) => j.keys,
+    iterate: function* () { for (const id of ids) yield { key: `pt|${id}`, id }; }, inScope: () => true,
+    build: (g) => ({ key: g.key, payload: { id: g.id, header: { content_hash: `${g.id}-v${ver.get(g.id) || 1}` }, lines: [{ n: 1 }] } }),
+    transformVersion: 'pipe_v1', chunkSize: 60, log: () => {}, sleep: async () => {},
+  });
+  const confirmed = () => [...L.loadFingerprints().values()].filter((fp) => fp !== '').length;
+  const sentKeys = () => posts.flatMap((p) => p.keys);
+  try {
+    // (1) 初回: chunk 0 は受け口が適用した後に応答を失う → 再送は same / chunk 1 は 400 = run は止まる → 残り 190 件 (100 の区切りを跨ぐ) が outbox に残る
+    const seen = new Map();
+    inject = (b) => { const n = (seen.get(b.chunk_index) || 0) + 1; seen.set(b.chunk_index, n); return b.chunk_index === 0 && n === 1 ? 'lose' : b.chunk_index === 1 ? 'fatal' : null; };
+    await assert.rejects(push(), /HTTP 400/);
+    assert.deepEqual(flushes, [100, 100, 50], `outbox に書く区切り = 100 行 (${flushes})`);
+    assert.deepEqual([seen.get(0), seen.get(1), store.size, confirmed(), L.outboxKeys().length], [2, 1, 60, 60, 190], '再送した chunk 0 だけ送付済み・残りは outbox');
+    assert.deepEqual(sentKeys(), ids.slice(0, 60).flatMap((k) => [`pt|${k}`]).concat(ids.slice(0, 60).map((k) => `pt|${k}`)), 'chunk 0 は同じ 60 件を 2 回 (再送)');
+    // (2) 次の run: 残り 190 件を追跡に引き継ぎ、走査で読み直して送る (抜け・重なり無し)
+    flushes.length = 0; posts = []; inject = () => null;
+    const r2 = await push();
+    assert.deepEqual([r2.ok, r2.carriedOver, r2.ledgerReset, r2.scanned, r2.unchanged, r2.changed, r2.applied, r2.same, r2.chunks], [true, 190, null, 250, 60, 190, 190, 0, 4]);
+    assert.deepEqual(flushes, [100, 90]);
+    assert.deepEqual(sentKeys(), ids.slice(60).map((k) => `pt|${k}`), '残りの 190 件を走査の順に 1 回ずつ');
+    assert.deepEqual([store.size, confirmed(), L.outboxKeys().length], [250, 250, 0]);
+    // (3) 変化なし = 送らない
+    flushes.length = 0; posts = [];
+    const r3 = await push();
+    assert.deepEqual([r3.ok, r3.unchanged, r3.changed, r3.chunks, flushes.length, posts.length], [true, 250, 0, 0, 0, 0]);
+    // (4) 150 件の中身が変わる (区切りを跨ぐ) = 次の世代で 150 件だけ送る
+    for (const id of ids.slice(50, 200)) ver.set(id, 2);
+    flushes.length = 0; posts = [];
+    const r4 = await push();
+    assert.deepEqual([r4.ok, r4.unchanged, r4.changed, r4.applied, r4.same, r4.chunks, r4.batchSeq > r2.batchSeq], [true, 100, 150, 150, 0, 3, true]);
+    assert.deepEqual(flushes, [100, 50]);
+    assert.deepEqual(sentKeys(), ids.slice(50, 200).map((k) => `pt|${k}`));
+    assert.ok(ids.every((id) => store.get(`pt|${id}`) === `${id}-v${ver.get(id) || 1}`), '受け口の中身 = 全部最新');
+    assert.deepEqual([confirmed(), L.outboxKeys().length], [250, 0]);
+    // (5) もう一度 = 変化なし
+    flushes.length = 0; posts = [];
+    const r5 = await push();
+    assert.deepEqual([r5.ok, r5.changed, posts.length, flushes.length], [true, 0, 0, 0]);
+  } finally { L.close(); W0.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
 W.close();
 server.close();
 

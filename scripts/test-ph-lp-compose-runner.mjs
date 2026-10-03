@@ -62,10 +62,10 @@ const state = path.join(tmp || process.cwd(), 'state');
  * 🚨 spawnSync は使えない — service-api を**同じプロセス**に立てているので、
  *    親が同期で止まると子の HTTP が返ってこない (行き詰まる)。
  */
-const phlp = (...args) => new Promise((resolve) => {
+const phlpWith = (extraEnv, ...args) => new Promise((resolve) => {
   const child = spawn(process.execPath, [PHLP, ...args], {
     cwd: work,
-    env: { ...process.env, PH_LP_BASE: BASE, PH_SERVICE_TOKEN: 'test-token-lp-runner', PH_LP_RETRIES: '1', PH_LP_STATE_DIR: state },
+    env: { ...process.env, PH_LP_BASE: BASE, PH_SERVICE_TOKEN: 'test-token-lp-runner', PH_LP_RETRIES: '1', PH_LP_STATE_DIR: state, ...extraEnv },
   });
   let so = '', se = '';
   child.stdout.on('data', (d) => { so += d; });
@@ -76,6 +76,8 @@ const phlp = (...args) => new Promise((resolve) => {
     resolve({ code, out: so, err: se, json });
   });
 });
+
+const phlp = (...args) => phlpWith({}, ...args);
 
 const exists = (n) => fs.existsSync(path.join(work, n));
 const inState = (n) => fs.existsSync(path.join(state, n));
@@ -158,11 +160,24 @@ console.log('⑤ 予約の前は fail / release、後は result');
 const rel = await phlp('release', jid, '--reason', '一時障害');
 eq(rel.code, 0, '予約前は手放せる');
 eq(rel.json.status, 'queued', 'キューに戻る');
-const cl2 = await phlp('claim', '--run', 'lp-test-2');
+// ランナーが決めた run id (PH_LP_RUN_ID) が job に写る。Claude が --run に何を書いても変わらない
+// (ランナーはこの id で「実際に本回答を書いたモデル」を付ける・codex #1591 High)
+const cl2 = await phlpWith({ PH_LP_RUN_ID: 'lpr-20261002-160000-abcdef' }, 'claim', '--run', 'lp-test-2');
 eq(cl2.json.job_id, req.job.id, 'もう一度掴める');
-const rv = await phlp('reserve', jid);
+eq(db.prepare('SELECT runner_run_id FROM ph_lp_compose_jobs WHERE id = ?').get(req.job.id).runner_run_id, 'lpr-20261002-160000-abcdef',
+  '🚨 run id はランナーの PH_LP_RUN_ID (Claude の --run ではない)');
+// モデルはランナーが PH_LP_MODEL で渡す (claude --model と同じ値)。Claude の申告は使わない (2026-10-02)
+const rvNoEnv = await phlp('reserve', jid);
+ok(rvNoEnv.code !== 0 && /PH_LP_MODEL/.test(rvNoEnv.err + rvNoEnv.out),
+  '🚨 PH_LP_MODEL が無ければ予約しない (claim の応答のモデルで代わりに予約しない・codex #1591 Medium)');
+const rvBad = await phlpWith({ PH_LP_MODEL: 'claude-opus-5' }, 'reserve', jid);
+eq(rvBad.code, 1, '🚨 サーバの設定と違うモデルでは予約できない');
+eq(rvBad.json?.code, 'bad_model', 'bad_model で断られる');
+const rv = await phlpWith({ PH_LP_MODEL: lp.DEFAULT_MODEL }, 'reserve', jid, '--model', 'claude-opus-5');
 eq(rv.code, 0, '予約できる');
 ok(rv.json.generation_id > 0, 'generation_id が返る');
+eq(db.prepare('SELECT model FROM ph_lp_compose_generations WHERE id = ?').get(rv.json.generation_id).model, lp.DEFAULT_MODEL,
+  '🚨 記録されるのはランナーが渡したモデル (--model を書いても使わない)');
 eq((await phlp('fail', jid, '--code', 'OTHER', '--message', 'x')).code, 1, '🚨 予約後に fail は通らない');
 eq((await phlp('release', jid, '--reason', 'x')).code, 1, '🚨 予約後に release も通らない');
 eq((await phlp('fail', jid, '--code', 'へんなコード')).code, 2, '知らない code は断る');

@@ -21,6 +21,7 @@
 import Database from 'better-sqlite3';
 import path from 'node:path';
 import fs from 'node:fs';
+import { assertDocumentVersionsReady } from '../../apps/warehouse/amazon-settlement-versions.js';
 
 // ============================================================
 // CLI args parsing
@@ -148,6 +149,8 @@ try {
     });
   console.log(`  Parsed ${statements.length} executable statements`);
 
+  // 🆕 2026-10-01 (D-66): 決済の行は採った文書の版だけから作る = 版の無い行 (過去の行の backfill 前) があれば止める (黙って行を落とさない)
+  assertDocumentVersionsReady(db);
   if (dryRun) {
     console.log(`  (dry-run) would execute ${statements.length} statements in a single tx`);
   } else {

@@ -126,7 +126,7 @@ ok(req.ok, '依頼できる');
 console.log('⑤ できたら本文と lint が入る');
 const claim = lp.claimJob(db, { runnerRunId: 'ui-run-1' });
 const gen = lp.reserveGeneration(db, claim.job.job_id, {
-  leaseToken: claim.job.lease_token, model: 'claude-opus-5', promptVersion: lp.PROMPT_VERSION,
+  leaseToken: claim.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION,
 });
 lp.recordImageServed(db, claim.job.job_id, {
   leaseToken: claim.job.lease_token, fileId: 'FILEIDTOP001', sha256: 'a'.repeat(64), bytes: 1234,
@@ -138,6 +138,12 @@ const sub = lp.submitResult(db, gen.generation_id, {
   packetHash: claim.job.packet_hash, verdict: 'accepted', output: OUT, reviewRounds: 1, lint: { ok: true },
 });
 eq(sub.status, 'done', '結果を受け取れる');
+{
+  // 🚨 本文は、ランナーが「実モデル = 頼んだモデル」を付けるまで出さない (codex #1591 R2 High)
+  const pre = embedded((await getDetail(draftId)).html);
+  ok(pre.job.status === 'done' && pre.job.model_check === null && pre.job.output_text === null, '🚨 実モデルの確認前は本文を画面に出さない (確認中)');
+  lp.recordModelCheck(db, { runnerRunId: 'ui-run-1', actualModels: ['claude-opus-5-5'] });
+}
 {
   const { html } = await getDetail(draftId);
   const s = embedded(html);
@@ -153,6 +159,15 @@ eq(sub.status, 'done', '結果を受け取れる');
   ok(typeof s.job.packet_hash === 'string' && s.job.packet_hash.length === 64, '台帳に要る packet_hash が渡っている');
   ok(typeof s.job.spec_id === 'number', '台帳に要る spec_id が渡っている');
   ok(s.job.within_deadline === true || s.job.within_deadline === false, '台帳に要る「期限内」が渡っている');
+
+  console.log('⑤a モデル名がボタンと結果に出る (2026-10-02)');
+  eq(s.model, lp.DEFAULT_MODEL, 'いま押したら使われるモデル (サーバの設定) が渡っている');
+  eq(s.model_label, 'Opus 5.5', 'ボタンに出す名前');
+  ok(html.includes('🤖 構成をAIに作らせる (Opus 5.5)</button>'), '🚨 最初の表示 (EJS) のボタンにもモデル名が出る');
+  eq(s.job.model, lp.DEFAULT_MODEL, 'この依頼で予約されたモデルが渡っている (台帳に書き写す)');
+  eq(s.job.model_label, 'Opus 5.5', '結果に出す名前');
+  ok(s.job.model_check === 'match' && s.job.actual_model === 'claude-opus-5-5', 'ランナーが付けた確認が画面に渡る (一致・実モデル)');
+  ok(html.includes("'モデル確認済み'") || html.includes('モデル確認済み'), '画面に確認の文言がある');
 
   console.log('⑤b 🚨 AI の本文で HTML が壊れない');
   // 🚨 文字列としての window.__lpcPwned は残る (本文なので当然)。
@@ -186,12 +201,97 @@ console.log('⑥b 🚨 裏面情報だけの商品でも押せる (画面と API
   // 商品情報は空、裏面情報だけ入れる
   db.prepare(`INSERT INTO draft_image_production (draft_id, product_info_text, back_info_text) VALUES (?, '', ?)`)
     .run(d3, '原材料: ハッカ油、エタノール。内容量 300ml。火気厳禁。');
+  db.prepare(`INSERT INTO draft_images (draft_id, sort, drive_file_id, drive_modified_time) VALUES (?, 0, 'FILEIDBACK01', '2026-09-30T00:00:00.000Z')`).run(d3);
   const html = (await getDetail(d3)).html;
   const s3 = embedded(html);
   eq(s3.blocked, null, '🚨 裏面情報だけでも押せる');
   // API 側と同じ判定になっていること
   const viaApi = await (await fetch(`${base}/api/drafts/${d3}/lp-compose`)).json();
   eq(viaApi.blocked, s3.blocked, '🚨 画面の最初の表示と API の判定が一致する');
+}
+
+console.log('⑥c 🚨 商品画像が無ければ押す前に止める (2026-10-02 の 1 件目は 4 分待って IMAGES_UNAVAILABLE)');
+{
+  const d4 = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('LP-UI-4', '吹き出し シール 20種120枚入', 'test')`
+  ).run().lastInsertRowid);
+  db.prepare(`INSERT INTO draft_image_production (draft_id, product_info_text) VALUES (?, ?)`).run(d4, '吹き出しの形のシール。20 種類 120 枚入り。');
+  const s4 = embedded((await getDetail(d4)).html);
+  ok(String(s4.blocked || '').includes('商品画像がありません'), `画像が無ければ押せない (${s4.blocked})`);
+  const viaApi4 = await (await fetch(`${base}/api/drafts/${d4}/lp-compose`)).json();
+  eq(viaApi4.blocked, s4.blocked, '🚨 画面の最初の表示と API の判定が一致する');
+  const post4 = await fetch(`${base}/api/drafts/${d4}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0004' }),
+  });
+  eq(post4.status, 409, '🚨 画面を通さずに POST しても受け付けない');
+  eq(db.prepare('SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE draft_id = ?').get(d4).n, 0, '依頼は作られない');
+
+  console.log('⑥d 白抜きだけでも押せる・白抜きが先頭 (2026-10-02 fukidashiseal: 白抜きしか無くて押せなかった)');
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, white_bg_drive_file_id, white_bg_modified_time) VALUES (?, 'FILEIDWHITE01', '2026-10-01T00:00:00.000Z')`).run(d4);
+  const s4w = embedded((await getDetail(d4)).html);
+  eq(s4w.blocked, null, '🚨 白抜きがあれば押せる');
+  const post4w = await fetch(`${base}/api/drafts/${d4}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0004w' }),
+  });
+  eq(post4w.status, 200, '依頼できる');
+  const pk = JSON.parse(db.prepare('SELECT packet_json FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(d4).packet_json);
+  eq(pk.images.map((im) => im.file_id), ['FILEIDWHITE01'], 'packet の画像 = 白抜き');
+  // 商品画像も入れると、白抜きが先頭・続けて TOP から (同じファイルは 1 回だけ)
+  db.prepare(`INSERT INTO draft_images (draft_id, sort, drive_file_id, drive_modified_time) VALUES (?, 0, 'FILEIDTOP004', '2026-10-01T00:00:00.000Z')`).run(d4);
+  db.prepare(`INSERT INTO draft_images (draft_id, sort, drive_file_id, drive_modified_time) VALUES (?, 1, 'FILEIDWHITE01', '2026-10-01T00:00:00.000Z')`).run(d4);
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ?`).run(d4);
+  const post4b = await fetch(`${base}/api/drafts/${d4}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0004b' }),
+  });
+  eq(post4b.status, 200, 'もう一度依頼できる');
+  const pk2 = JSON.parse(db.prepare('SELECT packet_json FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(d4).packet_json);
+  eq(pk2.images.map((im) => im.file_id), ['FILEIDWHITE01', 'FILEIDTOP004'], '白抜きが先頭・続けて TOP・重複は 1 回');
+  eq(pk2.images.map((im) => im.role), ['white_bg', 'slot:1'], '🚨 画像に役割が残る (白抜き / 画像タブの番号・codex #1592 Medium)');
+  eq(pk2.packet_version, 3, 'packet の版 = 3');
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ?`).run(d4);
+
+  console.log('⑥e 白抜き + 商品画像 6 枚 → 白抜き + 1〜5 (合わせて 6 枚)・画面に並びが出る (codex #1592 High・Low)');
+  db.prepare('DELETE FROM draft_images WHERE draft_id = ?').run(d4);
+  for (let i = 0; i < 6; i++) {
+    db.prepare(`INSERT INTO draft_images (draft_id, sort, drive_file_id, drive_modified_time) VALUES (?, ?, ?, '2026-10-01T00:00:00.000Z')`).run(d4, i, 'FILEIDSLOT0' + (i + 1));
+  }
+  const s6 = embedded((await getDetail(d4)).html);
+  eq((s6.image_plan || []).map((im) => im.label), ['白抜き', '1 TOP', '2', '3', '4', '5'], '🚨 押す前に「AI に渡す画像」の並びが画面に渡る');
+  // 画面の JS (lpcImagesText) を描画済みの HTML から切り出して実際に動かす (codex #1592 R2 High)
+  const html6pre = (await getDetail(d4)).html;
+  const src = html6pre.slice(html6pre.indexOf('// lpc-images-text:start'), html6pre.indexOf('// lpc-images-text:end'));
+  ok(src.includes('function lpcImagesText'), '画面の JS から切り出せる');
+  const lpcImagesText = new Function(src + '\nreturn lpcImagesText;')();
+  const t6 = lpcImagesText(s6, false);
+  ok(t6.includes('この依頼で AI に渡した画像: 白抜き → 1 TOP\n'), `終わった前回の依頼の並び (${JSON.stringify(t6)})`);
+  ok(t6.includes('もう一度押すと渡す画像: 白抜き → 1 TOP → 2 → 3 → 4 → 5'), '🚨 押し直したときに渡すいまの並びも出す (前回の並びだけを出さない)');
+  eq(lpcImagesText({ job: null, image_plan: s6.image_plan, blocked: null }, false).split('\n')[0], '押すと AI に渡す画像: 白抜き → 1 TOP → 2 → 3 → 4 → 5', '依頼が無ければいまの並びだけ');
+  eq(lpcImagesText({ job: null, image_plan: [], blocked: '商品画像がありません' }, false), '', '押せないときは出さない');
+  const post6 = await fetch(`${base}/api/drafts/${d4}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0004c' }),
+  });
+  eq(post6.status, 200, '依頼できる');
+  const pk6 = JSON.parse(db.prepare('SELECT packet_json FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(d4).packet_json);
+  eq(pk6.images.map((im) => im.file_id), ['FILEIDWHITE01', 'FILEIDSLOT01', 'FILEIDSLOT02', 'FILEIDSLOT03', 'FILEIDSLOT04', 'FILEIDSLOT05'],
+    '🚨 packet = 白抜き + 1〜5 (6 枚目は入らない)');
+  const sj = embedded((await getDetail(d4)).html);
+  eq(sj.job.images.map((im) => im.label), ['白抜き', '1 TOP', '2', '3', '4', '5'], '依頼の後は「この依頼で渡した画像」(受付時に固定) が画面に渡る');
+  eq(sj.job.images[0].file_id, 'FILEIDWHITE01', '測定行に書く file_id も渡る');
+  // POST の応答も初期表示と同じ形 (同じキーの再送に終わった依頼が返る場合・codex #1592 R3 Medium)
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ?`).run(d4);
+  const again = await (await fetch(`${base}/api/drafts/${d4}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0004c' }),
+  })).json();
+  ok(again.ok && again.created === false && again.job.status === 'cancelled', '同じキーの再送は終わった依頼を返す');
+  eq((again.image_plan || []).map((im) => im.label), ['白抜き', '1 TOP', '2', '3', '4', '5'], '🚨 POST の応答にも画像の並びがある');
+  ok('blocked' in again && 'spec' in again, 'POST の応答にも押せない理由・仕様書がある');
+  ok(lpcImagesText(again, false).includes('もう一度押すと渡す画像: 白抜き → 1 TOP'), '🚨 POST の応答をそのまま描いても「もう一度押すと渡す画像」が出る');
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'queued' WHERE draft_id = ? AND idempotency_key = 'ui-key-0004c'`).run(d4);
+  const tj = lpcImagesText(sj, true);
+  ok(tj.startsWith('この依頼で AI に渡した画像: 白抜き → 1 TOP → 2 → 3 → 4 → 5') && !tj.includes('もう一度押すと'), '作っている間はその依頼の並びだけ');
+  const html6 = (await getDetail(d4)).html;
+  ok(html6.includes('id="lpc-images"'), '画像の並びを出す置き場がある');
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ?`).run(d4);
 }
 
 console.log('⑦ 失敗・成否不明も画面に出る');
@@ -203,7 +303,7 @@ console.log('⑦ 失敗・成否不明も画面に出る');
   const dr2 = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(d2);
   const r2 = lp.requestJob(db, {
     draft: dr2, spec, idempotencyKey: 'ui-key-0002', actor: 'nakahara@x',
-    productInfo: '天然ハッカ油 200ml。', colorVariations: '', images: [],
+    productInfo: '天然ハッカ油 200ml。', colorVariations: '', images: [{ file_id: 'FILEIDUI2001' }],
   });
   ok(r2.ok, '2 件目を受け付ける');
   const c2 = lp.claimJob(db, { runnerRunId: 'ui-run-2' });

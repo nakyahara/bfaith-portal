@@ -23,6 +23,13 @@
 -- ----------------------------
 DROP TABLE IF EXISTS _silver_month_v1;
 
+-- 🆕 2026-10-01 (D-66・D7b-1b-3): 決済ごとに採る文書の版 = 1 つ (db.js の v_amazon_settlement_selected_documents。送り手 amazon-finance-transform.mjs と同じ規則)。
+--   日次の財務・Easy Ship の割り振りの両方を **採った版の行だけ** から作る (版をまたいで行ごとに最新を選ばない = 新しい文書から消えた行を古い文書から残さない)
+DROP TABLE IF EXISTS _selected_docs_v1;
+CREATE TEMP TABLE _selected_docs_v1 AS
+SELECT document_version_seq, settlement_id FROM v_amazon_settlement_selected_documents;
+CREATE UNIQUE INDEX _selected_docs_v1_idx ON _selected_docs_v1 (document_version_seq, settlement_id);
+
 -- 2026-09-28: 同じ決済の中で business_line_key が同じ行は parser の重複ではなく本物の別々の行だった
 --   (全部の行の合計が振込額と 1 円まで一致・(決済, 鍵) で 1 行にすると 2 週間ごとに 55〜65 万円少ない)
 --   → 同じ文書の中の出現順 (occ) を鍵に足す。db.js の v_amazon_settlement_unified と同じ形
@@ -30,9 +37,10 @@ DROP TABLE IF EXISTS _silver_month_v1;
 CREATE TEMP TABLE _silver_month_v1 AS
 WITH occ AS (
   SELECT l.*,
-         DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.source_document_id ORDER BY l.source_line_no) AS occ
+         DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.document_version_seq ORDER BY l.source_line_no) AS occ
   FROM raw_amazon_settlement_lines l
   WHERE l.year_month_int = :year_month_int
+    AND (l.document_version_seq, l.source_settlement_id) IN (SELECT document_version_seq, settlement_id FROM _selected_docs_v1)
     AND l.economic_date IS NOT NULL
     AND l.seller_sku_normalized IS NOT NULL
     AND TRIM(l.seller_sku_normalized) <> ''
@@ -50,14 +58,7 @@ dedup AS (
   SELECT l.*,
          ROW_NUMBER() OVER (
            PARTITION BY l.source_settlement_id, l.business_line_key, l.occ
-           ORDER BY CASE l.source_layer
-                      WHEN 'sp_api_v1' THEN 1
-                      WHEN 'sp_api_v2' THEN 1
-                      WHEN 'manual_csv' THEN 2
-                      ELSE 3
-                    END,
-                    l.ingested_at DESC,
-                    l.source_document_id
+           ORDER BY l.ingested_at DESC, l.id
          ) AS rn
   FROM occ l
 )
@@ -97,9 +98,10 @@ DROP TABLE IF EXISTS _easyship_alloc_v1;
 CREATE TEMP TABLE _easyship_alloc_v1 AS
 WITH es_occ AS (
   SELECT l.*,
-         DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.source_document_id ORDER BY l.source_line_no) AS occ
+         DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.document_version_seq ORDER BY l.source_line_no) AS occ
   FROM raw_amazon_settlement_lines l
   WHERE l.year_month_int = :year_month_int
+    AND (l.document_version_seq, l.source_settlement_id) IN (SELECT document_version_seq, settlement_id FROM _selected_docs_v1)
     AND l.economic_date IS NOT NULL
     AND l.transaction_type = 'Amazon Easy Ship Charges'
 ),
@@ -108,22 +110,16 @@ es AS MATERIALIZED (
          COALESCE(l.other_amount_micro, 0) + COALESCE(l.item_related_fee_amount_micro, 0) AS amt,
          ROW_NUMBER() OVER (
            PARTITION BY l.source_settlement_id, l.business_line_key, l.occ
-           ORDER BY CASE l.source_layer
-                      WHEN 'sp_api_v1' THEN 1
-                      WHEN 'sp_api_v2' THEN 1
-                      WHEN 'manual_csv' THEN 2
-                      ELSE 3
-                    END,
-                    l.ingested_at DESC,
-                    l.source_document_id
+           ORDER BY l.ingested_at DESC, l.id
          ) AS rn
   FROM es_occ l
 ),
 od_occ AS (
   SELECT l.*,
-         DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.source_document_id ORDER BY l.source_line_no) AS occ
+         DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.document_version_seq ORDER BY l.source_line_no) AS occ
   FROM raw_amazon_settlement_lines l INDEXED BY idx_settle_lines_order
   WHERE l.amazon_order_id IN (SELECT amazon_order_id FROM es WHERE rn = 1 AND amazon_order_id IS NOT NULL)
+    AND (l.document_version_seq, l.source_settlement_id) IN (SELECT document_version_seq, settlement_id FROM _selected_docs_v1)
     AND l.transaction_type = 'Order'
     AND l.seller_sku_normalized IS NOT NULL
     AND TRIM(l.seller_sku_normalized) <> ''
@@ -132,14 +128,7 @@ od AS (
   SELECT l.amazon_order_id, l.seller_sku_normalized AS seller_sku, l.price_type, l.price_amount_micro,
          ROW_NUMBER() OVER (
            PARTITION BY l.source_settlement_id, l.business_line_key, l.occ
-           ORDER BY CASE l.source_layer
-                      WHEN 'sp_api_v1' THEN 1
-                      WHEN 'sp_api_v2' THEN 1
-                      WHEN 'manual_csv' THEN 2
-                      ELSE 3
-                    END,
-                    l.ingested_at DESC,
-                    l.source_document_id
+           ORDER BY l.ingested_at DESC, l.id
          ) AS rn
   FROM od_occ l
 ),
