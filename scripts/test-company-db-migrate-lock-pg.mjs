@@ -27,6 +27,7 @@
  *   O0 migration の file は役割を切り替える文を持たない (grep の縛り) / O1〜O4 持ち主の mode (Codex R-D60-v3-10 H2) = ① PR 1b の前 (印なし = 接続の役割) / ② PR 1b 自身 (owner-transition = 接続の役割で移し、記録は印の役割・
  *     同じ回の後の file は owner mode) / ③ PR 1b の後 (SET ROLE で流す・接続の役割は記録表に書けない・失敗しても役割が戻り lock が外れる・SET できなければ止まる) /
  *     印を作ってよいのは owner-transition の file だけ・owner-transition が印を作らなければ巻き戻す・2 回目の owner-transition は流さない
+ *   O5 印と owner-transition の適用を両方向で確かめる (印が消えた・印だけある → 止まる) / O6 本文が役割を戻しても記録は印の役割で入る
  * 使い方: node scripts/test-company-db-migrate-lock-pg.mjs   (npm run test:company-db にも入っている)
  *   使い捨てのクラスタを embedded-postgres で起動し、最後に止めて消す (test-company-db-profit-fn-revoke-pg.mjs と同じ作り)。
  *   見つからない・版が違う・起動できない・フォルダが消えない = 失敗 (exit 1)
@@ -683,7 +684,7 @@ create table app.r2 (x int);
     assert.equal((await c.query(`select count(*)::int as n from pg_class where relname = 'r1'`)).rows[0].n, 0);
     // owner-transition をもう一度 = 流さない (前の検査で止まる)
     const dir5 = mkDir({ ...base, '0003_more.sql': 'create table app.more (x int);\n', '0004_idx.sql': CI_SQL, '0004_idx.expect.json': JSON.stringify(EXPECT), '0005_again.sql': transitionSql(dbName, role + 'x') });
-    await assert.rejects(migrate(c, { dir: dir5 }), (e) => e.code === 'OWNER_MODE_INVALID' && /もう owner mode/.test(e.message));
+    await assert.rejects(migrate(c, { dir: dir5 }), (e) => e.code === 'OWNER_MODE_INVALID' && /2 つある|もう owner mode/.test(e.message));
     // 接続の役割が印の役割に SET できない → 止まる (何も流さない)
     await su.query(`grant ${role} to ${OWNER} with set false granted by ${OWNER}`);   // 同じ付与の SET を外す
     await assert.rejects(migrate(c, { dir: dir2 }), (e) => e.code === 'OWNER_MODE_INVALID' && /SET ROLE できない/.test(e.message));
@@ -705,6 +706,54 @@ create table app.r2 (x int);
     assert.equal(await ownerOf(c, 'ops.schema_migrations'), OWNER);
     assert.deepEqual(await versions(c), ['0001']);
     assert.deepEqual(await lockHolders(dbName), []);
+  });
+
+  await t('O5 印と owner-transition の適用を両方向で確かめる (Codex R-D60-v3-11 M-new-2): transition 適用済み・印が消えた → 止まる / 印がある・transition が未適用 (file なし・未適用) → 止まる', async () => {
+    const dbName = await newDb();
+    const c = await open(dbName);
+    const role = `cdb_owner_${hex}_${++roleSeq}`;
+    const base = { '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role) };
+    await migrate(c, { dir: mkDir(base) });
+    const more = mkDir({ ...base, '0003_more.sql': 'create table app.more (x int);\n' });
+    // 印が消えた (人が誤って drop) = legacy に戻らない
+    const dbSu = new URL(suUrl); dbSu.pathname = `/${dbName}`;
+    const s2 = await openPgClient(dbSu.toString()); s2.on('error', () => {}); clients.push(s2);
+    await s2.query('drop table ops.migrate_owner');
+    await assert.rejects(migrate(c, { dir: more }), (e) => e.code === 'OWNER_MODE_INVALID' && /印が消えた可能性/.test(e.message));
+    // 接続の役割が記録表を読めても (権限を足しても) ① の検査で止まる
+    await s2.query(`grant usage on schema ops to ${OWNER}; grant select, insert on ops.schema_migrations to ${OWNER}`);
+    await assert.rejects(migrate(c, { dir: more }), (e) => e.code === 'OWNER_MODE_INVALID' && /適用済みなのに印/.test(e.message));
+    assert.equal((await s2.query(`select count(*)::int as n from pg_class where relname = 'more'`)).rows[0].n, 0, 'legacy で流した');
+    assert.deepEqual(await lockHolders(dbName), []);
+    // 逆: 印だけがある (transition の file が無い・未適用) → 止まる
+    const db2 = await newDb();
+    const c2 = await open(db2);
+    await migrate(c2, { dir: mkDir({ '0001_base.sql': BASE }) });
+    const db2Su = new URL(suUrl); db2Su.pathname = `/${db2}`;
+    const s3 = await openPgClient(db2Su.toString()); s3.on('error', () => {}); clients.push(s3);
+    await s3.query(`create table ops.migrate_owner (x int); alter table ops.migrate_owner owner to ${OWNER}`);
+    await assert.rejects(migrate(c2, { dir: mkDir({ '0001_base.sql': BASE, '0002_more.sql': 'create table app.more (x int);\n' }) }), (e) => e.code === 'OWNER_MODE_INVALID' && /file に無い/.test(e.message));
+    const r2 = `cdb_owner_${hex}_${++roleSeq}`;
+    await assert.rejects(migrate(c2, { dir: mkDir({ '0001_base.sql': BASE, '0002_owner.sql': transitionSql(db2, r2) }) }), (e) => e.code === 'OWNER_MODE_INVALID' && /が適用されていない \(0002_owner\.sql\)/.test(e.message));
+    assert.deepEqual(await versions(c2), ['0001']);
+    assert.deepEqual(await lockHolders(db2), []);
+  });
+
+  await t('O6 owner mode で本文が (grep を逃れる形で) 役割を戻しても、記録の INSERT は印の役割で入る (Codex R-D60-v3-11 M-new-3 = INSERT の直前の SET LOCAL ROLE)', async () => {
+    const dbName = await newDb();
+    const c = await open(dbName);
+    const role = `cdb_owner_${hex}_${++roleSeq}`;
+    const base = { '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role) };
+    await migrate(c, { dir: mkDir(base) });
+    // set_config('role', 'none', true) = SET LOCAL ROLE NONE と同じ (字句の検査は見つけない)。接続の役割は記録表に書けない = 直前の SET LOCAL ROLE が無ければ 42501
+    const body = "select set_config('role', 'none', true) as r;\n";
+    assert.deepEqual(roleSwitchStatements(body), []);
+    const r = await migrate(c, { dir: mkDir({ ...base, '0003_evade.sql': body }) });
+    assert.deepEqual(r.applied, ['0003']);
+    const dbSu = new URL(suUrl); dbSu.pathname = `/${dbName}`;
+    const s2 = await openPgClient(dbSu.toString()); s2.on('error', () => {}); clients.push(s2);
+    assert.equal((await s2.query(`select count(*)::int as n from ops.schema_migrations where version = '0003'`)).rows[0].n, 1);
+    assert.deepEqual(await whoami(c), { cu: OWNER, su: OWNER });
   });
 
   await t('X1 --index-expect は使い捨ての DB から expect.json の中身を出す (試験で作ったものと同じ)', async () => {

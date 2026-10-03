@@ -778,10 +778,27 @@ export async function applyMigrations(db, opts = {}) {
     `);
   }
   // dry-run は DDL を流さない = 記録表が無ければ「何も適用していない」とみる
-  const appliedRows = (migExists || !dryRun) ? await inModeTx(db, mode0, async () => (await db.query('select version, checksum from ops.schema_migrations order by version')).rows) : [];
+  let appliedRows = [];
+  if (migExists || !dryRun) {
+    try {
+      appliedRows = await inModeTx(db, mode0, async () => (await db.query('select version, checksum from ops.schema_migrations order by version')).rows);
+    } catch (e) {
+      // legacy なのに記録表を読めない = 持ち主を移した後に印 (ops.migrate_owner) が消えた可能性 = legacy に戻して流さない (Codex R-D60-v3-11 M-new-2)
+      if (mode0.mode === 'legacy' && e.code === '42501') throw ownerErr(`印 ${OWNER_MARKER_TABLE} が無いのに記録表 ops.schema_migrations を接続の役割で読めない (${e.message}) = 持ち主を移した後に印が消えた可能性 = 流さない`);
+      throw e;
+    }
+  }
   const applied = new Map(appliedRows.map((r) => [r.version, r.checksum]));
 
   const files = listMigrationFiles(dir);
+  // 🚨 持ち主の印と owner-transition の適用を両方向で確かめる (Codex R-D60-v3-11 M-new-2: 印が消えて legacy に戻る fail-open を塞ぐ)
+  //   ① owner-transition の migration が適用済み → 印が要る / ② 印がある → owner-transition の migration (file も) が適用済み
+  const transFiles = files.filter((f) => f.ownerTransition);
+  if (transFiles.length > 1) throw ownerErr(`owner-transition の migration が 2 つある (${transFiles.map((f) => f.file).join(', ')}) = 持ち主の移しは 1 つの file (1 つの取引) だけ`);
+  const transFile = transFiles[0] || null;
+  const transApplied = !!(transFile && applied.has(transFile.version));
+  if (mode0.mode === 'legacy' && transApplied) throw ownerErr(`owner-transition の ${transFile.file} は適用済みなのに印 ${OWNER_MARKER_TABLE} が無い = 印が消えた可能性 = legacy に戻して流さない (印を戻すまで止まる)`);
+  if (mode0.mode === 'owner' && !transApplied) throw ownerErr(`印 ${OWNER_MARKER_TABLE} があるのに owner-transition の migration が${transFile ? `適用されていない (${transFile.file})` : ' file に無い'} = 印だけが作られた可能性 = 流さない`);
   // 🚨 DB に記録があるのにファイルが無い = 別ブランチ・別 checkout で流したか、ファイルを消した。黙って成功にしない (Codex R1-M5)
   const onDisk = new Set(files.map((f) => f.version));
   const orphan = [...applied.keys()].filter((v) => !onDisk.has(v));
