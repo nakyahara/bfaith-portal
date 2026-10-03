@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * test-company-db-migrate-lock-pg.mjs — migrate.mjs の全体の排他と concurrent-index の migration を本物の PostgreSQL で確かめる
- *   (D-60 PR 3a-i・設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10「migrate の runner の契約 (3a-i)」v3.9)
+ *   (D-60 PR 3a-i・設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10「migrate の runner の契約 (3a-i)」v3.14)
  *
  * 固定する契約:
  *   L0b runner は db/company/migrations/ の番号つきの file だけを読む (migrations-pending/ は読まない)
@@ -33,6 +33,8 @@
  *     C10 6 本を続けて作る = この回に作った分を後の空きから引く (H3) / C11 容量の resource と接続先の結び付け (H2) / O9 --list の両方向の検査 (M1) /
  *     C12 既存の index の tablespace・fillfactor (M2) / M3 最上位の取引の制御を拒む (0001〜 には無い) / C13 setSession の途中の失敗でも設定が戻る (Low) /
  *     C14 同じ index の名前の操作が 2 つ = 拒む (Low)
+ *   🆕 Codex R2 High (PR #1606): O0・O8 = Unicode の escape の名前・文字列 (U&"…"・U&'…'・UESCAPE) = 本物の PG と PGlite で役割が本当に戻る形を、owner の状態では流す前に止める
+ *     (中身を読まずに一律に拒む・ドルの引用の中も) / O12 = legacy の file は ⚠️ だけで今までどおり流す・同じ回の owner-transition の後の file は拒む
  *   🆕 Codex R-D60-v3-13 H1: O0・O6・O8 = ドルの引用の中 (DO の本文) の set_config('role', …) も拒む / 動的 SQL (EXECUTE format) は見ない = ⚠️ を出して流し、記録は印の役割 (補助で sandbox ではない)
  *   🆕 設計 13 v3.14 (形 B): 持ち主の mode の試験は CREATEROLE の無い deployer (DEPLOYER) で流す (役割は superuser が作る) / O10 = 到達の検査の禁止の集合 (owner の状態では必須・本番の道・--dry-run・--list)・
  *     役割の図の比較 / O11 = 記録の INSERT の後の deferred の trigger / C10 ③ = 前の回の valid・未記録の index を含む予約 / C11 = host の対応の fixture・未確認の間は CIC を流さない
@@ -53,6 +55,7 @@ import {
   openPgClient, pgAdapter, pgliteAdapter, applyMigrations, migrateWithLock, withMigrateLock, listMigrationFiles, buildIndexExpect, readIndexAttrs, attrDiff,
   splitSqlStatements, parseConcurrentIndexStatement, planConcurrentIndexFile, estimateIndexBytes, roleSwitchStatements, ALLOWED_SET_LOCAL_ROLES, MIGRATE_LOCK_NAME, DISK_ESTIMATE, DEFAULT_DIR,
   txControlStatements, renderResourceMatchesUrl, renderDiskMetricsReader, migrationStatus, RENDER_PG_HOST_MAPPING, roleAdminReachable, ROLE_ADMIN_FORBIDDEN_PREDEFINED,
+  unicodeEscapeLiterals,
 } from './company-db/migrate.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -819,6 +822,8 @@ ${tail}`;
 
   await t('O0 migration の file は全部、許さない役割の切り替えを持たない (grep の縛り) / 拒む形 = RESET ROLE・session の SET ROLE・SET SESSION ROLE・ROLE NONE・SESSION AUTHORIZATION・set_config(role)・DISCARD・一覧の外の SET LOCAL ROLE / 許す = 一覧の SET LOCAL ROLE (設計 13 v3.11 ③)', async () => {
     for (const f of listMigrationFiles()) assert.deepEqual(roleSwitchStatements(f.text), [], f.file);
+    // 🆕 Codex R2 High: 0001〜 に Unicode の escape は 1 つも無い (legacy の ⚠️ も出ない = 後方の互換を壊さない)
+    for (const f of listMigrationFiles()) assert.deepEqual(unicodeEscapeLiterals(f.text), [], f.file);
     assert.deepEqual(ALLOWED_SET_LOCAL_ROLES, ['cdb_owner', 'profit_definer', 'heavy_guard_definer', 'heavy_read_definer', 'd60_calib_definer', 'finance_revision_definer']);
     assert.deepEqual(roleSwitchStatements(["-- reset role", "select 'set role x'; /* set local role y */ select 1;"].join(String.fromCharCode(10))), []);
     // 🆕 Codex R-D60-v3-13 H1: ドルの引用の中は (データの文字列でも) 見る = 拒む向き
@@ -832,14 +837,21 @@ ${tail}`;
       // 🆕 Codex R-D60-v3-13 H1: ドルの引用の中 (DO の本文・関数の本文・入れ子) も見る
       "do $$ begin perform set_config('role', 'none', true); end $$", 'DO $x$ BEGIN RESET ROLE; END $x$', "create function app.f() returns void language plpgsql as $f$ begin set local role postgres; end $f$",
       'do $a$ begin execute $b$ reset "role" $b$; end $a$', "do $$ begin perform pg_catalog.set_config(v_name, 'none', true); end $$", 'do $$ begin execute \'x\'; reset role; end $$',
-      'do $$ begin raise notice $q$ unclosed; end $$'];
+      'do $$ begin raise notice $q$ unclosed; end $$',
+      // 🆕 Codex R2 High: Unicode の escape の名前・文字列 (U&"…"・U&'…'・UESCAPE) = 中身を読まずに一律に拒む (大文字小文字・空白・コメント・ドルの引用の中も)
+      'RESET U&"role";', "SET LOCAL U&\"r\\006Fle\" = 'none';", "SELECT pg_catalog.U&\"set_confi\\0067\"('role', 'none', true);",
+      'reset u&"ROLE"', "set local U&\"r!006Fle\" UESCAPE '!' = 'none'", 'RESET U & "role"', 'reset U/* c */&"role"', "select u&'x'", "select U&'x' uescape '!'", 'select 1 UESCAPE',
+      'set local role U&"cdb_owner"', 'do $$ begin reset U&"role"; end $$', "do $a$ begin perform pg_catalog.U&\"set_confi\\0067\"('role', 'none', true); end $a$",
+      "create function app.g() returns text language sql as $f$ select U&'\\0061' $f$"];
     for (const x of rejected) assert.ok(roleSwitchStatements(x).length > 0, `拒まない: ${x}`);
     const allowed = ['set local role cdb_owner', 'SET LOCAL ROLE profit_definer;', 'set local role heavy_guard_definer', 'set local role heavy_read_definer', 'set local role d60_calib_definer', 'set local role finance_revision_definer',
       'SET LOCAL ROLE "profit_definer"', "set local role 'cdb_owner'", 'reset all', "select set_config('search_path', 'pg_catalog', true)",
       // DO の本文の許す形 (今の migration の書き方)・動的 SQL の文字列の中は見ない (= 補助で sandbox ではない・runner は ⚠️ を出す)
       "do $$ begin perform set_config('app.x', 'y', true); execute format('grant select on %I to x', 't'); end $$", 'do $$ begin set local role cdb_owner; end $$',
       "do $$ begin execute format('select set_config(%L, %L, true)', 'role', 'none'); end $$",
-      "select \"set_config\"('search_path', 'pg_catalog', true)", 'select "role" from app.t', "comment on column app.t.a is 'reset role'"];
+      "select \"set_config\"('search_path', 'pg_catalog', true)", 'select "role" from app.t', "comment on column app.t.a is 'reset role'",
+      // 🆕 Codex R2 High: U& でない形は今までどおり (名前 u・u & 数・文字列の中の U&・引用の名前の中の u&)
+      'select u from app.t', 'select u & 1 from app.t', "select 'U&\"role\"'", 'select "u&x" from app.t', 'select xu & 1 from app.t'];
     for (const x of allowed) assert.deepEqual(roleSwitchStatements(x), [], `拒んだ: ${x}`);
   });
 
@@ -1026,8 +1038,12 @@ create table app.r2 (x int);
   const QUOTED_ROLE_SWITCHES = ['RESET "role";', "SET LOCAL \"role\" = 'none';", "SELECT \"set_config\"('role', 'none', true);",
     'reset /* c */ "ROLE";', "set\n  local -- c\n  \"Role\" = 'none';", "select pg_catalog.\"set_config\"( 'role' , 'none' , true );", 'RESET\n"role"',
     // 🆕 Codex R-D60-v3-13 H1: DO の本文の中
-    "do $$ begin perform set_config('role', 'none', true); end $$;"];
-  await t('O8 (Codex R1 H1) 引用の名前の役割の切り替え (RESET "role"・SET LOCAL "role" = \'none\'・"set_config"(\'role\', …) と大文字小文字・空白・コメント) = 本物の PG と PGlite で本当に役割が戻る形 → owner の状態では流す前に止まる (current_user は接続の役割に戻らない = 何も作らない)', async () => {
+    "do $$ begin perform set_config('role', 'none', true); end $$;",
+    // 🆕 Codex R2 High: Unicode の escape の名前・文字列 (R2 の 3 つ + 大文字小文字・UESCAPE・文字列・DO の本文の中)
+    'RESET U&"role";', "SET LOCAL U&\"r\\006Fle\" = 'none';", "SELECT pg_catalog.U&\"set_confi\\0067\"('role', 'none', true);",
+    'reset u&"ROLE";', "set local U&\"r!006Fle\" UESCAPE '!' = 'none';", "select set_config(U&'r\\006Fle', 'none', true);",
+    'do $$ begin reset U&"role"; end $$;', "do $$ begin perform pg_catalog.U&\"set_confi\\0067\"('role', 'none', true); end $$;"];
+  await t('O8 (Codex R1 H1・R2 High) 引用の名前の役割の切り替え (RESET "role"・SET LOCAL "role" = \'none\'・"set_config"(\'role\', …) と大文字小文字・空白・コメント・U&"…"・U&\'…\'・UESCAPE) = 本物の PG と PGlite で本当に役割が戻る形 → owner の状態では流す前に止まる (current_user は接続の役割に戻らない = 何も作らない)', async () => {
     const dbName = await newDepDb();
     const c = await openDep(dbName);
     const role = await newOwnerRole();
@@ -1088,6 +1104,25 @@ alter table ops.migrate_owner owner to ${prole};
         assert.equal(await cu(), su0);
       }
     } finally { await pgl.close(); }
+  });
+
+  await t('O12 (Codex R2 High) legacy (印が無い) の file の U& は ⚠️ を出すだけで今までどおり流す / 同じ回の owner-transition の後の file の U& は流す前に止まる (前の file も流さない)', async () => {
+    const dbName = await newDepDb();
+    const c = await openDep(dbName);
+    const legacyU = "create table app.o12 (x int);\ncomment on table app.o12 is U&'d\\0061ta';\n";
+    const logs = [];
+    assert.deepEqual((await migrate(c, { dir: mkDir({ '0001_base.sql': BASE, '0002_u.sql': legacyU }), log: (m) => logs.push(m) })).applied, ['0001', '0002']);
+    assert.ok(logs.some((m) => /⚠️ 0002_u\.sql: Unicode の escape .*legacy/.test(m)), logs.join('\n'));
+    assert.equal((await c.query(`select obj_description('app.o12'::regclass, 'pg_class') as d`)).rows[0].d, 'data');
+    // 同じ回: 0002 が owner-transition → 0003 は owner の状態 = U& を拒む (1 周目で止まる = 0001 も流さない)
+    const db2 = await newDepDb();
+    const c2 = await openDep(db2);
+    const role = await newOwnerRole();
+    await assert.rejects(migrate(c2, { dir: mkDir({ '0001_base.sql': BASE, '0002_owner.sql': transitionSql(db2, role), '0003_u.sql': 'create table app.o12b (x int);\nRESET U&"role";\n' }) }),
+      (e) => e.code === 'OWNER_MODE_INVALID' && e.version === '0003' && /U&"…"/.test(e.message));
+    assert.deepEqual((await c2.query(`select (select count(*)::int from ops.schema_migrations) as n, to_regnamespace('app') is null as no_app`)).rows[0], { n: 0, no_app: true });   // 記録表は bootstrap だけ・0001 も流さない
+    assert.deepEqual(await whoami(c2), { cu: DEPLOYER, su: DEPLOYER });
+    assert.deepEqual(await lockHolders(db2), []);
   });
 
   await t('O9 (Codex R1 M1) --list も印と owner-transition の適用を両方向で確かめる: 印が消えた (接続の役割に記録表の SELECT が残る) → 一覧を出して exit 1 (OWNER_MODE_INVALID) / 印だけある → exit 1 / 整っていれば exit 0', async () => {

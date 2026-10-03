@@ -8,7 +8,7 @@
  *   - 🚨 適用済みファイルは書き換えない (checksum が違えば止まる)。直したいときは次の番号で足す
  *   - SQLite の「起動時に CREATE IF NOT EXISTS」方式は持ち込まない。適用は人が (または配布手順が) このコマンドで行う
  *
- * 🆕 D-60 PR 3a-i (設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10「migrate の runner の契約 (3a-i)」v3.9):
+ * 🆕 D-60 PR 3a-i (設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10「migrate の runner の契約 (3a-i)」v3.14):
  *   - **全体の排他** = CLI の入口 (migrateWithLock → withMigrateLock) が、接続の直後に session の advisory lock
  *     (hashtextextended('company_db_migrate', 0)) を try で取り、bootstrap → 未適用の判定 → DDL → 検証 → 記録 を同じ接続のまま行う (ふつうの migration も)。
  *     取れなければ待たずに MIGRATE_LOCKED (exit 1・「別の migrate が動いている」)。
@@ -32,9 +32,11 @@
  *     予想 × 3 を後の空きから引く + file の合計を先に 1 回で判定 / M1 --list も印の両方向の検査 / M2 属性に tablespace・reloptions /
  *     M3 ふつうの file の最上位の取引の制御を拒む / Low = setSession を try の中に・同じ index の名前の操作は 1 つ
  *   - 🆕 設計 13 v3.13 ①〜⑩・Codex R-D60-v3-13 / v3-14 = ドルの引用の中も役割の検査 (DO・EXECUTE は ⚠️) / ROLE_GRAPH_CHANGED (記録の INSERT → SET CONSTRAINTS
- *     ALL IMMEDIATE の後に比べる) / ROLE_ADMIN_REACHABLE (形 B = 必須・形 A = 警告) / resource の照合は host + API の databaseName・host の対応は未確認 = CIC を流さない /
+ *     ALL IMMEDIATE の後に比べる) / ROLE_ADMIN_REACHABLE (形 B = 必須・形 A は採らない = owner の状態では必ず拒む) / resource の照合は host + API の databaseName・host の対応は未確認 = CIC を流さない /
  *     予約に前の回の valid も / reltablespace・reloptions の正規化 / session の設定を戻せなければ接続を捨てる。
  *     🚨 owner の状態の migration は sandbox ではない (記録の直前の SET LOCAL ROLE が守るのは記録の行だけ)
+ *   - 🆕 Codex R2 (PR #1606) High = Unicode の escape の名前・文字列 (U&"…"・U&'…'・UESCAPE 句) は owner の状態の file では一律に拒む
+ *     (U&"role" で役割の検査を迂回できた・decode はしない = 下の unicodeEscapeLabel)。legacy の file は ⚠️ だけ (今までどおり流す)
  *
  * 使い方:
  *   COMPANY_DB_URL=postgres://... node scripts/company-db/migrate.mjs            # 未適用を全部
@@ -397,6 +399,52 @@ function rejectUnmarkedConcurrently(f) {
 }
 
 /**
+ * 🆕 Codex R2 High (PR #1606): toks[i] から始まる Unicode の escape の名前・文字列 (U&"…"・U&'…') と UESCAPE 句の印 (無ければ null)。
+ *   Postgres では U&"r\006Fle" は引用の名前 "role" の別の書き方 = `RESET U&"role"`・`SET LOCAL U&"r\006Fle" = 'none'`・
+ *   `pg_catalog.U&"set_confi\0067"('role', 'none', true)` が役割の検査を迂回できた (字句では U・&・"…" の 3 つに分かれる)。
+ *   形 = 単独の名前 u (大文字小文字を問わない) → & → 引用の名前か文字列。間の空白・コメントも拒む向きに含める (Postgres では空白を挟むと
+ *   U & "x" = 演算子になり escape ではないが、区別しない = 拒む向きに倒す)。UESCAPE は U& の後にしか書けない = 単独でも拒む。
+ * 🚨 正しく decode する道は採らない: \XXXX・\+XXXXXX・UESCAPE の任意の escape の文字・サロゲートの組・server の encoding・
+ *   standard_conforming_strings との組み合わせを Postgres と 1 文字も違わずに再現しなければならず、1 つでもずれると「無い」と言う側 (fail-open) に倒れる。
+ *   一律に拒むのは fail-closed で、migration の file は U& を要らない (0001〜0056 に 1 つも無い・普通の "…" で書ける)
+ */
+function unicodeEscapeLabel(toks, i) {
+  const tk = toks[i];
+  if (!tk || tk.t !== 'word') return null;
+  const w = tk.v.toLowerCase();
+  if (w === 'uescape') return 'UESCAPE 句 (Unicode の escape・中身を読まずに拒む)';
+  const amp = toks[i + 1], q = toks[i + 2];
+  if (w === 'u' && amp && amp.t === 'punct' && amp.v === '&' && q && (q.t === 'qid' || q.t === 'str')) {
+    return `${q.t === 'qid' ? 'U&"…" (Unicode の escape の名前' : "U&'…' (Unicode の escape の文字列"}・中身を読まずに拒む)`;
+  }
+  return null;
+}
+/**
+ * 文 (ドルの引用の中も深さ 4 まで) の Unicode の escape の印の一覧 ([] = 無い)。legacy の file の ⚠️ に使う (owner の状態は roleSwitchStatements が拒む)。
+ * 字句に読めない = 例外 (呼び手が決める)
+ */
+export function unicodeEscapeLiterals(text, depth = 0) {
+  const toks = lexSql(text);
+  const hits = [];
+  for (let i = 0; i < toks.length; i++) {
+    const ue = unicodeEscapeLabel(toks, i);
+    if (ue) hits.push(ue);
+    const tk = toks[i];
+    if (tk.t !== 'dollar' || depth >= 4) continue;
+    const tag = /^\$[^$]*\$/.exec(tk.v)[0];
+    let sub;
+    try { sub = unicodeEscapeLiterals(tk.v.slice(tag.length, tk.v.length - tag.length), depth + 1); } catch { continue; }
+    for (const h of sub) hits.push(h.startsWith('(ドルの引用の中) ') ? h : `(ドルの引用の中) ${h}`);
+  }
+  return hits;
+}
+function warnUnicodeEscapeInLegacy(f, log = () => {}) {
+  let hits;
+  try { hits = unicodeEscapeLiterals(f.text); } catch { return; }   // legacy = 読めない file は今までどおり Postgres に任せる
+  if (hits.length) log(`⚠️ ${f.file}: Unicode の escape (${[...new Set(hits)].join('・')}) がある。legacy (印が無い) なので今までどおり流すが、owner の状態 (PR 1b の後) では流す前に拒む = 普通の "…"・'…' で書く`);
+}
+
+/**
  * owner の状態の file で `SET LOCAL ROLE <名前>` を許す役割の一覧 (設計 13 v3.11 ③・正本はこの定数)。
  * 印の役割 cdb_owner と NOLOGIN の持ち主 5 つ (「以後の更新」の専用の持ち主の関数・設計 19 の F4-2a が file の中で使う)
  */
@@ -406,6 +454,7 @@ export const ALLOWED_SET_LOCAL_ROLES = Object.freeze(['cdb_owner', 'profit_defin
  * 役割を切り替える文のうち、owner の状態の file で許さないもの (コメント・文字列の外を見る・🆕 ドルの引用の中も同じに見る = R-D60-v3-13 H1)。戻り = 理由の一覧 ([] = 無い)。
  * 拒む (設計 13 v3.11 ③) = RESET ROLE・SET ROLE (LOCAL の無い = session)・SET SESSION ROLE・SET [LOCAL] ROLE NONE・SET / RESET SESSION AUTHORIZATION・
  *   set_config('role', …)・DISCARD・SET LOCAL ROLE <一覧の外の役割>。許す = SET LOCAL ROLE <ALLOWED_SET_LOCAL_ROLES のどれか> だけ。
+ * 🆕 Codex R2 High (PR #1606): Unicode の escape の名前・文字列 (U&"…"・U&'…'・UESCAPE 句) は中身を読まずに拒む (下の unicodeEscapeLabel)。
  * 🚨 字句の検査は補助で、sandbox ではない = 守りの本体は「記録の INSERT の直前の SET LOCAL ROLE <印の役割>」(動的 SQL で役割を変えられても記録は印の役割)。
  *   migration の本文の副作用 (動的 SQL で役割を変えた後の DDL・membership の変更) は取り消さない = 役割の管理は migration に書かず、別の資格・別の session で流す (設計 13 v3.13)
  */
@@ -429,6 +478,8 @@ export function roleSwitchStatements(text, allowed = ALLOWED_SET_LOCAL_ROLES, de
   };
   const hits = [];
   for (let i = 0; i < toks.length; i++) {
+    const ue = unicodeEscapeLabel(toks, i);   // 🆕 Codex R2 High: U&"…"・U&'…'・UESCAPE は名前を読まずに一律に拒む (ドルの引用の中も下の再帰で同じ)
+    if (ue) hits.push(ue);
     const w0 = lw(toks[i]), w1 = lw(toks[i + 1]), w2 = lw(toks[i + 2]);
     if (w0 === 'reset' && (w1 === 'role' || (w1 === 'session' && w2 === 'authorization'))) hits.push(`reset ${w1 === 'role' ? 'role' : 'session authorization'}`);
     if (w0 === 'discard' && ['all', 'plans', 'sequences', 'temp', 'temporary'].includes(w1)) hits.push(`discard ${w1}`);
@@ -1101,7 +1152,9 @@ export async function applyMigrations(db, opts = {}) {
   let ownerFromHere = mode0.mode === 'owner';
   for (const f of todo) {
     if (f.ownerTransition) { ownerFromHere = true; continue; }
-    if (ownerFromHere && !f.concurrentIndex) rejectRoleSwitchInOwnerMode(f, log);
+    if (f.concurrentIndex) continue;
+    if (ownerFromHere) rejectRoleSwitchInOwnerMode(f, log);   // 🆕 Codex R2 High: U&"…"・U&'…'・UESCAPE もここで拒む
+    else warnUnicodeEscapeInLegacy(f, log);   // legacy = ⚠️ だけ (今までどおり流す・0001〜0056 には U& が無い)
   }
   const transitions = todo.filter((f) => f.ownerTransition);
   if (transitions.length && mode0.mode === 'owner') throw Object.assign(new Error(`${transitions[0].file} は owner-transition の migration なのに、もう owner mode (${mode0.role}) = 流さない (持ち主の移しは 1 回だけ)`), { code: 'OWNER_MODE_INVALID', version: transitions[0].version });
