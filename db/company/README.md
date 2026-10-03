@@ -1679,6 +1679,66 @@ Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/c
 
 試験 = `node scripts/test-company-db-amazon-profit.mjs` (32 件: 材料は 1 回だけ計算 (関数の本体を数えて固定) / 受け取り時の出品を集合で比べる (財務・広告) / relink の後は印が付かない (わかる範囲の印の限界を固定) / coverage の関数の世代と版 (合計は source を含めて 1 つのときだけ) / coverage が null なら正式な値は全部 null / 差し替えた後の手で計算した値 (税込・税抜・値引きの税・広告 × 1.1・返品の推定・負の手数料・override_zero と原価不明) / 構成 0 件・候補 2 件・出品なし / 広告の状態 (legacy・missing・not_collected) / 分けられない部品の相殺・旧い形の行・単価の無い返品 / 同じ日に 2 回変わった原価・観測と推定 / hash が JS と一致 / ASIN は未解決・別名は結ぶ・未解決は出品の行だけ止める / Easy Ship (割合・等分・端数・返金・期間に依らない・配れない額・負の重み (0 にする)・全部が非正 (等分)・保存則) / master_notes (受け取りとの違い・監査の記録・タイトルは数えない) / 理由の順と列ごとの null (3 つの coverage で全行) / 日の合計 (列の組ごとの条件・税の表・保存則・row_kind が重ならない・取引の無い日) / 契約 / HTTP (10/1 から 503 `PROFIT_ROUTE_DISABLED`・DB に接続しない (pg の client を作らない)・鍵が無ければ 401))
 
+### 重い関数の権限と重い入口の棚卸し (0056・D-60 の緊急の封鎖 = PR 1a。Codex R-D60-v3-4 H2 / R-D60-v3-5)
+
+🚨 **0056 から、D-60 の重い関数 10 個は誰も直接呼べない** (持ち主・watcher・profit_reader・PUBLIC のどれでも `permission denied for function` = 42501)。
+受け口の 503 (#1570) は HTTP だけの封じ込めで、DB に直接つなげば (持ち主の `COMPANY_DB_URL`・watcher・PUBLIC) 呼べた = 10/1 の停止をもう一度起こせた。受け口は 503 のまま (この PR で 1 文字も変えない)。
+上の「受け入れの条件」「読むだけの確かめ」の SQL も **本番では 42501 で止まる** (流さない)。校正は使い捨ての同じ条件の DB で (§3.10)。
+
+- **重い入口の棚卸し = `scripts/company-db/heavy-entry-manifest.mjs` (`HEAVY_ENTRY_MANIFEST`)**。署名つきの固定の一覧で、0056 の migration とは別に持つ。分け方:
+  - `revoke` (10) = 0056 で権限の表 (`proacl`) を **空** にした = `mart.amazon_profit_daily_range`・`mart.amazon_profit_day_totals_range`・`mart._amazon_profit_totals`・`mart._amazon_profit_rows`・
+    `mart._amazon_profit_finance_days`・`mart._amazon_profit_ad_days`・`mart._amazon_profit_ad_children`・`mart._amazon_easy_ship_alloc`・`mart.amazon_profit_assert_args`・`mart.finance_daily_sku_range`
+    (0047 / 0050 の watcher の GRANT も外した)。PUBLIC・watcher・profit_reader (あれば)・持ち主・表に載っていた全部の役割から外し、最後に空を確かめる (違えば例外 = 取引ごと巻き戻す。持ち主でない役割で流すと `d60_revoke_incomplete`)
+  - `guard_later` = 重いが正当な呼び手がいる (か、外すかを人が決める) = **権限は変えない** (後の PR で共通の lock `company_db_heavy` に参加させるか外す)。
+    `mart.finance_daily_range` (受け口 `GET /order-finance/daily`・watcher にも明示の GRANT)・`mart.ad_efficiency` / `_coverage`・`mart.sku_activity` / `_gaps`・`mart.sales_expanded_to_skus`・`mart.listings_to_skus` (人・AI が読む)・
+    `mart.sales_daily_check` / `refresh_sales_daily` / `build_sales_daily_dates` / `purge_sales_daily` (受け口)・`core.relink_shipments_bulk` / `reresolve_order_lines` / `merge_duplicate_suppliers` (一時の表 = TEMP)・
+    `core.relink_shipments`・`core.relink_ad_spend_listings`・`raw.purge_superseded_observations`・`ops.amazon_map_sales_coverage` / `unmapped_recent` (理由は manifest)。
+    🚨 **これらは今も DB に直接つなげば呼べる** (「repo の中から呼んでいない」は直呼びを防いだ証明ではない)
+  - `light` = 規則にかかるが重くない (定数・policy の表だけ・DDL の補助・coverage の 1 行など)。権限は変えない
+- **見つける規則** (試験と `--verify` が pg_proc と突き合わせる): core / mart / ops / raw / snapshots / events の関数 (trigger を除く) で、① schema が mart ② 入力の引数が期間・件数・保持の形
+  (名前 `p_from` / `p_to` / `p_since` / `p_after` / `p_upto` × 日付・時刻の型、`p_days` / `p_limit` / `p_keep_days` × 整数、`p_dates` × date[]) ③ 本体が revoke の関数を名前で呼ぶ、のどれか
+  = manifest に無ければ「分けていない」で落ちる。revoke の関数にあとから GRANT しても・guard_later / light の PUBLIC の可否が manifest と違っても落ちる。
+- **呼び手の調べ (10/3)** = アプリ (router・ingest・watch・miniPC の送り手・measure-amazon-finance) で revoke の関数を呼ぶ所は無い。revoke の関数を呼ぶ関数は revoke の関数だけ・SECURITY DEFINER の呼び手も無い。
+  coverage の complete の道 (財務の chunk → updating → complete → `finance_coverage_state`) は revoke の関数を使わない (本物の PG の試験で通す)。
+- **持ち主自身から外しても効く** (PostgreSQL 18.4 で確かめた)。ただし持ち主は **付け直せる** (持ち主は常に GRANT の権限を持つ) = この封鎖は「うっかり・ほかの接続から呼べない」まで。
+  SECURITY DEFINER の関数 (定義者 = 持ち主) の中から呼んでも 42501 = 抜け道にならない。superuser は権限を見ない (PGlite の試験の接続は superuser = ほかの試験は今までどおり呼べる)。
+- **PR 1a でしないこと** (PR 1b = 別の管理主体が要る): 役割 (`profit_definer`・migration の deployer) を作らない・持ち主を移さない・全体の既定の権限を変えない・**TEMP の権限を外さない**
+  (持ち主の relink・reresolve_order_lines・merge_duplicate_suppliers が一時の表を使う)。TEMP は `--verify` が **監査の結果を出すだけ** (PUBLIC・役割ごとの TEMP・一時の表を作る関数)。
+  PG 16 以降、CREATEROLE の役割が作った役割には ADMIN だけが付き SET が無い = `alter function … owner to` は `must be able to SET ROLE` で止まる (実機で確かめた)。
+- 🚨 **約束 1 (revoke の関数を直す)**: 持ち主にも EXECUTE が無いので、`create or replace` は関数の検査 (validator) が 42501 で止まる。直す migration は **同じ取引で**
+  `grant execute on function <署名> to current_user` → `create or replace` → 0056 と同じに全員から外す (`revoke … from public` / `from current_user`) → 権限の表が空を確かめる。
+- 🚨 **約束 2 (これから作る関数)**: 関数の既定は PUBLIC EXECUTE。`alter default privileges … in schema mart revoke … from public` は **効かない** (schema ごとの既定は全体の既定に足すだけ・実機で確かめた)。
+  → 重い入口の規則にかかる関数は **作った取引で署名ごとに REVOKE** (閉じるなら) し、manifest に分け方と理由を足す (足さないと試験が落ちる)。
+- 🚨 `create-watch-roles.mjs` は SECURITY DEFINER の関数の全部に **持ち主の EXECUTE を付け直す** (`grant execute … to <owner>`)。今の revoke の関数は SECURITY INVOKER なので当たらないが、
+  revoke の関数を SECURITY DEFINER にするとき (後の PR) はスクリプトから外す (流し直すと封鎖が外れる)。
+
+本番の確かめ (読むだけ・カタログの SELECT だけで重い関数は呼ばない): `node -r dotenv/config scripts/company-db/heavy-entry-manifest.mjs --verify` (問題があれば exit 1・TEMP の監査も出す)。
+
+試験 = `node scripts/test-company-db-profit-fn-revoke.mjs` (PGlite・13 件: 0055 までの姿で watcher・profit_reader・PUBLIC が呼べる前提 / 0056 の後は revoke の 10 の権限の表が空・3 つの役割は 42501 /
+guard_later・light の権限の表は前と 1 文字も同じ / 2 回流しても同じ / TEMP の監査は前と同じ / 棚卸しの突き合わせと漏れ止め 3 つ / 受け口は 503 で DB に接続しない) +
+`scripts/test-company-db-profit-fn-revoke-pg.mjs` (本物の PG・`TEST_PG_URL` が無ければ飛ばす・11 件: 持ち主 = superuser でない CREATEROLE の login の役割で全部の migration を流す /
+持ち主・watcher・profit_reader・PUBLIC だけの役割の全部が 42501 / guard_later・light と持ち主と TEMP は変わらない / coverage の complete の道と `finance_daily_range` は今までどおり /
+SECURITY DEFINER の中からも 42501 / create or replace の約束 / 2 回流しても同じ / `--verify` が前 ❌・後 ✅ / 持ち主でない役割で流すと止まる)。この PC では使い捨ての PG (embedded-postgres) で流す。
+
+**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に miniPC で dry-run → 本適用)**。0056 は権限だけ (表・関数の中身は変えない・利益の値は計算しない)。
+Render のコードは変わらない (受け口は 503 のまま) = Render の deploy と順番は無い。
+
+```
+# 本番で使っていない worktree から (miniPC の PowerShell 5.1。.env は本体の 1 つを読む)
+cd C:\Users\bfaith\bfaith-portal
+git fetch origin
+git worktree add C:\tmp\d60-revoke origin/master
+cd C:\tmp\d60-revoke
+npm ci
+$env:DOTENV_CONFIG_PATH = 'C:\Users\bfaith\bfaith-portal\.env'
+node -r dotenv/config scripts\company-db\heavy-entry-manifest.mjs --verify      # 前: ❌ (revoke の関数を watcher・PUBLIC・持ち主が呼べる) が出ること。TEMP の監査を控える
+node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                  # 0056 だけが出ること
+node -r dotenv/config scripts\company-db\migrate.mjs                            # 0056 (applied=1)
+node -r dotenv/config scripts\company-db\heavy-entry-manifest.mjs --verify      # 後: ✅
+cd C:\Users\bfaith\bfaith-portal
+git worktree remove C:\tmp\d60-revoke
+```
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。
