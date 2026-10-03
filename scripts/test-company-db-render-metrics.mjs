@@ -9,6 +9,8 @@
  *   使う直前の鮮度の再検査 / 設定 / 🚨 鍵 (RENDER_API_KEY) が戻り値・例外・console・fixture に出ない
  *   🆕 #1600 R1: 実在しない日付 (2026-02-30 ほか) は拒む・ナノ秒で比べる / 本文は逐次読み 1MB を超えたらやめる (Content-Length なし・少なく書いた・chunked) /
  *     値は本文の文字のままで整数の safe integer だけ (1073741824.00000001 ほか) / 400 ほか全部の非 200 / 理由の優先 (timeout が先・次に endpoint の順)
+ *   🆕 #1600 R2: 本文は自前の厳密な JSON の読み方 (reviver の context.source を使わない = 本番の node:20-slim で動く)。Node 20 でも流す:
+ *     npx -y node@20 scripts/test-company-db-render-metrics.mjs
  * 実行: node scripts/test-company-db-render-metrics.mjs
  */
 import assert from 'node:assert/strict';
@@ -17,7 +19,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { inspect } from 'node:util';
 import {
-  fetchPostgresMetrics, checkFreshness, readRenderMetricsConfig, parseRfc3339Nanos, RenderApiKey, REASONS, METRIC_ENDPOINTS, RENDER_API_BASE, RESOURCE_LABEL_FIELD,
+  fetchPostgresMetrics, checkFreshness, readRenderMetricsConfig, parseRfc3339Nanos, parseJsonIntegersOnly, RenderApiKey, REASONS, METRIC_ENDPOINTS, RENDER_API_BASE, RESOURCE_LABEL_FIELD,
 } from '../apps/company-db/profit/render-metrics.mjs';
 
 let ok = 0, ng = 0;
@@ -263,6 +265,41 @@ await t('整数の文字の safe integer は受け取る (9007199254740991 の�
   assert.equal(r.ok, true, JSON.stringify(r)); assert.equal(r.snapshot.memoryUsedBytes, 0);
   r = await run({ diskUsage: { body: rawSeries('diskUsage', '-0') } });
   assert.equal(r.ok, true, JSON.stringify(r)); assert.ok(Object.is(r.snapshot.diskUsedBytes, -0) || r.snapshot.diskUsedBytes === 0);
+});
+
+console.log(`JSON の読み方 = 自前の厳密な文法で数の字句をそのまま見る (Node 20 でも同じ・#1600 R2) [Node ${process.version}]`);
+await t('reviver の第 3 引数 (context.source) を使っていない (本番の node:20-slim では渡らない)', async () => {
+  const src = fs.readFileSync(new URL('../apps/company-db/profit/render-metrics.mjs', import.meta.url), 'utf8').replace(/^\s*\*.*$/gm, '').replace(/\/\/.*$/gm, '');
+  assert.doesNotMatch(src, /context\.source|JSON\.parse\(\s*[a-zA-Z_.]+\s*,/);   // JSON.parse(x, reviver) の形が無い (文字列の字句の JSON.parse(lex(…)) だけ)
+  const docker = fs.readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
+  assert.match(docker.split('\n')[0], /^FROM node:20/, '本番の Node の版が変わったら、この試験を Node の版に合わせて見直す');
+});
+await t('正常の 4 つの fixture の本文を JSON.parse と同じ値に読む (数は整数の safe integer のまま)', async () => {
+  for (const f of fs.readdirSync(FIX_DIR)) {
+    const text = fs.readFileSync(new URL(f, FIX_DIR), 'utf8');
+    assert.deepEqual(JSON.parse(JSON.stringify(parseJsonIntegersOnly(text))), JSON.parse(text), f);
+  }
+});
+await t('数の字句: 整数の safe integer だけ数・小数 / 指数 / 2^53 以上は NOT_INTEGER (境界 1073741824.00000001・1073741823.99999999 も)', async () => {
+  const one = (t) => parseJsonIntegersOnly(`[${t}]`)[0];
+  for (const [t, v] of [['0', 0], ['-0', -0], ['7', 7], ['-12', -12], ['9007199254740991', 9007199254740991], ['-9007199254740991', -9007199254740991]]) assert.ok(Object.is(one(t), v), t);
+  for (const t of ['1073741824.00000001', '1073741823.99999999', '1.0', '1e3', '1E3', '1e+3', '1e-3', '0.5', '-1.5', '9007199254740992', '9007199254740993', '1e300', '123456789012345678901234567890']) {
+    const v = one(t);
+    assert.ok(v !== null && typeof v === 'object' && v.notInteger === true, t);
+  }
+});
+await t('文法の違反・同じ key・深すぎる・末尾の余り → METRICS_SHAPE / "__proto__" の key は prototype を変えない', async () => {
+  const bad = ['', ' ', '[', '[1,]', '[,1]', '{"a":1,}', '{"a" 1}', '{a:1}', "{'a':1}", '[01]', '[+1]', '[1.]', '[.5]', '[-]', '[1e]', '[NaN]', '[Infinity]', '[tru]',
+    '["a\u0001"]', '["\\x41"]', '["\\u12"]', '[1] [2]', '[1]x', '{"a":1,"a":2}', '﻿[1]', `${'['.repeat(40)}${']'.repeat(40)}`, '[1 2]', '"\\"'];
+  for (const t of bad) assert.throws(() => parseJsonIntegersOnly(t), (e) => e && e.reason === 'METRICS_SHAPE', JSON.stringify(t));
+  const o = parseJsonIntegersOnly('{"__proto__":{"polluted":1},"a":[true,false,null,"x\\u00e9\\n"]}');
+  assert.equal(Object.getPrototypeOf(o), null);
+  assert.deepEqual(Object.keys(o), ['__proto__', 'a']);
+  assert.equal(({}).polluted, undefined);
+  assert.deepEqual(o.a, [true, false, null, 'xé\n']);
+  assert.deepEqual(JSON.parse(JSON.stringify(parseJsonIntegersOnly(' \r\n\t{ "k" : [ 1 , "2" ] } \n'))), { k: [1, '2'] });
+  // 深さ 32 までは読める
+  assert.ok(Array.isArray(parseJsonIntegersOnly(`${'['.repeat(32)}${']'.repeat(32)}`)));
 });
 
 console.log('時刻 = RFC 3339 の暦の要素を全部確かめる (Date.parse に直させない)');

@@ -11,6 +11,8 @@
  *   - 🆕 値は **JSON の本文の文字のままで整数 (小数点・指数なし) かつ safe integer** のときだけ受け取る (#1600 R1 M3)。
  *     JSON.parse の binary64 に直すと 1073741824.00000001 が 1073741824 になり、切り上げ / 切り捨ての安全の向きが逆になりうる
  *     → 文字を見て、小数・指数・2^53 以上は全部 METRICS_NOT_INTEGER (= 503)。丸めはしない
+ *     🆕 #1600 R2: 本文は自前の厳密な JSON の読み方 (parseJsonIntegersOnly・依存なし) で読み、数の字句をそのまま見る
+ *     (JSON.parse の reviver の context.source は本番の node:20-slim で渡らない = 使わない)
  *   - 各 endpoint は系列がちょうど 1 つ。その系列の最新の点を採る
  *   - Memory と Memory の上限・Disk Usage と Capacity は同じ resource で、点の時刻の差が 2 分以内
  *   - 空の配列・空の系列・重複の系列・同じ時刻の点が 2 つ・未来の時刻・負の値・数でない値・別の resource → 全部「不可」
@@ -150,18 +152,71 @@ const msFloor = (ns) => Number(ns / NS_PER_MS);   // ns ≥ 0 (1970 年より前
 
 class Reject extends Error { constructor(reason) { super(reason); this.reason = reason; } }
 
-/** 値が整数の文字でない・safe integer を超える数の印 (JSON.parse の reviver が置き換える) */
+/** 値が整数の文字でない・safe integer を超える数の印 (下の JSON の読み方が置き換える) */
 const NOT_INTEGER = Object.freeze({ notInteger: true });
 const INT_SOURCE_RE = /^-?(0|[1-9]\d*)$/;
-/** JSON を読む。数は本文の文字 (context.source) を見て、整数の文字かつ safe integer のときだけ数のまま (ほかは NOT_INTEGER) */
-function parseJsonIntegersOnly(text) {
-  return JSON.parse(text, (key, value, context) => {
-    if (typeof value !== 'number') return value;
-    // context.source が無い (古い Node) = 元の文字を確かめられない → 全部 NOT_INTEGER (fail-closed)
-    const src = context && typeof context.source === 'string' ? context.source : null;
-    if (src == null || !INT_SOURCE_RE.test(src) || !Number.isSafeInteger(value)) return NOT_INTEGER;
-    return value;
-  });
+const MAX_JSON_DEPTH = 32;
+/**
+ * JSON を読む (RFC 8259 の厳密な文法・依存なし・Node 20 で動く・#1600 R2 M1)。数は **本文の字句のまま** 見て、
+ * 整数の字句 (小数点・指数なし) かつ safe integer のときだけ数にする (ほかは NOT_INTEGER = binary64 に丸めた後で判定しない)。
+ *   🚨 JSON.parse の reviver の第 3 引数 (context.source・TC39 の source text access) は本番の Docker (node:20-slim) では渡らない = 使わない
+ *   - 文字列は 1 つずつ字句を切り出して JSON.parse に渡す (escape の解釈は標準のまま)
+ *   - 同じ key が 2 つ・深さ 32 を超える・末尾の余り・文法の違反は例外 (= METRICS_SHAPE)
+ *   - object は prototype の無い object に入れる (key が "__proto__" でも prototype を変えない)
+ */
+export function parseJsonIntegersOnly(text) {
+  if (typeof text !== 'string') throw new Reject('METRICS_SHAPE');
+  let i = 0;
+  const STRING_RE = /"(?:[^"\\\u0000-\u001f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"/y;
+  const NUMBER_RE = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+  const ws = () => { while (i < text.length && (text[i] === ' ' || text[i] === '\t' || text[i] === '\n' || text[i] === '\r')) i++; };
+  const bad = () => { throw new Reject('METRICS_SHAPE'); };
+  const lex = (re) => { re.lastIndex = i; const m = re.exec(text); if (!m) bad(); i = re.lastIndex; return m[0]; };
+  const value = (depth) => {
+    if (depth > MAX_JSON_DEPTH) bad();
+    ws();
+    const c = text[i];
+    if (c === '{') {
+      i++; const obj = Object.create(null); ws();
+      if (text[i] === '}') { i++; return obj; }
+      for (;;) {
+        ws(); if (text[i] !== '"') bad();
+        const key = JSON.parse(lex(STRING_RE));
+        if (Object.prototype.hasOwnProperty.call(obj, key)) bad();   // 同じ key が 2 つ = どちらを採るか決めない
+        ws(); if (text[i] !== ':') bad(); i++;
+        obj[key] = value(depth + 1);
+        ws();
+        if (text[i] === ',') { i++; continue; }
+        if (text[i] === '}') { i++; return obj; }
+        bad();
+      }
+    }
+    if (c === '[') {
+      i++; const arr = []; ws();
+      if (text[i] === ']') { i++; return arr; }
+      for (;;) {
+        arr.push(value(depth + 1)); ws();
+        if (text[i] === ',') { i++; continue; }
+        if (text[i] === ']') { i++; return arr; }
+        bad();
+      }
+    }
+    if (c === '"') return JSON.parse(lex(STRING_RE));
+    if (c === '-' || (c >= '0' && c <= '9')) {
+      const src = lex(NUMBER_RE);
+      if (!INT_SOURCE_RE.test(src)) return NOT_INTEGER;
+      const n = Number(src);
+      return Number.isSafeInteger(n) ? n : NOT_INTEGER;
+    }
+    for (const [word, v] of [['true', true], ['false', false], ['null', null]]) {
+      if (text.startsWith(word, i)) { i += word.length; return v; }
+    }
+    return bad();
+  };
+  const out = value(0);
+  ws();
+  if (i !== text.length) bad();
+  return out;
 }
 
 /** 1 つの endpoint の応答の本文 (parse 済み) を確かめ、最新の点を返す。nowNs = 応答を受けた時刻 (ナノ秒) */
