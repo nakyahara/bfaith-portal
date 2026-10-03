@@ -86,9 +86,9 @@ const FLASH_LAST = '2026-10-02';
 
 // Amazon の SKU: [seller_sku, asin_norm, product_name, FBA?, cost_status, is_cost_complete, 1 日の数量の基準, 単価]
 const AMZ = [
-  ['pr_alpha', 'B0ALPHA', 'アルファ商品', true, 'complete', 1, 9, 1000],
+  ['pr_alpha', 'B0ALPHA001', 'アルファ商品', true, 'complete', 1, 9, 1000],
   ['pr_beta', '', '', false, 'missing_cost', 0, 4, 800],
-  ['PR_Gamma', 'B0GAMMA', '', true, 'partial_cost', 0, 3, 2400],
+  ['PR_Gamma', 'B0GAMMA001', '', true, 'partial_cost', 0, 3, 2400],
   ['pr_delta', '', 'デルタ', true, 'complete', 1, 1, 500],
   ['pr_unres', '', '解決しない', false, 'late_bound_after_close', 0, 2, 700],
 ];
@@ -154,14 +154,14 @@ db.transaction(() => {
       ins('mirror_f_sales_by_listing', { date_jst: d, month_ym: d.slice(0, 7), mall: 'amazon', item_code: sku, channel: fba ? 'FBA' : 'FBM', item_name: name || null, units: base, sales_jpy_incl: base * price * 1.1, order_count: base, data_source: 'sp_api', source_updated_at: 't', source_run_id: 'parity', source_row_hash: 'h', synced_at: 't' });
     });
     ins('mirror_amazon_ads_sku_daily', { date_jst: d, mall: 'amazon', campaign_id: 'C1', ad_type: 'SP', target: 'pr_alpha', target_granularity: 'sku', clicks: 20, impressions: 2000, ad_cost: 500 + (i % 5) * 10, ad_sales: 3000, ad_units: 3, source_run_id: 'p', source_row_hash: 'h', synced_at: 't' });
-    ins('mirror_amazon_ads_sku_daily', { date_jst: d, mall: 'amazon', campaign_id: 'C2', ad_type: 'SP', target: 'b0gamma', target_granularity: 'asin', clicks: 30, impressions: 3000, ad_cost: 1500, ad_sales: i % 9 === 0 ? 0 : 1600, ad_units: 2, source_run_id: 'p', source_row_hash: 'h', synced_at: 't' });
+    ins('mirror_amazon_ads_sku_daily', { date_jst: d, mall: 'amazon', campaign_id: 'C2', ad_type: 'SP', target: 'b0gamma001', target_granularity: 'asin', clicks: 30, impressions: 3000, ad_cost: 1500, ad_sales: i % 9 === 0 ? 0 : 1600, ad_units: 2, source_run_id: 'p', source_row_hash: 'h', synced_at: 't' });
     ins('mirror_amazon_ads_campaign_daily', { date_jst: d, mall: 'amazon', campaign_id: 'C1', campaign_name: 'アルファSP', ad_type: 'SP', campaign_status: 'ENABLED', clicks: 20, impressions: 2000, ad_cost: 500 + (i % 5) * 10, ad_sales_14d: 3000, ad_units_1d: 3, source_run_id: 'p', source_row_hash: 'h', synced_at: 't' });
     ins('mirror_amazon_ads_campaign_daily', { date_jst: d, mall: 'amazon', campaign_id: 'C2', campaign_name: 'ガンマSP', ad_type: 'SP', campaign_status: 'ENABLED', clicks: 30, impressions: 3000, ad_cost: 1500, ad_sales_14d: 1600, ad_units_1d: 2, source_run_id: 'p', source_row_hash: 'h', synced_at: 't' });
     ins('mirror_amazon_ads_campaign_daily', { date_jst: d, mall: 'amazon', campaign_id: 'C3', campaign_name: 'オート', ad_type: 'SP', campaign_status: 'PAUSED', clicks: 10, impressions: 5000, ad_cost: 300, ad_sales_14d: 0, ad_units_1d: 0, source_run_id: 'p', source_row_hash: 'h', synced_at: 't' });
   }
 
   // 手数料・SKU の対・商品マスタ・セット・在庫・価格
-  const fees = [['pr_alpha', 'B0ALPHA', 'AFN', 0.15, 318, 1000], ['pr_beta', 'B0BETA', 'MFN', 0.15, null, 800], ['PR_Gamma', 'B0GAMMA', 'AFN', 0.1, 434, 2400], ['pr_delta', 'B0DELTA', 'AFN', 0.08, 290, 500]];
+  const fees = [['pr_alpha', 'B0ALPHA001', 'AFN', 0.15, 318, 1000], ['pr_beta', 'B0BETA0001', 'MFN', 0.15, null, 800], ['PR_Gamma', 'B0GAMMA001', 'AFN', 0.1, 434, 2400], ['pr_delta', 'B0DELTA001', 'AFN', 0.08, 290, 500]];
   for (const [sku, asin, ch, rate, fba, price] of fees) {
     ins('mirror_amazon_sku_fees', { seller_sku: sku, asin, fulfillment_channel: ch, referral_fee: r2(price * rate), referral_fee_rate: rate, fba_fee: fba, variable_closing_fee: 0, per_item_fee: 0, total_fee: r2(price * rate + (fba || 0)), price_used: price, fetched_at: '2026-10-02T21:00:00Z' });
   }
@@ -177,9 +177,9 @@ db.transaction(() => {
     ins('mirror_inv_daily_detail', { business_date: '2026-10-02', market: 'jp', category: cat, source_system: 'ne', source_item_code: ne, ne_code: ne, qty, unit_cost: 300, total_value: qty * 300, cost_status: 'complete', product_name: ne, last_sold_date: last, new_product_launch_date: ne === 'ne-c' ? '2026-08-01' : null, sales_30d_qty: ne === 'ne-c' ? 0 : 50, synced_at: 't' });
   }
   for (const d of ['2026-10-01', '2026-10-02']) {
-    ins('mirror_amazon_price_snapshot_daily', { date_jst: d, seller_sku: 'pr_alpha', asin: 'B0ALPHA', channel: 'FBA', my_price: 1000, buybox_price: 980, buybox_is_mine: 0, fetched_at: 't', source_run_id: 'p', source_row_hash: 'h', synced_at: `${d}T21:00:00Z` });
-    ins('mirror_amazon_price_snapshot_daily', { date_jst: d, seller_sku: 'PR_Gamma', asin: 'B0GAMMA', channel: 'FBA', my_price: 2400, buybox_price: 2400, buybox_is_mine: 1, fetched_at: 't', source_run_id: 'p', source_row_hash: 'h', synced_at: `${d}T21:00:00Z` });
-    ins('mirror_amazon_price_snapshot_daily', { date_jst: d, seller_sku: 'pr_beta', asin: 'B0BETA', channel: 'FBM', my_price: 800, buybox_price: null, buybox_is_mine: null, fetched_at: 't', source_run_id: 'p', source_row_hash: 'h', synced_at: `${d}T21:00:00Z` });
+    ins('mirror_amazon_price_snapshot_daily', { date_jst: d, seller_sku: 'pr_alpha', asin: 'B0ALPHA001', channel: 'FBA', my_price: 1000, buybox_price: 980, buybox_is_mine: 0, fetched_at: 't', source_run_id: 'p', source_row_hash: 'h', synced_at: `${d}T21:00:00Z` });
+    ins('mirror_amazon_price_snapshot_daily', { date_jst: d, seller_sku: 'PR_Gamma', asin: 'B0GAMMA001', channel: 'FBA', my_price: 2400, buybox_price: 2400, buybox_is_mine: 1, fetched_at: 't', source_run_id: 'p', source_row_hash: 'h', synced_at: `${d}T21:00:00Z` });
+    ins('mirror_amazon_price_snapshot_daily', { date_jst: d, seller_sku: 'pr_beta', asin: 'B0BETA0001', channel: 'FBM', my_price: 800, buybox_price: null, buybox_is_mine: null, fetched_at: 't', source_run_id: 'p', source_row_hash: 'h', synced_at: `${d}T21:00:00Z` });
   }
   ins('mirror_f_sales_velocity_by_product_mall', { 商品コード: 'ne-a', mall: 'amazon', qty_7d: 60, qty_30d: 260, as_of_date: '2026-10-02', synced_at: 't' });
 

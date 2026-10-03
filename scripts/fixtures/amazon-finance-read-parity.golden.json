@@ -3145,7 +3145,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "437a705101dc38ec348ffc37a1fa312529745f47498a701a2030cf409920598f",
+  "sha256": "902c0ead7e373f774dbca5850c590221bc9c82b4be850630246bc2c6d9788b89",
   "body": {
    "from": "2026-09-04",
    "to": "2026-10-03",
@@ -3163,7 +3163,7 @@
    "rows": [
     {
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "product_name": "商品B",
      "units_net": 112,
      "revenue_excl": 99250,
@@ -3192,7 +3192,7 @@
     },
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "product_name": "アルファ商品",
      "units_net": 227,
      "revenue_excl": 229000,
@@ -3221,7 +3221,7 @@
     },
     {
      "seller_sku": "PR_Gamma",
-     "asin": "B0GAMMA",
+     "asin": "B0GAMMA001",
      "product_name": "商品C",
      "units_net": 44,
      "revenue_excl": 110400,
@@ -3279,7 +3279,7 @@
     },
     {
      "seller_sku": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "",
      "product_name": "デルタ",
      "units_net": 9,
      "revenue_excl": 5000,
@@ -3313,7 +3313,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "4ea6733aa18d483136d598f01625b89d40854fa80254777fbe0ebd4ca3ca7b41",
+  "sha256": "5d976b2c704b77a922e27812cc85e3eb4bbc132e2d7fe6fe364d00c33d1efdfa",
   "body": {
    "from": "2026-07-06",
    "to": "2026-10-03",
@@ -3331,7 +3331,7 @@
    "rows": [
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "product_name": "アルファ商品",
      "units_net": 822,
      "revenue_excl": 829660,
@@ -3360,7 +3360,7 @@
     },
     {
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "product_name": "商品B",
      "units_net": 407,
      "revenue_excl": 360910,
@@ -3389,7 +3389,7 @@
     },
     {
      "seller_sku": "PR_Gamma",
-     "asin": "B0GAMMA",
+     "asin": "B0GAMMA001",
      "product_name": "商品C",
      "units_net": 159,
      "revenue_excl": 398840,
@@ -3447,7 +3447,7 @@
     },
     {
      "seller_sku": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "",
      "product_name": "デルタ",
      "units_net": 38,
      "revenue_excl": 20220,
@@ -3481,7 +3481,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "02e5d7b0af20202a68d31a29c2511c4c1ec385d7118fd89dc82c95a413945ee1",
+  "sha256": "17232be38173ed5ab5d497d7e7c11d8939bb6745bbf10ba630a9908fb58d4f58",
   "body": {
    "from": "2025-11-01",
    "to": "2026-10-03",
@@ -3499,7 +3499,7 @@
    "rows": [
     {
      "seller_sku": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "",
      "product_name": "デルタ",
      "units_net": 159,
      "revenue_excl": 84160,
@@ -3528,7 +3528,7 @@
     },
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "product_name": "アルファ商品",
      "units_net": 3270,
      "revenue_excl": 3302420,
@@ -3557,7 +3557,7 @@
     },
     {
      "seller_sku": "PR_Gamma",
-     "asin": "B0GAMMA",
+     "asin": "B0GAMMA001",
      "product_name": "商品C",
      "units_net": 630,
      "revenue_excl": 1586420,
@@ -3615,7 +3615,7 @@
     },
     {
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "product_name": "商品B",
      "units_net": 1620,
      "revenue_excl": 1437920,
@@ -3649,7 +3649,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "a78b69fd55cc8e453b32efbbe2bcb586fa6fa6c47c476112a9d7cef99fe8948c",
+  "sha256": "f1809e8410bd507ec63439db5d6f3215aa4d9e8a1dd93934957d855ed0e1a20b",
   "body": {
    "from": "2026-09-04",
    "to": "2026-10-03",
@@ -3667,7 +3667,7 @@
    "rows": [
     {
      "seller_sku": "PR_Gamma",
-     "asin": "B0GAMMA",
+     "asin": "B0GAMMA001",
      "product_name": "商品C",
      "units_net": 44,
      "revenue_excl": 110400,
@@ -3701,7 +3701,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "2006ae46e7eb902f07021cf36bd989d7a68aacd755d940eb064a68addfebd561",
+  "sha256": "23c48f148c737f1212b9b150e1a1202f1b69d1445a7f2fd001b84db2789831a2",
   "body": {
    "from": "2026-09-04",
    "to": "2026-10-03",
@@ -3719,7 +3719,7 @@
    "rows": [
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "product_name": "アルファ商品",
      "units_net": 227,
      "revenue_excl": 229000,
@@ -3748,7 +3748,7 @@
     },
     {
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "product_name": "商品B",
      "units_net": 112,
      "revenue_excl": 99250,
@@ -3804,8 +3804,8 @@
   "status": 200,
   "content_type": "text/csv; charset=utf-8",
   "content_disposition": "attachment; filename=\"amazon-sku-profit_2026-09-04_2026-10-03.csv\"",
-  "sha256": "9742f91f2f00a892d83d07c9644c5bbed2206ac742092ff51c736f57e1159192",
-  "body": "﻿\"seller_sku\",\"asin\",\"product_name\",\"units_net\",\"revenue_excl\",\"fees\",\"promotion\",\"refunds\",\"reimbursements\",\"cogs\",\"profit_before_ads\",\"ad_direct\",\"ad_allocated\",\"profit_after_ads\",\"easy_ship\",\"profit_after_easy_ship\",\"margin_pct\",\"cost_status\",\"precision_level\",\"fees_incl\",\"promotion_incl\",\"profit_before_ads_incl\",\"profit_after_ads_incl\",\"easy_ship_incl\",\"profit_after_easy_ship_incl\",\"points\"\r\n\"pr_beta\",\"B0BETA\",\"商品B\",\"112\",\"99250\",\"14412\",\"716\",\"1600\",\"1600\",\"0\",\"84687\",\"0\",\"0\",\"84687\",\"51300\",\"33387\",\"85.3\",\"missing_cost\",\"settled\",\"15853\",\"760\",\"83202\",\"83202\",\"56430\",\"26772\",\"240\"\r\n\"pr_alpha\",\"B0ALPHA\",\"アルファ商品\",\"227\",\"229000\",\"100590\",\"1768\",\"2000\",\"1600\",\"68700\",\"56912\",\"11950\",\"4714\",\"40248\",\"0\",\"40248\",\"17.6\",\"complete\",\"settled+allocated_ads\",\"110649\",\"1900\",\"46721\",\"28391\",\"0\",\"28391\",\"630\"\r\n\"PR_Gamma\",\"B0GAMMA\",\"商品C\",\"44\",\"110400\",\"29972\",\"676\",\"4800\",\"1600\",\"18400\",\"58031\",\"34500\",\"2186\",\"21345\",\"0\",\"21345\",\"19.3\",\"partial_cost\",\"settled+allocated_ads\",\"32969\",\"720\",\"54991\",\"14636\",\"0\",\"14636\",\"120\"\r\n\"pr_unres\",\"\",\"解決しない\",\"42\",\"35350\",\"4992\",\"102\",\"700\",\"400\",\"21500\",\"8951\",\"0\",\"0\",\"8951\",\"19350\",\"'-10399\",\"25.3\",\"late_bound_after_close\",\"settled\",\"5492\",\"105\",\"8449\",\"8449\",\"21285\",\"'-12836\",\"30\"\r\n\"pr_delta\",\"B0DELTA\",\"デルタ\",\"9\",\"5000\",\"3641\",\"68\",\"500\",\"1200\",\"4500\",\"'-2509\",\"0\",\"0\",\"'-2509\",\"0\",\"'-2509\",\"'-50.2\",\"complete\",\"settled\",\"4005\",\"75\",\"'-2880\",\"'-2880\",\"0\",\"'-2880\",\"0\""
+  "sha256": "79e9a66488e9413ec6178a9986797d1a31fd69aadc072b28d67367f5a9e858e3",
+  "body": "﻿\"seller_sku\",\"asin\",\"product_name\",\"units_net\",\"revenue_excl\",\"fees\",\"promotion\",\"refunds\",\"reimbursements\",\"cogs\",\"profit_before_ads\",\"ad_direct\",\"ad_allocated\",\"profit_after_ads\",\"easy_ship\",\"profit_after_easy_ship\",\"margin_pct\",\"cost_status\",\"precision_level\",\"fees_incl\",\"promotion_incl\",\"profit_before_ads_incl\",\"profit_after_ads_incl\",\"easy_ship_incl\",\"profit_after_easy_ship_incl\",\"points\"\r\n\"pr_beta\",\"\",\"商品B\",\"112\",\"99250\",\"14412\",\"716\",\"1600\",\"1600\",\"0\",\"84687\",\"0\",\"0\",\"84687\",\"51300\",\"33387\",\"85.3\",\"missing_cost\",\"settled\",\"15853\",\"760\",\"83202\",\"83202\",\"56430\",\"26772\",\"240\"\r\n\"pr_alpha\",\"B0ALPHA001\",\"アルファ商品\",\"227\",\"229000\",\"100590\",\"1768\",\"2000\",\"1600\",\"68700\",\"56912\",\"11950\",\"4714\",\"40248\",\"0\",\"40248\",\"17.6\",\"complete\",\"settled+allocated_ads\",\"110649\",\"1900\",\"46721\",\"28391\",\"0\",\"28391\",\"630\"\r\n\"PR_Gamma\",\"B0GAMMA001\",\"商品C\",\"44\",\"110400\",\"29972\",\"676\",\"4800\",\"1600\",\"18400\",\"58031\",\"34500\",\"2186\",\"21345\",\"0\",\"21345\",\"19.3\",\"partial_cost\",\"settled+allocated_ads\",\"32969\",\"720\",\"54991\",\"14636\",\"0\",\"14636\",\"120\"\r\n\"pr_unres\",\"\",\"解決しない\",\"42\",\"35350\",\"4992\",\"102\",\"700\",\"400\",\"21500\",\"8951\",\"0\",\"0\",\"8951\",\"19350\",\"'-10399\",\"25.3\",\"late_bound_after_close\",\"settled\",\"5492\",\"105\",\"8449\",\"8449\",\"21285\",\"'-12836\",\"30\"\r\n\"pr_delta\",\"\",\"デルタ\",\"9\",\"5000\",\"3641\",\"68\",\"500\",\"1200\",\"4500\",\"'-2509\",\"0\",\"0\",\"'-2509\",\"0\",\"'-2509\",\"'-50.2\",\"complete\",\"settled\",\"4005\",\"75\",\"'-2880\",\"'-2880\",\"0\",\"'-2880\",\"0\""
  },
  "dash.ads.30d": {
   "status": 200,
@@ -4356,7 +4356,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "3e1b292bbeb335b7e3b5c03a7fc2a735a71761d0037caac2a47712f4ad6ecfd7",
+  "sha256": "9bd04465638c33b25dc45fa272246142cc9f67388624d427c1a5a70afe538c9a",
   "body": {
    "from": "2026-09-04",
    "to": "2026-10-03",
@@ -4387,7 +4387,7 @@
    "ranking": [
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "product_name": "アルファ商品",
      "units_net": 227,
      "revenue_excl": 229000,
@@ -4497,7 +4497,7 @@
     },
     {
      "seller_sku": "PR_Gamma",
-     "asin": "B0GAMMA",
+     "asin": "B0GAMMA001",
      "product_name": "商品C",
      "units_net": 44,
      "revenue_excl": 110400,
@@ -4607,7 +4607,7 @@
     },
     {
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "product_name": "商品B",
      "units_net": 112,
      "revenue_excl": 99250,
@@ -4795,7 +4795,7 @@
     },
     {
      "seller_sku": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "",
      "product_name": "デルタ",
      "units_net": 9,
      "revenue_excl": 5000,
@@ -4836,7 +4836,7 @@
    "fallers": [
     {
      "seller_sku": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "",
      "product_name": "デルタ",
      "units_net": 9,
      "revenue_excl": 5000,
@@ -4952,7 +4952,7 @@
     },
     {
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "product_name": "商品B",
      "units_net": 112,
      "revenue_excl": 99250,
@@ -5062,7 +5062,7 @@
     },
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "product_name": "アルファ商品",
      "units_net": 227,
      "revenue_excl": 229000,
@@ -5221,7 +5221,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "09f5a5ae21360088457067d87620afa96ad75c375c960f9ab9622f3331b50d04",
+  "sha256": "38187d12de201bd4c2113bdc537ba89215d18f2b6a3d6d55c2a088f8c46d2c0e",
   "body": {
    "from": "2026-09-04",
    "to": "2026-10-03",
@@ -5252,7 +5252,7 @@
    "ranking": [
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "product_name": "アルファ商品",
      "units_net": 227,
      "revenue_excl": 229000,
@@ -5362,7 +5362,7 @@
     },
     {
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "product_name": "商品B",
      "units_net": 112,
      "revenue_excl": 99250,
@@ -5472,7 +5472,7 @@
     },
     {
      "seller_sku": "PR_Gamma",
-     "asin": "B0GAMMA",
+     "asin": "B0GAMMA001",
      "product_name": "商品C",
      "units_net": 44,
      "revenue_excl": 110400,
@@ -5660,7 +5660,7 @@
     },
     {
      "seller_sku": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "",
      "product_name": "デルタ",
      "units_net": 9,
      "revenue_excl": 5000,
@@ -5701,7 +5701,7 @@
    "fallers": [
     {
      "seller_sku": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "",
      "product_name": "デルタ",
      "units_net": 9,
      "revenue_excl": 5000,
@@ -5817,7 +5817,7 @@
     },
     {
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "product_name": "商品B",
      "units_net": 112,
      "revenue_excl": 99250,
@@ -5927,7 +5927,7 @@
     },
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "product_name": "アルファ商品",
      "units_net": 227,
      "revenue_excl": 229000,
@@ -6086,7 +6086,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "64813565bdc446f2f0caa67670bb6e024e3e3ea7425896cc1d246d146790d37b",
+  "sha256": "d1957ed0fbbbcc0ae9aea344d3fbcf5cf5430cd8a3a528c84a58a58543e29f82",
   "body": {
    "from": "2026-07-06",
    "to": "2026-10-03",
@@ -6117,7 +6117,7 @@
    "ranking": [
     {
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "product_name": "商品B",
      "units_net": 407,
      "revenue_excl": 360910,
@@ -6467,7 +6467,7 @@
     },
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "product_name": "アルファ商品",
      "units_net": 822,
      "revenue_excl": 829660,
@@ -6817,7 +6817,7 @@
     },
     {
      "seller_sku": "PR_Gamma",
-     "asin": "B0GAMMA",
+     "asin": "B0GAMMA001",
      "product_name": "商品C",
      "units_net": 159,
      "revenue_excl": 398840,
@@ -7405,7 +7405,7 @@
     },
     {
      "seller_sku": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "",
      "product_name": "デルタ",
      "units_net": 38,
      "revenue_excl": 20220,
@@ -7505,7 +7505,7 @@
    "risers": [
     {
      "seller_sku": "PR_Gamma",
-     "asin": "B0GAMMA",
+     "asin": "B0GAMMA001",
      "product_name": "商品C",
      "units_net": 159,
      "revenue_excl": 398840,
@@ -7857,7 +7857,7 @@
    "fallers": [
     {
      "seller_sku": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "",
      "product_name": "デルタ",
      "units_net": 38,
      "revenue_excl": 20220,
@@ -8193,7 +8193,7 @@
     },
     {
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "product_name": "商品B",
      "units_net": 407,
      "revenue_excl": 360910,
@@ -8543,7 +8543,7 @@
     },
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "product_name": "アルファ商品",
      "units_net": 822,
      "revenue_excl": 829660,
@@ -8980,7 +8980,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "4b8f5641233fc914feb2aa33d765cfaaabf2e996cc268b3959ac4e5146c7bc0b",
+  "sha256": "4675b790b326ef55b0f01a7e7208b906d5545fcee686f423772669c4209bce50",
   "body": {
    "generated_at": "2026-10-03T03:00:00.000Z",
    "base_month": "2026-09",
@@ -9070,7 +9070,7 @@
    "buybox_lost": [
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "my_price": 1000,
      "buybox_price": 980,
      "revenue_30d": 238000,
@@ -9425,7 +9425,7 @@
    "rows": [
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "product_name": "アルファ商品",
      "units_net": 259,
      "revenue_excl": 261220,
@@ -9454,7 +9454,7 @@
     },
     {
      "seller_sku": "PR_Gamma",
-     "asin": "B0GAMMA",
+     "asin": "B0GAMMA001",
      "product_name": "商品C",
      "units_net": 50,
      "revenue_excl": 125020,
@@ -9483,7 +9483,7 @@
     },
     {
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "product_name": "商品B",
      "units_net": 130,
      "revenue_excl": 114920,
@@ -9512,7 +9512,7 @@
     }
    ]
   },
-  "sha256": "7c0d9287cb62036d99507734ed7ebf5af6f6006e94b337853762c6efd6f7ed5e"
+  "sha256": "65424f268d55944b868cf5b1a5d4e37d5b7e7391027295ec1f52f8064c4f8b8c"
  },
  "margin.collect.page10000": {
   "ok": true,
@@ -9777,7 +9777,7 @@
   "value": [
    {
     "seller_sku": "PR_Gamma",
-    "asin": "B0GAMMA",
+    "asin": "B0GAMMA001",
     "channel": "AFN",
     "referral_fee_rate": 0.1,
     "fba_fee": 434,
@@ -9823,7 +9823,7 @@
    },
    {
     "seller_sku": "pr_alpha",
-    "asin": "B0ALPHA",
+    "asin": "B0ALPHA001",
     "channel": "AFN",
     "referral_fee_rate": 0.15,
     "fba_fee": 318,
@@ -9869,7 +9869,7 @@
    },
    {
     "seller_sku": "pr_beta",
-    "asin": "B0BETA",
+    "asin": "B0BETA0001",
     "channel": "MFN",
     "referral_fee_rate": 0.15,
     "fba_fee": null,
@@ -9915,7 +9915,7 @@
    },
    {
     "seller_sku": "pr_delta",
-    "asin": "B0DELTA",
+    "asin": "B0DELTA001",
     "channel": "AFN",
     "referral_fee_rate": 0.08,
     "fba_fee": 290,
@@ -9960,7 +9960,7 @@
     "ct_archived_at": null
    }
   ],
-  "sha256": "301d97a730efa0ea2a51d5883eb5d576a812c0d9ccaa185a31682e8a77bc1e6d"
+  "sha256": "691de64171555bc6eb7df684f06b1f88694c738cebc36189cf760c2aa3d8feee"
  },
  "pricing.mirrorTablesAvailable": {
   "ok": true,
@@ -9975,7 +9975,7 @@
   "value": [
    {
     "seller_sku": "pr_alpha",
-    "asin": "B0ALPHA",
+    "asin": "B0ALPHA001",
     "channel": "AFN",
     "referral_fee_rate": 0.15,
     "fba_fee": 318,
@@ -10022,7 +10022,7 @@
    },
    {
     "seller_sku": "pr_beta",
-    "asin": "B0BETA",
+    "asin": "B0BETA0001",
     "channel": "MFN",
     "referral_fee_rate": 0.15,
     "fba_fee": null,
@@ -10069,7 +10069,7 @@
    },
    {
     "seller_sku": "PR_Gamma",
-    "asin": "B0GAMMA",
+    "asin": "B0GAMMA001",
     "channel": "AFN",
     "referral_fee_rate": 0.1,
     "fba_fee": 434,
@@ -10116,7 +10116,7 @@
    },
    {
     "seller_sku": "pr_delta",
-    "asin": "B0DELTA",
+    "asin": "B0DELTA001",
     "channel": "AFN",
     "referral_fee_rate": 0.08,
     "fba_fee": 290,
@@ -10162,13 +10162,13 @@
     "custom_type": null
    }
   ],
-  "sha256": "309986d5049577cd99693ecf8d6fe8b7ab26675d10036c5ccb5c1423844461e7"
+  "sha256": "f99a978f4b7ff896fe9655f3d3d1fda9932510485c43673c507d01ac352c687d"
  },
  "pricing.loadListing.PR_Gamma": {
   "ok": true,
   "value": {
    "seller_sku": "PR_Gamma",
-   "asin": "B0GAMMA",
+   "asin": "B0GAMMA001",
    "channel": "AFN",
    "referral_fee_rate": 0.1,
    "fba_fee": 434,
@@ -10213,7 +10213,7 @@
    "ct_archived_at": null,
    "custom_type": null
   },
-  "sha256": "8489358d841b2404257b5d06ec310f1f81c6a44d88ce46bda42fb51a12b1009b"
+  "sha256": "fde500f5cdac5949c55b5a129cffe27e701cc6ef902d6ce3688419a054fbb76e"
  },
  "pricing.inputFingerprint": {
   "ok": true,
@@ -10294,7 +10294,7 @@
      "decision_id": 1,
      "run_id": "apr-murt0io0-mjbmqf",
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "evaluated_at": "2026-10-03T03:00:00.000Z",
      "snapshot_date_jst": "2026-10-02",
      "domain": "price",
@@ -10323,7 +10323,7 @@
      "decision_id": 2,
      "run_id": "apr-murt0io0-mjbmqf",
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "B0BETA0001",
      "evaluated_at": "2026-10-03T03:00:00.000Z",
      "snapshot_date_jst": "2026-10-02",
      "domain": "price",
@@ -10353,7 +10353,7 @@
      "decision_id": 3,
      "run_id": "apr-murt0io0-mjbmqf",
      "seller_sku": "PR_Gamma",
-     "asin": "B0GAMMA",
+     "asin": "B0GAMMA001",
      "evaluated_at": "2026-10-03T03:00:00.000Z",
      "snapshot_date_jst": "2026-10-02",
      "domain": "price",
@@ -10382,7 +10382,7 @@
      "decision_id": 4,
      "run_id": "apr-murt0io0-mjbmqf",
      "seller_sku": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "B0DELTA001",
      "evaluated_at": "2026-10-03T03:00:00.000Z",
      "snapshot_date_jst": "2026-10-02",
      "domain": "price",
@@ -10409,7 +10409,7 @@
     }
    ]
   },
-  "sha256": "2e6499e06dfdd9c16ba07fee5bb40ea6c07ca6e887a12f4b4a35d9bdb5dfc94b"
+  "sha256": "45ba2997d91f835f2ea2adeb5d9c6b395c71e105cf02914a11c1a81da6e9b5e1"
  },
  "pricing.http.health": {
   "status": 200,
@@ -10471,7 +10471,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "2e4372ae8b8ad40e4df12b004e45ba46d6462d2b89135f70ae17ab2c8b9564cc",
+  "sha256": "fcf20e0dcfd023510f566e270152f2c53eb51674b24820d25c668c6efcfb6799",
   "body": {
    "ok": true,
    "rule_version": "rule:ap-v1",
@@ -10487,7 +10487,7 @@
    "rows": [
     {
      "seller_sku": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "channel": "AFN",
      "referral_fee_rate": 0.15,
      "fba_fee": 318,
@@ -10563,7 +10563,7 @@
     },
     {
      "seller_sku": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "B0BETA0001",
      "channel": "MFN",
      "referral_fee_rate": 0.15,
      "fba_fee": null,
@@ -10640,7 +10640,7 @@
     },
     {
      "seller_sku": "PR_Gamma",
-     "asin": "B0GAMMA",
+     "asin": "B0GAMMA001",
      "channel": "AFN",
      "referral_fee_rate": 0.1,
      "fba_fee": 434,
@@ -10716,7 +10716,7 @@
     },
     {
      "seller_sku": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "B0DELTA001",
      "channel": "AFN",
      "referral_fee_rate": 0.08,
      "fba_fee": 290,
@@ -10797,7 +10797,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "3cfa2f88c432824c8b76b6857c3392e2cfe1a16ba39aabae63089a892cf443f3",
+  "sha256": "fa3a93b9a0269a35516ce1977ae60497fc15d3493a17302f4394c7e6e49a7b4e",
   "body": {
    "ok": true,
    "rule_version": "rule:ap-v1",
@@ -10813,7 +10813,7 @@
    "rows": [
     {
      "seller_sku": "PR_Gamma",
-     "asin": "B0GAMMA",
+     "asin": "B0GAMMA001",
      "channel": "AFN",
      "referral_fee_rate": 0.1,
      "fba_fee": 434,
@@ -10894,8 +10894,8 @@
   "status": 200,
   "content_type": "text/csv; charset=utf-8",
   "content_disposition": "attachment; filename=\"amazon-pricing-2026-10-03.csv\"",
-  "sha256": "4dbef810695c105c51f41654aeca476f9bee5a4de48de8b15640fe3db7639487",
-  "body": "﻿seller_sku,asin,channel,ne_code,ne_name,stock,my_price,buybox_price,buybox_is_mine,cost_incl_tax,fee_now,referral_fee_rate,fba_fee,ship_cost,gross_now,gross_rate_now,units_30d,computed_floor,floor_price,ceiling_price,offset_jpy,min_margin_rate,mode,custom_type,action,proposed_price,reason_code,reason_text,confidence,flags,snapshot_date_jst\r\npr_alpha,B0ALPHA,AFN,ne-a,商品A,12,1000,980,0,330,468,0.15,318,100,,,248,,,,0,,off,,keep,,OFF,追従しない設定,,CHANNEL_UNKNOWN,2026-10-02\r\npr_beta,B0BETA,MFN,ne-b,商品B,,800,,,,120,0.15,,100,,,123,,,,0,,off,,keep,,OFF,追従しない設定,,CHANNEL_UNKNOWN|COST_UNKNOWN,2026-10-02\r\nPR_Gamma,B0GAMMA,AFN,ne-a,商品A,3,2400,2400,1,1210,674,0.1,434,100,,,47,,,,0,,off,,keep,,OFF,追従しない設定,,CHANNEL_UNKNOWN,2026-10-02\r\npr_delta,B0DELTA,AFN,ne-d,商品D,,,,,220,,0.08,290,100,,,14,,,,0,,off,,hold,,NO_MY_PRICE,自分の出品価格が取れていない・異常 (価格スナップショットに無い / 0 以下 / 上限超え),,CHANNEL_UNKNOWN,2026-10-02"
+  "sha256": "f2ca82342700a6ed749c0fb0f35490bbdfff2cb2f546d6f71d22448a4269863e",
+  "body": "﻿seller_sku,asin,channel,ne_code,ne_name,stock,my_price,buybox_price,buybox_is_mine,cost_incl_tax,fee_now,referral_fee_rate,fba_fee,ship_cost,gross_now,gross_rate_now,units_30d,computed_floor,floor_price,ceiling_price,offset_jpy,min_margin_rate,mode,custom_type,action,proposed_price,reason_code,reason_text,confidence,flags,snapshot_date_jst\r\npr_alpha,B0ALPHA001,AFN,ne-a,商品A,12,1000,980,0,330,468,0.15,318,100,,,248,,,,0,,off,,keep,,OFF,追従しない設定,,CHANNEL_UNKNOWN,2026-10-02\r\npr_beta,B0BETA0001,MFN,ne-b,商品B,,800,,,,120,0.15,,100,,,123,,,,0,,off,,keep,,OFF,追従しない設定,,CHANNEL_UNKNOWN|COST_UNKNOWN,2026-10-02\r\nPR_Gamma,B0GAMMA001,AFN,ne-a,商品A,3,2400,2400,1,1210,674,0.1,434,100,,,47,,,,0,,off,,keep,,OFF,追従しない設定,,CHANNEL_UNKNOWN,2026-10-02\r\npr_delta,B0DELTA001,AFN,ne-d,商品D,,,,,220,,0.08,290,100,,,14,,,,0,,off,,hold,,NO_MY_PRICE,自分の出品価格が取れていない・異常 (価格スナップショットに無い / 0 以下 / 上限超え),,CHANNEL_UNKNOWN,2026-10-02"
  },
  "pricing.http.evaluations.run": {
   "status": 200,
@@ -11032,7 +11032,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "bedd9d0954dd73295704e4349391a4bc9d2be8529554aab14e0bfc024c060821",
+  "sha256": "ccda216debb5b781b44707caa7460c35f9f1fe6743da2874028fbb01c2bbaa39",
   "body": {
    "ok": true,
    "supplierName": "S01",
@@ -11075,7 +11075,7 @@
        "mall": "amazon",
        "listingId": "pr_alpha",
        "listingName": "アルファ商品",
-       "asin": "B0ALPHA",
+       "asin": "B0ALPHA001",
        "is_fba": true,
        "sold": 68,
        "pieces": 68,
@@ -11085,7 +11085,7 @@
        "mall": "amazon",
        "listingId": "pr_gamma",
        "listingName": "",
-       "asin": "B0GAMMA",
+       "asin": "B0GAMMA001",
        "is_fba": true,
        "sold": 14,
        "pieces": 28,
@@ -11148,7 +11148,7 @@
        "mall": "amazon",
        "listingId": "pr_beta",
        "listingName": "",
-       "asin": "B0BETA",
+       "asin": "",
        "is_fba": false,
        "sold": 32,
        "pieces": 32,
@@ -11193,7 +11193,7 @@
        "mall": "amazon",
        "listingId": "pr_delta",
        "listingName": "デルタ",
-       "asin": "B0DELTA",
+       "asin": "",
        "is_fba": true,
        "sold": 7,
        "pieces": 7,
@@ -11221,7 +11221,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "9722bde00daf78a802984c8832265c7f43c57d45c4ef51bb1d4112b7403d2614",
+  "sha256": "b90f4e229ac499dc86692a287e01a6531937ce3348d146266a19f65414a1e32c",
   "body": {
    "ok": true,
    "supplierName": "S01",
@@ -11264,7 +11264,7 @@
        "mall": "amazon",
        "listingId": "pr_alpha",
        "listingName": "アルファ商品",
-       "asin": "B0ALPHA",
+       "asin": "B0ALPHA001",
        "is_fba": true,
        "sold": 297,
        "pieces": 297,
@@ -11274,7 +11274,7 @@
        "mall": "amazon",
        "listingId": "pr_gamma",
        "listingName": "",
-       "asin": "B0GAMMA",
+       "asin": "B0GAMMA001",
        "is_fba": true,
        "sold": 58,
        "pieces": 116,
@@ -11337,7 +11337,7 @@
        "mall": "amazon",
        "listingId": "pr_beta",
        "listingName": "",
-       "asin": "B0BETA",
+       "asin": "",
        "is_fba": false,
        "sold": 148,
        "pieces": 148,
@@ -11382,7 +11382,7 @@
        "mall": "amazon",
        "listingId": "pr_delta",
        "listingName": "デルタ",
-       "asin": "B0DELTA",
+       "asin": "",
        "is_fba": true,
        "sold": 16,
        "pieces": 16,
@@ -11410,7 +11410,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "b5269933b9cbf63d320d7c5e8a81282060acf8c4071c02e52d99bab153ac4419",
+  "sha256": "cfe99674e88afc76f509fa18c60da43bd707251b402ab729cc7b9e7ee0cfbfd6",
   "body": {
    "ok": true,
    "supplierName": "S01",
@@ -11453,7 +11453,7 @@
        "mall": "amazon",
        "listingId": "pr_alpha",
        "listingName": "アルファ商品",
-       "asin": "B0ALPHA",
+       "asin": "B0ALPHA001",
        "is_fba": true,
        "sold": 892,
        "pieces": 892,
@@ -11463,7 +11463,7 @@
        "mall": "amazon",
        "listingId": "pr_gamma",
        "listingName": "",
-       "asin": "B0GAMMA",
+       "asin": "B0GAMMA001",
        "is_fba": true,
        "sold": 172,
        "pieces": 344,
@@ -11526,7 +11526,7 @@
        "mall": "amazon",
        "listingId": "pr_beta",
        "listingName": "",
-       "asin": "B0BETA",
+       "asin": "",
        "is_fba": false,
        "sold": 442,
        "pieces": 442,
@@ -11571,7 +11571,7 @@
        "mall": "amazon",
        "listingId": "pr_delta",
        "listingName": "デルタ",
-       "asin": "B0DELTA",
+       "asin": "",
        "is_fba": true,
        "sold": 45,
        "pieces": 45,
@@ -11599,7 +11599,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "3fffc2b33afab682865bd47f1d0360b33c841b0566a6416668fd0d900f737242",
+  "sha256": "0a49b8cbbc2c472609fc5296832e65586d244fc452baf43da2d72ff14e689db1",
   "body": {
    "ok": true,
    "supplierName": "S02",
@@ -11642,7 +11642,7 @@
        "mall": "amazon",
        "listingId": "pr_gamma",
        "listingName": "",
-       "asin": "B0GAMMA",
+       "asin": "B0GAMMA001",
        "is_fba": true,
        "sold": 14,
        "pieces": 14,
@@ -11680,7 +11680,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "9b0d94f23645ea4bbffd0486652aff600bbb8a8c244523eb767b322ad819ea51",
+  "sha256": "59eaefebd76a78ef36f449c398c00428e3fbd155e9097730556f851bf50eadd8",
   "body": {
    "ok": true,
    "supplierName": "S02",
@@ -11723,7 +11723,7 @@
        "mall": "amazon",
        "listingId": "pr_gamma",
        "listingName": "",
-       "asin": "B0GAMMA",
+       "asin": "B0GAMMA001",
        "is_fba": true,
        "sold": 58,
        "pieces": 58,
@@ -11761,7 +11761,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "1ebe85b772ea714654b9bca09fc5238dded99c902ad1227436180add5eb6ff06",
+  "sha256": "66b2be796bab9ac6939fc01f82d99654952c42660e50d2f8b1a66cc910425454",
   "body": {
    "ok": true,
    "supplierName": "S02",
@@ -11804,7 +11804,7 @@
        "mall": "amazon",
        "listingId": "pr_gamma",
        "listingName": "",
-       "asin": "B0GAMMA",
+       "asin": "B0GAMMA001",
        "is_fba": true,
        "sold": 172,
        "pieces": 172,
@@ -11842,7 +11842,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "3a6d75d1980af31fe4d7818717309939f3c13058501ee1ae6caf9e2991afc0a0",
+  "sha256": "c81ee062a359c29f66683fa7f5c8a41b91f5ad2fc110620e406f992b3e2aad98",
   "body": {
    "ok": true,
    "supplierName": "S01",
@@ -11885,7 +11885,7 @@
        "mall": "amazon",
        "listingId": "pr_alpha",
        "listingName": "アルファ商品",
-       "asin": "B0ALPHA",
+       "asin": "B0ALPHA001",
        "is_fba": true,
        "sold": 3567,
        "pieces": 3567,
@@ -11895,7 +11895,7 @@
        "mall": "amazon",
        "listingId": "pr_gamma",
        "listingName": "",
-       "asin": "B0GAMMA",
+       "asin": "B0GAMMA001",
        "is_fba": true,
        "sold": 688,
        "pieces": 1376,
@@ -11958,7 +11958,7 @@
        "mall": "amazon",
        "listingId": "pr_beta",
        "listingName": "",
-       "asin": "B0BETA",
+       "asin": "",
        "is_fba": false,
        "sold": 1768,
        "pieces": 1768,
@@ -12003,7 +12003,7 @@
        "mall": "amazon",
        "listingId": "pr_delta",
        "listingName": "デルタ",
-       "asin": "B0DELTA",
+       "asin": "",
        "is_fba": true,
        "sold": 172,
        "pieces": 172,
@@ -12071,7 +12071,7 @@
      "mall": "amazon",
      "is_fba": true,
      "listingId": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 8,
@@ -12082,7 +12082,7 @@
      "mall": "amazon",
      "is_fba": false,
      "listingId": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 3,
@@ -12137,7 +12137,7 @@
      "mall": "amazon",
      "is_fba": true,
      "listingId": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 10,
@@ -12148,7 +12148,7 @@
      "mall": "amazon",
      "is_fba": false,
      "listingId": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 4,
@@ -12181,7 +12181,7 @@
      "mall": "amazon",
      "is_fba": true,
      "listingId": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 12,
@@ -12192,7 +12192,7 @@
      "mall": "amazon",
      "is_fba": false,
      "listingId": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 5,
@@ -12203,7 +12203,7 @@
      "mall": "amazon",
      "is_fba": true,
      "listingId": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "",
      "ne_code": "ne-d",
      "product_name": "商品D",
      "units": 3,
@@ -12269,7 +12269,7 @@
      "mall": "amazon",
      "is_fba": true,
      "listingId": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 9,
@@ -12280,7 +12280,7 @@
      "mall": "amazon",
      "is_fba": false,
      "listingId": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 6,
@@ -12313,7 +12313,7 @@
      "mall": "amazon",
      "is_fba": true,
      "listingId": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 11,
@@ -12324,7 +12324,7 @@
      "mall": "amazon",
      "is_fba": false,
      "listingId": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 7,
@@ -12379,7 +12379,7 @@
      "mall": "amazon",
      "is_fba": true,
      "listingId": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 8,
@@ -12390,7 +12390,7 @@
      "mall": "amazon",
      "is_fba": false,
      "listingId": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 3,
@@ -12434,7 +12434,7 @@
      "mall": "amazon",
      "is_fba": true,
      "listingId": "pr_alpha",
-     "asin": "B0ALPHA",
+     "asin": "B0ALPHA001",
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 10,
@@ -12445,7 +12445,7 @@
      "mall": "amazon",
      "is_fba": false,
      "listingId": "pr_beta",
-     "asin": "B0BETA",
+     "asin": "",
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 4,
@@ -12456,7 +12456,7 @@
      "mall": "amazon",
      "is_fba": true,
      "listingId": "pr_delta",
-     "asin": "B0DELTA",
+     "asin": "",
      "ne_code": "ne-d",
      "product_name": "商品D",
      "units": 4,
@@ -12508,7 +12508,7 @@
     }
    ]
   },
-  "sha256": "628032a66fc5c51367140663ab7dbb1533280bd87e50a6c95ad17a8278e3ec67"
+  "sha256": "541b6525e675f4cd2d60814194e9fa75d499c45b79651329ebba7f2600b2e509"
  },
  "supplier.buildDailyCsv": {
   "ok": true,
@@ -12738,7 +12738,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "e5a06721773fd742b4ba79d4508d185cccd1e93b704b69eeb42427b3ca3e1fc1",
+  "sha256": "494a5f64272c0dca11f21b7d52c53d49ee24225f08c58bf02ae366c0ca01087d",
   "body": {
    "ok": true,
    "generatedAt": "2026-10-03T03:00:00.000Z",
@@ -12751,7 +12751,9 @@
     "amazon": 4,
     "qoo10": 0,
     "asinSources": {
-     "amazonAsinFees": 4
+     "amazonAsinFinance": 2,
+     "amazonAsinPrice": 1,
+     "amazonAsinFees": 1
     }
    },
    "products": [
@@ -12774,8 +12776,8 @@
        "url": null
       },
       "amazon": {
-       "asin": "B0GAMMA",
-       "url": "https://www.amazon.co.jp/dp/B0GAMMA"
+       "asin": "B0GAMMA001",
+       "url": "https://www.amazon.co.jp/dp/B0GAMMA001"
       },
       "qoo10": {
        "itemNo": null,
@@ -12806,8 +12808,8 @@
        "url": null
       },
       "amazon": {
-       "asin": "B0BETA",
-       "url": "https://www.amazon.co.jp/dp/B0BETA"
+       "asin": "B0BETA0001",
+       "url": "https://www.amazon.co.jp/dp/B0BETA0001"
       },
       "qoo10": {
        "itemNo": null,
@@ -12838,8 +12840,8 @@
        "url": null
       },
       "amazon": {
-       "asin": "B0GAMMA",
-       "url": "https://www.amazon.co.jp/dp/B0GAMMA"
+       "asin": "B0GAMMA001",
+       "url": "https://www.amazon.co.jp/dp/B0GAMMA001"
       },
       "qoo10": {
        "itemNo": null,
@@ -12870,8 +12872,8 @@
        "url": null
       },
       "amazon": {
-       "asin": "B0DELTA",
-       "url": "https://www.amazon.co.jp/dp/B0DELTA"
+       "asin": "B0DELTA001",
+       "url": "https://www.amazon.co.jp/dp/B0DELTA001"
       },
       "qoo10": {
        "itemNo": null,
@@ -12938,7 +12940,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3498,
     "is_fba": 1,
     "sales_principal_jpy": 11000,
@@ -12974,7 +12976,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -12992,7 +12994,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 2862,
     "is_fba": 1,
     "sales_principal_jpy": 9000,
@@ -13028,7 +13030,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13064,7 +13066,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3816,
     "is_fba": 1,
     "sales_principal_jpy": 12000,
@@ -13118,7 +13120,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13154,7 +13156,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3180,
     "is_fba": 1,
     "sales_principal_jpy": 10000,
@@ -13190,7 +13192,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13208,7 +13210,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 2544,
     "is_fba": 1,
     "sales_principal_jpy": 8000,
@@ -13244,7 +13246,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13280,7 +13282,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3498,
     "is_fba": 1,
     "sales_principal_jpy": 11000,
@@ -13316,7 +13318,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13352,7 +13354,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 2862,
     "is_fba": 1,
     "sales_principal_jpy": 9000,
@@ -13406,7 +13408,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13424,7 +13426,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3816,
     "is_fba": 1,
     "sales_principal_jpy": 12000,
@@ -13460,7 +13462,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13496,7 +13498,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3180,
     "is_fba": 1,
     "sales_principal_jpy": 10000,
@@ -13532,7 +13534,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13568,7 +13570,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 2544,
     "is_fba": 1,
     "sales_principal_jpy": 8000,
@@ -13604,7 +13606,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13622,7 +13624,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3498,
     "is_fba": 1,
     "sales_principal_jpy": 11000,
@@ -13676,7 +13678,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13712,7 +13714,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 2862,
     "is_fba": 1,
     "sales_principal_jpy": 9000,
@@ -13748,7 +13750,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13784,7 +13786,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3816,
     "is_fba": 1,
     "sales_principal_jpy": 12000,
@@ -13820,7 +13822,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13838,7 +13840,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3180,
     "is_fba": 1,
     "sales_principal_jpy": 10000,
@@ -13874,7 +13876,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -13910,7 +13912,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 2544,
     "is_fba": 1,
     "sales_principal_jpy": 8000,
@@ -13964,7 +13966,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14000,7 +14002,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3498,
     "is_fba": 1,
     "sales_principal_jpy": 11000,
@@ -14036,7 +14038,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14054,7 +14056,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 2862,
     "is_fba": 1,
     "sales_principal_jpy": 9000,
@@ -14090,7 +14092,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14126,7 +14128,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3816,
     "is_fba": 1,
     "sales_principal_jpy": 12000,
@@ -14162,7 +14164,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14198,7 +14200,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3180,
     "is_fba": 1,
     "sales_principal_jpy": 10000,
@@ -14252,7 +14254,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14270,7 +14272,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 2585.8,
     "is_fba": 1,
     "sales_principal_jpy": 8000,
@@ -14306,7 +14308,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 761.4,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14342,7 +14344,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3498,
     "is_fba": 1,
     "sales_principal_jpy": 11000,
@@ -14378,7 +14380,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14414,7 +14416,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 2862,
     "is_fba": 1,
     "sales_principal_jpy": 9000,
@@ -14450,7 +14452,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14468,7 +14470,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3816,
     "is_fba": 1,
     "sales_principal_jpy": 12000,
@@ -14522,7 +14524,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14558,7 +14560,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3180,
     "is_fba": 1,
     "sales_principal_jpy": 10000,
@@ -14594,7 +14596,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14630,7 +14632,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 2544,
     "is_fba": 1,
     "sales_principal_jpy": 8000,
@@ -14666,7 +14668,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14684,7 +14686,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 3498,
     "is_fba": 1,
     "sales_principal_jpy": 11000,
@@ -14720,7 +14722,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14756,7 +14758,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "complete",
-    "asin_norm": "B0ALPHA",
+    "asin_norm": "B0ALPHA001",
     "fba_fees_jpy": 2862,
     "is_fba": 1,
     "sales_principal_jpy": 9000,
@@ -14810,7 +14812,7 @@
     "margin_basis": "excl_tax",
     "margin_confidence": null,
     "cost_status": "partial_cost",
-    "asin_norm": "B0GAMMA",
+    "asin_norm": "B0GAMMA001",
     "fba_fees_jpy": 636,
     "is_fba": 1,
     "sales_principal_jpy": 4800,
@@ -14853,7 +14855,7 @@
     "synced_at": "2026-09-29T22:00:00Z"
    }
   ],
-  "sha256": "ac5836529ac41cbdd95b05f59e5619890733f83282adf7af68ad4f8238cd630f"
+  "sha256": "169214891a20fe681699c2be2de3e5208718b50adbeb36752d9091ec55bbff2d"
  },
  "unified.by_mall": {
   "ok": true,
