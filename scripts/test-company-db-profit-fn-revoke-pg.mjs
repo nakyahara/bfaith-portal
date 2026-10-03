@@ -16,9 +16,9 @@
  * 使い方: node scripts/test-company-db-profit-fn-revoke-pg.mjs   (npm run test:company-db にも入っている = 飛ばさない)
  *   🚨 **試験が自分で使い捨てのクラスタを起動する** (#1601 Codex R1 M2): embedded-postgres で OS の一時フォルダに新しいクラスタを作り、ランダムのポートで起動し、
  *      最後に止めて消す。外の PostgreSQL (TEST_PG_URL など) には一切つながない。起動したクラスタに watcher / profit_reader が既にあれば止まる (作り直さない・password を変えない)。
- *   embedded-postgres はリポジトリの依存に入れていない (OS ごとの PostgreSQL の本体 = 大きい・Render の npm ci に載せない) = 次の順に探す:
- *      リポジトリの node_modules → 環境変数 EMBEDDED_PG_DIR のフォルダ (package.json がある所) → C:/tmp/pg-embed (この PC の置き場)。
- *      **見つからない・起動できない = 失敗 (exit 1)**。用意 = 空のフォルダで `npm i embedded-postgres` → EMBEDDED_PG_DIR にそのフォルダ
+ *   embedded-postgres は devDependencies に正確な版で入っている (lockfile で固定・#1601 Codex R2 M。Render の npm ci --production には入らない)。探す順:
+ *      リポジトリの node_modules → 版が同じときだけ 環境変数 EMBEDDED_PG_DIR / C:/tmp/pg-embed (node_modules をジャンクションにした worktree のため)。
+ *      **見つからない・版が違う・起動できない・クラスタのフォルダが消えない = 失敗 (exit 1)**
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -37,30 +37,42 @@ import { validateFinanceChunk, ingestOrderFinanceChunk } from '../apps/company-d
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-/** embedded-postgres を探す (リポジトリ → EMBEDDED_PG_DIR → C:/tmp/pg-embed)。無ければ null */
+/** 使う embedded-postgres の版 = package.json の devDependencies の正確な版 (lockfile で固定・#1601 Codex R2 M) */
+const PINNED_EMBEDDED_PG = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).devDependencies['embedded-postgres'];
+/**
+ * embedded-postgres を探す。① リポジトリの node_modules (npm ci で入る = 正) ② 外の置き場 (EMBEDDED_PG_DIR → C:/tmp/pg-embed) は **版が PINNED と同じときだけ**
+ *   (node_modules を別の作業の木へのジャンクションにしている worktree で、npm ci をし直さずに流すため。違う版は使わない = 同じコミットで同じ版)。無ければ { why }
+ */
 async function loadEmbeddedPostgres() {
   const bases = [path.join(ROOT, 'package.json'), ...(process.env.EMBEDDED_PG_DIR ? [path.join(process.env.EMBEDDED_PG_DIR, 'package.json')] : []), 'C:/tmp/pg-embed/package.json'];
+  const seen = [];
   for (const b of bases) {
-    try { const req = createRequire(b); return (await import(pathToFileURL(req.resolve('embedded-postgres')).href)).default; } catch { /* 次へ */ }
+    let main, ver;
+    try { const req = createRequire(b); main = req.resolve('embedded-postgres'); let d = path.dirname(main); while (path.basename(d) !== 'embedded-postgres' && path.dirname(d) !== d) d = path.dirname(d); ver = JSON.parse(fs.readFileSync(path.join(d, 'package.json'), 'utf8')).version; /* exports が package.json を出さないので main から上へ */ } catch { continue; }
+    if (ver !== PINNED_EMBEDDED_PG) { seen.push(path.dirname(b) + ' = ' + ver); continue; }
+    return { EmbeddedPostgres: (await import(pathToFileURL(main).href)).default, from: path.dirname(b) };
   }
-  return null;
+  return { why: seen.length ? '版が ' + PINNED_EMBEDDED_PG + ' でない (' + seen.join(' / ') + ')' : '見つからない' };
 }
-const EmbeddedPostgres = await loadEmbeddedPostgres();
-if (!EmbeddedPostgres) {
-  console.error('❌ embedded-postgres が見つからない = 本物の PostgreSQL の権限の試験を流せない (飛ばさない)。空のフォルダで npm i embedded-postgres → 環境変数 EMBEDDED_PG_DIR にそのフォルダ');
+const loaded = await loadEmbeddedPostgres();
+if (!loaded.EmbeddedPostgres) {
+  console.error('❌ embedded-postgres ' + PINNED_EMBEDDED_PG + ' が' + loaded.why + ' = 本物の PostgreSQL の権限の試験を流せない (飛ばさない)。リポジトリで npm ci (devDependencies に入っている)');
   process.exit(1);
 }
+const { EmbeddedPostgres } = loaded;
 const clusterDir = path.join(os.tmpdir(), `cdb-d60-pg-${crypto.randomBytes(4).toString('hex')}`);
 const SU_PW = `su_${crypto.randomBytes(12).toString('hex')}`;
 const port = 55000 + crypto.randomInt(4000);
-const cluster = new EmbeddedPostgres({ databaseDir: clusterDir, user: 'postgres', password: SU_PW, port, persistent: true, onLog: () => {}, onError: () => {} });
+// persistent: false = 止めるときに embedded-postgres がフォルダを消す。残れば自分で消し、それでも残れば試験を失敗にする (#1601 Codex R2 Low 1)
+const cluster = new EmbeddedPostgres({ databaseDir: clusterDir, user: 'postgres', password: SU_PW, port, persistent: false, onLog: () => {}, onError: () => {} });
+let cleanupFailed = false;
 const stopCluster = async () => {
-  try { await cluster.stop(); } catch (e) { console.error(`使い捨てのクラスタを止められない: ${e.message}`); }
-  for (let i = 0; i < 5; i++) { try { fs.rmSync(clusterDir, { recursive: true, force: true }); break; } catch { await new Promise((r) => setTimeout(r, 500)); } }
+  try { await cluster.stop(); } catch (e) { console.error('使い捨てのクラスタを止めるときの誤り: ' + e.message); }
+  for (let i = 0; i < 10 && fs.existsSync(clusterDir); i++) { try { fs.rmSync(clusterDir, { recursive: true, force: true }); } catch { await new Promise((r) => setTimeout(r, 500)); } }
+  if (fs.existsSync(clusterDir)) { cleanupFailed = true; console.error('❌ 使い捨てのクラスタのフォルダが消えない: ' + clusterDir); }
 };
-try { await cluster.initialise(); await cluster.start(); }
-catch (e) { console.error(`❌ 使い捨てのクラスタを起動できない (飛ばさない): ${e.message}`); await stopCluster(); process.exit(1); }
 const url = `postgres://postgres:${SU_PW}@127.0.0.1:${port}/postgres`;
+console.log('使い捨てのクラスタ: embedded-postgres ' + PINNED_EMBEDDED_PG + ' (' + loaded.from + ')');
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
@@ -74,10 +86,17 @@ const SQL_0056 = fs.readFileSync(FILE_0056, 'utf8');
 const hex = crypto.randomBytes(4).toString('hex');
 const OWNER = `cdb_d60o_${hex}`, PROBE = `cdb_d60p_${hex}`, PW = `t_${crypto.randomBytes(12).toString('hex')}`;
 const DB1 = `cdb_d60_${hex}`, DB2 = `cdb_d60b_${hex}`;
+// 起動の後の全部 (役割・DB・接続の準備・試験) を外側の try/finally で覆い、どこで落ちても必ずクラスタを止めて消す (#1601 Codex R2 Low 1)
+const clients = [];
+let setupError = null;
+try {
+  await cluster.initialise();
+  await cluster.start();
 const su = await openPgClient(url);
+try {
 // 🚨 新しいクラスタのはず = watcher / profit_reader が既にあれば止まる (既存の役割の password・LOGIN を変えない。#1601 Codex R1 M2)
 const existing = (await su.query(`select rolname from pg_roles where rolname in ('watcher', 'profit_reader') order by 1`)).rows.map((r) => r.rolname);
-if (existing.length) { console.error(`❌ 使い捨てのクラスタのはずが ${existing.join(', ')} が既にある = 止める (役割を変えない)`); await su.end(); await stopCluster(); process.exit(1); }
+if (existing.length) throw new Error('使い捨てのクラスタのはずが ' + existing.join(', ') + ' が既にある = 止める (役割を変えない)');
 await su.query(`create role ${OWNER} login createrole password '${PW}'`);   // Render の default user と同じ: superuser でない・CREATEROLE
 await su.query(`create role ${PROBE} login password '${PW}'`);              // PUBLIC の権限だけの役割
 await su.query(`create role watcher login password '${PW}'`);
@@ -86,7 +105,6 @@ assert.equal((await su.query(`select rolsuper from pg_roles where rolname = $1`,
 await su.query(`create database ${DB1} owner ${OWNER}`);
 await su.query(`create database ${DB2} owner ${OWNER}`);
 const open = async (role, dbName) => { const x = new URL(url); x.username = role; x.password = PW; x.pathname = `/${dbName}`; const c = await openPgClient(x.toString()); c.on('error', () => {}); return c; };
-const clients = [];
 const O = await open(OWNER, DB1), W = await open('watcher', DB1), P = await open(PROBE, DB1), R = await open('profit_reader', DB1);
 clients.push(O, W, P, R);
 const odb = pgAdapter(O);
@@ -115,7 +133,7 @@ const keepBefore = {};
 let tempBefore = null;
 const aclOf = async (c, sig) => (await c.query(`select proacl::text as acl, proacl is null as dflt, coalesce(cardinality(proacl), -1) as n from pg_proc where oid = $1::regprocedure`, [sig])).rows[0];
 
-try {
+{   // 試験 (外側の finally が接続とクラスタを片づける)
   await migrateUpTo0055(odb);
   // create-watch-roles.mjs と同じ: watcher は schema の USAGE と表の SELECT。PUBLIC だけの役割は schema の USAGE だけ
   await O.query(`grant usage on schema core, mart to watcher, profit_reader, ${PROBE}; grant select on all tables in schema core, mart to watcher;
@@ -262,10 +280,16 @@ try {
     assert.deepEqual((await applyMigrations(pgAdapter(O2), { log: quiet })).applied, ['0056']);
     assert.deepEqual(await heavyEntryFindings(pgAdapter(O2)), []);
   });
+}
+} finally { await su.end().catch(() => {}); }
+} catch (e) {
+  setupError = e;
+  console.error('❌ 準備か試験の外で落ちた (飛ばさない): ' + (e.stack || e.message));
 } finally {
   for (const c of clients) { try { await c.end(); } catch { /* */ } }
-  await su.end();
-  await stopCluster();   // クラスタごと消す (役割・DB も消える)
+  await stopCluster();
 }
 console.log(`\n${ok} ok / ${ng} NG`);
-if (ng) process.exitCode = 1;
+// 🚨 process.exitCode では足りない: embedded-postgres が入れる async-exit-hook が beforeExit で process.exit(0) を呼び、exitCode = 1 を上書きする
+//    (失敗しても exit 0 = npm run test:company-db が緑になる・10/3 に見つけた) → 明示で process.exit
+process.exit(ng || setupError || cleanupFailed ? 1 : 0);

@@ -66,6 +66,7 @@
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.8",
+    "embedded-postgres": "18.4.0-beta.17",
     "playwright": "^1.61.1"
   }
 }

@@ -1723,9 +1723,14 @@ Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/c
 
 試験 = `node scripts/test-company-db-profit-fn-revoke.mjs` (PGlite・14 件: 0055 までの姿で watcher・profit_reader・PUBLIC が呼べる前提 / 0056 の後は revoke の 10 の権限の表が空・3 つの役割は 42501 /
 guard_later・light の権限の表は前と 1 文字も同じ / 2 回流しても同じ / TEMP の監査は前と同じ / 棚卸しの突き合わせ (関数・view・アプリ) と漏れ止め 4 つ / 受け口は 503 で DB に接続しない) +
-`scripts/test-company-db-profit-fn-revoke-pg.mjs` (本物の PG・11 件。**試験が自分で使い捨てのクラスタを起動して最後に消す** = 外の PostgreSQL にはつながない・watcher / profit_reader が既にあれば止まる・
-embedded-postgres が見つからなければ **失敗 (飛ばさない)**。embedded-postgres は依存に入れていない (OS ごとの本体が大きい・Render の npm ci に載せない) = リポジトリ → 環境変数 `EMBEDDED_PG_DIR` → `C:/tmp/pg-embed` の順に探す。
-どちらも `npm run test:company-db` に入っている = この試験が通らない PC では test:company-db が赤になる。**マージの前に必ず流す**: 持ち主 = superuser でない CREATEROLE の login の役割で全部の migration を流す /
+`scripts/test-company-db-profit-fn-revoke-pg.mjs` (本物の PG・11 件。**試験が自分で使い捨てのクラスタを起動して最後に必ず止めて消す** = 外の PostgreSQL にはつながない・watcher / profit_reader が既にあれば止まる・
+`persistent: false` + 起動の後の全部 (役割・DB・接続の準備・試験) を外側の try/finally で覆う = どこで落ちてもクラスタを消す・フォルダが残れば失敗。
+**embedded-postgres は devDependencies に正確な版 (`18.4.0-beta.17`) で入っている** (lockfile で固定・#1601 Codex R2 M) = clean な checkout + `npm ci` だけで流れる。
+Render の Dockerfile は `npm ci --production` = dev の依存は入らない (容量・起動は変わらない)。miniPC の本適用の手順も `npm ci --omit=dev` でよい (migrate.mjs と --verify は `pg`・`dotenv` = 本番の依存だけ)。
+外の置き場 (環境変数 `EMBEDDED_PG_DIR` → `C:/tmp/pg-embed`) は **版が同じときだけ** 使う (node_modules を別の作業の木へのジャンクションにした worktree で npm ci をし直さずに流すため。違う版は使わない = 同じコミットで同じ版)。
+見つからない・版が違う・起動できない = **失敗 (飛ばさない)**。
+🚨 終わりは `process.exit` を明示: embedded-postgres が入れる async-exit-hook が beforeExit で `process.exit(0)` を呼び `process.exitCode = 1` を上書きする (失敗しても exit 0 になっていた・10/3 に見つけた)。
+どちらも `npm run test:company-db` に入っている (飛ばさない)。**マージの前に必ず流す**: 持ち主 = superuser でない CREATEROLE の login の役割で全部の migration を流す /
 持ち主・watcher・profit_reader・PUBLIC だけの役割の全部が 42501 / guard_later・light と持ち主と TEMP は変わらない / coverage の complete の道と `finance_daily_range` は今までどおり /
 SECURITY DEFINER の中からも 42501 / create or replace の約束 / 2 回流しても同じ / `--verify` が前 ❌・後 ✅ / 持ち主でない役割で流すと止まる)。
 
@@ -1738,7 +1743,7 @@ cd C:\Users\bfaith\bfaith-portal
 git fetch origin
 git worktree add C:\tmp\d60-revoke origin/master
 cd C:\tmp\d60-revoke
-npm ci
+npm ci --omit=dev                                                                # 本適用には dev の依存 (embedded-postgres・PGlite・playwright) は要らない
 $env:DOTENV_CONFIG_PATH = 'C:\Users\bfaith\bfaith-portal\.env'
 node -r dotenv/config scripts\company-db\heavy-entry-manifest.mjs --verify      # 前: ❌ (revoke の関数を watcher・PUBLIC・持ち主が呼べる) が出ること。TEMP の監査を控える
 node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                  # 0056 だけが出ること
