@@ -23,7 +23,7 @@ import { getMirrorDB } from '../warehouse-mirror/db.js';
 // Amazon の ASIN は SKU → ASIN の専用のマップから (lib/amazon-sku-asin-map.js・2026-10-03)。
 //   前は 日次の財務 (asin_norm・常に空) → 価格の写し → 手数料の写し の 3 つを順に引いていた。マップは後ろの 2 つから作る = 財務は読まない
 //   (読み口 lib/amazon-finance-read.js の consumer 'site-products' は外した)
-import { loadSkuAsinMap } from '../../lib/amazon-sku-asin-map.js';
+import { loadSkuAsinMap, compareAsinHits, asinMapDiagnostics } from '../../lib/amazon-sku-asin-map.js';
 
 const router = express.Router();
 
@@ -52,16 +52,15 @@ function requireSiteReadToken(req, res, next) {
 
 const norm = (v) => String(v ?? '').trim().toLowerCase();
 
-// ASIN のマップの出どころ → 応答の診断 (resolved.asinSources) の名前・degradedLookups の名前 (前と同じ名前のまま)
+// ASIN のマップの出どころ → 応答の診断 (resolved.asinSources) の名前 (前と同じ名前のまま)。degradedLookups の名前は lib の DEGRADED_LOOKUP_NAME (asinPrice / asinFees)
 const ASIN_SOURCE_LABEL = { price_snapshot: 'amazonAsinPrice', sku_fees: 'amazonAsinFees' };
-const ASIN_DEGRADED_KEY = { price_snapshot: 'asinPrice', sku_fees: 'asinFees' };
 
 /**
  * lookupに使う表を一括ロードする。1表につき1クエリ。
  * mirror表はデプロイ時期によって存在しないことがあるため、失敗した表だけnull運用に落とす
  * (fail-soft。新mirror表はfail-soft必須の運用ルールに準拠)。
  */
-function loadIndexes(db, degraded) {
+function loadIndexes(db, degraded, diag = {}) {
   const q = (key, sql, build) => {
     try {
       return build(db.prepare(sql).all());
@@ -82,7 +81,9 @@ function loadIndexes(db, degraded) {
   // ASIN: SKU → ASIN の専用のマップ (取引の中で読む = キャッシュを使わない)。読めない出どころは前と同じ名前で degraded に
   const skuAsin = (() => {
     const m = loadSkuAsinMap(db, { cache: false });
-    for (const src of m.degraded) degraded.add(ASIN_DEGRADED_KEY[src] || src);
+    const d = asinMapDiagnostics(m);
+    for (const name of d.degradedLookups) degraded.add(name);
+    diag.asinMap = d.asinMap;   // 応答の asinMap (多対多の数)
     return m;
   })();
 
@@ -130,7 +131,8 @@ function loadIndexes(db, degraded) {
       }
     ),
     // ne_code (小文字) → seller_sku[] (Amazon SKU。1商品が複数SKUに紐づく)
-    skusByNe: q('skuResolved', `SELECT seller_sku, ne_code FROM mirror_sku_resolved`, (rows) => {
+    // 並びを決める (ASIN の選び方は下の全順序で決めるので並びに依らないが、SKU の一覧も毎回同じに。Codex #1604 R1 Medium)
+    skusByNe: q('skuResolved', `SELECT seller_sku, ne_code FROM mirror_sku_resolved ORDER BY LOWER(TRIM(ne_code)), LOWER(TRIM(seller_sku)), seller_sku`, (rows) => {
       const m = new Map();
       for (const r of rows) {
         const k = norm(r.ne_code);
@@ -211,14 +213,16 @@ function lookupMalls(idx, code, asinSourceCounts) {
     }
   }
 
-  // ASIN = 商品の SKU のうち「見た日」がいちばん新しい SKU の今の ASIN (同じ日なら先の SKU)。
-  // SKU ごとの今の ASIN の決め方 (手数料の写しと価格の写しのどちらを採るか) は lib/amazon-sku-asin-map.js
+  // ASIN = 商品の SKU の今の ASIN のうち、全順序でいちばん先のもの (lib の compareAsinHits):
+  //   見た日が新しい → 出どころの順位 (手数料の写しが先) → ASIN の文字の順 → SKU の文字の順
+  //   = 同じ日に複数の SKU があっても SQL の返す順 (DB の作り直しで変わる) に依らない (Codex #1604 R1 Medium)
+  // SKU ごとの今の ASIN の決め方 (手数料の写しと価格の写しのどちらを採るか) も同じ順 (lib/amazon-sku-asin-map.js)
   // (Codex指摘 (前の版): 複数SKUを持つ商品で古い/不定のASINを拾わないため)
   const sellerSkus = idx.skusByNe?.get(key) ?? [];
   let best = null;
   for (const sku of sellerSkus) {
     const hit = idx.asinBySku?.get(sku);
-    if (hit && (!best || hit.seen > best.seen)) best = hit;
+    if (hit && (!best || compareAsinHits(hit, best) < 0)) best = hit;
   }
   if (best) {
     const srcName = ASIN_SOURCE_LABEL[best.source] || best.source;
@@ -260,6 +264,7 @@ router.get('/products', requireSiteReadToken, (req, res) => {
   }
   try {
     const degraded = new Set();
+    const diag = {};
     const asinSourceCounts = {};
     let rows;
     let idx;
@@ -267,7 +272,7 @@ router.get('/products', requireSiteReadToken, (req, res) => {
     try {
       db.transaction(() => {
         rows = db.prepare(PRODUCTS_SQL).all();
-        idx = loadIndexes(db, degraded);
+        idx = loadIndexes(db, degraded, diag);
       })();
     } catch (e) {
       console.error('[site-products] products読み込み失敗:', e);
@@ -295,6 +300,8 @@ router.get('/products', requireSiteReadToken, (req, res) => {
       source: 'warehouse-mirror',
       count: result.length,
       degradedLookups: [...degraded],
+      // 診断: SKU → ASIN のマップの数 (skusWithManyAsins = ASIN を付け替えた SKU・asinsWithManySkus = 1 ASIN に複数 SKU)
+      asinMap: diag.asinMap ?? null,
       // 診断: モール別のURL解決数。0が続く場合は元データ (mirror同期) 側を疑う
       resolved: {
         rakuten: result.filter((p) => p.malls.rakuten.url).length,

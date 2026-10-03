@@ -12,6 +12,8 @@ await temporaryTestRoot(import.meta.url);
  *     Amazon (sku_resolved→asin)・Qoo10 (seller_code)・auPAY (idのみ・url=null)
  *  4. 境界値: 引当>在庫→stockFree=0 / price・name null
  *  5. fail-soft: prepare後に表をDROPしても該当lookupのみnull降格 (500にしない・degradedLookupsに記録)
+ *  6. ASIN の選び方の全順序 (Codex #1604 R1 Medium): 同じ日・複数 SKU の商品は 見た日 → 出どころ (手数料の写しが先) → ASIN → SKU の順で 1 つ。
+ *     SKU の登録の順 (SQL の返す順) を逆にしても同じ ASIN
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -37,6 +39,8 @@ insProduct.run(1, 'TEST1', 'テスト商品1', '通常', '取扱', 1980, 'ok', 1
 insProduct.run(2, 'TEST2', 'テスト商品2 (モール紐付けなし)', '通常', '取扱', 980, 'ok', 0, 0, 5, now);
 insProduct.run(3, 'TEST3', 'テスト商品3 (楽天フォールバックURL+price_snapshot経由ASIN)', '通常', '取扱', 500, 'ok', 5, 0, 5, now);
 insProduct.run(4, 'TEST4', null, '通常', '取扱', null, 'ok', 2, 5, 5, now); // 境界: name/price null・引当>在庫
+insProduct.run(5, 'TEST5', 'テスト商品5 (同じ日に SKU 3 つ)', '通常', '取扱', 100, 'ok', 1, 0, 5, now);
+insProduct.run(6, 'TEST6', 'テスト商品6 (TEST5 と同じ形・SKU の登録の順が逆)', '通常', '取扱', 100, 'ok', 1, 0, 5, now);
 
 const insRkMap = db.prepare(
   `INSERT INTO mirror_rakuten_sku_map (rakuten_code, ne_code, source, updated_at) VALUES (?, ?, ?, ?)`
@@ -92,7 +96,21 @@ db.prepare(
   `INSERT INTO mirror_amazon_price_snapshot_daily
    (date_jst, seller_sku, asin, source_run_id, source_row_hash, synced_at)
    VALUES (?, ?, ?, ?, ?, ?)`
-).run('2026-07-30', 'pr_test3_upper', 'B0PRICESNAP', 'r1', 'h6', now);
+).run('2026-07-30', 'pr_test3_upper', 'B0PRICESN1', 'r1', 'h6', now);
+
+// TEST5 / TEST6: 同じ日 (JST 7/30) に SKU が 3 つ。b = 手数料の写し (Z)・a = 価格の写し (A)・c = 手数料の写し (M)
+//   前の選び方 (見た日が大きいときだけ替える = 同じ日は先の SKU) だと登録の順で答えが変わる (TEST5 = Z・TEST6 = M)
+//   全順序: 見た日が同じ → 手数料の写しが先 (b・c) → ASIN の文字の順 → M。どちらの登録の順でも M
+for (const [ne, order] of [['TEST5', ['b', 'a', 'c']], ['TEST6', ['c', 'a', 'b']]]) {
+  const t = ne.slice(-1);
+  for (const k of order) {
+    db.prepare(`INSERT INTO mirror_sku_resolved (seller_sku, ne_code, quantity, source, synced_at) VALUES (?, ?, ?, ?, ?)`).run(`pr_t${t}_${k}`, ne, 1, 'master', now);
+  }
+  db.prepare(`INSERT INTO mirror_amazon_sku_fees (seller_sku, asin, fulfillment_channel, fetched_at) VALUES (?, ?, ?, ?)`).run(`pr_t${t}_b`, `B0T${t}ZZZZZ1`, 'FBA', '2026-07-30 01:00:00');
+  db.prepare(`INSERT INTO mirror_amazon_sku_fees (seller_sku, asin, fulfillment_channel, fetched_at) VALUES (?, ?, ?, ?)`).run(`pr_t${t}_c`, `B0T${t}MMMMM1`, 'FBA', '2026-07-29 20:00:00');   // UTC 20:00 = JST 7/30
+  db.prepare(`INSERT INTO mirror_amazon_price_snapshot_daily (date_jst, seller_sku, asin, source_run_id, source_row_hash, synced_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run('2026-07-30', `pr_t${t}_a`, `B0T${t}AAAAA1`, 'r1', `h-${t}`, now);
+}
 
 // ---------- server ----------
 const { default: router } = await import('../apps/site-products/router.js');
@@ -139,7 +157,7 @@ ok('Cache-Control: no-store', res.headers.get('cache-control') === 'no-store');
 
 // 2. 契約
 const body = await res.json();
-ok('ok=true / count=4', body.ok === true && body.count === 4, JSON.stringify({ ok: body.ok, count: body.count }));
+ok('ok=true / count=6', body.ok === true && body.count === 6, JSON.stringify({ ok: body.ok, count: body.count }));
 ok('degradedLookups空 (全表あり)', Array.isArray(body.degradedLookups) && body.degradedLookups.length === 0, JSON.stringify(body.degradedLookups));
 const p1 = body.products.find((p) => p.code === 'TEST1');
 const p2 = body.products.find((p) => p.code === 'TEST2');
@@ -148,18 +166,28 @@ const p4 = body.products.find((p) => p.code === 'TEST4');
 ok('TEST1が返る', !!p1);
 ok(
   'Amazon: price_snapshot経由+SKU大小ゆれでも解決',
-  p3?.malls?.amazon?.url === 'https://www.amazon.co.jp/dp/B0PRICESNAP',
+  p3?.malls?.amazon?.url === 'https://www.amazon.co.jp/dp/B0PRICESN1',
   p3?.malls?.amazon?.url
 );
 ok(
-  '診断: resolved件数とASIN解決元を返す (手数料の写し 1・価格の写し 1・財務は無い)',
-  body.resolved?.amazon === 2 && body.resolved?.asinSources?.amazonAsinPrice === 1 && body.resolved?.asinSources?.amazonAsinFees === 1
+  '診断: resolved件数とASIN解決元を返す (手数料の写し 3 (TEST1・TEST5・TEST6)・価格の写し 1・財務は無い)',
+  body.resolved?.amazon === 4 && body.resolved?.asinSources?.amazonAsinPrice === 1 && body.resolved?.asinSources?.amazonAsinFees === 3
     && !('amazonAsinFinance' in (body.resolved?.asinSources || {})),
   JSON.stringify(body.resolved)
 );
 ok('name/price', p1?.name === 'テスト商品1' && p1?.price === 1980);
 ok('stockFree=在庫-引当=7', p1?.stockFree === 7, `got ${p1?.stockFree}`);
 ok('TEST2 stockFree=0', p2?.stockFree === 0, `got ${p2?.stockFree}`);
+
+ok('診断: asinMap (SKU → ASIN のマップの数・多対多の数)', body.asinMap?.skus === 8 && body.asinMap?.asinsWithManySkus === 0 && body.asinMap?.skusWithManyAsins === 0, JSON.stringify(body.asinMap));
+
+// 6. ASIN の選び方の全順序 (同じ日・複数 SKU)
+{
+  const p5 = body.products.find((p) => p.code === 'TEST5');
+  const p6 = body.products.find((p) => p.code === 'TEST6');
+  ok('同じ日・SKU 3 つ: 手数料の写し → ASIN の文字の順 (TEST5 = B0T5MMMMM1)', p5?.malls?.amazon?.asin === 'B0T5MMMMM1', p5?.malls?.amazon?.asin);
+  ok('SKU の登録の順を逆にしても同じ形の答え (TEST6 = B0T6MMMMM1)', p6?.malls?.amazon?.asin === 'B0T6MMMMM1', p6?.malls?.amazon?.asin);
+}
 
 // 3. モールURL解決
 ok('楽天: snapshot URL優先', p1?.malls?.rakuten?.url === 'https://item.rakuten.co.jp/b-faith/test1-rk/', p1?.malls?.rakuten?.url);
