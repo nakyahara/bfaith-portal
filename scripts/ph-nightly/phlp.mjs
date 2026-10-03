@@ -39,7 +39,8 @@ import crypto from 'node:crypto';
 
 const BASE = process.env.PH_LP_BASE || 'https://bfaith-portal.onrender.com/apps/product-hub/service-api';
 const PROMPT_VERSION = 'lp-compose-v1';     // サーバ側の lib/lp-compose.js と一致していること
-const MAX_IMAGES = 6;
+// 商品 6 + 素材 10 (サーバの lp-compose.js MAX_IMAGES と同じ・2026-10-02)
+const MAX_IMAGES = 16;
 const REASON_MAX = 1000;
 const OUT_MAX = 200_000;
 const LINT_MAX = 100_000;
@@ -165,15 +166,32 @@ async function cmdQueue() {
   if (r.status !== 200) fail(1);
 }
 
+/** packet の画像を n 番 (img-<ID>-<n>.jpg) と種類つきで並べる */
+function imageList(job) {
+  return (job.packet.images || []).slice(0, MAX_IMAGES).map((im, i) => {
+    const material = /^material:/.test(String(im.role || ''));
+    return {
+      n: i + 1, file: `img-${job.job_id}-${i + 1}.jpg`,
+      kind: material ? 'material' : 'product',
+      role: im.role || null,
+      ...(material ? { folder: im.folder || null, name: im.name || null } : {}),
+    };
+  });
+}
+
 async function cmdClaim(opt) {
   // 🚨 ランナーが決めた run id (PH_LP_RUN_ID) を優先する。ランナーはこの id で「実際に本回答を書いたモデル」を
   //    サーバに付ける (model-check)。Claude が --run に別の値を書いても、ランナーの id が job に写る
   const run = String(process.env.PH_LP_RUN_ID || opt.run || '').trim();
   if (!run) die('--run RUN_ID が要ります');
-  const r = await api('POST', '/lp-compose/claim', { runner_run_id: run.slice(0, 80) });
+  // max_images = この CLI が落とせる枚数。サーバはそれより多い依頼を掴ませない (古い phlp は送らない = 6 枚扱い)
+  const r = await api('POST', '/lp-compose/claim', { runner_run_id: run.slice(0, 80), max_images: MAX_IMAGES });
   if (r.status !== 200) { out(r.json); return fail(1); }
   const job = r.json.job;
-  if (!job) { out({ job: null, exhausted: r.json.exhausted || false, note: '仕事はありません' }); return; }
+  if (!job) {
+    out({ job: null, exhausted: r.json.exhausted || false, too_many_images: r.json.too_many_images || 0, note: r.json.error || '仕事はありません' });
+    return;
+  }
   // lease と packet_hash は CLI が持つ。Claude には出さない
   saveLease(job.job_id, {
     lease_token: job.lease_token, packet_hash: job.packet_hash, run,
@@ -185,6 +203,9 @@ async function cmdClaim(opt) {
       name: job.packet.name, ne_code: job.packet.ne_code,
       product_info: job.packet.product_info, color_variations: job.packet.color_variations,
       images: (job.packet.images || []).length,
+      // 素材 (画像フォルダの下のフォルダの画像) の場所と名前。検品で「使用素材に無い素材を書いていないか」を見るため
+      materials: imageList(job).filter((im) => im.kind === 'material').map(({ n, folder, name }) => ({ n, folder, name })),
+      materials_omitted: Number(job.packet.materials_omitted) || 0,
     },
     // 証跡に file_id が要る。packet の並びをそのまま覚えておき、
     // images で n 番目 ↔ file_id を紐づける (Claude に手で写させない)
@@ -203,6 +224,12 @@ async function cmdClaim(opt) {
       product_info: job.packet.product_info,
       color_variations: job.packet.color_variations,
       images: job.packet.images.length,
+      // 何番が商品で何番が素材か (img-<ID>-<n>.jpg の n)。
+      // product = 商品の再現用 (形・ラベル・色)。material = 使用素材の候補 (画像フォルダの下のフォルダの画像)
+      image_list: imageList(job),
+      materials_omitted: Number(job.packet.materials_omitted) || 0,
+      // 🚨 添付画像の説明 = スタッフの ChatGPT 版にも同じ文を貼る (くらべっこを公平にする)。素材の扱いはこれに従う
+      image_guide: job.packet.image_guide || null,
     },
     // 🚨 スタッフが ChatGPT に貼る定型文と**同じ指示文** (設計 §5)。
     //    これに従って書く。自分の言葉で書き換えない —
@@ -404,7 +431,12 @@ function cmdReviewData(id) {
     '===== 材料① 商品の情報 (サーバが claim で渡したもの) =====',
     `商品名: ${nz(m.name)}`,
     `NEコード: ${nz(m.ne_code)}`,
-    `商品画像: ${Number(m.images) || 0} 枚 (実行役が取得できたのは ${imgs.length} 枚)`,
+    `画像: ${Number(m.images) || 0} 枚 (うち素材 ${(m.materials || []).length} 枚・実行役が取得できたのは ${imgs.length} 枚)`,
+    // 素材 = 画像フォルダの下のフォルダの画像。⑦ の「使用素材」はこの中から選ぶ (無い素材を書いていたら指摘)
+    ...((m.materials || []).length
+      ? ['[素材の一覧 (n = img-ID-n.jpg)]', ...(m.materials || []).map((x) => `  ${x.n}: ${x.folder ? x.folder + '/' : ''}${x.name || ''}`)]
+      : ['[素材の一覧] (なし)']),
+    ...(Number(m.materials_omitted) ? [`  (上限 10 枚で入らなかった素材 ${Number(m.materials_omitted)} 枚)`] : []),
     '',
     '[商品情報]',
     nz(m.product_info),

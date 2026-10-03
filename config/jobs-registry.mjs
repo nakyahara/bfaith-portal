@@ -319,7 +319,9 @@ export const JOBS_REGISTRY = [
     importance: 'P3',
     owner: '中原さん',
     purpose: 'LP 構成の AI 生成 (段階1・2026-10-01)。商品ハブの詳細画面で「🤖 構成をAIに作らせる」を押した商品について、'
-      + 'claim → 商品画像を落として見る → 仕様書 (LP制作システム V2.2) に従って ⑦ AI画像生成プロンプトを書く → lint → Codex 検品 (最大 2 巡) → 書き戻す。'
+      + 'claim → 画像を落として見る (商品画像 6 枚 + 素材画像 10 枚まで・素材 = 商品の画像フォルダの中のフォルダの画像・2026-10-02〜) → '
+      + '仕様書 (LP制作システム V2.2) と添付画像の説明 (スタッフの ChatGPT 版と同じ文) に従って ⑦ AI画像生成プロンプトを書く → lint → Codex 検品 (最大 2 巡) → 書き戻す。'
+      + '1 件の上限 15 分。'
       + '**段階1 の目的は機能ではなく測定** (AI の構成がスタッフの ChatGPT 出力と比べて使えるか・10 件で判定)。'
       + '書き戻した構成は画面に出るだけで、人がコピーして lp-tool に貼る運用は変わらない。画像生成・GAS への送信・撮影依頼書は段階2 以降',
     where: 'miniPC TaskScheduler [PhLpComposeMinutely] (scripts/ph-nightly/run-lp-compose.ps1 → work の ./phlp + スキル ph-lp-compose)。Render の PH_LP_COMPOSE_ENABLED=1 のときだけ動く',
@@ -336,7 +338,10 @@ export const JOBS_REGISTRY = [
       + '"server sent no usable model" (fail) → Render の PH_LP_COMPOSE_MODEL が読めない値 (読めなければ止める・既定に戻さない) / '
       + '"model not verified" (partial) → 本回答のモデルが頼んだモデルと違う・読めない・確認を送れなかった。その依頼は needs_review で本文は出ない。もう一度依頼する / '
       + '"model check re-send failed (kept)" → state\\lp-model-check-*.json に控えて毎分再送 (サーバは 15 分で未確認として閉じる) / '
-      + '"API Error: 400 ... 2.1.280 or newer" → miniPC の Claude Code が古い (上げるときは夜間の原稿生成・商品スカウトの引数も確認)。'
+      + '"API Error: 400 ... 2.1.280 or newer" → miniPC の Claude Code が古い (上げるときは夜間の原稿生成・商品スカウトの引数も確認) / '
+      // 素材画像 (2026-10-02・#1593)
+      + '依頼が queued のまま進まず claim の応答に too_many_images が出る → miniPC の phlp が古い (素材つき・7 枚以上の依頼を掴めない)。miniPC で install.ps1 を流す / '
+      + '押すと「素材画像を Drive から読めませんでした」→ 画像フォルダの共有・中のフォルダの数 (6 階層・60 フォルダ・500 件まで) を確かめてもう一度押す。'
       + '止めるなら Render の PH_LP_COMPOSE_ENABLED を外すか Disable-ScheduledTask PhLpComposeMinutely',
   },
   {
