@@ -34,6 +34,8 @@
  */
 import { AMAZON_SALES_GROSS_INCL_SQL } from '../warehouse-mirror/db.js';
 import { financeDailyTable } from '../../lib/amazon-finance-read.js';
+// 出品の ASIN は SKU → ASIN の専用のマップ (SKU の今の ASIN) から付ける。財務の asin_norm は常に空 (2026-10-03 までは ASIN の欄がいつも空だった)
+import { loadSkuAsinMap, currentAsin } from '../../lib/amazon-sku-asin-map.js';
 
 const AMAZON_FINANCE_DAILY = financeDailyTable('supplier-sales');
 
@@ -264,7 +266,7 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
 
     // Amazon: seller_sku を構成品へ展開
     const amzRows = db.prepare(`
-      SELECT date_jst d, LOWER(TRIM(seller_sku)) k, asin_norm asin, product_name name,
+      SELECT date_jst d, LOWER(TRIM(seller_sku)) k, product_name name,
              CAST(units_net_sold AS REAL) u, ${AMAZON_SALES_GROSS_INCL_SQL} sales,
              (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
       FROM ${AMAZON_FINANCE_DAILY}
@@ -273,10 +275,11 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
           SELECT LOWER(TRIM(seller_sku)) FROM mirror_sku_resolved
           WHERE LOWER(TRIM(ne_code)) IN (SELECT LOWER(TRIM(商品コード)) FROM mirror_products WHERE 仕入先コード = @s))
     `).all(params);
+    const asinMap = loadSkuAsinMap(db);
     for (const r of amzRows) {
       const comps = amzMap.get(r.k);
       if (!comps || !comps.length) continue;
-      attribute({ mall: 'amazon', listingId: r.k, listingName: r.name, asin: r.asin, fbaFee: r.fbaFee, date: r.d, u: r.u, sales: r.sales, comps });
+      attribute({ mall: 'amazon', listingId: r.k, listingName: r.name, asin: currentAsin(asinMap, r.k), fbaFee: r.fbaFee, date: r.d, u: r.u, sales: r.sales, comps });
     }
 
     // 非 Amazon: fact の ne_code がセットなら展開、単品ならそのまま
@@ -455,7 +458,7 @@ export function getSupplierDailyDetail(db, supplierCode, opts = {}) {
 
   // Amazon: 日次 × seller_sku（FBA/FBM 判別、構成品展開）
   const amz = db.prepare(`
-    SELECT date_jst, seller_sku, asin_norm, product_name,
+    SELECT date_jst, seller_sku, product_name,
            CAST(units_net_sold AS REAL) u, ${AMAZON_SALES_GROSS_INCL_SQL} sales,
            (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
     FROM ${AMAZON_FINANCE_DAILY}
@@ -464,8 +467,9 @@ export function getSupplierDailyDetail(db, supplierCode, opts = {}) {
         SELECT seller_sku FROM mirror_sku_resolved
         WHERE ne_code IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s))
   `).all(params);
+  const asinMap = loadSkuAsinMap(db);
   for (const r of amz) {
-    emit({ date: r.date_jst, mall: 'amazon', is_fba: r.fbaFee > 0, listingId: r.seller_sku, asin: r.asin_norm || '', comps: amzMap.get(r.seller_sku), u: r.u, sales: r.sales });
+    emit({ date: r.date_jst, mall: 'amazon', is_fba: r.fbaFee > 0, listingId: r.seller_sku, asin: currentAsin(asinMap, r.seller_sku), comps: amzMap.get(r.seller_sku), u: r.u, sales: r.sales });
   }
 
   // 非 Amazon: 日次 × 出品（fact の ne_code、セットは構成品展開）

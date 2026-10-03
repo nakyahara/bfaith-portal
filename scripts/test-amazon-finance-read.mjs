@@ -47,7 +47,6 @@ const EXPECTED = {
   'margin-alert': { finance_daily: FIN },
   'amazon-pricing': { finance_daily: FIN },
   'supplier-sales': { finance_daily: FIN },
-  'site-products': { finance_daily: FIN },
   'mall-finance-unified-view': { finance_daily: FIN },
 };
 {
@@ -92,7 +91,7 @@ console.log('\n── 3. 壊れた profile の組は止まる ──');
   ok(JSON.stringify(R.validateProfileSet('legacy')) === JSON.stringify(Object.keys(EXPECTED).sort()), 'legacy の組は通る');
   check('cdb を選ぶと止まる (F4-1 では選べない)', (s) => { s['supplier-sales'].finance_daily = 'cdb'; }, /選べない/);
   check('cdb:finance_only のような値も止まる', (s) => { s['amazon-pricing'].finance_daily = 'cdb:finance_only'; }, /選べない/);
-  check('consumer が 1 つ足りないと止まる', (s) => { delete s['site-products']; }, /足りない: site-products/);
+  check('consumer が 1 つ足りないと止まる', (s) => { delete s['amazon-pricing']; }, /足りない: amazon-pricing/);
   check('一覧に無い consumer があると止まる', (s) => { s['new-reader'] = { finance_daily: 'legacy' }; }, /余計: new-reader/);
   check('知らない dataset があると止まる', (s) => { s['amazon-dashboard:trend'].profit = 'legacy'; }, /知らない dataset 'profit'/);
   check('何も読まない consumer は止まる (dataset の抜け)', (s) => { s['margin-alert'] = {}; }, /何も読まない/);
@@ -232,7 +231,6 @@ const ASSIGN = {
   'apps/amazon-pricing/read-model.js': { '*': ['financeDailyTable:amazon-pricing'] },          // FINANCE_DAILY (360 行・必要な表・指紋・鮮度が使う)
   'apps/amazon-pricing/engine.js': { describeInputs: ['financeDailyTable:amazon-pricing'] },   // 判定の監査の出どころ
   'apps/supplier-sales/aggregate.js': { '*': ['financeDailyTable:supplier-sales'] },           // AMAZON_FINANCE_DAILY (4 つの SQL が使う)
-  'apps/site-products/router.js': { loadIndexes: ['financeDailyTable:site-products', 'financeDailyTable:site-products'] },
   'apps/warehouse-mirror/db.js': { createTables: ['financeDailyTable:mall-finance-unified-view'] },
 };
 /** 読み口を呼ぶ所を出てくる順に (位置, 「種類:consumer」) */

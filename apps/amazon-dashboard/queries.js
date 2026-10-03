@@ -22,6 +22,8 @@
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 // Amazon の財務の表の名前は共通の読み口から (F4-1・2026-10-03)。consumer ごとの profile = lib/amazon-finance-read.js (今は全部 legacy = 下の mirror_* の表)
 import { financeDailyTable, accountFeesTable } from '../../lib/amazon-finance-read.js';
+// SKU → ASIN の対応は専用のマップから (財務の asin_norm は常に空。2026-10-03)
+import { loadSkuAsinMap, currentAsin, asinsOfSku } from '../../lib/amazon-sku-asin-map.js';
 
 // 消費税率 (速報→税抜の概算換算用。軽減税率 SKU は過大控除になるが「推定」ラベル前提)
 const TAX_RATE = 1.1;
@@ -417,7 +419,10 @@ export function getTrend(from, to, granularity) {
 
 // ─── 広告費の SKU 配賦 (共通ロジック) ───
 // 1. direct: mirror_amazon_ads_sku_daily の target を SKU/ASIN 両対応で SKU に貼る
-//    (asin 粒度の行は同一 ASIN を持つ SKU 群に広告経由売上→無ければ確定売上比で按分)
+//    (asin 粒度の行は同一 ASIN を持つ SKU 群に確定売上比で按分)
+//    🆕 2026-10-03: ASIN → SKU の群は lib/amazon-sku-asin-map.js のマップ (一度でも対になった SKU 全部) から作る。
+//      前は財務の asin_norm (常に空) から作っていた = ASIN 粒度の広告は 1 円も SKU に貼れず、全部 2 の按分に回っていた
+//      群の中の割合は確定売上 (負は 0 として数える) の比・全部 0 なら等分。群は SKU の行ごとに 1 回 = 1 行の広告費を二重に配らない
 // 2. unallocated = campaign 合計 − direct 合計 → 各 SKU の広告経由売上比 (fallback 確定売上比) で按分
 // 戻り値: Map<seller_sku, {direct, allocated, ad_sales}>
 function allocateAdCost(db, from, to, skuRows) {
@@ -429,13 +434,13 @@ function allocateAdCost(db, from, to, skuRows) {
   `).all(from, to);
   const campaignTotal = adCost(db, from, to).ad_cost;
 
+  const asinMap = loadSkuAsinMap(db);
   const bySku = new Map();       // LOWER(seller_sku) → skuRow
-  const byAsin = new Map();      // LOWER(asin) → [skuRow]
+  const byAsin = new Map();      // LOWER(asin) → [skuRow] (SKU の行ごとに 1 回)
   for (const r of skuRows) {
     const skuKey = r.seller_sku.toLowerCase();
     bySku.set(skuKey, r);
-    const asinKey = (r.asin_norm || '').toLowerCase();
-    if (asinKey) {
+    for (const asinKey of asinsOfSku(asinMap, skuKey)) {
       if (!byAsin.has(asinKey)) byAsin.set(asinKey, []);
       byAsin.get(asinKey).push(r);
     }
@@ -458,10 +463,11 @@ function allocateAdCost(db, from, to, skuRows) {
       matchedDirect += a.cost;
     } else if (a.target_granularity === 'asin' && byAsin.has(a.target)) {
       // ASIN 行 → 同 ASIN の SKU 群に確定売上比で按分 (行単位の広告経由売上内訳は持っていない)
+      // 負の売上 (返金が多い SKU) は 0 として数える (割合が負や 1 超にならない = 群の合計は必ず a.cost)
       const group = byAsin.get(a.target);
-      const totalRev = group.reduce((s, r) => s + (r.revenue_excl || 0), 0);
+      const totalRev = group.reduce((s, r) => s + Math.max(0, r.revenue_excl || 0), 0);
       for (const r of group) {
-        const share = totalRev > 0 ? (r.revenue_excl || 0) / totalRev : 1 / group.length;
+        const share = totalRev > 0 ? Math.max(0, r.revenue_excl || 0) / totalRev : 1 / group.length;
         const e = ensure(r.seller_sku);
         e.direct += a.cost * share;
         e.ad_sales += a.sales * share;
@@ -540,9 +546,15 @@ function attachProductNames(db, rows, skuField = 'seller_sku') {
 
 // ─── SKU 別 確定集計 (利益分析/広告/売れ筋/診断の共通ベース) ───
 // consumer = 呼び手の画面 (読み口の profile のキー。F4-1)
+// asin = SKU の今の ASIN (lib/amazon-sku-asin-map.js・無ければ '')。財務の asin_norm は常に空なので読まない (2026-10-03)
+function attachAsins(db, rows) {
+  const map = loadSkuAsinMap(db);
+  for (const r of rows) r.asin = currentAsin(map, r.seller_sku);
+  return rows;
+}
 function settledBySku(db, from, to, consumer) {
-  return attachProductNames(db, db.prepare(`
-    SELECT seller_sku, MAX(asin_norm) AS asin_norm, MAX(product_name) AS product_name,
+  return attachAsins(db, attachProductNames(db, db.prepare(`
+    SELECT seller_sku, MAX(product_name) AS product_name,
       SUM(units_net_sold) AS units_net,
       SUM(units_ordered) AS units_ordered,
       SUM(sales_principal_jpy + sales_shipping_jpy + sales_giftwrap_jpy) AS revenue_excl,
@@ -566,7 +578,7 @@ function settledBySku(db, from, to, consumer) {
     FROM ${financeDailyTable(consumer)}
     WHERE date_jst >= ? AND date_jst <= ?
     GROUP BY seller_sku
-  `).all(from, to));
+  `).all(from, to)));
 }
 
 // ─── 利益分析タブ: ウォーターフォール ───
@@ -657,7 +669,7 @@ export function getSkuProfit(from, to, opts = {}) {
     const profitAfter = r.profit_before_ads - adTotal;
     return {
       seller_sku: r.seller_sku,
-      asin: r.asin_norm,
+      asin: r.asin,
       product_name: r.product_name,
       units_net: r.units_net,
       revenue_excl: Math.round(r.revenue_excl),
@@ -896,7 +908,7 @@ export function getBestsellers(from, toReq, axis) {
     const firstSale = firstSaleMap.get(r.seller_sku.toLowerCase()) || null;
     const profitAfter = r.profit_before_ads - a.direct - a.allocated;
     return {
-      seller_sku: r.seller_sku, asin: r.asin_norm, product_name: r.product_name,
+      seller_sku: r.seller_sku, asin: r.asin, product_name: r.product_name,
       units_net: r.units_net,
       revenue_excl: Math.round(r.revenue_excl),
       profit_after_ads: Math.round(profitAfter),

@@ -65,11 +65,16 @@ db.prepare(
 db.prepare(
   `INSERT INTO mirror_sku_resolved (seller_sku, ne_code, quantity, source, synced_at) VALUES (?, ?, ?, ?, ?)`
 ).run('pr_test1', 'TEST1', 1, 'master', now);
+// ASIN は SKU → ASIN の専用のマップ (手数料の写し・価格の写し) から (2026-10-03)。日次の財務の asin_norm は読まない
+db.prepare(
+  `INSERT INTO mirror_amazon_sku_fees (seller_sku, asin, fulfillment_channel, fetched_at) VALUES (?, ?, ?, ?)`
+).run('pr_test1', 'B0TESTASIN', 'FBA', '2026-07-30 01:00:00');
+// 財務の asin_norm に値があっても使わない (本番は常に空・Company DB にも無い)
 db.prepare(
   `INSERT INTO mirror_amazon_finance_sku_daily
    (date_jst, seller_sku, asin_norm, cost_status, source_run_id, source_row_hash, synced_at)
    VALUES (?, ?, ?, ?, ?, ?, ?)`
-).run('2026-07-30', 'pr_test1', 'B0TESTASIN', 'complete', 'r1', 'h4', now);
+).run('2026-07-30', 'pr_test1', 'B0FINANCEONLY', 'complete', 'r1', 'h4', now);
 db.prepare(
   `INSERT INTO mirror_qoo10_items (item_no, seller_code, source_run_id, source_row_hash, synced_at) VALUES (?, ?, ?, ?, ?)`
 ).run('123456789', 'TEST1', 'r1', 'h3', now);
@@ -147,8 +152,9 @@ ok(
   p3?.malls?.amazon?.url
 );
 ok(
-  '診断: resolved件数とASIN解決元を返す',
-  body.resolved?.amazon === 2 && body.resolved?.asinSources?.amazonAsinPrice === 1,
+  '診断: resolved件数とASIN解決元を返す (手数料の写し 1・価格の写し 1・財務は無い)',
+  body.resolved?.amazon === 2 && body.resolved?.asinSources?.amazonAsinPrice === 1 && body.resolved?.asinSources?.amazonAsinFees === 1
+    && !('amazonAsinFinance' in (body.resolved?.asinSources || {})),
   JSON.stringify(body.resolved)
 );
 ok('name/price', p1?.name === 'テスト商品1' && p1?.price === 1980);
@@ -182,6 +188,16 @@ db.exec('DROP TABLE mirror_qoo10_items');
   ok('Qoo10のみnull降格', q1?.malls?.qoo10?.url === null, JSON.stringify(q1?.malls?.qoo10));
   ok('他モールは維持', q1?.malls?.amazon?.url === 'https://www.amazon.co.jp/dp/B0TESTASIN');
   ok('degradedLookupsにqoo10Item', b.degradedLookups.includes('qoo10Items'), JSON.stringify(b.degradedLookups));
+}
+// ASIN のマップの出どころの 1 つ (価格の写し) が読めない → その出どころだけ飛ばす (前と同じ名前 asinPrice で degraded)
+db.exec('DROP TABLE mirror_amazon_price_snapshot_daily');
+{
+  const r = await fetch(`${base}/products`, { headers: { 'x-read-token': 'test-token-123' } });
+  ok('価格の写しを DROP しても 200', r.status === 200, `got ${r.status}`);
+  const b = await r.json();
+  ok('手数料の写しの ASIN は残る (TEST1)', b.products.find((p) => p.code === 'TEST1')?.malls?.amazon?.asin === 'B0TESTASIN');
+  ok('価格の写しだけの ASIN は null (TEST3)', b.products.find((p) => p.code === 'TEST3')?.malls?.amazon?.asin === null);
+  ok('degradedLookupsにasinPrice', b.degradedLookups.includes('asinPrice') && !b.degradedLookups.includes('asinFees'), JSON.stringify(b.degradedLookups));
 }
 
 await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));

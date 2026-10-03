@@ -327,7 +327,7 @@ try {
     await get(`po.mall-sales.${code}.${days}`, `/purchase-orders/api/products/${code}/mall-sales?days=${days}`);
   }
 
-  // site-products (asinFinance を含む lookup)
+  // site-products (ASIN は SKU → ASIN のマップ・2026-10-03 まで asinFinance = 財務の asin_norm も引いていた)
   await get('site.products', '/site/products', { 'x-read-token': 'parity-read-token' });
 
   // 統合の view (warehouse-mirror/db.js が作る・読み手 = purchase-orders・ai-insights)

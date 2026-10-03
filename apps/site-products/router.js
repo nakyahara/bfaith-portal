@@ -20,8 +20,10 @@
 import express from 'express';
 import crypto from 'node:crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
-// Amazon の財務の表の名前は共通の読み口から (F4-1・consumer 'site-products'・今は legacy = mirror_amazon_finance_sku_daily)
-import { financeDailyTable } from '../../lib/amazon-finance-read.js';
+// Amazon の ASIN は SKU → ASIN の専用のマップから (lib/amazon-sku-asin-map.js・2026-10-03)。
+//   前は 日次の財務 (asin_norm・常に空) → 価格の写し → 手数料の写し の 3 つを順に引いていた。マップは後ろの 2 つから作る = 財務は読まない
+//   (読み口 lib/amazon-finance-read.js の consumer 'site-products' は外した)
+import { loadSkuAsinMap } from '../../lib/amazon-sku-asin-map.js';
 
 const router = express.Router();
 
@@ -50,6 +52,10 @@ function requireSiteReadToken(req, res, next) {
 
 const norm = (v) => String(v ?? '').trim().toLowerCase();
 
+// ASIN のマップの出どころ → 応答の診断 (resolved.asinSources) の名前・degradedLookups の名前 (前と同じ名前のまま)
+const ASIN_SOURCE_LABEL = { price_snapshot: 'amazonAsinPrice', sku_fees: 'amazonAsinFees' };
+const ASIN_DEGRADED_KEY = { price_snapshot: 'asinPrice', sku_fees: 'asinFees' };
+
 /**
  * lookupに使う表を一括ロードする。1表につき1クエリ。
  * mirror表はデプロイ時期によって存在しないことがあるため、失敗した表だけnull運用に落とす
@@ -73,19 +79,12 @@ function loadIndexes(db, degraded) {
     }
     return m;
   };
-  // ASIN用: 日付も保持する (複数SKUを持つ商品で「最新のASIN」を選ぶため)
-  const datedMap = (rows) => {
-    const m = new Map();
-    for (const r of rows) {
-      const key = norm(r.seller_sku);
-      if (!key || !r.asin) continue;
-      const prev = m.get(key);
-      if (!prev || String(r.date ?? '') > String(prev.date ?? '')) {
-        m.set(key, { asin: r.asin, date: String(r.date ?? '') });
-      }
-    }
+  // ASIN: SKU → ASIN の専用のマップ (取引の中で読む = キャッシュを使わない)。読めない出どころは前と同じ名前で degraded に
+  const skuAsin = (() => {
+    const m = loadSkuAsinMap(db, { cache: false });
+    for (const src of m.degraded) degraded.add(ASIN_DEGRADED_KEY[src] || src);
     return m;
-  };
+  })();
 
   return {
     // ne_code (小文字) → 楽天SKUコード
@@ -141,33 +140,8 @@ function loadIndexes(db, degraded) {
       }
       return m;
     }),
-    // seller_sku (小文字) → {asin, date}。供給元3つを別Mapで持ち、優先順に引く。
-    // ⚠️日次履歴はSQL側でSKUごとの最新1行に絞る+dateを保持し、複数SKUでは最新を選ぶ (Codex指摘)
-    asinFinance: q(
-      'asinFinance',
-      `SELECT f.seller_sku, f.asin_norm AS asin, f.date_jst AS date
-       FROM ${financeDailyTable('site-products')} f
-       JOIN (SELECT seller_sku, MAX(date_jst) AS d FROM ${financeDailyTable('site-products')}
-             WHERE TRIM(asin_norm) <> '' GROUP BY seller_sku) l
-         ON l.seller_sku = f.seller_sku AND l.d = f.date_jst
-       WHERE TRIM(f.asin_norm) <> ''`,
-      (rows) => datedMap(rows)
-    ),
-    asinPrice: q(
-      'asinPrice',
-      `SELECT p.seller_sku, p.asin, p.date_jst AS date
-       FROM mirror_amazon_price_snapshot_daily p
-       JOIN (SELECT seller_sku, MAX(date_jst) AS d FROM mirror_amazon_price_snapshot_daily
-             WHERE TRIM(asin) <> '' GROUP BY seller_sku) l
-         ON l.seller_sku = p.seller_sku AND l.d = p.date_jst
-       WHERE TRIM(p.asin) <> ''`,
-      (rows) => datedMap(rows)
-    ),
-    asinFees: q(
-      'asinFees',
-      `SELECT seller_sku, asin, '' AS date FROM mirror_amazon_sku_fees WHERE TRIM(asin) <> ''`,
-      (rows) => datedMap(rows)
-    ),
+    // seller_sku (小文字) → { asin, seen (見た日), source }。SKU ごとに今の ASIN 1 つ
+    asinBySku: skuAsin.asinBySku,
     // 商品コード (小文字) → Qoo10商品番号
     qoo10ByCode: q(
       'qoo10Items',
@@ -237,26 +211,20 @@ function lookupMalls(idx, code, asinSourceCounts) {
     }
   }
 
-  // ASINは finance → price_snapshot → fees の順。同一ソース内では全SKUのうち最新日付を選ぶ
-  // (Codex指摘: 複数SKUを持つ商品で古い/不定のASINを拾わないため)
+  // ASIN = 商品の SKU のうち「見た日」がいちばん新しい SKU の今の ASIN (同じ日なら先の SKU)。
+  // SKU ごとの今の ASIN の決め方 (手数料の写しと価格の写しのどちらを採るか) は lib/amazon-sku-asin-map.js
+  // (Codex指摘 (前の版): 複数SKUを持つ商品で古い/不定のASINを拾わないため)
   const sellerSkus = idx.skusByNe?.get(key) ?? [];
-  for (const [srcName, map] of [
-    ['amazonAsinFinance', idx.asinFinance],
-    ['amazonAsinPrice', idx.asinPrice],
-    ['amazonAsinFees', idx.asinFees],
-  ]) {
-    if (!map) continue;
-    let best = null;
-    for (const sku of sellerSkus) {
-      const hit = map.get(sku);
-      if (hit && (!best || hit.date > best.date)) best = hit;
-    }
-    if (best) {
-      malls.amazon.asin = best.asin;
-      malls.amazon.url = `https://www.amazon.co.jp/dp/${best.asin}`;
-      asinSourceCounts[srcName] = (asinSourceCounts[srcName] ?? 0) + 1;
-      break;
-    }
+  let best = null;
+  for (const sku of sellerSkus) {
+    const hit = idx.asinBySku?.get(sku);
+    if (hit && (!best || hit.seen > best.seen)) best = hit;
+  }
+  if (best) {
+    const srcName = ASIN_SOURCE_LABEL[best.source] || best.source;
+    malls.amazon.asin = best.asin;
+    malls.amazon.url = `https://www.amazon.co.jp/dp/${best.asin}`;
+    asinSourceCounts[srcName] = (asinSourceCounts[srcName] ?? 0) + 1;
   }
 
   const itemNo = idx.qoo10ByCode?.get(key);
