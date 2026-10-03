@@ -26,6 +26,7 @@
     "test:fba-rules-v3": "node scripts/test-fba-rules-v3.mjs",
     "test:fba-smoothing": "node scripts/test-fba-smoothing.mjs",
     "test:fba-trials": "node scripts/test-fba-trials.mjs",
+    "test:ai-insights": "node apps/ai-insights/scripts/smoke.mjs && node apps/ai-insights/scripts/test-margin-cost-status.mjs",
     "test:fba-daily-cap": "node scripts/test-fba-daily-cap.mjs",
     "test:fba-inbound-snapshot": "node scripts/test-fba-inbound-snapshot.mjs",
     "test:sqljs-guard": "node scripts/test-sqljs-guard.mjs",

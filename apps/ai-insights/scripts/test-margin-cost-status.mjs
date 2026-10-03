@@ -150,6 +150,31 @@ for (const m of MALLS) {
 const amz = facts.by_mall.find((b) => b.mall === 'amazon');
 ok(amz?.margin_yen === -300 - 500 - 700 - 900 + 400 && amz?.sales_yen === 6000, 'amazon の粗利・売上の合計は全部の行', amz);
 
+// ═══ 3b. 同じ SKU で日により status が混ざる週 = 行 (日 × SKU) の単位で絞る ═══
+// (margin-alert は SKU の単位で「期間の全部の行が complete」を求める。ai-insights はそうしない、を固定する。Codex #1596 R1 Low)
+console.log('\n■ 同じ SKU に complete と missing_cost が混ざる週 (行の単位)');
+{
+  const PS2 = '2026-07-13';
+  const PE2 = '2026-07-20';
+  const rk = MALLS.find((m) => m.mall === 'rakuten');
+  const put = (date, status, units, sales, margin) => insertRow(rk.table, {
+    date_jst: date, [rk.sku]: 'rakuten-mixed', product_name: 'rakuten mixed',
+    units_net_sold: units, cost_status: status, is_cost_complete: status === 'complete' ? 1 : 0,
+    source_run_id: 'r', source_row_hash: `mixed-${date}`, synced_at: '2026-07-20T00:00:00Z',
+    ...rk.row(sales, margin),
+  });
+  put('2026-07-14', 'complete', 2, 1000, -200);
+  put('2026-07-15', 'missing_cost', 5, 3000, -1000);
+  const f2 = buildMarginFacts(db, PS2, PE2);
+  const mixed = f2.negative_margin_skus.find((w) => w.sku === 'rakuten-mixed');
+  ok(f2.negative_margin_skus.length === 1, 'ワーストは混ざった SKU の 1 件だけ', f2.negative_margin_skus);
+  ok(mixed?.units === 2 && mixed?.sales_yen === 1000 && mixed?.margin_yen === -200,
+    'complete の日 (7/14) の数量 2・売上 1,000・粗利 -200 だけを返す (missing_cost の日 7/15 は足さない)', mixed);
+  const rkMall = f2.by_mall.find((b) => b.mall === 'rakuten');
+  ok(rkMall?.cost_ok_row_share_pct === 50, '整備率 = complete 1 行 / 2 行 = 50%', rkMall);
+  ok(rkMall?.margin_yen === -1200 && rkMall?.sales_yen === 4000, 'モールの粗利・売上の合計は両方の日 (-1,200 / 4,000)', rkMall);
+}
+
 // ═══ 4. 週次の GChat (AI 不調時の機械整形) ═══
 console.log('\n■ 週次の GChat の文');
 const input = {
