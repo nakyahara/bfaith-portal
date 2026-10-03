@@ -4,17 +4,25 @@
  *
  * 🚨 使う所はまだ無い (単体の部品)。利益の受け口 (/amazon-profit/daily・/totals) は 503 のまま。開けるのは §3.10 の PR 6 だけ
  *
- * 契約 (§3.10「資源の関門」・Codex R-D60-v3-3 M4 / v3-4 M5・H4):
+ * 契約 (§3.10「資源の関門」・Codex R-D60-v3-3 M4 / v3-4 M5・H4・#1600 R1):
  *   - Postgres の resource の ID を設定で固定 (CDB_RENDER_PG_RESOURCE_ID・`dpg-` で始まる)。応答の系列の resource の label がこの ID と同じでなければ「不可」
  *   - 使う label を固定 (RESOURCE_LABEL_FIELD)。label が無い・2 つある・値が違う → 「不可」
- *   - 単位は bytes に直す (BYTE_UNITS にある単位だけ = 推測で倍率を掛けない。知らない単位は「不可」)。
- *     使用 (memory・disk usage) は切り上げ・上限 (memory limit・disk capacity) は切り捨て (安全側は方向で違う)
+ *   - 単位は bytes だけ (BYTE_UNITS にある倍率 1 の綴りだけ = 推測で倍率を掛けない。知らない単位は「不可」)
+ *   - 🆕 値は **JSON の本文の文字のままで整数 (小数点・指数なし) かつ safe integer** のときだけ受け取る (#1600 R1 M3)。
+ *     JSON.parse の binary64 に直すと 1073741824.00000001 が 1073741824 になり、切り上げ / 切り捨ての安全の向きが逆になりうる
+ *     → 文字を見て、小数・指数・2^53 以上は全部 METRICS_NOT_INTEGER (= 503)。丸めはしない
  *   - 各 endpoint は系列がちょうど 1 つ。その系列の最新の点を採る
  *   - Memory と Memory の上限・Disk Usage と Capacity は同じ resource で、点の時刻の差が 2 分以内
  *   - 空の配列・空の系列・重複の系列・同じ時刻の点が 2 つ・未来の時刻・負の値・数でない値・別の resource → 全部「不可」
+ *   - 🆕 時刻は RFC 3339 の暦の要素を全部確かめる (2026-02-30・2025-02-29・25 時・時差 +24:00 などは「不可」= Date.parse に直させない・#1600 R1 M1)。
+ *     小数秒は 9 桁まで受け取り、ナノ秒の整数で比べる (丸めない)
  *   - 取得から 2 分を超えた値は「不可」(取った時に確かめる + 使う直前に checkFreshness でもう一度)
- *   - HTTP の timeout は短い (既定 全体 5 秒)。401・403・429・5xx・ほかの非 200・網の失敗・timeout・redirect → 全部「不可」
+ *   - HTTP の timeout は短い (既定 全体 5 秒)。200 でない応答は **全部**「不可」(400 を含む)
+ *   - 🆕 本文は逐次読み、実のバイトが 1MB を超えた時点で読むのをやめる (Content-Length が無い・少なく書いた・chunked でも・#1600 R1 M2)
  *   - 「不可」は例外を投げずに { ok: false, reason } で返す (呼び手は 503 PROFIT_METRICS_UNAVAILABLE にする)。reason は下の REASONS の固定のコードだけ
+ *   - 🆕 理由の優先 (#1600 R1 Low): ① 設定 (METRICS_CONFIG・要求を送らない) ② 全体の timeout が起きたら METRICS_TIMEOUT (ほかの endpoint の理由より先)
+ *     ③ それ以外は METRIC_ENDPOINTS の順 (memory → memoryLimit → diskUsage → diskCapacity) で最初の endpoint の理由 ④ 4 つとも読めた後の組の検査
+ *     (PAIR_SKEW → ZERO_LIMIT → INCONSISTENT)
  *
  * 🚨 RENDER_API_KEY (workspace の全部に触れる強い秘密) の扱い:
  *   - 値をログ・例外の文・戻り値・fixture に絶対に残さない。この部品は console を使わない・例外を外に出さない (中の例外は METRICS_INTERNAL に変える)
@@ -32,11 +40,13 @@
  *     ?resource=<ID>&startTime=<date-time>&endTime=<date-time>&resolutionSeconds=<≥30>   (aggregationMethod は付けない = 系列をまとめさせない)
  *   Authorization: Bearer <RENDER_API_KEY>
  *   200 = [{ labels: [{ field, value }], values: [{ timestamp, value }], unit }]
+ *   🚨 公式の OpenAPI の共有の例は labels[].field = "service"・unit = "GB" (Postgres の保証ではなく、field と unit の一覧も無い)。
+ *     この部品は「resource の label・bytes の整数」だけを正常とし、それ以外は 503 に閉じる。本物の応答で確かめるまで 503 のまま (PR 6 の前に直す)
  */
 import { inspect } from 'node:util';
 
 export const RENDER_API_BASE = 'https://api.render.com/v1';
-/** 読む 4 つ (この順で結果を確かめる = 理由のコードが決まった順になる) */
+/** 読む 4 つ (この順が理由の優先の順) */
 export const METRIC_ENDPOINTS = Object.freeze({
   memory: '/metrics/memory',
   memoryLimit: '/metrics/memory-limit',
@@ -48,25 +58,26 @@ export const METRIC_ENDPOINTS = Object.freeze({
  * 違っていれば全部 METRICS_LABEL_MISSING (= 503) になるだけ (開く向きには間違えない)。PR 6 の前に、本物の応答 1 回で確かめて直す
  */
 export const RESOURCE_LABEL_FIELD = 'resource';
-/** bytes と読んでよい単位 (倍率 1 だけ)。🚨 Render の応答の unit の綴りは公式の説明に無い = 知らない綴り (MB など) は推測で掛け算せず「不可」 */
+/** bytes と読んでよい単位 (倍率 1 だけ)。🚨 Render の応答の unit の綴りは公式の説明に無い (例は "GB") = 知らない綴りは推測で掛け算せず「不可」 */
 export const BYTE_UNITS = Object.freeze(['bytes', 'byte', 'B', 'By']);
 export const MAX_AGE_MS = 2 * 60 * 1000;          // 取得 (と使う時) から 2 分を超えた点は「不可」
 export const MAX_PAIR_SKEW_MS = 2 * 60 * 1000;    // 使用と上限の点の時刻の差
 export const DEFAULT_TIMEOUT_MS = 5000;           // 4 つの要求の全体
 export const RESOLUTION_SECONDS = 30;             // 公式の最小
 export const WINDOW_MS = 10 * 60 * 1000;          // 読む区間 (今から 10 分前まで)
-export const MAX_BODY_BYTES = 1024 * 1024;
+export const MAX_BODY_BYTES = 1024 * 1024;        // 1 つの応答の本文の実のバイトの上限
 
 /** 「不可」の理由のコード (これ以外は返さない)。呼び手は全部 503 PROFIT_METRICS_UNAVAILABLE */
 export const REASONS = Object.freeze([
-  'METRICS_CONFIG',            // 鍵・resource の ID・送り先・timeout の設定が無い / 形が違う
+  'METRICS_CONFIG',            // 鍵・resource の ID・送り先・timeout の設定が無い / 形が違う (要求を送らない)
   'METRICS_AUTH',              // 401・403
   'METRICS_RATE_LIMITED',      // 429
   'METRICS_UPSTREAM',          // 5xx
-  'METRICS_HTTP',              // ほかの非 200 (3xx を含む)
-  'METRICS_TIMEOUT',           // 全体の timeout
-  'METRICS_NETWORK',           // 網の失敗・redirect
-  'METRICS_SHAPE',             // JSON でない・配列でない・系列や点の形が違う・時刻や値が読めない・大きすぎる
+  'METRICS_HTTP',              // ほかの 200 でない応答 (400・404・1xx/2xx/3xx のうち fetch が応答として返すもの = 201・204・300・304 など)
+  'METRICS_TIMEOUT',           // 全体の timeout (ほかの理由より先)
+  'METRICS_NETWORK',           // 網の失敗・redirect の 3xx (301・302・303・307・308 = redirect: 'error' で fetch が例外にする)
+  'METRICS_SHAPE',             // JSON でない・UTF-8 でない・配列でない・系列や点の形が違う・時刻が読めない / 実在しない・本文が 1MB を超える
+  'METRICS_NOT_INTEGER',       // 値が本文の文字のままで整数でない (小数・指数) か safe integer を超える
   'METRICS_EMPTY',             // 空の配列・点の無い系列
   'METRICS_DUPLICATE_SERIES',  // 系列が 2 つ以上
   'METRICS_DUPLICATE_POINT',   // 同じ時刻の点が 2 つ
@@ -115,19 +126,46 @@ export function readRenderMetricsConfig(env = process.env) {
   } catch { return fail('METRICS_CONFIG'); }
 }
 
-const ISO_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
-/** 厳しい ISO 8601 (時差つき) → ms。読めなければ null */
-const parseTs = (s) => {
+// ─── RFC 3339 の時刻 (暦の要素を全部確かめる) → epoch のナノ秒 (BigInt)。読めない / 実在しないなら null ───
+const RFC3339_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(?:(Z)|([+-])(\d{2}):(\d{2}))$/;
+const daysInMonth = (y, m) => [31, (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0 ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1];
+export function parseRfc3339Nanos(s) {
   if (typeof s !== 'string') return null;
-  const m = ISO_RE.exec(s); if (!m) return null;
-  const ms = Date.parse(`${m[1]}.${(m[2] || '0').padEnd(3, '0').slice(0, 3)}${m[3]}`);
-  return Number.isFinite(ms) ? ms : null;
-};
+  const m = RFC3339_RE.exec(s);
+  if (!m) return null;
+  const [y, mo, d, h, mi, se] = m.slice(1, 7).map(Number);
+  if (y < 1970 || mo < 1 || mo > 12 || d < 1 || d > daysInMonth(y, mo) || h > 23 || mi > 59 || se > 59) return null;   // 閏秒 (60) も受け取らない
+  let offMin = 0;
+  if (!m[8]) {
+    const oh = Number(m[10]), om = Number(m[11]);
+    if (oh > 23 || om > 59) return null;
+    offMin = (m[9] === '-' ? -1 : 1) * (oh * 60 + om);
+  }
+  const sec = Date.UTC(y, mo - 1, d, h, mi, se) / 1000 - offMin * 60;   // 要素を確かめた後なので Date.UTC は直さない
+  if (!Number.isSafeInteger(sec)) return null;
+  return BigInt(sec) * 1_000_000_000n + BigInt((m[7] || '').padEnd(9, '0') || '0');
+}
+const NS_PER_MS = 1_000_000n;
+const msFloor = (ns) => Number(ns / NS_PER_MS);   // ns ≥ 0 (1970 年より前は受け取らない)
 
 class Reject extends Error { constructor(reason) { super(reason); this.reason = reason; } }
 
-/** 1 つの endpoint の応答の本文 (parse 済み) を確かめ、最新の点を返す。nowMs = 応答を受けた時刻 */
-function pickLatestPoint(body, resourceId, nowMs) {
+/** 値が整数の文字でない・safe integer を超える数の印 (JSON.parse の reviver が置き換える) */
+const NOT_INTEGER = Object.freeze({ notInteger: true });
+const INT_SOURCE_RE = /^-?(0|[1-9]\d*)$/;
+/** JSON を読む。数は本文の文字 (context.source) を見て、整数の文字かつ safe integer のときだけ数のまま (ほかは NOT_INTEGER) */
+function parseJsonIntegersOnly(text) {
+  return JSON.parse(text, (key, value, context) => {
+    if (typeof value !== 'number') return value;
+    // context.source が無い (古い Node) = 元の文字を確かめられない → 全部 NOT_INTEGER (fail-closed)
+    const src = context && typeof context.source === 'string' ? context.source : null;
+    if (src == null || !INT_SOURCE_RE.test(src) || !Number.isSafeInteger(value)) return NOT_INTEGER;
+    return value;
+  });
+}
+
+/** 1 つの endpoint の応答の本文 (parse 済み) を確かめ、最新の点を返す。nowNs = 応答を受けた時刻 (ナノ秒) */
+function pickLatestPoint(body, resourceId, nowNs) {
   if (!Array.isArray(body)) throw new Reject('METRICS_SHAPE');
   if (body.length === 0) throw new Reject('METRICS_EMPTY');
   for (const s of body) {
@@ -147,31 +185,41 @@ function pickLatestPoint(body, resourceId, nowMs) {
   const seen = new Set();
   let latest = null;
   for (const p of s.values) {
-    if (!p || typeof p !== 'object' || Array.isArray(p)) throw new Reject('METRICS_SHAPE');
-    const at = parseTs(p.timestamp);
-    if (at == null || typeof p.value !== 'number' || !Number.isFinite(p.value)) throw new Reject('METRICS_SHAPE');
+    if (!p || typeof p !== 'object' || Array.isArray(p) || p === NOT_INTEGER) throw new Reject('METRICS_SHAPE');
+    const at = parseRfc3339Nanos(p.timestamp);
+    if (at == null) throw new Reject('METRICS_SHAPE');
+    if (p.value === NOT_INTEGER) throw new Reject('METRICS_NOT_INTEGER');
+    if (typeof p.value !== 'number' || !Number.isSafeInteger(p.value)) throw new Reject('METRICS_SHAPE');
     if (p.value < 0) throw new Reject('METRICS_NEGATIVE');
-    if (at > nowMs) throw new Reject('METRICS_FUTURE');
+    if (at > nowNs) throw new Reject('METRICS_FUTURE');
     if (seen.has(at)) throw new Reject('METRICS_DUPLICATE_POINT');
     seen.add(at);
     if (!latest || at > latest.at) latest = { at, value: p.value };
   }
-  if (nowMs - latest.at > MAX_AGE_MS) throw new Reject('METRICS_STALE');
+  if (nowNs - latest.at > BigInt(MAX_AGE_MS) * NS_PER_MS) throw new Reject('METRICS_STALE');
   return latest;
 }
 
-const toBytes = (value, direction) => {
-  const b = direction === 'up' ? Math.ceil(value) : Math.floor(value);
-  if (!Number.isSafeInteger(b)) throw new Reject('METRICS_SHAPE');
-  return b;
-};
-
-async function readBodyText(res) {
-  const len = Number(res.headers && res.headers.get && res.headers.get('content-length'));
-  if (Number.isFinite(len) && len > MAX_BODY_BYTES) throw new Reject('METRICS_SHAPE');
-  const text = await res.text();
-  if (text.length > MAX_BODY_BYTES) throw new Reject('METRICS_SHAPE');
-  return text;
+/** 本文を逐次読み、実のバイトが上限を超えたら読むのをやめて捨てる (全部を先にメモリに載せない) */
+async function readBodyTextCapped(res) {
+  const len = Number(res.headers && typeof res.headers.get === 'function' ? res.headers.get('content-length') : NaN);
+  if (Number.isFinite(len) && len > MAX_BODY_BYTES) { await discardBody(res); throw new Reject('METRICS_SHAPE'); }
+  if (!res.body || typeof res.body.getReader !== 'function') throw new Reject('METRICS_SHAPE');
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!(value instanceof Uint8Array)) { try { await reader.cancel(); } catch { /* */ } throw new Reject('METRICS_SHAPE'); }
+    total += value.byteLength;
+    if (total > MAX_BODY_BYTES) { try { await reader.cancel(); } catch { /* 捨てるだけ */ } throw new Reject('METRICS_SHAPE'); }
+    chunks.push(value);
+  }
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.byteLength; }
+  return new TextDecoder('utf-8', { fatal: true }).decode(buf);   // UTF-8 でなければ例外 → METRICS_SHAPE
 }
 
 const discardBody = async (res) => { try { if (res.body && typeof res.body.cancel === 'function') await res.body.cancel(); } catch { /* 捨てるだけ */ } };
@@ -183,7 +231,7 @@ const issued = new WeakSet();
  * @param {{ apiKey: RenderApiKey, resourceId: string, fetchImpl?: typeof fetch, now?: () => number, timeoutMs?: number, baseUrl?: string }} opts
  * @returns {Promise<{ ok: true, snapshot: object } | { ok: false, reason: string }>}
  *   snapshot = { resourceId, fetchedAt, resolutionSeconds, peakProof: false, memoryUsedBytes, memoryLimitBytes, diskUsedBytes, diskCapacityBytes,
- *                points: { memory, memoryLimit, diskUsage, diskCapacity } (各点の時刻 ISO), oldestPointAt }
+ *                points: { memory, memoryLimit, diskUsage, diskCapacity } (各点の時刻 ISO・ミリ秒は切り捨て = 古い向き), oldestPointAt }
  */
 export async function fetchPostgresMetrics(opts = {}) {
   try {
@@ -194,7 +242,7 @@ export async function fetchPostgresMetrics(opts = {}) {
     if (baseUrl !== RENDER_API_BASE && !LOOPBACK_BASE_RE.test(baseUrl)) return fail('METRICS_CONFIG');
 
     const startMs = now();
-    if (!Number.isFinite(startMs)) return fail('METRICS_CONFIG');
+    if (!Number.isSafeInteger(startMs) || startMs < 0) return fail('METRICS_CONFIG');
     const ac = new AbortController();
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; ac.abort(); }, timeoutMs);
@@ -219,7 +267,7 @@ export async function fetchPostgresMetrics(opts = {}) {
       }
       try {
         const st = res.status;
-        if (st !== 200) {
+        if (st !== 200) {   // 200 でない応答は全部「不可」(400 を含む・本文は読まずに捨てる)
           await discardBody(res);
           if (st === 401 || st === 403) return fail('METRICS_AUTH');
           if (st === 429) return fail('METRICS_RATE_LIMITED');
@@ -227,13 +275,13 @@ export async function fetchPostgresMetrics(opts = {}) {
           return fail('METRICS_HTTP');
         }
         let body;
-        try { body = JSON.parse(await readBodyText(res)); } catch (e) {
+        try { body = parseJsonIntegersOnly(await readBodyTextCapped(res)); } catch (e) {
           if (timedOut) return fail('METRICS_TIMEOUT');
           return fail(e instanceof Reject ? e.reason : 'METRICS_SHAPE');
         }
         const nowMs = now();
-        if (!Number.isFinite(nowMs)) return fail('METRICS_INTERNAL');
-        return Object.freeze({ ok: true, point: pickLatestPoint(body, resourceId, nowMs) });
+        if (!Number.isSafeInteger(nowMs) || nowMs < 0) return fail('METRICS_INTERNAL');
+        return Object.freeze({ ok: true, point: pickLatestPoint(body, resourceId, BigInt(nowMs) * NS_PER_MS) });
       } catch (e) {
         if (e instanceof Reject) return fail(e.reason);
         return fail(timedOut ? 'METRICS_TIMEOUT' : 'METRICS_INTERNAL');
@@ -247,31 +295,31 @@ export async function fetchPostgresMetrics(opts = {}) {
       clearTimeout(timer);
       ac.abort();   // 残りの要求があれば止める
     }
-    if (timedOut) return fail('METRICS_TIMEOUT');
+    if (timedOut) return fail('METRICS_TIMEOUT');   // 優先 ②: timeout はほかの endpoint の理由より先
     const names = Object.keys(METRIC_ENDPOINTS);
-    for (const r of results) if (!r.ok) return fail(r.reason);   // METRIC_ENDPOINTS の順で最初の理由
+    for (const r of results) if (!r.ok) return fail(r.reason);   // 優先 ③: METRIC_ENDPOINTS の順で最初の理由
     const p = Object.fromEntries(names.map((n, i) => [n, results[i].point]));
 
-    // 使用と上限の点の時刻の差 (同じ resource は上で確かめた)。今は「どの点も 2 分以内 (STALE)・未来でない (FUTURE)」から差は 2 分以内に収まる = この検査は
-    // MAX_AGE_MS を変えたときの守り (2 つの規則を別々に持つ。試験は fixture では作れない)
-    if (Math.abs(p.memory.at - p.memoryLimit.at) > MAX_PAIR_SKEW_MS) return fail('METRICS_PAIR_SKEW');
-    if (Math.abs(p.diskUsage.at - p.diskCapacity.at) > MAX_PAIR_SKEW_MS) return fail('METRICS_PAIR_SKEW');
-    const memoryUsedBytes = toBytes(p.memory.value, 'up');
-    const memoryLimitBytes = toBytes(p.memoryLimit.value, 'down');
-    const diskUsedBytes = toBytes(p.diskUsage.value, 'up');
-    const diskCapacityBytes = toBytes(p.diskCapacity.value, 'down');
+    // 優先 ④: 使用と上限の点の時刻の差 (同じ resource は上で確かめた)。今は「どの点も 2 分以内 (STALE)・未来でない (FUTURE)」から差は 2 分以内に
+    // 収まる = この検査は MAX_AGE_MS を変えたときの守り (2 つの規則を別々に持つ。試験は fixture では作れない)
+    const skew = BigInt(MAX_PAIR_SKEW_MS) * NS_PER_MS;
+    const absDiff = (a, b) => (a > b ? a - b : b - a);
+    if (absDiff(p.memory.at, p.memoryLimit.at) > skew || absDiff(p.diskUsage.at, p.diskCapacity.at) > skew) return fail('METRICS_PAIR_SKEW');
+    // 値は整数の文字の safe integer だけ (丸めない)
+    const memoryUsedBytes = p.memory.value, memoryLimitBytes = p.memoryLimit.value;
+    const diskUsedBytes = p.diskUsage.value, diskCapacityBytes = p.diskCapacity.value;
     if (memoryLimitBytes <= 0 || diskCapacityBytes <= 0) return fail('METRICS_ZERO_LIMIT');
     if (memoryUsedBytes > memoryLimitBytes || diskUsedBytes > diskCapacityBytes) return fail('METRICS_INCONSISTENT');
 
-    const oldest = Math.min(...names.map((n) => p[n].at));
+    const oldest = names.reduce((a, n) => (p[n].at < a ? p[n].at : a), p[names[0]].at);
     const snapshot = Object.freeze({
       resourceId,
       fetchedAt: new Date(startMs).toISOString(),
       resolutionSeconds: RESOLUTION_SECONDS,
       peakProof: false,   // 30 秒の bucket の値は区間の最大の証明にならない (要求の直前の関門にだけ使う)
       memoryUsedBytes, memoryLimitBytes, diskUsedBytes, diskCapacityBytes,
-      points: Object.freeze(Object.fromEntries(names.map((n) => [n, new Date(p[n].at).toISOString()]))),
-      oldestPointAt: new Date(oldest).toISOString(),
+      points: Object.freeze(Object.fromEntries(names.map((n) => [n, new Date(msFloor(p[n].at)).toISOString()]))),
+      oldestPointAt: new Date(msFloor(oldest)).toISOString(),   // ミリ秒に切り捨て = 古い向き (鮮度の再検査は厳しくなる側)
     });
     issued.add(snapshot);
     return Object.freeze({ ok: true, snapshot });
