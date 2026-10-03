@@ -19,6 +19,7 @@ process.env.DATA_DIR = tmpDir;
 const { initDB, getDB } = await import('./db.js');
 const { prepareReportTsv, prepareV2ReportTsv, ingestSettlement, settlementIngestedByV1, processV2Report } = await import('./fetch-amazon-settlements.js');
 const { V1_COLUMNS, V2_COLUMNS, v2DateTimeToV1, convertV2TsvToV1Tsv } = await import('./amazon-settlement-v2.js');
+const { classifyAccountFee } = await import('./amazon-account-fee-rules.js');
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -106,6 +107,16 @@ ok(JSON.stringify(unk([v2({ 'transaction-type': 'Other', 'amount-type': 'Mystery
 ok(JSON.stringify(unk([v2({ 'transaction-type': 'NewThing', 'order-id': 'N', sku: 'S', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '1.00' })])) === JSON.stringify(['NewThing | ItemPrice']), '未知の取引 × 既知の金額の種類 (品物の行) = 規則に無い');
 ok(JSON.stringify(unk([v2({ 'transaction-type': 'FBAFees', 'order-id': 'R9', 'amount-type': 'FBA Removal Order: Return Fee', 'amount-description': 'Tax on fee', amount: '-5.00' }), v2({ 'transaction-type': 'FBAFees', 'order-id': 'R9', 'amount-type': 'FBA Removal Order: Return Fee', 'amount-description': 'Base fee', amount: '-55.00' })])) === JSON.stringify(['FBAFees | FBA Removal Order: Return Fee | Tax on fee']), '料金の税が本体より前 = 規則に無い (まとめ方が V1 と違いうる)');
 ok(unk([v2({ 'transaction-type': 'other-transaction', 'amount-type': 'FBA Inventory Reimbursement', 'amount-description': 'CUSTOMER_RETURN', amount: '100.00' })]).length === 0, '説明をそのまま取引の種類にする型は新しい説明でも通す (補てんの新しい種類で止めない)');
+// 🆕 2026-10-03: 納品の運賃 (決済 12222191753 の 3 行・−24,649 円)。V2 = other-transaction の説明 'FBAInboundTransportationFee' → 取引の種類 = その説明。
+//   V1 の同じ費用は 'Inbound Transportation Fee' (中原さんが落とした V1 1587031020727.txt)。名前は違うが、どちらも月の手数料の その他 に同じ金額 (other-amount・Amazon の符号) で入る
+{
+  const v2it = convertV2TsvToV1Tsv(tsvOf(V2_COLUMNS, [V2_ROWS[0], v2({ 'transaction-type': 'other-transaction', 'amount-type': 'other-transaction', 'amount-description': 'FBAInboundTransportationFee', amount: '-21287.00', 'marketplace-name': '' })]));
+  const a = prepareReportTsv(v2it.tsv, 'R-IT2', 'r').lineRows.find((r) => r.transaction_type === 'FBAInboundTransportationFee');
+  const b = prepareReportTsv(tsvOf(V1_COLUMNS, [V1_ROWS[0], v1({ 'transaction-type': 'Inbound Transportation Fee', 'other-amount': '-21287.00', 'marketplace-name': '' })]), 'R-IT1', 'r').lineRows.find((r) => r.transaction_type === 'Inbound Transportation Fee');
+  ok(v2it.unknown.length === 0 && a && b && !a.seller_sku_normalized && !b.seller_sku_normalized && a.other_amount_micro === -21287000000 && b.other_amount_micro === a.other_amount_micro
+    && classifyAccountFee(a.transaction_type) === 'other_account_fee' && classifyAccountFee(b.transaction_type) === classifyAccountFee(a.transaction_type),
+    `🆕 納品の運賃: V2 (FBAInboundTransportationFee) と V1 (Inbound Transportation Fee) が同じ金額・同じ月の手数料の種類 (${a && classifyAccountFee(a.transaction_type)} / ${b && classifyAccountFee(b.transaction_type)})`);
+}
 throws(() => convertV2TsvToV1Tsv(tsvOf(V2_COLUMNS.filter((c) => c !== 'amount-type'), [V2_ROWS[0]])), /列が足りない/, 'V2 の列が足りなければ止める');
 throws(() => convertV2TsvToV1Tsv(tsvOf(V2_COLUMNS, [V2_ROWS[0], v2({ 'transaction-type': 'Order', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: 'abc' })])), /数でない/, '金額が数でなければ止める');
 

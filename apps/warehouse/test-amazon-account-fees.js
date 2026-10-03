@@ -11,6 +11,7 @@ await temporaryTestRoot(import.meta.url);
  *   ③ 分けられない SKU なしの取引 (知らない名前) が出たら最後の行が ⚠️ (daily-sync で「全部 OK」に数えない)・無ければ ✓
  *   ④ SKU の付いた行は入れない (SKU 単位の集計の側 = 二重にしない)。ただし納品不備は SKU の付いた行も入れる (2026-09-30 D-63・日次の財務から外した)
  *   ⑤ 前方一致で拾った未確認の名前は、金額を入れた上で ⚠️ / 同じ取引が 2 つの文書にあっても 1 回 / 低在庫手数料 / 前方一致の境目 (Codex #1515 R1)
+ *   ⑦ 納品の運賃 (2026-10-03): V1 の名前 Inbound Transportation Fee と V2 の名前 FBAInboundTransportationFee が同じ種類 (その他)・同じ金額・⚠️ にならない
  *
  * 実行: node apps/warehouse/test-amazon-account-fees.js (daily-sync 冒頭でも実行)。本番 DB には触れない (一時 DATA_DIR)
  */
@@ -26,6 +27,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const { initDB, getDB } = await import('./db.js');
 const { isWarnSummary } = await import('./amazon-fees-outcome.js');
 const { backfillDocumentVersions } = await import('./amazon-settlement-versions.js');
+const { classifyAccountFee } = await import('./amazon-account-fee-rules.js');
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -80,6 +82,28 @@ ok(isWarnSummary(lastLine(out)) && /未確認の名前 1 種類 \(集計に入�
 db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE transaction_type = 'FBA Removal Orderly'`).run();
 out = run();
 ok(!isWarnSummary(lastLine(out)) && /分けられない SKU なしの取引 0・未確認の名前 0/.test(lastLine(out)), `確かめた名前だけなら最後の行は ✓ (${lastLine(out)})`);
+// 🆕 2026-10-03 ⑦ 納品の運賃: 決済 12222191753 (2025-12-29〜2026-01-12) の同じ費用が V1 では 'Inbound Transportation Fee'・V2 では 'FBAInboundTransportationFee'。
+//   10/2 夜に採る版が V2 に替わり、朝に「分けられない SKU なしの取引: FBAInboundTransportationFee (延べ 3 行・¥-24,649)」の ⚠️ が出た。
+//   どちらの名前でも その他 (other_account_fee) に同じ金額 (Amazon の符号のまま) で入り、⚠️ にならない (別々の決済で 1 回ずつ確かめる)
+{
+  const otherAmt = () => Math.round(db.prepare(`SELECT amount_jpy a FROM f_amazon_account_fees_monthly_v1 WHERE month_start_jst = ? AND fee_type = 'other_account_fee'`).get(`${YM}-01`).a);
+  const base = otherAmt();
+  const amounts = [-2241, -1121, -21287];   // 本番の 3 行 (V1 の other-amount)
+  const runWith = (tx, settlement) => {
+    for (const a of amounts) line(tx, a, { settlement, doc: `D-${settlement}` });
+    const o = run();
+    const r = { tx, delta: otherAmt() - base, last: lastLine(o) };
+    db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE transaction_type = ?`).run(tx);
+    return r;
+  };
+  const v1r = runWith('Inbound Transportation Fee', 'S-IT-V1'), v2r = runWith('FBAInboundTransportationFee', 'S-IT-V2');
+  for (const r of [v1r, v2r]) {
+    ok(r.delta === -24649 && !isWarnSummary(r.last) && /分けられない SKU なしの取引 0・未確認の名前 0/.test(r.last), `🆕 納品の運賃 ${r.tx} = その他に −24,649 (Amazon の符号のまま)・⚠️ にならない (${r.delta} / ${r.last})`);
+  }
+  ok(v1r.delta === v2r.delta && classifyAccountFee('Inbound Transportation Fee') === 'other_account_fee' && classifyAccountFee('FBAInboundTransportationFee') === 'other_account_fee', '🆕 V1 と V2 の名前が同じ種類・同じ金額 (SQL の build と JS の判定 = Company DB の送り手が同じ)');
+  out = run();
+  ok(otherAmt() === base && !isWarnSummary(lastLine(out)), `消した後は元に戻る (${otherAmt()})`);
+}
 line('FBA Removal Order: Disposal Fee', -40);
 out = run();
 ok(isWarnSummary(lastLine(out)) && /FBA Removal Order: Disposal Fee → removal/.test(lastLine(out)) && Math.round(db.prepare(`SELECT amount_jpy a FROM f_amazon_account_fees_monthly_v1 WHERE month_start_jst = ? AND fee_type = 'removal'`).get(`${YM}-01`).a) === -165, `まだ見ていない返送の名前 (Disposal Fee) = 返送に入れて ⚠️ (${lastLine(out)})`);

@@ -250,7 +250,7 @@ export const ACCOUNT_FEE_LABELS = {
   low_inventory: '低在庫レベル手数料',
   subscription: '月額登録料',
   easy_ship: 'Easy Ship 配送料',   // 2026-09-28 から (注文ごとの配送料・SKU に付かない = SKU 別利益に入っていない)
-  other_account_fee: 'その他 (手数料の調整など)',   // 2026-09-29 から手数料の調整・払いすぎた手数料の返還 (戻り = 正) も入る
+  other_account_fee: 'その他 (手数料の調整・納品の運賃など)',   // 2026-09-29 から手数料の調整・払いすぎた手数料の返還 (戻り = 正)・2026-10-03 から納品の運賃 (Inbound Transportation Fee) も入る
 };
 export function getAccountFees(monthsBack = 13) {
   const db = getMirrorDB();

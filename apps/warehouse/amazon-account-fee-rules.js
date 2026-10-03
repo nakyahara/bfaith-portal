@@ -22,7 +22,12 @@ export const FEE_TYPE_RULES = [
   ['easy_ship', ['Amazon Easy Ship Charges'], []],
   // 🆕 2026-09-29: 手数料の調整・払いすぎた手数料の返還 (Amazon からの戻り = 正。中原さん「3」)。今まで NOT_ACCOUNT_FEE でどこにも入れていなかった
   //   (SKU のある行は日次の財務の reversal_reimbursement に入る = ここは SKU なしの行だけ = 二重にならない)。月の最終利益では ÷1.1 (ほかの手数料と同じ)
-  ['other_account_fee', ['Fee Adjustment', 'Overpaid Fees Adjustment'], []],
+  // 🆕 2026-10-03: 納品の運賃 (Amazon パートナーキャリアで FBA へ送った運賃・SKU なし・Amazon の符号 = 負・税込のまま = ほかの手数料と同じ)。
+  //   V1 = 'Inbound Transportation Fee' / V2 = 'FBAInboundTransportationFee' (V2 の other-transaction の説明をそのまま取引の種類にした名前)。
+  //   決済 12222191753 (2025-12-29〜2026-01-12) の 3 行・−24,649 円。V1 の名前も今まで規則に無かった (V1 で入っていた間も集計の外) →
+  //   10/2 夜に採る版が V2 に替わり、朝の ⚠️ (分けられない SKU なしの取引) で見つかった。専用の種類は作らず その他 に入れる
+  //   (種類を足すと Company DB の line_kind・mirror の CHECK・利益の mart の列まで変わる。月 0〜2 万円・14 か月でこの 3 行だけ)
+  ['other_account_fee', ['Fee Adjustment', 'Overpaid Fees Adjustment', 'Inbound Transportation Fee', 'FBAInboundTransportationFee'], []],
 ];
 // アカウント単位の手数料に入れない SKU なしの取引 (今までも入れていない。これ以外の SKU なしの取引が出たら ⚠️)
 //   預かり金の出し入れ (Current / Previous Reserve = 相殺) / 調整 (Goodwill・Retrocharge・ServiceFee・BuyerRecharge)
@@ -33,7 +38,7 @@ export const NOT_ACCOUNT_FEE = ['Current Reserve Amount', 'Previous Reserve Amou
 //   Inbound Defect Fee… / LowInventory は最初 (2026-07-06) から名前の揺れを前提にした型 = 型ごと確かめ済み
 export const CONFIRMED_NAMES = ['Storage Fee', 'Storage Fee - Correction', 'Storage Fee - Reversal', 'FBA Inventory Storage Fee',
   'StorageRenewalBilling', 'FBA Long Term Storage Fee', 'RemovalComplete', 'FBA Removal Order: Return Fee', 'Subscription Fee', 'Amazon Easy Ship Charges',
-  'Fee Adjustment', 'Overpaid Fees Adjustment'];
+  'Fee Adjustment', 'Overpaid Fees Adjustment', 'Inbound Transportation Fee', 'FBAInboundTransportationFee'];   // 納品の運賃 = 2026-10-03 (V1 / V2 の名前)
 // 🆕 2026-09-30 (D7b-2b / D-63・中原さん「種類ごとに分ける」): SKU の付いた行でも月の手数料に入れる種類 = 納品不備 (Inbound Defect Fee…) だけ。
 //   今までは SKU の付いた納品不備を日次の財務の other_amount (利益の式に入らない = 行き先の無い金額) に入れていた (4〜9 月 26 行・約 −1.4 万円)。
 //   → SKU の有無を問わず月の手数料の inbound_defect に入れ、日次の財務 (sql/amazon/build_f_amazon_finance_sku_daily_v1.sql の silver) からは外す (二重にしない)。
