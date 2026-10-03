@@ -1,24 +1,32 @@
 #!/usr/bin/env node
 /**
  * test-company-db-migrate-lock-pg.mjs — migrate.mjs の全体の排他と concurrent-index の migration を本物の PostgreSQL で確かめる
- *   (D-60 PR 3a-i・設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10「migrate の runner の契約 (3a-i)」)
+ *   (D-60 PR 3a-i・設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10「migrate の runner の契約 (3a-i)」v3.9)
  *
  * 固定する契約:
- *   L1 2 本の runner を同時に起動 → 2 本目は待たずに MIGRATE_LOCKED (CLI は exit 1・「別の migrate が動いている」)・何も流さない。--list は lock を取らずに読める・--dry-run は止まる
- *   L2 1 本目が途中の SQL で失敗 → ROLLBACK を終えてから unlock (順を記録で確かめる)・次の runner が取れる・接続は取引の外
+ *   L0b runner は db/company/migrations/ の番号つきの file だけを読む (migrations-pending/ は読まない)
+ *   L1 2 本の runner (CLI の入口 = migrateWithLock) を同時に起動 → 2 本目は待たずに MIGRATE_LOCKED・何も流さない
+ *   L1b CLI: lock を持たれている間 = 流す・--dry-run は exit 1 (「別の migrate が動いている」) / --list は exit 0 で持ち主の pid を出す / 外れた後は流せる
+ *   L2 1 本目が途中の SQL で失敗 → ROLLBACK が終わってから unlock (順を記録で確かめる)・pg_locks に残らない・次の runner がすぐ取れる
+ *   L2c ROLLBACK も失敗 (接続が死んだ) → unlock は呼ばない・接続を捨てれば外れる
  *   L3 接続が切れた (backend を terminate・socket を切る) → lock が外れて次の runner が取れる
- *   L4 本物の migrations (0001〜) を全部流す = 今までどおり (applied = 全部 → 2 回目は 0)・lock は残らない
- *   C1 concurrent-index: 正常 → valid と属性の一致で記録・もう一度流しても何もしない
+ *   L4 本物の migrations (0001〜) を全部流す = 今までどおり (2 回目は 0 本)・applied_by に migrate-v2・lock は残らない
+ *   L5 applyMigrations() は lock を取らない (使い回す関数に Postgres 専用の SQL を無条件で入れない) / dry-run は DDL を流さない
+ *   C1 concurrent-index: 正常 → valid と属性の一致で記録・容量を出す・もう一度流しても何もしない
+ *   C1b lock を持たずに (applyMigrations を直に) concurrent-index を流す → MIGRATE_LOCK_REQUIRED
  *   C2 許さない文が混じる (と各種の形) → 流す前に止まり何もしない (前の番号のふつうの migration も流さない)
- *   C3 lock_timeout で invalid が残る → 記録しない・回収の手順が出る → 長い取引が終わってからもう一度流すと invalid を作り直して記録
+ *   C3 lock_timeout で invalid が残る → 記録しない・回収の手順が出る → 長い取引が終わってから流すと invalid を作り直して記録
  *   C4 同じ名前で定義が違う index がある → 止まる (今の index に触らない・記録しない)
  *   C5 作り済みの valid (source の空白・大文字が違っても属性が同じ) は飛ばして続きを作る
- *   C6 容量: 上限が無い・見込みが上限 × 0.8 を超える → 流さない (dry-run も止まる)
+ *   C6 容量: メトリクスが読めない・空きが 予想 × 3 + 2GB に満たない・ANALYZE していない → 流さない (fail-closed)。CLI は RENDER_API_KEY が無ければ流さない
  *   C7 PostgreSQL の major が期待と違う → 流さない
  *   C8 同じ表の index の作りが別の接続で動いている → 止まる
  *   C9 drop index concurrently の migration
- *   P1 PGlite の adapter = concurrent-index は既定で止まる (何も流さない)・'skip' なら明示で飛ばす
+ *   P1 PGlite の adapter = concurrently を外してふつうの取引で流し、属性の検証は同じ (PG 18 で作った expect.json に PGlite でも一致)
  *   A1 属性の比べ方 = 空白・大文字が違っても同じ / 部分 index の条件・演算子のクラス・並びが違えば違う
+ *   O0 migration の file は役割を切り替える文を持たない (grep の縛り) / O1〜O4 持ち主の mode (Codex R-D60-v3-10 H2) = ① PR 1b の前 (印なし = 接続の役割) / ② PR 1b 自身 (owner-transition = 接続の役割で移し、記録は印の役割・
+ *     同じ回の後の file は owner mode) / ③ PR 1b の後 (SET ROLE で流す・接続の役割は記録表に書けない・失敗しても役割が戻り lock が外れる・SET できなければ止まる) /
+ *     印を作ってよいのは owner-transition の file だけ・owner-transition が印を作らなければ巻き戻す・2 回目の owner-transition は流さない
  * 使い方: node scripts/test-company-db-migrate-lock-pg.mjs   (npm run test:company-db にも入っている)
  *   使い捨てのクラスタを embedded-postgres で起動し、最後に止めて消す (test-company-db-profit-fn-revoke-pg.mjs と同じ作り)。
  *   見つからない・版が違う・起動できない・フォルダが消えない = 失敗 (exit 1)
@@ -33,8 +41,8 @@ import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 import {
-  openPgClient, pgAdapter, pgliteAdapter, applyMigrations, withMigrateLock, listMigrationFiles, buildIndexExpect, readIndexAttrs, attrDiff,
-  splitSqlStatements, parseConcurrentIndexStatement, planConcurrentIndexFile, MIGRATE_LOCK_NAME, DEFAULT_DIR,
+  openPgClient, pgAdapter, pgliteAdapter, applyMigrations, migrateWithLock, withMigrateLock, listMigrationFiles, buildIndexExpect, readIndexAttrs, attrDiff,
+  splitSqlStatements, parseConcurrentIndexStatement, planConcurrentIndexFile, estimateIndexBytes, roleSwitchStatements, MIGRATE_LOCK_NAME, DISK_ESTIMATE, DEFAULT_DIR,
 } from './company-db/migrate.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -73,10 +81,15 @@ let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
 const quiet = () => {};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const BIG_DISK = { limitBytes: 100 * 1024 ** 3 };
+const GB = 1024 ** 3;
+/** 試験の容量の読み手 (Render のメトリクスの代わり) */
+const disk = (capacityBytes, usedBytes) => async () => ({ ok: true, capacityBytes, usedBytes });
+const BIG_DISK = disk(100 * GB, 1 * GB);
+const NO_METRICS = async () => ({ ok: false, reason: 'METRICS_CONFIG' });
 
 const hex = crypto.randomBytes(4).toString('hex');
 const OWNER = `cdb_mig_${hex}`, PW = `t_${crypto.randomBytes(12).toString('hex')}`;
+const RUNTIME = `cdb_rt_${hex}`;   // 夜のバックアップが ops.schema_migrations と ops.migrate_owner を読む役割 (設計 13 v3.10)
 const tmpDirs = [];
 /** 試験用の migrations のフォルダ (files = { 'NNNN_name.sql': text, ... }) */
 const mkDir = (files) => {
@@ -88,6 +101,7 @@ const mkDir = (files) => {
 const BASE = `create schema app;
 create table app.t (id bigint primary key, a text not null, b int not null, c date);
 insert into app.t select g, 'x' || g, g % 100, date '2026-01-01' + (g % 30) from generate_series(1, 3000) g;
+analyze app.t;
 `;
 const CI_SQL = `-- migrate:concurrent-index
 -- 試験の index 2 つ (部分 index・include・desc・式・演算子のクラス)
@@ -104,6 +118,7 @@ try {
   const su = await openPgClient(suUrl);
   clients.push(su);
   await su.query(`create role ${OWNER} login createrole password '${PW}'`);   // Render の default user と同じ = superuser でない
+  await su.query(`create role ${RUNTIME} login password '${PW}'`);
   let dbSeq = 0;
   const newDb = async () => { const name = `cdb_mig_${hex}_${++dbSeq}`; await su.query(`create database ${name} owner ${OWNER}`); return name; };
   const urlOf = (dbName) => { const x = new URL(suUrl); x.username = OWNER; x.password = PW; x.pathname = `/${dbName}`; return x.toString(); };
@@ -115,16 +130,21 @@ try {
   const waitFor = async (cond, ms = 10000, what = '') => { const end = Date.now() + ms; while (Date.now() < end) { if (await cond()) return; await sleep(50); } throw new Error('待っても来ない: ' + what); };
   const pidOf = async (c) => (await c.query('select pg_backend_pid() as p')).rows[0].p;
   const versions = async (c) => (await c.query('select version from ops.schema_migrations order by 1')).rows.map((r) => r.version);
-  const runCli = (args) => spawnSync(process.execPath, ['scripts/company-db/migrate.mjs', ...args], { cwd: ROOT, env: { ...process.env, COMPANY_DB_URL: '', CDB_DB_LIMIT_BYTES: String(BIG_DISK.limitBytes) }, encoding: 'utf8', timeout: 60000 });
-  /** 記録の残る adapter (順を確かめる) */
-  const recording = (c) => { const a = pgAdapter(c); const logs = []; return { logs, caps: a.caps, query: (q, p) => { logs.push(q); return a.query(q, p); }, exec: (q) => { logs.push(q); return a.exec(q); } }; };
+  const runCli = (args, env = {}) => spawnSync(process.execPath, ['scripts/company-db/migrate.mjs', ...args], { cwd: ROOT, env: { ...process.env, COMPANY_DB_URL: '', RENDER_API_KEY: '', CDB_RENDER_PG_RESOURCE_ID: '', ...env }, encoding: 'utf8', timeout: 60000 });
+  /** 記録の残る adapter (順を確かめる)。failRollback = rollback を接続の死として失敗させる */
+  const recording = (c, { failRollback = false } = {}) => {
+    const a = pgAdapter(c); const logs = [];
+    return { logs, supportsConcurrentIndex: true, query: (q, p) => { logs.push(q); return a.query(q, p); },
+      exec: (q) => { logs.push(q); if (failRollback && q === 'rollback') return Promise.reject(new Error('Connection terminated (試験)')); return a.exec(q); } };
+  };
   /** 手で作る (取引の外・1 文ずつ) */
   const runStmts = async (c, stmts) => { for (const s of stmts) await c.query(s); };
+  const migrate = (c, opts) => migrateWithLock(pgAdapter(c), { log: quiet, readDiskMetrics: BIG_DISK, ...opts });
 
   // ─── 期待の属性 (expect.json) は使い捨ての DB で同じ文を流して作る (手で書かない) ───
   const dbX = await newDb();
   const cx = await open(dbX);
-  await applyMigrations(pgAdapter(cx), { dir: mkDir({ '0001_base.sql': BASE }), log: quiet });
+  await migrate(cx, { dir: mkDir({ '0001_base.sql': BASE }) });
   await runStmts(cx, CI_STMTS);
   const ciFile = { version: '0002', name: 'idx', file: '0002_idx.sql', text: CI_SQL, concurrentIndex: true };
   const EXPECT = await buildIndexExpect(pgAdapter(cx), ciFile);
@@ -141,30 +161,51 @@ try {
     assert.deepEqual(hits.sort(), ['scripts/company-db/migrate.mjs', 'scripts/test-company-db-migrate-lock-pg.mjs']);
   });
 
+  await t('L0b runner は db/company/migrations/ の番号つきの file だけを読む = 番号の無い置き場 db/company/migrations-pending/ (と下のフォルダ) は読まない (設計 19 v8 の F4-2a)', async () => {
+    assert.equal(path.relative(ROOT, DEFAULT_DIR).replace(/\\/g, '/'), 'db/company/migrations');
+    const parent = mkDir({});
+    fs.mkdirSync(path.join(parent, 'migrations'));
+    fs.mkdirSync(path.join(parent, 'migrations-pending'));
+    fs.mkdirSync(path.join(parent, 'migrations', 'pending'));
+    fs.writeFileSync(path.join(parent, 'migrations', '0001_base.sql'), BASE);
+    fs.writeFileSync(path.join(parent, 'migrations-pending', '0002_f4_2a.sql'), 'create table app.pending_should_not_run (x int);\n');
+    fs.writeFileSync(path.join(parent, 'migrations-pending', 'f4_2a.sql'), 'create table app.pending2 (x int);\n');
+    fs.writeFileSync(path.join(parent, 'migrations', 'pending', '0002_sub.sql'), 'create table app.pending3 (x int);\n');
+    fs.writeFileSync(path.join(parent, 'migrations', 'f4_2a_draft.sql'), 'create table app.pending4 (x int);\n');   // 番号の無い file も読まない
+    assert.deepEqual(listMigrationFiles(path.join(parent, 'migrations')).map((f) => f.file), ['0001_base.sql']);
+    const dbName = await newDb();
+    const c = await open(dbName);
+    const r = await migrate(c, { dir: path.join(parent, 'migrations') });
+    assert.deepEqual(r.applied, ['0001']);
+    assert.equal((await c.query(`select count(*)::int as n from pg_class where relname like 'pending%'`)).rows[0].n, 0);
+    // リポジトリの本物の置き場: migrations-pending があっても、DEFAULT_DIR の一覧に入らない
+    const pend = path.join(ROOT, 'db', 'company', 'migrations-pending');
+    if (fs.existsSync(pend)) { const names = new Set(listMigrationFiles().map((f) => f.file)); for (const x of fs.readdirSync(pend)) assert.equal(names.has(x), false, x); }
+  });
+
   await t('L1 2 本を同時に起動 → 2 本目は待たずに MIGRATE_LOCKED・何も流さない / 1 本目は最後まで流す', async () => {
     const dbName = await newDb();
     const dir = mkDir({ '0001_base.sql': BASE, '0002_sleep.sql': 'select pg_sleep(2);\ncreate table app.s (x int);\n' });
     const c1 = await open(dbName), c2 = await open(dbName);
-    const p1 = applyMigrations(pgAdapter(c1), { dir, log: quiet });
-    const pid1 = await pidOf(c1).catch(() => null);
+    const p1 = migrate(c1, { dir });
     await waitFor(async () => (await lockHolders(dbName)).length > 0, 10000, '1 本目が lock を取る');
     const t0 = Date.now();
-    await assert.rejects(applyMigrations(pgAdapter(c2), { dir, log: quiet }), (e) => e.code === 'MIGRATE_LOCKED' && /別の migrate が動いている/.test(e.message) && /pid \d+/.test(e.message));
+    await assert.rejects(migrate(c2, { dir }), (e) => e.code === 'MIGRATE_LOCKED' && /別の migrate が動いている/.test(e.message) && /pid \d+/.test(e.message));
     assert.ok(Date.now() - t0 < 1500, '2 本目が待った');
     const r1 = await p1;
     assert.deepEqual(r1.applied, ['0001', '0002']);
     assert.deepEqual(await versions(c2), ['0001', '0002']);
     assert.deepEqual(await lockHolders(dbName), []);
-    void pid1;
   });
 
-  await t('L1b CLI: lock を持たれている間 = 流す・--dry-run は exit 1 (「別の migrate が動いている」) / --list は exit 0 (lock を取らない) / 外れた後は流せる', async () => {
+  await t('L1b CLI: lock を持たれている間 = 流す・--dry-run は exit 1 / --list は exit 0 で持ち主の pid を出す / 外れた後は流せる', async () => {
     const dbName = await newDb();
     const dir = mkDir({ '0001_base.sql': BASE });
     const c1 = await open(dbName);
     let release;
     const held = withMigrateLock(pgAdapter(c1), () => new Promise((r) => { release = r; }));
     await waitFor(async () => (await lockHolders(dbName)).length > 0, 10000, 'lock');
+    const pid1 = await pidOf(c1);
     const run = runCli(['--url', urlOf(dbName), '--dir', dir]);
     assert.equal(run.status, 1, run.stdout + run.stderr);
     assert.match(run.stderr, /FAILED \(MIGRATE_LOCKED\): 別の migrate が動いている/);
@@ -172,18 +213,21 @@ try {
     assert.equal(dry.status, 1); assert.match(dry.stderr, /MIGRATE_LOCKED/);
     const list = runCli(['--url', urlOf(dbName), '--dir', dir, '--list']);
     assert.equal(list.status, 0, list.stderr); assert.match(list.stdout, /0001 pending/);
+    assert.match(list.stdout, new RegExp(`lock \\(company_db_migrate\\) を持っている: pid ${pid1} .*接続から \\d+ 分`));
     release(); await held;
     assert.deepEqual(await lockHolders(dbName), []);
+    const list2 = runCli(['--url', urlOf(dbName), '--dir', dir, '--list']);
+    assert.match(list2.stdout, /持っている接続は無い/);
     const run2 = runCli(['--url', urlOf(dbName), '--dir', dir]);
     assert.equal(run2.status, 0, run2.stderr); assert.match(run2.stdout, /applied=1/); assert.match(run2.stdout, /lock company_db_migrate を外した/);
   });
 
-  await t('L2 途中の SQL で失敗 → そのファイルは巻き戻り、ROLLBACK を終えてから unlock・接続は取引の外 → 次の runner が取れる', async () => {
+  await t('L2 途中の SQL で失敗 → そのファイルは巻き戻り、ROLLBACK が終わってから unlock・接続は取引の外 → 次の runner がすぐ取れる', async () => {
     const dbName = await newDb();
     const dir = mkDir({ '0001_base.sql': BASE, '0002_bad.sql': 'create table app.u (x int);\nselect 1/0;\n', '0003_after.sql': 'create table app.v (x int);\n' });
     const c1 = await open(dbName), c2 = await open(dbName);
     const rec = recording(c1);
-    await assert.rejects(applyMigrations(rec, { dir, log: quiet }), (e) => e.code === 'MIGRATION_FAILED' && e.version === '0002' && /division by zero/.test(e.message));
+    await assert.rejects(migrateWithLock(rec, { dir, log: quiet }), (e) => e.code === 'MIGRATION_FAILED' && e.version === '0002' && /division by zero/.test(e.message) && !e.connectionDead);
     const iRollback = rec.logs.lastIndexOf('rollback');
     const iUnlock = rec.logs.findIndex((q) => /pg_advisory_unlock/.test(q));
     assert.ok(iRollback >= 0 && iUnlock > iRollback, `rollback (${iRollback}) の後に unlock (${iUnlock})`);
@@ -193,7 +237,6 @@ try {
     assert.equal(st, 'idle', '取引が開いたまま');
     assert.equal((await c1.query(`select to_regclass('app.u') is null as gone`)).rows[0].gone, true);
     assert.deepEqual(await versions(c1), ['0001']);
-    // 次の runner (別の接続) が取れる
     await withMigrateLock(pgAdapter(c2), async () => { assert.deepEqual(await lockHolders(dbName), [await pidOf(c2)]); });
     assert.deepEqual(await lockHolders(dbName), []);
   });
@@ -202,8 +245,21 @@ try {
     const dbName = await newDb();
     const dir = mkDir({ '0001_base.sql': BASE, '0002_x.sql': '-- migrate:concurrent-index\ncreate table app.evil (x int);\n' });
     const c1 = await open(dbName);
-    await assert.rejects(applyMigrations(pgAdapter(c1), { dir, log: quiet }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED');
+    await assert.rejects(migrate(c1, { dir }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED');
     assert.deepEqual(await lockHolders(dbName), []);
+  });
+
+  await t('L2c ROLLBACK も失敗 (接続が死んだ) → unlock は呼ばない (connectionDead)・接続を捨てれば外れる', async () => {
+    const dbName = await newDb();
+    const dir = mkDir({ '0001_base.sql': BASE, '0002_bad.sql': 'select 1/0;\n' });
+    const c1 = await open(dbName), c2 = await open(dbName);
+    const rec = recording(c1, { failRollback: true });
+    await assert.rejects(migrateWithLock(rec, { dir, log: quiet }), (e) => e.code === 'MIGRATION_FAILED' && e.connectionDead === true);
+    assert.equal(rec.logs.some((q) => /pg_advisory_unlock/.test(q)), false, 'ROLLBACK が失敗したのに unlock を呼んだ');
+    assert.equal((await lockHolders(dbName)).length, 1, '(試験の前提) まだ持っている');
+    c1.connection.stream.destroy();
+    await waitFor(async () => (await lockHolders(dbName)).length === 0, 10000, '接続を捨てて外れる');
+    await withMigrateLock(pgAdapter(c2), async () => {});
   });
 
   await t('L3 接続が切れたら lock が外れる (backend を terminate / client の socket を切る)', async () => {
@@ -212,10 +268,9 @@ try {
     withMigrateLock(pgAdapter(c3), () => new Promise(() => {})).catch(() => {});
     await waitFor(async () => (await lockHolders(dbName)).length > 0, 10000, 'lock');
     await assert.rejects(withMigrateLock(pgAdapter(c5), async () => {}), (e) => e.code === 'MIGRATE_LOCKED');
-    await su.query('select pg_terminate_backend($1)', [await lockHolders(dbName).then((p) => p[0])]);
+    await su.query('select pg_terminate_backend($1)', [(await lockHolders(dbName))[0]]);
     await waitFor(async () => (await lockHolders(dbName)).length === 0, 10000, 'terminate で外れる');
     await withMigrateLock(pgAdapter(c5), async () => {});
-    // socket を切る (client が落ちた = Postgres の backend が EOF で終わる)
     withMigrateLock(pgAdapter(c4), () => new Promise(() => {})).catch(() => {});
     await waitFor(async () => (await lockHolders(dbName)).length > 0, 10000, 'lock (2)');
     c4.connection.stream.destroy();
@@ -223,23 +278,39 @@ try {
     await withMigrateLock(pgAdapter(c5), async () => {});
   });
 
-  await t('L4 本物の migrations (0001〜) を全部流す = 今までどおり (2 回目は 0 本)・lock は残らない', async () => {
+  await t('L4 本物の migrations (0001〜) を全部流す = 今までどおり (2 回目は 0 本)・applied_by に migrate-v2・lock は残らない', async () => {
     const dbName = await newDb();
     const c1 = await open(dbName);
     const all = listMigrationFiles().map((f) => f.version);
-    const r = await applyMigrations(pgAdapter(c1), { log: quiet });
+    const r = await migrate(c1, {});
     assert.deepEqual(r.applied, all);
-    assert.equal(r.unsupported.length, 0);
-    const r2 = await applyMigrations(pgAdapter(c1), { log: quiet });
+    const r2 = await migrate(c1, {});
     assert.deepEqual([r2.applied, r2.skipped.length], [[], all.length]);
     assert.deepEqual(await lockHolders(dbName), []);
+    const by = (await c1.query('select distinct applied_by from ops.schema_migrations')).rows.map((x) => x.applied_by);
+    assert.equal(by.length, 1); assert.match(by[0], / migrate-v2$/);
+  });
+
+  await t('L5 applyMigrations() は lock を取らない / dry-run は DDL を流さない (記録表も作らない)・try の lock を取って外す', async () => {
+    const dbName = await newDb();
+    const c1 = await open(dbName);
+    const rec = recording(c1);
+    await applyMigrations(rec, { dir: mkDir({ '0001_base.sql': BASE }), log: quiet });
+    assert.equal(rec.logs.some((q) => /advisory/.test(q)), false, 'applyMigrations が lock の SQL を流した');
+    const db2 = await newDb(); const c2 = await open(db2);
+    const rec2 = recording(c2);
+    const dry = await migrateWithLock(rec2, { dir: ciDir(), dryRun: true, log: quiet });
+    assert.deepEqual(dry.pending, ['0001', '0002']);
+    assert.equal((await c2.query(`select to_regclass('ops.schema_migrations') is null as none`)).rows[0].none, true, 'dry-run が記録表を作った');
+    assert.ok(rec2.logs.some((q) => /pg_try_advisory_lock/.test(q)) && rec2.logs.some((q) => /pg_advisory_unlock/.test(q)));
+    assert.deepEqual(await lockHolders(db2), []);
   });
 
   console.log('concurrent-index の migration');
   await t('A1 属性の比べ方: 空白・大文字が違っても同じ / 部分 index の条件・演算子のクラス・並びが違えば違う', async () => {
     const dbName = await newDb();
     const c = await open(dbName);
-    await applyMigrations(pgAdapter(c), { dir: mkDir({ '0001_base.sql': BASE }), log: quiet });
+    await migrate(c, { dir: mkDir({ '0001_base.sql': BASE }) });
     await c.query('CREATE   INDEX CONCURRENTLY IF NOT EXISTS T_A_B_IDX ON APP.T USING BTREE ( A , B DESC ) INCLUDE ( C ) WHERE B>10');
     assert.deepEqual(attrDiff((await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx')).attrs, EXPECT.indexes['app.t_a_b_idx']), []);
     await c.query('create index concurrently w1 on app.t (a, b desc) include (c) where b > 11');
@@ -255,25 +326,32 @@ try {
     assert.match(EXPECT.indexes['app.t_lower_a_uidx'].expressions, /lower/);
   });
 
-  await t('C1 正常: 取引の外で流し、valid と属性の一致の後にだけ記録 / もう一度流しても何もしない', async () => {
+  await t('C1 正常: 取引の外で流し、valid と属性の一致の後にだけ記録・容量を出す / もう一度流しても何もしない', async () => {
     const dbName = await newDb();
     const c = await open(dbName);
     const logs = [];
-    const r = await applyMigrations(pgAdapter(c), { dir: ciDir(), log: (m) => logs.push(m), disk: BIG_DISK });
+    const r = await migrate(c, { dir: ciDir(), log: (m) => logs.push(m) });
     assert.deepEqual(r.applied, ['0001', '0002']);
     for (const k of ['t_a_b_idx', 't_lower_a_uidx']) {
       const a = await readIndexAttrs(pgAdapter(c), 'app', k);
       assert.deepEqual([a.valid, a.ready, a.live], [true, true, true]);
       assert.deepEqual(attrDiff(a.attrs, EXPECT.indexes[`app.${k}`]), []);
     }
-    assert.ok(logs.some((m) => /容量: 今 .* index の見込み .*上限/.test(m)), '容量を出していない');
+    assert.equal(logs.filter((m) => /容量: app\.t_.* の予想 .* × 3 \+ .* \/ 空き /.test(m)).length, 2, '各文の前に容量を出していない');
     assert.deepEqual(await versions(c), ['0001', '0002']);
-    // session の設定は戻っている
     assert.equal((await c.query('show lock_timeout')).rows[0].lock_timeout, '0');
     assert.equal((await c.query('show statement_timeout')).rows[0].statement_timeout, '0');
-    const r2 = await applyMigrations(pgAdapter(c), { dir: ciDir(), log: quiet, disk: BIG_DISK });
+    const r2 = await migrate(c, { dir: ciDir() });
     assert.deepEqual(r2.applied, []);
     assert.deepEqual(await lockHolders(dbName), []);
+  });
+
+  await t('C1b lock を持たずに (applyMigrations を直に) concurrent-index を流す → MIGRATE_LOCK_REQUIRED・何も作らない', async () => {
+    const dbName = await newDb();
+    const c = await open(dbName);
+    await assert.rejects(applyMigrations(pgAdapter(c), { dir: ciDir(), log: quiet, readDiskMetrics: BIG_DISK }), (e) => e.code === 'MIGRATE_LOCK_REQUIRED');
+    assert.equal(await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx'), null);
+    assert.deepEqual(await versions(c), ['0001']);
   });
 
   await t('C2 許さない文が混じる → 流す前に止まる・何もしない (前の番号のふつうの migration も流さない)', async () => {
@@ -281,10 +359,9 @@ try {
     const c = await open(dbName);
     const bad = `-- migrate:concurrent-index\ncreate index concurrently if not exists t_a_b_idx on app.t (a);\ncreate table app.evil (x int);\n`;
     const dir = mkDir({ '0001_base.sql': BASE, '0002_bad.sql': bad, '0002_bad.expect.json': JSON.stringify({ format: 'company-db-index-expect/1', pg_major: 18, indexes: { 'app.t_a_b_idx': EXPECT.indexes['app.t_a_b_idx'] } }) });
-    await assert.rejects(applyMigrations(pgAdapter(c), { dir, log: quiet, disk: BIG_DISK }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED' && /許す文は/.test(e.message));
+    await assert.rejects(migrate(c, { dir }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED' && /許す文は/.test(e.message));
     assert.deepEqual(await versions(c), []);
     assert.equal((await c.query(`select count(*)::int as n from pg_namespace where nspname = 'app'`)).rows[0].n, 0, '0001 を流した');
-    // 各種の形 (DB なし)
     const reject = [
       ['begin', 'begin'],
       ['set', "set lock_timeout = '1s'"],
@@ -302,49 +379,59 @@ try {
       ['ドルの引用', 'create index concurrently if not exists x on app.t (a) where a <> $$q$$'],
       ['reindex', 'reindex index concurrently app.x'],
       ['alter', 'alter index app.x rename to y'],
+      ['create table', 'create table app.x (a int)'],
       ['空の列', 'create index concurrently if not exists x on app.t ()'],
     ];
     for (const [what, sql] of reject) {
       assert.throws(() => parseConcurrentIndexStatement(splitSqlStatements(sql)[0], 'f.sql'), (e) => e.code === 'CONCURRENT_INDEX_REJECTED', what);
     }
-    // 許す形 (コメント・文字列の中の ; と 'concurrently' は数えない)
-    const okSql = `create unique index concurrently if not exists x on only app.t using btree (lower(a), (b + 1) desc nulls last) include (c) where a <> 'p;q' /* ; */ and b > 0 -- ;\n`;
+    // 許す形 (コメント・文字列の中の ; と 'concurrently' は数えない)・列か式か・concurrently を外した形
+    const okSql = `create unique index concurrently if not exists x on only app.t using btree (lower(a), (b + 1) desc nulls last, c) include (id) where a <> 'p;q' /* ; */ and b > 0 -- ;\n`;
     const p = parseConcurrentIndexStatement(splitSqlStatements(okSql)[0], 'f.sql');
     assert.deepEqual([p.kind, p.unique, p.schema, p.table, p.name], ['create', true, 'app', 't', 'x']);
+    assert.deepEqual(p.elements, [{ column: null, expression: true }, { column: null, expression: true }, { column: 'c', expression: false }, { column: 'id', expression: false }]);
+    assert.match(p.sqlTx, /^create unique index +if not exists x on only app\.t/);
+    assert.equal(/concurrently/i.test(p.sqlTx), false);
     assert.equal(splitSqlStatements(okSql).length, 1);
-    // expect.json が無い・別の index がある → 止まる
+    // expect.json が無い・余分 → 止まる
     const noExpect = mkDir({ '0001_base.sql': BASE, '0002_idx.sql': CI_SQL });
-    await assert.rejects(applyMigrations(pgAdapter(c), { dir: noExpect, log: quiet, disk: BIG_DISK }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED' && /expect\.json が無い/.test(e.message));
+    await assert.rejects(migrate(c, { dir: noExpect }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED' && /expect\.json が無い/.test(e.message));
     const f2 = { version: '0002', name: 'idx', file: '0002_idx.sql', text: CI_SQL, concurrentIndex: true };
     const d3 = mkDir({ '0002_idx.expect.json': JSON.stringify({ ...EXPECT, indexes: { ...EXPECT.indexes, 'app.other': EXPECT.indexes['app.t_a_b_idx'] } }) });
     assert.throws(() => planConcurrentIndexFile(f2, d3), /app\.other はこのファイルで作らない/);
     // 印の無いファイルに concurrently = 止まる (取引の中に入る前)
     const unmarked = mkDir({ '0001_base.sql': BASE, '0002_u.sql': '-- index\ncreate index concurrently if not exists t_a_idx on app.t (a);\n' });
-    await assert.rejects(applyMigrations(pgAdapter(c), { dir: unmarked, log: quiet }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED' && /1 行目が/.test(e.message));
+    await assert.rejects(migrate(c, { dir: unmarked }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED' && /1 行目が/.test(e.message));
     const marker2 = mkDir({ '0001_base.sql': BASE, '0002_u.sql': '-- a\n-- migrate:concurrent-index\ncreate index concurrently if not exists t_a_idx on app.t (a);\n' });
-    await assert.rejects(applyMigrations(pgAdapter(c), { dir: marker2, log: quiet }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED');
+    await assert.rejects(migrate(c, { dir: marker2 }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED');
+    // dry-run でも同じ検査
+    await assert.rejects(migrate(c, { dir, dryRun: true }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED');
     assert.deepEqual(await versions(c), []);
   });
 
   await t('C3 lock_timeout で invalid が残る → 記録しない・回収の手順を出す → 長い取引が終わってから流すと作り直して記録', async () => {
     const dbName = await newDb();
     const c = await open(dbName), blocker = await open(dbName);
-    await applyMigrations(pgAdapter(c), { dir: ciDir(), to: '0001', log: quiet });
+    await migrate(c, { dir: ciDir(), to: '0001' });
     await blocker.query('begin');
     await blocker.query(`insert into app.t values (100000, 'y100000', 1, null)`);   // RowExclusive の取引を開いたまま = CIC は書き手を待つ
+    const rec = recording(c);
     let err = null;
-    try { await applyMigrations(pgAdapter(c), { dir: ciDir(), log: quiet, disk: BIG_DISK, concurrentIndexSettings: { lockTimeout: '1s' } }); } catch (e) { err = e; }
+    try { await migrateWithLock(rec, { dir: ciDir(), log: quiet, readDiskMetrics: BIG_DISK, concurrentIndexSettings: { lockTimeout: '1s' } }); } catch (e) { err = e; }
     assert.ok(err, '止まらなかった');
     assert.equal(err.code, 'MIGRATION_FAILED'); assert.match(err.message, /lock timeout/); assert.match(err.message, /回収の手順/);
     assert.deepEqual(err.invalidIndexes, ['app.t_a_b_idx']);
-    const inv = await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx');
-    assert.equal(inv.valid, false);
+    // 取引の外の失敗 = ROLLBACK をせずに unlock
+    const afterFail = rec.logs.slice(rec.logs.findIndex((q) => /create index concurrently if not exists t_a_b_idx/.test(q)));
+    assert.equal(afterFail.includes('rollback'), false, '取引の外の失敗で ROLLBACK を流した');
+    assert.ok(afterFail.some((q) => /pg_advisory_unlock/.test(q)));
+    assert.equal((await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx')).valid, false);
     assert.deepEqual(await versions(c), ['0001']);
     assert.deepEqual(await lockHolders(dbName), []);
     assert.equal((await c.query('show lock_timeout')).rows[0].lock_timeout, '0', 'session の設定が戻っていない');
     await blocker.query('commit');
     const logs = [];
-    const r = await applyMigrations(pgAdapter(c), { dir: ciDir(), log: (m) => logs.push(m), disk: BIG_DISK });
+    const r = await migrate(c, { dir: ciDir(), log: (m) => logs.push(m) });
     assert.deepEqual(r.applied, ['0002']);
     assert.ok(logs.some((m) => /app\.t_a_b_idx は invalid .* drop index concurrently してから作り直す/.test(m)), logs.join('\n'));
     assert.equal((await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx')).valid, true);
@@ -354,76 +441,92 @@ try {
   await t('C4 同じ名前で定義が違う index がある → 止まる (今の index に触らない・記録しない)', async () => {
     const dbName = await newDb();
     const c = await open(dbName);
-    await applyMigrations(pgAdapter(c), { dir: ciDir(), to: '0001', log: quiet });
+    await migrate(c, { dir: ciDir(), to: '0001' });
     await c.query('create index t_a_b_idx on app.t (a)');
     const before = (await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx')).attrs;
-    await assert.rejects(applyMigrations(pgAdapter(c), { dir: ciDir(), log: quiet, disk: BIG_DISK }), (e) => e.code === 'MIGRATION_FAILED' && e.reason === 'DEFINITION_MISMATCH' && /同じ名前で定義が違う/.test(e.message));
+    await assert.rejects(migrate(c, { dir: ciDir() }), (e) => e.code === 'MIGRATION_FAILED' && e.reason === 'DEFINITION_MISMATCH' && /同じ名前で定義が違う/.test(e.message));
     assert.deepEqual((await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx')).attrs, before);
     assert.equal(await readIndexAttrs(pgAdapter(c), 'app', 't_lower_a_uidx'), null, '後ろの文を流した');
     assert.deepEqual(await versions(c), ['0001']);
-    // 名前が表に取られている
     const db2 = await newDb(); const c2 = await open(db2);
-    await applyMigrations(pgAdapter(c2), { dir: ciDir(), to: '0001', log: quiet });
+    await migrate(c2, { dir: ciDir(), to: '0001' });
     await c2.query('create table app.t_a_b_idx (x int)');
-    await assert.rejects(applyMigrations(pgAdapter(c2), { dir: ciDir(), log: quiet, disk: BIG_DISK }), (e) => e.reason === 'NAME_TAKEN');
+    await assert.rejects(migrate(c2, { dir: ciDir() }), (e) => e.reason === 'NAME_TAKEN');
   });
 
   await t('C5 作り済みの valid (空白・大文字が違う SQL で作った) は飛ばして続きを作り、記録する', async () => {
     const dbName = await newDb();
     const c = await open(dbName);
-    await applyMigrations(pgAdapter(c), { dir: ciDir(), to: '0001', log: quiet });
+    await migrate(c, { dir: ciDir(), to: '0001' });
     await c.query('CREATE INDEX t_a_b_idx ON app.t (A, B DESC) INCLUDE (C) WHERE (B > 10)');
     const logs = [];
-    const r = await applyMigrations(pgAdapter(c), { dir: ciDir(), log: (m) => logs.push(m), disk: BIG_DISK });
+    const r = await migrate(c, { dir: ciDir(), log: (m) => logs.push(m) });
     assert.deepEqual(r.applied, ['0002']);
     assert.ok(logs.some((m) => /app\.t_a_b_idx は作り済み .* 飛ばす/.test(m)));
     assert.equal((await readIndexAttrs(pgAdapter(c), 'app', 't_lower_a_uidx')).valid, true);
   });
 
-  await t('C6 容量: 上限が無い・見込みが上限 × 0.8 を超える → 流さない (dry-run も止まる)・CLI は env の上限を読む', async () => {
+  await t('C6 容量: 読めない・空きが 予想 × 3 + 2GB に満たない・ANALYZE していない → 流さない / CLI は RENDER_API_KEY が無ければ流さない (dry-run は流す予定を出す)', async () => {
     const dbName = await newDb();
     const c = await open(dbName);
-    await applyMigrations(pgAdapter(c), { dir: ciDir(), to: '0001', log: quiet });
-    await assert.rejects(applyMigrations(pgAdapter(c), { dir: ciDir(), log: quiet }), (e) => e.code === 'DISK_CHECK_FAILED' && /CDB_DB_LIMIT_BYTES/.test(e.message));
-    await assert.rejects(applyMigrations(pgAdapter(c), { dir: ciDir(), log: quiet, disk: { limitBytes: 10 * 1024 ** 2 } }), (e) => e.code === 'DISK_CHECK_FAILED' && /を超える/.test(e.message) && e.disk && e.disk.estimateBytes > 0);
-    await assert.rejects(applyMigrations(pgAdapter(c), { dir: ciDir(), log: quiet, dryRun: true, disk: { limitBytes: 10 * 1024 ** 2 } }), (e) => e.code === 'DISK_CHECK_FAILED');
-    // 見込み = 表の大きさ × 3 (2 つの index で 2 回) が効く: 上限の境い目
-    const size = Number((await c.query(`select pg_table_size('app.t')::text as b`)).rows[0].b);
-    const used = Number((await c.query(`select coalesce(sum(pg_database_size(oid)), 0)::text as b from pg_database where datallowconn and has_database_privilege(oid, 'CONNECT')`)).rows[0].b);
-    const need = used + 1024 ** 3 + size * 3 * 2 + 512 * 1024 ** 2;   // WAL は予約 1GB (この役割は pg_ls_waldir を読めない)
-    await assert.rejects(applyMigrations(pgAdapter(c), { dir: ciDir(), log: quiet, disk: { limitBytes: Math.floor((need - size) / 0.8) } }), (e) => e.code === 'DISK_CHECK_FAILED');
+    await migrate(c, { dir: ciDir(), to: '0001' });
+    await assert.rejects(migrate(c, { dir: ciDir(), readDiskMetrics: NO_METRICS }), (e) => e.code === 'DISK_CHECK_FAILED' && /空き容量が読めない \(METRICS_CONFIG/.test(e.message));
+    await assert.rejects(migrate(c, { dir: ciDir(), readDiskMetrics: async () => { throw new Error('網'); } }), (e) => e.code === 'DISK_CHECK_FAILED' && e.reason === 'METRICS_INTERNAL');
+    await assert.rejects(migrate(c, { dir: ciDir(), readDiskMetrics: undefined }), (e) => e.code === 'DISK_CHECK_FAILED');
+    // 予想 = reltuples × (列の avg_width の和 + 式 64 + 16) × 1.3
+    const st = parseConcurrentIndexStatement(splitSqlStatements(CI_STMTS[0])[0]);
+    const est = await estimateIndexBytes(pgAdapter(c), st);
+    const w = Object.fromEntries((await c.query(`select attname::text as a, avg_width from pg_stats where schemaname = 'app' and tablename = 't'`)).rows.map((r) => [r.a, Number(r.avg_width)]));
+    const tuples = Number((await c.query(`select reltuples::float8 as r from pg_class where oid = 'app.t'::regclass`)).rows[0].r);
+    assert.equal(est, Math.ceil(tuples * (w.a + w.b + w.c + 16) * 1.3));
+    const st2 = parseConcurrentIndexStatement(splitSqlStatements(CI_STMTS[1])[0]);
+    const est2 = await estimateIndexBytes(pgAdapter(c), st2);
+    assert.equal(est2, Math.ceil(tuples * (64 + 16) * 1.3));
+    const need = est * DISK_ESTIMATE.safetyFactor + DISK_ESTIMATE.fixedReserveBytes;
+    await assert.rejects(migrate(c, { dir: ciDir(), readDiskMetrics: disk(10 * GB, 10 * GB - (need - 1)) }), (e) => e.code === 'DISK_CHECK_FAILED' && e.reason === 'NOT_ENOUGH' && e.needBytes === need);
     assert.equal(await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx'), null, '止まったのに作った');
-    const dry = await applyMigrations(pgAdapter(c), { dir: ciDir(), log: quiet, dryRun: true, disk: { limitBytes: Math.ceil((need + 64 * 1024 ** 2) / 0.8) } });
-    assert.deepEqual(dry.pending, ['0002']);
-    assert.equal(await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx'), null, 'dry-run で作った');
-    const cliDry = runCli(['--url', urlOf(dbName), '--dir', ciDir(), '--dry-run']);
-    assert.equal(cliDry.status, 0, cliDry.stderr); assert.match(cliDry.stdout, /dry-run: 0002_idx\.sql を流す予定 \(concurrent-index/);
-    const cliNoLimit = spawnSync(process.execPath, ['scripts/company-db/migrate.mjs', '--url', urlOf(dbName), '--dir', ciDir()], { cwd: ROOT, env: { ...process.env, CDB_DB_LIMIT_BYTES: '' }, encoding: 'utf8', timeout: 60000 });
-    assert.equal(cliNoLimit.status, 1); assert.match(cliNoLimit.stderr, /DISK_CHECK_FAILED/);
-    const cli = runCli(['--url', urlOf(dbName), '--dir', ciDir()]);
-    assert.equal(cli.status, 0, cli.stderr); assert.match(cli.stdout, /applied=1/);
+    assert.deepEqual(await versions(c), ['0001']);
+    // ちょうど足りる (空き = 2 つの文の必要の大きいほう) → 流す
+    const needMax = Math.max(need, est2 * DISK_ESTIMATE.safetyFactor + DISK_ESTIMATE.fixedReserveBytes);
+    const r = await migrate(c, { dir: ciDir(), readDiskMetrics: disk(10 * GB, 10 * GB - needMax) });
+    assert.deepEqual(r.applied, ['0002']);
+    // ANALYZE していない表 (reltuples = -1) → 見積もれない = 流さない
+    const db2 = await newDb(); const c2 = await open(db2);
+    const noAnalyze = BASE.replace('analyze app.t;\n', '');
+    await migrate(c2, { dir: mkDir({ '0001_base.sql': noAnalyze }) });
+    await assert.rejects(migrate(c2, { dir: mkDir({ '0001_base.sql': noAnalyze, '0002_idx.sql': CI_SQL, '0002_idx.expect.json': JSON.stringify(EXPECT) }) }), (e) => e.code === 'DISK_CHECK_FAILED' && /ANALYZE/.test(e.message));
+    // CLI: RENDER_API_KEY / CDB_RENDER_PG_RESOURCE_ID が無い = 流さない・dry-run は容量を見ない
+    const db3 = await newDb();
+    const cliDry = runCli(['--url', urlOf(db3), '--dir', ciDir(), '--dry-run']);
+    assert.equal(cliDry.status, 0, cliDry.stderr); assert.match(cliDry.stdout, /dry-run: 0002_idx\.sql を流す予定 \(concurrent-index・2 文・取引の外\)/);
+    const cli = runCli(['--url', urlOf(db3), '--dir', ciDir()]);
+    assert.equal(cli.status, 1); assert.match(cli.stderr, /DISK_CHECK_FAILED.*空き容量が読めない \(METRICS_CONFIG/);
+    const c3 = await open(db3);
+    assert.deepEqual(await versions(c3), ['0001']);
+    assert.deepEqual(await lockHolders(db3), []);
   });
 
   await t('C7 PostgreSQL の major が期待と違う → 流さない', async () => {
     const dbName = await newDb();
     const c = await open(dbName);
-    await applyMigrations(pgAdapter(c), { dir: ciDir(), to: '0001', log: quiet });
-    await assert.rejects(applyMigrations(pgAdapter(c), { dir: ciDir(), log: quiet, disk: BIG_DISK, expectedPgMajor: 17 }), (e) => e.code === 'PG_MAJOR_MISMATCH');
+    await migrate(c, { dir: ciDir(), to: '0001' });
+    await assert.rejects(migrate(c, { dir: ciDir(), expectedPgMajor: 17 }), (e) => e.code === 'PG_MAJOR_MISMATCH');
     const d = ciDir({ '0002_idx.expect.json': JSON.stringify({ ...EXPECT, pg_major: 17 }) });
-    await assert.rejects(applyMigrations(pgAdapter(c), { dir: d, log: quiet, disk: BIG_DISK }), (e) => e.code === 'PG_MAJOR_MISMATCH' && /expect\.json の pg_major/.test(e.message));
+    await assert.rejects(migrate(c, { dir: d }), (e) => e.code === 'PG_MAJOR_MISMATCH' && /expect\.json の pg_major/.test(e.message));
     assert.equal(await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx'), null);
+    assert.deepEqual(await lockHolders(dbName), []);
   });
 
   await t('C8 同じ表の index の作りが別の接続で動いている → 止まる (何も作らない)', async () => {
     const dbName = await newDb();
     const c = await open(dbName), blocker = await open(dbName), other = await open(dbName);
-    await applyMigrations(pgAdapter(c), { dir: ciDir(), to: '0001', log: quiet });
+    await migrate(c, { dir: ciDir(), to: '0001' });
     await blocker.query('begin');
     await blocker.query(`insert into app.t values (100001, 'y100001', 1, null)`);
     const otherPid = await pidOf(other);
     const building = other.query('create index concurrently other_idx on app.t (b)').catch((e) => e);
     await waitFor(async () => (await su.query('select count(*)::int as n from pg_stat_progress_create_index where pid = $1', [otherPid])).rows[0].n > 0, 10000, '別の作りが始まる');
-    await assert.rejects(applyMigrations(pgAdapter(c), { dir: ciDir(), log: quiet, disk: BIG_DISK }), (e) => e.code === 'MIGRATION_FAILED' && e.reason === 'BUILD_IN_PROGRESS' && new RegExp(`pid ${otherPid}`).test(e.message));
+    await assert.rejects(migrate(c, { dir: ciDir() }), (e) => e.code === 'MIGRATION_FAILED' && e.reason === 'BUILD_IN_PROGRESS' && new RegExp(`pid ${otherPid}`).test(e.message));
     assert.equal(await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx'), null);
     await su.query('select pg_cancel_backend($1)', [otherPid]);
     await building;
@@ -435,33 +538,177 @@ try {
     const dbName = await newDb();
     const c = await open(dbName);
     const d = ciDir({ '0003_drop.sql': '-- migrate:concurrent-index\ndrop index concurrently if exists app.t_lower_a_uidx;\n' });
-    const r = await applyMigrations(pgAdapter(c), { dir: d, log: quiet, disk: BIG_DISK });
+    const r = await migrate(c, { dir: d });
     assert.deepEqual(r.applied, ['0001', '0002', '0003']);
     assert.equal(await readIndexAttrs(pgAdapter(c), 'app', 't_lower_a_uidx'), null);
     assert.equal((await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx')).valid, true);
   });
 
-  await t('P1 PGlite の adapter: concurrent-index は既定で止まる (何も流さない)・skip なら明示で飛ばして記録しない', async () => {
+  await t('P1 PGlite の adapter: concurrently を外してふつうの取引で流し、属性の検証は同じ (PG 18 の expect.json に一致) / 定義が違えば巻き戻す', async () => {
     const pg = new PGlite();
     try {
       const db = pgliteAdapter(pg);
-      await assert.rejects(applyMigrations(db, { dir: ciDir(), log: quiet }), (e) => e.code === 'CONCURRENT_INDEX_UNSUPPORTED');
-      assert.equal((await db.query('select count(*)::int as n from ops.schema_migrations')).rows[0].n, 0);
       const logs = [];
-      const r = await applyMigrations(db, { dir: ciDir(), log: (m) => logs.push(m), onUnsupportedConcurrentIndex: 'skip' });
-      assert.deepEqual([r.applied, r.unsupported], [['0001'], ['0002']]);
-      assert.ok(logs.some((m) => /skip 0002_idx\.sql/.test(m)));
-      assert.equal((await db.query(`select count(*)::int as n from pg_class where relname = 't_a_b_idx'`)).rows[0].n, 0);
-      // PGlite でも許さない文は先に止まる (skip でも検査は飛ばさない)
-      const bad = mkDir({ '0001_base.sql': BASE, '0002_x.sql': '-- migrate:concurrent-index\ncreate table app.evil (x int);\n' });
+      const r = await applyMigrations(db, { dir: ciDir({ '0003_drop.sql': '-- migrate:concurrent-index\ndrop index concurrently if exists app.t_lower_a_uidx;\n' }), log: (m) => logs.push(m) });
+      assert.deepEqual(r.applied, ['0001', '0002', '0003']);
+      assert.ok(logs.some((m) => /0002_idx\.sql \(concurrent-index を取引の中で/.test(m)));
+      const a = await readIndexAttrs(db, 'app', 't_a_b_idx');
+      assert.deepEqual(attrDiff(a.attrs, EXPECT.indexes['app.t_a_b_idx']), []);
+      assert.equal(await readIndexAttrs(db, 'app', 't_lower_a_uidx'), null);
+      // 定義が違う同じ名前 → 巻き戻す (記録しない)
       const pg2 = new PGlite();
-      try { await assert.rejects(applyMigrations(pgliteAdapter(pg2), { dir: bad, log: quiet, onUnsupportedConcurrentIndex: 'skip' }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED'); } finally { await pg2.close(); }
+      try {
+        const db2 = pgliteAdapter(pg2);
+        await applyMigrations(db2, { dir: ciDir(), to: '0001', log: quiet });
+        await db2.exec('create index t_a_b_idx on app.t (a)');
+        await assert.rejects(applyMigrations(db2, { dir: ciDir(), log: quiet }), (e) => e.code === 'MIGRATION_FAILED' && e.reason === 'DEFINITION_MISMATCH');
+        assert.deepEqual((await db2.query('select version from ops.schema_migrations order by 1')).rows.map((x) => x.version), ['0001']);
+        assert.equal(await readIndexAttrs(db2, 'app', 't_lower_a_uidx'), null, '巻き戻していない');
+        // 許さない文は PGlite でも先に止まる
+        const bad = mkDir({ '0001_base.sql': BASE, '0002_x.sql': '-- migrate:concurrent-index\ncreate table app.evil (x int);\n' });
+        await assert.rejects(applyMigrations(db2, { dir: bad, log: quiet }), (e) => e.code === 'CONCURRENT_INDEX_REJECTED');
+      } finally { await pg2.close(); }
     } finally { await pg.close(); }
   });
 
+  console.log('持ち主の mode (Codex R-D60-v3-10 H2: ① PR 1b の前 / ② PR 1b 自身 / ③ PR 1b の後)');
+  let roleSeq = 0;
+  /** PR 1b の形の owner-transition の file (持ち主の役割を作り・表と記録表の持ち主を移し・印を作る)。makeMarker = false なら印を作らない (壊れた形) */
+  const transitionSql = (dbName, role, { makeMarker = true, header = true } = {}) => `${header ? '-- migrate:owner-transition\n' : ''}-- PR 1b の試験の形
+create role ${role} nologin;
+grant ${role} to ${OWNER} with inherit false, set true;
+grant create on database ${dbName} to ${role};
+grant usage, create on schema app, ops to ${role};
+grant usage on schema ops to ${RUNTIME};
+grant select on ops.schema_migrations to ${RUNTIME};   -- 夜のバックアップ (runtime) が読む
+alter table app.t owner to ${role};
+alter table ops.schema_migrations owner to ${role};
+${makeMarker ? `create table ops.migrate_owner (singleton boolean primary key default true check (singleton), owner_role name not null, since timestamptz not null default now());
+insert into ops.migrate_owner (owner_role) values ('${role}');
+grant select on ops.migrate_owner to ${RUNTIME};
+alter table ops.migrate_owner owner to ${role};` : ''}
+alter schema app owner to ${role};
+alter schema ops owner to ${role};
+`;
+  /** 持ち主 (catalog だけ = schema の USAGE が無くても読める) */
+  const ownerOf = async (c, rel) => { const [sc, nm] = rel.split('.'); return (await c.query('select pg_get_userbyid(c.relowner)::text as o from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = $1 and c.relname = $2', [sc, nm])).rows[0].o; };
+  const whoami = async (c) => (await c.query('select current_user::text as cu, session_user::text as su')).rows[0];
+
+  await t('O0 migration の file は全部、役割を切り替える文 (reset role・set role・session authorization) を持たない (owner mode で記録が別の役割で走らない・grep の縛り)', async () => {
+    for (const f of listMigrationFiles()) assert.deepEqual(roleSwitchStatements(f.text), [], f.file);
+    assert.deepEqual(roleSwitchStatements(["-- reset role", "select 'set role x'; /* set local role y */ select $$reset role$$;"].join(String.fromCharCode(10))), []);
+    assert.deepEqual(roleSwitchStatements('reset role'), ['reset role / session authorization']);
+    assert.deepEqual(roleSwitchStatements('SET LOCAL ROLE a'), ['set role']);
+    assert.deepEqual(roleSwitchStatements('set session role a'), ['set role']);
+    assert.deepEqual(roleSwitchStatements('set session authorization default'), ['set session authorization']);
+    assert.deepEqual(roleSwitchStatements('reset session authorization'), ['reset role / session authorization']);
+    assert.deepEqual(roleSwitchStatements("select set_config('role', 'x', true)"), [], '(set_config は検出しない = 迷った所)');
+  });
+
+  await t('O1 ① PR 1b の前 (印が無い) = legacy = 接続の役割のまま流す (今までどおり)・記録表の持ち主は接続の役割', async () => {
+    const dbName = await newDb();
+    const c = await open(dbName);
+    const logs = [];
+    await migrate(c, { dir: ciDir(), log: (m) => logs.push(m) });
+    assert.ok(logs.some((m) => /持ち主の mode = legacy/.test(m)));
+    assert.equal(await ownerOf(c, 'ops.schema_migrations'), OWNER);
+    assert.equal(await ownerOf(c, 'app.t_a_b_idx'), OWNER);
+  });
+
+  await t('O2 ② PR 1b 自身 (owner-transition) = 接続の役割で移し、記録は印の役割で / 同じ回の後の file (ふつう・CIC) は owner mode', async () => {
+    const dbName = await newDb();
+    const c = await open(dbName);
+    const role = `cdb_owner_${hex}_${++roleSeq}`;
+    const dir = ciDir({ '0002_idx.sql': transitionSql(dbName, role), '0003_after.sql': 'create table app.after (x int);\n', '0004_idx.sql': CI_SQL, '0004_idx.expect.json': JSON.stringify(EXPECT) });
+    fs.rmSync(path.join(dir, '0002_idx.expect.json'));
+    const logs = [];
+    const r = await migrate(c, { dir, log: (m) => logs.push(m) });
+    assert.deepEqual(r.applied, ['0001', '0002', '0003', '0004']);
+    assert.ok(logs.some((m) => /持ち主の mode = legacy/.test(m)) && logs.some((m) => new RegExp(`owner \\(SET ROLE ${role}\\) に移った`).test(m)), logs.join('\n'));
+    assert.equal(await ownerOf(c, 'ops.schema_migrations'), role);
+    assert.equal(await ownerOf(c, 'app.after'), role, '0003 が持ち主の役割で流れていない');
+    assert.equal((await readIndexAttrs(pgAdapter(c), 'app', 't_a_b_idx')).valid, true);
+    assert.deepEqual(await whoami(c), { cu: OWNER, su: OWNER }, 'SET ROLE が残った');
+    assert.deepEqual(await lockHolders(dbName), []);
+    // 接続の役割はもう記録表に書けない = SET ROLE が要る (③ の前提)
+    await assert.rejects(c.query(`insert into ops.schema_migrations (version, name, checksum) values ('9999', 'x', 'x')`), (e) => e.code === '42501');
+    // 記録は印の役割で読める (--list も)
+    // 夜のバックアップ (runtime) は記録表と印の表を読める (持ち主を移した後も GRANT が残る)
+    const rtUrl = new URL(urlOf(dbName)); rtUrl.username = RUNTIME;
+    const rt = await openPgClient(rtUrl.toString()); rt.on('error', () => {}); clients.push(rt);
+    assert.equal((await rt.query('select count(*)::int as n from ops.schema_migrations')).rows[0].n, 4);
+    assert.equal((await rt.query('select owner_role::text as r from ops.migrate_owner')).rows[0].r, role);
+    const list = runCli(['--url', urlOf(dbName), '--dir', dir, '--list']);
+    assert.equal(list.status, 0, list.stderr);
+    assert.match(list.stdout, /0004 applied/); assert.match(list.stdout, new RegExp(`持ち主の mode = owner \\(SET ROLE ${role}\\)`));
+  });
+
+  await t('O3 ③ PR 1b の後 = 印の役割で流す (ふつう・CIC・記録表)・失敗しても役割が戻り lock が外れる / SET できない・印が壊れている → 止まる', async () => {
+    const dbName = await newDb();
+    const c = await open(dbName);
+    const role = `cdb_owner_${hex}_${++roleSeq}`;
+    const base = { '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role) };
+    await migrate(c, { dir: mkDir(base) });
+    // ふつうの file と CIC の file (別の回 = 印を読んで owner mode から始まる)
+    const dir2 = mkDir({ ...base, '0003_more.sql': 'create table app.more (x int);\n', '0004_idx.sql': CI_SQL, '0004_idx.expect.json': JSON.stringify(EXPECT) });
+    const logs = [];
+    const r = await migrate(c, { dir: dir2, log: (m) => logs.push(m) });
+    assert.deepEqual(r.applied, ['0003', '0004']);
+    assert.ok(logs.some((m) => new RegExp(`持ち主の mode = owner \\(SET ROLE ${role}\\)`).test(m)));
+    assert.equal(await ownerOf(c, 'app.more'), role);
+    assert.equal((await c.query(`select applied_by from ops.schema_migrations where version = '0004'`).catch((e) => e)).code, '42501', '(前提) 接続の役割では読めない');
+    assert.deepEqual(await whoami(c), { cu: OWNER, su: OWNER });
+    // ふつうの file が落ちる → 巻き戻り・役割が戻る・lock が外れる
+    const dir3 = mkDir({ ...base, '0003_more.sql': 'create table app.more (x int);\n', '0004_idx.sql': CI_SQL, '0004_idx.expect.json': JSON.stringify(EXPECT), '0005_bad.sql': 'create table app.bad (x int);\nselect 1/0;\n' });
+    await assert.rejects(migrate(c, { dir: dir3 }), (e) => e.code === 'MIGRATION_FAILED' && e.version === '0005');
+    assert.deepEqual(await whoami(c), { cu: OWNER, su: OWNER });
+    assert.deepEqual(await lockHolders(dbName), []);
+    // CIC が落ちる (容量が読めない) → RESET ROLE・lock が外れる
+    const dir4 = mkDir({ ...base, '0003_more.sql': 'create table app.more (x int);\n', '0004_idx.sql': CI_SQL, '0004_idx.expect.json': JSON.stringify(EXPECT), '0005_idx2.sql': '-- migrate:concurrent-index\ncreate index concurrently if not exists t_c_idx on app.t (c);\n',
+      '0005_idx2.expect.json': JSON.stringify({ format: 'company-db-index-expect/1', pg_major: 18, indexes: { 'app.t_c_idx': { table: 'app.t' } } }) });
+    await assert.rejects(migrate(c, { dir: dir4, readDiskMetrics: NO_METRICS }), (e) => e.code === 'DISK_CHECK_FAILED');
+    assert.deepEqual(await whoami(c), { cu: OWNER, su: OWNER }, 'CIC の失敗で SET ROLE が残った');
+    assert.deepEqual(await lockHolders(dbName), []);
+    // owner mode の file に RESET ROLE / SET ROLE = 流す前に止まる (何も流さない)
+    for (const body of [`create table app.r1 (x int);
+reset role;
+create table app.r2 (x int);
+`, `set local role postgres;
+`, `SET SESSION AUTHORIZATION DEFAULT;
+`]) {
+      const d = mkDir({ ...base, '0003_more.sql': `create table app.more (x int);
+`, '0004_idx.sql': CI_SQL, '0004_idx.expect.json': JSON.stringify(EXPECT), '0005_role.sql': body });
+      await assert.rejects(migrate(c, { dir: d }), (e) => e.code === 'OWNER_MODE_INVALID' && /役割を切り替える文/.test(e.message), body);
+    }
+    assert.equal((await c.query(`select count(*)::int as n from pg_class where relname = 'r1'`)).rows[0].n, 0);
+    // owner-transition をもう一度 = 流さない (前の検査で止まる)
+    const dir5 = mkDir({ ...base, '0003_more.sql': 'create table app.more (x int);\n', '0004_idx.sql': CI_SQL, '0004_idx.expect.json': JSON.stringify(EXPECT), '0005_again.sql': transitionSql(dbName, role + 'x') });
+    await assert.rejects(migrate(c, { dir: dir5 }), (e) => e.code === 'OWNER_MODE_INVALID' && /もう owner mode/.test(e.message));
+    // 接続の役割が印の役割に SET できない → 止まる (何も流さない)
+    await su.query(`grant ${role} to ${OWNER} with set false granted by ${OWNER}`);   // 同じ付与の SET を外す
+    await assert.rejects(migrate(c, { dir: dir2 }), (e) => e.code === 'OWNER_MODE_INVALID' && /SET ROLE できない/.test(e.message));
+    assert.deepEqual(await lockHolders(dbName), []);
+    await su.query(`grant ${role} to ${OWNER} with set true granted by ${OWNER}`);
+    assert.deepEqual((await migrate(c, { dir: dir2 })).applied, []);
+  });
+
+  await t('O4 印を作ってよいのは owner-transition の file だけ / owner-transition が印を作らない → 巻き戻す', async () => {
+    const dbName = await newDb();
+    const c = await open(dbName);
+    await migrate(c, { dir: mkDir({ '0001_base.sql': BASE }) });
+    const r1 = `cdb_owner_${hex}_${++roleSeq}`;
+    await assert.rejects(migrate(c, { dir: mkDir({ '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, r1, { header: false }) }) }), (e) => e.code === 'MIGRATION_FAILED' && e.reason === 'OWNER_MODE_INVALID' && /owner-transition/.test(e.message));
+    const r2 = `cdb_owner_${hex}_${++roleSeq}`;
+    await assert.rejects(migrate(c, { dir: mkDir({ '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, r2, { makeMarker: false }) }) }), (e) => e.code === 'MIGRATION_FAILED' && e.reason === 'OWNER_MODE_INVALID' && /印 .* を作らなかった/.test(e.message));
+    // どちらも巻き戻った = 役割も印も無い・持ち主は接続の役割のまま
+    assert.equal((await su.query('select count(*)::int as n from pg_roles where rolname = any($1)', [[r1, r2]])).rows[0].n, 0);
+    assert.equal(await ownerOf(c, 'ops.schema_migrations'), OWNER);
+    assert.deepEqual(await versions(c), ['0001']);
+    assert.deepEqual(await lockHolders(dbName), []);
+  });
+
   await t('X1 --index-expect は使い捨ての DB から expect.json の中身を出す (試験で作ったものと同じ)', async () => {
-    const d = ciDir();
-    const r = runCli(['--url', urlOf(dbX), '--dir', d, '--index-expect', '0002']);
+    const r = runCli(['--url', urlOf(dbX), '--dir', ciDir(), '--index-expect', '0002']);
     assert.equal(r.status, 0, r.stderr);
     assert.deepEqual(JSON.parse(r.stdout), EXPECT);
   });
