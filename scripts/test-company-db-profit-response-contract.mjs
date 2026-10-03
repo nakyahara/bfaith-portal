@@ -10,6 +10,8 @@
  *   - fixture (月ごとの入力 → 最終の応答) が列ごとの規則どおり・最終の応答が契約を満たす (BigInt / Decimal は文字列・null の伝わり方・理由の順・raw の列なし・months[]・calculated_at は 1 つの値)
  *   - 契約を破った応答 (raw の列・数の bigint・3 桁の小数・-0.00・理由の順・calculated_at の違い・months の欠け ほか) を全部拒む
  *   - 503 の code の一覧・今の router の 503 (PROFIT_ROUTE_DISABLED) も同じ形 (DB に接続しない)
+ *   🆕 #1602 Codex R1: 503 は code ごとの固定の文・reason の列挙 (秘密の sentinel を必ず拒む)・全部の失敗の経路の対応表 /
+ *     /daily の全部の列の null の規則・下限・列挙・行の不変条件 (全部の列 × 行で規則を逆にすると拒む) / validator は例外を投げない / 13 か月の上限
  * 🚨 DB の実装はしない。利益の受け口は 503 のまま
  * 実行: node scripts/test-company-db-profit-response-contract.mjs
  */
@@ -20,7 +22,8 @@ import express from 'express';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import {
   CONTRACT_VERSION, PROFIT_503_CODES, REQUIRED_HEADERS, REASON_ORDER, TOTALS_REASONS, ASSUMED_ZERO_REASONS, MASTER_NOTE_KEYS, TOTALS_COLUMNS, TOTALS_RULES, DAILY_COLUMNS,
-  MONTH_KEYS, validateTotalsResponse, validateDailyResponse, validate503Body, monthsOf,
+  MONTH_KEYS, validateTotalsResponse, validateDailyResponse, validate503Body, monthsOf, PROFIT_503_ERRORS, PROFIT_503_REASONS, METRICS_REASONS, FAILURE_PATHS,
+  build503Body, SECRET_PATTERNS, DAILY_NUL_RULES, MAX_MONTHS,
 } from '../apps/company-db/profit/response-contract.mjs';
 import { combineTotals, combineDaily, sumDecimals, round2 } from './fixtures/amazon-profit-response/reference-combine.mjs';
 import companyDbRouter, { __setPgClientFactory } from '../apps/company-db/router.mjs';
@@ -214,17 +217,57 @@ const breakDaily = [
   ['返品数が 2 桁', (x) => { x.rows[2].units_refunded_customer_unrounded = '0.50'; }],
   ['金額の numeric が 6 桁', (x) => { x.rows[0].ad_cost = '120.500000'; }],
   ['null にならない列が null', (x) => { x.rows[0].profit_incomplete_reasons = null; }],
-  ['理由の順', (x) => { x.rows[1].profit_incomplete_reasons = ['composition_missing', 'listing_unresolved']; }],
+  ['理由の順', (x) => { x.rows[2].profit_incomplete_reasons = ['refund_units_partial_month', 'finance_incomplete']; }],
   ['0 と仮定の理由に refund_units_partial_month', (x) => { x.rows[2].assumed_zero_reasons = ['refund_units_partial_month']; }],
   ['master_notes の順', (x) => { x.rows[0].master_notes = ['listing_changed_since_received', 'pre_audit_unverifiable']; }],
   ['並び (出品の無い行が前)', (x) => { [x.rows[0], x.rows[1]] = [x.rows[1], x.rows[0]]; }],
-  ['同じ行が 2 つ', (x) => { x.rows.push(clone(x.rows[2])); }],
+  ['同じ行が 2 つ (行の鍵が重なる)', (x) => { x.rows.push(clone(x.rows[2])); }],
   ['期間の外の日', (x) => { x.rows[2].economic_date_jst = '2026-08-03'; }],
   ['日付の形', (x) => { x.rows[0].economic_date_jst = '2026-07-30T00:00:00Z'; }],
   ['列が欠ける', (x) => { delete x.rows[0].cogs_jpy; }],
   ['知らない列', (x) => { x.rows[0].row_total = '1'; }],
   ['0 行の月を落とした', (x) => { x.months.pop(); }],
   ['旧 totals の行の種類', (x) => { x.rows[0].row_kind = 'day'; }],
+  // 🆕 #1602 Codex R1 M1 (Codex が通ってしまうと示した 4 つ + 値域・列挙・行の鍵)
+  ['units_ordered が null', (x) => { x.rows[0].units_ordered = null; }],
+  ['0 と仮定の利益が null', (x) => { x.rows[1].contribution_after_ad_assuming_incomplete_zero_incl = null; }],
+  ['refund_units_status が知らない値', (x) => { x.rows[0].refund_units_status = 'invented'; }],
+  ['source_lines が負', (x) => { x.rows[0].source_lines = -1; }],
+  ['unclassified_abs_jpy が負', (x) => { x.rows[0].unclassified_abs_jpy = '-1'; }],
+  ['refund_incomplete_child_count が 2', (x) => { x.rows[2].refund_incomplete_child_count = 2; }],
+  ['refund_incomplete_child_count が状態と合わない', (x) => { x.rows[0].refund_incomplete_child_count = 1; }],
+  ['cost_basis が知らない値', (x) => { x.rows[0].cost_basis = 'sku_cost'; }],
+  ['composition_basis が知らない値', (x) => { x.rows[0].composition_basis = 'current'; }],
+  ['master_basis が current でない', (x) => { x.rows[0].master_basis = 'received'; }],
+  ['hash が 64 桁の 16 進でない', (x) => { x.rows[0].composition_hash = 'c0ffee'; }],
+  ['hash が大文字', (x) => { x.rows[0].cost_input_hash = 'B'.repeat(64); }],
+  ['resolved なのに listing_id が null', (x) => { x.rows[0].listing_id = null; }],
+  ['resolved なのに seller_sku_norm がある', (x) => { x.rows[0].seller_sku_norm = 'AB-001'; }],
+  ['resolved なのに listing_code が null', (x) => { x.rows[2].listing_code = null; }],
+  ['unresolved なのに listing_id がある', (x) => { x.rows[1].listing_id = '99'; }],
+  ['unresolved なのに seller_sku_norm が null', (x) => { x.rows[1].seller_sku_norm = null; }],
+  ['unresolved なのに listing_code がある', (x) => { x.rows[1].listing_code = 'ZZ'; }],
+  ['unresolved なのに原価がある', (x) => { x.rows[1].component_unit_cost_jpy = '1'; x.rows[1].cogs_jpy = '1'; }],
+  ['unresolved なのに cost_basis が sku_costs', (x) => { x.rows[1].cost_basis = 'sku_costs'; }],
+  ['unresolved なのに composition_basis が missing', (x) => { x.rows[1].composition_basis = 'missing'; }],
+  ['unresolved なのに理由に listing_unresolved が無い', (x) => { x.rows[1].profit_incomplete_reasons = []; x.rows[1].assumed_zero_reasons = []; }],
+  ['unresolved に pre_audit_unverifiable の印', (x) => { x.rows[1].master_notes = ['pre_audit_unverifiable']; }],
+  ['resolved に理由 listing_unresolved', (x) => { x.rows[0].profit_incomplete_reasons = ['listing_unresolved']; x.rows[0].assumed_zero_reasons = ['listing_unresolved']; }],
+  ['原価が分かるのに cogs が null', (x) => { x.rows[0].cogs_jpy = null; }],
+  ['原価が分かるのに cost_input_hash が null', (x) => { x.rows[0].cost_input_hash = null; }],
+  ['構成が分かるのに composition_hash が null', (x) => { x.rows[2].composition_hash = null; }],
+  ['理由が無いのに正式な値が null', (x) => { x.rows[0].contribution_after_ad_excl = null; }],
+  ['広告の前の理由があるのに正式な値がある', (x) => { x.rows[2].contribution_before_ad_incl_jpy = '-150'; }],
+  ['理由があるのに広告の後の正式な値がある', (x) => { x.rows[2].contribution_after_ad_incl = '-150.00'; }],
+  ['広告が complete なのに ad_cost が null', (x) => { x.rows[0].ad_cost = null; }],
+  ['広告が missing なのに ad_cost がある・理由が無い', (x) => { x.rows[0].ad_status = 'missing'; }],
+  ['返品の単価が無いのに丸める前の返品数がある', (x) => { x.rows[0].refund_units_status = 'unit_price_missing'; x.rows[0].refund_incomplete_child_count = 1; }],
+  ['返品の単価があるのに丸める前の返品数が null', (x) => { x.rows[0].units_a_to_z_refund_unrounded = null; }],
+  ['月の途中の単価なのに理由が無い', (x) => { x.rows[0].refund_units_status = 'estimated_partial_month_unit_price'; x.rows[0].refund_incomplete_child_count = 1; }],
+  ['日の財務が provisional なのに理由が無い', (x) => { x.rows[0].day_finance_status = 'provisional'; }],
+  ['0 と仮定の理由が理由と合わない', (x) => { x.rows[1].assumed_zero_reasons = []; }],
+  ['composition_basis が印と合わない', (x) => { x.rows[0].composition_basis = 'current_no_recorded_change'; }],
+  ['composition_audit_since が null', (x) => { x.rows[0].composition_audit_since = null; }],
 ];
 await t(`/daily: 契約を破った ${breakDaily.length} 通りを全部拒む`, async () => {
   for (const [name, f] of breakDaily) {
@@ -232,20 +275,94 @@ await t(`/daily: 契約を破った ${breakDaily.length} 通りを全部拒む`,
     assert.equal(validateDailyResponse(x).ok, false, name);
   }
 });
-
-console.log('503');
-await t('503 の code の一覧 = fixture の本文 (code ごとに 1 つ)・全部が契約を満たす・header は no-store', async () => {
-  assert.deepEqual(errors503.map((b) => b.code), [...PROFIT_503_CODES]);
-  for (const b of errors503) assert.deepEqual(validate503Body(b).errors, [], b.code);
-  assert.deepEqual({ ...REQUIRED_HEADERS }, { 'cache-control': 'no-store' });
+await t('/daily: 全部の列 × 全部の行で、null の規則 (nul) を逆にすると拒む (never は null に・iff_* は null ⇔ 値を入れ替える)', async () => {
+  assert.deepEqual([...new Set(DAILY_COLUMNS.map((c) => c.nul))].sort(), [...DAILY_NUL_RULES].sort());
+  const sample = (c) => ({ smallint: 1, integer: 0, bigint: '1', 'bigint[]': [], numeric: c.sixDp ? '0' : '1.00', date: '2026-07-30', text: c.hex64 ? 'e'.repeat(64) : 'x',
+    'text[]': [], 'timestamp with time zone': '2026-07-30T00:00:00.000Z' }[c.type]);
+  let n = 0;
+  for (const c of DAILY_COLUMNS.filter((c) => c.nul !== 'maybe')) {
+    for (let i = 0; i < dailyExp.rows.length; i++) {
+      const x = clone(dailyExp);
+      x.rows[i][c.name] = x.rows[i][c.name] === null ? sample(c) : null;
+      assert.equal(validateDailyResponse(x).ok, false, `${c.name} (${c.nul}) の行 ${i}`);
+      n++;
+    }
+  }
+  assert.ok(n > 200, `${n}`);
 });
-await t('503 の契約を破った本文を拒む (知らない code・rows・Render の本文・小文字の reason・ok が true)', async () => {
-  const bad = [{ ok: false, code: 'PROFIT_UNKNOWN', error: 'x' }, { ok: false, code: 'PROFIT_BUSY', error: 'x', rows: [] },
-    { ok: false, code: 'PROFIT_METRICS_UNAVAILABLE', error: 'x', upstream: { message: 'invalid key' } }, { ok: false, code: 'PROFIT_BUSY', error: 'x', reason: 'busy' },
-    { ok: true, code: 'PROFIT_BUSY', error: 'x' }, { ok: false, code: 'PROFIT_BUSY' }, { ok: false, code: 'PROFIT_BUSY', error: 'x', total: {} }, null];
+await t('/daily: maybe の列は null でも値でもよい (世代・監査の時刻・coverage)', async () => {
+  for (const c of DAILY_COLUMNS.filter((c) => c.nul === 'maybe')) {
+    const x = clone(dailyExp); x.rows[0][c.name] = null;
+    assert.deepEqual(validateDailyResponse(x).errors, [], c.name);
+  }
+});
+
+console.log('503 (固定の文・列挙の reason・全部の失敗の経路)');
+await t('503 の code の一覧 = fixture の本文 (code ごとに 1 つ・固定の文)・全部が契約を満たす', async () => {
+  assert.deepEqual(errors503.map((b) => b.code), [...PROFIT_503_CODES]);
+  for (const b of errors503) {
+    assert.deepEqual(validate503Body(b).errors, [], b.code);
+    assert.equal(b.error, PROFIT_503_ERRORS[b.code]);
+    assert.deepEqual(b, build503Body(b.code, b.reason));
+  }
+  for (const c of PROFIT_503_CODES) for (const re of SECRET_PATTERNS) assert.doesNotMatch(PROFIT_503_ERRORS[c], re, c);
+});
+await t('🚨 秘密の sentinel を error・reason・上流の例外・余計な列に入れた 503 は必ず拒む (H1)', async () => {
+  const SECRETS = ['Bearer rnd_EXPOSEDSECRET123456', 'rnd_EXPOSEDSECRET123456', 'postgres://cdb:p4ss@dpg-x.oregon-postgres.render.com/cdb',
+    'postgresql://u@h/db', 'RENDER_API_KEY=abc', 'password=hunter2'];
+  for (const s of SECRETS) {
+    const upstream = new Error(`connect failed: ${s}`);
+    const bad = [
+      { ok: false, code: 'PROFIT_METRICS_UNAVAILABLE', error: s, reason: 'METRICS_AUTH' },
+      { ok: false, code: 'PROFIT_METRICS_UNAVAILABLE', error: `${PROFIT_503_ERRORS.PROFIT_METRICS_UNAVAILABLE} ${s}` },
+      { ok: false, code: 'PROFIT_DB_UNAVAILABLE', error: upstream.message, reason: 'DB_CONNECT' },
+      { ok: false, code: 'PROFIT_DB_UNAVAILABLE', error: PROFIT_503_ERRORS.PROFIT_DB_UNAVAILABLE, reason: s },
+      { ok: false, code: 'PROFIT_DB_UNAVAILABLE', error: PROFIT_503_ERRORS.PROFIT_DB_UNAVAILABLE, reason: 'DB_CONNECT', detail: upstream.message },
+      { ok: false, code: 'PROFIT_INTERNAL', error: PROFIT_503_ERRORS.PROFIT_INTERNAL, reason: String(upstream.stack).slice(0, 60) },
+    ];
+    for (const b of bad) assert.equal(validate503Body(b).ok, false, JSON.stringify(b));
+    // build503Body は上流の例外の文を reason に渡されても付けない (列挙に無い) = 固定の本文だけ
+    const built = build503Body('PROFIT_DB_UNAVAILABLE', upstream.message);
+    assert.deepEqual(built, { ok: false, code: 'PROFIT_DB_UNAVAILABLE', error: PROFIT_503_ERRORS.PROFIT_DB_UNAVAILABLE });
+    assert.ok(!JSON.stringify(built).includes(s));
+    assert.deepEqual(validate503Body(built).errors, []);
+  }
+  assert.deepEqual(build503Body('NOT_A_CODE', 'x'), { ok: false, code: 'PROFIT_INTERNAL', error: PROFIT_503_ERRORS.PROFIT_INTERNAL });
+});
+await t('503 の契約を破った本文を拒む (知らない code・rows・Render の本文・列挙に無い reason・別の code の reason・ok が true・文の違い)', async () => {
+  const E = PROFIT_503_ERRORS;
+  const bad = [{ ok: false, code: 'PROFIT_UNKNOWN', error: 'x' }, { ok: false, code: 'PROFIT_BUSY', error: E.PROFIT_BUSY, rows: [] },
+    { ok: false, code: 'PROFIT_METRICS_UNAVAILABLE', error: E.PROFIT_METRICS_UNAVAILABLE, upstream: { message: 'invalid key' } },
+    { ok: false, code: 'PROFIT_BUSY', error: E.PROFIT_BUSY, reason: 'busy' }, { ok: false, code: 'PROFIT_BUSY', error: E.PROFIT_BUSY, reason: 'METRICS_AUTH' },
+    { ok: false, code: 'PROFIT_ROUTE_DISABLED', error: E.PROFIT_ROUTE_DISABLED, reason: 'LOCK_NOT_AVAILABLE' },
+    { ok: true, code: 'PROFIT_BUSY', error: E.PROFIT_BUSY }, { ok: false, code: 'PROFIT_BUSY' }, { ok: false, code: 'PROFIT_BUSY', error: 'x' },
+    { ok: false, code: 'PROFIT_BUSY', error: `${E.PROFIT_BUSY} ` }, { ok: false, code: 'PROFIT_BUSY', error: E.PROFIT_BUSY, total: {} }, null, 'x', [], { ok: false, code: 'toString' }];
   for (const b of bad) assert.equal(validate503Body(b).ok, false, JSON.stringify(b));
 });
-await t('今の router の 503 (PROFIT_ROUTE_DISABLED) も同じ形・DB に接続しない (封じ込めのまま)', async () => {
+await t('全部の失敗の経路 (M2) が 503 の code と reason の列挙に対応している・どの code も少なくとも 1 つの経路がある', async () => {
+  for (const f of FAILURE_PATHS) {
+    assert.ok(PROFIT_503_CODES.includes(f.code), f.path);
+    if (f.reason == null) { assert.deepEqual([...PROFIT_503_REASONS[f.code]], [], f.path); continue; }
+    for (const r of f.reason.split(' / ')) {
+      const allowed = PROFIT_503_REASONS[f.code];
+      if (r.endsWith('*')) assert.ok(allowed.some((a) => a.startsWith(r.slice(0, -1))), `${f.path}: ${r}`);
+      else assert.ok(allowed.includes(r), `${f.path}: ${r}`);
+    }
+  }
+  for (const c of PROFIT_503_CODES) assert.ok(FAILURE_PATHS.some((f) => f.code === c), `経路の無い code: ${c}`);
+  // 名指しの経路 (Codex R1 M2)
+  const need = ['DB の接続の失敗', 'BEGIN', 'SET LOCAL', '設定の読み返し', 'COMMIT の失敗', '結果が分からない', '予期しない DB の例外', '400'];
+  for (const w of need) assert.ok(FAILURE_PATHS.some((f) => f.path.includes(w)), w);
+  assert.ok(METRICS_REASONS.includes('METRICS_HTTP'));   // Render の 400 → PROFIT_METRICS_UNAVAILABLE + METRICS_HTTP
+  assert.equal(MAX_MONTHS, 13);
+});
+await t('metrics の理由の一覧 = PR 2 (#1600) の render-metrics.mjs の REASONS (両方の PR がそろったときだけ比べる)', async () => {
+  const p = new URL('../apps/company-db/profit/render-metrics.mjs', import.meta.url);
+  if (!fs.existsSync(p)) { console.log('      (render-metrics.mjs がまだ無い = PR 2 のマージの後に比べる)'); return; }
+  const { REASONS } = await import(p.href);
+  assert.deepEqual([...METRICS_REASONS], [...REASONS]);
+});
+await t('今の router の 503 (PROFIT_ROUTE_DISABLED) も同じ形 (固定の文と完全に一致)・DB に接続しない (封じ込めのまま)', async () => {
   process.env.MIRROR_SYNC_KEY = 'k';
   process.env.COMPANY_DB_URL = 'pglite://test';
   let created = 0;
@@ -260,6 +377,8 @@ await t('今の router の 503 (PROFIT_ROUTE_DISABLED) も同じ形・DB に接�
       assert.equal(res.status, 503);
       assert.equal(body.code, 'PROFIT_ROUTE_DISABLED');
       assert.deepEqual(validate503Body(body).errors, []);
+      // 🚨 no-store は今の router に付いていない = この契約の「router に触れる PR (遅くとも PR 6) の必須の条件」。ここでは今の事実だけを記録する
+      assert.notEqual(res.headers.get('cache-control'), REQUIRED_HEADERS['cache-control'], 'router に no-store が付いた = 文書の「PR 6 で付ける」を直す');
     }
   } finally { await new Promise((resolve) => server.close(resolve)); }
   assert.equal(created, 0);
@@ -273,13 +392,47 @@ await t('monthsOf: 月の境・年の境・1 日・うるう年', async () => {
   assert.deepEqual(monthsOf('2028-02-10', '2028-02-29'), [{ month_start: '2028-02-01', period_from: '2028-02-10', period_to: '2028-02-29' }]);
   assert.equal(monthsOf('2026-01-01', '2026-12-31').length, 12);
 });
+await t('形の合う実在しない時刻・日付・壊れた入力でも validator は例外を投げず {ok:false} (Low)', async () => {
+  const cases = [
+    (x) => { x.calculated_at = '2026-99-99T99:99:99.999Z'; x.master_as_of = x.calculated_at; },
+    (x) => { x.from = '2026-02-30'; },
+    (x) => { x.months[0].calculated_at = '2026-13-40T25:61:61.000Z'; },
+    (x) => { x.total = null; }, (x) => { x.months = [null, 1, 'x']; }, (x) => { x.total.master_note_counts = null; },
+  ];
+  for (const f of cases) { const x = clone(totalsExp); f(x); let r; assert.doesNotThrow(() => { r = validateTotalsResponse(x); }); assert.equal(r.ok, false); }
+  for (const f of [(x) => { x.rows[0].calculated_at = '2026-99-99T99:99:99.999Z'; }, (x) => { x.rows = [null, 7]; }, (x) => { x.rows[0].listing_id = '1x'; }, (x) => { x.rows[0].composition_audit_since = '9999-99-99T99:99:99.999Z'; }]) {
+    const x = clone(dailyExp); f(x); let r; assert.doesNotThrow(() => { r = validateDailyResponse(x); }); assert.equal(r.ok, false);
+  }
+  for (const b of [undefined, null, 1, 'x', [], { ok: false, code: 'PROFIT_BUSY', error: { toString: () => { throw new Error('x'); } } }]) {
+    let r; assert.doesNotThrow(() => { r = validateTotalsResponse(b); }); assert.equal(r.ok, false);
+    assert.doesNotThrow(() => { r = validateDailyResponse(b); }); assert.equal(r.ok, false);
+    assert.doesNotThrow(() => { r = validate503Body(b); }); assert.equal(r.ok, false);
+  }
+});
+await t(`触れる暦月は ${MAX_MONTHS} か月まで: 14 か月の応答は validator が拒む (受け口の 400 と 2 重)・13 か月はその理由では拒まない`, async () => {
+  const shift = (from, to) => {
+    const x = clone(dailyExp); x.from = from; x.to = to; x.rows = [];
+    x.months = monthsOf(from, to).map((m) => ({ ...m, finance_status: 'missing', has_finance_rows: false, finance_month_settled: false,
+      finance_coverage_generation: null, finance_source_revision: null, calculation_version: x.calculation_version, calculated_at: x.calculated_at }));
+    return x;
+  };
+  assert.deepEqual(validateDailyResponse(shift('2025-08-31', '2026-08-01')).errors, []);   // 13 か月 (8 月の端から端)
+  const r = validateDailyResponse(shift('2025-08-31', '2026-09-01'));
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.includes('上限 13 か月')), r.errors.join(' / '));
+});
 await t('文書 (docs/contracts) の付録の表 = 契約の部品の分類 (列・型・規則 / null) と同じ・503 の code の表も同じ', async () => {
   const doc = fs.readFileSync(new URL('../docs/contracts/company_db_amazon_profit_response.contract.md', import.meta.url), 'utf8');
   const section = (h) => { const s = doc.indexOf(h); assert.ok(s >= 0, h); const e = doc.indexOf('\n## ', s + 1); return doc.slice(s, e < 0 ? undefined : e); };
   const rows = (text) => [...text.matchAll(/^\| `([a-z_]+)` \| ([^|]+) \| ([^|]+) \|/gm)].map((m) => [m[1], m[2].trim(), m[3].trim()]);
   assert.deepEqual(rows(section('## 5. 付録 A')), TOTALS_COLUMNS.map((c) => [c.name, c.type, `\`${c.rule}\``]));
-  assert.deepEqual(rows(section('## 6. 付録 B')).map((r) => [r[0], r[1]]), DAILY_COLUMNS.map((c) => [c.name, c.type]));
-  assert.deepEqual([...section('## 4. 503').matchAll(/^\| `(PROFIT_[A-Z_]+)` \|/gm)].map((m) => m[1]), [...PROFIT_503_CODES]);
+  assert.deepEqual(rows(section('## 6. 付録 B')).map((r) => [r[0], r[1], r[2]]), DAILY_COLUMNS.map((c) => [c.name, c.type, `\`${c.nul}\``]));
+  const s503 = section('## 4. 503');
+  assert.deepEqual([...s503.matchAll(/^\| `(PROFIT_[A-Z_]+)` \| (.+?) \|/gm)].map((m) => [m[1], m[2]]), PROFIT_503_CODES.map((c) => [c, PROFIT_503_ERRORS[c]]));
+  for (const f of FAILURE_PATHS) assert.ok(section('## 4b.').includes(f.path), f.path);
+  // no-store は「PR 6 で付ける」(今の 503 には付いていない = 事実と違うことを書かない・Low)
+  assert.match(doc, /no-store[^\n]*PR 6/);
+  assert.doesNotMatch(doc, /全部の応答 \(200 も 503 も\) に `Cache-Control: no-store`。/);
 });
 await t('fixture に秘密らしい文字が無い (鍵・接続の文字列・Bearer)', async () => {
   for (const f of fs.readdirSync(FIX)) {

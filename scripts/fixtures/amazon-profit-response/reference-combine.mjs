@@ -8,7 +8,7 @@
  *   - bigint は BigInt で足す (JS の Number に入れない)
  *   - calculated_at は要求の 1 つの値 (月ごとの計算の値は捨てる・R5 Low)
  */
-import { TOTALS_COLUMNS, TOTALS_REASONS, AD_STATUS_RANK, MASTER_NOTE_KEYS, MONTH_KEYS, CONTRACT_VERSION, MASTER_BASIS, monthsOf } from '../../../apps/company-db/profit/response-contract.mjs';
+import { TOTALS_COLUMNS, TOTALS_REASONS, AD_STATUS_RANK, MASTER_NOTE_KEYS, MONTH_KEYS, CONTRACT_VERSION, MASTER_BASIS, monthsOf, build503Body } from '../../../apps/company-db/profit/response-contract.mjs';
 
 const DEC_RE = /^(-?)(\d+)(?:\.(\d+))?$/;
 /** numeric の文字 → { n: BigInt (10^scale 倍), scale } */
@@ -42,7 +42,7 @@ export function round2({ n, scale }) {
   return `${neg && a !== 0n ? '-' : ''}${s.slice(0, -2)}.${s.slice(-2)}`;
 }
 
-const versionMismatch = () => ({ status: 503, body: { ok: false, code: 'PROFIT_VERSION_MISMATCH', error: '月で calculation_version / master_basis が違うので計算できません。' } });
+const versionMismatch = (reason) => ({ status: 503, body: build503Body('PROFIT_VERSION_MISMATCH', reason) });
 
 function checkMonthsInput(input) {
   const { request, months } = input;
@@ -62,7 +62,8 @@ export function combineTotals(input) {
   checkMonthsInput(input);
   const ms = input.months, rows = ms.map((m) => m.totals);
   const versions = new Set([...ms.map((m) => m.meta.calculation_version), ...rows.map((r) => r.calculation_version)]);
-  if (versions.size !== 1 || rows.some((r) => r.master_basis !== MASTER_BASIS)) return versionMismatch();
+  if (versions.size !== 1) return versionMismatch('CALCULATION_VERSION');
+  if (rows.some((r) => r.master_basis !== MASTER_BASIS)) return versionMismatch('MASTER_BASIS');
   const [version] = versions;
   const total = {};
   for (const c of TOTALS_COLUMNS) {
@@ -97,7 +98,8 @@ export function combineDaily(input) {
   checkMonthsInput(input);
   const ms = input.months;
   const versions = new Set([...ms.map((m) => m.meta.calculation_version), ...ms.flatMap((m) => m.rows.map((r) => r.calculation_version))]);
-  if (versions.size !== 1 || ms.some((m) => m.rows.some((r) => r.master_basis !== MASTER_BASIS))) return versionMismatch();
+  if (versions.size !== 1) return versionMismatch('CALCULATION_VERSION');
+  if (ms.some((m) => m.rows.some((r) => r.master_basis !== MASTER_BASIS))) return versionMismatch('MASTER_BASIS');
   const [version] = versions;
   const rows = ms.flatMap((m) => m.rows.map((r) => ({ ...r, calculated_at: input.request.calculated_at })));
   return { status: 200, body: { ...top(input, 'daily', version), rows, months: monthsOut(input, version) } };

@@ -17,7 +17,7 @@
       "scope_key": "jp",
       "economic_date_jst": "2026-07-30",
       "listing_id": "9007199254740993",
-      "seller_sku_norm": "AB-001",
+      "seller_sku_norm": null,
       "listing_resolution": "resolved",
       "listing_code": "AB-001",
       "received_listing_ids": [
@@ -66,13 +66,13 @@
       "source_lines": 0,
       "order_rows": 0,
       "day_finance_status": "complete",
-      "refund_units_status": "no_refund",
+      "refund_units_status": "estimated_monthly_unit_price",
       "refund_incomplete_child_count": 0,
       "refund_unestimated_jpy": "0",
       "component_unit_cost_jpy": "400",
       "cogs_jpy": "800",
-      "cost_basis": "sku_cost",
-      "composition_basis": "current",
+      "cost_basis": "sku_costs",
+      "composition_basis": "pre_audit_unverifiable",
       "missing_cost_sku_ids": [],
       "cost_sku_cost_ids": [
         "77"
@@ -96,8 +96,8 @@
       "master_notes": [
         "pre_audit_unverifiable"
       ],
-      "composition_hash": "c0ffee",
-      "cost_input_hash": "beef",
+      "composition_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "cost_input_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "calculation_version": "amazon_profit_v1",
       "observed_generation": "3",
       "composition_audit_since": "2026-09-30T15:00:00.000Z",
@@ -162,10 +162,10 @@
       "refund_units_status": "no_refund",
       "refund_incomplete_child_count": 0,
       "refund_unestimated_jpy": "0",
-      "component_unit_cost_jpy": "0",
+      "component_unit_cost_jpy": null,
       "cogs_jpy": null,
-      "cost_basis": null,
-      "composition_basis": null,
+      "cost_basis": "missing",
+      "composition_basis": "listing_unresolved",
       "missing_cost_sku_ids": [],
       "cost_sku_cost_ids": [],
       "cost_observed_ids": [],
@@ -182,12 +182,10 @@
       "contribution_after_ad_assuming_incomplete_zero_incl": "700.00",
       "contribution_after_ad_assuming_incomplete_zero_excl": "636.36",
       "profit_incomplete_reasons": [
-        "listing_unresolved",
-        "composition_missing"
+        "listing_unresolved"
       ],
       "assumed_zero_reasons": [
-        "listing_unresolved",
-        "composition_missing"
+        "listing_unresolved"
       ],
       "master_basis": "current",
       "master_notes": [],
@@ -207,7 +205,7 @@
       "scope_key": "jp",
       "economic_date_jst": "2026-07-31",
       "listing_id": "15",
-      "seller_sku_norm": "AB-002",
+      "seller_sku_norm": null,
       "listing_resolution": "resolved",
       "listing_code": "AB-002",
       "received_listing_ids": [],
@@ -255,15 +253,17 @@
       "order_rows": 0,
       "day_finance_status": "complete",
       "refund_units_status": "estimated_partial_month_unit_price",
-      "refund_incomplete_child_count": 0,
+      "refund_incomplete_child_count": 1,
       "refund_unestimated_jpy": "0",
-      "component_unit_cost_jpy": "0",
+      "component_unit_cost_jpy": "500",
       "cogs_jpy": "0",
-      "cost_basis": null,
-      "composition_basis": null,
+      "cost_basis": "observed",
+      "composition_basis": "current_no_recorded_change",
       "missing_cost_sku_ids": [],
       "cost_sku_cost_ids": [],
-      "cost_observed_ids": [],
+      "cost_observed_ids": [
+        "5"
+      ],
       "ad_status": "verified_legacy",
       "ad_cost": "0.00",
       "ad_rows": 0,
@@ -282,12 +282,12 @@
       "assumed_zero_reasons": [],
       "master_basis": "current",
       "master_notes": [],
-      "composition_hash": null,
-      "cost_input_hash": null,
+      "composition_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "cost_input_hash": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
       "calculation_version": "amazon_profit_v1",
       "observed_generation": "0",
       "composition_audit_since": "2026-09-30T15:00:00.000Z",
-      "composition_audit_through": null,
+      "composition_audit_through": "2026-07-01T03:00:00.000Z",
       "finance_coverage_generation": "12",
       "finance_source_revision": "345",
       "calculated_at": "2026-10-03T03:00:00.123Z"
