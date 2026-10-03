@@ -11016,15 +11016,15 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "0a4bf459be77fd7714b35b66de3d9d39d33ca0ea0837a3bbaf7823c926172a6b",
+  "sha256": "bbe6261947772191b50d77367e30996185b095169da2948f323ef54f01a0d05d",
   "body": {
    "ok": true,
    "health": {
     "cutoff": "2026-09-25",
-    "totalSales30": 841250,
-    "unresolvedSales30": 42000,
-    "unresolvedRate": 0.049925705794948,
-    "level": "notice"
+    "totalSales30": 922918,
+    "unresolvedSales30": 54142,
+    "unresolvedRate": 0.058663933307184384,
+    "level": "warn"
    }
   }
  },
@@ -11032,7 +11032,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "95fb0fe686fefbd93e9caec154a6d6edf5066dc47a7b69fb3d590bd416013a2c",
+  "sha256": "717f5388d30acae8b1f40f5360d5ba35d31f4833e61ad0b4a9b788592ec6d2c4",
   "body": {
    "ok": true,
    "supplierName": "S01",
@@ -11065,9 +11065,9 @@
      "ne_code": "ne-a",
      "product_name": "商品A",
      "pieces": 128,
-     "sales": 125260,
+     "sales": 134076,
      "prevPieces": 125,
-     "prevSales": 125510,
+     "prevSales": 134626,
      "avgPerDay": 18.29,
      "lastSold": "2026-09-25",
      "listings": [
@@ -11079,7 +11079,7 @@
        "is_fba": true,
        "sold": 68,
        "pieces": 68,
-       "sales": 68000
+       "sales": 74800
       },
       {
        "mall": "amazon",
@@ -11089,7 +11089,7 @@
        "is_fba": true,
        "sold": 14,
        "pieces": 28,
-       "sales": 20160
+       "sales": 22176
       },
       {
        "mall": "rakuten",
@@ -11138,9 +11138,9 @@
      "ne_code": "ne-b",
      "product_name": "商品B",
      "pieces": 43,
-     "sales": 39240,
+     "sales": 44495,
      "prevPieces": 45,
-     "prevSales": 41340,
+     "prevSales": 46915,
      "avgPerDay": 6.14,
      "lastSold": "2026-09-25",
      "listings": [
@@ -11152,7 +11152,7 @@
        "is_fba": false,
        "sold": 32,
        "pieces": 32,
-       "sales": 25600
+       "sales": 30855
       },
       {
        "mall": "yahoo",
@@ -11183,7 +11183,7 @@
      "ne_code": "ne-d",
      "product_name": "商品D",
      "pieces": 7,
-     "sales": 3500,
+     "sales": 3850,
      "prevPieces": -1,
      "prevSales": 0,
      "avgPerDay": 1,
@@ -11197,7 +11197,7 @@
        "is_fba": true,
        "sold": 7,
        "pieces": 7,
-       "sales": 3500
+       "sales": 3850
       }
      ],
      "sokuho7": 0,
@@ -11209,9 +11209,9 @@
     "productCount": 3,
     "soldProductCount": 3,
     "pieces": 178,
-    "sales": 168000,
+    "sales": 182421,
     "prevPieces": 169,
-    "prevSales": 166850,
+    "prevSales": 181541,
     "sokuho7": 60,
     "sokuho30": 260
    }
@@ -11221,7 +11221,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "5bcac317fb7c281d973f30ce67aee2472d29c95686fc5df4d387ce1abb061386",
+  "sha256": "20eeb1a1e470d51edd78908ac3922e14bc0dbac131d40f0e3334f1d6476f03ea",
   "body": {
    "ok": true,
    "supplierName": "S01",
@@ -11254,9 +11254,9 @@
      "ne_code": "ne-a",
      "product_name": "商品A",
      "pieces": 543,
-     "sales": 541650,
+     "sales": 580677,
      "prevPieces": 542,
-     "prevSales": 541650,
+     "prevSales": 580677.2,
      "avgPerDay": 18.1,
      "lastSold": "2026-09-25",
      "listings": [
@@ -11268,7 +11268,7 @@
        "is_fba": true,
        "sold": 297,
        "pieces": 297,
-       "sales": 300000
+       "sales": 330242
       },
       {
        "mall": "amazon",
@@ -11278,7 +11278,7 @@
        "is_fba": true,
        "sold": 58,
        "pieces": 116,
-       "sales": 86400
+       "sales": 95185
       },
       {
        "mall": "rakuten",
@@ -11327,9 +11327,9 @@
      "ne_code": "ne-b",
      "product_name": "商品B",
      "pieces": 193,
-     "sales": 176100,
+     "sales": 199892,
      "prevPieces": 192,
-     "prevSales": 176100,
+     "prevSales": 199892,
      "avgPerDay": 6.43,
      "lastSold": "2026-09-25",
      "listings": [
@@ -11341,7 +11341,7 @@
        "is_fba": false,
        "sold": 148,
        "pieces": 148,
-       "sales": 120000
+       "sales": 143792
       },
       {
        "mall": "yahoo",
@@ -11372,9 +11372,9 @@
      "ne_code": "ne-d",
      "product_name": "商品D",
      "pieces": 16,
-     "sales": 8500,
+     "sales": 9350,
      "prevPieces": 12,
-     "prevSales": 6500,
+     "prevSales": 7392,
      "avgPerDay": 0.53,
      "lastSold": "2026-09-23",
      "listings": [
@@ -11386,7 +11386,7 @@
        "is_fba": true,
        "sold": 16,
        "pieces": 16,
-       "sales": 8500
+       "sales": 9350
       }
      ],
      "sokuho7": 0,
@@ -11398,9 +11398,9 @@
     "productCount": 3,
     "soldProductCount": 3,
     "pieces": 752,
-    "sales": 726250,
+    "sales": 789919,
     "prevPieces": 746,
-    "prevSales": 724250,
+    "prevSales": 787961.2,
     "sokuho7": 60,
     "sokuho30": 260
    }
@@ -11410,7 +11410,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "8400e8f77cac39591958b5ab05fe743543ecc5373353662a2b56d22de721cef1",
+  "sha256": "1b1f16266b491e822f23ccbbecc8a42c7af5c6ad311d4a5660352c301724ec8b",
   "body": {
    "ok": true,
    "supplierName": "S01",
@@ -11443,9 +11443,9 @@
      "ne_code": "ne-a",
      "product_name": "商品A",
      "pieces": 1614,
-     "sales": 1610800,
+     "sales": 1727882,
      "prevPieces": 1236,
-     "prevSales": 1159200,
+     "prevSales": 1276281.6,
      "avgPerDay": 17.93,
      "lastSold": "2026-09-25",
      "listings": [
@@ -11457,7 +11457,7 @@
        "is_fba": true,
        "sold": 892,
        "pieces": 892,
-       "sales": 900000
+       "sales": 990726
       },
       {
        "mall": "amazon",
@@ -11467,7 +11467,7 @@
        "is_fba": true,
        "sold": 172,
        "pieces": 344,
-       "sales": 259200
+       "sales": 285556
       },
       {
        "mall": "rakuten",
@@ -11516,9 +11516,9 @@
      "ne_code": "ne-b",
      "product_name": "商品B",
      "pieces": 573,
-     "sales": 523240,
+     "sales": 594616,
      "prevPieces": 442,
-     "prevSales": 360000,
+     "prevSales": 431376,
      "avgPerDay": 6.37,
      "lastSold": "2026-09-25",
      "listings": [
@@ -11530,7 +11530,7 @@
        "is_fba": false,
        "sold": 442,
        "pieces": 442,
-       "sales": 360000
+       "sales": 431376
       },
       {
        "mall": "yahoo",
@@ -11561,9 +11561,9 @@
      "ne_code": "ne-d",
      "product_name": "商品D",
      "pieces": 45,
-     "sales": 23500,
+     "sales": 26092,
      "prevPieces": 41,
-     "prevSales": 21500,
+     "prevSales": 23892,
      "avgPerDay": 0.5,
      "lastSold": "2026-09-23",
      "listings": [
@@ -11575,7 +11575,7 @@
        "is_fba": true,
        "sold": 45,
        "pieces": 45,
-       "sales": 23500
+       "sales": 26092
       }
      ],
      "sokuho7": 0,
@@ -11587,9 +11587,9 @@
     "productCount": 3,
     "soldProductCount": 3,
     "pieces": 2232,
-    "sales": 2157540,
+    "sales": 2348590,
     "prevPieces": 1719,
-    "prevSales": 1540700,
+    "prevSales": 1731549.6,
     "sokuho7": 60,
     "sokuho30": 260
    }
@@ -11599,7 +11599,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "219f1c2387a8f5e0570f172a79c9e96b4b91efd6176144a659af95ca0603ccdf",
+  "sha256": "3fffc2b33afab682865bd47f1d0360b33c841b0566a6416668fd0d900f737242",
   "body": {
    "ok": true,
    "supplierName": "S02",
@@ -11632,9 +11632,9 @@
      "ne_code": "ne-c",
      "product_name": "商品C",
      "pieces": 16,
-     "sales": 17840,
+     "sales": 19184,
      "prevPieces": 14,
-     "prevSales": 15640,
+     "prevSales": 16984,
      "avgPerDay": 2.29,
      "lastSold": "2026-09-25",
      "listings": [
@@ -11646,7 +11646,7 @@
        "is_fba": true,
        "sold": 14,
        "pieces": 14,
-       "sales": 13440
+       "sales": 14784
       },
       {
        "mall": "linegift",
@@ -11668,9 +11668,9 @@
     "productCount": 1,
     "soldProductCount": 1,
     "pieces": 16,
-    "sales": 17840,
+    "sales": 19184,
     "prevPieces": 14,
-    "prevSales": 15640,
+    "prevSales": 16984,
     "sokuho7": 0,
     "sokuho30": 0
    }
@@ -11680,7 +11680,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "34c3f0f83fed1e7eb072f501cdaf9eb47627376b48da7a295d063e818bd9e1fa",
+  "sha256": "9b0d94f23645ea4bbffd0486652aff600bbb8a8c244523eb767b322ad819ea51",
   "body": {
    "ok": true,
    "supplierName": "S02",
@@ -11713,9 +11713,9 @@
      "ne_code": "ne-c",
      "product_name": "商品C",
      "pieces": 65,
-     "sales": 73000,
+     "sales": 78857,
      "prevPieces": 65,
-     "prevSales": 75200,
+     "prevSales": 81056.8,
      "avgPerDay": 2.17,
      "lastSold": "2026-09-25",
      "listings": [
@@ -11727,7 +11727,7 @@
        "is_fba": true,
        "sold": 58,
        "pieces": 58,
-       "sales": 57600
+       "sales": 63457
       },
       {
        "mall": "linegift",
@@ -11749,9 +11749,9 @@
     "productCount": 1,
     "soldProductCount": 1,
     "pieces": 65,
-    "sales": 73000,
+    "sales": 78857,
     "prevPieces": 65,
-    "prevSales": 75200,
+    "prevSales": 81056.8,
     "sokuho7": 0,
     "sokuho30": 0
    }
@@ -11761,7 +11761,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "307588270ef51502ee151a7665cf07b9922362fbd1b37ea4bb5974d4dd92116b",
+  "sha256": "1ebe85b772ea714654b9bca09fc5238dded99c902ad1227436180add5eb6ff06",
   "body": {
    "ok": true,
    "supplierName": "S02",
@@ -11794,9 +11794,9 @@
      "ne_code": "ne-c",
      "product_name": "商品C",
      "pieces": 194,
-     "sales": 221200,
+     "sales": 238770,
      "prevPieces": 172,
-     "prevSales": 172800,
+     "prevSales": 190370.4,
      "avgPerDay": 2.16,
      "lastSold": "2026-09-25",
      "listings": [
@@ -11808,7 +11808,7 @@
        "is_fba": true,
        "sold": 172,
        "pieces": 172,
-       "sales": 172800
+       "sales": 190370
       },
       {
        "mall": "linegift",
@@ -11830,9 +11830,9 @@
     "productCount": 1,
     "soldProductCount": 1,
     "pieces": 194,
-    "sales": 221200,
+    "sales": 238770,
     "prevPieces": 172,
-    "prevSales": 172800,
+    "prevSales": 190370.4,
     "sokuho7": 0,
     "sokuho30": 0
    }
@@ -11842,7 +11842,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "f6619e72edddab70f6ba534e80a1c79584a977749600b2ff5603e051ed7d7d0c",
+  "sha256": "120102ac3a675e3eea727b67f0613dc6faa5f494338437d6886241493e5485a3",
   "body": {
    "ok": true,
    "supplierName": "S01",
@@ -11875,9 +11875,9 @@
      "ne_code": "ne-a",
      "product_name": "商品A",
      "pieces": 5321,
-     "sales": 5088400,
+     "sales": 5556726,
      "prevPieces": 149,
-     "prevSales": 139680,
+     "prevSales": 153890,
      "avgPerDay": 14.78,
      "lastSold": "2026-09-25",
      "listings": [
@@ -11889,7 +11889,7 @@
        "is_fba": true,
        "sold": 3567,
        "pieces": 3567,
-       "sales": 3600000
+       "sales": 3962904
       },
       {
        "mall": "amazon",
@@ -11899,7 +11899,7 @@
        "is_fba": true,
        "sold": 688,
        "pieces": 1376,
-       "sales": 1036800
+       "sales": 1142222
       },
       {
        "mall": "rakuten",
@@ -11948,9 +11948,9 @@
      "ne_code": "ne-b",
      "product_name": "商品B",
      "pieces": 1899,
-     "sales": 1603240,
+     "sales": 1888744,
      "prevPieces": 52,
-     "prevSales": 42400,
+     "prevSales": 50875,
      "avgPerDay": 5.28,
      "lastSold": "2026-09-25",
      "listings": [
@@ -11962,7 +11962,7 @@
        "is_fba": false,
        "sold": 1768,
        "pieces": 1768,
-       "sales": 1440000
+       "sales": 1725504
       },
       {
        "mall": "yahoo",
@@ -11993,9 +11993,9 @@
      "ne_code": "ne-d",
      "product_name": "商品D",
      "pieces": 172,
-     "sales": 90000,
+     "sales": 99726,
      "prevPieces": 6,
-     "prevSales": 3500,
+     "prevSales": 3850,
      "avgPerDay": 0.48,
      "lastSold": "2026-09-23",
      "listings": [
@@ -12007,7 +12007,7 @@
        "is_fba": true,
        "sold": 172,
        "pieces": 172,
-       "sales": 90000
+       "sales": 99726
       }
      ],
      "sokuho7": 0,
@@ -12019,9 +12019,9 @@
     "productCount": 3,
     "soldProductCount": 3,
     "pieces": 7392,
-    "sales": 6781640,
+    "sales": 7545196,
     "prevPieces": 207,
-    "prevSales": 185580,
+    "prevSales": 208615,
     "sokuho7": 60,
     "sokuho30": 260
    }
@@ -12031,15 +12031,15 @@
   "status": 200,
   "content_type": "text/csv; charset=utf-8",
   "content_disposition": "attachment; filename=\"supplier_sales_S01_2026-08-27_2026-09-25.csv\"",
-  "sha256": "c70ed40916bf4019211006bf48b4381fb95bb3762c1341776db501e9452f255a",
-  "body": "﻿種別,モール,商品コード/出品ID,名称,FBA,確定販売件数,確定ピース数,確定売上(税込),速報7日販売数(注文ベース),速報30日販売数(注文ベース),最終販売日\r\n商品,合計,ne-a,商品A,,,543,541650,60,260,2026-09-25\r\n出品,Amazon,pr_alpha,アルファ商品,FBA,297,297,300000,,,\r\n出品,Amazon,pr_gamma,,FBA,58,116,86400,,,\r\n出品,楽天,rk-a,x,,90,90,99000,,,\r\n出品,au PAY,au-setx,x,,15,30,41250,,,\r\n出品,Qoo10,q-a,x,,10,10,15000,,,\r\n商品,合計,ne-b,商品B,,,193,176100,0,0,2026-09-25\r\n出品,Amazon,pr_beta,,FBM,148,148,120000,,,\r\n出品,Yahoo!,y-b,x,,30,30,39600,,,\r\n出品,au PAY,au-setx,x,,15,15,16500,,,\r\n商品,合計,ne-d,商品D,,,16,8500,0,0,2026-09-23\r\n出品,Amazon,pr_delta,デルタ,FBA,16,16,8500,,,\r\n"
+  "sha256": "425970eb71157f81947328d35ee7c6622233b64fc2529dbd649d105662baedeb",
+  "body": "﻿種別,モール,商品コード/出品ID,名称,FBA,確定販売件数,確定ピース数,確定売上(税込),速報7日販売数(注文ベース),速報30日販売数(注文ベース),最終販売日\r\n商品,合計,ne-a,商品A,,,543,580677,60,260,2026-09-25\r\n出品,Amazon,pr_alpha,アルファ商品,FBA,297,297,330242,,,\r\n出品,Amazon,pr_gamma,,FBA,58,116,95185,,,\r\n出品,楽天,rk-a,x,,90,90,99000,,,\r\n出品,au PAY,au-setx,x,,15,30,41250,,,\r\n出品,Qoo10,q-a,x,,10,10,15000,,,\r\n商品,合計,ne-b,商品B,,,193,199892,0,0,2026-09-25\r\n出品,Amazon,pr_beta,,FBM,148,148,143792,,,\r\n出品,Yahoo!,y-b,x,,30,30,39600,,,\r\n出品,au PAY,au-setx,x,,15,15,16500,,,\r\n商品,合計,ne-d,商品D,,,16,9350,0,0,2026-09-23\r\n出品,Amazon,pr_delta,デルタ,FBA,16,16,9350,,,\r\n"
  },
  "supplier.daily.csv": {
   "status": 200,
   "content_type": "text/csv; charset=utf-8",
   "content_disposition": "attachment; filename=\"supplier_daily_S01_2026-08-27_2026-09-25.csv\"",
-  "sha256": "772b0c9b7a6857ec60895726d8829781b99249e8dfbcae059fcb5646161b37e0",
-  "body": "﻿受注日(確定),モール,出品ID,商品コード,商品名,数量(ピース),売上(税込)\r\n2026-09-25,Amazon FBA,pr_alpha,ne-a,商品A,8,8000\r\n2026-09-25,Amazon FBM,pr_beta,ne-b,商品B,3,2400\r\n2026-09-25,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-25,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-25,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-25,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-24,Amazon FBA,pr_alpha,ne-a,商品A,10,10000\r\n2026-09-24,Amazon FBM,pr_beta,ne-b,商品B,4,3200\r\n2026-09-24,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-24,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-23,Amazon FBA,pr_alpha,ne-a,商品A,12,12000\r\n2026-09-23,Amazon FBM,pr_beta,ne-b,商品B,5,4000\r\n2026-09-23,Amazon FBA,pr_delta,ne-d,商品D,3,1500\r\n2026-09-23,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-23,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-23,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-23,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-23,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-22,Amazon FBA,pr_alpha,ne-a,商品A,9,9000\r\n2026-09-22,Amazon FBM,pr_beta,ne-b,商品B,6,4800\r\n2026-09-22,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-22,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-21,Amazon FBA,pr_alpha,ne-a,商品A,11,11000\r\n2026-09-21,Amazon FBM,pr_beta,ne-b,商品B,7,5600\r\n2026-09-21,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-21,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-21,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-21,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-20,Amazon FBA,pr_alpha,ne-a,商品A,8,8000\r\n2026-09-20,Amazon FBM,pr_beta,ne-b,商品B,3,2400\r\n2026-09-20,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-20,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-20,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-19,Amazon FBA,pr_alpha,ne-a,商品A,10,10000\r\n2026-09-19,Amazon FBM,pr_beta,ne-b,商品B,4,3200\r\n2026-09-19,Amazon FBA,pr_delta,ne-d,商品D,4,2000\r\n2026-09-19,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-19,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-19,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-19,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-18,Amazon FBA,pr_alpha,ne-a,商品A,11,12000\r\n2026-09-18,Amazon FBM,pr_beta,ne-b,商品B,5,4000\r\n2026-09-18,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-18,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-17,Amazon FBA,pr_alpha,ne-a,商品A,9,9000\r\n2026-09-17,Amazon FBM,pr_beta,ne-b,商品B,5,4800\r\n2026-09-17,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-17,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-17,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-17,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-17,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-16,Amazon FBA,pr_alpha,ne-a,商品A,11,11000\r\n2026-09-16,Amazon FBM,pr_beta,ne-b,商品B,7,5600\r\n2026-09-16,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-16,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-15,Amazon FBA,pr_alpha,ne-a,商品A,8,8000\r\n2026-09-15,Amazon FBM,pr_beta,ne-b,商品B,3,2400\r\n2026-09-15,Amazon FBM,pr_delta,ne-d,商品D,'-1,0\r\n2026-09-15,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-15,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-15,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-15,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-14,Amazon FBA,pr_alpha,ne-a,商品A,10,10000\r\n2026-09-14,Amazon FBM,pr_beta,ne-b,商品B,4,3200\r\n2026-09-14,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-14,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-14,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-13,Amazon FBA,pr_alpha,ne-a,商品A,12,12000\r\n2026-09-13,Amazon FBM,pr_beta,ne-b,商品B,5,4000\r\n2026-09-13,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-13,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-13,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-13,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-12,Amazon FBA,pr_alpha,ne-a,商品A,9,9000\r\n2026-09-12,Amazon FBM,pr_beta,ne-b,商品B,6,4800\r\n2026-09-12,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-12,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-11,Amazon FBA,pr_alpha,ne-a,商品A,11,11000\r\n2026-09-11,Amazon FBM,pr_beta,ne-b,商品B,7,5600\r\n2026-09-11,Amazon FBA,pr_delta,ne-d,商品D,1,500\r\n2026-09-11,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-11,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-11,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-11,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-11,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-10,Amazon FBA,pr_alpha,ne-a,商品A,8,8000\r\n2026-09-10,Amazon FBM,pr_beta,ne-b,商品B,3,2400\r\n2026-09-10,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-10,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-09,Amazon FBA,pr_alpha,ne-a,商品A,10,10000\r\n2026-09-09,Amazon FBM,pr_beta,ne-b,商品B,4,3200\r\n2026-09-09,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-09,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-09,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-09,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-08,Amazon FBA,pr_alpha,ne-a,商品A,12,12000\r\n2026-09-08,Amazon FBM,pr_beta,ne-b,商品B,5,4000\r\n2026-09-08,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-08,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-08,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-07,Amazon FBA,pr_alpha,ne-a,商品A,8,9000\r\n2026-09-07,Amazon FBM,pr_beta,ne-b,商品B,6,4800\r\n2026-09-07,Amazon FBA,pr_delta,ne-d,商品D,2,1000\r\n2026-09-07,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-07,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-07,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-07,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-06,Amazon FBA,pr_alpha,ne-a,商品A,11,11000\r\n2026-09-06,Amazon FBM,pr_beta,ne-b,商品B,6,5600\r\n2026-09-06,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-06,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-05,Amazon FBA,pr_alpha,ne-a,商品A,8,8000\r\n2026-09-05,Amazon FBM,pr_beta,ne-b,商品B,3,2400\r\n2026-09-05,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-05,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-05,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-05,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-05,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-04,Amazon FBA,pr_alpha,ne-a,商品A,10,10000\r\n2026-09-04,Amazon FBM,pr_beta,ne-b,商品B,4,3200\r\n2026-09-04,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-04,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-03,Amazon FBA,pr_alpha,ne-a,商品A,12,12000\r\n2026-09-03,Amazon FBM,pr_beta,ne-b,商品B,5,4000\r\n2026-09-03,Amazon FBA,pr_delta,ne-d,商品D,3,1500\r\n2026-09-03,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-03,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-03,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-03,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-02,Amazon FBA,pr_alpha,ne-a,商品A,9,9000\r\n2026-09-02,Amazon FBM,pr_beta,ne-b,商品B,6,4800\r\n2026-09-02,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-02,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-02,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-01,Amazon FBA,pr_alpha,ne-a,商品A,11,11000\r\n2026-09-01,Amazon FBM,pr_beta,ne-b,商品B,7,5600\r\n2026-09-01,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-01,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-01,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-01,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-08-31,Amazon FBA,pr_alpha,ne-a,商品A,8,8000\r\n2026-08-31,Amazon FBM,pr_beta,ne-b,商品B,3,2400\r\n2026-08-31,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-08-31,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-08-30,Amazon FBA,pr_alpha,ne-a,商品A,10,10000\r\n2026-08-30,Amazon FBM,pr_beta,ne-b,商品B,4,3200\r\n2026-08-30,Amazon FBA,pr_delta,ne-d,商品D,4,2000\r\n2026-08-30,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-08-30,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-08-30,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-08-30,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-08-30,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-08-29,Amazon FBA,pr_alpha,ne-a,商品A,12,12000\r\n2026-08-29,Amazon FBM,pr_beta,ne-b,商品B,5,4000\r\n2026-08-29,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-08-29,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-08-28,Amazon FBA,pr_alpha,ne-a,商品A,9,9000\r\n2026-08-28,Amazon FBM,pr_beta,ne-b,商品B,6,4800\r\n2026-08-28,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-08-28,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-08-28,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-08-28,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-08-27,Amazon FBA,pr_alpha,ne-a,商品A,10,11000\r\n2026-08-27,Amazon FBM,pr_beta,ne-b,商品B,7,5600\r\n2026-08-27,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-08-27,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-08-27,Yahoo!,y-b,ne-b,商品B,1,1320\r\n"
+  "sha256": "c6f8f6abe319026c988c191fc1279f4f68f892b1c65b63b2cb815c0681d7fc84",
+  "body": "﻿受注日(確定),モール,出品ID,商品コード,商品名,数量(ピース),売上(税込)\r\n2026-09-25,Amazon FBA,pr_alpha,ne-a,商品A,8,8800\r\n2026-09-25,Amazon FBM,pr_beta,ne-b,商品B,3,3025\r\n2026-09-25,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-25,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-25,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-25,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-24,Amazon FBA,pr_alpha,ne-a,商品A,10,11000\r\n2026-09-24,Amazon FBM,pr_beta,ne-b,商品B,4,3905\r\n2026-09-24,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-24,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-23,Amazon FBA,pr_alpha,ne-a,商品A,12,13200\r\n2026-09-23,Amazon FBM,pr_beta,ne-b,商品B,5,4785\r\n2026-09-23,Amazon FBA,pr_delta,ne-d,商品D,3,1650\r\n2026-09-23,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-23,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-23,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-23,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-23,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-22,Amazon FBA,pr_alpha,ne-a,商品A,9,9900\r\n2026-09-22,Amazon FBM,pr_beta,ne-b,商品B,6,5665\r\n2026-09-22,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-22,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-21,Amazon FBA,pr_alpha,ne-a,商品A,11,12100\r\n2026-09-21,Amazon FBM,pr_beta,ne-b,商品B,7,6545\r\n2026-09-21,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-21,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-21,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-21,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-20,Amazon FBA,pr_alpha,ne-a,商品A,8,8800\r\n2026-09-20,Amazon FBM,pr_beta,ne-b,商品B,3,3025\r\n2026-09-20,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-20,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-20,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-19,Amazon FBA,pr_alpha,ne-a,商品A,10,11000\r\n2026-09-19,Amazon FBM,pr_beta,ne-b,商品B,4,3905\r\n2026-09-19,Amazon FBA,pr_delta,ne-d,商品D,4,2200\r\n2026-09-19,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-19,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-19,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-19,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-18,Amazon FBA,pr_alpha,ne-a,商品A,11,13200\r\n2026-09-18,Amazon FBM,pr_beta,ne-b,商品B,5,4785\r\n2026-09-18,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-18,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-17,Amazon FBA,pr_alpha,ne-a,商品A,9,9900\r\n2026-09-17,Amazon FBM,pr_beta,ne-b,商品B,5,5665\r\n2026-09-17,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-17,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-17,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-17,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-17,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-16,Amazon FBA,pr_alpha,ne-a,商品A,11,12100\r\n2026-09-16,Amazon FBM,pr_beta,ne-b,商品B,7,6545\r\n2026-09-16,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-16,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-15,Amazon FBA,pr_alpha,ne-a,商品A,8,8800\r\n2026-09-15,Amazon FBM,pr_beta,ne-b,商品B,3,3025\r\n2026-09-15,Amazon FBM,pr_delta,ne-d,商品D,'-1,0\r\n2026-09-15,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-15,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-15,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-15,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-14,Amazon FBA,pr_alpha,ne-a,商品A,10,11000\r\n2026-09-14,Amazon FBM,pr_beta,ne-b,商品B,4,3905\r\n2026-09-14,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-14,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-14,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-13,Amazon FBA,pr_alpha,ne-a,商品A,12,13200\r\n2026-09-13,Amazon FBM,pr_beta,ne-b,商品B,5,4785\r\n2026-09-13,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-13,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-13,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-13,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-12,Amazon FBA,pr_alpha,ne-a,商品A,9,9900\r\n2026-09-12,Amazon FBM,pr_beta,ne-b,商品B,6,5665\r\n2026-09-12,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-12,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-11,Amazon FBA,pr_alpha,ne-a,商品A,11,12100\r\n2026-09-11,Amazon FBM,pr_beta,ne-b,商品B,7,6545\r\n2026-09-11,Amazon FBA,pr_delta,ne-d,商品D,1,550\r\n2026-09-11,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-11,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-11,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-11,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-11,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-10,Amazon FBA,pr_alpha,ne-a,商品A,8,8800\r\n2026-09-10,Amazon FBM,pr_beta,ne-b,商品B,3,3025\r\n2026-09-10,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-10,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-09,Amazon FBA,pr_alpha,ne-a,商品A,10,11000\r\n2026-09-09,Amazon FBM,pr_beta,ne-b,商品B,4,3905\r\n2026-09-09,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-09,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-09,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-09,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-08,Amazon FBA,pr_alpha,ne-a,商品A,12,13200\r\n2026-09-08,Amazon FBM,pr_beta,ne-b,商品B,5,4785\r\n2026-09-08,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-08,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-08,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-07,Amazon FBA,pr_alpha,ne-a,商品A,8,9900\r\n2026-09-07,Amazon FBM,pr_beta,ne-b,商品B,6,5665\r\n2026-09-07,Amazon FBA,pr_delta,ne-d,商品D,2,1100\r\n2026-09-07,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-07,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-07,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-07,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-06,Amazon FBA,pr_alpha,ne-a,商品A,11,12100\r\n2026-09-06,Amazon FBM,pr_beta,ne-b,商品B,6,6545\r\n2026-09-06,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-06,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-05,Amazon FBA,pr_alpha,ne-a,商品A,8,8800\r\n2026-09-05,Amazon FBM,pr_beta,ne-b,商品B,3,3025\r\n2026-09-05,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-05,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-05,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-05,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-05,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-04,Amazon FBA,pr_alpha,ne-a,商品A,10,11000\r\n2026-09-04,Amazon FBM,pr_beta,ne-b,商品B,4,3905\r\n2026-09-04,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-04,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-03,Amazon FBA,pr_alpha,ne-a,商品A,12,13442\r\n2026-09-03,Amazon FBM,pr_beta,ne-b,商品B,5,4785\r\n2026-09-03,Amazon FBA,pr_delta,ne-d,商品D,3,1650\r\n2026-09-03,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-03,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-03,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-09-03,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-02,Amazon FBA,pr_alpha,ne-a,商品A,9,9900\r\n2026-09-02,Amazon FBM,pr_beta,ne-b,商品B,6,5907\r\n2026-09-02,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-09-02,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-09-02,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-09-01,Amazon FBA,pr_alpha,ne-a,商品A,11,12100\r\n2026-09-01,Amazon FBM,pr_beta,ne-b,商品B,7,6545\r\n2026-09-01,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-09-01,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-09-01,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-09-01,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-08-31,Amazon FBA,pr_alpha,ne-a,商品A,8,8800\r\n2026-08-31,Amazon FBM,pr_beta,ne-b,商品B,3,3025\r\n2026-08-31,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-08-31,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-08-30,Amazon FBA,pr_alpha,ne-a,商品A,10,11000\r\n2026-08-30,Amazon FBM,pr_beta,ne-b,商品B,4,3905\r\n2026-08-30,Amazon FBA,pr_delta,ne-d,商品D,4,2200\r\n2026-08-30,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-08-30,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-08-30,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-08-30,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-08-30,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-08-29,Amazon FBA,pr_alpha,ne-a,商品A,12,13200\r\n2026-08-29,Amazon FBM,pr_beta,ne-b,商品B,5,4785\r\n2026-08-29,楽天,rk-a,ne-a,商品A,4,3300\r\n2026-08-29,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-08-28,Amazon FBA,pr_alpha,ne-a,商品A,9,9900\r\n2026-08-28,Amazon FBM,pr_beta,ne-b,商品B,6,5665\r\n2026-08-28,au PAY,au-setx,ne-a,商品A,2,2750\r\n2026-08-28,au PAY,au-setx,ne-b,商品B,1,1100\r\n2026-08-28,楽天,rk-a,ne-a,商品A,3,3300\r\n2026-08-28,Yahoo!,y-b,ne-b,商品B,1,1320\r\n2026-08-27,Amazon FBA,pr_alpha,ne-a,商品A,10,12100\r\n2026-08-27,Amazon FBM,pr_beta,ne-b,商品B,7,6545\r\n2026-08-27,Qoo10,q-a,ne-a,商品A,1,1500\r\n2026-08-27,楽天,rk-a,ne-a,商品A,2,3300\r\n2026-08-27,Yahoo!,y-b,ne-b,商品B,1,1320\r\n"
  },
  "supplier.confirmedCutoff": {
   "ok": true,
@@ -12075,7 +12075,7 @@
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 8,
-     "sales": 8000
+     "sales": 8800
     },
     {
      "date": "2026-09-25",
@@ -12086,7 +12086,7 @@
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 3,
-     "sales": 2400
+     "sales": 3025
     },
     {
      "date": "2026-09-25",
@@ -12141,7 +12141,7 @@
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 10,
-     "sales": 10000
+     "sales": 11000
     },
     {
      "date": "2026-09-24",
@@ -12152,7 +12152,7 @@
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 4,
-     "sales": 3200
+     "sales": 3905
     },
     {
      "date": "2026-09-24",
@@ -12185,7 +12185,7 @@
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 12,
-     "sales": 12000
+     "sales": 13200
     },
     {
      "date": "2026-09-23",
@@ -12196,7 +12196,7 @@
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 5,
-     "sales": 4000
+     "sales": 4785
     },
     {
      "date": "2026-09-23",
@@ -12207,7 +12207,7 @@
      "ne_code": "ne-d",
      "product_name": "商品D",
      "units": 3,
-     "sales": 1500
+     "sales": 1650
     },
     {
      "date": "2026-09-23",
@@ -12273,7 +12273,7 @@
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 9,
-     "sales": 9000
+     "sales": 9900
     },
     {
      "date": "2026-09-22",
@@ -12284,7 +12284,7 @@
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 6,
-     "sales": 4800
+     "sales": 5665
     },
     {
      "date": "2026-09-22",
@@ -12317,7 +12317,7 @@
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 11,
-     "sales": 11000
+     "sales": 12100
     },
     {
      "date": "2026-09-21",
@@ -12328,7 +12328,7 @@
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 7,
-     "sales": 5600
+     "sales": 6545
     },
     {
      "date": "2026-09-21",
@@ -12383,7 +12383,7 @@
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 8,
-     "sales": 8000
+     "sales": 8800
     },
     {
      "date": "2026-09-20",
@@ -12394,7 +12394,7 @@
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 3,
-     "sales": 2400
+     "sales": 3025
     },
     {
      "date": "2026-09-20",
@@ -12438,7 +12438,7 @@
      "ne_code": "ne-a",
      "product_name": "商品A",
      "units": 10,
-     "sales": 10000
+     "sales": 11000
     },
     {
      "date": "2026-09-19",
@@ -12449,7 +12449,7 @@
      "ne_code": "ne-b",
      "product_name": "商品B",
      "units": 4,
-     "sales": 3200
+     "sales": 3905
     },
     {
      "date": "2026-09-19",
@@ -12460,7 +12460,7 @@
      "ne_code": "ne-d",
      "product_name": "商品D",
      "units": 4,
-     "sales": 2000
+     "sales": 2200
     },
     {
      "date": "2026-09-19",
@@ -12508,7 +12508,7 @@
     }
    ]
   },
-  "sha256": "60e369052645e3d0101086cdbd574720bd720b4ed687571d95644f5979b20c40"
+  "sha256": "dc09e576cdf2396a7d3dd415d57d7ab2c642eede4ffe0cbd66aa7ae305123d97"
  },
  "supplier.buildDailyCsv": {
   "ok": true,
@@ -12922,8 +12922,8 @@
  },
  "unified.view_sql": {
   "ok": true,
-  "value": "CREATE VIEW v_mall_finance_daily_unified AS\n    SELECT\n      date_jst, 'amazon' AS mall,\n      LOWER(TRIM(seller_sku)) AS sku_key,\n      NULL AS ne_code,\n      product_name,\n      CAST(units_net_sold AS INTEGER) AS units_net_sold,\n      COALESCE(sales_principal_jpy,0) + COALESCE(sales_shipping_jpy,0)\n        + COALESCE(sales_giftwrap_jpy,0) + COALESCE(sales_tax_jpy,0) AS sales_gross_jpy_incl,\n      -- 🚨 apps/amazon-dashboard/queries.js の PROFIT_EX_SQL と同じ式 (手数料は決済の額 = 税込 → 1/11 を戻す)。変えるときは両方\n      profit_amount\n        + (COALESCE(commission_jpy,0) + COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) + COALESCE(closing_fee_jpy,0)\n           + COALESCE(shipping_chargeback_jpy,0) + COALESCE(giftwrap_chargeback_jpy,0)) * 0.10 / 1.10\n        + COALESCE(promotion_tax_jpy,0) AS margin_jpy_for_reporting,\n      'excl_tax' AS margin_basis,\n      NULL AS margin_confidence,\n      cost_status,\n      asin_norm,\n      COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) AS fba_fees_jpy,\n      CASE WHEN COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) > 0 THEN 1 ELSE 0 END AS is_fba,\n      sales_principal_jpy,\n      synced_at\n    FROM mirror_amazon_finance_sku_daily\n    UNION ALL\n    SELECT\n      date_jst, 'rakuten',\n      LOWER(TRIM(rakuten_code)), LOWER(TRIM(ne_code)), product_name,\n      units_net_sold,\n      gross_sales_jpy_incl,\n      variable_margin_jpy_incl,\n      'incl_tax', NULL, cost_status,\n      NULL, NULL, NULL, NULL, synced_at\n    FROM mirror_rakuten_finance_sku_daily\n    UNION ALL\n    SELECT\n      date_jst, 'yahoo',\n      LOWER(TRIM(yahoo_sku_key)), LOWER(TRIM(ne_code)), product_name,\n      units_net_sold,\n      gross_sales_jpy_incl,\n      COALESCE(variable_margin_full_jpy_incl, variable_margin_partial_jpy_incl),\n      'incl_tax', margin_confidence, cost_status,\n      NULL, NULL, NULL, NULL, synced_at\n    FROM mirror_yahoo_finance_sku_daily\n    UNION ALL\n    SELECT\n      date_jst, 'aupay',\n      LOWER(TRIM(aupay_sku_key)), LOWER(TRIM(ne_code)), product_name,\n      units_net_sold,\n      gross_sales_jpy_incl,\n      COALESCE(variable_margin_full_jpy_incl, variable_margin_partial_jpy_incl),\n      'incl_tax', margin_confidence, cost_status,\n      NULL, NULL, NULL, NULL, synced_at\n    FROM mirror_aupay_finance_sku_daily\n    UNION ALL\n    SELECT\n      date_jst, 'qoo10',\n      LOWER(TRIM(sku_code)), LOWER(TRIM(ne_code)), product_name,\n      units_net_sold,\n      customer_paid_jpy_incl,\n      CASE\n        WHEN margin_confidence IN ('full', 'partial_minus_returns') THEN variable_margin_full_jpy_incl\n        ELSE variable_margin_jpy_incl\n      END,\n      'incl_tax', margin_confidence, cost_status,\n      NULL, NULL, NULL, NULL, synced_at\n    FROM mirror_qoo10_finance_sku_daily\n    UNION ALL\n    SELECT\n      date_jst, 'linegift',\n      LOWER(TRIM(sku_code)), LOWER(TRIM(ne_code)), product_name,\n      units_net_sold,\n      gross_sales_jpy_incl,\n      variable_margin_jpy_incl,\n      'incl_tax', margin_confidence, cost_status,\n      NULL, NULL, NULL, NULL, synced_at\n    FROM mirror_linegift_finance_sku_daily",
-  "sha256": "3a5d4d18dfa4a82ed0b4ff59e7569ff94c999fcfde1a923debff0507c6edca15"
+  "value": "CREATE VIEW v_mall_finance_daily_unified AS\n    SELECT\n      date_jst, 'amazon' AS mall,\n      LOWER(TRIM(seller_sku)) AS sku_key,\n      NULL AS ne_code,\n      product_name,\n      CAST(units_net_sold AS INTEGER) AS units_net_sold,\n      (COALESCE(sales_principal_jpy,0) + COALESCE(sales_shipping_jpy,0) + COALESCE(sales_giftwrap_jpy,0) + COALESCE(sales_tax_jpy,0)) AS sales_gross_jpy_incl,\n      -- 🚨 apps/amazon-dashboard/queries.js の PROFIT_EX_SQL と同じ式 (手数料は決済の額 = 税込 → 1/11 を戻す)。変えるときは両方\n      profit_amount\n        + (COALESCE(commission_jpy,0) + COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) + COALESCE(closing_fee_jpy,0)\n           + COALESCE(shipping_chargeback_jpy,0) + COALESCE(giftwrap_chargeback_jpy,0)) * 0.10 / 1.10\n        + COALESCE(promotion_tax_jpy,0) AS margin_jpy_for_reporting,\n      'excl_tax' AS margin_basis,\n      NULL AS margin_confidence,\n      cost_status,\n      asin_norm,\n      COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) AS fba_fees_jpy,\n      CASE WHEN COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) > 0 THEN 1 ELSE 0 END AS is_fba,\n      sales_principal_jpy,\n      synced_at\n    FROM mirror_amazon_finance_sku_daily\n    UNION ALL\n    SELECT\n      date_jst, 'rakuten',\n      LOWER(TRIM(rakuten_code)), LOWER(TRIM(ne_code)), product_name,\n      units_net_sold,\n      gross_sales_jpy_incl,\n      variable_margin_jpy_incl,\n      'incl_tax', NULL, cost_status,\n      NULL, NULL, NULL, NULL, synced_at\n    FROM mirror_rakuten_finance_sku_daily\n    UNION ALL\n    SELECT\n      date_jst, 'yahoo',\n      LOWER(TRIM(yahoo_sku_key)), LOWER(TRIM(ne_code)), product_name,\n      units_net_sold,\n      gross_sales_jpy_incl,\n      COALESCE(variable_margin_full_jpy_incl, variable_margin_partial_jpy_incl),\n      'incl_tax', margin_confidence, cost_status,\n      NULL, NULL, NULL, NULL, synced_at\n    FROM mirror_yahoo_finance_sku_daily\n    UNION ALL\n    SELECT\n      date_jst, 'aupay',\n      LOWER(TRIM(aupay_sku_key)), LOWER(TRIM(ne_code)), product_name,\n      units_net_sold,\n      gross_sales_jpy_incl,\n      COALESCE(variable_margin_full_jpy_incl, variable_margin_partial_jpy_incl),\n      'incl_tax', margin_confidence, cost_status,\n      NULL, NULL, NULL, NULL, synced_at\n    FROM mirror_aupay_finance_sku_daily\n    UNION ALL\n    SELECT\n      date_jst, 'qoo10',\n      LOWER(TRIM(sku_code)), LOWER(TRIM(ne_code)), product_name,\n      units_net_sold,\n      customer_paid_jpy_incl,\n      CASE\n        WHEN margin_confidence IN ('full', 'partial_minus_returns') THEN variable_margin_full_jpy_incl\n        ELSE variable_margin_jpy_incl\n      END,\n      'incl_tax', margin_confidence, cost_status,\n      NULL, NULL, NULL, NULL, synced_at\n    FROM mirror_qoo10_finance_sku_daily\n    UNION ALL\n    SELECT\n      date_jst, 'linegift',\n      LOWER(TRIM(sku_code)), LOWER(TRIM(ne_code)), product_name,\n      units_net_sold,\n      gross_sales_jpy_incl,\n      variable_margin_jpy_incl,\n      'incl_tax', margin_confidence, cost_status,\n      NULL, NULL, NULL, NULL, synced_at\n    FROM mirror_linegift_finance_sku_daily",
+  "sha256": "cd93d9d8c48b5343d5c52f1adfb8ed578b9c74e2d1dbb5d8df01ac91ae0c886d"
  },
  "unified.amazon_rows": {
   "ok": true,
@@ -15160,7 +15160,7 @@
        "margin_pct": 41.9,
        "prev_week_margin_yen": 55653,
        "prev_week_margin_pct": 35.5,
-       "cost_ok_row_share_pct": 0,
+       "cost_ok_row_share_pct": 32,
        "note": "amazonのみ税抜基準 (margin_basis=excl_tax)"
       },
       {
@@ -15170,7 +15170,7 @@
        "margin_pct": 18.2,
        "prev_week_margin_yen": 2100,
        "prev_week_margin_pct": 18.2,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 100
       },
       {
        "mall": "linegift",
@@ -15179,7 +15179,7 @@
        "margin_pct": -2.3,
        "prev_week_margin_yen": -100,
        "prev_week_margin_pct": -2.3,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 100
       },
       {
        "mall": "qoo10",
@@ -15188,7 +15188,7 @@
        "margin_pct": 16.3,
        "prev_week_margin_yen": 730,
        "prev_week_margin_pct": 16.2,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 100
       },
       {
        "mall": "rakuten",
@@ -15197,7 +15197,7 @@
        "margin_pct": 15.2,
        "prev_week_margin_yen": 2800,
        "prev_week_margin_pct": 12.1,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 86
       },
       {
        "mall": "yahoo",
@@ -15206,11 +15206,30 @@
        "margin_pct": 14.5,
        "prev_week_margin_yen": 1320,
        "prev_week_margin_pct": 14.3,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 100
       }
      ],
-     "negative_margin_skus": [],
-     "note": "粗利は原価整備済み行のみのワースト抽出。cost_ok_row_share_pct が低いモールは粗利の信頼度も低い"
+     "negative_margin_skus": [
+      {
+       "mall": "amazon",
+       "sku": "pr_delta",
+       "ne_code": null,
+       "product_name": "デルタ",
+       "units": 5,
+       "sales_yen": 2750,
+       "margin_yen": -439
+      },
+      {
+       "mall": "linegift",
+       "sku": "lg-c",
+       "ne_code": "ne-c",
+       "product_name": "x",
+       "units": 2,
+       "sales_yen": 4400,
+       "margin_yen": -100
+      }
+     ],
+     "note": "粗利は原価整備済み行 (cost_status=complete) のみのワースト抽出。cost_ok_row_share_pct (= その行の割合) が低いモールは粗利の信頼度も低い"
     },
     "inventory": {
      "by_category": [],
@@ -15241,7 +15260,7 @@
    "previous_open_topics": [],
    "recent_reports": []
   },
-  "sha256": "8151ef5c64734910671fcddcbdd055a28b0309fe52e0450b2a03b596a929fa38"
+  "sha256": "4b2bde629391b9ab4f4d61fdd49000f1d494f2942fd778c2e36578fe1b01a137"
  },
  "ai.monthly": {
   "ok": true,
@@ -15406,7 +15425,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "8151ef5c64734910671fcddcbdd055a28b0309fe52e0450b2a03b596a929fa38",
+  "sha256": "4b2bde629391b9ab4f4d61fdd49000f1d494f2942fd778c2e36578fe1b01a137",
   "body": {
    "meta": {
     "report_type": "weekly",
@@ -15654,7 +15673,7 @@
        "margin_pct": 41.9,
        "prev_week_margin_yen": 55653,
        "prev_week_margin_pct": 35.5,
-       "cost_ok_row_share_pct": 0,
+       "cost_ok_row_share_pct": 32,
        "note": "amazonのみ税抜基準 (margin_basis=excl_tax)"
       },
       {
@@ -15664,7 +15683,7 @@
        "margin_pct": 18.2,
        "prev_week_margin_yen": 2100,
        "prev_week_margin_pct": 18.2,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 100
       },
       {
        "mall": "linegift",
@@ -15673,7 +15692,7 @@
        "margin_pct": -2.3,
        "prev_week_margin_yen": -100,
        "prev_week_margin_pct": -2.3,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 100
       },
       {
        "mall": "qoo10",
@@ -15682,7 +15701,7 @@
        "margin_pct": 16.3,
        "prev_week_margin_yen": 730,
        "prev_week_margin_pct": 16.2,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 100
       },
       {
        "mall": "rakuten",
@@ -15691,7 +15710,7 @@
        "margin_pct": 15.2,
        "prev_week_margin_yen": 2800,
        "prev_week_margin_pct": 12.1,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 86
       },
       {
        "mall": "yahoo",
@@ -15700,11 +15719,30 @@
        "margin_pct": 14.5,
        "prev_week_margin_yen": 1320,
        "prev_week_margin_pct": 14.3,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 100
       }
      ],
-     "negative_margin_skus": [],
-     "note": "粗利は原価整備済み行のみのワースト抽出。cost_ok_row_share_pct が低いモールは粗利の信頼度も低い"
+     "negative_margin_skus": [
+      {
+       "mall": "amazon",
+       "sku": "pr_delta",
+       "ne_code": null,
+       "product_name": "デルタ",
+       "units": 5,
+       "sales_yen": 2750,
+       "margin_yen": -439
+      },
+      {
+       "mall": "linegift",
+       "sku": "lg-c",
+       "ne_code": "ne-c",
+       "product_name": "x",
+       "units": 2,
+       "sales_yen": 4400,
+       "margin_yen": -100
+      }
+     ],
+     "note": "粗利は原価整備済み行 (cost_status=complete) のみのワースト抽出。cost_ok_row_share_pct (= その行の割合) が低いモールは粗利の信頼度も低い"
     },
     "inventory": {
      "by_category": [],
@@ -15740,7 +15778,7 @@
   "status": 200,
   "content_type": "application/json; charset=utf-8",
   "content_disposition": null,
-  "sha256": "8151ef5c64734910671fcddcbdd055a28b0309fe52e0450b2a03b596a929fa38",
+  "sha256": "4b2bde629391b9ab4f4d61fdd49000f1d494f2942fd778c2e36578fe1b01a137",
   "body": {
    "meta": {
     "report_type": "weekly",
@@ -15988,7 +16026,7 @@
        "margin_pct": 41.9,
        "prev_week_margin_yen": 55653,
        "prev_week_margin_pct": 35.5,
-       "cost_ok_row_share_pct": 0,
+       "cost_ok_row_share_pct": 32,
        "note": "amazonのみ税抜基準 (margin_basis=excl_tax)"
       },
       {
@@ -15998,7 +16036,7 @@
        "margin_pct": 18.2,
        "prev_week_margin_yen": 2100,
        "prev_week_margin_pct": 18.2,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 100
       },
       {
        "mall": "linegift",
@@ -16007,7 +16045,7 @@
        "margin_pct": -2.3,
        "prev_week_margin_yen": -100,
        "prev_week_margin_pct": -2.3,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 100
       },
       {
        "mall": "qoo10",
@@ -16016,7 +16054,7 @@
        "margin_pct": 16.3,
        "prev_week_margin_yen": 730,
        "prev_week_margin_pct": 16.2,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 100
       },
       {
        "mall": "rakuten",
@@ -16025,7 +16063,7 @@
        "margin_pct": 15.2,
        "prev_week_margin_yen": 2800,
        "prev_week_margin_pct": 12.1,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 86
       },
       {
        "mall": "yahoo",
@@ -16034,11 +16072,30 @@
        "margin_pct": 14.5,
        "prev_week_margin_yen": 1320,
        "prev_week_margin_pct": 14.3,
-       "cost_ok_row_share_pct": 0
+       "cost_ok_row_share_pct": 100
       }
      ],
-     "negative_margin_skus": [],
-     "note": "粗利は原価整備済み行のみのワースト抽出。cost_ok_row_share_pct が低いモールは粗利の信頼度も低い"
+     "negative_margin_skus": [
+      {
+       "mall": "amazon",
+       "sku": "pr_delta",
+       "ne_code": null,
+       "product_name": "デルタ",
+       "units": 5,
+       "sales_yen": 2750,
+       "margin_yen": -439
+      },
+      {
+       "mall": "linegift",
+       "sku": "lg-c",
+       "ne_code": "ne-c",
+       "product_name": "x",
+       "units": 2,
+       "sales_yen": 4400,
+       "margin_yen": -100
+      }
+     ],
+     "note": "粗利は原価整備済み行 (cost_status=complete) のみのワースト抽出。cost_ok_row_share_pct (= その行の割合) が低いモールは粗利の信頼度も低い"
     },
     "inventory": {
      "by_category": [],
