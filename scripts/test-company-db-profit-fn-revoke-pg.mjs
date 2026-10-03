@@ -255,6 +255,10 @@ try {
     const x2 = new URL(url); x2.username = OWNER; x2.password = PW; x2.pathname = `/${DB2}`;
     const v0 = spawnSync(process.execPath, ['scripts/company-db/heavy-entry-manifest.mjs', '--verify'], { cwd: ROOT, env: { ...process.env, COMPANY_DB_URL: x2.toString() }, encoding: 'utf8', timeout: 60000 });
     assert.equal(v0.status, 1, '0056 の前の --verify は ❌ (exit 1)'); assert.match(v0.stdout, /❌ 重い入口/);
+    // 本適用の手順の dry-run (0055 までの DB) = 0056 だけが出る・何も流さない
+    const dry = await applyMigrations(pgAdapter(O2), { dryRun: true, log: quiet });
+    assert.deepEqual([dry.applied, dry.pending], [[], ['0056']]);
+    assert.deepEqual(await aclOf(O2, CLOSED_FUNCTIONS[0]), before);
     assert.deepEqual((await applyMigrations(pgAdapter(O2), { log: quiet })).applied, ['0056']);
     assert.deepEqual(await heavyEntryFindings(pgAdapter(O2)), []);
   });
