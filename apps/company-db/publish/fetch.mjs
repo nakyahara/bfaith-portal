@@ -640,8 +640,18 @@ export async function cli(argv, { env = process.env, now = new Date(), run = run
 const fold = (x) => (process.platform === 'win32' ? x.toLowerCase() : x);
 const isMain = (() => { try { return !!process.argv[1] && fold(fs.realpathSync.native(process.argv[1])) === fold(fs.realpathSync.native(fileURLToPath(import.meta.url))); } catch { return false; } })();
 if (isMain) {
-  const { code } = await cli(process.argv.slice(2));
-  // pg・fetch の直後に process.exit() しない (Windows の Node は libuv の assertion で 127 になる。#1386)
-  process.exitCode = code;
-  setTimeout(() => process.exit(code), 10000).unref();
+  // top-level await にしない (2026-10-03 07:00 の daily-sync が exit 13 で止まった):
+  //   cli が動的に読む部品 (照合の run.mjs・ping の lz-daily.mjs) は compare-old-tables.mjs 経由でこのファイルを読み込み返す。
+  //   入口が await で待つと「評価の終わっていないこのファイル」を部品が待つ輪になり、Node は何もできずに終わる (unsettled top-level await)。
+  //   then で待てば、このファイルの評価は先に終わり、部品の読み込みも通る。試験 = scripts/test-cli-import-cycles.mjs
+  cli(process.argv.slice(2)).then(({ code }) => {
+    // pg・fetch の直後に process.exit() しない (Windows の Node は libuv の assertion で 127 になる。#1386)
+    process.exitCode = code;
+    setTimeout(() => process.exit(code), 10000).unref();
+  }, (e) => {
+    // cli は自分の中で失敗を受け止める。ここに来るのは想定の外 = 失敗で終わる
+    console.error(`❌ Company DB の写し: ${String(e && e.message).replace(/\s+/g, ' ').slice(0, 400)}`);
+    process.exitCode = 1;
+    setTimeout(() => process.exit(1), 10000).unref();
+  });
 }
