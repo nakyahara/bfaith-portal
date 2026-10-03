@@ -221,14 +221,15 @@ export function readBarcodeExport(buf) {
 /**
  * バーコードの前後を比べる (取り込んだ商品と大文字小文字の候補)。商品ID とバーコードを文字として: 増えた・消えた・重複の数 (K4)。
  * 商品名などほかの列の変化は差にしない (見出しの 商品ID・バーコード の位置が変わったら差)
- * @param {{ pre, post, ids: Iterable<string>, cover?: { pre?: object, post?: object } }} p  cover = 同じ回に書き出した商品マスタ (readLzShohinMaster)。全商品がバーコードの書き出しにあること
+ * @param {{ pre, post, ids: Iterable<string>, cover?: { pre?: object, post?: object }, lastTarget?: 'unverifiable'|'compare' }} p  cover = 同じ回に書き出した商品マスタ (readLzShohinMaster)。全商品がバーコードの書き出しにあること。
+ *   lastTarget = 比べる商品が書き出しの最後の商品のとき: 'unverifiable' (既定) = 差 target_is_last_* / 'compare' = 差にしない・その商品も前後で比べる (exempt_last に残す)
  * @returns {{ ok: boolean, diffs: Array<{ id, kind: 'header_changed'|'added'|'removed', barcode?: string }> }}
  */
 export function barcodeMissing(lz, bc) {
   return [...lz.byId.keys()].filter((id) => !bc.byId.has(id));
 }
 
-export function compareBarcodes({ pre, post, ids, cover = null }) {
+export function compareBarcodes({ pre, post, ids, cover = null, lastTarget = 'unverifiable' }) {
   if (!pre || !pre.ok || !post || !post.ok) throw new Error('バーコードの前と後 (ok) が要る');
   const diffs = [];
   const pos = (h) => [h.indexOf('商品ID'), h.indexOf('バーコード')].join(',');
@@ -240,10 +241,15 @@ export function compareBarcodes({ pre, post, ids, cover = null }) {
   if (cover && cover.post) { const m = barcodeMissing(cover.post, post); if (m.length) diffs.push({ id: null, kind: 'missing_in_post_barcode', count: m.length, head: m.slice(0, 10) }); }
   // 比べる商品の行が全部そろっていると言えるのは: 商品ごとの行がひとまとまり・その商品が最後の商品でない (後ろに別の商品の行がある)。
   // 最後の商品の 2 本目以降で行の切れ目ちょうどに切れても、商品のそろいと行の数では分からない = 比べる商品が最後なら「確かめられない」(Codex #1530 R3 High)
+  // lastTarget = 'compare' (毎晩 = ほぼ全商品を比べる = 最後の商品が毎晩入る) = 差にせず、その商品も下で前後を比べる (exempt_last に残す)。ほかの値 = 確かめられない
+  const exempt = [];
   if (cover) {
     for (const [side, x] of [['pre', pre], ['post', post]]) {
       if (x.grouped === false) diffs.push({ id: null, kind: `barcode_not_grouped_${side}` });
-      for (const id of new Set(ids)) if (x.lastId === id) diffs.push({ id, kind: `target_is_last_${side}` });
+      for (const id of new Set(ids)) {
+        if (x.lastId !== id) continue;
+        if (lastTarget === 'compare') exempt.push({ id, side }); else diffs.push({ id, kind: `target_is_last_${side}` });
+      }
     }
   }
   if (post.rows < pre.rows) diffs.push({ id: null, kind: 'rows_decreased', pre: pre.rows, post: post.rows });
@@ -254,5 +260,5 @@ export function compareBarcodes({ pre, post, ids, cover = null }) {
     for (const [barcode, n] of ca) for (let k = cb.get(barcode) || 0; k < n; k++) diffs.push({ id, kind: 'removed', barcode });
     for (const [barcode, n] of cb) for (let k = ca.get(barcode) || 0; k < n; k++) diffs.push({ id, kind: 'added', barcode });
   }
-  return { ok: diffs.length === 0, diffs };
+  return exempt.length ? { ok: diffs.length === 0, diffs, exempt_last: exempt } : { ok: diffs.length === 0, diffs };
 }

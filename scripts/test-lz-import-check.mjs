@@ -179,6 +179,17 @@ await ta('[7] バーコード: 見出しに 商品ID・バーコード・列の�
   assert.deepEqual(V.compareBarcodes({ pre, post: pre, ids: ['A-1'], cover: { pre: L2, post: L2 } }).diffs, []);
   assert.deepEqual(V.compareBarcodes({ pre, post: pre, ids: ['B-2'], cover: { pre: L2, post: L2 } }).diffs.map((d) => `${d.kind}:${d.id}`), ['target_is_last_pre:B-2', 'target_is_last_post:B-2']);
   assert.deepEqual(V.compareBarcodes({ pre, post: pre, ids: ['B-2'] }).diffs, []);   // cover が無い比べ (単体の差) は今までどおり
+  // 毎晩 (lastTarget = 'compare'・ほぼ全商品を比べる = 最後の商品が毎晩入る): 最後の商品を差にしない (exempt_last に残す)・その商品の増えた / 消えたは差のまま・ひとまとまりでない も差のまま
+  assert.deepEqual(V.compareBarcodes({ pre, post: pre, ids: ['A-1', 'B-2'], cover: { pre: L2, post: L2 }, lastTarget: 'compare' }),
+    { ok: true, diffs: [], exempt_last: [{ id: 'B-2', side: 'pre' }, { id: 'B-2', side: 'post' }] });
+  const lastChanged = bc([['A-1', 'a', '4900000000001', '1'], ['A-1', 'a', '4900000000002', '1'], ['B-2', 'b', '4900000000008', '1']]);
+  assert.deepEqual(V.compareBarcodes({ pre, post: lastChanged, ids: ['B-2'], cover: { pre: L2, post: L2 }, lastTarget: 'compare' }).diffs.map((d) => `${d.kind}:${d.id}`), ['removed:B-2', 'added:B-2']);
+  const lastMore = bc([['A-1', 'a', '4900000000001', '1'], ['A-1', 'a', '4900000000002', '1'], ['B-2', 'b', '4900000000003', '1'], ['B-2', 'b', '4900000000007', '1']]);
+  assert.deepEqual(V.compareBarcodes({ pre, post: lastMore, ids: ['B-2'], cover: { pre: L2, post: L2 }, lastTarget: 'compare' }).diffs.map((d) => `${d.kind}:${d.id}`), ['added:B-2'], '前か後の片方だけが最後の商品の行の切れ目で切れた = 差 (verify_failed)');
+  const split0 = bc([['A-1', 'a', '4900000000001', '1'], ['B-2', 'b', '4900000000003', '1'], ['A-1', 'a', '4900000000002', '1'], ['C-3', 'c', '4900000000004', '1']]);
+  assert.deepEqual(V.compareBarcodes({ pre: split0, post: split0, ids: ['C-3'], cover: { pre: L2, post: L2 }, lastTarget: 'compare' }).diffs.map((d) => d.kind), ['barcode_not_grouped_pre', 'barcode_not_grouped_post']);
+  // 知らない値 = 今までどおり確かめられない (fail-closed)
+  assert.deepEqual(V.compareBarcodes({ pre, post: pre, ids: ['B-2'], cover: { pre: L2, post: L2 }, lastTarget: 'yes' }).diffs.map((d) => d.kind), ['target_is_last_pre', 'target_is_last_post']);
   const split = bc([['A-1', 'a', '4900000000001', '1'], ['B-2', 'b', '4900000000003', '1'], ['A-1', 'a', '4900000000002', '1'], ['C-3', 'c', '4900000000004', '1']]);
   assert.deepEqual([split.grouped, split.lastId], [false, 'C-3']);
   assert.deepEqual(V.compareBarcodes({ pre: split, post: split, ids: ['A-1'], cover: { pre: L2, post: L2 } }).diffs.map((d) => d.kind), ['barcode_not_grouped_pre', 'barcode_not_grouped_post']);

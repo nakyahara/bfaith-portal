@@ -719,6 +719,7 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
     - importing が残っている: 鍵が生きている = 動いている (何もしない) / 鍵が無い = mark-unknown → どの結末でも読み直して報告して**終わる** (この起動では取込に進まない・ロジザードに入らない)。
     - 前の夜の毎晩の回が未確かめ (imported_unverified) = **その夜は確かめのやり直しだけ** (L-25・記録 = `DATA_DIR/lz-import/runs/<実行 ID>/`)。止まった状態の知らせが知らせ済みになるまでは確かめない (知らせが届かないまま verified になって故障が隠れない)。
     - 同じ対象の日がもう始まった (`nightly_last`) = 何もしない。対象 = 前の日の lz-daily (合格・ポータルに送れた) → ポータルの成果物の識別と同じか → `nightly-readiness` (副作用なし) → 済みの印 → 取込 (エンジン・商品とバーコードの両方を比べる = L-24)。
+      - バーコードの書き出しの最後の商品 (商品ID の順の最後・2026-10-03 = `zuko5`) は毎晩の CSV にある。試験 (`POLICIES.test`) は「比べる商品が最後の商品 = 押さない (K4)」のまま、毎晩 (`POLICIES.nightly.barcodeLastTarget = 'compare'`) は押して、その商品も前後で比べる (差 = verify_failed・記録 = import.json の `barcode_last_is_target`・verify.json の `exempt_last`)。2026-10-03 00:20 の本番の最初の夜は、この判定で押す前に止まった (`lzim_night_20261002T152040_dbcb19`)。
   - ping `lz-daily-import` の ok = その夜の取込 (か確かめのやり直し) が verified **かつ** 前後どの回にも未送・知らせ済みにできない止まった状態が無いときだけ。on を見た後の途中の失敗の fail も `lz-daily-import` へ。ほか = ping しない (dead-man が拾う)・途中の例外 = fail。台帳への登録は切替の PR。
   - 本物のロジザードの包みは試験・毎晩・影で共用 (`scripts/logizard-import/lz-real-session.mjs`・1 つの鍵とページの中で 商品 → バーコード → プレビュー → 実行 → 商品 → バーコード・影は押す部品を渡さない)。
   - 確かめのやり直し (試験も毎晩も): 鍵を取ってから記録を読む (無い = evidence_missing・壊れた = evidence_broken・違う回 = evidence_mismatch = どれも verify_failed = 人が見る)・鍵を 30 秒ごとに延ばす・書き出しの前ごと・結果を書く前に締め切り (試験 = 次の 00:00 の前・毎晩 = 00:55) を見る (過ぎた・鍵を失った = 未確かめのまま)。取込の後の直後の書き出しと確かめの結果も同じ。

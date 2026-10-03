@@ -742,6 +742,7 @@ function realLikeLz({ over = {}, ids = ['A-1', 'B-2', 'C-3'], same = {}, now = n
         c[col('変更日時')] = s; c[col('インポート日時')] = over.importStampLag && i === rows.length - 1 ? stampOf(i + 60) : s;
       });
       if (over.touchBarcode) st.bc[0][2] = '4900000000999';
+      if (over.touchLastBarcode) st.bc[st.bc.length - 1][2] = '4900000000998';   // 書き出しの最後の商品のバーコードを変える
       return { executeIssued: true, confirm: 'clicked', reason: null, resultText: `インポート結果 総件数 : ${rows.length} 処理件数 : ${rows.length} 処理不要件数 : 0 エラー件数 : 0` };
     },
   };
@@ -972,6 +973,40 @@ await ta('[32] 取込の時刻の窓は、ポータルに結果の状態 (import
   assert.equal(r.result, 'verified');
   assert.deepEqual(seen[0], ['imported_unverified', true, true], '結果の状態を書く時点で窓が記録にある');
   assert.ok(seen.every((s) => s[1]), JSON.stringify(seen));
+});
+
+await ta('[33] 本番と同じく、バーコードの書き出しの最後の商品 (商品ID の順の最後) が今夜の CSV にある = 毎晩は押す・その商品も前後で比べる = verified / その商品のバーコードが変わった = verify_failed / 確かめのやり直しも同じ (2026-10-03 00:20 の本番の最初の夜は K4 で押せなかった)', async () => {
+  assert.deepEqual([E.POLICIES.test.barcodeLastTarget, E.POLICIES.nightly.barcodeLastTarget], ['stop', 'compare'], '試験は今までどおり押さない・毎晩だけ比べる');
+  // B-2 = 書き出しの最後の商品・CSV にある (本番 = zuko5)
+  let p = portal();
+  p.putArtifact();
+  let d = setupData();
+  let lz = realLikeLz({ ids: ['A-1', 'B-2'], now: () => p.clock.now });
+  let r = await N.runNightly(e2eOpts(p, d, lz).o);
+  assert.deepEqual([r.state, r.result, S.getStatus(p.db, { now: p.clock.now }).state, r.ping], ['imported', 'verified', 'verified', 'ok']);
+  const runDir = N.nightlyRunDir(d, r.runId);
+  const rec = JSON.parse(fs.readFileSync(path.join(runDir, 'import.json'), 'utf8'));
+  assert.deepEqual(rec.stages.filter((x) => x.name === 'barcode_last_is_target').map((x) => x.id), ['B-2'], '最後の商品を比べる商品にしたことを記録に残す');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(runDir, 'verify.json'), 'utf8')).barcode.exempt_last, [{ id: 'B-2', side: 'pre' }, { id: 'B-2', side: 'post' }]);
+  // 取込で最後の商品のバーコードが変わった = 差 = verify_failed (最後の商品も比べている)
+  p = portal();
+  p.putArtifact();
+  d = setupData();
+  lz = realLikeLz({ ids: ['A-1', 'B-2'], over: { touchLastBarcode: true }, now: () => p.clock.now });
+  r = await N.runNightly(e2eOpts(p, d, lz).o);
+  assert.deepEqual([r.result, S.getStatus(p.db, { now: p.clock.now }).state, r.ping], ['verify_failed', 'verify_failed', null]);
+  const vj = JSON.parse(fs.readFileSync(path.join(N.nightlyRunDir(d, r.runId), 'verify.json'), 'utf8'));
+  assert.deepEqual(vj.barcode.diffs.map((x) => `${x.kind}:${x.id}`).sort(), ['added:B-2', 'removed:B-2']);
+  // 確かめのやり直し (verifyAgain) も同じ扱い
+  p = portal();
+  p.putArtifact();
+  d = setupData();
+  lz = realLikeLz({ ids: ['A-1', 'B-2'], over: { postShohinFailsOnce: true }, now: () => p.clock.now });
+  r = await N.runNightly(e2eOpts(p, d, lz).o);
+  assert.equal(r.result, 'imported_unverified');
+  p.clock.now = NIGHT + 86400000;
+  r = await N.runNightly(e2eOpts(p, d, lz).o);
+  assert.deepEqual([r.state, r.result, S.getStatus(p.db, { now: p.clock.now }).state], ['verify_again', 'verified', 'verified']);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

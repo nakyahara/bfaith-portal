@@ -31,11 +31,18 @@ export const STOP_STATES = Object.freeze(['unknown', 'partial', 'verify_failed',
  * nightly = 毎晩の本番 (③c-1b-2b-2・持ち主 auto・mode nightly・名乗り lz-daily-import・商品とバーコードの両方を比べる (L-24)・
  *   時刻 = Render の時計の夜の窓・占有の文は要らない (夜の窓は自動だけ = Stream Deck の ③ は 00:00〜01:30 に動かない #1518)・
  *   確かめの列の決まり = RULES_NIGHTLY (実機の試験で決めるまで null = 動かない)
+ * barcodeLastTarget = 比べる商品がバーコードの書き出しの最後の商品のとき (K4):
+ *   'stop' (test) = 押さない (少数件の試験は、その商品を試験から外せる) /
+ *   'compare' (nightly) = 押す・その商品のバーコードも前後で比べる (差 = verify_failed)。毎晩の CSV はほぼ全商品 = 書き出しの最後の商品 (商品ID の順の最後・2026-10-03 = zuko5) が
+ *   毎晩入る = 'stop' では毎晩押せない (2026-10-03 00:20 の本番の最初の夜)。残る穴 = 最後の商品の 2 本目以降の行の切れ目ちょうどで書き出しが切れ、かつ取込がその商品のバーコードを変えた、が重なるときだけ
+ *   (5 列の取込にバーコードの列は無い)。'stop' 以外の知らない値 = 'stop' と同じ (fail-closed)
  */
 export const POLICIES = Object.freeze({
-  test: Object.freeze({ name: 'test', holder: 'auto', mode: 'test', by: 'lz-import-test', runIdPrefix: 'lzim_test_', label: '取込の試験', verbImport: '試験', rules: RULES_2B1, allowUndecided: true, barcode: true, importTtlSec: 180, verifyTtlSec: 300, window: 'day', serverClock: false, occupancy: 'required' }),
-  nightly: Object.freeze({ name: 'nightly', holder: 'auto', mode: 'nightly', by: 'lz-daily-import', runIdPrefix: 'lzim_night_', label: '毎晩の取込', verbImport: '取込', rules: RULES_NIGHTLY, allowUndecided: false, barcode: true, importTtlSec: 180, verifyTtlSec: 300, window: 'night', serverClock: true, occupancy: 'night_window' }),
+  test: Object.freeze({ name: 'test', holder: 'auto', mode: 'test', by: 'lz-import-test', runIdPrefix: 'lzim_test_', label: '取込の試験', verbImport: '試験', rules: RULES_2B1, allowUndecided: true, barcode: true, barcodeLastTarget: 'stop', importTtlSec: 180, verifyTtlSec: 300, window: 'day', serverClock: false, occupancy: 'required' }),
+  nightly: Object.freeze({ name: 'nightly', holder: 'auto', mode: 'nightly', by: 'lz-daily-import', runIdPrefix: 'lzim_night_', label: '毎晩の取込', verbImport: '取込', rules: RULES_NIGHTLY, allowUndecided: false, barcode: true, barcodeLastTarget: 'compare', importTtlSec: 180, verifyTtlSec: 300, window: 'night', serverClock: true, occupancy: 'night_window' }),
 });
+/** 比べる商品が書き出しの最後の商品のときの扱い (compareBarcodes の lastTarget)。'compare' だけが比べるだけ・ほか = 確かめられない */
+const lastTargetOf = (policy) => (policy.barcodeLastTarget === 'compare' ? 'compare' : 'unverifiable');
 function checkPolicy(policy) {
   if (!Object.values(POLICIES).includes(policy)) throw new Error('決まり (policy) が POLICIES に無い = 動かない');
   if (!policy.rules) throw new Error(`決まり ${policy.name} の確かめの列の決まりがまだ無い (実機の少数件の試験で決める = 2b-2b) = 動かない`);
@@ -297,7 +304,10 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
       // 取込の後に確かめられる形か (押す前に見る。Codex #1530 R4 Medium): 商品ごとの行がひとまとまり・比べる商品が最後の商品でない
       const checkIds = new Set([...table0.map((r) => r[0]), ...extraIds]);
       if (bcPre.grouped === false) throw new Error('直前のバーコードの書き出しで商品ごとの行がひとまとまりでない = 取込の後に確かめられない = 押さない (K4)');
-      if (checkIds.has(bcPre.lastId)) throw new Error(`比べる商品 ${bcPre.lastId} がバーコードの書き出しの最後の商品 = 取込の後に確かめられない = 押さない (K4・この商品を試験から外す)`);
+      if (checkIds.has(bcPre.lastId)) {
+        if (lastTargetOf(policy) !== 'compare') throw new Error(`比べる商品 ${bcPre.lastId} がバーコードの書き出しの最後の商品 = 取込の後に確かめられない = 押さない (K4・この商品を試験から外す)`);
+        stage('barcode_last_is_target', { id: bcPre.lastId });   // 毎晩 = 押す・最後の商品も前後で比べる (記録に残す)
+      }
       const again = preCheck(lz);
       if (again) { stage(...again.stage); throw new Error(again.error); }
       // ── 押す前にそろえる記録 (D) ──
@@ -356,7 +366,7 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
       const bcPost = g.postBc ? readBarcodeExport(g.postBc.buf) : null;
       const vr0 = lzPost ? (lzPost.ok ? verifyImport({ table, pre: lz, post: lzPost, rules: policy.rules, importWindow: rec.stamp_window }) : { ok: false, diffs: [{ kind: 'post_unreadable', reason: lzPost.reason }] })
         : (g.invalid && g.invalid.which === 'shohin' ? { ok: false, diffs: [{ kind: 'post_unreadable', reason: bad('shohin') }] } : null);
-      const br0 = bcPost ? (bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids, cover: { pre: lz, post: lzPost && lzPost.ok ? lzPost : null } }) : { ok: false, diffs: [{ kind: 'post_barcode_unreadable', reason: bcPost.reason }] })
+      const br0 = bcPost ? (bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids, cover: { pre: lz, post: lzPost && lzPost.ok ? lzPost : null }, lastTarget: lastTargetOf(policy) }) : { ok: false, diffs: [{ kind: 'post_barcode_unreadable', reason: bcPost.reason }] })
         : (g.invalid && g.invalid.which === 'barcode' ? { ok: false, diffs: [{ kind: 'post_barcode_unreadable', reason: bad('barcode') }] } : null);
       // 片方が一時の失敗で取れず、取れた側に差も壊れも無い = 確かめきれない = 未確かめのまま (verify でやり直す) / 取れた側に差・壊れ = verify_failed
       if ((!vr0 || !br0) && !((vr0 && !vr0.ok) || (br0 && !br0.ok))) { stage('post_export_failed', g.transient || {}); return; }
@@ -542,7 +552,7 @@ export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, 
     const bcPost = got.postBc ? readBarcodeExport(got.postBc.buf) : null;
     const vr0 = lzPost ? (lz.ok && lzPost.ok ? verifyImport({ table, pre: lz, post: lzPost, rules: policy.rules, importWindow: needWindow ? w : null }) : { ok: false, diffs: [{ kind: 'unreadable', reason: lz.ok ? lzPost.reason : lz.reason }], decided: false, rules_version: RV })
       : (got.invalid && got.invalid.which === 'shohin' ? { ok: false, diffs: [{ kind: 'unreadable', reason: bad('shohin') }], decided: false, rules_version: RV } : null);
-    const br0 = bcPost ? (bcPre.ok && bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids, cover: { pre: lz.ok ? lz : null, post: lzPost && lzPost.ok ? lzPost : null } }) : { ok: false, diffs: [{ kind: 'barcode_unreadable', reason: bcPre.ok ? bcPost.reason : bcPre.reason }] })
+    const br0 = bcPost ? (bcPre.ok && bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids, cover: { pre: lz.ok ? lz : null, post: lzPost && lzPost.ok ? lzPost : null }, lastTarget: lastTargetOf(policy) }) : { ok: false, diffs: [{ kind: 'barcode_unreadable', reason: bcPre.ok ? bcPost.reason : bcPre.reason }] })
       : (got.invalid && got.invalid.which === 'barcode' ? { ok: false, diffs: [{ kind: 'barcode_unreadable', reason: bad('barcode') }] } : null);
     if ((!vr0 || !br0) && !((vr0 && !vr0.ok) || (br0 && !br0.ok))) {   // 片方が一時の失敗で取れず、取れた側に差も壊れも無い = 未確かめのまま
       stage('verify_only_export_failed', got.transient || {});
