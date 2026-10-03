@@ -10411,6 +10411,607 @@
   },
   "sha256": "2e6499e06dfdd9c16ba07fee5bb40ea6c07ca6e887a12f4b4a35d9bdb5dfc94b"
  },
+ "pricing.http.health": {
+  "status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "content_disposition": null,
+  "sha256": "42160c984522a436cd75795254cd13cefc43d1d668f0ecccc57a6f44dad34413",
+  "body": {
+   "ok": true,
+   "writes_to_amazon": false,
+   "rule_version": "rule:ap-v1",
+   "mirror_tables": {
+    "ok": true,
+    "missing": []
+   },
+   "freshness": {
+    "snapshot_date_jst": "2026-10-02",
+    "snapshot_rows": 3,
+    "fees_fetched_at": "2026-10-02T21:00:00Z",
+    "fees_rows": 4,
+    "finance_last_date_jst": "2026-09-28",
+    "sku_norm_collisions": []
+   },
+   "latest_run": {
+    "run_id": "apr-murt0io0-mjbmqf",
+    "started_at": "2026-10-03T03:00:00.000Z",
+    "finished_at": "2026-10-03T03:00:00.000Z",
+    "trigger": "test",
+    "actor_id": "parity",
+    "snapshot_date_jst": "2026-10-02",
+    "input_fingerprint": "2026-10-02|3|2026-10-02T21:00:00Z|4|2026-10-02T21:00:00Z|5|t|5|2026-10-01T00:00:00Z|1463|2026-09-28|2026-09-29T22:00:00Z",
+    "rule_version": "rule:ap-v1",
+    "status": "success",
+    "listings_total": 4,
+    "summary_json": "{\"by_action\":{\"raise\":0,\"lower\":0,\"keep\":3,\"hold\":1},\"by_reason\":{\"OFF\":3,\"NO_MY_PRICE\":1},\"flags\":{\"CHANNEL_UNKNOWN\":4,\"COST_UNKNOWN\":1},\"no_policy\":4,\"snapshot_date_jst\":\"2026-10-02\"}",
+    "error": null,
+    "summary": {
+     "by_action": {
+      "raise": 0,
+      "lower": 0,
+      "keep": 3,
+      "hold": 1
+     },
+     "by_reason": {
+      "OFF": 3,
+      "NO_MY_PRICE": 1
+     },
+     "flags": {
+      "CHANNEL_UNKNOWN": 4,
+      "COST_UNKNOWN": 1
+     },
+     "no_policy": 4,
+     "snapshot_date_jst": "2026-10-02"
+    }
+   },
+   "policy_events": 0
+  }
+ },
+ "pricing.http.listings": {
+  "status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "content_disposition": null,
+  "sha256": "2e4372ae8b8ad40e4df12b004e45ba46d6462d2b89135f70ae17ab2c8b9564cc",
+  "body": {
+   "ok": true,
+   "rule_version": "rule:ap-v1",
+   "freshness": {
+    "snapshot_date_jst": "2026-10-02",
+    "snapshot_rows": 3,
+    "fees_fetched_at": "2026-10-02T21:00:00Z",
+    "fees_rows": 4,
+    "finance_last_date_jst": "2026-09-28",
+    "sku_norm_collisions": []
+   },
+   "count": 4,
+   "rows": [
+    {
+     "seller_sku": "pr_alpha",
+     "asin": "B0ALPHA",
+     "channel": "AFN",
+     "referral_fee_rate": 0.15,
+     "fba_fee": 318,
+     "per_item_fee": 0,
+     "variable_closing_fee": 0,
+     "total_fee": 468,
+     "price_used": 1000,
+     "fees_fetched_at": "2026-10-02T21:00:00Z",
+     "snapshot_date_jst": "2026-10-02",
+     "my_price": 1000,
+     "buybox_price": 980,
+     "buybox_is_mine": 0,
+     "ne_code": "ne-a",
+     "ne_name": "商品A",
+     "cost_incl_tax": 330,
+     "cost_missing_parts": 0,
+     "parts": 1,
+     "ship_cost": 100,
+     "fba_stock": 40,
+     "own_stock": 12,
+     "units_30d": 248,
+     "sales_30d": 250000,
+     "mode": "off",
+     "floor_price": null,
+     "ceiling_price": null,
+     "offset_jpy": 0,
+     "min_margin_rate": null,
+     "policy_note": null,
+     "policy_updated_at": null,
+     "policy_updated_by": null,
+     "custom_type_id": null,
+     "custom_type_name": null,
+     "ct_basis": null,
+     "ct_rival_scope": null,
+     "ct_direction": null,
+     "ct_offset_kind": null,
+     "ct_offset_value": null,
+     "ct_amazon_seller": null,
+     "ct_prime_as": null,
+     "ct_points": null,
+     "ct_solo_raise": null,
+     "ct_archived_at": null,
+     "custom_type": null,
+     "fee_now": 468,
+     "stock": 12,
+     "computed_floor": null,
+     "effective_floor": null,
+     "gross_now": {
+      "gross": null,
+      "rate": null
+     },
+     "buybox_gap": 20,
+     "has_policy": false,
+     "live": {
+      "action": "keep",
+      "verdict_label": "維持",
+      "verdict_class": "keep",
+      "proposed_price": null,
+      "current_price": 1000,
+      "reason_code": "OFF",
+      "reason_text": "追従しない設定",
+      "confidence": null,
+      "flags": [
+       "CHANNEL_UNKNOWN"
+      ],
+      "computed_floor": null,
+      "effective_floor": null,
+      "gross_now": {
+       "gross": null,
+       "rate": null
+      }
+     }
+    },
+    {
+     "seller_sku": "pr_beta",
+     "asin": "B0BETA",
+     "channel": "MFN",
+     "referral_fee_rate": 0.15,
+     "fba_fee": null,
+     "per_item_fee": 0,
+     "variable_closing_fee": 0,
+     "total_fee": 120,
+     "price_used": 800,
+     "fees_fetched_at": "2026-10-02T21:00:00Z",
+     "snapshot_date_jst": "2026-10-02",
+     "my_price": 800,
+     "buybox_price": null,
+     "buybox_is_mine": null,
+     "ne_code": "ne-b",
+     "ne_name": "商品B",
+     "cost_incl_tax": null,
+     "cost_missing_parts": 1,
+     "parts": 1,
+     "ship_cost": 100,
+     "fba_stock": 7,
+     "own_stock": null,
+     "units_30d": 123,
+     "sales_30d": 100000,
+     "mode": "off",
+     "floor_price": null,
+     "ceiling_price": null,
+     "offset_jpy": 0,
+     "min_margin_rate": null,
+     "policy_note": null,
+     "policy_updated_at": null,
+     "policy_updated_by": null,
+     "custom_type_id": null,
+     "custom_type_name": null,
+     "ct_basis": null,
+     "ct_rival_scope": null,
+     "ct_direction": null,
+     "ct_offset_kind": null,
+     "ct_offset_value": null,
+     "ct_amazon_seller": null,
+     "ct_prime_as": null,
+     "ct_points": null,
+     "ct_solo_raise": null,
+     "ct_archived_at": null,
+     "custom_type": null,
+     "fee_now": 120,
+     "stock": null,
+     "computed_floor": null,
+     "effective_floor": null,
+     "gross_now": {
+      "gross": null,
+      "rate": null
+     },
+     "buybox_gap": null,
+     "has_policy": false,
+     "live": {
+      "action": "keep",
+      "verdict_label": "維持",
+      "verdict_class": "keep",
+      "proposed_price": null,
+      "current_price": 800,
+      "reason_code": "OFF",
+      "reason_text": "追従しない設定",
+      "confidence": null,
+      "flags": [
+       "CHANNEL_UNKNOWN",
+       "COST_UNKNOWN"
+      ],
+      "computed_floor": null,
+      "effective_floor": null,
+      "gross_now": {
+       "gross": null,
+       "rate": null
+      }
+     }
+    },
+    {
+     "seller_sku": "PR_Gamma",
+     "asin": "B0GAMMA",
+     "channel": "AFN",
+     "referral_fee_rate": 0.1,
+     "fba_fee": 434,
+     "per_item_fee": 0,
+     "variable_closing_fee": 0,
+     "total_fee": 674,
+     "price_used": 2400,
+     "fees_fetched_at": "2026-10-02T21:00:00Z",
+     "snapshot_date_jst": "2026-10-02",
+     "my_price": 2400,
+     "buybox_price": 2400,
+     "buybox_is_mine": 1,
+     "ne_code": "ne-a",
+     "ne_name": "商品A",
+     "cost_incl_tax": 1210,
+     "cost_missing_parts": 0,
+     "parts": 2,
+     "ship_cost": 100,
+     "fba_stock": 0,
+     "own_stock": 3,
+     "units_30d": 47,
+     "sales_30d": 120000,
+     "mode": "off",
+     "floor_price": null,
+     "ceiling_price": null,
+     "offset_jpy": 0,
+     "min_margin_rate": null,
+     "policy_note": null,
+     "policy_updated_at": null,
+     "policy_updated_by": null,
+     "custom_type_id": null,
+     "custom_type_name": null,
+     "ct_basis": null,
+     "ct_rival_scope": null,
+     "ct_direction": null,
+     "ct_offset_kind": null,
+     "ct_offset_value": null,
+     "ct_amazon_seller": null,
+     "ct_prime_as": null,
+     "ct_points": null,
+     "ct_solo_raise": null,
+     "ct_archived_at": null,
+     "custom_type": null,
+     "fee_now": 674,
+     "stock": 3,
+     "computed_floor": null,
+     "effective_floor": null,
+     "gross_now": {
+      "gross": null,
+      "rate": null
+     },
+     "buybox_gap": 0,
+     "has_policy": false,
+     "live": {
+      "action": "keep",
+      "verdict_label": "維持",
+      "verdict_class": "keep",
+      "proposed_price": null,
+      "current_price": 2400,
+      "reason_code": "OFF",
+      "reason_text": "追従しない設定",
+      "confidence": null,
+      "flags": [
+       "CHANNEL_UNKNOWN"
+      ],
+      "computed_floor": null,
+      "effective_floor": null,
+      "gross_now": {
+       "gross": null,
+       "rate": null
+      }
+     }
+    },
+    {
+     "seller_sku": "pr_delta",
+     "asin": "B0DELTA",
+     "channel": "AFN",
+     "referral_fee_rate": 0.08,
+     "fba_fee": 290,
+     "per_item_fee": 0,
+     "variable_closing_fee": 0,
+     "total_fee": 330,
+     "price_used": 500,
+     "fees_fetched_at": "2026-10-02T21:00:00Z",
+     "snapshot_date_jst": "2026-10-02",
+     "my_price": null,
+     "buybox_price": null,
+     "buybox_is_mine": null,
+     "ne_code": "ne-d",
+     "ne_name": "商品D",
+     "cost_incl_tax": 220,
+     "cost_missing_parts": 0,
+     "parts": 1,
+     "ship_cost": 100,
+     "fba_stock": null,
+     "own_stock": null,
+     "units_30d": 14,
+     "sales_30d": 7500,
+     "mode": "off",
+     "floor_price": null,
+     "ceiling_price": null,
+     "offset_jpy": 0,
+     "min_margin_rate": null,
+     "policy_note": null,
+     "policy_updated_at": null,
+     "policy_updated_by": null,
+     "custom_type_id": null,
+     "custom_type_name": null,
+     "ct_basis": null,
+     "ct_rival_scope": null,
+     "ct_direction": null,
+     "ct_offset_kind": null,
+     "ct_offset_value": null,
+     "ct_amazon_seller": null,
+     "ct_prime_as": null,
+     "ct_points": null,
+     "ct_solo_raise": null,
+     "ct_archived_at": null,
+     "custom_type": null,
+     "fee_now": null,
+     "stock": null,
+     "computed_floor": null,
+     "effective_floor": null,
+     "gross_now": {
+      "gross": null,
+      "rate": null
+     },
+     "buybox_gap": null,
+     "has_policy": false,
+     "live": {
+      "action": "hold",
+      "verdict_label": "保留",
+      "verdict_class": "hold",
+      "proposed_price": null,
+      "current_price": null,
+      "reason_code": "NO_MY_PRICE",
+      "reason_text": "自分の出品価格が取れていない・異常 (価格スナップショットに無い / 0 以下 / 上限超え)",
+      "confidence": null,
+      "flags": [
+       "CHANNEL_UNKNOWN"
+      ],
+      "computed_floor": null,
+      "effective_floor": null,
+      "gross_now": {
+       "gross": null,
+       "rate": null
+      }
+     }
+    }
+   ]
+  }
+ },
+ "pricing.http.listings.q": {
+  "status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "content_disposition": null,
+  "sha256": "3cfa2f88c432824c8b76b6857c3392e2cfe1a16ba39aabae63089a892cf443f3",
+  "body": {
+   "ok": true,
+   "rule_version": "rule:ap-v1",
+   "freshness": {
+    "snapshot_date_jst": "2026-10-02",
+    "snapshot_rows": 3,
+    "fees_fetched_at": "2026-10-02T21:00:00Z",
+    "fees_rows": 4,
+    "finance_last_date_jst": "2026-09-28",
+    "sku_norm_collisions": []
+   },
+   "count": 1,
+   "rows": [
+    {
+     "seller_sku": "PR_Gamma",
+     "asin": "B0GAMMA",
+     "channel": "AFN",
+     "referral_fee_rate": 0.1,
+     "fba_fee": 434,
+     "per_item_fee": 0,
+     "variable_closing_fee": 0,
+     "total_fee": 674,
+     "price_used": 2400,
+     "fees_fetched_at": "2026-10-02T21:00:00Z",
+     "snapshot_date_jst": "2026-10-02",
+     "my_price": 2400,
+     "buybox_price": 2400,
+     "buybox_is_mine": 1,
+     "ne_code": "ne-a",
+     "ne_name": "商品A",
+     "cost_incl_tax": 1210,
+     "cost_missing_parts": 0,
+     "parts": 2,
+     "ship_cost": 100,
+     "fba_stock": 0,
+     "own_stock": 3,
+     "units_30d": 47,
+     "sales_30d": 120000,
+     "mode": "off",
+     "floor_price": null,
+     "ceiling_price": null,
+     "offset_jpy": 0,
+     "min_margin_rate": null,
+     "policy_note": null,
+     "policy_updated_at": null,
+     "policy_updated_by": null,
+     "custom_type_id": null,
+     "custom_type_name": null,
+     "ct_basis": null,
+     "ct_rival_scope": null,
+     "ct_direction": null,
+     "ct_offset_kind": null,
+     "ct_offset_value": null,
+     "ct_amazon_seller": null,
+     "ct_prime_as": null,
+     "ct_points": null,
+     "ct_solo_raise": null,
+     "ct_archived_at": null,
+     "custom_type": null,
+     "fee_now": 674,
+     "stock": 3,
+     "computed_floor": null,
+     "effective_floor": null,
+     "gross_now": {
+      "gross": null,
+      "rate": null
+     },
+     "buybox_gap": 0,
+     "has_policy": false,
+     "live": {
+      "action": "keep",
+      "verdict_label": "維持",
+      "verdict_class": "keep",
+      "proposed_price": null,
+      "current_price": 2400,
+      "reason_code": "OFF",
+      "reason_text": "追従しない設定",
+      "confidence": null,
+      "flags": [
+       "CHANNEL_UNKNOWN"
+      ],
+      "computed_floor": null,
+      "effective_floor": null,
+      "gross_now": {
+       "gross": null,
+       "rate": null
+      }
+     }
+    }
+   ]
+  }
+ },
+ "pricing.http.export.csv": {
+  "status": 200,
+  "content_type": "text/csv; charset=utf-8",
+  "content_disposition": "attachment; filename=\"amazon-pricing-2026-10-03.csv\"",
+  "sha256": "4dbef810695c105c51f41654aeca476f9bee5a4de48de8b15640fe3db7639487",
+  "body": "﻿seller_sku,asin,channel,ne_code,ne_name,stock,my_price,buybox_price,buybox_is_mine,cost_incl_tax,fee_now,referral_fee_rate,fba_fee,ship_cost,gross_now,gross_rate_now,units_30d,computed_floor,floor_price,ceiling_price,offset_jpy,min_margin_rate,mode,custom_type,action,proposed_price,reason_code,reason_text,confidence,flags,snapshot_date_jst\r\npr_alpha,B0ALPHA,AFN,ne-a,商品A,12,1000,980,0,330,468,0.15,318,100,,,248,,,,0,,off,,keep,,OFF,追従しない設定,,CHANNEL_UNKNOWN,2026-10-02\r\npr_beta,B0BETA,MFN,ne-b,商品B,,800,,,,120,0.15,,100,,,123,,,,0,,off,,keep,,OFF,追従しない設定,,CHANNEL_UNKNOWN|COST_UNKNOWN,2026-10-02\r\nPR_Gamma,B0GAMMA,AFN,ne-a,商品A,3,2400,2400,1,1210,674,0.1,434,100,,,47,,,,0,,off,,keep,,OFF,追従しない設定,,CHANNEL_UNKNOWN,2026-10-02\r\npr_delta,B0DELTA,AFN,ne-d,商品D,,,,,220,,0.08,290,100,,,14,,,,0,,off,,hold,,NO_MY_PRICE,自分の出品価格が取れていない・異常 (価格スナップショットに無い / 0 以下 / 上限超え),,CHANNEL_UNKNOWN,2026-10-02"
+ },
+ "pricing.http.evaluations.run": {
+  "status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "content_disposition": null,
+  "sha256": "e5517797157e6570a1b13429f7db7222bf8575fd4f146751589f13a1abbb685a",
+  "body": {
+   "ok": true,
+   "run": {
+    "run_id": "apr-murt0io0-24twaz",
+    "started_at": "2026-10-03T03:00:00.000Z",
+    "finished_at": "2026-10-03T03:00:00.000Z",
+    "trigger": "manual",
+    "actor_id": "unknown",
+    "snapshot_date_jst": "2026-10-02",
+    "input_fingerprint": "2026-10-02|3|2026-10-02T21:00:00Z|4|2026-10-02T21:00:00Z|5|t|5|2026-10-01T00:00:00Z|1463|2026-09-28|2026-09-29T22:00:00Z",
+    "rule_version": "rule:ap-v1",
+    "status": "success",
+    "listings_total": 4,
+    "summary_json": "{\"by_action\":{\"raise\":0,\"lower\":0,\"keep\":3,\"hold\":1},\"by_reason\":{\"OFF\":3,\"NO_MY_PRICE\":1},\"flags\":{\"CHANNEL_UNKNOWN\":4,\"COST_UNKNOWN\":1},\"no_policy\":4,\"snapshot_date_jst\":\"2026-10-02\"}",
+    "error": null,
+    "summary": {
+     "by_action": {
+      "raise": 0,
+      "lower": 0,
+      "keep": 3,
+      "hold": 1
+     },
+     "by_reason": {
+      "OFF": 3,
+      "NO_MY_PRICE": 1
+     },
+     "flags": {
+      "CHANNEL_UNKNOWN": 4,
+      "COST_UNKNOWN": 1
+     },
+     "no_policy": 4,
+     "snapshot_date_jst": "2026-10-02"
+    }
+   },
+   "summary": {
+    "by_action": {
+     "raise": 0,
+     "lower": 0,
+     "keep": 3,
+     "hold": 1
+    },
+    "by_reason": {
+     "OFF": 3,
+     "NO_MY_PRICE": 1
+    },
+    "flags": {
+     "CHANNEL_UNKNOWN": 4,
+     "COST_UNKNOWN": 1
+    },
+    "no_policy": 4,
+    "snapshot_date_jst": "2026-10-02"
+   }
+  }
+ },
+ "pricing.http.health.after-run": {
+  "status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "content_disposition": null,
+  "sha256": "42160c984522a436cd75795254cd13cefc43d1d668f0ecccc57a6f44dad34413",
+  "body": {
+   "ok": true,
+   "writes_to_amazon": false,
+   "rule_version": "rule:ap-v1",
+   "mirror_tables": {
+    "ok": true,
+    "missing": []
+   },
+   "freshness": {
+    "snapshot_date_jst": "2026-10-02",
+    "snapshot_rows": 3,
+    "fees_fetched_at": "2026-10-02T21:00:00Z",
+    "fees_rows": 4,
+    "finance_last_date_jst": "2026-09-28",
+    "sku_norm_collisions": []
+   },
+   "latest_run": {
+    "run_id": "apr-murt0io0-mjbmqf",
+    "started_at": "2026-10-03T03:00:00.000Z",
+    "finished_at": "2026-10-03T03:00:00.000Z",
+    "trigger": "test",
+    "actor_id": "parity",
+    "snapshot_date_jst": "2026-10-02",
+    "input_fingerprint": "2026-10-02|3|2026-10-02T21:00:00Z|4|2026-10-02T21:00:00Z|5|t|5|2026-10-01T00:00:00Z|1463|2026-09-28|2026-09-29T22:00:00Z",
+    "rule_version": "rule:ap-v1",
+    "status": "success",
+    "listings_total": 4,
+    "summary_json": "{\"by_action\":{\"raise\":0,\"lower\":0,\"keep\":3,\"hold\":1},\"by_reason\":{\"OFF\":3,\"NO_MY_PRICE\":1},\"flags\":{\"CHANNEL_UNKNOWN\":4,\"COST_UNKNOWN\":1},\"no_policy\":4,\"snapshot_date_jst\":\"2026-10-02\"}",
+    "error": null,
+    "summary": {
+     "by_action": {
+      "raise": 0,
+      "lower": 0,
+      "keep": 3,
+      "hold": 1
+     },
+     "by_reason": {
+      "OFF": 3,
+      "NO_MY_PRICE": 1
+     },
+     "flags": {
+      "CHANNEL_UNKNOWN": 4,
+      "COST_UNKNOWN": 1
+     },
+     "no_policy": 4,
+     "snapshot_date_jst": "2026-10-02"
+    }
+   },
+   "policy_events": 0
+  }
+ },
  "supplier.health": {
   "status": 200,
   "content_type": "application/json; charset=utf-8",
@@ -14800,5 +15401,995 @@
    "pl_hash": null
   },
   "sha256": "5587087bd356eafe25b7ee486ef9ac16d96ed993c4da5e7e3d5dfa1ce3771a6b"
+ },
+ "ai.http.report-input.weekly": {
+  "status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "content_disposition": null,
+  "sha256": "8151ef5c64734910671fcddcbdd055a28b0309fe52e0450b2a03b596a929fa38",
+  "body": {
+   "meta": {
+    "report_type": "weekly",
+    "period_start": "2026-09-21",
+    "period_end": "2026-09-28",
+    "period_label": "2026-09-21〜2026-09-27",
+    "generated_at": "2026-10-03T03:00:00.000Z",
+    "data_as_of": "2026-10-03",
+    "input_schema_version": "1.0"
+   },
+   "coverage": [
+    {
+     "source_id": "finance:amazon",
+     "source_kind": "finance",
+     "unit": "amazon",
+     "requirement": "conditional",
+     "status": "partial",
+     "detail": "未取込日: 2026-09-25, 2026-09-26, 2026-09-27"
+    },
+    {
+     "source_id": "finance:aupay",
+     "source_kind": "finance",
+     "unit": "aupay",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:linegift",
+     "source_kind": "finance",
+     "unit": "linegift",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:qoo10",
+     "source_kind": "finance",
+     "unit": "qoo10",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:rakuten",
+     "source_kind": "finance",
+     "unit": "rakuten",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:yahoo",
+     "source_kind": "finance",
+     "unit": "yahoo",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "inventory:fba_inbound",
+     "source_kind": "inventory",
+     "unit": "fba_inbound",
+     "requirement": "reference",
+     "status": "missing",
+     "detail": "対象期間に日次スナップショットなし"
+    },
+    {
+     "source_id": "inventory:fba_warehouse",
+     "source_kind": "inventory",
+     "unit": "fba_warehouse",
+     "requirement": "required",
+     "status": "missing",
+     "detail": "対象期間に日次スナップショットなし"
+    },
+    {
+     "source_id": "inventory:own_warehouse",
+     "source_kind": "inventory",
+     "unit": "own_warehouse",
+     "requirement": "required",
+     "status": "missing",
+     "detail": "対象期間に日次スナップショットなし"
+    },
+    {
+     "source_id": "mf:mf",
+     "source_kind": "mf",
+     "unit": "mf",
+     "requirement": "reference",
+     "status": "missing",
+     "detail": "MF publish run (success) なし"
+    },
+    {
+     "source_id": "po:pml",
+     "source_kind": "po",
+     "unit": "pml",
+     "requirement": "conditional",
+     "status": "missing",
+     "detail": "mirror_pml_published 未設定"
+    },
+    {
+     "source_id": "sales:amazon",
+     "source_kind": "sales",
+     "unit": "amazon",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "sales:aupay",
+     "source_kind": "sales",
+     "unit": "aupay",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "sales:linegift",
+     "source_kind": "sales",
+     "unit": "linegift",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "sales:qoo10",
+     "source_kind": "sales",
+     "unit": "qoo10",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "sales:rakuten",
+     "source_kind": "sales",
+     "unit": "rakuten",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "sales:yahoo",
+     "source_kind": "sales",
+     "unit": "yahoo",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    }
+   ],
+   "constraints": {
+    "generation": "allowed",
+    "data_quality_status": "degraded",
+    "prohibited_topic_areas": [
+     {
+      "area": "margin:amazon",
+      "reason": "未取込日: 2026-09-25, 2026-09-26, 2026-09-27"
+     },
+     {
+      "area": "inventory:fba_inbound",
+      "reason": "対象期間に日次スナップショットなし"
+     },
+     {
+      "area": "inventory:fba_warehouse",
+      "reason": "対象期間に日次スナップショットなし"
+     },
+     {
+      "area": "inventory:own_warehouse",
+      "reason": "対象期間に日次スナップショットなし"
+     },
+     {
+      "area": "po_outstanding",
+      "reason": "mirror_pml_published 未設定"
+     }
+    ]
+   },
+   "facts": {
+    "sales": {
+     "by_mall": [
+      {
+       "mall": "amazon",
+       "sales_yen": 164010,
+       "units": 133,
+       "prev_week_sales_yen": 164010,
+       "prev_week_units": 133,
+       "prior_4w_median_sales_yen": 164010,
+       "wow_pct": 0
+      }
+     ],
+     "daily": [
+      {
+       "mall": "amazon",
+       "date": "2026-09-21",
+       "sales_yen": 23430,
+       "units": 19
+      },
+      {
+       "mall": "amazon",
+       "date": "2026-09-22",
+       "sales_yen": 23430,
+       "units": 19
+      },
+      {
+       "mall": "amazon",
+       "date": "2026-09-23",
+       "sales_yen": 23430,
+       "units": 19
+      },
+      {
+       "mall": "amazon",
+       "date": "2026-09-24",
+       "sales_yen": 23430,
+       "units": 19
+      },
+      {
+       "mall": "amazon",
+       "date": "2026-09-25",
+       "sales_yen": 23430,
+       "units": 19
+      },
+      {
+       "mall": "amazon",
+       "date": "2026-09-26",
+       "sales_yen": 23430,
+       "units": 19
+      },
+      {
+       "mall": "amazon",
+       "date": "2026-09-27",
+       "sales_yen": 23430,
+       "units": 19
+      }
+     ],
+     "company": {
+      "sales_yen": 164010,
+      "units": 133,
+      "prev_week_sales_yen": 164010,
+      "wow_pct": 0
+     }
+    },
+    "margin": {
+     "by_mall": [
+      {
+       "mall": "amazon",
+       "margin_yen": 70404,
+       "sales_yen": 167860,
+       "margin_pct": 41.9,
+       "prev_week_margin_yen": 55653,
+       "prev_week_margin_pct": 35.5,
+       "cost_ok_row_share_pct": 0,
+       "note": "amazonのみ税抜基準 (margin_basis=excl_tax)"
+      },
+      {
+       "mall": "aupay",
+       "margin_yen": 2800,
+       "sales_yen": 15400,
+       "margin_pct": 18.2,
+       "prev_week_margin_yen": 2100,
+       "prev_week_margin_pct": 18.2,
+       "cost_ok_row_share_pct": 0
+      },
+      {
+       "mall": "linegift",
+       "margin_yen": -100,
+       "sales_yen": 4400,
+       "margin_pct": -2.3,
+       "prev_week_margin_yen": -100,
+       "prev_week_margin_pct": -2.3,
+       "cost_ok_row_share_pct": 0
+      },
+      {
+       "mall": "qoo10",
+       "margin_yen": 490,
+       "sales_yen": 3000,
+       "margin_pct": 16.3,
+       "prev_week_margin_yen": 730,
+       "prev_week_margin_pct": 16.2,
+       "cost_ok_row_share_pct": 0
+      },
+      {
+       "mall": "rakuten",
+       "margin_yen": 3500,
+       "sales_yen": 23100,
+       "margin_pct": 15.2,
+       "prev_week_margin_yen": 2800,
+       "prev_week_margin_pct": 12.1,
+       "cost_ok_row_share_pct": 0
+      },
+      {
+       "mall": "yahoo",
+       "margin_yen": 1340,
+       "sales_yen": 9240,
+       "margin_pct": 14.5,
+       "prev_week_margin_yen": 1320,
+       "prev_week_margin_pct": 14.3,
+       "cost_ok_row_share_pct": 0
+      }
+     ],
+     "negative_margin_skus": [],
+     "note": "粗利は原価整備済み行のみのワースト抽出。cost_ok_row_share_pct が低いモールは粗利の信頼度も低い"
+    },
+    "inventory": {
+     "by_category": [],
+     "as_of": "2026-09-27",
+     "stale_skus": null,
+     "low_supply_skus_14d": null
+    },
+    "po": {
+     "outstanding_qty": 0,
+     "outstanding_value_yen": 0,
+     "as_of": null,
+     "note": "発注残 = 将来の仕入支払コミットメント (原価ベース概算)"
+    },
+    "mf": {
+     "available": false
+    }
+   },
+   "events": {
+    "entries": [],
+    "note": "イベントは「実施された」事実のみ。売上への因果は仮説として扱うこと (断定禁止)"
+   },
+   "budget": {
+    "available": false,
+    "entries": [],
+    "budget_revision_id": null,
+    "note": "予算未入力。予算差に言及する論点は生成禁止 (前年比・トレンドのみで論じる)"
+   },
+   "previous_open_topics": [],
+   "recent_reports": []
+  }
+ },
+ "ai.http.report-input.weekly.default": {
+  "status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "content_disposition": null,
+  "sha256": "8151ef5c64734910671fcddcbdd055a28b0309fe52e0450b2a03b596a929fa38",
+  "body": {
+   "meta": {
+    "report_type": "weekly",
+    "period_start": "2026-09-21",
+    "period_end": "2026-09-28",
+    "period_label": "2026-09-21〜2026-09-27",
+    "generated_at": "2026-10-03T03:00:00.000Z",
+    "data_as_of": "2026-10-03",
+    "input_schema_version": "1.0"
+   },
+   "coverage": [
+    {
+     "source_id": "finance:amazon",
+     "source_kind": "finance",
+     "unit": "amazon",
+     "requirement": "conditional",
+     "status": "partial",
+     "detail": "未取込日: 2026-09-25, 2026-09-26, 2026-09-27"
+    },
+    {
+     "source_id": "finance:aupay",
+     "source_kind": "finance",
+     "unit": "aupay",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:linegift",
+     "source_kind": "finance",
+     "unit": "linegift",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:qoo10",
+     "source_kind": "finance",
+     "unit": "qoo10",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:rakuten",
+     "source_kind": "finance",
+     "unit": "rakuten",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:yahoo",
+     "source_kind": "finance",
+     "unit": "yahoo",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "inventory:fba_inbound",
+     "source_kind": "inventory",
+     "unit": "fba_inbound",
+     "requirement": "reference",
+     "status": "missing",
+     "detail": "対象期間に日次スナップショットなし"
+    },
+    {
+     "source_id": "inventory:fba_warehouse",
+     "source_kind": "inventory",
+     "unit": "fba_warehouse",
+     "requirement": "required",
+     "status": "missing",
+     "detail": "対象期間に日次スナップショットなし"
+    },
+    {
+     "source_id": "inventory:own_warehouse",
+     "source_kind": "inventory",
+     "unit": "own_warehouse",
+     "requirement": "required",
+     "status": "missing",
+     "detail": "対象期間に日次スナップショットなし"
+    },
+    {
+     "source_id": "mf:mf",
+     "source_kind": "mf",
+     "unit": "mf",
+     "requirement": "reference",
+     "status": "missing",
+     "detail": "MF publish run (success) なし"
+    },
+    {
+     "source_id": "po:pml",
+     "source_kind": "po",
+     "unit": "pml",
+     "requirement": "conditional",
+     "status": "missing",
+     "detail": "mirror_pml_published 未設定"
+    },
+    {
+     "source_id": "sales:amazon",
+     "source_kind": "sales",
+     "unit": "amazon",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "sales:aupay",
+     "source_kind": "sales",
+     "unit": "aupay",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "sales:linegift",
+     "source_kind": "sales",
+     "unit": "linegift",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "sales:qoo10",
+     "source_kind": "sales",
+     "unit": "qoo10",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "sales:rakuten",
+     "source_kind": "sales",
+     "unit": "rakuten",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "sales:yahoo",
+     "source_kind": "sales",
+     "unit": "yahoo",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    }
+   ],
+   "constraints": {
+    "generation": "allowed",
+    "data_quality_status": "degraded",
+    "prohibited_topic_areas": [
+     {
+      "area": "margin:amazon",
+      "reason": "未取込日: 2026-09-25, 2026-09-26, 2026-09-27"
+     },
+     {
+      "area": "inventory:fba_inbound",
+      "reason": "対象期間に日次スナップショットなし"
+     },
+     {
+      "area": "inventory:fba_warehouse",
+      "reason": "対象期間に日次スナップショットなし"
+     },
+     {
+      "area": "inventory:own_warehouse",
+      "reason": "対象期間に日次スナップショットなし"
+     },
+     {
+      "area": "po_outstanding",
+      "reason": "mirror_pml_published 未設定"
+     }
+    ]
+   },
+   "facts": {
+    "sales": {
+     "by_mall": [
+      {
+       "mall": "amazon",
+       "sales_yen": 164010,
+       "units": 133,
+       "prev_week_sales_yen": 164010,
+       "prev_week_units": 133,
+       "prior_4w_median_sales_yen": 164010,
+       "wow_pct": 0
+      }
+     ],
+     "daily": [
+      {
+       "mall": "amazon",
+       "date": "2026-09-21",
+       "sales_yen": 23430,
+       "units": 19
+      },
+      {
+       "mall": "amazon",
+       "date": "2026-09-22",
+       "sales_yen": 23430,
+       "units": 19
+      },
+      {
+       "mall": "amazon",
+       "date": "2026-09-23",
+       "sales_yen": 23430,
+       "units": 19
+      },
+      {
+       "mall": "amazon",
+       "date": "2026-09-24",
+       "sales_yen": 23430,
+       "units": 19
+      },
+      {
+       "mall": "amazon",
+       "date": "2026-09-25",
+       "sales_yen": 23430,
+       "units": 19
+      },
+      {
+       "mall": "amazon",
+       "date": "2026-09-26",
+       "sales_yen": 23430,
+       "units": 19
+      },
+      {
+       "mall": "amazon",
+       "date": "2026-09-27",
+       "sales_yen": 23430,
+       "units": 19
+      }
+     ],
+     "company": {
+      "sales_yen": 164010,
+      "units": 133,
+      "prev_week_sales_yen": 164010,
+      "wow_pct": 0
+     }
+    },
+    "margin": {
+     "by_mall": [
+      {
+       "mall": "amazon",
+       "margin_yen": 70404,
+       "sales_yen": 167860,
+       "margin_pct": 41.9,
+       "prev_week_margin_yen": 55653,
+       "prev_week_margin_pct": 35.5,
+       "cost_ok_row_share_pct": 0,
+       "note": "amazonのみ税抜基準 (margin_basis=excl_tax)"
+      },
+      {
+       "mall": "aupay",
+       "margin_yen": 2800,
+       "sales_yen": 15400,
+       "margin_pct": 18.2,
+       "prev_week_margin_yen": 2100,
+       "prev_week_margin_pct": 18.2,
+       "cost_ok_row_share_pct": 0
+      },
+      {
+       "mall": "linegift",
+       "margin_yen": -100,
+       "sales_yen": 4400,
+       "margin_pct": -2.3,
+       "prev_week_margin_yen": -100,
+       "prev_week_margin_pct": -2.3,
+       "cost_ok_row_share_pct": 0
+      },
+      {
+       "mall": "qoo10",
+       "margin_yen": 490,
+       "sales_yen": 3000,
+       "margin_pct": 16.3,
+       "prev_week_margin_yen": 730,
+       "prev_week_margin_pct": 16.2,
+       "cost_ok_row_share_pct": 0
+      },
+      {
+       "mall": "rakuten",
+       "margin_yen": 3500,
+       "sales_yen": 23100,
+       "margin_pct": 15.2,
+       "prev_week_margin_yen": 2800,
+       "prev_week_margin_pct": 12.1,
+       "cost_ok_row_share_pct": 0
+      },
+      {
+       "mall": "yahoo",
+       "margin_yen": 1340,
+       "sales_yen": 9240,
+       "margin_pct": 14.5,
+       "prev_week_margin_yen": 1320,
+       "prev_week_margin_pct": 14.3,
+       "cost_ok_row_share_pct": 0
+      }
+     ],
+     "negative_margin_skus": [],
+     "note": "粗利は原価整備済み行のみのワースト抽出。cost_ok_row_share_pct が低いモールは粗利の信頼度も低い"
+    },
+    "inventory": {
+     "by_category": [],
+     "as_of": "2026-09-27",
+     "stale_skus": null,
+     "low_supply_skus_14d": null
+    },
+    "po": {
+     "outstanding_qty": 0,
+     "outstanding_value_yen": 0,
+     "as_of": null,
+     "note": "発注残 = 将来の仕入支払コミットメント (原価ベース概算)"
+    },
+    "mf": {
+     "available": false
+    }
+   },
+   "events": {
+    "entries": [],
+    "note": "イベントは「実施された」事実のみ。売上への因果は仮説として扱うこと (断定禁止)"
+   },
+   "budget": {
+    "available": false,
+    "entries": [],
+    "budget_revision_id": null,
+    "note": "予算未入力。予算差に言及する論点は生成禁止 (前年比・トレンドのみで論じる)"
+   },
+   "previous_open_topics": [],
+   "recent_reports": []
+  }
+ },
+ "ai.http.report-input.monthly": {
+  "status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "content_disposition": null,
+  "sha256": "5587087bd356eafe25b7ee486ef9ac16d96ed993c4da5e7e3d5dfa1ce3771a6b",
+  "body": {
+   "meta": {
+    "report_type": "monthly",
+    "month_ym": "2026-08",
+    "period_start": "2026-08-01",
+    "period_end": "2026-09-01",
+    "period_label": "2026-08月次",
+    "generated_at": "2026-10-03T03:00:00.000Z",
+    "data_as_of": "2026-10-03",
+    "input_schema_version": "1.0"
+   },
+   "closing": {
+    "year_month": "2026-08",
+    "status": "open",
+    "declare_seq": 0,
+    "declared_at": null,
+    "mf_synced_after_declare": false,
+    "provisional_state": null,
+    "final_state": null,
+    "needs_correction": false
+   },
+   "coverage": [
+    {
+     "source_id": "sales:all",
+     "source_kind": "sales",
+     "unit": "all",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:amazon",
+     "source_kind": "finance",
+     "unit": "amazon",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:rakuten",
+     "source_kind": "finance",
+     "unit": "rakuten",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:yahoo",
+     "source_kind": "finance",
+     "unit": "yahoo",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:aupay",
+     "source_kind": "finance",
+     "unit": "aupay",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:linegift",
+     "source_kind": "finance",
+     "unit": "linegift",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:qoo10",
+     "source_kind": "finance",
+     "unit": "qoo10",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "mf:pl_monthly",
+     "source_kind": "mf",
+     "unit": "mf",
+     "requirement": "conditional",
+     "status": "missing",
+     "detail": "MF月次PLに 2026-08 の行なし"
+    }
+   ],
+   "constraints": {
+    "generation": "allowed",
+    "data_quality_status": "degraded",
+    "mf_reliability": "provisional",
+    "prohibited_topic_areas": [
+     {
+      "area": "mf_pl",
+      "reason": "MF月次PL未取込。会計数値の論点は生成禁止"
+     }
+    ]
+   },
+   "facts": {
+    "pl": {
+     "this_month": null,
+     "prev_month": null,
+     "last_year_same_month": null,
+     "yoy_sales_pct": null,
+     "sgae_yoy_top_increases": [],
+     "reliability": "暫定 (MF仕訳入力ラグあり。締め宣言前)"
+    },
+    "bs": {
+     "this_month": null,
+     "prev_month": null
+    },
+    "channel_sales": [],
+    "fy": [],
+    "anomaly_signals": [],
+    "mall_sales": [
+     {
+      "mall": "amazon",
+      "sales_yen": 726330,
+      "units": 589,
+      "prev_month_sales_yen": 726330,
+      "mom_pct": 0,
+      "last_year_sales_yen": null,
+      "yoy_pct": null
+     }
+    ],
+    "stock": {
+     "eom_qty": null,
+     "prev_eom_qty": null,
+     "eom_value_yen": null,
+     "note": "在庫金額は月末日近傍の日次スナップショット合計 (FBA+自社倉庫) の近似値"
+    },
+    "cash_flow_month": {
+     "this_month": {
+      "in": 0,
+      "out": 0
+     },
+     "prev_month": {
+      "in": 0,
+      "out": 0
+     },
+     "note": "銀行口座入出金の gross 集計。口座間振替を含むため純増減の解釈は不可"
+    }
+   },
+   "events": {
+    "entries": [],
+    "note": "イベントは「実施された」事実のみ。因果は仮説として扱うこと"
+   },
+   "budget": {
+    "available": false,
+    "note": "予算未入力。予算差に言及する論点は生成禁止 (前年比で論じる)"
+   },
+   "previous_open_topics": [],
+   "recent_reports": [],
+   "pl_hash": null
+  }
+ },
+ "ai.http.report-input.monthly.default": {
+  "status": 200,
+  "content_type": "application/json; charset=utf-8",
+  "content_disposition": null,
+  "sha256": "7572599599e460e3b91c497807cfaf6e56aaad0482f8372fff28ef4a94f05ccd",
+  "body": {
+   "meta": {
+    "report_type": "monthly",
+    "month_ym": "2026-09",
+    "period_start": "2026-09-01",
+    "period_end": "2026-10-01",
+    "period_label": "2026-09月次",
+    "generated_at": "2026-10-03T03:00:00.000Z",
+    "data_as_of": "2026-10-03",
+    "input_schema_version": "1.0"
+   },
+   "closing": {
+    "year_month": "2026-09",
+    "status": "open",
+    "declare_seq": 0,
+    "declared_at": null,
+    "mf_synced_after_declare": false,
+    "provisional_state": null,
+    "final_state": null,
+    "needs_correction": false
+   },
+   "coverage": [
+    {
+     "source_id": "sales:all",
+     "source_kind": "sales",
+     "unit": "all",
+     "requirement": "required",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:amazon",
+     "source_kind": "finance",
+     "unit": "amazon",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": "未取込 6/30日"
+    },
+    {
+     "source_id": "finance:rakuten",
+     "source_kind": "finance",
+     "unit": "rakuten",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:yahoo",
+     "source_kind": "finance",
+     "unit": "yahoo",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:aupay",
+     "source_kind": "finance",
+     "unit": "aupay",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:linegift",
+     "source_kind": "finance",
+     "unit": "linegift",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "finance:qoo10",
+     "source_kind": "finance",
+     "unit": "qoo10",
+     "requirement": "conditional",
+     "status": "ok",
+     "detail": null
+    },
+    {
+     "source_id": "mf:pl_monthly",
+     "source_kind": "mf",
+     "unit": "mf",
+     "requirement": "conditional",
+     "status": "missing",
+     "detail": "MF月次PLに 2026-09 の行なし"
+    }
+   ],
+   "constraints": {
+    "generation": "allowed",
+    "data_quality_status": "degraded",
+    "mf_reliability": "provisional",
+    "prohibited_topic_areas": [
+     {
+      "area": "mf_pl",
+      "reason": "MF月次PL未取込。会計数値の論点は生成禁止"
+     }
+    ]
+   },
+   "facts": {
+    "pl": {
+     "this_month": null,
+     "prev_month": null,
+     "last_year_same_month": null,
+     "yoy_sales_pct": null,
+     "sgae_yoy_top_increases": [],
+     "reliability": "暫定 (MF仕訳入力ラグあり。締め宣言前)"
+    },
+    "bs": {
+     "this_month": null,
+     "prev_month": null
+    },
+    "channel_sales": [],
+    "fy": [],
+    "anomaly_signals": [],
+    "mall_sales": [
+     {
+      "mall": "amazon",
+      "sales_yen": 702900,
+      "units": 570,
+      "prev_month_sales_yen": 726330,
+      "mom_pct": -3.2,
+      "last_year_sales_yen": 257730,
+      "yoy_pct": 172.7
+     }
+    ],
+    "stock": {
+     "eom_qty": null,
+     "prev_eom_qty": null,
+     "eom_value_yen": null,
+     "note": "在庫金額は月末日近傍の日次スナップショット合計 (FBA+自社倉庫) の近似値"
+    },
+    "cash_flow_month": {
+     "this_month": {
+      "in": 0,
+      "out": 0
+     },
+     "prev_month": {
+      "in": 0,
+      "out": 0
+     },
+     "note": "銀行口座入出金の gross 集計。口座間振替を含むため純増減の解釈は不可"
+    }
+   },
+   "events": {
+    "entries": [],
+    "note": "イベントは「実施された」事実のみ。因果は仮説として扱うこと"
+   },
+   "budget": {
+    "available": false,
+    "note": "予算未入力。予算差に言及する論点は生成禁止 (前年比で論じる)"
+   },
+   "previous_open_topics": [],
+   "recent_reports": [],
+   "pl_hash": null
+  }
  }
 }

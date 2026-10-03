@@ -18,6 +18,10 @@
  * 使い方:
  *   node scripts/test-amazon-finance-read-parity.mjs            比べる (違えば exit 1・実際の値を一時の場所に書く)
  *   node scripts/test-amazon-finance-read-parity.mjs --write    golden を作り直す (🚨 値を変える PR だけ。差分を PR に載せる)
+ *   node scripts/test-amazon-finance-read-parity.mjs --write --code-root <dir>
+ *        <dir> (別の worktree) のアプリのコードを呼んで golden を作る。読み口を入れる前のコードで golden を作るときに使う
+ *        (例: git worktree add <dir> 1fdd5efa → <dir>/node_modules を用意 → この試験をこの枝から --code-root <dir> で流す)。
+ *        比べるとき (--write なし) にも使える = 「前のコード」と golden の一致をいつでも確かめ直せる
  *
  * 🚨 F4 (Amazon 財務の利用側の切替) の間だけの試験。F4-6 で旧い写しを消すときに一緒に消す
  *    (それまでに Amazon の財務の画面の値を変える PR は --write で golden を作り直し、差分を PR の本文に書く)。
@@ -30,9 +34,13 @@ import crypto from 'node:crypto';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
 const WRITE = process.argv.includes('--write');
+// 呼ぶアプリのコードの場所 (既定 = この試験のある repo)。Codex #1599 R1 M4: golden を「前のコード」で作った証跡を再現できるように
+const codeRootArg = process.argv.indexOf('--code-root');
+const CODE_ROOT_ARG = codeRootArg >= 0 ? process.argv[codeRootArg + 1] : null;
 const SCRATCH = await temporaryTestDataDir(import.meta.url, 'afin-parity-');
 process.env.DATA_DIR = SCRATCH;
 process.env.SITE_PRODUCTS_READ_TOKEN = 'parity-read-token';
+process.env.AI_READ_TOKEN = 'parity-ai-read-token';
 delete process.env.MARGIN_ALERT_THRESHOLD_PCT;
 
 // ── 時刻と乱数を固定 (応答の generated_at・判定の run の id を決まった値にする) ──
@@ -48,7 +56,9 @@ Math.random = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return se
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const GOLDEN = path.join(REPO, 'scripts/fixtures/amazon-finance-read-parity.golden.json');
-const imp = (p) => import(pathToFileURL(path.join(REPO, p)).href);
+const CODE = CODE_ROOT_ARG ? path.resolve(CODE_ROOT_ARG) : REPO;
+if (!fs.existsSync(path.join(CODE, 'apps/warehouse-mirror/db.js'))) throw new Error(`--code-root にアプリのコードが無い: ${CODE}`);
+const imp = (p) => import(pathToFileURL(path.join(CODE, p)).href);
 
 const { initMirrorDB, getMirrorDB } = await imp('apps/warehouse-mirror/db.js');
 initMirrorDB();
@@ -212,16 +222,20 @@ const pricingEval = await imp('apps/amazon-pricing/evaluate.js');
 const aiDb = await imp('apps/ai-insights/db.js');
 const aiFacts = await imp('apps/ai-insights/facts.js');
 const aiMonthly = await imp('apps/ai-insights/facts-monthly.js');
+const pricingRouter = (await imp('apps/amazon-pricing/router.js')).default;
+const { aiInsightsApiRouter } = await imp('apps/ai-insights/router.js');
 
 const app = express();
 app.use('/amazon-dashboard', dashRouter);
 app.use('/supplier-sales', supplierRouter);
 app.use('/site', siteRouter);
 app.use('/purchase-orders', express.json(), poRouter);
+app.use('/amazon-pricing', pricingRouter);            // 本番は requireAppAccess の後ろ (session 無し = actor 'unknown')
+app.use('/api/ai-insights', aiInsightsApiRouter);      // 本番と同じ口 (x-read-token)
 const server = app.listen(0);
 const base = `http://127.0.0.1:${server.address().port}`;
-async function get(key, url, headers = {}) {
-  const res = await fetch(base + url, { headers });
+async function get(key, url, headers = {}, method = 'GET') {
+  const res = await fetch(base + url, { headers, method, body: method === 'POST' ? '{}' : undefined });
   const buf = Buffer.from(await res.arrayBuffer());
   const ct = res.headers.get('content-type') || '';
   const text = buf.toString('utf8');
@@ -286,6 +300,14 @@ try {
     const r = pricingEval.runEvaluation(db, { trigger: 'test', actorId: 'parity', force: true });
     return { ...r, evaluations: pricingDb.evaluationsOfRun(db, r.run.run_id) };
   });
+  // HTTP の口 (Codex #1599 R1 M4)。/api/evaluations/run は書き込む (ap_eval_runs・ap_evaluations) が、一時の DATA_DIR の fixture の中だけ
+  const P = '/amazon-pricing/api';
+  await get('pricing.http.health', `${P}/health`);
+  await get('pricing.http.listings', `${P}/listings.json`);
+  await get('pricing.http.listings.q', `${P}/listings.json?q=gam`);
+  await get('pricing.http.export.csv', `${P}/export.csv`);
+  await get('pricing.http.evaluations.run', `${P}/evaluations/run`, { 'content-type': 'application/json', origin: base }, 'POST');   // 画面からの操作と同じ (CSRF の 2 段の守り = Origin と JSON)
+  await get('pricing.http.health.after-run', `${P}/health`);
 
   // supplier-sales (社内の口。公開の口 public-router.js も同じ getSupplierReport / getSupplierDailyDetail を使う)
   const S = '/supplier-sales/api';
@@ -317,6 +339,12 @@ try {
   aiDb.initAiInsightsTables(db);
   call('ai.weekly', () => aiFacts.buildWeeklyReportInput(db, { periodStart: '2026-09-21' }));
   call('ai.monthly', () => aiMonthly.buildMonthlyReportInput(db, { month: '2026-08' }));
+  // HTTP の口 (Codex #1599 R1 M4・PC の runner が取る /api/ai-insights/report-input)
+  const AI = { 'x-read-token': 'parity-ai-read-token' };
+  await get('ai.http.report-input.weekly', '/api/ai-insights/report-input?type=weekly&period_start=2026-09-21', AI);
+  await get('ai.http.report-input.weekly.default', '/api/ai-insights/report-input?type=weekly', AI);
+  await get('ai.http.report-input.monthly', '/api/ai-insights/report-input?type=monthly&month=2026-08', AI);
+  await get('ai.http.report-input.monthly.default', '/api/ai-insights/report-input?type=monthly', AI);
 } finally {
   await new Promise((resolve) => server.close(resolve));
 }
@@ -332,7 +360,7 @@ db.close();
 if (WRITE) {
   fs.mkdirSync(path.dirname(GOLDEN), { recursive: true });
   fs.writeFileSync(GOLDEN, serialized);
-  console.log(`golden を書いた: ${path.relative(REPO, GOLDEN)} (${Object.keys(out).length} 口・${serialized.length} 文字)`);
+  console.log(`golden を書いた: ${path.relative(REPO, GOLDEN)} (${Object.keys(out).length} 口・${serialized.length} 文字・呼んだコード = ${CODE})`);
 } else {
   const golden = JSON.parse(fs.readFileSync(GOLDEN, 'utf8'));
   let fail = 0;
@@ -350,6 +378,6 @@ if (WRITE) {
     console.log(`\n❌ ${fail} / ${keys.size} 口で応答が golden と違う (今回の値 = ${actual})`);
     process.exitCode = 1;
   } else {
-    console.log(`✅ ${keys.size} 口の応答が golden と 1 バイトも違わない (golden = 読み口を入れる前のコード)${errs.length ? `・前も後も失敗 / 200 以外 = ${errs.join(', ')}` : ''}`);
+    console.log(`✅ ${keys.size} 口の応答が golden と 1 バイトも違わない (golden = 読み口を入れる前のコード・呼んだコード = ${CODE})${errs.length ? `・前も後も失敗 / 200 以外 = ${errs.join(', ')}` : ''}`);
   }
 }
