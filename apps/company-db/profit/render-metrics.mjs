@@ -385,6 +385,64 @@ export async function fetchPostgresMetrics(opts = {}) {
   }
 }
 
+/** 200 でない応答の理由 (本文は読まずに捨てる) */
+async function statusReason(res) {
+  await discardBody(res);
+  const st = res.status;
+  if (st === 401 || st === 403) return 'METRICS_AUTH';
+  if (st === 429) return 'METRICS_RATE_LIMITED';
+  if (st >= 500 && st <= 599) return 'METRICS_UPSTREAM';
+  return 'METRICS_HTTP';
+}
+
+/**
+ * 🆕 (PR #1606・設計 13 v3.13 ④ = 容量の resource と接続先の照合) Postgres の resource の名札を読む = GET /v1/postgres/{ID} の id と databaseName。
+ * 🚨 password を返す connection-info (GET /v1/postgres/{ID}/connection-info) は読まない。応答の本文はそのまま返さない (id と databaseName だけ)。
+ * 例外は投げない。戻り = { ok: true, id, databaseName } | { ok: false, reason } (reason は REASONS のどれか)。
+ *   id が設定の ID と違う = METRICS_WRONG_RESOURCE / databaseName が無い・文字でない = METRICS_SHAPE
+ * @param {{ apiKey: RenderApiKey, resourceId: string, fetchImpl?: typeof fetch, timeoutMs?: number, baseUrl?: string }} opts
+ */
+export async function fetchPostgresIdentity(opts = {}) {
+  try {
+    const { apiKey, resourceId, fetchImpl = globalThis.fetch, timeoutMs = DEFAULT_TIMEOUT_MS, baseUrl = RENDER_API_BASE } = opts;
+    if (!(apiKey instanceof RenderApiKey) || typeof resourceId !== 'string' || !RESOURCE_ID_RE.test(resourceId)) return fail('METRICS_CONFIG');
+    if (typeof fetchImpl !== 'function') return fail('METRICS_CONFIG');
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10000) return fail('METRICS_CONFIG');
+    if (baseUrl !== RENDER_API_BASE && !LOOPBACK_BASE_RE.test(baseUrl)) return fail('METRICS_CONFIG');
+    const ac = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ac.abort(); }, timeoutMs);
+    try {
+      let res;
+      try {
+        res = await fetchImpl(`${baseUrl}/postgres/${encodeURIComponent(resourceId)}`, {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${revealKey(apiKey)}`, Accept: 'application/json' },
+          redirect: 'error',
+          signal: ac.signal,
+        });
+      } catch {
+        return fail(timedOut ? 'METRICS_TIMEOUT' : 'METRICS_NETWORK');
+      }
+      if (res.status !== 200) return fail(await statusReason(res));
+      let body;
+      try { body = parseJsonIntegersOnly(await readBodyTextCapped(res)); } catch (e) {
+        if (timedOut) return fail('METRICS_TIMEOUT');
+        return fail(e instanceof Reject ? e.reason : 'METRICS_SHAPE');
+      }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return fail('METRICS_SHAPE');
+      if (body.id !== resourceId) return fail('METRICS_WRONG_RESOURCE');
+      if (typeof body.databaseName !== 'string' || !body.databaseName) return fail('METRICS_SHAPE');
+      return Object.freeze({ ok: true, id: body.id, databaseName: body.databaseName });
+    } finally {
+      clearTimeout(timer);
+      ac.abort();
+    }
+  } catch (e) {
+    return fail(e instanceof Reject ? e.reason : 'METRICS_INTERNAL');
+  }
+}
+
 /**
  * 使う直前の鮮度の再検査 (§3.10 の取引の 4. = lock の直後)。この部品が作った snapshot だけを認める (手で作った物・古い物は STALE)
  * @returns {{ ok: true } | { ok: false, reason: 'METRICS_STALE' }}
