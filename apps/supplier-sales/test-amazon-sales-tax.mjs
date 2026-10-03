@@ -149,7 +149,14 @@ const html = await ejs.renderFile(path.join(repoRoot, 'views/supplier-sales-publ
   query: { period: 'custom', start: OPTS.start, end: OPTS.end, tab: 'kakutei' },
 });
 ok(!/送料は含まず/.test(html), '「送料は含まず」と書かない (楽天・au PAY・Amazon は送料を含む)');
-ok(/商品代金・送料など、消費税込み/.test(html) && /全モール同じ基準/.test(html), '税込・送料込み・全モール同じ基準と書く');
+ok(/各モールの税込の総売上（商品代金・送料等）の合計/.test(html), '売上 = 各モールの税込の総売上 (商品代金・送料等) と書く');
+ok(/店負担のクーポン・値引き・ポイント・返金・モールの手数料は原則として差し引く前/.test(html),
+  'クーポン・値引き・ポイント・返金・手数料は差し引く前と書く (gross の実際の契約)');
+ok(/ピース数は返品・キャンセルを反映/.test(html), '返品・キャンセルの反映はピース数に限って書く');
+// Codex #1598 R1 Medium: 精算額・入金額と取られる言い過ぎを書かない
+for (const bad of ['お客さまが実際に支払った', 'お客さまがその出品に支払った', '全モール同じ基準', '返品・キャンセルを差し引いた実績']) {
+  ok(!html.includes(bad), `「${bad}」と書かない`);
+}
 ok(html.includes('9,116'), '公開ページの売上の合計 9,116', null);
 
 console.log(`\n═══ 結果: ${pass} PASS / ${fail} FAIL ═══`);
