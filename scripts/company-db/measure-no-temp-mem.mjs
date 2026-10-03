@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /**
- * measure-no-temp-mem.mjs — 0057 (一時の表を使わない relink_shipments_bulk / merge_duplicate_suppliers) の backend のピークのメモリを測る (Codex PR #1605 R1 High)
+ * measure-no-temp-mem.mjs — 0057 (一時の表を使わない relink_shipments_bulk / merge_duplicate_suppliers) の backend のピークのメモリを測る (Codex PR #1605 R1 High・R2 High)
  *
  * 使い捨ての PostgreSQL (embedded-postgres・試験と同じ版) を起動し、大きめの fixture で 旧 (0056 まで = 0017 / 0027 の一時の表) と 新 (0057) を呼んで、
  * 呼んだ接続の backend のプロセスの **ピークの private のメモリ** (Windows = PeakPagefileUsage = Get-Process の PeakPagedMemorySize64。共有メモリ (shared_buffers) は入らない) と
  * ピークの working set (共有メモリの触ったページも入る)・一時のファイルのバイト数 (pg_stat_database.temp_bytes の増え分)・時間を表にする。
  *   --r1-sql <file>   R1 の版 (配列・jsonb の変数) の 0057 の SQL も測る (git show d0e8e24e:db/company/migrations/0057_no_temp_relink_merge.sql > r1.sql)
+ *   --r2-sql <file>   R2 の版 (1 つの文の CTE + array_agg(…)[1] + 恒真の条件) の 0057 の SQL も測る (git show 88648aef:db/company/migrations/0057_no_temp_relink_merge.sql > r2.sql)
  *   --work-mem 4MB    work_mem (既定 = PostgreSQL の既定 4MB)
- *   --cases a,b       測るもの (既定 = 全部: relink-short / relink-long / merge-small / merge-large)
+ *   --cases a,b       測るもの (既定 = 全部: relink-short / relink-long / merge-small / merge-large / 最大のまとまりの幅 merge-wide-2k / merge-wide-20k (Codex R2 High))
  * 測り方:
  *   fixture は別の接続で入れて commit・analyze (本番と同じく統計がある)。測る接続は新しく開き (backend = 新しいプロセス)、接続の直後と `select 1` の後のピークを控えてから
  *   begin → 関数を 1 回 → rollback。ピーク − 控えた値 = 関数が増やしたピーク (backend の heap・一時の表の local buffers (temp_buffers)・work_mem の中間の結果・AFTER の trigger の待ち行列)
@@ -27,8 +28,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 const args = process.argv.slice(2);
 const arg = (f, d = null) => { const i = args.indexOf(f); return i >= 0 && i < args.length - 1 ? args[i + 1] : d; };
 const R1_SQL = arg('--r1-sql') ? fs.readFileSync(arg('--r1-sql'), 'utf8') : null;
+const R2_SQL = arg('--r2-sql') ? fs.readFileSync(arg('--r2-sql'), 'utf8') : null;
 const WORK_MEM = arg('--work-mem', '4MB');
-const CASES = (arg('--cases', 'relink-short,relink-long,merge-small,merge-large')).split(',');
+const CASES = (arg('--cases', 'relink-short,relink-long,merge-small,merge-large,merge-wide-2k,merge-wide-20k')).split(',');
 
 const PINNED = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).devDependencies['embedded-postgres'];
 let EmbeddedPostgres = null;
@@ -81,11 +83,26 @@ const mergeFixture = (k, len) => `
   insert into docs.document_links (document_id, entity_type, entity_id, link_role, created_at)
     select d.document_id, 'supplier', s.supplier_id, case when s.code = '0001' and d.document_id % 2 = 0 then null else ${pad(`s.code || '-' || d.document_id || '-'`, len)} end, now()
       from docs.documents d cross join core.suppliers s where s.code <> '0001' or d.document_id % 3 <> 0;`;
+// 最大のまとまりの幅 (Codex R2 High): 仕入先 5,000 (上限) が全部同じ形のコード ('1'・'01'・'001'・… = 1 つの残す行 '0001' に 4,999 を寄せる)・
+//   全部が同じ商品 2 つ・同じ文書 2 つを持ち、それぞれに長い文字 (len 文字) = (残す行, 商品) / (文書, 残す行) のまとまり 1 つに 5,000 行・列ごとに 5,000 × len バイト
+//   (array_agg の版は まとまりの値を全部 1 つの配列にする = len に比例して増える)
+const wideFixture = (len) => `
+  insert into core.suppliers (company_id, code, name, email_to, order_memo)
+    select 1, repeat('0', g) || '1', repeat('0', g) || '1', ${pad(`'to' || g || '-'`, len)}, ${pad(`'memo' || g || '-'`, len)} from generate_series(0, 4999) g;
+  insert into core.skus (company_id, sku_kind, code, name) values (1, 'set', 'W1', 'W1'), (1, 'set', 'W2', 'W2');
+  insert into core.supplier_skus (company_id, supplier_id, sku_id, vendor_code, order_unit, unit_cost_jpy, created_by_type, created_at)
+    select 1, s.supplier_id, k.sku_id, ${pad(`'v' || s.supplier_id || '-' || k.code || '-'`, len)}, ${pad(`'u' || s.supplier_id || '-'`, len)}, s.supplier_id, 'system', now()
+      from core.suppliers s cross join core.skus k;
+  insert into docs.documents (company_id, document_type, storage, external_ref, title) values (1, 'contract', 'url', 'w1', 'w1'), (1, 'contract', 'url', 'w2', 'w2');
+  insert into docs.document_links (document_id, entity_type, entity_id, link_role, created_at)
+    select d.document_id, 'supplier', s.supplier_id, ${pad(`'r' || s.supplier_id || '-'`, len)}, now() from docs.documents d cross join core.suppliers s;`;
 const CASE_DEF = {
   'relink-short': { fx: relinkFixture(100000, 16), call: 'select * from core.relink_shipments_bulk(1::smallint, 0, 100000)', what: 'relink 100,000 件・注文番号 16 文字' },
   'relink-long': { fx: relinkFixture(100000, 1000), call: 'select * from core.relink_shipments_bulk(1::smallint, 0, 100000)', what: 'relink 100,000 件・注文番号 1,000 文字 (約 100 MB)' },
   'merge-small': { fx: mergeFixture(2000, 1000), call: 'select * from core.merge_duplicate_suppliers()', what: 'merge 仕入先 3→1・商品の行 約 5,300・文書の紐付け 約 5,300・各 1,000 文字' },
   'merge-large': { fx: mergeFixture(40000, 1000), call: 'select * from core.merge_duplicate_suppliers()', what: 'merge 仕入先 3→1・商品の行 約 107,000・文書の紐付け 約 107,000・各 1,000 文字 (約 200 MB)' },
+  'merge-wide-2k': { fx: wideFixture(2000), call: 'select * from core.merge_duplicate_suppliers()', what: 'merge 最大の幅 (仕入先 5,000→1・同じ商品 2・同じ文書 2)・各 2,000 文字 (まとまり 1 つの列 = 約 10 MB)' },
+  'merge-wide-20k': { fx: wideFixture(20000), call: 'select * from core.merge_duplicate_suppliers()', what: 'merge 最大の幅 (仕入先 5,000→1・同じ商品 2・同じ文書 2)・各 20,000 文字 (まとまり 1 つの列 = 約 100 MB)' },
 };
 
 const rows = [];
@@ -93,7 +110,7 @@ let su = null;
 try {
   await pg.initialise(); await pg.start();
   su = await openPgClient(base + 'postgres');
-  const variants = [['old', '0056', null], ['new', null, null], ...(R1_SQL ? [['r1', '0056', R1_SQL]] : [])];
+  const variants = [['old', '0056', null], ['new', null, null], ...(R1_SQL ? [['r1', '0056', R1_SQL]] : []), ...(R2_SQL ? [['r2', '0056', R2_SQL]] : [])];
   for (const [v, to, sql] of variants) {
     await su.query(`create database tpl_${v}`);
     const c = await openPgClient(base + `tpl_${v}`);

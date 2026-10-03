@@ -1765,68 +1765,103 @@ git worktree remove C:\tmp\d60-revoke
 なぜ: `temp_file_limit` は明示の一時の表 (TEMP) を縛らない = PR 1b で TEMP の権限を superuser でない全部の LOGIN の役割から外す。その前に、正当な呼び手が使う関数から一時の表を無くす。
 Codex R-D60-v3-7 = 「`relink_shipments_bulk` と `merge_duplicate_suppliers` は着手してよい・`reresolve_order_lines` は止める (上限の単位・cursor・期間の端・戻り値を直してから)」。
 
-**形 (Codex PR #1605 R1 High への対応)** = 中間の結果を **変数に溜めない**。一時の表だった所は **1 つの文の中の CTE** にする。文の中の中間の結果 (CTE の tuplestore・並べ替え・hash) は
-work_mem (hash は × hash_mem_multiplier) を超えたら一時のファイルに逃げる = **backend の heap は件数・文字の長さに依らず work_mem の桁で頭打ち** (R1 の版は配列・jsonb の変数 = heap に全部載り、どこにも逃げなかった)。
-🚨 **枠を明示する** = どちらの関数にも `work_mem = 4MB`・`hash_mem_multiplier = 2` を付ける (関数の中だけ・出るときに戻る) = 呼び手の work_mem に依らず heap の増え分は数十 MB (下の表)。
-付けないと新は work_mem に比例した (呼び手が 32MB のとき relink 100,000 件・1,000 文字 = 新 +130 MB / 旧 +75 MB・merge 大 = 新 +119 MB / 旧 +47 MB)。
-ディスクに逃げた分は `temp_file_limit` の対象 (本番は今 -1 = 無制限。0017 / 0027 の一時の表もディスクは無制限だった = ディスクの使い方は今までと同じ桁)。
-変える順は 0017 / 0027 と同じ: 1 つの文の中の「データを変える CTE」は、後の CTE が前の CTE を `(select count(*) from 前) >= 0` (planner の One-Time Filter = 最初に 1 回だけ評価) で待つ
-= 前の CTE を全部終えてから次を始める (relink = 全部の候補を lock してから結ぶ / merge = 消す → 直す → 足す)。
+**形 (Codex PR #1605 R1 High・R2 High / Medium / Low への対応)**:
+- 中間の結果を **変数に溜めない** (R1)。一時の表だった所は文の中の CTE・並べ替え・hash = work_mem (hash は × hash_mem_multiplier) を超えたら一時のファイルに逃げる。
+  変数に残るのは relink の数 3 つと merge の「寄せる行 → 残す行」(bigint の配列 2 つ・仕入先 ≦ 5,000 行を同じ snapshot で数えてから作る = 約 80 KB が上限) だけ。
+- 「列ごとに空でない最初の値」を `array_agg(…)[1]` で取らない (R2 High = array_agg はまとまりの値を全部 1 つの配列にする = バイト数の上限が無い)。
+  窓関数で まとまりの中の順 (0027 と同じ順の鍵) に空でない値の数を数え (`count(列) over w`)、数 = 1 の行だけを `min(列) filter (…)` で拾う = 集約の状態は 1 つの値だけ。
+  窓の並べ替え・窓の行の置き場 (tuplestore) は work_mem を超えたら一時のファイルに逃げる。
+- 文の中の順を **恒真の条件 (`(select count(*) from 前) >= 0`) で作らない** (R2 Medium = PostgreSQL の契約ではない)。順は (a) 別の文 (b) データの依存 (後の段が前の DML の RETURNING の出力を集約して使う = 集約はまとまりの行を全部読むまで値を出せない) だけで作る。
+- 🚨 **枠を明示する** = どちらの関数にも `work_mem = 4MB`・`hash_mem_multiplier = 2` (関数の中だけ・出るときに戻る = 呼び手の work_mem に依らない)。
+  付けないと R1 後の版は work_mem に比例した (呼び手が 32MB のとき relink 100,000 件・1,000 文字 = +130 MB / 旧 +75 MB・merge 大 = +119 MB / 旧 +47 MB)。
 
-- `core.relink_shipments_bulk(smallint, bigint, integer)` = 0017 の一時の表 `_relink_cand2` → 1 つの文 (候補の CTE (materialized・shipment_id の順に p_limit 件 for update) → 結ぶ UPDATE の CTE → 数える)。
-  変数は戻り値の 3 つだけ。p_limit ≦ 100,000 は今までどおり。結合の鍵は CTE の列 (0017 の教訓 = 式で結合しない)。署名・戻り値 (linked・examined・last_id)・結果は同じ
-  - 🚨 **関数に `enable_nestloop = off`・`enable_mergejoin = off`** (= 結合は hash だけ。関数の中だけ・出るときに戻る): 0017 は一時の表を analyze して候補の件数と列の分布を planner に渡していた。
-    CTE の列には統計が無い (選択度は既定値) → (a) 統計の無い / 古い orders では入れ子のループで 0021 の索引 (company_id, mall, scope_key, 日付 / 更新時刻) を引き mall_order_no を Filter で見る
-    (b) work_mem が大きいと統計があっても (mall, scope_key) だけの鍵の merge join + mall_order_no の Join Filter = どちらも候補 × 同じモールの注文 = 件数の 2 乗
-    (使い捨ての PG で測った: (a) 注文 300k・統計なしで 5,000 件 = 1 回 36 秒・100,000 件は 60 秒で打ち切り / (b) 100,000 件・1,000 文字・work_mem 32MB = 9 分を超えて打ち切り)。
-    hash join は等号の条件を全部 hash の鍵に使う = 件数に比例。速さ (注文 300k・伝票 500k (未結合 100k)): 統計ありで全部を 5,000 件ずつ 21 回 = 旧 4.7 秒 / 新 7.9 秒 (1 回の最大 0.33 / 0.49 秒)・
-    100,000 件 1 回 = 3.8 / 3.8 秒 / 統計なしで 5,000 件ずつ = 11.4 / 6.5 秒・100,000 件 1 回 = 4.1 / 3.7 秒 (受け口の statement_timeout は 60 秒)
-- `core.merge_duplicate_suppliers()` = 0027 の一時の表 3 つ → ① 寄せる行 → 残す行の対応 = bigint の配列 2 つ ② まとめた値 (0027 の _ss_merged・_dl_merged) = 1 つの文の中の CTE
-  (寄せる行を消す (RETURNING で消した行の値を返す) → 残す行 (文の始めの snapshot) と消した行から列ごとの値をまとめる → 直す → 足す)。文の順番は 0027 と同じ。
-  配列は **仕入先 ≦ 5,000 行を同じ文の同じ snapshot で数えてから** 作る (超えたら配列を作らずに 54000・何も変えない) = 要素は 5,000 未満 (約 80 KB が上限・競合中に足されても超えない。lock は要らない)。本番は約 40〜80 行
-  - 監査 (AFTER の行 trigger) は 0027 では文ごと、この形では文の終わりにまとめて発火する (並ぶ順 = 消す → 直す → 足す は同じ。待ち行列は 1 行 数十バイト = 下の表の merge 大で数 MB)
-  - relink と同じ理由で結合は hash だけ (CTE の列に統計が無い = (残す行, 商品) の一部の鍵だけの結合を選ばせない)
+- `core.relink_shipments_bulk(smallint, bigint, integer)` = 0017 の 2 つの文 (候補を一時の表 `_relink_cand2` に lock して入れる → 結ぶ) を、一時の表なしの **2 つの文** にした:
+  文 1 = 候補を shipment_id の順に p_limit 件 `for update` (skip locked にしない) で lock し、数と最後の番号だけを変数に (0017 の 1 つ目の文と同じ行・同じ順の lock) /
+  文 2 = (p_after, 最後の番号] の未結合の伝票を CTE (`for update`・照合用の鍵を列にする = 0017 の教訓 = 式で結合しない) にして orders と列どうしの等結合で結び、
+  結んだ組 (shipment_id, order_id) の CTE から UPDATE する (FROM に CTE と orders を直接書くと、EvalPlanQual のために両方の行全体 = 長い注文番号 2 つを運び、一時のファイルが 3 倍になった)。
+  文 2 は新しい snapshot = 0017 の 2 つ目の文と同じく、lock を待った後に commit された注文が見える (R2 の版は 1 つの snapshot で、足された注文を見ず・鍵を変えた / 消した注文に結びえた)。
+  文 1 の候補は lock を持っている (文 2 で待たない・変わらない)。文 1 の後に範囲に入った伝票も文 2 の CTE で lock して最新の版で鍵を作る = UPDATE までに誰も直せない。
+  署名・戻り値 (linked・examined・last_id)・p_limit ≦ 100,000 は同じ
+  - 🚨 **関数に `enable_nestloop = off`・`enable_mergejoin = off`** = hash join を強く選ばせる (off は完全な禁止ではない = ほかの結合の方法が無ければ planner は入れ子のループも選ぶ)。
+    0017 は一時の表を analyze して候補の件数と列の分布を planner に渡していた。CTE の列には統計が無い (選択度は既定値) → (a) 統計の無い / 古い orders では入れ子のループで 0021 の索引
+    (company_id, mall, scope_key, 日付 / 更新時刻) を引き mall_order_no を Filter で見る (b) work_mem が大きいと統計があっても (mall, scope_key) だけの鍵の merge join + mall_order_no の Join Filter
+    = どちらも候補 × 同じモールの注文 = 件数の 2 乗 (使い捨ての PG で測った: (a) 注文 300k・統計なしで 5,000 件 = 1 回 36 秒・100,000 件は 60 秒で打ち切り / (b) 100,000 件・1,000 文字・work_mem 32MB = 9 分を超えて打ち切り)。
+    R2 の後の文 2 の計画を見直した (注文 300k・未結合 100k): 統計なしで設定を外すと (a) に戻る (`Nested Loop` + `ix_orders_mall_date` + `Filter: mall_order_no`) = **設定は要る**。設定ありは統計の有無に依らず hash join だけ
+- `core.merge_duplicate_suppliers()` = 0027 の一時の表 3 つ → ① 寄せる行 → 残す行の対応 = bigint の配列 2 つ ② まとめた値 (0027 の `_ss_merged`・`_dl_merged`) = 1 つの文:
+  寄せる行を消す (`DELETE … RETURNING` で消した行の値を返す) → 残す行 (文の始めの snapshot) と消した行を まとまり (残す行, 商品) / (文書, 残す行) ごとに 0027 と同じ優先
+  (残す行 → 寄せる行の supplier_id の順) で列ごとに空でない最初の値にまとめる (上の窓関数) → **`MERGE` 1 つで 直す (WHEN MATCHED) / 足す (WHEN NOT MATCHED)** (R2 Medium = 直すと足すを 1 つの DML に)。
+  消すのが先 = まとめた値は消した行 (RETURNING) の集約 = そのまとまりの寄せる行を全部消してから出る。代表の印 (`ux_supplier_skus_primary`) がぶつかる相手は同じまとまりの寄せる行だけ = 0027 の「消す → 直す → 足す」の前提を同じく守る。
+  `MERGE` は BEFORE INSERT の trigger を本当に足す行だけに発火する (`INSERT … ON CONFLICT` は直す行にも BEFORE INSERT を発火する = version の通し番号を余計に進める → 使わない)。
+  文の順番は 0027 と同じ (仕入先を補う → 仕入先ごとの商品 → 発注・外部 ID → 文書の紐付け → 寄せた仕入先を消す → コードを揃える → 二重が残れば raise)。上限 = 仕入先 ≦ 5,000 (超えたら 54000・何も変えない。本番は約 40〜80 行)
+  - `MERGE` の足すとき、文の snapshot の後に別の取引が同じ (残す行, 商品) / (文書, 残す行) を足して commit していたら 23505 になる (R2 Medium) → **その文だけ例外の塊 (subtransaction) で巻き戻し、新しい snapshot でやり直す** (3 回まで。ほかの 23505 は 3 回目で同じ誤りを返す)。
+    仕入先ごとの商品は、別の取引が残す仕入先に行を足すと FK の検査 (残す仕入先の KEY SHARE) が merge の最初の文 (残す仕入先を直す) の lock とぶつかって merge の commit まで待つ = 窓は開かない (試験で確かめた・やり直しは保険)。
+    文書の紐付けは仕入先への FK が無い = 窓が開く → やり直しで吸収する (試験で固定)
+  - 監査 (AFTER の行 trigger) は文の終わりに発火する。0027 は消す・直す・足すが別の文 = 監査の並びは 消す…直す…足す。この形は 消す… の後、直すと足すが `MERGE` の行の順に混ざりうる
+    (今の計画 = Hash Right Join は 直す行が先・足す行が後 = 0027 と同じ並び。計画しだいなので試験は同じ対象の UPDATE / INSERT が続く所だけ並べ替えて比べる。1 行の変更の中の並び = 列の名前の順は同じ)
+  - 計画 (R2 の後に見直した): 2 つの文とも 設定あり / なしで同じ計画 (消す = hash join・まとめる = 並べ替え + 窓 + GroupAggregate・`MERGE` = Hash Right Join)。
+    外さない理由 = 寄せる仕入先が多いとき、配列の変数の件数・CTE の件数は planner に見えない = 入れ子のループ + 一部の鍵の結合を選ばせない保険 (relink と同じ理由)
 - どちらも `search_path = pg_catalog, pg_temp`・`enable_nestloop = off`・`enable_mergejoin = off`・`work_mem = 4MB`・`hash_mem_multiplier = 2`・表と関数は schema で修飾・SECURITY INVOKER のまま。CREATE OR REPLACE = 持ち主・EXECUTE の権限の表は変わらない
-- 🚨 **旧と違うのは同時に動くときの 2 つだけ** (試験で固定): ① relink は 1 つの snapshot = 候補の lock を待った相手が **同じ取引で足した注文** は見ない (0017 は別の文 = 見て結んだ)。
-  結べなかった伝票は order_id が null のまま残り、次の走査 (注文を送った後の先頭からの走査 = push/mall-orders.mjs の relink_rescan) で結ばれる。本番のコードは注文を消さない・注文の鍵を変えない
-  (= 「文の始めの注文に結んだが、その注文は消えていた」は起きない) ② merge は消した行そのもの (lock を待った後の最新の版) の値でまとめる = 寄せる行を別の取引が直して commit した直後でも、
-  直した後の値を残す行に移す (0027 は直す前の値で上書きすることがあった)
+- **関数の SET は中で発火する trigger と、それが呼ぶ関数にも効く** (R2 Low)。発火するのは core.shipments (`touch_updated_at_unless_seq_only`・FK) / core.suppliers (version・監査・touch・lifecycle・FK) /
+  core.supplier_skus (version・監査・touch・`guard_master_edit_write`・`guard_reg_csv_live`・`guard_primary_supplier_registered`・FK) / docs.document_links (FK) / core.purchase_orders (touch・発行の guard 3 つ・FK) /
+  core.external_ids (writer・JAN の guard 3 つ・JAN の監査と version・FK)。結合があるのは `ops.guard_master_edit_write` (商品の親の輪) と `ops.guard_reg_csv_live` (SKU 数個) だけ =
+  どちらも画面のロール master_edit のときだけ (ほかの呼び手は最初の行で返る)。ほかは 1 つの表を引くか早く返すだけ = 設定で計画は変わらない。**一覧は試験で固定** (増えたら試験が落ちる = 見直す)
+- 🚨 **旧と違うのは同時に動くときの 4 つだけ** (試験で固定): relink ① lock の文の後に commit されて (p_after, 最後の番号] に入った未結合の伝票も結ぶ (0017 は結ばずに cursor を越える = 次の先頭からの走査
+  (`relink_rescan`) まで残る。linked に入り examined には入らない) ② 店舗 (ne_shops) は結ぶ文の版を使う (0017 は lock の文の版を一時の表に写していた) /
+  merge ③ 消した行そのもの (lock を待った後の最新の版) の値でまとめる = 寄せる行を別の取引が直して commit した直後でも、直した後の値を残す行に移す (0027 は直す前の値で上書きすることがあった)
+  ④ 文書の紐付けの文の snapshot の後に別の取引が残す行に同じ文書の紐付けを足して commit → やり直し = 相手の行を残す行としてまとめる (0027 は相手の役割を寄せる行の値で上書きした)。
+  ほか (lock を待った相手が注文を足した・注文の鍵を変えた / 消した・伝票を直した・残す行の商品の行を直した / 消した・2 本同時・lock_timeout・deadlock) は旧と同じ
 - 🚨 **変えないこと**: `core.reresolve_order_lines` (0024・一時の表 4 つ) には触らない / TEMP の権限は外さない (PR 1b) / EXECUTE の権限も変えない
   (`merge_duplicate_suppliers` を PUBLIC・watcher・runtime から外すのは PR 1b = 設計 13 §3.10 の「重い入口の分け」)。`--verify` の「一時の表を作る関数」は 3 → 1 (`reresolve_order_lines` だけ) になる
 
-**backend のピークのメモリ** (`node scripts/company-db/measure-no-temp-mem.mjs [--r1-sql r1.sql] [--work-mem 32MB]`。使い捨ての PG 18.4・Windows・fixture は commit して analyze・測る接続は新しく開いて関数を 1 回。
-数 = Get-Process の PeakPagedMemorySize64 (= PeakPagefileUsage = private のピーク。shared_buffers は入らない) の、接続の直後からの増え分。旧 = 0056 まで (0017 / 0027 の一時の表)・R1 = この PR の最初の版 (配列・jsonb の変数)・新 = 今の 0057):
+**backend のピークのメモリ** (`node scripts/company-db/measure-no-temp-mem.mjs [--r2-sql r2.sql] [--work-mem 32MB]`。使い捨ての PG 18.4・Windows・fixture は commit して analyze・測る接続は新しく開いて関数を 1 回。
+数 = Get-Process の PeakPagedMemorySize64 (= PeakPagefileUsage = private のピーク。shared_buffers は入らない) の、接続の直後からの増え分。旧 = 0056 まで (0017 / 0027 の一時の表)・
+R2 = Codex R2 の時の 0057 (88648aef = 1 つの文の CTE + `array_agg(…)[1]` + 恒真の条件)・新 = 今の 0057。最大の幅 = 仕入先 5,000 (上限) が全部同じ形のコード = 1 つの残す行に 4,999 を寄せ、
+全部が同じ商品 2 つ・同じ文書 2 つを持つ = まとまり 1 つに 5,000 行 (Codex R2 High の「最大のまとまりの幅」)):
 
-backend の private のピークの増え分 (MB)。列 = 版 (呼び手の work_mem)。R1 は 32MB では測っていない:
+backend の private のピークの増え分 (MB)。列 = 版 (呼び手の work_mem):
 
-| 測ったもの | 旧 (4MB) | R1 (4MB) | **新 (4MB)** | 旧 (32MB) | **新 (32MB)** |
+| 測ったもの | 旧 (4MB) | R2 (4MB) | **新 (4MB)** | 旧 (32MB) | **新 (32MB)** |
 |---|---|---|---|---|---|
-| relink 100,000 件・注文番号 16 文字 | +26.6 | +44.0 | **+27.8** | +33.5 | **+27.7** |
-| relink 100,000 件・注文番号 1,000 文字 (約 100 MB) | +75.1 | +327.8 | **+29.3** | +75.3 | **+29.9** |
-| merge 仕入先 3→1・商品の行と文書の紐付け 約 5,300 ずつ・1,000 文字 | +17.5 | +26.8 | **+21.2** | +29.8 | **+21.2** |
-| merge 仕入先 3→1・商品の行と文書の紐付け 約 107,000 ずつ・1,000 文字 (約 200 MB) | +22.5 | +339.1 | **+26.0** | +48.3 | **+26.0** |
+| relink 100,000 件・注文番号 16 文字 | +26.6 | +27.7 | **+26.5** | +33.5 | **+26.4** |
+| relink 100,000 件・注文番号 1,000 文字 (約 100 MB) | +75.2 | +29.7 | **+24.9** | +75.3 | **+24.8** |
+| merge 仕入先 3→1・商品の行と文書の紐付け 約 5,300 ずつ・1,000 文字 | +17.4 | +21.2 | **+15.3** | +29.9 | **+15.7** |
+| merge 仕入先 3→1・商品の行と文書の紐付け 約 107,000 ずつ・1,000 文字 (約 200 MB) | +20.7 | +26.1 | **+20.3** | +47.5 | **+20.1** |
+| merge 最大の幅・各 2,000 文字 (まとまり 1 つの列 = 約 10 MB) | +53.5 | +58.3 | **+12.3** | +54.2 | **+12.2** |
+| merge 最大の幅・各 20,000 文字 (まとまり 1 つの列 = 約 100 MB) | +399.4 | +402.8 | **+17.3** | +404.0 | **+17.1** |
 
-- **新は 8 通りとも +30 MB 以下** = 件数 (×20)・文字の長さ (×60)・呼び手の work_mem (4MB / 32MB) で増えない (関数の中は work_mem 4MB に固定)。旧より大きいのは 4MB の 3 通りで +1.2〜+3.7 MB (文の中で同時に work_mem を使う所が 1〜2 個多い・監査の待ち行列が文の終わりまで溜まる)。R1 はデータの大きさに比例 (+328 / +339 MB)
-- 関数に work_mem を付ける前は、呼び手が 32MB のとき新 +55 / +130 / +33 / +119 MB (= work_mem に比例) → 付けた
-- 一時のファイル (MB・4MB): relink 短 = 旧 11 / R1 21 / 新 26・relink 長 = 288 / 577 / 616・merge 小 = 11 / 6 / 20・merge 大 = 336 / 297 / 852。新はディスクに多く逃がす (本番の merge は仕入先 約 40〜80 行・商品の行はマスタの大きさ = 桁が小さい)
-- 時間 (秒・4MB): relink 短 = 旧 7.4 / R1 6.9 / 新 7.0・relink 長 = 16.1 / 15.8 / 14.2・merge 小 = 1.24 / 1.39 / 1.24・merge 大 = 34.2 / 34.5 / 33.3
-- 接続の直後の private は約 5 MB。working set (shared_buffers の触ったページも入る) は旧と新で同じ桁 (relink 長 = 旧 +188 / 新 +159・merge 大 = +152 / +156)
+- **新は 12 通りとも +27 MB 以下**。最大の幅で文字を 10 倍 (2,000 → 20,000) にしても +12 → +17 MB (旧と R2 は +54 → +400 MB = まとまりの値を全部配列にする `array_agg` の分だけ比例して増えた = R2 High はこれ)。
+  件数 (×20)・文字の長さ (×10〜60)・呼び手の work_mem (4MB / 32MB) に比例して増えない。**残るもの** = 1 行の値の大きさ (窓・集約・MERGE が 1 行ずつ持つ) と、AFTER の行 trigger の待ち行列
+  (変えた行の数に比例・1 行 数十バイト。0027 も文ごとに同じ) = 「件数・文字の長さに依らず一定」ではない (測った範囲で +27 MB 以下)
+- 一時のファイル (MB): relink 短 = 旧 11 / R2 26 / 新 13・relink 長 = 288 / 616 / 294・merge 小 = 11 / 20 / 20・merge 大 = **336 / 852 / 638**・最大の幅 2,000 = 0 / 3 / 3・20,000 = 10 / 15 / 15
+  (32MB: 旧 0 / 200 / 0 / 292 / 0 / 0・新は 4MB と同じ = 関数の中は 4MB)。旧の一時の表 (`_ss_merged` など) は temp_bytes に入らない (表のファイル = local buffers) = 旧の本当のディスクはこれより多い。
+  新の merge 大が多いのは、窓のための並べ替え (残す行と消した行の全部の列) と MERGE の hash (対象の表の比べる列) が一時のファイルに逃げるため (R2 の 852 MB よりは減った)。
+  relink は文 2 で結んだ組 (shipment_id, order_id) の CTE を挟んで旧と同じ桁にした (挟む前は 929〜1,209 MB)
+- 時間 (秒・4MB): relink 短 = 旧 6.9 / R2 6.9 / 新 6.5・relink 長 = 17.4 / 13.7 / 16.0・merge 小 = 1.22 / 1.22 / 1.23・merge 大 = 38.3 / 35.0 / 31.9・最大の幅 2,000 = 5.2 / 5.0 / 5.1・20,000 = 9.2 / 9.3 / 8.4
+- 接続の直後の private は約 5 MB。working set (shared_buffers の触ったページも入る) は旧と新で同じ桁 (relink 長 = 旧 +188 / 新 +155・merge 大 = +151 / +152・最大の幅 20,000 = +412 / +48)
 
-限界: OS から見たプロセスの値 (palloc の文脈ごとの内訳は出ない)・1 回ずつ (ぶれは数 MB)・合成の fixture (本番の行の幅・分布とは違う)・本番 (Render の 1GB) の shared_buffers・work_mem とは違う
-= 見ているのは「件数・文字の長さで増えるか」と桁。Windows 以外は /proc の VmHWM (共有メモリも入る) しか出さない。
+限界: OS から見たプロセスの値 (palloc の文脈ごとの内訳は出ない)・1 回ずつ (ぶれは数 MB)・合成の fixture (本番の行の幅・分布とは違う)・本番 (Render の 1GB) の shared_buffers・work_mem・OS (Linux) とは違う
+= 見ているのは「件数・まとまりの幅・文字の長さ・呼び手の work_mem で増えるか」と桁。Windows 以外は /proc の VmHWM (共有メモリも入る) しか出さない。
 
 試験 = `node scripts/test-company-db-no-temp-pg.mjs` (本物の PG・試験が自分で使い捨てのクラスタを起動して最後に消す = profit-fn-revoke-pg と同じ作り。`npm run test:company-db` に入っている)。
 0056 まで流した雛形 (旧い関数) と 0057 の後の雛形 (新しい関数) から回ごとに DB を作り、同じ fixture を入れて同じ順で呼ぶ → 戻り値 (例外の SQLSTATE と文言も)・全部の表・全部の通し番号が同じ
-(境目 = 候補 0 件・p_limit ちょうど / ±1・100,000 / 100,001・候補 100,001 件 (統計なし)・p_after = null・同じ取引で続けて・仕入先の 3 つの連鎖・会社をまたぐ同じコード・代表の印・文書の重なり・乱数の fixture 6 回ずつ)。
-🚨 1 つの文の中で行を処理する順は契約ではない (旧い関数でも実行計画しだい) = `version` は「version を除いた行 + version の値の集まり」、監査 (`events.master_change_events`) は
-「change_id のまとまり (中の出来事の順 = 列の名前の順はそのまま) の集まり + event_id の順の 操作|対象 + event_id の集まり」で比べる。新しい関数は呼んだ取引の中で一時の表が 0 個・TEMP の権限を外した DB で通る (旧い関数は 42501)。
-同時の試験 (2 接続。待つ側が lock を待っていることを `pg_blocking_pids` で確かめてから相手を commit) = relink 2 本 (同じ cursor)・lock_timeout (55P03)・relink 中の伝票 / 店舗 / 注文の更新・
-merge 2 本・merge 中の商品の行 / 文書の紐付けの足し・直し (FK の 23503 も)・deadlock (何回か回して 40P01 の数と最後の表) → 戻り値・SQLSTATE・最後の表が旧と同じ (違うのは上の 2 つだけ・説明つきで固定)。
+(境目 = 候補 0 件・p_limit ちょうど / ±1・100,000 / 100,001・候補 100,001 件 (統計なし)・p_after = null・同じ取引で続けて・仕入先の 3 つの連鎖・会社をまたぐ同じコード・代表の印・文書の重なり・
+**最大のまとまりの幅 (仕入先 5,000 → 1・空でない最初の値がまとまりの奥)**・乱数の fixture 6 回ずつ)。
+🚨 1 つの文の中で行を処理する順は契約ではない (旧い関数でも実行計画しだい) = `version` は「fixture の後に上げた値を `bumped` にして行ごと (どの行を上げたか) + 通し番号の最後の値」
+(値そのものは直す行と足す行の順で変わる = 足す行は通し番号を 2 つ進める)、監査 (`events.master_change_events`) は「change_id のまとまり (中の出来事の順 = 列の名前の順はそのまま) の集まり +
+event_id の順の 操作|対象 (同じ対象の UPDATE と INSERT が続く所だけ並べ替える = MERGE) + event_id の集まり」で比べる。新しい関数は呼んだ取引の中で一時の表が 0 個・TEMP の権限を外した DB で通る (旧い関数は 42501)。
+本文に恒真の条件と `array_agg(…)[1]` が無いこと・関数の設定・中で発火する trigger の一覧 (と結合を持つ trigger の関数) も固定。
+同時の試験 (2 接続。待つ側が lock を待っていることを `pg_blocking_pids` で確かめてから相手を commit) = relink 2 本 (同じ cursor)・lock_timeout (55P03)・relink 中の伝票 / 注文 (鍵でない列・
+足した注文・鍵を変えた / 消した注文) の更新・merge 2 本・merge 中の商品の行 / 文書の紐付けの足し・直し・消し (FK の 23503 も)・残す仕入先への商品の行の足し (merge の commit まで待つ)・
+deadlock (何回か回して 40P01 の数と最後の表) → 戻り値・SQLSTATE・最後の表が旧と同じ (違うのは上の 4 つだけ・説明つきで固定)。
 
 **マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に miniPC で dry-run → 本適用)**。0057 は関数の差し替えだけ (表・データ・権限は変えない)。
+🚨 **`temp_file_limit` が有限になるまで本番に当てない (Codex R2)**。新は中間の結果を一時のファイルに逃がす (上の表 = merge 大で 638 MB・旧 336 MB + 旧の一時の表)。
+本番は今 `temp_file_limit = -1` (無制限) = 逃げた分が disk を食い尽くしても取引を止める安全弁が無い (同時の接続の数だけ掛かる)。上限の値と disk の予算 (同時の接続を含む) を決めて有限にしてから当てる
+(設定は Render の DB の設定 = この PR では変えない)。
 0056 が未適用なら、先に上の 0056 の手順を済ませてから (dry-run に 0056 が出たら止める)。夜間ロード (02:00) の最中は避ける (いつもの migrate と同じ)。
 
 ```
+# 0) 先に: Render の DB で show temp_file_limit が -1 でない (有限) ことを確かめる。-1 なら止める
 # 本番で使っていない worktree から (miniPC の PowerShell 5.1。.env は本体の 1 つを読む)
 cd C:\Users\bfaith\bfaith-portal
 git fetch origin
