@@ -1393,12 +1393,27 @@ async function call(method, url, { body, session = 'editor', origin = true, ctyp
   let j = null; try { j = JSON.parse(text); } catch { /* HTML */ }
   return { status: r.status, j, text };
 }
-/** 画面の JS が文法として読めること (描画の試験は通っても、画面の JS が壊れていることがある) と、EJS の出力が JS の中に混ざっていないこと */
-function checkScripts(html, expected) {
-  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((x) => x[1]);
-  assert.equal(scripts.length, expected, `<script> の数 ${scripts.length}`);
-  for (const s of scripts) { new vm.Script(s); assert.ok(!/<%|%>/.test(s), 'EJS のタグが JS に残っている'); }
-  return scripts;
+/**
+ * 画面の JS が文法として読めること (描画の試験は通っても、画面の JS が壊れていることがある) と、EJS の出力が JS の中に混ざっていないこと。
+ * 新しいデザインの画面 (一覧・1 つの商品) は JS を public/ のファイルに分けた = <script src> は中身を HTTP で取ってきて同じに確かめる。
+ * <script type="application/json"> (画面の JS に渡す値) は JSON として読めること
+ */
+async function checkScripts(html, expected) {
+  const all = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
+  assert.equal(all.length, [...html.matchAll(/<script\b/gi)].length, 'script の開きと閉じの数が合わない');
+  const inline = all.filter((m) => !/\bsrc=/.test(m[1]) && !/type="application\/json"/.test(m[1])).map((m) => m[2]);
+  assert.equal(inline.length, expected, `<script> の数 ${inline.length}`);
+  for (const m of all.filter((x) => /type="application\/json"/.test(x[1]))) JSON.parse(m[2]);
+  const files = [];
+  for (const m of all.filter((x) => /\bsrc=/.test(x[1]))) {
+    const src = /\bsrc="([^"]+)"/.exec(m[1])[1];
+    assert.match(src, /^\/apps\/master-edit\/public\/[a-z-]+\.js\?v=[0-9a-f]{12}$/, src);
+    const r = await fetch(ORIGIN + src.replace(/&amp;/g, '&'), { headers: { 'x-test-session': 'editor' } });
+    assert.equal(r.status, 200, src); assert.match(r.headers.get('content-type') || '', /javascript/);
+    files.push(await r.text());
+  }
+  for (const s of [...inline, ...files]) { new vm.Script(s); assert.ok(!/<%|%>/.test(s), 'EJS のタグが JS に残っている'); }
+  return [...inline, ...files];
 }
 const tokenIn = (html) => /data-token="([0-9a-f]{64})"/.exec(html)?.[1];
 const eventIn = (html) => /data-event-id="(\d+)"/.exec(html)?.[1];
@@ -1408,9 +1423,17 @@ await ta('[15] 一覧: 描画・検索・区分・状態・未入力 (売上分�
   let r = await call('GET', '/');
   assert.equal(r.status, 200); assert.match(r.text, /マスタの入力/);
   assert.deepEqual(opened, ['master_edit']);
-  checkScripts(r.text, 0);
+  const listJs = await checkScripts(r.text, 0);
+  assert.ok(listJs.some((s) => s.includes('requestNavigate')), '全体の JS (me-shell.js) を読んでいない');
+  assert.match(r.text, /href="\/apps\/master-edit\/public\/master-edit\.css\?v=[0-9a-f]{12}"/);
+  const css = await fetch(ORIGIN + '/apps/master-edit/public/master-edit.css', { headers: { 'x-test-session': 'editor' } });
+  assert.equal(css.status, 200); assert.match(css.headers.get('content-type') || '', /css/);
+  assert.equal((await fetch(ORIGIN + '/apps/master-edit/public/nope.js', { headers: { 'x-test-session': 'editor' } })).status, 404);
   assert.match(r.text, /href="sku\/set001"/);
-  assert.match(r.text, /10\*/);
+  assert.match(r.text, /10%<span class="fx">計算<\/span>/);   // セットの税率 = 構成品から計算した値 (前の * の代わり)
+  assert.ok(r.text.includes('<a class="chip on" href="./" aria-current="true">全部 <span class="n">'), '区分の札 (全部) がいま押されている');
+  assert.match(r.text, /原価が未入力 <span class="n">\d+<\/span>/);   // 札の数 (会社全体)
+  assert.ok(r.text.includes('この画面で絞る') && !r.text.includes('</span> 保存</div>'), '一覧は / の案内あり・Ctrl+S の案内なし');
   assert.ok(!/いまは保存できません/.test(r.text));
   r = await call('GET', '/?q=S00&kind=single');
   assert.ok(r.text.includes('sku/s001') && !r.text.includes('sku/set001'));
@@ -1425,23 +1448,42 @@ await ta('[15] 一覧: 描画・検索・区分・状態・未入力 (売上分�
   assert.equal(bare.status, 301); assert.equal(bare.headers.get('location'), '/apps/master-edit/');
   const m = await call('GET', '/manual');
   assert.equal(m.status, 200);
-  for (const word of ['保存', '+ 構成品', '表示し直す', '画面を開き直す', '例外原価をやめる (構成品の合計に戻す)', 'NEとの差あり', '未入力', '切替前', 'NE でやること']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
+  for (const word of ['保存', '構成品を足す', '表示し直す', '画面を開き直す', '例外原価をやめる (構成品の合計に戻す)', 'NE との差', '未入力', '切替前', 'NE でやること', 'Ctrl + K', '捨てて移る', '🔒 の値']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
 });
 
 await ta('[15] 単品・セットの画面: 描画・画面の JS・編集の印・導く値・食い違い・JAN とロジザードは単品だけ・404', async () => {
   let r = await call('GET', '/sku/s001');
   assert.equal(r.status, 200);
-  const scripts = checkScripts(r.text, 1);
-  for (const api of ["'/api/sku/'", "'/api/lookup?code='"]) assert.ok(scripts[0].includes(api), `画面が ${api} を呼んでいない`);
+  const scripts = await checkScripts(r.text, 0);
+  const skuJs = scripts.find((s) => s.includes('me-sku.js — 1 つの商品の画面')) || '';
+  for (const api of ["'/api/sku/'", "'/api/lookup?code='"]) assert.ok(skuJs.includes(api), `画面が ${api} を呼んでいない`);
   assert.equal(tokenIn(r.text), await tokenOf('s001'));
   assert.match(r.text, /data-can-save="1"/);
-  assert.match(r.text, /<label class="k">JAN<\/label>/); assert.match(r.text, /ロジザードが正/);
+  assert.match(r.text, /id="lab-jan">JAN</); assert.match(r.text, /ロジザードが正/);
+  // 未保存に数えるのは保存する欄だけ (data-dirty-field)。保存の理由・全体から探す・一覧の絞る欄には付けない
+  for (const f of ['name', 'handling', 'parent_code', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan']) assert.match(r.text, new RegExp(`data-dirty-field="${f}"`), f);
+  assert.ok(!/id="reason"[^>]*data-dirty-field|data-dirty-field[^>]*id="reason"/.test(r.text), '保存の理由を数えない');
+  // s001 を使うセット set005 は、前の試験 ([9] 日の境目) で原価が 2030-01-11 (画面の今日の翌日) から始まる = s001 の原価はここでは閉じる (サーバーも set_cost_future)
+  assert.ok(r.text.includes('id="cost-future"') && r.text.includes('set005') && !r.text.includes('data-dirty-field="cost"'), '先の日付の原価のあるセットを使う単品の原価は閉じる');
+  const futRes = await call('POST', '/api/sku/s001', { body: { request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) }, values: { cost: { jpy: '130', reason: '試験' } } } });
+  assert.deepEqual([futRes.status, futRes.j.reason], [409, 'set_cost_future']);
+  assert.match(r.text, /<span class="b mute">単品<\/span>/);
+  assert.match(r.text, /<h2 id="h-save">保存すると変わること<\/h2>/);
+  assert.match(r.text, /最後に直した人 /);   // 変更の記録から (日本時間)
+  assert.match(r.text, /\d{1,2}\/\d{1,2} \([日月火水木金土]\) \d{2}:\d{2}/);
+  assert.ok(!/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(r.text), 'DB の時刻の文字 (UTC) をそのまま出さない');
+  const pageJson = JSON.parse(/<script type="application\/json" id="me-page">([\s\S]*?)<\/script>/.exec(r.text)[1]);
+  assert.deepEqual([pageJson.code, pageJson.kind, pageJson.canSave], ['s001', 'single', true]);
   await save('set001', { components: [{ code: 's001', qty: 1 }, { code: 's003', qty: 2 }] });
   await promote((await observe([{ set_code: 'set001', rows: [{ code: 's001', qty: 1, sort: 1 }] }], { at: nextAt() })).set001);
   r = await call('GET', '/sku/set001');
-  checkScripts(r.text, 1);
-  assert.ok(!/<label class="k">JAN<\/label>/.test(r.text) && !/ロジザードが正/.test(r.text), 'セットに JAN・ロジザードの欄を出さない');
-  assert.match(r.text, /導く値 \(今の構成/); assert.match(r.text, /NE でやること \(構成の依頼\)/); assert.match(r.text, /導く値 \(依頼の構成\)/);
+  await checkScripts(r.text, 0);
+  assert.ok(r.text.length > 5000 && r.text.includes('セット 1'), '描けている');
+  assert.ok(!/id="lab-jan"/.test(r.text) && !/ロジザードが正/.test(r.text), 'セットに JAN・ロジザードの欄を出さない');
+  assert.match(r.text, /計算で決まる値 \(今の構成から/); assert.match(r.text, /NE でやること \(構成の依頼\)/); assert.match(r.text, /依頼どおりなら/);
+  assert.match(r.text, /<table class="comp" id="comp" data-field="components" data-dirty-field="components"/);
+  assert.ok(!/id="set-mode"[^>]*data-dirty-field/.test(r.text), '構成の見せ方の切り替えは数えない');
+  assert.match(r.text, /<tr class="(add|rm|qty)">/);   // くらべる (今 → 依頼)
   assert.match(r.text, /NE でやること \(食い違い: NE の構成が依頼と違う\)/);
   const hist = await call('GET', '/sku/set001/history');
   assert.equal(hist.status, 200); assert.match(hist.text, /構成の依頼/); assert.match(hist.text, /マスタの入力/);
@@ -1450,6 +1492,78 @@ await ta('[15] 単品・セットの画面: 描画・画面の JS・編集の印
   const lk = await call('GET', '/api/lookup?code=S002');
   assert.deepEqual([lk.status, lk.j.item.code, lk.j.item.kind], [200, 's002', 'single']);
   assert.equal((await call('GET', '/api/lookup?code=nope')).status, 404);
+});
+
+await ta('[15] 見せ方 (PR 画面の作り直し 1): 変更の記録は人の言葉・日本時間 / 誤りの画面 / 時刻と原価の帯の部品 / Amazon の未判定の日付', async () => {
+  const U = await import('../apps/master-edit/ui-format.mjs');
+  const hist = await call('GET', '/sku/s001/history');
+  assert.equal(hist.status, 200);
+  assert.ok(hist.text.includes('時刻 (日本時間)') && hist.text.includes('夜間の取り込み'), '描けている');
+  for (const raw of ['standard_price_jpy', 'reorder_months', '{&#34;', 'portal_master_edit']) assert.ok(!hist.text.includes(raw), `変更の記録に生の ${raw} を出さない`);
+  assert.ok(!/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(hist.text), 'DB の時刻の文字をそのまま出さない');
+  const nf = await call('GET', '/sku/nope');
+  assert.equal(nf.status, 404); assert.match(nf.text, /商品コード nope は Company DB にありません/); assert.match(nf.text, /master-edit\.css/);
+  // 時刻: DB の文字 (+00 / +09)・ISO・Date を東京にそろえる。時間帯の無い文字は推測しない
+  const now = Date.parse('2026-10-02T03:00:00Z');
+  assert.equal(U.fmtJst('2026-10-02 01:54:00.123456+00', { nowMs: now }), '10/2 (金) 10:54');
+  assert.equal(U.fmtJst('2026-10-02 10:54:00+09', { nowMs: now }), '10/2 (金) 10:54');
+  assert.equal(U.fmtJst('2025-12-31T15:30:00Z', { nowMs: now }), '1/1 (木) 00:30');
+  assert.equal(U.fmtJst('2025-12-30T15:30:00Z', { nowMs: now }), '2025/12/31 (水) 00:30');
+  assert.equal(U.fmtJst(new Date('2026-10-02T03:00:00Z'), { nowMs: now }), '10/2 (金) 12:00');
+  assert.equal(U.fmtJst('2026-10-02 01:54:00', { nowMs: now }), '2026-10-02 01:54:00');
+  assert.equal(U.fmtDay('2026-11-01', '2026-10-02'), '11/1 (日)'); assert.equal(U.fmtDay('2027-01-04', '2026-10-02'), '2027/1/4 (月)');
+  // 変更の記録の言葉
+  assert.equal(U.eventWords({ operation: 'UPDATE', entity_type: 'sku', attribute: 'standard_price_jpy', old_value: 1680, new_value: 1780 }).text, '標準売価 1,680 円 → 1,780 円');
+  assert.equal(U.eventWords({ operation: 'UPDATE', entity_type: 'sku', attribute: 'handling', old_value: 'active', new_value: 'discontinued' }).text, '取扱区分 取扱中 → 中止');
+  assert.equal(U.eventWords({ operation: 'UPDATE', entity_type: 'sku', attribute: 'version', old_value: 1, new_value: 2 }), null);
+  assert.equal(U.eventWords({ operation: 'INSERT', entity_type: 'external_id', new_value: { external_value: '4900000001013' } }).text, 'JAN を足した 4900000001013');
+  assert.equal(U.eventWords({ operation: 'INSERT', entity_type: 'sku_cost', new_value: { cost_jpy: 860, valid_from: '2026-11-01', cost_source: 'manual' } }).text, '原価 860 円 (11/1 (日) から) · 手で入れた');
+  assert.equal(U.actorWords({ actor_type: 'system', source_system: 'company_db_load' }), '夜間の取り込み');
+  // 原価の帯: これまで・いま・先の日付 (今日を含む行が「いま」)
+  const tl = U.costTimeline([{ cost_jpy: 780, valid_from: '2026-07-01', valid_to: '2026-09-26' }, { cost_jpy: 820, valid_from: '2026-09-27', valid_to: '2026-10-31' }, { cost_jpy: 860, valid_from: '2026-11-01', valid_to: null }], '2026-10-02');
+  assert.deepEqual(tl.segs.map((s) => [s.kind, s.value]), [['past', '780 円'], ['now', '820 円'], ['fut', '860 円']]);
+  assert.equal(tl.hasFuture, true); assert.equal(tl.months.length, 6);
+  assert.ok(tl.segs.every((s) => s.left >= 0 && s.left + s.width <= 100.0001));
+  // Amazon の未判定の日 (node-postgres の date = その日の 0 時の Date) を YYYY-MM-DD に (前は「Sat Sep 26 2026 00:00:00 GMT+0900」が出た)
+  // 札の数 (listCounts = 原価の表を 1 回だけ走査する形・#1589 R1 M1) は一覧の絞り込みと同じ数 (原価・税率・区分・中止)
+  const cnt = await R.listCounts(db, { now: NOW });
+  for (const [k, f] of [['miss_cost', { missing: 'cost' }], ['miss_tax', { missing: 'tax' }], ['n_set', { kind: 'set' }], ['n_single', { kind: 'single' }], ['discontinued', { state: 'discontinued' }], ['n_all', {}]]) assert.equal(cnt[k], (await R.listSkus(db, f, { now: NOW })).total, k);
+  const { dateOnly } = await import('../apps/master-edit/amazon-read.mjs');
+  assert.equal(dateOnly(new Date(2026, 8, 26)), '2026-09-26');
+  assert.equal(dateOnly('2026-09-26'), '2026-09-26');
+});
+
+await ta('[15] 先の日付の原価: 画面が閉じる原価の欄 = サーバーが断る (セット自身 = cost_future・使っているセット = set_cost_future)・ほかの欄は開いたまま (#1589 R2 M2)', async () => {
+  const FUT = '2030-02-01';   // 画面の今日 2030-01-10 より先
+  await q("update core.sku_costs set valid_to = $1::date - 1 where valid_to is null and sku_id = (select sku_id from core.skus where code = 'set006')", [FUT]);
+  await q("insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from) select 1, sku_id, 777, 'set_calc', 'COMPLETE', $1::date from core.skus where code = 'set006'", [FUT]);
+  try {
+    // 単品 s006 (set006 だけの構成品): 原価の欄は閉じる・理由に set006・ほかの欄 (名前) は直せる → 原価を送るとサーバーも断る
+    let r = await call('GET', '/sku/s006');
+    assert.equal(r.status, 200);
+    assert.ok(r.text.includes('id="cost-future"') && /セット set006 \(2\/1 \(金\) から\)/.test(r.text), '使っているセットの先の原価を理由に出す');
+    assert.ok(!r.text.includes('id="btn-cost-open"') && !r.text.includes('id="cost-jpy"'), '原価の欄を出さない');
+    assert.ok(r.text.includes('data-field="name"'), 'ほかの欄は直せる');
+    let res = await call('POST', '/api/sku/s006', { body: { request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) }, values: { cost: { jpy: '120', reason: '試験' } } } });
+    assert.deepEqual([res.status, res.j.reason], [409, 'set_cost_future']);
+    // セット set006: 例外原価の欄は閉じる・サーバーも cost_future
+    r = await call('GET', '/sku/set006');
+    assert.ok(r.text.includes('id="xcost-future"') && !r.text.includes('id="xcost-jpy"'), '例外原価の欄を出さない');
+    res = await call('POST', '/api/sku/set006', { body: { request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) }, values: { exception_cost: { jpy: '500', reason: '試験' } } } });
+    assert.deepEqual([res.status, res.j.reason], [400, 'cost_future']);
+    // 先の原価の無い単品 (s002) は原価の欄が開いている (閉じすぎない)
+    r = await call('GET', '/sku/s002');
+    assert.ok(r.text.includes('id="cost-jpy"') && !r.text.includes('id="cost-future"'));
+    // 使っているセットの先の原価が例外原価 (manual・override_zero) なら、セットの合計は計算し直さない = 単品の原価は閉じない (サーバーの OVERRIDE_SOURCES と同じ)
+    for (const src of ['manual', 'override_zero']) {
+      await q("update core.sku_costs set cost_source = $2 where valid_from = $1::date and sku_id = (select sku_id from core.skus where code = 'set006')", [FUT, src]);
+      r = await call('GET', '/sku/s006');
+      assert.ok(r.text.includes('id="cost-jpy"') && !r.text.includes('id="cost-future"'), `${src} の先の原価では閉じない`);
+    }
+  } finally {
+    await q("delete from core.sku_costs where valid_from = $1::date and sku_id = (select sku_id from core.skus where code = 'set006')", [FUT]);
+    await q("update core.sku_costs set valid_to = null where valid_to = $1::date - 1 and sku_id = (select sku_id from core.skus where code = 'set006')", [FUT]);
+  }
 });
 
 await ta('[15] 保存の API: 画面と同じ形で通る (画面のロールで書く)・名簿・Origin・Content-Type・押し直し・印の違い', async () => {
@@ -1480,9 +1594,10 @@ await ta('[15] 保存を開いていない (MASTER_EDIT_OPEN なし / 持ち主�
   delete process.env.MASTER_EDIT_OPEN;
   let r = await call('GET', '/sku/s001');
   assert.match(r.text, /いまは保存できません \(保存を開くスイッチ/);
-  assert.match(r.text, /data-can-save="0"/); assert.match(r.text, /id="save" disabled/);
-  assert.match(r.text, /data-field="name" value="[^"]*" size="60" disabled/);
-  assert.match(r.text, /<span class="tag">切替前<\/span>/);
+  assert.match(r.text, /data-can-save="0"/); assert.ok(!/id="save"/.test(r.text), '保存できない画面に保存のボタンを出さない');
+  assert.ok(!/data-field="name"/.test(r.text), '直せない欄は入力欄にしない (🔒 の値で見せる)');
+  assert.ok(r.text.includes('data-row="name"><div class="lab" id="lab-name">名前</div><div class="ctl"><span class="lockval">'), '名前は 🔒 の値');
+  assert.match(r.text, /<span class="b warn" title="この項目の正はまだ NE・\/register です">切替前<\/span>/);
   const body = { request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) }, values: { name: 'x' } };
   assert.deepEqual([(await call('POST', '/api/sku/s001', { body })).status], [409]);
   process.env.MASTER_EDIT_OPEN = '1';

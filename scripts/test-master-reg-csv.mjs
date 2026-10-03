@@ -1358,7 +1358,8 @@ async function call(method, url, { body, session = 'boss@test', origin = true } 
   return { status: r.status, j, text, buf, headers: r.headers };
 }
 function checkScripts(html, expected) {
-  const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].filter((m) => !/\bsrc=/.test(m[1])).map((m) => m[2]);
+  for (const m of [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].filter((x) => /type="application\/json"/.test(x[1]))) JSON.parse(m[2]);   // 画面の JS に渡す値
+  const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].filter((m) => !/\bsrc=/.test(m[1]) && !/type="application\/json"/.test(m[1])).map((m) => m[2]);
   assert.equal([...html.matchAll(/<script\b/gi)].length, [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].length);
   if (expected != null) assert.equal(scripts.length, expected);
   for (const s of scripts) { new vm.Script(s); assert.ok(!/<%|%>/.test(s), 'EJS のタグが JS に残っている'); }
@@ -1396,8 +1397,11 @@ try {
     assert.equal(f.headers.get('x-content-sha256'), sha);
     let page = await call('GET', '/apps/master-edit/sku/new-web', { session: 'naka@test' });
     checkScripts(page.text);
-    assert.match(page.text, /NE 登録の CSV/); assert.match(page.text, /配った後なので/);
-    assert.match(page.text, /data-field="jan"/);
+    assert.match(page.text, /NE 登録の CSV/); assert.match(page.text, /鍵がかかっています/);
+    // 配った後 = NE に送る欄 (名前・売価・原価・税率・仕入先・取扱区分・代表・JAN) は入力欄にしない (🔒 の値・保存しても 409 reg_csv_issued)
+    for (const f of ['name', 'standard_price', 'tax_rate', 'primary_supplier', 'handling', 'parent_code', 'jan', 'cost']) assert.ok(!new RegExp(`data-field="${f}"`).test(page.text), `配った後の ${f} は入力欄にしない`);
+    assert.match(page.text, /data-field="shipping_code"/);   // NE へ送らない欄は直せる
+    assert.match(page.text, /NE に送った値 \(ファイル #\d+\)/);
     const d = await call('POST', `/apps/master-edit/api/reg-csv/exports/${id}/declare`, { body: { sha256: sha, result: 'ok', ne_message: '1件成功しました。' } });
     assert.equal(d.status, 200, d.text);
     assert.equal(await regOf('new-web'), 'ne_pending');

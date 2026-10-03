@@ -8,7 +8,7 @@
  */
 import { MASTER_OWNERSHIP } from '../../config/master-ownership.mjs';
 import { normSku } from '../../lib/sku-norm.js';
-import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID } from '../../lib/master-write.mjs';
+import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
 import { latestRun } from '../master-decisions/decide.mjs';
@@ -132,6 +132,7 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
       primary_supplier: r.primary_supplier, shipping_code: r.shipping_code, reorder_months: num(r.reorder_months),
       state: r.handling === 'discontinued' ? 'discontinued' : 'available',
       reg_state: r.reg_state ?? 'none',
+      comp_count: isSet ? (compClasses.get(r.sku_id) || []).length : null,
     };
   });
   if (f.missing === 'sales') list = list.filter((r) => r.sales_class == null && r.kind !== 'exception');
@@ -149,6 +150,49 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : []),
     ...(cardOf.has(r.sku_id) ? [CARD_FLAG[cardOf.get(r.sku_id)]] : [])];
   return { rows: pageRows, total: list.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable };
+}
+
+/**
+ * 一覧の札の数 (会社全体・絞り込みとは別。1 回の集計)。売上分類の未入力はセットを JS で導くので数えない (札は数なしで出す)。
+ * 表が無い DB (0052 の前など) の札は null (= 数を出さない)
+ * 🚨 その日の原価は SKU ごとの lateral (costAsOfJoin) にしない = sku_costs を SKU の数だけ走査する (#1589 Codex R1 M1)。
+ *    原価の表を 1 回だけ走査して DISTINCT ON (sku_id) で「その日の原価」を作り、SKU に join する。並びは costAsOfJoin と同じ
+ *    (valid_from が新しい → created_at が新しい → sku_cost_id が大きい) = 同じ行を選ぶ。ほかの札も SKU ごとの exists にしない (1 回の集合)
+ */
+export async function listCounts(db, { now = new Date() } = {}) {
+  const today = jstDate(now);
+  const hasReg = await regclass(db, 'ops.master_registrations');
+  const hasOutbox = await regclass(db, 'ops.product_hub_outbox');
+  const diffAvailable = await regclass(db, 'ops.master_decision_candidates');
+  const run = diffAvailable ? await latestRun(db) : null;
+  const params = [COMPANY_ID, today];
+  if (run) params.push(run.compare_run_id);
+  const r = (await db.query(`with c as (
+        select distinct on (y.sku_id) y.sku_id, y.cost_status
+          from core.sku_costs y
+         where y.valid_from <= $2::date and (y.valid_to is null or y.valid_to >= $2::date)
+         order by y.sku_id, y.valid_from desc, y.created_at desc, y.sku_cost_id desc)
+      ${hasReg ? ", rd as (select distinct sku_id from ops.master_registrations where state = 'draft')" : ''}
+      ${hasOutbox ? ", ow as (select distinct sku_id from ops.product_hub_outbox where status in ('pending', 'failed')), oc as (select distinct sku_id from ops.product_hub_outbox where status = 'conflict')" : ''}
+      ${run ? ', dc as (select distinct code_norm from ops.master_decision_candidates where last_seen_run = $3)' : ''}
+      select count(*)::int as n_all,
+        count(*) filter (where s.sku_kind = 'single')::int as n_single, count(*) filter (where s.sku_kind = 'set')::int as n_set,
+        count(*) filter (where s.sku_kind = 'exception')::int as n_exception,
+        count(*) filter (where s.handling = 'discontinued')::int as discontinued,
+        count(*) filter (where s.tax_rate is null)::int as miss_tax, count(*) filter (where s.shipping_code is null)::int as miss_shipping,
+        count(*) filter (where s.reorder_months is null)::int as miss_reorder,
+        count(*) filter (where coalesce(c.cost_status not in ('COMPLETE', 'OVERRIDDEN'), true))::int as miss_cost,
+        ${hasReg ? 'count(rd.sku_id)::int' : 'null::int'} as reg_draft,
+        ${hasOutbox ? 'count(ow.sku_id)::int' : 'null::int'} as card_waiting,
+        ${hasOutbox ? 'count(oc.sku_id)::int' : 'null::int'} as card_conflict,
+        ${run ? 'count(dc.code_norm)::int' : 'null::int'} as diff
+      from core.skus s
+      left join c on c.sku_id = s.sku_id
+      ${hasReg ? 'left join rd on rd.sku_id = s.sku_id' : ''}
+      ${hasOutbox ? 'left join ow on ow.sku_id = s.sku_id left join oc on oc.sku_id = s.sku_id' : ''}
+      ${run ? 'left join dc on dc.code_norm = s.code_norm' : ''}
+     where s.company_id = $1`, params)).rows[0];
+  return r;
 }
 
 /** 1 つの SKU の画面 (B・C) に出すもの。無ければ null。open = env MASTER_EDIT_OPEN (切替の段階 new_open と両方で欄が開く) */
@@ -180,8 +224,12 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
       ? (await db.query('select col, child, source, export_id::text as export_id from ops.ne_csv_export_rows where reserved and code_norm = $1 order by col, child', [cur.code_norm])).rows : [];
     const card = await readCardEvent(db, id);
     const regItems = await regItemsOfSku(db, id);
+    // 最近の変更 (画面の右の「最近の変更」と見出しの「最後に直した人」)。新しい順
+    const recent = (await changesSince(db, { skuId: id, productId: cur.product_id, sinceEventId: null, limit: 30 })).reverse();
+    const locks = await readFieldLocks(db, cur);
+    locks.futureCost = await readFutureCostLocks(db, cur, today);
     return {
-      cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today, card, regItems,
+      cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today, card, regItems, recent, locks,
       state: cur.handling === 'discontinued' ? 'discontinued' : 'available',
       derived: cur.sku_kind === 'set' ? setDerivations(cur) : null,
       fields: fieldOwnership(cur.sku_kind, ownership, open && newEntryWritable(phase, ownership)),
@@ -193,6 +241,70 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
   } finally {
     await db.query('rollback');
   }
+}
+
+/**
+ * 保存しても断られる欄 (画面は入力欄でなく 🔒 の値で見せる)。読むだけ = 保存の確かめ (lib/master-write.mjs) はそのまま。
+ *   reg = 新商品の NE 登録の CSV を配った後 (issued / import_declared / partial) = REG_CSV_FIELDS の欄 (409 reg_csv_issued)。
+ *         単品の税率はそれを含むセット (今の構成 + 開いている構成の依頼) の CSV にも入る = そのセットの CSV も見る
+ *   csv = 既にある商品の NE に取り込む CSV (0040) が出ている列 (409 csv_issued・issuedCsv と同じ条件)
+ * 戻り値 = { fields: { 欄: { why: 'reg' | 'csv', exports: [番号] } }, regExports: [番号], taxParentCodes: [コード] }
+ */
+async function readFieldLocks(db, cur) {
+  const fields = {};
+  const put = (f, why, ids) => {
+    if (!fields[f]) fields[f] = { why, exports: [] };
+    for (const x of ids) if (!fields[f].exports.includes(String(x))) fields[f].exports.push(String(x));
+  };
+  const kind = cur.sku_kind;
+  const defs = fieldsOf(kind);
+  const regExports = [];
+  const taxParentCodes = [];
+  if (await regclass(db, 'ops.ne_reg_export_items')) {
+    const issued = ['issued', 'import_declared', 'partial'];
+    const mine = (await db.query('select distinct export_id::text as id from ops.ne_reg_export_items where sku_id = $1 and state = any($2::text[]) order by 1', [cur.sku_id, issued])).rows.map((r) => r.id);
+    regExports.push(...mine);
+    if (mine.length) for (const f of REG_CSV_FIELDS[kind] || []) put(f, 'reg', mine);
+    if (kind === 'single') {
+      const hasReq = await regclass(db, 'ops.sku_component_requests');
+      const parents = (await db.query(`select distinct i.export_id::text as id, k.code from ops.ne_reg_export_items i join core.skus k on k.sku_id = i.sku_id
+         where i.state = any($2::text[]) and (i.sku_id in (select c.parent_sku_id from core.sku_components c where c.child_sku_id = $1::bigint)
+           ${hasReq ? "or i.sku_id in (select q.set_sku_id from ops.sku_component_requests q where q.status = 'open' and exists (select 1 from jsonb_array_elements(q.rows) x where (x ->> 'sku_id') = $1::text))" : ''})
+         order by 1`, [cur.sku_id, issued])).rows;
+      if (parents.length) {
+        put('tax_rate', 'reg', parents.map((p) => p.id));
+        for (const p of parents) if (!taxParentCodes.includes(p.code)) taxParentCodes.push(p.code);
+      }
+    }
+  }
+  const colToField = new Map(Object.entries(defs).filter(([, d]) => d.csvCol).map(([f, d]) => [d.csvCol, f]));
+  if (colToField.size) {
+    for (const r of await issuedCsv(db, cur.code_norm, [...colToField.keys()])) {
+      const f = colToField.get(r.col);
+      if (f && !fields[f]) put(f, 'csv', [r.export_id]);
+      else if (f && fields[f].why === 'csv') put(f, 'csv', [r.export_id]);
+    }
+  }
+  return { fields, regExports, taxParentCodes };
+}
+
+/** 例外原価の出どころ = lib/master-write.mjs の OVERRIDE_SOURCES そのもの (写さない = サーバーの判定とずれない。#1589 Codex R3 L4) */
+const OVERRIDE_COST_SOURCES = OVERRIDE_SOURCES;
+/**
+ * 先の日付から始まる原価があって、今日からの原価を入れられない (保存すると 409。#1589 Codex R2 M2)。画面は該当する原価の欄だけを理由つきで閉じる。
+ *   own     = この SKU の続いている原価 (valid_to が空) が今日より先に始まる → 単品の原価・セットの例外原価は 409 cost_future (checkCostToday)
+ *   parents = 単品の原価を変えるとセットの合計を今日から計算し直すが、そのセット (今の構成) の続いている原価が今日より先に始まり、
+ *             例外原価でない → 409 set_cost_future (recomputeSetCost)。開き直しても同じなので、開き直しではなく欄を閉じる
+ */
+async function readFutureCostLocks(db, cur, today) {
+  const own = cur.open_cost && cur.open_cost.valid_from > today ? { valid_from: cur.open_cost.valid_from, cost_jpy: cur.open_cost.cost_jpy } : null;
+  let parents = [];
+  if (cur.sku_kind === 'single' && cur.parent_set_ids.length) {
+    parents = (await db.query(`select k.code, c.valid_from::text as valid_from, c.cost_source from core.sku_costs c join core.skus k on k.sku_id = c.sku_id
+       where c.sku_id = any($1::bigint[]) and c.valid_to is null and c.valid_from > $2::date order by k.code_norm`, [cur.parent_set_ids, today])).rows
+      .filter((r) => !OVERRIDE_COST_SOURCES.has(r.cost_source)).map((r) => ({ code: r.code, valid_from: r.valid_from }));
+  }
+  return { own, parents };
 }
 
 /** 新商品の登録 (画面 D) に出すもの: 切替の段階・有効な仕入先・backfill 済みか (新商品の登録の前提) */

@@ -1,0 +1,23 @@
+<%# 新しいデザインの枠を閉じる (_header.ejs の ui2 と対)・全体から探す窓・離れるときの確認・読み上げの知らせ %>
+  </main>
+</div>
+<div class="palette-bg" id="palette-bg">
+  <div class="palette" role="dialog" aria-modal="true" aria-labelledby="pal-title" data-base="<%= base %>">
+    <h2 class="sr" id="pal-title">全体から探す</h2>
+    <div class="pin"><svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+      <input id="pal-in" type="text" placeholder="コード・名前・JAN・seller SKU・操作" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="pal-res" aria-autocomplete="list" aria-label="全体から探す (商品・Amazon SKU・操作)">
+      <span class="kbd" aria-hidden="true">Esc</span></div>
+    <div class="pres" id="pal-res" role="listbox" aria-label="候補"></div>
+    <div class="pfoot" aria-hidden="true"><span><span class="kbd">↑</span><span class="kbd">↓</span> 選ぶ</span><span><span class="kbd">Enter</span> 開く</span><span><span class="kbd">Esc</span> 閉じる</span><span style="margin-left:auto">コードがぴったりなら商品をすぐ開けます</span></div>
+  </div>
+</div>
+<div class="modal-bg" id="leave-bg">
+  <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="leave-t" aria-describedby="leave-d">
+    <h2 id="leave-t"><svg class="ic l" aria-hidden="true"><use href="#i-warn"/></svg>保存していない変更が <span id="leave-n">0</span> 件あります</h2>
+    <div class="hint" id="leave-d" style="color:var(--text2)">このまま別の画面へ移ると、下の変更は消えます。</div>
+    <ul id="leave-list"></ul>
+    <div class="impact" id="leave-imp" style="margin:0 0 16px" hidden><div class="it">保存していれば、こうなるはずでした</div><ul id="leave-imp-list"></ul></div>
+    <div class="mbtns"><button class="btn ghost" type="button" id="leave-stay">ここに残る</button><button class="btn danger" type="button" id="leave-drop">捨てて移る</button><button class="btn pri" type="button" id="leave-review">変更内容を確認する</button></div>
+  </div>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg><span id="toast-t"></span></div>
