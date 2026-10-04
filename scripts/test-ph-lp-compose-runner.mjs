@@ -283,6 +283,11 @@ console.log('⑩ 素材画像 — 何番が素材かを Claude に伝え、検�
   ok(rdM.code === 0 && rdM.out.includes('うち素材 2 枚'), `検品の材料① に素材の枚数 (${rdM.out.split('\n').find((l) => l.includes('画像:'))})`);
   ok(rdM.out.includes('[素材の一覧 (n = img-ID-n.jpg)]') && rdM.out.includes('2: 素材/使用イメージ/玄関.jpg') && rdM.out.includes('3: 素材/パーツ.png'),
     '🚨 検品の材料① に素材の一覧 (使用素材に無い素材を書いていないかを見るため)');
+  // 🚨 検品の観点 6 は「素材画像」だけを素材の一覧と照らす。商品画像 (提供された実物商品画像) を指摘させない
+  //    (2026-10-04 job 2: 素材 0 枚の商品で、仕様書どおりの「提供された実物商品画像」を 2 巡とも high にされて rejected)
+  const reviewSh = fs.readFileSync(path.join(path.dirname(PHLP), 'phlpreview'), 'utf8');
+  ok(/6\. 各画像の「使用素材」に\*\*素材画像\*\*を書いているなら/.test(reviewSh) && reviewSh.includes('「提供された実物商品画像」') && reviewSh.includes('これは指摘しない'),
+    '🚨 検品の観点 6: 商品画像 (提供された実物商品画像) は素材の一覧に無くてよい');
   ok(String(clM.json.packet.image_guide || '').includes('2枚目: 素材画像 (素材1・素材/使用イメージ/玄関.jpg)'),
     '🚨 claim に添付画像の説明 (スタッフの ChatGPT 版と同じ文) が出る');
   eq((await phlp('release', mid, '--reason', '試験の片付け')).code, 0, '片付け (予約前なので手放せる)');
