@@ -73,6 +73,18 @@ export function linegiftListingDiff(db, monthStr) {
 }
 
 /**
+ * 月初の立ち上がりの古い部分 (finance-dq-month-mode.js の monthStartRampOlder): 受注日 [from, to] の listing と、fact と同じ条件で数えた受注日の売上
+ * @returns {{ listingJpy: number, boughtBasisJpy: number }}
+ */
+export function linegiftListingBetween(db, from, to) {
+  const num = (sql, ...p) => Number(db.prepare(sql).get(...p)?.p || 0);
+  return {
+    listingJpy: num(`SELECT SUM(売上金額) AS p FROM f_sales_by_listing WHERE モール = 'linegift' AND substr(日付, 1, 10) BETWEEN ? AND ?`, from, to),
+    boughtBasisJpy: num(`SELECT SUM(selling_price * stock_count) AS p FROM raw_linegift_orders WHERE ${FACT_WHITELIST_SQL} AND substr(bought_date_jst, 1, 10) BETWEEN ? AND ?`, from, to),
+  };
+}
+
+/**
  * しきい値の選び方: 過去月 = past。当月と前月の月初 (recent_past) = current (受取がまだの受注が fact に居ないぶん、構造的に fact が小さい)
  * @param {'current'|'recent_past'|'past'} mode  finance-dq-month-mode.js の monthMode()
  */

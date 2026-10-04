@@ -37,7 +37,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, monthStartRamp, monthStartRampWindow, recentListingJpy, applyMonthStartRamp, monthStartRampNote } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, monthStartRamp, monthStartRampWindow, recentListingJpy, applyMonthStartRamp, monthStartRampNote, monthStartRampOlder, listingOlderPart, whitelistOlderPart, NO_LISTING_RAMP_FLAG } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -71,6 +71,8 @@ try { now = resolveDqNow(getArg('--now')); }
 catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
 // daily-sync はこの回のモールの取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
 const noMonthStartGrace = args.includes('--no-month-start-grace');
+// daily-sync はこの回の f_sales の再構築が ❌ のとき --no-listing-ramp を付ける (= listing_diff_pct の月初の立ち上がりを使わない。比べる相手が古い)
+const noListingRamp = args.includes(NO_LISTING_RAMP_FLAG);
 
 
 const THRESHOLDS_PAST_MONTH = {
@@ -99,8 +101,9 @@ const mode = monthMode(monthStr, { now });
 const isCurMonth = mode === 'current';
 const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST_MONTH, THRESHOLDS_CURRENT_MONTH);
 // 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 7 日目までは listing_diff_pct・whitelist_coverage_pct の error を、
-// 「足りない向き」かつ「足りない分 ≤ 直近 2 日 + 今日の受注」のときだけ ⚠️ に下げる (出荷待ちの差。6〜10 月の毎月 2〜3・6 日に ❌ だった)
-const ramp = monthStartRamp('yahoo', monthStr, { now, noGrace: noMonthStartGrace });
+// 「足りない向き」かつ「直近 2 日 + 今日より前の日には差が無い (ふだんのしきい値で error でない)」かつ「足りない分 ≤ 直近の受注」の
+// ときだけ ⚠️ に下げる (出荷待ちの差。6〜10 月の毎月 2〜3・6 日に ❌ だった)
+const ramp = monthStartRamp('yahoo', monthStr, { now, noGrace: noMonthStartGrace, noListingRamp });
 const rampedChecks = [];
 
 const db = new Database(dbPath);
@@ -186,11 +189,14 @@ try {
 if (listingAvailable) {
   const totalDiff = Math.abs(dailyTotal - listingTotal);
   const totalDiffPct = listingTotal !== 0 ? (totalDiff / Math.abs(listingTotal)) * 100 : 0;
-  const ld = applyMonthStartRamp(monthStartGrace ? null : ramp, 'listing_diff_pct',
-    totalDiffPct > THRESHOLDS.listing_diff_pct.error ? 'error' :
-      totalDiffPct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info',
+  const listingSeverity = (pct) => (pct > THRESHOLDS.listing_diff_pct.error ? 'error' : pct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info');
+  const lw = monthStartRampWindow(ramp, 'listing_diff_pct');
+  const ld = applyMonthStartRamp(monthStartGrace ? null : ramp, 'listing_diff_pct', listingSeverity(totalDiffPct),
     { daily_listing_estimated_jpy: dailyTotal, listing_total_jpy: listingTotal, diff_jpy: dailyTotal - listingTotal },
-    { shortfall: listingTotal - dailyTotal, explainedBy: recentListingJpy(db, 'yahoo', monthStartRampWindow(ramp, 'listing_diff_pct')) });
+    { shortfall: listingTotal - dailyTotal, explainedBy: recentListingJpy(db, 'yahoo', lw),
+      // 窓より前の古い部分 (月の 1 日〜窓の前の日) の listing と fact を、同じしきい値で比べる
+      older: monthStartRampOlder(lw, (from, to) => listingOlderPart(recentListingJpy(db, 'yahoo', { from, to }),
+        Number(db.prepare('SELECT SUM(listing_sales_estimated_jpy_incl) AS p FROM f_yahoo_finance_sku_daily_v1 WHERE date_jst BETWEEN ? AND ?').get(from, to)?.p || 0), listingSeverity)) });
   if (ld.ramped) rampedChecks.push({ checkName: 'listing_diff_pct', value: totalDiffPct });
   recordResult('listing_diff_pct', ld.severity, totalDiffPct, THRESHOLDS.listing_diff_pct.error, ld.details);
 } else {
@@ -276,15 +282,16 @@ const whitelistCheck = db.prepare(`
 `).get(monthStr, monthStr);
 
 const wlPct = whitelistCheck.pct || 0;
-// 月初の立ち上がりの ②: whitelist に入っていない行の数 ≤ 直近 2 日 + 今日の受注の行の数
+// 月初の立ち上がりの ③: whitelist に入っていない行の数 ≤ 直近 2 日 + 今日の受注の行の数
 const wlWin = monthStartRampWindow(ramp, 'whitelist_coverage_pct');
 const wlRecent = wlWin ? db.prepare("SELECT COUNT(*) AS c FROM raw_yahoo_orders WHERE substr(order_time, 1, 10) BETWEEN ? AND ?").get(wlWin.from, wlWin.to).c : null;
 // 下限閾値: warn < 95%、error < 90% (低い方が NG なので比較反転)
-const wl = applyMonthStartRamp(monthStartGrace ? null : ramp, 'whitelist_coverage_pct',
-  wlPct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' :
-    wlPct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info',
+const wlSeverity = (pct) => (pct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' : pct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info');
+const wl = applyMonthStartRamp(monthStartGrace ? null : ramp, 'whitelist_coverage_pct', wlSeverity(wlPct),
   { total_lines: whitelistCheck.total, whitelist_lines: whitelistCheck.wl },
-  { shortfall: (whitelistCheck.total || 0) - (whitelistCheck.wl || 0), explainedBy: wlRecent });
+  { shortfall: (whitelistCheck.total || 0) - (whitelistCheck.wl || 0), explainedBy: wlRecent,
+    // 窓より前の古い部分: その期間の受注のうち whitelist に入った割合を、同じしきい値で判定 (古い注文が止まっていれば ❌ のまま)
+    older: monthStartRampOlder(wlWin, (from, to) => { const o = db.prepare("SELECT COUNT(*) AS t, COALESCE(SUM(order_status = '5' AND pay_status = '1' AND ship_status = '3'), 0) AS w FROM raw_yahoo_orders WHERE substr(order_time, 1, 10) BETWEEN ? AND ?").get(from, to); return whitelistOlderPart(o.t, o.w, wlSeverity); }) });
 if (wl.ramped) rampedChecks.push({ checkName: 'whitelist_coverage_pct', value: wlPct });
 recordResult('whitelist_coverage_pct', wl.severity, wlPct, THRESHOLDS.whitelist_coverage_pct.warn, wl.details);
 

@@ -31,7 +31,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, monthStartRamp, monthStartRampWindow, applyMonthStartRamp, monthStartRampNote } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, monthStartRamp, monthStartRampWindow, applyMonthStartRamp, monthStartRampNote, monthStartRampOlder, whitelistOlderPart, NO_LISTING_RAMP_FLAG } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -50,6 +50,8 @@ try { now = resolveDqNow(getArg('--now')); }
 catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
 // daily-sync はこの回のモールの取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
 const noMonthStartGrace = args.includes('--no-month-start-grace');
+// daily-sync はこの回の f_sales の再構築が ❌ のとき --no-listing-ramp も付ける (Qoo10 は listing の立ち上がりを持たない = 受けるだけ)
+const noListingRamp = args.includes(NO_LISTING_RAMP_FLAG);
 
 const THRESHOLDS_PAST = {
   row_count_drift:                       { warn: 0,    error: 0 },
@@ -82,8 +84,9 @@ const mode = monthMode(monthStr, { now });
 const isCur = mode === 'current';
 const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST, THRESHOLDS_CURRENT);
 // 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 12 日目までは whitelist_coverage_pct の error を、
-// 「whitelist に入っていない行の数 ≤ 直近 5 日 + 今日の受注の行の数」のときだけ ⚠️ に下げる (配送完了待ち。6〜10 月の毎月 3〜11 日に ❌ = daily-sync が exit 1 だった)
-const ramp = monthStartRamp('qoo10', monthStr, { now, noGrace: noMonthStartGrace });
+// 「直近 6 日 + 今日より前の受注は配送完了が止まっていない (ふだんのしきい値で error でない)」かつ「whitelist に入っていない行の数 ≤ 直近の受注の行の数」の
+// ときだけ ⚠️ に下げる (配送完了待ち。6〜10 月の毎月 3〜11 日に ❌ = daily-sync が exit 1 だった)
+const ramp = monthStartRamp('qoo10', monthStr, { now, noGrace: noMonthStartGrace, noListingRamp });
 const rampedChecks = [];
 
 const db = new Database(dbPath);
@@ -204,12 +207,14 @@ const cov = db.prepare(`SELECT
   (SELECT COUNT(*) FROM raw_qoo10_orders WHERE substr(order_date,1,7)=? AND legacy_fields_missing=0) AS total,
   (SELECT COUNT(*) FROM raw_qoo10_orders WHERE substr(order_date,1,7)=? AND legacy_fields_missing=0 AND shipping_status='Delivered(5)') AS wl`).get(monthStr, monthStr);
 const wlPct = cov.total > 0 ? cov.wl / cov.total * 100 : 0;
-// 月初の立ち上がりの ②: whitelist に入っていない行 (まだ配送が終わっていない) の数 ≤ 直近 5 日 + 今日の受注の行の数
+// 月初の立ち上がりの ③: whitelist に入っていない行 (まだ配送が終わっていない) の数 ≤ 直近 6 日 + 今日の受注の行の数
 const wlWin = monthStartRampWindow(ramp, 'whitelist_coverage_pct');
 const wlRecent = wlWin ? db.prepare('SELECT COUNT(*) AS c FROM raw_qoo10_orders WHERE substr(order_date, 1, 10) BETWEEN ? AND ? AND legacy_fields_missing = 0').get(wlWin.from, wlWin.to).c : null;
-const wl = applyMonthStartRamp(monthStartGrace ? null : ramp, 'whitelist_coverage_pct',
-  wlPct <= THRESHOLDS.whitelist_coverage_pct.error ? 'error' : wlPct <= THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info',
-  { total_lines: cov.total, whitelist_lines: cov.wl }, { shortfall: (cov.total || 0) - (cov.wl || 0), explainedBy: wlRecent });
+const wlSeverity = (pct) => (pct <= THRESHOLDS.whitelist_coverage_pct.error ? 'error' : pct <= THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info');
+const wl = applyMonthStartRamp(monthStartGrace ? null : ramp, 'whitelist_coverage_pct', wlSeverity(wlPct),
+  { total_lines: cov.total, whitelist_lines: cov.wl }, { shortfall: (cov.total || 0) - (cov.wl || 0), explainedBy: wlRecent,
+    // ② 窓より前の古い部分: その期間の受注のうち配送完了 (Delivered(5)) の割合を、同じしきい値で判定 (古い注文の配送完了が止まっていれば ❌ のまま)
+    older: monthStartRampOlder(wlWin, (from, to) => { const o = db.prepare("SELECT COUNT(*) AS t, COALESCE(SUM(shipping_status = 'Delivered(5)'), 0) AS w FROM raw_qoo10_orders WHERE substr(order_date, 1, 10) BETWEEN ? AND ? AND legacy_fields_missing = 0").get(from, to); return whitelistOlderPart(o.t, o.w, wlSeverity); }) });
 if (wl.ramped) rampedChecks.push({ checkName: 'whitelist_coverage_pct', value: wlPct });
 recordResult('whitelist_coverage_pct', wl.severity, wlPct, THRESHOLDS.whitelist_coverage_pct.warn, wl.details);
 

@@ -26,7 +26,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, monthStartRamp, monthStartRampWindow, recentListingJpy, applyMonthStartRamp, monthStartRampNote } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, monthStartRamp, monthStartRampWindow, recentListingJpy, applyMonthStartRamp, monthStartRampNote, monthStartRampOlder, listingOlderPart, whitelistOlderPart, NO_LISTING_RAMP_FLAG } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -45,6 +45,8 @@ try { now = resolveDqNow(getArg('--now')); }
 catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
 // daily-sync はこの回のモールの取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
 const noMonthStartGrace = args.includes('--no-month-start-grace');
+// daily-sync はこの回の f_sales の再構築が ❌ のとき --no-listing-ramp を付ける (= listing_diff_pct の月初の立ち上がりを使わない。比べる相手が古い)
+const noListingRamp = args.includes(NO_LISTING_RAMP_FLAG);
 
 const THRESHOLDS_PAST = {
   row_count_drift:                  { warn: 0,    error: 0 },
@@ -75,8 +77,9 @@ const mode = monthMode(monthStr, { now });
 const isCur = mode === 'current';
 const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST, THRESHOLDS_CURRENT);
 // 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 7 日目までは listing_diff_pct・whitelist_coverage_pct の error を、
-// 「足りない向き」かつ「足りない分 ≤ 直近 2 日 + 今日の受注」のときだけ ⚠️ に下げる (出荷待ちの差。6〜10 月の毎月 2〜4 日に ❌ だった)
-const ramp = monthStartRamp('aupay', monthStr, { now, noGrace: noMonthStartGrace });
+// 「足りない向き」かつ「直近 2 日 + 今日より前の日には差が無い (ふだんのしきい値で error でない)」かつ「足りない分 ≤ 直近の受注」の
+// ときだけ ⚠️ に下げる (出荷待ちの差。6〜10 月の毎月 2〜4 日に ❌ だった)
+const ramp = monthStartRamp('aupay', monthStr, { now, noGrace: noMonthStartGrace, noListingRamp });
 const rampedChecks = [];
 
 const db = new Database(dbPath);
@@ -128,10 +131,14 @@ let listingTotal = 0, listingAvail = false;
 try { const r = db.prepare("SELECT SUM(売上金額) AS p FROM f_sales_by_listing WHERE モール='aupay' AND substr(日付,1,7) = ?").get(monthStr); listingTotal = r?.p || 0; listingAvail = listingTotal > 0; } catch (e) { console.log(`  (listing 突合スキップ: ${e.message})`); }
 if (listingAvail) {
   const diffPct = listingTotal !== 0 ? Math.abs(factGross - listingTotal) / Math.abs(listingTotal) * 100 : 0;
-  const ld = applyMonthStartRamp(monthStartGrace ? null : ramp, 'listing_diff_pct',
-    diffPct > THRESHOLDS.listing_diff_pct.error ? 'error' : diffPct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info',
+  const listingSeverity = (pct) => (pct > THRESHOLDS.listing_diff_pct.error ? 'error' : pct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info');
+  const lw = monthStartRampWindow(ramp, 'listing_diff_pct');
+  const ld = applyMonthStartRamp(monthStartGrace ? null : ramp, 'listing_diff_pct', listingSeverity(diffPct),
     { fact_gross_jpy: factGross, listing_jpy: listingTotal, diff_jpy: factGross - listingTotal },
-    { shortfall: listingTotal - factGross, explainedBy: recentListingJpy(db, 'aupay', monthStartRampWindow(ramp, 'listing_diff_pct')) });
+    { shortfall: listingTotal - factGross, explainedBy: recentListingJpy(db, 'aupay', lw),
+      // 窓より前の古い部分 (月の 1 日〜窓の前の日) の listing と fact を、同じしきい値で比べる
+      older: monthStartRampOlder(lw, (from, to) => listingOlderPart(recentListingJpy(db, 'aupay', { from, to }),
+        Number(db.prepare('SELECT SUM(gross_sales_jpy_incl) AS p FROM f_aupay_finance_sku_daily_v1 WHERE date_jst BETWEEN ? AND ?').get(from, to)?.p || 0), listingSeverity)) });
   if (ld.ramped) rampedChecks.push({ checkName: 'listing_diff_pct', value: diffPct });
   recordResult('listing_diff_pct', ld.severity, diffPct, THRESHOLDS.listing_diff_pct.error, ld.details);
 } else { recordResult('listing_diff_pct', 'info', null, THRESHOLDS.listing_diff_pct.error, { skipped: true }); }
@@ -156,12 +163,14 @@ const cov = db.prepare(`SELECT
   (SELECT COUNT(*) FROM raw_aupay_orders WHERE substr(replace(order_date,'/','-'),1,7)=?) AS total,
   (SELECT COUNT(*) FROM raw_aupay_orders WHERE substr(replace(order_date,'/','-'),1,7)=? AND order_status='完了' AND item_cancel_status='N') AS wl`).get(monthStr, monthStr);
 const wlPct = cov.total > 0 ? cov.wl / cov.total * 100 : 0;
-// 月初の立ち上がりの ②: whitelist に入っていない行の数 ≤ 直近 2 日 + 今日の受注の行の数
+// 月初の立ち上がりの ③: whitelist に入っていない行の数 ≤ 直近 2 日 + 今日の受注の行の数
 const wlWin = monthStartRampWindow(ramp, 'whitelist_coverage_pct');
 const wlRecent = wlWin ? db.prepare("SELECT COUNT(*) AS c FROM raw_aupay_orders WHERE substr(replace(order_date,'/','-'),1,10) BETWEEN ? AND ?").get(wlWin.from, wlWin.to).c : null;
-const wl = applyMonthStartRamp(monthStartGrace ? null : ramp, 'whitelist_coverage_pct',
-  wlPct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' : wlPct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info',
-  { total_lines: cov.total, whitelist_lines: cov.wl }, { shortfall: (cov.total || 0) - (cov.wl || 0), explainedBy: wlRecent });
+const wlSeverity = (pct) => (pct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' : pct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info');
+const wl = applyMonthStartRamp(monthStartGrace ? null : ramp, 'whitelist_coverage_pct', wlSeverity(wlPct),
+  { total_lines: cov.total, whitelist_lines: cov.wl }, { shortfall: (cov.total || 0) - (cov.wl || 0), explainedBy: wlRecent,
+    // 窓より前の古い部分: その期間の受注のうち whitelist に入った割合を、同じしきい値で判定 (古い注文が止まっていれば ❌ のまま)
+    older: monthStartRampOlder(wlWin, (from, to) => { const o = db.prepare("SELECT COUNT(*) AS t, COALESCE(SUM(order_status = '完了' AND item_cancel_status = 'N'), 0) AS w FROM raw_aupay_orders WHERE substr(replace(order_date, '/', '-'), 1, 10) BETWEEN ? AND ?").get(from, to); return whitelistOlderPart(o.t, o.w, wlSeverity); }) });
 if (wl.ramped) rampedChecks.push({ checkName: 'whitelist_coverage_pct', value: wlPct });
 recordResult('whitelist_coverage_pct', wl.severity, wlPct, THRESHOLDS.whitelist_coverage_pct.warn, wl.details);
 

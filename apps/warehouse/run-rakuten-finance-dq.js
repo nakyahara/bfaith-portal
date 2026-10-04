@@ -33,7 +33,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, jstShifted, monthStartRamp, monthStartRampWindow, recentListingJpy, applyMonthStartRamp, monthStartRampNote } from './finance-dq-month-mode.js';
+import { decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, jstShifted, monthStartRamp, monthStartRampWindow, recentListingJpy, applyMonthStartRamp, monthStartRampNote, monthStartRampOlder, listingOlderPart, NO_LISTING_RAMP_FLAG } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -68,6 +68,8 @@ try { now = resolveDqNow(getArg('--now')); }
 catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
 // daily-sync はこの回の楽天の取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
 const noMonthStartGrace = args.includes('--no-month-start-grace');
+// daily-sync はこの回の f_sales の再構築が ❌ のとき --no-listing-ramp を付ける (= listing_diff_pct の月初の立ち上がりを使わない。比べる相手が古い)
+const noListingRamp = args.includes(NO_LISTING_RAMP_FLAG);
 
 // ============================================================
 // Threshold config (Phase 1a #R-2 確定値)
@@ -99,8 +101,9 @@ const THRESHOLDS_CURRENT_MONTH = {
 
 const THRESHOLDS = isCurrentMonth(monthStr) ? THRESHOLDS_CURRENT_MONTH : THRESHOLDS_PAST_MONTH;
 // 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 7 日目までは listing_diff_pct の error を、
-// 「fact が足りない向き」かつ「足りない分 ≤ 直近 2 日 + 今日の受注」のときだけ ⚠️ に下げる (出荷待ちの差。6〜10 月の毎月 2〜6 日に ❌ だった)
-const ramp = monthStartRamp('rakuten', monthStr, { now, noGrace: noMonthStartGrace });
+// 「fact が足りない向き」かつ「直近 2 日 + 今日より前の日には差が無い (ふだんのしきい値で error でない)」かつ「足りない分 ≤ 直近の受注」の
+// ときだけ ⚠️ に下げる (出荷待ちの差。6〜10 月の毎月 2〜6 日に ❌ だった)
+const ramp = monthStartRamp('rakuten', monthStr, { now, noGrace: noMonthStartGrace, noListingRamp });
 const rampedChecks = [];
 
 const db = new Database(dbPath);
@@ -192,11 +195,14 @@ try {
 if (listingAvailable) {
   const totalDiff = Math.abs(dailyTotal - listingTotal);
   const totalDiffPct = listingTotal !== 0 ? (totalDiff / Math.abs(listingTotal)) * 100 : 0;
-  const ld = applyMonthStartRamp(monthStartGrace ? null : ramp, 'listing_diff_pct',
-    totalDiffPct > THRESHOLDS.listing_diff_pct.error ? 'error' :
-      totalDiffPct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info',
+  const listingSeverity = (pct) => (pct > THRESHOLDS.listing_diff_pct.error ? 'error' : pct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info');
+  const lw = monthStartRampWindow(ramp, 'listing_diff_pct');
+  const ld = applyMonthStartRamp(monthStartGrace ? null : ramp, 'listing_diff_pct', listingSeverity(totalDiffPct),
     { daily_total_jpy: dailyTotal, listing_total_jpy: listingTotal, diff_jpy: dailyTotal - listingTotal },
-    { shortfall: listingTotal - dailyTotal, explainedBy: recentListingJpy(db, 'rakuten', monthStartRampWindow(ramp, 'listing_diff_pct')) });
+    { shortfall: listingTotal - dailyTotal, explainedBy: recentListingJpy(db, 'rakuten', lw),
+      // 窓より前の古い部分 (月の 1 日〜窓の前の日) の listing と fact を、同じしきい値で比べる
+      older: monthStartRampOlder(lw, (from, to) => listingOlderPart(recentListingJpy(db, 'rakuten', { from, to }),
+        Number(db.prepare('SELECT SUM(gross_sales_jpy_incl) AS p FROM f_rakuten_finance_sku_daily_v1 WHERE date_jst BETWEEN ? AND ?').get(from, to)?.p || 0), listingSeverity)) });
   if (ld.ramped) rampedChecks.push({ checkName: 'listing_diff_pct', value: totalDiffPct });
   recordResult('listing_diff_pct', ld.severity, totalDiffPct, THRESHOLDS.listing_diff_pct.error, ld.details);
 } else {

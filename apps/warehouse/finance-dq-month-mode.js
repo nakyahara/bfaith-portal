@@ -415,18 +415,36 @@ export function applyMonthStartSkip(grace, checkName, severity, details) {
  * (applyMonthStartRamp。説明できなければ ❌ のまま):
  *   ① 向き: fact (whitelist) が比べる相手より **少ない**。多い向きは出荷待ちでは起きない (二重計上・比べる相手が古い) → ❌ のまま
  *      (足りない分が 0 なのに error = raw が 0 行で率が 0% になった等も、出荷待ちではないので ❌ のまま)
- *   ② 大きさ: 足りない分 (listing − fact の円 / whitelist に入っていない行の数) が、直近 settleDays 日 + 今日 の受注
- *      (f_sales_by_listing の円 / raw の行の数) 以下。それより大きい = もっと前の日の分まで欠けている → ❌ のまま
- *   ③ daily-sync がこの回のモールの取込を ❌ と言っていない (--no-month-start-grace)。言っていれば下げない
+ *   ② 古い部分 (PR #1613 R1 High): 直近の窓 (window.from = 今日 − settleDays 日) **より前** の日 (月の 1 日〜window.from の前の日) だけを
+ *      取り出し、その検査のふだんの当月のしきい値で判定して error でないこと (applyMonthStartRamp の older)。
+ *        listing   = その期間の f_sales_by_listing と fact (受注日) の累計の差 % (|fact − listing| ÷ listing)
+ *        whitelist = その期間の受注 (raw) のうち whitelist に入った行の割合 %
+ *      窓より前に古い日の欠け・配送完了の止まりがあれば、窓の中がどれだけ正常でも ❌ のまま。
+ *      🚨「月全体の足りない分 ≤ 直近の全部の受注」だけで下げてはいけない (R1 High の反例): 直近の受注には fact / whitelist に
+ *        入った注文も含まれるので、それが古い日の欠けを許す枠になる (Qoo10 10 日目に 1〜4 日の 40 件が未配送・5〜10 日の 60 件は
+ *        配送済み = 60% が warn に / 楽天 4 日目に 1 日の 100 円が丸ごと欠け・2〜4 日は正常 = 25% が warn に)。
+ *      しきい値をふだんの当月のもの (error の線) にした理由 = 「1 日の小さい揺れ」(キャンセル・NE とモールの金額の差。Yahoo は月を通して
+ *        約 4% の差がある) で古い部分が止まらないように。古い部分は累計で見る (日ごとだと 1 日の揺れで止まる)。
+ *   ③ 大きさ: 足りない分 (listing − fact の円 / whitelist に入っていない行の数) が、直近 settleDays 日 + 今日 の受注
+ *      (f_sales_by_listing の円 / raw の行の数) 以下 (② があれば強い意味は無いが、残す)
+ *   ④ daily-sync がこの回のモールの取込を ❌ と言っていない (--no-month-start-grace)。言っていれば下げない
+ *   ⑤ listing だけ: daily-sync がこの回の f_sales の再構築を ❌ と言っていない (--no-listing-ramp。PR #1613 R1 Medium)。
+ *      比べる相手 (f_sales_by_listing) が古いままだと、fact が多い向きになるとは限らない (古い listing 1000・fact 800・
+ *      窓の listing 500 でも 200 ≤ 500 になる)。whitelist (raw どうし) と 0 行の猶予はこの印では止めない
  *   rampDays を過ぎたら今までどおり (月半ばに差が増えたら ❌)。しきい値の表 (CURRENT / PAST) は変えない。
  *
- *   試算 (上の error の日すべてを、2026-10-04 の f_sales_by_listing と raw で数え直した):
- *     listing:   settleDays = 2 で楽天・Yahoo・au PAY の全部の日が ② を満たす (1 だと Yahoo 7/3 が外れる)
- *     whitelist: Yahoo・au PAY・LINE は 2 で全部、Qoo10 は 5 で全部 (3 だと 6/7〜8・6/11〜12・8/7・9/7〜8・9/10〜11 が外れる)
+ *   試算 (上の error の日すべてを数え直した。PR #1613 の本文の表):
+ *     ③: listing は settleDays = 2 で楽天・Yahoo・au PAY の全部の日が満たす (1 だと Yahoo 7/3 が外れる)
+ *     ②: Yahoo は出荷日 (ship_date)・LINE は受取日でその朝の状態を作り直して数えた。楽天・au PAY・Qoo10 は出荷・配送完了の日を
+ *        持たないので、dq_run_results の毎朝の足りない分を「受注から何日目か」の割合に回帰して見積もった (r² 0.75〜0.98)。
+ *        楽天・Yahoo・au PAY の古い部分は差 0.2〜3.8% (error の線 15%)・au PAY の whitelist は約 97% (70%)。
+ *        Qoo10 は受注から 6 日目まで約半分が配送完了にならない (Delivered(5) を待つ) → settleDays を 5 → 6 にした
+ *        (5 だと 7 日目の古い部分 = 1 日の注文が約 50% で 60% の線を割る)。6 なら古い部分は約 80〜93%
  *     2026-10-04 の楽天・Yahoo・au PAY の listing は ① で外れる (fact が多い) = 月初の遅れではなく、f_sales の再構築が
- *       10/3 は見送り・10/4 は 10 分で打ち切られて比べる相手が 10/2 のまま止まっていた (#1611)。これは今までどおり ❌
+ *       10/3 は見送り・10/4 は 10 分で打ち切られて比べる相手が 10/2 のまま止まっていた (#1611)。これは今までどおり ❌ (⑤ でも止まる)
  *   LINE ギフトは受注 → 受取が 0〜8 日 (9 割が 0〜2 日) なので 3 (受注日の月で比べるようになってからの月初の記録はまだ無い)。
- *   1 月は年末年始の休み (12/29〜1/3) で最初の出荷が遅れるので rampDays・settleDays に MONTH_START_JANUARY_EXTRA_DAYS を足す。
+ *   1 月は年末年始の休み (12/29〜1/3) で最初の出荷が遅れるので rampDays・settleDays に MONTH_START_JANUARY_EXTRA_DAYS (3) を足す。
+ *     ただし rampDays は上限 MONTH_START_RAMP_MAX (14 日) で丸める = Qoo10 の 1 月は 12 + 3 = 15 → 14 日 (+2)。settleDays は丸めない (PR #1613 R1 Low)。
  *   0 行の月は今までどおり #1572 (decideMonthStartEmpty・dq_month_high_water) が受け持つ。立ち上がりは行のある月の 2 つの検査だけを見る
  *   (0 行の猶予の中は applyMonthStartSkip で info になっているので、ここは何もしない = 二重に緩めない)。
  *   ★ 数字を差し替えるときはこの表だけを直す (試験 scripts/test-finance-dq-month-mode.mjs は表の値から境界を作る)
@@ -437,18 +455,21 @@ export const MONTH_START_RAMP = Object.freeze({
   yahoo:    Object.freeze({ rampDays: 7,  settleDays: Object.freeze({ listing_diff_pct: 2, whitelist_coverage_pct: 2 }) }),
   aupay:    Object.freeze({ rampDays: 7,  settleDays: Object.freeze({ listing_diff_pct: 2, whitelist_coverage_pct: 2 }) }),
   linegift: Object.freeze({ rampDays: 7,  settleDays: Object.freeze({ listing_diff_pct: 3, whitelist_coverage_pct: 3 }) }),
-  // Qoo10 の listing_diff_pct はもともと info だけ (gate しない) なので whitelist だけ
-  qoo10:    Object.freeze({ rampDays: 12, settleDays: Object.freeze({ whitelist_coverage_pct: 5 }) }),
+  // Qoo10 の listing_diff_pct はもともと info だけ (gate しない) なので whitelist だけ。6 = 受注から 6 日目まで約半分が配送完了にならない (上の試算)
+  qoo10:    Object.freeze({ rampDays: 12, settleDays: Object.freeze({ whitelist_coverage_pct: 6 }) }),
 });
-/** 立ち上がりの日数の上限 (これより長いのは「月初」ではない = 前月の whitelist の猶予と同じ 14 日) */
-const MONTH_START_RAMP_MAX = RECENT_PAST_GRACE_DAYS;
+/** 立ち上がりの日数の上限 (これより長いのは「月初」ではない = 前月の whitelist の猶予と同じ 14 日)。1 月の +3 もこれで丸める */
+export const MONTH_START_RAMP_MAX = RECENT_PAST_GRACE_DAYS;
 export const MONTH_START_RAMP_PREFIX = '⚠️ 月初の立ち上がり:';
+/** daily-sync がこの回の f_sales の再構築を ❌ と言ったときに付ける印 (listing の立ち上がりだけを止める。⑤) */
+export const NO_LISTING_RAMP_FLAG = '--no-listing-ramp';
 
 /**
- * 暦の上の判定 (③ を含む)。active = 当月 (JST) かつ JST の日 ≤ rampDays かつ 呼び手が禁じていない
- * @returns {{ active: boolean, mall, ym, today: string, dayOfMonth: number, rampDays: number, settleDays: Record<string, number>, reasons: string[] }}
+ * 暦の上の判定 (④ を含む)。active = 当月 (JST) かつ JST の日 ≤ rampDays かつ 呼び手が禁じていない
+ *   noListingRamp (⑤) は active を変えず、deniedChecks.listing_diff_pct に理由を入れる (whitelist は続ける)
+ * @returns {{ active: boolean, mall, ym, today: string, dayOfMonth: number, rampDays: number, settleDays: Record<string, number>, reasons: string[], deniedChecks: Record<string, string> }}
  */
-export function monthStartRamp(mall, ym, { now = new Date(), noGrace = false } = {}) {
+export function monthStartRamp(mall, ym, { now = new Date(), noGrace = false, noListingRamp = false } = {}) {
   const spec = Object.hasOwn(MONTH_START_RAMP, mall) ? MONTH_START_RAMP[mall] : null;
   if (!spec) throw new Error(`月初の立ち上がり: 知らないモール "${mall}"`);
   if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error('monthStartRamp: now が日時でない');
@@ -461,43 +482,103 @@ export function monthStartRamp(mall, ym, { now = new Date(), noGrace = false } =
   else if (dayOfMonth > rampDays) reasons.push(`立ち上がり (${rampDays} 日まで) を過ぎた`);
   if (noGrace) reasons.push('呼び手が猶予を禁じた (この回のモールの取込が ❌)');
   const settleDays = Object.fromEntries(Object.entries(spec.settleDays).map(([k, v]) => [k, v + jan]));
-  return { active: reasons.length === 0, mall, ym, today, dayOfMonth, rampDays, settleDays, reasons };
+  const deniedChecks = {};
+  if (noListingRamp) deniedChecks.listing_diff_pct = `比べる相手 (f_sales_by_listing) をこの回に作り直せていない (f_sales 再構築が ❌ = ${NO_LISTING_RAMP_FLAG})`;
+  return { active: reasons.length === 0, mall, ym, today, dayOfMonth, rampDays, settleDays, reasons, deniedChecks: Object.freeze(deniedChecks) };
 }
 
-/** ② に使う日の範囲 [from, to] (to = 今日 JST・from は当月の 1 日より前に出ない)。立ち上がりの外・表に無い検査は null */
+const addDaysYmd = (ymd, n) => new Date(Date.parse(`${ymd}T00:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
+
+/** 直近の窓 [from, to] (to = 今日 JST・from = 今日 − settleDays 日。当月の 1 日より前に出ない)。立ち上がりの外・表に無い検査は null */
 export function monthStartRampWindow(ramp, checkName) {
   if (!ramp || !ramp.active || !Object.hasOwn(ramp.settleDays, checkName)) return null;
   const n = ramp.settleDays[checkName];
   const monthStart = `${ramp.ym}-01`;
-  let from = new Date(Date.parse(`${ramp.today}T00:00:00Z`) - n * 86400000).toISOString().slice(0, 10);
+  let from = addDaysYmd(ramp.today, -n);
   if (from < monthStart) from = monthStart;
-  return { from, to: ramp.today, settleDays: n };
+  return { from, to: ramp.today, settleDays: n, monthStart };
 }
 
-/** ② の listing 側: f_sales_by_listing のそのモールの直近の受注 (円)。範囲が無い・読めないときは null (= 下げない) */
-export function recentListingJpy(db, mall, window) {
-  if (!window) return null;
+/**
+ * ② の古い部分の範囲 = 月の 1 日〜窓の前の日。窓が月の 1 日から始まる (月の 2・3 日など) なら empty (古い部分が無い = 確かめるものが無い)
+ * @returns {{ from: string, to: string|null, empty: boolean }|null}  窓が無いときは null
+ */
+export function monthStartRampOlderRange(window) {
+  if (!window || !window.monthStart) return null;
+  if (window.from <= window.monthStart) return { from: window.monthStart, to: null, empty: true };
+  return { from: window.monthStart, to: addDaysYmd(window.from, -1), empty: false };
+}
+
+/**
+ * ② の古い部分を数える。compute(from, to) は { severity, value, ...数字 } を返す (DQ がその検査のふだんの当月のしきい値で判定した結果)。
+ * 窓が無ければ null・古い部分が無ければ { empty: true }・compute が投げたら severity なし (= applyMonthStartRamp は下げない)
+ */
+export function monthStartRampOlder(window, compute) {
+  const r = monthStartRampOlderRange(window);
+  if (!r) return null;
+  if (r.empty) return { empty: true, from: r.from, to: null };
   try {
-    return Number(db.prepare(`SELECT SUM(売上金額) AS p FROM f_sales_by_listing WHERE モール = ? AND substr(日付, 1, 10) BETWEEN ? AND ?`).get(mall, window.from, window.to)?.p || 0);
+    return { ...compute(r.from, r.to), empty: false, from: r.from, to: r.to };
+  } catch (e) {
+    return { empty: false, from: r.from, to: r.to, error: String(e?.message || e) };
+  }
+}
+
+/** ② の listing の古い部分: |fact − listing| ÷ listing (累計)。listing が 0 で fact がある = 比べる相手が無いのに実績がある → error */
+export function listingOlderPart(listingJpy, factJpy, severityOf) {
+  if (!Number.isFinite(listingJpy) || !Number.isFinite(factJpy)) throw new Error('古い部分の listing か fact を数えられない');
+  if (listingJpy === 0) return { listing_jpy: 0, fact_jpy: factJpy, value: null, severity: factJpy === 0 ? 'info' : 'error' };
+  const value = Math.abs(factJpy - listingJpy) / Math.abs(listingJpy) * 100;
+  return { listing_jpy: listingJpy, fact_jpy: factJpy, value, severity: severityOf(value) };
+}
+
+/** ② の whitelist の古い部分: whitelist に入った行の割合 %。行が 0 = 古い注文が無い → info */
+export function whitelistOlderPart(total, wl, severityOf) {
+  if (!Number.isFinite(total) || !Number.isFinite(wl)) throw new Error('古い部分の行を数えられない');
+  if (total === 0) return { total_lines: 0, whitelist_lines: 0, value: null, severity: 'info' };
+  const value = wl / total * 100;
+  return { total_lines: total, whitelist_lines: wl, value, severity: severityOf(value) };
+}
+
+/** f_sales_by_listing のそのモールの範囲の受注 (円)。③ の直近の窓と ② の古い部分の両方で使う。範囲が無い・読めないときは null (= 下げない) */
+export function recentListingJpy(db, mall, range) {
+  if (!range || !range.from || !range.to) return null;
+  try {
+    return Number(db.prepare(`SELECT SUM(売上金額) AS p FROM f_sales_by_listing WHERE モール = ? AND substr(日付, 1, 10) BETWEEN ? AND ?`).get(mall, range.from, range.to)?.p || 0);
   } catch {
     return null;
   }
 }
 
+const SEVERITIES = ['info', 'warn', 'error'];
 /**
- * error のときだけ ①②③ を見て、出荷待ちで説明できれば warn に下げる (元の判定と数字は details に残す)。
- * @param {{ shortfall: number, explainedBy: number }} amounts  shortfall = 比べる相手 − fact (listing は円・whitelist は行の数)。explainedBy = 直近の受注 (同じ単位)
+ * error のときだけ ①〜⑤ を見て、出荷待ちで説明できれば warn に下げる (元の判定と数字は details に残す)。
+ * @param {{ shortfall: number, explainedBy: number, older: object|null }} amounts
+ *   shortfall = 比べる相手 − fact (listing は円・whitelist は行の数)。explainedBy = 直近の受注 (同じ単位)
+ *   older = monthStartRampOlder の結果 (② 古い部分)。無い (null・undefined) = 確かめていない → 下げない
  * @returns {{ severity: string, details: object|null, ramped: boolean }}
  */
-export function applyMonthStartRamp(ramp, checkName, severity, details, { shortfall, explainedBy } = {}) {
+export function applyMonthStartRamp(ramp, checkName, severity, details, { shortfall, explainedBy, older } = {}) {
   if (severity !== 'error' || !MONTH_START_RAMP_CHECKS.includes(checkName)) return { severity, details, ramped: false };
   const window = monthStartRampWindow(ramp, checkName);
   if (!window) return { severity, details, ramped: false };
   const base = { ...(details || {}), ramp_window_from: window.from, ramp_window_to: window.to, ramp_shortfall: shortfall ?? null, ramp_explained_by: explainedBy ?? null };
+  if (older) {
+    base.ramp_older_from = older.from ?? null; base.ramp_older_to = older.to ?? null;
+    if (older.empty) base.ramp_older_empty = true;
+    else { base.ramp_older_value = Number.isFinite(older.value) ? older.value : null; base.ramp_older_severity = older.severity ?? null; }
+  }
+  const deniedByCaller = ramp.deniedChecks && Object.hasOwn(ramp.deniedChecks, checkName) ? ramp.deniedChecks[checkName] : null;
   let denied = null;
-  if (!Number.isFinite(shortfall) || !Number.isFinite(explainedBy)) denied = '足りない分か直近の受注を数えられない';
+  if (deniedByCaller) denied = deniedByCaller;
+  else if (!Number.isFinite(shortfall) || !Number.isFinite(explainedBy)) denied = '足りない分か直近の受注を数えられない';
   else if (shortfall < 0) denied = '実績が比べる相手より多い (出荷待ちでは起きない向き = 二重計上か、比べる相手が古い)';
   else if (shortfall === 0) denied = '足りない分が無いのに error (raw が 0 行など) = 出荷待ちの差ではない';
+  else if (!older) denied = '窓より前の古い部分を確かめていない';
+  else if (!older.empty && !SEVERITIES.includes(older.severity)) denied = `窓より前 (${older.from}〜${older.to}) を数えられない${older.error ? ` (${older.error})` : ''}`;
+  else if (!older.empty && older.severity === 'error') {
+    denied = `窓より前 (${older.from}〜${older.to}) にも差がある (${Number.isFinite(older.value) ? `${Number(older.value).toFixed(1)}%` : 'n/a'} = ふだんの当月のしきい値で error) = 前の日の欠け・配送完了の止まり。直近の受注では説明できない`;
+  }
   else if (shortfall > explainedBy) denied = `足りない分 ${Math.round(shortfall)} が直近 ${window.settleDays} 日と今日 (${window.from}〜${window.to}) の受注 ${Math.round(explainedBy)} より大きい = 出荷待ちでは説明できない`;
   if (denied) return { severity, details: { ...base, month_start_ramp_denied: denied }, ramped: false };
   return { severity: 'warn', details: { ...base, month_start_ramp: true, severity_without_ramp: 'error' }, ramped: true };
@@ -506,5 +587,5 @@ export function applyMonthStartRamp(ramp, checkName, severity, details, { shortf
 /** 立ち上がりで下げた回の最後の行 (daily-sync は isMonthStartGraceSummary で見分けて見出しを ⚠️ にする) */
 export function monthStartRampNote(ramp, ramped) {
   const list = ramped.map((c) => `${c.checkName} ${Number.isFinite(c.value) ? Number(c.value).toFixed(1) : 'n/a'}%`).join(' / ');
-  return `${MONTH_START_RAMP_PREFIX} ${ramp.ym} の ${list} は直近の受注がまだ出荷 (完了) していない分で説明できる差 (JST ${ramp.dayOfMonth} 日・立ち上がりは ${ramp.rampDays} 日まで)。説明できない差・実績が多い向きは ❌ のまま`;
+  return `${MONTH_START_RAMP_PREFIX} ${ramp.ym} の ${list} は直近の受注がまだ出荷 (完了) していない分で説明できる差 (JST ${ramp.dayOfMonth} 日・立ち上がりは ${ramp.rampDays} 日まで・窓より前の日には差が無い)。説明できない差・窓より前の差・実績が多い向きは ❌ のまま`;
 }
