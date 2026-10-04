@@ -22,7 +22,8 @@
  *   ./phlp reserve ID                               **AI を呼ぶ前に必ず**予約する (モデルはランナーが決める)
  *   ./phlp lint    ID --file out-ID.md              構成を lint する (サーバが正本・何度でも呼べる)
  *   ./phlp result  ID --accepted --file out-ID.md [--lint lint-ID.json] [--rounds N]
- *   ./phlp result  ID --rejected --reason-file reason-ID.txt [--lint lint-ID.json] [--rounds N]
+ *   ./phlp result  ID --rejected --reason-file reason-ID.txt [--file out-ID.md] [--lint lint-ID.json] [--rounds N]
+ *     (--rejected でも書いた構成があれば --file で渡す。チェックを通らなかった構成として画面に出し、人が判断する)
  *     (--lint は参考値。受け取るかどうかは**サーバ側の lint** で決まる)
  *   ./phlp fail    ID --code CODE --message "text"  予約の**前**だけ (生成できない材料)
  *   ./phlp release ID --reason "text"               予約の**前**だけ (一時障害)
@@ -324,6 +325,12 @@ async function cmdResult(id, opt) {
     output = fs.readFileSync(p, 'utf8');
     if (!output.trim()) die('構成の本文が空です');
     if (output.length > OUT_MAX) die(`構成が大きすぎます (${OUT_MAX} 文字まで)`);
+  }
+  // チェックで落ちた構成も残す (2026-10-04 中原さん「A」・人が見て使えるか決める)。無ければ送らない
+  if (rejected && opt.file) {
+    output = fs.readFileSync(safePath(opt.file, 'out', id), 'utf8');
+    if (output.length > OUT_MAX) die(`構成が大きすぎます (${OUT_MAX} 文字まで)`);
+    if (!output.trim()) output = null;
   }
   let reason = null;
   if (rejected) {

@@ -321,7 +321,7 @@ export const JOBS_REGISTRY = [
     purpose: 'LP 構成の AI 生成 (段階1・2026-10-01)。商品ハブの詳細画面で「🤖 構成をAIに作らせる」を押した商品について、'
       + 'claim → 画像を落として見る (商品画像 6 枚 + 素材画像 10 枚まで・素材 = 商品の画像フォルダの中のフォルダの画像・2026-10-02〜) → '
       + '仕様書 (LP制作システム V2.2) と添付画像の説明 (スタッフの ChatGPT 版と同じ文) に従って ⑦ AI画像生成プロンプトを書く → lint → Codex 検品 (最大 2 巡) → 書き戻す。'
-      + '1 件の上限 15 分。'
+      + '1 件の上限 20 分。チェックを通らなかった構成も画面に「参考」として出す (人が判断する・2026-10-04)。memory と claude.ai の接続は使わない (毎回同じ条件)。'
       + '**段階1 の目的は機能ではなく測定** (AI の構成がスタッフの ChatGPT 出力と比べて使えるか・10 件で判定)。'
       + '書き戻した構成は画面に出るだけで、人がコピーして lp-tool に貼る運用は変わらない。画像生成・GAS への送信・撮影依頼書は段階2 以降',
     where: 'miniPC TaskScheduler [PhLpComposeMinutely] (scripts/ph-nightly/run-lp-compose.ps1 → work の ./phlp + スキル ph-lp-compose)。Render の PH_LP_COMPOSE_ENABLED=1 のときだけ動く',

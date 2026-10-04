@@ -80,6 +80,7 @@ export function collectMarginRows(db, from, to, opts = {}) {
   const skipped = [];
   const skipReasons = {};   // モール → スキップの理由 (通知に出す)
   let amazonWindow = null;  // Amazon の実際の集計期間 (決済のそろった日まで。getSkuProfit の settled)
+  let amazonDegradedLookups = [];   // Amazon の SKU → ASIN のマップの読めなかった出どころ (getSkuProfit の degradedLookups。Codex #1604 R1 Medium)
 
   // ─ Amazon: amazon-dashboard の SKU 利益テーブルをそのまま流用 (広告込み margin_pct も取れる) ─
   // Codex R1 High: getSkuProfit は limit 上限 20,000 で切り詰めるため、total を見て全ページ取得する
@@ -105,6 +106,7 @@ export function collectMarginRows(db, from, to, opts = {}) {
         if (!amazonWindow || !amazonWindow.last_date || amazonWindow.effective_to < from) { noSettled = true; break; }
       }
       total = res.total;
+      for (const name of res.degradedLookups || []) if (!amazonDegradedLookups.includes(name)) amazonDegradedLookups.push(name);
       if (res.rows.length === 0) break;
       for (const r of res.rows) {
         if (!(r.revenue_excl > 0)) continue;
@@ -189,7 +191,7 @@ export function collectMarginRows(db, from, to, opts = {}) {
     }
   }
 
-  return { rows, skipped, skipReasons, amazonWindow };
+  return { rows, skipped, skipReasons, amazonWindow, amazonDegradedLookups };
 }
 
 /**
@@ -251,7 +253,7 @@ function formatItemLine(idx, r) {
 /**
  * 通知本文を組み立てる (純関数、テスト対象)。
  */
-export function formatMarginAlertMessage({ todayJst, from, to, thresholdPct, result, isFirstRun, skipped, skipReasons = {}, amazonWindow = null }) {
+export function formatMarginAlertMessage({ todayJst, from, to, thresholdPct, result, isFirstRun, skipped, skipReasons = {}, amazonWindow = null, amazonDegradedLookups = [] }) {
   const jstWeekdays = ['日', '月', '火', '水', '木', '金', '土'];
   const [y, m, day] = todayJst.split('-').map(Number);
   // Date.UTC でカレンダー上の曜日を直接引く (toISOString の UTC ずれ罠を回避)
@@ -264,6 +266,10 @@ export function formatMarginAlertMessage({ todayJst, from, to, thresholdPct, res
   // Amazon は決済のそろった日までで集計 (期間の終わりが短い)。判定できなかった日は下の「集計スキップ」に出る
   if (amazonWindow && amazonWindow.trimmed && !skipped.includes('amazon')) {
     lines.push(`※ Amazon は決済のそろった ${amazonWindow.effective_to} まで (直近${WINDOW_DAYS}日のうち確定分)`);
+  }
+  // SKU → ASIN の対応の出どころが読めない = ASIN の広告の一部が SKU に結びつかず按分に回る (広告込みの利益率がずれ得る。判定 = 広告費前は影響なし)
+  if (amazonDegradedLookups.length > 0 && !skipped.includes('amazon')) {
+    lines.push(`⚠️ Amazon の SKU と ASIN の対応の一部が読めない (${amazonDegradedLookups.join(', ')}) = 広告込みの利益率がずれ得ます`);
   }
   // 集計スキップは先頭に (明細の後だと 3,500 字の切り詰めで消える = 判定できなかったことが伝わらない。Codex #1529 R1)
   if (skipped.length > 0) {
@@ -382,7 +388,7 @@ export async function runMarginAlertJob() {
     const to = addDays(todayJst, -1);              // 昨日まで (当日分は sync 前で常に空のため)
     const from = addDays(todayJst, -WINDOW_DAYS);  // 直近30日ウィンドウ
 
-    const { rows, skipped, skipReasons, amazonWindow } = collectMarginRows(db, from, to);
+    const { rows, skipped, skipReasons, amazonWindow, amazonDegradedLookups } = collectMarginRows(db, from, to);
     if (skipped.length === 5) {
       console.error('[margin-alert] 全モールの集計に失敗。通知を中止。');
       return { ok: false, reason: 'all_malls_failed' };
@@ -392,7 +398,7 @@ export async function runMarginAlertJob() {
     const isFirstRun = state === null;
     const result = classifyMarginRows(rows, thresholdPct, isFirstRun ? null : state.flagged_keys);
 
-    const text = formatMarginAlertMessage({ todayJst, from, to, thresholdPct, result, isFirstRun, skipped, skipReasons, amazonWindow });
+    const text = formatMarginAlertMessage({ todayJst, from, to, thresholdPct, result, isFirstRun, skipped, skipReasons, amazonWindow, amazonDegradedLookups });
     console.log(`[margin-alert] 送信開始 flagged=${result.flagged.length} new=${result.newItems.length} excluded=${result.excludedCount} skipped=${skipped.join(',') || 'none'} text_len=${text.length}`);
     const sendResult = await sendGChatMessage(webhookUrl, text);
     console.log(`[margin-alert] 送信成功 status=${sendResult.status}`);

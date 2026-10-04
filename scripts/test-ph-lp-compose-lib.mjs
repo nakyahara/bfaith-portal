@@ -258,6 +258,57 @@ eq(jRej.error_code, 'rejected', '理由が残る');
 ok(!!jRej.completed_at, 'rejected でも completed_at が入る');
 eq(db.prepare('SELECT status FROM ph_lp_compose_generations WHERE id = ?').get(g2.generation_id).status, 'rejected',
   '🚨 generation も確定する (reserved のまま残さない)');
+eq(jRej.output_text, null, '構成を送らなければ何も残らない (書けなかったとき)');
+
+console.log('⑦b 🚨 チェックを通らなかった構成も残す (2026-10-04 中原さん「A」: くらべっこなので捨てない)');
+{
+  const dR = mkDraft('LP-REJ', 'ハッカ油スプレー REJ');
+  lp.requestJob(db, args(dR, s2.spec, 'key-rej-1', { now: min(5012) }));
+  const cR = lp.claimJob(db, { runnerRunId: 'lpr-20261004-120000-rejrej', now: min(5012) });
+  const gR = lp.reserveGeneration(db, cR.job.job_id, { leaseToken: cR.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(5012) });
+  const DRAFT = '# LP制作システム\n(チェックで指摘が残った構成の下書き)';
+  eq(lp.submitResult(db, gR.generation_id, { packetHash: cR.job.packet_hash, verdict: 'rejected', output: 'x'.repeat(lp.OUTPUT_MAX + 1), reason: 'r', now: min(5013) }).code,
+    'too_large', '大きすぎる下書きは断る');
+  serve(cR.job, min(5012.5));   // 画像を全部見て書いた (下書きを残す条件)
+  const sR = lp.submitResult(db, gR.generation_id, { packetHash: cR.job.packet_hash, verdict: 'rejected', output: DRAFT, reviewRounds: 2, reason: '2 巡目に high が 3 件 (縦の配分が 100% を超える ほか)', now: min(5013) });
+  eq(sR.status, 'failed', 'rejected は failed のまま');
+  eq(db.prepare('SELECT output_text FROM ph_lp_compose_jobs WHERE id = ?').get(cR.job.job_id).output_text, DRAFT, '🚨 書いた構成を残す');
+  const pre = lp.jobStateFor(db, dR.id, { now: min(5013.1) }).job;
+  ok(pre.draft_text === null && pre.output_text === null, '実モデルの確認前は出さない');
+  eq(pre.has_draft, true, '下書きが残っていることは画面に渡る (確認が付くまで待つ)');
+  eq(lp.requestJob(db, args(dR, s2.spec, 'key-rej-1b', { now: min(5013.15) })).code, 'already_running',
+    '🚨 確認前の rejected がある間は再依頼を受けない (参考の構成が画面から消えないように・codex #1609 High)');
+  eq(lp.requestPrecheck(db, { draft: dR, productInfo: 'x', spec: s2.spec, images: [{ file_id: 'FILEID000001', role: 'slot:1' }], idempotencyKey: 'key-rej-1c', now: min(5013.15) }).code,
+    'already_running', '先の検査も同じ');
+  lp.recordModelCheck(db, { runnerRunId: 'lpr-20261004-120000-rejrej', actualModels: ['claude-opus-5-5'], now: min(5013.2) });
+  const st = lp.jobStateFor(db, dR.id, { now: min(5013.3) }).job;
+  ok(st.status === 'failed' && st.draft_text === DRAFT, '🚨 一致したら「チェックを通らなかった構成」として画面に出す');
+  eq(st.output_text, null, '「できた本文」(done 用) には出さない (参考扱いを混ぜない)');
+  ok((st.error || '').includes('縦の配分'), '指摘されたこと (reason) も画面に渡る');
+  const again = lp.submitResult(db, gR.generation_id, { packetHash: cR.job.packet_hash, verdict: 'rejected', output: DRAFT, reviewRounds: 2, reason: '2 巡目に high が 3 件 (縦の配分が 100% を超える ほか)', now: min(5014) });
+  ok(again.ok && again.already, '同じ内容の再送は保存済みを返す');
+  // 不一致なら出さない
+  const dR2 = mkDraft('LP-REJ2', 'ハッカ油スプレー REJ2');
+  lp.requestJob(db, args(dR2, s2.spec, 'key-rej-2', { now: min(5015) }));
+  const cR2 = lp.claimJob(db, { runnerRunId: 'lpr-20261004-120100-rejre2', now: min(5015) });
+  const gR2 = lp.reserveGeneration(db, cR2.job.job_id, { leaseToken: cR2.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(5015) });
+  serve(cR2.job, min(5015.5));
+  lp.submitResult(db, gR2.generation_id, { packetHash: cR2.job.packet_hash, verdict: 'rejected', output: DRAFT, reason: 'r', now: min(5016) });
+  lp.recordModelCheck(db, { runnerRunId: 'lpr-20261004-120100-rejre2', actualModels: ['claude-sonnet-5'], now: min(5016.1) });
+  eq(lp.jobStateFor(db, dR2.id, { now: min(5016.2) }).job.draft_text, null, '🚨 別のモデルが書いた下書きは出さない');
+  // 画像を見ずに書いた下書きは残さない (rejected の判定は受け取る・codex #1609 R2 Medium)
+  const dR3 = mkDraft('LP-REJ3', 'ハッカ油スプレー REJ3');
+  lp.requestJob(db, args(dR3, s2.spec, 'key-rej-3', { now: min(5017) }));
+  const cR3 = lp.claimJob(db, { runnerRunId: 'lpr-20261004-120200-rejre3', now: min(5017) });
+  const gR3 = lp.reserveGeneration(db, cR3.job.job_id, { leaseToken: cR3.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(5017) });
+  const sR3 = lp.submitResult(db, gR3.generation_id, { packetHash: cR3.job.packet_hash, verdict: 'rejected', output: DRAFT, reason: 'r', now: min(5018) });
+  ok(sR3.ok && sR3.status === 'failed', 'rejected の判定は受け取る');
+  eq(db.prepare('SELECT output_text FROM ph_lp_compose_jobs WHERE id = ?').get(cR3.job.job_id).output_text, null, '🚨 画像を見ていない下書きは残さない');
+  eq(lp.jobStateFor(db, dR3.id, { now: min(5018.1) }).job.has_draft, false, '下書きが無いことが画面に渡る (待たない)');
+  const rR3b = lp.requestJob(db, args(dR3, s2.spec, 'key-rej-3b', { now: min(5018.2) }));
+  ok(rR3b.ok, '🚨 下書きの無い rejected は確認を待たずに押し直せる (codex #1609 R3 Medium)');
+  if (rR3b.ok) db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?`).run(rR3b.job.id);   // 後の claim が拾わないように
+}
 
 // 🚨 packet の画像を**全部**見ていなければ accepted は出せない (codex exec review P1)。
 // 1 枚でも配っていればよいにしていたときは、途中の枚で落ちた実行役が

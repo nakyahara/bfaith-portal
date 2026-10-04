@@ -34,6 +34,9 @@
  */
 import { AMAZON_SALES_GROSS_INCL_SQL } from '../warehouse-mirror/db.js';
 import { financeDailyTable } from '../../lib/amazon-finance-read.js';
+// 出品の ASIN は SKU → ASIN の専用のマップ (SKU の今の ASIN) から付ける。財務の asin_norm は常に空 (2026-10-03 までは ASIN の欄がいつも空だった)
+//   読めない出どころがあれば応答の degradedLookups に出す (site-products と同じ名前・社内の /api/summary の JSON に出る。公開の口の画面・CSV には出さない。Codex #1604 R1 Medium)
+import { loadSkuAsinMap, currentAsin, asinMapDiagnostics } from '../../lib/amazon-sku-asin-map.js';
 
 const AMAZON_FINANCE_DAILY = financeDailyTable('supplier-sales');
 
@@ -196,7 +199,8 @@ function loadSupplierProductCodes(db, supplier) {
  *   商品行 = 取扱中商品(売上ゼロ含む) ∪ 期間内に確定売上のある商品 ∪ 速報に数字のある商品。
  *   （2026-09-01 中原さん要望: 売上ゼロの商品も一覧に出す。「売れていない」も仕入先への情報）
  * @returns { period, products:[{ne_code,name,pieces,sales,prevPieces,prevSales,lastSold,
- *            listings:[{mall,listingId,listingName,asin,is_fba,sold,pieces,sales}]}], totals }
+ *            listings:[{mall,listingId,listingName,asin,is_fba,sold,pieces,sales}]}], totals,
+ *            degradedLookups (ASIN のマップの読めなかった出どころ), asinMap (マップの数・確定の期間が無ければ null) }
  */
 export function getSupplierReport(db, supplierCode, opts = {}) {
   // 確定(精算)期間。finance マートが空だと null になり得るが、速報(注文ベース)は
@@ -206,6 +210,7 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
   const prod = loadProductMap(db);
   const setMap = loadSetMap(db, supplierCode);
   const amzMap = loadAmazonMap(db, supplierCode);
+  let asinMap = null;   // 確定のパートで読む (応答の診断に出す)
 
   // 商品(構成品=対象仕入先)ごとのアキュムレータ
   const out = new Map();
@@ -264,7 +269,7 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
 
     // Amazon: seller_sku を構成品へ展開
     const amzRows = db.prepare(`
-      SELECT date_jst d, LOWER(TRIM(seller_sku)) k, asin_norm asin, product_name name,
+      SELECT date_jst d, LOWER(TRIM(seller_sku)) k, product_name name,
              CAST(units_net_sold AS REAL) u, ${AMAZON_SALES_GROSS_INCL_SQL} sales,
              (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
       FROM ${AMAZON_FINANCE_DAILY}
@@ -273,10 +278,11 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
           SELECT LOWER(TRIM(seller_sku)) FROM mirror_sku_resolved
           WHERE LOWER(TRIM(ne_code)) IN (SELECT LOWER(TRIM(商品コード)) FROM mirror_products WHERE 仕入先コード = @s))
     `).all(params);
+    asinMap = loadSkuAsinMap(db);
     for (const r of amzRows) {
       const comps = amzMap.get(r.k);
       if (!comps || !comps.length) continue;
-      attribute({ mall: 'amazon', listingId: r.k, listingName: r.name, asin: r.asin, fbaFee: r.fbaFee, date: r.d, u: r.u, sales: r.sales, comps });
+      attribute({ mall: 'amazon', listingId: r.k, listingName: r.name, asin: currentAsin(asinMap, r.k), fbaFee: r.fbaFee, date: r.d, u: r.u, sales: r.sales, comps });
     }
 
     // 非 Amazon: fact の ne_code がセットなら展開、単品ならそのまま
@@ -354,7 +360,7 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
     sokuho30: products.reduce((a, p) => a + p.sokuho30, 0),
   };
 
-  return { period: P, sokuho: { asOf: sokuho.asOf, status: sokuho.status }, products, totals };
+  return { period: P, sokuho: { asOf: sokuho.asOf, status: sokuho.status }, products, totals, ...asinMapDiagnostics(asinMap) };
 }
 
 // 速報モール別の表示ラベルとグルーピング。
@@ -418,11 +424,11 @@ function round2(n) { return Math.round(n * 100) / 100; }
  *   = 「いつ・どのモールで・何個・いくら」の確定データ（CSV用）。
  *   finance マート(date_jst 粒度)由来。原価は出さない。期間 P 内のみ(prev は含めない)。
  *   Amazon は seller_sku→仕入先解決＋FBA/FBM判別、他モールは fact の ne_code。
- * @returns { period, rows:[{date, mall, is_fba, listingId, asin, ne_code, product_name, units, sales}] }
+ * @returns { period, rows:[{date, mall, is_fba, listingId, asin, ne_code, product_name, units, sales}], degradedLookups, asinMap }
  */
 export function getSupplierDailyDetail(db, supplierCode, opts = {}) {
   const P = resolvePeriod(db, opts);
-  if (!P) return { period: null, rows: [] };
+  if (!P) return { period: null, rows: [], ...asinMapDiagnostics(null) };
   const prod = loadProductMap(db);
   const amzMap = loadAmazonMap(db, supplierCode);
   const setMap = loadSetMap(db, supplierCode);
@@ -455,7 +461,7 @@ export function getSupplierDailyDetail(db, supplierCode, opts = {}) {
 
   // Amazon: 日次 × seller_sku（FBA/FBM 判別、構成品展開）
   const amz = db.prepare(`
-    SELECT date_jst, seller_sku, asin_norm, product_name,
+    SELECT date_jst, seller_sku, product_name,
            CAST(units_net_sold AS REAL) u, ${AMAZON_SALES_GROSS_INCL_SQL} sales,
            (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
     FROM ${AMAZON_FINANCE_DAILY}
@@ -464,8 +470,9 @@ export function getSupplierDailyDetail(db, supplierCode, opts = {}) {
         SELECT seller_sku FROM mirror_sku_resolved
         WHERE ne_code IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s))
   `).all(params);
+  const asinMap = loadSkuAsinMap(db);
   for (const r of amz) {
-    emit({ date: r.date_jst, mall: 'amazon', is_fba: r.fbaFee > 0, listingId: r.seller_sku, asin: r.asin_norm || '', comps: amzMap.get(r.seller_sku), u: r.u, sales: r.sales });
+    emit({ date: r.date_jst, mall: 'amazon', is_fba: r.fbaFee > 0, listingId: r.seller_sku, asin: currentAsin(asinMap, r.seller_sku), comps: amzMap.get(r.seller_sku), u: r.u, sales: r.sales });
   }
 
   // 非 Amazon: 日次 × 出品（fact の ne_code、セットは構成品展開）
@@ -490,7 +497,7 @@ export function getSupplierDailyDetail(db, supplierCode, opts = {}) {
   rows.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0)
     || (a.mall < b.mall ? -1 : a.mall > b.mall ? 1 : 0)
     || (a.listingId < b.listingId ? -1 : 1));
-  return { period: P, rows };
+  return { period: P, rows, ...asinMapDiagnostics(asinMap) };
 }
 
 /**
