@@ -66,19 +66,25 @@ console.log('① 設定 (fail-closed・品質段は low / medium / high だけ)'
   eq(li.lpImageConfig({ ...ENV, PH_LP_MONTHLY_BUDGET_JPY: '500' }).budget, 500, '上限は変えられる');
 }
 
-console.log('② 費用の計算 (検討 §5.1 の単価・1 ドル 150 円)');
+console.log('② 費用の計算 (検討 §5.1 の単価・少なく数えないよう 1 ドル 160 円)');
 {
-  // 文 1,000 + 画像 3,000 tok 入力・出力 439 tok (medium) → (1000×5 + 3000×8 + 439×30)/1e6 × 150
-  eq(li.costJpyFromUsage({ input_tokens: 4000, output_tokens: 439, input_tokens_details: { text_tokens: 1000, image_tokens: 3000 } }), 6.33, '円に直す');
+  // 文 1,000 + 画像 3,000 tok 入力・出力 439 tok (medium) → (1000×5 + 3000×8 + 439×30)/1e6 × 160
+  eq(li.costJpyFromUsage({ input_tokens: 4000, output_tokens: 439, input_tokens_details: { text_tokens: 1000, image_tokens: 3000 } }), 6.75, '円に直す');
   eq(li.costJpyFromUsage(null), null, 'usage が無ければ null (見込み額のまま)');
   eq(li.jstMonth(Date.parse('2026-10-31T15:30:00Z')), '2026-11', '月は JST で区切る');
+  // 取り置き = これ以上はかからない額 (#1612 R1 High)。medium・参考 2 枚・4,000 字 → (6000×5 + 6000×8 + 2000×30)/1e6 × 170
+  eq(li.reserveJpy({ quality: 'medium', refs: 2, promptChars: 4000 }), 23.46, '取り置きの計算 (medium・参考 2 枚・4,000 字)');
+  ok(li.reserveJpy({ quality: 'high', refs: 4, promptChars: 4000 }) > li.reserveJpy({ quality: 'medium', refs: 4, promptChars: 4000 }), '品質段が上がれば取り置きも上がる');
+  ok(li.reserveJpy({ quality: 'medium', refs: 4, promptChars: 4000 }) > li.reserveJpy({ quality: 'medium', refs: 1, promptChars: 4000 }), '参考画像が多ければ上がる');
+  ok(li.reserveJpy({ quality: 'medium', refs: 2, promptChars: 4000 }) > li.costJpyFromUsage({ input_tokens: 4000, output_tokens: 439, input_tokens_details: { text_tokens: 1000, image_tokens: 3000 } }), '🚨 取り置きは実際の額より大きい');
+  eq(li.reserveJpy({ quality: 'max', refs: 2, promptChars: 10 }), null, '知らない品質段は取り置けない (= 作らない)');
 }
 
 console.log('③ 作る画像の一覧 (prompt と参考画像)');
 {
   const out = compositionFor('ハッカ油スプレー').replace(/## 使用素材\n提供された実物商品画像/, '## 使用素材\n提供された実物商品画像／素材/使用イメージ/玄関.jpg');
   const packet = { images: [
-    { file_id: 'FILEIDWHITE01', role: 'white_bg' }, { file_id: 'FILEIDTOP0001', role: 'slot:1' }, { file_id: 'FILEIDSLOT002', role: 'slot:2' },
+    { file_id: 'FILEIDWHITE01', role: 'white_bg', modified_time: '2026-10-01T00:00:00.000Z' }, { file_id: 'FILEIDTOP0001', role: 'slot:1' }, { file_id: 'FILEIDSLOT002', role: 'slot:2' },
     { file_id: 'FILEIDMAT0001', role: 'material:1', folder: '素材/使用イメージ', name: '玄関.jpg' },
     { file_id: 'FILEIDMAT0002', role: 'material:2', folder: '素材', name: '使わない.jpg' },
   ] };
@@ -94,6 +100,8 @@ console.log('③ 作る画像の一覧 (prompt と参考画像)');
   ok(plan.images.every((im) => im.refs.length <= li.MAX_REFS), '参考画像は 4 枚まで (API の上限)');
   ok(withMat.prompt.includes('素材 (素材/使用イメージ/玄関.jpg)'), 'prompt に参考画像の中身を書く');
   ok(li.buildImagePlan({ outputText: 'ただの文章', packet }).error, '画像のブロックが無ければ作らない');
+  eq(noMat.refs[0].modified_time, '2026-10-01T00:00:00.000Z', '参考画像は Drive の更新日時も固定する (作る前に照らす)');
+  ok(plan.images.every((im) => im.est_jpy > 0) && withMat.est_jpy > noMat.est_jpy, '1 枚ずつ取り置き額を出す (素材を渡す画像は高い)');
 }
 
 console.log('④ 受け付け (押せない理由・固定・二重にしない)');
@@ -101,7 +109,8 @@ const A = makeComposed();
 {
   const okState = li.imageStateFor(db, { draft: A.draft, folderId: FOLDER, env: ENV, now: T0 });
   eq(okState.blocked, null, '構成ができていて画像フォルダがあれば押せる');
-  eq(okState.planned_count, 3, '作る枚数が画面に渡る (約 N 円の表示)');
+  eq(okState.planned_count, 3, '作る枚数が画面に渡る');
+  ok(okState.planned_reserve_jpy > 0, `押したときに取り置く額 (最大の額) が画面に渡る (${okState.planned_reserve_jpy} 円)`);
   ok(/画像フォルダ/.test(li.imageBlockReason(db, { draft: A.draft, folderId: null, env: ENV, now: T0 })), '画像フォルダが無ければ押せない (保存先が無い)');
   ok(/PH_LP_IMAGE_ENABLED/.test(li.imageBlockReason(db, { draft: A.draft, folderId: FOLDER, env: {}, now: T0 })), '機能フラグが無ければ押せない');
   const noCompose = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('X1', 'x', 't')`).run().lastInsertRowid));
@@ -111,6 +120,7 @@ const A = makeComposed();
   ok(r1.ok && r1.created && r1.job.status === 'queued', '受け付ける');
   ok(r1.job.model === 'gpt-image-2.5-flare' && r1.job.quality === 'medium' && r1.job.folder_id === FOLDER, 'モデル・品質段・保存先を受付時に固定');
   eq(db.prepare('SELECT COUNT(*) AS n FROM ph_lp_images WHERE image_job_id = ?').get(r1.job.id).n, 3, '画像 3 枚分の prompt を固定');
+  ok(db.prepare('SELECT MIN(est_jpy) AS m FROM ph_lp_images WHERE image_job_id = ?').get(r1.job.id).m > 0, '取り置き額も 1 枚ずつ固定');
   const again = li.requestImageJob(db, { draft: A.draft, folderId: FOLDER, idempotencyKey: 'img-key-0001', env: ENV, now: T0 });
   ok(again.ok && !again.created && again.job.id === r1.job.id, '同じキーの再送は前の依頼');
   eq(li.requestImageJob(db, { draft: A.draft, folderId: FOLDER, idempotencyKey: 'img-key-0002', env: ENV, now: T0 }).code, 'already_running', '🚨 動いている間は 2 つ目を受けない');
@@ -154,10 +164,10 @@ console.log('⑤ 作る係 — うまくいく');
   ok(calls.ensure.every((p) => p === FOLDER), '保存先は商品の画像フォルダの中の「AI初稿」');
   ok(calls.upload[0].name.startsWith('LPIMG1_AI初稿_') && calls.upload[0].name.endsWith('_0枚目.png'), `名前に商品コードと何枚目か (${calls.upload[0].name})`);
   const us = usageOf(jobId);
-  ok(us.length === 3 && us.every((u) => u.status === 'charged' && u.cost_jpy === 6.33 && u.out_tokens === 439), '台帳に 1 枚ずつ実額で記録 (charged)');
-  eq(li.monthUsage(db, T0).used_jpy, 18.99, '今月の使った額 = 実額の合計');
+  ok(us.length === 3 && us.every((u) => u.status === 'charged' && u.cost_jpy === 6.75 && u.out_tokens === 439), '台帳に 1 枚ずつ実額で記録 (charged)');
+  eq(li.monthUsage(db, T0).used_jpy, 20.25, '今月の使った額 = 実額の合計');
   const st = li.imageStateFor(db, { draft: A.draft, folderId: FOLDER, env: ENV, now: T0 });
-  ok(st.job.status === 'done' && st.job.images.length === 3 && st.job.cost_jpy === 18.99, '画面に画像と費用が渡る');
+  ok(st.job.status === 'done' && st.job.images.length === 3 && st.job.cost_jpy === 20.25, '画面に画像と費用が渡る');
   const evs = db.prepare('SELECT event FROM draft_events WHERE draft_id = ? ORDER BY id').all(A.draft.id).map((r) => r.event);
   ok(evs.includes('lp_image_requested') && evs.includes('lp_image_done'), '商品の履歴に残る');
   ok(dbmod.imageRefOfFileId(db, 'DRIVEOUT0001'), '🚨 作った画像はサムネイルの口で見せてよい (登録済みと同じ扱い)');
@@ -166,10 +176,15 @@ console.log('⑤ 作る係 — うまくいく');
 console.log('⑥ 作る係 — お金の上限で止める (fail-closed)');
 {
   const B = makeComposed();
-  // 使った 18.99 円。1 枚目: 18.99 + 取り置き 15 = 33.99 ≤ 45 → 実額 6.33 で 25.32。2 枚目: 40.32 ≤ 45 → 31.65。3 枚目: 46.65 > 45 で止める
-  const env = { ...ENV, PH_LP_MONTHLY_BUDGET_JPY: '45' };
-  const r = li.requestImageJob(db, { draft: B.draft, folderId: FOLDER, idempotencyKey: 'img-key-b001', env: { ...ENV, PH_LP_MONTHLY_BUDGET_JPY: '70' }, now: T0 });
-  ok(r.ok, '受け付ける (受付時は 18.99 + 45 = 63.99 ≤ 70)');
+  const r = li.requestImageJob(db, { draft: B.draft, folderId: FOLDER, idempotencyKey: 'img-key-b001', env: ENV, now: T0 });
+  ok(r.ok, '受け付ける');
+  // 上限を実際の取り置き額から組む: 1 枚目 = 使った額 + 取り置き1 ≤ 上限 → 実額 6.75。2 枚目 = 使った額 + 6.75 + 取り置き2 ≤ 上限 → 実額 6.75。
+  // 3 枚目 = 使った額 + 13.5 + 取り置き3 > 上限 で止まる
+  const est = imagesOf(r.job.id).map((im) => im.est_jpy);
+  const used0 = li.monthUsage(db, T0).used_jpy;
+  const cap = Math.ceil(used0 + 6.75 + est[1]) + 1;
+  ok(used0 + est[0] <= cap && used0 + 13.5 + est[2] > cap, `上限の組み立て (使った ${used0} 円・取り置き ${est.join(' / ')} 円・上限 ${cap} 円)`);
+  const env = { ...ENV, PH_LP_MONTHLY_BUDGET_JPY: String(cap) };
   const { deps, calls } = fakeDeps({ env });
   await li.createLpImageWorker(deps).kick();
   const ims = imagesOf(r.job.id);
@@ -195,10 +210,11 @@ console.log('⑦ 作る係 — 失敗の費用の扱い');
   await li.createLpImageWorker(deps).kick();
   const ims = imagesOf(r.job.id);
   const us = usageOf(r.job.id);
-  ok(ims[0].status === 'failed' && /内容で断られました/.test(ims[0].error) && us[0].status === 'failed' && us[0].cost_jpy === 0,
-    '内容で断られた (400 moderation) = 請求なし (0 円)・ほかの画像は続ける');
+  ok(ims[0].status === 'failed' && /内容で断られました/.test(ims[0].error) && us[0].status === 'unknown' && us[0].cost_jpy === null,
+    '🚨 内容で断られた (moderation) は出力の後のこともあるので取り置き額のまま数える (#1612 R1 High)・ほかの画像は続ける');
   ok(ims[1].status === 'failed' && us[1].status === 'unknown' && us[1].cost_jpy === null, '🚨 結果が分からない失敗 (通信断) は見込み額のまま数える');
-  ok(ims[2].status === 'done' && us[2].status === 'charged' && us[2].cost_jpy === li.EST_JPY_PER_IMAGE, 'usage が無い成功は見込み額で記録');
+  ok(ims[2].status === 'done' && us[2].status === 'charged' && us[2].cost_jpy === ims[2].est_jpy, '🚨 usage が無い成功は取り置き額 (最大の額) で記録');
+  ok(us.every((u, k) => u.est_jpy === ims[k].est_jpy), '台帳の取り置き額 = 受付時に固定した額');
   eq(jobOf(r.job.id).status, 'partial', '一部だけ');
 }
 
@@ -226,7 +242,31 @@ console.log('⑧ 作る係 — キーが使えない・混んでいる・Drive �
   const ims2 = imagesOf(r2.job.id);
   ok(ims2[0].status === 'done' && slept === 1, '429 (混んでいる) は少し待ってやり直す');
   ok(ims2[1].status === 'failed' && /Drive に保存できませんでした/.test(ims2[1].error) && Number(ims2[1].cost_jpy) > 0, '作れたが保存できない = 失敗 (費用は払った)');
+  eq(ims2[2].status, 'skipped', '🚨 保存できなければ残りは作らない (お金を使い続けない・#1612 R1 Medium)');
   eq(usageOf(r2.job.id)[1].status, 'charged', '保存できなくても台帳は charged');
+}
+
+console.log('⑧b 「AI初稿」は作る前に用意する・参考画像の差し替え (#1612 R1 Medium)');
+{
+  const H = makeComposed();
+  const r = li.requestImageJob(db, { draft: H.draft, folderId: FOLDER, idempotencyKey: 'img-key-h001', env: ENV, now: T0 });
+  const { deps, calls } = fakeDeps({ ensureFolder: async () => { throw new Error('insufficient permissions'); } });
+  await li.createLpImageWorker(deps).kick();
+  eq(calls.generate.length, 0, '🚨 「AI初稿」を作れなければ 1 枚も作らない (お金を使う前に止める)');
+  eq(imagesOf(r.job.id).map((im) => im.status), ['failed', 'skipped', 'skipped'], '残りも止める');
+  ok(usageOf(r.job.id).every((u) => u.status === 'failed' && u.cost_jpy === 0), 'まだ呼んでいないので 0 円');
+  ok(/AI初稿/.test(imagesOf(r.job.id)[0].error), '理由を残す');
+
+  const I = makeComposed(undefined, { images: [{ file_id: 'FILEIDWHITE01', role: 'white_bg', modified_time: '2026-10-01T00:00:00.000Z' }] });
+  const r2 = li.requestImageJob(db, { draft: I.draft, folderId: FOLDER, idempotencyKey: 'img-key-i001', env: ENV, now: T0 });
+  const seenExpected = [];
+  let n = 0;
+  const f2 = fakeDeps({ fetchRef: async (id, opt) => { seenExpected.push(opt?.expectedModifiedTime); n++; if (n === 1) throw Object.assign(new Error('changed'), { changed: true }); return { buf: Buffer.from('r'), mime: 'image/jpeg' }; } });
+  await li.createLpImageWorker(f2.deps).kick();
+  ok(seenExpected.every((x) => x === '2026-10-01T00:00:00.000Z'), '参考画像は受付時の更新日時で照らす');
+  const ims = imagesOf(r2.job.id);
+  ok(ims[0].status === 'failed' && /差し替わりました/.test(ims[0].error) && usageOf(r2.job.id)[0].cost_jpy === 0, '🚨 差し替わっていたら作らない (0 円)');
+  ok(ims.slice(1).every((im) => im.status === 'done'), 'ほかの画像は続ける');
 }
 
 console.log('⑨ 再起動の片付け (recover)');
@@ -239,9 +279,14 @@ console.log('⑨ 再起動の片付け (recover)');
   db.prepare(`UPDATE ph_lp_image_jobs SET status = 'running' WHERE id = ?`).run(r.job.id);
   db.prepare(`INSERT INTO ph_ai_usage (kind, month, draft_id, ref_id, model, quality, status, est_jpy) VALUES ('lp_image', ?, ?, ?, 'gpt-image-2.5-flare', 'medium', 'reserved', 15)`)
     .run(li.jstMonth(T0), F.draft.id, first.id);
+  // もう 1 つ: 期限内 (入れ替え中の古いプロセスがまだ作っている) は触らない
+  const alive = imagesOf(r.job.id)[2];
+  db.prepare(`UPDATE ph_lp_images SET status = 'running', claimed_by = 'w-old', lease_until = ? WHERE id = ?`).run(new Date(T0 + 5 * 60_000).toISOString(), alive.id);
   const { deps, calls } = fakeDeps();
   const w = li.createLpImageWorker(deps);
   w.recover();
+  eq(imagesOf(r.job.id)[2].status, 'running', '🚨 期限内の「作っている途中」は中断にしない (#1612 R1 Medium)');
+  db.prepare(`UPDATE ph_lp_images SET status = 'queued', claimed_by = NULL, lease_until = NULL WHERE id = ?`).run(alive.id);
   ok(imagesOf(r.job.id)[0].status === 'failed' && /途中で止まりました/.test(imagesOf(r.job.id)[0].error), '途中の画像は失敗 (自動で作り直さない)');
   eq(usageOf(r.job.id)[0].status, 'unknown', '🚨 費用は見込みのまま (請求されたものとして数える)');
   await w.kick();

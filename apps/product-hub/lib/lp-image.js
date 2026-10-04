@@ -12,8 +12,13 @@
  *   ③ 機能フラグ (PH_LP_IMAGE_ENABLED=1) と専用キー (OPENAI_LP_IMAGE_API_KEY) がそろわなければ動かない。
  *      キーは問い合わせハブの OPENAI_API_KEY と**名前を分ける** (検討 §6 層1)。同じキーを入れれば共用で始められ、
  *      後から専用キーに替えるのは Render の設定 1 つで済む (中原さん「共用で」2026-10-04)
- *   ④ prompt と参考画像は**受付時に固定** (作り直すときは新しい job)。1 依頼 (draft) に動いている job は 1 つ
- *   ⑤ 結果が分からない失敗 (通信断・5xx・Render の再起動) は**請求されたものとして**見込み額のまま残す
+ *   ④ prompt と参考画像は**受付時に固定** (作り直すときは新しい job)。参考画像は Drive の更新日時も固定し、
+ *      作る前に照らす (差し替わっていたら作らない)。1 依頼 (draft) に動いている job は 1 つ
+ *   ⑤ 取り置きは「これ以上はかからない額」(品質段・参考画像の枚数・prompt の長さから・#1612 R1 High)。
+ *      請求されないと言い切れる失敗 (401 / 403 / 404 / 429) だけ 0 円。内容で断られた (moderation) を含むほかの失敗・
+ *      通信断・5xx・再起動・usage の無い成功は**取り置き額のまま** (少なく数えない)
+ *   ⑥ 🚨 **Render の 1 台 (1 インスタンス) で動かす前提**。台帳も claim も product-hub の SQLite (1 台のディスク) が正本。
+ *      product-hub 全体がもともとこの前提 (DB を別のインスタンスと共有できない)。台数を増やすなら台帳を中央の DB に移すこと
  *
  * DB とロジックはここ。Drive / OpenAI / 画面は router.js から差し込む (試験で差し替えられるように)。
  */
@@ -30,12 +35,31 @@ export const MAX_LP_IMAGES = 8;                                // 検討 §4: �
 export const MAX_REFS = 4;                                     // API の上限 (1 回に参考画像 4 枚まで)
 export const MAX_PRODUCT_REFS = 2;                             // 商品の写真 (白抜き → TOP) は 2 枚まで。残りは使う素材
 export const DEFAULT_MONTHLY_BUDGET_JPY = 3000;               // 中原さん 2026-10-04「全部おすすめ」(見込み約 1,020 円の約 3 倍)
-/** 1 枚の取り置き額 (見込み)。medium で出力 2 円 + 参考画像 4 枚の入力 + 文 ≒ 10 円前後なので多めに */
-export const EST_JPY_PER_IMAGE = 15;
-const USD_JPY = 150;
 // $/1M tokens (検討 §5.1・2026-09 の公開価格)
 const PRICE = { textIn: 5, imageIn: 8, out: 30 };
+/** 実額の円換算。請求はドルなので推定。少なく数えないよう、検討 §5 の 150 円より高めに置く */
+const USD_JPY = 160;
+/** 取り置きの円換算 (為替の動きの余裕をさらに見る) */
+const USD_JPY_RESERVE = 170;
+/**
+ * 取り置きの上限トークン (#1612 R1 High: 一律 15 円だと実費が上回れば上限を突破できた)。
+ * 出力: 検討 §5.1 のベンチ (1024px で low 196 / medium 439 / high 1,756) を 1200px の面積 (×1.37) で伸ばし、さらに 3 倍以上の余裕。
+ * 入力: 参考画像 1 枚 (1024px) は 2 枚で約 3,000 tok の実測の 2 倍で 1 枚 3,000。文は 1 文字 1.5 トークンで見る
+ */
+const OUT_TOKENS_CEIL = { low: 1_000, medium: 2_000, high: 8_000 };
+const IMAGE_IN_TOKENS_PER_REF_CEIL = 3_000;
+const TEXT_TOKENS_PER_CHAR_CEIL = 1.5;
+/** 1 枚の取り置き額 (円・小数 2 桁で切り上げ)。品質段が知らない値なら null (= 作らない) */
+export function reserveJpy({ quality, refs = 0, promptChars = 0 }) {
+  const out = OUT_TOKENS_CEIL[quality];
+  if (!out) return null;
+  const usd = (Math.ceil(promptChars * TEXT_TOKENS_PER_CHAR_CEIL) * PRICE.textIn
+    + Math.max(0, refs) * IMAGE_IN_TOKENS_PER_REF_CEIL * PRICE.imageIn + out * PRICE.out) / 1_000_000;
+  return Math.ceil(usd * USD_JPY_RESERVE * 100) / 100;
+}
 const PROMPT_MAX = 30_000;
+/** 作っている画像の期限 (分)。段階ごとに延ばす。切れたものだけ片付ける */
+const LEASE_MIN = 15;
 const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9_.:-]{8,80}$/;
 const DRIVE_ID_RE = /^[-\w]{10,200}$/;
 
@@ -114,7 +138,7 @@ const sectionOf = (block, heading) => {
  * 参考画像 = 商品の写真 (白抜き → TOP の順に 2 枚まで) + その画像の「使用素材」に名前の出てくる素材 (合わせて 4 枚まで)
  * @returns {{images: Array<{seq,no,name,prompt,refs}>, error: string|null}}
  */
-export function buildImagePlan({ outputText, packet }) {
+export function buildImagePlan({ outputText, packet, quality = DEFAULT_LP_IMAGE_QUALITY }) {
   let doc;
   try { doc = parseConstructionDoc(String(outputText || '')); } catch (e) { return { images: [], error: '構成を読み取れません: ' + String(e?.message || e).slice(0, 200) }; }
   const imgs = (doc?.images || []).filter((im) => trim(im?.individualPrompt || im?.rawBlockText));
@@ -127,7 +151,8 @@ export function buildImagePlan({ outputText, packet }) {
   const packetImgs = Array.isArray(packet?.images) ? packet.images : [];
   const products = packetImgs.filter((im) => !/^material:/.test(String(im?.role || ''))).slice(0, MAX_PRODUCT_REFS);
   const materials = packetImgs.filter((im) => /^material:/.test(String(im?.role || '')));
-  const ref = (im) => ({ file_id: im.file_id, role: im.role || null, name: im.name || null, folder: im.folder || null });
+  // modified_time = Drive の更新日時。作る前に照らし、差し替わっていたら作らない (#1612 R1 Medium)
+  const ref = (im) => ({ file_id: im.file_id, role: im.role || null, name: im.name || null, folder: im.folder || null, modified_time: im.modified_time || null });
   const out = imgs.slice(0, MAX_LP_IMAGES).map((im, i) => {
     const block = trim(im.individualPrompt || im.rawBlockText);
     // その画像の「使用素材」に名前 (または 場所/名前) が出てくる素材だけ参考に渡す
@@ -147,7 +172,8 @@ export function buildImagePlan({ outputText, packet }) {
       '',
       `【この画像の指示: ${title}】`, block,
     ].filter((x) => x !== '').join('\n').slice(0, PROMPT_MAX);
-    return { seq: i + 1, no: Number.isInteger(im.no) ? im.no : null, name: trim(im.name, 100) || null, prompt, refs };
+    return { seq: i + 1, no: Number.isInteger(im.no) ? im.no : null, name: trim(im.name, 100) || null, prompt, refs,
+      est_jpy: reserveJpy({ quality, refs: refs.length, promptChars: prompt.length }) };
   });
   return { images: out, error: null };
 }
@@ -178,10 +204,12 @@ export function imageBlockReason(db, { draft, folderId, env = process.env, now =
   }
   if (!exact(folderId, DRIVE_ID_RE)) return '画像フォルダ (Driveリンク) が無いので、保存先がありません (画像タブで画像フォルダを設定してください)';
   if (activeImageJob(db, draftId)) return 'この商品の画像をいま作っています';
-  const plan = buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json) });
+  const plan = buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json), quality: cfg.quality });
   if (plan.error) return plan.error;
+  if (plan.images.some((im) => im.est_jpy == null)) return '画像の品質段の設定が読めません';
   const { used_jpy } = monthUsage(db, now);
-  const need = plan.images.length * EST_JPY_PER_IMAGE;
+  // 取り置き (= これ以上はかからない額) の合計で見る
+  const need = Math.ceil(plan.images.reduce((a, im) => a + im.est_jpy, 0));
   if (used_jpy + need > cfg.budget) {
     return `今月の上限 (${cfg.budget.toLocaleString()} 円) を超えるので作れません (今月 ${Math.round(used_jpy)} 円・この商品で約 ${need} 円)`;
   }
@@ -208,13 +236,13 @@ export function requestImageJob(db, { draft, folderId, idempotencyKey, actor, en
     if (blocked) return { code: activeImageJob(db, draftId) ? 'already_running' : 'not_ready', error: blocked };
     const cfg = lpImageConfig(env);
     const cj = latestComposeJob(db, draftId);
-    const plan = buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json) });
+    const plan = buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json), quality: cfg.quality });
     const id = Number(db.prepare(`INSERT INTO ph_lp_image_jobs
       (draft_id, compose_job_id, idempotency_key, status, model, quality, size, folder_id, requested_by, created_at)
       VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`)
       .run(draftId, cj.id, key, cfg.model, cfg.quality, cfg.size, folderId, trim(actor, 120) || 'unknown', nowS).lastInsertRowid);
-    const ins = db.prepare(`INSERT INTO ph_lp_images (image_job_id, seq, no, name, prompt, refs_json, status) VALUES (?, ?, ?, ?, ?, ?, 'queued')`);
-    for (const im of plan.images) ins.run(id, im.seq, im.no, im.name, im.prompt, JSON.stringify(im.refs));
+    const ins = db.prepare(`INSERT INTO ph_lp_images (image_job_id, seq, no, name, prompt, refs_json, est_jpy, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued')`);
+    for (const im of plan.images) ins.run(id, im.seq, im.no, im.name, im.prompt, JSON.stringify(im.refs), im.est_jpy);
     logEvent(db, draftId, 'lp_image_requested', `画像 ${plan.images.length} 枚 (${cfg.model} / ${cfg.quality}・依頼 ${id})`, trim(actor, 120) || 'unknown');
     return { ok: true, job: db.prepare('SELECT * FROM ph_lp_image_jobs WHERE id = ?').get(id), created: true };
   }).immediate();
@@ -229,15 +257,16 @@ export function imageStateFor(db, { draft, folderId, env = process.env, now = Da
   const images = job ? db.prepare(`SELECT id, seq, no, name, status, drive_file_id, error, cost_jpy FROM ph_lp_images
     WHERE image_job_id = ? ORDER BY seq`).all(job.id) : [];
   const cj = draftId ? latestComposeJob(db, draftId) : null;
-  const plannedCount = cj && cj.status === 'done' && cj.model_check === 'match' && trim(cj.output_text)
-    ? buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json) }).images.length : 0;
+  const planned = cj && cj.status === 'done' && cj.model_check === 'match' && trim(cj.output_text)
+    ? buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json), quality: cfg.quality || DEFAULT_LP_IMAGE_QUALITY }).images : [];
   return {
     enabled: cfg.enabled,
     usable: cfg.usable,
     model: cfg.model, quality: cfg.quality,
     budget_jpy: cfg.budget, month, used_jpy,
-    est_jpy_per_image: EST_JPY_PER_IMAGE,
-    planned_count: plannedCount,
+    planned_count: planned.length,
+    // 押したときに取り置く額 (= これ以上はかからない額)。実際はもっと安い (検討 §5: 1 枚 数円)
+    planned_reserve_jpy: Math.ceil(planned.reduce((a, im) => a + (im.est_jpy || 0), 0)),
     blocked: draftId ? imageBlockReason(db, { draft, folderId, env, now }) : '商品の ID が不正です',
     job: job ? {
       id: job.id, status: job.status, model: job.model, quality: job.quality, error: job.error,
@@ -265,19 +294,33 @@ export function createLpImageWorker(deps) {
   const env = () => deps.env || process.env;
   const now = () => (deps.now ? deps.now() : Date.now());
   const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  // このプロセスの印。作っている画像に付け、期限 (lease) が切れたものだけを片付ける (#1612 R1 Medium)
+  const token = deps.token || `w-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
   let running = false;
   let again = false;
 
-  /** 動いていた画像 (Render の再起動で途中になったもの) を「中断」にする。費用は見込みのまま (請求されたものとして) */
+  const leaseUntil = () => new Date(now() + LEASE_MIN * 60_000).toISOString();
+  /** 作っている間、段階ごとに期限を延ばす (生成 4 分 × やり直し 2 回 + Drive でも切れないように) */
+  const renew = (db, id) => db.prepare(`UPDATE ph_lp_images SET lease_until = ? WHERE id = ? AND status = 'running' AND claimed_by = ?`)
+    .run(leaseUntil(), id, token).changes === 1;
+
+  /**
+   * 期限の切れた「作っている途中」の画像を失敗にする (Render の再起動などで止まったもの)。
+   * 🚨 期限内のものは触らない — 入れ替え中の古いプロセスがまだ作っているかもしれない。
+   * 費用は取り置き額のまま (請求されたものとして)。自動では作り直さない
+   */
   function recover() {
     const db = deps.getDB();
     const nowS = new Date(now()).toISOString();
     db.transaction(() => {
-      for (const im of db.prepare(`SELECT id FROM ph_lp_images WHERE status = 'running'`).all()) {
-        db.prepare(`UPDATE ph_lp_images SET status = 'failed', error = ?, completed_at = ? WHERE id = ? AND status = 'running'`)
-          .run('途中で止まりました (Render の再起動など)。費用は見込みのまま数えています', nowS, im.id);
-        db.prepare(`UPDATE ph_ai_usage SET status = 'unknown', finished_at = ?, error = ? WHERE kind = 'lp_image' AND ref_id = ? AND status = 'reserved'`)
-          .run(nowS, 'interrupted', im.id);
+      for (const im of db.prepare(`SELECT id FROM ph_lp_images WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?)`).all(nowS)) {
+        const ch = db.prepare(`UPDATE ph_lp_images SET status = 'failed', error = ?, completed_at = ?
+          WHERE id = ? AND status = 'running' AND (lease_until IS NULL OR lease_until < ?)`)
+          .run('途中で止まりました (Render の再起動など)。費用は取り置き額のまま数えています', nowS, im.id, nowS).changes;
+        if (ch) {
+          db.prepare(`UPDATE ph_ai_usage SET status = 'unknown', finished_at = ?, error = ? WHERE kind = 'lp_image' AND ref_id = ? AND status = 'reserved'`)
+            .run(nowS, 'interrupted', im.id);
+        }
       }
     }).immediate();
     finalizeJobs(db);
@@ -297,7 +340,7 @@ export function createLpImageWorker(deps) {
     }
   }
 
-  /** 残りの画像を全部 skipped にする (上限・キーが使えない・設定が外れた) */
+  /** 残りの画像を全部 skipped にする (上限・キーが使えない・保存できない・設定が外れた) */
   function skipRest(db, jobId, reason) {
     const nowS = new Date(now()).toISOString();
     db.prepare(`UPDATE ph_lp_images SET status = 'skipped', error = ?, completed_at = ? WHERE image_job_id = ? AND status = 'queued'`)
@@ -309,28 +352,30 @@ export function createLpImageWorker(deps) {
   function claimNext(db) {
     const nowS = new Date(now()).toISOString();
     return db.transaction(() => {
-      const im = db.prepare(`SELECT i.*, j.draft_id, j.model, j.quality, j.size, j.folder_id, j.status AS job_status
+      const im = db.prepare(`SELECT i.*, j.draft_id, j.model, j.quality, j.size, j.folder_id, j.ai_folder_id
         FROM ph_lp_images i JOIN ph_lp_image_jobs j ON j.id = i.image_job_id
         WHERE i.status = 'queued' AND j.status IN ('queued','running') ORDER BY j.id, i.seq LIMIT 1`).get();
       if (!im) return null;
       const cfg = lpImageConfig(env());
       if (!cfg.usable) { skipRest(db, im.image_job_id, '途中で止めました: ' + cfg.error); return { skipped: true }; }
-      // 🚨 依頼のときのモデル・品質段で作る (途中で設定が変わっても混ぜない)。読めない値なら止める
-      if (!LP_IMAGE_MODELS.includes(im.model) || !LP_IMAGE_QUALITIES.includes(im.quality)) {
-        skipRest(db, im.image_job_id, '依頼のモデル・品質段が読めません'); return { skipped: true };
+      // 🚨 依頼のときのモデル・品質段で作る (途中で設定が変わっても混ぜない)。読めない値・取り置き額が無いなら止める
+      if (!LP_IMAGE_MODELS.includes(im.model) || !LP_IMAGE_QUALITIES.includes(im.quality) || !(Number(im.est_jpy) > 0)) {
+        skipRest(db, im.image_job_id, '依頼のモデル・品質段・取り置き額が読めません'); return { skipped: true };
       }
+      const est = Number(im.est_jpy);
       const { month, used_jpy } = monthUsage(db, now());
-      if (used_jpy + EST_JPY_PER_IMAGE > cfg.budget) {
+      if (used_jpy + est > cfg.budget) {
         skipRest(db, im.image_job_id, `今月の上限 (${cfg.budget.toLocaleString()} 円) に達したので止めました`);
         return { skipped: true };
       }
-      const ch = db.prepare(`UPDATE ph_lp_images SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'`).run(nowS, im.id).changes;
+      const ch = db.prepare(`UPDATE ph_lp_images SET status = 'running', started_at = ?, claimed_by = ?, lease_until = ?
+        WHERE id = ? AND status = 'queued'`).run(nowS, token, leaseUntil(), im.id).changes;
       if (ch !== 1) return { skipped: true };
       db.prepare(`UPDATE ph_lp_image_jobs SET status = 'running', started_at = COALESCE(started_at, ?) WHERE id = ? AND status = 'queued'`).run(nowS, im.image_job_id);
       const usageId = Number(db.prepare(`INSERT INTO ph_ai_usage (kind, month, draft_id, ref_id, model, quality, status, est_jpy, created_at)
         VALUES ('lp_image', ?, ?, ?, ?, ?, 'reserved', ?, ?)`)
-        .run(month, im.draft_id, im.id, im.model, im.quality, EST_JPY_PER_IMAGE, nowS).lastInsertRowid);
-      return { im, usageId };
+        .run(month, im.draft_id, im.id, im.model, im.quality, est, nowS).lastInsertRowid);
+      return { im, usageId, est };
     }).immediate();
   }
 
@@ -344,27 +389,54 @@ export function createLpImageWorker(deps) {
         error ? String(error).slice(0, 300) : null, new Date(now()).toISOString(), usageId);
   }
 
+  /** 自分が掴んでいる画像だけを確定する (片付けで失敗にされた後なら何もしない) */
   function finishImage(db, id, fields) {
-    db.prepare(`UPDATE ph_lp_images SET status = ?, drive_file_id = ?, error = ?, cost_jpy = ?, completed_at = ? WHERE id = ? AND status = 'running'`)
+    return db.prepare(`UPDATE ph_lp_images SET status = ?, drive_file_id = ?, error = ?, cost_jpy = ?, completed_at = ?
+      WHERE id = ? AND status = 'running' AND claimed_by = ?`)
       .run(fields.status, fields.drive_file_id || null, fields.error ? String(fields.error).slice(0, 500) : null,
-        fields.cost ?? null, new Date(now()).toISOString(), id);
+        fields.cost ?? null, new Date(now()).toISOString(), id, token).changes === 1;
   }
 
-  async function processOne(db, { im, usageId }) {
-    // 1) 参考画像 (失敗 = まだ呼んでいないので請求なし)
-    let refs = [];
+  /** まだ呼んでいない段階の失敗 = 請求なし */
+  function failBeforeCall(db, c, why, { stopRest = false } = {}) {
+    finishUsage(db, c.usageId, { status: 'failed', cost: 0, error: why });
+    finishImage(db, c.im.id, { status: 'failed', error: why });
+    if (stopRest) skipRest(db, c.im.image_job_id, why);
+  }
+
+  async function processOne(db, c) {
+    const { im, usageId, est } = c;
+    // 1) 「AI初稿」フォルダを**作る前に**用意する (1 依頼に 1 回・#1612 R1 Medium)。
+    //    書き込めないのに作ってから気づくと、全部の画像にお金を払ってから全部保存できない
+    let aiFolder = db.prepare('SELECT ai_folder_id FROM ph_lp_image_jobs WHERE id = ?').get(im.image_job_id).ai_folder_id;
+    if (!aiFolder) {
+      try {
+        aiFolder = await deps.ensureFolder(im.folder_id);
+        if (!exact(String(aiFolder || ''), DRIVE_ID_RE)) throw new Error('フォルダの ID が返ってきませんでした');
+        db.prepare('UPDATE ph_lp_image_jobs SET ai_folder_id = COALESCE(ai_folder_id, ?) WHERE id = ?').run(aiFolder, im.image_job_id);
+        aiFolder = db.prepare('SELECT ai_folder_id FROM ph_lp_image_jobs WHERE id = ?').get(im.image_job_id).ai_folder_id;
+      } catch (e) {
+        failBeforeCall(db, c, '画像フォルダの中に「AI初稿」を作れません (Drive の権限・共有を確かめてください): ' + String(e?.message || e).slice(0, 160), { stopRest: true });
+        return;
+      }
+    }
+    renew(db, im.id);
+    // 2) 参考画像。受付時の更新日時と違えば (差し替わっていたら) 作らない (#1612 R1 Medium)。失敗 = まだ呼んでいないので請求なし
+    const refs = [];
     try {
       const list = safeJson(im.refs_json) || [];
       for (const [k, r] of list.entries()) {
-        const got = await deps.fetchRef(r.file_id);
-        refs.push({ buf: got.buf, mime: got.mime || 'image/jpeg', filename: `ref-${k + 1}.${/png/.test(got.mime || '') ? 'png' : 'jpg'}` });
+        const got = await deps.fetchRef(r.file_id, { expectedModifiedTime: r.modified_time || null });
+        refs.push({ buf: got.buf, mime: got.mime || 'image/jpeg', filename: `ref-${k + 1}.${/png/.test(got.mime || '') ? 'png' : (/webp/.test(got.mime || '') ? 'webp' : 'jpg')}` });
       }
     } catch (e) {
-      finishUsage(db, usageId, { status: 'failed', cost: 0, error: 'ref: ' + (e?.message || e) });
-      finishImage(db, im.id, { status: 'failed', error: '参考画像を Drive から取れませんでした: ' + String(e?.message || e).slice(0, 200) });
+      const why = e?.changed ? '参考画像が依頼のあとで差し替わりました (作り直すときはもう一度押してください)'
+        : '参考画像を Drive から取れませんでした: ' + String(e?.message || e).slice(0, 200);
+      failBeforeCall(db, c, why);
       return;
     }
-    // 2) 生成 (混んでいる 429 だけ少し待って 2 回まで)
+    renew(db, im.id);
+    // 3) 生成 (混んでいる 429 だけ少し待って 2 回まで)
     let result = null;
     for (let attempt = 0; ; attempt++) {
       try {
@@ -374,31 +446,34 @@ export function createLpImageWorker(deps) {
         break;
       } catch (e) {
         const status = Number(e?.status) || 0;
-        if (status === 429 && attempt < 2) { await sleep(20_000 * (attempt + 1)); continue; }
-        // 401 / 403 = キーが使えない → 残りも作らない。4xx (内容で断られた等) = 請求されない。それ以外 = 結果が分からない (見込みのまま)
-        const definite = status >= 400 && status < 500 && status !== 408 && !e?.transient;
-        finishUsage(db, usageId, { status: definite ? 'failed' : 'unknown', cost: definite ? 0 : null, error: `${status || 'net'} ${e?.code || ''} ${e?.message || ''}` });
-        const why = e?.code === 'moderation_blocked' ? '画像の AI に内容で断られました (moderation)'
+        if (status === 429 && attempt < 2) { await sleep(20_000 * (attempt + 1)); renew(db, im.id); continue; }
+        // 🚨 請求されないと言い切れるのは、処理の前に断られるものだけ (キー・権限・モデルが無い・混雑)。
+        //    内容で断られた (moderation) は出力の後で止まることもあるので、ほかの失敗と同じく取り置き額のまま (#1612 R1 High)
+        const noCharge = !e?.transient && [401, 403, 404, 429].includes(status) && e?.code !== 'moderation_blocked';
+        finishUsage(db, usageId, { status: noCharge ? 'failed' : 'unknown', cost: noCharge ? 0 : null, error: `${status || 'net'} ${e?.code || ''} ${e?.message || ''}` });
+        const why = e?.code === 'moderation_blocked' ? '画像の AI に内容で断られました (moderation)。費用は取り置き額のまま数えています'
           : status === 401 || status === 403 ? 'OpenAI のキーが使えません (Render の OPENAI_LP_IMAGE_API_KEY)'
+          : status === 429 ? 'OpenAI が混んでいて作れませんでした (少し時間をおいてもう一度押してください)'
           : `画像を作れませんでした (${status || '通信'}: ${String(e?.message || '').slice(0, 160)})`;
         finishImage(db, im.id, { status: 'failed', error: why });
-        if (status === 401 || status === 403) skipRest(db, im.image_job_id, why);
+        if (status === 401 || status === 403 || status === 404) skipRest(db, im.image_job_id, why);
         return;
       }
     }
-    // 3) 費用を確定 (作れた = 請求された)
-    const cost = costJpyFromUsage(result.usage) ?? EST_JPY_PER_IMAGE;
+    renew(db, im.id);
+    // 4) 費用を確定 (作れた = 請求された)。usage が無ければ取り置き額のまま
+    const cost = costJpyFromUsage(result.usage) ?? est;
     finishUsage(db, usageId, { status: 'charged', cost, usage: result.usage });
-    // 4) Drive の「AI初稿」に保存 (失敗しても費用は払った・画像は失敗にする)
+    // 5) Drive の「AI初稿」に保存。失敗したら残りは作らない (保存できないのにお金を使い続けない・#1612 R1 Medium)
     try {
-      let folder = db.prepare('SELECT folder_id FROM ph_lp_image_jobs WHERE id = ?').get(im.image_job_id).folder_id;
-      const sub = await deps.ensureFolder(folder);
       const draft = db.prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(im.draft_id) || {};
       const name = `${trim(draft.ne_code, 60) || 'draft' + im.draft_id}_AI初稿_${im.image_job_id}_${String(im.seq).padStart(2, '0')}${im.no != null ? '_' + im.no + '枚目' : ''}.png`;
-      const fileId = await deps.upload({ folderId: sub, name, buf: result.buf });
+      const fileId = await deps.upload({ folderId: aiFolder, name, buf: result.buf });
       finishImage(db, im.id, { status: 'done', drive_file_id: fileId, cost });
     } catch (e) {
-      finishImage(db, im.id, { status: 'failed', cost, error: '作れましたが Drive に保存できませんでした: ' + String(e?.message || e).slice(0, 200) });
+      const why = '作れましたが Drive に保存できませんでした: ' + String(e?.message || e).slice(0, 200);
+      finishImage(db, im.id, { status: 'failed', cost, error: why });
+      skipRest(db, im.image_job_id, 'Drive に保存できないので残りは作っていません');
     }
   }
 
@@ -410,13 +485,14 @@ export function createLpImageWorker(deps) {
       do {
         again = false;
         const db = deps.getDB();
+        recover();   // 期限の切れた途中のものを先に片付ける
         for (;;) {
           const c = claimNext(db);
           if (!c) break;
           if (c.skipped) { finalizeJobs(db); continue; }
           try { await processOne(db, c); }
           catch (e) {
-            // ここに来るのは想定外 (部品の作りの誤り)。費用は見込みのまま・画像は失敗
+            // ここに来るのは想定外 (部品の作りの誤り)。費用は取り置き額のまま・画像は失敗
             try {
               finishUsage(db, c.usageId, { status: 'unknown', error: 'worker: ' + (e?.message || e) });
               finishImage(db, c.im.id, { status: 'failed', error: '想定外の失敗: ' + String(e?.message || e).slice(0, 200) });
@@ -431,7 +507,7 @@ export function createLpImageWorker(deps) {
     }
   }
 
-  return { kick, recover, isRunning: () => running };
+  return { kick, recover, isRunning: () => running, token };
 }
 
 // ─── 本物の部品 ─────────────────────────────────────────

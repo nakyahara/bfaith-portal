@@ -5893,9 +5893,10 @@ th.attr-unknown { color: #dc2626; }
       state = s;
       const job = s.job;
       const running = !!job && RUNNING.includes(job.status);
-      const est = (Number(s.planned_count) || 0) * (Number(s.est_jpy_per_image) || 0);
+      // 押したときに取り置く額 (= これ以上はかからない額)。実際はもっと安い
+      const est = Number(s.planned_reserve_jpy) || 0;
       btn.disabled = !!s.blocked || running || posting;
-      btn.textContent = running ? '🖼 画像を作っています…' : (job ? '🖼 もう一度画像を作る' : '🖼 画像を作る') + (est ? ' (' + s.planned_count + ' 枚・約 ' + yen(est) + ')' : '');
+      btn.textContent = running ? '🖼 画像を作っています…' : (job ? '🖼 もう一度画像を作る' : '🖼 画像を作る') + (est ? ' (' + s.planned_count + ' 枚・最大 ' + yen(est) + ')' : '');
       metaEl.textContent = (s.model ? s.model + ' / 品質 ' + s.quality + '・' : '')
         + '今月 ' + yen(s.used_jpy) + ' / 上限 ' + yen(s.budget_jpy)
         + (job && job.cost_jpy ? '・この画像で ' + yen(job.cost_jpy) : '');
@@ -5927,9 +5928,9 @@ th.attr-unknown { color: #dc2626; }
     }
     btn.addEventListener('click', async () => {
       if (posting) return;
-      const est = (Number(state.planned_count) || 0) * (Number(state.est_jpy_per_image) || 0);
+      const est = Number(state.planned_reserve_jpy) || 0;
       // 作り直しはお金がかかるので確かめる
-      if (state.job && !window.confirm('もう一度作ると、約 ' + yen(est) + ' かかります (前の画像は Drive に残ります)。作りますか？')) return;
+      if (state.job && !window.confirm('もう一度作ると、最大 ' + yen(est) + ' かかります (前の画像は Drive に残ります)。作りますか？')) return;
       posting = true;
       btn.disabled = true;
       statusEl.textContent = '依頼しています…';
@@ -5946,6 +5947,8 @@ th.attr-unknown { color: #dc2626; }
         statusEl.textContent = (json && json.error) || '依頼できませんでした';
         if (res.status === 409 || res.status === 400) idemKey = null;
         btn.disabled = !!state.blocked;
+        // 別のタブで作っている最中などは、最新の状況を取り直して出す (#1612 R1 Low)
+        if (res.status === 409) poll();
       } catch (e) {
         posting = false;
         btn.disabled = false;

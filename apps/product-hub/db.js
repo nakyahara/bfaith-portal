@@ -1436,7 +1436,8 @@ export function initProductHubDB() {
       model           TEXT NOT NULL,
       quality         TEXT NOT NULL,
       size            TEXT NOT NULL,
-      folder_id       TEXT,                    -- 保存先 = 商品の画像フォルダの中の AI初稿
+      folder_id       TEXT,                    -- 商品の画像フォルダ (drive_folder_url)
+      ai_folder_id    TEXT,                    -- その中の「AI初稿」。**最初の画像を作る前に**用意して固定する (#1612 R1)
       requested_by    TEXT,
       error           TEXT,
       created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -1456,6 +1457,9 @@ export function initProductHubDB() {
       prompt          TEXT NOT NULL,
       refs_json       TEXT NOT NULL DEFAULT '[]',  -- 参考に渡す画像 [{file_id, role, label}]
       status          TEXT NOT NULL CHECK (status IN ('queued','running','done','failed','skipped')),
+      est_jpy         REAL NOT NULL DEFAULT 0, -- 取り置き額 = これ以上はかからない額 (品質段・参考画像・prompt の長さから・#1612 R1)
+      claimed_by      TEXT,                    -- 作っているプロセス (再起動の片付けで、生きているものを中断にしない・#1612 R1)
+      lease_until     TEXT,
       drive_file_id   TEXT,
       error           TEXT,
       cost_jpy        REAL,

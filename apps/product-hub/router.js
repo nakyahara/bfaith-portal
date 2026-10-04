@@ -3907,8 +3907,17 @@ const lpImageWorker = createLpImageWorker({
   getDB,
   generate: (args) => openaiGenerateImage(args),
   // 参考画像は AI に構成を書かせたときと同じ幅 (1024px) のサムネイル。ラベルの文字が読める大きさ
-  fetchRef: async (fileId) => {
-    const e = await getDriveThumbnail(fileId, LP_COMPOSE_IMAGE_WIDTH);
+  // 受付時の更新日時と照らし、差し替わっていたら作らない (#1612 R1 Medium)。更新日時が記録されていない画像は照らさない
+  fetchRef: async (fileId, { expectedModifiedTime = null } = {}) => {
+    if (expectedModifiedTime) {
+      const meta = await getDriveWriteClient().files.get({ fileId, fields: 'modifiedTime', supportsAllDrives: true }, { timeout: 30_000 });
+      const cur = meta?.data?.modifiedTime || null;
+      if (cur && Date.parse(cur) !== Date.parse(expectedModifiedTime)) {
+        throw Object.assign(new Error(`参考画像が差し替わっています (${fileId})`), { changed: true });
+      }
+    }
+    // 版 = 受付時の更新日時 (サムネイルのキャッシュも受付時の版で引く)
+    const e = await getDriveThumbnail(fileId, LP_COMPOSE_IMAGE_WIDTH, expectedModifiedTime || '');
     return { buf: e.buf, mime: sniffImageMime(e.buf) };
   },
   ensureFolder: async (parentId) => (await ensureImageFolder(getDriveWriteClient(), { name: 'AI初稿', parentId })).id,
@@ -3922,12 +3931,12 @@ const lpImageWorker = createLpImageWorker({
     return r.data.id;
   },
 });
-// 起動のとき: 途中で止まった画像を片付けてから、残りを作る (機能が有効なときだけ)
+// 起動のときと 10 分おき: 期限の切れた途中の画像を片付けてから、残りを作る (機能が有効なときだけ)。
+// kick の中で recover するので、入れ替え中の古いプロセスが作っている画像 (期限内) には触らない (#1612 R1 Medium)
 if (process.env.PH_LP_IMAGE_ENABLED === '1') {
-  setTimeout(() => {
-    try { lpImageWorker.recover(); lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e)); }
-    catch (e) { console.error('[product-hub] lp-image recover:', e?.message || e); }
-  }, 15_000).unref();
+  const lpImageTick = () => lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e));
+  setTimeout(lpImageTick, 15_000).unref();
+  setInterval(lpImageTick, 10 * 60_000).unref();
 }
 
 /** 状況 (画面が作っている間 5 秒おきに叩く) */
