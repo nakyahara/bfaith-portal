@@ -96,7 +96,7 @@ function Exit-ClaudeLock {
 # the lock has started nothing, and counting it made two runners wait for each other until both deadlines.
 # A guarded runner starts node / claude only after taking the lock, and its job kills them if it dies.
 # (An unguarded OLD runner is still caught once it starts node / claude; install both runners together.)
-$ClaudeResiduePattern = '(?i)(@anthropic-ai[\\/]claude-code|claude-code[\\/](bin|cli\.js)|\bkw-publish\.cjs\b|\bkw-preflight\.cjs\b|\bad-kw-ai\.mjs\b)'
+$ClaudeResiduePattern = '(?i)(@anthropic-ai[\\/]claude-code|claude-code[\\/](bin|cli\.js)|\bkw-publish\.cjs\b|\bkw-preflight\.cjs\b|\bad-kw-ai\.mjs\b|\bphlp\.mjs\b)'
 # Returns @{ Ok = $true; Items = @(...) } or @{ Ok = $false; Error = '...' } when the process list could not be read.
 # A failed listing is NEVER "nothing is running" (Codex #1427 R1 #2): callers must not start Claude or delete the OAuth lock.
 # CommandLine is readable for this user's own processes (the runners and Claude all run as the same user);

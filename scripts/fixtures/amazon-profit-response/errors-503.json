@@ -1,0 +1,58 @@
+{
+  "_note": "503 の本文の形 = { ok: false, code, error, reason? }。error は code ごとの固定の文 (PROFIT_503_ERRORS) と完全に一致・reason は code ごとの列挙 (PROFIT_503_REASONS) だけ。値・部分の結果・Render の応答の本文・上流の例外の文・鍵・接続の文字列は出さない。header の Cache-Control: no-store は router に触れる PR (遅くとも PR 6) で付けて試験する",
+  "bodies": [
+    {
+      "ok": false,
+      "code": "PROFIT_ROUTE_DISABLED",
+      "error": "Amazon の利益の読む口は 2026-10-01 から止めています (封じ込め)。93 日分の計算で本番の Postgres が落ちたため。設計『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10 (D-60 v3.1 = 1 か月ずつ計算) で作り直すまで使えません。"
+    },
+    {
+      "ok": false,
+      "code": "PROFIT_NOT_CALIBRATED",
+      "error": "承認済みの校正の記録が無いか、今の DB と合わないので計算しません。",
+      "reason": "CALIBRATION_MISSING"
+    },
+    {
+      "ok": false,
+      "code": "PROFIT_BUSY",
+      "error": "ほかの重い処理の最中なので計算しません。しばらくしてからもう一度。",
+      "reason": "LOCK_NOT_AVAILABLE"
+    },
+    {
+      "ok": false,
+      "code": "PROFIT_RESOURCE",
+      "error": "DB のメモリ・一時ファイル・負荷の条件を満たさないので計算しません。",
+      "reason": "RESOURCE_MEMORY"
+    },
+    {
+      "ok": false,
+      "code": "PROFIT_METRICS_UNAVAILABLE",
+      "error": "Render の metrics が読めないので計算しません。",
+      "reason": "METRICS_CONFIG"
+    },
+    {
+      "ok": false,
+      "code": "PROFIT_DB_UNAVAILABLE",
+      "error": "DB に接続できないか、計算の取引を始められない / 終えられないので、どの値も返しません。",
+      "reason": "DB_CONNECT"
+    },
+    {
+      "ok": false,
+      "code": "PROFIT_PARTIAL_FAILED",
+      "error": "1 か月の計算に失敗したので、どの値も返しません。",
+      "reason": "MONTH_META_FAILED"
+    },
+    {
+      "ok": false,
+      "code": "PROFIT_VERSION_MISMATCH",
+      "error": "月で calculation_version / master_basis が違うので計算できません。",
+      "reason": "CALCULATION_VERSION"
+    },
+    {
+      "ok": false,
+      "code": "PROFIT_INTERNAL",
+      "error": "受け口の中の思わぬ失敗なので、どの値も返しません。",
+      "reason": "APP_UNEXPECTED"
+    }
+  ]
+}

@@ -8,7 +8,7 @@
  *     未コミットは断る / ずれの検出 / 戻す / 途中の失敗は戻す
  *   4 .bat は CRLF・.js は LF (各 PC の今のファイルと同じバイト)
  *   5 入荷バーコード連携 (auto-barcode.js・③c-1b-3a): JST 00:00〜01:30 は動かない (CSV・鍵・ブラウザの前 / 各ステップと実行ボタンの前) /
- *     LOGIZARD_BC_DAILY=auto = ①② だけ (③ の CSV を要求しない) / 引数は --dry だけ
+ *     切替の PR (L-23) から ①② だけ (③ の CSV を見ない・前の設定 LOGIZARD_BC_DAILY が残っていても ③ はしない) / 引数は --dry だけ
  *   6 バーコードの書き出し (barcode-export.js・③c-1b-2b K4): 検証は印つきの例外・全件の条件・承認は「エクスポート処理を行います」だけ・② の出力には書かない
  * 使い方: node scripts/test-logizard-automation.mjs
  */
@@ -255,7 +255,7 @@ await ta('[5] 正本の形: manifest のファイルが全部ある・.bat は C
 const BM = await import('../tools/logizard-automation/barcode-mode.js');
 const jst = (hhmm, day = '2030-01-16') => new Date(`${day}T${hhmm}:00+09:00`);
 
-await ta('[6] 夜の止め: JST 00:00 以上 01:30 未満は動かない (境目・日付をまたぐ) / 起動の形: LOGIZARD_BC_DAILY (無い・manual = ①②③ / auto = ①②) / 引数は --dry だけ', async () => {
+await ta('[6] 夜の止め: JST 00:00 以上 01:30 未満は動かない (境目・日付をまたぐ) / 起動の形: ①② だけ (設定に依らない・前の設定 LOGIZARD_BC_DAILY は注意を出すだけ) / 引数は --dry だけ', async () => {
   const times = ['23:59', '00:00', '00:15', '00:55', '01:29', '01:30', '08:40', '12:00'];
   assert.deepEqual(times.map((t) => BM.inNightBlock(jst(t))), [false, true, true, true, true, false, false, false]);
   assert.deepEqual([BM.jstMinuteOfDay(new Date('2030-01-15T15:00:00Z')), BM.jstMinuteOfDay(new Date('2030-01-15T16:29:00Z'))], [0, 89]);   // UTC の前の日 15 時 = JST 0 時
@@ -274,15 +274,22 @@ await ta('[6] 夜の止め: JST 00:00 以上 01:30 未満は動かない (境目
   const n = BM.asNightError(plain, '確認の OK の前', at('2030-01-15T23:59:58.1+09:00'));
   assert.ok(n.nightBlock && /\[Timeout 2900ms exceeded\.\]/.test(n.message), n.message);
   const mode = (env, argv = []) => BM.resolveBarcodeMode({ env, argv });
-  assert.deepEqual([mode({}).daily, mode({}).import2, mode({}).dry], ['manual', true, false]);
-  assert.deepEqual([mode({ LOGIZARD_BC_DAILY: 'manual' }).import2, mode({ LOGIZARD_BC_DAILY: ' auto ' }).import2, mode({ LOGIZARD_BC_DAILY: 'auto' }, ['--dry']).dry], [true, false, true]);
-  assert.throws(() => mode({ LOGIZARD_BC_DAILY: 'Auto' }), /LOGIZARD_BC_DAILY が不正/);
+  assert.deepEqual(mode({}), { dry: false, showMode: false, label: BM.LABEL, notes: [] });
+  assert.deepEqual([mode({}, ['--show-mode']).showMode, mode({}, ['--show-mode']).dry], [true, false]);   // 配った版の読み戻し (Codex #1558 R2 High)
+  assert.ok(!/→ ③/.test(BM.LABEL) && /③ 毎日の商品マスタは miniPC の自動/.test(BM.LABEL), BM.LABEL);
+  // 前の設定が残っていても ①② だけ (値で ③ を戻せない = fail-closed)・現場の ①② は止めない (注意を出すだけ)
+  for (const v of ['manual', 'auto', ' auto ', 'Auto', 'yes', '']) {
+    const m = mode({ LOGIZARD_BC_DAILY: v });
+    assert.deepEqual([Object.keys(m).sort(), m.label, m.notes.length], [['dry', 'label', 'notes', 'showMode'], BM.LABEL, 1], JSON.stringify(v));
+    assert.match(m.notes[0], /LOGIZARD_BC_DAILY はもう使いません/);
+  }
+  assert.equal(mode({ LOGIZARD_BC_DAILY: 'manual' }, ['--dry']).dry, true);
   assert.throws(() => mode({}, ['--dyr']), /知らない引数です: --dyr/);
   assert.throws(() => mode({}, ['--dry', 'x']), /知らない引数/);
-  assert.throws(() => mode({ LOGIZARD_BC_DAILY: 'auto' }, ['--only-daily']), /まだありません/);
+  assert.throws(() => mode({ LOGIZARD_BC_DAILY: 'manual' }, ['--only-daily']), /この道具から外しました.*ポータルの画面の「手の取込」/);
 });
 
-await ta('[7] auto-barcode.js: 夜の止めは CSV・鍵・ブラウザに触る前 / 実行ボタンの前と各ステップの前でも見る / auto = ③ の CSV を要求しない (本物のファイルを時刻を差し替えて動かす)', async () => {
+await ta('[7] auto-barcode.js: 夜の止めは CSV・鍵・ブラウザに触る前 / 実行ボタンの前と各ステップの前でも見る / ③ が無い (③ の CSV を見ない・前の設定が残っていても。本物のファイルを時刻を差し替えて動かす)', async () => {
   const s = fs.readFileSync(path.join(TOOL, 'auto-barcode.js'), 'utf8');
   // 実行ボタン (① ③ = FM07_01・② = 書き出し) の直前に夜の止め
   // 処理を始めるボタン (実行・始める確認の OK) は持ち時間つきの nightClick だけで押す (Codex #1518 R1・R2)
@@ -293,13 +300,18 @@ await ta('[7] auto-barcode.js: 夜の止めは CSV・鍵・ブラウザに触る
   assert.equal((s.match(/login\(page, loginOpts\(\)\)\.catch\(\(err\) => \{ throw asNightError\(err, 'ログインのボタンの前'\); \}\)/g) || []).length, 2, '最初のログインと再ログイン');
   const cm = fs.readFileSync(path.join(TOOL, 'logizard-common.js'), 'utf8');
   assert.ok(cm.includes("page.click('#login', clickOpts)") && cm.includes('if (Number.isFinite(ms) && ms > 0) clickOpts = { timeout: ms };'), '共通部品のログインのボタンに持ち時間');
-  for (const where of ['ログインの前', '①の前', '②の前', '③の前']) assert.ok(s.includes(`assertOutsideNightBlock('${where}')`), where);
+  for (const where of ['ログインの前', '①の前', '②の前']) assert.ok(s.includes(`assertOutsideNightBlock('${where}')`), where);
   // ブラウザの確認 dialog: 夜の止めの中なら承認しない (承認の分岐より前に見る)
   const dlg = s.slice(s.indexOf("page.on('dialog'"), s.indexOf('function assertNoUnexpectedDialog'));
   assert.ok(dlg.indexOf('if (inNightBlock())') > 0 && dlg.indexOf('if (inNightBlock())') < dlg.indexOf('d.accept()'), 'dialog の承認の前に夜の止め');
   const order = ['if (inNightBlock())', 'precheckImportCsv(IMPORT1_CSV', 'acquireLock(', 'await launchBrowser('].map((x) => s.indexOf(x));
   assert.ok(order.every((v, k) => v > 0 && (k === 0 || v > order[k - 1])), `順番 ${order}`);
-  assert.ok(s.includes('if (MODE.import2) pre2 = precheckImportCsv(IMPORT2_CSV'));
+  // Stream Deck の bat の見出しも ①② だけ (Codex #1558 R2 Low)
+  const bat = fs.readFileSync(path.join(TOOL, 'run-barcode.bat'), 'latin1');
+  assert.ok(!/import shohin/.test(bat) && bat.includes('(import bc_upload - export master)') && /imported by the miniPC nightly/.test(bat), 'run-barcode.bat の見出し');
+  // ③ 毎日の商品マスタの取込は無い (切替の PR・L-23)。GAS の ③ に戻すのは lz-gas-rollback の固定の版だけ
+  for (const gone of ['IMPORT2', 'import2', 'pre2', 'デイリー取込商品マスタ', 'MODE.daily', "'③の前'", "withRelogin('③'"]) assert.ok(!s.includes(gone), gone);
+  assert.equal((s.match(/runImport\(/g) || []).length, 2, '取込は ① の 1 か所だけ (定義 + 呼び 1 つ)');
 
   // 本物の auto-barcode.js を一時フォルダ (playwright-core を読めるようにリポジトリの中) に写して、時刻を差し替えて動かす
   const tmp = fs.mkdtempSync(path.join(ROOT, '.tmp-lzbc-'));
@@ -327,23 +339,66 @@ globalThis.Date = D;
       assert.match(r.err, new RegExp(`いま ${t} \\(JST\\)。00:00〜01:30 は動きません`), t + r.err);
       assert.ok(!r.out.includes('📥') && !touched(), `${t}: CSV も鍵も見ない`);
     }
-    let r = run(jst('01:30'));   // 止めの外・manual (既定) = ③ の CSV を要求する
-    assert.equal(r.status, 1);
-    assert.match(r.err, /③取込CSV \(商品マスタ\) がありません/);
-    r = run(jst('23:59', '2030-01-15'), { daily: 'manual' });
-    assert.match(r.err, /③取込CSV \(商品マスタ\) がありません/);
-    r = run(jst('10:00'), { daily: 'auto' });   // auto = ③ の CSV を見ない → 次の確かめ (② の保存先) まで進む
+    let r = run(jst('01:30'));   // 止めの外 = ①② だけ (③ の CSV を見ない。LOGIZARD_BC_IMPORT2 に無いファイルがあっても) → 次の確かめ (② の保存先) まで進む
     assert.equal(r.status, 1);
     assert.ok(!/③取込CSV/.test(r.err + r.out), r.err);
     assert.match(r.err, /②の保存先フォルダがありません/);
-    assert.match(r.out, /③ 毎日の商品マスタは miniPC の自動/);
-    for (const [o, re] of [[{ args: ['--dyr'] }, /知らない引数です: --dyr/], [{ args: ['--only-daily'] }, /まだありません/], [{ daily: 'yes' }, /LOGIZARD_BC_DAILY が不正/]]) {
+    assert.match(r.out, /③ 毎日の商品マスタは miniPC の自動が取り込む/);
+    assert.ok(!/LOGIZARD_BC_DAILY/.test(r.out), '前の設定が無い = 注意も無い');
+    for (const daily of ['manual', 'auto', 'yes']) {   // 前の設定が残っていても ③ はしない (消してよいと出す)
+      r = run(jst('23:59', '2030-01-15'), { daily });
+      assert.equal(r.status, 1, daily);
+      assert.ok(!/③取込CSV/.test(r.err + r.out), daily + r.err);
+      assert.match(r.err, /②の保存先フォルダがありません/, daily);
+      assert.match(r.out, /LOGIZARD_BC_DAILY はもう使いません/, daily);
+    }
+    // 配った版の読み戻し --show-mode (Codex #1558 R2 High): 夜でも・何にも触らずに ①② の見出しを出して exit 0
+    r = run(jst('00:20'), { args: ['--show-mode'] });
+    assert.equal(r.status, 0, r.err);
+    assert.match(r.out, /① 新商品の取込 → ② バーコード情報の書き出し \(③ 毎日の商品マスタは miniPC の自動が取り込む\)/);
+    assert.match(r.out, /③ 毎日の商品マスタの取込: この版には無い/);
+    assert.ok(!r.out.includes('📥') && !touched(), '--show-mode は CSV も鍵も見ない');
+    // .env が無くても・夜でも・CSV が無くても exit 0 (.env を読む前に終わる。Codex #1558 R3 Low)
+    {
+      const envFile = path.join(tmp, '.env');
+      const saved = fs.readFileSync(envFile);
+      fs.rmSync(envFile);
+      try {
+        const { LOGIZARD_BC_DAILY: _d, LOGIZARD_USER_ID: _u, LOGIZARD_PASSWORD: _p, ...bare } = process.env;
+        const c = spawnSync(process.execPath, ['--import', pathToFileURL(path.join(tmp, 'fake-now.mjs')).href, path.join(tmp, 'auto-barcode.js'), '--show-mode'],
+          { cwd: tmp, encoding: 'utf8', env: { ...bare, FAKE_NOW: jst('00:20').toISOString() }, timeout: 60000 });
+        assert.equal(c.status, 0, c.stdout + c.stderr);
+        assert.match(c.stdout, /③ 毎日の商品マスタの取込: この版には無い/);
+        assert.ok(!touched(), '.env が無くても何にも触らない');
+      } finally { fs.writeFileSync(envFile, saved); }
+    }
+    for (const [o, re] of [[{ args: ['--dyr'] }, /知らない引数です: --dyr/], [{ args: ['--only-daily'] }, /この道具から外しました/]]) {
       r = run(jst('10:00'), o);
       assert.equal(r.status, 1);
       assert.match(r.err, re);
       assert.ok(!r.out.includes('📥'));
     }
     assert.ok(!touched(), '鍵のフォルダ (logs) は一度も作られていない');
+    // ③ のある古い版 (戻しの固定の版 = tag の commit) に --show-mode = 知らない引数で止まる = 古い作業場所から配ったと分かる
+    const { JOBS_REGISTRY } = await import('../config/jobs-registry.mjs');
+    const rb = JOBS_REGISTRY.find((e) => e.id === 'lz-gas-rollback').rollback;
+    const old = fs.mkdtempSync(path.join(ROOT, '.tmp-lzbc-old-'));
+    try {
+      for (const f of ['auto-barcode.js', 'barcode-mode.js', 'logizard-common.js', 'csv-util.js']) {
+        const g = spawnSync('git', ['show', `${rb.commit}:tools/logizard-automation/${f}`], { cwd: ROOT, encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 });
+        assert.equal(g.status, 0, `${f} (git fetch origin tag ${rb.tag})`);
+        fs.writeFileSync(path.join(old, f), g.stdout);
+      }
+      fs.writeFileSync(path.join(old, 'fake-now.mjs'), fs.readFileSync(path.join(tmp, 'fake-now.mjs')));
+      fs.writeFileSync(path.join(old, '.env'), envBase.join('\n') + '\n');
+      const { LOGIZARD_BC_DAILY: _drop, ...env } = process.env;
+      const c = spawnSync(process.execPath, ['--import', pathToFileURL(path.join(old, 'fake-now.mjs')).href, path.join(old, 'auto-barcode.js'), '--show-mode'],
+        { cwd: old, encoding: 'utf8', env: { ...env, FAKE_NOW: jst('10:00').toISOString() }, timeout: 60000 });
+      assert.equal(c.status, 1, c.stdout + c.stderr);
+      assert.match(c.stderr, /知らない引数です: --show-mode/);
+    } finally {
+      fs.rmSync(old, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
+    }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });   // 子のブラウザがつかんでいる間は待って消す
   }
@@ -413,7 +468,7 @@ await ta('[8] 偽物のロジザードで本物の auto-barcode.js: 押す直前
     fs.writeFileSync(path.join(tmp, 'in1.csv'), sj('"商品ID","バーコード"\r\n"A-1","4900000000001"\r\n'));
     fs.mkdirSync(path.join(tmp, 'out'));
     fs.writeFileSync(path.join(tmp, '.env'), ['LOGIZARD_USER_ID=u', 'LOGIZARD_PASSWORD=p', 'LOGIZARD_SKIP_DRIVE_CHECK=1', 'LOGIZARD_SKIP_LOGIN_CHECK=1', 'LOGIZARD_BC_MAX_AGE_HOURS=0',
-      'LOGIZARD_BC_DAILY=auto', `LOGIZARD_BC_IMPORT1=${path.join(tmp, 'in1.csv')}`, `LOGIZARD_BC_OUT=${path.join(tmp, 'out', 'bc.csv')}`].join('\n') + '\n');
+      `LOGIZARD_BC_IMPORT1=${path.join(tmp, 'in1.csv')}`, `LOGIZARD_BC_OUT=${path.join(tmp, 'out', 'bc.csv')}`].join('\n') + '\n');
     const logs = path.join(tmp, 'logs');
     const run = (scenario, at, jumpTo = '2030-01-16T00:00:01+09:00') => {
       const stateFile = path.join(tmp, `state-${scenario || 'none'}-${Math.random().toString(16).slice(2)}.json`);
@@ -450,17 +505,17 @@ await ta('[8] 偽物のロジザードで本物の auto-barcode.js: 押す直前
     assert.match(r.text, /① \(再ログインの前\): いま 00:00/);
     // 実行ボタンの後・確認の OK の前に 00:00 → OK を押さない (取込は始まらない)
     r = run('confirm', T0);
-    assert.deepEqual([r.status, r.result.status, r.st.exec, r.st.ok, r.st.closed, lockGone(), r.result.progress], [1, 'NIGHT_BLOCK', 1, 0, true, true, '①未 ②未 ③未'], r.text);
+    assert.deepEqual([r.status, r.result.status, r.st.exec, r.st.ok, r.st.closed, lockGone(), r.result.progress], [1, 'NIGHT_BLOCK', 1, 0, true, true, '①未 ②未'], r.text);
     assert.match(r.text, /①新商品バーコード登録 \(確認の OK の前\): いま 00:00/);
     assert.deepEqual(imported(), {});
     // 確認の OK が押せるようになるのを待つ間に 00:00 の直前 → 押さない (取込は始まらない・Codex #1518 R2)
     r = run('confirmwait', T0, T1);
-    assert.deepEqual([r.status, r.result.status, r.st.exec, r.st.ok, r.st.closed, lockGone(), r.result.progress], [1, 'NIGHT_BLOCK', 1, 0, true, true, '①未 ②未 ③未'], r.text);
+    assert.deepEqual([r.status, r.result.status, r.st.exec, r.st.ok, r.st.closed, lockGone(), r.result.progress], [1, 'NIGHT_BLOCK', 1, 0, true, true, '①未 ②未'], r.text);
     assert.match(r.text, /①新商品バーコード登録 \(確認の OK の前\): いま 23:59 \(JST\).*00:00 の直前 2 秒からは押さない.*\[.*Timeout/);
     assert.deepEqual(imported(), {});
     // ① が済んだ後に 00:00 → ② に進まない・① は取込済みとして残る
     r = run('after1', T0);
-    assert.deepEqual([r.status, r.result.status, r.st.exec, r.st.ok, r.st.closed, lockGone(), r.result.progress], [1, 'NIGHT_BLOCK', 1, 1, true, true, '①済 ②未 ③未'], r.text);
+    assert.deepEqual([r.status, r.result.status, r.st.exec, r.st.ok, r.st.closed, lockGone(), r.result.progress], [1, 'NIGHT_BLOCK', 1, 1, true, true, '①済 ②未'], r.text);
     assert.match(r.text, /②の前: いま 00:00/);
     assert.ok(imported().import1 && imported().import1.sha256, '① は取込済みとして記録');
     assert.deepEqual(r.st.other, [], '② の画面は開いていない');

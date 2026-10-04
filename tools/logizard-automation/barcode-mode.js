@@ -4,13 +4,16 @@
  * 1. 夜の止め: JST 00:00〜01:30 は動かない (始めない・実行ボタンも押さない)。
  *    miniPC の毎日の商品マスタの取込 (00:15〜00:55) と同じ共通アカウントを使うため
  *    (同じ ID で 2 か所からログインするとセッションを追い出し合う)。専用アカウントは作らない (L-14 の見直し 9/28)。
- * 2. どこまで動かすか: .env の LOGIZARD_BC_DAILY
- *    - 無い / manual = 今までどおり ① 新商品の取込 → ② バーコード情報の書き出し → ③ 毎日の商品マスタの取込
- *    - auto = ①② だけ (③ の CSV を見ない・取り込まない。毎日の商品マスタは miniPC の自動が取り込む = 切替日から)
- * 3. 引数は --dry だけ (打ち間違いで本番が動かないように、知らない引数は断る)。
- *    戻し方の手の ③ (--only-daily) は ③c-1b-3b (まだ無い)。
+ * 2. 動かすのは **① 新商品の取込 → ② バーコード情報の書き出し だけ** (切替の PR・L-23・③c-1b-3b v4 §7)。
+ *    ③ 毎日の商品マスタの取込 (GAS の CSV) はこの道具から外した = 設定に依らない (fail-closed)。
+ *    毎日の商品マスタは miniPC の自動 (00:20) が取り込み、自動が止まったときに人が取り込むのはポータルの画面の「手の取込」。
+ *    GAS の ③ に戻すのはシステム全体を旧方式に戻すときだけ (台帳 lz-gas-rollback の固定の版を配る)。
+ *    .env に前の設定 LOGIZARD_BC_DAILY が残っていても、①② だけ (値は見ない・消してよいと出す)。
+ * 3. 引数は --dry と --show-mode だけ (打ち間違いで本番が動かないように、知らない引数は断る)。
+ *    --show-mode = 配った版を読み戻す (①② だけの版の見出しを出して終わる・ログイン・CSV・鍵・ブラウザに触らない・夜でも動く)。
+ *    ③ のある古い版はこの引数を知らない = 「知らない引数」で止まる = 古い作業場所から配ったと分かる (Codex #1558 R2 High)。
  *
- * 設計 = AI_reference CompanyDB構想/10 §6.3 (v2 §2・§6 / 契約 v3 / L-11 / L-14 の見直し)
+ * 設計 = AI_reference CompanyDB構想/10 §6.3 (v2 §2・§6 / 契約 v3 / L-11 / L-14 の見直し / L-23 / 2b-2 契約 v3 の切替の PR)
  */
 
 export const NIGHT_BLOCK = Object.freeze({ fromMin: 0, toMin: 90 });   // JST 00:00 以上 01:30 未満
@@ -84,30 +87,22 @@ export function asNightError(e, where, now = new Date()) {
   return e;
 }
 
-const KNOWN_ARGS = new Set(['--dry']);
+const KNOWN_ARGS = new Set(['--dry', '--show-mode']);
+
+export const LABEL = '① 新商品の取込 → ② バーコード情報の書き出し (③ 毎日の商品マスタは miniPC の自動が取り込む)';
 
 /**
- * 起動の形を決める。
- * @returns {{ dry: boolean, daily: 'manual' | 'auto', import2: boolean, label: string }}
+ * 起動の形を決める (①② だけ。③ は設定に依らず無い)。
+ * @returns {{ dry: boolean, showMode: boolean, label: string, notes: string[] }}  notes = 起動のときに出す注意 (止めない)
  */
 export function resolveBarcodeMode({ env = process.env, argv = process.argv.slice(2) } = {}) {
   if (argv.includes('--only-daily')) {
-    throw new Error('--only-daily (戻し方の手の ③) はまだありません (③c-1b-3b)。今の毎日の商品マスタの取込は、引数なしの起動の ③ です。');
+    throw new Error('③ 毎日の商品マスタの取込はこの道具から外しました (切替済み・毎晩 miniPC の自動が取り込む)。自動が止まったときに手で取り込むのは、ポータルの画面の「手の取込」です。');
   }
   const unknown = argv.filter((a) => !KNOWN_ARGS.has(a));
-  if (unknown.length) throw new Error(`知らない引数です: ${unknown.join(' ')} (使えるのは --dry だけ)`);
-  const raw = String(env.LOGIZARD_BC_DAILY ?? '').trim();
-  let daily;
-  if (raw === '' || raw === 'manual') daily = 'manual';
-  else if (raw === 'auto') daily = 'auto';
-  else throw new Error(`.env の LOGIZARD_BC_DAILY が不正です: "${raw}" (manual か auto。無ければ manual)`);
-  const dry = argv.includes('--dry');
-  return {
-    dry,
-    daily,
-    import2: daily === 'manual',
-    label: daily === 'manual'
-      ? '① 新商品の取込 → ② バーコード情報の書き出し → ③ 毎日の商品マスタの取込'
-      : '① 新商品の取込 → ② バーコード情報の書き出し (③ 毎日の商品マスタは miniPC の自動)',
-  };
+  if (unknown.length) throw new Error(`知らない引数です: ${unknown.join(' ')} (使えるのは --dry と --show-mode だけ)`);
+  const notes = [];
+  // 前の設定が残っていても ①② だけ (値で ③ を戻せない = fail-closed。現場の ①② は止めない)
+  if (Object.prototype.hasOwnProperty.call(env, 'LOGIZARD_BC_DAILY')) notes.push('.env の LOGIZARD_BC_DAILY はもう使いません (③ は切替で外した)。この行は消してかまいません。');
+  return { dry: argv.includes('--dry'), showMode: argv.includes('--show-mode'), label: LABEL, notes };
 }

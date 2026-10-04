@@ -182,6 +182,71 @@ await ta('[7] バーコード: 見出しに 商品ID・バーコード・列の�
   const split = bc([['A-1', 'a', '4900000000001', '1'], ['B-2', 'b', '4900000000003', '1'], ['A-1', 'a', '4900000000002', '1'], ['C-3', 'c', '4900000000004', '1']]);
   assert.deepEqual([split.grouped, split.lastId], [false, 'C-3']);
   assert.deepEqual(V.compareBarcodes({ pre: split, post: split, ids: ['A-1'], cover: { pre: L2, post: L2 } }).diffs.map((d) => d.kind), ['barcode_not_grouped_pre', 'barcode_not_grouped_post']);
+  // 見張りの商品 (毎晩の K4・Codex #1595 R1 Medium): 本物の書き出しは行の間に改行・末尾に改行なし = 「改行の前」で切れると末尾の改行・列の数では分からない。
+  // 見張り (商品ID の順の最後・CSV に無い) が前後の書き出しの最後の行 = その前の全商品の行がそろっている。最後の本物の商品 B-2 は比べる商品のまま確かめられる
+  const S0 = V.LZ_SENTINEL_ID;
+  const cut = (rows, n) => bc(rows.slice(0, rows.length - n));   // 後ろの n 行が落ちた (行の切れ目・改行の前で切れた) 書き出し
+  const rowsPre = [['A-1', 'a', '4900000000001', '1'], ['B-2', 'b', '4900000000003', '1'], ['B-2', 'b', '4900000000004', '1'], [S0, 's', V.LZ_SENTINEL_BARCODE, '1']];
+  const LS = lz([lzRow('A-1'), lzRow('B-2'), lzRow(S0)]);
+  const sp = bc(rowsPre);
+  const fullBuf = csvOf(rowsPre, { header: BH }), crlf = Buffer.from('\r\n');
+  assert.deepEqual([V.readBarcodeExport(fullBuf.subarray(0, fullBuf.lastIndexOf(crlf))).ok, V.readBarcodeExport(fullBuf.subarray(0, fullBuf.lastIndexOf(crlf) + 2)).reason], [true, 'barcode_truncated'], '改行の前で切れた = 読める (切れが分からない) / 改行の後 = 切れと分かる');
+  assert.deepEqual(V.compareBarcodes({ pre: sp, post: sp, ids: ['A-1', 'B-2'], cover: { pre: LS, post: LS }, sentinel: S0 }), { ok: true, diffs: [] });
+  const sk = (r) => r.diffs.map((d) => d.kind);
+  // 片側 (後) だけ切れ + 増えた: 後の実体 = B-2 に 4900000000005 が増えた・増えた行と見張りの前で切れる = B-2 は前後同じに見える → 見張りが最後に無い = 差
+  const rowsPostAdd = [...rowsPre.slice(0, 3), ['B-2', 'b', '4900000000005', '1'], rowsPre[3]];
+  let r = V.compareBarcodes({ pre: sp, post: cut(rowsPostAdd, 2), ids: ['A-1', 'B-2'], cover: { pre: LS, post: LS }, sentinel: S0 });
+  assert.deepEqual(r.diffs.filter((d) => d.id === 'B-2' && (d.kind === 'added' || d.kind === 'removed')), [], 'B-2 のバーコードだけ見ると同じ (見張りが無いと見逃す)');
+  assert.ok(!r.ok && sk(r).includes('sentinel_not_last_barcode_post') && sk(r).includes('missing_in_post_barcode'), sk(r).join(','));
+  // 片側 (前) だけ切れ + 消えた: 前が 2 本目の前で切れる・取込で 2 本目が消えた = B-2 は前後同じに見える → 差
+  r = V.compareBarcodes({ pre: cut(rowsPre, 2), post: bc([rowsPre[0], rowsPre[1], rowsPre[3]]), ids: ['A-1', 'B-2'], cover: { pre: LS, post: LS }, sentinel: S0 });
+  assert.ok(!r.ok && sk(r).includes('sentinel_not_last_barcode_pre') && !sk(r).includes('sentinel_not_last_barcode_post'), sk(r).join(','));
+  // 両側が同じ所で切れ + 置き換え (4900000000004 → 4900000000006): 前後とも [4900000000003] に見える → 差
+  const rowsPostRep = [rowsPre[0], rowsPre[1], ['B-2', 'b', '4900000000006', '1'], rowsPre[3]];
+  r = V.compareBarcodes({ pre: cut(rowsPre, 2), post: cut(rowsPostRep, 2), ids: ['A-1', 'B-2'], cover: { pre: LS, post: LS }, sentinel: S0 });
+  assert.deepEqual(sk(r).filter((k) => k.startsWith('sentinel_')), ['sentinel_not_last_barcode_pre', 'sentinel_not_last_barcode_post']);
+  // 見張りより後ろの商品 (見張りが最後でない)・見張りを比べる商品にした・商品マスタの最後が見張りでない = 差
+  r = V.compareBarcodes({ pre: sp, post: bc([...rowsPre, [`${S0}z`, 'x', '4900000008888', '1']]), ids: ['B-2'], cover: { pre: LS, post: LS }, sentinel: S0 });
+  assert.deepEqual(sk(r), ['sentinel_not_last_barcode_post']);
+  assert.deepEqual(sk(V.compareBarcodes({ pre: sp, post: sp, ids: ['B-2', S0], cover: { pre: LS, post: LS }, sentinel: S0 })), ['target_is_last_pre', 'target_is_last_post', 'sentinel_is_target']);
+  const LS2 = lz([lzRow('A-1'), lzRow('B-2')]);
+  assert.deepEqual(V.sentinelDiffs({ sentinel: S0, side: 'post', shohin: LS2 }), [{ id: S0, kind: 'sentinel_not_last_shohin_post', last: 'B-2', present: false }]);
+  assert.deepEqual(V.sentinelDiffs({ sentinel: S0, side: 'pre', shohin: LS, barcode: sp }), []);
+  // 見張りを使わない比べ (試験の決まり) は今までどおり (最後の本物の商品を比べる = 確かめられない)
+  assert.deepEqual(sk(V.compareBarcodes({ pre, post: pre, ids: ['B-2'], cover: { pre: L2, post: L2 } })), ['target_is_last_pre', 'target_is_last_post']);
+  // 商品ID の順の崩れ (Codex #1597 R1 Medium): 本物の書き出しは商品ID のかたまりが CP932 のバイト順で厳密に増えていく。崩れた = 差
+  //   (並びの前提が崩れた夜 [A, 見張り, Z] でも、崩れが見える書き出しなら止まる。見張りの直後で切れて崩れが見えない分は、比べる商品なら precheck (直前) と verifyImport (直後) が「無い」で止める)
+  assert.equal(sp.ordered, true);
+  const disorder = bc([rowsPre[0], rowsPre[1], rowsPre[2], rowsPre[3], ['Z-9', 'z', '4900000000009', '1']]);   // [A, B, 見張り, Z] = 見張りの後ろに Z
+  assert.deepEqual([disorder.ordered, disorder.grouped, disorder.lastId], [false, true, 'Z-9']);
+  assert.deepEqual(sk(V.compareBarcodes({ pre: sp, post: disorder, ids: ['B-2'], cover: { pre: LS, post: LS }, sentinel: S0 })).filter((k) => /sentinel|order/.test(k)), ['sentinel_not_last_barcode_post', 'order_broken_barcode_post']);
+  const swapped = bc([rowsPre[1], rowsPre[2], rowsPre[0], rowsPre[3]]);   // 並びの崩れだけ (見張りは最後・かたまりはひとまとまり)
+  assert.deepEqual([swapped.ordered, swapped.grouped, swapped.lastId], [false, true, S0]);
+  assert.deepEqual(sk(V.compareBarcodes({ pre: sp, post: swapped, ids: ['B-2'], cover: { pre: LS, post: LS }, sentinel: S0 })), ['order_broken_barcode_post']);
+  const twoBlocks = bc([rowsPre[0], rowsPre[1], ['A-1', 'a', '4900000000002', '1'], rowsPre[2], rowsPre[3]]);   // 同じ ID の 2 つ目のかたまり
+  assert.deepEqual([twoBlocks.ordered, twoBlocks.grouped], [false, false]);
+  assert.deepEqual(sk(V.compareBarcodes({ pre: twoBlocks, post: sp, ids: ['B-2'], cover: { pre: LS, post: LS }, sentinel: S0 })).filter((k) => /sentinel|order/.test(k)), ['order_broken_barcode_pre']);
+  // 商品マスタの並びの崩れ (見張りは最後)
+  const LSbad = lz([lzRow('B-2'), lzRow('A-1'), lzRow(S0)]);
+  assert.deepEqual(V.sentinelDiffs({ sentinel: S0, side: 'pre', shohin: LSbad }).map((d) => d.kind), ['order_broken_shohin_pre']);
+  // 並びの崩れ + 見張りの直後で切れた (実体 [A, 見張り, Z] → 見える [A, 見張り]): 見える分は崩れていない = この確かめでは分からない (残るリスク)。
+  //   Z が比べる商品なら、直前の一覧に Z が無い = precheck (L-7) が押さない・直後の一覧に Z が無い = verifyImport の差 (test-lz-nightly [35])
+  const cutAfterSentinel = bc([rowsPre[0], rowsPre[3]]);
+  assert.deepEqual([cutAfterSentinel.ordered, cutAfterSentinel.lastId], [true, S0]);
+  // 見張りのバーコード (Codex #1597 R1 Low): LZ_SENTINEL_BARCODE の 1 本だけ・ほかの商品と重ならない。変わった・増えた・消えた・重なった = 差
+  const withSent = (sentRows, extra = []) => bc([rowsPre[0], rowsPre[1], rowsPre[2], ...extra, ...sentRows]);
+  const SB = V.LZ_SENTINEL_BARCODE;
+  for (const [name, x, want] of [
+    ['変わった', withSent([[S0, 's', 'LZGUARD0002', '1']]), ['sentinel_barcode_post']],
+    ['増えた', withSent([[S0, 's', SB, '1'], [S0, 's', 'LZGUARD0002', '1']]), ['sentinel_barcode_post']],
+    ['同じものが 2 本', withSent([[S0, 's', SB, '1'], [S0, 's', SB, '1']]), ['sentinel_barcode_post']],
+    ['重なった (ほかの商品に同じバーコード)', bc([rowsPre[0], rowsPre[1], ['B-2', 'b', SB, '1'], rowsPre[3]]), ['sentinel_barcode_shared_post']],
+  ]) assert.deepEqual(sk(V.compareBarcodes({ pre: sp, post: x, ids: ['A-1'], cover: { pre: LS, post: LS }, sentinel: S0 })).filter((k) => k.startsWith('sentinel_')), want, name);
+  // 消えた (見張りの行が無い) = 最後でない + 商品のそろい
+  assert.ok(sk(V.compareBarcodes({ pre: sp, post: bc(rowsPre.slice(0, 3)), ids: ['A-1'], cover: { pre: LS, post: LS }, sentinel: S0 })).includes('sentinel_not_last_barcode_post'));
+  assert.deepEqual(V.sentinelDiffs({ sentinel: S0, side: 'pre', barcode: sp }), [], '正しい見張り = 差なし');
+  // 見張りの ID = 商品ID の順 (バイト順) で、本物の商品ID に使われている文字 (+ - . 0-9 A-Z _ a-z) のどれより後ろ
+  assert.ok(/^z+$/.test(S0) && S0.length >= 10);
   assert.equal(bc([['A-1', '1', '2']], ['商品ID', 'バーコード', 'バーコード']).reason, 'barcode_header');
 });
 

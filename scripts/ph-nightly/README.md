@@ -133,6 +133,85 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ph-nightly\install.p
 - 材料の取得失敗 (miniPC 停止・ABA 未取込など) → その job はその晩やめて 12 時間後 (`retry_wait`)。同じ照会が 3 晩失敗したら打ち切り
 - ping の note: `auto=+N (今日/上限)`・`input=` (材料が見つからない = 画面で種を入れて続ける)・`failed=` (失敗で未確認 = 画面で「確認済みにする」まで partial)
 
+## LP 構成の AI 生成 (段階1・2026-10-01)
+
+商品ハブの詳細画面で「🤖 構成をAIに作らせる」を押した商品の **LP 構成 (⑦ AI画像生成プロンプト)** を書く。
+正本 = AI_reference『商品ハブ_LP構成AI生成_段階1設計_20260930.md』。
+
+**段階1 の目的は機能ではなく測定** — 「AI の構成はスタッフの ChatGPT 出力と比べて使えるか」を 10 件で判定する。
+書き戻した構成は画面に出るだけで、**人がコピーして lp-tool に貼る運用は変わらない**。
+画像生成・GAS への送信・撮影依頼書は段階2 以降。
+
+| もの | 場所 (miniPC) |
+|---|---|
+| CLI (書き換え不可) | `bin\phlp.mjs` |
+| シム・検品ラッパー | `work\phlp` / `work\phlpreview` (ACL で書き込み拒否) |
+| スキル (コピー) | `work\.claude\skills\ph-lp-compose` |
+| ランナー | `bin\run-lp-compose.ps1` + Task Scheduler `PhLpComposeMinutely` |
+| ログ | `logs\lp-compose.log` + 実行ごとの `*.lp.out.log` / `*.lp.err.log` |
+| 監視 | jobs-monitor ping `ph-lp-compose` (heartbeat・max_age 1 時間) |
+
+### なぜ 1 分おきでよいか
+
+**仕事が無い分は HTTP 1 回だけで終わる。** ランナーはまず `bin\phlp.mjs queue` を叩き、
+`claimable` が 0 なら Claude を起動せず終了する (ロックも残骸検査もしない)。
+人がボタンを押して画面を見ている運用なので、拾うのは速いほうがよい。
+
+### 夜間ジョブとの関係
+
+同じサブスク OAuth を `PhGenerateNightly` (02:30) と `ProductKWScout` (05:00) が使う。
+LP のランナーも **Claude 共通ロックを取る**が、期限は **5 秒**。
+夜間ジョブがロックを持っている間は `skipped` を出して**その分をあきらめ、次の分で拾う**
+(1 分おきなので、2 時間の夜間ジョブの後ろに積み上がってはいけない)。
+`ClaudeGuard.ps1` の `$ClaudeResiduePattern` には `phlp.mjs` を入れてある
+(入れないと、残った実行役を「残骸なし」と誤判定して 2 つ目の Claude を起動する)。
+
+### 朝のチェック (jobs-monitor に `ph-lp-compose` が出たら)
+
+`C:\tools\ph-nightly\logs\lp-compose.log` の末尾を見る:
+
+- `skipped (another Claude job holds the lock)` → 夜間ジョブが動いている間は**正常**
+- `needs_review +N` (partial) → AI を呼んだのに結果が返らなかった = **成否不明**。
+  **自動では作り直さない**ので、画面でもう一度依頼する
+- `nothing moved` (fail) → claude の認証切れ・ツールの deny・仕様書が未取込。
+  `*.lp.err.log` と `*.lp.out.log` の `permission_denials` を見る
+- `PH_LP_COMPOSE_ENABLED is off` → Render のフラグが未設定 (立ち上げ中は正常)
+- `server sent no usable model` (fail) → Render の `PH_LP_COMPOSE_MODEL` が読めない値 (下の「モデル」)
+- `model not verified` (partial) → 本回答を書いたモデルが頼んだモデルと違った・読めなかった・確認を送れなかった。
+  その依頼は needs_review になり、画面は本文を出さず理由を出す。もう一度依頼する。
+  `main model(s)=` の行に実際のモデル、`check=` にサーバの判定 (match / mismatch / unknown / send failed) が出る
+- `model check re-send failed (kept)` → 確認を送れず `state\lp-model-check-*.json` に控えてある。
+  毎分送り直す (キューが空でも)。サーバは 15 分付かなければ「未確認」で閉じるので、放っておいても画面は止まらない
+- `claude reported an error: API Error: 400 ... version 2.1.280 or newer is required` → Claude Code が古い (下の「モデル」)
+
+### モデル (2026-10-02〜)
+
+- 決める場所は **Render の `PH_LP_COMPOSE_MODEL` だけ** (未設定なら `claude-opus-5-5[1m]` = Opus 5.5・1M)。
+  ボタンにも「🤖 構成をAIに作らせる (Opus 5.5)」と出る。**設定してあるのに読めない値**ならボタンは押せず、claim もしない (黙って既定に戻さない)
+- ランナーは queue で受け取った値を `claude --model` と `PH_LP_MODEL` (`./phlp reserve` が送る) に渡す。サーバは違うモデルの予約を断る
+- 終わったらランナーが stream-json の `assistant.message.model` (サブエージェント以外) を読み、ランナーだけが呼ぶ
+  `POST /lp-compose/model-check` で「実際に書いたモデル」を付ける。**一致した done にだけ本文を出す**
+- 🚨 Opus 5.5 は **Claude Code 2.1.280 以上**が要る。miniPC は 2026-10-02 に 2.1.252 → 2.1.280 に上げた (決め打ち・自動更新なし)。
+  上げ下げするときは夜間の `PhGenerateNightly`・`ProductKWScout` も同じ Claude Code を使うので、
+  商品スカウトの引数 (`product-idea-scout/ai/cli.cjs` の `invocationArgs`) が `claude --help` に残っているかを見る
+- モデルを変えるとき・配置するとき: Render の `PH_LP_COMPOSE_ENABLED` を外す → **queue の `running` が 0 になったのを確かめる** →
+  Render の反映 → miniPC で `install.ps1` → フラグを戻す (サーバとランナーの版が食い違う数分に依頼を受けない)
+
+### 素材画像 (2026-10-02〜)
+
+- 商品の画像フォルダ (`drive_folder_url`) の**中のフォルダ (何階層下でも)** の画像 = 素材画像。**直下**の画像は商品画像 (白抜き・1 TOP・2〜)
+- **押したときに 1 回だけ** Drive を読んで packet に固定する (商品 6 + 素材 10 = 16 枚まで)。読めなければ依頼を作らない。
+  歯止め = 6 階層・60 フォルダ・500 件・25 秒・API 200 回
+- 実行役は claim で `max_images` (この phlp は 16) を送る。**送らない古い phlp は 6 枚まで扱い**で、素材つきの依頼は掴まない (queued のまま)。
+  ランナーのログに `too_many_images` が出たら miniPC で `install.ps1`
+- 「添付画像の説明」(`packet.image_guide`) は **AI にもスタッフにも同じ文**。くらべるときは画面の「ChatGPT 版に貼る文」を
+  「📝 商品分析を準備」の文の最後に貼り、画像を同じ順に添付する
+
+### 止めたい
+
+Render の `PH_LP_COMPOSE_ENABLED` を外す (受付・claim・予約が止まる) か、
+`Disable-ScheduledTask PhLpComposeMinutely`。
+
 ## 費用の目安 (API 方式に切り替える場合の参考)
 
 実測 (2026-08-28、48 件): 1 件あたり input ≈ 8,300 / output ≈ 6,620 トークン (生成+検品+修正 40%)。

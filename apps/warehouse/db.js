@@ -13,6 +13,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
+import { createSettlementVersionSchema } from './amazon-settlement-versions.js';
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'warehouse.db');
@@ -835,6 +836,71 @@ function createTables() {
   // 作り直しが信用した NE の印の通し番号 (C1。照合 ② は「作り直しの材料 = 比べる NE」を時刻と番号の組で確かめる)。信用しなかった回・前の記録は NULL
   addColumnIfMissing('m_products_builds', 'ne_products_complete_rev', 'INTEGER');
   addColumnIfMissing('m_products_builds', 'ne_setproducts_complete_rev', 'INTEGER');
+  // 作り直しが使った Company DB の写しの世代 (④a。持ち主が全部 load の日は、持ち主が同じ今の世代 = 値 0 行)。前の記録・世代が無い回は NULL。
+  //   applied_hash = 入れた後に読み直した「持ち主が C の列の値」のハッシュ (次の工程 fetch.mjs --verify-apply が読み直して同じか確かめる)
+  addColumnIfMissing('m_products_builds', 'cdb_publish_generation_no', 'INTEGER');
+  addColumnIfMissing('m_products_builds', 'cdb_publish_generation_id', 'TEXT');
+  addColumnIfMissing('m_products_builds', 'cdb_publish_content_hash', 'TEXT');
+  addColumnIfMissing('m_products_builds', 'cdb_publish_applied_hash', 'TEXT');
+  // 使った世代の持ち主の設定のハッシュ = 今使っている epoch (この記録は作り直しの取引が通ったときだけ入る = 通らなければ epoch は進まない。Codex R1 H1)
+  addColumnIfMissing('m_products_builds', 'cdb_publish_ownership_hash', 'TEXT');
+  // 16b-2. Company DB の写し (マスタ正本切替 ④a。設計 = AI_reference CompanyDB構想/15 §3。apps/warehouse/master-publish.js)
+  //   書くのは apps/company-db/publish/fetch.mjs (daily-sync の「Company DB の写し」)。持ち主が C の列の値を、確かめてから 1 取引で世代ごとに入れる。
+  //   今の世代 = sync_meta 'cdb_publish_current' (verified のときだけ・前にしか進まない)。読むのは rebuild-m-products.js。14 世代残す (今の世代は消さない)
+  db.exec(`CREATE TABLE IF NOT EXISTS cdb_publish_generations (
+    generation_no      INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation_id      TEXT NOT NULL UNIQUE,
+    cdb_read_at        TEXT NOT NULL,
+    version_watermark  INTEGER,
+    watermark_fingerprint TEXT,
+    load_run_id        TEXT,
+    load_commit_seq    INTEGER,
+    ownership          TEXT NOT NULL,
+    ownership_hash     TEXT NOT NULL,
+    row_count          INTEGER NOT NULL,
+    sku_count          INTEGER NOT NULL,
+    content_hash       TEXT NOT NULL,
+    state              TEXT NOT NULL CHECK (state IN ('verified', 'rejected')),
+    reason             TEXT,
+    created_at         TEXT NOT NULL
+  )`);
+  //   value = JSON の文字列。'null' = Company DB でわざと空にした値。col = '_sku' = その SKU が Company DB にあることの行 (持ち主が C の列があるときだけ。
+  //   「C にある SKU の欄が欠けた」(止める) と「C に無い SKU」(NE の値で作る) を分ける)
+  db.exec(`CREATE TABLE IF NOT EXISTS cdb_publish_values (
+    generation_no  INTEGER NOT NULL REFERENCES cdb_publish_generations (generation_no) ON DELETE CASCADE,
+    code_norm      TEXT NOT NULL,
+    col            TEXT NOT NULL CHECK (col IN ('_sku', 'name', 'cost', 'standard_price', 'tax_rate', 'tax_class', 'sales_class', 'shipping', 'reorder_months', 'handling', 'primary_supplier')),
+    code           TEXT NOT NULL,
+    sku_kind       TEXT NOT NULL CHECK (sku_kind IN ('single', 'set', 'exception')),
+    value          TEXT NOT NULL,
+    PRIMARY KEY (generation_no, code_norm, col)
+  )`);
+  // 16b'. 写しの反映の門 (④a・#1564 Codex R2 High 2)。後の工程 (daily-sync・自動再試行・商品管理リストの手の更新) を止めるかどうかの正 = この 1 行。
+  //   safe = 流してよい / broken = 古い表が作り直しの世代と違う / unknown = 持ち主が C なのに確かめられていない。
+  //   broken を safe に戻せるのは「入れた後の確かめ」が通った回だけ (fetch.mjs --verify-apply)。遅れ・証跡が読めない回は前の値のまま。
+  //   行が無い = 持ち主が全部 load と分かる (確かめた世代と作り直しが両方ある) ときだけ「流してよい」。apps/warehouse/publish-gate.js
+  //   safe は確かめた作り直し・世代・入れた値のハッシュ・持ち主のハッシュを持つ = 読み手が今と比べ、違えば使わない (#1564 Codex R3 High 2)
+  db.exec(`CREATE TABLE IF NOT EXISTS cdb_publish_gate (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    state          TEXT NOT NULL CHECK (state IN ('safe', 'broken', 'unknown')),
+    reason         TEXT,
+    build_id       TEXT,
+    generation_no  INTEGER,
+    applied_hash   TEXT,
+    ownership_hash TEXT,
+    checked_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+  )`);
+  addColumnIfMissing('cdb_publish_gate', 'applied_hash', 'TEXT');
+  addColumnIfMissing('cdb_publish_gate', 'ownership_hash', 'TEXT');
+  addColumnIfMissing('cdb_publish_generations', 'load_commit_seq', 'INTEGER');
+  // 16b''. C にあるセットの導き方の入力・構成品の行 (#1564 Codex R7 High)。書くのは作り直しの取引 (m_products と一緒に入れ替える)。
+  //   入れた後の確かめ (master-publish.js の verifyApplied) が同じ決め方で導き直して m_products・m_set_components と比べる (持ち主が全部 load = 行が無い)
+  db.exec(`CREATE TABLE IF NOT EXISTS m_set_publish_expect (
+    set_code        TEXT PRIMARY KEY,
+    args_json       TEXT NOT NULL,
+    components_json TEXT NOT NULL
+  )`);   // 世代が読んだ夜間ロードの commit の番号 (0055。activate が比べる。#1564 Codex R4 Medium 2)
   // 16c. raw_ne_products / raw_ne_set_products の通し番号 (sync_meta の ne_raw_<kind>_rev)。書き換えた行 1 つにつき 1 増える (INSERT OR REPLACE も 1)。
   //   どの書き込み口でも同じ取引で増える → NE 取込の完了の印 (ne_api_<kind>_complete_rev) と比べて「印の後に書かれたか」を見分ける (readNeRawRev)
   for (const [table, kind] of [['raw_ne_products', 'products'], ['raw_ne_set_products', 'setproducts']]) {
@@ -1543,6 +1609,13 @@ function createTables() {
     UNIQUE (inventory_run_id, report_id)
   )`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_inventory_report ON amazon_settlement_report_inventory(report_id)`);
+
+  // ---- 決済の文書の版 (D-66)・生の表の版 source_revision・読み直す注文・coverage の lease・初期の印 (D-65) (2026-10-01・D7b-1b-3) ----
+  // 設計 = AI_reference CompanyDB構想/13 §3.1・D-65・D-66。本体 = amazon-settlement-versions.js (表・trigger・view)
+  //   生の表 (headers / lines) に report_document_id / normalization_version / document_version_seq / currency_raw を足す。
+  //   過去の行の版は夜に手で migrate-settlement-document-versions.js --commit が付ける (coordinator は版付けを流さない = 版の無い行があれば ❌ で止まる・#1567 Codex R1 Medium)
+  //   = それまで build・送り手は止まる (黙って行を落とさない)。🚨 初回の initDB は生の表に索引を作る (時間はログ) = pull の後の初回は daily-sync・retry と重ねない別の作業 (R4 Medium 2)
+  createSettlementVersionSchema(db);
 
   // ---- Phase 1 #1-7a: job_locks (concurrency guard)
   // daily-sync / mart rebuild / sync の重複起動防止
@@ -2297,30 +2370,28 @@ function createTables() {
   //   → 同じ文書の中の出現順 (occ = その鍵の何行目か) を鍵に足す。同じ文書の同じ行 (過去の膨張の残骸) は DENSE_RANK で同じ occ = 1 行にまとまる。
   //   層 (sp_api_v1 / v2 / manual_csv) の選び方は今まで通り。rebuild-amazon-settlement-mart.js・rebuild-amazon-account-fees.js・
   //   sql/amazon/build_f_amazon_finance_sku_daily_v1.sql も同じ形 (4 か所そろえる)
-  //   🚨 前提: 1 文書 = 1 決済の全部 (完全なレポート) で、行番号 (source_line_no) がある。raw に書くのは fetch-amazon-settlements.js だけ
+  //   🚨 前提: 1 文書 = 1 決済の全部 (完全なレポート) で、行番号 (source_line_no) がある。raw に書くのは fetch-amazon-settlements.js だけ (2026-10-01 から coordinator の回の中だけ・手のファイルも同じ関数)
   //   (SP-API の決済レポート 1 本 = 1 文書。manual_csv の層に書く処理は無い・本番も sp_api_v1 だけ・行番号の空 0 = 2026-09-28)。
   //   1 つの決済を複数の文書に分けて書く取込 (期間で区切った CSV など) を足すときは、この数え方を見直す (文書ごとの出現順を取るので、分かれた行を 1 行にしてしまう)。
   //   過去の作り直しと照合のスクリプト (rebuild-amazon-settlement-history.js・#1511) は 2026-09-29 に消した (1〜9 月を作り直し・照合 17/17)。
   //   また過去を作り直すときは git の履歴から戻す (月の集計 --all → 日次の財務を月ごと → アカウント単位の手数料 → 決済ごとに振込額と照合)
+  // 🆕 2026-10-01 (D-66・D7b-1b-3): 決済ごとに採る文書の版を 1 つ (v_amazon_settlement_selected_documents) にして、**その版の行だけ** を使う
+  //   (前 = 文書をまたいで (決済, 鍵, 出現順) ごとに層 → 新しい順で 1 行 = 新しい文書から消えた行が古い文書から残りえた)。
+  //   出現順 = 同じ版の中の行番号の DENSE_RANK・同じ (鍵, 出現順) の 2 行目以降 = 過去の膨張の残骸 (ingested_at の新しい順 → id の 1 行)。
+  //   5 か所 (ここ・rebuild-amazon-settlement-mart.js・rebuild-amazon-account-fees.js・sql/amazon/build_f_amazon_finance_sku_daily_v1.sql・送り手の amazon-finance-transform.mjs) を同じ形に
   db.exec(`CREATE VIEW v_amazon_settlement_unified AS
     WITH occ AS (
       SELECT l.*,
-             DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.source_document_id ORDER BY l.source_line_no) AS occ
+             DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.document_version_seq ORDER BY l.source_line_no) AS occ
       FROM raw_amazon_settlement_lines l
+      WHERE (l.document_version_seq, l.source_settlement_id) IN (SELECT document_version_seq, settlement_id FROM v_amazon_settlement_selected_documents)
     ),
     dedup AS (
       SELECT
         l.*,
         ROW_NUMBER() OVER (
           PARTITION BY l.source_settlement_id, l.business_line_key, l.occ
-          ORDER BY CASE l.source_layer
-                     WHEN 'sp_api_v1' THEN 1
-                     WHEN 'sp_api_v2' THEN 1
-                     WHEN 'manual_csv' THEN 2
-                     ELSE 3
-                   END,
-                   l.ingested_at DESC,
-                   l.source_document_id
+          ORDER BY l.ingested_at DESC, l.id
         ) AS rn
       FROM occ l
     )

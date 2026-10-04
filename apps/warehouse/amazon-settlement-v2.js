@@ -10,6 +10,7 @@
  * 並べ直しの規則 (2026-09-28 に V1 / V2 を 6 期間 突き合わせて決めた = business_line_key が全部一致):
  *   ① 品物の行: amount-type ItemPrice → price-type / ItemFees・Points・Item Fee Adjustment → item-related-fee-type / Promotion → promotion-type
  *      (種類の名前 = amount-description)。個数は V1 では品物の行に付かない
+ *      税の取り直し (Order_Retrocharge / Refund_Retrocharge の Tax・ShippingTax だけ) も同じ規則 (2026-10-02 に V1 の 2026-01 の決済で確かめた)
  *   ② 注文の品物ごとに「個数だけの行」を 1 行作る (V1 は Order の品物ごとに金額の無い行 + quantity-purchased。ItemPrice / Principal の行から)
  *   ③ ポイントの行は V2 で order-item-code が空 → 同じ取引・注文・SKU・時刻の品物の行から補う (1 つに決まるときだけ)
  *   ④ 品物でない行 (補てん・手数料・その他) は other-amount。取引の種類の名前は V1 の書き方に直す:
@@ -23,7 +24,7 @@
  *   🚨 通すのは 6 期間で確かめた組み合わせだけ (KNOWN_* の一覧)。それ以外・料金の部分が本体の前に来る・日時が空 / 暦に無い は unknown に数える。
  *      呼び手 (fetch-amazon-settlements.js) は unknown が 1 つでもあるレポートを **取り込まない** (Codex #1508 R1 High:
  *      取り込んだ後で規則を直して入れ直すと business_line_key が変わり、古い行と新しい行が二重になる)。
- *      V2 のレポートは約 90 日取り直せる = 規則を足してから入れれば落ちない
+ *      取込は 85 日の固定の窓の間は毎朝読み直す (Amazon の保持は約 90 日) = 規則を足してから入れれば落ちない
  *   説明をそのまま取引の種類にする型 (other-transaction の FBA Inventory Reimbursement・other-transaction・Inbound Defect Fee) は
  *   説明の値を問わず通す (9 種類の説明で同じ規則を確かめた = 新しい補てんの種類で取込を止めない)
  */
@@ -61,6 +62,26 @@ export function parseV2Tsv(text) {
   return { header, rows };
 }
 
+/**
+ * V2 の TSV を行の物にせずに持つ (#1567 メモリ: 19 万行の物を全部同時に持たない)。rowAt(k) = k 番目の行 (空の行を飛ばした後の番号) の物 = parseV2Tsv の rows[k] と同じ形
+ *   戻り = { header, n, rowAt }。列が足りなければ parseV2Tsv と同じ例外
+ */
+export function v2LeanRows(text) {
+  const lines = String(text).split(/\r?\n/);
+  const header = lines[0].split('\t');
+  const missing = V2_COLUMNS.filter((c) => !header.includes(c));
+  if (missing.length) throw new Error(`V2 の列が足りない: ${missing.join(', ')}`);
+  const idx = [];
+  for (let i = 1; i < lines.length; i++) if (lines[i].trim()) idx.push(i);
+  const rowAt = (k) => {
+    const cols = lines[idx[k]].split('\t');
+    const o = {};
+    header.forEach((h, j) => (o[h] = cols[j] ?? ''));
+    return o;
+  };
+  return { header, n: idx.length, rowAt };
+}
+
 const ITEM_TYPES = {
   ItemPrice: ['price-type', 'price-amount'],
   ItemFees: ['item-related-fee-type', 'item-related-fee-amount'],
@@ -69,7 +90,17 @@ const ITEM_TYPES = {
   Promotion: ['promotion-type', 'promotion-amount'],
 };
 // 6 期間 (2026-06-29〜09-21) で確かめた組み合わせ。これ以外は unknown (= そのレポートは取り込まない)
-const KNOWN_ITEM_TX = { ItemPrice: ['Order', 'Refund', 'A-to-z Guarantee Refund', 'Chargeback Refund'], ItemFees: ['Order', 'Refund', 'A-to-z Guarantee Refund', 'Chargeback Refund'], Points: ['Order', 'Refund'], Promotion: ['Order', 'Refund'], 'Item Fee Adjustment': ['Fee Adjustment'] };
+// 🆕 2026-10-02: ItemPrice に Order_Retrocharge / Refund_Retrocharge (税の取り直し・その取り消し)。決済 12222191753 (2025-12-29〜2026-01-12) で
+//   Order_Retrocharge の Tax / ShippingTax が来て、決済が丸ごと止まった。V1 の同じ決済では 取引 = Order_Retrocharge・price-type = Tax / ShippingTax・
+//   注文番号・計上日・marketplace だけ (SKU・品物の番号・個数は空・個数だけの行は無い) = ① の規則 (② は Order の Principal だけ) のままで同じ形になる。
+//   Retrocharge の中身は公式 (Finances API の RetrochargeEvent) で BaseTax / ShippingTax と 米国の代理徴収の源泉 (RetrochargeTaxWithheldList) だけ =
+//   手数料・値引き・ポイントは来ない → ItemPrice だけに足す。源泉 (ItemWithheldTax など) は ITEM_TYPES に無い = 来たら unknown で止まる (足さない)
+//   🚨 説明 (amount-description) も Tax / ShippingTax だけ通す (KNOWN_ITEM_DESC。Principal などは unknown = 止める。Codex #1582 R1 Medium)。
+//   Refund_Retrocharge は実物を見ていない (手元の V1 にも無い) = Order_Retrocharge と同じ形の仮定。違う説明が来たら止まる
+const KNOWN_ITEM_TX = { ItemPrice: ['Order', 'Refund', 'A-to-z Guarantee Refund', 'Chargeback Refund', 'Order_Retrocharge', 'Refund_Retrocharge'], ItemFees: ['Order', 'Refund', 'A-to-z Guarantee Refund', 'Chargeback Refund'], Points: ['Order', 'Refund'], Promotion: ['Order', 'Refund'], 'Item Fee Adjustment': ['Fee Adjustment'] };
+// 品物の行で説明 (amount-description) まで決めている組み合わせ: 取引 → amount-type → 説明 (ここに無い取引は説明を問わない = 今まで通り)
+const KNOWN_ITEM_DESC = { Order_Retrocharge: { ItemPrice: ['Tax', 'ShippingTax'] }, Refund_Retrocharge: { ItemPrice: ['Tax', 'ShippingTax'] } };
+const isKnownItem = (tx, at, desc) => (KNOWN_ITEM_TX[at] || []).includes(tx) && (!KNOWN_ITEM_DESC[tx] || (KNOWN_ITEM_DESC[tx][at] || []).includes(desc));
 // 料金 (本体 + 部分): 取引 → 料金の種類 (amount-type)
 const KNOWN_FEE = { AmazonFees: ['Amazon Easy Ship Charges'], FBAFees: ['FBA Inventory Storage Fee', 'FBA Long Term Storage Fee', 'FBA Removal Order: Return Fee'] };
 const FEE_PARTS = new Set(['Tax on fee', 'Discount on Fee']);   // 「Base fee」の後に続けてまとめる部分
@@ -96,23 +127,33 @@ function baseV1(r) {
 
 /** V2 の行 → V1 の行 (列名は V1)。unknown = 規則に無い組み合わせ ([名前, 件数])・itemCodeUnresolved = ポイントの行で品物の番号が 1 つに決まらなかった数 */
 export function v2RowsToV1Rows(rows) {
-  const out = [];
-  const unknown = new Map();
-  const bump = (k) => unknown.set(k, (unknown.get(k) || 0) + 1);
-  // ③ のための索引: (取引・注文・調整・SKU・時刻) → 品物の番号
-  const itemCodes = new Map();
-  const ikey = (r) => JSON.stringify([r['transaction-type'], r['order-id'], r['adjustment-id'], r.sku, r['posted-date-time']]);
-  for (const r of rows) if (r['order-item-code']) { const k = ikey(r); const s = itemCodes.get(k) || new Set(); s.add(r['order-item-code']); itemCodes.set(k, s); }
-  let itemCodeUnresolved = 0;
+  const tally = { unknown: new Map(), itemCodeUnresolved: 0 };
+  const out = [...v2RowsToV1RowsIter((i) => rows[i], rows.length, tally)];
+  return { rows: out, unknown: [...tally.unknown], itemCodeUnresolved: tally.itemCodeUnresolved };
+}
 
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i];
+/**
+ * 並べ直しの本体 (V1 の行を 1 つずつ yield・#1567 メモリ = 全部の V1 の行を同時に持たない)。rowAt(i) = i 番目の V2 の行・n = 行の数。
+ *   tally = { unknown: Map, itemCodeUnresolved } に数える (v2RowsToV1Rows と prepareV2ReportTsv が同じ規則を使う)
+ */
+export function* v2RowsToV1RowsIter(rowAt, n, tally) {
+  const unknown = tally.unknown;
+  const bump = (k) => unknown.set(k, (unknown.get(k) || 0) + 1);
+  // ③ のための索引: (取引・注文・調整・SKU・時刻) → 品物の番号。引くのはポイントの行で品物の番号が空のときだけ = その鍵だけ集める (全部の行の鍵を持たない・引いた結果は同じ)
+  const ikey = (r) => JSON.stringify([r['transaction-type'], r['order-id'], r['adjustment-id'], r.sku, r['posted-date-time']]);
+  const need = new Set();
+  for (let i = 0; i < n; i++) { const r = rowAt(i); if (r['amount-type'] === 'Points' && !r['order-item-code']) need.add(ikey(r)); }
+  const itemCodes = new Map();
+  if (need.size) for (let i = 0; i < n; i++) { const r = rowAt(i); if (r['order-item-code']) { const k = ikey(r); if (!need.has(k)) continue; const s = itemCodes.get(k) || new Set(); s.add(r['order-item-code']); itemCodes.set(k, s); } }
+
+  for (let i = 0; i < n; i++) {
+    const r = rowAt(i);
     const isHeader = r['total-amount'] !== '' && r['transaction-type'] === '' && r['posted-date'] === '';
     if (isHeader) {
       const o = emptyV1();
       o['settlement-id'] = r['settlement-id']; o['total-amount'] = r['total-amount']; o.currency = r.currency;
       for (const c of ['settlement-start-date', 'settlement-end-date', 'deposit-date']) o[c] = v2DateTimeToV1(r[c]);
-      out.push(o);
+      yield o;
       continue;
     }
     if (r['transaction-type'] === '' && r['amount-type'] === '' && r.amount === '') continue;   // 空の行
@@ -123,15 +164,16 @@ export function v2RowsToV1Rows(rows) {
       o[map[0]] = desc;
       o[map[1]] = fromCents(toCents(r.amount));
       if (!(KNOWN_ITEM_TX[at] || []).includes(tx)) bump(`${tx} | ${at}`);
+      else if (!isKnownItem(tx, at, desc)) bump(`${tx} | ${at} | ${desc}`);   // 取引 × 種類は知っているが説明が違う (Retrocharge の Principal など)
       if (at === 'Points' && !o['order-item-code']) {
         const s = itemCodes.get(ikey(r));
-        if (s && s.size === 1) o['order-item-code'] = [...s][0]; else itemCodeUnresolved++;
+        if (s && s.size === 1) o['order-item-code'] = [...s][0]; else tally.itemCodeUnresolved++;
       }
-      out.push(o);
+      yield o;
       if (tx === 'Order' && at === 'ItemPrice' && desc === 'Principal') {   // ② 個数だけの行
         const q = baseV1(r);
         q['quantity-purchased'] = r['quantity-purchased'];
-        out.push(q);
+        yield q;
       }
       continue;
     }
@@ -139,8 +181,8 @@ export function v2RowsToV1Rows(rows) {
     if (!isKnownNonItem(tx, at, desc)) bump(`${tx} | ${at} | ${desc}`);
     let cents = toCents(r.amount);
     if (desc === 'Base fee' && KNOWN_FEE[tx]) {
-      while (i + 1 < rows.length) {
-        const nx = rows[i + 1];
+      while (i + 1 < n) {
+        const nx = rowAt(i + 1);
         if (!FEE_PARTS.has(nx['amount-description']) || !sameExceptAmount(r, nx)) break;
         cents += toCents(nx.amount); i++;
       }
@@ -153,9 +195,8 @@ export function v2RowsToV1Rows(rows) {
     else o['other-amount'] = fromCents(cents);
     if (at === 'Other transactions') { o['price-type'] = 'SAFE-T Reimbursement'; o['order-item-code'] = ''; }   // ⑤
     o['quantity-purchased'] = r['quantity-purchased'];
-    out.push(o);
+    yield o;
   }
-  return { rows: out, unknown: [...unknown], itemCodeUnresolved };
 }
 
 export function v1RowsToTsv(rows) {

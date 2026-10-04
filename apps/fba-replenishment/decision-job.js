@@ -21,6 +21,8 @@
  *   - 09:40・10:40 は入力がそろっていなければ **待つ** (ai.decisions は書かない。ops.job_runs に「待機」を残す)。
  *     11:40 (以降) の回でもそろわなければ「今日は決められない」を記録して、前日以前の提案を無効にする
  *   - 計算そのものの失敗は、どの回でも記録する (前日以前の提案も無効)。次の回でまた試す
+ *     🆕 Sheet なしのモードで材料が欠けて止まった失敗 (result.sheetless_blocked・⑦-F) だけは前の提案に触らず、
+ *     「止めた印」を残して自動で送るのを止める (shadow-draft.mjs recordSheetlessBlockedRun・findSendBlock)
  *   - ping: 決めた = ok / 11:40 で決められなかった = partial / 例外・計算の失敗 = fail。待機は ping しない
  *
  * 🚨 画面への影響: レポートの取り込み (syncLatestPlanningFromMiniPC) は画面の「レポート全取得」と同じ処理なので、
@@ -30,6 +32,7 @@ import { buildWarehouseFromMirror, diffWarehouse } from './mirror-warehouse.js';
 import {
   inputGate, recordShadowDraft, pickDraftRows, COMPANY_ID, DOMAIN, GENERATOR, RUN_SUMMARY_KEY, RULE_VERSION_OF,
 } from './shadow-draft.mjs';
+import { MINIPC_SHEETLESS_ERRORS } from './sheetless-mode.js';
 
 export const DECISION_JOB_ID = 'fba-decision-draft';
 /** session advisory lock の鍵 (この仕組み専用の固定値。'FBAD') */
@@ -127,6 +130,7 @@ async function writeJobRun(db, { startedAt, status, summary }) {
  * @param {(inbound: object, opts: object) => object} deps.generate  generateRecommendations(false, inbound, opts)
  * @param {() => object} deps.readSettings
  * @param {(status: string, note: string) => void} deps.ping
+ * @param {() => string|null} [deps.checkSheetless]  Sheet なしのモードで計算を止める理由 (db.getSheetlessCalcBlock)。無ければ止めない
  * @param {object} [o]
  * @param {() => number} [o.nowMs]
  * @param {string} [o.trigger]  cron / startup / manual (記録に残すだけ)
@@ -156,7 +160,11 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
 
     // ① Amazon のレポートを引いて保存し直す (失敗・保存しなかった も理由に残す)
     let sync;
-    try { sync = await deps.syncReports(); } catch (e) { sync = { ok: false, thrown: String(e.message).slice(0, 200) }; }
+    try { sync = await deps.syncReports(); } catch (e) {
+      sync = { ok: false, thrown: String(e.message).slice(0, 200) };
+      // miniPC が Sheet なしの理由で断った (⑦-F・Codex PR R5 Medium 2): 下で止めた印の道にする
+      if (e && MINIPC_SHEETLESS_ERRORS.includes(e.code)) sync.sheetless_code = e.code;
+    }
     // ② 準備中を取り直す (取り直した世代のデータと状態を組で持つ。Codex A2b High 3)
     let inbound;
     try { inbound = await deps.fetchInbound(); } catch (e) {
@@ -176,9 +184,23 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
     let rulesCompare = null;
     const decisionRules = decisionRulesOf(deps);
     let warehouseInfo = { source: 'logizard_mirror', ok: wh.ok, reasons: wh.reasons };
+    // 🚨 Sheet なしのモード (⑦-F・Codex PR R2 High 1): 倉庫の写しの関所とは別に、Sheet なしの材料を先に確かめる。
+    //    欠けていれば (倉庫の写しも読めない・古い日を含めて) 計算せずに「止めた印」の道へ = 前の提案に触らない・send_blocked・fail。
+    //    倉庫の関所だけで最後の回まで行くと、今までどおり前の提案を superseded にしてしまう。モードなし・deps に無いときは null = 今までどおり
+    let sheetlessBlock = null;
+    try { sheetlessBlock = deps.checkSheetless ? deps.checkSheetless() : null; } catch (e) {
+      sheetlessBlock = `Sheet なしのモード: 材料を確かめられない (${String(e.message).slice(0, 160)})。計算しない (Sheet には戻らない・前の結果はそのまま)`;
+    }
+    //   miniPC が Sheet なしの理由で引き取りを断った日 (印が無い・FNSKU が食い違う) も同じ止めた印の道 (待って最後の回で superseded にしない)
+    if (!sheetlessBlock && sync?.sheetless_code) {
+      sheetlessBlock = `Sheet なしのモード: miniPC が引き取りを断った (${sync.sheetless_code}: ${sync.thrown})。計算しない (前の結果はそのまま)`;
+    }
     if (!wh.ok) {
       extra.push({ code: 'warehouse_mirror_not_ready', detail: wh.reasons.join(' / ').slice(0, 300) });
-    } else {
+    }
+    if (sheetlessBlock) {
+      result = { items: [], data_quality: {}, errors: [sheetlessBlock], sheetless_blocked: true };
+    } else if (wh.ok) {
       // 計算が投げても「今日は計算できなかった」として記録する (前日以前の提案も無効にする)
       //   決まりの変更 v3-1 (2026-09-26): 同じ入力で v2 (画面と同じ決まり) と v3 (中原さんの方針) を両方計算し、
       //   記録するのは decisionRules (既定 v3) の提案。もう片方との差を SKU ごとに run 要約行へ残す
@@ -248,6 +270,8 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
         ok: !!sync.ok, error: sync.error || sync.thrown || null, snapshot_date: sync.snapshot_date || null,
         restock: sync.restock ?? null, planning_latest: sync.planning_latest ?? null,
         restock_skip_reason: sync.restock_skip_reason || null, planning_latest_skip_reason: sync.planning_latest_skip_reason || null,
+        // Sheet なしのモードで miniPC の FNSKU を反映しなかった (miniPC のコードが古い。⑦-F)。無い日は項目を足さない (今までと同じ形)
+        ...(sync.fnsku_skip_reason ? { fnsku_skip_reason: sync.fnsku_skip_reason } : {}),
       } : null,
     };
     const rec = await recordShadowDraft(db, result || { items: [], data_quality: {}, snapshot_date: null }, {
@@ -270,7 +294,9 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
       return { outcome: 'gated_final', detail: rec };
     }
     // 試す候補 (v3-3) の材料が読めなかった日は partial で知らせる (提案は記録済み。候補は翌日また計算する)
-    deps.ping(rec.trialsFailed ? 'partial' : 'ok', `${businessDate} 提案${rec.proposals}/不能${rec.blocked}${rec.trialsFailed ? ' / 🚨 試す候補を計算できなかった' : ''} (${trigger})`);
+    //   Sheet なしのモードで FNSKU を反映しなかった日も partial (提案は記録済み。miniPC を配り直すまで FNSKU が古いまま。⑦-F)
+    const fnskuSkipped = !!sync?.fnsku_skip_reason;
+    deps.ping(rec.trialsFailed || fnskuSkipped ? 'partial' : 'ok', `${businessDate} 提案${rec.proposals}/不能${rec.blocked}${rec.trialsFailed ? ' / 🚨 試す候補を計算できなかった' : ''}${fnskuSkipped ? ' / 🚨 FNSKU を反映していない (miniPC が古い)' : ''} (${trigger})`);
     return { outcome: 'decided', detail: rec };
   } finally {
     if (locked) { try { await db.query('select pg_advisory_unlock($1::bigint)', [DECISION_LOCK_KEY]); } catch { /* 接続を閉じればロックも外れる */ } }

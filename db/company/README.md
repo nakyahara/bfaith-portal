@@ -204,6 +204,100 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - 控え (DATA_DIR/cdb-material) は**世代の時刻から 35 日**残す (個数ではない。retry で世代が増えても照合に要る控えが消えない)
 - 試験 = `node scripts/test-master-build-lineage.mjs` (作り直しの記録・由来・到達の証跡) / `node scripts/test-material-lineage.mjs` (0029・35 日)
 
+### Amazon SKU の対の世代の受け口 (Render・⑦-0。16 §7 H1・§8 契約 v3)
+
+Render の `/apps/mirror/api/sync` が Amazon SKU ↔ NE コードの対 (`sku_master` / `sku_resolved`) を**世代つき**で受ける口 (送り手は ⑦-2)。コード = `apps/warehouse-mirror/sku-map-generation.js`・並べ方とハッシュ = `lib/sku-map-canonical.js`。
+**今の送り手 (sync-to-render.js) は世代を付けないので、今の動きは変わらない** (PR #1568 で、前の master (c894ca64) と同じ世代なしの body 16 通りを流し、応答と mirror の全部の表が同じことを確かめた。試験は [G1])。
+🚨 SKU の対の部も受け口の上限 (12MB・server.js) に入ること。合成の 2 万 SKU / 4 万構成で 13.7MB = 1 回では送れない (⑦-2 の送り手は `assertPartFits` で見る)。
+
+**決まり**
+- 世代つきの body = **SKU の対だけの単独の POST**。置いてよい鍵は `sku_master`・`sku_resolved`・`sku_map_generation`・`meta` (オブジェクト) だけ。ほかの表があれば 422 `sku_map_body_not_standalone` (何も書かない)。2 表・状態・同期の印 (last_sync・meta) は 1 つの取引
+- **最初に有効にするのは 2 つがそろったときだけ**: Render の env `SKU_MAP_ACTIVATION_ALLOWED=1` と、世代の印の `activate: true`。どちらか無ければ 409 `sku_map_activation_not_allowed` (`missing` に足りない方)。形・ハッシュを確かめた後に見るので、この 409 は「受けられる形だった・何も書いていない」
+- 有効になった後 (**戻せない**・状態は `mirror_sku_map_state` の 1 行): 世代なし・古い世代・同じ世代で違うハッシュ = 409 / 空にする・片方だけ・形・ハッシュ・行数違い = 422 / 同じ世代・同じハッシュ = `replayed`。🚨 **今の送り手のマスタの部 (対が入っている) は部ごと 409** (products なども入らない)
+- `SKU_MAP_REQUIRE_GENERATION=1` = 状態の行が無くても (表が無くても) 有効とみなし、世代なしの対を断る。**有効は DB ファイルごと** (Render のディスクを戻した・DATA_DIR を変えた = 行が消えて世代なしを黙って受ける) なので、**切替の後に Render に置く**。行が無いときの世代つきは、上の 2 つがそろったときだけ有効にして記録する (下の「バックアップから戻したとき」)
+- 初期化 (表・trigger・列) が途中で落ちた = 確かめる口が 503 (capability を出さない)・世代つきも 503。世代なしは今までどおり (有効になった後なら 409 のまま)。再起動で直らなければ 503 の `init_error` を見る
+- 状態が読めない (表が無いのとは別の失敗) = 世代なしの対も 503 (有効かどうか分からないまま入れない)。対の無い部は今までどおり
+- trigger は名前に版 (`trg_sku_map_state_*_v1`)。`CREATE TRIGGER IF NOT EXISTS` は今ある定義を直さないので、**定義を変えるときは名前の版を上げ、前の名前を `RETIRED_STATE_TRIGGERS` (`apps/warehouse-mirror/sku-map-state-schema.js`) に足す** (新しいのを作った後に DROP)。起動のたびに sqlite_master の定義と照らし、違えば上の「初期化の失敗」
+
+**確かめる口** (`GET /api/sync/sku-map/state`・x-sync-key)。200 = `capability`・`state` (activated・generation は 10 進の文字・content_hash・行数)・`receiver` (今の env)。503 = capability なし (世代つきで送らない)
+```
+# miniPC の PowerShell (リポジトリ直下。RENDER_MIRROR_URL は末尾に /apps/mirror が付いている)
+node -r dotenv/config -e "fetch(process.env.RENDER_MIRROR_URL + '/api/sync/sku-map/state', { headers: { 'x-sync-key': process.env.MIRROR_SYNC_KEY } }).then(async (r) => console.log(r.status, await r.text()))"
+```
+
+**受け手が miniPC (SQLite) より厳しいところ** (⑦-2 の影運転で `validateSkuMap` / `skuMapKeyProblem` をそのまま使って数え、切替の前に 0 にする)
+- 鍵 (seller_sku・ne_code): 前後に U+0020 以外の空白 (TAB・改行・VT・FF・NBSP U+00A0・全角の空白 U+3000・BOM U+FEFF・U+1680・U+2000〜U+200A・U+2028・U+2029・U+202F・U+205F) / どこかに制御文字 (U+0000〜U+001F・U+007F) / 256 文字以上。miniPC の CHECK (`lower(x) = x AND trim(x) = x`) は SQLite の trim が U+0020 しか削らないので通してしまう (Company DB の `btrim` も同じ)
+- 名前: 空白だけ (全角の空白だけなど) / NUL を含む
+- 時刻: `YYYY-MM-DDTHH:MM:SS.sssZ` 以外 (miniPC の既定値はこの形。CSV・API で別の形が入った行)
+- 構成: 構成が 0 行の親 / sort_order が SKU ごとに 0..N-1 でない (隙間・重なり。CSV の REPLACE で起きうる) / 数量が 1 以上の整数でない
+- 同じところ: ASCII の大文字は両方とも断る。全角の大文字・鍵の中の空白は両方とも通す (鍵 = `core.norm_code(鍵)` までは求めない。正規化で重なる鍵は切替前の片付け = 16 §3 #4)
+
+**⑦-2 で本当に有効にするとき**
+1. 前提: ⑦-2 の送り手が **SKU の対を別の部 (単独の POST) で送り、マスタの部から対を外した** 版が miniPC に配られていること (でないと有効にした次の朝にマスタの部が 409 = 下の「壊れるもの」)。ほかに (Codex R1 の申し送り):
+   - 影運転で上の「厳しいところ」が **0 件** (legacy_reopen の送り手も同じ決まりで断られるので、有効にする条件にする)
+   - 対の部が受け口の上限 (12MB) に入る。超える件数なら、送り手で分けるだけでは足りない (1 回の POST が 2 表をそろえて持つ決まり) = 受け口の側に staging → chunk → finalize の契約を作るか、上限を上げる
+   - 同じ世代の再送 (replayed) は `synced_at` を進めない = `recent-missing-candidates` (GAS) は 26 時間で止まる。切替の後も GAS を並べて動かすなら、状態の表に「受け取った時刻」を足す
+2. Render → Environment に `SKU_MAP_ACTIVATION_ALLOWED=1` (再起動を待つ) → 送り手が `activate: true` で 1 回送る → 応答が `result: activated`
+3. `SKU_MAP_ACTIVATION_ALLOWED` を消し、`SKU_MAP_REQUIRE_GENERATION=1` を置く → 確かめる口の `receiver` が `{ activation_allowed: false, require_generation: true }`
+
+**間違えて有効にしてしまったとき** (影運転が本番に `activate: true` で送った・env を消し忘れた など)
+- 気づき方: 毎朝の Render 同期が `マスタ: HTTP 409 {"error":"sku_map_generation_required"...}` で失敗する。確かめる口で `state.activated: true`・`activated_at`・`activation_generation` (いつ・どの世代で有効になったか)
+- 壊れるもの: マスタの部 (products・set_components・手数料・楽天 SKU・在庫の集計・材料の世代・SKU の対) が**部ごと** 409 = mirror が前の日のまま。送り手は 409 で止まるので**後の部** (出荷サマリ・在庫の明細・月末在庫・月次・日次・商品管理リスト…) も送られない。材料の世代の証跡は `unconfirmed`・夜間ロード・FBA 補充・分析の画面が古い値
+- 戻し方 (記録つき。手で SQL を打たない):
+  1. Render → Environment から `SKU_MAP_ACTIVATION_ALLOWED` (と `SKU_MAP_REQUIRE_GENERATION`) を消す → 再起動を待つ。間違えて送った送り手を止める
+  2. **送り手を止めた後、処理中の要求が無いことを確かめる** (Render のログで `/apps/mirror/api/sync` の最後の要求が終わっている・確かめる口の `state.generation` が 1 分ほど変わらない)
+  3. Render の Shell で見るだけ: `node apps/warehouse-mirror/sku-map-state-reset.mjs` (今の状態・控えに書く中身と、次に打つ `--expect-generation` / `--expect-content-hash` が出る。何も書かない)
+  4. 全体の控えも取るなら、空きを確かめてから (`df -h $DATA_DIR`・DB の大きさの 2 倍以上の空きがあるときだけ): `node -e "new (require('better-sqlite3'))(process.env.DATA_DIR + '/warehouse-mirror.db', { readonly: true }).backup(process.env.DATA_DIR + '/warehouse-mirror.before-sku-map-reset.db').then(() => console.log('ok'))"`
+  5. 戻す: `node apps/warehouse-mirror/sku-map-state-reset.mjs --apply --by "名前" --reason "いつ・どの送り手が・なぜ" --expect-generation <3 で出た世代> --expect-content-hash <3 で出たハッシュ>`
+     - 全部 1 つの取引 (BEGIN IMMEDIATE)。**鍵を取った後に状態を読み直し、期待と違えば何もしないで断る** (`RESET_STATE_CHANGED` = 見た後に送り手が新しい世代を入れた・誰かが先に戻した → 2 からやり直す)。控えと記録は鍵の中で読んだ状態から作る
+     - 控え = `DATA_DIR/sku-map-state-resets/sku-map-state-reset-<時刻>.json` (前の状態の行・表と trigger の定義・2 表の行数とハッシュ。上書きしない)。`status` = `committed` (戻した・`audit_id` つき) / `aborted` (DB で落ちた = 何も戻していない・`error` つき) / `pending` (途中で止まった = 記録の表と照らす)
+     - 記録 = 表 `mirror_sku_map_state_resets` (消せない・直せない) に 誰が・いつ・なぜ・控えの場所・前の状態
+     - `mirror_sku_map_state` を DROP → 空で作り直す (有効でない)。2 表の中身は触らない (次の世代なしの同期が入れ替える)。env が残っていれば断る
+  6. 確かめる: 確かめる口が `activated: false`。miniPC の Render 同期を流し直す (か翌朝) → マスタの部が 200
+  7. AI_reference のインシデントのメモに 誰が・いつ・なぜ・控えの場所 を残す
+
+**Render のディスクをバックアップから戻したとき** (有効にした後。状態はバックアップの時点に戻る = 行が無い・古い世代のどちらか)
+1. 送り手 (⑦-2 の写し・daily-sync の Render 同期) を止め、処理中の要求が無いことを確かめる。`SKU_MAP_REQUIRE_GENERATION=1` は残す (世代なしの対を断り続ける)
+2. 確かめる口で今の状態を見る (`state.activated`・`state.generation`)
+3. 次に送る世代を決める: **max(Company DB の世代・miniPC の世代・Render の今の世代) より大きい値** (受け口は戻した後の状態しか知らないので、行が無ければ小さい世代でも受けてしまう。付け直しは ⑦-2 の世代の付け直しと同じ道で)
+4. 行が無い (`activated: false`) とき: Render → Environment に `SKU_MAP_ACTIVATION_ALLOWED=1` を一時的に置く (再起動を待つ) → 送り手が 3 の世代で `activate: true` の単独の POST を 1 回 → 応答が `result: activated` → **すぐ `SKU_MAP_ACTIVATION_ALLOWED` を消す** (再起動を待つ)
+   古い世代の行がある (`activated: true`) とき: 許しは要らない。3 の世代で送れば `result: applied` (有効の時刻と最初の世代はバックアップのまま)
+5. 確かめる口で `state.activated: true`・`state.generation` = 3 の世代・`state.content_hash` = 送った中身・`receiver` = `{ activation_allowed: false, require_generation: true }`
+6. 送り手を戻す。試験 = guards の [G11]
+
+- 試験 = `node scripts/test-sku-map-canonical.mjs` (並べ方・ハッシュ・空白と時刻の決まり) / `node scripts/test-sku-map-receiver.mjs` (受け口の契約) / `node scripts/test-sku-map-receiver-guards.mjs` (今のマスタの部・古い DB・初期化の失敗・状態が読めない・相乗り・有効にする許し・REQUIRE_GENERATION・戻し (鍵の後の読み直し・aborted)・時間・バックアップから戻したとき)
+
+### Amazon SKU の対応の編集 (0054・⑦-1。16 §2・§3・§7 v2・§8 契約 v3)
+
+Amazon の seller SKU ↔ NE コード (今の正本 = miniPC の `m_sku_master` + `m_sku_components`) を、切替 (⑥) の後に Company DB で直すための土台。
+**今の動きは変わらない** (新しい表は空・足した列は null・夜間ロードは対応の無い出品を今までどおり作る。試験 [1] = 0053 (⑤-2b) までの DB と 0054 までの DB で夜間ロードの結果が同じ)。
+
+- 表 `core.amazon_sku_maps` (1 行 = 1 つの出品の対応・`state` = active / deleted (墓標)・`origin` = legacy (切替の日の移行) / portal (画面))。構成の正本は `core.listing_components` のまま (`updated_at` を足した = 写しの構成の更新時刻)
+- 書くのは security definer の関数だけ: `ops.save_amazon_sku_map` (登録・直す・墓標から戻す) / `ops.delete_amazon_sku_map` (墓標にする)。画面 = `/apps/master-edit/amazon/` (lib/amazon-map-write.mjs)。門は ⑤ と同じ (段階 new_open・持ち主表のハッシュ・`MASTER_EDIT_OPEN=1`) + 持ち主 `listing_components.amazon` = company
+- 🚨 墓標は消さない: `core.amazon_sku_maps` の DELETE / TRUNCATE は trigger がいつも拒む (持ち主も)。復元 (`apps/company-db/backup/dump.mjs`) はユーザーの trigger を止めて入れ直すので通る
+- 🚨 **残る危うさ (Codex #1586 R1 High・⑥ の go / no-go「夜間ロードのロールを分ける」)**: 夜間ロード・push・migration・復元・ロールの設定は全部同じログイン (`COMPANY_DB_URL` = DB・schema・表の持ち主・CREATEROLE) で動く。
+  持ち主は trigger を止められ・schema の持ち主として表を DROP でき・CREATEROLE で作ったロールの一員に自分でなれる (PostgreSQL 18 で試した) = **この表の持ち主だけを別のロールにしても守りにならない**ので、この PR ではしていない。
+  持ち主のパスワードが漏れた・持ち主の権限で動くコードの誤り (trigger を止めて消す) なら、墓標は消せてしまう。本当の直し = 夜間ロードと push を、持ち主でなく CREATEROLE の無い別のログインにする (今の全部の書き手に効く = ⑥ で決める)。
+  それまでの手当て: **消えた対応** `ops.amazon_map_lost_listings()` (変更の記録 = 追記だけ に対応の行の記録があるのに今の行が無い出品) を、夜間ロードは「対応がある」と同じに扱う (自動の構成を作り直さない・報告の conflicts に `amazon_map_lost`)・切替の段階を company_owner / new_open に進める前提にする (`0054_amazon_map`)。両方の表の trigger を止めて消すまでは、墓標が消えても自動の対応は戻らない
+- 表の CHECK は写しの受け手 (`lib/sku-map-canonical.js`) と同じ空白の決まり: seller SKU の前後の TAB・NBSP・全角の空白・ASCII の大文字・制御文字、名前が空白だけ (TAB・NBSP・全角の空白だけも) は、どの書き手でも断る (Codex #1586 R1 M1)
+- 不変条件 (commit のとき・deferred の constraint trigger): Amazon (日本) の出品・`listing_norm = core.norm_code(seller_sku)`・active は構成 1 行以上で並び 0..N-1・墓標は構成 0 行。対応の無い出品は見ない
+- 構成の書き手: 段階 company_owner / new_open の間、対応のある出品の構成と対応の行は、取引の設定 `core.source_system` が `portal_amazon_map` (画面の関数) か `amazon_map_migration` (切替の日の移行) のときだけ書ける
+- 夜間ロード (`apps/company-db/load/engine.mjs`): 対応 (墓標も) のある出品の構成は持ち主によらず作らない。持ち主 company = SKU マスタ・Sheet の構成は材料にしない・FBM の完全一致は対応の無い出品にだけ
+
+**移行 (影運転・切替の日)** = `scripts/company-db/amazon-map-migrate.mjs` (lib/amazon-map-migrate.mjs)。古い表 (warehouse.db・fba.db) は読むだけで開く
+```
+# 影運転 (T-7 から毎日)。🚨 試し用の DB だけ。本番の URL (COMPANY_DB_URL) が要る = ホスト・ポート・DB 名が同じ (ユーザーは見ない)・つないだ DB の識別が同じか読めない (同じ DB 名) なら断る。1 つの取引で移して照らし、必ず巻き戻す
+node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --shadow --db-url <試し用の DB> --legacy <warehouse.db> --fba-db <fba.db> --json shadow.json
+# 古い表のハッシュ (H0) だけ
+node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --legacy-hash --legacy <warehouse.db>
+# 切替の日 ③ (段階 frozen の間だけ・止める項目 0・H0 と同じときだけ commit。⑥ の手順書の順番でだけ)
+node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect-hash <H0> --legacy <warehouse.db> --fba-db <fba.db> --actor <人のメール> --yes
+```
+- `--fba-db` は影運転と apply の両方で要る (無い・読めない・`sku_mapping` の表が無い = すぐ断る。Sheet にだけある SKU を 0 件と読まない・Codex #1586 R1 M3)。識別 (system_identifier) が読めない所では、試し用の DB は本番と違う DB 名にする
+- 止める項目 (目標は全部 0・16 §5 の 4): key (受け手の鍵の決まり)・name_blank・timestamp・qty・no_components・sort_gap・orphan_component・not_in_company (NE に無いコード)・component_collision / seller_sku_collision (正規化で重なる)・ne_code_differs (Company DB の SKU のコードから作る NE コードが違う)・sheet_only
+- 同じ構成の行は時刻 (created_at / updated_at) だけそろえる = 変更の記録・出品の version を増やさない (0049 の印を増やさない)。FBM の完全一致など古い表に無い行は消す
+- ⑦-2 (写し・世代・FBA の Sheet 無し・台帳) と ⑥ (段階の戻す道) はこの PR に無い
+
 ### マスタの照合 ①ロードの検証 (0030・W13。10 §6.1.1 B)
 
 毎朝 daily-sync の「マスタ照合」(`apps/company-db/master-compare/run.mjs --daily`・見張りの前) が、最新の夜間ロード (Render・02:00) を検証する。
@@ -608,7 +702,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 原価 0 を出さないようにした後 (Codex R1): 比べる 4,932・不正 76 (**原価 0 が 74** = メルカリ訳アリ品 50・オオクワガタのセット 20 ほか。NE・ロジザード・Company DB とも 0 / 衝突 2)・許す差 157・説明できない 0・判定できない 0 (NE の道の推測の形も 0)。
 原価 0 をそのまま出すようにした後 (L-9 C): 比べる 5,006 (原価 0 を出す 74・ロジザードに 0 でない原価があるもの 0)・新商品待ち 5・不正 2 (衝突)・許す差 159・説明できない 0・判定できない 0。
 
-**取込 (③c-1b。今は影の取込だけ = 実行ボタンは押さない)**: `scripts/logizard-import/lz-daily-import.mjs` (miniPC の 00:20 の定時 `run-nyuka-csv-scheduled.bat` の 1.5 ステップ目)。
+**取込 (③c-1b)**: `scripts/logizard-import/lz-daily-import.mjs` (miniPC の 00:20 の定時 `run-nyuka-csv-scheduled.bat` の 1.5 ステップ目)。切替 (下の「毎晩の本番の切替と GAS への戻し」) から `LZ_DAILY_IMPORT=on` = 毎晩の本番。それまで (と戻した後) は下の影 (実行ボタンは押さない)。
 - **毎晩の影は `LZ_DAILY_IMPORT_SHADOW=on` (miniPC のリポジトリ直下の .env) のときだけ動く。既定 = 止めてある**。手の道 (Stream Deck の auto-barcode.js) が 00:00〜01:30 に動かない版 (③c-1b-3a) を Stream Deck の PC に写してから on にする (同じ共通アカウントなので、影のログインが手の取込のセッションを切らないように時刻で分ける。専用アカウントは作らない = 中原さん 2026-09-28)。
 - 00:15〜00:55 の回だけ・1 日 1 回。対象 = **前の日の lz-daily の正式な証跡 1 つだけ** (daily-sync の回・complete・CSV の sha256 と行数・期限 = 翌日 01:00)。
 - ポータルの取込の状態 (`apps/logizard-import-state`) と、この PC の初期化の印 (`DATA_DIR/lz-import/init.json`) を照合。
@@ -625,6 +719,13 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
     - importing が残っている: 鍵が生きている = 動いている (何もしない) / 鍵が無い = mark-unknown → どの結末でも読み直して報告して**終わる** (この起動では取込に進まない・ロジザードに入らない)。
     - 前の夜の毎晩の回が未確かめ (imported_unverified) = **その夜は確かめのやり直しだけ** (L-25・記録 = `DATA_DIR/lz-import/runs/<実行 ID>/`)。止まった状態の知らせが知らせ済みになるまでは確かめない (知らせが届かないまま verified になって故障が隠れない)。
     - 同じ対象の日がもう始まった (`nightly_last`) = 何もしない。対象 = 前の日の lz-daily (合格・ポータルに送れた) → ポータルの成果物の識別と同じか → `nightly-readiness` (副作用なし) → 済みの印 → 取込 (エンジン・商品とバーコードの両方を比べる = L-24)。
+      - **見張りの商品 (K4)**: 毎晩の CSV はほぼ全商品 = 書き出しの最後の商品 (商品ID の順の最後・2026-10-03 = `zuko5`) が毎晩入り、「比べる商品が最後の商品 = 確かめられない (本物の書き出しは行の間に改行・末尾に改行なし = 最後の商品の 2 本目以降の行の切れ目 (改行の前) で切れても分からない)」に当たる (10/3 00:20 の本番の最初の夜は押す前に止まった・`lzim_night_20261002T152040_dbcb19`)。
+        ロジザードにだけ見張りの商品 `LZ_SENTINEL_ID` (`apps/master-decisions/lz-import-verify.mjs` の 1 か所 = `zzzzzzzzzz`・バーコード 1 本・Company DB / NE には登録しない) を置き、毎晩 (`POLICIES.nightly.sentinel`) は直前・直後の商品マスタとバーコードの書き出しの**最後の行が見張り**・見張りは取り込む CSV に無い、を確かめる (直前 = 押さない / 直後・確かめのやり直し = verify_failed)。試験 (`POLICIES.test`) は見張りを使わない (最後の商品を試験から外す = 今までどおり)。
+        見張りの商品が無い夜 = 「見張りの商品 … がロジザードの書き出しに無い (見張りの商品の登録が要る)」で押さない (ロジザードに書かない・状態は動かない)。
+        見張りの商品の条件: 商品ID = `zzzzzzzzzz`・削除フラグ 0・バーコード 1 本 (今あるどれとも重ならない英数字だけ・8 桁 / 13 桁の数字にしない・JAN / FNSKU (X00…) に似せない。**必ず `LZGUARD0001`** = コードがこの値 1 本だけを求める。違う値・2 本以上は毎晩押さない。入荷検品のバーコードマスタには fnsku として入るが、mirror_products に無いので検索・表示の対象外。Company DB の JAN のロード (barcode_type = jan だけ) の対象外)・商品名は Shift_JIS で戻せる文字だけ (案「【システム用・触らない】取込の見張り」)・在庫 0 (入荷・出荷しない)・NE / Company DB には登録しない・登録や直しは JST 00:00〜01:30 を避ける。
+        ほかの仕組み (lz-daily の比べ・lz-shadow・見張り W4 / W13・入荷検品・在庫の写し・Stream Deck の ①②) は、今の「ロジザードにだけある商品」と同じく黙って対象外 (除外の手当ては要らない)。
+        毎晩の確かめ (押す前 = 押さない / 押した後・確かめのやり直し = verify_failed): 最後の行が見張り・商品マスタとバーコードの商品ID のかたまりが **CP932 のバイト順で厳密に増えていく** (本物の 10/3 の書き出しで確かめた順。同じ ID の 2 つ目のかたまりも崩れ)・見張りのバーコードが `LZ_SENTINEL_BARCODE` (`LZGUARD0001`・ID と同じ 1 か所) の 1 本だけでほかの商品と重ならない・見張りは取り込む CSV に無い。
+        **残るリスク**: ロジザードの商品ID の長さの上限・使える文字・書き出しの並び順の**正式な記述が無い** (リポジトリにも AI_reference にも無い。見張りが最後に来るのは本物の書き出しで確かめたバイト順と、今の ID の文字 (`+ - . 0-9 A-Z _ a-z`・最長 29 文字) からの推定)。`zzzzzzzzzz` で始まるもっと長い ID・`z` より後ろのバイトの文字で始まる ID が登録された・並び順が変わった、は崩れが書き出しに見えれば止まる (安全側) が、「並びの前提が崩れた」と「見張りの直後で切れた」が同じ回に重なると崩れが見えない。そのとき比べる商品が隠れれば precheck (直前) と商品マスタの確かめ (直後) が「無い」で止めるが、比べる商品でない商品の変化は見えない。
   - ping `lz-daily-import` の ok = その夜の取込 (か確かめのやり直し) が verified **かつ** 前後どの回にも未送・知らせ済みにできない止まった状態が無いときだけ。on を見た後の途中の失敗の fail も `lz-daily-import` へ。ほか = ping しない (dead-man が拾う)・途中の例外 = fail。台帳への登録は切替の PR。
   - 本物のロジザードの包みは試験・毎晩・影で共用 (`scripts/logizard-import/lz-real-session.mjs`・1 つの鍵とページの中で 商品 → バーコード → プレビュー → 実行 → 商品 → バーコード・影は押す部品を渡さない)。
   - 確かめのやり直し (試験も毎晩も): 鍵を取ってから記録を読む (無い = evidence_missing・壊れた = evidence_broken・違う回 = evidence_mismatch = どれも verify_failed = 人が見る)・鍵を 30 秒ごとに延ばす・書き出しの前ごと・結果を書く前に締め切り (試験 = 次の 00:00 の前・毎晩 = 00:55) を見る (過ぎた・鍵を失った = 未確かめのまま)。取込の後の直後の書き出しと確かめの結果も同じ。
@@ -696,13 +797,27 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
    - 旧い手の ③ を断る (manual_daily → retired・DB に何も書かない)。
    - DATA_DIR がこの miniPC のもの (初期化の印がポータルと同じ)。
    - 次の夜の済みの印が無い。
-6. #1558 をマージする → Render の反映を待つ (台帳が `lz-daily-import` に・影は RETIRED_JOBS)。
+6. #1558 をマージする → Render の反映を待つ (台帳が `lz-daily-import` に・影は RETIRED_JOBS。読み戻しは 8 の `--expect ready`)。
    - `RETIRED_JOBS` の `lz-daily-import-shadow` の `retired_at` は、マージの日に直してからマージする。
-7. 配る:
-   - miniPC: `git pull --ff-only` → `node tools/logizard-automation/deploy.mjs --pc minipc --apply` → `--check` (bat の見出し・drift 0)。
-   - Stream Deck の PC: master の作業場所から `deploy.mjs --pc streamdeck --apply` → `--check` (drift 0 = ③ の無い版)。
+   - マージの commit (GitHub の #1558 の merge commit の SHA) を控える = 下の `<merge>`。
+7. 配る (**配る元が #1558 の後か確かめてから**。`deploy.mjs --check` は「配った先が配る元と同じ」しか見ない = 古い作業場所から配っても drift 0 になる。Codex #1558 R2 High):
+   - miniPC:
+     - `git pull --ff-only` → `git merge-base --is-ancestor <merge> HEAD` が exit 0 (#1558 が入っている) → `git status --porcelain` が空。
+     - `node tools/logizard-automation/deploy.mjs --pc minipc --apply` → `--check` (bat の見出し・drift 0)。
+   - Stream Deck の PC:
+     - 配るための作業場所を merge の commit で作る: `git fetch origin` → `git worktree add --detach C:\tmp\lz-cutover-deploy <merge>`。
+     - その作業場所で `node tools/logizard-automation/deploy.mjs --pc streamdeck --apply` → `--check` (drift 0)。
+     - **読み戻す**: `node C:\tools\logizard-automation\auto-barcode.js --show-mode` が「① 新商品の取込 → ② バーコード情報の書き出し (③ 毎日の商品マスタは miniPC の自動が取り込む)」と「③ … この版には無い」を出して exit 0。
+       - ログイン・CSV・鍵に触らない。
+       - 「知らない引数です: --show-mode」= ③ のある古い版を配った = 8 に進まない。
+     - 片付け: `git worktree remove C:\tmp\lz-cutover-deploy`。
 8. miniPC のリポジトリ直下の .env に `LZ_DAILY_IMPORT=on` を足す (`LZ_DAILY_IMPORT_SHADOW` の行は消す。.env は 1 つだけ)。
-   - → `lz-cutover-check.mjs --expect ready` = 全部 ✅ (cutover の全部 + 毎晩の本番 on + 送り先 `GCHAT_WEBHOOK_JOBS` が本番と同じ判定で使える)。
+   - → `lz-cutover-check.mjs --expect ready` = 全部 ✅。見るもの:
+     - cutover の全部。
+     - 毎晩の本番 on。
+     - 送り先 `GCHAT_WEBHOOK_JOBS` が本番と同じ判定で使える。
+     - この miniPC のリポジトリの台帳が #1558 の後 (`lz-daily-import` = P2・00:20・猶予 40 分・影は退役)。
+     - **Render の見張り (`/apps/jobs-monitor/status`) も同じ台帳** (反映を待った = 01:00 の締切が効く。見張りは台帳に無い id の ping も 200 で受けるので、ping の成功では分からない)。
 9. 止めの解除: `status` の `halt_revision` を見て `import-state-cli.js resume --by <名前> --note "切替" --halt-revision <番号>`。
 10. 次の夜 00:20 の後:
     - `C:\tools\logizard-automation\logs\scheduled.log` の `[lz-daily-import]` が ✅ verified になり、台帳 `lz-daily-import` の ok が来ている。
@@ -728,7 +843,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 8. 自動の取込の止めは**解かない** (同じ夜に自動と GAS の ③ が両方取り込まない。GAS の ③ は時刻で分ける = 00:00〜01:30 は動かない)。
    - 台帳 `lz-daily-import` は毎晩の締切で鳴る。戻しが 1 日を超えるなら、台帳を戻す PR を作る (lz-daily-import を外す・理由を書く)。
 
-**台帳**: `lz-daily-build` (scheduled_job・P3・毎日 07:00 + 猶予 7 時間 = 作れた回の ok が来なければ気づく) / `lz-daily-import-shadow` (scheduled_job・P3・00:20 + 猶予 6 時間。切替で RETIRED_JOBS へ = `lz-daily-import-shadow-retire`) / `lz-gas-rollback` (temporary_asset・GAS への戻しの固定の版・2026-11-30 まで) / `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
+**台帳**: `lz-daily-build` (scheduled_job・P3・毎日 07:00 + 猶予 7 時間 = 作れた回の ok が来なければ気づく) / `lz-daily-import` (scheduled_job・P2・00:20 + 猶予 40 分 = 01:00 までに verified の ok が来なければ気づく。切替の PR で影 `lz-daily-import-shadow` を置き換えた = RETIRED_JOBS) / `lz-gas-rollback` (temporary_asset・GAS への戻しの固定の版・2026-11-30 まで) / `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
 
 **試験**: `scripts/test-lz-nightly.mjs` (毎晩の本番の miniPC 側) / `scripts/test-lz-cutover-check.mjs` (切替・戻しの確かめ・本物のポータルの状態の機械・戻しの版の sha256 と tag) / `scripts/test-lz-daily.mjs` [1]〜[12] (ロジザードの一覧の見出しは実ファイルの 1 行目のバイト。[11][12] = 成果物をポータルへ送る・入口)・`scripts/test-retry-rerun.mjs` (照合が直ったら作り直す)
 
@@ -991,12 +1106,60 @@ commit;
 - **突き合わせ** `--reconcile [--all]` = 直近 45 日 + 台帳の「未照合の月」(送った集合の新旧の計上日の月) の 日 × SKU (鍵の和集合・Easy Ship の割り振りだけの行は除く・数量 5 列 + 金額 21 列 + profit_before_cogs) と月 × 手数料の種類 (金額・行数) と uncovered。差の月 → 日次の財務のやり残し (`amazon-finance-pending.json`) / 月の手数料のやり残し (`amazon-account-fees-pending.json`・daily-sync の手数料の build / sync がその月までさかのぼり、両方が通ったら消す)。差が 1 回目 ⚠️・2 回続けば ❌
 - 受領記録の指紋は受け口が作り直した行で計算する (`receiptRows`) = 次の回に「Render が復元された」と誤判定しない
 - **daily-sync の工程 (F2b-3)**: 手数料の build / sync の後に `amazon-finance.mjs --incremental --require-backfilled` (日曜 = `--full`・`amazonFinanceDailyArgs`) → 送れたら `--reconcile --require-backfilled`。バックフィルの完了印の前はどちらも「⏭️ バックフィル前」で何もしない。送り手は retry の対象 (`--full`)・突き合わせは retry に載せない (差の続いた回数を数えている)
+  - 🆕 2026-10-01 (D7b-1b-3): スイッチ `CDB_FINANCE_COORDINATOR=1` があるとき **送信は下の coordinator の中** (daily-sync の「Amazon決済と財務」・coverage の回は `--full`)・単独の `--incremental` / `--full` は送らない (dry-run だけ)。スイッチが無いとき = 今までどおり daily-sync の「CompanyDB財務(Amazon)」と単独の `--incremental` / `--full` が送る (token の無い chunk = Render は complete を無効にする・要約は ⚠️) — ただし coordinator に一度でも切り替えた環境 (coverage の世代がある) では送る前に ❌ (一方向・#1567 Codex R6 High)。突き合わせは今までどおり手数料の build / sync の後 (送れた朝だけ)
 - **バックフィルの手順** (miniPC・人が。daily-sync の 07:00〜09:10 は避ける。送り手の lock があるので重なっても片方は見送る):
   1. `--from 月初 --to 月末 --dry-run` (1 注文の最大の行数 ≤ 500・最大の JSON・拾われない金額・鍵の分からない行) と `node scripts/company-db/measure-amazon-finance.mjs --from … --to …` (1 行・1 注文の大きさ・置き換えの倍率)
   2. 中原さんが D-W5 (Render の Postgres のプラン) を決める → miniPC の `.env` に `CDB_DB_LIMIT_BYTES` (と測った `CDB_FINANCE_ROW_BYTES` / `CDB_FINANCE_ORDER_BYTES` / `CDB_FINANCE_REPLACE_FACTOR`) を置く
   3. 1 か月ずつ `--from 月初 --to 月末` → `--reconcile` (差 0 を見る。差の月は翌朝の build が作り直す) を 2026-01 から当月まで
   4. `--mark-backfilled` (送れない鍵・鍵の分からない行が 0 で、全期間の突き合わせ `--reconcile --all` が一致したときだけ印を付ける) → 翌朝から daily-sync が送る
 - 試験 = `node scripts/test-company-db-amazon-finance.mjs` (二重の実装の一致・送り手の通し (本物の router を HTTP で)・突き合わせ・手数料のやり残し)
+
+### Amazon の決済と財務の coordinator (miniPC・D7b-1b-3 = `apps/warehouse/amazon-finance-coverage-run.js`。設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.1・D-65・D-66)
+
+- **なに**: 決済の取込 (SP-API の V2・手で積んだファイル) と上の送り手と「決済のそろい」(Render の `core.finance_coverage`・受け口 = PR #1561) を **1 回** として回す。daily-sync の 1 工程「Amazon決済と財務」(前の「Amazon Settlement」と「CompanyDB財務(Amazon)」をまとめた)・retry の単位も同じ
+- **lease** = warehouse.db の `amazon_finance_coverage_lease` の 1 行。取る・放すのは coordinator の親だけ (持ち主の判定 = `retry-lock.js` と同じ・心拍の期限では奪わない)。生の表の取引はどれも「lease が自分の世代・token のまま」を同じ取引の中で確かめてから書く = 古い回 (死んだ持ち主) の子は書けない
+- **1 回の順**: ① 過去の決済の行に版の無い行があれば **❌ で止まる** (重い版付けは流さない = 夜に手で `migrate-settlement-document-versions.js --commit`・#1567 Codex R1 Medium。新しく取り込む行の版は取込の取引の中で付く) ② mode を **生の表に書く前に** 決める → Render の今の世代を読み、台帳 (`company-db-push.db` の `order_finance:amazon:coverage_generation`) を少なくともそこまで進めて新しい世代と token を **HTTP の前に** 台帳と lease に保存 → `updating` (失敗なら取込を始めない) ③ 順番待ちの初期の印 (updating の後・lease の下) → 手で積んだファイル → SP-API の取込 (一覧の回に世代・token・最新の初期の印の epoch) ④ 送り手 = `--full` (全部の注文を変換 = receipt digest)・全部の chunk に `coverage_generation` / `run_token`・走査の同じ読み取りの取引の中で manifest (`amazon-finance-coverage.js`)・送れた注文の「読み直す注文」を読み取りの版 R 以下だけ消す ⑤ 完成の判定 → **complete の直前に source_revision と初期の印 (id・epoch・digest・順番待ち) を読み直す** (manifest と違えば送らない) → lease を確かめる → `complete` (1 回 120 秒・3 回まで)
+- **採る版の列** (#1567 Codex R2 High 1): 版を選ぶ所 (送り手・判定・印・調べ) はどこも `VERSION_SELECT_COLUMNS` (detail_valid・header_count を含む) を全部渡す。足りなければ `selectDocumentVersions` が throw (黙って SQLite の view と別の版を採らない)
+- **文書の版 (D-66)**: 決済のレポート 1 本 = 版 1 つ (`amazon_settlement_document_versions`・`document_version_id` = {source_layer, report_type, report_id, report_document_id, file_hash, normalization_version} の正規の JSON の SHA-256)。生の行は整数の鍵 `document_version_seq` で版を参照。決済ごとに採る版は 1 つ (層 (sp_api_v2 → sp_api_v1 → manual_csv → ほか) → 新しい順 → ID のバイトの順・SQL の view `v_amazon_settlement_selected_documents` と JS が同じ規則) = SQLite の build (日次の財務・月の手数料・月の mart・表示用の view) と送り手の変換は **採った版の行だけ**。V2 は V1 で取込済みの決済でも必ず版として保存。採る版が変わったら旧い版と新しい版の全部の注文を「読み直す注文」に
+- **source_revision と読み直す注文**: `amazon_settlement_source_revision` (1 行) と `amazon_settlement_dirty_orders`。lines / headers の INSERT / UPDATE / DELETE の trigger (lines の UPDATE は OLD と NEW の両方の注文)。過去の行の backfill (版の鍵の null → 値) は数えない
+- **complete にする条件** (どれか欠ければ Render は `updating` のまま = 正式な利益は null): 採った版の見出しがちょうど 1 行・期間が読める・明細の部品の合計 = 見出しの total・通貨 JPY (原文。過去の行は初期の印で代える) / 起点 (policy の period_from の JST 00:00) から途切れずにつながる end (🚨 区間に数えるのは初期の印か一覧の鎖の期待の report で裏付けのある採った決済だけ。**[起点, frontier) に重なる採った決済は全部** 裏付けが要る = 区間を延ばす決済も内側に収まる決済も。裏付けが無い = 今回の一覧の窓の中 (見出しの end ≥ 窓の createdSince) なら `not_in_inventory` (❌・API の食い違い待ち = retry)・窓より前か手のファイルなら `not_in_inventory_outside_window` (⚠️ もう一覧に出ない = 印を作り直す)・#1567 Codex R3 High 1・R4 High・Medium 1) / **初期の印** (`initial_marker_headers` / `initial_marker_settlements`・追記だけ) がある・印の決済が採った見出しと一致 / 印の後の成功した一覧の回が空白なく重なる (85 日以上あけない)・今回の回が最後 / 期待の report (必須の type = V2・report ID ごとに最新の観測) が全部 imported か satisfied_by_selected_settlement (detail_digest の完全な一致)・CANCELLED / FATAL / DONE でない / 期間の分からない report は未充足 / 送れない注文・整形できない・stale・読み直す鍵・読み直す注文 (R 以下)・鍵の分からない行 = 0 / source_revision が R のまま
+- **Render を読めない朝は取込も始めない** (設計どおり = 生の表を書く前に coverage を無効にする)。取込は 85 日の固定の窓 (report の作成の時刻) = 翌朝 (か retry) に取り戻せる (長く止まって窓の外に出た report は一覧の鎖の切れ目 ⚠️)。取込だけ (財務のバックフィルの完了印の前) にするのは **coverage で一度も回ったことが無いとローカルと Render の両方で言えるときだけ** (#1567 Codex R1 High 1・R8 High。ローカルの証拠 = 台帳の coverage の世代 **か** warehouse.db の一覧の回・手のファイル・印の順番待ちの世代 = 台帳を失くしても分かる / Render = 決済のそろいの status が 200 で coverage = null = 台帳・warehouse.db を切り替えの前に戻した・新しい DATA_DIR でも分かる。Render を読めない = 判定できない = ❌)。Render の決済のそろいが 409 not_migrated・404 (Render が 0050 / #1561 の前に戻った疑い) は **いつも ❌** (#1561・0050 は本番に入っている = 今までの送り方 (legacy) の保険は消した・R8)。完了印の無い台帳 (台帳を失くした疑い) と合わせ、Render に古い complete が残っているかもしれない = **取込も送信もしない** (❌。台帳を戻す・財務のバックフィルをやり直す・Render を確かめる)
+- **採る版の並び** (#1567 R1・R2・R12): 中身の確かな版 (detail_valid = 見出し 1 行・部品の合計 = total・通貨 JPY) が先 → 見出しがちょうど 1 行の版が先 → 層 (**V2 → V1** → 手のファイル → ほか) → 新しい順 → ID。🆕 V2 を V1 より先にした (#1567 Codex R12 Medium 1・前は同じ順位): 退避の `--source v1` (11/11 の V1 の廃止まで) が有効な V2 の版を追い出さない = V2 の取込に戻せば手で選び直さなくてよい (同じ順位だと、新しい V1 が採られ、同じ V2 の文書は入れ直しで版の時刻が変わらず V2 に戻らない)。V2 の版が壊れていれば V1 が採られる。中身の悪い新しい版・見出しの無い一部だけの版は、良い旧い版を押しのけない
+- **止めるのは次の回で直る一時の状態だけ**: ① 版の無い行 (過去の行の版付けの前・途中) ② 要約の古い版 (版付け・取込が途中で止まった・行を手で直した)。どちらかがあれば SQLite の build (日次の財務・月の手数料・月の mart) も送り手も ❌ (行を黙って落とさない) = ① は夜に手で `migrate-settlement-document-versions.js --commit` (coordinator は流さない)・② は coordinator の次の回で直る
+- **人が直すもの** (止めない・要約の頭が ⚠️🚨・retry しない): 良い版が無い決済 = 中身の悪い版の中で一番の版を **仮に採る** (「🚨 仮に採った壊れた版」provisional_broken_version・正式な値は null) / 決済 ID の決まらない版 (version_unresolved_settlement = 下の --allow-unresolved の後だけ)
+- **見出しが 2 行以上の文書** (連結・壊れた文書・#1567 Codex R3 High 2): parser は見出しを全部返し、取込は拒む (V2 = blocked で一覧に理由つき・V1 = 同じく blocked・手のファイルは積まない・`ingestSettlement` も throw)。版の見出しの数は **物理の行の数**。過去の行の版付けも、見出しの物理の行が 2 行以上の文書があれば版を付けずに止まる (`--allow-unresolved` でも進めない = 正しい文書で入れ直す)。取込の一覧は証拠の一覧と **同じ固定の窓** (`createdSince` = 回の開始の 85 日前・`createdUntil` = 回の開始。#1567 Codex R4) = 一覧に出ない report を取込まない (85〜90 日前の report も取込まない = 毎朝の回なら 85 日の窓の中で取込済み。長く止まって窓の外に出た report は一覧の鎖の切れ目 ⚠️ = complete にしない側)
+- **決済 ID が 2 つ以上ある過去の文書** (見出しと明細の決済 ID の和集合が 2 つ以上・#1567 R3): 版付け (migrate) は **版を付けずに止まる** = 行は版の無いまま = build と送り手も止まる (S-U2 の行を黙って落とさない・Render に墓石を送らない)。文書を確かめた上で進めるときだけ `migrate-settlement-document-versions.js --commit --allow-unresolved` (その版はどの決済にも採られない)。🚨 本番のコピーの版付けの dry-run で「決済 ID が 2 つ以上ある文書 0」を確かめてから初回を流す (必須)
+- daily-sync は「財務を送った回か」を coordinator の小さな記録 `DATA_DIR/amazon-finance-coverage-last.json` (同じ DAILY_SYNC_RUN_ID・finance_pushed・finance_push_ok) で決め、送信がそろって終わった朝だけ突き合わせる (retry の見送りは終了コードで決まる = 人が直す理由だけなら exit 0)
+- 🚨 **デプロイの前に本番の DB のコピーで測る (必須)**: コピー = `warehouse.db` と `company-db-push.db` (台帳) を同じ時点で写したフォルダ。`$env:DATA_DIR = '<コピー>'` で ① `migrate-settlement-document-versions.js` (dry-run) = 🚨 **最初の行の「[versions] 索引 … を作った: … ms」= 初回の schema の準備の索引の作成の時間 = その間の warehouse.db の書き込みの lock の長さ** (版付けの「1 取引の最長」には入らない・#1567 Codex R4 Medium 2。本番では pull の後の初回の initDB で起きる = 夜に daily-sync・retry と重ねない別の作業として、まずこの dry-run を単独で流す。🆕 本番の写しの実測 (2026-10-01 夜) = `idx_settle_lines_docver` **32,911 ms** = 約 33 秒 warehouse.db に書けない)・「決済 ID が 2 つ以上ある文書 0」「見出しの行が 2 行以上ある文書 0」 ② `--commit` = 最後の行の「所要 … 分・最大メモリ (RSS) … MB」と「1 取引の最長 … ms (取引の名前)」(🆕 本番の写しの実測 (2026-10-01 夜) = 所要 6.7 分・RSS 120 MB・文書 18・明細 4,428,382 行・**1 取引の最長 14,957 ms** (要約の作り直し (版 #7)・書き込みの取引 861) = warehouse の busy_timeout 5 秒を超える。15 秒までは許容と決めた (10/1)。🚨 **版付けの間は daily-sync・retry だけでなく倉庫の画面 (ポータル) などの warehouse.db への書き込みも busy でエラーになりうる = 深夜に単独で流す**。最長は版の登録・行の版の UPDATE・版の +1・要約の作り直し (1 版の全行を読み並べ digest を作る) の **全部** の書き込みの取引の最長 (#1567 Codex R5 Medium 1)。索引の作成は ① の別の行) ③ `amazon-finance-coverage-run.js --measure` (= dry-run + Render の鍵の取得 (GET だけ) と変わった注文の chunk の serialize まで。Render には書かない・送らない。SP-API の一覧とダウンロードは走る。🆕 R5 Medium 2) = 所要 **60 分以内** (daily-sync の上限 90 分の余裕)・最大メモリ **1,200 MB 以下** (下の根拠。🆕 本番の写し (2026-10-01 夜・head 2ca0906c) = 15.2 分・**1,560 MB で超えた** → メモリの持ち方を直した = V2 を 1 行ずつ並べ直す・dry-run は明細を持たない・決済のレポートは 1 本ずつ・台帳の指紋は 1 つずつ引く・受領記録は一時の SQLite・読み直す注文の記録を消す候補は記録のある注文だけ。直した後の目標 = `--measure` で **800 MB 以下**・送り直しの多い初回の実の回でも 1,200 MB 以下) ④ 空き容量 = 版付けの前後の warehouse.db と WAL の大きさの増えた分の 2 倍以上の空き。どれか満たさなければデプロイしない (相談)。🚨 **定期実行の前のハードゲート = スイッチ** (#1567 Codex R5 Medium 2): daily-sync・retry が coordinator を使うのは miniPC の `.env` に `CDB_FINANCE_COORDINATOR=1` があるときだけ (`apps/warehouse/finance-coordinator-switch.js`)。無ければ今までどおり「Amazon Settlement」(`fetch-amazon-settlements.js --days 14` = 書く取込・coverage の lease を取る) → 「CompanyDB財務(Amazon)」(`amazon-finance.mjs`) の 2 工程 = 本体がほかの PR の deploy で pull されても coordinator は動き出さない。dry-run (`--measure` でも) は送信・台帳・受領の記録の書き込みをしないので毎朝の実の `--full` と同じではない = daily-sync・retry の動いていない夜に実の回 (`amazon-finance-coverage-run.js`) を手で 1 回流し、**exit 0・所要 60 分以内・最大メモリ (RSS) 1,200 MB 以下** を全部満たしたときだけ、中原さんの指示の後に **同じ保守の枠の中ですぐ** `.env` に `CDB_FINANCE_COORDINATOR=1` を足す (下の手順・満たさなければ足さない = 相談)。🚨 **不合格のときも一方向**: 実の回は coverage の世代を作る = 足さなくても今までの 2 工程には戻らない = 翌朝から「Amazon Settlement」が ❌ で止まる (決済の取込と財務の送信が止まる = 正式な利益は出ない側・可用性の停止)。その日のうちに相談して (a) 上限・分け方を直して実の回をもう一度 か (b) 上限 90 分の中なら `.env` に足して coordinator で回す のどちらかを決める (決済のレポートは 85 日の固定の窓 = 数日の停止は次の回で取り戻せる)。不合格の見込みを下げるため、実の回の前に本番の DB のコピーで `--measure` が目安 (60 分・1,200 MB) を満たすのを確かめておく。🚨 スイッチは **一方向** (#1567 Codex R6 High): 手の実の回が coverage の世代を作った後は、スイッチが無い朝 (足す前に朝が来た・足した後に消えた) の daily-sync・retry・単独の入口は今までの取込・送り手を **生の表を書く前・送る前に ❌ で止める** (古い complete を残さない = 安全側・勝手に coordinator も起動しない)。証拠 = ローカル (財務の台帳・warehouse.db の coverage の世代) **と Render** (決済のそろいの行 = coordinator が一度でも updating を送った・状態は問わない) の両方。ローカルの DB を失くした・切り替えの前のバックアップに戻した・新しい DATA_DIR でも Render に行があれば ❌。**Render を読めない (網の失敗・404・401・409・5xx・形が違う) = 判定できない = ❌** (fail-closed・#1567 Codex R7 High 1)。両方とも「無い」と確かに分かったときだけ今までの 2 工程を許す = 🚨 切り替えの前でも、朝に Render が落ちていると今までの取込も止まる (可用性の代わりに正しさ・Render が戻れば次の回 / retry で動く)。足す前に朝が来たら、その朝の「Amazon Settlement」は ❌ (足せば翌朝から戻る)。🚨 `.env` は miniPC のリポジトリの直下の 1 つだけ・足す 1 行だけ書き、ほかの行を書き直さない (2026-09-30 に書き直して `CDB_DB_LIMIT_BYTES` など 4 つが消えた)。**Restart-Service は要らない** (daily-sync と自動再試行 Retry1〜3 は Task Scheduler が毎回 `cd /d C:\Users\bfaith\bfaith-portal` から新しい node で起こし、`dotenv/config` がそのつど `.env` を読む = 台帳 warehouse-daily-sync の where。常駐のサービス (WarehouseServer など) はこの工程を動かさない)。翌朝の「Amazon決済と財務」を見る。スイッチは一時物 (台帳 `cdb-finance-coordinator-switch`・2026-11-30 までに消して常に coordinator にする)。1,200 MB の根拠 = miniPC は物理 7.9 GB・2026-09-01 の実測で空きは 1.4 GB (手で開いたブラウザが残っていた時) 〜 2.8 GB・常駐のサーバーの合計 464 MB = 一番少ない空き 1.4 GB を超えず OS とページキャッシュに 200 MB 残す値。デプロイの後は、毎朝の記録 `amazon-finance-coverage-last.json` の `elapsed_minutes`・`max_rss_mb` (coverage の回 = --full) を最初の 1 週間見る
+- 🚨 **`.env` に `CDB_FINANCE_COORDINATOR=1` を足す手順** (#1567 Codex R6 Medium 2・miniPC の PowerShell 5.1・`&&` は使えない・値は表示しない)。🚨 まだ流さない = 手の実の --full の合格の直後・中原さんの指示の後・同じ保守の枠の中:
+  ```powershell
+  Set-Location C:\Users\bfaith\bfaith-portal
+  $pat = '^\s*CDB_FINANCE_COORDINATOR\s*='
+  # ① 足す前: キーがまだ 0 行 (1 以上なら止めて相談 = 重ねて足さない)・行の数を控える
+  (Select-String -Path .env -Pattern $pat).Count
+  $before = (Get-Content .env).Count
+  # ② 末尾が改行で終わっていなければ改行を 1 つ足してから、1 行だけ足す (ほかの行は書き直さない = 2026-09-30 の件)
+  $raw = [IO.File]::ReadAllText((Resolve-Path .env).Path)
+  if ($raw.Length -gt 0 -and -not $raw.EndsWith("`n")) { Add-Content -Path .env -Value '' -Encoding ASCII }
+  Add-Content -Path .env -Value 'CDB_FINANCE_COORDINATOR=1' -Encoding ASCII
+  # ③ 足した後: キーがちょうど 1 行・行の数はちょうど 1 つ増えた (最後の行に改行が無かったときも 1)
+  (Select-String -Path .env -Pattern $pat).Count
+  (Get-Content .env).Count - $before
+  # ④ 新しい node のプロセスから '1' と読める (OK switch)・ほかの必須の鍵が残っている (yes / no だけ・値は出さない)
+  node -r dotenv/config -e "console.log(process.env.CDB_FINANCE_COORDINATOR === '1' ? 'OK switch' : 'NG switch')"
+  node -r dotenv/config -e "for (const k of ['MIRROR_SYNC_KEY','RENDER_MIRROR_URL','RENDER_PORTAL_URL','SP_API_CLIENT_ID','SP_API_CLIENT_SECRET','SP_API_REFRESH_TOKEN','CDB_DB_LIMIT_BYTES','CDB_FINANCE_ROW_BYTES','CDB_FINANCE_ORDER_BYTES','CDB_FINANCE_REPLACE_FACTOR']) console.log(k, process.env[k] ? 'yes' : 'no')"
+  ```
+  ① が 0・③ が 1 と 1・④ が `OK switch` で、④ の鍵が足す前と同じ (足す前にも ④ の 2 行目を流して控える。RENDER_MIRROR_URL / RENDER_PORTAL_URL はどちらか一方) なら済み。違えば `.env` を元に戻して相談。その日の後半と翌朝にも ④ を流して残っているかを見る (9/30 の件)
+- **V1 と V2 の中身を先に比べる** (読むだけ・本番の DB のコピーで): コピーに `migrate-settlement-document-versions.js --commit` → `check-settlement-v1-v2.js` (SP-API の V2 を読んで採っている版の detail_digest と比べる)。版付けの後、`SELECT settlement_id, COUNT(*) FROM amazon_settlement_document_versions GROUP BY 1 HAVING SUM(header_count = 0) > 0 AND COUNT(*) > 1` が 0 件 (見出しの無い版とほかの版が同じ決済に無い) を確かめてから初回を流す
+- **最後の行**: `✅` complete / `⚠️` 人が直すまで complete にしない (初期の印が無い・印の決済が無い・CANCELLED・窓の空白 など = exit 0) / `❌` 失敗 (retry) / 終了コード 3 = 取り込めない V2 (規則を足す)。財務のバックフィルの完了印の前 = 取込だけ (「財務 push: ⏭️」・ローカルと Render の両方で一度も回っていないときだけ)
+- **初期の印を作る** (D-65 案 a・中原さんが Seller Central の「過去の決済情報」を書き出した後): JSON か CSV を `node apps/warehouse/amazon-finance-initial-marker.js --file 印.json` (dry-run = SQLite の採った見出しと突き合わせる) → `--queue` (順番待ちに積むだけ。次の coordinator の回が Render を updating にした後・同じ lease の下で新しい epoch として入れる = 印を変える前に古い complete を無効にする・#1567 Codex R1 High 2。回の途中で積まれた印・manifest の後に変わった印があれば complete にしない)。🚨 coordinator の回が動いている間 (生きている lease) は `--queue` も手のファイルの `--queue` も **積まずに拒む** = 「回が終わってから積み直す」(#1567 Codex R2 High 2)。coordinator は complete の POST が終わるまで lease を持ち、POST の後にもう一度 印・順番待ち・source_revision を読み直して、変わっていれば新しい世代の updating で complete を取り消す (❌)。形 = `{ evidence_kind, verified_from (起点以前), verified_through, captured_at (時差つき), settlements: [{ settlement_id, start, end (日付 = JST の日), total (円), currency, report_id? }] }`。🚨 CANCELLED・窓の空白が出た・印の決済を直す = 新しい印を作り直す (積み上げは新しい印の後の回だけ)
+- 🚨 **失敗した順番待ちは complete を止め続ける** (#1567 Codex R9 High・永続の状態を毎回読む = 失敗した回を忘れない): ① 入れられなかった初期の印 (順番待ちの `failed_at` = 積んだ後に中身が壊れた・digest が違う。二度と入れ直されない) = 理由 `marker_queue_failed` ② 取り込めていない手のファイル (保管物が無い・hash が積んだときと違う・形が違う = 毎回読み直す) = 理由 `manual_file_not_ingested`。どちらも人が直す理由 (⚠️・exit 0・retry しない)。
+  - 見る: `node apps/warehouse/amazon-finance-initial-marker.js --list` / `node apps/warehouse/amazon-settlement-manual-file.js --list` (番号 #・理由・解決の印)
+  - 直す (どれか): 印 = Seller Central の決済の一覧から印を作り直して `--queue` (より新しい印が入れば外れる) / 手のファイル = 保管物を直す (次の回で入る) か、同じ決済の正しいファイルを積み直す (同じ決済のより新しいファイルが入れば外れる)
+  - 諦める (解決の印・理由は必ず・coordinator の回が動いている間は付けない): `node apps/warehouse/amazon-finance-initial-marker.js --resolve-failed <番号> --note "理由"` / `node apps/warehouse/amazon-settlement-manual-file.js --resolve <番号> --note "理由"` (解決の印の付いたファイルは次の回から取り込まない)。付けた後の最初の coordinator の回で complete に戻れる (ほかの理由が無ければ)
+- **SQLite に無い決済を手で入れる** (API は 90 日より前を返さない): Seller Central から落とした V2 (か V1) を `node apps/warehouse/amazon-settlement-manual-file.js --file x.txt` (dry-run = 決済 ID・期間・合計の一致) → `--queue` (順番待ち)。次の coordinator の回が manual_csv の版として入れる
+- **手で流す**: `node apps/warehouse/amazon-finance-coverage-run.js --dry-run` (書かない・送らない・判定の理由を出す)。過去の行の版付けは `node apps/warehouse/migrate-settlement-document-versions.js --commit` (夜に手で・coordinator は流さない。所要時間と最大メモリを最後に出す。🚨 本番の写しで 1 取引の最長 約 15 秒・初回の索引 約 33 秒 = その間は倉庫の画面などの warehouse.db への書き込みもエラーになりうる = 深夜に daily-sync・retry・ポータルの作業と重ねず単独で)。取込・送り手の単独の実行は **スイッチ次第**: `CDB_FINANCE_COORDINATOR=1` がある = dry-run だけ (`fetch-amazon-settlements.js` は常に dry-run・`amazon-finance.mjs --incremental/--full` は送らない) / 無い = 今までどおり書く・送る (取込は coverage の lease を取る) — ただし coordinator に一度でも切り替えた環境では、書く前・送る前に ❌ (`FINANCE_SWITCHED_BACK` = .env を確かめる・勝手に coordinator を起動しない)。`--from/--to` のバックフィルはどちらでも token の無い chunk = Render は complete を無効にする (要約は ⚠️・切り替え済みの環境は ❌ exit 1・#1567 Codex R6 Medium 1)。🚨 `--from/--to` も **送る前に** 同じ門 (ローカル + Render) を通る = 切り替え済み・判定できないなら送らずに ❌ (送った後の exit 1 では、Render の受け口が #1561 の前に戻っていると古い complete を防げない・#1567 Codex R7 High 2) = 財務のバックフィル (`--from/--to` → `--mark-backfilled`) は coordinator を回す前にだけ流せる。🚨 スイッチが無いときの daily-sync・retry の工程は **入口・引数・時間の上限が master (#1567 の前) と同じ** というだけで、中身は D-66 の文書の版・85 日の固定の窓・coverage の lease・V2 の版の保存に変わっている (完全に同じ動きではない)
+- 試験 = `node scripts/test-amazon-finance-coverage-run.mjs` (本物の router + PR #1561 の受け口を PGlite で) と `node apps/warehouse/test-settlement-document-versions.js` (daily-sync の冒頭でも)
 
 ### Amazon の利益の mart の下ごしらえ (0047。D7b-1a。設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.2・§3.5b・§3.6・§3.7)
 
@@ -1069,8 +1232,8 @@ select economic_date_jst, seller_sku_norm, unclassified_component_count, unclass
 
 ### 決済のレポートの一覧 (miniPC の SQLite・D7b-1b の下ごしらえ・Company DB構想 13 §3.1 / D-65)
 
-- 書き手 = `apps/warehouse/fetch-amazon-settlements.js` (部品 `apps/warehouse/amazon-settlement-inventory.js`)。表 = warehouse.db の `amazon_settlement_report_inventory_runs` (回) / `amazon_settlement_report_inventory` (report ごと)。**今は記録だけ** (読み手 = 後の coverage)。取込む行には関わらない
-- 呼ぶ順 = 取込の一覧の要求 (日時の境なし・今と同じ) → 取込のダウンロードのループ (結果は report ごとにメモリ) → **ループが全部終わった後** に別の getReports で一覧を取る (窓 = `createdUntil` = 回の開始の時刻・`createdSince` = その 85 日前・時間の上限 120 秒) → 一覧の行・取込の結果・完了を **1 つの取引** で書く。最後のページまで取れない・応答の形が違う・時間切れ = `last_page_reached = 0` / `list_error` (取込の結果・終了コードは変わらない)
+- 書き手 = `apps/warehouse/fetch-amazon-settlements.js` (部品 `apps/warehouse/amazon-settlement-inventory.js`)。表 = warehouse.db の `amazon_settlement_report_inventory_runs` (回) / `amazon_settlement_report_inventory` (report ごと)。読み手 = coverage の判定 (`amazon-finance-coverage.js`)。🆕 2026-10-01 (#1567 Codex R4) から **取込の一覧も同じ固定の窓** = この窓に出ない report (85〜90 日前に作られた・回の開始の後に作られた) は取込まない (前 = 取込は日時の境なし = Amazon の既定の 90 日)
+- 呼ぶ順 = 取込の一覧の要求 (証拠の一覧と同じ固定の窓 = `createdSince` 回の開始の 85 日前・`createdUntil` 回の開始。今までの取込の接続) → 取込のダウンロードのループ (結果は report ごとにメモリ) → **ループが全部終わった後** に別の getReports で一覧を取る (窓 = `createdUntil` = 回の開始の時刻・`createdSince` = その 85 日前・時間の上限 120 秒) → 一覧の行・取込の結果・完了を **1 つの取引** で書く。最後のページまで取れない・応答の形が違う・時間切れ = `last_page_reached = 0` / `list_error` (取込の結果・終了コードは変わらない)
 - 一覧の要求は **専用の SP-API の接続** (amazon-sp-api の `auto_request_tokens: false`・`auto_request_throttled: false`・`retry_remote_timeout: false`・要求ごとに残り時間の `timeouts`) = 期限で socket を破棄し、429 でも待って再試行しない。アクセストークンは最初に全体の期限の中で 1 回だけ取り、403 (expired) でも取り直さず一覧の失敗にする (取込が済んだら node が自分で終わる)。取込の接続の設定は変えない
 - 🚨 **途中で落ちた回**: 取込が例外で止まった回は一覧を記録するが `completed_at` は null・`ingest_error` に理由。**daily-sync の時間切れなどで kill された回は一覧の記録が無い** = その回は coverage の証拠に使えない (安全側・次の回で取り直す)
 - 🚨 **記録の失敗**: 一覧の行・取込の結果のどこかを書けなければ取引ごと戻し、見出しだけを `record_error` つき・`completed_at` null で書く (行は無い = 「成功した回」に見せない)。見出しも書けなければ回は残らない
@@ -1630,6 +1793,80 @@ Measure-Command { Invoke-RestMethod -Headers $h 'https://<Render の URL>/apps/c
 
 試験 = `node scripts/test-company-db-amazon-profit.mjs` (32 件: 材料は 1 回だけ計算 (関数の本体を数えて固定) / 受け取り時の出品を集合で比べる (財務・広告) / relink の後は印が付かない (わかる範囲の印の限界を固定) / coverage の関数の世代と版 (合計は source を含めて 1 つのときだけ) / coverage が null なら正式な値は全部 null / 差し替えた後の手で計算した値 (税込・税抜・値引きの税・広告 × 1.1・返品の推定・負の手数料・override_zero と原価不明) / 構成 0 件・候補 2 件・出品なし / 広告の状態 (legacy・missing・not_collected) / 分けられない部品の相殺・旧い形の行・単価の無い返品 / 同じ日に 2 回変わった原価・観測と推定 / hash が JS と一致 / ASIN は未解決・別名は結ぶ・未解決は出品の行だけ止める / Easy Ship (割合・等分・端数・返金・期間に依らない・配れない額・負の重み (0 にする)・全部が非正 (等分)・保存則) / master_notes (受け取りとの違い・監査の記録・タイトルは数えない) / 理由の順と列ごとの null (3 つの coverage で全行) / 日の合計 (列の組ごとの条件・税の表・保存則・row_kind が重ならない・取引の無い日) / 契約 / HTTP (10/1 から 503 `PROFIT_ROUTE_DISABLED`・DB に接続しない (pg の client を作らない)・鍵が無ければ 401))
 
+### 重い関数の権限と重い入口の棚卸し (0056・D-60 の緊急の封鎖 = PR 1a。Codex R-D60-v3-4 H2 / R-D60-v3-5)
+
+🚨 **0056 から、D-60 の重い関数 10 個は誰も直接呼べない** (持ち主・watcher・profit_reader・PUBLIC のどれでも `permission denied for function` = 42501)。
+受け口の 503 (#1570) は HTTP だけの封じ込めで、DB に直接つなげば (持ち主の `COMPANY_DB_URL`・watcher・PUBLIC) 呼べた = 10/1 の停止をもう一度起こせた。受け口は 503 のまま (この PR で 1 文字も変えない)。
+上の「受け入れの条件」「読むだけの確かめ」の SQL も **本番では 42501 で止まる** (流さない)。校正は使い捨ての同じ条件の DB で (§3.10)。
+
+- **重い入口の棚卸し = `scripts/company-db/heavy-entry-manifest.mjs` (`HEAVY_ENTRY_MANIFEST`)**。署名つきの固定の一覧で、0056 の migration とは別に持つ。分け方:
+  - `revoke` (10) = 0056 で権限の表 (`proacl`) を **空** にした = `mart.amazon_profit_daily_range`・`mart.amazon_profit_day_totals_range`・`mart._amazon_profit_totals`・`mart._amazon_profit_rows`・
+    `mart._amazon_profit_finance_days`・`mart._amazon_profit_ad_days`・`mart._amazon_profit_ad_children`・`mart._amazon_easy_ship_alloc`・`mart.amazon_profit_assert_args`・`mart.finance_daily_sku_range`
+    (0047 / 0050 の watcher の GRANT も外した)。PUBLIC・watcher・profit_reader (あれば)・持ち主・表に載っていた全部の役割から外し、最後に空を確かめる (違えば例外 = 取引ごと巻き戻す。持ち主でない役割で流すと `d60_revoke_incomplete`)
+  - `guard_later` = 重いが正当な呼び手がいる (か、外すかを人が決める) = **権限は変えない** (後の PR で共通の lock `company_db_heavy` に参加させるか外す)。
+    `mart.finance_daily_range` (受け口 `GET /order-finance/daily`・watcher にも明示の GRANT)・`mart.ad_efficiency` / `_coverage`・`mart.sku_activity` / `_gaps`・`mart.sales_expanded_to_skus`・`mart.listings_to_skus` (人・AI が読む)・
+    `mart.sales_daily_check` / `refresh_sales_daily` / `build_sales_daily_dates` / `purge_sales_daily` (受け口)・`core.relink_shipments_bulk` / `reresolve_order_lines` / `merge_duplicate_suppliers` (一時の表 = TEMP)・
+    `core.relink_shipments`・`core.relink_ad_spend_listings`・`raw.purge_superseded_observations`・`ops.amazon_map_sales_coverage` / `unmapped_recent` (理由は manifest)。
+    🚨 **これらは今も DB に直接つなげば呼べる** (「repo の中から呼んでいない」は直呼びを防いだ証明ではない)
+  - `light` = 規則にかかるが重くない (定数・policy の表だけ・DDL の補助・coverage の 1 行など)。権限は変えない
+  - 期間の形でない既知の入口も手で `guard_later` に足した = `core.apply_order_finance_batch` (POST /order-finance の chunk)・`core.apply_order_batch` (POST /orders)・`core.apply_shipment_batch` (POST /shipments) (jsonb の大きさに SQL の上限は無い)
+- 🚨 **保証の範囲** (#1601 Codex R1 M1) = 「Company DB の全部の重い入口」**ではない**。機械で漏れを止めるのは 3 つだけ:
+  (a) 関数 = 下の見つける規則 (期間の集計の関数・mart の関数・D-60 の関数に依る関数) + 手で足した既知の入口 /
+  (b) view = **mart / ops の全部の view** (`HEAVY_VIEWS` に heavy / light と理由・pg_class と突き合わせる。heavy = `mart.v_finance_daily`・`v_finance_account_fees_monthly`・`v_order_finance_summary`・`v_order_finance_uncovered`・`v_sales_daily`・`v_shipments_daily`・`v_shipments_unlinked`・`v_ad_spend_daily`・`v_cross_mall_diff`。権限は変えない) /
+  (c) アプリの側の重い処理 (`APP_HEAVY_ENTRIES` = POST /order-finance の chunk・coverage の complete の計算・バックアップ・見張り・夜間ロード。ファイルがあることだけ試験)。
+  規則にかからない関数 (jsonb の batch を受ける ops の SECURITY DEFINER など) は、重くても機械では見つけない = 足すときは手で。D-60 の共通の lock に参加させる相手の正本は後の PR (PR 4) で、この 3 つの一覧から始める
+- **見つける規則** (試験と `--verify` が pg_proc と突き合わせる): core / mart / ops / raw / snapshots / events の関数 (trigger を除く) で、① schema が mart ② 入力の引数が期間・件数・保持の形
+  (名前 `p_from` / `p_to` / `p_since` / `p_after` / `p_upto` × 日付・時刻の型、`p_days` / `p_limit` / `p_keep_days` × 整数、`p_dates` × date[]) ③ 本体が revoke の関数を名前で呼ぶ、のどれか
+  = manifest に無ければ「分けていない」で落ちる。revoke の関数にあとから GRANT しても・guard_later / light の PUBLIC の可否が manifest と違っても落ちる。
+- **呼び手の調べ (10/3)** = アプリ (router・ingest・watch・miniPC の送り手・measure-amazon-finance) で revoke の関数を呼ぶ所は無い。revoke の関数を呼ぶ関数は revoke の関数だけ・SECURITY DEFINER の呼び手も無い。
+  coverage の complete の道 (財務の chunk → updating → complete → `finance_coverage_state`) は revoke の関数を使わない (本物の PG の試験で通す)。
+- **持ち主自身から外しても効く** (PostgreSQL 18.4 で確かめた)。ただし持ち主は **付け直せる** (持ち主は常に GRANT の権限を持つ) = この封鎖は「うっかり・ほかの接続から呼べない」まで。
+  SECURITY DEFINER の関数 (定義者 = 持ち主) の中から呼んでも 42501 = 抜け道にならない。superuser は権限を見ない (PGlite の試験の接続は superuser = ほかの試験は今までどおり呼べる)。
+- **PR 1a でしないこと** (PR 1b = 別の管理主体が要る): 役割 (`profit_definer`・migration の deployer) を作らない・持ち主を移さない・全体の既定の権限を変えない・**TEMP の権限を外さない**
+  (持ち主の relink・reresolve_order_lines・merge_duplicate_suppliers が一時の表を使う)。TEMP は `--verify` が **監査の結果を出すだけ** (PUBLIC・役割ごとの TEMP・一時の表を作る関数)。
+  PG 16 以降、CREATEROLE の役割が作った役割には ADMIN だけが付き SET が無い = `alter function … owner to` は `must be able to SET ROLE` で止まる (実機で確かめた)。
+- 🚨 **約束 1 (revoke の関数を直す)**: 持ち主にも EXECUTE が無いので、`create or replace` は関数の検査 (validator) が 42501 で止まる。直す migration は **同じ取引で**
+  `grant execute on function <署名> to current_user` → `create or replace` → 0056 と同じに全員から外す (`revoke … from public` / `from current_user`) → 権限の表が空を確かめる。
+- 🚨 **約束 2 (これから作る関数)**: 関数の既定は PUBLIC EXECUTE。`alter default privileges … in schema mart revoke … from public` は **効かない** (schema ごとの既定は全体の既定に足すだけ・実機で確かめた)。
+  → 重い入口の規則にかかる関数は **作った取引で署名ごとに REVOKE** (閉じるなら) し、manifest に分け方と理由を足す (足さないと試験が落ちる)。
+- 🚨 `create-watch-roles.mjs` は SECURITY DEFINER の関数の全部に **持ち主の EXECUTE を付け直す** (`grant execute … to <owner>`)。今の revoke の関数は SECURITY INVOKER なので当たらない (PR 1a の今の形では問題なし)。
+  **後の PR で D-60 の関数を SECURITY DEFINER にするときは、① スクリプトの対象から D-60 の関数を外す処理 ② 流し直しても revoke の関数の権限の表が空のままの回帰の試験 の 2 つが必須** (#1601 Codex R1 Low。
+  コメントだけでは防げない: 持ち主が runtime のままなら封鎖が開き、専用の持ち主に移した後ならスクリプト全体が権限の誤りで巻き戻る)。
+
+本番の確かめ (読むだけ・カタログの SELECT だけで重い関数は呼ばない): `node -r dotenv/config scripts/company-db/heavy-entry-manifest.mjs --verify` (問題があれば exit 1・TEMP の監査も出す)。
+
+試験 = `node scripts/test-company-db-profit-fn-revoke.mjs` (PGlite・14 件: 0055 までの姿で watcher・profit_reader・PUBLIC が呼べる前提 / 0056 の後は revoke の 10 の権限の表が空・3 つの役割は 42501 /
+guard_later・light の権限の表は前と 1 文字も同じ / 2 回流しても同じ / TEMP の監査は前と同じ / 棚卸しの突き合わせ (関数・view・アプリ) と漏れ止め 4 つ / 受け口は 503 で DB に接続しない) +
+`scripts/test-company-db-profit-fn-revoke-pg.mjs` (本物の PG・11 件。**試験が自分で使い捨てのクラスタを起動して最後に必ず止めて消す** = 外の PostgreSQL にはつながない・watcher / profit_reader が既にあれば止まる・
+`persistent: false` + 起動の後の全部 (役割・DB・接続の準備・試験) を外側の try/finally で覆う = どこで落ちてもクラスタを消す・フォルダが残れば失敗。
+**embedded-postgres は devDependencies に正確な版 (`18.4.0-beta.17`) で入っている** (lockfile で固定・#1601 Codex R2 M) = clean な checkout + `npm ci` だけで流れる。
+Render の Dockerfile は `npm ci --production` = dev の依存は入らない (容量・起動は変わらない)。miniPC の本適用の手順も `npm ci --omit=dev` でよい (migrate.mjs と --verify は `pg`・`dotenv` = 本番の依存だけ)。
+外の置き場 (環境変数 `EMBEDDED_PG_DIR` → `C:/tmp/pg-embed`) は **版が同じときだけ** 使う (node_modules を別の作業の木へのジャンクションにした worktree で npm ci をし直さずに流すため。違う版は使わない = 同じコミットで同じ版)。
+見つからない・版が違う・起動できない = **失敗 (飛ばさない)**。
+🚨 終わりは `process.exit` を明示: embedded-postgres が入れる async-exit-hook が beforeExit で `process.exit(0)` を呼び `process.exitCode = 1` を上書きする (失敗しても exit 0 になっていた・10/3 に見つけた)。
+どちらも `npm run test:company-db` に入っている (飛ばさない)。**マージの前に必ず流す**: 持ち主 = superuser でない CREATEROLE の login の役割で全部の migration を流す /
+持ち主・watcher・profit_reader・PUBLIC だけの役割の全部が 42501 / guard_later・light と持ち主と TEMP は変わらない / coverage の complete の道と `finance_daily_range` は今までどおり /
+SECURITY DEFINER の中からも 42501 / create or replace の約束 / 2 回流しても同じ / `--verify` が前 ❌・後 ✅ / 持ち主でない役割で流すと止まる)。
+
+**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に miniPC で dry-run → 本適用)**。0056 は権限だけ (表・関数の中身は変えない・利益の値は計算しない)。
+Render のコードは変わらない (受け口は 503 のまま) = Render の deploy と順番は無い。
+
+```
+# 本番で使っていない worktree から (miniPC の PowerShell 5.1。.env は本体の 1 つを読む)
+cd C:\Users\bfaith\bfaith-portal
+git fetch origin
+git worktree add C:\tmp\d60-revoke origin/master
+cd C:\tmp\d60-revoke
+npm ci --omit=dev                                                                # 本適用には dev の依存 (embedded-postgres・PGlite・playwright) は要らない
+$env:DOTENV_CONFIG_PATH = 'C:\Users\bfaith\bfaith-portal\.env'
+node -r dotenv/config scripts\company-db\heavy-entry-manifest.mjs --verify      # 前: ❌ (revoke の関数を watcher・PUBLIC・持ち主が呼べる) が出ること。TEMP の監査を控える
+node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                  # 0056 だけが出ること
+node -r dotenv/config scripts\company-db\migrate.mjs                            # 0056 (applied=1)
+node -r dotenv/config scripts\company-db\heavy-entry-manifest.mjs --verify      # 後: ✅
+cd C:\Users\bfaith\bfaith-portal
+git worktree remove C:\tmp\d60-revoke
+```
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。
@@ -1799,3 +2036,53 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
 - 価格の比較 (v_product_360 の min/max、v_cross_mall_diff) は **単品出品 (構成 1 行・qty=1)** だけ。組合せ出品の価格を単品の価格にしない
 - 月パーティションは `snapshots.ensure_month_partitions(from, to)` で作る。作り忘れても default に入って落ちない。**後から作ると default の行をその月に移してから attach する** (同一トランザクション)
 - 実行器: 番号は 0001 からの連番 (欠番は不正)。DB に適用記録があるのにファイルが無い checkout では流さない
+
+## 持ち主の epoch (0055。マスタ正本切替 ④a・Codex #1564 R1 H1・R2 High 3)
+
+列ごとの持ち主 (`config/master-ownership.mjs`) を 3 つに分ける。**config を書き換えてデプロイしただけでは何も変わらない**:
+- **configured** = config/master-ownership.mjs (コードに書いた「こうしたい」)
+- **prepared** = 人が `master-ownership-epoch.mjs prepare` で記録した「次にこれにする」。明示して頼んだロード (`--use-prepared`) と、その後の写しの世代だけが使う
+- **active** = 今使っている持ち主 (`ops.master_ownership_state`)。毎晩の夜間ロード・miniPC の写し (fetch.mjs)・m_products の作り直しはこれ。**行が無い = 全部 load** (今)
+- 変更の記録 = `ops.master_ownership_events` (足すだけ。init / prepare / cancel_prepare / activate と、activate のときの確かめの証拠)
+- 記録の後に足した列 (後の PR で `OWNED_COLUMNS` に足した列 = 記録した持ち主に無い列) = **'load' として足す** (夜間ロード・写しは止まらない。`status` の `filled_as_load` に出る)。知らない列・知らない値・ハッシュが中身と違う = 壊れ (推測しない = 止める)
+
+切替の日の順番 (⑤-3 の切替の手順の中。🚨 **古い書き込み口 (/register など) を閉じるのは ⑤-3 = 持ち主を変える前に閉じる**。0050 では閉じない):
+1. config/master-ownership.mjs を書き換えてデプロイ (ここでは何も変わらない)
+2. miniPC: `node scripts/company-db/master-ownership-epoch.mjs prepare` (一緒に切り替える組・④a が写さない列を確かめて記録)
+3. `node scripts/company-db/remote-load.mjs load --apply --wait --use-prepared` (prepared の持ち主で 1 回だけロード)
+4. miniPC: `node apps/company-db/publish/fetch.mjs` → `node apps/warehouse/rebuild-m-products.js` → `node apps/company-db/publish/fetch.mjs --verify-apply` (prepared の世代を入れて確かめる)
+5. miniPC: `node scripts/company-db/master-ownership-epoch.mjs activate` (最新の作り直しが prepared の世代・その世代が prepare の後に Company DB を読んだ・今朝の確かめが通った・読み直しても同じ、
+   かつ **⑤-1 の切替の段階 (`ops.master_cutover_state`) が `frozen`** (古い入口を止めた後・持ち主を C にする前) のときだけ active に。足りなければ理由を出して断る。段階の表が無い = 断る。
+   証拠を集めたときの prepare の時刻を行の鍵の後に比べる = その間に prepare をやり直したら `PREPARED_CHANGED` で断る (やり直しは 3 から)。
+   証拠の世代が読んだ夜間ロードが最後のロードでない (証拠の後に毎晩のロードなどが入った。DB の commit の番号で比べる) = `LOAD_AFTER_EVIDENCE` で断る (やり直しは 3 から。#1564 Codex R3 High 1・R4))
+- 途中で止める = `master-ownership-epoch.mjs cancel` (prepared を消す。active はそのまま = 毎晩は前の持ち主)。今の状態 = `master-ownership-epoch.mjs status`
+
+**マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0055 は表を 3 つ (epoch・その記録・夜間ロードの commit の順) と、⑤-1 の切替の段階・画面の保存の門に「持ち主の epoch と同じ」の確かめを足すだけ (行は作らない = 全部 load のまま = 何も変わらない)。
+あわせて ⑤-1 の `ops.ownership_hash` の式を「load の列は数えない」に作り直す (下の「1 つの式」)。🚨 段階が company_owner / new_open の DB では 0055 は止まる (本番は legacy_open = 当たらない)。
+🚨 **番号**: master 0050 (finance_coverage) → ⑤-1 0051 (master_edit) → ⑤-2a 0052 (master_registrations) → ⑤-2b 0053 (ne_registration_csv) → ⑦-1 0054 (amazon_sku_maps) → この 0055 の順に積む (migrate.mjs は欠番・重複を拒む)。
+🚨 **デプロイは Render と miniPC を同じ日に**: 夜間ロードの規則の指紋 (`engine.mjs` の `LOAD_RULE_FILES`) に `apps/company-db/load/ownership-state.mjs` が入った (engine.mjs も変わった)。
+Render (夜間ロード) と miniPC (朝の照合 ①) のコードが違う日は、朝の照合 ① が「規則の指紋がこのコードと違う」で判定できない (blocked) になる。同じ日の夜間ロードの前に両方をそろえる
+
+```
+node -r dotenv/config scripts\company-db\migrate.mjs --dry-run                 # 0055 だけが出ること (0051〜0054 は先に入っている)
+node -r dotenv/config scripts\company-db\migrate.mjs                           # 0055 (applied=1)
+node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     # state = missing (行が無い = 全部 load)
+```
+
+### epoch の鍵・持ち主表のハッシュの 1 つの式 (#1564 Codex R3)
+- **epoch の鍵** `ops.master_ownership_lock_key()` = **4705310055** (0036 の親子の鍵 4705310036・0051 のマスタの書き込みの鍵 4705310051 と同じ作り。2^31 より大きい = `hashtext()` の鍵とも重ならない)。
+  - 夜間ロード (`engine.mjs`・`--use-prepared` も) = 取引の冒頭に**共有**で取ってから、取引の中で epoch を読む (書き終わるまで持つ)。prepare / activate / cancel (`ownership-state.mjs`) = **排他** = ロードの途中で epoch が変わらない
+  - activate は鍵の後に「証拠の世代が読んだ夜間ロード = 最後に commit したロード」を見る (古い active で走ったロードは activate より前に commit している = 証拠の世代に入っていない = 断る)
+- **夜間ロードの commit の順** `ops.master_load_commits` (#1564 Codex R4): 本適用のロード 1 回 = 1 行 (dry-run は無し・足すだけ)。番号 `commit_seq` は DB が commit の直前に振る
+  (epoch の鍵 (共有) とマスタの書き込みの鍵 (排他) を持ったまま = 番号の順 = commit の順)。送り手の時計 (`started_at` / `finished_at`)・場所 (`host`) では並べない。
+  - 写し (`publish/fetch.mjs` の `selectPublishLoad`) = 番号の一番大きいロード (毎晩の cron = `render-nightly` も、切替の日に HTTP で流した `--use-prepared` のロード = `render` も)。
+    行がまだ無い (0055 の後に本適用のロードが無い) = 今までどおり毎晩の cron の最新。照合 ① (`compare-load.mjs` の `selectNightlyLoad`) は毎晩の cron の回のまま (別の目的)
+  - 世代 (warehouse.db の `cdb_publish_generations.load_commit_seq`) と証跡 (`master-publish.load_commit_seq`) に番号を残す。activate はその番号 = 一番大きい番号か
+    (`LOAD_AFTER_EVIDENCE`)・最後のロードの持ち主が prepared か (`LOAD_EPOCH_MISMATCH`) を鍵の後に見る
+  - 🚨 **鍵の順** (全部の書き手で同じ = デッドロックしない): epoch (0055) → 切替の段階 (0051 の `hashtext('ops.master_cutover')`) → マスタの書き込み (0051) → 親子 (0036) → 行。
+    夜間ロード = epoch 共有 → 書き込み 排他 → 親子 / activate = epoch 排他 → 段階 共有 → 行 / 画面の保存・登録 = 段階 共有 → 書き込み 共有 (epoch は取らない)
+- **持ち主表のハッシュは 1 つの式** = 持ち主が `load` でない列だけを `[キー, 値]` にしてキーの順に並べた JSON の sha256 (= 記録に無い列は load と同じ)。
+  `lib/master-cutover.mjs` の `ownershipHash` (画面・門の記録)・`ownership-state.mjs` の `ownershipHashOf` (epoch)・`master-publish.js` の `ownershipHash` (写しの世代・作り直しの記録)・
+  夜間ロードの記録 (`ops.load_materials.ownership_hash`)・DB の `ops.ownership_hash` (0055 で作り直し) が全部これ。
+  切替の後に `OWNED_COLUMNS` に列を足しても (足した列は load)、段階の記録 (`owner_hash`)・epoch・画面の保存のハッシュは変わらない (保存・登録が `before_cutover` にならない)。
+  写しは夜間ロードが記録した持ち主表から今の式でハッシュを作って比べる (式を変えた日に前の式で記録したロードがあっても偽の食い違いにしない)

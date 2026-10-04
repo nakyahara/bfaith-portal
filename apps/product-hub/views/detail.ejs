@@ -1612,6 +1612,59 @@ th.attr-unknown { color: #dc2626; }
             <textarea id="prompt-text" rows="16" style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
           </div>
         </div>
+          <%# 🤖 構成をAIに作らせる (段階1・PR1-d)。既存の「📝 商品分析を準備」は残す (退避路)。
+              押す = キューに積むだけ。書き戻した構成は**ここに出るだけ**で、
+              人がコピーして lp-tool に貼るところまでは変わらない %>
+          <% if (lpCompose.enabled) { %>
+          <div id="lpc" class="field" style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;"
+               data-draft-id="<%= draft.id %>" data-ne-code="<%= draft.ne_code || '' %>" data-name="<%= draft.name || '' %>">
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <%# モデル名をボタンに出す (2026-10-02 中原さん)。決める場所は Render の PH_LP_COMPOSE_MODEL だけ %>
+              <button type="button" class="btn" id="lpc-btn">🤖 構成をAIに作らせる<%= lpCompose.model_label ? ' (' + lpCompose.model_label + ')' : '' %></button>
+              <span class="muted" id="lpc-status" style="font-size:12px;"></span>
+            </div>
+            <div class="muted" id="lpc-spec" style="font-size:11px; margin-top:4px;"></div>
+            <%# AI に渡す (渡した) 画像の並び。測定で比べるときはスタッフ版 (ChatGPT) にも同じ画像を同じ順に添付する
+                (codex #1592 High: 同じ材料から作った 2 つを比べるのが測定の前提) %>
+            <div class="muted" id="lpc-images" style="font-size:11px; margin-top:2px;"></div>
+            <%# 添付画像の説明 = AI に渡したのと同じ文。くらべっこ (測定) を公平にするため、スタッフの ChatGPT 版にも貼る
+                (codex #1593 High・中原さん 2026-10-03「A」) %>
+            <div id="lpc-guide" hidden style="margin-top:6px; background:#fff; border:1px dashed #cbd5e1; border-radius:8px; padding:6px 8px;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <strong style="font-size:12px;">ChatGPT 版に貼る文 (添付画像の説明)</strong>
+                <button type="button" class="btn btn-sm" id="lpc-guide-copy">コピー</button>
+                <span class="muted" id="lpc-guide-result" style="font-size:12px;"></span>
+              </div>
+              <div class="muted" style="font-size:11px; margin:2px 0 4px;">
+                くらべるとき: 「📝 商品分析を準備」の文の最後にこれを貼り、画像をこの順に添付してください (AI にも同じ文を渡しています)
+              </div>
+              <textarea id="lpc-guide-text" rows="6" readonly style="width:100%; font-size:12px;"></textarea>
+            </div>
+            <%# 🚨 失敗したときの説明はここ。lint の中身 (lpc-lint) は「できた」ときの箱の中にあるので、
+                失敗したときは見えない (codex exec review P2) %>
+            <div id="lpc-fail" hidden class="muted" style="font-size:11px; margin-top:4px; color:#b45309;"></div>
+            <%# 測定台帳 (設計 §7.1b) に書き写す値。画面は作らない方針なので、
+                台帳に要る「機械が知っている事実」だけをここに並べる %>
+            <div id="lpc-meas" hidden class="muted" style="font-size:11px; margin-top:4px; font-family:ui-monospace, monospace; word-break:break-all;"></div>
+            <div id="lpc-result" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px;">
+                <strong style="font-size:13px;">AI が作った構成 (⑦ AI画像生成プロンプト)</strong>
+                <button type="button" class="btn btn-primary btn-sm" id="lpc-copy">コピー</button>
+                <a class="btn btn-sm" id="lpc-open" href="#" target="_blank" rel="noopener">lp-tool を開く</a>
+                <span class="muted" id="lpc-copy-result" style="font-size:12px;"></span>
+              </div>
+              <div class="muted" id="lpc-lint" style="font-size:11px; margin-bottom:6px;"></div>
+              <textarea id="lpc-text" rows="16" readonly style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
+              <div class="muted" style="font-size:11px; margin-top:4px;">
+                🚨 <strong>そのまま使わないでください。</strong>初稿です。中身を読んでから lp-tool に貼ってください
+                (材料に無い効果・数値・認証が混じっていないか、商品の形・容量が合っているか)。
+              </div>
+            </div>
+          </div>
+          <%# 🚨 `<` は必ず潰す。本文は **AI が書いたもの** なので `</script>` を含みうる。
+              潰さないとそこで script が閉じて、以降の画面が丸ごと壊れる (prompt-templates-json と同じ作り) %>
+          <script type="application/json" id="lpc-json"><%- JSON.stringify(lpCompose).replace(/</g, '\\u003c') %></script>
+          <% } %>
         <script type="application/json" id="prompt-templates-json"><%- JSON.stringify(promptTemplates).replace(/</g, '\\u003c') %></script>
         <%# 本番の構成の 済/まだ (2026-09-13 スタッフ要望)。縦列「仮構成」とは別。ボードのカードに「構成：まだ／済」で出る %>
         <div class="field" style="padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;">
@@ -1622,7 +1675,7 @@ th.attr-unknown { color: #dc2626; }
             <% if (composeState.done) { %><strong style="color:#15803d;">済</strong><% } else { %><strong>まだ</strong><% } %>
             <span class="muted" style="font-size:12px;">
               <% if (composeState.marked) { %><%= String(ip.compose_updated_at || '').slice(0, 16).replace('T', ' ') %> <%= ip.compose_updated_by || '' %>
-              <% } else if (composeState.implied) { %>(③素材待ちが済んでいるので 済 とみなしています)
+              <% } else if (composeState.implied) { %>(④AI制作が済んで ⑤デザイン修正 に移っているので 済 とみなしています)
               <% } else { %>(本番の構成ができたら押す。縦列「仮構成」とは別)<% } %>
             </span>
             <%# 推定の 済 でも「まだに戻す」を出す (人の値が推定より優先 — Codex R1) %>
@@ -5783,6 +5836,248 @@ th.attr-unknown { color: #dc2626; }
         btn.textContent = before;
       }
     });
+  })();
+  // 🤖 構成をAIに作らせる (段階1・PR1-d)。
+  // 画面がするのは「押す」「状況を見る」「出す」だけ。判定も lint もサーバー側。
+  // 書き戻した構成は**ここに出るだけ**で、lp-tool へは人がコピーして貼る。
+  (function initLpCompose() {
+    const root = document.getElementById('lpc');
+    const holder = document.getElementById('lpc-json');
+    if (!root || !holder) return;
+    let state = null;
+    try { state = JSON.parse(holder.textContent); } catch (e) { return; }
+
+    const draftId = root.dataset.draftId;
+    const btn = document.getElementById('lpc-btn');
+    const statusEl = document.getElementById('lpc-status');
+    const specEl = document.getElementById('lpc-spec');
+    const resultEl = document.getElementById('lpc-result');
+    const textEl = document.getElementById('lpc-text');
+    const lintEl = document.getElementById('lpc-lint');
+    const openEl = document.getElementById('lpc-open');
+    const copyResultEl = document.getElementById('lpc-copy-result');
+    const failEl = document.getElementById('lpc-fail');
+    const measEl = document.getElementById('lpc-meas');
+    const imagesEl = document.getElementById('lpc-images');
+    const guideEl = document.getElementById('lpc-guide');
+    const guideTextEl = document.getElementById('lpc-guide-text');
+
+    const RUNNING = ['queued', 'running'];
+    let timer = null;
+    // 二重クリック・通信リトライで依頼を増やさないためのキー。
+    // 🚨 押すたびに作り直さない — 返事が来ないまま押し直したときに別の依頼になってしまう
+    let idemKey = null;
+    let posting = false;
+
+    const LP_TOOL = 'https://bfaith-flow.onrender.com/lp-tool.html';
+    const newKey = () => (window.crypto?.randomUUID ? window.crypto.randomUUID()
+      : 'lpc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
+
+    function lintLine(lint) {
+      if (!lint) return '';
+      if (lint.ok === false) {
+        const n = (lint.errors || []).length;
+        return 'lint: ' + n + ' 件ひっかかりました';
+      }
+      const warn = (lint.warnings || []).length;
+      return 'lint: 通っています' + (warn ? ' (警告 ' + warn + ' 件 — 仕様書とパーサーのズレ。構成そのものは問題ありません)' : '');
+    }
+
+    // 実際に本回答を書いたモデルの確認 (ランナーが終わった後に付ける・codex exec review #1591 High)。
+    // 頼んだモデル (job.model) と違えば測定に数えない
+    const MODEL_CHECK_TEXT = { match: '一致', mismatch: '不一致', unknown: '未確認' };
+    // 🚨 本文は「一致」した done にしか来ない (サーバが出さない)。不一致・未確認は needs_review に落ちて理由が error に入る
+    function modelNote(job) {
+      if (!job.model) return '';
+      if (job.model_check === 'match') return job.model_label + '・モデル確認済み';
+      return job.model_label;
+    }
+    // できてから実モデルの確認が付くまで (ふつうは数十秒〜2 分) 見に行く。上限は置かない —
+    // サーバが 15 分付かなければ「未確認」で閉じる (= needs_review になってポーリングも止まる)。
+    // 🚨 completed_at を基準にしない: lease 切れの後に結果が届いた依頼は completed_at が古いまま (codex #1591 R3 Low)
+    const checkingModel = (job) => !!job && !!job.model && !job.model_check && job.status === 'done';
+
+    // lpc-images-text:start (試験がここを切り出して動かす・scripts/test-ph-lp-compose-ui.mjs)
+    // AI に渡す画像の並び。作っている間・確認待ちの間はその依頼で渡した画像だけ。終わった後は
+    // 「この依頼で渡した画像」(測定はこちら) と「もう一度押すと渡す画像」(いまの画像タブ) の両方
+    // (codex #1592 R2 High: 終わった依頼の並びだけを出すと、画像を差し替えて押し直したときに食い違う)
+    function lpcImagesText(s, inProgress) {
+      // 素材 (role = material:N) は画像フォルダの下のフォルダの画像。商品画像の並びとは分けて、場所と名前つきで出す
+      const isMat = (im) => /^material:/.test(String(im.role || ''));
+      const line = (imgs) => imgs.filter((im) => !isMat(im)).map((im) => im.label).join(' → ');
+      const matLine = (im) => im.label + ' ' + (im.folder ? im.folder + '/' : '') + (im.name || '');
+      const jobImgs = s.job && Array.isArray(s.job.images) && s.job.images.length ? s.job.images : null;
+      const plan = Array.isArray(s.image_plan) ? s.image_plan : [];
+      const lines = [];
+      if (jobImgs) {
+        lines.push('この依頼で AI に渡した画像: ' + line(jobImgs));
+        const mats = jobImgs.filter(isMat);
+        const omitted = Number(s.job.materials_omitted) || 0;
+        if (mats.length) lines.push('素材 (' + mats.length + ' 枚): ' + mats.map(matLine).join(' / '));
+        if (omitted) lines.push('⚠️ 上限 (素材 10 枚) で入らなかった素材 ' + omitted + ' 枚');
+      }
+      if (!inProgress && !s.blocked && plan.length) {
+        lines.push((jobImgs ? 'もう一度押すと渡す画像: ' : '押すと AI に渡す画像: ') + line(plan)
+          + (s.materials_folder ? ' + 素材 (画像フォルダの下のフォルダから最大 10 枚・押したときに読む)' : ''));
+      }
+      if (!lines.length) return '';
+      return lines.join('\n') + '\n— くらべるときは「📝 商品分析を準備」の ChatGPT 版にも、その依頼で AI に渡した画像を同じ順に添付し、下の「ChatGPT 版に貼る文」を貼ってください';
+    }
+    // lpc-images-text:end
+
+    function render(s) {
+      state = s;
+      const job = s.job;
+      const blocked = s.blocked;
+      const running = !!job && RUNNING.includes(job.status);
+      // 確認待ちの間も押させない (サーバも already_running で断る・codex #1591 R4 Medium)
+      btn.disabled = !!blocked || running || checkingModel(job) || posting;
+      // モデル名をボタンに出す。ここは「いま押したら使われるモデル」(サーバの設定)
+      const ml = s.model_label ? ' (' + s.model_label + ')' : '';
+      btn.textContent = running ? '🤖 AI' + ml + ' が作っています…' : '🤖 構成をAIに作らせる' + ml;
+
+      imagesEl.textContent = lpcImagesText(s, running || checkingModel(job));
+      const guide = job && typeof job.image_guide === 'string' ? job.image_guide : '';
+      guideEl.hidden = !guide;
+      if (guide && guideTextEl.value !== guide) guideTextEl.value = guide;
+      imagesEl.style.whiteSpace = 'pre-wrap';
+
+      specEl.textContent = s.spec
+        ? '仕様書: ' + s.spec.title + ' (' + String(s.spec.imported_at || '').slice(0, 10) + ' 取込)'
+        : '';
+
+      if (blocked) { statusEl.textContent = blocked; }
+      else if (!job) { statusEl.textContent = '押すと AI が構成の初稿を作ります (2分ほど)'; }
+      else if (running) {
+        statusEl.textContent = 'AI が構成を作っています… (2分ほどかかります・' + (job.elapsed_sec || 0) + ' 秒経過)';
+      } else if (job.status === 'done') {
+        // ここは「この依頼で実際に予約されたモデル」(設定がその後に変わっても、作ったモデルを出す)
+        if (job.model && !job.model_check) {
+          statusEl.textContent = 'できました。作ったモデル (' + job.model_label + ') を確かめています… 確かめたら本文を出します';
+        } else {
+          const mn = modelNote(job);
+          statusEl.textContent = 'できました (' + (mn ? mn + '・' : '') + (job.elapsed_sec || 0) + ' 秒'
+            + (job.review_rounds != null ? '・検品 ' + job.review_rounds + ' 巡' : '') + ')';
+        }
+      } else if (job.status === 'needs_review' && String(job.error_code || '').startsWith('model_')) {
+        // 実モデルが頼んだモデルと違う・確かめられなかった。本文は出さない (測定に数えない)
+        statusEl.textContent = '⚠️ ' + (job.error || '作ったモデルを確かめられませんでした。もう一度依頼してください');
+      } else if (job.status === 'needs_review') {
+        // 🚨 成否不明。自動では作り直さない (AI 枠を使ったかもしれないので人が見る)
+        statusEl.textContent = '結果を受け取れませんでした。もう一度依頼してください';
+      } else if (job.status === 'failed') {
+        statusEl.textContent = '作れませんでした: ' + (job.error || '理由が残っていません');
+      } else {
+        statusEl.textContent = '';
+      }
+
+      const done = !!job && job.status === 'done' && job.output_text;
+      resultEl.hidden = !done;
+      if (done) {
+        if (textEl.value !== job.output_text) textEl.value = job.output_text;
+        lintEl.textContent = lintLine(job.lint);
+        const q = new URLSearchParams({ product_code: root.dataset.neCode || '', product_name: root.dataset.name || '' });
+        openEl.href = LP_TOOL + '?' + q.toString();
+      }
+      // 失敗したときも lint が残っていれば何がひっかかったかを出す (直す手がかり)。
+      // 🚨 出す場所は resultEl の**外**。中に書くと「できた」ときしか見えない (codex exec review P2)
+      const failing = !!job && job.status === 'failed' && job.lint && job.lint.ok === false;
+      failEl.hidden = !failing;
+      if (failing) {
+        const errs = (job.lint.errors || []).slice(0, 8).map((e) => '・' + (e.detail || e.label)).join('\n');
+        failEl.textContent = lintLine(job.lint) + (errs ? '\n' + errs : '')
+          + ((job.lint.errors || []).length > 8 ? '\n…ほか ' + ((job.lint.errors || []).length - 8) + ' 件' : '');
+        failEl.style.whiteSpace = 'pre-wrap';
+      }
+
+      // 測定台帳 (設計 §7.1b) に書き写す値。終わった job だけ出す
+      const terminal = !!job && ['done', 'failed', 'needs_review', 'cancelled'].includes(job.status);
+      measEl.hidden = !terminal;
+      if (terminal) {
+        measEl.textContent = '測定用 … job_id=' + job.id + ' / spec_id=' + job.spec_id
+          // 🚨 切り詰めない — 台帳に packet_hash を残すのは「この測定がどの材料で作られたか」を
+          // 後から突き合わせるためなので、頭 12 文字だけでは用をなさない (codex exec review P2)
+          + ' / packet_hash=' + String(job.packet_hash || '')
+          + ' / 所要秒=' + (job.elapsed_sec != null ? job.elapsed_sec : '?')
+          + ' / 期限内=' + (job.within_deadline === null ? '?' : (job.within_deadline ? 'はい' : 'いいえ'))
+          + ' / lint=' + (job.lint ? (job.lint.ok ? '通った' : 'ひっかかった') : 'なし')
+          + ' / 検品巡回=' + (job.review_rounds != null ? job.review_rounds : '?')
+          + ' / モデル=' + (job.model || 'なし (AI を呼ぶ前に止まった)')
+          + (job.model ? ' / 実モデル=' + (job.actual_model || '-')
+            + ' / モデル確認=' + (MODEL_CHECK_TEXT[job.model_check] || '確認中') : '')
+          + ' / 画像=' + (job.images || []).map((im) => im.label + ':' + im.file_id).join(',')
+          + ' / 状態=' + job.status;
+      }
+
+      if (running || checkingModel(job)) schedule(); else stop();
+    }
+
+    function stop() { if (timer) { clearTimeout(timer); timer = null; } }
+    function schedule() { stop(); timer = setTimeout(poll, 5000); }
+
+    async function poll() {
+      // 🚨 `timer = null` ではなく stop()。null にするだけだと、
+      //    待っている setTimeout を消さずに手放すことになり、
+      //    それが後から発火して**ポーリングが 2 本に増える** (codex exec review P2)
+      stop();
+      // タブが裏に回っている間は叩かない (5 秒おきが積み上がらないように)
+      if (document.hidden) { schedule(); return; }
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-compose', { headers: { Accept: 'application/json' } });
+        const json = await res.json();
+        if (json && json.ok) { render(json); return; }
+      } catch (e) { /* 一時的な通信断。次の回で拾う */ }
+      schedule();
+    }
+
+    btn.addEventListener('click', async () => {
+      if (posting) return;
+      posting = true;
+      btn.disabled = true;
+      statusEl.textContent = '依頼しています…';
+      if (!idemKey) idemKey = newKey();
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-compose', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idempotency_key: idemKey }),
+        });
+        const json = await res.json();
+        posting = false;
+        if (!res.ok || !json.ok) {
+          statusEl.textContent = json?.error || '依頼できませんでした';
+          btn.disabled = false;
+          return;
+        }
+        // 受け付けられた = このキーは使い切り。次に押すときは新しい依頼
+        idemKey = null;
+        render(json);
+      } catch (e) {
+        // 🚨 ここで idemKey を消さない。届いているかもしれないので、押し直しは同じキーで送る
+        posting = false;
+        btn.disabled = false;
+        statusEl.textContent = '依頼できたか分かりません。もう一度押してください (二重にはなりません)';
+      }
+    });
+
+    document.getElementById('lpc-guide-copy').addEventListener('click', async () => {
+      const r = document.getElementById('lpc-guide-result');
+      try { await navigator.clipboard.writeText(guideTextEl.value); r.textContent = 'コピーしました。ChatGPT 版の定型文の最後に貼ってください'; }
+      catch (e) { guideTextEl.select(); r.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }
+    });
+    document.getElementById('lpc-copy').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(textEl.value); copyResultEl.textContent = 'コピーしました。lp-tool に貼ってください'; }
+      catch (e) { textEl.select(); copyResultEl.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }
+    });
+
+    // 裏に回って戻ってきたら、待たずに 1 回見る。
+    // 🚨 待機中の setTimeout を**先に消す**。消さないと表裏を行き来するたびに
+    //    ポーリングが増えていく (codex exec review P2)
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && timer) { stop(); poll(); }
+    });
+
+    render(state);
   })();
   // 定型文ボタン (画像工程 v2)。文面はサーバー (lib/prompt-templates.js) が組み立て、画面は表示とコピーだけ
   (function initPromptButtons() {

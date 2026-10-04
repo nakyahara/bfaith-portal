@@ -10,7 +10,21 @@
  *      切替の段階・門の記録・NE の観測の書き込み。core.sku_costs の削除は渡すが、今日より前の行は DB の trigger が拒む (0051)
  *      core.suppliers の update (仕入先の行の共有の鍵は 0051 の関数 core.lock_suppliers_for_share = security definer の実行だけ)
  *   ロールの設定 = statement_timeout 20s・lock_timeout 10s・idle_in_transaction_session_timeout 60s (画面の接続の設定と同じ。画面が付け忘れても長く持たない)
- * master_ops      (手の操作 scripts/company-db/master-cutover.mjs が env COMPANY_DB_MASTER_OPS_URL で使う): ops.set_master_cutover_phase の実行と、段階・記録を読むだけ
+ *   ⑤-2a (0052・新商品の登録 lib/master-register.mjs・カードの知らせ lib/product-hub-outbox.mjs): 登録の関数 (ops.register_new_sku = 番号 → 登録の約束 →
+ *   商品・SKU・状態・仕入先・原価・構成の依頼・知らせ → done を関数の中で)・新しいコードの決まり (ops.new_sku_code_problem)・SKU を足した commit の確かめ
+ *   (ops.sku_registration_problem = 遅らせた trigger が呼び手の権限で呼ぶ)・知らせを借りる / 結果を書く関数 (ops.claim_card_events / finish_card_event) の実行。
+ *   🚨 渡さない: core.products / core.skus の insert・知らせの insert (登録の関数だけが書く)・ops.create_sku_registration の実行 (登録の関数の中だけ)・
+ *      登録の状態・履歴・backfill の印の表の書き込み (関数だけ)・知らせの状態 / 結果 / 借りの列の update (関数だけ・仮レビュー L7)
+ *   ⑤-2b (0053・新商品の NE 登録の CSV lib/master-reg-csv.mjs・JAN lib/master-write.mjs): 新規登録の CSV の表・実機の確かめ・仕入先の登録の状態を読む /
+ *   新規登録の CSV の関数 (ops.ne_reg_build / issue / declare / supersede / record_verified = 約束 reg_csv_*)・保存の中の ops.ne_reg_guard_on_save・
+ *   JAN の関数 (ops.edit_sku_jan = 約束 jan_edit)・NE の元のコードを要る分だけ読む関数 (ops.ne_reg_ne_codes) の実行。
+ *   🚨 渡さない: 新規登録の CSV の表・core.external_ids・仕入先の登録の状態の表の書き込み (関数だけ)・NE の元のコードの表の select・
+ *      仕入先の関数 (ops.create_supplier ほか = 書くロールは ⑥ で決める)・照合の確かめの 3 つ (watch_writer だけ = create-watch-roles.mjs)・関数の中の部品
+ *   ⑦-1 (0054・Amazon SKU の対応): 保存と削除の関数 (ops.save_amazon_sku_map / ops.delete_amazon_sku_map = 出品・対応・構成・保存の記録 done を関数の中で)・
+ *   「未登録」の一覧と売上の公開のそろいの関数 (注文の表は読ませない) の実行と、対応の表・ASIN (catalog_items) を読むだけ。
+ *   🚨 渡さない: core.amazon_sku_maps / core.listings / core.listing_components の書き込み (DELETE も = 墓標は消さない)・関数の中の部品 (ops.amazon_map_begin ほか)
+ * master_ops      (手の操作 scripts/company-db/master-cutover.mjs が env COMPANY_DB_MASTER_OPS_URL で使う): ops.set_master_cutover_phase の実行と、段階・記録を読むだけ。
+ *   ⑤-2a: 切替の日の backfill (ops.registration_backfill_plan / backfill_sku_registrations) と、登録をやめる (ops.transition_sku_registration) の実行・登録の状態を読む
  * master_observer (⑤-2 の夜間ロードが NE のセットの構成の観測を書く env COMPANY_DB_MASTER_OBSERVER_URL): ops.record_ne_set_observations の実行だけ
  * master_gate     (まとめのロール・ログインできない): ops.record_legacy_gate_ack の実行と、段階を読むだけ。ログインは場所ごとのメンバー (#1563 仮レビュー Low 3):
  *   master_gate_render (Render の ⑤-3 の古い入口の門 env COMPANY_DB_MASTER_GATE_RENDER_URL) / master_gate_minipc (miniPC の門 env COMPANY_DB_MASTER_GATE_MINIPC_URL)。
@@ -24,7 +38,7 @@
  *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs --dry-run   # 流す文だけ見る
  *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs             # 作る / 権限をそろえる (新しいロールのパスワードだけ、この画面に出る)
  *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs --rotate-password master_gate_render   # そのロールのパスワードだけ変える (何回でも付けられる)
- * 🚨 0051 まで migration を流した後に。migration で表を足したら流し直す (権限は表ごとに付ける)
+ * 🚨 0054 まで migration を流した後に (⑤-2b・⑦-1 の表・関数が無いと止まる)。migration で表を足したら流し直す (権限は表ごとに付ける)
  */
 import crypto from 'node:crypto';
 import { openPgClient } from './migrate.mjs';
@@ -52,6 +66,12 @@ export const MASTER_EDIT_SELECT = [
   'events.master_change_events',
   'ops.master_cutover_state', 'ops.master_edit_requests', 'ops.sku_component_requests', 'ops.sku_component_breaches', 'ops.ne_set_observations', 'ops.ne_set_observation_runs',
   'ops.ne_csv_exports', 'ops.ne_csv_export_rows', 'ops.master_decision_candidates', 'ops.master_decision_observations', 'ops.master_compare_runs',
+  // ⑤-2a (0052): 登録の状態 (画面に出す)・backfill の印 (新商品の登録の前提)・カードの知らせ (読むだけ)
+  'ops.master_registrations', 'ops.master_registration_backfill', 'ops.product_hub_outbox',
+  // ⑤-2b (0053): 新規登録の CSV (ファイル・試み・商品・行・照合の確かめ)・実機の確かめ・仕入先の登録の状態 (読むだけ。NE の元のコードは関数 ops.ne_reg_ne_codes で)
+  'ops.ne_reg_exports', 'ops.ne_reg_attempts', 'ops.ne_reg_export_items', 'ops.ne_reg_export_rows', 'ops.ne_reg_checks', 'ops.ne_csv_verified', 'ops.supplier_registrations',
+  // ⑦-1 (0054): Amazon SKU の対応 (読むだけ)・ASIN
+  'core.amazon_sku_maps', 'core.catalog_items',
 ];
 /** 保存の経路で書く表・列 (lib/master-write.mjs の saveSku)。insert も列を絞る */
 export const MASTER_EDIT_WRITE = [
@@ -62,7 +82,40 @@ export const MASTER_EDIT_WRITE = [
   ['insert (request_id, company_id, operation, target_code, sku_id, actor_id, payload_hash, status, result, error, started_at)', 'ops.master_edit_requests'],
   ['insert (company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, edit_request_id), update (status, closed_at, closed_by, close_reason)', 'ops.sku_component_requests'],
   ['update (status, closed_at, closed_by, close_reason)', 'ops.sku_component_breaches'],
+  // ⑤-2a (0052): 新商品の商品・SKU・カードの知らせの insert は渡さない (登録の関数 ops.register_new_sku だけが書く)
 ];
+/** ⑤-2a (0052): 画面のロールが実行する関数 (security definer) */
+export const REGISTER_FUNCTION = 'ops.register_new_sku(uuid, text, text, jsonb, text, jsonb)';
+export const REGISTER_EDIT_FUNCTIONS = Object.freeze([REGISTER_FUNCTION, 'ops.new_sku_code_problem(text)', 'ops.sku_registration_problem(bigint, text)',
+  'ops.claim_card_events(text, text, uuid, bigint, integer, integer, integer)', 'ops.finish_card_event(uuid, text, text, jsonb, text)']);
+/** ⑤-2a (0052): 運用のロールが実行する関数 (切替の日の backfill・登録をやめる) と読む表 */
+export const REGISTER_OPS_FUNCTIONS = Object.freeze(['ops.registration_backfill_plan()', 'ops.backfill_sku_registrations(integer, text, text, text)',
+  'ops.transition_sku_registration(bigint, text, text, text, text, jsonb, text)']);
+export const REGISTER_OPS_SELECT = Object.freeze(['ops.master_registrations', 'ops.master_registration_events', 'ops.master_registration_backfill']);
+/** ⑤-2a (0052): だれにも渡さない (夜間ロード = 持ち主だけ・状態の行は登録の関数の中だけ) */
+export const REGISTER_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.quarantine_unregistered_skus(text)', 'ops.create_sku_registration(bigint, text, text, text)']);
+/** ⑤-2b (0053): 画面のロールが実行する関数 (security definer = 約束を書くのも表に書くのも関数の中だけ・#1571 R1 High 3) */
+export const REG_CSV_EDIT_FUNCTIONS = Object.freeze(['ops.ne_reg_build(jsonb, bytea)', 'ops.ne_reg_issue(uuid, text, jsonb, bigint)',
+  'ops.ne_reg_declare(uuid, text, jsonb, bigint, text, text, text, timestamptz, text)', 'ops.ne_reg_supersede(uuid, text, jsonb, bigint, text, text)',
+  'ops.ne_reg_guard_on_save(bigint[], text, text)', 'ops.ne_reg_record_verified(uuid, text, jsonb, text, text, text, text, text, bigint)',
+  'ops.edit_sku_jan(uuid, text, text, jsonb, bigint, jsonb, jsonb)', 'ops.ne_reg_ne_codes(text[])']);
+/** ⑤-2b (0053): だれにも渡さない (関数の中の部品・trigger・仕入先の関数 = 書くロールは ⑥ で決める)。照合の確かめの 3 つは watch_writer (create-watch-roles.mjs) */
+export const REG_CSV_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.ne_reg_lock_skus(bigint[])', 'ops.ne_reg_lock_export(bigint)', 'ops.ne_reg_export_skus(bigint)',
+  'ops.ne_reg_canonical(bigint, date)', 'ops.ne_reg_supersede_built(bigint[], text, text)', 'ops.ne_reg_observation_hash(text)',
+  'ops.reg_write_gate(jsonb, text[])', 'ops.open_reg_write(text, uuid, text, text, jsonb, bigint, bigint[], bigint[], text, jsonb)', 'ops.close_reg_write(jsonb, text)', 'ops.reg_hash(jsonb)',
+  'ops.guard_reg_csv_write()', 'ops.guard_reg_csv_live()', 'core.guard_master_edit_jan()',
+  'ops.create_supplier(uuid, text, text, jsonb, text, text, text, integer)', 'ops.declare_supplier_in_ne(uuid, text, jsonb, text, text, text)',
+  'ops.deactivate_supplier(uuid, text, text, jsonb, text, text)',
+  'ops.snapshot_ne_reg_targets(text)', 'ops.record_ne_registration_observations(jsonb)', 'ops.seal_ne_registration_run(text, text, text)', 'ops.record_ne_registration_check(text)']);
+/** ⑤-2b (0053): 読むだけで、ほかのロールの一覧に入らない表 (流し直しのときに外す) */
+export const REG_CSV_OTHER_TABLES = Object.freeze(['ops.supplier_registration_events', 'ops.v_ne_reg_targets', 'ops.ne_reg_compare_targets', 'ops.ne_reg_compare_runs', 'ops.ne_reg_compare_observations',
+  'ops.ne_reg_compare_receipts', 'ops.master_ne_codes', 'ops.master_ne_code_mark']);
+/** ⑦-1 (0054): 画面のロールが実行する関数 (Amazon SKU の対応の保存・削除・未登録の一覧・売上の公開のそろい) */
+export const AMAZON_MAP_EDIT_FUNCTIONS = Object.freeze(['ops.save_amazon_sku_map(uuid, text, text, jsonb, text, jsonb)', 'ops.delete_amazon_sku_map(uuid, text, text, jsonb, text, jsonb)',
+  'ops.amazon_map_unmapped_recent(date, integer)', 'ops.amazon_map_sales_coverage(date, integer)']);
+/** ⑦-1 (0054): だれにも渡さない (保存の関数の中の部品・不変条件・守り) */
+export const AMAZON_MAP_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.amazon_map_begin(text, uuid, text, text, jsonb, text, jsonb)', 'ops.amazon_map_components(jsonb)',
+  'core.amazon_map_problem(bigint)', 'core.check_amazon_map_invariant()', 'core.guard_amazon_map_writer()', 'ops.guard_amazon_map_write()', 'ops.guard_master_edit_request_listing()']);
 export const CUTOVER_FUNCTION = 'ops.set_master_cutover_phase(text, text, jsonb, text)';
 export const OBSERVE_FUNCTION = 'ops.record_ne_set_observations(jsonb)';
 export const ACK_FUNCTION = 'ops.record_legacy_gate_ack(text, text, text, jsonb, text, text, integer, timestamptz, boolean, text)';
@@ -98,21 +151,30 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   }
   for (const [role, group] of Object.entries(MEMBER_OF)) s.push(`grant ${group} to ${role}`);
   // 前に付けた権限を外してから付け直す (流し直しで広い権限が残らない)
-  for (const t of new Set([...MASTER_EDIT_SELECT, ...MASTER_EDIT_WRITE.map(([, t2]) => t2), 'events.master_change_events', 'ops.master_legacy_gate_acks', 'ops.master_legacy_manifests', 'ops.master_cutover_events', 'ops.master_write_sessions', 'ops.master_cutover_prereq_checks'])) {
+  for (const t of new Set([...MASTER_EDIT_SELECT, ...MASTER_EDIT_WRITE.map(([, t2]) => t2), 'events.master_change_events', 'ops.master_legacy_gate_acks', 'ops.master_legacy_manifests', 'ops.master_cutover_events',
+    'ops.master_write_sessions', 'ops.master_cutover_prereq_checks', ...REGISTER_OPS_SELECT, ...REG_CSV_OTHER_TABLES])) {
     s.push(`revoke all on ${t} from ${all}`);
   }
-  for (const f of [CUTOVER_FUNCTION, OBSERVE_FUNCTION, ACK_FUNCTION, LOCK_SUPPLIERS_FUNCTION, BEGIN_WRITE_FUNCTION]) s.push(`revoke all on function ${f} from public, ${all}`);
+  for (const f of [CUTOVER_FUNCTION, OBSERVE_FUNCTION, ACK_FUNCTION, LOCK_SUPPLIERS_FUNCTION, BEGIN_WRITE_FUNCTION, ...REGISTER_EDIT_FUNCTIONS, ...REGISTER_OPS_FUNCTIONS, ...REGISTER_OWNER_ONLY_FUNCTIONS,
+    ...REG_CSV_EDIT_FUNCTIONS, ...REG_CSV_OWNER_ONLY_FUNCTIONS, ...AMAZON_MAP_EDIT_FUNCTIONS, ...AMAZON_MAP_OWNER_ONLY_FUNCTIONS]) {
+    s.push(`revoke all on function ${f} from public, ${all}`);
+  }
   // master_edit
   for (const sc of ['core', 'ops', 'events']) s.push(`grant usage on schema ${sc} to master_edit`);
   for (const t of MASTER_EDIT_SELECT) s.push(`grant select on ${t} to master_edit`);
   for (const [priv, t] of MASTER_EDIT_WRITE) s.push(`grant ${priv} on ${t} to master_edit`);
   s.push(`grant execute on function ${LOCK_SUPPLIERS_FUNCTION} to master_edit`);
   s.push(`grant execute on function ${BEGIN_WRITE_FUNCTION} to master_edit`);
+  for (const f of REGISTER_EDIT_FUNCTIONS) s.push(`grant execute on function ${f} to master_edit`);
+  for (const f of REG_CSV_EDIT_FUNCTIONS) s.push(`grant execute on function ${f} to master_edit`);
+  for (const f of AMAZON_MAP_EDIT_FUNCTIONS) s.push(`grant execute on function ${f} to master_edit`);
   s.push('grant usage on sequence core.master_version_seq to master_edit');   // version の既定値・0026 の bump_master_version の nextval (呼び手の権限)
   // master_ops
   s.push('grant usage on schema ops to master_ops');
   for (const t of ['ops.master_cutover_state', 'ops.master_cutover_events', 'ops.master_legacy_gate_acks', 'ops.master_legacy_manifests']) s.push(`grant select on ${t} to master_ops`);
   s.push(`grant execute on function ${CUTOVER_FUNCTION} to master_ops`);
+  for (const t of REGISTER_OPS_SELECT) s.push(`grant select on ${t} to master_ops`);
+  for (const f of REGISTER_OPS_FUNCTIONS) s.push(`grant execute on function ${f} to master_ops`);
   // master_observer
   s.push('grant usage on schema ops to master_observer');
   s.push(`grant execute on function ${OBSERVE_FUNCTION} to master_observer`);

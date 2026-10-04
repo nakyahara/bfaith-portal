@@ -27,6 +27,7 @@ import {
 } from '../fba-replenishment/inbound-plans.js';
 import { syncInboundHistory } from '../fba-replenishment/inbound-history.js';
 import { syncSkuMappings } from '../fba-replenishment/sheets-sync.js';
+import { isSheetlessIoRequested, SHEET_SYNC_GONE_MESSAGE } from '../fba-replenishment/sheetless-mode.js';
 import { generateRecommendations } from '../fba-replenishment/calculation-engine.js';
 import { nextInboundCache } from '../fba-replenishment/inbound-state.js';
 
@@ -36,6 +37,8 @@ import { acquireLock, releaseLock, heartbeatLock } from './job-locks.js';
 import { refreshFbaLive } from './refresh-fba-live.js';
 import { buildProductManagementSnapshot } from './build-product-management-snapshot.js';
 import { syncPmlSnapshotOnly } from './sync-to-render.js';
+import { runPmlFbaRefresh } from './pml-fba-refresh.js';
+import { readPublishGate } from './publish-gate.js';
 
 // db.jsは default export + named exports の混在なので動的importで対応
 let db;
@@ -114,7 +117,7 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
         // FNSKU 更新 (RESTOCK からも取れる)
         const fnskuRows = normalizedRestock
           .filter(r => r.fnsku && r.amazon_sku)
-          .map(r => ({ sku: r.amazon_sku, fnsku: r.fnsku }));
+          .map(r => ({ sku: r.amazon_sku, fnsku: r.fnsku, asin: r.asin || null }));   // asin は Sheet なしのモードのときだけ使う (⑦-F)
         if (fnskuRows.length > 0) db.updateFnskuBatch(fnskuRows);
       }
 
@@ -143,7 +146,7 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
         // PLANNING報告に含まれる全SKUについて現在のFNSKUを明示同期（nullなら明示的にクリア）
         const fnskuRows = results.planning
           .filter(r => r['sku'])
-          .map(r => ({ sku: r['sku'], fnsku: r['fnsku'] || null }));
+          .map(r => ({ sku: r['sku'], fnsku: r['fnsku'] || null, asin: r['asin'] || null }));   // asin は Sheet なしのモードのときだけ使う (⑦-F)
         if (fnskuRows.length > 0) db.syncFnskuBatch(fnskuRows);
       }
 
@@ -255,27 +258,9 @@ router.post('/pml/fba-refresh', rateLimitMiddleware('sp-api'), async (req, res) 
     job = createJob('pml-fba-refresh', async (updateProgress) => {
       const hb = setInterval(() => { try { heartbeatLock(wdb, lock); } catch {} }, 60 * 1000);
       try {
-        updateProgress({ step: 'fetch-restock', message: 'AmazonからRESTOCK在庫を取得中…(数分かかります)' });
-        const live = await refreshFbaLive();
-
-        updateProgress({ step: 'build', message: `スナップショット再生成中 (FBA ${live.row_count}件)…` });
-        const built = await buildProductManagementSnapshot({ fbaSource: 'live' });
-        if (!built.ok) {
-          throw new Error(`snapshot生成に失敗 (status=${built.status}): ${(built.reasons || []).join('; ')}`);
-        }
-
-        updateProgress({ step: 'sync', message: 'Renderへ反映中…' });
-        const synced = await syncPmlSnapshotOnly();
-        if (synced.state !== 'sent') {
-          throw new Error(`Render同期に失敗/スキップ: ${synced.reason || synced.state}`);
-        }
-
-        return {
-          fba_fetched_at: live.fetched_at,
-          fba_row_count: live.row_count,
-          pml_run_id: built.run_id,
-          synced_count: synced.count,
-        };
+        // Company DB の写しの反映が世代と違う朝は作らない・送らない (daily-sync・再試行と同じ証跡 = publish-gate.js。#1564 の見直し M-2)
+        return await runPmlFbaRefresh({ updateProgress, refresh: refreshFbaLive, build: buildProductManagementSnapshot, sync: syncPmlSnapshotOnly,
+          gate: () => readPublishGate({ db: wdb }) });
       } finally {
         clearInterval(hb);
         releaseLock(wdb, lock);
@@ -401,6 +386,8 @@ router.get('/sku-mappings', dbHandler(async (req, res, db) => {
 }));
 
 router.post('/sync-sku-mappings', async (req, res) => {
+  // Sheet なしのモード (⑦-F): 手の Sheet 同期の口は止める。miniPC は計算をしないので FBA_SHEETLESS_IO=1 で止める (Codex PR R1 Medium 1)
+  if (isSheetlessIoRequested()) return errorResponse(res, { status: 410, error: 'SHEETLESS_MODE', message: SHEET_SYNC_GONE_MESSAGE, requestId: req.requestId });
   try {
     const result = await syncSkuMappings();
     okResponse(res, { result });
@@ -510,13 +497,34 @@ router.get('/recommendations-inbound-cache', async (req, res) => {
 
 // ミニPC→Render 同期用: 最新日付のPLANNINGスナップショットとFNSKU一覧（全SKU、null含む）を返す
 router.get('/sync/latest-planning', dbHandler(async (req, res, db) => {
+  // Sheet なしのモードの Render は ?fnsku_source=attrs で頼む (⑦-F): FNSKU は fba_sku_attrs からだけ返す (sku_mapping の値を渡さない)。
+  //   🚨 miniPC が Sheet の入出力を止めている (FBA_SHEETLESS_IO) ときは、頼み方に関わらず fba_sku_attrs から返す
+  //      (sku_mapping はもう FNSKU を書かない = 凍結。古い Render が ? を付けずに頼んでも古い FNSKU を渡さない。Codex PR R3 Medium 1)
+  //   どちらでもなければ今までどおり
+  const ioOn = isSheetlessIoRequested();
+  const fromAttrs = req.query?.fnsku_source === 'attrs' || ioOn;
+  // miniPC の fba.db に一回限りの移行の印が無い = 起動のたびに Sheet の値が fba_sku_attrs に入る / 最後の backfill が済んでいない
+  //   → fba_sku_attrs をまだ正にできない (fnsku_ready: false。Render は反映しない・9:40 は partial。Codex PR R2 Medium 1)
+  const attrsReady = fromAttrs ? !!db.getBackfillMark() : null;
+  // 🚨 入出力を止めたのに印が無い = fba_sku_attrs が欠けているかもしれない → どの Render にも FNSKU を渡さない (503 = 引き取りそのものが失敗)
+  if (ioOn && !attrsReady) {
+    errorResponse(res, { status: 503, error: 'FBA_SHEETLESS_NOT_READY', message: 'miniPC は FBA_SHEETLESS_IO=1 だが fba.db に一回限りの移行の印が無い。scripts/fba-sheetless-backfill-once.mjs を IO を外して流してから入れ直す', requestId: req.requestId });
+    return undefined;
+  }
   const rows = db.getLatestSnapshots();
   const snapshotDate = rows[0]?.snapshot_date || null;
-  const mappings = db.getSkuMappings();
+  // fba_sku_attrs から返すときは、大小文字・前後の空白だけ違う SKU を 1 行にまとめる。FNSKU が食い違えば渡さない (503。Codex PR R4 Medium)
+  const attrsSync = fromAttrs ? db.getFbaSkuAttrsForSync() : null;
+  if (attrsSync && attrsSync.conflicts.length) {
+    errorResponse(res, { status: 503, error: 'FBA_SKU_ATTRS_CONFLICT', message: `fba_sku_attrs に大小文字だけ違う SKU で FNSKU が食い違う組が ${attrsSync.conflicts.length} 組ある: ${attrsSync.conflicts.slice(0, 10).map((c) => c.rows.join(' ≠ ')).join(' | ')}。scripts/fba-sheetless-backfill-once.mjs の説明の手順 (b) で 1 行にする (印は消さない・スクリプトは流さない)`, requestId: req.requestId });
+    return undefined;
+  }
   // 全SKU対象（fnsku=nullも含む）。Render側で現状に合わせてupsert（null時はクリア）
-  const fnskus = mappings
-    .filter(m => m.amazon_sku)
-    .map(m => ({ sku: m.amazon_sku, fnsku: m.fnsku || null }));
+  const fnskus = fromAttrs
+    ? attrsSync.rows.map(a => ({ sku: a.amazon_sku, fnsku: a.fnsku || null }))
+    : db.getSkuMappings()
+      .filter(m => m.amazon_sku)
+      .map(m => ({ sku: m.amazon_sku, fnsku: m.fnsku || null }));
   // RESTOCK / PLANNING_LATEST も同送 (Render側で saveRestockLatest / savePlanningLatest される)
   const restockRows = typeof db.getRestockLatest === 'function' ? db.getRestockLatest() : [];
   const planningLatestRows = typeof db.getPlanningLatest === 'function' ? db.getPlanningLatest() : [];
@@ -526,6 +534,10 @@ router.get('/sync/latest-planning', dbHandler(async (req, res, db) => {
     fnskus,
     restock_rows: restockRows,
     planning_latest_rows: planningLatestRows,
+    ...(fromAttrs ? {
+      fnsku_source: 'fba_sku_attrs', fnsku_ready: attrsReady,
+      ...(attrsReady ? {} : { fnsku_not_ready_reason: 'miniPC の fba.db に一回限りの移行の印が無い (scripts/fba-sheetless-backfill-once.mjs を流してから FBA_SHEETLESS_IO=1)' }),
+    } : {}),
   };
 }));
 

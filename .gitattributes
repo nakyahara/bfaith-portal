@@ -7,6 +7,13 @@
 # bash shim for the nightly runner: CRLF would append \r to the last argument
 scripts/ph-nightly/phq text eol=lf
 scripts/ph-nightly/phreview text eol=lf
+scripts/ph-nightly/phlp text eol=lf
+scripts/ph-nightly/phlpreview text eol=lf
+# LP 構成の fixture と移植したパーサーは **バイトが契約**。
+# パーサーは配信元との sha256 一致をテストで見ているし、fixture は
+# パース結果を固定するためのものなので、各 PC の core.autocrlf に左右させない。
+apps/product-hub/lib/lp-parser.js text eol=lf
+scripts/fixtures/lp-compose/*.md text eol=lf
 # ロジザードの自動化の正本 (tools/logizard-automation)。各 PC の C:	oolslogizard-automation に写して使う。
 # 今の各 PC のファイルは LF = 写した後もバイトが同じになるように LF に固定する (.bat は上の決まりで CRLF のまま)。
 tools/logizard-automation/*.js text eol=lf

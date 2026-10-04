@@ -16,6 +16,7 @@ import { getDB } from './db.js';
 
 import { getTask, getTaskByDestination, safeLogTaskEvent } from './tasks-db.js';
 import { ensureBatchForTask } from './batches.js';
+import { materialsOf } from '../../lib/iroha-materials.js';
 import { normSupplierCode } from '../purchase-orders/db.js';
 
 const utcNow = () => new Date().toISOString();
@@ -69,6 +70,8 @@ export function createTaskForDestination(dest, { actor = null, barcode = null } 
     '有効期限': dest.expiry_date || null, destination_id: dest.id, source: 'inbound_check',
   };
   const snapshot = e.wm ? {
+    // 資材は配列が正本。material_code は 1 件目の写し (古い画面・外部委託の検証がこれを読む)
+    materials: materialsOf(e.wm),
     material_code: e.wm.material_code ?? null, storage_container: e.wm.storage_container ?? null,
     units_per_container: e.wm.units_per_container ?? null, process_count: e.wm.process_count ?? null,
     note: e.wm.note ?? null, video_url: e.wm.video_url ?? null, version: e.wm.version ?? null,

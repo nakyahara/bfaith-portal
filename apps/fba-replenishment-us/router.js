@@ -117,6 +117,10 @@ export async function loadJpInputs() {
   if (!jp.isFbaDbReady()) {
     throw Object.assign(new Error('日本の FBA在庫補充の DB がまだ準備中です (起動直後)。少し待ってから読み直してください'), { code: 'JP_DB_NOT_READY' });
   }
+  // Sheet なしのモード (⑦-F・Codex PR R1 Medium 4): 日本の計算と同じ止め (設定・SKU の対応・商品管理リスト) を先に通す。
+  //   欠けていれば配分を出さない (Sheet に戻らない・日本の画面と同じ理由)。モードなしは何も読まない = 今までどおり
+  const block = jp.getSheetlessCalcBlock();
+  if (block) throw Object.assign(new Error(block), { code: 'FBA_SHEETLESS_BLOCKED' });
   const { calcTargetDays, mergeRestockWithPlanning } = await import('../fba-replenishment/calculation-engine.js');
   const { norm } = await import('./allocation.js');
   const settings = jp.getSettings();
@@ -153,7 +157,7 @@ router.get('/api/allocation', async (req, res) => {
     const { view, alloc } = await computeAll(payload);
     res.json({ ok: true, ...alloc, us_slips: summarizeUsReserved(alloc._usReserved) });
   } catch (e) {
-    const status = e.code === 'JP_DB_NOT_READY' ? 503 : 500;
+    const status = (e.code === 'JP_DB_NOT_READY' || e.code === 'FBA_SHEETLESS_MISCONFIG' || e.code === 'FBA_SHEETLESS_BLOCKED') ? 503 : 500;   // Sheet なしのモードの止め (⑦-F) も 503
     res.status(status).json({ ok: false, error: e.code || 'allocation_failed', message: e.message });
   }
 });
@@ -278,6 +282,7 @@ router.post('/api/ne-csv', express.json({ limit: '64kb' }), async (req, res) => 
     if (e.code === 'US_NE_REJECTED') return res.status(409).json({ ok: false, error: 'rejected', message: e.message });
     if (e.code === 'US_NE_REUSED') return res.status(409).json({ ok: false, error: 'request_reused', message: e.message });
     if (e.code === 'US_LEDGER_NOT_AVAILABLE') return res.status(503).json({ ok: false, error: 'not_available', message: e.message });
+    if (e.code === 'FBA_SHEETLESS_BLOCKED' || e.code === 'FBA_SHEETLESS_MISCONFIG') return res.status(503).json({ ok: false, error: e.code, message: e.message });   // ⑦-F
     return res.status(500).json({ ok: false, error: 'ne_csv_failed', message: e.message });
   }
 });

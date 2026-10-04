@@ -22,11 +22,19 @@
  *   月の手数料を mart.v_finance_account_fees_monthly と f_amazon_account_fees_monthly_v1 で。差の月 = 日次の財務のやり残し (amazon-finance-pending.json) /
  *   月の手数料のやり残し (amazon-account-fees-pending.json) に登録 = 次の daily-sync の build が作り直す。差が 1 回目 ⚠️・2 回続けば ❌
  *
+ * 🆕 2026-10-01 (D7b-1b-3・設計 = AI_reference CompanyDB構想/13 §3.1・D-66):
+ *   - 🚨 **送る回 (--incremental / --full) は coordinator (apps/warehouse/amazon-finance-coverage-run.js) の中だけ**。単独は dry-run・調べ (--reconcile など)・
+ *     人が 1 か月ずつ流すバックフィル (--from/--to = token の無い chunk = Render は complete を無効にする = coverage に影響しない) だけ
+ *   - 決済ごとに採った文書の版の行だけを変換する (filterSelectedRows。版の無い行があれば止める)
+ *   - --incremental は watermark に加えて「読み直す注文」(amazon_settlement_dirty_orders) を必ず読む
+ *   - coordinator は coverage = { generation, runToken, ... } を渡す: 全部の chunk に coverage_generation / run_token・
+ *     走査の同じ読み取りの取引の中で manifest (onScanSnapshot)・送った後に読み直す注文の記録を R 以下だけ消す・complete (finalize)
+ *
  * 使い方 (miniPC。F2b-2 = 手で流す。daily-sync には F2b-3 で入れる):
  *   node apps/company-db/push/amazon-finance.mjs --from 2026-08-01 --to 2026-08-31 --dry-run     → 送らずに件数・1 注文の最大の行数・最大の JSON・拾われない金額
  *   node apps/company-db/push/amazon-finance.mjs --from 2026-08-01 --to 2026-08-31               → 1 か月だけ送る (上限の env が要る)
  *   node apps/company-db/push/amazon-finance.mjs --reconcile [--all]                             → 突き合わせ (差があれば exit 1)
- *   node apps/company-db/push/amazon-finance.mjs --incremental --require-backfilled | --full --require-backfilled   (F2b-3 の daily-sync)
+ *   node apps/company-db/push/amazon-finance.mjs --incremental --require-backfilled --dry-run | --full --require-backfilled --dry-run   (🆕 送る回は coordinator の中だけ = 単独は dry-run)
  *   node apps/company-db/push/amazon-finance.mjs --mark-backfilled                                → 全期間の突き合わせが一致したら完了印
  *   node apps/company-db/push/amazon-finance.mjs --reset-ledger                                   → 台帳の指紋を空にする
  * env: DATA_DIR / RENDER_MIRROR_URL / MIRROR_SYNC_KEY / CDB_PUSH_CHUNK / CDB_DB_LIMIT_BYTES (必須・送るとき) / CDB_FINANCE_ROW_BYTES / CDB_FINANCE_REPLACE_FACTOR / CDB_WAL_ALLOWANCE_BYTES / CDB_CAPACITY_MARGIN_BYTES
@@ -45,6 +53,10 @@ import { validateFinanceChunk, FINANCE_ORDER_NO_RE } from '../ingest/order-finan
 import { pseudoOrderNo, isPseudoOrderNo, PSEUDO_PREFIX } from '../finance/order-finance-checksum.mjs';
 import { aggregateOrderFinance, financePayload, isRealDate, RAW_COLUMNS, AMAZON_FINANCE_TRANSFORM_VERSION, FINANCE_MALL, FINANCE_SCOPE } from './amazon-finance-transform.mjs';
 import { addPendingMonths, ACCOUNT_FEES_PENDING_FILE, PENDING_FILE } from '../../warehouse/amazon-finance-months.js';
+import { filterSelectedRows } from './amazon-finance-transform.mjs';
+import { selectDocumentVersions, assertDocumentVersionsReady, VERSION_SELECT_SQL } from '../../warehouse/amazon-settlement-versions.js';
+import { createReceiptDigester } from '../finance/coverage-manifest.mjs';
+import { financeCoordinatorEnabled, FINANCE_COORDINATOR_ENV, assertLegacyAllowedRemote, coverageEverRan } from '../../warehouse/finance-coordinator-switch.js';
 
 export const FINANCE_KIND = `order_finance:${FINANCE_MALL}`;
 export const FINANCE_FLOOR = '2026-01-01';            // policy (0043) の始まり = 決済の行の始まり
@@ -78,11 +90,17 @@ export const SQL = {
   maxIngested: `SELECT MAX(ingested_at) AS m FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_ingested`,
   byOrder: `SELECT ${COLS} FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_order WHERE amazon_order_id = ?`,
   byPseudo: `SELECT ${COLS} FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_economic WHERE economic_date = ? AND (amazon_order_id IS NULL OR amazon_order_id = '')`,
-  // 注文番号の無い行の計上日 (読めない日付を見つける = §4.5b)。疑似注文の鍵の元
-  pseudoDates: `SELECT economic_date AS d, COUNT(*) AS n, MIN(id) AS example_id FROM raw_amazon_settlement_lines WHERE amazon_order_id IS NULL OR amazon_order_id = '' GROUP BY economic_date`,
+  // 注文番号の無い行の計上日 (読めない日付を見つける = §4.5b)。疑似注文の鍵の元。決済・版ごとに分ける (読めない日付は採った版の行だけで数える = #1567 Codex R13 Medium 1)
+  pseudoDates: `SELECT economic_date AS d, source_settlement_id AS s, document_version_seq AS v, COUNT(*) AS n, MIN(id) AS example_id FROM raw_amazon_settlement_lines
+    WHERE amazon_order_id IS NULL OR amazon_order_id = '' GROUP BY economic_date, source_settlement_id, document_version_seq ORDER BY economic_date`,
   allOrders: `SELECT DISTINCT amazon_order_id AS o FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_order WHERE amazon_order_id IS NOT NULL AND amazon_order_id <> ''`,
   ingestedSince: `SELECT DISTINCT amazon_order_id AS o, economic_date AS d FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_ingested WHERE ingested_at >= ?`,
   economicRange: `SELECT DISTINCT amazon_order_id AS o, economic_date AS d FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_economic WHERE economic_date BETWEEN ? AND ?`,
+  // 🆕 D7b-1b-3: 文書の版 (決済ごとに採る版を JS で決める)・生の表の版 R・読み直す注文
+  //   🚨 採る版に要る列は全部 (VERSION_SELECT_COLUMNS。header_count が無いと見出し 0 行の新しい版を採り、SQLite の view と別の版を送っていた = #1567 Codex R2 High 1)
+  versions: VERSION_SELECT_SQL,
+  revision: `SELECT revision FROM amazon_settlement_source_revision WHERE id = 1`,
+  dirty: `SELECT mall_order_no AS o, revision AS r FROM amazon_settlement_dirty_orders`,
 };
 
 /** watermark ('YYYY-MM-DD HH:MM:SS' UTC) の days 日前 (同じ書き方) */
@@ -101,6 +119,31 @@ function keyMonthsStore(ledger) {
   return {
     get: (key) => { const r = get.get(ledger.kind, key); return r ? r.months.split(',').filter(Boolean) : []; },
     putMany: (entries) => ledger.db.transaction(() => { for (const [k, ms] of entries) put.run(ledger.kind, k, ms.join(',')); })(),
+    /** entries = [鍵, 月をつないだ文字 (putMany と同じ ms.join(','))] を 1 つずつ (changedSpool から・#1567 メモリ) */
+    putManyJoined: (entries) => ledger.db.transaction(() => { for (const [k, joined] of entries) put.run(ledger.kind, k, joined); })(),
+  };
+}
+
+/**
+ * 変わった注文の「鍵ごとの月」(送る前に台帳へ) と「容量の重さ」(chunk の見込み) を溜める (#1567 メモリ: 送り直しが多い回に 51 万件の配列と Map を持たない)。
+ *   名前の無い一時の SQLite (閉じると消える)。同じ鍵が 2 回来たら後の値 (前の配列 → putMany の上書き・Map の set と同じ)。送る回だけ使う (dry-run は数だけ)
+ *   put(鍵, 月をつないだ文字, 重さ) / weight(鍵) → 重さ | undefined / entries() → [鍵, 月をつないだ文字] (入れた順) / close()
+ */
+export function changedSpool() {
+  const db = new Database('');
+  db.pragma('journal_mode = OFF');
+  db.pragma('synchronous = OFF');
+  db.exec('create table c (key text primary key, months text not null, w integer not null)');
+  const put = db.prepare('insert into c (key, months, w) values (?, ?, ?) on conflict (key) do update set months = excluded.months, w = excluded.w');
+  const getW = db.prepare('select w from c where key = ?').pluck();
+  const all = db.prepare('select key, months from c order by rowid');
+  db.exec('begin');
+  let closed = false;
+  return {
+    put: (key, joined, w) => { put.run(key, joined, w); },
+    weight: (key) => getW.get(key),
+    *entries() { for (const r of all.iterate()) yield [r.key, r.months]; },
+    close() { if (!closed) { closed = true; try { db.close(); } catch { /* 一時の DB */ } } },
   };
 }
 
@@ -122,6 +165,52 @@ export function retryStore(ledger) {
   };
 }
 
+/** 指紋 '' (追跡するだけ・未確認) の鍵。ctx.fps = loadFingerprints の Map か fingerprintLookup の口 (#1567 メモリ) */
+function* emptyFpKeys(fps) {
+  if (typeof fps.emptyKeys === 'function') { yield* fps.emptyKeys(); return; }
+  for (const [k, fp] of fps) if (fp === '') yield k;
+}
+
+/**
+ * 受領記録を溜める (#1567 メモリ: 51 万件の物の配列 (約 90 MB) を持たない)。名前の無い一時の SQLite (ディスク・閉じると消える) に 1 行ずつ入れ、
+ *   summary() = mall_order_no の BINARY の順 (= UTF-8 のバイトの順 = cmpUtf8) に読み直して createReceiptDigester に足す = receiptDigest(配列) と同じ結果・同じ所で止まる
+ *   (同じ番号が 2 回・並びの崩れ・型の違いは digester が throw = coverage の理由 receipt_digest)。lines = 0 は入れない (receiptDigest も除く)
+ *   入れる前に型を見る (文字・文字・文字か null・数) = SQLite を通しても値が変わらない物だけ入れる。外れた物 (undefined・bigint・壊れた文字など) は覚えておいて
+ *   summary() で throw (build は止めない = 前の配列の形と同じく要約の所で止まる = coverage の理由 receipt_digest)。列に型を付けない = 入れた値のまま
+ *   push(r) / length / summary() (何度でも) / close()
+ */
+export function receiptSpool() {
+  const db = new Database('');
+  db.pragma('journal_mode = OFF');
+  db.pragma('synchronous = OFF');
+  db.exec('create table r (mall_order_no, set_checksum, transform_version, lines)');
+  const ins = db.prepare('insert into r (mall_order_no, set_checksum, transform_version, lines) values (?, ?, ?, ?)');
+  const sel = db.prepare('select mall_order_no, set_checksum, transform_version, lines from r order by mall_order_no');
+  db.exec('begin');
+  let n = 0, bad = null, closed = false;
+  return {
+    push(x) {
+      if (x && x.lines === 0) return n;
+      const str = (v) => typeof v === 'string' && v.isWellFormed();
+      if (!x || typeof x !== 'object' || !str(x.mall_order_no) || !str(x.set_checksum) || !(x.transform_version === null || str(x.transform_version)) || typeof x.lines !== 'number') {
+        if (!bad) bad = `受領記録の形が違う (${String(x && x.mall_order_no).slice(0, 40)})`;
+        return n;
+      }
+      ins.run(x.mall_order_no, x.set_checksum, x.transform_version, x.lines);
+      return ++n;
+    },
+    get length() { return n; },
+    summary() {
+      if (closed) throw new Error('受領記録の一時の表を閉じた後に要約を求めた');
+      if (bad) throw new Error(bad);
+      const d = createReceiptDigester();
+      for (const x of sel.iterate()) d.add(x);
+      return d.finish();
+    },
+    close() { if (!closed) { closed = true; try { db.close(); } catch { /* 一時の DB */ } } },
+  };
+}
+
 /**
  * 送る鍵を決めて 1 注文ずつ yield する generator の材料を作る (pipeline の iterate)。
  * sel = { mode: 'incremental' | 'full' | 'range', from, to, since (incremental の ingested_at の下限。null = 全部), extraKeys: [鍵] }
@@ -131,18 +220,35 @@ export function makeIterate(sel, run) {
     const byOrder = warehouse.prepare(SQL.byOrder).safeIntegers(true);
     const byPseudo = warehouse.prepare(SQL.byPseudo).safeIntegers(true);
     stats.maxIngested = warehouse.prepare(SQL.maxIngested).get().m ?? null;
+    // 🆕 D7b-1b-3: 同じ読み取りの取引の中で 生の表の版 R・決済ごとに採る版 (D-66) を決める。版の無い行があれば止める (黙って行を落とさない)
+    assertDocumentVersionsReady(warehouse);
+    stats.sourceRevision = Number(warehouse.prepare(SQL.revision).get()?.revision ?? 0);
+    const versions = warehouse.prepare(SQL.versions).all();
+    const selectedVersions = selectDocumentVersions(versions);
+    const selected = new Map([...selectedVersions].map(([k, v]) => [k, v.seq]));
+    stats.selectedVersions = selectedVersions; stats.versionCount = versions.length;
+    const pick = (rows) => filterSelectedRows(rows, selected);
     // ① 注文番号の無い行の計上日 = 疑似注文の鍵。読めない日付は「鍵の分からない不正な行」(§4.5b)
+    //   🆕 #1567 Codex R13 Medium 1: 読めない日付 (unkeyed = 疑似注文を全部止め・complete にしない) は **採った版の行だけ** で数える
+    //   (前は全部の版 = 採らない版 (退避の V1 など) の不正な行で、正しい採った版がそろっても complete にならなかった)。
+    //   本物の日付は今までどおり全部の版から拾う (= 旧い版にだけある疑似注文の日も読み直す = 墓石の候補)。版の分からない行は採った版と同じに数える (止める側)
     const valid = new Set();
-    stats.unkeyed = [];
+    const unkeyed = new Map();
     for (const r of warehouse.prepare(SQL.pseudoDates).all()) {
-      if (isRealDate(r.d)) valid.add(r.d);
-      else stats.unkeyed.push({ economic_date: r.d, n: r.n, example_id: r.example_id });
+      if (isRealDate(r.d)) { valid.add(r.d); continue; }
+      const sv = selected.get(r.s);
+      if (r.v != null && sv != null && Number(r.v) !== Number(sv)) continue;   // 採らない版の行 = 送らない = 止めない
+      if (r.v != null && sv == null && r.s != null) continue;                  // どの版も採られない決済 (決済 ID の決まらない版など) = 送らない
+      const u = unkeyed.get(r.d) || { economic_date: r.d, n: 0, example_id: r.example_id };
+      u.n += r.n; if (r.example_id < u.example_id) u.example_id = r.example_id;
+      unkeyed.set(r.d, u);
     }
+    stats.unkeyed = [...unkeyed.values()];
     // ② 選ぶ
     const orders = new Set(), dates = new Set();
     const addRow = (o, d) => { if (o == null || o === '') { if (valid.has(d)) dates.add(d); } else orders.add(o); };
     if (sel.mode === 'full' || (sel.mode === 'incremental' && sel.since == null)) {
-      for (const r of warehouse.prepare(SQL.allOrders).all()) orders.add(r.o);
+      for (const o of warehouse.prepare(SQL.allOrders).pluck().iterate()) orders.add(o);   // 1 行ずつ (51 万件の行の物の配列を作らない。#1567 メモリ)
       for (const d of valid) dates.add(d);
     } else if (sel.mode === 'incremental') {
       for (const r of warehouse.prepare(SQL.ingestedSince).all(sel.since)) addRow(r.o, r.d);
@@ -158,9 +264,16 @@ export function makeIterate(sel, run) {
     };
     // 読み直す鍵 (送れなかった・止めた・前の回に outbox に残った。#1534 Codex R1 High)
     for (const k of sel.extraKeys || []) addKey(k);
+    // 🆕 D7b-1b-3: 読み直す注文 (生の表の trigger・採る版が変わった) = どの mode でも読む (incremental は watermark に加えて必ず。R13 M1)
+    stats.dirtyOrders = 0;
+    // 🆕 #1567 メモリ: 「読み直す注文の記録を消してよい注文」(作れた・送るものが無い) は、この読み取りで記録があった注文だけ覚える
+    //   (前は作れた全部の注文 = 51 万件を覚えて、消すときに全部を DELETE に流した)。消す SQL は「この番号・版 R 以下」だけ = 記録の無い番号は何も消さない。
+    //   R 以下の記録は全部この読み取りで見えている (記録の trigger は先に版を上げる = 後から入る記録は R より大きい) = 消える行は前と同じ
+    run.dirtyOrderNos = new Set();
+    if (sel.mode !== 'range') for (const r of warehouse.prepare(SQL.dirty).all()) { run.dirtyOrderNos.add(r.o); addKey(financeKey(r.o)); stats.dirtyOrders++; }
     // 台帳で「追跡するだけ・未確認」(指紋 '') の鍵 = Render の復元で指紋を空にした・台帳を Render から取り戻した・--reset-ledger の後 → 全部読み直す (#1534 Codex R1 High)
     let unconfirmed = 0;
-    for (const [k, fp] of ctx.fps) if (fp === '') { addKey(k); unconfirmed++; }
+    for (const k of emptyFpKeys(ctx.fps)) { addKey(k); unconfirmed++; }
     stats.unconfirmed = unconfirmed;
     // ③ Render にだけある鍵 (--full。空の集合を送る)
     const renderOnly = [];
@@ -177,12 +290,24 @@ export function makeIterate(sel, run) {
     stats.pseudoBlocked = pseudoBlocked ? dates.size + renderOnly.filter(isPseudoOrderNo).length : 0;
     // 止めた疑似注文は全部「読み直す鍵」に残す (今回の窓・期間で選んだ分も。落とすと止めが解けた後に読み直されない。#1534 Codex R2 High)
     stats.blockedPseudoKeys = pseudoBlocked ? [...[...dates].map((d) => financeKey(pseudoOrderNo(d))), ...renderOnly.filter(isPseudoOrderNo).map(financeKey)] : [];
+    // 採った版の行が無い注文 (ほかの版にだけある・行が消えた) で、台帳にも Render にも無いもの = 送らない (空の集合の受領記録を作らない)
+    const known = (no) => ctx.fps.has(financeKey(no)) || !!(ctx.pre && ctx.pre.renderKeys && ctx.pre.renderKeys.has(no));
+    stats.skippedEmpty = 0;
+    // 送るものが無いと確かめた注文 (採った版に行が無く、台帳にも Render にも無い / 行が無く受け口の形でもない) = 読み直す注文の記録を消してよい (R1 Medium 1)。
+    //   消さないと毎回 dirty_left で complete にならない (API の版がある決済に手のファイルを積んだ・採る版が替わって旧い版にだけ未送信の注文があった)
+    stats.nothingToSend = [];
+    const nothing = (no) => { if (run.dirtyOrderNos.has(no)) stats.nothingToSend.push(no); };   // 記録のある注文だけ覚える (上の #1567 メモリ)
     for (const no of [...orders].sort()) {
-      const rows = byOrder.all(no);
-      if (!rows.length && !FINANCE_ORDER_NO_RE.test(no)) continue;   // 行が消えた不正な形の番号 = 受け口が受け取らない = Render に無い (空の集合も送れない)
+      const rows = pick(byOrder.all(no));
+      if (!rows.length && !FINANCE_ORDER_NO_RE.test(no)) { nothing(no); continue; }   // 行が消えた不正な形の番号 = 受け口が受け取らない = Render に無い (空の集合も送れない)
+      if (!rows.length && !known(no)) { stats.skippedEmpty++; nothing(no); continue; }
       yield { key: financeKey(no), orderNo: no, rows };
     }
-    if (!pseudoBlocked) for (const d of [...dates].sort()) yield { key: financeKey(pseudoOrderNo(d)), orderNo: pseudoOrderNo(d), rows: byPseudo.all(d) };
+    if (!pseudoBlocked) for (const d of [...dates].sort()) {
+      const no = pseudoOrderNo(d), rows = pick(byPseudo.all(d));
+      if (!rows.length && !known(no)) { stats.skippedEmpty++; nothing(no); continue; }
+      yield { key: financeKey(no), orderNo: no, rows };
+    }
     for (const no of renderOnly.sort()) {
       if (pseudoBlocked && isPseudoOrderNo(no)) continue;
       yield { key: financeKey(no), orderNo: no, rows: [], renderOnly: true };
@@ -215,6 +340,9 @@ export function makeBuild(run, transformVersion = AMAZON_FINANCE_TRANSFORM_VERSI
     }
     const fp = fingerprintOf(transformVersion, payload);
     if (ctx.fps.get(group.key) !== fp) run.noteChanged(group.key, lines, ctx.pre && ctx.pre.renderKeys ? ctx.pre.renderKeys.get(group.orderNo) : null);
+    // 🆕 D7b-1b-3: 作れた注文 (読み直す注文の記録を消せる候補)・受領記録 (lines > 0 だけ = receipt digest。墓石は入れない)
+    if (!run.dirtyOrderNos || run.dirtyOrderNos.has(group.orderNo)) run.built.add(group.orderNo);   // 記録のある注文だけ (makeIterate の #1567 メモリ)
+    if (lines.length > 0) run.receipts.push({ mall_order_no: group.orderNo, set_checksum: payload.header.set_checksum, transform_version: payload.header.transform_version, lines: lines.length });
     return { key: group.key, payload, n_lines: lines.length };
   }
 }
@@ -272,9 +400,19 @@ export async function fetchRenderKeys(fetchImpl, { base, syncKey, mustOwn = () =
  * 送る (本体)。戻り値 = runPush の結果 + { finance: { ... } }
  * mode = 'incremental' | 'full' | 'range'
  */
+/**
+ * coverage (coordinator だけが渡す・設計 13 §3.1) = {
+ *   generation, runToken,                        全部の chunk の coverage_generation / run_token (受け口は updating のその世代・token のときだけ適用)
+ *   beforeScan({ fetchImpl, base, syncKey, mustOwn, log }) → 走査の前に Render の coverage がその世代・token の updating か確かめる (throw = 送らない)
+ *   onScanSnapshot({ warehouse, stats, ctx, r, receipts }) → 同じ読み取りの取引の中で manifest を計算 (throw = run ごと失敗)
+ *   finalize({ r, scanSnapshot, dirty, ledger, owner, mustOwn, log }) → 送り終えた後 (台帳の lock の中) に完成の判定と complete (戻り値の error = run は ok = false)
+ * }
+ * dirty (coordinator が渡す) = { clear(orderNos, maxRevision) → 消した数 } = 読み直す注文の記録を消す別の短い書き込みの接続 (lease を確かめる)
+ */
 export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode, from = null, to = null, dryRun = false, force = false, chunkSize = DEFAULT_CHUNK,
-  fetchImpl = fetch, log = console.log, now = () => new Date(), capacity = null, transformVersion = AMAZON_FINANCE_TRANSFORM_VERSION, ...rest }) {
+  fetchImpl = fetch, log = console.log, now = () => new Date(), capacity = null, transformVersion = AMAZON_FINANCE_TRANSFORM_VERSION, coverage = null, dirty = null, ...rest }) {
   if (!['incremental', 'full', 'range'].includes(mode)) throw new Error(`mode が不正: ${mode}`);
+  if (coverage && mode === 'range') throw new Error('coverage の回は range にしない (一部の期間だけ = 全体のそろいを言えない)');
   if (mode === 'range' && (!isDate(from) || !isDate(to) || from > to)) throw new Error('--from / --to は YYYY-MM-DD で from <= to');
   const retry = retryStore(ledger);
   const watermark = ledger.getMeta(META.watermark);
@@ -285,18 +423,23 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
   if (!dryRun && leftover.length) retry.add(leftover.map((key) => ({ key, error: 'outbox_leftover' })));
   const sel = { mode, from, to, since, extraKeys: [...new Set([...retry.list().map((f) => f.key), ...leftover].filter((k) => typeof k === 'string'))] };
   const store = keyMonthsStore(ledger);
-  const changedMonths = new Set(); const keyMonthsNew = []; const weight = new Map();
+  const changedMonths = new Set();
+  let changed = null;   // 変わった注文の鍵ごとの月・重さ (changedSpool・送る回だけ・runPush の直前に開いて直後に閉じる。#1567 メモリ)
   const run = {
     stats: { lines: 0, rawRows: 0, dedupRows: 0, maxLines: 0, maxLinesKey: null, maxBytes: 0, maxBytesKey: null, weightLines: 0, unmapped: { rows: 0, columns: {}, exampleIds: [] } },
     noteChanged: (key, lines, renderLines = null) => {
       const ms = [...new Set(lines.map((l) => monthOf(l.economic_date_jst)))].sort();
       for (const m of [...store.get(key), ...ms]) changedMonths.add(m);
-      keyMonthsNew.push([key, ms]);
       // 置き換えで消える行 = Render のいまの行数 (走査の前に取った鍵の一覧)。容量の見込みは max(Render, 新)
       const w = Math.max(lines.length, Number.isFinite(renderLines) ? renderLines : 0);
-      weight.set(key, w); run.stats.weightLines += w;
+      run.stats.weightLines += w;
+      if (dryRun) return;   // 鍵ごとの月・重さは送る回だけ使う (persistBeforeSend・容量の見張り)。dry-run は数だけ (#1567 メモリ)
+      changed.put(key, ms.join(','), w);
     },
     buildFailed: [],
+    built: new Set(),   // 作れた注文番号のうち、読み直す注文の記録がある注文 (D7b-1b-3・#1567 メモリ)
+    dirtyOrderNos: null,   // 読み直す注文の記録がある注文番号 (makeIterate が同じ読み取りで入れる)
+    receipts: null,     // 作れた注文の受領記録 (lines > 0)。一時の SQLite に溜める (receiptSpool・runPush の直前に開いて直後に閉じる。#1567 メモリ)
     persistBeforeSend: (st) => {
       if (dryRun) return;
       const cur = new Set(readJson(ledger, META.unreconciled, []));
@@ -304,30 +447,39 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
       // 読み直す鍵に足す = 今回の整形できない鍵 ∪ 止めた疑似注文 (送り終えたら下で作り直す。送信の途中で落ちたらこのまま残る)
       retry.add([...run.buildFailed, ...(st.blockedPseudoKeys || []).map((key) => ({ key, error: 'pseudo_blocked' }))]);
       ledger.setMeta({ [META.unreconciled]: JSON.stringify([...cur].sort()), [META.unkeyed]: JSON.stringify(st.unkeyed || []) });
-      store.putMany(keyMonthsNew);
+      store.putManyJoined(changed.entries());
     },
   };
   let guard = null;
   if (!dryRun) {
     guard = capacityGuard({ ...capacity, fetchStatus: () => getJson(fetchImpl, `${base}${RENDER_PATHS.status}`, syncKey, 'Render の状態 (容量)', { log, sleep: rest.sleep }),
-      weightOf: (rows) => rows.reduce((s, x) => s + (weight.get(financeKey(x.mall_order_no)) ?? (x.lines ? x.lines.length : 0)), 0) });
+      weightOf: (rows) => rows.reduce((s, x) => s + (changed.weight(financeKey(x.mall_order_no)) ?? (x.lines ? x.lines.length : 0)), 0) });
   }
   const stats = {};
+  run.receipts = receiptSpool();
+  if (!dryRun) changed = changedSpool();
   const r = await runPush({
     kind: FINANCE_KIND, label: 'Amazon 財務', warehouse, ledger, fetchImpl, base, syncKey, paths: RENDER_PATHS,
     countOf: (j) => ({ count: j && j.counts ? Number(j.counts.orders) : NaN, maxBatchSeq: j && j.counts && j.counts.max_batch_seq != null ? Number(j.counts.max_batch_seq) : null }),
     keysOf: (j) => (Array.isArray(j.keys) ? j.keys.map(financeKey) : j.keys),
     iterate: makeIterate(sel, run), inScope: () => true, build: makeBuild(run, transformVersion), transformVersion,
+    lazyFingerprints: true,   // 台帳の指紋を 1 つずつ引く (#1567 メモリ)
     mode, scopeLabel: mode === 'range' ? `計上日 ${from}〜${to} の行を持つ注文` : mode === 'full' ? '全部 (作り直し)' : since ? `ingested_at ${since} 以後` : '全部 (watermark 無し / 変換の版が変わった)',
     chunkSize, dryRun, force, log, now, stats,
     // Render の鍵の一覧 (注文ごとの行数) はどの mode でも取る = --full は Render にだけある鍵・どれも容量の見込みの「消える行」(#1534 Codex R4 High)
-    beforeScan: async ({ mustOwn }) => ({ renderKeys: await fetchRenderKeys(fetchImpl, { base, syncKey, mustOwn, getOpts: { log, sleep: rest.sleep } }) }),
+    //   coverage の回は先に Render の coverage がその世代・token の updating か確かめる (送り手は世代を採らない・coverage を変えない。R19 M4)
+    beforeScan: async ({ mustOwn }) => {
+      if (coverage && coverage.beforeScan) { await coverage.beforeScan({ fetchImpl, base, syncKey, mustOwn, log }); mustOwn(); }
+      return { renderKeys: await fetchRenderKeys(fetchImpl, { base, syncKey, mustOwn, getOpts: { log, sleep: rest.sleep } }) };
+    },
+    chunkExtra: coverage ? { coverage_generation: String(coverage.generation), run_token: coverage.runToken } : null,
+    onScanSnapshot: coverage && coverage.onScanSnapshot ? (sctx) => coverage.onScanSnapshot({ ...sctx, receipts: run.receipts }) : null,
     beforeChunk: guard,
     receiptRows: (body) => validateFinanceChunk(body).rows,   // 受け口は行を作り直す (内容の列だけ + 付け足し) = 受領記録の指紋も同じ形で
     // failed / stale の鍵は outbox から消える前に「読み直す鍵」へ (後の chunk で落ちても失わない。#1534 Codex R2 High)
     beforeAck: ({ failedKeys, staleKeys }) => retry.add([...failedKeys.map((key) => ({ key, error: 'failed' })), ...staleKeys.map((key) => ({ key, error: 'stale' }))]),
     // 最後まで送れた回の確定 (読み直す鍵の作り直し・watermark) は lock の中で、持ち主の確認と同じ取引 (lock を外した後に書くと、次の送り手が残した鍵を消す。#1534 Codex R3 High)
-    afterSend: async ({ owner, r: rr }) => {
+    afterSend: async ({ owner, r: rr, mustOwn }) => {
       const failed = [...rr.transformErrors.map((t) => ({ key: t.key, error: String(t.error).slice(0, 200) })),
         ...rr.failed.map((f) => ({ key: f.key, error: String(f.error || 'failed').slice(0, 200) })),
         ...rr.staleKeys.map((k) => ({ key: k, error: 'stale' })),
@@ -337,14 +489,33 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
       // watermark は incremental / full でそろって終わった回だけ進める (範囲のバックフィルは動かさない)
       if (mode !== 'range' && rr.ok && !unkeyed.length && stats.maxIngested) { meta[META.watermark] = stats.maxIngested; meta[META.transformVersion] = transformVersion; }
       ledger.db.transaction(() => { ledger.assertLock(owner); retry.replace(failed); ledger.setMeta(meta); }).immediate();
-      return { failedKeys: failed.length };
+      const out = { failedKeys: failed.length, dirtyCleared: 0, dirtyClearable: 0 };
+      // 🆕 D7b-1b-3: 読み直す注文の記録を消す = 読み取りの版 R 以下だけ (後から入った記録を消さない・R14 M1)。
+      //   消してよい注文 = この回で作れた注文のうち、送れなかった・stale・整形できない・止めた疑似注文でないもの
+      //   (applied / same になった注文と、中身が台帳の送付確認済みの指紋と同じで送らなかった (unchanged) 注文。
+      //    unchanged の 3 つの条件 = 台帳の指紋が送付確認済み・Render の復元の検査を通過 (受領記録が無ければ runPush が指紋を空にする)・今回の読み取りで同じ中身を再計算した = R17 M3)
+      if (dirty && mode !== 'range' && stats.sourceRevision != null) {
+        const bad = new Set(failed.map((x) => { try { return orderNoOfKey(x.key); } catch { return null; } }).filter(Boolean));
+        // + 送るものが無いと確かめた注文 (同じ読み取りの取引の中で確かめた = R 以下の記録だけ消す)
+        const clearable = [...new Set([...run.built, ...(stats.nothingToSend || [])])].filter((no) => !bad.has(no));
+        out.dirtyClearable = clearable.length;
+        mustOwn();
+        out.dirtyCleared = dirty.clear(clearable, stats.sourceRevision);
+      }
+      if (coverage && coverage.finalize) {
+        mustOwn();
+        out.coverage = await coverage.finalize({ r: rr, scanSnapshot: rr.scanSnapshot, stats, ledger, owner, log, failedKeys: failed, unkeyed, dirtyCleared: out.dirtyCleared });
+        if (out.coverage && out.coverage.error) out.error = out.coverage.error;
+      }
+      return out;
     },
     ...rest,
-  });
+  }).finally(() => { run.receipts.close(); if (changed) changed.close(); });   // 一時の表を消す (受領の要約は走査の取引の中の onScanSnapshot・月と重さは送り終えるまでに使い終わる)
   const finance = { ...run.stats, selectedOrders: stats.selectedOrders ?? 0, selectedPseudo: stats.selectedPseudo ?? 0, renderOnly: stats.renderOnly ?? 0,
+    sourceRevision: stats.sourceRevision ?? null, dirtyOrders: stats.dirtyOrders ?? 0, skippedEmpty: stats.skippedEmpty ?? 0, receipts: run.receipts.length,
     unkeyed: stats.unkeyed || [], pseudoBlocked: stats.pseudoBlocked || 0, unconfirmed: stats.unconfirmed ?? 0, maxIngested: stats.maxIngested ?? null, since, capacity: guard ? guard.state : null };
   r.finance = finance;
-  if (r.afterSend) r.finance.failedKeys = r.afterSend.failedKeys;
+  if (r.afterSend) { r.finance.failedKeys = r.afterSend.failedKeys; r.finance.dirtyCleared = r.afterSend.dirtyCleared; r.finance.coverage = r.afterSend.coverage ?? null; }
   r.ok = r.ok && !finance.unkeyed.length;
   return r;
 }
@@ -473,6 +644,18 @@ export function summarizeReconcile(rr, { all = false } = {}) {
     + ` → 差の月を build のやり残しに登録した (${rr.streak} 回続けて差${rr.streak >= 2 ? ' = ❌' : ' = 1 回目は ⚠️'})`;
 }
 
+/**
+ * CLI の最後の行と終了コード。complete を無効にした送信 (r.coverageInvalidated > 0・--from/--to のバックフィルなど) = 要約の頭は少なくとも ⚠️ (summarizeFinance)・
+ *   coordinator に切り替え済みの環境 (switched) なら ❌ で exit 1 (正式な利益が止まった = 次の coordinator の回まで null。#1567 Codex R6 Medium 1)
+ */
+export function financeCliOutcome(r, { switched = false } = {}) {
+  const base = summarizeFinance(r);
+  const invalidatedSwitched = !r.dryRun && !r.lockedBy && switched && r.coverageInvalidated > 0;
+  const summary = invalidatedSwitched ? `${base.replace(/^(✅|⚠️) /, '❌ ')} = coordinator に切り替え済みの環境で complete を無効にした (次の coordinator の回で作り直す)` : base;
+  const exitCode = r.lockedBy ? 1 : (r.dryRun ? (r.transformErrors.length || r.finance.unkeyed.length ? 1 : 0) : (r.ok && !invalidatedSwitched ? 0 : 1));
+  return { summary, exitCode };
+}
+
 export function summarizeFinance(r) {
   const f = r.finance || {};
   const lines = `注文 ${f.selectedOrders ?? 0} + 疑似注文 ${f.selectedPseudo ?? 0}${f.renderOnly ? ` + Render にだけある ${f.renderOnly}` : ''} を集約 (決済の行 ${f.rawRows ?? 0} → 重複除去 ${f.dedupRows ?? 0} → 財務の行 ${f.lines ?? 0})・1 注文の最大 ${f.maxLines ?? 0} 行 (${f.maxLinesKey ?? '-'})・最大の JSON ${Math.round((f.maxBytes || 0) / 1024)} KB`;
@@ -485,10 +668,12 @@ export function summarizeFinance(r) {
   if (r.lockedBy) return `⏸️ Company DB Amazon 財務 push: 別の送り手が走っているので見送り (${r.lockedBy.owner} pid ${r.lockedBy.pid})`;
   if (r.dryRun) return `${r.transformErrors.length || (f.unkeyed && f.unkeyed.length) ? '❌' : f.unmapped && f.unmapped.rows ? '⚠️' : '✅'} dry-run: ${lines} / 変わった ${r.changed} / 整形できない ${r.transformErrors.length}${warn ? ` / ${warn}` : ''}`;
   // 最後の行の頭 = daily-sync の判定 (isWarnSummary は頭の ⚠️ だけを見る)。Render の復元・台帳の取り戻しも ⚠️ (✅ で始めると全部 OK に数えられる。#1536 Codex R1 Medium)
-  const head = !r.ok ? '❌' : ((f.unmapped && f.unmapped.rows) || r.ledgerReset || r.ledgerRebuilt) ? '⚠️' : '✅';
+  // Render の決済のそろい (complete) を無効にした (token の無い chunk が受領記録を変えた) = 正式な利益が止まった = 少なくとも ⚠️ (切替済みの環境は main が ❌。#1567 Codex R6 Medium 1)
+  const head = !r.ok ? '❌' : ((f.unmapped && f.unmapped.rows) || r.ledgerReset || r.ledgerRebuilt || r.coverageInvalidated > 0) ? '⚠️' : '✅';
   return `${head} Company DB Amazon 財務 push: 変わった ${r.changed} 注文を送った (applied ${r.applied} / same ${r.same} / stale ${r.stale} / failed ${r.failed.length} / 整形できない ${r.transformErrors.length}) 世代 ${r.batchSeq ?? '-'} chunk ${r.chunks} / ${lines}`
     + (warn ? ` / ${warn}` : '') + (r.ledgerReset ? ` / ⚠️Render が復元されていたので台帳の指紋を空にして送り直した (${r.ledgerReset})` : '')
-    + (r.ledgerRebuilt ? ` / ⚠️台帳が空だったので Render から ${r.ledgerRebuilt} 注文を取り戻した` : '');
+    + (r.ledgerRebuilt ? ` / ⚠️台帳が空だったので Render から ${r.ledgerRebuilt} 注文を取り戻した` : '')
+    + (r.coverageInvalidated > 0 ? ` / ⚠️Render の決済のそろい (complete) を ${r.coverageInvalidated} 件無効にした (token の無い送信 = 正式な利益は次の coordinator の回まで null)` : '');
 }
 
 export function parseArgs(argv) {
@@ -563,17 +748,31 @@ async function main() {
       process.exitCode = rr.level === 'error' ? 1 : 0;
       return;
     }
+    // 🚨 D7b-1b-3: スイッチ (env CDB_FINANCE_COORDINATOR=1) があるとき、送る回 (--incremental / --full) は coordinator (amazon-finance-coverage-run.js) の中だけ。単独は dry-run・バックフィル (--from/--to) だけ。
+    //   スイッチが無いとき = 今までどおり (daily-sync の「CompanyDB財務(Amazon)」・retry の --full)。token の無い chunk = Render は Amazon 財務の complete を無効にする
+    if (!a.dryRun && (mode === 'incremental' || mode === 'full') && financeCoordinatorEnabled()) {
+      throw new Error(`--incremental / --full で送るのは coordinator (node apps/warehouse/amazon-finance-coverage-run.js) の回の中だけ (${FINANCE_COORDINATOR_ENV}=1・決済の取込・coverage の世代と token と一緒)。単独は --dry-run で調べる`);
+    }
+    // 🚨 一方向の門 (#1567 Codex R6 High・R7 High 1・2): 単独の送信 (--incremental / --full / --from/--to) はどれも token の無い chunk = **送る前に** 門を通す。
+    //   coordinator が coverage の回で回ったことがある (ローカルの台帳・warehouse.db か Render の決済のそろいの行) = ❌・Render を読めない = 判定できない = ❌ (fail-closed)。
+    //   送った後の exit 1 では古い complete を防げない (Render の受け口が #1561 の前に戻っていれば complete を落とさない)。勝手に coordinator も起動しない (.env を直す)
+    if (!a.dryRun && mode) {
+      await assertLegacyAllowedRemote(warehouse, ledger, mode === 'range' ? '単独の --from/--to の送信 (token の無い chunk)' : '今までの送り手 (token の無い chunk を送る)', { base, syncKey });
+      if (mode === 'range') console.log('⚠️ --from/--to の送信は token の無い chunk = Render は Amazon 財務の complete を無効にする (coordinator で一度も回っていないことを確かめた後だけ送る)');
+      else console.log(`ℹ️ ${FINANCE_COORDINATOR_ENV} が無い = 今までどおり送る (token の無い chunk = Render は Amazon 財務の complete を無効にする)`);
+    }
     const capacity = a.dryRun ? null : capacityFromEnv();
     if (!a.dryRun && !(capacity.limitBytes > 0)) throw new Error('容量の上限 (CDB_DB_LIMIT_BYTES) が無い = D-W5 (Render の Postgres のプラン) を決めるまで送らない。まず --dry-run');
     const startedAt = new Date();
     const r = await pushAmazonFinance({ warehouse, ledger, base, syncKey, mode, from: a.from, to: a.to, dryRun: a.dryRun, force: a.force, chunkSize, capacity });
-    console.log(summarizeFinance(r));
+    const out = financeCliOutcome(r, { switched: !a.dryRun && r.coverageInvalidated > 0 && coverageEverRan(warehouse, ledger) });
+    console.log(out.summary);
     if ((mode === 'incremental' || mode === 'full') && !a.dryRun) {
       writeEvidence(dataDir, 'finance-amazon', { kind: 'order_finance', mall: FINANCE_MALL, scope: FINANCE_SCOPE, mode, ok: !!r.ok, run_id: r.runId ?? null, batch_seq: r.batchSeq ?? null,
         started_at: startedAt.toISOString(), changed: r.changed, applied: r.applied, same: r.same, stale: r.stale, failed: r.failed.length, transform_errors: r.transformErrors.length,
         unkeyed: (r.finance.unkeyed || []).length, unmapped_rows: r.finance.unmapped.rows });
     }
-    process.exitCode = r.lockedBy ? 1 : (r.dryRun ? (r.transformErrors.length || r.finance.unkeyed.length ? 1 : 0) : (r.ok ? 0 : 1));
+    process.exitCode = out.exitCode;
   } finally { ledger.close(); warehouse.close(); }
 }
 

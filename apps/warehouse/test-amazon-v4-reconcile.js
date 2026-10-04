@@ -19,6 +19,7 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amazon-v4-reconcile-test-'
 process.env.DATA_DIR = tmpDir;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const { initDB, getDB } = await import('./db.js');
+const { backfillDocumentVersions } = await import('./amazon-settlement-versions.js');   // 直接入れた行に文書の版を付ける (build は版の無い行があれば止まる)
 const { reconcileMonthly, reconcileSkuTop } = await import('./amazon-finance-v4-reconcile.js');
 
 let failed = 0;
@@ -65,7 +66,7 @@ db.prepare(`INSERT INTO m_products (商品コード, 商品名, 商品区分, �
 // v4 は SKU 別の広告費の表を参照する (本番は広告の取込が作る・ここでは空の表だけ)
 db.exec(`CREATE TABLE IF NOT EXISTS fact_ad_spend (日付 TEXT, モール TEXT, ターゲット粒度 TEXT, ターゲット TEXT, 広告費 REAL, 広告経由売上 REAL)`);
 
-const runNode = (args) => execFileSync(process.execPath, args, { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+const runNode = (args) => (backfillDocumentVersions(db), execFileSync)(process.execPath, args, { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 runNode(['apps/warehouse/rebuild-amazon-settlement-mart.js', '--ym', String(YMI)]);
 runNode(['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM]);
 

@@ -651,11 +651,33 @@
   .opt.legacy{border-style:dashed;border-color:var(--amber);background:var(--amber-soft);color:var(--amber)}
   .opt.legacy small{font-weight:400;font-size:.7rem;display:block}
   .opt.add{color:var(--accent);border-color:var(--accent);border-style:dashed;background:var(--surface)}
+  /* 上限まで選んだあとの候補 (資材は 2 つまで)。押せないことを色でも伝える */
+  .opt:disabled{opacity:.45;cursor:default}
   .opt.wide{grid-column:1/-1;aspect-ratio:auto;flex-direction:row;justify-content:center;min-height:46px}
   /* ラベル待ちのロケーション (Z/Y/なし) は画像を持たない札。タイルにはしない */
   .opts.chips{display:flex;flex-wrap:wrap}
   .opts.chips .opt{aspect-ratio:auto;flex-direction:row;justify-content:center;min-height:46px;padding:8px 14px;font-size:.98rem}
   .optq{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;font-size:1rem;background:var(--surface);color:var(--ink);margin:2px 0 6px}
+  /* ── 選んだ資材 (2026-10-01: 10 個ずつ小分けする袋も登録できるように) ──
+     選んだものを候補の下にまとめて出す。候補の中で選択中を探さなくていいように (タイルが多いと見失う) */
+  .matpicked{display:flex;flex-direction:column;gap:8px;margin:6px 0 2px}
+  .matrow{border:1px solid var(--accent);border-radius:var(--r-sm);background:var(--surface);padding:8px 10px}
+  .matrow .mhead{display:flex;align-items:center;gap:8px}
+  .matrow .mnm{flex:1;font-weight:700;font-size:.95rem;word-break:break-all}
+  .matrow .mdrop{border:1px solid var(--line);background:var(--surface);color:var(--sub);border-radius:var(--r-sm);
+    padding:6px 10px;font-size:.82rem;font-weight:700;cursor:pointer;font-family:var(--font);min-height:40px;flex:none}
+  /* 使い道の 2 択。大きめに (手袋でも押せるように — 現場の端末は iPad) */
+  .matuse{display:flex;gap:8px;margin-top:8px}
+  .matuse button{flex:1;border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);
+    padding:8px 6px;font-size:.88rem;font-weight:700;cursor:pointer;font-family:var(--font);min-height:44px}
+  .matuse button.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+  .matper{display:flex;align-items:center;gap:8px;margin-top:8px}
+  .matper{flex-wrap:wrap}
+  .matper label{margin:0;flex:none}
+  .matper .perhint{flex-basis:100%;font-size:.78rem;color:var(--amber);font-weight:700}
+  /* .mfields input{width:100%} より後に効かせる (型つきの方が強い)。数は 3 桁も見えれば十分 */
+  .matper input[type=number]{width:110px;flex:none}
+  .matpicked .none{color:var(--sub);font-size:.86rem}
   .optnew{display:flex;gap:8px;width:100%;margin-top:4px;grid-column:1/-1}
   .opts .hint{grid-column:1/-1}
   .optnew input{flex:1;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 10px;font-size:1rem;background:var(--surface);color:var(--ink);min-height:46px}
@@ -1099,10 +1121,13 @@
       <div class="mname" id="mvName">—</div>
       <div class="msaving" id="mvMsg"></div>
       <div class="mfields">
-        <div class="mvf" data-f="material_code">
-          <label>資材 (タップして選ぶ)</label>
+        <div class="mvf" data-f="materials">
+          <label>資材 (タップして選ぶ。2 つまで)</label>
           <input class="optq" id="optqMaterial" placeholder="候補をしぼる (例: D-8)" hidden oninput="filterOpts('material', this.value)">
           <div class="opts" id="optMaterial" role="group" aria-label="資材の候補"></div>
+          <!-- 選んだ資材と、その使い道 (10 個ずつ小分けする袋なら「何個ずつ」も) -->
+          <div class="matpicked" id="matPicked"></div>
+          <!-- 値は JSON の配列で持つ (保存は「開いた時点との差分」なので、文字列で比べられる形にする) -->
           <input type="hidden" id="mvMaterial">
         </div>
         <div class="mvf" data-f="storage_container">
@@ -1547,6 +1572,9 @@ async function loadStateOnce() {
     }
     else forceCloseDetail('このカードは一覧から外れました');
   }
+  // 取り直せたことを呼び元に伝える (失敗した経路は上で return 済み = undefined)。
+  // 競合のあとにフォームを組み直してよいかの判断に使う (Codex 2026-10-01)
+  return true;
 }
 
 /** 正本モードで変わる固定文言 (状態変更ダイアログの注意書き・更新ボタン) */
@@ -1627,7 +1655,12 @@ function pickTab(key) { curTab = key; tabAuto = false; renderTabs(); renderList(
 function masterSummary(c) {
   const m = c.master;
   const parts = [];
-  if (m.material_code) parts.push('資材 ' + m.material_code);
+  // 資材は複数 (小分け袋を含む)。一覧では短く「D-8 ＋ 313ビニール袋 (10個ずつ)」
+  const mats = Array.isArray(m.materials) ? m.materials : (m.material_code ? [{ code: m.material_code }] : []);
+  if (mats.length) {
+    parts.push('資材 ' + mats.map((x) => x.code
+      + (x.usage === 'inner_pack' ? (x.units_per_pack != null ? ' (' + x.units_per_pack + '個ずつ)' : ' (小分け袋)') : '')).join(' ＋ '));
+  }
   if (m.storage_container) parts.push(m.storage_container + (m.units_per_container != null ? 'に' + m.units_per_container + '個ずつ' : ''));
   else if (m.units_per_container != null) parts.push('入数 ' + m.units_per_container);
   return parts.join(' ・ ');
@@ -1695,7 +1728,7 @@ function renderList() {
       boxesText(c) ? '📦 ' + esc(boxesText(c, { short: true })) : null,
       c.plan_hours != null ? '⏱ ' + esc(approxHours(c.plan_hours)) : null,
       c.arrival ? '入庫 ' + esc(c.arrival) : null,
-      masterSummary(c) || null,
+      esc(masterSummary(c)) || null,   // 🚨資材・保管箱の名前は人が登録した文字列。必ずエスケープして入れる
     ].filter(Boolean).join(' ・ ');
     // 在庫日数・売上・外部出し目安は職員の判断材料 → 職員モードのときだけ (利用者の一覧から外す — 監修 F-5)
     const staffUI = isStaffUI();
@@ -3983,6 +4016,26 @@ function workInfoHtml(c, m, missSet) {
       '<div class="nm num">' + (empty ? (miss ? '⚠ 未登録' : '未設定') : esc(value)) + '</div></div>' +
       (strip || '') + chip(empty) + '</div>';
   };
+  /**
+   * 資材のタイル (2026-10-01 から複数)。小分け袋は「この袋に 10 個ずつ入れる」の帯つき。
+   * 0 件なら未登録の枠を 1 つだけ出す (空の写真枠を 2 つ並べない)
+   */
+  const matThings = (mm) => {
+    const list = Array.isArray(mm.materials) ? mm.materials : (mm.material_code ? [{ code: mm.material_code, usage: 'normal' }] : []);
+    if (list.length === 0) return thing('資材 (袋)', null, 'materials', 'material', missSet.has('資材'));
+    return list.map((x, i) => {
+      const inner = x.usage === 'inner_pack';
+      const perMiss = inner && x.units_per_pack == null;
+      // 入数の帯と同じ作り (帯そのものを押すと資材の変更になる)
+      const strip = inner
+        ? open('strip' + (perMiss ? ' miss' : ''), 'materials')
+          + (perMiss ? '⚠ 何個ずつ入れるかが未登録'
+            : 'この袋に <b class="num">' + esc(String(x.units_per_pack)) + '</b> 個ずつ入れる')
+          + chip(perMiss) + '</div>'
+        : '';
+      return thing(inner ? '小分けの袋' : (i === 0 ? '資材 (袋)' : '資材'), x.code, 'materials', 'material', false, strip);
+    }).join('');
+  };
   // 入数は保管箱とセットで読ませる (「1箱に120個ずつ入れる」— 120 が総数か1箱分か迷わない)。
   // 帯だけ別の項目なので data-reg を内側に置く (closest は内側が勝つ)
   const unitsMiss = missSet.has('入数');
@@ -4029,7 +4082,7 @@ function workInfoHtml(c, m, missSet) {
     '</div>';
 
   return '<div class="wigroup">使うもの</div><div class="things">' +
-      thing('資材 (袋)', m.material_code, 'material_code', 'material', missSet.has('資材')) +
+      matThings(m) +
       thing('保管箱と入れ方', m.storage_container, 'storage_container', 'container', missSet.has('保管箱'), unitsStrip) +
     '</div>' +
     '<div class="wigroup">作業のしかた</div><div class="wrows">' +
@@ -4763,29 +4816,38 @@ const optKey = s => String(s == null ? '' : s).normalize('NFKC').replace(/\s+/g,
 const optFilter = { material: '', container: '' };
 function filterOpts(kind, v) { optFilter[kind] = v || ''; renderOpts(kind); }
 function renderOpts(kind) {
-  const cur = document.getElementById(OPT_FIELD[kind]).value;
+  // 資材は複数選べる (選んだものは下の一覧に出る)。保管箱は 1 つだけ
+  const multi = kind === 'material';
+  const picked = multi ? matList() : [];
+  const cur = multi ? '' : document.getElementById(OPT_FIELD[kind]).value;
   const curKey = optKey(cur);
+  const isOn = (code) => (multi ? matHas(picked, code) : optKey(code) === curKey);
+  const anyPicked = multi ? picked.length > 0 : !!cur;
+  const full = multi && picked.length >= MAT_MAX;
   const all = (state.options && state.options[kind]) || [];
   const qEl = document.getElementById('optq' + kind.charAt(0).toUpperCase() + kind.slice(1));
   if (qEl) qEl.hidden = all.length <= OPT_SEARCH_FROM;
   const q = optKey(optFilter[kind] || '');
   const list = q ? all.filter(o => optKey(o.code).includes(q)) : all;
   // 選んでいるかどうかは見た目だけでなく aria-pressed でも伝える (読み上げ・キーボード — Codex R1)
-  const tile = (cls, code, label, img, extra) =>
+  const tile = (cls, code, label, img, extra, off) =>
     '<button type="button" class="opt ' + cls + '" data-code="' + esc(code) + '" aria-pressed="' + (/\bon\b/.test(cls) ? 'true' : 'false') + '"' +
+    (off ? ' disabled title="' + MAT_MAX + ' つまでです (使わないものを外してください)"' : '') +
     ' onclick="pickOptEl(this,\'' + kind + '\')">' +
     '<span class="thumb">' + (img ? '<img src="' + esc(img) + '" alt="" loading="lazy" onerror="optImgFail(this)">' : '📦') + '</span>' +
     '<span class="nm">' + esc(label) + (extra || '') + '</span></button>';
-  let h = '<button type="button" class="opt none wide' + (cur ? '' : ' on') + '" data-code="" aria-pressed="' + (cur ? 'false' : 'true') + '"' +
+  // 資材では「なし」= 全部外す。1 つでも選んでいれば押せる形にする
+  let h = '<button type="button" class="opt none wide' + (anyPicked ? '' : ' on') + '" data-code="" aria-pressed="' + (anyPicked ? 'false' : 'true') + '"' +
     ' onclick="pickOptEl(this,\'' + kind + '\')">なし</button>';
   // 今の値が候補に無い (管理者が外した・古いマスタ値) ときは「候補外」と分かる形で選択中に見せる (Codex R1 #7)。
   // 比較はサーバーと同じ正規化 (全角/大小文字の違いを候補外にしない — Codex R2 #3)
-  if (cur && !all.some(o => optKey(o.code) === curKey)) {
-    h += tile('on legacy', cur, cur, null, '<small>(候補外)</small>');
-  }
+  const legacy = multi ? picked.filter((m) => !all.some((o) => optKey(o.code) === optKey(m.code))).map((m) => m.code)
+    : (cur && !all.some((o) => optKey(o.code) === curKey) ? [cur] : []);
+  for (const code of legacy) h += tile('on legacy', code, code, null, '<small>(候補外)</small>');
   for (const o of list) {
     // 値は data-code に持たせ onclick には埋めない (人が入れた文字列を JS 文字列にしない)
-    h += tile(optKey(o.code) === curKey ? 'on' : '', o.code, o.code, o.image_url || null, '');
+    const on = isOn(o.code);
+    h += tile(on ? 'on' : '', o.code, o.code, o.image_url || null, '', !on && full);
   }
   if (q && list.length === 0) h += '<span class="hint" style="align-self:center">「' + esc(q) + '」に合う候補はありません</span>';
   h += '<button type="button" class="opt add wide" onclick="openOptNew(\'' + kind + '\')">＋ 新しく登録</button>';
@@ -4797,10 +4859,91 @@ function renderOpts(kind) {
 }
 // 画像が読めなかったときは枠を消さず絵文字に戻す (消すとタイルが真っ白になる)
 function optImgFail(el) { if (el.parentNode) el.parentNode.textContent = '📦'; }
+// ── 資材は複数選べる (2026-10-01 中原さん: 10 個ずつ小分けする袋も登録したい) ──
+// 値は #mvMaterial に **JSON の配列** で持つ ([{code, usage, units_per_pack}])。
+// 保存は「開いた時点との差分」なので、文字列で比べられる形にしておく
+// 🚨 画面で選べるのは 2 つまで (現場の要望は「袋をもう 1 つ」)。サーバーは 3 つまで許す = 余裕
+const MAT_MAX = 2;           // 🚨 lib/iroha-materials.js の MAX_MATERIALS と同じ数にすること (テストが見張っている)
+const MAT_PER_MAX = 100000;  // 小分けの数の上限 (同じく MAX_UNITS_PER_PACK と合わせる)
+function matList() {
+  try { const v = JSON.parse(document.getElementById('mvMaterial').value || '[]'); return Array.isArray(v) ? v : []; }
+  catch (e) { return []; }   // 壊れていたら空から選び直してもらう (画面を止めない)
+}
+function matWrite(list) { document.getElementById('mvMaterial').value = JSON.stringify(list); }
+function setMatList(list) { matWrite(list); renderOpts('material'); renderMatPicked(); }
+const matHas = (list, code) => list.some((m) => optKey(m.code) === optKey(code));
+
+/** 選んだ資材の一覧 (候補の下)。使い道と「何個ずつ」はここで決める */
+function renderMatPicked() {
+  const box = document.getElementById('matPicked');
+  if (!box) return;
+  const list = matList();
+  if (list.length === 0) { box.innerHTML = '<div class="none">まだ選んでいません (上の候補をタップしてください)</div>'; return; }
+  box.innerHTML = list.map((m, i) => {
+    const inner = m.usage === 'inner_pack';
+    const per = m.units_per_pack == null ? '' : String(m.units_per_pack);
+    return '<div class="matrow">'
+      + '<div class="mhead"><span class="mnm">' + esc(m.code) + '</span>'
+      + '<button type="button" class="mdrop" onclick="matDrop(' + i + ')">外す</button></div>'
+      + '<div class="matuse">'
+      + '<button type="button" class="' + (inner ? '' : 'on') + '" aria-pressed="' + (inner ? 'false' : 'true') + '"'
+      + ' onclick="matUse(' + i + ', 0)">ふつうに使う</button>'
+      + '<button type="button" class="' + (inner ? 'on' : '') + '" aria-pressed="' + (inner ? 'true' : 'false') + '"'
+      + ' onclick="matUse(' + i + ', 1)">小分け袋として使う</button>'
+      + '</div>'
+      + (inner ? '<div class="matper"><label>この袋に</label>'
+          + '<input type="number" min="1" step="1" inputmode="numeric" aria-label="この袋に入れる数"'
+          + ' value="' + esc(per) + '" oninput="matPer(' + i + ', this.value)">'
+          + '<label>個ずつ入れる</label><span class="perhint" id="matPerHint' + i + '"></span></div>' : '')
+      + '</div>';
+  }).join('');
+}
+function matDrop(i) { const l = matList(); if (!l[i]) return; l.splice(i, 1); setMatList(l); }
+function matUse(i, innerFlag) {
+  const l = matList();
+  if (!l[i]) return;
+  // ふつうに戻したら「何個ずつ」は消す (サーバーと同じ決まり。古い数が残って表示されない)
+  l[i] = innerFlag ? { code: l[i].code, usage: 'inner_pack', units_per_pack: l[i].units_per_pack } : { code: l[i].code, usage: 'normal' };
+  setMatList(l);
+}
+function matPer(i, v) {
+  const l = matList();
+  if (!l[i]) return;
+  const t = String(v).trim();
+  // 🚨 parseInt は "1.5" を 1、"1e2" を 1 として通してしまう。作業の指示が黙って違う数になるので
+  //    整数として読めない値は**入れない** (未登録のまま = カードに ⚠ が出る) — Codex 2026-10-01
+  const n = Number(t);
+  const good = t !== '' && Number.isInteger(n) && n > 0 && n <= MAT_PER_MAX;
+  const next = { code: l[i].code, usage: 'inner_pack' };
+  if (good) next.units_per_pack = n;
+  l[i] = next;
+  const hint = document.getElementById('matPerHint' + i);
+  if (hint) hint.textContent = (t === '' || good) ? '' : '1 以上の整数で入れてください';
+  // 🚨ここでは描き直さない — 数字を打つたびに input を作り直すと、1 文字ごとにフォーカスが飛ぶ
+  matWrite(l);
+}
+
 function pickOptEl(el, kind) {
-  document.getElementById(OPT_FIELD[kind]).value = el.dataset.code || '';
+  const code = el.dataset.code || '';
+  if (kind !== 'material') {
+    document.getElementById(OPT_FIELD[kind]).value = code;
+    optNewKind = null;
+    renderOpts(kind);
+    return;
+  }
+  const list = matList();
+  if (!code) { optNewKind = null; setMatList([]); return; }   // 「なし」= 資材を全部外す
+  const i = list.findIndex((m) => optKey(m.code) === optKey(code));
+  if (i >= 0) list.splice(i, 1);                               // もう一度タップ = 外す
+  else {
+    if (list.length >= MAT_MAX) {
+      document.getElementById('mvMsg').textContent = '資材は ' + MAT_MAX + ' つまでです (使わないものを「外す」でどけてください)';
+      return;
+    }
+    list.push({ code, usage: 'normal' });
+  }
   optNewKind = null;
-  renderOpts(kind);
+  setMatList(list);
 }
 function openOptNew(kind) {
   optNewKind = kind; renderOpts(kind);
@@ -4834,9 +4977,16 @@ async function saveOptNew(kind) {
   state.options = state.options || { material: [], container: [] };
   if (!state.options[kind].some(o => o.id === j.option.id)) state.options[kind].push(j.option);
   $('#mvMsg').textContent = '';
-  document.getElementById(OPT_FIELD[kind]).value = j.option.code;
   optNewKind = null;
-  renderOpts(kind);
+  if (kind === 'material') {
+    // 登録した資材はそのまま選んだ状態にする (上限まで選んでいるときは候補に増やすだけ)
+    const l = matList();
+    if (!matHas(l, j.option.code) && l.length < MAT_MAX) l.push({ code: j.option.code, usage: 'normal' });
+    setMatList(l);
+  } else {
+    document.getElementById(OPT_FIELD[kind]).value = j.option.code;
+    renderOpts(kind);
+  }
   toast('「' + j.option.code + '」を' + OPT_LABEL[kind] + 'の候補に登録しました');
 }
 
@@ -4845,7 +4995,8 @@ let mvSaving = false;
 // ⭐開いた時点の値と version を固定する (Codex PR4 #3: 60秒ポーリングが version を進めると、
 //   古い入力を新しい version で送れてしまい他人の変更を上書きする)
 let mvCtx = null;   // { pageId, code, version, values }
-const MV_MAP = { material_code: 'mvMaterial', storage_container: 'mvContainer', units_per_container: 'mvUnits',
+// ⭐資材は materials (配列) で送る。#mvMaterial には JSON の文字列が入る (差分の比較を文字列のままにするため)
+const MV_MAP = { materials: 'mvMaterial', storage_container: 'mvContainer', units_per_container: 'mvUnits',
   // 作り方動画のリンクは画面から外した (中原さん 2026-09-03)。DB の video_url と API は残してあるので、戻すときはここに足す
   // ⭐「大きさ」は廃止 (中原さん 2026-09-06 — 要件 §AA)。大きさは配送方法から見なすので手で登録しない
   process_count: 'mvProcess', note: 'mvNote', expiry_seal: 'mvSeal' };
@@ -4935,9 +5086,15 @@ document.addEventListener('keydown', (e) => {
  * 抜けていると input.value に undefined が入り、触っていないのに 'undefined' を送ってしまう
  * (期限シールで実際に起きていた。2026-09-06 修正)
  */
+/** カードの作業仕様から資材の配列を取り出す (古いキャッシュの応答には materials が無いので material_code で代用) */
+function matOfMaster(m) {
+  if (Array.isArray(m.materials)) return m.materials;
+  return m.material_code ? [{ code: m.material_code, usage: 'normal' }] : [];
+}
+
 function mvValues(m) {
   return {
-    material_code: m.material_code || '', storage_container: m.storage_container || '',
+    materials: JSON.stringify(matOfMaster(m)), storage_container: m.storage_container || '',
     units_per_container: m.units_per_container == null ? '' : String(m.units_per_container),
     process_count: m.process_count == null ? '' : String(m.process_count),
     note: m.note || '',
@@ -4945,7 +5102,7 @@ function mvValues(m) {
   };
 }
 
-const MV_TITLE = { material_code: '資材', storage_container: '保管箱', units_per_container: '入数',
+const MV_TITLE = { materials: '資材', storage_container: '保管箱', units_per_container: '入数',
   process_count: '工程数', note: '気をつけること', expiry_seal: '期限シール' };
 /**
  * 作業のやり方の登録・変更。**タップした項目だけ**を出す (中原さん 2026-09-03:
@@ -4961,7 +5118,7 @@ function openMaster(field) {
   mvCtx = { cardId: c.id, code: c.product_code, version: c.master.version, values: cur, field: MV_MAP[field] ? field : null };
   for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur[f];
   renderSealOpts();
-  optNewKind = null; renderOpts('material'); renderOpts('container');
+  optNewKind = null; renderOpts('material'); renderOpts('container'); renderMatPicked();
   // 出す項目を絞る (他は隠すだけ。保存は「開いた時点との差分」なので触っていない項目は送られない)
   for (const el of document.querySelectorAll('#mvOv .mvf')) {
     el.hidden = !!mvCtx.field && el.dataset.f !== mvCtx.field;
@@ -4989,7 +5146,10 @@ async function saveMaster() {
   const targets = mvCtx.field ? [[mvCtx.field, MV_MAP[mvCtx.field]]] : Object.entries(MV_MAP);
   for (const [f, id] of targets) {
     const v = document.getElementById(id).value.trim();
-    if (v !== mvCtx.values[f]) fields[f] = v;   // 開いた時点との差分だけ送る
+    if (v === mvCtx.values[f]) continue;        // 開いた時点との差分だけ送る
+    // 資材だけは配列で送る (画面では JSON の文字列で持っている)
+    if (f === 'materials') { try { fields[f] = JSON.parse(v || '[]'); } catch (e) { fields[f] = []; } }
+    else fields[f] = v;
   }
   if (Object.keys(fields).length === 0) { closeMaster(); toast('変更はありませんでした'); return; }
   mvSaving = true;
@@ -5027,13 +5187,19 @@ async function saveMaster() {
     // 最新を読み込み、フォームも最新値で組み直す (古い入力のままの再保存で上書きさせない — Codex PR4 #4)
     $('#mvMsg').textContent = '⏳ ' + (j.message || '他の人が先に更新しました') + ' — 最新を読み込んでいます…';
     const keepField = mvCtx.field;   // 開いていた項目を引き継ぐ (落とすと隠れている項目まで送ってしまう)
-    await loadState();
+    const fresh = await loadState();
+    // 🚨取り直せていないのに「最新にしました」と言わない。古い内容のまま送り直すと競合を繰り返す (Codex 2026-10-01)
+    if (!fresh) {
+      $('#mvMsg').textContent = '❌ 他の人が先に更新しましたが、最新を読み込めませんでした。'
+        + 'いったん「やめる」で閉じ、つながってから開き直してください';
+      return;
+    }
     const c2 = state.cards.find(x => x.id === mvCtx.cardId);
     if (c2) {
       const cur2 = mvValues(c2.master);
       mvCtx = { cardId: c2.id, code: c2.product_code, version: c2.master.version, values: cur2, field: keepField };
       for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur2[f];
-      optNewKind = null; renderOpts('material'); renderOpts('container');
+      optNewKind = null; renderOpts('material'); renderOpts('container'); renderMatPicked();
     }
     $('#mvMsg').textContent = '❌ 他の人が先に更新したため、最新の内容に読み込み直しました。もう一度入力してください';
     return;
@@ -5185,7 +5351,9 @@ function renderBlock(c) {
 /** 足りない資材 (このカードの資材・保管箱を 1 タップ、その他は書く) と足りない数 (任意) */
 function materialsPanelHtml(c) {
   const m = c.master || {};
-  const cands = [m.material_code ? { v: m.material_code, l: '資材 ' + m.material_code } : null,
+  // 資材は複数あるので 1 つずつ候補に出す (どれが足りないかをそのまま選べるように — 2026-10-01)
+  const mats = Array.isArray(m.materials) ? m.materials : (m.material_code ? [{ code: m.material_code }] : []);
+  const cands = [...mats.map((x) => ({ v: x.code, l: (x.usage === 'inner_pack' ? '小分けの袋 ' : '資材 ') + x.code })),
     m.storage_container ? { v: m.storage_container, l: '保管箱 ' + m.storage_container } : null].filter(Boolean);
   return '<div class="dq matq"><label>足りない資材はどれですか</label>' +
     '<div class="quick">' + cands.map((x) => '<button type="button" data-mat="' + esc(x.v) + '">' + esc(x.l) + '</button>').join('') +
@@ -6166,7 +6334,11 @@ function cplanRowHtml(r) {
   facts.push('<span>まとまり #' + esc(String(r.seq)) + '</span>');
   if (r.ar_no) facts.push('<span>入荷 ' + esc(r.ar_no) + '</span>');
   if (r.storage_container) facts.push('<span>保管箱 ' + esc(r.storage_container) + '</span>');
-  if (r.material_code) facts.push('<span>資材 ' + esc(r.material_code) + '</span>');
+  // 資材は複数 (小分け袋を含む)。渡す前に何を使うか分かるように 1 つずつ出す
+  for (const x of (Array.isArray(r.materials) ? r.materials : (r.material_code ? [{ code: r.material_code }] : []))) {
+    facts.push('<span>' + (x.usage === 'inner_pack' ? '小分けの袋 ' : '資材 ') + esc(x.code)
+      + (x.usage === 'inner_pack' && x.units_per_pack != null ? ' (' + esc(String(x.units_per_pack)) + '個ずつ)' : '') + '</span>');
+  }
   if (r.expiry) facts.push('<span>期限 ' + esc(r.expiry) + '</span>');
   if (cplanFac === 'all') facts.push('<span>🏢 ' + esc(facilityName(r.facility_code)) + '</span>');
   if (r.state === 'handed') {

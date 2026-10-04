@@ -1313,7 +1313,137 @@ export function initProductHubDB() {
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
     CREATE INDEX IF NOT EXISTS idx_draft_events_draft ON draft_events(draft_id);
+
+    -- ── LP 構成の AI 生成 (段階1・2026-10-01) ───────────────────────────
+    -- 正本 = AI_reference『商品ハブ_LP構成AI生成_段階1設計_20260930.md』。
+    -- 型は SP広告KW の夜間 AI (ph_ad_kw_ai_jobs / _generations) の manual を縮小して写したもの。
+    -- 段階1 の目的は機能ではなく測定 (AI の構成が使えるか)。画像生成・GAS 送信・夜間実行は範囲外。
+
+    -- 仕様書のスナップショット。**追記専用** — 一度入れた行は書き換えない (Codex R3 #3)。
+    -- job は「最新版」ではなく受付時の spec_id を持ち、claim で hash を照合する。
+    -- こうしないと、依頼から claim までに仕様書が差し替わると packet_hash が同じまま中身が変わる。
+    CREATE TABLE IF NOT EXISTS ph_lp_specs (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind              TEXT NOT NULL CHECK (kind IN ('product_analysis')),
+      title             TEXT NOT NULL,
+      body              TEXT NOT NULL,          -- 全タブをテキスト化したもの
+      hash              TEXT NOT NULL,          -- body の sha256
+      sheet_titles_json TEXT NOT NULL DEFAULT '[]',
+      imported_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      imported_by       TEXT NOT NULL
+    );
+    -- 同じ中身を上げ直しても行が増えない (= 版が無駄に進まない)
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_lp_specs_hash ON ph_lp_specs(kind, hash);
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_specs_kind ON ph_lp_specs(kind, id DESC);
+    -- 「追記専用」を宣言でなく DB で担保する (Codex R4 #4)。
+    -- 宣言だけだと通常の UPDATE で中身を差し替えられ、spec_hash の照合が通ったまま
+    -- AI への実効入力が変わる = job の再現性が失われる。
+    CREATE TRIGGER IF NOT EXISTS trg_ph_lp_specs_no_update BEFORE UPDATE ON ph_lp_specs
+      BEGIN SELECT RAISE(ABORT, 'ph_lp_specs は追記専用です (更新は新しい行として入れてください)'); END;
+    CREATE TRIGGER IF NOT EXISTS trg_ph_lp_specs_no_delete BEFORE DELETE ON ph_lp_specs
+      BEGIN SELECT RAISE(ABORT, 'ph_lp_specs は追記専用です (job が版を参照しています)'); END;
+
+    -- 🚨 draft_id に FK / ON DELETE CASCADE を張らない (Codex R3 #5)。
+    --    段階1 は測定が目的なので、draft を普通に消しただけで実験記録が消えては困る。
+    -- 🚨 kind 列を作らない (Codex R3 #6)。この 2 表は**構成生成専用**。
+    --    SQLite は CHECK の変更に表の再構築が要るので「段階2 で足す」前提の列は足かせにしかならない。
+    --    段階2 の画像生成は別の表 (image job / attempt / artifact) にし、構成の結果をその入力にする。
+    CREATE TABLE IF NOT EXISTS ph_lp_compose_jobs (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id        INTEGER NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      status          TEXT NOT NULL
+                        CHECK (status IN ('queued','running','done','needs_review','failed','cancelled')),
+      packet_json     TEXT NOT NULL,          -- 受付時に固定した材料
+      packet_hash     TEXT NOT NULL,
+      packet_version  INTEGER NOT NULL,
+      spec_id         INTEGER NOT NULL REFERENCES ph_lp_specs(id),
+      spec_hash       TEXT NOT NULL,
+      lease_token     TEXT,
+      lease_until     TEXT,
+      runner_run_id   TEXT,
+      claims          INTEGER NOT NULL DEFAULT 0,
+      output_text     TEXT,                   -- ⑦ の全文 (人がコピーするもの)
+      output_hash     TEXT,
+      lint_json       TEXT,                   -- lint と parser 検査の結果
+      review_rounds   INTEGER,                -- 検品が何巡で通ったか (測定用)
+      error_code      TEXT,
+      error           TEXT,
+      requested_by    TEXT NOT NULL,
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      -- 測定用の 2 列 (Codex R4 #2)。lease は 40 分なので、3 分の合格ラインと接続されていないと
+      -- 「3 分では終わらなかったが後で成功した」job が所要時間の母数から抜けてしまう。
+      --   measurement_deadline_at = 受付時に created_at + 3 分で固定 (以後書き換えない)
+      --   completed_at            = done / failed / needs_review / cancelled の**すべて**で必ず入れる
+      --                             (finalized_at は reserve 後の終了にしか付かないので別に持つ)
+      -- 期限内に終わったかは completed_at <= measurement_deadline_at で後から計算する。
+      -- どちらも一度書いたら変えないので、集計をあとから都合よく動かせない。
+      measurement_deadline_at TEXT NOT NULL,
+      -- 🚨 実行役へ実際に配った商品画像の記録 (file_id / sha256 / bytes)。
+      --    **サーバが配ったときに自分で書く**。実行役の作業ディレクトリに置くと、
+      --    Claude のセッションが Write できてしまい「見ていないのに見たことにする」偽造ができる
+      --    (codex exec review P1)。証跡は測定の根拠なので、セッションが触れない所に持つ。
+      images_served_json TEXT NOT NULL DEFAULT '[]',
+      completed_at    TEXT,
+      finalized_at    TEXT
+    );
+    -- 二重クリック・通信リトライで job が増えない
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_lp_compose_jobs_key
+      ON ph_lp_compose_jobs(draft_id, idempotency_key);
+    -- 同じ商品で動いている依頼は 1 つだけ
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_lp_compose_jobs_active
+      ON ph_lp_compose_jobs(draft_id) WHERE status IN ('queued','running');
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_compose_jobs_status ON ph_lp_compose_jobs(status, id);
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_compose_jobs_draft ON ph_lp_compose_jobs(draft_id, id DESC);
+
+    -- AI を呼ぶ「前」に予約する行。呼んだ後の終了は必ずここを確定させる (設計 §4.3b)。
+    -- reserved のまま残る = 成否不明 → job は needs_review。自動で作り直さない。
+    CREATE TABLE IF NOT EXISTS ph_lp_compose_generations (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id         INTEGER NOT NULL REFERENCES ph_lp_compose_jobs(id) ON DELETE CASCADE,
+      packet_hash    TEXT NOT NULL,
+      lease_token    TEXT NOT NULL,
+      runner_run_id  TEXT,
+      status         TEXT NOT NULL CHECK (status IN ('reserved','accepted','rejected','discarded')),
+      model          TEXT NOT NULL,
+      prompt_version TEXT NOT NULL,
+      reserved_day   TEXT NOT NULL,
+      payload_hash   TEXT,
+      -- receipt_json には「何を見て作ったか」を残す: 実際に配った商品画像のバイト列の sha256 と枚数。
+      -- Drive の差し替えに対する**事前**照合は段階1 では張らない (Codex R4 #3 を承知で見送り):
+      -- 生成は数分で、その間に社内の商品画像が差し替わる確率は低く、事前照合には Drive metadata の
+      -- 追加参照が要る (既存 getDriveThumbnail の version はキャッシュキーで検証ではない)。
+      -- 段階2 (画像生成で本当に効く場面) で revision / md5Checksum の固定を入れる。
+      -- 段階1 は「あとから何を見たか分かる」ところまでで足りる。
+      receipt_json   TEXT,
+      discard_reason TEXT,
+      reserved_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      finalized_at   TEXT,
+      UNIQUE (job_id)                          -- 段階1 は 1 job 1 生成 (構成生成試行として閉じる)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_compose_generations_day
+      ON ph_lp_compose_generations(reserved_day);
   `);
+
+  // LP 構成: 実行役へ配った画像の記録 (PR1-b で追加。PR1-a でデプロイ済みの DB にも入れる)
+  const lpJobCols = new Set(db.prepare('PRAGMA table_info(ph_lp_compose_jobs)').all().map((c) => c.name));
+  if (lpJobCols.size > 0 && !lpJobCols.has('images_served_json')) {
+    db.exec("ALTER TABLE ph_lp_compose_jobs ADD COLUMN images_served_json TEXT NOT NULL DEFAULT '[]'");
+  }
+  // LP 構成: 実際に本回答を書いたモデル (2026-10-02・codex exec review #1591 High)。
+  // model = 頼んだモデル (reserve)。こちらはランナーが stream-json の assistant.message.model を読んで後から付ける。
+  // model_check: match / mismatch / unknown (NULL = まだ付いていない)。一度付けたら書き換えない
+  const lpGenCols = new Set(db.prepare('PRAGMA table_info(ph_lp_compose_generations)').all().map((c) => c.name));
+  if (lpGenCols.size > 0 && !lpGenCols.has('actual_model')) {
+    db.exec('ALTER TABLE ph_lp_compose_generations ADD COLUMN actual_model TEXT');
+  }
+  if (lpGenCols.size > 0 && !lpGenCols.has('model_check')) {
+    db.exec("ALTER TABLE ph_lp_compose_generations ADD COLUMN model_check TEXT CHECK (model_check IN ('match','mismatch','unknown'))");
+  }
+  if (lpGenCols.size > 0 && !lpGenCols.has('model_checked_at')) {
+    db.exec('ALTER TABLE ph_lp_compose_generations ADD COLUMN model_checked_at TEXT');
+  }
 
   // 既存 DB へのカラム追加 (warehouse-mirror/db.js の addColumnIfMissing と同方針の冪等 ALTER)
   const draftCols = new Set(db.prepare('PRAGMA table_info(product_drafts)').all().map((c) => c.name));
@@ -1431,6 +1561,29 @@ export function initProductHubDB() {
   if (!draftCols.has('added_to_draft_id')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN added_to_draft_id INTEGER');
   }
+  // Company DB の「新商品の登録」から作ったカード (2026-10-01・Company DB構想 14 ⑤-2a)。cdb_sku_id = Company DB の core.skus.sku_id。
+  // 1 つの SKU にカードは 1 枚 (部分 unique)。取り込み (services/cdb-card-intake.js) はこの一意で冪等。
+  // ph_cdb_card_events = 取り込んだ知らせ (Company DB の ops.product_hub_outbox の event_id) と結果 (作った / 結んであった / 衝突)・
+  // 発送方法 (送料コード) を楽天の配送方法に対応できたか (unmapped = カードに「要確認」)
+  if (!draftCols.has('cdb_sku_id')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN cdb_sku_id INTEGER');
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_product_drafts_cdb_sku ON product_drafts(cdb_sku_id) WHERE cdb_sku_id IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS ph_cdb_card_events (
+      event_id          TEXT PRIMARY KEY,
+      cdb_sku_id        INTEGER NOT NULL,
+      ne_code           TEXT NOT NULL,
+      outcome           TEXT NOT NULL CHECK (outcome IN ('created', 'linked', 'conflict')),
+      draft_id          INTEGER,
+      conflict_draft_id INTEGER,
+      shipping_status   TEXT CHECK (shipping_status IS NULL OR shipping_status IN ('mapped', 'unmapped')),
+      shipping_code     TEXT,
+      shipping_method   TEXT,
+      applied_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_cdb_card_events_draft ON ph_cdb_card_events(draft_id);
+  `);
   // ページ表記の自動保存 (#691): ページロードごとのトークン + 単調増加 seq。
   // 自動保存とpagehideビーコンの到着順が逆転しても「古いリクエストが新しい保存を
   // 上書きしない」ためのリビジョン (同一トークン内でのみ seq を比較する)
@@ -1754,7 +1907,7 @@ export function initProductHubDB() {
     ['workflow_state', "ALTER TABLE draft_image_production ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'active' CHECK (workflow_state IN ('active', 'on_hold'))"],
     ['hold_note', 'ALTER TABLE draft_image_production ADD COLUMN hold_note TEXT'],
     // 2026-09-13 スタッフ要望: 本番の構成の 済/まだ。縦列 ②仮構成 とは別に持つ。
-    //   NULL = 人がまだ決めていない (③素材待ちが決着していれば 済 とみなす) / 'done' / 'todo' = 人が決めた値 (推定より優先)
+    //   NULL = 人がまだ決めていない (④AI制作が決着していれば 済 とみなす) / 'done' / 'todo' = 人が決めた値 (推定より優先)
     ['compose_status', "ALTER TABLE draft_image_production ADD COLUMN compose_status TEXT CHECK (compose_status IN ('done', 'todo'))"],
     ['compose_updated_at', 'ALTER TABLE draft_image_production ADD COLUMN compose_updated_at TEXT'],
     ['compose_updated_by', 'ALTER TABLE draft_image_production ADD COLUMN compose_updated_by TEXT'],

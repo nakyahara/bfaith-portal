@@ -264,6 +264,10 @@ export async function sendPing(jobId, { status, note }, { env = process.env, fet
     const res = await fetchImpl(`${u.origin}/apps/jobs-monitor/ping/${encodeURIComponent(jobId)}?${q}`,
       { method: 'POST', headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(15000) });
     if (!res.ok) { warn(`[lz-daily] ping が受け付けられなかった: HTTP ${res.status}`); return false; }
+    // 見張りは台帳に無い id も 200 で受ける (registered: false) = 締切で見てもらえない = 送れたと数えない (Codex #1558 R2 Medium)
+    let j = null;
+    try { j = typeof res.json === 'function' ? await res.json() : null; } catch { j = null; }
+    if (j && j.registered === false) { warn(`[lz-daily] ping の id ${jobId} が Render の見張りの台帳に無い (registered: false)`); return false; }
     return true;
   } catch (e) { warn(`[lz-daily] ping 失敗: ${String(e && e.message).slice(0, 160)}`); return false; }
 }

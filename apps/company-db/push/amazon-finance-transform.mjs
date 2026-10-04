@@ -6,8 +6,11 @@
  *   月の手数料の build (apps/warehouse/rebuild-amazon-account-fees.js) の別の実装。式の文字列は比べない =
  *   **同じ決済の行を両方に通して全列一致** の試験 (scripts/test-company-db-amazon-finance.mjs) で守る。build の CASE を変えたらここも変えて試験を流す
  *
- *   重複除去 = build と同じ出現順つき: (決済, business_line_key, 文書) の中の行番号の DENSE_RANK = occ → (決済, business_line_key, occ) ごとに
- *     層 (sp_api_v1 / v2 = 1・manual_csv = 2・ほか 3) → ingested_at の新しい順 → 文書 の 1 行。
+ *   🆕 2026-10-01 (D-66・D7b-1b-3): **決済ごとに採った文書の版の行だけ** を使う (filterSelectedRows = 送り手が読み取りの取引の中で
+ *     amazon-settlement-versions.js の selectDocumentVersions で決めた版。SQL の view v_amazon_settlement_selected_documents と同じ規則)。
+ *     前 = 文書をまたいで (決済, 鍵, 出現順) ごとに層 → 新しい順で 1 行 = 新しい文書から消えた行が古い文書から残りえた。
+ *   重複除去 = build と同じ出現順つき: (決済, business_line_key, 版) の中の行番号の DENSE_RANK = occ → (決済, business_line_key, occ) ごとに
+ *     ingested_at の新しい順 → id の 1 行 (同じ版の同じ行番号 = 過去の膨張の残骸)。1 つの決済に版が 2 つ以上混ざった行が来たら整形できない (選び忘れ)。
  *     business_line_key は注文番号・posted_date・SKU・取引の種類・金額の全部を含む = 注文 (疑似注文 = 注文番号の無いその計上日の行) で絞ってから除いても build と同じ
  *   行 = (計上日, SKU, line_kind, source) ごと。SKU のある行 = 'sku' / SKU の無い行 = 月の手数料の分け方 (amazon-account-fee-rules.js) / 手数料に入れない = not_account_fee / 分けられない = unknown。
  *     SKU のある行でも BuyerRecharge と預かり金 2 種は build が日次の財務から除く → SKU を '-' にして not_account_fee (金額は net に残す = 決済の行の金額の全部)
@@ -30,7 +33,7 @@ export const FINANCE_MALL = 'amazon';
 export const FINANCE_SCOPE = 'jp';
 
 // 決済の行から読む列 (送り手の SELECT と試験がこの一覧を使う)
-export const RAW_COLUMNS = ['id', 'source_settlement_id', 'business_line_key', 'source_document_id', 'source_line_no', 'source_layer', 'ingested_at', 'posted_date_utc',
+export const RAW_COLUMNS = ['id', 'source_settlement_id', 'business_line_key', 'source_document_id', 'document_version_seq', 'source_line_no', 'source_layer', 'ingested_at', 'posted_date_utc',
   'economic_date', 'amazon_order_id', 'seller_sku_normalized', 'transaction_type', 'currency', 'quantity_purchased',
   'price_type', 'price_amount_micro', 'item_related_fee_type', 'item_related_fee_amount_micro', 'promotion_type', 'promotion_amount_micro',
   'shipment_fee_amount_micro', 'order_fee_amount_micro', 'misc_fee_amount_micro', 'other_fee_amount_micro', 'direct_payment_amount_micro', 'other_amount_micro'];
@@ -92,7 +95,6 @@ const yenOf = (v, what) => {
   if (b % MICRO !== 0n) throw new Error(`${what} が円未満の端数を持つ (${b} micro)`);
   return b / MICRO;
 };
-const layerRank = (l) => (l === 'sp_api_v1' || l === 'sp_api_v2' ? 1 : l === 'manual_csv' ? 2 : 3);
 /** SQLite の既定の並び (NULL が先・TEXT は UTF-8 のバイト順・数は数の順) */
 const sqliteCmp = (a, b) => {
   if (a == null || b == null) return a == null ? (b == null ? 0 : -1) : 1;
@@ -101,10 +103,26 @@ const sqliteCmp = (a, b) => {
   return x < y ? -1 : x > y ? 1 : 0;
 };
 
-/** build と同じ出現順つきの重複除去 (注文 (疑似注文) の全部の行を渡す)。戻り値 = 残す行 (元の順) */
+/**
+ * 決済ごとに採った版の行だけ残す (D-66)。selected = Map<決済 ID, 採った版の seq> (送り手が同じ読み取りの取引の中で決める)。
+ *   採った版の無い決済の行・ほかの版の行は落とす。戻り値 = 残す行 (元の順)
+ */
+export function filterSelectedRows(rows, selected) {
+  if (!(selected instanceof Map)) throw new Error('filterSelectedRows: 採った版の Map が無い');
+  return rows.filter((r) => { const s = selected.get(r.source_settlement_id); return s != null && r.document_version_seq != null && Number(r.document_version_seq) === Number(s); });
+}
+
+/** build と同じ出現順つきの重複除去 (注文 (疑似注文) の、採った版の行を渡す)。戻り値 = 残す行 (元の順) */
 export function dedupSettlementRows(rows) {
-  const byDoc = new Map();   // (決済, 鍵, 文書) → 行番号の一覧
-  const k3 = (r) => `${r.source_settlement_id}\u0000${r.business_line_key}\u0000${r.source_document_id}`;
+  // 1 つの決済に版が 2 つ以上 = 採る版を選び忘れた (filterSelectedRows を通していない) = 整形できない
+  const verOf = new Map();
+  for (const r of rows) {
+    const v = r.document_version_seq == null ? null : String(r.document_version_seq);
+    if (verOf.has(r.source_settlement_id) && verOf.get(r.source_settlement_id) !== v) throw new Error(`決済 ${r.source_settlement_id} の行に文書の版が 2 つ以上ある (決済ごとに採る版を 1 つに絞ってから渡す)`);
+    verOf.set(r.source_settlement_id, v);
+  }
+  const byDoc = new Map();   // (決済, 鍵, 版) → 行番号の一覧
+  const k3 = (r) => `${r.source_settlement_id}\u0000${r.business_line_key}\u0000${r.document_version_seq ?? ''}`;
   for (const r of rows) { const k = k3(r); if (!byDoc.has(k)) byDoc.set(k, []); byDoc.get(k).push(r.source_line_no ?? null); }
   const rankOf = new Map();   // DENSE_RANK ORDER BY source_line_no (同じ行番号は同じ順位)
   for (const [k, nos] of byDoc) {
@@ -114,13 +132,9 @@ export function dedupSettlementRows(rows) {
   }
   const occOf = (r) => { const d = rankOf.get(k3(r)); return d.findIndex((n) => sqliteCmp(n, r.source_line_no ?? null) === 0) + 1; };
   const best = new Map();   // (決済, 鍵, occ) → 選ぶ行
-  const better = (a, b) => {   // a が b より先か (層 → ingested_at の新しい順 → 文書。同順位は id の小さい順 = 決まった 1 行)
-    const la = layerRank(a.source_layer), lb = layerRank(b.source_layer);
-    if (la !== lb) return la < lb;
+  const better = (a, b) => {   // a が b より先か (同じ版の同じ行番号 = 残骸: ingested_at の新しい順 → id の小さい順 = build と同じ)
     const ia = sqliteCmp(a.ingested_at, b.ingested_at);
     if (ia !== 0) return ia > 0;
-    const da = sqliteCmp(a.source_document_id, b.source_document_id);
-    if (da !== 0) return da < 0;
     return sqliteCmp(a.id, b.id) < 0;
   };
   for (const r of rows) {

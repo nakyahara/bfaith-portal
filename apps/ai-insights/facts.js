@@ -346,8 +346,21 @@ function buildSalesFacts(db, periodStart, periodEnd) {
   };
 }
 
+// 「原価がそろっている」行の cost_status。
+// 統合 view に入る 6 モールの finance 表 (mirror_*_finance_sku_daily) の CHECK は
+// 'complete' / 'missing_cost' / 'partial_cost' / 'late_bound_after_close' の 4 値で、'ok' は無い
+// ('ok' は在庫の表 mirror_inv_daily_detail・v_sku_costed の別の決まり)。
+// 'complete' だけを数える理由 (各モールの build SQL の意味):
+//   - missing_cost = 原価が無い → cogs = 0 で粗利が売上近くまで膨らむ
+//   - partial_cost = Amazon はセットの構成品の一部だけ原価あり (cogs が足りない) /
+//     au PAY・LINEギフトは子・親の SKU から導いた推計 (後で置き換わる)
+//   - late_bound_after_close = 契約の枠だけで、どの build も作らない
+//   → 粗利をそのまま信じてよいのは 'complete' だけ (= is_cost_complete = 1・margin-alert・
+//     yahoo / qoo10 の分析とも同じ線)。2026-10-03 Codex R-F4-1 High 6。
+export const COST_COMPLETE_STATUS = 'complete';
+
 /** モール別粗利 (finance fact 統合ビュー) + ワーストSKU */
-function buildMarginFacts(db, periodStart, periodEnd) {
+export function buildMarginFacts(db, periodStart, periodEnd) {
   const prevStart = addDaysYmd(periodStart, -7);
   const byMall = db.prepare(`
     SELECT mall,
@@ -355,12 +368,12 @@ function buildMarginFacts(db, periodStart, periodEnd) {
            SUM(CASE WHEN date_jst >= :ps THEN sales_gross_jpy_incl ELSE 0 END) AS sales,
            SUM(CASE WHEN date_jst < :ps THEN margin_jpy_for_reporting ELSE 0 END) AS prev_margin,
            SUM(CASE WHEN date_jst < :ps THEN sales_gross_jpy_incl ELSE 0 END) AS prev_sales,
-           SUM(CASE WHEN date_jst >= :ps AND cost_status = 'ok' THEN 1 ELSE 0 END) AS rows_cost_ok,
+           SUM(CASE WHEN date_jst >= :ps AND cost_status = :complete THEN 1 ELSE 0 END) AS rows_cost_ok,
            SUM(CASE WHEN date_jst >= :ps THEN 1 ELSE 0 END) AS rows_total
     FROM v_mall_finance_daily_unified
     WHERE date_jst >= :prevStart AND date_jst < :pe
     GROUP BY mall
-  `).all({ ps: periodStart, prevStart, pe: periodEnd });
+  `).all({ ps: periodStart, prevStart, pe: periodEnd, complete: COST_COMPLETE_STATUS });
 
   const marginByMall = byMall.map((r) => ({
     mall: r.mall,
@@ -379,12 +392,12 @@ function buildMarginFacts(db, periodStart, periodEnd) {
            SUM(sales_gross_jpy_incl) AS sales,
            SUM(margin_jpy_for_reporting) AS margin
     FROM v_mall_finance_daily_unified
-    WHERE date_jst >= ? AND date_jst < ? AND cost_status = 'ok'
+    WHERE date_jst >= ? AND date_jst < ? AND cost_status = ?
     GROUP BY mall, sku_key
     HAVING SUM(units_net_sold) > 0 AND SUM(margin_jpy_for_reporting) < 0
     ORDER BY SUM(margin_jpy_for_reporting) ASC
     LIMIT 10
-  `).all(periodStart, periodEnd).map((r) => ({
+  `).all(periodStart, periodEnd, COST_COMPLETE_STATUS).map((r) => ({
     mall: r.mall,
     sku: r.sku_key,
     ne_code: r.ne_code,
@@ -395,7 +408,7 @@ function buildMarginFacts(db, periodStart, periodEnd) {
   }));
 
   return { by_mall: marginByMall, negative_margin_skus: worstSkus,
-    note: '粗利は原価整備済み行のみのワースト抽出。cost_ok_row_share_pct が低いモールは粗利の信頼度も低い' };
+    note: '粗利は原価整備済み行 (cost_status=complete) のみのワースト抽出。cost_ok_row_share_pct (= その行の割合) が低いモールは粗利の信頼度も低い' };
 }
 
 /** 在庫 (カテゴリ別 最新日 vs 7日前) + 滞留・欠品リスク件数 */

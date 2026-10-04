@@ -11,7 +11,7 @@
  * buildItemPayload が provisional_code=1 を見て出品を止める (出品直前ゲート)。
  */
 import { getDB, logEvent } from '../db.js';
-import { ensureProgress, setStepState } from '../lib/workflow-progress.js';
+import { ensureProgress, setStepState, IMAGE_RAKUTEN_STAGE } from '../lib/workflow-progress.js';
 import { SET_NE_STEP_CODE } from '../lib/set-decision.js';
 // 画像の引き継ぎ計画 (§4.7)。枠の数え方・語彙・「制作が要るか」の判定は lib 側が正
 import {
@@ -579,6 +579,21 @@ export function pendingImagePlanSlots(db, setDraftId) {
  * (親の画像をコピーしてあるので、出品ゲートの TOP 画像も満たせる)。
  * 1 枠でもあれば skip を todo に戻して「依頼」から始める。
  * 🚨 **done は触らない** — 人が進めた工程を巻き戻さない。動かすのは todo ⇄ skip だけ。
+ *
+ * 🚨 **⑧楽天登録 (image_stage='rakuten') は「対象外」にしない** (2026-10-01)。
+ * この関数が表しているのは「画像を**作る**仕事が要るか」で、⑧は作った画像を楽天に載せる
+ * 後工程 = **実際に楽天へ出したか**を表す工程 (出品すると自動で完了する)。
+ * 親の画像をそのまま使うセットも楽天には出すので、ここを「対象外」にすると
+ *   ・まだ楽天に出していないのにカードが完了列に入る
+ *   ・人が ⑧楽天登録 の列へ戻しても、画像の計画を保存し直すと黙って対象外に戻る
+ * という食い違いになる (2026-10-01 スタッフ報告「2個セットで楽天未登録なのに
+ * 楽天登録に移動しようとすると A+コンテンツまで飛ばされる」の根っこ)。
+ * ⑨A+登録 も厳密には同じ性格だが、全部そのまま使うセットに毎回 A+ の作業を出すかは
+ * 運用の判断なので、要望が出るまで従来どおり計画に従わせる。
+ *
+ * ただし **「対象外」で残っている ⑧ は、計画を保存し直したときに開き直す** —
+ * 反映対象から完全に外すと、この修正より前に作ったセット (⑧が skip のまま) が
+ * 計画を直しても永久に完了列から出てこない (Codex 名指し R2 P1)。
  * @returns {{needsProduction: boolean, changed: number}}
  */
 export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
@@ -591,6 +606,9 @@ export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
     SELECT p.step_code, p.state FROM draft_step_progress p
     JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
     WHERE p.draft_id = ? AND s.track = 'image' AND s.image_kind = 'detail'
+      ${/* 工程コードでなく image_stage で外す (管理画面で改名されても壊れない)。
+            段階キーは workflow-progress.js の IMAGE_RAKUTEN_STAGE が正 (定数なので SQL に埋める) */''}
+      AND COALESCE(s.image_stage, '') <> '${IMAGE_RAKUTEN_STAGE}'
   `).all(id);
   const from = needs ? 'skip' : 'todo';
   const to = needs ? 'todo' : 'skip';
@@ -599,16 +617,63 @@ export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
     SET state = ?, version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     WHERE draft_id = ? AND step_code = ? AND state = ?
   `);
-  let changed = 0;
-  for (const r of rows) changed += upd.run(to, id, r.step_code, from).changes;
-  if (changed > 0) {
+  // 制作工程 (①〜⑦⑨) の変更数と ⑧ の変更数は**別に数える** (Codex 名指し R6 P2:
+  // ⑧ だけ動いたときに「制作工程を戻しました」の汎用イベントが出ると、履歴が実態と食い違う)
+  let productionChanged = 0;
+  for (const r of rows) productionChanged += upd.run(to, id, r.step_code, from).changes;
+  // ⑧楽天登録 は「対象外」にはしないが、**対象外で残っていれば開き直す** (上の 🚨 のとおり)。
+  // 人が進めた done は触らない (todo ⇄ skip だけ、は他の工程と同じ)。
+  // 開き方は楽天の実態で決める (Codex R10 P2 / 名指し R5 P1):
+  //   ・楽天モールが「対象外」= この商品は楽天に出さない → ⑧も対象外のまま置く。
+  //     開くと、出品の根拠が無いので閉じられず、対象外に戻すのは管理者だけ = カードが詰まる
+  //   ・もう出ている (登録記録 / モール done) → **done** で開く。`todo` にすると
+  //     モールの done 遷移はもう起きないので閉じる自動の経路が無く、出品済みなのに列に残る
+  //   ・それ以外 → `todo` (これから出す)
+  const rkEvidence = db.prepare(`
+    SELECT (SELECT registered_at FROM draft_rakuten WHERE draft_id = @id) AS registered_at,
+           (SELECT state FROM draft_mall_status WHERE draft_id = @id AND mall = 'rakuten') AS mall_state,
+           (SELECT listed_at FROM draft_mall_status WHERE draft_id = @id AND mall = 'rakuten') AS listed_at
+  `).get({ id }) || {};
+  const rkSkipped = rkEvidence.mall_state === 'skip';
+  const listedRk = !rkSkipped && (!!rkEvidence.registered_at || rkEvidence.mall_state === 'done');
+  let rakutenChanged = 0;
+  if (!rkSkipped) {
+    rakutenChanged = db.prepare(`
+      UPDATE draft_step_progress
+      SET state = @state, done_at = @done_at, done_by = @done_by,
+          version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE draft_id = @id AND state = 'skip' AND step_code IN (
+        SELECT code FROM ph_steps WHERE active = 1 AND track = 'image' AND image_kind = 'detail'
+          AND image_stage = '${IMAGE_RAKUTEN_STAGE}'
+      )
+    `).run({
+      id,
+      state: listedRk ? 'done' : 'todo',
+      // 🚨 完了の日時・人は**実際に楽天へ出したときのもの**を使う (名指し R5 P2)。
+      //    計画を保存した時刻・人を入れると、工程の所要時間や担当者の集計が狂う。
+      //    どちらも取れないときは時刻を空にして、誰がやったかは下のイベントに残す
+      done_at: listedRk ? (rkEvidence.registered_at || rkEvidence.listed_at || null) : null,
+      done_by: listedRk ? 'system' : null,
+    }).changes;
+  }
+  const changed = productionChanged + rakutenChanged;
+  if (productionChanged > 0) {
     logEvent(db, id, 'set_image_plan_track',
       needs
         ? '画像の計画に「直して使う/作り直す」が入ったので、画像の制作工程を戻しました'
         : '画像はすべて親のものを使う計画なので、画像の制作工程を「対象外」にしました',
       actor);
   }
-  return { needsProduction: needs, changed };
+  // ⑧を動かしたことは**別のイベント**で残す (制作工程の話と混ぜると、
+  // 「制作工程を戻しました」の 1 行の中に ⑧ の補正が埋もれる — 名指し R5 P2)
+  if (rakutenChanged > 0) {
+    logEvent(db, id, 'set_image_plan_rakuten',
+      listedRk
+        ? `楽天登録(⑧) が「対象外」で残っていたので、出品済みの根拠 (${rkEvidence.registered_at ? 'アプリからの登録記録' : 'モール別の展開状況'}) を見て「完了」にしました`
+        : '楽天登録(⑧) が「対象外」で残っていたので「未着手」に戻しました (セットも楽天には出すため)',
+      actor);
+  }
+  return { needsProduction: needs, changed, rakutenChanged, rakutenSkipped: rkSkipped };
 }
 
 /**

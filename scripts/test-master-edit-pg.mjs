@@ -27,6 +27,11 @@
  *     保存が先 = ロードは鍵で待ってから最後まで (行の鍵で待ち合わない = デッドロックしない)
  *  16 NE の観測の書き込み × 古い観測の昇格 (R3 M4): 昇格がセットの鍵を持っている間、新しい観測の書き込みは待つ (昇格の後に書かれる)
  *  17 画面のロールの直接の書き込み (R3 M2・R4 M2): begin_master_write の前は 42501・約束の相手でない SKU も 42501・偽の core.actor_* は記録に残らない
+ *  18 新商品の NE 登録の CSV を作る取引 × 同じ商品の保存 (⑤-2b・0053): 保存は SKU の鍵で待ち、作った後の CSV (まだ配っていない) を「使わない」にしてから保存する
+ *  19 JAN を 2 つの商品に同時に付ける (⑤-2b): 後の方は一意の索引で待ち、前の方の commit の後に 409 jan_taken (500 にしない・両方は付かない)
+ *  20 同じファイルの「取り込んだ」の申告が 2 つ並ぶ (⑤-2b・DB の関数 ops.ne_reg_declare): 後の方は鍵で待ち「もう一度」・NE 登録待ちへは 1 回だけ・画面のロールは表を直接書けない・
+ *     約束を書く部品の関数 (ops.open_reg_write) を呼べない・JAN の行を直接書けない・申告の約束 (reg_csv_declare) は関数が書く (0053・#1571 R1 High 3)
+ *  (9・12 は 0053 で: 代表の仕入先に使っている仕入先は止められない = 待った後に supplier_in_use / 付け替えてから止める)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-edit-pg.mjs
  *   (この PC では C:/tmp/pg-embed の run-conc.mjs が使い捨ての PostgreSQL を起動して TEST_PG_URL を渡す)
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロール master_* をクラスタに作る)。localhost 以外の URL は拒む (本番を渡さない)。
@@ -46,6 +51,8 @@ if (!['localhost', '127.0.0.1', '::1', '[::1]'].includes(u0.hostname)) { console
 
 const W = await import('../lib/master-write.mjs');
 const C = await import('../lib/master-cutover.mjs');
+const R = await import('../lib/master-register.mjs');
+const G = await import('../lib/master-reg-csv.mjs');
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -127,8 +134,12 @@ try {
   });
   assert.equal((await O.query('select phase from ops.master_cutover_state')).rows[0].phase, 'frozen', '[0] で frozen に進んでいない');
   await acks(ALL_COMPANY, 'frozen');
+  // 0055 (④a): company_owner に進むのは持ち主の epoch が active で段階の持ち主表と同じときだけ = 試験で置く (本番 = ④a の activate)
+  await (await import('./fixtures/master-epoch.mjs')).seedActiveEpoch(dbO, ALL_COMPANY);
   await C.advanceCutoverPhase(dbP, { to: 'company_owner', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: h } });
   await acks(ALL_COMPANY, 'company_owner');
+  // 0052 (⑤-2a): new_open の前に既存の SKU の登録の状態 (backfill) が要る (運用のロールで)
+  { const p = (await dbP.query('select * from ops.registration_backfill_plan()')).rows[0]; await dbP.query('select ops.backfill_sku_registrations($1, $2, $3)', [p.sku_count, p.snapshot_hash, 't@test']); }
   await C.advanceCutoverPhase(dbP, { to: 'new_open', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: h } });
   assert.equal((await O.query('select phase from ops.master_cutover_state')).rows[0].phase, 'new_open');
 
@@ -298,7 +309,9 @@ try {
     assert.equal(o.done, false, '止める側は保存が持つ仕入先の行の鍵で待つ');
     g.open();
     assert.ok((await a2.promise).ok);
-    assert.ok((await o.promise).ok);
+    // 0053 (⑤-2b・Medium 3): 待った後、代表の仕入先に使われている (p003) と分かって止めない (付け替えてから止める = [12])
+    const ro = await o.promise;
+    assert.match(String(ro.err?.message), /supplier_in_use/, ro.err ? ro.err.message : '止められてしまった');
   });
 
   await ta('[10] 同じ request_id の失敗する保存が 2 つ並ぶ = 失敗の記録は 1 行だけ・両方とも同じ誤り', async () => {
@@ -343,7 +356,16 @@ try {
   });
 
   await ta('[12] 画面を開いた後に仕入先の有効が変わった = 編集の印が違う (409) → 開き直すと保存できる', async () => {
-    const token = await tokenOf('p001');   // p001 の仕入先 0001 は [9] で止めた (名前は [5] の CSV が出ているので発注の月数で)
+    // p001 の仕入先 0001 を止める。0052: [9] で代表にした p003 を、同じ取引で 0003 に付け替えてから (名前は [5] の CSV が出ているので発注の月数で)
+    await O.query('begin');
+    await O.query("insert into core.suppliers (company_id, code, name) values (1, '0003', '三番')");
+    await O.query(`insert into core.supplier_skus (company_id, supplier_id, sku_id, is_primary)
+      select 1, s.supplier_id, k.sku_id, false from core.suppliers s, core.skus k where s.code = '0003' and k.code = 'p003'`);
+    await O.query("update core.supplier_skus set is_primary = false where sku_id = (select sku_id from core.skus where code = 'p003') and is_primary");
+    await O.query("update core.supplier_skus set is_primary = true where sku_id = (select sku_id from core.skus where code = 'p003') and supplier_id = (select supplier_id from core.suppliers where code = '0003')");
+    await O.query("update core.suppliers set active = false where code = '0001'");
+    await O.query('commit');
+    const token = await tokenOf('p001');
     await O.query("update core.suppliers set active = true where code = '0001'");
     await assert.rejects(() => save(dbA, 'p001', { reorder_months: '4' }, { token }), (e) => e.reason === 'version_conflict');
     const s = await save(dbA, 'p001', { reorder_months: '4' }, { token: await tokenOf('p001') });
@@ -487,6 +509,81 @@ try {
     await denied(A, "insert into ops.master_write_sessions (session_id, txid, request_id, operation, sku_id, derived_sku_ids, target_product_ids, edit_token, payload_hash, versions, actor_id, source_system, db_user, phase, owner_hash, ownership) values (gen_random_uuid(), txid_current(), gen_random_uuid(), 'sku_edit', 1, '{}', '{}', repeat('a', 64), repeat('a', 64), '{}', 'x', 'portal_master_edit', 'x', 'new_open', repeat('a', 64), '{}')", 'edit: sessions に直接');
     assert.equal(Number((await q("select count(*)::int as n from events.master_change_events where actor_id = 'forged@evil'"))[0].n), 0);
     assert.equal(Number((await q("select count(*)::int as n from ops.master_write_sessions where db_user = 'master_edit'"))[0].n) > 10, true);
+  });
+
+  // ─── ⑤-2b (0053): 新商品の NE 登録の CSV (書くのは DB の関数 = 画面のロール master_edit で)・JAN ───
+  const RUN = 'mc_20300110T000000000Z_aaaaaa';
+  await O.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, '2030-01-10T00:00:00Z', 0)`, [RUN]);
+  await O.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: RUN, entries: ['p001', 'p002', 'p003', 'p004', 'ps01'].map((c) => ({ code_norm: c, kind: 'product', state: 'ok', ne_code: c, spellings: [c] })) })]);
+  const rates = new Map([['S01', { method: 'ゆうパケット', cost: 210 }]]);
+  await R.registerNewSku(dbA, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: 'pnew', card: { create: false },
+    values: { name: '新しい単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', cost: { jpy: '300' } } },
+  { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: rates });   // 原価の始まり = DB の東京の今日 (0052)
+
+  await ta('[18] NE 登録の CSV を作る取引の途中は、同じ商品の保存が SKU の鍵で待つ → 作った後に保存 = そのファイル (まだ配っていない) を使わないにして保存する', async () => {
+    const g = gate();
+    const a = launch(G.buildRegExport(dbA, { actor: 'boss@test', kind: 'products', codes: ['pnew'], requestId: crypto.randomUUID() },
+      { ownership: ALL_COMPANY, open: true, nowMs: NOW.getTime(), beforeCommit: g.wait }));
+    await sleep(300);
+    const token = await tokenOf('pnew');
+    const b = launch(save(dbB, 'pnew', { name: '直した名前' }, { token }));
+    await sleep(500);
+    assert.equal(b.done, false, '保存は SKU の鍵で待つ');
+    g.open();
+    const ra = await a.promise;
+    assert.ok(ra.ok, ra.err?.message);
+    const rb = await b.promise;
+    assert.ok(rb.ok, rb.err?.message);
+    assert.ok(rb.ok.warnings.some((w) => w.includes(`#${ra.ok.export.export_id}`)), JSON.stringify(rb.ok.warnings));
+    assert.deepEqual((await q('select state, close_reason from ops.ne_reg_exports where export_id = $1', [ra.ok.export.export_id]))[0], { state: 'closed', close_reason: 'superseded' });
+  });
+
+  await ta('[19] 同じ JAN を 2 つの商品に同時に = 後の方は一意の索引で待ち、前の方の commit の後に 409 jan_taken (両方は付かない)', async () => {
+    const jan = '4900000000108';
+    assert.equal(W.janValid(jan), true);
+    const g = gate();
+    const a = launch(save(dbA, 'p001', { jan }, { token: await tokenOf('p001'), beforeCommit: g.wait }));
+    await sleep(300);
+    const b = launch(save(dbB, 'p002', { jan }, { token: await tokenOf('p002') }));
+    await sleep(500);
+    assert.equal(b.done, false, '後の方は一意の索引で待つ');
+    g.open();
+    assert.ok((await a.promise).ok);
+    const rb = await b.promise;
+    assert.equal(rb.err?.reason, 'jan_taken', rb.err?.message || 'ok になった');
+    assert.equal(Number((await q("select count(*)::int as n from core.external_ids where system = 'jan' and external_value = $1 and valid_to is null", [jan]))[0].n), 1);
+  });
+
+  await ta('[20] 同じファイルの申告が 2 つ並ぶ (画面のロール・DB の関数) = 後の方は鍵で待ち、前の方の後に「もう一度」(試みを足すだけ)・NE 登録待ちへは 1 回だけ', async () => {
+    // 代表の仕入先 = 0003 ([12] で作った・使える。0002 は [9] で止めた)
+    await R.registerNewSku(dbA, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: 'pnew2', card: { create: false },
+      values: { name: '新しい単品 2', standard_price: '1600', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0003', cost: { jpy: '310' } } },
+    { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: rates });   // 原価の始まり = DB の東京の今日 (0052)
+    const o = { ownership: ALL_COMPANY, open: true, nowMs: NOW.getTime() };
+    const b0 = await G.buildRegExport(dbA, { actor: 'boss@test', kind: 'products', codes: ['pnew2'], requestId: crypto.randomUUID() }, o);
+    await G.issueRegExport(dbA, { actor: 'boss@test', exportId: b0.export.export_id }, o);
+    const dec = (db, extra = {}) => G.declareRegExport(db, { actor: 'boss@test', exportId: b0.export.export_id, sha256: b0.export.sha256, result: 'ok' }, { ...o, ...extra });
+    const g = gate();
+    const a = launch(dec(dbA, { beforeCommit: g.wait }));
+    await sleep(300);
+    const b = launch(dec(dbB));
+    await sleep(500);
+    assert.equal(b.done, false, '後の申告は鍵で待つ');
+    g.open();
+    const [ra, rb] = [await a.promise, await b.promise];
+    assert.deepEqual([ra.ok?.state, ra.ok?.ne_pending, rb.ok?.again], ['declared', ['pnew2'], true], JSON.stringify([ra.ok || ra.err?.message, rb.ok || rb.err?.message]));
+    assert.equal(Number((await q("select count(*)::int as n from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code = 'pnew2' and e.to_state = 'ne_pending'"))[0].n), 1);
+    assert.equal(Number((await q('select count(*)::int as n from ops.ne_reg_attempts where export_id = $1', [b0.export.export_id]))[0].n), 2);
+    // 画面のロールは表を直接書けない (本物のログイン)
+    await denied(A, `update ops.ne_reg_export_items set state = 'verified' where export_id = ${Number(b0.export.export_id)}`, 'ne_reg_export_items の直接の update');
+    await denied(A, `select ops.transition_sku_registration(1, 'ne_confirmed', 'system', 'x', null, '{}'::jsonb, null)`, '状態の関数');
+    // 本物のログインでも: 約束を書く部品の関数は呼べない・JAN の行は直接書けない (JAN の約束の関数の中だけ)。申告の約束 (reg_csv_declare) と done は関数が書く
+    await denied(A, "select ops.open_reg_write('reg_csv_supersede', gen_random_uuid(), 'boss@test', null, '{}'::jsonb, null, null, null, repeat('a', 64), '{}'::jsonb)", '約束を書く部品の関数');
+    await denied(A, `insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id, evidence)
+      select 1, 'product', product_id, 'jan', 'jan', '4900000000146', 'manual', 'human', 'x', '{}'::jsonb from core.skus where code = 'p003'`, 'JAN の直接の書き込み');
+    const ev = (await q("select e.actor_id, e.request_id from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code = 'pnew2' and e.to_state = 'ne_pending'"))[0];
+    const sess = await q("select s.actor_id, s.db_user, s.operation, d.status from ops.master_write_sessions s join ops.master_edit_requests d on d.request_id = s.request_id where s.request_id::text = $1", [ev.request_id]);
+    assert.deepEqual([ev.actor_id, sess.map((s) => [s.actor_id, s.db_user, s.operation, s.status])], ['boss@test', [['boss@test', 'master_edit', 'reg_csv_declare', 'done']]]);
   });
 } finally {
   for (const c of clients.reverse()) { try { await c.end(); } catch { /* */ } }

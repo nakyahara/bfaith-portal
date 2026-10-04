@@ -11,6 +11,9 @@
 import Database from 'better-sqlite3';
 import { MIRROR_PRODUCTS_DDL, MIRROR_SET_COMPONENTS_DDL } from './material-tables.js';
 import { createProductScoutTables } from '../product-scout/schema.js';
+import { createSkuMapGenerationTables } from './sku-map-state-schema.js';   // import を持たない部品 (amazon-pricing の書き込む経路の試験がたどる)
+// 統合の view (v_mall_finance_daily_unified) の Amazon の枝が読む表の名前 = 共通の読み口 (F4-1・consumer 'mall-finance-unified-view')。import を持たない部品
+import { financeDailyTable } from '../../lib/amazon-finance-read.js';
 import path from 'path';
 import fs from 'fs';
 import {
@@ -22,6 +25,18 @@ const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'warehouse-mirror.db');
 
 let db = null;
+
+// Amazon の「税込の売上」= mirror_amazon_finance_sku_daily の 1 行の式 (他モールの gross_sales_jpy_incl と同じ意味)。
+//   本体 + 送料 + ギフト包装 (どれも決済の額 = 税抜) + 決済の消費税の実額 (Tax + ShippingTax + GiftWrapTax)。
+//   × 1.10 の推定ではない (軽減税率 8% の商品も正しい)。値引き (promotion)・ポイント・返金・手数料は引かない
+//   (= 楽天・Yahoo!・au PAY の gross_sales_jpy_incl も店のクーポン・ポイント・返金の前)。
+//   🚨 sales_tax_jpy は返金の行の税 (−) も足した正味 = 返金のあった日はその税の分だけ少なく出る (本体の返金は引かない)。
+//   列は表の別名なしで書く (FROM が mirror_amazon_finance_sku_daily 1 つの所・別名の表に同じ名前の列が無い所で使う)。
+//   使う所: v_mall_finance_daily_unified の Amazon の枝 / supplier-sales (仕入先別の売上・公開の口あり)。
+//   2026-10-03 Codex R-F4-1 High 6 (supplier-sales が Amazon だけ本体の税抜を足していた)。
+export const AMAZON_SALES_GROSS_INCL_SQL =
+  '(COALESCE(sales_principal_jpy,0) + COALESCE(sales_shipping_jpy,0)'
+  + ' + COALESCE(sales_giftwrap_jpy,0) + COALESCE(sales_tax_jpy,0))';
 
 // Yahoo!表の初期化失敗を保持 (mirror本体は継続する fail-soft。router が sync 応答に載せる)。
 // 2026-07-12 の本番障害 (#476→#477 revert) の再発防御: 新規表のDDLで落ちても既存モールを道連れにしない
@@ -48,6 +63,11 @@ export let productScoutInitError = null;
 // SKUマップ 2種 (yahoo/aupay) も同様 (価格一括改定ツール PR1、2026-08-28)
 export let skuMapInitError = null;
 
+// Amazon SKU の対 (mirror_sku_master + mirror_sku_resolved) の世代の状態も同様 (PR ⑦-0、2026-10-01)。
+// 作れなくても他の表は続ける。これが立っている間は、確かめる口 (GET /api/sync/sku-map/state) が 503 (capability を出さない)・
+// 世代つきの対も 503 で断る。世代なしの対は今までどおり (表が無い = 一度も有効になっていない。表があって行があれば有効のまま = 409)
+export let skuMapGenerationInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -62,6 +82,7 @@ export function initMirrorDB() {
   logizardStockInitError = null;
   productScoutInitError = null;
   skuMapInitError = null;
+  skuMapGenerationInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -231,6 +252,17 @@ function createTables() {
     synced_at          TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mir_sku_master_updated ON mirror_sku_master(source_updated_at)');
+
+  // mirror_sku_map_state — 上の 2 表 (SKU の対) の世代の状態 (PR ⑦-0。Company DB構想 16 §7 H1 / §8 契約 v3)。
+  //   1 行だけ・消せない・世代は下げられない (trigger・名前に版 _v1)。mirror_sku_resolved に構成の時刻の列 (component_created_at / component_updated_at) も足す。
+  //   1 つの取引で作り、最後に列と trigger の定義を照らす (違えば投げる = 初期化の失敗)。
+  //   表の定義 = sku-map-state-schema.js・受け手の決まり = sku-map-generation.js。fail-soft (2026-07-12 障害の教訓: 新しい表の DDL で他の表を道連れにしない)
+  try {
+    createSkuMapGenerationTables(db);
+  } catch (e) {
+    skuMapGenerationInitError = { message: String(e.message || e), code: e.code || null };
+    console.error('[Mirror] SKU の対の世代の表の初期化に失敗 (他の表は続ける・世代つきの対は 503 で断る):', e.message);
+  }
 
   // mirror_inv_daily_summary — 日次在庫スナップショットの集計結果ミラー
   // 元: ミニPC warehouse.db.inv_daily_summary
@@ -2583,8 +2615,7 @@ function createTables() {
       NULL AS ne_code,
       product_name,
       CAST(units_net_sold AS INTEGER) AS units_net_sold,
-      COALESCE(sales_principal_jpy,0) + COALESCE(sales_shipping_jpy,0)
-        + COALESCE(sales_giftwrap_jpy,0) + COALESCE(sales_tax_jpy,0) AS sales_gross_jpy_incl,
+      ${AMAZON_SALES_GROSS_INCL_SQL} AS sales_gross_jpy_incl,
       -- 🚨 apps/amazon-dashboard/queries.js の PROFIT_EX_SQL と同じ式 (手数料は決済の額 = 税込 → 1/11 を戻す)。変えるときは両方
       profit_amount
         + (COALESCE(commission_jpy,0) + COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) + COALESCE(closing_fee_jpy,0)
@@ -2598,7 +2629,7 @@ function createTables() {
       CASE WHEN COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) > 0 THEN 1 ELSE 0 END AS is_fba,
       sales_principal_jpy,
       synced_at
-    FROM mirror_amazon_finance_sku_daily
+    FROM ${financeDailyTable('mall-finance-unified-view')}
     UNION ALL
     SELECT
       date_jst, 'rakuten',
