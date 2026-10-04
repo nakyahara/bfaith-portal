@@ -42,6 +42,11 @@
  *     ALTER ROLE / DATABASE … SET・UPDATE pg_settings = 本物の PG と PGlite で役割が戻る形を流す前に止める / O14 (High 2) = 前の file が
  *     standard_conforming_strings = off を残しても次の file の set_config('r\ole', …)・'a\'b'; RESET ROLE; … は止まる (2 つの file・本物の PG と PGlite)・
  *     file の中の字句の前提の GUC の変更を拒む・reset_val が off なら流さない・legacy は今までどおり / C15 = concurrent-index の session も同じ前提
+ *   🆕 Codex R4 (PR #1606): O15 (High 1) = 前の legacy の file が off を残しても、owner-transition の本文・ふつうの legacy の file の
+ *     `SELECT 'a\'b'; COMMIT; SELECT 'x\'';` は Postgres の構文の誤りで何も流さずに止まる (取引の中で流す全部の file に字句の前提・本物の PG と PGlite)・
+ *     legacy / owner-transition の file の中の字句の前提の GUC の変更は ⚠️ だけ / O16 (High 2) = 行コメントの CR だけの改行・字句の頭の NBSP / U+3000
+ *     (Postgres では識別子の文字) で隠した RESET ROLE・SET session_authorization・COMMIT を、ふつうの file・owner-transition・owner の file・ドルの引用の中で
+ *     流す前に止める (本物の PG と PGlite で効くことを前提に確かめる)・1 行目の印も CR だけの改行で読む
  * 使い方: node scripts/test-company-db-migrate-lock-pg.mjs   (npm run test:company-db にも入っている)
  *   使い捨てのクラスタを embedded-postgres で起動し、最後に止めて消す (test-company-db-profit-fn-revoke-pg.mjs と同じ作り)。
  *   見つからない・版が違う・起動できない・フォルダが消えない = 失敗 (exit 1)
@@ -60,6 +65,7 @@ import {
   splitSqlStatements, parseConcurrentIndexStatement, planConcurrentIndexFile, estimateIndexBytes, roleSwitchStatements, ALLOWED_SET_LOCAL_ROLES, MIGRATE_LOCK_NAME, DISK_ESTIMATE, DEFAULT_DIR,
   txControlStatements, renderResourceMatchesUrl, renderDiskMetricsReader, migrationStatus, RENDER_PG_HOST_MAPPING, roleAdminReachable, ROLE_ADMIN_FORBIDDEN_PREDEFINED,
   unicodeEscapeLiterals, ROLE_GUCS, LEXER_GUCS, OWNER_MODE_FORBIDDEN_GUCS, LEXER_PREMISE,
+  lexerPremiseChanges, isOwnerTransitionText, isConcurrentIndexText,
 } from './company-db/migrate.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -1400,6 +1406,215 @@ alter table ops.migrate_owner owner to ${prole};
       assert.deepEqual((await applyMigrations(db, { dir: dirBs(), log: quiet })).applied, ['0001', '0002']);
       assert.equal((await db.query('show standard_conforming_strings')).rows[0].standard_conforming_strings, 'off', 'PGlite: SET LOCAL が取引の外に残った');
     } finally { await pgl.close(); }
+  });
+
+  // 🆕 Codex R4 High 1: 取引の制御の文の検査 (txControlStatements) も lexSql の読み方 = 字句の前提を owner-transition・legacy の file にも入れる
+  const R4_TX_BYPASS = "SELECT 'a\\'b'; COMMIT; SELECT 'x\\'';";
+  const pgCount = async (c, rel) => (await c.query('select count(*)::int as n from pg_class where relname = $1', [rel])).rows[0].n;
+  await t('O15 (Codex R4 High 1) 前の legacy の file が SET standard_conforming_strings = off を session に残しても、owner-transition の本文・ふつうの legacy の file の `SELECT \'a\\\'b\'; COMMIT; SELECT \'x\\\'\';` は何も流さずに止まる (runner が取引の中で流す全部の file の本文の前に別のクエリで SET LOCAL・本物の PG と PGlite) / legacy・owner-transition の file の中の字句の前提の GUC の変更は ⚠️ だけで今までどおり流れる / 0001〜 には字句の前提の GUC が無い', async () => {
+    for (const f of listMigrationFiles()) assert.deepEqual(lexerPremiseChanges(f.text), [], `0001〜 に字句の前提の GUC: ${f.file}`);
+    assert.deepEqual(txControlStatements(R4_TX_BYPASS), [], '(前提) 字句の検査は COMMIT を見つけない (on の読み方では文字列の中)');
+    assert.ok(lexerPremiseChanges('set standard_conforming_strings = off;').length > 0);
+    // (前提) 本物の PG: off の session では同じ本文の COMMIT が本当に流れる (取引を途中で切る)
+    {
+      const c = await openDep(await newDepDb());
+      await c.query('set standard_conforming_strings = off');
+      await c.query('begin');
+      await c.query(`create table public.o15_pre (x int); ${R4_TX_BYPASS}`);
+      await c.query('rollback');   // 取引は無い (警告だけ)
+      assert.equal(await pgCount(c, 'o15_pre'), 1, '(前提) off で COMMIT が流れない');
+      await c.query('reset standard_conforming_strings');
+    }
+    // 本物の PG: 0002 (legacy) が off を残す → 0003 (owner-transition / ふつうの legacy) の本文の前に on = Postgres の構文の誤り = 何も流さない
+    for (const kind of ['owner-transition', 'legacy']) {
+      const dbName = await newDepDb();
+      const c = await openDep(dbName);
+      const body = kind === 'owner-transition'
+        ? transitionSql(dbName, await newOwnerRole()).replace('-- migrate:owner-transition\n', `-- migrate:owner-transition\ncreate table app.o15_before (x int);\n${R4_TX_BYPASS}\n`)
+        : `create table app.o15_before (x int);\n${R4_TX_BYPASS}\ncreate table app.o15_after (x int);\n`;
+      assert.deepEqual(txControlStatements(body), [], `(前提) ${kind}: 字句の検査は見つけない`);
+      const logs = [];
+      let err = null;
+      try { await migrate(c, { dir: mkDir({ '0001_base.sql': BASE, '0002_off.sql': 'create table app.o15_legacy (x int);\nset standard_conforming_strings = off;\n', '0003_r4.sql': body }), log: (m) => logs.push(m) }); } catch (e) { err = e; }
+      assert.ok(err && err.code === 'MIGRATION_FAILED' && err.version === '0003', `${kind}: 止まらない (${err ? `${err.code} ${err.message}` : '成功した'})`);
+      assert.equal(await pgCount(c, 'o15_before'), 0, `${kind}: COMMIT の前の本文が残った (取引を切られた)`);
+      assert.equal(await pgCount(c, 'o15_after'), 0);
+      assert.equal(await pgCount(c, 'migrate_owner'), 0, `${kind}: 印が残った`);
+      assert.equal(await pgCount(c, 'o15_legacy'), 1, 'legacy の 0002 は今までどおり流れる');
+      assert.ok(logs.some((m) => /⚠️ 0002_off\.sql: 字句の前提の GUC を変える文/.test(m)), `legacy の ⚠️ が無い: ${logs.join(' / ')}`);
+      assert.equal((await c.query('show standard_conforming_strings')).rows[0].standard_conforming_strings, 'off', 'legacy の file が残した session の設定は runner が触らない (今までどおり)');
+      await c.query('reset standard_conforming_strings');
+      const dbSu = new URL(suUrl); dbSu.pathname = `/${dbName}`;
+      const s2 = await openPgClient(dbSu.toString()); s2.on('error', () => {}); clients.push(s2);
+      assert.deepEqual((await s2.query('select version from ops.schema_migrations order by 1')).rows.map((r) => r.version), ['0001', '0002'], kind);
+      assert.deepEqual(await whoami(c), { cu: DEPLOYER, su: DEPLOYER });
+      assert.deepEqual(await lockHolders(dbName), []);
+    }
+    // owner-transition の file の中の字句の前提の GUC の変更 = ⚠️ だけで流れ、次の owner の状態の file は前提の中で流れる
+    {
+      const dbName = await newDepDb();
+      const c = await openDep(dbName);
+      const role = await newOwnerRole();
+      const logs = [];
+      const r = await migrate(c, { dir: mkDir({ '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role, { tail: 'set standard_conforming_strings = off;\n' }), '0003_ok.sql': "create table app.o15_ok (x text);\ninsert into app.o15_ok values ('a\\b');\n" }), log: (m) => logs.push(m) });
+      assert.deepEqual(r.applied, ['0001', '0002', '0003']);
+      assert.ok(logs.some((m) => /⚠️ 0002_owner\.sql: 字句の前提の GUC を変える文.*owner-transition/.test(m)), logs.join(' / '));
+      const dbSu = new URL(suUrl); dbSu.pathname = `/${dbName}`;
+      const s2 = await openPgClient(dbSu.toString()); s2.on('error', () => {}); clients.push(s2);
+      assert.equal((await s2.query('select x from app.o15_ok')).rows[0].x, 'a\\b', '0003 は on の読み方 (\\ は文字) で流れる');
+      await c.query('reset standard_conforming_strings');
+    }
+    // PGlite の道も同じ (1 つの session = 0002 の off が残る)
+    for (const kind of ['owner-transition', 'legacy']) {
+      const pgl = new PGlite();
+      try {
+        const db = pgliteAdapter(pgl);
+        const prole = 'cdb_owner_pgl_o15';
+        await db.exec(`create role ${prole} nologin`);
+        const transPgl = `-- migrate:owner-transition
+create table app.o15_before (x int);
+${R4_TX_BYPASS}
+grant usage, create on schema app, ops to ${prole};
+alter table app.t owner to ${prole};
+alter table ops.schema_migrations owner to ${prole};
+create table ops.migrate_owner (singleton boolean primary key default true check (singleton), owner_role name not null, since timestamptz not null default now());
+insert into ops.migrate_owner (owner_role) values ('${prole}');
+alter table ops.migrate_owner owner to ${prole};
+`;
+        const body = kind === 'owner-transition' ? transPgl : `create table app.o15_before (x int);\n${R4_TX_BYPASS}\n`;
+        let err = null;
+        try { await applyMigrations(db, { dir: mkDir({ '0001_base.sql': BASE, '0002_off.sql': 'set standard_conforming_strings = off;\n', '0003_r4.sql': body }), log: quiet }); } catch (e) { err = e; }
+        assert.ok(err && err.code === 'MIGRATION_FAILED' && err.version === '0003', `PGlite ${kind}: 止まらない (${err ? err.message : '成功した'})`);
+        assert.equal(await pgCount(db, 'o15_before'), 0, `PGlite ${kind}: 取引を切られた`);
+        assert.equal(await pgCount(db, 'migrate_owner'), 0);
+        assert.deepEqual((await db.query('select version from ops.schema_migrations order by 1')).rows.map((r) => r.version), ['0001', '0002']);
+        assert.equal((await db.query('show standard_conforming_strings')).rows[0].standard_conforming_strings, 'off', 'PGlite: legacy の設定は今までどおり');
+      } finally { await pgl.close(); }
+    }
+  });
+
+  // 🆕 Codex R4 High 2: lexSql と PostgreSQL の scan.l の違い = 行コメントの CR だけの改行・字句の頭の NBSP / U+3000 (Postgres では識別子の文字)
+  const CR = String.fromCharCode(13), NBSP = String.fromCharCode(0xa0), IDSP = String.fromCharCode(0x3000), VT = String.fromCharCode(11);
+  const R4_ROLE_FORMS = (dep) => [`SELECT 1; -- c${CR}RESET ROLE;`, `-- c${CR}SET session_authorization = '${dep}';`];
+  const R4_DO_FORMS = (dep) => [`do $$ begin perform 1; -- c${CR}RESET ROLE; end $$;`, `do $$ begin -- c${CR}SET session_authorization = '${dep}'; end $$;`, `do $$ begin -- c${CR}perform set_config('role', 'none', true); end $$;`];
+  const R4_TX_FORMS = (tbl) => [`create table ${tbl}_cr (x int); -- c${CR}COMMIT;`, `create table ${tbl}_nb (x int); select 1 ${NBSP}$a$; COMMIT; select 2 ${NBSP}$a$;`, `create table ${tbl}_id (x int); select 1 ${IDSP}$a$; COMMIT; select 2 ${IDSP}$a$;`];
+  await t('O16 (Codex R4 High 2) 行コメントの CR だけの改行・字句の頭の NBSP / U+3000 で隠した RESET ROLE・SET session_authorization・COMMIT = 本物の PG と PGlite で効く (前提) / ふつうの file・owner-transition・owner の file・ドルの引用の中で流す前に止まる / DO の中の COMMIT は Postgres が止める / 1 行目の印も CR だけの改行で読む', async () => {
+    // 字句の検査 (JS)
+    for (const x of [...R4_ROLE_FORMS(DEPLOYER), ...R4_DO_FORMS(DEPLOYER)]) assert.ok(roleSwitchStatements(x).length > 0, `拒まない: ${JSON.stringify(x)}`);
+    for (const x of R4_TX_FORMS('app.o16')) assert.deepEqual(txControlStatements(x), ['commit'], JSON.stringify(x));
+    assert.deepEqual(txControlStatements(`select 1; -- c${VT}COMMIT;`), [], 'VT は改行でない (scan.l の newline = [\\n\\r]) = コメントが続く');
+    assert.deepEqual(txControlStatements(`select 1; -- c\r\nCOMMIT;`), ['commit']);
+    assert.equal(isOwnerTransitionText(`-- migrate:owner-transition${CR}select 1`), true);
+    assert.equal(isConcurrentIndexText(`-- migrate:concurrent-index ${CR}create index concurrently if not exists i on app.t (a)`), true);
+    assert.equal(isOwnerTransitionText(`-- migrate:owner-transition\r\nselect 1`), true);
+    assert.equal(isOwnerTransitionText(`-- migrate:owner-transition${NBSP}\nselect 1`), false, 'NBSP は空白でない');
+    // (前提) 本物の PG: 各形が本当に役割を戻す・COMMIT を流す
+    const dbName = await newDepDb();
+    const c = await openDep(dbName);
+    const role = await newOwnerRole();
+    const base = { '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role) };
+    await migrate(c, { dir: mkDir(base) });
+    for (const x of [...R4_ROLE_FORMS(DEPLOYER), ...R4_DO_FORMS(DEPLOYER)]) {
+      await c.query('begin');
+      try {
+        await c.query(`set local role ${role}`);
+        await c.query(x);
+        assert.equal((await whoami(c)).cu, DEPLOYER, `(前提) 役割が戻らない: ${JSON.stringify(x)}`);
+      } finally { await c.query('rollback'); }
+    }
+    for (const x of R4_TX_FORMS('public.o16pre')) {
+      await c.query('begin');
+      await c.query(x);
+      await c.query('rollback');   // 取引は無い (警告だけ)
+    }
+    for (const sfx of ['cr', 'nb', 'id']) assert.equal(await pgCount(c, `o16pre_${sfx}`), 1, `(前提) COMMIT が流れない: ${sfx}`);
+    const dbSu = new URL(suUrl); dbSu.pathname = `/${dbName}`;
+    const s2 = await openPgClient(dbSu.toString()); s2.on('error', () => {}); clients.push(s2);
+    const recorded = async () => (await s2.query('select version from ops.schema_migrations order by 1')).rows.map((r) => r.version);
+    // owner の状態の file: 役割の形 (最上位・ドルの引用の中) = OWNER_MODE_INVALID / COMMIT の形 = TX_CONTROL_REJECTED。何も流さない
+    for (const x of [...R4_ROLE_FORMS(DEPLOYER), ...R4_DO_FORMS(DEPLOYER)]) {
+      await assert.rejects(migrate(c, { dir: mkDir({ ...base, '0003_cr.sql': `create table app.o16_before (x int);\n${x}\n` }) }), (e) => e.code === 'OWNER_MODE_INVALID' && /許さない役割の切り替え/.test(e.message), JSON.stringify(x));
+    }
+    for (const x of R4_TX_FORMS('app.o16')) {
+      await assert.rejects(migrate(c, { dir: mkDir({ ...base, '0003_cr.sql': `create table app.o16_before (x int);\n${x}\n` }) }), (e) => e.code === 'TX_CONTROL_REJECTED' && e.version === '0003', JSON.stringify(x));
+    }
+    assert.equal((await s2.query(`select count(*)::int as n from pg_class where relname like 'o16\\_%'`)).rows[0].n, 0, 'owner の状態の file を流した');
+    assert.deepEqual(await recorded(), ['0001', '0002']);
+    assert.deepEqual(await whoami(c), { cu: DEPLOYER, su: DEPLOYER });
+    assert.deepEqual(await lockHolders(dbName), []);
+    // ふつうの file (legacy) と owner-transition の file: COMMIT の形 = 流す前に止まる (前の番号も流さない)
+    const c2 = await openDep(await newDepDb());
+    for (const x of R4_TX_FORMS('app.o16')) {
+      await assert.rejects(migrate(c2, { dir: mkDir({ '0001_base.sql': BASE, '0002_cr.sql': x }) }), (e) => e.code === 'TX_CONTROL_REJECTED' && e.version === '0002', `legacy: ${JSON.stringify(x)}`);
+      const role2 = `cdb_owner_${hex}_${++roleSeq}`;   // 流す前に止まる = 役割は作らない
+      await assert.rejects(migrate(c2, { dir: mkDir({ '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role2, { tail: `${x}\n` }) }) }), (e) => e.code === 'TX_CONTROL_REJECTED' && e.version === '0002', `owner-transition: ${JSON.stringify(x)}`);
+      // 1 行目の印が CR だけの改行でも owner-transition の file として検査する
+      await assert.rejects(migrate(c2, { dir: mkDir({ '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role2, { tail: `${x}\n` }).replace('-- migrate:owner-transition\n', `-- migrate:owner-transition${CR}`) }) }), (e) => e.code === 'TX_CONTROL_REJECTED' && e.version === '0002', `owner-transition (CR の印): ${JSON.stringify(x)}`);
+    }
+    assert.equal((await c2.query(`select count(*)::int as n from pg_namespace where nspname = 'app'`)).rows[0].n, 0, '0001 を流した');
+    // ドルの引用の中の COMMIT (legacy の file) = 字句の検査は数えない (DO の中) が、Postgres が取引の中の COMMIT を止める = 何も残らない
+    {
+      const x = `create table app.o16_do (x int);\ndo $$ begin -- c${CR}COMMIT; end $$;\n`;
+      assert.deepEqual(txControlStatements(x), []);
+      const dbD = await newDepDb();
+      const cD = await openDep(dbD);
+      let err = null;
+      try { await migrate(cD, { dir: mkDir({ '0001_base.sql': BASE, '0002_do.sql': x }) }); } catch (e) { err = e; }
+      assert.ok(err && err.code === 'MIGRATION_FAILED' && err.version === '0002' && /invalid transaction termination/.test(err.message), `${err && err.message}`);
+      assert.equal(await pgCount(cD, 'o16_do'), 0);
+    }
+    // 1 行目の印が CR だけの改行の owner-transition の file は、ふつうに持ち主を移せる (印の読み方が Postgres の行と同じ)
+    {
+      const dbM = await newDepDb();
+      const cM = await openDep(dbM);
+      const roleM = await newOwnerRole();
+      const r = await migrate(cM, { dir: mkDir({ '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbM, roleM).replace('-- migrate:owner-transition\n', `-- migrate:owner-transition${CR}`) }) });
+      assert.deepEqual(r.applied, ['0001', '0002']);
+      assert.equal(await pgCount(cM, 'migrate_owner'), 1);
+    }
+    // PGlite の道も (役割の形が本当に戻る = 前提 / owner の状態の file で止まる / legacy の COMMIT の形も止まる)
+    const pgl = new PGlite();
+    try {
+      const db = pgliteAdapter(pgl);
+      const prole = 'cdb_owner_pgl_o16';
+      await db.exec(`create role ${prole} nologin`);
+      const transPgl = `-- migrate:owner-transition
+grant usage, create on schema app, ops to ${prole};
+alter table app.t owner to ${prole};
+alter table ops.schema_migrations owner to ${prole};
+create table ops.migrate_owner (singleton boolean primary key default true check (singleton), owner_role name not null, since timestamptz not null default now());
+insert into ops.migrate_owner (owner_role) values ('${prole}');
+alter table ops.migrate_owner owner to ${prole};
+alter schema app owner to ${prole};
+`;
+      const pbase = { '0001_base.sql': BASE, '0002_owner.sql': transPgl };
+      assert.deepEqual((await applyMigrations(db, { dir: mkDir(pbase), log: quiet })).applied, ['0001', '0002']);
+      const cu = async () => (await db.query('select current_user::text as cu')).rows[0].cu;
+      const su0 = await cu();
+      for (const x of [...R4_ROLE_FORMS(su0), ...R4_DO_FORMS(su0)]) {
+        await db.exec('begin');
+        try {
+          await db.exec(`set local role ${prole}`);
+          await db.exec(x);
+          assert.equal(await cu(), su0, `(前提・PGlite) 役割が戻らない: ${JSON.stringify(x)}`);
+        } finally { await db.exec('rollback'); }
+        await assert.rejects(applyMigrations(db, { dir: mkDir({ ...pbase, '0003_cr.sql': `create table app.o16_before (x int);\n${x}\n` }), log: quiet }), (e) => e.code === 'OWNER_MODE_INVALID', `PGlite: ${JSON.stringify(x)}`);
+      }
+      for (const x of R4_TX_FORMS('app.o16')) {
+        await assert.rejects(applyMigrations(db, { dir: mkDir({ ...pbase, '0003_cr.sql': x }), log: quiet }), (e) => e.code === 'TX_CONTROL_REJECTED', `PGlite: ${JSON.stringify(x)}`);
+      }
+      assert.equal((await db.query(`select count(*)::int as n from pg_class where relname like 'o16\\_%'`)).rows[0].n, 0);
+      assert.equal(await cu(), su0);
+    } finally { await pgl.close(); }
+    const pgl2 = new PGlite();
+    try {
+      for (const x of R4_TX_FORMS('public.o16p')) {
+        await pgl2.exec('begin');
+        await pgl2.exec(x);
+        await pgl2.exec('rollback');
+      }
+      for (const sfx of ['cr', 'nb', 'id']) assert.equal((await pgl2.query('select count(*)::int as n from pg_class where relname = $1', [`o16p_${sfx}`])).rows[0].n, 1, `(前提・PGlite) COMMIT が流れない: ${sfx}`);
+    } finally { await pgl2.close(); }
   });
 
   await t('O9 (Codex R1 M1) --list も印と owner-transition の適用を両方向で確かめる: 印が消えた (接続の役割に記録表の SELECT が残る) → 一覧を出して exit 1 (OWNER_MODE_INVALID) / 印だけある → exit 1 / 整っていれば exit 0', async () => {

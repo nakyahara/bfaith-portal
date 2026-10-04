@@ -40,8 +40,12 @@
  *   - 🆕 Codex R3 (PR #1606) High 1 = 役割を変えられる GUC (ROLE_GUCS = role・session_authorization・PG 18 の guc_tables.c の棚卸し) を変える全部の形
  *     (SET [LOCAL | SESSION] <GUC>・RESET <GUC>・set_config・関数の SET 句・ALTER ROLE / DATABASE … SET) を owner の状態の file で拒む /
  *     High 2 = 字句の前提 (LEXER_PREMISE = standard_conforming_strings on・client_encoding UTF8) を owner の状態の file の本文の前に別のクエリで SET LOCAL し
- *     (concurrent-index の session と PGlite の道も)、file の中で LEXER_GUCS を変える文 (同じ全部の形・SET NAMES・UPDATE pg_settings) を拒む。legacy の file には入れない (今までどおり)。
- *     🚨 字句の検査は補助で sandbox ではない (動的 SQL の中は見ない) = 本当の守りは形 B (接続の役割が役割の管理に届かない・ROLE_ADMIN_REACHABLE)
+ *     (concurrent-index の session と PGlite の道も)、file の中で LEXER_GUCS を変える文 (同じ全部の形・SET NAMES・UPDATE pg_settings) を拒む。
+ *     🚨 字句の検査は補助で sandbox ではない (動的 SQL の中は見ない)・記録の直前の再 SET が守るのは記録の行だけ = 本当の役割の境は形 B (接続の役割が役割の管理に届かない・ROLE_ADMIN_REACHABLE)
+ *   - 🆕 Codex R4 (PR #1606) High 1 = 字句の前提の SET LOCAL を **取引の中で流す全部の file (legacy・owner-transition・owner)** の本文の前に (取引の制御の文の検査も
+ *     lexSql に頼る)。legacy・owner-transition の file の中の字句の前提の GUC の変更は ⚠️ だけ (lexerPremiseChanges) /
+ *     High 2 = lexSql を PostgreSQL 18 の scan.l に合わせる (行コメントは \r でも終わる・空白は [ \t\n\r\f\v] だけ = NBSP・U+3000 は識別子の文字)・1 行目の印も CR だけの改行に合わせる。
+ *     🚨 owner-transition の file 自身は ROLE_ADMIN_REACHABLE の対象の外 (流す時は legacy) = R0b-0 / R0b までの間に別の owner の migration を流さない運用が必須 (README)
  *
  * 使い方:
  *   COMPANY_DB_URL=postgres://... node scripts/company-db/migrate.mjs            # 未適用を全部
@@ -91,10 +95,18 @@ export function checksumOf(text) {
   return crypto.createHash('sha256').update(text.replace(/\r\n/g, '\n'), 'utf-8').digest('hex');
 }
 
-/** 1 行目が concurrent-index の印か (BOM・行末の空白・CR は無視) */
+/**
+ * 1 行目 (先頭の BOM は除く) の行末の空白を除いたもの。🆕 Codex R4 High 2 (PR #1606): 行の終わり = PostgreSQL の scan.l の newline [\n\r] と同じ
+ * (CR だけの改行も行の終わり = lexSql の行コメントと同じ)。行末の空白も scan.l の non_newline_space [ \t\f\v] だけ (NBSP などは空白でない)
+ */
+const BOM = String.fromCharCode(0xfeff);
+function firstLineOf(text) {
+  const t = text.startsWith(BOM) ? text.slice(1) : text;
+  return t.split(/[\r\n]/, 1)[0].replace(/[ \t\f\v]+$/, '');
+}
+/** 1 行目が concurrent-index の印か (BOM・行末の空白は無視・CR だけの改行も行の終わり) */
 export function isConcurrentIndexText(text) {
-  const first = text.replace(/^\uFEFF/, '').split('\n', 1)[0].replace(/\s+$/, '');
-  return first === CONCURRENT_INDEX_MARKER;
+  return firstLineOf(text) === CONCURRENT_INDEX_MARKER;
 }
 
 // ─── 持ち主の mode (Codex R-D60-v3-10 H2・PR 1b の前 / PR 1b 自身 / PR 1b の後) ───
@@ -113,8 +125,7 @@ export const OWNER_TRANSITION_MARKER = '-- migrate:owner-transition';
 export const OWNER_MARKER_TABLE = 'ops.migrate_owner';
 const ROLE_RE = /^[a-z_][a-z0-9_]{0,62}$/;
 export function isOwnerTransitionText(text) {
-  const first = text.replace(/^\uFEFF/, '').split('\n', 1)[0].replace(/\s+$/, '');
-  return first === OWNER_TRANSITION_MARKER;
+  return firstLineOf(text) === OWNER_TRANSITION_MARKER;
 }
 const ownerErr = (msg) => Object.assign(new Error(`持ち主の mode: ${msg}`), { code: 'OWNER_MODE_INVALID' });
 /**
@@ -179,11 +190,17 @@ const sqlErr = (msg) => Object.assign(new Error(msg), { code: 'SQL_LEX' });
  * 字句 = { t: 'word' | 'str' | 'qid' | 'dollar' | 'num' | 'punct', v, start, end }
  *   str = '…' と E'…' (E は \ の escape あり)・qid = "…"・dollar = $tag$…$tag$ (中身は 1 つの字句)
  * 閉じていない文字列・コメント・ドルの引用は SQL_LEX で止まる
+ * 🆕 Codex R4 High 2 (PR #1606): PostgreSQL 18 の scan.l に合わせる (棚卸しの表 = db/company/README.md「字句の検査と scan.l の違い」)
+ *   - 行コメント (--) の終わり = \r と \n の早い方 (scan.l の non_newline [^\n\r])。CR だけの改行の後の文は SQL として流れる (`-- c<CR>COMMIT;`)
+ *   - 空白 = scan.l の space [ \t\n\r\f\v] だけ。NBSP・和文の空白 (U+3000) などの JS の \s は Postgres では識別子の文字 (\200-\377) =
+ *     `x<NBSP>$a$` は 1 つの識別子でドルの引用にならない (JS の \s で空白とみると、後ろをドルの引用の中と誤って COMMIT を見落とす)
+ * 前提 = standard_conforming_strings = on・client_encoding = UTF8 (runner が取引の中で流す全部の file の本文の前に別のクエリで SET LOCAL する = setLexerPremiseLocal)
  */
 export function lexSql(text) {
   const toks = [];
   const n = text.length;
   let i = 0;
+  const isSpace = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === '\v';
   const isIdStart = (c) => /[A-Za-z_\u0080-\uffff]/.test(c);
   const isId = (c) => /[A-Za-z0-9_$\u0080-\uffff]/.test(c);
   const scanString = (q, escape) => {   // q = 開きの ' の位置。戻り = 閉じの次
@@ -197,8 +214,8 @@ export function lexSql(text) {
   };
   while (i < n) {
     const c = text[i], d = text[i + 1];
-    if (/\s/.test(c)) { i++; continue; }
-    if (c === '-' && d === '-') { const j = text.indexOf('\n', i); i = j < 0 ? n : j + 1; continue; }
+    if (isSpace(c)) { i++; continue; }
+    if (c === '-' && d === '-') { let j = i + 2; while (j < n && text[j] !== '\n' && text[j] !== '\r') j++; i = j; continue; }
     if (c === '/' && d === '*') {
       let depth = 1, j = i + 2;
       while (j < n && depth) {
@@ -448,6 +465,23 @@ function warnUnicodeEscapeInLegacy(f, log = () => {}) {
   try { hits = unicodeEscapeLiterals(f.text); } catch { return; }   // legacy = 読めない file は今までどおり Postgres に任せる
   if (hits.length) log(`⚠️ ${f.file}: Unicode の escape (${[...new Set(hits)].join('・')}) がある。legacy (印が無い) なので今までどおり流すが、owner の状態 (PR 1b の後) では流す前に拒む = 普通の "…"・'…' で書く`);
 }
+/**
+ * 🆕 Codex R4 High 1 (PR #1606): file の中で字句の前提の GUC (LEXER_GUCS・SET NAMES・pg_settings) を変える文の一覧 ([] = 無い・字句に読めない = 例外)。
+ * legacy と owner-transition の file では ⚠️ だけ (今までどおり流す)。拒まない理由 =
+ *   ① runner は取引の中で流す全部の file の本文の前に、別のクエリで前提を入れ直す (setLexerPremiseLocal)
+ *   ② Postgres は simple query の本文の全部を、どの文を流すよりも前に字句に分ける = file の中の変更は、その file の本文と後の file の本文の境目を変えられない
+ *      (変えられるのは同じ file の後の DO の本文・動的 SQL = legacy と owner-transition では元から役割の検査をしない・DO の中の COMMIT は Postgres が止める)
+ *   ③ ALTER ROLE / DATABASE … SET で既定 (reset_val) を変えれば、次の回は全部の file が LEXER_PREMISE で止まる (fail-closed)
+ * owner の状態の file では拒む (rejectRoleSwitchInOwnerMode = DO の本文の役割の検査の前提を守る)
+ */
+export function lexerPremiseChanges(text) {
+  return roleSwitchStatements(text).filter((h) => h.includes('字句の前提の GUC'));
+}
+function warnLexerGucOutsideOwner(f, log = () => {}) {
+  let hits;
+  try { hits = lexerPremiseChanges(f.text); } catch { return; }   // 読めない file は今までどおり Postgres に任せる (取引の制御の検査が先に止める)
+  if (hits.length) log(`⚠️ ${f.file}: 字句の前提の GUC を変える文 (${[...new Set(hits)].join('・')}) がある。${f.ownerTransition ? 'owner-transition' : 'legacy (印が無い)'} の file なので今までどおり流すが、runner は次の file の本文の前に前提 (${Object.entries(LEXER_PREMISE).map(([k, v]) => `${k} = ${v}`).join('・')}) を入れ直す。owner の状態 (PR 1b の後) では流す前に拒む`);
+}
 
 /**
  * owner の状態の file で `SET LOCAL ROLE <名前>` を許す役割の一覧 (設計 13 v3.11 ③・正本はこの定数)。
@@ -491,8 +525,10 @@ const gucKind = (g) => (ROLE_GUCS.includes(g) ? '役割の GUC' : '字句の前�
  *   (SET [LOCAL | SESSION] <GUC>・RESET <GUC>・set_config・関数の SET 句・ALTER ROLE / DATABASE / SYSTEM … SET | RESET・SET NAMES・pg_settings) も拒む。
  *   引用の名前・大文字小文字・コメント・ドルの引用の中も同じ (下の lw と再帰)。RESET ALL は役割を戻さない (role・session_authorization は
  *   GUC_NO_RESET_ALL) ので許すが、字句の前提の GUC は RESET ALL で reset_val に戻る = runner が reset_val も LEXER_PREMISE と同じかを確かめる (setLexerPremiseLocal)
- * 🚨 字句の検査は補助で、sandbox ではない = 守りの本体は「記録の INSERT の直前の SET LOCAL ROLE <印の役割>」(動的 SQL で役割を変えられても記録は印の役割)。
- *   migration の本文の副作用 (動的 SQL で役割を変えた後の DDL・membership の変更) は取り消さない = 役割の管理は migration に書かず、別の資格・別の session で流す (設計 13 v3.13)
+ * 🚨 守りの分担 (Codex R4 Low で統一): ① 字句の検査 (この関数) は補助で sandbox ではない (動的 SQL・EXECUTE の中は見ない) /
+ *   ② 記録の INSERT の直前の SET LOCAL ROLE <印の役割> が守るのは **記録の行だけ** (本文の副作用 = 役割を変えた後の DDL は守らない) /
+ *   ③ 本当の役割の境は **形 B** (接続の役割が役割の管理・危険な権限に届かない = ROLE_ADMIN_REACHABLE・役割の図の比較 ROLE_GRAPH_CHANGED)。
+ *   役割の管理は migration に書かず、別の資格・別の session で流す (設計 13 v3.13・v3.14)
  */
 export function roleSwitchStatements(text, allowed = ALLOWED_SET_LOCAL_ROLES, depth = 0) {
   const toks = lexSql(text);   // 読めない = 例外 (owner の状態では止まる)
@@ -912,11 +948,16 @@ export function migrateWithLock(db, opts = {}) {
 
 // ─── 字句の前提 (Codex R3 High 2) ───
 /**
- * 🆕 Codex R3 High 2 (PR #1606): owner の状態の file の本文の前に、別のクエリで LEXER_PREMISE を SET LOCAL する
- * (simple query は送った文字列の全部を受け取った時の設定で字句に分ける = 本文と同じクエリに入れても効かない・前のクエリで入れる)。
+ * 🆕 Codex R3 High 2 (PR #1606): file の本文の前に、別のクエリで LEXER_PREMISE を SET LOCAL する
+ * (simple query は送った文字列の全部を、本文のどの文を流すよりも前に、受け取った時の設定で字句に分ける = 本文と同じクエリに入れても効かない・前のクエリで入れる)。
  * 前の file (legacy の SET standard_conforming_strings = off・動的 SQL) が session に残した値に左右されない。
  * さらに reset_val も同じかを確かめる (本文の RESET ALL は字句の前提の GUC を reset_val に戻す = ALTER ROLE / DATABASE の既定が off なら
- * 本文の途中から前提がずれる = 流さない)。legacy (印が無い・今の本番) の file には入れない (今までどおり)
+ * 本文の DO の本文 (流す時に字句に分ける) から前提がずれる = 流さない)。
+ * 🆕 Codex R4 High 1 (PR #1606): owner の状態の file だけでなく **取引の中で流す全部の file (legacy・owner-transition・owner)** に入れる
+ *   (取引の制御の文の検査 txControlStatements も lexSql に頼る = legacy の前の file が off を残すと、owner-transition の本文の `'a\'b'; COMMIT; …` の
+ *   COMMIT を見落とし、R1 + R2 + 印の同じ取引を途中で切られた)。0001〜0056 に字句の前提の GUC も最上位の '…' の中の \ も無い (ドルの引用の中の \ は
+ *   関数の本文 = 今の本番 (on) と同じ前提) = 今の本番の再実行・--list (どちらも本文を流さない) と次の legacy の file の流れ方は変わらない。
+ *   client_encoding の reset_val = node-postgres が起動の時に必ず送る UTF8 (pg-protocol の startup)
  */
 async function setLexerPremiseLocal(db) {
   await db.exec(`set local standard_conforming_strings = ${LEXER_PREMISE.standard_conforming_strings}`);
@@ -929,7 +970,7 @@ async function setLexerPremiseLocal(db) {
     if (String(r.setting).toLowerCase() !== want.toLowerCase()) bad.push(`${k} = ${r.setting}`);
     if (String(r.reset_val).toLowerCase() !== want.toLowerCase()) bad.push(`${k} の reset_val = ${r.reset_val} (RESET ALL で前提がずれる・ALTER ROLE / DATABASE の既定を見る)`);
   }
-  if (bad.length) throw Object.assign(ownerErr(`LEXER_PREMISE: 字句の前提 (${Object.entries(LEXER_PREMISE).map(([k, v]) => `${k} = ${v}`).join('・')}) にできない: ${bad.join('・')} = 流さない`), { reason: 'LEXER_PREMISE' });
+  if (bad.length) throw Object.assign(new Error(`LEXER_PREMISE: 字句の前提 (${Object.entries(LEXER_PREMISE).map(([k, v]) => `${k} = ${v}`).join('・')}) にできない: ${bad.join('・')} = 流さない`), { code: 'LEXER_PREMISE_INVALID', reason: 'LEXER_PREMISE' });
 }
 
 // ─── concurrent-index のファイルを流す ───
@@ -1231,10 +1272,10 @@ export async function applyMigrations(db, opts = {}) {
   // owner mode で流す file (今が owner・または前に owner-transition がある) は役割を切り替える文を禁止 (設計 13 v3.10)
   let ownerFromHere = mode0.mode === 'owner';
   for (const f of todo) {
-    if (f.ownerTransition) { ownerFromHere = true; continue; }
+    if (f.ownerTransition) { warnLexerGucOutsideOwner(f, log); ownerFromHere = true; continue; }   // 🆕 Codex R4 High 1: ⚠️ だけ (本文の前に前提を入れ直す)
     if (f.concurrentIndex) continue;
     if (ownerFromHere) rejectRoleSwitchInOwnerMode(f, log);   // 🆕 Codex R2 High: U&"…"・U&'…'・UESCAPE もここで拒む
-    else warnUnicodeEscapeInLegacy(f, log);   // legacy = ⚠️ だけ (今までどおり流す・0001〜0056 には U& が無い)
+    else { warnUnicodeEscapeInLegacy(f, log); warnLexerGucOutsideOwner(f, log); }   // legacy = ⚠️ だけ (今までどおり流す・0001〜0056 には U& も字句の前提の GUC も無い)
   }
   const transitions = todo.filter((f) => f.ownerTransition);
   if (transitions.length && mode0.mode === 'owner') throw Object.assign(new Error(`${transitions[0].file} は owner-transition の migration なのに、もう owner mode (${mode0.role}) = 流さない (持ち主の移しは 1 回だけ)`), { code: 'OWNER_MODE_INVALID', version: transitions[0].version });
@@ -1265,8 +1306,9 @@ export async function applyMigrations(db, opts = {}) {
     try {
       if (mode.mode === 'owner') await db.exec(`set local role ${mode.role}`);   // 取引の終わり (commit / rollback) で戻る = 例外に左右されない
       await db.exec(`set local lock_timeout = '${lockTimeout}'; set local statement_timeout = '${statementTimeout}';`);
-      // 🆕 Codex R3 High 2: owner の状態の file = 本文の前に別のクエリで字句の前提 (standard_conforming_strings = on・client_encoding = UTF8) を入れる。legacy は今までどおり
-      if (mode.mode === 'owner') await setLexerPremiseLocal(db);
+      // 🆕 Codex R3 High 2 / R4 High 1: 本文の前に別のクエリで字句の前提 (standard_conforming_strings = on・client_encoding = UTF8) を入れる。
+      //   owner の状態の file だけでなく legacy・owner-transition の file も (取引の制御の文の検査が lexSql と同じ境目で Postgres に読まれるように)
+      await setLexerPremiseLocal(db);
       // 🆕 設計 13 v3.13 ③ / v3.14 ①: owner の状態のふつうの file と owner-transition の file = 本文の前の役割の図 (役割を作る・membership を変えるのは migration の外)
       const graph0 = mode.mode === 'owner' || f.ownerTransition ? await roleGraphHash(db) : null;
       await db.exec(f.text);
