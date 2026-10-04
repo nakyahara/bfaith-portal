@@ -50,7 +50,7 @@ try { now = resolveDqNow(getArg('--now')); }
 catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
 // daily-sync はこの回のモールの取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
 const noMonthStartGrace = args.includes('--no-month-start-grace');
-// daily-sync はこの回の f_sales の再構築が ❌ のとき --no-listing-ramp も付ける (Qoo10 は listing の立ち上がりを持たない = 受けるだけ)
+// daily-sync はこの回の f_sales の再構築か NE の取込が ❌ のとき --no-listing-ramp も付ける (Qoo10 は listing の立ち上がりを持たない = 受けるだけ)
 const noListingRamp = args.includes(NO_LISTING_RAMP_FLAG);
 
 const THRESHOLDS_PAST = {

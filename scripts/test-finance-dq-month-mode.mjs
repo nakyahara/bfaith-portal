@@ -756,6 +756,84 @@ for (const mall of ['aupay', 'linegift', 'qoo10']) {
         `codes=${a.code},${b.code} ${JSON.stringify(sb.listing_diff_pct)}`);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   }
+  // R2 Medium (通し): f_sales の再構築は ✅・NE の取込は ❌ の朝 (daily-sync は NE が ❌ でも古い raw_ne_orders から f_sales を作り直す)。
+  //   旗は daily-sync の本物の呼び出しの式 (listingRampFlag(…) の引数) から作る → Yahoo・au PAY・LINE ギフトの listing は ❌ のまま /
+  //   whitelist の立ち上がりと 0 行の猶予は止めない / 楽天 (listing の元 = raw_rakuten_orders) は NE で止めない
+  {
+    const dsSrc = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/daily-sync.js'), 'utf8').replace(/\r\n/g, '\n');
+    const lrDef = dsSrc.match(/function listingRampFlag\([^)]*\) \{[^\n]*\}/)?.[0];
+    const flagFor = (script, results) => {
+      const m = dsSrc.match(new RegExp(`${script.replace(/\./g, '\\.')} [^\`]*\\$\\{listingRampFlag\\(([^)]*)\\)\\}\``));
+      if (!lrDef || !m) return null;
+      const names = m[1].split(',').map((x) => x.trim());
+      if (!names.every((x) => /^\w+$/.test(x))) return null;   // 変数の名前だけを受ける (式は組み立てない)
+      // eslint-disable-next-line no-new-func
+      return new Function(...names, `${lrDef}\nreturn listingRampFlag(${m[1]});`)(...names.map((n) => results[n])).trim();
+    };
+    const neNg = { fSalesResult: { success: true }, neResult: { success: false } };
+    const allOk = { fSalesResult: { success: true }, neResult: { success: true } };
+    const ne3 = ['yahoo', 'aupay', 'linegift'];
+    check('通し (R2 Medium): f_sales ✅・NE ❌ の朝 → Yahoo・au PAY・LINE ギフト・Qoo10 の DQ に --no-listing-ramp / 楽天には付けない (listing の元は楽天の取込) / 両方 ✅ なら どれにも付けない',
+      [...ne3, 'qoo10'].every((m) => flagFor(`run-${m}-finance-dq.js`, neNg) === NO_LISTING_RAMP_FLAG) && flagFor('run-rakuten-finance-dq.js', neNg) === ''
+      && MALLS.every(({ script }) => flagFor(script, allOk) === ''),
+      MALLS.map(({ script }) => `${script}=${flagFor(script, neNg)}`).join(' '));
+    for (const mall of ['yahoo', 'aupay']) {
+      const flag = flagFor(`run-${mall}-finance-dq.js`, neNg);
+      const { dir, script } = setup(mall, OCT[mall]);
+      try {
+        const a = runDq(dir, script, '2026-10', at(4), 'r2-ne-ok');
+        const b = runDq(dir, script, '2026-10', at(4), 'r2-ne-ng', flag ? [flag] : []);
+        const sa = res(dir, 'r2-ne-ok'); const sb = res(dir, 'r2-ne-ng');
+        check(`${mall} (R2 Medium): 10/4 の朝の形で f_sales ✅・NE ❌ → listing_diff_pct は ❌ のまま (exit 1)・理由 = NE / NE も ✅ の朝は ⚠️ (exit 0)`,
+          a.code === 0 && sa.listing_diff_pct?.severity === 'warn' && b.code === 1 && sb.listing_diff_pct?.severity === 'error'
+          && /NE/.test(sb.listing_diff_pct.details.month_start_ramp_denied || '') && sb.listing_diff_pct.details.ramp_shortfall > 0,
+          `flag=${flag} codes=${a.code},${b.code} ${JSON.stringify(sb.listing_diff_pct)}`);
+        if (mall === 'aupay') check('aupay (R2 Medium): f_sales ✅・NE ❌ の朝も whitelist (au PAY の raw どうし) の立ち上がりは続ける (⚠️ のまま)',
+          sb.whitelist_coverage_pct?.severity === 'warn' && sb.whitelist_coverage_pct.details.month_start_ramp === true, JSON.stringify(sb.whitelist_coverage_pct));
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    }
+    {
+      // LINE ギフト・5 日目 (窓 10/2〜10/5・古い部分 10/1): listing は毎日 10,000 円 / 受取済みは 10/1 が 10 件・10/2〜10/5 が 6 件ずつ
+      //   → 受注日の売上 34,000 円 vs listing 50,000 円 (32% = error)・足りない 16,000 ≤ 窓の listing 40,000・古い部分 (10/1) は差 0%
+      const flag = flagFor('run-linegift-finance-dq.js', neNg);
+      const r = setup('linegift', { listing: { '2026-10-01': 10000, '2026-10-02': 10000, '2026-10-03': 10000, '2026-10-04': 10000, '2026-10-05': 10000 } });
+      try {
+        withDb(r.dir, (d) => {
+          addFactRow(d, r.table, '2026-10-02', 'l-oct');
+          let n = 0;
+          for (const [bought, total, received] of [['2026-10-01', 10, 10], ['2026-10-02', 10, 6], ['2026-10-03', 10, 6], ['2026-10-04', 10, 6], ['2026-10-05', 10, 6]]) {
+            for (let i = 0; i < total; i++) {
+              n++;
+              const done = i < received;
+              d.prepare('INSERT INTO raw_linegift_orders (order_id, status, sku_code, stock_count, selling_price, fee, bought_date_jst, received_date_jst) VALUES (?, ?, ?, 1, 1000, 100, ?, ?)')
+                .run(`lg${n}`, done ? 'received' : 'gift_message_send', 'sku', bought, done ? '2026-10-05' : null);
+            }
+          }
+        });
+        runDq(r.dir, r.script, '2026-10', at(5), 'l-r2-ne-ok');
+        runDq(r.dir, r.script, '2026-10', at(5), 'l-r2-ne-ng', flag ? [flag] : []);
+        const sa = res(r.dir, 'l-r2-ne-ok'); const sb = res(r.dir, 'l-r2-ne-ng');
+        check('linegift (R2 Medium): f_sales ✅・NE ❌ の朝 → listing_diff_pct (32%) は ❌ のまま・理由 = NE / NE も ✅ の朝は ⚠️ (古い部分 10/1 は差 0%)・whitelist の判定は旗で変わらない',
+          sa.listing_diff_pct?.severity === 'warn' && sa.listing_diff_pct.details.month_start_ramp === true && sa.listing_diff_pct.details.ramp_older_value === 0
+          && sb.listing_diff_pct?.severity === 'error' && /NE/.test(sb.listing_diff_pct.details.month_start_ramp_denied || '')
+          && sb.listing_diff_pct.details.ramp_shortfall === 16000 && sb.listing_diff_pct.details.ramp_explained_by === 40000
+          && !!sa.whitelist_coverage_pct && sa.whitelist_coverage_pct.severity === sb.whitelist_coverage_pct?.severity,
+          `flag=${flag} ok=${JSON.stringify(sa.listing_diff_pct)} ng=${JSON.stringify(sb.listing_diff_pct)} wl=${sa.whitelist_coverage_pct?.severity},${sb.whitelist_coverage_pct?.severity}`);
+      } finally { fs.rmSync(r.dir, { recursive: true, force: true }); }
+    }
+    for (const mall of ne3) {
+      // 0 行の猶予 (#1572) は取込の結果だけで決める = NE ❌ の旗では止めない (当月 1 日の 0 行は exit 0・⚠️ 月初の猶予)
+      const flag = flagFor(`run-${mall}-finance-dq.js`, neNg);
+      const table = `f_${mall}_finance_sku_daily_v1`;
+      const dir = makeDir(mall, table);
+      try {
+        withDb(dir, (d) => addFactRow(d, table, '2026-09-30'));
+        const z = runDq(dir, `run-${mall}-finance-dq.js`, '2026-10', DAY(1), 'r2-ne-ng-empty', flag ? [flag] : []);
+        check(`${mall} (R2 Medium): f_sales ✅・NE ❌ の旗 (${flag}) でも当月 1 日の 0 行の猶予は止めない → exit 0・⚠️ 月初の猶予`,
+          flag === NO_LISTING_RAMP_FLAG && z.code === 0 && z.last.startsWith(MONTH_START_GRACE_PREFIX), `flag=${flag} code=${z.code} last=${z.last} ${z.err.slice(-200)}`);
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    }
+  }
   // 月半ば・月末: 立ち上がりの外は今までどおり (小さい差は info で通る / 月半ばに差が急に増えたら ❌)
   {
     const days = {}; const lst = {};
@@ -877,20 +955,28 @@ for (const mall of ['aupay', 'linegift', 'qoo10']) {
 {
   const src = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/daily-sync.js'), 'utf8').replace(/\r\n/g, '\n');
   check('daily-sync: --now も FINANCE_DQ_ALLOW_NOW も渡さない (試験専用の口を本番で使わない)', !/--now\b/.test(src) && !src.includes('FINANCE_DQ_ALLOW_NOW'));
+  // 4 つ目 = listingRampFlag に渡すもの: f_sales の結果 + listing の元の取込 (R2 Medium: Yahoo・au PAY・LINE ギフト・Qoo10 の listing は NE の raw_ne_orders から作る。
+  // 楽天は raw_rakuten_orders = 楽天の取込が ❌ なら monthStartGraceFlag(rkResult) で立ち上がりごと止まる)
   const calls = [
-    ['run-rakuten-finance-dq.js', 'rkResult', 'rakutenFinanceDqResult'],
-    ['run-yahoo-finance-dq.js', 'yahooResult', 'yahooFinanceDqResult'],
-    ['run-aupay-finance-dq.js', 'aupayResult', 'aupayFinanceDqResult'],
-    ['run-linegift-finance-dq.js', 'linegiftResult', 'linegiftFinanceDqResult'],
-    ['run-qoo10-finance-dq.js', 'qoo10Result', 'qoo10FinanceDqResult'],
+    ['run-rakuten-finance-dq.js', 'rkResult', 'rakutenFinanceDqResult', 'fSalesResult'],
+    ['run-yahoo-finance-dq.js', 'yahooResult', 'yahooFinanceDqResult', 'fSalesResult, neResult'],
+    ['run-aupay-finance-dq.js', 'aupayResult', 'aupayFinanceDqResult', 'fSalesResult, neResult'],
+    ['run-linegift-finance-dq.js', 'linegiftResult', 'linegiftFinanceDqResult', 'fSalesResult, neResult'],
+    ['run-qoo10-finance-dq.js', 'qoo10Result', 'qoo10FinanceDqResult', 'fSalesResult, neResult'],
   ];
-  for (const [script, imp, v] of calls) {
-    check(`daily-sync: ${script} に取込の結果で猶予の禁止 (monthStartGraceFlag(${imp})) と f_sales の結果で listing の立ち上がりの禁止 (listingRampFlag(fSalesResult)) を渡し、結果に warn を付ける`,
-      src.includes(`${script} --data-dir \${DATA_DIR_ARG} --month \${`) && new RegExp(`${script.replace(/\./g, '\\.')} --data-dir \\$\\{DATA_DIR_ARG\\} --month \\$\\{\\w+\\}\\$\\{monthStartGraceFlag\\(${imp}(, \\.\\.\\.\\w+)?\\)\\}\\$\\{listingRampFlag\\(fSalesResult\\)\\}\``).test(src)
+  for (const [script, imp, v, lra] of calls) {
+    check(`daily-sync: ${script} に取込の結果で猶予の禁止 (monthStartGraceFlag(${imp})) と f_sales・listing の元の結果で listing の立ち上がりの禁止 (listingRampFlag(${lra})) を渡し、結果に warn を付ける`,
+      src.includes(`${script} --data-dir \${DATA_DIR_ARG} --month \${`) && new RegExp(`${script.replace(/\./g, '\\.')} --data-dir \\$\\{DATA_DIR_ARG\\} --month \\$\\{\\w+\\}\\$\\{monthStartGraceFlag\\(${imp}(, \\.\\.\\.\\w+)?\\)\\}\\$\\{listingRampFlag\\(${lra}\\)\\}\``).test(src)
       && src.includes(`...${v}, warn: dqMonthStartWarn(${v}) }`));
   }
   check('daily-sync (R1 Medium): f_sales の再構築 (fSalesResult) は当月の finance DQ より前に流れる',
     src.indexOf("const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js'") > 0 && src.indexOf("const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js'") < src.indexOf('run-rakuten-finance-dq.js --data-dir'));
+  check('daily-sync (R2 Medium): NE の取込 (neResult) は main の上の段で f_sales より前に流れ、f_sales は NE の結果に関係なく流れる (= f_sales ✅ でも元の NE は古いことがある → NE の結果も渡す前提)',
+    src.includes("\n  const neResult = runScript('apps/warehouse/ne-api.js sync', 'NE API');") && src.includes("\n  const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js'")
+    && src.indexOf("const neResult = runScript('apps/warehouse/ne-api.js sync'") < src.indexOf("const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js'"));
+  check('rebuild-f-sales (R2 Medium): Yahoo・au PAY・LINE ギフト・Qoo10 の listing は raw_ne_orders から・楽天は raw_rakuten_orders から (NE の行から楽天を除く)',
+    (() => { const fs2 = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/rebuild-f-sales.js'), 'utf8').replace(/\r\n/g, '\n');
+      return /rakutenListingRows = db\.prepare\(`[^`]*FROM raw_rakuten_orders/.test(fs2) && /neListingRows = db\.prepare\(`[^`]*FROM raw_ne_orders o[^`]*NOT IN \('_ignore', 'amazon_fbm', 'rakuten'\)/.test(fs2); })());
   check('daily-sync: Yahoo は月初の猶予の間、前月も build → DQ → (DQ が通れば) sync', /Yahoo finance build \$\{yahooPrevYm\} \(月初の前月\)/.test(src) && /Yahoo finance DQ \$\{yahooPrevYm\} \(月初の前月\)/.test(src)
     && /if \(yahooPrevDq\.success\) \{\n\s+const yahooPrevSync = runScript\(\n\s+`apps\/warehouse\/sync-yahoo-finance-daily\.js --data-dir \$\{DATA_DIR_ARG\} --month \$\{yahooPrevYm\}`/.test(src));
   check('daily-sync (R2 Medium 2): 前月の build と DQ の結果を当月の DQ の旗に渡す (どちらか ❌ なら猶予を禁じる)',
@@ -906,6 +992,9 @@ for (const mall of ['aupay', 'linegift', 'qoo10']) {
     const lr = new Function(`${lrSrc}\nreturn listingRampFlag;`)();
     check('daily-sync (R1 Medium): f_sales ✅ → 旗なし / ❌ (打ち切り)・見送り (gated)・結果なし → --no-listing-ramp',
       lr({ success: true }) === '' && lr({ success: false }) === ` ${NO_LISTING_RAMP_FLAG}` && lr({ success: false, blocked: true, gated: true }) === ` ${NO_LISTING_RAMP_FLAG}` && lr(undefined) === ` ${NO_LISTING_RAMP_FLAG}`);
+    const ok = { success: true }; const ng = { success: false };
+    check('daily-sync (R2 Medium): f_sales ✅・NE ✅ → 旗なし / f_sales ✅・NE ❌ (か無い) → --no-listing-ramp / f_sales ❌・NE ✅ → --no-listing-ramp',
+      lr(ok, ok) === '' && lr(ok, ng) === ` ${NO_LISTING_RAMP_FLAG}` && lr(ok, undefined) === ` ${NO_LISTING_RAMP_FLAG}` && lr(ng, ok) === ` ${NO_LISTING_RAMP_FLAG}` && lr(undefined, ok) === ` ${NO_LISTING_RAMP_FLAG}`);
   }
   const allOkSrc = 'const allOk = results.every(r => r.success && r.warn !== true) && urgentWarnings.length === 0 && diskWarnings.length === 0;';
   check('daily-sync: 補助の関数 3 つと見出しの式がある', !!flagSrc && !!warnSrc && !!iconSrc && src.includes(allOkSrc));

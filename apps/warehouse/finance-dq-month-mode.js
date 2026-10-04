@@ -428,9 +428,11 @@ export function applyMonthStartSkip(grace, checkName, severity, details) {
  *   ③ 大きさ: 足りない分 (listing − fact の円 / whitelist に入っていない行の数) が、直近 settleDays 日 + 今日 の受注
  *      (f_sales_by_listing の円 / raw の行の数) 以下 (② があれば強い意味は無いが、残す)
  *   ④ daily-sync がこの回のモールの取込を ❌ と言っていない (--no-month-start-grace)。言っていれば下げない
- *   ⑤ listing だけ: daily-sync がこの回の f_sales の再構築を ❌ と言っていない (--no-listing-ramp。PR #1613 R1 Medium)。
+ *   ⑤ listing だけ: daily-sync がこの回の f_sales の再構築と listing の元の取込 (Yahoo・au PAY・LINE ギフト = NE) を ❌ と言っていない
+ *      (--no-listing-ramp。PR #1613 R1 Medium・R2 Medium)。楽天の listing の元は楽天の取込 (raw_rakuten_orders) = ④ で止まる。
  *      比べる相手 (f_sales_by_listing) が古いままだと、fact が多い向きになるとは限らない (古い listing 1000・fact 800・
  *      窓の listing 500 でも 200 ≤ 500 になる)。whitelist (raw どうし) と 0 行の猶予はこの印では止めない
+ *      R2 Medium: daily-sync は NE の取込が ❌ でも f_sales を作り直す (古い raw_ne_orders から = ✅ になりうる) → f_sales の結果だけでは足りない
  *   rampDays を過ぎたら今までどおり (月半ばに差が増えたら ❌)。しきい値の表 (CURRENT / PAST) は変えない。
  *
  *   試算 (上の error の日すべてを数え直した。PR #1613 の本文の表):
@@ -461,7 +463,7 @@ export const MONTH_START_RAMP = Object.freeze({
 /** 立ち上がりの日数の上限 (これより長いのは「月初」ではない = 前月の whitelist の猶予と同じ 14 日)。1 月の +3 もこれで丸める */
 export const MONTH_START_RAMP_MAX = RECENT_PAST_GRACE_DAYS;
 export const MONTH_START_RAMP_PREFIX = '⚠️ 月初の立ち上がり:';
-/** daily-sync がこの回の f_sales の再構築を ❌ と言ったときに付ける印 (listing の立ち上がりだけを止める。⑤) */
+/** daily-sync がこの回の f_sales の再構築か listing の元の取込 (NE) を ❌ と言ったときに付ける印 (listing の立ち上がりだけを止める。⑤) */
 export const NO_LISTING_RAMP_FLAG = '--no-listing-ramp';
 
 /**
@@ -483,7 +485,7 @@ export function monthStartRamp(mall, ym, { now = new Date(), noGrace = false, no
   if (noGrace) reasons.push('呼び手が猶予を禁じた (この回のモールの取込が ❌)');
   const settleDays = Object.fromEntries(Object.entries(spec.settleDays).map(([k, v]) => [k, v + jan]));
   const deniedChecks = {};
-  if (noListingRamp) deniedChecks.listing_diff_pct = `比べる相手 (f_sales_by_listing) をこの回に作り直せていない (f_sales 再構築が ❌ = ${NO_LISTING_RAMP_FLAG})`;
+  if (noListingRamp) deniedChecks.listing_diff_pct = `比べる相手 (f_sales_by_listing) をこの回の新しい元から作り直せていない (f_sales 再構築か、その元の NE の取込が ❌ = ${NO_LISTING_RAMP_FLAG})`;
   return { active: reasons.length === 0, mall, ym, today, dayOfMonth, rampDays, settleDays, reasons, deniedChecks: Object.freeze(deniedChecks) };
 }
 
@@ -587,5 +589,5 @@ export function applyMonthStartRamp(ramp, checkName, severity, details, { shortf
 /** 立ち上がりで下げた回の最後の行 (daily-sync は isMonthStartGraceSummary で見分けて見出しを ⚠️ にする) */
 export function monthStartRampNote(ramp, ramped) {
   const list = ramped.map((c) => `${c.checkName} ${Number.isFinite(c.value) ? Number(c.value).toFixed(1) : 'n/a'}%`).join(' / ');
-  return `${MONTH_START_RAMP_PREFIX} ${ramp.ym} の ${list} は直近の受注がまだ出荷 (完了) していない分で説明できる差 (JST ${ramp.dayOfMonth} 日・立ち上がりは ${ramp.rampDays} 日まで・窓より前の日には差が無い)。説明できない差・窓より前の差・実績が多い向きは ❌ のまま`;
+  return `${MONTH_START_RAMP_PREFIX} ${ramp.ym} の ${list} は直近の受注がまだ出荷 (完了) していない分で説明できる差 (JST ${ramp.dayOfMonth} 日・立ち上がりは ${ramp.rampDays} 日まで・窓より前に error 級の差が無い)。説明できない差・窓より前の差・実績が多い向きは ❌ のまま`;
 }

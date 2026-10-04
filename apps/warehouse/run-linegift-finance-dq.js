@@ -53,7 +53,7 @@ try { now = resolveDqNow(getArg('--now')); }
 catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
 // daily-sync はこの回のモールの取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
 const noMonthStartGrace = args.includes('--no-month-start-grace');
-// daily-sync はこの回の f_sales の再構築が ❌ のとき --no-listing-ramp を付ける (= listing_diff_pct の月初の立ち上がりを使わない。比べる相手が古い)
+// daily-sync はこの回の f_sales の再構築か、listing の元の NE の取込が ❌ のとき --no-listing-ramp を付ける (= listing_diff_pct の月初の立ち上がりを使わない。比べる相手が古い。R2 Medium)
 const noListingRamp = args.includes(NO_LISTING_RAMP_FLAG);
 
 // 重複期間: 既存 linegift_accounting CSV (受注日基準) と新 fact (受取日基準) が並走している月 → listing_diff_pct を informational に格下げ
@@ -98,7 +98,7 @@ const isCur = mode === 'current';
 const isDuplicatePeriod = DUPLICATE_PERIOD_MONTHS.has(monthStr);
 const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST, THRESHOLDS_CURRENT);
 // 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 7 日目までは listing_diff_pct・whitelist_coverage_pct の error を、
-// 「足りない向き」かつ「直近 3 日 + 今日より前の日には差が無い (ふだんのしきい値で error でない)」かつ「足りない分 ≤ 直近の受注」の
+// 「足りない向き」かつ「直近 3 日 + 今日より前に error 級の差が無い (ふだんのしきい値で error でない = warn は通す)」かつ「足りない分 ≤ 直近の受注」の
 // ときだけ ⚠️ に下げる (受取待ちの差。受注 → 受取は 0〜8 日)
 const ramp = monthStartRamp('linegift', monthStr, { now, noGrace: noMonthStartGrace, noListingRamp });
 const rampedChecks = [];

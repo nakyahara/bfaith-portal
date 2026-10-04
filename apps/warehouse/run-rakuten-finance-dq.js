@@ -68,7 +68,8 @@ try { now = resolveDqNow(getArg('--now')); }
 catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
 // daily-sync はこの回の楽天の取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
 const noMonthStartGrace = args.includes('--no-month-start-grace');
-// daily-sync はこの回の f_sales の再構築が ❌ のとき --no-listing-ramp を付ける (= listing_diff_pct の月初の立ち上がりを使わない。比べる相手が古い)
+// daily-sync はこの回の f_sales の再構築が ❌ のとき --no-listing-ramp を付ける (= listing_diff_pct の月初の立ち上がりを使わない。比べる相手が古い)。
+// 楽天の listing の元は raw_rakuten_orders (NE ではない) = 楽天の取込が ❌ の朝は --no-month-start-grace で立ち上がりごと止まる
 const noListingRamp = args.includes(NO_LISTING_RAMP_FLAG);
 
 // ============================================================
@@ -101,7 +102,7 @@ const THRESHOLDS_CURRENT_MONTH = {
 
 const THRESHOLDS = isCurrentMonth(monthStr) ? THRESHOLDS_CURRENT_MONTH : THRESHOLDS_PAST_MONTH;
 // 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 7 日目までは listing_diff_pct の error を、
-// 「fact が足りない向き」かつ「直近 2 日 + 今日より前の日には差が無い (ふだんのしきい値で error でない)」かつ「足りない分 ≤ 直近の受注」の
+// 「fact が足りない向き」かつ「直近 2 日 + 今日より前に error 級の差が無い (ふだんのしきい値で error でない = warn は通す)」かつ「足りない分 ≤ 直近の受注」の
 // ときだけ ⚠️ に下げる (出荷待ちの差。6〜10 月の毎月 2〜6 日に ❌ だった)
 const ramp = monthStartRamp('rakuten', monthStr, { now, noGrace: noMonthStartGrace, noListingRamp });
 const rampedChecks = [];
