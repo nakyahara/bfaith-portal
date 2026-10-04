@@ -963,7 +963,7 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
       1. `master-ownership-epoch.mjs prepare` (段階は legacy_open のまま = 入口はまだ開いている)
       2. `master-cutover.mjs --to frozen` (段階を変える関数は CLI の共有の鍵を待つ。この瞬間から C の列の入口だけ閉じる)。証拠の `owner_hash` は**新しい門の記録 (ack) のハッシュ** = 配ったコードの configured (13 キー = `c36e3d0f5f56cb01e7acdf71f73a0cf6608826ffeabfa58506734e41bbb6b3dd`)。active (全部 load = `4f53cda1…`) を入れると `acks_invalid` で止まる
       3. 全部のプロセスの書きかけ 0 (`master-legacy-instance.mjs --list` の inflight・`pg_locks` の `hashtext('ops.master_cutover')` の共有の鍵 0 = CLI が書いていない)
-      4. **active (全部 load) の最後のロード** (NE の取得 → m_products の作り直し → Render の同期 → `remote-load.mjs load --apply --wait` = `--use-prepared` を付けない) = prepare をまたいで書き終えた古い入口の値を Company DB に回収する → 照合 ① ②
+      4. **active (全部 load) の最後のロード** (NE の取得 → m_products の作り直し → Render の同期 → `remote-load.mjs load --apply --wait` = `--use-prepared` を付けない) = prepare をまたいで書き終えた古い入口の値を Company DB に回収する → そのロードが返した run_id の report が成功・照合 ② (今の値) で未説明の差 0 を確かめる (🚨照合 ① は host = render-nightly の 02:00 のロードだけを選ぶ = この手動のロードは見ない。① はその朝の基準として見る)
       5. `remote-load.mjs load --apply --wait --use-prepared` → 写し → 作り直し → 確かめ → activate
       試験 = `scripts/test-master-legacy-gate-pg.mjs` [19] (2 つの接続で交差を再現・3 を飛ばして 5 = 値が消える・4 の後 = 残る)。
     - 配る前の確かめ (`master-legacy-readiness.mjs`) は門のログインで `ops.master_ownership_state` の有無・SELECT の権限・門と同じ読み方を確かめる (legacy_open の間は門は持ち主を読まない = ここで見ないと frozen にした瞬間に全部 503)。
@@ -2159,16 +2159,18 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
 - 変更の記録 = `ops.master_ownership_events` (足すだけ。init / prepare / cancel_prepare / activate と、activate のときの確かめの証拠)
 - 記録の後に足した列 (後の PR で `OWNED_COLUMNS` に足した列 = 記録した持ち主に無い列) = **'load' として足す** (夜間ロード・写しは止まらない。`status` の `filled_as_load` に出る)。知らない列・知らない値・ハッシュが中身と違う = 壊れ (推測しない = 止める)
 
-切替の日の順番 (⑤-3 の切替の手順の中。🚨 **古い書き込み口 (/register など) を閉じるのは ⑤-3 = 持ち主を変える前に閉じる**。0050 では閉じない):
-1. config/master-ownership.mjs を書き換えてデプロイ (ここでは何も変わらない)
-2. miniPC: `node scripts/company-db/master-ownership-epoch.mjs prepare` (一緒に切り替える組・④a が写さない列を確かめて記録)
+切替の日の順番 (🆕 #1610 R1〜R3 で直した = 正本は AI_reference 17 §4.2 の表。🚨 **古い書き込み口 (/register など) を閉じるのは ⑤-3b = 持ち主が C の列の入口だけ・prepare の後の frozen で閉じる**):
+1. config/master-ownership.mjs を書き換えてデプロイ (ここでは何も変わらない)。配る前の確かめ `master-legacy-readiness.mjs` が両方の環境で終了コード 0
+2. miniPC: `node scripts/company-db/master-ownership-epoch.mjs prepare` (一緒に切り替える組・④a が写さない列を確かめて記録。段階は legacy_open のまま = 入口はまだ開いている)
+2a. `master-cutover.mjs --to frozen` (この瞬間から prepared の C の列の入口だけ閉じる) → 全部のプロセスの書きかけ 0 (`master-legacy-instance.mjs --list`・`pg_locks` の段階の共有の鍵 0)
+2b. **最後の同期 = active (全部 load) のロード** (NE の取得 → 作り直し → Render の同期 → `remote-load.mjs load --apply --wait` = `--use-prepared` を付けない) = prepare をまたいで書き終えた古い入口の値を回収 → そのロードの run_id の report の成功 + 照合 ② (照合 ① は 02:00 のロードだけを見る)
 3. `node scripts/company-db/remote-load.mjs load --apply --wait --use-prepared` (prepared の持ち主で 1 回だけロード)
 4. miniPC: `node apps/company-db/publish/fetch.mjs` → `node apps/warehouse/rebuild-m-products.js` → `node apps/company-db/publish/fetch.mjs --verify-apply` (prepared の世代を入れて確かめる)
 5. miniPC: `node scripts/company-db/master-ownership-epoch.mjs activate` (最新の作り直しが prepared の世代・その世代が prepare の後に Company DB を読んだ・今朝の確かめが通った・読み直しても同じ、
    かつ **⑤-1 の切替の段階 (`ops.master_cutover_state`) が `frozen`** (古い入口を止めた後・持ち主を C にする前) のときだけ active に。足りなければ理由を出して断る。段階の表が無い = 断る。
    証拠を集めたときの prepare の時刻を行の鍵の後に比べる = その間に prepare をやり直したら `PREPARED_CHANGED` で断る (やり直しは 3 から)。
    証拠の世代が読んだ夜間ロードが最後のロードでない (証拠の後に毎晩のロードなどが入った。DB の commit の番号で比べる) = `LOAD_AFTER_EVIDENCE` で断る (やり直しは 3 から。#1564 Codex R3 High 1・R4))
-- 途中で止める = `master-ownership-epoch.mjs cancel` (prepared を消す。active はそのまま = 毎晩は前の持ち主)。今の状態 = `master-ownership-epoch.mjs status`
+- 途中で止める = `master-ownership-epoch.mjs cancel` (prepared を消す。active はそのまま = 毎晩は前の持ち主)。🚨 cancel すると門から見た C の列が消える = **段階が frozen のままでも、その列の古い入口が再び開く** (門は active ∪ prepared で見る)。入口を閉じたまま夜を越すなら cancel しない (prepared を残す)。cancel したらスタッフに知らせ、翌日は prepare からやり直す。prepared を残して 02:00 のロードが走ったら activate は LOAD_AFTER_EVIDENCE で止まる = 2b (最後の同期) からやり直す。今の状態 = `master-ownership-epoch.mjs status`
 
 **マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0055 は表を 3 つ (epoch・その記録・夜間ロードの commit の順) と、⑤-1 の切替の段階・画面の保存の門に「持ち主の epoch と同じ」の確かめを足すだけ (行は作らない = 全部 load のまま = 何も変わらない)。
 あわせて ⑤-1 の `ops.ownership_hash` の式を「load の列は数えない」に作り直す (下の「1 つの式」)。🚨 段階が company_owner / new_open の DB では 0055 は止まる (本番は legacy_open = 当たらない)。
