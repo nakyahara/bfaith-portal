@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 // import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport, getSalesCountBySku, searchByJan, searchByKeyword, searchByPartNumber } from './sp-api.js';
 import { normalizePartNumber, estimateMonthlySales, getSalesLevel } from './sp-api.js'; // ローカル関数のみ残す
 import { ASIN_RE } from '../../lib/asin.js';
+import { masterLegacyGate, legacyBannerHtml } from '../../lib/master-legacy-gate.mjs';
 
 // --- ミニPC接続（SP-API実行用） ---
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -52,6 +53,19 @@ import { getSetting, setSetting, getAllSettings } from './settings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
+// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #9・14 §5・§9 M2・契約 v3 H1)。NE 用 CSV (NE への 2 つ目の出口) と仕入れ先マスタの追加・削除は
+//    legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る) = owner_cols のどれかが C のときだけ閉じる (⑤-3b・列が全部 load の入口は開いたまま)・段階 / 持ち主が読めない = 410 / 503 (何も書かない・CSV を作らない)。
+//    画面は帯を出して、その部品を隠す (sendPage)
+router.use(masterLegacyGate('profit-calculator'));
+
+/** 画面を返す。古い入口を閉じたときだけ帯を入れて書く部品を隠す (閉じていなければ今までどおり sendFile) */
+function sendPage(res, file, hideSelectors) {
+  const legacy = res.locals.masterLegacy;
+  if (!legacy || !legacy.frozen) return res.sendFile(path.join(__dirname, file));
+  const html = fs.readFileSync(path.join(__dirname, file), 'utf8');
+  const banner = legacyBannerHtml(legacy, { hideSelectors });
+  res.type('html').send(/<body[^>]*>/i.test(html) ? html.replace(/<body[^>]*>/i, (m) => m + banner) : banner + html);
+}
 
 // DB初期化
 let dbReady = false;
@@ -95,15 +109,15 @@ function enrichUserNames(session) {
 
 // ── ページ配信 ──
 router.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+  sendPage(res, 'index.html', ['[onclick^="saveNewSupplier"]']);
 });
 
 router.get('/research', (req, res) => {
-  res.sendFile(path.join(__dirname, 'list.html'));
+  sendPage(res, 'list.html', ['[onclick^="addNewSupplier"]', '[onclick^="deleteSupplier"]', '#sup-new-code', '#sup-new-name']);
 });
 
 router.get('/products', (req, res) => {
-  res.sendFile(path.join(__dirname, 'products.html'));
+  sendPage(res, 'products.html', ['[onclick^="exportNeCsv"]']);
 });
 
 router.get('/amazon', (req, res) => {
@@ -120,7 +134,7 @@ router.get('/price-revision', (req, res) => {
 });
 
 router.get('/suppliers', (req, res) => {
-  res.sendFile(path.join(__dirname, 'suppliers.html'));
+  sendPage(res, 'suppliers.html', ['.add-form', '[onclick^="startEdit"]', '[onclick^="saveEdit"]', '[onclick^="del("]']);
 });
 
 router.get('/shipping', (req, res) => {

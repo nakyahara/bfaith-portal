@@ -22,7 +22,9 @@ import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from '../../scripts/company-db/migrate.mjs';
 import { buildPlanFromRender } from './load/sources.mjs';
 import { runInitialLoad } from './load/engine.mjs';
-import { MASTER_OWNERSHIP } from '../../config/master-ownership.mjs';
+import { OWNED_COLUMNS as OWNED_COLUMNS_FOR_BASE } from '../../config/master-ownership.mjs';
+// 試験の基準 = 切替前の持ち主表 (全部 load)。⑤-3b の PR から config/master-ownership.mjs (configured) は 10/5 の 13 キーが company = 基準にしない
+const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries(OWNED_COLUMNS_FOR_BASE.map((k) => [k, 'load'])));
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }

@@ -37,7 +37,8 @@ const { applyMigrations, pgliteAdapter } = await import('./company-db/migrate.mj
 const { createRoles } = await import('./company-db/create-watch-roles.mjs');
 const { createMasterEditRoles } = await import('./company-db/create-master-edit-roles.mjs');
 const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
-const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
+// 試験の基準 = 切替前の持ち主表 (全部 load)。⑤-3b の PR から config/master-ownership.mjs (configured) は 10/5 の 13 キーが company = 基準にしない
+const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries((await import('../config/master-ownership.mjs')).OWNED_COLUMNS.map((k) => [k, 'load'])));
 const C = await import('../lib/master-cutover.mjs');
 const A = await import('../lib/amazon-map-write.mjs');
 const M = await import('../lib/amazon-map-migrate.mjs');

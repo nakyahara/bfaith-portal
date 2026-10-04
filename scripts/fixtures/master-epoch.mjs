@@ -3,7 +3,8 @@
  *
  * なぜ: 0055 から、切替の段階を company_owner・new_open に進めるのは「持ち主の epoch が active で、段階の持ち主表 (owner_hash) と同じ」ときだけ
  *   (⑤-1 の差し込み口の前提・段階の行の trigger)・画面の保存も active と同じ持ち主表だけ (master_write_sessions の trigger)。
- *   本番は ④a の手順 (master-ownership-epoch.mjs prepare → 写し → 作り直し → 確かめ → activate) で active になる。
+ *   本番は切替の日の手順 (readiness → master-ownership-epoch.mjs prepare → frozen → 書きかけ 0 → 最後の active (全部 load) のロード → その run_id の report の成功 + 照合 ② →
+ *   --use-prepared のロード → 写し → 作り直し → 確かめ → activate。db/company/README.md・AI_reference 17 §4.2) で active になる。
  *   ⑤ の試験は切替を進めるときにその手順を流さない = ここで「activate 済み」の状態を直接置く (段階を進める直前に。表が無い DB = 何もしない)
  */
 import { ownershipHash as hashOf } from '../../lib/master-cutover.mjs';   // 持ち主表のハッシュ = 1 つの式 (load の列は数えない。0055 の ops.ownership_hash と同じ)

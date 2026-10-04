@@ -16,7 +16,8 @@
  *     🚨 product-hub の正規化した ne_code の一意 (idx_product_drafts_ne_norm) は、前からの重なりがあると張れない (db.js) = 一意に頼らず、
  *        取引の中で同じコードのカードを全部数える (PR #1566 Codex R2 Medium)
  * 🚨 切替の段階が frozen 以降に、このファイル (と ⑤-2a のコード) でカードを作る道はこの取り込みだけ (知らせは new_open の登録でしか書かれない)。
- *    product-hub の古い作成の道 (/api/drafts・NE の一括登録・自動取込) を frozen から閉じるのは ⑤-3
+ *    product-hub の古い作成の道 (/api/drafts・NE の一括登録・自動取込) を閉じるのは ⑤-3 の門 (⑤-3b: frozen 以降で新しい登録の列が全部 C のとき = owner_match 'all'。
+ *    それまでは古い道も開いている = cdb_sku_id の一意と同じコードの衝突 (conflict) で二重にしない)
  * 発送方法: Company DB の送料コードの方法 (送料の表の小分類区分名称 = NE の配送方法と同じ名前) を ph_shipping_method_map で楽天の配送方法グループへ。
  *   対応が無い = 楽天の配送方法は空のまま・shipping_status = unmapped (ボードのカードに「要確認」)。🚨 名前が似ているだけで推し量らない
  * Yahoo!: 画面 D で配送方法を入れたときだけ delivery_label を入れる (楽天の配送方法と違えば「ヤフーだけ別」= shipping_override 1)。

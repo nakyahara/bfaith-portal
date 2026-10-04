@@ -62,6 +62,28 @@ export async function readOwnershipState(db) {
 }
 
 /**
+ * 古い入口の門 (lib/master-legacy-gate.mjs・⑤-3b) が使う「持ち主が C の列」= active と prepared の C の列を合わせたもの。
+ *   🚨 prepared も数える: prepare (切替の日) から activate までの間に、古い入口から入れた値は --use-prepared のロード・写しの材料に入らず、
+ *      activate の後の夜間ロードは C の列の既にある行を上書きしない = 黙って消える。門は legacy_open の間は持ち主を読まない = prepare しただけでは閉じない
+ *      (閉じ始めるのは frozen にした時点)。cancel で prepared が消えると、prepared だけで C だった列 (active では load) の入口は frozen のままでも再び開く (activate の後は prepared が無く active が C = 閉じたまま・cancel は対象外)。
+ *      prepare をまたいで書き終えた値は、frozen の後の最後の active (全部 load) のロードで回収する (README の 2a・2b)
+ *   🚨 読めない (表が無い = 0055 の前・権限が無い・記録が壊れている) = { readable: false } = 門は閉じる側 (fail-closed)。行が無い = 全部 load (誰も prepare していない)
+ *   config (configured) は見ない (デプロイの成果物 = 場所ごとに切り替わる時刻が違う。契約 v3 H1)
+ * @returns {{ readable: boolean, company: string[]|null, active_hash: string|null, prepared_hash: string|null, state: string|null, error: string|null }}
+ */
+export async function readGateOwnership(db) {
+  try {
+    const st = await readOwnershipState(db);
+    if (st.state === 'no_table') return { readable: false, company: null, active_hash: null, prepared_hash: null, state: st.state, error: '持ち主の epoch の表 (ops.master_ownership_state・0055) が無い' };
+    const company = new Set(Object.keys(st.active.map).filter((k) => st.active.map[k] === 'company'));
+    if (st.prepared) for (const k of Object.keys(st.prepared.map)) if (st.prepared.map[k] === 'company') company.add(k);
+    return { readable: true, company: [...company].sort(), active_hash: st.active.hash, prepared_hash: st.prepared ? st.prepared.hash : null, state: st.state, error: null };
+  } catch (e) {
+    return { readable: false, company: null, active_hash: null, prepared_hash: null, state: null, error: `持ち主を読めない: ${String((e && e.message) || e).slice(0, 300)}` };
+  }
+}
+
+/**
  * 夜間ロードが使う持ち主。既定 = active (行が無い = 全部 load)。usePrepared = 切替の日に明示して頼んだロードだけ (prepared が無ければ投げる)
  * @returns {{ ownership: object, epoch: 'active'|'prepared'|'default', hash: string, state: string }}
  */
@@ -157,8 +179,9 @@ async function readCutoverPhaseInTx(db) {
  *   expectLoadCommitSeq = 証拠の世代が読んだ夜間ロードの commit の番号 (0055 の ops.master_load_commits)。最後に commit したロードがこれでない = 断る
  *   (LOAD_AFTER_EVIDENCE。古い active で走ったロードが証拠の後に C の列を NE の値で書いた = 証拠の世代はもう DB と同じでない。#1564 Codex R3 High 1・R4 Medium 2)。
  *   最後のロードの持ち主が prepared でない = 断る (LOAD_EPOCH_MISMATCH)
- * 🚨 切替の段階が frozen (古い入口を止めた後・持ち主を C にする前) のときだけ (#1564 の見直し M-1)。
- *   段階の表が無い (⑤-1 の前) = 断る / legacy_open (古い入口がまだ正) = 断る / company_owner・new_open (もう切り替えた後) = 断る。
+ * 🚨 切替の段階が frozen (prepared の C の列の古い入口を止めた後・持ち主を C にする前) のときだけ (#1564 の見直し M-1)。
+ *   段階の表が無い (⑤-1 の前) = 断る / legacy_open (古い入口が全部開いている) = 断る / company_owner・new_open (もう切り替えた後) = 断る。
+ *   (frozen = 持ち主が C (active ∪ prepared) の列の古い入口だけ閉じている。load の列の入口は開いたまま = ⑤-3b)
  *   持ち主の正を 1 つにする残り (⑤-1 の company_owner に進む条件 = active_hash と owner_hash が同じ・新しい画面が DB の active を読む) は ⑤ / ⑥ で結ぶ
  */
 export async function activateOwnership(db, { expectHash, expectPreparedAt, expectLoadCommitSeq, actor, evidence }) {
@@ -169,12 +192,12 @@ export async function activateOwnership(db, { expectHash, expectPreparedAt, expe
   return inTx(db, async () => {
     const phase = await readCutoverPhaseInTx(db);
     if (phase == null) throw Object.assign(new Error(`切替の段階の表 (${CUTOVER_TABLE}) が無い・行が無い = active にしない (⑤-1 の migration の後・段階 ${ACTIVATE_PHASE} で)`), { code: 'CUTOVER_STATE_MISSING' });
-    if (phase !== ACTIVATE_PHASE) throw Object.assign(new Error(`切替の段階が ${phase} = active にしない (${ACTIVATE_PHASE} = 古い入口を止めた後だけ)`), { code: 'CUTOVER_PHASE_NOT_FROZEN', phase });
+    if (phase !== ACTIVATE_PHASE) throw Object.assign(new Error(`切替の段階が ${phase} = active にしない (${ACTIVATE_PHASE} = C にする列の古い入口を止めた後だけ)`), { code: 'CUTOVER_PHASE_NOT_FROZEN', phase });
     const cur = (await rowsOf(db, `select prepared_hash, prepared_map, to_char(prepared_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as prepared_at
       from ops.master_ownership_state where id = 1 for update`))[0];
     if (!cur || !cur.prepared_hash) throw Object.assign(new Error('prepared の持ち主が無い'), { code: 'NO_PREPARED_OWNERSHIP' });
     if (cur.prepared_at !== expectPreparedAt) {
-      throw Object.assign(new Error(`証拠を集めた後に prepare がやり直された (${expectPreparedAt} → ${cur.prepared_at}) = この証拠では active にしない (写し・作り直し・確かめからやり直す)`), { code: 'PREPARED_CHANGED' });
+      throw Object.assign(new Error(`証拠を集めた後に prepare がやり直された (${expectPreparedAt} → ${cur.prepared_at}) = この証拠では active にしない (書きかけ 0 → 最後の active (全部 load) のロード (README の 2b・17 §4.2 #5) → その run_id の report の成功 + 照合 ② → --use-prepared のロード からやり直す)`), { code: 'PREPARED_CHANGED' });
     }
     // 確かめた世代の持ち主 (実際に効く持ち主のハッシュ = 記録に無い列は load を足した後) と比べる
     const eff = checkedMap(cur.prepared_map, cur.prepared_hash, 'prepared');
@@ -183,7 +206,7 @@ export async function activateOwnership(db, { expectHash, expectPreparedAt, expe
     //   古い active を読んで走っていたロードは、ここより前に commit している (その書き込みは証拠の世代に入っていない = 写しからやり直す)
     const last = await latestLoadCommit(db);
     if (!last || last.commit_seq !== expectLoadCommitSeq) {
-      throw Object.assign(new Error(`証拠の世代の後に夜間ロード (${last ? `${last.ingest_run_id} = 番号 ${last.commit_seq}` : 'なし'}) が入った (証拠 = 番号 ${expectLoadCommitSeq}) = この証拠では active にしない (--use-prepared のロードからやり直す)`),
+      throw Object.assign(new Error(`証拠の世代の後に夜間ロード (${last ? `${last.ingest_run_id} = 番号 ${last.commit_seq}` : 'なし'}) が入った (証拠 = 番号 ${expectLoadCommitSeq}) = この証拠では active にしない (最後の active (全部 load) のロード (README の 2b・17 §4.2 #5) → その run_id の report の成功 + 照合 ② → --use-prepared のロード からやり直す)`),
         { code: 'LOAD_AFTER_EVIDENCE', last_load: last ? last.ingest_run_id : null, last_commit_seq: last ? last.commit_seq : null });
     }
     if (last.ownership_hash !== eff.hash) {

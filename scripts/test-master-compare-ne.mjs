@@ -1172,7 +1172,8 @@ await ta('[29] 新商品の NE 登録の CSV (⑤-2b): ② が最後まで走っ
 });
 
 await ta('[30] 持ち主が C の列 (④a): C ≠ NE で写し = C なら rule (company_owned・NE を C の値に・方向 to_ne) / 写しの後に C が変わった = rule_lag / どの列も direction_unknown にしない', async () => {
-  const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
+  // 試験の基準 = 切替前の持ち主表 (全部 load)。⑤-3b の PR から config/master-ownership.mjs (configured) は 10/5 の 13 キーが company = 基準にしない
+  const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries((await import('../config/master-ownership.mjs')).OWNED_COLUMNS.map((k) => [k, 'load'])));
   const own = { ...MASTER_OWNERSHIP, ...Object.fromEntries(['skus.name', 'products.name', 'skus.handling', 'products.status', 'skus.tax_rate', 'skus.tax_class', 'skus.standard_price', 'sku_costs', 'supplier_skus.is_primary'].map((k) => [k, 'company'])) };
   const NE = baseNe();
   const d0 = '2030-05-01', d1 = '2030-05-02';
@@ -1215,7 +1216,8 @@ await ta('[30] 持ち主が C の列 (④a): C ≠ NE で写し = C なら rule 
 });
 
 await ta('[31] 持ち主が C の列は NE の値が空・0・null・不正でも company_owned で分ける (incomparable・ne_no_value にしない。NE の状態は残す)・NE も C も空 = 一致 (Codex #1564 R1 M6)', async () => {
-  const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
+  // 試験の基準 = 切替前の持ち主表 (全部 load)。⑤-3b の PR から config/master-ownership.mjs (configured) は 10/5 の 13 キーが company = 基準にしない
+  const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries((await import('../config/master-ownership.mjs')).OWNED_COLUMNS.map((k) => [k, 'load'])));
   const own = { ...MASTER_OWNERSHIP, ...Object.fromEntries(['skus.name', 'products.name', 'skus.handling', 'products.status', 'skus.tax_rate', 'skus.tax_class', 'skus.standard_price', 'sku_costs', 'supplier_skus.is_primary'].map((k) => [k, 'company'])) };
   const NE = baseNe();
   const d0 = '2030-06-01', d1 = '2030-06-02';

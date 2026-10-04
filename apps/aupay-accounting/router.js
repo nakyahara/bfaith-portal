@@ -17,8 +17,12 @@ import fs from 'fs';
 import iconv from 'iconv-lite';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { requireImportKey, importJsonParser } from '../../lib/import-key-auth.js';
+import { masterLegacyGate, legacyBannerHtml } from '../../lib/master-legacy-gate.mjs';
 
 const router = Router();
+// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #4・14 §5・契約 v3 H1)。POST /register (mirror_products の税率・売上分類) は
+//    legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る)。税率・売上分類が C = 410・段階か持ち主が読めない = 503 (何も書かない)。画面 (/) は帯を出して登録の部品を隠す
+router.use(masterLegacyGate('aupay-accounting'));
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
 if (!fs.existsSync(UPLOAD_DIR)) { try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {} }
 const upload = multer({ dest: UPLOAD_DIR });
@@ -274,7 +278,7 @@ function aggregate(resolvedRows) {
 // ─── GET / — メイン画面 ───
 
 router.get('/', (req, res) => {
-  res.send(renderPage());
+  res.send(renderPage(res.locals.masterLegacy));
 });
 
 // ─── POST /upload — 注文データCSVアップロード＆集計 ───
@@ -592,7 +596,7 @@ router.post('/import-history', requireImportKey('IMPORT_KEY_AUPAY'), importJsonP
 
 // ─── HTML ───
 
-function renderPage() {
+function renderPage(legacy = null) {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -643,6 +647,7 @@ function renderPage() {
   </style>
 </head>
 <body>
+  ${legacyBannerHtml(legacy, { hideSelectors: ['#registerBtn', '.reg-sel'] })}
   <div class="header">
     <h1>auペイマーケット売上集計</h1>
     <a href="/">\\u2190 \\u30dd\\u30fc\\u30bf\\u30eb\\u306b\\u623b\\u308b</a>
@@ -1167,7 +1172,7 @@ function renderPage() {
           alert('登録完了: 税率 ' + result.updatedTax + '件 / セグメント ' + result.updatedSeg + '件\\n\\n再集計を実行します。');
           doUpload();
         } else {
-          alert('登録エラー: ' + (result.error || ''));
+          alert('登録エラー: ' + (result.message || result.error || ''));
         }
       } catch(e) {
         alert('登録エラー: ' + e.message);

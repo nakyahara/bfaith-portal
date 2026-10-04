@@ -599,7 +599,7 @@
             const msgs = err.details.map(d => `・${d.name}: ${d.missing.join(', ')}`).join('\n');
             alert(`必須項目が不足しています:\n\n${msgs}`);
           } else {
-            alert(err.error || 'エラーが発生しました');
+            alert(err.message || err.error || 'エラーが発生しました');
           }
           return;
         }

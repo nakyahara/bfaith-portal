@@ -25,6 +25,9 @@ const db = getDB();
 db.prepare('INSERT INTO raw_ne_products (商品コード, 商品名, 原価) VALUES (?, ?, ?)').run('ne-aaa', 'NE-A', 100);
 
 const mod = await import('../apps/warehouse/router.js');
+// 切替の段階 = legacy_open (マスタの古い入口の門 lib/master-legacy-gate.mjs を今までどおり通す。門そのものの試験は test-master-legacy-gate.mjs)
+const { __setLegacyPhaseReader } = await import('../lib/master-legacy-gate.mjs');
+__setLegacyPhaseReader(async () => ({ readable: true, phase: 'legacy_open' }));
 const router = mod.default;
 
 const app = express();

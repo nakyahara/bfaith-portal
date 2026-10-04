@@ -39,6 +39,7 @@ import { getSetting, setSetting, audit, markCycleFbaJobDone } from './ledger.js'
 import { computeShortageRisk, shortageSettings, validateShortageSetting, shortageSettingKey, SHORTAGE_DEFAULTS } from './shortage-risk.js';
 import { getDriveCsvInfo, downloadDriveCsv } from '../../lib/drive-csv.js';
 import { startFbaAutoRefresh, nextBusinessDay9Jst } from './scheduler.js';
+import { masterLegacyGate, legacyRecheck } from '../../lib/master-legacy-gate.mjs';
 
 startEmailDispatcher(); // 予約送信 (毎分、時刻が来たqueuedジョブを送信。unrefでプロセス終了は妨げない)
 
@@ -69,6 +70,10 @@ async function callWarehouse(fullPath, { method = 'GET', timeout = 30000 } = {})
 startFbaAutoRefresh(callWarehouse); // 平日16時 (JST) のFBA在庫自動更新 (土日祝スキップ・Render限定。中原さん要望 2026-08-27)
 
 const router = Router();
+// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #7・PR #1565 R1 H4)。仕入先 (po_suppliers) を書く API (マスタ管理の仕入先タブ・宛先の CSV・一括取込) は
+//    legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る) = owner_cols のどれかが C のときだけ閉じる (⑤-3b・列が全部 load の入口は開いたまま)・段階 / 持ち主が読めない = 410 / 503 (切替の手順で書き込み先を Company DB に替えるまで仕入先は見るだけ)。
+//    仕入先でないマスタ (発注条件・資材・属性・先方品番) は止めない (config/master-legacy-entries.mjs の when)
+router.use(masterLegacyGate('purchase-orders'));
 
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
 if (!fs.existsSync(UPLOAD_DIR)) { try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {} }
@@ -1467,7 +1472,7 @@ router.post('/api/email/mode', (req, res) => {
 });
 
 // 宛先マスタCSV取込 (既存GASスプシ「仕入先ごとの発注メール送信先一覧」の生DL。仕入先名称で突合)
-router.post('/api/email/recipients/csv', upload.single('file'), (req, res) => {
+router.post('/api/email/recipients/csv', upload.single('file'), legacyRecheck('purchase-orders:POST:/api/email/recipients/csv'), (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'ファイルがありません' });
     let buf;
@@ -2723,7 +2728,7 @@ router.delete('/api/masters/:kind/:id', (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-router.post('/api/masters/:kind/csv', upload.single('file'), (req, res) => {
+router.post('/api/masters/:kind/csv', upload.single('file'), legacyRecheck('purchase-orders:POST:/api/masters/:kind/csv:suppliers'), (req, res) => {
   const def = MASTER_DEFS[req.params.kind];
   if (!def) return res.status(404).json({ ok: false, error: 'unknown master' });
   if (!req.file) return res.status(400).json({ ok: false, error: 'CSVファイルが必要です' });
@@ -2917,7 +2922,7 @@ function bulkInvalidReason(table, row) {
 }
 const TABLE_LABEL = { materials: '原料グループ', conditions: '発注条件グループ', suppliers: '仕入先', attrs: '商品紐付け', selectable: '選べるセット構成' };
 
-router.post('/api/import', upload.array('files', 12), (req, res) => {
+router.post('/api/import', upload.array('files', 12), legacyRecheck('purchase-orders:POST:/api/import'), (req, res) => {
   if (!req.files || !req.files.length) return res.status(400).json({ ok: false, error: 'CSVファイルを選択してください' });
   const classified = []; const fileErrors = []; const warnings = [];
   const warn = m => { if (warnings.length < 200) warnings.push(m); };

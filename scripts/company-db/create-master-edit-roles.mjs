@@ -26,7 +26,7 @@
  * master_ops      (手の操作 scripts/company-db/master-cutover.mjs が env COMPANY_DB_MASTER_OPS_URL で使う): ops.set_master_cutover_phase の実行と、段階・記録を読むだけ。
  *   ⑤-2a: 切替の日の backfill (ops.registration_backfill_plan / backfill_sku_registrations) と、登録をやめる (ops.transition_sku_registration) の実行・登録の状態を読む
  * master_observer (⑤-2 の夜間ロードが NE のセットの構成の観測を書く env COMPANY_DB_MASTER_OBSERVER_URL): ops.record_ne_set_observations の実行だけ
- * master_gate     (まとめのロール・ログインできない): ops.record_legacy_gate_ack の実行と、段階を読むだけ。ログインは場所ごとのメンバー (#1563 仮レビュー Low 3):
+ * master_gate     (まとめのロール・ログインできない): ops.record_legacy_gate_ack の実行と、段階・列ごとの持ち主 (0055 の ops.master_ownership_state・⑤-3b) を読むだけ。ログインは場所ごとのメンバー (#1563 仮レビュー Low 3):
  *   master_gate_render (Render の ⑤-3 の古い入口の門 env COMPANY_DB_MASTER_GATE_RENDER_URL) / master_gate_minipc (miniPC の門 env COMPANY_DB_MASTER_GATE_MINIPC_URL)。
  *   DB の関数がログインのロールと記録の場所 (host) を照らす = Render のログインで minipc を名乗れない
  * 構成の依頼を上げる (promoteComponentRequest) のは夜間ロード = 表の持ち主のロール (COMPANY_DB_URL)
@@ -181,6 +181,9 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   // master_gate (まとめ。ログインは master_gate_render / master_gate_minipc が INHERIT で使う)
   s.push('grant usage on schema ops to master_gate');
   s.push('grant select on ops.master_cutover_state to master_gate');
+  // ⑤-3b: 古い入口の門は列ごとの持ち主 (active と prepared) も読む。表は 0055 から = 無ければ付けない (流し直しで付く)。
+  //   付いていない = 門は legacy_open 以外で「持ち主を読めない」= 全部閉じる (fail-closed)
+  s.push(`do $$ begin if to_regclass('ops.master_ownership_state') is not null then execute 'revoke all on ops.master_ownership_state from ${all}'; execute 'grant select on ops.master_ownership_state to master_gate'; end if; end $$`);
   s.push(`grant execute on function ${ACK_FUNCTION} to master_gate`);
   return s;
 }
