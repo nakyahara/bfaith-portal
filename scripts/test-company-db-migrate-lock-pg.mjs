@@ -10,7 +10,9 @@
  *   L2 1 本目が途中の SQL で失敗 → ROLLBACK が終わってから unlock (順を記録で確かめる)・pg_locks に残らない・次の runner がすぐ取れる
  *   L2c ROLLBACK も失敗 (接続が死んだ) → unlock は呼ばない・接続を捨てれば外れる
  *   L3 接続が切れた (backend を terminate・socket を切る) → lock が外れて次の runner が取れる
- *   L4 本物の migrations (0001〜) を全部流す = 今までどおり (2 回目は 0 本)・applied_by に migrate-v2・lock は残らない
+ *   L4 本物の migrations (0001〜最新) を全部、本物の lock の道 (CIC は取引の外) で流す: 新しい DB = 最初の CIC の file で何も作らずに止まる (統計なし) →
+ *      CIC の表に種 (L4_SEED) を入れて ANALYZE → 最新まで全部流れる (2 回目は 0 本)・applied_by に migrate-v2・lock は残らない
+ *   L4b 本物の PG で supportsConcurrentIndex: false (試験の準備の道) でも 0001〜最新を全部流せる
  *   L5 applyMigrations() は lock を取らない (使い回す関数に Postgres 専用の SQL を無条件で入れない) / dry-run は DDL を流さない
  *   C1 concurrent-index: 正常 → valid と属性の一致で記録・容量を出す・もう一度流しても何もしない
  *   C1b lock を持たずに (applyMigrations を直に) concurrent-index を流す → MIGRATE_LOCK_REQUIRED
@@ -314,28 +316,65 @@ try {
     await withMigrateLock(pgAdapter(c5), async () => {});
   });
 
-  await t('L4 本物の migrations (0001〜) を全部流す = 今までどおり (2 回目は 0 本)・applied_by に migrate-v2・lock は残らない', async () => {
+  /**
+   * L4 の種 = 本物の置き場の concurrent-index の file が index を作る表に入れる最小の行 (ANALYZE で pg_stats の列ができれば容量を見積もれる)。
+   * 🚨 concurrent-index の file を足して表が増えたら、ここに 1 行足す (無ければ L4 が「種が無い」で落ちる = 黙って飛ばさない)。
+   * FK と trigger は準備だけ session_replication_role = replica で外す (superuser の接続で入れる)
+   */
+  const L4_SEED = {
+    'core.listings': "insert into core.listings (company_id, mall, listing_code) select 1, 'amazon', 'L4_' || g from generate_series(1, 3) g",
+    'core.external_ids': "insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type) select 1, 'listing', g, 'amazon', 'seller_sku', 'L4_' || g, 'manual', 'human' from generate_series(1, 3) g",
+    'core.sku_costs': "insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from, valid_to) select 1, g, 100, 'ne', 'COMPLETE', date '2026-01-01', null from generate_series(1, 3) g",
+    'events.master_change_events': "insert into events.master_change_events (company_id, change_id, operation, entity_type, entity_id, entity_key, attribute, old_value, new_value, actor_type, source_system) select 1, gen_random_uuid(), 'UPDATE', 'listing_component', null, jsonb_build_object('listing_id', g, 'sku_id', 1), 'listing_id', to_jsonb(g), to_jsonb(g + 1), 'system', 'test' from generate_series(1, 3) g",
+    'raw.logizard_inventory_observations': "insert into raw.logizard_inventory_observations (ingest_run_id, scope_key, business_key, content_hash, fetch_status, observed_at) select 'run', 'lz', 'k' || g, null, 'not_found', now() - make_interval(hours => g) from generate_series(1, 3) g",
+  };
+  await t('L4 本物の migrations (0001〜最新) を全部、本物の lock の道 (migrateWithLock・CIC は取引の外) で流す: 新しい DB = 最初の CIC の file の前まで流れ、CIC の file で何も作らずに止まる (統計なし = fail-closed) → CIC の表に種を入れて ANALYZE → 最新まで全部 (CIC の file も・その後に足す file も) 流れる・2 回目は 0 本・applied_by に migrate-v2・lock は残らない', async () => {
     const dbName = await newDb();
     const c1 = await open(dbName);
-    // 🆕 D-60 3a-i の index (concurrent-index の file) が本物の置き場に入った後: 新しい DB の表は一度も ANALYZE していない = 容量を見積もれない =
-    //   runner はその file で何も作らずに止まる (fail-closed)。ここでは「最初の concurrent-index の file の前まで」を全部流し、その file で止まることを確かめる
-    //   (concurrent-index の file そのものはデータと統計のある DB で test-company-db-d60-load-count-indexes-pg.mjs が流す)
     const files = listMigrationFiles();
+    const latest = files.map((f) => f.version);
     const firstCi = files.find((f) => f.concurrentIndex);
-    const all = files.filter((f) => !firstCi || f.version < firstCi.version).map((f) => f.version);
-    const to = all[all.length - 1];
-    const r = await migrate(c1, { to });
-    assert.deepEqual(r.applied, all);
-    const r2 = await migrate(c1, { to });
-    assert.deepEqual([r2.applied, r2.skipped.length], [[], all.length]);
-    assert.deepEqual(await lockHolders(dbName), []);
+    const before = files.filter((f) => !firstCi || f.version < firstCi.version).map((f) => f.version);
     if (firstCi) {
+      // ① 新しい DB の表は一度も ANALYZE していない = 容量を見積もれない = 最初の CIC の file で何も作らずに止まる (その前の file は全部流れて記録)
       await assert.rejects(migrate(c1, {}), (e) => e.code === 'DISK_CHECK_FAILED' && e.version === firstCi.version && /ANALYZE/.test(e.message));
-      assert.equal((await c1.query('select count(*)::int as n from ops.schema_migrations where version = $1', [firstCi.version])).rows[0].n, 0);
+      assert.deepEqual(await versions(c1), before);
       assert.deepEqual(await lockHolders(dbName), []);
+      // ② CIC の file が index を作る表に種を入れて ANALYZE (本番では保守の時間の明示の操作 = ここは試験の準備)
+      const ciTables = [...new Set(files.filter((f) => f.concurrentIndex).flatMap((f) => [...planConcurrentIndexFile(f).creates.values()].map((s) => `${s.schema}.${s.table}`)))];
+      assert.deepEqual(ciTables.filter((x) => !Object.hasOwn(L4_SEED, x)), [], 'concurrent-index の file の表に L4 の種が無い = L4_SEED に足す');
+      const s1 = await openPgClient(suUrl.replace(/\/postgres$/, `/${dbName}`)); clients.push(s1);
+      await s1.query('set session_replication_role = replica');
+      for (const x of ciTables) await s1.query(L4_SEED[x]);
+      await s1.query('reset session_replication_role');
+      for (const x of ciTables) await s1.query(`analyze ${x}`);
+    }
+    // ③ 最新まで全部 (CIC の file は本物の lock の道・取引の外)
+    const r = await migrate(c1, {});
+    assert.deepEqual(r.applied, latest.filter((v) => !before.includes(v)));
+    assert.deepEqual(await versions(c1), latest);
+    const r2 = await migrate(c1, {});
+    assert.deepEqual([r2.applied, r2.skipped.length], [[], latest.length]);
+    assert.deepEqual(await lockHolders(dbName), []);
+    // CIC の file の index は全部 valid・ready・live
+    for (const f of files.filter((x) => x.concurrentIndex)) {
+      for (const st of planConcurrentIndexFile(f).creates.values()) {
+        const cur = await readIndexAttrs(pgAdapter(c1), st.schema, st.name);
+        assert.ok(cur && cur.valid && cur.ready && cur.live, `${f.file}: ${st.schema}.${st.name}`);
+      }
     }
     const by = (await c1.query('select distinct applied_by from ops.schema_migrations')).rows.map((x) => x.applied_by);
     assert.equal(by.length, 1); assert.match(by[0], / migrate-v2$/);
+  });
+
+  await t('L4b 本物の PG で supportsConcurrentIndex: false (concurrently を外して取引の中 = 試験の準備の道) でも 0001〜最新を全部流せる (2 回目は 0 本)', async () => {
+    const dbName = await newDb();
+    const c1 = await open(dbName);
+    const db = { ...pgAdapter(c1), supportsConcurrentIndex: false };
+    const latest = listMigrationFiles().map((f) => f.version);
+    assert.deepEqual((await applyMigrations(db, { log: quiet })).applied, latest);
+    assert.deepEqual((await applyMigrations(db, { log: quiet })).applied, []);
+    assert.deepEqual(await versions(c1), latest);
   });
 
   await t('L5 applyMigrations() は lock を取らない / dry-run は DDL を流さない (記録表も作らない)・try の lock を取って外す', async () => {

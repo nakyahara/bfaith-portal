@@ -1,0 +1,28 @@
+{
+  "format": "company-db-index-expect/1",
+  "pg_major": 18,
+  "indexes": {
+    "raw.ix_logizard_inventory_obs_observed_at": {
+      "table": "raw.logizard_inventory_observations",
+      "access_method": "btree",
+      "unique": false,
+      "nulls_not_distinct": false,
+      "key_columns": 1,
+      "all_columns": 1,
+      "columns": [
+        {
+          "column": "observed_at",
+          "definition": "observed_at",
+          "key": true,
+          "opclass": "pg_catalog.timestamptz_ops",
+          "collation": null,
+          "option": 0
+        }
+      ],
+      "expressions": null,
+      "predicate": null,
+      "reltablespace": 0,
+      "reloptions": []
+    }
+  }
+}

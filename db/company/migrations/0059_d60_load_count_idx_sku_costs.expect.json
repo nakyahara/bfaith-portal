@@ -1,0 +1,44 @@
+{
+  "format": "company-db-index-expect/1",
+  "pg_major": 18,
+  "indexes": {
+    "core.ix_sku_costs_company_sku_from": {
+      "table": "core.sku_costs",
+      "access_method": "btree",
+      "unique": false,
+      "nulls_not_distinct": false,
+      "key_columns": 3,
+      "all_columns": 3,
+      "columns": [
+        {
+          "column": "company_id",
+          "definition": "company_id",
+          "key": true,
+          "opclass": "pg_catalog.int2_ops",
+          "collation": null,
+          "option": 0
+        },
+        {
+          "column": "sku_id",
+          "definition": "sku_id",
+          "key": true,
+          "opclass": "pg_catalog.int8_ops",
+          "collation": null,
+          "option": 0
+        },
+        {
+          "column": "valid_from",
+          "definition": "valid_from",
+          "key": true,
+          "opclass": "pg_catalog.date_ops",
+          "collation": null,
+          "option": 0
+        }
+      ],
+      "expressions": null,
+      "predicate": null,
+      "reltablespace": 0,
+      "reloptions": []
+    }
+  }
+}

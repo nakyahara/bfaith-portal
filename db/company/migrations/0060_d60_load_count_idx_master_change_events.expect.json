@@ -1,0 +1,50 @@
+{
+  "format": "company-db-index-expect/1",
+  "pg_major": 18,
+  "indexes": {
+    "events.ix_master_change_events_component_listing": {
+      "table": "events.master_change_events",
+      "access_method": "btree",
+      "unique": false,
+      "nulls_not_distinct": false,
+      "key_columns": 1,
+      "all_columns": 1,
+      "columns": [
+        {
+          "column": null,
+          "definition": "(\nCASE\n    WHEN (entity_type = 'listing_component'::text) THEN (entity_key ->> 'listing_id'::text)\n    ELSE NULL::text\nEND)",
+          "key": true,
+          "opclass": "pg_catalog.text_ops",
+          "collation": "pg_catalog.default",
+          "option": 0
+        }
+      ],
+      "expressions": "\nCASE\n    WHEN (entity_type = 'listing_component'::text) THEN (entity_key ->> 'listing_id'::text)\n    ELSE NULL::text\nEND",
+      "predicate": "(\nCASE\n    WHEN (entity_type = 'listing_component'::text) THEN (entity_key ->> 'listing_id'::text)\n    ELSE NULL::text\nEND IS NOT NULL)",
+      "reltablespace": 0,
+      "reloptions": []
+    },
+    "events.ix_master_change_events_component_old_listing": {
+      "table": "events.master_change_events",
+      "access_method": "btree",
+      "unique": false,
+      "nulls_not_distinct": false,
+      "key_columns": 1,
+      "all_columns": 1,
+      "columns": [
+        {
+          "column": null,
+          "definition": "(\nCASE\n    WHEN ((entity_type = 'listing_component'::text) AND (operation = 'UPDATE'::text) AND (attribute = 'listing_id'::text)) THEN (old_value #>> '{}'::text[])\n    ELSE NULL::text\nEND)",
+          "key": true,
+          "opclass": "pg_catalog.text_ops",
+          "collation": "pg_catalog.default",
+          "option": 0
+        }
+      ],
+      "expressions": "\nCASE\n    WHEN ((entity_type = 'listing_component'::text) AND (operation = 'UPDATE'::text) AND (attribute = 'listing_id'::text)) THEN (old_value #>> '{}'::text[])\n    ELSE NULL::text\nEND",
+      "predicate": "(\nCASE\n    WHEN ((entity_type = 'listing_component'::text) AND (operation = 'UPDATE'::text) AND (attribute = 'listing_id'::text)) THEN (old_value #>> '{}'::text[])\n    ELSE NULL::text\nEND IS NOT NULL)",
+      "reltablespace": 0,
+      "reloptions": []
+    }
+  }
+}

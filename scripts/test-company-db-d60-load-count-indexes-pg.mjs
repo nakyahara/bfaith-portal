@@ -1,25 +1,29 @@
 #!/usr/bin/env node
 /**
- * test-company-db-d60-load-count-indexes-pg.mjs — D-60 PR 3a-i の index 6 つの migration (db/company/migrations/<番号>_d60_load_count_indexes.sql) を確かめる
+ * test-company-db-d60-load-count-indexes-pg.mjs — D-60 PR 3a-i の index 6 つの migration (表ごとの 5 つの file = db/company/migrations/<番号>_d60_load_count_idx_<表>.sql) を確かめる
  *   設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』(v40・D-60 v3.15) の付録 B (B.2 段のパイプライン・B.3 許す plan の木) と
  *   §3.10「migrate の runner の契約 (3a-i)」。runner = scripts/company-db/migrate.mjs (#1606)
  *
  * 固定する契約:
- *   S1 file の中身 = 付録 B の 6 つ (名前・表・列の並び・CASE の式・部分 index の条件・INCLUDE なし・unique でない・btree・昇順) / 横の expect.json も同じ 6 つ (PG 18)・
+ *   S1 file = 表ごとに 1 つ (5 つ・名前 d60_load_count_idx_<表>・決まった順の連番・1 行目の印・1 つの表だけ) / 中身 = 付録 B の 6 つ (名前・表・列の並び・CASE の式・
+ *      部分 index の条件・INCLUDE なし・unique でない・btree・昇順) / 横の expect.json はその file の index だけ (PG 18)・
  *      本文と expect.json は番号を書かない (付け替え = git mv だけ) / ⑨a・⑨b の index の式 = 付録 B の本文の式 (別名 e. を外すと同じ文字)
  *   R1 本物の PG 18 の runner の legacy の道 (migrateWithLock・取引の外の CREATE INDEX CONCURRENTLY):
  *      a 一度も ANALYZE していない表 (新しい DB) = 見積もれない = 何も作らずに DISK_CHECK_FAILED (fail-closed・本番の手順の「先に reltuples を確かめる」)
- *      b 本番の CLI の容量の読み手は RENDER_PG_HOST_MAPPING.confirmed = false の間 HOST_MAPPING_UNCONFIRMED = 何も作らない (Render の回答の前にマージしない理由)
- *      c --dry-run 相当 = 作らずに pending に出る
- *      d データと統計のある DB = 6 つを作り、indisvalid・indisready・indislive と expect.json の属性が一致して記録・applied_by = migrate-v2・lock が残らない・
- *        もう一度流すと 0 本
+ *      b 容量の読み手が通さない (HOST_MAPPING_UNCONFIRMED・METRICS_STALE など・試験の読み手 = 本物の定数 RENDER_PG_HOST_MAPPING.confirmed に依らない) = 何も作らず記録しない
+ *        (本番の CLI の読み手が confirmed = false の間 HOST_MAPPING_UNCONFIRMED を返すことは runner の試験 test-company-db-migrate-lock-pg.mjs C11 が持つ)
+ *      c --dry-run 相当 = 作らずに 5 つとも pending に出る
+ *      d データと統計のある DB = 5 つの file・6 つの index を作り、indisvalid・indisready・indislive と expect.json の属性が一致して file ごとに記録・
+ *        容量の判定 = この回の全部 (1 回) + file ごと (5 回) + 文ごと (6 回)・applied_by = migrate-v2・lock が残らない・もう一度流すと 0 本
+ *      e 途中で止まる (4/5 の 2 文目の前で容量が読めない) = 1/5〜3/5 は記録済み・4/5 は記録しない (1 本目は valid のまま) → もう一度流すと 4/5・5/5 だけ
+ *        (この回の全部の判定は残りの 2 つの file だけ・作り済みの 1 本目は飛ばす)
  *   R2 門の GUC (付録 B.2) の下で 14 段 (①〜⑨b の 12 段 + (b)-1・(b)-2) の EXPLAIN (FORMAT JSON) が許す木 (付録 B.3) だけ:
  *      ①〜⑤ = Limit → (Index Scan | Index Only Scan) / ⑥〜⑨b・(b) = Aggregate (Plain) → [Subquery Scan] → Limit → scan・
  *      scan の Index Name が付録 B の表どおり・Filter なし・Index Cond に段の列・Disabled なし・ほかの node なし
  *   R3 EXPLAIN ANALYZE で、上限 100 のとき ①〜⑨b の scan が 101 行で止まる (データは各段 101 行より多い)
  *   R4 新しい index を 1 つずつ外すと (取引の中で drop → rollback)、その段の木が不合格になる (= 6 つとも段の上限に要る)
  *   I1 (PR 3a への事実) 段の文の多くは $1〜$7 の一部しか使わない = pg の driver に 7 つの値をそのまま渡すと 42P18 (型が決まらない)
- *   P1 PGlite の道 (applyMigrations・concurrently を外して取引の中) で同じ file が通り、属性が同じ expect.json に一致し、14 段の木も同じ形
+ *   P1 PGlite の道 (applyMigrations・concurrently を外して取引の中) で同じ 5 つの file が通り、属性が同じ expect.json に一致し、14 段の木も同じ形
  * 段の SQL の文字は付録 B の正本の写し (PR 3a で apps/company-db/profit/load-count.mjs に同じ文を置き、文字の一致を試験にする)。
  * 使い方: node scripts/test-company-db-d60-load-count-indexes-pg.mjs   (npm run test:company-db にも入っている)
  *   使い捨てのクラスタを embedded-postgres で起動し、最後に止めて消す (test-company-db-migrate-lock-pg.mjs と同じ作り)。
@@ -35,27 +39,33 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 import {
   openPgClient, pgAdapter, pgliteAdapter, applyMigrations, migrateWithLock, listMigrationFiles, readIndexAttrs, attrDiff, expectPathOf,
-  splitSqlStatements, parseConcurrentIndexStatement, planConcurrentIndexFile, renderDiskMetricsReader, readOwnerMode, MIGRATE_LOCK_NAME, DEFAULT_DIR,
+  splitSqlStatements, parseConcurrentIndexStatement, planConcurrentIndexFile, readOwnerMode, MIGRATE_LOCK_NAME, DEFAULT_DIR,
 } from './company-db/migrate.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-// ─── 番号を持たない = 付け替え (#1605・#1607 の後の次の空き) は 2 つの file を git mv するだけ ───
-export const D60_IDX_NAME = 'd60_load_count_indexes';
-const FILE = listMigrationFiles().find((f) => f.name === D60_IDX_NAME);
-if (!FILE) { console.error(`❌ db/company/migrations/NNNN_${D60_IDX_NAME}.sql が無い`); process.exit(1); }
-const VER = FILE.version;
-const PREV = String(Number(VER) - 1).padStart(4, '0');
+// ─── 番号を持たない = 付け替え (#1605・#1607 の後の次の空き) は 5 つの組 (.sql と .expect.json) を同じ順のまま git mv するだけ ───
+export const D60_IDX_PREFIX = 'd60_load_count_idx_';
+/** 表ごとの file の順 (名前の後ろ = 表)。番号はこの順の連番 */
+export const D60_IDX_FILES = ['listings', 'external_ids', 'sku_costs', 'master_change_events', 'logizard_inventory_obs'];
+const ALL_FILES = listMigrationFiles();
+const FILES = D60_IDX_FILES.map((sfx) => ALL_FILES.find((f) => f.name === D60_IDX_PREFIX + sfx));
+if (FILES.some((f) => !f)) { console.error(`❌ db/company/migrations/NNNN_${D60_IDX_PREFIX}<表>.sql が揃わない (${D60_IDX_FILES.filter((_, i) => !FILES[i]).join('・')})`); process.exit(1); }
+const VERS = FILES.map((f) => f.version);
+const FIRST = VERS[0], VER = VERS[VERS.length - 1];
+const PREV = String(Number(FIRST) - 1).padStart(4, '0');
 
 /** 付録 B の index 6 つ (正本の定義) */
 const NEW_INDEXES = {
-  'core.ix_listings_company_mall_norm': { stage: '④a', table: 'core.listings', columns: ['company_id', 'mall', 'listing_norm'], predicate: null },
-  'core.ix_external_ids_listing_alias': { stage: '④b', table: 'core.external_ids', columns: ['company_id', 'system', 'external_norm'], predicate: "((entity_type = 'listing'::text) AND (valid_to IS NULL))" },
-  'core.ix_sku_costs_company_sku_from': { stage: '⑥・⑥b', table: 'core.sku_costs', columns: ['company_id', 'sku_id', 'valid_from'], predicate: null },
-  'events.ix_master_change_events_component_listing': { stage: '⑨a', table: 'events.master_change_events', columns: [null], expr: "case when entity_type = 'listing_component' then entity_key ->> 'listing_id' end" },
-  'events.ix_master_change_events_component_old_listing': { stage: '⑨b', table: 'events.master_change_events', columns: [null], expr: "case when entity_type = 'listing_component' and operation = 'UPDATE' and attribute = 'listing_id' then old_value #>> '{}' end" },
-  'raw.ix_logizard_inventory_obs_observed_at': { stage: '(b)-2', table: 'raw.logizard_inventory_observations', columns: ['observed_at'], predicate: null },
+  'core.ix_listings_company_mall_norm': { file: 'listings', stage: '④a', table: 'core.listings', columns: ['company_id', 'mall', 'listing_norm'], predicate: null },
+  'core.ix_external_ids_listing_alias': { file: 'external_ids', stage: '④b', table: 'core.external_ids', columns: ['company_id', 'system', 'external_norm'], predicate: "((entity_type = 'listing'::text) AND (valid_to IS NULL))" },
+  'core.ix_sku_costs_company_sku_from': { file: 'sku_costs', stage: '⑥・⑥b', table: 'core.sku_costs', columns: ['company_id', 'sku_id', 'valid_from'], predicate: null },
+  'events.ix_master_change_events_component_listing': { file: 'master_change_events', stage: '⑨a', table: 'events.master_change_events', columns: [null], expr: "case when entity_type = 'listing_component' then entity_key ->> 'listing_id' end" },
+  'events.ix_master_change_events_component_old_listing': { file: 'master_change_events', stage: '⑨b', table: 'events.master_change_events', columns: [null], expr: "case when entity_type = 'listing_component' and operation = 'UPDATE' and attribute = 'listing_id' then old_value #>> '{}' end" },
+  'raw.ix_logizard_inventory_obs_observed_at': { file: 'logizard_inventory_obs', stage: '(b)-2', table: 'raw.logizard_inventory_observations', columns: ['observed_at'], predicate: null },
 };
+/** file の後ろ (表) → その file の index の鍵 (順は file の中の文の順) */
+const keysOfFile = (sfx) => Object.keys(NEW_INDEXES).filter((k) => NEW_INDEXES[k].file === sfx);
 
 /**
  * 付録 B.2 の段 (SQL の文字は正本の写し)。引数 = $1 会社・$2 モール・$3 scope・$4 月の初日・$5 翌月の初日・$6 上限・$7 鍵の配列。
@@ -275,15 +285,28 @@ const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + n
 const quiet = () => {};
 const GB = 1024 ** 3;
 const BIG_DISK = async () => ({ ok: true, capacityBytes: 100 * GB, usedBytes: 1 * GB });
-const EXPECT = JSON.parse(fs.readFileSync(expectPathOf(DEFAULT_DIR, FILE), 'utf8'));
+/** file ごとの expect.json (EXPECT_BY_FILE[i]) と、index の鍵 → 属性 (EXPECT.indexes) */
+const EXPECT_BY_FILE = FILES.map((f) => JSON.parse(fs.readFileSync(expectPathOf(DEFAULT_DIR, f), 'utf8')));
+const EXPECT = { indexes: Object.assign({}, ...EXPECT_BY_FILE.map((e) => e.indexes)) };
 const stripAlias = (s) => s.replace(/\b[a-z]\.(?=[a-z_]+\b)/g, '');
 
-console.log(`対象 = ${FILE.file} (番号 ${VER}・前 ${PREV})`);
+console.log(`対象 = ${FILES.map((f) => f.file).join('・')} (前 ${PREV})`);
 
 // ─── S1 file の中身 (DB なし) ───
-await t('S1 file = 付録 B の 6 つ (名前・表・列の並び・式・部分 index の条件・INCLUDE なし)・expect.json も同じ 6 つ (PG 18)・番号を書かない・⑨a/⑨b の式 = 段の本文の式', async () => {
-  assert.equal(FILE.concurrentIndex, true, '1 行目が -- migrate:concurrent-index でない');
-  const stmts = splitSqlStatements(FILE.text).map((s) => parseConcurrentIndexStatement(s, FILE.file));
+await t('S1 file = 表ごとに 1 つ (5 つ・決まった順の連番・1 つの表だけ)・中身 = 付録 B の 6 つ (名前・表・列の並び・式・部分 index の条件・INCLUDE なし)・expect.json はその file の index だけ (PG 18)・番号を書かない・⑨a/⑨b の式 = 段の本文の式', async () => {
+  // 連番 (付け替えでも同じ順のまま) = 名前の後ろだけで file が決まる
+  assert.deepEqual(VERS, VERS.map((_, i) => String(Number(FIRST) + i).padStart(4, '0')), `5 つの file の番号が連番でない (${VERS.join(', ')})`);
+  assert.equal(ALL_FILES.filter((f) => f.name.startsWith(D60_IDX_PREFIX)).length, D60_IDX_FILES.length, `${D60_IDX_PREFIX}* の file が 5 つでない`);
+  const stmts = [];
+  for (const [i, f] of FILES.entries()) {
+    assert.equal(f.concurrentIndex, true, `${f.file} の 1 行目が -- migrate:concurrent-index でない`);
+    const ss = splitSqlStatements(f.text).map((s) => parseConcurrentIndexStatement(s, f.file));
+    assert.deepEqual(ss.map((s) => `${s.schema}.${s.name}`), keysOfFile(D60_IDX_FILES[i]), `${f.file} の index`);
+    assert.equal(new Set(ss.map((s) => `${s.schema}.${s.table}`)).size, 1, `${f.file} が 2 つ以上の表に作る (1 file = 1 表)`);
+    assert.deepEqual(Object.keys(EXPECT_BY_FILE[i].indexes), keysOfFile(D60_IDX_FILES[i]), `${f.file} の expect.json の index`);
+    assert.equal(EXPECT_BY_FILE[i].pg_major, 18);
+    stmts.push(...ss);
+  }
   assert.deepEqual(stmts.map((s) => `${s.schema}.${s.name}`), Object.keys(NEW_INDEXES));
   for (const s of stmts) {
     const want = NEW_INDEXES[`${s.schema}.${s.name}`];
@@ -304,8 +327,7 @@ await t('S1 file = 付録 B の 6 つ (名前・表・列の並び・式・部�
     const want = Object.values(NEW_INDEXES).find((x) => x.stage === id).expr;
     assert.ok(stripAlias(st.sql).includes(`(${want}) = any($7::text[])`), `${id} の段の式が index の式と違う`);
   }
-  // expect.json
-  assert.equal(EXPECT.pg_major, 18);
+  // expect.json (5 つの合わせ)
   assert.deepEqual(Object.keys(EXPECT.indexes).sort(), Object.keys(NEW_INDEXES).sort());
   for (const [key, want] of Object.entries(NEW_INDEXES)) {
     const a = EXPECT.indexes[key];
@@ -322,10 +344,12 @@ await t('S1 file = 付録 B の 6 つ (名前・表・列の並び・式・部�
     }
   }
   // 付け替え = git mv だけ (本文・expect.json に番号を書かない)
-  //   (本文の 0057 / 0058 は #1605・#1607 の番号の説明 = 自分の番号ではない)
-  assert.doesNotMatch(FILE.text, /\d{4}_d60_load_count_indexes/, '本文に自分の番号つきの名前がある (付け替えで本文を直すことになる)');
-  assert.doesNotMatch(fs.readFileSync(expectPathOf(DEFAULT_DIR, FILE), 'utf8'), /\d{4}_/, 'expect.json に番号がある');
-  planConcurrentIndexFile(FILE);   // runner の流す前の検査 (許す文・expect.json の形) が通る
+  for (const f of FILES) {
+    assert.doesNotMatch(f.text, /\d{4}_d60_load_count_idx/, `${f.file} の本文に番号つきの名前がある (付け替えで本文を直すことになる)`);
+    assert.doesNotMatch(f.text, /\b0{1,2}[5-9]\d\b/, `${f.file} の本文に番号らしい数字がある`);
+    assert.doesNotMatch(fs.readFileSync(expectPathOf(DEFAULT_DIR, f), 'utf8'), /\d{4}_/, `${f.file} の expect.json に番号がある`);
+    planConcurrentIndexFile(f);   // runner の流す前の検査 (許す文・expect.json の形) が通る
+  }
 });
 
 await t('S2 試験の木の検査そのもの = 合格の木は通り、Bitmap・Seq Scan + Disabled・Filter・別の index・Index Cond の列の欠け・余分な node は落ちる', async () => {
@@ -383,13 +407,15 @@ if (!setupError) {
      where n.nspname || '.' || ci.relname = any($1::text[]) order by 1`, [Object.keys(NEW_INDEXES)])).rows;
   const lockHolders = async (c) => (await c.query(`select pid from pg_locks where locktype = 'advisory' and objid = (hashtextextended($1, 0) & 4294967295)::oid`, [MIGRATE_LOCK_NAME])).rows;
 
-  await t('R1a 一度も ANALYZE していない表 (新しい DB) = 見積もれない = 何も作らず記録もしない (DISK_CHECK_FAILED・fail-closed)', async () => {
+  const recorded = async (c) => (await c.query('select version from ops.schema_migrations where version = any($1::text[]) order by 1', [VERS])).rows.map((r) => r.version);
+
+  await t('R1a 一度も ANALYZE していない表 (新しい DB) = 見積もれない = 何も作らず記録もしない (DISK_CHECK_FAILED・fail-closed・この回の全部の判定で 1/5 の前に止まる)', async () => {
     const c = await newDb('d60_fresh');
     await migrateWithLock(pgAdapter(c), { to: PREV, log: quiet, readDiskMetrics: BIG_DISK });
     await assert.rejects(migrateWithLock(pgAdapter(c), { to: VER, log: quiet, readDiskMetrics: BIG_DISK }),
-      (e) => e.code === 'DISK_CHECK_FAILED' && /ANALYZE/.test(e.message));
+      (e) => e.code === 'DISK_CHECK_FAILED' && e.version === FIRST && /ANALYZE/.test(e.message));
     assert.deepEqual(await indexState(c), []);
-    assert.equal((await c.query('select count(*)::int as n from ops.schema_migrations where version = $1', [VER])).rows[0].n, 0);
+    assert.deepEqual(await recorded(c), []);
     assert.deepEqual(await lockHolders(c), []);
   });
 
@@ -399,28 +425,32 @@ if (!setupError) {
   const keys = await buildKeys((s, p) => c.query(s, p));
   console.log(`  (データ: 鍵の数 E ${keys.E.length}・N∪T ${keys.NT.length}・T ${keys.T.length}・L ${keys.L.length}・S ${keys.S.length})`);
 
-  await t('R1b 本番の CLI の容量の読み手は host の対応が未確認の間 HOST_MAPPING_UNCONFIRMED = 何も作らない (Render の回答の前にマージしない理由)', async () => {
-    const reader = await renderDiskMetricsReader({ RENDER_API_KEY: 'rnd_d60idxtest', CDB_RENDER_PG_RESOURCE_ID: 'dpg-d60idxtest-a' }, 'postgres://u:p@dpg-d60idxtest-a/cdb', { currentDatabase: 'cdb' });
-    const m = await reader();
-    assert.equal(m.ok, false); assert.equal(m.detail, 'HOST_MAPPING_UNCONFIRMED', JSON.stringify(m));
-    await assert.rejects(migrateWithLock(pgAdapter(c), { to: VER, log: quiet, readDiskMetrics: reader }),
-      (e) => e.code === 'DISK_CHECK_FAILED' && /HOST_MAPPING_UNCONFIRMED/.test(e.message));
-    assert.deepEqual(await indexState(c), []);
+  await t('R1b 容量の読み手が通さない (HOST_MAPPING_UNCONFIRMED・METRICS_STALE・試験の読み手 = 本物の定数 RENDER_PG_HOST_MAPPING.confirmed に依らない) = 5 つとも何も作らず記録しない', async () => {
+    // 本番の CLI の読み手が confirmed = false の間 HOST_MAPPING_UNCONFIRMED を返すことは runner の試験 (test-company-db-migrate-lock-pg.mjs C11) が持つ
+    for (const m of [{ ok: false, reason: 'RESOURCE_MISMATCH', detail: 'HOST_MAPPING_UNCONFIRMED' }, { ok: false, reason: 'METRICS_STALE' }]) {
+      await assert.rejects(migrateWithLock(pgAdapter(c), { to: VER, log: quiet, readDiskMetrics: async () => m }),
+        (e) => e.code === 'DISK_CHECK_FAILED' && e.version === FIRST && e.message.includes(m.detail || m.reason), JSON.stringify(m));
+      assert.deepEqual(await indexState(c), []);
+      assert.deepEqual(await recorded(c), []);
+      assert.deepEqual(await lockHolders(c), []);
+    }
   });
 
-  await t('R1c dry-run = 作らずに pending に出る (許す文と expect.json の検査は通る)', async () => {
+  await t('R1c dry-run = 作らずに 5 つとも pending に出る (許す文と expect.json の検査は通る)', async () => {
     const r = await migrateWithLock(pgAdapter(c), { to: VER, dryRun: true, log: quiet, readDiskMetrics: BIG_DISK });
-    assert.deepEqual([r.applied, r.pending], [[], [VER]], JSON.stringify(r));
+    assert.deepEqual([r.applied, r.pending], [[], VERS], JSON.stringify(r));
     assert.deepEqual(await indexState(c), []);
   });
 
-  await t('R1d runner の legacy の道 (取引の外の CIC) = 6 つが valid・ready・live で expect.json と一致して記録 / applied_by = migrate-v2 / lock が残らない / もう一度流すと 0 本', async () => {
+  await t('R1d runner の legacy の道 (取引の外の CIC) = 5 つの file・6 つの index が valid・ready・live で expect.json と一致して file ごとに記録 / 容量の判定 = この回の全部 1 回 + file ごと 5 回 + 文ごと 6 回 / applied_by = migrate-v2 / lock が残らない / もう一度流すと 0 本', async () => {
     assert.equal((await readOwnerMode(pgAdapter(c))).mode, 'legacy');
     const logs = [];
     const r = await migrateWithLock(pgAdapter(c), { to: VER, log: (m) => logs.push(m), readDiskMetrics: BIG_DISK });
-    assert.deepEqual(r.applied, [VER]);
-    assert.ok(logs.some((m) => /concurrent-index・取引の外で 6 文/.test(m)), logs.join('\n'));
-    assert.equal(logs.filter((m) => /^容量: .+ の予想 /.test(m)).length, 6, '各文の前の容量の判定が 6 回でない');
+    assert.deepEqual(r.applied, VERS);
+    assert.deepEqual(logs.map((m) => /concurrent-index・取引の外で (\d+) 文/.exec(m)).filter(Boolean).map((x) => Number(x[1])), D60_IDX_FILES.map((sfx) => keysOfFile(sfx).length), logs.join('\n'));
+    assert.equal(logs.filter((m) => /^容量: この回の concurrent-index の file 5 本 .+ の index 6 本の予想の合計/.test(m)).length, 1, 'この回の全部の判定が 1 回でない');
+    assert.equal(logs.filter((m) => /^容量: \d{4}_d60_load_count_idx_[a-z_]+\.sql の index \d+ 本の予想の合計/.test(m)).length, 5, 'file ごとの判定が 5 回でない');
+    assert.equal(logs.filter((m) => /^容量: [a-z_]+\.[a-z_]+ の予想 /.test(m)).length, 6, '各文の前の容量の判定が 6 回でない');
     const st = await indexState(c);
     assert.deepEqual(st.map((x) => x.key), Object.keys(NEW_INDEXES).sort());
     assert.ok(st.every((x) => x.ok), JSON.stringify(st));
@@ -429,11 +459,37 @@ if (!setupError) {
       const cur = await readIndexAttrs(pgAdapter(c), sc, nm);
       assert.deepEqual(attrDiff(cur.attrs, EXPECT.indexes[key]), [], key);
     }
-    const rec = (await c.query('select applied_by from ops.schema_migrations where version = $1', [VER])).rows;
-    assert.equal(rec.length, 1); assert.match(rec[0].applied_by, / migrate-v2$/);
+    const rec = (await c.query('select version, applied_by from ops.schema_migrations where version = any($1::text[]) order by 1', [VERS])).rows;
+    assert.deepEqual(rec.map((x) => x.version), VERS);
+    assert.ok(rec.every((x) => / migrate-v2$/.test(x.applied_by)), JSON.stringify(rec));
     assert.deepEqual(await lockHolders(c), []);
     const r2 = await migrateWithLock(pgAdapter(c), { to: VER, log: quiet, readDiskMetrics: BIG_DISK });
-    assert.deepEqual(r2.applied, []); assert.ok(r2.skipped.includes(VER));
+    assert.deepEqual(r2.applied, []); assert.ok(VERS.every((v) => r2.skipped.includes(v)));
+  });
+
+  await t('R1e 途中で止まる (4/5 の 2 文目の前で容量が読めない) = 1/5〜3/5 は記録済み・4/5 は記録しない (1 本目は valid のまま) → もう一度流すと 4/5・5/5 だけ (この回の全部の判定は残りの 2 つ・作り済みの 1 本目は属性を比べて飛ばす)', async () => {
+    const d = await newDb('d60_partial');
+    await migrateWithLock(pgAdapter(d), { to: PREV, log: quiet, readDiskMetrics: BIG_DISK });
+    await d.query(dataSql(0.2));
+    const probe = await openPgClient(urlOf('d60_partial')); probe.on('error', () => {}); clients.push(probe);
+    const FIRST_OF_4 = keysOfFile('master_change_events')[0];
+    // 4/5 の 1 本目ができた後の読みだけ「読めない」(= 2 本目の前の文ごとの判定で止まる)
+    const stopAfter = async () => ((await probe.query('select to_regclass($1) is not null as x', [FIRST_OF_4])).rows[0].x ? { ok: false, reason: 'METRICS_STALE' } : BIG_DISK());
+    await assert.rejects(migrateWithLock(pgAdapter(d), { to: VER, log: quiet, readDiskMetrics: stopAfter }),
+      (e) => e.code === 'DISK_CHECK_FAILED' && e.version === VERS[3] && /METRICS_STALE/.test(e.message));
+    assert.deepEqual(await recorded(d), VERS.slice(0, 3));
+    const st = Object.fromEntries((await indexState(d)).map((x) => [x.key, x.ok]));
+    assert.deepEqual(Object.keys(st).sort(), [...keysOfFile('listings'), ...keysOfFile('external_ids'), ...keysOfFile('sku_costs'), FIRST_OF_4].sort());
+    assert.ok(Object.values(st).every(Boolean), JSON.stringify(st));
+    assert.deepEqual(await lockHolders(d), []);
+    const logs = [];
+    const r = await migrateWithLock(pgAdapter(d), { to: VER, log: (m) => logs.push(m), readDiskMetrics: BIG_DISK });
+    assert.deepEqual(r.applied, VERS.slice(3));
+    assert.equal(logs.filter((m) => /^容量: この回の concurrent-index の file 2 本 /.test(m)).length, 1, logs.join('\n'));
+    assert.ok(logs.some((m) => m.startsWith(`${FIRST_OF_4} は作り済み`)), logs.join('\n'));
+    assert.equal(logs.filter((m) => /^容量: [a-z_]+\.[a-z_]+ の予想 /.test(m)).length, 2, '残りの文ごとの判定が 2 回でない');
+    assert.deepEqual(await recorded(d), VERS);
+    assert.ok((await indexState(d)).length === 6 && (await indexState(d)).every((x) => x.ok));
   });
 
   let plans = null;
@@ -479,7 +535,7 @@ await t('P1 PGlite の道 (applyMigrations・concurrently を外して取引の�
   try {
     const db = pgliteAdapter(pg);
     const r = await applyMigrations(db, { to: VER, log: quiet });
-    assert.ok(r.applied.includes(VER), JSON.stringify(r.applied.slice(-3)));
+    assert.deepEqual(r.applied.slice(-VERS.length), VERS, JSON.stringify(r.applied.slice(-6)));
     for (const key of Object.keys(NEW_INDEXES)) {
       const [sc, nm] = key.split('.');
       const cur = await readIndexAttrs(db, sc, nm);

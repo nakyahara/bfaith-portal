@@ -1,0 +1,44 @@
+{
+  "format": "company-db-index-expect/1",
+  "pg_major": 18,
+  "indexes": {
+    "core.ix_external_ids_listing_alias": {
+      "table": "core.external_ids",
+      "access_method": "btree",
+      "unique": false,
+      "nulls_not_distinct": false,
+      "key_columns": 3,
+      "all_columns": 3,
+      "columns": [
+        {
+          "column": "company_id",
+          "definition": "company_id",
+          "key": true,
+          "opclass": "pg_catalog.int2_ops",
+          "collation": null,
+          "option": 0
+        },
+        {
+          "column": "system",
+          "definition": "system",
+          "key": true,
+          "opclass": "pg_catalog.text_ops",
+          "collation": "pg_catalog.default",
+          "option": 0
+        },
+        {
+          "column": "external_norm",
+          "definition": "external_norm",
+          "key": true,
+          "opclass": "pg_catalog.text_ops",
+          "collation": "pg_catalog.default",
+          "option": 0
+        }
+      ],
+      "expressions": null,
+      "predicate": "((entity_type = 'listing'::text) AND (valid_to IS NULL))",
+      "reltablespace": 0,
+      "reloptions": []
+    }
+  }
+}
