@@ -978,18 +978,21 @@ await t('起点の後の policy の穴 (採用されない行の最後の日が�
   L0.setMeta({ [META.unreconciled]: JSON.stringify([]), [META.diffStreak]: '0' });
 });
 // 🆕 #1614 Codex R1: policy を過去へ広げたとき・起点が月の途中・source の違い・coverage/status が読めないとき
-await t('widenedPolicyMonths / policyFingerprintOf: 指紋が同じなら戻さない・起点が過去へ広がった月だけ・初回は 2026-01-01 から・縮んだら戻さない・指紋が無ければ行から作る', async () => {
+await t('widenedPolicyMonths / policyFingerprintOf: 指紋が同じなら戻さない・指紋が変われば起点の向きに関係なく今の policy で覆われる全部の月・初回は 2026-01-01 より前だけ・指紋が無ければ行から作る (#1614 Codex R2 Medium)', async () => {
   const { widenedPolicyMonths, policyFingerprintOf, FINANCE_FLOOR } = await import('../apps/company-db/push/amazon-finance.mjs');
   const A = 'a'.repeat(64), B = 'b'.repeat(64), today = '2026-10-04';
   assert.equal(FINANCE_FLOOR, '2026-01-01');
   assert.deepEqual(widenedPolicyMonths(null, { fingerprint: A, floor: '2026-01-01' }, today), [], '初回 (明朝) = 今の起点 2026-01-01 = 何も戻さない (2025-12 は対象外のまま)');
   assert.deepEqual(widenedPolicyMonths(null, { fingerprint: A, floor: '2025-12-29' }, today), ['2025-12'], '初回の前に広げていても戻す (見落とさない側)');
   assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-01-01' }, { fingerprint: A, floor: '2026-01-01' }, today), []);
-  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-01-01' }, { fingerprint: B, floor: '2025-12-29' }, today), ['2025-12']);
-  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-03-15' }, { fingerprint: B, floor: '2026-01-01' }, today), ['2026-01', '2026-02', '2026-03'], '前の起点が月の途中 = その月の前半も新しく対象 = 戻す');
-  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-01-01' }, { fingerprint: B, floor: '2026-03-01' }, today), [], '縮んだ = 戻さない');
-  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-01-01' }, { fingerprint: B, floor: '2026-01-01' }, today), [], '起点が同じで途中が変わった = 戻さない (採用されない行に出る)');
-  assert.deepEqual(widenedPolicyMonths('{', { fingerprint: B, floor: '2025-11-01' }, today), ['2025-11', '2025-12'], '読めない台帳 = 初回と同じ');
+  const y2026 = (from) => ['2026-01', '2026-02', '2026-03', '2026-04', '2026-05', '2026-06', '2026-07', '2026-08', '2026-09', '2026-10'].filter((m) => m >= from);
+  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-01-01' }, { fingerprint: B, floor: '2025-12-29' }, today), ['2025-12', ...y2026('2026-01')], '過去へ広げた = 今の起点〜今月の全部');
+  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-03-15' }, { fingerprint: B, floor: '2026-01-01' }, today), y2026('2026-01'));
+  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-01-01' }, { fingerprint: B, floor: '2026-03-01' }, today), y2026('2026-03'), '縮んだ = 今の起点からの全部 (見落とさない側)');
+  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-01-01' }, { fingerprint: B, floor: '2026-01-01' }, today), y2026('2026-01'), '🚨 起点が同じで途中が変わった (穴を埋めた・source を切り替えた) = 全部の月を戻す (R2 Medium: 前は [] = 見落とした)');
+  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-01-01' }, { fingerprint: B, floor: '2026-11-01' }, today), [], '起点が今月より先 = 戻す月が無い');
+  assert.deepEqual(widenedPolicyMonths('{', { fingerprint: B, floor: '2025-11-01' }, today), ['2025-11', '2025-12'], '読めない台帳 = 初回と同じ (2026-01-01 より前だけ)');
+  assert.deepEqual(widenedPolicyMonths({ fingerprint: A }, { fingerprint: B, floor: '2026-01-01' }, today), [], 'floor の無い台帳 = 初回と同じ = 起点 2026-01-01 なら何も戻さない');
   assert.equal(policyFingerprintOf({ fingerprint: A, rows: [] }), A);
   const rows = [{ source: 's', period_from: '2026-01-01', period_to: null }];
   const f1 = policyFingerprintOf({ rows }), f2 = policyFingerprintOf({ rows: [{ ...rows[0], period_from: '2025-12-29' }] });
@@ -1026,15 +1029,15 @@ await t('🚨 policy を過去へ広げた: 起点より前で台帳から外し
       assert.deepEqual({ u: L0.getMeta(META.unreconciled), p: L0.getMeta(META.reconcilePolicy), s: L0.getMeta(META.diffStreak) }, before, '途中で止まった回は台帳を変えない');
       const logs = [];
       const r3 = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: (m) => logs.push(m) });
-      assert.deepEqual(r3.policyWidened, [MA], '新しく対象になった月を未照合の月に戻した');
+      assert.deepEqual(r3.policyWidened, [MA, MB, ymOffset(0)], '指紋が変わった = 今の policy で覆われる全部の月を未照合の月に戻した (R2 Medium)');
       assert.equal(r3.level, 'warn');
       assert.ok(r3.daily.some((x) => x.date_jst === day && x.seller_sku === sku && x.side === 'sqlite_only'), JSON.stringify(r3.daily.slice(0, 3)));
       assert.ok(r3.dailyDiffMonths.includes(MA));
       assert.ok(JSON.parse(L0.getMeta(META.unreconciled)).includes(MA), '差の月は台帳に残る');
       assert.ok(readPendingMonths(tmpDir, { file: PENDING_FILE }).months.includes(MA), '差の月をやり残しに登録');
-      assert.ok(logs.some((m) => m.includes(`新しく対象になった月 ${MA}`)), logs.join('\n'));
+      assert.ok(logs.some((m) => m.includes(`policy が変わった (起点 ${MB}-01 → 起点 ${MA}-01) = 今の policy で覆われる月 ${MA}〜${ymOffset(0)} (3 か月) を一度だけ未照合の月に戻して比べる`)), logs.join('\n'));
       const { summarizeReconcile } = await import('../apps/company-db/push/amazon-finance.mjs');
-      assert.match(summarizeReconcile(r3), new RegExp(`^⚠️ .*新しく対象になった月 ${MA} を比べた`));
+      assert.ok(/^⚠️ /.test(summarizeReconcile(r3)) && summarizeReconcile(r3).includes(`policy が変わった = 今の policy で覆われる月 ${MA}〜${ymOffset(0)} (3 か月) を一度だけ比べ直した`), summarizeReconcile(r3));
       assert.equal(JSON.parse(L0.getMeta(META.reconcilePolicy)).floor, `${MA}-01`);
     } finally { w.close(); }
   } finally { wdb.prepare(`delete from f_amazon_finance_sku_daily_v1 where date_jst = ? and seller_sku = ?`).run(day, sku); }
@@ -1066,6 +1069,82 @@ await t('起点が月の途中: 起点の後の日次の差は差 (⚠️・や�
   } finally { w.close(); }
   build();
   L0.setMeta({ [META.unreconciled]: JSON.stringify([]), [META.diffStreak]: '0' });
+});
+// 🆕 #1614 Codex R2
+await t('🚨 起点は同じで policy が変わった (穴を埋めた・source を切り替えた = 指紋だけ変わる): 窓にも台帳にも無い月の本物の差を次の回で比べて ⚠️ (#1614 Codex R2 Medium)', async () => {
+  const day = d(MA, 5), sku = 'sku-r2-same-floor';   // 直近 45 日の窓には決して入らない日
+  await setPolicy(`${MA}-01`);
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([]), [META.diffStreak]: '0' });
+  let w = reader();
+  try {
+    const r0 = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+    assert.equal(r0.ok, true, JSON.stringify({ d: r0.daily.slice(0, 3), f: r0.fees, u: r0.uncovered }));
+    assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), []);
+  } finally { w.close(); }
+  const src = wdb.prepare(`select * from f_amazon_finance_sku_daily_v1 where seller_sku = 'sku-a' limit 1`).get();
+  const cols = Object.keys(src);
+  wdb.prepare(`insert into f_amazon_finance_sku_daily_v1 (${cols.join(', ')}) values (${cols.map(() => '?').join(', ')})`).run(...cols.map((c) => c === 'date_jst' ? day : c === 'seller_sku' ? sku : src[c]));
+  try {
+    w = reader();
+    try {
+      const r1 = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+      assert.equal(r1.ok, true, '試験の前提: policy が同じなら窓にも台帳にも無い MA は比べない');
+      assert.deepEqual(r1.policyWidened, []);
+      // 起点は同じ・期間の終わりだけ変える (覆う範囲は実質同じ) = 指紋だけ変わる (途中の穴を埋めた・source を切り替えたのと同じ形)
+      await setPolicy(`${MA}-01`, '2099-01-01');
+      const r2 = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+      assert.deepEqual(r2.policyWidened, [MA, MB, ymOffset(0)], '起点が同じでも今の policy で覆われる全部の月を戻す');
+      assert.equal(r2.level, 'warn');
+      assert.ok(r2.daily.some((x) => x.date_jst === day && x.seller_sku === sku && x.side === 'sqlite_only'), JSON.stringify(r2.daily.slice(0, 3)));
+      assert.deepEqual(r2.dailyDiffMonths, [MA]);
+      assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), [MA], '差の月だけ台帳に残る・一致した月は消える');
+      assert.ok(readPendingMonths(tmpDir, { file: PENDING_FILE }).months.includes(MA));
+    } finally { w.close(); }
+  } finally { wdb.prepare(`delete from f_amazon_finance_sku_daily_v1 where date_jst = ? and seller_sku = ?`).run(day, sku); }
+  w = reader();
+  try {
+    const r3 = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+    assert.equal(r3.ok, true, JSON.stringify({ d: r3.daily.slice(0, 3), f: r3.fees, u: r3.uncovered }));
+    assert.deepEqual(r3.policyWidened, [], '一度だけ');
+    assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), []);
+  } finally { w.close(); }
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([]), [META.diffStreak]: '0' });
+});
+await t('policy が 0 行 = 突き合わせを止める (起点が決まらない)・台帳 (未照合の月・続いた回数・policy の指紋) を変えない・ほかを読まない (#1614 Codex R2 Low 1)', async () => {
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([MA]), [META.diffStreak]: '1' });
+  const before = { u: L0.getMeta(META.unreconciled), p: L0.getMeta(META.reconcilePolicy), s: L0.getMeta(META.diffStreak) };
+  const urls = [];
+  const fake = (url, o) => { urls.push(String(url)); return String(url).includes('/order-finance/coverage/status?') ? Promise.resolve(Response.json({ policy: { fingerprint: 'e'.repeat(64), rows: [] } })) : fetch(url, o); };
+  const w = reader();
+  try {
+    for (const all of [false, true]) {
+      urls.length = 0;
+      await assert.rejects(reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet, fetchImpl: fake, all }), /policy が 0 行 = 突き合わせられない/);
+      assert.ok(urls.length === 1 && urls[0].includes('/order-finance/coverage/status?'), urls.join(' '));
+      assert.deepEqual({ u: L0.getMeta(META.unreconciled), p: L0.getMeta(META.reconcilePolicy), s: L0.getMeta(META.diffStreak) }, before);
+    }
+  } finally { w.close(); }
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([]), [META.diffStreak]: '0' });
+});
+await t('起点が月の途中でその月を直近 45 日の窓だけで見た (台帳に無い) = 対象外の行に月と起点より前の日 × SKU を出す (#1614 Codex R2 Low 2)', async () => {
+  const floor = d(MB, 15);
+  await setPolicy(floor);
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([]), [META.diffStreak]: '0' });
+  const w = reader();
+  try {
+    await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });   // policy を変えた回 (全部の月を戻す) を済ませる
+    L0.setMeta({ [META.unreconciled]: JSON.stringify([]), [META.diffStreak]: '0' });
+    const rr = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+    assert.equal(rr.ok, true, JSON.stringify({ d: rr.daily.slice(0, 3), f: rr.fees, u: rr.uncovered, ex: rr.excluded }));
+    assert.deepEqual(rr.policyWidened, [], '試験の前提: 窓だけの回');
+    assert.ok(rr.checkedMonths.includes(MB), '試験の前提: MB は直近 45 日の窓に入る');
+    const { countSqliteDaily, summarizeReconcile } = await import('../apps/company-db/push/amazon-finance.mjs');
+    const n = countSqliteDaily(w, `${MB}-01`, d(MB, 14));
+    assert.ok(n > 0 && rr.excluded.sqliteFees > 0, '試験の前提: 起点より前に日次の行と月の手数料がある');
+    assert.deepEqual(rr.excluded.months, [MB]);
+    assert.equal(rr.excluded.sqliteDaily, n);
+    assert.ok(summarizeReconcile(rr).includes(`対象外 (policy の起点 ${floor} より前 = 比べない): 月 ${MB} の 日 × SKU ${n}・月の手数料 ${rr.excluded.sqliteFees} (SQLite)`), summarizeReconcile(rr));
+  } finally { w.close(); }
 });
 await t('source の違い (source_mismatch) は起点より前でも対象外にしない・no_policy で起点より前だけが対象外 (#1614 Codex R1 Low 2)', async () => {
   const floor = `${MB}-01`;

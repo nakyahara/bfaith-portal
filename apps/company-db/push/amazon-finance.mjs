@@ -74,7 +74,7 @@ export const META = {
   unreconciled: 'unreconciled_months',     // JSON ['YYYY-MM'] = 送った集合の計上日の月 (照合がそろうまで消さない)
   diffStreak: 'reconcile_diff_streak',     // 突き合わせの差が続いた回数
   backfill: 'backfill_done',               // '1' = 全期間のバックフィルと突き合わせがそろった
-  reconcilePolicy: 'reconcile_policy',     // JSON { fingerprint, floor } = 前回そろって終わった突き合わせが見た Render の policy (起点が過去へ広がったら、新しく対象になった月を一度だけ未照合の月に戻す)
+  reconcilePolicy: 'reconcile_policy',     // JSON { fingerprint, floor } = 前回そろって終わった突き合わせが見た Render の policy (指紋が変わったら、今の policy で覆われる全部の月を一度だけ未照合の月に戻す)
 };
 export const RENDER_PATHS = {
   post: '/order-finance',
@@ -576,6 +576,8 @@ export function diffAccountFees(localRows, remoteRows) {
 const monthsBetween = (from, to) => { const out = []; let [y, m] = from.split('-').map(Number); const [ty, tm] = to.split('-').map(Number); while (y < ty || (y === ty && m <= tm)) { out.push(`${y}-${String(m).padStart(2, '0')}`); m++; if (m > 12) { m = 1; y++; } } return out; };
 const monthEnd = (ym) => { const [y, m] = ym.split('-').map(Number); return new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10); };
 
+/** 月の並び (昇順) を短く: 1 つ = そのまま・続く 3 つ以上 = 最初〜最後 (N か月)・それ以外 = カンマ */
+export const monthRange = (ms) => (ms.length >= 3 && monthsBetween(ms[0], ms[ms.length - 1]).length === ms.length ? `${ms[0]}〜${ms[ms.length - 1]} (${ms.length} か月)` : ms.join(', '));
 const dayBefore = (ymd) => new Date(Date.parse(`${ymd}T00:00:00Z`) - 86400000).toISOString().slice(0, 10);
 /** SQLite の日次の財務の行数 (readSqliteDaily と同じ絞り = Easy Ship の割り振りだけの行は除く)。起点より前で比べない行を数える */
 export function countSqliteDaily(warehouse, from, to) {
@@ -583,7 +585,7 @@ export function countSqliteDaily(warehouse, from, to) {
 }
 /** Render の policy (core.finance_source_policy) を読む口 = 決済のそろいの状態 (0050・受領記録の digest は付けない = 軽い) */
 export const POLICY_PATH = `/order-finance/coverage/status?mall=${FINANCE_MALL}&scope=${FINANCE_SCOPE}&source=${FINANCE_SOURCE}`;
-/** policy の起点 = その会社 × モール × scope の policy の行の period_from の最小 (YYYY-MM-DD)。行が無ければ null (= 全部が採用されない = 起点で切らない) */
+/** policy の起点 = その会社 × モール × scope の policy の行の period_from の最小 (YYYY-MM-DD)。行が無ければ null (突き合わせは止まる = reconcileAmazonFinance。#1614 Codex R2 Low 1) */
 export function policyFloorOf(rows) {
   if (!Array.isArray(rows)) throw new Error('Render の policy の応答の形が違う (policy.rows が無い)');
   let floor = null;
@@ -601,19 +603,24 @@ export function policyFingerprintOf(policy) {
   return `rows:${createHash('sha256').update(JSON.stringify(rows)).digest('hex')}`;
 }
 /**
- * policy の起点が過去へ広がったとき、新しく対象になった月 (今回の起点〜前回の起点の前日 にかかる月) = 一度だけ未照合の月に戻す月。
- *   prev = 台帳の META.reconcilePolicy ({ fingerprint, floor })。指紋が同じなら []。
- *   初回 (台帳に無い・読めない) は前回の起点 = FINANCE_FLOOR (この変更の前の突き合わせが見ていた起点 = 2026-01-01) とみなす
- *   (今の policy の起点が 2026-01-01 なら何も戻さない・それより前へ広げた後に初回が来ても戻す = 見落とさない側)。
- *   起点が後ろへ縮んだ・期間の途中が変わった (穴・source の違い) は戻さない = それは採用されない行 (uncovered は全期間) に差として出る。
+ * policy が変わったとき一度だけ未照合の月に戻す月。prev = 台帳の META.reconcilePolicy ({ fingerprint, floor })。
+ *   ・指紋が同じ = []。
+ *   ・指紋が違う (起点の向きに関係なく = 過去へ広げた・途中の穴を埋めた・source を切り替えた・縮めた) = **今の policy で覆われる全部の月** (今の起点の月〜今月)。
+ *     途中の穴を埋めた・source を切り替えた月は、変える前は採用されない行 (no_policy など) に出ていても、変えた後はその警告が消える =
+ *     直近 45 日にも台帳にも無い月は比べられずに ✅ になりうる → 全部を一度比べ直す (#1614 Codex R2 Medium。
+ *     新しく覆われた区間だけを求める案 = policy の行の snapshot を台帳に残す は、より正確だが手間 = 今は全部を戻す見落とさない側)。
+ *     重さ = 1 か月 1 回の日次の読み取り + 月の手数料 24 か月ごとに 1 回 (1 年分で 13 回ほど) = 通常の締め切り (RECONCILE_BUDGET_MS 480 秒) に収まる (R1 の時に確かめた)。
+ *     policy を変えるのは年に数回 = その翌朝の 1 回だけ重い。
+ *   ・初回 (台帳に無い・読めない) = 前回の起点 = FINANCE_FLOOR (この変更の前の突き合わせが見ていた起点 = 2026-01-01) とみなし、
+ *     起点がそれより過去なら その起点〜2025-12 の月だけを戻す (今の policy の起点が 2026-01-01 なら何も戻さない = 10/5 朝の初回は何も戻らない)。
  */
 export function widenedPolicyMonths(prev, { fingerprint, floor }, today) {
   const ok = prev && typeof prev === 'object' && typeof prev.fingerprint === 'string' && (prev.floor === null || isRealDate(String(prev.floor)));
-  if (ok && prev.fingerprint === fingerprint) return [];
-  const prevFloor = (ok ? prev.floor : null) ?? FINANCE_FLOOR;
   const curFloor = floor ?? FINANCE_FLOOR;
-  if (!(curFloor < prevFloor)) return [];
-  return monthsBetween(curFloor.slice(0, 7), dayBefore(prevFloor).slice(0, 7)).filter((m) => m <= today.slice(0, 7));
+  const upTo = (to) => (curFloor.slice(0, 7) <= to ? monthsBetween(curFloor.slice(0, 7), to) : []).filter((m) => m <= today.slice(0, 7));
+  if (ok) return prev.fingerprint === fingerprint ? [] : upTo(today.slice(0, 7));
+  if (!(curFloor < FINANCE_FLOOR)) return [];
+  return upTo(dayBefore(FINANCE_FLOOR).slice(0, 7));
 }
 
 /**
@@ -625,8 +632,8 @@ export function widenedPolicyMonths(prev, { fingerprint, floor }, today) {
  *   未照合の月がまるごと起点より前なら台帳から外す (送り手は変わった注文の計上日の月を足すので、起点より前の月も入る)。
  *   起点が月の途中なら、その月の日次は起点から比べ、月の手数料 (月の合計) は比べない (Render は起点からの合計・SQLite は月の全部 = 比べられない)。
  *   (10/4 朝: 10/2 に入れた 2025/12/29〜2026/1/12 の決済の 2025-12-29〜31 の行で ⚠️ = 日 × SKU 1575・月の手数料 3・採用されない行 4394 が全部この対象外だった)
- *   policy の指紋 (coverage/status の policy.fingerprint) を台帳 (META.reconcilePolicy) に残し、起点が過去へ広がっていたら
- *   新しく対象になった月を一度だけ未照合の月に戻す (widenedPolicyMonths。起点より前で台帳から外した月を、広げた後の毎朝の回が比べ直す。#1614 Codex R1 Medium)
+ *   policy の指紋 (coverage/status の policy.fingerprint) を台帳 (META.reconcilePolicy) に残し、指紋が変わっていたら (起点の向きに関係なく)
+ *   今の policy で覆われる全部の月を一度だけ未照合の月に戻す (widenedPolicyMonths。#1614 Codex R1 Medium・R2 Medium)。policy が 0 行なら止まる (R2 Low 1)
  */
 export const RECONCILE_BUDGET_MS = 480000;   // 突き合わせ全体の読み取りの締め切り (daily-sync の工程の上限 600 秒より前に、自分で理由を出して止まる)
 export async function reconcileAmazonFinance({ warehouse, ledger, dataDir, base, syncKey, fetchImpl = fetch, all = false, today = jstDate(0), log = console.log, registerPending = true, sleep = undefined, budgetMs = RECONCILE_BUDGET_MS }) {
@@ -635,18 +642,20 @@ export async function reconcileAmazonFinance({ warehouse, ledger, dataDir, base,
   const getOpts = { log, sleep, deadline: Date.now() + budgetMs };
   // policy の起点 (Render の今の policy)。読めなければ止まる (起点が分からないまま比べると、起点より前を差に数える / 起点の後を見落とす)
   const pol = await getJson(fetchImpl, `${base}${POLICY_PATH}`, syncKey, 'Render の policy', getOpts);
-  const floor = policyFloorOf(pol && pol.policy ? pol.policy.rows : undefined);   // null = policy が無い = 起点で切らない (全部が差に出る = 正しい)
-  const winFloor = floor ?? FINANCE_FLOOR;
+  const floor = policyFloorOf(pol && pol.policy ? pol.policy.rows : undefined);
+  // policy が 0 行 = Company DB の財務の view は何も出さない = 比べても全部が差になるだけ・起点も決まらない → 止まる (台帳もやり残しも変えない。#1614 Codex R2 Low 1)
+  if (floor === null) throw new Error('Render の policy が 0 行 = 突き合わせられない (core.finance_source_policy に行を入れてから)');
+  const winFloor = floor;
   const before = (m) => floor !== null && monthEnd(m) < floor;                 // 月がまるごと起点より前
   const straddles = (m) => floor !== null && `${m}-01` < floor && !before(m);  // 起点が月の途中
   const excluded = { months: new Set(), sqliteDaily: 0, sqliteFees: 0, renderUncovered: 0, renderFrom: null, renderTo: null };
-  // policy が過去へ広がった = 新しく対象になった月を一度だけ未照合の月に戻す (#1614 Codex R1 Medium)。
+  // policy が変わった = 今の policy で覆われる全部の月を一度だけ未照合の月に戻す (#1614 Codex R1 Medium・R2 Medium)。
   //   台帳に指紋を書くのは最後 (未照合の月と同じ setMeta) = 途中で止まれば次の回がまた戻す (一度だけ = そろって終わった回で 1 回)
   const policyNow = { fingerprint: policyFingerprintOf(pol.policy), floor };
   const prevPolicy = readJson(ledger, META.reconcilePolicy, null);
   const widened = widenedPolicyMonths(prevPolicy, policyNow, today);
-  const prevLabel = prevPolicy && typeof prevPolicy === 'object' && 'floor' in prevPolicy ? (prevPolicy.floor ?? '無し') : `初回 = ${FINANCE_FLOOR}`;
-  if (widened.length) log(`  policy の起点が過去へ広がった (${prevLabel} → ${floor ?? '無し'}) = 新しく対象になった月 ${widened.join(', ')} を未照合の月に戻して比べる`);
+  const prevLabel = prevPolicy && typeof prevPolicy === 'object' && 'floor' in prevPolicy ? `起点 ${prevPolicy.floor ?? '無し'}` : `初回 = 起点 ${FINANCE_FLOOR} とみなす`;
+  if (widened.length) log(`  policy が変わった (${prevLabel} → 起点 ${floor}) = 今の policy で覆われる月 ${monthRange(widened)} を一度だけ未照合の月に戻して比べる`);
   const ledgerMonths = [...new Set([...readJson(ledger, META.unreconciled, []), ...widened])].sort();
   const unreconciled = ledgerMonths.filter((m) => /^\d{4}-\d{2}$/.test(m) && m <= today.slice(0, 7));
   const windows = [];   // [from, to, fullMonth | null]
@@ -671,6 +680,8 @@ export async function reconcileAmazonFinance({ warehouse, ledger, dataDir, base,
     for (const m of monthsBetween(a.slice(0, 7), b.slice(0, 7))) monthsChecked.add(m);
   }
   const months = [...monthsChecked].sort();
+  // 起点が月の途中で、その月を直近 45 日の窓だけで見た (台帳に無い) = 対象外の月としても数える (表示の月が空にならない。#1614 Codex R2 Low 2)
+  for (const m of months) if (straddles(m) && !excluded.months.has(m)) { excluded.months.add(m); excluded.sqliteDaily += countSqliteDaily(warehouse, `${m}-01`, dayBefore(floor)); }
   // 月の手数料は月の合計 = 起点が月の途中の月は比べない (Render は起点からの合計)・まるごと前の月は窓に入っていない (数えるだけ)
   const feeMonths = months.filter((m) => !straddles(m));
   const feeExcluded = [...new Set([...months.filter(straddles), ...[...excluded.months].filter(before)])].sort();
@@ -743,7 +754,7 @@ export function summarizeReconcile(rr, { all = false } = {}) {
   const head = rr.level === 'ok' ? '✅' : rr.level === 'warn' ? '⚠️' : '❌';
   const scope = all ? `全期間 ${rr.checkedMonths[0] ?? '-'}〜${rr.checkedMonths[rr.checkedMonths.length - 1] ?? '-'}` : `直近 ${RECONCILE_DAYS} 日 + 未照合の月`;
   const ex = excludedLine(rr.excluded);
-  const tail = (rr.policyWidened && rr.policyWidened.length ? ` / policy の起点が過去へ広がった = 新しく対象になった月 ${rr.policyWidened.join(', ')} を比べた` : '') + (ex ? ` / ${ex}` : '');
+  const tail = (rr.policyWidened && rr.policyWidened.length ? ` / policy が変わった = 今の policy で覆われる月 ${monthRange(rr.policyWidened)} を一度だけ比べ直した` : '') + (ex ? ` / ${ex}` : '');
   if (rr.ok) return `${head} Company DB Amazon 財務 突き合わせ (${scope}): 日 × SKU・月の手数料とも SQLite と一致 (採用されない行 0)${tail}`;
   return `${head} Company DB Amazon 財務 突き合わせ (${scope}): 日 × SKU の差 ${rr.daily.length} (月 ${rr.dailyDiffMonths.join(', ') || '-'}) / 月の手数料の差 ${rr.fees.length} (月 ${rr.feeDiffMonths.join(', ') || '-'}) / 採用されない行 ${rr.uncovered}`
     + ` → 差の月を build のやり残しに登録した (${rr.streak} 回続けて差${rr.streak >= 2 ? ' = ❌' : ' = 1 回目は ⚠️'})${tail}`;
