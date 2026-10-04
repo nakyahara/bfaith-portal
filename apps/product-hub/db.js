@@ -1424,6 +1424,72 @@ export function initProductHubDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_ph_lp_compose_generations_day
       ON ph_lp_compose_generations(reserved_day);
+
+    -- LP 画像の生成 (段階2・2026-10-04 中原さん「画像を作って比べたい」)。
+    -- 構成ができた (done・実モデル一致) 依頼の ⑦ を画像ごとに gpt-image-2.5 へ。人がボタンを押したときだけ。
+    CREATE TABLE IF NOT EXISTS ph_lp_image_jobs (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id        INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      compose_job_id  INTEGER NOT NULL REFERENCES ph_lp_compose_jobs(id) ON DELETE CASCADE,
+      idempotency_key TEXT NOT NULL,
+      status          TEXT NOT NULL CHECK (status IN ('queued','running','done','partial','failed','cancelled')),
+      model           TEXT NOT NULL,
+      quality         TEXT NOT NULL,
+      size            TEXT NOT NULL,
+      folder_id       TEXT,                    -- 商品の画像フォルダ (drive_folder_url)
+      ai_folder_id    TEXT,                    -- その中の「AI初稿」。**最初の画像を作る前に**用意して固定する (#1612 R1)
+      requested_by    TEXT,
+      error           TEXT,
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      started_at      TEXT,
+      completed_at    TEXT,
+      UNIQUE (draft_id, idempotency_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_image_jobs_draft ON ph_lp_image_jobs(draft_id, id DESC);
+
+    -- 1 枚ずつ。prompt と参考画像は受付時に固定 (作り直すときは新しい job)
+    CREATE TABLE IF NOT EXISTS ph_lp_images (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      image_job_id    INTEGER NOT NULL REFERENCES ph_lp_image_jobs(id) ON DELETE CASCADE,
+      seq             INTEGER NOT NULL,         -- 作る順 (1〜)
+      no              INTEGER,                  -- 構成の画像番号 (0 = サムネイル)
+      name            TEXT,
+      prompt          TEXT NOT NULL,
+      refs_json       TEXT NOT NULL DEFAULT '[]',  -- 参考に渡す画像 [{file_id, role, label}]
+      status          TEXT NOT NULL CHECK (status IN ('queued','running','done','failed','skipped')),
+      est_jpy         INTEGER NOT NULL DEFAULT 0, -- 取り置き額 (円・切り上げ。品質段・参考画像・prompt のバイト数から・#1612 R1〜R4)
+      claimed_by      TEXT,                    -- 作っているプロセス (再起動の片付けで、生きているものを中断にしない・#1612 R1)
+      lease_until     TEXT,
+      drive_file_id   TEXT,
+      error           TEXT,
+      cost_jpy        INTEGER,                 -- 円 (切り上げ・金額は整数の決まり)
+      started_at      TEXT,
+      completed_at    TEXT,
+      UNIQUE (image_job_id, seq)
+    );
+
+    -- AI の従量課金の台帳 (検討 §6 層2・fail-closed)。呼ぶ**前**に見込みで取り置き (reserved)、
+    -- 終わったら実額 (charged) か 0 (failed・請求されない失敗) に確定する。
+    -- 当月の合計 = charged の実額 + reserved / unknown の見込み額。これが上限を超えるなら呼ばない
+    CREATE TABLE IF NOT EXISTS ph_ai_usage (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind            TEXT NOT NULL,            -- 'lp_image'
+      month           TEXT NOT NULL,            -- JST の YYYY-MM
+      draft_id        INTEGER,
+      ref_id          INTEGER,                  -- ph_lp_images.id
+      model           TEXT,
+      quality         TEXT,
+      status          TEXT NOT NULL CHECK (status IN ('reserved','charged','failed','unknown')),
+      est_jpy         INTEGER NOT NULL,        -- 円 (切り上げ)
+      cost_jpy        INTEGER,                 -- 円 (切り上げ・推定)
+      in_text_tokens  INTEGER,
+      in_image_tokens INTEGER,
+      out_tokens      INTEGER,
+      error           TEXT,
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      finished_at     TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_ai_usage_month ON ph_ai_usage(kind, month);
   `);
 
   // LP 構成: 実行役へ配った画像の記録 (PR1-b で追加。PR1-a でデプロイ済みの DB にも入れる)
@@ -2930,8 +2996,11 @@ export function imageRefOfFileId(db, fileId) {
     SELECT white_bg_modified_time FROM draft_rakuten WHERE white_bg_drive_file_id = ?
     UNION ALL
     SELECT drive_modified_time FROM draft_sku_images WHERE drive_file_id = ?
+    UNION ALL
+    -- AI が作った LP 画像 (段階2)。保存したのはサーバ自身なので、登録済みの画像と同じく見せてよい
+    SELECT completed_at FROM ph_lp_images WHERE drive_file_id = ?
     LIMIT 1
-  `).get(fileId, fileId, fileId) || null;
+  `).get(fileId, fileId, fileId, fileId) || null;
 }
 
 /**

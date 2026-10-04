@@ -72,7 +72,12 @@ import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } fr
 // Company DB の「新商品の登録」から作るカード (2026-10-01・Company DB構想 14 ⑤-2a)。知らせ (outbox) の取り込みと、新規作成の入口の切り替え
 import { applyCdbCardEvent, cdbShippingCheckIds } from './services/cdb-card-intake.js';
 import { sweepCardOutbox, newEntryGate } from '../../lib/product-hub-outbox.mjs';
-import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
+import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders, getDriveWriteClient, ensureImageFolder } from './services/drive-image-folder.js';
+import {
+  requestImageJob as requestLpImageJob, imageStateFor as lpImageStateFor, createLpImageWorker, openaiGenerateImage,
+  imageBlockReason as lpImageBlockReason, imageRefCandidates as lpImageRefCandidates, validImageRequestKey as lpImageValidKey,
+} from './lib/lp-image.js';
+import { Readable } from 'node:stream';
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
 import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
@@ -488,6 +493,8 @@ router.get('/detail/:id', (req, res) => {
     // (読み込み直後に 1 回 fetch すると、押せる/押せないが一瞬ちらつく)。
     // 画面はこの後 5 秒おきに GET /api/drafts/:id/lp-compose を叩いて更新する
     lpCompose: lpComposeInitialState(db, draft),
+    // 「🖼 画像を作る」(段階2・2026-10-04)。同じく最初の表示をここで作る
+    lpImage: lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }),
   });
 });
 
@@ -3880,6 +3887,107 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
     // 「仕様書: ○○ (YYYY-MM-DD 取込)」。古ければ人が上げ直す (設計 §4.1 のアップロード忘れ対策)
     spec: lpSpecSummary(db, 'product_analysis'),
   });
+});
+
+// ─── 画面: LP 画像を作る (段階2・2026-10-04 中原さん) ─────────────
+// 正本 = AI_reference『商品ハブ_LP構成と画像の自動生成_検討_20260929.md』。ロジックは lib/lp-image.js。
+
+/** 保存先 = 商品の画像フォルダ (画像タブの「画像フォルダから自動セット」の URL) */
+function lpImageFolderId(draft) {
+  const p = parseDriveLink(draft?.drive_folder_url);
+  return p && p.type === 'folder' ? p.id : null;
+}
+/** 先頭のバイト列で画像の種類を見る (Drive のサムネイルは JPEG が多いが、PNG のこともある) */
+function sniffImageMime(buf) {
+  if (buf && buf.length > 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+  if (buf && buf.length > 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+  return 'image/jpeg';
+}
+// 作る係 (Render のプロセスの中で 1 枚ずつ)。押されたときと起動のときに動く
+const lpImageWorker = createLpImageWorker({
+  getDB,
+  generate: (args) => openaiGenerateImage(args),
+  // 参考画像は AI に構成を書かせたときと同じ幅 (1024px) のサムネイル。ラベルの文字が読める大きさ
+  // 受付時の更新日時と照らし、差し替わっていたら作らない (#1612 R1 Medium)。更新日時が無ければ作らない (#1612 R2 Medium)
+  fetchRef: async (fileId, { expectedModifiedTime = null } = {}) => {
+    if (!expectedModifiedTime) throw Object.assign(new Error('参考画像の更新日時がありません'), { changed: true });
+    {
+      const meta = await getDriveWriteClient().files.get({ fileId, fields: 'modifiedTime', supportsAllDrives: true }, { timeout: 30_000 });
+      const cur = meta?.data?.modifiedTime || null;
+      if (!cur || Date.parse(cur) !== Date.parse(expectedModifiedTime)) {
+        throw Object.assign(new Error(`参考画像が差し替わっています (${fileId})`), { changed: true });
+      }
+    }
+    // 版 = 受付時の更新日時 (サムネイルのキャッシュも受付時の版で引く)
+    const e = await getDriveThumbnail(fileId, LP_COMPOSE_IMAGE_WIDTH, expectedModifiedTime || '');
+    return { buf: e.buf, mime: sniffImageMime(e.buf) };
+  },
+  ensureFolder: async (parentId) => (await ensureImageFolder(getDriveWriteClient(), { name: 'AI初稿', parentId })).id,
+  upload: async ({ folderId, name, buf }) => {
+    const r = await getDriveWriteClient().files.create({
+      requestBody: { name, parents: [folderId], mimeType: 'image/png' },
+      media: { mimeType: 'image/png', body: Readable.from(buf) },
+      fields: 'id',
+      supportsAllDrives: true,
+    }, { timeout: 120_000 });
+    return r.data.id;
+  },
+});
+const lpImageTick = () => lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e));
+// 起動のとき 1 回: 期限の切れた途中の画像を片付けてから、残りを作る (機能が有効なときだけ)。
+// kick の中で recover するので、入れ替え中の古いプロセスが作っている画像 (期限内) には触らない (#1612 R1 Medium)。
+// 定期の見回り (setInterval) は置かない — 画面が作っている間 5 秒おきに状況を見に来るので、そのときに起こす (#1612 R2)
+if (process.env.PH_LP_IMAGE_ENABLED === '1') setTimeout(lpImageTick, 15_000).unref();
+
+/** 参考画像の Drive の更新日時をいま取り直す (受付時に固定する値・#1612 R2 Medium)。取れなければ throw */
+async function lpImageRefTimes(fileIds) {
+  const drive = getDriveWriteClient();
+  const out = {};
+  for (const fileId of fileIds) {
+    const meta = await drive.files.get({ fileId, fields: 'modifiedTime', supportsAllDrives: true }, { timeout: 30_000 });
+    if (!meta?.data?.modifiedTime) throw new Error(`更新日時が返ってきませんでした (${fileId})`);
+    out[fileId] = meta.data.modifiedTime;
+  }
+  return out;
+}
+
+/** 状況 (画面が作っている間 5 秒おきに叩く) */
+router.get('/api/drafts/:id/lp-images', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const st = lpImageStateFor(getDB(), { draft, folderId: lpImageFolderId(draft) });
+  // 作っている途中なのに作る係が休んでいる (再起動の後・期限切れの片付け待ち) なら起こす。kick は重ねて呼んでも 1 本だけ
+  if (st.job && ['queued', 'running'].includes(st.job.status) && !lpImageWorker.isRunning()) lpImageTick();
+  res.json({ ok: true, ...st });
+});
+
+/** 作る (誰でも押せる)。body: { idempotency_key }。同じキーの再送は前の依頼を返す */
+router.post('/api/drafts/:id/lp-images', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const folderId = lpImageFolderId(draft);
+  // 押せない理由があれば Drive を読まずに断る (同じキーの再送は requestLpImageJob が前の依頼を返す)
+  const key = req.body?.idempotency_key;
+  if (!lpImageValidKey(key)) return res.status(400).json({ ok: false, code: 'bad_request', error: 'idempotency_key の形が不正です' });
+  const prior = db.prepare('SELECT 1 FROM ph_lp_image_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draft.id, key);
+  let refTimes = null;
+  if (!prior) {
+    const blocked = lpImageBlockReason(db, { draft, folderId });
+    if (blocked) return res.status(409).json({ ok: false, code: 'not_ready', error: blocked });
+    try { refTimes = await lpImageRefTimes(lpImageRefCandidates(db, draft)); }
+    catch (e) {
+      console.error('[product-hub] lp-image ref times:', draft.id, String(e?.message || e).slice(0, 300));
+      return res.status(502).json({ ok: false, code: 'refs_unavailable', error: '参考画像の情報を Drive から読めませんでした — もう一度押してください' });
+    }
+  }
+  const r = requestLpImageJob(db, { draft, folderId, idempotencyKey: key, actor: actorOf(req), refTimes });
+  if (!r.ok) {
+    const status = r.code === 'already_running' || r.code === 'not_ready' ? 409 : 400;
+    return res.status(status).json({ ok: false, code: r.code, error: r.error });
+  }
+  lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e));
+  res.json({ ok: true, created: r.created, ...lpImageStateFor(db, { draft, folderId }) });
 });
 
 /**
