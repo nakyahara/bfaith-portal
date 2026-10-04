@@ -51,7 +51,7 @@ await admin.query(`create database ${dbName}`);
 const u = new URL(url); u.pathname = `/${dbName}`;
 const M = await openPgClient(u.toString()), A = await openPgClient(u.toString()), Bc = await openPgClient(u.toString());
 try {
-  await applyMigrations(pgAdapter(M), { log: () => {} });
+  await applyMigrations({ ...pgAdapter(M), supportsConcurrentIndex: false }, { log: () => {} });   // 準備 = concurrent-index の file も取引の中で (PGlite と同じ道・本物の CIC の道は test-company-db-d60-load-count-indexes-pg.mjs)
   const run = (i) => `mc_20300101T0000000${String(i).padStart(2, '0')}Z_abcdef`;
   const dayOf = (i) => new Date(Date.UTC(2030, 0, 10) + i * 86400000).toISOString().slice(0, 10);
   const gen = (i) => ({ products_at: `${dayOf(i)} 07:00:00`, products_rev: String(100 + i), sets_at: `${dayOf(i)} 07:00:01`, sets_rev: String(200 + i), cdb_read_at: `${dayOf(i)}T08:40:00.000Z` });
@@ -375,8 +375,8 @@ try {
     const conn = async (n) => { const x = new URL(url); x.pathname = `/${n}`; return openPgClient(x.toString()); };
     const S = await conn(names[0]), D = await conn(names[1]);
     try {
-      await applyMigrations(pgAdapter(S), { log: () => {} });
-      await applyMigrations(pgAdapter(D), { log: () => {} });
+      await applyMigrations({ ...pgAdapter(S), supportsConcurrentIndex: false }, { log: () => {} });   // 準備 = concurrent-index の file も取引の中で (PGlite と同じ道・本物の CIC の道は test-company-db-d60-load-count-indexes-pg.mjs)
+      await applyMigrations({ ...pgAdapter(D), supportsConcurrentIndex: false }, { log: () => {} });
       const odd = Buffer.from([0x00, 0xff, 0x0d, 0x0a, 0x5c, 0x78, 0x41, 0xe3, 0x81]);
       const h = crypto.createHash('sha256').update(odd).digest('hex');
       await S.query(`insert into ops.ne_csv_exports (kind, col, ne_column, converter_version, encoding, trial, row_count, sha256, file_bytes, compare_run_id, created_by, state, void_at, void_reason)

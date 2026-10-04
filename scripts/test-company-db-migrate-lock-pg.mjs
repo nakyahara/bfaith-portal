@@ -317,12 +317,23 @@ try {
   await t('L4 本物の migrations (0001〜) を全部流す = 今までどおり (2 回目は 0 本)・applied_by に migrate-v2・lock は残らない', async () => {
     const dbName = await newDb();
     const c1 = await open(dbName);
-    const all = listMigrationFiles().map((f) => f.version);
-    const r = await migrate(c1, {});
+    // 🆕 D-60 3a-i の index (concurrent-index の file) が本物の置き場に入った後: 新しい DB の表は一度も ANALYZE していない = 容量を見積もれない =
+    //   runner はその file で何も作らずに止まる (fail-closed)。ここでは「最初の concurrent-index の file の前まで」を全部流し、その file で止まることを確かめる
+    //   (concurrent-index の file そのものはデータと統計のある DB で test-company-db-d60-load-count-indexes-pg.mjs が流す)
+    const files = listMigrationFiles();
+    const firstCi = files.find((f) => f.concurrentIndex);
+    const all = files.filter((f) => !firstCi || f.version < firstCi.version).map((f) => f.version);
+    const to = all[all.length - 1];
+    const r = await migrate(c1, { to });
     assert.deepEqual(r.applied, all);
-    const r2 = await migrate(c1, {});
+    const r2 = await migrate(c1, { to });
     assert.deepEqual([r2.applied, r2.skipped.length], [[], all.length]);
     assert.deepEqual(await lockHolders(dbName), []);
+    if (firstCi) {
+      await assert.rejects(migrate(c1, {}), (e) => e.code === 'DISK_CHECK_FAILED' && e.version === firstCi.version && /ANALYZE/.test(e.message));
+      assert.equal((await c1.query('select count(*)::int as n from ops.schema_migrations where version = $1', [firstCi.version])).rows[0].n, 0);
+      assert.deepEqual(await lockHolders(dbName), []);
+    }
     const by = (await c1.query('select distinct applied_by from ops.schema_migrations')).rows.map((x) => x.applied_by);
     assert.equal(by.length, 1); assert.match(by[0], / migrate-v2$/);
   });
