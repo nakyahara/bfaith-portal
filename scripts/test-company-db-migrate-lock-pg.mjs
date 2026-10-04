@@ -38,6 +38,10 @@
  *   🆕 Codex R-D60-v3-13 H1: O0・O6・O8 = ドルの引用の中 (DO の本文) の set_config('role', …) も拒む / 動的 SQL (EXECUTE format) は見ない = ⚠️ を出して流し、記録は印の役割 (補助で sandbox ではない)
  *   🆕 設計 13 v3.14 (形 B): 持ち主の mode の試験は CREATEROLE の無い deployer (DEPLOYER) で流す (役割は superuser が作る) / O10 = 到達の検査の禁止の集合 (owner の状態では必須・本番の道・--dry-run・--list)・
  *     役割の図の比較 / O11 = 記録の INSERT の後の deferred の trigger / C10 ③ = 前の回の valid・未記録の index を含む予約 / C11 = host の対応の fixture・未確認の間は CIC を流さない
+ *   🆕 Codex R3 (PR #1606): O0 = 禁止の GUC の集合 (ROLE_GUCS・LEXER_GUCS) の全部の形 / O13 (High 1) = session_authorization の generic の GUC・関数の SET 句・
+ *     ALTER ROLE / DATABASE … SET・UPDATE pg_settings = 本物の PG と PGlite で役割が戻る形を流す前に止める / O14 (High 2) = 前の file が
+ *     standard_conforming_strings = off を残しても次の file の set_config('r\ole', …)・'a\'b'; RESET ROLE; … は止まる (2 つの file・本物の PG と PGlite)・
+ *     file の中の字句の前提の GUC の変更を拒む・reset_val が off なら流さない・legacy は今までどおり / C15 = concurrent-index の session も同じ前提
  * 使い方: node scripts/test-company-db-migrate-lock-pg.mjs   (npm run test:company-db にも入っている)
  *   使い捨てのクラスタを embedded-postgres で起動し、最後に止めて消す (test-company-db-profit-fn-revoke-pg.mjs と同じ作り)。
  *   見つからない・版が違う・起動できない・フォルダが消えない = 失敗 (exit 1)
@@ -55,7 +59,7 @@ import {
   openPgClient, pgAdapter, pgliteAdapter, applyMigrations, migrateWithLock, withMigrateLock, listMigrationFiles, buildIndexExpect, readIndexAttrs, attrDiff,
   splitSqlStatements, parseConcurrentIndexStatement, planConcurrentIndexFile, estimateIndexBytes, roleSwitchStatements, ALLOWED_SET_LOCAL_ROLES, MIGRATE_LOCK_NAME, DISK_ESTIMATE, DEFAULT_DIR,
   txControlStatements, renderResourceMatchesUrl, renderDiskMetricsReader, migrationStatus, RENDER_PG_HOST_MAPPING, roleAdminReachable, ROLE_ADMIN_FORBIDDEN_PREDEFINED,
-  unicodeEscapeLiterals,
+  unicodeEscapeLiterals, ROLE_GUCS, LEXER_GUCS, OWNER_MODE_FORBIDDEN_GUCS, LEXER_PREMISE,
 } from './company-db/migrate.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -842,8 +846,33 @@ ${tail}`;
       'RESET U&"role";', "SET LOCAL U&\"r\\006Fle\" = 'none';", "SELECT pg_catalog.U&\"set_confi\\0067\"('role', 'none', true);",
       'reset u&"ROLE"', "set local U&\"r!006Fle\" UESCAPE '!' = 'none'", 'RESET U & "role"', 'reset U/* c */&"role"', "select u&'x'", "select U&'x' uescape '!'", 'select 1 UESCAPE',
       'set local role U&"cdb_owner"', 'do $$ begin reset U&"role"; end $$', "do $a$ begin perform pg_catalog.U&\"set_confi\\0067\"('role', 'none', true); end $a$",
-      "create function app.g() returns text language sql as $f$ select U&'\\0061' $f$"];
+      "create function app.g() returns text language sql as $f$ select U&'\\0061' $f$",
+      // 🆕 Codex R3 High 1: session_authorization の generic の GUC の形 (1 語の名前・引用・大文字小文字・コメント・関数の SET 句・ALTER ROLE / DATABASE … SET・ドルの引用の中)
+      "SET session_authorization TO 'deployer';", "SET LOCAL session_authorization = 'deployer';", 'RESET session_authorization;', "ALTER ROLE deployer SET session_authorization TO 'deployer';",
+      "CREATE FUNCTION app.f() RETURNS int LANGUAGE sql SET session_authorization TO 'deployer' AS $f$ select 1 $f$;", "set \"SESSION_AUTHORIZATION\" = 'x'", 'reset /* c */ "Session_Authorization"',
+      "set session session_authorization = 'x'", "set session session authorization 'x'", "set local session authorization 'x'", "do $$ begin perform set_config('session_authorization', 'x', true); end $$",
+      "select set_config('Session_Authorization', 'x', false)", "alter database d set role = 'none'", 'alter role x in database d reset role', "alter function app.f() set role to 'x'", "alter system set session_authorization = 'x'",
+      "create procedure app.p() language sql set role from current as $p$ select 1 $p$", "update pg_settings set setting = 'none' where name = 'role'", "UPDATE pg_catalog.\"PG_SETTINGS\" SET setting = 'x' WHERE name = 'session_authorization'",
+      'do $$ begin reset session_authorization; end $$',
+      // 🆕 Codex R3 High 2: 字句の前提の GUC (standard_conforming_strings・backslash_quote・escape_string_warning・client_encoding / SET NAMES)
+      'SET standard_conforming_strings = off', "set local \"Standard_Conforming_Strings\" to 'off'", 'reset standard_conforming_strings', 'set local backslash_quote = on', 'reset escape_string_warning',
+      "select set_config('standard_conforming_strings', 'off', false)", "select set_config('backslash_quote', 'on', true)", "set names 'SJIS'", "set local client_encoding = 'SJIS'", "select set_config('client_encoding', 'SJIS', true)",
+      "create function app.h() returns int language sql set standard_conforming_strings = off as $f$ select 1 $f$", 'alter role x set standard_conforming_strings = off', 'alter database d set escape_string_warning = off',
+      'do $$ begin set local standard_conforming_strings = off; end $$'];
     for (const x of rejected) assert.ok(roleSwitchStatements(x).length > 0, `拒まない: ${x}`);
+    // 🆕 Codex R3: 禁止の GUC の集合 (正本 = 定数)。役割の GUC = PG 18 の guc_tables.c で assign の hook が役割を変える 2 つ
+    assert.deepEqual(ROLE_GUCS, ['role', 'session_authorization']);
+    assert.deepEqual(LEXER_GUCS, ['standard_conforming_strings', 'backslash_quote', 'escape_string_warning', 'client_encoding']);
+    assert.deepEqual(OWNER_MODE_FORBIDDEN_GUCS, [...ROLE_GUCS, ...LEXER_GUCS]);
+    assert.deepEqual({ ...LEXER_PREMISE }, { standard_conforming_strings: 'on', client_encoding: 'UTF8' });
+    // 集合のどの GUC も、SET / SET LOCAL / SET SESSION / RESET / set_config / 関数の SET 句 / ALTER ROLE … SET / ALTER DATABASE … SET の全部の形で拒む
+    for (const g of OWNER_MODE_FORBIDDEN_GUCS) {
+      for (const x of [`set ${g} to 'x'`, `SET LOCAL ${g.toUpperCase()} = 'x'`, `set session "${g}" = 'x'`, `reset ${g}`, `RESET "${g.toUpperCase()}"`, `select set_config('${g}', 'x', true)`, `select pg_catalog.set_config(' ${g.toUpperCase()} ', 'x', true)`,
+        `create function app.z() returns int language sql set ${g} = 'x' as $f$ select 1 $f$`, `create function app.z() returns int language sql set ${g} from current as $f$ select 1 $f$`,
+        `alter role r set ${g} = 'x'`, `alter role r in database d set ${g} to default`, `alter database d set ${g} = 'x'`, `alter database d reset ${g}`, `do $$ begin perform set_config('${g}', 'x', true); end $$`]) {
+        assert.ok(roleSwitchStatements(x).length > 0, `拒まない: ${x}`);
+      }
+    }
     const allowed = ['set local role cdb_owner', 'SET LOCAL ROLE profit_definer;', 'set local role heavy_guard_definer', 'set local role heavy_read_definer', 'set local role d60_calib_definer', 'set local role finance_revision_definer',
       'SET LOCAL ROLE "profit_definer"', "set local role 'cdb_owner'", 'reset all', "select set_config('search_path', 'pg_catalog', true)",
       // DO の本文の許す形 (今の migration の書き方)・動的 SQL の文字列の中は見ない (= 補助で sandbox ではない・runner は ⚠️ を出す)
@@ -851,7 +880,10 @@ ${tail}`;
       "do $$ begin execute format('select set_config(%L, %L, true)', 'role', 'none'); end $$",
       "select \"set_config\"('search_path', 'pg_catalog', true)", 'select "role" from app.t', "comment on column app.t.a is 'reset role'",
       // 🆕 Codex R2 High: U& でない形は今までどおり (名前 u・u & 数・文字列の中の U&・引用の名前の中の u&)
-      'select u from app.t', 'select u & 1 from app.t', "select 'U&\"role\"'", 'select "u&x" from app.t', 'select xu & 1 from app.t'];
+      'select u from app.t', 'select u & 1 from app.t', "select 'U&\"role\"'", 'select "u&x" from app.t', 'select xu & 1 from app.t',
+      // 🆕 Codex R3: 禁止の GUC を読むだけ・名前の一部・別の GUC は今までどおり
+      "select current_setting('standard_conforming_strings')", 'show standard_conforming_strings', "select set_config('app.role', 'x', true)", "set local app.session_authorization = 'x'", 'set local search_path = app, public',
+      'select rolname from pg_catalog.pg_roles', "select 'set session_authorization x'", 'create table app.s (session_authorization_x int)'];
     for (const x of allowed) assert.deepEqual(roleSwitchStatements(x), [], `拒んだ: ${x}`);
   });
 
@@ -1123,6 +1155,251 @@ alter table ops.migrate_owner owner to ${prole};
     assert.deepEqual((await c2.query(`select (select count(*)::int from ops.schema_migrations) as n, to_regnamespace('app') is null as no_app`)).rows[0], { n: 0, no_app: true });   // 記録表は bootstrap だけ・0001 も流さない
     assert.deepEqual(await whoami(c2), { cu: DEPLOYER, su: DEPLOYER });
     assert.deepEqual(await lockHolders(db2), []);
+  });
+
+  // 🆕 Codex R3 High 1: session_authorization の generic の GUC の形と pg_settings の UPDATE。u = 接続の (認証した) 役割の名前。全部、本当に役割を戻す形 (下の「前提」で確かめる)
+  const SESSION_AUTH_FORMS = (u) => [`SET session_authorization TO '${u}';`, `SET LOCAL session_authorization = '${u}';`, `set "SESSION_AUTHORIZATION" = '${u}';`,
+    `set session /* c */ "Session_Authorization" to '${u}';`, 'RESET session_authorization;', 'reset -- c\n  "Session_Authorization";',
+    `select set_config('session_authorization', '${u}', true);`, `select pg_catalog.set_config('SESSION_AUTHORIZATION', '${u}', false);`,
+    `do $$ begin perform set_config('session_authorization', '${u}', true); end $$;`, 'do $x$ begin reset session_authorization; end $x$;'];
+  /** pg_settings の UPDATE (rule で set_config)。role・session_authorization は GUC_NO_SHOW_ALL = pg_settings に出ない = 役割は変わらない (前提で確かめる) が、参照ごと拒む */
+  const PG_SETTINGS_ROLE_FORMS = (u) => ["update pg_settings set setting = 'none' where name = 'role';", `UPDATE pg_catalog.pg_settings SET setting = '${u}' WHERE name = 'session_authorization';`];
+  /** 関数の SET 句 = 呼んでいる間は役割が変わる (前提 = 呼んだ結果の current_user)。名前は試験ごとに変える */
+  const sessAuthFn = (u, fn) => `create function app.${fn}() returns text language sql set session_authorization to '${u}' as $f$ select current_user::text $f$;\nselect app.${fn}();`;
+  await t('O13 (Codex R3 High 1) session_authorization の generic の GUC (SET / SET LOCAL / RESET session_authorization・引用・大文字小文字・コメント・set_config・DO の中・関数の SET 句) = 本物の PG と PGlite で本当に役割が戻る形 → owner の状態では流す前に止まる / ALTER ROLE・ALTER DATABASE … SET・UPDATE pg_settings (role は pg_settings に出ない = 前提で確かめる) も止まる', async () => {
+    const dbName = await newDepDb();
+    const c = await openDep(dbName);
+    const role = await newOwnerRole();
+    const base = { '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role) };
+    await migrate(c, { dir: mkDir(base) });
+    const forms = SESSION_AUTH_FORMS(DEPLOYER);
+    // (前提) 本物の PG: 各形は SET LOCAL ROLE <印の役割> を本当に接続の役割へ戻す / 関数の SET 句は呼んでいる間 接続の役割
+    for (const x of forms) {
+      await c.query('begin');
+      try {
+        await c.query(`set local role ${role}`);
+        assert.equal((await whoami(c)).cu, role);
+        await c.query(x);
+        assert.equal((await whoami(c)).cu, DEPLOYER, `(前提) ${x} で役割が戻らない`);
+      } finally { await c.query('rollback'); }
+    }
+    await c.query('begin');
+    try {
+      await c.query(`set local role ${role}`);
+      const r = await c.query(sessAuthFn(DEPLOYER, 'o13_pre'));
+      assert.equal(r[1].rows[0].o13_pre, DEPLOYER, '(前提) 関数の SET 句で役割が変わらない');
+      assert.equal((await whoami(c)).cu, role);
+    } finally { await c.query('rollback'); }
+    // (前提) role・session_authorization は pg_settings に出ない (GUC_NO_SHOW_ALL) = UPDATE しても役割は変わらない (それでも pg_settings は参照ごと拒む = 字句の前提の GUC は変えられる・O14)
+    assert.equal((await c.query("select count(*)::int as n from pg_settings where name in ('role', 'session_authorization')")).rows[0].n, 0);
+    for (const x of PG_SETTINGS_ROLE_FORMS(DEPLOYER)) {
+      await c.query('begin');
+      try {
+        await c.query(`set local role ${role}`);
+        await c.query(x);
+        assert.equal((await whoami(c)).cu, role, x);
+      } finally { await c.query('rollback'); }
+    }
+    const dbSu = new URL(suUrl); dbSu.pathname = `/${dbName}`;
+    const s2 = await openPgClient(dbSu.toString()); s2.on('error', () => {}); clients.push(s2);
+    const rejectOnly = [...PG_SETTINGS_ROLE_FORMS(DEPLOYER), sessAuthFn(DEPLOYER, 'o13_fn'), `ALTER ROLE ${DEPLOYER} SET session_authorization TO '${DEPLOYER}';`, `alter role ${role} in database ${dbName} set "ROLE" = 'none';`,
+      `alter database ${dbName} set session_authorization = '${DEPLOYER}';`, `alter role ${DEPLOYER} reset session_authorization;`];
+    for (const x of [...forms, ...rejectOnly]) {
+      assert.ok(roleSwitchStatements(x).length > 0, `拒まない: ${x}`);
+      const d = mkDir({ ...base, '0003_evade.sql': `create table app.o13_before (x int);\n${x}\ncreate table app.o13_after (x int);\n` });
+      await assert.rejects(migrate(c, { dir: d }), (e) => e.code === 'OWNER_MODE_INVALID' && /許さない役割の切り替え/.test(e.message), x);
+      assert.deepEqual(await whoami(c), { cu: DEPLOYER, su: DEPLOYER });
+      assert.equal((await s2.query(`select count(*)::int as n from pg_class where relname like 'o13\\_%'`)).rows[0].n, 0, `${x} を流した`);
+      assert.deepEqual((await s2.query('select version from ops.schema_migrations order by 1')).rows.map((r) => r.version), ['0001', '0002']);
+      assert.equal((await s2.query(`select count(*)::int as n from pg_db_role_setting s join pg_roles r on r.oid = s.setrole where r.rolname = any($1)`, [[DEPLOYER, role]])).rows[0].n, 0, x);
+      assert.deepEqual(await lockHolders(dbName), []);
+    }
+    // PGlite (superuser の 1 つの session) でも同じ: 役割が戻る形 (前提) / owner の状態の file にあれば流す前に止まる
+    const pgl = new PGlite();
+    try {
+      const db = pgliteAdapter(pgl);
+      const prole = 'cdb_owner_pgl_o13';
+      await db.exec(`create role ${prole} nologin`);
+      const transPgl = `-- migrate:owner-transition
+grant usage, create on schema app, ops to ${prole};
+alter table app.t owner to ${prole};
+alter table ops.schema_migrations owner to ${prole};
+create table ops.migrate_owner (singleton boolean primary key default true check (singleton), owner_role name not null, since timestamptz not null default now());
+insert into ops.migrate_owner (owner_role) values ('${prole}');
+alter table ops.migrate_owner owner to ${prole};
+alter schema app owner to ${prole};
+`;
+      const pbase = { '0001_base.sql': BASE, '0002_owner.sql': transPgl };
+      assert.deepEqual((await applyMigrations(db, { dir: mkDir(pbase), log: quiet })).applied, ['0001', '0002']);
+      const cu = async () => (await db.query('select current_user::text as cu')).rows[0].cu;
+      const su0 = await cu();
+      const pforms = SESSION_AUTH_FORMS(su0);
+      const reverted = [];
+      for (const x of pforms) {
+        await db.exec('begin');
+        try {
+          await db.exec(`set local role ${prole}`);
+          assert.equal(await cu(), prole);
+          await db.exec(x);
+          if ((await cu()) === su0) reverted.push(x);
+        } finally { await db.exec('rollback'); }
+      }
+      for (const x of pforms) assert.ok(reverted.includes(x), `(前提・PGlite) ${x} で役割が戻らない`);
+      for (const x of [...pforms, ...PG_SETTINGS_ROLE_FORMS(su0), sessAuthFn(su0, 'o13_fn'), `alter role ${su0} set session_authorization = '${su0}';`]) {
+        await assert.rejects(applyMigrations(db, { dir: mkDir({ ...pbase, '0003_evade.sql': `create table app.o13_before (x int);\n${x}\ncreate table app.o13_after (x int);\n` }), log: quiet }),
+          (e) => e.code === 'OWNER_MODE_INVALID' && /許さない役割の切り替え/.test(e.message), x);
+        assert.equal((await db.query(`select count(*)::int as n from pg_class where relname like 'o13\\_%'`)).rows[0].n, 0, `PGlite: ${x} を流した`);
+        assert.equal(await cu(), su0);
+      }
+    } finally { await pgl.close(); }
+  });
+
+  // 🆕 Codex R3 High 2: standard_conforming_strings = off の session では、字句 (lexSql) が「無い」と言う 2 つの形が本当に役割を戻す
+  const LEXER_BYPASS = ["SELECT set_config('r\\ole', 'none', true);", "SELECT 'a\\'b'; RESET ROLE; SELECT 'x\\'';"];
+  const O14_WHO = 'create table public.o14_who (f text, who text);\ngrant select, insert on public.o14_who to public;\n';
+  const o14Body = (x) => `insert into public.o14_who values ('before', current_user::text);\n${x}\ninsert into public.o14_who values ('after', current_user::text);\n`;
+  await t('O14 (Codex R3 High 2) 前の file (legacy) が SET standard_conforming_strings = off を session に残しても、次の owner の状態の file の set_config(\'r\\ole\', …)・\'a\\\'b\'; RESET ROLE; … は止まる (runner が本文の前に別のクエリで SET LOCAL standard_conforming_strings = on・2 つの file にまたがる本物の PG と PGlite) / file の中の字句の前提の GUC の変更は流す前に止まる / reset_val が off なら流さない / legacy は今までどおり', async () => {
+    for (const x of LEXER_BYPASS) assert.deepEqual(roleSwitchStatements(x), [], `(前提) 字句の検査は見つけない: ${x}`);
+    // (前提) 本物の PG: standard_conforming_strings = off の session では各形が役割を戻す
+    {
+      const dbName = await newDepDb();
+      const c = await openDep(dbName);
+      const role = await newOwnerRole();
+      await migrate(c, { dir: mkDir({ '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role) }) });
+      await c.query('set standard_conforming_strings = off');
+      for (const x of LEXER_BYPASS) {
+        await c.query('begin');
+        try {
+          await c.query(`set local role ${role}`);
+          await c.query(x);
+          assert.equal((await whoami(c)).cu, DEPLOYER, `(前提) scs = off で ${x} が役割を戻さない`);
+        } finally { await c.query('rollback'); }
+      }
+      await c.query('reset standard_conforming_strings');
+    }
+    // 2 つの file: 0002 (legacy) が session に off を残す → 0003 owner-transition → 0004 (owner の状態) の迂回 = 本文の前の SET LOCAL で on = 止まる (Postgres の誤りで巻き戻す)
+    for (const x of LEXER_BYPASS) {
+      const dbName = await newDepDb();
+      const c = await openDep(dbName);
+      const role = await newOwnerRole();
+      const logs = [];
+      const dir = mkDir({ '0001_base.sql': BASE + O14_WHO, '0002_off.sql': 'create table app.o14_legacy (x int);\nset standard_conforming_strings = off;\n', '0003_owner.sql': transitionSql(dbName, role), '0004_bypass.sql': o14Body(x) });
+      let err = null;
+      try { await migrate(c, { dir, log: (m) => logs.push(m) }); } catch (e) { err = e; }
+      assert.ok(err && err.code === 'MIGRATION_FAILED' && err.version === '0004', `${x}: 止まらない (${err ? `${err.code} ${err.message}` : '成功した'})`);
+      assert.deepEqual((await c.query('select f, who from public.o14_who')).rows, [], `${x}: 0004 の本文が残った`);
+      assert.deepEqual((await c.query(`select count(*)::int as n from pg_class where relname = 'o14_legacy'`)).rows[0].n, 1, 'legacy の 0002 は今までどおり流れる');
+      assert.equal((await c.query('show standard_conforming_strings')).rows[0].standard_conforming_strings, 'off', 'legacy の file が残した session の設定は runner が触らない (今までどおり)');
+      await c.query('reset standard_conforming_strings');
+      const dbSu = new URL(suUrl); dbSu.pathname = `/${dbName}`;
+      const s2 = await openPgClient(dbSu.toString()); s2.on('error', () => {}); clients.push(s2);
+      assert.deepEqual((await s2.query('select version from ops.schema_migrations order by 1')).rows.map((r) => r.version), ['0001', '0002', '0003']);
+      assert.deepEqual(await whoami(c), { cu: DEPLOYER, su: DEPLOYER });
+      assert.deepEqual(await lockHolders(dbName), []);
+    }
+    // file の中で字句の前提の GUC を変える形 = owner の状態では流す前に止まる (前提 = DO の本文は実行の時の設定で読まれる = 同じ file の後の DO の 'r\ole' が role になる)
+    {
+      const dbName = await newDepDb();
+      const c = await openDep(dbName);
+      const role = await newOwnerRole();
+      const base = { '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role) };
+      await migrate(c, { dir: mkDir(base) });
+      await c.query('begin');
+      try {
+        await c.query(`set local role ${role}`);
+        await c.query("set local standard_conforming_strings = off;\ndo $$ begin perform set_config('r\\ole', 'none', true); end $$;");
+        assert.equal((await whoami(c)).cu, DEPLOYER, '(前提) file の中の scs = off の後の DO の本文が役割を戻さない');
+      } finally { await c.query('rollback'); }
+      // (前提) UPDATE pg_settings で字句の前提の GUC を変えられる (rule で set_config)
+      await c.query('begin');
+      try {
+        await c.query(`set local role ${role}`);
+        await c.query("update pg_settings set setting = 'off' where name = 'standard_conforming_strings'");
+        assert.equal((await c.query('show standard_conforming_strings')).rows[0].standard_conforming_strings, 'off', '(前提) pg_settings で変わらない');
+      } finally { await c.query('rollback'); }
+      const forms = ['SET standard_conforming_strings = off;', "set local \"Standard_Conforming_Strings\" to 'off';", 'reset backslash_quote;', "select set_config('escape_string_warning', 'off', true);",
+        "set names 'SJIS';", "set local client_encoding = 'SJIS';", 'create function app.o14_f() returns int language sql set standard_conforming_strings = off as $f$ select 1 $f$;',
+        "do $$ begin set local standard_conforming_strings = off; end $$;\ndo $$ begin perform set_config('r\\ole', 'none', true); end $$;", `alter role ${DEPLOYER} set standard_conforming_strings = off;`,
+        `alter database ${dbName} set standard_conforming_strings = off;`, "update pg_settings set setting = 'off' where name = 'standard_conforming_strings';",
+        "UPDATE pg_catalog.\"pg_settings\" SET setting = 'SJIS' WHERE name = 'client_encoding';"];
+      for (const x of forms) {
+        await assert.rejects(migrate(c, { dir: mkDir({ ...base, '0003_lex.sql': `create table app.o14_before (x int);\n${x}\n` }) }), (e) => e.code === 'OWNER_MODE_INVALID' && /字句の前提の GUC/.test(e.message), x);
+        assert.equal((await c.query(`select count(*)::int as n from pg_class where relname = 'o14_before'`)).rows[0].n, 0, `${x} を流した`);
+      }
+      assert.equal((await su.query('select count(*)::int as n from pg_db_role_setting s join pg_roles r on r.oid = s.setrole where r.rolname = $1', [DEPLOYER])).rows[0].n, 0);
+      // reset_val が off (ALTER ROLE の既定) = 本文の RESET ALL で前提がずれる = 流さない (LEXER_PREMISE)。外せば流れる
+      await su.query(`alter role ${DEPLOYER} set standard_conforming_strings = off`);
+      try {
+        const c2 = await openDep(dbName);
+        assert.equal((await c2.query('show standard_conforming_strings')).rows[0].standard_conforming_strings, 'off');
+        let err = null;
+        try { await migrate(c2, { dir: mkDir({ ...base, '0003_ok.sql': 'create table app.o14_ok (x int);\n' }) }); } catch (e) { err = e; }
+        assert.ok(err && err.code === 'MIGRATION_FAILED' && err.reason === 'LEXER_PREMISE' && /reset_val = off/.test(err.message), `${err && err.code} ${err && err.reason} ${err && err.message}`);
+        assert.equal((await c2.query(`select count(*)::int as n from pg_class where relname = 'o14_ok'`)).rows[0].n, 0);
+        assert.deepEqual(await lockHolders(dbName), []);
+      } finally { await su.query(`alter role ${DEPLOYER} reset standard_conforming_strings`); }
+      const c3 = await openDep(dbName);
+      assert.deepEqual((await migrate(c3, { dir: mkDir({ ...base, '0003_ok.sql': 'create table app.o14_ok (x int);\n' }) })).applied, ['0003']);
+    }
+    // PGlite の道も同じ (1 つの session = 0002 の off が残る)
+    for (const x of LEXER_BYPASS) {
+      const pgl = new PGlite();
+      try {
+        const db = pgliteAdapter(pgl);
+        const prole = 'cdb_owner_pgl_o14';
+        await db.exec(`create role ${prole} nologin`);
+        const transPgl = `-- migrate:owner-transition
+grant usage, create on schema app, ops to ${prole};
+alter table app.t owner to ${prole};
+alter table ops.schema_migrations owner to ${prole};
+create table ops.migrate_owner (singleton boolean primary key default true check (singleton), owner_role name not null, since timestamptz not null default now());
+insert into ops.migrate_owner (owner_role) values ('${prole}');
+alter table ops.migrate_owner owner to ${prole};
+`;
+        const su0 = (await db.query('select current_user::text as cu')).rows[0].cu;
+        let err = null;
+        try {
+          await applyMigrations(db, { dir: mkDir({ '0001_base.sql': BASE + O14_WHO, '0002_off.sql': 'set standard_conforming_strings = off;\n', '0003_owner.sql': transPgl, '0004_bypass.sql': o14Body(x) }), log: quiet });
+        } catch (e) { err = e; }
+        assert.ok(err && err.code === 'MIGRATION_FAILED' && err.version === '0004', `PGlite: ${x}: 止まらない (${err ? err.message : '成功した'})`);
+        assert.deepEqual((await db.query('select f, who from public.o14_who')).rows, [], `PGlite: ${x}`);
+        assert.equal((await db.query('show standard_conforming_strings')).rows[0].standard_conforming_strings, 'off', 'PGlite: legacy の設定は今までどおり');
+        assert.equal((await db.query('select current_user::text as cu')).rows[0].cu, su0);
+      } finally { await pgl.close(); }
+    }
+  });
+
+  await t('C15 (Codex R3 High 2) concurrent-index の session も字句の前提 = 前の file が standard_conforming_strings = off を残しても、where の \'x\\\' を lexSql と同じ境目で流す (本物の PG = session の SET → 終わりに RESET・PGlite = SET LOCAL)', async () => {
+    const CI_BS = "-- migrate:concurrent-index\ncreate index concurrently if not exists t_bs_idx on app.t (a) where a <> 'x\\';\n";
+    const bsFile = { version: '0002', name: 'bs', file: '0002_bs.sql', text: CI_BS, concurrentIndex: true };
+    const dbE = await newDb();
+    const ce = await open(dbE);
+    await migrate(ce, { dir: mkDir({ '0001_base.sql': BASE }) });
+    await runStmts(ce, splitSqlStatements(CI_BS).map((s) => s.sql));
+    const expectBs = await buildIndexExpect(pgAdapter(ce), bsFile);
+    assert.match(expectBs.indexes['app.t_bs_idx'].predicate, /'x\\'/);
+    const dirBs = () => mkDir({ '0001_base.sql': BASE + 'set standard_conforming_strings = off;\n', '0002_bs.sql': CI_BS, '0002_bs.expect.json': JSON.stringify(expectBs) });
+    // (前提) off の session では同じ文は閉じていない文字列 = 流せない
+    const dbP = await newDb();
+    const cp = await open(dbP);
+    await migrate(cp, { dir: mkDir({ '0001_base.sql': BASE }) });
+    await cp.query('set standard_conforming_strings = off');
+    await assert.rejects(cp.query(splitSqlStatements(CI_BS)[0].sql), /unterminated|syntax/i, '(前提) off で流せてしまう');
+    // 本物の PG: 0001 (legacy) が off を残す → CIC の session で on → 作れて属性が一致・終わりに RESET (reset_val = on)
+    const dbName = await newDb();
+    const c = await open(dbName);
+    const r = await migrate(c, { dir: dirBs() });
+    assert.deepEqual(r.applied, ['0001', '0002']);
+    assert.equal((await readIndexAttrs(pgAdapter(c), 'app', 't_bs_idx')).valid, true);
+    assert.equal((await c.query('show standard_conforming_strings')).rows[0].standard_conforming_strings, 'on', 'CIC の session の設定を戻していない');
+    assert.equal((await c.query('show client_encoding')).rows[0].client_encoding, 'UTF8');
+    // PGlite の道 (取引の中で concurrently を外す) も同じ
+    const pgl = new PGlite();
+    try {
+      const db = pgliteAdapter(pgl);
+      assert.deepEqual((await applyMigrations(db, { dir: dirBs(), log: quiet })).applied, ['0001', '0002']);
+      assert.equal((await db.query('show standard_conforming_strings')).rows[0].standard_conforming_strings, 'off', 'PGlite: SET LOCAL が取引の外に残った');
+    } finally { await pgl.close(); }
   });
 
   await t('O9 (Codex R1 M1) --list も印と owner-transition の適用を両方向で確かめる: 印が消えた (接続の役割に記録表の SELECT が残る) → 一覧を出して exit 1 (OWNER_MODE_INVALID) / 印だけある → exit 1 / 整っていれば exit 0', async () => {

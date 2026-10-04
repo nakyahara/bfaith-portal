@@ -37,6 +37,11 @@
  *     🚨 owner の状態の migration は sandbox ではない (記録の直前の SET LOCAL ROLE が守るのは記録の行だけ)
  *   - 🆕 Codex R2 (PR #1606) High = Unicode の escape の名前・文字列 (U&"…"・U&'…'・UESCAPE 句) は owner の状態の file では一律に拒む
  *     (U&"role" で役割の検査を迂回できた・decode はしない = 下の unicodeEscapeLabel)。legacy の file は ⚠️ だけ (今までどおり流す)
+ *   - 🆕 Codex R3 (PR #1606) High 1 = 役割を変えられる GUC (ROLE_GUCS = role・session_authorization・PG 18 の guc_tables.c の棚卸し) を変える全部の形
+ *     (SET [LOCAL | SESSION] <GUC>・RESET <GUC>・set_config・関数の SET 句・ALTER ROLE / DATABASE … SET) を owner の状態の file で拒む /
+ *     High 2 = 字句の前提 (LEXER_PREMISE = standard_conforming_strings on・client_encoding UTF8) を owner の状態の file の本文の前に別のクエリで SET LOCAL し
+ *     (concurrent-index の session と PGlite の道も)、file の中で LEXER_GUCS を変える文 (同じ全部の形・SET NAMES・UPDATE pg_settings) を拒む。legacy の file には入れない (今までどおり)。
+ *     🚨 字句の検査は補助で sandbox ではない (動的 SQL の中は見ない) = 本当の守りは形 B (接続の役割が役割の管理に届かない・ROLE_ADMIN_REACHABLE)
  *
  * 使い方:
  *   COMPANY_DB_URL=postgres://... node scripts/company-db/migrate.mjs            # 未適用を全部
@@ -451,10 +456,41 @@ function warnUnicodeEscapeInLegacy(f, log = () => {}) {
 export const ALLOWED_SET_LOCAL_ROLES = Object.freeze(['cdb_owner', 'profit_definer', 'heavy_guard_definer', 'heavy_read_definer', 'd60_calib_definer', 'finance_revision_definer']);
 
 /**
+ * 🆕 Codex R3 High 1 (PR #1606): 役割 (権限の主体 = current_user・session_user) を変えられる GUC の集合 (正本はこの定数)。
+ * PostgreSQL 18 の guc_tables.c の棚卸し = assign の hook が SetCurrentRoleId / SetSessionAuthorization を呼ぶのは
+ *   role (assign_role) と session_authorization (assign_session_authorization) の 2 つだけ。
+ *   is_superuser は PGC_INTERNAL (SET できない・表示だけ)。createrole_self_grant は CREATEROLE の役割が作った役割の membership の既定 =
+ *   権限の主体は変えない (CREATEROLE は ROLE_ADMIN_REACHABLE が owner の状態で拒む・membership の変化は ROLE_GRAPH_CHANGED が見る)。
+ * owner の状態の file では、この集合の GUC を変える全部の形を拒む = SET [LOCAL | SESSION] <GUC> {TO | =} … / RESET <GUC> /
+ *   set_config('<GUC>', …) / 関数の SET 句 (CREATE / ALTER FUNCTION … SET <GUC> …) / ALTER ROLE | DATABASE | SYSTEM … SET | RESET <GUC> /
+ *   UPDATE pg_settings (rule で set_config を呼ぶ。role・session_authorization は GUC_NO_SHOW_ALL = pg_settings に出ない = UPDATE しても変わらないが、
+ *   LEXER_GUCS は変えられる = 参照ごと拒む)。例外 = SET LOCAL ROLE <ALLOWED_SET_LOCAL_ROLES> (専用の文法) だけ
+ */
+export const ROLE_GUCS = Object.freeze(['role', 'session_authorization']);
+/**
+ * 🆕 Codex R3 High 2 (PR #1606): 字句 (lexSql) と Postgres の文字列・引用の境目の前提を変える GUC。
+ *   standard_conforming_strings = off なら '…' の中の \ が escape になる ('a\'b' の境目がずれる・'r\ole' が role になる)。
+ *   backslash_quote・escape_string_warning は同じ系統 (\' の扱い・警告)。client_encoding (と同じ意味の SET NAMES) は送った bytes の読み方 =
+ *   SJIS などでは 2 byte 目の 0x5C (\) を文字に飲み込む = E'…' の境目がずれる。
+ * owner の状態の file では、この集合の GUC を変える全部の形を拒み (ROLE_GUCS と同じ形)、runner は本文の前に別のクエリで
+ *   LEXER_PREMISE を SET LOCAL する (前の file・動的 SQL が session に残した値に左右されない = lexSql の前提と一致させる)
+ */
+export const LEXER_GUCS = Object.freeze(['standard_conforming_strings', 'backslash_quote', 'escape_string_warning', 'client_encoding']);
+/** owner の状態の file で変えてはいけない GUC の全部 (ROLE_GUCS + LEXER_GUCS) */
+export const OWNER_MODE_FORBIDDEN_GUCS = Object.freeze([...ROLE_GUCS, ...LEXER_GUCS]);
+/** runner が owner の状態の file の本文の前 (と concurrent-index の session) に入れる字句の前提 (lexSql と同じ読み方) */
+export const LEXER_PREMISE = Object.freeze({ standard_conforming_strings: 'on', client_encoding: 'UTF8' });
+const gucKind = (g) => (ROLE_GUCS.includes(g) ? '役割の GUC' : '字句の前提の GUC');
+
+/**
  * 役割を切り替える文のうち、owner の状態の file で許さないもの (コメント・文字列の外を見る・🆕 ドルの引用の中も同じに見る = R-D60-v3-13 H1)。戻り = 理由の一覧 ([] = 無い)。
  * 拒む (設計 13 v3.11 ③) = RESET ROLE・SET ROLE (LOCAL の無い = session)・SET SESSION ROLE・SET [LOCAL] ROLE NONE・SET / RESET SESSION AUTHORIZATION・
  *   set_config('role', …)・DISCARD・SET LOCAL ROLE <一覧の外の役割>。許す = SET LOCAL ROLE <ALLOWED_SET_LOCAL_ROLES のどれか> だけ。
  * 🆕 Codex R2 High (PR #1606): Unicode の escape の名前・文字列 (U&"…"・U&'…'・UESCAPE 句) は中身を読まずに拒む (下の unicodeEscapeLabel)。
+ * 🆕 Codex R3 High 1・2 (PR #1606): ROLE_GUCS (role・session_authorization) と LEXER_GUCS (standard_conforming_strings ほか) を変える全部の形
+ *   (SET [LOCAL | SESSION] <GUC>・RESET <GUC>・set_config・関数の SET 句・ALTER ROLE / DATABASE / SYSTEM … SET | RESET・SET NAMES・pg_settings) も拒む。
+ *   引用の名前・大文字小文字・コメント・ドルの引用の中も同じ (下の lw と再帰)。RESET ALL は役割を戻さない (role・session_authorization は
+ *   GUC_NO_RESET_ALL) ので許すが、字句の前提の GUC は RESET ALL で reset_val に戻る = runner が reset_val も LEXER_PREMISE と同じかを確かめる (setLexerPremiseLocal)
  * 🚨 字句の検査は補助で、sandbox ではない = 守りの本体は「記録の INSERT の直前の SET LOCAL ROLE <印の役割>」(動的 SQL で役割を変えられても記録は印の役割)。
  *   migration の本文の副作用 (動的 SQL で役割を変えた後の DDL・membership の変更) は取り消さない = 役割の管理は migration に書かず、別の資格・別の session で流す (設計 13 v3.13)
  */
@@ -481,27 +517,45 @@ export function roleSwitchStatements(text, allowed = ALLOWED_SET_LOCAL_ROLES, de
     const ue = unicodeEscapeLabel(toks, i);   // 🆕 Codex R2 High: U&"…"・U&'…'・UESCAPE は名前を読まずに一律に拒む (ドルの引用の中も下の再帰で同じ)
     if (ue) hits.push(ue);
     const w0 = lw(toks[i]), w1 = lw(toks[i + 1]), w2 = lw(toks[i + 2]);
-    if (w0 === 'reset' && (w1 === 'role' || (w1 === 'session' && w2 === 'authorization'))) hits.push(`reset ${w1 === 'role' ? 'role' : 'session authorization'}`);
+    // RESET <GUC> (ALTER ROLE / DATABASE / FUNCTION / SYSTEM … RESET <GUC> も同じ字句)。🆕 Codex R3 High 1: RESET session_authorization (1 語の名前) も
+    if (w0 === 'reset') {
+      if (w1 === 'session' && w2 === 'authorization') hits.push('reset session authorization');
+      else if (OWNER_MODE_FORBIDDEN_GUCS.includes(w1)) hits.push(`reset ${w1} (${gucKind(w1)})`);
+    }
     if (w0 === 'discard' && ['all', 'plans', 'sequences', 'temp', 'temporary'].includes(w1)) hits.push(`discard ${w1}`);
     if (w0 === 'set_config' && isPunct(toks[i + 1], '(')) {
-      // 1 つ目の引数が「ただの文字列 1 つ」で role 以外のときだけ通す (U&'role'・'ro' || 'le'・E'\x72ole'・式・引用の名前は全部拒む向き)
+      // 1 つ目の引数が「ただの文字列 1 つ」で禁止の GUC (OWNER_MODE_FORBIDDEN_GUCS) 以外のときだけ通す (U&'role'・'ro' || 'le'・E'\x72ole'・式・引用の名前は全部拒む向き)
       const a = toks[i + 2];
       const plain = a && a.t === 'str' && a.v.startsWith("'") && isPunct(toks[i + 3], ',');
-      if (!plain || a.v.slice(1, -1).replace(/''/g, "'").trim().toLowerCase() === 'role') hits.push("set_config('role', …)");
+      const g = plain ? a.v.slice(1, -1).replace(/''/g, "'").trim().toLowerCase() : null;
+      if (!plain) hits.push("set_config(<ただの文字列でない名前>, …)");
+      else if (OWNER_MODE_FORBIDDEN_GUCS.includes(g)) hits.push(`set_config('${g}', …) (${gucKind(g)})`);
     }
+    // 🆕 Codex R3: UPDATE pg_settings は rule で set_config(name, setting, false) を呼ぶ = 名前を読まずに拒む (参照も)。role・session_authorization は
+    //   GUC_NO_SHOW_ALL で pg_settings に出ない (UPDATE しても変わらない) が、字句の前提の GUC (standard_conforming_strings・client_encoding ほか) は変えられる
+    if (w0 === 'pg_settings') hits.push('pg_settings (UPDATE で set_config と同じ・字句の前提の GUC を変えられる)');
     if (w0 === 'set') {
-      if (w1 === 'session' && w2 === 'authorization') { hits.push('set session authorization'); continue; }
-      if (w1 === 'role') { hits.push('set role (session)'); continue; }
-      if (w1 === 'session' && w2 === 'role') { hits.push('set session role'); continue; }
-      if (w1 === 'local' && w2 === 'role') {
-        const name = nameOf(toks[i + 3]);
-        const after = toks[i + 4];
-        if (name == null) hits.push('set local role (名前が読めない)');
-        else if (toks[i + 3].t === 'word' && name === 'none') hits.push('set local role none');
-        else if (!allowed.includes(name)) hits.push(`set local role ${name} (許す一覧の外)`);
-        else if (after && !isPunct(after, ';')) hits.push(`set local role ${name} の後ろに「${after.v}」`);
-      }
-      if (w1 === 'local' && w2 === 'session' && lw(toks[i + 3]) === 'authorization') hits.push('set local session authorization');
+      // SET [LOCAL | SESSION] <名前> … (ALTER ROLE / DATABASE / FUNCTION / SYSTEM … SET と関数の SET 句も同じ字句)。SET SESSION AUTHORIZATION の SESSION は範囲の語でない
+      let j = i + 1, scope = '';
+      const a = lw(toks[j]);
+      if ((a === 'local' || a === 'session') && !(a === 'session' && lw(toks[j + 1]) === 'authorization')) { scope = a; j++; }
+      const v = lw(toks[j]), v2 = lw(toks[j + 1]);
+      const sp = scope ? `${scope} ` : '';
+      if (v === 'session' && v2 === 'authorization') hits.push(`set ${sp}session authorization`);
+      else if (v === 'role') {
+        if (scope === 'session') hits.push('set session role');
+        else if (scope !== 'local') hits.push('set role (session)');
+        else {
+          // 許すのは SET LOCAL ROLE <一覧の役割> だけ (role TO x・role = x の generic の形も名前が to / = に見えて拒む向き)
+          const name = nameOf(toks[j + 1]);
+          const after = toks[j + 2];
+          if (name == null) hits.push('set local role (名前が読めない)');
+          else if (toks[j + 1].t === 'word' && name === 'none') hits.push('set local role none');
+          else if (!allowed.includes(name)) hits.push(`set local role ${name} (許す一覧の外)`);
+          else if (after && !isPunct(after, ';')) hits.push(`set local role ${name} の後ろに「${after.v}」`);
+        }
+      } else if (OWNER_MODE_FORBIDDEN_GUCS.includes(v)) hits.push(`set ${sp}${v} (${gucKind(v)})`);
+      else if (v === 'names') hits.push(`set ${sp}names (= client_encoding・字句の前提の GUC)`);
     }
   }
   // 🆕 Codex R-D60-v3-13 H1: ドルの引用の中 (DO の本文・関数の本文) も同じ検査で見る (`do $$ begin perform set_config('role', 'none', true); end $$` を通さない)。
@@ -537,7 +591,7 @@ export function ownerModeUncheckedNotes(text) {
 function rejectRoleSwitchInOwnerMode(f, log = () => {}) {
   let hits;
   try { hits = roleSwitchStatements(f.text); } catch (e) { throw Object.assign(new Error(`${f.file}: owner の状態の file を字句に読めない (${e.message}) = 役割を切り替える文が無いと言えないので流さない`), { code: 'OWNER_MODE_INVALID', version: f.version }); }
-  if (hits.length) throw Object.assign(new Error(`${f.file}: owner の状態の file に許さない役割の切り替えがある (${[...new Set(hits)].join('・')}) = 流さない (許すのは SET LOCAL ROLE ${ALLOWED_SET_LOCAL_ROLES.join(' / ')} だけ)`), { code: 'OWNER_MODE_INVALID', version: f.version });
+  if (hits.length) throw Object.assign(new Error(`${f.file}: owner の状態の file に許さない役割の切り替え・字句の前提の変更がある (${[...new Set(hits)].join('・')}) = 流さない (許すのは SET LOCAL ROLE ${ALLOWED_SET_LOCAL_ROLES.join(' / ')} だけ・GUC ${OWNER_MODE_FORBIDDEN_GUCS.join(' / ')} は変えない)`), { code: 'OWNER_MODE_INVALID', version: f.version });
   const notes = ownerModeUncheckedNotes(f.text);
   if (notes.length) log(`⚠️ ${f.file}: owner の状態の file に字句の検査が中まで見られない形がある (${notes.join('・')}) = 役割の切り替えの字句の検査は補助で sandbox ではない (動的 SQL の中は見ない・記録は印の役割で入る)。役割の管理は migration に書かない`);
 }
@@ -856,8 +910,33 @@ export function migrateWithLock(db, opts = {}) {
   return withMigrateLock(db, () => applyMigrations(db, opts), { log: opts.lockLog || (() => {}) });
 }
 
+// ─── 字句の前提 (Codex R3 High 2) ───
+/**
+ * 🆕 Codex R3 High 2 (PR #1606): owner の状態の file の本文の前に、別のクエリで LEXER_PREMISE を SET LOCAL する
+ * (simple query は送った文字列の全部を受け取った時の設定で字句に分ける = 本文と同じクエリに入れても効かない・前のクエリで入れる)。
+ * 前の file (legacy の SET standard_conforming_strings = off・動的 SQL) が session に残した値に左右されない。
+ * さらに reset_val も同じかを確かめる (本文の RESET ALL は字句の前提の GUC を reset_val に戻す = ALTER ROLE / DATABASE の既定が off なら
+ * 本文の途中から前提がずれる = 流さない)。legacy (印が無い・今の本番) の file には入れない (今までどおり)
+ */
+async function setLexerPremiseLocal(db) {
+  await db.exec(`set local standard_conforming_strings = ${LEXER_PREMISE.standard_conforming_strings}`);
+  await db.exec(`set local client_encoding = '${LEXER_PREMISE.client_encoding}'`);
+  const { rows } = await db.query(`select name::text as name, setting::text as setting, reset_val::text as reset_val from pg_catalog.pg_settings where name = any($1::text[])`, [Object.keys(LEXER_PREMISE)]);
+  const bad = [];
+  for (const [k, want] of Object.entries(LEXER_PREMISE)) {
+    const r = rows.find((x) => x.name === k);
+    if (!r) { bad.push(`${k} が読めない`); continue; }
+    if (String(r.setting).toLowerCase() !== want.toLowerCase()) bad.push(`${k} = ${r.setting}`);
+    if (String(r.reset_val).toLowerCase() !== want.toLowerCase()) bad.push(`${k} の reset_val = ${r.reset_val} (RESET ALL で前提がずれる・ALTER ROLE / DATABASE の既定を見る)`);
+  }
+  if (bad.length) throw Object.assign(ownerErr(`LEXER_PREMISE: 字句の前提 (${Object.entries(LEXER_PREMISE).map(([k, v]) => `${k} = ${v}`).join('・')}) にできない: ${bad.join('・')} = 流さない`), { reason: 'LEXER_PREMISE' });
+}
+
 // ─── concurrent-index のファイルを流す ───
 async function setSession(db, s, log) {
+  // 🆕 Codex R3 High 2: 字句の前提を先に (concurrent-index の文も lexSql で読んだ境目のまま流す)。finally の resetSession で戻す
+  await db.exec(`set standard_conforming_strings = ${LEXER_PREMISE.standard_conforming_strings}`);
+  await db.exec(`set client_encoding = '${LEXER_PREMISE.client_encoding}'`);
   await db.exec(`set lock_timeout = '${s.lockTimeout}'`);
   await db.exec(`set statement_timeout = '${s.statementTimeout}'`);
   try {
@@ -871,7 +950,7 @@ async function setSession(db, s, log) {
 /** session の設定を全部戻す (1 つが落ちても残りを試す)。戻り = 戻せなかった設定の名前 ([] = 全部戻した)。🆕 設計 13 v3.13 ⑩: 戻せなければ呼び手は接続を捨てる */
 async function resetSession(db) {
   const bad = [];
-  for (const k of ['role', 'lock_timeout', 'statement_timeout', 'client_connection_check_interval']) { try { await db.exec(`reset ${k}`); } catch { bad.push(k); } }
+  for (const k of ['role', 'lock_timeout', 'statement_timeout', 'client_connection_check_interval', 'standard_conforming_strings', 'client_encoding']) { try { await db.exec(`reset ${k}`); } catch { bad.push(k); } }
   return bad;
 }
 const SETTING_RE = /^\d+(ms|s|min|h)?$/;
@@ -987,6 +1066,7 @@ async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTim
   try {
     if (mode.mode === 'owner') await db.exec(`set local role ${mode.role}`);
     await db.exec(`set local lock_timeout = '${lockTimeout}'; set local statement_timeout = '${statementTimeout}';`);
+    await setLexerPremiseLocal(db);   // 🆕 Codex R3 High 2: PGlite の道も同じ前提 (concurrent-index の file は新しい形 = legacy の互換は関係ない)
     for (const st of plan.statements) {
       if (st.kind === 'create') {
         const cur = await readIndexAttrs(db, st.schema, st.name, { inTx: true });
@@ -1185,6 +1265,8 @@ export async function applyMigrations(db, opts = {}) {
     try {
       if (mode.mode === 'owner') await db.exec(`set local role ${mode.role}`);   // 取引の終わり (commit / rollback) で戻る = 例外に左右されない
       await db.exec(`set local lock_timeout = '${lockTimeout}'; set local statement_timeout = '${statementTimeout}';`);
+      // 🆕 Codex R3 High 2: owner の状態の file = 本文の前に別のクエリで字句の前提 (standard_conforming_strings = on・client_encoding = UTF8) を入れる。legacy は今までどおり
+      if (mode.mode === 'owner') await setLexerPremiseLocal(db);
       // 🆕 設計 13 v3.13 ③ / v3.14 ①: owner の状態のふつうの file と owner-transition の file = 本文の前の役割の図 (役割を作る・membership を変えるのは migration の外)
       const graph0 = mode.mode === 'owner' || f.ownerTransition ? await roleGraphHash(db) : null;
       await db.exec(f.text);
