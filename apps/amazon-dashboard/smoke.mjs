@@ -46,10 +46,10 @@ const tx = db.transaction(() => {
     const date = d(i);
     // alpha: 10個/日 単価1000 手数料150 FBA100 保管10 プロモ20 damage 5 refund 30 原価300
     const profitA = 10000 - 1500 - 1000 - 100 - 200 + 50 - 300 - 3000;
-    insFin.run(date, 'pr_alpha', 'B0ALPHA', 'アルファ商品', 10, 10, 10000, 1500, 1000, 100, 200, 50, 300, 300, date, 310, 3000, profitA);
+    insFin.run(date, 'pr_alpha', 'B0ALPHA001', 'アルファ商品', 10, 10, 10000, 1500, 1000, 100, 200, 50, 300, 300, date, 310, 3000, profitA);
     // beta: 5個/日 単価800
     const profitB = 4000 - 600 - 500 - 50 - 80 + 0 - 100 - 1200;
-    insFin.run(date, 'pr_beta', 'B0BETA', 'ベータ商品', 5, 5, 4000, 600, 500, 50, 80, 0, 100, 240, date, 240, 1200, profitB);
+    insFin.run(date, 'pr_beta', 'B0BETA0001', 'ベータ商品', 5, 5, 4000, 600, 500, 50, 80, 0, 100, 240, date, 240, 1200, profitB);
   }
 
   const insFlash = db.prepare(`INSERT INTO mirror_f_sales_by_listing (
@@ -74,19 +74,19 @@ const tx = db.transaction(() => {
   for (let i = 0; i < 90; i++) {
     const date = d(i);
     insAdsSku.run(date, 'C1', 'pr_alpha', 'sku', 20, 2000, 500, 3000, 3);
-    insAdsSku.run(date, 'C2', 'b0beta', 'asin', 30, 3000, 1500, 1600, 2);  // beta は ASIN 粒度 + 広告費過大
+    insAdsSku.run(date, 'C2', 'b0beta0001', 'asin', 30, 3000, 1500, 1600, 2);  // beta は ASIN 粒度 + 広告費過大
     insAdsCamp.run(date, 'C1', 'アルファSP', 20, 2000, 500, 100, 200, 3000, 3100, 3);
     insAdsCamp.run(date, 'C2', 'ベータSP', 30, 3000, 1500, 50, 100, 1600, 1700, 2);
     insAdsCamp.run(date, 'C3', 'オート全商品', 10, 5000, 300, 0, 0, 0, 0, 0);  // 未配賦分
   }
 
   db.prepare(`INSERT INTO mirror_amazon_sku_fees (seller_sku, asin, fulfillment_channel, referral_fee, referral_fee_rate, fba_fee, variable_closing_fee, per_item_fee, total_fee, price_used, fetched_at)
-    VALUES ('pr_alpha', 'B0ALPHA', 'AMAZON_JP', 150, 0.15, 250, 0, 0, 400, 1100, 't')`).run();
+    VALUES ('pr_alpha', 'B0ALPHA001', 'AMAZON_JP', 150, 0.15, 250, 0, 0, 400, 1100, 't')`).run();
   db.prepare(`INSERT INTO mirror_amazon_sku_fees (seller_sku, asin, fulfillment_channel, referral_fee, referral_fee_rate, fba_fee, variable_closing_fee, per_item_fee, total_fee, price_used, fetched_at)
-    VALUES ('pr_beta', 'B0BETA', 'AMAZON_JP', 120, 0.15, 200, 0, 0, 320, 880, 't')`).run();
+    VALUES ('pr_beta', 'B0BETA0001', 'AMAZON_JP', 120, 0.15, 200, 0, 0, 320, 880, 't')`).run();
 
   // pr_gamma: settlement fact の商品名が空 (フォールバック解決のテスト用)
-  insFin.run(d(3), 'pr_gamma', 'B0GAMMA', '', 2, 2, 1600, 240, 200, 20, 30, 0, 40, 100, d(3), 100, 200, 770);
+  insFin.run(d(3), 'pr_gamma', 'B0GAMMA001', '', 2, 2, 1600, 240, 200, 20, 30, 0, 40, 100, d(3), 100, 200, 770);
 
   const insRes = db.prepare(`INSERT INTO mirror_sku_resolved (seller_sku, ne_code, quantity, source, 商品名, source_updated_at, synced_at) VALUES (?, ?, ?, 'master', ?, 't', 't')`);
   insRes.run('pr_alpha', 'NE-A', 1, 'アルファ商品');
@@ -111,9 +111,9 @@ const tx = db.transaction(() => {
 
   // カート価格スナップショット: alpha=自分が5%以上高い+カート他社 / beta=カート自社保有
   const insSnap = db.prepare("INSERT INTO mirror_amazon_price_snapshot_daily (date_jst, seller_sku, asin, channel, my_price, buybox_price, buybox_is_mine, fetched_at, source_run_id, source_row_hash, synced_at) VALUES (?, ?, ?, 'FBA', ?, ?, ?, 't', 'smoke', 'h', 't')");
-  insSnap.run(today, 'pr_alpha', 'B0ALPHA', 1200, 1000, 0);
-  insSnap.run(today, 'pr_beta', 'B0BETA', 880, 880, 1);
-  insSnap.run(today, 'pr_gamma', 'B0GAMMA', 900, 700, null);  // 保有者不明 → 非検出であるべき
+  insSnap.run(today, 'pr_alpha', 'B0ALPHA001', 1200, 1000, 0);
+  insSnap.run(today, 'pr_beta', 'B0BETA0001', 880, 880, 1);
+  insSnap.run(today, 'pr_gamma', 'B0GAMMA001', 900, 700, null);  // 保有者不明 → 非検出であるべき
 
   // アカウント単位フィー (当月+前月、負=費用)
   const insFee = db.prepare("INSERT INTO mirror_amazon_account_fees_monthly (date_jst, fee_type, amount_jpy, row_count, source_run_id, source_row_hash, synced_at) VALUES (?, ?, ?, 1, 'smoke', 'h', 't')");
@@ -168,11 +168,11 @@ check('getWaterfall 全体', () => {
   {
     // Easy Ship の割り振りだけの行 (翌日・売上なし) は決済の最後の日を動かさない (2026-09-28 Codex #1520 R2)
     const before = q.lastSettledDate(db);
-    db.prepare(`INSERT INTO mirror_amazon_finance_sku_daily (date_jst, seller_sku, asin_norm, product_name, easy_ship_jpy, cost_status, source_run_id, source_row_hash, synced_at) VALUES (?, 'pr_alpha', 'B0ALPHA', '', 500, 'missing_cost', 'smoke', 'h', 't')`).run(q.addDays(today, 1));
+    db.prepare(`INSERT INTO mirror_amazon_finance_sku_daily (date_jst, seller_sku, asin_norm, product_name, easy_ship_jpy, cost_status, source_run_id, source_row_hash, synced_at) VALUES (?, 'pr_alpha', 'B0ALPHA001', '', 500, 'missing_cost', 'smoke', 'h', 't')`).run(q.addDays(today, 1));
     const after = q.lastSettledDate(db);
     db.prepare(`DELETE FROM mirror_amazon_finance_sku_daily WHERE date_jst = ?`).run(q.addDays(today, 1));
     assert(before === after, 'Easy Ship だけの行で決済の最後の日が動かない (' + before + ' / ' + after + ')');
-    db.prepare(`INSERT INTO mirror_amazon_finance_sku_daily (date_jst, seller_sku, asin_norm, product_name, easy_ship_jpy, cost_status, source_run_id, source_row_hash, synced_at) VALUES (?, 'pr_alpha', 'B0ALPHA', '', 0, 'missing_cost', 'smoke', 'h', 't')`).run(q.addDays(today, 2));
+    db.prepare(`INSERT INTO mirror_amazon_finance_sku_daily (date_jst, seller_sku, asin_norm, product_name, easy_ship_jpy, cost_status, source_run_id, source_row_hash, synced_at) VALUES (?, 'pr_alpha', 'B0ALPHA001', '', 0, 'missing_cost', 'smoke', 'h', 't')`).run(q.addDays(today, 2));
     const after0 = q.lastSettledDate(db);
     db.prepare(`DELETE FROM mirror_amazon_finance_sku_daily WHERE date_jst = ?`).run(q.addDays(today, 2));
     assert(before === after0, '料金と返金が打ち消し合った 0 円の割り振りだけの行でも動かない (' + before + ' / ' + after0 + ')');
