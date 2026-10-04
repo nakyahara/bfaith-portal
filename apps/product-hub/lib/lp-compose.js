@@ -403,7 +403,7 @@ export function requestPrecheck(db, { draft, productInfo, spec, images, idempote
     return { code: 'already_running', error: 'この商品の構成をいま作っています' };
   }
   if (db.prepare(`SELECT 1 FROM ph_lp_compose_jobs j JOIN ph_lp_compose_generations g ON g.job_id = j.id
-    WHERE j.draft_id = ? AND (j.status = 'done' OR (j.status = 'failed' AND j.error_code = 'rejected')) AND g.model_check IS NULL LIMIT 1`).get(draftId)) {
+    WHERE j.draft_id = ? AND (j.status = 'done' OR (j.status = 'failed' AND j.error_code = 'rejected' AND j.output_text IS NOT NULL)) AND g.model_check IS NULL LIMIT 1`).get(draftId)) {
     return { code: 'already_running', error: 'この商品の構成を作ったモデルをいま確かめています' };
   }
   return null;
@@ -452,7 +452,7 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
     //    確認は 15 分で必ず閉じる (recoverExpired) ので、ずっと押せなくなることはない
     const checking = db.prepare(`SELECT j.* FROM ph_lp_compose_jobs j
       JOIN ph_lp_compose_generations g ON g.job_id = j.id
-      WHERE j.draft_id = ? AND (j.status = 'done' OR (j.status = 'failed' AND j.error_code = 'rejected')) AND g.model_check IS NULL LIMIT 1`).get(draftId);
+      WHERE j.draft_id = ? AND (j.status = 'done' OR (j.status = 'failed' AND j.error_code = 'rejected' AND j.output_text IS NOT NULL)) AND g.model_check IS NULL LIMIT 1`).get(draftId);
     if (checking) return { code: 'already_running', error: 'この商品の構成を作ったモデルをいま確かめています', job: checking };
     let id;
     try {
@@ -1229,6 +1229,8 @@ export function jobStateFor(db, draftId, { now = Date.now() } = {}) {
       // チェック (lint / Codex 検品) を通らなかった構成 (参考)。人が見て使えるか決める (中原さん「A」)。
       // 本文と同じく、実モデルが一致したものだけ出す
       draft_text: job.status === 'failed' && job.error_code === 'rejected' && gen?.model_check === 'match' ? (job.output_text || null) : null,
+      // 下書きが残っている rejected か (確認が付くまで待つのはこれだけ。下書きが無ければすぐ押し直せる・codex #1609 R3 Medium)
+      has_draft: job.status === 'failed' && job.error_code === 'rejected' && !!job.output_text,
       packet_hash: job.packet_hash,
       // この依頼で AI に渡した画像の並び (受付時に固定)。スタッフ版に同じ画像を同じ順で添付し、測定行にも残す
       images: (() => { try { return imagePlan(JSON.parse(job.packet_json).images); } catch { return []; } })(),

@@ -275,6 +275,7 @@ console.log('⑦b 🚨 チェックを通らなかった構成も残す (2026-10
   eq(db.prepare('SELECT output_text FROM ph_lp_compose_jobs WHERE id = ?').get(cR.job.job_id).output_text, DRAFT, '🚨 書いた構成を残す');
   const pre = lp.jobStateFor(db, dR.id, { now: min(5013.1) }).job;
   ok(pre.draft_text === null && pre.output_text === null, '実モデルの確認前は出さない');
+  eq(pre.has_draft, true, '下書きが残っていることは画面に渡る (確認が付くまで待つ)');
   eq(lp.requestJob(db, args(dR, s2.spec, 'key-rej-1b', { now: min(5013.15) })).code, 'already_running',
     '🚨 確認前の rejected がある間は再依頼を受けない (参考の構成が画面から消えないように・codex #1609 High)');
   eq(lp.requestPrecheck(db, { draft: dR, productInfo: 'x', spec: s2.spec, images: [{ file_id: 'FILEID000001', role: 'slot:1' }], idempotencyKey: 'key-rej-1c', now: min(5013.15) }).code,
@@ -303,6 +304,10 @@ console.log('⑦b 🚨 チェックを通らなかった構成も残す (2026-10
   const sR3 = lp.submitResult(db, gR3.generation_id, { packetHash: cR3.job.packet_hash, verdict: 'rejected', output: DRAFT, reason: 'r', now: min(5018) });
   ok(sR3.ok && sR3.status === 'failed', 'rejected の判定は受け取る');
   eq(db.prepare('SELECT output_text FROM ph_lp_compose_jobs WHERE id = ?').get(cR3.job.job_id).output_text, null, '🚨 画像を見ていない下書きは残さない');
+  eq(lp.jobStateFor(db, dR3.id, { now: min(5018.1) }).job.has_draft, false, '下書きが無いことが画面に渡る (待たない)');
+  const rR3b = lp.requestJob(db, args(dR3, s2.spec, 'key-rej-3b', { now: min(5018.2) }));
+  ok(rR3b.ok, '🚨 下書きの無い rejected は確認を待たずに押し直せる (codex #1609 R3 Medium)');
+  if (rR3b.ok) db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?`).run(rR3b.job.id);   // 後の claim が拾わないように
 }
 
 // 🚨 packet の画像を**全部**見ていなければ accepted は出せない (codex exec review P1)。

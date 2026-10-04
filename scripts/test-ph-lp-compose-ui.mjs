@@ -413,6 +413,8 @@ console.log('⑦b チェックを通らなかった構成も画面に出す (202
   eq([post6x.status, (await post6x.json()).code], [409, 'already_running'], '🚨 確認待ちの間は再依頼を受けない (先の参考の構成が画面から消えないように)');
   lp.recordModelCheck(db, { runnerRunId: 'lpr-ui-rej-6', actualModels: ['claude-opus-5-5'] });
   ok(checkingModel(embedded((await getDetail(d6)).html).job) === false, '確認が付いたら待ちを終える (ポーリングを止める)');
+  ok(checkingModel({ model: 'm', model_check: null, status: 'failed', error_code: 'rejected', has_draft: false }) === false,
+    '🚨 下書きの無い rejected は待たない (すぐ押し直せる・codex #1609 R3 Medium)');
   const { html: h6 } = await getDetail(d6);
   const s6r = embedded(h6);
   ok(s6r.job.status === 'failed' && s6r.job.draft_text === DRAFT6, '🚨 チェックを通らなかった構成が画面に渡る');
