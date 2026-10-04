@@ -25,7 +25,11 @@
  *     門のログインの接続は 古い 1 本 + 新しい 1 本 = 2 本まで。古いプロセスの最後の記録は stopped (Codex #1565 R2 Medium 3)
  *  17 場所ごとの門のログインが無く COMPANY_DB_URL だけ = 段階は読める (古い入口は動く) が、門の記録は書けず readiness が落ちる (Codex #1565 R4 Low の 3 つの場合の 2)
  *  18 ⑤-3b: 門のログイン (master_gate_minipc) で列ごとの持ち主 (0055 の ops.master_ownership_state) も読める (ロールの作りが権限を付ける)。
- *     frozen で行が無い = 全部 load = 列の入口は開く / active・prepared の C の列の入口だけ閉じる / 権限を外す = 読めない = 全部閉じる (CLI も)
+ *     frozen で行が無い = 全部 load = 列の入口は開く / active・prepared の C の列の入口だけ閉じる / 権限を外す = 読めない = 全部閉じる (CLI も)・
+ *     配る前の確かめ (readiness) も落ちる (Codex #1610 R1 Medium)
+ *  19 ⑤-3b Codex #1610 R1 High: 門を通った古い書き込みが prepare をまたぐ (2 つの接続) = prepare は待たない・--use-prepared のロードだけでは
+ *     その値が Company DB に入らない (C の列は既にある行を上書きしない)。手順の「prepare → frozen → 書きかけ 0 → 全部 load の最後のロード →
+ *     --use-prepared」なら、最後のロードで回収できて、その後の --use-prepared のロードでも残る
  * ロールは ⑤-1 の本物の作り (scripts/company-db/create-master-edit-roles.mjs) だけで作る (試験で足さない)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-legacy-gate-pg.mjs
  *   (cd C:/tmp/pg-embed && node run-conc.mjs scripts/test-master-legacy-gate-pg.mjs C:/tmp/sor53-work)
@@ -422,14 +426,82 @@ try {
       const r3 = await quiet(() => G.runWithLegacyCliLock('cli:import-sku-master.js', async () => 'wrote', { log: () => {} }));
       assert.equal(r3.ran, false);
       process.exitCode = savedCode;
+      // 配る前の確かめ (readiness) = legacy_open でも、門のログインで持ち主を読めないことを先に見つける (Codex #1610 R1 Medium)
+      const { checkReadiness } = await import('./company-db/master-legacy-readiness.mjs');
+      let rd = await checkReadiness({ host: 'minipc', env });
+      assert.equal(rd.ok, false, rd.lines.join('\n'));
+      assert.ok(rd.problems.some((x) => /ops\.master_ownership_state の SELECT が無い/.test(x)), rd.lines.join('\n'));
       // legacy_open = 持ち主を読まない = 権限が無くても開く (切替の前の動きは変わらない)
       await setPhase('legacy_open');
       assert.equal((await G.checkLegacyGate({ entry: 'warehouse:POST:/api/shipping' })).writable, true);
       // ロールの作りを流し直せば付く (流し直しでパスワードは変えない)
       await createMasterEditRoles(M);
+      rd = await (await import('./company-db/master-legacy-readiness.mjs')).checkReadiness({ host: 'minipc', env });
+      assert.equal(rd.ok, true, rd.lines.join('\n'));
+      assert.ok(rd.lines.some((l) => l.includes('列ごとの持ち主を読める')), rd.lines.join('\n'));
       await setPhase('frozen');
       assert.equal((await G.checkLegacyGate({ entry: 'warehouse:POST:/api/m-sku-master' })).owner.readable, true);
     } finally {
+      await setAllC();
+      await setPhase('legacy_open');
+      await G.closeLegacyGatePool();
+      if (saved === undefined) delete process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL; else process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = saved;
+    }
+  });
+  await ta('[19] ⑤-3b Codex #1610 R1 High: 門を通った古い書き込みが prepare をまたぐ = --use-prepared だけでは消える・prepare → frozen → 書きかけ 0 → 全部 load の最後のロードで回収できる', async () => {
+    const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
+    const OS = await import('../apps/company-db/load/ownership-state.mjs');
+    const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
+    const saved = process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL;
+    process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = gateUrl('minipc');
+    G.__setLegacyPhaseReader(null);
+    await G.closeLegacyGatePool();
+    // 夜間ロードの材料 (SQLite の写し) の代わり。古い入口 (例外原価の取込 = sku_costs) が書き換える
+    const plan = {
+      skus: [{ code: 'x19a', name: '交差の試験', kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: 3, cost: { jpy: 100, source: 'ne', status: 'COMPLETE' } }],
+      variationGroups: [], setComponents: [], listings: [], observations: [], physicals: [], compliance: [], workers: [], suppliers: [], supplierSkus: [],
+    };
+    const cost = async () => Number((await M.query(`select c.cost_jpy from core.sku_costs c join core.skus s on s.sku_id = c.sku_id where s.code = 'x19a' and c.valid_to is null order by c.valid_from desc limit 1`)).rows[0]?.cost_jpy);
+    const load = async (runId, usePrepared = false) => { const r = await runInitialLoad(db, plan, { log: () => {}, runId, usePrepared }); assert.equal(r.ok, true, r.error); return r; };
+    try {
+      await M.query('delete from ops.master_ownership_state');
+      await setPhase('legacy_open');
+      await load('l19_0');
+      assert.equal(await cost(), 100);
+      // (1) 古い入口 (CLI・自分の接続で段階の共有の鍵を持つ) が門を通って、書いている途中
+      let release, entered = false;
+      const hold = new Promise((r) => { release = r; });
+      const cli = G.runWithLegacyCliLock('cli:csv-import.js:exception_genka', async () => {
+        entered = true; await hold;
+        plan.skus[0].cost = { jpy: 150, source: 'ne', status: 'COMPLETE' };   // = SQLite の例外原価に書いた
+        return 'wrote';
+      }, { log: () => {} });
+      for (let i = 0; i < 100 && !entered; i++) await sleep(20);
+      assert.equal(entered, true, '古い書き込みが門を通った');
+      // (2) 別の接続で prepare = 待たない (epoch の鍵と段階の鍵は別 = 古い書き込みは prepare をまたげる)
+      const t0 = Date.now();
+      await OS.prepareOwnership(db, { map: MASTER_OWNERSHIP, actor: 'test' });
+      assert.ok(Date.now() - t0 < 3000, `prepare が待った ${Date.now() - t0}ms`);
+      // legacy_open の間は prepared があっても入口は開いている → frozen にした瞬間に 13 キーの入口だけ閉じる
+      assert.equal((await G.checkLegacyGate({ entry: 'cli:csv-import.js:exception_genka' })).writable, true, 'legacy_open = 開く');
+      await setPhase('frozen');
+      assert.equal((await G.checkLegacyGate({ entry: 'cli:csv-import.js:exception_genka' })).writable, false, 'frozen + prepared の C = 閉じる');
+      assert.equal((await G.checkLegacyGate({ entry: 'cli:import-sku-master.js' })).writable, true, 'Amazon SKU は開いたまま');
+      // (3) 古い書き込みが書き終わる (= 書きかけ 0。でも値は prepare の後に入った)
+      release();
+      assert.deepEqual(await cli, { ran: true, result: 'wrote' });
+      // (4) 危ない道: --use-prepared のロードだけ = C の列は既にある行を上書きしない = 150 が Company DB に入らない (消える)
+      await load('l19_p1', true);
+      assert.equal(await cost(), 100, '--use-prepared だけでは prepare をまたいだ古い書き込みが入らない (Codex High の再現)');
+      // (5) 手順: 書きかけ 0 の後に active (全部 load) の最後のロード = 回収する
+      await load('l19_final');
+      assert.equal(await cost(), 150, '全部 load の最後のロードで回収');
+      // (6) その後の --use-prepared のロード = 回収した値を守る (材料が別の値に戻っても上書きしない)
+      plan.skus[0].cost = { jpy: 999, source: 'ne', status: 'COMPLETE' };
+      await load('l19_p2', true);
+      assert.equal(await cost(), 150, 'C の列は回収した値のまま');
+    } finally {
+      try { await OS.cancelPrepared(db, { actor: 'test' }); } catch { /* */ }
       await setAllC();
       await setPhase('legacy_open');
       await G.closeLegacyGatePool();

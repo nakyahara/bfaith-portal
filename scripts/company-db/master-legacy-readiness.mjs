@@ -7,6 +7,8 @@
  *   1. env: 段階を読む接続先 (COMPANY_DB_MASTER_GATE_RENDER_URL / _MINIPC_URL → COMPANY_DB_URL。見張りの watcher は使わない) と、この場所の門のログイン
  *   2. 段階を読める = 0051 が本適用済み・select の権限がある (読めないと古い入口は全部 503)
  *   3. 門のログイン: ログインの役が master_gate_<場所>・記録の関数 (ops.record_legacy_gate_ack) の実行権がある・一覧 (manifest) を DB が受け取れる形
+ *      🆕 ⑤-3b (Codex #1610 R1 Medium): 列ごとの持ち主の表 (0055 の ops.master_ownership_state) がある・このログインに SELECT がある・
+ *      門と同じ読み方 (readGateOwnership) で読める。legacy_open の間は門は持ち主を読まない = ここで先に確かめないと、frozen にした瞬間に全部 503 になる
  *   4. build の番号が分かる (Render = RENDER_GIT_COMMIT・miniPC = git の HEAD)
  *   5. (見るだけ) 黙っているプロセス (今までに記録を書いて、15 分以内の記録も「止めた」も無い = 何日前でも) の数。⑤-1 はこれがあると段階を進めない
  * 使い方:
@@ -20,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from './migrate.mjs';
 import { readCutoverPhase } from '../../lib/master-cutover.mjs';
 import { phaseUrlFrom, gateUrlFor, GATE_URL_ENV, legacyManifest, resolveBuildId, ACK_FUNCTION_SIGNATURE } from '../../lib/master-legacy-gate.mjs';
+import { readGateOwnership } from '../../apps/company-db/load/ownership-state.mjs';
 
 export async function checkReadiness({ host, env = process.env, open = (url) => openPgClient(url, { application_name: 'master-legacy-readiness', connectionTimeoutMillis: 5000, statement_timeout: 5000 }) } = {}) {
   const lines = [];
@@ -57,6 +60,18 @@ export async function checkReadiness({ host, env = process.env, open = (url) => 
         const h = (await c.query('select ops.legacy_manifest_hash($1::jsonb) as h', [JSON.stringify(legacyManifest())])).rows[0].h;
         ok(`古い入口の一覧を DB が受け取れる形 (manifest_hash = ${h})`);
       } catch (e) { ng(`古い入口の一覧の形が DB に合わない: ${String(e && e.message).slice(0, 200)}`); }
+      // ⑤-3b: 列ごとの持ち主 (段階が legacy_open 以外のとき門が読む)。表・SELECT の権限・門と同じ読み方の 3 つ
+      const tbl = (await c.query("select to_regclass('ops.master_ownership_state')::text as t")).rows[0].t;
+      if (!tbl) ng('列ごとの持ち主の表 ops.master_ownership_state が無い (0055 の前) = frozen にした瞬間に古い入口が全部 503');
+      else {
+        const sel = (await c.query("select has_table_privilege(session_user, 'ops.master_ownership_state', 'SELECT') as ok")).rows[0].ok;
+        if (!sel) ng('門のログインに ops.master_ownership_state の SELECT が無い (この PR の create-master-edit-roles.mjs を流し直す) = frozen にした瞬間に古い入口が全部 503');
+        else {
+          const o = await readGateOwnership(pgAdapter(c));
+          if (o.readable) ok(`列ごとの持ち主を読める (C の列 ${o.company.length} 個${o.prepared_hash ? '・prepared あり' : ''})`);
+          else ng(`列ごとの持ち主を読めない: ${String(o.error).slice(0, 200)}`);
+        }
+      }
     } catch (e) { ng(`門のログインでつながらない: ${String(e && e.message).slice(0, 200)}`); } finally { if (c) { try { await c.end(); } catch { /* */ } } }
   }
   // 4. build の番号

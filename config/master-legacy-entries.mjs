@@ -46,8 +46,10 @@ const R = (o) => Object.freeze({ kind: 'route', when_frozen: 'http_410', ...o })
  */
 export const NEW_PRODUCT_COLS = Object.freeze(['products.name', 'products.sales_class', 'products.status', 'sku_components', 'sku_costs', 'skus.handling', 'skus.name',
   'skus.reorder_months', 'skus.shipping', 'skus.sku_kind', 'skus.standard_price', 'skus.tax_class', 'skus.tax_rate', 'supplier_skus.is_primary']);
-/** profit-calculator の NE 用 CSV (NE の商品マスタの一括取込) が書く列 */
-const NE_CSV_COLS = Object.freeze(['skus.name', 'sku_costs', 'skus.standard_price', 'supplier_skus.is_primary', 'sku_components']);
+/** profit-calculator の NE 用 CSV (NE の商品マスタの一括取込) が書く列 = 商品名 (syohin_name)・仕入先 (sire_code)・原価 (genka_tnk)・売価 (baika_tnk)・代表コード (daihyo_syohin_code)・セットの数量 (suryo) */
+const NE_CSV_COLS = Object.freeze(['skus.name', 'products.name', 'sku_costs', 'skus.standard_price', 'supplier_skus.is_primary', 'products.parent', 'sku_components']);
+/** 発注アプリの仕入先の行 (po_suppliers) の全部の列 = 名前・発注方法 (send_method)・リードタイム (lead_days)・連絡先 6 列 (order_memo を含む)。Codex #1610 R1 Medium */
+const PO_SUPPLIER_COLS = Object.freeze(['suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days', 'suppliers.contacts']);
 const S = (o) => Object.freeze({ kind: 'screen', when_frozen: 'banner', method: 'GET', ...o });
 
 /** 閉じる入口 (段階 frozen / company_owner / new_open で owner_cols の列の持ち主が C のとき・段階か持ち主が読めないとき) */
@@ -80,7 +82,7 @@ export const LEGACY_ENTRIES = Object.freeze([
 
   // ─── 10 §4 #4: Render の会計アプリ 5 つの POST /register (mirror_products の税率・売上分類。翌朝の入れ替えで消える) ───
   ...['aupay-accounting', 'yahoo-accounting', 'mercari-accounting', 'linegift-accounting', 'qoo10-accounting'].flatMap((app) => [
-    R({ id: `${app}:POST:/register`, app, host: 'render', file: `apps/${app}/router.js`, mount: `/apps/${app}`, method: 'POST', path: '/register', writes: ['mirror_products'], owner_cols: ['skus.tax_rate', 'products.sales_class'], ref: '10 §4 #4' }),
+    R({ id: `${app}:POST:/register`, app, host: 'render', file: `apps/${app}/router.js`, mount: `/apps/${app}`, method: 'POST', path: '/register', writes: ['mirror_products'], owner_cols: ['skus.tax_rate', 'skus.tax_class', 'products.sales_class'], ref: '10 §4 #4' }),
     S({ id: `${app}:screen:/`, app, host: 'render', file: `apps/${app}/router.js`, mount: `/apps/${app}`, path: '/', owner_cols: ['skus.tax_rate', 'products.sales_class'], ref: '10 §4 #4' }),
   ]),
 
@@ -126,11 +128,11 @@ export const LEGACY_ENTRIES = Object.freeze([
   // ─── 10 §4 #7: 発注アプリの仕入先 (po_suppliers)。仕入先の列 (suppliers.*) が C になったら閉じる (⑤-3b。10/5 は load = 開いたまま) = 切替の手順で書き込み先を Company DB に替えるまで仕入先は見るだけ (R1 H4) ───
   ...[['POST', '/api/masters/:kind'], ['DELETE', '/api/masters/:kind/:id'], ['POST', '/api/masters/:kind/csv']].map(([method, p]) => R({
     id: `purchase-orders:${method}:${p}:suppliers`, app: 'purchase-orders', host: 'render', file: 'apps/purchase-orders/router.js', mount: '/apps/purchase-orders',
-    method, path: p, when: Object.freeze({ param: 'kind', in: Object.freeze(['suppliers']) }), writes: ['po_suppliers'], owner_cols: ['suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days', 'suppliers.contacts'], ref: '10 §4 #7 (PR #1565 R1 H4)',
+    method, path: p, when: Object.freeze({ param: 'kind', in: Object.freeze(['suppliers']) }), writes: ['po_suppliers'], owner_cols: PO_SUPPLIER_COLS, ref: '10 §4 #7 (PR #1565 R1 H4)',
     ...(p.endsWith('/csv') ? { recheck: true } : {}),
   })),
-  R({ id: 'purchase-orders:POST:/api/email/recipients/csv', app: 'purchase-orders', host: 'render', file: 'apps/purchase-orders/router.js', mount: '/apps/purchase-orders', method: 'POST', path: '/api/email/recipients/csv', writes: ['po_suppliers'], owner_cols: ['suppliers.contacts'], ref: '10 §4 #7 (宛先の CSV)', recheck: true }),
-  R({ id: 'purchase-orders:POST:/api/import', app: 'purchase-orders', host: 'render', file: 'apps/purchase-orders/router.js', mount: '/apps/purchase-orders', method: 'POST', path: '/api/import', writes: ['po_suppliers'], owner_cols: ['suppliers.name'], ref: '10 §4 #7 (マスタの一括取込。仕入先を含む = 🚨 仕入先の列が C になった後は仕入先でない種類のファイルもまとめて止まる = 仕入先でないマスタはマスタ管理の各タブの CSV で入れる)', recheck: true }),
+  R({ id: 'purchase-orders:POST:/api/email/recipients/csv', app: 'purchase-orders', host: 'render', file: 'apps/purchase-orders/router.js', mount: '/apps/purchase-orders', method: 'POST', path: '/api/email/recipients/csv', writes: ['po_suppliers'], owner_cols: ['suppliers.contacts', 'suppliers.order_method'], ref: '10 §4 #7 (宛先の CSV。発注方法が空なら email を入れる = send_method も書く)', recheck: true }),
+  R({ id: 'purchase-orders:POST:/api/import', app: 'purchase-orders', host: 'render', file: 'apps/purchase-orders/router.js', mount: '/apps/purchase-orders', method: 'POST', path: '/api/import', writes: ['po_suppliers'], owner_cols: PO_SUPPLIER_COLS, ref: '10 §4 #7 (マスタの一括取込。仕入先を含む = 🚨 仕入先の列が C になった後は仕入先でない種類のファイルもまとめて止まる = 仕入先でないマスタはマスタ管理の各タブの CSV で入れる)', recheck: true }),
   // ─── 10 §4 #8: 仕入先向け売れ筋共有の表示名 (supplier_share_master) ───
   R({ id: 'supplier-sales:POST:/api/supplier-name', app: 'supplier-sales', host: 'render', file: 'apps/supplier-sales/router.js', mount: '/apps/supplier-sales', method: 'POST', path: '/api/supplier-name', writes: ['supplier_share_master'], owner_cols: ['suppliers.name'], ref: '10 §4 #8 (PR #1565 R1 H4)' }),
 

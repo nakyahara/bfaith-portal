@@ -858,6 +858,14 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
     - 新商品の古い作り方 (product-hub の `/new`・NE のコードから登録・自動取込を手で回す・Notion の画像の取込・intake-cron) は `owner_match: 'all'` = 新しい登録の列 (`NEW_PRODUCT_COLS` = `NEW_ENTRY_KEYS` の単品 + セット) が**全部** C のときだけ閉じる。product-hub の `/new` の案内 (`newEntryGate`) も同じ門の答え (開いている = 今までの画面)。
     - 🚨 段階が legacy_open 以外で**持ち主を読めない** (0055 の表が無い・門のログインに `ops.master_ownership_state` の select が無い・記録が壊れた) = **全部の入口を閉じる** (503 `{error:'master_owner_unreadable'}`・CLI は終了コード 3)。門のログインの権限は `create-master-edit-roles.mjs` を 0055 の後に流し直すと付く。legacy_open の間は持ち主を読まない (切替の前の動きは ⑤-3 と同じ)。
     - 画面は閉じた列の部品だけ隠す (`legacyBannerHtml(info, { parts })`。/register = `REGISTER_WRITE_PARTS`・データウェアハウスの画面 = `DASHBOARD_WRITE_PARTS`)。
+    - 🚨 **切替の日の順番 (Codex #1610 R1 High)**: 門を通った古い書き込みは prepare をまたげる (HTTP・定期実行は持ち主の epoch の鍵を持たない・CLI が持つのは段階の鍵だけ = prepare は待たない)。prepare の後に書き終えた値は `--use-prepared` のロードに入らず、C の列は既にある行を上書きしないので**黙って消える**。書きかけ 0 を見るだけでは防げない。→ 次の順番だけで進める:
+      1. `master-ownership-epoch.mjs prepare` (段階は legacy_open のまま = 入口はまだ開いている)
+      2. `master-cutover.mjs --to frozen` (段階を変える関数は CLI の共有の鍵を待つ。この瞬間から C の列の入口だけ閉じる)。証拠の `owner_hash` は**新しい門の記録 (ack) のハッシュ** = 配ったコードの configured (13 キー = `c36e3d0f5f56cb01e7acdf71f73a0cf6608826ffeabfa58506734e41bbb6b3dd`)。active (全部 load = `4f53cda1…`) を入れると `acks_invalid` で止まる
+      3. 全部のプロセスの書きかけ 0 (`master-legacy-instance.mjs --list` の inflight・`pg_locks` の `hashtext('ops.master_cutover')` の共有の鍵 0 = CLI が書いていない)
+      4. **active (全部 load) の最後のロード** (NE の取得 → m_products の作り直し → Render の同期 → `remote-load.mjs load --apply --wait` = `--use-prepared` を付けない) = prepare をまたいで書き終えた古い入口の値を Company DB に回収する → 照合 ① ②
+      5. `remote-load.mjs load --apply --wait --use-prepared` → 写し → 作り直し → 確かめ → activate
+      試験 = `scripts/test-master-legacy-gate-pg.mjs` [19] (2 つの接続で交差を再現・3 を飛ばして 5 = 値が消える・4 の後 = 残る)。
+    - 配る前の確かめ (`master-legacy-readiness.mjs`) は門のログインで `ops.master_ownership_state` の有無・SELECT の権限・門と同じ読み方を確かめる (legacy_open の間は門は持ち主を読まない = ここで見ないと frozen にした瞬間に全部 503)。
   - API = 410 `{error:'master_frozen', message, url}`。段階が読めない = 503 `{error:'master_phase_unreadable'}` (閉じる側)。何も書かない。画面は `message` を出す (`master_frozen` の文字は出さない)。
   - 書かない試し (NE のコードから登録・自動取込を手で回す・Notion の画像の取込・Notion の状態から取込 の dry run) は、段階を読めないときだけ注意つきで通す (応答の見出し `X-Master-Legacy-Warning: phase_unreadable`)。閉じた後は 410 のまま。
   - 門で待っている間に相手が切れた (画面を閉じた) = 書かない (書きかけにも数えない)。

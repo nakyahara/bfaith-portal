@@ -12,9 +12,11 @@
  *       直近 15 分に記録した全部の実体 (instance_id) の build が expected_builds にあり、manifest_hash・owner_hash が証拠と同じ。
  *       今までに記録のある実体で、最後の記録が 15 分より前 (黙っている・何日前でも) のものがあれば進めない = 止めた実体は stopped の記録を書く (⑤-3 の CLI・正しく終わるとき)
  *   → frozen:        + manual_entries_stopped: [{ id, by, at }, ...] (id の集まり = manifest の手の入口 kind='manual' と完全に同じ)
- *                    + drain: { done: true, checked_by, checked_at }。owner_hash = いまの持ち主表 (全部 load) のハッシュ
+ *                    + drain: { done: true, checked_by, checked_at }。owner_hash = 門の記録 (ack) が書いた持ち主表のハッシュ = 配ったコードの configured
+ *                    (⑤-3b の後 = 10/5 の 13 キーが company = c36e3d0f5f56cb01e7acdf71f73a0cf6608826ffeabfa58506734e41bbb6b3dd)。🚨 active (全部 load = 4f53cda1…) ではない
+ *                    (入れると acks_invalid で止まる)。値は読み戻し GET /apps/warehouse/api/master-legacy-gate の owner_hash (新しい ack) をそのまま使う (Codex #1610 R1 Low)
  *                    checked_at・at は今の段階に入った後でサーバーの今以前 (先の日付・前の試みの証拠は使えない)。書きかけ 0 も (#1563 R3)
- *   → company_owner: owner_hash = 新しい持ち主表のハッシュ。門の記録は frozen に入った後・phase_seen = 'frozen'・処理中 0
+ *   → company_owner: owner_hash = 新しい持ち主表のハッシュ (= activate した active = configured と同じ c36e3d0f…bb6b3dd。0055 の守りが active と同じかを見る)。門の記録は frozen に入った後・phase_seen = 'frozen'・処理中 0
  *   → new_open:      owner_hash は company_owner と同じ。門の記録は company_owner に入った後・phase_seen = 'company_owner'・処理中 0
  *   ops.master_cutover_prereq_problems(from, to) が問題を返したら、どの段階も進めない (後の PR は ops.master_cutover_prereq_checks に関数を 1 行足す)
  * 🚨 --to は切替日の手順書の順番でだけ使う (定期実行にしない)。--yes が無ければ何もしない

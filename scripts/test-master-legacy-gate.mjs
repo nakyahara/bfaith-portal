@@ -1393,6 +1393,23 @@ await t('E1: 一覧の全部の入口 × 持ち主 = 全部 load は全部開く
     'supplier-sales:POST:/api/supplier-name',
     'warehouse:DELETE:/api/m-sku-master/:sku', 'warehouse:POST:/api/csv/m-sku-master', 'warehouse:POST:/api/m-sku-master', 'warehouse:PUT:/api/m-sku-master/:sku',
   ].sort());
+  // Codex #1610 R1 Medium: owner_cols = 実際に書く列。発注アプリの仕入先の行を書く口は、書く欄 (fromBody) から列を決めて全部持つ
+  const poSrc = fs.readFileSync(path.join(ROOT, 'apps/purchase-orders/router.js'), 'utf8');
+  const supBody = (poSrc.match(/suppliers: \{\s*table: 'po_suppliers'[\s\S]*?fromBody: b => \(\{([\s\S]*?)\}\),/) || [])[1];
+  assert.ok(supBody, '発注アプリの仕入先の fromBody を見つけた');
+  const PO_FIELD_COL = { supplier_code: null, name: 'suppliers.name', send_method: 'suppliers.order_method', lead_days: 'suppliers.lead_time_days',
+    order_memo: 'suppliers.contacts', email_to: 'suppliers.contacts', email_cc: 'suppliers.contacts', contact_name: 'suppliers.contacts', fax_number: 'suppliers.contacts', relay_to: 'suppliers.contacts' };
+  const fields = [...supBody.matchAll(/(\w+):/g)].map((m) => m[1]);
+  for (const f of fields) assert.ok(Object.hasOwn(PO_FIELD_COL, f), `仕入先の欄 ${f} の列が決まっていない (試験の対応表に足す)`);
+  const supCols = [...new Set(fields.map((f) => PO_FIELD_COL[f]).filter(Boolean))].sort();
+  for (const id of ['purchase-orders:POST:/api/import', 'purchase-orders:POST:/api/masters/:kind:suppliers', 'purchase-orders:DELETE:/api/masters/:kind/:id:suppliers', 'purchase-orders:POST:/api/masters/:kind/csv:suppliers']) {
+    assert.deepEqual([...E.entryById(id).owner_cols].sort(), supCols, id);
+  }
+  assert.ok(['suppliers.contacts', 'suppliers.order_method'].every((k) => E.entryById('purchase-orders:POST:/api/email/recipients/csv').owner_cols.includes(k)), '宛先の CSV は連絡先と発注方法 (空なら email) を書く');
+  // 連絡先だけ C に分けた日 = 一括取込も閉じる (order_memo を NULL にできない)
+  assert.equal(G.legacyStateFor(st(['suppliers.contacts']), E.entryById('purchase-orders:POST:/api/import').owner_cols).writable, false);
+  // NE 用 CSV は代表コード (daihyo_syohin_code)・商品名も NE に書く
+  assert.ok(['products.parent', 'products.name', 'skus.name'].every((k) => E.entryById('profit-calculator:GET:/api/products/csv/ne').owner_cols.includes(k)));
   // 新商品の作り方 (owner_match 'all') = 新しい登録の列 (NEW_ENTRY_KEYS の単品 + セット) と同じ列
   const { NEW_ENTRY_KEYS } = await import('../lib/master-register.mjs');
   assert.deepEqual([...E.NEW_PRODUCT_COLS].sort(), [...new Set([...NEW_ENTRY_KEYS.single, ...NEW_ENTRY_KEYS.set])].sort());
