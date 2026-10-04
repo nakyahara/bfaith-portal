@@ -151,8 +151,8 @@ import { resolveListingTax } from './services/listing-tax.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 router.use(express.json({ limit: '512kb' }));
-// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #6・14 §5・契約 v3 H1・PR #1565 R1 H4/H5)。切替の段階が legacy_open のときだけ今までどおり:
-//    税率の手入力 (tax_rate を送る保存) = frozen 以降・段階が読めない = 410 / 503 (何も書かない)。tax_rate を送らない保存 (ほかの欄) は通る。
+// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #6・14 §5・契約 v3 H1・PR #1565 R1 H4/H5・⑤-3b)。legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る):
+//    税率の手入力 (tax_rate を送る保存) = 税率の列が C (frozen 以降)・段階か持ち主が読めない = 410 / 503 (何も書かない)。tax_rate を送らない保存 (ほかの欄) は通る。
 //    Notion の取込 (税率も書く)・古い新商品の作り方 (POST /api/drafts・NE のコードから登録・自動取込を手で回す) = 閉じる (新商品は新しい登録の画面から)。
 //    セットを作る = 作るのは通すが、親の税率は写さない (res.locals.masterLegacyWrite.writable のときだけ)。
 //    詳細画面・利益の試算・楽天の出品は Company DB の税率 (listing-tax.mjs)。本文を読んだ後に置く
@@ -265,11 +265,11 @@ router.get('/list', (req, res) => {
 });
 
 // 新規作成 (2026-10-01・Company DB構想 14 §11 の 2「新商品の入口を 1 つに」)。
-//   切替の前 (MASTER_EDIT_OPEN が無い・段階 legacy_open) = 今までの画面のまま (Company DB にもつながない)
+//   切替の前 (MASTER_EDIT_OPEN が無い・段階 legacy_open) と、古い作り方の門が開いている間 (新しい登録の列にまだ load がある = owner_match 'all'・⑤-3b) = 今までの画面のまま
 //   切替の後 (段階 new_open かつ MASTER_EDIT_OPEN = 1) = 「マスタの入力 → 新商品の登録」へ案内するだけ (保存でカードが自動でできる)
 //   切替の途中・段階が読めない = 登録は止めている、の案内 (古い入口も開けない = fail-closed)
 //   🚨 (PR #1566 R1 M5) 段階が frozen 以降に ⑤-2a のコードがカードを作る道は outbox の取り込み (services/cdb-card-intake.js) だけ。
-//      ここの画面の案内以外の古い作成の道 (POST /api/drafts・NE の一括登録・自動取込 intake-cron) を frozen から閉じるのは ⑤-3
+//      ここの画面の案内以外の古い作成の道 (POST /api/drafts・NE の一括登録・自動取込 intake-cron) を閉じるのは ⑤-3 の門 (⑤-3b: frozen 以降で新しい登録の列が全部 C (active ∪ prepared) のとき = owner_match 'all'。cancel で再び開き得る)
 //   (async は門を読む前段だけ。描画は今までどおり同期の handler = 誤りは Express の誤りの handler へ)
 router.get('/new', (req, res, next) => {
   newEntryGate()
@@ -290,7 +290,7 @@ router.get('/new', (req, res, next) => {
 
 /**
  * 詳細画面の税率の見せ方 (中間レビュー 2 回目 M-B):
- *   'cdb'      = 段階を読めて閉じている (frozen 以降) → Company DB の税率を読む (代表コードは構成の SKU から。混ざる・無い・読めない = 決められない)
+ *   'cdb'      = 段階と持ち主を読めて、税率の列が閉じている (frozen 以降で skus.tax_rate が C (active ∪ prepared)) → Company DB の税率を読む (代表コードは構成の SKU から。混ざる・無い・読めない = 決められない)
  *   'readonly' = 段階を読めない → 今の値 (draft_yahoo) を見るだけ (Company DB を読みに行かない = 詳細を開くたびに接続を作らない・切替前に「出品は止まります」と出さない)
  *   'legacy'   = 切替前 → 今までどおり (手入力の欄)
  */
@@ -3717,7 +3717,7 @@ serviceApiRouter.post('/ad-kw-ai/jobs/:id/release', (req, res) => {
 });
 
 /**
- * AI 生成の材料の税率 (draft_yahoo.tax_rate) は、切替前 (段階を読めて legacy_open) だけ渡す。
+ * AI 生成の材料の税率 (draft_yahoo.tax_rate) は、税率の列が開いている間 (legacy_open・frozen 以降でも skus.tax_rate が load) だけ渡す。
  * 閉じた後・段階を読めない = 渡さない (null)。税率の持ち主は Company DB = 古い手入力の値を AI の文に入れない (中間レビュー 2 回目 Low)。
  * 段階は画面と同じ読み方 (30 秒の使い回し・1 秒で諦める = 生成の材料を待たせない)
  */

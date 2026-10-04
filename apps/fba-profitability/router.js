@@ -12,7 +12,7 @@ import { masterLegacyGate, legacyBannerHtml } from '../../lib/master-legacy-gate
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 // 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #5・14 §5・契約 v3 H1)。原価の手入力 (POST /api/update-cost = mirror_products) は
-//    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = 410 / 503 (何も書かない)。画面 (/) は帯を出して原価の部品を隠す
+//    legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る)。原価が C = 410・段階か持ち主が読めない = 503 (何も書かない)。画面 (/) は帯を出して原価の部品を隠す
 router.use(masterLegacyGate('fba-profitability'));
 
 // 🚨 mirror_products.消費税率 は「小数」で入っている (0.1 = 10%, 0.08 = 8%)。

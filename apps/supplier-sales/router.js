@@ -22,7 +22,7 @@ import {
 } from './share-db.js';
 
 const router = express.Router();
-// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #8・PR #1565 R1 H4)。仕入先の表示名 (POST /api/supplier-name) は切替の段階が legacy_open のとき、または suppliers.name の持ち主が load のとき (⑤-3b) だけ
+// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #8・PR #1565 R1 H4)。仕入先の表示名 (POST /api/supplier-name) は切替の段階が legacy_open のとき、または suppliers.name の持ち主 (active ∪ prepared) が load のとき (⑤-3b) だけ (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る)
 router.use(masterLegacyGate('supplier-sales'));
 
 router.get('/', (req, res) => {

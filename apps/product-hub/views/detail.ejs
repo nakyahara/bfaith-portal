@@ -289,7 +289,7 @@ th.attr-unknown { color: #dc2626; }
     <details class="hdr-help" style="margin:0 0 6px;">
       <summary>送られる値・項目の場所</summary>
       <p>
-        <% const phTaxMode = (typeof taxMode !== 'undefined' && taxMode) || 'legacy'; %>税率 (<%= phTaxMode === 'cdb' ? ('Company DB の税率 = ' + ((typeof cdbTax !== 'undefined' && cdbTax && cdbTax.ok) ? cdbTax.label : '決まっていない = 出品は止まります')) : phTaxMode === 'readonly' ? ((yahoo?.tax_rate || '未設定') + '。切替の段階を読めないので、いまは出品できません (少し待ってもう一度)') : (yahoo?.tax_rate || '未設定 = 店舗デフォルト10%') %>) と カタログID (JAN<%= (variation && variation.kind === 'variation' && variation.memberCount > 1) ? ' — SKU表の値をSKUごとに' : ': ' + (draft.jan_code || '未入力') %>) は基本情報タブの値を自動で送ります。
+        <% const phTaxMode = (typeof taxMode !== 'undefined' && taxMode) || 'legacy'; %>税率 (<%= phTaxMode === 'cdb' ? ('Company DB の税率 = ' + ((typeof cdbTax !== 'undefined' && cdbTax && cdbTax.ok) ? cdbTax.label : '決まっていない = 出品は止まります')) : phTaxMode === 'readonly' ? ((yahoo?.tax_rate || '未設定') + '。切替の状態を読めないので、いまは出品できません (少し待ってもう一度)') : (yahoo?.tax_rate || '未設定 = 店舗デフォルト10%') %>) と カタログID (JAN<%= (variation && variation.kind === 'variation' && variation.memberCount > 1) ? ' — SKU表の値をSKUごとに' : ': ' + (draft.jan_code || '未入力') %>) は基本情報タブの値を自動で送ります。
         在庫は常に 0 で登録します。<br>
         配送方法・売価は「基本情報」タブ、ジャンル・店舗内カテゴリ・商品属性は「カテゴリ・属性」タブにあります。
         </p>
@@ -865,9 +865,9 @@ th.attr-unknown { color: #dc2626; }
           <%# 段階を読めない (中間レビュー 2 回目 M-B): 今の値を見るだけ。手入力の欄 (id="y-tax") は出さない = 税率を送らない (ほかの欄の保存は通る) %>
           <label>税率 <span class="muted">(見るだけ)</span></label>
           <input type="text" id="y-tax-view" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="未設定" readonly disabled>
-          <div class="muted" style="font-size:12px;">切替の段階を読めないので、いまは税率を変えられません (少し待って開き直す)</div>
+          <div class="muted" style="font-size:12px;">切替の状態を読めないので、いまは税率を変えられません (少し待って開き直す)</div>
           <% } else if (phTaxModeB === 'cdb') { %>
-          <%# 切替で古い入口を閉じた後 (Company DB構想 10 §4 #6): 手入力の欄 (id="y-tax") は出さない = 保存でも即保存でも税率を送らない。Company DB の税率を見せるだけ %>
+          <%# 税率の列の古い入口が閉じた後 (frozen 以降で skus.tax_rate が C (active ∪ prepared)・Company DB構想 10 §4 #6・⑤-3b): 手入力の欄 (id="y-tax") は出さない = 保存でも即保存でも税率を送らない。Company DB の税率を見せるだけ %>
           <% const cdbTaxView = (typeof cdbTax !== 'undefined' && cdbTax) ? cdbTax : { ok: false, reason: '読めません' }; %>
           <label>税率 <span class="muted">(Company DB の税率・見るだけ)</span></label>
           <input type="text" id="y-tax-cdb" value="<%= cdbTaxView.ok ? cdbTaxView.label : '' %>" placeholder="<%= cdbTaxView.ok ? '' : cdbTaxView.reason %>" readonly disabled>
@@ -3387,7 +3387,7 @@ th.attr-unknown { color: #dc2626; }
       setTimeout(() => reloadSafely(), 600);
     } else {
       const detail = json.reasons ? json.reasons.join(' / ') : '';
-      const gateMsg = (json.error === 'master_frozen' || json.error === 'master_phase_unreadable') ? json.message : null;
+      const gateMsg = (json.error === 'master_frozen' || json.error === 'master_phase_unreadable' || json.error === 'master_owner_unreadable') ? json.message : null;
       alert((gateMsg || json.error || 'エラーが発生しました') + (detail ? '\n' + detail : ''));
     }
   }
@@ -7549,7 +7549,7 @@ th.attr-unknown { color: #dc2626; }
         if (!json || !json.ok) {
           // 🚨 打った値は戻さない (人の入力を消さない)。未保存の印が出たままになるので、
           //    「基本情報を保存」で拾えるし、読み直しても #1397 の関所が書き戻す
-          say(f, el, (json && (json.error === 'master_frozen' || json.error === 'master_phase_unreadable') ? json.message : (json && json.error ? json.error : '保存できませんでした'))
+          say(f, el, (json && (json.error === 'master_frozen' || json.error === 'master_phase_unreadable' || json.error === 'master_owner_unreadable') ? json.message : (json && json.error ? json.error : '保存できませんでした'))
             + ' — 「基本情報を保存」を押してください', true);
           return;
         }

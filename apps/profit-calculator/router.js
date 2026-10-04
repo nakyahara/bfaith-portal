@@ -54,7 +54,7 @@ import { getSetting, setSetting, getAllSettings } from './settings.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
 // 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #9・14 §5・§9 M2・契約 v3 H1)。NE 用 CSV (NE への 2 つ目の出口) と仕入れ先マスタの追加・削除は
-//    切替の段階が legacy_open のときだけ今までどおり。frozen 以降は、その入口の owner_cols のどれかの持ち主が C (active ∪ prepared) のときだけ閉じる (⑤-3b・列が全部 load の入口は開いたまま)・段階 / 持ち主が読めない = 410 / 503 (何も書かない・CSV を作らない)。
+//    legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る) = owner_cols のどれかが C のときだけ閉じる (⑤-3b・列が全部 load の入口は開いたまま)・段階 / 持ち主が読めない = 410 / 503 (何も書かない・CSV を作らない)。
 //    画面は帯を出して、その部品を隠す (sendPage)
 router.use(masterLegacyGate('profit-calculator'));
 

@@ -33,13 +33,14 @@ const ON = new Set(['1', 'true', 'on', 'yes']);
  */
 export async function runProductHubIntake({ sync = syncNewProducts } = {}) {
   try {
-    // 🚨 切替で古い入口を閉じた後 (段階 frozen 以降・読めない) は取込を丸ごと止める = NE が先の新商品の作り方は古い入口
+    // 🚨 古い入口の門が閉じている (段階 frozen 以降で新しい登録の列が全部 C = owner_match 'all'・段階か持ち主が読めない) ときは取込を丸ごと止める = NE が先の新商品の作り方は古い入口
+    //    (legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る)。10/5 の 13 キーでは開いたまま)
     //    (新商品は新しい登録の画面から Company DB 経由。Codex ⑤-2a M5)。閉じている = ok で「止めた」と残す (見張りを鳴らさない)・読めない = fail (鳴らす)
     //    取込は門の共通の包み (runLegacyJob) の中 = 終わるまで書きかけに数える (門の記録の書きかけ・読み戻しの inflight.by_entry。Codex #1565 R2 Medium 2)
     const job = await runLegacyJob('job:product-hub:intake-cron', () => sync({ actor: 'cron:ne-intake' }));
     if (!job.ran) {
       const gate = job.state;
-      const why = gate.readable ? `切替の段階 ${gate.phase} = 古い新商品の取込は閉じている` : `切替の段階を読めない (${gate.error}) = 止める`;
+      const why = gate.readable ? `切替の段階 ${gate.phase}・新しい登録の列が全部 Company DB = 古い新商品の取込は閉じている` : `切替の段階か持ち主を読めない (${gate.error}) = 止める`;
       console.log(`[product-hub] intake skipped: ${why}`);
       ping(gate.readable ? 'ok' : 'fail', `skip: ${why}`.slice(0, 180));   // 読めない = 設定・つながりの誤り = 見張りを鳴らす
       return;

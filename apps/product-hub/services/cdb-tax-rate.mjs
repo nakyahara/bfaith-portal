@@ -1,7 +1,8 @@
 /**
  * cdb-tax-rate.mjs — Company DB の税率を読む・ドラフトの税率を決める (product-hub・Company DB構想 10 §4 #6・14 §5 / PR #1565 Codex R1 H5)
  *
- * 切替で古い入口を閉じた後 (段階 frozen 以降・段階が読めないときも)、product-hub は税率の手入力 (draft_yahoo.tax_rate) を使わない:
+ * 税率の列 (skus.tax_rate) の古い入口が閉じた後 (段階 frozen 以降で税率が C (active ∪ prepared)・⑤-3b)、product-hub は税率の手入力 (draft_yahoo.tax_rate) を使わない
+ *   (段階か持ち主が読めないときは、詳細画面は今の値を見るだけ・出品は止める = listing-tax.mjs):
  *   詳細画面の表示・利益の試算・楽天の出品 (プレビュー・登録) は Company DB (core.skus.tax_rate) の税率だけ。閉じる前は呼ばない (今までどおり)。
  * ドラフトの商品コードが代表コード (バリエーションの親・SKU の行が無いことが多い) なら、構成の SKU (NE の写しの代表商品コードでまとまる子) の税率を読む。
  *   子の税率が混ざる・どれかが無い / 未解決 = 決められない (出品は止める)。Company DB を読めない = 決められない (fail-closed)

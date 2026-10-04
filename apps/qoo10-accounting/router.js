@@ -20,7 +20,7 @@ import { masterLegacyGate, legacyBannerHtml } from '../../lib/master-legacy-gate
 
 const router = Router();
 // 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #4・14 §5・契約 v3 H1)。POST /register (mirror_products の税率・売上分類) は
-//    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = 410 / 503 (何も書かない)。画面 (/) は帯を出して登録の部品を隠す
+//    legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る)。税率・売上分類が C = 410・段階か持ち主が読めない = 503 (何も書かない)。画面 (/) は帯を出して登録の部品を隠す
 router.use(masterLegacyGate('qoo10-accounting'));
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
 if (!fs.existsSync(UPLOAD_DIR)) { try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {} }

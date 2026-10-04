@@ -955,7 +955,7 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
 - **一覧 = `config/master-legacy-entries.mjs`** (閉じる入口・閉じない口 (写し・閉じ済み・手の入口の 3 種類)・CLI の mode・書かない試しの見分け方 `dry_run`)。一覧がそのまま門の設定。id は英数字と `_.:/-` だけ (⑤-1 の manifest の形)。
 - **門 = `lib/master-legacy-gate.mjs`**。切替の段階 (`ops.master_cutover_state`・0051) を**読めて** `legacy_open` のときは今までどおり書ける (frozen 以降は下の ⑤-3b = owner_cols の持ち主が C の入口だけ閉じる)。
   - 🆕 **⑤-3b (2026-10-04・列を分けて切り替える)**: `frozen` 以降は、**その入口が書く列 (一覧の `owner_cols`) のどれかの持ち主が C の入口だけ**閉じる。列が全部 load の入口 (10/5 なら SKU タブ = Amazon SKU の対応・発注アプリの仕入先と一括取込・売れ筋共有の表示名・profit-calculator の仕入れ先・SKU マスタの取込) は開けたまま。
-    - 持ち主 = **Company DB の epoch** (`ops.master_ownership_state` の **active と prepared** の C の列を合わせたもの = prepare した時点で閉じる・cancel で開く)。🚨 `config/master-ownership.mjs` (configured) は見ない (デプロイの成果物 = 場所ごとに切り替わる時刻が違う)。
+    - 持ち主 = **Company DB の epoch** (`ops.master_ownership_state` の **active と prepared** の C の列を合わせたもの。段階が legacy_open の間は持ち主を読まない = prepare しただけでは閉じない・閉じ始めるのは frozen にした時点。cancel で prepared が消えると、frozen のままでもその列の入口は再び開く)。🚨 `config/master-ownership.mjs` (configured) は見ない (デプロイの成果物 = 場所ごとに切り替わる時刻が違う)。
     - 新商品の古い作り方 (product-hub の `/new`・NE のコードから登録・自動取込を手で回す・Notion の画像の取込・intake-cron) は `owner_match: 'all'` = 新しい登録の列 (`NEW_PRODUCT_COLS` = `NEW_ENTRY_KEYS` の単品 + セット) が**全部** C のときだけ閉じる。product-hub の `/new` の案内 (`newEntryGate`) も同じ門の答え (開いている = 今までの画面)。
     - 🚨 段階が legacy_open 以外で**持ち主を読めない** (0055 の表が無い・門のログインに `ops.master_ownership_state` の select が無い・記録が壊れた) = **全部の入口を閉じる** (503 `{error:'master_owner_unreadable'}`・CLI は終了コード 3)。門のログインの権限は `create-master-edit-roles.mjs` を 0055 の後に流し直すと付く。legacy_open の間は持ち主を読まない (切替の前の動きは ⑤-3 と同じ)。
     - 画面は閉じた列の部品だけ隠す (`legacyBannerHtml(info, { parts })`。/register = `REGISTER_WRITE_PARTS`・データウェアハウスの画面 = `DASHBOARD_WRITE_PARTS`)。
@@ -2168,9 +2168,9 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
 3. `node scripts/company-db/remote-load.mjs load --apply --wait --use-prepared` (prepared の持ち主で 1 回だけロード)
 4. miniPC: `node apps/company-db/publish/fetch.mjs` → `node apps/warehouse/rebuild-m-products.js` → `node apps/company-db/publish/fetch.mjs --verify-apply` (prepared の世代を入れて確かめる)
 5. miniPC: `node scripts/company-db/master-ownership-epoch.mjs activate` (最新の作り直しが prepared の世代・その世代が prepare の後に Company DB を読んだ・今朝の確かめが通った・読み直しても同じ、
-   かつ **⑤-1 の切替の段階 (`ops.master_cutover_state`) が `frozen`** (古い入口を止めた後・持ち主を C にする前) のときだけ active に。足りなければ理由を出して断る。段階の表が無い = 断る。
-   証拠を集めたときの prepare の時刻を行の鍵の後に比べる = その間に prepare をやり直したら `PREPARED_CHANGED` で断る (やり直しは 3 から)。
-   証拠の世代が読んだ夜間ロードが最後のロードでない (証拠の後に毎晩のロードなどが入った。DB の commit の番号で比べる) = `LOAD_AFTER_EVIDENCE` で断る (やり直しは 3 から。#1564 Codex R3 High 1・R4))
+   かつ **⑤-1 の切替の段階 (`ops.master_cutover_state`) が `frozen`** (prepared の C の列の古い入口を止めた後・持ち主を C にする前) のときだけ active に。足りなければ理由を出して断る。段階の表が無い = 断る。
+   証拠を集めたときの prepare の時刻を行の鍵の後に比べる = その間に prepare をやり直したら `PREPARED_CHANGED` で断る (やり直しは **2a から** = 書きかけ 0 → 2b の最後の active のロード → 照合 ② → 3。新しく C に入った列の入口は、やり直しの prepare までは開いていたため)。
+   証拠の世代が読んだ夜間ロードが最後のロードでない (証拠の後に毎晩のロードなどが入った。DB の commit の番号で比べる) = `LOAD_AFTER_EVIDENCE` で断る (やり直しは **2b から** = 最後の active (全部 load) のロード → その run_id の report の成功 + 照合 ② → 3 の --use-prepared。介在したロードの結果を確かめないまま 3 に進まない。#1564 Codex R3 High 1・R4・#1610 R5)
 - 途中で止める = `master-ownership-epoch.mjs cancel` (prepared を消す。active はそのまま = 毎晩は前の持ち主)。🚨 cancel すると門から見た C の列が消える = **段階が frozen のままでも、その列の古い入口が再び開く** (門は active ∪ prepared で見る)。入口を閉じたまま夜を越すなら cancel しない (prepared を残す)。cancel したらスタッフに知らせ、翌日は prepare からやり直す。prepared を残して 02:00 のロードが走ったら activate は LOAD_AFTER_EVIDENCE で止まる = 2b (最後の同期) からやり直す。今の状態 = `master-ownership-epoch.mjs status`
 
 **マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0055 は表を 3 つ (epoch・その記録・夜間ロードの commit の順) と、⑤-1 の切替の段階・画面の保存の門に「持ち主の epoch と同じ」の確かめを足すだけ (行は作らない = 全部 load のまま = 何も変わらない)。

@@ -1215,8 +1215,8 @@ await t('product-hub (R1 H5): 楽天の出品のプレビューは、閉じた�
   let asked = false;
   __setCdbTaxReader(async (codes) => { asked = true; return cdbRates({ 'ph-rep-a': 0.08, 'ph-rep-b': 0.08 })(codes); });
   r = await quiet(() => call('GET', `/apps/product-hub/api/drafts/${repDraftId}/rakuten/preview`));
-  assert.ok((r.json?.warnings || []).some((x) => x.includes('切替の段階を読めない')), JSON.stringify(r.json));
-  assert.ok(!taxBlocked(r) && !(r.json?.reasons || []).some((x) => x.includes('切替の段階を読めない')), 'プレビューは税率で止めない');
+  assert.ok((r.json?.warnings || []).some((x) => x.includes('切替の状態を読めない')), JSON.stringify(r.json));
+  assert.ok(!taxBlocked(r) && !(r.json?.reasons || []).some((x) => x.includes('切替の状態を読めない')), 'プレビューは税率で止めない');
   assert.equal(asked, false, '段階が読めないときに Company DB の税率へ切り替えない');
   setPhase('legacy_open');
   r = await quiet(() => call('GET', `/apps/product-hub/api/drafts/${repDraftId}/rakuten/preview`));
@@ -1231,7 +1231,7 @@ await t('product-hub (R1 H5): 楽天への本当の登録 (registerItem) も、�
   assert.equal(r.ok, false); assert.ok((r.reasons || []).some((x) => x.includes('税率を Company DB から決められない')), JSON.stringify(r));
   setPhase('unreadable');
   const r2 = await quiet(() => listing.registerItem(repDraftId, { actor: 'test' }));
-  assert.equal(r2.ok, false); assert.ok((r2.reasons || []).some((x) => x.includes('切替の段階を読めない')), JSON.stringify(r2));
+  assert.equal(r2.ok, false); assert.ok((r2.reasons || []).some((x) => x.includes('切替の状態を読めない')), JSON.stringify(r2));
   __setCdbTaxReader(null);
 });
 await t('中間レビュー Medium-3: Company DB が止まっていても (段階を読めない)、税率を変えない保存 (名前・売価・メモ・Yahoo! の値) は通る', async () => {
@@ -1314,7 +1314,7 @@ await t('product-hub の詳細画面: 閉じたら手入力の欄 (id="y-tax") �
   assert.equal(r.status, 200);
   assert.equal(asked, false, '段階を読めない = Company DB を読まない');
   assert.ok(/id="y-tax-view" value="10%"/.test(r.text) && !r.text.includes('id="y-tax"') && !r.text.includes('y-tax-cdb'), '今の値を見るだけ (手入力の欄なし)');
-  assert.ok(r.text.includes('切替の段階を読めないので、いまは税率を変えられません') && !r.text.includes('決まっていない = 出品は止まります'));
+  assert.ok(r.text.includes('切替の状態を読めないので、いまは税率を変えられません') && !r.text.includes('決まっていない = 出品は止まります'));
   assert.ok(/data-tax="10"/.test(r.text), '試算は今の値');
   __setCdbTaxReader(null);
 });

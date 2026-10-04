@@ -3,7 +3,7 @@ import fs from 'fs';
 import { legacyCliGate, runWithLegacyCliLock } from '../../lib/master-legacy-gate.mjs';
 
 // 🚨 売上分類 (product_sales_class) はマスタ = 古い入口の門を通す (Company DB構想 10 §4 #10・14 §9 M2・契約 v3 H1)。
-//    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = 何も書かないで終了コード 3
+//    legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る)。売上分類が C・段階か持ち主が読めない = 何も書かないで終了コード 3
 if (await legacyCliGate('cli:import-sales-class.js')) {
   const db = new Database('data/warehouse.db');
   const buf = fs.readFileSync('data/import/sales_class.csv');
@@ -26,7 +26,7 @@ if (await legacyCliGate('cli:import-sales-class.js')) {
       count++;
     }
   });
-  // 書くところ = 段階の鍵を共有で持ったまま読み直し、legacy_open のときだけ書く (段階を変える関数は書き終わるまで待つ)
+  // 書くところ = 段階の鍵を共有で持ったまま段階と持ち主を読み直し、その入口の列で書いてよいときだけ書く (legacy_open は書く・それ以降は active ∪ prepared と owner_cols。段階を変える関数は書き終わるまで待つ)
   const { ran } = await runWithLegacyCliLock('cli:import-sales-class.js', () => tx());
   if (ran) {
     console.log('取り込み完了:', count, '件, スキップ:', skipped, '件');

@@ -16,8 +16,8 @@ export async function resolveListingTax(db, draft, { gate = checkLegacyGate, pre
   let g;
   try { g = await gate({ purpose: 'write', cols: TAX_COLS }); } catch (e) { g = { writable: false, readable: false, error: String((e && e.message) || e) }; }
   if (!g || g.readable !== true) {
-    if (preview) return { mode: 'legacy', warning: '切替の段階を読めないので、今の税率 (draft_yahoo) で見せています。登録はできません (少し待ってもう一度)' };
-    return { mode: 'blocked', reason: `切替の段階を読めないので出品を止めています (少し待ってもう一度)${g && g.error ? `: ${g.error}` : ''}` };
+    if (preview) return { mode: 'legacy', warning: '切替の状態を読めないので、今の税率 (draft_yahoo) で見せています。登録はできません (少し待ってもう一度)' };
+    return { mode: 'blocked', reason: `切替の状態を読めないので出品を止めています (少し待ってもう一度)${g && g.error ? `: ${g.error}` : ''}` };
   }
   if (g.writable === true) return { mode: 'legacy' };
   const r = await resolveCdbDraftTax(db, draft);
