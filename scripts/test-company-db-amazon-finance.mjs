@@ -875,6 +875,8 @@ await t('月の手数料: 14 か月より古い月を訂正 → 差 → 手数�
 });
 await t('未照合の月が 800 日より前でも、月の手数料は 24 か月ずつ取る (受け口の上限で 400 にならない。#1534 Codex R1 Medium)', async () => {
   const far = ymOffset(-30);
+  // 起点より前の月は比べない (10/4) = 30 か月前の月を比べるため、policy の起点もそこまで下げる (試験だけ)
+  await pg.query(`update core.finance_source_policy set period_from = $1::date where mall = 'amazon'`, [`${far}-01`]);
   L0.setMeta({ [META.unreconciled]: JSON.stringify([far]) });
   const w = reader();
   try {
@@ -883,6 +885,97 @@ await t('未照合の月が 800 日より前でも、月の手数料は 24 か�
     assert.ok(rr.checkedMonths.includes(far));
     assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), []);
   } finally { w.close(); }
+});
+// 🆕 2026-10-04: policy の起点より前は比べない (10/4 朝 = 2025-12-29〜31 の行で ⚠️・日 × SKU 1575・月の手数料 3・採用されない行 4394 が全部起点より前だった)
+const setPolicy = (from, to = null) => pg.query(`update core.finance_source_policy set period_from = $1::date, period_to = $2::date where mall = 'amazon'`, [from, to]);
+const renderRowsBefore = async (floor) => { const r = await one(`select count(*)::int as n, min(economic_date_jst)::text as a, max(economic_date_jst)::text as b from core.order_finance_daily where mall = 'amazon' and economic_date_jst < $1::date`, [floor]); return { n: Number(r.n), a: r.a, b: r.b }; };
+await t('policyFloorOf: policy の行の period_from の最小・行が無ければ null・形が違えば止まる', async () => {
+  const { policyFloorOf } = await import('../apps/company-db/push/amazon-finance.mjs');
+  assert.equal(policyFloorOf([{ period_from: '2026-03-01', period_to: null, source: 's' }, { period_from: '2026-01-01', period_to: '2026-03-01', source: 's' }]), '2026-01-01');
+  assert.equal(policyFloorOf([]), null);
+  assert.throws(() => policyFloorOf(undefined), /policy の応答の形/);
+  assert.throws(() => policyFloorOf([{ period_from: '2026-02-30' }]), /policy の行の形/);
+});
+await t('🚨 起点より前の月が未照合の月に入っても差に数えない (SQLite にだけある日 × SKU・月の手数料・Render の採用されない行 = 対象外として数える)・台帳から外す・やり残しに登録しない・続いた回数を 0 に', async () => {
+  const floor = `${MB}-01`;   // 2 か月前 (MA) はまるごと起点より前
+  await setPolicy(floor);
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([MA, MB]), [META.diffStreak]: '1' });   // 10/4 朝と同じ = 1 回目の ⚠️ の後
+  const pendingBefore = readPendingMonths(tmpDir, { file: PENDING_FILE }).months;
+  const feesPendingBefore = readPendingMonths(tmpDir, { file: ACCOUNT_FEES_PENDING_FILE }).months;
+  const w = reader();
+  try {
+    const sqliteMa = readSqliteDaily(w, `${MA}-01`, monthEnd(MA)).length, sqliteMaFees = readSqliteFees(w, [MA]).length;
+    assert.ok(sqliteMa > 0, '試験の前提: SQLite に起点より前 (MA) の日次の行がある');
+    const renderBefore = await renderRowsBefore(floor);
+    assert.ok(renderBefore.n > 0, '試験の前提: Render に起点より前の計上日の行がある (送り手は注文の集合をまるごと送る)');
+    const logs = [];
+    const rr = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: (m) => logs.push(m) });
+    assert.equal(rr.ok, true, JSON.stringify({ d: rr.daily.slice(0, 3), f: rr.fees, u: rr.uncovered, ex: rr.excluded }));
+    assert.equal(rr.level, 'ok'); assert.equal(rr.streak, 0); assert.equal(L0.getMeta(META.diffStreak), '0');
+    assert.equal(rr.uncovered, 0);
+    assert.deepEqual(rr.excluded, { floor, months: [MA], sqliteDaily: sqliteMa, sqliteFees: sqliteMaFees, renderUncovered: renderBefore.n, renderFrom: renderBefore.a, renderTo: renderBefore.b });
+    assert.ok(!rr.checkedMonths.includes(MA), '起点より前の月は Render に取りに行かない');
+    assert.ok(rr.checkedMonths.includes(MB));
+    assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), [], '起点より前の月 (MA) は台帳から外す・MB は一致したので消す');
+    assert.deepEqual(readPendingMonths(tmpDir, { file: PENDING_FILE }).months, pendingBefore, '日次のやり残しに足さない');
+    assert.deepEqual(readPendingMonths(tmpDir, { file: ACCOUNT_FEES_PENDING_FILE }).months, feesPendingBefore, '月の手数料のやり残しに足さない');
+    const { summarizeReconcile } = await import('../apps/company-db/push/amazon-finance.mjs');
+    const s = summarizeReconcile(rr);
+    assert.match(s, /^✅ /);
+    assert.ok(s.includes(`対象外 (policy の起点 ${floor} より前 = 比べない): 月 ${MA} の 日 × SKU ${sqliteMa}・月の手数料 ${sqliteMaFees} (SQLite)・採用されない行 ${renderBefore.n} (Render ${renderBefore.a}〜${renderBefore.b})`), s);
+    assert.ok(logs.some((m) => m.includes('対象外')), '突き合わせのログにも 1 行');
+  } finally { w.close(); }
+});
+await t('起点の後の差は今までどおり (起点より前を外しても、起点の後の日 × SKU の差は ⚠️ → ❌・やり残しに登録)', async () => {
+  await setPolicy(`${MB}-01`);
+  wdb.prepare(`update f_amazon_finance_sku_daily_v1 set commission_jpy = commission_jpy + 1 where date_jst = ? and seller_sku = 'sku-a'`).run(d(MB, 5));
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([MA, MB]) });
+  const w = reader();
+  try {
+    const r1 = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+    assert.equal(r1.level, 'warn'); assert.deepEqual(r1.dailyDiffMonths, [MB]); assert.equal(r1.uncovered, 0);
+    assert.ok(r1.excluded.renderUncovered > 0 && r1.excluded.months.includes(MA));
+    assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), [MB], '差の月は残す・起点より前の月は外す');
+    assert.ok(readPendingMonths(tmpDir, { file: PENDING_FILE }).months.includes(MB));
+    assert.ok(!readPendingMonths(tmpDir, { file: PENDING_FILE }).months.includes(MA));
+    const r2 = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+    assert.equal(r2.level, 'error'); assert.equal(r2.streak, 2);
+  } finally { w.close(); }
+  build();
+  const w2 = reader();
+  try {
+    const r3 = await reconcileAmazonFinance({ warehouse: w2, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+    assert.equal(r3.ok, true, JSON.stringify({ d: r3.daily.slice(0, 3), f: r3.fees, u: r3.uncovered }));
+  } finally { w2.close(); }
+});
+await t('起点が月の途中: その月の日次は起点から比べ、月の手数料 (月の合計) は比べない = 起点より前の Easy Ship (6 日) を差に数えない', async () => {
+  const floor = d(MB, 15);
+  await setPolicy(floor);
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([MB]) });
+  const w = reader();
+  try {
+    const before = readSqliteDaily(w, `${MB}-01`, d(MB, 14)).length;
+    assert.ok(before > 0 && readSqliteFees(w, [MB]).length > 0, '試験の前提: MB の起点より前に日次の行と月の手数料がある');
+    const rr = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+    assert.equal(rr.ok, true, JSON.stringify({ d: rr.daily.slice(0, 3), f: rr.fees, u: rr.uncovered, ex: rr.excluded }));
+    assert.equal(rr.excluded.sqliteDaily, before);
+    assert.equal(rr.excluded.sqliteFees, readSqliteFees(w, [MB]).length);
+    assert.ok(rr.excluded.months.includes(MB));
+    assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), [], '起点からの日次が一致した = 消す');
+  } finally { w.close(); }
+});
+await t('起点の後の policy の穴 (採用されない行の最後の日が起点の後) は今までどおり差 (対象外にしない)', async () => {
+  await setPolicy(`${MB}-01`, d(MB, 10));   // MB の 10 日から後は policy が無い
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([]), [META.diffStreak]: '0' });
+  const w = reader();
+  try {
+    const rr = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet, registerPending: false });
+    assert.equal(rr.level, 'warn');
+    assert.ok(rr.uncovered > 0, `起点の後の採用されない行は差: ${rr.uncovered}`);
+    assert.equal(rr.excluded.renderUncovered, 0, '起点の前後にまたがる組はまるごと差 (見落とさない側)');
+  } finally { w.close(); }
+  await setPolicy(`${ymOffset(-30)}-01`);   // 前の試験の policy に戻す
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([]), [META.diffStreak]: '0' });
 });
 console.log('④ daily-sync の工程 (F2b-3)');
 await t('日曜 (JST の業務日) は --full・ほかは --incremental・どちらも --require-backfilled', async () => {
