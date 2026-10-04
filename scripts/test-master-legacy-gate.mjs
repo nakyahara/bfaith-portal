@@ -1503,6 +1503,13 @@ await t('E5: 13 キー C の product-hub = 新商品の作成 (POST /api/drafts�
     const sync = async () => { seen = G.legacyInflight().by_entry['job:product-hub:intake-cron']; return { ok: true, mode: 'intake', created: 0, merged: 0, drafts: [] }; };
     await quiet(() => runProductHubIntake({ sync }));
     assert.equal(seen, 1, `${phase}: 自動取込が動いた`);
+    // 書く直前の確かめ (fence) も入口の列で決める = 13 キーでは開いたまま (段階だけで決めると投げる)
+    const j = await G.runLegacyJob('job:product-hub:intake-cron', async ({ fence }) => { await fence(); return 'wrote'; });
+    assert.deepEqual([j.ran, j.result], [true, 'wrote'], `${phase}: fence`);
+    // 門を通った後 (13 キー) に、その入口の列も C になった (prepare など) = 書く直前の確かめで止める
+    await quiet(() => assert.rejects(G.runLegacyJob('job:product-hub:intake-cron', async ({ fence }) => { setOwnerPhase(phase, [...OWNED_COLUMNS]); await fence(); return 'wrote'; }),
+      (e) => e.code === 'master_legacy_aborted' && e.status === 410));
+    setOwnerPhase(phase, CUT13);
     const page = await call('GET', '/apps/product-hub/new');
     assert.ok(!page.text.includes('master-legacy-banner') && page.text.includes('id="create-btn"'), '今までの新規作成の画面');
   }
