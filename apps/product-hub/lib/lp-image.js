@@ -64,13 +64,13 @@ const IMAGE_IN_TOKENS_PER_REF_CEIL = 6_000;
 /** 月の上限の手前に取る安全幅 (5%・最低 100 円)。取り置きを超える請求がまれにあっても、上限は超えない */
 const BUDGET_SAFETY_RATE = 0.05;
 const BUDGET_SAFETY_MIN_JPY = 100;
-/** 1 枚の取り置き額 (円・小数 2 桁で切り上げ)。品質段が知らない値なら null (= 作らない) */
+/** 1 枚の取り置き額 (**整数の円・切り上げ**)。品質段が知らない値なら null (= 作らない) */
 export function reserveJpy({ quality, refs = 0, promptBytes = 0 }) {
   const out = OUT_TOKENS_CEIL[quality];
   if (!out) return null;
   const usd = (Math.max(0, promptBytes) * PRICE.textIn
     + Math.max(0, refs) * IMAGE_IN_TOKENS_PER_REF_CEIL * PRICE.imageIn + out * PRICE.out) / 1_000_000;
-  return Math.ceil(usd * USD_JPY_RESERVE * 100) / 100;
+  return Math.ceil(usd * USD_JPY_RESERVE);
 }
 const PROMPT_MAX = 30_000;
 /** 作っている画像の期限 (分)。段階ごとに延ばす。切れたものだけ片付ける */
@@ -124,17 +124,20 @@ export function lpImageConfig(env = process.env) {
   return { enabled, usable: !error, error, model, quality, budget, safety, spendable: budget ? Math.max(0, budget - safety) : null, size: LP_IMAGE_SIZE };
 }
 
-/** 返事の usage から円を出す (検討 §5.1 の単価)。usage が無ければ null (= 見込み額のまま) */
+/**
+ * 返事の usage から円を出す (検討 §5.1 の単価・**整数の円・切り上げ**)。
+ * 🚨 内訳がそろって数が合うときだけ使う (#1612 R4 High)。内訳が無い・合わない・負の数・整数でない usage は null
+ *    (= 取り置き額のまま)。内訳が無いのを安い単価で数えると、取り置きが不当に戻って上限を超えて呼べた
+ */
 export function costJpyFromUsage(usage) {
   if (!usage || typeof usage !== 'object') return null;
-  const out = Number(usage.output_tokens);
-  const inAll = Number(usage.input_tokens);
-  if (!Number.isFinite(out) || !Number.isFinite(inAll)) return null;
-  const det = usage.input_tokens_details || {};
-  const img = Number.isFinite(Number(det.image_tokens)) ? Number(det.image_tokens) : 0;
-  const txt = Number.isFinite(Number(det.text_tokens)) ? Number(det.text_tokens) : Math.max(0, inAll - img);
+  const det = usage.input_tokens_details;
+  if (!det || typeof det !== 'object') return null;
+  const n = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : null);
+  const out = n(usage.output_tokens), inAll = n(usage.input_tokens), img = n(det.image_tokens), txt = n(det.text_tokens);
+  if (out == null || inAll == null || img == null || txt == null || img + txt !== inAll) return null;
   const usd = (txt * PRICE.textIn + img * PRICE.imageIn + out * PRICE.out) / 1_000_000;
-  return Math.round(usd * USD_JPY * 100) / 100;
+  return Math.ceil(usd * USD_JPY);
 }
 
 /** 当月の使った額 = 実額 (charged) + 取り置き (reserved) + 結果不明の見込み (unknown) */
@@ -144,7 +147,7 @@ export function monthUsage(db, now = Date.now()) {
       WHEN status = 'charged' THEN COALESCE(cost_jpy, est_jpy)
       WHEN status IN ('reserved','unknown') THEN est_jpy ELSE 0 END), 0) AS jpy
     FROM ph_ai_usage WHERE kind = 'lp_image' AND month = ?`).get(month);
-  return { month, used_jpy: Math.round(Number(r.jpy) * 100) / 100 };
+  return { month, used_jpy: Math.ceil(Number(r.jpy)) };
 }
 
 const sectionOf = (block, heading) => {
@@ -316,7 +319,7 @@ export function imageStateFor(db, { draft, folderId, env = process.env, now = Da
       id: job.id, status: job.status, model: job.model, quality: job.quality, error: job.error,
       created_at: job.created_at, completed_at: job.completed_at, folder_id: job.folder_id,
       compose_job_id: job.compose_job_id,
-      cost_jpy: Math.round(images.reduce((a, im) => a + (Number(im.cost_jpy) || 0), 0) * 100) / 100,
+      cost_jpy: images.reduce((a, im) => a + (Number(im.cost_jpy) || 0), 0),   // 1 枚ずつ整数の円 (切り上げ済み)
       images,
     } : null,
   };
@@ -354,6 +357,9 @@ export function createLpImageWorker(deps) {
   const token = deps.token || `w-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
   let running = false;
   let again = false;
+  let wakeTimer = null;
+  const setTimer = deps.setTimer || ((fn, ms) => setTimeout(fn, ms));
+  const clearTimer = deps.clearTimer || ((t) => clearTimeout(t));
 
   const leaseUntil = () => new Date(now() + LEASE_MIN * 60_000).toISOString();
   /** 作っている間、段階ごとに期限を延ばす (生成 4 分 × やり直し 2 回 + Drive でも切れないように) */
@@ -566,12 +572,26 @@ export function createLpImageWorker(deps) {
         }
         finalizeJobs(db);
       } while (again);
+      try { scheduleWake(deps.getDB()); } catch { /* 次に起こされたときに拾う */ }
     } finally {
       running = false;
     }
   }
 
-  return { kick, recover, isRunning: () => running, token };
+  /**
+   * 作っている途中の画像が残っていたら、いちばん早い期限の少し後に 1 回だけ起こす (#1612 R4 Medium)。
+   * 再起動の直後は前のプロセスの期限内なので片付けられない。定期の見回りは置かず、この 1 回で拾う
+   */
+  function scheduleWake(db) {
+    if (wakeTimer) { clearTimer(wakeTimer); wakeTimer = null; }
+    const r = db.prepare(`SELECT MIN(lease_until) AS t FROM ph_lp_images WHERE status = 'running' AND lease_until IS NOT NULL`).get();
+    if (!r?.t) return null;
+    const ms = Math.max(1_000, Date.parse(r.t) - now() + 5_000);
+    wakeTimer = setTimer(() => { wakeTimer = null; kick().catch(() => {}); }, ms);
+    return ms;
+  }
+
+  return { kick, recover, isRunning: () => running, token, scheduleWake };
 }
 
 // ─── 本物の部品 ─────────────────────────────────────────

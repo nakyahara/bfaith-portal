@@ -1457,12 +1457,12 @@ export function initProductHubDB() {
       prompt          TEXT NOT NULL,
       refs_json       TEXT NOT NULL DEFAULT '[]',  -- 参考に渡す画像 [{file_id, role, label}]
       status          TEXT NOT NULL CHECK (status IN ('queued','running','done','failed','skipped')),
-      est_jpy         REAL NOT NULL DEFAULT 0, -- 取り置き額 = これ以上はかからない額 (品質段・参考画像・prompt の長さから・#1612 R1)
+      est_jpy         INTEGER NOT NULL DEFAULT 0, -- 取り置き額 (円・切り上げ。品質段・参考画像・prompt のバイト数から・#1612 R1〜R4)
       claimed_by      TEXT,                    -- 作っているプロセス (再起動の片付けで、生きているものを中断にしない・#1612 R1)
       lease_until     TEXT,
       drive_file_id   TEXT,
       error           TEXT,
-      cost_jpy        REAL,
+      cost_jpy        INTEGER,                 -- 円 (切り上げ・金額は整数の決まり)
       started_at      TEXT,
       completed_at    TEXT,
       UNIQUE (image_job_id, seq)
@@ -1480,8 +1480,8 @@ export function initProductHubDB() {
       model           TEXT,
       quality         TEXT,
       status          TEXT NOT NULL CHECK (status IN ('reserved','charged','failed','unknown')),
-      est_jpy         REAL NOT NULL,
-      cost_jpy        REAL,
+      est_jpy         INTEGER NOT NULL,        -- 円 (切り上げ)
+      cost_jpy        INTEGER,                 -- 円 (切り上げ・推定)
       in_text_tokens  INTEGER,
       in_image_tokens INTEGER,
       out_tokens      INTEGER,

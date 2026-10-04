@@ -73,11 +73,18 @@ console.log('① 設定 (fail-closed・品質段は low / medium / high だけ)'
 console.log('② 費用の計算 (検討 §5.1 の単価・取り置きも確定も 1 ドル 170 円)');
 {
   // 文 1,000 + 画像 3,000 tok 入力・出力 439 tok (medium) → (1000×5 + 3000×8 + 439×30)/1e6 × 170
-  eq(li.costJpyFromUsage({ input_tokens: 4000, output_tokens: 439, input_tokens_details: { text_tokens: 1000, image_tokens: 3000 } }), 7.17, '円に直す');
+  eq(li.costJpyFromUsage({ input_tokens: 4000, output_tokens: 439, input_tokens_details: { text_tokens: 1000, image_tokens: 3000 } }), 8, '円に直す');
   eq(li.costJpyFromUsage(null), null, 'usage が無ければ null (見込み額のまま)');
+  // 🚨 内訳がそろって数が合うときだけ使う (#1612 R4 High)。安い単価で数えて取り置きが戻るのを防ぐ
+  eq(li.costJpyFromUsage({ input_tokens: 24000, output_tokens: 4000, input_tokens_details: {} }), null, '🚨 内訳が無ければ使わない (取り置き額のまま)');
+  eq(li.costJpyFromUsage({ input_tokens: 24000, output_tokens: 4000 }), null, '内訳そのものが無くても使わない');
+  eq(li.costJpyFromUsage({ input_tokens: 5000, output_tokens: 439, input_tokens_details: { text_tokens: 1000, image_tokens: 3000 } }), null, '🚨 内訳の合計が合わなければ使わない');
+  eq(li.costJpyFromUsage({ input_tokens: -4000, output_tokens: 439, input_tokens_details: { text_tokens: -1000, image_tokens: -3000 } }), null, '負の数は使わない');
+  eq(li.costJpyFromUsage({ input_tokens: 4000.5, output_tokens: 439, input_tokens_details: { text_tokens: 1000.5, image_tokens: 3000 } }), null, '整数でなければ使わない');
+  ok(Number.isInteger(li.reserveJpy({ quality: 'medium', refs: 1, promptBytes: 123 })), '取り置きは整数の円 (金額は整数の決まり・切り上げ)');
   eq(li.jstMonth(Date.parse('2026-10-31T15:30:00Z')), '2026-11', '月は JST で区切る');
   // 取り置き (#1612 R2): 文は UTF-8 のバイト数。medium・参考 2 枚・4,000 バイト → (4000×5 + 12000×8 + 4000×30)/1e6 × 170
-  eq(li.reserveJpy({ quality: 'medium', refs: 2, promptBytes: 4000 }), 40.12, '取り置きの計算 (medium・参考 2 枚・4,000 バイト)');
+  eq(li.reserveJpy({ quality: 'medium', refs: 2, promptBytes: 4000 }), 41, '取り置きの計算 (medium・参考 2 枚・4,000 バイト)');
   ok(li.reserveJpy({ quality: 'high', refs: 4, promptBytes: 4000 }) > li.reserveJpy({ quality: 'medium', refs: 4, promptBytes: 4000 }), '品質段が上がれば取り置きも上がる');
   ok(li.reserveJpy({ quality: 'medium', refs: 4, promptBytes: 4000 }) > li.reserveJpy({ quality: 'medium', refs: 1, promptBytes: 4000 }), '参考画像が多ければ上がる');
   ok(li.reserveJpy({ quality: 'medium', refs: 2, promptBytes: 4000 }) > li.costJpyFromUsage({ input_tokens: 4000, output_tokens: 439, input_tokens_details: { text_tokens: 1000, image_tokens: 3000 } }), '🚨 取り置きは実際の額より大きい');
@@ -199,10 +206,10 @@ console.log('⑤ 作る係 — うまくいく');
   ok(calls.ensure.every((p) => p === FOLDER), '保存先は商品の画像フォルダの中の「AI初稿」');
   ok(calls.upload[0].name.startsWith(A.draft.ne_code + '_AI初稿_') && calls.upload[0].name.endsWith('_0枚目.png'), `名前に商品コードと何枚目か (${calls.upload[0].name})`);
   const us = usageOf(jobId);
-  ok(us.length === 3 && us.every((u) => u.status === 'charged' && u.cost_jpy === 7.17 && u.out_tokens === 439), '台帳に 1 枚ずつ実額で記録 (charged)');
-  eq(li.monthUsage(db, T0).used_jpy, 21.51, '今月の使った額 = 実額の合計');
+  ok(us.length === 3 && us.every((u) => u.status === 'charged' && u.cost_jpy === 8 && u.out_tokens === 439), '台帳に 1 枚ずつ実額で記録 (charged)');
+  eq(li.monthUsage(db, T0).used_jpy, 24, '今月の使った額 = 実額の合計');
   const st = li.imageStateFor(db, { draft: A.draft, folderId: FOLDER, env: ENV, now: T0 });
-  ok(st.job.status === 'done' && st.job.images.length === 3 && st.job.cost_jpy === 21.51, '画面に画像と費用が渡る');
+  ok(st.job.status === 'done' && st.job.images.length === 3 && st.job.cost_jpy === 24, '画面に画像と費用が渡る');
   const evs = db.prepare('SELECT event FROM draft_events WHERE draft_id = ? ORDER BY id').all(A.draft.id).map((r) => r.event);
   ok(evs.includes('lp_image_requested') && evs.includes('lp_image_done'), '商品の履歴に残る');
   ok(dbmod.imageRefOfFileId(db, 'DRIVEOUT0001'), '🚨 作った画像はサムネイルの口で見せてよい (登録済みと同じ扱い)');
@@ -213,12 +220,12 @@ console.log('⑥ 作る係 — お金の上限で止める (fail-closed)');
   const B = makeComposed();
   const r = li.requestImageJob(db, { draft: B.draft, folderId: FOLDER, idempotencyKey: 'img-key-b001', env: ENV, now: T0 });
   ok(r.ok, '受け付ける');
-  // 上限を実際の取り置き額から組む: 1 枚目 = 使った額 + 取り置き1 ≤ 上限 → 実額 7.17。2 枚目 = 使った額 + 7.17 + 取り置き2 ≤ 上限 → 実額 7.17。
-  // 3 枚目 = 使った額 + 14.34 + 取り置き3 > 上限 で止まる
+  // 上限を実際の取り置き額から組む: 1 枚目 = 使った額 + 取り置き1 ≤ 上限 → 実額 8。2 枚目 = 使った額 + 8 + 取り置き2 ≤ 上限 → 実額 8。
+  // 3 枚目 = 使った額 + 16 + 取り置き3 > 上限 で止まる
   const est = imagesOf(r.job.id).map((im) => im.est_jpy);
   const used0 = li.monthUsage(db, T0).used_jpy;
-  const cap = Math.ceil(used0 + 7.17 + est[1]) + 1;
-  ok(used0 + est[0] <= cap && used0 + 14.34 + est[2] > cap, `上限の組み立て (使った ${used0} 円・取り置き ${est.join(' / ')} 円・上限 ${cap} 円)`);
+  const cap = Math.ceil(used0 + 8 + est[1]) + 1;
+  ok(used0 + est[0] <= cap && used0 + 16 + est[2] > cap, `上限の組み立て (使った ${used0} 円・取り置き ${est.join(' / ')} 円・上限 ${cap} 円)`);
   // 呼んでよい額 = 上限 − 安全幅 (この大きさでは最低の 100 円)。cap を呼んでよい額にする
   const env = { ...ENV, PH_LP_MONTHLY_BUDGET_JPY: String(cap + 100) };
   eq(li.lpImageConfig(env).spendable, cap, '呼んでよい額 = cap');
@@ -317,7 +324,7 @@ console.log('⑧c 取り置きを超えた請求・保存の ID・時間の上�
   const capK = Math.ceil(used0 + est[0]) + 1;   // 1 枚目は呼べる / 1 枚目の実額 (取り置きの 3 倍) の後は 2 枚目を呼べない
   const envK = { ...ENV, PH_LP_MONTHLY_BUDGET_JPY: String(capK + 100) };
   let n = 0;
-  const fk = fakeDeps({ env: envK, generate: async () => { n++; return { buf: Buffer.from('P'), usage: { input_tokens: 0, output_tokens: bigOut } }; } });
+  const fk = fakeDeps({ env: envK, generate: async () => { n++; return { buf: Buffer.from('P'), usage: { input_tokens: 0, output_tokens: bigOut, input_tokens_details: { text_tokens: 0, image_tokens: 0 } } }; } });
   await li.createLpImageWorker(fk.deps).kick();
   const u = usageOf(r.job.id);
   ok(u[0].status === 'charged' && u[0].cost_jpy > est[0] && /取り置き/.test(u[0].error || ''), '🚨 取り置きを超えた請求も実額のまま正直に記録する (目印つき)');
@@ -365,6 +372,31 @@ console.log('⑨ 再起動の片付け (recover)');
   await w.kick();
   eq(imagesOf(r.job.id).map((im) => im.status), ['failed', 'done', 'done'], '残りは続けて作る');
   eq(calls.generate.length, 2, '途中の 1 枚は呼び直さない');
+}
+
+console.log('⑨b 再起動の直後に期限内で残った画像は、期限の少し後に 1 回だけ見回る (#1612 R4 Medium)');
+{
+  const W = makeComposed(undefined, { priority: '仕入商品（重要度：低）' });
+  const r = li.requestImageJob(db, { draft: W.draft, folderId: FOLDER, idempotencyKey: 'img-key-w001', env: ENV, now: T0 });
+  const im = imagesOf(r.job.id)[0];
+  // 前のプロセスが掴んだまま再起動した (期限は 15 分後)
+  db.prepare(`UPDATE ph_lp_images SET status = 'running', claimed_by = 'w-old', lease_until = ? WHERE id = ?`).run(new Date(T0 + 15 * 60_000).toISOString(), im.id);
+  db.prepare(`UPDATE ph_lp_image_jobs SET status = 'running' WHERE id = ?`).run(r.job.id);
+  db.prepare(`INSERT INTO ph_ai_usage (kind, month, draft_id, ref_id, model, quality, status, est_jpy) VALUES ('lp_image', ?, ?, ?, 'gpt-image-2.5-flare', 'medium', 'reserved', 30)`).run(li.jstMonth(T0), W.draft.id, im.id);
+  let nowMs = T0;
+  const timers = [];
+  const fw = fakeDeps({ now: () => nowMs, setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimer: () => {} });
+  const w = li.createLpImageWorker(fw.deps);
+  await w.kick();
+  eq(imagesOf(r.job.id)[0].status, 'running', '期限内なので片付けない (前のプロセスがまだ作っているかもしれない)');
+  ok(timers.length >= 1 && Math.abs(timers[timers.length - 1].ms - (15 * 60_000 + 5_000)) < 1_000, `🚨 いちばん早い期限の少し後に 1 回だけ起こす (${timers[timers.length - 1]?.ms} ms)`);
+  nowMs = T0 + 15 * 60_000 + 6_000;   // 期限が切れた
+  await timers[timers.length - 1].fn();
+  await new Promise((res) => setImmediate(res));
+  while (w.isRunning()) await new Promise((res) => setImmediate(res));
+  ok(imagesOf(r.job.id)[0].status === 'failed' && /途中で止まりました/.test(imagesOf(r.job.id)[0].error), '🚨 起きたときに期限切れを片付ける (画面を開かなくても残り続けない)');
+  eq(jobOf(r.job.id).status, 'failed', '依頼も終わる (もう一度押せる)');
+  eq(usageOf(r.job.id)[0].status, 'unknown', '費用は取り置き額のまま (請求されたものとして)');
 }
 
 console.log('⑩ OpenAI の呼び方 (本物の部品を偽の fetch で)');
