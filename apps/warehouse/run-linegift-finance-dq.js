@@ -33,8 +33,8 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow } from './finance-dq-month-mode.js';
-import { linegiftListingDiff, linegiftFactRawMismatch, listingDiffThreshold, listingDiffSeverity } from './linegift-listing-diff.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, monthStartRamp, monthStartRampWindow, recentListingJpy, applyMonthStartRamp, monthStartRampNote, monthStartRampOlder, listingOlderPart, whitelistOlderPart, NO_LISTING_RAMP_FLAG } from './finance-dq-month-mode.js';
+import { linegiftListingDiff, linegiftFactRawMismatch, listingDiffThreshold, listingDiffSeverity, linegiftListingBetween } from './linegift-listing-diff.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -53,6 +53,8 @@ try { now = resolveDqNow(getArg('--now')); }
 catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
 // daily-sync はこの回のモールの取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
 const noMonthStartGrace = args.includes('--no-month-start-grace');
+// daily-sync はこの回の f_sales の再構築か、listing の元の NE の取込が ❌ のとき --no-listing-ramp を付ける (= listing_diff_pct の月初の立ち上がりを使わない。比べる相手が古い。R2 Medium)
+const noListingRamp = args.includes(NO_LISTING_RAMP_FLAG);
 
 // 重複期間: 既存 linegift_accounting CSV (受注日基準) と新 fact (受取日基準) が並走している月 → listing_diff_pct を informational に格下げ
 // (設計書 §8 #2、Codex #9: 受注日 vs 受取日で 1〜数日ずれて売上が流れるため、構造的に diff が出る)
@@ -95,6 +97,11 @@ const mode = monthMode(monthStr, { now });
 const isCur = mode === 'current';
 const isDuplicatePeriod = DUPLICATE_PERIOD_MONTHS.has(monthStr);
 const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST, THRESHOLDS_CURRENT);
+// 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 7 日目までは listing_diff_pct・whitelist_coverage_pct の error を、
+// 「足りない向き」かつ「直近 3 日 + 今日より前に error 級の差が無い (ふだんのしきい値で error でない = warn は通す)」かつ「足りない分 ≤ 直近の受注」の
+// ときだけ ⚠️ に下げる (受取待ちの差。受注 → 受取は 0〜8 日)
+const ramp = monthStartRamp('linegift', monthStr, { now, noGrace: noMonthStartGrace, noListingRamp });
+const rampedChecks = [];
 
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -186,9 +193,15 @@ try { ld = linegiftListingDiff(db, monthStr); }
 catch (e) { console.log(`  (listing 突合スキップ: ${e.message})`); }
 const thr = listingDiffThreshold(mode, THRESHOLDS_PAST.listing_diff_pct, THRESHOLDS_CURRENT.listing_diff_pct);
 if (ld && ld.listingAvail) {
-  const severity = listingDiffSeverity(ld.diffPct, thr, { isDuplicatePeriod });
-  recordResult('listing_diff_pct', severity, ld.diffPct, thr.error, { basis: 'bought_month', bought_basis_jpy: ld.boughtBasisJpy, listing_jpy: ld.listingJpy, diff_jpy: ld.boughtBasisJpy - ld.listingJpy,
-    not_received_yet_jpy: ld.notReceivedJpy, received_without_bought_date: ld.receivedWithoutBoughtDate, received_basis_fact_jpy: ld.receivedBasisFactJpy, received_basis_diff_pct: ld.receivedBasisDiffPct, duplicate_period: isDuplicatePeriod });
+  const lw = monthStartRampWindow(ramp, 'listing_diff_pct');
+  const lr = applyMonthStartRamp(monthStartGrace ? null : ramp, 'listing_diff_pct', listingDiffSeverity(ld.diffPct, thr, { isDuplicatePeriod }),
+    { basis: 'bought_month', bought_basis_jpy: ld.boughtBasisJpy, listing_jpy: ld.listingJpy, diff_jpy: ld.boughtBasisJpy - ld.listingJpy,
+      not_received_yet_jpy: ld.notReceivedJpy, received_without_bought_date: ld.receivedWithoutBoughtDate, received_basis_fact_jpy: ld.receivedBasisFactJpy, received_basis_diff_pct: ld.receivedBasisDiffPct, duplicate_period: isDuplicatePeriod },
+    { shortfall: ld.listingJpy - ld.boughtBasisJpy, explainedBy: recentListingJpy(db, 'linegift', lw),
+      // 窓より前の古い部分 (受注日が月の 1 日〜窓の前の日) の listing と受注日の売上を、同じしきい値で比べる
+      older: monthStartRampOlder(lw, (from, to) => { const o = linegiftListingBetween(db, from, to); return listingOlderPart(o.listingJpy, o.boughtBasisJpy, (pct) => listingDiffSeverity(pct, thr, { isDuplicatePeriod })); }) });
+  if (lr.ramped) rampedChecks.push({ checkName: 'listing_diff_pct', value: ld.diffPct });
+  recordResult('listing_diff_pct', lr.severity, ld.diffPct, thr.error, lr.details);
 } else { recordResult('listing_diff_pct', 'info', null, thr.error, { skipped: true }); }
 
 // Check 14: fact_raw_mismatch_keys — fact が raw から欠けずに作られているか (受取日の月どうし。listing の有無・重複期間に関係なく必ず見る)
@@ -229,9 +242,17 @@ const cov = db.prepare(`SELECT
   (SELECT COUNT(*) FROM raw_linegift_orders WHERE substr(received_date_jst,1,7)=? OR (received_date_jst IS NULL AND substr(bought_date_jst,1,7)=?)) AS total,
   (SELECT COUNT(*) FROM raw_linegift_orders WHERE substr(received_date_jst,1,7)=? AND status='received') AS wl`).get(monthStr, monthStr, monthStr);
 const wlPct = cov.total > 0 ? cov.wl / cov.total * 100 : 0;
-recordResult('whitelist_coverage_pct',
-  wlPct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' : wlPct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info',
-  wlPct, THRESHOLDS.whitelist_coverage_pct.warn, { total_lines: cov.total, whitelist_lines: cov.wl });
+// 月初の立ち上がりの ③: whitelist に入っていない行 (まだ受け取っていない) の数 ≤ 直近 3 日 + 今日の受注の行の数
+const wlWin = monthStartRampWindow(ramp, 'whitelist_coverage_pct');
+const wlRecent = wlWin ? db.prepare('SELECT COUNT(*) AS c FROM raw_linegift_orders WHERE substr(bought_date_jst, 1, 10) BETWEEN ? AND ?').get(wlWin.from, wlWin.to).c : null;
+const wlSeverity = (pct) => (pct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' : pct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info');
+const wl = applyMonthStartRamp(monthStartGrace ? null : ramp, 'whitelist_coverage_pct', wlSeverity(wlPct),
+  { total_lines: cov.total, whitelist_lines: cov.wl }, { shortfall: (cov.total || 0) - (cov.wl || 0), explainedBy: wlRecent,
+    // 窓より前の古い部分: 受注日がその期間で、上の total と同じ数え方 (当月に受取 or まだ受け取っていない) の行のうち受け取った割合を、同じしきい値で判定
+    older: monthStartRampOlder(wlWin, (from, to) => { const o = db.prepare(`SELECT COUNT(*) AS t, COALESCE(SUM(substr(received_date_jst, 1, 7) = ? AND status = 'received'), 0) AS w FROM raw_linegift_orders
+      WHERE substr(bought_date_jst, 1, 10) BETWEEN ? AND ? AND (substr(received_date_jst, 1, 7) = ? OR received_date_jst IS NULL)`).get(monthStr, from, to, monthStr); return whitelistOlderPart(o.t, o.w, wlSeverity); }) });
+if (wl.ramped) rampedChecks.push({ checkName: 'whitelist_coverage_pct', value: wlPct });
+recordResult('whitelist_coverage_pct', wl.severity, wlPct, THRESHOLDS.whitelist_coverage_pct.warn, wl.details);
 
 // Check 8: resolved_but_zero_cost_count
 // 原価状態='OVERRIDDEN' AND 原価=0 は人手の意図的 0 円上書き → snapshot=0 (lookup 成功で 0 円) の行のみ除外。
@@ -328,5 +349,7 @@ function printSummary() {
 printSummary();
 // 月初の猶予で通した回は、最後の行を「⚠️ 月初の猶予: …」にする (daily-sync はこの行を要約に出し、warn を立てて見出しを ⚠️ にする)
 if (monthStartGrace && !hasError) console.log(monthStartEmptyNote('f_linegift_finance_sku_daily_v1', monthStr, monthStartGrace));
+// 月初の立ち上がりで下げた回も、最後の行を「⚠️ 月初の立ち上がり: …」にする (daily-sync は見出しを ⚠️ にする)
+else if (rampedChecks.length > 0 && !hasError) console.log(monthStartRampNote(ramp, rampedChecks));
 db.close();
 process.exit(hasError ? 1 : 0);

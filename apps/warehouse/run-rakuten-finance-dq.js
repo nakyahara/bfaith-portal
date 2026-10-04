@@ -33,7 +33,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, jstShifted } from './finance-dq-month-mode.js';
+import { decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, jstShifted, monthStartRamp, monthStartRampWindow, recentListingJpy, applyMonthStartRamp, monthStartRampNote, monthStartRampOlder, listingOlderPart, NO_LISTING_RAMP_FLAG } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -68,6 +68,9 @@ try { now = resolveDqNow(getArg('--now')); }
 catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
 // daily-sync はこの回の楽天の取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
 const noMonthStartGrace = args.includes('--no-month-start-grace');
+// daily-sync はこの回の f_sales の再構築が ❌ のとき --no-listing-ramp を付ける (= listing_diff_pct の月初の立ち上がりを使わない。比べる相手が古い)。
+// 楽天の listing の元は raw_rakuten_orders (NE ではない) = 楽天の取込が ❌ の朝は --no-month-start-grace で立ち上がりごと止まる
+const noListingRamp = args.includes(NO_LISTING_RAMP_FLAG);
 
 // ============================================================
 // Threshold config (Phase 1a #R-2 確定値)
@@ -98,6 +101,11 @@ const THRESHOLDS_CURRENT_MONTH = {
 };
 
 const THRESHOLDS = isCurrentMonth(monthStr) ? THRESHOLDS_CURRENT_MONTH : THRESHOLDS_PAST_MONTH;
+// 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 7 日目までは listing_diff_pct の error を、
+// 「fact が足りない向き」かつ「直近 2 日 + 今日より前に error 級の差が無い (ふだんのしきい値で error でない = warn は通す)」かつ「足りない分 ≤ 直近の受注」の
+// ときだけ ⚠️ に下げる (出荷待ちの差。6〜10 月の毎月 2〜6 日に ❌ だった)
+const ramp = monthStartRamp('rakuten', monthStr, { now, noGrace: noMonthStartGrace, noListingRamp });
+const rampedChecks = [];
 
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -188,14 +196,16 @@ try {
 if (listingAvailable) {
   const totalDiff = Math.abs(dailyTotal - listingTotal);
   const totalDiffPct = listingTotal !== 0 ? (totalDiff / Math.abs(listingTotal)) * 100 : 0;
-  recordResult(
-    'listing_diff_pct',
-    totalDiffPct > THRESHOLDS.listing_diff_pct.error ? 'error' :
-      totalDiffPct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info',
-    totalDiffPct,
-    THRESHOLDS.listing_diff_pct.error,
-    { daily_total_jpy: dailyTotal, listing_total_jpy: listingTotal, diff_jpy: dailyTotal - listingTotal }
-  );
+  const listingSeverity = (pct) => (pct > THRESHOLDS.listing_diff_pct.error ? 'error' : pct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info');
+  const lw = monthStartRampWindow(ramp, 'listing_diff_pct');
+  const ld = applyMonthStartRamp(monthStartGrace ? null : ramp, 'listing_diff_pct', listingSeverity(totalDiffPct),
+    { daily_total_jpy: dailyTotal, listing_total_jpy: listingTotal, diff_jpy: dailyTotal - listingTotal },
+    { shortfall: listingTotal - dailyTotal, explainedBy: recentListingJpy(db, 'rakuten', lw),
+      // 窓より前の古い部分 (月の 1 日〜窓の前の日) の listing と fact を、同じしきい値で比べる
+      older: monthStartRampOlder(lw, (from, to) => listingOlderPart(recentListingJpy(db, 'rakuten', { from, to }),
+        Number(db.prepare('SELECT SUM(gross_sales_jpy_incl) AS p FROM f_rakuten_finance_sku_daily_v1 WHERE date_jst BETWEEN ? AND ?').get(from, to)?.p || 0), listingSeverity)) });
+  if (ld.ramped) rampedChecks.push({ checkName: 'listing_diff_pct', value: totalDiffPct });
+  recordResult('listing_diff_pct', ld.severity, totalDiffPct, THRESHOLDS.listing_diff_pct.error, ld.details);
 } else {
   recordResult(
     'listing_diff_pct',
@@ -332,6 +342,8 @@ function printSummary() {
 printSummary();
 // 月初の猶予で通した回は、最後の行を「⚠️ 月初の猶予: …」にする (daily-sync はこの行を要約に出し、warn を立てて見出しを ⚠️ にする)
 if (monthStartGrace && !hasError) console.log(monthStartEmptyNote('f_rakuten_finance_sku_daily_v1', monthStr, monthStartGrace));
+// 月初の立ち上がりで下げた回も、最後の行を「⚠️ 月初の立ち上がり: …」にする (daily-sync は見出しを ⚠️ にする)
+else if (rampedChecks.length > 0 && !hasError) console.log(monthStartRampNote(ramp, rampedChecks));
 
 db.close();
 process.exit(hasError ? 1 : 0);

@@ -282,6 +282,12 @@ export function coordinatorPushedFinance(dataDir, runId) {
 // この回のモールの取込が ❌ なら DQ に猶予を禁じる (= 当月 0 行は猶予なしで CRITICAL。取込が止まった朝に 0 行を「月初だから」と通さない)
 // 渡した結果が 1 つでも ❌ (か無い) なら禁じる。Yahoo は月初の前月の build / DQ の結果も一緒に渡す (R2)
 function monthStartGraceFlag(...results) { return results.length > 0 && results.every((r) => r && r.success) ? '' : ' --no-month-start-grace'; }
+// 月初の立ち上がり (PR #1613 R1 Medium): この回の f_sales の再構築が ❌ (打ち切り・見送りを含む) なら、listing_diff_pct の立ち上がりだけを禁じる
+// (比べる相手の f_sales_by_listing が古いと、fact が多い向きになるとは限らない)。whitelist の立ち上がりと 0 行の猶予は取込の結果 (上) だけで決める
+// R2 Medium: f_sales の再構築は NE の取込が ❌ でも流れて ✅ になりうる (古い raw_ne_orders から作り直すだけ)。listing の元の取込の結果も渡し、
+// 1 つでも ❌ (か無い) なら禁じる。元 = Yahoo・au PAY・LINE ギフト・Qoo10 は NE (rebuild-f-sales.js の raw_ne_orders) / 楽天は raw_rakuten_orders
+// (楽天の取込が ❌ の朝は monthStartGraceFlag(rkResult) で立ち上がりごと止まる = ここで渡すのは f_sales だけ)。Qoo10 は listing の立ち上がりを持たない (受けるだけ)
+function listingRampFlag(fSales, ...sources) { return [fSales, ...sources].every((r) => r && r.success) ? '' : ' --no-listing-ramp'; }
 // 1 行ごとの印: 失敗 ❌ / 見送り ⏸️ / warn つきの成功 ⚠️ (月初の猶予の DQ など。R2) / 成功 ✅
 function resultIcon(r) { return r.skipped ? '⏸️' : (r.success ? (r.warn === true ? '⚠️' : '✅') : '❌'); }
 // 月初の猶予で通した DQ (最後の行が「⚠️ 月初の猶予:」) は warn = 見出しを ⚠️ にし、通知が落ちた朝に lock を残す。
@@ -1023,7 +1029,7 @@ async function main() {
 
     if (rakutenFinanceBuildResult.success) {
       const rakutenFinanceDqResult = runScript(
-        `apps/warehouse/run-rakuten-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}${monthStartGraceFlag(rkResult)}`,
+        `apps/warehouse/run-rakuten-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}${monthStartGraceFlag(rkResult)}${listingRampFlag(fSalesResult)}`,
         '楽天 finance DQ', 300000
       );
       results.push({ name: '楽天 finance DQ', ...rakutenFinanceDqResult, warn: dqMonthStartWarn(rakutenFinanceDqResult) });
@@ -1247,7 +1253,7 @@ async function main() {
         }
       }
       const yahooFinanceDqResult = runScript(
-        `apps/warehouse/run-yahoo-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}${monthStartGraceFlag(yahooResult, ...yahooPrevSteps)}`,
+        `apps/warehouse/run-yahoo-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}${monthStartGraceFlag(yahooResult, ...yahooPrevSteps)}${listingRampFlag(fSalesResult, neResult)}`,
         'Yahoo finance DQ', 300000
       );
       results.push({ name: 'Yahoo finance DQ', ...yahooFinanceDqResult, warn: dqMonthStartWarn(yahooFinanceDqResult) });
@@ -1286,7 +1292,7 @@ async function main() {
       });
       for (const ym of aupayRollingMonths) {
         const aupayFinanceDqResult = runScript(
-          `apps/warehouse/run-aupay-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}${monthStartGraceFlag(aupayResult)}`,
+          `apps/warehouse/run-aupay-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}${monthStartGraceFlag(aupayResult)}${listingRampFlag(fSalesResult, neResult)}`,
           `au PAY finance DQ ${ym}`, 300000
         );
         results.push({ name: `au PAY finance DQ ${ym}`, ...aupayFinanceDqResult, warn: dqMonthStartWarn(aupayFinanceDqResult) });
@@ -1326,7 +1332,7 @@ async function main() {
       });
       for (const ym of linegiftRollingMonths) {
         const linegiftFinanceDqResult = runScript(
-          `apps/warehouse/run-linegift-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}${monthStartGraceFlag(linegiftResult)}`,
+          `apps/warehouse/run-linegift-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}${monthStartGraceFlag(linegiftResult)}${listingRampFlag(fSalesResult, neResult)}`,
           `LINEギフト finance DQ ${ym}`, 300000
         );
         results.push({ name: `LINEギフト finance DQ ${ym}`, ...linegiftFinanceDqResult, warn: dqMonthStartWarn(linegiftFinanceDqResult) });
@@ -1384,7 +1390,7 @@ async function main() {
       });
       for (const ym of qoo10RollingMonths) {
         const qoo10FinanceDqResult = runScript(
-          `apps/warehouse/run-qoo10-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}${monthStartGraceFlag(qoo10Result)}`,
+          `apps/warehouse/run-qoo10-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}${monthStartGraceFlag(qoo10Result)}${listingRampFlag(fSalesResult, neResult)}`,
           `Qoo10 finance DQ ${ym}`, 300000
         );
         results.push({ name: `Qoo10 finance DQ ${ym}`, ...qoo10FinanceDqResult, warn: dqMonthStartWarn(qoo10FinanceDqResult) });
