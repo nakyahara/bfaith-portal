@@ -9,7 +9,12 @@
  * 形 (v3.4 = 旧 #1559 の「日・月・期間の中の月の小計・期間の合計」の行は返さない):
  *   /totals 200 = { ok, contract, kind: 'totals', mall, scope, from, to, master_basis, calculation_version, calculated_at, master_as_of, total: {期間の全体の 1 行}, months: [...] }
  *   /daily  200 = { ok, contract, kind: 'daily',  mall, scope, from, to, master_basis, calculation_version, calculated_at, master_as_of, rows: [日 × 出品], months: [...] }
- *   503         = { ok: false, code: PROFIT_503_CODES のどれか, error: 文, reason?: 'METRICS_…' などの大文字のコード }
+ *   503         = { ok: false, code: PROFIT_503_CODES のどれか, error: 文, reason?: 'METRICS_…' などの大文字のコード, failed_months?: ['YYYY-MM', …] (PROFIT_PARTIAL_FAILED だけ) }
+ *
+ * 🆕 v2 (D-60 の PR 2c・設計 §3.10 の PR の表の 2c・§5 の 0b-2 の (d)・0b-3 の (c)・設計 19 v14 §6.6.1 / §6.2.1 ③):
+ *   - months[] に finance_coverage_token (64 桁の小文字の 16 進・core.finance_coverage_token の値 = F4 の coverage_token と同じ関数・3a で作る)
+ *   - /daily の行に member_seller_skus (その行の粒度にまとまった、受け取った seller SKU を trim + 小文字・UTF-8 の bytes の順・重複なしの配列)
+ *   - 503: 57014 / 25P04 の分け方 (CANCEL_MAP・classifyCancellation) の reason を列挙に・PROFIT_PARTIAL_FAILED の本文に failed_months (月だけ・値は出さない)
  *
  * 値の書き方 (JSON):
  *   bigint (金額・数・ID) = 10 進の文字列 (JS の Number に入れない) / bigint[] = その文字列の配列
@@ -20,7 +25,15 @@
  *   raw の列 (丸める前の値・名前が _raw で終わる) と旧 totals の行の種類 (row_kind・month_start ほか) は出さない
  */
 
-export const CONTRACT_VERSION = 'amazon_profit_response_v1';
+export const CONTRACT_VERSION = 'amazon_profit_response_v2';
+/**
+ * 版の履歴 (形を変えたら版を上げてここに 1 行足す・試験が CONTRACT_VERSION = 最後の行を確かめる)。
+ * 🚨 v2 は PR 5 (校正) と PR 6 (開ける) の前に入れる = 開けた応答に最初から含める (後から足すと校正と契約の版をやり直す・設計 19 §6.6.1)
+ */
+export const CONTRACT_HISTORY = Object.freeze([
+  Object.freeze({ version: 'amazon_profit_response_v1', pr: '#1602 (D-60 PR 2b)', change: '最初の形 (期間の全体の 1 行 + months[]・日 × 出品の行・503 の固定の文と reason の列挙)' }),
+  Object.freeze({ version: 'amazon_profit_response_v2', pr: 'D-60 PR 2c', change: 'months[].finance_coverage_token・日の行の member_seller_skus・57014 / 25P04 の分け方の reason (CANCEL_MAP)・PROFIT_PARTIAL_FAILED の failed_months' }),
+]);
 
 /**
  * 503 の code ごとの **固定の安全な文** (#1602 Codex R1 H1)。error はこの文と完全に一致しなければ違反 = 上流の例外の文・Render の応答の本文・
@@ -55,13 +68,17 @@ export const PROFIT_503_REASONS = Object.freeze({
     'CALIBRATION_INPUTS_CHANGED', 'CALIBRATION_PLAN_CHANGED']),
   PROFIT_BUSY: Object.freeze(['LOCK_NOT_AVAILABLE']),
   PROFIT_RESOURCE: Object.freeze(['RESOURCE_MEMORY', 'RESOURCE_TEMP_FILES', 'RESOURCE_PROCESS_INPUTS', 'RESOURCE_LOAD_FACTOR', 'RESOURCE_COUNT_PLAN',
-    'RESOURCE_TEMP_FILE_LIMIT_NOT_FINITE', 'RESOURCE_PRIVILEGES']),
+    'RESOURCE_TEMP_FILE_LIMIT_NOT_FINITE', 'RESOURCE_PRIVILEGES',
+    // 🆕 v2 (設計 §3.10「57014 の分け方」の表・R-v3-10 M2)
+    'RESOURCE_LOAD_COUNT_TIME', 'RESOURCE_TRANSACTION_TIMEOUT']),
   PROFIT_METRICS_UNAVAILABLE: METRICS_REASONS,
   PROFIT_DB_UNAVAILABLE: Object.freeze(['DB_CONNECT', 'DB_BEGIN', 'DB_SET_LOCAL', 'DB_SETTING_READBACK', 'DB_LOCK_STATEMENT', 'DB_COMMIT', 'DB_OUTCOME_UNKNOWN',
     'DB_UNEXPECTED']),
   PROFIT_PARTIAL_FAILED: Object.freeze(['MONTH_META_FAILED', 'MONTH_CALC_FAILED', 'MONTH_STATEMENT_TIMEOUT']),
   PROFIT_VERSION_MISMATCH: Object.freeze(['CALCULATION_VERSION', 'MASTER_BASIS']),
-  PROFIT_INTERNAL: Object.freeze(['APP_UNEXPECTED']),
+  PROFIT_INTERNAL: Object.freeze(['APP_UNEXPECTED',
+    // 🆕 v2 (設計 §3.10「57014 の分け方」の表)
+    'INTERNAL_EXTERNAL_CANCEL', 'INTERNAL_UNCLASSIFIED_CANCEL']),
 });
 /**
  * 1 回の要求の **全部の失敗の経路** → 503 の code / reason の対応表 (#1602 Codex R1 M2・設計 §3.10「1 回の要求の取引」0.〜7. の順)。
@@ -82,12 +99,78 @@ export const FAILURE_PATHS = Object.freeze([
   ['4. 関門の中の予期しない DB の例外 (月の計算の前)', 'PROFIT_DB_UNAVAILABLE', 'DB_UNEXPECTED'],
   ['5. 月の metadata の関数の失敗', 'PROFIT_PARTIAL_FAILED', 'MONTH_META_FAILED'],
   ['5. 月の包む関数の失敗', 'PROFIT_PARTIAL_FAILED', 'MONTH_CALC_FAILED'],
-  ['5. 月の計算の statement_timeout', 'PROFIT_PARTIAL_FAILED', 'MONTH_STATEMENT_TIMEOUT'],
+  ['5. 月の計算の statement_timeout (57014・アプリの timer の印 app_statement_budget)', 'PROFIT_PARTIAL_FAILED', 'MONTH_STATEMENT_TIMEOUT'],
   ['5. calculation_version / master_basis が月で違う', 'PROFIT_VERSION_MISMATCH', 'CALCULATION_VERSION / MASTER_BASIS'],
   ['6. COMMIT の失敗', 'PROFIT_DB_UNAVAILABLE', 'DB_COMMIT'],
   ['6. 結果が分からない (接続が切れた・ROLLBACK も失敗 = 接続を捨てる)', 'PROFIT_DB_UNAVAILABLE', 'DB_OUTCOME_UNKNOWN'],
   ['応答を作る所 (アプリ) の思わぬ例外', 'PROFIT_INTERNAL', 'APP_UNEXPECTED'],
+  // 🆕 v2 = 57014 / 25P04 の分け方 (下の CANCEL_MAP と同じ行・設計 §3.10「門の関数の契約」の「57014 の分け方」の表)
+  ['4. 負荷の数え上げの文の取り消し (57014・アプリの timer の印 app_statement_budget)', 'PROFIT_RESOURCE', 'RESOURCE_LOAD_COUNT_TIME'],
+  ['4. 負荷の数え上げの wall-clock の deadline (印 app_deadline・57014 か取り消し無し)', 'PROFIT_RESOURCE', 'RESOURCE_LOAD_COUNT_TIME'],
+  ['4.・5. 印の無い取り消し (57014 unmarked = 人・見張りの pg_cancel_backend か、server の statement_timeout がアプリの timer より先)', 'PROFIT_INTERNAL', 'INTERNAL_EXTERNAL_CANCEL'],
+  ['どの段でも transaction_timeout (25P04・ROLLBACK を送らず接続を捨てる)', 'PROFIT_RESOURCE', 'RESOURCE_TRANSACTION_TIMEOUT'],
+  ['取り消しの表 (CANCEL_MAP) に無い組 (例 = 2. の SET LOCAL や 3. の lock の文の 57014)', 'PROFIT_INTERNAL', 'INTERNAL_UNCLASSIFIED_CANCEL'],
 ].map(([path, code, reason]) => Object.freeze({ path, code, reason })));
+
+/**
+ * 🆕 v2 取り消しの分け方 (設計 §3.10「門の関数の契約」の「57014 (query_canceled) の分け方」の表の正本 = R-v3-10 M2・R-v3-11 L-new-2)。
+ * 同じ 57014 でも意味が違う → (stage, sqlstate, cancellation_source) で 503 の code / reason を決める。
+ *   - cancellation_source はアプリが自分で決める (PostgreSQL の文の文字に頼らない)。アプリの timer・関門の wall-clock の deadline・HTTP の切断のどれかが
+ *     発火したら、pg_cancel_backend を送る前に要求の状態に印 cancel_mark = { source, stage } を書く (最初の 1 つだけ・後から変えない)
+ *   - **印があれば印の source** (経過時間を見ない) / **印が無ければ unmarked**。印を書いた要求は文が先に終わっても結果を使わずに 503 (接続は捨てる)
+ *   - 門 (Gr・_d60_guard) の D6* / 55P03 はこの表でなく HEAVY_GUARD_SQLSTATES の対応 (3a で固定) = classifyCancellation は印が無ければ null を返す
+ */
+export const CANCELLATION_SOURCES = Object.freeze(['app_statement_budget', 'app_deadline', 'client_disconnect', 'unmarked']);
+/** 要求の取引の段 (設計 §3.10「1 回の要求の取引」の 2.〜6.)。CANCEL_MAP の行は 4. と 5. と「どの段でも」だけ = ほかの段の 57014 は表に無い組 */
+export const CANCEL_STAGES = Object.freeze(['tx_setup', 'lock_statement', 'load_count', 'month_body', 'commit']);
+/**
+ * 表の行 (上から順に見る)。'*' = どれでも。sqlstate null = 取り消しの例外が無い (文が先に終わった・文と文の間で deadline が来た)。
+ *   respond = false → 応答を作らない (client が居ない・今の契約の 7.) / send_rollback = false → ROLLBACK を送らず接続を捨てる (25P04 = session が終わる)
+ *   failed_months = true → 503 の本文に止まった月 (PROFIT_PARTIAL_FAILED) / log = ログの理由 (3 つの組と段だけを出す・文と値は出さない)
+ */
+export const CANCEL_MAP = Object.freeze([
+  ['month_body', '57014', 'app_statement_budget', 'PROFIT_PARTIAL_FAILED', 'MONTH_STATEMENT_TIMEOUT', { failed_months: true, log: 'month_statement_timeout' }],
+  ['load_count', '57014', 'app_statement_budget', 'PROFIT_RESOURCE', 'RESOURCE_LOAD_COUNT_TIME', { log: 'load_count_statement_timeout' }],
+  ['load_count', '57014', 'app_deadline', 'PROFIT_RESOURCE', 'RESOURCE_LOAD_COUNT_TIME', { log: 'load_count_deadline' }],
+  ['load_count', null, 'app_deadline', 'PROFIT_RESOURCE', 'RESOURCE_LOAD_COUNT_TIME', { log: 'load_count_deadline' }],
+  ['*', '*', 'client_disconnect', null, null, { respond: false, log: 'client_disconnect' }],
+  ['*', '25P04', '*', 'PROFIT_RESOURCE', 'RESOURCE_TRANSACTION_TIMEOUT', { send_rollback: false, log: 'transaction_timeout' }],
+  ['load_count', '57014', 'unmarked', 'PROFIT_INTERNAL', 'INTERNAL_EXTERNAL_CANCEL', { log: 'external_cancel' }],
+  ['month_body', '57014', 'unmarked', 'PROFIT_INTERNAL', 'INTERNAL_EXTERNAL_CANCEL', { log: 'external_cancel' }],
+].map(([stage, sqlstate, source, code, reason, x]) => Object.freeze({
+  stage, sqlstate, source, code, reason, respond: x.respond ?? true, send_rollback: x.send_rollback ?? true, failed_months: x.failed_months ?? false, log: x.log,
+})));
+/** 表に無い組 = 握りつぶして成功・部分の値にしない・rethrow もしない (応答は安全な固定の 503)・ログに 3 つの組だけ */
+export const CANCEL_UNCLASSIFIED = Object.freeze({ stage: '*', sqlstate: '*', source: '*', code: 'PROFIT_INTERNAL', reason: 'INTERNAL_UNCLASSIFIED_CANCEL',
+  respond: true, send_rollback: true, failed_months: false, log: 'unclassified_cancel' });
+/** 取り消しの例外の SQLSTATE (この 2 つと「印あり」だけがこの表の対象) */
+export const CANCEL_SQLSTATES = Object.freeze(['57014', '25P04']);
+
+/**
+ * 取り消しを (stage, sqlstate, 印) から 1 つの結果に分ける。経過時間は引数に無い (経過時間の近さでは決めない = R-v3-11 L-new-2)。
+ *   @param {{ stage: string, sqlstate?: string|null, mark?: { source: string, stage?: string }|null }} x
+ *     stage = 例外を受けた (印が無いとき) 段 / mark = 要求の状態の印 (stage があれば印の段で引く = timer を張った段の理由)
+ *   @returns 表の行 (CANCEL_MAP の 1 つか CANCEL_UNCLASSIFIED) / null = 取り消しでない (印が無く sqlstate が 57014 / 25P04 でない = 門の対応か FAILURE_PATHS のほかの行)
+ * 順: ① 印 client_disconnect = 応答を作らない (client が居ない) ② 25P04 = どの段でも RESOURCE_TRANSACTION_TIMEOUT (ROLLBACK を送らない)
+ *     ③ 印あり = 印の source と段で引く (文が先に終わった・ほかの例外で終わった も 57014 と同じに扱う = 結果を使わない) ④ 印なしの 57014 = unmarked で引く
+ *     ⑤ どれにも当たらない = CANCEL_UNCLASSIFIED (知らない段・知らない source の印も)
+ */
+export function classifyCancellation({ stage, sqlstate = null, mark = null } = {}) {
+  const hasMark = mark != null;
+  const source = hasMark ? mark.source : 'unmarked';
+  if (hasMark && (!CANCELLATION_SOURCES.includes(source) || source === 'unmarked')) return CANCEL_UNCLASSIFIED;
+  if (source === 'client_disconnect') return CANCEL_MAP.find((e) => e.source === 'client_disconnect');
+  if (sqlstate === '25P04') return CANCEL_MAP.find((e) => e.sqlstate === '25P04');
+  if (!hasMark && sqlstate !== '57014') return null;
+  const st = hasMark && mark.stage != null ? mark.stage : stage;
+  if (!CANCEL_STAGES.includes(st)) return CANCEL_UNCLASSIFIED;
+  const tries = hasMark && sqlstate === null ? [null, '57014'] : ['57014'];
+  for (const s of tries) {
+    const hit = CANCEL_MAP.find((e) => (e.stage === '*' || e.stage === st) && (e.sqlstate === '*' || e.sqlstate === s) && (e.source === '*' || e.source === source));
+    if (hit) return hit;
+  }
+  return CANCEL_UNCLASSIFIED;
+}
 /**
  * 応答に付ける header (200 も 503 も)。AI・画面は正式な値を自分で保存しない。
  * 🚨 今の router の 503 (封じ込め) には付いていない = 契約の定数だけ。**router に触れる PR (遅くとも PR 6) の必須の条件**: 本物の HTTP の応答の header を試験で確かめる
@@ -96,9 +179,31 @@ export const REQUIRED_HEADERS = Object.freeze({ 'cache-control': 'no-store' });
 /** 1 回の要求で触れる暦月の上限 (受け口の 400 と、この契約の validator の両方で縛る) */
 export const MAX_MONTHS = 13;
 
-/** 503 の本文を作る (固定の文・列挙にない reason は付けない = 上流の例外の文を入れる道が無い) */
-export function build503Body(code, reason) {
+/**
+ * 🆕 v2 failed_months (設計 §5 の 0b-3 の (c) = 2026-10-04 中原さんが推しどおり) = PROFIT_PARTIAL_FAILED の本文 **だけ** に、止まった月を 'YYYY-MM' の配列で。
+ * 必須 (1 つ以上)・月の昇順・重複なし・MAX_MONTHS (13) まで・要求の触れる暦月の中。🚨 値 (金額・行・SKU・例外の文) は入れない = 要素は月の形の文字だけ
+ */
+export const FAILED_MONTHS_CODE = 'PROFIT_PARTIAL_FAILED';
+const YM_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+/** 503 の本文に出してよい列 (failed_months は FAILED_MONTHS_CODE のときだけ) */
+export const PROFIT_503_BODY_KEYS = Object.freeze(['ok', 'code', 'error', 'reason', 'failed_months']);
+
+/**
+ * 503 の本文を作る (固定の文・列挙にない reason は付けない = 上流の例外の文を入れる道が無い)。
+ * 🆕 v2: PROFIT_PARTIAL_FAILED は failedMonths ('YYYY-MM' の配列・並べ替えと重複の除きはここでする) が必須。月の形でない要素が 1 つでもある・
+ *   空・13 を超える なら、値を出す道を作らないために **PROFIT_INTERNAL / APP_UNEXPECTED** にする (呼び手の誤り)。ほかの code では failedMonths を付けない
+ */
+export function build503Body(code, reason, failedMonths) {
   const c = Object.hasOwn(PROFIT_503_ERRORS, code) ? code : 'PROFIT_INTERNAL';
+  if (c === FAILED_MONTHS_CODE) {
+    const ok = Array.isArray(failedMonths) && failedMonths.length > 0 && failedMonths.every((m) => typeof m === 'string' && YM_RE.test(m));
+    const months = ok ? [...new Set(failedMonths)].sort() : [];
+    if (!ok || months.length > MAX_MONTHS) return build503Body('PROFIT_INTERNAL', 'APP_UNEXPECTED');
+    const body = { ok: false, code: c, error: PROFIT_503_ERRORS[c] };
+    if (typeof reason === 'string' && PROFIT_503_REASONS[c].includes(reason)) body.reason = reason;
+    body.failed_months = months;
+    return body;
+  }
   const body = { ok: false, code: c, error: PROFIT_503_ERRORS[c] };
   if (typeof reason === 'string' && PROFIT_503_REASONS[c].includes(reason)) body.reason = reason;
   return body;
@@ -204,6 +309,8 @@ export const DAILY_COLUMNS = Object.freeze([
   ['company_id', 'smallint', 'never'], ['mall', 'text', 'never'], ['scope_key', 'text', 'never'], ['economic_date_jst', 'date', 'never'],
   ['listing_id', 'bigint', 'iff_unresolved'], ['seller_sku_norm', 'text', 'iff_resolved'], ['listing_resolution', 'text', 'never', { enum: LISTING_RESOLUTIONS }],
   ['listing_code', 'text', 'iff_unresolved'],
+  // 🆕 v2 (PR 2c・設計 19 §6.6.1 の案 (a)) = 0050 の関数の戻りには無い = 3a の包む関数が返す (addedIn: 'v2' = DB の列の突き合わせから外す)
+  ['member_seller_skus', 'text[]', 'never', { memberSkus: true, addedIn: 'v2' }],
   ['received_listing_ids', 'bigint[]', 'never', IDS_ASC], ['received_listing_unresolved_count', 'integer', 'never', N0], ['ad_received_listing_ids', 'bigint[]', 'never', IDS_ASC],
   ['ad_received_unresolved_rows', 'integer', 'never', N0],
   ['units_ordered', 'integer', 'never'], ['units_refunded_customer', 'integer', 'never'], ['units_marketplace_guarantee', 'integer', 'never'],
@@ -242,10 +349,45 @@ export const DAILY_NUL_RULES = Object.freeze(['never', 'maybe', 'iff_unresolved'
   'iff_refund_price_missing', 'iff_ad_uncollected', 'iff_not_ok_before', 'iff_not_ok_after']);
 /** 互換の名前 (null にならない列の一覧) */
 export const DAILY_NOT_NULL = Object.freeze(DAILY_COLUMNS.filter((c) => c.nul === 'never').map((c) => c.name));
+/** 今の DB の関数 (0049 / 0050 の mart.amazon_profit_daily_range) の戻りの列 = DAILY_COLUMNS から v2 で足した列を除いたもの (試験が pg_proc と突き合わせる) */
+export const DAILY_DB_COLUMNS = Object.freeze(DAILY_COLUMNS.filter((c) => !c.addedIn));
+
+/**
+ * 🆕 v2 member_seller_skus の規則 (設計 13 §3.10 の PR の表の 2c・設計 19 §6.6.1 / §6.2.5 の「文字の配列」):
+ *   - 中身 = その行の粒度 (解決 = 出品 / 未解決 = 正規化 SKU) にまとまった、その日の財務の行で **受け取った seller SKU** を trim + 小文字にしたもの
+ *     (利益の行と同じ計算・同じスナップショットで解決 = F4-5 の「まとめた SKU」の構成の SKU)
+ *   - 型 = 文字の配列・null にならない。**空の配列 [] = その日のその粒度に財務の行が無い** (広告だけ・Easy Ship だけの行)。⇔ order_rows = 0
+ *   - 並び = UTF-8 の bytes の厳密な昇順 (= 重複なし・locale の比べを使わない・JS は Buffer.compare)
+ *   - 要素 = 空でない・前後に空白なし (trim の空白 = MEMBER_SKU_EDGE_SPACE・core.norm_code と 0054 の amazon_map_key_problem と同じ集合)・
+ *     ASCII の大文字なし (lower)・MAX_MEMBER_SKU_CHARS 文字まで (0054 の対応の表の seller_sku と同じ 255)
+ *   - 上限 = 1 行に MAX_MEMBER_SELLER_SKUS 個まで (直接の一致 = 1 つの粒度の SKU は全部 core.norm_code が同じ = 全角・半角・空白・ダッシュの違いだけ)
+ *   - 同じ日の行の間で同じ seller SKU は 1 つの粒度にだけ (trim + 小文字が同じなら core.norm_code も同じ = 同じ粒度・F4-5 の「財務の全部の SKU がちょうど 1 つの粒度」)
+ */
+export const MAX_MEMBER_SELLER_SKUS = 100;
+export const MAX_MEMBER_SKU_CHARS = 255;
+// eslint-disable-next-line no-control-regex
+export const MEMBER_SKU_EDGE_SPACE = /^[\u0009-\u000d \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]|[\u0009-\u000d \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]$/;
+/** member_seller_skus の 1 つの配列の形の違反の文 (空 = 違反なし) */
+export function memberSkuErrors(v) {
+  if (!Array.isArray(v)) return ['配列でない'];
+  const e = [];
+  if (v.length > MAX_MEMBER_SELLER_SKUS) e.push(`${v.length} 個 (上限 ${MAX_MEMBER_SELLER_SKUS})`);
+  v.forEach((s, k) => {
+    if (typeof s !== 'string' || s.length === 0) { e.push(`[${k}] 空でない文字でない`); return; }
+    if ([...s].length > MAX_MEMBER_SKU_CHARS) e.push(`[${k}] ${MAX_MEMBER_SKU_CHARS} 文字を超える`);
+    if (MEMBER_SKU_EDGE_SPACE.test(s)) e.push(`[${k}] 前後に空白 (trim していない)`);
+    if (/[A-Z]/.test(s)) e.push(`[${k}] 大文字 (小文字にしていない)`);
+    if (k > 0 && typeof v[k - 1] === 'string' && Buffer.compare(Buffer.from(v[k - 1], 'utf8'), Buffer.from(s, 'utf8')) >= 0) e.push(`[${k}] UTF-8 の bytes の厳密な昇順でない (重複・順の違い)`);
+  });
+  return e;
+}
 
 /** months[] の 1 つ (月の metadata の関数 mart.amazon_profit_month_meta から作る・0 行の月にもある) */
 export const MONTH_KEYS = Object.freeze(['month_start', 'period_from', 'period_to', 'finance_status', 'has_finance_rows', 'finance_month_settled',
-  'finance_coverage_generation', 'finance_source_revision', 'calculation_version', 'calculated_at']);
+  'finance_coverage_generation', 'finance_source_revision',
+  // 🆕 v2 = core.finance_coverage_token(company_id, mall, scope_key, month_start) の値 (64 桁の小文字の 16 進・null にならない・設計 19 §6.2.1 ③ の coverage_token と同じ関数)
+  'finance_coverage_token',
+  'calculation_version', 'calculated_at']);
 export const TOP_KEYS = Object.freeze({
   totals: Object.freeze(['ok', 'contract', 'kind', 'mall', 'scope', 'from', 'to', 'master_basis', 'calculation_version', 'calculated_at', 'master_as_of', 'total', 'months']),
   daily: Object.freeze(['ok', 'contract', 'kind', 'mall', 'scope', 'from', 'to', 'master_basis', 'calculation_version', 'calculated_at', 'master_as_of', 'rows', 'months']),
@@ -355,6 +497,10 @@ function checkMonths(body, errs) {
     if (!FINANCE_STATUS_RANK.includes(m.finance_status)) errs.push(`${p}.finance_status: 知らない状態`);
     if (typeof m.has_finance_rows !== 'boolean' || typeof m.finance_month_settled !== 'boolean') errs.push(`${p}: has_finance_rows / finance_month_settled が boolean でない`);
     for (const k of ['finance_coverage_generation', 'finance_source_revision']) if (m[k] !== null && !isBigStr(m[k])) errs.push(`${p}.${k}: 10 進の文字列か null でない`);
+    // 🆕 v2: coverage の token = 64 桁の小文字の 16 進 (null にならない = 部品の日が月を覆わなければ関数が例外 = 503 MONTH_META_FAILED)
+    if (typeof m.finance_coverage_token !== 'string' || !HEX64.test(m.finance_coverage_token)) errs.push(`${p}.finance_coverage_token: 64 桁の小文字の 16 進でない`);
+    // 部品の period_from / period_to は月の中の日 = 月が違えば token の入力の文字も違う → 同じ応答の 2 つの月で同じ token は写し間違い
+    else if (body.months.slice(0, i).some((q) => isObj(q) && q.finance_coverage_token === m.finance_coverage_token)) errs.push(`${p}.finance_coverage_token: 前の月と同じ (月ごとに違う値のはず)`);
     if (m.calculation_version !== body.calculation_version) errs.push(`${p}.calculation_version: 上と違う (違えば 503 PROFIT_VERSION_MISMATCH)`);
     if (m.calculated_at !== body.calculated_at) errs.push(`${p}.calculated_at: 上と違う (1 つの値)`);
   });
@@ -458,6 +604,10 @@ function dailyRowRuleErrors(r, p) {
   iff(r.ad_status === 'not_collected', has(reasons, 'ad_not_collected'), '広告 not_collected ⇔ 理由 ad_not_collected');
   iff(r.ad_status === 'missing', has(reasons, 'ad_missing'), '広告 missing ⇔ 理由 ad_missing');
   iff(r.ad_status === 'legacy_incomplete', has(reasons, 'ad_legacy_unverified'), '広告 legacy_incomplete ⇔ 理由 ad_legacy_unverified');
+  // 🆕 v2: member は財務の行から作る = 財務の子がある (order_rows > 0) ⇔ member が空でない (広告だけ・Easy Ship だけの行は [])
+  if (Array.isArray(r.member_seller_skus) && Number.isSafeInteger(r.order_rows)) {
+    iff(r.order_rows > 0, r.member_seller_skus.length > 0, '財務の行がある (order_rows > 0) ⇔ member_seller_skus が空でない');
+  }
   // 0 と仮定の理由 = 理由から refund_units_partial_month を除いたもの (0050 の 2 つの array_remove)
   if (Array.isArray(reasons) && Array.isArray(r.assumed_zero_reasons)
     && JSON.stringify(r.assumed_zero_reasons) !== JSON.stringify(reasons.filter((x) => x !== 'refund_units_partial_month'))) {
@@ -491,6 +641,7 @@ function dailyErrors(body) {
       if (c.enum && !c.enum.includes(v)) errs.push(`${p}.${c.name}: 知らない値 (${JSON.stringify(v)})`);
       if (c.hex64 && !HEX64.test(v)) errs.push(`${p}.${c.name}: 64 桁の 16 進でない`);
       if (c.idsAscending && v.some((x, k) => BigInt(x) < 1n || (k > 0 && BigInt(x) <= BigInt(v[k - 1])))) errs.push(`${p}.${c.name}: ID の厳密な昇順 (BigInt・重複なし・1 以上) でない`);
+      if (c.memberSkus) for (const m of memberSkuErrors(v)) errs.push(`${p}.${c.name}: ${m}`);
     }
     if (r.mall !== body.mall || r.scope_key !== body.scope) errs.push(`${p}: mall / scope が上と違う`);
     if (typeof r.economic_date_jst === 'string' && (r.economic_date_jst < body.from || r.economic_date_jst > body.to)) errs.push(`${p}.economic_date_jst: 期間の外`);
@@ -508,7 +659,22 @@ function dailyErrors(body) {
   });
   errs.push(...dayLevelErrors(body.rows));
   errs.push(...requestLevelErrors(body.rows));
+  errs.push(...memberAcrossRowsErrors(body.rows));
   return errs;
+}
+/** 🆕 v2: 同じ日の行の間で同じ seller SKU (trim + 小文字) は 1 つの粒度にだけ (F4-5 の「財務の全部の SKU がちょうど 1 つの粒度」) */
+function memberAcrossRowsErrors(rows) {
+  const e = [], seen = new Map();
+  rows.forEach((r, i) => {
+    if (!isObj(r) || !Array.isArray(r.member_seller_skus)) return;
+    for (const s of r.member_seller_skus) {
+      if (typeof s !== 'string') continue;
+      const k = JSON.stringify([String(r.economic_date_jst), s]);
+      if (seen.has(k)) e.push(`$.rows[${i}].member_seller_skus: 同じ日の行 ${seen.get(k)} にもある seller SKU (1 つの SKU は 1 つの粒度にだけ)`);
+      else seen.set(k, i);
+    }
+  });
+  return e;
 }
 /**
  * 要求全体で固定の値は全部の行で同じ (#1602 Codex R4 M1)。0050 の最後の SELECT で要求全体に固定の列 =
@@ -566,17 +732,36 @@ const findSecrets = (body, errs) => {
   for (const re of SECRET_PATTERNS) if (re.test(text)) errs.push(`$: 秘密らしい文字 (${re}) がある`);
 };
 
-/** 503 の本文を確かめる (今の封じ込めの PROFIT_ROUTE_DISABLED もこの形)。error は code の固定の文・reason は code ごとの列挙だけ */
-export function validate503Body(body) {
+/**
+ * 503 の本文を確かめる (今の封じ込めの PROFIT_ROUTE_DISABLED もこの形)。error は code の固定の文・reason は code ごとの列挙だけ。
+ * 🆕 v2: failed_months は PROFIT_PARTIAL_FAILED のときだけ・必須・'YYYY-MM' の厳密な昇順・13 まで。request ({ from, to }) を渡せば要求の触れる暦月の中かも確かめる
+ */
+export function validate503Body(body, request) {
   return guard(() => {
     const errs = [];
     if (!isObj(body)) return ['$: object でない'];
     findSecrets(body, errs);
-    for (const k of Object.keys(body)) if (!['ok', 'code', 'error', 'reason'].includes(k)) errs.push(`$.${k}: 503 に出さない列 (値・部分の結果・Render の本文を返さない)`);
+    for (const k of Object.keys(body)) if (!PROFIT_503_BODY_KEYS.includes(k)) errs.push(`$.${k}: 503 に出さない列 (値・部分の結果・Render の本文を返さない)`);
     if (body.ok !== false) errs.push('$.ok: false でない');
     if (!PROFIT_503_CODES.includes(body.code)) { errs.push(`$.code: 一覧に無い`); return errs; }
     if (body.error !== PROFIT_503_ERRORS[body.code]) errs.push('$.error: code の固定の文と違う (上流の例外・本文を入れない)');
     if (Object.hasOwn(body, 'reason') && !PROFIT_503_REASONS[body.code].includes(body.reason)) errs.push('$.reason: この code の列挙に無い');
+    if (body.code !== FAILED_MONTHS_CODE) {
+      if (Object.hasOwn(body, 'failed_months')) errs.push(`$.failed_months: ${FAILED_MONTHS_CODE} のときだけ`);
+      return errs;
+    }
+    const fm = body.failed_months;
+    if (!Array.isArray(fm) || fm.length === 0) { errs.push('$.failed_months: 止まった月の配列 (1 つ以上) が無い'); return errs; }
+    if (fm.length > MAX_MONTHS) errs.push(`$.failed_months: ${fm.length} 個 (上限 ${MAX_MONTHS})`);
+    fm.forEach((m, k) => {
+      if (typeof m !== 'string' || !YM_RE.test(m)) errs.push(`$.failed_months[${k}]: 'YYYY-MM' の形でない (値・行・例外の文を入れない)`);
+      else if (k > 0 && !(typeof fm[k - 1] === 'string' && fm[k - 1] < m)) errs.push(`$.failed_months[${k}]: 月の厳密な昇順でない (重複・順の違い)`);
+    });
+    if (request != null) {
+      const touched = isValidDate(request.from) && isValidDate(request.to) && request.from <= request.to ? monthsOf(request.from, request.to).map((x) => x.month_start.slice(0, 7)) : null;
+      if (!touched) errs.push('request: from / to が日付でない・逆');
+      else for (const m of fm) if (typeof m === 'string' && !touched.includes(m)) errs.push(`$.failed_months: ${m} は要求の触れる暦月の外`);
+    }
     return errs;
   });
 }

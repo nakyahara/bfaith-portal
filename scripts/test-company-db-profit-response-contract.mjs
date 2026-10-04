@@ -24,7 +24,11 @@ import {
   CONTRACT_VERSION, PROFIT_503_CODES, REQUIRED_HEADERS, REASON_ORDER, TOTALS_REASONS, ASSUMED_ZERO_REASONS, MASTER_NOTE_KEYS, TOTALS_COLUMNS, TOTALS_RULES, DAILY_COLUMNS,
   MONTH_KEYS, validateTotalsResponse, validateDailyResponse, validate503Body, monthsOf, PROFIT_503_ERRORS, PROFIT_503_REASONS, METRICS_REASONS, FAILURE_PATHS,
   build503Body, SECRET_PATTERNS, DAILY_NUL_RULES, MAX_MONTHS, REQUEST_LEVEL_FIELDS,
+  // 🆕 v2 (PR 2c)
+  CONTRACT_HISTORY, DAILY_DB_COLUMNS, MAX_MEMBER_SELLER_SKUS, MAX_MEMBER_SKU_CHARS, memberSkuErrors, FAILED_MONTHS_CODE, PROFIT_503_BODY_KEYS,
+  CANCELLATION_SOURCES, CANCEL_STAGES, CANCEL_MAP, CANCEL_UNCLASSIFIED, CANCEL_SQLSTATES, classifyCancellation,
 } from '../apps/company-db/profit/response-contract.mjs';
+import crypto from 'node:crypto';
 import { combineTotals, combineDaily, sumDecimals, round2 } from './fixtures/amazon-profit-response/reference-combine.mjs';
 import companyDbRouter, { __setPgClientFactory } from '../apps/company-db/router.mjs';
 
@@ -61,10 +65,13 @@ await t('/totals の分類の表 = mart.amazon_profit_day_totals_range の戻り
     'profit_after_account_fees_incl', 'profit_after_account_fees_excl', 'ad_cost_total']) assert.match(TOTALS_COLUMNS.find((c) => c.name === n).rule, /_null$/, n);
   for (const n of ['day_finance_status', 'finance_coverage_generation', 'finance_source_revision']) assert.equal(TOTALS_COLUMNS.find((c) => c.name === n).rule, 'null_in_period', n);
 });
-await t('/daily の列の表 = mart.amazon_profit_daily_range の戻りの列 (名前・型・並び) と同じ', async () => {
+await t('/daily の列の表 (v2 で足した列を除く) = mart.amazon_profit_daily_range の戻りの列 (名前・型・並び) と同じ・v2 で足したのは member_seller_skus だけ', async () => {
   const cols = await fnCols('mart.amazon_profit_daily_range(smallint,text,text,date,date)');
   assert.ok(cols.length > 80, `${cols.length}`);
-  assert.deepEqual(DAILY_COLUMNS.map((c) => [c.name, c.type]), cols.map((c) => [c.name, c.type]));
+  assert.deepEqual(DAILY_DB_COLUMNS.map((c) => [c.name, c.type]), cols.map((c) => [c.name, c.type]));
+  // 🆕 v2: 応答だけの列 (3a の包む関数が返す) = 今の DB の関数の戻りに無い
+  assert.deepEqual(DAILY_COLUMNS.filter((c) => c.addedIn).map((c) => [c.name, c.type, c.nul, c.addedIn]), [['member_seller_skus', 'text[]', 'never', 'v2']]);
+  assert.ok(!cols.some((c) => c.name === 'member_seller_skus'), '0050 の関数が member_seller_skus を返すようになった = DAILY_COLUMNS の addedIn を外す');
 });
 await t('理由・印の決まった順 = 0049 / 0050 の関数の本文の array_remove(array[…]) の順', async () => {
   const def = async (sig) => (await pg.query(`select pg_get_functiondef($1::regprocedure) as d`, [sig])).rows[0].d;
@@ -401,7 +408,8 @@ await t('503 の code の一覧 = fixture の本文 (code ごとに 1 つ・固�
   for (const b of errors503) {
     assert.deepEqual(validate503Body(b).errors, [], b.code);
     assert.equal(b.error, PROFIT_503_ERRORS[b.code]);
-    assert.deepEqual(b, build503Body(b.code, b.reason));
+    assert.deepEqual(b, build503Body(b.code, b.reason, b.failed_months));
+    assert.equal(Object.hasOwn(b, 'failed_months'), b.code === FAILED_MONTHS_CODE, b.code);   // 🆕 v2
   }
   for (const c of PROFIT_503_CODES) for (const re of SECRET_PATTERNS) assert.doesNotMatch(PROFIT_503_ERRORS[c], re, c);
 });
@@ -511,7 +519,8 @@ await t(`触れる暦月は ${MAX_MONTHS} か月まで: 14 か月の応答は va
   const shift = (from, to) => {
     const x = clone(dailyExp); x.from = from; x.to = to; x.rows = [];
     x.months = monthsOf(from, to).map((m) => ({ ...m, finance_status: 'missing', has_finance_rows: false, finance_month_settled: false,
-      finance_coverage_generation: null, finance_source_revision: null, calculation_version: x.calculation_version, calculated_at: x.calculated_at }));
+      finance_coverage_generation: null, finance_source_revision: null, finance_coverage_token: crypto.createHash('sha256').update(m.month_start).digest('hex'),
+      calculation_version: x.calculation_version, calculated_at: x.calculated_at }));
     return x;
   };
   assert.deepEqual(validateDailyResponse(shift('2025-08-31', '2026-08-01')).errors, []);   // 13 か月 (8 月の端から端)
@@ -537,7 +546,225 @@ await t('fixture に秘密らしい文字が無い (鍵・接続の文字列・B
     const text = fs.readFileSync(new URL(f, FIX), 'utf8');
     assert.doesNotMatch(text, /rnd_[A-Za-z0-9]{8,}|RENDER_API_KEY|postgres(ql)?:\/\/|Bearer |x-sync-key/i, f);
   }
-  assert.equal(CONTRACT_VERSION, 'amazon_profit_response_v1');
+  // 🆕 v2 (PR 2c): 版を上げた・版の履歴の最後 = 今の版・fixture の応答も同じ版
+  assert.equal(CONTRACT_VERSION, 'amazon_profit_response_v2');
+  assert.deepEqual(CONTRACT_HISTORY.map((h) => h.version), ['amazon_profit_response_v1', 'amazon_profit_response_v2']);
+  assert.equal(CONTRACT_HISTORY.at(-1).version, CONTRACT_VERSION);
+  for (const x of [totalsExp, dailyExp]) assert.equal(x.contract, CONTRACT_VERSION);
+});
+
+console.log('🆕 v2 (PR 2c): months[].finance_coverage_token');
+await t('fixture の全部の月に finance_coverage_token (64 桁の小文字の 16 進・財務の行が 0 の月にも・月ごとに違う)・月の metadata の値をそのまま', async () => {
+  for (const [exp, inp] of [[totalsExp, totalsIn], [dailyExp, dailyIn]]) {
+    const toks = exp.months.map((m) => m.finance_coverage_token);
+    assert.ok(toks.every((x) => /^[0-9a-f]{64}$/.test(x)), JSON.stringify(toks));
+    assert.equal(new Set(toks).size, toks.length);
+    assert.deepEqual(toks, inp.months.map((m) => m.meta.finance_coverage_token));
+    assert.ok(exp.months.some((m) => m.has_finance_rows === false && m.finance_coverage_token), '財務の行が 0 の月にも token');
+  }
+  assert.equal(MONTH_KEYS.indexOf('finance_coverage_token'), MONTH_KEYS.indexOf('finance_source_revision') + 1);
+  // 世代と版が null の月 (月の途中で source が 2 つ) でも token はある = 無効化の判定は token で
+  const x = clone(totalsExp); x.months[0].finance_coverage_generation = null; x.months[0].finance_source_revision = null;
+  assert.deepEqual(validateTotalsResponse(x).errors, []);
+});
+const breakToken = [
+  ['token が無い', (m) => { delete m[0].finance_coverage_token; }],
+  ['token が null', (m) => { m[0].finance_coverage_token = null; }],
+  ['token が大文字', (m) => { m[0].finance_coverage_token = m[0].finance_coverage_token.toUpperCase(); }],
+  ['token が 63 桁', (m) => { m[0].finance_coverage_token = m[0].finance_coverage_token.slice(1); }],
+  ['token が 65 桁', (m) => { m[0].finance_coverage_token += '0'; }],
+  ['token が 16 進でない', (m) => { m[0].finance_coverage_token = 'g'.repeat(64); }],
+  ['token が数', (m) => { m[0].finance_coverage_token = 12345; }],
+  ['token が空', (m) => { m[0].finance_coverage_token = ''; }],
+  ['token が object (部品の配列をそのまま出した)', (m) => { m[0].finance_coverage_token = { components: [] }; }],
+  ['2 つの月で同じ token (写し間違い)', (m) => { m[1].finance_coverage_token = m[0].finance_coverage_token; }],
+  ['財務の行が 0 の月の token が null', (m) => { m[m.length - 1].finance_coverage_token = null; }],
+];
+await t(`finance_coverage_token の違反 ${breakToken.length} 通りを /totals・/daily の両方で拒む`, async () => {
+  for (const [name, f] of breakToken) {
+    const a = clone(totalsExp); f(a.months);
+    assert.ok(validateTotalsResponse(a).errors.some((e) => e.includes('finance_coverage_token')), `totals: ${name}`);
+    const b = clone(dailyExp); f(b.months);
+    assert.ok(validateDailyResponse(b).errors.some((e) => e.includes('finance_coverage_token')), `daily: ${name}`);
+  }
+});
+
+console.log('🆕 v2 (PR 2c): 日の行の member_seller_skus');
+const FW_SPACE = String.fromCodePoint(0x3000), NBSP = String.fromCodePoint(0xa0), BOM = String.fromCodePoint(0xfeff), TAB = String.fromCodePoint(9);
+await t('fixture の全部の行に member_seller_skus・財務の行がある (order_rows > 0) 行は空でない・全角の SKU も bytes の順で同じ粒度に', async () => {
+  for (const r of dailyExp.rows) {
+    assert.ok(Array.isArray(r.member_seller_skus) && r.member_seller_skus.length > 0 && r.order_rows > 0, r.listing_code);
+    assert.deepEqual(memberSkuErrors(r.member_seller_skus), []);
+  }
+  assert.deepEqual(dailyExp.rows[0].member_seller_skus, ['ab-001', 'ａｂ-００１']);   // locale の比べでも同じだが bytes で確かめる (半角 0x61 < 全角 0xEF)
+  assert.deepEqual(dailyExp.rows[1].member_seller_skus, ['zz-unknown']);              // 未解決の行にも (seller_sku_norm の粒度)
+  assert.deepEqual(DAILY_COLUMNS.map((c) => c.name).slice(DAILY_COLUMNS.findIndex((c) => c.name === 'listing_code'), DAILY_COLUMNS.findIndex((c) => c.name === 'listing_code') + 2), ['listing_code', 'member_seller_skus']);
+  assert.equal(MAX_MEMBER_SELLER_SKUS, 100);
+  assert.equal(MAX_MEMBER_SKU_CHARS, 255);
+});
+await t('member_seller_skus の受け取るべき形: 財務の行が無い行 (広告だけ・Easy Ship だけ) は [] ・上限ちょうど・255 文字・bytes の順 (locale の順でない)・別の日なら同じ SKU', async () => {
+  const ok = [
+    ['財務の行が無い行は []', (x) => { x.rows[3].order_rows = 0; x.rows[3].source_lines = 0; x.rows[3].member_seller_skus = []; }],
+    ['100 個ちょうど', (x) => { x.rows[0].member_seller_skus = Array.from({ length: 100 }, (_, i) => `ab-001-${String(i).padStart(3, '0')}`); }],
+    ['255 文字ちょうど (全角も 1 文字)', (x) => { x.rows[0].member_seller_skus = ['a'.repeat(254) + 'ａ']; }],
+    ['bytes の順 = f (0x66) < é (0xC3) (locale の比べなら é が先)', (x) => { x.rows[0].member_seller_skus = ['f', 'é']; }],
+    ['中の空白はそのまま (trim は前後だけ)', (x) => { x.rows[0].member_seller_skus = ['ab 001']; }],
+    ['別の日の行なら同じ SKU', (x) => { x.rows[2].member_seller_skus = ['ab-001']; }],
+  ];
+  assert.ok('é'.localeCompare('f') < 0, 'locale の比べでは é が先 (= bytes の順と違う例になっている)');
+  for (const [name, f] of ok) { const x = clone(dailyExp); f(x); assert.deepEqual(validateDailyResponse(x).errors, [], name); }
+});
+const breakMember = [
+  ['列が無い', (x) => { delete x.rows[0].member_seller_skus; }],
+  ['null', (x) => { x.rows[0].member_seller_skus = null; }],
+  ['配列でない (文字)', (x) => { x.rows[0].member_seller_skus = 'ab-001'; }],
+  ['要素が数', (x) => { x.rows[0].member_seller_skus = [1]; }],
+  ['要素が null', (x) => { x.rows[0].member_seller_skus = [null]; }],
+  ['要素が空の文字', (x) => { x.rows[0].member_seller_skus = ['']; }],
+  ['大文字 (小文字にしていない)', (x) => { x.rows[0].member_seller_skus = ['AB-001']; }],
+  ['前に半角の空白', (x) => { x.rows[0].member_seller_skus = [' ab-001']; }],
+  ['後ろに半角の空白', (x) => { x.rows[0].member_seller_skus = ['ab-001 ']; }],
+  ['後ろに全角の空白', (x) => { x.rows[0].member_seller_skus = ['ab-001' + FW_SPACE]; }],
+  ['前に NBSP', (x) => { x.rows[0].member_seller_skus = [NBSP + 'ab-001']; }],
+  ['前に BOM', (x) => { x.rows[0].member_seller_skus = [BOM + 'ab-001']; }],
+  ['後ろに tab', (x) => { x.rows[0].member_seller_skus = ['ab-001' + TAB]; }],
+  ['順が違う', (x) => { x.rows[0].member_seller_skus = ['ａｂ-００１', 'ab-001']; }],
+  ['locale の順 (é が f より前)', (x) => { x.rows[0].member_seller_skus = ['é', 'f']; }],
+  ['重複', (x) => { x.rows[0].member_seller_skus = ['ab-001', 'ab-001']; }],
+  ['101 個 (上限超え)', (x) => { x.rows[0].member_seller_skus = Array.from({ length: 101 }, (_, i) => `ab-001-${String(i).padStart(3, '0')}`); }],
+  ['256 文字', (x) => { x.rows[0].member_seller_skus = ['a'.repeat(256)]; }],
+  ['財務の行があるのに []', (x) => { x.rows[0].member_seller_skus = []; }],
+  ['財務の行が無いのに空でない', (x) => { x.rows[3].order_rows = 0; x.rows[3].source_lines = 0; }],
+  ['同じ日の 2 つの行に同じ SKU (1 つの SKU が 2 つの粒度に)', (x) => { x.rows[1].member_seller_skus = ['ab-001']; }],
+  ['同じ日の別の行の SKU を写した', (x) => { x.rows[4].member_seller_skus = ['ab-003', 'ab-004']; }],
+  ['要素が object (財務の値を混ぜた)', (x) => { x.rows[0].member_seller_skus = [{ seller_sku: 'ab-001', net_jpy: '2625' }]; }],
+];
+await t(`member_seller_skus の違反 ${breakMember.length} 通りを全部拒む`, async () => {
+  for (const [name, f] of breakMember) {
+    const x = clone(dailyExp); f(x);
+    const v = validateDailyResponse(x);
+    assert.equal(v.ok, false, name);
+    assert.ok(v.errors.some((e) => e.includes('member_seller_skus')), `${name}: ${v.errors.join(' / ')}`);
+  }
+});
+
+console.log('🆕 v2 (PR 2c): 503 の failed_months');
+await t('PROFIT_PARTIAL_FAILED の 3 つの reason で failed_months つきの本文が通る・build503Body は並べ替えと重複の除き・要求の暦月の中', async () => {
+  for (const reason of PROFIT_503_REASONS.PROFIT_PARTIAL_FAILED) {
+    const b = build503Body('PROFIT_PARTIAL_FAILED', reason, ['2026-08', '2026-07', '2026-08']);
+    assert.deepEqual(b, { ok: false, code: 'PROFIT_PARTIAL_FAILED', error: PROFIT_503_ERRORS.PROFIT_PARTIAL_FAILED, reason, failed_months: ['2026-07', '2026-08'] });
+    assert.deepEqual(validate503Body(b).errors, [], reason);
+    assert.deepEqual(validate503Body(b, { from: '2026-07-30', to: '2026-08-02' }).errors, [], reason);
+    assert.ok(validate503Body(b, { from: '2026-07-01', to: '2026-07-31' }).errors.some((e) => e.includes('2026-08 は要求の触れる暦月の外')));
+  }
+  const thirteen = monthsOf('2025-08-31', '2026-08-01').map((m) => m.month_start.slice(0, 7));
+  assert.equal(thirteen.length, MAX_MONTHS);
+  assert.deepEqual(validate503Body(build503Body('PROFIT_PARTIAL_FAILED', 'MONTH_CALC_FAILED', thirteen)).errors, []);
+  assert.deepEqual([...PROFIT_503_BODY_KEYS], ['ok', 'code', 'error', 'reason', 'failed_months']);
+  assert.equal(FAILED_MONTHS_CODE, 'PROFIT_PARTIAL_FAILED');
+});
+await t('🚨 build503Body: failed_months に値・例外の文・秘密が混ざる / 空 / 14 個 = PROFIT_INTERNAL に落とし、月も値も出さない・ほかの code には付けない', async () => {
+  const INTERNAL = { ok: false, code: 'PROFIT_INTERNAL', error: PROFIT_503_ERRORS.PROFIT_INTERNAL, reason: 'APP_UNEXPECTED' };
+  const fourteen = monthsOf('2025-07-31', '2026-08-01').map((m) => m.month_start.slice(0, 7));
+  assert.equal(fourteen.length, 14);
+  for (const fm of [undefined, null, [], '2026-07', [202607], ['2026-07', 'net_jpy=2625'], ['2026-07: -1500.01'], ['2026-07-01'], ['2026-7'], ['2026-13'],
+    [{ month: '2026-07' }], ['postgres://u:p@h/db'], fourteen]) {
+    const b = build503Body('PROFIT_PARTIAL_FAILED', 'MONTH_CALC_FAILED', fm);
+    assert.deepEqual(b, INTERNAL, JSON.stringify(fm));
+    assert.deepEqual(validate503Body(b).errors, []);
+  }
+  for (const c of PROFIT_503_CODES.filter((x) => x !== FAILED_MONTHS_CODE)) assert.ok(!('failed_months' in build503Body(c, PROFIT_503_REASONS[c][0], ['2026-07'])), c);
+});
+const PF = (fm) => ({ ok: false, code: 'PROFIT_PARTIAL_FAILED', error: PROFIT_503_ERRORS.PROFIT_PARTIAL_FAILED, reason: 'MONTH_CALC_FAILED', ...(fm === undefined ? {} : { failed_months: fm }) });
+const breakFailed = [
+  ['PROFIT_PARTIAL_FAILED に failed_months が無い', PF(undefined)],
+  ['failed_months が空', PF([])],
+  ['failed_months が null', PF(null)],
+  ['failed_months が文字', PF('2026-07')],
+  ['要素が数', PF([202607])],
+  ['要素が日付', PF(['2026-07-01'])],
+  ['要素の月が 1 桁', PF(['2026-7'])],
+  ['13 月', PF(['2026-13'])],
+  ['値が混ざる (金額)', PF(['2026-07', '2625'])],
+  ['値が混ざる (月 + 金額の文字)', PF(['2026-07: net_jpy=2625'])],
+  ['値が混ざる (object)', PF([{ month: '2026-07', net_jpy: '2625' }])],
+  ['値が混ざる (例外の文)', PF(['canceling statement due to statement timeout'])],
+  ['重複', PF(['2026-07', '2026-07'])],
+  ['降順', PF(['2026-08', '2026-07'])],
+  ['14 個', PF(monthsOf('2025-07-31', '2026-08-01').map((m) => m.month_start.slice(0, 7)))],
+  ['秘密 (接続の文字列)', PF(['postgres://cdb:p4ss@dpg-x/cdb'])],
+  ['ほかの code に failed_months', { ok: false, code: 'PROFIT_RESOURCE', error: PROFIT_503_ERRORS.PROFIT_RESOURCE, reason: 'RESOURCE_LOAD_COUNT_TIME', failed_months: ['2026-07'] }],
+  ['封じ込めの 503 に failed_months', { ok: false, code: 'PROFIT_ROUTE_DISABLED', error: PROFIT_503_ERRORS.PROFIT_ROUTE_DISABLED, failed_months: ['2026-07'] }],
+];
+await t(`503 の failed_months の違反 ${breakFailed.length} 通りを全部拒む`, async () => {
+  for (const [name, b] of breakFailed) assert.equal(validate503Body(b).ok, false, name);
+});
+
+console.log('🆕 v2 (PR 2c): 57014 / 25P04 の分け方 (CANCEL_MAP)');
+const cancelCases = readFix('cancel-cases.json').cases;
+const outcome = (r) => r && { code: r.code, reason: r.reason, respond: r.respond, send_rollback: r.send_rollback, failed_months: r.failed_months, log: r.log };
+await t(`取り消しの golden ${cancelCases.length} 件 = classifyCancellation の結果 (表の全部の行・印の優先・表に無い組・取り消しでない)`, async () => {
+  for (const c of cancelCases) assert.deepEqual(outcome(classifyCancellation(c.input)), c.expect, c.name);
+});
+await t('CANCEL_MAP の全部の行と「表に無い組」が golden で 1 回以上当たる・code / reason は 503 の列挙と FAILURE_PATHS にある', async () => {
+  const hit = new Set(cancelCases.map((c) => classifyCancellation(c.input)).filter(Boolean));
+  for (const e of [...CANCEL_MAP, CANCEL_UNCLASSIFIED]) assert.ok(hit.has(e), `golden に当たらない行: ${JSON.stringify(e)}`);
+  for (const e of [...CANCEL_MAP, CANCEL_UNCLASSIFIED]) {
+    assert.ok(e.stage === '*' || CANCEL_STAGES.includes(e.stage), e.stage);
+    assert.ok(e.source === '*' || CANCELLATION_SOURCES.includes(e.source), e.source);
+    assert.ok(e.sqlstate === '*' || e.sqlstate === null || CANCEL_SQLSTATES.includes(e.sqlstate), String(e.sqlstate));
+    if (!e.respond) { assert.equal(e.code, null); assert.equal(e.source, 'client_disconnect'); continue; }
+    assert.ok(PROFIT_503_REASONS[e.code].includes(e.reason), `${e.code} / ${e.reason}`);
+    assert.ok(FAILURE_PATHS.some((f) => f.code === e.code && f.reason === e.reason), `FAILURE_PATHS に無い: ${e.code} / ${e.reason}`);
+    assert.equal(e.failed_months, e.code === FAILED_MONTHS_CODE, e.reason);
+  }
+  // 新しい reason 4 つは全部 CANCEL_MAP か「表に無い組」から出る
+  for (const r of ['RESOURCE_LOAD_COUNT_TIME', 'RESOURCE_TRANSACTION_TIMEOUT', 'INTERNAL_EXTERNAL_CANCEL', 'INTERNAL_UNCLASSIFIED_CANCEL']) {
+    assert.ok([...CANCEL_MAP, CANCEL_UNCLASSIFIED].some((e) => e.reason === r), r);
+  }
+  // 25P04 だけ ROLLBACK を送らない・client_disconnect だけ応答を作らない
+  assert.deepEqual(CANCEL_MAP.filter((e) => !e.send_rollback).map((e) => e.sqlstate), ['25P04']);
+  assert.deepEqual(CANCEL_MAP.filter((e) => !e.respond).map((e) => e.source), ['client_disconnect']);
+  assert.deepEqual([...CANCELLATION_SOURCES], ['app_statement_budget', 'app_deadline', 'client_disconnect', 'unmarked']);
+});
+await t('印の優先: 経過時間は分け方に使わない・印があれば例外が無くても 503・印が無ければ期限の直前でも unmarked', async () => {
+  // classifyCancellation は経過時間を受け取らない (渡しても同じ結果)
+  for (const c of cancelCases) {
+    const a = classifyCancellation(c.input), b = classifyCancellation({ ...c.input, elapsed_ms: 0 }), d = classifyCancellation({ ...c.input, elapsed_ms: 1e9 });
+    assert.equal(a, b, c.name); assert.equal(a, d, c.name);
+  }
+  for (const st of CANCEL_STAGES) {
+    for (const src of ['app_statement_budget', 'app_deadline']) {
+      const r = classifyCancellation({ stage: st, sqlstate: null, mark: { source: src, stage: st } });
+      assert.ok(r && r.respond && r.code, `${st} / ${src}: 印を書いた要求は 503`);
+    }
+    assert.equal(classifyCancellation({ stage: st, sqlstate: null, mark: null }), null, `${st}: 印も例外も無ければ取り消しでない`);
+  }
+  assert.equal(classifyCancellation({ stage: 'month_body', sqlstate: '57014', mark: null }).source, 'unmarked');
+  // 応答を作る結果は全部、安全な固定の 503 の本文になる (failed_months つきは止まった月で)
+  for (const c of cancelCases) {
+    const r = classifyCancellation(c.input);
+    if (!r || !r.respond) continue;
+    const b = build503Body(r.code, r.reason, r.failed_months ? ['2026-07'] : undefined);
+    assert.deepEqual([b.code, b.reason], [r.code, r.reason], c.name);
+    assert.deepEqual(validate503Body(b, { from: '2026-07-30', to: '2026-08-02' }).errors, [], c.name);
+  }
+  // 壊れた入力でも例外を投げない (表に無い組 か 取り消しでない)
+  for (const x of [undefined, {}, { stage: null, sqlstate: '57014' }, { stage: 'load_count', sqlstate: '57014', mark: {} }, { stage: 'load_count', sqlstate: '57014', mark: { source: 1 } }]) {
+    let r; assert.doesNotThrow(() => { r = classifyCancellation(x); });
+    assert.ok(r === null || r === CANCEL_UNCLASSIFIED, JSON.stringify(x));
+  }
+});
+await t('文書 (docs/contracts) に v2 の項目: months の token・§4c の取り消しの表の全部のログの理由・§8 の版の履歴', async () => {
+  const doc = fs.readFileSync(new URL('../docs/contracts/company_db_amazon_profit_response.contract.md', import.meta.url), 'utf8');
+  const section = (h) => { const s = doc.indexOf(h); assert.ok(s >= 0, h); const e = doc.indexOf('\n## ', s + 1); return doc.slice(s, e < 0 ? undefined : e); };
+  for (const k of MONTH_KEYS) assert.ok(section('## 3. months[]').includes(`\`${k}\``), k);
+  const s4c = section('## 4c.');
+  for (const e of [...CANCEL_MAP, CANCEL_UNCLASSIFIED]) assert.ok(s4c.includes(`\`${e.log}\``), e.log);
+  for (const s of [...CANCEL_STAGES, ...CANCELLATION_SOURCES]) assert.ok(s4c.includes(`\`${s}\``), s);
+  assert.deepEqual([...section('## 8. 版の履歴').matchAll(/^\| `(amazon_profit_response_v\d+)` \|/gm)].map((m) => m[1]), CONTRACT_HISTORY.map((h) => h.version));
+  assert.ok(doc.includes(`\`contract\` = \`${CONTRACT_VERSION}\``));
+  assert.ok(section('## 4. 503').includes('failed_months'));
 });
 
 console.log(`\n${ok} 件 PASS${ng ? ` / ${ng} 件 NG` : ''}`);

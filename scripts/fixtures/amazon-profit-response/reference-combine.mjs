@@ -7,6 +7,7 @@
  *     (PostgreSQL の round(numeric, 2) = 0 から遠い方へ。試験で PGlite の round と突き合わせる)
  *   - bigint は BigInt で足す (JS の Number に入れない)
  *   - calculated_at は要求の 1 つの値 (月ごとの計算の値は捨てる・R5 Low)
+ *   - 🆕 v2 (PR 2c): months[].finance_coverage_token は月の metadata の値をそのまま / 日の行の member_seller_skus は月の行の値をそのまま (つなぐだけ・並べ直さない)
  */
 import { TOTALS_COLUMNS, TOTALS_REASONS, AD_STATUS_RANK, MASTER_NOTE_KEYS, MONTH_KEYS, CONTRACT_VERSION, MASTER_BASIS, monthsOf, build503Body } from '../../../apps/company-db/profit/response-contract.mjs';
 

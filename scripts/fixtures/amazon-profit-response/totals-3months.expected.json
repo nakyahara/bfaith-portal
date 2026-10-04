@@ -1,6 +1,6 @@
 {
   "ok": true,
-  "contract": "amazon_profit_response_v1",
+  "contract": "amazon_profit_response_v2",
   "kind": "totals",
   "mall": "amazon",
   "scope": "jp",
@@ -203,6 +203,7 @@
       "finance_month_settled": true,
       "finance_coverage_generation": "12",
       "finance_source_revision": "345",
+      "finance_coverage_token": "802299f139e16cce84c4ae2ff4e0ffa26bd25c9f52a2d2900d9ec16edb4ffd96",
       "calculation_version": "amazon_profit_v1",
       "calculated_at": "2026-10-03T03:00:00.123Z"
     },
@@ -215,6 +216,7 @@
       "finance_month_settled": false,
       "finance_coverage_generation": "12",
       "finance_source_revision": null,
+      "finance_coverage_token": "bc78a381c7d248c33cd8699d345c971645a00f63b4cf47fa574d1886812b997b",
       "calculation_version": "amazon_profit_v1",
       "calculated_at": "2026-10-03T03:00:00.123Z"
     },
@@ -227,6 +229,7 @@
       "finance_month_settled": false,
       "finance_coverage_generation": null,
       "finance_source_revision": null,
+      "finance_coverage_token": "0d7ca2a6afeb24688252c821760d51369373a567a621d25ac33e3ba9643f625b",
       "calculation_version": "amazon_profit_v1",
       "calculated_at": "2026-10-03T03:00:00.123Z"
     }

@@ -1,5 +1,5 @@
 {
-  "_note": "月ごとの日の行をつなぐ (足さない)。8 月は行が 0 でも months[] にある。calculated_at は要求の 1 つの値に置き換える (月の計算の値は捨てる)。listing_id の無い行は日の中で後ろ",
+  "_note": "月ごとの日の行をつなぐ (足さない)。8 月は行が 0 でも months[] にある。calculated_at は要求の 1 つの値に置き換える (月の計算の値は捨てる)。listing_id の無い行は日の中で後ろ。🆕 v2 = 行に member_seller_skus (受け取った seller SKU を trim + 小文字・bytes の順・財務の行がある ⇔ 空でない)・months[] に finance_coverage_token (64 桁の 16 進・月ごとに違う・値は試験用の固定の hash)",
   "request": {
     "mall": "amazon",
     "scope": "jp",
@@ -18,6 +18,7 @@
         "finance_month_settled": true,
         "finance_coverage_generation": "12",
         "finance_source_revision": "345",
+        "finance_coverage_token": "bc78a381c7d248c33cd8699d345c971645a00f63b4cf47fa574d1886812b997b",
         "calculation_version": "amazon_profit_v1"
       },
       "rows": [
@@ -30,6 +31,10 @@
           "seller_sku_norm": null,
           "listing_resolution": "resolved",
           "listing_code": "AB-001",
+          "member_seller_skus": [
+            "ab-001",
+            "ａｂ-００１"
+          ],
           "received_listing_ids": [
             "15",
             "9007199254740993"
@@ -78,8 +83,8 @@
           "unclassified_abs_jpy": "0",
           "unmapped_component_count": 0,
           "finance_legacy_rows": 0,
-          "source_lines": 0,
-          "order_rows": 0,
+          "source_lines": 7,
+          "order_rows": 3,
           "day_finance_status": "complete",
           "refund_units_status": "estimated_monthly_unit_price",
           "refund_incomplete_child_count": 0,
@@ -132,6 +137,9 @@
           "seller_sku_norm": "ZZ-UNKNOWN",
           "listing_resolution": "unresolved",
           "listing_code": null,
+          "member_seller_skus": [
+            "zz-unknown"
+          ],
           "received_listing_ids": [],
           "received_listing_unresolved_count": 0,
           "ad_received_listing_ids": [],
@@ -173,8 +181,8 @@
           "unclassified_abs_jpy": "0",
           "unmapped_component_count": 0,
           "finance_legacy_rows": 0,
-          "source_lines": 0,
-          "order_rows": 0,
+          "source_lines": 2,
+          "order_rows": 1,
           "day_finance_status": "complete",
           "refund_units_status": "no_refund",
           "refund_incomplete_child_count": 0,
@@ -225,6 +233,9 @@
           "seller_sku_norm": null,
           "listing_resolution": "resolved",
           "listing_code": "AB-002",
+          "member_seller_skus": [
+            "ab-002"
+          ],
           "received_listing_ids": [],
           "received_listing_unresolved_count": 0,
           "ad_received_listing_ids": [],
@@ -266,8 +277,8 @@
           "unclassified_abs_jpy": "0",
           "unmapped_component_count": 0,
           "finance_legacy_rows": 0,
-          "source_lines": 0,
-          "order_rows": 0,
+          "source_lines": 4,
+          "order_rows": 2,
           "day_finance_status": "complete",
           "refund_units_status": "estimated_partial_month_unit_price",
           "refund_incomplete_child_count": 1,
@@ -319,6 +330,9 @@
           "seller_sku_norm": null,
           "listing_resolution": "resolved",
           "listing_code": "AB-003",
+          "member_seller_skus": [
+            "ab-003"
+          ],
           "received_listing_ids": [],
           "received_listing_unresolved_count": 0,
           "ad_received_listing_ids": [],
@@ -360,8 +374,8 @@
           "unclassified_abs_jpy": "30",
           "unmapped_component_count": 1,
           "finance_legacy_rows": 2,
-          "source_lines": 0,
-          "order_rows": 0,
+          "source_lines": 5,
+          "order_rows": 2,
           "day_finance_status": "complete",
           "refund_units_status": "no_refund",
           "refund_incomplete_child_count": 0,
@@ -416,6 +430,9 @@
           "seller_sku_norm": null,
           "listing_resolution": "resolved",
           "listing_code": "AB-004",
+          "member_seller_skus": [
+            "ab-004"
+          ],
           "received_listing_ids": [],
           "received_listing_unresolved_count": 0,
           "ad_received_listing_ids": [],
@@ -457,8 +474,8 @@
           "unclassified_abs_jpy": "0",
           "unmapped_component_count": 0,
           "finance_legacy_rows": 0,
-          "source_lines": 0,
-          "order_rows": 0,
+          "source_lines": 3,
+          "order_rows": 1,
           "day_finance_status": "complete",
           "refund_units_status": "no_refund",
           "refund_incomplete_child_count": 0,
@@ -515,6 +532,7 @@
         "finance_month_settled": false,
         "finance_coverage_generation": null,
         "finance_source_revision": null,
+        "finance_coverage_token": "0d7ca2a6afeb24688252c821760d51369373a567a621d25ac33e3ba9643f625b",
         "calculation_version": "amazon_profit_v1"
       },
       "rows": []

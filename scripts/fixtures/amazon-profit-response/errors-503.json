@@ -1,5 +1,5 @@
 {
-  "_note": "503 の本文の形 = { ok: false, code, error, reason? }。error は code ごとの固定の文 (PROFIT_503_ERRORS) と完全に一致・reason は code ごとの列挙 (PROFIT_503_REASONS) だけ。値・部分の結果・Render の応答の本文・上流の例外の文・鍵・接続の文字列は出さない。header の Cache-Control: no-store は router に触れる PR (遅くとも PR 6) で付けて試験する",
+  "_note": "503 の本文の形 = { ok: false, code, error, reason? }。error は code ごとの固定の文 (PROFIT_503_ERRORS) と完全に一致・reason は code ごとの列挙 (PROFIT_503_REASONS) だけ。値・部分の結果・Render の応答の本文・上流の例外の文・鍵・接続の文字列は出さない。header の Cache-Control: no-store は router に触れる PR (遅くとも PR 6) で付けて試験する。🆕 v2 = PROFIT_PARTIAL_FAILED だけ failed_months (止まった月の YYYY-MM の配列・必須・13 まで・値は入れない)",
   "bodies": [
     {
       "ok": false,
@@ -40,7 +40,10 @@
       "ok": false,
       "code": "PROFIT_PARTIAL_FAILED",
       "error": "1 か月の計算に失敗したので、どの値も返しません。",
-      "reason": "MONTH_META_FAILED"
+      "reason": "MONTH_META_FAILED",
+      "failed_months": [
+        "2026-07"
+      ]
     },
     {
       "ok": false,

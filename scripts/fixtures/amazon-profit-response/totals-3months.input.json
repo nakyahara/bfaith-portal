@@ -1,5 +1,5 @@
 {
-  "_note": "月ごとの計算の結果 (仮の形 = PR 3 の包む関数で決まったら合わせる) → 最終の応答 (totals-3months.expected.json)。7 月は原価・広告が欠けて正式な値が null / 8 月は財務の行が 0 (months[] にはある) / net_jpy は 2^53 を超える = BigInt で足す / 端数は月ごとに丸めると合わない値 / 負の半分は 0 から遠い方へ",
+  "_note": "月ごとの計算の結果 (仮の形 = PR 3 の包む関数で決まったら合わせる) → 最終の応答 (totals-3months.expected.json)。7 月は原価・広告が欠けて正式な値が null / 8 月は財務の行が 0 (months[] にはある) / net_jpy は 2^53 を超える = BigInt で足す / 端数は月ごとに丸めると合わない値 / 負の半分は 0 から遠い方へ。🆕 v2 = months[] に finance_coverage_token (64 桁の 16 進・財務の行が 0 の月にもある・値は試験用の固定の hash)",
   "request": {
     "mall": "amazon",
     "scope": "jp",
@@ -18,6 +18,7 @@
         "finance_month_settled": true,
         "finance_coverage_generation": "12",
         "finance_source_revision": "345",
+        "finance_coverage_token": "802299f139e16cce84c4ae2ff4e0ffa26bd25c9f52a2d2900d9ec16edb4ffd96",
         "calculation_version": "amazon_profit_v1"
       },
       "totals": {
@@ -123,6 +124,7 @@
         "finance_month_settled": false,
         "finance_coverage_generation": "12",
         "finance_source_revision": null,
+        "finance_coverage_token": "bc78a381c7d248c33cd8699d345c971645a00f63b4cf47fa574d1886812b997b",
         "calculation_version": "amazon_profit_v1"
       },
       "totals": {
@@ -303,6 +305,7 @@
         "finance_month_settled": false,
         "finance_coverage_generation": null,
         "finance_source_revision": null,
+        "finance_coverage_token": "0d7ca2a6afeb24688252c821760d51369373a567a621d25ac33e3ba9643f625b",
         "calculation_version": "amazon_profit_v1"
       },
       "totals": {
