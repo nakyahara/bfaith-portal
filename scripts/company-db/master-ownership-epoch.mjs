@@ -91,7 +91,7 @@ export async function cli(argv, { env = process.env, connect = null, openSqlite 
       const p = checkPublishOwnership(ownership);
       if (p.length) { log(`❌ 用意しない: ④a で扱えない持ち主の設定 (${p.join(' / ')})`); return 1; }
       const r = await prepareOwnership(c.db, { map: ownership, actor });
-      log(`✅ prepared = ${r.prepared_hash} (active のまま)。次 = master-cutover.mjs --to frozen → 書きかけ 0 → 最後の active (全部 load) のロード (--use-prepared なし) → その run_id の report + 照合 ② → remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → --verify-apply → activate (17 §4.2)。🚨 cancel すると、その列の古い入口が再び開く`);
+      log(`✅ prepared = ${r.prepared_hash} (active のまま)。次 = master-cutover.mjs --to frozen → 書きかけ 0 → 最後の active (全部 load) のロード (--use-prepared なし) → その run_id の report + 照合 ② → remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → --verify-apply → activate (17 §4.2)。🚨 activate の前に cancel すると、今回 prepared で C にした列の古い入口が再び開く (activate の後は対象外)`);
       return 0;
     }
     if (cmd === 'cancel') { const r = await cancelPrepared(c.db, { actor }); log(r.cancelled ? '✅ prepared を取り消した (active のまま)' : '⏭️ prepared は無い'); return 0; }

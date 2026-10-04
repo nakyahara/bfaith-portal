@@ -968,15 +968,15 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
       試験 = `scripts/test-master-legacy-gate-pg.mjs` [19] (2 つの接続で交差を再現・3 を飛ばして 5 = 値が消える・4 の後 = 残る)。
     - 配る前の確かめ (`master-legacy-readiness.mjs`) は門のログインで `ops.master_ownership_state` の有無・SELECT の権限・門と同じ読み方を確かめる (legacy_open の間は門は持ち主を読まない = ここで見ないと frozen にした瞬間に全部 503)。
   - API = 410 `{error:'master_frozen', message, url}`。段階が読めない = 503 `{error:'master_phase_unreadable'}` (閉じる側)。何も書かない。画面は `message` を出す (`master_frozen` の文字は出さない)。
-  - 書かない試し (NE のコードから登録・自動取込を手で回す・Notion の画像の取込・Notion の状態から取込 の dry run) は、段階を読めないときだけ注意つきで通す (応答の見出し `X-Master-Legacy-Warning: phase_unreadable`)。閉じた後は 410 のまま。
+  - 書かない試し (NE のコードから登録・自動取込を手で回す・Notion の画像の取込・Notion の状態から取込 の dry run) は、切替の状態 (段階または持ち主) を読めないときだけ注意つきで通す (応答の見出し `X-Master-Legacy-Warning: phase_unreadable`)。閉じた後は 410 のまま。 (🆕 #1610 R6: 持ち主を読めないときも書かない試しは通し、ヘッダは今のところ `phase_unreadable` のまま = 書き込みは起きない。専用の warning にするのは後の PR)
   - 門で待っている間に相手が切れた (画面を閉じた) = 書かない (書きかけにも数えない)。
   - 画面 = 帯「マスタは新しい画面で直します ↗」+ 書く部品を隠す。
   - product-hub の税率:
     - 手入力は閉じたら 410。画面は税率を**変えたときだけ**送る (保存できたら送った値を「元の値」にする) = 名前・売価・メモの保存は Company DB が止まっていても通る。
-    - 詳細画面: 切替前 = 今までどおり / 段階を読めて閉じている = Company DB の税率を見せるだけ (代表コードは構成の SKU から。混ざる・無い・読めない = 決められない・試算は「税率が決まっていません」= 0% で計算しない) / **段階を読めない = 今の値を見るだけ** (Company DB を読みに行かない・「出品は止まります」と言わない)。
-    - 楽天の登録: 段階を読めない = 止める (切替前の瞬断で Company DB の税率に黙って切り替えない)・閉じた後に Company DB の税率を決められない = 止める。プレビュー (送らない) は、段階を読めないとき今の税率で見せて注意を添える。
-    - AI の生成の材料 (`/generation-queue`・claim) は、切替前だけ `yahoo.tax_rate` を渡す (閉じた後・段階を読めない = null)。
-    - セットを作る: 段階を読めない = 503 (作らない)・読めて閉じている = 作るが親の税率は写さない・legacy_open = 今までどおり。
+    - 詳細画面: 切替前 = 今までどおり / 切替の状態を読めて閉じている = Company DB の税率を見せるだけ (代表コードは構成の SKU から。混ざる・無い・読めない = 決められない・試算は「税率が決まっていません」= 0% で計算しない) / **切替の状態 (段階または持ち主) を読めない = 今の値を見るだけ** (Company DB を読みに行かない・「出品は止まります」と言わない)。
+    - 楽天の登録: 切替の状態 (段階または持ち主) を読めない = 止める (切替前の瞬断で Company DB の税率に黙って切り替えない)・閉じた後に Company DB の税率を決められない = 止める。プレビュー (送らない) は、切替の状態 (段階または持ち主) を読めないとき今の税率で見せて注意を添える。
+    - AI の生成の材料 (`/generation-queue`・claim) は、切替前だけ `yahoo.tax_rate` を渡す (閉じた後・切替の状態 (段階または持ち主) を読めない = null)。
+    - セットを作る: 切替の状態 (段階または持ち主) を読めない = 503 (作らない)・読めて閉じている = 作るが親の税率は写さない・legacy_open = 今までどおり。
   - 発注アプリは仕入先 (`kind = suppliers` の追加・削除・CSV・宛先の CSV) と一括取込 (`POST /api/import` = 中に仕入先があるので**丸ごと**) を、仕入先の列 (`suppliers.*`) が C になったら閉じる (⑤-3b。10/5 は load = 開いたまま) = 切替の手順で書き込み先を Company DB に替えるまで仕入先は見るだけ。発注条件・資材・先方品番の画面は止めない。
   - CLI = mode が分かったらすぐ (引数・ファイルの検査より前・DB を開く前) に終了コード 3。書く間は段階の**共有の鍵** (`pg_advisory_lock_shared(hashtext('ops.master_cutover'))`) を持ち、鍵を取ってから段階を読み直す = 段階を変える側 (排他の鍵) は CLI が書き終わるまで待つ・変えている最中に始めた CLI は待ってから読む。csv-import.js は `product_shipping`・`exception_genka` だけ閉じる (受注・ロジザード・NE の写し・送料の表は止めない)。CLI が書くのは miniPC の warehouse.db だけ = ⑤-1 の夜間ロードの鍵 (`core.master_write_lock_key`) は取らない。
   - 定期実行: product-hub の NE が先の自動取込 (intake-cron) は丸ごと止める (閉じている = ok の ping で「止めた」・読めない = fail の ping)。
@@ -2171,7 +2171,7 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
    かつ **⑤-1 の切替の段階 (`ops.master_cutover_state`) が `frozen`** (prepared の C の列の古い入口を止めた後・持ち主を C にする前) のときだけ active に。足りなければ理由を出して断る。段階の表が無い = 断る。
    証拠を集めたときの prepare の時刻を行の鍵の後に比べる = その間に prepare をやり直したら `PREPARED_CHANGED` で断る (やり直しは **2a から** = 書きかけ 0 → 2b の最後の active のロード → 照合 ② → 3。新しく C に入った列の入口は、やり直しの prepare までは開いていたため)。
    証拠の世代が読んだ夜間ロードが最後のロードでない (証拠の後に毎晩のロードなどが入った。DB の commit の番号で比べる) = `LOAD_AFTER_EVIDENCE` で断る (やり直しは **2b から** = 最後の active (全部 load) のロード → その run_id の report の成功 + 照合 ② → 3 の --use-prepared。介在したロードの結果を確かめないまま 3 に進まない。#1564 Codex R3 High 1・R4・#1610 R5)
-- 途中で止める = `master-ownership-epoch.mjs cancel` (prepared を消す。active はそのまま = 毎晩は前の持ち主)。🚨 cancel すると門から見た C の列が消える = **段階が frozen のままでも、その列の古い入口が再び開く** (門は active ∪ prepared で見る)。入口を閉じたまま夜を越すなら cancel しない (prepared を残す)。cancel したらスタッフに知らせ、翌日は prepare からやり直す。prepared を残して 02:00 のロードが走ったら activate は LOAD_AFTER_EVIDENCE で止まる = 2b (最後の同期) からやり直す。今の状態 = `master-ownership-epoch.mjs status`
+- 途中で止める = `master-ownership-epoch.mjs cancel` (prepared を消す。active はそのまま = 毎晩は前の持ち主)。🚨 cancel は prepared だけを消す (active はそのまま) = **activate の前**なら、今回 prepared で C にした列 (= active ではまだ load の列) の古い入口が、段階が frozen のままでも再び開く (10/5 = active は全部 load なので 13 キーすべて)。**activate の後**は prepared が無いのが正常 = active が C なので入口は閉じたまま・cancel は対象外 (門は active ∪ prepared で見る)。入口を閉じたまま夜を越すなら cancel しない (prepared を残す)。cancel したらスタッフに知らせ、翌日は prepare からやり直す。prepared を残して 02:00 のロードが走ったら activate は LOAD_AFTER_EVIDENCE で止まる = 2b (最後の同期) からやり直す。今の状態 = `master-ownership-epoch.mjs status`
 
 **マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)**。0055 は表を 3 つ (epoch・その記録・夜間ロードの commit の順) と、⑤-1 の切替の段階・画面の保存の門に「持ち主の epoch と同じ」の確かめを足すだけ (行は作らない = 全部 load のまま = 何も変わらない)。
 あわせて ⑤-1 の `ops.ownership_hash` の式を「load の列は数えない」に作り直す (下の「1 つの式」)。🚨 段階が company_owner / new_open の DB では 0055 は止まる (本番は legacy_open = 当たらない)。

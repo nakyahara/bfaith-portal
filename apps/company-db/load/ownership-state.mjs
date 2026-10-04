@@ -65,7 +65,7 @@ export async function readOwnershipState(db) {
  * 古い入口の門 (lib/master-legacy-gate.mjs・⑤-3b) が使う「持ち主が C の列」= active と prepared の C の列を合わせたもの。
  *   🚨 prepared も数える: prepare (切替の日) から activate までの間に、古い入口から入れた値は --use-prepared のロード・写しの材料に入らず、
  *      activate の後の夜間ロードは C の列の既にある行を上書きしない = 黙って消える。門は legacy_open の間は持ち主を読まない = prepare しただけでは閉じない
- *      (閉じ始めるのは frozen にした時点)。cancel で prepared が消えると、frozen のままでもその列の入口は再び開く。
+ *      (閉じ始めるのは frozen にした時点)。cancel で prepared が消えると、prepared だけで C だった列 (active では load) の入口は frozen のままでも再び開く (activate の後は prepared が無く active が C = 閉じたまま・cancel は対象外)。
  *      prepare をまたいで書き終えた値は、frozen の後の最後の active (全部 load) のロードで回収する (README の 2a・2b)
  *   🚨 読めない (表が無い = 0055 の前・権限が無い・記録が壊れている) = { readable: false } = 門は閉じる側 (fail-closed)。行が無い = 全部 load (誰も prepare していない)
  *   config (configured) は見ない (デプロイの成果物 = 場所ごとに切り替わる時刻が違う。契約 v3 H1)
