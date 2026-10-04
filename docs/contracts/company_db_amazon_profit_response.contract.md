@@ -64,12 +64,13 @@
 | `PROFIT_RESOURCE` | DB のメモリ・一時ファイル・負荷の条件を満たさないので計算しません。 | `RESOURCE_MEMORY` `RESOURCE_TEMP_FILES` `RESOURCE_PROCESS_INPUTS` `RESOURCE_LOAD_FACTOR` `RESOURCE_COUNT_PLAN` `RESOURCE_TEMP_FILE_LIMIT_NOT_FINITE` `RESOURCE_PRIVILEGES` 🆕 `RESOURCE_LOAD_COUNT_TIME` `RESOURCE_TRANSACTION_TIMEOUT` |
 | `PROFIT_METRICS_UNAVAILABLE` | Render の metrics が読めないので計算しません。 | `METRICS_CONFIG` `METRICS_AUTH` `METRICS_RATE_LIMITED` `METRICS_UPSTREAM` `METRICS_HTTP` `METRICS_TIMEOUT` `METRICS_NETWORK` `METRICS_SHAPE` `METRICS_NOT_INTEGER` `METRICS_EMPTY` `METRICS_DUPLICATE_SERIES` `METRICS_DUPLICATE_POINT` `METRICS_LABEL_MISSING` `METRICS_WRONG_RESOURCE` `METRICS_UNIT` `METRICS_NEGATIVE` `METRICS_FUTURE` `METRICS_STALE` `METRICS_PAIR_SKEW` `METRICS_ZERO_LIMIT` `METRICS_INCONSISTENT` `METRICS_INTERNAL` |
 | `PROFIT_DB_UNAVAILABLE` | DB に接続できないか、計算の取引を始められない / 終えられないので、どの値も返しません。 | `DB_CONNECT` `DB_BEGIN` `DB_SET_LOCAL` `DB_SETTING_READBACK` `DB_LOCK_STATEMENT` `DB_COMMIT` `DB_OUTCOME_UNKNOWN` `DB_UNEXPECTED` |
-| `PROFIT_PARTIAL_FAILED` | 1 か月の計算に失敗したので、どの値も返しません。 | `MONTH_META_FAILED` `MONTH_CALC_FAILED` `MONTH_STATEMENT_TIMEOUT` (🆕 v2 = 本文に `failed_months` が必須) |
+| `PROFIT_PARTIAL_FAILED` | 1 か月の計算に失敗したので、どの値も返しません。 | `MONTH_META_FAILED` `MONTH_CALC_FAILED` `MONTH_STATEMENT_TIMEOUT` (🆕 v2 = 本文に `reason` も `failed_months` も必須) |
 | `PROFIT_VERSION_MISMATCH` | 月で calculation_version / master_basis が違うので計算できません。 | `CALCULATION_VERSION` `MASTER_BASIS` |
 | `PROFIT_INTERNAL` | 受け口の中の思わぬ失敗なので、どの値も返しません。 | `APP_UNEXPECTED` 🆕 `INTERNAL_EXTERNAL_CANCEL` `INTERNAL_UNCLASSIFIED_CANCEL` |
 
 - `PROFIT_ROUTE_DISABLED` の文は今の router (#1570) の文そのもの。版の「v3.1」は PR 6 で router と一緒に直す (この表も同じ PR で)
 - 🆕 **`failed_months`** (v2・設計 §5 の 0b-3 の (c) = 2026-10-04 中原さんが推しどおり) = `PROFIT_PARTIAL_FAILED` の本文 **だけ** に、止まった月を `"YYYY-MM"` の配列で (例 `{ ok: false, code: "PROFIT_PARTIAL_FAILED", error: "…", reason: "MONTH_CALC_FAILED", failed_months: ["2026-07"] }`)。**必須** (1 つ以上)・月の厳密な昇順 (重複なし)・`MAX_MONTHS` (13) まで・要求の触れる暦月の中。🚨 **値は入れない** = 要素は月の形の文字だけ (金額・行・SKU・例外の文・別の形の日付は違反)。ほかの code の本文に付いていれば違反。`build503Body(code, reason, failedMonths)` は並べ替えと重複の除きをし、月の形でない要素が 1 つでもある・空・13 を超えるときは値を出す道を作らないため `PROFIT_INTERNAL` / `APP_UNEXPECTED` にする。`validate503Body(body, { from, to })` は要求を渡せば暦月の中かも確かめる
+- 🆕 `PROFIT_PARTIAL_FAILED` は `reason` も **必須** (#1615 Codex R1 M2・`REASON_REQUIRED_CODES`) = 3 つの reason (`MONTH_META_FAILED` / `MONTH_CALC_FAILED` / `MONTH_STATEMENT_TIMEOUT`) のどれかを必ず持つ。`build503Body` は reason が無い・列挙に無いときも `PROFIT_INTERNAL` / `APP_UNEXPECTED` に落とし (reason の無い `PROFIT_PARTIAL_FAILED` を作らない)、`validate503Body` は reason の無い本文を拒む。ほかの code の reason は今までどおり任意
 - `PROFIT_METRICS_UNAVAILABLE` の reason は metrics の client (PR 2 #1600 の `REASONS`) と同じ一覧。2 つの PR がそろったら試験が一致を確かめる
 
 ## 4b. 全部の失敗の経路 → 503 の code (#1602 Codex R1 M2・設計 §3.10「1 回の要求の取引」の 0.〜7.)
@@ -103,7 +104,7 @@
 
 - HTTP の切断 (7.) は応答を返さない (別の接続から `pg_cancel_backend`・接続を pool に戻さない) = 503 の対象でない (🆕 v2 = §4c の `client_disconnect` の行)
 - Render の metrics の API は 200 でない応答を **全部** `PROFIT_METRICS_UNAVAILABLE` にする (公式に列挙の 400 を含む)
-- `PROFIT_PARTIAL_FAILED` の経路 (5. の 3 つ) は全部、本文に `failed_months` (止まった月) を付ける
+- `PROFIT_PARTIAL_FAILED` の経路 (5. の 3 つ) は全部、本文に `reason` (その経路の reason・🆕 #1615 R1 M2 で必須) と `failed_months` (止まった月) を付ける
 
 ## 4c. 🆕 取り消しの分け方 (v2・設計 §3.10「門の関数の契約」の「57014 (query_canceled) の分け方」の表・R-v3-10 M2・R-v3-11 L-new-2)
 
@@ -112,7 +113,7 @@
 - `cancellation_source` = `app_statement_budget` / `app_deadline` / `client_disconnect` / `unmarked`。**アプリが自分で決める** (PostgreSQL の文の文字に頼らない)。アプリの timer (server の `statement_timeout` より 500ms 短い)・関門の wall-clock の deadline・HTTP の切断のどれかが発火したら、`pg_cancel_backend` を送る **前に** 要求の状態に印 `cancel_mark = { source, stage }` を書く (最初の 1 つだけ・後から変えない)
 - **印があれば印の source** (経過時間を見ない・印に段があれば印の段で引く) / **印が無ければ `unmarked`**。印を書いた要求は文が先に終わっても (ほかの例外で終わっても) 結果を使わずに 503 (接続は捨てる)
 - `stage` = 要求の取引の段 `tx_setup` (2.) / `lock_statement` (3.) / `load_count` (4.) / `month_body` (5.) / `commit` (6.)
-- 見る順 = ① 印 `client_disconnect` (応答を作らない) ② `25P04` (どの段でも) ③ 印あり (印の source と段) ④ 印なしの 57014 (`unmarked`) ⑤ どれにも当たらない = 表に無い組。印が無く sqlstate が 57014 / 25P04 でなければ `null` = 取り消しでない (門の `D6*`・`55P03` は `HEAVY_GUARD_SQLSTATES` の対応 = 3a で固定)
+- 見る順 (code / reason / 応答 / ログ) = ⓪ 知らない印 (source が一覧に無い・`unmarked` と書いた・中身が無い) = 表に無い組 ① 印 `client_disconnect` (応答を作らない) ② `25P04` (どの段でも) ③ 印あり (印の source と段) ④ 印なしの 57014 (`unmarked`) ⑤ どれにも当たらない = 表に無い組。ROLLBACK はこの順と別に決める (下の表の後の規則)。印が無く sqlstate が 57014 / 25P04 でなければ `null` = 取り消しでない (門の `D6*`・`55P03` は `HEAVY_GUARD_SQLSTATES` の対応 = 3a で固定)
 
 | stage | sqlstate | cancellation_source | code / reason | 応答 | ROLLBACK | 本文の failed_months | ログの理由 |
 |---|---|---|---|---|---|---|---|
@@ -120,11 +121,13 @@
 | `load_count` | `57014` | `app_statement_budget` | `PROFIT_RESOURCE` / `RESOURCE_LOAD_COUNT_TIME` | 503 | 送る | - | `load_count_statement_timeout` |
 | `load_count` | `57014` | `app_deadline` | `PROFIT_RESOURCE` / `RESOURCE_LOAD_COUNT_TIME` | 503 | 送る | - | `load_count_deadline` |
 | `load_count` | (無し) | `app_deadline` | `PROFIT_RESOURCE` / `RESOURCE_LOAD_COUNT_TIME` | 503 | 送る | - | `load_count_deadline` |
-| (どれでも) | (どれでも) | `client_disconnect` | - | **作らない** (client が居ない) | 送るか接続を捨てる | - | `client_disconnect` |
-| (どれでも) | `25P04` | (どれでも) | `PROFIT_RESOURCE` / `RESOURCE_TRANSACTION_TIMEOUT` | 503 | **送らない** (session が終わる = 接続を捨てる) | - | `transaction_timeout` |
+| (どれでも) | (どれでも) | `client_disconnect` | - | **作らない** (client が居ない) | 送る (`25P04` なら送らない = 接続を捨てる・下の規則) | - | `client_disconnect` |
+| (どれでも) | `25P04` | (どれでも) | `PROFIT_RESOURCE` / `RESOURCE_TRANSACTION_TIMEOUT` | 503 | **送らない** (session が終わる = 接続を捨てる・🆕 印 `client_disconnect`・知らない印で別の行に当たっても = 下の規則) | - | `transaction_timeout` |
 | `load_count` | `57014` | `unmarked` | `PROFIT_INTERNAL` / `INTERNAL_EXTERNAL_CANCEL` | 503 | 送る | - | `external_cancel` (🚨 誰かが計算を止めたか、server の timeout が先) |
 | `month_body` | `57014` | `unmarked` | `PROFIT_INTERNAL` / `INTERNAL_EXTERNAL_CANCEL` | 503 | 送る | - | `external_cancel` |
-| **上の表に無い組** (例 = `tx_setup` や `lock_statement` の 57014・知らない段・知らない source の印) | | | `PROFIT_INTERNAL` / `INTERNAL_UNCLASSIFIED_CANCEL` | 503 (握りつぶして成功・部分の値にしない・rethrow もしない) | 送る | - | `unclassified_cancel` (3 つの組だけ・文と値は出さない) |
+| **上の表に無い組** (例 = `tx_setup` や `lock_statement` の 57014・知らない段・知らない source の印) | | | `PROFIT_INTERNAL` / `INTERNAL_UNCLASSIFIED_CANCEL` | 503 (握りつぶして成功・部分の値にしない・rethrow もしない) | 送る (`25P04` なら送らない) | - | `unclassified_cancel` (3 つの組だけ・文と値は出さない) |
+
+- 🆕 **respond と send_rollback は別々に決める** (#1615 Codex R1 M1): 応答 = 印 `client_disconnect` なら sqlstate に関係なく **作らない** / ROLLBACK = sqlstate が `NO_ROLLBACK_SQLSTATES` (`25P04`) なら、上の表のどの行 (表に無い組も) に当たっても・印の正しさに関係なく **送らない** (session が終わっている = 接続を捨てる)。例 = 印 `client_disconnect` × `25P04` → 応答なし・ROLLBACK なし / 知らない印 × `25P04` → `PROFIT_INTERNAL` / `INTERNAL_UNCLASSIFIED_CANCEL` の 503・ROLLBACK なし。`classifyCancellation` は当たった行の「送らない」版 (send_rollback だけ違う凍結した object・同じ入力には同じ参照) を返す。golden = `cancel-cases.json` の「表 4 × 表 6」「表 8 × 表 6」の行
 
 ## 5. 付録 A: /totals の期間の行の全部の列の分類 (型の全部の分類の表)
 
@@ -235,7 +238,7 @@ null の規則 (nul):
 | `seller_sku_norm` | text | `iff_resolved` | 文字 |  |
 | `listing_resolution` | text | `never` | 文字 | 列挙 (resolved / unresolved) |
 | `listing_code` | text | `iff_unresolved` | 文字 |  |
-| `member_seller_skus` | text[] | `never` | 配列 (文字) | 🆕 v2 (3a の包む関数が返す・0050 の戻りには無い)。受け取った seller SKU を trim + 小文字・UTF-8 の bytes の厳密な昇順 (重複なし)・1 行 100 個まで・各 255 文字まで・空 `[]` ⇔ `order_rows = 0` |
+| `member_seller_skus` | text[] | `never` | 配列 (文字) | 🆕 v2 (3a の包む関数が返す・0050 の戻りには無い)。受け取った seller SKU を trim + 小文字 (**ASCII の英字だけ小文字を保証**・非 ASCII の大小は縛らない)・UTF-8 の bytes の厳密な昇順 (重複なし)・1 行 100 個まで・各 255 文字まで・空 `[]` ⇔ `order_rows = 0` |
 | `received_listing_ids` | bigint[] | `never` | 配列 (文字列) | ID (BigInt) の厳密な昇順・重複なし・1 以上 |
 | `received_listing_unresolved_count` | integer | `never` | 数 | ≥ 0 |
 | `ad_received_listing_ids` | bigint[] | `never` | 配列 (文字列) | ID (BigInt) の厳密な昇順・重複なし・1 以上 |
@@ -332,7 +335,7 @@ null の規則 (nul):
 - `assumed_zero_reasons` = `profit_incomplete_reasons` から `refund_units_partial_month` を除いたもの
 - 🆕 **`member_seller_skus` (v2・設計 19 §6.6.1 の案 (a)・設計 13 §5 の 0b-2 の (d) = 2026-10-04 中原さんが推しどおり)** = その行の粒度 (解決 = 出品 `listing_id` / 未解決 = 正規化 SKU `seller_sku_norm`) にまとまった、その日の財務の行で受け取った seller SKU。利益の行と **同じ計算・同じスナップショット** で解決する (F4-5 の「まとめた SKU」の構成の SKU = 財務の和と利益が 1 行でそろう)
   - 型 = 文字の配列・null にならない。**空の配列 `[]` = その日のその粒度に財務の行が無い** (広告だけ・Easy Ship だけの行) ⇔ `order_rows = 0` (財務の子がある ⇔ 空でない)
-  - 要素 = trim (前後の空白を除く・空白の集合 = `core.norm_code` / 0054 の `amazon_map_key_problem` と同じ = 全角の空白・NBSP・BOM も) + 小文字 (ASCII の大文字なし)・空でない・255 文字まで (0054 の対応の表の `seller_sku` と同じ)
+  - 要素 = trim (前後の空白を除く・空白の集合 = `core.norm_code` / 0054 の `amazon_map_key_problem` と同じ = 全角の空白・NBSP・BOM も) + 小文字 (🆕 #1615 Codex R1 Low: **ASCII の英字だけ小文字を保証** = `A`〜`Z` を含まない。全角の `Ａ`・`É`・`Σ` など非 ASCII の大小は縛らない = PostgreSQL の `lower()` の非 ASCII の扱いは照合順序に依る。全部の Unicode を縛るかは 3a で DB の式と統合試験をそろえるときに決める)・空でない・255 文字まで (0054 の対応の表の `seller_sku` と同じ)
   - 並び = UTF-8 の bytes の厳密な昇順 (重複なし・locale の比べを使わない・設計 19 §6.2.5 の「文字の配列」と同じ)。例 = `["ab-001","ａｂ-００１"]` (全角の SKU も正規化 SKU が同じなら同じ出品の粒度・半角が先)
   - 上限 = 1 行に **100 個** まで (直接の一致 = 1 つの粒度の SKU は全部 `core.norm_code` が同じ = 全角・半角・空白・ダッシュの違いだけ)
   - **同じ日の行の間で同じ seller SKU は 1 つの粒度にだけ** (trim + 小文字が同じなら `core.norm_code` も同じ = 同じ粒度・F4-5 の「財務の全部の SKU がちょうど 1 つの粒度」)
@@ -346,11 +349,11 @@ null の規則 (nul):
 - Decimal の足し算は試験の中では BigInt の固定小数 (参照の組み立て)。本番の組み立て (PR 6) は設計どおり Decimal のライブラリを直接の依存にし、`rounding-vectors.json` を通すこと
 - 🆕 v2 (PR 2c) で設計に書いていない細部を決めた所 (3a / PR 6 で違えば、この文書と版を一緒に直す):
   - 版の名前 = `amazon_profit_response_v2` (v1 の続き)・版の履歴を `CONTRACT_HISTORY` に
-  - `member_seller_skus` の上限 (1 行 100 個・各 255 文字)・trim の空白の集合 (`core.norm_code` と同じ)・小文字は ASCII の大文字なしで確かめる (`lower()` の非 ASCII の扱いは DB の照合順序に依る = 契約では縛らない)・日の行の中の位置 (`listing_code` の後ろ)
+  - `member_seller_skus` の上限 (1 行 100 個・各 255 文字)・trim の空白の集合 (`core.norm_code` と同じ)・小文字は **ASCII の英字だけ小文字を保証** (ASCII の大文字なしで確かめる・`lower()` の非 ASCII の扱いは DB の照合順序に依る = 契約では縛らない・#1615 Codex R1 Low で §6 の主契約の文もこれにそろえた)・日の行の中の位置 (`listing_code` の後ろ)
   - `member_seller_skus` の空 ⇔ `order_rows = 0` と、同じ日の行の間で重ならないこと (設計の「財務の全部の SKU がちょうど 1 つの粒度」から)
   - `finance_coverage_token` は null にならない (関数が部品の日の覆いを確かめて例外 = 503)・同じ応答の 2 つの月で同じ値は違反
-  - `failed_months` は `PROFIT_PARTIAL_FAILED` の 3 つの reason 全部で **必須**・`build503Body` は月の形でない要素があれば `PROFIT_INTERNAL` に落とす
-  - 取り消しの段の名前 (`tx_setup`・`lock_statement`・`load_count`・`month_body`・`commit`)・見る順 (印 `client_disconnect` → `25P04` → 印 → `unmarked`)・印に段があれば印の段で引く・印を書いた後にほかの例外で終わっても印の理由・門の `D6*` / `55P03` の対応は 3a (`HEAVY_GUARD_SQLSTATES`) に残す
+  - `failed_months` は `PROFIT_PARTIAL_FAILED` の 3 つの reason 全部で **必須**・`build503Body` は月の形でない要素があれば `PROFIT_INTERNAL` に落とす・🆕 `reason` も必須 (無い・列挙に無いなら `PROFIT_INTERNAL`・#1615 R1 M2)
+  - 取り消しの段の名前 (`tx_setup`・`lock_statement`・`load_count`・`month_body`・`commit`)・見る順 (知らない印 → 印 `client_disconnect` → `25P04` → 印 → `unmarked`・ROLLBACK は 25P04 かどうかだけで別に決める = #1615 R1 M1)・印に段があれば印の段で引く・印を書いた後にほかの例外で終わっても印の理由・門の `D6*` / `55P03` の対応は 3a (`HEAVY_GUARD_SQLSTATES`) に残す
 
 ## 8. 版の履歴
 
@@ -358,3 +361,5 @@ null の規則 (nul):
 |---|---|---|
 | `amazon_profit_response_v1` | #1602 (D-60 PR 2b) | 最初の形 (期間の全体の 1 行 + `months[]`・日 × 出品の行・503 の固定の文と reason の列挙) |
 | `amazon_profit_response_v2` | D-60 PR 2c | `months[].finance_coverage_token`・日の行の `member_seller_skus`・57014 / 25P04 の分け方の reason (`CANCEL_MAP`)・`PROFIT_PARTIAL_FAILED` の `failed_months` |
+
+- 🆕 #1615 の Codex R1 の直し (`25P04` は表のどの行でも ROLLBACK を送らない・`PROFIT_PARTIAL_FAILED` の `reason` を必須に・「小文字」は ASCII の英字だけの保証) は **同じ PR 2c の中** = v2 のまま (版は上げない)。v2 はまだどこにも出していない (受け口は 503 のまま・マージ前) ので、v2 を読む側はまだ居ない

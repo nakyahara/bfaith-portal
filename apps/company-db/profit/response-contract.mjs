@@ -13,7 +13,7 @@
  *
  * 🆕 v2 (D-60 の PR 2c・設計 §3.10 の PR の表の 2c・§5 の 0b-2 の (d)・0b-3 の (c)・設計 19 v14 §6.6.1 / §6.2.1 ③):
  *   - months[] に finance_coverage_token (64 桁の小文字の 16 進・core.finance_coverage_token の値 = F4 の coverage_token と同じ関数・3a で作る)
- *   - /daily の行に member_seller_skus (その行の粒度にまとまった、受け取った seller SKU を trim + 小文字・UTF-8 の bytes の順・重複なしの配列)
+ *   - /daily の行に member_seller_skus (その行の粒度にまとまった、受け取った seller SKU を trim + 小文字 (ASCII の英字だけ保証)・UTF-8 の bytes の順・重複なしの配列)
  *   - 503: 57014 / 25P04 の分け方 (CANCEL_MAP・classifyCancellation) の reason を列挙に・PROFIT_PARTIAL_FAILED の本文に failed_months (月だけ・値は出さない)
  *
  * 値の書き方 (JSON):
@@ -125,7 +125,8 @@ export const CANCELLATION_SOURCES = Object.freeze(['app_statement_budget', 'app_
 export const CANCEL_STAGES = Object.freeze(['tx_setup', 'lock_statement', 'load_count', 'month_body', 'commit']);
 /**
  * 表の行 (上から順に見る)。'*' = どれでも。sqlstate null = 取り消しの例外が無い (文が先に終わった・文と文の間で deadline が来た)。
- *   respond = false → 応答を作らない (client が居ない・今の契約の 7.) / send_rollback = false → ROLLBACK を送らず接続を捨てる (25P04 = session が終わる)
+ *   respond = false → 応答を作らない (client が居ない・今の契約の 7.) / send_rollback = false → ROLLBACK を送らず接続を捨てる (25P04 = session が終わる・
+ *   🆕 #1615 R1 M1 = 25P04 なら当たった行に関係なく false = NO_ROLLBACK_SQLSTATES・classifyCancellation が行の「送らない」版を返す)
  *   failed_months = true → 503 の本文に止まった月 (PROFIT_PARTIAL_FAILED) / log = ログの理由 (3 つの組と段だけを出す・文と値は出さない)
  */
 export const CANCEL_MAP = Object.freeze([
@@ -145,17 +146,32 @@ export const CANCEL_UNCLASSIFIED = Object.freeze({ stage: '*', sqlstate: '*', so
   respond: true, send_rollback: true, failed_months: false, log: 'unclassified_cancel' });
 /** 取り消しの例外の SQLSTATE (この 2 つと「印あり」だけがこの表の対象) */
 export const CANCEL_SQLSTATES = Object.freeze(['57014', '25P04']);
+/**
+ * 🆕 #1615 Codex R1 M1: ROLLBACK を送らない SQLSTATE = 25P04 (transaction_timeout は session を終える)。**表のどの行に当たっても** (印 client_disconnect・
+ *   知らない印 = 表に無い組 も) この SQLSTATE なら send_rollback = false (接続を捨てる)。応答 (respond) は印 client_disconnect だけで決める = 2 つは別々に決める
+ */
+export const NO_ROLLBACK_SQLSTATES = Object.freeze(['25P04']);
+/** 表の行 → 「ROLLBACK を送らない」版の行 (読み込みのときに 1 回だけ作る = 同じ入力には同じ参照を返す) */
+const NO_ROLLBACK_ROW = new Map([...CANCEL_MAP, CANCEL_UNCLASSIFIED].map((r) => [r, r.send_rollback ? Object.freeze({ ...r, send_rollback: false }) : r]));
 
 /**
  * 取り消しを (stage, sqlstate, 印) から 1 つの結果に分ける。経過時間は引数に無い (経過時間の近さでは決めない = R-v3-11 L-new-2)。
  *   @param {{ stage: string, sqlstate?: string|null, mark?: { source: string, stage?: string }|null }} x
  *     stage = 例外を受けた (印が無いとき) 段 / mark = 要求の状態の印 (stage があれば印の段で引く = timer を張った段の理由)
- *   @returns 表の行 (CANCEL_MAP の 1 つか CANCEL_UNCLASSIFIED) / null = 取り消しでない (印が無く sqlstate が 57014 / 25P04 でない = 門の対応か FAILURE_PATHS のほかの行)
- * 順: ① 印 client_disconnect = 応答を作らない (client が居ない) ② 25P04 = どの段でも RESOURCE_TRANSACTION_TIMEOUT (ROLLBACK を送らない)
+ *   @returns 表の行 (CANCEL_MAP の 1 つか CANCEL_UNCLASSIFIED・25P04 ならその「ROLLBACK を送らない」版) /
+ *     null = 取り消しでない (印が無く sqlstate が 57014 / 25P04 でない = 門の対応か FAILURE_PATHS のほかの行)
+ * code / reason / respond / log の順: ⓪ 知らない印 (source が一覧に無い・unmarked と書いた) = CANCEL_UNCLASSIFIED
+ *     ① 印 client_disconnect = 応答を作らない (client が居ない) ② 25P04 = どの段でも RESOURCE_TRANSACTION_TIMEOUT
  *     ③ 印あり = 印の source と段で引く (文が先に終わった・ほかの例外で終わった も 57014 と同じに扱う = 結果を使わない) ④ 印なしの 57014 = unmarked で引く
- *     ⑤ どれにも当たらない = CANCEL_UNCLASSIFIED (知らない段・知らない source の印も)
+ *     ⑤ どれにも当たらない = CANCEL_UNCLASSIFIED (知らない段も)
+ * send_rollback は別に決める (#1615 Codex R1 M1): sqlstate が NO_ROLLBACK_SQLSTATES (25P04) なら ⓪〜⑤ のどれでも false
+ *   (例 = 印 client_disconnect × 25P04 → 応答なし・ROLLBACK なし / 知らない印 × 25P04 → 表に無い組の 503・ROLLBACK なし)
  */
-export function classifyCancellation({ stage, sqlstate = null, mark = null } = {}) {
+export function classifyCancellation(x = {}) {
+  const row = classifyCancellationRow(x);
+  return row && NO_ROLLBACK_SQLSTATES.includes(x.sqlstate) ? NO_ROLLBACK_ROW.get(row) : row;
+}
+function classifyCancellationRow({ stage, sqlstate = null, mark = null } = {}) {
   const hasMark = mark != null;
   const source = hasMark ? mark.source : 'unmarked';
   if (hasMark && (!CANCELLATION_SOURCES.includes(source) || source === 'unmarked')) return CANCEL_UNCLASSIFIED;
@@ -192,15 +208,18 @@ export const PROFIT_503_BODY_KEYS = Object.freeze(['ok', 'code', 'error', 'reaso
  * 503 の本文を作る (固定の文・列挙にない reason は付けない = 上流の例外の文を入れる道が無い)。
  * 🆕 v2: PROFIT_PARTIAL_FAILED は failedMonths ('YYYY-MM' の配列・並べ替えと重複の除きはここでする) が必須。月の形でない要素が 1 つでもある・
  *   空・13 を超える なら、値を出す道を作らないために **PROFIT_INTERNAL / APP_UNEXPECTED** にする (呼び手の誤り)。ほかの code では failedMonths を付けない
+ * 🆕 #1615 Codex R1 M2: PROFIT_PARTIAL_FAILED は reason も **必須** (3 つの経路 = MONTH_META_FAILED・MONTH_CALC_FAILED・MONTH_STATEMENT_TIMEOUT の
+ *   どれか)。reason が無い・列挙に無いときも PROFIT_INTERNAL / APP_UNEXPECTED にする (reason も failed_months も無い PARTIAL_FAILED を作らない)
  */
+export const REASON_REQUIRED_CODES = Object.freeze([FAILED_MONTHS_CODE]);
 export function build503Body(code, reason, failedMonths) {
   const c = Object.hasOwn(PROFIT_503_ERRORS, code) ? code : 'PROFIT_INTERNAL';
   if (c === FAILED_MONTHS_CODE) {
     const ok = Array.isArray(failedMonths) && failedMonths.length > 0 && failedMonths.every((m) => typeof m === 'string' && YM_RE.test(m));
     const months = ok ? [...new Set(failedMonths)].sort() : [];
-    if (!ok || months.length > MAX_MONTHS) return build503Body('PROFIT_INTERNAL', 'APP_UNEXPECTED');
-    const body = { ok: false, code: c, error: PROFIT_503_ERRORS[c] };
-    if (typeof reason === 'string' && PROFIT_503_REASONS[c].includes(reason)) body.reason = reason;
+    const reasonOk = typeof reason === 'string' && PROFIT_503_REASONS[c].includes(reason);
+    if (!ok || months.length > MAX_MONTHS || !reasonOk) return build503Body('PROFIT_INTERNAL', 'APP_UNEXPECTED');
+    const body = { ok: false, code: c, error: PROFIT_503_ERRORS[c], reason };
     body.failed_months = months;
     return body;
   }
@@ -355,11 +374,13 @@ export const DAILY_DB_COLUMNS = Object.freeze(DAILY_COLUMNS.filter((c) => !c.add
 /**
  * 🆕 v2 member_seller_skus の規則 (設計 13 §3.10 の PR の表の 2c・設計 19 §6.6.1 / §6.2.5 の「文字の配列」):
  *   - 中身 = その行の粒度 (解決 = 出品 / 未解決 = 正規化 SKU) にまとまった、その日の財務の行で **受け取った seller SKU** を trim + 小文字にしたもの
+ *     (🆕 #1615 Codex R1 Low: 契約が保証する「小文字」は **ASCII の英字 (A-Z) だけ**。全角の英字 Ａ など非 ASCII の大小は縛らない =
+ *     PostgreSQL の lower() の非 ASCII の扱いは照合順序に依る。全部の Unicode を縛るかは 3a で DB の式と統合試験をそろえるときに決める)
  *     (利益の行と同じ計算・同じスナップショットで解決 = F4-5 の「まとめた SKU」の構成の SKU)
  *   - 型 = 文字の配列・null にならない。**空の配列 [] = その日のその粒度に財務の行が無い** (広告だけ・Easy Ship だけの行)。⇔ order_rows = 0
  *   - 並び = UTF-8 の bytes の厳密な昇順 (= 重複なし・locale の比べを使わない・JS は Buffer.compare)
  *   - 要素 = 空でない・前後に空白なし (trim の空白 = MEMBER_SKU_EDGE_SPACE・core.norm_code と 0054 の amazon_map_key_problem と同じ集合)・
- *     ASCII の大文字なし (lower)・MAX_MEMBER_SKU_CHARS 文字まで (0054 の対応の表の seller_sku と同じ 255)
+ *     ASCII の大文字 (A-Z) なし (lower・非 ASCII の大小は見ない)・MAX_MEMBER_SKU_CHARS 文字まで (0054 の対応の表の seller_sku と同じ 255)
  *   - 上限 = 1 行に MAX_MEMBER_SELLER_SKUS 個まで (直接の一致 = 1 つの粒度の SKU は全部 core.norm_code が同じ = 全角・半角・空白・ダッシュの違いだけ)
  *   - 同じ日の行の間で同じ seller SKU は 1 つの粒度にだけ (trim + 小文字が同じなら core.norm_code も同じ = 同じ粒度・F4-5 の「財務の全部の SKU がちょうど 1 つの粒度」)
  */
@@ -376,7 +397,7 @@ export function memberSkuErrors(v) {
     if (typeof s !== 'string' || s.length === 0) { e.push(`[${k}] 空でない文字でない`); return; }
     if ([...s].length > MAX_MEMBER_SKU_CHARS) e.push(`[${k}] ${MAX_MEMBER_SKU_CHARS} 文字を超える`);
     if (MEMBER_SKU_EDGE_SPACE.test(s)) e.push(`[${k}] 前後に空白 (trim していない)`);
-    if (/[A-Z]/.test(s)) e.push(`[${k}] 大文字 (小文字にしていない)`);
+    if (/[A-Z]/.test(s)) e.push(`[${k}] ASCII の大文字 (小文字にしていない)`);   // 非 ASCII (全角の Ａ ほか) の大小は契約で縛らない (#1615 Codex R1 Low)
     if (k > 0 && typeof v[k - 1] === 'string' && Buffer.compare(Buffer.from(v[k - 1], 'utf8'), Buffer.from(s, 'utf8')) >= 0) e.push(`[${k}] UTF-8 の bytes の厳密な昇順でない (重複・順の違い)`);
   });
   return e;
@@ -735,6 +756,7 @@ const findSecrets = (body, errs) => {
 /**
  * 503 の本文を確かめる (今の封じ込めの PROFIT_ROUTE_DISABLED もこの形)。error は code の固定の文・reason は code ごとの列挙だけ。
  * 🆕 v2: failed_months は PROFIT_PARTIAL_FAILED のときだけ・必須・'YYYY-MM' の厳密な昇順・13 まで。request ({ from, to }) を渡せば要求の触れる暦月の中かも確かめる
+ *   PROFIT_PARTIAL_FAILED は reason も必須 (REASON_REQUIRED_CODES・#1615 Codex R1 M2)
  */
 export function validate503Body(body, request) {
   return guard(() => {
@@ -746,6 +768,8 @@ export function validate503Body(body, request) {
     if (!PROFIT_503_CODES.includes(body.code)) { errs.push(`$.code: 一覧に無い`); return errs; }
     if (body.error !== PROFIT_503_ERRORS[body.code]) errs.push('$.error: code の固定の文と違う (上流の例外・本文を入れない)');
     if (Object.hasOwn(body, 'reason') && !PROFIT_503_REASONS[body.code].includes(body.reason)) errs.push('$.reason: この code の列挙に無い');
+    // 🆕 #1615 Codex R1 M2: PROFIT_PARTIAL_FAILED は reason が必須 (3 つの経路のどれか)
+    if (REASON_REQUIRED_CODES.includes(body.code) && !Object.hasOwn(body, 'reason')) errs.push(`$.reason: ${body.code} では必須 (${PROFIT_503_REASONS[body.code].join(' / ')})`);
     if (body.code !== FAILED_MONTHS_CODE) {
       if (Object.hasOwn(body, 'failed_months')) errs.push(`$.failed_months: ${FAILED_MONTHS_CODE} のときだけ`);
       return errs;

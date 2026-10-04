@@ -27,6 +27,8 @@ import {
   // 🆕 v2 (PR 2c)
   CONTRACT_HISTORY, DAILY_DB_COLUMNS, MAX_MEMBER_SELLER_SKUS, MAX_MEMBER_SKU_CHARS, memberSkuErrors, FAILED_MONTHS_CODE, PROFIT_503_BODY_KEYS,
   CANCELLATION_SOURCES, CANCEL_STAGES, CANCEL_MAP, CANCEL_UNCLASSIFIED, CANCEL_SQLSTATES, classifyCancellation,
+  // 🆕 #1615 Codex R1
+  NO_ROLLBACK_SQLSTATES, REASON_REQUIRED_CODES,
 } from '../apps/company-db/profit/response-contract.mjs';
 import crypto from 'node:crypto';
 import { combineTotals, combineDaily, sumDecimals, round2 } from './fixtures/amazon-profit-response/reference-combine.mjs';
@@ -610,6 +612,9 @@ await t('member_seller_skus の受け取るべき形: 財務の行が無い行 (
     ['bytes の順 = f (0x66) < é (0xC3) (locale の比べなら é が先)', (x) => { x.rows[0].member_seller_skus = ['f', 'é']; }],
     ['中の空白はそのまま (trim は前後だけ)', (x) => { x.rows[0].member_seller_skus = ['ab 001']; }],
     ['別の日の行なら同じ SKU', (x) => { x.rows[2].member_seller_skus = ['ab-001']; }],
+    // 🆕 #1615 R1 Low: 「小文字」の保証は ASCII の英字 (A-Z) だけ = 非 ASCII の大文字 (全角の Ａ・É・Σ) は縛らない
+    ['非 ASCII の大文字 (全角の ＡＢ) は縛らない', (x) => { x.rows[0].member_seller_skus = ['ab-001', 'ＡＢ-００１']; }],
+    ['非 ASCII の大文字 (É・Σ) は縛らない', (x) => { x.rows[0].member_seller_skus = ['ab-É', 'ab-Σ']; }],
   ];
   assert.ok('é'.localeCompare('f') < 0, 'locale の比べでは é が先 (= bytes の順と違う例になっている)');
   for (const [name, f] of ok) { const x = clone(dailyExp); f(x); assert.deepEqual(validateDailyResponse(x).errors, [], name); }
@@ -622,6 +627,7 @@ const breakMember = [
   ['要素が null', (x) => { x.rows[0].member_seller_skus = [null]; }],
   ['要素が空の文字', (x) => { x.rows[0].member_seller_skus = ['']; }],
   ['大文字 (小文字にしていない)', (x) => { x.rows[0].member_seller_skus = ['AB-001']; }],
+  ['ASCII の大文字が 1 つだけ混ざる (全角の英字の中)', (x) => { x.rows[0].member_seller_skus = ['ab-001', 'ａｂ-００１X']; }],
   ['前に半角の空白', (x) => { x.rows[0].member_seller_skus = [' ab-001']; }],
   ['後ろに半角の空白', (x) => { x.rows[0].member_seller_skus = ['ab-001 ']; }],
   ['後ろに全角の空白', (x) => { x.rows[0].member_seller_skus = ['ab-001' + FW_SPACE]; }],
@@ -699,6 +705,28 @@ const breakFailed = [
 await t(`503 の failed_months の違反 ${breakFailed.length} 通りを全部拒む`, async () => {
   for (const [name, b] of breakFailed) assert.equal(validate503Body(b).ok, false, name);
 });
+await t('🆕 #1615 R1 M2: PROFIT_PARTIAL_FAILED は reason が必須 = 無い・不正の reason の本文を拒み、build503Body は PROFIT_INTERNAL / APP_UNEXPECTED に落とす', async () => {
+  assert.deepEqual([...REASON_REQUIRED_CODES], ['PROFIT_PARTIAL_FAILED']);
+  const INTERNAL = { ok: false, code: 'PROFIT_INTERNAL', error: PROFIT_503_ERRORS.PROFIT_INTERNAL, reason: 'APP_UNEXPECTED' };
+  const BAD_REASONS = [undefined, null, '', 'month_calc_failed', 'MONTH_FAILED', 'DB_CONNECT', 'APP_UNEXPECTED', 'RESOURCE_TRANSACTION_TIMEOUT', 1, ['MONTH_CALC_FAILED'],
+    { reason: 'MONTH_CALC_FAILED' }, 'canceling statement due to statement timeout', 'toString', '__proto__'];
+  for (const r of BAD_REASONS) {
+    const b = build503Body('PROFIT_PARTIAL_FAILED', r, ['2026-07']);
+    assert.deepEqual(b, INTERNAL, String(r));
+    assert.ok(!('failed_months' in b), String(r));
+    assert.deepEqual(validate503Body(b).errors, [], String(r));
+  }
+  // 本文の側: reason が無い (Codex R1 の例そのもの)・null・不正・別の code の reason・小文字 = 拒む
+  const body = (extra) => ({ ok: false, code: 'PROFIT_PARTIAL_FAILED', error: PROFIT_503_ERRORS.PROFIT_PARTIAL_FAILED, ...extra, failed_months: ['2026-07'] });
+  const noReason = body({});
+  assert.deepEqual(Object.keys(noReason), ['ok', 'code', 'error', 'failed_months']);
+  assert.ok(validate503Body(noReason).errors.some((e) => e.startsWith('$.reason: PROFIT_PARTIAL_FAILED では必須')), JSON.stringify(validate503Body(noReason).errors));
+  for (const r of BAD_REASONS.filter((x) => x !== undefined)) assert.equal(validate503Body(body({ reason: r })).ok, false, String(r));
+  // 3 つの正しい reason は通る (requestつきでも)
+  for (const r of PROFIT_503_REASONS.PROFIT_PARTIAL_FAILED) assert.deepEqual(validate503Body(body({ reason: r }), { from: '2026-07-01', to: '2026-07-31' }).errors, [], r);
+  // ほかの code は今までどおり reason なしでも通る (必須にしたのは PROFIT_PARTIAL_FAILED だけ)
+  for (const c of PROFIT_503_CODES.filter((x) => x !== FAILED_MONTHS_CODE)) assert.deepEqual(validate503Body(build503Body(c)).errors, [], c);
+});
 
 console.log('🆕 v2 (PR 2c): 57014 / 25P04 の分け方 (CANCEL_MAP)');
 const cancelCases = readFix('cancel-cases.json').cases;
@@ -755,6 +783,35 @@ await t('印の優先: 経過時間は分け方に使わない・印があれば
     assert.ok(r === null || r === CANCEL_UNCLASSIFIED, JSON.stringify(x));
   }
 });
+await t('🆕 #1615 R1 M1: respond と send_rollback は別々 = 25P04 は段・印 (無い・正しい・知らない・壊れた) に関係なく ROLLBACK なし / 印 client_disconnect は sqlstate に関係なく応答なし', async () => {
+  assert.deepEqual([...NO_ROLLBACK_SQLSTATES], ['25P04']);
+  const MARKS = [null, ...CANCELLATION_SOURCES.map((source) => ({ source })), { source: 'timer' }, { source: 1 }, {}, { source: 'app_statement_budget', stage: 'somewhere' }];
+  const STAGES = [...CANCEL_STAGES, 'somewhere', undefined];
+  let n = 0;
+  for (const stage of STAGES) for (const m of MARKS) for (const sqlstate of [...CANCEL_SQLSTATES, null, 'D6L01', '40001']) {
+    const mark = m && m.source !== undefined && !m.stage && stage ? { ...m, stage } : m;
+    const x = { stage, sqlstate, mark }, r = classifyCancellation(x), label = JSON.stringify(x);
+    if (sqlstate === '25P04') { assert.ok(r, `${label}: 25P04 は必ず取り消しの結果`); assert.equal(r.send_rollback, false, label); n++; }
+    else if (r) assert.equal(r.send_rollback, true, label);   // 25P04 でなければ ROLLBACK を送る (表の行の値)
+    if (r) assert.equal(r.respond, mark?.source !== 'client_disconnect', label);
+    if (mark?.source === 'client_disconnect') assert.deepEqual([r.respond, r.code, r.reason, r.log], [false, null, null, 'client_disconnect'], label);
+    if (r) { assert.ok(Object.isFrozen(r), label); assert.equal(classifyCancellation({ ...x }), r, `${label}: 同じ入力には同じ参照`); }
+    // 「送らない」版は元の行と send_rollback だけが違う
+    if (r && !CANCEL_MAP.includes(r) && r !== CANCEL_UNCLASSIFIED) {
+      const base = [...CANCEL_MAP, CANCEL_UNCLASSIFIED].find((e) => e.log === r.log && e.code === r.code && e.reason === r.reason && e.respond === r.respond);
+      assert.ok(base, label); assert.deepEqual({ ...r, send_rollback: true }, { ...base, send_rollback: true }, label);
+    }
+  }
+  assert.equal(n, STAGES.length * MARKS.length, `25P04 の組 ${n}`);   // 段 7 × 印 9 の全部の組
+  // Codex R1 の 2 つの組そのもの
+  assert.deepEqual(outcome(classifyCancellation({ stage: 'month_body', sqlstate: '25P04', mark: { source: 'client_disconnect', stage: 'month_body' } })),
+    { code: null, reason: null, respond: false, send_rollback: false, failed_months: false, log: 'client_disconnect' });
+  assert.deepEqual(outcome(classifyCancellation({ stage: 'month_body', sqlstate: '25P04', mark: { source: 'timer', stage: 'month_body' } })),
+    { code: 'PROFIT_INTERNAL', reason: 'INTERNAL_UNCLASSIFIED_CANCEL', respond: true, send_rollback: false, failed_months: false, log: 'unclassified_cancel' });
+  // 表の行そのものは変えない (送らない版は別の object)
+  assert.equal(CANCEL_UNCLASSIFIED.send_rollback, true);
+  assert.equal(CANCEL_MAP.find((e) => e.source === 'client_disconnect').send_rollback, true);
+});
 await t('文書 (docs/contracts) に v2 の項目: months の token・§4c の取り消しの表の全部のログの理由・§8 の版の履歴', async () => {
   const doc = fs.readFileSync(new URL('../docs/contracts/company_db_amazon_profit_response.contract.md', import.meta.url), 'utf8');
   const section = (h) => { const s = doc.indexOf(h); assert.ok(s >= 0, h); const e = doc.indexOf('\n## ', s + 1); return doc.slice(s, e < 0 ? undefined : e); };
@@ -765,6 +822,12 @@ await t('文書 (docs/contracts) に v2 の項目: months の token・§4c の�
   assert.deepEqual([...section('## 8. 版の履歴').matchAll(/^\| `(amazon_profit_response_v\d+)` \|/gm)].map((m) => m[1]), CONTRACT_HISTORY.map((h) => h.version));
   assert.ok(doc.includes(`\`contract\` = \`${CONTRACT_VERSION}\``));
   assert.ok(section('## 4. 503').includes('failed_months'));
+  // 🆕 #1615 Codex R1: 文書と実装の意味を 1 つに (M1 = 25P04 は表のどの行でも ROLLBACK を送らない / M2 = reason が必須 / Low = ASCII の英字だけ)
+  assert.ok(s4c.includes('`NO_ROLLBACK_SQLSTATES`') && s4c.includes('respond と send_rollback は別々に決める'), '§4c の M1');
+  assert.ok(!s4c.includes('送るか接続を捨てる'), '§4c: client_disconnect の ROLLBACK の曖昧な書き方を残さない');
+  assert.ok(section('## 4. 503').includes('`reason` も **必須**'), '§4 の M2');
+  for (const h of ['## 6.', '## 7.']) assert.ok(section(h).includes('ASCII の英字だけ'), `${h} の Low`);
+  assert.ok(!/trim \+ 小文字・UTF-8/.test(doc), '「小文字」をただし書きなしで書かない');
 });
 
 console.log(`\n${ok} 件 PASS${ng ? ` / ${ng} 件 NG` : ''}`);

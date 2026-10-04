@@ -1,5 +1,5 @@
 {
-  "_note": "取り消しの分け方 (response-contract.mjs の CANCEL_MAP・classifyCancellation) の golden = 設計 §3.10「57014 の分け方」の表の全部の行 + 印の優先 + 表に無い組。input の elapsed_ms は分け方に使わない (経過時間の近さでは決めない = R-v3-11 L-new-2)。expect = null は「取り消しでない」(門の対応か FAILURE_PATHS のほかの行)。respond = false は応答を作らない / send_rollback = false は ROLLBACK を送らず接続を捨てる / failed_months = true は 503 の本文に止まった月",
+  "_note": "取り消しの分け方 (response-contract.mjs の CANCEL_MAP・classifyCancellation) の golden = 設計 §3.10「57014 の分け方」の表の全部の行 + 印の優先 + 表に無い組。input の elapsed_ms は分け方に使わない (経過時間の近さでは決めない = R-v3-11 L-new-2)。expect = null は「取り消しでない」(門の対応か FAILURE_PATHS のほかの行)。respond = false は応答を作らない / send_rollback = false は ROLLBACK を送らず接続を捨てる (🆕 #1615 R1 M1 = respond と send_rollback は別々に決める: 印 client_disconnect → 応答なし / 25P04 → 当たった行・印の正しさに関係なく ROLLBACK なし) / failed_months = true は 503 の本文に止まった月",
   "cases": [
     {
       "name": "表 1: 月の本体の文がアプリの timer で取り消された",
@@ -135,7 +135,7 @@
       }
     },
     {
-      "name": "表 4: HTTP の切断の後に 25P04 = client が居ないので応答を作らない",
+      "name": "表 4 × 表 6: HTTP の切断の後に 25P04 = client が居ないので応答を作らない・session が終わったので ROLLBACK も送らない (接続を捨てる)",
       "input": {
         "stage": "month_body",
         "sqlstate": "25P04",
@@ -148,7 +148,7 @@
         "code": null,
         "reason": null,
         "respond": false,
-        "send_rollback": true,
+        "send_rollback": false,
         "failed_months": false,
         "log": "client_disconnect"
       }
@@ -354,6 +354,79 @@
         "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
         "respond": true,
         "send_rollback": true,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "表 4 × 表 6: HTTP の切断 (SET LOCAL の段) の後に 25P04 = 応答なし・ROLLBACK なし",
+      "input": {
+        "stage": "tx_setup",
+        "sqlstate": "25P04",
+        "mark": {
+          "source": "client_disconnect",
+          "stage": "tx_setup"
+        }
+      },
+      "expect": {
+        "code": null,
+        "reason": null,
+        "respond": false,
+        "send_rollback": false,
+        "failed_months": false,
+        "log": "client_disconnect"
+      }
+    },
+    {
+      "name": "表 8 × 表 6: 知らない source の印で 25P04 = 表に無い組の 503・ROLLBACK は送らない (印の正しさに関係なく)",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": "25P04",
+        "mark": {
+          "source": "timer",
+          "stage": "month_body"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": false,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "表 8 × 表 6: 印に unmarked と書いてあって 25P04 = 表に無い組の 503・ROLLBACK は送らない",
+      "input": {
+        "stage": "load_count",
+        "sqlstate": "25P04",
+        "mark": {
+          "source": "unmarked",
+          "stage": "load_count"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": false,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "表 8 × 表 6: 中身の無い印 ({}) で 25P04 = 表に無い組の 503・ROLLBACK は送らない",
+      "input": {
+        "stage": "commit",
+        "sqlstate": "25P04",
+        "mark": {}
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": false,
         "failed_months": false,
         "log": "unclassified_cancel"
       }
