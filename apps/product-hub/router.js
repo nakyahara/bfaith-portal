@@ -72,7 +72,11 @@ import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } fr
 // Company DB の「新商品の登録」から作るカード (2026-10-01・Company DB構想 14 ⑤-2a)。知らせ (outbox) の取り込みと、新規作成の入口の切り替え
 import { applyCdbCardEvent, cdbShippingCheckIds } from './services/cdb-card-intake.js';
 import { sweepCardOutbox, newEntryGate } from '../../lib/product-hub-outbox.mjs';
-import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
+import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders, getDriveWriteClient, ensureImageFolder } from './services/drive-image-folder.js';
+import {
+  requestImageJob as requestLpImageJob, imageStateFor as lpImageStateFor, createLpImageWorker, openaiGenerateImage,
+} from './lib/lp-image.js';
+import { Readable } from 'node:stream';
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
 import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
@@ -488,6 +492,8 @@ router.get('/detail/:id', (req, res) => {
     // (読み込み直後に 1 回 fetch すると、押せる/押せないが一瞬ちらつく)。
     // 画面はこの後 5 秒おきに GET /api/drafts/:id/lp-compose を叩いて更新する
     lpCompose: lpComposeInitialState(db, draft),
+    // 「🖼 画像を作る」(段階2・2026-10-04)。同じく最初の表示をここで作る
+    lpImage: lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }),
   });
 });
 
@@ -3880,6 +3886,70 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
     // 「仕様書: ○○ (YYYY-MM-DD 取込)」。古ければ人が上げ直す (設計 §4.1 のアップロード忘れ対策)
     spec: lpSpecSummary(db, 'product_analysis'),
   });
+});
+
+// ─── 画面: LP 画像を作る (段階2・2026-10-04 中原さん) ─────────────
+// 正本 = AI_reference『商品ハブ_LP構成と画像の自動生成_検討_20260929.md』。ロジックは lib/lp-image.js。
+
+/** 保存先 = 商品の画像フォルダ (画像タブの「画像フォルダから自動セット」の URL) */
+function lpImageFolderId(draft) {
+  const p = parseDriveLink(draft?.drive_folder_url);
+  return p && p.type === 'folder' ? p.id : null;
+}
+/** 先頭のバイト列で画像の種類を見る (Drive のサムネイルは JPEG が多いが、PNG のこともある) */
+function sniffImageMime(buf) {
+  if (buf && buf.length > 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+  if (buf && buf.length > 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+  return 'image/jpeg';
+}
+// 作る係 (Render のプロセスの中で 1 枚ずつ)。押されたときと起動のときに動く
+const lpImageWorker = createLpImageWorker({
+  getDB,
+  generate: (args) => openaiGenerateImage(args),
+  // 参考画像は AI に構成を書かせたときと同じ幅 (1024px) のサムネイル。ラベルの文字が読める大きさ
+  fetchRef: async (fileId) => {
+    const e = await getDriveThumbnail(fileId, LP_COMPOSE_IMAGE_WIDTH);
+    return { buf: e.buf, mime: sniffImageMime(e.buf) };
+  },
+  ensureFolder: async (parentId) => (await ensureImageFolder(getDriveWriteClient(), { name: 'AI初稿', parentId })).id,
+  upload: async ({ folderId, name, buf }) => {
+    const r = await getDriveWriteClient().files.create({
+      requestBody: { name, parents: [folderId], mimeType: 'image/png' },
+      media: { mimeType: 'image/png', body: Readable.from(buf) },
+      fields: 'id',
+      supportsAllDrives: true,
+    }, { timeout: 120_000 });
+    return r.data.id;
+  },
+});
+// 起動のとき: 途中で止まった画像を片付けてから、残りを作る (機能が有効なときだけ)
+if (process.env.PH_LP_IMAGE_ENABLED === '1') {
+  setTimeout(() => {
+    try { lpImageWorker.recover(); lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e)); }
+    catch (e) { console.error('[product-hub] lp-image recover:', e?.message || e); }
+  }, 15_000).unref();
+}
+
+/** 状況 (画面が作っている間 5 秒おきに叩く) */
+router.get('/api/drafts/:id/lp-images', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  res.json({ ok: true, ...lpImageStateFor(getDB(), { draft, folderId: lpImageFolderId(draft) }) });
+});
+
+/** 作る (誰でも押せる)。body: { idempotency_key }。同じキーの再送は前の依頼を返す */
+router.post('/api/drafts/:id/lp-images', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const folderId = lpImageFolderId(draft);
+  const r = requestLpImageJob(db, { draft, folderId, idempotencyKey: req.body?.idempotency_key, actor: actorOf(req) });
+  if (!r.ok) {
+    const status = r.code === 'already_running' || r.code === 'not_ready' ? 409 : 400;
+    return res.status(status).json({ ok: false, code: r.code, error: r.error });
+  }
+  lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e));
+  res.json({ ok: true, created: r.created, ...lpImageStateFor(db, { draft, folderId }) });
 });
 
 /**

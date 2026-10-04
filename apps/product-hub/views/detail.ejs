@@ -1665,6 +1665,20 @@ th.attr-unknown { color: #dc2626; }
               潰さないとそこで script が閉じて、以降の画面が丸ごと壊れる (prompt-templates-json と同じ作り) %>
           <script type="application/json" id="lpc-json"><%- JSON.stringify(lpCompose).replace(/</g, '\\u003c') %></script>
           <% } %>
+          <%# 🖼 画像を作る (段階2・2026-10-04 中原さん)。できた構成から gpt-image-2.5 で画像を作り、
+              商品の画像フォルダの中の「AI初稿」に保存する。人が押したときだけ・月の上限つき %>
+          <% if (typeof lpImage !== 'undefined' && lpImage && lpImage.enabled) { %>
+          <div id="lpi" class="field" style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f0fdf4; border:1px solid #bbf7d0;"
+               data-draft-id="<%= draft.id %>">
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <button type="button" class="btn" id="lpi-btn">🖼 画像を作る</button>
+              <span class="muted" id="lpi-status" style="font-size:12px;"></span>
+            </div>
+            <div class="muted" id="lpi-meta" style="font-size:11px; margin-top:4px;"></div>
+            <div id="lpi-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:8px; margin-top:8px;"></div>
+          </div>
+          <script type="application/json" id="lpi-json"><%- JSON.stringify(lpImage).replace(/</g, '\\u003c') %></script>
+          <% } %>
         <script type="application/json" id="prompt-templates-json"><%- JSON.stringify(promptTemplates).replace(/</g, '\\u003c') %></script>
         <%# 本番の構成の 済/まだ (2026-09-13 スタッフ要望)。縦列「仮構成」とは別。ボードのカードに「構成：まだ／済」で出る %>
         <div class="field" style="padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;">
@@ -5820,6 +5834,125 @@ th.attr-unknown { color: #dc2626; }
         btn.textContent = before;
       }
     });
+  })();
+  // 🖼 画像を作る (段階2・2026-10-04)。押す → サーバの作る係が 1 枚ずつ作って Drive の「AI初稿」へ。
+  // 画面は作っている間 5 秒おきに状況を見て、できた画像からサムネイルを並べる
+  (function initLpImages() {
+    const root = document.getElementById('lpi');
+    const holder = document.getElementById('lpi-json');
+    if (!root || !holder) return;
+    let state = null;
+    try { state = JSON.parse(holder.textContent); } catch (e) { return; }
+    const draftId = root.dataset.draftId;
+    const btn = document.getElementById('lpi-btn');
+    const statusEl = document.getElementById('lpi-status');
+    const metaEl = document.getElementById('lpi-meta');
+    const gridEl = document.getElementById('lpi-grid');
+    const RUNNING = ['queued', 'running'];
+    const STATUS_TEXT = { queued: '待ち', running: '作っています…', done: 'できました', failed: '作れませんでした', skipped: '作っていません' };
+    let timer = null;
+    let posting = false;
+    let idemKey = null;
+    const newKey = () => (window.crypto?.randomUUID ? window.crypto.randomUUID()
+      : 'lpi-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
+    const yen = (n) => Math.round(Number(n) || 0).toLocaleString() + ' 円';
+
+    function tile(im) {
+      const box = document.createElement('div');
+      box.style.cssText = 'border:1px solid #e2e8f0; border-radius:8px; padding:4px; background:#fff; font-size:11px;';
+      const title = document.createElement('div');
+      title.style.cssText = 'font-weight:600; margin-bottom:2px;';
+      title.textContent = (im.no != null ? im.no + '枚目' : im.seq + '番目') + (im.name ? '｜' + im.name : '');
+      box.appendChild(title);
+      if (im.status === 'done' && im.drive_file_id) {
+        const a = document.createElement('a');
+        a.href = 'https://drive.google.com/file/d/' + encodeURIComponent(im.drive_file_id) + '/view';
+        a.target = '_blank'; a.rel = 'noopener';
+        const img = document.createElement('img');
+        img.src = '/apps/product-hub/api/thumb/' + encodeURIComponent(im.drive_file_id) + '?w=320';
+        img.alt = title.textContent; img.loading = 'lazy';
+        img.style.cssText = 'width:100%; aspect-ratio:1/1; object-fit:contain; background:#f8fafc; border-radius:6px;';
+        a.appendChild(img);
+        box.appendChild(a);
+      } else {
+        const ph = document.createElement('div');
+        ph.style.cssText = 'width:100%; aspect-ratio:1/1; display:flex; align-items:center; justify-content:center; background:#f8fafc; border-radius:6px; color:#64748b; text-align:center; padding:4px;';
+        ph.textContent = STATUS_TEXT[im.status] || im.status;
+        box.appendChild(ph);
+      }
+      if (im.error) {
+        const er = document.createElement('div');
+        er.style.cssText = 'color:#b45309; margin-top:2px; white-space:pre-wrap;';
+        er.textContent = im.error;
+        box.appendChild(er);
+      }
+      return box;
+    }
+
+    function render(s) {
+      state = s;
+      const job = s.job;
+      const running = !!job && RUNNING.includes(job.status);
+      const est = (Number(s.planned_count) || 0) * (Number(s.est_jpy_per_image) || 0);
+      btn.disabled = !!s.blocked || running || posting;
+      btn.textContent = running ? '🖼 画像を作っています…' : (job ? '🖼 もう一度画像を作る' : '🖼 画像を作る') + (est ? ' (' + s.planned_count + ' 枚・約 ' + yen(est) + ')' : '');
+      metaEl.textContent = (s.model ? s.model + ' / 品質 ' + s.quality + '・' : '')
+        + '今月 ' + yen(s.used_jpy) + ' / 上限 ' + yen(s.budget_jpy)
+        + (job && job.cost_jpy ? '・この画像で ' + yen(job.cost_jpy) : '');
+      if (s.blocked && !running) statusEl.textContent = s.blocked;
+      else if (!job) statusEl.textContent = '押すと、できた構成から画像を作って画像フォルダの「AI初稿」に保存します (1 枚 1 分くらい)';
+      else {
+        const done = (job.images || []).filter((im) => im.status === 'done').length;
+        const total = (job.images || []).length;
+        statusEl.textContent = running ? '画像を作っています… (' + done + ' / ' + total + ' 枚)'
+          : job.status === 'done' ? 'できました (' + done + ' / ' + total + ' 枚)。画像を押すと Drive で開きます'
+          : job.status === 'partial' ? '一部だけできました (' + done + ' / ' + total + ' 枚)' + (job.error ? ' — ' + job.error : '')
+          : '作れませんでした' + (job.error ? ': ' + job.error : '');
+      }
+      gridEl.textContent = '';
+      for (const im of (job && job.images) || []) gridEl.appendChild(tile(im));
+      if (running) schedule(); else stop();
+    }
+    function stop() { if (timer) { clearTimeout(timer); timer = null; } }
+    function schedule() { stop(); timer = setTimeout(poll, 5000); }
+    async function poll() {
+      stop();
+      if (document.hidden) { schedule(); return; }
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-images', { headers: { Accept: 'application/json' } });
+        const json = await res.json();
+        if (json && json.ok) { render(json); return; }
+      } catch (e) { /* 一時的な通信断。次の回で拾う */ }
+      schedule();
+    }
+    btn.addEventListener('click', async () => {
+      if (posting) return;
+      const est = (Number(state.planned_count) || 0) * (Number(state.est_jpy_per_image) || 0);
+      // 作り直しはお金がかかるので確かめる
+      if (state.job && !window.confirm('もう一度作ると、約 ' + yen(est) + ' かかります (前の画像は Drive に残ります)。作りますか？')) return;
+      posting = true;
+      btn.disabled = true;
+      statusEl.textContent = '依頼しています…';
+      if (!idemKey) idemKey = newKey();
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-images', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idempotency_key: idemKey }),
+        });
+        const json = await res.json().catch(() => null);
+        posting = false;
+        if (json && json.ok) { idemKey = null; render(json); return; }
+        statusEl.textContent = (json && json.error) || '依頼できませんでした';
+        if (res.status === 409 || res.status === 400) idemKey = null;
+        btn.disabled = !!state.blocked;
+      } catch (e) {
+        posting = false;
+        btn.disabled = false;
+        statusEl.textContent = '依頼できたか分かりません。もう一度押してください (二重にはなりません)';
+      }
+    });
+    render(state);
   })();
   // 🤖 構成をAIに作らせる (段階1・PR1-d)。
   // 画面がするのは「押す」「状況を見る」「出す」だけ。判定も lint もサーバー側。
