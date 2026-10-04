@@ -816,7 +816,9 @@ async function main() {
   results.push({ name: 'CompanyDB観測原価', ...cdbObservedResult, warn: cdbObservedResult.success && isWarnSummary(cdbObservedResult.summary) });
 
   // 販売集計テーブル再構築
-  const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築');
+  // 上限 30 分 = retry-failed-jobs.js の JOB_DEFINITIONS と同じ。ふだん 6〜7 分 (読み 2.5〜3 分 + 書き 3〜4 分) で既定の 10 分に近く、
+  // 2026-10-04 は miniPC が重く 10 分 33 秒で打ち切られ、Render 同期・当月の finance DQ・lz-daily まで止まった
+  const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築', 1800000);
   results.push({ name: 'f_sales', ...fSalesResult });
 
   // 販売速度サマリ再構築 (商品管理リスト用: FBA/FBA以外 × 7d/30d)
