@@ -62,7 +62,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 import {
   openPgClient, pgAdapter, pgliteAdapter, applyMigrations, migrateWithLock, withMigrateLock, listMigrationFiles, buildIndexExpect, readIndexAttrs, attrDiff,
-  splitSqlStatements, parseConcurrentIndexStatement, planConcurrentIndexFile, estimateIndexBytes, roleSwitchStatements, ALLOWED_SET_LOCAL_ROLES, MIGRATE_LOCK_NAME, DISK_ESTIMATE, DEFAULT_DIR,
+  splitSqlStatements, parseConcurrentIndexStatement, planConcurrentIndexFile, estimateIndexBytes, roleSwitchStatements, ALLOWED_SET_LOCAL_ROLES, roleGraphHash, readOwnerMode, MIGRATE_LOCK_NAME, DISK_ESTIMATE, DEFAULT_DIR,
   txControlStatements, renderResourceMatchesUrl, renderDiskMetricsReader, migrationStatus, RENDER_PG_HOST_MAPPING, roleAdminReachable, ROLE_ADMIN_FORBIDDEN_PREDEFINED,
   unicodeEscapeLiterals, ROLE_GUCS, LEXER_GUCS, OWNER_MODE_FORBIDDEN_GUCS, LEXER_PREMISE,
   lexerPremiseChanges, isOwnerTransitionText, isConcurrentIndexText,
@@ -1343,6 +1343,13 @@ alter schema app owner to ${prole};
         assert.ok(err && err.code === 'MIGRATION_FAILED' && err.reason === 'LEXER_PREMISE' && /reset_val = off/.test(err.message), `${err && err.code} ${err && err.reason} ${err && err.message}`);
         assert.equal((await c2.query(`select count(*)::int as n from pg_class where relname = 'o14_ok'`)).rows[0].n, 0);
         assert.deepEqual(await lockHolders(dbName), []);
+        // 🆕 Codex R5 Low 2: --dry-run も環境の前提 (reset_val) を確かめる = 流す前に分かる (code = LEXER_PREMISE_INVALID・reason = LEXER_PREMISE・何も変えない)
+        let dErr = null;
+        try { await migrate(c2, { dir: mkDir({ ...base, '0003_ok.sql': 'create table app.o14_ok (x int);\n' }), dryRun: true }); } catch (e) { dErr = e; }
+        assert.ok(dErr && dErr.code === 'LEXER_PREMISE_INVALID' && dErr.reason === 'LEXER_PREMISE' && /reset_val = off/.test(dErr.message), `dry-run: ${dErr && dErr.code} ${dErr && dErr.reason} ${dErr && dErr.message}`);
+        assert.equal((await c2.query('show standard_conforming_strings')).rows[0].standard_conforming_strings, 'off', 'dry-run が session の設定を変えた');
+        assert.equal((await su.query('select state from pg_stat_activity where pid = $1', [await pidOf(c2)])).rows[0].state, 'idle', 'dry-run の取引が開いたまま');
+        assert.deepEqual(await lockHolders(dbName), []);
       } finally { await su.query(`alter role ${DEPLOYER} reset standard_conforming_strings`); }
       const c3 = await openDep(dbName);
       assert.deepEqual((await migrate(c3, { dir: mkDir({ ...base, '0003_ok.sql': 'create table app.o14_ok (x int);\n' }) })).applied, ['0003']);
@@ -1776,6 +1783,218 @@ create constraint trigger o11_t after insert on ops.schema_migrations deferrable
     assert.deepEqual((await s2.query('select version from ops.schema_migrations order by 1')).rows.map((r) => r.version), ['0001', '0002']);
     assert.deepEqual(await whoami(c), { cu: DEPLOYER, su: DEPLOYER });
     assert.deepEqual(await lockHolders(dbName), []);
+  });
+
+  console.log('🆕 Codex R5 (PR #1606)');
+  /** 接続を閉じる (クラスタの max_connections を使い切らない・最後の一括の end は 2 回目でも握りつぶす) */
+  const closeAll = async (...cs) => { for (const x of cs) { try { await x.end(); } catch { /* */ } } };
+  /** その試験で開いた接続を、落ちても最後に閉じる (NG の試験が接続を残して後の試験を巻き込まない) */
+  const tR5 = (name, fn) => t(name, async () => { const mark = clients.length; try { await fn(); } finally { await closeAll(...clients.slice(mark)); } });
+  await tR5('C16 (Codex R5 M1・設計 13 v3.13 ⑤ (a)) 複数の CIC の file (0002 に 3 本・0003 に 3 本): file ごとの合計なら足りるが、この回の全部の合計では足りない空き → 最初の file の前に止まる (0002 の index も作らない・記録しない) / 古いメトリクスでも file の合計の判定 (この回に先に作った分を引く) は残る / 合計ちょうどなら 2 つとも流す', async () => {
+    const mk = (names) => '-- migrate:concurrent-index\n' + names.map((x) => x + ';\n').join('');
+    const A = mk(['create index concurrently if not exists t16_a_idx on app.t (a)', 'create index concurrently if not exists t16_b_idx on app.t (b)', 'create index concurrently if not exists t16_c_idx on app.t (c)']);
+    const B = mk(['create index concurrently if not exists t16_ab_idx on app.t (a, b)', 'create index concurrently if not exists t16_bc_idx on app.t (b, c)', 'create index concurrently if not exists t16_lower_idx on app.t (lower(a))']);
+    // expect.json は使い捨ての DB で同じ文を流して作る (手で書かない)
+    const dbE = await newDb(); const ce = await open(dbE);
+    await migrate(ce, { dir: mkDir({ '0001_base.sql': BASE }) });
+    await runStmts(ce, [...splitSqlStatements(A), ...splitSqlStatements(B)].map((x) => x.sql));
+    const EA = await buildIndexExpect(pgAdapter(ce), { version: '0002', name: 'a3', file: '0002_a3.sql', text: A, concurrentIndex: true });
+    const EB = await buildIndexExpect(pgAdapter(ce), { version: '0003', name: 'b3', file: '0003_b3.sql', text: B, concurrentIndex: true });
+    const dir = mkDir({ '0001_base.sql': BASE, '0002_a3.sql': A, '0002_a3.expect.json': JSON.stringify(EA), '0003_b3.sql': B, '0003_b3.expect.json': JSON.stringify(EB) });
+    const F = DISK_ESTIMATE.safetyFactor, R = DISK_ESTIMATE.fixedReserveBytes;
+    const sum = async (c, txt) => { let s = 0; for (const x of splitSqlStatements(txt)) s += await estimateIndexBytes(pgAdapter(c), parseConcurrentIndexStatement(x)); return s; };
+    const made = async (c, txt) => { let n = 0; for (const x of splitSqlStatements(txt)) { const st = parseConcurrentIndexStatement(x); const a = await readIndexAttrs(pgAdapter(c), st.schema, st.name); if (a && !a.notIndex) n++; } return n; };
+    const dbName = await newDb(); const c = await open(dbName);
+    await migrate(c, { dir, to: '0001' });
+    const ea = await sum(c, A), eb = await sum(c, B);
+    const fileA = ea * F + R, fileB = eb * F + R, all = (ea + eb) * F + R;
+    const free = Math.max(fileA, fileB);
+    assert.ok(ea > 0 && eb > 0 && free < all, '(試験の前提) file ごとなら足り、全部の合計では足りない');
+    // ① 空きが一定 = file ごとの合計の大きい方 → この回の合計で最初の file の前に止まる (旧の runner は 0002 の 3 本を作って記録した)
+    let err = null;
+    try { await migrate(c, { dir, readDiskMetrics: disk(10 * GB, 10 * GB - free) }); } catch (e) { err = e; }
+    assert.ok(err && err.code === 'DISK_CHECK_FAILED' && err.reason === 'NOT_ENOUGH' && err.needBytes === all && err.version === '0002', `${err && err.code} ${err && err.reason} ${err && err.needBytes} / ${all} ${err && err.message}`);
+    assert.match(err.message, /この回の concurrent-index の file 2 本 \(0002_a3\.sql・0003_b3\.sql\) の index 6 本の合計/);
+    assert.equal(await made(c, A), 0, '0002 の index を作った');
+    assert.equal(await made(c, B), 0);
+    assert.deepEqual(await versions(c), ['0001']);
+    assert.deepEqual(await lockHolders(dbName), []);
+    // ② 古いメトリクス (最初の読み = この回の合計の判定だけ空きが多い・後は 0002 の合計ちょうど) → 0002 は作って記録・0003 は file の合計の判定
+    //    (0002 で作った分を予約に入れる) で止まる = file 単位・文単位の確かめは残っている
+    let n = 0;
+    const stale = async () => (n++ === 0 ? { ok: true, capacityBytes: 100 * GB, usedBytes: 0 } : { ok: true, capacityBytes: 10 * GB, usedBytes: 10 * GB - fileA });
+    err = null;
+    try { await migrate(c, { dir, readDiskMetrics: stale }); } catch (e) { err = e; }
+    assert.ok(err && err.code === 'DISK_CHECK_FAILED' && err.reason === 'NOT_ENOUGH' && err.version === '0003' && err.reservedBytes === ea * F && err.needBytes === all, `${err && err.code} ${err && err.version} ${err && err.message}`);
+    assert.match(err.message, /0003_b3\.sql の index 3 本の合計/);
+    assert.deepEqual(await versions(c), ['0001', '0002']);
+    assert.equal(await made(c, A), 3); assert.equal(await made(c, B), 0);
+    assert.deepEqual(await lockHolders(dbName), []);
+    // ③ 新しい DB で 全部の合計ちょうどの空き → 2 つとも流す (この回の合計の判定は 1 回だけ)
+    const db3 = await newDb(); const c3 = await open(db3);
+    await migrate(c3, { dir, to: '0001' });
+    const logs3 = [];
+    assert.deepEqual((await migrate(c3, { dir, readDiskMetrics: disk(10 * GB, 10 * GB - all), log: (m) => logs3.push(m) })).applied, ['0002', '0003']);
+    assert.equal(logs3.filter((m) => /この回の concurrent-index の file 2 本/.test(m)).length, 1, logs3.join('\n'));
+    assert.equal(await made(c3, A) + await made(c3, B), 6);
+    await closeAll(ce, c, c3);
+  });
+
+  await tR5('O17 (Codex R5 M2) 前の file が session に `SET search_path = evil, pg_catalog` と同じ名前の aggregate (jsonb_agg)・表 (pg_class・pg_stats の view) を残しても、次の file の最初の役割の図の hash・持ち主の mode の読み・容量の見積もりは騙されない (本物の PG・旧の hash の SQL では本当に騙せることを先に確かめる)', async () => {
+    // ① 役割の図の hash: evil.jsonb_agg (jsonb の exact match = pg_catalog の多相の jsonb_agg より先に選ばれる) が「変えた後の役割の設定」を先回りして出す
+    {
+      const dbName = await newDepDb();
+      const c = await openDep(dbName);
+      const role = await newOwnerRole();
+      const base = { '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role) };
+      await migrate(c, { dir: mkDir(base) });
+      const dbSu = new URL(suUrl); dbSu.pathname = `/${dbName}`;
+      const s2 = await openPgClient(dbSu.toString()); s2.on('error', () => {}); clients.push(s2);
+      const evil = `create schema evil;
+grant usage on schema evil to public;
+create function evil.agg_step(s jsonb, x jsonb) returns jsonb language sql as $f$ select s || pg_catalog.jsonb_build_array(x) $f$;
+create function evil.agg_final(s jsonb) returns jsonb language plpgsql as $f$
+begin
+  -- 役割の設定 (pg_db_role_setting) の配列にだけ、次の file が足す行を先回りして入れる (members・roles はそのまま)
+  if pg_catalog.jsonb_array_length(s) = 0 or (s -> 0) ? 'database' then
+    return (select pg_catalog.jsonb_agg(e order by (e ->> 'database')::pg_catalog.int8, (e ->> 'role')::pg_catalog.int8)
+              from pg_catalog.jsonb_array_elements(s || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+                'database', (select d.oid::pg_catalog.int8 from pg_catalog.pg_database d where d.datname = pg_catalog.current_database()),
+                'role', (select r.oid::pg_catalog.int8 from pg_catalog.pg_roles r where r.rolname = '${role}'),
+                'config', pg_catalog.to_jsonb(array['work_mem=32MB']::pg_catalog.text[])))) e);
+  end if;
+  return s;
+end $f$;
+create aggregate evil.jsonb_agg(jsonb) (sfunc = evil.agg_step, stype = jsonb, initcond = '[]', finalfunc = evil.agg_final);
+set search_path = evil, pg_catalog;
+`;
+      const change = `alter role ${role} in database ${dbName} set work_mem = '32MB';\ncreate table app.o17_after (x int);\n`;
+      assert.deepEqual(roleSwitchStatements(evil), [], '(前提) 字句の検査は見つけない');
+      assert.deepEqual(roleSwitchStatements(change), [], '(前提) 字句の検査は見つけない');
+      await migrate(c, { dir: mkDir({ ...base, '0003_evil.sql': evil }) });
+      assert.equal((await c.query("select pg_catalog.current_setting('search_path') as p")).rows[0].p, 'evil, pg_catalog', '(前提) 前の file の search_path が session に残る');
+      // (前提) 旧の hash の SQL (R5 の前 = jsonb_agg・jsonb_build_object・to_jsonb が未修飾) は、この session では変えた後の図と同じ値を出す = 比較を本当に騙せる
+      const OLD_HASH_SQL = `select pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.jsonb_build_object(
+      'members', (select coalesce(jsonb_agg(jsonb_build_object('roleid', m.roleid::int8, 'member', m.member::int8, 'grantor', m.grantor::int8,
+          'admin', m.admin_option, 'inherit', m.inherit_option, 'set', m.set_option) order by m.roleid, m.member, m.grantor), '[]'::jsonb) from pg_catalog.pg_auth_members m),
+      'roles', (select coalesce(jsonb_agg(jsonb_build_object('oid', r.oid::int8, 'name', r.rolname::text, 'super', r.rolsuper, 'inherit', r.rolinherit, 'createrole', r.rolcreaterole,
+          'createdb', r.rolcreatedb, 'login', r.rolcanlogin, 'replication', r.rolreplication, 'bypassrls', r.rolbypassrls, 'connlimit', r.rolconnlimit,
+          'validuntil', r.rolvaliduntil, 'config', to_jsonb(r.rolconfig)) order by r.oid), '[]'::jsonb) from pg_catalog.pg_roles r),
+      'settings', (select coalesce(jsonb_agg(jsonb_build_object('database', s.setdatabase::int8, 'role', s.setrole::int8, 'config', to_jsonb(s.setconfig)) order by s.setdatabase, s.setrole), '[]'::jsonb)
+          from pg_catalog.pg_db_role_setting s)
+    )::text, 'UTF8')), 'hex') as h`;
+      await c.query('begin');
+      try {
+        await c.query(`set local role ${role}`);
+        const oldBefore = (await c.query(OLD_HASH_SQL)).rows[0].h;
+        const newBefore = await roleGraphHash(pgAdapter(c));
+        await c.query(`alter role ${role} in database ${dbName} set work_mem = '32MB'`);
+        // 変えた後の本当の図 = 同じ旧の SQL を search_path = pg_catalog の中で (roleGraphHash に頼らない)
+        await c.query('set local search_path = pg_catalog, pg_temp');
+        const realAfter = (await c.query(OLD_HASH_SQL)).rows[0].h;
+        assert.equal(oldBefore, realAfter, '(前提) 旧の hash の SQL は先回りした値 = 変えた後の図と同じ (比較を騙せる)');
+        assert.notEqual(newBefore, realAfter, '新しい hash (pg_catalog. で修飾) は先回りに騙されない');
+      } finally { await c.query('rollback'); }
+      // 本番の道: 0004 が役割の設定を変える → ROLE_GRAPH_CHANGED で巻き戻す (旧の runner は最初の hash を騙されて通した)
+      let err = null;
+      try { await migrate(c, { dir: mkDir({ ...base, '0003_evil.sql': evil, '0004_change.sql': change }) }); } catch (e) { err = e; }
+      assert.ok(err && err.code === 'MIGRATION_FAILED' && err.version === '0004' && err.reason === 'ROLE_GRAPH_CHANGED', `${err && err.code} ${err && err.reason} ${err && err.message}`);
+      assert.equal((await s2.query('select count(*)::int as n from pg_db_role_setting s join pg_roles r on r.oid = s.setrole where r.rolname = $1', [role])).rows[0].n, 0, '役割の設定が残った');
+      assert.equal((await s2.query(`select count(*)::int as n from pg_class where relname = 'o17_after'`)).rows[0].n, 0);
+      assert.deepEqual((await s2.query('select version from ops.schema_migrations order by 1')).rows.map((r) => r.version), ['0001', '0002', '0003']);
+      assert.deepEqual(await whoami(c), { cu: DEPLOYER, su: DEPLOYER });
+      assert.equal((await c.query("select pg_catalog.current_setting('search_path') as p")).rows[0].p, 'evil, pg_catalog', 'runner は session の search_path を変えない (本文の名前の解決は今までどおり)');
+      assert.deepEqual(await lockHolders(dbName), []);
+      await closeAll(c, s2);
+    }
+    // ② 持ち主の mode の読み・容量の見積もり: evil.pg_class が印 (ops.migrate_owner) を隠す・evil.pg_stats が列の幅を 1 にする
+    {
+      const dbName = await newDepDb();
+      const c = await openDep(dbName);
+      const role = await newOwnerRole();
+      const base = { '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role) };
+      await migrate(c, { dir: mkDir(base) });
+      const dbSu = new URL(suUrl); dbSu.pathname = `/${dbName}`;
+      const s2 = await openPgClient(dbSu.toString()); s2.on('error', () => {}); clients.push(s2);
+      const hide = `create schema evil;
+grant usage on schema evil to public;
+create view evil.pg_class as select * from pg_catalog.pg_class where relname <> 'migrate_owner';
+create view evil.pg_stats as select schemaname, tablename, attname, 1::int4 as avg_width from pg_catalog.pg_stats;
+grant select on evil.pg_class, evil.pg_stats to public;
+set search_path = evil, pg_catalog;
+`;
+      assert.deepEqual(roleSwitchStatements(hide), []);
+      const dir = mkDir({ ...base, '0003_hide.sql': hide, '0004_after.sql': 'create table app.o17b (x int);\n', '0005_idx.sql': CI_SQL, '0005_idx.expect.json': JSON.stringify(EXPECT) });
+      const logs = [];
+      let err = null, r = null;
+      try { r = await migrate(c, { dir, log: (m) => logs.push(m) }); } catch (e) { err = e; }
+      assert.ok(!err, `${err && err.code} ${err && err.reason} ${err && err.message}`);
+      assert.deepEqual(r.applied, ['0003', '0004', '0005'], logs.join('\n'));
+      assert.equal((await s2.query(`select pg_get_userbyid(c.relowner)::text as o from pg_class c where c.relname = 'o17b'`)).rows[0].o, role, '0004 が印の役割で流れていない (印を隠された = legacy と誤った)');
+      assert.equal((await c.query("select pg_catalog.current_setting('search_path') as p")).rows[0].p, 'evil, pg_catalog', '(前提) 前の file の search_path が session に残る');
+      assert.equal((await c.query(`select count(*)::int as n from pg_class where relname = 'migrate_owner'`)).rows[0].n, 0, '(前提) この session の素の pg_class では印が見えない');
+      assert.deepEqual(await readOwnerMode(pgAdapter(c)), { mode: 'owner', role });
+      // 容量の見積もり = 素の session と同じ (evil.pg_stats の幅 1 に騙されない)
+      const st = parseConcurrentIndexStatement(splitSqlStatements('create index concurrently if not exists t_x_idx on app.t (a, b)')[0]);
+      await c.query(`set role ${role}`);
+      try {
+        assert.equal((await c.query("select avg_width from pg_stats where tablename = 't' and attname = 'a'")).rows[0].avg_width, 1, '(前提) この session の素の pg_stats は幅 1');
+        await s2.query(`set role ${role}`);
+        assert.equal(await estimateIndexBytes(pgAdapter(c), st), await estimateIndexBytes(pgAdapter(s2), st));
+      } finally { await c.query('reset role'); await s2.query('reset role'); }
+      assert.deepEqual(await whoami(c), { cu: DEPLOYER, su: DEPLOYER });
+      assert.deepEqual(await lockHolders(dbName), []);
+      await closeAll(c, s2);
+    }
+  });
+
+  await tR5('O18 (Codex R5 M3) 形 B の保証の範囲: SET で届く owner の役割 (印の役割・許す SET LOCAL ROLE の一覧・接続の役割が SET で届く役割) に LOGIN があれば止まる (本番の道・--dry-run・--list・OWNER_ROLE_CAN_LOGIN) / NOLOGIN に戻せば流れる / SET の無い LOGIN の役割・接続の役割自身は対象の外', async () => {
+    const dbName = await newDepDb();
+    const c = await openDep(dbName);
+    const role = await newOwnerRole();
+    const base = { '0001_base.sql': BASE, '0002_owner.sql': transitionSql(dbName, role) };
+    await migrate(c, { dir: mkDir(base) });
+    const dbSu = new URL(suUrl); dbSu.pathname = `/${dbName}`;
+    const s2 = await openPgClient(dbSu.toString()); s2.on('error', () => {}); clients.push(s2);
+    const count = async (rel) => (await s2.query('select count(*)::int as n from pg_class where relname = $1', [rel])).rows[0].n;
+    const okDir = mkDir({ ...base, '0003_ok.sql': 'create table app.o18_ok (x int);\n' });
+    // (前提) 形 B でも、SET で届く役割として自分の password は変えられる (見えない = 役割の図の比較に出ない) = NOLOGIN でなければ資格になる
+    await c.query('begin');
+    try {
+      await c.query(`set local role ${role}`);
+      const h0 = await roleGraphHash(pgAdapter(c));
+      await c.query(`alter role ${role} password 'o18_${hex}'`);
+      assert.equal(await roleGraphHash(pgAdapter(c)), h0, '(前提) password の変更は役割の図に出ない');
+    } finally { await c.query('rollback'); }
+    const other = `cdb_o18_login_${hex}`;
+    await su.query(`create role ${other} login password '${PW}'`);
+    if (!(await su.query(`select 1 from pg_roles where rolname = 'profit_definer'`)).rows.length) await su.query('create role profit_definer nologin');
+    const cases = [
+      ['印の役割が LOGIN', `alter role ${role} login`, `alter role ${role} nologin`, role],
+      ['許す一覧の役割 (profit_definer・SET が無くても) が LOGIN', 'alter role profit_definer login', 'alter role profit_definer nologin', 'profit_definer'],
+      ['接続の役割が SET で届く LOGIN の役割', `grant ${other} to ${DEPLOYER} with inherit false, set true`, `revoke ${other} from ${DEPLOYER}`, other],
+    ];
+    for (const [what, on, off, name] of cases) {
+      await su.query(on);
+      try {
+        const isLogin = (e) => e.code === 'OWNER_MODE_INVALID' && e.reason === 'OWNER_ROLE_CAN_LOGIN' && e.message.includes(name);
+        await assert.rejects(migrate(c, { dir: okDir }), isLogin, `本番の道: ${what}`);
+        await assert.rejects(migrate(c, { dir: okDir, dryRun: true }), isLogin, `dry-run: ${what}`);
+        const list = runCli(['--url', urlDep(dbName), '--dir', okDir, '--list']);
+        assert.equal(list.status, 1, `--list: ${what} ${list.stdout}`);
+        assert.match(list.stderr, /FAILED \(OWNER_MODE_INVALID\).*OWNER_ROLE_CAN_LOGIN/, what);
+        assert.equal(await count('o18_ok'), 0, `流した: ${what}`);
+        assert.deepEqual(await lockHolders(dbName), []);
+      } finally { await su.query(off); }
+    }
+    // SET の無い LOGIN の役割 (MEMBER だけ) と接続の役割自身 (LOGIN) は対象の外 = 流れる
+    await su.query(`grant ${other} to ${DEPLOYER} with inherit false, set false`);
+    try {
+      assert.deepEqual((await migrate(c, { dir: okDir })).applied, ['0003']);
+    } finally { await su.query(`revoke ${other} from ${DEPLOYER}`); }
+    assert.equal(await count('o18_ok'), 1);
+    await closeAll(c, s2);
+    await su.query(`drop role ${other}`);
   });
 
   await t('X1 --index-expect は使い捨ての DB から expect.json の中身を出す (試験で作ったものと同じ)', async () => {

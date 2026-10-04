@@ -46,6 +46,11 @@
  *     lexSql に頼る)。legacy・owner-transition の file の中の字句の前提の GUC の変更は ⚠️ だけ (lexerPremiseChanges) /
  *     High 2 = lexSql を PostgreSQL 18 の scan.l に合わせる (行コメントは \r でも終わる・空白は [ \t\n\r\f\v] だけ = NBSP・U+3000 は識別子の文字)・1 行目の印も CR だけの改行に合わせる。
  *     🚨 owner-transition の file 自身は ROLE_ADMIN_REACHABLE の対象の外 (流す時は legacy) = R0b-0 / R0b までの間に別の owner の migration を流さない運用が必須 (README)
+ *   - 🆕 Codex R5 (PR #1606) M1 = この回に流す全部の CIC の file の create の合計を最初の CIC の file の前に 1 回で判定 (checkDiskForRun・足りなければ 1 本も作らない) /
+ *     M2 = runner の検査・記録の SQL は search_path = pg_catalog, pg_temp の取引の中 + 関数・表・型を pg_catalog. で修飾 (前の file が残した search_path と
+ *     同じ名前の jsonb_agg・pg_class などに騙されない・本文の前に元の search_path へ戻す = withCatalogPath) /
+ *     M3 = owner の状態で、SET で届く owner の役割 (印の役割・ALLOWED_SET_LOCAL_ROLES・接続の役割が SET で届く役割) が全部 NOLOGIN かを確かめる
+ *     (OWNER_ROLE_CAN_LOGIN・本文はその役割の password を見えずに変えられる = 資格として使えないことだけを保証) / Low = --dry-run も字句の前提 (reset_val) を確かめる
  *
  * 使い方:
  *   COMPANY_DB_URL=postgres://... node scripts/company-db/migrate.mjs            # 未適用を全部
@@ -128,33 +133,76 @@ export function isOwnerTransitionText(text) {
   return firstLineOf(text) === OWNER_TRANSITION_MARKER;
 }
 const ownerErr = (msg) => Object.assign(new Error(`持ち主の mode: ${msg}`), { code: 'OWNER_MODE_INVALID' });
+
+// ─── runner の SQL の名前の解決 (Codex R5 M2・PR #1606) ───
+/**
+ * 🆕 Codex R5 M2 (PR #1606): runner が流す検査・記録の SQL は、前の file が session に残した search_path (`SET search_path = attacker, pg_catalog`)
+ * に左右されない = 解決先を pg_catalog に固定する。PostgreSQL は pg_catalog を search_path に明示で後ろに置くと、前の schema の同じ名前の
+ * 関数・aggregate・演算子・型・表が組み込みを隠す (exact match の関数は pg_catalog の多相の関数より先に選ばれる = 後ろに置かなくても効く)。
+ * 守りは 2 つ重ねる: ① 取引の中で `SET LOCAL search_path = pg_catalog, pg_temp` (演算子・型・表も含めて全部・pg_temp を最後 = 一時の表に隠されない)
+ * ② 関数・表・型は SQL の中でも pg_catalog. で修飾 (① が外れても関数・表は変わらない)。
+ * migration の本文は今までどおりの search_path で流す (固定した値は本文の前に元へ戻す = 本文の名前の解決は変えない)
+ */
+export const CATALOG_SEARCH_PATH = 'pg_catalog, pg_temp';
+/**
+ * fn を search_path = pg_catalog, pg_temp の中で流す。
+ *   inTx = false (取引の外から呼ぶ) = begin → SET LOCAL → fn → commit (失敗は rollback して投げ直す)
+ *   inTx = true (呼び手の取引の中) = 今の値を覚えて SET LOCAL → fn → set_config(…, true) で元の値に戻す (本文の前に呼ぶ・本文の名前の解決を変えない)
+ */
+async function withCatalogPath(db, fn, { inTx = false } = {}) {
+  if (inTx) {
+    const prev = (await db.query("select pg_catalog.current_setting('search_path') as p")).rows[0].p;
+    await db.exec(`set local search_path = ${CATALOG_SEARCH_PATH}`);
+    const r = await fn();
+    await db.query("select pg_catalog.set_config('search_path', $1, true)", [prev]);
+    return r;
+  }
+  await db.exec('begin');
+  try {
+    await db.exec(`set local search_path = ${CATALOG_SEARCH_PATH}`);
+    const r = await fn();
+    await db.exec('commit');
+    return r;
+  } catch (e) {
+    try { await db.exec('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する = 元の誤りを出す */ }
+    throw e;
+  }
+}
+
 /**
  * 今の持ち主の mode を読む (catalog だけ = 接続の役割で読める)。
  * 戻り = { mode: 'legacy' } | { mode: 'owner', role }。役割の名前が不正・SET できない・記録表の持ち主と違う = OWNER_MODE_INVALID
+ * 🆕 Codex R5 M2: search_path = pg_catalog の中で読む (前の file が attacker.pg_class を search_path の前に置いても印を隠せない)。
+ *   inTx = true = 呼び手の取引の中 (本文の後 = もう pg_catalog に固定してある)
  */
-export async function readOwnerMode(db) {
+export async function readOwnerMode(db, { inTx = false } = {}) {
   // 🚨 catalog だけで読む (pg_class / pg_namespace は誰でも読める)。PR 1b の後は接続の役割が ops の USAGE を持たないかもしれない = to_regclass や表の SELECT に頼らない
-  const { rows } = await db.query(`select
-      (select pg_get_userbyid(c.relowner)::text from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'ops' and c.relname = 'migrate_owner' and c.relkind in ('r', 'p')) as marker_owner,
-      (select pg_get_userbyid(c.relowner)::text from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'ops' and c.relname = 'schema_migrations' and c.relkind in ('r', 'p')) as mig_owner`);
-  const role = rows[0].marker_owner;
-  if (role == null) return { mode: 'legacy' };
-  if (!ROLE_RE.test(role)) throw ownerErr(`印の表 ${OWNER_MARKER_TABLE} の持ち主の名前が不正: ${role}`);
-  if (rows[0].mig_owner !== role) throw ownerErr(`ops.schema_migrations の持ち主 (${rows[0].mig_owner}) が印の表 ${OWNER_MARKER_TABLE} の持ち主 ${role} と違う`);
-  const { rows: can } = await db.query(`select pg_has_role(session_user, $1, 'SET') as can`, [role]);
-  if (!can[0].can) throw ownerErr(`接続の役割 (session_user) が ${role} に SET ROLE できない (grant ${role} to <接続の役割> with set true)`);
-  return { mode: 'owner', role };
+  return withCatalogPath(db, async () => {
+    const { rows } = await db.query(`select
+        (select pg_catalog.pg_get_userbyid(c.relowner)::pg_catalog.text from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'ops' and c.relname = 'migrate_owner' and c.relkind in ('r', 'p')) as marker_owner,
+        (select pg_catalog.pg_get_userbyid(c.relowner)::pg_catalog.text from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'ops' and c.relname = 'schema_migrations' and c.relkind in ('r', 'p')) as mig_owner`);
+    const role = rows[0].marker_owner;
+    if (role == null) return { mode: 'legacy' };
+    if (!ROLE_RE.test(role)) throw ownerErr(`印の表 ${OWNER_MARKER_TABLE} の持ち主の名前が不正: ${role}`);
+    if (rows[0].mig_owner !== role) throw ownerErr(`ops.schema_migrations の持ち主 (${rows[0].mig_owner}) が印の表 ${OWNER_MARKER_TABLE} の持ち主 ${role} と違う`);
+    const { rows: can } = await db.query(`select pg_catalog.pg_has_role(session_user, $1, 'SET') as can`, [role]);
+    if (!can[0].can) throw ownerErr(`接続の役割 (session_user) が ${role} に SET ROLE できない (grant ${role} to <接続の役割> with set true)`);
+    return { mode: 'owner', role };
+  }, { inTx });
 }
-/** ops の表があるか (catalog だけ = schema の USAGE が無くても読める) */
+/** ops の表があるか (catalog だけ = schema の USAGE が無くても読める)。🆕 Codex R5 M2: search_path = pg_catalog の中で */
 async function opsTableExists(db, name) {
-  const { rows } = await db.query(`select exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'ops' and c.relname = $1) as e`, [name]);
-  return rows[0].e === true;
+  return withCatalogPath(db, async () => {
+    const { rows } = await db.query(`select exists (select 1 from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'ops' and c.relname = $1) as e`, [name]);
+    return rows[0].e === true;
+  });
 }
 const modeText = (m) => (m.mode === 'owner' ? `owner (SET ROLE ${m.role})` : 'legacy (接続の役割のまま)');
-/** 取引の中で fn (owner なら SET LOCAL ROLE)。読むだけの短い取引に使う */
+/** 取引の中で fn (owner なら SET LOCAL ROLE)。読むだけの短い取引に使う。🆕 Codex R5 M2: search_path = pg_catalog, pg_temp */
 async function inModeTx(db, mode, fn) {
   await db.exec('begin');
   try {
+    await db.exec(`set local search_path = ${CATALOG_SEARCH_PATH}`);
     if (mode.mode === 'owner') await db.exec(`set local role ${mode.role}`);
     const r = await fn();
     await db.exec('commit');
@@ -735,19 +783,19 @@ export function attrDiff(actual, expected) {
 }
 
 async function serverMajor(db) {
-  const { rows } = await db.query('select current_setting(\'server_version_num\')::int as v');
+  // 🆕 Codex R5 M2: 関数と型を pg_catalog. で修飾 (演算子は使わない = search_path に左右されない)
+  const { rows } = await db.query("select pg_catalog.current_setting('server_version_num')::pg_catalog.int4 as v");
   return Math.floor(Number(rows[0].v) / 10000);
 }
 
-/** 同じ表の index の作りが (別の backend で) 動いていないか。見えない (relid が null = 別の役割) のも「ある」とみなす */
+/** 同じ表の index の作りが (別の backend で) 動いていないか。見えない (relid が null = 別の役割) のも「ある」とみなす。🆕 Codex R5 M2: search_path = pg_catalog の中で */
 async function buildsInProgress(db, qualifiedTable) {
-  const { rows } = await db.query(`
-    select p.pid, p.relid::regclass::text as rel, p.phase
-      from pg_stat_progress_create_index p
-     where p.datid = (select oid from pg_database where datname = current_database())
-       and p.pid <> pg_backend_pid()
-       and (p.relid is null or $1::text is null or p.relid = to_regclass($1::text))`, [qualifiedTable]);
-  return rows;
+  return withCatalogPath(db, async () => (await db.query(`
+    select p.pid, p.relid::pg_catalog.regclass::pg_catalog.text as rel, p.phase
+      from pg_catalog.pg_stat_progress_create_index p
+     where p.datid = (select oid from pg_catalog.pg_database where datname = pg_catalog.current_database())
+       and p.pid <> pg_catalog.pg_backend_pid()
+       and (p.relid is null or $1::pg_catalog.text is null or p.relid = pg_catalog.to_regclass($1::pg_catalog.text))`, [qualifiedTable])).rows);
 }
 
 // ─── 空き容量 ───
@@ -757,14 +805,18 @@ const mb = (b) => `${Math.round(Number(b) / 1048576).toLocaleString()} MB`;
  * 列は key と include の両方 (include も葉に入る = 上に倒す)
  */
 export async function estimateIndexBytes(db, st) {
+  return withCatalogPath(db, () => estimateIndexBytesInPath(db, st));   // 🆕 Codex R5 M2: 前の file の attacker.pg_stats などに騙されない
+}
+/** estimateIndexBytes の中身 (呼び手が search_path = pg_catalog の取引を開いている) */
+async function estimateIndexBytesInPath(db, st) {
   const fail = (msg) => Object.assign(new Error(`容量: ${st.schema}.${st.name} の大きさを見積もれない (${msg}) = 流さずに止めた`), { code: 'DISK_CHECK_FAILED' });
-  const { rows: rel } = await db.query(`select c.reltuples::float8 as reltuples from pg_class c join pg_namespace n on n.oid = c.relnamespace
+  const { rows: rel } = await db.query(`select c.reltuples::pg_catalog.float8 as reltuples from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace
     where n.nspname = $1 and c.relname = $2 and c.relkind in ('r', 'p', 'm')`, [st.schema, st.table]);
   if (!rel.length) throw fail(`表 ${st.schema}.${st.table} が無い`);
   const reltuples = Number(rel[0].reltuples);
   if (!(reltuples >= 0)) throw fail(`表 ${st.schema}.${st.table} の reltuples が ${reltuples} = 一度も ANALYZE していない (先に analyze ${st.schema}.${st.table})`);
   const cols = [...new Set(st.elements.filter((e) => !e.expression).map((e) => e.column))];
-  const { rows: stats } = cols.length ? await db.query('select attname::text as attname, avg_width from pg_stats where schemaname = $1 and tablename = $2 and attname = any($3::text[])', [st.schema, st.table, cols]) : { rows: [] };
+  const { rows: stats } = cols.length ? await db.query('select attname::pg_catalog.text as attname, avg_width from pg_catalog.pg_stats where schemaname = $1 and tablename = $2 and attname = any($3::pg_catalog.text[])', [st.schema, st.table, cols]) : { rows: [] };
   const width = new Map(stats.map((r) => [r.attname, Number(r.avg_width)]));
   let sum = 0;
   for (const e of st.elements) {
@@ -808,16 +860,34 @@ export async function checkDiskBeforeCreate(db, st, readDiskMetrics, log = () =>
  * (途中まで作って容量で止まる = 半端な状態を作らない)。各文の前の関門 (checkDiskBeforeCreate) はそのまま残す (流している間の空きの変化を見る)
  */
 export async function checkDiskForFile(db, creates, readDiskMetrics, log = () => {}, { reservedBytes = 0, file = '' } = {}) {
+  return checkDiskTotal(db, creates, readDiskMetrics, log, { reservedBytes, label: file });
+}
+/** creates の予想の和 (1 つの取引・search_path = pg_catalog)。呼び手の session の役割で読む (owner の状態の CIC は SET ROLE の後 = pg_stats の列が見える) */
+async function sumIndexEstimates(db, creates) {
+  return withCatalogPath(db, async () => { let total = 0; for (const st of creates) total += await estimateIndexBytesInPath(db, st); return total; });
+}
+/** 合計の判定 (file の合計と run の合計で共通)。必要 = 予想の合計 × 3 + reservedBytes + 2GB */
+async function checkDiskTotal(db, creates, readDiskMetrics, log, { reservedBytes = 0, label = '' } = {}) {
   if (!creates.length) return { totalEstimateBytes: 0 };
-  let total = 0;
-  for (const st of creates) total += await estimateIndexBytes(db, st);
+  const total = await sumIndexEstimates(db, creates);
   const need = total * DISK_ESTIMATE.safetyFactor + reservedBytes + DISK_ESTIMATE.fixedReserveBytes;
-  const fail = (msg, extra = {}) => Object.assign(new Error(`容量: ${file} の index ${creates.length} 本の合計: ${msg} = 何も作らずに止めた`), { code: 'DISK_CHECK_FAILED', ...extra });
+  const fail = (msg, extra = {}) => Object.assign(new Error(`容量: ${label} の index ${creates.length} 本の合計: ${msg} = 何も作らずに止めた`), { code: 'DISK_CHECK_FAILED', ...extra });
   const { free } = await readFreeBytes(readDiskMetrics, fail, { estimateBytes: total });
   const resText = reservedBytes ? ` + この回に先に作った分 ${mb(reservedBytes)}` : '';
-  log(`容量: ${file} の index ${creates.length} 本の予想の合計 ${mb(total)} × ${DISK_ESTIMATE.safetyFactor}${resText} + ${mb(DISK_ESTIMATE.fixedReserveBytes)} = ${mb(need)} / 空き ${mb(free)}`);
+  log(`容量: ${label} の index ${creates.length} 本の予想の合計 ${mb(total)} × ${DISK_ESTIMATE.safetyFactor}${resText} + ${mb(DISK_ESTIMATE.fixedReserveBytes)} = ${mb(need)} / 空き ${mb(free)}`);
   if (free < need) throw fail(`空き ${mb(free)} が 合計 × ${DISK_ESTIMATE.safetyFactor}${resText} + 2GB = ${mb(need)} に満たない`, { reason: 'NOT_ENOUGH', estimateBytes: total, needBytes: need, freeBytes: free, reservedBytes });
   return { totalEstimateBytes: total, needBytes: need, freeBytes: free };
+}
+/**
+ * 🆕 Codex R5 M1 (設計 13 v3.13 ⑤ (a)・v3.14 ④): この回に流す **全部の未適用の concurrent-index の file** の create を最初に集めて 1 回で判定する
+ * (最初の CIC の file の最初の文の前・足りなければ 1 本も作らない)。前の回で作り済み・valid・未記録の index も含める (二重に数えても止まる向き)。
+ * 式 = 予想の合計 × 3 + 2GB (設計の「Σ 予想 + max(予想) × 2 + 2GB」より大きいか同じ = 止まる向き・file の合計の判定と同じ式)。
+ * file の合計の判定 (checkDiskForFile)・各文の前の判定 (checkDiskBeforeCreate) はそのまま残す (流している間の空きの変化を見る)。
+ * CIC の file が 1 つだけの回は、その file の合計の判定と同じ = 呼ばない (メトリクスを二重に読まない)
+ */
+export async function checkDiskForRun(db, files, readDiskMetrics, log = () => {}) {
+  const creates = files.flatMap((f) => [...f.plan.creates.values()]);
+  return checkDiskTotal(db, creates, readDiskMetrics, log, { label: `この回の concurrent-index の file ${files.length} 本 (${files.map((f) => f.file).join('・')})` });
 }
 
 /**
@@ -881,23 +951,26 @@ export async function renderDiskMetricsReader(env = process.env, url = null, { c
 // ─── 全体の排他 (CLI の入口) ───
 /** lock を持っている backend (見えれば)。接続からの分 = 見張り (45 分) と同じ物差し */
 export async function describeLockHolder(db) {
-  const { rows } = await db.query(`
-    select l.pid, a.application_name, a.usename::text as usename, a.backend_start,
-           floor(extract(epoch from (now() - a.backend_start)) / 60)::int as minutes
-      from pg_locks l left join pg_stat_activity a on a.pid = l.pid
+  // 🆕 Codex R5 M2: search_path = pg_catalog の取引で (演算子・型も pg_catalog で解く)
+  return withCatalogPath(db, async () => (await db.query(`
+    select l.pid, a.application_name, a.usename::pg_catalog.text as usename, a.backend_start,
+           pg_catalog.floor(extract(epoch from (pg_catalog.now() - a.backend_start)) / 60)::pg_catalog.int4 as minutes
+      from pg_catalog.pg_locks l left join pg_catalog.pg_stat_activity a on a.pid = l.pid
      where l.locktype = 'advisory' and l.granted and l.objsubid = 1
-       and l.database = (select oid from pg_database where datname = current_database())
-       and ((l.classid::bigint << 32) | l.objid::bigint) = hashtextextended($1, 0)`, [MIGRATE_LOCK_NAME]);
-  return rows;
+       and l.database = (select oid from pg_catalog.pg_database where datname = pg_catalog.current_database())
+       and ((l.classid::pg_catalog.int8 << 32) | l.objid::pg_catalog.int8) = pg_catalog.hashtextextended($1, 0)`, [MIGRATE_LOCK_NAME])).rows);
 }
 const holderText = (rows) => rows.map((r) => `pid ${r.pid}${r.application_name ? ` (${r.application_name}${r.usename ? `・${r.usename}` : ''})` : ''}${r.minutes != null ? ` 接続から ${r.minutes} 分` : ''}`).join(', ');
 
 /** この session が migrate の lock を持っているか (concurrent-index は lock の中でだけ流す) */
 async function holdsMigrateLock(db) {
-  const { rows } = await db.query(`select exists (select 1 from pg_locks l where l.locktype = 'advisory' and l.granted and l.objsubid = 1 and l.pid = pg_backend_pid()
-    and l.database = (select oid from pg_database where datname = current_database())
-    and ((l.classid::bigint << 32) | l.objid::bigint) = hashtextextended($1, 0)) as held`, [MIGRATE_LOCK_NAME]);
-  return rows[0].held === true;
+  // 🆕 Codex R5 M2: search_path = pg_catalog の取引で (前の file が残した search_path の同じ名前の関数・演算子に「持っている」と言わせない)
+  return withCatalogPath(db, async () => {
+    const { rows } = await db.query(`select exists (select 1 from pg_catalog.pg_locks l where l.locktype = 'advisory' and l.granted and l.objsubid = 1 and l.pid = pg_catalog.pg_backend_pid()
+      and l.database = (select oid from pg_catalog.pg_database where datname = pg_catalog.current_database())
+      and ((l.classid::pg_catalog.int8 << 32) | l.objid::pg_catalog.int8) = pg_catalog.hashtextextended($1, 0)) as held`, [MIGRATE_LOCK_NAME]);
+    return rows[0].held === true;
+  });
 }
 
 /**
@@ -906,7 +979,8 @@ async function holdsMigrateLock(db) {
  * 取引の外の失敗 (e.noTransaction = concurrent-index の文) は ROLLBACK をせずに unlock
  */
 export async function withMigrateLock(db, fn, { log = () => {} } = {}) {
-  const got = (await db.query('select pg_try_advisory_lock(hashtextextended($1, 0)) as got', [MIGRATE_LOCK_NAME])).rows[0].got;
+  // 🆕 Codex R5 M2: 関数を pg_catalog. で修飾 (演算子は使わない・session の lock = 取引に入れない)
+  const got = (await db.query('select pg_catalog.pg_try_advisory_lock(pg_catalog.hashtextextended($1, 0)) as got', [MIGRATE_LOCK_NAME])).rows[0].got;
   if (!got) {
     let who = '';
     try { const h = await describeLockHolder(db); if (h.length) who = ' / 持っている接続: ' + holderText(h); } catch { /* 見えなくても止まる理由は同じ */ }
@@ -937,7 +1011,8 @@ export async function withMigrateLock(db, fn, { log = () => {} } = {}) {
 async function unlock(db) {
   // session の役割に戻してから外す (owner mode の SET ROLE が残っていても lock は session のもの = 外れ方は変わらないが、一貫させる・R-D60-v3-10 H2)
   await db.exec('reset role');
-  const ok = (await db.query('select pg_advisory_unlock(hashtextextended($1, 0)) as ok', [MIGRATE_LOCK_NAME])).rows[0].ok;
+  // 🆕 Codex R5 M2: 関数を pg_catalog. で修飾 (前の file が残した search_path の同じ名前の関数に外させない・演算子は使わない)
+  const ok = (await db.query('select pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0)) as ok', [MIGRATE_LOCK_NAME])).rows[0].ok;
   if (!ok) throw new Error('pg_advisory_unlock が false (持っていなかった)');
 }
 
@@ -962,7 +1037,8 @@ export function migrateWithLock(db, opts = {}) {
 async function setLexerPremiseLocal(db) {
   await db.exec(`set local standard_conforming_strings = ${LEXER_PREMISE.standard_conforming_strings}`);
   await db.exec(`set local client_encoding = '${LEXER_PREMISE.client_encoding}'`);
-  const { rows } = await db.query(`select name::text as name, setting::text as setting, reset_val::text as reset_val from pg_catalog.pg_settings where name = any($1::text[])`, [Object.keys(LEXER_PREMISE)]);
+  // 🆕 Codex R5 M2: 呼び手が search_path = pg_catalog に固定した中で呼ぶ (型も修飾)
+  const { rows } = await db.query(`select name::pg_catalog.text as name, setting::pg_catalog.text as setting, reset_val::pg_catalog.text as reset_val from pg_catalog.pg_settings where name = any($1::pg_catalog.text[])`, [Object.keys(LEXER_PREMISE)]);
   const bad = [];
   for (const [k, want] of Object.entries(LEXER_PREMISE)) {
     const r = rows.find((x) => x.name === k);
@@ -1022,6 +1098,16 @@ async function applyConcurrentIndexFile(db, f, plan, opts, log, appliedBy, mode,
     await setSession(db, s, log);
     // owner mode = file の全部 (DDL・記録表・pg_stats の読み) を持ち主の役割で。finally の resetSession で RESET ROLE
     if (mode.mode === 'owner') await db.exec(`set role ${mode.role}`);
+    // 🆕 Codex R5 M1: この回の最初の CIC の file の前に、この回に流す全部の CIC の file の create の合計を 1 回で判定 (足りなければ 1 本も作らない)
+    if (!diskRun.runChecked) {
+      diskRun.runChecked = true;
+      const runFiles = diskRun.runFiles || [];
+      if (runFiles.length >= 2) {
+        try {
+          await checkDiskForRun(db, runFiles, opts.readDiskMetrics, log);
+        } catch (e) { if (e.code === 'DISK_CHECK_FAILED') { e.message = `${f.file} の前: ${e.message}`; e.version = f.version; } throw e; }
+      }
+    }
     // 🆕 Codex R1 H3: この file の create の全部の合計を先に 1 回で判定 (+ この回の前の file で作った分)。
     //   🆕 Codex R-D60-v3-14 M4: 作り済みの valid (前の回が作って記録の前に落ちた = メトリクスにまだ出ていないかもしれない) も合計に入れる (二重に数えても止まる向き)
     try {
@@ -1079,7 +1165,8 @@ async function applyConcurrentIndexFile(db, f, plan, opts, log, appliedBy, mode,
       const [sc, nm] = key.split('.');
       if (await readIndexAttrs(db, sc, nm)) throw fail(`${key} が消えていない`, { reason: 'NOT_DROPPED' });
     }
-    await db.query('insert into ops.schema_migrations (version, name, checksum, applied_by) values ($1, $2, $3, $4)', [f.version, f.name, f.checksum, appliedBy]);
+    // 🆕 Codex R5 M2: 記録も search_path = pg_catalog の取引で (ふつうの file の記録と同じ・前の file が残した search_path に依らない)
+    await withCatalogPath(db, () => db.query('insert into ops.schema_migrations (version, name, checksum, applied_by) values ($1, $2, $3, $4)', [f.version, f.name, f.checksum, appliedBy]));
   } catch (e) {
     const err = ['MIGRATION_FAILED', 'DISK_CHECK_FAILED'].includes(e.code) ? e : fail(e.message, { cause: e });
     // invalid が残っていれば回収の手順を添える
@@ -1107,6 +1194,8 @@ async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTim
   try {
     if (mode.mode === 'owner') await db.exec(`set local role ${mode.role}`);
     await db.exec(`set local lock_timeout = '${lockTimeout}'; set local statement_timeout = '${statementTimeout}';`);
+    // 🆕 Codex R5 M2: runner の SQL は pg_catalog で解く (この道の create の前の readIndexAttrs も同じ固定を入れていた = 文の解決は変わらない・drop は schema つき)
+    await db.exec(`set local search_path = ${CATALOG_SEARCH_PATH}`);
     await setLexerPremiseLocal(db);   // 🆕 Codex R3 High 2: PGlite の道も同じ前提 (concurrent-index の file は新しい形 = legacy の互換は関係ない)
     for (const st of plan.statements) {
       if (st.kind === 'create') {
@@ -1145,21 +1234,42 @@ async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTim
  */
 export const ROLE_ADMIN_FORBIDDEN_PREDEFINED = Object.freeze(['pg_read_server_files', 'pg_write_server_files', 'pg_execute_server_program', 'pg_create_subscription', 'pg_checkpoint', 'pg_signal_backend']);
 export async function roleAdminReachable(db) {
-  const { rows } = await db.query(`select r.rolname::text as role, r.rolsuper as su, r.rolcreaterole as cr, r.rolcreatedb as cdb, r.rolreplication as rep, r.rolbypassrls as bypass,
+  // 🆕 Codex R5 M2: search_path = pg_catalog の取引で (前の file が残した search_path の同じ名前の関数・演算子に「届かない」と言わせない)
+  const rows = await withCatalogPath(db, async () => (await db.query(`select r.rolname::pg_catalog.text as role, r.rolsuper as su, r.rolcreaterole as cr, r.rolcreatedb as cdb, r.rolreplication as rep, r.rolbypassrls as bypass,
       exists (select 1 from pg_catalog.pg_auth_members m where m.member = r.oid and m.admin_option) as adm,
-      r.rolname = any($1::text[]) as predefined
+      r.rolname = any($1::pg_catalog.text[]) as predefined
     from pg_catalog.pg_roles r
    where pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER')
-   order by 1`, [ROLE_ADMIN_FORBIDDEN_PREDEFINED]);
+   order by 1`, [ROLE_ADMIN_FORBIDDEN_PREDEFINED])).rows);
   return rows.filter((r) => r.su || r.cr || r.cdb || r.rep || r.bypass || r.adm || r.predefined)
     .map((r) => `${r.role} (${[r.su && 'superuser', r.cr && 'CREATEROLE', r.cdb && 'CREATEDB', r.rep && 'REPLICATION', r.bypass && 'BYPASSRLS', r.adm && 'ADMIN の membership', r.predefined && '危険な定義済みの役割'].filter(Boolean).join('・')})`);
 }
-/** owner の状態のときに呼ぶ。届けば OWNER_MODE_INVALID (reason ROLE_ADMIN_REACHABLE) */
-async function checkRoleAdminReach(db, log = () => {}) {
-  if (db.roleAdminReachExempt === true) { log('到達の検査 (ROLE_ADMIN_REACHABLE) を飛ばす = この adapter は試験だけ (PGlite の superuser の 1 つの session)'); return; }
+/**
+ * 🆕 Codex R5 M3 (PR #1606) `OWNER_ROLE_CAN_LOGIN`: 形 B の保証の範囲 = owner の状態の本文は runner の `SET LOCAL ROLE <印の役割>` (と動的 SQL の
+ * set_config('role', …)) で接続の役割 (session_user) が SET で届く役割になり、その役割として **自分の password を変えられる** (PostgreSQL は普通の役割にも
+ * 自分の password の変更を許す・password は役割の図の比較に見えない = pg_authid は superuser だけ)。
+ * → SET で届く owner の役割が NOLOGIN なら、変えられた password は資格として使えない。ここではそれを fail-closed で確かめる:
+ *   対象 = 印の役割 + 許す SET LOCAL ROLE の一覧 (ALLOWED_SET_LOCAL_ROLES・在れば) + session_user が SET で届く全部の役割 (session_user 自身は除く =
+ *   deployer 自身の password は形 B でも残る穴・設計 13 v3.14 ③)。1 つでも LOGIN (rolcanlogin) なら止まる。
+ * 戻り = LOGIN の役割の名前の一覧 ([] = 全部 NOLOGIN)
+ */
+export async function ownerRolesCanLogin(db, markRole) {
+  const rows = await withCatalogPath(db, async () => (await db.query(`select r.rolname::pg_catalog.text as role
+    from pg_catalog.pg_roles r
+   where r.rolcanlogin
+     and (r.rolname = $1::pg_catalog.text
+          or r.rolname = any($2::pg_catalog.text[])
+          or (r.rolname <> session_user and pg_catalog.pg_has_role(session_user, r.oid, 'SET')))
+   order by 1`, [markRole, ALLOWED_SET_LOCAL_ROLES])).rows);
+  return rows.map((r) => r.role);
+}
+/** owner の状態のときに呼ぶ。届けば OWNER_MODE_INVALID (reason ROLE_ADMIN_REACHABLE)・🆕 SET で届く owner の役割が LOGIN なら OWNER_MODE_INVALID (reason OWNER_ROLE_CAN_LOGIN) */
+async function checkRoleAdminReach(db, log = () => {}, markRole = null) {
+  if (db.roleAdminReachExempt === true) { log('到達の検査 (ROLE_ADMIN_REACHABLE・OWNER_ROLE_CAN_LOGIN) を飛ばす = この adapter は試験だけ (PGlite の superuser の 1 つの session)'); return; }
   const hits = await roleAdminReachable(db);
-  if (!hits.length) return;
-  throw Object.assign(ownerErr(`ROLE_ADMIN_REACHABLE: 接続の役割 (session_user) が役割の管理・危険な権限に届く: ${hits.join(', ')} = owner の状態の migration の本文は動的 SQL でこの権限を使える (sandbox ではない) = 流さない (形 B = 役割の管理は別の LOGIN・設計 13 v3.14 ②)`), { reason: 'ROLE_ADMIN_REACHABLE' });
+  if (hits.length) throw Object.assign(ownerErr(`ROLE_ADMIN_REACHABLE: 接続の役割 (session_user) が役割の管理・危険な権限に届く: ${hits.join(', ')} = owner の状態の migration の本文は動的 SQL でこの権限を使える (sandbox ではない) = 流さない (形 B = 役割の管理は別の LOGIN・設計 13 v3.14 ②)`), { reason: 'ROLE_ADMIN_REACHABLE' });
+  const login = await ownerRolesCanLogin(db, markRole);
+  if (login.length) throw Object.assign(ownerErr(`OWNER_ROLE_CAN_LOGIN: SET で届く owner の役割 (印の役割・許す SET LOCAL ROLE の一覧・接続の役割が SET で届く役割) に LOGIN がある: ${login.join(', ')} = owner の状態の本文はその役割として自分の password を見えずに変えられる (役割の図の比較に出ない) = 資格として使える役割には SET させない (ALTER ROLE … NOLOGIN にしてから流す・Codex R5 M3)`), { reason: 'OWNER_ROLE_CAN_LOGIN', loginRoles: login });
 }
 
 /**
@@ -1169,15 +1279,17 @@ async function checkRoleAdminReach(db, log = () => {}) {
  * 🚨 password の変更は見えない (pg_authid は superuser だけ) = これだけでは役割の境を守れない
  */
 export async function roleGraphHash(db) {
+  // 🆕 Codex R5 M2: 関数・aggregate・型を全部 pg_catalog. で修飾 (jsonb_agg・jsonb_build_object・to_jsonb・jsonb・int8・text)。演算子は使わない
+  //   (order by は型の既定の btree の演算子のクラス = search_path に依らない)。呼び手は search_path = pg_catalog, pg_temp の中で呼ぶ (二重の守り)
   const { rows } = await db.query(`select pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.jsonb_build_object(
-      'members', (select coalesce(jsonb_agg(jsonb_build_object('roleid', m.roleid::int8, 'member', m.member::int8, 'grantor', m.grantor::int8,
-          'admin', m.admin_option, 'inherit', m.inherit_option, 'set', m.set_option) order by m.roleid, m.member, m.grantor), '[]'::jsonb) from pg_catalog.pg_auth_members m),
-      'roles', (select coalesce(jsonb_agg(jsonb_build_object('oid', r.oid::int8, 'name', r.rolname::text, 'super', r.rolsuper, 'inherit', r.rolinherit, 'createrole', r.rolcreaterole,
+      'members', (select coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('roleid', m.roleid::pg_catalog.int8, 'member', m.member::pg_catalog.int8, 'grantor', m.grantor::pg_catalog.int8,
+          'admin', m.admin_option, 'inherit', m.inherit_option, 'set', m.set_option) order by m.roleid, m.member, m.grantor), '[]'::pg_catalog.jsonb) from pg_catalog.pg_auth_members m),
+      'roles', (select coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('oid', r.oid::pg_catalog.int8, 'name', r.rolname::pg_catalog.text, 'super', r.rolsuper, 'inherit', r.rolinherit, 'createrole', r.rolcreaterole,
           'createdb', r.rolcreatedb, 'login', r.rolcanlogin, 'replication', r.rolreplication, 'bypassrls', r.rolbypassrls, 'connlimit', r.rolconnlimit,
-          'validuntil', r.rolvaliduntil, 'config', to_jsonb(r.rolconfig)) order by r.oid), '[]'::jsonb) from pg_catalog.pg_roles r),
-      'settings', (select coalesce(jsonb_agg(jsonb_build_object('database', s.setdatabase::int8, 'role', s.setrole::int8, 'config', to_jsonb(s.setconfig)) order by s.setdatabase, s.setrole), '[]'::jsonb)
+          'validuntil', r.rolvaliduntil, 'config', pg_catalog.to_jsonb(r.rolconfig)) order by r.oid), '[]'::pg_catalog.jsonb) from pg_catalog.pg_roles r),
+      'settings', (select coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('database', s.setdatabase::pg_catalog.int8, 'role', s.setrole::pg_catalog.int8, 'config', pg_catalog.to_jsonb(s.setconfig)) order by s.setdatabase, s.setrole), '[]'::pg_catalog.jsonb)
           from pg_catalog.pg_db_role_setting s)
-    )::text, 'UTF8')), 'hex') as h`);
+    )::pg_catalog.text, 'UTF8')), 'hex') as h`);
   return rows[0].h;
 }
 
@@ -1229,7 +1341,8 @@ export async function applyMigrations(db, opts = {}) {
   const migExists = await opsTableExists(db, 'schema_migrations');
   if (!migExists && !dryRun) {
     // bootstrap: 記録表だけはここで作る (0001 より前に要る)。あれば DDL を流さない (owner mode の接続の役割は ops に CREATE を持たない)
-    await db.exec(`
+    // 🆕 Codex R5 M2: 型と既定の関数 (text・timestamptz・now()) を pg_catalog で解く (role / database の既定の search_path に依らない)
+    await withCatalogPath(db, () => db.exec(`
       create schema if not exists ops;
       create table if not exists ops.schema_migrations (
         version    text primary key,
@@ -1238,7 +1351,7 @@ export async function applyMigrations(db, opts = {}) {
         applied_at timestamptz not null default now(),
         applied_by text
       );
-    `);
+    `));
   }
   // dry-run は DDL を流さない = 記録表が無ければ「何も適用していない」とみる
   let appliedRows = [];
@@ -1282,9 +1395,24 @@ export async function applyMigrations(db, opts = {}) {
   if (transitions.length > 1) throw Object.assign(new Error(`owner-transition の migration が 2 つある (${transitions.map((f) => f.file).join(', ')})`), { code: 'OWNER_MODE_INVALID' });
   // 🆕 設計 13 v3.14 ②: owner の状態なら、接続の役割が禁止の集合に届けば流さない (dry-run も・何も流す前)
   let reachChecked = false;
-  if (mode0.mode === 'owner') { await checkRoleAdminReach(db, log); reachChecked = true; }
+  if (mode0.mode === 'owner') { await checkRoleAdminReach(db, log, mode0.role); reachChecked = true; }   // 🆕 Codex R5 M3: SET で届く owner の役割の NOLOGIN も
+  // 🆕 Codex R5 Low 2: dry-run でも環境の字句の前提 (setting と reset_val) を確かめる (流す道と同じ関数・取引を開いて巻き戻す = 何も変えない)。
+  //   流す道で前提を入れる file (取引の中で流す file) があるときだけ = 流す道と同じ範囲。違えば code = LEXER_PREMISE_INVALID (reason = LEXER_PREMISE)
+  if (dryRun && todo.some((f) => !f.concurrentIndex || db.supportsConcurrentIndex !== true)) {
+    await db.exec('begin');
+    try {
+      await db.exec(`set local search_path = ${CATALOG_SEARCH_PATH}`);
+      await setLexerPremiseLocal(db);
+    } catch (e) {
+      try { await db.exec('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する = 元の誤りを出す */ }
+      throw e;
+    }
+    await db.exec('rollback');   // SET LOCAL を残さない (dry-run は何も変えない)
+    log(`dry-run: 字句の前提 (${Object.entries(LEXER_PREMISE).map(([k, v]) => `${k} = ${v}`).join('・')}・reset_val も) を確かめた`);
+  }
   // 2 周目 = 流す
-  const diskRun = { reservedBytes: 0 };   // この回に作った index の「予想 × 3」の和 (Codex R1 H3・後の文と後の file の空きから引く)
+  // この回に作った index の「予想 × 3」の和 (Codex R1 H3・後の文と後の file の空きから引く)。🆕 Codex R5 M1: runFiles = この回に流す全部の CIC の file (最初の CIC の file の前に合計で 1 回判定)
+  const diskRun = { reservedBytes: 0, runChecked: false, runFiles: todo.filter((f) => f.concurrentIndex) };
   for (const f of todo) {
     if (dryRun) {
       log(f.concurrentIndex ? `dry-run: ${f.file} を流す予定 (concurrent-index・${f.plan.statements.length} 文・${db.supportsConcurrentIndex ? '取引の外' : 'concurrently を外して取引の中'})` : `dry-run: ${f.file} を流す予定${f.ownerTransition ? ' (owner-transition = 接続の役割で流し、記録は印の役割で)' : ''}`);
@@ -1294,7 +1422,7 @@ export async function applyMigrations(db, opts = {}) {
     // file ごとに mode を読み直す (前の file が owner-transition なら、ここから owner mode)
     const mode = await readOwnerMode(db);
     if (f.ownerTransition && mode.mode === 'owner') throw Object.assign(new Error(`${f.file} は owner-transition なのに、もう owner mode = 流さない`), { code: 'OWNER_MODE_INVALID', version: f.version });
-    if (mode.mode === 'owner' && !reachChecked) { await checkRoleAdminReach(db, log); reachChecked = true; }   // 同じ回で owner-transition の後
+    if (mode.mode === 'owner' && !reachChecked) { await checkRoleAdminReach(db, log, mode.role); reachChecked = true; }   // 同じ回で owner-transition の後
     if (f.concurrentIndex) {
       if (db.supportsConcurrentIndex === true) await applyConcurrentIndexFile(db, f, f.plan, opts, log, appliedBy, mode, diskRun);
       else await applyConcurrentIndexFileInTx(db, f, f.plan, log, appliedBy, lockTimeout, statementTimeout, mode);
@@ -1308,15 +1436,20 @@ export async function applyMigrations(db, opts = {}) {
       await db.exec(`set local lock_timeout = '${lockTimeout}'; set local statement_timeout = '${statementTimeout}';`);
       // 🆕 Codex R3 High 2 / R4 High 1: 本文の前に別のクエリで字句の前提 (standard_conforming_strings = on・client_encoding = UTF8) を入れる。
       //   owner の状態の file だけでなく legacy・owner-transition の file も (取引の制御の文の検査が lexSql と同じ境目で Postgres に読まれるように)
-      await setLexerPremiseLocal(db);
-      // 🆕 設計 13 v3.13 ③ / v3.14 ①: owner の状態のふつうの file と owner-transition の file = 本文の前の役割の図 (役割を作る・membership を変えるのは migration の外)
-      const graph0 = mode.mode === 'owner' || f.ownerTransition ? await roleGraphHash(db) : null;
+      // 🆕 Codex R5 M2: 本文の前の runner の SQL (字句の前提の確かめ・最初の役割の図の hash) も search_path = pg_catalog, pg_temp の中で
+      //   (前の file が session に `SET search_path = attacker, pg_catalog` と同じ名前の jsonb_agg などを残しても、最初の hash の解決先を変えさせない)。
+      //   固定は本文の前に元の値へ戻す (withCatalogPath の inTx = set_config(…, true)) = 本文の名前の解決は今までどおり
+      const graph0 = await withCatalogPath(db, async () => {
+        await setLexerPremiseLocal(db);
+        // 🆕 設計 13 v3.13 ③ / v3.14 ①: owner の状態のふつうの file と owner-transition の file = 本文の前の役割の図 (役割を作る・membership を変えるのは migration の外)
+        return mode.mode === 'owner' || f.ownerTransition ? roleGraphHash(db) : null;
+      }, { inTx: true });
       await db.exec(f.text);
       // 本文が search_path を変えていても、runner の後の SQL (mode の読み・記録・役割の図の hash) は pg_catalog の名前で解く (本文が作った同じ名前の関数・型に解かせない)
-      await db.exec('set local search_path = pg_catalog, pg_temp');
+      await db.exec(`set local search_path = ${CATALOG_SEARCH_PATH}`);
       if (mode.mode === 'legacy') {
         // 印を作ってよいのは owner-transition の file だけ / owner-transition の file は印を作り終えていなければならない
-        const after = await readOwnerMode(db);
+        const after = await readOwnerMode(db, { inTx: true });
         if (f.ownerTransition) {
           if (after.mode !== 'owner') throw Object.assign(new Error(`owner-transition の file が持ち主の印 (${OWNER_MARKER_TABLE}) を作らなかった`), { code: 'OWNER_MODE_INVALID' });
           await db.exec(`set local role ${after.role}`);   // 記録は移した後の持ち主で (接続の役割は記録表の権限を失っているかもしれない)
@@ -1365,7 +1498,7 @@ export async function migrationStatus(db, opts = {}) {
   //   🆕 設計 13 v3.14 ②: owner の状態なら到達の検査も (届けば OWNER_MODE_INVALID = exit 1)
   try {
     assertOwnerTransitionConsistent(mode, files, applied);
-    if (mode.mode === 'owner') await checkRoleAdminReach(db, opts.log || (() => {}));
+    if (mode.mode === 'owner') await checkRoleAdminReach(db, opts.log || (() => {}), mode.role);
   } catch (e) { e.statusRows = status; throw e; }
   return status;
 }
@@ -1497,7 +1630,7 @@ if (isMain) {
       console.log(JSON.stringify(await buildIndexExpect(db, f), null, 2));
       return 0;
     }
-    const r = await migrateWithLock(db, { dir, to, dryRun: args.includes('--dry-run'), readDiskMetrics: await renderDiskMetricsReader(process.env, url, { currentDatabase: (await client.query('select current_database()::text as d')).rows[0].d }), lockLog: (m) => console.log(`[company-db] ${m}`) });
+    const r = await migrateWithLock(db, { dir, to, dryRun: args.includes('--dry-run'), readDiskMetrics: await renderDiskMetricsReader(process.env, url, { currentDatabase: (await client.query('select pg_catalog.current_database()::pg_catalog.text as d')).rows[0].d }), lockLog: (m) => console.log(`[company-db] ${m}`) });
     console.log(`[company-db] applied=${r.applied.length} skipped=${r.skipped.length} pending=${r.pending.length}`);
     return 0;
   })().then(async (c) => {
