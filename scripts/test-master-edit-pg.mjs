@@ -81,7 +81,7 @@ const O = await open(null);
 const clients = [O];
 try {
   const dbO = pgAdapter(O);
-  await applyMigrations(dbO, { log: () => {} });
+  await applyMigrations({ ...dbO, supportsConcurrentIndex: false }, { log: () => {} });   // 準備 = concurrent-index の file も取引の中で (PGlite と同じ道・本物の CIC の道は test-company-db-d60-load-count-indexes-pg.mjs)
   await createMasterEditRoles(O, { pw: PW });
   const [A, B, GR, GM, P, V, O2] = [await open('master_edit'), await open('master_edit'), await open('master_gate_render'), await open('master_gate_minipc'),
     await open('master_ops'), await open('master_observer'), await open(null)];

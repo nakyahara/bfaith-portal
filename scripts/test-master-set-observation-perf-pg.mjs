@@ -63,7 +63,7 @@ try {
     const c = await openPgClient(uu.toString());
     try {
       const db = pgAdapter(c);
-      await applyMigrations(db, { log: () => {} });
+      await applyMigrations({ ...db, supportsConcurrentIndex: false }, { log: () => {} });   // 準備 = concurrent-index の file も取引の中で (PGlite と同じ道・本物の CIC の道は test-company-db-d60-load-count-indexes-pg.mjs)
       const rows1 = compsOf(n, false);
       const t0 = Date.now();
       const r1 = await runInitialLoad(db, planOf(n, rows1, materialOf(`mat_perf_${n}_1`, rows1)), { log: () => {}, runId: `load_perf_${n}_1`, now: new Date() });

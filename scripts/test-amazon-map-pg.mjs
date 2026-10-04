@@ -86,7 +86,7 @@ try {
     assert.equal(r.ok, true, r.error);
     const before = await snap();
     assert.ok(before.comps.some((c) => c.listing_code === 'pm_1' && c.sort_order === 3));
-    const res = await applyMigrations(dbO, { log: () => {} });
+    const res = await applyMigrations(dbO, { log: () => {}, to: '0055' });   // to = この試験は 0054・0055 (master でも 0056 以降が入って落ちていた・後の concurrent-index の file は lock の道)
     assert.deepEqual(res.applied, ['0054', '0055']);   // 0055 = ④a の持ち主の epoch (表を足すだけ = ここも何も変えない)
     assert.deepEqual(await snap(), before);
     const r2 = await loadWith(dbO, 'load_pg_1', MASTER_OWNERSHIP);

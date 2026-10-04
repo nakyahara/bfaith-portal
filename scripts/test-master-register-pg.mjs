@@ -77,7 +77,7 @@ const stateOf = async (code) => (await q('select r.state from ops.master_registr
 
 try {
   const dbM = pgAdapter(M);
-  await applyMigrations(dbM, { log: () => {} });
+  await applyMigrations({ ...dbM, supportsConcurrentIndex: false }, { log: () => {} });   // 準備 = concurrent-index の file も取引の中で (PGlite と同じ道・本物の CIC の道は test-company-db-d60-load-count-indexes-pg.mjs)
   await createMasterEditRoles(M, { pw: PW });
   const [A, B, P, GR, GM, O2] = [await open('master_edit'), await open('master_edit'), await open('master_ops'), await open('master_gate_render'), await open('master_gate_minipc'), await open(null)];
   clients.push(A, B, P, GR, GM, O2);
