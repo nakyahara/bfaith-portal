@@ -1316,7 +1316,7 @@ export const JOBS_REGISTRY = [
       + '古い表が世代と違う (exit 4) = その後の m_products・上書き表を読む工程を全部止める (apps/warehouse/publish-gate.js の一覧 = 履歴・観測の原価・f_sales・販売速度・商品管理リスト・各モールの財務の日次・Render同期・ロジザードの商品マスタ (影) ほか。'
       + '⚠️ 見送り・retry に載せない・lz-daily-build は fail の ping)。'
       + '持ち主の epoch (0055): config/master-ownership.mjs を書き換えただけでは何も変わらない (夜間ロード・写し・作り直しは Company DB の active)。'
-      + '切替の日 = scripts/company-db/master-ownership-epoch.mjs prepare → remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → --verify-apply → master-ownership-epoch.mjs activate '
+      + '切替の日 = (AI_reference 17 §4.2 の表が正) readiness → scripts/company-db/master-ownership-epoch.mjs prepare → master-cutover.mjs --to frozen → 書きかけ 0 → 最後の active (全部 load) のロード (--use-prepared なし = prepare をまたいだ古い書き込みの回収) → そのロードの run_id の report の成功 + 照合 ② → remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → --verify-apply → activate '
       + '(今の作り直しが prepared の世代・今朝の確かめが通った・読み直しても同じ ときだけ)。🚨 古い書き込み口 (/register など) を閉じるのは ⑤-3 の切替の手順 (持ち主を変える前) = ここでは閉じない。'
       + '今は持ち主が全部 load = 値 0 行の世代 = しくみが毎日通ることの確かめ (m_products は変わらない) = 止まっても今は何も困らない = P3。'
       + '切替の後は、止まると C の変更が古い表 (m_products・mirror) に届かない',
@@ -1329,7 +1329,7 @@ export const JOBS_REGISTRY = [
     runbook: 'logs/daily-sync-*.log の「Company DB の写し」「Company DB の写しの反映」の行と DATA_DIR/company-db-evidence/<日付>/master-publish.json (state・problems・detail・generation_no・epochs・shadow・apply)。'
       + '① の ❌ の理由: ownership_not_supported (config/master-ownership.mjs の一緒に切り替える組 products.name+skus.name / products.status+skus.handling / skus.tax_rate+skus.tax_class の片方だけ・'
       + '④a が写さない列を company にした) / not_newer (今の世代より古い読み) / watermark_backward・watermark_fork (変更の記録の番号が下がった・前の水位の出来事が無い・違う = Company DB の復元・別の DB を疑う) / '
-      + 'ownership_mismatch (Company DB の epoch (active・prepared) と最新の夜間ロードが記録した持ち主が違う = 切替の日は「prepare → remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → 確かめ → activate」の順。'
+      + 'ownership_mismatch (Company DB の epoch (active・prepared) と最新の夜間ロードが記録した持ち主が違う = 切替の日は「readiness → prepare → master-cutover.mjs --to frozen → 書きかけ 0 → 最後の active (全部 load) のロード (--use-prepared なし = prepare をまたいだ古い書き込みの回収) → そのロードの run_id の report の成功 + 照合 ② → remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → --verify-apply → activate」の順 (17 §4.2)。'
       + 'status = node scripts/company-db/master-ownership-epoch.mjs status) / '
       + 'no_nightly_load・no_load_ownership (夜間ロードの記録が無い) / incomplete (C にある SKU なのに持ち主が C の欄が無い = 種類の違いなど) / '
       + '⚠️ だけ (止めない・ok の ping): Company DB に無い SKU (NE にしか無い) = NE の値のまま作る = 証跡の not_in_cdb (件数とコード)・夜間ロードが入れた翌朝から C の値 / '

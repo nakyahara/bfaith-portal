@@ -2,9 +2,12 @@
 /**
  * master-ownership-epoch.mjs — 持ち主の設定の epoch を人が進めるコマンド (0055。マスタ正本切替 ④a・Codex #1564 R1 H1)
  *
- * 切替の日の順番 (⑤-3 の切替の手順の中。🚨 古い書き込み口 (/register など) を閉じるのはその手順 = 持ち主を変える前に閉じる。ここでは閉じない):
- *   1. config/master-ownership.mjs を書き換えてデプロイ (= configured。これだけでは何も変わらない。夜間ロード・写し・作り直しは active のまま)
- *   2. prepare   (miniPC)        : configured を prepared として Company DB に記録する (一緒に切り替える組・写さない列を確かめる)
+ * 切替の日の順番 (🆕 #1610 = AI_reference 17 §4.2 の表が正。🚨 古い入口の門は active ∪ prepared の C の列の入口だけ閉じる = prepare の後の frozen で閉じる):
+ *   1. config/master-ownership.mjs を書き換えてデプロイ (= configured。これだけでは何も変わらない。夜間ロード・写し・作り直しは active のまま)。readiness が両方の環境で 0
+ *   2. prepare   (miniPC)        : configured を prepared として Company DB に記録する (一緒に切り替える組・写さない列を確かめる)。段階は legacy_open のまま
+ *   2a. master-cutover.mjs --to frozen (この瞬間から prepared の C の列の入口だけ閉じる) → 全部のプロセスの書きかけ 0
+ *   2b. 最後の active (全部 load) のロード = remote-load.mjs load --apply --wait (--use-prepared を付けない・prepare をまたいだ古い書き込みの回収)
+ *       → そのロードの run_id の report の成功 + 照合 ② (照合 ① は 02:00 のロードだけ)
  *   3. node scripts/company-db/remote-load.mjs load --apply --wait --use-prepared   (prepared の持ち主で 1 回だけロード)
  *   4. node apps/company-db/publish/fetch.mjs → m_products 再構築 → fetch.mjs --verify-apply   (miniPC。prepared の世代を作り直しで入れて確かめる)
  *   5. activate  (miniPC)        : 4 の確かめが通った証拠 (今の作り直しの記録・prepare の後に読んだ世代・証跡の apply) があり、
@@ -88,7 +91,7 @@ export async function cli(argv, { env = process.env, connect = null, openSqlite 
       const p = checkPublishOwnership(ownership);
       if (p.length) { log(`❌ 用意しない: ④a で扱えない持ち主の設定 (${p.join(' / ')})`); return 1; }
       const r = await prepareOwnership(c.db, { map: ownership, actor });
-      log(`✅ prepared = ${r.prepared_hash} (active のまま)。次 = remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → --verify-apply → activate`);
+      log(`✅ prepared = ${r.prepared_hash} (active のまま)。次 = master-cutover.mjs --to frozen → 書きかけ 0 → 最後の active (全部 load) のロード (--use-prepared なし) → その run_id の report + 照合 ② → remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → --verify-apply → activate (17 §4.2)。🚨 cancel すると、その列の古い入口が再び開く`);
       return 0;
     }
     if (cmd === 'cancel') { const r = await cancelPrepared(c.db, { actor }); log(r.cancelled ? '✅ prepared を取り消した (active のまま)' : '⏭️ prepared は無い'); return 0; }

@@ -10,11 +10,11 @@
  *               空欄を埋める (coalesce) こともしない = わざと消した値が翌朝に戻らない (Codex R2)
  *
  * 🚨 ここは configured (コードに書いた「こうしたい」) だけ。これを変えてデプロイしても夜間ロード・写し・古い入口の門は変わらない
- *    (どれも Company DB の epoch = ops.master_ownership_state の active を見る。apps/company-db/load/ownership-state.mjs)。
- *    切替の日に人が readiness → prepare → frozen → 書きかけ 0 → 最後の active (全部 load) のロード (prepare をまたいだ古い書き込みの回収) →
+ *    (夜間ロード・写しは Company DB の epoch = ops.master_ownership_state の active を、古い入口の門は active ∪ prepared を見る。apps/company-db/load/ownership-state.mjs)。
+ *    切替の日に人が readiness → prepare → frozen → 書きかけ 0 → 最後の active (全部 load) のロード (prepare をまたいだ古い書き込みの回収) → そのロードの run_id の report の成功 + 照合 ② →
  *    --use-prepared のロード → 写し・確かめ → activate で active にする (AI_reference 17 §4.2 の表が正・#1610)。
  * 🆕 2026-10-05 の切替 (中原さんの決定 10/4・10 §13) で C にする 13 キー = 下の 'company'。写せない・手当ての PR が無い列 (products.parent・skus.sku_kind・
- *    sku_components・listing_components.amazon・suppliers の 4 つ) は 'load' のまま (⑦-2・④b の後)
+ *    sku_components・listing_components.amazon・suppliers の 5 つ) は 'load' のまま (⑦-2・④b の後)
  * 🚨 列を足すときは engine.mjs でその列を実際に見ているかを確かめる (ここに書いただけでは効かない)。知らないキーは起動時に落とす。
  *
  * ここに無いもの:

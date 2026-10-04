@@ -86,7 +86,7 @@ export function rejectWritesOnRender(req, res, next) {
 router.use(rejectWritesOnRender);
 router.use(requireApiKey);
 // 🚨 マスタの古い入口の門 (Company DB構想 14 §5・§10 契約 v3 H1)。config/master-legacy-entries.mjs の warehouse の入口だけを見る:
-//    切替の段階が legacy_open のときだけ今までどおり書ける。frozen 以降・段階が読めない = 410 / 503 (何も書かない)。
+//    切替の段階が legacy_open のときだけ今までどおり書ける。frozen 以降は、その入口の owner_cols のどれかの持ち主が C (active ∪ prepared) のときだけ閉じる (⑤-3b・列が全部 load の入口は開いたまま)・段階 / 持ち主が読めない = 410 / 503 (何も書かない)。
 //    画面 (/register と /) は res.locals.masterLegacy で帯を出す。multer の取込 (CSV) より前 = 閉じているときはファイルを受け取らない。
 //    CSV はファイルを受け取った後・書く前にもう一度読む (legacyRecheck。受け取っている間に段階が変わっても書かない)
 router.use(masterLegacyGate('warehouse'));

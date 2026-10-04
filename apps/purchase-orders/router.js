@@ -71,7 +71,7 @@ startFbaAutoRefresh(callWarehouse); // 平日16時 (JST) のFBA在庫自動更�
 
 const router = Router();
 // 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #7・PR #1565 R1 H4)。仕入先 (po_suppliers) を書く API (マスタ管理の仕入先タブ・宛先の CSV・一括取込) は
-//    切替の段階が legacy_open のときだけ今までどおり。frozen 以降・段階が読めない = 410 / 503 (切替の手順で書き込み先を Company DB に替えるまで仕入先は見るだけ)。
+//    切替の段階が legacy_open のときだけ今までどおり。frozen 以降は、その入口の owner_cols のどれかの持ち主が C (active ∪ prepared) のときだけ閉じる (⑤-3b・列が全部 load の入口は開いたまま)・段階 / 持ち主が読めない = 410 / 503 (切替の手順で書き込み先を Company DB に替えるまで仕入先は見るだけ)。
 //    仕入先でないマスタ (発注条件・資材・属性・先方品番) は止めない (config/master-legacy-entries.mjs の when)
 router.use(masterLegacyGate('purchase-orders'));
 

@@ -953,7 +953,7 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
 古い入口 = NE の写しにマスタを書く API・画面・手の CLI・人の操作で動く取込 (miniPC の `/apps/warehouse/register` と SKU マスタ・会計アプリ 5 つの `POST /register`・fba-profitability の原価・product-hub の税率と古い新商品の作り方 (`/new`・NE のコードから登録・NE が先の自動取込・Notion の画像の取込)・Notion の取込・profit-calculator の NE 用 CSV と仕入れ先・発注アプリの仕入先・売れ筋共有の表示名・手の取込)。
 
 - **一覧 = `config/master-legacy-entries.mjs`** (閉じる入口・閉じない口 (写し・閉じ済み・手の入口の 3 種類)・CLI の mode・書かない試しの見分け方 `dry_run`)。一覧がそのまま門の設定。id は英数字と `_.:/-` だけ (⑤-1 の manifest の形)。
-- **門 = `lib/master-legacy-gate.mjs`**。切替の段階 (`ops.master_cutover_state`・0051) を**読めて** `legacy_open` のときだけ今までどおり書ける。
+- **門 = `lib/master-legacy-gate.mjs`**。切替の段階 (`ops.master_cutover_state`・0051) を**読めて** `legacy_open` のときは今までどおり書ける (frozen 以降は下の ⑤-3b = owner_cols の持ち主が C の入口だけ閉じる)。
   - 🆕 **⑤-3b (2026-10-04・列を分けて切り替える)**: `frozen` 以降は、**その入口が書く列 (一覧の `owner_cols`) のどれかの持ち主が C の入口だけ**閉じる。列が全部 load の入口 (10/5 なら SKU タブ = Amazon SKU の対応・発注アプリの仕入先と一括取込・売れ筋共有の表示名・profit-calculator の仕入れ先・SKU マスタの取込) は開けたまま。
     - 持ち主 = **Company DB の epoch** (`ops.master_ownership_state` の **active と prepared** の C の列を合わせたもの = prepare した時点で閉じる・cancel で開く)。🚨 `config/master-ownership.mjs` (configured) は見ない (デプロイの成果物 = 場所ごとに切り替わる時刻が違う)。
     - 新商品の古い作り方 (product-hub の `/new`・NE のコードから登録・自動取込を手で回す・Notion の画像の取込・intake-cron) は `owner_match: 'all'` = 新しい登録の列 (`NEW_PRODUCT_COLS` = `NEW_ENTRY_KEYS` の単品 + セット) が**全部** C のときだけ閉じる。product-hub の `/new` の案内 (`newEntryGate`) も同じ門の答え (開いている = 今までの画面)。
@@ -1058,12 +1058,13 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
      - 読む時間: `node -r dotenv/config scripts/company-db/master-legacy-latency.mjs --host minipc` の p95 を PR に残す (つなぎ直しの p95 が 1 秒を超える = 起動の直後などは画面が 5 分前の結果か帯になる。書き込みは待つので止まらない)。
   4. マージして配った後: `node -r dotenv/config scripts/company-db/master-legacy-instance.mjs --list` で、Render と miniPC の**全部のプロセス**が「新しい」・段階 `legacy_open`・書きかけ 0・build = 配った commit。配る前の古いプロセスは全部「止めた」(何日前のプロセスでも、止めたが無ければ段階を進められない)。黙っている古いプロセスが残る = 止まったのを確かめて `--stop` (再起動の後は毎回見る)。
   5. **戻し方**: 配った後に古い入口が 503 のまま・門の記録が書けない = このマージを revert する PR → Render は自動で配り直し・miniPC は `git pull` → `Restart-Service WarehouseServer`。DB は何も変えていない (段階は legacy_open のまま・門の記録は追記だけで残っても害が無い)。🚨 **段階を frozen に進めた後は revert しない** (門の無いコードに戻る = 古い入口が開く)。
-- **切替の手順 (legacy_open → frozen → 最後の同期。⑤-1 の関数の求めに合わせる)**:
+- **切替の手順の門の条件 (legacy_open → frozen。⑤-1 の関数の求めに合わせる)**: 🚨 当日の完全な順番は epoch の節「切替の日の順番」と AI_reference 17 §4.2 の表が正 (readiness → **prepare** → frozen → 書きかけ 0 → 最後の active (全部 load) のロード → そのロードの run_id の report の成功 + 照合 ② → --use-prepared → 写し・作り直し・確かめ → activate → company_owner)。ここは frozen の証拠の条件だけ。🚨 **prepare をしないで frozen にすると、持ち主がまだ全部 load = 13 キーの入口は閉じない**。
+  0. 先に `master-ownership-epoch.mjs prepare` (段階は legacy_open のまま)。
   1. 上の 4 がそろっている (全部のプロセスが新しい記録・同じ build と一覧。今までに記録を書いて止めたプロセスは全部「止めた」)。
   2. NE の画面・GAS など機械で閉じられない入口 (manifest の `kind: manual` = `ne:item-screen`・`gas:logizard-sheet-and-sku-map`) を止め、止めた人と時刻を証拠 (`manual_entries_stopped` の `at`) に書く。🚨 `at` は**今の段階に入った後・サーバーの今以前** (先の日付・前の試みの証拠は ⑤-1 の関数が拒む = 進める日に止めて、その時刻を書く)。
   3. miniPC で手の取込 (csv-import ほか) が動いていないのを確かめ、`--list` で全部のプロセスが「新しい」かつ書きかけ 0 = 証拠の `drain` (`{ done: true, checked_by, checked_at }`。`checked_at` も今の段階に入った後・今以前) を書いて、段階を `frozen` に進める。⑤-1 の関数が確かめるもの: 全部の場所・全部のプロセスの新しい記録・build・一覧・持ち主表・**書きかけ 0 (→ frozen でも)**・黙っているプロセスが無いこと (何日前でも)・証拠。
   4. 🚨 **frozen の後の本当の drain**: `--list` で全部のプロセスに**段階 `frozen` の新しい記録**が来て、書きかけが 0 になるまで待つ (記録は要求のついでに 5 分おき。読み戻しを呼べばすぐ書く)。⑤-1 の関数は frozen → company_owner のときに「frozen に入った後の記録・書きかけ 0」を求める。CLI は書いている間は共有の鍵を持つので、段階を変える側が待つ (段階をまたいで書かない)。
-  5. そこで初めて最後の同期 (NE → Company DB) に進み、company_owner に進める。
+  5. そこで初めて最後の同期 (active = 全部 load のロード・`--use-prepared` を付けない) に進み、そのロードの run_id の report の成功 + 照合 ② → `--use-prepared` のロード → 写し・作り直し・確かめ → activate の後に company_owner に進める (epoch の節の順番)。
 - 書き込みの猶予 (legacy_open を最後に読めてから 60 秒などは書かせる) は**入れていない** (約束を変えるので中原さんが決める。案と良し悪しは PR の本文)。
 - 試験: `scripts/test-master-legacy-entries.mjs` (ルートと関数の呼び出しをたどって、一覧に無いマスタの書き込みの口を落とす) / `scripts/test-master-legacy-gate.mjs` (入口ごとに legacy_open・閉じた・読めない・途中で閉じた・切れた相手・書かない試し・CLI・画面の遅い読み・PGlite の本物の記録の関数・前の起動) / `scripts/test-master-legacy-gate-pg.mjs` (実 PostgreSQL = 門のログインのプール 1 本・毎回読む・切断・打ち切り・CLI の共有の鍵・場所ごとのログインで本物の記録・止めた・--force・配る前の確かめ・frozen に進める・読む時間。`cd C:/tmp/pg-embed && node run-conc.mjs scripts/test-master-legacy-gate-pg.mjs <リポジトリ>`)。
 
