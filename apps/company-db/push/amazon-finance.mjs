@@ -43,6 +43,7 @@
  */
 import 'dotenv/config';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { openLedger } from './ledger.mjs';
@@ -73,6 +74,7 @@ export const META = {
   unreconciled: 'unreconciled_months',     // JSON ['YYYY-MM'] = 送った集合の計上日の月 (照合がそろうまで消さない)
   diffStreak: 'reconcile_diff_streak',     // 突き合わせの差が続いた回数
   backfill: 'backfill_done',               // '1' = 全期間のバックフィルと突き合わせがそろった
+  reconcilePolicy: 'reconcile_policy',     // JSON { fingerprint, floor } = 前回そろって終わった突き合わせが見た Render の policy (起点が過去へ広がったら、新しく対象になった月を一度だけ未照合の月に戻す)
 };
 export const RENDER_PATHS = {
   post: '/order-finance',
@@ -591,6 +593,28 @@ export function policyFloorOf(rows) {
   }
   return floor;
 }
+/** policy の指紋 = coverage/status の policy.fingerprint (64 桁の hex)。無ければ policy の行 (source・period_from・period_to) を並べた JSON の SHA-256 */
+export function policyFingerprintOf(policy) {
+  const fp = policy && policy.fingerprint;
+  if (typeof fp === 'string' && /^[0-9a-f]{64}$/.test(fp)) return fp;
+  const rows = (policy && Array.isArray(policy.rows) ? policy.rows : []).map((r) => [String(r.source ?? ''), String(r.period_from ?? ''), r.period_to == null ? null : String(r.period_to)]).sort((a, b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : 1);
+  return `rows:${createHash('sha256').update(JSON.stringify(rows)).digest('hex')}`;
+}
+/**
+ * policy の起点が過去へ広がったとき、新しく対象になった月 (今回の起点〜前回の起点の前日 にかかる月) = 一度だけ未照合の月に戻す月。
+ *   prev = 台帳の META.reconcilePolicy ({ fingerprint, floor })。指紋が同じなら []。
+ *   初回 (台帳に無い・読めない) は前回の起点 = FINANCE_FLOOR (この変更の前の突き合わせが見ていた起点 = 2026-01-01) とみなす
+ *   (今の policy の起点が 2026-01-01 なら何も戻さない・それより前へ広げた後に初回が来ても戻す = 見落とさない側)。
+ *   起点が後ろへ縮んだ・期間の途中が変わった (穴・source の違い) は戻さない = それは採用されない行 (uncovered は全期間) に差として出る。
+ */
+export function widenedPolicyMonths(prev, { fingerprint, floor }, today) {
+  const ok = prev && typeof prev === 'object' && typeof prev.fingerprint === 'string' && (prev.floor === null || isRealDate(String(prev.floor)));
+  if (ok && prev.fingerprint === fingerprint) return [];
+  const prevFloor = (ok ? prev.floor : null) ?? FINANCE_FLOOR;
+  const curFloor = floor ?? FINANCE_FLOOR;
+  if (!(curFloor < prevFloor)) return [];
+  return monthsBetween(curFloor.slice(0, 7), dayBefore(prevFloor).slice(0, 7)).filter((m) => m <= today.slice(0, 7));
+}
 
 /**
  * 突き合わせる。all = 全期間 (policy の起点〜今日)。戻り値 = { ok, level: 'ok' | 'warn' | 'error', daily: [差], fees: [差], uncovered, checkedMonths, dailyDiffMonths, feeDiffMonths, streak, excluded }
@@ -601,6 +625,8 @@ export function policyFloorOf(rows) {
  *   未照合の月がまるごと起点より前なら台帳から外す (送り手は変わった注文の計上日の月を足すので、起点より前の月も入る)。
  *   起点が月の途中なら、その月の日次は起点から比べ、月の手数料 (月の合計) は比べない (Render は起点からの合計・SQLite は月の全部 = 比べられない)。
  *   (10/4 朝: 10/2 に入れた 2025/12/29〜2026/1/12 の決済の 2025-12-29〜31 の行で ⚠️ = 日 × SKU 1575・月の手数料 3・採用されない行 4394 が全部この対象外だった)
+ *   policy の指紋 (coverage/status の policy.fingerprint) を台帳 (META.reconcilePolicy) に残し、起点が過去へ広がっていたら
+ *   新しく対象になった月を一度だけ未照合の月に戻す (widenedPolicyMonths。起点より前で台帳から外した月を、広げた後の毎朝の回が比べ直す。#1614 Codex R1 Medium)
  */
 export const RECONCILE_BUDGET_MS = 480000;   // 突き合わせ全体の読み取りの締め切り (daily-sync の工程の上限 600 秒より前に、自分で理由を出して止まる)
 export async function reconcileAmazonFinance({ warehouse, ledger, dataDir, base, syncKey, fetchImpl = fetch, all = false, today = jstDate(0), log = console.log, registerPending = true, sleep = undefined, budgetMs = RECONCILE_BUDGET_MS }) {
@@ -614,7 +640,14 @@ export async function reconcileAmazonFinance({ warehouse, ledger, dataDir, base,
   const before = (m) => floor !== null && monthEnd(m) < floor;                 // 月がまるごと起点より前
   const straddles = (m) => floor !== null && `${m}-01` < floor && !before(m);  // 起点が月の途中
   const excluded = { months: new Set(), sqliteDaily: 0, sqliteFees: 0, renderUncovered: 0, renderFrom: null, renderTo: null };
-  const ledgerMonths = readJson(ledger, META.unreconciled, []);
+  // policy が過去へ広がった = 新しく対象になった月を一度だけ未照合の月に戻す (#1614 Codex R1 Medium)。
+  //   台帳に指紋を書くのは最後 (未照合の月と同じ setMeta) = 途中で止まれば次の回がまた戻す (一度だけ = そろって終わった回で 1 回)
+  const policyNow = { fingerprint: policyFingerprintOf(pol.policy), floor };
+  const prevPolicy = readJson(ledger, META.reconcilePolicy, null);
+  const widened = widenedPolicyMonths(prevPolicy, policyNow, today);
+  const prevLabel = prevPolicy && typeof prevPolicy === 'object' && 'floor' in prevPolicy ? (prevPolicy.floor ?? '無し') : `初回 = ${FINANCE_FLOOR}`;
+  if (widened.length) log(`  policy の起点が過去へ広がった (${prevLabel} → ${floor ?? '無し'}) = 新しく対象になった月 ${widened.join(', ')} を未照合の月に戻して比べる`);
+  const ledgerMonths = [...new Set([...readJson(ledger, META.unreconciled, []), ...widened])].sort();
   const unreconciled = ledgerMonths.filter((m) => /^\d{4}-\d{2}$/.test(m) && m <= today.slice(0, 7));
   const windows = [];   // [from, to, fullMonth | null]
   const monthWindow = (m) => {
@@ -687,14 +720,14 @@ export async function reconcileAmazonFinance({ warehouse, ledger, dataDir, base,
   const left = ledgerMonths.filter((m) => !(fullyChecked.has(m) && !diffMonths.has(m)) && !(/^\d{4}-\d{2}$/.test(m) && before(m)));
   const streak = anyDiff ? (Number(ledger.getMeta(META.diffStreak)) || 0) + 1 : 0;
   const saved = [...new Set([...left, ...diffMonths])].sort();
-  ledger.setMeta({ [META.unreconciled]: JSON.stringify(saved), [META.diffStreak]: String(streak) });   // 戻り値の unreconciledLeft と同じ
+  ledger.setMeta({ [META.unreconciled]: JSON.stringify(saved), [META.diffStreak]: String(streak), [META.reconcilePolicy]: JSON.stringify(policyNow) });   // 戻り値の unreconciledLeft と同じ
   const level = !anyDiff ? 'ok' : streak >= 2 ? 'error' : 'warn';
   for (const d of dailyDiff.slice(0, 20)) log(`  差 ${d.date_jst} ${d.seller_sku}: ${d.side === 'both' ? d.columns.map((c) => `${c.c} ${c.sqlite} / ${c.render}`).join(', ') : d.side === 'sqlite_only' ? 'SQLite にだけある' : 'Render にだけある'} (SQLite / Render)`);
   for (const f of fees.slice(0, 20)) log(`  月の手数料の差 ${f.month} ${f.fee_type}: SQLite ${f.sqlite ? `${f.sqlite.amount_jpy} 円・${f.sqlite.row_count} 行` : '無し'} / Render ${f.render ? `${f.render.amount_jpy} 円・${f.render.row_count} 行` : '無し'}`);
   const ex = { floor, months: [...excluded.months].sort(), sqliteDaily: excluded.sqliteDaily, sqliteFees: excluded.sqliteFees, renderUncovered: excluded.renderUncovered, renderFrom: excluded.renderFrom, renderTo: excluded.renderTo };
   const exLine = excludedLine(ex);
   if (exLine) log(`  ${exLine}`);
-  return { ok: !anyDiff, level, daily: dailyDiff, fees, uncovered, checkedMonths: months, dailyDiffMonths, feeDiffMonths, streak, unreconciledLeft: saved.length, excluded: ex };
+  return { ok: !anyDiff, level, daily: dailyDiff, fees, uncovered, checkedMonths: months, dailyDiffMonths, feeDiffMonths, streak, unreconciledLeft: saved.length, excluded: ex, policyWidened: widened };
 }
 
 /** 対象外 (policy の起点より前) の 1 行。何も無ければ '' */
@@ -710,7 +743,7 @@ export function summarizeReconcile(rr, { all = false } = {}) {
   const head = rr.level === 'ok' ? '✅' : rr.level === 'warn' ? '⚠️' : '❌';
   const scope = all ? `全期間 ${rr.checkedMonths[0] ?? '-'}〜${rr.checkedMonths[rr.checkedMonths.length - 1] ?? '-'}` : `直近 ${RECONCILE_DAYS} 日 + 未照合の月`;
   const ex = excludedLine(rr.excluded);
-  const tail = ex ? ` / ${ex}` : '';
+  const tail = (rr.policyWidened && rr.policyWidened.length ? ` / policy の起点が過去へ広がった = 新しく対象になった月 ${rr.policyWidened.join(', ')} を比べた` : '') + (ex ? ` / ${ex}` : '');
   if (rr.ok) return `${head} Company DB Amazon 財務 突き合わせ (${scope}): 日 × SKU・月の手数料とも SQLite と一致 (採用されない行 0)${tail}`;
   return `${head} Company DB Amazon 財務 突き合わせ (${scope}): 日 × SKU の差 ${rr.daily.length} (月 ${rr.dailyDiffMonths.join(', ') || '-'}) / 月の手数料の差 ${rr.fees.length} (月 ${rr.feeDiffMonths.join(', ') || '-'}) / 採用されない行 ${rr.uncovered}`
     + ` → 差の月を build のやり残しに登録した (${rr.streak} 回続けて差${rr.streak >= 2 ? ' = ❌' : ' = 1 回目は ⚠️'})${tail}`;

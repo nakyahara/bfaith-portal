@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import Database from 'better-sqlite3';
 import express from 'express';
 import { PGlite } from '@electric-sql/pglite';
@@ -976,6 +976,151 @@ await t('起点の後の policy の穴 (採用されない行の最後の日が�
   } finally { w.close(); }
   await setPolicy(`${ymOffset(-30)}-01`);   // 前の試験の policy に戻す
   L0.setMeta({ [META.unreconciled]: JSON.stringify([]), [META.diffStreak]: '0' });
+});
+// 🆕 #1614 Codex R1: policy を過去へ広げたとき・起点が月の途中・source の違い・coverage/status が読めないとき
+await t('widenedPolicyMonths / policyFingerprintOf: 指紋が同じなら戻さない・起点が過去へ広がった月だけ・初回は 2026-01-01 から・縮んだら戻さない・指紋が無ければ行から作る', async () => {
+  const { widenedPolicyMonths, policyFingerprintOf, FINANCE_FLOOR } = await import('../apps/company-db/push/amazon-finance.mjs');
+  const A = 'a'.repeat(64), B = 'b'.repeat(64), today = '2026-10-04';
+  assert.equal(FINANCE_FLOOR, '2026-01-01');
+  assert.deepEqual(widenedPolicyMonths(null, { fingerprint: A, floor: '2026-01-01' }, today), [], '初回 (明朝) = 今の起点 2026-01-01 = 何も戻さない (2025-12 は対象外のまま)');
+  assert.deepEqual(widenedPolicyMonths(null, { fingerprint: A, floor: '2025-12-29' }, today), ['2025-12'], '初回の前に広げていても戻す (見落とさない側)');
+  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-01-01' }, { fingerprint: A, floor: '2026-01-01' }, today), []);
+  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-01-01' }, { fingerprint: B, floor: '2025-12-29' }, today), ['2025-12']);
+  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-03-15' }, { fingerprint: B, floor: '2026-01-01' }, today), ['2026-01', '2026-02', '2026-03'], '前の起点が月の途中 = その月の前半も新しく対象 = 戻す');
+  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-01-01' }, { fingerprint: B, floor: '2026-03-01' }, today), [], '縮んだ = 戻さない');
+  assert.deepEqual(widenedPolicyMonths({ fingerprint: A, floor: '2026-01-01' }, { fingerprint: B, floor: '2026-01-01' }, today), [], '起点が同じで途中が変わった = 戻さない (採用されない行に出る)');
+  assert.deepEqual(widenedPolicyMonths('{', { fingerprint: B, floor: '2025-11-01' }, today), ['2025-11', '2025-12'], '読めない台帳 = 初回と同じ');
+  assert.equal(policyFingerprintOf({ fingerprint: A, rows: [] }), A);
+  const rows = [{ source: 's', period_from: '2026-01-01', period_to: null }];
+  const f1 = policyFingerprintOf({ rows }), f2 = policyFingerprintOf({ rows: [{ ...rows[0], period_from: '2025-12-29' }] });
+  assert.match(f1, /^rows:[0-9a-f]{64}$/); assert.notEqual(f1, f2); assert.equal(f1, policyFingerprintOf({ fingerprint: 'x', rows: [...rows] }));
+});
+await t('🚨 policy を過去へ広げた: 起点より前で台帳から外した月に差を入れる → 広げる前は対象外 (✅) → 広げた後の通常の回で差 (⚠️・やり残し) → 直した後は一度だけ (#1614 Codex R1 Medium)', async () => {
+  // MA の 5 日 = 直近 45 日の窓には決して入らない日 (今日が何日でも) = 通常の回が比べるのは台帳の未照合の月としてだけ
+  const day = d(MA, 5), sku = 'sku-widen-test';
+  await setPolicy(`${MB}-01`);
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([MA]), [META.diffStreak]: '0' });
+  let w = reader();
+  try {
+    const r1 = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+    assert.equal(r1.ok, true, JSON.stringify({ d: r1.daily.slice(0, 3), f: r1.fees, u: r1.uncovered }));
+    assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), [], '起点より前の MA は台帳から外れた');
+    assert.equal(JSON.parse(L0.getMeta(META.reconcilePolicy)).floor, `${MB}-01`, '見た policy を台帳に残す');
+  } finally { w.close(); }
+  // SQLite にだけある日 × SKU を MA に作る (= 本物の差)
+  const src = wdb.prepare(`select * from f_amazon_finance_sku_daily_v1 where seller_sku = 'sku-a' limit 1`).get();
+  assert.ok(src, '試験の前提: 写す行がある');
+  const cols = Object.keys(src);
+  wdb.prepare(`insert into f_amazon_finance_sku_daily_v1 (${cols.join(', ')}) values (${cols.map(() => '?').join(', ')})`).run(...cols.map((c) => c === 'date_jst' ? day : c === 'seller_sku' ? sku : src[c]));
+  try {
+    w = reader();
+    try {
+      const r2 = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+      assert.equal(r2.ok, true, '広げる前 = MA は対象外 (比べない)');
+      assert.deepEqual(r2.policyWidened, []);
+      // policy を過去へ広げる → 途中で読めない回 (日次が 503) は台帳の指紋も未照合の月も変えない = 次の回がまた戻す
+      await setPolicy(`${MA}-01`);
+      const before = { u: L0.getMeta(META.unreconciled), p: L0.getMeta(META.reconcilePolicy), s: L0.getMeta(META.diffStreak) };
+      const failing = (url, o) => String(url).includes('/order-finance/daily?') ? Promise.resolve(new Response('down', { status: 503 })) : fetch(url, o);
+      await assert.rejects(reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet, fetchImpl: failing, sleep: async () => {} }), /日次の財務が取れない/);
+      assert.deepEqual({ u: L0.getMeta(META.unreconciled), p: L0.getMeta(META.reconcilePolicy), s: L0.getMeta(META.diffStreak) }, before, '途中で止まった回は台帳を変えない');
+      const logs = [];
+      const r3 = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: (m) => logs.push(m) });
+      assert.deepEqual(r3.policyWidened, [MA], '新しく対象になった月を未照合の月に戻した');
+      assert.equal(r3.level, 'warn');
+      assert.ok(r3.daily.some((x) => x.date_jst === day && x.seller_sku === sku && x.side === 'sqlite_only'), JSON.stringify(r3.daily.slice(0, 3)));
+      assert.ok(r3.dailyDiffMonths.includes(MA));
+      assert.ok(JSON.parse(L0.getMeta(META.unreconciled)).includes(MA), '差の月は台帳に残る');
+      assert.ok(readPendingMonths(tmpDir, { file: PENDING_FILE }).months.includes(MA), '差の月をやり残しに登録');
+      assert.ok(logs.some((m) => m.includes(`新しく対象になった月 ${MA}`)), logs.join('\n'));
+      const { summarizeReconcile } = await import('../apps/company-db/push/amazon-finance.mjs');
+      assert.match(summarizeReconcile(r3), new RegExp(`^⚠️ .*新しく対象になった月 ${MA} を比べた`));
+      assert.equal(JSON.parse(L0.getMeta(META.reconcilePolicy)).floor, `${MA}-01`);
+    } finally { w.close(); }
+  } finally { wdb.prepare(`delete from f_amazon_finance_sku_daily_v1 where date_jst = ? and seller_sku = ?`).run(day, sku); }
+  // 直した後: 未照合の月 (MA) として比べて一致 → 消える。指紋は同じ = もう戻さない (一度だけ)
+  w = reader();
+  try {
+    const r4 = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+    assert.equal(r4.ok, true, JSON.stringify({ d: r4.daily.slice(0, 3), f: r4.fees, u: r4.uncovered }));
+    assert.deepEqual(r4.policyWidened, []);
+    assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), []);
+    const r5 = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+    assert.deepEqual(r5.policyWidened, [], '一度だけ = 指紋が同じ次の回は戻さない'); assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), []);
+  } finally { w.close(); }
+});
+await t('起点が月の途中: 起点の後の日次の差は差 (⚠️・やり残し)・起点より前の日次の差と月の手数料は比べない (#1614 Codex R1 Low 2)', async () => {
+  await setPolicy(d(MB, 15));
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([MB]), [META.diffStreak]: '0' });
+  wdb.prepare(`update f_amazon_finance_sku_daily_v1 set commission_jpy = commission_jpy + 1 where date_jst = ? and seller_sku = 'sku-o20'`).run(d(MB, 27));   // 起点の後
+  wdb.prepare(`update f_amazon_finance_sku_daily_v1 set commission_jpy = commission_jpy + 1 where date_jst = ? and seller_sku = 'sku-a'`).run(d(MB, 5));     // 起点より前
+  const w = reader();
+  try {
+    const rr = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+    assert.equal(rr.level, 'warn');
+    assert.deepEqual(rr.daily.map((x) => `${x.date_jst} ${x.seller_sku}`), [`${d(MB, 27)} sku-o20`], '起点の後の差だけ');
+    assert.deepEqual(rr.dailyDiffMonths, [MB]); assert.deepEqual(rr.feeDiffMonths, [], '起点が途中の月の手数料は比べない');
+    assert.ok(rr.excluded.months.includes(MB));
+    assert.ok(readPendingMonths(tmpDir, { file: PENDING_FILE }).months.includes(MB));
+    assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), [MB]);
+  } finally { w.close(); }
+  build();
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([]), [META.diffStreak]: '0' });
+});
+await t('source の違い (source_mismatch) は起点より前でも対象外にしない・no_policy で起点より前だけが対象外 (#1614 Codex R1 Low 2)', async () => {
+  const floor = `${MB}-01`;
+  await setPolicy(floor);
+  const pre = d(MA, 3);
+  const fake = (url, o) => String(url).includes('/order-finance/uncovered?') ? Promise.resolve(Response.json({ rows: [
+    { reason: 'source_mismatch', n: 3, first_date: pre, last_date: pre },
+    { reason: 'no_policy', n: 2, first_date: pre, last_date: pre },
+  ] })) : fetch(url, o);
+  const w = reader();
+  try {
+    const rr = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet, fetchImpl: fake, registerPending: false });
+    assert.equal(rr.uncovered, 3, 'source の違いは差');
+    assert.equal(rr.excluded.renderUncovered, 2, 'no_policy で起点より前だけが対象外');
+    assert.equal(rr.level, 'warn');
+  } finally { w.close(); }
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([]), [META.diffStreak]: '0' });
+});
+await t('CLI: coverage/status が 5xx・policy の無い応答・形の違う行 = ❌ exit 1・台帳 (未照合の月・続いた回数・policy の指紋)・やり残しを変えない・ほかを読まない (#1614 Codex R1 Low 1)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-af-policy-cli-'));
+  try {
+    fs.copyFileSync(path.join(tmpDir, 'warehouse.db'), path.join(dir, 'warehouse.db'));
+    const l = openLedger(dir, { kind: FINANCE_KIND });
+    l.setMeta({ [META.unreconciled]: JSON.stringify([MA, MB]), [META.diffStreak]: '1', [META.reconcilePolicy]: JSON.stringify({ fingerprint: 'c'.repeat(64), floor: '2026-01-01' }) });
+    l.close();
+    fs.writeFileSync(path.join(dir, PENDING_FILE), JSON.stringify({ months: ['2026-02'] }));
+    fs.writeFileSync(path.join(dir, ACCOUNT_FEES_PENDING_FILE), JSON.stringify({ months: ['2026-03'] }));
+    const stub = path.join(dir, 'fetch-stub.mjs'), fetchLog = path.join(dir, 'fetch.log');
+    fs.writeFileSync(stub, `import fs from 'node:fs';
+globalThis.fetch = async (url) => {
+  fs.appendFileSync(process.env.CDB_TEST_FETCH_LOG, String(url) + '\\n');
+  if (!String(url).includes('/order-finance/coverage/status?')) throw new Error('試験: policy の後は読まないはず');
+  const mode = process.env.CDB_TEST_FETCH_MODE;
+  if (mode === '500') return new Response('boom', { status: 500 });
+  if (mode === 'no-policy') return Response.json({ mall: 'amazon', coverage: null });
+  return Response.json({ policy: { fingerprint: 'd'.repeat(64), rows: [{ period_from: '2026-13-01', period_to: null, source: 's' }] } });
+};
+`);
+    const snap = () => { const x = openLedger(dir, { kind: FINANCE_KIND }); try { return { u: x.getMeta(META.unreconciled), s: x.getMeta(META.diffStreak), p: x.getMeta(META.reconcilePolicy),
+      pending: fs.readFileSync(path.join(dir, PENDING_FILE), 'utf8'), fees: fs.readFileSync(path.join(dir, ACCOUNT_FEES_PENDING_FILE), 'utf8') }; } finally { x.close(); } };
+    const before = snap();
+    for (const [mode, re] of [['500', /Render の policyが取れない: HTTP 500/], ['no-policy', /policy の応答の形が違う/], ['bad-rows', /policy の行の形が違う/]]) {
+      fs.writeFileSync(fetchLog, '');
+      const env = { ...process.env, DATA_DIR: dir, RENDER_MIRROR_URL: 'https://cdb.invalid/x', RENDER_PORTAL_URL: '', MIRROR_SYNC_KEY: 'k', CDB_GET_MAX_ATTEMPTS: '1', CDB_TEST_FETCH_MODE: mode, CDB_TEST_FETCH_LOG: fetchLog };
+      let code = 0, out = '';
+      try { out = execFileSync(process.execPath, ['--import', pathToFileURL(stub).href, 'apps/company-db/push/amazon-finance.mjs', '--reconcile'], { cwd: repoRoot, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
+      catch (e) { code = e.status; out = String(e.stdout || '') + String(e.stderr || ''); }
+      assert.equal(code, 1, `${mode}: ${out}`);
+      assert.match(out.trim().split('\n').pop(), /^❌ Company DB Amazon 財務: /, `${mode}: ${out}`);
+      assert.match(out, re, `${mode}: ${out}`);
+      const urls = fs.readFileSync(fetchLog, 'utf8').trim().split('\n');
+      assert.ok(urls.length >= 1 && urls.every((u) => u.includes('/order-finance/coverage/status?')), `${mode}: policy だけを読んだ: ${urls.join(' ')}`);
+      assert.deepEqual(snap(), before, `${mode}: 台帳・やり残しを変えない`);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 console.log('④ daily-sync の工程 (F2b-3)');
 await t('日曜 (JST の業務日) は --full・ほかは --incremental・どちらも --require-backfilled', async () => {
