@@ -158,7 +158,8 @@ await ta('[3] ロードの時の判断を使う: manual の行 (数量が同じ 
 });
 
 await ta('[4] ロードした回の持ち主・条件で比べる列を決める (company の列・0027 の無い回の列は比べない)', async () => {
-  const own = { ...(await import('../config/master-ownership.mjs')).MASTER_OWNERSHIP, 'skus.name': 'company' };
+  // 基準 = 全部 load (configured は ⑤-3b から 13 キーが company = 基準にしない)
+  const own = { ...Object.fromEntries((await import('../config/master-ownership.mjs')).OWNED_COLUMNS.map((k) => [k, 'load'])), 'skus.name': 'company' };
   assert.equal((await nightly(db, 'load_mc_4', { ownership: own })).ok, true);
   await db.query("update core.skus set name = '持ち主が company の名前' where code = 'b002'");
   let r = await compareIn(db);

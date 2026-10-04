@@ -48,7 +48,8 @@ const { applyMigrations, pgliteAdapter } = await import('./company-db/migrate.mj
 const { createRoles } = await import('./company-db/create-watch-roles.mjs');
 const { createMasterEditRoles } = await import('./company-db/create-master-edit-roles.mjs');
 const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
-const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
+// 試験の基準 = 切替前の持ち主表 (全部 load)。⑤-3b の PR から config/master-ownership.mjs (configured) は 10/5 の 13 キーが company = 基準にしない
+const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries((await import('../config/master-ownership.mjs')).OWNED_COLUMNS.map((k) => [k, 'load'])));
 const W = await import('../lib/master-write.mjs');
 const C = await import('../lib/master-cutover.mjs');
 const R = await import('../lib/master-register.mjs');
@@ -1303,6 +1304,9 @@ console.log('\nproduct-hub (新規作成の入口・ボード)');
 let phCalls = 0;
 let phMode = 'pglite';
 O.__setGateOwnership(ALL_COMPANY);   // 試験の持ち主表 (本番は config/master-ownership.mjs)
+// ⑤-3b: 古い新商品の作り方の門 (lib/master-legacy-gate.mjs・持ち主は Company DB の epoch) = 既定は「新商品の登録の列が全部 C = 閉じている」
+let oldCreation = { readable: true, writable: false };
+O.__setNewEntryLegacyGate(async () => oldCreation);
 O.__setCompanyDbClientFactory(async (url) => {
   phCalls++;
   if (phMode === 'down') throw new Error('connect ECONNREFUSED');
@@ -1339,6 +1343,15 @@ await ta('[P2] MASTER_EDIT_OPEN = 1: 段階 new_open = 案内だけ (新商品�
   r = await call('GET', '/apps/product-hub/new');
   assert.match(r.text, /いまは新商品の登録を止めています/); assert.ok(!/id="create-btn"/.test(r.text));
   phMode = 'pglite';
+  // ⑤-3b: new_open でも、新商品の登録の列にまだ load がある (古い作り方の門が開いている・10/5 の 13 キー) = 今までの画面
+  oldCreation = { readable: true, writable: true };
+  r = await call('GET', '/apps/product-hub/new');
+  assert.match(r.text, /id="create-btn"/); assert.ok(!r.text.includes('/apps/master-edit/new?kind=single'));
+  // 古い作り方の門を読めない (持ち主を読めない) = 止めている
+  oldCreation = { readable: false, writable: false, error: 'x' };
+  r = await call('GET', '/apps/product-hub/new');
+  assert.match(r.text, /いまは新商品の登録を止めています/);
+  oldCreation = { readable: true, writable: false };
 });
 
 await ta('[P3] ボードを開く = 取り込み待ちの知らせからカードを作る (MASTER_EDIT_OPEN = 1)・要確認の札・Company DB に届かなくてもボードは出る', async () => {

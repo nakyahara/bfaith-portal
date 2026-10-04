@@ -191,6 +191,10 @@ for (const e of LEGACY_EXEMPT) {
     ok(useAt >= 0 && (firstWrite < 0 || useAt < firstWrite), `閉じ済み ${e.id}: router.use(${e.guard}) が全部の書き込みのルートより前`);
   } else if (e.kind === 'manual') {
     ok(!e.file && !e.method && !e.path, `手の入口 ${e.id}: コードを持たない (切替の証拠 manual_entries_stopped に載せる)`);
+  } else if (e.kind === 'company_db_outbox') {
+    // ⑤-3b のマージで見つけた: ボードを開いたときの新しい登録の知らせの取り込み = 新しい道。MASTER_EDIT_OPEN = 1 の Render だけ (guard が書き手にある)
+    const src = text.get(e.writer_file) || '';
+    ok(e.method === 'GET' && src.includes(e.guard), `新しい道の口 ${e.id}: ${e.writer_file} は ${e.guard} のときだけ取り込む`);
   } else if (e.kind === 'seed_on_read') {
     const src = text.get(e.writer_file) || '';
     ok(e.method === 'GET' && src.includes(e.guard) && src.includes('existsSync('), `初期データだけの口 ${e.id}: ${e.writer_file} は無いときだけ ${e.guard} を書く`);

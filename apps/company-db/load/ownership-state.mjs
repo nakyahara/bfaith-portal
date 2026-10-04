@@ -62,6 +62,26 @@ export async function readOwnershipState(db) {
 }
 
 /**
+ * 古い入口の門 (lib/master-legacy-gate.mjs・⑤-3b) が使う「持ち主が C の列」= active と prepared の C の列を合わせたもの。
+ *   🚨 prepared も数える: prepare (切替の日) から activate までの間に、古い入口から入れた値は --use-prepared のロード・写しの材料に入らず、
+ *      activate の後の夜間ロードは C の列の既にある行を上書きしない = 黙って消える。prepare した時点で閉じる (cancel で開く)
+ *   🚨 読めない (表が無い = 0055 の前・権限が無い・記録が壊れている) = { readable: false } = 門は閉じる側 (fail-closed)。行が無い = 全部 load (誰も prepare していない)
+ *   config (configured) は見ない (デプロイの成果物 = 場所ごとに切り替わる時刻が違う。契約 v3 H1)
+ * @returns {{ readable: boolean, company: string[]|null, active_hash: string|null, prepared_hash: string|null, state: string|null, error: string|null }}
+ */
+export async function readGateOwnership(db) {
+  try {
+    const st = await readOwnershipState(db);
+    if (st.state === 'no_table') return { readable: false, company: null, active_hash: null, prepared_hash: null, state: st.state, error: '持ち主の epoch の表 (ops.master_ownership_state・0055) が無い' };
+    const company = new Set(Object.keys(st.active.map).filter((k) => st.active.map[k] === 'company'));
+    if (st.prepared) for (const k of Object.keys(st.prepared.map)) if (st.prepared.map[k] === 'company') company.add(k);
+    return { readable: true, company: [...company].sort(), active_hash: st.active.hash, prepared_hash: st.prepared ? st.prepared.hash : null, state: st.state, error: null };
+  } catch (e) {
+    return { readable: false, company: null, active_hash: null, prepared_hash: null, state: null, error: `持ち主を読めない: ${String((e && e.message) || e).slice(0, 300)}` };
+  }
+}
+
+/**
  * 夜間ロードが使う持ち主。既定 = active (行が無い = 全部 load)。usePrepared = 切替の日に明示して頼んだロードだけ (prepared が無ければ投げる)
  * @returns {{ ownership: object, epoch: 'active'|'prepared'|'default', hash: string, state: string }}
  */

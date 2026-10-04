@@ -9,7 +9,11 @@
  *   'company' = Company DB が正。夜間ロードは **既にある行を上書きしない** (新しく見つかった行にだけ最初の値を入れる)。
  *               空欄を埋める (coalesce) こともしない = わざと消した値が翌朝に戻らない (Codex R2)
  *
- * 🚨 切替日 (10 §8。人の入力を一斉にポータルへ移す日) までは **全部 'load'** のまま。切替日に対象の列をまとめて 'company' にする。
+ * 🚨 ここは configured (コードに書いた「こうしたい」) だけ。これを変えてデプロイしても夜間ロード・写し・古い入口の門は変わらない
+ *    (どれも Company DB の epoch = ops.master_ownership_state の active を見る。apps/company-db/load/ownership-state.mjs)。
+ *    切替の日に人が master-ownership-epoch.mjs prepare → --use-prepared のロード → 写し → activate で active にする (17 の手順)。
+ * 🆕 2026-10-05 の切替 (中原さんの決定 10/4・10 §13) で C にする 13 キー = 下の 'company'。写せない・手当ての PR が無い列 (products.parent・skus.sku_kind・
+ *    sku_components・listing_components.amazon・suppliers の 4 つ) は 'load' のまま (⑦-2・④b の後)
  * 🚨 列を足すときは engine.mjs でその列を実際に見ているかを確かめる (ここに書いただけでは効かない)。知らないキーは起動時に落とす。
  *
  * ここに無いもの:
@@ -37,18 +41,18 @@ export const OWNED_COLUMNS = Object.freeze([
 
 export const MASTER_OWNERSHIP = Object.freeze({
   // 単品の商品 (core.products)
-  'products.name': 'load',
-  'products.sales_class': 'load',
-  'products.status': 'load',          // 単品の取扱中 / 中止。バリエーションの名札の状態 (子から決める) もこれに従う
+  'products.name': 'company',
+  'products.sales_class': 'company',
+  'products.status': 'company',          // 単品の取扱中 / 中止。バリエーションの名札の状態 (子から決める) もこれに従う
   'products.parent': 'load',          // 代表関係 (親子 = 色違い・サイズ違いの名札)。'company' なら夜間ロードは名札を作らず、親を付けない・変えない・外さない (D3)
   // SKU (core.skus)
-  'skus.name': 'load',
+  'skus.name': 'company',
   'skus.sku_kind': 'load',
-  'skus.tax_rate': 'load',
-  'skus.tax_class': 'load',
-  'skus.handling': 'load',
+  'skus.tax_rate': 'company',
+  'skus.tax_class': 'company',
+  'skus.handling': 'company',
   // 行ごと
-  'sku_costs': 'load',                // 原価 (有効期間の付け替え)。'company' なら夜間ロードは原価の行を作らない・閉じない
+  'sku_costs': 'company',                // 原価 (有効期間の付け替え)。'company' なら夜間ロードは原価の行を作らない・閉じない
   'sku_components': 'load',           // セット構成。'company' なら夜間ロードは構成を足さない・直さない・消さない (manual は今も守られる)
   'listing_components.amazon': 'load',// Amazon SKU ↔ NE コード (FBA のマップ。D-43)。'company' なら SKU マスタ・Sheet の構成は材料にしない (FBM の完全一致は対応の無い出品にだけ続ける・
                                       //   出品そのもの・ASIN・FNSKU は続ける)。対応 (core.amazon_sku_maps・0054) がある出品は持ち主によらず触らない (16 §7 M10・⑦-1)
@@ -57,13 +61,13 @@ export const MASTER_OWNERSHIP = Object.freeze({
   'suppliers.order_method': 'load',
   'suppliers.lead_time_days': 'load',
   // 0027 (②c-2) で足した列
-  'skus.standard_price': 'load',      // 標準売価 (standard_price_jpy)
-  'skus.shipping': 'load',            // 自社の計算用の送料 (shipping_code / shipping_method / shipping_cost_jpy をまとめて)
-  'skus.reorder_months': 'load',      // 推奨保有月数。商品管理リストの公開 snapshot が使えない日は 'load' でも触らない
+  'skus.standard_price': 'company',      // 標準売価 (standard_price_jpy)
+  'skus.shipping': 'company',            // 自社の計算用の送料 (shipping_code / shipping_method / shipping_cost_jpy をまとめて)
+  'skus.reorder_months': 'company',      // 推奨保有月数。商品管理リストの公開 snapshot が使えない日は 'load' でも触らない
   'suppliers.contacts': 'load',       // 連絡先 6 列 (email_to / email_cc / contact_name / fax_number / relay_to / order_memo をまとめて)
-  'supplier_skus.is_primary': 'load', // 代表の仕入先 (NE の商品の仕入先コード)。コードが空の商品は触らない
+  'supplier_skus.is_primary': 'company', // 代表の仕入先 (NE の商品の仕入先コード)。コードが空の商品は触らない
   // 0053 (⑤-2b) で足した列
-  'external_ids.jan': 'load',         // 商品の JAN。'company' なら夜間ロードは商品の JAN を足さない・外さない (JAN の観測と解決の記録は続ける)
+  'external_ids.jan': 'company',         // 商品の JAN。'company' なら夜間ロードは商品の JAN を足さない・外さない (JAN の観測と解決の記録は続ける)
 });
 
 /** 知らないキー・知らない値を落とす (typo で「守ったつもり」を作らない) */

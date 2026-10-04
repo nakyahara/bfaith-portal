@@ -1694,6 +1694,26 @@ export const REGISTER_WRITE_SELECTORS = Object.freeze([
   '[data-act="edit-sku-master"]', '#m-sku-master-new-btn', '#sku-modal-submit', '#sku-modal-comps button', '#csv-card',
 ]);
 export const DASHBOARD_WRITE_SELECTORS = Object.freeze(['[data-action^="reg-"]', '[data-action^="update-"]', '[data-action="delete"]']);
+/** ⑤-3b: データウェアハウスの画面の書く部品を列ごとに (送料 / 原価)。合わせると DASHBOARD_WRITE_SELECTORS と同じ */
+export const DASHBOARD_WRITE_PARTS = Object.freeze([
+  { cols: ['skus.shipping'], selectors: ['[data-action="reg-shipping"]', '[data-action="update-shipping"]', '[data-action="delete"][data-type="shipping"]'] },
+  { cols: ['sku_costs'], selectors: ['[data-action="reg-genka"]', '[data-action="update-genka"]', '[data-action="delete"][data-type="genka"]'] },
+].map((p) => Object.freeze({ ...p, cols: Object.freeze(p.cols), selectors: Object.freeze(p.selectors) })));
+/**
+ * ⑤-3b: /register の書く部品を列ごとに分ける (その列の持ち主が C になった部品だけ隠す)。
+ *   SKU タブ (Amazon SKU ↔ NE コードの対応 = listing_components.amazon) と、それ以外 (送料・原価・売上分類・税率・推奨保有月数) を分ける。
+ *   合わせると REGISTER_WRITE_SELECTORS と同じ部品 (試験が確かめる)。CSV のカードは、全部の種類を閉じたときだけ丸ごと隠す (match 'all')
+ */
+export const REGISTER_WRITE_PARTS = Object.freeze([
+  { cols: ['skus.shipping'], selectors: ['[data-act="reg-ship"]', '[data-act="update-ship"]', '[data-act="del"][data-type="shipping"]', '#csv-tab-shipping'] },
+  { cols: ['sku_costs'], selectors: ['[data-act="reg-genka"]', '[data-act="update-genka"]', '[data-act="del"][data-type="genka"]', '#csv-tab-genka'] },
+  { cols: ['products.sales_class'], selectors: ['[data-act="reg-class"]', '[data-act="update-class"]', '[data-act="del"][data-type="sales_class"]', '#csv-tab-salesclass'] },
+  { cols: ['skus.tax_rate', 'skus.tax_class'], selectors: ['[data-act="reg-tax"]', '[data-act="update-tax"]', '[data-act="del"][data-type="tax_rate"]', '#csv-tab-taxrate'] },
+  { cols: ['skus.reorder_months'], selectors: ['[data-act="reg-reorder"]', '[data-act="update-reorder"]', '[data-act="del"][data-type="reorder_setting"]', '#csv-tab-reorder'] },
+  { cols: ['listing_components.amazon'], selectors: ['[data-act="reg-sku"]', '[data-act="reg-sku-multi"]', '[data-act="add-sku-row"]', '[data-act="remove-sku-row"]', '[data-act="edit-sku-master"]',
+    '[data-act="del"][data-type="m-sku-master"]', '#m-sku-master-new-btn', '#sku-modal-submit', '#sku-modal-comps button', '#csv-tab-msku'] },
+  { cols: ['skus.shipping', 'sku_costs', 'products.sales_class', 'skus.tax_rate', 'skus.tax_class', 'skus.reorder_months', 'listing_components.amazon'], match: 'all', selectors: ['#csv-card'] },
+].map((p) => Object.freeze({ ...p, cols: Object.freeze(p.cols), selectors: Object.freeze(p.selectors) })));
 
 function renderRegisterPage(shippingRates, session = {}, legacy = null) {
   const ratesJson = jsonForScriptTag(shippingRates);
@@ -1769,7 +1789,7 @@ function renderRegisterPage(shippingRates, session = {}, legacy = null) {
 </head>
 <body>
   ${renderOnRenderNotice()}
-  ${legacyBannerHtml(legacy, { hideSelectors: REGISTER_WRITE_SELECTORS })}
+  ${legacyBannerHtml(legacy, { parts: REGISTER_WRITE_PARTS })}
   <div class="header">
     <h1>マスタ登録</h1>
     <div class="spacer"></div>
@@ -2514,6 +2534,13 @@ function renderRegisterPage(shippingRates, session = {}, legacy = null) {
       document.getElementById('csv-result').textContent = '';
     }
     switchCsvType('shipping', document.getElementById('csv-tab-shipping'));
+    // 切替で送料の CSV を閉じたとき (⑤-3b・帯の CSS で隠した) は、見えている最初の種類を選ぶ (隠した種類を選んだまま取り込ませない)
+    (function () {
+      var t = document.getElementById('csv-tab-shipping');
+      if (!t || getComputedStyle(t).display !== 'none') return;
+      var v = Array.prototype.find.call(document.querySelectorAll('#csv-card .tabs button'), function (b) { return getComputedStyle(b).display !== 'none'; });
+      if (v) v.click();
+    })();
 
     function downloadMissing() {
       window.location.href = B + '/api/missing/download?type=' + curType;
@@ -2634,7 +2661,7 @@ function renderDashboard(stats, legacy = null) {
 </head>
 <body>
   ${renderOnRenderNotice()}
-  ${legacyBannerHtml(legacy, { hideSelectors: DASHBOARD_WRITE_SELECTORS })}
+  ${legacyBannerHtml(legacy, { parts: DASHBOARD_WRITE_PARTS })}
   <div class="header">
     <h1>Data Warehouse</h1>
     <nav>

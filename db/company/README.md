@@ -853,7 +853,11 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
 
 - **一覧 = `config/master-legacy-entries.mjs`** (閉じる入口・閉じない口 (写し・閉じ済み・手の入口の 3 種類)・CLI の mode・書かない試しの見分け方 `dry_run`)。一覧がそのまま門の設定。id は英数字と `_.:/-` だけ (⑤-1 の manifest の形)。
 - **門 = `lib/master-legacy-gate.mjs`**。切替の段階 (`ops.master_cutover_state`・0051) を**読めて** `legacy_open` のときだけ今までどおり書ける。
-  - `frozen` 以降は、持ち主表 (`config/master-ownership.mjs`) がまだ `load` でも閉じる (持ち主の切替より先に古い入口を閉じる順番のため)。
+  - 🆕 **⑤-3b (2026-10-04・列を分けて切り替える)**: `frozen` 以降は、**その入口が書く列 (一覧の `owner_cols`) のどれかの持ち主が C の入口だけ**閉じる。列が全部 load の入口 (10/5 なら SKU タブ = Amazon SKU の対応・発注アプリの仕入先と一括取込・売れ筋共有の表示名・profit-calculator の仕入れ先・SKU マスタの取込) は開けたまま。
+    - 持ち主 = **Company DB の epoch** (`ops.master_ownership_state` の **active と prepared** の C の列を合わせたもの = prepare した時点で閉じる・cancel で開く)。🚨 `config/master-ownership.mjs` (configured) は見ない (デプロイの成果物 = 場所ごとに切り替わる時刻が違う)。
+    - 新商品の古い作り方 (product-hub の `/new`・NE のコードから登録・自動取込を手で回す・Notion の画像の取込・intake-cron) は `owner_match: 'all'` = 新しい登録の列 (`NEW_PRODUCT_COLS` = `NEW_ENTRY_KEYS` の単品 + セット) が**全部** C のときだけ閉じる。product-hub の `/new` の案内 (`newEntryGate`) も同じ門の答え (開いている = 今までの画面)。
+    - 🚨 段階が legacy_open 以外で**持ち主を読めない** (0055 の表が無い・門のログインに `ops.master_ownership_state` の select が無い・記録が壊れた) = **全部の入口を閉じる** (503 `{error:'master_owner_unreadable'}`・CLI は終了コード 3)。門のログインの権限は `create-master-edit-roles.mjs` を 0055 の後に流し直すと付く。legacy_open の間は持ち主を読まない (切替の前の動きは ⑤-3 と同じ)。
+    - 画面は閉じた列の部品だけ隠す (`legacyBannerHtml(info, { parts })`。/register = `REGISTER_WRITE_PARTS`・データウェアハウスの画面 = `DASHBOARD_WRITE_PARTS`)。
   - API = 410 `{error:'master_frozen', message, url}`。段階が読めない = 503 `{error:'master_phase_unreadable'}` (閉じる側)。何も書かない。画面は `message` を出す (`master_frozen` の文字は出さない)。
   - 書かない試し (NE のコードから登録・自動取込を手で回す・Notion の画像の取込・Notion の状態から取込 の dry run) は、段階を読めないときだけ注意つきで通す (応答の見出し `X-Master-Legacy-Warning: phase_unreadable`)。閉じた後は 410 のまま。
   - 門で待っている間に相手が切れた (画面を閉じた) = 書かない (書きかけにも数えない)。
@@ -864,7 +868,7 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
     - 楽天の登録: 段階を読めない = 止める (切替前の瞬断で Company DB の税率に黙って切り替えない)・閉じた後に Company DB の税率を決められない = 止める。プレビュー (送らない) は、段階を読めないとき今の税率で見せて注意を添える。
     - AI の生成の材料 (`/generation-queue`・claim) は、切替前だけ `yahoo.tax_rate` を渡す (閉じた後・段階を読めない = null)。
     - セットを作る: 段階を読めない = 503 (作らない)・読めて閉じている = 作るが親の税率は写さない・legacy_open = 今までどおり。
-  - 発注アプリは仕入先 (`kind = suppliers` の追加・削除・CSV・宛先の CSV) と一括取込 (`POST /api/import` = 中に仕入先があるので**丸ごと**) を閉じる = 切替の手順で書き込み先を Company DB に替えるまで仕入先は見るだけ。発注条件・資材・先方品番の画面は止めない。
+  - 発注アプリは仕入先 (`kind = suppliers` の追加・削除・CSV・宛先の CSV) と一括取込 (`POST /api/import` = 中に仕入先があるので**丸ごと**) を、仕入先の列 (`suppliers.*`) が C になったら閉じる (⑤-3b。10/5 は load = 開いたまま) = 切替の手順で書き込み先を Company DB に替えるまで仕入先は見るだけ。発注条件・資材・先方品番の画面は止めない。
   - CLI = mode が分かったらすぐ (引数・ファイルの検査より前・DB を開く前) に終了コード 3。書く間は段階の**共有の鍵** (`pg_advisory_lock_shared(hashtext('ops.master_cutover'))`) を持ち、鍵を取ってから段階を読み直す = 段階を変える側 (排他の鍵) は CLI が書き終わるまで待つ・変えている最中に始めた CLI は待ってから読む。csv-import.js は `product_shipping`・`exception_genka` だけ閉じる (受注・ロジザード・NE の写し・送料の表は止めない)。CLI が書くのは miniPC の warehouse.db だけ = ⑤-1 の夜間ロードの鍵 (`core.master_write_lock_key`) は取らない。
   - 定期実行: product-hub の NE が先の自動取込 (intake-cron) は丸ごと止める (閉じている = ok の ping で「止めた」・読めない = fail の ping)。
 - **段階の読み方**:

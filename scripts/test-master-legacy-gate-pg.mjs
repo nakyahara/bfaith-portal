@@ -24,6 +24,8 @@
  *  16 配り直し (古いプロセスの普通の記録が書いている途中に SIGTERM・新しいプロセスが起動): 古いプロセスは途中の記録を待ってから「止めた」を 1 回。
  *     門のログインの接続は 古い 1 本 + 新しい 1 本 = 2 本まで。古いプロセスの最後の記録は stopped (Codex #1565 R2 Medium 3)
  *  17 場所ごとの門のログインが無く COMPANY_DB_URL だけ = 段階は読める (古い入口は動く) が、門の記録は書けず readiness が落ちる (Codex #1565 R4 Low の 3 つの場合の 2)
+ *  18 ⑤-3b: 門のログイン (master_gate_minipc) で列ごとの持ち主 (0055 の ops.master_ownership_state) も読める (ロールの作りが権限を付ける)。
+ *     frozen で行が無い = 全部 load = 列の入口は開く / active・prepared の C の列の入口だけ閉じる / 権限を外す = 読めない = 全部閉じる (CLI も)
  * ロールは ⑤-1 の本物の作り (scripts/company-db/create-master-edit-roles.mjs) だけで作る (試験で足さない)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-legacy-gate-pg.mjs
  *   (cd C:/tmp/pg-embed && node run-conc.mjs scripts/test-master-legacy-gate-pg.mjs C:/tmp/sor53-work)
@@ -74,6 +76,13 @@ try {
   process.env.COMPANY_DB_WATCH_URL = urlFor(u.toString(), 'watcher', 'w-pw');   // --stop の確かめ (見るだけ) に使う。門の段階の読みには使わない
   process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = gateUrl('minipc');
   G.__setLegacyPhaseReader(null);   // 本物の読み方 (プール)
+  // ⑤-3b: 段階が legacy_open 以外では列ごとの持ち主も読む。[1]〜[17] は持ち主が全部 C の場合 (= ⑤-3 と同じ「全部閉じる」)。列を分けた場合は [18]
+  const { OWNED_COLUMNS: OWN_COLS } = await import('../config/master-ownership.mjs');
+  const { ownershipHash: ownHash } = await import('../lib/master-cutover.mjs');
+  const ALL_C_MAP = Object.fromEntries(OWN_COLS.map((k) => [k, 'company']));
+  const setAllC = () => M.query(`insert into ops.master_ownership_state (id, active_hash, active_map, activated_by) values (1, $1, $2::jsonb, 'test')
+    on conflict (id) do update set active_hash = excluded.active_hash, active_map = excluded.active_map, prepared_hash = null, prepared_map = null, prepared_at = null, prepared_by = null`, [ownHash(ALL_C_MAP), JSON.stringify(ALL_C_MAP)]);
+  await setAllC();
 
   await ta('[1] 門のログイン (master_gate_minipc) と本物の読み方 (プール) で段階を読める。watcher の env があっても使わない。legacy_open = 書ける', async () => {
     const s = await G.checkLegacyGate();
@@ -374,6 +383,57 @@ try {
       if (saved.gate === undefined) delete process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL; else process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = saved.gate;
       if (saved.owner === undefined) delete process.env.COMPANY_DB_URL; else process.env.COMPANY_DB_URL = saved.owner;
       G.__resetLegacyAck();
+    }
+  });
+  await ta('[18] ⑤-3b: 門のログインで列ごとの持ち主 (active と prepared) を読み、C の列の入口だけ閉じる・権限が無い = 読めない = 全部閉じる (CLI も)', async () => {
+    const { OWNED_COLUMNS } = await import('../config/master-ownership.mjs');
+    const { ownershipHash } = await import('../lib/master-cutover.mjs');
+    const mapOf = (cols) => Object.fromEntries(OWNED_COLUMNS.map((k) => [k, cols.includes(k) ? 'company' : 'load']));
+    const saved = process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL;
+    process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = gateUrl('minipc');
+    G.__setLegacyPhaseReader(null);
+    await G.closeLegacyGatePool();
+    try {
+      await M.query('delete from ops.master_ownership_state');
+      await setPhase('frozen');
+      let s = await G.checkLegacyGate();
+      assert.deepEqual([s.phase, s.owner && s.owner.readable, s.owner && s.owner.company], ['frozen', true, []], JSON.stringify(s.owner));
+      assert.equal((await G.checkLegacyGate({ entry: 'warehouse:POST:/api/shipping' })).writable, true, '全部 load = 送料は開く');
+      // prepare した (prepared = 送料 C) = 閉じる・Amazon SKU は開く
+      const a = mapOf([]), pm = mapOf(['skus.shipping']);
+      await M.query(`insert into ops.master_ownership_state (id, active_hash, active_map, activated_by, prepared_hash, prepared_map, prepared_at, prepared_by)
+        values (1, $1, $2::jsonb, 'test', $3, $4::jsonb, now(), 'test')`, [ownershipHash(a), JSON.stringify(a), ownershipHash(pm), JSON.stringify(pm)]);
+      s = await G.checkLegacyGate({ entry: 'warehouse:POST:/api/shipping' });
+      assert.deepEqual([s.writable, s.closed_cols], [false, ['skus.shipping']]);
+      assert.equal((await G.checkLegacyGate({ entry: 'warehouse:POST:/api/m-sku-master' })).writable, true);
+      // CLI (専用の接続・段階の共有の鍵の中) も同じ: 送料の CSV = 書かない / SKU マスタの取込 = 書く
+      const savedCode = process.exitCode;
+      let ran = false;
+      const r1 = await quiet(() => G.runWithLegacyCliLock('cli:csv-import.js:product_shipping', async () => { ran = true; }, { log: () => {} }));
+      assert.deepEqual([r1.ran, ran], [false, false]);
+      const r2 = await G.runWithLegacyCliLock('cli:import-sku-master.js', async () => 'wrote', { log: () => {} });
+      assert.deepEqual([r2.ran, r2.result], [true, 'wrote']);
+      process.exitCode = savedCode;
+      // 権限を外す = 持ち主を読めない = Amazon SKU も閉じる (503 の理由)
+      await M.query('revoke select on ops.master_ownership_state from master_gate');
+      s = await quiet(() => G.checkLegacyGate({ entry: 'warehouse:POST:/api/m-sku-master' }));
+      assert.deepEqual([s.writable, s.readable, s.owner_unreadable], [false, false, true], s.error);
+      assert.match(s.error, /permission denied|権限/);
+      const r3 = await quiet(() => G.runWithLegacyCliLock('cli:import-sku-master.js', async () => 'wrote', { log: () => {} }));
+      assert.equal(r3.ran, false);
+      process.exitCode = savedCode;
+      // legacy_open = 持ち主を読まない = 権限が無くても開く (切替の前の動きは変わらない)
+      await setPhase('legacy_open');
+      assert.equal((await G.checkLegacyGate({ entry: 'warehouse:POST:/api/shipping' })).writable, true);
+      // ロールの作りを流し直せば付く (流し直しでパスワードは変えない)
+      await createMasterEditRoles(M);
+      await setPhase('frozen');
+      assert.equal((await G.checkLegacyGate({ entry: 'warehouse:POST:/api/m-sku-master' })).owner.readable, true);
+    } finally {
+      await setAllC();
+      await setPhase('legacy_open');
+      await G.closeLegacyGatePool();
+      if (saved === undefined) delete process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL; else process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = saved;
     }
   });
 } finally {

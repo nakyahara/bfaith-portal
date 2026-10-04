@@ -42,7 +42,9 @@ import crypto from 'node:crypto';
 import { openPgClient, pgAdapter, applyMigrations } from './company-db/migrate.mjs';
 import { createMasterEditRoles } from './company-db/create-master-edit-roles.mjs';
 import { runInitialLoad } from '../apps/company-db/load/engine.mjs';
-import { MASTER_OWNERSHIP } from '../config/master-ownership.mjs';
+import { OWNED_COLUMNS as OWNED_COLUMNS_FOR_BASE } from '../config/master-ownership.mjs';
+// 試験の基準 = 切替前の持ち主表 (全部 load)。⑤-3b の PR から config/master-ownership.mjs (configured) は 10/5 の 13 キーが company = 基準にしない
+const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries(OWNED_COLUMNS_FOR_BASE.map((k) => [k, 'load'])));
 
 const url = process.env.TEST_PG_URL || '';
 if (!url) { console.log('⏭️ TEST_PG_URL が無い (実 PostgreSQL の同時実行の試験は飛ばす。PGlite の試験は scripts/test-master-edit.mjs)'); process.exit(0); }

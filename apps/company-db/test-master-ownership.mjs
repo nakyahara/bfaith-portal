@@ -42,7 +42,9 @@ function makePlan() {
     supplierSkus: [{ supplierCode: '0001', skuCode: 'own001', vendorCode: 'AMC-001', stockUnitsPerOrderUnit: 12 }],
   };
 }
-const with_ = (over) => ({ ...MASTER_OWNERSHIP, ...over });
+/** 全部 load の持ち主表 (試験の基準)。🚨 configured (config/master-ownership.mjs) は 10/5 の切替で 13 キーが company = 基準にしない (夜間ロードは epoch を読む) */
+const ALL_LOAD = Object.freeze(Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'load'])));
+const with_ = (over) => ({ ...ALL_LOAD, ...over });
 
 const pg = new PGlite();
 const db = pgliteAdapter(pg);
@@ -56,8 +58,9 @@ const setComps = async () => (await q("select c.qty from core.sku_components c j
 const amzComps = async () => (await q("select lc.qty, lc.resolution from core.listing_components lc join core.listings l on l.listing_id = lc.listing_id where l.mall = 'amazon' and l.listing_code = 'pr_own001'")).map((r) => [Number(r.qty), r.resolution]);
 const supplier = async () => (await q("select name, order_method, lead_time_days from core.suppliers where code = '0001'"))[0];
 
-await ta('[1] 既定 (全部 load): SQLite の値で作る。report.company_owned は空', async () => {
-  assert.deepEqual(companyOwned(MASTER_OWNERSHIP), []);
+await ta('[1] 既定 (epoch の行が無い = 全部 load): SQLite の値で作る。report.company_owned は空。configured (13 キーが company) を書き換えただけでは変わらない', async () => {
+  // ⑤-3b の PR: configured は 10/5 の 13 キーが company。夜間ロードは epoch (0055 の active。行が無い = 全部 load) を読む = マージしても結果は変わらない
+  assert.equal(companyOwned(MASTER_OWNERSHIP).length, 13);
   const r = await run(makePlan(), 'own_1');
   assert.deepEqual(r.company_owned, []);
   assert.deepEqual(await sku('own001'), { name: 'NE の名前 1', tax_rate: 0.1, tax_class: 'STANDARD_10', handling: 'active', pname: 'NE の名前 1', sales_class: 3, status: 'active' });
@@ -90,13 +93,13 @@ await db.query("insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_s
 await db.query("update core.sku_components set qty = 5 where parent_sku_id = (select sku_id from core.skus where code = 'set001')");
 await db.query("update core.listing_components set qty = 3 where listing_id = (select listing_id from core.listings where listing_code = 'pr_own001')");
 
-const ALL_COMPANY = with_(Object.fromEntries(Object.keys(MASTER_OWNERSHIP).map((k) => [k, 'company'])));
+const ALL_COMPANY = with_(Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'company'])));
 
 await ta('[2][4] 全部 company: 人が直した名前・税率・取扱・分類・状態・仕入先・原価・セット構成・Amazon の構成が夜間ロードで戻らない', async () => {
   const plan = makePlan();
   plan.skus.push({ code: 'own003', name: 'NE の新商品', kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: 4, cost: { jpy: 300, source: 'ne', status: 'COMPLETE' } });
   const r = await run(plan, 'own_3', ALL_COMPANY);
-  assert.equal(r.company_owned.length, Object.keys(MASTER_OWNERSHIP).length);
+  assert.equal(r.company_owned.length, OWNED_COLUMNS.length);
   assert.deepEqual(await sku('own001'), { name: '人が直した名前', tax_rate: 0.08, tax_class: 'REDUCED_8', handling: 'discontinued', pname: '人が直した商品名', sales_class: 1, status: 'discontinued' });
   assert.deepEqual(await supplier(), { name: 'アメージングクラフト', order_method: null, lead_time_days: 7 });   // 空欄にした発注方法も埋め戻さない
   assert.deepEqual(await activeCost('own001'), { jpy: 999, cost_source: 'manual' });
@@ -153,7 +156,7 @@ await ta('[5] 仕入先の列を全部 company にしても (do nothing)、suppl
 await ta('[7] 知らないキー・知らない値・書き漏れは OWNERSHIP_INVALID で落とす (ロードも始めない)', async () => {
   assert.throws(() => validateOwnership(with_({ 'skus.nmae': 'company' })), (e) => e.code === 'OWNERSHIP_INVALID' && /知らない列: skus\.nmae/.test(e.message));
   assert.throws(() => validateOwnership(with_({ 'skus.name': 'Company' })), (e) => e.code === 'OWNERSHIP_INVALID' && /持ち主が不正/.test(e.message));
-  const missing = { ...MASTER_OWNERSHIP }; delete missing['sku_costs'];
+  const missing = { ...ALL_LOAD }; delete missing['sku_costs'];
   assert.throws(() => validateOwnership(missing), (e) => e.code === 'OWNERSHIP_INVALID' && /書かれていない列: sku_costs/.test(e.message));
   const before = (await q('select count(*)::int as n from ops.ingest_runs'))[0].n;
   await assert.rejects(runInitialLoad(db, makePlan(), { log: quiet, runId: 'own_bad', ownership: with_({ 'skus.name': 'nobody' }) }), (e) => e.code === 'OWNERSHIP_INVALID');
@@ -162,10 +165,10 @@ await ta('[7] 知らないキー・知らない値・書き漏れは OWNERSHIP_I
 
 await ta('[7] 設定ファイルそのものの typo も落とす: 正しいキーの一覧は設定とは別 (OWNED_COLUMNS) に持つ', async () => {
   // 設定に typo のキーを足し、本物のキーは load のまま = 「守ったつもり」の形 (Codex PR #1440 R1 Medium)
-  const typoConfig = { ...MASTER_OWNERSHIP, 'products.nmae': 'company' };
+  const typoConfig = { ...ALL_LOAD, 'products.nmae': 'company' };
   assert.throws(() => validateOwnership(typoConfig), (e) => e.code === 'OWNERSHIP_INVALID' && /知らない列: products\.nmae/.test(e.message));
   // 本物のキーを typo に置き換えた形 (書き漏れと知らない列の両方で落ちる)
-  const renamed = { ...MASTER_OWNERSHIP }; delete renamed['products.name']; renamed['products.nmae'] = 'company';
+  const renamed = { ...ALL_LOAD }; delete renamed['products.name']; renamed['products.nmae'] = 'company';
   assert.throws(() => validateOwnership(renamed), (e) => /知らない列: products\.nmae/.test(e.message) && /書かれていない列: products\.name/.test(e.message));
   // 一覧と設定のキーが同じ
   assert.deepEqual([...OWNED_COLUMNS].sort(), Object.keys(MASTER_OWNERSHIP).sort());

@@ -3723,7 +3723,7 @@ serviceApiRouter.post('/ad-kw-ai/jobs/:id/release', (req, res) => {
  */
 async function dropLegacyTaxUnlessOpen(drafts) {
   let g;
-  try { g = await checkLegacyGate({ purpose: 'screen' }); } catch { g = { readable: false, writable: false }; }
+  try { g = await checkLegacyGate({ purpose: 'screen', cols: ['skus.tax_rate'] }); } catch { g = { readable: false, writable: false }; }   // 税率の列の持ち主で決める (⑤-3b)
   if (g.readable === true && g.writable === true) return drafts;
   for (const d of drafts) if (d && d.yahoo) d.yahoo = { ...d.yahoo, tax_rate: null };
   return drafts;

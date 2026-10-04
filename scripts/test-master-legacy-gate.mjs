@@ -9,6 +9,9 @@
  *      画面は帯。miniPC の /register (全部の API)・CSV を受け取っている間に閉じた・会計アプリ 5 つ・fba-profitability・profit-calculator・
  *      product-hub (税率・Notion の取込・古い新商品の作り方・自動取込・代表コードの税率・出品を止める)・発注アプリの仕入先・売れ筋共有の表示名
  *   D. CLI (子プロセス): 閉じた mode は引数・ファイルの検査より前に終了コード 3 / 書く直前に閉じたら書かない / 止めない 5 つの mode は動く / 読めない = 3
+ *   E. ⑤-3b 列ごと: 10/5 の 13 キーだけ C = C の列の入口だけ 410 (SKU タブ・仕入先・product-hub の新商品の作成と自動取込は動く) /
+ *      全部 load = 今までどおり (全部開く) / 持ち主を読めない = 全部 503 (legacy_open は持ち主を読まずに開く) / product-hub の /new の出し方 / CLI
+ *   (A〜D の「閉じた」は持ち主が全部 C の場合 = ⑤-3 と同じ)
  *
  * 使い方: node scripts/test-master-legacy-gate.mjs (一時の DATA_DIR・PGlite・127.0.0.1 の偽のサーバーだけ。本番の DB・API にはつながない)
  */
@@ -41,7 +44,14 @@ async function t(name, fn) {
   catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; }
 }
 const CLOSED = ['frozen', 'company_owner', 'new_open'];
-const phaseReader = (phase) => async () => (phase === 'unreadable' ? { readable: false, phase: null, error: '試験: 読めない' } : { readable: true, phase });
+const { OWNED_COLUMNS } = await import('../config/master-ownership.mjs');
+/**
+ * ⑤-3b: 段階が legacy_open 以外のときは持ち主 (C の列) も読む。試験の既定 = 全部の列が C (⑤-3 の「全部閉じる」と同じ場合)。
+ * 列を分けた場合 (10/5 の 13 キー)・持ち主を読めない場合は E 節で見る
+ */
+const OWNER_ALL_C = Object.freeze({ readable: true, company: [...OWNED_COLUMNS] });
+const withOwner = (phase, owner = OWNER_ALL_C) => (phase === 'legacy_open' ? { readable: true, phase } : { readable: true, phase, owner });
+const phaseReader = (phase) => async () => (phase === 'unreadable' ? { readable: false, phase: null, error: '試験: 読めない' } : withOwner(phase));
 const setPhase = (phase) => G.__setLegacyPhaseReader(phaseReader(phase));
 const quiet = async (fn) => { const w = console.warn, l = console.log, e = console.error; console.warn = console.log = console.error = () => {}; try { return await fn(); } finally { console.warn = w; console.log = l; console.error = e; } };
 
@@ -67,7 +77,7 @@ await t('読めない・知らない段階・例外 = 書けない', async () =>
 });
 await t('🚨 R1 H1: 直前に legacy_open を読めても、次に読めなければすぐ閉じる (前に読めた値で通さない)', async () => {
   let mode = 'legacy_open';
-  G.__setLegacyPhaseReader(async () => (mode === 'down' ? { readable: false, phase: null, error: 'down' } : { readable: true, phase: mode }));
+  G.__setLegacyPhaseReader(async () => (mode === 'down' ? { readable: false, phase: null, error: 'down' } : withOwner(mode)));
   assert.equal((await G.checkLegacyGate()).writable, true);
   mode = 'down';
   const s = await quiet(() => G.checkLegacyGate());
@@ -145,7 +155,7 @@ await t('一覧: app ごとの入口・知らない app の門は起動時に落
   assert.throws(() => G.masterLegacyGate('no-such-app'));
   assert.equal(E.cliEntry('apps/warehouse/csv-import.js', 'product_shipping').id, 'cli:csv-import.js:product_shipping');
   assert.equal(E.cliEntry('apps/warehouse/csv-import.js', 'orders'), null);
-  assert.ok(E.LEGACY_EXEMPT.every((e) => ['replication', 'already_closed', 'manual', 'seed_on_read'].includes(e.kind)));
+  assert.ok(E.LEGACY_EXEMPT.every((e) => ['replication', 'already_closed', 'manual', 'seed_on_read', 'company_db_outbox'].includes(e.kind)));
 });
 await t('CLI の門: legacy_open = 通す / 閉じた・読めない = 理由を出して終了コード 3 (process.exit は呼ばない)', async () => {
   const logs = [];
@@ -251,7 +261,7 @@ await t('中間レビュー 2 回目 M-A: 画面の読みが 1 秒で返らな�
   let now = Date.now();
   G.__setLegacyClock(() => now);
   let calls = 0, delay = 1300, phase = 'legacy_open', down = false;
-  G.__setLegacyPhaseReader(async () => { calls++; if (delay) await wait(delay); return down ? { readable: false, phase: null, error: 'down' } : { readable: true, phase }; });
+  G.__setLegacyPhaseReader(async () => { calls++; if (delay) await wait(delay); return down ? { readable: false, phase: null, error: 'down' } : withOwner(phase); });
   try {
     // (1) 前の結果が無い = その画面だけ読めない扱い。遅れて返った結果は使い回しに入る (次の画面は読み直さずに帯なし)
     let s = await quiet(() => G.checkLegacyGate({ purpose: 'screen' }));
@@ -714,29 +724,81 @@ await pg.query('set role deploy');
 const cdb = pgliteAdapter(pg);
 await applyMigrations(cdb, { log: () => {} });
 await createRoles(pg, { watcherPw: 'a', writerPw: 'b' });
-/** 試験だけ: 段階を直接変える (段階を進める関数の門 = 記録と証拠は ⑤-1 の試験が見る。ここは古い入口の門の側だけを見る) */
+const ALL_LOAD_MAP = Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'load']));
+const mapOf = (cols) => ({ ...ALL_LOAD_MAP, ...Object.fromEntries(cols.map((k) => [k, 'company'])) });
+/** 試験だけ: 持ち主の epoch (0055) を直接置く (prepare / activate の証拠は ④a の試験が見る。ここは門の側だけ) */
+async function setEpoch(activeCols, preparedCols = null) {
+  const a = mapOf(activeCols), pm = preparedCols ? mapOf(preparedCols) : null;
+  await pg.query(`insert into ops.master_ownership_state (id, active_hash, active_map, activated_by) values (1, $1, $2::jsonb, 'test')
+    on conflict (id) do update set active_hash = excluded.active_hash, active_map = excluded.active_map, prepared_hash = null, prepared_map = null, prepared_at = null, prepared_by = null`, [ownershipHash(a), JSON.stringify(a)]);
+  if (pm) await pg.query(`update ops.master_ownership_state set prepared_hash = $1, prepared_map = $2::jsonb, prepared_at = now(), prepared_by = 'test' where id = 1`, [ownershipHash(pm), JSON.stringify(pm)]);
+  return ownershipHash(a);
+}
+/** 試験だけ: 段階を直接変える (段階を進める関数の門 = 記録と証拠は ⑤-1 の試験が見る。ここは古い入口の門の側だけを見る)。
+ *  company_owner / new_open は 0055 の守り = 段階の持ち主表 = active (C の列がある) = 先に setEpoch */
 async function forcePhase(phase) {
+  let owner = null;
+  if (['company_owner', 'new_open'].includes(phase)) owner = (await pg.query('select active_hash from ops.master_ownership_state where id = 1')).rows[0]?.active_hash ?? null;
   await pg.query(`select set_config('ops.cutover_protocol', '1', false)`);
-  await pg.query(`update ops.master_cutover_state set phase = $1, owner_hash = $2 where id = 1`, [phase, ['company_owner', 'new_open'].includes(phase) ? 'a'.repeat(64) : null]);
+  await pg.query(`update ops.master_cutover_state set phase = $1, owner_hash = $2 where id = 1`, [phase, owner]);
   await pg.query(`select set_config('ops.cutover_protocol', '', false)`);
 }
-await t('Company DB の段階が frozen 以降になると門が閉じる (持ち主表はまだ全部 load のまま)', async () => {
-  const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
-  assert.ok(Object.values(MASTER_OWNERSHIP).every((v) => v === 'load'));
-  G.__setLegacyPhaseReader(() => readCutoverPhase(cdb));
+// 段階を直接変える試験なので、⑤-2a の前提 (既存の SKU の登録の状態の backfill = 0052 の trigger) は外す (⑤-2a の試験が見る)。
+// 0055 の守り (段階の持ち主表 = active) は残す = setEpoch で本物の形にそろえる
+await pg.query('alter table ops.master_cutover_state disable trigger trg_master_cutover_state_prereq');
+const readReal = () => G.readPhaseAndOwner(cdb);
+const SHIP = { owner_cols: ['skus.shipping'] }, AMZ = { owner_cols: ['listing_components.amazon'] };
+await t('Company DB (0055) の持ち主で決める: 行が無い (全部 load) の frozen = 列の入口は開いたまま / C の列の入口だけ閉じる / prepared の C も閉じる / 表を読めない = 閉じる', async () => {
+  G.__setLegacyPhaseReader(readReal);
   assert.equal((await G.checkLegacyGate()).writable, true, 'legacy_open');
+  assert.equal((await G.checkLegacyGate()).owner, null, 'legacy_open では持ち主を読まない');
+  await forcePhase('frozen');
+  let s = await G.checkLegacyGate();
+  assert.deepEqual([s.phase, s.writable, s.owner.readable, s.owner.company], ['frozen', false, true, []], '段階だけの答えは閉じる・持ち主は全部 load');
+  assert.equal(G.legacyStateFor(s, SHIP.owner_cols).writable, true, '全部 load = 送料の入口は開く');
+  // prepare した (prepared に送料が C) = 閉じる (activate の前でも)
+  await setEpoch([], ['skus.shipping']);
+  s = await G.checkLegacyGate();
+  assert.deepEqual(s.owner.company, ['skus.shipping']);
+  assert.equal(G.legacyStateFor(s, SHIP.owner_cols).writable, false, 'prepared の C = 閉じる');
+  assert.equal(G.legacyStateFor(s, AMZ.owner_cols).writable, true, 'Amazon SKU は load = 開く');
+  // activate の後 (active に C)
+  await setEpoch(['skus.shipping', 'sku_costs']);
   for (const to of CLOSED) {
     await forcePhase(to);
-    const s = await G.checkLegacyGate();
-    assert.equal(s.phase, to); assert.equal(s.writable, false, to);
+    s = await G.checkLegacyGate();
+    assert.equal(s.phase, to);
+    assert.equal(G.legacyStateFor(s, SHIP.owner_cols).writable, false, `${to} 送料`);
+    assert.equal(G.legacyStateFor(s, AMZ.owner_cols).writable, true, `${to} Amazon SKU`);
   }
+  // 壊れた記録 (ハッシュが中身と違う) = 持ち主を読めない = 閉じる (fail-closed)
+  await pg.query(`update ops.master_ownership_state set active_map = active_map || '{"skus.name":"company"}'::jsonb where id = 1`);
+  s = await quiet(() => G.checkLegacyGate());
+  assert.equal(s.owner.readable, false); assert.match(s.owner.error, /ハッシュ/);
+  const amz = G.legacyStateFor(s, AMZ.owner_cols);
+  assert.deepEqual([amz.writable, amz.readable, amz.owner_unreadable], [false, false, true], '壊れた = Amazon SKU も閉じる');
+  assert.equal(G.refusal(amz, { id: 'x' })[0], 503);
+  await setEpoch(['skus.shipping', 'sku_costs']);
 });
 await t('miniPC の読み方 = 見張りの照会用ロール watcher で段階を読める (新しい秘密・権限を足さない)', async () => {
   await pg.query('set role watcher');
   try {
-    const s = await readCutoverPhase(cdb);
+    const s = await G.readPhaseAndOwner(cdb);
     assert.equal(s.readable, true, s.error); assert.equal(s.phase, 'new_open');
+    assert.equal(s.owner.readable, true, s.owner.error); assert.deepEqual(s.owner.company, ['sku_costs', 'skus.shipping'], 'watcher で持ち主も読める');
   } finally { await pg.query('set role deploy'); }
+});
+await t('⑤-3b: 0055 の表が無い DB (段階は frozen) = 持ち主を読めない = 全部の入口を閉じる (503)', async () => {
+  const pg3 = new PGlite();
+  await pg3.exec(`create schema ops; create table ops.master_cutover_state (id int primary key, phase text, owner_hash text, changed_at timestamptz default now(), changed_by text);
+    insert into ops.master_cutover_state values (1, 'frozen', null, now(), 'x')`);
+  G.__setLegacyPhaseReader(() => G.readPhaseAndOwner(pgliteAdapter(pg3)));
+  const s = await quiet(() => G.checkLegacyGate());
+  assert.deepEqual([s.readable, s.phase, s.owner.readable], [true, 'frozen', false]);
+  assert.match(s.owner.error, /0055/);
+  const amz = G.legacyStateFor(s, AMZ.owner_cols);
+  assert.deepEqual([amz.writable, amz.owner_unreadable], [false, true]);
+  await pg3.close();
 });
 await t('表が無い (0051 の前の DB) = 読めない = 閉じる', async () => {
   const pg2 = new PGlite();
@@ -769,7 +831,7 @@ await t('門の記録を ⑤-1 の本物の関数 (ops.record_legacy_gate_ack) �
   // 1 回目に読んだ段階は古い (legacy_open)・DB はもう frozen = 関数が stale_phase で拒む → 読み直して frozen で書く
   await forcePhase('frozen');
   let n = 0;
-  G.__setLegacyPhaseReader(async () => (n++ === 0 ? { readable: true, phase: 'legacy_open' } : readCutoverPhase(cdb)));
+  G.__setLegacyPhaseReader(async () => (n++ === 0 ? { readable: true, phase: 'legacy_open' } : readReal()));
   const r2 = await quiet(() => G.ackLegacyGates({ host: 'minipc', connect: loginAs('master_gate_minipc'), env }));
   assert.equal(r2.state, 'acked', r2.detail);
   assert.equal((await cdb.query('select phase_seen from ops.master_legacy_gate_acks where ack_id = $1', [r2.ack_id])).rows[0].phase_seen, 'frozen');
@@ -891,7 +953,7 @@ for (const phase of [...CLOSED, 'unreadable']) {
 await t('🚨 R1 H3: CSV を受け取っている間に frozen になった = 書く直前にもう一度読んで 410・何も書かない・受け取ったファイルも消す', async () => {
   for (const id of whRoutes.filter((e) => e.recheck).map((e) => e.id)) {
     let n = 0;
-    G.__setLegacyPhaseReader(async () => ({ readable: true, phase: n++ === 0 ? 'legacy_open' : 'frozen' }));   // 1 回目 (門) は legacy_open・2 回目 (書く直前) は frozen
+    G.__setLegacyPhaseReader(async () => withOwner(n++ === 0 ? 'legacy_open' : 'frozen'));   // 1 回目 (門) は legacy_open・2 回目 (書く直前) は frozen
     const before = whSnap();
     const files0 = uploadsNow();
     const r = await quiet(() => whReq(id));
@@ -933,7 +995,7 @@ await t('miniPC /register: 一覧に無い要求 (読むだけの GET) は段階
 await t('miniPC の画面 (/register と /): 閉じたら帯と書く部品を隠す・legacy_open は今までどおり (帯なし)', async () => {
   setPhase('frozen'); G.__resetLegacyGate();
   let r = await call('GET', '/apps/warehouse/register');
-  assert.ok(r.text.includes('マスタは新しい画面で直します ↗') && r.text.includes('#csv-card') && r.text.includes('[data-act^="reg-"]') && r.text.includes('id="csv-card"'));
+  assert.ok(r.text.includes('マスタは新しい画面で直します ↗') && /#csv-card{display:none/.test(r.text) && r.text.includes('[data-act="reg-ship"]') && r.text.includes('[data-act="reg-sku-multi"]') && r.text.includes('id="csv-card"'));
   r = await call('GET', '/apps/warehouse/');
   assert.ok(r.text.includes('マスタは新しい画面で直します ↗') && r.text.includes('[data-action="delete"]'));
   setPhase('legacy_open'); G.__resetLegacyGate();
@@ -1294,6 +1356,228 @@ await t('売れ筋共有: 仕入先の表示名は閉じたら 410 / 読めな�
   assert.equal((await call('POST', '/apps/supplier-sales/api/supplier-name', { code: '0888', name: '切替前' })).status, 200);
   assert.equal(shown(), '切替前');
 });
+// ═══ E. ⑤-3b 列ごと (10/5 の 13 キーだけ C) ═══
+console.log('── E. ⑤-3b 列ごと (HTTP) ──');
+const { MASTER_OWNERSHIP, companyOwned } = await import('../config/master-ownership.mjs');
+/** 10/5 に C にする 13 キー (中原さんの決定 10/4・10 §13) */
+const CUT13 = ['products.name', 'skus.name', 'products.status', 'skus.handling', 'skus.tax_rate', 'skus.tax_class', 'products.sales_class', 'skus.standard_price',
+  'skus.shipping', 'skus.reorder_months', 'sku_costs', 'supplier_skus.is_primary', 'external_ids.jan'];
+const setOwnerPhase = (phase, company) => G.__setLegacyPhaseReader(async () => (phase === 'legacy_open' && company !== 'unreadable' ? { readable: true, phase }
+  : { readable: true, phase, owner: company === 'unreadable' ? { readable: false, error: '試験: 持ち主を読めない' } : { readable: true, company } }));
+const closedBy13 = (e) => (e.owner_match === 'all' ? e.owner_cols.every((k) => CUT13.includes(k)) : e.owner_cols.some((k) => CUT13.includes(k)));
+
+await t('E0: configured (config/master-ownership.mjs) = 13 キーだけ C・④a の写しが扱える組 (一緒に切り替える組・写せない列が無い)', async () => {
+  assert.deepEqual(companyOwned(MASTER_OWNERSHIP).sort(), [...CUT13].sort());
+  const { checkPublishOwnership } = await import('../apps/warehouse/master-publish.js');
+  assert.deepEqual(checkPublishOwnership(MASTER_OWNERSHIP), []);
+  for (const k of ['products.parent', 'skus.sku_kind', 'sku_components', 'listing_components.amazon', 'suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days', 'suppliers.contacts']) {
+    assert.equal(MASTER_OWNERSHIP[k], 'load', k);
+  }
+});
+await t('E1: 一覧の全部の入口 × 持ち主 = 全部 load は全部開く / 全部 C は全部閉じる / 13 キーは C の列の入口だけ閉じる (SKU タブ・仕入先・新商品の作り方は開く)', async () => {
+  const st = (company) => ({ writable: false, readable: true, phase: 'frozen', owner: { readable: true, company } });
+  for (const e of E.LEGACY_ENTRIES) {
+    assert.equal(G.legacyStateFor(st([]), e.owner_cols, e.owner_match).writable, true, `全部 load: ${e.id}`);
+    assert.equal(G.legacyStateFor(st([...OWNED_COLUMNS]), e.owner_cols, e.owner_match).writable, false, `全部 C: ${e.id}`);
+  }
+  const open13 = E.LEGACY_ENTRIES.filter((e) => G.legacyStateFor(st(CUT13), e.owner_cols, e.owner_match).writable).map((e) => e.id).sort();
+  assert.deepEqual(open13, [
+    'cli:import-sku-master.js',
+    'job:product-hub:intake-cron',
+    'product-hub:POST:/api/drafts', 'product-hub:POST:/api/intake/run', 'product-hub:POST:/api/notion-image-import', 'product-hub:POST:/api/register-codes',
+    'product-hub:screen:/new',
+    'profit-calculator:DELETE:/api/suppliers', 'profit-calculator:POST:/api/suppliers',
+    'profit-calculator:screen:/', 'profit-calculator:screen:/research', 'profit-calculator:screen:/suppliers',
+    'purchase-orders:DELETE:/api/masters/:kind/:id:suppliers', 'purchase-orders:POST:/api/email/recipients/csv', 'purchase-orders:POST:/api/import',
+    'purchase-orders:POST:/api/masters/:kind/csv:suppliers', 'purchase-orders:POST:/api/masters/:kind:suppliers',
+    'supplier-sales:POST:/api/supplier-name',
+    'warehouse:DELETE:/api/m-sku-master/:sku', 'warehouse:POST:/api/csv/m-sku-master', 'warehouse:POST:/api/m-sku-master', 'warehouse:PUT:/api/m-sku-master/:sku',
+  ].sort());
+  // 新商品の作り方 (owner_match 'all') = 新しい登録の列 (NEW_ENTRY_KEYS の単品 + セット) と同じ列
+  const { NEW_ENTRY_KEYS } = await import('../lib/master-register.mjs');
+  assert.deepEqual([...E.NEW_PRODUCT_COLS].sort(), [...new Set([...NEW_ENTRY_KEYS.single, ...NEW_ENTRY_KEYS.set])].sort());
+  // 列が分からない (owner_cols が空) = 段階で閉じる / 持ち主を読めない = 閉じる (503)
+  assert.equal(G.legacyStateFor(st([]), []).writable, false);
+  const u = G.legacyStateFor({ writable: false, readable: true, phase: 'frozen', owner: { readable: false, error: 'x' } }, ['listing_components.amazon']);
+  assert.deepEqual([u.writable, u.readable, u.owner_unreadable], [false, false, true]);
+  assert.deepEqual(G.refusal(u, { id: 'x' }).map((v, i) => (i === 0 ? v : v.error)), [503, 'master_owner_unreadable']);
+  // legacy_open は持ち主を見ない (読めなくても開く)
+  assert.equal(G.legacyStateFor({ writable: true, readable: true, phase: 'legacy_open', owner: null }, ['skus.shipping']).writable, true);
+});
+for (const phase of CLOSED) {
+  await t(`E2: ${phase} × 13 キー C = miniPC /register の C の列の API は 410 (何も書かない)・SKU タブ (Amazon SKU の対応) の API と CSV は書ける`, async () => {
+    setOwnerPhase(phase, CUT13);
+    await quiet(async () => {
+      let opened = 0;
+      for (const e of whRoutes) {
+        const before = whSnap();
+        const r = await whReq(e.id);
+        if (closedBy13(e)) {
+          assert.equal(r.status, 410, `${e.id}: ${r.status} ${r.text.slice(0, 200)}`);
+          assert.equal(r.json.error, 'master_frozen');
+          assert.ok(r.json.closed_cols.length > 0 && r.json.closed_cols.every((k) => CUT13.includes(k)), `${e.id} closed_cols`);
+          assert.equal(whSnap(), before, `${e.id} が書いた`);
+        } else {
+          opened++;
+          assert.ok(r.status < 300 && !isGateRefusal(r), `${e.id} は開いているはず: ${r.status} ${r.text.slice(0, 200)}`);
+        }
+      }
+      assert.equal(opened, 4, 'SKU タブの API 3 つ + SKU マスタの CSV');
+    });
+    assert.ok(whdb.prepare("SELECT 1 FROM m_sku_master WHERE seller_sku = 'sku-csv'").get(), 'SKU マスタの CSV が入った');
+    assert.equal(whdb.prepare("SELECT count(*) AS c FROM m_sku_master WHERE seller_sku = 'sku-x'").get().c, 0, '登録 → 直す → 消すが通った');
+    assert.equal(G.legacyInflight().count, 0);
+  });
+}
+await t('E3: 13 キー C の /register の画面 = 帯を出し、送料・原価・売上分類・税率・推奨保有月数の部品だけ隠す (SKU タブ・CSV のカード・SKU マスタの CSV は見せる)', async () => {
+  setOwnerPhase('frozen', CUT13); G.__resetLegacyGate();
+  const r = await call('GET', '/apps/warehouse/register');
+  const css = (r.text.match(/<style>([^<]*)\{display:none !important\}<\/style>/) || [])[1] || '';
+  assert.ok(r.text.includes('マスタは新しい画面で直します ↗') && r.text.includes('ほかの項目は今までどおり'), '一部だけ閉じた帯');
+  for (const sel of ['[data-act="reg-ship"]', '[data-act="update-genka"]', '[data-act="del"][data-type="sales_class"]', '[data-act="reg-tax"]', '[data-act="update-reorder"]', '#csv-tab-shipping', '#csv-tab-genka', '#csv-tab-salesclass', '#csv-tab-taxrate', '#csv-tab-reorder']) {
+    assert.ok(css.split(',').includes(sel), `隠す: ${sel}`);
+  }
+  for (const sel of ['[data-act="reg-sku-multi"]', '[data-act="edit-sku-master"]', '#m-sku-master-new-btn', '#sku-modal-submit', '#csv-tab-msku', '#csv-card', '[data-act="del"][data-type="m-sku-master"]']) {
+    assert.ok(!css.split(',').includes(sel), `隠さない: ${sel}`);
+  }
+  // 部品を合わせると今までの「全部隠す」と同じ書く部品 (ページの data-act は全部どこかの部品にある)
+  const acts = new Set([...r.text.matchAll(/data-act="([a-z-]+)"/g)].map((m) => m[1]).filter((a) => a !== 'show-sku-detail'));
+  const allSel = whMod.REGISTER_WRITE_PARTS.flatMap((x) => x.selectors).join(' ');
+  for (const a of acts) assert.ok(allSel.includes(`[data-act="${a}"]`), `部品に無い書くボタン: ${a}`);
+  // 全部の列が C = CSV のカードも丸ごと隠す
+  setOwnerPhase('frozen', [...OWNED_COLUMNS]); G.__resetLegacyGate();
+  assert.ok(/#csv-card\{display:none/.test((await call('GET', '/apps/warehouse/register')).text));
+  // データウェアハウスの画面 (/) も列ごと: 原価だけ C = 原価の部品だけ隠す
+  setOwnerPhase('frozen', ['sku_costs']); G.__resetLegacyGate();
+  const dcss = ((await call('GET', '/apps/warehouse/')).text.match(/<style>([^<]*)\{display:none !important\}<\/style>/) || [])[1] || '';
+  assert.ok(dcss.split(',').includes('[data-action="update-genka"]') && !dcss.includes('shipping'), dcss);
+  // 全部 load (段階は frozen) = 帯なし
+  setOwnerPhase('frozen', []); G.__resetLegacyGate();
+  assert.ok(!(await call('GET', '/apps/warehouse/register')).text.includes('master-legacy-banner'));
+  assert.ok(!(await call('GET', '/apps/warehouse/')).text.includes('master-legacy-banner'));
+  setPhase('legacy_open'); G.__resetLegacyGate();
+});
+await t('E4: 13 キー C の Render の入口 = 会計アプリ・fba-profitability・NE 用 CSV・product-hub の税率・Notion の取込は 410 / 発注アプリの仕入先・売れ筋共有の表示名・profit-calculator の仕入れ先は書ける', async () => {
+  const { getDB: poDB } = await import('../apps/purchase-orders/db.js');
+  for (const phase of CLOSED) {
+    setOwnerPhase(phase, CUT13);
+    await quiet(async () => {
+      for (const a of ACC) assert.equal((await call('POST', `/apps/${a}-accounting/register`, { items: [{ code: 'mp-1', taxRate: 8, segment: 1 }] })).status, 410, a);
+      assert.equal((await call('POST', '/apps/fba-profitability/api/update-cost', { sku: 'mp-1', cost: 999 })).status, 410);
+      assert.equal((await call('GET', '/apps/profit-calculator/api/products/csv/ne?type=single')).status, 410);
+      assert.equal((await call('POST', `/apps/product-hub/api/drafts/${draftId}`, { tax_rate: '8%' })).status, 410);
+      assert.equal((await call('POST', '/apps/product-hub/api/notion-import', { codes: 'mp-1' })).status, 410);
+      // 開いたまま
+      const code = `07${CLOSED.indexOf(phase)}9`;
+      let r = await call('POST', '/apps/purchase-orders/api/masters/suppliers', { supplier_code: code, name: `13 キーの後の仕入先 ${phase}` });
+      assert.ok(r.status < 300 && !isGateRefusal(r), `発注アプリの仕入先: ${r.status} ${r.text.slice(0, 160)}`);
+      const row = poDB().prepare('SELECT supplier_code FROM po_suppliers WHERE name = ?').get(`13 キーの後の仕入先 ${phase}`);
+      assert.ok(row, '仕入先が入った');
+      r = await call('DELETE', `/apps/purchase-orders/api/masters/suppliers/${encodeURIComponent(row.supplier_code)}`);
+      assert.ok(!isGateRefusal(r), `仕入先の削除: ${r.status}`);
+      r = await call('POST', '/apps/purchase-orders/api/import', undefined, { files: [['suppliers.csv', 'x\n']] });
+      assert.ok(!isGateRefusal(r), `一括取込: ${r.status} ${r.text.slice(0, 160)}`);
+      r = await call('POST', '/apps/purchase-orders/api/masters/suppliers/csv', undefined, { csv: 'supplier_code,name\n0778,x\n' });
+      assert.ok(!isGateRefusal(r), `仕入先の CSV: ${r.status}`);
+      assert.equal((await call('POST', '/apps/supplier-sales/api/supplier-name', { code: '0889', name: `13 キーの後 ${phase}` })).status, 200);
+      assert.equal((await call('POST', '/apps/profit-calculator/api/suppliers', { code: '7778', name: '13 キーの後' })).status, 200);
+      assert.equal((await call('DELETE', '/apps/profit-calculator/api/suppliers', { code: '7778' })).status, 200);
+    });
+  }
+  // 画面: 会計アプリは帯 / profit-calculator の仕入れ先の画面は帯なし・NE 用 CSV の画面は帯
+  setOwnerPhase('frozen', CUT13); G.__resetLegacyGate();
+  assert.ok((await call('GET', '/apps/aupay-accounting/')).text.includes('#registerBtn,.reg-sel{display:none !important}'));
+  assert.ok(!(await call('GET', '/apps/profit-calculator/suppliers')).text.includes('master-legacy-banner'));
+  assert.ok((await call('GET', '/apps/profit-calculator/products')).text.includes('master-legacy-banner'));
+  setPhase('legacy_open'); G.__resetLegacyGate();
+});
+await t('E5: 13 キー C の product-hub = 新商品の作成 (POST /api/drafts・NE のコードから・自動取込) は動く・/new は今までの画面 (帯なし)・税率は Company DB', async () => {
+  const { runProductHubIntake } = await import('../apps/product-hub/intake-cron.js');
+  for (const phase of CLOSED) {
+    setOwnerPhase(phase, CUT13); G.__resetLegacyGate();
+    const r = await quiet(() => call('POST', '/apps/product-hub/api/drafts', { ne_code: `new-13-${phase}`, name: `13 キーの後の新商品 ${phase}` }));
+    assert.ok(!isGateRefusal(r), `POST /api/drafts: ${r.status} ${r.text.slice(0, 160)}`);
+    const r2 = await quiet(() => call('POST', '/apps/product-hub/api/register-codes', { codes: `new-13-${phase}`, dry_run: true }));
+    assert.ok(!isGateRefusal(r2), `register-codes: ${r2.status}`);
+    let seen = 'not-run';
+    const sync = async () => { seen = G.legacyInflight().by_entry['job:product-hub:intake-cron']; return { ok: true, mode: 'intake', created: 0, merged: 0, drafts: [] }; };
+    await quiet(() => runProductHubIntake({ sync }));
+    assert.equal(seen, 1, `${phase}: 自動取込が動いた`);
+    const page = await call('GET', '/apps/product-hub/new');
+    assert.ok(!page.text.includes('master-legacy-banner') && page.text.includes('id="create-btn"'), '今までの新規作成の画面');
+  }
+  // 税率は C = 詳細画面は Company DB の税率 (手入力の欄なし)・楽天の出品の税率も Company DB
+  __setCdbTaxReader(cdbRates({ 'ph-rep-a': 0.08, 'ph-rep-b': 0.08 }));
+  setOwnerPhase('frozen', CUT13); G.__resetLegacyGate();
+  const d = await call('GET', `/apps/product-hub/detail/${repDraftId}`);
+  assert.ok(!d.text.includes('id="y-tax"') && /id="y-tax-cdb" value="8%"/.test(d.text));
+  const { resolveListingTax } = await import('../apps/product-hub/services/listing-tax.mjs');
+  assert.equal((await resolveListingTax(phdb, phdb.prepare('SELECT * FROM product_drafts WHERE id = ?').get(repDraftId))).mode, 'cdb');
+  // 税率が load (段階は frozen) = 今までどおり draft_yahoo の税率
+  setOwnerPhase('frozen', ['skus.shipping']); G.__resetLegacyGate();
+  assert.equal((await resolveListingTax(phdb, phdb.prepare('SELECT * FROM product_drafts WHERE id = ?').get(repDraftId))).mode, 'legacy');
+  assert.ok((await call('GET', `/apps/product-hub/detail/${repDraftId}`)).text.includes('id="y-tax"'));
+  __setCdbTaxReader(null);
+  setPhase('legacy_open'); G.__resetLegacyGate();
+});
+await t('E6: 持ち主を読めない (段階は frozen・new_open) = 開いているはずの入口も 503 (fail-closed)・legacy_open は持ち主を読まずに今までどおり', async () => {
+  for (const phase of ['frozen', 'new_open']) {
+    setOwnerPhase(phase, 'unreadable');
+    await quiet(async () => {
+      const before = whSnap();
+      for (const id of ['warehouse:POST:/api/m-sku-master', 'warehouse:POST:/api/shipping']) {
+        const r = await whReq(id);
+        assert.deepEqual([r.status, r.json.error], [503, 'master_owner_unreadable'], id);
+      }
+      assert.equal(whSnap(), before);
+      const n0 = nDrafts();
+      assert.equal((await call('POST', '/apps/product-hub/api/drafts', { ne_code: 'owner-unreadable', name: 'x' })).status, 503);
+      assert.equal(nDrafts(), n0);
+      assert.equal((await call('POST', '/apps/purchase-orders/api/masters/suppliers', { supplier_code: '0776', name: 'x' })).status, 503);
+      assert.equal((await call('POST', '/apps/supplier-sales/api/supplier-name', { code: '0887', name: 'x' })).status, 503);
+    });
+    G.__resetLegacyGate();
+    const page = await quiet(() => call('GET', '/apps/warehouse/register'));
+    assert.ok(page.text.includes('列ごとの持ち主を読めない') && /#csv-card\{display:none/.test(page.text), '画面は全部隠す');
+  }
+  // legacy_open = 持ち主を読まない (読めなくても開く)
+  setOwnerPhase('legacy_open', 'unreadable');
+  const r = await whReq('warehouse:POST:/api/shipping');
+  assert.equal(r.status, 200, r.text.slice(0, 200));
+  await whReq('warehouse:DELETE:/api/shipping/:sku');
+  setPhase('legacy_open'); G.__resetLegacyGate();
+});
+await t('E7: product-hub の /new の出し方 (newEntryGate・MASTER_EDIT_OPEN = 1) = 新商品の登録の列が全部 C のときだけ案内 / 13 キーは今までの画面 / 持ち主を読めない = 止めている', async () => {
+  const O = await import('../lib/product-hub-outbox.mjs');
+  const allC = Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'company']));
+  let cdbPhase = 'new_open';
+  O.__setCompanyDbClientFactory(async () => ({ query: async (q) => (/master_cutover_state/.test(q) ? { rows: [{ phase: cdbPhase, owner_hash: ownershipHash(allC), changed_at: 'x', changed_by: 'x' }] } : { rows: [] }), end: async () => {}, on: () => {} }));
+  O.__setGateOwnership(allC);
+  const saved = [process.env.MASTER_EDIT_OPEN, process.env.COMPANY_DB_MASTER_EDIT_URL];
+  process.env.MASTER_EDIT_OPEN = '1'; process.env.COMPANY_DB_MASTER_EDIT_URL = 'postgres://fake@127.0.0.1:1/x';
+  try {
+    setOwnerPhase('new_open', [...OWNED_COLUMNS]); G.__resetLegacyGate();
+    assert.equal((await O.newEntryGate()).mode, 'guide', '全部 C = 案内');
+    setOwnerPhase('new_open', CUT13); G.__resetLegacyGate();
+    assert.equal((await O.newEntryGate()).mode, 'legacy', '13 キー = 新しい登録では作れない = 今までの画面');
+    let page = await call('GET', '/apps/product-hub/new');
+    assert.ok(page.text.includes('id="create-btn"') && !page.text.includes('/apps/master-edit/new?kind=single'));
+    setOwnerPhase('new_open', 'unreadable'); G.__resetLegacyGate();
+    assert.equal((await quiet(() => O.newEntryGate())).mode, 'paused', '持ち主を読めない = 止めている');
+    cdbPhase = 'company_owner';
+    setOwnerPhase('company_owner', [...OWNED_COLUMNS]); G.__resetLegacyGate();
+    assert.equal((await O.newEntryGate()).mode, 'paused', '切替の途中 (全部 C) = 止めている');
+    setOwnerPhase('company_owner', CUT13); G.__resetLegacyGate();
+    assert.equal((await O.newEntryGate()).mode, 'legacy', '切替の途中でも 13 キー = 今までの画面 (古い作り方の門は開いている)');
+    page = await call('GET', '/apps/product-hub/new');
+    assert.ok(page.text.includes('id="create-btn"'));
+  } finally {
+    if (saved[0] === undefined) delete process.env.MASTER_EDIT_OPEN; else process.env.MASTER_EDIT_OPEN = saved[0];
+    if (saved[1] === undefined) delete process.env.COMPANY_DB_MASTER_EDIT_URL; else process.env.COMPANY_DB_MASTER_EDIT_URL = saved[1];
+    O.__setCompanyDbClientFactory(null); O.__setGateOwnership(null);
+    setPhase('legacy_open'); G.__resetLegacyGate();
+  }
+});
 server.close();
 
 // ═══ D. CLI (子プロセス) ═══
@@ -1408,6 +1692,30 @@ await t('migrate-reorder-setting-initial.js: 閉じたら終了コード 3・書
   assert.equal(countIn('m_reorder_setting'), 0);
   const r = runCli([S, `--csv=${csv}`], { phase: 'legacy_open' });
   assert.equal(r.code, 0, r.out); assert.equal(countIn('m_reorder_setting'), 1);
+});
+
+console.log('── E. ⑤-3b 列ごと (CLI) ──');
+await t('E8: 13 キー C の CLI = 送料・原価・売上分類・推奨保有月数は終了コード 3 / SKU マスタの取込は動く / 持ち主を読めない = 3', async () => {
+  const own = CUT13.join(',');
+  const S = path.join(ROOT, 'apps/warehouse/import-sku-master.js');
+  const csv = path.join(cliDir, 'skumaster13.csv');
+  fs.writeFileSync(csv, 'sku,asin,商品名,NE商品コード,数量\nsku-cli-13,B013,13 キーの後,ne-aaa,1\n');
+  const n0 = countIn('m_sku_master');
+  let r = runCli([S, csv, '--encoding=utf-8'], { phase: 'frozen', env: { TEST_LEGACY_OWNER: own } });
+  assert.equal(r.code, 0, r.out); assert.equal(countIn('m_sku_master'), n0 + 1);
+  r = runCli([CSV_IMPORT, 'product_shipping', shipCsv], { phase: 'new_open', env: { TEST_LEGACY_OWNER: own } });
+  assert.equal(r.code, 3, r.out); assert.ok(r.out.includes('skus.shipping'), r.out);
+  assert.equal(runCli([CSV_IMPORT, 'exception_genka', path.join(cliDir, 'genka.csv')], { phase: 'frozen', env: { TEST_LEGACY_OWNER: own } }).code, 3);
+  assert.equal(runCli([path.join(ROOT, 'apps/warehouse/migrate-reorder-setting-initial.js'), `--csv=${path.join(cliDir, 'pml.csv')}`], { phase: 'company_owner', env: { TEST_LEGACY_OWNER: own } }).code, 3);
+  // 全部 load (段階は frozen) = 今までどおり入る
+  r = runCli([CSV_IMPORT, 'exception_genka', path.join(cliDir, 'genka.csv')], { phase: 'frozen', env: { TEST_LEGACY_OWNER: 'none' } });
+  assert.equal(r.code, 0, r.out);
+  // 持ち主を読めない = SKU マスタも 3
+  r = runCli([S, csv, '--encoding=utf-8'], { phase: 'frozen', env: { TEST_LEGACY_OWNER: 'unreadable' } });
+  assert.equal(r.code, 3, r.out); assert.ok(r.out.includes('持ち主を読めない'), r.out);
+  // 書く直前に (1 回目 legacy_open → 2 回目 frozen) = 2 回目の持ち主で決める (13 キー = SKU マスタは書ける)
+  r = runCli([S, csv, '--encoding=utf-8'], { phase: 'legacy_open_then_frozen', env: { TEST_LEGACY_OWNER: own } });
+  assert.equal(r.code, 0, r.out);
 });
 
 G.__setLegacyPhaseReader(null);

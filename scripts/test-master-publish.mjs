@@ -82,7 +82,9 @@ const { MIRROR_PRODUCTS_DDL, MIRROR_SET_COMPONENTS_DDL } = await import('../apps
 const { masterReceiptEvidence } = await import('../apps/warehouse/sync-to-render.js');
 const { buildPlanFromRender } = await import('../apps/company-db/load/sources.mjs');
 const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
-const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
+// 試験の基準 = 全部 load の持ち主表 (⑤-3b の PR から configured = config/master-ownership.mjs は 10/5 の 13 キーが company。写し・作り直しは epoch を読むので configured は基準にしない)
+const { OWNED_COLUMNS: OWNED_COLS_ALL } = await import('../config/master-ownership.mjs');
+const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries(OWNED_COLS_ALL.map((k) => [k, 'load'])));
 const { readEvidence } = await import('../apps/company-db/push/evidence.mjs');
 const { jstDateStr } = await import('../lib/jst-date.js');
 const MP = await import('../apps/warehouse/master-publish.js');
