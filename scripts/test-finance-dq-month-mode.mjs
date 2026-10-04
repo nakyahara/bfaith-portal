@@ -15,6 +15,7 @@ import {
   MONTH_START_GRACE, MONTH_START_JANUARY_EXTRA_DAYS, monthStartGraceDays, MONTH_START_GRACE_PREFIX, isMonthStartGraceSummary,
   SKIP_IN_MONTH_START_GRACE, applyMonthStartSkip, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, monthHadRowsBefore, prevMonthFreshness, decideMonthStartEmpty,
   ensureMonthHighWater, markMonthHighWater, migrateLegacyHighWater, prepareMonthHighWater, isRealYmd, highWaterReady, shouldSkipEmptyMonthClear,
+  MONTH_START_RAMP, MONTH_START_RAMP_CHECKS, MONTH_START_RAMP_PREFIX, monthStartRamp, monthStartRampWindow, applyMonthStartRamp, monthStartRampNote,
 } from '../apps/warehouse/finance-dq-month-mode.js';
 
 let failures = 0;
@@ -274,6 +275,84 @@ const hw = (d, mall, ym) => d.prepare('SELECT * FROM dq_month_high_water WHERE m
   check('highWaterReady: 表があり移し済み → true / 表が無い → false', highWaterReady(ok) === true && highWaterReady(memDb({ ensure: false })) === false);
 }
 
+// ══ 月初の立ち上がり (2026-10-04): 行のある当月の 7 日目 (Qoo10 は 12 日目) までは、listing_diff_pct・whitelist_coverage_pct の error を
+//    「足りない向き」かつ「足りない分 ≤ 直近 settleDays 日 + 今日の受注」のときだけ ⚠️ に下げる ══
+{
+  // 表と暦
+  check('立ち上がり: 表は 5 モール・書き換えられない・日数は 1〜14・検査は 2 つだけ',
+    Object.isFrozen(MONTH_START_RAMP) && Object.keys(MONTH_START_RAMP).length === 5
+    && Object.values(MONTH_START_RAMP).every((s) => Object.isFrozen(s) && Object.isFrozen(s.settleDays) && s.rampDays >= 1 && s.rampDays <= 14
+      && Object.keys(s.settleDays).every((k) => MONTH_START_RAMP_CHECKS.includes(k)))
+    && MONTH_START_RAMP_CHECKS.length === 2);
+  check('立ち上がり: 楽天は whitelist を持たない・Qoo10 は listing (もともと info) を持たない',
+    !Object.hasOwn(MONTH_START_RAMP.rakuten.settleDays, 'whitelist_coverage_pct') && !Object.hasOwn(MONTH_START_RAMP.qoo10.settleDays, 'listing_diff_pct'));
+  for (const mall of Object.keys(MONTH_START_RAMP)) {
+    const n = MONTH_START_RAMP[mall].rampDays;
+    check(`立ち上がり ${mall}: 当月 1 日・${n} 日 (境界) は active / ${n + 1} 日は過ぎた / 前月・未来の月は当月でない`,
+      monthStartRamp(mall, '2026-10', { now: jst(2026, 10, 1, 7) }).active && monthStartRamp(mall, '2026-10', { now: jst(2026, 10, n, 7) }).active
+      && !monthStartRamp(mall, '2026-10', { now: jst(2026, 10, n + 1, 7) }).active
+      && !monthStartRamp(mall, '2026-09', { now: jst(2026, 10, 2, 7) }).active && !monthStartRamp(mall, '2026-11', { now: jst(2026, 10, 2, 7) }).active);
+  }
+  check('立ち上がり: --no-month-start-grace (取込が ❌) なら active にしない・理由を残す',
+    (() => { const r = monthStartRamp('rakuten', '2026-10', { now: jst(2026, 10, 2, 7), noGrace: true }); return !r.active && r.reasons.some((x) => x.includes('取込が ❌')); })());
+  check('立ち上がり: JST の日付で数える (10/7 23:30 JST は 7 日 / 10/8 00:30 JST は 8 日)',
+    monthStartRamp('yahoo', '2026-10', { now: jst(2026, 10, 7, 23.5) }).dayOfMonth === 7 && monthStartRamp('yahoo', '2026-10', { now: jst(2026, 10, 8, 0.5) }).dayOfMonth === 8);
+  {
+    const j = monthStartRamp('aupay', '2027-01', { now: jst(2027, 1, 9, 7) });
+    check(`立ち上がり: 1 月は日数と settleDays に年末年始の ${MONTH_START_JANUARY_EXTRA_DAYS} 日を足す (14 日が上限)`,
+      j.active && j.rampDays === MONTH_START_RAMP.aupay.rampDays + MONTH_START_JANUARY_EXTRA_DAYS && j.settleDays.listing_diff_pct === MONTH_START_RAMP.aupay.settleDays.listing_diff_pct + MONTH_START_JANUARY_EXTRA_DAYS
+      && monthStartRamp('qoo10', '2027-01', { now: jst(2027, 1, 14, 7) }).rampDays === 14, JSON.stringify(j));
+  }
+  check('立ち上がり: 知らないモール・壊れた now は投げる', throws(() => monthStartRamp('amazon', '2026-10')) && throws(() => monthStartRamp('yahoo', '2026-10', { now: new Date('x') })));
+  // 範囲
+  const r4 = monthStartRamp('rakuten', '2026-10', { now: jst(2026, 10, 4, 7) });
+  const w4 = monthStartRampWindow(r4, 'listing_diff_pct');
+  check('範囲: 10/4・2 日 → 10/2〜10/4 (今日まで)', w4 && w4.from === '2026-10-02' && w4.to === '2026-10-04' && w4.settleDays === 2, JSON.stringify(w4));
+  const w2 = monthStartRampWindow(monthStartRamp('rakuten', '2026-10', { now: jst(2026, 10, 2, 7) }), 'listing_diff_pct');
+  check('範囲: 10/2 → 前月に出ない (10/1〜10/2)', w2 && w2.from === '2026-10-01' && w2.to === '2026-10-02', JSON.stringify(w2));
+  check('範囲: 表に無い検査 (楽天の whitelist)・立ち上がりの外・null は null',
+    monthStartRampWindow(r4, 'whitelist_coverage_pct') === null && monthStartRampWindow(monthStartRamp('rakuten', '2026-10', { now: jst(2026, 10, 20, 7) }), 'listing_diff_pct') === null && monthStartRampWindow(null, 'listing_diff_pct') === null);
+  // 判定
+  const A = (sev, amounts, ramp = r4, name = 'listing_diff_pct') => applyMonthStartRamp(ramp, name, sev, { x: 1 }, amounts);
+  const ok = A('error', { shortfall: 354367, explainedBy: 1075151 });
+  check('判定: 足りない向き・直近で説明できる → warn・元の判定と数字を details に残す',
+    ok.severity === 'warn' && ok.ramped && ok.details.month_start_ramp === true && ok.details.severity_without_ramp === 'error' && ok.details.x === 1 && ok.details.ramp_shortfall === 354367 && ok.details.ramp_window_from === '2026-10-02');
+  const ex = A('error', { shortfall: -720784, explainedBy: 1075151 });
+  check('判定 (本物の異常): 実績が多い向き (二重計上・比べる相手が古い) → error のまま・理由', ex.severity === 'error' && !ex.ramped && /多い/.test(ex.details.month_start_ramp_denied));
+  const big = A('error', { shortfall: 1719944, explainedBy: 1075151 });
+  check('判定 (本物の異常): 足りない分が直近の受注より大きい (前の日の分まで欠けている) → error のまま', big.severity === 'error' && /説明できない/.test(big.details.month_start_ramp_denied));
+  check('判定: 足りない分が 0 なのに error (raw が 0 行など) → error のまま', A('error', { shortfall: 0, explainedBy: 0 }).severity === 'error');
+  check('判定: 数えられない (null・NaN) → error のまま', A('error', { shortfall: 5, explainedBy: null }).severity === 'error' && A('error', { shortfall: NaN, explainedBy: 9 }).severity === 'error');
+  check('判定: warn・info は触らない / 立ち上がりの外・null の ramp・ほかの検査は触らない',
+    A('warn', { shortfall: 1, explainedBy: 9 }).severity === 'warn' && A('info', { shortfall: 1, explainedBy: 9 }).details.x === 1 && !A('info', { shortfall: 1, explainedBy: 9 }).details.month_start_ramp
+    && A('error', { shortfall: 1, explainedBy: 9 }, monthStartRamp('rakuten', '2026-10', { now: jst(2026, 10, 8, 7) })).severity === 'error'
+    && A('error', { shortfall: 1, explainedBy: 9 }, null).severity === 'error' && A('error', { shortfall: 1, explainedBy: 9 }, r4, 'missing_cost_rate_pct').severity === 'error');
+  check('判定: 境界 (足りない分 = 直近の受注) は下げる / 1 多いと下げない',
+    A('error', { shortfall: 100, explainedBy: 100 }).severity === 'warn' && A('error', { shortfall: 101, explainedBy: 100 }).severity === 'error');
+  const rn = monthStartRampNote(r4, [{ checkName: 'listing_diff_pct', value: 19.37 }]);
+  check('最後の行: 「⚠️ 月初の立ち上がり:」で始まり、daily-sync の isMonthStartGraceSummary が拾う / 0 行の猶予の行とは別の印',
+    rn.startsWith(MONTH_START_RAMP_PREFIX) && isMonthStartGraceSummary(rn) && rn.includes('listing_diff_pct 19.4%') && rn.includes('7 日まで') && !rn.startsWith(MONTH_START_GRACE_PREFIX), rn);
+
+  // 実測で試す: 2026-06〜10 の当月の DQ で error になった日 (miniPC の dq_run_results) から、settleDays の境目に近いものを選んだ
+  //   [モール, JST の日, 検査, 足りない分, 直近 settleDays 日 + 今日の受注 (2026-10-04 の f_sales_by_listing / raw で数え直した)]
+  const OBSERVED = [
+    ['rakuten', '2026-09-02', 'listing_diff_pct', 373622, 872944], ['rakuten', '2026-09-06', 'listing_diff_pct', 1387571, 3305496], ['rakuten', '2026-07-06', 'listing_diff_pct', 1457056, 2775799],
+    ['yahoo', '2026-07-03', 'listing_diff_pct', 337379, 431164], ['yahoo', '2026-09-07', 'listing_diff_pct', 273938, 863063], ['yahoo', '2026-08-03', 'whitelist_coverage_pct', 190, 601],
+    ['aupay', '2026-07-04', 'listing_diff_pct', 78446, 142082], ['aupay', '2026-10-02', 'whitelist_coverage_pct', 22, 43], ['aupay', '2026-06-04', 'whitelist_coverage_pct', 35, 87],
+    ['qoo10', '2026-09-11', 'whitelist_coverage_pct', 154, 169], ['qoo10', '2026-06-12', 'whitelist_coverage_pct', 163, 177], ['qoo10', '2026-08-07', 'whitelist_coverage_pct', 35, 59],
+  ];
+  let down = 0;
+  for (const [mall, d, name, shortfall, explainedBy] of OBSERVED) {
+    const [y, m, day] = d.split('-').map(Number);
+    const r = applyMonthStartRamp(monthStartRamp(mall, d.slice(0, 7), { now: jst(y, m, day, 8) }), name, 'error', null, { shortfall, explainedBy });
+    if (r.severity === 'warn') down++;
+  }
+  check(`実測: 6〜10 月の月初の空振り (出荷待ち) ${OBSERVED.length} 件は全部 ⚠️ に下がる`, down === OBSERVED.length, `down=${down}`);
+  const r1004 = (mall) => monthStartRamp(mall, '2026-10', { now: jst(2026, 10, 4, 9) });
+  check('実測 (本物): 10/4 の楽天・Yahoo・au PAY の listing (比べる相手が 10/2 のまま = fact が多い) は ❌ のまま',
+    [['rakuten', -720784, 1075151], ['yahoo', -182836, 281513], ['aupay', -52491, 124699]].every(([m, s, e]) => applyMonthStartRamp(r1004(m), 'listing_diff_pct', 'error', null, { shortfall: s, explainedBy: e }).severity === 'error'));
+}
+
 // ── 5 本の DQ と 3 本の sync を子プロセスで (一時の DATA_DIR の SQLite・本番の DB には触らない) ──
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const readSql = (rel) => fs.readFileSync(path.join(repoRoot, rel), 'utf8');
@@ -475,6 +554,152 @@ for (const mall of ['aupay', 'linegift', 'qoo10']) {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
+// ── 月初の立ち上がりを子プロセスで: 2026-10-04 の朝の数字の形 (楽天・Yahoo・au PAY・Qoo10)・月半ば・月末・本物の異常・LINE ギフトの 0 行 ──
+{
+  const FACT_COL = { rakuten: 'gross_sales_jpy_incl', yahoo: 'listing_sales_estimated_jpy_incl', aupay: 'gross_sales_jpy_incl' };
+  // 2026-10-04 の朝の形 (f_sales_by_listing は 11:30 の作り直しの後の値 = 07:00 に f_sales が通っていればこうだった)
+  const OCT = {
+    rakuten: { fact: { '2026-10-01': 730199, '2026-10-02': 635378, '2026-10-03': 109404 }, listing: { '2026-10-01': 754197, '2026-10-02': 649348, '2026-10-03': 425803 } },
+    yahoo: { fact: { '2026-10-01': 207355, '2026-10-02': 142865, '2026-10-03': 52915 }, listing: { '2026-10-01': 220299, '2026-10-02': 149795, '2026-10-03': 131718 },
+      raw: [['2026-10-01', 130, 129], ['2026-10-02', 100, 96], ['2026-10-03', 92, 32]] },
+    aupay: { fact: { '2026-10-01': 40345, '2026-10-02': 21896, '2026-10-03': 30595 }, listing: { '2026-10-01': 40345, '2026-10-02': 27392, '2026-10-03': 97307 },
+      raw: [['2026-10-01', 29, 29], ['2026-10-02', 14, 14], ['2026-10-03', 57, 18], ['2026-10-04', 2, 0]] },
+  };
+  const addRaw = (d, mall, rows) => {
+    let n = 0;
+    for (const [date, total, wl] of rows) {
+      for (let i = 0; i < total; i++) {
+        const done = i < wl;
+        n++;
+        if (mall === 'yahoo') d.prepare('INSERT INTO raw_yahoo_orders VALUES (?, ?, ?, ?)').run(`${date} 10:00:00`, done ? '5' : '2', '1', done ? '3' : '1');
+        else if (mall === 'aupay') d.prepare('INSERT INTO raw_aupay_orders VALUES (?, ?, ?, ?, 0)').run(`o${n}`, `${date.replace(/-/g, '/')} 10:00:00`, done ? '完了' : '新規受付', 'N');
+        else if (mall === 'qoo10') d.prepare(`INSERT INTO raw_qoo10_orders (order_id, source_type, source_order_key, pack_no, shipping_status, item_code, seller_item_code, order_date, first_seen_at, last_seen_at, last_api_snapshot_at, synced_at)
+          VALUES (?, 'api_v3', ?, ?, ?, 'i', 's', ?, 'x', 'x', 'x', 'x')`).run(`api:${n}`, String(n), n, done ? 'Delivered(5)' : 'Shipping(4)', `${date} 10:00:00`);
+      }
+    }
+  };
+  const setup = (mall, spec) => {
+    const table = `f_${mall}_finance_sku_daily_v1`;
+    const dir = makeDir(mall, table);
+    withDb(dir, (d) => {
+      addFactRow(d, table, '2026-09-30', 'prev');
+      let k = 0;
+      for (const [date, p] of Object.entries(spec.fact || {})) {
+        addFactRow(d, table, date, `k${++k}`);
+        if (FACT_COL[mall]) d.prepare(`UPDATE ${table} SET ${FACT_COL[mall]} = ? WHERE rowid = (SELECT MAX(rowid) FROM ${table})`).run(p);
+      }
+      for (const [date, p] of Object.entries(spec.listing || {})) d.prepare('INSERT INTO f_sales_by_listing (日付, モール, 売上金額) VALUES (?, ?, ?)').run(date, mall, p);
+      if (mall === 'aupay') d.prepare("UPDATE f_aupay_finance_sku_daily_v1 SET mall_fee_calc_method = 'estimated_rate'").run();   // 既定の unknown だと別の検査 (mall_fee_rate_missing_pct) が error
+      addRaw(d, mall, spec.raw || []);
+    });
+    return { dir, table, script: `run-${mall}-finance-dq.js` };
+  };
+  const at = (day, h = 9) => `2026-10-${dd(day)}T${dd(h)}:00:00+09:00`;
+  const errLines = (r) => r.out.split('\n').filter((l) => /❌/.test(l)).join(' | ');
+
+  for (const mall of ['rakuten', 'yahoo', 'aupay']) {
+    const { dir, script } = setup(mall, OCT[mall]);
+    try {
+      const n = MONTH_START_RAMP[mall].rampDays;
+      const a = runDq(dir, script, '2026-10', at(4), 'r-oct4');
+      const s = res(dir, 'r-oct4');
+      check(`${mall} (10/4 の朝の形): listing_diff_pct は ⚠️ warn に下がり (元は error)・exit 0・最後の行が ⚠️ 月初の立ち上がり`,
+        a.code === 0 && s.listing_diff_pct?.severity === 'warn' && s.listing_diff_pct.details.severity_without_ramp === 'error' && a.last.startsWith(MONTH_START_RAMP_PREFIX) && isMonthStartGraceSummary(a.last),
+        `code=${a.code} last=${a.last} ld=${JSON.stringify(s.listing_diff_pct)} err=${a.err.slice(-300)} ${errLines(a)}`);
+      if (mall === 'aupay') check('aupay (10/4 の朝の形): whitelist_coverage_pct 59.8% も ⚠️ に下がる (入っていない 41 行 ≤ 10/2〜10/4 の 73 行)',
+        s.whitelist_coverage_pct?.severity === 'warn' && s.whitelist_coverage_pct.details.ramp_shortfall === 41 && s.whitelist_coverage_pct.details.ramp_explained_by === 73, JSON.stringify(s.whitelist_coverage_pct));
+      if (mall === 'yahoo') check('yahoo (10/4 の朝の形): whitelist_coverage_pct 79.8% はもともと warn = 触らない (立ち上がりの印なし)',
+        s.whitelist_coverage_pct?.severity === 'warn' && !s.whitelist_coverage_pct.details.month_start_ramp, JSON.stringify(s.whitelist_coverage_pct));
+      const b = runDq(dir, script, '2026-10', at(n + 1), 'r-after');
+      check(`${mall}: 同じ数字でも ${n + 1} 日 (立ち上がりの外) なら今までどおり ❌ (exit 1・listing_diff_pct error)`, b.code === 1 && res(dir, 'r-after').listing_diff_pct?.severity === 'error', `code=${b.code}`);
+      const c = runDq(dir, script, '2026-10', at(4), 'r-nograce', ['--no-month-start-grace']);
+      check(`${mall}: 取込が ❌ の朝 (--no-month-start-grace) は下げない → exit 1`, c.code === 1 && res(dir, 'r-nograce').listing_diff_pct?.severity === 'error', `code=${c.code}`);
+      // 本物の異常 1: 比べる相手が古い (10/4 の本物の朝 = f_sales が打ち切られて listing が 10/1 だけ) → fact が多い向き → ❌
+      withDb(dir, (d) => d.prepare("DELETE FROM f_sales_by_listing WHERE 日付 > '2026-10-01'").run());
+      const e = runDq(dir, script, '2026-10', at(4), 'r-stale');
+      const se = res(dir, 'r-stale');
+      check(`${mall} (本物の異常): 比べる相手が古い (fact が多い向き) → 立ち上がりの中でも ❌ (exit 1)・理由を details に`,
+        e.code === 1 && se.listing_diff_pct?.severity === 'error' && /多い/.test(se.listing_diff_pct.details.month_start_ramp_denied || ''), `code=${e.code} ${JSON.stringify(se.listing_diff_pct)}`);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+  // 本物の異常 2: fact が前の日の分まで欠けている (10/1 と 10/2 の出荷が丸ごと無い) → 足りない分 > 直近 2 日 + 今日の受注 → ❌
+  {
+    const { dir, script } = setup('rakuten', { fact: { '2026-10-03': 109404 }, listing: OCT.rakuten.listing });
+    try {
+      const r = runDq(dir, script, '2026-10', at(4), 'r-missing');
+      const s = res(dir, 'r-missing');
+      check('rakuten (本物の異常): fact が 10/1・10/2 の分まで欠けている → 立ち上がりの中でも ❌ (足りない 1,719,944 円 > 10/2〜10/4 の受注 1,075,151 円)',
+        r.code === 1 && s.listing_diff_pct?.severity === 'error' && /説明できない/.test(s.listing_diff_pct.details.month_start_ramp_denied || ''), `code=${r.code} ${JSON.stringify(s.listing_diff_pct)}`);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+  // 月半ば・月末: 立ち上がりの外は今までどおり (小さい差は info で通る / 月半ばに差が急に増えたら ❌)
+  {
+    const days = {}; const lst = {};
+    for (let i = 1; i <= 30; i++) { const d = `2026-10-${dd(i)}`; days[d] = 500000; lst[d] = 510000; }
+    const { dir, script } = setup('rakuten', { fact: days, listing: lst });
+    try {
+      const m = runDq(dir, script, '2026-10', at(15), 'r-mid');
+      check('rakuten (月半ば 10/15): 差 2% は今までどおり info・exit 0・立ち上がりの行は出ない', m.code === 0 && res(dir, 'r-mid').listing_diff_pct?.severity === 'info' && !m.last.startsWith(MONTH_START_RAMP_PREFIX), `code=${m.code} last=${m.last} ${errLines(m)}`);
+      const e = runDq(dir, script, '2026-10', at(31), 'r-end');
+      check('rakuten (月末 10/31): 差 2% は info・exit 0', e.code === 0 && res(dir, 'r-end').listing_diff_pct?.severity === 'info', `code=${e.code}`);
+      withDb(dir, (d) => d.prepare("UPDATE f_rakuten_finance_sku_daily_v1 SET gross_sales_jpy_incl = 0 WHERE date_jst BETWEEN '2026-10-10' AND '2026-10-14'").run());
+      const g = runDq(dir, script, '2026-10', at(15), 'r-mid-gap');
+      const sg = res(dir, 'r-mid-gap');
+      check('rakuten (本物の異常・月半ば): 10/10〜14 の fact が消えた (差 18%) → 今までどおり ❌ (立ち上がりの外は下げない・判定の跡も付けない)',
+        g.code === 1 && sg.listing_diff_pct?.severity === 'error' && !sg.listing_diff_pct.details.month_start_ramp_denied && !sg.listing_diff_pct.details.ramp_window_from, `code=${g.code} ${JSON.stringify(sg.listing_diff_pct)}`);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+  // Qoo10: 10/4 の朝の形 (whitelist 34.4% = daily-sync が exit 1 になった原因) → ⚠️・13 日なら ❌・本物の停滞 (古い注文の配送が止まった) は ❌
+  {
+    const q = (rows, nFact = 10) => {
+      const r = setup('qoo10', { raw: rows });
+      withDb(r.dir, (d) => { for (let i = 0; i < nFact; i++) addFactRow(d, r.table, '2026-10-01', `q${i}`); });
+      return r;
+    };
+    const { dir, script } = q([['2026-10-01', 14, 10], ['2026-10-02', 7, 1], ['2026-10-03', 9, 0], ['2026-10-04', 2, 0]]);
+    try {
+      const a = runDq(dir, script, '2026-10', at(4), 'q-oct4');
+      const s = res(dir, 'q-oct4');
+      check('qoo10 (10/4 の朝の形): whitelist_coverage_pct 34.4% → ⚠️ warn (入っていない 21 行 ≤ 10/1〜10/4 の 32 行)',
+        s.whitelist_coverage_pct?.severity === 'warn' && s.whitelist_coverage_pct.details.severity_without_ramp === 'error' && s.whitelist_coverage_pct.details.ramp_shortfall === 21,
+        `code=${a.code} ${JSON.stringify(s.whitelist_coverage_pct)} ${errLines(a)}`);
+      const errs = Object.entries(s).filter(([, v]) => v.severity === 'error').map(([k]) => k);
+      check('qoo10 (10/4 の朝の形): error の検査が 0 = exit 0 (daily-sync の dq_fail にならない)・最後の行が ⚠️ 月初の立ち上がり', a.code === 0 && errs.length === 0 && a.last.startsWith(MONTH_START_RAMP_PREFIX), `code=${a.code} errors=${errs.join(',')} last=${a.last}`);
+      const n = MONTH_START_RAMP.qoo10.rampDays;
+      const b = runDq(dir, script, '2026-10', at(n + 1), 'q-after');
+      check(`qoo10: 同じ数字でも ${n + 1} 日なら今までどおり ❌`, b.code === 1 && res(dir, 'q-after').whitelist_coverage_pct?.severity === 'error', `code=${b.code}`);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    const rows = []; for (let i = 1; i <= 10; i++) rows.push([`2026-10-${dd(i)}`, 10, i <= 2 ? 10 : 0]);   // 10/3 以降の注文が 1 件も配送完了にならない
+    const st = q(rows);
+    try {
+      const r = runDq(st.dir, st.script, '2026-10', at(10), 'q-stuck');
+      check('qoo10 (本物の異常): 10/3〜10/10 の注文が 1 件も配送完了にならない (入っていない 80 行 > 10/5〜10/10 の 60 行) → 立ち上がりの中でも ❌',
+        r.code === 1 && res(st.dir, 'q-stuck').whitelist_coverage_pct?.severity === 'error', `code=${r.code} ${JSON.stringify(res(st.dir, 'q-stuck').whitelist_coverage_pct)}`);
+    } finally { fs.rmSync(st.dir, { recursive: true, force: true }); }
+  }
+  // LINE ギフト: 10/4 の 0 行 (取込が 10/1 から止まっている) は立ち上がりの対象ではない = 今までどおり ❌ (0 行の猶予は 3 日まで)
+  {
+    const { dir, script } = setup('linegift', {});
+    try {
+      const a = runDq(dir, script, '2026-10', at(4), 'l-oct4', ['--no-month-start-grace']);
+      const b = runDq(dir, script, '2026-10', at(4), 'l-oct4-flag-off');
+      check('linegift (10/4 の朝の形): 当月 0 行 → --no-month-start-grace でも無しでも exit 1・CRITICAL (立ち上がりは行のある月だけ)',
+        a.code === 1 && b.code === 1 && /のデータが 0 行/.test(a.err) && /のデータが 0 行/.test(b.err) && !a.last.startsWith(MONTH_START_RAMP_PREFIX), `codes=${a.code},${b.code}`);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+  // #1572 と重ならない: 当月 0 行の猶予の回は「⚠️ 月初の猶予:」の行 (立ち上がりの行ではない)
+  {
+    const { dir, script } = setup('yahoo', { listing: { '2026-10-01': 220299 }, raw: [['2026-10-01', 130, 53]] });
+    try {
+      const a = runDq(dir, script, '2026-10', at(1), 'y-empty');
+      const s = res(dir, 'y-empty');
+      check('yahoo: 当月 0 行の猶予 (1 日) は今までどおり 0 行の猶予の行・listing と whitelist は info (立ち上がりで二重に触らない)',
+        a.code === 0 && a.last.startsWith(MONTH_START_GRACE_PREFIX) && s.listing_diff_pct?.severity === 'info' && s.whitelist_coverage_pct?.severity === 'info' && !s.whitelist_coverage_pct.details.month_start_ramp,
+        `code=${a.code} last=${a.last} ${JSON.stringify(s.whitelist_coverage_pct)}`);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+}
+
 // ── daily-sync (静的に読む。本物の daily-sync は流さない) ──
 {
   const src = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/daily-sync.js'), 'utf8').replace(/\r\n/g, '\n');
@@ -559,6 +784,8 @@ for (const mall of ['aupay', 'linegift', 'qoo10']) {
     const results = [{ success: true, summary: 'ok' }, { ...grace, warn: f.dqMonthStartWarn(grace) }];
     const allOk = results.every((r) => r.success && r.warn !== true);
     check('daily-sync: 月初の猶予の DQ は warn = 見出しが ⚠️ (allOk にならない)', results[1].warn === true && allOk === false);
+    check('daily-sync: 月初の立ち上がりで下げた DQ (最後の行が ⚠️ 月初の立ち上がり) も warn = 見出しが ⚠️',
+      f.dqMonthStartWarn({ success: true, summary: monthStartRampNote(monthStartRamp('qoo10', '2026-10', { now: jst(2026, 10, 4, 9) }), [{ checkName: 'whitelist_coverage_pct', value: 34.4 }]) }) === true);
     check('daily-sync: 検査の warn つきの合格・失敗した DQ は warn にしない (今までどおり)', f.dqMonthStartWarn(plainWarn) === false && f.dqMonthStartWarn({ success: false, summary: note }) === false);
   }
 }

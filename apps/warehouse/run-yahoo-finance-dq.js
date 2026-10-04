@@ -37,7 +37,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, monthStartRamp, monthStartRampWindow, recentListingJpy, applyMonthStartRamp, monthStartRampNote } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -98,6 +98,10 @@ const THRESHOLDS_CURRENT_MONTH = {
 const mode = monthMode(monthStr, { now });
 const isCurMonth = mode === 'current';
 const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST_MONTH, THRESHOLDS_CURRENT_MONTH);
+// 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 7 日目までは listing_diff_pct・whitelist_coverage_pct の error を、
+// 「足りない向き」かつ「足りない分 ≤ 直近 2 日 + 今日の受注」のときだけ ⚠️ に下げる (出荷待ちの差。6〜10 月の毎月 2〜3・6 日に ❌ だった)
+const ramp = monthStartRamp('yahoo', monthStr, { now, noGrace: noMonthStartGrace });
+const rampedChecks = [];
 
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -182,13 +186,13 @@ try {
 if (listingAvailable) {
   const totalDiff = Math.abs(dailyTotal - listingTotal);
   const totalDiffPct = listingTotal !== 0 ? (totalDiff / Math.abs(listingTotal)) * 100 : 0;
-  recordResult(
-    'listing_diff_pct',
+  const ld = applyMonthStartRamp(monthStartGrace ? null : ramp, 'listing_diff_pct',
     totalDiffPct > THRESHOLDS.listing_diff_pct.error ? 'error' :
       totalDiffPct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info',
-    totalDiffPct, THRESHOLDS.listing_diff_pct.error,
-    { daily_listing_estimated_jpy: dailyTotal, listing_total_jpy: listingTotal, diff_jpy: dailyTotal - listingTotal }
-  );
+    { daily_listing_estimated_jpy: dailyTotal, listing_total_jpy: listingTotal, diff_jpy: dailyTotal - listingTotal },
+    { shortfall: listingTotal - dailyTotal, explainedBy: recentListingJpy(db, 'yahoo', monthStartRampWindow(ramp, 'listing_diff_pct')) });
+  if (ld.ramped) rampedChecks.push({ checkName: 'listing_diff_pct', value: totalDiffPct });
+  recordResult('listing_diff_pct', ld.severity, totalDiffPct, THRESHOLDS.listing_diff_pct.error, ld.details);
 } else {
   recordResult('listing_diff_pct', 'info', null, THRESHOLDS.listing_diff_pct.error, { skipped: true });
 }
@@ -272,14 +276,17 @@ const whitelistCheck = db.prepare(`
 `).get(monthStr, monthStr);
 
 const wlPct = whitelistCheck.pct || 0;
+// 月初の立ち上がりの ②: whitelist に入っていない行の数 ≤ 直近 2 日 + 今日の受注の行の数
+const wlWin = monthStartRampWindow(ramp, 'whitelist_coverage_pct');
+const wlRecent = wlWin ? db.prepare("SELECT COUNT(*) AS c FROM raw_yahoo_orders WHERE substr(order_time, 1, 10) BETWEEN ? AND ?").get(wlWin.from, wlWin.to).c : null;
 // 下限閾値: warn < 95%、error < 90% (低い方が NG なので比較反転)
-recordResult(
-  'whitelist_coverage_pct',
+const wl = applyMonthStartRamp(monthStartGrace ? null : ramp, 'whitelist_coverage_pct',
   wlPct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' :
     wlPct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info',
-  wlPct, THRESHOLDS.whitelist_coverage_pct.warn,
-  { total_lines: whitelistCheck.total, whitelist_lines: whitelistCheck.wl }
-);
+  { total_lines: whitelistCheck.total, whitelist_lines: whitelistCheck.wl },
+  { shortfall: (whitelistCheck.total || 0) - (whitelistCheck.wl || 0), explainedBy: wlRecent });
+if (wl.ramped) rampedChecks.push({ checkName: 'whitelist_coverage_pct', value: wlPct });
+recordResult('whitelist_coverage_pct', wl.severity, wlPct, THRESHOLDS.whitelist_coverage_pct.warn, wl.details);
 
 // ============================================================
 // Check 7: resolved_but_zero_cost_count (Phase 1.3)
@@ -365,5 +372,7 @@ function printSummary() {
 printSummary();
 // 月初の猶予で通した回は、最後の行を「⚠️ 月初の猶予: …」にする (daily-sync はこの行を要約に出し、warn を立てて見出しを ⚠️ にする)
 if (monthStartGrace && !hasError) console.log(monthStartEmptyNote('f_yahoo_finance_sku_daily_v1', monthStr, monthStartGrace));
+// 月初の立ち上がりで下げた回も、最後の行を「⚠️ 月初の立ち上がり: …」にする (daily-sync は見出しを ⚠️ にする)
+else if (rampedChecks.length > 0 && !hasError) console.log(monthStartRampNote(ramp, rampedChecks));
 db.close();
 process.exit(hasError ? 1 : 0);

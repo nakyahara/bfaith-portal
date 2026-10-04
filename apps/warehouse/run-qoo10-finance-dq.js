@@ -31,7 +31,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, monthStartRamp, monthStartRampWindow, applyMonthStartRamp, monthStartRampNote } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -81,6 +81,10 @@ const THRESHOLDS_CURRENT = {
 const mode = monthMode(monthStr, { now });
 const isCur = mode === 'current';
 const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST, THRESHOLDS_CURRENT);
+// 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 12 日目までは whitelist_coverage_pct の error を、
+// 「whitelist に入っていない行の数 ≤ 直近 5 日 + 今日の受注の行の数」のときだけ ⚠️ に下げる (配送完了待ち。6〜10 月の毎月 3〜11 日に ❌ = daily-sync が exit 1 だった)
+const ramp = monthStartRamp('qoo10', monthStr, { now, noGrace: noMonthStartGrace });
+const rampedChecks = [];
 
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -200,9 +204,14 @@ const cov = db.prepare(`SELECT
   (SELECT COUNT(*) FROM raw_qoo10_orders WHERE substr(order_date,1,7)=? AND legacy_fields_missing=0) AS total,
   (SELECT COUNT(*) FROM raw_qoo10_orders WHERE substr(order_date,1,7)=? AND legacy_fields_missing=0 AND shipping_status='Delivered(5)') AS wl`).get(monthStr, monthStr);
 const wlPct = cov.total > 0 ? cov.wl / cov.total * 100 : 0;
-recordResult('whitelist_coverage_pct',
+// 月初の立ち上がりの ②: whitelist に入っていない行 (まだ配送が終わっていない) の数 ≤ 直近 5 日 + 今日の受注の行の数
+const wlWin = monthStartRampWindow(ramp, 'whitelist_coverage_pct');
+const wlRecent = wlWin ? db.prepare('SELECT COUNT(*) AS c FROM raw_qoo10_orders WHERE substr(order_date, 1, 10) BETWEEN ? AND ? AND legacy_fields_missing = 0').get(wlWin.from, wlWin.to).c : null;
+const wl = applyMonthStartRamp(monthStartGrace ? null : ramp, 'whitelist_coverage_pct',
   wlPct <= THRESHOLDS.whitelist_coverage_pct.error ? 'error' : wlPct <= THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info',
-  wlPct, THRESHOLDS.whitelist_coverage_pct.warn, { total_lines: cov.total, whitelist_lines: cov.wl });
+  { total_lines: cov.total, whitelist_lines: cov.wl }, { shortfall: (cov.total || 0) - (cov.wl || 0), explainedBy: wlRecent });
+if (wl.ramped) rampedChecks.push({ checkName: 'whitelist_coverage_pct', value: wlPct });
+recordResult('whitelist_coverage_pct', wl.severity, wlPct, THRESHOLDS.whitelist_coverage_pct.warn, wl.details);
 
 // Check 7: resolved_but_zero_cost_count
 // 原価状態='OVERRIDDEN' AND 原価=0 は人手の意図的 0 円上書き → snapshot=0 (lookup 成功で 0 円) の行のみ除外。
@@ -370,5 +379,7 @@ function printSummary() {
 printSummary();
 // 月初の猶予で通した回は、最後の行を「⚠️ 月初の猶予: …」にする (daily-sync はこの行を要約に出し、warn を立てて見出しを ⚠️ にする)
 if (monthStartGrace && !hasError) console.log(monthStartEmptyNote('f_qoo10_finance_sku_daily_v1', monthStr, monthStartGrace));
+// 月初の立ち上がりで下げた回も、最後の行を「⚠️ 月初の立ち上がり: …」にする (daily-sync は見出しを ⚠️ にする)
+else if (rampedChecks.length > 0 && !hasError) console.log(monthStartRampNote(ramp, rampedChecks));
 db.close();
 process.exit(hasError ? 1 : 0);

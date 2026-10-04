@@ -26,7 +26,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, monthStartRamp, monthStartRampWindow, recentListingJpy, applyMonthStartRamp, monthStartRampNote } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -74,6 +74,10 @@ const THRESHOLDS_CURRENT = {
 const mode = monthMode(monthStr, { now });
 const isCur = mode === 'current';
 const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST, THRESHOLDS_CURRENT);
+// 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 7 日目までは listing_diff_pct・whitelist_coverage_pct の error を、
+// 「足りない向き」かつ「足りない分 ≤ 直近 2 日 + 今日の受注」のときだけ ⚠️ に下げる (出荷待ちの差。6〜10 月の毎月 2〜4 日に ❌ だった)
+const ramp = monthStartRamp('aupay', monthStr, { now, noGrace: noMonthStartGrace });
+const rampedChecks = [];
 
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -124,7 +128,12 @@ let listingTotal = 0, listingAvail = false;
 try { const r = db.prepare("SELECT SUM(売上金額) AS p FROM f_sales_by_listing WHERE モール='aupay' AND substr(日付,1,7) = ?").get(monthStr); listingTotal = r?.p || 0; listingAvail = listingTotal > 0; } catch (e) { console.log(`  (listing 突合スキップ: ${e.message})`); }
 if (listingAvail) {
   const diffPct = listingTotal !== 0 ? Math.abs(factGross - listingTotal) / Math.abs(listingTotal) * 100 : 0;
-  recordResult('listing_diff_pct', diffPct > THRESHOLDS.listing_diff_pct.error ? 'error' : diffPct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info', diffPct, THRESHOLDS.listing_diff_pct.error, { fact_gross_jpy: factGross, listing_jpy: listingTotal, diff_jpy: factGross - listingTotal });
+  const ld = applyMonthStartRamp(monthStartGrace ? null : ramp, 'listing_diff_pct',
+    diffPct > THRESHOLDS.listing_diff_pct.error ? 'error' : diffPct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info',
+    { fact_gross_jpy: factGross, listing_jpy: listingTotal, diff_jpy: factGross - listingTotal },
+    { shortfall: listingTotal - factGross, explainedBy: recentListingJpy(db, 'aupay', monthStartRampWindow(ramp, 'listing_diff_pct')) });
+  if (ld.ramped) rampedChecks.push({ checkName: 'listing_diff_pct', value: diffPct });
+  recordResult('listing_diff_pct', ld.severity, diffPct, THRESHOLDS.listing_diff_pct.error, ld.details);
 } else { recordResult('listing_diff_pct', 'info', null, THRESHOLDS.listing_diff_pct.error, { skipped: true }); }
 
 // Check 3: missing_cost_rate_pct
@@ -147,7 +156,14 @@ const cov = db.prepare(`SELECT
   (SELECT COUNT(*) FROM raw_aupay_orders WHERE substr(replace(order_date,'/','-'),1,7)=?) AS total,
   (SELECT COUNT(*) FROM raw_aupay_orders WHERE substr(replace(order_date,'/','-'),1,7)=? AND order_status='完了' AND item_cancel_status='N') AS wl`).get(monthStr, monthStr);
 const wlPct = cov.total > 0 ? cov.wl / cov.total * 100 : 0;
-recordResult('whitelist_coverage_pct', wlPct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' : wlPct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info', wlPct, THRESHOLDS.whitelist_coverage_pct.warn, { total_lines: cov.total, whitelist_lines: cov.wl });
+// 月初の立ち上がりの ②: whitelist に入っていない行の数 ≤ 直近 2 日 + 今日の受注の行の数
+const wlWin = monthStartRampWindow(ramp, 'whitelist_coverage_pct');
+const wlRecent = wlWin ? db.prepare("SELECT COUNT(*) AS c FROM raw_aupay_orders WHERE substr(replace(order_date,'/','-'),1,10) BETWEEN ? AND ?").get(wlWin.from, wlWin.to).c : null;
+const wl = applyMonthStartRamp(monthStartGrace ? null : ramp, 'whitelist_coverage_pct',
+  wlPct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' : wlPct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info',
+  { total_lines: cov.total, whitelist_lines: cov.wl }, { shortfall: (cov.total || 0) - (cov.wl || 0), explainedBy: wlRecent });
+if (wl.ramped) rampedChecks.push({ checkName: 'whitelist_coverage_pct', value: wlPct });
+recordResult('whitelist_coverage_pct', wl.severity, wlPct, THRESHOLDS.whitelist_coverage_pct.warn, wl.details);
 
 // Check 7: resolved_but_zero_cost_count
 // 原価状態='OVERRIDDEN' AND 原価=0 は人手の意図的 0 円上書き → snapshot=0 (lookup 成功で 0 円) の行のみ除外。
@@ -195,5 +211,7 @@ function printSummary() {
 printSummary();
 // 月初の猶予で通した回は、最後の行を「⚠️ 月初の猶予: …」にする (daily-sync はこの行を要約に出し、warn を立てて見出しを ⚠️ にする)
 if (monthStartGrace && !hasError) console.log(monthStartEmptyNote('f_aupay_finance_sku_daily_v1', monthStr, monthStartGrace));
+// 月初の立ち上がりで下げた回も、最後の行を「⚠️ 月初の立ち上がり: …」にする (daily-sync は見出しを ⚠️ にする)
+else if (rampedChecks.length > 0 && !hasError) console.log(monthStartRampNote(ramp, rampedChecks));
 db.close();
 process.exit(hasError ? 1 : 0);
