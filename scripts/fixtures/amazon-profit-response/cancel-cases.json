@@ -1,0 +1,537 @@
+{
+  "_note": "取り消しの分け方 (response-contract.mjs の CANCEL_MAP・classifyCancellation) の golden = 設計 §3.10「57014 の分け方」の表の全部の行 + 印の優先 + 表に無い組。input の elapsed_ms は分け方に使わない (経過時間の近さでは決めない = R-v3-11 L-new-2)。expect = null は「取り消しでない」(門の対応か FAILURE_PATHS のほかの行)。respond = false は応答を作らない / send_rollback = false は ROLLBACK を送らず接続を捨てる (🆕 #1615 R1 M1 = respond と send_rollback は別々に決める: 印 client_disconnect → 応答なし / 25P04 → 当たった行・印の正しさに関係なく ROLLBACK なし) / failed_months = true は 503 の本文に止まった月",
+  "cases": [
+    {
+      "name": "表 1: 月の本体の文がアプリの timer で取り消された",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": "57014",
+        "mark": {
+          "source": "app_statement_budget",
+          "stage": "month_body"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_PARTIAL_FAILED",
+        "reason": "MONTH_STATEMENT_TIMEOUT",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": true,
+        "log": "month_statement_timeout"
+      }
+    },
+    {
+      "name": "表 2: 負荷の数え上げの文がアプリの timer で取り消された",
+      "input": {
+        "stage": "load_count",
+        "sqlstate": "57014",
+        "mark": {
+          "source": "app_statement_budget",
+          "stage": "load_count"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_RESOURCE",
+        "reason": "RESOURCE_LOAD_COUNT_TIME",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "load_count_statement_timeout"
+      }
+    },
+    {
+      "name": "表 3: 負荷の数え上げの wall-clock の deadline で取り消した",
+      "input": {
+        "stage": "load_count",
+        "sqlstate": "57014",
+        "mark": {
+          "source": "app_deadline",
+          "stage": "load_count"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_RESOURCE",
+        "reason": "RESOURCE_LOAD_COUNT_TIME",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "load_count_deadline"
+      }
+    },
+    {
+      "name": "表 3: deadline が文と文の間で来た (取り消しの例外なし)",
+      "input": {
+        "stage": "load_count",
+        "sqlstate": null,
+        "mark": {
+          "source": "app_deadline",
+          "stage": "load_count"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_RESOURCE",
+        "reason": "RESOURCE_LOAD_COUNT_TIME",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "load_count_deadline"
+      }
+    },
+    {
+      "name": "表 4: HTTP の切断 (負荷の数え上げ) = 応答を作らない",
+      "input": {
+        "stage": "load_count",
+        "sqlstate": "57014",
+        "mark": {
+          "source": "client_disconnect",
+          "stage": "load_count"
+        }
+      },
+      "expect": {
+        "code": null,
+        "reason": null,
+        "respond": false,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "client_disconnect"
+      }
+    },
+    {
+      "name": "表 4: HTTP の切断 (月の本体) = 応答を作らない",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": "57014",
+        "mark": {
+          "source": "client_disconnect",
+          "stage": "month_body"
+        }
+      },
+      "expect": {
+        "code": null,
+        "reason": null,
+        "respond": false,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "client_disconnect"
+      }
+    },
+    {
+      "name": "表 4: HTTP の切断 (SET LOCAL の段) = どの段でも応答を作らない",
+      "input": {
+        "stage": "tx_setup",
+        "sqlstate": "57014",
+        "mark": {
+          "source": "client_disconnect",
+          "stage": "tx_setup"
+        }
+      },
+      "expect": {
+        "code": null,
+        "reason": null,
+        "respond": false,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "client_disconnect"
+      }
+    },
+    {
+      "name": "表 4 × 表 6: HTTP の切断の後に 25P04 = client が居ないので応答を作らない・session が終わったので ROLLBACK も送らない (接続を捨てる)",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": "25P04",
+        "mark": {
+          "source": "client_disconnect",
+          "stage": "month_body"
+        }
+      },
+      "expect": {
+        "code": null,
+        "reason": null,
+        "respond": false,
+        "send_rollback": false,
+        "failed_months": false,
+        "log": "client_disconnect"
+      }
+    },
+    {
+      "name": "表 5: 負荷の数え上げで印の無い 57014 (人・見張りの pg_cancel_backend)",
+      "input": {
+        "stage": "load_count",
+        "sqlstate": "57014",
+        "mark": null
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_EXTERNAL_CANCEL",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "external_cancel"
+      }
+    },
+    {
+      "name": "表 5: 期限の直前の外の取り消し (経過 119.9 秒) も印が無いので unmarked",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": "57014",
+        "mark": null,
+        "elapsed_ms": 119900
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_EXTERNAL_CANCEL",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "external_cancel"
+      }
+    },
+    {
+      "name": "表 6: transaction_timeout (SET LOCAL の段) = ROLLBACK を送らない",
+      "input": {
+        "stage": "tx_setup",
+        "sqlstate": "25P04",
+        "mark": null
+      },
+      "expect": {
+        "code": "PROFIT_RESOURCE",
+        "reason": "RESOURCE_TRANSACTION_TIMEOUT",
+        "respond": true,
+        "send_rollback": false,
+        "failed_months": false,
+        "log": "transaction_timeout"
+      }
+    },
+    {
+      "name": "表 6: transaction_timeout (負荷の数え上げ)",
+      "input": {
+        "stage": "load_count",
+        "sqlstate": "25P04",
+        "mark": null
+      },
+      "expect": {
+        "code": "PROFIT_RESOURCE",
+        "reason": "RESOURCE_TRANSACTION_TIMEOUT",
+        "respond": true,
+        "send_rollback": false,
+        "failed_months": false,
+        "log": "transaction_timeout"
+      }
+    },
+    {
+      "name": "表 6: transaction_timeout は timer の印より先 (session が終わる)",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": "25P04",
+        "mark": {
+          "source": "app_statement_budget",
+          "stage": "month_body"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_RESOURCE",
+        "reason": "RESOURCE_TRANSACTION_TIMEOUT",
+        "respond": true,
+        "send_rollback": false,
+        "failed_months": false,
+        "log": "transaction_timeout"
+      }
+    },
+    {
+      "name": "表 8: SET LOCAL の段の 57014 = 表に無い組",
+      "input": {
+        "stage": "tx_setup",
+        "sqlstate": "57014",
+        "mark": null
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "表 8: lock の文の 57014 = 表に無い組",
+      "input": {
+        "stage": "lock_statement",
+        "sqlstate": "57014",
+        "mark": null
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "表 8: COMMIT の 57014 = 表に無い組",
+      "input": {
+        "stage": "commit",
+        "sqlstate": "57014",
+        "mark": null
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "表 8: 知らない段の 57014",
+      "input": {
+        "stage": "somewhere",
+        "sqlstate": "57014",
+        "mark": null
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "表 8: 月の本体に deadline の印 (deadline は関門だけ) = 表に無い組",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": null,
+        "mark": {
+          "source": "app_deadline",
+          "stage": "month_body"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "表 8: 知らない source の印",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": "57014",
+        "mark": {
+          "source": "timer",
+          "stage": "month_body"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "表 8: 印に unmarked は書かない (書いてあれば表に無い組)",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": "57014",
+        "mark": {
+          "source": "unmarked",
+          "stage": "month_body"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "表 4 × 表 6: HTTP の切断 (SET LOCAL の段) の後に 25P04 = 応答なし・ROLLBACK なし",
+      "input": {
+        "stage": "tx_setup",
+        "sqlstate": "25P04",
+        "mark": {
+          "source": "client_disconnect",
+          "stage": "tx_setup"
+        }
+      },
+      "expect": {
+        "code": null,
+        "reason": null,
+        "respond": false,
+        "send_rollback": false,
+        "failed_months": false,
+        "log": "client_disconnect"
+      }
+    },
+    {
+      "name": "表 8 × 表 6: 知らない source の印で 25P04 = 表に無い組の 503・ROLLBACK は送らない (印の正しさに関係なく)",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": "25P04",
+        "mark": {
+          "source": "timer",
+          "stage": "month_body"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": false,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "表 8 × 表 6: 印に unmarked と書いてあって 25P04 = 表に無い組の 503・ROLLBACK は送らない",
+      "input": {
+        "stage": "load_count",
+        "sqlstate": "25P04",
+        "mark": {
+          "source": "unmarked",
+          "stage": "load_count"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": false,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "表 8 × 表 6: 中身の無い印 ({}) で 25P04 = 表に無い組の 503・ROLLBACK は送らない",
+      "input": {
+        "stage": "commit",
+        "sqlstate": "25P04",
+        "mark": {}
+      },
+      "expect": {
+        "code": "PROFIT_INTERNAL",
+        "reason": "INTERNAL_UNCLASSIFIED_CANCEL",
+        "respond": true,
+        "send_rollback": false,
+        "failed_months": false,
+        "log": "unclassified_cancel"
+      }
+    },
+    {
+      "name": "印の優先: 印を書いた後に文が先に終わった = 結果を使わず 503",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": null,
+        "mark": {
+          "source": "app_statement_budget",
+          "stage": "month_body"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_PARTIAL_FAILED",
+        "reason": "MONTH_STATEMENT_TIMEOUT",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": true,
+        "log": "month_statement_timeout"
+      }
+    },
+    {
+      "name": "印の優先: 印を書いた後に門の例外で終わった = 印の理由",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": "D6L01",
+        "mark": {
+          "source": "app_statement_budget",
+          "stage": "month_body"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_PARTIAL_FAILED",
+        "reason": "MONTH_STATEMENT_TIMEOUT",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": true,
+        "log": "month_statement_timeout"
+      }
+    },
+    {
+      "name": "印の優先: 印の段で引く (timer を張った段 = 負荷の数え上げ)",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": "57014",
+        "mark": {
+          "source": "app_statement_budget",
+          "stage": "load_count"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_RESOURCE",
+        "reason": "RESOURCE_LOAD_COUNT_TIME",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "load_count_statement_timeout"
+      }
+    },
+    {
+      "name": "印の段が無ければ例外を受けた段で引く",
+      "input": {
+        "stage": "load_count",
+        "sqlstate": "57014",
+        "mark": {
+          "source": "app_statement_budget"
+        }
+      },
+      "expect": {
+        "code": "PROFIT_RESOURCE",
+        "reason": "RESOURCE_LOAD_COUNT_TIME",
+        "respond": true,
+        "send_rollback": true,
+        "failed_months": false,
+        "log": "load_count_statement_timeout"
+      }
+    },
+    {
+      "name": "取り消しでない: 印なし・例外なし",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": null,
+        "mark": null
+      },
+      "expect": null
+    },
+    {
+      "name": "取り消しでない: 印なしの門の例外 (D6L01 = HEAVY_GUARD_SQLSTATES の対応)",
+      "input": {
+        "stage": "load_count",
+        "sqlstate": "D6L01",
+        "mark": null
+      },
+      "expect": null
+    },
+    {
+      "name": "取り消しでない: 印なしのほかの例外 (40001)",
+      "input": {
+        "stage": "month_body",
+        "sqlstate": "40001",
+        "mark": null
+      },
+      "expect": null
+    }
+  ]
+}
