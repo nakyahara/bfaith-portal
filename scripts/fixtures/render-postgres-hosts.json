@@ -1,0 +1,21 @@
+{
+  "_what": "Render の Postgres の resource の ID と接続先の host の対応 (scripts/company-db/migrate.mjs の renderResourceMatchesUrl・設計 13 v3.13 ④・Codex R-D60-v3-14 M5)。試験 = scripts/test-company-db-migrate-lock-pg.mjs の C11",
+  "_status": "未確認 = Render に問い合わせ中 (設計 13 §5 の英文の質問 14)。confirmed が false の間は migrate.mjs の RENDER_PG_HOST_MAPPING.confirmed も false = concurrent-index (CIC) を流さない (RESOURCE_MISMATCH/HOST_MAPPING_UNCONFIRMED)。Render の回答で形が決まったら、この file と定数を同じ PR で直す",
+  "_rule": "host の最初の名前 = resource の ID のときだけ一致 (内部 = <ID>・外部 = <ID>.<地域>-postgres.render.com)。connection pool の host の形は未確認 = どれも一致にしない (拒む向き)。password を返す connection-info は使わない",
+  "confirmed": false,
+  "resourceId": "dpg-aaaaaaaaaaaaaaaaaaaa-a",
+  "cases": [
+    { "kind": "internal", "host": "dpg-aaaaaaaaaaaaaaaaaaaa-a", "match": true },
+    { "kind": "external", "host": "dpg-aaaaaaaaaaaaaaaaaaaa-a.singapore-postgres.render.com", "match": true },
+    { "kind": "external (別の地域の形)", "host": "dpg-aaaaaaaaaaaaaaaaaaaa-a.oregon-postgres.render.com", "match": true },
+    { "kind": "pool (形は未確認・仮の形 = 拒む)", "host": "dpg-aaaaaaaaaaaaaaaaaaaa-a-pool.singapore-postgres.render.com", "match": false },
+    { "kind": "pool (形は未確認・仮の形 = 拒む)", "host": "pool-dpg-aaaaaaaaaaaaaaaaaaaa-a.singapore-postgres.render.com", "match": false },
+    { "kind": "別の resource (内部)", "host": "dpg-bbbbbbbbbbbbbbbbbbbb-a", "match": false },
+    { "kind": "別の resource (外部)", "host": "dpg-bbbbbbbbbbbbbbbbbbbb-a.singapore-postgres.render.com", "match": false },
+    { "kind": "ID の後ろに余り", "host": "dpg-aaaaaaaaaaaaaaaaaaaa-ax.singapore-postgres.render.com", "match": false },
+    { "kind": "render.com でない", "host": "dpg-aaaaaaaaaaaaaaaaaaaa-a.evil.example.com", "match": false },
+    { "kind": "render.com の後ろに余り", "host": "dpg-aaaaaaaaaaaaaaaaaaaa-a.singapore-postgres.render.com.evil.example", "match": false },
+    { "kind": "loopback (tunnel)", "host": "127.0.0.1", "match": false },
+    { "kind": "localhost", "host": "localhost", "match": false }
+  ]
+}
