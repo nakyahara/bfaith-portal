@@ -403,7 +403,7 @@ export function requestPrecheck(db, { draft, productInfo, spec, images, idempote
     return { code: 'already_running', error: 'この商品の構成をいま作っています' };
   }
   if (db.prepare(`SELECT 1 FROM ph_lp_compose_jobs j JOIN ph_lp_compose_generations g ON g.job_id = j.id
-    WHERE j.draft_id = ? AND j.status = 'done' AND g.model_check IS NULL LIMIT 1`).get(draftId)) {
+    WHERE j.draft_id = ? AND (j.status = 'done' OR (j.status = 'failed' AND j.error_code = 'rejected')) AND g.model_check IS NULL LIMIT 1`).get(draftId)) {
     return { code: 'already_running', error: 'この商品の構成を作ったモデルをいま確かめています' };
   }
   return null;
@@ -452,7 +452,7 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
     //    確認は 15 分で必ず閉じる (recoverExpired) ので、ずっと押せなくなることはない
     const checking = db.prepare(`SELECT j.* FROM ph_lp_compose_jobs j
       JOIN ph_lp_compose_generations g ON g.job_id = j.id
-      WHERE j.draft_id = ? AND j.status = 'done' AND g.model_check IS NULL LIMIT 1`).get(draftId);
+      WHERE j.draft_id = ? AND (j.status = 'done' OR (j.status = 'failed' AND j.error_code = 'rejected')) AND g.model_check IS NULL LIMIT 1`).get(draftId);
     if (checking) return { code: 'already_running', error: 'この商品の構成を作ったモデルをいま確かめています', job: checking };
     let id;
     try {

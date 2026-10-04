@@ -274,6 +274,10 @@ console.log('⑦b 🚨 チェックを通らなかった構成も残す (2026-10
   eq(db.prepare('SELECT output_text FROM ph_lp_compose_jobs WHERE id = ?').get(cR.job.job_id).output_text, DRAFT, '🚨 書いた構成を残す');
   const pre = lp.jobStateFor(db, dR.id, { now: min(5013.1) }).job;
   ok(pre.draft_text === null && pre.output_text === null, '実モデルの確認前は出さない');
+  eq(lp.requestJob(db, args(dR, s2.spec, 'key-rej-1b', { now: min(5013.15) })).code, 'already_running',
+    '🚨 確認前の rejected がある間は再依頼を受けない (参考の構成が画面から消えないように・codex #1609 High)');
+  eq(lp.requestPrecheck(db, { draft: dR, productInfo: 'x', spec: s2.spec, images: [{ file_id: 'FILEID000001', role: 'slot:1' }], idempotencyKey: 'key-rej-1c', now: min(5013.15) }).code,
+    'already_running', '先の検査も同じ');
   lp.recordModelCheck(db, { runnerRunId: 'lpr-20261004-120000-rejrej', actualModels: ['claude-opus-5-5'], now: min(5013.2) });
   const st = lp.jobStateFor(db, dR.id, { now: min(5013.3) }).job;
   ok(st.status === 'failed' && st.draft_text === DRAFT, '🚨 一致したら「チェックを通らなかった構成」として画面に出す');

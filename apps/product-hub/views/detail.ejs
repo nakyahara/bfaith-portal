@@ -5882,7 +5882,11 @@ th.attr-unknown { color: #dc2626; }
     // できてから実モデルの確認が付くまで (ふつうは数十秒〜2 分) 見に行く。上限は置かない —
     // サーバが 15 分付かなければ「未確認」で閉じる (= needs_review になってポーリングも止まる)。
     // 🚨 completed_at を基準にしない: lease 切れの後に結果が届いた依頼は completed_at が古いまま (codex #1591 R3 Low)
-    const checkingModel = (job) => !!job && !!job.model && !job.model_check && job.status === 'done';
+    // lpc-checking:start (試験がここを切り出して動かす)
+    // チェックを通らなかった (rejected) 依頼も、確認が付くまでは待つ (付けば参考の構成が出る・codex #1609 High)
+    const checkingModel = (job) => !!job && !!job.model && !job.model_check
+      && (job.status === 'done' || (job.status === 'failed' && job.error_code === 'rejected'));
+    // lpc-checking:end
 
     // lpc-images-text:start (試験がここを切り出して動かす・scripts/test-ph-lp-compose-ui.mjs)
     // AI に渡す画像の並び。作っている間・確認待ちの間はその依頼で渡した画像だけ。終わった後は
@@ -5952,6 +5956,8 @@ th.attr-unknown { color: #dc2626; }
       } else if (job.status === 'needs_review') {
         // 🚨 成否不明。自動では作り直さない (AI 枠を使ったかもしれないので人が見る)
         statusEl.textContent = '結果を受け取れませんでした。もう一度依頼してください';
+      } else if (job.status === 'failed' && job.error_code === 'rejected' && checkingModel(job)) {
+        statusEl.textContent = '⚠️ チェックを通りませんでした。作ったモデル (' + job.model_label + ') を確かめています… 確かめたら書いた構成を参考として出します';
       } else if (job.status === 'failed' && job.draft_text) {
         statusEl.textContent = '⚠️ チェックを通りませんでした。書いた構成は下に参考として出しています (' + (job.elapsed_sec || 0) + ' 秒)';
       } else if (job.status === 'failed') {
