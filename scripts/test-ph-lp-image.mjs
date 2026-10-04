@@ -12,7 +12,7 @@ await temporaryTestDataDir(import.meta.url, 'test-lp-image-');
  *   ④ prompt と参考画像は受付時に固定・1 商品に動いている依頼は 1 つ・同じキーの再送は前の依頼
  */
 process.env.PH_LP_COMPOSE_ENABLED = '1';
-const ENV = { PH_LP_IMAGE_ENABLED: '1', OPENAI_LP_IMAGE_API_KEY: 'sk-test-lp-image' };
+const ENV = { PH_LP_IMAGE_ENABLED: '1', OPENAI_LP_IMAGE_API_KEY: 'sk-test-lp-image', PH_LP_MONTHLY_BUDGET_JPY: '3000' };
 for (const [k, v] of Object.entries(ENV)) process.env[k] = v;
 
 const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
@@ -32,7 +32,7 @@ const FOLDER = '1MtcKdnRZPf1iqKiNxMJ1ODDPJE3vX9JR';
 const spec = lp.importSpec(db, { kind: 'product_analysis', title: 'LP制作システム', body: '本文 V2.2', sheetTitles: ['出力形式'], actor: 't' }).spec;
 let seqNo = 0;
 /** 構成ができた (done・実モデル一致) 商品を 1 つ作る */
-function makeComposed(output, { images = [{ file_id: 'FILEIDWHITE01', role: 'white_bg' }, { file_id: 'FILEIDTOP0001', role: 'slot:1' }] } = {}) {
+function makeComposed(output, { images = [{ file_id: 'FILEIDWHITE01', role: 'white_bg', modified_time: '2026-10-01T00:00:00.000Z' }, { file_id: 'FILEIDTOP0001', role: 'slot:1', modified_time: '2026-10-01T00:00:00.000Z' }] } = {}) {
   seqNo++;
   const name = 'ハッカ油スプレー';
   const id = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, drive_folder_url, created_by) VALUES (?, ?, ?, 't')`)
@@ -55,7 +55,11 @@ console.log('① 設定 (fail-closed・品質段は low / medium / high だけ)'
 {
   const c = li.lpImageConfig(ENV);
   ok(c.usable && c.model === 'gpt-image-2.5-flare' && c.quality === 'medium' && c.budget === 3000 && c.size === '1200x1200',
-    '既定 = flare・medium・月 3,000 円・1200x1200 (中原さん「全部おすすめ」)');
+    '既定 = flare・medium・1200x1200・上限は書いた値 (中原さん「全部おすすめ」= 3,000 円)');
+  const noBudget = li.lpImageConfig({ PH_LP_IMAGE_ENABLED: '1', OPENAI_LP_IMAGE_API_KEY: 'k' });
+  ok(!noBudget.usable && /月の上限が書かれていません/.test(noBudget.error), '🚨 月の上限が書かれていなければ作らない (検討 §6 層2・中原さん 2026-10-04)');
+  ok(c.safety === 150 && c.spendable === 2850, '安全幅 = 5% (最低 100 円)・呼んでよいのは 2,850 円まで');
+  ok(li.lpImageConfig({ ...ENV, PH_LP_MONTHLY_BUDGET_JPY: '500' }).spendable === 400, '小さい上限でも安全幅は最低 100 円');
   ok(!li.lpImageConfig({ ...ENV, PH_LP_IMAGE_ENABLED: '' }).usable, '機能フラグが無ければ使えない');
   ok(!li.lpImageConfig({ PH_LP_IMAGE_ENABLED: '1' }).usable, '🚨 キーが無ければ使えない');
   ok(/OPENAI_LP_IMAGE_API_KEY/.test(li.lpImageConfig({ PH_LP_IMAGE_ENABLED: '1', OPENAI_API_KEY: 'sk-other' }).error), '🚨 問い合わせハブのキー名 (OPENAI_API_KEY) は読まない (名前を分ける・検討 §6 層1)');
@@ -72,12 +76,12 @@ console.log('② 費用の計算 (検討 §5.1 の単価・少なく数えない
   eq(li.costJpyFromUsage({ input_tokens: 4000, output_tokens: 439, input_tokens_details: { text_tokens: 1000, image_tokens: 3000 } }), 6.75, '円に直す');
   eq(li.costJpyFromUsage(null), null, 'usage が無ければ null (見込み額のまま)');
   eq(li.jstMonth(Date.parse('2026-10-31T15:30:00Z')), '2026-11', '月は JST で区切る');
-  // 取り置き = これ以上はかからない額 (#1612 R1 High)。medium・参考 2 枚・4,000 字 → (6000×5 + 6000×8 + 2000×30)/1e6 × 170
-  eq(li.reserveJpy({ quality: 'medium', refs: 2, promptChars: 4000 }), 23.46, '取り置きの計算 (medium・参考 2 枚・4,000 字)');
-  ok(li.reserveJpy({ quality: 'high', refs: 4, promptChars: 4000 }) > li.reserveJpy({ quality: 'medium', refs: 4, promptChars: 4000 }), '品質段が上がれば取り置きも上がる');
-  ok(li.reserveJpy({ quality: 'medium', refs: 4, promptChars: 4000 }) > li.reserveJpy({ quality: 'medium', refs: 1, promptChars: 4000 }), '参考画像が多ければ上がる');
-  ok(li.reserveJpy({ quality: 'medium', refs: 2, promptChars: 4000 }) > li.costJpyFromUsage({ input_tokens: 4000, output_tokens: 439, input_tokens_details: { text_tokens: 1000, image_tokens: 3000 } }), '🚨 取り置きは実際の額より大きい');
-  eq(li.reserveJpy({ quality: 'max', refs: 2, promptChars: 10 }), null, '知らない品質段は取り置けない (= 作らない)');
+  // 取り置き (#1612 R2): 文は UTF-8 のバイト数。medium・参考 2 枚・4,000 バイト → (4000×5 + 12000×8 + 4000×30)/1e6 × 170
+  eq(li.reserveJpy({ quality: 'medium', refs: 2, promptBytes: 4000 }), 40.12, '取り置きの計算 (medium・参考 2 枚・4,000 バイト)');
+  ok(li.reserveJpy({ quality: 'high', refs: 4, promptBytes: 4000 }) > li.reserveJpy({ quality: 'medium', refs: 4, promptBytes: 4000 }), '品質段が上がれば取り置きも上がる');
+  ok(li.reserveJpy({ quality: 'medium', refs: 4, promptBytes: 4000 }) > li.reserveJpy({ quality: 'medium', refs: 1, promptBytes: 4000 }), '参考画像が多ければ上がる');
+  ok(li.reserveJpy({ quality: 'medium', refs: 2, promptBytes: 4000 }) > li.costJpyFromUsage({ input_tokens: 4000, output_tokens: 439, input_tokens_details: { text_tokens: 1000, image_tokens: 3000 } }), '🚨 取り置きは実際の額より大きい');
+  eq(li.reserveJpy({ quality: 'max', refs: 2, promptBytes: 10 }), null, '知らない品質段は取り置けない (= 作らない)');
 }
 
 console.log('③ 作る画像の一覧 (prompt と参考画像)');
@@ -101,6 +105,9 @@ console.log('③ 作る画像の一覧 (prompt と参考画像)');
   ok(withMat.prompt.includes('素材 (素材/使用イメージ/玄関.jpg)'), 'prompt に参考画像の中身を書く');
   ok(li.buildImagePlan({ outputText: 'ただの文章', packet }).error, '画像のブロックが無ければ作らない');
   eq(noMat.refs[0].modified_time, '2026-10-01T00:00:00.000Z', '参考画像は Drive の更新日時も固定する (作る前に照らす)');
+  const plan2 = li.buildImagePlan({ outputText: out, packet, refTimes: { FILEIDTOP0001: '2026-10-03T00:00:00.000Z' } });
+  eq(plan2.images.find((im) => !im.refs.some((r) => /^material:/.test(r.role || ''))).refs[1].modified_time, '2026-10-03T00:00:00.000Z', '受付時に Drive から取り直した更新日時を使う (packet の空欄を埋める)');
+  ok(Buffer.byteLength(plan.images[0].prompt, 'utf8') > plan.images[0].prompt.length, '日本語の prompt はバイト数のほうが大きい (取り置きはバイト数で見る)');
   ok(plan.images.every((im) => im.est_jpy > 0) && withMat.est_jpy > noMat.est_jpy, '1 枚ずつ取り置き額を出す (素材を渡す画像は高い)');
 }
 
@@ -116,6 +123,12 @@ const A = makeComposed();
   const noCompose = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('X1', 'x', 't')`).run().lastInsertRowid));
   ok(/構成を作って/.test(li.imageBlockReason(db, { draft: noCompose, folderId: FOLDER, env: ENV, now: T0 })), '構成ができていなければ押せない');
   eq(li.requestImageJob(db, { draft: A.draft, folderId: FOLDER, idempotencyKey: 'x', env: ENV, now: T0 }).code, 'bad_request', 'キーの形');
+  const Z = makeComposed(undefined, { images: [{ file_id: 'FILEIDNOTIME1', role: 'white_bg' }] });
+  const rz = li.requestImageJob(db, { draft: Z.draft, folderId: FOLDER, idempotencyKey: 'img-key-z001', env: ENV, now: T0 });
+  ok(rz.code === 'not_ready' && /更新日時/.test(rz.error), '🚨 更新日時の分からない参考画像があれば受け付けない (#1612 R2 Medium)');
+  eq(li.imageRefCandidates(db, Z.draft.id), ['FILEIDNOTIME1'], '受付の前に Drive で日時を取り直す候補');
+  ok(li.requestImageJob(db, { draft: Z.draft, folderId: FOLDER, idempotencyKey: 'img-key-z002', refTimes: { FILEIDNOTIME1: '2026-10-01T00:00:00.000Z' }, env: ENV, now: T0 }).ok, '取り直した日時があれば受け付ける');
+  db.prepare(`UPDATE ph_lp_image_jobs SET status = 'cancelled' WHERE draft_id = ?`).run(Z.draft.id);
   const r1 = li.requestImageJob(db, { draft: A.draft, folderId: FOLDER, idempotencyKey: 'img-key-0001', actor: 'u@x', env: ENV, now: T0 });
   ok(r1.ok && r1.created && r1.job.status === 'queued', '受け付ける');
   ok(r1.job.model === 'gpt-image-2.5-flare' && r1.job.quality === 'medium' && r1.job.folder_id === FOLDER, 'モデル・品質段・保存先を受付時に固定');
@@ -184,7 +197,9 @@ console.log('⑥ 作る係 — お金の上限で止める (fail-closed)');
   const used0 = li.monthUsage(db, T0).used_jpy;
   const cap = Math.ceil(used0 + 6.75 + est[1]) + 1;
   ok(used0 + est[0] <= cap && used0 + 13.5 + est[2] > cap, `上限の組み立て (使った ${used0} 円・取り置き ${est.join(' / ')} 円・上限 ${cap} 円)`);
-  const env = { ...ENV, PH_LP_MONTHLY_BUDGET_JPY: String(cap) };
+  // 呼んでよい額 = 上限 − 安全幅 (この大きさでは最低の 100 円)。cap を呼んでよい額にする
+  const env = { ...ENV, PH_LP_MONTHLY_BUDGET_JPY: String(cap + 100) };
+  eq(li.lpImageConfig(env).spendable, cap, '呼んでよい額 = cap');
   const { deps, calls } = fakeDeps({ env });
   await li.createLpImageWorker(deps).kick();
   const ims = imagesOf(r.job.id);
@@ -269,6 +284,42 @@ console.log('⑧b 「AI初稿」は作る前に用意する・参考画像の差
   ok(ims.slice(1).every((im) => im.status === 'done'), 'ほかの画像は続ける');
 }
 
+console.log('⑧c 取り置きを超えた請求・保存の ID・時間の上限 (#1612 R2)');
+{
+  const K = makeComposed();
+  const r = li.requestImageJob(db, { draft: K.draft, folderId: FOLDER, idempotencyKey: 'img-key-k001', env: ENV, now: T0 });
+  const est = imagesOf(r.job.id).map((im) => im.est_jpy);
+  const used0 = li.monthUsage(db, T0).used_jpy;
+  // 1 枚目だけ取り置きの 3 倍かかったことにする → 2 枚目は呼んでよい額を超えて止まる
+  const bigOut = Math.ceil((est[0] * 3) / 160 / 30 * 1_000_000);
+  const capK = Math.ceil(used0 + est[0]) + 1;   // 1 枚目は呼べる / 1 枚目の実額 (取り置きの 3 倍) の後は 2 枚目を呼べない
+  const envK = { ...ENV, PH_LP_MONTHLY_BUDGET_JPY: String(capK + 100) };
+  let n = 0;
+  const fk = fakeDeps({ env: envK, generate: async () => { n++; return { buf: Buffer.from('P'), usage: { input_tokens: 0, output_tokens: bigOut } }; } });
+  await li.createLpImageWorker(fk.deps).kick();
+  const u = usageOf(r.job.id);
+  ok(u[0].status === 'charged' && u[0].cost_jpy > est[0] && /取り置き/.test(u[0].error || ''), '🚨 取り置きを超えた請求も実額のまま正直に記録する (目印つき)');
+  eq(imagesOf(r.job.id).map((im) => im.status), ['done', 'skipped', 'skipped'], '🚨 超えた分を数えて、次の 1 枚からは止まる');
+  eq(n, 1, 'API は 1 回だけ');
+
+  const L = makeComposed();
+  const r2 = li.requestImageJob(db, { draft: L.draft, folderId: FOLDER, idempotencyKey: 'img-key-l001', env: ENV, now: T0 });
+  const fl = fakeDeps({ upload: async () => undefined });
+  await li.createLpImageWorker(fl.deps).kick();
+  const imsL = imagesOf(r2.job.id);
+  ok(imsL[0].status === 'failed' && /ID が返ってきませんでした/.test(imsL[0].error) && imsL[0].drive_file_id === null, '🚨 保存の ID が返らなければ「できました」にしない (#1612 R2 Low)');
+  ok(imsL.slice(1).every((im) => im.status === 'skipped'), '残りは作らない');
+
+  const M = makeComposed();
+  const r3 = li.requestImageJob(db, { draft: M.draft, folderId: FOLDER, idempotencyKey: 'img-key-m001', env: ENV, now: T0 });
+  const fm = fakeDeps({ timeouts: { ref: 30 }, fetchRef: () => new Promise(() => {}) });   // 返ってこない Drive
+  const w = li.createLpImageWorker(fm.deps);
+  await w.kick();
+  ok(!w.isRunning(), '🚨 Drive が返ってこなくても作る係は止まり続けない (時間の上限・#1612 R2 Medium)');
+  ok(imagesOf(r3.job.id).every((im) => im.status === 'failed' && /終わりませんでした/.test(im.error)), '時間切れは失敗として残す (呼ぶ前なので 0 円)');
+  ok(usageOf(r3.job.id).every((x) => x.cost_jpy === 0), 'まだ呼んでいないので 0 円');
+}
+
 console.log('⑨ 再起動の片付け (recover)');
 {
   const F = makeComposed();
@@ -336,6 +387,14 @@ console.log('⑪ 画面の口 (router)');
   ok(html.includes('id="lpi-btn"') && html.includes('id="lpi-json"'), '詳細画面に「🖼 画像を作る」がある');
   const bad = await fetch(`${base}/api/drafts/${G.draft.id}/lp-images`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'x' }) });
   eq(bad.status, 400, 'POST: キーの形が違えば 400');
+  const savedKey = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  const nBefore = db.prepare('SELECT COUNT(*) AS n FROM ph_lp_image_jobs WHERE draft_id = ?').get(G.draft.id).n;
+  const p502 = await fetch(`${base}/api/drafts/${G.draft.id}/lp-images`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'img-key-g001' }) });
+  const j502 = await p502.json();
+  ok(p502.status === 502 && j502.code === 'refs_unavailable', '🚨 参考画像の更新日時を Drive から取れなければ受け付けない (502)');
+  eq(db.prepare('SELECT COUNT(*) AS n FROM ph_lp_image_jobs WHERE draft_id = ?').get(G.draft.id).n, nBefore, '依頼は作られない');
+  if (savedKey !== undefined) process.env.GOOGLE_SERVICE_ACCOUNT_KEY = savedKey;
   const thumb = await fetch(`${base}/api/thumb/NOTREGISTERED0001`);
   eq(thumb.status, 404, '登録されていない ID のサムネイルは見せない (今までどおり)');
   process.env.PH_LP_IMAGE_ENABLED = '';
