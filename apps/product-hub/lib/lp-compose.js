@@ -725,7 +725,9 @@ export function reserveGeneration(db, jobId, { leaseToken, model, promptVersion,
  * job だけ進んで generation が reserved のまま残る経路を作らない。
  *
  * - `verdict: 'accepted'` … lint も検品も通った → job = done。output を保存する
- * - `verdict: 'rejected'` … lint / 検品が 2 巡で通らなかった → job = failed。理由を残す
+ * - `verdict: 'rejected'` … lint / 検品が 2 巡で通らなかった → job = failed。理由を残す。
+ *   **書いた構成 (output) があれば一緒に残す** (2026-10-04 中原さん「A」): 段階1 は AI と人のくらべっこなので、
+ *   チェックで落ちた構成も捨てずに画面に出し、使えるかは人が決める (検品の指摘 = reason を横に出す)
  *
  * **確定済み + 同じ payload の再送は保存済みの receipt を返す** (通信断のリトライで二重に書かない)。
  * lease が切れていても受ける — AI 枠は既に消費しているので、結果は取りこぼさない (④)。
@@ -740,8 +742,8 @@ export function submitResult(db, generationId, {
   const out = output == null ? '' : String(output);
   if (v === 'accepted') {
     if (!out.trim()) return { code: 'bad_request', error: '構成の本文が空です' };
-    if (out.length > OUTPUT_MAX) return { code: 'too_large', error: `構成が大きすぎます (${OUTPUT_MAX} 文字まで)` };
   }
+  if (out.length > OUTPUT_MAX) return { code: 'too_large', error: `構成が大きすぎます (${OUTPUT_MAX} 文字まで)` };
   // 🚨 実行役から来た値の検査は **payloadHash を作る前**。canonicalJson は循環参照で
   //    スタックを溢れさせるので、先に JSON にできるかを確かめる (コード R1 #5)
   // 範囲外を黙って null にしない — 未指定と区別できず、別の再送が同じ payloadHash になる (コード R5)
@@ -885,10 +887,12 @@ export function submitResult(db, generationId, {
         .run(out, sha256(out), storedLint, rounds, nowS, nowS, nowS, job.id).changes
       : db.prepare(`UPDATE ph_lp_compose_jobs
           SET status = 'failed', lint_json = ?, review_rounds = ?, error_code = 'rejected', error = ?,
+              output_text = ?, output_hash = ?,
               lease_token = NULL, lease_until = NULL,
               updated_at = ?, completed_at = COALESCE(completed_at, ?), finalized_at = ?
           WHERE id = ? AND status IN ('running', 'needs_review')`)
-        .run(storedLint, rounds, reasonText || '検品で通らなかった', nowS, nowS, nowS, job.id).changes;
+        .run(storedLint, rounds, reasonText || '検品で通らなかった', out.trim() ? out : null, out.trim() ? sha256(out) : null,
+          nowS, nowS, nowS, job.id).changes;
 
     if (genCh !== 1 || jobCh !== 1) {
       throw new Error(`lp-compose: 結果の確定で行が動かなかった (generation=${genCh} job=${jobCh})`);
@@ -1213,6 +1217,9 @@ export function jobStateFor(db, draftId, { now = Date.now() } = {}) {
       // 🚨 本文を出すのは「実モデルが頼んだモデルと一致」した done だけ (codex exec review #1591 R2 High)。
       //    確認中 (null) は出さない — 確認の前にコピーされて使われると、不一致でも取り返せない
       output_text: job.status === 'done' && gen?.model_check === 'match' ? job.output_text : null,
+      // チェック (lint / Codex 検品) を通らなかった構成 (参考)。人が見て使えるか決める (中原さん「A」)。
+      // 本文と同じく、実モデルが一致したものだけ出す
+      draft_text: job.status === 'failed' && job.error_code === 'rejected' && gen?.model_check === 'match' ? (job.output_text || null) : null,
       packet_hash: job.packet_hash,
       // この依頼で AI に渡した画像の並び (受付時に固定)。スタッフ版に同じ画像を同じ順で添付し、測定行にも残す
       images: (() => { try { return imagePlan(JSON.parse(job.packet_json).images); } catch { return []; } })(),

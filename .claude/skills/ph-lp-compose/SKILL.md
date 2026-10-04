@@ -29,7 +29,7 @@ description: product-hub の「構成をAIに作らせる」の実行役 — cla
 ./phlp reserve ID                             🚨 **構成を書き始める前に必ず**
 ./phlp lint    ID --file out-ID.md             lint (サーバが正本・AI 枠を使わないので何度でも)
 ./phlp result  ID --accepted --file out-ID.md --lint lint-ID.json --rounds N
-./phlp result  ID --rejected --reason-file reason-ID.txt --lint lint-ID.json --rounds N
+./phlp result  ID --rejected --reason-file reason-ID.txt --file out-ID.md --lint lint-ID.json --rounds N
 ./phlp fail    ID --code CODE --message "…"   予約の**前**だけ
 ./phlp release ID --reason "…"                予約の**前**だけ (一時障害)
 ./phlp clean   ID                             一時ファイルを消す (rm は使えない)
@@ -191,10 +191,14 @@ critical / high の指摘があれば `out-<ID>.md` を直して、`_lp_review_<
 🚨 **2 巡で critical / high が消えなければ、そこで打ち切って `rejected`**:
 
 ```bash
-./phlp result <ID> --rejected --reason-file reason-<ID>.txt --lint lint-<ID>.json --rounds 2
+./phlp result <ID> --rejected --reason-file reason-<ID>.txt --file out-<ID>.md --lint lint-<ID>.json --rounds 2
 ```
 
-`reason-<ID>.txt` には「何が通らなかったか」を具体的に書く (1000 字まで)。
+🚨 **書いた構成 (`out-<ID>.md`) があれば必ず `--file` で渡す** (2026-10-04 中原さん)。
+チェックを通らなかった構成として画面に出し、使えるかどうかは人が決める (くらべっこなので捨てない)。
+書けなかった (out が無い) ときだけ `--file` を付けない。
+
+`reason-<ID>.txt` には「何が通らなかったか」を具体的に書く (1000 字まで・画面で構成の横に出る)。
 **これは失敗ではなく測定結果。** 正直に書く。
 
 ### 7. 書き戻す

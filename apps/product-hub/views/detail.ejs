@@ -1629,6 +1629,20 @@ th.attr-unknown { color: #dc2626; }
             <%# 🚨 失敗したときの説明はここ。lint の中身 (lpc-lint) は「できた」ときの箱の中にあるので、
                 失敗したときは見えない (codex exec review P2) %>
             <div id="lpc-fail" hidden class="muted" style="font-size:11px; margin-top:4px; color:#b45309;"></div>
+            <%# チェック (Codex 検品など) を通らなかった構成 (参考)。捨てずに出して、使えるかは人が決める
+                (2026-10-04 中原さん「A」: 段階1 は AI と人のくらべっこなので、落ちた構成も比べる材料) %>
+            <div id="lpc-draft" hidden style="margin-top:8px; background:#fffbeb; border:1px solid #fcd34d; border-radius:8px; padding:8px;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:4px;">
+                <strong style="font-size:13px;">⚠️ チェックを通らなかった構成 (参考)</strong>
+                <button type="button" class="btn btn-sm" id="lpc-draft-copy">コピー</button>
+                <span class="muted" id="lpc-draft-result" style="font-size:12px;"></span>
+              </div>
+              <div class="muted" style="font-size:11px; margin-bottom:4px;">
+                AI は最後まで書きましたが、チェック役に指摘が残りました。下の「指摘されたこと」を読んで、使えるかどうかを決めてください
+              </div>
+              <div id="lpc-draft-reason" style="font-size:12px; white-space:pre-wrap; background:#fff; border:1px solid #fde68a; border-radius:6px; padding:6px; margin-bottom:6px;"></div>
+              <textarea id="lpc-draft-text" rows="12" readonly style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
+            </div>
             <%# 測定台帳 (設計 §7.1b) に書き写す値。画面は作らない方針なので、
                 台帳に要る「機械が知っている事実」だけをここに並べる %>
             <div id="lpc-meas" hidden class="muted" style="font-size:11px; margin-top:4px; font-family:ui-monospace, monospace; word-break:break-all;"></div>
@@ -5829,6 +5843,9 @@ th.attr-unknown { color: #dc2626; }
     const failEl = document.getElementById('lpc-fail');
     const measEl = document.getElementById('lpc-meas');
     const imagesEl = document.getElementById('lpc-images');
+    const draftEl = document.getElementById('lpc-draft');
+    const draftTextEl = document.getElementById('lpc-draft-text');
+    const draftReasonEl = document.getElementById('lpc-draft-reason');
     const guideEl = document.getElementById('lpc-guide');
     const guideTextEl = document.getElementById('lpc-guide-text');
 
@@ -5935,6 +5952,8 @@ th.attr-unknown { color: #dc2626; }
       } else if (job.status === 'needs_review') {
         // 🚨 成否不明。自動では作り直さない (AI 枠を使ったかもしれないので人が見る)
         statusEl.textContent = '結果を受け取れませんでした。もう一度依頼してください';
+      } else if (job.status === 'failed' && job.draft_text) {
+        statusEl.textContent = '⚠️ チェックを通りませんでした。書いた構成は下に参考として出しています (' + (job.elapsed_sec || 0) + ' 秒)';
       } else if (job.status === 'failed') {
         statusEl.textContent = '作れませんでした: ' + (job.error || '理由が残っていません');
       } else {
@@ -5951,6 +5970,13 @@ th.attr-unknown { color: #dc2626; }
       }
       // 失敗したときも lint が残っていれば何がひっかかったかを出す (直す手がかり)。
       // 🚨 出す場所は resultEl の**外**。中に書くと「できた」ときしか見えない (codex exec review P2)
+      // チェックを通らなかった構成 (参考)。本文と同じく、実モデルが一致したものだけサーバが返す
+      const draft = !!job && job.status === 'failed' && typeof job.draft_text === 'string' && job.draft_text ? job.draft_text : '';
+      draftEl.hidden = !draft;
+      if (draft) {
+        if (draftTextEl.value !== draft) draftTextEl.value = draft;
+        draftReasonEl.textContent = '指摘されたこと: ' + (job.error || '(理由が残っていません)');
+      }
       const failing = !!job && job.status === 'failed' && job.lint && job.lint.ok === false;
       failEl.hidden = !failing;
       if (failing) {
@@ -6030,6 +6056,11 @@ th.attr-unknown { color: #dc2626; }
       }
     });
 
+    document.getElementById('lpc-draft-copy').addEventListener('click', async () => {
+      const r = document.getElementById('lpc-draft-result');
+      try { await navigator.clipboard.writeText(draftTextEl.value); r.textContent = 'コピーしました (指摘されたことを直してから使ってください)'; }
+      catch (e) { draftTextEl.select(); r.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }
+    });
     document.getElementById('lpc-guide-copy').addEventListener('click', async () => {
       const r = document.getElementById('lpc-guide-result');
       try { await navigator.clipboard.writeText(guideTextEl.value); r.textContent = 'コピーしました。ChatGPT 版の定型文の最後に貼ってください'; }

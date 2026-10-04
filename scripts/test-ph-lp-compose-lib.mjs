@@ -258,6 +258,38 @@ eq(jRej.error_code, 'rejected', '理由が残る');
 ok(!!jRej.completed_at, 'rejected でも completed_at が入る');
 eq(db.prepare('SELECT status FROM ph_lp_compose_generations WHERE id = ?').get(g2.generation_id).status, 'rejected',
   '🚨 generation も確定する (reserved のまま残さない)');
+eq(jRej.output_text, null, '構成を送らなければ何も残らない (書けなかったとき)');
+
+console.log('⑦b 🚨 チェックを通らなかった構成も残す (2026-10-04 中原さん「A」: くらべっこなので捨てない)');
+{
+  const dR = mkDraft('LP-REJ', 'ハッカ油スプレー REJ');
+  lp.requestJob(db, args(dR, s2.spec, 'key-rej-1', { now: min(5012) }));
+  const cR = lp.claimJob(db, { runnerRunId: 'lpr-20261004-120000-rejrej', now: min(5012) });
+  const gR = lp.reserveGeneration(db, cR.job.job_id, { leaseToken: cR.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(5012) });
+  const DRAFT = '# LP制作システム\n(チェックで指摘が残った構成の下書き)';
+  eq(lp.submitResult(db, gR.generation_id, { packetHash: cR.job.packet_hash, verdict: 'rejected', output: 'x'.repeat(lp.OUTPUT_MAX + 1), reason: 'r', now: min(5013) }).code,
+    'too_large', '大きすぎる下書きは断る');
+  const sR = lp.submitResult(db, gR.generation_id, { packetHash: cR.job.packet_hash, verdict: 'rejected', output: DRAFT, reviewRounds: 2, reason: '2 巡目に high が 3 件 (縦の配分が 100% を超える ほか)', now: min(5013) });
+  eq(sR.status, 'failed', 'rejected は failed のまま');
+  eq(db.prepare('SELECT output_text FROM ph_lp_compose_jobs WHERE id = ?').get(cR.job.job_id).output_text, DRAFT, '🚨 書いた構成を残す');
+  const pre = lp.jobStateFor(db, dR.id, { now: min(5013.1) }).job;
+  ok(pre.draft_text === null && pre.output_text === null, '実モデルの確認前は出さない');
+  lp.recordModelCheck(db, { runnerRunId: 'lpr-20261004-120000-rejrej', actualModels: ['claude-opus-5-5'], now: min(5013.2) });
+  const st = lp.jobStateFor(db, dR.id, { now: min(5013.3) }).job;
+  ok(st.status === 'failed' && st.draft_text === DRAFT, '🚨 一致したら「チェックを通らなかった構成」として画面に出す');
+  eq(st.output_text, null, '「できた本文」(done 用) には出さない (参考扱いを混ぜない)');
+  ok((st.error || '').includes('縦の配分'), '指摘されたこと (reason) も画面に渡る');
+  const again = lp.submitResult(db, gR.generation_id, { packetHash: cR.job.packet_hash, verdict: 'rejected', output: DRAFT, reviewRounds: 2, reason: '2 巡目に high が 3 件 (縦の配分が 100% を超える ほか)', now: min(5014) });
+  ok(again.ok && again.already, '同じ内容の再送は保存済みを返す');
+  // 不一致なら出さない
+  const dR2 = mkDraft('LP-REJ2', 'ハッカ油スプレー REJ2');
+  lp.requestJob(db, args(dR2, s2.spec, 'key-rej-2', { now: min(5015) }));
+  const cR2 = lp.claimJob(db, { runnerRunId: 'lpr-20261004-120100-rejre2', now: min(5015) });
+  const gR2 = lp.reserveGeneration(db, cR2.job.job_id, { leaseToken: cR2.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(5015) });
+  lp.submitResult(db, gR2.generation_id, { packetHash: cR2.job.packet_hash, verdict: 'rejected', output: DRAFT, reason: 'r', now: min(5016) });
+  lp.recordModelCheck(db, { runnerRunId: 'lpr-20261004-120100-rejre2', actualModels: ['claude-sonnet-5'], now: min(5016.1) });
+  eq(lp.jobStateFor(db, dR2.id, { now: min(5016.2) }).job.draft_text, null, '🚨 別のモデルが書いた下書きは出さない');
+}
 
 // 🚨 packet の画像を**全部**見ていなければ accepted は出せない (codex exec review P1)。
 // 1 枚でも配っていればよいにしていたときは、途中の枚で落ちた実行役が

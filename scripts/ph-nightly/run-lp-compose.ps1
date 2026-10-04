@@ -34,7 +34,7 @@ $PingPs1   = Join-Path $PSScriptRoot 'ping.ps1'
 $Phlp      = Join-Path $Root 'bin\phlp.mjs'
 if (-not $TokenFile) { $TokenFile = Join-Path $env:USERPROFILE '.claude\secrets\ph-service-token.txt' }
 $PingId      = 'ph-lp-compose'
-$TimeoutMin  = 15     # one request: read spec + look at up to 16 images (6 product + 10 material) + write + lint + Codex review (<= 2 rounds)
+$TimeoutMin  = 20     # one request: up to 16 images + write + lint + Codex review (<= 2 rounds). 2026-10-04: two runs took 13.5 min
 $LockWaitSec = 5      # SHORT: at 1 run/min we must not pile up behind the nightly jobs
 $Stamp     = Get-Date -Format 'yyyyMMdd-HHmmss'
 $LogDir    = Join-Path $Root 'logs'
@@ -208,10 +208,16 @@ try {
   $RunId = 'lpr-' + $Stamp + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
   $env:PH_LP_MODEL = $Model   # inherited by claude -> ./phlp (reserve records the REQUESTED model)
   $env:PH_LP_RUN_ID = $RunId
+  # Same conditions every run (2026-10-04, checked on the miniPC with a secret word in MEMORY.md):
+  # - no auto memory: notes from earlier runs (shared work dir with the manuscript job) must not change this run
+  # - no claude.ai connectors / MCP servers (Gmail, Drive ... were attached to the session)
+  # Only for this process tree; the nightly manuscript runner is not affected.
+  $env:CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'
+  $env:ENABLE_CLAUDEAI_MCP_SERVERS = 'false'
   try {
     $p = Start-Process -FilePath $Claude -WorkingDirectory $WorkDir -NoNewWindow -PassThru `
            -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog `
-           -ArgumentList @('-p', ('"' + $prompt + '"'), '--model', $Model, '--output-format', 'stream-json', '--verbose')
+           -ArgumentList @('-p', ('"' + $prompt + '"'), '--model', $Model, '--output-format', 'stream-json', '--verbose', '--strict-mcp-config')
     # PS 5.1: with -NoNewWindow + redirection, ExitCode stays empty unless the handle is taken right away
     $null = $p.Handle
     if (-not $p.WaitForExit($TimeoutMin * 60 * 1000)) {
@@ -229,6 +235,8 @@ try {
   }
   Remove-Item Env:PH_LP_MODEL -ErrorAction SilentlyContinue
   Remove-Item Env:PH_LP_RUN_ID -ErrorAction SilentlyContinue
+  Remove-Item Env:CLAUDE_CODE_DISABLE_AUTO_MEMORY -ErrorAction SilentlyContinue
+  Remove-Item Env:ENABLE_CLAUDEAI_MCP_SERVERS -ErrorAction SilentlyContinue
   Log ('claude exit=' + $claudeExit + ' timedOut=' + $timedOut + ' run=' + $RunId)
   # Without this a refused model or a login problem looks like "nothing moved"
   # (2026-10-02: Claude Code 2.1.252 refused Opus 5.5 with API 400 - needs 2.1.280+).

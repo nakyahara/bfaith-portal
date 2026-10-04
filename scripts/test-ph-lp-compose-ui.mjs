@@ -383,6 +383,30 @@ console.log('⑦ 失敗・成否不明も画面に出る');
   ok(failAt > 0 && resultAt > 0 && failAt < resultAt, '🚨 失敗の箱は「できた」の箱より前 (= 外側) にある');
 }
 
+console.log('⑦b チェックを通らなかった構成も画面に出す (2026-10-04 中原さん「A」)');
+{
+  const d6 = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('LP-UI-6', 'ハッカ油スプレー 300ml', 'test')`
+  ).run().lastInsertRowid);
+  db.prepare(`INSERT INTO draft_image_production (draft_id, product_info_text) VALUES (?, ?)`).run(d6, '天然ハッカ油 300ml。');
+  const r6 = lp.requestJob(db, {
+    draft: db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(d6), spec, idempotencyKey: 'ui-key-0006', actor: 'nakahara@x',
+    productInfo: '天然ハッカ油 300ml。', colorVariations: '', images: [{ file_id: 'FILEIDUI6001', role: 'slot:1' }],
+  });
+  ok(r6.ok, '依頼');
+  const c6 = lp.claimJob(db, { runnerRunId: 'lpr-ui-rej-6', maxImages: 16 });
+  const g6 = lp.reserveGeneration(db, c6.job.job_id, { leaseToken: c6.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION });
+  const DRAFT6 = '# LP制作システム\n## ⑦ AI画像生成プロンプト\n(下書き)';
+  lp.submitResult(db, g6.generation_id, { packetHash: c6.job.packet_hash, verdict: 'rejected', output: DRAFT6, reviewRounds: 2, reason: '2 巡目に high: 0 枚目の縦の配分が 100% を超える' });
+  lp.recordModelCheck(db, { runnerRunId: 'lpr-ui-rej-6', actualModels: ['claude-opus-5-5'] });
+  const { html: h6 } = await getDetail(d6);
+  const s6r = embedded(h6);
+  ok(s6r.job.status === 'failed' && s6r.job.draft_text === DRAFT6, '🚨 チェックを通らなかった構成が画面に渡る');
+  ok(s6r.job.output_text === null, '「できた本文」の箱には入れない');
+  ok(h6.includes('id="lpc-draft"') && h6.includes('⚠️ チェックを通らなかった構成 (参考)') && h6.includes('id="lpc-draft-copy"'), '参考の箱とコピーがある');
+  ok(h6.includes('使えるかどうかを決めてください'), '人が決める、と書いてある');
+}
+
 console.log('⑧ 仕様書の取込カード (一覧画面・admin だけ)');
 {
   const getList = async (role) => {
