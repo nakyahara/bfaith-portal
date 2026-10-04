@@ -51,6 +51,7 @@
  *     同じ名前の jsonb_agg・pg_class などに騙されない・本文の前に元の search_path へ戻す = withCatalogPath) /
  *     M3 = owner の状態で、SET で届く owner の役割 (印の役割・ALLOWED_SET_LOCAL_ROLES・接続の役割が SET で届く役割) が全部 NOLOGIN かを確かめる
  *     (OWNER_ROLE_CAN_LOGIN・本文はその役割の password を見えずに変えられる = 資格として使えないことだけを保証) / Low = --dry-run も字句の前提 (reset_val) を確かめる
+ *   - 🆕 Codex R6 (PR #1606) Low = PGlite の道 (applyConcurrentIndexFileInTx) も CIC の文は元の session の search_path で流す (本物の PG と同じ・runner の SQL だけ固定)
  *
  * 使い方:
  *   COMPANY_DB_URL=postgres://... node scripts/company-db/migrate.mjs            # 未適用を全部
@@ -1194,7 +1195,11 @@ async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTim
   try {
     if (mode.mode === 'owner') await db.exec(`set local role ${mode.role}`);
     await db.exec(`set local lock_timeout = '${lockTimeout}'; set local statement_timeout = '${statementTimeout}';`);
-    // 🆕 Codex R5 M2: runner の SQL は pg_catalog で解く (この道の create の前の readIndexAttrs も同じ固定を入れていた = 文の解決は変わらない・drop は schema つき)
+    // 🆕 Codex R5 M2: runner の SQL は pg_catalog で解く (drop は schema つき)。
+    // 🆕 Codex R6 Low: CIC の文は本物の PG と同じく **元の session の search_path** で流す (前の file が残した search_path と同じ名前の関数を使う
+    //   index の式が、PGlite だけ通って本物の PG で属性が違って止まる・または逆、を作らない)。固定する前の値を覚え、各文の直前に set_config(…, true) で戻し、
+    //   文の後にまた固定する (readIndexAttrs の inTx は固定を取引の終わりまで残す = 文の前に毎回戻す)
+    const sessionPath = (await db.query("select pg_catalog.current_setting('search_path') as p")).rows[0].p;
     await db.exec(`set local search_path = ${CATALOG_SEARCH_PATH}`);
     await setLexerPremiseLocal(db);   // 🆕 Codex R3 High 2: PGlite の道も同じ前提 (concurrent-index の file は新しい形 = legacy の互換は関係ない)
     for (const st of plan.statements) {
@@ -1202,7 +1207,9 @@ async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTim
         const cur = await readIndexAttrs(db, st.schema, st.name, { inTx: true });
         if (cur && cur.notIndex) throw new Error(`${st.schema}.${st.name} は index でない (relkind ${cur.relkind}) = 名前が取られている`);
       }
+      await db.query("select pg_catalog.set_config('search_path', $1, true)", [sessionPath]);
       await db.exec(st.sqlTx);
+      await db.exec(`set local search_path = ${CATALOG_SEARCH_PATH}`);
     }
     for (const [key, st] of plan.creates) {
       const cur = await readIndexAttrs(db, st.schema, st.name, { inTx: true });

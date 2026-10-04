@@ -100,7 +100,7 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
   | PostgreSQL の版・lock を取る / 外す (`pg_try_advisory_lock`・`pg_advisory_unlock`) | 外すのは流れる | ② (演算子を使わない・lock は session のもの = 取引に入れない) |
   | 記録表の bootstrap (`create table ops.schema_migrations`) | 流れない (最初の 1 回) | ① (role / database の既定の search_path に依らない) |
   | session の `SET` / `RESET`・`set local role`・`drop index concurrently if exists <schema>.<名前>` | — | 名前を解決しない・schema つき |
-  | CIC の文 (`create index concurrently …`) と migration の本文 | 流れる | **固定しない** (本文の意味を変えない)。CIC の式・演算子のクラスが別の schema に解かれたら、属性の検証 (`pg_catalog` で読む `pg_get_expr` と expect.json) が違いとして止める |
+  | CIC の文 (`create index concurrently …`) と migration の本文 | 流れる | **固定しない** (本文の意味を変えない・🆕 PGlite の道 (`concurrently` を外して取引の中で流す) も CIC の文の直前に元の session の値へ戻す = 本物の PG と同じ名前の解決・Codex R6 Low・試験 P2)。CIC の式・演算子のクラスが別の schema に解かれたら、属性の検証 (`pg_catalog` で読む `pg_get_expr` と expect.json) が違いとして止める |
 - 🆕 `--list` も印と owner-transition の適用を両方向で確かめる (Codex R1 M1) = 食い違えば一覧と lock の持ち主を出した後に `FAILED (OWNER_MODE_INVALID)` で exit 1
 - runner が読むのは `db/company/migrations/` の **番号つきの file (`NNNN_名前.sql`) だけ**。番号の無い置き場 `db/company/migrations-pending/`・下のフォルダ・番号の無い file は読まない (試験 L0b・設計 19 v8 の F4-2a)
 

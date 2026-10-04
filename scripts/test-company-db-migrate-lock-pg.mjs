@@ -47,6 +47,8 @@
  *     legacy / owner-transition の file の中の字句の前提の GUC の変更は ⚠️ だけ / O16 (High 2) = 行コメントの CR だけの改行・字句の頭の NBSP / U+3000
  *     (Postgres では識別子の文字) で隠した RESET ROLE・SET session_authorization・COMMIT を、ふつうの file・owner-transition・owner の file・ドルの引用の中で
  *     流す前に止める (本物の PG と PGlite で効くことを前提に確かめる)・1 行目の印も CR だけの改行で読む
+ *   🆕 Codex R6 (PR #1606): P2 (Low) = 前の file が session に残した search_path と同じ名前の関数を使う index の式 = PGlite の道も本物の PG と同じく
+ *     CIC の文を元の session の search_path で流す (同じ expect.json に一致・runner は session の search_path を変えない)
  * 使い方: node scripts/test-company-db-migrate-lock-pg.mjs   (npm run test:company-db にも入っている)
  *   使い捨てのクラスタを embedded-postgres で起動し、最後に止めて消す (test-company-db-profit-fn-revoke-pg.mjs と同じ作り)。
  *   見つからない・版が違う・起動できない・フォルダが消えない = 失敗 (exit 1)
@@ -1995,6 +1997,41 @@ set search_path = evil, pg_catalog;
     assert.equal(await count('o18_ok'), 1);
     await closeAll(c, s2);
     await su.query(`drop role ${other}`);
+  });
+
+  console.log('🆕 Codex R6 (PR #1606)');
+  await tR5('P2 (Codex R6 Low) PGlite の道も CIC の文は元の session の search_path で流す = 前の file が session に残した search_path (r6, public) と同じ名前の関数 (r6.f6) を使う index の式 → 本物の PG と PGlite の両方で同じ expect.json に一致して流れ、記録する / runner の SQL は固定のまま・session の search_path は前の file の値のまま', async () => {
+    const PREV = `create schema r6;
+create function r6.f6(x text) returns text language sql immutable as $f$ select pg_catalog.lower(x) $f$;
+set search_path = r6, public;
+`;
+    const CI6 = '-- migrate:concurrent-index\ncreate index concurrently if not exists t_f6_idx on app.t (f6(a));\n';
+    const pathOf = async (q) => (await q("select pg_catalog.current_setting('search_path') as p")).rows[0].p;
+    // expect.json は使い捨ての DB で同じ文を流して作る (手で書かない)
+    const dbE = await newDb(); const ce = await open(dbE);
+    await migrate(ce, { dir: mkDir({ '0001_base.sql': BASE, '0002_prev.sql': PREV }) });
+    assert.equal(await pathOf((q) => ce.query(q)), 'r6, public', '(前提) 前の file の search_path が session に残る');
+    await runStmts(ce, splitSqlStatements(CI6).map((x) => x.sql));
+    const exp6 = await buildIndexExpect(pgAdapter(ce), { version: '0003', name: 'f6', file: '0003_f6.sql', text: CI6, concurrentIndex: true });
+    assert.match(exp6.indexes['app.t_f6_idx'].expressions, /^r6\.f6\(a\)$/, '(前提) 式は元の session の search_path で r6.f6 に解かれる');
+    const files = { '0001_base.sql': BASE, '0002_prev.sql': PREV, '0003_f6.sql': CI6, '0003_f6.expect.json': JSON.stringify(exp6, null, 2) };
+    // 本物の PG (CIC = 取引の外・元の session の search_path で流す)
+    const dbR = await newDb(); const cr = await open(dbR);
+    assert.deepEqual((await migrate(cr, { dir: mkDir(files) })).applied, ['0001', '0002', '0003']);
+    assert.deepEqual(attrDiff((await readIndexAttrs(pgAdapter(cr), 'app', 't_f6_idx')).attrs, exp6.indexes['app.t_f6_idx']), []);
+    assert.equal(await pathOf((q) => cr.query(q)), 'r6, public', '本物の PG: runner は session の search_path を変えない');
+    // PGlite (concurrently を外して取引の中で流す道) = 同じ文・同じ expect.json で流れる (R6 の前は pg_catalog, pg_temp に固定した中で流し f6 が見つからなかった)
+    const pg = new PGlite();
+    try {
+      const db = pgliteAdapter(pg);
+      const logs = [];
+      const r = await applyMigrations(db, { dir: mkDir(files), log: (m) => logs.push(m) });
+      assert.deepEqual(r.applied, ['0001', '0002', '0003']);
+      assert.ok(logs.some((m) => /0003_f6\.sql \(concurrent-index を取引の中で/.test(m)), 'PGlite の道を通った');
+      assert.deepEqual(attrDiff((await readIndexAttrs(db, 'app', 't_f6_idx')).attrs, exp6.indexes['app.t_f6_idx']), []);
+      assert.equal(await pathOf((q) => db.query(q)), 'r6, public', 'PGlite: runner は session の search_path を変えない');
+      assert.deepEqual((await db.query('select version from ops.schema_migrations order by 1')).rows.map((x) => x.version), ['0001', '0002', '0003']);
+    } finally { await pg.close(); }
   });
 
   await t('X1 --index-expect は使い捨ての DB から expect.json の中身を出す (試験で作ったものと同じ)', async () => {
