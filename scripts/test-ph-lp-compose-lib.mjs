@@ -269,6 +269,7 @@ console.log('⑦b 🚨 チェックを通らなかった構成も残す (2026-10
   const DRAFT = '# LP制作システム\n(チェックで指摘が残った構成の下書き)';
   eq(lp.submitResult(db, gR.generation_id, { packetHash: cR.job.packet_hash, verdict: 'rejected', output: 'x'.repeat(lp.OUTPUT_MAX + 1), reason: 'r', now: min(5013) }).code,
     'too_large', '大きすぎる下書きは断る');
+  serve(cR.job, min(5012.5));   // 画像を全部見て書いた (下書きを残す条件)
   const sR = lp.submitResult(db, gR.generation_id, { packetHash: cR.job.packet_hash, verdict: 'rejected', output: DRAFT, reviewRounds: 2, reason: '2 巡目に high が 3 件 (縦の配分が 100% を超える ほか)', now: min(5013) });
   eq(sR.status, 'failed', 'rejected は failed のまま');
   eq(db.prepare('SELECT output_text FROM ph_lp_compose_jobs WHERE id = ?').get(cR.job.job_id).output_text, DRAFT, '🚨 書いた構成を残す');
@@ -290,9 +291,18 @@ console.log('⑦b 🚨 チェックを通らなかった構成も残す (2026-10
   lp.requestJob(db, args(dR2, s2.spec, 'key-rej-2', { now: min(5015) }));
   const cR2 = lp.claimJob(db, { runnerRunId: 'lpr-20261004-120100-rejre2', now: min(5015) });
   const gR2 = lp.reserveGeneration(db, cR2.job.job_id, { leaseToken: cR2.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(5015) });
+  serve(cR2.job, min(5015.5));
   lp.submitResult(db, gR2.generation_id, { packetHash: cR2.job.packet_hash, verdict: 'rejected', output: DRAFT, reason: 'r', now: min(5016) });
   lp.recordModelCheck(db, { runnerRunId: 'lpr-20261004-120100-rejre2', actualModels: ['claude-sonnet-5'], now: min(5016.1) });
   eq(lp.jobStateFor(db, dR2.id, { now: min(5016.2) }).job.draft_text, null, '🚨 別のモデルが書いた下書きは出さない');
+  // 画像を見ずに書いた下書きは残さない (rejected の判定は受け取る・codex #1609 R2 Medium)
+  const dR3 = mkDraft('LP-REJ3', 'ハッカ油スプレー REJ3');
+  lp.requestJob(db, args(dR3, s2.spec, 'key-rej-3', { now: min(5017) }));
+  const cR3 = lp.claimJob(db, { runnerRunId: 'lpr-20261004-120200-rejre3', now: min(5017) });
+  const gR3 = lp.reserveGeneration(db, cR3.job.job_id, { leaseToken: cR3.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION, now: min(5017) });
+  const sR3 = lp.submitResult(db, gR3.generation_id, { packetHash: cR3.job.packet_hash, verdict: 'rejected', output: DRAFT, reason: 'r', now: min(5018) });
+  ok(sR3.ok && sR3.status === 'failed', 'rejected の判定は受け取る');
+  eq(db.prepare('SELECT output_text FROM ph_lp_compose_jobs WHERE id = ?').get(cR3.job.job_id).output_text, null, '🚨 画像を見ていない下書きは残さない');
 }
 
 // 🚨 packet の画像を**全部**見ていなければ accepted は出せない (codex exec review P1)。

@@ -837,6 +837,15 @@ export function submitResult(db, generationId, {
         };
       }
     }
+    // 🚨 rejected の下書きも「全部の画像を見て書いたもの」だけ残す (codex #1609 R2 Medium)。
+    //    見ずに書いた構成が「参考」として画面に出て、くらべっこに混ざらないように。
+    //    rejected の判定そのものは受け取る (下書きを残さないだけ・作れなかった記録は失わない)
+    let rejectedDraft = null;
+    if (v === 'rejected' && out.trim()) {
+      const seenIds = new Set(served.map((im) => im && im.file_id).filter(Boolean));
+      const allSeen = packetImages.every((im) => !im?.file_id || seenIds.has(im.file_id));
+      rejectedDraft = allSeen ? out : null;
+    }
     // 🚨 **lint はサーバが実行する。これが正本** (PR1-c・設計 §6)。
     //    PR1-b までは実行役の自己申告 (`lint.ok`) を信じていたが、
     //    それだと**自分で `{"ok":true}` と書けば何でも通せた**。
@@ -891,7 +900,7 @@ export function submitResult(db, generationId, {
               lease_token = NULL, lease_until = NULL,
               updated_at = ?, completed_at = COALESCE(completed_at, ?), finalized_at = ?
           WHERE id = ? AND status IN ('running', 'needs_review')`)
-        .run(storedLint, rounds, reasonText || '検品で通らなかった', out.trim() ? out : null, out.trim() ? sha256(out) : null,
+        .run(storedLint, rounds, reasonText || '検品で通らなかった', rejectedDraft, rejectedDraft ? sha256(rejectedDraft) : null,
           nowS, nowS, nowS, job.id).changes;
 
     if (genCh !== 1 || jobCh !== 1) {

@@ -324,6 +324,8 @@ console.log('⑩ 素材画像 — 何番が素材かを Claude に伝え、検�
   eq(clRj.json.job_id, rRj.job.id, '依頼を掴む');
   eq((await phlpWith({ PH_LP_MODEL: lp.DEFAULT_MODEL }, 'reserve', rj)).code, 0, '予約');
   fs.writeFileSync(path.join(work, `out-${rj}.md`), '# LP制作システム\n(下書き)', 'utf8');
+  // 画像を全部見たことにする (この試験は Drive が無いので、サーバが配った記録を直接入れる)
+  lp.recordImageServed(db, rRj.job.id, { leaseToken: db.prepare('SELECT lease_token FROM ph_lp_compose_jobs WHERE id = ?').get(rRj.job.id).lease_token, fileId: 'FILEIDRJ0001', sha256: 'c'.repeat(64), bytes: 10 });
   fs.writeFileSync(path.join(work, `reason-${rj}.txt`), '2 巡目に high が残った', 'utf8');
   const resRj = await phlp('result', rj, '--rejected', '--reason-file', `reason-${rj}.txt`, '--file', `out-${rj}.md`, '--rounds', '2');
   ok(resRj.code === 0 && resRj.json.status === 'failed', 'rejected で返せる');

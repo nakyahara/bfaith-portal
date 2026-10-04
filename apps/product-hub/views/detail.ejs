@@ -5958,6 +5958,12 @@ th.attr-unknown { color: #dc2626; }
         statusEl.textContent = '結果を受け取れませんでした。もう一度依頼してください';
       } else if (job.status === 'failed' && job.error_code === 'rejected' && checkingModel(job)) {
         statusEl.textContent = '⚠️ チェックを通りませんでした。作ったモデル (' + job.model_label + ') を確かめています… 確かめたら書いた構成を参考として出します';
+      } else if (job.status === 'failed' && job.error_code === 'rejected' && job.model_check && job.model_check !== 'match') {
+        // 実モデルが違った・確かめられなかったので参考の構成も出さない。その理由も出す (codex #1609 R2 Low)
+        statusEl.textContent = '作れませんでした: ' + (job.error || '理由が残っていません')
+          + (job.model_check === 'mismatch'
+            ? ' — 作ったモデル (' + (job.actual_model || '?') + ') が頼んだモデルと違ったので、書いた構成は出していません'
+            : ' — 作ったモデルを確かめられなかったので、書いた構成は出していません');
       } else if (job.status === 'failed' && job.draft_text) {
         statusEl.textContent = '⚠️ チェックを通りませんでした。書いた構成は下に参考として出しています (' + (job.elapsed_sec || 0) + ' 秒)';
       } else if (job.status === 'failed') {

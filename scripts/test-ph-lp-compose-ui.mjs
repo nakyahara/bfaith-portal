@@ -398,6 +398,7 @@ console.log('⑦b チェックを通らなかった構成も画面に出す (202
   const c6 = lp.claimJob(db, { runnerRunId: 'lpr-ui-rej-6', maxImages: 16 });
   const g6 = lp.reserveGeneration(db, c6.job.job_id, { leaseToken: c6.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION });
   const DRAFT6 = '# LP制作システム\n## ⑦ AI画像生成プロンプト\n(下書き)';
+  lp.recordImageServed(db, c6.job.job_id, { leaseToken: c6.job.lease_token, fileId: 'FILEIDUI6001', sha256: '6'.repeat(64), bytes: 66 });
   lp.submitResult(db, g6.generation_id, { packetHash: c6.job.packet_hash, verdict: 'rejected', output: DRAFT6, reviewRounds: 2, reason: '2 巡目に high: 0 枚目の縦の配分が 100% を超える' });
   // 🚨 確認前 (rejected・model_check なし) は「待ち」: 画面は見に行き続け、ボタンは押せず、サーバも再依頼を断る (codex #1609 High)
   const { html: h6pre } = await getDetail(d6);
