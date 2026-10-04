@@ -7,14 +7,15 @@
  *
  * 守りたいこと:
  *   ① **従量課金の上限を fail-closed で守る** (検討 §6 層2)。呼ぶ前に見込み額を台帳 (ph_ai_usage) に取り置き、
- *      当月の合計 (実額 + 取り置き + 結果不明の見込み) が上限 (既定 3,000 円) を超えるなら呼ばない
+ *      当月の合計 (推定の実額 + 取り置き + 結果不明の見込み) が「上限 − 安全幅」を超えるなら呼ばない。上限は Render に書く (書かれていなければ作らない)
  *   ② **品質段はサーバが固定**。xhigh / max は使わせない (medium の 16 倍・検討 §5)
  *   ③ 機能フラグ (PH_LP_IMAGE_ENABLED=1) と専用キー (OPENAI_LP_IMAGE_API_KEY) がそろわなければ動かない。
  *      キーは問い合わせハブの OPENAI_API_KEY と**名前を分ける** (検討 §6 層1)。同じキーを入れれば共用で始められ、
  *      後から専用キーに替えるのは Render の設定 1 つで済む (中原さん「共用で」2026-10-04)
  *   ④ prompt と参考画像は**受付時に固定** (作り直すときは新しい job)。参考画像は Drive の更新日時も固定し、
  *      作る前に照らす (差し替わっていたら作らない)。1 依頼 (draft) に動いている job は 1 つ
- *   ⑤ 取り置きは「これ以上はかからない額」(品質段・参考画像の枚数・prompt の長さから・#1612 R1 High)。
+ *   ⑤ 取り置きは安全側の見込み額 (品質段・参考画像の枚数・prompt のバイト数から・#1612 R1〜R3)。保証された上限ではないので、
+ *      月の上限の手前に安全幅を残す。
  *      請求されないと言い切れる失敗 (401 / 403 / 404 / 429) だけ 0 円。内容で断られた (moderation) を含むほかの失敗・
  *      通信断・5xx・再起動・usage の無い成功は**取り置き額のまま** (少なく数えない)
  *   ⑥ 🚨 **Render の 1 台 (1 インスタンス) で動かす前提**。台帳も claim も product-hub の SQLite (1 台のディスク) が正本。
@@ -32,16 +33,25 @@ export const DEFAULT_LP_IMAGE_MODEL = 'gpt-image-2.5-flare';   // ChatGPT の既
 export const DEFAULT_LP_IMAGE_QUALITY = 'medium';
 export const LP_IMAGE_SIZE = '1200x1200';                      // 仕様書の「1200×1200px／正方形」(16 の倍数なので API がそのまま受ける)
 export const MAX_LP_IMAGES = 8;                                // 検討 §4: 高 = 全枚数 (上限 8)
+/**
+ * 何枚まで作るか (検討 §4: 高 = 全枚数 (上限 8) / 低・激低 = 1 枚目のみ・#1612 R3 Medium)。
+ * 重要度に「（重要度：高）」が付くものだけ全部。低・激低・**まだ決まっていない**ものは 1 枚目だけ (お金を使いすぎない側)
+ */
+export function imageLimitForPriority(priority) {
+  return /（重要度：高）/.test(String(priority || '')) ? MAX_LP_IMAGES : 1;
+}
 export const MAX_REFS = 4;                                     // API の上限 (1 回に参考画像 4 枚まで)
 export const MAX_PRODUCT_REFS = 2;                             // 商品の写真 (白抜き → TOP) は 2 枚まで。残りは使う素材
 /** 推奨の月の上限 (中原さん 2026-10-04「全部おすすめ」・見込み約 1,020 円の約 3 倍)。**既定値ではない** — Render に書く値 */
 export const RECOMMENDED_MONTHLY_BUDGET_JPY = 3000;
 // $/1M tokens (検討 §5.1・2026-09 の公開価格)
 const PRICE = { textIn: 5, imageIn: 8, out: 30 };
-/** 実額の円換算。請求はドルなので推定。少なく数えないよう、検討 §5 の 150 円より高めに置く */
-const USD_JPY = 160;
-/** 取り置きの円換算 (為替の動きの余裕をさらに見る) */
-const USD_JPY_RESERVE = 170;
+/**
+ * 円換算 (請求はドル)。**取り置きも確定もこの 1 つの値**で数える (#1612 R3 High: 取り置き 170・確定 160 と分けていたら、
+ * 成功のたびに為替の余裕が空いて上限を超えられた)。検討 §5 の 150 円より高め = 少なく数えない。cost_jpy もこの換算の推定値
+ */
+const USD_JPY = 170;
+const USD_JPY_RESERVE = USD_JPY;
 /**
  * 取り置きの上限トークン (#1612 R1 High: 一律 15 円だと実費が上回れば上限を突破できた)。
  * 出力: 検討 §5.1 のベンチ (1024px で low 196 / medium 439 / high 1,756) を 1200px の面積 (×1.37) で伸ばし、さらに 3 倍以上の余裕。
@@ -148,7 +158,7 @@ const sectionOf = (block, heading) => {
  * 参考画像 = 商品の写真 (白抜き → TOP の順に 2 枚まで) + その画像の「使用素材」に名前の出てくる素材 (合わせて 4 枚まで)
  * @returns {{images: Array<{seq,no,name,prompt,refs}>, error: string|null}}
  */
-export function buildImagePlan({ outputText, packet, quality = DEFAULT_LP_IMAGE_QUALITY, refTimes = null }) {
+export function buildImagePlan({ outputText, packet, quality = DEFAULT_LP_IMAGE_QUALITY, refTimes = null, maxImages = MAX_LP_IMAGES }) {
   let doc;
   try { doc = parseConstructionDoc(String(outputText || '')); } catch (e) { return { images: [], error: '構成を読み取れません: ' + String(e?.message || e).slice(0, 200) }; }
   const imgs = (doc?.images || []).filter((im) => trim(im?.individualPrompt || im?.rawBlockText));
@@ -165,7 +175,10 @@ export function buildImagePlan({ outputText, packet, quality = DEFAULT_LP_IMAGE_
   // refTimes = 受付のときに Drive から取り直した更新日時 (packet の日時より優先。packet の日時は空のことがある・#1612 R2 Medium)
   const ref = (im) => ({ file_id: im.file_id, role: im.role || null, name: im.name || null, folder: im.folder || null,
     modified_time: (refTimes && refTimes[im.file_id]) || im.modified_time || null });
-  const out = imgs.slice(0, MAX_LP_IMAGES).map((im, i) => {
+  // 1 枚だけのときは「1枚目」(FV) を作る (無ければ最初のブロック)。サムネイル (0 枚目) は対象にしない
+  const limit = Math.max(1, Math.min(MAX_LP_IMAGES, Number(maxImages) || 1));
+  const chosen = limit === 1 ? [imgs.find((im) => im.no === 1) || imgs[0]] : imgs.slice(0, limit);
+  const out = chosen.map((im, i) => {
     const block = trim(im.individualPrompt || im.rawBlockText);
     // その画像の「使用素材」に名前 (または 場所/名前) が出てくる素材だけ参考に渡す
     const used = sectionOf(block, '使用素材');
@@ -200,11 +213,16 @@ function latestComposeJob(db, draftId) {
 /** 依頼のキーの形 (二重クリック対策のキー)。router が Drive を読む前に確かめる */
 export const validImageRequestKey = (key) => !!exact(key, IDEMPOTENCY_KEY_RE);
 
-/** 参考画像になりうるファイル (いちばん新しい構成の packet の画像)。受付の前に Drive の更新日時を取り直すのに使う */
-export function imageRefCandidates(db, draftId) {
-  const cj = latestComposeJob(db, posInt(draftId));
-  const imgs = safeJson(cj?.packet_json)?.images;
-  return Array.isArray(imgs) ? [...new Set(imgs.map((im) => im?.file_id).filter((id) => exact(String(id || ''), DRIVE_ID_RE)))] : [];
+/**
+ * 受付の前に Drive の更新日時を取り直すファイル = **実際に参考に渡す画像だけ** (計画の refs の和集合・#1612 R3 Medium)。
+ * 使わない画像が消えていても受付を止めない
+ */
+export function imageRefCandidates(db, draft, env = process.env) {
+  const cj = latestComposeJob(db, posInt(draft?.id));
+  if (!cj || !trim(cj.output_text)) return [];
+  const cfg = lpImageConfig(env);
+  const plan = buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json), quality: cfg.quality || DEFAULT_LP_IMAGE_QUALITY, maxImages: imageLimitForPriority(draft?.image_priority) });
+  return [...new Set(plan.images.flatMap((im) => im.refs.map((r) => r.file_id)).filter((id) => exact(String(id || ''), DRIVE_ID_RE)))];
 }
 
 /** 動いている (queued / running) 画像の job */
@@ -226,14 +244,14 @@ export function imageBlockReason(db, { draft, folderId, env = process.env, now =
   }
   if (!exact(folderId, DRIVE_ID_RE)) return '画像フォルダ (Driveリンク) が無いので、保存先がありません (画像タブで画像フォルダを設定してください)';
   if (activeImageJob(db, draftId)) return 'この商品の画像をいま作っています';
-  const plan = buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json), quality: cfg.quality });
+  const plan = buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json), quality: cfg.quality, maxImages: imageLimitForPriority(draft?.image_priority) });
   if (plan.error) return plan.error;
   if (plan.images.some((im) => im.est_jpy == null)) return '画像の品質段の設定が読めません';
   const { used_jpy } = monthUsage(db, now);
-  // 取り置き (= これ以上はかからない額) の合計で見る
+  // 取り置き (安全側の見込み額) の合計で見る
   const need = Math.ceil(plan.images.reduce((a, im) => a + im.est_jpy, 0));
   if (used_jpy + need > cfg.spendable) {
-    return `今月の上限 (${cfg.budget.toLocaleString()} 円・安全幅 ${cfg.safety} 円を残す) を超えるおそれがあるので作れません (今月 ${Math.round(used_jpy)} 円・この商品で最大 ${need} 円)`;
+    return `今月の上限 (${cfg.budget.toLocaleString()} 円・安全幅 ${cfg.safety} 円を残す) を超えるおそれがあるので作れません (今月 ${Math.round(used_jpy)} 円・この商品の取り置き 約 ${need} 円)`;
   }
   return null;
 }
@@ -258,7 +276,7 @@ export function requestImageJob(db, { draft, folderId, idempotencyKey, actor, re
     if (blocked) return { code: activeImageJob(db, draftId) ? 'already_running' : 'not_ready', error: blocked };
     const cfg = lpImageConfig(env);
     const cj = latestComposeJob(db, draftId);
-    const plan = buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json), quality: cfg.quality, refTimes });
+    const plan = buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json), quality: cfg.quality, refTimes, maxImages: imageLimitForPriority(draft?.image_priority) });
     // 🚨 参考画像は全部、更新日時を固定する (作る前に照らせないものを通さない・#1612 R2 Medium)
     if (plan.images.some((im) => im.refs.some((r) => !r.modified_time))) {
       return { code: 'not_ready', error: '参考画像の更新日時を Drive から取れませんでした (もう一度押してください)' };
@@ -284,14 +302,14 @@ export function imageStateFor(db, { draft, folderId, env = process.env, now = Da
     WHERE image_job_id = ? ORDER BY seq`).all(job.id) : [];
   const cj = draftId ? latestComposeJob(db, draftId) : null;
   const planned = cj && cj.status === 'done' && cj.model_check === 'match' && trim(cj.output_text)
-    ? buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json), quality: cfg.quality || DEFAULT_LP_IMAGE_QUALITY }).images : [];
+    ? buildImagePlan({ outputText: cj.output_text, packet: safeJson(cj.packet_json), quality: cfg.quality || DEFAULT_LP_IMAGE_QUALITY, maxImages: imageLimitForPriority(draft?.image_priority) }).images : [];
   return {
     enabled: cfg.enabled,
     usable: cfg.usable,
     model: cfg.model, quality: cfg.quality,
     budget_jpy: cfg.budget, month, used_jpy,
     planned_count: planned.length,
-    // 押したときに取り置く額 (= これ以上はかからない額)。実際はもっと安い (検討 §5: 1 枚 数円)
+    // 押したときに取り置く額 (安全側の見込み・保証ではない)。実際はふつうもっと安い (検討 §5: 1 枚 数円)
     planned_reserve_jpy: Math.ceil(planned.reduce((a, im) => a + (im.est_jpy || 0), 0)),
     blocked: draftId ? imageBlockReason(db, { draft, folderId, env, now }) : '商品の ID が不正です',
     job: job ? {

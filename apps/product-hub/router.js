@@ -3975,7 +3975,7 @@ router.post('/api/drafts/:id/lp-images', async (req, res) => {
   if (!prior) {
     const blocked = lpImageBlockReason(db, { draft, folderId });
     if (blocked) return res.status(409).json({ ok: false, code: 'not_ready', error: blocked });
-    try { refTimes = await lpImageRefTimes(lpImageRefCandidates(db, draft.id)); }
+    try { refTimes = await lpImageRefTimes(lpImageRefCandidates(db, draft)); }
     catch (e) {
       console.error('[product-hub] lp-image ref times:', draft.id, String(e?.message || e).slice(0, 300));
       return res.status(502).json({ ok: false, code: 'refs_unavailable', error: '参考画像の情報を Drive から読めませんでした — もう一度押してください' });

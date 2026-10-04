@@ -5893,10 +5893,10 @@ th.attr-unknown { color: #dc2626; }
       state = s;
       const job = s.job;
       const running = !!job && RUNNING.includes(job.status);
-      // 押したときに取り置く額 (= これ以上はかからない額)。実際はもっと安い
+      // 押したときに取り置く額 (安全側の見込み・保証ではない)。実際はふつうもっと安い
       const est = Number(s.planned_reserve_jpy) || 0;
       btn.disabled = !!s.blocked || running || posting;
-      btn.textContent = running ? '🖼 画像を作っています…' : (job ? '🖼 もう一度画像を作る' : '🖼 画像を作る') + (est ? ' (' + s.planned_count + ' 枚・最大 ' + yen(est) + ')' : '');
+      btn.textContent = running ? '🖼 画像を作っています…' : (job ? '🖼 もう一度画像を作る' : '🖼 画像を作る') + (est ? ' (' + s.planned_count + ' 枚・取り置き 約 ' + yen(est) + ')' : '');
       metaEl.textContent = (s.model ? s.model + ' / 品質 ' + s.quality + '・' : '')
         + '今月 ' + yen(s.used_jpy) + ' / 上限 ' + yen(s.budget_jpy)
         + (job && job.cost_jpy ? '・この画像で ' + yen(job.cost_jpy) : '');
@@ -5930,7 +5930,7 @@ th.attr-unknown { color: #dc2626; }
       if (posting) return;
       const est = Number(state.planned_reserve_jpy) || 0;
       // 作り直しはお金がかかるので確かめる
-      if (state.job && !window.confirm('もう一度作ると、最大 ' + yen(est) + ' かかります (前の画像は Drive に残ります)。作りますか？')) return;
+      if (state.job && !window.confirm('もう一度作ります。月の枠から約 ' + yen(est) + ' を取り置きます (見込み・実際はふつうもっと少ない。前の画像は Drive に残ります)。作りますか？')) return;
       posting = true;
       btn.disabled = true;
       statusEl.textContent = '依頼しています…';
