@@ -311,6 +311,27 @@ console.log('⑩ 素材画像 — 何番が素材かを Claude に伝え、検�
   eq(im16.json?.expected, 16, '🚨 16 枚を落としにいく (6 枚で止めない・この試験は Drive が無いので 1 枚目で失敗する)');
   await phlp('release', String(r16.job.id), '--reason', '試験の片付け');
   await phlp('clean', String(r16.job.id));
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?`).run(r16.job.id);
+
+  // チェックを通らなかった構成も --file で送る (2026-10-04 中原さん「A」)
+  const dRj = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('LP-RUN-RJ', 'ハッカ油スプレー RJ', 'test')`).run().lastInsertRowid);
+  const rRj = lp.requestJob(db, {
+    draft: db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(dRj), spec, productInfo: '天然ハッカ油。', colorVariations: '',
+    images: [{ file_id: 'FILEIDRJ0001', role: 'slot:1' }], idempotencyKey: 'runner-test-rj-1', actor: 'nakahara@x',
+  });
+  const rj = String(rRj.job.id);
+  const clRj = await phlpWith({ PH_LP_RUN_ID: 'lpr-20261004-130000-rjrjrj' }, 'claim', '--run', 'lp-test-rj');
+  eq(clRj.json.job_id, rRj.job.id, '依頼を掴む');
+  eq((await phlpWith({ PH_LP_MODEL: lp.DEFAULT_MODEL }, 'reserve', rj)).code, 0, '予約');
+  fs.writeFileSync(path.join(work, `out-${rj}.md`), '# LP制作システム\n(下書き)', 'utf8');
+  // 画像を全部見たことにする (この試験は Drive が無いので、サーバが配った記録を直接入れる)
+  lp.recordImageServed(db, rRj.job.id, { leaseToken: db.prepare('SELECT lease_token FROM ph_lp_compose_jobs WHERE id = ?').get(rRj.job.id).lease_token, fileId: 'FILEIDRJ0001', sha256: 'c'.repeat(64), bytes: 10 });
+  fs.writeFileSync(path.join(work, `reason-${rj}.txt`), '2 巡目に high が残った', 'utf8');
+  const resRj = await phlp('result', rj, '--rejected', '--reason-file', `reason-${rj}.txt`, '--file', `out-${rj}.md`, '--rounds', '2');
+  ok(resRj.code === 0 && resRj.json.status === 'failed', 'rejected で返せる');
+  eq(db.prepare('SELECT output_text FROM ph_lp_compose_jobs WHERE id = ?').get(rRj.job.id).output_text, '# LP制作システム\n(下書き)',
+    '🚨 --file で送った下書きがサーバに残る (画面で人が判断する)');
+  await phlp('clean', rj);
 }
 
 server.close();

@@ -214,7 +214,9 @@ $lpAction   = New-ScheduledTaskAction -Execute 'powershell.exe' `
                 -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $Bin 'run-lp-compose.ps1') + '"')
 $lpTrigger  = New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
                 -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration ([TimeSpan]::FromDays(3650))
-$lpSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 20) `
+# 30 min: the runner's own Claude timeout is 20 min; the rest is for the kill, the model check, the post-check and the ping
+# (the same 20 min here would kill PowerShell before its cleanup - codex #1609 Medium)
+$lpSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30) `
                 -MultipleInstances IgnoreNew -RunOnlyIfNetworkAvailable
 Register-ScheduledTask -TaskName $lpTaskName -Action $lpAction -Trigger $lpTrigger -Principal $principal -Settings $lpSettings -Force | Out-Null
 $lpT = Get-ScheduledTask -TaskName $lpTaskName

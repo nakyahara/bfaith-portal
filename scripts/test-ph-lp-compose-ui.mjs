@@ -383,6 +383,46 @@ console.log('⑦ 失敗・成否不明も画面に出る');
   ok(failAt > 0 && resultAt > 0 && failAt < resultAt, '🚨 失敗の箱は「できた」の箱より前 (= 外側) にある');
 }
 
+console.log('⑦b チェックを通らなかった構成も画面に出す (2026-10-04 中原さん「A」)');
+{
+  const d6 = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('LP-UI-6', 'ハッカ油スプレー 300ml', 'test')`
+  ).run().lastInsertRowid);
+  db.prepare(`INSERT INTO draft_image_production (draft_id, product_info_text) VALUES (?, ?)`).run(d6, '天然ハッカ油 300ml。');
+  db.prepare(`INSERT INTO draft_images (draft_id, sort, drive_file_id, drive_modified_time) VALUES (?, 0, 'FILEIDUI6001', '2026-10-01T00:00:00.000Z')`).run(d6);
+  const r6 = lp.requestJob(db, {
+    draft: db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(d6), spec, idempotencyKey: 'ui-key-0006', actor: 'nakahara@x',
+    productInfo: '天然ハッカ油 300ml。', colorVariations: '', images: [{ file_id: 'FILEIDUI6001', role: 'slot:1' }],
+  });
+  ok(r6.ok, '依頼');
+  const c6 = lp.claimJob(db, { runnerRunId: 'lpr-ui-rej-6', maxImages: 16 });
+  const g6 = lp.reserveGeneration(db, c6.job.job_id, { leaseToken: c6.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION });
+  const DRAFT6 = '# LP制作システム\n## ⑦ AI画像生成プロンプト\n(下書き)';
+  lp.recordImageServed(db, c6.job.job_id, { leaseToken: c6.job.lease_token, fileId: 'FILEIDUI6001', sha256: '6'.repeat(64), bytes: 66 });
+  lp.submitResult(db, g6.generation_id, { packetHash: c6.job.packet_hash, verdict: 'rejected', output: DRAFT6, reviewRounds: 2, reason: '2 巡目に high: 0 枚目の縦の配分が 100% を超える' });
+  // 🚨 確認前 (rejected・model_check なし) は「待ち」: 画面は見に行き続け、ボタンは押せず、サーバも再依頼を断る (codex #1609 High)
+  const { html: h6pre } = await getDetail(d6);
+  const csrc = h6pre.slice(h6pre.indexOf('// lpc-checking:start'), h6pre.indexOf('// lpc-checking:end'));
+  const checkingModel = new Function(csrc + '\nreturn checkingModel;')();
+  const s6pre = embedded(h6pre);
+  ok(s6pre.job.status === 'failed' && s6pre.job.draft_text === null && s6pre.job.model_check === null, '確認前は参考の構成を出さない');
+  ok(checkingModel(s6pre.job) === true, '🚨 確認前の rejected は「確認待ち」= ポーリングを続ける・ボタンを押せない');
+  const post6x = await fetch(`${base}/api/drafts/${d6}/lp-compose`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotency_key: 'ui-key-0006b' }),
+  });
+  eq([post6x.status, (await post6x.json()).code], [409, 'already_running'], '🚨 確認待ちの間は再依頼を受けない (先の参考の構成が画面から消えないように)');
+  lp.recordModelCheck(db, { runnerRunId: 'lpr-ui-rej-6', actualModels: ['claude-opus-5-5'] });
+  ok(checkingModel(embedded((await getDetail(d6)).html).job) === false, '確認が付いたら待ちを終える (ポーリングを止める)');
+  ok(checkingModel({ model: 'm', model_check: null, status: 'failed', error_code: 'rejected', has_draft: false }) === false,
+    '🚨 下書きの無い rejected は待たない (すぐ押し直せる・codex #1609 R3 Medium)');
+  const { html: h6 } = await getDetail(d6);
+  const s6r = embedded(h6);
+  ok(s6r.job.status === 'failed' && s6r.job.draft_text === DRAFT6, '🚨 チェックを通らなかった構成が画面に渡る');
+  ok(s6r.job.output_text === null, '「できた本文」の箱には入れない');
+  ok(h6.includes('id="lpc-draft"') && h6.includes('⚠️ チェックを通らなかった構成 (参考)') && h6.includes('id="lpc-draft-copy"'), '参考の箱とコピーがある');
+  ok(h6.includes('使えるかどうかを決めてください'), '人が決める、と書いてある');
+}
+
 console.log('⑧ 仕様書の取込カード (一覧画面・admin だけ)');
 {
   const getList = async (role) => {
