@@ -106,8 +106,14 @@ await ta('[1] 画面・つかいかた・末尾の / ・決められるかの印
   const m = await call('GET', '/manual');
   assert.equal(m.status, 200);
   const page = fs.readFileSync(new URL('../apps/master-decisions/views/index.ejs', import.meta.url), 'utf8');
-  const buttons = [...page.matchAll(/<button class="btn-sm" data-act="[^"]+">([^<]+)<\/button>/g)].map((x) => x[1]);
-  assert.deepEqual(buttons, ['差を残す', 'NE を直す (提案の値で)', '却下']);
+  // まとめて決める帯のボタン (新しいデザイン・10/5 = よく使う「NE を直す」を先頭の主ボタンに)
+  const buttons = [...page.matchAll(/<button class="btn[^"]*" type="button" data-act="[^"]+">([^<]+)<\/button>/g)].map((x) => x[1]);
+  assert.deepEqual(buttons, ['NE を直す (提案の値で)', '差を残す', '却下']);
+  // 画面の部品はこの口から配る (マスタの入力の CSS・共通の動きを写さずに共有)・版つき・決めた名前だけ
+  assert.match(r.text, /href="\/apps\/master-decisions\/public\/master-edit\.css\?v=[0-9a-f]{12}"/);
+  assert.match(r.text, /src="\/apps\/master-decisions\/public\/me-shell\.js\?v=[0-9a-f]{12}"/);
+  for (const f of ['master-edit.css', 'me-shell.js', 'md.css', 'favicon.svg']) assert.equal((await call('GET', `/public/${f}`)).status, 200, f);
+  for (const f of ['me-sku.js', '..%2Frouter.mjs', 'router.mjs']) assert.equal((await call('GET', `/public/${f}`)).status, 404, f);
   for (const b of [...buttons, '判断を取り消す']) assert.ok(m.text.includes(b), `つかいかたに「${b}」が無い`);
 });
 
