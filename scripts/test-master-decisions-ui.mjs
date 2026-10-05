@@ -348,6 +348,37 @@ await ta('[16] 代表 (親。D3b) の直す値: 目標の入力が必須 (提案
   assert.match(page, /空 = 親なし/);
 });
 
+await ta('[17] 名前 = 商品コード は NE に入れない (2026-10-05): 社内の名前がコードのまま (cdb_name_is_code) は NE を直すを選べない・社内を直す (NE の名前が既定) / 古い形の候補 (NE をコードに) も承認で拒む (name_is_code) / 税率は % で見せる', async () => {
+  const N1 = '1'.repeat(63) + 'a', N2 = '1'.repeat(63) + 'b', N3 = '1'.repeat(63) + 'c';
+  const more = {
+    [N1]: cand(N1, { subject_key: 'value:akadama-big-2l-2', col: 'name', cls: 'rule', reason_kind: 'cdb_name_is_code', n: null, n_state: 'empty', c: 'akadama-big-2l-2', resolutions: ['fix_cdb', 'accept_difference'], proposal: { op: 'fill_cdb_name' } }),
+    [N2]: cand(N2, { subject_key: 'value:b-002', col: 'name', cls: 'rule', reason_kind: 'cdb_name_is_code', n: 'NE の名前', c: 'b-002', resolutions: ['fix_cdb', 'accept_difference'], proposal: { op: 'set_cdb_value', value: 'NE の名前' } }),
+    // 照合を直す前の形 (company_owned で「NE を akadama-x に」) が今の回に残っていても、NE をコードにする承認は作らない
+    [N3]: cand(N3, { subject_key: 'value:akadama-x', col: 'name', cls: 'rule', reason_kind: 'company_owned', n: null, n_state: 'empty', c: 'akadama-x', resolutions: ['accept_difference', 'fix_ne'], proposal: { op: 'set_ne_value', value: 'akadama-x' } }),
+  };
+  await writeDecisions(db, { compareRunId: run(8), observedAt: '2030-01-08T00:00:00Z', decisions: Object.values(more) });
+  const one = async (fp, resolution, extra) => (await decide({ kind: 'approved', resolution, items: [item(await find(fp), extra)] })).j;
+  assert.deepEqual((await one(N1, 'fix_ne', { target_text: '赤玉土 大粒 2L 2 個' })).skipped.map((x) => x.reason), ['resolution_not_allowed']);   // NE を直すは選べない
+  assert.deepEqual((await one(N1, 'fix_cdb')).skipped.map((x) => x.reason), ['needs_target']);   // NE も空 = 本当の名前を入れる
+  assert.equal((await one(N1, 'fix_cdb', { target_text: '赤玉土 大粒 2L 2 個' })).applied.length, 1);
+  assert.equal((await find(N1)).decision.target.value, '赤玉土 大粒 2L 2 個');
+  assert.equal((await one(N2, 'fix_cdb')).applied.length, 1);   // 既定 = NE の名前
+  assert.equal((await find(N2)).decision.target.value, 'NE の名前');
+  assert.deepEqual((await one(N3, 'fix_ne')).skipped.map((x) => x.reason), ['name_is_code']);   // 提案の値 (コード)
+  assert.deepEqual((await one(N3, 'fix_ne', { target_text: 'AKADAMA-X' })).skipped.map((x) => x.reason), ['name_is_code']);   // 大文字・全角でも同じコード
+  assert.deepEqual((await one(N3, 'fix_ne', { target_text: 'ＡＫＡＤＡＭＡ－Ｘ' })).skipped.map((x) => x.reason), ['name_is_code']);
+  assert.equal((await one(N3, 'fix_ne', { target_text: '赤玉土 X' })).applied.length, 1);
+  // 画面: 税率は NE の書き方 (10 / 8 = %)・社内は 10% (0.1)・提案は「NE を 10 (%) に」/ 新しい理由・提案・拒んだ理由の言葉
+  const page = (await call('GET', '/')).text;
+  const src = page.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/)[1];
+  const fns = new vm.Script(`(function () { const esc = (s) => String(s ?? ''); ${src.match(/const show = [\s\S]*?\n  const proposalText = [\s\S]*?return '決める'; };/)[0]}; return { showNe, showCdb, proposalText }; })()`).runInNewContext({});
+  assert.deepEqual([fns.showNe('tax_rate', 0.1), fns.showCdb('tax_rate', 0.1), fns.showCdb('tax_rate', 0.08), fns.proposalText({ col: 'tax_rate', proposal: { op: 'set_ne_value', value: 0.1 } })],
+    ['10%', '10% (0.1)', '8% (0.08)', 'NE を 10 (%) に']);
+  assert.deepEqual([fns.showCdb('name', 'x'), fns.proposalText({ col: 'name', proposal: { op: 'fill_cdb_name' } }), fns.proposalText({ col: 'name', proposal: { op: 'set_cdb_value', value: 'NE の名前' } })],
+    ['x', '社内 (ポータル) で本当の名前を入れる (NE も空)', '社内 (ポータル) の名前を NE の名前 NE の名前 に']);
+  for (const w of ["cdb_name_is_code: '社内の名前がコードのまま", "name_is_code: '商品コードは名前ではない"]) assert.ok(page.includes(w), w);
+});
+
 server.close();
 await pg.close();
 console.log(`\n${passed} 件 PASS`);

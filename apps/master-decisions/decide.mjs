@@ -22,6 +22,8 @@ const FP_RE = /^[0-9a-f]{64}$/;
 const RUN_RE = /^mc_\d{8}T\d{9}Z_[0-9a-f]{6}$/;
 const ABSENT = '__absent__';
 const FIX = new Set(['fix_ne', 'fix_cdb']);
+/** 名前が商品コードと同じ (照合の正規化で) = 名前ではない (compare-ne の nameIsCode と同じ決まり) */
+export const nameIsCodeOf = (v, codeNorm) => typeof v === 'string' && !!codeNorm && normSku(v) === normSku(codeNorm);
 
 /** 入力の誤り (400) */
 export class DecideError extends Error {
@@ -246,6 +248,8 @@ export async function applyDecisions(db, { actor, kind, resolution = null, note 
           const nv = normalizeTarget(c.col, raw, { selfNorm });
           // 入れた値が読めない = invalid_target / 提案の値が目標にできない (複数の仕入先など) = 値を入れて 1 件ずつ
           if (!nv.ok) { skip(given !== undefined ? 'invalid_target' : 'needs_target'); continue; }
+          // NE の名前を商品コードにしない (コードは名前ではない。社内の名前がコードのまま = 夜間ロードの代わりの値。2026-10-05 の 383 セット)。CSV (ne-csv.mjs) にも同じ守り
+          if (resolution === 'fix_ne' && c.col === 'name' && nameIsCodeOf(nv.value, c.code_norm)) { skip('name_is_code'); continue; }
           target = { subject_key: c.subject_key, col: c.col, child: c.child ?? null, value: nv.value };
         }
       } else if (kind === 'revoked' && (!last || last.kind === 'revoked')) { skip('nothing_to_revoke'); continue; }

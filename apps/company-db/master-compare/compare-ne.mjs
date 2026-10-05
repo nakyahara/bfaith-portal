@@ -34,7 +34,7 @@ const DECISION_CLASSES = new Set(['rule', 'rule_lag', 'held_by_load', 'spec_unde
 /** 承認の指紋の「意味の版」(理由の種類ごとに手で上げる。C2 v4 §6) */
 export const SEMANTIC_VERSIONS = Object.freeze({ tax_fallback: 1, tax_unresolved: 1, exception_cost: 1, exception_tax_manual: 1, set_name_blank: 1, set_price_from_goods: 1,
   set_tax_from_components: 1, not_in_latest_fetch: 1, 'load_rule:name_blank_to_code': 1, manual: 1, held_by_load: 1, spec_undecided: 1, ne_no_value: 1, none: 1, parent_manual: 1,
-  company_owned: 1 });
+  company_owned: 1, cdb_name_is_code: 1 });
 /** 作り直しの理由の列 → 照合の列 (company_owned の handling・primary_supplier は同じ名前。sales_class・shipping は照合しない列) */
 const BUILD_COL = { cost: 'cost', tax_rate: 'tax_rate', name: 'name', price: 'standard_price_jpy', handling: 'handling', primary_supplier: 'primary_supplier' };
 /** ④a が持ち主 C の値を m_products に写す、照合の列 (これらの差は「C → NE」の予定の差。compareNe の companyCopied) */
@@ -44,7 +44,26 @@ const REASON_FIELDS = { tax_fallback: ['source', 'value'], exception_cost: ['val
   set_tax_from_components: ['value', 'category'], set_name_blank: [], not_in_latest_fetch: [], tax_unresolved: [], 'load_rule:name_blank_to_code': [], parent_manual: [],
   // 作り直しが持ち主が C の列に Company DB の値を入れた (④a。rebuild-m-products.js / master-publish.js の mergeReasons)。
   //   持ち主のキー・変換の前の C の値・古い表に入れた値・原価の元の出どころ (世代の番号は毎朝変わるので指紋に入れない)
-  company_owned: ['owner_key', 'cdb_value', 'value', 'cdb_cost_source'] };
+  company_owned: ['owner_key', 'cdb_value', 'value', 'cdb_cost_source'],
+  // 社内の名前が商品コードのまま (夜間ロードが NE の空の名前の代わりにコードを入れた名残。engine の `name || code`)。中身は無い (コードは案件の鍵にある)
+  cdb_name_is_code: [] };
+/** 売価・原価 (円)。0 は「値が無い」(NE の 0.00 = 未入力・Company DB の 0 = NE の 0 を写したもの) = 0 どうし・0 と空は一致 */
+const YEN_COLS = new Set(['standard_price_jpy', 'cost']);
+/**
+ * 名前がその SKU の商品コードと同じ (照合の正規化で) = 名前ではない (コードの代わりの値)。
+ * 🚨 NE に「名前 = コード」を入れる提案・承認・CSV を作らない (NE の名前を壊す。2026-10-05 の 383 セット)
+ */
+export const nameIsCode = (v, norm) => typeof v === 'string' && !!norm && normSku(v) === norm;
+/**
+ * 判断の一覧で「NE をこの値に」と提案してよい値か。空・(無い)・空の配列・売価/原価の 0・名前 = コード は提案しない (決める / 社内を直す)
+ */
+export function proposableValue(col, v, norm) {
+  if (v === null || v === undefined || v === '(無い)' || v === '(ロードは触らない)' || isMarker(v)) return false;
+  if (Array.isArray(v) && !v.length) return false;
+  if (YEN_COLS.has(col) && Number(v) === 0) return false;
+  if (col === 'name' && nameIsCode(v, norm)) return false;
+  return true;
+}
 
 /** 「ロードは触らない (保持)」= この列の値を材料が持たない (原価が無い・代表の仕入先が空・構成が 0 行)。ABSENT = その SKU が材料に無い */
 export const PRESERVE = '__load_preserves__';
@@ -150,6 +169,7 @@ export function resolutionsFor({ cls, reasonKind, incomparableNoValue = false, h
   if (cls === 'held_by_load') return ['fix_input', 'accept_difference'];
   if (reasonKind === 'parent_manual') return ['accept_difference', 'fix_ne', 'fix_cdb'];   // 人が決めた親子 (D3b)
   if (reasonKind === 'manual') return ['accept_difference', 'fix_cdb'];
+  if (reasonKind === 'cdb_name_is_code') return ['fix_cdb', 'accept_difference'];   // 社内の名前がコードのまま = 社内 (ポータル) で本当の名前を入れる。NE を直すは選べない
   if (cls === 'ne_no_value') return hasC ? ['fix_ne', 'accept_difference'] : ['accept_difference', 'spec'];
   return ['accept_difference', 'fix_ne'];
 }
@@ -572,15 +592,24 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     //   🚨 NE の値が空・0・null・不正でも先にここで分ける (Codex #1564 R1 M6。NE の値は C が正の列の判断に使わない = incomparable・ne_no_value にしない)。
     //     NE に値が無く C も空 = 一致 / それ以外 = NE を C の値に (C が空なら決める)。NE の状態 (n_state・n_validity・比べやすさ) は detail に残す
     if (companyCopied(type, col)) {
-      const cEmpty = c == null || (Array.isArray(c) && c.length === 0);
+      // 社内に値が無い = 空・空の配列・売価/原価の 0 (NE の 0 と社内の 0 を差にしない。2026-10-05 の「NE を 0 に」)
+      const cEmpty = c == null || (Array.isArray(c) && c.length === 0) || (YEN_COLS.has(col) && Number(c) === 0);
       if (comp === 'comparable' ? eqv(nv, c) : comp === 'no_value' && cEmpty) return { cls: 'match', detail };
       detail.owner = 'company';
       if (comp !== 'comparable') detail.n_comparability = comp;
+      // 社内の名前がコードのまま (NE の名前が空だったときの代わりの値) = 名前ではない。NE に入れる提案にしない (理由を分ける)
+      if (col === 'name' && nameIsCode(c, norm)) {
+        const nc = { reason: 'cdb_name_is_code' };
+        detail.reasons = [...(detail.reasons || []), nc];
+        return { cls: 'rule', detail, explained: nc };
+      }
       const co = reasons.find((r) => r.reason === 'company_owned') || { reason: 'company_owned' };
       const copy = tt === PRESERVE ? (col === 'primary_supplier' ? [] : null) : tt;
       return eqv(copy, c) ? { cls: 'rule', detail, explained: co } : { cls: 'rule_lag', detail, explained: co };
     }
     if (comp === 'incomparable') return { cls: 'incomparable', detail };
+    // 売価・原価の NE の 0 と社内の 0 = 同じ (どちらも「値が無い」。差として出さない)
+    if (comp === 'no_value' && YEN_COLS.has(col) && nst.raw === 'zero' && c !== null && !isMarker(c) && Number(c) === 0) return { cls: 'match', detail };
     if (comp === 'no_value') return { cls: 'ne_no_value', detail };
     if (eqv(nv, c)) return { cls: 'match', detail };
     // A 昨夜の適用
@@ -779,13 +808,18 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       if (!DECISION_CLASSES.has(col.cls) && !incomparableNoValue) continue;
       const reason = col.explained || (col.reasons && col.reasons[0]) || null;
       const reasonKind = col.cls === 'held_by_load' ? 'held_by_load' : col.cls === 'spec_undecided' ? 'spec_undecided' : reason?.reason || (col.cls === 'ne_no_value' ? 'ne_no_value' : 'none');
-      const proposal = col.cls === 'ne_no_value' || incomparableNoValue ? (col.c != null && col.c !== '(無い)' ? { op: 'set_ne_value', value: col.c } : { op: 'decide' })
-        : col.cls === 'held_by_load' ? { op: 'fix_load_input', reason_code: reason?.reason_code ?? null }
-          : col.cls === 'spec_undecided' ? { op: 'decide_spec' }
-            : reasonKind === 'manual' || reasonKind === 'parent_manual' ? { op: 'decide_manual_priority' }
-              : reasonKind === 'set_price_from_goods' || reasonKind === 'load_rule:name_blank_to_code' ? { op: 'set_ne_value', value: col.t_today }
-                // 持ち主が C の列の差 (④a) = NE を C の値に (C が空 = 決める)
-                : reasonKind === 'company_owned' ? (col.c != null && col.c !== '(無い)' ? { op: 'set_ne_value', value: col.c } : { op: 'decide' }) : { op: 'decide' };
+      // NE をこの値に = 提案してよい値だけ (空・0 の売価/原価・名前 = コード は「決める」。2026-10-05 の「NE を 0 に」「NE をコードに」)
+      const setNe = (v) => (proposableValue(col.col, v, it.norm) ? { op: 'set_ne_value', value: v } : { op: 'decide' });
+      const proposal = reasonKind === 'cdb_name_is_code'
+        // 社内の名前がコードのまま = 社内 (ポータル) で本当の名前を入れる。NE に名前があれば社内をその名前に (fix_cdb の既定の目標 = NE の値)
+        ? (typeof col.n === 'string' && col.n.trim() && !nameIsCode(col.n, it.norm) ? { op: 'set_cdb_value', value: col.n } : { op: 'fill_cdb_name' })
+        : col.cls === 'ne_no_value' || incomparableNoValue ? setNe(col.c)
+          : col.cls === 'held_by_load' ? { op: 'fix_load_input', reason_code: reason?.reason_code ?? null }
+            : col.cls === 'spec_undecided' ? { op: 'decide_spec' }
+              : reasonKind === 'manual' || reasonKind === 'parent_manual' ? { op: 'decide_manual_priority' }
+                : reasonKind === 'set_price_from_goods' || reasonKind === 'load_rule:name_blank_to_code' ? setNe(col.t_today)
+                  // 持ち主が C の列の差 (④a) = NE を C の値に (C が空・0 = 決める)
+                  : reasonKind === 'company_owned' ? setNe(col.c) : { op: 'decide' };
       const owner = col.col === 'exists' ? 'load' : own ? own[ownerKey(col.col)] ?? null : null;   // SKU の INSERT は持ち主で止めない
       const print = decisionPrint({ norm: it.norm, kind: it.kind, col: col.col, child: col.child ?? null, problem: it.type, owner, reasonKind, reason, n_state: col.n_state, n: col.n, c: col.c, proposal });
       const fingerprint = approvalFingerprint(print);
@@ -793,7 +827,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       out.decisions.push({ subject_key: it.subject_key, code: it.code, norm: it.norm, code_norm: it.norm, kind: it.kind, col: col.col, child: col.child ?? null, cls: col.cls, reason_kind: reasonKind,
         n_state: col.n_state ?? null, n: col.n ?? null, c: col.c ?? null, t_today: col.t_today ?? null, reason, proposal, decision_status: 'pending',
         fingerprint, approval_fingerprint: fingerprint, print, semantic: print.semantic,
-        resolutions: resolutionsFor({ cls: col.cls, reasonKind, incomparableNoValue, hasC: col.c != null && col.c !== '(無い)' }) });
+        resolutions: resolutionsFor({ cls: col.cls, reasonKind, incomparableNoValue, hasC: proposal.op === 'set_ne_value' }) });   // 提案できる値が無い (空・0) = NE を直すは値を入れて
     }
   }
   // ── 11. 判断の台帳 (D1 契約 v3): 列の分類はそのまま・判断の状態を重ねる / 差を残す承認だけで埋まった案件を閉じる / 直す承認の完了を目標の単位で確かめる ──

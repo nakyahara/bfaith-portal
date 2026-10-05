@@ -787,6 +787,30 @@ await ta('[19] migration の権限: watcher が先にいる DB (本番と同じ)
   await p.close();
 });
 
+await ta('[26] 2026-10-05: 名前 = 商品コード は承認されていても CSV に入れない (judge = NE の画面へ name_is_code・buildCsv も拒む) / 税率は % の整数 (10 / 8) だけ・0.1 のような値は CSV に出ない / 売価・原価の 0 は書かない', async () => {
+  const run = 'mc_20300301T000000001Z_abcdef';
+  const neCodes = { run, map: new Map([['product|akadama-big-2l-2', { state: 'ok', ne_code: 'akadama-big-2l-2' }], ['product|abc-1', { state: 'ok', ne_code: 'ABC-1' }], ['product|t-1', { state: 'ok', ne_code: 't-1' }]]) };
+  const u = (code, col, value, kind = 'set') => ({ fingerprint: H(`26-${code}-${col}`), event_id: 1, subject_key: `value:${code}`, code_norm: code, col, child: null, last_seen_run: run, done: false,
+    print: { sku_kind: kind, n: null, c: value }, target: { subject_key: `value:${code}`, col, child: null, value } });
+  const j = (x) => csvMod.judge(x, { run, reservations: new Map(), neCodes });
+  for (const [x, why] of [[u('akadama-big-2l-2', 'name', 'akadama-big-2l-2'), 'name_is_code'], [u('akadama-big-2l-2', 'name', 'AKADAMA-BIG-2L-2'), 'name_is_code'],
+    [u('abc-1', 'name', 'ABC-1', 'single'), 'name_is_code'], [u('abc-1', 'name', 'ａｂｃ－１', 'single'), 'name_is_code'],
+    [u('akadama-big-2l-2', 'standard_price_jpy', 0), 'yen_range'], [u('abc-1', 'cost', 0, 'single'), 'yen_range'], [u('abc-1', 'tax_rate', 10, 'single'), 'tax_value']]) {
+    const r = j(x);
+    assert.deepEqual([r.status, r.reason], ['ne_screen', why], `${x.code_norm} ${x.col} ${x.target.value}`);
+  }
+  assert.deepEqual([j(u('akadama-big-2l-2', 'name', '赤玉土 大粒 2L 2 個')).status, j(u('akadama-big-2l-2', 'name', '赤玉土 大粒 2L 2 個')).cell], ['csv', '赤玉土 大粒 2L 2 個']);
+  // 税率: Company DB の 0.1 / 0.08 → NE の消費税率 (%) 10 / 8
+  assert.deepEqual([0.1, 0.08].map((v) => j(u('t-1', 'tax_rate', v, 'single'))).map((r) => [r.status, r.cell]), [['csv', '10'], ['csv', '8']]);
+  // buildCsv の二重の守り (judge の後で値が崩れても CSV にしない)
+  assert.equal(buildCsv(COLUMNS['products:tax_rate'], [{ ne_code: 't-1', cell: '10' }, { ne_code: 't-2', cell: '8' }]).bytes.toString('utf8'), 'syohin_code,tax_rate\r\nt-1,10\r\nt-2,8\r\n');
+  for (const bad of ['0.1', '0.08', '10.0', '10%', '', '0']) assert.throws(() => buildCsv(COLUMNS['products:tax_rate'], [{ ne_code: 't-1', cell: bad }]), /値の形が違う/, bad);
+  for (const k of ['products:standard_price_jpy', 'products:cost', 'sets:standard_price_jpy']) for (const bad of ['0', '0.00', '-1', '1.5']) assert.throws(() => buildCsv(COLUMNS[k], [{ ne_code: 'x1', cell: bad }]), /値の形が違う/, `${k} ${bad}`);
+  for (const k of ['products:name', 'sets:name']) assert.throws(() => buildCsv(COLUMNS[k], [{ ne_code: 'Akadama-1', cell: 'akadama-1' }]), /名前が商品コードと同じ/, k);
+  // 列の表の全部の値の書き方が cellRe の形に合う (税率・円の列)
+  for (const [k, s] of Object.entries(COLUMNS)) if (s.cellRe) for (const v of [0.1, 0.08, 1, 1980, 999999999]) { const c = s.cell(v); if (c.ok) assert.match(c.cell, s.cellRe, `${k} ${v}`); }
+});
+
 server.close();
 await pg.close();
 console.log(`\n${passed} 件 ok${process.exitCode ? ' (NG あり)' : ''}`);
