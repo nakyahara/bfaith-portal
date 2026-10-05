@@ -119,7 +119,7 @@ function svg({ bg, art }) {
 </svg>`;
 }
 
-const only = process.argv.slice(2);
+const only = [...new Set(process.argv.slice(2))];
 const targets = only.length ? APPS.filter(a => only.includes(a.slug)) : APPS;
 if (only.length && targets.length !== only.length) {
   console.error(`知らない slug があります: ${only.filter(s => !APPS.some(a => a.slug === s)).join(', ')}`);
