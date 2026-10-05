@@ -77,7 +77,7 @@ await t('watcher は公開の関数と finance_daily_sku_range・profit_reader �
 
 console.log('0056');
 await t('実行器で流れる (0056 だけ)', async () => {
-  assert.deepEqual((await applyMigrations(db, { log: quiet })).applied, ['0056']);
+  assert.deepEqual((await applyMigrations(db, { log: quiet, to: '0056' })).applied, ['0056']);   // 0056 まで (後の migration は対象の外)
 });
 await t('🚨 revoke の 10 の関数は権限の表が空 (null = 既定 でもない)・PUBLIC・watcher・profit_reader は false・棚卸しの問題は 0 件', async () => {
   assert.equal(REVOKE.length, 10);
@@ -106,7 +106,7 @@ await t('2 回流しても同じ (0056 の本文をもう一度 = 例外なし�
   const before = {}; for (const e of HEAVY_ENTRY_MANIFEST) before[e.sig] = await aclText(e.sig);
   await pg.exec(fs.readFileSync(FILE_0056, 'utf8'));
   for (const e of HEAVY_ENTRY_MANIFEST) assert.equal(await aclText(e.sig), before[e.sig], e.sig);
-  assert.equal((await applyMigrations(db, { log: quiet })).applied.length, 0);
+  assert.equal((await applyMigrations(db, { log: quiet, to: '0056' })).applied.length, 0);
   assert.deepEqual(await heavyEntryFindings(db), []);
 });
 await t('TEMP の権限は監査を出すだけ (0056 の前と後で同じ・PUBLIC は TEMP あり = PR 1b で外す)・一時の表を作る関数を数える', async () => {

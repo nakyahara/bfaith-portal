@@ -41,6 +41,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normSku } from '../../../lib/sku-norm.js';
 import { validateOwnership, loadOwns as ownsIn, companyOwned } from '../../../config/master-ownership.mjs';
+import { hasRegisteredOn } from '../../../lib/sku-registered-on.mjs';
 import { MASTER_WRITE_EXCLUSIVE_LOCK_SQL, MASTER_WRITE_LOCK_EXISTS_SQL } from '../../../lib/master-cutover.mjs';
 import { resolveLoadOwnership, ownershipHashOf, OWNERSHIP_LOCK_EXISTS_SQL, OWNERSHIP_SHARED_LOCK_SQL } from './ownership-state.mjs';
 
@@ -56,6 +57,7 @@ export const LOAD_RULE_FILES = Object.freeze([
   'apps/company-db/load/sources.mjs', 'apps/company-db/load/engine.mjs', 'apps/warehouse/material-lineage.js', 'lib/sku-norm.js', 'config/master-ownership.mjs',
   'apps/company-db/load/ownership-state.mjs',   // 持ち主の epoch (0055)。ロードが使う持ち主を決める
   'apps/warehouse-mirror/material-tables.js',   // mirror の表の型 (ロードが読む値・照合が控えを戻す表)
+  'lib/sku-registered-on.mjs',                  // 0057: NE の作成日 → 登録日の読み方
 ]);
 export function loadRuleFingerprint(root = fileURLToPath(new URL('../../../', import.meta.url))) {
   const h = crypto.createHash('sha256');
@@ -98,6 +100,16 @@ export function skuValuesForLoad(s) {
     tax_rate: s.taxRate ?? null, tax_class: s.taxClass ?? null, handling: s.handling || 'unknown',
     standard_price_jpy: s.standardPriceJpy ?? null, shipping_code: s.shippingCode ?? null, shipping_method: s.shippingMethod ?? null, shipping_cost_jpy: s.shippingCostJpy ?? null,
   };
+}
+
+/**
+ * 0057: 夜間ロードが新しく作る SKU の登録日 (既にある行には使わない = on conflict の更新に入れない)。
+ *   NE の作成日がある = その日 (ne) / 無い単品 = 空 (翌晩以降に NE の作成日で埋める) / 無いセット・例外 = ロードの日 (first_seen = NE で初めて見た日)
+ */
+export function registeredOnForNew(s, jstToday) {
+  if (s.registeredOn) return { registered_on: s.registeredOn, registered_on_source: 'ne' };
+  if (s.kind !== 'single') return { registered_on: jstToday, registered_on_source: 'first_seen' };
+  return { registered_on: null, registered_on_source: null };
 }
 
 /** プロセスの起動時に計算 (= 動いているコード)。読めなければ null (ロードは止めない) */
@@ -250,6 +262,9 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const has0027 = (await db.query("select 1 from information_schema.columns where table_schema = 'core' and table_name = 'skus' and column_name = 'standard_price_jpy'")).rows.length > 0;
     if (!has0027) report.notes = [...(report.notes || []), '0027 が未適用: 標準売価・送料・推奨保有月数・連絡先・代表の仕入先は見送り'];
     const newCols = (key) => has0027 && loadOwns(key);
+    // 0057 (登録日) が未適用の DB でも夜間ロードを止めない (列を書かない = 今までどおり)
+    const has0057 = await hasRegisteredOn(db);
+    if (!has0057) report.notes = [...(report.notes || []), '0057 が未適用: 登録日は見送り'];
     const rulePriority = new Map(rules.map((r) => [`${r.attribute}|${r.packaging_scope}|${r.source_system}`, r.priority]));
 
     // ── 1. 予定の確定 (正規化衝突は先に落とし、以降は accepted だけを使う) ──
@@ -295,6 +310,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const skuRows = accepted.map((s) => ({
       company_id: COMPANY_ID, product_id: s.kind === 'single' ? productIdBySku.get(normSku(s.code)) : null,
       ...skuValuesForLoad(s),   // 照合の ① と共用する規則 (0027 の列を含む)
+      // 0057: 新しく作る行の登録日 (既にある行は on conflict で触らない = 下の「空の行だけ埋める」で)。2 つの列は必ず明示する (書かないと DB の既定 = ポータルで登録 になる)
+      ...registeredOnForNew(s, jstToday),
       created_by_type: 'system', created_by_id: runId,
     }));
     const skuIds = new Map();   // code_norm → sku_id (accepted のみ)
@@ -304,7 +321,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
       .filter(([c, k]) => loadOwns(k) && (has0027 || !SKU_0027_COLUMNS.includes(c))).map(([c]) => [c, `excluded.${c}`]);
     skuSet.push(['product_id', 'coalesce(core.skus.product_id, excluded.product_id)']);
     const returned = await insertMany(db, 'core.skus', ['company_id', 'product_id', 'sku_kind', 'code', 'name', 'tax_rate', 'tax_class', 'handling',
-      ...(has0027 ? ['standard_price_jpy', 'shipping_code', 'shipping_method', 'shipping_cost_jpy'] : []), 'created_by_type', 'created_by_id'], skuRows, {
+      ...(has0027 ? ['standard_price_jpy', 'shipping_code', 'shipping_method', 'shipping_cost_jpy'] : []), ...(has0057 ? ['registered_on', 'registered_on_source'] : []),
+      'created_by_type', 'created_by_id'], skuRows, {
       onConflict: `on conflict (company_id, code_norm) do update set ${skuSet.map(([c, v]) => `${c} = ${v}`).join(', ')}`
         + ` where (${skuSet.map(([c]) => `core.skus.${c}`).join(', ')}) is distinct from (${skuSet.map(([, v]) => v).join(', ')})`,
       returning: 'sku_id, code_norm',
@@ -333,6 +351,21 @@ export async function runInitialLoad(db, plan, opts = {}) {
         rmUpdated += r.rowCount ?? 0;
       }
       skuSec.notes.push(`推奨保有月数: 変更 ${rmUpdated} / 同じ ${rm.length - rmUpdated} (snapshot ${plan.reorder.runId}${plan.reorder.reason ? '・' + plan.reorder.reason : ''})`);
+    }
+    // 0057: 登録日。空の行だけ NE の作成日で埋める (一度入った値は変えない = DB の trigger も止める)。持ち主 (load / company) によらない
+    if (has0057) {
+      const reg = accepted.filter((x) => x.registeredOn).map((x) => [skuIdOf(x.code), x.registeredOn]).filter(([id]) => id);
+      let filled = 0;
+      for (let i = 0; i < reg.length; i += CHUNK) {
+        const chunk = reg.slice(i, i + CHUNK); const params = [];
+        const vals = chunk.map(([id, d]) => { params.push(id, d); return `($${params.length - 1}::bigint, $${params.length}::date)`; }).join(', ');
+        const r = await db.query(`update core.skus s set registered_on = v.d, registered_on_source = 'ne' from (values ${vals}) as v(id, d) where s.sku_id = v.id and s.registered_on is null`, params);
+        filled += r.rowCount ?? 0;
+      }
+      const ra = plan.registered || {};
+      skuSec.notes.push(ra.available
+        ? `登録日: 空だった ${filled} 件を NE の作成日で埋めた (NE の作成日あり ${reg.length} 件・snapshot ${ra.runId}${ra.invalid ? '・読めない日付 ' + ra.invalid + ' 件' : ''}${ra.dup ? '・コードが正規化で重なる ' + ra.dup + ' 件' : ''})`
+        : `登録日: NE の作成日は見送り (${ra.reason || '材料なし'})`);
     }
     const productIdOf = (code) => (isAcceptedCode(code) ? productIdBySku.get(normSku(code)) : undefined);
     const productIdsInRun = [...new Set(accepted.map((s) => productIdOf(s.code)).filter(Boolean))];

@@ -158,7 +158,7 @@ async function openCutover(E, ownership, upTo = 'new_open') {
 console.log('今の本番は変わらない (0053 と 0054)');
 await ta('[1] 同じ材料の夜間ロード (全部 load・legacy_open): 0053 までの DB と 0054 までの DB で出品・構成・変更の記録・report が同じ / 0054 を後から流しても何も変わらない・その後のロードも同じ', async () => {
   const E52 = await setupDb({ to: '0053' });
-  const E53 = await setupDb();
+  const E53 = await setupDb({ to: '0054' });   // 0054 までの DB (0057 の登録日など後の migration は比べる対象の外)
   assert.equal((await E52.db.query("select count(*)::int as n from ops.schema_migrations where version = '0054'")).rows[0].n, 0);
   const r52 = await load(E52.db); const r53 = await load(E53.db);
   assert.deepEqual(reportShape(r53), reportShape(r52));

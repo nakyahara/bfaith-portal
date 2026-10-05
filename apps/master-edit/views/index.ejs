@@ -8,6 +8,7 @@
   <%
     const SALES = { 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' };
     const REG_BADGE = { draft: 'warn', ne_pending: 'info', ne_confirmed: 'info', distributable: 'info', quarantined: 'err', cancelled: 'mute' };
+    const REGISTERED_ON_SOURCES_LABEL = { ne: 'NE の作成日', portal: 'ポータルで登録', first_seen: '夜間ロードで初めて見た日' };
     const FLAG_BADGE = { 'NEとの差': 'err', 'CSV待ち': 'info', '構成の依頼': 'warn', 'カード作成待ち': 'warn', 'カード作成待ち (失敗)': 'err', 'カードの衝突': 'err' };
     // 今の絞り込み (offset を除く) を土台に、1 つだけ変えた URL
     const keep = Object.fromEntries(Object.entries(filters).filter(([k, v]) => v && k !== 'offset'));
@@ -82,6 +83,7 @@
           <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>もっと絞る (状態・登録・カード・未入力の項目)</summary>
           <form method="get" action="" class="row2">
             <% if (filters.q) { %><input type="hidden" name="q" value="<%= filters.q %>"><% } %>
+            <% if (filters.sort) { %><input type="hidden" name="sort" value="<%= filters.sort %>"><% } %>
             <label>区分 <select class="in" name="kind"><option value="">全部</option><% for (const [k, v] of Object.entries(KINDS)) { %><option value="<%= k %>"<%= filters.kind === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
             <label>状態 <select class="in" name="state"><option value="">全部</option><% for (const [k, v] of Object.entries(STATES)) { %><option value="<%= k %>"<%= filters.state === k ? ' selected' : '' %>><%= k === 'available' ? '取扱中' : v %></option><% } %></select></label>
             <label>登録 <select class="in" name="reg"><option value="">全部</option><% for (const [k, v] of Object.entries(REG_STATES)) { %><option value="<%= k %>"<%= filters.reg === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
@@ -99,14 +101,15 @@
       <div class="tbl-top">
         <span><b><%= data.total.toLocaleString('ja-JP') %></b> 件</span><span class="dotsep" aria-hidden="true"></span>
         <span>コードを押すか <span class="kbd">↑</span><span class="kbd">↓</span> で選んで <span class="kbd">Enter</span> で開く</span>
+        <% if (data.sorts) { %><span class="dotsep" aria-hidden="true"></span><span>並び <% for (const [k, v] of Object.entries(data.sorts)) { %><% if ((filters.sort || '') === k) { %><b aria-current="true"><%= v %></b><% } else if (k && !data.registeredOnAvailable) { %><% } else { %><a href="<%= hrefWith({ sort: k }) %>"><%= v %></a><% } %> <% } %></span><% } %>
         <span class="right"><span><span class="fx">計算</span> = 構成品から計算した値</span></span>
       </div>
       <div class="tblwrap">
         <table class="tbl click" id="list-tbl">
           <caption class="sr">商品・セットの一覧 (<%= data.total %> 件)</caption>
-          <thead><tr><th scope="col" style="width:130px">コード</th><th scope="col" style="min-width:260px">名前</th><th scope="col" style="width:150px">状態</th><th scope="col" class="n" style="width:84px">売価</th><th scope="col" class="n" style="width:112px">原価</th><th scope="col" class="n" style="width:74px">税</th><th scope="col" style="width:120px">売上分類</th><th scope="col" style="width:150px">対応が必要</th></tr></thead>
+          <thead><tr><th scope="col" style="width:130px">コード</th><th scope="col" style="min-width:260px">名前</th><th scope="col" style="width:150px">状態</th><th scope="col" style="width:96px">登録日</th><th scope="col" class="n" style="width:84px">売価</th><th scope="col" class="n" style="width:112px">原価</th><th scope="col" class="n" style="width:74px">税</th><th scope="col" style="width:120px">売上分類</th><th scope="col" style="width:150px">対応が必要</th></tr></thead>
           <tbody>
-            <% if (!data.rows.length) { %><tr><td colspan="8" class="muted" style="text-align:center;padding:30px"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
+            <% if (!data.rows.length) { %><tr><td colspan="9" class="muted" style="text-align:center;padding:30px"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
             <% for (const r of data.rows) { const isSet = r.kind === 'set'; %>
             <tr>
               <td><a class="rowlink" href="sku/<%= encodeURIComponent(r.code) %>"><%= r.code %></a></td>
@@ -115,6 +118,7 @@
                 <% if (r.state === 'discontinued') { %><span class="b mute">中止</span><% } else { %><span class="b ok"><span class="dot" aria-hidden="true"></span>取扱中</span><% } %>
                 <% if (r.reg_state !== 'none' && r.reg_state !== 'available') { %><span class="b <%= REG_BADGE[r.reg_state] || 'mute' %>" style="margin-top:4px"><%= REG_STATES[r.reg_state] || r.reg_state %></span><% } %>
               </td>
+              <td class="muted"<%- r.registered_on_source ? ' title="' + (REGISTERED_ON_SOURCES_LABEL[r.registered_on_source] || r.registered_on_source) + '"' : '' %>><%= r.registered_on ? r.registered_on.replace(/-/g, '/') : '—' %></td>
               <td class="n"><%= fmt.yen(r.standard_price) %></td>
               <td class="n"><% if (r.cost == null) { %><span class="b err">未入力</span><% } else { %><%= fmt.yen(r.cost) %><% if (r.cost_derived) { %><span class="fx">計算</span><% } %><% } %></td>
               <td class="n"><% if (r.tax_rate == null) { %><span class="b warn">未入力</span><% } else { %><%= fmt.tax(r.tax_rate) %>%<% if (r.tax_derived) { %><span class="fx">計算</span><% } %><% } %></td>

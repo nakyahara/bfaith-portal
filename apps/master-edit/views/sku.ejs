@@ -88,6 +88,7 @@
         <div class="meta">
           <% if (last) { %><span>最後に直した人 <%= ui.actorWords(last) %></span><span class="dotsep" aria-hidden="true"></span><span><%= ui.fmtJst(last.recorded_at, { nowMs }) %></span><% } else { %><span>変更の記録はまだありません</span><% } %>
           <% if (!isSet && c.primary_supplier) { %><span class="dotsep" aria-hidden="true"></span><span>仕入先 <%= c.primary_supplier %> <%= supName(c.primary_supplier) %></span><% } %>
+          <% if (page.registered) { %><span class="dotsep" aria-hidden="true"></span><span id="registered-on">登録日 <%= page.registered.date ? page.registered.date.replace(/-/g, '/') + ' (' + page.registered.label + ')' : '— (分かりません)' %></span><% } %>
         </div>
       </div>
       <div class="ph-actions" style="align-items:center">

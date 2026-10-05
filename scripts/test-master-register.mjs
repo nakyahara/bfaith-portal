@@ -497,6 +497,8 @@ await ta('[R4] 単品: 1 つの取引で 商品・SKU・状態 draft・代表の
   assert.deepEqual(row, { sku_kind: 'single', name: '新しい単品', tax: 0.1, tax_class: 'STANDARD_10', handling: 'active', price: 1980, shipping_code: 'S01', shipping_method: 'ゆうパケット',
     ship: 210, months: 1.5, created_by_type: 'human', created_by_id: 'naka@test', display_code: 'new-a1', pname: '新しい単品', sales_class: 3, status: 'active', expiry_managed: true, inbound_date_managed: false });
   assert.deepEqual(await regOf('new-a1'), { state: 'draft', origin: 'new_entry', gen: null });
+  // 0057: 登録日 = 登録した取引の JST の今日・出どころ portal (登録の関数は列を書かない = DB の既定)
+  assert.deepEqual(await one("select registered_on::text as d, registered_on_source as src from core.skus where code = 'new-a1'"), { d: TODAY, src: 'portal' });
   assert.deepEqual((await q(`select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id join core.skus k on k.sku_id = x.sku_id where k.code = 'new-a1' and x.is_primary`)).map((x) => x.code), ['0001']);
   assert.deepEqual(await q(`select c.cost_jpy::int as jpy, c.cost_source as src, c.cost_status as st, c.valid_from::text as f, c.valid_to, c.reason from core.sku_costs c join core.skus k on k.sku_id = c.sku_id where k.code = 'new-a1'`),
     [{ jpy: 800, src: 'manual', st: 'COMPLETE', f: TODAY, valid_to: null, reason: '新商品の登録' }]);

@@ -14,6 +14,7 @@ import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs
 import { latestRun } from '../master-decisions/decide.mjs';
 import { readCardEvent } from '../../lib/product-hub-outbox.mjs';
 import { regItemsOfSku } from '../../lib/master-reg-csv.mjs';
+import { hasRegisteredOn, LIST_SORTS, listOrderBy, REGISTERED_ON_SOURCES } from '../../lib/sku-registered-on.mjs';
 
 /** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0053) */
 async function selectableSuppliers(db) {
@@ -52,6 +53,7 @@ export function normalizeFilters(q = {}) {
     reg: pick(String(q.reg ?? ''), REG_STATES),
     card: pick(String(q.card ?? ''), CARD_FILTERS),
     diff: q.diff === '1' ? '1' : '',
+    sort: pick(String(q.sort ?? ''), LIST_SORTS),   // 0057: '' = コード順 / reg_desc = 登録日の新しい順
     offset,
   };
 }
@@ -97,6 +99,7 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   }
   const diffAvailable = await regclass(db, 'ops.master_decision_candidates');
   const run = diffAvailable ? await latestRun(db) : null;
+  const hasRegOn = await hasRegisteredOn(db);   // 0057 の前の DB = 登録日の列は空・コード順
   if (f.diff) {
     if (!run) where.push('false');
     else { params.push(run.compare_run_id); where.push(`s.code_norm in (select code_norm from ops.master_decision_candidates where last_seen_run = $${params.length})`); }
@@ -105,12 +108,13 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
         s.standard_price_jpy::text as standard_price, s.shipping_code, s.reorder_months::text as reorder_months, s.set_sales_class_override,
         p.sales_class, c.cost_jpy::text as cost_jpy, c.cost_source, c.cost_status,
         (select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id where x.sku_id = s.sku_id and x.is_primary order by sp.code limit 1) as primary_supplier,
-        ${hasReg ? '(select mr.state from ops.master_registrations mr where mr.sku_id = s.sku_id)' : 'null::text'} as reg_state
+        ${hasReg ? '(select mr.state from ops.master_registrations mr where mr.sku_id = s.sku_id)' : 'null::text'} as reg_state,
+        ${hasRegOn ? 's.registered_on::text as registered_on, s.registered_on_source' : 'null::text as registered_on, null::text as registered_on_source'}
       from core.skus s
       left join core.products p on p.product_id = s.product_id
       ${costAsOfJoin('s.sku_id', '$2', 'c')}
      where ${where.join(' and ')}
-     order by s.code_norm`, params)).rows;
+     order by ${listOrderBy(f.sort, { alias: 's', hasColumn: hasRegOn })}`, params)).rows;
   // セットの売上分類 (構成品から導く・上書き)
   const setIds = rows.filter((r) => r.sku_kind === 'set').map((r) => r.sku_id);
   const compClasses = new Map();
@@ -133,6 +137,7 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
       state: r.handling === 'discontinued' ? 'discontinued' : 'available',
       reg_state: r.reg_state ?? 'none',
       comp_count: isSet ? (compClasses.get(r.sku_id) || []).length : null,
+      registered_on: r.registered_on ?? null, registered_on_source: r.registered_on_source ?? null,
     };
   });
   if (f.missing === 'sales') list = list.filter((r) => r.sales_class == null && r.kind !== 'exception');
@@ -149,7 +154,7 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   const CARD_FLAG = { pending: 'カード作成待ち', failed: 'カード作成待ち (失敗)', conflict: 'カードの衝突' };
   for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : []),
     ...(cardOf.has(r.sku_id) ? [CARD_FLAG[cardOf.get(r.sku_id)]] : [])];
-  return { rows: pageRows, total: list.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable };
+  return { rows: pageRows, total: list.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable, sorts: LIST_SORTS, registeredOnAvailable: hasRegOn };
 }
 
 /**
@@ -227,9 +232,13 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
     // 最近の変更 (画面の右の「最近の変更」と見出しの「最後に直した人」)。新しい順
     const recent = (await changesSince(db, { skuId: id, productId: cur.product_id, sinceEventId: null, limit: 30 })).reverse();
     const locks = await readFieldLocks(db, cur);
+    // 0057: 登録日 (見出しに出すだけ。保存の確かめ = editTokenOf には入れない)。0057 の前の DB = null
+    const registered = (await hasRegisteredOn(db))
+      ? (await db.query('select registered_on::text as date, registered_on_source as source from core.skus where sku_id = $1', [id])).rows[0] : null;
+    if (registered) registered.label = registered.source ? (REGISTERED_ON_SOURCES[registered.source] || registered.source) : null;
     locks.futureCost = await readFutureCostLocks(db, cur, today);
     return {
-      cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today, card, regItems, recent, locks,
+      cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today, card, regItems, recent, locks, registered,
       state: cur.handling === 'discontinued' ? 'discontinued' : 'available',
       derived: cur.sku_kind === 'set' ? setDerivations(cur) : null,
       fields: fieldOwnership(cur.sku_kind, ownership, open && newEntryWritable(phase, ownership)),

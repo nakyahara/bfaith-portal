@@ -24,6 +24,7 @@ import Database from 'better-sqlite3';
 import { normSku } from '../../../lib/sku-norm.js';
 import { pickByPriority, variationGroupName, FNSKU_SOURCE_PRIORITY } from './engine.mjs';
 import { materialDigest, cleanMaterialText, MATERIAL_ID_RE, MATERIAL_HASH_RE } from '../../warehouse/material-lineage.js';
+import { parseNeCreationDate } from '../../../lib/sku-registered-on.mjs';
 
 const MARKETPLACE_JP = 'A1VC38T7YXB528';
 /**
@@ -308,6 +309,35 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       }
     } else plan.reorder.reason = '商品管理リストの snapshot の表が無い';
     src.reorder = plan.reorder;
+
+    // 0057: 登録日 ← 商品管理リストの公開 snapshot の 登録日 (= miniPC の raw_ne_products.作成日 = NE の goods_creation_date)。
+    //   使ってよい snapshot は推奨保有月数と同じ判定 (status ok / partial・行数が row_count と合う)。使えない日は registeredOn を付けない = 夜間ロードは触らない。
+    //   🚨 mirror_products.new_product_launch_date は使わない (「発売日」として人が手で直せる・NE の作成日より手の値が勝つ = 登録日ではない)。
+    //   値が無い・読めない・未来の日付の商品は付けない (翌晩以降にもう一度見る)。正規化すると同じになる行が 2 つ以上ある商品は使わない
+    plan.registered = { available: false, runId: null, reason: null, withDate: 0, invalid: 0, dup: 0 };
+    if (!plan.reorder.available || !plan.reorder.runId) plan.registered.reason = `snapshot が使えない (${plan.reorder.reason || '材料なし'})`;
+    else if (!hasColumn(mirror, 'mirror_pml_snapshot_rows', '登録日')) plan.registered.reason = 'snapshot に 登録日 の列が無い';
+    else {
+      const today = new Date(now.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+      const byCode = new Map(); const dupNorm = new Set();
+      for (const r of rows(mirror, 'select 商品コード as code, 登録日 as reg from mirror_pml_snapshot_rows where run_id = ?', [plan.reorder.runId])) {
+        const k = normSku(r.code); if (byCode.has(k)) dupNorm.add(k); else byCode.set(k, r.reg);
+      }
+      const reg = plan.registered;
+      Object.assign(reg, { available: true, runId: plan.reorder.runId });
+      for (const sku of plan.skus) {
+        const k = normSku(sku.code);
+        if (!byCode.has(k)) continue;
+        if (dupNorm.has(k)) { reg.dup++; continue; }
+        const raw = byCode.get(k);
+        if (raw == null || String(raw).trim() === '') continue;   // NE の作成日が無い (セット・例外) = 付けない
+        const d = parseNeCreationDate(raw, today);
+        if (!d) { reg.invalid++; continue; }
+        sku.registeredOn = d;
+        reg.withDate++;
+      }
+    }
+    src.registered = plan.registered;
 
     // ── Amazon listings ← mirror_sku_master + mirror_sku_resolved (+ fees の ASIN, fba.db の ASIN/JAN/FNSKU) ──
     const fees = hasTable(mirror, 'mirror_amazon_sku_fees') ? new Map(rows(mirror, 'select seller_sku, asin from mirror_amazon_sku_fees where asin is not null').map((r) => [normSku(r.seller_sku), s(r.asin)])) : new Map();
