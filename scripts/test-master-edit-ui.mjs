@@ -13,9 +13,13 @@
  *   8 JAN の欄に打ったまま (Enter を押さずに) ほかの欄も変えて Ctrl+S = JAN も保存する / 形の違う JAN なら保存しない (#1589 Codex R2 M1)
  *   9 画面を開いた後に登録をやめた (cancelled_sku) = 開き直しが要る (欄を触っても保存のボタンが戻らない)・やめた商品は初めから見るだけ (M3)
  *  10 先の日付の原価がある = 該当する原価の欄だけ閉じる (ほかの欄は保存できる) (M2)
- *  11 保存が通った後は入力の場所を閉じ「表示し直す」へ (保存の後に打てない = 黙って消える値を作らない)・離れても聞かない (#1589 Codex R3 M1)
+ *  11 保存が通ったら画面を読み直す (10/5): 読み直すまでは入力の場所を閉じる (#1589 Codex R3 M1)・欄と見出しは保存した後の値・上に知らせが 1 回・続けて直せる・戻る 1 回で一覧
  *  12 変わった項目が無い保存 (5 と 5.0) の後は未保存が残らない (R3 L3)
  *  13 登録をやめた商品はカードの操作 (もう一度作る・結ぶ) も出さない (R3 M2・画面だけ。API の拒否は master からある穴 = 別 PR)
+ *  14 絞る欄の Enter = 絞る・IME の変換を確かめる Enter では送らない・表の行の Enter = 開く・パンくずで同じ絞り込みへ戻る (10/5)
+ *  15 かなの同一視 (ひらがな・カタカナ・半角カナ・全角英数・大文字小文字) = 一覧・全体から探す・画面とサーバーの決まりが同じ (10/5)
+ *  16 原価を変える理由 = 選ぶ (既定 = メーカーからの値上げ通知)・その他は書かないと保存できない・記録に残る (10/5)
+ *  17 1440 / 1280 / 1024 幅: 一覧をスクロールしても見出しの行が上の帯の下に見えている・横に送っても列がずれない (10/5)
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -67,7 +71,11 @@ const sku = (code, name, kind, taxRate, salesClass, cost) => ({
   code, name, kind, taxRate, taxClass: taxRate === 0.08 ? 'REDUCED_8' : 'STANDARD_10', handling: 'active', salesClass,
   cost: { jpy: cost, source: kind === 'set' ? 'set_calc' : 'ne', status: 'COMPLETE' }, standardPriceJpy: 1000, shippingCode: 'S02', shippingMethod: '宅急便', shippingCostJpy: 520, reorderMonths: 2,
 });
-const singles = [sku('s001', '単品 1', 'single', 0.1, 3, 100), sku('s002', '単品 2 (長い名前の試験: 国産 有機 シリコン 保存袋 Sサイズ 3枚入 まとめ買い 12 個セット)', 'single', 0.1, 3, 200), sku('s003', '単品 3', 'single', 0.08, 1, 50)];
+const singles = [sku('s001', '単品 1', 'single', 0.1, 3, 100), sku('s002', '単品 2 (長い名前の試験: 国産 有機 シリコン 保存袋 Sサイズ 3枚入 まとめ買い 12 個セット)', 'single', 0.1, 3, 200), sku('s003', '単品 3', 'single', 0.08, 1, 50),
+  // 長い一覧 (見出しの行を上に残す試験) と かなの同一視の試験の名前 (10/5)
+  sku('k001', '国産 はちみつ 500g', 'single', 0.08, 1, 300), sku('k002', 'ハチミツ レモン', 'single', 0.08, 1, 310), sku('k003', 'ﾊﾁﾐﾂ ｷｬﾝﾃﾞｨ', 'single', 0.08, 1, 120),
+  sku('k004', 'ＡＢＣ 保存袋', 'single', 0.1, 3, 90), sku('k005', 'abc 小袋', 'single', 0.1, 3, 80), sku('k006', 'みかん', 'single', 0.08, 1, 70),
+  ...Array.from({ length: 40 }, (_, i) => sku(`z${String(i).padStart(3, '0')}`, `一覧を長くする単品 ${i}`, 'single', 0.1, 3, 100 + i))];
 const lr = await runInitialLoad(db, {
   skus: [...singles, sku('set001', 'セット 1', 'set', 0.1, null, 300)], variationGroups: [],
   setComponents: [{ parentCode: 'set001', childCode: 's001', qty: 1, source: 'ne' }, { parentCode: 'set001', childCode: 's002', qty: 1, source: 'ne' }],
@@ -322,19 +330,38 @@ await ta('[10] 先の日付の原価 (使っているセット) = 原価の欄�
   }
 });
 
-await ta('[11] 保存が通った後は入力の場所を閉じる (打てない・Ctrl+S でも何もしない)・フォーカスは「表示し直す」・離れても聞かない', async (p) => {
-  await p.goto(B + '/sku/s003');
+await ta('[11] 保存が通ったら画面を読み直す (10/5): 読み直すまでは打てない・欄は保存した後の値・上に知らせが 1 回・続けて別の欄を直して保存できる・戻る 1 回で一覧へ', async (p) => {
+  await p.goto(B + '/');
+  await Promise.all([p.waitForNavigation(), p.click('a.rowlink:has-text("s003")')]);
   await p.fill('#f-reorder_months', '6');
+  // 読み直しを一度止めて (ME.reloadPage を差し替え)、読み直すまでは入力の場所が閉じていることを見る
+  await p.evaluate(() => { window.__reload = window.MasterEdit.reloadPage; window.MasterEdit.reloadPage = () => { window.__reloadAsked = true; }; });
   await p.click('#save');
-  await p.waitForSelector('.result.ok');
-  assert.equal(await active(p), 'reload', '「表示し直す」へ');
-  for (const sel of ['#f-name', '#f-reorder_months', '#jan-in', '#reason', '.handling-top .seg button']) assert.equal(await p.locator(sel).first().isDisabled(), true, `${sel} は閉じる`);
+  await p.waitForFunction(() => window.__reloadAsked === true);
+  assert.match(await p.textContent('#msg'), /読み直しています/);
+  for (const sel of ['#f-name', '#f-reorder_months', '#jan-in', '#reason', '.handling-top .seg button']) assert.equal(await p.locator(sel).first().isDisabled(), true, `${sel} は読み直すまで閉じる`);
   assert.equal(await p.evaluate(() => document.getElementById('f').firstElementChild.hasAttribute('inert')), true);
-  await p.keyboard.press('Control+s');
-  await p.waitForTimeout(200);
+  assert.equal(await dirty(p), 0, '保存した = 未保存 0 (離れても聞かない)');
+  await p.evaluate(() => window.__reload());
+  await p.waitForSelector('#saved-note');
+  assert.equal(await p.inputValue('#f-reorder_months'), '6', '欄は保存した後の値');
+  assert.match(await p.textContent('#saved-note'), /保存しました[\s\S]*推奨保有月数/);
+  assert.match(await p.textContent('#toast-t'), /保存しました \(推奨保有月数/);
   assert.equal((await row('s003')).months, 6);
-  await Promise.all([p.waitForNavigation(), p.click('.rail a[aria-label="つかいかた"]')]);
-  assert.match(p.url(), /manual$/);
+  assert.equal(await dirty(p), 0);
+  assert.equal(await p.isDisabled('#f-name'), false, '読み直した後は打てる');
+  await p.reload();
+  assert.equal(await p.locator('#saved-note').count(), 0, '知らせは 1 回だけ');
+  // 続けて直す (読み直しで新しい編集の印)
+  await p.fill('#f-name', '単品 3 改');
+  await p.keyboard.press('Control+s');
+  await p.waitForSelector('#saved-note');
+  assert.equal(await p.inputValue('#f-name'), '単品 3 改');
+  assert.equal(await p.textContent('h1'), '単品 3 改', '見出しも保存した後の値');
+  assert.equal((await row('s003')).name, '単品 3 改');
+  await p.goBack();
+  await p.waitForSelector('#list-tbl');
+  assert.match(p.url(), /master-edit\/$/, '戻る 1 回で一覧 (同じ画面が履歴に 2 つ並ばない)');
 });
 
 await ta('[12] 変わった項目が無い保存 (6 → 6.0) の後は未保存が残らない (保存のボタン・離れるときの確認も)', async (p) => {
@@ -363,6 +390,152 @@ await ta('[13] 登録をやめた商品は、カードの操作 (もう一度作
   assert.equal(await p.locator('#card-retry').count(), 0, 'やめた商品にカードの操作を出さない');
   assert.equal(await p.locator('#card-link').count(), 0);
 });
+
+const listCodes = (p) => p.$$eval('#list-tbl a.rowlink', (as) => as.map((a) => a.textContent.trim()));
+
+await ta('[14] 絞る欄の Enter (10/5): 絞る欄で Enter = 絞る (URL の q)・IME の変換を確かめる Enter では送らない・↓ で表へ移った後の Enter = その行を開く・パンくずで同じ絞り込みの一覧へ戻る', async (p) => {
+  await p.goto(B + '/');
+  // 作った keydown (ブラウザ自身は送らない) で、画面の JS の決まりそのものを見る: 変換中 = 送らない / 変換でない = 送る
+  await p.focus('#q');
+  await p.fill('#q', 'みかん');
+  await p.evaluate(() => document.getElementById('q').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, keyCode: 229, bubbles: true, cancelable: true })));
+  await p.waitForTimeout(300);
+  assert.doesNotMatch(p.url(), /q=/, '変換を確かめる Enter (isComposing) では送らない');
+  await p.evaluate(() => document.getElementById('q').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 229, bubbles: true, cancelable: true })));
+  await p.waitForTimeout(300);
+  assert.doesNotMatch(p.url(), /q=/, 'keyCode 229 (IME が受けた Enter) では送らない');
+  await Promise.all([p.waitForNavigation(), p.evaluate(() => document.getElementById('q').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true, cancelable: true })))]);
+  assert.equal(new URL(p.url()).searchParams.get('q'), 'みかん', '画面の JS の Enter で送る');
+  assert.deepEqual(await listCodes(p), ['k006']);
+  // 本物の IME (CDP): 変換中の Enter は字が確かまるだけ → もう一度 Enter で絞る
+  await p.goto(B + '/');
+  await p.click('#q');
+  const cdp = await p.context().newCDPSession(p);
+  await cdp.send('Input.imeSetComposition', { text: 'はちみつ', selectionStart: 4, selectionEnd: 4 });
+  await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 229, nativeVirtualKeyCode: 229 });
+  await cdp.send('Input.insertText', { text: 'はちみつ' });
+  await p.waitForTimeout(300);
+  assert.doesNotMatch(p.url(), /q=/, 'IME の変換を確かめる Enter では送らない');
+  assert.equal(await p.inputValue('#q'), 'はちみつ');
+  await Promise.all([p.waitForNavigation(), p.keyboard.press('Enter')]);
+  assert.equal(new URL(p.url()).searchParams.get('q'), 'はちみつ');
+  assert.deepEqual(await listCodes(p), ['k001', 'k002', 'k003']);
+  // ↓ で表の 1 行目へ・Enter = その行を開く (絞る欄の外)
+  await p.focus('#q');
+  await p.keyboard.press('ArrowDown');
+  assert.equal(await p.evaluate(() => document.activeElement.textContent.trim()), 'k001');
+  await Promise.all([p.waitForNavigation(), p.keyboard.press('Enter')]);
+  assert.match(p.url(), /sku\/k001$/);
+  // パンくずの「商品・セット」= さっきの絞り込みの一覧へ
+  assert.equal(new URL(await p.locator('.crumb a').first().evaluate((a) => a.href)).searchParams.get('q'), 'はちみつ');
+  await Promise.all([p.waitForNavigation(), p.click('.crumb a')]);
+  assert.deepEqual(await listCodes(p), ['k001', 'k002', 'k003']);
+});
+
+await ta('[15] かなの同一視 (10/5): ひらがな・カタカナ・半角カナ・全角英数・大文字小文字が同じ商品に当たる (一覧・全体から探す)・画面とサーバーの決まりが同じ', async (p) => {
+  for (const q of ['はちみつ', 'ハチミツ', 'ﾊﾁﾐﾂ', 'ﾊﾁみつ']) {
+    await p.goto(B + '/?q=' + encodeURIComponent(q));
+    assert.deepEqual(await listCodes(p), ['k001', 'k002', 'k003'], q);
+  }
+  for (const q of ['ＡＢＣ', 'abc', 'ABC', 'Ａｂｃ']) {
+    await p.goto(B + '/?q=' + encodeURIComponent(q));
+    assert.deepEqual(await listCodes(p), ['k004', 'k005'], q);
+  }
+  // 全体から探す (Ctrl+K) の「〜で商品・セットを絞る」も同じ一覧
+  await p.goto(B + '/sku/s001');
+  await p.keyboard.press('Control+k');
+  await p.keyboard.type('ﾊﾁﾐﾂ');
+  await Promise.all([p.waitForNavigation(), p.keyboard.press('Enter')]);
+  assert.deepEqual(await listCodes(p), ['k001', 'k002', 'k003']);
+  // 操作の候補もかなを同じに見る (「ツカイカタ」で「つかいかた」)
+  await p.keyboard.press('Control+k');
+  await p.keyboard.type('ツカイカタ');
+  assert.match(await p.textContent('#pal-res'), /つかいかた/);
+  await p.keyboard.press('Escape');
+  // 画面の JS (ME.fold) とサーバー (search-fold.mjs) が同じ答え
+  const { foldSearch } = await import('../apps/master-edit/search-fold.mjs');
+  const samples = ['はちみつ', 'ﾊﾁﾐﾂ', 'ｶﾞｷﾞｸﾞ', 'ＡＢＣ１２３', 'ゔゝゞぁゖ', 'ラーメン', 'ｧｨｩ', 'Ｍｉｘ ミックス みっくす'];
+  assert.deepEqual(await p.evaluate((xs) => xs.map((x) => window.MasterEdit.fold(x)), samples), samples.map(foldSearch));
+});
+
+await ta('[16] 原価を変える理由 (10/5): 既定 = メーカーからの値上げ通知で保存できる・その他で空なら保存できない・その他に書いた文が記録に残る', async (p) => {
+  const costReason = async (code) => (await pg.query('select c.reason from core.sku_costs c join core.skus s on s.sku_id = c.sku_id where s.code = $1 and c.valid_to is null', [code])).rows[0].reason;
+  await p.goto(B + '/sku/k006');
+  await p.click('#btn-cost-open');
+  assert.equal(await p.isChecked('input[name="cost-reason-pick"][value="メーカーからの値上げ通知"]'), true, '最初から選ばれている');
+  assert.equal(await p.isHidden('#cost-reason'), true, 'その他の欄は隠れている');
+  await p.fill('#cost-jpy', '75');
+  assert.equal(await dirty(p), 1, '理由の選択は未保存に数えない (原価だけ)');
+  await p.click('#save');
+  await p.waitForSelector('#saved-note');
+  assert.equal(await costReason('k006'), 'メーカーからの値上げ通知');
+  assert.match(await p.textContent('#sku-page'), /メーカーからの値上げ通知/, '原価の履歴に出る');
+  // その他 = 書かないと保存できない
+  await p.goto(B + '/sku/k005');
+  await p.click('#btn-cost-open');
+  await p.fill('#cost-jpy', '85');
+  await p.check('input[name="cost-reason-pick"][data-other]');
+  assert.equal(await p.isVisible('#cost-reason'), true, 'その他 = 書く欄が出る');
+  assert.equal(await active(p), 'cost-reason', '書く欄へ');
+  assert.equal(await p.isDisabled('#save'), true, 'その他で空 = 保存できない');
+  await p.keyboard.press('Control+s');
+  await p.waitForTimeout(200);
+  assert.equal(await costReason('k005'), 'initial load load_ui', '保存していない (今の原価は取り込みの行のまま)');
+  await p.fill('#cost-reason', '送料込みの仕入値に変わった');
+  assert.equal(await p.isDisabled('#save'), false);
+  await p.click('#save');
+  await p.waitForSelector('#saved-note');
+  assert.equal(await costReason('k005'), '送料込みの仕入値に変わった');
+  assert.match(await p.textContent('#sku-page'), /送料込みの仕入値に変わった/, '原価の履歴に出る');
+  // 選び直すと書く欄は隠れる
+  await p.click('#btn-cost-open');
+  await p.check('input[name="cost-reason-pick"][data-other]');
+  await p.check('input[name="cost-reason-pick"][value="メーカーからの値下げ通知"]');
+  assert.equal(await p.isHidden('#cost-reason'), true);
+});
+
+const SHOTDIR = process.env.MASTER_EDIT_UI_SHOTS || '';
+for (const [label, vp] of [['1440', { width: 1440, height: 900 }], ['1280', { width: 1280, height: 720 }], ['1024', { width: 1024, height: 768 }]]) {
+  await ta(`[17] ${label} 幅: 一覧をスクロールしても見出しの行 (コード・名前・…) が上の帯のすぐ下に見えている・横に送っても列がずれない (10/5)`, async (p) => {
+    await p.goto(B + '/');
+    // 画面の出だしの動き (.page の rise) が終わってから測る (動きの途中は数 px 動く)
+    await p.waitForFunction(() => document.querySelector('.page').getAnimations().every((a) => a.playState !== 'running'));
+    if (SHOTDIR) await p.screenshot({ path: `${SHOTDIR}/一覧_${label}_上.png` });
+    const pos = () => p.evaluate(() => {
+      const th = document.querySelector('#list-tbl thead th'); const r = th.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.left + 20, r.top + r.height / 2);
+      const td = document.querySelector('#list-tbl tbody tr td');
+      return { top: r.top, left: r.left, tdLeft: td.getBoundingClientRect().left, hdr: document.querySelector('.hdr').getBoundingClientRect().bottom, seen: !!(hit && hit.closest('thead')), text: th.textContent.trim() };
+    });
+    const before = await pos();
+    assert.ok(before.top > before.hdr + 100, '始めは表の上 (動かしていない)');
+    await p.evaluate(() => window.scrollTo(0, document.querySelector('#list-tbl').getBoundingClientRect().top + window.scrollY + 500));
+    await p.waitForTimeout(150);
+    const after = await pos();
+    assert.ok(Math.abs(after.top - after.hdr) <= 1.5, `見出しの行が帯の下 (${after.top} / 帯 ${after.hdr})`);
+    assert.equal(after.seen, true, '見出しの行が行の上に見えている (重なりで隠れない)');
+    assert.equal(after.text, 'コード');
+    assert.ok(Math.abs(after.left - after.tdLeft) <= 1, '見出しと行の左の位置が同じ');
+    // 横に送れる幅なら、送っても見出しと行の列がずれない
+    const wrapScroll = await p.evaluate(() => { const w = document.querySelector('#list-tbl').closest('.tblwrap'); w.scrollLeft = 120; return w.scrollLeft; });
+    if (wrapScroll > 0) {
+      await p.waitForTimeout(50);
+      const s = await pos();
+      assert.ok(Math.abs(s.left - s.tdLeft) <= 1, '横に送っても列がずれない');
+      assert.equal(s.seen, true);
+      if (SHOTDIR) await p.screenshot({ path: `${SHOTDIR}/一覧_${label}_スクロールして横にも送った.png` });
+      await p.evaluate(() => { document.querySelector('.tblwrap').scrollLeft = 0; });
+    }
+    if (SHOTDIR) await p.screenshot({ path: `${SHOTDIR}/一覧_${label}_スクロールした.png` });
+    // 表の終わりより下では見出しも表の中に止まる (表の外へ出ない)
+    await p.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await p.waitForTimeout(150);
+    const end = await p.evaluate(() => { const t = document.querySelector('#list-tbl'); const th = t.querySelector('thead th').getBoundingClientRect(); return { thBottom: th.bottom, tblBottom: t.getBoundingClientRect().bottom }; });
+    assert.ok(end.thBottom <= end.tblBottom + 1, '見出しは表の外へ出ない');
+    const [sw, cw] = await p.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+    assert.ok(sw <= cw + 1, `ページが横にはみ出さない ${sw} > ${cw}`);
+  }, vp);
+}
 
 // 拡大 125% / 150% = 画面の CSS の幅が 1/1.25・1/1.5 になる。MASTER_EDIT_UI_SHOTS=フォルダ を付けると、そのフォルダに写しを残す (目で見る用)
 const SHOTS = process.env.MASTER_EDIT_UI_SHOTS || '';

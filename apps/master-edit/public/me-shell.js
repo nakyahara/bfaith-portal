@@ -13,7 +13,18 @@
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
   function icon(id) { return '<svg class="ic" aria-hidden="true"><use href="#' + id + '"/></svg>'; }
 
+  /**
+   * 検索の同一視 (サーバーの apps/master-edit/search-fold.mjs の foldSearch と同じ決まり):
+   * NFKC (半角カナ → 全角・全角英数 → 半角) → 小文字 → ひらがな → カタカナ。長音・小さい文字・濁点の有無は変えない
+   */
+  function fold(s) {
+    s = String(s == null ? '' : s);
+    if (s.normalize) s = s.normalize('NFKC');
+    return s.toLowerCase().replace(/[ぁ-ゖゝゞ]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) + 0x60); });
+  }
+
   var ME = window.MasterEdit = window.MasterEdit || {};
+  ME.fold = fold;
   /** 画面が上書きする: 未保存の変更 { n, items: [文字], impacts: [文字] } */
   ME.dirty = ME.dirty || function () { return { n: 0, items: [], impacts: [] }; };
   ME.onSave = ME.onSave || null;      // Ctrl+S (保存のある画面だけ)
@@ -82,6 +93,20 @@
     go(url); return true;
   }
   ME.requestNavigate = requestNavigate;
+  /**
+   * 画面を読み直す (保存が通った後。未保存は 0 にしてから呼ぶ)。離れるときの確認は出さない。
+   * 戻るの見張りで足した履歴 (armBackGuard) があれば先に 1 つ戻してから読み直す = 読み直した後の「戻る」1 回で前の画面へ (同じ画面が 2 つ並ばない)
+   */
+  ME.reloadPage = function () {
+    leaving = true;
+    if (!backArmed) { location.reload(); return; }
+    backArmed = false;
+    var done = false;
+    var fin = function () { if (done) return; done = true; location.reload(); };
+    window.addEventListener('popstate', fin);
+    setTimeout(fin, 500);   // popstate が来ない (履歴が違う) ときもそのまま読み直す
+    history.back();
+  };
   var stay = $('#leave-stay'), drop = $('#leave-drop'), rev = $('#leave-review');
   if (stay) stay.addEventListener('click', function () { closeLeave(true); });
   if (drop) drop.addEventListener('click', function () { closeLeave(false); go(pendingGo); });
@@ -154,7 +179,7 @@
       palItems.push({ g: 'Amazon SKU', ico: 'i-cart', t: '「' + q + '」で Amazon SKU の対応を探す', go: BASE + '/amazon/?q=' + encodeURIComponent(q) });
       if (/^[\x21-\x7e]{1,100}$/.test(q)) palItems.push({ g: 'Amazon SKU', ico: 'i-cart', code: q.toLowerCase(), t: 'この seller SKU を開く', go: BASE + '/amazon/sku?sku=' + encodeURIComponent(q) });
     }
-    OPS.forEach(function (o) { if (!q || o.t.toLowerCase().indexOf(q.toLowerCase()) >= 0) palItems.push({ g: '操作', ico: o.ico, t: o.t, go: o.go }); });
+    OPS.forEach(function (o) { if (!q || fold(o.t).indexOf(fold(q)) >= 0) palItems.push({ g: '操作', ico: o.ico, t: o.t, go: o.go }); });
     palSel = Math.max(0, Math.min(palSel, palItems.length - 1));
     var h = '', g = '';
     palItems.forEach(function (p, i) {
@@ -219,6 +244,13 @@
       return;
     }
     if (openBox()) return;
+    // 一覧の絞る欄にいるときの Enter = 絞る (「絞る」を押すのと同じ)。表の行にいるときの Enter = その行を開く (リンクそのもの)。
+    // IME の変換を確かめる Enter (isComposing・keyCode 229) では送らない = 字が確かまるだけ
+    if (e.key === 'Enter' && t.id === 'q' && t.form && !e.isComposing && e.keyCode !== 229 && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+      e.preventDefault();
+      if (t.form.requestSubmit) t.form.requestSubmit(); else t.form.submit();
+      return;
+    }
     // / = この画面の絞る欄 (一覧だけ。無い画面では何もしない)
     if (e.key === '/' && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
       var local = $('#q'); if (local) { e.preventDefault(); local.focus(); local.select(); }
@@ -257,6 +289,63 @@
     var j = e.target.closest && e.target.closest('[data-jump]');
     if (j) { var to = document.getElementById(j.getAttribute('data-jump')); if (to) { to.scrollIntoView({ behavior: 'smooth', block: 'center' }); to.focus({ preventScroll: true }); } }
   });
+
+  /* ---------- 一覧に戻る: 最後に見た一覧 (絞り込み・ページ) を覚え、1 つの商品の画面のパンくず「商品・セット」をそこへ向ける ---------- */
+  var LIST_KEY = 'master-edit:list-url';
+  if ($('#list-tbl')) { try { sessionStorage.setItem(LIST_KEY, location.pathname + location.search); } catch (err) { /* 覚えられない = いつもの一覧へ */ } }
+  var back = $('a[data-list-back]');
+  if (back) {
+    try {
+      var last = sessionStorage.getItem(LIST_KEY), basePath = back.pathname;
+      // 同じ一覧 (同じ path) の絞り込みだけ使う (よその URL へは向けない)
+      if (last && last.split('?')[0] === basePath && last.indexOf('?') > 0) back.setAttribute('href', last);
+    } catch (err) { /* そのまま */ }
+  }
+
+  /* ---------- 一覧の絞り込みを送った = 読み込み中と分かるように (一覧の読み込みに時間がかかっても押せたと分かる) ---------- */
+  document.addEventListener('submit', function (e) {
+    var f = e.target;
+    if (e.defaultPrevented || !f || f.id !== 'list-search') return;
+    f.classList.add('busy'); f.setAttribute('aria-busy', 'true');
+    var b = $('.go', f); if (b) b.textContent = '絞っています…';   // disabled にはしない (送っている途中のボタンを閉じない)
+  });
+  // 戻るで戻ってきた (bfcache) ときは元に戻す
+  window.addEventListener('pageshow', function () {
+    var f = $('#list-search'); if (!f) return;
+    f.classList.remove('busy'); f.removeAttribute('aria-busy');
+    var b = $('.go', f); if (b) b.textContent = '絞る';
+  });
+
+  /*
+   * ---------- 一覧の見出しの行 (コード・名前・…) をスクロールしても上の帯の下に残す ----------
+   * position: sticky は使えない: 表の囲い (.tblwrap) が横に送る囲い (overflow-x: auto = 縦も overflow の箱になる) なので、
+   * sticky はその囲いの中でしか効かない (囲いは縦に送らない = 何も起きない)。囲いを外すと 1024 幅・拡大で表がページの横にはみ出す。
+   * → 見出しのセルを、表の上端が帯の下に隠れた分だけ下へずらす (transform。横に送る囲いの中のままなので横の位置もずれない)
+   */
+  var listTbl = $('#list-tbl');
+  if (listTbl && listTbl.tHead) {
+    var hdrBar = $('.hdr');
+    var headTick = false;
+    var placeHead = function () {
+      headTick = false;
+      var top = hdrBar ? hdrBar.getBoundingClientRect().bottom : 0;
+      var r = listTbl.getBoundingClientRect();
+      var cell = listTbl.tHead.rows[0] && listTbl.tHead.rows[0].cells[0];
+      if (!cell) return;
+      var cur = parseFloat(listTbl.style.getPropertyValue('--head-y')) || 0;
+      var cr = cell.getBoundingClientRect();
+      var natural = cr.top - cur;          // ずらしていないときの見出しの上端 (表の上端と少し違うことがある = セルの実際の位置で測る)
+      var y = Math.max(0, Math.min(top - natural, r.bottom - cr.height - natural));
+      listTbl.style.setProperty('--head-y', y + 'px');
+      listTbl.classList.toggle('head-stuck', y > 0);
+    };
+    var askHead = function () { if (!headTick) { headTick = true; requestAnimationFrame(placeHead); } };
+    window.addEventListener('scroll', askHead, { passive: true });
+    window.addEventListener('resize', askHead);
+    // 画面の出だしの動き (.page の rise = 4px 上がる) が終わった後もそろえ直す (動きの途中に測ると数 px ずれたまま残る)
+    document.addEventListener('animationend', askHead, true);
+    placeHead();
+  }
 
   /* ---------- スクロールしても何の商品か分かる小見出し ---------- */
   var ph = $('#sku-ph'), sticky = $('#sku-sticky');

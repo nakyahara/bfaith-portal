@@ -8,6 +8,7 @@
  */
 import { MASTER_OWNERSHIP } from '../../config/master-ownership.mjs';
 import { normSku } from '../../lib/sku-norm.js';
+import { foldSearch, foldSql, likeOf } from './search-fold.mjs';
 import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
@@ -56,22 +57,38 @@ export function normalizeFilters(q = {}) {
   };
 }
 
-/** 一覧 (画面 A)。{ rows, total, offset, limit, filters, latestRun, diffAvailable } */
+/**
+ * その日の原価 (SKU ごとに 1 行) の CTE の中身。costAsOfJoin (lib/master-write.mjs) と同じ行を選ぶ
+ * (valid_from が新しい → created_at が新しい → sku_cost_id が大きい)。原価の表を 1 回だけ走査する (#1589 Codex R1 M1)。
+ * dayP = その日の $番号・idsP = 絞る sku_id の配列の $番号 (null = 全部)
+ */
+const costTodaySql = (dayP, idsP = null) => `select distinct on (y.sku_id) y.sku_id, y.cost_jpy, y.cost_source, y.cost_status
+    from core.sku_costs y
+   where y.valid_from <= $${dayP}::date and (y.valid_to is null or y.valid_to >= $${dayP}::date)${idsP ? ` and y.sku_id = any($${idsP}::bigint[])` : ''}
+   order by y.sku_id, y.valid_from desc, y.created_at desc, y.sku_cost_id desc`;
+
+/**
+ * 一覧 (画面 A)。{ rows, total, offset, limit, filters, latestRun, diffAvailable }
+ * 🚨 速さ (10/5 中原さん「一覧に戻るのが遅い」): 前は全部の SKU (7,377) に SKU ごとの lateral (原価)・代表の仕入先の副問い合わせを付けて読み、
+ *    JS で 100 件に切っていた = 原価の表を SKU の数だけ走査する (PGlite・原価 73,770 行で 65 秒)。
+ *    今は ① 絞り込みと並びだけの軽い読み (原価が要るのは「原価が未入力」のときだけ・1 回の集合) → ② このページの 100 件だけ中身を読む (原価・仕入先も 1 回の集合)。
+ *    値・並び・件数は前と同じ (試験 test-master-edit で前の形と比べる)
+ */
 export async function listSkus(db, filters, { now = new Date() } = {}) {
   const f = normalizeFilters(filters);
   const today = jstDate(now);
-  const params = [COMPANY_ID, today];
+  const params = [COMPANY_ID];
   const where = ['s.company_id = $1'];
   if (f.q) {
-    // LIKE の % と _ と \ は文字として探す (既定の escape = \)
-    const likeOf = (s) => `%${s.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    // コード = normSku (全角→半角・小文字)・名前 = かなの同一視 (search-fold.mjs: NFKC・小文字・ひらがな→カタカナ)・JAN = ぴったり
     params.push(likeOf(normSku(f.q)));
     const codeLike = params.length;
-    params.push(likeOf(f.q));
+    const fold = foldSql(params);
+    params.push(likeOf(foldSearch(f.q)));
     const nameLike = params.length;
     params.push(f.q);
     const raw = params.length;
-    where.push(`(s.code_norm like $${codeLike} or s.name ilike $${nameLike}
+    where.push(`(s.code_norm like $${codeLike} or ${fold('s.name')} like $${nameLike}
       or exists (select 1 from core.external_ids e where e.entity_type = 'product' and e.entity_id = s.product_id and e.system = 'jan' and e.id_kind = 'jan'
                  and e.valid_to is null and e.external_norm = core.norm_code($${raw})))`);
   }
@@ -81,7 +98,12 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   if (f.missing === 'tax') where.push('s.tax_rate is null');
   if (f.missing === 'shipping') where.push('s.shipping_code is null');
   if (f.missing === 'reorder') where.push('s.reorder_months is null');
-  if (f.missing === 'cost') where.push(`coalesce(c.cost_status not in ('COMPLETE', 'OVERRIDDEN'), true)`);
+  let costCte = '';
+  if (f.missing === 'cost') {
+    params.push(today);
+    costCte = `with c as (${costTodaySql(params.length)}) `;
+    where.push(`coalesce(c.cost_status not in ('COMPLETE', 'OVERRIDDEN'), true)`);
+  }
   // 登録の状態とカードは別々の絞り込み (両方 = 両方に合う商品。PR #1566 Codex R2 Low)
   const hasReg = await regclass(db, 'ops.master_registrations');
   if (f.reg) {
@@ -101,33 +123,58 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
     if (!run) where.push('false');
     else { params.push(run.compare_run_id); where.push(`s.code_norm in (select code_norm from ops.master_decision_candidates where last_seen_run = $${params.length})`); }
   }
-  const rows = (await db.query(`select s.sku_id::text as sku_id, s.code, s.code_norm, s.sku_kind, s.name, s.handling, s.tax_rate::text as tax_rate, s.tax_class,
+  // ① 絞り込みと並び (軽い列だけ)
+  const keys = (await db.query(`${costCte}select s.sku_id::text as sku_id, s.sku_kind, s.set_sales_class_override, p.sales_class
+      from core.skus s
+      left join core.products p on p.product_id = s.product_id
+      ${costCte ? 'left join c on c.sku_id = s.sku_id' : ''}
+     where ${where.join(' and ')}
+     order by s.code_norm`, params)).rows;
+  /** セットの構成品の売上分類 (導く材料)。ids = セットの sku_id → Map<sku_id, [分類]> */
+  const compClassesOf = async (ids) => {
+    const m = new Map();
+    if (!ids.length) return m;
+    for (const c of (await db.query(`select c.parent_sku_id::text as parent, p.sales_class from core.sku_components c join core.skus k on k.sku_id = c.child_sku_id
+        left join core.products p on p.product_id = k.product_id where c.parent_sku_id = any($1::bigint[])`, [ids])).rows) {
+      if (!m.has(c.parent)) m.set(c.parent, []);
+      m.get(c.parent).push(num(c.sales_class));
+    }
+    return m;
+  };
+  const salesOf = (r, comp) => (r.sku_kind === 'set' ? deriveSetSalesClassCdb(r.set_sales_class_override, comp.get(r.sku_id) || []) : num(r.sales_class));
+  let matched = keys;
+  let compClasses = null;
+  // 売上分類の未入力 = セットは構成品から導く (保存していない) ので、絞った全部のセットを導いてから JS で絞る
+  if (f.missing === 'sales') {
+    compClasses = await compClassesOf(keys.filter((r) => r.sku_kind === 'set').map((r) => r.sku_id));
+    matched = keys.filter((r) => salesOf(r, compClasses) == null && r.sku_kind !== 'exception');
+  }
+  const pageIds = matched.slice(f.offset, f.offset + LIST_LIMIT).map((r) => r.sku_id);
+  // ② このページの分だけ中身を読む
+  const rowsById = new Map();
+  if (pageIds.length) {
+    const rows = (await db.query(`with c as (${costTodaySql(2, 1)}),
+        ps as (select distinct on (x.sku_id) x.sku_id, sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id
+                where x.sku_id = any($1::bigint[]) and x.is_primary order by x.sku_id, sp.code)
+      select s.sku_id::text as sku_id, s.code, s.code_norm, s.sku_kind, s.name, s.handling, s.tax_rate::text as tax_rate, s.tax_class,
         s.standard_price_jpy::text as standard_price, s.shipping_code, s.reorder_months::text as reorder_months, s.set_sales_class_override,
-        p.sales_class, c.cost_jpy::text as cost_jpy, c.cost_source, c.cost_status,
-        (select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id where x.sku_id = s.sku_id and x.is_primary order by sp.code limit 1) as primary_supplier,
+        p.sales_class, c.cost_jpy::text as cost_jpy, c.cost_source, c.cost_status, ps.code as primary_supplier,
         ${hasReg ? '(select mr.state from ops.master_registrations mr where mr.sku_id = s.sku_id)' : 'null::text'} as reg_state
       from core.skus s
       left join core.products p on p.product_id = s.product_id
-      ${costAsOfJoin('s.sku_id', '$2', 'c')}
-     where ${where.join(' and ')}
-     order by s.code_norm`, params)).rows;
-  // セットの売上分類 (構成品から導く・上書き)
-  const setIds = rows.filter((r) => r.sku_kind === 'set').map((r) => r.sku_id);
-  const compClasses = new Map();
-  if (setIds.length) {
-    for (const c of (await db.query(`select c.parent_sku_id::text as parent, p.sales_class from core.sku_components c join core.skus k on k.sku_id = c.child_sku_id
-        left join core.products p on p.product_id = k.product_id where c.parent_sku_id = any($1::bigint[])`, [setIds])).rows) {
-      if (!compClasses.has(c.parent)) compClasses.set(c.parent, []);
-      compClasses.get(c.parent).push(num(c.sales_class));
-    }
+      left join c on c.sku_id = s.sku_id
+      left join ps on ps.sku_id = s.sku_id
+     where s.sku_id = any($1::bigint[])`, [pageIds, today])).rows;
+    for (const r of rows) rowsById.set(r.sku_id, r);
   }
-  let list = rows.map((r) => {
+  if (!compClasses) compClasses = await compClassesOf(pageIds.filter((id) => rowsById.get(id)?.sku_kind === 'set'));
+  const pageRows = pageIds.map((id) => rowsById.get(id)).filter(Boolean).map((r) => {
     const isSet = r.sku_kind === 'set';
     return {
       sku_id: r.sku_id, code: r.code, code_norm: r.code_norm, kind: r.sku_kind, name: r.name, handling: r.handling,
       tax_rate: num(r.tax_rate), tax_class: r.tax_class, tax_derived: isSet,
       standard_price: num(r.standard_price), cost: KNOWN_COST.has(r.cost_status) ? Number(r.cost_jpy) : null, cost_derived: isSet && r.cost_source === 'set_calc',
-      sales_class: isSet ? deriveSetSalesClassCdb(r.set_sales_class_override, compClasses.get(r.sku_id) || []) : num(r.sales_class),
+      sales_class: salesOf(r, compClasses),
       sales_derived: isSet && r.set_sales_class_override == null,
       primary_supplier: r.primary_supplier, shipping_code: r.shipping_code, reorder_months: num(r.reorder_months),
       state: r.handling === 'discontinued' ? 'discontinued' : 'available',
@@ -135,9 +182,7 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
       comp_count: isSet ? (compClasses.get(r.sku_id) || []).length : null,
     };
   });
-  if (f.missing === 'sales') list = list.filter((r) => r.sales_class == null && r.kind !== 'exception');
   // ⚠ の印 (NE との差・CSV 待ち・構成の依頼) はこのページの分だけ
-  const pageRows = list.slice(f.offset, f.offset + LIST_LIMIT);
   const norms = pageRows.map((r) => r.code_norm);
   const diffSet = new Set(); const csvSet = new Set(); const reqSet = new Set();
   if (norms.length && run) for (const r of (await db.query('select distinct code_norm from ops.master_decision_candidates where last_seen_run = $1 and code_norm = any($2::text[])', [run.compare_run_id, norms])).rows) diffSet.add(r.code_norm);
@@ -149,7 +194,7 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   const CARD_FLAG = { pending: 'カード作成待ち', failed: 'カード作成待ち (失敗)', conflict: 'カードの衝突' };
   for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : []),
     ...(cardOf.has(r.sku_id) ? [CARD_FLAG[cardOf.get(r.sku_id)]] : [])];
-  return { rows: pageRows, total: list.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable };
+  return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable };
 }
 
 /**
@@ -168,10 +213,7 @@ export async function listCounts(db, { now = new Date() } = {}) {
   const params = [COMPANY_ID, today];
   if (run) params.push(run.compare_run_id);
   const r = (await db.query(`with c as (
-        select distinct on (y.sku_id) y.sku_id, y.cost_status
-          from core.sku_costs y
-         where y.valid_from <= $2::date and (y.valid_to is null or y.valid_to >= $2::date)
-         order by y.sku_id, y.valid_from desc, y.created_at desc, y.sku_cost_id desc)
+        ${costTodaySql(2)})
       ${hasReg ? ", rd as (select distinct sku_id from ops.master_registrations where state = 'draft')" : ''}
       ${hasOutbox ? ", ow as (select distinct sku_id from ops.product_hub_outbox where status in ('pending', 'failed')), oc as (select distinct sku_id from ops.product_hub_outbox where status = 'conflict')" : ''}
       ${run ? ', dc as (select distinct code_norm from ops.master_decision_candidates where last_seen_run = $3)' : ''}
