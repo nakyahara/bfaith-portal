@@ -10,6 +10,7 @@ import { MASTER_OWNERSHIP } from '../../config/master-ownership.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import { foldSearch, foldSql, likeOf } from './search-fold.mjs';
 import { backorderOf, backorderKeys, stockOf, buildableOf } from './extras.mjs';
+import { fbaAvailableOf } from './fba-stock.mjs';
 import { TOKEN_RE } from './search-token.mjs';
 import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
@@ -309,6 +310,8 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
   if (!compClasses) compClasses = await compClassesOf(pageIds.filter((id) => rowsById.get(id)?.sku_kind === 'set'));
   // セットの構成品 (作れる数の材料。このページのセットだけ・在庫が読めたときだけ)
   if (!compsOf) compsOf = await compsOfSets(pageIds.filter((id) => rowsById.get(id)?.sku_kind === 'set'));
+  // FBA (日本) の販売可能 (このページの SKU だけ・Company DB の在庫の日次の最新の complete の日。読めなければ null = 「—」)
+  const fbaMap = extras.fba && extras.fba.ok ? await fbaAvailableOf(db, extras.fba, pageIds) : null;
   const pageRows = pageIds.map((id) => rowsById.get(id)).filter(Boolean).map((r) => {
     const isSet = r.sku_kind === 'set';
     return {
@@ -326,6 +329,10 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
       backorder: extras.backorders ? backorderOf(extras.backorders, r.code) : null,
       stock: isSet ? null : (extras.stock ? stockOf(extras.stock, r.code_norm) : null),
       buildable: isSet ? buildableOf(extras.stock, compsOf.get(r.sku_id)) : null,
+      // FBA (JP) の販売可能: 数 = 1 × 1 の出品の合計 (行が無い = 0 = mart.v_sku_stock と同じ) / null = 読めない。
+      //   fba_row = その日のレポートに 1 × 1 の出品の行があるか (数とは別。画面は 0 に「出品なし」と添える)
+      fba: fbaMap ? (fbaMap.get(r.sku_id) ?? 0) : null,
+      fba_row: fbaMap ? fbaMap.has(r.sku_id) : null,
     };
   });
   // ⚠ の印 (NE との差・CSV 待ち・構成の依頼) はこのページの分だけ

@@ -134,7 +134,7 @@
             <div class="adv-foot">
               <button class="btn pri sm" type="submit"><svg class="ic s" aria-hidden="true"><use href="#i-search"/></svg>この条件で探す</button>
               <a class="btn ghost sm" href="./">クリア (条件を全部外す)</a>
-              <span class="hint">条件は URL に残ります (戻る・共有で同じ結果。長い条件は 24 時間の印) · 在庫 = ロジザード · 注文残 = 発注アプリ</span>
+              <span class="hint">条件は URL に残ります (戻る・共有で同じ結果。長い条件は 24 時間の印) · 在庫 = ロジザード · FBA (JP) = Amazon の朝のレポート (販売可能) · 注文残 = 発注アプリ</span>
             </div>
           </form>
         </details>
@@ -159,10 +159,17 @@
             const st = extras && extras.stock, bo = extras && extras.backorders;
             const stSub = !st || !st.ok ? '読めない' : (st.stale ? '古い ' : '') + ui.fmtJst(st.asOf, { nowMs }).replace(/^.*\) /, '');
             const stTitle = !st || !st.ok ? (st && st.error) || '読めない' : 'ロジザード ' + ui.fmtJst(st.asOf, { nowMs }) + ' 時点' + (st.stale ? ' (2 時間より前 = 古い)' : '') + ' · 参考 · セットは構成品から作れる数';
+            // FBA (JP) = Company DB の在庫の日次 (朝の SP-API のレポートを取り終えた時刻 = 何時時点か・26 時間より前 = 古い)
+            const fb = extras && extras.fba;
+            const fbWhen = fb && fb.ok ? ui.fmtJst(fb.asOf, { nowMs }).replace(/ \(.\) /, ' ') : '';
+            const fbSub = !fb || !fb.ok ? '読めない' : (fb.stale ? '古い ' : '') + fbWhen;
+            const fbTitle = !fb || !fb.ok ? (fb && fb.error) || '読めない'
+              : 'FBA (日本) の販売可能 · ' + ui.fmtJst(fb.asOf, { nowMs }) + ' 時点 (朝のレポート)' + (fb.stale ? ' (26 時間より前 = 古い)' : '') + (fb.newer ? ' · ' + ui.fmtDay(fb.newer.date) + ' は' + fb.newer.words + 'ので前の日の値' : '')
+                + ' · 参考 · この SKU 1 個の出品だけの合計 (まとめ売り・セットの出品は入れない)';
           %>
-          <thead><tr><th scope="col" style="width:130px">コード</th><th scope="col" style="min-width:260px">名前</th><th scope="col" style="width:150px">状態</th><th scope="col" style="width:96px">登録日</th><th scope="col" class="n" style="width:84px">売価</th><th scope="col" class="n" style="width:112px">原価</th><th scope="col" class="n" style="width:74px">税</th><th scope="col" style="width:120px">売上分類</th><th scope="col" class="n ref<%= !st || !st.ok ? ' bad' : st.stale ? ' stale' : '' %>" style="width:86px" title="<%= stTitle %>">在庫<span class="thsub"><%= stSub %></span></th><% if (!poDenied) { %><th scope="col" class="n ref<%= !bo || !bo.ok ? ' bad' : '' %>" style="width:76px" title="<%= !bo || !bo.ok ? '発注アプリの台帳を読めない' : '発注アプリの注文残 (発注したがまだ入庫していない数)' %>">注文残<span class="thsub"><%= !bo || !bo.ok ? '読めない' : '発注' %></span></th><% } %><th scope="col" style="width:150px">対応が必要</th></tr></thead>
+          <thead><tr><th scope="col" style="width:130px">コード</th><th scope="col" style="min-width:260px">名前</th><th scope="col" style="width:150px">状態</th><th scope="col" style="width:96px">登録日</th><th scope="col" class="n" style="width:84px">売価</th><th scope="col" class="n" style="width:112px">原価</th><th scope="col" class="n" style="width:74px">税</th><th scope="col" style="width:120px">売上分類</th><th scope="col" class="n ref<%= !st || !st.ok ? ' bad' : st.stale ? ' stale' : '' %>" style="width:86px" title="<%= stTitle %>">在庫<span class="thsub"><%= stSub %></span></th><th scope="col" class="n ref<%= !fb || !fb.ok ? ' bad' : fb.stale ? ' stale' : '' %>" style="width:92px" title="<%= fbTitle %>" id="th-fba">FBA (JP)<span class="thsub"><%= fbSub %></span></th><% if (!poDenied) { %><th scope="col" class="n ref<%= !bo || !bo.ok ? ' bad' : '' %>" style="width:76px" title="<%= !bo || !bo.ok ? '発注アプリの台帳を読めない' : '発注アプリの注文残 (発注したがまだ入庫していない数)' %>">注文残<span class="thsub"><%= !bo || !bo.ok ? '読めない' : '発注' %></span></th><% } %><th scope="col" style="width:150px">対応が必要</th></tr></thead>
           <tbody>
-            <% if (!data.rows.length) { %><tr><td colspan="<%= poDenied ? 10 : 11 %>" class="muted" style="text-align:center;padding:30px"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
+            <% if (!data.rows.length) { %><tr><td colspan="<%= poDenied ? 11 : 12 %>" class="muted" style="text-align:center;padding:30px"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
             <% for (const r of data.rows) { const isSet = r.kind === 'set'; %>
             <tr>
               <td><a class="rowlink" href="sku/<%= encodeURIComponent(r.code) %>"><%= r.code %></a></td>
@@ -177,6 +184,7 @@
               <td class="n"><% if (r.tax_rate == null) { %><span class="b warn">未入力</span><% } else { %><%= fmt.tax(r.tax_rate) %>%<% if (r.tax_derived) { %><span class="fx">計算</span><% } %><% } %></td>
               <td><% if (r.sales_class == null) { %><% if (r.kind !== 'exception') { %><span class="b warn">未入力</span><% } %><% } else { %><%= SALES[r.sales_class] || r.sales_class %><% if (r.sales_derived) { %><span class="fx">計算</span><% } %><% } %></td>
               <td class="n ref"><% if (isSet) { %><% if (r.buildable != null) { %><span title="構成品の在庫から作れる数 (参考)"><%= r.buildable.toLocaleString('ja-JP') %></span><span class="fx">作れる</span><% } %><% } else if (r.stock != null) { %><%= r.stock ? r.stock.toLocaleString('ja-JP') : '0' %><% } else { %><span class="muted">—</span><% } %></td>
+              <td class="n ref"><% if (r.fba != null) { %><%= r.fba.toLocaleString('ja-JP') %><% if (!r.fba_row) { %><span class="fx" title="その日の FBA のレポートに、この SKU 1 個だけの出品の行が無い (販売可能 0 と数える)">出品なし</span><% } %><% } else { %><span class="muted">—</span><% } %></td>
               <% if (!poDenied) { %><td class="n ref"><% if (r.backorder) { %><%= r.backorder.toLocaleString('ja-JP') %><% } else if (r.backorder == null) { %><span class="muted">—</span><% } %></td><% } %>
               <td><div class="flags"><% for (const f of r.flags) { %><span class="b <%= FLAG_BADGE[f] || 'mute' %>"><%= f %></span><% } %></div></td>
             </tr>

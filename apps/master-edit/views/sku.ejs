@@ -372,6 +372,29 @@
               <% } else { %><span class="big" id="ref-stock"><%= stockN == null ? '—' : stockN.toLocaleString('ja-JP') %></span>
                 <span class="when<%= st.stale ? ' stale' : '' %>" id="ref-stock-when" style="display:block"><%= st.stale ? '古い · ' : '' %><%= ui.fmtJst(st.asOf, { nowMs }) %> 時点<%= isSet ? ' · 構成品の在庫 ÷ 数 の小さい方' : '' %></span><% } %>
             </span></div>
+            <% const fx = extras.fba; %>
+            <%# FBA (JP) = Company DB の在庫の日次 (朝の SP-API のレポート・最新の complete の日)。この SKU 1 個だけの出品の合計 (まとめ売り・セットの出品は下に別に・合計に入れない) %>
+            <div class="row"><span class="k">FBA (JP) 販売可能</span><span class="v">
+              <% if (!fx || !fx.ok) { %><span class="when bad" id="ref-fba-when">読めない<%= fx && fx.error ? ' (' + fx.error + ')' : '' %></span>
+              <% } else { %><span class="big" id="ref-fba"><%= fx.total.available.toLocaleString('ja-JP') %></span>
+                <span class="when<%= fx.day.stale ? ' stale' : '' %>" id="ref-fba-when" style="display:block"><%= fx.day.stale ? '古い · ' : '' %><%= ui.fmtJst(fx.day.asOf, { nowMs }) %> 時点 (Amazon の朝のレポート)<%= fx.day.newer ? ' · ' + ui.fmtDay(fx.day.newer.date) + ' は' + fx.day.newer.words + 'ので前の日の値' : '' %></span>
+                <% if (!fx.total.hasRow) { %><span class="hint" id="ref-fba-none" style="display:block">FBA の出品なし (この SKU 1 個だけの出品の行が、その日の FBA のレポートに無い = 販売可能 0 と数える)</span><% } %>
+              <% } %>
+            </span></div>
+            <% if (fx && fx.ok && fx.total.hasRow) { const T = fx.total; const allUnknown = T.unknown === fx.rows.length; const fc = (n) => allUnknown ? '不明' : n.toLocaleString('ja-JP') + (T.unknown ? ' +不明' : ''); %>
+            <table id="ref-fba-parts"><thead><tr><th scope="col">FBA の内訳</th><th scope="col" class="n">数</th></tr></thead><tbody>
+              <tr><td>販売可能</td><td class="n"><%= T.available.toLocaleString('ja-JP') %></td></tr>
+              <tr><td>FC 移管中</td><td class="n"><%= fc(T.transfer) %></td></tr>
+              <tr><td>FC 処理中</td><td class="n"><%= fc(T.processing) %></td></tr>
+              <tr><td>出荷待ち (注文の引き当て)</td><td class="n"><%= fc(T.customer) %></td></tr>
+              <tr><td>入荷待ち (納品の途中)</td><td class="n"><%= T.inbound.toLocaleString('ja-JP') %></td></tr>
+            </tbody></table>
+            <% if (T.unknown) { %><div class="hint" id="ref-fba-unknown">不明 = その出品 SKU が Amazon の RESTOCK レポートに無かった (0 ではなく分からない)</div><% } %>
+            <% if (fx.rows.length > 1) { %><div class="hint" id="ref-fba-skus">出品 SKU <%= fx.rows.length %> つの合計: <%= fx.rows.map((r) => r.code + ' ' + r.available.toLocaleString('ja-JP')).join(' · ') %></div><% } else { %><div class="hint" id="ref-fba-skus">出品 SKU <%= fx.rows[0].code %></div><% } %>
+            <% } %>
+            <% if (fx && fx.ok && fx.bundles.length) { %>
+            <div class="hint" id="ref-fba-bundles" style="margin-top:4px">まとめ売り・セットの出品 (上の数に入れていない): <%= fx.bundles.slice(0, 6).map((b) => b.code + (b.others ? ' (ほか ' + b.others + ' 品と' + (b.qty > 1 ? '・×' + b.qty : '') + ')' : ' ×' + b.qty) + ' = ' + (b.available == null ? '—' : b.available.toLocaleString('ja-JP'))).join(' · ') %><%= fx.bundles.length > 6 ? ' · ほか ' + (fx.bundles.length - 6) + ' 件' : '' %></div>
+            <% } %>
             <% if (!isSet) { const bo = extras.backorder; %>
             <div class="row"><span class="k">注文残 (発注アプリ)</span><span class="v">
               <% if (bo && bo.denied) { %><span class="when" id="ref-po-why">注文残 (発注アプリの権限がないので出せません)</span>

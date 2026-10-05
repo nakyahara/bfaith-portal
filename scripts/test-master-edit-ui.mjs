@@ -26,6 +26,7 @@
  *  21 在庫の範囲はセットなら作れる数で絞る (#1620 Codex R1 M1)
  *  22 注文残は発注アプリの利用権がある人だけ (列・絞り込み・内訳) (#1620 Codex R1 M3)
  *  23 詳細検索の長い条件 = 本物の HTTP で 500 件の境目・印 (?s=)・GET なら 431・Origin と JSON の守り・期限切れ (#1620 Codex R1 M2)
+ *  24 FBA (JP) の在庫 (参考・Company DB の在庫の日次): 一覧の列と見出しの時刻・1 × 1 の出品だけ・「—」と 0・単品の画面の内訳とまとめ売り / セットの出品・古い (26 時間) / 読めない (権限なし)・流し直しで戻る (10/5)
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -139,6 +140,24 @@ initPurchaseOrders();
   const lz = mirrorDb.prepare(`insert into mirror_logizard_stock (商品ID, 商品名, ブロック略称, ロケ, 品質区分名, 在庫数, 引当数, captured_at, synced_at) values (?, ?, ?, ?, ?, ?, 0, ?, ?)`);
   const cap = new Date(Date.now() - 20 * 60e3).toISOString();
   for (const [code, block, loke, q, n] of [['K001', 'P', 'A-01', '良品', 12], ['k001', 'P', 'A-02', '不良', 3], ['s001', 'P', 'B-01', '良品', 8], ['S001', 'R', 'Z-01', '良品', 2], ['s002', 'P', 'B-02', '良品', 5]]) lz.run(code, code, block, loke, q, n, cap, now);
+}
+// ── FBA (JP) の在庫の日次の見本 (Company DB・10/5): k001 × 1 の出品 2 つ・k001 × 3 (まとめ売り)・k001 + k002 (セットの出品)・k006 × 1 (在庫 0)。k002 だけの出品は無い ──
+const { ingestStockDay } = await import('../apps/company-db/ingest/stock-daily.mjs');
+const FBA_CAPTURED = new Date(Date.now() - 3 * 3600e3).toISOString();
+{
+  const sid = async (code) => Number((await pg.query('select sku_id from core.skus where code = $1', [code])).rows[0].sku_id);
+  const k1 = await sid('k001'), k2 = await sid('k002'), k6 = await sid('k006');
+  const listing = async (code, comps) => {
+    const id = (await pg.query(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'amazon', 'main@A1VC38T7YXB528', $1, 'active') returning listing_id`, [code])).rows[0].listing_id;
+    let i = 0;
+    for (const [skuId, qty] of comps) await pg.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, sort_order, resolution, resolved_by_type) values (1, $1, $2, $3, $4, 'exact', 'system')`, [id, skuId, qty, i++]);
+  };
+  await listing('pr-k001', [[k1, 1]]); await listing('pr-k001-b', [[k1, 1]]); await listing('pr-k001-3p', [[k1, 3]]); await listing('pr-k1k2', [[k1, 1], [k2, 1]]); await listing('pr-k006', [[k6, 1]]);
+  const r = (code, a, x, pr, c, w = 0) => ({ code, fba_available: a, fba_fc_transfer: x, fba_fc_processing: pr, fba_customer_order: c, fba_inbound_working: w, fba_inbound_shipped: 0, fba_inbound_received: 0 });
+  const today = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+  const got = await ingestStockDay(db, { source: 'fba_jp', snapshot_date: today, captured_at: FBA_CAPTURED,
+    rows: [r('pr-k001', 20, 1, 0, 2, 5), r('pr-k001-b', 4, 0, 1, 0), r('pr-k001-3p', 6, 0, 0, 0), r('pr-k1k2', 3, 0, 0, 0), r('pr-k006', 0, 0, 0, 0)] }, { todayJst: today });
+  assert.equal(got.day_status, 'complete');
 }
 const row = async (code) => (await pg.query('select s.name, s.reorder_months::float8 as months, s.handling from core.skus s where s.code = $1', [code])).rows[0];
 /** 画面の外で同じ商品を直す (その間の変更 = 画面の編集の印が古くなる) */
@@ -540,7 +559,8 @@ const cells = (p) => p.$eval('#list-tbl', (tbl) => {
   const h = [...tbl.querySelectorAll('thead th')].map((th) => th.textContent.trim());
   const iS = h.findIndex((x) => x.startsWith('在庫'));
   const iP = h.findIndex((x) => x.startsWith('注文残'));
-  return [...tbl.querySelectorAll('tbody tr')].map((tr) => { const t = [...tr.children].map((td) => td.textContent.replace(/\s+/g, ' ').trim()); return { code: t[0], stock: iS < 0 ? undefined : t[iS], po: iP < 0 ? undefined : t[iP] }; });
+  const iF = h.findIndex((x) => x.startsWith('FBA'));
+  return [...tbl.querySelectorAll('tbody tr')].map((tr) => { const t = [...tr.children].map((td) => td.textContent.replace(/\s+/g, ' ').trim()); return { code: t[0], stock: iS < 0 ? undefined : t[iS], po: iP < 0 ? undefined : t[iP], fba: iF < 0 ? undefined : t[iF] }; });
 });
 const advGo = async (p, fill) => {
   await p.goto(B + '/');
@@ -660,7 +680,7 @@ await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 
     await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns002' }));
     assert.doesNotMatch(await p.textContent('#list-tbl thead'), /注文残/, '列を出さない');
     assert.deepEqual((await cells(p)).map((x) => x.code), ['k001', 's002']);
-    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td').count(), 10, '行の欄も 1 つ少ない (11 → 10)');
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td').count(), 11, '行の欄も 1 つ少ない (12 → 11。FBA (JP) の列を足した)');
     assert.equal(await p.locator('input[name="po"]').count(), 0, '「注文残あり」を出さない');
     assert.match(await p.textContent('#po-denied'), /注文残 \(発注アプリの権限がないので出せません\)/);
     // URL に po=1 を付けても、注文残のある商品だけに絞らない (どの商品に注文残があるかを出さない)
@@ -679,6 +699,68 @@ await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 
     await p.goto(B + '/sku/k001');
     assert.equal(await p.textContent('#ref-po'), '7');
   } finally { SESSION_APPS = ['master-edit', 'purchase-orders']; }
+});
+
+await ta('[24] FBA (JP) の在庫 (10/5): 一覧の列 (参考・灰色)・見出しの下に何時時点か・1 × 1 の出品だけ・「—」と 0・単品の画面の内訳・まとめ売り / セットの出品は別・古い / 読めない', async (p) => {
+  const hhmm = (iso) => { const d = new Date(Date.parse(iso) + 9 * 3600e3); return `${d.getUTCMonth() + 1}/${d.getUTCDate()} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`; };
+  await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\nk002\nk006\ns001' }));
+  const c = Object.fromEntries((await cells(p)).map((x) => [x.code, x]));
+  assert.deepEqual([c.k001.fba, c.k002.fba, c.k006.fba, c.s001.fba], ['24', '0出品なし', '0', '0出品なし'], 'k001 = 1 × 1 の出品 2 つ (20 + 4)・まとめ売り / セットの出品は入れない / k002・s001 = 1 × 1 の出品の行なし = 0 + 「出品なし」(mart.v_sku_stock と同じ 0) / k006 = レポートに 0');
+  const th = p.locator('#th-fba');
+  assert.equal((await th.textContent()).trim(), 'FBA (JP)' + hhmm(FBA_CAPTURED), '見出しの下に取得の時刻 (月/日 時:分)');
+  assert.match(await th.getAttribute('title'), /FBA \(日本\) の販売可能 · .* 時点 \(朝のレポート\) · 参考 · この SKU 1 個の出品だけの合計/);
+  assert.equal(await th.evaluate((x) => x.className), 'n ref');
+  // 参考の列 = 灰色・小さめ (在庫の列と同じ見せ方)
+  const [fbaStyle, stockStyle] = await p.evaluate(() => {
+    const td = (i) => document.querySelector('#list-tbl tbody tr').children[i];
+    const h = [...document.querySelectorAll('#list-tbl thead th')].map((x) => x.textContent.trim());
+    const pick = (el) => { const s = getComputedStyle(el); return [s.color, s.fontSize]; };
+    return [pick(td(h.findIndex((x) => x.startsWith('FBA')))), pick(td(h.findIndex((x) => x.startsWith('在庫'))))];
+  });
+  assert.deepEqual(fbaStyle, stockStyle, 'FBA の列は在庫の列と同じ灰色・大きさ');
+  if (SHOT2) await p.screenshot({ path: `${SHOT2}/一覧_FBAの列.png`, fullPage: true });
+  // 単品の画面
+  await p.goto(B + '/sku/k001');
+  assert.equal(await p.textContent('#ref-fba'), '24');
+  assert.match(await p.textContent('#ref-fba-when'), /時点 \(Amazon の朝のレポート\)/);
+  assert.doesNotMatch(await p.textContent('#ref-fba-when'), /古い/);
+  const parts = await p.$$eval('#ref-fba-parts tbody tr', (trs) => trs.map((tr) => [...tr.children].map((td) => td.textContent.trim())));
+  assert.deepEqual(parts, [['販売可能', '24'], ['FC 移管中', '1'], ['FC 処理中', '1'], ['出荷待ち (注文の引き当て)', '2'], ['入荷待ち (納品の途中)', '5']]);
+  assert.match(await p.textContent('#ref-fba-skus'), /出品 SKU 2 つの合計: pr-k001 20 · pr-k001-b 4/);
+  assert.match(await p.textContent('#ref-fba-bundles'), /まとめ売り・セットの出品 \(上の数に入れていない\): pr-k001-3p ×3 = 6 · pr-k1k2 \(ほか 1 品と\) = 3/);
+  if (SHOT2) await p.screenshot({ path: `${SHOT2}/単品_FBAの内訳.png`, fullPage: true });
+  await p.goto(B + '/sku/k002');
+  assert.equal(await p.textContent('#ref-fba'), '0');
+  assert.match(await p.textContent('#ref-fba-none'), /FBA の出品なし \(この SKU 1 個だけの出品の行が、その日の FBA のレポートに無い = 販売可能 0 と数える\)/);
+  assert.equal(await p.locator('#ref-fba-parts').count(), 0);
+  assert.match(await p.textContent('#ref-fba-bundles'), /pr-k1k2 \(ほか 1 品と\) = 3/);
+  // 古い (取得が 26 時間より前)
+  const keepCap = (await pg.query("select captured_at from snapshots.stock_capture_days where source = 'fba_jp'")).rows[0].captured_at;
+  await pg.query("update snapshots.stock_capture_days set captured_at = now() - interval '27 hours' where source = 'fba_jp'");
+  try {
+    await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001' }));
+    assert.match(await p.textContent('#th-fba'), /^FBA \(JP\)古い \d+\/\d+ \d{2}:\d{2}$/);
+    assert.equal(await p.locator('#th-fba').evaluate((x) => x.className), 'n ref stale');
+    assert.equal((await cells(p))[0].fba, '24', '古くても値は出す');
+    await p.goto(B + '/sku/k001');
+    assert.match(await p.textContent('#ref-fba-when'), /^古い · /);
+    assert.equal(await p.locator('#ref-fba-when').evaluate((x) => x.className), 'when stale');
+  } finally { await pg.query("update snapshots.stock_capture_days set captured_at = $1 where source = 'fba_jp'", [keepCap]); }
+  // 読めない (画面のロールに権限が無い = 流し直しの前の本番) → 流し直すと戻る
+  await pg.query('revoke select on snapshots.stock_capture_days from master_edit');
+  try {
+    await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001' }));
+    assert.equal((await p.textContent('#th-fba')).trim(), 'FBA (JP)読めない');
+    assert.equal(await p.locator('#th-fba').evaluate((x) => x.className), 'n ref bad');
+    assert.equal((await cells(p))[0].fba, '—');
+    assert.equal((await cells(p))[0].stock, '15', 'ロジザードの在庫はそのまま');
+    await p.goto(B + '/sku/k001');
+    assert.match(await p.textContent('#ref-fba-when'), /読めない \(画面のロールに FBA の在庫を読む権限がまだ無い/);
+    assert.equal(await p.locator('#ref-fba-parts').count(), 0);
+    assert.equal(await p.textContent('#ref-stock'), '15');
+  } finally { await createMasterEditRoles(pg, {}); }
+  await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001' }));
+  assert.equal((await cells(p))[0].fba, '24', '流し直した = 読める');
 });
 
 await ta('[23] 詳細検索の長い条件 (#1620 Codex R1 M2): 本物の HTTP で商品コード 500 件 = 印 (?s=) で開ける・501 件 = 500 件まで・GET に載せると 431・Origin と JSON の守り・期限切れ', async (p) => {
