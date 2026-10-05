@@ -102,9 +102,9 @@ export function buildNewProductContext(db, codeKeys, { today = jstDateStr() } = 
   // ① 登録日。**商品管理リスト snapshot の 登録日 が正本** (Codex R1 #4)。
   //    mirror_products.new_product_launch_date は「発売日」として人が手で設定できる項目で、
   //    rebuild-m-products.js resolveLaunchDate が **手動値を NE の 作成日 より優先** する。
-  //    PML の 登録日 は build-product-management-snapshot.js が `ne.作成日 AS 登録日` として
-  //    そのまま写したもので、手が入らない。NE で今日登録した商品の判定を人の設定値で
-  //    取り逃さないよう、PML → mirror_products の順に見る。
+  //    PML の 登録日 は build-product-management-snapshot.js が NE の作成日 (単品 = goods_creation_date・
+  //    セット = set_goods_creation_date。README「新商品の定義」) をそのまま写したもので、手が入らない。
+  //    NE で今日登録した商品の判定を人の設定値で取り逃さないよう、PML → mirror_products の順に見る。
   //    表ごと無い / 空 = miniPC 同期前 → unknown に倒す (「取れなかった」を「新商品ではない」にしない)
   const launch = new Map();
   let anySource = false;

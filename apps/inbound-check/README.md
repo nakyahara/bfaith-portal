@@ -571,13 +571,15 @@ DB の `status` は `unchecked` / `checked` の**2値のまま**。CHECK 制約�
 
 | 何を | どこから (Render 側で読めるもの) |
 |---|---|
-| 商品登録日 (正本) | `mirror_pml_snapshot_rows.登録日` (商品管理リスト snapshot、毎朝 07:00 の daily-sync で更新)。`build-product-management-snapshot.js` が NE 商品マスタの **作成日** (`goods_creation_date`) を `ne.作成日 AS 登録日` としてそのまま写したもので、**人の手が入らない** |
+| 商品登録日 (正本) | `mirror_pml_snapshot_rows.登録日` (商品管理リスト snapshot、毎朝 07:00 の daily-sync で更新)。`build-product-management-snapshot.js` が NE から写したもので、**人の手が入らない**。**単品** = NE 商品マスタの **作成日** (`goods_creation_date` = `raw_ne_products.作成日`)。**セット** = それが無いときだけ NE セット商品マスタの作成日 (`set_goods_creation_date` = `raw_ne_set_products.作成日`。2026-10 #1624 から)。セットの作成日は、最新の NE の API の完全な取得の世代 (完了の印があり、印の通し番号 = 今の raw の通し番号) のときだけ使い (印・通し番号・行は 1 つの読み取りの取引で読む)、構成の行で食い違う・空と日付が混ざるセットは空。CSV の取込の後などは空 |
 | 商品登録日 (控え) | `mirror_products.new_product_launch_date`。同じく NE の 作成日 由来だが、`rebuild-m-products.js resolveLaunchDate` が **「発売日」として人が手で設定した値を NE の 作成日 より優先**する。PML にまだ載っていない商品 (今日 NE に登録した等) の控えとしてだけ使う |
 | 入庫履歴 ① | `mirror_pml_snapshot_rows.最終仕入日`。NE の `goods_last_time_supplied_date` = ロジザード入庫 → NE 仕入計上で入る日付。**一番直接的な証拠** |
 | 入庫履歴 ② | `mirror_logizard_stock` にその商品の行があるか (在庫ゼロでも行は残る) |
 | 入庫履歴 ③ | `f_inbound_check_destinations` — このアプリの過去の受入実績。⚠**実数0で確定した行は数えない** (「これ以上来ない — 不足◯個」は現物が1つも来ていないので入庫の証拠にならない) |
 
 判定は `new-product.js` の `buildNewProductContext()` に1か所だけ置く (一覧と確認 API が同じ規則を見る)。
+
+**セット商品 (商品区分 = セット) は判定の対象外** (`unknown` = 撮影を必須にしない)。入荷の行はロジザードの入荷 CSV の商品ID = 物の単位で、NE のセットは構成の単品で入ってくる。セットの登録日は 2026-10 まで空 = いつも `unknown` だったので、#1624 でセットに登録日が入っても判定は今までどおり (商品区分は PML → `mirror_products` の順に見る)。
 
 🚨**「データが無い」を「新商品ではない」に読み替えない**。商品マスタのミラーが空・その商品コードが
 無い・登録日が空、のどれかなら `unknown` を返す。`unknown` は **撮影を必須にしない** (入荷受付が止まると

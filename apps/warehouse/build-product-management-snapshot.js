@@ -60,7 +60,8 @@ const COLUMNS = [
   '代表商品コード', 'ロケーションコード', '商品分類タグ', '登録日',
 ];
 
-export async function buildProductManagementSnapshot({ fbaSource = 'daily' } = {}) {
+// _afterSetMarkCheck = 試験だけが使う (印を確かめた後・行を読む前に別の接続から書き込む = 同じ読み取りの取引で読めているかを確かめる)
+export async function buildProductManagementSnapshot({ fbaSource = 'daily', _afterSetMarkCheck = null } = {}) {
   const db = getDB();
   const generatedAt = nowTs();
   const today = jstToday();
@@ -151,11 +152,14 @@ export async function buildProductManagementSnapshot({ fbaSource = 'daily' } = {
   // セットの作成日を 登録日 に使うのは、最新の NE の API の完全な取得の世代のときだけ (#1624 Codex R1 Medium 2)。
   //   完了の印 (ne_api_setproducts_complete_at) があり、その印の通し番号 (_complete_rev) が今の raw の通し番号 (ne_raw_setproducts_rev) と同じ
   //   = 印の後に CSV の取込などで書き換わっていない。違えばセットの 登録日 は空 (登録日は一度入ると変えられない = 疑わしい日は入れない)
-  const setMark = Object.fromEntries(db.prepare("SELECT key, value FROM sync_meta WHERE key IN ('ne_api_setproducts_complete_at', 'ne_api_setproducts_complete_rev')").all().map(r => [r.key, r.value]));
-  const setDatesTrusted = !!setMark.ne_api_setproducts_complete_at && setMark.ne_api_setproducts_complete_rev != null
-    && String(setMark.ne_api_setproducts_complete_rev) === String(readNeRawRev('setproducts'));
-  if (!setDatesTrusted) console.log('[pml-snapshot] セットの作成日は使わない (NE の API の完全な取得の印が無い / 印の後に書き換わった) → セットの 登録日 は空');
-  const srcRows = db.prepare(`
+  //   🚨 印・通し番号・行は 1 つの読み取りの取引で読む (#1624 Codex R2 Medium)。WAL なので取引の最初の読み取りの時点の中身が最後まで見える
+  //   = 確かめた後に CSV の取込が一部の行を書き換えても、確かめた世代 (完全な古い世代) を読む。CSV の取込は pml-pipeline の鍵を取らない
+  const readSource = db.transaction(() => {
+    const setMark = Object.fromEntries(db.prepare("SELECT key, value FROM sync_meta WHERE key IN ('ne_api_setproducts_complete_at', 'ne_api_setproducts_complete_rev')").all().map(r => [r.key, r.value]));
+    const setDatesTrusted = !!setMark.ne_api_setproducts_complete_at && setMark.ne_api_setproducts_complete_rev != null
+      && String(setMark.ne_api_setproducts_complete_rev) === String(readNeRawRev('setproducts'));
+    if (_afterSetMarkCheck) _afterSetMarkCheck();
+    const srcRows = db.prepare(`
     SELECT
       m.商品コード, m.商品名, m.取扱区分, m.商品区分, m.売上分類,
       m.標準売価 AS 売価, m.原価, m.送料,
@@ -177,7 +181,11 @@ export async function buildProductManagementSnapshot({ fbaSource = 'daily' } = {
     ) sc ON m.商品コード = sc.code COLLATE NOCASE
     ${fbaSub}
     ORDER BY m.商品コード
-  `).all(setDatesTrusted ? 1 : 0, setMark.ne_api_setproducts_complete_at || '', ...params);
+    `).all(setDatesTrusted ? 1 : 0, setMark.ne_api_setproducts_complete_at || '', ...params);
+    return { srcRows, setDatesTrusted };
+  });
+  const { srcRows, setDatesTrusted } = readSource();   // BEGIN (deferred) … COMMIT。呼び手が取引の中なら savepoint (同じ取引の中の読み取り)
+  if (!setDatesTrusted) console.log('[pml-snapshot] セットの作成日は使わない (NE の API の完全な取得の印が無い / 印の後に書き換わった) → セットの 登録日 は空');
 
   const rows = srcRows.map(s => {
     const own = s.自社在庫 ?? 0;

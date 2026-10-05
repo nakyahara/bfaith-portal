@@ -14,6 +14,7 @@
  *   7 証跡の書き込みで失敗したら、セットの入れ替え・完了の印・親の数・整合の証跡がそろって巻き戻る / 商品は印が付かない
  *   9 セットの作成日 (set_goods_creation_date) を API に頼んで raw_ne_set_products.作成日 に残す (親ごとに 1 つに決まるときだけ。無い・空・食い違い・空と日付の混在・
  *     同じ親 × 子の重複で違う日 = 全部の行を NULL・整合の証跡に親)。snapshot は最新の API の完全な取得の世代のときだけセットの作成日を使う (CSV の取込の後などは空)。
+ *  10 snapshot は印・通し番号・行を 1 つの読み取りの取引で読む (確かめた後に別の接続が書き換えても、確かめた完全な世代を読む)
  *     商品管理リストの snapshot の 登録日 = 単品は今までどおり NE の商品の作成日・セットはそれが無いときセットの作成日 (構成の行で食い違えば空)
  * 使い方: node scripts/test-ne-src.mjs
  */
@@ -28,6 +29,7 @@ import Database from 'better-sqlite3';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ne-src-'));
 process.env.DATA_DIR = tmp;
+process.env.PML_KEEP_RUNS = '1000';   // [9][10] は同じ秒に何度も snapshot を作る (generated_at は秒 = 古い回の掃除がその回の行を消さないように)
 fs.writeFileSync(path.join(tmp, 'ne-tokens.json'), JSON.stringify({ access_token: 'a', refresh_token: 'r' }));
 
 // 古い形の DB (C1 の列が無い) を先に作っておく = initDB が列を足す道を通す
@@ -356,6 +358,36 @@ await ta('[9] セットの作成日 (set_goods_creation_date) を API に頼み 
   assert.deepEqual(db().prepare("SELECT 商品コード AS c, 作成日 AS d FROM raw_ne_set_products WHERE セット商品コード = 'sr1' ORDER BY 1").all(), [{ c: 'g1', d: null }, { c: 'g2', d: '2025-06-01 09:00:00' }]);
   assert.equal(meta('ne_api_setproducts_complete_at'), null);
   assert.deepEqual(await regOf(), noSetDates);
+});
+
+await ta('[10] snapshot は印・通し番号・行を 1 つの読み取りの取引で読む: 確かめた後に別の接続が CSV の取込と同じ書き換え (一部の行の置き換え・印を消す) をしても、確かめた完全な世代を読む (#1624 Codex R2 Medium)', async () => {
+  await quietly(fetchSetProducts);   // [9] の後の CSV で消えた印を API の取得で付け直す (同じ ne.setgoods)
+  const { buildProductManagementSnapshot } = await import('../apps/warehouse/build-product-management-snapshot.js');
+  const regOf = async (opts) => {
+    const r = await quietly(() => buildProductManagementSnapshot(opts));
+    return Object.fromEntries(db().prepare('SELECT 商品コード AS c, 登録日 AS d FROM product_management_snapshot_rows WHERE run_id = ?').all(r.run_id).map((x) => [x.c, x.d]));
+  };
+  const full = await regOf();
+  assert.deepEqual([full.sr1, full.sr5, full.sr10], ['2025-06-01 09:00:00', '2022/7/8 10:00:00', '2019-03-03 00:00:00']);
+  let wrote = false;
+  const got = await regOf({ _afterSetMarkCheck: () => {
+    // 2 つ目の接続 = 別のプロセスの CSV の取込 (csv-import.js と同じ: 一部の行を INSERT OR REPLACE・作成日は書かない・完了の印を消す)
+    const w = new Database(path.join(tmp, 'warehouse.db'));
+    try {
+      w.pragma('busy_timeout = 2000');
+      w.transaction(() => {
+        w.prepare("INSERT OR REPLACE INTO raw_ne_set_products (セット商品コード, セット商品名, セット販売価格, 商品コード, 数量, セット在庫数, 代表商品コード, synced_at) VALUES ('sr1', 'SR1', 1, 'g1', 1, 0, '', '2099-01-01 00:00:00')").run();
+        w.prepare("INSERT OR REPLACE INTO raw_ne_set_products (セット商品コード, セット商品名, セット販売価格, 商品コード, 数量, セット在庫数, 代表商品コード, synced_at) VALUES ('sr10', 'SR10', 1, 'g1', 1, 0, '', '2099-01-01 00:00:00')").run();
+        w.prepare("DELETE FROM sync_meta WHERE key LIKE 'ne_api_setproducts_complete%'").run();
+      })();
+      wrote = true;
+    } finally { w.close(); }
+  } });
+  assert.ok(wrote, '2 つ目の接続から書けた (WAL = 読み取りの取引は書き込みを止めない)');
+  assert.deepEqual(got, full);   // 確かめた世代 (書き換えの前の完全な世代) をそのまま読む = 残った行だけから日を採らない
+  // 書き換えの後の次の snapshot = 印が無い → セットの 登録日 は全部空
+  const after = await regOf();
+  assert.deepEqual([after.sr1, after.sr5, after.sr10, after['g-reg']], [null, null, null, '2024-03-15 10:00:00']);
 });
 
 globalThis.fetch = realFetch;
