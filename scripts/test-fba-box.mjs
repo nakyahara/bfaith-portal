@@ -1712,8 +1712,12 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     const row = st.rows[0];
     const bx = db.createBox({ packGroupId: st.groups[0].id, materialCode: 'box140', worker: member });
     db.addPlacement({ runId: c4.runId, rowId: row.id, boxId: bx.boxId, qty: 20, worker: member, deviceKey: 'dev:s', requestId: 'sq1' });
-    assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 31, worker: staff }).error, 'bad_qty');
+    // 予定より増やすこと自体はできる (2026-10-05) が、理由は 本社指示 / その他 だけ (在庫が少ない で増やすのは矛盾)
+    assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 31, worker: staff }).error, 'bad_reason');
     assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 19, worker: staff }).error, 'bad_qty');
+    // 🚨 空 (null / '') を 0 = 「1 個も送らない」にしない
+    assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: null, worker: staff }).error, 'bad_qty');
+    assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: '', worker: staff }).error, 'bad_qty');
     assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 25, reason: 'nope', worker: staff }).error, 'bad_reason');
     const r = db.setRowSendQty({ rowId: row.id, sendQty: 25, worker: staff, deviceLabel: 'iPad' });
     assert.equal(r.ok, true, JSON.stringify(r));
@@ -1729,6 +1733,124 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     // 投入 25 のまま予定 (30) に戻す → 不足が消え、残り 5 になる
     assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 30, worker: staff }).ok, true);
     assert.equal(db.getRunState(c4.runId).rows[0].shortage_qty, null);
+  });
+  // ── 送る数を予定より増やす (中原さん 2026-10-05: いろはの iPad で「送る数は予定 (4) を超えられません」と出た) ──
+  t('setRowSendQty: 予定 4 → 送る数 5 (本社指示) = 増やした数 1。5 個まで入れられ、完了でき、出荷前チェックと本社向け一覧に「4 → 5」', () => {
+    const cx = db.createRunFromPicking({ pickingRun: { id: 1010, delivery_date: '2026-10-06' }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, sku: 's', fnsku: 'X0EXTRA001', productName: 'プロレスマスク', qty: '4' }] }], createdBy: 't' });
+    const st = db.getRunState(cx.runId);
+    const row = st.rows[0];
+    const bx = db.createBox({ packGroupId: st.groups[0].id, materialCode: 'box140', worker: member });
+    const r = db.setRowSendQty({ rowId: row.id, sendQty: 5, reason: 'hq_order', worker: staff, deviceLabel: 'iPad' });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.extra, 1); assert.equal(r.shortage, 0); assert.equal(r.from, 4); assert.equal(r.sendQty, 5);
+    const after = db.getRunState(cx.runId).rows[0];
+    assert.equal(after.extra_qty, 1); assert.equal(after.extra_reason, 'hq_order'); assert.equal(after.extra_by, staff.display_name);
+    assert.equal(after.shortage_qty, null);
+    assert.equal(db.sendQtyOf(after), 5);
+    // 5 個まで入る (6 は送る数を超える。上限の計算に要る数を返す)
+    const ov = db.addPlacement({ runId: cx.runId, rowId: row.id, boxId: bx.boxId, qty: 6, worker: member, deviceKey: 'dev:x', requestId: 'ex1' });
+    assert.equal(ov.error, 'over_qty'); assert.equal(ov.extra, 1); assert.equal(ov.plannedQty, 4);
+    assert.match(ov.message, /送る数 5/);
+    assert.equal(db.addPlacement({ runId: cx.runId, rowId: row.id, boxId: bx.boxId, qty: 5, worker: member, deviceKey: 'dev:x', requestId: 'ex2' }).ok, true);
+    // 入れたあとで予定 (4) に戻すことはできない (入れた 5 より少なくなる)
+    assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 4, worker: staff }).error, 'bad_qty');
+    // 出荷前チェック: 入力済み扱い (rows_incomplete にならない)・「予定より多く送る」の警告に 4 → 5
+    const rd = db.exportReadiness(cx.runId);
+    assert.ok(!rd.blockers.some((b) => b.code === 'rows_incomplete'), JSON.stringify(rd.blockers));
+    const w = rd.warnings.find((x) => x.code === 'extra_rows');
+    assert.ok(w && w.rows[0].planned === 4 && w.rows[0].sendQty === 5 && w.rows[0].extra === 1 && /本社指示/.test(w.rows[0].reasonJa), JSON.stringify(w));
+    assert.ok(!rd.warnings.some((x) => x.code === 'shortage_rows'));
+    // 完了: 残りは 0 なので確認なしで終わる。増やした数はそのまま
+    db.closeBox({ boxId: bx.boxId, measuredKg: 2, worker: staff });
+    const fin = db.finishRun({ runId: cx.runId, worker: staff });
+    assert.equal(fin.ok, true, JSON.stringify(fin));
+    assert.equal(db.getRunState(cx.runId).rows[0].extra_qty, 1);
+    // 本社向け一覧: 数量変更 4 → 5・理由に「予定より増やした (本社指示)」・未投入なし
+    const rep = report.buildRunReport(cx.runId);
+    const ch = rep.changes.find((x) => x.fnsku === 'X0EXTRA001');
+    assert.ok(ch && ch.action === 'qty' && ch.planned === 4 && ch.placed === 5 && /予定より増やした \(本社指示\)/.test(ch.reasonJa) && ch.remaining === 0, JSON.stringify(ch));
+  });
+  t('送る数を増やしたあと: 「数が足りない」で増やした数は消える / 予定に戻すと両方消える / 予定ちょうどまで入っていれば「数が足りない」は断る', () => {
+    const cx = db.createRunFromPicking({ pickingRun: { id: 1011 }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, sku: 's', fnsku: 'X0EXTRA002', productName: 'x', qty: '4' }] }], createdBy: 't' });
+    const st = db.getRunState(cx.runId);
+    const row = st.rows[0];
+    assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 6, reason: 'other', worker: staff }).ok, true);
+    assert.equal(db.setRowShortage({ rowId: row.id, shortageQty: 1, reason: 'damaged', worker: staff }).ok, true);
+    let cur = db.getRunState(cx.runId).rows[0];
+    assert.equal(cur.extra_qty, null); assert.equal(cur.shortage_qty, 1); assert.equal(db.sendQtyOf(cur), 3);
+    assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 6, reason: 'hq_order', worker: staff }).ok, true);
+    cur = db.getRunState(cx.runId).rows[0];
+    assert.equal(cur.extra_qty, 2); assert.equal(cur.shortage_qty, null);     // 増やすと不足は消える (同時に持たない)
+    assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 4, worker: staff }).ok, true);
+    cur = db.getRunState(cx.runId).rows[0];
+    assert.equal(cur.extra_qty, null); assert.equal(cur.shortage_qty, null); assert.equal(cur.extra_reason, null);
+    // 予定 4 まで入れた行に「数が足りない」は付けられない (分かる言葉で断る)
+    assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 5, reason: 'hq_order', worker: staff }).ok, true);
+    const bx = db.createBox({ packGroupId: st.groups[0].id, materialCode: 'box140', worker: member });
+    db.addPlacement({ runId: cx.runId, rowId: row.id, boxId: bx.boxId, qty: 5, worker: member, deviceKey: 'dev:y', requestId: 'ey1' });
+    const sh = db.setRowShortage({ rowId: row.id, shortageQty: 1, reason: 'damaged', worker: staff });
+    assert.equal(sh.error, 'bad_qty'); assert.match(sh.message, /送る数を直す/);
+    assert.equal(db.getRunState(cx.runId).rows[0].extra_qty, 1);   // 断ったときは何も変えない
+  });
+  t('送る数を増やした行を入れ切らずに完了: 送る数 = 入れた数 (予定を超えた分だけ増やした数に残る / 予定に届かなければ不足 = 今回は納品しない)', () => {
+    const cx = db.createRunFromPicking({ pickingRun: { id: 1012 }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [
+      { no: 1, sku: 'a', fnsku: 'X0EXTRA003', productName: 'a', qty: '4' }, { no: 2, sku: 'b', fnsku: 'X0EXTRA004', productName: 'b', qty: '4' }] }], createdBy: 't' });
+    const st = db.getRunState(cx.runId);
+    const [ra, rb] = st.rows;
+    const bx = db.createBox({ packGroupId: st.groups[0].id, materialCode: 'box140', worker: member });
+    db.setRowSendQty({ rowId: ra.id, sendQty: 6, reason: 'hq_order', worker: staff });
+    db.setRowSendQty({ rowId: rb.id, sendQty: 6, reason: 'hq_order', worker: staff });
+    db.addPlacement({ runId: cx.runId, rowId: ra.id, boxId: bx.boxId, qty: 5, worker: member, deviceKey: 'dev:z', requestId: 'ez1' });
+    db.addPlacement({ runId: cx.runId, rowId: rb.id, boxId: bx.boxId, qty: 3, worker: member, deviceKey: 'dev:z', requestId: 'ez2' });
+    db.closeBox({ boxId: bx.boxId, measuredKg: 2, worker: staff });
+    const inc = db.finishRun({ runId: cx.runId, worker: staff });
+    assert.equal(inc.error, 'incomplete');
+    assert.deepEqual(inc.rows.map((x) => x.remaining).sort(), [1, 3]);
+    assert.equal(db.finishRun({ runId: cx.runId, acknowledge: true, worker: staff }).ok, true);
+    const rows = db.getRunState(cx.runId).rows;
+    const a = rows.find((x) => x.id === ra.id), b = rows.find((x) => x.id === rb.id);
+    assert.equal(a.extra_qty, 1); assert.equal(a.shortage_qty, null);                                   // 予定 4 → 5
+    assert.equal(b.extra_qty, null); assert.equal(b.shortage_qty, 1); assert.equal(b.shortage_reason, 'not_shipped');   // 予定 4 → 3
+    assert.equal(b.extra_reason, null);
+    const rd = db.exportReadiness(cx.runId);
+    assert.ok(!rd.blockers.some((x) => x.code === 'rows_incomplete'), JSON.stringify(rd.blockers));
+  });
+  t('送る数を増やした行に Excel を添付: 増やした送る数までは入っていても断らない・新しい予定との差に置き直す (作業中 / 完了後)', () => {
+    // fixture2 は 4 SKU (5, 5, 1, 30)。picking では 4 つ目を 28 にする
+    const rowsPk = f2rows.map((r, i) => ({ no: i + 1, sku: r.sku, fnsku: r.fnsku, productName: 'p' + i, qty: String(i === 3 ? 28 : r.plannedQty) }));
+    // 作業中: 2 つ目 (予定 5) を 7 にして 7 入れる / 4 つ目 (28) を 30 に増やす → Excel (5 / 30) を添付
+    const ca = db.createRunFromPicking({ pickingRun: { id: 1013, delivery_date: '2026-10-07' }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: rowsPk }], createdBy: 't' });
+    const sa = db.getRunState(ca.runId);
+    const bxa = db.createBox({ packGroupId: sa.groups[0].id, materialCode: 'box140', worker: member });
+    assert.equal(db.setRowSendQty({ rowId: sa.rows[1].id, sendQty: 7, reason: 'hq_order', worker: staff }).ok, true);
+    assert.equal(db.addPlacement({ runId: ca.runId, rowId: sa.rows[1].id, boxId: bxa.boxId, qty: 7, worker: member, deviceKey: 'dev:w', requestId: 'ew1' }).ok, true);
+    assert.equal(db.setRowSendQty({ rowId: sa.rows[3].id, sendQty: 30, reason: 'hq_order', worker: staff }).ok, true);
+    const at = db.attachExcelToRun({ runId: ca.runId, parsed: ing.parsed, file: { originalName: 'ex.xlsx', storedPath: ing.storedPath, sha256: ing.sha256 }, actor: 't' });
+    assert.equal(at.ok, true, JSON.stringify(at));
+    let rows = db.getRunState(ca.runId).rows;
+    const r1 = rows.find((x) => x.id === sa.rows[1].id), r3 = rows.find((x) => x.id === sa.rows[3].id);
+    assert.equal(r1.planned_qty, 5); assert.equal(r1.extra_qty, 2); assert.equal(db.sendQtyOf(r1), 7);   // STA のプランを直していない Excel → 増やした数はそのまま
+    assert.equal(r3.planned_qty, 30); assert.equal(r3.extra_qty, null); assert.equal(db.sendQtyOf(r3), 30);   // 本社が予定を 30 に直した → 増やした数は 0
+    assert.ok(at.warnings.some((w) => w.kind === 'extra_recomputed' && w.fnsku === f2rows[3].fnsku && w.extraTo === 0), JSON.stringify(at.warnings));
+    // 増やした送る数より多くは入っていない → それを超える Excel の添付拒否はこれまでどおり
+    // 完了後: 4 つ目を 28 → 31 に増やして 31 入れて完了 → Excel (30) を添付 → 増やした数 1
+    const cb = db.createRunFromPicking({ pickingRun: { id: 1014, delivery_date: '2026-10-08' }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: rowsPk }], createdBy: 't' });
+    const sb = db.getRunState(cb.runId);
+    const bxb = db.createBox({ packGroupId: sb.groups[0].id, materialCode: 'box140', worker: member });
+    assert.equal(db.setRowSendQty({ rowId: sb.rows[3].id, sendQty: 31, reason: 'other', worker: staff }).ok, true);
+    for (const [i, r] of sb.rows.entries()) {
+      assert.equal(db.addPlacement({ runId: cb.runId, rowId: r.id, boxId: bxb.boxId, qty: i === 3 ? 31 : r.planned_qty, worker: member, deviceKey: 'dev:v', requestId: 'ev' + i }).ok, true);
+    }
+    db.closeBox({ boxId: bxb.boxId, measuredKg: 5, worker: staff });
+    assert.equal(db.finishRun({ runId: cb.runId, worker: staff }).ok, true);
+    const atb = db.attachExcelToRun({ runId: cb.runId, parsed: ing.parsed, file: { originalName: 'exb.xlsx', storedPath: ing.storedPath, sha256: ing.sha256 }, actor: 't' });
+    assert.equal(atb.ok, true, JSON.stringify(atb));
+    rows = db.getRunState(cb.runId).rows;
+    const rb3 = rows.find((x) => x.id === sb.rows[3].id);
+    assert.equal(rb3.planned_qty, 30); assert.equal(rb3.extra_qty, 1); assert.equal(rb3.shortage_qty, null); assert.equal(rb3.extra_reason, 'other');
+    const rd = db.exportReadiness(cb.runId);
+    assert.equal(rd.ok, true, JSON.stringify(rd.blockers));
+    assert.ok(rd.warnings.some((w) => w.code === 'extra_rows'));
   });
   // 商品画像: キャッシュ + images.js (fetcher / 属性源を差し替え)
   const img = await import('../apps/fba-box/images.js');

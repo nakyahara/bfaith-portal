@@ -242,7 +242,7 @@
       </div>
       <!-- 🆕 アップデートのお知らせ。版を上げたら UPDATE_ID も変える (✕ で消した端末にも、新しい版はまた出る) -->
       <div id="updbar" class="hidden" style="display:flex; align-items:center; gap:10px; background:#FFF4E6; border:2px solid #E8890C; border-radius:12px; padding:10px 12px; margin-bottom:12px">
-        <a href="./manual#updates" target="_blank" style="flex:1; color:#8A4B00; font-weight:800; text-decoration:none; line-height:1.5">🆕 9/24 アップデート: 番号で探す・1 つの商品を何箱にも分けて入れる・箱の中身から数を直す <span style="text-decoration:underline">→ 何が変わったか見る</span></a>
+        <a href="./manual#updates" target="_blank" style="flex:1; color:#8A4B00; font-weight:800; text-decoration:none; line-height:1.5">🆕 10/5 アップデート: 送る数を予定より増やせるようになりました (職員の「送る数を直す」) <span style="text-decoration:underline">→ 何が変わったか見る</span></a>
         <button id="updbar-x" class="chip" style="background:#E9ECEF; color:#495057; flex:none" aria-label="お知らせを閉じる">✕</button>
       </div>
       <div id="runlist">読み込み中…</div>
@@ -710,7 +710,7 @@
       return;
     }
     $('#rows').innerHTML = rows.map(r => {
-      const rem = r.planned_qty - r.placed - (r.shortage_qty || 0);
+      const rem = sendOf(r) - r.placed;
       const done = rowDone(r);
       const pp = planParts(r.plan_no);
       return `<div class="row ${done ? 'done' : ''} ${r.shortage_qty ? 'short' : ''}" data-id="${r.id}">
@@ -722,17 +722,20 @@
             ${r.match_state === 'excel_only' ? '<span class="badge warnm">Excelにだけある</span>' : ''}
             ${r.match_state === 'picking_only' ? '<span class="badge short">Excelに無い (入れない)</span>' : ''}
             ${r.shortage_qty ? `<span class="badge short">送る数 ${r.planned_qty - r.shortage_qty} (予定 ${r.planned_qty}${r.shortage_reason ? '・' + esc(REASON_JA[r.shortage_reason] || r.shortage_reason) : ''})</span>` : ''}
+            ${r.extra_qty ? `<span class="badge warnm">送る数 ${sendOf(r)} (予定 ${r.planned_qty} から増やした${r.extra_reason ? '・' + esc(REASON_JA[r.extra_reason] || r.extra_reason) : ''})</span>` : ''}
             ${expiryOf(r.id) ? `<span class="badge exp">期限 ${esc(expiryOf(r.id))}</span>` : ''}
             ${!expiryOf(r.id) && r.requires_expiry === 1 && r.placed > 0 ? '<span class="badge short">期限まだ</span>' : ''}
             ${r.check_worker ? `✅${esc(r.check_worker)}` : ''}
           </div>
         </div>
-        <div class="qty"><span class="rem">${done ? '✓' : rem}</span><div class="of">${r.placed}/${r.planned_qty}</div></div>
+        <div class="qty"><span class="rem">${done ? '✓' : rem}</span><div class="of">${r.placed}/${r.extra_qty ? sendOf(r) : r.planned_qty}</div></div>
       </div>`;
     }).join('');
     $('#rows').querySelectorAll('.row').forEach(el => el.addEventListener('click', () => openRowDialog(Number(el.dataset.id))));
   }
-  function rowDone(r) { return r.match_state === 'picking_only' || (r.placed + (r.shortage_qty || 0) >= r.planned_qty && r.planned_qty > 0); }
+  function rowDone(r) { return r.match_state === 'picking_only' || (r.placed >= sendOf(r) && (r.planned_qty > 0 || sendOf(r) > 0)); }
+  /** 送る数 = 予定 − 不足 + 予定より増やした数 (2026-10-05: 予定より多く送ることもある。db.js sendQtyOf と同じ) */
+  function sendOf(r) { return r.planned_qty - (r.shortage_qty || 0) + (r.extra_qty || 0); }
   function switchGroup(gid) {
     curGroupId = gid;
     const boxOk = S.boxes.some(x => x.id === curBoxId && x.status === 'open' && x.pack_group_id === curGroupId);
@@ -793,7 +796,7 @@
     if (!j.ok) { alert(j.message || '読み込めませんでした'); return; }
     const r = j.readiness;
     const item = (x, color) => `<div style="padding:6px 0; border-bottom:1px solid #F1F3F5; color:${color}">${esc(x.message)}
-      ${x.rows ? `<div style="font-size:0.85em; color:#495057">${x.rows.slice(0, 12).map(y => `・${esc(shortName(y.name, 16))} ${esc(fn4(y.fnsku))} (${y.placed}/${y.planned})`).join('<br>')}${x.rows.length > 12 ? '<br>…' : ''}</div>` : ''}
+      ${x.rows ? `<div style="font-size:0.85em; color:#495057">${x.rows.slice(0, 12).map(y => `・${esc(shortName(y.name, 16))} ${esc(fn4(y.fnsku))} (${y.placed}/${y.sendQty ?? y.planned})`).join('<br>')}${x.rows.length > 12 ? '<br>…' : ''}</div>` : ''}
       ${x.boxes ? `<div style="font-size:0.85em; color:#495057">${x.boxes.map(y => `・${esc(y.code)}${y.amazonName && y.amazonBoxNo !== y.boxNo ? ' → Amazon ' + esc(y.amazonName) : ''}`).join('<br>')}</div>` : ''}</div>`;
     openDialog(`
       <h2>📋 まとめ — ${esc(S.run.title)}</h2>
@@ -972,7 +975,7 @@
   function openRowDialog(rowId, draft) {
     const r = S.rows.find(x => x.id === rowId);
     if (!r) return;
-    const rem = r.planned_qty - r.placed - (r.shortage_qty || 0);
+    const rem = sendOf(r) - r.placed;
     // この商品のグループで開いている箱。箱の番号順 (箱に書いた「1箱目・2箱目」と同じ並び)
     const boxes = S.boxes.filter(b => b.pack_group_id === r.pack_group_id && b.status === 'open').sort((a, b) => a.box_no - b.box_no);
     const knownExpiry = expiryOf(r.id);
@@ -1024,7 +1027,7 @@
         </div>
       </div>
       <div class="grid2">
-        <div>予定 <b style="font-size:1.3em">${r.planned_qty}</b></div>
+        <div>予定 <b style="font-size:1.3em">${r.planned_qty}</b>${r.extra_qty ? ` <small style="color:#B5651D; font-weight:700">→ 送る数 ${sendOf(r)}</small>` : ''}</div>
         <div>残り <b style="font-size:1.3em; color:${rem > 0 ? '#C92A2A' : '#2B8A3E'}">${excluded ? '—' : rem}</b></div>
       </div>
       ${draft && draft.notStored ? `<div class="warnbox" style="margin-top:8px">⚠ 前に押した分は、まだ記録していません (この端末に控えを保存できませんでした)
@@ -1075,11 +1078,12 @@
               : '上の「👤 作業者を選ぶ」から選んでください'}</small>`))}</button>
       <div class="lbl">⚠ 困ったとき (職員)</div>
       <div class="grid3">
-        <button class="selbtn" id="d-sendqty">${r.shortage_qty ? `送る数 ${r.planned_qty - r.shortage_qty} を直す` : '送る数を直す'}</button>
+        <button class="selbtn" id="d-sendqty">${r.shortage_qty || r.extra_qty ? `送る数 ${sendOf(r)} を直す` : '送る数を直す'}</button>
         <button class="selbtn" id="d-short">数が足りない</button>
         <button class="selbtn" id="d-close">閉じる</button>
       </div>
       ${r.shortage_qty ? `<div class="msg" style="color:#C92A2A">予定 ${r.planned_qty} → 送る数 ${r.planned_qty - r.shortage_qty}${r.shortage_reason ? ' (' + esc(REASON_JA[r.shortage_reason] || r.shortage_reason) + ')' : ''}</div>` : ''}
+      ${r.extra_qty ? `<div class="msg" style="color:#B5651D">予定 ${r.planned_qty} → 送る数 ${sendOf(r)} (予定より増やした${r.extra_reason ? '・' + esc(REASON_JA[r.extra_reason] || r.extra_reason) : ''})</div>` : ''}
       ${rem > 0 && !excluded
         // 「入れた」は画面の下に貼り付ける (中原さん 2026-09-23: 積み方・置いた場所・期限などの下にあってスクロールが要った)。
         // 送信中・エラーの文言も同じ帯に置く (押したボタンのすぐ上で見える)
@@ -2351,7 +2355,7 @@ ${j.message || ''}
   function adjustDialog(row, placementId, currentQty, opts) {
     if (!worker) { pickWorker(); return; }
     const pp = planParts(row.plan_no);
-    const rem = row.planned_qty - row.placed - (row.shortage_qty || 0);
+    const rem = sendOf(row) - row.placed;
     // 箱の中身・読み合わせから来たときは、その画面が出していた記録そのもの (opts.placement) を使う。
     // S.placements は少し古いことがあり、別の iPad が入れた直後の記録だと見つからない・置いた場所が食い違う (Codex PR #1430 R2 #1)
     const pl = (opts && opts.placement) || (S.placements || []).find(p => p.id === placementId) || null;
@@ -2364,7 +2368,7 @@ ${j.message || ''}
       <div style="font-weight:800; color:#495057">${esc(pp.label)}<span style="font-size:1.6em; color:#B5651D; margin-left:2px">${esc(pp.no)}</span></div>
       <div class="pname">${esc(shortName(row.product_name))}${boxCode ? ` — <b>${esc(boxCode)}</b> の記録` : ''} <b style="font-size:1.3em">${currentQty}</b>個</div>
       ${plInfo ? `<div class="msg" style="color:#495057; margin-top:0">記録: ${esc(plInfo)}</div>` : ''}
-      <div class="msg" style="color:#868E96; margin-top:0">予定 ${row.planned_qty} / 入れた ${row.placed}${row.shortage_qty ? ` / 送らない ${row.shortage_qty}` : ''} → この記録は <b>${currentQty + Math.max(0, rem)}</b> 個まで増やせます</div>
+      <div class="msg" style="color:#868E96; margin-top:0">予定 ${row.planned_qty}${row.extra_qty ? ` (送る数 ${sendOf(row)})` : ''} / 入れた ${row.placed}${row.shortage_qty ? ` / 送らない ${row.shortage_qty}` : ''} → この記録は <b>${currentQty + Math.max(0, rem)}</b> 個まで増やせます</div>
       <div class="lbl">正しい個数 (0 = この記録を取り消す)</div>
       <input class="qtyin" id="a-qty" type="tel" inputmode="numeric" value="${currentQty}">
       <div style="margin-top:14px"><button class="bigbtn" id="a-go">この数に直す</button></div>
@@ -2415,8 +2419,8 @@ ${j.message || ''}
       // 上限はサーバーが返した**今の**数で出す (画面を開いたあとに別の iPad が入れていると、開いた時点の数は古い — Codex PR #1430 R1 #1)。
       // placed はこの記録を取り消したあとの数
       if (!j.ok && j.error === 'over_qty') {
-        const max = Number.isFinite(j.plannedQty) && Number.isFinite(j.placed) ? Math.max(0, j.plannedQty - (j.shortage || 0) - j.placed) : currentQty + Math.max(0, rem);
-        msg.className = 'msg err'; msg.textContent = `この記録は ${max} 個までにしか直せません (予定を超えます)`; return;
+        const max = Number.isFinite(j.plannedQty) && Number.isFinite(j.placed) ? Math.max(0, j.plannedQty - (j.shortage || 0) + (j.extra || 0) - j.placed) : currentQty + Math.max(0, rem);
+        msg.className = 'msg err'; msg.textContent = `この記録は ${max} 個までにしか直せません (送る数を超えます。予定より多く送るときは、職員が商品の画面の「送る数を直す」で増やしてください)`; return;
       }
       if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message || '直せませんでした'; return; }
       if (j.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください');
@@ -2428,9 +2432,11 @@ ${j.message || ''}
   }
 
   // ─── 送る数の修正 (職員): 棚の在庫が予定より少ないとき等。予定 → 送る数 と理由を記録 ───
+  // 予定より多くもできる (中原さん 2026-10-05)。そのときの理由は「本社指示」「その他」だけ (減らす理由は押せなくする)
+  const EXTRA_REASONS = ['hq_order', 'other'];
   function sendQtyDialog(row, draft) {
     staffPinPrompt(async (staffWorker, pin) => {
-      const current = row.planned_qty - (row.shortage_qty || 0);
+      const current = sendOf(row);
       const dlg = openDialog(`
         <h2>✏ 送る数を直す (職員)</h2>
         <div class="pname">${esc(shortName(row.product_name))}</div>
@@ -2444,19 +2450,42 @@ ${j.message || ''}
         <div class="lbl">理由</div>
         <div class="grid3">
           ${[['stock_short', '在庫が少ない'], ['damaged', '破損'], ['not_shipped', '今回は納品しない'], ['hq_order', '本社指示'], ['other', 'その他']]
-            .map(([v, ja]) => `<button class="selbtn qrsn ${(row.shortage_reason || 'stock_short') === v ? 'on' : ''}" data-v="${v}">${ja}</button>`).join('')}
+            .map(([v, ja]) => `<button class="selbtn qrsn" data-v="${v}">${ja}</button>`).join('')}
         </div>
+        <div class="msg hidden" id="q-extra" style="color:#B5651D; font-weight:700"></div>
         <div class="msg" style="color:#868E96">予定に戻すときは送る数に予定の数 (${row.planned_qty}) を入れてください。本社の画面には「予定 → 送る数」と理由が出ます</div>
         <div style="margin-top:14px"><button class="bigbtn" id="q-go">この数で送る</button></div>
         <div class="msg" id="q-msg"></div>`);
-      let reason = ['stock_short', 'damaged', 'not_shipped', 'hq_order', 'other'].includes(row.shortage_reason) ? row.shortage_reason : 'stock_short';
+      const prevReason = row.extra_qty ? row.extra_reason : row.shortage_reason;
+      let reason = ['stock_short', 'damaged', 'not_shipped', 'hq_order', 'other'].includes(prevReason) ? prevReason : 'stock_short';
+      const qtyIn = dlg.querySelector('#q-qty');
+      // 空欄・数字以外は NaN (Number('') = 0 で「送らない」にしない)
+      const readQty = () => { const raw = qtyIn.value.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).trim(); return /^\d{1,6}$/.test(raw) ? Number(raw) : NaN; };
+      // 予定より多い数のときは、減らす理由 (在庫が少ない・破損・今回は納品しない) を押せなくして「本社指示」に寄せる
+      const paint = () => {
+        const q = readQty();
+        const over = Number.isInteger(q) && q > row.planned_qty;
+        if (over && !EXTRA_REASONS.includes(reason)) reason = 'hq_order';
+        dlg.querySelectorAll('.qrsn').forEach(b => {
+          const off = over && !EXTRA_REASONS.includes(b.dataset.v);
+          b.disabled = off; b.style.opacity = off ? '0.35' : '';
+          b.classList.toggle('on', b.dataset.v === reason);
+        });
+        const ex = dlg.querySelector('#q-extra');
+        ex.classList.toggle('hidden', !over);
+        ex.textContent = over ? `予定 (${row.planned_qty}) より ${q - row.planned_qty} 個 多く送ります。Amazon の納品プランの数量は本社が直します` : '';
+      };
+      qtyIn.addEventListener('input', paint);
+      paint();
       dlg.querySelectorAll('.qrsn').forEach(b => b.addEventListener('click', () => {
-        dlg.querySelectorAll('.qrsn').forEach(x => x.classList.remove('on'));
-        b.classList.add('on'); reason = b.dataset.v;
+        if (b.disabled) return;
+        reason = b.dataset.v; paint();
       }));
       dlg.querySelector('#q-go').addEventListener('click', async () => {
         const msg = dlg.querySelector('#q-msg');
-        const j = await apiPost(`/api/rows/${row.id}/send-qty`, { worker_id: staffWorker.id, pin, send_qty: Number(dlg.querySelector('#q-qty').value), reason });
+        const q = readQty();
+        if (!Number.isInteger(q)) { msg.className = 'msg err'; msg.textContent = '送る数を 0 以上の整数で入れてください'; return; }
+        const j = await apiPost(`/api/rows/${row.id}/send-qty`, { worker_id: staffWorker.id, pin, send_qty: q, reason });
         if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message; return; }
         dialogOpen = false; $('#ovl-root').innerHTML = '';
         // 商品の画面に戻る (一覧に落とさない)。入力途中の箱ごとの数はそのまま — 送る数が減って残りを超えたら赤く出る
@@ -2512,7 +2541,7 @@ ${j.message || ''}
   }
 
   // ─── アップデートのお知らせ (端末ごとに ✕ で閉じられる。版が変われば また出る) ───
-  const UPDATE_ID = '2026-09-24';
+  const UPDATE_ID = '2026-10-05';
   (function initUpdateBar() {
     const bar = $('#updbar');
     if (!bar) return;
