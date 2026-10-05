@@ -12,6 +12,10 @@
  *   5 CSV の取込も元の値を残す (列が無ければ NULL)。完了の印・親の数・整合の証跡は消える (CSV は完全な NE 集合にしない)
  *   6 自動取込 (auto-import.js) も同じ (実際に動かして確かめる)
  *   7 証跡の書き込みで失敗したら、セットの入れ替え・完了の印・親の数・整合の証跡がそろって巻き戻る / 商品は印が付かない
+ *   9 セットの作成日 (set_goods_creation_date) を API に頼んで raw_ne_set_products.作成日 に残す (親ごとに 1 つに決まるときだけ。無い・空・食い違い・空と日付の混在・
+ *     同じ親 × 子の重複で違う日 = 全部の行を NULL・整合の証跡に親)。snapshot は最新の API の完全な取得の世代のときだけセットの作成日を使う (CSV の取込の後などは空)。
+ *  10 snapshot は印・通し番号・行を 1 つの読み取りの取引で読む (確かめた後に別の接続が書き換えても、確かめた完全な世代を読む)
+ *     商品管理リストの snapshot の 登録日 = 単品は今までどおり NE の商品の作成日・セットはそれが無いときセットの作成日 (構成の行で食い違えば空)
  * 使い方: node scripts/test-ne-src.mjs
  */
 import assert from 'node:assert/strict';
@@ -25,6 +29,7 @@ import Database from 'better-sqlite3';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ne-src-'));
 process.env.DATA_DIR = tmp;
+process.env.PML_KEEP_RUNS = '1000';   // [9][10] は同じ秒に何度も snapshot を作る (generated_at は秒 = 古い回の掃除がその回の行を消さないように)
 fs.writeFileSync(path.join(tmp, 'ne-tokens.json'), JSON.stringify({ access_token: 'a', refresh_token: 'r' }));
 
 // 古い形の DB (C1 の列が無い) を先に作っておく = initDB が列を足す道を通す
@@ -57,6 +62,7 @@ globalThis.fetch = async (url, opts) => {
   const q = new URLSearchParams(opts.body);
   const offset = Number(q.get('offset')), limit = Number(q.get('limit'));
   const list = u.endsWith('/api_v1_master_goods/search') ? ne.goods : ne.setgoods;
+  if (u.endsWith('/api_v1_master_setgoods/search')) ne.setFields = q.get('fields');
   return { ok: true, status: 200, json: async () => ({ result: 'success', data: list.slice(offset, offset + limit) }) };
 };
 const { fetchProducts, fetchSetProducts } = await quietly(() => import('../apps/warehouse/ne-api.js'));
@@ -89,7 +95,7 @@ await ta('[1] API の取込は元の値を JSON の文字列で残す (空文字
 });
 
 await ta('[2] 古い形の DB は列が足され、前からの行・その回に取れなかった行の元の値は NULL のまま (逆算しない)。作り直しの記録の前の行も番号は NULL', async () => {
-  for (const [t, c] of [['raw_ne_products', ['原価_src', '売価_src', '消費税率_src', '代表商品コード_src']], ['raw_ne_set_products', ['セット販売価格_src', '数量_src']],
+  for (const [t, c] of [['raw_ne_products', ['原価_src', '売価_src', '消費税率_src', '代表商品コード_src']], ['raw_ne_set_products', ['セット販売価格_src', '数量_src', '作成日']],
     ['m_products_builds', ['ne_products_complete_rev', 'ne_setproducts_complete_rev']]]) {
     for (const x of c) assert.ok(cols(t).includes(x), `${t}.${x}`);
   }
@@ -97,8 +103,8 @@ await ta('[2] 古い形の DB は列が足され、前からの行・その回�
   await quietly(fetchProducts);
   assert.deepEqual([row('old1').原価_src, row('old1').売価_src, row('old1').消費税率_src], [null, null, null]);
   assert.equal(row('old1').原価, 100);
-  const s = db().prepare("SELECT セット販売価格_src, 数量_src, 数量 FROM raw_ne_set_products WHERE セット商品コード = 'oldset'").get();
-  assert.deepEqual([s.セット販売価格_src, s.数量_src, s.数量], [null, null, 2]);
+  const s = db().prepare("SELECT セット販売価格_src, 数量_src, 数量, 作成日 FROM raw_ne_set_products WHERE セット商品コード = 'oldset'").get();
+  assert.deepEqual([s.セット販売価格_src, s.数量_src, s.数量, s.作成日], [null, null, 2, null]);
   const b = db().prepare("SELECT ne_products_complete_rev, ne_setproducts_complete_rev FROM m_products_builds WHERE build_id = 'mpb_old'").get();
   assert.deepEqual([b.ne_products_complete_rev, b.ne_setproducts_complete_rev], [null, null]);
 });
@@ -293,6 +299,95 @@ await ta('[8] NE のコードの元の書き方 (③b-1b): 保存の前に集め
     assert.equal(meta('ne_api_products_complete_at'), null);
     assert.equal(db().prepare("SELECT COUNT(*) AS n FROM raw_ne_code_spellings WHERE code_norm = 'zz-9'").get().n, 0);
   } finally { db().exec('DROP TRIGGER IF EXISTS t_sp_fail'); }
+});
+
+await ta('[9] セットの作成日 (set_goods_creation_date) を API に頼み raw_ne_set_products.作成日 に残す (親ごとに 1 つに決まるときだけ。無い・空・食い違い・空と日付の混在・同じ親 × 子の重複で違う日 = 全部の行を NULL) → 商品管理リストの snapshot の 登録日 (セットだけ・単品は今までどおり NE の商品の作成日)', async () => {
+  const D = (id, child, date) => ({ set_goods_id: id, set_goods_name: id, set_goods_selling_price: '1', set_goods_detail_goods_id: child, set_goods_detail_quantity: '1',
+    ...(date === undefined ? {} : { set_goods_creation_date: date }) });
+  ne.setgoods = [
+    D('SR1', 'G1', '2025-06-01 09:00:00'), D('SR1', 'G2', '2025-06-01 09:00:00'),
+    D('SR2', 'G1'),                                                              // 欠落
+    D('SR3', 'G1', '2024-01-01 00:00:00'), D('SR3', 'G2', '2024-01-02 00:00:00'),    // 構成の行で食い違い
+    D('SR4', 'G1', ''), D('SR4', 'G2', '2023-01-02 03:04:05'),                   // 空と日付の混在 = 分からない
+    D('Sr5', 'G1', '2022/7/8 10:00:00'),
+    D('SR6', 'G1', '2021-01-01 00:00:00'),
+    D('SR7', 'G1', '2021-01-01 00:00:00'),
+    D('SR8', 'G1', null),
+    D('SR9', 'G1', '2020-05-05 00:00:00'), D('SR9', 'G1', '2020-05-06 00:00:00'),    // 同じ親 × 子の重複で違う日 (保存すると後の行だけ残る)
+    D('SR10', 'G1', '2019-03-03 00:00:00'), D('SR10', 'G1', ' 2019-03-03 00:00:00 '),   // 同じ日の重複 (前後の空白は同じ扱い) = 使える
+    D('SR11', '', '2018-01-01 00:00:00'), D('SR11', 'G1', '2018-01-02 00:00:00'),   // 子のコードが空の行 (保存しない) の日付も比べる
+  ];
+  await quietly(fetchSetProducts);
+  assert.ok(ne.setFields.split(',').includes('set_goods_creation_date'), ne.setFields);
+  const sc = Object.fromEntries(db().prepare('SELECT セット商品コード AS s, 商品コード AS c, 作成日 AS d FROM raw_ne_set_products').all().map((r) => [`${r.s}/${r.c}`, r.d]));
+  assert.deepEqual(sc, {
+    'sr1/g1': '2025-06-01 09:00:00', 'sr1/g2': '2025-06-01 09:00:00', 'sr2/g1': null, 'sr3/g1': null, 'sr3/g2': null, 'sr4/g1': null, 'sr4/g2': null,
+    'sr5/g1': '2022/7/8 10:00:00', 'sr6/g1': '2021-01-01 00:00:00', 'sr7/g1': '2021-01-01 00:00:00', 'sr8/g1': null, 'sr9/g1': null,
+    'sr10/g1': '2019-03-03 00:00:00', 'sr11/g1': null,
+  });
+  const it = JSON.parse(meta('ne_api_setproducts_integrity'));
+  assert.deepEqual([it.creation_date_conflict_count, it.creation_date_conflicts], [4, ['sr3', 'sr4', 'sr9', 'sr11']]);
+  const insNe = db().prepare('INSERT OR REPLACE INTO raw_ne_products (商品コード, 商品名, 作成日, synced_at) VALUES (?, ?, ?, ?)');
+  insNe.run('g-reg', '単品', '2024-03-15 10:00:00', 'x');
+  insNe.run('g-noreg', '単品', '', 'x');
+  insNe.run('sr7', 'NE の商品にもあるセット', '2020-02-02 02:02:02', 'x');   // NE の商品の作成日がある = そちらが先 (今までどおり)
+  db().exec('DELETE FROM m_products');
+  const insM = db().prepare("INSERT INTO m_products (商品コード, 商品名, 商品区分, 原価状態, updated_at) VALUES (?, ?, ?, 'OK', 'x')");
+  for (const [c, k] of [['g-reg', '単品'], ['g-noreg', '単品'], ['sr1', 'セット'], ['sr2', 'セット'], ['sr3', 'セット'], ['sr4', 'セット'], ['sr5', 'セット'],
+    ['sr6', '単品'], ['sr7', 'セット'], ['sr8', 'セット'], ['sr9', 'セット'], ['sr10', 'セット'], ['sr11', 'セット'], ['ex1', '例外']]) insM.run(c, c, k);
+  const { buildProductManagementSnapshot } = await import('../apps/warehouse/build-product-management-snapshot.js');
+  const regOf = async () => {
+    const r = await quietly(() => buildProductManagementSnapshot());
+    return Object.fromEntries(db().prepare('SELECT 商品コード AS c, 登録日 AS d FROM product_management_snapshot_rows WHERE run_id = ?').all(r.run_id).map((x) => [x.c, x.d]));
+  };
+  const base = { 'g-reg': '2024-03-15 10:00:00', 'g-noreg': null, sr7: '2020-02-02 02:02:02', sr6: null, ex1: null };   // セットの作成日を使わなくても同じ行
+  const noSetDates = { ...base, sr1: null, sr2: null, sr3: null, sr4: null, sr5: null, sr8: null, sr9: null, sr10: null, sr11: null };
+  assert.deepEqual(await regOf(), {
+    ...base,
+    sr1: '2025-06-01 09:00:00', sr2: null, sr3: null, sr4: null, sr5: '2022/7/8 10:00:00',
+    // sr6 = 単品 (セットの表に同じコードがあってもセットの作成日は使わない)
+    sr8: null, sr9: null, sr10: '2019-03-03 00:00:00', sr11: null,
+  });
+  // 完了の印の後に raw が書き換わった (通し番号が進んだ) = 最新の API の完全な取得の世代ではない → セットの 登録日 は空
+  db().prepare("UPDATE raw_ne_set_products SET 数量 = 数量 WHERE セット商品コード = 'sr1'").run();
+  assert.deepEqual(await regOf(), noSetDates);
+  // API で取り直す → 使える / その後に一部だけ CSV の取込 (完了の印が消える・ほかの行の API の作成日は残る) → 空
+  await quietly(fetchSetProducts);
+  assert.equal((await regOf()).sr1, '2025-06-01 09:00:00');
+  runCsv('sets', [header(7), 'SR1,SR1,1,G1,1,0,']);
+  assert.deepEqual(db().prepare("SELECT 商品コード AS c, 作成日 AS d FROM raw_ne_set_products WHERE セット商品コード = 'sr1' ORDER BY 1").all(), [{ c: 'g1', d: null }, { c: 'g2', d: '2025-06-01 09:00:00' }]);
+  assert.equal(meta('ne_api_setproducts_complete_at'), null);
+  assert.deepEqual(await regOf(), noSetDates);
+});
+
+await ta('[10] snapshot は印・通し番号・行を 1 つの読み取りの取引で読む: 確かめた後に別の接続が CSV の取込と同じ書き換え (一部の行の置き換え・印を消す) をしても、確かめた完全な世代を読む (#1624 Codex R2 Medium)', async () => {
+  await quietly(fetchSetProducts);   // [9] の後の CSV で消えた印を API の取得で付け直す (同じ ne.setgoods)
+  const { buildProductManagementSnapshot } = await import('../apps/warehouse/build-product-management-snapshot.js');
+  const regOf = async (opts) => {
+    const r = await quietly(() => buildProductManagementSnapshot(opts));
+    return Object.fromEntries(db().prepare('SELECT 商品コード AS c, 登録日 AS d FROM product_management_snapshot_rows WHERE run_id = ?').all(r.run_id).map((x) => [x.c, x.d]));
+  };
+  const full = await regOf();
+  assert.deepEqual([full.sr1, full.sr5, full.sr10], ['2025-06-01 09:00:00', '2022/7/8 10:00:00', '2019-03-03 00:00:00']);
+  let wrote = false;
+  const got = await regOf({ _afterSetMarkCheck: () => {
+    // 2 つ目の接続 = 別のプロセスの CSV の取込 (csv-import.js と同じ: 一部の行を INSERT OR REPLACE・作成日は書かない・完了の印を消す)
+    const w = new Database(path.join(tmp, 'warehouse.db'));
+    try {
+      w.pragma('busy_timeout = 2000');
+      w.transaction(() => {
+        w.prepare("INSERT OR REPLACE INTO raw_ne_set_products (セット商品コード, セット商品名, セット販売価格, 商品コード, 数量, セット在庫数, 代表商品コード, synced_at) VALUES ('sr1', 'SR1', 1, 'g1', 1, 0, '', '2099-01-01 00:00:00')").run();
+        w.prepare("INSERT OR REPLACE INTO raw_ne_set_products (セット商品コード, セット商品名, セット販売価格, 商品コード, 数量, セット在庫数, 代表商品コード, synced_at) VALUES ('sr10', 'SR10', 1, 'g1', 1, 0, '', '2099-01-01 00:00:00')").run();
+        w.prepare("DELETE FROM sync_meta WHERE key LIKE 'ne_api_setproducts_complete%'").run();
+      })();
+      wrote = true;
+    } finally { w.close(); }
+  } });
+  assert.ok(wrote, '2 つ目の接続から書けた (WAL = 読み取りの取引は書き込みを止めない)');
+  assert.deepEqual(got, full);   // 確かめた世代 (書き換えの前の完全な世代) をそのまま読む = 残った行だけから日を採らない
+  // 書き換えの後の次の snapshot = 印が無い → セットの 登録日 は全部空
+  const after = await regOf();
+  assert.deepEqual([after.sr1, after.sr5, after.sr10, after['g-reg']], [null, null, null, '2024-03-15 10:00:00']);
 });
 
 globalThis.fetch = realFetch;

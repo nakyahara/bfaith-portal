@@ -9,6 +9,8 @@
  * 中原さんの定義 (2026-09-18):
  *   新商品 = **NE の商品登録日が過去3週間以内** かつ **一度も入庫履歴がない**
  *
+ * 🆕 (#1624・10/5) 今の決まり: 登録日は商品管理リスト snapshot の 登録日 (PML) を先に見て、無ければ mirror_products (下の ①)。
+ *   セット商品 (商品区分 = セット) は新商品の判定の対象外 = unknown (入荷するのは構成の単品)。下の説明は 2026-09-18 の初めの作り。
  * どのデータで判定するか (2026-09-18 に本番データで実在を確認):
  *   ①登録日   = mirror_products.new_product_launch_date
  *              miniPC で NE 商品マスタの 作成日 (goods_creation_date) から作られ、Render へ毎日
@@ -102,12 +104,16 @@ export function buildNewProductContext(db, codeKeys, { today = jstDateStr() } = 
   // ① 登録日。**商品管理リスト snapshot の 登録日 が正本** (Codex R1 #4)。
   //    mirror_products.new_product_launch_date は「発売日」として人が手で設定できる項目で、
   //    rebuild-m-products.js resolveLaunchDate が **手動値を NE の 作成日 より優先** する。
-  //    PML の 登録日 は build-product-management-snapshot.js が `ne.作成日 AS 登録日` として
-  //    そのまま写したもので、手が入らない。NE で今日登録した商品の判定を人の設定値で
-  //    取り逃さないよう、PML → mirror_products の順に見る。
+  //    PML の 登録日 は build-product-management-snapshot.js が NE の作成日 (単品 = goods_creation_date・
+  //    セット = set_goods_creation_date。README「新商品の定義」) をそのまま写したもので、手が入らない。
+  //    NE で今日登録した商品の判定を人の設定値で取り逃さないよう、PML → mirror_products の順に見る。
   //    表ごと無い / 空 = miniPC 同期前 → unknown に倒す (「取れなかった」を「新商品ではない」にしない)
   const launch = new Map();
   let anySource = false;
+  // 商品区分 (PML → mirror_products の順)。セットは判定の対象外 (#1624 Codex R1 Low): 入荷の行はロジザードの入荷 CSV の商品ID = 物の単位で、
+  //   NE のセットは構成の単品で入ってくる。セットの登録日は 2026-10 まで空 = いつも unknown だったので、セットの作成日が入っても今までどおり unknown に止める
+  //   (裏面ラベルの写真を必須にしない)
+  const kindOf = new Map();
 
   //   (a) 商品管理リスト (公開中の run のみ)。登録日と最終仕入日をまとめて引く
   const supplied = new Map();   // code_key → 最終仕入日 (空文字 = 一度も仕入なし)
@@ -117,9 +123,10 @@ export function buildNewProductContext(db, codeKeys, { today = jstDateStr() } = 
     if (pub && pub.run_id) {
       pmlReady = db.prepare('SELECT EXISTS (SELECT 1 FROM mirror_pml_snapshot_rows WHERE run_id = ?) AS e').get(pub.run_id).e === 1;
       anySource = anySource || pmlReady;
-      chunked(`SELECT LOWER(TRIM(商品コード)) AS k, 最終仕入日 AS d, 登録日 AS reg
+      chunked(`SELECT LOWER(TRIM(商品コード)) AS k, 最終仕入日 AS d, 登録日 AS reg, 商品区分 AS kind
         FROM mirror_pml_snapshot_rows WHERE run_id = ? AND LOWER(TRIM(商品コード)) IN (@IN@)`, (r) => {
         if (!r.k) return;
+        if (r.kind) kindOf.set(r.k, r.kind);
         supplied.set(r.k, r.d || '');
         if (r.reg) launch.set(r.k, r.reg);
       }, pub.run_id);
@@ -131,8 +138,9 @@ export function buildNewProductContext(db, codeKeys, { today = jstDateStr() } = 
   if (tableExists(db, 'mirror_products')) {
     mirrorReady = db.prepare('SELECT EXISTS (SELECT 1 FROM mirror_products) AS e').get().e === 1;
     anySource = anySource || mirrorReady;
-    chunked(`SELECT LOWER(TRIM(商品コード)) AS k, new_product_launch_date AS d
+    chunked(`SELECT LOWER(TRIM(商品コード)) AS k, new_product_launch_date AS d, 商品区分 AS kind
       FROM mirror_products WHERE LOWER(TRIM(商品コード)) IN (@IN@)`, (r) => {
+      if (r.k && !kindOf.has(r.k) && r.kind) kindOf.set(r.k, r.kind);
       if (r.k && !launch.has(r.k) && r.d) launch.set(r.k, r.d);
       if (r.k && !launch.has(r.k)) launch.set(r.k, null);   // 行はあるが登録日が空 = そう記録する
     });
@@ -159,6 +167,10 @@ export function buildNewProductContext(db, codeKeys, { today = jstDateStr() } = 
     // 登録日を引ける表が1つも来ていない → 判定材料が無い。止めない
     if (!anySource) {
       out.set(k, { verdict: 'unknown', launch_date: null, reason: '商品マスタがまだ届いていないため判定できません' });
+      continue;
+    }
+    if (kindOf.get(k) === 'セット') {
+      out.set(k, { verdict: 'unknown', launch_date: null, reason: 'セット商品は新商品の判定の対象外です (入荷するのは構成の単品)' });
       continue;
     }
     const d = normalizeDate(launch.get(k));

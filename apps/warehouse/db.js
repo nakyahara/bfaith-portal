@@ -193,6 +193,9 @@ function createTables() {
   // NE の元の値 (raw_ne_products と同じ契約。数量は parseInt(x) || 1 で不正と 1 を区別しないため)
   addColumnIfMissing('raw_ne_set_products', 'セット販売価格_src', 'TEXT');
   addColumnIfMissing('raw_ne_set_products', '数量_src', 'TEXT');
+  // NE のセット商品の作成日 (set_goods_creation_date。親ごとの値を構成の行それぞれに持つ)。商品管理リストの snapshot の 登録日 (セット) の材料。
+  //   API の取込だけが書く (CSV の取込・古い行は NULL = 分からない)
+  addColumnIfMissing('raw_ne_set_products', '作成日', 'TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_set_child ON raw_ne_set_products(商品コード)');
 
   // 4. ロジザード在庫（全件洗い替え）

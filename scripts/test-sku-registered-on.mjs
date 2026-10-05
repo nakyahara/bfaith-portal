@@ -10,7 +10,8 @@
  *   L 夜間ロード: 空の行だけ NE の作成日 (商品管理リストの公開 snapshot の 登録日) で埋める・読めない / 未来 / 行の無い商品は空のまま・
  *      0057 の前からあるセットは空のまま・新しいセット = 初めて見た日 (first_seen)・新しい単品 = NE の作成日で作る (無ければ空)・
  *      NE の値が後で変わっても上書きしない・ポータルで登録した商品 (portal) も上書きしない・値が同じ 2 回目は何も変わらない (記録も増えない)・
- *      snapshot が使えない日は触らない (翌晩に埋める)・mirror_products の new_product_launch_date (人が直せる発売日) は使わない
+ *      snapshot が使えない日は触らない (翌晩に埋める)・mirror_products の new_product_launch_date (人が直せる発売日) は使わない・
+ *      セットの作成日 (NE の set_goods_creation_date) が snapshot に来た晩は、空のセットも ne で埋める・新しいセットも ne で作る (L7)
  *   F 登録の関数 (ops.register_new_sku) の 0057 の作り直しは 0052 の本文と「SKU の INSERT に登録日 = v_today・portal を足した」所だけが違う・
  *      security definer・search_path・持ち主・権限は同じ / 古い形の INSERT で空のまま作った単品は、次の夜間ロードが NE の作成日で埋める
  *   B 0057 の前にポータルで登録した SKU (登録の状態の行 origin = new_entry) は 0057 が行を作った日 (JST)・portal で埋める (単品・セット・状態は問わない・backfill は空)・
@@ -471,6 +472,21 @@ await ta('[B] 0057 の前のポータルの登録: 0057 が登録の行の日 (J
   assert.deepEqual(await reg2('rb01'), ['2023-06-01', 'ne']);
   assert.equal((await q2("select count(*)::int as n from events.master_change_events where run_id = 'rb_1' and attribute like 'registered_on%' and entity_key ->> 'sku_id' in (select sku_id::text from core.skus where code in ('rp01', 'rp02', 'rpset1'))"))[0].n, 0);
   await pg2.close();
+});
+
+await ta('[L7] セットの作成日が snapshot の 登録日 に来た晩 (NE の set_goods_creation_date): 空のセットは ne で埋める・新しいセットは ne で作る・first_seen のセットは変えない', async () => {
+  assert.deepEqual(await regOf('rset1'), [null, null]);   // 0057 の前からあるセット (空)
+  assert.deepEqual(await regOf('rset3'), [null, null]);   // 古い夜間ロードの形で作ったセット (空)
+  assert.deepEqual(await regOf('rset2'), [LOAD_DAY, 'first_seen']);
+  mirrorExec("update mirror_pml_snapshot_rows set 登録日 = '2021-04-01 09:00:00' where 商品コード = 'rset1'");
+  mirrorExec("update mirror_pml_snapshot_rows set 登録日 = '2022/5/6 07:00:00' where 商品コード = 'rset3'");
+  mirrorExec("update mirror_pml_snapshot_rows set 登録日 = '2020-01-01 00:00:00' where 商品コード = 'rset2'");
+  addProduct('rset4', 'セット', '2026-09-30 12:00:00');
+  await load('rl_13');
+  assert.deepEqual(await regOf('rset1'), ['2021-04-01', 'ne']);
+  assert.deepEqual(await regOf('rset3'), ['2022-05-06', 'ne']);
+  assert.deepEqual(await regOf('rset4'), ['2026-09-30', 'ne']);
+  assert.deepEqual(await regOf('rset2'), [LOAD_DAY, 'first_seen']);   // 一度入った日は変えない
 });
 
 server.close();
