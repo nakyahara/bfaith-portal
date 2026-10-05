@@ -811,6 +811,58 @@ await ta('[26] 2026-10-05: 名前 = 商品コード は承認されていても 
   for (const [k, s] of Object.entries(COLUMNS)) if (s.cellRe) for (const v of [0.1, 0.08, 1, 1980, 999999999]) { const c = s.cell(v); if (c.ok) assert.match(c.cell, s.cellRe, `${k} ${v}`); }
 });
 
+await ta('[27] 直す前に作った・確かめた CSV (名前 = コード) は、確かめを押さなくても配らない (unsafe)・確かめると void・申告できない / 安全な古いファイルは今までどおり (#1629 Codex R1 High)', async () => {
+  const f = await freshDb();
+  const day = '2030-03-01', nowMs = at(day, 10);
+  const run1 = runId(day);
+  await writeDecisions(f.db, { compareRunId: run1, observedAt: new Date(at(day, 8)).toISOString(), decisions: [C.a001, C.q017, C.t001] });
+  const ev = async (c) => Number((await f.pg.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'setup@test') returning event_id`,
+    [c.fingerprint, JSON.stringify({ subject_key: c.subject_key, col: c.col, child: null, value: 'x' })])).rows[0].event_id);
+  // 直す前の作り方 = 照合が出した「NE を akadama-1 に」をそのまま CSV にした (今の buildCsv は作らない = byte 列を手で)
+  const oldFile = async (c, code, cell, state) => {
+    const bytes = Buffer.from(`syohin_code,syohin_name\r\n${code},${cell}\r\n`, 'utf8');
+    const e = (await f.pg.query(`insert into ops.ne_csv_exports (kind, col, ne_column, converter_version, encoding, trial, row_count, sha256, file_bytes, compare_run_id, created_by, created_at, state, checked_at, checked_run, checked_by)
+      values ('products', 'name', 'syohin_name', 'ne-csv-v2', 'utf8', true, 1, $1, $2, $3, 'old@test', $4, $5, $6, $7, $8) returning export_id`,
+    [sha(bytes), bytes, run1, new Date(at(day, 9)).toISOString(), state, state === 'checked' ? new Date(at(day, 9)).toISOString() : null, state === 'checked' ? run1 : null, state === 'checked' ? 'old@test' : null])).rows[0].export_id;
+    await f.pg.query(`insert into ops.ne_csv_export_rows (export_id, source, approved_event_id, fingerprint, code_norm, col, child, ne_code, target, cell) values ($1, 'fix_ne', $2, $3, $4, 'name', null, $5, $6::jsonb, $7)`,
+      [e, await ev(c), c.fingerprint, code.toLowerCase(), code, JSON.stringify({ subject_key: c.subject_key, col: 'name', child: null, value: cell }), cell]);
+    return Number(e);
+  };
+  const made = await oldFile(C.a001, 'akadama-1', 'akadama-1', 'made');
+  const checked = await oldFile(C.q017, 'akadama-2', 'AKADAMA-2', 'checked');
+  const safe = await oldFile(C.t001, 't001', '本物の名前', 'made');
+  // 配らない (確かめを押していなくても・確かめ済みでも)
+  for (const id of [made, checked]) {
+    const r = await csvMod.exportFile(f.db, id, { nowMs });
+    assert.deepEqual([r.state, r.reason, r.bytes], ['unsafe', 'name_is_code', null], String(id));
+  }
+  assert.equal((await csvMod.exportFile(f.db, safe, { nowMs })).bytes.toString('utf8'), 'syohin_code,syohin_name\r\nt001,本物の名前\r\n');   // 安全な古いファイルはそのまま
+  // 確かめ済みのファイルも申告できない
+  await assert.rejects(csvMod.declareExport(f.db, { actor: 'naka@test', exportId: checked, result: 'ok', nowMs }), (e) => e.code === 'unsafe' || /今の決まりでは使えません/.test(e.message));
+  // 確かめる = 外れて void (予約を外す = 作り直せる)
+  const ck = await csvMod.checkExport(f.db, { actor: 'naka@test', exportId: made, nowMs });
+  assert.deepEqual([ck.passed, ck.voided, ck.failures.map((x) => x.reason)], [false, true, ['unsafe:name_is_code']]);
+  assert.equal((await f.pg.query('select state from ops.ne_csv_exports where export_id = $1', [made])).rows[0].state, 'void');
+  // 値の形が崩れた古いファイル (税率 0.1) も配らない
+  assert.equal(csvMod.unsafeReason({ kind: 'products', col: 'tax_rate' }, [{ ne_code: 't-1', code_norm: 't-1', cell: '0.1' }]), 'cell_format');
+  assert.equal(csvMod.unsafeReason({ kind: 'products', col: 'tax_rate' }, [{ ne_code: 't-1', code_norm: 't-1', cell: '10' }]), null);
+  // 保存した byte 列が今の作り方と違う = 配らない
+  assert.equal(csvMod.unsafeReason({ kind: 'products', col: 'name' }, [{ ne_code: 't001', code_norm: 't001', cell: '名前' }], Buffer.from('syohin_code,syohin_name\r\nt001,別\r\n')), 'bytes_differ');
+  await f.pg.close();
+  // HTTP: 名前 = コードのファイルは 410 (unsafe)
+  const e2 = await (async () => {
+    const run2 = runId('2030-01-10');
+    const bytes = Buffer.from('syohin_code,syohin_name\r\nzz-1,ZZ-1\r\n', 'utf8');
+    const id = Number((await pg.query(`insert into ops.ne_csv_exports (kind, col, ne_column, converter_version, encoding, trial, row_count, sha256, file_bytes, compare_run_id, created_by, state)
+      values ('products', 'name', 'syohin_name', 'ne-csv-v2', 'utf8', true, 1, $1, $2, $3, 'old@test', 'made') returning export_id`, [sha(bytes), bytes, run2])).rows[0].export_id);
+    await pg.query(`insert into ops.ne_csv_export_rows (export_id, source, approved_event_id, fingerprint, code_norm, col, child, ne_code, target, cell) values ($1, 'fix_ne', $2, $3, 'zz-1', 'name', null, 'zz-1', $4::jsonb, 'ZZ-1')`,
+      [id, EV.a001, C.a001.fingerprint, JSON.stringify({ subject_key: 'value:zz-1', col: 'name', child: null, value: 'ZZ-1' })]);
+    return id;
+  })();
+  const r = await call('GET', `/api/csv/exports/${e2}/file`);
+  assert.deepEqual([r.status, r.j?.reason, r.j?.detail], [410, 'unsafe', 'name_is_code']);
+});
+
 server.close();
 await pg.close();
 console.log(`\n${passed} 件 ok${process.exitCode ? ' (NG あり)' : ''}`);

@@ -92,6 +92,24 @@ export function buildCsv(spec, rows) {
   return { bytes, sha256: crypto.createHash('sha256').update(bytes).digest('hex'), header: header.join(',') };
 }
 
+/**
+ * 保存したファイルを今の決まりで確かめ直す (直す前・古い版で作ったファイルを配らない・確かめ・申告で通さない。#1629 Codex R1 High)。
+ * 名前 = その行のコード (広い正規化で) / 値の形 (cellRe) / 今の buildCsv で作り直した byte 列が保存した byte 列と同じ。問題が無ければ null
+ * @param {{ kind, col }} e  ファイル / rows = 行 (row_id の順) / bytes = 保存した byte 列 (無ければ byte 列は照らさない)
+ */
+export function unsafeReason(e, rows, bytes = null) {
+  const spec = specOf(String(e.kind), String(e.col));
+  if (!spec) return 'col_not_csv';
+  if (spec.col === 'name' && rows.some((r) => nameIsCodeOf(String(r.cell), r.code_norm) || nameIsCodeOf(String(r.cell), r.ne_code))) return 'name_is_code';
+  let csv;
+  try { csv = buildCsv(spec, rows); } catch { return 'cell_format'; }
+  if (bytes && crypto.createHash('sha256').update(bytes).digest('hex') !== csv.sha256) return 'bytes_differ';
+  return null;
+}
+async function exportRowsOf(db, exportId) {
+  return (await db.query(`select ${ROW_COLS} from ops.ne_csv_export_rows where export_id = $1 order by row_id`, [exportId])).rows.map(shapeRow);
+}
+
 // ─────────── 時刻 (JST) ───────────
 export const jstDate = (ms) => new Date(ms + JST).toISOString().slice(0, 10);
 /** その JST の日の次の日の 0 時 (UTC の ms) */
@@ -376,6 +394,9 @@ export async function exportFile(db, exportId, { nowMs = Date.now() } = {}) {
   if (ex.state === 'declared' && !declaredUsable(ex, { run: (await todayRun(db, nowMs)).run, released: await releasedExports(db, [ex.export_id]), nowMs })) return { state: 'retired', file_name: fileNameOf(ex), bytes: null };
   const bytes = Buffer.from(e.file_bytes);
   if (crypto.createHash('sha256').update(bytes).digest('hex') !== e.sha256) throw new Error(`ファイル ${exportId} の sha256 が記録と違う`);
+  // 今の決まりで確かめ直す (直す前に作った・確かめたファイルも、名前 = コードなどを含めば配らない。確かめを押していなくても)
+  const unsafe = unsafeReason(ex, await exportRowsOf(db, ex.export_id), bytes);
+  if (unsafe) return { state: 'unsafe', reason: unsafe, file_name: fileNameOf(ex), bytes: null };
   return { state: e.state, file_name: fileNameOf(ex), bytes };
 }
 
@@ -460,6 +481,13 @@ export async function checkExport(db, { actor, exportId, nowMs = Date.now() }) {
     if (e.state === 'declared') throw new DecideError('取り込んだと申告したファイルは確かめ直さない', 'already_declared');
     needToday(await todayRun(db, nowMs));
     const rows = (await db.query(`select ${ROW_COLS} from ops.ne_csv_export_rows where export_id = $1 order by row_id`, [exportId])).rows.map(shapeRow);
+    // 今の決まりで確かめ直す (直す前に作ったファイル = 名前 = コードなど)。外れたら void (作り直せる)
+    const bytesRow = (await db.query('select file_bytes from ops.ne_csv_exports where export_id = $1', [exportId])).rows[0];
+    const unsafe = unsafeReason(e, rows, bytesRow ? Buffer.from(bytesRow.file_bytes) : null);
+    if (unsafe) {
+      await voidIn(db, exportId, 'check_failed', actor, nowMs);
+      return { passed: false, voided: true, failures: rows.map((r) => ({ row_id: r.row_id, code_norm: r.code_norm, fingerprint: r.fingerprint, reason: `unsafe:${unsafe}` })), run: null };
+    }
     await lockCandidates(db, rows.map((r) => r.fingerprint).filter(Boolean));
     // 照合の回は候補の行を取った後に読む (その間に入った新しい回で判定する。#1495 Codex R1 High)。この後に入った回は、申告のときに照らす
     const tr = await todayRun(db, nowMs);
@@ -508,6 +536,9 @@ export async function declareExport(db, { actor, exportId, result, note = null, 
     if (e.state === 'declared' && !declaredUsable(e, { run: tr.run, released: await releasedExports(db, [exportId]), nowMs })) {
       throw new DecideError('この申告済みのファイルはもう使えません (次の日になった・新しい照合があった・行の予約が外れた)。取り込み直すなら作り直してください', 'retired');
     }
+    // 今の決まりで確かめ直す (直す前に確かめたファイルを申告で通さない)
+    const unsafe = unsafeReason(e, await exportRowsOf(db, exportId));
+    if (unsafe) throw new DecideError(`このファイルは今の決まりでは使えません (${unsafe})。取り込まないで、作り直してください`, 'unsafe');
     await db.query(`insert into ops.ne_csv_attempts (export_id, declared_by, declared_at, result, note) values ($1, $2, $3, $4, $5)`, [exportId, actor, iso(nowMs), result, note || null]);
     if (e.state === 'declared') return { state: 'declared', first_declared_at: e.declared_at };
     if (result === 'rejected_all') { await voidIn(db, exportId, 'rejected_all', actor, nowMs); return { state: 'void' }; }

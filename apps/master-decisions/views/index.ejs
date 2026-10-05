@@ -99,7 +99,8 @@
   const REASON = { tax_fallback: '税率の補い', tax_unresolved: '税率が決まらない', exception_cost: '例外の原価', exception_tax_manual: '例外の税率', set_name_blank: 'セット名が空欄',
     set_price_from_goods: 'セット売価を商品表から', set_tax_from_components: 'セット税率を構成から', not_in_latest_fetch: '最新の取得に無い', 'load_rule:name_blank_to_code': '名前の空欄をコードで',
     manual: '手で入れた構成', parent_manual: '人が決めた代表 (親)', held_by_load: 'ロードが触らなかった', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', none: 'その他',
-    company_owned: '社内 (Company DB) の値が正', cdb_name_is_code: '社内の名前がコードのまま (仮の名前)' };
+    company_owned: '社内 (Company DB) の値が正', cdb_name_is_code: '社内の名前がコードのまま (仮の名前)',
+    name_like_code: '名前がコードに見える (確かめる)', cdb_zero_yen: '社内が 0 円 (NE は 0 を表せない)' };
   const CLS = { rule: '決まりで説明済み', rule_lag: '決まり (反映待ち)', held_by_load: 'ロードが保持', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', incomparable: '比べられない (NE の値が不正)' };
   const COL = { name: '商品名', handling: '取扱区分', tax_rate: '税率', standard_price_jpy: '売価', cost: '原価', primary_supplier: '代表の仕入先', components: '構成', exists: '有無', kind: '種類', parent: '代表 (親)' };
   const RES = { accept_difference: '差を残す', fix_ne: 'NE を直す', fix_cdb: '社内の値を直す', fix_input: '材料を直す', spec: '仕様を決める' };
@@ -115,7 +116,8 @@
   const showCdb = (col, v) => (isRate(col, v) ? esc(pct(v) + '% (' + v + ')') : show(v));
   const proposalText = (c) => { const p = c.proposal || {};
     if (p.op === 'set_ne_value') return 'NE を ' + (isRate(c.col, p.value) ? esc(String(pct(p.value))) + ' (%)' : show(p.value)) + ' に';
-    if (p.op === 'set_cdb_value') return '社内 (ポータル) の名前を NE の名前 ' + show(p.value) + ' に';
+    if (p.op === 'check_name') return '名前がコードで良いか確かめる (良ければ差を残す)';
+    if (p.op === 'decide_zero') return '社内の 0 円で良いか決める (良ければ差を残す・違えば社内を直す)';
     if (p.op === 'fill_cdb_name') return '社内 (ポータル) で本当の名前を入れる (NE も空)';
     if (p.op === 'decide_manual_priority') return '手の構成と NE のどちらを採るか'; if (p.op === 'fix_load_input') return '材料を直す'; if (p.op === 'decide_spec') return '仕様を決める'; return '決める'; };
   let items = [], selected = new Set(), latest = null;
