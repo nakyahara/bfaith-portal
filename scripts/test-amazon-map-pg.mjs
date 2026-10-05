@@ -88,8 +88,10 @@ try {
     assert.equal(r.ok, true, r.error);
     const before = await snap();
     assert.ok(before.comps.some((c) => c.listing_code === 'pm_1' && c.sort_order === 3));
-    const res = await applyMigrations(dbO, { log: () => {} });
+    const res = await applyMigrations(dbO, { log: () => {}, to: '0055' });
     assert.deepEqual(res.applied, ['0054', '0055']);   // 0055 = ④a の持ち主の epoch (表を足すだけ = ここも何も変えない)
+    assert.deepEqual(await snap(), before);
+    await applyMigrations(dbO, { log: () => {} });   // 0056 から後 (D-60 の権限・0057 の登録日 = 列を足すだけ) も流してから同じロードを確かめる
     assert.deepEqual(await snap(), before);
     const r2 = await loadWith(dbO, 'load_pg_1', MASTER_OWNERSHIP);
     assert.equal(r2.ok, true, r2.error); assert.equal(r2.summary.listing_components.applied, 0);

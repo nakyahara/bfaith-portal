@@ -535,7 +535,13 @@ await ta('[16] 原価を変える理由 (10/5): 既定 = メーカーからの�
 
 // ── 詳細検索・注文残・在庫 (PR2・10/5) ──
 const SHOT2 = process.env.MASTER_EDIT_UI_SHOTS2 || '';
-const cells = (p) => p.$$eval('#list-tbl tbody tr', (trs) => trs.map((tr) => { const t = [...tr.children].map((td) => td.textContent.replace(/\s+/g, ' ').trim()); return { code: t[0], stock: t[7], po: t[8] }; }));
+// 列の位置は見出しから (登録日の列 (0057) などで位置が変わっても同じ)
+const cells = (p) => p.$eval('#list-tbl', (tbl) => {
+  const h = [...tbl.querySelectorAll('thead th')].map((th) => th.textContent.trim());
+  const iS = h.findIndex((x) => x.startsWith('在庫'));
+  const iP = h.findIndex((x) => x.startsWith('注文残'));
+  return [...tbl.querySelectorAll('tbody tr')].map((tr) => { const t = [...tr.children].map((td) => td.textContent.replace(/\s+/g, ' ').trim()); return { code: t[0], stock: iS < 0 ? undefined : t[iS], po: iP < 0 ? undefined : t[iP] }; });
+});
 const advGo = async (p, fill) => {
   await p.goto(B + '/');
   await p.click('#adv > summary');
@@ -645,7 +651,7 @@ await ta('[21] 在庫の範囲で絞る = 一覧に出す値 (セットは作れ
   assert.deepEqual(await q({ codes: 'set001', stock_min: '1' }), ['set001'], '作れる数 5 は 1 以上に入る');
   assert.deepEqual(await q({ codes: 'set001', stock_max: '0' }), [], '作れる数 5 は 0 以下に入らない');
   assert.deepEqual(await q({ codes: 'set001\ns001\ns002', stock_min: '5', stock_max: '5' }), ['s002', 'set001'], '単品は在庫・セットは作れる数');
-  assert.equal(await p.textContent('#list-tbl tbody tr:has-text("set001") td:nth-child(8)'), '5作れる');
+  assert.equal(await p.textContent('#list-tbl tbody tr:has-text("set001") td:nth-child(9)'), '5作れる');   // 9 番目 = 在庫 (4 番目に登録日の列・0057)
 });
 
 await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 Codex R1 M3): 無い人 = 列・絞り込み・内訳を出さず「権限がないので出せません」', async (p) => {
@@ -654,7 +660,7 @@ await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 
     await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns002' }));
     assert.doesNotMatch(await p.textContent('#list-tbl thead'), /注文残/, '列を出さない');
     assert.deepEqual((await cells(p)).map((x) => x.code), ['k001', 's002']);
-    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td').count(), 9, '行の欄も 1 つ少ない');
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td').count(), 10, '行の欄も 1 つ少ない (11 → 10)');
     assert.equal(await p.locator('input[name="po"]').count(), 0, '「注文残あり」を出さない');
     assert.match(await p.textContent('#po-denied'), /注文残 \(発注アプリの権限がないので出せません\)/);
     // URL に po=1 を付けても、注文残のある商品だけに絞らない (どの商品に注文残があるかを出さない)

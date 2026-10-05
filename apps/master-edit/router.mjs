@@ -323,7 +323,7 @@ router.post('/api/search', (req, res) => {
   const f = normalizeFilters(b);
   const cond = Object.fromEntries(ADV_KEYS.filter((k) => f[k]).map((k) => [k, f[k]]));
   if (Buffer.byteLength(JSON.stringify(cond)) > SEARCH_COND_MAX_BYTES) return tooLarge(`検索の条件が大きすぎます (全部で ${SEARCH_COND_MAX_BYTES / 1024}KB まで。複数の欄を分けて検索してください)`);
-  const rest = Object.fromEntries(['q', 'kind', 'state', 'missing', 'reg', 'card', 'diff'].filter((k) => f[k]).map((k) => [k, f[k]]));
+  const rest = Object.fromEntries(['q', 'kind', 'state', 'missing', 'reg', 'card', 'diff', 'sort'].filter((k) => f[k]).map((k) => [k, f[k]]));
   const qs = new URLSearchParams({ ...rest, ...(Object.keys(cond).length ? { s: putSearch(cond, clock()) } : {}) }).toString();
   res.json({ ok: true, url: `${req.baseUrl}/${qs ? `?${qs}` : ''}` });
 });

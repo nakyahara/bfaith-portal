@@ -17,6 +17,7 @@ import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs
 import { latestRun } from '../master-decisions/decide.mjs';
 import { readCardEvent } from '../../lib/product-hub-outbox.mjs';
 import { regItemsOfSku } from '../../lib/master-reg-csv.mjs';
+import { hasRegisteredOn, LIST_SORTS, listOrderBy, parseNeCreationDate, REGISTERED_ON_SOURCES } from '../../lib/sku-registered-on.mjs';
 
 /** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0053) */
 async function selectableSuppliers(db) {
@@ -48,7 +49,7 @@ export const MULTI_MAX = 500;
 export const TAX_FILTERS = Object.freeze({ 8: '8%', 10: '10%' });
 export const SALES_FILTERS = Object.freeze({ 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' });
 /** 詳細検索の項目 (URL のクエリの名前)。これが 1 つでも入っていれば詳細検索の板を開いておく */
-export const ADV_KEYS = Object.freeze(['codes', 'jans', 'sups', 'parents', 'name', 'cost_min', 'cost_max', 'price_min', 'price_max', 'stock_min', 'stock_max', 'tax', 'sales', 'po']);
+export const ADV_KEYS = Object.freeze(['codes', 'jans', 'sups', 'parents', 'name', 'cost_min', 'cost_max', 'price_min', 'price_max', 'stock_min', 'stock_max', 'tax', 'sales', 'po', 'reg_from', 'reg_to']);
 /**
  * 改行・カンマ・空白・タブ・読点で区切った値 (前後の空白を除く・重複は 1 つ・空は捨てる)。
  * limit = 取り出す数の上限 (そこで走査を止める = 巨大な入力でも長く止まらない。#1620 Codex R2)。重複は Set で O(n)
@@ -67,6 +68,7 @@ export function splitMulti(s, limit = Infinity) {
 }
 /** 複数の欄 = 1 行 1 つ。MULTI_MAX + 1 件まで (1 件多く取って「500 件まで」を知らせる) */
 const multiText = (v) => { const xs = splitMulti(v, MULTI_MAX + 1); return xs.length ? xs.join('\n') : ''; };
+const dateText = (v) => parseNeCreationDate(String(v ?? '').trim().slice(0, 20)) || '';
 const intText = (v) => { const t = String(v ?? '').replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/[,，\s円]/g, ''); return /^\d{1,9}$/.test(t) ? String(Number(t)) : ''; };
 
 /** 一覧の絞り込みを決まった形に (知らない値は捨てる) */
@@ -81,6 +83,7 @@ export function normalizeFilters(q = {}) {
     reg: pick(String(q.reg ?? ''), REG_STATES),
     card: pick(String(q.card ?? ''), CARD_FILTERS),
     diff: q.diff === '1' ? '1' : '',
+    sort: pick(String(q.sort ?? ''), LIST_SORTS),   // 0057: '' = コード順 / reg_desc = 登録日の新しい順 (① の SQL の order by = ページ分けの前)
     // 詳細検索 (10/5 中原さん「NE の商品詳細検索のような」)。複数の欄は 1 行 1 つの文字に (URL に載る形)
     codes: multiText(q.codes), jans: multiText(q.jans), sups: multiText(q.sups), parents: multiText(q.parents),
     name: String(q.name ?? '').trim().slice(0, 200),   // POST の入口の上限 (SEARCH_VALUE_MAX.name = 200) と同じ (#1620 Codex R3 Low)
@@ -89,6 +92,8 @@ export function normalizeFilters(q = {}) {
     tax: pick(String(q.tax ?? ''), TAX_FILTERS),
     sales: pick(String(q.sales ?? ''), SALES_FILTERS),
     po: q.po === '1' ? '1' : '',
+    // 登録日の範囲 (0057)。'YYYY-MM-DD' (input type=date) か 'YYYY/M/D'。読めない日付は捨てる
+    reg_from: dateText(q.reg_from), reg_to: dateText(q.reg_to),
     // 長い詳細検索の条件の印 (search-token.mjs・router が中身に戻してから渡す)。形だけ確かめる
     s: TOKEN_RE.test(String(q.s ?? '')) ? String(q.s) : '',
     offset,
@@ -220,17 +225,27 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
   }
   const diffAvailable = await regclass(db, 'ops.master_decision_candidates');
   const run = diffAvailable ? await latestRun(db) : null;
+  const hasRegOn = await hasRegisteredOn(db);   // 0057 の前の DB = 登録日の列は無い = コード順・登録日の範囲は何も当てない
+  // 登録日の範囲 (0057)。空 (分からない) は範囲に入らない
+  if (f.reg_from || f.reg_to) {
+    if (!hasRegOn) where.push('false');
+    else {
+      if (f.reg_from) { params.push(f.reg_from); where.push(`s.registered_on >= $${params.length}::date`); }
+      if (f.reg_to) { params.push(f.reg_to); where.push(`s.registered_on <= $${params.length}::date`); }
+    }
+  }
   if (f.diff) {
     if (!run) where.push('false');
     else { params.push(run.compare_run_id); where.push(`s.code_norm in (select code_norm from ops.master_decision_candidates where last_seen_run = $${params.length})`); }
   }
-  // ① 絞り込みと並び (軽い列だけ)
+  // ① 絞り込みと並び (軽い列だけ)。並び (コード順 / 登録日の新しい順 = 空は最後・同じ日はコード順) はここの order by = ページ分けの前。
+  //   この後の JS の絞り込み (売上分類・セットの作れる数) は filter だけ = 並びを変えない
   const keys = (await db.query(`${costCte}select s.sku_id::text as sku_id, s.sku_kind, s.set_sales_class_override, p.sales_class
       from core.skus s
       left join core.products p on p.product_id = s.product_id
       ${costCte ? 'left join c on c.sku_id = s.sku_id' : ''}
      where ${where.join(' and ')}
-     order by s.code_norm`, params)).rows;
+     order by ${listOrderBy(f.sort, { alias: 's', hasColumn: hasRegOn })}`, params)).rows;
   /** セットの構成品の売上分類 (導く材料)。ids = セットの sku_id → Map<sku_id, [分類]> */
   const compClassesOf = async (ids) => {
     const m = new Map();
@@ -282,7 +297,8 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
       select s.sku_id::text as sku_id, s.code, s.code_norm, s.sku_kind, s.name, s.handling, s.tax_rate::text as tax_rate, s.tax_class,
         s.standard_price_jpy::text as standard_price, s.shipping_code, s.reorder_months::text as reorder_months, s.set_sales_class_override,
         p.sales_class, c.cost_jpy::text as cost_jpy, c.cost_source, c.cost_status, ps.code as primary_supplier,
-        ${hasReg ? '(select mr.state from ops.master_registrations mr where mr.sku_id = s.sku_id)' : 'null::text'} as reg_state
+        ${hasReg ? '(select mr.state from ops.master_registrations mr where mr.sku_id = s.sku_id)' : 'null::text'} as reg_state,
+        ${hasRegOn ? 's.registered_on::text as registered_on, s.registered_on_source' : 'null::text as registered_on, null::text as registered_on_source'}
       from core.skus s
       left join core.products p on p.product_id = s.product_id
       left join c on c.sku_id = s.sku_id
@@ -305,6 +321,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
       state: r.handling === 'discontinued' ? 'discontinued' : 'available',
       reg_state: r.reg_state ?? 'none',
       comp_count: isSet ? (compClasses.get(r.sku_id) || []).length : null,
+      registered_on: r.registered_on ?? null, registered_on_source: r.registered_on_source ?? null,
       // 参考 (ほかのアプリの値・読めなければ null): 注文残 = 発注アプリの台帳 / 在庫 = ロジザード (セットは作れる数)
       backorder: extras.backorders ? backorderOf(extras.backorders, r.code) : null,
       stock: isSet ? null : (extras.stock ? stockOf(extras.stock, r.code_norm) : null),
@@ -323,7 +340,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
   const CARD_FLAG = { pending: 'カード作成待ち', failed: 'カード作成待ち (失敗)', conflict: 'カードの衝突' };
   for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : []),
     ...(cardOf.has(r.sku_id) ? [CARD_FLAG[cardOf.get(r.sku_id)]] : [])];
-  return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable, notFound, multiCut };
+  return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable, notFound, multiCut, sorts: LIST_SORTS, registeredOnAvailable: hasRegOn };
 }
 
 /**
@@ -398,9 +415,13 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
     // 最近の変更 (画面の右の「最近の変更」と見出しの「最後に直した人」)。新しい順
     const recent = (await changesSince(db, { skuId: id, productId: cur.product_id, sinceEventId: null, limit: 30 })).reverse();
     const locks = await readFieldLocks(db, cur);
+    // 0057: 登録日 (見出しに出すだけ。保存の確かめ = editTokenOf には入れない)。0057 の前の DB = null
+    const registered = (await hasRegisteredOn(db))
+      ? (await db.query('select registered_on::text as date, registered_on_source as source from core.skus where sku_id = $1', [id])).rows[0] : null;
+    if (registered) registered.label = registered.source ? (REGISTERED_ON_SOURCES[registered.source] || registered.source) : null;
     locks.futureCost = await readFutureCostLocks(db, cur, today);
     return {
-      cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today, card, regItems, recent, locks,
+      cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today, card, regItems, recent, locks, registered,
       state: cur.handling === 'discontinued' ? 'discontinued' : 'available',
       derived: cur.sku_kind === 'set' ? setDerivations(cur) : null,
       fields: fieldOwnership(cur.sku_kind, ownership, open && newEntryWritable(phase, ownership)),
