@@ -95,6 +95,11 @@ console.log('1. 画面表示');
   check('pending (送信待ち) も要対応に出る (送信前に止められる)', html.includes('⏳送信待ち'));
   check('認証期限30日前警告が出る', html.includes('認証期限 残'));
   check('ナビに運用管理タブ', html.includes('運用管理'));
+  // ファビコン (2026-10-05): ブラウザのタブで他のポータル画面と見分ける
+  check('問い合わせ管理のファビコン (タブ・ホーム画面)',
+    html.includes('href="/app-icons/inquiry-hub-192.png"') && html.includes('href="/app-icons/inquiry-hub-180.png"')
+    && fs.existsSync(new URL('../../public/app-icons/inquiry-hub-192.png', import.meta.url))
+    && fs.existsSync(new URL('../../public/app-icons/inquiry-hub-180.png', import.meta.url)));
 }
 
 // ─── 1b. 詳細画面の本文表示 (空行圧縮+長文折りたたみ) ───
