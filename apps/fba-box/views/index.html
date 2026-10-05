@@ -828,9 +828,9 @@
         <h2>⚠ まだ入っていない商品があります</h2>
         <div class="msg" style="color:#495057">${esc(j.message)}</div>
         <div style="max-height:40vh; overflow-y:auto; margin:10px 0; background:#FFF5F5; border-radius:10px; padding:10px">
-          ${j.rows.map(x => `<div style="padding:5px 0; border-bottom:1px solid #FFE3E3"><b>${esc(x.planNo || '')}</b> ${esc(shortName(x.name, 22))} — 予定 ${x.planned}${x.extra ? ` (送る数 ${x.sendQty})` : ''} / 入れた ${x.placed}${x.shortage ? ' / 不足 ' + x.shortage : ''} → <b style="color:#C92A2A">残り ${x.remaining}</b></div>`).join('')}
+          ${j.rows.map(x => `<div style="padding:5px 0; border-bottom:1px solid #FFE3E3"><b>${esc(x.planNo || '')}</b> ${esc(shortName(x.name, 22))} — 予定 ${x.planned}${x.extra ? ` (送る数 ${x.sendQty})` : ''} / 入れた ${x.placed}${x.shortage ? ' / 不足 ' + x.shortage : ''} → <b style="color:#C92A2A">残り ${x.remaining}</b>${x.trim ? `<br><small style="color:#B5651D">${x.notShip ? `予定に届かない ${x.notShip} 個は「今回は納品しない」・` : ''}増やした分の ${x.trim} 個は増やすのをやめる</small>` : ''}</div>`).join('')}
         </div>
-        <div class="msg" style="color:#868E96">破損・自社出荷の引当などで納品しない場合はそのまま完了できます。残りは「今回は納品しない」として記録され、本社の画面に出ます</div>
+        <div class="msg" style="color:#868E96">破損・自社出荷の引当などで納品しない場合はそのまま完了できます。${(j.notShipTotal ?? 1) > 0 ? '予定に届かない残りは「今回は納品しない」として記録され、本社の画面に出ます' : ''}${j.trimTotal ? `${(j.notShipTotal ?? 1) > 0 ? '。' : ''}予定より増やした商品は、入れた数まで送る数を戻します` : ''}</div>
         <div class="grid2" style="margin-top:12px">
           <button class="bigbtn sub" id="f-back">戻って続ける</button>
           <button class="bigbtn red" id="f-go">それでも完了する</button>

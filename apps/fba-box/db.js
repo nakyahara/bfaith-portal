@@ -1030,10 +1030,18 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel, don
         message: `予定より多く入っている商品が ${over.length} 行あります。記録を取り消すか不足を解除してから完了してください` };
     }
     if (rows.length > 0 && !acknowledge) {
-      return { ok: false, error: 'incomplete', rows: rows.map((r) => ({ id: r.id, fnsku: r.fnsku, name: r.product_name, planNo: r.plan_no, planned: r.planned_qty, placed: r.placed, shortage: r.shortage, extra: r.extra, sendQty: r.planned_qty - r.shortage + r.extra, remaining: r.remaining })),
-        // 予定より増やした行の残りは「増やすのをやめる」だけで、予定に届かない分だけが「今回は納品しない」(Codex PR #1621 R2 Low)
-        message: `まだ入っていない商品が ${rows.length} 行あります (合計 ${rows.reduce((a, r) => a + Math.max(0, r.remaining), 0)} 個)。このまま完了すると、残りは「今回は納品しない」として記録されます`
-          + (rows.some((r) => r.extra > 0) ? '。予定より増やした商品は、予定を超えた分は増やすのをやめるだけです (予定に届かない分だけ「今回は納品しない」)' : '') };
+      // 残りの行き先を分けて言う (Codex PR #1621 R2/R3 Low): 予定に届かない分 = 「今回は納品しない」/ 予定より増やした分 = 増やすのをやめる
+      //   (下の確定処理と同じ式。増やした行は 予定 − 入れた数 だけが不足になる)
+      const out = rows.map((r) => {
+        const notShip = r.extra > 0 ? Math.max(0, r.planned_qty - r.placed) : Math.max(0, r.remaining);
+        return { id: r.id, fnsku: r.fnsku, name: r.product_name, planNo: r.plan_no, planned: r.planned_qty, placed: r.placed, shortage: r.shortage,
+          extra: r.extra, sendQty: r.planned_qty - r.shortage + r.extra, remaining: r.remaining, notShip, trim: Math.max(0, r.remaining - notShip) };
+      });
+      const notShipTotal = out.reduce((a, r) => a + r.notShip, 0), trimTotal = out.reduce((a, r) => a + r.trim, 0);
+      const what = [notShipTotal > 0 ? `予定に届かない ${notShipTotal} 個は「今回は納品しない」として記録されます` : null,
+        trimTotal > 0 ? `予定より増やした分の ${trimTotal} 個は、増やすのをやめます (「今回は納品しない」にはしません)` : null].filter(Boolean).join('。');
+      return { ok: false, error: 'incomplete', rows: out, notShipTotal, trimTotal,
+        message: `まだ入っていない商品が ${rows.length} 行あります (合計 ${out.reduce((a, r) => a + Math.max(0, r.remaining), 0)} 個)。このまま完了すると、${what}` };
     }
     const now = utcNow();
     const voided = [];

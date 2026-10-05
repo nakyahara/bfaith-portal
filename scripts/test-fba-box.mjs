@@ -1811,7 +1811,13 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     assert.deepEqual(inc.rows.map((x) => x.remaining).sort(), [1, 3]);
     // 確認の一覧は「送る数 6 / 入れた 5」で出せる・文に「増やすのをやめるだけ」(Codex PR #1621 R2 Low)
     assert.ok(inc.rows.every((x) => x.sendQty === 6 && x.extra === 2 && x.planned === 4), JSON.stringify(inc.rows));
-    assert.match(inc.message, /増やすのをやめるだけ/);
+    // 文は残りの行き先を分けて言う: a (6 送る・5 入れた) は増やした分 1 個をやめるだけ / b (6 送る・3 入れた) は予定に届かない 1 個 + 増やした分 2 個 (Codex R3 Low)
+    assert.equal(inc.notShipTotal, 1); assert.equal(inc.trimTotal, 3);
+    assert.match(inc.message, /予定に届かない 1 個は「今回は納品しない」/);
+    assert.match(inc.message, /増やした分の 3 個は、増やすのをやめます/);
+    assert.doesNotMatch(inc.message, /残りは「今回は納品しない」/);
+    const ia = inc.rows.find((x) => x.id === ra.id), ib = inc.rows.find((x) => x.id === rb.id);
+    assert.deepEqual([ia.notShip, ia.trim, ib.notShip, ib.trim], [0, 1, 1, 2]);
     const fin = db.finishRun({ runId: cx.runId, acknowledge: true, worker: staff });
     assert.equal(fin.ok, true);
     assert.equal(fin.notShipped, 1); assert.equal(fin.extraTrimmed, 1);   // a は増やした数を縮めただけ = 「納品しない」に数えない
