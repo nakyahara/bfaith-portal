@@ -1438,6 +1438,9 @@ await ta('[15] 一覧: 描画・検索・区分・状態・未入力 (売上分�
   assert.ok(!/いまは保存できません/.test(r.text));
   r = await call('GET', '/?q=S00&kind=single');
   assert.ok(r.text.includes('sku/s001') && !r.text.includes('sku/set001'));
+  // 参考の列: 発注アプリの台帳・ロジザードの写しが無い (この試験の DATA_DIR) = その列だけ「読めない」で一覧は出る (10/5 PR2)
+  assert.ok(r.text.includes('在庫<span class="thsub">読めない</span>') && r.text.includes('注文残<span class="thsub">読めない</span>'), '読めない列');
+  assert.ok((await call('GET', '/?po=1')).text.includes('当てはまる商品がありません'), '注文残が読めない = 注文残ありでは当てない');
   r = await call('GET', '/?q=' + encodeURIComponent('セット 5'));
   assert.ok(r.text.includes('sku/set005') && !r.text.includes('sku/s001"'));
   await pg.query("update core.products set sales_class = null where product_id = (select product_id from core.skus where code = 's003')");
@@ -1462,7 +1465,7 @@ await ta('[15] 一覧: 描画・検索・区分・状態・未入力 (売上分�
   assert.equal(bare.status, 301); assert.equal(bare.headers.get('location'), '/apps/master-edit/');
   const m = await call('GET', '/manual');
   assert.equal(m.status, 200);
-  for (const word of ['保存', '構成品を足す', '保存した後の値', 'メーカーからの値上げ通知', 'ひらがな・カタカナ・半角カナ', '画面を開き直す', '例外原価をやめる (構成品の合計に戻す)', 'NE との差', '未入力', '切替前', 'NE でやること', 'Ctrl + K', '捨てて移る', '🔒 の値']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
+  for (const word of ['保存', '構成品を足す', '保存した後の値', 'メーカーからの値上げ通知', 'ひらがな・カタカナ・半角カナ', '商品コードを複数', '作れる数', '画面を開き直す', '例外原価をやめる (構成品の合計に戻す)', 'NE との差', '未入力', '切替前', 'NE でやること', 'Ctrl + K', '捨てて移る', '🔒 の値']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
 });
 
 await ta('[15] 単品・セットの画面: 描画・画面の JS・編集の印・導く値・食い違い・JAN とロジザードは単品だけ・404', async () => {

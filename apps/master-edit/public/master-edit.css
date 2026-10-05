@@ -610,3 +610,36 @@ button:focus-visible, a:focus-visible, summary:focus-visible, select:focus-visib
 .saved-note { margin: -6px 0 16px; }
 .saved-note .rt { display: flex; align-items: center; gap: 6px; color: var(--ok); }
 .saved-note #saved-note-close { margin-top: 6px; }
+/* 詳細検索 (10/5) */
+details.adv[open] > summary { border-color: var(--line-strong); color: #fff; }
+.adv-grid { display: grid; grid-template-columns: minmax(220px, 1.2fr) repeat(2, minmax(200px, 1fr)); gap: 14px 18px; margin-top: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(8, 14, 27, 0.55); }
+.adv-grid label, .adv-grid .rng { display: flex; flex-direction: column; gap: 4px; font-size: 13.5px; color: var(--text2); }
+.adv-grid .lab { font-size: 12.5px; color: var(--muted); letter-spacing: 0.04em; }
+.adv-grid textarea.in { width: 100%; min-height: 58px; resize: vertical; font-family: var(--mono); font-size: 13px; line-height: 1.5; padding: 8px 10px; }
+.adv-grid .adv-codes { grid-row: span 2; }
+.adv-grid .adv-codes textarea.in { min-height: 150px; }
+.adv-grid .adv-col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.adv-grid input.in, .adv-grid select.in { height: 34px; font-size: 13.5px; }
+.adv-grid .rng { flex-direction: row; align-items: center; gap: 6px; }
+.adv-grid .rng .lab { width: 34px; flex: none; }
+.adv-grid .rng input.in { width: 0; flex: 1; min-width: 60px; text-align: right; font-variant-numeric: tabular-nums; }
+.adv-grid .chk { flex-direction: row; align-items: center; gap: 8px; }
+.adv-grid .adv-sels { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.adv-grid .adv-foot { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding-top: 4px; border-top: 1px solid var(--line-soft); }
+@media (max-width: 1100px) { .adv-grid { grid-template-columns: 1fr 1fr; } .adv-grid .adv-codes { grid-row: auto; } }
+/* 参考の列 (在庫 = ロジザード・注文残 = 発注アプリ): 灰色で小さめ */
+.tbl .ref { color: var(--muted); font-size: 13px; }
+.tbl th.ref { line-height: 1.25; }
+.tbl th .thsub { display: block; font-size: 11px; letter-spacing: 0.02em; color: var(--faint); font-weight: 400; }
+.tbl th.ref.stale .thsub { color: var(--warn); }
+.tbl th.ref.bad .thsub { color: var(--err); }
+/* 1 つの商品の画面の 在庫・注文残 (参考) */
+.refbox .big { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); }
+.refbox .when { font-size: 12.5px; color: var(--muted); }
+.refbox .when.stale { color: var(--warn); }
+.refbox .when.bad { color: var(--err); }
+.refbox table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 6px; }
+.refbox th, .refbox td { padding: 4px 6px; border-bottom: 1px solid var(--line-soft); text-align: left; white-space: nowrap; }
+.refbox th { color: var(--muted); font-weight: 500; }
+.refbox td.n, .refbox th.n { text-align: right; font-variant-numeric: tabular-nums; }
+.refbox .sup { white-space: normal; max-width: 110px; }

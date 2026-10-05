@@ -9,6 +9,7 @@
 import { MASTER_OWNERSHIP } from '../../config/master-ownership.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import { foldSearch, foldSql, likeOf } from './search-fold.mjs';
+import { backorderOf, backorderKeys, stockOf, buildableOf } from './extras.mjs';
 import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
@@ -41,6 +42,21 @@ async function regclass(db, name) {
   return (await db.query('select to_regclass($1) is not null as ok', [name])).rows[0].ok;
 }
 
+/** 詳細検索の「複数」の欄で受ける数の上限 (貼り付けた Excel の列。URL に載せるので多すぎない数) */
+export const MULTI_MAX = 500;
+export const TAX_FILTERS = Object.freeze({ 8: '8%', 10: '10%' });
+export const SALES_FILTERS = Object.freeze({ 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' });
+/** 詳細検索の項目 (URL のクエリの名前)。これが 1 つでも入っていれば詳細検索の板を開いておく */
+export const ADV_KEYS = Object.freeze(['codes', 'jans', 'sups', 'parents', 'name', 'cost_min', 'cost_max', 'price_min', 'price_max', 'stock_min', 'stock_max', 'tax', 'sales', 'po']);
+/** 改行・カンマ・空白・タブ・読点で区切った値 (前後の空白を除く・重複は 1 つ・空は捨てる) */
+export function splitMulti(s) {
+  const out = [];
+  for (const x of String(s ?? '').split(/[\s,、，;；]+/)) { const v = x.trim(); if (v && !out.includes(v)) out.push(v); }
+  return out;
+}
+const multiText = (v) => { const xs = splitMulti(v); return xs.length ? xs.join('\n') : ''; };
+const intText = (v) => { const t = String(v ?? '').replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/[,，\s円]/g, ''); return /^\d{1,9}$/.test(t) ? String(Number(t)) : ''; };
+
 /** 一覧の絞り込みを決まった形に (知らない値は捨てる) */
 export function normalizeFilters(q = {}) {
   const pick = (v, allowed) => (Object.prototype.hasOwnProperty.call(allowed, v) ? v : '');
@@ -53,6 +69,14 @@ export function normalizeFilters(q = {}) {
     reg: pick(String(q.reg ?? ''), REG_STATES),
     card: pick(String(q.card ?? ''), CARD_FILTERS),
     diff: q.diff === '1' ? '1' : '',
+    // 詳細検索 (10/5 中原さん「NE の商品詳細検索のような」)。複数の欄は 1 行 1 つの文字に (URL に載る形)
+    codes: multiText(q.codes), jans: multiText(q.jans), sups: multiText(q.sups), parents: multiText(q.parents),
+    name: String(q.name ?? '').trim().slice(0, 60),
+    cost_min: intText(q.cost_min), cost_max: intText(q.cost_max), price_min: intText(q.price_min), price_max: intText(q.price_max),
+    stock_min: intText(q.stock_min), stock_max: intText(q.stock_max),
+    tax: pick(String(q.tax ?? ''), TAX_FILTERS),
+    sales: pick(String(q.sales ?? ''), SALES_FILTERS),
+    po: q.po === '1' ? '1' : '',
     offset,
   };
 }
@@ -74,7 +98,7 @@ const costTodaySql = (dayP, idsP = null) => `select distinct on (y.sku_id) y.sku
  *    今は ① 絞り込みと並びだけの軽い読み (原価が要るのは「原価が未入力」のときだけ・1 回の集合) → ② このページの 100 件だけ中身を読む (原価・仕入先も 1 回の集合)。
  *    値・並び・件数は前と同じ (試験 test-master-edit で前の形と比べる)
  */
-export async function listSkus(db, filters, { now = new Date() } = {}) {
+export async function listSkus(db, filters, { now = new Date(), extras = {} } = {}) {
   const f = normalizeFilters(filters);
   const today = jstDate(now);
   const params = [COMPANY_ID];
@@ -99,10 +123,71 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   if (f.missing === 'shipping') where.push('s.shipping_code is null');
   if (f.missing === 'reorder') where.push('s.reorder_months is null');
   let costCte = '';
-  if (f.missing === 'cost') {
+  if (f.missing === 'cost' || f.cost_min || f.cost_max) {
     params.push(today);
     costCte = `with c as (${costTodaySql(params.length)}) `;
-    where.push(`coalesce(c.cost_status not in ('COMPLETE', 'OVERRIDDEN'), true)`);
+    if (f.missing === 'cost') where.push(`coalesce(c.cost_status not in ('COMPLETE', 'OVERRIDDEN'), true)`);
+    // 原価の範囲 = 一覧に出す原価 (その日の原価で、決まっている = COMPLETE / OVERRIDDEN) だけ。未入力は範囲に入らない
+    if (f.cost_min) { params.push(Number(f.cost_min)); where.push(`c.cost_status in ('COMPLETE', 'OVERRIDDEN') and c.cost_jpy >= $${params.length}`); }
+    if (f.cost_max) { params.push(Number(f.cost_max)); where.push(`c.cost_status in ('COMPLETE', 'OVERRIDDEN') and c.cost_jpy <= $${params.length}`); }
+  }
+  // ── 詳細検索 (10/5)。複数の値は 1 本の SQL の = any(配列) ──
+  const notFound = [];
+  let multiCut = false;
+  const multi = (s) => { const xs = splitMulti(s); if (xs.length > MULTI_MAX) multiCut = true; return xs.slice(0, MULTI_MAX); };
+  if (f.codes) {
+    // 商品コード (複数) = ぴったり (大文字小文字・全角半角は同じ = NE のコードの正規化)。見つからないコードは別に返す
+    const raw = multi(f.codes);
+    const norms = raw.map((x) => normSku(x));
+    const found = new Set((await db.query('select code_norm from core.skus where company_id = $1 and code_norm = any($2::text[])', [COMPANY_ID, norms])).rows.map((r) => r.code_norm));
+    raw.forEach((x, i) => { if (!found.has(norms[i])) notFound.push(x); });
+    params.push(norms); where.push(`s.code_norm = any($${params.length}::text[])`);
+  }
+  if (f.jans) {
+    params.push(multi(f.jans).map((x) => normSku(x)));
+    where.push(`exists (select 1 from core.external_ids e where e.entity_type = 'product' and e.entity_id = s.product_id and e.system = 'jan' and e.id_kind = 'jan'
+                 and e.valid_to is null and e.external_norm = any($${params.length}::text[]))`);
+  }
+  if (f.sups) {
+    // 仕入先コード (複数) = 代表の仕入先 (一覧の「仕入先」と同じ)。先頭の 0 の有無は同じ ('0001' と '1')
+    const xs = multi(f.sups).map((x) => normSku(x));
+    params.push(xs.map((x) => x.replace(/^0+(?=.)/, '')));
+    where.push(`exists (select 1 from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id
+                 where x.sku_id = s.sku_id and x.is_primary and regexp_replace(sp.code_norm, '^0+(?=.)', '') = any($${params.length}::text[]))`);
+  }
+  if (f.parents) {
+    // 代表 (親) の商品コード (複数) = その代表の商品 (子) と代表そのもの
+    params.push(multi(f.parents).map((x) => normSku(x)));
+    where.push(`(s.code_norm = any($${params.length}::text[])
+      or exists (select 1 from core.skus ps where ps.company_id = s.company_id and ps.sku_kind = 'single' and ps.product_id = p.parent_product_id and ps.code_norm = any($${params.length}::text[])))`);
+  }
+  if (f.name) {
+    const fold = foldSql(params);
+    params.push(likeOf(foldSearch(f.name)));
+    where.push(`${fold('s.name')} like $${params.length}`);
+  }
+  if (f.price_min) { params.push(Number(f.price_min)); where.push(`s.standard_price_jpy >= $${params.length}`); }
+  if (f.price_max) { params.push(Number(f.price_max)); where.push(`s.standard_price_jpy <= $${params.length}`); }
+  if (f.tax) { params.push(Number(f.tax) / 100); where.push(`s.tax_rate = $${params.length}::numeric`); }
+  // 注文残あり (発注アプリの台帳)。読めないときは何も当てない (読めないことは画面に出す)
+  if (f.po) {
+    if (!extras.backorders || !extras.backorders.ok) where.push('false');
+    else { params.push(backorderKeys(extras.backorders)); where.push(`lower(trim(s.code)) = any($${params.length}::text[])`); }
+  }
+  // 在庫 (ロジザード) の範囲。写しに無いコード = 0。読めないときは何も当てない
+  if (f.stock_min || f.stock_max) {
+    const st = extras.stock;
+    if (!st || !st.ok) where.push('false');
+    else {
+      const lo = f.stock_min ? Number(f.stock_min) : -Infinity, hi = f.stock_max ? Number(f.stock_max) : Infinity;
+      params.push([...st.map].filter(([, n]) => n >= lo && n <= hi).map(([k]) => k));
+      const inRange = params.length;
+      if (lo <= 0 && hi >= 0) {
+        // 0 が範囲に入る = 写しに無いコード (在庫 0) も当てる。🚨 使わない $番号を足さない (型が決まらず SQL が落ちる)
+        params.push([...st.map.keys()]);
+        where.push(`(s.code_norm = any($${inRange}::text[]) or not (s.code_norm = any($${params.length}::text[])))`);
+      } else where.push(`s.code_norm = any($${inRange}::text[])`);
+    }
   }
   // 登録の状態とカードは別々の絞り込み (両方 = 両方に合う商品。PR #1566 Codex R2 Low)
   const hasReg = await regclass(db, 'ops.master_registrations');
@@ -144,10 +229,11 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   const salesOf = (r, comp) => (r.sku_kind === 'set' ? deriveSetSalesClassCdb(r.set_sales_class_override, comp.get(r.sku_id) || []) : num(r.sales_class));
   let matched = keys;
   let compClasses = null;
-  // 売上分類の未入力 = セットは構成品から導く (保存していない) ので、絞った全部のセットを導いてから JS で絞る
-  if (f.missing === 'sales') {
+  // 売上分類の未入力・売上分類で絞る = セットは構成品から導く (保存していない) ので、絞った全部のセットを導いてから JS で絞る
+  if (f.missing === 'sales' || f.sales) {
     compClasses = await compClassesOf(keys.filter((r) => r.sku_kind === 'set').map((r) => r.sku_id));
-    matched = keys.filter((r) => salesOf(r, compClasses) == null && r.sku_kind !== 'exception');
+    if (f.missing === 'sales') matched = matched.filter((r) => salesOf(r, compClasses) == null && r.sku_kind !== 'exception');
+    if (f.sales) matched = matched.filter((r) => salesOf(r, compClasses) === Number(f.sales));
   }
   const pageIds = matched.slice(f.offset, f.offset + LIST_LIMIT).map((r) => r.sku_id);
   // ② このページの分だけ中身を読む
@@ -168,6 +254,16 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
     for (const r of rows) rowsById.set(r.sku_id, r);
   }
   if (!compClasses) compClasses = await compClassesOf(pageIds.filter((id) => rowsById.get(id)?.sku_kind === 'set'));
+  // セットの構成品 (作れる数の材料。このページのセットだけ・在庫が読めたときだけ)
+  const compsOf = new Map();
+  const pageSetIds = pageIds.filter((id) => rowsById.get(id)?.sku_kind === 'set');
+  if (pageSetIds.length && extras.stock && extras.stock.ok) {
+    for (const c of (await db.query(`select c.parent_sku_id::text as parent, k.code_norm, c.qty from core.sku_components c join core.skus k on k.sku_id = c.child_sku_id
+        where c.parent_sku_id = any($1::bigint[])`, [pageSetIds])).rows) {
+      if (!compsOf.has(c.parent)) compsOf.set(c.parent, []);
+      compsOf.get(c.parent).push({ code_norm: c.code_norm, qty: Number(c.qty) });
+    }
+  }
   const pageRows = pageIds.map((id) => rowsById.get(id)).filter(Boolean).map((r) => {
     const isSet = r.sku_kind === 'set';
     return {
@@ -180,6 +276,10 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
       state: r.handling === 'discontinued' ? 'discontinued' : 'available',
       reg_state: r.reg_state ?? 'none',
       comp_count: isSet ? (compClasses.get(r.sku_id) || []).length : null,
+      // 参考 (ほかのアプリの値・読めなければ null): 注文残 = 発注アプリの台帳 / 在庫 = ロジザード (セットは作れる数)
+      backorder: extras.backorders ? backorderOf(extras.backorders, r.code) : null,
+      stock: isSet ? null : (extras.stock ? stockOf(extras.stock, r.code_norm) : null),
+      buildable: isSet ? buildableOf(extras.stock, compsOf.get(r.sku_id)) : null,
     };
   });
   // ⚠ の印 (NE との差・CSV 待ち・構成の依頼) はこのページの分だけ
@@ -194,7 +294,7 @@ export async function listSkus(db, filters, { now = new Date() } = {}) {
   const CARD_FLAG = { pending: 'カード作成待ち', failed: 'カード作成待ち (失敗)', conflict: 'カードの衝突' };
   for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : []),
     ...(cardOf.has(r.sku_id) ? [CARD_FLAG[cardOf.get(r.sku_id)]] : [])];
-  return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable };
+  return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable, notFound, multiCut };
 }
 
 /**

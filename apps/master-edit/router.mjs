@@ -53,7 +53,8 @@ import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFE
 import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
-import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS } from './read.mjs';
+import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX } from './read.mjs';
+import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
@@ -265,10 +266,12 @@ router.get('/', (req, res) => {
   if (!String(req.originalUrl || '').split('?')[0].endsWith('/')) return res.redirect(301, `${req.baseUrl}/`);
   return withPgPage(req, res, async (db, dbError) => {
     const filters = normalizeFilters(req.query);
-    const data = db ? await listSkus(db, filters, { now: new Date(clock()) }) : { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false };
+    // 参考の値 (注文残 = 発注アプリ・在庫 = ロジザード)。読めなくても一覧は出す (その欄だけ「読めない」)
+    const extras = { backorders: readBackorders(), stock: await readWarehouseStock({ now: clock() }) };
+    const data = db ? await listSkus(db, filters, { now: new Date(clock()), extras }) : { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false, notFound: [], multiCut: false };
     const phase = db ? await readCutoverPhase(db) : null;
     const counts = db ? await listCounts(db, { now: new Date(clock()) }) : null;
-    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, fmt });
+    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, fmt });
   });
 });
 router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), ui2: true, nav: 'manual', MAX_COMPONENTS }));
@@ -298,9 +301,17 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
   const page = db ? await readSkuPage(db, req.params.code, { now, ownership: ownershipNow(), open: isOpen() }) : null;
   if (db && !page) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), ui2: true, nav: 'list', message: `商品コード ${req.params.code} は Company DB にありません` });
   const shipping = page ? await shippingRatesProvider() : null;
+  // 参考の値: 注文残の内訳 (発注アプリ)・在庫 (ロジザード。セットは構成品から作れる数)
+  const stock = page ? await readWarehouseStock({ now: clock() }) : null;
+  const extras = page ? {
+    backorder: page.cur.sku_kind === 'set' ? null : readBackorderLines(page.cur.code),
+    stock,
+    qty: page.cur.sku_kind === 'set' ? null : stockOf(stock, page.cur.code_norm),
+    buildable: page.cur.sku_kind === 'set' ? buildableOf(stock, (page.cur.components || []).map((x) => ({ code_norm: normSku(x.code), qty: x.qty }))) : null,
+  } : null;
   res.render(view('sku.ejs'), {
     ...pageLocals(req, page ? page.phase : null), ui2: true, nav: 'list', dbError, page, FIELD_DEFS: page ? fieldsOf(page.cur.sku_kind) : {}, REG_FIELDS: page ? (REG_CSV_FIELDS[page.cur.sku_kind] || []) : [], code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,
-    shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
+    shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null, extras,
   });
 }));
 router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
