@@ -311,7 +311,7 @@ router.post('/api/search', (req, res) => {
   // 🚨 境界で大きさを決める (#1620 Codex R2 M1: 巨大な条件を印の表に溜めない・走査で長く止まらない)。超えたら 413 と分かる文
   const tooLarge = (message) => res.status(413).json({ ok: false, error: 'too_large', message });
   for (const [k, v] of Object.entries(b)) {
-    if (v != null && typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') return res.status(400).json({ ok: false, error: `${k} の形が違います` });
+    if (typeof v !== 'string') return res.status(400).json({ ok: false, error: `${k} の形が違います (文字だけ)` });   // 画面は FormData の文字だけを送る (#1620 Codex R3 Low)
     if (String(v ?? '').length > SEARCH_FIELD_MAX_CHARS) return tooLarge(`${SEARCH_LABELS[k] || k} が長すぎます (1 つの欄は ${SEARCH_FIELD_MAX_CHARS.toLocaleString('ja-JP')} 字まで・複数の欄は ${MULTI_MAX} 件まで)`);
   }
   for (const [k, max] of Object.entries(SEARCH_VALUE_MAX)) {

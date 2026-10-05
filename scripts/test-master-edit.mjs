@@ -1496,6 +1496,10 @@ await ta('[15] 詳細検索の印 (POST /api/search) の大きさの上限 (#162
   r = await call('POST', '/api/search', { body: { name: 'あ'.repeat(201) } });
   assert.equal(r.status, 413); assert.match(r.j.message, /商品名 は 1 つ 200 字まで/);
   assert.equal((await call('POST', '/api/search', { body: { codes: ['x'] } })).status, 400, '文字でない値');
+  // #1620 Codex R3 Low: 数・真偽・null も 400 (文字だけ) / 商品名は 200 字まで検索に使う (61〜200 字を黙って切らない)
+  for (const body of [{ codes: 123 }, { name: true }, { jans: null }]) assert.equal((await call('POST', '/api/search', { body })).status, 400, `文字でない値 ${JSON.stringify(body)}`);
+  const { normalizeFilters: nf } = await import('../apps/master-edit/read.mjs');
+  assert.equal(nf({ name: 'い'.repeat(150) }).name.length, 150, '商品名 150 字はそのまま使う');
   // 条件全体 64KB まで (各欄 500 件 × 64 字 = 4 欄で 128KB = 断る)
   const big = Array.from({ length: 500 }, (_, i) => `${String(i).padStart(3, '0')}${'z'.repeat(61)}`).join('\n');
   r = await call('POST', '/api/search', { body: { codes: big, parents: big, sups: big } });

@@ -83,7 +83,7 @@ export function normalizeFilters(q = {}) {
     diff: q.diff === '1' ? '1' : '',
     // 詳細検索 (10/5 中原さん「NE の商品詳細検索のような」)。複数の欄は 1 行 1 つの文字に (URL に載る形)
     codes: multiText(q.codes), jans: multiText(q.jans), sups: multiText(q.sups), parents: multiText(q.parents),
-    name: String(q.name ?? '').trim().slice(0, 60),
+    name: String(q.name ?? '').trim().slice(0, 200),   // POST の入口の上限 (SEARCH_VALUE_MAX.name = 200) と同じ (#1620 Codex R3 Low)
     cost_min: intText(q.cost_min), cost_max: intText(q.cost_max), price_min: intText(q.price_min), price_max: intText(q.price_max),
     stock_min: intText(q.stock_min), stock_max: intText(q.stock_max),
     tax: pick(String(q.tax ?? ''), TAX_FILTERS),
