@@ -16,8 +16,11 @@
  * いつまでの数か = 公開の回の src_velocity_as_of (前日)。毎朝 07:00 の daily-sync で前日までに進む (11:30 まで自動の再試行)。
  *   古い = 前日より前 (正午までは前々日まで待つ = 朝の取込の前)。商品管理リストの回が作れない日 (販売速度が 2 日より古い・FBA と NE の重なり) は前の回のまま = 古いと出る
  * 読めない (写しがまだ無い・表が無い) = その欄だけ「読めない」(画面は出る)。Company DB の権限は使わない (create-master-edit-roles.mjs は変えない)
+ * 🚨 公開の回の切り替え (同期 = 古い回の明細を消してポインタを差し替える) を挟んでも食い違わない (#1627 Codex R1 M1): 明細を読むときは
+ *   ポインタを読み直して明細と同じ読み取りの取引で読む (発注アプリの loadPml と同じ)。回が変わっていたら新しい回で読み、run (見出しの日付) もその回に直す
  */
 import { normProductCode } from '../purchase-orders/db.js';
+import { checkDeadline, ListTimeoutError } from './deadline.mjs';
 
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 864e5;
@@ -53,14 +56,31 @@ export function salesStale(asOf, nowMs) {
  * 公開の回 (いつまでの数か)。
  * { ok: true, runId, asOf: 'YYYY-MM-DD' (この日まで), from7, from30, stale } / { ok: false, error, reason: 'no_data' | 'error' }
  */
+const PUB_SQL = 'select run_id, src_velocity_as_of from mirror_pml_published where id = 1';
+/** 公開の回の行 → run (読めない形なら ok: false) */
+function runOf(pub, now) {
+  if (!pub || !pub.run_id) return { ok: false, error: '商品管理リスト (販売数) の写しがまだありません', reason: 'no_data' };
+  const asOf = String(pub.src_velocity_as_of ?? '').slice(0, 10);
+  if (!YMD.test(asOf)) return { ok: false, error: '販売数がいつまでの数か分かりません (商品管理リストの回に日付が無い)', reason: 'no_data' };
+  return { ok: true, runId: String(pub.run_id), asOf, from7: addDays(asOf, -6), from30: addDays(asOf, -29), stale: salesStale(asOf, now), now };
+}
+/** 読み取りの取引 (better-sqlite3 の transaction。無い db = そのまま) */
+const inTx = (db, fn) => (typeof db.transaction === 'function' ? db.transaction(fn)() : fn());
+/**
+ * 取引の中で公開の回を読み直す。変わっていたら run をその回に直す (同じ物を見出しにも使う)。読めない形になった = ok: false に直して null を返す
+ */
+function recheckRun(db, run) {
+  const cur = runOf(db.prepare(PUB_SQL).get(), run.now ?? Date.now());
+  if (cur.ok && cur.runId === run.runId) return run;
+  for (const k of Object.keys(run)) delete run[k];
+  Object.assign(run, cur, cur.ok ? { switched: true } : {});
+  return run.ok ? run : null;
+}
+
 export async function readSalesRun({ now = Date.now() } = {}) {
   try {
     const db = await mirrorDb();
-    const pub = db.prepare('select run_id, src_velocity_as_of from mirror_pml_published where id = 1').get();
-    if (!pub || !pub.run_id) return { ok: false, error: '商品管理リスト (販売数) の写しがまだありません', reason: 'no_data' };
-    const asOf = String(pub.src_velocity_as_of ?? '').slice(0, 10);
-    if (!YMD.test(asOf)) return { ok: false, error: '販売数がいつまでの数か分かりません (商品管理リストの回に日付が無い)', reason: 'no_data' };
-    return { ok: true, runId: String(pub.run_id), asOf, from7: addDays(asOf, -6), from30: addDays(asOf, -29), stale: salesStale(asOf, now) };
+    return runOf(db.prepare(PUB_SQL).get(), now);
   } catch (e) {
     console.error(`[master-edit] 販売数 (商品管理リスト) を読めない: ${e && e.message}`);
     return { ok: false, error: '販売数 (商品管理リスト) を読めません', reason: 'error' };
@@ -77,21 +97,27 @@ const CHUNK = 200;
  * 一覧のページの商品コードの販売数。Map(normProductCode(コード) → { d7, d30, d7fba, d7other, d30fba, d30other })。
  * Map に無いコード = 商品管理リストに無い (NE にまだ無い商品など。0 とは分ける)。読めない回 (run.ok でない) = null
  * 索引 idx_mpsr_run_code_norm (run_id, LOWER(TRIM(商品コード))) で、そのページのコードだけ引く (全部の商品を読まない)
+ * ポインタの読み直しと明細を 1 つの取引で (回が変わっていたら run を直す)。deadline = CSV の期限 (塊ごとに確かめる・過ぎたら ListTimeoutError)
  */
-export async function salesOfCodes(run, codes) {
+export async function salesOfCodes(run, codes, { deadline = null } = {}) {
   if (!run || !run.ok) return null;
   const keys = [...new Set(codes.map((c) => normProductCode(c)).filter(Boolean))];
   const m = new Map();
   if (!keys.length) return m;
   try {
     const db = await mirrorDb();
-    for (let i = 0; i < keys.length; i += CHUNK) {
-      const part = keys.slice(i, i + CHUNK);
-      const rows = db.prepare(`select ${SELECT_COLS} from mirror_pml_snapshot_rows where run_id = ? and lower(trim(商品コード)) in (${part.map(() => '?').join(', ')})`).all(run.runId, ...part);
-      for (const r of rows) m.set(normProductCode(r.code), rowOf(r));
-    }
-    return m;
+    return inTx(db, () => {
+      if (!recheckRun(db, run)) return null;
+      for (let i = 0; i < keys.length; i += CHUNK) {
+        checkDeadline(deadline);
+        const part = keys.slice(i, i + CHUNK);
+        const rows = db.prepare(`select ${SELECT_COLS} from mirror_pml_snapshot_rows where run_id = ? and lower(trim(商品コード)) in (${part.map(() => '?').join(', ')})`).all(run.runId, ...part);
+        for (const r of rows) m.set(normProductCode(r.code), rowOf(r));
+      }
+      return m;
+    });
   } catch (e) {
+    if (e instanceof ListTimeoutError) throw e;
     console.error(`[master-edit] 販売数 (一覧) を読めない: ${e && e.message}`);
     return null;
   }
@@ -107,6 +133,15 @@ export async function readSalesSku(run, code) {
   const key = normProductCode(code);
   try {
     const db = await mirrorDb();
+    return inTx(db, () => readSalesSkuTx(db, run, key));
+  } catch (e) {
+    console.error(`[master-edit] 販売数 (1 つの商品) を読めない: ${e && e.message}`);
+    return { ok: false, error: '販売数 (商品管理リスト) を読めません' };
+  }
+}
+function readSalesSkuTx(db, run, key) {
+  {
+    if (!recheckRun(db, run)) return run;
     const r = db.prepare(`select ${SELECT_COLS} from mirror_pml_snapshot_rows where run_id = ? and lower(trim(商品コード)) = ?`).get(run.runId, key);
     let malls;
     try {
@@ -124,8 +159,5 @@ export async function readSalesSku(run, code) {
       malls = { ok: false, rows: [] };
     }
     return { ok: true, run, row: r ? rowOf(r) : null, malls };
-  } catch (e) {
-    console.error(`[master-edit] 販売数 (1 つの商品) を読めない: ${e && e.message}`);
-    return { ok: false, error: '販売数 (商品管理リスト) を読めません' };
   }
 }

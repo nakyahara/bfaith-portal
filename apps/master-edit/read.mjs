@@ -12,6 +12,7 @@ import { foldSearch, foldSql, likeOf } from './search-fold.mjs';
 import { backorderOf, backorderKeys, stockOf, buildableOf } from './extras.mjs';
 import { fbaAvailableOf } from './fba-stock.mjs';
 import { salesOfCodes } from './sales-qty.mjs';
+import { checkDeadline, ListTimeoutError } from './deadline.mjs';
 import { normProductCode } from '../purchase-orders/db.js';
 import { TOKEN_RE } from './search-token.mjs';
 import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES } from '../../lib/master-write.mjs';
@@ -120,13 +121,16 @@ const costTodaySql = (dayP, idsP = null) => `select distinct on (y.sku_id) y.sku
  *    今は ① 絞り込みと並びだけの軽い読み (原価が要るのは「原価が未入力」のときだけ・1 回の集合) → ② このページの 100 件だけ中身を読む (原価・仕入先も 1 回の集合)。
  *    値・並び・件数は前と同じ (試験 test-master-edit で前の形と比べる)
  * mode (10/5 中原さん「コードのコピー・CSV」): 'page' (既定 = offset から 100 件) / 'codes' (絞った全件の商品コードだけ = ② を読まない) /
- *   'all' (絞った全件の中身 + JAN = CSV)。codes / all は件数が max を超えたら { tooMany: true, total } だけ返す (何も読まない)。
- *   deadline (ms) を過ぎたら ListTimeoutError (段ごとに確かめる。1 つの文は接続の statement_timeout 20s)
+ *   'all' (絞った全件の中身 + JAN = CSV)。codes / all は件数が max を超えたら { tooMany: true, total, atLeast } だけ返す (中身は読まない)。
+ *   🚨 資源を守る (#1627 Codex R1 M3): codes / all の ① は SQL で max + 1 件までしか読まない (JS で絞る条件 = 売上分類・在庫の範囲があるときは
+ *   EXPORT_SCAN_MAX + 1 件まで)。deadline (ms・リクエストの始めに作る) を段ごと・販売数の塊ごとに確かめ、過ぎたら ListTimeoutError (1 つの文は statement_timeout 20s)
  */
 export const EXPORT_MAX = 10000;
-export class ListTimeoutError extends Error { constructor() { super('一覧の読み出しに時間がかかりすぎました'); this.name = 'ListTimeoutError'; } }
+/** JS で絞る条件があるときの ① の読みの上限 (会社の SKU は 7,400 ほど = 普段は届かない) */
+export const EXPORT_SCAN_MAX = 50000;
+export { ListTimeoutError };
 export async function listSkus(db, filters, { now = new Date(), extras = {}, mode = 'page', max = EXPORT_MAX, deadline = null } = {}) {
-  const tick = () => { if (deadline != null && Date.now() > deadline) throw new ListTimeoutError(); };
+  const tick = () => checkDeadline(deadline);
   const f = normalizeFilters(filters);
   const today = jstDate(now);
   const params = [COMPANY_ID];
@@ -249,12 +253,19 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   }
   // ① 絞り込みと並び (軽い列だけ)。並び (コード順 / 登録日の新しい順 = 空は最後・同じ日はコード順) はここの order by = ページ分けの前。
   //   この後の JS の絞り込み (売上分類・セットの作れる数) は filter だけ = 並びを変えない
+  // codes / all の読みの上限: JS で絞る条件が無ければ max + 1 件 (超えた = 上限を超える) / あれば EXPORT_SCAN_MAX + 1 件
+  const jsFiltered = f.missing === 'sales' || !!f.sales || !!stockRange;
+  const scanCap = mode === 'page' ? null : (jsFiltered ? Math.max(EXPORT_SCAN_MAX, max) : max) + 1;
+  tick();
   const keys = (await db.query(`${costCte}select s.sku_id::text as sku_id, s.code, s.sku_kind, s.set_sales_class_override, p.sales_class
       from core.skus s
       left join core.products p on p.product_id = s.product_id
       ${costCte ? 'left join c on c.sku_id = s.sku_id' : ''}
      where ${where.join(' and ')}
-     order by ${listOrderBy(f.sort, { alias: 's', hasColumn: hasRegOn })}`, params)).rows;
+     order by ${listOrderBy(f.sort, { alias: 's', hasColumn: hasRegOn })}${scanCap ? ` limit ${scanCap}` : ''}`, params)).rows;
+  tick();
+  // 読みの上限に届いた = それ以上ある (JS で絞った後の数は分からない = 上限を超える扱い)
+  if (scanCap && keys.length >= scanCap) return { tooMany: true, atLeast: true, total: keys.length - 1, max, filters: f, notFound, multiCut };
   /** セットの構成品の売上分類 (導く材料)。ids = セットの sku_id → Map<sku_id, [分類]> */
   const compClassesOf = async (ids) => {
     const m = new Map();
@@ -297,7 +308,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
     });
   }
   tick();
-  if (mode !== 'page' && matched.length > max) return { tooMany: true, total: matched.length, max, filters: f, notFound, multiCut };
+  if (mode !== 'page' && matched.length > max) return { tooMany: true, atLeast: false, total: matched.length, max, filters: f, notFound, multiCut };
   // 絞った全件の商品コード (並びも一覧と同じ)。中身は読まない
   if (mode === 'codes') return { codes: matched.map((r) => r.code), total: matched.length, filters: f, notFound, multiCut };
   const pageIds = (mode === 'all' ? matched : matched.slice(f.offset, f.offset + LIST_LIMIT)).map((r) => r.sku_id);
@@ -326,7 +337,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   // FBA (日本) の販売可能 (このページの SKU だけ・Company DB の在庫の日次の最新の complete の日。読めなければ null = 「—」)
   const fbaMap = extras.fba && extras.fba.ok ? await fbaAvailableOf(db, extras.fba, pageIds) : null;
   // 売れた数 (7 日・30 日。このページの商品コードだけ・商品管理リストの公開の回 = 発注アプリと同じ数。読めなければ null = 「—」)
-  const salesMap = extras.sales && extras.sales.ok ? await salesOfCodes(extras.sales, pageIds.map((id) => rowsById.get(id)?.code).filter(Boolean)) : null;
+  const salesMap = extras.sales && extras.sales.ok ? await salesOfCodes(extras.sales, pageIds.map((id) => rowsById.get(id)?.code).filter(Boolean), { deadline }) : null;
   const pageRows = pageIds.map((id) => rowsById.get(id)).filter(Boolean).map((r) => {
     const isSet = r.sku_kind === 'set';
     return {
@@ -441,6 +452,8 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
     const usedIn = cur.sku_kind === 'single'
       ? (await db.query(`select p.code, p.name, c.qty from core.sku_components c join core.skus p on p.sku_id = c.parent_sku_id where c.child_sku_id = $1 order by p.code_norm limit 50`, [id])).rows.map((r) => ({ ...r, qty: Number(r.qty) }))
       : [];
+    // 含むセットの数 (表示は 50 件まで = 数は別に数える。#1627 Codex R1 Low)
+    const usedInCount = cur.sku_kind === 'single' ? Number((await db.query('select count(*)::int as n from core.sku_components where child_sku_id = $1', [id])).rows[0].n) : 0;
     const amazon = Number((await db.query(`select count(distinct lc.listing_id)::int as n from core.listing_components lc join core.listings l on l.listing_id = lc.listing_id
        where lc.sku_id = $1 and l.mall in ('amazon', 'amazon_us')`, [id])).rows[0].n);
     const breaches = cur.sku_kind === 'set' && await regclass(db, 'ops.sku_component_breaches')
@@ -458,7 +471,7 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
     if (registered) registered.label = registered.source ? (REGISTERED_ON_SOURCES[registered.source] || registered.source) : null;
     locks.futureCost = await readFutureCostLocks(db, cur, today);
     return {
-      cur, costs, suppliers, activeSuppliers, jan, usedIn, amazon, csvRows, today, card, regItems, recent, locks, registered,
+      cur, costs, suppliers, activeSuppliers, jan, usedIn, usedInCount, amazon, csvRows, today, card, regItems, recent, locks, registered,
       state: cur.handling === 'discontinued' ? 'discontinued' : 'available',
       derived: cur.sku_kind === 'set' ? setDerivations(cur) : null,
       fields: fieldOwnership(cur.sku_kind, ownership, open && newEntryWritable(phase, ownership)),

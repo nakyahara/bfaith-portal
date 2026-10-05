@@ -71,10 +71,9 @@ export function buildListCsv(data, extras, { poOk = false, nowMs = Date.now(), r
   for (const r of data.rows) lines.push(cols.map(([, f]) => csvCell(f(r))).join(','));
   return `\ufeff${lines.join('\r\n')}\r\n`;
 }
-/** 売れた数: 読めない・商品管理リストに無い・セットで 0 (構成品に入る) = 空 (画面の「—」と同じ) */
+/** 売れた数: 読めない・商品管理リストに無い・セット (値に関係なく = 構成品に入る。構成の欠けたセットだけ上流がセットのコードに数えることがある) = 空 (画面の「—」と同じ) */
 function salesValue(r, k) {
   const s = r.sales;
-  if (!s || s.missing) return null;
-  if (r.kind === 'set' && !s.d7 && !s.d30) return null;
+  if (!s || s.missing || r.kind === 'set') return null;
   return s[k];
 }
