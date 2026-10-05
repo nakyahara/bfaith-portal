@@ -1784,7 +1784,13 @@ await ta('[16] FBA (JP) の在庫 (10/5): 読み元 = Company DB の在庫の日
   assert.match(r.text, /title="FBA \(日本\) の販売可能 · 1\/9 \(水\) 07:40 時点 \(朝のレポート\) \(26 時間より前 = 古い\)/);
   assert.match(r.text, /class="n ref stale" style="width:92px"/);
   assert.equal(fbaCell(r.text, 's001'), '15', 's001 = 1 × 1 の出品 2 つの販売可能の合計 (10 + 5)・まとめ売り 7 とセットの出品 2 は入れない');
-  assert.equal(fbaCell(r.text, 's002'), '—', 's002 = その日のレポートに 1 × 1 の出品が無い (pr-s002 は行が無い)');
+  assert.equal(fbaCell(r.text, 's002'), '0出品なし', 's002 = その日のレポートに 1 × 1 の出品の行が無い = 販売可能 0 (mart.v_sku_stock と同じ)・「出品なし」と添える (#1625 Codex R1 M)');
+  assert.equal(fbaCell(r.text, 's003'), '0出品なし', '出品が 1 つも無い SKU も 0');
+  {
+    // mart.v_sku_stock (商品の動き) と同じ数 (同じ complete の日・行の無い SKU は 0)
+    const v = await q("select k.code, v.fba_jp_available::int as n from mart.v_sku_stock v join core.skus k on k.sku_id = v.sku_id where k.code in ('s001', 's002', 's003') order by k.code");
+    assert.deepEqual(v.map((x) => [x.code, x.n]), [['s001', 15], ['s002', 0], ['s003', 0]]);
+  }
   assert.equal(fbaCell((await call('GET', '/?kind=set')).text, 'set001'), '4', 'NE のセット = そのセットに 1 × 1 で当たる出品の数 (構成品へ展開しない)');
   // 1/10 は RESTOCK が取れなかった (partial) = 使わない (前の complete の日 1/9 のまま・古い)・そのことを見出しの説明に出す
   await ingestStockDay(db, { source: 'fba_jp', snapshot_date: '2030-01-10', captured_at: '2030-01-09T22:41:00.000Z', partial: true,
@@ -1802,7 +1808,7 @@ await ta('[16] FBA (JP) の在庫 (10/5): 読み元 = Company DB の在庫の日
   assert.match(p, /id="ref-fba-skus">出品 SKU 2 つの合計: PR-S001-A 10 · pr-s001-b 5</);
   assert.match(p, /id="ref-fba-bundles"[^>]*>まとめ売り・セットの出品 \(上の数に入れていない\): pr-s001-3p ×3 = 7 · pr-s1s2 \(ほか 1 品と\) = 2</);
   p = (await call('GET', '/sku/s002')).text;
-  assert.match(p, /id="ref-fba">—</); assert.match(p, /id="ref-fba-none"/);
+  assert.match(p, /id="ref-fba">0</); assert.match(p, /id="ref-fba-none"[^>]*>FBA の出品なし/); assert.ok(!/id="ref-fba-parts"/.test(p), '行が無い = 内訳の表は出さない');
   assert.match(p, /pr-s1s2 \(ほか 1 品と\) = 2/, 's002 にもセットの出品を出す (合計には入れない)');
   // 1/10 が後から全部取れた (partial → complete) = 新しい日・新しい時刻・古くない
   await ingestStockDay(db, { source: 'fba_jp', snapshot_date: '2030-01-10', captured_at: '2030-01-09T23:05:00.000Z',
@@ -1811,7 +1817,7 @@ await ta('[16] FBA (JP) の在庫 (10/5): 読み元 = Company DB の在庫の日
   assert.equal(fbaTh(r.text), '1/10 08:05', '新しい complete の日 = 取得の時刻 (08:05 JST)');
   assert.match(r.text, /class="n ref" style="width:92px"/);
   assert.ok(!/は一部だけ取れた/.test(r.text));
-  assert.deepEqual([fbaCell(r.text, 's001'), fbaCell(r.text, 's002')], ['11', '0'], 'レポートにある 0 は 0 (「—」と分ける)');
+  assert.deepEqual([fbaCell(r.text, 's001'), fbaCell(r.text, 's002')], ['11', '0'], 'レポートの行にある 0 は 0 だけ (「出品なし」は添えない)');
   p = (await call('GET', '/sku/s001')).text;
   assert.match(p, /id="ref-fba-when" style="display:block">1\/10 \(木\) 08:05 時点 \(Amazon の朝のレポート\)</);
   assert.ok(!/id="ref-fba-unknown"/.test(p));
@@ -1819,6 +1825,15 @@ await ta('[16] FBA (JP) の在庫 (10/5): 読み元 = Company DB の在庫の日
   const day = await asEditor(E0, () => F.readFbaDay(db, { now: Date.parse('2030-01-10T23:05:00.000Z') }));
   assert.deepEqual([day.ok, day.date, day.asOf, day.stale, day.newer], [true, '2030-01-10', '2030-01-09T23:05:00.000Z', false, null]);
   assert.equal((await asEditor(E0, () => F.readFbaDay(db, { now: Date.parse('2030-01-11T01:05:01.000Z') }))).stale, true, '26 時間を 1 秒過ぎた = 古い');
+  // 最新の日が missing (取れなかった) = 前の complete の日の値・そのことを出す (#1625 Codex R1 Low)。complete より古い missing の日 (1/8) は案内しない
+  await ingestStockDay(db, { source: 'fba_jp', snapshot_date: '2030-01-08', missing: true }, { todayJst: '2030-01-12', now: Date.parse('2030-01-12T03:00:00Z') });
+  await ingestStockDay(db, { source: 'fba_jp', snapshot_date: '2030-01-11', missing: true }, { todayJst: '2030-01-12', now: Date.parse('2030-01-12T03:00:00Z') });
+  const dm = await asEditor(E0, () => F.readFbaDay(db, { now: NOW.getTime() }));
+  assert.deepEqual([dm.date, dm.asOf, dm.newer], ['2030-01-10', '2030-01-09T23:05:00.000Z', { date: '2030-01-11', status: 'missing', words: '取れなかった' }]);
+  r = await call('GET', '/?kind=single');
+  assert.equal(fbaCell(r.text, 's001'), '11', 'missing の日は使わない');
+  assert.match(r.text, /1\/11 \(金\) は取れなかったので前の日の値/);
+  assert.match((await call('GET', '/sku/s001')).text, /id="ref-fba-when" style="display:block">1\/10 \(木\) 08:05 時点 \(Amazon の朝のレポート\) · 1\/11 \(金\) は取れなかったので前の日の値</);
   // 権限: master_edit = 2 つの表を読むだけ (書けない・ほかの在庫の表・mart は読めない・分割を作る関数は CREATE が無いので動かない)
   for (const sql of ['select 1 from snapshots.sku_stock_daily limit 1', 'select 1 from snapshots.stock_capture_days limit 1']) assert.equal(await pgCode(asEditor(E0, () => pg.query(sql))), 'ok', sql);
   for (const sql of ['update snapshots.sku_stock_daily set qty = qty where false', 'delete from snapshots.stock_capture_days where false',

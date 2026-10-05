@@ -601,7 +601,7 @@ try {
     assert.deepEqual([day.ok, day.date, day.asOf, day.stale], [true, '2030-01-10', '2030-01-09T22:40:00.000Z', false], JSON.stringify(day));
     assert.deepEqual([...(await F.fbaAvailableOf(dbA, day, [String(p1)]))], [[String(p1), 12]]);
     const one = await F.readFbaSku(dbA, day, String(p1));
-    assert.deepEqual([one.ok, one.total], [true, { available: 12, transfer: 1, processing: 0, customer: 2, inbound: 3, unknown: 0 }]);
+    assert.deepEqual([one.ok, one.total], [true, { available: 12, transfer: 1, processing: 0, customer: 2, inbound: 3, unknown: 0, hasRow: true }]);
     for (const [sql, label] of [['update snapshots.sku_stock_daily set qty = qty where false', '日次の行の update'], ['delete from snapshots.stock_capture_days where false', '取れた日の delete'],
       ['select 1 from snapshots.sku_stock_daily_default limit 1', '分割の子を直接'], ['select 1 from snapshots.warehouse_stock_daily limit 1', 'ロケの在庫の日次'],
       ['select 1 from mart.v_sku_stock limit 1', 'mart の view'], ['select 1 from ops.ingest_runs limit 1', '取込の記録'],

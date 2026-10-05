@@ -329,9 +329,10 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
       backorder: extras.backorders ? backorderOf(extras.backorders, r.code) : null,
       stock: isSet ? null : (extras.stock ? stockOf(extras.stock, r.code_norm) : null),
       buildable: isSet ? buildableOf(extras.stock, compsOf.get(r.sku_id)) : null,
-      // FBA (JP) の販売可能: 数 = 1 × 1 の出品の合計 / null = その日のレポートに 1 × 1 の出品が無い・読めない (fba_known で分ける)
-      fba: fbaMap ? (fbaMap.has(r.sku_id) ? fbaMap.get(r.sku_id) : null) : null,
-      fba_known: !!fbaMap,
+      // FBA (JP) の販売可能: 数 = 1 × 1 の出品の合計 (行が無い = 0 = mart.v_sku_stock と同じ) / null = 読めない。
+      //   fba_row = その日のレポートに 1 × 1 の出品の行があるか (数とは別。画面は 0 に「出品なし」と添える)
+      fba: fbaMap ? (fbaMap.get(r.sku_id) ?? 0) : null,
+      fba_row: fbaMap ? fbaMap.has(r.sku_id) : null,
     };
   });
   // ⚠ の印 (NE との差・CSV 待ち・構成の依頼) はこのページの分だけ

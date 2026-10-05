@@ -705,7 +705,7 @@ await ta('[24] FBA (JP) の在庫 (10/5): 一覧の列 (参考・灰色)・見�
   const hhmm = (iso) => { const d = new Date(Date.parse(iso) + 9 * 3600e3); return `${d.getUTCMonth() + 1}/${d.getUTCDate()} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`; };
   await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\nk002\nk006\ns001' }));
   const c = Object.fromEntries((await cells(p)).map((x) => [x.code, x]));
-  assert.deepEqual([c.k001.fba, c.k002.fba, c.k006.fba, c.s001.fba], ['24', '—', '0', '—'], 'k001 = 1 × 1 の出品 2 つ (20 + 4)・まとめ売り / セットの出品は入れない / k002 = 1 × 1 の出品なし = — / k006 = レポートに 0');
+  assert.deepEqual([c.k001.fba, c.k002.fba, c.k006.fba, c.s001.fba], ['24', '0出品なし', '0', '0出品なし'], 'k001 = 1 × 1 の出品 2 つ (20 + 4)・まとめ売り / セットの出品は入れない / k002・s001 = 1 × 1 の出品の行なし = 0 + 「出品なし」(mart.v_sku_stock と同じ 0) / k006 = レポートに 0');
   const th = p.locator('#th-fba');
   assert.equal((await th.textContent()).trim(), 'FBA (JP)' + hhmm(FBA_CAPTURED), '見出しの下に取得の時刻 (月/日 時:分)');
   assert.match(await th.getAttribute('title'), /FBA \(日本\) の販売可能 · .* 時点 \(朝のレポート\) · 参考 · この SKU 1 個の出品だけの合計/);
@@ -730,8 +730,9 @@ await ta('[24] FBA (JP) の在庫 (10/5): 一覧の列 (参考・灰色)・見�
   assert.match(await p.textContent('#ref-fba-bundles'), /まとめ売り・セットの出品 \(上の数に入れていない\): pr-k001-3p ×3 = 6 · pr-k1k2 \(ほか 1 品と\) = 3/);
   if (SHOT2) await p.screenshot({ path: `${SHOT2}/単品_FBAの内訳.png`, fullPage: true });
   await p.goto(B + '/sku/k002');
-  assert.equal(await p.textContent('#ref-fba'), '—');
-  assert.match(await p.textContent('#ref-fba-none'), /この SKU 1 個だけの出品が、その日の FBA のレポートにありません/);
+  assert.equal(await p.textContent('#ref-fba'), '0');
+  assert.match(await p.textContent('#ref-fba-none'), /FBA の出品なし \(この SKU 1 個だけの出品の行が、その日の FBA のレポートに無い = 販売可能 0 と数える\)/);
+  assert.equal(await p.locator('#ref-fba-parts').count(), 0);
   assert.match(await p.textContent('#ref-fba-bundles'), /pr-k1k2 \(ほか 1 品と\) = 3/);
   // 古い (取得が 26 時間より前)
   const keepCap = (await pg.query("select captured_at from snapshots.stock_capture_days where source = 'fba_jp'")).rows[0].captured_at;

@@ -376,12 +376,12 @@
             <%# FBA (JP) = Company DB の在庫の日次 (朝の SP-API のレポート・最新の complete の日)。この SKU 1 個だけの出品の合計 (まとめ売り・セットの出品は下に別に・合計に入れない) %>
             <div class="row"><span class="k">FBA (JP) 販売可能</span><span class="v">
               <% if (!fx || !fx.ok) { %><span class="when bad" id="ref-fba-when">読めない<%= fx && fx.error ? ' (' + fx.error + ')' : '' %></span>
-              <% } else { %><span class="big" id="ref-fba"><%= fx.total ? fx.total.available.toLocaleString('ja-JP') : '—' %></span>
+              <% } else { %><span class="big" id="ref-fba"><%= fx.total.available.toLocaleString('ja-JP') %></span>
                 <span class="when<%= fx.day.stale ? ' stale' : '' %>" id="ref-fba-when" style="display:block"><%= fx.day.stale ? '古い · ' : '' %><%= ui.fmtJst(fx.day.asOf, { nowMs }) %> 時点 (Amazon の朝のレポート)<%= fx.day.newer ? ' · ' + ui.fmtDay(fx.day.newer.date) + ' は' + fx.day.newer.words + 'ので前の日の値' : '' %></span>
-                <% if (!fx.total) { %><span class="hint" id="ref-fba-none" style="display:block">この SKU 1 個だけの出品が、その日の FBA のレポートにありません</span><% } %>
+                <% if (!fx.total.hasRow) { %><span class="hint" id="ref-fba-none" style="display:block">FBA の出品なし (この SKU 1 個だけの出品の行が、その日の FBA のレポートに無い = 販売可能 0 と数える)</span><% } %>
               <% } %>
             </span></div>
-            <% if (fx && fx.ok && fx.total) { const T = fx.total; const allUnknown = T.unknown === fx.rows.length; const fc = (n) => allUnknown ? '不明' : n.toLocaleString('ja-JP') + (T.unknown ? ' +不明' : ''); %>
+            <% if (fx && fx.ok && fx.total.hasRow) { const T = fx.total; const allUnknown = T.unknown === fx.rows.length; const fc = (n) => allUnknown ? '不明' : n.toLocaleString('ja-JP') + (T.unknown ? ' +不明' : ''); %>
             <table id="ref-fba-parts"><thead><tr><th scope="col">FBA の内訳</th><th scope="col" class="n">数</th></tr></thead><tbody>
               <tr><td>販売可能</td><td class="n"><%= T.available.toLocaleString('ja-JP') %></td></tr>
               <tr><td>FC 移管中</td><td class="n"><%= fc(T.transfer) %></td></tr>

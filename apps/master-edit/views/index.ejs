@@ -184,7 +184,7 @@
               <td class="n"><% if (r.tax_rate == null) { %><span class="b warn">未入力</span><% } else { %><%= fmt.tax(r.tax_rate) %>%<% if (r.tax_derived) { %><span class="fx">計算</span><% } %><% } %></td>
               <td><% if (r.sales_class == null) { %><% if (r.kind !== 'exception') { %><span class="b warn">未入力</span><% } %><% } else { %><%= SALES[r.sales_class] || r.sales_class %><% if (r.sales_derived) { %><span class="fx">計算</span><% } %><% } %></td>
               <td class="n ref"><% if (isSet) { %><% if (r.buildable != null) { %><span title="構成品の在庫から作れる数 (参考)"><%= r.buildable.toLocaleString('ja-JP') %></span><span class="fx">作れる</span><% } %><% } else if (r.stock != null) { %><%= r.stock ? r.stock.toLocaleString('ja-JP') : '0' %><% } else { %><span class="muted">—</span><% } %></td>
-              <td class="n ref"><% if (r.fba != null) { %><%= r.fba.toLocaleString('ja-JP') %><% } else if (r.fba_known) { %><span class="muted" title="その日の FBA のレポートに、この SKU 1 個だけの出品が無い">—</span><% } else { %><span class="muted">—</span><% } %></td>
+              <td class="n ref"><% if (r.fba != null) { %><%= r.fba.toLocaleString('ja-JP') %><% if (!r.fba_row) { %><span class="fx" title="その日の FBA のレポートに、この SKU 1 個だけの出品の行が無い (販売可能 0 と数える)">出品なし</span><% } %><% } else { %><span class="muted">—</span><% } %></td>
               <% if (!poDenied) { %><td class="n ref"><% if (r.backorder) { %><%= r.backorder.toLocaleString('ja-JP') %><% } else if (r.backorder == null) { %><span class="muted">—</span><% } %></td><% } %>
               <td><div class="flags"><% for (const f of r.flags) { %><span class="b <%= FLAG_BADGE[f] || 'mute' %>"><%= f %></span><% } %></div></td>
             </tr>

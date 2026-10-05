@@ -38,21 +38,21 @@ export async function readFbaDay(db, { now = Date.now() } = {}) {
     const priv = (await db.query(`select has_schema_privilege('snapshots', 'usage') as sch`)).rows[0];
     const tbl = priv && priv.sch ? (await db.query(`select has_table_privilege('snapshots.stock_capture_days', 'select') and has_table_privilege('snapshots.sku_stock_daily', 'select') as ok`)).rows[0] : null;
     if (!tbl || !tbl.ok) return { ok: false, error: '画面のロールに FBA の在庫を読む権限がまだ無い (create-master-edit-roles.mjs の流し直しが要る)', reason: 'no_privilege' };
-    const days = (await db.query(`
-      (select snapshot_date::text as d, status, captured_at from snapshots.stock_capture_days
-        where company_id = $1 and source = $2 and scope_key = $3 and status = 'complete' order by snapshot_date desc limit 1)
-      union all
-      (select snapshot_date::text as d, status, captured_at from snapshots.stock_capture_days
-        where company_id = $1 and source = $2 and scope_key = $3 and status in ('complete', 'partial', 'missing') order by snapshot_date desc limit 1)`,
-    [COMPANY_ID, FBA_SOURCE.source, FBA_SOURCE.scope])).rows;
-    const done = days.find((r) => r.status === 'complete');
-    if (!done) return { ok: false, error: 'FBA の在庫の日次 (全部取れた日) がまだありません', reason: 'no_data' };
-    const last = days[days.length - 1];
-    const asOf = toIso(done.captured_at);
+    // 最新の complete の日と、最新の日 (complete / partial / missing のどれでも) を別の列で 1 行に (行の順に頼らない。#1625 Codex R1 Low)
+    const x = (await db.query(`
+      with d as (select snapshot_date, status, captured_at from snapshots.stock_capture_days
+                  where company_id = $1 and source = $2 and scope_key = $3 and status in ('complete', 'partial', 'missing'))
+      select (select snapshot_date::text from d where status = 'complete' order by snapshot_date desc limit 1) as done_date,
+             (select captured_at from d where status = 'complete' order by snapshot_date desc limit 1) as done_at,
+             (select snapshot_date::text from d order by snapshot_date desc limit 1) as last_date,
+             (select status from d order by snapshot_date desc limit 1) as last_status`,
+    [COMPANY_ID, FBA_SOURCE.source, FBA_SOURCE.scope])).rows[0];
+    if (!x || !x.done_date) return { ok: false, error: 'FBA の在庫の日次 (全部取れた日) がまだありません', reason: 'no_data' };
+    const asOf = toIso(x.done_at);
     const t = Date.parse(asOf);
     return {
-      ok: true, date: done.d, asOf, stale: !Number.isFinite(t) || now - t > FBA_STALE_MS,
-      newer: last && last.d > done.d ? { date: last.d, status: last.status, words: DAY_STATUS_WORDS[last.status] || last.status } : null,
+      ok: true, date: x.done_date, asOf, stale: !Number.isFinite(t) || now - t > FBA_STALE_MS,
+      newer: x.last_date && x.last_date > x.done_date ? { date: x.last_date, status: x.last_status, words: DAY_STATUS_WORDS[x.last_status] || x.last_status } : null,
     };
   } catch (e) {
     console.error(`[master-edit] FBA の在庫を読めない: ${e && e.message}`);
@@ -61,7 +61,8 @@ export async function readFbaDay(db, { now = Date.now() } = {}) {
 }
 
 /**
- * 一覧のページの SKU の FBA の在庫 (販売可能)。Map(sku_id 文字 → 販売可能の合計)。その日のレポートに 1 × 1 の出品が無い SKU は Map に無い (画面は「—」)。
+ * 一覧のページの SKU の FBA の在庫 (販売可能)。Map(sku_id 文字 → 販売可能の合計) = その日のレポートに 1 × 1 の出品の行がある SKU だけ。
+ * 🚨 Map に無い SKU は **販売可能 0** (mart.v_sku_stock の coalesce(…, 0) と同じ。#1625 Codex R1 M)。「行が無い」は在庫の数とは別に (呼ぶ側の fba_row) 持つ
  * 読めない日 (day.ok でない) = null
  */
 export async function fbaAvailableOf(db, day, skuIds) {
@@ -81,7 +82,7 @@ export async function fbaAvailableOf(db, day, skuIds) {
 
 /**
  * 1 つの SKU の FBA の在庫の内訳。
- * { ok: true, day, total: { available, transfer, processing, customer, inbound, unknown (FC の 3 区分が分からない出品 SKU の数) } | null (1 × 1 の出品がその日に無い),
+ * { ok: true, day, total: { available, transfer, processing, customer, inbound, unknown (FC の 3 区分が分からない出品 SKU の数), hasRow (1 × 1 の出品の行がその日にある。無ければ数は全部 0) },
  *   rows: [{ code, available, transfer, processing, customer, inbound_working, inbound_shipped, inbound_received }],
  *   bundles: [{ code, qty, others, available }] (この SKU を含む まとめ売り・セットの出品 = 合計に入れていない) } / { ok: false, error }
  */
@@ -95,11 +96,12 @@ export async function readFbaSku(db, day, skuId) {
       .map((r) => ({ code: r.code, available: num(r.fba_available), transfer: num(r.fba_fc_transfer), processing: num(r.fba_fc_processing), customer: num(r.fba_customer_order),
         inbound_working: num(r.fba_inbound_working), inbound_shipped: num(r.fba_inbound_shipped), inbound_received: num(r.fba_inbound_received) }));
     const sum = (k) => rows.reduce((s, r) => s + (r[k] || 0), 0);
-    const total = rows.length ? {
+    // 行が無い = 販売可能 0 (mart.v_sku_stock と同じ)。hasRow = その日のレポートにこの SKU 1 個だけの出品の行があるか (数とは別に持つ)
+    const total = {
       available: sum('available'), transfer: sum('transfer'), processing: sum('processing'), customer: sum('customer'),
       inbound: sum('inbound_working') + sum('inbound_shipped') + sum('inbound_received'),
-      unknown: rows.filter((r) => r.transfer == null).length,
-    } : null;
+      unknown: rows.filter((r) => r.transfer == null).length, hasRow: rows.length > 0,
+    };
     // この SKU を含む まとめ売り・セットの出品 (Amazon 日本)。受け口と同じ出品の当て方 (core.resolve_listing_id) で、その日の sku_id の無い行に当てる。
     //   候補 = この SKU を構成に持つ出品だけ (数件) → その日の行は出品の正規化で絞ってから resolve_listing_id で確かめる (全行に関数を呼ばない)
     const bundles = (await db.query(`
