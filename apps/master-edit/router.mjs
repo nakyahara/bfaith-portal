@@ -55,6 +55,16 @@ import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
 import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX } from './read.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
+import { putSearch, getSearch } from './search-token.mjs';
+import { sessionHasApp } from '../../lib/app-access.js';
+
+/**
+ * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
+ * 判定は server.js の requireAppAccess と同じ関数。無い人には読まない (列・絞り込みも出さない)
+ */
+const PO_APP_ID = 'purchase-orders';
+const PO_DENIED = Object.freeze({ ok: false, denied: true, error: '発注アプリの権限がないので出せません' });
+const canSeeBackorders = (req) => sessionHasApp(req.session, PO_APP_ID);
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
@@ -265,14 +275,38 @@ router.get('/', (req, res) => {
   // 画面の中のリンクは相対 (sku/… ・manual) = 末尾の / が無いと 1 つ上を指す
   if (!String(req.originalUrl || '').split('?')[0].endsWith('/')) return res.redirect(301, `${req.baseUrl}/`);
   return withPgPage(req, res, async (db, dbError) => {
-    const filters = normalizeFilters(req.query);
-    // 参考の値 (注文残 = 発注アプリ・在庫 = ロジザード)。読めなくても一覧は出す (その欄だけ「読めない」)
-    const extras = { backorders: readBackorders(), stock: await readWarehouseStock({ now: clock() }) };
-    const data = db ? await listSkus(db, filters, { now: new Date(clock()), extras }) : { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false, notFound: [], multiCut: false };
+    // 長い詳細検索の条件は印 (?s=) で来る = 中身に戻す (URL に同じ名前があっても印の中身が勝つ)。期限切れ・再起動で消えた = 何も出さずに知らせる
+    let query = req.query;
+    let searchExpired = false;
+    if (req.query.s) {
+      const cond = getSearch(String(req.query.s), clock());
+      if (cond) query = { ...req.query, ...cond };
+      else searchExpired = true;
+    }
+    const filters = normalizeFilters(query);
+    // 参考の値 (注文残 = 発注アプリ・在庫 = ロジザード)。読めなくても一覧は出す (その欄だけ「読めない」)。
+    // 注文残は発注アプリの利用権がある人だけ (無い人の「注文残あり」の絞り込みも使わない = どの商品に注文残があるかも出さない)
+    const poOk = canSeeBackorders(req);
+    if (!poOk) filters.po = '';
+    const extras = { backorders: poOk ? readBackorders() : PO_DENIED, stock: await readWarehouseStock({ now: clock() }) };
+    const empty = { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false, notFound: [], multiCut: false };
+    const data = db && !searchExpired ? await listSkus(db, filters, { now: new Date(clock()), extras }) : empty;
     const phase = db ? await readCutoverPhase(db) : null;
     const counts = db ? await listCounts(db, { now: new Date(clock()) }) : null;
-    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, fmt });
+    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt });
   });
+});
+/**
+ * 詳細検索を印にする (長い条件 = GET の URL に載せると HTTP 431)。POST は /api/ の守り (Origin が Host と同じ・JSON) を通る = 保存と同じ。
+ * 本文 = 詳細検索の板の欄 (名前 → 値)。返す = { ok, url } (一覧の URL。詳細検索の項目は ?s=<印>・ほかの絞り込みはそのまま)
+ */
+router.post('/api/search', (req, res) => {
+  const b = req.body && typeof req.body === 'object' ? req.body : {};
+  const f = normalizeFilters(b);
+  const cond = Object.fromEntries(ADV_KEYS.filter((k) => f[k]).map((k) => [k, f[k]]));
+  const rest = Object.fromEntries(['q', 'kind', 'state', 'missing', 'reg', 'card', 'diff'].filter((k) => f[k]).map((k) => [k, f[k]]));
+  const qs = new URLSearchParams({ ...rest, ...(Object.keys(cond).length ? { s: putSearch(cond, clock()) } : {}) }).toString();
+  res.json({ ok: true, url: `${req.baseUrl}/${qs ? `?${qs}` : ''}` });
 });
 router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), ui2: true, nav: 'manual', MAX_COMPONENTS }));
 
@@ -304,7 +338,7 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
   // 参考の値: 注文残の内訳 (発注アプリ)・在庫 (ロジザード。セットは構成品から作れる数)
   const stock = page ? await readWarehouseStock({ now: clock() }) : null;
   const extras = page ? {
-    backorder: page.cur.sku_kind === 'set' ? null : readBackorderLines(page.cur.code),
+    backorder: page.cur.sku_kind === 'set' ? null : (canSeeBackorders(req) ? readBackorderLines(page.cur.code) : PO_DENIED),
     stock,
     qty: page.cur.sku_kind === 'set' ? null : stockOf(stock, page.cur.code_norm),
     buildable: page.cur.sku_kind === 'set' ? buildableOf(stock, (page.cur.components || []).map((x) => ({ code_norm: normSku(x.code), qty: x.qty }))) : null,

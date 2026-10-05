@@ -117,6 +117,7 @@ import stockBotRouter, { stockBotAuth } from './apps/stock-bot/router.js';
 import shohyoLinksRouter from './apps/shohyo-links/router.js';
 import { startShohyoAttachCron } from './apps/shohyo-links/attach-job.js';
 import { apps, warehouseVariantDashboardApps } from './lib/portal-apps.js';
+import { sessionHasApp } from './lib/app-access.js';
 import { dashboardLocals, validateRegistry } from './lib/portal-dashboard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -503,8 +504,8 @@ function requireAppAccess(appId) {
       rememberReturnTo(req);
       return res.redirect('/login');
     }
-    const allowed = req.session.allowedApps;
-    if (allowed === '*' || (Array.isArray(allowed) && allowed.includes(appId))) {
+    // 判定は lib/app-access.js (ほかのアプリの情報を見せる画面も同じ判定を使う)
+    if (sessionHasApp(req.session, appId)) {
       return next();
     }
     if (isApiRequest(req)) return res.status(403).json({ error: 'forbidden' });

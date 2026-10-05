@@ -10,6 +10,7 @@ import { MASTER_OWNERSHIP } from '../../config/master-ownership.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import { foldSearch, foldSql, likeOf } from './search-fold.mjs';
 import { backorderOf, backorderKeys, stockOf, buildableOf } from './extras.mjs';
+import { TOKEN_RE } from './search-token.mjs';
 import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
@@ -77,6 +78,8 @@ export function normalizeFilters(q = {}) {
     tax: pick(String(q.tax ?? ''), TAX_FILTERS),
     sales: pick(String(q.sales ?? ''), SALES_FILTERS),
     po: q.po === '1' ? '1' : '',
+    // 長い詳細検索の条件の印 (search-token.mjs・router が中身に戻してから渡す)。形だけ確かめる
+    s: TOKEN_RE.test(String(q.s ?? '')) ? String(q.s) : '',
     offset,
   };
 }
@@ -174,19 +177,21 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
     if (!extras.backorders || !extras.backorders.ok) where.push('false');
     else { params.push(backorderKeys(extras.backorders)); where.push(`lower(trim(s.code)) = any($${params.length}::text[])`); }
   }
-  // 在庫 (ロジザード) の範囲。写しに無いコード = 0。読めないときは何も当てない
-  if (f.stock_min || f.stock_max) {
+  // 在庫 (ロジザード) の範囲 = 一覧に出す値で絞る: 単品・例外 = そのコードの在庫 (写しに無いコード = 0)・
+  //   セット = 構成品から作れる数 (下で JS。SQL では通しておく。#1620 Codex R1 M1)。読めないときは何も当てない
+  const stockRange = (f.stock_min || f.stock_max) ? { lo: f.stock_min ? Number(f.stock_min) : -Infinity, hi: f.stock_max ? Number(f.stock_max) : Infinity } : null;
+  if (stockRange) {
     const st = extras.stock;
     if (!st || !st.ok) where.push('false');
     else {
-      const lo = f.stock_min ? Number(f.stock_min) : -Infinity, hi = f.stock_max ? Number(f.stock_max) : Infinity;
+      const { lo, hi } = stockRange;
       params.push([...st.map].filter(([, n]) => n >= lo && n <= hi).map(([k]) => k));
       const inRange = params.length;
       if (lo <= 0 && hi >= 0) {
         // 0 が範囲に入る = 写しに無いコード (在庫 0) も当てる。🚨 使わない $番号を足さない (型が決まらず SQL が落ちる)
         params.push([...st.map.keys()]);
-        where.push(`(s.code_norm = any($${inRange}::text[]) or not (s.code_norm = any($${params.length}::text[])))`);
-      } else where.push(`s.code_norm = any($${inRange}::text[])`);
+        where.push(`(s.sku_kind = 'set' or s.code_norm = any($${inRange}::text[]) or not (s.code_norm = any($${params.length}::text[])))`);
+      } else where.push(`(s.sku_kind = 'set' or s.code_norm = any($${inRange}::text[]))`);
     }
   }
   // 登録の状態とカードは別々の絞り込み (両方 = 両方に合う商品。PR #1566 Codex R2 Low)
@@ -235,6 +240,27 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
     if (f.missing === 'sales') matched = matched.filter((r) => salesOf(r, compClasses) == null && r.sku_kind !== 'exception');
     if (f.sales) matched = matched.filter((r) => salesOf(r, compClasses) === Number(f.sales));
   }
+  /** セットの構成品 (作れる数の材料)。ids = セットの sku_id → Map<sku_id, [{ code_norm, qty }]> */
+  const compsOfSets = async (ids) => {
+    const m = new Map();
+    if (!ids.length || !extras.stock || !extras.stock.ok) return m;
+    for (const c of (await db.query(`select c.parent_sku_id::text as parent, k.code_norm, c.qty from core.sku_components c join core.skus k on k.sku_id = c.child_sku_id
+        where c.parent_sku_id = any($1::bigint[])`, [ids])).rows) {
+      if (!m.has(c.parent)) m.set(c.parent, []);
+      m.get(c.parent).push({ code_norm: c.code_norm, qty: Number(c.qty) });
+    }
+    return m;
+  };
+  let compsOf = null;
+  if (stockRange && extras.stock && extras.stock.ok) {
+    // セットは表示と同じ「作れる数」で範囲に入るか (作れる数が決まらない = 構成が無い は入れない)。ページ分けの前
+    compsOf = await compsOfSets(matched.filter((r) => r.sku_kind === 'set').map((r) => r.sku_id));
+    matched = matched.filter((r) => {
+      if (r.sku_kind !== 'set') return true;
+      const b = buildableOf(extras.stock, compsOf.get(r.sku_id));
+      return b != null && b >= stockRange.lo && b <= stockRange.hi;
+    });
+  }
   const pageIds = matched.slice(f.offset, f.offset + LIST_LIMIT).map((r) => r.sku_id);
   // ② このページの分だけ中身を読む
   const rowsById = new Map();
@@ -255,15 +281,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
   }
   if (!compClasses) compClasses = await compClassesOf(pageIds.filter((id) => rowsById.get(id)?.sku_kind === 'set'));
   // セットの構成品 (作れる数の材料。このページのセットだけ・在庫が読めたときだけ)
-  const compsOf = new Map();
-  const pageSetIds = pageIds.filter((id) => rowsById.get(id)?.sku_kind === 'set');
-  if (pageSetIds.length && extras.stock && extras.stock.ok) {
-    for (const c of (await db.query(`select c.parent_sku_id::text as parent, k.code_norm, c.qty from core.sku_components c join core.skus k on k.sku_id = c.child_sku_id
-        where c.parent_sku_id = any($1::bigint[])`, [pageSetIds])).rows) {
-      if (!compsOf.has(c.parent)) compsOf.set(c.parent, []);
-      compsOf.get(c.parent).push({ code_norm: c.code_norm, qty: Number(c.qty) });
-    }
-  }
+  if (!compsOf) compsOf = await compsOfSets(pageIds.filter((id) => rowsById.get(id)?.sku_kind === 'set'));
   const pageRows = pageIds.map((id) => rowsById.get(id)).filter(Boolean).map((r) => {
     const isSet = r.sku_kind === 'set';
     return {

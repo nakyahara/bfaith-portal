@@ -309,8 +309,31 @@
     f.classList.add('busy'); f.setAttribute('aria-busy', 'true');
     var b = $('.go', f); if (b) b.textContent = '絞っています…';   // disabled にはしない (送っている途中のボタンを閉じない)
   });
+  /*
+   * 詳細検索: 条件が長い (商品コード 500 件など) と GET の URL が上限を超えて HTTP 431 になる (#1620 Codex R1 M2)。
+   * 短いときは今までどおり GET (URL に条件がそのまま残る)。長いときは POST api/search (保存と同じ Origin・JSON の守り) で
+   * 条件を印にしてもらい、?s=<印> の URL を開く
+   */
+  var ADV_URL_MAX = 1800;
+  document.addEventListener('submit', function (e) {
+    var f = e.target;
+    if (e.defaultPrevented || !f || f.id !== 'adv-form' || !window.FormData || !window.fetch) return;
+    var body = {}, qs = new URLSearchParams();
+    new FormData(f).forEach(function (v, k) { if (String(v).trim() !== '') { body[k] = String(v); qs.append(k, String(v)); } });
+    if ((location.pathname + '?' + qs.toString()).length <= ADV_URL_MAX) return;   // 短い = GET のまま
+    e.preventDefault();
+    var b = $('button[type="submit"]', f); if (b) b.disabled = true;
+    fetch(new URL(f.getAttribute('data-api') || 'api/search', location.href).href, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) })
+      .then(function (r) { return r.json().catch(function () { return {}; }); })
+      .then(function (j) {
+        if (j && j.ok && j.url) { requestNavigate(j.url, b); return; }
+        if (b) b.disabled = false; toast('検索の条件を送れませんでした' + (j && j.error ? ' (' + j.error + ')' : ''));
+      })
+      .catch(function () { if (b) b.disabled = false; toast('通信できませんでした。もう一度「この条件で探す」を押してください'); });
+  });
   // 戻るで戻ってきた (bfcache) ときは元に戻す
   window.addEventListener('pageshow', function () {
+    var ab = $('#adv-form button[type="submit"]'); if (ab) ab.disabled = false;
     var f = $('#list-search'); if (!f) return;
     f.classList.remove('busy'); f.removeAttribute('aria-busy');
     var b = $('.go', f); if (b) b.textContent = '絞る';

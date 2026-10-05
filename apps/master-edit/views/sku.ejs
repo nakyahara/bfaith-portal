@@ -373,7 +373,8 @@
             </span></div>
             <% if (!isSet) { const bo = extras.backorder; %>
             <div class="row"><span class="k">注文残 (発注アプリ)</span><span class="v">
-              <% if (!bo || !bo.ok) { %><span class="when bad" id="ref-po-why">読めない</span>
+              <% if (bo && bo.denied) { %><span class="when" id="ref-po-why">注文残 (発注アプリの権限がないので出せません)</span>
+              <% } else if (!bo || !bo.ok) { %><span class="when bad" id="ref-po-why">読めない</span>
               <% } else { %><span class="big" id="ref-po"><%= bo.total.toLocaleString('ja-JP') %></span><% if (!bo.lines.length) { %> <span class="when">なし</span><% } %><% } %>
             </span></div>
             <% if (bo && bo.ok && bo.lines.length) { %>

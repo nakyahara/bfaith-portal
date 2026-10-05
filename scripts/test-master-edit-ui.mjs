@@ -23,6 +23,9 @@
  *  18 詳細検索: 商品コードを複数 (貼り付け・大文字・全角) = ぴったり・見つからないコード・URL に残る・クリア (10/5)
  *  19 詳細検索の項目: JAN・仕入先・代表 (親)・商品名・原価 / 売価の範囲・税率・売上分類・取扱区分 (10/5)
  *  20 注文残 (発注アプリ)・在庫 (ロジザード): 一覧の列・絞り込み・1 つの商品の画面の内訳と時刻・セットは作れる数・古い / 読めない (10/5)
+ *  21 在庫の範囲はセットなら作れる数で絞る (#1620 Codex R1 M1)
+ *  22 注文残は発注アプリの利用権がある人だけ (列・絞り込み・内訳) (#1620 Codex R1 M3)
+ *  23 詳細検索の長い条件 = 本物の HTTP で 500 件の境目・印 (?s=)・GET なら 431・Origin と JSON の守り・期限切れ (#1620 Codex R1 M2)
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -60,6 +63,7 @@ const DATA_TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'meux-ui-'));
 process.env.DATA_DIR = DATA_TMP;
 const { default: router, __setPgClientFactory, __setOwnership, __setShippingRatesProvider } = await import('../apps/master-edit/router.mjs');
 const { __clearStockCache } = await import('../apps/master-edit/extras.mjs');
+const { __clearSearchTokens } = await import('../apps/master-edit/search-token.mjs');
 
 const quiet = () => {};
 const ALL = Object.fromEntries(Object.keys(MASTER_OWNERSHIP).map((k) => [k, 'company']));
@@ -160,7 +164,9 @@ __setOwnership(ALL);
 __setShippingRatesProvider(async () => RATES);
 const app = express();
 app.set('view engine', 'ejs');
-app.use((req, res, next) => { req.session = { authenticated: true, email: 'naka@test', displayName: '中原', role: 'user', allowedApps: ['master-edit'] }; next(); });
+// 利用権 (試験の途中で変える: 発注アプリの利用権が無い人には注文残を出さない = #1620 Codex R1 M3)
+let SESSION_APPS = ['master-edit', 'purchase-orders'];
+app.use((req, res, next) => { req.session = { authenticated: true, email: 'naka@test', displayName: '中原', role: 'user', allowedApps: SESSION_APPS }; next(); });
 app.use('/apps/master-edit', router);
 app.get('/', (req, res) => res.send('<p>portal</p>'));
 const server = http.createServer(app);
@@ -631,6 +637,92 @@ await ta('[20] 注文残 (発注アプリ)・在庫 (ロジザード) (10/5): �
   for (const r of keep) ins.run(...Object.values(r));
   mirrorDb.prepare('update mirror_logizard_stock set captured_at = ?').run(new Date(Date.now() - 20 * 60e3).toISOString());
   __clearStockCache();
+});
+
+await ta('[21] 在庫の範囲で絞る = 一覧に出す値 (セットは作れる数) で絞る (#1620 Codex R1 M1)', async (p) => {
+  const q = async (qs) => { await p.goto(B + '/?' + new URLSearchParams(qs)); return listCodes(p); };
+  // set001 は構成品 s001 (10) と s002 (5) から 5 作れる (セット自身の行はロジザードに無い)
+  assert.deepEqual(await q({ codes: 'set001', stock_min: '1' }), ['set001'], '作れる数 5 は 1 以上に入る');
+  assert.deepEqual(await q({ codes: 'set001', stock_max: '0' }), [], '作れる数 5 は 0 以下に入らない');
+  assert.deepEqual(await q({ codes: 'set001\ns001\ns002', stock_min: '5', stock_max: '5' }), ['s002', 'set001'], '単品は在庫・セットは作れる数');
+  assert.equal(await p.textContent('#list-tbl tbody tr:has-text("set001") td:nth-child(8)'), '5作れる');
+});
+
+await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 Codex R1 M3): 無い人 = 列・絞り込み・内訳を出さず「権限がないので出せません」', async (p) => {
+  SESSION_APPS = ['master-edit'];
+  try {
+    await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns002' }));
+    assert.doesNotMatch(await p.textContent('#list-tbl thead'), /注文残/, '列を出さない');
+    assert.deepEqual((await cells(p)).map((x) => x.code), ['k001', 's002']);
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td').count(), 9, '行の欄も 1 つ少ない');
+    assert.equal(await p.locator('input[name="po"]').count(), 0, '「注文残あり」を出さない');
+    assert.match(await p.textContent('#po-denied'), /注文残 \(発注アプリの権限がないので出せません\)/);
+    // URL に po=1 を付けても、注文残のある商品だけに絞らない (どの商品に注文残があるかを出さない)
+    await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns001\ns002', po: '1' }));
+    assert.deepEqual(await listCodes(p), ['k001', 's001', 's002']);
+    await p.goto(B + '/sku/k001');
+    assert.match(await p.textContent('#ref-po-why'), /注文残 \(発注アプリの権限がないので出せません\)/);
+    assert.equal(await p.locator('#ref-po').count(), 0);
+    assert.equal(await p.locator('#ref-po-lines').count(), 0, '内訳 (仕入先・発注日・数・納期) を出さない');
+    assert.doesNotMatch(await p.content(), /PO-2026-0001|AMC<\/td>/);
+    assert.equal(await p.textContent('#ref-stock'), '15', '在庫 (ロジザード) は出す');
+  } finally { SESSION_APPS = ['master-edit', 'purchase-orders']; }
+  // ある人 (* も同じ)
+  SESSION_APPS = '*';
+  try {
+    await p.goto(B + '/sku/k001');
+    assert.equal(await p.textContent('#ref-po'), '7');
+  } finally { SESSION_APPS = ['master-edit', 'purchase-orders']; }
+});
+
+await ta('[23] 詳細検索の長い条件 (#1620 Codex R1 M2): 本物の HTTP で商品コード 500 件 = 印 (?s=) で開ける・501 件 = 500 件まで・GET に載せると 431・Origin と JSON の守り・期限切れ', async (p) => {
+  const origin = new URL(B).origin;
+  const code30 = (i) => `nope-${String(i).padStart(4, '0')}-${'x'.repeat(30)}`.slice(0, 30);
+  const codes500 = ['k001', ...Array.from({ length: 499 }, (_, i) => code30(i))];
+  const post = (body, headers = {}) => fetch(B + '/api/search', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json', Accept: 'application/json', ...headers }, body: JSON.stringify(body) });
+  // GET の URL にそのまま載せる = Express に届く前に 431 (これを避けるための印)
+  const raw = await fetch(B + '/?' + new URLSearchParams({ codes: codes500.join('\n') }));
+  assert.equal(raw.status, 431, `GET に 500 件 = ${raw.status}`);
+  // 守り = 保存の POST と同じ (Origin が Host と同じ・JSON)
+  assert.equal((await post({ codes: 'k001' }, { Origin: 'https://evil.example' })).status, 403);
+  assert.equal((await fetch(B + '/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403, 'Origin なし');
+  assert.equal((await post({ codes: 'k001' }, { 'Content-Type': 'application/x-www-form-urlencoded' })).status, 415);
+  // 500 件 = 全部使う
+  const j = await (await post({ codes: codes500.join('\n'), kind: 'single', q: '' })).json();
+  assert.equal(j.ok, true);
+  assert.match(j.url, /^\/apps\/master-edit\/\?kind=single&s=[A-Za-z0-9_-]{22}$/, j.url);
+  const page500 = await (await fetch(origin + j.url)).text();
+  assert.match(page500, /499 件 見つからない/);
+  assert.doesNotMatch(page500, /500 件までを使いました/);
+  assert.match(page500, /href="sku\/k001"/);
+  // 501 件 = 500 件まで (知らせる)
+  const j2 = await (await post({ codes: [...codes500, 'k002'].join('\n') })).json();
+  const page501 = await (await fetch(origin + j2.url)).text();
+  assert.match(page501, /500 件までを使いました/);
+  assert.doesNotMatch(page501, /href="sku\/k002"/, '501 件目は使わない');
+  // 画面から: 500 件を貼って「この条件で探す」= 印の URL で開く・区分の札を押しても条件が残る (URL は短いまま)
+  await p.goto(B + '/');
+  await p.click('#adv > summary');
+  await p.fill('#adv-codes', codes500.join('\n'));
+  await Promise.all([p.waitForNavigation(), p.click('#adv-form button[type="submit"]')]);
+  assert.match(p.url(), /\?s=[A-Za-z0-9_-]{22}$/);
+  assert.deepEqual(await listCodes(p), ['k001']);
+  assert.match(await p.textContent('#not-found'), /499 件 見つからない/);
+  assert.equal((await p.inputValue('#adv-codes')).split('\n').length, 500, '欄には条件が戻る');
+  await Promise.all([p.waitForNavigation(), p.click('.chips a.chip:has-text("単品")')]);
+  assert.ok(p.url().length < 200, `札の URL も短い (${p.url().length})`);
+  assert.deepEqual(await listCodes(p), ['k001']);
+  // 期限切れ・再起動で消えた印
+  __clearSearchTokens();
+  await p.reload();
+  assert.match(await p.textContent('#search-expired'), /条件の期限が切れました。もう一度検索してください/);
+  assert.deepEqual(await listCodes(p), [], '消えた条件で全部を出さない');
+  // 短い条件は今までどおり GET (URL に条件が残る)
+  await p.goto(B + '/');
+  await p.click('#adv > summary');
+  await p.fill('#adv-codes', 'k001\nk002');
+  await Promise.all([p.waitForNavigation(), p.click('#adv-form button[type="submit"]')]);
+  assert.equal(new URL(p.url()).searchParams.get('codes').replace(/\r/g, ''), 'k001\nk002');
 });
 
 const SHOTDIR = process.env.MASTER_EDIT_UI_SHOTS || '';

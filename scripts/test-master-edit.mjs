@@ -1439,8 +1439,11 @@ await ta('[15] 一覧: 描画・検索・区分・状態・未入力 (売上分�
   r = await call('GET', '/?q=S00&kind=single');
   assert.ok(r.text.includes('sku/s001') && !r.text.includes('sku/set001'));
   // 参考の列: 発注アプリの台帳・ロジザードの写しが無い (この試験の DATA_DIR) = その列だけ「読めない」で一覧は出る (10/5 PR2)
-  assert.ok(r.text.includes('在庫<span class="thsub">読めない</span>') && r.text.includes('注文残<span class="thsub">読めない</span>'), '読めない列');
-  assert.ok((await call('GET', '/?po=1')).text.includes('当てはまる商品がありません'), '注文残が読めない = 注文残ありでは当てない');
+  //   editor = 発注アプリの利用権が無い (allowedApps = master-edit だけ) = 注文残の列・絞り込みを出さない (#1620 Codex R1 M3) / admin (*) = 読めない列
+  assert.ok(r.text.includes('在庫<span class="thsub">読めない</span>') && !r.text.includes('注文残<span class="thsub">') && r.text.includes('発注アプリの権限がないので出せません'), '利用権の無い人');
+  const ra = await call('GET', '/?q=S00&kind=single', { session: 'admin' });
+  assert.ok(ra.text.includes('注文残<span class="thsub">読めない</span>'), '読めない列');
+  assert.ok((await call('GET', '/?po=1', { session: 'admin' })).text.includes('当てはまる商品がありません'), '注文残が読めない = 注文残ありでは当てない');
   r = await call('GET', '/?q=' + encodeURIComponent('セット 5'));
   assert.ok(r.text.includes('sku/set005') && !r.text.includes('sku/s001"'));
   await pg.query("update core.products set sales_class = null where product_id = (select product_id from core.skus where code = 's003')");
