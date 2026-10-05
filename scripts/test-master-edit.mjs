@@ -1438,6 +1438,12 @@ await ta('[15] 一覧: 描画・検索・区分・状態・未入力 (売上分�
   assert.ok(!/いまは保存できません/.test(r.text));
   r = await call('GET', '/?q=S00&kind=single');
   assert.ok(r.text.includes('sku/s001') && !r.text.includes('sku/set001'));
+  // 参考の列: 発注アプリの台帳・ロジザードの写しが無い (この試験の DATA_DIR) = その列だけ「読めない」で一覧は出る (10/5 PR2)
+  //   editor = 発注アプリの利用権が無い (allowedApps = master-edit だけ) = 注文残の列・絞り込みを出さない (#1620 Codex R1 M3) / admin (*) = 読めない列
+  assert.ok(r.text.includes('在庫<span class="thsub">読めない</span>') && !r.text.includes('注文残<span class="thsub">') && r.text.includes('発注アプリの権限がないので出せません'), '利用権の無い人');
+  const ra = await call('GET', '/?q=S00&kind=single', { session: 'admin' });
+  assert.ok(ra.text.includes('注文残<span class="thsub">読めない</span>'), '読めない列');
+  assert.ok((await call('GET', '/?po=1', { session: 'admin' })).text.includes('当てはまる商品がありません'), '注文残が読めない = 注文残ありでは当てない');
   r = await call('GET', '/?q=' + encodeURIComponent('セット 5'));
   assert.ok(r.text.includes('sku/set005') && !r.text.includes('sku/s001"'));
   await pg.query("update core.products set sales_class = null where product_id = (select product_id from core.skus where code = 's003')");
@@ -1462,7 +1468,66 @@ await ta('[15] 一覧: 描画・検索・区分・状態・未入力 (売上分�
   assert.equal(bare.status, 301); assert.equal(bare.headers.get('location'), '/apps/master-edit/');
   const m = await call('GET', '/manual');
   assert.equal(m.status, 200);
-  for (const word of ['保存', '構成品を足す', '保存した後の値', 'メーカーからの値上げ通知', 'ひらがな・カタカナ・半角カナ', '画面を開き直す', '例外原価をやめる (構成品の合計に戻す)', 'NE との差', '未入力', '切替前', 'NE でやること', 'Ctrl + K', '捨てて移る', '🔒 の値']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
+  for (const word of ['保存', '構成品を足す', '保存した後の値', 'メーカーからの値上げ通知', 'ひらがな・カタカナ・半角カナ', '商品コードを複数', '作れる数', '画面を開き直す', '例外原価をやめる (構成品の合計に戻す)', 'NE との差', '未入力', '切替前', 'NE でやること', 'Ctrl + K', '捨てて移る', '🔒 の値']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
+});
+
+await ta('[15] 詳細検索の印 (POST /api/search) の大きさの上限 (#1620 Codex R2 M1): 巨大な入力は速く 413・上限内は今までどおり・表の合計バイト数で古い印から消える', async () => {
+  const T = await import('../apps/master-edit/search-token.mjs');
+  const timed = async (body) => { const t0 = performance.now(); const r = await call('POST', '/api/search', { body }); return { ...r, ms: performance.now() - t0 }; };
+  // 240,000 字の 1 つの欄 = 欄の字数で断る (分けない・溜めない)
+  let r = await timed({ codes: 'x'.repeat(240000) });
+  assert.equal(r.status, 413); assert.equal(r.j.error, 'too_large'); assert.match(r.j.message, /商品コード が長すぎます/);
+  assert.ok(r.ms < 1000, `速く断る (${Math.round(r.ms)}ms)`);
+  // 10 万の値 (区切りだらけ・20 万字。256KB の JSON の上限の内) も同じ
+  r = await timed({ jans: Array(100000).fill('4').join(',') });
+  assert.equal(r.status, 413); assert.match(r.j.message, /JAN が長すぎます/);
+  assert.ok(r.ms < 1000, `速く断る (${Math.round(r.ms)}ms)`);
+  // 分ける関数そのもの: 10 万の値でも上限 + 1 件で止める・重複は Set
+  const t0 = performance.now();
+  const xs = R.splitMulti(Array.from({ length: 100000 }, (_, i) => `c${i % 50000}`).join('\n'), R.MULTI_MAX + 1);
+  assert.equal(xs.length, R.MULTI_MAX + 1);
+  assert.ok(performance.now() - t0 < 200, '上限で走査を止める');
+  assert.deepEqual(R.splitMulti('a, a\tb\r\nb、c', 10), ['a', 'b', 'c']);
+  // 1 つの値の字数 (商品コード 64・JAN 32・名前 200)
+  r = await call('POST', '/api/search', { body: { codes: `ok1\n${'a'.repeat(65)}` } });
+  assert.equal(r.status, 413); assert.match(r.j.message, /商品コード は 1 つ 64 字まで/);
+  r = await call('POST', '/api/search', { body: { jans: '4'.repeat(33) } });
+  assert.equal(r.status, 413); assert.match(r.j.message, /JAN は 1 つ 32 字まで/);
+  r = await call('POST', '/api/search', { body: { name: 'あ'.repeat(201) } });
+  assert.equal(r.status, 413); assert.match(r.j.message, /商品名 は 1 つ 200 字まで/);
+  assert.equal((await call('POST', '/api/search', { body: { codes: ['x'] } })).status, 400, '文字でない値');
+  // #1620 Codex R3 Low: 数・真偽・null も 400 (文字だけ) / 商品名は 200 字まで検索に使う (61〜200 字を黙って切らない)
+  for (const body of [{ codes: 123 }, { name: true }, { jans: null }]) assert.equal((await call('POST', '/api/search', { body })).status, 400, `文字でない値 ${JSON.stringify(body)}`);
+  const { normalizeFilters: nf } = await import('../apps/master-edit/read.mjs');
+  assert.equal(nf({ name: 'い'.repeat(150) }).name.length, 150, '商品名 150 字はそのまま使う');
+  // 条件全体 64KB まで (各欄 500 件 × 64 字 = 4 欄で 128KB = 断る)
+  const big = Array.from({ length: 500 }, (_, i) => `${String(i).padStart(3, '0')}${'z'.repeat(61)}`).join('\n');
+  r = await call('POST', '/api/search', { body: { codes: big, parents: big, sups: big } });
+  assert.equal(r.status, 413); assert.match(r.j.message, /検索の条件が大きすぎます/);
+  // 上限内は今までどおり (500 件 × 64 字 = 1 欄 32KB は通る・印で開ける)
+  r = await call('POST', '/api/search', { body: { codes: big, kind: 'single' } });
+  assert.equal(r.status, 200); assert.match(r.j.url, /\?kind=single&s=[A-Za-z0-9_-]{22}$/);
+  const page = await fetch(ORIGIN + r.j.url, { headers: { 'x-test-session': 'editor' } });
+  assert.equal(page.status, 200); assert.match(await page.text(), /500 件 見つからない/);
+  // 表の合計バイト数の上限: 古い (使っていない) 印から消える。使った印は残る (LRU)
+  T.__clearSearchTokens();
+  T.__setTokenLimits({ tokens: 5000, bytes: 3000 });
+  try {
+    const one = (i) => ({ codes: `${String(i).padStart(4, '0')}${'q'.repeat(1100)}` });   // 1 件 ≒ 1.2KB (3 件で 3,000 バイトを超える)
+    const a = T.putSearch(one(1)), b = T.putSearch(one(2));
+    assert.ok(T.getSearch(a), 'a を使う (新しい側へ)');
+    const c = T.putSearch(one(3));
+    assert.equal(T.getSearch(b), null, '一番古い (使っていない) b が消える');
+    assert.ok(T.getSearch(a) && T.getSearch(c));
+    assert.ok(T.__tokenStats().bytes <= 3000, `合計 ${T.__tokenStats().bytes}`);
+    T.putSearch(one(4)); T.putSearch(one(5));
+    assert.equal(T.__tokenStats().count, 2);
+    assert.ok(T.__tokenStats().bytes <= 3000);
+    // 件数の上限も
+    T.__setTokenLimits({ tokens: 2, bytes: 1e9 });
+    T.putSearch({ codes: 'x1' }); T.putSearch({ codes: 'x2' }); T.putSearch({ codes: 'x3' });
+    assert.equal(T.__tokenStats().count, 2);
+  } finally { T.__setTokenLimits(); T.__clearSearchTokens(); }
 });
 
 await ta('[15] 単品・セットの画面: 描画・画面の JS・編集の印・導く値・食い違い・JAN とロジザードは単品だけ・404', async () => {

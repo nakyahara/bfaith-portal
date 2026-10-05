@@ -361,6 +361,34 @@
           </div>
         </section>
 
+        <% if (extras) { const st = extras.stock; const stockN = isSet ? extras.buildable : extras.qty; %>
+        <%# 参考 (ほかのアプリの値・読むだけ): 在庫 = ロジザード (セットは構成品から作れる数)・注文残 = 発注アプリの台帳 (apps/master-edit/extras.mjs) %>
+        <section class="panel refbox" aria-labelledby="h-ref" id="ref-box">
+          <div class="panel-h" style="margin-bottom:10px"><h2 id="h-ref">在庫・注文残</h2><span class="sub">参考 (ほかのアプリの値)</span></div>
+          <div class="kv">
+            <div class="row"><span class="k"><%= isSet ? '作れる数' : '在庫' %> (ロジザード)</span><span class="v">
+              <% if (!st || !st.ok) { %><span class="when bad" id="ref-stock-when">読めない<%= st && st.error ? ' (' + st.error + ')' : '' %></span>
+              <% } else { %><span class="big" id="ref-stock"><%= stockN == null ? '—' : stockN.toLocaleString('ja-JP') %></span>
+                <span class="when<%= st.stale ? ' stale' : '' %>" id="ref-stock-when" style="display:block"><%= st.stale ? '古い · ' : '' %><%= ui.fmtJst(st.asOf, { nowMs }) %> 時点<%= isSet ? ' · 構成品の在庫 ÷ 数 の小さい方' : '' %></span><% } %>
+            </span></div>
+            <% if (!isSet) { const bo = extras.backorder; %>
+            <div class="row"><span class="k">注文残 (発注アプリ)</span><span class="v">
+              <% if (bo && bo.denied) { %><span class="when" id="ref-po-why">注文残 (発注アプリの権限がないので出せません)</span>
+              <% } else if (!bo || !bo.ok) { %><span class="when bad" id="ref-po-why">読めない</span>
+              <% } else { %><span class="big" id="ref-po"><%= bo.total.toLocaleString('ja-JP') %></span><% if (!bo.lines.length) { %> <span class="when">なし</span><% } %><% } %>
+            </span></div>
+            <% if (bo && bo.ok && bo.lines.length) { %>
+            <table id="ref-po-lines"><thead><tr><th scope="col">発注日</th><th scope="col">仕入先</th><th scope="col" class="n">数</th><th scope="col">納期</th></tr></thead><tbody>
+              <% for (const l of bo.lines.slice(0, 8)) { %><tr><td><%= ui.fmtJst(l.issuedAt, { nowMs }).replace(/ \d\d:\d\d$/, '') %></td><td class="sup"><%= l.supplierName || l.supplierCode %></td><td class="n"><%= Number(l.remaining).toLocaleString('ja-JP') %></td><td><%= l.due ? ui.fmtDay(l.due, page.today) + (l.dueKind === 'promised' ? ' 回答' : ' 希望') : '未定' %></td></tr><% } %>
+            </tbody></table>
+            <% if (bo.lines.length > 8) { %><div class="hint">ほか <%= bo.lines.length - 8 %> 件</div><% } %>
+            <a class="hint" href="/apps/purchase-orders">発注アプリで見る <svg class="ic s" style="vertical-align:-2px" aria-hidden="true"><use href="#i-ext"/></svg></a>
+            <% } %>
+            <% } %>
+          </div>
+        </section>
+        <% } %>
+
         <% if (page.regItems.length || page.card) { %>
         <section class="panel" aria-labelledby="h-reg" id="card-box" data-base="<%= base %>" data-code="<%= c.code %>">
           <div class="panel-h" style="margin-bottom:10px"><h2 id="h-reg">この商品の登録</h2></div>

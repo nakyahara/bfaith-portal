@@ -53,7 +53,10 @@ import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFE
 import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
-import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS } from './read.mjs';
+import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti } from './read.mjs';
+import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
+import { putSearch, getSearch } from './search-token.mjs';
+import { sessionHasApp } from '../../lib/app-access.js';
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
@@ -64,6 +67,20 @@ import {
   regSummary, buildRegExport, issueRegExport, regExportFile, declareRegExport, supersedeRegExport, recordRegVerified,
   REG_ITEM_STATES, REG_RESULTS,
 } from '../../lib/master-reg-csv.mjs';
+
+/**
+ * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
+ * 判定は server.js の requireAppAccess と同じ関数。無い人には読まない (列・絞り込みも出さない)
+ */
+const PO_APP_ID = 'purchase-orders';
+const PO_DENIED = Object.freeze({ ok: false, denied: true, error: '発注アプリの権限がないので出せません' });
+const canSeeBackorders = (req) => sessionHasApp(req.session, PO_APP_ID);
+
+/** 詳細検索 (POST /api/search) の大きさの上限 (#1620 Codex R2 M1)。1 つの欄の字数・1 つの値の字数・条件全体のバイト数 */
+const SEARCH_FIELD_MAX_CHARS = 64 * 1024;
+const SEARCH_VALUE_MAX = Object.freeze({ codes: 64, parents: 64, sups: 64, jans: 32, name: 200 });
+const SEARCH_COND_MAX_BYTES = 64 * 1024;
+const SEARCH_LABELS = Object.freeze({ codes: '商品コード', parents: '代表 (親) の商品コード', sups: '仕入先コード', jans: 'JAN', name: '商品名', q: '絞る欄' });
 
 /** NE 登録の CSV の画面の言葉 */
 const REG_EXPORT_STATES = Object.freeze({ built: '作った (まだ配っていない)', issued: '配った (取り込み待ち)', declared: '取り込んだと申告', closed: '閉じた' });
@@ -264,12 +281,51 @@ router.get('/', (req, res) => {
   // 画面の中のリンクは相対 (sku/… ・manual) = 末尾の / が無いと 1 つ上を指す
   if (!String(req.originalUrl || '').split('?')[0].endsWith('/')) return res.redirect(301, `${req.baseUrl}/`);
   return withPgPage(req, res, async (db, dbError) => {
-    const filters = normalizeFilters(req.query);
-    const data = db ? await listSkus(db, filters, { now: new Date(clock()) }) : { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false };
+    // 長い詳細検索の条件は印 (?s=) で来る = 中身に戻す (URL に同じ名前があっても印の中身が勝つ)。期限切れ・再起動で消えた = 何も出さずに知らせる
+    let query = req.query;
+    let searchExpired = false;
+    if (req.query.s) {
+      const cond = getSearch(String(req.query.s), clock());
+      if (cond) query = { ...req.query, ...cond };
+      else searchExpired = true;
+    }
+    const filters = normalizeFilters(query);
+    // 参考の値 (注文残 = 発注アプリ・在庫 = ロジザード)。読めなくても一覧は出す (その欄だけ「読めない」)。
+    // 注文残は発注アプリの利用権がある人だけ (無い人の「注文残あり」の絞り込みも使わない = どの商品に注文残があるかも出さない)
+    const poOk = canSeeBackorders(req);
+    if (!poOk) filters.po = '';
+    const extras = { backorders: poOk ? readBackorders() : PO_DENIED, stock: await readWarehouseStock({ now: clock() }) };
+    const empty = { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false, notFound: [], multiCut: false };
+    const data = db && !searchExpired ? await listSkus(db, filters, { now: new Date(clock()), extras }) : empty;
     const phase = db ? await readCutoverPhase(db) : null;
     const counts = db ? await listCounts(db, { now: new Date(clock()) }) : null;
-    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, fmt });
+    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt });
   });
+});
+/**
+ * 詳細検索を印にする (長い条件 = GET の URL に載せると HTTP 431)。POST は /api/ の守り (Origin が Host と同じ・JSON) を通る = 保存と同じ。
+ * 本文 = 詳細検索の板の欄 (名前 → 値)。返す = { ok, url } (一覧の URL。詳細検索の項目は ?s=<印>・ほかの絞り込みはそのまま)
+ */
+router.post('/api/search', (req, res) => {
+  const b = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  // 🚨 境界で大きさを決める (#1620 Codex R2 M1: 巨大な条件を印の表に溜めない・走査で長く止まらない)。超えたら 413 と分かる文
+  const tooLarge = (message) => res.status(413).json({ ok: false, error: 'too_large', message });
+  for (const [k, v] of Object.entries(b)) {
+    if (typeof v !== 'string') return res.status(400).json({ ok: false, error: `${k} の形が違います (文字だけ)` });   // 画面は FormData の文字だけを送る (#1620 Codex R3 Low)
+    if (String(v ?? '').length > SEARCH_FIELD_MAX_CHARS) return tooLarge(`${SEARCH_LABELS[k] || k} が長すぎます (1 つの欄は ${SEARCH_FIELD_MAX_CHARS.toLocaleString('ja-JP')} 字まで・複数の欄は ${MULTI_MAX} 件まで)`);
+  }
+  for (const [k, max] of Object.entries(SEARCH_VALUE_MAX)) {
+    if (b[k] == null) continue;
+    const vals = k === 'name' ? [String(b[k]).trim()] : splitMulti(b[k], MULTI_MAX + 1);
+    const bad = vals.find((x) => x.length > max);
+    if (bad) return tooLarge(`${SEARCH_LABELS[k]} は 1 つ ${max} 字までです (${bad.slice(0, 20)}… が ${bad.length} 字)`);
+  }
+  const f = normalizeFilters(b);
+  const cond = Object.fromEntries(ADV_KEYS.filter((k) => f[k]).map((k) => [k, f[k]]));
+  if (Buffer.byteLength(JSON.stringify(cond)) > SEARCH_COND_MAX_BYTES) return tooLarge(`検索の条件が大きすぎます (全部で ${SEARCH_COND_MAX_BYTES / 1024}KB まで。複数の欄を分けて検索してください)`);
+  const rest = Object.fromEntries(['q', 'kind', 'state', 'missing', 'reg', 'card', 'diff'].filter((k) => f[k]).map((k) => [k, f[k]]));
+  const qs = new URLSearchParams({ ...rest, ...(Object.keys(cond).length ? { s: putSearch(cond, clock()) } : {}) }).toString();
+  res.json({ ok: true, url: `${req.baseUrl}/${qs ? `?${qs}` : ''}` });
 });
 router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), ui2: true, nav: 'manual', MAX_COMPONENTS }));
 
@@ -298,9 +354,17 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
   const page = db ? await readSkuPage(db, req.params.code, { now, ownership: ownershipNow(), open: isOpen() }) : null;
   if (db && !page) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), ui2: true, nav: 'list', message: `商品コード ${req.params.code} は Company DB にありません` });
   const shipping = page ? await shippingRatesProvider() : null;
+  // 参考の値: 注文残の内訳 (発注アプリ)・在庫 (ロジザード。セットは構成品から作れる数)
+  const stock = page ? await readWarehouseStock({ now: clock() }) : null;
+  const extras = page ? {
+    backorder: page.cur.sku_kind === 'set' ? null : (canSeeBackorders(req) ? readBackorderLines(page.cur.code) : PO_DENIED),
+    stock,
+    qty: page.cur.sku_kind === 'set' ? null : stockOf(stock, page.cur.code_norm),
+    buildable: page.cur.sku_kind === 'set' ? buildableOf(stock, (page.cur.components || []).map((x) => ({ code_norm: normSku(x.code), qty: x.qty }))) : null,
+  } : null;
   res.render(view('sku.ejs'), {
     ...pageLocals(req, page ? page.phase : null), ui2: true, nav: 'list', dbError, page, FIELD_DEFS: page ? fieldsOf(page.cur.sku_kind) : {}, REG_FIELDS: page ? (REG_CSV_FIELDS[page.cur.sku_kind] || []) : [], code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,
-    shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
+    shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null, extras,
   });
 }));
 router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, dbError) => {

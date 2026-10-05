@@ -20,6 +20,12 @@
  *  15 かなの同一視 (ひらがな・カタカナ・半角カナ・全角英数・大文字小文字) = 一覧・全体から探す・画面とサーバーの決まりが同じ (10/5)
  *  16 原価を変える理由 = 選ぶ (既定 = メーカーからの値上げ通知)・その他は書かないと保存できない・記録に残る (10/5)
  *  17 1440 / 1280 / 1024 幅: 一覧をスクロールしても見出しの行が上の帯の下に見えている・横に送っても列がずれない (10/5)
+ *  18 詳細検索: 商品コードを複数 (貼り付け・大文字・全角) = ぴったり・見つからないコード・URL に残る・クリア (10/5)
+ *  19 詳細検索の項目: JAN・仕入先・代表 (親)・商品名・原価 / 売価の範囲・税率・売上分類・取扱区分 (10/5)
+ *  20 注文残 (発注アプリ)・在庫 (ロジザード): 一覧の列・絞り込み・1 つの商品の画面の内訳と時刻・セットは作れる数・古い / 読めない (10/5)
+ *  21 在庫の範囲はセットなら作れる数で絞る (#1620 Codex R1 M1)
+ *  22 注文残は発注アプリの利用権がある人だけ (列・絞り込み・内訳) (#1620 Codex R1 M3)
+ *  23 詳細検索の長い条件 = 本物の HTTP で 500 件の境目・印 (?s=)・GET なら 431・Origin と JSON の守り・期限切れ (#1620 Codex R1 M2)
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -27,6 +33,9 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import express from 'express';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 if (process.env.MASTER_EDIT_UI_SKIP === '1') { console.log('⏭️ MASTER_EDIT_UI_SKIP=1 = 画面の JS の試験 (test-master-edit-ui) を飛ばす'); process.exit(0); }
 let chromium;
@@ -49,7 +58,12 @@ const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries((await import('../conf
 const W = await import('../lib/master-write.mjs');
 const C = await import('../lib/master-cutover.mjs');
 const { seedActiveEpoch } = await import('./fixtures/master-epoch.mjs');
+// 発注アプリの台帳・ロジザードの写し (warehouse-mirror.db) = 使い捨ての DATA_DIR (router を読み込む前に。warehouse-mirror/db.js は読み込んだ時に DATA_DIR を決める)
+const DATA_TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'meux-ui-'));
+process.env.DATA_DIR = DATA_TMP;
 const { default: router, __setPgClientFactory, __setOwnership, __setShippingRatesProvider } = await import('../apps/master-edit/router.mjs');
+const { __clearStockCache } = await import('../apps/master-edit/extras.mjs');
+const { __clearSearchTokens } = await import('../apps/master-edit/search-token.mjs');
 
 const quiet = () => {};
 const ALL = Object.fromEntries(Object.keys(MASTER_OWNERSHIP).map((k) => [k, 'company']));
@@ -77,7 +91,7 @@ const singles = [sku('s001', '単品 1', 'single', 0.1, 3, 100), sku('s002', '�
   sku('k004', 'ＡＢＣ 保存袋', 'single', 0.1, 3, 90), sku('k005', 'abc 小袋', 'single', 0.1, 3, 80), sku('k006', 'みかん', 'single', 0.08, 1, 70),
   ...Array.from({ length: 40 }, (_, i) => sku(`z${String(i).padStart(3, '0')}`, `一覧を長くする単品 ${i}`, 'single', 0.1, 3, 100 + i))];
 const lr = await runInitialLoad(db, {
-  skus: [...singles, sku('set001', 'セット 1', 'set', 0.1, null, 300)], variationGroups: [],
+  skus: [...singles, sku('set001', 'セット 1', 'set', 0.1, null, 300)], variationGroups: [{ code: 'k001', name: '国産 はちみつ', childCodes: ['k002'], status: 'active' }],
   setComponents: [{ parentCode: 'set001', childCode: 's001', qty: 1, source: 'ne' }, { parentCode: 'set001', childCode: 's002', qty: 1, source: 'ne' }],
   listings: [], observations: [], physicals: [], compliance: [], workers: [],
   suppliers: [{ code: '0001', name: 'AMC' }], supplierSkus: singles.map((s) => ({ supplierCode: '0001', skuCode: s.code })), primarySuppliers: singles.map((s) => ({ skuCode: s.code, supplierCode: '0001' })),
@@ -103,6 +117,29 @@ const bp = (await pg.query('select * from ops.registration_backfill_plan()')).ro
 await as('master_ops', () => pg.query('select ops.backfill_sku_registrations($1, $2, $3)', [bp.sku_count, bp.snapshot_hash, 'naka@test']));
 await toPhase('company_owner');
 await toPhase('new_open');
+// ── 発注アプリの台帳 (注文残) とロジザードの写し (在庫) の見本 (PR2) ──
+const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
+const mirrorDb = initMirrorDB();
+const { initPurchaseOrders } = await import('../apps/purchase-orders/db.js');
+initPurchaseOrders();
+{
+  const now = new Date().toISOString();
+  mirrorDb.prepare(`insert into po_settings (key, value, effective_at) values ('tracking_started_at', '2026-07-13T00:00:00.000Z', ?)`).run(now);
+  const po = (sup, name, issuedAt, poNo, items) => {
+    const id = mirrorDb.prepare(`insert into po_orders (supplier_code, supplier_name, status, created_at, updated_at) values (?, ?, 'draft', ?, ?)`).run(sup, name, now, now).lastInsertRowid;
+    const ids = items.map((it) => mirrorDb.prepare('insert into po_order_items (order_id, product_code, product_key, product_name, qty, promised_date) values (?, ?, ?, ?, ?, ?)')
+      .run(id, it.code, it.code.trim().toLowerCase(), it.code, it.qty, it.promised || null).lastInsertRowid);
+    mirrorDb.prepare(`update po_orders set status = 'issued', issued_at = ?, po_number = ?, tracking_mode = 'tracked' where id = ?`).run(issuedAt, poNo, id);
+    return ids;
+  };
+  const [k001Item] = po('0001', 'AMC', '2026-09-20T01:00:00.000Z', 'PO-2026-0001', [{ code: 'K001', qty: 10 }, { code: 's002', qty: 4, promised: '2026-10-20' }]);
+  // 一部取消 3 = 残 7
+  mirrorDb.prepare(`insert into po_item_events (order_item_id, event_type, qty, effective_date, recorded_at, actor_type) values (?, 'cancel', 3, '2026-09-25', '2026-09-25T00:00:00.000Z', 'user')`).run(k001Item);
+  po('0001', 'AMC', '2020-01-01T00:00:00.000Z', 'PO-2020-0001', [{ code: 'k003', qty: 50 }]);   // 境界より前 = 数えない
+  const lz = mirrorDb.prepare(`insert into mirror_logizard_stock (商品ID, 商品名, ブロック略称, ロケ, 品質区分名, 在庫数, 引当数, captured_at, synced_at) values (?, ?, ?, ?, ?, ?, 0, ?, ?)`);
+  const cap = new Date(Date.now() - 20 * 60e3).toISOString();
+  for (const [code, block, loke, q, n] of [['K001', 'P', 'A-01', '良品', 12], ['k001', 'P', 'A-02', '不良', 3], ['s001', 'P', 'B-01', '良品', 8], ['S001', 'R', 'Z-01', '良品', 2], ['s002', 'P', 'B-02', '良品', 5]]) lz.run(code, code, block, loke, q, n, cap, now);
+}
 const row = async (code) => (await pg.query('select s.name, s.reorder_months::float8 as months, s.handling from core.skus s where s.code = $1', [code])).rows[0];
 /** 画面の外で同じ商品を直す (その間の変更 = 画面の編集の印が古くなる) */
 async function changeBehind(code, values) {
@@ -127,7 +164,9 @@ __setOwnership(ALL);
 __setShippingRatesProvider(async () => RATES);
 const app = express();
 app.set('view engine', 'ejs');
-app.use((req, res, next) => { req.session = { authenticated: true, email: 'naka@test', displayName: '中原', role: 'user', allowedApps: ['master-edit'] }; next(); });
+// 利用権 (試験の途中で変える: 発注アプリの利用権が無い人には注文残を出さない = #1620 Codex R1 M3)
+let SESSION_APPS = ['master-edit', 'purchase-orders'];
+app.use((req, res, next) => { req.session = { authenticated: true, email: 'naka@test', displayName: '中原', role: 'user', allowedApps: SESSION_APPS }; next(); });
 app.use('/apps/master-edit', router);
 app.get('/', (req, res) => res.send('<p>portal</p>'));
 const server = http.createServer(app);
@@ -494,6 +533,198 @@ await ta('[16] 原価を変える理由 (10/5): 既定 = メーカーからの�
   assert.equal(await p.isHidden('#cost-reason'), true);
 });
 
+// ── 詳細検索・注文残・在庫 (PR2・10/5) ──
+const SHOT2 = process.env.MASTER_EDIT_UI_SHOTS2 || '';
+const cells = (p) => p.$$eval('#list-tbl tbody tr', (trs) => trs.map((tr) => { const t = [...tr.children].map((td) => td.textContent.replace(/\s+/g, ' ').trim()); return { code: t[0], stock: t[7], po: t[8] }; }));
+const advGo = async (p, fill) => {
+  await p.goto(B + '/');
+  await p.click('#adv > summary');
+  await fill();
+  await Promise.all([p.waitForNavigation(), p.click('#adv-form button[type="submit"]')]);
+};
+
+await ta('[18] 詳細検索 (10/5): 商品コードを複数 (Excel の列の貼り付け・大文字・全角) = ぴったり・見つからないコードを上に出す・URL に残る・クリア', async (p) => {
+  await advGo(p, () => p.fill('#adv-codes', 'K001\tｋ００２\r\nnope-1, s003\nNOPE-2\nk001'));
+  assert.deepEqual(await listCodes(p), ['k001', 'k002', 's003']);
+  assert.match(await p.textContent('#not-found'), /2 件 見つからない[\s\S]*nope-1, NOPE-2/);
+  const u = new URL(p.url());
+  assert.match(u.searchParams.get('codes'), /NOPE-2/, '条件は URL に');
+  assert.equal((await p.inputValue('#adv-codes')).split('\n').length, 6, '貼り付けた値は 1 行 1 つに直して欄に残る');
+  assert.equal(await p.getAttribute('#adv', 'open'), '', '詳細検索を使っている = 板を開いておく');
+  if (SHOT2) await p.screenshot({ path: `${SHOT2}/詳細検索_商品コードを複数.png`, fullPage: true });
+  await p.reload();
+  assert.deepEqual(await listCodes(p), ['k001', 'k002', 's003'], '戻る・開き直すで同じ結果');
+  // 札・絞る欄と一緒に使える (区分の札を押しても詳細検索の条件は残る)
+  await Promise.all([p.waitForNavigation(), p.click('.chips a.chip:has-text("単品")')]);
+  assert.deepEqual(await listCodes(p), ['k001', 'k002', 's003']);
+  await Promise.all([p.waitForNavigation(), p.click('#adv-form a:has-text("クリア")')]);
+  assert.equal(new URL(p.url()).search, '');
+  assert.ok((await listCodes(p)).length > 40, 'クリア = 全部');
+  assert.equal(await p.locator('#not-found').count(), 0);
+});
+
+await ta('[19] 詳細検索の項目 (10/5): JAN (複数)・仕入先 (0001 と 1)・代表 (親)・商品名 (かな)・原価 / 売価の範囲・税率・売上分類・取扱区分', async (p) => {
+  const q = async (qs) => { await p.goto(B + '/?' + new URLSearchParams(qs)); return listCodes(p); };
+  assert.deepEqual(await q({ jans: `0000000\n${jan13('490000000777')}` }), ['s003']);
+  const bySup = await q({ sups: '1', kind: 'single' });
+  assert.ok(bySup.includes('k001') && bySup.includes('s001') && !bySup.includes('set001'), '代表の仕入先 0001 (1 と書いても同じ)');
+  assert.deepEqual(await q({ sups: '9999' }), []);
+  assert.deepEqual(await q({ parents: 'K001' }), ['k001', 'k002'], '代表 k001 = 子 k002 と代表そのもの');
+  assert.deepEqual(await q({ name: 'ﾊﾁﾐﾂ' }), ['k001', 'k002', 'k003']);
+  assert.deepEqual(await q({ cost_min: '305', cost_max: '310' }), ['k002']);
+  assert.deepEqual(await q({ price_min: '1,200' }), ['ui-card-1'], '売価の範囲 (カンマ付きでも)');
+  assert.deepEqual(await q({ name: 'はちみつ', tax: '8' }), ['k001', 'k002', 'k003']);
+  assert.deepEqual(await q({ name: 'はちみつ', tax: '10' }), []);
+  assert.deepEqual(await q({ name: 'はちみつ', sales: '1' }), ['k001', 'k002', 'k003']);
+  assert.deepEqual(await q({ name: 'はちみつ', sales: '3' }), []);
+  assert.deepEqual(await q({ codes: 'set001\ns001', sales: '3' }), ['s001', 'set001'], 'セットの売上分類は構成品から導いて絞る');
+  assert.deepEqual(await q({ codes: 'k001\nk002', state: 'discontinued' }), []);
+  // 画面の部品から: 選ぶ欄・範囲
+  await advGo(p, async () => { await p.fill('#adv-name', 'はちみつ'); await p.selectOption('#adv-tax', '8'); await p.fill('input[name="cost_max"]', '200'); });
+  assert.deepEqual(await listCodes(p), ['k003']);
+});
+
+await ta('[20] 注文残 (発注アプリ)・在庫 (ロジザード) (10/5): 一覧の列・「注文残あり」と在庫の範囲で絞る・1 つの商品の画面の内訳と「いつの写しか」・セットは作れる数・古い / 読めない', async (p) => {
+  await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns001\ns002\nset001\nk006' }));
+  const c = Object.fromEntries((await cells(p)).map((x) => [x.code, x]));
+  assert.deepEqual([c.k001.stock, c.k001.po], ['15', '7'], 'k001: 在庫 = 全部のロケ・品質区分の合計 (大文字の商品ID も同じ)・注文残 = 10 − 取消 3');
+  assert.deepEqual([c.s001.stock, c.s001.po], ['10', ''], '注文残 0 = 空');
+  assert.deepEqual([c.s002.stock, c.s002.po], ['5', '4']);
+  assert.equal(c.set001.stock, '5作れる', 'セット = 構成品から作れる数 (s001 10 ÷ 1・s002 5 ÷ 1 の小さい方)');
+  assert.deepEqual([c.k006.stock, c.k006.po], ['0', ''], '写しに無い = 0');
+  const th = await p.textContent('#list-tbl thead');
+  assert.match(th, /在庫\d{2}:\d{2}/, '見出しに写しの時刻');
+  assert.doesNotMatch(th, /古い|読めない/);
+  if (SHOT2) await p.screenshot({ path: `${SHOT2}/一覧_在庫と注文残の列.png`, fullPage: true });
+  const q = async (qs) => { await p.goto(B + '/?' + new URLSearchParams(qs)); return listCodes(p); };
+  assert.deepEqual(await q({ po: '1' }), ['k001', 's002'], '注文残あり (境界より前の発注は入らない)');
+  const st10 = await q({ stock_min: '10', kind: 'single' });
+  assert.deepEqual(st10, ['k001', 's001']);
+  assert.deepEqual(await q({ stock_max: '0', name: 'みかん' }), ['k006'], '在庫 0 (写しに無い) も範囲に入る');
+  // 1 つの商品の画面
+  await p.goto(B + '/sku/k001');
+  assert.equal(await p.textContent('#ref-stock'), '15');
+  assert.match(await p.textContent('#ref-stock-when'), /時点/);
+  assert.doesNotMatch(await p.textContent('#ref-stock-when'), /古い/);
+  assert.equal(await p.textContent('#ref-po'), '7');
+  const lines = await p.textContent('#ref-po-lines');
+  assert.match(lines, /AMC/); assert.match(lines, /未定/);
+  if (SHOT2) await p.screenshot({ path: `${SHOT2}/単品_在庫と注文残.png`, fullPage: true });
+  await p.goto(B + '/sku/s002');
+  assert.match(await p.textContent('#ref-po-lines'), /10\/20 \(火\) 回答/);
+  await p.goto(B + '/sku/set001');
+  assert.equal(await p.textContent('#ref-stock'), '5');
+  assert.match(await p.textContent('#ref-box'), /作れる数/);
+  assert.equal(await p.locator('#ref-po').count(), 0, 'セットは注文残を出さない (発注は単品)');
+  // 古い (2 時間より前)
+  mirrorDb.prepare('update mirror_logizard_stock set captured_at = ?').run(new Date(Date.now() - 3 * 3600e3).toISOString());
+  __clearStockCache();
+  await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001' }));
+  assert.match(await p.textContent('#list-tbl thead'), /古い/);
+  await p.goto(B + '/sku/k001');
+  assert.match(await p.textContent('#ref-stock-when'), /古い/);
+  // 読めない (写しが無い)
+  const keep = mirrorDb.prepare('select * from mirror_logizard_stock').all();
+  mirrorDb.prepare('delete from mirror_logizard_stock').run();
+  __clearStockCache();
+  await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001' }));
+  assert.match(await p.textContent('#list-tbl thead'), /読めない/);
+  assert.equal((await cells(p))[0].stock, '—');
+  assert.deepEqual(await q({ stock_min: '1' }), [], '読めないときは在庫の範囲で当てない');
+  await p.goto(B + '/sku/k001');
+  assert.match(await p.textContent('#ref-stock-when'), /読めない/);
+  const ins = mirrorDb.prepare(`insert into mirror_logizard_stock (${Object.keys(keep[0]).map((k) => `"${k}"`).join(', ')}) values (${Object.keys(keep[0]).map(() => '?').join(', ')})`);
+  for (const r of keep) ins.run(...Object.values(r));
+  mirrorDb.prepare('update mirror_logizard_stock set captured_at = ?').run(new Date(Date.now() - 20 * 60e3).toISOString());
+  __clearStockCache();
+});
+
+await ta('[21] 在庫の範囲で絞る = 一覧に出す値 (セットは作れる数) で絞る (#1620 Codex R1 M1)', async (p) => {
+  const q = async (qs) => { await p.goto(B + '/?' + new URLSearchParams(qs)); return listCodes(p); };
+  // set001 は構成品 s001 (10) と s002 (5) から 5 作れる (セット自身の行はロジザードに無い)
+  assert.deepEqual(await q({ codes: 'set001', stock_min: '1' }), ['set001'], '作れる数 5 は 1 以上に入る');
+  assert.deepEqual(await q({ codes: 'set001', stock_max: '0' }), [], '作れる数 5 は 0 以下に入らない');
+  assert.deepEqual(await q({ codes: 'set001\ns001\ns002', stock_min: '5', stock_max: '5' }), ['s002', 'set001'], '単品は在庫・セットは作れる数');
+  assert.equal(await p.textContent('#list-tbl tbody tr:has-text("set001") td:nth-child(8)'), '5作れる');
+});
+
+await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 Codex R1 M3): 無い人 = 列・絞り込み・内訳を出さず「権限がないので出せません」', async (p) => {
+  SESSION_APPS = ['master-edit'];
+  try {
+    await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns002' }));
+    assert.doesNotMatch(await p.textContent('#list-tbl thead'), /注文残/, '列を出さない');
+    assert.deepEqual((await cells(p)).map((x) => x.code), ['k001', 's002']);
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td').count(), 9, '行の欄も 1 つ少ない');
+    assert.equal(await p.locator('input[name="po"]').count(), 0, '「注文残あり」を出さない');
+    assert.match(await p.textContent('#po-denied'), /注文残 \(発注アプリの権限がないので出せません\)/);
+    // URL に po=1 を付けても、注文残のある商品だけに絞らない (どの商品に注文残があるかを出さない)
+    await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns001\ns002', po: '1' }));
+    assert.deepEqual(await listCodes(p), ['k001', 's001', 's002']);
+    await p.goto(B + '/sku/k001');
+    assert.match(await p.textContent('#ref-po-why'), /注文残 \(発注アプリの権限がないので出せません\)/);
+    assert.equal(await p.locator('#ref-po').count(), 0);
+    assert.equal(await p.locator('#ref-po-lines').count(), 0, '内訳 (仕入先・発注日・数・納期) を出さない');
+    assert.doesNotMatch(await p.content(), /PO-2026-0001|AMC<\/td>/);
+    assert.equal(await p.textContent('#ref-stock'), '15', '在庫 (ロジザード) は出す');
+  } finally { SESSION_APPS = ['master-edit', 'purchase-orders']; }
+  // ある人 (* も同じ)
+  SESSION_APPS = '*';
+  try {
+    await p.goto(B + '/sku/k001');
+    assert.equal(await p.textContent('#ref-po'), '7');
+  } finally { SESSION_APPS = ['master-edit', 'purchase-orders']; }
+});
+
+await ta('[23] 詳細検索の長い条件 (#1620 Codex R1 M2): 本物の HTTP で商品コード 500 件 = 印 (?s=) で開ける・501 件 = 500 件まで・GET に載せると 431・Origin と JSON の守り・期限切れ', async (p) => {
+  const origin = new URL(B).origin;
+  const code30 = (i) => `nope-${String(i).padStart(4, '0')}-${'x'.repeat(30)}`.slice(0, 30);
+  const codes500 = ['k001', ...Array.from({ length: 499 }, (_, i) => code30(i))];
+  const post = (body, headers = {}) => fetch(B + '/api/search', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json', Accept: 'application/json', ...headers }, body: JSON.stringify(body) });
+  // GET の URL にそのまま載せる = Express に届く前に 431 (これを避けるための印)
+  const raw = await fetch(B + '/?' + new URLSearchParams({ codes: codes500.join('\n') }));
+  assert.equal(raw.status, 431, `GET に 500 件 = ${raw.status}`);
+  // 守り = 保存の POST と同じ (Origin が Host と同じ・JSON)
+  assert.equal((await post({ codes: 'k001' }, { Origin: 'https://evil.example' })).status, 403);
+  assert.equal((await fetch(B + '/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403, 'Origin なし');
+  assert.equal((await post({ codes: 'k001' }, { 'Content-Type': 'application/x-www-form-urlencoded' })).status, 415);
+  // 500 件 = 全部使う
+  const j = await (await post({ codes: codes500.join('\n'), kind: 'single', q: '' })).json();
+  assert.equal(j.ok, true);
+  assert.match(j.url, /^\/apps\/master-edit\/\?kind=single&s=[A-Za-z0-9_-]{22}$/, j.url);
+  const page500 = await (await fetch(origin + j.url)).text();
+  assert.match(page500, /499 件 見つからない/);
+  assert.doesNotMatch(page500, /500 件までを使いました/);
+  assert.match(page500, /href="sku\/k001"/);
+  // 501 件 = 500 件まで (知らせる)
+  const j2 = await (await post({ codes: [...codes500, 'k002'].join('\n') })).json();
+  const page501 = await (await fetch(origin + j2.url)).text();
+  assert.match(page501, /500 件までを使いました/);
+  assert.doesNotMatch(page501, /href="sku\/k002"/, '501 件目は使わない');
+  // 画面から: 500 件を貼って「この条件で探す」= 印の URL で開く・区分の札を押しても条件が残る (URL は短いまま)
+  await p.goto(B + '/');
+  await p.click('#adv > summary');
+  await p.fill('#adv-codes', codes500.join('\n'));
+  await Promise.all([p.waitForNavigation(), p.click('#adv-form button[type="submit"]')]);
+  assert.match(p.url(), /\?s=[A-Za-z0-9_-]{22}$/);
+  assert.deepEqual(await listCodes(p), ['k001']);
+  assert.match(await p.textContent('#not-found'), /499 件 見つからない/);
+  assert.equal((await p.inputValue('#adv-codes')).split('\n').length, 500, '欄には条件が戻る');
+  await Promise.all([p.waitForNavigation(), p.click('.chips a.chip:has-text("単品")')]);
+  assert.ok(p.url().length < 200, `札の URL も短い (${p.url().length})`);
+  assert.deepEqual(await listCodes(p), ['k001']);
+  // 期限切れ・再起動で消えた印
+  __clearSearchTokens();
+  await p.reload();
+  assert.match(await p.textContent('#search-expired'), /条件の期限が切れました。もう一度検索してください/);
+  assert.deepEqual(await listCodes(p), [], '消えた条件で全部を出さない');
+  // 短い条件は今までどおり GET (URL に条件が残る)
+  await p.goto(B + '/');
+  await p.click('#adv > summary');
+  await p.fill('#adv-codes', 'k001\nk002');
+  await Promise.all([p.waitForNavigation(), p.click('#adv-form button[type="submit"]')]);
+  assert.equal(new URL(p.url()).searchParams.get('codes').replace(/\r/g, ''), 'k001\nk002');
+});
+
 const SHOTDIR = process.env.MASTER_EDIT_UI_SHOTS || '';
 for (const [label, vp] of [['1440', { width: 1440, height: 900 }], ['1280', { width: 1280, height: 720 }], ['1024', { width: 1024, height: 768 }]]) {
   await ta(`[17] ${label} 幅: 一覧をスクロールしても見出しの行 (コード・名前・…) が上の帯のすぐ下に見えている・横に送っても列がずれない (10/5)`, async (p) => {
@@ -503,7 +734,9 @@ for (const [label, vp] of [['1440', { width: 1440, height: 900 }], ['1280', { wi
     if (SHOTDIR) await p.screenshot({ path: `${SHOTDIR}/一覧_${label}_上.png` });
     const pos = () => p.evaluate(() => {
       const th = document.querySelector('#list-tbl thead th'); const r = th.getBoundingClientRect();
-      const hit = document.elementFromPoint(r.left + 20, r.top + r.height / 2);
+      // 見えている所 (表の囲いの左から 40px) で、見出しの行の高さの真ん中 = 一番上に見えているのが見出しか (横に送っても)
+      const wr = th.closest('.tblwrap').getBoundingClientRect();
+      const hit = document.elementFromPoint(wr.left + 40, r.top + r.height / 2);
       const td = document.querySelector('#list-tbl tbody tr td');
       return { top: r.top, left: r.left, tdLeft: td.getBoundingClientRect().left, hdr: document.querySelector('.hdr').getBoundingClientRect().bottom, seen: !!(hit && hit.closest('thead')), text: th.textContent.trim() };
     });
@@ -559,5 +792,6 @@ for (const [label, vp, scale] of [['1280×720 100%', { width: 1280, height: 720 
 
 await browser.close();
 server.close();
+try { mirrorDb.close(); fs.rmSync(DATA_TMP, { recursive: true, force: true }); } catch { /* 消せなくてもよい */ }
 console.log(`\n${passed} 件 ok`);
 if (process.exitCode) console.error('NG があります');
