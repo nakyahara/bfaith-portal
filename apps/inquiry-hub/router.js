@@ -1193,14 +1193,23 @@ router.get('/inquiries/:id', (req, res) => {
       return s.toLowerCase().replace(/[\\s\\u2010-\\u2015\\u2212-]/g, '');
     }
     // お客様ごとの情報が残っていないか。テンプレート名 (初期値 = 件名) と本文の両方を見る。
-    // 姓だけ「山田様」と書くことが多いので、名前の最初の語も見る
+    // 姓だけ「山田様」と書くことが多いので、名前の最初の語も見る。空白のない名前 (山田太郎) は
+    // どこまでが姓か分からないので、先頭 2〜4 文字に「様」が続く形 (山田様) を探す
     function checkPersonal() {
       var hay = pnorm(nameEl.value + '\\n' + bodyEl.value), hits = [];
       var nm = ST_SEED.customerName;
       if (nm) {
         var first = nm.split(/[\\s\\u3000]+/)[0];
-        if (pnorm(nm).length >= 2 && hay.indexOf(pnorm(nm)) >= 0) hits.push('お客様の名前「' + nm + '」');
-        else if (first && pnorm(first).length >= 2 && hay.indexOf(pnorm(first)) >= 0) hits.push('お客様の名前「' + first + '」');
+        var hit = '';
+        if (pnorm(nm).length >= 2 && hay.indexOf(pnorm(nm)) >= 0) hit = nm;
+        else if (first && first !== nm && pnorm(first).length >= 2 && hay.indexOf(pnorm(first)) >= 0) hit = first;
+        else {
+          var chars = Array.from(pnorm(nm));
+          for (var k = Math.min(4, chars.length - 1); k >= 2 && !hit; k--) {
+            if (hay.indexOf(chars.slice(0, k).join('') + '様') >= 0) hit = chars.slice(0, k).join('') + '様';
+          }
+        }
+        if (hit) hits.push('お客様の名前「' + hit + '」');
       }
       var on = pnorm(ST_SEED.orderNumber);
       if (on.length >= 4 && hay.indexOf(on) >= 0) hits.push('注文番号「' + ST_SEED.orderNumber + '」');
@@ -1270,7 +1279,12 @@ router.get('/inquiries/:id', (req, res) => {
         closeDlg();
         if (window.ihResetTplCache) window.ihResetTplCache();
         toast('「' + group + '」に「' + name + '」を登録しました');
-      }).catch(function(e) { setSaving(false); toast('保存に失敗しました: ' + e.message); });
+      }).catch(function(e) {
+        setSaving(false);
+        toast('保存に失敗しました: ' + e.message);
+        // 応答だけ途切れて実は登録できていることがある → 一覧を取り直し、もう一度押したら「同じ名前があります」で止める
+        load();
+      });
     });
   })();
   // 📧 今後の自動処理 (メールルール作成。複数条件を組み合わせられる)
