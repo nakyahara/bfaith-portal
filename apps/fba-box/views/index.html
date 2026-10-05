@@ -2461,11 +2461,14 @@ ${j.message || ''}
       const qtyIn = dlg.querySelector('#q-qty');
       // 空欄・数字以外は NaN (Number('') = 0 で「送らない」にしない)
       const readQty = () => { const raw = qtyIn.value.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).trim(); return /^\d{1,6}$/.test(raw) ? Number(raw) : NaN; };
-      // 予定より多い数のときは、減らす理由 (在庫が少ない・破損・今回は納品しない) を押せなくして「本社指示」に寄せる
+      // 予定より多い数のときは、減らす理由 (在庫が少ない・破損・今回は納品しない) を押せなくして「本社指示」に寄せる。
+      // 寄せたあと予定以下に戻したら、寄せる前の理由に戻す (人が選んでいない「本社指示」を残さない — Codex PR #1621 R1 Medium)
+      let autoFrom = null;   // 自動で「本社指示」に寄せる前の理由。人が理由を押したら消す
       const paint = () => {
         const q = readQty();
         const over = Number.isInteger(q) && q > row.planned_qty;
-        if (over && !EXTRA_REASONS.includes(reason)) reason = 'hq_order';
+        if (over && !EXTRA_REASONS.includes(reason)) { autoFrom = reason; reason = 'hq_order'; }
+        else if (!over && autoFrom) { reason = autoFrom; autoFrom = null; }
         dlg.querySelectorAll('.qrsn').forEach(b => {
           const off = over && !EXTRA_REASONS.includes(b.dataset.v);
           b.disabled = off; b.style.opacity = off ? '0.35' : '';
@@ -2479,7 +2482,7 @@ ${j.message || ''}
       paint();
       dlg.querySelectorAll('.qrsn').forEach(b => b.addEventListener('click', () => {
         if (b.disabled) return;
-        reason = b.dataset.v; paint();
+        reason = b.dataset.v; autoFrom = null; paint();
       }));
       dlg.querySelector('#q-go').addEventListener('click', async () => {
         const msg = dlg.querySelector('#q-msg');

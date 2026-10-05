@@ -2521,10 +2521,12 @@ export function shortageBreakdownFor({ shortage = 0, reason = null, detail = nul
  * Amazon の STA のプランの数量は本社が直す (出荷前チェック・本社向け一覧に「数量を 4 → 5 に変更」と出る)
  */
 export const EXTRA_REASONS = ['hq_order', 'other'];
+const SEND_QTY_MAX = 999999;   // iPad の入力欄 (6 桁) と同じ
 export function setRowSendQty({ rowId, sendQty, reason = 'stock_short', worker, deviceLabel }) {
   // 🚨 空 (null / '') を Number で 0 にしない = 「1 個も送らない」に化ける
   const q = sendQty === null || sendQty === undefined || String(sendQty).trim() === '' ? NaN : Number(sendQty);
-  if (!Number.isInteger(q) || q < 0) return { ok: false, error: 'bad_qty', message: '送る数は 0 以上の整数で入力してください' };
+  // 予定より多くできるようになったので上限も見る (1e100 など。iPad の入力欄と同じ 6 桁まで — Codex PR #1621 R1 Low)
+  if (!Number.isSafeInteger(q) || q < 0 || q > SEND_QTY_MAX) return { ok: false, error: 'bad_qty', message: `送る数は 0〜${SEND_QTY_MAX} の整数で入力してください` };
   const reasonKey = String(reason || 'stock_short');
   if (!SHORTAGE_REASONS.includes(reasonKey)) return { ok: false, error: 'bad_reason', message: '理由を選んでください' };
   const d = getDB();

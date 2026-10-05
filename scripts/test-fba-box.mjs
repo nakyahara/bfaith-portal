@@ -1718,6 +1718,9 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     // 🚨 空 (null / '') を 0 = 「1 個も送らない」にしない
     assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: null, worker: staff }).error, 'bad_qty');
     assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: '', worker: staff }).error, 'bad_qty');
+    // 上限 (iPad の入力欄と同じ 6 桁)。1e100 のような安全でない整数も断る (Codex PR #1621 R1 Low)
+    assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 1e100, reason: 'hq_order', worker: staff }).error, 'bad_qty');
+    assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 1000000, reason: 'hq_order', worker: staff }).error, 'bad_qty');
     assert.equal(db.setRowSendQty({ rowId: row.id, sendQty: 25, reason: 'nope', worker: staff }).error, 'bad_reason');
     const r = db.setRowSendQty({ rowId: row.id, sendQty: 25, worker: staff, deviceLabel: 'iPad' });
     assert.equal(r.ok, true, JSON.stringify(r));
