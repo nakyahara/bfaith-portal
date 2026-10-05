@@ -108,6 +108,10 @@ export function buildNewProductContext(db, codeKeys, { today = jstDateStr() } = 
   //    表ごと無い / 空 = miniPC 同期前 → unknown に倒す (「取れなかった」を「新商品ではない」にしない)
   const launch = new Map();
   let anySource = false;
+  // 商品区分 (PML → mirror_products の順)。セットは判定の対象外 (#1624 Codex R1 Low): 入荷の行はロジザードの入荷 CSV の商品ID = 物の単位で、
+  //   NE のセットは構成の単品で入ってくる。セットの登録日は 2026-10 まで空 = いつも unknown だったので、セットの作成日が入っても今までどおり unknown に止める
+  //   (裏面ラベルの写真を必須にしない)
+  const kindOf = new Map();
 
   //   (a) 商品管理リスト (公開中の run のみ)。登録日と最終仕入日をまとめて引く
   const supplied = new Map();   // code_key → 最終仕入日 (空文字 = 一度も仕入なし)
@@ -117,9 +121,10 @@ export function buildNewProductContext(db, codeKeys, { today = jstDateStr() } = 
     if (pub && pub.run_id) {
       pmlReady = db.prepare('SELECT EXISTS (SELECT 1 FROM mirror_pml_snapshot_rows WHERE run_id = ?) AS e').get(pub.run_id).e === 1;
       anySource = anySource || pmlReady;
-      chunked(`SELECT LOWER(TRIM(商品コード)) AS k, 最終仕入日 AS d, 登録日 AS reg
+      chunked(`SELECT LOWER(TRIM(商品コード)) AS k, 最終仕入日 AS d, 登録日 AS reg, 商品区分 AS kind
         FROM mirror_pml_snapshot_rows WHERE run_id = ? AND LOWER(TRIM(商品コード)) IN (@IN@)`, (r) => {
         if (!r.k) return;
+        if (r.kind) kindOf.set(r.k, r.kind);
         supplied.set(r.k, r.d || '');
         if (r.reg) launch.set(r.k, r.reg);
       }, pub.run_id);
@@ -131,8 +136,9 @@ export function buildNewProductContext(db, codeKeys, { today = jstDateStr() } = 
   if (tableExists(db, 'mirror_products')) {
     mirrorReady = db.prepare('SELECT EXISTS (SELECT 1 FROM mirror_products) AS e').get().e === 1;
     anySource = anySource || mirrorReady;
-    chunked(`SELECT LOWER(TRIM(商品コード)) AS k, new_product_launch_date AS d
+    chunked(`SELECT LOWER(TRIM(商品コード)) AS k, new_product_launch_date AS d, 商品区分 AS kind
       FROM mirror_products WHERE LOWER(TRIM(商品コード)) IN (@IN@)`, (r) => {
+      if (r.k && !kindOf.has(r.k) && r.kind) kindOf.set(r.k, r.kind);
       if (r.k && !launch.has(r.k) && r.d) launch.set(r.k, r.d);
       if (r.k && !launch.has(r.k)) launch.set(r.k, null);   // 行はあるが登録日が空 = そう記録する
     });
@@ -159,6 +165,10 @@ export function buildNewProductContext(db, codeKeys, { today = jstDateStr() } = 
     // 登録日を引ける表が1つも来ていない → 判定材料が無い。止めない
     if (!anySource) {
       out.set(k, { verdict: 'unknown', launch_date: null, reason: '商品マスタがまだ届いていないため判定できません' });
+      continue;
+    }
+    if (kindOf.get(k) === 'セット') {
+      out.set(k, { verdict: 'unknown', launch_date: null, reason: 'セット商品は新商品の判定の対象外です (入荷するのは構成の単品)' });
       continue;
     }
     const d = normalizeDate(launch.get(k));

@@ -497,5 +497,25 @@ console.log('[23] 再送で置き換えた旧行は Drive から拾い直して�
   ok(bl.photosOf('new-u').every((x) => x.id !== oldRow.id), '退けた旧行は一覧にも出ない');
 }
 
+console.log('[24] セット商品は新商品の判定の対象外 (セットの作成日が登録日に入っても unknown のまま。#1624 Codex R1 Low)');
+{
+  // 商品管理リストにセットの登録日 (NE のセットの作成日) が入った
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+    VALUES (161, 'SET-N', '新しいセット', 'セット', '取扱中', 'unknown', NULL, ?)`).run(now);
+  db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 商品区分, 最終仕入日, 登録日) VALUES ('run-1', 'SET-N', '新しいセット', 'セット', '', ?)`).run(`${d(2)} 10:00:00`);
+  // 商品管理リストにまだ載っていないセット (商品マスタだけ・発売日を手で入れた)
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+    VALUES (162, 'SET-M', '商品マスタだけのセット', 'セット', '取扱中', 'unknown', ?, ?)`).run(d(1), now);
+  // 比べ: 同じ条件の単品は新商品
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+    VALUES (163, 'ONE-N', '新しい単品', '単品', '取扱中', 'unknown', NULL, ?)`).run(now);
+  db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 商品区分, 最終仕入日, 登録日) VALUES ('run-1', 'ONE-N', '新しい単品', '単品', '', ?)`).run(`${d(2)} 10:00:00`);
+  const m = np.buildNewProductContext(db, ['SET-N', 'set-m', 'ONE-N'], { today });
+  ok(m.get('set-n').verdict === 'unknown' && /セット商品は新商品の判定の対象外/.test(m.get('set-n').reason), 'セット (登録日が 2 日前・入庫履歴なし) は unknown = 裏面ラベルを必須にしない');
+  ok(m.get('set-m').verdict === 'unknown', '商品マスタだけのセットも unknown');
+  ok(m.get('one-n').verdict === 'new', '同じ条件の単品は新商品のまま');
+  ok(np.judgeNewProduct(db, 'SET-N', { today }).verdict === 'unknown', '1件だけの判定も同じ');
+}
+
 console.log(`\n${fail === 0 ? '✅' : '❌'} PASS ${pass} / FAIL ${fail}`);
 process.exit(fail === 0 ? 0 : 1);

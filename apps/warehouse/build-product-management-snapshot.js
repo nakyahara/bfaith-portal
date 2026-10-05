@@ -11,7 +11,8 @@
  *   f_sales_velocity_by_product … 7日/30日 × FBA/FBA以外 販売数 (③)
  *   m_reorder_setting       … 推奨保有月数 (②)
  *   raw_ne_set_products     … セットの 登録日 = NE のセットの作成日 (set_goods_creation_date)。raw_ne_products に作成日が無いセットだけ。
- *                             構成の行で作成日が食い違う・全部空 = 空 (どの日か決められない)
+ *                             構成の行で作成日が食い違う・空と日付が混ざる・全部空 = 空 (どの日か決められない)。
+ *                             最新の NE の API の完全な取得の世代 (完了の印の通し番号 = 今の raw の通し番号) のときだけ使う (CSV の取込の後などは空)
  *
  * 健全性ゲート (status):
  *   failed  … velocity 無し / FBA在庫日付 無し / ne_fba_overlap>0 / velocity as_of が VELOCITY_MAX_LAG_DAYS 超過
@@ -22,7 +23,7 @@
  * 使い方: node apps/warehouse/build-product-management-snapshot.js
  */
 import crypto from 'crypto';
-import { getDB, initDB } from './db.js';
+import { getDB, initDB, readNeRawRev } from './db.js';
 
 const VELOCITY_MAX_LAG_DAYS = parseInt(process.env.PML_VELOCITY_MAX_LAG_DAYS || '2', 10);
 const FBA_MAX_LAG_DAYS = parseInt(process.env.PML_FBA_MAX_LAG_DAYS || '3', 10);
@@ -147,6 +148,13 @@ export async function buildProductManagementSnapshot({ fbaSource = 'daily' } = {
     : `LEFT JOIN (SELECT NULL AS ne_code, 0 AS qty) fba ON 1=0`;
   const fbaSub = fbaSource === 'live' ? liveFbaSub : dailyFbaSub;
   const params = (fbaSource === 'live' || !fbaBizDate) ? [] : [fbaBizDate];
+  // セットの作成日を 登録日 に使うのは、最新の NE の API の完全な取得の世代のときだけ (#1624 Codex R1 Medium 2)。
+  //   完了の印 (ne_api_setproducts_complete_at) があり、その印の通し番号 (_complete_rev) が今の raw の通し番号 (ne_raw_setproducts_rev) と同じ
+  //   = 印の後に CSV の取込などで書き換わっていない。違えばセットの 登録日 は空 (登録日は一度入ると変えられない = 疑わしい日は入れない)
+  const setMark = Object.fromEntries(db.prepare("SELECT key, value FROM sync_meta WHERE key IN ('ne_api_setproducts_complete_at', 'ne_api_setproducts_complete_rev')").all().map(r => [r.key, r.value]));
+  const setDatesTrusted = !!setMark.ne_api_setproducts_complete_at && setMark.ne_api_setproducts_complete_rev != null
+    && String(setMark.ne_api_setproducts_complete_rev) === String(readNeRawRev('setproducts'));
+  if (!setDatesTrusted) console.log('[pml-snapshot] セットの作成日は使わない (NE の API の完全な取得の印が無い / 印の後に書き換わった) → セットの 登録日 は空');
   const srcRows = db.prepare(`
     SELECT
       m.商品コード, m.商品名, m.取扱区分, m.商品区分, m.売上分類,
@@ -154,7 +162,7 @@ export async function buildProductManagementSnapshot({ fbaSource = 'daily' } = {
       COALESCE(ne.仕入先コード, m.仕入先コード) AS 仕入先,
       ne.最終仕入日, ne.在庫数 AS 自社在庫, ne.引当数, ne.発注残数 AS 注残数,
       ne.発注ロット単位, ne.代表商品コード, ne.ロケーションコード, ne.商品分類タグ,
-      COALESCE(NULLIF(ne.作成日, ''), CASE WHEN m.商品区分 = 'セット' AND sc.n = 1 THEN sc.d END) AS 登録日,
+      COALESCE(NULLIF(ne.作成日, ''), CASE WHEN m.商品区分 = 'セット' AND sc.n = 1 AND sc.d <> '' THEN sc.d END) AS 登録日,
       COALESCE(v.qty_7d_fba,0) AS s7f, COALESCE(v.qty_7d_nonfba,0) AS s7n, COALESCE(v.qty_7d_total,0) AS s7t,
       COALESCE(v.qty_30d_fba,0) AS s30f, COALESCE(v.qty_30d_nonfba,0) AS s30n, COALESCE(v.qty_30d_total,0) AS s30t,
       r.推奨保有月数,
@@ -164,12 +172,12 @@ export async function buildProductManagementSnapshot({ fbaSource = 'daily' } = {
     LEFT JOIN f_sales_velocity_by_product v ON m.商品コード = v.商品コード COLLATE NOCASE
     LEFT JOIN m_reorder_setting r ON m.商品コード = r.sku COLLATE NOCASE
     LEFT JOIN (
-      SELECT LOWER(セット商品コード) AS code, MIN(TRIM(作成日)) AS d, COUNT(DISTINCT TRIM(作成日)) AS n
-        FROM raw_ne_set_products WHERE COALESCE(TRIM(作成日), '') <> '' GROUP BY LOWER(セット商品コード)
+      SELECT LOWER(セット商品コード) AS code, MIN(COALESCE(TRIM(作成日), '')) AS d, COUNT(DISTINCT COALESCE(TRIM(作成日), '')) AS n
+        FROM raw_ne_set_products WHERE ? = 1 AND synced_at = ? GROUP BY LOWER(セット商品コード)
     ) sc ON m.商品コード = sc.code COLLATE NOCASE
     ${fbaSub}
     ORDER BY m.商品コード
-  `).all(...params);
+  `).all(setDatesTrusted ? 1 : 0, setMark.ne_api_setproducts_complete_at || '', ...params);
 
   const rows = srcRows.map(s => {
     const own = s.自社在庫 ?? 0;

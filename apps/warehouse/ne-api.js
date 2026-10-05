@@ -294,6 +294,18 @@ async function fetchSetProducts() {
   let droppedMissingKey = 0, droppedMissingParent = 0;
   const missingChildParents = new Set();   // 親はあるが子のコードが空 (C2。Codex C2-R0 M5 = その親だけ照合を止める)
   const spell = { set: new Map(), child: new Map(), set_rep: new Map() };   // NE のコードの元の書き方 (③b-1b。保存の前に全部の行から)
+  // セットの作成日は親ごとに 1 つに決まるときだけ使う (#1624 Codex R1 Medium 1)。保存の前の全部の行 (同じ親 × 子の重複・子のコードが空の行も) で集める
+  //   = 保存 (INSERT OR REPLACE) の後では重複の前の値が消えて食い違いが見えない。日付が 2 つ以上・空と日付が混ざる親 = 全部の行を NULL
+  //   (登録日は一度入ると変えられないので、疑わしい日は入れない)
+  const setDates = new Map();   // setCode → Set (trim した元の値。無い・null・空 = '')
+  for (const item of allItems) {
+    const setCode = (item.set_goods_id || '').toLowerCase();
+    if (!setCode) continue;
+    if (!setDates.has(setCode)) setDates.set(setCode, new Set());
+    setDates.get(setCode).add(String(item.set_goods_creation_date ?? '').trim());
+  }
+  const setDateOf = (setCode) => { const ds = setDates.get(setCode); return ds && ds.size === 1 ? ([...ds][0] || null) : null; };
+  const dateConflicts = [...setDates].filter(([, ds]) => ds.size > 1).map(([c]) => c);
   for (const item of allItems) {
     const setCode = (item.set_goods_id || '').toLowerCase();
     const childCode = (item.set_goods_detail_goods_id || '').toLowerCase();
@@ -323,7 +335,7 @@ async function fetchSetProducts() {
       (item.set_goods_representation_id || '').toLowerCase(),
       ts,
       neSrc(item.set_goods_selling_price), neSrc(item.set_goods_detail_quantity),
-      item.set_goods_creation_date || null,   // 無い・空 = NULL (分からない)
+      setDateOf(setCode),   // 親ごとに 1 つに決まる作成日。無い・空・食い違い = NULL (分からない)
     ]);
   }
   const parentConflicts = [...parentAttrs].filter(([, s]) => s.size > 1).map(([c]) => c);
@@ -332,7 +344,8 @@ async function fetchSetProducts() {
   const setIntegrity = { fetched_rows: allItems.length, valid_rows: validRows.length, dropped_missing_key: droppedMissingKey,
     dropped_missing_parent: droppedMissingParent, missing_child_parents: [...missingChildParents],
     parent_conflict_count: parentConflicts.length, parent_conflicts: parentConflicts,
-    pair_dup_count: pairDups.length, pair_dups: pairDups };
+    pair_dup_count: pairDups.length, pair_dups: pairDups,
+    creation_date_conflict_count: dateConflicts.length, creation_date_conflicts: dateConflicts };   // 作成日が食い違う (空と日付の混在を含む) 親 = 作成日を NULL にした
   if (validRows.length === 0) {
     const cur = db.prepare('SELECT COUNT(*) AS c FROM raw_ne_set_products').get().c;
     if (cur > 0) {
