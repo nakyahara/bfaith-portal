@@ -23,6 +23,9 @@
  *   ⑦-1 (0054・Amazon SKU の対応): 保存と削除の関数 (ops.save_amazon_sku_map / ops.delete_amazon_sku_map = 出品・対応・構成・保存の記録 done を関数の中で)・
  *   「未登録」の一覧と売上の公開のそろいの関数 (注文の表は読ませない) の実行と、対応の表・ASIN (catalog_items) を読むだけ。
  *   🚨 渡さない: core.amazon_sku_maps / core.listings / core.listing_components の書き込み (DELETE も = 墓標は消さない)・関数の中の部品 (ops.amazon_map_begin ほか)
+ *   FBA の在庫 (10/5・apps/master-edit/fba-stock.mjs): snapshots の usage と、在庫の日次の 2 つの表 (FBA_STOCK_SELECT) の select だけ。
+ *   🚨 mart (mart.v_sku_stock) は渡さない: 取得の時刻と内訳が無い・mart の usage を渡すと mart の関数も呼べる範囲が広がる。
+ *      snapshots の関数 = 月の分割を作る 2 つ (呼び手の権限 = schema の CREATE が要る = master_edit では何もできない) と trigger の関数だけ
  * master_ops      (手の操作 scripts/company-db/master-cutover.mjs が env COMPANY_DB_MASTER_OPS_URL で使う): ops.set_master_cutover_phase の実行と、段階・記録を読むだけ。
  *   ⑤-2a: 切替の日の backfill (ops.registration_backfill_plan / backfill_sku_registrations) と、登録をやめる (ops.transition_sku_registration) の実行・登録の状態を読む
  * master_observer (⑤-2 の夜間ロードが NE のセットの構成の観測を書く env COMPANY_DB_MASTER_OBSERVER_URL): ops.record_ne_set_observations の実行だけ
@@ -73,6 +76,8 @@ export const MASTER_EDIT_SELECT = [
   // ⑦-1 (0054): Amazon SKU の対応 (読むだけ)・ASIN
   'core.amazon_sku_maps', 'core.catalog_items',
 ];
+/** FBA の在庫 (参考・読むだけ。10/5): 在庫の日次の取れた日と行 (source = fba_jp ほか)。schema snapshots の usage も渡す (この 2 つの表のためだけ) */
+export const FBA_STOCK_SELECT = Object.freeze(['snapshots.stock_capture_days', 'snapshots.sku_stock_daily']);
 /** 保存の経路で書く表・列 (lib/master-write.mjs の saveSku)。insert も列を絞る */
 export const MASTER_EDIT_WRITE = [
   ['update (name, tax_rate, tax_class, handling, standard_price_jpy, shipping_code, shipping_method, shipping_cost_jpy, reorder_months, set_sales_class_override, handling_own)', 'core.skus'],
@@ -151,7 +156,7 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   }
   for (const [role, group] of Object.entries(MEMBER_OF)) s.push(`grant ${group} to ${role}`);
   // 前に付けた権限を外してから付け直す (流し直しで広い権限が残らない)
-  for (const t of new Set([...MASTER_EDIT_SELECT, ...MASTER_EDIT_WRITE.map(([, t2]) => t2), 'events.master_change_events', 'ops.master_legacy_gate_acks', 'ops.master_legacy_manifests', 'ops.master_cutover_events',
+  for (const t of new Set([...MASTER_EDIT_SELECT, ...FBA_STOCK_SELECT, ...MASTER_EDIT_WRITE.map(([, t2]) => t2), 'events.master_change_events', 'ops.master_legacy_gate_acks', 'ops.master_legacy_manifests', 'ops.master_cutover_events',
     'ops.master_write_sessions', 'ops.master_cutover_prereq_checks', ...REGISTER_OPS_SELECT, ...REG_CSV_OTHER_TABLES])) {
     s.push(`revoke all on ${t} from ${all}`);
   }
@@ -162,6 +167,8 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   // master_edit
   for (const sc of ['core', 'ops', 'events']) s.push(`grant usage on schema ${sc} to master_edit`);
   for (const t of MASTER_EDIT_SELECT) s.push(`grant select on ${t} to master_edit`);
+  s.push('grant usage on schema snapshots to master_edit');
+  for (const t of FBA_STOCK_SELECT) s.push(`grant select on ${t} to master_edit`);
   for (const [priv, t] of MASTER_EDIT_WRITE) s.push(`grant ${priv} on ${t} to master_edit`);
   s.push(`grant execute on function ${LOCK_SUPPLIERS_FUNCTION} to master_edit`);
   s.push(`grant execute on function ${BEGIN_WRITE_FUNCTION} to master_edit`);

@@ -28,6 +28,7 @@
  *  16 NE の観測の書き込み × 古い観測の昇格 (R3 M4): 昇格がセットの鍵を持っている間、新しい観測の書き込みは待つ (昇格の後に書かれる)
  *  17 画面のロールの直接の書き込み (R3 M2・R4 M2): begin_master_write の前は 42501・約束の相手でない SKU も 42501・偽の core.actor_* は記録に残らない
  *  18 新商品の NE 登録の CSV を作る取引 × 同じ商品の保存 (⑤-2b・0053): 保存は SKU の鍵で待ち、作った後の CSV (まだ配っていない) を「使わない」にしてから保存する
+ *  21 FBA の在庫 (10/5・apps/master-edit/fba-stock.mjs): master_edit のログインで在庫の日次の 2 つの表 (分割の親) を読める・分割の子を直接・書き込み・mart・ほかの在庫の表・分割を作る関数は 42501
  *  19 JAN を 2 つの商品に同時に付ける (⑤-2b): 後の方は一意の索引で待ち、前の方の commit の後に 409 jan_taken (500 にしない・両方は付かない)
  *  20 同じファイルの「取り込んだ」の申告が 2 つ並ぶ (⑤-2b・DB の関数 ops.ne_reg_declare): 後の方は鍵で待ち「もう一度」・NE 登録待ちへは 1 回だけ・画面のロールは表を直接書けない・
  *     約束を書く部品の関数 (ops.open_reg_write) を呼べない・JAN の行を直接書けない・申告の約束 (reg_csv_declare) は関数が書く (0053・#1571 R1 High 3)
@@ -586,6 +587,25 @@ try {
     const ev = (await q("select e.actor_id, e.request_id from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code = 'pnew2' and e.to_state = 'ne_pending'"))[0];
     const sess = await q("select s.actor_id, s.db_user, s.operation, d.status from ops.master_write_sessions s join ops.master_edit_requests d on d.request_id = s.request_id where s.request_id::text = $1", [ev.request_id]);
     assert.deepEqual([ev.actor_id, sess.map((s) => [s.actor_id, s.db_user, s.operation, s.status])], ['boss@test', [['boss@test', 'master_edit', 'reg_csv_declare', 'done']]]);
+  });
+  await ta('[21] FBA の在庫 (10/5): master_edit のログインで在庫の日次の 2 つの表を読める (分割の親を通して)・読むだけ (書けない・分割の子・mart・ほかの在庫の表・分割を作る関数は 42501)', async () => {
+    const { ingestStockDay } = await import('../apps/company-db/ingest/stock-daily.mjs');
+    const F = await import('../apps/master-edit/fba-stock.mjs');
+    const p1 = Number((await q("select sku_id from core.skus where code = 'p001'"))[0].sku_id);
+    const lid = (await q(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'amazon', 'main@A1VC38T7YXB528', 'pr-p001', 'active') returning listing_id`))[0].listing_id;
+    await O.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, sort_order, resolution, resolved_by_type) values (1, $1, $2, 1, 0, 'exact', 'system')`, [lid, p1]);
+    await ingestStockDay(dbO, { source: 'fba_jp', snapshot_date: '2030-01-10', captured_at: '2030-01-09T22:40:00.000Z',
+      rows: [{ code: 'pr-p001', fba_available: 12, fba_fc_transfer: 1, fba_fc_processing: 0, fba_customer_order: 2, fba_inbound_working: 3, fba_inbound_shipped: 0, fba_inbound_received: 0 }] },
+    { todayJst: '2030-01-10', now: NOW.getTime() });
+    const day = await F.readFbaDay(dbA, { now: NOW.getTime() });
+    assert.deepEqual([day.ok, day.date, day.asOf, day.stale], [true, '2030-01-10', '2030-01-09T22:40:00.000Z', false], JSON.stringify(day));
+    assert.deepEqual([...(await F.fbaAvailableOf(dbA, day, [String(p1)]))], [[String(p1), 12]]);
+    const one = await F.readFbaSku(dbA, day, String(p1));
+    assert.deepEqual([one.ok, one.total], [true, { available: 12, transfer: 1, processing: 0, customer: 2, inbound: 3, unknown: 0 }]);
+    for (const [sql, label] of [['update snapshots.sku_stock_daily set qty = qty where false', '日次の行の update'], ['delete from snapshots.stock_capture_days where false', '取れた日の delete'],
+      ['select 1 from snapshots.sku_stock_daily_default limit 1', '分割の子を直接'], ['select 1 from snapshots.warehouse_stock_daily limit 1', 'ロケの在庫の日次'],
+      ['select 1 from mart.v_sku_stock limit 1', 'mart の view'], ['select 1 from ops.ingest_runs limit 1', '取込の記録'],
+      ["select snapshots.ensure_month_partitions_for(array['sku_stock_daily'], '2031-05-01', '2031-05-31')", '分割を作る関数']]) await denied(A, sql, label);
   });
 } finally {
   for (const c of clients.reverse()) { try { await c.end(); } catch { /* */ } }
