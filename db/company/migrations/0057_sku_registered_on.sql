@@ -9,7 +9,11 @@
 -- 決まり:
 --   ・一度入った値は変えない (下の trigger)。夜間ロードは registered_on が空の行だけを埋める (NE の値が後から変わっても上書きしない)。
 --     ポータルで登録した商品は、あとで NE に登録しても (NE の作成日 = CSV を取り込んだ日) ポータルの日のまま
---   ・既にある行は空のまま (この migration では埋めない)。適用の後の最初の夜間ロードが、商品管理リストの公開 snapshot の 登録日 から単品を埋める
+--   ・既にある行は空のまま。ただし 0057 の前にポータルで登録した SKU (ops.master_registrations の origin = 'new_entry' = ⑤-2a の登録の関数が作った) だけは、
+--     この migration の中で先に portal・登録の状態の行を作った日 (created_at の JST の日付 = 登録の関数の v_today と同じ取引の時刻) で埋める (下の「0057 の前の
+--     ポータルの登録」)。埋めないと、単品は NE に登録した後の夜間ロードで NE の作成日 (= CSV を取り込んだ日) の ne で確定し、セットは NE の作成日を取らないので
+--     ずっと空になる (#1617 Codex R2 Medium)。この埋めも変更の記録と version が 1 回付く (source_system = migration_0057)
+--     それ以外の既にある行は、適用の後の最初の夜間ロードが、商品管理リストの公開 snapshot の 登録日 から単品を埋める
 --     (2026-10-05 の本番: 単品 5,059 件は全部 NE の作成日あり・セット 2,229 件と例外 89 件は無い = 空のまま = 画面は「—」)
 --   ・🚨 列の既定値は持たない (= 空)。書き手が明示する: 登録の関数 = 今日 + portal / 夜間ロード = NE の作成日・初めて見た日・空。
 --     既定値に「今日 + portal」を置くと、0057 の後に残った古い夜間ロードのプロセスや戻したコード (2 つの列を書かない INSERT) が、
@@ -44,6 +48,22 @@ begin
 end $$;
 create trigger trg_skus_registered_on_fixed before update of registered_on, registered_on_source on core.skus
   for each row execute function core.guard_sku_registered_on();
+
+-- 0057 の前のポータルの登録 (#1617 Codex R2 Medium): ⑤-2a (0052) の登録の関数で作った SKU = 登録の状態の行の origin = 'new_entry'。
+--   登録日 = その行を作った時刻 (created_at = 登録の関数の取引の now()) の JST の日付 = 0057 の後の登録の関数が書く v_today と同じ決め方。
+--   状態 (draft〜available・cancelled) は問わない = ポータルで作った SKU であることは変わらない。空の行だけ (trigger は 空 → 値 を通す)。
+--   変更の記録 (0026) と version が付く = 本番で数えた件数は README の 0057 の節。設定は同じ取引の中だけ (is_local)・終わったら消す
+select pg_catalog.set_config('core.actor_type', 'system', true), pg_catalog.set_config('core.source_system', 'migration_0057', true),
+       pg_catalog.set_config('core.reason', '0057: 0057 の前にポータルで登録した SKU の登録日 (ops.master_registrations の origin = new_entry の created_at の JST の日付)', true);
+update core.skus s
+   set registered_on = (r.created_at at time zone 'Asia/Tokyo')::date,
+       registered_on_source = 'portal'
+  from ops.master_registrations r
+ where r.sku_id = s.sku_id
+   and r.company_id = s.company_id
+   and r.origin = 'new_entry'
+   and s.registered_on is null;
+select pg_catalog.set_config('core.actor_type', '', true), pg_catalog.set_config('core.source_system', '', true), pg_catalog.set_config('core.reason', '', true);
 
 -- 新商品の登録の関数 (0052 の ops.register_new_sku) を作り直す: SKU の INSERT に登録日 (この取引の JST の今日 = v_today) と portal を明示して足すだけ。
 --   🚨 ほかは 0052 の定義と一字も変えない (0053〜0056 は作り直していない = 0052 が最新の定義)。署名・security definer・search_path・持ち主は同じ。
