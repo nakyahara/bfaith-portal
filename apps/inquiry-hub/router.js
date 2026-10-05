@@ -1177,11 +1177,21 @@ router.get('/inquiries/:id', (req, res) => {
       }
       syncNewCat();
     }
+    // いまあるテンプレを取り直す。取れたら true (同じ名前の確認ができる状態)
     function load() {
       return fetch('/apps/inquiry-hub/api/templates')
         .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-        .then(function(j) { known = j.templates || []; fillCats(j.categories, known); })
-        .catch(function(e) { fillCats([], []); toast('グループの読み込みに失敗しました: ' + e.message); });
+        .then(function(j) { known = j.templates || []; fillCats(j.categories, known); return true; })
+        .catch(function(e) {
+          if (cat.options.length <= 1) fillCats([], []);
+          toast('テンプレートの読み込みに失敗しました: ' + e.message);
+          return false;
+        });
+    }
+    // 保存ボタンは、いまあるテンプレを読めてから押せるようにする (同じ名前の確認をすり抜けない)
+    function loadThenEnable() {
+      saveBtn.disabled = true;
+      return load().then(function(ok) { if (!saving) saveBtn.disabled = !ok; });
     }
     function syncNewCat() {
       catNew.hidden = !isNewCat();
@@ -1230,7 +1240,7 @@ router.get('/inquiries/:id', (req, res) => {
       nameEl.value = ST_SEED.subject;
       catNew.value = '';
       checkPersonal();
-      load();
+      loadThenEnable();
       if (typeof stDlg.showModal === 'function') stDlg.showModal(); else stDlg.setAttribute('open', '');
       cat.focus();
     }
@@ -1282,8 +1292,9 @@ router.get('/inquiries/:id', (req, res) => {
       }).catch(function(e) {
         setSaving(false);
         toast('保存に失敗しました: ' + e.message);
-        // 応答だけ途切れて実は登録できていることがある → 一覧を取り直し、もう一度押したら「同じ名前があります」で止める
-        load();
+        // 応答だけ途切れて実は登録できていることがある → 一覧を取り直してから押せるようにし、
+        // もう一度押したら「同じ名前があります」で止める (取り直せなければ押せないまま)
+        loadThenEnable();
       });
     });
   })();
