@@ -2,6 +2,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title><%= title %> | B-Faith Portal</title>
   <link rel="icon" type="image/png" href="/favicon.png">
+  <%# この画面だけのファビコン (箱 = 商品・画面の色)。SVG を読めないブラウザは上の共通の PNG のまま %>
+  <link rel="icon" type="image/svg+xml" href="<%= locals.base || '/apps/master-edit' %>/public/favicon.svg?v=<%= locals.assetV || '' %>">
 <% if (locals.ui2) { %>
   <%# 新しいデザイン (一覧・1 つの商品・つかいかた・誤り)。CSS はこの画面だけのもの 1 つ (ポータル共通の style.css は読まない = 色がぶつからない) %>
   <meta name="color-scheme" content="dark">
