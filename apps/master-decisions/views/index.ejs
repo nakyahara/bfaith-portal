@@ -55,7 +55,8 @@
       </div>
     </section>
 
-    <div id="res" class="resbox" hidden></div>
+    <%# 決めた結果・失敗の欄 (読み上げ: 結果は status・失敗は alert。空なら見せない = md.css .resbox:empty。#1626 Codex R1 L4) %>
+    <div id="res" class="resbox" role="status" aria-live="polite"></div>
 
     <div class="tbl-top">
       <span><b id="count">–</b> 件</span><span id="count-sub"></span>
@@ -171,8 +172,8 @@
   /** 結果の箱 (一覧の上)。tone = ok / warn / err。html はエスケープ済み */
   function showRes(tone, title, html) {
     const box = $('res');
-    if (!title) { box.hidden = true; box.innerHTML = ''; return; }
-    box.hidden = false;
+    if (!title) { box.innerHTML = ''; box.setAttribute('role', 'status'); return; }
+    box.setAttribute('role', tone === 'err' ? 'alert' : 'status');
     box.innerHTML = '<div class="callout ' + (tone === 'ok' ? 'info' : tone) + '">' + icon(tone === 'ok' ? 'i-check' : tone === 'warn' ? 'i-warn' : 'i-x') + '<div class="grow"><div class="t">' + esc(title) + '</div>' + (html || '') + '</div>'
       + (lastApplied.length && CAN ? '<button class="btn sm" type="button" id="undo">' + icon('i-undo', 's') + '元に戻す (取り消す)</button>' : '') + '<button class="iconbtn" type="button" id="res-x" aria-label="この知らせを閉じる">' + icon('i-x', 's') + '</button></div>';
     if ($('undo')) $('undo').onclick = undo;

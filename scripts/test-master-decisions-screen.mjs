@@ -12,6 +12,8 @@
  *   7 CSV の画面: 判断の画面の「CSV を作る画面へ」で移る・作る → ファイルの札 (ダウンロードのリンク = api/csv/exports/N/file) → 確かめる → 結果を選ばずに申告 = 止める → 選んで申告
  *   8 名簿に無い人: 見るだけ (四角・決めるボタン・まとめての帯が無い・「見るだけです」)
  *   9 1440 / 1280 / 1024 幅: 判断・CSV・つかいかたの画面がページの横にはみ出さない・下の帯が画面の中
+ *  11 (#1626 Codex R1) 結果の欄の読み上げ (status / 失敗は alert)・CSV の「次にやること」のボタンが送る (作る所・ファイル・届かなかった行)・
+ *     書く操作の連打で POST は 1 回 (遅い通信でダブルクリック・押した直後にボタンが閉じる)・離れるときの確認が実機の確かめの欄を全部数えて最初の欄へ戻す
  *  10 部品はこの口から (マスタの入力の CSS・共通の動きを共有): 404 が無い・全体から探す (Ctrl+K) が開いて閉じる
  * 写しを撮る: env MASTER_DECISIONS_SHOTS=<フォルダ> を付けると 1440 / 1280 / 1024 幅の写しを置く (付けなければ撮らない)
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_DECISIONS_UI_SKIP=1 を付けたときだけ (黙って飛ばさない)
@@ -183,6 +185,16 @@ try {
     await page.waitForFunction(() => /元に戻しました 1 件/.test(document.getElementById('res').textContent));
     assert.equal((await cand('c1')).status, 'pending');
     assert.equal(await page.locator('#rows a.rowlink', { hasText: '0726-000629-bk' }).count(), 1);
+    // 結果の欄は読み上げの欄 (status)。決められなかった = alert (#1626 Codex R1 L4)
+    assert.deepEqual([await page.getAttribute('#res', 'role'), await page.getAttribute('#res', 'aria-live')], ['status', 'polite']);
+    await page.route('**/api/decisions', (route) => route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'サーバーエラーが発生しました' }) }));
+    await page.locator('#rows tr', { has: page.locator('a.rowlink', { hasText: '0726-000629-bk' }) }).locator('[data-q="fix_ne"]').click();
+    await page.waitForFunction(() => /決められませんでした/.test(document.getElementById('res').textContent));
+    assert.equal(await page.getAttribute('#res', 'role'), 'alert');
+    await page.unroute('**/api/decisions');
+    assert.equal((await cand('c1')).status, 'pending');
+    await page.click('#res-x');
+    assert.equal(await page.isHidden('#res'), true);
   });
 
   await ta('[3] まとめて決める: Space で選ぶ → 下の帯 (件数・決められる数・押せないボタン) → 差を残す で全部入る・帯が消える', async () => {
@@ -314,16 +326,64 @@ try {
     await Promise.all([page.waitForURL(/\/csv$/), page.click('#next-a a[href="csv"]')]);
     await page.waitForSelector('[data-make="products:cost"]');
     assert.match(await page.getAttribute('#st-1', 'class'), /\bcur\b/);
-    await page.click('[data-make="products:cost"]');
+    // 次にやること (作る) = 作る所へ送ってフォーカス (#1626 Codex R1 M1)
+    const goneTo = async (sel, id) => {
+      await page.click('#next-a ' + sel);
+      await page.waitForFunction((x) => document.activeElement && document.activeElement.id === x, id);
+      await page.waitForFunction((x) => { const r = document.getElementById(x).getBoundingClientRect(); return r.top >= 58 && r.top < innerHeight; }, id);
+    };
+    await page.evaluate(() => scrollTo(0, document.body.scrollHeight));
+    await goneTo('[data-goto="make"]', 'make');
+    // 遅い通信でダブルクリック = 作る POST は 1 回・送っている間はボタンが閉じる (#1626 Codex R1 M2)
+    const posts = [];
+    page.on('request', (rq) => { if (rq.method() === 'POST' && /\/api\/csv\//.test(rq.url())) posts.push(new URL(rq.url()).pathname); });
+    await page.route('**/api/csv/exports', async (route) => { await new Promise((r) => setTimeout(r, 700)); await route.continue(); });
+    await page.dblclick('[data-make="products:cost"]');
+    await page.waitForFunction(() => document.querySelector('[data-make="products:cost"]').disabled && document.querySelector('[data-make="products:cost"]').getAttribute('aria-busy') === 'true');
     await page.waitForSelector('#exports .fcard');
+    await page.unroute('**/api/csv/exports');
+    assert.deepEqual(posts.filter((x) => /\/exports$/.test(x)).length, 1, posts.join(','));
+    assert.equal(await page.locator('#exports .fcard').count(), 1);
     assert.match(await page.textContent('#msg'), /ファイル \d+ を作りました/);
     const id = (await page.textContent('#exports .fcard .fno')).replace(/\D/g, '');
     assert.equal(await page.getAttribute(`#file-${id} a[download]`, 'href'), `api/csv/exports/${id}/file`);
     const dl = await fetch(new URL(`api/csv/exports/${id}/file`, BASE + 'csv'), { headers: { 'x-test-session': 'approver' } });
     assert.equal(dl.status, 200); assert.match(await dl.text(), /genka_tnk/);
     assert.match(await page.getAttribute('#st-2', 'class'), /\bcur\b/);
-    await page.click(`#file-${id} [data-check]`);
+    await page.evaluate(() => scrollTo(0, 0));
+    await goneTo(`[data-goto="file-${id}"]`, `file-${id}`);
+    // 確かめるの onclick を 2 回 (遅い通信) = POST は 1 回
+    await page.route('**/check', async (route) => { await new Promise((r) => setTimeout(r, 700)); await route.continue(); });
+    await page.evaluate((x) => { const b = document.querySelector('#file-' + x + ' [data-check]'); b.onclick({ stopPropagation() {} }); b.onclick({ stopPropagation() {} }); }, id);
     await page.waitForSelector(`#file-${id} [data-declare]`);
+    await page.unroute('**/check');
+    assert.equal(posts.filter((x) => /\/check$/.test(x)).length, 1, posts.join(','));
+    await page.evaluate(() => scrollTo(0, document.body.scrollHeight));
+    await goneTo(`[data-goto="file-${id}"]`, `file-${id}`);
+    // 離れるときの確認: 申告のメモだけ → 「入力を確認する」でそのメモへ (#1626 Codex R1 L3)
+    await page.fill(`[data-note-for="${id}"]`, '取込の履歴を見た');
+    await page.evaluate(() => document.querySelector('.rail a.nav[href$="/apps/master-decisions/"]').click());
+    await page.waitForSelector('#leave-bg.on');
+    assert.match(await page.textContent('#leave-list'), new RegExp(`ファイル ${id} の申告のメモ`));
+    await page.click('#leave-review');
+    assert.equal(await page.evaluate(() => document.activeElement.dataset.noteFor), id);
+    await page.fill(`[data-note-for="${id}"]`, '');
+    // 実機の確かめ: 結果・ファイル番号を変えただけでも数える → 最初の変えた欄 (結果) へ戻る・既定に戻すと数えない
+    await page.selectOption('#v-result', 'ng');
+    await page.fill('#v-export', id);
+    assert.equal(await page.textContent('#unsaved-n'), '未保存 1 件');
+    await page.evaluate(() => document.querySelector('.rail a.nav[href$="/apps/master-decisions/"]').click());
+    await page.waitForSelector('#leave-bg.on');
+    assert.match(await page.textContent('#leave-list'), /実機で確かめた結果 \(結果・ファイル番号\)/);
+    await page.click('#leave-review');
+    assert.equal(await page.evaluate(() => document.activeElement.id), 'v-result');
+    await page.selectOption('#v-key', await page.evaluate(() => document.querySelectorAll('#v-key option')[1].value));   // 既定 (最初) ではない種類
+    await page.selectOption('#v-result', 'ok');
+    await page.fill('#v-export', '');
+    assert.equal(await page.isVisible('#unsaved'), true);   // 種類を変えた = まだ数える
+    assert.match(await page.evaluate(() => window.MasterEdit.dirty().items.join()), /種類・項目/);
+    await page.selectOption('#v-key', await page.evaluate(() => document.querySelector('#v-key option').value));
+    assert.equal(await page.isHidden('#unsaved'), true);
     assert.match(await page.textContent('#next-t'), new RegExp(`ファイル ${id}.*今日のうちに NE に取り込んで`));
     await shot(page, '05_CSV_申告の前_1440.png');
     await page.click(`#file-${id} [data-declare]`);
@@ -334,6 +394,19 @@ try {
     await page.waitForFunction(() => /申告しました/.test(document.getElementById('msg').textContent));
     assert.equal(await page.isHidden('#unsaved'), true);
     assert.match(await page.textContent(`#file-${id}`), /取り込んだ \(申告済み\)/);
+    // 届かなかった行がある (翌朝の照合の後) = 次にやること はそのファイルへ (届き方は画面だけ差し替えて見る)
+    await page.route('**/api/csv/summary', async (route) => {
+      const r = await route.fetch(); const j = await r.json();
+      for (const e of j.exports) if (String(e.export_id) === id) e.row_states = { not_reflected: 1 };
+      await route.fulfill({ response: r, json: j });
+    });
+    await page.reload();
+    await page.waitForFunction(() => /届かなかった・確かめが要る行が 1 行/.test(document.getElementById('next-t').textContent));
+    assert.match(await page.getAttribute('#next', 'class'), /\bwarn\b/);
+    await goneTo(`[data-goto="file-${id}"]`, `file-${id}`);
+    await page.unroute('**/api/csv/summary');
+    await page.reload();
+    await page.waitForSelector(`#file-${id}`);
     // 行を見る (右の窓)
     await page.click(`#file-${id} [data-open]`);
     await page.waitForSelector('#dr-bg.on table');

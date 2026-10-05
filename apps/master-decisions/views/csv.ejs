@@ -137,14 +137,14 @@
   const who = (email) => String(email || '').split('@')[0];
   const hasWin = typeof window !== 'undefined';
   const ME = hasWin ? (window.MasterEdit = window.MasterEdit || {}) : {};
-  let S = null, selected = new Set();
+  let S = null, selected = new Set(), vDefaultKey = '';
 
   async function getJson(url) { const r = await fetch(url, { headers: { Accept: 'application/json' } }); const j = await r.json().catch(() => ({})); if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }
   async function postJson(url, body) {
     const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body || {}) });
     const j = await r.json().catch(() => ({})); if (!r.ok || !j.ok) { const e = new Error(j.error || ('HTTP ' + r.status)); e.details = j.details; throw e; } return j;
   }
-  function setMsg(text, cls) { const m = $('msg'); m.className = 'msgline ' + (cls || ''); m.textContent = text || ''; if (text && ME.toast && cls === 'ok') ME.toast(text.split('。')[0]); }
+  function setMsg(text, cls) { const m = $('msg'); if (m.setAttribute) m.setAttribute('role', cls === 'err' ? 'alert' : 'status'); m.className = 'msgline ' + (cls || ''); m.textContent = text || ''; if (text && ME.toast && cls === 'ok') ME.toast(text.split('。')[0]); }
 
   async function load() {
     S = await getJson('api/csv/summary');
@@ -156,7 +156,7 @@
       + '<td>' + (g.verified ? '<span class="b ok">' + icon('i-check') + '済み (1,000 行まで)</span>' : '<span class="b mute">まだ = 試し用 (5 行まで)</span>') + '</td>'
       + '<td style="text-align:right"><button class="btn sm' + (CAN && S.today && g.csv ? ' pri' : '') + '" type="button" data-make="' + esc(g.key) + '"' + (CAN && S.today && g.csv ? '' : ' disabled') + '>CSV を作る</button></td></tr>').join('')
       : '<tr class="loadrow"><td colspan="7">CSV にする列がありません</td></tr>';
-    for (const b of document.querySelectorAll('[data-make]')) b.onclick = () => { const [kind, col] = b.dataset.make.split(':'); make({ kind, col }); };
+    for (const b of document.querySelectorAll('[data-make]')) b.onclick = () => { const [kind, col] = b.dataset.make.split(':'); make({ kind, col }, b); };
     selected = new Set();
     const free = S.csv_items.filter((x) => !x.export_id).length;
     $('items-n').textContent = free + ' 件';
@@ -171,8 +171,11 @@
       : '<tr class="loadrow"><td colspan="4">ありません</td></tr>';
     renderExports();
     renderFlow();
+    const keepKey = $('v-key').value;
     $('v-key').innerHTML = S.groups.map((g) => '<option value="' + esc(g.key) + '">' + esc(KIND[g.kind] + ' / ' + (COL[g.col] || g.col)) + '</option>').join('');
     $('verified').innerHTML = S.verified.length ? '記録: ' + S.verified.map((v) => esc(v.kind + ':' + v.col + ' ' + v.result + ' (' + who(v.verified_by) + ' ' + (v.verified_at || '').slice(0, 10) + ')')).join(' / ') : 'まだ記録がありません';
+    vDefaultKey = S.groups.length ? S.groups[0].key : '';
+    if (keepKey && S.groups.some((g) => g.key === keepKey)) $('v-key').value = keepKey;
     $('v-save').disabled = !CAN;
     $('gate').textContent = CAN ? '' : GATE;
   }
@@ -200,14 +203,22 @@
       $('st' + (i + 1) + '-s').textContent = st.s;
     });
     let tone = '', text = '', act = '';
-    if (cur === 2) { const e = toDeclare[0]; text = '<b>ファイル ' + e.export_id + '</b> は今日の照合で確かめました。<b>今日のうちに NE に取り込んで</b>、NE の履歴のメッセージを見て申告してください'; act = '<button class="btn pri sm" type="button" data-jump="file-' + e.export_id + '">ファイル ' + e.export_id + ' へ</button>'; }
-    else if (cur === 3) { tone = 'warn'; const e = ex.find((x) => (x.row_states || {}).not_reflected || (x.row_states || {}).needs_look); text = '<b>届かなかった・確かめが要る行が ' + bad + ' 行</b>あります。行を見て、作り直すか NE の画面で直してください'; act = e ? '<button class="btn sm" type="button" data-jump="file-' + e.export_id + '">ファイル ' + e.export_id + ' へ</button>' : ''; }
-    else if (cur === 1) { const e = toCheck[0]; text = '<b>ファイル ' + e.export_id + '</b> をダウンロードし、取り込む日に「取り込む直前に確かめる」を押してください'; act = '<button class="btn pri sm" type="button" data-jump="file-' + e.export_id + '">ファイル ' + e.export_id + ' へ</button>'; }
-    else if (cur === 0) { text = '<b>CSV にできる承認が ' + make + ' 件</b>あります。列ごとに「CSV を作る」を押してください' + (S.today ? '' : ' (今日の照合の回が無いので、いまは作れません)'); act = '<button class="btn pri sm" type="button" data-jump="make">作る所へ</button>'; }
+    if (cur === 2) { const e = toDeclare[0]; text = '<b>ファイル ' + e.export_id + '</b> は今日の照合で確かめました。<b>今日のうちに NE に取り込んで</b>、NE の履歴のメッセージを見て申告してください'; act = '<button class="btn pri sm" type="button" data-goto="file-' + e.export_id + '">ファイル ' + e.export_id + ' へ</button>'; }
+    else if (cur === 3) { tone = 'warn'; const e = ex.find((x) => (x.row_states || {}).not_reflected || (x.row_states || {}).needs_look); text = '<b>届かなかった・確かめが要る行が ' + bad + ' 行</b>あります。行を見て、作り直すか NE の画面で直してください'; act = e ? '<button class="btn sm" type="button" data-goto="file-' + e.export_id + '">ファイル ' + e.export_id + ' へ</button>' : ''; }
+    else if (cur === 1) { const e = toCheck[0]; text = '<b>ファイル ' + e.export_id + '</b> をダウンロードし、取り込む日に「取り込む直前に確かめる」を押してください'; act = '<button class="btn pri sm" type="button" data-goto="file-' + e.export_id + '">ファイル ' + e.export_id + ' へ</button>'; }
+    else if (cur === 0) { text = '<b>CSV にできる承認が ' + make + ' 件</b>あります。列ごとに「CSV を作る」を押してください' + (S.today ? '' : ' (今日の照合の回が無いので、いまは作れません)'); act = '<button class="btn pri sm" type="button" data-goto="make">作る所へ</button>'; }
     else { tone = 'ok'; text = '<b>いまやることはありません。</b>' + (waiting ? '申告したファイルの ' + waiting + ' 行は翌朝の照合で届いたかが出ます' : '判断の画面で NE を直すと決めると、ここで CSV にできます'); }
     $('next').className = 'nextline' + (tone ? ' ' + tone : '');
     $('next-t').innerHTML = text; $('next-a').innerHTML = act;
+    for (const b of document.querySelectorAll('[data-goto]')) b.onclick = () => goTo(b.dataset.goto);
     const rc = $('rail-n-csv'); if (rc) { const n = make + toCheck.length + toDeclare.length; rc.hidden = !n; rc.textContent = String(n); }
+  }
+
+  /** 「次にやること」のボタン: その札 (または作る所) へ送って、フォーカスを移す (上の帯に隠れないよう scroll-margin は md.css。#1626 Codex R1 M1) */
+  function goTo(id) {
+    const t = $(id); if (!t) return;
+    if (t.scrollIntoView) t.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (t.focus) t.focus({ preventScroll: true });
   }
 
   // ─────────── ファイルの札 ───────────
@@ -245,7 +256,7 @@
   }
   function renderExports() {
     $('exports').innerHTML = S.exports.length ? S.exports.map(fileCard).join('') : '<div class="empty">まだありません。上の「CSV を作る」で作ると、ここに並びます</div>';
-    for (const b of document.querySelectorAll('[data-check]')) b.onclick = (ev) => { ev.stopPropagation(); act('api/csv/exports/' + b.dataset.check + '/check', {}, (r) => (r.passed ? '確かめました。今日のうちに NE に取り込んで「取り込んだと申告」を押してください' : '外れた行があったので、このファイルは使えなくしました (void)。作り直してください: ' + r.failures.map((f) => f.code_norm + ' ' + (FAIL[f.reason] || f.reason)).join(' / '))); };
+    for (const b of document.querySelectorAll('[data-check]')) b.onclick = (ev) => { ev.stopPropagation(); act('api/csv/exports/' + b.dataset.check + '/check', {}, (r) => (r.passed ? '確かめました。今日のうちに NE に取り込んで「取り込んだと申告」を押してください' : '外れた行があったので、このファイルは使えなくしました (void)。作り直してください: ' + r.failures.map((f) => f.code_norm + ' ' + (FAIL[f.reason] || f.reason)).join(' / ')), b); };
     for (const b of document.querySelectorAll('[data-declare]')) b.onclick = (ev) => {
       ev.stopPropagation();
       const id = b.dataset.declare;
@@ -253,18 +264,26 @@
       if (!chosen) return setMsg('NE の「進捗状況・履歴」のメッセージを見て、ファイル ' + id + ' の結果を 1 つ選んでください (全部取り込めた / 一部失敗した / 全部拒まれた)', 'err');
       const noteEl = document.querySelector('[data-note-for="' + id + '"]');
       const note = (noteEl && noteEl.value && noteEl.value.trim()) || null;
-      act('api/csv/exports/' + id + '/declare', { result: chosen.value, note }, (r) => (r.state === 'void' ? '全部拒まれたので、このファイルは使えなくしました。作り直せます' : '申告しました。翌朝の照合で行ごとに届いたかが出ます'));
+      act('api/csv/exports/' + id + '/declare', { result: chosen.value, note }, (r) => (r.state === 'void' ? '全部拒まれたので、このファイルは使えなくしました。作り直せます' : '申告しました。翌朝の照合で行ごとに届いたかが出ます'), b);
     };
-    for (const b of document.querySelectorAll('[data-void]')) b.onclick = (ev) => { ev.stopPropagation(); if (confirm('ファイル ' + b.dataset.void + ' を使わない (void) にしますか? 予約が外れて、作り直せるようになります')) act('api/csv/exports/' + b.dataset.void + '/void', {}, () => '使わないにしました'); };
+    for (const b of document.querySelectorAll('[data-void]')) b.onclick = (ev) => { ev.stopPropagation(); if (confirm('ファイル ' + b.dataset.void + ' を使わない (void) にしますか? 予約が外れて、作り直せるようになります')) act('api/csv/exports/' + b.dataset.void + '/void', {}, () => '使わないにしました', b); };
     for (const b of document.querySelectorAll('[data-open]')) b.onclick = (ev) => { if (ev && ev.stopPropagation) ev.stopPropagation(); openDetail(b.dataset.open, b).catch((e) => setMsg(e.message, 'err')); };
   }
-  async function act(url, body, okText) {
-    // 確かめで外れた (passed = false) は通信の失敗ではない = 理由を出して一覧を読み直す (void になったファイルを画面に残さない。#1495 Codex R1 Medium)
-    try { const r = await postJson(url, body); setMsg(okText(r), r.passed === false || r.voided ? 'err' : 'ok'); await load(); refreshDirty(); }
-    catch (e) { setMsg('できませんでした: ' + e.message + (e.details ? '\n' + e.details.map((d) => d.fingerprint.slice(0, 8) + ' ' + d.status + (d.reason ? ' (' + (WHY[d.reason] || d.reason) + ')' : '')).join('\n') : ''), 'err'); }
+  /** 送っている口 (同じ口の 2 回目は送らない = 連打で同じ POST を 2 回出さない。#1626 Codex R1 M2) */
+  const sending = new Set();
+  /** 書く操作。btn = 押したボタン (送っている間は閉じる・finally で戻す)。返り値 = 通ったか */
+  async function act(url, body, okText, btn) {
+    if (sending.has(url)) return false;
+    sending.add(url);
+    if (btn) { btn.disabled = true; if (btn.setAttribute) btn.setAttribute('aria-busy', 'true'); }
+    try {
+      // 確かめで外れた (passed = false) は通信の失敗ではない = 理由を出して一覧を読み直す (void になったファイルを画面に残さない。#1495 Codex R1 Medium)
+      const r = await postJson(url, body); setMsg(okText(r), r.passed === false || r.voided ? 'err' : 'ok'); await load(); refreshDirty(); return true;
+    } catch (e) { setMsg('できませんでした: ' + e.message + (e.details ? '\n' + e.details.map((d) => d.fingerprint.slice(0, 8) + ' ' + d.status + (d.reason ? ' (' + (WHY[d.reason] || d.reason) + ')' : '')).join('\n') : ''), 'err'); return false; }
+    finally { sending.delete(url); if (btn) { btn.disabled = false; if (btn.removeAttribute) btn.removeAttribute('aria-busy'); } }
   }
-  async function make(body) {
-    await act('api/csv/exports', body, (r) => 'ファイル ' + r.export.export_id + ' を作りました (' + r.export.row_count + ' 行' + (r.export.trial ? '・試し用' : '') + ')' + (r.left ? '。残り ' + r.left + ' 件は次のファイルで' : '') + '。ダウンロードして、取り込む日に「取り込む直前に確かめる」を押してください');
+  async function make(body, btn) {
+    await act('api/csv/exports', body, (r) => 'ファイル ' + r.export.export_id + ' を作りました (' + r.export.row_count + ' 行' + (r.export.trial ? '・試し用' : '') + ')' + (r.left ? '。残り ' + r.left + ' 件は次のファイルで' : '') + '。ダウンロードして、取り込む日に「取り込む直前に確かめる」を押してください', btn);
   }
   $('make-sel').onclick = () => {
     const list = [...selected].map((i) => S.csv_items[i]);
@@ -272,13 +291,16 @@
     const keys = new Set(list.map((x) => (x.sku_kind === 'set' ? 'sets' : 'products') + ':' + x.col));
     if (keys.size !== 1) return setMsg('1 つのファイルには同じ種類・同じ項目だけ (種類・項目ごとに選んでください)', 'err');
     const [kind, col] = [...keys][0].split(':');
-    make({ kind, col, fingerprints: list.map((x) => x.fingerprint) });
+    make({ kind, col, fingerprints: list.map((x) => x.fingerprint) }, $('make-sel'));
   };
   $('v-save').onclick = () => {
     const [kind, col] = $('v-key').value.split(':');
     const ex = $('v-export').value.trim();
-    act('api/csv/verified', { kind, col, result: $('v-result').value, note: $('v-note').value.trim() || null, export_id: ex ? Number(ex) : null }, () => '残しました').then(() => { if (!/err/.test($('msg').className)) $('v-note').value = ''; refreshDirty(); });
+    act('api/csv/verified', { kind, col, result: $('v-result').value, note: $('v-note').value.trim() || null, export_id: ex ? Number(ex) : null }, () => '残しました', $('v-save')).then((ok) => { if (ok) resetVerified(); refreshDirty(); });
   };
+
+  /** 実機の確かめの欄を既定に戻す (残せた後) */
+  function resetVerified() { $('v-key').value = vDefaultKey; $('v-result').value = 'ok'; $('v-export').value = ''; $('v-note').value = ''; }
 
   // ─────────── ファイルの行 (右から出る窓) ───────────
   let drawerFrom = null;
@@ -317,17 +339,34 @@
         else if (!ev.shiftKey && document.activeElement === f[f.length - 1]) { ev.preventDefault(); f[0].focus(); }
       }
     }, true);
-    // 数えるのは まだ送っていない入力だけ: 申告の結果を選んだ・メモを書いた (申告を押していない)・実機の確かめのメモ
-    ME.dirty = () => {
+    /**
+     * まだ送っていない入力を画面の上から順に [{ el, t }]: ファイルごとの申告 (結果を選んだ・メモを書いた = まだ「取り込んだと申告」を押していない) →
+     * 実機で確かめた結果 (種類・結果・ファイル番号・メモのどれかを既定から変えた)。数えるのも戻るのもこの順 (#1626 Codex R1 L3)
+     */
+    const unsent = () => {
       const out = [];
-      for (const r of document.querySelectorAll('.declare input[type=radio]:checked')) out.push('ファイル ' + r.name.slice(4) + ' の申告 (結果を選んだが、まだ「取り込んだと申告」を押していない)');
-      for (const n of document.querySelectorAll('[data-note-for]')) if (n.value.trim() && !document.querySelector('input[name="res-' + n.dataset.noteFor + '"]:checked')) out.push('ファイル ' + n.dataset.noteFor + ' の申告のメモ');
-      if ($('v-note').value.trim()) out.push('実機で確かめた結果のメモ');
-      return { n: out.length, items: out, impacts: [] };
+      for (const d of document.querySelectorAll('.declare')) {
+        const btn = d.querySelector('[data-declare]'); if (!btn) continue;
+        const id = btn.dataset.declare, r = d.querySelector('input[type=radio]:checked'), n = d.querySelector('[data-note-for]');
+        if (r) out.push({ el: r, t: 'ファイル ' + id + ' の申告 (結果を選んだが、まだ「取り込んだと申告」を押していない)' });
+        else if (n && n.value.trim()) out.push({ el: n, t: 'ファイル ' + id + ' の申告のメモ' });
+      }
+      const v = [['v-key', $('v-key').value !== vDefaultKey, '種類・項目'], ['v-result', $('v-result').value !== 'ok', '結果'], ['v-export', !!$('v-export').value.trim(), 'ファイル番号'], ['v-note', !!$('v-note').value.trim(), 'メモ']].filter((x) => x[1]);
+      if (v.length) out.push({ el: $(v[0][0]), t: '実機で確かめた結果 (' + v.map((x) => x[2]).join('・') + ')' });
+      return out;
     };
-    ME.review = () => { const r = document.querySelector('.declare input[type=radio]:checked'); const t = r ? r.closest('.declare').querySelector('[data-declare]') : $('v-note'); if (t) t.focus(); };
-    document.addEventListener('change', (ev) => { if (ev.target && ev.target.closest && ev.target.closest('.declare')) refreshDirty(); });
-    document.addEventListener('input', (ev) => { if (ev.target && (ev.target.id === 'v-note' || (ev.target.dataset && ev.target.dataset.noteFor))) refreshDirty(); });
+    ME.dirty = () => { const u = unsent(); return { n: u.length, items: u.map((x) => x.t), impacts: [] }; };
+    // 「入力を確認する」= 最初の まだ送っていない欄へ (畳んだ申告は開く)
+    ME.review = () => {
+      const u = unsent(); if (!u.length) return;
+      const el = u[0].el, det = el.closest && el.closest('details');
+      if (det) det.open = true;
+      if (el.scrollIntoView) el.scrollIntoView({ block: 'center' });
+      el.focus();
+    };
+    const V_IDS = ['v-key', 'v-result', 'v-export', 'v-note'];
+    document.addEventListener('change', (ev) => { if (ev.target && ((ev.target.closest && ev.target.closest('.declare')) || V_IDS.includes(ev.target.id))) refreshDirty(); });
+    document.addEventListener('input', (ev) => { if (ev.target && (V_IDS.includes(ev.target.id) || (ev.target.dataset && ev.target.dataset.noteFor))) refreshDirty(); });
     getJson('api/summary').then((s) => { const rn = $('rail-n-decide'); if (rn && s.total) { rn.hidden = !s.total.pending; rn.textContent = String(s.total.pending); } }).catch(() => { /* 件数の札を出さないだけ */ });
   }
 

@@ -159,3 +159,9 @@ main.has-bulk { padding-bottom: 150px; }
 /* まとめて決める帯が出ている間は、知らせ (toast) を帯の上へ */
 body:has(main.has-bulk) .toast { bottom: 100px; }
 .tbl td.rsn { min-width: 150px; }
+/* 「次にやること」で送った先 (作る所・ファイルの札) が上の帯 (58px) に隠れない・フォーカスが見える (#1626 Codex R1 M1) */
+#make, .fcard { scroll-margin-top: 76px; }
+.fcard:focus, #make:focus { outline: 2px solid var(--accent); outline-offset: 3px; }
+.btn[aria-busy="true"] { cursor: progress; }
+/* 決めた結果の欄は いつも置いておく (読み上げの欄は後から足すと読まれない)。空なら見せない */
+.resbox:empty { display: none; }
