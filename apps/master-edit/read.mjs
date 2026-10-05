@@ -119,8 +119,14 @@ const costTodaySql = (dayP, idsP = null) => `select distinct on (y.sku_id) y.sku
  *    JS で 100 件に切っていた = 原価の表を SKU の数だけ走査する (PGlite・原価 73,770 行で 65 秒)。
  *    今は ① 絞り込みと並びだけの軽い読み (原価が要るのは「原価が未入力」のときだけ・1 回の集合) → ② このページの 100 件だけ中身を読む (原価・仕入先も 1 回の集合)。
  *    値・並び・件数は前と同じ (試験 test-master-edit で前の形と比べる)
+ * mode (10/5 中原さん「コードのコピー・CSV」): 'page' (既定 = offset から 100 件) / 'codes' (絞った全件の商品コードだけ = ② を読まない) /
+ *   'all' (絞った全件の中身 + JAN = CSV)。codes / all は件数が max を超えたら { tooMany: true, total } だけ返す (何も読まない)。
+ *   deadline (ms) を過ぎたら ListTimeoutError (段ごとに確かめる。1 つの文は接続の statement_timeout 20s)
  */
-export async function listSkus(db, filters, { now = new Date(), extras = {} } = {}) {
+export const EXPORT_MAX = 10000;
+export class ListTimeoutError extends Error { constructor() { super('一覧の読み出しに時間がかかりすぎました'); this.name = 'ListTimeoutError'; } }
+export async function listSkus(db, filters, { now = new Date(), extras = {}, mode = 'page', max = EXPORT_MAX, deadline = null } = {}) {
+  const tick = () => { if (deadline != null && Date.now() > deadline) throw new ListTimeoutError(); };
   const f = normalizeFilters(filters);
   const today = jstDate(now);
   const params = [COMPANY_ID];
@@ -243,7 +249,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
   }
   // ① 絞り込みと並び (軽い列だけ)。並び (コード順 / 登録日の新しい順 = 空は最後・同じ日はコード順) はここの order by = ページ分けの前。
   //   この後の JS の絞り込み (売上分類・セットの作れる数) は filter だけ = 並びを変えない
-  const keys = (await db.query(`${costCte}select s.sku_id::text as sku_id, s.sku_kind, s.set_sales_class_override, p.sales_class
+  const keys = (await db.query(`${costCte}select s.sku_id::text as sku_id, s.code, s.sku_kind, s.set_sales_class_override, p.sales_class
       from core.skus s
       left join core.products p on p.product_id = s.product_id
       ${costCte ? 'left join c on c.sku_id = s.sku_id' : ''}
@@ -290,16 +296,20 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
       return b != null && b >= stockRange.lo && b <= stockRange.hi;
     });
   }
-  const pageIds = matched.slice(f.offset, f.offset + LIST_LIMIT).map((r) => r.sku_id);
+  tick();
+  if (mode !== 'page' && matched.length > max) return { tooMany: true, total: matched.length, max, filters: f, notFound, multiCut };
+  // 絞った全件の商品コード (並びも一覧と同じ)。中身は読まない
+  if (mode === 'codes') return { codes: matched.map((r) => r.code), total: matched.length, filters: f, notFound, multiCut };
+  const pageIds = (mode === 'all' ? matched : matched.slice(f.offset, f.offset + LIST_LIMIT)).map((r) => r.sku_id);
   // ② このページの分だけ中身を読む
   const rowsById = new Map();
   if (pageIds.length) {
     const rows = (await db.query(`with c as (${costTodaySql(2, 1)}),
-        ps as (select distinct on (x.sku_id) x.sku_id, sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id
+        ps as (select distinct on (x.sku_id) x.sku_id, sp.code, sp.name from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id
                 where x.sku_id = any($1::bigint[]) and x.is_primary order by x.sku_id, sp.code)
       select s.sku_id::text as sku_id, s.code, s.code_norm, s.sku_kind, s.name, s.handling, s.tax_rate::text as tax_rate, s.tax_class,
         s.standard_price_jpy::text as standard_price, s.shipping_code, s.reorder_months::text as reorder_months, s.set_sales_class_override,
-        p.sales_class, c.cost_jpy::text as cost_jpy, c.cost_source, c.cost_status, ps.code as primary_supplier,
+        p.sales_class, c.cost_jpy::text as cost_jpy, c.cost_source, c.cost_status, ps.code as primary_supplier, ps.name as primary_supplier_name, s.product_id::text as product_id,
         ${hasReg ? '(select mr.state from ops.master_registrations mr where mr.sku_id = s.sku_id)' : 'null::text'} as reg_state,
         ${hasRegOn ? 's.registered_on::text as registered_on, s.registered_on_source' : 'null::text as registered_on, null::text as registered_on_source'}
       from core.skus s
@@ -309,6 +319,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
      where s.sku_id = any($1::bigint[])`, [pageIds, today])).rows;
     for (const r of rows) rowsById.set(r.sku_id, r);
   }
+  tick();
   if (!compClasses) compClasses = await compClassesOf(pageIds.filter((id) => rowsById.get(id)?.sku_kind === 'set'));
   // セットの構成品 (作れる数の材料。このページのセットだけ・在庫が読めたときだけ)
   if (!compsOf) compsOf = await compsOfSets(pageIds.filter((id) => rowsById.get(id)?.sku_kind === 'set'));
@@ -324,7 +335,8 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
       standard_price: num(r.standard_price), cost: KNOWN_COST.has(r.cost_status) ? Number(r.cost_jpy) : null, cost_derived: isSet && r.cost_source === 'set_calc',
       sales_class: salesOf(r, compClasses),
       sales_derived: isSet && r.set_sales_class_override == null,
-      primary_supplier: r.primary_supplier, shipping_code: r.shipping_code, reorder_months: num(r.reorder_months),
+      primary_supplier: r.primary_supplier, primary_supplier_name: r.primary_supplier_name ?? null, product_id: r.product_id ?? null,
+      shipping_code: r.shipping_code, reorder_months: num(r.reorder_months),
       state: r.handling === 'discontinued' ? 'discontinued' : 'available',
       reg_state: r.reg_state ?? 'none',
       comp_count: isSet ? (compClasses.get(r.sku_id) || []).length : null,
@@ -341,6 +353,17 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
       sales: salesMap ? (salesMap.get(normProductCode(r.code)) || { missing: true }) : null,
     };
   });
+  tick();
+  // JAN (CSV だけ = 画面の一覧には出さない)。商品ごと・今の JAN (終わっていない) を並べる
+  if (mode === 'all') {
+    const pids = [...new Set(pageRows.map((r) => r.product_id).filter(Boolean))];
+    const janOf = new Map();
+    if (pids.length) {
+      for (const j of (await db.query(`select entity_id::text as pid, string_agg(external_value, ' ' order by external_value) as jan from core.external_ids
+          where entity_type = 'product' and system = 'jan' and id_kind = 'jan' and valid_to is null and entity_id = any($1::bigint[]) group by entity_id`, [pids])).rows) janOf.set(j.pid, j.jan);
+    }
+    for (const r of pageRows) r.jan = (r.product_id && janOf.get(r.product_id)) || '';
+  }
   // ⚠ の印 (NE との差・CSV 待ち・構成の依頼) はこのページの分だけ
   const norms = pageRows.map((r) => r.code_norm);
   const diffSet = new Set(); const csvSet = new Set(); const reqSet = new Set();
@@ -353,6 +376,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
   const CARD_FLAG = { pending: 'カード作成待ち', failed: 'カード作成待ち (失敗)', conflict: 'カードの衝突' };
   for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : []),
     ...(cardOf.has(r.sku_id) ? [CARD_FLAG[cardOf.get(r.sku_id)]] : [])];
+  tick();
   return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable, notFound, multiCut, sorts: LIST_SORTS, registeredOnAvailable: hasRegOn };
 }
 

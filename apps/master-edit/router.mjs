@@ -53,7 +53,8 @@ import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFE
 import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
-import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti } from './read.mjs';
+import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError } from './read.mjs';
+import { buildListCsv, csvFileName } from './list-csv.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
 import { readFbaDay, readFbaSku } from './fba-stock.mjs';
 import { readSalesRun, readSalesSku } from './sales-qty.mjs';
@@ -279,29 +280,42 @@ const fmt = {
   tax: (v) => (v == null ? '' : String(Math.round(Number(v) * 100))),
 };
 
+/**
+ * 一覧の絞り込み (画面・CSV・コードを全部コピーで同じ)。長い詳細検索の条件は印 (?s=) で来る = 中身に戻す (URL に同じ名前があっても印の中身が勝つ)。
+ * 期限切れ・再起動で消えた = searchExpired。注文残は発注アプリの利用権がある人だけ (無い人の「注文残あり」の絞り込みも使わない = どの商品に注文残があるかも出さない)
+ */
+function listQuery(req) {
+  let query = req.query;
+  let searchExpired = false;
+  if (req.query.s) {
+    const cond = getSearch(String(req.query.s), clock());
+    if (cond) query = { ...req.query, ...cond };
+    else searchExpired = true;
+  }
+  const filters = normalizeFilters(query);
+  const poOk = canSeeBackorders(req);
+  if (!poOk) filters.po = '';
+  return { filters, searchExpired, poOk };
+}
+/** 参考の値 (注文残 = 発注アプリ・在庫 = ロジザード・FBA (JP) = Company DB の在庫の日次・売れた数 = 商品管理リストの公開の回)。読めなくても一覧は出す (その欄だけ「読めない」) */
+async function listExtras(db, poOk) {
+  return { backorders: poOk ? readBackorders() : PO_DENIED, stock: await readWarehouseStock({ now: clock() }), fba: db ? await readFbaDay(db, { now: clock() }) : null, sales: await readSalesRun({ now: clock() }) };
+}
+/** CSV・全部コピーの件数・時間の上限 (時間は段ごとに確かめる。1 つの文は接続の statement_timeout 20s)。試験は小さくする */
+const EXPORT_LIMITS = { max: EXPORT_MAX, timeMs: 45e3 };
+export function __setExportLimits(o) { EXPORT_LIMITS.max = (o && o.max) ?? EXPORT_MAX; EXPORT_LIMITS.timeMs = (o && o.timeMs) ?? 45e3; }
+
 router.get('/', (req, res) => {
   // 画面の中のリンクは相対 (sku/… ・manual) = 末尾の / が無いと 1 つ上を指す
   if (!String(req.originalUrl || '').split('?')[0].endsWith('/')) return res.redirect(301, `${req.baseUrl}/`);
   return withPgPage(req, res, async (db, dbError) => {
-    // 長い詳細検索の条件は印 (?s=) で来る = 中身に戻す (URL に同じ名前があっても印の中身が勝つ)。期限切れ・再起動で消えた = 何も出さずに知らせる
-    let query = req.query;
-    let searchExpired = false;
-    if (req.query.s) {
-      const cond = getSearch(String(req.query.s), clock());
-      if (cond) query = { ...req.query, ...cond };
-      else searchExpired = true;
-    }
-    const filters = normalizeFilters(query);
-    // 参考の値 (注文残 = 発注アプリ・在庫 = ロジザード・FBA (JP) = Company DB の在庫の日次・売れた数 = 商品管理リストの公開の回)。読めなくても一覧は出す (その欄だけ「読めない」)。
-    // 注文残は発注アプリの利用権がある人だけ (無い人の「注文残あり」の絞り込みも使わない = どの商品に注文残があるかも出さない)
-    const poOk = canSeeBackorders(req);
-    if (!poOk) filters.po = '';
-    const extras = { backorders: poOk ? readBackorders() : PO_DENIED, stock: await readWarehouseStock({ now: clock() }), fba: db ? await readFbaDay(db, { now: clock() }) : null, sales: await readSalesRun({ now: clock() }) };
+    const { filters, searchExpired, poOk } = listQuery(req);
+    const extras = await listExtras(db, poOk);
     const empty = { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false, notFound: [], multiCut: false };
     const data = db && !searchExpired ? await listSkus(db, filters, { now: new Date(clock()), extras }) : empty;
     const phase = db ? await readCutoverPhase(db) : null;
     const counts = db ? await listCounts(db, { now: new Date(clock()) }) : null;
-    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt });
+    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max });
   });
 });
 /**
@@ -329,6 +343,44 @@ router.post('/api/search', (req, res) => {
   const qs = new URLSearchParams({ ...rest, ...(Object.keys(cond).length ? { s: putSearch(cond, clock()) } : {}) }).toString();
   res.json({ ok: true, url: `${req.baseUrl}/${qs ? `?${qs}` : ''}` });
 });
+/**
+ * 絞った一覧の CSV (10/5 中原さん)。今の一覧の URL の条件 (札・絞る欄・詳細検索・印 ?s=・並び) のまま、ページ分けに関係なく全件 (EXPORT_MAX 件まで)。
+ * 見られる人 = 一覧を見られる人 (server.js の requireAppAccess('master-edit'))・注文残の列は発注アプリの利用権がある人だけ
+ */
+router.get('/list.csv', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const text = (status, msg) => res.status(status).type('text/plain; charset=utf-8').send(msg);
+  if (!db) return text(503, dbError || 'Company DB につながりません');
+  const { filters, searchExpired, poOk } = listQuery(req);
+  if (searchExpired) return text(410, '条件の期限が切れました。一覧で検索し直してから CSV を出してください');
+  const extras = await listExtras(db, poOk);
+  let data;
+  try { data = await listSkus(db, filters, { now: new Date(clock()), extras, mode: 'all', max: EXPORT_LIMITS.max, deadline: Date.now() + EXPORT_LIMITS.timeMs }); } catch (e) {
+    if (e instanceof ListTimeoutError) return text(503, `時間がかかりすぎました (${EXPORT_LIMITS.timeMs / 1000} 秒)。絞ってからもう一度出してください`);
+    throw e;
+  }
+  if (data.tooMany) return text(413, `${data.total.toLocaleString('ja-JP')} 件あります。CSV は ${data.max.toLocaleString('ja-JP')} 件までです。絞ってから出してください`);
+  const body = buildListCsv(data, extras, { poOk, nowMs: clock(), regStates: REG_STATES });
+  const name = csvFileName(clock());
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="${name}"; filename*=UTF-8''${encodeURIComponent(name)}`);
+  res.set('Cache-Control', 'no-store');
+  res.send(body);
+}));
+/** 絞った一覧の商品コードを全部 (コピーのボタン)。{ ok, codes, total } / 413 (件数の上限) / 410 (条件の期限切れ) / 503 */
+router.get('/api/codes', (req, res) => withPgApi(res, async (db) => {
+  const { filters, searchExpired, poOk } = listQuery(req);
+  if (searchExpired) return res.status(410).json({ ok: false, error: '条件の期限が切れました。検索し直してください' });
+  // 在庫の範囲・注文残ありで絞っているときは、一覧と同じ参考の値で絞る (中身は読まない)
+  const extras = filters.stock_min || filters.stock_max || filters.po ? await listExtras(db, poOk) : {};
+  let data;
+  try { data = await listSkus(db, filters, { now: new Date(clock()), extras, mode: 'codes', max: EXPORT_LIMITS.max, deadline: Date.now() + EXPORT_LIMITS.timeMs }); } catch (e) {
+    if (e instanceof ListTimeoutError) return res.status(503).json({ ok: false, error: '時間がかかりすぎました。絞ってからもう一度' });
+    throw e;
+  }
+  if (data.tooMany) return res.status(413).json({ ok: false, error: `${data.total.toLocaleString('ja-JP')} 件あります。全部コピーは ${data.max.toLocaleString('ja-JP')} 件までです。絞ってから`, total: data.total, max: data.max });
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, codes: data.codes, total: data.total });
+}));
 router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), ui2: true, nav: 'manual', MAX_COMPONENTS }));
 
 // 新商品の登録 (画面 D)。つながらないときも画面は出す (帯・保存のボタンは出さない)

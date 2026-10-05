@@ -290,6 +290,54 @@
     if (j) { var to = document.getElementById(j.getAttribute('data-jump')); if (to) { to.scrollIntoView({ behavior: 'smooth', block: 'center' }); to.focus({ preventScroll: true }); } }
   });
 
+  /* ---------- 一覧: 商品コードのコピー (1 行のボタン・絞った一覧を全部) (10/5) ---------- */
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) return navigator.clipboard.writeText(text);
+    return new Promise(function (ok, ng) {
+      var ta = document.createElement('textarea'); ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.top = '-1000px'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      var done = false; try { done = document.execCommand('copy'); } catch (err) { done = false; }
+      document.body.removeChild(ta);
+      if (done) ok(); else ng(new Error('copy'));
+    });
+  }
+  ME.copyText = copyText;
+  /** 絞った一覧の商品コードを全部 (サーバーに聞く)。{ codes } / 誤りの文 (413 = 件数の上限・410 = 条件の期限切れ) で reject */
+  function fetchCodes(url) {
+    return fetch(url, { headers: { Accept: 'application/json' }, credentials: 'same-origin' }).then(function (r) {
+      return r.json().catch(function () { return null; }).then(function (j) {
+        if (!r.ok || !j || !j.ok) throw new Error((j && j.error) || 'コードを読めませんでした (' + r.status + ')');
+        return j.codes;
+      });
+    });
+  }
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest && e.target.closest('.copybtn');
+    if (b) {
+      e.preventDefault(); e.stopPropagation();
+      var code = b.getAttribute('data-copy') || '';
+      copyText(code).then(function () { toast('コピーしました: ' + code); }, function () { toast('コピーできませんでした (ブラウザが許していない)'); });
+      return;
+    }
+    var all = e.target.closest && e.target.closest('#copy-all');
+    if (all && !all.disabled) {
+      e.preventDefault();
+      all.disabled = true; all.setAttribute('aria-busy', 'true');
+      var url = all.getAttribute('data-url');
+      var n = 0, why = '';
+      var codesP = fetchCodes(url).then(function (codes) { n = codes.length; return codes.join('\n'); }, function (err) { why = err.message; throw err; });
+      var copied;
+      // Safari は押した直後でないと書けない = 中身の約束ごと渡す (ClipboardItem)。無いブラウザは読んでから書く
+      if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write && window.isSecureContext) {
+        copied = navigator.clipboard.write([new ClipboardItem({ 'text/plain': codesP.then(function (t) { return new Blob([t], { type: 'text/plain' }); }) })])
+          .catch(function (err) { if (why) throw err; return codesP.then(copyText); });
+      } else copied = codesP.then(copyText);
+      copied.then(function () { toast('コピーしました: 商品コード ' + n.toLocaleString('ja-JP') + ' 件 (1 行 1 つ)'); },
+        function () { toast(why || 'コピーできませんでした (ブラウザが許していない)'); })
+        .then(function () { all.disabled = false; all.removeAttribute('aria-busy'); });
+    }
+  });
+
   /* ---------- 一覧に戻る: 最後に見た一覧 (絞り込み・ページ) を覚え、1 つの商品の画面のパンくず「商品・セット」をそこへ向ける ---------- */
   var LIST_KEY = 'master-edit:list-url';
   if ($('#list-tbl')) { try { sessionStorage.setItem(LIST_KEY, location.pathname + location.search); } catch (err) { /* 覚えられない = いつもの一覧へ */ } }
