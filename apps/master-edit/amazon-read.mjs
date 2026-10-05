@@ -7,6 +7,7 @@
  *   売上の日次の公開がそろっていない日があれば「未判定」(0 件と言わない = M11)
  */
 import { normSku } from '../../lib/sku-norm.js';
+import { foldSearch, foldSql, likeOf } from './search-fold.mjs';
 import { COMPANY_ID, jstDate } from '../../lib/master-write.mjs';
 import { readAmazonMap, MAP_STATES, AMAZON_JP_SHOP_CODE } from '../../lib/amazon-map-write.mjs';
 import { readCutoverPhase } from '../../lib/master-cutover.mjs';
@@ -46,10 +47,11 @@ export async function listAmazonMaps(db, filters, { channels = null } = {}) {
   const params = [];
   const where = ['true'];
   if (f.q) {
-    const likeOf = (s) => `%${s.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    // 名前 = かなの同一視 (search-fold.mjs・商品・セットの一覧と同じ決まり)
     params.push(likeOf(normSku(f.q))); const norm = params.length;
-    params.push(likeOf(f.q)); const raw = params.length;
-    where.push(`(core.norm_code(m.seller_sku) like $${norm} or m.name ilike $${raw}
+    const fold = foldSql(params);
+    params.push(likeOf(foldSearch(f.q))); const raw = params.length;
+    where.push(`(core.norm_code(m.seller_sku) like $${norm} or ${fold('m.name')} like $${raw}
       or exists (select 1 from core.listing_components c join core.skus k on k.sku_id = c.sku_id where c.listing_id = m.listing_id and k.code_norm like $${norm}))`);
   }
   if (f.state) { params.push(f.state); where.push(`m.state = $${params.length}`); }

@@ -11,7 +11,10 @@
     const REGISTERED_ON_SOURCES_LABEL = { ne: 'NE の作成日', portal: 'ポータルで登録', first_seen: '夜間ロードで初めて見た日' };
     const FLAG_BADGE = { 'NEとの差': 'err', 'CSV待ち': 'info', '構成の依頼': 'warn', 'カード作成待ち': 'warn', 'カード作成待ち (失敗)': 'err', 'カードの衝突': 'err' };
     // 今の絞り込み (offset を除く) を土台に、1 つだけ変えた URL
-    const keep = Object.fromEntries(Object.entries(filters).filter(([k, v]) => v && k !== 'offset'));
+    // 詳細検索を印 (?s=) で使っているときは、詳細検索の項目は印に任せる (URL に長い条件を戻さない = HTTP 431 にしない)
+    const keep = Object.fromEntries(Object.entries(filters).filter(([k, v]) => v && k !== 'offset' && !(filters.s && ADV_KEYS.includes(k))));
+    // 注文残を見せない人 (発注アプリの利用権が無い) = 列・絞り込みを出さない
+    const poDenied = !!(extras && extras.backorders && extras.backorders.denied);
     const hrefWith = (over) => {
       const p = { ...keep };
       for (const [k, v] of Object.entries(over)) { if (v) p[k] = v; else delete p[k]; }
@@ -56,7 +59,7 @@
         <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
         <input id="q" name="q" value="<%= filters.q %>" autocomplete="off" aria-keyshortcuts="/" aria-label="商品・セットを絞る (コード・名前・JAN)" placeholder="商品・セットを絞る (コード・名前・JAN)　例: はちみつ / 4901234567894">
         <% for (const [k, v] of Object.entries(keep)) { if (k === 'q') continue; %><input type="hidden" name="<%= k %>" value="<%= v %>"><% } %>
-        <button class="btn soft sm go" type="submit">絞る</button>
+        <button class="btn soft sm go" type="submit" title="Enter でも絞れます">絞る</button>
         <span class="kbd" aria-hidden="true">/</span>
       </form>
       <div class="filters">
@@ -84,6 +87,7 @@
           <form method="get" action="" class="row2">
             <% if (filters.q) { %><input type="hidden" name="q" value="<%= filters.q %>"><% } %>
             <% if (filters.sort) { %><input type="hidden" name="sort" value="<%= filters.sort %>"><% } %>
+            <% if (filters.s) { %><input type="hidden" name="s" value="<%= filters.s %>"><% } else { for (const k of ADV_KEYS) { if (filters[k] && !['state'].includes(k)) { %><input type="hidden" name="<%= k %>" value="<%= filters[k] %>"><% } } } %>
             <label>区分 <select class="in" name="kind"><option value="">全部</option><% for (const [k, v] of Object.entries(KINDS)) { %><option value="<%= k %>"<%= filters.kind === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
             <label>状態 <select class="in" name="state"><option value="">全部</option><% for (const [k, v] of Object.entries(STATES)) { %><option value="<%= k %>"<%= filters.state === k ? ' selected' : '' %>><%= k === 'available' ? '取扱中' : v %></option><% } %></select></label>
             <label>登録 <select class="in" name="reg"><option value="">全部</option><% for (const [k, v] of Object.entries(REG_STATES)) { %><option value="<%= k %>"<%= filters.reg === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
@@ -94,22 +98,71 @@
             <% if (Object.keys(keep).length) { %><a class="btn ghost sm" href="./">条件を全部外す</a><% } %>
           </form>
         </details>
+        <%
+          const advOn = ADV_KEYS.some((k) => filters[k]);
+          const sel = (name, opts, cur, blank) => '<select class="in" name="' + name + '" id="adv-' + name + '"><option value="">' + blank + '</option>' + Object.entries(opts).map(([k, v]) => '<option value="' + k + '"' + (String(cur) === String(k) ? ' selected' : '') + '>' + v + '</option>').join('') + '</select>';
+        %>
+        <details class="more adv"<%= advOn ? ' open' : '' %> id="adv">
+          <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>詳細検索 (商品コードを複数・JAN・仕入先・代表・名前・原価・売価・登録日・在庫・注文残)<% if (advOn) { %> <span class="b info">使っている</span><% } %></summary>
+          <%# 長い条件 (商品コード 500 件など) は画面の JS が POST api/search で印にして ?s=<印> で開く (GET の URL は HTTP 431 になる)。JS が無いときは今までどおり GET %>
+          <form method="get" action="" class="adv-grid" id="adv-form" data-api="api/search">
+            <% for (const k of ['q', 'missing', 'reg', 'card', 'diff', 'sort']) { if (filters[k]) { %><input type="hidden" name="<%= k %>" value="<%= filters[k] %>"><% } } %>
+            <label class="adv-codes"><span class="lab">商品コード (複数)</span>
+              <textarea class="in" name="codes" id="adv-codes" rows="5" spellcheck="false" placeholder="Excel の列をそのまま貼り付け&#10;(改行・カンマ・空白・タブで区切る)&#10;ぴったり当てる · 大文字小文字・全角半角は同じ"><%= filters.codes %></textarea>
+              <span class="hint"><%= MULTI_MAX %> 件まで · 見つからないコードは一覧の上に出ます</span></label>
+            <div class="adv-col">
+              <label><span class="lab">JAN (複数)</span><textarea class="in" name="jans" id="adv-jans" rows="2" spellcheck="false"><%= filters.jans %></textarea></label>
+              <label><span class="lab">仕入先コード (複数・代表の仕入先)</span><textarea class="in" name="sups" id="adv-sups" rows="2" spellcheck="false" placeholder="例: 0001 (1 でも同じ)"><%= filters.sups %></textarea></label>
+            </div>
+            <div class="adv-col">
+              <label><span class="lab">代表 (親) の商品コード (複数)</span><textarea class="in" name="parents" id="adv-parents" rows="2" spellcheck="false" placeholder="その代表の商品と代表そのもの"><%= filters.parents %></textarea></label>
+              <label><span class="lab">商品名 (含む)</span><input class="in" name="name" id="adv-name" value="<%= filters.name %>" autocomplete="off" placeholder="ひらがな・カタカナ・半角カナは同じ"></label>
+            </div>
+            <div class="adv-col adv-ranges">
+              <div class="rng"><span class="lab">原価</span><input class="in" name="cost_min" inputmode="numeric" value="<%= filters.cost_min %>" aria-label="原価 から (円)"><span>〜</span><input class="in" name="cost_max" inputmode="numeric" value="<%= filters.cost_max %>" aria-label="原価 まで (円)"><span class="unit">円</span></div>
+              <div class="rng"><span class="lab">売価</span><input class="in" name="price_min" inputmode="numeric" value="<%= filters.price_min %>" aria-label="売価 から (円)"><span>〜</span><input class="in" name="price_max" inputmode="numeric" value="<%= filters.price_max %>" aria-label="売価 まで (円)"><span class="unit">円</span></div>
+              <% if (data.registeredOnAvailable) { %><div class="rng" id="adv-regdate"><span class="lab">登録日</span><input class="in" type="date" name="reg_from" value="<%= filters.reg_from %>" min="2000-01-01" aria-label="登録日 から"><span>〜</span><input class="in" type="date" name="reg_to" value="<%= filters.reg_to %>" min="2000-01-01" aria-label="登録日 まで"><span class="unit"></span></div><% } %>
+              <div class="rng"><span class="lab">在庫</span><input class="in" name="stock_min" inputmode="numeric" value="<%= filters.stock_min %>" aria-label="在庫 (ロジザード) から"><span>〜</span><input class="in" name="stock_max" inputmode="numeric" value="<%= filters.stock_max %>" aria-label="在庫 (ロジザード) まで"><span class="unit">個</span></div>
+              <% if (poDenied) { %><span class="hint" id="po-denied">注文残 (発注アプリの権限がないので出せません)</span><% } else { %><label class="chk"><input type="checkbox" name="po" value="1"<%= filters.po ? ' checked' : '' %>> 注文残あり (発注アプリ)</label><% } %>
+            </div>
+            <div class="adv-col adv-sels">
+              <label><span class="lab">取扱区分</span><%- sel('state', { available: '取扱中', discontinued: '中止' }, filters.state, '全部') %></label>
+              <label><span class="lab">単品 / セット</span><%- sel('kind', KINDS, filters.kind, '全部') %></label>
+              <label><span class="lab">税率</span><%- sel('tax', TAX_FILTERS, filters.tax, '全部') %></label>
+              <label><span class="lab">売上分類</span><%- sel('sales', SALES_FILTERS, filters.sales, '全部') %></label>
+            </div>
+            <div class="adv-foot">
+              <button class="btn pri sm" type="submit"><svg class="ic s" aria-hidden="true"><use href="#i-search"/></svg>この条件で探す</button>
+              <a class="btn ghost sm" href="./">クリア (条件を全部外す)</a>
+              <span class="hint">条件は URL に残ります (戻る・共有で同じ結果。長い条件は 24 時間の印) · 在庫 = ロジザード · 注文残 = 発注アプリ</span>
+            </div>
+          </form>
+        </details>
       </div>
     </div>
+
+    <% if (locals.searchExpired) { %><div class="callout warn" id="search-expired" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">条件の期限が切れました。もう一度検索してください</div><div class="hint">長い詳細検索の条件は、画面の裏で 24 時間だけ預かっています (アプリの入れ替えでも消えます)。</div></div><a class="btn sm" href="./">条件を外す</a></div><% } %>
+    <% if (data.notFound && data.notFound.length) { %><div class="callout warn" id="not-found" role="status"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t"><%= data.notFound.length %> 件 見つからない</div><div class="hint mono" style="color:var(--text2)"><%= data.notFound.slice(0, 60).join(', ') %><%= data.notFound.length > 60 ? ' ほか ' + (data.notFound.length - 60) + ' 件' : '' %></div></div></div><% } %>
+    <% if (data.multiCut) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">複数の欄は <%= MULTI_MAX %> 件までを使いました (それより後は使っていません)</div></div><% } %>
 
     <div class="panel">
       <div class="tbl-top">
         <span><b><%= data.total.toLocaleString('ja-JP') %></b> 件</span><span class="dotsep" aria-hidden="true"></span>
-        <span>コードを押すか <span class="kbd">↑</span><span class="kbd">↓</span> で選んで <span class="kbd">Enter</span> で開く</span>
+        <span>絞る欄で <span class="kbd">Enter</span> = 絞る · コードを押すか <span class="kbd">↑</span><span class="kbd">↓</span> で選んで <span class="kbd">Enter</span> で開く</span>
         <% if (data.sorts) { %><span class="dotsep" aria-hidden="true"></span><span>並び <% for (const [k, v] of Object.entries(data.sorts)) { %><% if ((filters.sort || '') === k) { %><b aria-current="true"><%= v %></b><% } else if (k && !data.registeredOnAvailable) { %><% } else { %><a href="<%= hrefWith({ sort: k }) %>"><%= v %></a><% } %> <% } %></span><% } %>
         <span class="right"><span><span class="fx">計算</span> = 構成品から計算した値</span></span>
       </div>
       <div class="tblwrap">
         <table class="tbl click" id="list-tbl">
           <caption class="sr">商品・セットの一覧 (<%= data.total %> 件)</caption>
-          <thead><tr><th scope="col" style="width:130px">コード</th><th scope="col" style="min-width:260px">名前</th><th scope="col" style="width:150px">状態</th><th scope="col" style="width:96px">登録日</th><th scope="col" class="n" style="width:84px">売価</th><th scope="col" class="n" style="width:112px">原価</th><th scope="col" class="n" style="width:74px">税</th><th scope="col" style="width:120px">売上分類</th><th scope="col" style="width:150px">対応が必要</th></tr></thead>
+          <%
+            const st = extras && extras.stock, bo = extras && extras.backorders;
+            const stSub = !st || !st.ok ? '読めない' : (st.stale ? '古い ' : '') + ui.fmtJst(st.asOf, { nowMs }).replace(/^.*\) /, '');
+            const stTitle = !st || !st.ok ? (st && st.error) || '読めない' : 'ロジザード ' + ui.fmtJst(st.asOf, { nowMs }) + ' 時点' + (st.stale ? ' (2 時間より前 = 古い)' : '') + ' · 参考 · セットは構成品から作れる数';
+          %>
+          <thead><tr><th scope="col" style="width:130px">コード</th><th scope="col" style="min-width:260px">名前</th><th scope="col" style="width:150px">状態</th><th scope="col" style="width:96px">登録日</th><th scope="col" class="n" style="width:84px">売価</th><th scope="col" class="n" style="width:112px">原価</th><th scope="col" class="n" style="width:74px">税</th><th scope="col" style="width:120px">売上分類</th><th scope="col" class="n ref<%= !st || !st.ok ? ' bad' : st.stale ? ' stale' : '' %>" style="width:86px" title="<%= stTitle %>">在庫<span class="thsub"><%= stSub %></span></th><% if (!poDenied) { %><th scope="col" class="n ref<%= !bo || !bo.ok ? ' bad' : '' %>" style="width:76px" title="<%= !bo || !bo.ok ? '発注アプリの台帳を読めない' : '発注アプリの注文残 (発注したがまだ入庫していない数)' %>">注文残<span class="thsub"><%= !bo || !bo.ok ? '読めない' : '発注' %></span></th><% } %><th scope="col" style="width:150px">対応が必要</th></tr></thead>
           <tbody>
-            <% if (!data.rows.length) { %><tr><td colspan="9" class="muted" style="text-align:center;padding:30px"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
+            <% if (!data.rows.length) { %><tr><td colspan="<%= poDenied ? 10 : 11 %>" class="muted" style="text-align:center;padding:30px"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
             <% for (const r of data.rows) { const isSet = r.kind === 'set'; %>
             <tr>
               <td><a class="rowlink" href="sku/<%= encodeURIComponent(r.code) %>"><%= r.code %></a></td>
@@ -123,6 +176,8 @@
               <td class="n"><% if (r.cost == null) { %><span class="b err">未入力</span><% } else { %><%= fmt.yen(r.cost) %><% if (r.cost_derived) { %><span class="fx">計算</span><% } %><% } %></td>
               <td class="n"><% if (r.tax_rate == null) { %><span class="b warn">未入力</span><% } else { %><%= fmt.tax(r.tax_rate) %>%<% if (r.tax_derived) { %><span class="fx">計算</span><% } %><% } %></td>
               <td><% if (r.sales_class == null) { %><% if (r.kind !== 'exception') { %><span class="b warn">未入力</span><% } %><% } else { %><%= SALES[r.sales_class] || r.sales_class %><% if (r.sales_derived) { %><span class="fx">計算</span><% } %><% } %></td>
+              <td class="n ref"><% if (isSet) { %><% if (r.buildable != null) { %><span title="構成品の在庫から作れる数 (参考)"><%= r.buildable.toLocaleString('ja-JP') %></span><span class="fx">作れる</span><% } %><% } else if (r.stock != null) { %><%= r.stock ? r.stock.toLocaleString('ja-JP') : '0' %><% } else { %><span class="muted">—</span><% } %></td>
+              <% if (!poDenied) { %><td class="n ref"><% if (r.backorder) { %><%= r.backorder.toLocaleString('ja-JP') %><% } else if (r.backorder == null) { %><span class="muted">—</span><% } %></td><% } %>
               <td><div class="flags"><% for (const f of r.flags) { %><span class="b <%= FLAG_BADGE[f] || 'mute' %>"><%= f %></span><% } %></div></td>
             </tr>
             <% } %>

@@ -886,15 +886,26 @@ function initLedgerSchema(db) {
 
   // 商品別のアプリ台帳注残 (残>0のオープン tracked 発注のみ、移行PO含む)。
   // logic.js loadLedgerBackorders / 要発注判定 / PML出力の全消費者がこのビューを使う (集計ロジックの一本化)
+  // 注残の明細 (対象の条件はここだけ = v_ledger_backorder_by_product はこの明細を足すだけ)。
+  // マスタの入力 (apps/master-edit) の 1 つの商品の画面が「注文残の内訳 (発注日・仕入先・数・納期)」に使う (logic.js loadBackorderLines)。
+  // 納期 = 回答納期 → 希望納期 (明細 → ヘッダ) の順 (listBackorders の due と同じ)
   db.exec('DROP VIEW IF EXISTS v_ledger_backorder_by_product');
-  db.exec(`CREATE VIEW v_ledger_backorder_by_product AS
-    SELECT i.product_key AS product_key, SUM(b.remaining_qty) AS backorder_qty
+  db.exec('DROP VIEW IF EXISTS v_ledger_backorder_lines');
+  db.exec(`CREATE VIEW v_ledger_backorder_lines AS
+    SELECT i.product_key AS product_key, i.product_code AS product_code, i.id AS order_item_id, o.id AS order_id,
+           o.po_number AS po_number, o.supplier_code AS supplier_code, o.supplier_name AS supplier_name, o.issued_at AS issued_at,
+           i.promised_date AS promised_date,
+           COALESCE(NULLIF(i.requested_date, ''), NULLIF(o.requested_date, '')) AS requested_date,
+           b.remaining_qty AS remaining_qty
     FROM po_order_items i
     JOIN po_orders o ON o.id = i.order_id
     JOIN v_po_item_balance b ON b.order_item_id = i.id
     WHERE o.status = 'issued' AND o.tracking_mode = 'tracked' AND o.closed_at IS NULL AND b.remaining_qty > 0
-      AND o.issued_at >= (SELECT value FROM po_settings WHERE key = 'tracking_started_at')
-    GROUP BY i.product_key`);
+      AND o.issued_at >= (SELECT value FROM po_settings WHERE key = 'tracking_started_at')`);
+  db.exec(`CREATE VIEW v_ledger_backorder_by_product AS
+    SELECT product_key, SUM(remaining_qty) AS backorder_qty
+    FROM v_ledger_backorder_lines
+    GROUP BY product_key`);
 
   // 商品別オープン注残の希望納期内訳 (対象母集合は v_ledger_backorder_by_product と同一条件)。
   // 発注ワークスペースの「注残がいつ入る予定か」表示用。希望納期は明細スナップショット優先、

@@ -74,7 +74,7 @@
   <div class="page" id="sku-page">
   <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div><div class="hint">つながったら画面を開き直してください。</div></div></div><% } %>
   <% if (page) { %>
-    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/">商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span class="mono" aria-current="page"><%= c.code %></span></nav>
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span class="mono" aria-current="page"><%= c.code %></span></nav>
     <div class="ph" id="sku-ph">
       <div>
         <div class="idrow">
@@ -154,7 +154,14 @@
               <div class="cost-add" id="cost-add" hidden>
                 <div class="ttl"><svg class="ic" style="color:var(--accent)" aria-hidden="true"><use href="#i-clock"/></svg>原価を変える (<%= ui.fmtDay(page.today) %> 今日から)</div>
                 <div class="f"><label class="lab" for="cost-jpy">新しい原価</label><div class="ctl"><span class="yen"><input class="in w-s" id="cost-jpy" inputmode="numeric" autocomplete="off" placeholder="0" <%- meta('cost') %> data-unit=" 円"></span><span class="unit">円</span><span id="cost-delta" aria-live="polite"></span></div></div>
-                <div class="f"><label class="lab" for="cost-reason">理由 <span class="req">必須</span></label><div class="ctl"><input class="in w-full" id="cost-reason" maxlength="200" placeholder="例: 仕入値の改定 (メーカーから通知)"></div></div>
+                <%# 理由はふだん「メーカーからの値上げ通知」(中原さん 10/5) = 選ぶだけ。その他のときだけ書く。送る文 = 選んだ文そのもの / その他は書いた文 %>
+                <div class="f"><span class="lab" id="lab-cost-reason">理由 <span class="req">必須</span></span><div class="ctl">
+                  <div class="reason-pick" role="radiogroup" aria-labelledby="lab-cost-reason" id="cost-reason-pick">
+                    <% ['メーカーからの値上げ通知', 'メーカーからの値下げ通知', '仕入先を変えた', '入力の誤りを直す'].forEach((t, i) => { %><label class="rp"><input type="radio" name="cost-reason-pick" value="<%= t %>"<%= i === 0 ? ' checked' : '' %>><span><%= t %></span></label><% }) %>
+                    <label class="rp"><input type="radio" name="cost-reason-pick" value="" data-other="1"><span>その他</span></label>
+                  </div>
+                  <input class="in w-full" id="cost-reason" maxlength="200" autocomplete="off" aria-label="その他の理由" placeholder="その他の理由を書く (例: 送料込みの仕入値に変わった)" hidden>
+                </div></div>
                 <div class="foot"><span class="hint">今日から変わります。いまの原価は昨日で終わります (過去の粗利は変わりません)。入れたら右の「保存する」で確定します。</span>
                   <button class="btn ghost" type="button" id="cost-cancel">やめる</button></div>
               </div>
@@ -354,6 +361,34 @@
             <div class="row"><span class="k">NE の待ち</span><span class="v"><% if (page.csvRows.length) { %><span class="b warn">NE に取り込む CSV <%= page.csvRows.length %> 列</span><span class="hint" style="display:block"><%= page.csvRows.map((r) => r.col + (r.child ? '(' + r.child + ')' : '')).join('・') %> · <a href="/apps/master-decisions/csv">マスタの判断 ↗</a></span><% } else if (isSet && c.component_request) { %><span class="b warn">構成の依頼 1 件</span><% } else { %><span class="b ok"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>なし</span><% } %></span></div>
           </div>
         </section>
+
+        <% if (extras) { const st = extras.stock; const stockN = isSet ? extras.buildable : extras.qty; %>
+        <%# 参考 (ほかのアプリの値・読むだけ): 在庫 = ロジザード (セットは構成品から作れる数)・注文残 = 発注アプリの台帳 (apps/master-edit/extras.mjs) %>
+        <section class="panel refbox" aria-labelledby="h-ref" id="ref-box">
+          <div class="panel-h" style="margin-bottom:10px"><h2 id="h-ref">在庫・注文残</h2><span class="sub">参考 (ほかのアプリの値)</span></div>
+          <div class="kv">
+            <div class="row"><span class="k"><%= isSet ? '作れる数' : '在庫' %> (ロジザード)</span><span class="v">
+              <% if (!st || !st.ok) { %><span class="when bad" id="ref-stock-when">読めない<%= st && st.error ? ' (' + st.error + ')' : '' %></span>
+              <% } else { %><span class="big" id="ref-stock"><%= stockN == null ? '—' : stockN.toLocaleString('ja-JP') %></span>
+                <span class="when<%= st.stale ? ' stale' : '' %>" id="ref-stock-when" style="display:block"><%= st.stale ? '古い · ' : '' %><%= ui.fmtJst(st.asOf, { nowMs }) %> 時点<%= isSet ? ' · 構成品の在庫 ÷ 数 の小さい方' : '' %></span><% } %>
+            </span></div>
+            <% if (!isSet) { const bo = extras.backorder; %>
+            <div class="row"><span class="k">注文残 (発注アプリ)</span><span class="v">
+              <% if (bo && bo.denied) { %><span class="when" id="ref-po-why">注文残 (発注アプリの権限がないので出せません)</span>
+              <% } else if (!bo || !bo.ok) { %><span class="when bad" id="ref-po-why">読めない</span>
+              <% } else { %><span class="big" id="ref-po"><%= bo.total.toLocaleString('ja-JP') %></span><% if (!bo.lines.length) { %> <span class="when">なし</span><% } %><% } %>
+            </span></div>
+            <% if (bo && bo.ok && bo.lines.length) { %>
+            <table id="ref-po-lines"><thead><tr><th scope="col">発注日</th><th scope="col">仕入先</th><th scope="col" class="n">数</th><th scope="col">納期</th></tr></thead><tbody>
+              <% for (const l of bo.lines.slice(0, 8)) { %><tr><td><%= ui.fmtJst(l.issuedAt, { nowMs }).replace(/ \d\d:\d\d$/, '') %></td><td class="sup"><%= l.supplierName || l.supplierCode %></td><td class="n"><%= Number(l.remaining).toLocaleString('ja-JP') %></td><td><%= l.due ? ui.fmtDay(l.due, page.today) + (l.dueKind === 'promised' ? ' 回答' : ' 希望') : '未定' %></td></tr><% } %>
+            </tbody></table>
+            <% if (bo.lines.length > 8) { %><div class="hint">ほか <%= bo.lines.length - 8 %> 件</div><% } %>
+            <a class="hint" href="/apps/purchase-orders">発注アプリで見る <svg class="ic s" style="vertical-align:-2px" aria-hidden="true"><use href="#i-ext"/></svg></a>
+            <% } %>
+            <% } %>
+          </div>
+        </section>
+        <% } %>
 
         <% if (page.regItems.length || page.card) { %>
         <section class="panel" aria-labelledby="h-reg" id="card-box" data-base="<%= base %>" data-code="<%= c.code %>">

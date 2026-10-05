@@ -15,6 +15,8 @@
  *      security definer・search_path・持ち主・権限は同じ / 古い形の INSERT で空のまま作った単品は、次の夜間ロードが NE の作成日で埋める
  *   B 0057 の前にポータルで登録した SKU (登録の状態の行 origin = new_entry) は 0057 が行を作った日 (JST)・portal で埋める (単品・セット・状態は問わない・backfill は空)・
  *      記録は migration_0057・その後の夜間ロードで ne に変わらない (#1617 Codex R2 Medium)
+ *   C 並び × ページ送り × 詳細検索: 登録日の新しい順は一覧の ① の SQL で並べてから 100 件に切る (2 ページ目は続き)・詳細検索の登録日の範囲 (空は入らない・読めない日付は捨てる)・
+ *      ページ送り・?s= の印・札のリンク・3 つのフォームが並びを引き継ぐ・登録日と在庫の列が一緒に出る
  *   V 画面: 一覧に登録日の列・「登録日の新しい順」(空は最後・同じ日はコード順)・知らない並びはコード順・単品の画面の見出しに登録日と出どころ / 分からない
  * 使い方: node scripts/test-sku-registered-on.mjs
  */
@@ -353,6 +355,66 @@ await ta('[V3] 単品の画面の見出しに登録日と出どころ・分か�
   assert.ok(r.text.includes('<span id="registered-on">登録日 2026/10/05 (夜間ロードで初めて見た日)</span>'));
   const page = await R.readSkuPage(db, 'r009', { now: LOAD_NOW });
   assert.deepEqual([page.registered.source, page.registered.label], ['portal', 'ポータルで登録']);
+});
+
+// ── C: 並び × ページ送り × 詳細検索 (#1619 の 2 段の読み方・#1620 の詳細検索と ?s= の印) ──
+//   130 件 (登録日 = 1/1 から 40 日を回す・最後の 10 件は空) を足す = 1 ページ 100 件を超える。上の V の試験の後 (一覧の数を変えない)
+await ta('[C] 並び × ページ送り × 詳細検索: 登録日の新しい順は ① の SQL で並べてから 100 件に切る・登録日の範囲 (空は入らない)・ページ送り / ?s= の印 / 絞り込みのリンク / フォームが並びを引き継ぐ', async () => {
+  await q(`insert into core.skus (company_id, sku_kind, code, name, handling, registered_on, registered_on_source)
+           select 1, 'exception', 'pg' || lpad(i::text, 3, '0'), 'ページ試験 ' || i, 'active',
+                  case when i <= 120 then date '2026-01-01' + (i % 40) end, case when i <= 120 then 'ne' end
+             from generate_series(1, 130) i`);
+  const all = (await q("select code, registered_on::text as d from core.skus where code like 'pg%'"));
+  const byRegDesc = (xs) => [...xs].sort((a, b) => (a.d === b.d ? (a.code < b.code ? -1 : 1) : a.d == null ? 1 : b.d == null ? -1 : a.d < b.d ? 1 : -1)).map((x) => x.code);
+  const inRange = all.filter((x) => x.d != null && x.d >= '2026-01-03');   // i % 40 が 0・1 の 6 件と空の 10 件を除く = 114 件
+  assert.equal(inRange.length, 114);
+  const want = byRegDesc(inRange);
+  // 読む関数: ① で並べてから切る (JS で 100 件を並べ直すのではない) = 2 ページ目は続き
+  const f = { name: 'ぺーじ', reg_from: '2026/1/3', sort: 'reg_desc' };   // 名前はかなの同一視・日付は / でも読む
+  const p1 = await R.listSkus(db, f, { now: LOAD_NOW });
+  const p2 = await R.listSkus(db, { ...f, offset: '100' }, { now: LOAD_NOW });
+  assert.equal(p1.total, 114); assert.equal(p2.total, 114);
+  assert.deepEqual([...p1.rows, ...p2.rows].map((x) => x.code), want);
+  assert.equal(p1.filters.reg_from, '2026-01-03');
+  assert.ok(p1.rows.every((x) => x.registered_on >= '2026-01-03' && x.registered_on_source === 'ne'));
+  // コード順 (既定) は同じ件数でコード順・登録日の終わりだけ・空は範囲に入らない・読めない日付は捨てる (= 範囲なし)
+  assert.deepEqual((await R.listSkus(db, { name: 'ページ', reg_from: '2026-01-03' }, { now: LOAD_NOW })).rows.map((x) => x.code), inRange.map((x) => x.code).sort().slice(0, 100));
+  assert.equal((await R.listSkus(db, { name: 'ページ', reg_to: '2026-01-02' }, { now: LOAD_NOW })).total, 6);
+  assert.equal((await R.listSkus(db, { name: 'ページ', reg_from: '2026-02-30' }, { now: LOAD_NOW })).total, 130);
+  assert.equal((await R.listSkus(db, { name: 'ページ', reg_from: '2026-02-30' }, { now: LOAD_NOW })).filters.reg_from, '');
+  // 画面 (HTTP): 1 ページ目 → 「次の 100 件」のリンク (並び・範囲を引き継ぐ) → 2 ページ目
+  const codesOf = (html) => [...html.matchAll(/class="rowlink" href="sku\/([^"]+)"/g)].map((m) => decodeURIComponent(m[1]));
+  const nextOf = (html) => { const m = /<a class="btn sm" href="([^"]+)">次の 100 件/.exec(html); return m ? m[1].replace(/&amp;/g, '&') : null; };
+  let r = await get('/?' + new URLSearchParams({ name: 'ページ', reg_from: '2026-01-03', sort: 'reg_desc' }));
+  assert.equal(r.status, 200);
+  assert.deepEqual(codesOf(r.text), want.slice(0, 100));
+  assert.ok(r.text.includes('<b aria-current="true">登録日の新しい順</b>'));
+  assert.ok(r.text.includes('id="adv-regdate"') && r.text.includes('name="reg_from" value="2026-01-03"'), '詳細検索の板に登録日の範囲');
+  let next = nextOf(r.text);
+  assert.ok(next && /sort=reg_desc/.test(next) && /reg_from=2026-01-03/.test(next) && /offset=100/.test(next), next);
+  r = await get('/' + next);
+  assert.deepEqual(codesOf(r.text), want.slice(100));
+  // 札のリンク・もっと絞るのフォーム・詳細検索のフォーム・絞る欄が並びを引き継ぐ
+  assert.ok(/<a class="chip[^"]*" href="\?[^"]*sort=reg_desc[^"]*"[^>]*>[^]*?セット/.test(r.text), '区分の札');
+  assert.equal((r.text.match(/<input type="hidden" name="sort" value="reg_desc">/g) || []).length, 3, '絞る欄・もっと絞る・詳細検索の 3 つのフォーム');
+  // 列: 登録日・在庫・(注文残)・対応が必要 が一緒に出る
+  assert.ok(/<th scope="col" style="width:96px">登録日<\/th>[^]*在庫<span class="thsub">/.test(r.text));
+  // ?s= の印 (長い詳細検索の条件): 並びは印の外の URL・登録日の範囲は印の中。ページ送りも印と並びを引き継ぐ
+  const origin = new URL(BASE).origin;
+  const pr = await fetch(BASE + '/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json', Origin: origin }, body: JSON.stringify({ name: 'ページ', reg_from: '2026-01-03', sort: 'reg_desc' }) });
+  const pj = await pr.json();
+  assert.equal(pr.status, 200, JSON.stringify(pj));
+  const u = new URL(pj.url, BASE);
+  assert.deepEqual([u.searchParams.get('sort'), u.searchParams.get('reg_from'), u.searchParams.get('name'), !!u.searchParams.get('s')], ['reg_desc', null, null, true]);
+  r = await get('/' + u.search);
+  assert.deepEqual(codesOf(r.text), want.slice(0, 100));
+  next = nextOf(r.text);
+  assert.ok(next && /[?&]s=/.test(next) && /sort=reg_desc/.test(next) && !/reg_from=/.test(next) && /offset=100/.test(next), next);
+  r = await get('/' + next);
+  assert.deepEqual(codesOf(r.text), want.slice(100));
+  // 印のときの「もっと絞る」は印と並びを引き継ぐ
+  assert.ok(/<input type="hidden" name="s" value="[A-Za-z0-9_-]+">/.test(r.text));
+  await q("delete from core.skus where code like 'pg%'");
 });
 
 // ── B: 0057 の前にポータルで登録した SKU (⑤-2a = ops.master_registrations の origin = 'new_entry') は 0057 が portal で埋める (#1617 Codex R2 Medium) ──
