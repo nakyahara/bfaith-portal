@@ -444,11 +444,11 @@
       if (!confirm('この納品回を完了にしますか? (以後 iPad から入力できません)')) return;
       let j = await post(`/admin/runs/${b.dataset.id}/finish`, { acknowledge: false });
       if (!j.ok && j.error === 'incomplete') {
-        const list = j.rows.slice(0, 15).map(x => `- ${x.planNo || ''} ${(x.name || '').slice(0, 30)}: 残り ${x.remaining}`).join('\n');
+        const list = j.rows.slice(0, 15).map(x => `- ${x.planNo || ''} ${(x.name || '').slice(0, 30)}: ${x.extra ? `送る数 ${x.sendQty} (予定 ${x.planned}) ・ ` : ''}残り ${x.remaining}`).join('\n');
         if (!confirm(`${j.message}\n\n${list}${j.rows.length > 15 ? '\n…' : ''}\n\n残りを「今回は納品しない」として完了しますか?`)) return;
         j = await post(`/admin/runs/${b.dataset.id}/finish`, { acknowledge: true });
       }
-      setMsg($('#run-msg'), j.ok ? 'ok' : 'err', j.ok ? `完了にしました${j.notShipped ? ` (納品しない商品 ${j.notShipped} 行)` : ''}` : j.message);
+      setMsg($('#run-msg'), j.ok ? 'ok' : 'err', j.ok ? `完了にしました${j.notShipped ? ` (納品しない商品 ${j.notShipped} 行)` : ''}${j.extraTrimmed ? ` (予定より増やすのをやめた商品 ${j.extraTrimmed} 行)` : ''}` : j.message);
       if (j.ok) setTimeout(() => location.reload(), 800);
     }));
     document.querySelectorAll('.run-cancel').forEach(b => b.addEventListener('click', async () => {

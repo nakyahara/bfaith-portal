@@ -828,7 +828,7 @@
         <h2>⚠ まだ入っていない商品があります</h2>
         <div class="msg" style="color:#495057">${esc(j.message)}</div>
         <div style="max-height:40vh; overflow-y:auto; margin:10px 0; background:#FFF5F5; border-radius:10px; padding:10px">
-          ${j.rows.map(x => `<div style="padding:5px 0; border-bottom:1px solid #FFE3E3"><b>${esc(x.planNo || '')}</b> ${esc(shortName(x.name, 22))} — 予定 ${x.planned} / 入れた ${x.placed}${x.shortage ? ' / 不足 ' + x.shortage : ''} → <b style="color:#C92A2A">残り ${x.remaining}</b></div>`).join('')}
+          ${j.rows.map(x => `<div style="padding:5px 0; border-bottom:1px solid #FFE3E3"><b>${esc(x.planNo || '')}</b> ${esc(shortName(x.name, 22))} — 予定 ${x.planned}${x.extra ? ` (送る数 ${x.sendQty})` : ''} / 入れた ${x.placed}${x.shortage ? ' / 不足 ' + x.shortage : ''} → <b style="color:#C92A2A">残り ${x.remaining}</b></div>`).join('')}
         </div>
         <div class="msg" style="color:#868E96">破損・自社出荷の引当などで納品しない場合はそのまま完了できます。残りは「今回は納品しない」として記録され、本社の画面に出ます</div>
         <div class="grid2" style="margin-top:12px">
@@ -840,7 +840,7 @@
         const j2 = await apiPost(`/api/runs/${curRunId}/finish`, { worker_id: sw.id, pin, acknowledge: true });
         if (!j2.ok) { alert(j2.message || '終えられませんでした'); return; }
         closeDialog();
-        alert(`✅ 作業を終えました (納品しない商品 ${j2.notShipped} 行)`);
+        alert(`✅ 作業を終えました (納品しない商品 ${j2.notShipped} 行${j2.extraTrimmed ? ` / 予定より増やすのをやめた商品 ${j2.extraTrimmed} 行` : ''})`);
         backToRuns();
       });
     });

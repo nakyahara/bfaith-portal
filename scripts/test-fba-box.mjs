@@ -1809,7 +1809,12 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     const inc = db.finishRun({ runId: cx.runId, worker: staff });
     assert.equal(inc.error, 'incomplete');
     assert.deepEqual(inc.rows.map((x) => x.remaining).sort(), [1, 3]);
-    assert.equal(db.finishRun({ runId: cx.runId, acknowledge: true, worker: staff }).ok, true);
+    // 確認の一覧は「送る数 6 / 入れた 5」で出せる・文に「増やすのをやめるだけ」(Codex PR #1621 R2 Low)
+    assert.ok(inc.rows.every((x) => x.sendQty === 6 && x.extra === 2 && x.planned === 4), JSON.stringify(inc.rows));
+    assert.match(inc.message, /増やすのをやめるだけ/);
+    const fin = db.finishRun({ runId: cx.runId, acknowledge: true, worker: staff });
+    assert.equal(fin.ok, true);
+    assert.equal(fin.notShipped, 1); assert.equal(fin.extraTrimmed, 1);   // a は増やした数を縮めただけ = 「納品しない」に数えない
     const rows = db.getRunState(cx.runId).rows;
     const a = rows.find((x) => x.id === ra.id), b = rows.find((x) => x.id === rb.id);
     assert.equal(a.extra_qty, 1); assert.equal(a.shortage_qty, null);                                   // 予定 4 → 5

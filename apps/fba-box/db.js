@@ -1030,8 +1030,10 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel, don
         message: `予定より多く入っている商品が ${over.length} 行あります。記録を取り消すか不足を解除してから完了してください` };
     }
     if (rows.length > 0 && !acknowledge) {
-      return { ok: false, error: 'incomplete', rows: rows.map((r) => ({ id: r.id, fnsku: r.fnsku, name: r.product_name, planNo: r.plan_no, planned: r.planned_qty, placed: r.placed, shortage: r.shortage, remaining: r.remaining })),
-        message: `まだ入っていない商品が ${rows.length} 行あります (合計 ${rows.reduce((a, r) => a + Math.max(0, r.remaining), 0)} 個)。このまま完了すると、残りは「今回は納品しない」として記録されます` };
+      return { ok: false, error: 'incomplete', rows: rows.map((r) => ({ id: r.id, fnsku: r.fnsku, name: r.product_name, planNo: r.plan_no, planned: r.planned_qty, placed: r.placed, shortage: r.shortage, extra: r.extra, sendQty: r.planned_qty - r.shortage + r.extra, remaining: r.remaining })),
+        // 予定より増やした行の残りは「増やすのをやめる」だけで、予定に届かない分だけが「今回は納品しない」(Codex PR #1621 R2 Low)
+        message: `まだ入っていない商品が ${rows.length} 行あります (合計 ${rows.reduce((a, r) => a + Math.max(0, r.remaining), 0)} 個)。このまま完了すると、残りは「今回は納品しない」として記録されます`
+          + (rows.some((r) => r.extra > 0) ? '。予定より増やした商品は、予定を超えた分は増やすのをやめるだけです (予定に届かない分だけ「今回は納品しない」)' : '') };
     }
     const now = utcNow();
     const voided = [];
@@ -1047,7 +1049,7 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel, don
       ON CONFLICT(row_id) DO UPDATE SET shortage_qty = excluded.shortage_qty, shortage_reason = excluded.shortage_reason, shortage_detail = excluded.shortage_detail,
         shortage_by = excluded.shortage_by, updated_at = excluded.updated_at`);
     const setExtraDone = d.prepare('UPDATE fbx_row_work SET extra_qty = ?, extra_reason = CASE WHEN ? IS NULL THEN NULL ELSE extra_reason END, extra_by = CASE WHEN ? IS NULL THEN NULL ELSE extra_by END, updated_at = ? WHERE row_id = ?');
-    let notShipped = 0;
+    let notShipped = 0, extraTrimmed = 0;   // 不足 (今回は納品しない) にした行 / 予定より増やした数を縮めただけの行
     for (const r of rows) {
       // 予定より増やした行で入れ切らなかった: 送る数 = 入れた数。予定を超えた分だけ増やした数に残し、
       // 予定に届かなければ増やした数を消して不足 (今回は納品しない) にする
@@ -1058,7 +1060,7 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel, don
         if (short > 0) upShort.run(r.id, short, 'not_shipped', null, worker?.display_name || null, now);
         logEvent({ runId: run.id, action: 'row_extra', targetType: 'row', targetId: r.id, workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
           payload: { extraQty: ex || 0, shortageQty: short, auto: true, via: 'finish', remaining: r.remaining, from: r.extra } }, d);
-        notShipped++;
+        if (short > 0) notShipped++; else extraTrimmed++;
         continue;
       }
       const total = r.shortage + r.remaining;
@@ -1068,14 +1070,14 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel, don
         payload: { shortageQty: total, reason: 'not_shipped', auto: true, remaining: r.remaining, detail: safeJson(bd.detail, null) } }, d);
       notShipped++;
     }
-    if (notShipped > 0 || voided.length > 0) bumpRunVersion(d, run.id);
+    if (notShipped > 0 || extraTrimmed > 0 || voided.length > 0) bumpRunVersion(d, run.id);
     d.prepare(`UPDATE fbx_runs SET status = 'done', done_at = ? WHERE id = ?`).run(now, run.id);
     // 完了の知らせ (本社の Google Chat) を同じトランザクションで積む。送るのは notify-outbox.js
     // (応答のあと・再起動のあとでも送る。投げっぱなしにしない — Codex PR #1307 R1 P1)
     enqueueRunDoneNotify(run.id, doneBy || worker?.display_name || deviceLabel || null, d);
     logEvent({ runId: run.id, action: 'run_done', targetType: 'run', targetId: run.id, workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
-      payload: { via: 'finish', notShippedRows: notShipped, voidedBoxes: voided } }, d);
-    return { ok: true, notShipped, voidedBoxes: voided };
+      payload: { via: 'finish', notShippedRows: notShipped, extraTrimmedRows: extraTrimmed, voidedBoxes: voided } }, d);
+    return { ok: true, notShipped, extraTrimmed, voidedBoxes: voided };
   }).immediate();
 }
 
