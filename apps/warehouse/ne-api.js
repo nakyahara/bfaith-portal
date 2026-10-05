@@ -257,7 +257,8 @@ async function fetchSetProducts() {
   const db = getDB();
   const ts = now();
 
-  const fields = 'set_goods_id,set_goods_name,set_goods_selling_price,set_goods_detail_goods_id,set_goods_detail_quantity,set_goods_representation_id';
+  // set_goods_creation_date = セットの作成日 (NE の API の説明の取得できる項目にある)。商品管理リストの snapshot の 登録日 (セット) → Company DB の登録日 (0057)
+  const fields = 'set_goods_id,set_goods_name,set_goods_selling_price,set_goods_detail_goods_id,set_goods_detail_quantity,set_goods_representation_id,set_goods_creation_date';
 
   // 全ページを先にメモリへ取得してから、DELETE + INSERT を単一トランザクションで実行する。
   // DELETE を先に commit してからページ毎に挿入すると、途中の API エラー / 親 timeout kill で
@@ -322,6 +323,7 @@ async function fetchSetProducts() {
       (item.set_goods_representation_id || '').toLowerCase(),
       ts,
       neSrc(item.set_goods_selling_price), neSrc(item.set_goods_detail_quantity),
+      item.set_goods_creation_date || null,   // 無い・空 = NULL (分からない)
     ]);
   }
   const parentConflicts = [...parentAttrs].filter(([, s]) => s.size > 1).map(([c]) => c);
@@ -342,8 +344,8 @@ async function fetchSetProducts() {
     INSERT OR REPLACE INTO raw_ne_set_products (
       セット商品コード, セット商品名, セット販売価格,
       商品コード, 数量, セット在庫数, 代表商品コード, synced_at,
-      セット販売価格_src, 数量_src
-    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+      セット販売価格_src, 数量_src, 作成日
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
   `);
 
   let total = 0;

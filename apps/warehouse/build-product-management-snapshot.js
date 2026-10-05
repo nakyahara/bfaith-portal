@@ -10,6 +10,8 @@
  *   inv_daily_detail        … FBA在庫数 = fba_warehouse + fba_inbound(入荷待ち) (最新 business_date)
  *   f_sales_velocity_by_product … 7日/30日 × FBA/FBA以外 販売数 (③)
  *   m_reorder_setting       … 推奨保有月数 (②)
+ *   raw_ne_set_products     … セットの 登録日 = NE のセットの作成日 (set_goods_creation_date)。raw_ne_products に作成日が無いセットだけ。
+ *                             構成の行で作成日が食い違う・全部空 = 空 (どの日か決められない)
  *
  * 健全性ゲート (status):
  *   failed  … velocity 無し / FBA在庫日付 無し / ne_fba_overlap>0 / velocity as_of が VELOCITY_MAX_LAG_DAYS 超過
@@ -151,7 +153,8 @@ export async function buildProductManagementSnapshot({ fbaSource = 'daily' } = {
       m.標準売価 AS 売価, m.原価, m.送料,
       COALESCE(ne.仕入先コード, m.仕入先コード) AS 仕入先,
       ne.最終仕入日, ne.在庫数 AS 自社在庫, ne.引当数, ne.発注残数 AS 注残数,
-      ne.発注ロット単位, ne.代表商品コード, ne.ロケーションコード, ne.商品分類タグ, ne.作成日 AS 登録日,
+      ne.発注ロット単位, ne.代表商品コード, ne.ロケーションコード, ne.商品分類タグ,
+      COALESCE(NULLIF(ne.作成日, ''), CASE WHEN m.商品区分 = 'セット' AND sc.n = 1 THEN sc.d END) AS 登録日,
       COALESCE(v.qty_7d_fba,0) AS s7f, COALESCE(v.qty_7d_nonfba,0) AS s7n, COALESCE(v.qty_7d_total,0) AS s7t,
       COALESCE(v.qty_30d_fba,0) AS s30f, COALESCE(v.qty_30d_nonfba,0) AS s30n, COALESCE(v.qty_30d_total,0) AS s30t,
       r.推奨保有月数,
@@ -160,6 +163,10 @@ export async function buildProductManagementSnapshot({ fbaSource = 'daily' } = {
     LEFT JOIN raw_ne_products ne ON m.商品コード = ne.商品コード COLLATE NOCASE
     LEFT JOIN f_sales_velocity_by_product v ON m.商品コード = v.商品コード COLLATE NOCASE
     LEFT JOIN m_reorder_setting r ON m.商品コード = r.sku COLLATE NOCASE
+    LEFT JOIN (
+      SELECT LOWER(セット商品コード) AS code, MIN(TRIM(作成日)) AS d, COUNT(DISTINCT TRIM(作成日)) AS n
+        FROM raw_ne_set_products WHERE COALESCE(TRIM(作成日), '') <> '' GROUP BY LOWER(セット商品コード)
+    ) sc ON m.商品コード = sc.code COLLATE NOCASE
     ${fbaSub}
     ORDER BY m.商品コード
   `).all(...params);
