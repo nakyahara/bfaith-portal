@@ -576,6 +576,26 @@ await ta('[6] 行が増えた・変わった (仕入先ごとの商品・JAN・�
   assert.notEqual(await tokenOf('s002'), t2);
 });
 
+await ta('[6] 0057 の最初の夜間ロードの登録日の埋め (version が 1 回進む): 開いていた単品と、それを含むセット (構成の依頼の画面も同じ印) の保存は 409・2 回目のロードは印を変えない (#1617 Codex R1 Low)', async () => {
+  assert.equal((await q("select registered_on from core.skus where code = 's001'"))[0].registered_on, null);
+  const tSet = await tokenOf('set001'); const tS = await tokenOf('s001'); const since = await lastEvent();
+  const withReg = () => { const p = makePlan(); p.skus.find((x) => x.code === 's001').registeredOn = '2026-01-02'; p.registered = { available: true, runId: 'pml_test' }; return p; };
+  const r = await runInitialLoad(db, withReg(), { log: quiet, runId: 'load_regdate_1', ownership: ALL_COMPANY, now: LOAD_NOW });
+  assert.equal(r.ok, true, r.error);
+  assert.equal((await q("select registered_on::text as d from core.skus where code = 's001'"))[0].d, '2026-01-02');
+  assert.notEqual(await tokenOf('set001'), tSet); assert.notEqual(await tokenOf('s001'), tS);
+  const n = await nEvents();
+  // セットの「その間の変更」はセット自身の記録だけ = 構成品の登録日の埋めは並ばない (409 で開き直してもらう。中身は変わっていない)
+  await rejectsWith(save('set001', { standard_price: '4321' }, { token: tSet, eventId: since }), 409, 'version_conflict');
+  const e = await rejectsWith(save('s001', { name: '古い画面' }, { token: tS, eventId: since }), 409, 'version_conflict');
+  assert.ok(e.extra.events.some((x) => x.attribute === 'registered_on'), JSON.stringify(e.extra.events));
+  assert.equal(await nEvents(), n);
+  // 2 回目 (同じ材料) は何も変えない = 開き直した画面の印はそのまま
+  const tSet2 = await tokenOf('set001');
+  assert.equal((await runInitialLoad(db, withReg(), { log: quiet, runId: 'load_regdate_2', ownership: ALL_COMPANY, now: LOAD_NOW })).ok, true);
+  assert.equal(await tokenOf('set001'), tSet2);
+});
+
 console.log('\n入力の検証');
 
 await ta('[7] 形の誤り (400): 名前・売価・税率・分類・月数・原価・構成・知らない項目・種類に無い項目・番号・編集の印', async () => {

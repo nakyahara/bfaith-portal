@@ -5,12 +5,14 @@
  * 固定する契約:
  *   P NE の作成日の読み方: 'YYYY-MM-DD HH:MM:SS' / 'YYYY/M/D …' / 日付だけ → 'YYYY-MM-DD'。無い日付・2000 年より前・未来・形の違う文字 = null
  *   M 0057 の前の DB: 夜間ロードは止まらない (見送りの印)・画面は登録日を出さずにコード順
- *   D DDL: 既にある行は空のまま・列を書かない INSERT = JST の今日 + portal・出どころは 3 つだけ・日付と出どころは両方空か両方あり・2000 年より前は入らない・
+ *   D DDL: 既にある行は空のまま・列の既定値は無い (列を書かない INSERT = 古い夜間ロードの形 = 空。#1617 Codex R1 Medium)・出どころは 3 つだけ・日付と出どころは両方空か両方あり・2000 年より前は入らない・
  *      一度入った登録日 (と出どころ) は変えられない (空にもできない)・空 → 値 は通る・ほかの列の UPDATE は通る・画面のロールは登録日を UPDATE できない
  *   L 夜間ロード: 空の行だけ NE の作成日 (商品管理リストの公開 snapshot の 登録日) で埋める・読めない / 未来 / 行の無い商品は空のまま・
  *      0057 の前からあるセットは空のまま・新しいセット = 初めて見た日 (first_seen)・新しい単品 = NE の作成日で作る (無ければ空)・
  *      NE の値が後で変わっても上書きしない・ポータルで登録した商品 (portal) も上書きしない・値が同じ 2 回目は何も変わらない (記録も増えない)・
  *      snapshot が使えない日は触らない (翌晩に埋める)・mirror_products の new_product_launch_date (人が直せる発売日) は使わない
+ *   F 登録の関数 (ops.register_new_sku) の 0057 の作り直しは 0052 の本文と「SKU の INSERT に登録日 = v_today・portal を足した」所だけが違う・
+ *      security definer・search_path・持ち主・権限は同じ / 古い形の INSERT で空のまま作った単品は、次の夜間ロードが NE の作成日で埋める
  *   V 画面: 一覧に登録日の列・「登録日の新しい順」(空は最後・同じ日はコード順)・知らない並びはコード順・単品の画面の見出しに登録日と出どころ / 分からない
  * 使い方: node scripts/test-sku-registered-on.mjs
  */
@@ -132,12 +134,13 @@ await applyMigrations(db, { log: quiet });
 await createRoles(pg, { watcherPw: 'a', writerPw: 'b' });
 await createMasterEditRoles(pg, {});
 
-await ta('[D] DDL: 既にある行は空・列を書かない INSERT = JST の今日 + portal・CHECK・一度入ったら変えない・画面のロールは UPDATE できない', async () => {
+await ta('[D] DDL: 既にある行は空・列を書かない INSERT (古い夜間ロードの形) = 空・CHECK・一度入ったら変えない・画面のロールは UPDATE できない', async () => {
   assert.equal(await hasRegisteredOn(db), true);
   assert.equal((await one('select count(*)::int as n from core.skus where registered_on is not null or registered_on_source is not null')).n, 0);
   const today = (await one("select core.jst_date(now())::text as d")).d;
   const id = (await one("insert into core.skus (company_id, sku_kind, code, name) values (1, 'exception', 'ddl-1', 'x') returning sku_id")).sku_id;
-  assert.deepEqual(await regOf('ddl-1'), [today, 'portal']);
+  assert.deepEqual(await regOf('ddl-1'), [null, null]);   // 既定値なし (#1617 Codex R1 Medium)
+  assert.equal((await one("select count(*)::int as n from information_schema.columns where table_schema = 'core' and table_name = 'skus' and column_name like 'registered_on%' and column_default is not null")).n, 0);
   // 明示の空 (夜間ロードの新しい単品) は空のまま
   await q("insert into core.skus (company_id, sku_kind, code, name, registered_on, registered_on_source) values (1, 'exception', 'ddl-2', 'x', null, null)");
   assert.deepEqual(await regOf('ddl-2'), [null, null]);
@@ -212,7 +215,8 @@ await ta('[L3] 新しい SKU: 単品は NE の作成日で作る (無ければ�
 await ta('[L4] ポータルで登録した商品 (portal) は、あとで NE に登録されても上書きしない', async () => {
   const today = (await one("select core.jst_date(now())::text as d")).d;
   const pid = (await one("insert into core.products (company_id, display_code, name) values (1, 'r009', '商品 r009') returning product_id")).product_id;
-  await q("insert into core.skus (company_id, product_id, sku_kind, code, name) values (1, $1, 'single', 'r009', '商品 r009')", [pid]);   // 登録の関数と同じく列を書かない
+  // 登録の関数と同じ形 (今日 + portal を明示。関数そのものは test-master-register.mjs の R4 が確かめる)
+  await q("insert into core.skus (company_id, product_id, sku_kind, code, name, registered_on, registered_on_source) values (1, $1, 'single', 'r009', '商品 r009', core.jst_date(now()), 'portal')", [pid]);
   assert.deepEqual(await regOf('r009'), [today, 'portal']);
   addProduct('r009', '単品', '2020-01-01 00:00:00');
   await load('rl_7');
@@ -253,6 +257,42 @@ await ta('[L6] 正規化すると同じになる snapshot の行が 2 つ = 使�
   assert.deepEqual(await regOf('r011'), [null, null]);
 });
 
+await ta('[F1] 登録の関数の作り直し (0057): 0052 の本文との違いは SKU の INSERT に登録日 (v_today・portal) を足した所だけ', async () => {
+  const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
+  const fnOf = (file, head) => {
+    const lines = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n').split('\n');
+    const a = lines.findIndex((l) => l.startsWith(head)); const b = lines.findIndex((l, i) => i > a && l === 'end $$;');
+    assert.ok(a >= 0 && b > a, file); return lines.slice(a, b + 1).join('\n');
+  };
+  const f52 = fnOf('0052_master_registrations.sql', 'create function ops.register_new_sku(');
+  const f57 = fnOf('0057_sku_registered_on.sql', 'create or replace function ops.register_new_sku(');
+  for (const file of fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0052' && x.slice(0, 4) < '0057')) {
+    assert.ok(!/function\s+ops\.register_new_sku\s*\(/i.test(fs.readFileSync(path.join(MIG, file), 'utf8')), file + ' が登録の関数を作り直している = 0057 の元にする定義を見直す');
+  }
+  const back = f57
+    .replace('create or replace function ops.register_new_sku(', 'create function ops.register_new_sku(')
+    .replace('  -- 0057: 登録日 = この取引の JST の今日 (v_today = 原価の valid_from と同じ日)・出どころ portal を明示する (列の既定値には頼らない = 既定は空)\n', '')
+    .replace('created_by_type, created_by_id,\n                         registered_on, registered_on_source)', 'created_by_type, created_by_id)')
+    .replace("v_own, 'human', p_actor_id,\n            v_today, 'portal');", "v_own, 'human', p_actor_id);");
+  assert.equal(back, f52);
+  const p = await one(`select prosecdef, proconfig, pg_get_userbyid(proowner) as owner, has_function_privilege('master_edit', oid, 'execute') as editor,
+      has_function_privilege('watcher', oid, 'execute') as watcher from pg_proc where oid = 'ops.register_new_sku(uuid, text, text, jsonb, text, jsonb)'::regprocedure`);
+  assert.deepEqual(p, { prosecdef: true, proconfig: ['search_path=pg_catalog, pg_temp'], owner: 'deploy', editor: true, watcher: false });
+});
+
+await ta('[F2] 古い夜間ロードの形 (2 つの列を書かない INSERT) で作った単品は空のまま = 次の晩に NE の作成日で埋まる (portal で確定しない)', async () => {
+  const pid = (await one("insert into core.products (company_id, display_code, name, created_by_type, created_by_id) values (1, 'r012', '商品 r012', 'system', 'old_load') returning product_id")).product_id;
+  await q("insert into core.skus (company_id, product_id, sku_kind, code, name, tax_rate, tax_class, handling, created_by_type, created_by_id) values (1, $1, 'single', 'r012', '商品 r012', 0.1, 'STANDARD_10', 'active', 'system', 'old_load')", [pid]);
+  await q("insert into core.skus (company_id, sku_kind, code, name, handling, created_by_type, created_by_id) values (1, 'set', 'rset3', 'セット rset3', 'active', 'system', 'old_load')");
+  assert.deepEqual(await regOf('r012'), [null, null]);
+  assert.deepEqual(await regOf('rset3'), [null, null]);
+  addProduct('r012', '単品', '2026-08-08 08:08:08');
+  addProduct('rset3', 'セット', null);
+  await load('rl_12');
+  assert.deepEqual(await regOf('r012'), ['2026-08-08', 'ne']);
+  assert.deepEqual(await regOf('rset3'), [null, null]);   // 古い形で作られたセットは「初めて見た日」も分からない = 空のまま (今日にはしない)
+});
+
 // ── V: 画面 (本物の router・画面のロールで読む) ──
 process.env.COMPANY_DB_MASTER_EDIT_URL = 'postgres://master_edit@localhost:5432/test';
 process.env.MASTER_EDITORS = 'naka@test';
@@ -276,10 +316,10 @@ await ta('[V1] 一覧の「登録日の新しい順」: 新しい順・空は最
   const sorted = (await R.listSkus(db, { sort: 'reg_desc' }, { now: LOAD_NOW })).rows.map((x) => [x.code, x.registered_on]);
   const today = (await one("select core.jst_date(now())::text as d")).d;
   const want = [['r009', today], ['r010', '2026-10-05'], ['rset2', '2026-10-05'], ['r007', '2026-10-04'], ['r002', '2026-10-03'], ['r004', '2026-02-28'], ['r001', '2024-03-15'], ['r006', '2019-12-11'],
-    ['r003', null], ['r005', null], ['r008', null], ['r011', null], ['rset1', null]];
+    ['r003', null], ['r005', null], ['r008', null], ['r011', null], ['rset1', null], ['r012', '2026-08-08'], ['rset3', null]];
   want.sort((a, b) => (a[1] === b[1] ? (a[0] < b[0] ? -1 : 1) : a[1] == null ? 1 : b[1] == null ? -1 : a[1] < b[1] ? 1 : -1));
   assert.deepEqual(sorted, want);
-  assert.deepEqual((await R.listSkus(db, {}, { now: LOAD_NOW })).rows.map((x) => x.code), ['r001', 'r002', 'r003', 'r004', 'r005', 'r006', 'r007', 'r008', 'r009', 'r010', 'r011', 'rset1', 'rset2']);
+  assert.deepEqual((await R.listSkus(db, {}, { now: LOAD_NOW })).rows.map((x) => x.code), ['r001', 'r002', 'r003', 'r004', 'r005', 'r006', 'r007', 'r008', 'r009', 'r010', 'r011', 'r012', 'rset1', 'rset2', 'rset3']);
   assert.deepEqual((await R.listSkus(db, { sort: 'nope' }, { now: LOAD_NOW })).rows.map((x) => x.code)[0], 'r001');
   const one1 = (await R.listSkus(db, { q: 'r001' }, { now: LOAD_NOW })).rows[0];
   assert.deepEqual([one1.registered_on, one1.registered_on_source], ['2024-03-15', 'ne']);

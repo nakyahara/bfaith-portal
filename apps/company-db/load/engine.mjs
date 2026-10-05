@@ -310,7 +310,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const skuRows = accepted.map((s) => ({
       company_id: COMPANY_ID, product_id: s.kind === 'single' ? productIdBySku.get(normSku(s.code)) : null,
       ...skuValuesForLoad(s),   // 照合の ① と共用する規則 (0027 の列を含む)
-      // 0057: 新しく作る行の登録日 (既にある行は on conflict で触らない = 下の「空の行だけ埋める」で)。2 つの列は必ず明示する (書かないと DB の既定 = ポータルで登録 になる)
+      // 0057: 新しく作る行の登録日 (既にある行は on conflict で触らない = 下の「空の行だけ埋める」で)。2 つの列は明示する (列の既定値は空。書かない古いコードの INSERT も空 = 次の晩に NE の作成日で埋まる)
       ...registeredOnForNew(s, jstToday),
       created_by_type: 'system', created_by_id: runId,
     }));
