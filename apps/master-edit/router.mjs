@@ -53,18 +53,10 @@ import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFE
 import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
-import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX } from './read.mjs';
+import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti } from './read.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
-
-/**
- * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
- * 判定は server.js の requireAppAccess と同じ関数。無い人には読まない (列・絞り込みも出さない)
- */
-const PO_APP_ID = 'purchase-orders';
-const PO_DENIED = Object.freeze({ ok: false, denied: true, error: '発注アプリの権限がないので出せません' });
-const canSeeBackorders = (req) => sessionHasApp(req.session, PO_APP_ID);
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
@@ -75,6 +67,20 @@ import {
   regSummary, buildRegExport, issueRegExport, regExportFile, declareRegExport, supersedeRegExport, recordRegVerified,
   REG_ITEM_STATES, REG_RESULTS,
 } from '../../lib/master-reg-csv.mjs';
+
+/**
+ * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
+ * 判定は server.js の requireAppAccess と同じ関数。無い人には読まない (列・絞り込みも出さない)
+ */
+const PO_APP_ID = 'purchase-orders';
+const PO_DENIED = Object.freeze({ ok: false, denied: true, error: '発注アプリの権限がないので出せません' });
+const canSeeBackorders = (req) => sessionHasApp(req.session, PO_APP_ID);
+
+/** 詳細検索 (POST /api/search) の大きさの上限 (#1620 Codex R2 M1)。1 つの欄の字数・1 つの値の字数・条件全体のバイト数 */
+const SEARCH_FIELD_MAX_CHARS = 64 * 1024;
+const SEARCH_VALUE_MAX = Object.freeze({ codes: 64, parents: 64, sups: 64, jans: 32, name: 200 });
+const SEARCH_COND_MAX_BYTES = 64 * 1024;
+const SEARCH_LABELS = Object.freeze({ codes: '商品コード', parents: '代表 (親) の商品コード', sups: '仕入先コード', jans: 'JAN', name: '商品名', q: '絞る欄' });
 
 /** NE 登録の CSV の画面の言葉 */
 const REG_EXPORT_STATES = Object.freeze({ built: '作った (まだ配っていない)', issued: '配った (取り込み待ち)', declared: '取り込んだと申告', closed: '閉じた' });
@@ -301,9 +307,22 @@ router.get('/', (req, res) => {
  * 本文 = 詳細検索の板の欄 (名前 → 値)。返す = { ok, url } (一覧の URL。詳細検索の項目は ?s=<印>・ほかの絞り込みはそのまま)
  */
 router.post('/api/search', (req, res) => {
-  const b = req.body && typeof req.body === 'object' ? req.body : {};
+  const b = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  // 🚨 境界で大きさを決める (#1620 Codex R2 M1: 巨大な条件を印の表に溜めない・走査で長く止まらない)。超えたら 413 と分かる文
+  const tooLarge = (message) => res.status(413).json({ ok: false, error: 'too_large', message });
+  for (const [k, v] of Object.entries(b)) {
+    if (v != null && typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') return res.status(400).json({ ok: false, error: `${k} の形が違います` });
+    if (String(v ?? '').length > SEARCH_FIELD_MAX_CHARS) return tooLarge(`${SEARCH_LABELS[k] || k} が長すぎます (1 つの欄は ${SEARCH_FIELD_MAX_CHARS.toLocaleString('ja-JP')} 字まで・複数の欄は ${MULTI_MAX} 件まで)`);
+  }
+  for (const [k, max] of Object.entries(SEARCH_VALUE_MAX)) {
+    if (b[k] == null) continue;
+    const vals = k === 'name' ? [String(b[k]).trim()] : splitMulti(b[k], MULTI_MAX + 1);
+    const bad = vals.find((x) => x.length > max);
+    if (bad) return tooLarge(`${SEARCH_LABELS[k]} は 1 つ ${max} 字までです (${bad.slice(0, 20)}… が ${bad.length} 字)`);
+  }
   const f = normalizeFilters(b);
   const cond = Object.fromEntries(ADV_KEYS.filter((k) => f[k]).map((k) => [k, f[k]]));
+  if (Buffer.byteLength(JSON.stringify(cond)) > SEARCH_COND_MAX_BYTES) return tooLarge(`検索の条件が大きすぎます (全部で ${SEARCH_COND_MAX_BYTES / 1024}KB まで。複数の欄を分けて検索してください)`);
   const rest = Object.fromEntries(['q', 'kind', 'state', 'missing', 'reg', 'card', 'diff'].filter((k) => f[k]).map((k) => [k, f[k]]));
   const qs = new URLSearchParams({ ...rest, ...(Object.keys(cond).length ? { s: putSearch(cond, clock()) } : {}) }).toString();
   res.json({ ok: true, url: `${req.baseUrl}/${qs ? `?${qs}` : ''}` });

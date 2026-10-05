@@ -49,13 +49,24 @@ export const TAX_FILTERS = Object.freeze({ 8: '8%', 10: '10%' });
 export const SALES_FILTERS = Object.freeze({ 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' });
 /** 詳細検索の項目 (URL のクエリの名前)。これが 1 つでも入っていれば詳細検索の板を開いておく */
 export const ADV_KEYS = Object.freeze(['codes', 'jans', 'sups', 'parents', 'name', 'cost_min', 'cost_max', 'price_min', 'price_max', 'stock_min', 'stock_max', 'tax', 'sales', 'po']);
-/** 改行・カンマ・空白・タブ・読点で区切った値 (前後の空白を除く・重複は 1 つ・空は捨てる) */
-export function splitMulti(s) {
+/**
+ * 改行・カンマ・空白・タブ・読点で区切った値 (前後の空白を除く・重複は 1 つ・空は捨てる)。
+ * limit = 取り出す数の上限 (そこで走査を止める = 巨大な入力でも長く止まらない。#1620 Codex R2)。重複は Set で O(n)
+ */
+export function splitMulti(s, limit = Infinity) {
   const out = [];
-  for (const x of String(s ?? '').split(/[\s,、，;；]+/)) { const v = x.trim(); if (v && !out.includes(v)) out.push(v); }
+  const seen = new Set();
+  const re = /[^\s,、，;；]+/g;
+  const str = String(s ?? '');
+  let m;
+  while (out.length < limit && (m = re.exec(str))) {
+    const v = m[0];
+    if (!seen.has(v)) { seen.add(v); out.push(v); }
+  }
   return out;
 }
-const multiText = (v) => { const xs = splitMulti(v); return xs.length ? xs.join('\n') : ''; };
+/** 複数の欄 = 1 行 1 つ。MULTI_MAX + 1 件まで (1 件多く取って「500 件まで」を知らせる) */
+const multiText = (v) => { const xs = splitMulti(v, MULTI_MAX + 1); return xs.length ? xs.join('\n') : ''; };
 const intText = (v) => { const t = String(v ?? '').replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/[,，\s円]/g, ''); return /^\d{1,9}$/.test(t) ? String(Number(t)) : ''; };
 
 /** 一覧の絞り込みを決まった形に (知らない値は捨てる) */

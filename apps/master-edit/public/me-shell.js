@@ -327,7 +327,7 @@
       .then(function (r) { return r.json().catch(function () { return {}; }); })
       .then(function (j) {
         if (j && j.ok && j.url) { requestNavigate(j.url, b); return; }
-        if (b) b.disabled = false; toast('検索の条件を送れませんでした' + (j && j.error ? ' (' + j.error + ')' : ''));
+        if (b) b.disabled = false; toast('検索の条件を送れませんでした' + (j && (j.message || j.error) ? ' (' + (j.message || j.error) + ')' : ''));
       })
       .catch(function () { if (b) b.disabled = false; toast('通信できませんでした。もう一度「この条件で探す」を押してください'); });
   });
