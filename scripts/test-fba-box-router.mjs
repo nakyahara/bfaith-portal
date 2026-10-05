@@ -447,7 +447,16 @@ await t('作業を終える: 利用者は 403 / 職員PIN + 未投入あり → 
   assert.equal((await call('POST', `/api/rows/${row.id}/send-qty`, { body: { worker_id: memberId, send_qty: 2 } })).status, 403);
   const sq = await call('POST', `/api/rows/${row.id}/send-qty`, { body: { worker_id: staffId, pin: '2468', send_qty: 2, reason: 'stock_short' } });
   assert.equal(sq.j.ok, true, JSON.stringify(sq.j)); assert.equal(sq.j.shortage, row.planned_qty - 2);
-  const open = await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: staffId, pin: '2468' } });
+  // 予定より増やす (2026-10-05): 理由が「在庫が少ない」なら 400 / 「本社指示」なら通り、iPad の状態に増やした数が載る
+  const upBad = await call('POST', `/api/rows/${row.id}/send-qty`, { body: { worker_id: staffId, pin: '2468', send_qty: row.planned_qty + 1, reason: 'stock_short' } });
+  assert.equal(upBad.status, 400); assert.equal(upBad.j.error, 'bad_reason');
+  const up = await call('POST', `/api/rows/${row.id}/send-qty`, { body: { worker_id: staffId, pin: '2468', send_qty: row.planned_qty + 1, reason: 'hq_order' } });
+  assert.equal(up.j.ok, true, JSON.stringify(up.j)); assert.equal(up.j.extra, 1); assert.equal(up.j.shortage, 0);
+  const stUp = (await call('GET', `/api/state?run=${pkRunId}`)).j.rows.find((x) => x.id === row.id);
+  assert.equal(stUp.extra_qty, 1); assert.equal(stUp.extra_reason, 'hq_order'); assert.equal(stUp.shortage_qty, null);
+  // 元の流れに戻す (送る数 2)
+  assert.equal((await call('POST', `/api/rows/${row.id}/send-qty`, { body: { worker_id: staffId, pin: '2468', send_qty: 2, reason: 'stock_short' } })).j.ok, true);
+  const open =await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: staffId, pin: '2468' } });
   assert.equal(open.status, 409); assert.equal(open.j.error, 'open_boxes');
   assert.equal((await call('POST', `/api/boxes/${bx.boxId}/close`, { body: { worker_id: memberId, measured_kg: 1.2 } })).j.ok, true);
   const inc = await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: staffId, pin: '2468' } });

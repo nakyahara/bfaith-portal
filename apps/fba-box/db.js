@@ -142,6 +142,9 @@ const ROWS_DDL = (name) => `
 /** 出力対象外の行 (Excel に無い / 差し替えで消えた)。完了判定・出力・iPad 表示から除外 */
 const EXCLUDED_ROW_STATES = ['picking_only', 'retired'];
 
+/** 送る数 = 予定 − 不足 + 予定より増やした数 (getRunState の行。2026-10-05 から予定より多くもできる) */
+export const sendQtyOf = (r) => r.planned_qty - (r.shortage_qty || 0) + (r.extra_qty || 0);
+
 /**
  * テーブル再構築 (CHECK / NOT NULL は ALTER できない)。公式手順 = 新表→コピー→DROP→RENAME を
  * foreign_keys OFF の下で1トランザクションで行い、最後に foreign_key_check。失敗時は元のまま
@@ -483,6 +486,11 @@ export function createTables(d = getDB()) {
   addColumn('fbx_exports', 'sta_uploaded_by', 'TEXT');
   // 不足の内訳 (理由別 [{reason, qty}])。作業完了時の自動確定で既存の不足 (例: 破損 2) と混ざるときに理由を失わない (Codex R13 #2)
   addColumn('fbx_row_work', 'shortage_detail', 'TEXT');
+  // 予定より多く送る数 (中原さん 2026-10-05: 送る数を予定より増やすこともある)。送る数 = 予定 − 不足 + 増やした数。
+  // 不足と増やした数は同時に正にならない (setRowSendQty / setRowShortage / finishRun / attachExcelToRun が保つ)
+  addColumn('fbx_row_work', 'extra_qty', 'INTEGER CHECK (extra_qty IS NULL OR extra_qty > 0)');
+  addColumn('fbx_row_work', 'extra_reason', 'TEXT');
+  addColumn('fbx_row_work', 'extra_by', 'TEXT');
   // 完了通知 (本社の Google Chat) の送信待ち。完了 (finishRun) と同じトランザクションで積み、notify-outbox.js が送る
   // (投げっぱなしだと再起動で消える — Codex PR #1307 R1 P1)。UNIQUE(run_id, kind) = 1 回の完了に 1 通
   d.exec(`CREATE TABLE IF NOT EXISTS fbx_notify_outbox (
@@ -744,8 +752,12 @@ export function attachExcelToRun({ runId, parsed, file, actor }) {
     const rowsByGroup = new Map(groups.map((g) => [g.id, d.prepare(`SELECT w.*,
         COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0) AS placed,
         (SELECT COUNT(*) FROM fbx_placements p WHERE p.row_id = w.id) AS placement_rows,
-        COALESCE((SELECT rw.shortage_qty FROM fbx_row_work rw WHERE rw.row_id = w.id), 0) AS shortage
+        COALESCE((SELECT rw.shortage_qty FROM fbx_row_work rw WHERE rw.row_id = w.id), 0) AS shortage,
+        COALESCE((SELECT rw.extra_qty FROM fbx_row_work rw WHERE rw.row_id = w.id), 0) AS extra
       FROM fbx_rows w WHERE w.pack_group_id = ? AND w.match_state != 'retired' ORDER BY w.id`).all(g.id)]));
+    // 予定より増やした行の「送る数」(添付で予定が変わっても、現場が決めた送る数は変えない — 2026-10-05)
+    const extraTargetById = new Map([...rowsByGroup.values()].flat().filter((r) => r.extra > 0)
+      .map((r) => [r.id, r.planned_qty - r.shortage + r.extra]));
     const match = matchExcelSheetsToGroups(parsed.sheets, groups.map((g) => ({ id: g.id, name: g.sheet_name, fnskus: rowsByGroup.get(g.id).map((r) => r.fnsku) })));
     if (!match.ok) return { ok: false, error: 'unmatched_sheet', message: match.message, issues: match.issues };
     // 対応先グループの現在の Excel が (現行データ版で) STA アップ済みなら差し替え不可 (Codex PR2.5 #1)
@@ -771,8 +783,10 @@ export function attachExcelToRun({ runId, parsed, file, actor }) {
         if (seen.has(key)) return { ok: false, error: 'duplicate_identity', message: `Excel 内で FNSKU ${er.fnsku} が重複しています (手動転記に切り替えてください)` };
         seen.add(key);
         // 投入済み > Excel の予定 は拒否 (不足は後で予定に合わせて縮める/伸ばすので条件に入れない — Codex R14 #1)
+        // 予定より増やした行は、増やした送る数までは入っていてよい (STA のプランをまだ直していない Excel でも添付できる)
         const row = existing.get(key);
-        if (row && row.placed > er.plannedQty) {
+        const ceiling = row && extraTargetById.has(row.id) ? Math.max(er.plannedQty, extraTargetById.get(row.id)) : er.plannedQty;
+        if (row && row.placed > ceiling) {
           conflicts.push({ kind: 'over_placed', group: g.sheet_name, fnsku: er.fnsku, excelQty: er.plannedQty, placed: row.placed, shortage: row.shortage });
         }
       }
@@ -875,13 +889,32 @@ export function attachExcelToRun({ runId, parsed, file, actor }) {
     {
       const affected = d.prepare(`SELECT w.id, w.planned_qty, w.fnsku,
           COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0) AS placed,
-          COALESCE(rw.shortage_qty, 0) AS shortage, rw.shortage_reason, rw.shortage_detail
+          COALESCE(rw.shortage_qty, 0) AS shortage, rw.shortage_reason, rw.shortage_detail,
+          COALESCE(rw.extra_qty, 0) AS extra
         FROM fbx_rows w LEFT JOIN fbx_row_work rw ON rw.row_id = w.id
         WHERE w.run_id = ? AND w.excel_row IS NOT NULL AND w.match_state NOT IN ('picking_only','retired')`).all(run.id);
       const up = d.prepare(`INSERT INTO fbx_row_work (row_id, shortage_qty, shortage_reason, shortage_detail, shortage_by, updated_at) VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(row_id) DO UPDATE SET shortage_qty = excluded.shortage_qty, shortage_reason = excluded.shortage_reason, shortage_detail = excluded.shortage_detail,
           shortage_by = excluded.shortage_by, updated_at = excluded.updated_at`);
+      const setExtra = d.prepare('UPDATE fbx_row_work SET extra_qty = ?, extra_reason = CASE WHEN ? IS NULL THEN NULL ELSE extra_reason END, extra_by = CASE WHEN ? IS NULL THEN NULL ELSE extra_by END, updated_at = ? WHERE row_id = ?');
       for (const r of affected) {
+        // 予定より増やした行: 送る数 (= 増やした結果) を保ち、新しい予定との差を増やした数に置き直す。
+        //   作業中: 予定が送る数以上になったら増やした数は消える (残りは現場が入れる)
+        //   完了済み: 送る数 = 入れた数。予定より少なければ不足 (今回は納品しない)、多ければ増やした数
+        if (extraTargetById.has(r.id)) {
+          const target = run.status === 'done' ? r.placed : extraTargetById.get(r.id);
+          const nextExtra = Math.max(0, target - r.planned_qty);
+          const nextShort = run.status === 'done' ? Math.max(0, r.planned_qty - r.placed) : 0;
+          if (nextExtra === r.extra && nextShort === r.shortage) continue;
+          const ex = nextExtra > 0 ? nextExtra : null;
+          setExtra.run(ex, ex, ex, now, r.id);
+          if (nextShort > 0) up.run(r.id, nextShort, 'not_shipped', null, actor || null, now);
+          logEvent({ runId: run.id, action: 'row_extra', targetType: 'row', targetId: r.id, deviceLabel: actor, ok: true,
+            payload: { extraQty: nextExtra, shortageQty: nextShort, auto: true, via: 'excel_attach', runStatus: run.status, from: r.extra, planned: r.planned_qty, placed: r.placed } }, d);
+          recomputed++;
+          warnings.push({ kind: 'extra_recomputed', fnsku: r.fnsku, planned: r.planned_qty, placed: r.placed, extraFrom: r.extra, extraTo: nextExtra, shortageTo: nextShort });
+          continue;
+        }
         const gap = r.planned_qty - r.placed;   // placed ≤ planned は over_placed で保証済み
         const need = run.status === 'done' ? gap : Math.min(r.shortage, gap);
         if (need === r.shortage) continue;
@@ -950,7 +983,7 @@ export function setRunStatus(runId, status, actor) {
         LEFT JOIN fbx_row_work rw ON rw.row_id = w.id
         WHERE w.run_id = ? AND w.match_state NOT IN ('picking_only','retired')
           AND COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0)
-              + COALESCE(rw.shortage_qty, 0) != w.planned_qty`).get(run.id).c;
+              + COALESCE(rw.shortage_qty, 0) - COALESCE(rw.extra_qty, 0) != w.planned_qty`).get(run.id).c;
       if (bad > 0) return { ok: false, error: 'rows_incomplete', message: `投入数と不足の合計が予定数と合わない商品が ${bad} 行あります。iPad で入力を終えるか、不足を確定してから完了にしてください` };
     }
     // 状態変更は Excel の中身を変えないので data_version は進めない (出力済みの版を「旧版」にしない)
@@ -985,10 +1018,11 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel, don
     }
     const rows = d.prepare(`SELECT w.*,
         COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0) AS placed,
-        COALESCE(rw.shortage_qty, 0) AS shortage, rw.shortage_reason, rw.shortage_detail
+        COALESCE(rw.shortage_qty, 0) AS shortage, rw.shortage_reason, rw.shortage_detail,
+        COALESCE(rw.extra_qty, 0) AS extra
       FROM fbx_rows w LEFT JOIN fbx_row_work rw ON rw.row_id = w.id
       WHERE w.run_id = ? AND w.match_state NOT IN ('picking_only','retired') ORDER BY w.pack_group_id, w.id`).all(run.id)
-      .map((r) => ({ ...r, remaining: r.planned_qty - r.placed - r.shortage })).filter((r) => r.remaining !== 0);
+      .map((r) => ({ ...r, remaining: r.planned_qty - r.placed - r.shortage + r.extra })).filter((r) => r.remaining !== 0);
     // 投入+不足 > 予定 は不変条件違反 (通常は addPlacement / 添付で防いでいる)。完了させず専用エラー (Codex R13 #3)
     const over = rows.filter((r) => r.remaining < 0);
     if (over.length > 0) {
@@ -996,8 +1030,18 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel, don
         message: `予定より多く入っている商品が ${over.length} 行あります。記録を取り消すか不足を解除してから完了してください` };
     }
     if (rows.length > 0 && !acknowledge) {
-      return { ok: false, error: 'incomplete', rows: rows.map((r) => ({ id: r.id, fnsku: r.fnsku, name: r.product_name, planNo: r.plan_no, planned: r.planned_qty, placed: r.placed, shortage: r.shortage, remaining: r.remaining })),
-        message: `まだ入っていない商品が ${rows.length} 行あります (合計 ${rows.reduce((a, r) => a + Math.max(0, r.remaining), 0)} 個)。このまま完了すると、残りは「今回は納品しない」として記録されます` };
+      // 残りの行き先を分けて言う (Codex PR #1621 R2/R3 Low): 予定に届かない分 = 「今回は納品しない」/ 予定より増やした分 = 増やすのをやめる
+      //   (下の確定処理と同じ式。増やした行は 予定 − 入れた数 だけが不足になる)
+      const out = rows.map((r) => {
+        const notShip = r.extra > 0 ? Math.max(0, r.planned_qty - r.placed) : Math.max(0, r.remaining);
+        return { id: r.id, fnsku: r.fnsku, name: r.product_name, planNo: r.plan_no, planned: r.planned_qty, placed: r.placed, shortage: r.shortage,
+          extra: r.extra, sendQty: r.planned_qty - r.shortage + r.extra, remaining: r.remaining, notShip, trim: Math.max(0, r.remaining - notShip) };
+      });
+      const notShipTotal = out.reduce((a, r) => a + r.notShip, 0), trimTotal = out.reduce((a, r) => a + r.trim, 0);
+      const what = [notShipTotal > 0 ? `予定に届かない ${notShipTotal} 個は「今回は納品しない」として記録されます` : null,
+        trimTotal > 0 ? `予定より増やした分の ${trimTotal} 個は、増やすのをやめます (「今回は納品しない」にはしません)` : null].filter(Boolean).join('。');
+      return { ok: false, error: 'incomplete', rows: out, notShipTotal, trimTotal,
+        message: `まだ入っていない商品が ${rows.length} 行あります (合計 ${out.reduce((a, r) => a + Math.max(0, r.remaining), 0)} 個)。このまま完了すると、${what}` };
     }
     const now = utcNow();
     const voided = [];
@@ -1012,8 +1056,21 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel, don
     const upShort = d.prepare(`INSERT INTO fbx_row_work (row_id, shortage_qty, shortage_reason, shortage_detail, shortage_by, updated_at) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(row_id) DO UPDATE SET shortage_qty = excluded.shortage_qty, shortage_reason = excluded.shortage_reason, shortage_detail = excluded.shortage_detail,
         shortage_by = excluded.shortage_by, updated_at = excluded.updated_at`);
-    let notShipped = 0;
+    const setExtraDone = d.prepare('UPDATE fbx_row_work SET extra_qty = ?, extra_reason = CASE WHEN ? IS NULL THEN NULL ELSE extra_reason END, extra_by = CASE WHEN ? IS NULL THEN NULL ELSE extra_by END, updated_at = ? WHERE row_id = ?');
+    let notShipped = 0, extraTrimmed = 0;   // 不足 (今回は納品しない) にした行 / 予定より増やした数を縮めただけの行
     for (const r of rows) {
+      // 予定より増やした行で入れ切らなかった: 送る数 = 入れた数。予定を超えた分だけ増やした数に残し、
+      // 予定に届かなければ増やした数を消して不足 (今回は納品しない) にする
+      if (r.extra > 0) {
+        const ex = r.placed > r.planned_qty ? r.placed - r.planned_qty : null;
+        setExtraDone.run(ex, ex, ex, now, r.id);
+        const short = Math.max(0, r.planned_qty - r.placed);
+        if (short > 0) upShort.run(r.id, short, 'not_shipped', null, worker?.display_name || null, now);
+        logEvent({ runId: run.id, action: 'row_extra', targetType: 'row', targetId: r.id, workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
+          payload: { extraQty: ex || 0, shortageQty: short, auto: true, via: 'finish', remaining: r.remaining, from: r.extra } }, d);
+        if (short > 0) notShipped++; else extraTrimmed++;
+        continue;
+      }
       const total = r.shortage + r.remaining;
       const bd = shortageBreakdownFor({ shortage: r.shortage, reason: r.shortage_reason, detail: r.shortage_detail }, total);
       upShort.run(r.id, total, bd.reason || 'not_shipped', bd.detail, worker?.display_name || null, now);
@@ -1021,14 +1078,14 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel, don
         payload: { shortageQty: total, reason: 'not_shipped', auto: true, remaining: r.remaining, detail: safeJson(bd.detail, null) } }, d);
       notShipped++;
     }
-    if (notShipped > 0 || voided.length > 0) bumpRunVersion(d, run.id);
+    if (notShipped > 0 || extraTrimmed > 0 || voided.length > 0) bumpRunVersion(d, run.id);
     d.prepare(`UPDATE fbx_runs SET status = 'done', done_at = ? WHERE id = ?`).run(now, run.id);
     // 完了の知らせ (本社の Google Chat) を同じトランザクションで積む。送るのは notify-outbox.js
     // (応答のあと・再起動のあとでも送る。投げっぱなしにしない — Codex PR #1307 R1 P1)
     enqueueRunDoneNotify(run.id, doneBy || worker?.display_name || deviceLabel || null, d);
     logEvent({ runId: run.id, action: 'run_done', targetType: 'run', targetId: run.id, workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
-      payload: { via: 'finish', notShippedRows: notShipped, voidedBoxes: voided } }, d);
-    return { ok: true, notShipped, voidedBoxes: voided };
+      payload: { via: 'finish', notShippedRows: notShipped, extraTrimmedRows: extraTrimmed, voidedBoxes: voided } }, d);
+    return { ok: true, notShipped, extraTrimmed, voidedBoxes: voided };
   }).immediate();
 }
 
@@ -1699,6 +1756,7 @@ export function getRunState(runId) {
   const rows = d.prepare(`SELECT w.*,
       COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0) AS placed,
       rw.label_worker, rw.check_worker, rw.check_worker_source, rw.shortage_qty, rw.shortage_reason, rw.shortage_detail, rw.shortage_by,
+      rw.extra_qty, rw.extra_reason, rw.extra_by,
       (SELECT i.image_url FROM fbx_product_images i WHERE i.fnsku = w.fnsku AND i.status = 'ok') AS image_url
     FROM fbx_rows w LEFT JOIN fbx_row_work rw ON rw.row_id = w.id
     WHERE w.run_id = ? ORDER BY w.pack_group_id, w.excel_row, w.picking_row_no, w.id`).all(run.id);
@@ -2069,13 +2127,14 @@ export function addPlacement({ runId, rowId, boxId, qty, splits, expiry, layer, 
       if (box.status !== 'open') return { ok: false, error: 'box_closed', boxId: box.id, message: `${which}この箱は閉じられています (職員が再オープンすれば入れられます)` };
       boxes.push(box);
     }
-    // 残数 = 予定 − 投入済み − 確定不足 (Codex PR1 #4: 不足確定後にその分を超えて入れられない)。分けたときは合計で見る
+    // 残数 = 予定 − 投入済み − 確定不足 + 増やした数 (Codex PR1 #4: 不足確定後にその分を超えて入れられない)。分けたときは合計で見る
     const placed = placedOf(d, row.id);
-    const shortage = d.prepare('SELECT COALESCE(shortage_qty, 0) s FROM fbx_row_work WHERE row_id = ?').get(row.id)?.s || 0;
-    if (placed + shortage + total > row.planned_qty) {
-      const rem = Math.max(0, row.planned_qty - placed - shortage);
-      return { ok: false, error: 'over_qty', placed, plannedQty: row.planned_qty, shortage,
-        message: `予定数を超えます (予定 ${row.planned_qty} / 入力済み ${placed}${shortage ? ` / 不足確定 ${shortage}` : ''})。残りは ${rem} 個です` };
+    const rw = d.prepare('SELECT COALESCE(shortage_qty, 0) s, COALESCE(extra_qty, 0) x FROM fbx_row_work WHERE row_id = ?').get(row.id);
+    const shortage = rw?.s || 0, extra = rw?.x || 0;
+    if (placed + shortage + total > row.planned_qty + extra) {
+      const rem = Math.max(0, row.planned_qty + extra - placed - shortage);
+      return { ok: false, error: 'over_qty', placed, plannedQty: row.planned_qty, shortage, extra,
+        message: `${extra ? `送る数を超えます (送る数 ${row.planned_qty + extra}・予定 ${row.planned_qty}` : `予定数を超えます (予定 ${row.planned_qty}`} / 入力済み ${placed}${shortage ? ` / 不足確定 ${shortage}` : ''})。残りは ${rem} 個です` };
     }
     // 期限制約 (要件 §5-3): 同一納品回×同一商品行は1期限。既存と異なる期限はブロック
     if (exp != null) {
@@ -2467,39 +2526,54 @@ export function shortageBreakdownFor({ shortage = 0, reason = null, detail = nul
 /**
  * 送る数の修正 (職員)。「予定 30 だが棚に 25 しかない」→ 送る数 25 = 不足 5 (理由 stock_short) として記録する
  * (中原さん 9/3)。修正前 (予定) → 修正後 (送る数) は fbx_row_work の shortage で復元でき、本社画面に出す。
- * 送る数 = 予定 に戻せば不足は消える。投入済みより少なくはできない
+ * 送る数 = 予定 に戻せば不足は消える。投入済みより少なくはできない。
+ * 予定より多くもできる (中原さん 2026-10-05: 増やすこともある) → 増えた分は extra_qty (理由は 本社指示 / その他)。
+ * Amazon の STA のプランの数量は本社が直す (出荷前チェック・本社向け一覧に「数量を 4 → 5 に変更」と出る)
  */
+export const EXTRA_REASONS = ['hq_order', 'other'];
+const SEND_QTY_MAX = 999999;   // iPad の入力欄 (6 桁) と同じ
 export function setRowSendQty({ rowId, sendQty, reason = 'stock_short', worker, deviceLabel }) {
-  const q = Number(sendQty);
-  if (!Number.isInteger(q) || q < 0) return { ok: false, error: 'bad_qty', message: '送る数は 0 以上の整数で入力してください' };
+  // 🚨 空 (null / '') を Number で 0 にしない = 「1 個も送らない」に化ける
+  const q = sendQty === null || sendQty === undefined || String(sendQty).trim() === '' ? NaN : Number(sendQty);
+  // 予定より多くできるようになったので上限も見る (1e100 など。iPad の入力欄と同じ 6 桁まで — Codex PR #1621 R1 Low)
+  if (!Number.isSafeInteger(q) || q < 0 || q > SEND_QTY_MAX) return { ok: false, error: 'bad_qty', message: `送る数は 0〜${SEND_QTY_MAX} の整数で入力してください` };
   const reasonKey = String(reason || 'stock_short');
   if (!SHORTAGE_REASONS.includes(reasonKey)) return { ok: false, error: 'bad_reason', message: '理由を選んでください' };
   const d = getDB();
   return d.transaction(() => {
     const row = d.prepare(`SELECT w.*, r.status AS run_status,
         COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0) AS placed,
-        COALESCE((SELECT rw.shortage_qty FROM fbx_row_work rw WHERE rw.row_id = w.id), 0) AS shortage
+        COALESCE((SELECT rw.shortage_qty FROM fbx_row_work rw WHERE rw.row_id = w.id), 0) AS shortage,
+        COALESCE((SELECT rw.extra_qty FROM fbx_row_work rw WHERE rw.row_id = w.id), 0) AS extra
       FROM fbx_rows w JOIN fbx_runs r ON r.id = w.run_id WHERE w.id = ?`).get(Number(rowId));
     if (!row) return { ok: false, error: 'not_found', message: '商品行が見つかりません' };
     if (row.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
     const excluded = rowExcludedError(row);
     if (excluded) return excluded;
-    if (q > row.planned_qty) return { ok: false, error: 'bad_qty', message: `送る数は予定 (${row.planned_qty}) を超えられません (増やすときは本社が STA のプランを直してください)` };
-    if (q < row.placed) return { ok: false, error: 'bad_qty', message: `既に ${row.placed} 個入っています。送る数を ${row.placed} より少なくするには先に記録を取り消してください` };
-    const before = row.planned_qty - row.shortage;
-    const shortage = row.planned_qty - q;
-    if (shortage === 0) {
-      d.prepare('UPDATE fbx_row_work SET shortage_qty = NULL, shortage_reason = NULL, shortage_detail = NULL, shortage_by = NULL, updated_at = ? WHERE row_id = ?').run(utcNow(), row.id);
-    } else {
-      d.prepare(`INSERT INTO fbx_row_work (row_id, shortage_qty, shortage_reason, shortage_detail, shortage_by, updated_at) VALUES (?, ?, ?, NULL, ?, ?)
-        ON CONFLICT(row_id) DO UPDATE SET shortage_qty = excluded.shortage_qty, shortage_reason = excluded.shortage_reason, shortage_detail = NULL, shortage_by = excluded.shortage_by, updated_at = excluded.updated_at`)
-        .run(row.id, shortage, reasonKey, worker?.display_name || null, utcNow());
+    if (q > row.planned_qty && !EXTRA_REASONS.includes(reasonKey)) {
+      return { ok: false, error: 'bad_reason', message: '予定より増やすときの理由は「本社指示」か「その他」を選んでください' };
     }
+    if (q < row.placed) return { ok: false, error: 'bad_qty', message: `既に ${row.placed} 個入っています。送る数を ${row.placed} より少なくするには先に記録を取り消してください` };
+    const before = row.planned_qty - row.shortage + row.extra;
+    const shortage = Math.max(0, row.planned_qty - q);
+    const extra = Math.max(0, q - row.planned_qty);
+    const now = utcNow();
+    // 不足と増やした数は同時に持たない (送る数 = 予定 − 不足 + 増やした数)。予定に戻すときは行を作らない (これまでどおり)
+    if (shortage === 0 && extra === 0) {
+      d.prepare(`UPDATE fbx_row_work SET shortage_qty = NULL, shortage_reason = NULL, shortage_detail = NULL, shortage_by = NULL,
+        extra_qty = NULL, extra_reason = NULL, extra_by = NULL, updated_at = ? WHERE row_id = ?`).run(now, row.id);
+    } else d.prepare(`INSERT INTO fbx_row_work (row_id, shortage_qty, shortage_reason, shortage_detail, shortage_by, extra_qty, extra_reason, extra_by, updated_at)
+        VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)
+      ON CONFLICT(row_id) DO UPDATE SET shortage_qty = excluded.shortage_qty, shortage_reason = excluded.shortage_reason, shortage_detail = NULL,
+        shortage_by = excluded.shortage_by, extra_qty = excluded.extra_qty, extra_reason = excluded.extra_reason, extra_by = excluded.extra_by,
+        updated_at = excluded.updated_at`)
+      .run(row.id, shortage || null, shortage ? reasonKey : null, shortage ? (worker?.display_name || null) : null,
+        extra || null, extra ? reasonKey : null, extra ? (worker?.display_name || null) : null, now);
     bumpRunVersion(d, row.run_id);
     logEvent({ runId: row.run_id, action: 'row_send_qty', targetType: 'row', targetId: row.id,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
-      payload: { planned: row.planned_qty, from: before, to: q, shortage, reason: shortage ? reasonKey : null } }, d);
-    return { ok: true, planned: row.planned_qty, sendQty: q, shortage, from: before };
+      payload: { planned: row.planned_qty, from: before, to: q, shortage, extra, reason: (shortage || extra) ? reasonKey : null } }, d);
+    return { ok: true, planned: row.planned_qty, sendQty: q, shortage, extra, from: before };
   }).immediate();
 }
 
@@ -2518,12 +2592,17 @@ export function setRowShortage({ rowId, shortageQty, reason, worker, deviceLabel
     if (excluded) return excluded;
     const remaining = row.planned_qty - row.placed;
     const q = Number(shortageQty);
+    if (remaining <= 0) {
+      return { ok: false, error: 'bad_qty', message: `予定 (${row.planned_qty}) の数まで入っています。送る数を変えるときは「送る数を直す」を使ってください` };
+    }
     if (!Number.isInteger(q) || q <= 0 || q > remaining) {
       return { ok: false, error: 'bad_qty', message: `不足数は 1〜${remaining} で入力してください (残数を超えられません)` };
     }
+    // 不足 = 予定より少なく送る → 予定より増やした数は消す (同時に持たない)
     d.prepare(`INSERT INTO fbx_row_work (row_id, shortage_qty, shortage_reason, shortage_detail, shortage_by, updated_at) VALUES (?, ?, ?, NULL, ?, ?)
       ON CONFLICT(row_id) DO UPDATE SET shortage_qty = excluded.shortage_qty,
-        shortage_reason = excluded.shortage_reason, shortage_detail = NULL, shortage_by = excluded.shortage_by, updated_at = excluded.updated_at`)
+        shortage_reason = excluded.shortage_reason, shortage_detail = NULL, shortage_by = excluded.shortage_by,
+        extra_qty = NULL, extra_reason = NULL, extra_by = NULL, updated_at = excluded.updated_at`)
       .run(row.id, q, reasonKey, worker?.display_name || null, utcNow());
     bumpRunVersion(d, row.run_id);
     logEvent({ runId: row.run_id, action: 'row_shortage', targetType: 'row', targetId: row.id,
@@ -2814,8 +2893,9 @@ export function exportReadiness(runId) {
   const boxBrief = (b) => ({ id: b.id, code: b.box_code, boxNo: b.box_no, amazonBoxNo: b.amazon_box_no, amazonName: b.amazon_name, qty: b.total_qty, status: b.status });
   const detailJa = (s) => { const arr = safeJson(s, null); return Array.isArray(arr) ? arr.map((x) => `${SHORTAGE_REASON_JA[x.reason] || x.reason} ${x.qty}`).join(' + ') : null; };
   const rowBrief = (r) => ({ id: r.id, fnsku: r.fnsku, sku: r.seller_sku, name: r.product_name, planNo: r.plan_no, planned: r.planned_qty, placed: r.placed,
-    shortage: r.shortage_qty || 0, sendQty: r.planned_qty - (r.shortage_qty || 0), reason: r.shortage_reason || null,
-    reasonJa: r.shortage_reason ? (detailJa(r.shortage_detail) || SHORTAGE_REASON_JA[r.shortage_reason] || r.shortage_reason) : null });
+    shortage: r.shortage_qty || 0, extra: r.extra_qty || 0, sendQty: sendQtyOf(r), reason: r.shortage_reason || r.extra_reason || null,
+    reasonJa: r.shortage_reason ? (detailJa(r.shortage_detail) || SHORTAGE_REASON_JA[r.shortage_reason] || r.shortage_reason)
+      : (r.extra_qty > 0 && r.extra_reason ? `増やした (${SHORTAGE_REASON_JA[r.extra_reason] || r.extra_reason})` : null) });
 
   if (run.status !== 'active' && run.status !== 'done') {
     blockers.push({ code: 'run_status', message: `納品回が「${run.status}」のため出力できません` });
@@ -2831,7 +2911,7 @@ export function exportReadiness(runId) {
   const live = boxes.filter((b) => b.status !== 'void');
   if (live.length === 0) blockers.push({ code: 'no_boxes', message: '箱がひとつもありません' });
   // picking_only / retired (Excel に無い = プランから外れた) 行は完了判定から外す
-  const incomplete = rows.filter((r) => !EXCLUDED_ROW_STATES.includes(r.match_state) && r.placed + (r.shortage_qty || 0) !== r.planned_qty);
+  const incomplete = rows.filter((r) => !EXCLUDED_ROW_STATES.includes(r.match_state) && r.placed !== sendQtyOf(r));
   if (incomplete.length > 0) {
     blockers.push({ code: 'rows_incomplete', message: `投入数+不足 が予定数と合わない商品が ${incomplete.length} 行あります (iPad で入力を終えるか、職員が不足を確定してください)`, rows: incomplete.map(rowBrief) });
   }
@@ -2854,6 +2934,9 @@ export function exportReadiness(runId) {
   if (unchecked.length > 0) warnings.push({ code: 'unchecked_rows', message: `確認担当が未記録の商品が ${unchecked.length} 行あります`, rows: unchecked.map(rowBrief) });
   const shortages = rows.filter((r) => r.shortage_qty > 0);
   if (shortages.length > 0) warnings.push({ code: 'shortage_rows', message: `送る数を予定から修正した商品が ${shortages.length} 行あります (修正前 → 修正後と理由を確認。Excel の数量は入れた分だけ。STA 側の予定数量との差は Amazon 側で調整)`, rows: shortages.map(rowBrief) });
+  // 予定より多く送る商品 (2026-10-05)。Excel の箱の数は入れた分なので、STA のプランの数量が少ないままだと合わない
+  const extras = rows.filter((r) => !EXCLUDED_ROW_STATES.includes(r.match_state) && r.extra_qty > 0);
+  if (extras.length > 0) warnings.push({ code: 'extra_rows', message: `予定より多く送る商品が ${extras.length} 行あります (STA のプランの数量を送る数まで増やしてから、パックリスト Excel を DL し直して添付してください)`, rows: extras.map(rowBrief) });
   // 期限管理商品なのに期限が空 (中原さん 2026-09-18)。**止めない (warning)** — 現場は入れ終わっていて、
   // 本社が STA 画面に入れる前に気づければよい。requires_expiry=1 の行だけ (NULL = 分からない商品は数えない)
   const placedIds = new Set(placements.filter((p) => !p.revoked_at && p.expiry).map((p) => p.row_id));
