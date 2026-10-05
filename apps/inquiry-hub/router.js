@@ -680,7 +680,7 @@ router.get('/inquiries/:id', (req, res) => {
           <input type="text" id="stCatNew" maxlength="200" placeholder="新しいグループの名前 (例: 成分・原材料について)" hidden>
           <label class="st-label">② テンプレート名
             <input type="text" id="stName" maxlength="200" placeholder="例: 成分の問い合わせ"></label>
-          <label class="st-label">③ 本文 <span class="sub">ここで直した内容がテンプレになります (返信欄はそのまま)</span>
+          <label class="st-label">③ 本文 <span class="sub">ここで直した内容がテンプレになります (返信欄はそのまま)。お客様の名前・注文番号など、その人だけの情報は消してください</span>
             <textarea id="stBody" rows="9"></textarea></label>
           <div class="draft-warn" id="stWarn" hidden></div>
           <div class="row st-ops">
@@ -1143,17 +1143,21 @@ router.get('/inquiries/:id', (req, res) => {
       customerName: String(inq.customer_name || '').trim(),
       orderNumber: String(inq.order_number || '').trim(),
     }).replace(/</g, '\\u003c')};
-    var NEW_CAT = '__new__';
     var cat = document.getElementById('stCat'), catNew = document.getElementById('stCatNew');
     var nameEl = document.getElementById('stName'), bodyEl = document.getElementById('stBody');
     var warn = document.getElementById('stWarn'), saveBtn = document.getElementById('stSave');
+    var cancelBtn = document.getElementById('stCancel'), closeBtn = document.getElementById('stClose');
+    var SAVE_LABEL = saveBtn.textContent;
     var known = [];   // いまあるテンプレ (同じグループに同じ名前があるか見る)
+    var saving = false;   // 保存の通信中。閉じて開き直して二重に登録しないよう、終わるまで閉じさせない
     var lastCat = '';
     try { lastCat = localStorage.getItem('ih.saveTpl.lastCat') || ''; } catch (e) { /* 使えなくてもよい */ }
+    // 「＋ 新しいグループを作る…」は値ではなく印で見分ける (同じ文字のグループ名と取り違えない)
+    function isNewCat() { var o = cat.options[cat.selectedIndex]; return !!(o && o.dataset.newCat); }
     function fillCats(cats, tpls) {
       var order = (cats || []).slice();
       (tpls || []).forEach(function(t) { if (t.category && order.indexOf(t.category) < 0) order.push(t.category); });
-      var cur = cat.value;
+      var wasNew = isNewCat(), cur = cat.value;
       cat.textContent = '';
       var head = document.createElement('option');
       head.value = ''; head.textContent = 'グループを選んでください';
@@ -1164,10 +1168,13 @@ router.get('/inquiries/:id', (req, res) => {
         cat.appendChild(o);
       });
       var add = document.createElement('option');
-      add.value = NEW_CAT; add.textContent = '＋ 新しいグループを作る…';
+      add.value = ''; add.dataset.newCat = '1'; add.textContent = '＋ 新しいグループを作る…';
       cat.appendChild(add);
-      cat.value = cur || (order.indexOf(lastCat) >= 0 ? lastCat : '');
-      if (cat.selectedIndex < 0) cat.value = '';
+      if (wasNew) add.selected = true;
+      else {
+        cat.value = cur || (order.indexOf(lastCat) >= 0 ? lastCat : '');
+        if (cat.selectedIndex < 0) cat.value = '';
+      }
       syncNewCat();
     }
     function load() {
@@ -1177,35 +1184,53 @@ router.get('/inquiries/:id', (req, res) => {
         .catch(function(e) { fillCats([], []); toast('グループの読み込みに失敗しました: ' + e.message); });
     }
     function syncNewCat() {
-      catNew.hidden = cat.value !== NEW_CAT;
+      catNew.hidden = !isNewCat();
     }
-    // お客様ごとの情報が残っていないか (姓だけ「山田様」と書くことが多いので、名前の最初の語も見る)
+    // 照合用: 全角/半角・大文字/小文字・空白・ハイフンの違いを無くす (「山田 花子」と「山田花子」、注文番号の - の有無)
+    function pnorm(s) {
+      s = String(s || '');
+      try { s = s.normalize('NFKC'); } catch (e) { /* 古い環境では正規化なしで続行 */ }
+      return s.toLowerCase().replace(/[\\s\\u2010-\\u2015\\u2212-]/g, '');
+    }
+    // お客様ごとの情報が残っていないか。テンプレート名 (初期値 = 件名) と本文の両方を見る。
+    // 姓だけ「山田様」と書くことが多いので、名前の最初の語も見る
     function checkPersonal() {
-      var text = bodyEl.value, hits = [];
+      var hay = pnorm(nameEl.value + '\\n' + bodyEl.value), hits = [];
       var nm = ST_SEED.customerName;
       if (nm) {
         var first = nm.split(/[\\s\\u3000]+/)[0];
-        if (text.indexOf(nm) >= 0) hits.push('お客様の名前「' + nm + '」');
-        else if (first && first.length >= 2 && text.indexOf(first) >= 0) hits.push('お客様の名前「' + first + '」');
+        if (pnorm(nm).length >= 2 && hay.indexOf(pnorm(nm)) >= 0) hits.push('お客様の名前「' + nm + '」');
+        else if (first && pnorm(first).length >= 2 && hay.indexOf(pnorm(first)) >= 0) hits.push('お客様の名前「' + first + '」');
       }
-      if (ST_SEED.orderNumber && text.indexOf(ST_SEED.orderNumber) >= 0) hits.push('注文番号「' + ST_SEED.orderNumber + '」');
+      var on = pnorm(ST_SEED.orderNumber);
+      if (on.length >= 4 && hay.indexOf(on) >= 0) hits.push('注文番号「' + ST_SEED.orderNumber + '」');
       warn.hidden = !hits.length;
       warn.textContent = hits.length
-        ? '⚠️ ' + hits.join('・') + ' が入っています。ほかのお客様にも使うなら、消すか「○○様」などに置き換えてください'
+        ? '⚠️ テンプレート名か本文に ' + hits.join('・') + ' が入っています。ほかのお客様にも使うなら、消すか「○○様」などに置き換えてください'
         : '';
     }
+    function setSaving(on) {
+      saving = on;
+      saveBtn.disabled = on; cancelBtn.disabled = on; closeBtn.disabled = on;
+      saveBtn.textContent = on ? '保存しています…' : SAVE_LABEL;
+    }
     function openDlg(text) {
+      if (saving) { toast('前の保存がまだ終わっていません'); return; }
       if (!String(text || '').trim()) { toast('本文が空です。返信を書いてから保存してください'); return; }
       bodyEl.value = text;
       nameEl.value = ST_SEED.subject;
       catNew.value = '';
-      saveBtn.disabled = false;
       checkPersonal();
       load();
       if (typeof stDlg.showModal === 'function') stDlg.showModal(); else stDlg.setAttribute('open', '');
       cat.focus();
     }
-    function closeDlg() { if (typeof stDlg.close === 'function') stDlg.close(); else stDlg.removeAttribute('open'); }
+    function closeDlg() {
+      if (saving) return;
+      if (typeof stDlg.close === 'function') stDlg.close(); else stDlg.removeAttribute('open');
+    }
+    // Esc で閉じるのも、保存の通信中は止める
+    stDlg.addEventListener('cancel', function(e) { if (saving) e.preventDefault(); });
     var stBtn = document.getElementById('saveTplBtn');
     if (stBtn) stBtn.addEventListener('click', function() {
       var ta = document.getElementById('replyBody');
@@ -1217,19 +1242,22 @@ router.get('/inquiries/:id', (req, res) => {
         openDlg(full ? full.textContent : '');
       });
     });
-    cat.addEventListener('change', function() { syncNewCat(); if (cat.value === NEW_CAT) catNew.focus(); });
+    cat.addEventListener('change', function() { syncNewCat(); if (isNewCat()) catNew.focus(); });
     bodyEl.addEventListener('input', checkPersonal);
-    document.getElementById('stCancel').addEventListener('click', closeDlg);
-    document.getElementById('stClose').addEventListener('click', closeDlg);
+    nameEl.addEventListener('input', checkPersonal);
+    cancelBtn.addEventListener('click', closeDlg);
+    closeBtn.addEventListener('click', closeDlg);
     saveBtn.addEventListener('click', function() {
-      var group = cat.value === NEW_CAT ? catNew.value.trim() : cat.value;
+      if (saving) return;
+      var creating = isNewCat();
+      var group = creating ? catNew.value.trim() : cat.value;
       var name = nameEl.value.trim();
-      if (!group) { toast(cat.value === NEW_CAT ? '新しいグループの名前を入れてください' : '保存するグループを選んでください'); (cat.value === NEW_CAT ? catNew : cat).focus(); return; }
+      if (!group) { toast(creating ? '新しいグループの名前を入れてください' : '保存するグループを選んでください'); (creating ? catNew : cat).focus(); return; }
       if (!name) { toast('テンプレート名を入れてください'); nameEl.focus(); return; }
       if (!bodyEl.value.trim()) { toast('本文が空です'); bodyEl.focus(); return; }
       var dup = known.some(function(t) { return t.name === name && (t.category || '') === group; });
       if (dup && !confirm('「' + group + '」には同じ名前「' + name + '」のテンプレートがもうあります。\\n別のテンプレートとして追加しますか?')) return;
-      saveBtn.disabled = true;
+      setSaving(true);
       fetch('/apps/inquiry-hub/api/templates', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ template_name: name, category: group, template_body: bodyEl.value,
@@ -1238,10 +1266,11 @@ router.get('/inquiries/:id', (req, res) => {
         return r.json().catch(function() { return {}; }).then(function(j) { if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; });
       }).then(function() {
         try { localStorage.setItem('ih.saveTpl.lastCat', group); } catch (e) { /* 使えなくてもよい */ }
+        setSaving(false);
         closeDlg();
         if (window.ihResetTplCache) window.ihResetTplCache();
         toast('「' + group + '」に「' + name + '」を登録しました');
-      }).catch(function(e) { saveBtn.disabled = false; toast('保存に失敗しました: ' + e.message); });
+      }).catch(function(e) { setSaving(false); toast('保存に失敗しました: ' + e.message); });
     });
   })();
   // 📧 今後の自動処理 (メールルール作成。複数条件を組み合わせられる)
