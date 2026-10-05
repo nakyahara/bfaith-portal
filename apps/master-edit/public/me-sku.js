@@ -41,7 +41,7 @@
   var initial = new Map();
   tracked().forEach(function (el) { initial.set(el, valueOf(el)); });
   var initialCompHtml = $('#comp-rows') ? $('#comp-rows').innerHTML : null;
-  var saved = false;      // 保存できた後 (表示し直すまで、もう未保存と数えない)
+  var saved = false;      // 保存できた後 (読み直すまで、もう未保存と数えない)
 
   function dirtyKeys() {
     var keys = [];
@@ -133,7 +133,7 @@
     var reason = $('#reason') ? $('#reason').value.trim() : '';
     var el = firstEl(isSet ? 'handling_own' : 'handling');
     if (keys.indexOf(isSet ? 'handling_own' : 'handling') >= 0 && el && valueOf(el) === 'discontinued' && !reason) out.push({ t: '取扱を中止にするときは理由が要ります (下の「理由」)', focus: '#reason' });
-    if (keys.indexOf('cost') >= 0 && !$('#cost-reason').value.trim()) out.push({ t: '原価を変えるときは、原価の欄の「理由」が要ります', focus: '#cost-reason' });
+    if (keys.indexOf('cost') >= 0 && !costReason().trim()) out.push({ t: '原価を変える理由で「その他」を選んだときは、理由を書いてください', focus: '#cost-reason' });
     if (keys.indexOf('exception_cost') >= 0 && !$('#xcost-reason').value.trim()) out.push({ t: '例外原価を変えるときは、その「理由」が要ります', focus: '#xcost-reason' });
     return out;
   }
@@ -182,9 +182,33 @@
     var d = v - P.costNow, pct = P.costNow ? Math.round((d / P.costNow) * 1000) / 10 : null;
     el.innerHTML = '<span class="hint">いまの ' + yen(P.costNow) + ' 円から</span> <span class="delta ' + (d >= 0 ? 'up' : 'down') + '">' + (d >= 0 ? '+' : '−') + yen(Math.abs(d)) + ' 円' + (pct == null ? '' : ' (' + (d >= 0 ? '+' : '−') + Math.abs(pct) + '%)') + '</span>';
   }
+  /**
+   * 原価を変える理由 (10/5 中原さん: ふだんはメーカーからの値上げ通知 = 選ぶだけ)。選んだ文そのものを送る・「その他」は書いた文。
+   * 選ぶ部品は未保存に数えない (data-dirty-field を付けない = 今までの理由の欄と同じ)
+   */
+  function costReason() {
+    var p = $('input[name="cost-reason-pick"]:checked');
+    var other = $('#cost-reason');
+    if (!p) return other ? other.value : '';
+    return p.hasAttribute('data-other') ? (other ? other.value.trim() : '') : p.value;
+  }
+  function costReasonShow(focus) {
+    var p = $('input[name="cost-reason-pick"]:checked'), other = $('#cost-reason');
+    if (!other) return;
+    other.hidden = !(p && p.hasAttribute('data-other'));
+    if (!other.hidden && focus) other.focus();
+  }
+  function costReasonReset() {
+    var first = $('input[name="cost-reason-pick"]');
+    if (first) first.checked = true;
+    if ($('#cost-reason')) $('#cost-reason').value = '';
+    costReasonShow(false);
+  }
+  $$('input[name="cost-reason-pick"]').forEach(function (r) { r.addEventListener('change', function () { costReasonShow(true); update(); }); });
+  if ($('#cost-reason')) $('#cost-reason').addEventListener('input', update);
   if (costOpen && costBox) {
     costOpen.addEventListener('click', function () { costBox.hidden = false; costOpen.setAttribute('aria-expanded', 'true'); $('#cost-jpy').focus(); });
-    $('#cost-cancel').addEventListener('click', function () { $('#cost-jpy').value = ''; $('#cost-reason').value = ''; costDelta(); costBox.hidden = true; costOpen.setAttribute('aria-expanded', 'false'); costOpen.focus(); update(); });
+    $('#cost-cancel').addEventListener('click', function () { $('#cost-jpy').value = ''; costReasonReset(); costDelta(); costBox.hidden = true; costOpen.setAttribute('aria-expanded', 'false'); costOpen.focus(); update(); });
     $('#cost-jpy').addEventListener('input', costDelta);
   }
 
@@ -301,7 +325,7 @@
     });
     if (initialCompHtml != null && $('#comp-rows')) $('#comp-rows').innerHTML = initialCompHtml;
     if (janTokens) { $$('.tok', janTokens).forEach(function (t) { t.remove(); }); janList(janHidden.value).forEach(function (j) { janTokens.insertBefore(janTok(j, false), janIn); }); janIn.value = ''; janSay(''); }
-    if ($('#cost-reason')) $('#cost-reason').value = '';
+    costReasonReset();
     if ($('#xcost-reason')) $('#xcost-reason').value = '';
     if (costBox) { costBox.hidden = true; if (costOpen) costOpen.setAttribute('aria-expanded', 'false'); costDelta(); }
     $$('.f.err', scope).forEach(function (f) { f.classList.remove('err'); });
@@ -333,7 +357,7 @@
     if (isSet && compEditable && JSON.stringify(components()) !== initial.get(compTable)) values.components = components();
     if (!isSet) {
       var cj = $('#cost-jpy');
-      if (cj && !cj.disabled && cj.value.trim()) values.cost = { jpy: cj.value.trim(), reason: $('#cost-reason').value };
+      if (cj && !cj.disabled && cj.value.trim()) values.cost = { jpy: cj.value.trim(), reason: costReason() };
     } else {
       var xj = $('#xcost-jpy'), xc = $('#xcost-clear');
       if (xj && !xj.disabled) {
@@ -366,15 +390,40 @@
   function showResult(j) {
     var r = $('#result');
     if (j.no_change) { r.innerHTML = '<div class="result"><div class="rt">変わった項目がありません (何も保存していません)</div></div>'; return; }
-    r.innerHTML = '<div class="result ok" role="status"><div class="rt">保存しました' + (j.replayed ? ' (前に保存した結果)' : '') + '</div>'
-      + '<ul>' + li(j.changed.map(function (c) { var hf = c.field === 'handling' || c.field === 'handling_own'; return esc(c.label) + ': ' + esc(show(hf ? HANDLING[c.from] || c.from : c.from)) + ' → ' + esc(show(hf ? HANDLING[c.to] || c.to : c.to)) + ' <span class="muted">(' + esc(NE[c.ne] || c.ne) + ')</span>'; })) + '</ul>'
+  }
+  /** 保存が通った返事の中身 (変えた項目・計算し直した値・NE でやること・気をつけること) */
+  function changeText(c) { var hf = c.field === 'handling' || c.field === 'handling_own'; return String(c.label) + ': ' + show(hf ? HANDLING[c.from] || c.from : c.from) + ' → ' + show(hf ? HANDLING[c.to] || c.to : c.to); }
+  function changeLine(c) { return esc(changeText(c)); }
+  function savedHtml(j) {
+    var changed = Array.isArray(j.changed) ? j.changed : [];
+    return '<div class="rt"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg> 保存しました' + (j.replayed ? ' (前に保存した結果)' : '') + ' · 画面は保存した後の値です</div>'
+      + (changed.length ? '<ul>' + li(changed.map(function (c) { return changeLine(c) + ' <span class="muted">(' + esc(NE[c.ne] || c.ne) + ')</span>'; })) + '</ul>' : '')
       + (j.derived && j.derived.length ? '<div class="sec2">構成品から計算し直した値</div><ul>' + li(j.derived.map(function (d) { var hf = d.col === 'handling'; return esc(d.code) + ' の ' + esc(COL[d.col] || d.col) + ': ' + esc(show(hf ? HANDLING[d.from] || d.from : d.from)) + ' → ' + esc(show(hf ? HANDLING[d.to] || d.to : d.to)); })) + '</ul>' : '')
       + (j.ne_steps && j.ne_steps.length ? '<div class="sec2">NE でやること</div><ul>' + li(j.ne_steps.map(esc)) + '</ul>' : '')
       + (j.warnings && j.warnings.length ? '<div class="sec2">気をつけること</div><ul>' + li(j.warnings.map(esc)) + '</ul>' : '')
-      + '<div class="sec2">続けて直すときは「表示し直す」を押してください (保存の後は入力の場所を閉じています)</div>'
-      + '<button type="button" class="btn soft sm" id="reload">表示し直す</button></div>';
-    $('#reload').addEventListener('click', function () { location.reload(); });
-    $('#reload').focus();
+      + '<button type="button" class="btn ghost sm" id="saved-note-close">閉じる</button>';
+  }
+  /*
+   * 保存が通った後は画面を読み直す (10/5 中原さん「保存したらすぐに保存箇所も変わるように」)。
+   * 読み直す前に返事を sessionStorage に置き、読み直した画面の上に 1 回だけ出す (置けない・壊れている = 出さないだけ。画面の値は読み直しで正しい)
+   */
+  var NOTE_KEY = 'master-edit:saved-note';
+  function keepSavedNote(j) {
+    try {
+      sessionStorage.setItem(NOTE_KEY, JSON.stringify({ code: P.code, at: Date.now(), j: { replayed: !!j.replayed, changed: j.changed || [], derived: j.derived || [], ne_steps: j.ne_steps || [], warnings: j.warnings || [] } }));
+    } catch (e) { /* 置けない (プライベートのウィンドウなど) = 知らせを出さないだけ */ }
+  }
+  function showSavedNote() {
+    var n = null;
+    try { var raw = sessionStorage.getItem(NOTE_KEY); if (raw) { sessionStorage.removeItem(NOTE_KEY); n = JSON.parse(raw); } } catch (e) { return; }
+    if (!n || !n.j || n.code !== P.code || !(Date.now() - Number(n.at) < 5 * 60000)) return;
+    var box = document.createElement('div');
+    box.id = 'saved-note'; box.className = 'result ok saved-note'; box.setAttribute('role', 'status');
+    box.innerHTML = savedHtml(n.j);
+    var ph = $('#sku-ph'); if (ph && ph.parentNode) ph.parentNode.insertBefore(box, ph.nextSibling); else form.parentNode.insertBefore(box, form);
+    $('#saved-note-close').addEventListener('click', function () { box.remove(); });
+    var ch = Array.isArray(n.j.changed) ? n.j.changed : [];
+    ME.toast('保存しました' + (ch.length ? ' (' + changeText(ch[0]) + (ch.length > 1 ? ' ほか ' + (ch.length - 1) + ' 件' : '') + ')' : ''));
   }
   // 先の日付の原価 (cost_future / set_cost_future) は入れない = 画面を開いたときに分かっている状態で、該当する原価の欄を閉じてある。
   // その間に入った = 編集の印が変わる = version_conflict で返る (#1589 Codex R2 M2)。登録をその間にやめた = cancelled_sku (M3)
@@ -402,8 +451,8 @@
   /** 今の値を基準にし直す (変わった項目が無かった保存の後) */
   function rebase() { tracked().forEach(function (el) { initial.set(el, valueOf(el)); }); }
   /**
-   * 保存が通った後: 画面の値と編集の印はもう古い = 入力の場所を閉じる (inert + disabled)。続けて直すときは「表示し直す」(#1589 Codex R3 M1)。
-   * 閉じないと、保存の後に打った値は未保存に数えず (saved)、保存も離れるときの確認も効かないまま黙って消える
+   * 保存が通った後、読み直すまでの間: 画面の値と編集の印はもう古い = 入力の場所を閉じる (inert + disabled)。(#1589 Codex R3 M1)
+   * 閉じないと、読み直しの間に打った値は未保存に数えず (saved)、黙って消える。読み直した後は新しい印で続けて直せる
    */
   function lockAfterSave() {
     var main = form.firstElementChild;
@@ -431,7 +480,10 @@
         if (x.r.ok && x.j.ok) {
           // 変わった項目が無い (5 と 5.0 など) = 今の値を「開いたときの値」にそろえる = 未保存を消す (#1589 Codex R3 L3)
           if (x.j.no_change) { requestId = uuid(); rebase(); msg(''); showResult(x.j); update(); return; }
-          saved = true; msg(''); lockAfterSave(); showResult(x.j); update(); ME.toast('保存しました');
+          // 保存が通った = 画面を読み直して保存した後の値 (と新しい編集の印) にする。読み直すまでの間は打てないように閉じる
+          saved = true; lockAfterSave(); update(); msg('保存しました。保存した後の値を読み直しています…', 'ok');
+          keepSavedNote(x.j);
+          if (ME.reloadPage) ME.reloadPage(); else location.reload();
           return;
         }
         msg('', 'err');
@@ -462,7 +514,7 @@
     if (saveBtn && !saveBtn.disabled) { doSave(); return; }
     if (lastState.need && lastState.need.length) { review(); ME.toast(lastState.need[0].t); return; }
     if (mustReload) { ME.toast('この画面は古くなりました。「画面を開き直す」を押してください'); var rb = $('#reload'); if (rb) rb.focus(); return; }
-    ME.toast(saved ? 'もう保存しました。「表示し直す」で最新の値を読みます' : '保存する変更がありません');
+    ME.toast(saved ? '保存しました。保存した後の値を読み直しています' : '保存する変更がありません');
   } : null;
 
   /* ---------- product-hub の出品カード (前の画面と同じ API) ---------- */
@@ -499,4 +551,5 @@
   });
 
   update();
+  showSavedNote();
 })();

@@ -1445,11 +1445,24 @@ await ta('[15] 一覧: 描画・検索・区分・状態・未入力 (売上分�
   await pg.query("update core.products set sales_class = 1 where product_id = (select product_id from core.skus where code = 's003')");
   assert.deepEqual((await R.listSkus(db, { kind: 'set', state: 'available' }, { now: NOW })).rows.map((x) => [x.code, x.tax_derived]), [['set001', true]]);
   assert.deepEqual((await R.listSkus(db, { kind: 'set', state: 'discontinued' }, { now: NOW })).rows.map((x) => x.code), ['set004', 'set005', 'set006']);
-  const bare = await fetch(`${ORIGIN}/apps/master-edit`, { headers: { 'x-test-session': 'editor' }, redirect: 'manual' });
+  // 一覧の原価 (10/5 に 1 回の集合の走査に直した) = 1 つの商品の引き当て (costAsOfJoin の lateral) と同じ値・代表の仕入先も前の副問い合わせと同じ
+  {
+    const all = await R.listSkus(db, {}, { now: NOW });
+    assert.ok(all.rows.length > 5);
+    for (const x of all.rows) {
+      const one = await R.lookupSku(db, x.code, { now: NOW });
+      assert.equal(x.cost, one.cost_jpy, `原価 ${x.code}`);
+      const ps = (await pg.query('select (select sp.code from core.supplier_skus y join core.suppliers sp on sp.supplier_id = y.supplier_id where y.sku_id = s.sku_id and y.is_primary order by sp.code limit 1) as c from core.skus s where s.code = $1', [x.code])).rows[0].c;
+      assert.equal(x.primary_supplier, ps, `代表の仕入先 ${x.code}`);
+    }
+    // 件数 = 絞らなければ全部の商品 (軽い読みで数える)
+    assert.equal(all.total, (await pg.query('select count(*)::int as n from core.skus where company_id = 1')).rows[0].n);
+  }
+  const bare =await fetch(`${ORIGIN}/apps/master-edit`, { headers: { 'x-test-session': 'editor' }, redirect: 'manual' });
   assert.equal(bare.status, 301); assert.equal(bare.headers.get('location'), '/apps/master-edit/');
   const m = await call('GET', '/manual');
   assert.equal(m.status, 200);
-  for (const word of ['保存', '構成品を足す', '表示し直す', '画面を開き直す', '例外原価をやめる (構成品の合計に戻す)', 'NE との差', '未入力', '切替前', 'NE でやること', 'Ctrl + K', '捨てて移る', '🔒 の値']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
+  for (const word of ['保存', '構成品を足す', '保存した後の値', 'メーカーからの値上げ通知', 'ひらがな・カタカナ・半角カナ', '画面を開き直す', '例外原価をやめる (構成品の合計に戻す)', 'NE との差', '未入力', '切替前', 'NE でやること', 'Ctrl + K', '捨てて移る', '🔒 の値']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
 });
 
 await ta('[15] 単品・セットの画面: 描画・画面の JS・編集の印・導く値・食い違い・JAN とロジザードは単品だけ・404', async () => {

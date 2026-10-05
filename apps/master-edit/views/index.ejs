@@ -55,7 +55,7 @@
         <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
         <input id="q" name="q" value="<%= filters.q %>" autocomplete="off" aria-keyshortcuts="/" aria-label="商品・セットを絞る (コード・名前・JAN)" placeholder="商品・セットを絞る (コード・名前・JAN)　例: はちみつ / 4901234567894">
         <% for (const [k, v] of Object.entries(keep)) { if (k === 'q') continue; %><input type="hidden" name="<%= k %>" value="<%= v %>"><% } %>
-        <button class="btn soft sm go" type="submit">絞る</button>
+        <button class="btn soft sm go" type="submit" title="Enter でも絞れます">絞る</button>
         <span class="kbd" aria-hidden="true">/</span>
       </form>
       <div class="filters">
@@ -98,7 +98,7 @@
     <div class="panel">
       <div class="tbl-top">
         <span><b><%= data.total.toLocaleString('ja-JP') %></b> 件</span><span class="dotsep" aria-hidden="true"></span>
-        <span>コードを押すか <span class="kbd">↑</span><span class="kbd">↓</span> で選んで <span class="kbd">Enter</span> で開く</span>
+        <span>絞る欄で <span class="kbd">Enter</span> = 絞る · コードを押すか <span class="kbd">↑</span><span class="kbd">↓</span> で選んで <span class="kbd">Enter</span> で開く</span>
         <span class="right"><span><span class="fx">計算</span> = 構成品から計算した値</span></span>
       </div>
       <div class="tblwrap">
