@@ -365,7 +365,7 @@
         <% if (extras) { const st = extras.stock; const stockN = isSet ? extras.buildable : extras.qty; %>
         <%# 参考 (ほかのアプリの値・読むだけ): 在庫 = ロジザード (セットは構成品から作れる数)・注文残 = 発注アプリの台帳 (apps/master-edit/extras.mjs) %>
         <section class="panel refbox" aria-labelledby="h-ref" id="ref-box">
-          <div class="panel-h" style="margin-bottom:10px"><h2 id="h-ref">在庫・注文残</h2><span class="sub">参考 (ほかのアプリの値)</span></div>
+          <div class="panel-h" style="margin-bottom:10px"><h2 id="h-ref">在庫・売れた数・注文残</h2><span class="sub">参考 (ほかのアプリの値)</span></div>
           <div class="kv">
             <div class="row"><span class="k"><%= isSet ? '作れる数' : '在庫' %> (ロジザード)</span><span class="v">
               <% if (!st || !st.ok) { %><span class="when bad" id="ref-stock-when">読めない<%= st && st.error ? ' (' + st.error + ')' : '' %></span>
@@ -394,6 +394,31 @@
             <% } %>
             <% if (fx && fx.ok && fx.bundles.length) { %>
             <div class="hint" id="ref-fba-bundles" style="margin-top:4px">まとめ売り・セットの出品 (上の数に入れていない): <%= fx.bundles.slice(0, 6).map((b) => b.code + (b.others ? ' (ほか ' + b.others + ' 品と' + (b.qty > 1 ? '・×' + b.qty : '') + ')' : ' ×' + b.qty) + ' = ' + (b.available == null ? '—' : b.available.toLocaleString('ja-JP'))).join(' · ') %><%= fx.bundles.length > 6 ? ' · ほか ' + (fx.bundles.length - 6) + ' 件' : '' %></div>
+            <% } %>
+            <% const sx = extras.sales; const sr = sx && sx.ok ? sx.row : null; const nf = (v) => Number(v).toLocaleString('ja-JP'); const dd = (d) => ui.fmtDay(d).replace(/ \(.\)$/, ''); %>
+            <%# 売れた数 = 商品管理リストの公開の回 (apps/master-edit/sales-qty.mjs。発注アプリ・商品管理リストと同じ数・前日まで・セットで売れた分は構成品に入る) %>
+            <div class="row"><span class="k">売れた数 (7 日 / 30 日)</span><span class="v">
+              <% if (!sx || !sx.ok) { %><span class="when bad" id="ref-sales-when">読めない<%= sx && sx.error ? ' (' + sx.error + ')' : '' %></span>
+              <% } else { %>
+                <% if (sr && !(isSet && !sr.d7 && !sr.d30)) { %><span class="big" id="ref-sales"><%= nf(sr.d7) %> / <%= nf(sr.d30) %></span>
+                <% } else if (isSet) { %><span class="when" id="ref-sales-set" style="display:block">セットで売れた分は構成品の数に入る (商品管理リスト・発注アプリと同じ数え方。セットのコードには数が付かない)</span>
+                <% } else { %><span class="when" id="ref-sales-missing" style="display:block">商品管理リストに無い商品 (NE にまだ無いなど)</span><% } %>
+                <span class="when<%= sx.run.stale ? ' stale' : '' %>" id="ref-sales-asof" style="display:block"><%= sx.run.stale ? '古い · ' : '' %><%= ui.fmtDay(sx.run.asOf) %> まで (7 日 = <%= dd(sx.run.from7) %>〜・30 日 = <%= dd(sx.run.from30) %>〜・今日は入れない) · 注文日・キャンセルを除く・全部のモール</span>
+              <% } %>
+            </span></div>
+            <% if (sr && !(isSet && !sr.d7 && !sr.d30)) { const ml = sx.malls; %>
+            <table id="ref-sales-parts"><thead><tr><th scope="col">売れた数の内訳</th><th scope="col" class="n">7 日</th><th scope="col" class="n">30 日</th></tr></thead><tbody>
+              <tr><td>Amazon FBA</td><td class="n"><%= nf(sr.d7fba) %></td><td class="n"><%= nf(sr.d30fba) %></td></tr>
+              <tr><td>FBA 以外 (NE の受注)</td><td class="n"><%= nf(sr.d7other) %></td><td class="n"><%= nf(sr.d30other) %></td></tr>
+            </tbody></table>
+            <% if (ml && ml.ok && ml.rows.length) { %>
+            <table id="ref-sales-malls"><thead><tr><th scope="col">モール別<%= ml.asOf && ml.asOf !== sx.run.asOf ? ' (' + dd(ml.asOf) + ' まで)' : '' %></th><th scope="col" class="n">7 日</th><th scope="col" class="n">30 日</th></tr></thead><tbody>
+              <% for (const m of ml.rows.slice(0, 10)) { %><tr><td><%= m.label %></td><td class="n"><%= nf(m.d7) %></td><td class="n"><%= nf(m.d30) %></td></tr><% } %>
+            </tbody></table>
+            <% if (ml.rows.length > 10) { %><div class="hint">ほか <%= ml.rows.length - 10 %> 件</div><% } %>
+            <% if ((ml.asOf && ml.asOf !== sx.run.asOf) || ml.mixed) { %><div class="hint" id="ref-sales-malls-lag">モール別は<%= ml.mixed ? '日がそろっていない' : ' ' + ui.fmtDay(ml.asOf) + ' までの数' %> (合計とずれることがある)</div><% } %>
+            <% } %>
+            <% if (!isSet && page.usedIn.length) { %><div class="hint" id="ref-sales-sets">この商品を含むセット <%= page.usedIn.length %> 件で売れた分も入っている (セット経由の分だけは分けられない)</div><% } %>
             <% } %>
             <% if (!isSet) { const bo = extras.backorder; %>
             <div class="row"><span class="k">注文残 (発注アプリ)</span><span class="v">

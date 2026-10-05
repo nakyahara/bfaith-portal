@@ -56,6 +56,7 @@ import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
 import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti } from './read.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
 import { readFbaDay, readFbaSku } from './fba-stock.mjs';
+import { readSalesRun, readSalesSku } from './sales-qty.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
 import { ui } from './ui-format.mjs';
@@ -291,11 +292,11 @@ router.get('/', (req, res) => {
       else searchExpired = true;
     }
     const filters = normalizeFilters(query);
-    // 参考の値 (注文残 = 発注アプリ・在庫 = ロジザード・FBA (JP) = Company DB の在庫の日次)。読めなくても一覧は出す (その欄だけ「読めない」)。
+    // 参考の値 (注文残 = 発注アプリ・在庫 = ロジザード・FBA (JP) = Company DB の在庫の日次・売れた数 = 商品管理リストの公開の回)。読めなくても一覧は出す (その欄だけ「読めない」)。
     // 注文残は発注アプリの利用権がある人だけ (無い人の「注文残あり」の絞り込みも使わない = どの商品に注文残があるかも出さない)
     const poOk = canSeeBackorders(req);
     if (!poOk) filters.po = '';
-    const extras = { backorders: poOk ? readBackorders() : PO_DENIED, stock: await readWarehouseStock({ now: clock() }), fba: db ? await readFbaDay(db, { now: clock() }) : null };
+    const extras = { backorders: poOk ? readBackorders() : PO_DENIED, stock: await readWarehouseStock({ now: clock() }), fba: db ? await readFbaDay(db, { now: clock() }) : null, sales: await readSalesRun({ now: clock() }) };
     const empty = { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false, notFound: [], multiCut: false };
     const data = db && !searchExpired ? await listSkus(db, filters, { now: new Date(clock()), extras }) : empty;
     const phase = db ? await readCutoverPhase(db) : null;
@@ -364,6 +365,8 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     buildable: page.cur.sku_kind === 'set' ? buildableOf(stock, (page.cur.components || []).map((x) => ({ code_norm: normSku(x.code), qty: x.qty }))) : null,
     // FBA (JP) = Company DB の在庫の日次 (最新の complete の日・1 × 1 の出品の合計と内訳・まとめ売り / セットの出品は別に)
     fba: await readFbaSku(db, await readFbaDay(db, { now: clock() }), page.cur.sku_id),
+    // 売れた数 (7 日・30 日) = 商品管理リストの公開の回 (発注アプリと同じ数)・FBA / FBA 以外・モール別 (速報)
+    sales: await readSalesSku(await readSalesRun({ now: clock() }), page.cur.code),
   } : null;
   res.render(view('sku.ejs'), {
     ...pageLocals(req, page ? page.phase : null), ui2: true, nav: 'list', dbError, page, FIELD_DEFS: page ? fieldsOf(page.cur.sku_kind) : {}, REG_FIELDS: page ? (REG_CSV_FIELDS[page.cur.sku_kind] || []) : [], code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,

@@ -25,6 +25,8 @@
  *     Company DB が無い・届かない = 帯と 503 / 保存を開いていない = 帯・欄と保存のボタンが閉じている / server.js は Render だけ
  *  16 FBA (JP) の在庫 (参考): Company DB の在庫の日次の最新の complete の日・何時時点 (取得の時刻)・1 × 1 の出品だけ足す (まとめ売り・セットの出品は別)・
  *     partial の日は使わない・古い (26 時間) / 読めない (日次なし・権限なし)・master_edit は 2 つの表を読むだけ・流し直しで読める
+ *  17 売れた数 (参考): 商品管理リストの公開の回 (Render の写し・発注アプリと同じ数)・いつまでの数か (前日まで)・FBA / FBA 以外・モール別・セットは構成品に入る (「—」)・
+ *     商品管理リストに無い = 「—」・古い / 読めない・ページの分だけ索引で引く・Company DB の権限は広げない
  * 使い方: node scripts/test-master-edit.mjs
  */
 import assert from 'node:assert/strict';
@@ -1854,6 +1856,116 @@ await ta('[16] FBA (JP) の在庫 (10/5): 読み元 = Company DB の在庫の日
   await createMasterEditRoles(pg, {});
   r = await call('GET', '/?kind=single');
   assert.equal(fbaCell(r.text, 's001'), '11', '流し直した = 読める');
+});
+
+await ta('[17] 売れた数 (10/5): 読み元 = 商品管理リストの公開の回 (発注アプリと同じ数)・いつまでの数か (前日まで)・FBA / FBA 以外・モール別・セットは構成品に入る (「—」)・商品管理リストに無い・古い / 読めない・ページの分だけ索引で引く・Company DB の権限は広げない', async () => {
+  const S = await import('../apps/master-edit/sales-qty.mjs');
+  const { default: Database } = await import('better-sqlite3');
+  const salesTh = (html) => /id="th-sales">売れた 7日\/30日<span class="thsub">([^<]*)<\/span>/.exec(html)?.[1];
+  const salesCell = (html, code) => {
+    const tr = html.split('<tr>').find((x) => x.includes(`href="sku/${code}"`));
+    const tds = [...tr.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)].map((m) => m[1].replace(/<[^>]+>/g, '').trim());
+    return tds[10];   // 0 コード / … / 8 在庫 / 9 FBA (JP) / 10 売れた 7日/30日
+  };
+  // ① 写しが無い (warehouse-mirror.db を開いていない) = 「読めない」(一覧・単品とも画面は出る)
+  let r = await call('GET', '/?kind=single');
+  assert.equal(r.status, 200);
+  assert.equal(salesTh(r.text), '読めない');
+  assert.equal(salesCell(r.text, 's001'), '—');
+  assert.match((await call('GET', '/sku/s001')).text, /id="ref-sales-when">読めない \(販売数 \(商品管理リスト\) を読めません\)/);
+  // ② 写し (Render の warehouse-mirror.db と同じ表・索引の部分)。公開の回 pml_b (1/9 まで)・古い回 pml_a は読まない
+  const m = new Database(':memory:');
+  m.exec(`create table mirror_pml_published (id integer primary key check (id = 1), run_id text not null, status text not null, as_of_date text, src_velocity_as_of text, synced_at text not null);
+    create table mirror_pml_snapshot_rows (run_id text not null, 商品コード text not null, 販売数7日_FBA integer, 販売数7日_FBA以外 integer, 販売数7日_合計 integer,
+      販売数30日_FBA integer, 販売数30日_FBA以外 integer, 販売数30日_合計 integer, primary key (run_id, 商品コード));
+    create index idx_mpsr_run_code_norm on mirror_pml_snapshot_rows(run_id, LOWER(TRIM(商品コード)));
+    create table mirror_f_sales_velocity_by_product_mall (商品コード text not null, mall text not null, qty_7d integer not null default 0, qty_30d integer not null default 0, as_of_date text not null, synced_at text not null, primary key (商品コード, mall));
+    create table dim_mall (mall_key text primary key, label text not null, display_order integer not null);`);
+  const sql = [];
+  S.__setSalesMirrorProvider(() => ({ prepare: (t) => { sql.push(t); return m.prepare(t); } }));
+  try {
+    r = await call('GET', '/?kind=single');
+    assert.equal(salesTh(r.text), '読めない', '公開の回がまだ無い');
+    assert.match(r.text, /title="商品管理リスト \(販売数\) の写しがまだありません"/);
+    m.prepare(`insert into mirror_pml_published (id, run_id, status, as_of_date, src_velocity_as_of, synced_at) values (1, 'pml_b', 'ok', '2030-01-10', '2030-01-09', 'x')`).run();
+    const ins = m.prepare('insert into mirror_pml_snapshot_rows values (?, ?, ?, ?, ?, ?, ?, ?)');
+    ins.run('pml_a', 's001', 99, 99, 198, 99, 99, 198);   // 前の回 = 読まない
+    ins.run('pml_b', 'S001', 5, 7, 12, 20, 28, 48);        // 大文字 (NE のコードの書き方) でも当たる
+    ins.run('pml_b', ' s002 ', 0, 0, 0, 0, 0, 0);
+    ins.run('pml_b', 'set001', 0, 0, 0, 0, 0, 0);           // セットのコードには数が付かない (構成品に入る)
+    const mi = m.prepare('insert into mirror_f_sales_velocity_by_product_mall values (?, ?, ?, ?, ?, ?)');
+    mi.run('s001', 'amazon_fba', 5, 20, '2030-01-09', 'x'); mi.run('s001', 'rakuten', 4, 18, '2030-01-09', 'x'); mi.run('S001', 'wholesale', 3, 10, '2030-01-09', 'x');
+    for (const [k, l, o] of [['amazon_fba', 'Amazon FBA', 110], ['rakuten', '楽天', 20], ['wholesale', '卸', 130]]) m.prepare('insert into dim_mall values (?, ?, ?)').run(k, l, o);
+    sql.length = 0;
+    r = await call('GET', '/?kind=single');
+    assert.equal(salesTh(r.text), '1/9 まで', '見出しの下 = いつまでの数か (前日まで = 古くない)');
+    assert.match(r.text, /title="売れた数 \(7 日 \/ 30 日\) · 1\/9 \(水\) まで \(7 日 = 1\/3〜・30 日 = 12\/11〜・今日は入れない\) · 参考 · 商品管理リスト・発注アプリと同じ数/);
+    assert.match(r.text, /class="n ref" style="width:96px" title="売れた数/);
+    assert.equal(salesCell(r.text, 's001'), '12 / 48', '公開の回の 7 日 / 30 日の合計 (前の回 pml_a は読まない)');
+    assert.match(r.text, /title="7 日 12 \(FBA 5 · FBA 以外 7\) \/ 30 日 48 \(FBA 20 · FBA 以外 28\)"/);
+    assert.equal(salesCell(r.text, 's002'), '0 / 0', '商品管理リストにあって売れていない = 0');
+    assert.equal(salesCell(r.text, 's003'), '—', '商品管理リストに無い = 「—」(0 とは分ける)');
+    assert.match(r.text, /title="商品管理リストに無い商品 \(NE にまだ無いなど\)">—</);
+    {
+      // ページの分だけ引く: 公開の回を 1 回 + そのページの商品コードだけ (in の ? の数 = 行の数)・索引を使う
+      const hit = sql.filter((t) => /from mirror_pml_snapshot_rows/.test(t));
+      const rows = (r.text.match(/<a class="rowlink"/g) || []).length;
+      assert.equal(hit.length, 1);
+      assert.equal((hit[0].match(/\?/g) || []).length - 1, rows, 'このページの行の数だけ');
+      assert.equal(sql.filter((t) => /from mirror_pml_published/.test(t)).length, 1);
+      const plan = m.prepare(`explain query plan ${hit[0]}`).all('pml_b', ...Array.from({ length: rows }, (_, i) => `x${i}`)).map((x) => x.detail).join(' / ');
+      assert.match(plan, /USING INDEX idx_mpsr_run_code_norm/, plan);
+    }
+    r = await call('GET', '/?kind=set');
+    assert.equal(salesCell(r.text, 'set001'), '—');
+    assert.match(r.text, /title="セットで売れた分は構成品の数に入る \(商品管理リスト・発注アプリと同じ数え方\)">—</);
+    // 単品の画面: 7 日 / 30 日・いつまで・FBA / FBA 以外・モール別 (多い順・名前は dim_mall)・この商品を含むセットの分も入っている
+    let p = (await call('GET', '/sku/s001')).text;
+    assert.match(p, /<h2 id="h-ref">在庫・売れた数・注文残<\/h2>/);
+    assert.match(p, /id="ref-sales">12 \/ 48</);
+    assert.match(p, /id="ref-sales-asof" style="display:block">1\/9 \(水\) まで \(7 日 = 1\/3〜・30 日 = 12\/11〜・今日は入れない\) · 注文日・キャンセルを除く・全部のモール</);
+    const flat = (id) => new RegExp(`<table id="${id}">([\\s\\S]*?)<\\/table>`).exec(p)[1].replace(/\s*<[^>]+>\s*/g, '|').replace(/\|+/g, '|');
+    assert.equal(flat('ref-sales-parts'), '|売れた数の内訳|7 日|30 日|Amazon FBA|5|20|FBA 以外 (NE の受注)|7|28|');
+    assert.equal(flat('ref-sales-malls'), '|モール別|7 日|30 日|Amazon FBA|5|20|楽天|4|18|卸|3|10|');
+    assert.match(p, /id="ref-sales-sets">この商品を含むセット \d+ 件で売れた分も入っている \(セット経由の分だけは分けられない\)/);
+    assert.ok(!/id="ref-sales-malls-lag"/.test(p));
+    p = (await call('GET', '/sku/set001')).text;
+    assert.match(p, /id="ref-sales-set" style="display:block">セットで売れた分は構成品の数に入る/);
+    assert.ok(!/id="ref-sales-parts"/.test(p));
+    p = (await call('GET', '/sku/s003')).text;
+    assert.match(p, /id="ref-sales-missing" style="display:block">商品管理リストに無い商品/);
+    assert.ok(!/id="ref-sales-parts"/.test(p));
+    // モール別だけ前の朝のまま (FBA と NE が重なった朝は作り直さない) = モール別の日を出す
+    m.prepare(`update mirror_f_sales_velocity_by_product_mall set as_of_date = '2030-01-08'`).run();
+    p = (await call('GET', '/sku/s001')).text;
+    assert.match(p, /<th scope="col">モール別 \(1\/8 まで\)<\/th>/);
+    assert.match(p, /id="ref-sales-malls-lag">モール別は 1\/8 \(火\) までの数 \(合計とずれることがある\)/);
+    // 古い: 前日までになっていない (正午から。正午までは前々日まで待つ = 朝の取込の前)
+    m.prepare(`update mirror_pml_published set src_velocity_as_of = '2030-01-08'`).run();
+    r = await call('GET', '/?kind=single');
+    assert.equal(salesTh(r.text), '古い 1/8 まで');
+    assert.match(r.text, /class="n ref stale" style="width:96px"/);
+    assert.match(r.text, /\(前日までの数になっていない = 古い\)/);
+    assert.match((await call('GET', '/sku/s001')).text, /id="ref-sales-asof" style="display:block">古い · 1\/8 \(火\) まで/);
+    assert.equal(S.salesStale('2030-01-08', Date.parse('2030-01-10T02:59:59Z')), false, '1/10 11:59 = 朝の取込の再試行の間 = まだ古くない');
+    assert.equal(S.salesStale('2030-01-08', Date.parse('2030-01-10T03:00:00Z')), true, '1/10 12:00 = 古い');
+    assert.equal(S.salesStale('2030-01-07', Date.parse('2030-01-09T15:00:00Z')), true, '前々々日まで = 夜中でも古い');
+    assert.equal(S.salesStale('2030-01-09', Date.parse('2030-01-10T14:59:59Z')), false);
+    // 日付の無い回 = 読めない (いつまでの数か分からない数は出さない)
+    m.prepare(`update mirror_pml_published set src_velocity_as_of = null`).run();
+    r = await call('GET', '/?kind=single');
+    assert.equal(salesTh(r.text), '読めない'); assert.equal(salesCell(r.text, 's001'), '—');
+    // 表が無い (写しの作りが古い) = 読めない (例外にしない)
+    m.exec('drop table mirror_pml_snapshot_rows');
+    m.prepare(`update mirror_pml_published set src_velocity_as_of = '2030-01-09'`).run();
+    r = await call('GET', '/?kind=single');
+    assert.equal(r.status, 200); assert.equal(salesCell(r.text, 's001'), '—');
+    assert.match((await call('GET', '/sku/s001')).text, /id="ref-sales-when">読めない/);
+  } finally { S.__setSalesMirrorProvider(null); m.close(); }
+  // Company DB の権限は広げない (売れた数は Render の写しから読む): master_edit は mart の売上の日次・注文の表を読めない
+  for (const t of ['select 1 from mart.sales_daily limit 1', 'select 1 from mart.v_sales_daily limit 1', 'select 1 from core.orders limit 1', 'select 1 from core.order_lines limit 1']) {
+    assert.equal(await pgCode(asEditor(E0, () => pg.query(t))), '42501', t);
+  }
 });
 
 server.close();

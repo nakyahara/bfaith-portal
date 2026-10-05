@@ -11,6 +11,8 @@ import { normSku } from '../../lib/sku-norm.js';
 import { foldSearch, foldSql, likeOf } from './search-fold.mjs';
 import { backorderOf, backorderKeys, stockOf, buildableOf } from './extras.mjs';
 import { fbaAvailableOf } from './fba-stock.mjs';
+import { salesOfCodes } from './sales-qty.mjs';
+import { normProductCode } from '../purchase-orders/db.js';
 import { TOKEN_RE } from './search-token.mjs';
 import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
@@ -312,6 +314,8 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
   if (!compsOf) compsOf = await compsOfSets(pageIds.filter((id) => rowsById.get(id)?.sku_kind === 'set'));
   // FBA (日本) の販売可能 (このページの SKU だけ・Company DB の在庫の日次の最新の complete の日。読めなければ null = 「—」)
   const fbaMap = extras.fba && extras.fba.ok ? await fbaAvailableOf(db, extras.fba, pageIds) : null;
+  // 売れた数 (7 日・30 日。このページの商品コードだけ・商品管理リストの公開の回 = 発注アプリと同じ数。読めなければ null = 「—」)
+  const salesMap = extras.sales && extras.sales.ok ? await salesOfCodes(extras.sales, pageIds.map((id) => rowsById.get(id)?.code).filter(Boolean)) : null;
   const pageRows = pageIds.map((id) => rowsById.get(id)).filter(Boolean).map((r) => {
     const isSet = r.sku_kind === 'set';
     return {
@@ -333,6 +337,8 @@ export async function listSkus(db, filters, { now = new Date(), extras = {} } = 
       //   fba_row = その日のレポートに 1 × 1 の出品の行があるか (数とは別。画面は 0 に「出品なし」と添える)
       fba: fbaMap ? (fbaMap.get(r.sku_id) ?? 0) : null,
       fba_row: fbaMap ? fbaMap.has(r.sku_id) : null,
+      // 売れた数: { d7, d30, … } / { missing: true } = 商品管理リストに無い (NE にまだ無い商品など・0 とは分ける) / null = 読めない
+      sales: salesMap ? (salesMap.get(normProductCode(r.code)) || { missing: true }) : null,
     };
   });
   // ⚠ の印 (NE との差・CSV 待ち・構成の依頼) はこのページの分だけ
