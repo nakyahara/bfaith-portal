@@ -624,6 +624,7 @@ router.get('/inquiries/:id', (req, res) => {
       <div class="job-body-full">${he(body)}</div>
       ${attNames.length ? `<div class="sub">📎 ${he(attNames.join(' / '))} — <b>添付は付け直してください</b> (送信済みの実体は保持していません)</div>` : ''}
       ${canRestoreBody ? '<button class="ghost job-restore" type="button">↩ この内容を返信欄に戻す</button>' : ''}
+      <button class="ghost job-save-tpl" type="button">📄 この内容をテンプレに保存</button>
     </details>`;
   };
   const outboxHtml = outboxJobs.length ? `
@@ -668,6 +669,26 @@ router.get('/inquiries/:id', (req, res) => {
   // 楽天 R-Messe にも完了APIはあるが miniPC passthrough 未整備 → 追加時はここと adapter.completeInquiry)
   const mallCompleteSupported = inq.channel_type === 'yahoo';
 
+  // 📄 返信をテンプレに保存する小窓 (2026-10-05 スタッフ要望「よく使う回答をその場でテンプレ化したい」)。
+  // 作業の順 = ①グループを選ぶ → ②名前 → ③本文を見直す (お客様の名前・注文番号が残っていたら知らせる)
+  const saveTplDialog = `
+        <dialog id="saveTplDlg" class="save-tpl-dlg" aria-labelledby="stTitle">
+          <div class="st-head"><b id="stTitle">📄 テンプレに保存</b>
+            <button type="button" class="ghost st-x" id="stClose" aria-label="閉じる">✕</button></div>
+          <label class="st-label">① 保存するグループ
+            <select id="stCat" required><option value="">読み込み中…</option></select></label>
+          <input type="text" id="stCatNew" maxlength="200" placeholder="新しいグループの名前 (例: 成分・原材料について)" hidden>
+          <label class="st-label">② テンプレート名
+            <input type="text" id="stName" maxlength="200" placeholder="例: 成分の問い合わせ"></label>
+          <label class="st-label">③ 本文 <span class="sub">ここで直した内容がテンプレになります (返信欄はそのまま)</span>
+            <textarea id="stBody" rows="9"></textarea></label>
+          <div class="draft-warn" id="stWarn" hidden></div>
+          <div class="row st-ops">
+            <a class="sub" href="/apps/inquiry-hub/templates" target="_blank" rel="noopener">📄 テンプレート一覧を開く</a>
+            <button type="button" class="ghost" id="stCancel">キャンセル</button>
+            <button type="button" class="pri" id="stSave">💾 このグループに保存</button>
+          </div>
+        </dialog>`;
   const replyPanel = replyEditorEnabled() ? `
       <div class="panel">
         <h3>✉️ 返信を作成</h3>
@@ -700,6 +721,10 @@ router.get('/inquiries/:id', (req, res) => {
           <span class="sub">${he(ALLOWED_LABEL)}・1ファイル${Math.round(MAX_FILE_BYTES / 1048576)}MB・最大${MAX_FILES_PER_REPLY}つ</span>
         </div>
         <div id="attList"></div>` : ''}
+        <div class="row rw-row save-tpl-row">
+          <button class="ghost" type="button" id="saveTplBtn">📄 この回答をテンプレに保存</button>
+          <span class="sub">よく使う回答は、ここからそのままテンプレにできます</span>
+        </div>
         <div class="row" style="margin-top:8px; justify-content:flex-end; gap:8px">
           ${replyBlocked
             ? `<button class="pri" id="replyBtn" disabled title="返信不可のアドレスのため送信できません">🚫 このアドレスには送信できません</button>`
@@ -709,6 +734,7 @@ router.get('/inquiries/:id', (req, res) => {
           <button class="ghost" id="replyBtn" type="button" title="送信後は「返信処理中」になります">✉️ 送信</button>
           <button class="pri" id="replyCompleteBtn" type="button" title="${mallCompleteSupported ? '送信と同時にモール側も回答完了にします' : '送信後に完了にします'}">✅ 送信して${mallCompleteSupported ? '回答完了' : '完了'}</button>`}
         </div>`}
+        ${saveTplDialog}
       </div>` : `
       <div class="panel reply-note">${bouncedBanner}${blockedBanner}✉️ 返信機能はまだ有効になっていません (いまはメールディーラーから返信してください)。
         <span class="sub">管理者が env <code>INQUIRY_HUB_REPLY_EDITOR_ENABLED=true</code> を設定すると、この画面から返信できます</span></div>`;
@@ -1106,6 +1132,118 @@ router.get('/inquiries/:id', (req, res) => {
       toast('本文を返信欄に戻しました。添付があった場合は付け直してください');
     });
   });
+  // 📄 この回答をテンプレに保存 (2026-10-05 スタッフ要望)。返信欄の文面、または送信ジョブ履歴の本文を
+  // グループを選んでそのまま登録する。テンプレは他のお客様にも使うので、この問い合わせの
+  // お客様の名前・注文番号が残っていたら知らせる (止めはしない。直すかどうかは人が決める)
+  var stDlg = document.getElementById('saveTplDlg');
+  if (stDlg) (function() {
+    var ST_SEED = ${JSON.stringify({
+      inquiryId: inq.id,
+      subject: String(inq.subject || '').trim().slice(0, 60),
+      customerName: String(inq.customer_name || '').trim(),
+      orderNumber: String(inq.order_number || '').trim(),
+    }).replace(/</g, '\\u003c')};
+    var NEW_CAT = '__new__';
+    var cat = document.getElementById('stCat'), catNew = document.getElementById('stCatNew');
+    var nameEl = document.getElementById('stName'), bodyEl = document.getElementById('stBody');
+    var warn = document.getElementById('stWarn'), saveBtn = document.getElementById('stSave');
+    var known = [];   // いまあるテンプレ (同じグループに同じ名前があるか見る)
+    var lastCat = '';
+    try { lastCat = localStorage.getItem('ih.saveTpl.lastCat') || ''; } catch (e) { /* 使えなくてもよい */ }
+    function fillCats(cats, tpls) {
+      var order = (cats || []).slice();
+      (tpls || []).forEach(function(t) { if (t.category && order.indexOf(t.category) < 0) order.push(t.category); });
+      var cur = cat.value;
+      cat.textContent = '';
+      var head = document.createElement('option');
+      head.value = ''; head.textContent = 'グループを選んでください';
+      cat.appendChild(head);
+      order.forEach(function(c) {
+        var o = document.createElement('option');
+        o.value = c; o.textContent = c;
+        cat.appendChild(o);
+      });
+      var add = document.createElement('option');
+      add.value = NEW_CAT; add.textContent = '＋ 新しいグループを作る…';
+      cat.appendChild(add);
+      cat.value = cur || (order.indexOf(lastCat) >= 0 ? lastCat : '');
+      if (cat.selectedIndex < 0) cat.value = '';
+      syncNewCat();
+    }
+    function load() {
+      return fetch('/apps/inquiry-hub/api/templates')
+        .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function(j) { known = j.templates || []; fillCats(j.categories, known); })
+        .catch(function(e) { fillCats([], []); toast('グループの読み込みに失敗しました: ' + e.message); });
+    }
+    function syncNewCat() {
+      catNew.hidden = cat.value !== NEW_CAT;
+    }
+    // お客様ごとの情報が残っていないか (姓だけ「山田様」と書くことが多いので、名前の最初の語も見る)
+    function checkPersonal() {
+      var text = bodyEl.value, hits = [];
+      var nm = ST_SEED.customerName;
+      if (nm) {
+        var first = nm.split(/[\\s\\u3000]+/)[0];
+        if (text.indexOf(nm) >= 0) hits.push('お客様の名前「' + nm + '」');
+        else if (first && first.length >= 2 && text.indexOf(first) >= 0) hits.push('お客様の名前「' + first + '」');
+      }
+      if (ST_SEED.orderNumber && text.indexOf(ST_SEED.orderNumber) >= 0) hits.push('注文番号「' + ST_SEED.orderNumber + '」');
+      warn.hidden = !hits.length;
+      warn.textContent = hits.length
+        ? '⚠️ ' + hits.join('・') + ' が入っています。ほかのお客様にも使うなら、消すか「○○様」などに置き換えてください'
+        : '';
+    }
+    function openDlg(text) {
+      if (!String(text || '').trim()) { toast('本文が空です。返信を書いてから保存してください'); return; }
+      bodyEl.value = text;
+      nameEl.value = ST_SEED.subject;
+      catNew.value = '';
+      saveBtn.disabled = false;
+      checkPersonal();
+      load();
+      if (typeof stDlg.showModal === 'function') stDlg.showModal(); else stDlg.setAttribute('open', '');
+      cat.focus();
+    }
+    function closeDlg() { if (typeof stDlg.close === 'function') stDlg.close(); else stDlg.removeAttribute('open'); }
+    var stBtn = document.getElementById('saveTplBtn');
+    if (stBtn) stBtn.addEventListener('click', function() {
+      var ta = document.getElementById('replyBody');
+      openDlg(ta ? ta.value : '');
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('.job-save-tpl'), function(btn) {
+      btn.addEventListener('click', function() {
+        var full = btn.parentElement && btn.parentElement.querySelector('.job-body-full');
+        openDlg(full ? full.textContent : '');
+      });
+    });
+    cat.addEventListener('change', function() { syncNewCat(); if (cat.value === NEW_CAT) catNew.focus(); });
+    bodyEl.addEventListener('input', checkPersonal);
+    document.getElementById('stCancel').addEventListener('click', closeDlg);
+    document.getElementById('stClose').addEventListener('click', closeDlg);
+    saveBtn.addEventListener('click', function() {
+      var group = cat.value === NEW_CAT ? catNew.value.trim() : cat.value;
+      var name = nameEl.value.trim();
+      if (!group) { toast(cat.value === NEW_CAT ? '新しいグループの名前を入れてください' : '保存するグループを選んでください'); (cat.value === NEW_CAT ? catNew : cat).focus(); return; }
+      if (!name) { toast('テンプレート名を入れてください'); nameEl.focus(); return; }
+      if (!bodyEl.value.trim()) { toast('本文が空です'); bodyEl.focus(); return; }
+      var dup = known.some(function(t) { return t.name === name && (t.category || '') === group; });
+      if (dup && !confirm('「' + group + '」には同じ名前「' + name + '」のテンプレートがもうあります。\\n別のテンプレートとして追加しますか?')) return;
+      saveBtn.disabled = true;
+      fetch('/apps/inquiry-hub/api/templates', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ template_name: name, category: group, template_body: bodyEl.value,
+          notes: '問い合わせ #' + ST_SEED.inquiryId + ' の返信から登録' }),
+      }).then(function(r) {
+        return r.json().catch(function() { return {}; }).then(function(j) { if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; });
+      }).then(function() {
+        try { localStorage.setItem('ih.saveTpl.lastCat', group); } catch (e) { /* 使えなくてもよい */ }
+        closeDlg();
+        if (window.ihResetTplCache) window.ihResetTplCache();
+        toast('「' + group + '」に「' + name + '」を登録しました');
+      }).catch(function(e) { saveBtn.disabled = false; toast('保存に失敗しました: ' + e.message); });
+    });
+  })();
   // 📧 今後の自動処理 (メールルール作成。複数条件を組み合わせられる)
   var mrBtn = document.getElementById('mrBtn');
   if (mrBtn) {
@@ -1214,6 +1352,8 @@ router.get('/inquiries/:id', (req, res) => {
     var tplSel = document.getElementById('tplSel');
     var tplSearch = document.getElementById('tplSearch');
     var TPLS = null, CATS = [], tplLoading = null;
+    // 「テンプレに保存」した直後に一覧を取り直す (保存したものがすぐ選べるように)
+    window.ihResetTplCache = function() { tplLoading = null; loadTpls(); };
     function loadTpls() {
       if (tplLoading) return tplLoading;
       tplLoading = fetch('/apps/inquiry-hub/api/templates')
@@ -2863,9 +3003,10 @@ function tplFields(body, res) {
 
 router.post('/api/templates', (req, res) => {
   const f = tplFields(req.body, res); if (!f) return;
-  getDB().prepare(`INSERT INTO reply_templates (template_name, category, subject, keywords, template_body, body_bottom, notes)
+  const r = getDB().prepare(`INSERT INTO reply_templates (template_name, category, subject, keywords, template_body, body_bottom, notes)
     VALUES (@template_name, @category, @subject, @keywords, @template_body, @body_bottom, @notes)`).run(f);
-  res.json({ ok: true });
+  console.log(`[inquiry-hub] テンプレート追加「${f.template_name}」(グループ: ${f.category || 'なし'}) by ${actorOf(req)}`);
+  res.json({ ok: true, id: Number(r.lastInsertRowid) });
 });
 
 router.post('/api/templates/:id(\\d+)', (req, res) => {
@@ -5427,6 +5568,24 @@ figure.att-img.att-err .att-fail { display: block; }
   border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 10px; margin: 6px 0;
   font-size: 13px; max-height: 340px; overflow-y: auto; }
 .job-restore { margin-bottom: 4px; }
+.job-save-tpl { margin-bottom: 4px; }
+/* 📄 返信をテンプレに保存 (2026-10-05) */
+.save-tpl-row .sub { margin-left: 2px; }
+.save-tpl-dlg { width: min(560px, calc(100vw - 32px)); max-height: calc(100vh - 48px); border: none; border-radius: 14px;
+  padding: 16px 18px; box-shadow: 0 20px 50px rgba(15,23,42,.35); color: #0f172a; }
+.save-tpl-dlg::backdrop { background: rgba(15,23,42,.45); }
+.save-tpl-dlg .st-head { display: flex; align-items: center; margin-bottom: 10px; font-size: 15px; }
+.save-tpl-dlg .st-x { margin-left: auto; padding: 2px 10px; }
+.save-tpl-dlg .st-label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 10px; }
+.save-tpl-dlg .st-label .sub { font-weight: 400; }
+.save-tpl-dlg select, .save-tpl-dlg input[type=text], .save-tpl-dlg textarea { display: block; width: 100%; margin-top: 4px;
+  padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; font-family: inherit; font-weight: 400; }
+.save-tpl-dlg #stCatNew { margin: -4px 0 10px; }
+.save-tpl-dlg [hidden] { display: none !important; }
+.save-tpl-dlg textarea { resize: vertical; line-height: 1.6; }
+.save-tpl-dlg .st-ops { gap: 8px; align-items: center; margin-top: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.save-tpl-dlg .st-ops a { margin-right: auto; }
+.save-tpl-dlg .st-ops button { white-space: nowrap; }
 /* AI書き換えボタン行 */
 .rw-row { margin-top: 6px; flex-wrap: wrap; align-items: center; }
 .rw-row .rw-btn { margin: 0; }
