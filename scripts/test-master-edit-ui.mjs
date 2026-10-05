@@ -498,6 +498,8 @@ const SHOTDIR = process.env.MASTER_EDIT_UI_SHOTS || '';
 for (const [label, vp] of [['1440', { width: 1440, height: 900 }], ['1280', { width: 1280, height: 720 }], ['1024', { width: 1024, height: 768 }]]) {
   await ta(`[17] ${label} 幅: 一覧をスクロールしても見出しの行 (コード・名前・…) が上の帯のすぐ下に見えている・横に送っても列がずれない (10/5)`, async (p) => {
     await p.goto(B + '/');
+    // 画面の出だしの動き (.page の rise) が終わってから測る (動きの途中は数 px 動く)
+    await p.waitForFunction(() => document.querySelector('.page').getAnimations().every((a) => a.playState !== 'running'));
     if (SHOTDIR) await p.screenshot({ path: `${SHOTDIR}/一覧_${label}_上.png` });
     const pos = () => p.evaluate(() => {
       const th = document.querySelector('#list-tbl thead th'); const r = th.getBoundingClientRect();

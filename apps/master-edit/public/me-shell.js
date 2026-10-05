@@ -342,6 +342,8 @@
     var askHead = function () { if (!headTick) { headTick = true; requestAnimationFrame(placeHead); } };
     window.addEventListener('scroll', askHead, { passive: true });
     window.addEventListener('resize', askHead);
+    // 画面の出だしの動き (.page の rise = 4px 上がる) が終わった後もそろえ直す (動きの途中に測ると数 px ずれたまま残る)
+    document.addEventListener('animationend', askHead, true);
     placeHead();
   }
 
