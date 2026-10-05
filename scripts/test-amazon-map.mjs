@@ -838,10 +838,25 @@ async function call(method, url, { body, session = 'editor', origin = true } = {
   let j = null; try { j = JSON.parse(text); } catch { /* HTML */ }
   return { status: r.status, j, text, headers: r.headers };
 }
-function checkScripts(html, expected) {
-  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((x) => x[1]);
-  assert.equal(scripts.length, expected, `<script> の数 ${scripts.length}`);
-  for (const s of scripts) { new vm.Script(s); assert.ok(!/<%|%>/.test(s), 'EJS のタグが JS に残っている'); }
+/**
+ * 画面の JS が文法として読めること・EJS の出力が JS に混ざっていないこと。
+ * マスタの入力の画面は JS を public/ のファイルに分けた (第 2 段 10/5) = <script src> は中身を HTTP で取ってきて同じに確かめ、返す (インラインの後ろに並べる)
+ */
+async function checkScripts(html, expected) {
+  const all = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
+  assert.equal([...html.matchAll(/<script\b/gi)].length, all.length, 'script の開きと閉じの数が合わない');
+  for (const m of all.filter((x) => /type="application\/json"/.test(x[1]))) JSON.parse(m[2]);   // 画面の JS に渡す値
+  const scripts = all.filter((m) => !/\bsrc=/.test(m[1]) && !/type="application\/json"/.test(m[1])).map((m) => m[2]);
+  if (expected != null) assert.equal(scripts.length, expected, `<script> の数 ${scripts.length}`);
+  const files = [];
+  for (const m of all.filter((x) => /\bsrc="\/apps\/master-edit\/public\//.test(x[1]))) {
+    const src = /\bsrc="([^"]+)"/.exec(m[1])[1];
+    const r = await fetch(ORIGIN + src.replace(/&amp;/g, '&'), { headers: { 'x-test-session': 'editor' } });
+    assert.equal(r.status, 200, src);
+    files.push(await r.text());
+  }
+  for (const x of [...scripts, ...files]) { new vm.Script(x); assert.ok(!/<%|%>/.test(x), 'EJS のタグが JS に残っている'); }
+  return [...scripts, ...files];
 }
 const decode = (s) => s.replace(/&#34;/g, '"').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
 
@@ -849,7 +864,7 @@ await ta('[12] 一覧・1 つ・変更の記録・つかいかた・末尾の / 
   const bare = await fetch(`${BASE}/amazon`, { headers: { 'x-test-session': 'editor' }, redirect: 'manual' });
   assert.equal(bare.status, 301); assert.equal(bare.headers.get('location'), '/apps/master-edit/amazon/');
   let r = await call('GET', '/amazon/');
-  assert.equal(r.status, 200); checkScripts(r.text, 0);
+  assert.equal(r.status, 200); await checkScripts(r.text, 0);
   assert.ok(r.text.includes('sku?sku=pr_a001') && r.text.includes('sku?sku=a004') && r.text.includes('削除済み (墓標)'));
   assert.ok(!r.text.includes('いまは保存できません'));
   r = await call('GET', '/amazon/?state=deleted');
@@ -857,7 +872,9 @@ await ta('[12] 一覧・1 つ・変更の記録・つかいかた・末尾の / 
   r = await call('GET', '/amazon/?q=a006');   // NE コードでも探せる (pr_new1 は無い = この DB では無し)
   assert.equal(r.status, 200);
   r = await call('GET', '/amazon/sku?sku=PR_A001');
-  assert.equal(r.status, 200); checkScripts(r.text, 1);
+  assert.equal(r.status, 200);
+  const amzJs = (await checkScripts(r.text, 0)).find((x) => x.includes('me-amazon.js — Amazon SKU の対応')) || '';
+  for (const api of ["'/api/amazon/save'", "'/api/amazon/delete'", "'/api/lookup?code='"]) assert.ok(amzJs.includes(api), `画面が ${api} を呼んでいない`);
   assert.ok(r.text.includes('pr_a001') && r.text.includes('FBA') && r.text.includes('対応を直す'));
   const versions = JSON.parse(decode(/data-versions="([^"]*)"/.exec(r.text)[1]));
   assert.deepEqual(versions, await versionsOf('pr_a001'));
@@ -925,7 +942,7 @@ await ta('[12] 未登録 (M11): 直近 7 日の Amazon の注文で構成が無�
   await order('2030-01-10', [[null, 'zz_cancel', 2, 2], [null, 'zz_sold', 3, 1]]);
   await order('2030-01-10', [[null, 'zz_hdr', 1]], { cancelled: true });
   let r = await call('GET', '/amazon/unmapped');
-  assert.equal(r.status, 200); checkScripts(r.text, 0);
+  assert.equal(r.status, 200); await checkScripts(r.text, 0);
   assert.ok(r.text.includes('未判定'));   // 売上の日次が公開されていない
   assert.ok(r.text.includes('zz_sold') && !r.text.includes('zz_fbm') && !r.text.includes('zz_old'));
   r = await call('GET', '/amazon/unmapped?channel=FBM');

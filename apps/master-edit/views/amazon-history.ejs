@@ -6,39 +6,85 @@
 <body>
   <%- include('_header') %>
   <%
+    // Amazon SKU の変更の記録 (新しいデザイン・第 2 段 10/5): 対応・構成・出品の変更を、保存 1 回 = 1 枚 (同じ取引 = 同じ時刻・同じ人・同じ理由) で・日本時間で
     const ENT = { amazon_sku_map: '対応', listing_component: '構成', listing: '出品' };
-    const OP = { INSERT: '追加', UPDATE: '変更', DELETE: '削除' };
+    const OP = { INSERT: 'を足した', UPDATE: 'を変えた', DELETE: 'を外した' };
     const WHO = { portal_amazon_map: 'マスタの入力 (Amazon SKU)', amazon_map_migration: '切替の日の移行', company_db_load: '夜間ロード', sql: 'SQL' };
-    const val = (v) => (v === null || v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v));
+    const ATTR = { name: '名前', state: '状態', qty: '数', sort_order: '並び', title: 'タイトル', status: '出品の状態', resolution: 'どこから', listing_code: '出品のコード',
+      deleted_reason: '削除の理由', deleted_at: '削除した時刻', deleted_by: '削除した人', changed_by: '変えた人', registered_by: '登録した人' };
+    const HIDE = new Set(['version', 'updated_at', 'changed_at', 'registered_at', 'listing_norm', 'row_hash']);
+    const STATE = Object.assign({}, MAP_STATES);
+    const one = (k, v) => (k === 'state' ? (STATE[v] || v) : /_at$/.test(k) ? ui.fmtJst(v, { nowMs }) : v);
+    // 値を人の言葉に (オブジェクト = 分かる項目だけ「名前 = 値」で)
+    const show = (v, attr) => {
+      if (v === null || v === undefined || v === '') return '';
+      if (typeof v !== 'object') return String(attr ? one(attr, v) : v);
+      if (Object.prototype.hasOwnProperty.call(v, 'value') && Object.keys(v).length === 1) return show(v.value, attr);
+      const parts = Object.entries(v).filter(([k, x]) => !HIDE.has(k) && x !== null && x !== '' && typeof x !== 'object' && (ATTR[k] || k === 'seller_sku'))
+        .map(([k, x]) => (ATTR[k] || k) + ' ' + one(k, x));
+      return parts.join(' · ');
+    };
+    const groups = [];
+    if (h) {
+      for (const e of h.events) {
+        if (e.operation === 'UPDATE' && HIDE.has(String(e.attribute || ''))) continue;
+        const key = [e.recorded_at, e.actor_type, e.actor_id, e.source_system, e.reason_text].join('|');
+        const what = (ENT[e.entity_type] || e.entity_type) + (e.operation === 'UPDATE' && e.attribute ? ' の ' + (ATTR[e.attribute] || e.attribute) : (OP[e.operation] || e.operation));
+        const line = { what, from: e.operation === 'INSERT' ? '' : show(e.old_value, e.attribute), to: e.operation === 'DELETE' ? '(なし)' : show(e.new_value, e.attribute) };
+        const g = groups.length && groups[groups.length - 1].key === key ? groups[groups.length - 1] : null;
+        if (g) { g.lines.push(line); continue; }
+        const when = ui.fmtJst(e.recorded_at, { nowMs });
+        const m = /^(.*\S) (\d{2}:\d{2})$/.exec(when);
+        const load = e.source_system === 'company_db_load' || (e.actor_type !== 'human' && !e.actor_id);
+        groups.push({ key, e, day: m ? m[1] : when, time: m ? m[2] : '', who: load ? 'load' : 'human', lines: [line] });
+      }
+    }
+    const nHuman = groups.filter((g) => g.who === 'human').length;
+    const nLoad = groups.length - nHuman;
+    let lastDay = null;
+    const title = h ? (h.cur.map ? h.cur.map.name : (h.cur.listing.title || '')) : '';
   %>
-  <div class="me-wrap">
-    <p class="muted" style="font-size: 0.85em;"><a href="<%= base %>/amazon/">← Amazon SKU の一覧へ</a> ・ <a href="<%= base %>/amazon/sku?sku=<%= encodeURIComponent(sku) %>">← <%= sku %> へ</a></p>
-    <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
+  <div class="page" id="history-page">
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/amazon/" data-list-back>Amazon SKU</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><a class="mono" href="<%= base %>/amazon/sku?sku=<%= encodeURIComponent(sku) %>"><%= sku %></a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">変更の記録</span></nav>
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
     <% if (h) { %>
-    <h2 style="font-size: 1.1em;"><%= sku %> の変更の記録 <span class="muted" style="font-size: 0.8em;"><%= h.cur.map ? h.cur.map.name : (h.cur.listing.title || '') %></span></h2>
-    <p class="muted" style="font-size: 0.85em;">新しい順に 200 件まで。対応・構成 (NE コードは SKU の番号)・出品の変更を、DB のトリガーが同じ取引で残しています。</p>
-    <div class="tbox">
-      <table class="me">
-        <thead><tr><th>時刻</th><th>対象</th><th>操作</th><th>項目</th><th>前</th><th>後</th><th>誰が</th><th>どこから</th><th>理由</th></tr></thead>
-        <tbody>
-          <% if (!h.events.length) { %><tr><td colspan="9" class="muted">記録はまだありません</td></tr><% } %>
-          <% for (const e of h.events) { %>
-          <tr>
-            <td style="white-space: nowrap;"><%= String(e.recorded_at).slice(0, 19) %></td>
-            <td><%= ENT[e.entity_type] || e.entity_type %></td>
-            <td><%= OP[e.operation] || e.operation %></td>
-            <td><%= e.attribute || '' %></td>
-            <td style="max-width: 260px; word-break: break-all;"><%= val(e.old_value) %></td>
-            <td style="max-width: 260px; word-break: break-all;"><%= val(e.new_value) %></td>
-            <td><%= e.actor_id || e.actor_type %></td>
-            <td><%= WHO[e.source_system] || e.source_system %></td>
-            <td><%= e.reason_text || '' %></td>
-          </tr>
+    <div class="ph">
+      <div>
+        <div class="idrow"><span class="code-pill"><%= sku %></span></div>
+        <h1>変更の記録 <span class="muted" style="font-size:17px;font-weight:500"><%= title %></span></h1>
+        <div class="lead">対応・構成 (NE の商品 × 数)・出品の変更。保存 1 回が 1 枚のカードです。時刻はすべて日本時間。新しい順に 200 件まで (DB のトリガーが同じ取引で残しています)。</div>
+      </div>
+      <div class="ph-actions"><a class="btn" href="<%= base %>/amazon/sku?sku=<%= encodeURIComponent(sku) %>"><svg class="ic" aria-hidden="true"><use href="#i-cart"/></svg>この SKU の画面へ</a></div>
+    </div>
+    <% if (groups.length) { %>
+    <div class="panel" style="padding:14px 18px">
+      <div class="chips" role="group" aria-label="見るもの" id="hist-filter">
+        <span class="chip-lab" aria-hidden="true">見るもの</span>
+        <button class="chip" type="button" data-hf="" aria-pressed="true">すべて <span class="n"><%= groups.length %></span></button>
+        <button class="chip" type="button" data-hf="human" aria-pressed="false"<%= nHuman ? '' : ' disabled' %>><svg class="ic s" aria-hidden="true"><use href="#i-user"/></svg>人の変更 <span class="n"><%= nHuman %></span></button>
+        <button class="chip" type="button" data-hf="load" aria-pressed="false"<%= nLoad ? '' : ' disabled' %>><svg class="ic s" aria-hidden="true"><use href="#i-moon"/></svg>夜間ロード・移行など <span class="n"><%= nLoad %></span></button>
+      </div>
+    </div>
+    <% } %>
+    <div class="sr" id="hist-status" role="status" aria-live="polite"></div>
+    <div id="hist-cards">
+    <% if (!groups.length) { %><div class="empty">記録はまだありません</div><% } %>
+    <% for (const g of groups) { %>
+      <% if (g.day !== lastDay) { lastDay = g.day; %><div class="daygrp" data-day><%= g.day %></div><% } %>
+      <article class="hcard<%= g.who === 'load' ? ' load' : '' %>" data-who="<%= g.who %>">
+        <div class="hh"><span class="time"><%= g.time %></span><span class="who"><%= g.e.actor_id || g.e.actor_type %></span><span class="b mute"><%= WHO[g.e.source_system] || g.e.source_system %></span><% if (g.lines.length > 1) { %><span class="muted" style="font-size:13px"><%= g.lines.length %> 項目</span><% } %></div>
+        <% if (g.e.reason_text) { %><div class="why">理由 <q><%= g.e.reason_text %></q></div><% } %>
+        <ul class="hchanges">
+          <% for (const x of g.lines) { %>
+          <li><span class="what"><%= x.what %></span><span class="ch"><% if (x.from) { %><span class="from"><%= x.from %></span><span class="arrow" aria-label="から">→</span><% } %><span class="to"><%= x.to || '—' %></span></span></li>
           <% } %>
-        </tbody>
-      </table>
+        </ul>
+      </article>
+    <% } %>
     </div>
     <% } %>
   </div>
+  <%- include('_footer') %>
+  <% if (h) { %><script src="<%= base %>/public/me-history.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>

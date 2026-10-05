@@ -97,16 +97,23 @@
    * 画面を読み直す (保存が通った後。未保存は 0 にしてから呼ぶ)。離れるときの確認は出さない。
    * 戻るの見張りで足した履歴 (armBackGuard) があれば先に 1 つ戻してから読み直す = 読み直した後の「戻る」1 回で前の画面へ (同じ画面が 2 つ並ばない)
    */
-  ME.reloadPage = function () {
+  function afterSave(url) {
     leaving = true;
-    if (!backArmed) { location.reload(); return; }
+    var fin0 = function () { if (url) location.replace(url); else location.reload(); };
+    if (!backArmed) { fin0(); return; }
     backArmed = false;
     var done = false;
-    var fin = function () { if (done) return; done = true; location.reload(); };
+    var fin = function () { if (done) return; done = true; fin0(); };
     window.addEventListener('popstate', fin);
     setTimeout(fin, 500);   // popstate が来ない (履歴が違う) ときもそのまま読み直す
     history.back();
-  };
+  }
+  ME.reloadPage = function () { afterSave(null); };
+  /**
+   * 保存が通った後に別の画面へ (新商品の登録 → できた商品の画面)。今の画面の履歴を置き換える = 戻る 1 回で前の画面 (入力の途中の画面へは戻らない)。
+   * 離れるときの確認は出さない (未保存は 0 にしてから呼ぶ)
+   */
+  ME.replacePage = function (url) { afterSave(String(url)); };
   var stay = $('#leave-stay'), drop = $('#leave-drop'), rev = $('#leave-review');
   if (stay) stay.addEventListener('click', function () { closeLeave(true); });
   if (drop) drop.addEventListener('click', function () { closeLeave(false); go(pendingGo); });
@@ -291,12 +298,14 @@
   });
 
   /* ---------- 一覧に戻る: 最後に見た一覧 (絞り込み・ページ) を覚え、1 つの商品の画面のパンくず「商品・セット」をそこへ向ける ---------- */
+  // 一覧ごとに覚える (商品・セットの一覧と Amazon SKU の一覧で上書きし合わない。第 2 段 10/5)
   var LIST_KEY = 'master-edit:list-url';
-  if ($('#list-tbl')) { try { sessionStorage.setItem(LIST_KEY, location.pathname + location.search); } catch (err) { /* 覚えられない = いつもの一覧へ */ } }
+  var listKeyOf = function (p) { return p === (BASE || '') + '/' ? LIST_KEY : LIST_KEY + ':' + p; };
+  if ($('#list-tbl')) { try { sessionStorage.setItem(listKeyOf(location.pathname), location.pathname + location.search); } catch (err) { /* 覚えられない = いつもの一覧へ */ } }
   var back = $('a[data-list-back]');
   if (back) {
     try {
-      var last = sessionStorage.getItem(LIST_KEY), basePath = back.pathname;
+      var basePath = back.pathname, last = sessionStorage.getItem(listKeyOf(basePath));
       // 同じ一覧 (同じ path) の絞り込みだけ使う (よその URL へは向けない)
       if (last && last.split('?')[0] === basePath && last.indexOf('?') > 0) back.setAttribute('href', last);
     } catch (err) { /* そのまま */ }

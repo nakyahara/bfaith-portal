@@ -1358,13 +1358,25 @@ async function call(method, url, { body, session = 'boss@test', origin = true } 
   let j = null; try { j = JSON.parse(text); } catch { /* HTML / CSV */ }
   return { status: r.status, j, text, buf, headers: r.headers };
 }
-function checkScripts(html, expected) {
-  for (const m of [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].filter((x) => /type="application\/json"/.test(x[1]))) JSON.parse(m[2]);   // 画面の JS に渡す値
-  const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].filter((m) => !/\bsrc=/.test(m[1]) && !/type="application\/json"/.test(m[1])).map((m) => m[2]);
-  assert.equal([...html.matchAll(/<script\b/gi)].length, [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].length);
-  if (expected != null) assert.equal(scripts.length, expected);
-  for (const s of scripts) { new vm.Script(s); assert.ok(!/<%|%>/.test(s), 'EJS のタグが JS に残っている'); }
-  return scripts;
+/**
+ * 画面の JS が文法として読めること・EJS の出力が JS に混ざっていないこと。
+ * マスタの入力の画面は JS を public/ のファイルに分けた (第 2 段 10/5) = <script src> は中身を HTTP で取ってきて同じに確かめ、返す (インラインの後ろに並べる)
+ */
+async function checkScripts(html, expected) {
+  const all = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
+  assert.equal([...html.matchAll(/<script\b/gi)].length, all.length, 'script の開きと閉じの数が合わない');
+  for (const m of all.filter((x) => /type="application\/json"/.test(x[1]))) JSON.parse(m[2]);   // 画面の JS に渡す値
+  const scripts = all.filter((m) => !/\bsrc=/.test(m[1]) && !/type="application\/json"/.test(m[1])).map((m) => m[2]);
+  if (expected != null) assert.equal(scripts.length, expected, `<script> の数 ${scripts.length}`);
+  const files = [];
+  for (const m of all.filter((x) => /\bsrc="\/apps\/master-edit\/public\//.test(x[1]))) {
+    const src = /\bsrc="([^"]+)"/.exec(m[1])[1];
+    const r = await fetch(ORIGIN + src.replace(/&amp;/g, '&'), { headers: { 'x-test-session': 'editor' } });
+    assert.equal(r.status, 200, src);
+    files.push(await r.text());
+  }
+  for (const x of [...scripts, ...files]) { new vm.Script(x); assert.ok(!/<%|%>/.test(x), 'EJS のタグが JS に残っている'); }
+  return [...scripts, ...files];
 }
 
 try {
@@ -1372,8 +1384,9 @@ try {
     await reg('single', 'new-web', single({ name: 'WEB' }));
     let r = await call('GET', '/apps/master-edit/reg-csv');
     assert.equal(r.status, 200, r.text.slice(0, 300));
-    const sc = checkScripts(r.text, 1);
-    for (const api of ["'/api/reg-csv/exports'", "'/api/reg-csv/verified'", "'/declare'", "'/supersede'", "'/issue'", "'/file'"]) assert.ok(sc[0].includes(api), `画面が ${api} を呼んでいない`);
+    const sc = await checkScripts(r.text, 0);
+    const rcJs = sc.find((x) => x.includes('me-regcsv.js — NE 登録の CSV の画面')) || '';
+    for (const api of ["'/api/reg-csv/exports'", "'/api/reg-csv/verified'", "'/declare'", "'/supersede'", "'/issue'", "'/file'"]) assert.ok(rcJs.includes(api), `画面が ${api} を呼んでいない`);
     assert.match(r.text, /new-web/); assert.match(r.text, /NE にもうある/); assert.match(r.text, /試し用/);
     assert.match(r.text, /value="new-web"(?![^>]*disabled)/);
     r = await call('GET', '/apps/master-edit/reg-csv', { session: 'naka@test' });
@@ -1397,7 +1410,7 @@ try {
     const sha = crypto.createHash('sha256').update(f.buf).digest('hex');
     assert.equal(f.headers.get('x-content-sha256'), sha);
     let page = await call('GET', '/apps/master-edit/sku/new-web', { session: 'naka@test' });
-    checkScripts(page.text);
+    await checkScripts(page.text);
     assert.match(page.text, /NE 登録の CSV/); assert.match(page.text, /鍵がかかっています/);
     // 配った後 = NE に送る欄 (名前・売価・原価・税率・仕入先・取扱区分・代表・JAN) は入力欄にしない (🔒 の値・保存しても 409 reg_csv_issued)
     for (const f of ['name', 'standard_price', 'tax_rate', 'primary_supplier', 'handling', 'parent_code', 'jan', 'cost']) assert.ok(!new RegExp(`data-field="${f}"`).test(page.text), `配った後の ${f} は入力欄にしない`);
@@ -1409,7 +1422,7 @@ try {
     const bad = await call('POST', `/apps/master-edit/api/reg-csv/exports/${id}/declare`, { body: { sha256: 'a'.repeat(64), result: 'ok' } });
     assert.deepEqual([bad.status, bad.j.reason], [409, 'sha256_mismatch']);
     page = await call('GET', '/apps/master-edit/new?kind=single', { session: 'naka@test' });
-    checkScripts(page.text, 1);
+    await checkScripts(page.text, 0);
     assert.ok(!/data-field="jan"/.test(page.text), '新商品の登録の画面に JAN の欄は無い (登録の後に商品の画面で)');
     assert.ok(!/0012 テスト商事/.test(page.text), '取引停止の仕入先は選べない');
   });
