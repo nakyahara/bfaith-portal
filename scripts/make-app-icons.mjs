@@ -4,7 +4,8 @@
  * 背景: ピッキング・梱包・入荷受付チェックが全部 /favicon.png を使っていたため、
  *       ホーム画面に3つ並べると同じアイコンになって現場が押し間違える (中原さん 2026-09-01)。
  *
- * 実行: node scripts/make-app-icons.mjs
+ * 実行: node scripts/make-app-icons.mjs            (全部)
+ *       node scripts/make-app-icons.mjs inquiry-hub (指定したものだけ。ほかの PNG を作り直して差分を出さない)
  * 出力: public/app-icons/<slug>-180.png (Apple touch icon) と -192/-512.png (PWA manifest)
  *
  * 依存は sharp のみ (既に package.json にある)。SVG を組み立ててラスタライズする。
@@ -89,6 +90,19 @@ const APPS = [
             stroke-linecap="round" opacity="0.85"/>
       <path d="M256 424 L296 386" stroke="#fff" stroke-width="16" stroke-linecap="round"/>`,
   },
+  {
+    slug: 'inquiry-hub',
+    label: '問い合わせ管理',
+    bg: ['#7048e8', '#5f3dc4'],     // 紫 = 問い合わせ (倉庫系の青・橙・緑・ティール・茶と重ならない)
+    // 吹き出し + 「…」= お客様からのメッセージ。タブの 16px でも形が残るよう、白の大きな面 1 つにする
+    // (中原さん 2026-10-05「問い合わせのファビコン作って」)
+    art: `
+      <rect x="84" y="112" width="344" height="240" rx="72" fill="#fff"/>
+      <path d="M150 330 L124 420 L238 344 Z" fill="#fff"/>
+      <circle cx="176" cy="232" r="28" fill="#6741d9"/>
+      <circle cx="256" cy="232" r="28" fill="#6741d9"/>
+      <circle cx="336" cy="232" r="28" fill="#6741d9"/>`,
+  },
 ];
 
 const SIZES = [180, 192, 512];
@@ -105,8 +119,14 @@ function svg({ bg, art }) {
 </svg>`;
 }
 
+const only = process.argv.slice(2);
+const targets = only.length ? APPS.filter(a => only.includes(a.slug)) : APPS;
+if (only.length && targets.length !== only.length) {
+  console.error(`知らない slug があります: ${only.filter(s => !APPS.some(a => a.slug === s)).join(', ')}`);
+  process.exit(1);
+}
 fs.mkdirSync(OUT_DIR, { recursive: true });
-for (const app of APPS) {
+for (const app of targets) {
   const buf = Buffer.from(svg(app));
   for (const size of SIZES) {
     const out = path.join(OUT_DIR, `${app.slug}-${size}.png`);

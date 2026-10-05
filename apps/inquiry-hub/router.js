@@ -5900,6 +5900,8 @@ function pageShell(title, active, body, script, opts = {}) {
   </aside>`;
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="/app-icons/inquiry-hub-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/app-icons/inquiry-hub-180.png">
 <title>${he(title)}</title><style>${CSS}</style></head>
 <body>
 <header class="app">
