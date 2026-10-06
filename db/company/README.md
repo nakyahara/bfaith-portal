@@ -65,7 +65,7 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
   - session の設定 = `lock_timeout = 5min`・`statement_timeout = 30min`・`client_connection_check_interval = 1s` (Linux の server だけ。Windows の試験の server では使えないと出して続ける)。ファイルが終われば戻す
   - **記録** = 全部の文が通り、作った index が全部 `indisvalid and indisready and indislive` で属性が期待どおり・消した index が無いときだけ (1 文の取引・🆕 `search_path = pg_catalog, pg_temp` に固定 = Codex R5 M2)。途中で落ちたら記録しない = 次に流すと続きから
   - PGlite (試験) など CIC に対応しない adapter = 同じ文から `concurrently` を外した `create index if not exists` / `drop index if exists` を **ふつうの取引で** 流し、属性の検証は同じに通す (試験の schema は本番と同じ index を持つ)。invalid の回収・lock の待ちは試さない (本物の PG の試験で)
-  - 🚨 **見張り** = migrate の lock を持つ時間が **45 分** を超えたら知らせる (CIC 1 文の `statement_timeout = 30min` で先に切れるはず = 鳴るのは止まっている印)。今は `--list` の ⚠️ だけ (GChat の見張りは後の PR)。CIC は古いスナップショットを待つ = **夜間のバックアップ (REPEATABLE READ の長い取引) の間は流さない**
+  - 🚨 **見張り** = migrate の lock を持つ時間が **45 分** を超えたら知らせる (CIC 1 文の `statement_timeout = 30min` で先に切れるはず = 鳴るのは止まっている印)。`--list` の ⚠️ と、本番で流す間だけ別の窓で動かす GChat の見張り `scripts/company-db/migrate-lock-watch.mjs` (下の「migrate の lock の 45 分の見張り」)。CIC は古いスナップショットを待つ = **夜間のバックアップ (REPEATABLE READ の長い取引) の間は流さない**
 - **空き容量** (concurrent-index の create の各文の前・表示だけにしない) = 予想の index の大きさ = `reltuples × (index の列の pg_stats.avg_width の和 + 式の列は 64 + 16) × 1.3` (列は key と include の両方)。**空き (Render のメトリクスの Disk Capacity − Disk Usage = `apps/company-db/profit/render-metrics.mjs`) が `予想 × 3 + この回に先に作った index の予想 × 3 の和 + 2GB` に満たなければ流さずに exit 1** (メトリクスは最大 2 分古い = 続けて作った分がまだ使用に入っていない・Codex R1 H3)。🆕 **この回に流す全部の未適用の CIC の file の create を最初に集めて 1 回で判定する** (最初の CIC の file の最初の文の前・`予想の合計 × 3 + 2GB`・足りなければ 1 本も作らない・前の回の valid・未記録の index も含める・Codex R5 M1 = 設計 13 v3.13 ⑤ (a)。式は設計の `Σ 予想 + max(予想) × 2 + 2GB` 以上 = 止まる向き。CIC の file が 1 つの回は下の file の判定と同じ = 呼ばない。間の ふつうの file が作る表の index は、その表がまだ無い = 見積もれずに止まる = fail-closed)。file の最初の文の前にも、その file の **全部の create の合計** + この回に先に作った分 (前の回が作って記録の前に落ちた valid の index も含める = メトリクスにまだ出ていないかもしれない・Codex R-D60-v3-14 M4) で 1 回判定する (途中まで作って止まらない・残す)。飛ばす作り済みの index も予約に入れる。止まったら少し待ってもう一度流す。🆕 **容量を読む resource は接続先と同じでなければ流さない** (Codex R1 H2・設計 13 v3.13 ④・`DISK_CHECK_FAILED` の `RESOURCE_MISMATCH/<詳しく>`) = ① `CDB_RENDER_PG_RESOURCE_ID` が接続先 (`COMPANY_DB_URL` / `--url`) の host の最初の名前と同じ (内部 = `dpg-xxxx-a`・外部 = `dpg-xxxx-a.<地域>-postgres.render.com`・pool の host は未確認 = 一致にしない) ② Render の API の名札 (`GET /v1/postgres/{ID}` の `databaseName`・password を含まない) = `current_database()`。🚨 **host の対応はまだ Render に確かめていない** (設計 13 §5 の質問 14) = `RENDER_PG_HOST_MAPPING.confirmed = false` の間は **照合を通さない = CIC の migration は流れない** (`RESOURCE_MISMATCH/HOST_MAPPING_UNCONFIRMED`・Codex R-D60-v3-14 M5)。形の fixture = `scripts/fixtures/render-postgres-hosts.json` (回答で決まったら fixture と定数を同じ PR で直す)。password を返す connection-info は使わない。メトリクスが読めない (`RENDER_API_KEY`・`CDB_RENDER_PG_RESOURCE_ID` が無い・古い・形が違う)・表を一度も ANALYZE していない (reltuples が負・列の pg_stats が無い) ときも流さない (fail-closed・`DISK_CHECK_FAILED`)。人が画面で読んだ空きを渡す道は作らない。dry-run は容量を見ない
 
 - **持ち主の mode** (Codex R-D60-v3-10 H2 = PR 1b の前 / PR 1b 自身 / PR 1b の後) = runner は file ごとに catalog だけで mode を読む (接続の役割が ops の USAGE を失っても読める)
@@ -135,6 +135,24 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
 1. `select indexrelid::regclass, indisvalid, indisready from pg_index where not indisvalid;` で invalid を見る
 2. `pg_stat_progress_create_index` と `pg_stat_activity` (`application_name = 'company-db-migrate'`) で前の作りが動いていないかを見る。動いていれば終わるのを待つ (止めるなら人が `pg_cancel_backend`)
 3. runner をもう一度流す (同じ名前の invalid を `drop index concurrently` してから作り直す)。🚨 手で `DROP INDEX` (CONCURRENTLY なし) はしない (表に強い lock)
+
+#### migrate の lock の 45 分の見張り (GChat・本番で流す間だけ)
+
+- 設計 13 §3.10 (v3.9「見張り」・v3.12「45 分の見張り」) = migrate の lock (`company_db_migrate`) を持つ時間が **45 分** (`MIGRATE_LOCK_ALERT_MINUTES`) を超えたら GChat (要対応スペース = `GCHAT_WEBHOOK_JOBS`)。CIC 1 文は `statement_timeout = 30min` で先に切れるはず = 鳴るのは止まっている印 (ただし file・文が多い回は全体で 45 分を超えうる)
+- **本番の migrate を流す前に、別の PowerShell の窓で起動する** (定期実行ではない = 台帳に載せない・自分で終わる)。接続は照会用の `COMPANY_DB_WATCH_URL` (watcher の役割・読むだけ・lock を取らない・backend を止めない)
+- 60 秒ごとに `pg_locks` を読む。watcher の役割からは runner の `backend_start` が見えない = **lock が無かった直前の見回りの時刻から数える** (長めに数える = 早めに鳴る)。見えれば (同じ役割・`pg_read_all_stats`) 接続から数える。起動した時にもう持たれていて接続の時刻も見えなければ、起動した時から数え、知らせに「実際はもっと長い」と書く = **migrate より先に起動する**
+- 鳴った後も持たれていれば 60 分ごとにもう一度・外れたら「外れた」を送る。送れなかった知らせは次の見回りで送り直す。DB を 3 回続けて読めなければ「見張れていない」を 1 回送る
+- 終わり方 = lock が外れた (exit 0・migrate をもう一度流すなら見張りも起動し直す) / 起動から 30 分 lock が現れない (exit 0) / 8 時間を超えてもまだ持たれている (「打ち切る」を送って exit 1) / `GCHAT_WEBHOOK_JOBS` か `COMPANY_DB_WATCH_URL` が無い・引数の誤り (起動しない・exit 2)
+- 試し = `--dry-run` (GChat に送らず、送る文を画面に出すだけ)。値は `--interval-sec`・`--alert-min`・`--repeat-min`・`--wait-start-min`・`--max-hours` で変えられる (本番は既定のまま)
+- 試験 = `scripts/test-company-db-migrate-lock-watch.mjs` (時計を差し替えた単体 + 使い捨ての PG 18.4 で runner の `withMigrateLock` が持つ lock を watcher の役割から見る + CLI)
+
+```
+# 窓 1 (先に): 見張り
+cd C:Usersfaithfaith-portal
+node scriptscompany-dbmigrate-lock-watch.mjs
+# 窓 2: migrate (見張りが「見張りを始める」を出した後)
+node -r dotenv/config scriptscompany-dbmigrate.mjs
+```
 
 #### 配り方 = runner を先にマージして配る (古い runner と並ばない)
 
