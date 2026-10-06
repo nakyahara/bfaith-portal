@@ -128,6 +128,29 @@ r = await post({ mix_up: true, records: [record('503-0000000-0000001', { mis_typ
 check('応答', r.status, 201);
 check('保存されたモール', r.data && r.data.ids && r.data.ids.map(mallOf), ['amazon', 'other']);
 
+console.log('FBA 納品の内部伝票 (platform _ignore) は「見つからない」扱い = 勝手に「その他」で数えない');
+PLATFORM_OF['fba-inbound-1'] = '_ignore';
+const lookupRes = await fetch(BASE + '/orders/lookup?order_id=fba-inbound-1', { signal: AbortSignal.timeout(3000) });
+check('画面の検索', [lookupRes.status, await lookupRes.json()], [200, { found: false }]);
+r = await post({ mix_up: false, records: [record('fba-inbound-1')] });
+check('モールを選ばずに登録', [r.status, r.data && r.data.error], [400, 'lookup_miss_requires_manual_mall']);
+r = await post({ mix_up: false, records: [record('fba-inbound-1', { manual_mall: 'amazon' })] });
+check('手で Amazon を選んで登録', r.status, 201);
+check('保存されたモール', r.data && mallOf(r.data.id), 'amazon');
+
+console.log('mall が無い壊れた応答も「見つからない」扱い (黙って「その他」にしない)');
+PLATFORM_OF['no-mall-1'] = null;   // 偽サーバは platform が偽なら found:false を返すので、下で差し替える
+const baseHandler = lookupServer.listeners('request')[0];
+lookupServer.removeAllListeners('request');
+lookupServer.on('request', (req, res) => {
+  const id = new URL(req.url, 'http://x').searchParams.get('order_id');
+  if (id !== 'no-mall-1') return baseHandler(req, res);
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify({ found: true, mall: null, sku: 'pr_test', product_name: 'p', ordered_qty: 1, order_date: '2026-10-05' }));
+});
+r = await post({ mix_up: false, records: [record('no-mall-1')] });
+check('モールを選ばずに登録', [r.status, r.data && r.data.error], [400, 'lookup_miss_requires_manual_mall']);
+
 console.log('登録で思わぬ失敗をしても固まらない (DB の CHECK に当たる長い SKU)');
 PLATFORM_OF['long-sku-1'] = 'rakuten';
 const origEnd = lookupServer.listeners('request')[0];

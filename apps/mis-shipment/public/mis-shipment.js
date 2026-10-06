@@ -890,16 +890,17 @@
 
     let result = null;
     let networkError = false;
+    // サーバが応答しないときでも「登録中…」のまま止めない。サーバは注文の引き直しに
+    // 1 件 最大 5 秒 (テレコは 2 件) かかるので、それより十分長く待ってから諦める。
+    // (AbortSignal.timeout は古い Safari に無いので、AbortController + setTimeout で作る)
+    const aborter = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = aborter ? setTimeout(() => aborter.abort(), 30000) : null;
     try {
-      // サーバが応答しないときでも「登録中…」のまま止めない。サーバは注文の引き直しに
-      // 1 件 最大 5 秒 (テレコは 2 件) かかるので、それより十分長く待ってから諦める。
-      // (AbortSignal.timeout が無い古いブラウザでは時間制限なしで送る。送れなくなるよりよい)
-      const signal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
-        ? AbortSignal.timeout(30000) : undefined;
-      result = await apiFetch('/submissions', { method: 'POST', body: payload, signal });
+      result = await apiFetch('/submissions', { method: 'POST', body: payload, signal: aborter ? aborter.signal : undefined });
     } catch (e) {
       networkError = true;
     } finally {
+      if (timer) clearTimeout(timer);
       form.dataset.submitting = '';
       submitBtn.disabled = false;
       submitBtn.textContent = '登録する';

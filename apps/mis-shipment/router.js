@@ -46,11 +46,11 @@ const ROOT_CAUSE_STAGE_ENUM = new Set(['receiving','supplier','master_data','pic
 // DB の mall 列 (CHECK) の選択肢とは名前が違うものがあるので、ここで寄せる。
 //   - Amazon の注文は NE の店舗 4 = 'amazon_fbm' で来る → 'amazon'
 //   - ヤフオク・ラクマ・卸・dショッピング など選択肢に無い店舗 → 'other'
+//   ('_ignore' と壊れた応答は、ここに来る前に asLookupMissIfNotCounted で「見つからない」になる)
 // 寄せずに入れると INSERT が CHECK で落ちる (2026-10-06 まで Amazon の注文が登録できなかった)。
 const MALL_ALIAS = { amazon_fbm: 'amazon' };
 function normalizeLookupMall(platform) {
-  const p = typeof platform === 'string' ? platform : '';
-  const mall = Object.hasOwn(MALL_ALIAS, p) ? MALL_ALIAS[p] : p;
+  const mall = Object.hasOwn(MALL_ALIAS, platform) ? MALL_ALIAS[platform] : platform;
   return MALL_ENUM.has(mall) ? mall : 'other';
 }
 
@@ -116,7 +116,26 @@ async function lookupOrderFromMinipc(orderId) {
     err.status = res.status;
     throw err;
   }
-  return res.json();
+  return asLookupMissIfNotCounted(await res.json(), orderId);
+}
+
+/**
+ * 誤出荷として数えない伝票・壊れた応答は「見つからない」として扱う。
+ *   - '_ignore' = NE の店舗 7 (使っていないライジングAmazon) と 15 (FBA 納品の内部伝票)。
+ *     お客様の注文ではないので、勝手に「その他」で数えない
+ *   - mall が空・文字列でない = miniPC の応答が壊れている。黙って「その他」にしない
+ * どちらも、画面では「見つかりません」→「モールを手で選んで進む」に流れる (現場は止めない)。
+ * 登録時の引き直しも同じ関数を通るので、手で選んだモールで登録される。
+ */
+function asLookupMissIfNotCounted(result, orderId) {
+  if (!result || result.found !== true) return result;
+  const platform = result.mall;
+  if (typeof platform !== 'string' || platform === '') {
+    console.warn('[mis-shipment] 注文検索の応答に mall がありません。見つからない扱いにします:', orderId);
+    return { found: false };
+  }
+  if (platform === '_ignore') return { found: false };
+  return result;
 }
 
 // ─── helper: 入力 record の正規化と CHECK 制約事前検証 (DB CHECK と二層防御) ───
