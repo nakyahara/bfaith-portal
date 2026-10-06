@@ -19,6 +19,7 @@ import { normProductCode } from '../purchase-orders/db.js';
 import { readMirrorLogizardStock } from '../company-db/inventory/logizard.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import path from 'node:path';
+import { ListTimeoutError } from './deadline.mjs';
 
 export const STOCK_STALE_MS = 2 * 3600e3;
 /** ロジザードの在庫の写しが動く時間 (JST・毎時 00 分): logizard-stock-hourly の「毎日 09:00-18:00」 */
@@ -44,6 +45,7 @@ export function readBackorders() {
   try {
     return { ok: true, map: loadLedgerBackorders() };
   } catch (e) {
+    if (e instanceof ListTimeoutError) throw e;   // 期限切れ (CSV・全部コピー) は「読めない」にしない = 503 へ (#1627 Codex R4)
     console.error(`[master-edit] 発注アプリの注文残を読めない: ${e && e.message}`);
     return { ok: false, error: '発注アプリの台帳を読めません' };
   }
@@ -63,6 +65,7 @@ export function readBackorderLines(code) {
     const lines = loadBackorderLines(code);
     return { ok: true, lines, total: lines.reduce((s, l) => s + Number(l.remaining || 0), 0) };
   } catch (e) {
+    if (e instanceof ListTimeoutError) throw e;   // 期限切れ (CSV・全部コピー) は「読めない」にしない = 503 へ (#1627 Codex R4)
     console.error(`[master-edit] 発注アプリの注文残の内訳を読めない: ${e && e.message}`);
     return { ok: false, error: '発注アプリの台帳を読めません' };
   }
@@ -93,6 +96,7 @@ export async function readWarehouseStock({ now = Date.now(), reader = readMirror
       out = { ok: true, asOf: got.capturedAt, map };
     }
   } catch (e) {
+    if (e instanceof ListTimeoutError) throw e;   // 期限切れ (CSV・全部コピー) は「読めない」にしない = 503 へ (#1627 Codex R4)
     console.error(`[master-edit] ロジザードの在庫を読めない: ${e && e.message}`);
     out = { ok: false, error: 'ロジザードの在庫を読めません' };
   }

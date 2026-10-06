@@ -2283,6 +2283,9 @@ await ta('[19] 大きめの見本 (#1627 Codex R1 M3 / Low): CSV・全部コピ�
       const c = await pgFactory(url, extra);
       return { ...c, query: async (t, p) => {
         if (/^set statement_timeout/.test(t)) sets.push(t);
+        const fbaDaySql = /from snapshots\.stock_capture_days/.test(t) && /done_date/.test(t);
+        const fbaSumSql = /sum\(fba_available\)/.test(t);
+        if ((mode === 'fbaDay' && fbaDaySql) || (mode === 'fbaSum' && fbaSumSql)) { const e = new Error('canceling statement due to statement timeout'); e.code = '57014'; throw e; }
         if (LIST1.test(t) && /order by/.test(t)) {
           if (mode === 'slow') await new Promise((ok) => setTimeout(ok, 400));   // ① の SQL が遅い (PGlite は止めないので JS で遅らせる)
           if (mode === '57014') { const e = new Error('canceling statement due to statement timeout'); e.code = '57014'; throw e; }
@@ -2305,6 +2308,21 @@ await ta('[19] 大きめの見本 (#1627 Codex R1 M3 / Low): CSV・全部コピ�
       assert.equal(got.status, 503, '57014 = 503'); assert.match(await got.text(), /時間がかかりすぎました/);
       c = await call('GET', '/api/codes?kind=single');
       assert.deepEqual([c.status, c.j.reason], [503, 'timeout']);
+      // FBA の参考の値の SQL が止まった (#1627 Codex R4): 「読めない」に吸い込まず 503 (CSV = 日付の SQL・在庫の集計の SQL / 全部コピー = 在庫の範囲で絞る = 日付の SQL)
+      for (const m2 of ['fbaDay', 'fbaSum']) {
+        mode = m2;
+        got = await fetch(BASE + '/list.csv?kind=single', { headers: { 'x-test-session': 'editor' } });
+        assert.equal(got.status, 503, `${m2}: CSV`); assert.match(await got.text(), /時間がかかりすぎました/);
+      }
+      mode = 'fbaDay';
+      c = await call('GET', '/api/codes?kind=single&stock_min=0');
+      assert.deepEqual([c.status, c.j.reason], [503, 'timeout'], 'fbaDay: 全部コピー');
+      // 期限の無い一覧の画面は今まで通り「読めない」で画面を出す
+      mode = 'fbaDay';
+      const pl = await call('GET', '/?kind=single');
+      assert.equal(pl.status, 200); assert.match(pl.text, /id="th-fba">FBA \(JP\)<span class="thsub">読めない</);
+      mode = 'fbaSum';
+      assert.equal((await call('GET', '/?kind=single')).status, 200);
       // 一覧の画面は今のまま (期限の db を使わない = statement_timeout は接続の 20s だけ)
       mode = 'none'; sets.length = 0;
       assert.equal((await call('GET', '/?kind=single')).status, 200);

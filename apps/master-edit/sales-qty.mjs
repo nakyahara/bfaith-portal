@@ -87,6 +87,7 @@ export async function readSalesRun({ now = Date.now() } = {}) {
     const db = await mirrorDb();
     return runOf(db.prepare(PUB_SQL).get(), now);
   } catch (e) {
+    if (e instanceof ListTimeoutError) throw e;   // 期限切れ (CSV・全部コピー) は「読めない」にしない = 503 へ (#1627 Codex R4)
     console.error(`[master-edit] 販売数 (商品管理リスト) を読めない: ${e && e.message}`);
     return { ok: false, error: '販売数 (商品管理リスト) を読めません', reason: 'error' };
   }
@@ -142,6 +143,7 @@ export async function readSalesSku(run, code) {
     const db = await mirrorDb();
     return inTx(db, () => readSalesSkuTx(db, run, key));
   } catch (e) {
+    if (e instanceof ListTimeoutError) throw e;   // 期限切れ (CSV・全部コピー) は「読めない」にしない = 503 へ (#1627 Codex R4)
     console.error(`[master-edit] 販売数 (1 つの商品) を読めない: ${e && e.message}`);
     failRun(run, '販売数 (商品管理リスト) を読めません');
     return { ok: false, error: run.error };

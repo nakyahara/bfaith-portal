@@ -20,6 +20,7 @@
  * 米国 (fba_us) は出さない: 出品 SKU が Company DB の出品 (amazon_us) の構成に当たらず、NE のコードに結べない (10/5 の本番で 15 行とも sku_id なし)
  */
 import { COMPANY_ID } from '../../lib/master-write.mjs';
+import { ListTimeoutError } from './deadline.mjs';
 
 export const FBA_STALE_MS = 26 * 3600e3;
 export const FBA_SOURCE = Object.freeze({ source: 'fba_jp', scope: 'jp', mall: 'amazon', label: 'FBA (JP)' });
@@ -55,6 +56,7 @@ export async function readFbaDay(db, { now = Date.now() } = {}) {
       newer: x.last_date && x.last_date > x.done_date ? { date: x.last_date, status: x.last_status, words: DAY_STATUS_WORDS[x.last_status] || x.last_status } : null,
     };
   } catch (e) {
+    if (e instanceof ListTimeoutError) throw e;   // 期限切れ (CSV・全部コピー) は「読めない」にしない = 503 へ (#1627 Codex R4)
     console.error(`[master-edit] FBA の在庫を読めない: ${e && e.message}`);
     return { ok: false, error: e && e.code === '42501' ? '画面のロールに FBA の在庫を読む権限がまだ無い' : 'FBA の在庫を読めません', reason: e && e.code === '42501' ? 'no_privilege' : 'error' };
   }
@@ -75,6 +77,7 @@ export async function fbaAvailableOf(db, day, skuIds) {
     [COMPANY_ID, FBA_SOURCE.source, FBA_SOURCE.scope, day.date, skuIds])).rows) m.set(r.id, Number(r.n));
     return m;
   } catch (e) {
+    if (e instanceof ListTimeoutError) throw e;   // 期限切れ (CSV・全部コピー) は「読めない」にしない = 503 へ (#1627 Codex R4)
     console.error(`[master-edit] FBA の在庫 (一覧) を読めない: ${e && e.message}`);
     return null;
   }
@@ -119,6 +122,7 @@ export async function readFbaSku(db, day, skuId) {
       .map((r) => ({ code: r.code, qty: Number(r.qty), others: Number(r.others), available: num(r.fba_available) }));
     return { ok: true, day, total, rows, bundles };
   } catch (e) {
+    if (e instanceof ListTimeoutError) throw e;   // 期限切れ (CSV・全部コピー) は「読めない」にしない = 503 へ (#1627 Codex R4)
     console.error(`[master-edit] FBA の在庫 (1 つの SKU) を読めない: ${e && e.message}`);
     return { ok: false, error: e && e.code === '42501' ? '画面のロールに FBA の在庫を読む権限がまだ無い' : 'FBA の在庫を読めません' };
   }
