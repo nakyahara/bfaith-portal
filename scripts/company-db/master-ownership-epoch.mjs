@@ -26,6 +26,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { MASTER_OWNERSHIP, validateOwnership } from '../../config/master-ownership.mjs';
+import { configuredBeyondCapable, capabilityFingerprint, COMPANY_CAPABLE } from '../../config/master-capability.mjs';
 import { readOwnershipState, prepareOwnership, activateOwnership, cancelPrepared, ownershipHashOf } from '../../apps/company-db/load/ownership-state.mjs';
 import { checkPublishOwnership, readCurrentPublish, verifyApplied } from '../../apps/warehouse/master-publish.js';
 import { latestBuild, publishOfBuild } from '../../apps/warehouse/master-material.js';
@@ -71,7 +72,7 @@ export function activationEvidence({ sqlite, dataDir, prepared, now = new Date()
     applied_hash: bp.applied_hash, verified_at: ev?.apply?.checked_at ?? null, load_run_id: genLoad?.load_run_id ?? null, load_commit_seq: loadCommitSeq } : null };
 }
 
-export async function cli(argv, { env = process.env, connect = null, openSqlite = null, log = console.log, ownership = MASTER_OWNERSHIP, now = new Date() } = {}) {
+export async function cli(argv, { env = process.env, connect = null, openSqlite = null, log = console.log, ownership = MASTER_OWNERSHIP, now = new Date(), capable = COMPANY_CAPABLE } = {}) {
   const cmd = argv[0];
   const argAfter = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };
   const actor = argAfter('--actor') || `${os.userInfo().username}@${os.hostname()}`;
@@ -83,13 +84,16 @@ export async function cli(argv, { env = process.env, connect = null, openSqlite 
     const st = await readOwnershipState(c.db);
     const configuredHash = ownershipHashOf(validateOwnership(ownership));
     if (cmd === 'status') {
-      log(JSON.stringify({ state: st.state, configured: configuredHash, active: st.active.hash, prepared: st.prepared?.hash ?? null, activated_at: st.active.activated_at, prepared_at: st.prepared?.prepared_at ?? null,
+      log(JSON.stringify({ state: st.state, configured: configuredHash, capability: capabilityFingerprint(), active: st.active.hash, prepared: st.prepared?.hash ?? null, activated_at: st.active.activated_at, prepared_at: st.prepared?.prepared_at ?? null,
         filled_as_load: { active: st.active.filled, prepared: st.prepared?.filled ?? [] } }, null, 1));   // 記録の後に足した列 = load として足した列
       return 0;
     }
     if (cmd === 'prepare') {
       const p = checkPublishOwnership(ownership);
       if (p.length) { log(`❌ 用意しない: ④a で扱えない持ち主の設定 (${p.join(' / ')})`); return 1; }
+      // 広げる道 PR-0: このコードが company として扱えないキー (config/master-capability.mjs の COMPANY_CAPABLE の外) は用意しない = 能力の PR が先
+      const beyond = configuredBeyondCapable(ownership, capable);
+      if (beyond.length) { log(`❌ 用意しない: このコードが company として扱えないキー (${beyond.join('・')})。config/master-capability.mjs の COMPANY_CAPABLE に足す PR を全部の場所に配ってから`); return 1; }
       const r = await prepareOwnership(c.db, { map: ownership, actor });
       log(`✅ prepared = ${r.prepared_hash} (active のまま)。次 = master-cutover.mjs --to frozen → 書きかけ 0 → 最後の active (全部 load) のロード (--use-prepared なし) → その run_id の report + 照合 ② → remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → --verify-apply → activate (17 §4.2)。🚨 activate の前に cancel すると、今回 prepared で C にした列の古い入口が再び開く (activate の後は対象外)`);
       return 0;
