@@ -79,12 +79,19 @@ export async function readAmazonPage(db, sellerSku, { channels = null } = {}) {
   return { cur, phase, related, lastRequest, channel: channels ? (channels.get(normSku(sellerSku)) ?? null) : null };
 }
 
-/** 変更の記録 (対応・構成・出品)。新しい順に 200 件 */
+/**
+ * 変更の記録 (対応・構成・出品)。新しい順に 200 件。
+ * 構成の行は、どの商品か (entity_key の sku_id、無ければ行の中身の sku_id) を商品コードに引いて sku_code に入れる (引けない = sku_id だけ・#1628 Codex R2 M3)
+ */
 export async function amazonHistory(db, sellerSku) {
   const cur = await readAmazonMap(db, sellerSku);
   if (!cur.listing) return null;
+  const skuIdOf = `coalesce(nullif(e.entity_key ->> 'sku_id', ''), nullif(e.new_value ->> 'sku_id', ''), nullif(e.old_value ->> 'sku_id', ''))`;
   const events = (await db.query(`select e.event_id::text as event_id, e.operation, e.entity_type, e.attribute, e.old_value, e.new_value,
-        e.actor_type, e.actor_id, e.source_system, e.reason_text, e.recorded_at::text as recorded_at
+        e.actor_type, e.actor_id, e.source_system, e.reason_text, e.recorded_at::text as recorded_at,
+        case when e.entity_type = 'listing_component' then ${skuIdOf} end as sku_id,
+        case when e.entity_type = 'listing_component' and ${skuIdOf} ~ '^[0-9]{1,18}$'
+          then (select k.code from core.skus k where k.sku_id = (${skuIdOf})::bigint) end as sku_code
       from events.master_change_events e
      where (e.entity_type in ('amazon_sku_map', 'listing') and e.entity_id = $1::bigint)
         or (e.entity_type = 'listing_component' and (e.entity_key ->> 'listing_id')::bigint = $1::bigint)

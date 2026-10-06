@@ -76,6 +76,11 @@
       { id: 'name', sec: 'sec-code', t: '名前', ok: !!val('f-name'), focus: '#f-name', level: 1 },
     ];
     if (isSet) list.push({ id: 'components', sec: 'sec-comp', t: '構成 (1 品以上)', ok: components().some(function (r) { return r.code; }), focus: '#comp-rows .c-code', level: 1 });
+    if (isSet) {
+      var cc = compCheck();
+      if (cc.pending.length) list.push({ id: 'comp_pending', sec: 'sec-comp', t: '構成品を確かめています (' + cc.pending.length + ' 行)', ok: false, focus: '#comp-rows tr.comp-row:nth-child(' + (cc.pending[0].sectionRowIndex + 1) + ') .c-code', level: 1 });
+      else if (cc.bad.length) list.push({ id: 'comp_bad', sec: 'sec-comp', t: '構成品にできないコードを直す (' + cc.bad.length + ' 行)', ok: false, focus: '#comp-rows tr.comp-row:nth-child(' + (cc.bad[0].sectionRowIndex + 1) + ') .c-code', level: 1 });
+    }
     if (isSet && salesFromComp != null && val('f-set_sales_class_override')) list.push({ id: 'override', sec: 'sec-comp', t: '売上分類の上書きを空にする (構成品から導けます)', ok: false, focus: '#f-set_sales_class_override', level: 1 });
     list.push({ id: 'standard_price', sec: 'sec-money', t: '売価', ok: priceOk('f-standard_price'), focus: '#f-standard_price', level: 1 });
     if (!isSet) list.push({ id: 'tax_rate', sec: 'sec-tax', t: '税率', ok: !!segVal('f-tax_rate'), focus: '#f-tax_rate button', level: 1 });
@@ -183,7 +188,18 @@
 
   /* ---------- セットの構成 ---------- */
   var rowsEl = $('#comp-rows');
-  var facts = new Map();   // 行 → 引き当てた値
+  /**
+   * 行 → 引き当てた答え { code (どのコードの答えか), item (見つからない = null), error }。
+   * 今のコードの答えが無い行 = 照合中 (打ち直した直後・返事待ち) = ① で保存を止める (#1628 Codex R2 M1: 古い答えの見込みのまま保存して断られる)
+   */
+  var facts = new Map();
+  function factOf(tr) { var f = facts.get(tr); return f && f.code === $('.c-code', tr).value.trim() ? f : null; }
+  function compCheck() {
+    var rows = $$('#comp-rows tr.comp-row').filter(function (tr) { return $('.c-code', tr).value.trim(); });
+    var pending = rows.filter(function (tr) { return !factOf(tr); });
+    var bad = rows.filter(function (tr) { var f = factOf(tr); return f && (!f.item || f.item.kind !== 'single'); });
+    return { pending: pending, bad: bad };
+  }
   function relabel(tr, i) {
     var code = $('.c-code', tr).value.trim(), who = (i + 1) + ' 行目' + (code ? ' (' + code + ')' : '');
     $('.no', tr).textContent = String(i + 1);
@@ -196,16 +212,20 @@
   function lookup(tr) {
     var code = $('.c-code', tr).value.trim();
     var set = function (cls, v, bad) { var el = $(cls, tr); el.textContent = v; if (cls === '.c-name') el.classList.toggle('bad', !!bad); };
+    clearTimeout(tr.__lookupTimer);
+    var f0 = facts.get(tr);
+    if (f0 && f0.code === code && !f0.error) return;   // 同じコードの答えはもう持っている
     facts.delete(tr);
     if (!code) { ['.c-name', '.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { set(c, ''); }); tiles(); return; }
+    var seq = tr.__lookupSeq = (tr.__lookupSeq || 0) + 1;   // 古い返事を使わない (同じ行で打ち直した後に前の返事が遅れて来る)
     set('.c-name', '引き当てています…');
     fetch(BASE + '/api/lookup?code=' + encodeURIComponent(code), { headers: { Accept: 'application/json' } })
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
       .then(function (x) {
-        if ($('.c-code', tr).value.trim() !== code) return;
-        if (!x.r.ok || !x.j.ok) { set('.c-name', x.j.error || '見つかりません', true); ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { set(c, ''); }); tiles(); update(); return; }
+        if (tr.__lookupSeq !== seq || $('.c-code', tr).value.trim() !== code) return;
+        if (!x.r.ok || !x.j.ok) { facts.set(tr, { code: code, item: null }); set('.c-name', x.j.error || '見つかりません', true); ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { set(c, ''); }); tiles(); update(); return; }
         var it = x.j.item;
-        facts.set(tr, it);
+        facts.set(tr, { code: code, item: it });
         set('.c-name', it.name + (it.kind !== 'single' ? ' (単品でない = 構成品にできません)' : ''), it.kind !== 'single');
         set('.c-tax', it.tax_rate == null ? '未' : Math.round(it.tax_rate * 100) + '%');
         set('.c-sales', it.sales_class == null ? '未' : String(it.sales_class));
@@ -213,7 +233,7 @@
         set('.c-handling', HANDLING[it.handling] || it.handling);
         tiles(); update();
       })
-      .catch(function () { set('.c-name', '引き当てできません (通信)', true); tiles(); });
+      .catch(function () { if (tr.__lookupSeq !== seq) return; set('.c-name', '引き当てできません (通信)。少し待ってもう一度確かめます', true); tiles(); update(); tr.__lookupTimer = setTimeout(function () { lookup(tr); }, 3000); });
   }
   /** 構成品から導いた売上分類 (導けない・分からない = null) */
   var salesFromComp = null;
@@ -227,7 +247,7 @@
   /** 計算で決まる値の見込み (lib/master-set-rules.js deriveSetCdb と同じ決まり: 税率 = 全部同じならそれ・混ざれば低い 8%・未入力があれば決まらない / 売上分類 = 1〜3 の小さい番号 (4 だけなら 4・4 と 1〜3 の混在は決まらない) / 原価 = 原価 × 数の合計 (0・未入力があれば決まらない)) */
   function tiles() {
     if (!isSet) return;
-    var rows = $$('#comp-rows tr.comp-row').map(function (tr) { var c = $('.c-code', tr).value.trim(); return c ? { f: facts.get(tr), qty: Number(half($('.c-qty', tr).value.trim())) } : null; }).filter(Boolean);
+    var rows = $$('#comp-rows tr.comp-row').map(function (tr) { var c = $('.c-code', tr).value.trim(); var f = factOf(tr); return c ? { f: f ? f.item : null, qty: Number(half($('.c-qty', tr).value.trim())) } : null; }).filter(Boolean);
     var put = function (id, tv, tr, bad) { var t = $('#' + id); if (!t) return; t.classList.toggle('bad', !!bad); $('.tv', t).innerHTML = tv; $('.tr', t).textContent = tr; };
     salesFromComp = null;
     if (!rows.length) { overrideState(); put('t-tax', '—', '構成品を入れると出ます'); put('t-sales', '—', 'いちばん小さい番号'); put('t-cost', '—', '構成品の原価 × 数'); put('t-price', '—', 'セットの売価とくらべる'); return; }
@@ -264,13 +284,22 @@
     rowsEl.addEventListener('click', function (e) {
       var b = e.target.closest('button[data-act]'); if (!b || b.disabled) return;
       var tr = b.closest('tr'), act = b.getAttribute('data-act');
-      if (act === 'del') { var next = tr.nextElementSibling || tr.previousElementSibling; facts.delete(tr); tr.remove(); if (next) $('.c-code', next).focus(); else $('#comp-add').focus(); }
+      if (act === 'del') { var next = tr.nextElementSibling || tr.previousElementSibling; clearTimeout(tr.__lookupTimer); facts.delete(tr); tr.remove(); if (next) $('.c-code', next).focus(); else $('#comp-add').focus(); }
       if (act === 'up' && tr.previousElementSibling) { tr.parentNode.insertBefore(tr, tr.previousElementSibling); b.focus(); }
       if (act === 'down' && tr.nextElementSibling) { tr.parentNode.insertBefore(tr.nextElementSibling, tr); b.focus(); }
       renumber();
     });
     rowsEl.addEventListener('change', function (e) { if (e.target.classList.contains('c-code')) { var tr = e.target.closest('tr'); relabel(tr, $$('#comp-rows tr.comp-row').indexOf(tr)); lookup(tr); } });
-    rowsEl.addEventListener('input', function (e) { if (e.target.classList.contains('c-qty')) tiles(); });
+    rowsEl.addEventListener('input', function (e) {
+      if (e.target.classList.contains('c-qty')) tiles();
+      if (e.target.classList.contains('c-code')) {
+        var tr = e.target.closest('tr');
+        if (!factOf(tr)) { ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { $(c, tr).textContent = ''; }); $('.c-name', tr).textContent = e.target.value.trim() ? '確かめています…' : ''; }
+        tiles();
+        clearTimeout(tr.__lookupTimer);
+        tr.__lookupTimer = setTimeout(function () { lookup(tr); }, 500);
+      }
+    });
     // 構成品のコードで Enter = 引き当てて数の欄へ (保存はしない)
     rowsEl.addEventListener('keydown', function (e) {
       if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
@@ -286,15 +315,27 @@
   ['f-standard_price', 'xcost-jpy', 'f-set_sales_class_override'].forEach(function (id) { var e = document.getElementById(id); if (e) { e.addEventListener('input', tiles); e.addEventListener('change', tiles); } });
 
   /* ---------- 出品カード: 作らない・参考 URL・Amazon URL から ASIN・セット商品を作るか ---------- */
+  /** カードの欄に値が残っているか (カードを作らないときも送る = 形が違えば保存で断られる) */
+  function cardHasValues() {
+    return ['official-url', 'amazon-url', 'asin', 'set-text'].some(function (id) { return !!val(id); }) || refUrls().length > 0 || !!segVal('set-plan') || !!val('set-reason');
+  }
   function cardShow() {
     var on = cardOn();
-    var cf = $('#card-fields'); if (cf) { cf.hidden = !on; }
-    var note = $('#card-off-note'); if (note) note.hidden = on;
+    var keep = !on && cardHasValues();
+    var cf = $('#card-fields'); if (cf) { cf.hidden = !on && !keep; }
+    var note = $('#card-off-note');
+    if (note) {
+      note.hidden = on;
+      note.textContent = keep ? 'カードは作りません。ただし下の欄に入れた値は保存のときに確かめます (形が違うと保存できません)。要らなければ空にしてください。' : 'カードは作りません (保存しても product-hub のボードにカードはできません)。';
+      note.classList.toggle('wrn', keep);
+    }
     var plan = segVal('set-plan');
     var rr = $('#row-set-reason'); if (rr) rr.hidden = !(on && (plan === 'none' || plan === 'hold'));
     var sr = $('#set-reason'); if (sr) sr.disabled = !canSave || plan !== 'none';
   }
   ['card-create', 'set-plan'].forEach(function (id) { var e = document.getElementById(id); if (e) e.addEventListener('change', function () { cardShow(); update(); }); });
+  // カードを作らないときに欄を空にしていったら、全部空になった時点で畳む (打っている途中では畳まない = 欄を離れたとき)
+  var cardFieldsEl = $('#card-fields'); if (cardFieldsEl) cardFieldsEl.addEventListener('focusout', function () { setTimeout(cardShow, 0); });
   var refRows = $('#ref-rows');
   function refRenumber() { $$('#ref-rows .urlrow').forEach(function (r, i) { $('.idx', r).textContent = String(i + 1); $('.ref-url', r).setAttribute('aria-label', '参考 URL ' + (i + 1)); $('[data-ref-del]', r).setAttribute('aria-label', '参考 URL ' + (i + 1) + ' を外す'); }); }
   var refAdd = $('#ref-add');
@@ -371,6 +412,7 @@
     if (j.reason === 'set_underivable' && Array.isArray(j.blockers)) h += '<ul>' + j.blockers.map(function (b) { return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>';
     $('#result').innerHTML = h + '</div>';
     if (j.field) {
+      if (/^card\./.test(String(j.field))) { var cf = $('#card-fields'); if (cf) cf.hidden = false; }   // 隠れた欄の誤りでも直せるように開く
       var row = $('[data-row="' + String(j.field).replace(/"/g, '') + '"]', scope);
       if (row) {
         row.classList.add('err');

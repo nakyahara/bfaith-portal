@@ -10,7 +10,7 @@
     const ENT = { amazon_sku_map: '対応', listing_component: '構成', listing: '出品' };
     const OP = { INSERT: 'を足した', UPDATE: 'を変えた', DELETE: 'を外した' };
     const WHO = { portal_amazon_map: 'マスタの入力 (Amazon SKU)', amazon_map_migration: '切替の日の移行', company_db_load: '夜間ロード', sql: 'SQL' };
-    const ATTR = { name: '名前', state: '状態', qty: '数', sort_order: '並び', title: 'タイトル', status: '出品の状態', resolution: 'どこから', listing_code: '出品のコード',
+    const ATTR = { name: '名前', state: '状態', qty: '数', sort_order: '並び', title: 'タイトル', status: '出品の状態', resolution: 'どこから', evidence: '決めた根拠', listing_code: '出品のコード',
       deleted_reason: '削除の理由', deleted_at: '削除した時刻', deleted_by: '削除した人', changed_by: '変えた人', registered_by: '登録した人' };
     const HIDE = new Set(['version', 'updated_at', 'changed_at', 'registered_at', 'listing_norm', 'row_hash']);
     const STATE = Object.assign({}, MAP_STATES);
@@ -29,7 +29,9 @@
       for (const e of h.events) {
         if (e.operation === 'UPDATE' && HIDE.has(String(e.attribute || ''))) continue;
         const key = [e.recorded_at, e.actor_type, e.actor_id, e.source_system, e.reason_text].join('|');
-        const what = (ENT[e.entity_type] || e.entity_type) + (e.operation === 'UPDATE' && e.attribute ? ' の ' + (ATTR[e.attribute] || e.attribute) : (OP[e.operation] || e.operation));
+        // 構成の行は、どの商品か (商品コード・引けなければ sku_id) を付ける = 「構成 abc123 の数」
+        const who = e.entity_type === 'listing_component' ? (e.sku_code ? ' ' + e.sku_code : e.sku_id ? ' (sku_id ' + e.sku_id + ')' : '') : '';
+        const what = (ENT[e.entity_type] || e.entity_type) + who + (e.operation === 'UPDATE' && e.attribute ? ' の ' + (ATTR[e.attribute] || e.attribute) : (who ? ' ' : '') + (OP[e.operation] || e.operation));
         const line = { what, from: e.operation === 'INSERT' ? '' : show(e.old_value, e.attribute), to: e.operation === 'DELETE' ? '(なし)' : show(e.new_value, e.attribute) };
         const g = groups.length && groups[groups.length - 1].key === key ? groups[groups.length - 1] : null;
         if (g) { g.lines.push(line); continue; }

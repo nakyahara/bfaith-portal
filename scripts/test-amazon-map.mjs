@@ -925,6 +925,11 @@ await ta('[12] 保存・削除の API: 名簿の人だけ・Origin が要る・�
   assert.equal(r.status, 400);
   r = await call('POST', '/api/amazon/delete', { body: { request_id: uuid(), seller_sku: 'pr_pack2', reason: '画面から削除', seen: { versions: await versionsOf('pr_pack2') } } });
   assert.equal(r.status, 200, r.text); assert.equal(r.j.state, 'deleted');
+  // 変更の記録: どの構成品を足した・外したかを商品コードで出す (#1628 Codex R2 M3)
+  const hh = await call('GET', '/amazon/sku/history?sku=pr_pack2');
+  assert.equal(hh.status, 200);
+  assert.match(hh.text, /構成 a002 を足した/, '足した構成品のコード: ' + [...hh.text.matchAll(/<span class="what">([^<]*)<\/span>/g)].map((m) => m[1]).join(' | '));
+  assert.match(hh.text, /構成 a001 を外した/, '外した構成品のコード');
   process.env.MASTER_EDIT_OPEN = '0';
   r = await call('POST', '/api/amazon/save', { body: { request_id: uuid(), seller_sku: 'pr_pack2', name: '2 個組', components: [{ code: 'a001', qty: 2 }], seen: { versions: await versionsOf('pr_pack2') } } });
   assert.equal(r.status, 409); assert.equal(r.j.reason, 'before_cutover');

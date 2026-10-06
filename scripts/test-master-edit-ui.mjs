@@ -918,6 +918,55 @@ await ta('[26] 新商品の登録 (セット・10/5): 空の行は数えない�
   await ovr.selectOption('');
   assert.equal(await ovr.isDisabled(), true);
   assert.ok(!/売上分類の上書きを空にする/.test(await p.textContent('#checklist')));
+  // 照合中は保存しない (#1628 Codex R2 M1): 導けない構成 + 上書き (保存できる) から、導ける構成品へ打ち直した直後 = 古い答えで保存しない
+  const newCalls = [];
+  p.on('request', (rq) => { if (/\/api\/new$/.test(rq.url())) newCalls.push(rq.url()); });
+  await p.fill('#code', 'ui-set-race');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', '照合中の試験');
+  await p.fill('#f-standard_price', '1500');
+  await p.selectOption('#shipping', 'S02');
+  await rows.nth(0).locator('.c-code').fill('ui-new-1');
+  await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /UI 新商品 1/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
+  await ovr.selectOption('2');
+  assert.equal(await p.isDisabled('#save'), false, '導けない構成 + 上書き = 保存できる');
+  await rows.nth(0).locator('.c-code').fill('s003');   // 欄を離れない (照合は打つのが止まってから)
+  assert.equal(await p.isDisabled('#save'), true, '打ち直した直後 = 照合中 = 押せない');
+  assert.match(await p.textContent('#checklist'), /構成品を確かめています/);
+  await p.keyboard.press('Control+s');
+  await p.waitForFunction(() => /単品 3/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
+  assert.deepEqual(newCalls, [], '照合中の Ctrl+S で送らない');
+  assert.match(await p.textContent('#checklist'), /売上分類の上書きを空にする/, '照合の後は導ける = 上書きを空にするまで止める');
+  assert.equal(await p.isDisabled('#save'), true);
+  await ovr.selectOption('');
+  assert.equal(await p.isDisabled('#save'), false, '上書きを空にすれば保存できる');
+});
+
+await ta('[30] 新商品の登録 (#1628 Codex R2 M2): カードを作らないでも値の残る欄は隠さない (保存のときに確かめる)・カードの欄の誤りは開いてその欄へ・空にすると畳む', async (p) => {
+  await p.goto(B + '/new?kind=single');
+  await p.fill('#amazon-url', 'not-a-url');
+  await p.click('#card-create button[data-v="0"]');
+  assert.equal(await p.isHidden('#card-fields'), false, '値が残っている = 隠さない');
+  assert.match(await p.textContent('#card-off-note'), /要らなければ空にしてください/);
+  await p.fill('#code', 'ui-nocard-1');
+  await p.waitForSelector('#code-msg.ok, #code-msg.err, #code-msg.warn');
+  assert.match(await p.getAttribute('#code-msg', 'class'), /ok/, await p.textContent('#code-msg'));
+  await p.fill('#f-name', 'カードの試験');
+  await p.fill('#f-standard_price', '900');
+  await p.click('#f-tax_rate button[data-v="0.1"]');
+  await p.selectOption('#shipping', 'S01');
+  await p.click('#save');
+  await p.waitForSelector('.result.err');
+  assert.match(await p.textContent('.result.err'), /URL/);
+  assert.equal(await p.isHidden('#card-fields'), false);
+  assert.equal(await p.locator('[data-row="card.amazon_url"].err').count(), 1, '誤りの欄に印');
+  assert.equal(await active(p), 'amazon-url', '誤りの欄へ');
+  assert.equal(await skuRow('ui-nocard-1'), undefined, '登録していない');
+  await p.fill('#amazon-url', '');
+  await p.focus('#f-name');
+  await p.waitForFunction(() => document.getElementById('card-fields').hidden === true);
+  assert.match(await p.textContent('#card-off-note'), /カードは作りません \(保存しても/);
 });
 
 await ta('[27] Amazon SKU (10/5): 新しい対応 = 名前で未保存 1 件 (理由は数えない)・離れるときの確認・Ctrl+S → 読み直し (知らせ)・削除の理由は数えない・削除は 1 回だけ確かめる (Esc で戻る)・墓標・変更の記録のカード', async (p) => {
