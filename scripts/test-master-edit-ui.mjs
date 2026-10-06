@@ -32,6 +32,8 @@
  *  35〜44 第 2 段 (10/5・#1628): 新商品の登録 (単品・セット)・Amazon SKU・NE 登録の CSV・変更の記録 = 未保存 (data-dirty-field だけ)・離れるときの確認・保存 → 読み直し / できた商品の画面へ・
  *        削除は 1 回だけ確かめる・申告はファイルを落として sha256 を照合・1440 / 1280 / 1024 / 150% で横にはみ出さない
  *        (41〜46 = 構成品の照合・カードを作らないときの欄・確かめ直しの上限・Yahoo! の残値と誤りの欄・Amazon の変わらない保存)
+ *  49〜50 利益 (1 個あたり・10/6): 単品 / セットの欄を変えると保存の前にその場で計算し直す (保存すると ○ → ○)・数でない・マイナスは赤・元に戻す・一覧の列と利益の少ない順
+ *  51 円の欄 (標準売価・原価・例外原価) の読みはサーバーと同じ (カンマ・全角の数字・空白): 保存すると変わること・前との差・保存するとこうなる・利益
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -687,7 +689,7 @@ await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 
     await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns002' }));
     assert.doesNotMatch(await p.textContent('#list-tbl thead'), /注文残/, '列を出さない');
     assert.deepEqual((await cells(p)).map((x) => x.code), ['k001', 's002']);
-    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td').count(), 13, '行の欄も 1 つ少ない (14 → 13。FBA (JP)・区分・売れた数の列を足した)');
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td').count(), 15, '行の欄も 1 つ少ない (16 → 15。FBA (JP)・区分・売れた数・利益・利益率の列を足した)');
     assert.equal(await p.locator('input[name="po"]').count(), 0, '「注文残あり」を出さない');
     assert.match(await p.textContent('#po-denied'), /注文残 \(発注アプリの権限がないので出せません\)/);
     // URL に po=1 を付けても、注文残のある商品だけに絞らない (どの商品に注文残があるかを出さない)
@@ -1486,6 +1488,147 @@ for (const [label, vp, scale] of [['1440', { width: 1440, height: 900 }, 1], ['1
     } finally { delete process.env.MASTER_DECISION_APPROVERS; }
   }, vp, scale);
 }
+
+// 利益 (1 個あたり・参考・10/6)。MASTER_EDIT_UI_PROFIT_SHOTS=フォルダ を付けると 1440 幅の写し (単品・セット・一覧) を残す (目で見る用)
+const PROFIT_SHOTS = process.env.MASTER_EDIT_UI_PROFIT_SHOTS || '';
+const pfText = (p, sel) => p.evaluate((s) => document.querySelector(s).textContent.replace(/\s+/g, ' ').trim(), sel);
+await ta('[49] 利益 (1 個あたり・10/6): 単品 = 売価・税率・送料・原価を変えると保存の前にその場で計算し直す (保存すると ○ → ○)・数でない = 理由・マイナスは赤・元に戻す = いまの値 (未保存の数は変えない)', async (p) => {
+  await p.goto(B + '/sku/z030');   // 売価 1,000・原価 130・税率 10%・送料 S02 (520) (ほかの試験が触らない商品)
+  await p.waitForSelector('html[data-me-profit="ready"]');
+  const st = async () => ({ val: await pfText(p, '#pf-val'), rate: await pfText(p, '#pf-rate'), when: await pfText(p, '#pf-when'), neg: await p.evaluate(() => document.querySelector('#pf-val').classList.contains('neg')),
+    next: await p.evaluate(() => { const n = document.querySelector('#pf-next'); return n.hidden ? null : n.textContent.replace(/\s+/g, ' ').trim(); }) });
+  // 1000 − 100 − 130 × 1.10 (143) − 520 = 237 円・23.7%
+  assert.deepEqual(await st(), { val: '237円', rate: '23.7%', when: 'いまの値で', neg: false, next: null });
+  assert.equal(await pfText(p, '#pf-calc'), '売価 1,000 − 手数料 100 (10%) − 税込原価 143 (130 × 1.10) − 配送料 520 = 利益 237 円');
+  // 売価 2,500: 2500 − 250 − 143 − 520 = 1,587 円・63.5%
+  await p.fill('#f-standard_price', '2500');
+  assert.deepEqual(await st(), { val: '1,587円', rate: '63.5%', when: '画面の値で (未保存)', neg: false, next: '保存すると利益 237 円 (23.7%) → 1,587 円 (63.5%)' });
+  assert.equal(await dirty(p), 1, '利益の欄は未保存に数えない (売価の 1 件だけ)');
+  assert.equal(await pfText(p, '#pf-calc'), '売価 2,500 − 手数料 250 (10%) − 税込原価 143 (130 × 1.10) − 配送料 520 = 利益 1,587 円');
+  // 税率 8%: 2500 − 250 − 140.4 − 520 = 1589.6 → 1,590
+  await p.click('.seg[data-field="tax_rate"] button[data-v="0.08"]');
+  assert.equal((await st()).val, '1,590円');
+  // 送料 S01 (210): 2500 − 250 − 140.4 − 210 = 1899.6 → 1,900
+  await p.selectOption('#f-shipping_code', 'S01');
+  assert.equal((await st()).val, '1,900円');
+  assert.equal(await pfText(p, '#pf-calc'), '売価 2,500 − 手数料 250 (10%) − 税込原価 140.4 (130 × 1.08) − 配送料 210 = 1,899.6 → 利益 1,900 円 (四捨五入)', '内訳の式と右の数が合う (円未満も出す)');
+  const shot = async (name) => {
+    if (!PROFIT_SHOTS) return;
+    await p.evaluate(() => { if (document.activeElement) document.activeElement.blur(); document.querySelector('#profit-row').scrollIntoView({ block: 'center' }); });
+    await p.waitForTimeout(150);
+    await p.screenshot({ path: `${PROFIT_SHOTS}/${name}.png` });
+  };
+  await shot('単品_1440_売価と税率と送料を変えた');
+  // 原価を変える 3,000 (カンマも読む): 2500 − 250 − 3240 − 210 = −1,200 (赤・下がった印)
+  await p.click('#btn-cost-open');
+  await p.fill('#cost-jpy', '3,000');
+  let s = await st();
+  assert.deepEqual([s.val, s.rate, s.neg], ['−1,200円', '−48.0%', true]);
+  assert.equal(s.next, '保存すると利益 237 円 (23.7%) → −1,200 円 (−48.0%)');
+  assert.equal(await p.evaluate(() => document.querySelector('#pf-next').classList.contains('down')), true, '利益が下がる = 赤い枠');
+  await shot('単品_1440_原価を3000円にして赤字');
+  // 数でない売価 = 計算しない (理由)
+  await p.fill('#f-standard_price', 'abc');
+  s = await st();
+  assert.deepEqual([s.val, s.rate], ['—', '—']);
+  assert.equal(await pfText(p, '#pf-why'), '入れた標準売価が数ではないので計算できません');
+  assert.equal(await p.isHidden('#pf-calc'), true);
+  // 売価を空 = 未入力 (0 円として計算しない)
+  await p.fill('#f-standard_price', '');
+  assert.equal(await pfText(p, '#pf-why'), '標準売価が未入力なので計算できません');
+  await shot('単品_1440_売価を空にした');
+  // 元に戻す = いまの値
+  await p.click('#revert');
+  await p.waitForTimeout(50);
+  assert.deepEqual(await st(), { val: '237円', rate: '23.7%', when: 'いまの値で', neg: false, next: null });
+  assert.equal(await dirty(p), 0);
+  if (PROFIT_SHOTS) { await p.evaluate(() => window.scrollTo(0, 0)); await p.waitForTimeout(150); await p.screenshot({ path: `${PROFIT_SHOTS}/単品_1440_開いたとき.png`, fullPage: true }); }
+});
+
+await ta('[50] 利益 (セット・10/6): セットの売価・セットの原価 (例外原価 / 合計に戻す)・セットの税率・送料で同じ式・保存の前にその場で / 一覧の利益・利益率の列と利益の少ない順', async (p) => {
+  await p.goto(B + '/sku/set001');
+  await p.waitForSelector('html[data-me-profit="ready"]');
+  const P = await p.evaluate(() => JSON.parse(document.getElementById('me-page').textContent).profit);
+  const hand = (price, cost, tax, ship) => Math.round(price - Math.round(price * 0.1) - cost * (1 + (tax ?? 0.1)) - (ship ?? 0));
+  const yen = (v) => (v < 0 ? '−' : '') + Math.abs(v).toLocaleString('ja-JP') + '円';
+  assert.ok(P.price > 0 && P.cost != null && P.setCostSum != null, JSON.stringify(P));
+  assert.equal(await pfText(p, '#pf-val'), yen(hand(P.price, P.cost, P.taxRate, P.shipping)), 'いまの値 (セットの売価・原価・税率・送料)');
+  assert.match(await pfText(p, '#h-profit'), /利益/);
+  // 例外原価 100 円 (例外のときの中)
+  await p.click('details.more.panel > summary');
+  await p.fill('#xcost-jpy', '100');
+  assert.equal(await pfText(p, '#pf-val'), yen(hand(P.price, 100, P.taxRate, P.shipping)));
+  assert.match(await pfText(p, '#pf-next'), /^保存すると利益 .+ → .+$/);
+  // 例外原価をやめる (構成品の合計に戻す) = 構成品の合計
+  await p.check('#xcost-clear');
+  assert.equal(await pfText(p, '#pf-val'), yen(hand(P.price, P.setCostSum, P.taxRate, P.shipping)));
+  await p.uncheck('#xcost-clear');
+  // 売価と送料
+  await p.fill('#f-standard_price', '3000');
+  await p.selectOption('#f-shipping_code', 'S01');
+  assert.equal(await pfText(p, '#pf-val'), yen(hand(3000, 100, P.taxRate, 210)));
+  if (PROFIT_SHOTS) {
+    await p.evaluate(() => { document.activeElement && document.activeElement.blur(); document.querySelector('#p-profit').scrollIntoView({ block: 'center' }); });
+    await p.waitForTimeout(150);
+    await p.screenshot({ path: `${PROFIT_SHOTS}/セット_1440_売価と例外原価と送料を変えた.png` });
+  }
+  await p.click('#revert');
+  await p.waitForTimeout(50);
+  assert.equal(await pfText(p, '#pf-val'), yen(hand(P.price, P.cost, P.taxRate, P.shipping)));
+  assert.equal(await p.isHidden('#pf-next'), true);
+  if (PROFIT_SHOTS) { await p.evaluate(() => window.scrollTo(0, 0)); await p.waitForTimeout(150); await p.screenshot({ path: `${PROFIT_SHOTS}/セット_1440_開いたとき.png`, fullPage: true }); }
+  // 一覧: 列 (z030 = 237 円・23.7%)・並びのリンク → 利益の少ない順。z039 は画面の外で原価 3,000 円に = 1000 − 100 − 3300 − 520 = −2,920 (赤字・一番上)
+  await changeBehind('z039', { cost: { jpy: '3000', reason: '赤字の見本' } });
+  await p.goto(B + '/');
+  const cell = (code, col) => p.evaluate(([c, k]) => { const a = [...document.querySelectorAll('#list-tbl a.rowlink')].find((x) => x.textContent === c); return a ? a.closest('tr').querySelector(`td[data-col="${k}"]`).textContent.replace(/\s+/g, ' ').trim() : null; }, [code, col]);
+  assert.equal(await p.textContent('#th-profit'), '利益1 個・参考');
+  await Promise.all([p.waitForNavigation(), p.click('.tbl-top a:has-text("利益の少ない順")')]);
+  assert.match(p.url(), /sort=profit_asc/);
+  assert.equal(await cell('z030', 'profit'), '237');
+  assert.equal(await cell('z030', 'profit-rate'), '23.7%');
+  assert.equal(await p.textContent('#list-tbl tbody tr:first-child a.rowlink'), 'z039', '赤字が一番上');
+  assert.deepEqual([await cell('z039', 'profit'), await cell('z039', 'profit-rate')], ['−2,920', '−292.0%']);
+  assert.equal(await p.evaluate(() => getComputedStyle(document.querySelector('#list-tbl tbody tr:first-child td[data-col="profit"] .pf')).color), 'rgb(255, 112, 133)', 'マイナスは赤 (--err)');
+  const vals = await p.evaluate(() => [...document.querySelectorAll('#list-tbl td[data-col="profit"]')].map((td) => td.textContent.replace(/仮/g, '').trim()).filter((t) => t !== '—').map((t) => Number(t.replace('−', '-').replace(/,/g, ''))));
+  assert.ok(vals.length > 10);
+  for (let i = 1; i < vals.length; i++) assert.ok(vals[i - 1] <= vals[i], `利益の少ない順 ${vals[i - 1]} → ${vals[i]}`);
+  const [sw, cw] = await p.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+  assert.ok(sw <= cw + 1, `一覧が横にはみ出さない ${sw} > ${cw}`);
+  if (PROFIT_SHOTS) {
+    await p.waitForFunction(() => document.querySelector('.page').getAnimations().every((a) => a.playState !== 'running'));
+    await p.screenshot({ path: `${PROFIT_SHOTS}/一覧_1440_利益の少ない順.png` });
+    await p.evaluate(() => { const w = document.querySelector('#list-tbl').closest('.tblwrap'); w.scrollLeft = 400; document.querySelector('#list-tbl').scrollIntoView(); });
+    await p.waitForTimeout(150);
+    await p.screenshot({ path: `${PROFIT_SHOTS}/一覧_1440_利益の列.png` });
+  }
+});
+
+await ta('[51] 円の欄の読み = サーバーと同じ (10/6): 原価「3,000」・全角「３，０００」・空白入りでも「保存すると変わること」「保存するとこうなる」・前との差・利益が同じ数 / 整数でない = 打った字のまま・利益は理由', async (p) => {
+  await p.goto(B + '/sku/z031');   // 売価 1,000・原価 131・税率 10%・送料 S02 (520) (ほかの試験が触らない商品)
+  await p.waitForSelector('html[data-me-profit="ready"]');
+  // 画面の読み (サーバーの intIn と同じ規則)
+  assert.deepEqual(await p.evaluate(() => ['3,000', '３，０００', '3 000', '3　000', '－5', '1.5', '', 'ab', ' 42 '].map((s) => window.MasterEdit.intOf(s))), [3000, 3000, 3000, 3000, -5, null, null, null, 42]);
+  const diffTo = (label) => p.evaluate((l) => { const li = [...document.querySelectorAll('#save-diff li')].find((x) => x.querySelector('.k span').textContent.startsWith(l)); return li ? li.querySelector('.to').textContent : null; }, label);
+  await p.click('#btn-cost-open');
+  for (const typed of ['3,000', '３，０００', '3 000']) {
+    await p.fill('#cost-jpy', typed);
+    assert.equal(await diffTo('原価'), '3,000 円', `${typed}: 保存すると変わること`);
+    assert.match(await p.textContent('#cost-delta'), /いまの 131 円から\s*\+2,869 円/, `${typed}: 前との差`);
+    assert.match(await p.textContent('#save-impact-list'), /この商品の原価は 3,000 円/, `${typed}: 保存するとこうなる`);
+    assert.equal(await pfText(p, '#pf-val'), '−2,920円', `${typed}: 利益 (1000 − 100 − 3300 − 520)`);
+  }
+  await p.fill('#cost-jpy', 'ab');
+  assert.equal(await diffTo('原価'), '「ab」(整数ではない)');
+  assert.equal(await p.textContent('#cost-delta'), '');
+  assert.equal(await pfText(p, '#pf-why'), '入れた原価が数ではないので計算できません');
+  // 標準売価も同じ読み (全角・カンマ)
+  await p.fill('#cost-jpy', '3000');
+  await p.fill('#f-standard_price', '２，５００');
+  assert.equal(await diffTo('標準売価'), '2,500 円');
+  assert.equal(await pfText(p, '#pf-val'), '−1,570円', '2500 − 250 − 3300 − 520');
+  await p.click('#revert');
+  assert.equal(await dirty(p), 0);
+});
 
 const SHOTDIR = process.env.MASTER_EDIT_UI_SHOTS || '';
 for (const [label, vp] of [['1440', { width: 1440, height: 900 }], ['1280', { width: 1280, height: 720 }], ['1024', { width: 1024, height: 768 }]]) {

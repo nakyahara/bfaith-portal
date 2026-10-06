@@ -66,6 +66,7 @@ import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/mast
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
 import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, CHANNELS, UNMAPPED_DAYS } from './amazon-read.mjs';
 import { normSku } from '../../lib/sku-norm.js';
+import * as PF from '../../lib/profit-estimate.js';
 import { approverGate } from '../master-decisions/router.mjs';
 import {
   regSummary, buildRegExport, issueRegExport, regExportFile, declareRegExport, supersedeRegExport, recordRegVerified,
@@ -100,11 +101,18 @@ const router = express.Router();
  * 版 (assetV) = 中身のハッシュ = 配り直した日に古い CSS / JS が 1 時間残らない
  */
 const PUBLIC_DIR = path.join(__dirname, 'public');
+/**
+ * 利益の計算 (lib/profit-estimate.js) はサーバーと画面で同じファイル = ブラウザにはこの 1 つのファイルだけをそのまま配る (10/6)。
+ * public/me-profit.js が import する (版 = 下の assetV に入れる = 配り直した日に古い式が残らない)
+ */
+const PROFIT_LIB = path.join(__dirname, '..', '..', 'lib', 'profit-estimate.js');
 const assetV = (() => {
   const h = crypto.createHash('sha256');
   try { for (const f of fs.readdirSync(PUBLIC_DIR).sort()) h.update(f).update(fs.readFileSync(path.join(PUBLIC_DIR, f))); } catch { /* 無ければ空の版 */ }
+  try { h.update('profit-estimate.js').update(fs.readFileSync(PROFIT_LIB)); } catch { /* 無ければ空 */ }
   return h.digest('hex').slice(0, 12);
 })();
+router.get('/public/profit-estimate.js', (req, res) => res.sendFile(PROFIT_LIB, { maxAge: '1h', headers: { 'Content-Type': 'text/javascript; charset=utf-8' } }));
 router.use('/public', express.static(PUBLIC_DIR, { maxAge: '1h', index: false }));
 
 /** Postgres の接続の作り方 (試験は PGlite に差し替える。本番では触らない) */
@@ -294,6 +302,7 @@ const pageLocals = (req, phase = null) => {
     amazonClosed: !!amazonWhy, amazonClosedWhy: amazonWhy,
     // 見せ方の道具・部品の版・左の列でいまどこか。画面はすべて新しいデザイン (ui2。第 2 段 10/5 で新商品・NE 登録の CSV・Amazon・変更の記録も)
     ui, assetV, ui2: true, nav: '', nowMs: clock(),
+    PF,   // 利益 (1 個あたり・参考) の計算と見せ方 = lib/profit-estimate.js (一覧・1 つの商品の画面・つかいかた。画面の JS も同じファイル)
   };
 };
 const fmt = {

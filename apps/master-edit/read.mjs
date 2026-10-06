@@ -22,6 +22,7 @@ import { latestRun } from '../master-decisions/decide.mjs';
 import { readCardEvent } from '../../lib/product-hub-outbox.mjs';
 import { regItemsOfSku } from '../../lib/master-reg-csv.mjs';
 import { hasRegisteredOn, LIST_SORTS, listOrderBy, parseNeCreationDate, REGISTERED_ON_SOURCES } from '../../lib/sku-registered-on.mjs';
+import { masterProfit } from '../../lib/profit-estimate.js';
 
 /** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0053) */
 async function selectableSuppliers(db) {
@@ -43,6 +44,22 @@ export const REG_STATES = Object.freeze({
 });
 const KNOWN_COST = new Set(['COMPLETE', 'OVERRIDDEN']);
 const num = (v) => (v == null ? null : Number(v));
+
+/**
+ * 利益 (1 個あたり・参考) の並び (10/6 中原さん「利益の計算も入れてほしい」)。並びの SQL (listOrderBy) はコード順のまま読み、
+ * 絞った全件の利益を lib/profit-estimate.js の masterProfit (= price-update と同じ estimateGross) で出して JS で並べる (式を SQL に 2 つ目として書かない)。
+ * 計算できない商品 (原価・売価が無い) は最後 (その中はコード順)
+ */
+export const PROFIT_SORTS = Object.freeze({ profit_asc: '利益の少ない順', rate_asc: '利益率の低い順' });
+export const SORTS = Object.freeze({ ...LIST_SORTS, ...PROFIT_SORTS });
+const isProfitSort = (sort) => Object.prototype.hasOwnProperty.call(PROFIT_SORTS, sort);
+/**
+ * 一覧の行の利益 (1 個あたり・参考)。売価 = 標準売価 (税込)・原価 = その日の原価 (決まっている = COMPLETE / OVERRIDDEN だけ。足りないセットは「原価が未登録」)・
+ * 税率 = SKU の税率 (セットは構成品から導いた値)・配送料 = 自社の計算用の送料 (shipping_cost_jpy)・手数料 = 売価の 10% (PLATFORM_FEE_RATES.standard)
+ */
+export function rowProfit({ standard_price, cost, tax_rate, shipping_cost }) {
+  return masterProfit({ price: standard_price, cost, taxRate: tax_rate, shipping: shipping_cost });
+}
 
 async function regclass(db, name) {
   return (await db.query('select to_regclass($1) is not null as ok', [name])).rows[0].ok;
@@ -87,7 +104,7 @@ export function normalizeFilters(q = {}) {
     reg: pick(String(q.reg ?? ''), REG_STATES),
     card: pick(String(q.card ?? ''), CARD_FILTERS),
     diff: q.diff === '1' ? '1' : '',
-    sort: pick(String(q.sort ?? ''), LIST_SORTS),   // 0057: '' = コード順 / reg_desc = 登録日の新しい順 (① の SQL の order by = ページ分けの前)
+    sort: pick(String(q.sort ?? ''), SORTS),   // 0057: '' = コード順 / reg_desc = 登録日の新しい順 (① の SQL の order by = ページ分けの前) / 利益の並び (10/6) = JS で並べる
     // 詳細検索 (10/5 中原さん「NE の商品詳細検索のような」)。複数の欄は 1 行 1 つの文字に (URL に載る形)
     codes: multiText(q.codes), jans: multiText(q.jans), sups: multiText(q.sups), parents: multiText(q.parents),
     name: String(q.name ?? '').trim().slice(0, 200),   // POST の入口の上限 (SEARCH_VALUE_MAX.name = 200) と同じ (#1620 Codex R3 Low)
@@ -155,7 +172,8 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   if (f.missing === 'shipping') where.push('s.shipping_code is null');
   if (f.missing === 'reorder') where.push('s.reorder_months is null');
   let costCte = '';
-  if (f.missing === 'cost' || f.cost_min || f.cost_max) {
+  const profitSort = isProfitSort(f.sort);
+  if (f.missing === 'cost' || f.cost_min || f.cost_max || profitSort) {
     params.push(today);
     costCte = `with c as (${costTodaySql(params.length)}) `;
     if (f.missing === 'cost') where.push(`coalesce(c.cost_status not in ('COMPLETE', 'OVERRIDDEN'), true)`);
@@ -258,6 +276,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   const scanCap = mode === 'page' ? null : (jsFiltered ? Math.max(EXPORT_SCAN_MAX, max) : max) + 1;
   tick();
   const keys = (await db.query(`${costCte}select s.sku_id::text as sku_id, s.code, s.sku_kind, s.set_sales_class_override, p.sales_class
+      ${profitSort ? ', s.standard_price_jpy::text as standard_price, s.tax_rate::text as tax_rate, s.shipping_cost_jpy::text as shipping_cost, c.cost_jpy::text as cost_jpy, c.cost_status' : ''}
       from core.skus s
       left join core.products p on p.product_id = s.product_id
       ${costCte ? 'left join c on c.sku_id = s.sku_id' : ''}
@@ -307,6 +326,19 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
       return b != null && b >= stockRange.lo && b <= stockRange.hi;
     });
   }
+  // 利益の並び (10/6): 絞った全件の利益を同じ関数で出して並べる (ページ分けの前・codes / all も同じ並び)。計算できない = 最後 (コード順のまま)
+  if (profitSort) {
+    const key = f.sort === 'rate_asc' ? 'rate' : 'profit';
+    const val = new Map(matched.map((r) => {
+      const pr = rowProfit({ standard_price: num(r.standard_price), cost: KNOWN_COST.has(r.cost_status) ? Number(r.cost_jpy) : null, tax_rate: num(r.tax_rate), shipping_cost: num(r.shipping_cost) });
+      return [r.sku_id, pr.ok && Number.isFinite(pr[key]) ? pr[key] : null];
+    }));
+    matched = [...matched].sort((a, b) => {
+      const x = val.get(a.sku_id); const y = val.get(b.sku_id);
+      if (x == null || y == null) return (x == null) - (y == null);
+      return x - y;
+    });
+  }
   tick();
   if (mode !== 'page' && matched.length > max) return { tooMany: true, atLeast: false, total: matched.length, max, filters: f, notFound, multiCut };
   // 絞った全件の商品コード (並びも一覧と同じ)。中身は読まない
@@ -319,7 +351,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
         ps as (select distinct on (x.sku_id) x.sku_id, sp.code, sp.name from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id
                 where x.sku_id = any($1::bigint[]) and x.is_primary order by x.sku_id, sp.code)
       select s.sku_id::text as sku_id, s.code, s.code_norm, s.sku_kind, s.name, s.handling, s.tax_rate::text as tax_rate, s.tax_class,
-        s.standard_price_jpy::text as standard_price, s.shipping_code, s.reorder_months::text as reorder_months, s.set_sales_class_override,
+        s.standard_price_jpy::text as standard_price, s.shipping_code, s.shipping_cost_jpy::text as shipping_cost, s.reorder_months::text as reorder_months, s.set_sales_class_override,
         p.sales_class, c.cost_jpy::text as cost_jpy, c.cost_source, c.cost_status, ps.code as primary_supplier, ps.name as primary_supplier_name, s.product_id::text as product_id,
         ${hasReg ? '(select mr.state from ops.master_registrations mr where mr.sku_id = s.sku_id)' : 'null::text'} as reg_state,
         ${hasRegOn ? 's.registered_on::text as registered_on, s.registered_on_source' : 'null::text as registered_on, null::text as registered_on_source'}
@@ -342,14 +374,18 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   const salesMap = salesRes && salesRes.ok ? salesRes.map : null;
   const pageRows = pageIds.map((id) => rowsById.get(id)).filter(Boolean).map((r) => {
     const isSet = r.sku_kind === 'set';
+    const cost = KNOWN_COST.has(r.cost_status) ? Number(r.cost_jpy) : null;
+    // 利益 (1 個あたり・参考・10/6)。計算できない = profit null + 理由
+    const pr = rowProfit({ standard_price: num(r.standard_price), cost, tax_rate: num(r.tax_rate), shipping_cost: num(r.shipping_cost) });
     return {
       sku_id: r.sku_id, code: r.code, code_norm: r.code_norm, kind: r.sku_kind, name: r.name, handling: r.handling,
       tax_rate: num(r.tax_rate), tax_class: r.tax_class, tax_derived: isSet,
-      standard_price: num(r.standard_price), cost: KNOWN_COST.has(r.cost_status) ? Number(r.cost_jpy) : null, cost_derived: isSet && r.cost_source === 'set_calc',
+      standard_price: num(r.standard_price), cost, cost_derived: isSet && r.cost_source === 'set_calc',
       sales_class: salesOf(r, compClasses),
       sales_derived: isSet && r.set_sales_class_override == null,
       primary_supplier: r.primary_supplier, primary_supplier_name: r.primary_supplier_name ?? null, product_id: r.product_id ?? null,
-      shipping_code: r.shipping_code, reorder_months: num(r.reorder_months),
+      shipping_code: r.shipping_code, shipping_cost: num(r.shipping_cost), reorder_months: num(r.reorder_months),
+      profit: pr.ok ? pr.profit : null, profit_rate: pr.ok ? pr.rate : null, profit_reason: pr.ok ? null : pr.reason, profit_notes: pr.notes, profit_detail: pr,
       state: r.handling === 'discontinued' ? 'discontinued' : 'available',
       reg_state: r.reg_state ?? 'none',
       comp_count: isSet ? (compClasses.get(r.sku_id) || []).length : null,
@@ -390,7 +426,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : []),
     ...(cardOf.has(r.sku_id) ? [CARD_FLAG[cardOf.get(r.sku_id)]] : [])];
   tick();
-  return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable, notFound, multiCut, sorts: LIST_SORTS, registeredOnAvailable: hasRegOn };
+  return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable, notFound, multiCut, sorts: SORTS, registeredOnAvailable: hasRegOn };
 }
 
 /**
