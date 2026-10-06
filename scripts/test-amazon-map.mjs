@@ -28,6 +28,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import express from 'express';
 import Database from 'better-sqlite3';
@@ -892,6 +893,21 @@ await ta('[12] 一覧・1 つ・変更の記録・つかいかた・末尾の / 
   for (const word of ['Amazon SKU の対応を直す', '墓標', '未登録', '07:00', 'NE確認済み']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
   const idx = await call('GET', '/');
   assert.ok(idx.text.includes('href="/apps/master-edit/amazon/"'));
+});
+
+await ta('[12] 画面の属性のエスケープ (#1628 Codex R1 M4): 構成品のコードに引用符・< があっても属性が増えない (並べ替え・外すのボタンの読み上げの名前)', async () => {
+  const ejs = (await import('ejs')).default;
+  const { ui } = await import('../apps/master-edit/ui-format.mjs');
+  const evil = 'x" onfocus="alert(1)" a="<b>';
+  const html = await ejs.renderFile(path.join(path.dirname(fileURLToPath(import.meta.url)), '../apps/master-edit/views/amazon-sku.ejs'), {
+    title: 't', username: 'u', displayName: 'u', canEdit: true, gateMessage: '', base: '/apps/master-edit', ui, assetV: 'v', ui2: true, nav: 'amazon', nowMs: Date.now(),
+    amazonClosed: false, amazonClosedWhy: '', dbError: null, sku: 'pr_x', MAP_STATES: { active: '有効', deleted: '削除済み (墓標)' }, CHANNELS: { FBA: 'FBA', FBM: 'FBM' }, MAX_MAP_COMPONENTS: 20, MAX_MAP_QTY: 999,
+    page: { channel: 'FBA', related: [], lastRequest: null, phase: null, cur: { listing: { listing_id: '1', listing_code: 'pr_x', title: 'T', status: 'active', asin: null }, map: null, fnsku: null, versions: {},
+      components: [{ code: evil, name: 'N', qty: 1, sku_kind: 'single', reg_state: 'available', resolution: 'manual' }] } },
+  });
+  assert.ok(!/onfocus="/.test(html), '引用符で属性を抜けない (onfocus という属性ができない)');
+  assert.ok(!html.includes('a="<b>'), '< をそのまま出さない');
+  assert.ok(html.includes('x&quot; onfocus=&quot;alert(1)&quot; a=&quot;&lt;b&gt;'), 'エスケープして出す');
 });
 
 await ta('[12] 保存・削除の API: 名簿の人だけ・Origin が要る・保存の結果・削除 (理由)・閉じていれば 409', async () => {

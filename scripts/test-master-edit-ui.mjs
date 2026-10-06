@@ -895,6 +895,29 @@ await ta('[26] 新商品の登録 (セット・10/5): 空の行は数えない�
   assert.equal(await rows.nth(0).locator('.c-qty').getAttribute('aria-label'), '1 行目 (s003) の数');
   assert.match(await p.textContent('#remain'), /あと\s*4\s*つ/);
   assert.equal(await p.isDisabled('#save'), true);
+  // 売上分類の上書き (#1628 Codex R1 M2): 構成品から導ける (3 と 1 = 1) 間は押せない
+  const ovr = p.locator('#f-set_sales_class_override');
+  assert.equal(await ovr.isDisabled(), true, '導ける間は上書きを押せない');
+  assert.match(await p.textContent('#override-hint'), /導けるので、上書きはできません/);
+  // 売上分類が未入力の構成品 (ui-new-1 = [25] で分類を入れずに登録) = 導けない = 上書きで決める
+  await rows.nth(0).locator('.c-code').fill('ui-new-1');
+  await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /UI 新商品 1/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
+  assert.equal(await ovr.isDisabled(), false, '導けないときは上書きできる');
+  assert.match(await p.textContent('#t-sales'), /決まりません/);
+  await p.click('#sec-comp details.more > summary');
+  await ovr.selectOption('2');
+  assert.match(await p.textContent('#t-sales'), /2\s*取引先限定[\s\S]*導けないので/);
+  // 導ける構成に戻す = サーバーが断る形 = ① で止める (保存のボタンも)
+  await rows.nth(0).locator('.c-code').fill('s003');
+  await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /単品 3/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
+  assert.match(await p.textContent('#t-sales'), /上書きできません/);
+  assert.match(await p.textContent('#checklist'), /売上分類の上書きを空にする/);
+  assert.equal(await ovr.isDisabled(), false, '入れてある上書きは空にできる');
+  await ovr.selectOption('');
+  assert.equal(await ovr.isDisabled(), true);
+  assert.ok(!/売上分類の上書きを空にする/.test(await p.textContent('#checklist')));
 });
 
 await ta('[27] Amazon SKU (10/5): 新しい対応 = 名前で未保存 1 件 (理由は数えない)・離れるときの確認・Ctrl+S → 読み直し (知らせ)・削除の理由は数えない・削除は 1 回だけ確かめる (Esc で戻る)・墓標・変更の記録のカード', async (p) => {
@@ -947,6 +970,19 @@ await ta('[27] Amazon SKU (10/5): 新しい対応 = 名前で未保存 1 件 (�
   assert.ok(await p.locator('.hcard').count() >= 2, '保存 1 回 = 1 枚');
   assert.match(await p.textContent('#hist-cards'), /UI の試験で消す/);
   await p.click('#hist-filter button[data-hf="load"]').catch(() => {});
+  // 対応の無い seller SKU を、夜間の取り込みの名前・構成のまま (変えた欄 0) 新しく登録できる (#1628 Codex R1 M1)
+  await pg.query("update core.listings set title = 'はちみつ 3 個組' where listing_code = 'pr-k001-3p'");
+  await p.goto(B + '/amazon/sku?sku=pr-k001-3p');
+  assert.equal(await dirty(p), 0);
+  assert.equal(await p.inputValue('#name'), 'はちみつ 3 個組');
+  assert.equal(await p.isDisabled('#save'), false, '初期値のままでも保存できる');
+  assert.match(await p.textContent('#save-impact-list'), /新しく作ります \(今の名前・構成のまま\)/);
+  assert.match(await p.textContent('#save-empty'), /このまま保存すると|この名前・構成のまま保存すると/);
+  await p.click('#save');
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /新しい対応を作りました/);
+  assert.deepEqual(await mapOf('pr-k001-3p'), { name: 'はちみつ 3 個組', state: 'active' });
+  assert.equal(await p.isDisabled('#save'), true, '作った後は変えた欄が無ければ押せない');
 });
 
 await ta('[28] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウンロード) → 申告の書きかけ = 未保存 (離れるときの確認) → 違うファイルは照合で止める → 同じファイルで申告 → 読み直し', async (p, ctx) => {
@@ -990,17 +1026,24 @@ await ta('[28] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウ
     assert.match(await c2.locator('[data-drawer="declare"] [data-msg]').textContent(), /sha256 が合いません/);
     await c2.locator('input[data-sha-file]').setInputFiles(file);
     await p.waitForSelector('[data-drop].done');
+    // いまの時刻を入れる (#1628 Codex R1 M3): 秒まで・今の時刻 = 配った直後 (配った時刻の秒が 0 でない) でも断られない
+    await c2.locator('[data-now]').click();
+    const imp = await c2.locator('input[name="imported_at"]').inputValue();
+    assert.match(imp, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/, '秒まで入る: ' + imp);
+    assert.ok(Math.abs(new Date(imp).getTime() - Date.now()) < 5000, imp);
     await c2.locator('button[data-act="declare"]').click();
     await p.waitForSelector('.saved-note:has-text("申告しました")');
     const st = (await pg.query("select r.state from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id where s.code_norm = 'ui-new-1'")).rows[0].state;
     assert.equal(st, 'ne_pending');
+    const att = (await pg.query('select imported_at, declared_at from ops.ne_reg_attempts order by attempt_id desc limit 1')).rows[0];
+    assert.ok(att.imported_at && new Date(att.imported_at) <= new Date(att.declared_at), JSON.stringify(att));
     assert.equal(await dirty(p), 0);
   } finally { delete process.env.MASTER_DECISION_APPROVERS; }
 });
 
 // 第 2 段の画面の幅: 1440 / 1280 / 1024 と 1280×720 の 150% で横にはみ出さない・板からはみ出さない・構成の表は横に送る囲いの中。
-// MASTER_EDIT_UI_SHOTS2=フォルダ を付けると 1440 / 1280 / 1024 の写しを残す (目で見る用)
-const SHOTS2 = process.env.MASTER_EDIT_UI_SHOTS2 || '';
+// MASTER_EDIT_UI_SHOTS_STAGE2=フォルダ を付けると 1440 / 1280 / 1024 の写しを残す (目で見る用。MASTER_EDIT_UI_SHOTS2 は [20] / [24] の写しで使っている)
+const SHOTS2 = process.env.MASTER_EDIT_UI_SHOTS_STAGE2 || '';
 const fillNew = async (p) => { await p.fill('#code', 'shot-new-1'); await p.waitForSelector('#code-msg.ok'); await p.fill('#f-name', '国産 はちみつ レモン 500g'); await p.fill('#f-standard_price', '1680'); await p.click('#f-tax_rate button[data-v="0.08"]'); };
 const fillSet = async (p) => {
   const rows = p.locator('#comp-rows tr.comp-row');

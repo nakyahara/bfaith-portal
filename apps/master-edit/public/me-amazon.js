@@ -47,9 +47,9 @@
   }
   function impacts(items) {
     var out = [];
-    if (!items.length) return out;
+    if (!items.length && !newReady()) return out;
     var rows = components();
-    if (P.isNew) out.push([0, 'この seller SKU の対応を新しく作ります']);
+    if (P.isNew) out.push([0, 'この seller SKU の対応を新しく作ります' + (items.length ? '' : ' (今の名前・構成のまま)')]);
     if (P.deleted) out.push([1, '削除済み (墓標) の seller SKU をもう一度登録します (登録日は新しくなります)']);
     if (items.some(function (x) { return x.k === 'components'; })) {
       if (rows.length && rows[0].code) out.push([0, '代表の NE コードは ' + rows[0].code + ' (1 行目)']);
@@ -58,6 +58,11 @@
     out.push([0, '古い表 (miniPC の SKU マスタ・Render) と FBA 補充には、翌朝 7:00 の写しで届きます']);
     return out;
   }
+  /**
+   * 対応がまだ無い seller SKU = 夜間の取り込みの名前・構成のままでも新しく登録できる (変えた欄が 0 でも保存できる・#1628 Codex R1 M1)。
+   * 名前と 1 行以上の構成があるときだけ (中身の確かめはサーバー)
+   */
+  function newReady() { return !!P.isNew && !saved && !!$('#name') && $('#name').value.trim() !== '' && components().some(function (r) { return r.code; }); }
   var saveBtn = $('#save'), revertBtn = $('#revert');
   var lastState = { n: 0, items: [], impacts: [] };
   function update() {
@@ -66,12 +71,14 @@
     $('#save-diff').innerHTML = items.map(function (it) {
       return '<li><div class="k"><span>' + esc(it.label) + '</span></div><div class="v"><span class="from">' + esc(it.from) + '</span><span class="muted" aria-label="から">→</span><span class="to">' + esc(it.to) + '</span></div></li>';
     }).join('');
-    $('#save-empty').hidden = items.length > 0;
+    var empty = $('#save-empty');
+    empty.hidden = items.length > 0;
+    if (canSave && P.isNew && !items.length) empty.textContent = newReady() ? 'この名前・構成のまま保存すると、この seller SKU の対応を新しく作ります (直すところがあれば直してから)。' : '名前と構成 (1 行以上) を入れると、新しい対応を作れます。';
     var cnt = $('#save-count'); cnt.textContent = items.length + ' 件'; cnt.className = 'b count ' + (items.length ? 'warn' : 'mute');
     var imp = impacts(items);
     $('#save-impact').hidden = imp.length === 0;
     $('#save-impact-list').innerHTML = imp.map(function (x) { return '<li class="' + (x[0] ? 'warn' : '') + '">' + esc(x[1]) + '</li>'; }).join('');
-    if (saveBtn) saveBtn.disabled = !canSave || saved || busy || mustReload || items.length === 0;
+    if (saveBtn) saveBtn.disabled = !canSave || saved || busy || mustReload || (items.length === 0 && !newReady());
     if (revertBtn) revertBtn.disabled = saved || items.length === 0;
     // 代表の印 = 1 行目
     $$('tr.comp-row', rowsEl).forEach(function (tr, i) {

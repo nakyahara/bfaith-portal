@@ -12,8 +12,9 @@
   const dis = canSave ? '' : ' disabled';
   const SALES = { 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' };
   // 切り替えボタン (税率・売上分類・ロジザード・取扱・カード・セット商品)。押された状態は aria-pressed・見出し (lab-…) と結ぶ
+  const h = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const seg = (id, field, current, opts, label) => '<div class="seg" role="group" id="' + id + '" aria-labelledby="lab-' + id + '" data-field="' + field + '" data-dirty-field="' + field + '" data-label="' + label + '" data-value="' + current + '">'
-    + opts.map(([v, t, small]) => '<button type="button" data-v="' + v + '" aria-pressed="' + (current === v ? 'true' : 'false') + '"' + (current === v ? ' class="on"' : '') + dis + '>' + t + (small ? ' <small>' + small + '</small>' : '') + '</button>').join('') + '</div>';
+    + opts.map(([v, t, small]) => '<button type="button" data-v="' + h(v) + '" aria-pressed="' + (current === v ? 'true' : 'false') + '"' + (current === v ? ' class="on"' : '') + dis + '>' + h(t) + (small ? ' <small>' + h(small) + '</small>' : '') + '</button>').join('') + '</div>';
   const compRow = (i) => '<tr class="comp-row"><td class="no">' + i + '</td><td><input class="in mono c-code" style="width:150px" autocomplete="off" spellcheck="false" placeholder="商品コード" aria-label="' + i + ' 行目の構成品のコード"' + dis + '> <span class="c-name"></span></td>'
     + '<td><input class="in c-qty" style="width:70px;text-align:right" inputmode="numeric" autocomplete="off" value="1" aria-label="' + i + ' 行目の数"' + dis + '></td><td class="c-tax"></td><td class="c-sales"></td><td class="c-cost n"></td><td class="c-handling"></td>'
     + '<td class="acts"><button type="button" class="iconbtn" data-act="up" aria-label="' + i + ' 行目を上へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg></button><button type="button" class="iconbtn" data-act="down" aria-label="' + i + ' 行目を下へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-down"/></svg></button><button type="button" class="iconbtn del" data-act="del" aria-label="' + i + ' 行目を外す"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-trash"/></svg></button></td></tr>';
@@ -89,7 +90,7 @@
                 <div class="ctl"><select class="in w-m" id="f-set_sales_class_override" data-field="set_sales_class_override" data-dirty-field="set_sales_class_override" data-label="売上分類の上書き"<%= dis %>>
                   <option value="">— (構成品から)</option>
                   <% for (const [k, v] of Object.entries(SALES)) { %><option value="<%= k %>"><%= v %></option><% } %>
-                </select><span class="hint">構成品から導けないときだけ</span></div></div>
+                </select><span class="hint" id="override-hint">構成品から導けないときだけ (未入力・輸出 4 と 1〜3 の混在)</span></div></div>
               <div class="f" data-row="exception_cost"><label class="lab" for="xcost-jpy">例外原価</label>
                 <div class="ctl"><span class="yen"><input class="in w-s" id="xcost-jpy" inputmode="numeric" autocomplete="off" data-dirty-field="exception_cost" data-label="例外原価" placeholder="0"<%= dis %>></span><span class="unit">円</span>
                   <input class="in w-m" id="xcost-reason" maxlength="200" autocomplete="off" aria-label="例外原価の理由" placeholder="理由 (例外原価を入れるときは必要)"<%= dis %>><span class="hint">空なら構成品の原価の合計</span></div></div>

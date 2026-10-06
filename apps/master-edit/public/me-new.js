@@ -76,6 +76,7 @@
       { id: 'name', sec: 'sec-code', t: '名前', ok: !!val('f-name'), focus: '#f-name', level: 1 },
     ];
     if (isSet) list.push({ id: 'components', sec: 'sec-comp', t: '構成 (1 品以上)', ok: components().some(function (r) { return r.code; }), focus: '#comp-rows .c-code', level: 1 });
+    if (isSet && salesFromComp != null && val('f-set_sales_class_override')) list.push({ id: 'override', sec: 'sec-comp', t: '売上分類の上書きを空にする (構成品から導けます)', ok: false, focus: '#f-set_sales_class_override', level: 1 });
     list.push({ id: 'standard_price', sec: 'sec-money', t: '売価', ok: priceOk('f-standard_price'), focus: '#f-standard_price', level: 1 });
     if (!isSet) list.push({ id: 'tax_rate', sec: 'sec-tax', t: '税率', ok: !!segVal('f-tax_rate'), focus: '#f-tax_rate button', level: 1 });
     list.push({ id: 'shipping_code', sec: 'sec-ship', t: '発送方法', ok: !!val('shipping'), focus: '#shipping', level: 1 });
@@ -202,7 +203,7 @@
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
       .then(function (x) {
         if ($('.c-code', tr).value.trim() !== code) return;
-        if (!x.r.ok || !x.j.ok) { set('.c-name', x.j.error || '見つかりません', true); ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { set(c, ''); }); tiles(); return; }
+        if (!x.r.ok || !x.j.ok) { set('.c-name', x.j.error || '見つかりません', true); ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { set(c, ''); }); tiles(); update(); return; }
         var it = x.j.item;
         facts.set(tr, it);
         set('.c-name', it.name + (it.kind !== 'single' ? ' (単品でない = 構成品にできません)' : ''), it.kind !== 'single');
@@ -210,30 +211,44 @@
         set('.c-sales', it.sales_class == null ? '未' : String(it.sales_class));
         set('.c-cost', it.cost_jpy == null ? '未' : yen(it.cost_jpy) + ' 円');
         set('.c-handling', HANDLING[it.handling] || it.handling);
-        tiles();
+        tiles(); update();
       })
       .catch(function () { set('.c-name', '引き当てできません (通信)', true); tiles(); });
+  }
+  /** 構成品から導いた売上分類 (導けない・分からない = null) */
+  var salesFromComp = null;
+  /** 売上分類の上書きの欄: 構成品から導ける間は押せない (入れてあれば空にできるよう開けておく = ① で止める) */
+  function overrideState() {
+    var sel = document.getElementById('f-set_sales_class_override'); if (!sel || !canSave || saved) return;
+    sel.disabled = salesFromComp != null && !sel.value;
+    var hint = document.getElementById('override-hint');
+    if (hint) hint.textContent = salesFromComp != null ? '構成品から ' + salesFromComp + ' (' + (SALES[salesFromComp] || '') + ') を導けるので、上書きはできません' : '構成品から導けないときだけ (未入力・輸出 4 と 1〜3 の混在)';
   }
   /** 計算で決まる値の見込み (lib/master-set-rules.js deriveSetCdb と同じ決まり: 税率 = 全部同じならそれ・混ざれば低い 8%・未入力があれば決まらない / 売上分類 = 1〜3 の小さい番号 (4 だけなら 4・4 と 1〜3 の混在は決まらない) / 原価 = 原価 × 数の合計 (0・未入力があれば決まらない)) */
   function tiles() {
     if (!isSet) return;
     var rows = $$('#comp-rows tr.comp-row').map(function (tr) { var c = $('.c-code', tr).value.trim(); return c ? { f: facts.get(tr), qty: Number(half($('.c-qty', tr).value.trim())) } : null; }).filter(Boolean);
     var put = function (id, tv, tr, bad) { var t = $('#' + id); if (!t) return; t.classList.toggle('bad', !!bad); $('.tv', t).innerHTML = tv; $('.tr', t).textContent = tr; };
-    if (!rows.length) { put('t-tax', '—', '構成品を入れると出ます'); put('t-sales', '—', 'いちばん小さい番号'); put('t-cost', '—', '構成品の原価 × 数'); put('t-price', '—', 'セットの売価とくらべる'); return; }
+    salesFromComp = null;
+    if (!rows.length) { overrideState(); put('t-tax', '—', '構成品を入れると出ます'); put('t-sales', '—', 'いちばん小さい番号'); put('t-cost', '—', '構成品の原価 × 数'); put('t-price', '—', 'セットの売価とくらべる'); return; }
     var known = rows.every(function (r) { return !!r.f; });
-    if (!known) { ['t-tax', 't-sales', 't-cost', 't-price'].forEach(function (id) { put(id, '…', '構成品を引き当て中か、見つからない行があります'); }); return; }
+    if (!known) { overrideState(); ['t-tax', 't-sales', 't-cost', 't-price'].forEach(function (id) { put(id, '…', '構成品を引き当て中か、見つからない行があります'); }); return; }
     var taxes = rows.map(function (r) { return r.f.tax_rate; });
     if (taxes.some(function (t) { return t == null; })) put('t-tax', '決まりません', '税率が未入力の構成品があります (先に単品の税率を)', true);
     else { var uniq = taxes.filter(function (t, i) { return taxes.indexOf(t) === i; }); put('t-tax', (uniq.length > 1 ? 8 : Math.round(uniq[0] * 100)) + '<small>%</small>', uniq.length > 1 ? '8% と 10% が混ざっています (低い方の 8%)' : '構成品が全部 ' + Math.round(uniq[0] * 100) + '%', uniq.length > 1); }
+    // 売上分類: 構成品から導ける間は上書きできない (サーバーが断る = lib/master-register.mjs)。導けない (未入力・輸出 4 と 1〜3 の混在) ときだけ上書きで決める (#1628 Codex R1 M2)
     var ov = val('f-set_sales_class_override');
     var sc = rows.map(function (r) { return r.f.sales_class; });
-    if (ov) put('t-sales', esc(ov) + '<small> ' + esc(SALES[ov] || '') + '</small>', '上書き (例外のとき)');
-    else if (sc.some(function (x) { return x == null; })) put('t-sales', '決まりません', '売上分類が未入力の構成品があります (「売上分類の上書き」で決める)', true);
-    else {
-      var four = sc.filter(function (x) { return Number(x) === 4; }).length;
-      if (four && four < sc.length) put('t-sales', '決まりません', '輸出 4 と 1〜3 が混ざっています (「売上分類の上書き」で決める)', true);
-      else { var m = Math.min.apply(null, sc.map(Number)); put('t-sales', m + '<small> ' + esc(SALES[m] || '') + '</small>', four ? '全部 輸出' : 'いちばん小さい番号'); }
-    }
+    var four = sc.filter(function (x) { return Number(x) === 4; }).length;
+    var missing = sc.some(function (x) { return x == null; });
+    var mixed = !missing && four > 0 && four < sc.length;
+    salesFromComp = missing || mixed ? null : Math.min.apply(null, sc.map(Number));
+    if (salesFromComp != null && ov) put('t-sales', '上書きできません', '構成品から ' + salesFromComp + ' (' + (SALES[salesFromComp] || '') + ') を導けます。「売上分類の上書き」を空にしてください', true);
+    else if (ov) put('t-sales', esc(ov) + '<small> ' + esc(SALES[ov] || '') + '</small>', '上書き (構成品から導けないので)');
+    else if (missing) put('t-sales', '決まりません', '売上分類が未入力の構成品があります (「例外のとき」の「売上分類の上書き」で決める)', true);
+    else if (mixed) put('t-sales', '決まりません', '輸出 4 と 1〜3 が混ざっています (「例外のとき」の「売上分類の上書き」で決める)', true);
+    else put('t-sales', salesFromComp + '<small> ' + esc(SALES[salesFromComp] || '') + '</small>', four ? '全部 輸出' : 'いちばん小さい番号');
+    overrideState();
     var xc = val('xcost-jpy');
     if (xc) put('t-cost', esc(yen(half(xc).replace(/,/g, ''))) + '<small> 円</small>', '例外原価 (構成品の合計の代わり)');
     else if (rows.some(function (r) { return !(r.f.cost_jpy > 0); })) put('t-cost', '決まりません', '原価が無い構成品があります (先に単品の原価か、例外原価を)', true);

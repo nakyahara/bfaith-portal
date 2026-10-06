@@ -18,7 +18,9 @@
   const startRows = cur ? (deleted ? [] : cur.components) : [];
   const startName = map ? map.name : (cur && cur.listing && cur.listing.title) || '';
   const title = map ? map.name : (cur && cur.listing && cur.listing.title) || '';
-  const iconBtns = (i, code) => { const who = i + ' 行目' + (code ? ' (' + code + ')' : ''); return '<button type="button" class="iconbtn" data-act="up" aria-label="' + who + ' を上へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg></button><button type="button" class="iconbtn" data-act="down" aria-label="' + who + ' を下へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-down"/></svg></button><button type="button" class="iconbtn del" data-act="del" aria-label="' + who + ' を外す"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-trash"/></svg></button>'; };
+  // 属性に入れる値は必ずエスケープする (コードに引用符があっても属性が増えない = #1628 Codex R1 M4)
+  const h = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const iconBtns = (i, code) => { const who = h(i + ' 行目' + (code ? ' (' + code + ')' : '')); return '<button type="button" class="iconbtn" data-act="up" aria-label="' + who + ' を上へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg></button><button type="button" class="iconbtn" data-act="down" aria-label="' + who + ' を下へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-down"/></svg></button><button type="button" class="iconbtn del" data-act="del" aria-label="' + who + ' を外す"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-trash"/></svg></button>'; };
   const pageData = page ? { base, sku, canSave, maxComponents: MAX_MAP_COMPONENTS, maxQty: MAX_MAP_QTY, isNew: !map, deleted } : null;
 %>
   <%- include('_header', { hasSave: canSave }) %>

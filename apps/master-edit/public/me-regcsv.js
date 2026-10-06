@@ -92,12 +92,12 @@
     drop.addEventListener('dragleave', function () { drop.classList.remove('over'); });
     drop.addEventListener('drop', function (e) { e.preventDefault(); drop.classList.remove('over'); var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]; hashFile(drop, f); });
   });
-  // いまの時刻を入れる (日本時間のまま・1 分前 = 「今より後」で断られないように)
+  // いまの時刻を入れる (このパソコンの時刻・秒まで = 配った時刻より前にならない。前は 1 分前の分までにしていて、配った直後だと断られた = #1628 Codex R1 M3)
   root.addEventListener('click', function (e) {
     var b = e.target.closest && e.target.closest('[data-now]'); if (!b) return;
     var inp = $('input[name="imported_at"]', b.closest('.drawer'));
-    var d = new Date(Date.now() - 60000), p = function (n) { return String(n).padStart(2, '0'); };
-    inp.value = d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes());
+    var d = new Date(), p = function (n) { return String(n).padStart(2, '0'); };
+    inp.value = d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
     inp.dispatchEvent(new Event('input', { bubbles: true }));
   });
 
