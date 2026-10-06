@@ -152,13 +152,23 @@ function rootItemsStart(text){
 }
 function completeItems(response){
   response=String(response);const begin=rootItemsStart(response);if(begin<0)return [];
-  const items=[];let quoted=false,escaped=false,depth=0,start=-1;
-  for(let i=begin;i<response.length;i++){
-    const c=response[i];if(quoted){if(escaped)escaped=false;else if(c==='\\')escaped=true;else if(c==='"')quoted=false;continue;}
-    if(c==='"'){quoted=true;continue;}if(c==='{'&&depth++===0)start=i;
-    if(c==='}'&&--depth===0&&start>=0){try{items.push(JSON.parse(response.slice(start,i+1)));}catch{break;}start=-1;}
-    if(c===']'&&depth===0)break;
-  }return items;
+  // Follow the array grammar: { ... } then only "," or "]". Anything else (a closing fence, prose) ends the rescue,
+  // so objects after the truncated array are never collected (Codex R3).
+  const items=[];let i=begin;
+  while(true){
+    while(/\s/.test(response[i]||''))i++;
+    if(response[i]!=='{')break;
+    let quoted=false,escaped=false,depth=0,end=-1;
+    for(let j=i;j<response.length;j++){
+      const c=response[j];if(quoted){if(escaped)escaped=false;else if(c==='\\')escaped=true;else if(c==='"')quoted=false;continue;}
+      if(c==='"')quoted=true;else if(c==='{')depth++;else if(c==='}'&&--depth===0){end=j;break;}
+    }
+    if(end<0)break;
+    try{items.push(JSON.parse(response.slice(i,end+1)));}catch{break;}
+    i=end+1;while(/\s/.test(response[i]||''))i++;
+    if(response[i]!==',')break;i++;
+  }
+  return items;
 }
 function parseBatchResponse(response,pool,context){
   let raw,truncated=false;try{raw=parseJson(response,v=>Array.isArray(v?.items));}catch(error){const items=completeItems(String(response));if(!items.length)throw error;raw={items,no_idea:[]};truncated=true;}

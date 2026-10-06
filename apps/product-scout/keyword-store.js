@@ -61,15 +61,18 @@ function screenedList(db){
  const seen=new Set(),items=[],code_counts={},byRun=db.prepare('SELECT run_id,day,body_json FROM scout_keyword_runs WHERE run_id=?');
  for(const {run_id}of recent){
   const run=byRun.get(run_id),body=JSON.parse(run.body_json);
-  for(const s of Array.isArray(body.screened_out)?body.screened_out:[]){
+  // 同じ回の中でも後の組ほど新しい。後ろから読んで同じ案は後の組の理由と元商品を採り、並びは元の順に戻す (Codex R3)
+  const inRun=[];
+  for(const s of Array.isArray(body.screened_out)?[...body.screened_out].reverse():[]){
    if(!s||typeof s.candidate_id!=='string'||typeof s.kw!=='string'||seen.has(s.candidate_id))continue;
    // 最新の回で数えてから出すか決める。最新が already_seen なら古い回の見送りも出さない
    seen.add(s.candidate_id);const codes=Array.isArray(s.codes)?s.codes.filter(c=>typeof c==='string'):[];
    if(proposed.has(s.candidate_id)||codes.includes('already_seen'))continue;
    for(const c of codes)code_counts[c]=(code_counts[c]||0)+1;
    const sources=Array.isArray(s.sources)?s.sources.filter(o=>/^[A-Z0-9]{10}$/.test(o?.asin)):(Array.isArray(s.source_asins)?s.source_asins:[]).filter(a=>/^[A-Z0-9]{10}$/.test(a)).map(asin=>({asin,title:''}));
-   items.push({candidate_id:s.candidate_id,kw:s.kw,decision:s.decision,codes,reason:typeof s.reason==='string'?s.reason:'',by:s.by,use:s.use||'',idea:s.idea||'',idea_reason:s.idea_reason||'',sources:sources.slice(0,5).map(o=>({asin:o.asin,title:typeof o.title==='string'?o.title:''})),run_id:run.run_id,day:run.day});
+   inRun.push({candidate_id:s.candidate_id,kw:s.kw,decision:s.decision,codes,reason:typeof s.reason==='string'?s.reason:'',by:s.by,use:s.use||'',idea:s.idea||'',idea_reason:s.idea_reason||'',sources:sources.slice(0,5).map(o=>({asin:o.asin,title:typeof o.title==='string'?o.title:''})),run_id:run.run_id,day:run.day});
   }
+  items.push(...inRun.reverse());
  }
  const value={key,items,code_counts,runs:recent.length};screenedCache.set(db,value);return value;
 }

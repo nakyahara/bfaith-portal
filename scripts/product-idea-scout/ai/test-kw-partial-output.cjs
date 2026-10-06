@@ -14,6 +14,11 @@ test('文章の途中の {"items":[...]} は、途中で切れた返事の救出
  // 先頭のコードブロック内の切れた返事は、これまでどおり完全な項目だけ救う。値の中の "items" という文字は鍵と見なさない
  const lead='```json\n{"note":"items","items":['+JSON.stringify(item(2))+',{"kw":"途中';
  const r=parseBatchResponse(lead,rows,learningContext([],rows));assert.equal(r.partial,true);assert.deepEqual(r.items.map(i=>i.kw),['用途2 シート']);
+ // 切れた配列のあとにある {...} (コードブロックの外の説明文など) は拾わない (Codex R3)
+ const after='```json\n{"items":['+JSON.stringify(item(2))+',{"kw":"途中\n```\n補足 '+JSON.stringify(item(3));
+ assert.deepEqual(parseBatchResponse(after,rows,learningContext([],rows)).items.map(i=>i.kw),['用途2 シート']);
+ const glued='{"items":['+JSON.stringify(item(1))+' 文章 '+JSON.stringify(item(3));
+ assert.deepEqual(parseBatchResponse(glued,rows,learningContext([],rows)).items.map(i=>i.kw),['用途1 シート']);
 });
 test('製造先や需要が不明という理由で案を消す出力は受け付けない',()=>{
  assert.throws(()=>validateBatch({items:[item(1),item(2)],no_idea:[{asin:rows[2].asin,reason:'製造先が不明'}]},rows,learningContext([],rows)),/INVALID_NO_IDEA_REASON/);

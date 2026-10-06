@@ -55,3 +55,9 @@ test('最新の回が既出 (already_seen) なら古い回の見送りも出さ�
  ingestKeywords(edition('d3',10),db);
  assert.equal(screenedOutKeywords({},db).total,0,'提案に出た案が、覚えた一覧のせいで残っている');
 });
+test('同じ回の中で同じ案が2回見送られたら、後の組の理由を出す (Codex R3)',t=>{
+ const db=new Database(':memory:');t.after(()=>db.close());createKeywordTables(db);
+ const rec=(reason,codes)=>({candidate_id:keywordId('二度出た案'),kw:'二度出た案',decision:'defer',codes,reason,by:'R03'});
+ ingestKeywords({...edition('one'),screened_out:[rec('1組目の理由',['brand_dependent']),rec('2組目の理由',['feedback_constraint'])]},db);
+ const s=screenedOutKeywords({},db);assert.deepEqual(s.items.map(i=>i.reason),['2組目の理由']);assert.deepEqual(s.code_counts,{feedback_constraint:1});
+});
