@@ -198,7 +198,9 @@ try {
     assert.match(row.instance_id, /^pg-test:\d+:[0-9a-f]{8}$/);
     assert.equal(row.manifest_hash, r.manifest_hash);
     assert.equal(row.manifest_hash, (await M.query('select ops.legacy_manifest_hash($1::jsonb) as h', [JSON.stringify(G.legacyManifest())])).rows[0].h, 'DB が同じ一覧から計算した値');
-    assert.deepEqual(row.entries.entries.filter((x) => x.kind === 'manual').map((x) => x.id), ['ne:item-screen', 'gas:logizard-sheet-and-sku-map']);
+    assert.deepEqual(row.entries.entries.filter((x) => x.kind === 'manual').map((x) => x.id), ['ne:item-screen', 'ne:set-kind', 'gas:logizard-sheet-and-sku-map']);
+    // 広げる道 PR-6: 実 PostgreSQL に残った manifest にも手の入口の owner_cols が残る
+    assert.deepEqual(row.entries.entries.find((x) => x.id === 'ne:set-kind').owner_cols, ['skus.sku_kind']);
     const who = (await M.query(`select distinct usename from pg_stat_activity where datname = $1 and application_name = 'master-legacy-gate'`, [dbName])).rows.map((x) => x.usename);
     assert.deepEqual(who, ['master_gate_minipc'], '段階の読みも門のログイン');
     // 読み戻しの manifest_hash = 最後に DB が受け取った一覧

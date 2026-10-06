@@ -23,6 +23,8 @@
           <span class="muted" style="font-weight:400">／ NEに未取込の新商品 <%= intake.pending %> 件</span>
         <% } %>
       </summary>
+      <%# 広げる道 PR-6: 単品 (やセット) の新商品を Company DB の「新商品の登録」へ移したときの案内。移していなければ空 %>
+      <%- typeof masterLegacyKindNotice === 'string' ? masterLegacyKindNotice : '' %>
       <p class="muted" style="margin:10px 0;">
         NE商品マスタにある商品コードを貼り付けると、ドラフトをまとめて作ります。
         <strong>バリエーションは代表商品コード単位で1件にまとまります</strong>（楽天は1ページ＝代表コード単位のため）。
@@ -340,7 +342,7 @@
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
         });
         const j = await res.json();
-        if (!j.ok) { out.textContent = ''; alert(j.error || '実行に失敗しました'); return; }
+        if (!j.ok) { out.textContent = ''; alert(j.message || j.error || '実行に失敗しました'); return; }
         out.textContent = j.mode === 'seed'
           ? '✅ 初回シード完了 (' + j.seeded + '件を既存として記録)。明日以降の新商品から自動でドラフト化されます'
           : '✅ 取込完了: 新規ドラフト ' + j.created + ' 件' + (j.merged ? ' / 既存グループへ集約 ' + j.merged + ' 件' : '');
@@ -759,7 +761,7 @@
         body: JSON.stringify({ codes: codes, dry_run: dryRun }),
       });
       const j = await res.json();
-      if (!j.ok) { out.textContent = 'エラー: ' + (j.error || '不明'); return; }
+      if (!j.ok) { out.textContent = 'エラー: ' + (j.message || j.error || '不明') + (Array.isArray(j.codes) && j.codes.length ? ' (' + j.codes.join(', ') + ')' : ''); return; }
       const s = j.summary;
       out.textContent = (dryRun ? '【確認】' : '') + '新規 ' + s.created + ' / 既存にまとまる ' + s.merged
         + ' / NEに無い ' + s.not_in_ne + '（' + j.results.length + ' コード）';

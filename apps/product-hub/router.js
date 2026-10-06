@@ -68,7 +68,7 @@ import { autoProductInfoText, effectiveProductInfo } from './lib/product-info-au
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
 import { existingPageOfDraft, EXISTING_PAGE_CHOICES } from './lib/existing-page.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
-import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
+import { registerByCodes, syncNewProducts, intakeStatus, newKindOfCode, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 // Company DB の「新商品の登録」から作るカード (2026-10-01・Company DB構想 14 ⑤-2a)。知らせ (outbox) の取り込みと、新規作成の入口の切り替え
 import { applyCdbCardEvent, cdbShippingCheckIds } from './services/cdb-card-intake.js';
 import { sweepCardOutbox, newEntryGate } from '../../lib/product-hub-outbox.mjs';
@@ -149,7 +149,7 @@ import {
   suggestShopCategories, canAutoApplyShopCategory, countSelectableShopCategories,
   shopCategoriesNeverSaved, isAutoApplyRequestValid,
 } from './lib/shop-categories.js';
-import { masterLegacyGate, legacyBannerHtml, checkLegacyGate, legacyHandler, legacyWriteFence, respondIfLegacyAborted } from '../../lib/master-legacy-gate.mjs';
+import { masterLegacyGate, legacyBannerHtml, legacyNewKindNoticeHtml, refuseLegacyNewKind, checkLegacyGate, legacyHandler, legacyWriteFence, respondIfLegacyAborted } from '../../lib/master-legacy-gate.mjs';
 import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
 import { resolveListingTax } from './services/listing-tax.mjs';
 
@@ -159,6 +159,8 @@ router.use(express.json({ limit: '512kb' }));
 // 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #6・14 §5・契約 v3 H1・PR #1565 R1 H4/H5・⑤-3b)。legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る):
 //    税率の手入力 (tax_rate を送る保存) = 税率の列が C (frozen 以降)・段階か持ち主が読めない = 410 / 503 (何も書かない)。tax_rate を送らない保存 (ほかの欄) は通る。
 //    Notion の取込 (税率も書く)・古い新商品の作り方 (POST /api/drafts・NE のコードから登録・自動取込を手で回す) = 閉じる (新商品は新しい登録の画面から)。
+//    🆕 広げる道 PR-6 (種類ごとの門): 新商品の古い作り方は、その種類 (単品 / セット) の新しい登録の列が全部 C になったら、その種類の作成だけ 409 (新しい「新商品の登録」へ案内)。
+//       skus.sku_kind を C に広げる = 単品の作成が閉じる (セットは sku_components を広げるまで今までどおり)。種類は handler が NE の商品区分で決める (newKindOfCode)
 //    セットを作る = 作るのは通すが、親の税率は写さない (res.locals.masterLegacyWrite.writable のときだけ)。
 //    詳細画面・利益の試算・楽天の出品は Company DB の税率 (listing-tax.mjs)。本文を読んだ後に置く
 router.use(masterLegacyGate('product-hub'));
@@ -266,6 +268,8 @@ router.get('/list', (req, res) => {
     lpSpec: { enabled: lpComposeEnabled(), spec: lpSpecSummary(db, 'product_analysis') },
     shopCategoryCount: countActiveShopCategories(db),
     maxShopCategoryLines: MAX_SHOP_CATEGORY_LINES,
+    // 広げる道 PR-6: 一部の種類 (例: 単品) の新商品を新しい画面へ移したときの案内 (門 product-hub:screen:/list。移していなければ空)
+    masterLegacyKindNotice: legacyNewKindNoticeHtml(res.locals.masterLegacy),
   });
 });
 
@@ -287,7 +291,8 @@ router.get('/new', (req, res, next) => {
     return res.render(view('new.ejs'), {
       title: '新規商品ドラフト', displayName,
       // 切替で古い新商品の作り方を閉じた後だけ帯 (登録のボタンを隠す。POST /api/drafts は門が 410)。閉じる前は空文字 = 今までどおり
-      masterLegacyBanner: legacyBannerHtml(res.locals.masterLegacy, { hideSelectors: ['#create-btn'] }),
+      // 広げる道 PR-6: 単品だけ閉じた = 案内 (ボタンは残す = NE のセットのコードは今までどおり作れる。単品は POST が 409)
+      masterLegacyBanner: legacyBannerHtml(res.locals.masterLegacy, { hideSelectors: ['#create-btn'] }) + legacyNewKindNoticeHtml(res.locals.masterLegacy),
     });
   }
   res.render(view('new-guide.ejs'), { title: '新商品の登録', displayName, mode: gate.mode, phase: gate.phase || null });
@@ -567,6 +572,8 @@ router.post('/api/drafts', async (req, res) => {
       error: '商品コードの重複 (大文字小文字違い) があるため登録を停止しています。管理者にご連絡ください',
     });
   }
+  // 🚨 広げる道 PR-6 (種類ごとの門): 作る種類 (NE のセットのコード = セット・それ以外 = 単品) が閉じていれば 409 (書く前・この後は同期で書く)
+  if (refuseLegacyNewKind(res, newKindOfCode(db, neCode), { extra: { ne_code: neCode } })) return;
 
   // 既定でまとめる (2026-07-25 中原さん方針): 子SKUのコードで登録されたら、
   // 確認を挟まず代表商品コード (= 楽天1ページ) に正規化する。人の作業を最小にするため。
@@ -2822,7 +2829,16 @@ router.post('/api/register-codes', (req, res) => {
   if (codes.length > MAX_REGISTER_CODES) {
     return res.status(400).json({ ok: false, error: `一度に登録できるのは ${MAX_REGISTER_CODES} 件までです (指定: ${codes.length} 件)` });
   }
-  const r = registerByCodes(codes, { actor: actorOf(req), dryRun: req.body?.dry_run === true });
+  // 🚨 広げる道 PR-6 (種類ごとの門): コードごとに種類 (NE のセット = セット・それ以外 = 単品) を決め、閉じた種類のコードが 1 つでもあれば
+  //    丸ごと 409 (一部だけ作らない = 何を作ったか分かりにくくしない)。NE の写しを読めない = registerByCodes が断る (何も作らない)
+  const dryRunReg = req.body?.dry_run === true;
+  const phDb = getDB();
+  if (mirrorReady(phDb)) {
+    const byKind = new Map();
+    for (const c of codes) { const k = newKindOfCode(phDb, c); if (!byKind.has(k)) byKind.set(k, []); byKind.get(k).push(c); }
+    for (const [k, list] of byKind) if (refuseLegacyNewKind(res, k, { dryRun: dryRunReg, extra: { codes: list } })) return;
+  }
+  const r = registerByCodes(codes, { actor: actorOf(req), dryRun: dryRunReg });
   if (!r.ok) {
     const msg = {
       mirror_unavailable: 'NE商品マスタを参照できません (時間をおいて再試行してください)',
@@ -2850,6 +2866,8 @@ router.post('/api/intake/run', (req, res) => {
   if (req.session?.role !== 'admin') {
     return res.status(403).json({ ok: false, error: '自動取込の実行は管理者のみです' });
   }
+  // 広げる道 PR-6: 自動取込は NE の単品だけを作る (入口の門も単品の列で閉じる = ここは念のための同じ確かめ)
+  if (refuseLegacyNewKind(res, 'single', { dryRun: req.body?.dry_run === true })) return;
   const r = syncNewProducts({ dryRun: req.body?.dry_run === true, actor: actorOf(req) });
   if (!r.ok) {
     const msg = {

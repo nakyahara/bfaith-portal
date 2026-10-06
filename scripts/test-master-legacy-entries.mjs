@@ -191,6 +191,8 @@ for (const e of LEGACY_EXEMPT) {
     ok(useAt >= 0 && (firstWrite < 0 || useAt < firstWrite), `閉じ済み ${e.id}: router.use(${e.guard}) が全部の書き込みのルートより前`);
   } else if (e.kind === 'manual') {
     ok(!e.file && !e.method && !e.path, `手の入口 ${e.id}: コードを持たない (切替の証拠 manual_entries_stopped に載せる)`);
+    // 広げる道 PR-6 (G12): 手の入口も、人が書くキー (owner_cols) を持つ = 広げるときに止める手の入口を導ける
+    ok(Array.isArray(e.owner_cols) && e.owner_cols.length > 0, `手の入口 ${e.id}: owner_cols (人が書くキー) を持つ`);
   } else if (e.kind === 'company_db_outbox') {
     // ⑤-3b のマージで見つけた: ボードを開いたときの新しい登録の知らせの取り込み = 新しい道。MASTER_EDIT_OPEN = 1 の Render だけ (guard が書き手にある)
     const src = text.get(e.writer_file) || '';
@@ -263,6 +265,18 @@ console.log('── 5. 門が実際に掛かっている ──');
     const src = text.get(e.file) || '';
     // 門の共通の包み (runLegacyJob = 毎回段階を読む・終わるまで書きかけに数える。Codex #1565 R2 Medium 2) を通し、流さなかったら丸ごと止める
     ok(src.includes(`await runLegacyJob('${e.id}', `) && /if \(!job\.ran\) \{[\s\S]{0,600}?return;/.test(src), `${e.id}: 門の共通の包み (runLegacyJob) で毎回段階を読み・書きかけに数え、閉じていれば丸ごと止める (ログを残して return)`);
+  }
+  // 広げる道 PR-6 (G17): 単品もセットも作れる新商品の古い作り方は、handler が作る種類を決めて種類の門 (refuseLegacyNewKind) を通す (書く前)。
+  //   種類が 1 つだけの入口は、入口の門 (owner_cols = その種類の列・owner_match 'all') がそのまま種類の門
+  for (const e of LEGACY_ENTRIES.filter((x) => x.kind === 'route' && Array.isArray(x.new_kinds))) {
+    const b = blocks.find((x) => x.route && x.file === e.file && x.route.method === e.method && x.route.path === e.path);
+    if (e.new_kinds.length > 1) {
+      const at = b ? b.text.indexOf('refuseLegacyNewKind(res, ') : -1;
+      const firstWrite = b ? b.text.search(/registerByCodes\(|db\.transaction\(|INSERT INTO product_drafts/) : -1;
+      ok(at >= 0 && (firstWrite < 0 || at < firstWrite), `${e.id}: handler が書く前に種類の門 (refuseLegacyNewKind) を通す`);
+    } else {
+      ok(e.owner_match === 'all' && e.new_kinds.length === 1, `${e.id}: 種類が 1 つ = 入口の門がその種類の門`);
+    }
   }
   for (const e of LEGACY_ENTRIES.filter((x) => x.kind === 'route_part')) {
     const b = blocks.find((x) => x.route && x.file === e.file && x.route.method === e.method && x.route.path === e.path);
