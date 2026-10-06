@@ -2646,6 +2646,47 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
     vari.RAKUTEN_GROUP_NE_HINTS['8'].includes('宅急便')
     && vari.RAKUTEN_GROUP_NE_HINTS['5'].includes('ネコポス')
     && vari.RAKUTEN_GROUP_NE_HINTS['1'].includes('定形'));
+  {
+    // ─── 基本情報の配送方法を変えたら試算もそれに合わせる (2026-10-06 中原さん報告) ───
+    // 「配送方法を定形外にしているが利益計算が更新されない」= #1167 は候補を上に集めるだけで
+    // 選択は NE の登録値に留まっていた。楽天のグループは粒度が粗いので「どれで試算するか」を決める
+    const hints = { '1': ['定形'], '5': ['ネコポス'], '8': ['宅急便'] };
+    const opts = [
+      { method: '定形内（50g以内）', cost: 146, count: 12 },
+      { method: '定形外規格内（50g以内）', cost: 182, count: 900 },
+      { method: 'ネコポス', cost: 237, count: 3832, isCurrent: true },
+      { method: '定形外規格外（1kg以内）', cost: 510, count: 40 },
+      { method: '宅急便60サイズ', cost: 538, count: 417 },
+    ];
+    const picks = vari.profitShipPickByGroup(opts, hints);
+    check('配送方法で試算: 楽天「定形外」= いちばん多く使っている定形の便で試算する',
+      picks['1']?.method === '定形外規格内（50g以内）' && picks['1']?.cost === 182,
+      JSON.stringify(picks['1']));
+    check('配送方法で試算: 大きさで何通りあるか・送料の幅を返す (画面で選び直させるため)',
+      picks['1']?.from === 3 && picks['1']?.min === 146 && picks['1']?.max === 510,
+      JSON.stringify(picks['1']));
+    check('🚨 配送方法で試算: NE の登録値が当てはまるグループは代表値でなく NE の実送料を使う',
+      picks['5']?.method === 'ネコポス' && picks['5']?.isNe === true && picks['1']?.isNe === false,
+      JSON.stringify(picks['5']));
+    check('配送方法で試算: 候補が1つのグループもそのまま返す',
+      picks['8']?.method === '宅急便60サイズ' && picks['8']?.from === 1, JSON.stringify(picks['8']));
+    check('🚨 配送方法で試算: 当てはまる配送方法が無いグループはキーを作らない (画面は変えない)',
+      !('9' in vari.profitShipPickByGroup(opts, { ...hints, '9': ['ゆうパケット'] })),
+      JSON.stringify(Object.keys(vari.profitShipPickByGroup(opts, { ...hints, '9': ['ゆうパケット'] }))));
+    // NE の登録値が当てはまらないときは最多 → 同数なら高い方 (利益を実際より良く見せない側)
+    const tie = vari.profitShipPickByGroup(
+      [{ method: '定形A', cost: 300, count: 5 }, { method: '定形B', cost: 400, count: 5 }], { '1': ['定形'] });
+    check('配送方法で試算: 使われた数が同じなら高い方で試算する (利益を良く見せない側)',
+      tie['1']?.method === '定形B' && tie['1']?.cost === 400, JSON.stringify(tie['1']));
+    // 送料が無い行は画面の選択肢にも無い = 合わせ先にしない (0円で利益を過大に見せない)
+    const noCost = vari.profitShipPickByGroup(
+      [{ method: '定形なし', cost: null, count: 9 }, { method: '定形あり', cost: 182, count: 1 }], { '1': ['定形'] });
+    check('配送方法で試算: 送料が分からない配送方法は合わせ先にしない',
+      noCost['1']?.method === '定形あり', JSON.stringify(noCost['1']));
+    check('配送方法で試算: 選択肢が空でも落ちない', JSON.stringify(vari.profitShipPickByGroup([], hints)) === '{}');
+    check('配送方法で試算: 既定の目安 (引数を省く) でも楽天「定形外」が決まる',
+      vari.profitShipPickByGroup(opts)['1']?.method === '定形外規格内（50g以内）');
+  }
   db.prepare('DELETE FROM mirror_products WHERE product_id BETWEEN 99500 AND 99599').run();
 }
 // ─── 他社の商品ページURL → ジャンルID (2026-09-04) ────────────────────────
@@ -9564,6 +9605,19 @@ check('extractAsin: どちらも無ければ null', dbmod.extractAsin({}) === nu
     !evil.sales.includes('"onerror="'), evil.sales.slice(0, 300));
 }
 
+// 利益試算の配送方法の選択肢 (詳細画面の fixture)。
+// 🚨 `</script>` 入りの配送方法名は JSON 埋め込みのエスケープの番人なので外さない。
+// 定形外は**大きさで送料が変わる** (3通り) ので、楽天「定形外」に合わせる動きもここで描かせる
+const detailShipOptions = [
+  { method: '定形内（50g以内）', cost: 146, count: 12 },
+  { method: '定形外規格内（50g以内）', cost: 182, count: 900 },
+  { method: 'ネコポス', cost: 237, count: 3832, isCurrent: true },
+  { method: '定形外規格外（1kg以内）', cost: 510, count: 40 },
+  { method: '宅急便60サイズ', cost: 538, count: 417 },
+  { method: '</script><script>alert(1)</script>', cost: 999, count: 1 },
+];
+const detailShipHints = { '1': ['定形'], '5': ['ネコポス'], '8': ['宅急便'] };
+
 const renders = [
   ['index.ejs (banner+rows+import panel)', 'index.ejs', {
     title: 't', displayName: 'smoke',
@@ -9627,7 +9681,8 @@ const renders = [
     rakuten: { genre_id: '205761', attributes_json: '[{"name":"ブランド名","values":["x"]}]', article_number: null, registered_at: null, last_error: null, shipping_method_group: '5', postage_included: 1, normal_delivery_date_id: '1000', white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://drive.google.com/file/d/gw/view', published_at: null }, cabinetImages: [],
     genreDict: { genreId: '205761', genreName: '入浴剤', genrePath: '美容・コスメ > 入浴剤', fixedAt: null, fetchedAt: '2026-07-28T00:00:00Z', attributes: [{ name: 'ブランド名', mandatory: true, inputMethod: 'DESCRIPTIVE', multiValueLimit: 3, maxLength: 100, unit: null, dataType: 'STRING', mandatoryType: 'MANDATORY' }] },
     neCost: { costExTax: 660, shippingCost: 237, shippingMethod: 'ネコポス', taxPercent: 10 }, profitSim: { profit: 189, marginPct: 14.8, costIncTax: 726 }, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, setDecisionReasons: sd.SET_DECISION_REASONS, neShippingOptions: [{ method: 'ネコポス', cost: 237, count: 3832 }, { method: '宅急便60サイズ', cost: 538, count: 417 }, { method: '</script><script>alert(1)</script>', cost: 999, count: 1 }], rakutenGroupNeHints: { '5': ['ネコポス'], '8': ['宅急便'] }, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '1y5', ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, setDecisionReasons: sd.SET_DECISION_REASONS, neShippingOptions: detailShipOptions, rakutenGroupNeHints: detailShipHints,
+    profitShipPicks: vari.profitShipPickByGroup(detailShipOptions, detailShipHints), yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '1y5', ...pageInfoVars,
     // 商品ページ表記: 化粧品 + NE推測の配送で全分岐を描かせる
     pageInfo: { product_type: 'cosmetics', content_volume: '50ml', size_text: null, ingredients: '水', usage_notes: null, origin_type: '海外製', origin_country: 'フランス', category_label: '化粧品', seller_name: 'メーカーA', importer_name: '輸入者B', food_name: null, food_ingredients: null, food_expiry: null, food_storage: null },
     pageInfoHtml: '<table><tr><td>x</td></tr></table>',
@@ -10280,6 +10335,8 @@ for (const [name, file, data] of renders) {
     const html = await ejs.renderFile(path.join(views, file),
       {
         thumbnailUrl, fileViewUrl, shopCatSyncState: null,
+        // 楽天の配送方法を変えたとき利益試算をどれに合わせるか (2026-10-06)。既定 = 合わせ先なし
+        profitShipPicks: {},
         // 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18)。既定 = 無し。
         //    「ある」ときの見え方は fixture 側で上書きする
         backLabelPhotos: [], backLabelOcrEnabled: false,
@@ -12932,10 +12989,23 @@ for (const [name, file, data] of renders) {
   check('配送費の試算: 配送費は書き換えられる変数で持つ (固定の const ではない)',
     /let ship = Number\(box\.dataset\.ship\)/.test(sim) && !/const ship = Number\(box\.dataset\.ship\)/.test(sim));
   check('配送費の試算: 配送方法を変えたら利益を再計算する',
-    /sel\.addEventListener\('change', apply\)/.test(sim) && /ship = Number\(op\.dataset\.cost\)/.test(sim)
-    && /function apply\(\)[\s\S]{0,400}render\(\)/.test(sim));
-  check('配送費の試算: 楽天の配送方法を変えたら候補を組み直す',
-    /rkShip\.addEventListener\('change', build\)/.test(sim));
+    /sel\.addEventListener\('change', [\s\S]{0,60}apply\(\)/.test(sim) && /ship = Number\(op\.dataset\.cost\)/.test(sim)
+    && /function apply\(\)[\s\S]{0,600}render\(\)/.test(sim));
+  // 🚨 候補を組み直すだけでは利益が動かない (2026-10-06 中原さん報告)。**選択も合わせる**こと
+  check('配送費の試算: 楽天の配送方法を変えたら候補を組み直し、試算もその配送方法に合わせる',
+    /rkShip\.addEventListener\('change', \(\) => build\(\{ follow: true \}\)\)/.test(sim)
+    && /const pick = doFollow \? data\.picks\?\.\[group\] : null/.test(sim)
+    && /sel\.value = \(pick && data\.options\.some/.test(sim));
+  check('🚨 配送費の試算: 読み込み時は合わせない (開いただけで利益額を代えない)',
+    /build\(\);/.test(sim) && !/build\(\{ follow: true \}\);/.test(sim)
+    && /function build\(\{ follow = false \} = \{\}\)/.test(sim));
+  check('配送費の試算: 未選択 (— 選んでください) に戻したときは合わせない',
+    /const doFollow = follow && group !== ''/.test(sim));
+  check('配送費の試算: 何で試算したか・ほかに何通りあるかを画面に書く',
+    /function followNote\(\)/.test(sim) && sim.includes('で試算しています')
+    && sim.includes('違うなら選び直してください') && sim.includes('選択肢にありません'));
+  check('配送費の試算: 試算のプルダウンを自分で選び直したら、合わせた注記は消える',
+    /sel\.addEventListener\('change', \(\) => \{ followed = null; apply\(\); \}\)/.test(sim));
   check('配送費の試算: 売価の入力でも従来どおり再計算する',
     /priceInput\.addEventListener\('input', render\)/.test(sim));
   check('配送費の試算: 試算であって NE や出品内容は変えないと画面に書く',
