@@ -339,6 +339,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         sku_kind_raw_mismatch: result.ne.sku_kind_raw_mismatch ?? null,
         sku_kind_raw_mismatch_count: result.ne.sku_kind_raw_mismatch_count ?? null,
         kind_gate: result.ne.kind_gate ?? null,
+        fetch_counts: result.ne.fetch_counts ?? null,   // 今朝の取得の件数の状態 (区分のゲートの integrity_untrusted の内訳)
         baseline: result.ne.baseline ? { state: result.ne.baseline.state, held_reason: result.ne.baseline.held_reason ?? null, write: result.ne.baseline.write ?? null, write_code: result.ne.baseline.write_code ?? null,
           counts: result.ne.baseline.counts ?? null, written: result.ne.baseline.written ?? null } : null } : null,
       // ②b 古い表 (由来 = 作り直しの ID・写しの世代。比べない朝は not_applied と理由だけ)

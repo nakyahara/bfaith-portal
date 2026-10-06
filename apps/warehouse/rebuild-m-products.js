@@ -15,7 +15,7 @@ import {
 import crypto from 'node:crypto';
 import { normSku } from '../../lib/sku-norm.js';
 import { ALL_LOAD } from '../company-db/load/ownership-state.mjs';
-import { readCurrentPublish, makePublishResolver, mergeReasons, kindReason, handlingFromCdb, publishCols, applySideTables, verifyApplied, ownershipHash, writeSetPublishExpect, writeKindFrozen } from './master-publish.js';
+import { readCurrentPublish, makePublishResolver, mergeReasons, kindReason, handlingFromCdb, publishCols, applySideTables, verifyApplied, ownershipHash, writeSetPublishExpect, writeKindFrozen, kindFrozenSnapshot } from './master-publish.js';
 
 // ─── ヘルパー ───
 
@@ -630,7 +630,8 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
         db.prepare(`INSERT INTO m_set_components_staging (${colList(MSC_COLS)}) SELECT ${colList(MSC_COLS)} FROM main.m_set_components WHERE セット商品コード = ?`).run(code);
       }
       pub.forget(code);
-      kindFrozen.push({ code, prev: !!prev });
+      // 固定した時の行と構成 (入れ替えの前の main = この作り直しで入れる行そのもの)。載せない = 行も構成も無い
+      kindFrozen.push({ code, prev: !!prev, snapshot: prev ? kindFrozenSnapshot(db, code, { products: 'main.m_products', components: 'main.m_set_components' }) : JSON.stringify({ product: null, components: [] }) });
       for (const x of reasons.filter((y) => y.code === code)) reasons.splice(reasons.indexOf(x), 1);   // NE の道の理由は使わない (前の行のまま / 載せない)
       const ck = pub.publication?.entries?.get(normSku(code))?.kind ?? null;
       reasons.push({ code, kind: neKind, col: 'kind', reason: 'kind_c_set_ne_single_frozen', owner_key: 'skus.sku_kind', cdb_value: { kind: ck }, value: prev ? 'previous_row' : 'omitted', ne_value: neKind, generation_no: pub.generation?.generation_no ?? null });

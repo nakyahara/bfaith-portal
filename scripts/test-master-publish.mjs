@@ -2153,7 +2153,25 @@ await ta('[33] 区分の持ち主が C の 9 升 (C の区分 3 × NE の区分 
   db.exec('DELETE FROM m_publish_kind_frozen');
   const v3 = MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: own, taxRates: TAX_RATES, maxProblems: Infinity });
   assert.ok(v3.problems.some((x) => x.code === 'q-ts' || x.code === 'q-xs'), JSON.stringify(v3.problems.slice(0, 5)));
-  for (const f of keepFrozen) db.prepare('INSERT INTO m_publish_kind_frozen (code, prev_row) VALUES (?, ?)').run(f.code, f.prev_row);
+  for (const f of keepFrozen) db.prepare('INSERT INTO m_publish_kind_frozen (code, prev_row, snapshot) VALUES (?, ?, ?)').run(f.code, f.prev_row, f.snapshot);
+  // わざと壊す (#1641 Codex R1 High): 印を残したまま、前の行のまま の商品の行 (名前・原価)・構成の行を書き換える / 載せない SKU の行を足す = 確かめで見つかり・ハッシュも変わる
+  const vOk = MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: own, taxRates: TAX_RATES, maxProblems: Infinity });
+  assert.equal(vOk.ok, true, JSON.stringify(vOk.problems.slice(0, 3)));
+  const tamper = [
+    ["UPDATE m_products SET 商品名 = '書き換え' WHERE 商品コード = 'q-ts'", "UPDATE m_products SET 商品名 = ? WHERE 商品コード = 'q-ts'", prev['q-ts'].商品名, 'q-ts'],
+    ["UPDATE m_products SET 原価 = 1 WHERE 商品コード = 'q-xs'", "UPDATE m_products SET 原価 = ? WHERE 商品コード = 'q-xs'", prev['q-xs'].原価, 'q-xs'],
+    ["UPDATE m_set_components SET 数量 = 9 WHERE セット商品コード = 'q-ts'", "UPDATE m_set_components SET 数量 = ? WHERE セット商品コード = 'q-ts'", prevC['q-ts'][0].数量, 'q-ts'],
+    ["INSERT INTO m_products (商品コード, 商品名, 商品区分, 原価状態, updated_at) VALUES ('q-new', '足した', 'セット', 'MISSING', 'x')", "DELETE FROM m_products WHERE 商品コード = 'q-new'", undefined, 'q-new'],
+  ];
+  assert.ok(prevC['q-ts'].length > 0);   // q-ts の前の行はセット (構成つき)
+  for (const [bad, undo, val, code] of tamper) {
+    db.prepare(bad).run();
+    const vb = MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: own, taxRates: TAX_RATES, maxProblems: Infinity });
+    assert.ok(vb.problems.some((x) => x.code === code && x.col === 'kind_frozen'), `${bad}: ${JSON.stringify(vb.problems.slice(0, 3))}`);
+    assert.notEqual(vb.applied_hash, vOk.applied_hash, bad);
+    if (val === undefined) db.prepare(undo).run(); else db.prepare(undo).run(val);
+  }
+  assert.equal(MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: own, taxRates: TAX_RATES, maxProblems: Infinity }).applied_hash, vOk.applied_hash);
   // 下流 3 系統: f_sales (Amazon の注文のセット展開) / 商品管理リスト / router の未登録一覧
   db.exec('CREATE TABLE IF NOT EXISTS raw_rakuten_orders (order_number TEXT, order_date TEXT, order_status INTEGER, item_number TEXT, item_name TEXT, price_tax_incl REAL, units INTEGER, delete_item_flag INTEGER)');
   const { rebuildFSales } = await import('../apps/warehouse/rebuild-f-sales.js');

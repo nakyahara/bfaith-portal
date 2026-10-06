@@ -20,6 +20,7 @@ import { readMaterialSnapshot } from '../../warehouse/material-lineage.js';
 import { readEvidence } from '../push/evidence.mjs';
 import { planFromSnapshot, subjectKey, sameValue } from './compare-load.mjs';
 import { evaluateBaseline } from './baseline.mjs';
+import { readNeFetchCounts } from '../../warehouse/ne-fetch-counts.js';
 
 export const NE_FORMAT = 'mc-ne-v1';
 /** NE の取扱区分で知っている語 (2026-09-26 の実データ。これ以外は invalid = 照合しない。今のロードの mapHandling は知らない語も discontinued にする) */
@@ -320,7 +321,10 @@ export function readNeSide(dataDir) {
       // 例外の表 (例外の原価のコード) = 区分のゲートの母集合 E (広げる道 v11 §3.6.4)。同じ読み取りの取引で。表が無い = 空
       let exceptions = [];
       try { exceptions = db.prepare('SELECT sku FROM exception_genka').all().map((r) => r.sku); } catch { exceptions = []; }
-      return { meta, products, sets, setRowsTotal, build, hasSrc, spellings, exceptions };
+      // 今朝の取得の件数 (広げる道 PR-9 = #1642。取得が完了の印と同じ取引で残した fetched / write_attempts / stored / 落とした行)。同じ読み取りの取引で読む
+      let fetchCounts;
+      try { fetchCounts = readNeFetchCounts(db); } catch (e) { fetchCounts = { ok: false, error: String(e && e.message).slice(0, 200) }; }
+      return { meta, products, sets, setRowsTotal, build, hasSrc, spellings, exceptions, fetchCounts };
     } finally { db.exec('COMMIT'); }
   } finally { db.close(); }
 }
@@ -824,6 +828,25 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   const carryKeys = new Set();   // 評価しきれなかった案件 = 台帳の単位をそのまま書き写す
   const regList = { waiting: [], stale: [], cancelled: [], kind_mismatch: [], partial: [] };   // ポータルで登録した新商品で NE に無いもの・区分違い (照合の報告に残す)
   const regEntry = (code, norm, kind, reg) => ({ code, norm, kind, state: reg.state, stage: reg.stage ?? null, since: reg.since, created: reg.created, days: reg.days ?? null });
+  /**
+   * 区分の差 (NE の区分 ≠ C の区分) の分類 = 1 か所 (例外の分岐と通常の分岐で同じ順。#1641 Codex R1 Medium):
+   *   1. ポータルで登録した新商品で登録待ち (下書き・NE 登録待ち) = reg_kind_mismatch (#1635。区分の持ち主によらず最優先)
+   *   2. 区分の持ち主が C (昨夜のロードが記録) = company の分類 (classifyKindCompany)
+   *   3. それ以外 = 今までの分類
+   *   1 つの SKU に区分の列は 1 つ (二重に数えない)
+   */
+  const kindLabel = (k) => (k === 'set' ? 'セット' : k === 'exception' ? '例外' : '単品');
+  const classifyKindDiff = (norm, code, neKind, cKind, entity) => {
+    const rg = registrations && registrations.state === 'ok' ? registrations.byNorm.get(norm) : null;
+    if (rg && REG_WAIT_STATES.includes(rg.state)) {
+      regList.kind_mismatch.push({ ...regEntry(code, norm, cKind, { ...rg, days: null }), ne_kind: neKind });
+      return { cls: 'reg_kind_mismatch', detail: { n_state: 'value', n_validity: 'ok', n: neKind, c: cKind, reg_state: rg.state, reg_stage: rg.stage, reg_since: rg.since,
+        note: `ポータルで${kindLabel(cKind)}として登録したのに NE は${kindLabel(neKind)}` }, explained: { reason: 'reg_kind_mismatch', state: rg.state } };
+    }
+    if (kindCompany) return classifyKindCompany(norm, neKind, cKind);
+    return classify({ key: subjectKey('kind', norm), type: 'kind', norm, col: 'kind', nst: { raw: 'value', validity: 'ok' }, nv: neKind,
+      tt: tValue(tToday, norm, 'kind'), tl: tLoad ? tValue(tLoad, norm, 'kind') : undefined, c: cKind, entity });
+  };
   const universe = new Set([...nm.keys(), ...cdb.skuByNorm.keys()]);
   for (const norm of universe) {
     const n = nm.get(norm) || null;
@@ -836,10 +859,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       const neKind = n ? n.kind : (tk === 'exception' || exceptionNorms.has(norm) ? 'exception' : null);
       const kindDiff = !!cRow && !!neKind && neKind !== cRow.sku_kind && !collidedNorms.has(norm) && !intBlocked.has(norm);
       if (kindDiff) {
-        const r = kindCompany ? classifyKindCompany(norm, neKind, cRow.sku_kind)
-          : classify({ key: subjectKey('kind', norm), type: 'kind', norm, col: 'kind', nst: { raw: 'value', validity: 'ok' }, nv: neKind,
-            tt: tValue(tToday, norm, 'kind'), tl: tLoad ? tValue(tLoad, norm, 'kind') : undefined, c: cRow.sku_kind, entity: 'products' });
-        addCol('kind', norm, code, neKind, r, 'kind');
+        addCol('kind', norm, code, neKind, classifyKindDiff(norm, code, neKind, cRow.sku_kind, 'products'), 'kind');
       }
       for (const t of PROBLEM_TYPES) if (!(kindDiff && t === 'kind')) out.out_of_scope[subjectKey(t, norm)] = 'exception_item';
       continue;
@@ -895,17 +915,8 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       out.recoverable.push(subjectKey('only_in_cdb', norm));
       continue;
     } else if (n.kind !== cRow.sku_kind) {
-      // ポータルで登録した新商品 (NE 登録の前〜確かめ待ち) の区分が NE と違う (単品で登録したのに NE はセット など) = 重大な登録の不一致。反映待ち・材料の説明より先に分ける
-      const rg = registrations && registrations.state === 'ok' ? registrations.byNorm.get(norm) : null;
-      const r = rg && REG_WAIT_STATES.includes(rg.state)
-        ? { cls: 'reg_kind_mismatch', detail: { n_state: 'value', n_validity: 'ok', n: n.kind, c: cRow.sku_kind, reg_state: rg.state, reg_stage: rg.stage, reg_since: rg.since,
-          note: `ポータルで${cRow.sku_kind === 'set' ? 'セット' : '単品'}として登録したのに NE は${n.kind === 'set' ? 'セット' : '単品'}` }, explained: { reason: 'reg_kind_mismatch', state: rg.state } }
-        // それ以外 = 区分の持ち主が C (昨夜のロードが記録) なら company の分類 (sku_kind 準備の PR)・load なら今までの分類 (1 つの SKU に区分の列は 1 つ = 二重に数えない)
-        : kindCompany ? classifyKindCompany(norm, n.kind, cRow.sku_kind)
-        : classify({ key: subjectKey('kind', norm), type: 'kind', norm, col: 'kind', nst: { raw: 'value', validity: 'ok' }, nv: n.kind,
-          tt: tValue(tToday, norm, 'kind'), tl: tLoad ? tValue(tLoad, norm, 'kind') : undefined, c: cRow.sku_kind, entity });
-      if (r.cls === 'reg_kind_mismatch') regList.kind_mismatch.push({ ...regEntry(code, norm, cRow.sku_kind, { ...rg, days: null }), ne_kind: n.kind });
-      addCol('kind', norm, code, n.kind, r, 'kind');
+      // ポータルで登録した新商品の区分違い (reg_kind_mismatch) が最優先・次に区分の持ち主 (classifyKindDiff)
+      addCol('kind', norm, code, n.kind, classifyKindDiff(norm, code, n.kind, cRow.sku_kind, entity), 'kind');
       for (const t of ['value', 'cost', 'primary_supplier', 'components', 'parent']) holdKey(t, norm, 'kind_mismatch');
       out.recoverable.push(subjectKey('only_in_cdb', norm));
       continue;
@@ -1137,6 +1148,9 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   //   区分 = 表への所属 (NE の生には商品区分の列が無い): S にある = セット (P にもあるのは正常) / P にだけ = 単品 / P にも S にも無く E にある = 例外 (E_only = E − (P ∪ S)) / どれにも無い = NE に無い。
   //   kind_gate = 次の 5 つの鍵だけ (照合の封 ops.master_compare_seals の kind_gate に PR-7 でつなぐ):
   //     integrity_untrusted = P・S の行で、空のコード・形の壊れた行 (セットの子が空)・取込の整合で保持した SKU (intBlocked) に当たる行の数
+  //       + 今朝の取得が raw 表に書く前に落とした行 (dropped_no_code + dropped_missing_fields) と重なって上書きされた行 (write_attempts − stored_rows)。
+  //       取得の件数が読めない (取得中・記録が無い・形が崩れた・別の回・版が違う) 種類は 1 と数える (fail-closed。理由は fetch_counts に)
+  //     raw_unverifiable_affected_existing_cdb には、保存した行の有無によらず取込の整合で保持した SKU (intBlocked = 子が全部空で落ちたセットの親・重なったコード) も入れる
   //     norm_collision = P のコードと S の親のコードで同じ code_norm に違う書き方が 2 つ以上ある code_norm の数 (nModelOf と同じ。セットの子の衝突は親に数える)
   //     unknown_kind = 区分を本当に決められない code_norm の数 = 今の母集合では必ず 0 (所属で必ず決まる・壊れた行は integrity_untrusted)。
   //       🚨 P / S と例外の表の重なりは原価の補完 (単品・セットにも例外原価の行がある) = 区分不明にしない (作り直しも P・S を優先する。Codex R12 High)
@@ -1160,10 +1174,26 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     }
     // 区分を決められない code_norm = 今の母集合では必ず 0 (所属で必ず決まる。壊れたセットの行は integrity_untrusted だけに数える。Codex R13 Low)
     const unknown = new Set();
-    const affected = new Set([...badRowNorms, ...nCollided, ...unknown].filter((k) => cdb.skuByNorm.has(k)));
+    // 今朝の取得の件数 (#1642)。読めない種類 = 1 (fail-closed)
+    const fc = ne.fetchCounts || { ok: false };
+    let fetchUntrusted = 0;
+    const fetchState = { ok: !!fc.ok, fetch_fingerprint: fc.fetch_fingerprint ?? null, ...(fc.error ? { error: fc.error } : {}), ...(fc.fetch_fingerprint_mismatch ? { fetch_fingerprint_mismatch: true } : {}) };
+    for (const kind of ['products', 'setproducts']) {
+      const r = fc[kind];
+      if (r && r.ok) {
+        const c = r.counts;
+        const dropped = c.dropped_no_code + c.dropped_missing_fields, dup = c.write_attempts - c.stored_rows;
+        fetchUntrusted += dropped + dup;
+        fetchState[kind] = { ok: true, dropped_no_code: c.dropped_no_code, dropped_missing_fields: c.dropped_missing_fields, overwritten: dup };
+      } else { fetchUntrusted += 1; fetchState[kind] = { ok: false, reason: r ? r.reason : (fc.error ? 'error' : 'unreadable') }; }
+    }
+    if (!fc.ok && fc.fetch_fingerprint_mismatch && fetchUntrusted === 0) fetchUntrusted = 1;   // 2 つの取得の版が違う = 信用しない
+    integrityRows += fetchUntrusted;
+    out.fetch_counts = fetchState;
+    const affected = new Set([...badRowNorms, ...intBlocked.keys(), ...nCollided, ...unknown].filter((k) => cdb.skuByNorm.has(k)));
     const codes = [];
     for (const [norm, cRow] of cdb.skuByNorm) {
-      if (badRowNorms.has(norm) || nCollided.has(norm) || unknown.has(norm)) continue;
+      if (badRowNorms.has(norm) || intBlocked.has(norm) || nCollided.has(norm) || unknown.has(norm)) continue;
       const neKind = S.has(norm) ? 'set' : P.has(norm) ? 'single' : E.has(norm) ? 'exception' : null;
       if (!neKind || neKind === cRow.sku_kind) continue;
       codes.push(cRow.code);

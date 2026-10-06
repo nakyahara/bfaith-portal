@@ -139,6 +139,11 @@ function setNe(ne, asOf, { intP = {}, intS = {}, dropIntKeys = [] } = {}) {
   up('ne_api_setproducts_complete_parents', String(new Set(ne.sets.map((r) => r.parent)).size));
   const s = { ...INT_S, ...intS }; for (const k of dropIntKeys) delete s[k];
   up('ne_api_products_integrity', JSON.stringify({ ...INT_P, ...intP })); up('ne_api_setproducts_integrity', JSON.stringify(s));
+  // 取得の件数 (#1642 の ne-fetch-counts.js の形)。この試験の NE は落とした行・重なりの無いきれいな取得 (本物の取込を通す試験は [38])
+  const fc = (kind, n, rev, detail, notes) => JSON.stringify({ version: 'fc1', kind, fetch_fingerprint: 'a'.repeat(64), complete_at: ts, complete_rev: Number(rev), fetched_rows: n, write_attempts: n, stored_rows: n,
+    dropped_no_code: 0, dropped_missing_fields: 0, dropped_missing_detail: detail, notes, page_limit: 1000, pages: 1, page_rows: [n], last_page_rows: n });
+  up('ne_api_products_fetch_counts', fc('products', ne.products.length, meta('ne_raw_products_rev'), {}, {}));
+  up('ne_api_setproducts_fetch_counts', fc('setproducts', ne.sets.length, meta('ne_raw_setproducts_rev'), { set_goods_detail_goods_id: 0 }, { quantity_defaulted_rows: 0 }));
   return { at: ts, prev: meta('ne_raw_products_rev'), srev: meta('ne_raw_setproducts_rev') };
 }
 function setBuild(asOf, marks, reasons = []) {
@@ -1675,6 +1680,86 @@ await ta('[37] 区分の持ち主が C でも、登録待ち (下書き・NE 登
   assert.deepEqual(x.ne.decisions.filter((d) => d.subject_key === 'kind:r901').map((d) => d.reason_kind), ['reg_kind_mismatch']);
   assert.ok(x.ne.sku_kind_raw_mismatch.codes.includes('r901'));   // 生の数 (ゲート) には入る = 登録待ちでも区分の差は区分の差
   assert.equal(x.ne.kind_gate.raw_mismatch, x.ne.sku_kind_raw_mismatch.count);
+  // 例外の分岐でも登録待ちが最優先 (#1641 Codex R1 Medium): 下書きの単品 r902・NE 登録待ちのセット r903 を、NE は例外 (例外の表だけ・今朝の材料の例外の行) で持つ
+  const regSku = async (code, kind, state) => {
+    await pg.query('begin');
+    const pp = kind === 'single' ? (await pg.query(`insert into core.products (company_id, display_code, name, status) values (1, $1, $1, 'active') returning product_id`, [code])).rows[0].product_id : null;
+    const s2 = (await pg.query(`insert into core.skus (company_id, product_id, sku_kind, code, name) values (1, $1, $2, $3, $3) returning sku_id`, [pp, kind, code])).rows[0].sku_id;
+    await pg.query('select ops.create_sku_registration($1, $2)', [s2, 'naka@test']);
+    await pg.query('commit');
+    if (state !== 'draft') {
+      await pg.query('begin'); await pg.query("select set_config('ops.registration_protocol', '1', true)");
+      await pg.query('update ops.master_registrations set state = $2 where sku_id = $1', [s2, state]); await pg.query('commit');
+    }
+  };
+  await regSku('r902', 'single', 'draft'); await regSku('r903', 'set', 'ne_pending');
+  assert.deepEqual((await db.query("select s.code, r.state from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id where s.code in ('r902', 'r903') order by s.code")).rows.map((r) => [r.code, r.state]), [['r902', 'draft'], ['r903', 'ne_pending']]);
+  wh().prepare("INSERT OR REPLACE INTO exception_genka (sku, genka, 商品名, synced_at) VALUES ('r902', 9, 'x', 'x'), ('r903', 9, 'x', 'x')").run();
+  const matEx = toMaterial(NE, (m) => { for (const [c, pid] of [['r902', 902], ['r903', 903]]) m.products.push({ 商品コード: c, 商品名: c, 商品区分: '例外', 取扱区分: '取扱中', 標準売価: null, 原価: 9, 原価ソース: '例外', 原価状態: 'OVERRIDDEN', 消費税率: 0.1, 税区分: 'STANDARD_10', product_id: pid }); });
+  const y = await day('2030-11-03', { ne: NE, material: matEx, ownership: own });
+  for (const [code, c] of [['r902', 'single'], ['r903', 'set']]) {
+    const k = col(y.ne, `kind:${code}`, 'kind');
+    assert.deepEqual(k.map((z) => [z.cls, z.n, z.c]), [['reg_kind_mismatch', 'exception', c]], `${code}: ${JSON.stringify(k)}`);
+    const ds = y.ne.decisions.filter((d) => d.subject_key === `kind:${code}`);
+    assert.deepEqual(ds.map((d) => d.reason_kind), ['reg_kind_mismatch']);   // company_owned は 0 件
+    assert.ok(y.ne.reg_pending.kind_mismatch.some((e) => e.code === code && e.ne_kind === 'exception'));
+  }
+  wh().prepare("DELETE FROM exception_genka WHERE sku IN ('r902', 'r903')").run();
+});
+
+await ta('[38] 区分のゲートは本物の取込 (fetchProducts / fetchSetProducts) が raw 表に書く前に落とした行・重なりも数える: コードが空の商品・子が空の行だけのセット (親は intBlocked で affected に)・同じコードが 2 度 (#1641 Codex R1 High 2・#1642 の取得の件数)', async () => {
+  fs.writeFileSync(path.join(tmp, 'ne-tokens.json'), JSON.stringify({ access_token: 'a', refresh_token: 'r' }));
+  const api = { goods: [], setgoods: [] };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    if (!u.startsWith('https://api.next-engine.org')) return realFetch(url, opts);
+    const q = new URLSearchParams(opts.body); const offset = Number(q.get('offset')), limit = Number(q.get('limit'));
+    const rows = (u.endsWith('/api_v1_master_goods/search') ? api.goods : api.setgoods).slice(offset, offset + limit);
+    return { ok: true, status: 200, json: async () => ({ result: 'success', data: rows }) };
+  };
+  try {
+    const { fetchProducts, fetchSetProducts } = await quietly(() => import('../apps/warehouse/ne-api.js'));
+    const NE = baseNe();
+    const goodsOf = (r) => ({ goods_id: r.code, goods_name: r.name, goods_supplier_id: r.supplier, goods_cost_price: JSON.parse(r.cost_src), goods_selling_price: JSON.parse(r.price_src),
+      goods_merchandise_name: r.handling, goods_representation_id: '', goods_tax_rate: JSON.parse(r.tax_src) });
+    const setOf = (r) => ({ set_goods_id: r.parent, set_goods_name: r.name, set_goods_selling_price: JSON.parse(r.price_src), set_goods_detail_goods_id: r.child, set_goods_detail_quantity: JSON.parse(r.qty_src) });
+    api.goods = [...NE.products.map(goodsOf),
+      { goods_id: '', goods_name: 'コードが空' },                                  // 書く前に落とす (dropped_no_code)
+      { ...goodsOf(NE.products.find((r) => r.code === 'c003')), goods_id: 'C003' }];   // 同じコードが 2 度 (小文字にして重なる = 上書き)
+    api.setgoods = [...NE.sets.map(setOf),
+      { set_goods_id: 'e005', set_goods_name: '子が空', set_goods_selling_price: '1', set_goods_detail_goods_id: '', set_goods_detail_quantity: '1' },   // 子が空の行だけ = 書く前に落とす・親は missing_child_parents
+      { set_goods_id: 'z801', set_goods_name: '子が空', set_goods_selling_price: '1', set_goods_detail_goods_id: '', set_goods_detail_quantity: '1' }];   // 社内のセット z801 = 商品の表にも無い (保存した行が 1 つも無い親)
+    await db.query("insert into core.skus (company_id, sku_kind, code, name) values (1, 'set', 'z801', 'セット z801') on conflict do nothing");
+    const asOf = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10);   // 本物の取込の時刻 = 今日 (JST)
+    await nightly(asOf);
+    await quietly(() => fetchProducts()); await quietly(() => fetchSetProducts());
+    const m = (k) => wh().prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value;
+    // 取込は落とした行を raw 表に書かない (保存した行を数えるだけでは見えない)
+    assert.equal(wh().prepare("SELECT COUNT(*) AS n FROM raw_ne_products WHERE 商品コード = ''").get().n, 0);
+    assert.equal(wh().prepare("SELECT COUNT(*) AS n FROM raw_ne_set_products WHERE セット商品コード = 'e005'").get().n, 0);
+    // 作り直しの記録 (本物の印)・Render へ送る・照合
+    const pa = m('ne_api_products_complete_at'), sa = m('ne_api_setproducts_complete_at');
+    wh().prepare('DELETE FROM m_products_builds').run();   // 前の試験の 2030 年の作り直しの記録 (今日より新しい) を外す = 今朝の作り直しがこの回
+    const id = `mpb_${asOf.replace(/-/g, '')}_real38`; const pub = at(asOf, '08:07').toISOString();
+    wh().prepare(`INSERT INTO m_products_builds (build_id, daily_sync_run_id, started_at, published_at, ne_products_complete_at, ne_setproducts_complete_at, products_rows, products_hash,
+      set_components_rows, set_components_hash, rule_version, reason_counts, reasons, ne_products_complete_rev, ne_setproducts_complete_rev) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, `ds_${asOf}`, pub, pub, pa, sa, 0, 'x', 0, 'x', 'v', '{}', '[]', Number(m('ne_api_products_complete_rev')), Number(m('ne_api_setproducts_complete_rev')));
+    sendToRender(toMaterial(NE), asOf, id);
+    const r = await compare(asOf);
+    const ne = r.result.ne;
+    assert.notEqual(ne.verdict, 'blocked', ne.blocked_reason);
+    assert.deepEqual([ne.fetch_counts.ok, ne.fetch_counts.products, ne.fetch_counts.setproducts],
+      [true, { ok: true, dropped_no_code: 1, dropped_missing_fields: 0, overwritten: 1 }, { ok: true, dropped_no_code: 0, dropped_missing_fields: 2, overwritten: 0 }]);
+    // integrity = 書く前に落とした 3 行 + 重なり 1 行 + 保持した SKU (intBlocked の c003・e005) の保存した商品の行 2 行 = 6
+    //   affected = intBlocked の c003 (重なり)・e005・z801 (子が空のセットの親。保存した行が 1 つも無い z801 も) = Company DB にある 3 件
+    assert.deepEqual([ne.kind_gate.integrity_untrusted, ne.kind_gate.raw_unverifiable_affected_existing_cdb], [6, 3]);
+    // 取得の件数が読めない朝 (記録が消えた = PR-9 の前の取得) = 種類ごとに 1 (fail-closed)
+    wh().prepare("DELETE FROM sync_meta WHERE key IN ('ne_api_products_fetch_counts', 'ne_api_setproducts_fetch_counts')").run();
+    const r2 = await compare(asOf);
+    assert.deepEqual([r2.result.ne.fetch_counts.products, r2.result.ne.fetch_counts.setproducts, r2.result.ne.kind_gate.integrity_untrusted],
+      [{ ok: false, reason: 'no_record' }, { ok: false, reason: 'no_record' }, 2 + 2]);   // 読めない 2 種類 + 保持した SKU の保存した行 2
+  } finally { globalThis.fetch = realFetch; }
 });
 
 await pg.close();

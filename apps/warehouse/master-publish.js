@@ -532,16 +532,30 @@ export function writeSetPublishExpect(db, rows) {
   const ins = db.prepare('INSERT INTO m_set_publish_expect (set_code, args_json, components_json) VALUES (?, ?, ?)');
   for (const r of rows) ins.run(r.code, JSON.stringify(r.args), JSON.stringify(r.components));
 }
-/** 前の行のまま (prev = true) / 載せない (prev = false) にした SKU (作り直しの取引で m_products と一緒に入れ替える。区分の持ち主が C のときだけ書く) */
+/** 前の行のまま の SKU の snapshot に入れる列 (m_products は product_id = 入れ替えで振り直す番号 を除く全部・m_set_components は全部) */
+export const KIND_FROZEN_MP_COLS = Object.freeze(['商品コード', '商品名', '商品区分', '取扱区分', '標準売価', '原価', '原価ソース', '原価状態', '送料', '送料コード', '配送方法',
+  '消費税率', '税区分', '在庫数', '引当数', '仕入先コード', 'セット構成品数', '売上分類', 'seasonality_flag', 'season_months', 'new_product_flag', 'new_product_launch_date', 'updated_at']);
+export const KIND_FROZEN_MSC_COLS = Object.freeze(['セット商品コード', '構成商品コード', '数量', '構成商品名', '構成商品原価', 'updated_at']);
+/**
+ * 1 つのコードの m_products の行と m_set_components の構成の行 (全部) の正準な形 (JSON の文字列)。行が無い = product null。
+ * tables = 読む表 (作り直しは入れ替えの前の main の表 = 固定する行・確かめは今の表)
+ */
+export function kindFrozenSnapshot(db, code, { products = 'm_products', components = 'm_set_components' } = {}) {
+  const q = (cols) => cols.map((c) => `"${c}"`).join(', ');
+  const p = db.prepare(`SELECT ${q(KIND_FROZEN_MP_COLS)} FROM ${products} WHERE 商品コード = ?`).raw().get(code) ?? null;
+  const cs = db.prepare(`SELECT ${q(KIND_FROZEN_MSC_COLS)} FROM ${components} WHERE セット商品コード = ? ORDER BY 構成商品コード`).raw().all(code);
+  return JSON.stringify({ product: p, components: cs });
+}
+/** 前の行のまま (prev = true) / 載せない (prev = false) にした SKU と固定した時の snapshot (作り直しの取引で m_products と一緒に入れ替える。区分の持ち主が C のときだけ書く) */
 export function writeKindFrozen(db, rows) {
   db.exec('DELETE FROM m_publish_kind_frozen');
-  const ins = db.prepare('INSERT INTO m_publish_kind_frozen (code, prev_row) VALUES (?, ?)');
-  for (const r of rows) ins.run(r.code, r.prev ? 1 : 0);
+  const ins = db.prepare('INSERT INTO m_publish_kind_frozen (code, prev_row, snapshot) VALUES (?, ?, ?)');
+  for (const r of rows) ins.run(r.code, r.prev ? 1 : 0, r.snapshot);
 }
-/** 前の行のまま にした SKU (表が無い = 空) */
+/** 前の行のまま / 載せない にした SKU の印 [{code, prev_row, snapshot}] (表が無い = 空) */
 export function readKindFrozen(db) {
-  try { return new Set(db.prepare('SELECT code FROM m_publish_kind_frozen').all().map((r) => r.code)); } catch (e) {
-    if (/no such table/.test(String(e && e.message))) return new Set();
+  try { return db.prepare('SELECT code, prev_row, snapshot FROM m_publish_kind_frozen ORDER BY code').all(); } catch (e) {
+    if (/no such table/.test(String(e && e.message))) return [];
     throw e;
   }
 }
@@ -591,8 +605,18 @@ export function verifyApplied(db, { publication, ownership, taxRates = [], expec
   // 区分の持ち主が C = 区分も写した (m_products の商品区分 = C の区分のはず。違えば下の cols の kind の確かめで落ちる)。
   //   kindCopied = 区分は比べないが、作り直しが区分を写したか (②b = 世代の持ち主から。前の行のまま (frozen) の SKU を比べない)
   const copyKind = kindCopied ?? ownSet.has('kind');
-  // C = セット・NE = 単品 / 例外を含む食い違い で前の行のまま にした SKU (作り直しが m_publish_kind_frozen に残す) = 比べない
-  const frozen = copyKind ? readKindFrozen(db) : new Set();
+  // C = セット・NE = 単品 / 例外を含む食い違い で前の行のまま にした SKU (作り直しが m_publish_kind_frozen に残す) = 世代の値とは比べない。
+  //   代わりに固定した時の snapshot (行・構成の全部。載せない = 行も構成も無い) と今を比べ、ハッシュに入れる (印を残したまま行を書き換えた = 見つかる。#1641 Codex R1 High)
+  const frozenRows = copyKind ? readKindFrozen(db) : [];
+  const frozen = new Set(frozenRows.map((f) => f.code));
+  for (const f of frozenRows) {
+    let want;
+    try { want = JSON.parse(f.snapshot); } catch { want = null; }
+    const got = JSON.parse(kindFrozenSnapshot(db, f.code));
+    out.counts.checked++;
+    lines.push(JSON.stringify([f.code, 'kind_frozen', f.prev_row, got]));
+    if (!want || !same(want, got) || (f.prev_row === 1) !== (got.product != null)) bad(f.code, 'kind_frozen', want, got);
+  }
   if (copyKind) { out.counts.kind_frozen = 0; out.kind_frozen_codes = []; }
   const entries = withoutNorms(withoutNorms(withoutNorms(allEntries, comp.kindMismatchNorms), comp.kindFrozenNorms), new Set([...frozen].map((c) => normSku(c))));
   if (copyKind) {
