@@ -17,7 +17,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPgClient } from './migrate.mjs';
-import { ackLegacyGates, gateUrlFor, GATE_URL_ENV } from '../../lib/master-legacy-gate.mjs';
+import { ackLegacyGates, gateUrlFor, GATE_URL_ENV, legacyManifest } from '../../lib/master-legacy-gate.mjs';
 
 /**
  * プロセスごとの最後の記録。出すのは「最後が『止めた』でない (何日前の記録でも)」か「hours 時間以内」のプロセス
@@ -25,7 +25,7 @@ import { ackLegacyGates, gateUrlFor, GATE_URL_ENV } from '../../lib/master-legac
  */
 export async function listInstances(client, { hours = 24 } = {}) {
   return (await client.query(`select * from (
-      select distinct on (host, instance_id) host, instance_id, build_id, phase_seen, inflight_count, acked_at, acked_at::text as acked_at_text, stopped, stopped_reason, session_role,
+      select distinct on (host, instance_id) host, instance_id, build_id, manifest_hash, phase_seen, inflight_count, acked_at, acked_at::text as acked_at_text, stopped, stopped_reason, session_role,
           acked_at >= clock_timestamp() - make_interval(mins => ops.master_cutover_ack_fresh_minutes()) as fresh
         from ops.master_legacy_gate_acks
         order by host, instance_id, acked_at desc, ack_id desc) last
@@ -72,7 +72,12 @@ if (isMain) {
         const c = await openPgClient(url, { application_name: 'master-legacy-instance' });
         try {
           const rows = await listInstances(c, { hours: Number(getArg('--hours') || 24) });
-          for (const r of rows) console.log(`${r.host}\t${r.instance_id}\t最後 ${r.acked_at}\t${r.stopped ? `止めた (${r.stopped_reason})` : r.fresh ? '新しい' : '⚠️ 黙っている = 15 分より前で「止めた」も無い (段階を進められない。止まったのを確かめて --stop)'}\t段階 ${r.phase_seen}\t書きかけ ${r.inflight_count}\tbuild ${String(r.build_id).slice(0, 12)}`);
+          // 広げる道 PR-6 (Codex #1636 R1 Low): 古い入口の一覧 (manifest) が、この checkout の一覧と同じかも出す (配った後に全部のプロセスが新しい一覧で記録したかを見る)
+          let want = null;
+          try { want = (await c.query('select ops.legacy_manifest_hash($1::jsonb) as h', [JSON.stringify(legacyManifest())])).rows[0].h; } catch (e) { console.log(`(この checkout の一覧のハッシュを DB で計算できない: ${e.message})`); }
+          if (want) console.log(`この checkout の一覧 (manifest) = ${want}`);
+          const manifestNote = (r) => `\t一覧 ${String(r.manifest_hash).slice(0, 12)}${want ? (r.manifest_hash === want ? ' (この checkout と同じ)' : ' ⚠️ この checkout と違う') : ''}`;
+          for (const r of rows) console.log(`${r.host}\t${r.instance_id}\t最後 ${r.acked_at}\t${r.stopped ? `止めた (${r.stopped_reason})` : r.fresh ? '新しい' : '⚠️ 黙っている = 15 分より前で「止めた」も無い (段階を進められない。止まったのを確かめて --stop)'}\t段階 ${r.phase_seen}\t書きかけ ${r.inflight_count}\tbuild ${String(r.build_id).slice(0, 12)}${manifestNote(r)}`);
           if (!rows.length) console.log('(止めていないプロセスも、24 時間以内に止めたプロセスも無い)');
         } finally { await c.end(); }
       }

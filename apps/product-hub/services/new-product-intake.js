@@ -179,6 +179,17 @@ function markSeenStmt(db) {
   `);
 }
 
+/**
+ * そのコードから作る新商品の種類 (広げる道 PR-6・種類ごとの門)。
+ *   'set'    = NE の商品マスタ (mirror_products) でセット (正規化で同じコードの行が全部セット)
+ *   'single' = それ以外 = NE の単品・NE にまだ無い新商品・代表コード・区分が割れた (閉じる側に倒す)
+ * mirror_products が無い = 投げる (呼び手は mirrorReady を先に見る)
+ */
+export function newKindOfCode(db, code) {
+  const rows = db.prepare('SELECT 商品区分 AS k FROM mirror_products WHERE LOWER(TRIM(商品コード)) = ?').all(norm(code));
+  return rows.length > 0 && rows.every((r) => String(r.k ?? '').trim() === 'セット') ? 'set' : 'single';
+}
+
 /** 1回の一括登録で受け付けるコード数の上限 */
 export const MAX_REGISTER_CODES = 200;
 
