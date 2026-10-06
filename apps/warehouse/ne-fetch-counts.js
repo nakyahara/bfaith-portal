@@ -30,7 +30,8 @@
  *   取得の始め (最初の API の呼び出しの前) に独立した取引で commit し、完了の印と同じ取引で消す (自分の run_id の印だけ)。
  *   途中で失敗した・件数が合わず完了の印を付けなかった回は **残る** (次に最後まで取れた回が上書きして消す)。
  *   🚨 同じ種類の取得は 1 本ずつ (Codex PR #1642 R1 Medium): 印の取得がまだ生きていれば新しい取得は印を書かずに throw (NE_FETCH_BUSY)。
- *   死んだ印 (この process で終わった回・PID が居ない・読めない・NE_FETCH_STALE_MS より古い) だけ回収する (judgeNeFetchMark)。
+ *   死んだ印 (この process で終わった回・PID が居ない / node でない / 印より後に始まったプロセス = PID の使い回し・形が違う・始めた時刻が未来・
+ *   NE_FETCH_STALE_MS より古い) だけ回収する (judgeNeFetchMark。Codex #1642 R2 Medium)。
  *   = 「A 開始 → B 開始 → B 完了 → A がまだ通信中」で印が消える、が起きない
  *   セットの取得は全部のページをメモリに集めてから書く = API と通信している間は SQLite の書き込みの鍵を持たない → 開く前のゲート (PR-7) は
  *   BEGIN IMMEDIATE ではこの間を見つけられないので、この印で拒む。
@@ -44,6 +45,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isAliveNodeSince, FUTURE_SKEW_MS } from './retry-lock.js';
 
 export const NE_FETCH_COUNTS_VERSION = 'fc1';
 export const NE_FETCH_KINDS = Object.freeze(['products', 'setproducts']);
@@ -52,12 +54,12 @@ export const NE_FETCH_IN_PROGRESS_KEY = Object.freeze({ products: 'ne_api_produc
 
 /**
  * 取得の版 (設計 v14 §3.7 の component = fetch・R14)。対象のファイル (リポジトリの根からのパス・この固定の順) =
- *   取得 (ne-api.js)・取得が使う守りの部品 (このファイル)・通し番号 / 完了の印 / 書き方の保存がある db.js。
+ *   取得 (ne-api.js)・取得が使う守りの部品 (このファイル)・通し番号 / 完了の印 / 書き方の保存がある db.js・取得中の印の生きているかの判定 (retry-lock.js)。
  * 版 = 各ファイルについて「パス + NUL + 中身 (改行を LF にそろえる = CRLF → LF。Windows の checkout でも同じ値) + NUL」をこの順につなげた UTF-8 の sha256 (64 桁の 16 進)。
  * 取得は API の入力を読む前に 1 回だけ計算し、完了まで同じ値を持ち回る (途中でファイルが変わっても、記録する版は始めに計算した値)。
  * 🚨 一覧と計算はここ 1 か所 (PR-1 の版の登録の CLI はこれを import して使う)
  */
-export const NE_FETCH_FINGERPRINT_FILES = Object.freeze(['apps/warehouse/ne-api.js', 'apps/warehouse/ne-fetch-counts.js', 'apps/warehouse/db.js']);
+export const NE_FETCH_FINGERPRINT_FILES = Object.freeze(['apps/warehouse/ne-api.js', 'apps/warehouse/ne-fetch-counts.js', 'apps/warehouse/db.js', 'apps/warehouse/retry-lock.js']);
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** 取得の版を計算する。root = リポジトリの根 (既定 = このファイルから見た根)。読めないファイルがあれば throw */
 export function computeFetchFingerprint(root = REPO_ROOT) {
@@ -206,25 +208,39 @@ const nowText = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
 export const NE_FETCH_STALE_MS = 6 * 60 * 60 * 1000;
 /** この process の中で今走っている取得の run_id (取得の関数の finally で外す) */
 const RUNNING = new Set();
-function pidAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return e && e.code === 'EPERM'; }   // EPERM = 居るが権限が無い = 生きている
+/** 印の形 (beginNeFetch が書く形と同じでなければ壊れた印 = 回収する) */
+function markShapeOk(v, kind) {
+  return !!v && typeof v === 'object' && !Array.isArray(v)
+    && v.version === NE_FETCH_COUNTS_VERSION && (kind === undefined || v.kind === kind)
+    && typeof v.run_id === 'string' && /^[0-9a-f-]{36}$/.test(v.run_id)
+    && typeof v.started_at === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v.started_at)
+    && Number.isSafeInteger(v.started_ms) && v.started_ms > 0
+    && Number.isSafeInteger(v.pid) && v.pid > 0
+    && typeof v.host === 'string' && v.host.length > 0;
 }
 /**
- * 前の印がまだ走っている取得のものか (R1 Codex Medium: 生きている取得の印は上書きしない・死んだ / 期限切れの印だけ回収する)。
- *   読めない・形が違う = 回収 (このコードが書いた印ではない) / NE_FETCH_STALE_MS より古い = 回収 /
+ * 前の印がまだ走っている取得のものか (Codex #1642 R1 Medium: 生きている取得の印は上書きしない・死んだ / 期限切れの印だけ回収する /
+ * R2 Medium: PID の使い回し・関係の無いプロセスを「取得中」と見ない)。
+ *   読めない・形が違う (欄の欠け・型・知らない版・別の種類) = 回収 (このコードが書いた印ではない) /
+ *   始めた時刻が未来 (FUTURE_SKEW_MS より先) = 回収 / NE_FETCH_STALE_MS より古い = 回収 /
  *   同じ host・同じ process = この process で今走っている run_id のときだけ生きている (失敗して finally を抜けた回は死んでいる) /
- *   同じ host・別の process = その PID が生きていれば生きている / 別の host = 期限まで生きているとみなす
+ *   同じ host・別の process = その PID が **生きている node** で、**そのプロセスが印を書く前 (+ 30 秒) から動いている** ときだけ生きている
+ *     (retry-lock.js の isAliveNodeSince と同じ判定 = 後から始まったプロセス = PID の使い回し = 回収。Windows は tasklist と Get-Process の開始時刻) /
+ *   別の host = 期限まで生きているとみなす (確かめられない = 並走しない側)
+ * @param {string} raw  sync_meta の値
+ * @param {number} [nowMs]
+ * @param {{ kind?: string, isAlive?: (pid: number, startedAtIso: string) => boolean }} [o]  isAlive は試験で差し替える
  * @returns {{ alive: boolean, prev: object|null }}
  */
-export function judgeNeFetchMark(raw, nowMs = Date.now()) {
+export function judgeNeFetchMark(raw, nowMs = Date.now(), { kind, isAlive = (pid, at) => isAliveNodeSince(pid, at, { now: new Date(nowMs) }) } = {}) {
   let v = null;
   try { v = JSON.parse(raw); } catch { return { alive: false, prev: null }; }
-  if (!v || typeof v !== 'object' || typeof v.run_id !== 'string' || !Number.isFinite(v.started_ms)) return { alive: false, prev: v };
+  if (!markShapeOk(v, kind)) return { alive: false, prev: v };
+  if (v.started_ms > nowMs + FUTURE_SKEW_MS) return { alive: false, prev: v };
   if (nowMs - v.started_ms >= NE_FETCH_STALE_MS) return { alive: false, prev: v };
   if (v.host !== os.hostname()) return { alive: true, prev: v };
   if (v.pid === process.pid) return { alive: RUNNING.has(v.run_id), prev: v };
-  return { alive: pidAlive(v.pid), prev: v };
+  return { alive: !!isAlive(v.pid, new Date(v.started_ms).toISOString()), prev: v };
 }
 /**
  * 取得中の印を書く (取得の始め・最初の API の呼び出しの前。呼び手の取引の中で = 呼び手が commit する)。返り値 = 書いた値 (消す時に渡す)。
@@ -238,7 +254,7 @@ export function beginNeFetch(db, kind, startedAt) {
   if (!key) throw new Error(`beginNeFetch: 知らない種類 ${kind}`);
   const cur = db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(key);
   if (cur) {
-    const j = judgeNeFetchMark(cur.value);
+    const j = judgeNeFetchMark(cur.value, Date.now(), { kind });
     if (j.alive) {
       const e = new Error(`[NE] 同じ種類の取得 (${kind}) がまだ走っている (pid ${j.prev.pid}・${j.prev.host}・開始 ${j.prev.started_at}) → この取得はしない`);
       e.code = 'NE_FETCH_BUSY';

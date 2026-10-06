@@ -91,7 +91,7 @@ await ta('[1] 商品: 空のコード・同じコードが 2 度 (ページの�
   // 取得の版 = 固定の順の各ファイルの「パス + NUL + LF にそろえた中身 + NUL」をつなげた sha256 (この試験の中で別に計算する)
   const crypto = await import('node:crypto');
   const expectFp = crypto.createHash('sha256').update(NE_FETCH_FINGERPRINT_FILES.map((f) => f + String.fromCharCode(0) + fs.readFileSync(path.join(repoRoot, f), 'utf8').split(String.fromCharCode(13, 10)).join(String.fromCharCode(10)) + String.fromCharCode(0)).join(''), 'utf8').digest('hex');
-  assert.deepEqual([...NE_FETCH_FINGERPRINT_FILES], ['apps/warehouse/ne-api.js', 'apps/warehouse/ne-fetch-counts.js', 'apps/warehouse/db.js']);
+  assert.deepEqual([...NE_FETCH_FINGERPRINT_FILES], ['apps/warehouse/ne-api.js', 'apps/warehouse/ne-fetch-counts.js', 'apps/warehouse/db.js', 'apps/warehouse/retry-lock.js']);
   assert.equal(c.fetch_fingerprint, expectFp);
   assert.equal(computeFetchFingerprint(), expectFp);
   // 今までの証跡は形も値も今までどおり (written_rows = 書いた回数・dup_codes = 小文字のコード)
@@ -415,7 +415,7 @@ await ta('[13] セットの数が読めない行は落とさず 1 で書く (今
   assert.equal(computeFetchFingerprint(), fpBefore);   // 差し替えを戻せば元の版
 });
 
-await ta('[14] 同じ種類の取得は 1 本ずつ (Codex #1642 R1): A の通信中に始めた B は印を書かずに断る (A の印は消えない・A が完了して消す) / 別の process の生きている印は上書きしない / 死んだ・期限切れ・読めない印は回収', async () => {
+await ta('[14] 同じ種類の取得は 1 本ずつ (Codex #1642 R1・R2): A の通信中に始めた B は印を書かずに断る / 別の process の生きている node の印は上書きしない / 死んだ・期限切れ・node でない・後から始まった (PID の使い回し)・壊れた・未来の印は回収', async () => {
   const KS = NE_FETCH_IN_PROGRESS_KEY.setproducts, KP = NE_FETCH_IN_PROGRESS_KEY.products;
   // (a) セット A の API の通信中 (SQLite の鍵を持たない間) に、同じ種類の B を始めて終わらせる (Codex の「B が先に終わる」順)
   await nextSecond();
@@ -443,43 +443,64 @@ await ta('[14] 同じ種類の取得は 1 本ずつ (Codex #1642 R1): A の通�
   assert.equal(meta(KS), null, 'A の完了で消える');
   assert.deepEqual(db().prepare('SELECT セット商品コード AS p FROM raw_ne_set_products ORDER BY 1').all().map((r) => r.p), ['aa', 'ab']);
   assert.equal(counts('setproducts').stored_rows, 2);
-  // (b) 別の process (この試験の親 = 生きている PID) の新しい印 → 商品・セットとも断る。商品は前の回の完了の印も消さない (同じ取引で戻る)
-  await nextSecond();
-  ne.goods = [g('P1')];
-  await quietly(fetchProducts);
-  const pAt = meta('ne_api_products_complete_at');
-  const live = (kind) => JSON.stringify({ version: 'fc1', kind, run_id: 'other-run', started_at: '2026-10-06 00:00:00', started_ms: Date.now(), pid: process.ppid, host: os.hostname() });
-  const lp = live('products'), ls = live('setproducts');
-  setMeta(KP, lp); setMeta(KS, ls);
-  await assert.rejects(quietly(fetchProducts), (e) => e.code === 'NE_FETCH_BUSY');
-  await assert.rejects(quietly(fetchSetProducts), (e) => e.code === 'NE_FETCH_BUSY');
-  assert.deepEqual([meta(KP), meta(KS), meta('ne_api_products_complete_at')], [lp, ls, pAt]);
-  assert.equal(JSON.parse(meta(KP)).run_id, 'other-run');
-  // (c) 死んだ PID の印 → 回収して最後まで取る (印は消える)
-  const dead = spawnSync(process.execPath, ['-e', '0']).pid;
-  const mark = (kind, extra) => JSON.stringify({ version: 'fc1', kind, run_id: 'x-' + kind, started_at: '2026-10-06 00:00:00', started_ms: Date.now(), pid: dead, host: os.hostname(), ...extra });
-  setMeta(KS, mark('setproducts'));
-  await nextSecond();
-  await quietly(fetchSetProducts);
-  assert.equal(meta(KS), null);
-  // (d) 期限切れ (生きている PID でも NE_FETCH_STALE_MS より古い = PID の使い回し) → 回収
-  setMeta(KP, mark('products', { pid: process.ppid, started_ms: Date.now() - NE_FETCH_STALE_MS - 1000 }));
-  await nextSecond();
-  await quietly(fetchProducts);
-  assert.equal(meta(KP), null);
-  assert.ok(meta('ne_api_products_complete_at'));
-  // (e) 判定そのもの: 別の host は期限まで生きている・読めない / 形の違う印は回収・この process の終わった回は死んでいる・今走っている回は生きている
-  const now = Date.now();
-  assert.equal(judgeNeFetchMark(mark('products', { host: 'other-host' }), now).alive, true);
-  assert.equal(judgeNeFetchMark(mark('products', { host: 'other-host', started_ms: now - NE_FETCH_STALE_MS }), now).alive, false);
-  assert.equal(judgeNeFetchMark('{壊れ', now).alive, false);
-  assert.equal(judgeNeFetchMark(JSON.stringify({ pid: process.ppid }), now).alive, false);
-  assert.equal(judgeNeFetchMark(mark('products', { pid: process.pid, run_id: 'not-running' }), now).alive, false);
-  assert.equal(judgeNeFetchMark(mark('products', { pid: process.ppid }), now).alive, true);
-  const own = db().transaction(() => beginNeFetch(db(), 'products', '2026-10-06 00:00:00'))();
-  assert.equal(judgeNeFetchMark(own).alive, true);
-  releaseNeFetch(own);
-  assert.equal(judgeNeFetchMark(own).alive, false);   // 取得の関数を抜けた (失敗した) 回 = 死んでいる = 次の取得が回収できる
+  // 本物の別のプロセス: 生きている node (印を書く前から動いている) / node でない生きているプロセス (cmd)
+  const { spawn } = await import('node:child_process');
+  const crypto = await import('node:crypto');
+  const liveNode = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'], { stdio: 'ignore' });
+  const notNode = process.platform === 'win32' ? spawn('cmd', ['/c', 'ping -n 120 127.0.0.1 >nul'], { stdio: 'ignore', windowsHide: true }) : null;
+  try {
+    await new Promise((r) => setTimeout(r, 1500));   // 子が始まってから印を書く (印の時刻 ≧ プロセスの開始)
+    const mark = (kind, extra) => JSON.stringify({ version: 'fc1', kind, run_id: crypto.randomUUID(), started_at: '2026-10-06 00:00:00', started_ms: Date.now(), pid: liveNode.pid, host: os.hostname(), ...extra });
+    // (b) 生きている node の新しい印 → 商品・セットとも断る。商品は前の回の完了の印も消さない (同じ取引で戻る)
+    await nextSecond();
+    ne.goods = [g('P1')];
+    await quietly(fetchProducts);
+    const pAt = meta('ne_api_products_complete_at');
+    const lp = mark('products'), ls = mark('setproducts');
+    setMeta(KP, lp); setMeta(KS, ls);
+    await assert.rejects(quietly(fetchProducts), (e) => e.code === 'NE_FETCH_BUSY');
+    await assert.rejects(quietly(fetchSetProducts), (e) => e.code === 'NE_FETCH_BUSY');
+    assert.deepEqual([meta(KP), meta(KS), meta('ne_api_products_complete_at')], [lp, ls, pAt]);
+    // 回収して最後まで取れる印 (どれも 1 つずつ: セットに置いて取る → 印は消える)
+    const reclaim = async (label, raw) => {
+      setMeta(KS, raw);
+      await nextSecond();
+      await quietly(fetchSetProducts);
+      assert.equal(meta(KS), null, label);
+    };
+    // (c) 死んだ PID
+    await reclaim('死んだ PID', mark('setproducts', { pid: spawnSync(process.execPath, ['-e', '0']).pid }));
+    // (d) 期限切れ (生きている node でも NE_FETCH_STALE_MS より古い)
+    await reclaim('期限切れ', mark('setproducts', { started_ms: Date.now() - NE_FETCH_STALE_MS - 1000 }));
+    // (f) 関係の無い生きているプロセス (node でない = PID の使い回しで PowerShell などに当たった)
+    if (notNode) await reclaim('node でない生きているプロセス', mark('setproducts', { pid: notNode.pid }));
+    // (g) 印より後に始まったプロセス (= 前の取得が死んだ後に PID が別の node に使い回された)
+    await reclaim('後から始まった node', mark('setproducts', { started_ms: Date.now() - 10 * 60 * 1000 }));
+    // (h) 壊れた印 (pid・host が無い・知らない版・別の種類・run_id の形) / 未来の時刻
+    await reclaim('pid・host が無い', JSON.stringify({ run_id: crypto.randomUUID(), started_ms: Date.now() }));
+    await reclaim('知らない版', mark('setproducts', { version: 'fc0' }));
+    await reclaim('別の種類', mark('products'));
+    await reclaim('run_id の形', mark('setproducts', { run_id: 'other-run' }));
+    await reclaim('未来の時刻', mark('setproducts', { started_ms: Date.now() + 60 * 60 * 1000 }));
+    // (e) 判定そのもの: 別の host は期限まで生きている・この process の終わった回は死んでいる・今走っている回は生きている・生きているかの判定は差し替えられる
+    const now = Date.now();
+    const yes = () => true, no = () => false;
+    assert.equal(judgeNeFetchMark(mark('products', { host: 'other-host' }), now, { isAlive: no }).alive, true);
+    assert.equal(judgeNeFetchMark(mark('products', { host: 'other-host', started_ms: now - NE_FETCH_STALE_MS }), now, { isAlive: yes }).alive, false);
+    assert.equal(judgeNeFetchMark('{壊れ', now, { isAlive: yes }).alive, false);
+    assert.equal(judgeNeFetchMark(JSON.stringify({ run_id: crypto.randomUUID(), started_ms: now }), now, { isAlive: yes }).alive, false);   // 壊れた印 (欄の欠け) は「別の host」にもしない
+    assert.equal(judgeNeFetchMark(mark('products', { pid: process.pid }), now, { isAlive: yes }).alive, false);   // この process の、今走っていない run_id
+    assert.equal(judgeNeFetchMark(mark('products'), now, { kind: 'setproducts', isAlive: yes }).alive, false);    // 別の種類の印
+    assert.equal(judgeNeFetchMark(mark('products', { started_ms: now + 11 * 60 * 1000 }), now, { isAlive: yes }).alive, false);   // 未来の時刻 (この関数が自分で見る)
+    assert.equal(judgeNeFetchMark(mark('products'), now, { isAlive: yes }).alive, true);
+    assert.equal(judgeNeFetchMark(mark('products'), now, { isAlive: no }).alive, false);
+    assert.equal(judgeNeFetchMark(mark('products'), now).alive, true);   // 本物の判定: 生きている node・印より前から動いている
+    db().prepare('DELETE FROM sync_meta WHERE key = ?').run(KP);   // (b) の生きている印を除く
+    const own = db().transaction(() => beginNeFetch(db(), 'products', '2026-10-06 00:00:00'))();
+    assert.equal(judgeNeFetchMark(own).alive, true);
+    releaseNeFetch(own);
+    assert.equal(judgeNeFetchMark(own).alive, false);   // 取得の関数を抜けた (失敗した) 回 = 死んでいる = 次の取得が回収できる
+  } finally { liveNode.kill(); if (notNode) notNode.kill(); }
   db().prepare('DELETE FROM sync_meta WHERE key = ?').run(KP);
 });
 
