@@ -12,8 +12,10 @@
  * 終わり方 (最後の行 = 朝の要約):
  *   exit 0 = 開いた / 未設定 (接続が無い = この段は飛ばす) / 関数が無い (0058 の前) / 照合 ② が判定できない・落ちた・流れていない (grant を呼ばない) /
  *            widen の前で拒まれた (準備中 = 毎朝 ❌ にしない)。🚨 0058 の前・設定の前に毎朝の処理を止めない
- *   exit 1 = 拒まれた (理由つき・revoke してから) / 接続・関数の失敗 / その回の照合の証跡が無い (retry に載る。人が直せば同じ日のうちに開く)
- *   開かなかった回は revoke_new_entry_lease を呼ぶ (閉じる向きだけ・照合 ② の始めの close と同じ向き)
+ *   exit 1 = 拒まれた (理由つき) / 接続・関数の失敗 / その回の照合の証跡が無い / 状態不明 (retry に載る。retry は「マスタ照合」からやり直す = gateRetryJobs)
+ *   開かなかった回は、いつも新しい接続で revoke_new_entry_lease → new_entry_lease_valid = false を確かめる (closeAndVerify)。
+ *   「閉」と出すのは閉じたのを確かめたときだけ。確かめられない (grant の応答が切れた・返り値が壊れた・新しい接続も落ちた) = 「⚠️ 状態不明 (開いている可能性)」・exit 1 (#1645 Codex R1 High)
+ *   🚨 0058 で new_entry_gate に ops.new_entry_lease_valid(text) の EXECUTE が要る (無いと毎回「状態不明」)
  */
 import 'dotenv/config';
 import fs from 'node:fs';
@@ -37,6 +39,18 @@ export function skipAfterCompare(compareResult) {
   if (compareResult && compareResult.success) return null;
   return { name: STEP_NAME, success: false, skipped: true, blocked: true, summary: `⏭️ 見送り (マスタ照合が失敗 = ${HEAD} 閉のまま。照合の再試行が成功したらこの段も流す)` };
 }
+
+/**
+ * retry に載せる工程の名前 (#1645 Codex R1 Medium)。「新商品の許可」が残っていれば「マスタ照合」も足す。
+ *   拒まれた後の revoke は停止の床を今の結果の行まで進める = 同じ照合の回では二度と開かない。
+ *   retry は必ず新しい照合の回 (close → record) からやり直し、RERUN_AFTER で許可を出す。daily-sync と retry-failed-jobs の両方が使う
+ */
+export function gateRetryJobs(names) {
+  const out = Array.isArray(names) ? [...names] : [];
+  if (out.includes(STEP_NAME) && !out.includes(COMPARE_STEP)) out.push(COMPARE_STEP);
+  return out;
+}
+export const COMPARE_STEP = 'マスタ照合';
 
 /** その朝の照合 ② の回を証跡から読む。{ ok, compareRunId } か { ok: false, kind: 'closed' | 'error', reason } */
 export function compareRunOf(ev, { asOf, syncRunId }) {
@@ -78,17 +92,34 @@ export async function connectGate(url) {
 
 const short = (e) => String(e && e.message ? e.message : e).replace(/\s+/g, ' ').slice(0, 200);
 
-/** 取り消し (閉じる向き)。結果 = { ok, note } */
-async function revoke(db, reason) {
+/**
+ * 閉じたことを確かめる (#1645 Codex R1 High)。**いつも新しい接続**で revoke → ops.new_entry_lease_valid('single') = false を読む。
+ *   grant の後に応答が切れた・返り値が壊れた接続は使わない (DB では許可が開いたままかもしれない)。
+ *   結果 = { ok: true } (閉じたのを確かめた) か { ok: false, note } (確かめられない = 開いている可能性)
+ */
+export async function closeAndVerify(url, reason, { connect = connectGate } = {}) {
+  let c;
+  try { c = await connect(url); }
+  catch (e) { return { ok: false, note: `取り消しの接続もできない (${short(e).slice(0, 80)})` }; }
   try {
-    const r = (await db.query('select ops.revoke_new_entry_lease($1, $2) as r', [KIND, String(reason).slice(0, 480)])).rows[0]?.r ?? null;
-    return { ok: true, result: r };
-  } catch (e) { return { ok: false, note: `取り消しも失敗 (${short(e).slice(0, 80)})` }; }
+    try { await c.db.query('select ops.revoke_new_entry_lease($1, $2) as r', [KIND, String(reason).slice(0, 480)]); }
+    catch (e) { return { ok: false, note: `取り消しも失敗 (${short(e).slice(0, 80)})` }; }
+    let v;
+    try { v = (await c.db.query('select ops.new_entry_lease_valid($1) as v', [KIND])).rows[0]?.v; }
+    catch (e) { return { ok: false, note: `取り消したが閉じたかを読めない (${short(e).slice(0, 80)})` }; }
+    if (v === false) return { ok: true };
+    return { ok: false, note: `取り消した後も有効と読めた (${JSON.stringify(v ?? null)})` };
+  } finally {
+    try { await c.close(); } catch { /* */ }
+  }
 }
+
+/** 閉じられたか確かめられない = 「状態不明」(開いている可能性)・exit 1。「閉」と出すのは閉じたのを確かめたときだけ */
+const unknownLine = (why, note) => `⚠️ ${HEAD} 状態不明 (開いている可能性・${why} / ${note})`;
 
 /**
  * 1 回ぶん。戻り値 = { code, state, line }
- *   state: opened / not_configured / not_applied / compare_not_ready / prep / denied / error
+ *   state: opened / not_configured / not_applied / compare_not_ready / prep / denied / error / unknown
  */
 export async function runGateStep({ env = process.env, dataDir, now = new Date(), connect = connectGate, readEv = (d, a) => readEvidence(d, a) } = {}) {
   const url = String(env[ENV_URL] || '').trim();
@@ -100,41 +131,55 @@ export async function runGateStep({ env = process.env, dataDir, now = new Date()
   try { const all = readEv(dataDir, asOf) || {}; ev = all[syncRunId ? EVIDENCE_NAME : `${EVIDENCE_NAME}.manual`]; }
   catch (e) { ev = { error: short(e) }; }
   const cr = compareRunOf(ev, { asOf, syncRunId });
+  /** 開かなかった回の終わり方: 新しい接続で閉じたのを確かめた = 閉 (closedCode) / 確かめられない = 状態不明 (exit 1) */
+  const closeOut = async (why, revokeReason, { closedCode = 1, state = 'error', line = null } = {}) => {
+    const v = await closeAndVerify(url, revokeReason, { connect });
+    if (!v.ok) return { code: 1, state: 'unknown', line: unknownLine(why, v.note) };
+    return { code: closedCode, state, line: line || `${HEAD} 閉 (${why})` };
+  };
 
   let c;
   try { c = await connect(url); }
-  catch (e) { return { code: 1, state: 'error', line: `${HEAD} 閉 (接続できない: ${short(e).slice(0, 120)})` }; }
+  catch (e) { const why = `接続できない: ${short(e).slice(0, 120)}`; return closeOut(why, `新商品の許可の段: ${why}`); }
+  let phase = 'check', granted = false, g = null, grantError = null;
   try {
     const db = c.db;
     const has = (await db.query("select to_regprocedure('ops.grant_new_entry_lease(text, text)') is not null as ok")).rows[0]?.ok === true;
     if (!has) return { code: 0, state: 'not_applied', line: `${HEAD} 閉のまま (許可の関数が無い = 0058 の前・この段は飛ばした)` };
-
-    if (!cr.ok) {
-      // 照合 ② が判定できない・落ちた・その回の証跡が無い = grant を呼ばない (閉じる向きだけ)
-      const rv = await revoke(db, `照合 ② の次の段: ${cr.reason}`);
-      const code = cr.kind === 'error' || !rv.ok ? 1 : 0;
-      return { code, state: cr.kind === 'error' ? 'error' : 'compare_not_ready', line: `${HEAD} 閉 (${cr.reason}${rv.ok ? '' : ` / ${rv.note}`})` };
+    if (cr.ok) {
+      phase = 'grant';
+      try { g = (await db.query('select ops.grant_new_entry_lease($1, $2) as r', [KIND, cr.compareRunId])).rows[0]?.r ?? null; granted = true; }
+      catch (e) { grantError = e; }
     }
-
-    let g;
-    try { g = (await db.query('select ops.grant_new_entry_lease($1, $2) as r', [KIND, cr.compareRunId])).rows[0]?.r ?? null; }
-    catch (e) {
-      const msg = short(e);
-      const codes = deniedCodes(msg);
-      const denied = /lease_denied:/.test(msg);
-      const rv = await revoke(db, `許可を出せない (${cr.compareRunId}): ${msg}`);
-      const prep = denied && codes.length > 0 && codes.every((k) => PREP_CODES.includes(k));
-      const why = denied ? msg.replace(/^.*?lease_denied:\s*/, '') : msg;
-      if (prep && rv.ok) return { code: 0, state: 'prep', line: `⏸️ ${HEAD} 閉 (widen の前 = 準備中: ${why.slice(0, 160)})` };
-      return { code: 1, state: denied ? 'denied' : 'error', line: `${HEAD} 閉 (${denied ? '拒まれた' : '許可を出せない'}: ${why.slice(0, 220)}${rv.ok ? '' : ` / ${rv.note}`})` };
-    }
-    if (!g || !g.expires_at) return { code: 1, state: 'error', line: `${HEAD} 閉 (許可の返り値が読めない: ${JSON.stringify(g).slice(0, 80)})` };
-    return { code: 0, state: 'opened', grant: g, line: `${HEAD} 開 (〜${jstShort(g.expires_at)} JST・照合 ${cr.compareRunId}・許可 #${g.lease_id ?? '?'})` };
   } catch (e) {
-    return { code: 1, state: 'error', line: `${HEAD} 閉 (確かめられない: ${short(e).slice(0, 160)})` };
+    grantError = grantError || e;
   } finally {
     try { await c.close(); } catch { /* */ }
   }
+
+  if (!cr.ok) {
+    // 照合 ② が判定できない・落ちた・その回の証跡が無い = grant を呼ばない (閉じる向きだけ)
+    if (grantError) { const why = `確かめられない: ${short(grantError).slice(0, 120)}`; return closeOut(why, `新商品の許可の段: ${why}`); }
+    return closeOut(cr.reason, `照合 ② の次の段: ${cr.reason}`, { closedCode: cr.kind === 'error' ? 1 : 0, state: cr.kind === 'error' ? 'error' : 'compare_not_ready' });
+  }
+  if (grantError) {
+    const msg = short(grantError);
+    const denied = phase === 'grant' && /lease_denied:/.test(msg);
+    const codes = denied ? deniedCodes(msg) : [];
+    const why = denied ? msg.replace(/^.*?lease_denied:\s*/, '') : msg;
+    const revokeReason = `許可を出せない (${cr.compareRunId}): ${msg}`;
+    if (denied && codes.length > 0 && codes.every((k) => PREP_CODES.includes(k))) {
+      return closeOut(`widen の前 = 準備中: ${why.slice(0, 160)}`, revokeReason, { closedCode: 0, state: 'prep', line: `⏸️ ${HEAD} 閉 (widen の前 = 準備中: ${why.slice(0, 160)})` });
+    }
+    // grant の応答が切れた (DB では開いたかもしれない) も、拒まれたのと同じく新しい接続で閉じて確かめる
+    return closeOut(`${denied ? '拒まれた' : '許可を出せない'}: ${why.slice(0, 220)}`, revokeReason, { state: denied ? 'denied' : 'error' });
+  }
+  if (!granted || !g || typeof g !== 'object' || !g.expires_at || !Number.isFinite(Date.parse(g.expires_at))) {
+    // grant は返ったが返り値が読めない = 開いたかどうか分からない → 新しい接続で閉じて確かめる
+    const why = `許可の返り値が読めない: ${JSON.stringify(g ?? null).slice(0, 80)}`;
+    return closeOut(why, `許可を出せない (${cr.compareRunId}): ${why}`);
+  }
+  return { code: 0, state: 'opened', grant: g, line: `${HEAD} 開 (〜${jstShort(g.expires_at)} JST・照合 ${cr.compareRunId}・許可 #${g.lease_id ?? '?'})` };
 }
 
 export function parseArgs(argv) {

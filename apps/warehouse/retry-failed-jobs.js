@@ -35,6 +35,7 @@ import { isWarnSummary } from './amazon-fees-outcome.js';
 import { acquireRetryLock, releaseRetryLock } from './retry-lock.js';
 import { financeCoordinatorEnabled, legacyGateCheck, FINANCE_COORDINATOR_ENV } from './finance-coordinator-switch.js';
 import { publishGateDecision, readPublishGate } from './publish-gate.js';
+import { gateRetryJobs } from '../company-db/master-compare/new-entry-gate.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -344,7 +345,9 @@ function deleteState() {
  * 1 回ぶんの再試行 (実行ループ)。remaining_jobs のうち RETRY_ORDER にあるものを順に走らせ、結果 [{name, success, summary}] を返す。
  * main() から切り出しただけで動きは同じ (試験が run を差し替えて、上流の規則が実際のループで効いていることを確かめられるように。Codex #1369 R1 #2)
  */
-export function runRetryRound(remainingJobs, { run = runScript, log = console.log, rerunAfter = RERUN_AFTER, publishGate = { broken: false } } = {}) {
+export function runRetryRound(remainingJobs0, { run = runScript, log = console.log, rerunAfter = RERUN_AFTER, publishGate = { broken: false } } = {}) {
+  // 「新商品の許可」は同じ照合の回では開かない (拒まれた後の revoke で停止の床が進む) = 必ず「マスタ照合」からやり直す (#1645 Codex R1 Medium)
+  const remainingJobs = gateRetryJobs(remainingJobs0);
   const results = []; // {name, success, summary}
   const rerun = new Set();   // この回で上流が成功したので走らせ直す下流 (RERUN_AFTER)
 
