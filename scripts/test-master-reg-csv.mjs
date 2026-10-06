@@ -969,6 +969,18 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
   await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [setPay, Buffer.from('x')])), /new_entry_closed: 新商品 \(set\)/);
   const setEx = (await one("select export_id::text as id from ops.ne_reg_exports where kind = 'sets' and state in ('issued', 'declared') order by export_id desc limit 1"))?.id;
   if (setEx) await pgErr(as(E, 'master_edit', () => pg.query('select * from ops.ne_reg_file($1::bigint)', [setEx])), /reg_file_expired/);
+  // ⑧ 期限 = 東京の翌日 07:00 (daily-sync の始まり・#1641 Codex R3): 06:59:59 は有効・07:00:00 は無効 (期限の式と、期限ちょうどで無効になる比べ方)
+  const exp = (await one("select to_char(ops.new_entry_lease_expiry('2030-01-10T08:00:00+09:00') at time zone 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS') as e")).e;
+  assert.equal(exp, '2030-01-11 07:00:00');
+  const insLease = async (expiresIn) => { await pg.query('begin'); await pg.query("select set_config('ops.lease_protocol', '1', true)");
+    await pg.query("insert into ops.master_new_entry_leases (kind, result_id, compare_run_id, granted_by, granted_at, expires_at) select 'single', r.result_id, r.compare_run_id, 'test', clock_timestamp() - interval '1 hour', clock_timestamp() + $1::interval from ops.new_entry_gate_results r order by r.result_id desc limit 1", [expiresIn]);
+    await pg.query('commit'); };
+  await insLease('2 seconds'); assert.equal(await isValid(), true, '期限の 1 秒前 = 有効');
+  await new Promise((r) => setTimeout(r, 2100)); assert.equal(await isValid(), false, '期限ちょうど以降 = 無効');
+  // 後の試験のために開け直す (新しい照合の回)
+  await pg.query("insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T110000000Z_0a5808', '2030-01-10T11:00:00Z', 0)");
+  await recordNeCodes(pg, 'mc_20300110T110000000Z_0a5808', ['new-dup', 'new-x1']);
+  assert.equal(await isValid(), true);
 });
 
 

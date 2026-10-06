@@ -416,6 +416,9 @@ export async function restoreFromLines(db, openLines, { log = () => {}, maxDefer
     // 0058 (広げる道 #1644 Codex R1 High 2): 復元の前の区分の持ち主 (skus.sku_kind が company か)。company → load に戻す復元は拒む (下)
     const lockedBefore = (await db.query(`select to_regprocedure('ops.sku_kind_locked()') is not null as ok`)).rows[0].ok === true
       ? (await db.query('select ops.sku_kind_locked() as l')).rows[0].l === true : false;
+    // 0058 (#1644 Codex R2 High): 新商品の許可の鍵を表を消す前に排他で取る (保存・配るの取引と逆の順で待ち合わない)。0058 の無い DB は何もしない
+    const hasRestoreStop = (await db.query(`select to_regprocedure('ops.stop_new_entry_for_restore(text)') is not null as ok`)).rows[0].ok === true;
+    if (hasRestoreStop) await db.query("select ops.stop_new_entry_for_restore('lock')");
     // migrations は完全一致でなければ拒否 (古いダンプで新しいスキーマの履歴を巻き戻さない)
     const applied = (await db.query('select version from ops.schema_migrations order by version')).rows.map((r) => r.version);
     const want = [...(header.migrations || [])].sort();
@@ -617,6 +620,10 @@ export async function restoreFromLines(db, openLines, { log = () => {}, maxDefer
       try { kindShape = (await db.query('select ops.assert_sku_kind_shape_after_restore() as r')).rows[0].r; }
       catch (e) { throw Object.assign(new Error(`戻した行の最終形が違う (区分の持ち主が company) = 復元しない: ${e.message}`), { code: 'RESTORE_KIND_SHAPE', cause: e }); }
     }
+    // 0058 (#1644 Codex R2 High): ダンプから戻った新商品の許可は使わない = 全部取り消して停止の床を戻した後の一番新しい結果まで進める
+    //   (戻った許可・結果・床がそろっていても入口は閉じたまま。新しい照合 ② の close → record → grant の後だけ開く)
+    let newEntryStop = null;
+    if (hasRestoreStop) newEntryStop = (await db.query("select ops.stop_new_entry_for_restore('stop') as r")).rows[0].r;
     // 0058 (#1644 Codex R1 High 2): 区分の持ち主が company だった DB に、widen の前のダンプを戻す = 持ち主が load に戻り G18 / G19 / G25 が外れる = 復元しない
     //   (sku_kind は forward-only。戻すなら、ダンプを選び直す = widen の後のダンプ)
     if (lockedBefore && (await db.query('select ops.sku_kind_locked() as l')).rows[0].l !== true) {
@@ -624,7 +631,7 @@ export async function restoreFromLines(db, openLines, { log = () => {}, maxDefer
         { code: 'RESTORE_KIND_OWNER_REGRESSION' });
     }
     await db.exec('commit');
-    return { tables: summary, totalRows, selfFix, generatedAt: header.generatedAt, skipped: tables.filter((t) => SKIP_RESTORE.includes(t.table)).map((t) => t.table), kindShape };
+    return { tables: summary, totalRows, selfFix, generatedAt: header.generatedAt, skipped: tables.filter((t) => SKIP_RESTORE.includes(t.table)).map((t) => t.table), kindShape, newEntryStop };
   } catch (e) {
     try { await db.exec('rollback'); } catch { /* 接続が死んでいれば rollback も失敗 */ }
     throw e;

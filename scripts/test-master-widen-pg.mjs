@@ -14,6 +14,7 @@
  *   6  今の origin/master のロードを widen の後に: 区分の変わった材料では取引ごと失敗 (何も残らない)・区分の変わらない材料は今までどおり通る
  *   7  復元の 3 種類 (sku_kind が load のダンプ = 最終形が崩れていても通る / company で整合 = 通る / company で不整合 = 復元全体が rollback)
  *  18  開放の許可 (照合 ② の始めに閉じる → 結果 → 今回の回で grant・権限・取り消しと閉じるは保存の取引を待つ・停止の床・結果を書く前に落ちた再実行では出ない)
+ *  19  復元で新商品の許可が生き返らない (有効な許可のときのダンプ → 閉じる → 復元 = 閉じたまま・新しい照合 ② の後だけ開く)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-widen-pg.mjs
  *   (この PC では C:/tmp/pg-embed の run-conc.mjs が使い捨ての PostgreSQL を起動して TEST_PG_URL を渡す)
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロールをクラスタに作る)。localhost 以外の URL は拒む (本番を渡さない)。TEST_PG_URL が無ければ飛ばす (test:master-edit の最後)
@@ -470,11 +471,11 @@ try {
     const l1 = await grant(NG, 'mc_lease_1');
     assert.equal(typeof l1.lease_id, 'string'); assert.equal(l1.compare_run_id, 'mc_lease_1');
     assert.equal(await valid(E), true); assert.equal(await valid(WA), true);
-    // 期限 = 東京の今日の翌日 10:00 (DB と session の TimeZone に左右されない)
+    // 期限 = 東京の今日の翌日 07:00 (daily-sync の始まり・DB と session の TimeZone に左右されない)
     const exp = async (c, t) => (await c.query("select to_char(ops.new_entry_lease_expiry($1::timestamptz) at time zone 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI') as e", [t])).rows[0].e;
     await O.query("set timezone = 'America/Los_Angeles'");
-    assert.equal(await exp(O, '2030-01-10T23:59:00+09:00'), '2030-01-11 10:00');
-    assert.equal(await exp(O, '2030-01-10T00:01:00+09:00'), '2030-01-11 10:00');
+    assert.equal(await exp(O, '2030-01-10T23:59:00+09:00'), '2030-01-11 07:00');
+    assert.equal(await exp(O, '2030-01-10T00:01:00+09:00'), '2030-01-11 07:00');
     await O.query('reset timezone');
     // 取り消しは保存の取引 (種類の共有の鍵) の完了を待つ → その後の保存は閉じる。許可の有無によらず停止の床を足す
     await O2.query('begin'); await O2.query("select ops._require_new_entry_lease('single')");
@@ -523,6 +524,27 @@ try {
     await O.query('rollback');
     assert.match(String(s9e?.message), /shape/);
     await grant(NG, 'mc_lease_5');
+    assert.equal(await valid(), true);
+  });
+
+  await ta('[19] 復元で新商品の許可が生き返らない (#1644 Codex R2 High): 有効な許可のときのダンプ → 照合 ② の始めに閉じる → 復元 = 閉じたまま・新しい close → record → grant の後だけ開く', async () => {
+    const valid = async () => (await E.query("select ops.new_entry_lease_valid('single') as v")).rows[0].v;
+    assert.equal(await valid(), true);
+    const dumpValid = await dumpText();
+    await WW.query("select ops.close_new_entry_for_compare('mc_restore_1')");
+    assert.equal(await valid(), false);
+    const r = await restoreCompanyDb(dbO, dumpValid, { log: () => {} });
+    assert.ok(r.newEntryStop && r.newEntryStop.revoked >= 1, JSON.stringify(r.newEntryStop));
+    assert.equal(await valid(), false, 'ダンプから戻った許可は使わない');
+    const maxR = (await O.query('select max(result_id)::text as m from ops.new_entry_gate_results')).rows[0].m;
+    assert.deepEqual((await O.query("select kind, floor_result_id::text as f from ops.master_new_entry_stop_floors where reason = '復元' order by floor_id desc limit 2")).rows.map((x) => [x.kind, x.f]).sort(),
+      [['set', maxR], ['single', maxR]]);
+    await assert.rejects(NG.query("select ops.grant_new_entry_lease('single', 'mc_lease_5')"), /stop_floor/);   // 戻った結果の行ではもう出せない
+    await assert.rejects(E.query("select ops.stop_new_entry_for_restore('stop')"), (e) => e.code === '42501');   // 画面のロールは呼べない
+    // 新しい照合 ② (閉じる → 結果 → その回で grant) の後だけ開く
+    await WW.query("select ops.close_new_entry_for_compare('mc_restore_2')");
+    await WW.query('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', ['mc_restore_2', new Date(Date.now() - 1000).toISOString(), JSON.stringify(ZERO_GATE)]);
+    await NG.query("select ops.grant_new_entry_lease('single', 'mc_restore_2')");
     assert.equal(await valid(), true);
   });
 

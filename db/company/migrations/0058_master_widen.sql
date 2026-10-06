@@ -17,7 +17,7 @@
 --   9. G25: 復元の最後 (commit の前) の数え直し ops.assert_sku_kind_shape_after_restore() (apps/company-db/backup/dump.mjs が呼ぶ)
 --  10. 照合 ② の新商品のゲートの結果 ops.new_entry_gate_results (watch_writer が ops.record_new_entry_gate で 1 行・kind_gate の 5 つ + DB が数えた最終形)
 --  11. 開放の許可 (lease): 照合 ② の開始で ops.close_new_entry_for_compare (watch_writer) が閉じる → ops.grant_new_entry_lease(種類, 今回の回)
---      (ログイン new_entry_gate・一番新しい結果の行 = 今回の回・全部 0・今日・widen の後・停止の床より新しい → 翌日 10:00 まで)・
+--      (ログイン new_entry_gate・一番新しい結果の行 = 今回の回・全部 0・今日・widen の後・停止の床より新しい → 翌日 07:00 まで)・
 --      ops.revoke_new_entry_lease (停止の床)・ops.acquire_new_entry_locks (アプリの鍵の入口)。新商品を作る 3 つの関数の中で強制
 --  12. NE で一度でも見たコードの履歴 (seed + 毎日の照合)・配る直前の重なりの確かめ (NE の登録の CSV は upsert = 社内の DB の重なりの確かめで止める)
 --  13. 配ったファイルは ops.ne_reg_file だけで渡す (配ってから 2 時間 + 配った時の許可が有効)。file_bytes の列を読めるロールを無くす
@@ -916,7 +916,7 @@ create table ops.master_new_entry_leases (
   constraint ck_mnel_expires check (expires_at > granted_at)
 );
 create index ix_master_new_entry_leases_kind on ops.master_new_entry_leases (kind, lease_id desc);
-comment on table ops.master_new_entry_leases is '新商品の入口の開放の許可 (0058・最小の計画 §3)。出すのは ops.grant_new_entry_lease だけ (ログイン new_entry_gate)・期限 = 翌日 10:00 (JST)。新商品を作る DB の関数が ops._require_new_entry_lease で確かめる';
+comment on table ops.master_new_entry_leases is '新商品の入口の開放の許可 (0058・最小の計画 §3)。出すのは ops.grant_new_entry_lease だけ (ログイン new_entry_gate)・期限 = 翌日 07:00 (JST・daily-sync の始まり)。新商品を作る DB の関数が ops._require_new_entry_lease で確かめる';
 
 create function ops.guard_master_new_entry_leases() returns trigger language plpgsql set search_path = pg_catalog, pg_temp as $$
 begin
@@ -937,9 +937,10 @@ revoke all on function ops.guard_master_new_entry_leases() from public;
 create trigger trg_master_new_entry_leases_guard before insert or update or delete on ops.master_new_entry_leases for each row execute function ops.guard_master_new_entry_leases();
 create trigger trg_master_new_entry_leases_truncate before truncate on ops.master_new_entry_leases for each statement execute function core.reject_mutation();
 
--- 許可の期限 = 東京の今日の翌日 10:00 (DB と session の TimeZone に左右されない)
+-- 許可の期限 = 東京の今日の翌日 07:00 (= daily-sync の始まり・#1641 Codex R3: 照合 ② の始めの close が失敗しても、前日の許可は朝の照合の前に必ず切れる)。
+--   DB と session の TimeZone に左右されない
 create function ops.new_entry_lease_expiry(p_now timestamptz) returns timestamptz language sql immutable set search_path = pg_catalog, pg_temp as $$
-  select (((p_now at time zone 'Asia/Tokyo')::date + 1) + time '10:00') at time zone 'Asia/Tokyo'
+  select (((p_now at time zone 'Asia/Tokyo')::date + 1) + time '07:00') at time zone 'Asia/Tokyo'
 $$;
 revoke all on function ops.new_entry_lease_expiry(timestamptz) from public;
 
@@ -1120,6 +1121,36 @@ begin
   return jsonb_build_object('revoked', v_n, 'floor_result_id', v_floor::text, 'compare_run_id', p_compare_run_id);
 end $$;
 revoke all on function ops.close_new_entry_for_compare(text) from public;
+
+-- 復元 (apps/company-db/backup/dump.mjs の restoreCompanyDb) 専用の停止 (#1644 Codex R2 High)。DB の持ち主だけ・同じ取引の中で 2 回呼ぶ:
+--   p_phase = 'lock' (取引の最初・表を消す前) = 全部の種類の許可の鍵を single → set の順に排他で取る (保存・配るの取引の完了を待つ・§3.10 の 2 を最初に)
+--   p_phase = 'stop' (戻した後・commit の前) = 鍵をもう一度取り、ダンプから戻った取り消されていない許可を全部取り消し、停止の床を戻した後の一番新しい結果の行まで進める
+--   = ダンプの時点で有効だった許可・結果・床が戻っても入口は閉じたまま (新しい照合 ② の close → record → grant の後だけ開く)。戻り値 = { revoked, floor_result_id }
+create function ops.stop_new_entry_for_restore(p_phase text) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  k       text;
+  v_n     integer := 0;
+  v_floor bigint;
+begin
+  if not coalesce(ops.session_is_db_owner(), false) then
+    raise exception 'owner_only: 復元の停止は DB の持ち主だけ (session_user %)', session_user using errcode = '42501';
+  end if;
+  if p_phase is null or p_phase not in ('lock', 'stop') then raise exception 'invalid_input: p_phase は lock / stop' using errcode = '22023'; end if;
+  foreach k in array ops.new_entry_lease_kinds() loop perform pg_catalog.pg_advisory_xact_lock(ops.new_entry_lease_lock_key(k)); end loop;
+  if p_phase = 'lock' then return pg_catalog.jsonb_build_object('locked', true); end if;
+  perform pg_catalog.set_config('ops.lease_protocol', '1', true);
+  update ops.master_new_entry_leases set revoked_at = pg_catalog.clock_timestamp(), revoke_reason = '復元 (ダンプから戻した許可は使わない)', revoked_by = session_user::text
+   where revoked_at is null;
+  get diagnostics v_n = row_count;
+  perform pg_catalog.set_config('ops.lease_protocol', '', true);
+  select coalesce(pg_catalog.max(x.result_id), 0) into v_floor from ops.new_entry_gate_results x;
+  foreach k in array ops.new_entry_lease_kinds() loop
+    insert into ops.master_new_entry_stop_floors (kind, floor_result_id, reason, recorded_by) values (k, v_floor, '復元', session_user::text);
+  end loop;
+  return pg_catalog.jsonb_build_object('revoked', v_n, 'floor_result_id', v_floor::text);
+end $$;
+revoke all on function ops.stop_new_entry_for_restore(text) from public;
 
 -- 許可を取り消す (ゲートの失敗 = new_entry_gate・人が止めたい = DB の持ち主)。排他の鍵 = 保存の取引の完了を待ってから・その後の保存は閉じる。
 --   許可の有無によらず停止の床を足す。戻り値 = { revoked (取り消した数), floor_result_id (文字) }
@@ -1884,7 +1915,7 @@ begin
     -- 🆕 0058 (v13 §3.8): 初回の built → issued (初めて配る) だけ許可を確かめる (もう配った・閉じる道は要らない)
     perform ops._require_new_entry_lease(case when e.kind = 'products' then 'single' else 'set' end);   -- セットはセットの許可 (#1644 Codex R1 Medium 2)
     -- 🆕 0058 (v17 §3.9 R16 M5): 配った時の許可と、その許可を出した朝の照合の回を export に残す (ops.ne_reg_file が「配った時の許可がまだ有効」を見る)。
-    --   セットの CSV は許可が要らない = 有効な許可があるときだけ残す (無ければダウンロードできない = 閉じる側・設計への質問)
+    --   セットの CSV はセット専用の許可が要る (上の _require_new_entry_lease)。本番の grant は single だけ = セットは閉じたまま (#1644 Codex R1 Medium 2 / R2 Low)
     select l.lease_id, l.compare_run_id into v_lease, v_run from ops.master_new_entry_leases l
      where l.kind = case when e.kind = 'products' then 'single' else 'set' end order by l.lease_id desc limit 1;
     -- 🆕 0058 (v15 §3.9): 配る直前に、その時の NE のコード (最新の照合の回) と履歴の両方に無いことをもう一度確かめる (build の後の新しい取得で見えたコードを配らない)

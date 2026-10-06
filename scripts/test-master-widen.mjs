@@ -173,10 +173,10 @@ await ta('[15] 照合 ② の新商品のゲートの結果: 5 つの数の形�
   const rv = (await q("select ops.revoke_new_entry_lease('single', '試験') as r"))[0].r;
   assert.deepEqual([rv.revoked, rv.floor_result_id], [0, (await q('select max(result_id)::text as m from ops.new_entry_gate_results'))[0].m]);
   await assert.rejects(q("select ops.revoke_new_entry_lease('single', ' ')"), /理由/);
-  // 期限 = 東京の今日の翌日 10:00 (session の TimeZone に左右されない)
+  // 期限 = 東京の今日の翌日 07:00 (daily-sync の始まり・session の TimeZone に左右されない)
   await db.query("set timezone = 'America/Los_Angeles'");
   const exp = async (t) => (await q("select to_char(ops.new_entry_lease_expiry($1::timestamptz) at time zone 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI') as e", [t]))[0].e;
-  assert.equal(await exp('2030-01-10T23:59:00+09:00'), '2030-01-11 10:00'); assert.equal(await exp('2030-01-10T00:01:00+09:00'), '2030-01-11 10:00');
+  assert.equal(await exp('2030-01-10T23:59:00+09:00'), '2030-01-11 07:00'); assert.equal(await exp('2030-01-10T00:01:00+09:00'), '2030-01-11 07:00');
   await db.query('reset timezone');
   // アプリの鍵の入口: 知らない種類は拒む・今の許可が無い = false
   assert.equal((await q("select ops.acquire_new_entry_locks('single') as v"))[0].v, false);

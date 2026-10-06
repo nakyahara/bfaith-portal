@@ -144,7 +144,7 @@ export const LEASE_GATE_FUNCTIONS = Object.freeze(['ops.grant_new_entry_lease(te
 /** 0058: だれにも渡さない (DB の持ち主だけ = prepare / cancel / 停止 / widen / 保守の印 / 判定の本体 / private の _ の関数 / trigger と部品) */
 export const WIDEN_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.prepare_master_widen(integer, jsonb, text, jsonb, text)', 'ops.cancel_master_widen(uuid, text)',
   'ops.record_widen_manual_stop(uuid, text, text, text)', 'ops.widen_master_ownership(uuid, integer, text, jsonb)', 'ops._widen_judge(uuid, integer)',
-  'ops.begin_master_maintenance(text)', 'ops.master_maintenance_active()',
+  'ops.begin_master_maintenance(text)', 'ops.master_maintenance_active()', 'ops.stop_new_entry_for_restore(text)',
   'ops._new_entry_lease_ok(text)', 'ops._require_new_entry_lease(text)', 'ops._new_entry_gate_problems(text, bigint)', 'ops._new_entry_lease_shared_locks()',
   'ops.sku_kind_locked()', 'ops.sku_kind_shape_counts(integer)', 'ops.assert_sku_kind_shape_after_restore()', 'ops.session_is_db_owner()',
   'core.guard_sku_kind_locked()', 'core.check_sku_kind_shape()', 'ops.guard_master_ownership_widen()', 'ops.guard_new_entry_gate_results()', 'ops.restrict_ne_reg_file_bytes()']);
