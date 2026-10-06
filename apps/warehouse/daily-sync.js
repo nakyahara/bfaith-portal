@@ -18,6 +18,7 @@ import { publishGateDecision, readPublishGate, gateAfterVerify } from './publish
 import { waitOtherRunGone, isAliveNodeSince, remainingRetrySlots } from './retry-lock.js';
 import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS } from './amazon-finance-months.js';
 import { financeCoordinatorEnabled, settlementStep, financePushStep, FINANCE_COORDINATOR_ENV, legacyGateCheck } from './finance-coordinator-switch.js';
+import { skipAfterCompare, STEP_NAME as NEW_ENTRY_GATE_STEP } from '../company-db/master-compare/new-entry-gate.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -87,7 +88,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価'];
 // 🚨 Amazon の決済と財務は env CDB_FINANCE_COORDINATOR=1 のときだけ coordinator「Amazon決済と財務」の 1 工程・無ければ今までの 2 工程「Amazon Settlement」→「CompanyDB財務(Amazon)」
 //   (finance-coordinator-switch.js・#1567。走るのはどちらか片方 = retry の対象には両方の名前を載せる)
 
@@ -1740,6 +1741,17 @@ async function main() {
   // 差がある・判定できない は ⚠️ (exit 0)。照合そのものの失敗だけ ❌ (retry。Render同期 が retry で直ったら照合 → 見張りも走らせ直す = RERUN_AFTER)
   const masterCompareResult = runScript('apps/company-db/master-compare/run.mjs --daily', 'マスタ照合', 300000);
   results.push({ name: 'マスタ照合', ...masterCompareResult, warn: masterCompareResult.success && isWarnSummary(masterCompareResult.summary) });
+
+  // ─── 新商品の許可 (照合 ② の次の 1 段・計画 newentry_min_plan.md §3 の 2・PR-7。新しい定期実行ではない) ───
+  // その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease('single', 回) を呼ぶ = 単品の新商品をポータルで開ける (〜翌日 10:00)。
+  // 照合が失敗・見送り = 流さない (入口は照合の始めで閉じたまま。retry で照合が直ったら RERUN_AFTER でこの段も流す)。照合 ② が判定できない回はこの段が grant を呼ばない。
+  // 接続 COMPANY_DB_NEW_ENTRY_GATE_URL が無い・関数が無い (0058 の前) = 飛ばして要約に一言 (exit 0)。拒まれた = 理由つきで閉・revoke してから ❌ (retry)
+  const newEntryGateSkip = skipAfterCompare(masterCompareResult);
+  if (newEntryGateSkip) results.push(newEntryGateSkip);
+  else {
+    const newEntryGateResult = runScript('apps/company-db/master-compare/new-entry-gate.mjs --daily', NEW_ENTRY_GATE_STEP, 120000);
+    results.push({ name: NEW_ENTRY_GATE_STEP, ...newEntryGateResult, warn: newEntryGateResult.success && isWarnSummary(newEntryGateResult.summary) });
+  }
 
   // ─── ロジザードの毎日の商品マスタ (影。マスタ正本切替 ③c-1a。設計 = AI_reference CompanyDB構想/10 §6.3「③c 契約 v1〜v3」) ───
   // Company DB の値で作り、NE の取得の値から作ったもの (GAS と同じ変換と確かめ済み) と突き合わせる。**まだロジザードに取り込まない**。

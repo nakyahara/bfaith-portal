@@ -280,6 +280,7 @@ export const PUBLISH_UNGATED_SCRIPTS = Object.freeze({
   'apps/yahoo-inquiry-alert/notify-job.js': '問い合わせの知らせだけ',
   'apps/warehouse/backup-warehouse.js': '写しを残す (壊れた朝の証拠も残す)',
   'apps/company-db/master-compare/run.mjs': '比べて知らせる側 (② と ②b が壊れを朝の要約に出す)',
+  'apps/company-db/master-compare/new-entry-gate.mjs': 'Company DB の新商品の許可だけ (照合の証跡と DB の関数を読む)',
   'apps/company-db/watch/run.mjs': 'Company DB だけを見る',
 });
 
