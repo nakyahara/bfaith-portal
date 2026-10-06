@@ -168,6 +168,7 @@
   }
   function resultHtml(j) {
     var li = function (a) { return a.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join(''); };
+    if (j.no_change) return '<div class="rt">変わった項目がありません (何も保存していません) · 画面は今の値です</div><button type="button" class="btn ghost sm" id="saved-note-close">閉じる</button>';
     return '<div class="rt"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg> ' + (j.state === 'deleted' ? '削除 (墓標に) しました' : '保存しました') + (j.replayed ? ' (前に保存した結果)' : '') + ' · 画面は保存した後の値です</div><ul>'
       + (j.created ? '<li>新しい対応を作りました' + (j.listing_created ? ' (出品も作りました)' : '') + '</li>' : '')
       + (j.revived ? '<li>削除済みの seller SKU をもう一度登録しました</li>' : '')
@@ -179,7 +180,7 @@
   }
   var NOTE_KEY = 'master-edit:amazon-saved-note';
   function keepNote(j) {
-    try { sessionStorage.setItem(NOTE_KEY, JSON.stringify({ sku: P.sku, at: Date.now(), j: { state: j.state, replayed: !!j.replayed, created: !!j.created, listing_created: !!j.listing_created, revived: !!j.revived, name: j.name || null, components: j.components || null, removed: j.removed || null, notes: j.notes || [] } })); } catch (e) { /* 置けない = 知らせを出さないだけ */ }
+    try { sessionStorage.setItem(NOTE_KEY, JSON.stringify({ sku: P.sku, at: Date.now(), j: { no_change: !!j.no_change, state: j.state, replayed: !!j.replayed, created: !!j.created, listing_created: !!j.listing_created, revived: !!j.revived, name: j.name || null, components: j.components || null, removed: j.removed || null, notes: j.notes || [] } })); } catch (e) { /* 置けない = 知らせを出さないだけ */ }
   }
   function showNote() {
     var n = null;
@@ -190,7 +191,7 @@
     box.innerHTML = resultHtml(n.j);
     var ph = $('#sku-ph'); ph.parentNode.insertBefore(box, ph.nextSibling);
     $('#saved-note-close').addEventListener('click', function () { box.remove(); });
-    ME.toast(n.j.state === 'deleted' ? '削除 (墓標に) しました' : '保存しました');
+    ME.toast(n.j.no_change ? '変わった項目がありません' : n.j.state === 'deleted' ? '削除 (墓標に) しました' : '保存しました');
   }
   function lockAfterSave() {
     var main = form.firstElementChild;
@@ -206,12 +207,8 @@
       .then(function (x) {
         busy = false;
         if (x.r.ok && x.j.ok) {
-          if (x.j.no_change) {
-            requestId = uuid();
-            tracked().forEach(function (el) { initial.set(el, valueOf(el)); });
-            msg(msgId, ''); $('#result').innerHTML = '<div class="result"><div class="rt">変わった項目がありません (何も保存していません)</div></div>'; update(); delState(); return;
-          }
-          saved = true; lockAfterSave(); update(); msg(msgId, '保存しました。保存した後の値を読み直しています…', 'ok');
+          // 変わった項目が無い (数 1 → 01 など) ときも読み直す = 欄・比べる基準・「元に戻す」の先をサーバーの値にそろえる (#1628 Codex R5 L2)
+          saved = true; lockAfterSave(); update(); msg(msgId, x.j.no_change ? '変わった項目がありません。画面を読み直しています…' : '保存しました。保存した後の値を読み直しています…', 'ok');
           keepNote(x.j);
           if (ME.reloadPage) ME.reloadPage(); else location.reload();
           return;

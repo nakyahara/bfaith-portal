@@ -31,7 +31,7 @@
  *  26 区分の列・コードのコピーのボタン (クリップボード・知らせ・行を開かない・キーボード)・全部コピー (絞った全件)・CSV のリンク (ダウンロード)・区分の順 (10/5)
  *  35〜44 第 2 段 (10/5・#1628): 新商品の登録 (単品・セット)・Amazon SKU・NE 登録の CSV・変更の記録 = 未保存 (data-dirty-field だけ)・離れるときの確認・保存 → 読み直し / できた商品の画面へ・
  *        削除は 1 回だけ確かめる・申告はファイルを落として sha256 を照合・1440 / 1280 / 1024 / 150% で横にはみ出さない
- *        (41〜44 = 構成品の照合・カードを作らないときの欄・確かめ直しの上限・Yahoo! の残値)
+ *        (41〜46 = 構成品の照合・カードを作らないときの欄・確かめ直しの上限・Yahoo! の残値と誤りの欄・Amazon の変わらない保存)
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -1309,6 +1309,50 @@ await ta('[38] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウ
     assert.ok(att.imported_at && new Date(att.imported_at) <= new Date(att.declared_at), JSON.stringify(att));
     assert.equal(await dirty(p), 0);
   } finally { delete process.env.MASTER_DECISION_APPROVERS; }
+});
+
+await ta('[45] 新商品 (#1628 Codex R5 L1): Yahoo! の 1 行に 2 つある欄 (佐川・path) の誤り = 畳んだ Yahoo! の欄を開き、その欄に印を付けてそこへ', async (p) => {
+  await p.goto(B + '/new?kind=single');
+  await p.fill('#code', 'ui-yahoo-2');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', 'Yahoo! の欄の試験');
+  await p.fill('#f-standard_price', '800');
+  await p.click('#f-tax_rate button[data-v="0.1"]');
+  await p.selectOption('#shipping', 'S01');
+  for (const [id, val, re] of [['y-price-sagawa', 'abc', /Yahoo!売価 \(佐川\)/], ['y-path', 'a\tb', /Yahoo!path/]]) {
+    await p.evaluate(() => { document.getElementById('sec-yahoo').open = true; });
+    await p.fill('#' + id, val);
+    await p.evaluate(() => { document.getElementById('sec-yahoo').open = false; });   // 畳む
+    assert.equal(await p.evaluate(() => document.getElementById('sec-yahoo').open), false);
+    await p.click('#save');
+    await p.waitForSelector('.result.err');
+    assert.match(await p.textContent('.result.err'), re);
+    assert.equal(await p.evaluate(() => document.getElementById('sec-yahoo').open), true, id + ': Yahoo! の欄を開く');
+    assert.equal(await active(p), id, id + ': その欄へ');
+    assert.equal(await p.evaluate((x) => document.getElementById(x).closest('.f').classList.contains('err'), id), true, id + ': 誤りの印');
+    await p.fill('#' + id, '');
+    await p.evaluate(() => { document.getElementById('result').innerHTML = ''; document.querySelectorAll('.f.err').forEach((x) => x.classList.remove('err')); });
+  }
+  assert.equal(await skuRow('ui-yahoo-2'), undefined);
+});
+
+await ta('[46] Amazon SKU (#1628 Codex R5 L2): 変わった項目が無い保存 (数 3 → 03) の後は読み直す = その後に構成を変えて「元に戻す」で未保存 0', async (p) => {
+  await p.goto(B + '/amazon/sku?sku=pr-k001-3p');
+  const qty = p.locator('#comp-rows tr.comp-row .c-qty').first();
+  assert.equal(await qty.inputValue(), '3');
+  await qty.fill('03');
+  assert.equal(await dirty(p), 1);
+  await p.click('#save');
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /変わった項目がありません/);
+  assert.equal(await p.locator('#comp-rows tr.comp-row .c-qty').first().inputValue(), '3', '読み直した = サーバーの値');
+  assert.equal(await dirty(p), 0);
+  await p.locator('#comp-rows tr.comp-row .c-qty').first().fill('5');
+  assert.equal(await dirty(p), 1);
+  await p.click('#revert');
+  assert.equal(await p.locator('#comp-rows tr.comp-row .c-qty').first().inputValue(), '3');
+  assert.equal(await dirty(p), 0, '元に戻したら未保存 0');
+  assert.equal(await p.isDisabled('#save'), true);
 });
 
 // 第 2 段の画面の幅: 1440 / 1280 / 1024 と 1280×720 の 150% で横にはみ出さない・板からはみ出さない・構成の表は横に送る囲いの中。

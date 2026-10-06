@@ -456,6 +456,11 @@
 
   /* ---------- 登録 ---------- */
   function msg(t, cls) { var m = $('#msg'); m.className = 'msgline ' + (cls || ''); m.textContent = t || ''; }
+  /**
+   * サーバーの誤りの項目 → 直す欄 (1 つの行に欄が 2 つある Yahoo! など。#1628 Codex R5 L1)。
+   * ここに無い項目は data-row の行の最初の欄
+   */
+  var FIELD_INPUT = { 'card.yahoo': '#y-price', 'card.yahoo.price': '#y-price', 'card.yahoo.price_sagawa': '#y-price-sagawa', 'card.yahoo.delivery_label': '#y-delivery', 'card.yahoo.category_id': '#y-category', 'card.yahoo.path': '#y-path' };
   function showError(j, status) {
     var h = '<div class="result err" role="alert"><div class="rt">' + esc(j.error || ('HTTP ' + status)) + '</div>';
     if (j.reason === 'set_underivable' && Array.isArray(j.blockers)) h += '<ul>' + j.blockers.map(function (b) { return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>';
@@ -463,6 +468,8 @@
     if (j.field) {
       if (/^card\./.test(String(j.field))) { var cf = $('#card-fields'); if (cf) cf.hidden = false; }   // 隠れた欄の誤りでも直せるように開く
       var row = $('[data-row="' + String(j.field).replace(/"/g, '') + '"]', scope);
+      var target = Object.prototype.hasOwnProperty.call(FIELD_INPUT, j.field) ? $(FIELD_INPUT[j.field]) : null;
+      if (target) row = target.closest('.f');
       // セット判断の誤りで「作らない / 保留」を選んでいる = 直すのは理由・メモの欄
       var plan0 = segVal('set-plan');
       if (j.field === 'card.set_decision' && (plan0 === 'none' || plan0 === 'hold') && $('#row-set-reason')) { row = $('#row-set-reason'); row.hidden = false; }
@@ -470,7 +477,7 @@
         row.classList.add('err');
         var det = row.closest('details'); if (det) det.open = true;
         row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        var c = $('input:not([disabled]), select:not([disabled]), button:not([disabled])', row); if (c) try { c.focus({ preventScroll: true }); } catch (e) { c.focus(); }
+        var c = target || $('input:not([disabled]), select:not([disabled]), button:not([disabled])', row); if (c) try { c.focus({ preventScroll: true }); } catch (e) { c.focus(); }
       }
     }
   }
