@@ -476,7 +476,7 @@ export const JOBS_REGISTRY = [
       + 'retry: Render同期 が retry で直ったら マスタ照合 → 見張り も走らせ直す (retry-failed-jobs.js の RERUN_AFTER)。新しい定期実行ではない) が走る。'
       + '🆕 2026-10 (PR-7・計画 newentry_min_plan.md §3 の 2): 「マスタ照合」の直後に「新商品の許可」(apps/company-db/master-compare/new-entry-gate.mjs --daily。新しい定期実行ではない・この台帳の ping に乗る)。'
       + 'その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease(\'single\', 回) を呼ぶ (0058・ログイン new_entry_gate = miniPC の .env の COMPANY_DB_NEW_ENTRY_GATE_URL)。'
-      + '許可が出た = 単品の新商品をポータルで開ける (〜翌日 10:00 JST・要約に「🆕 新商品の入口: 開」)。照合 ② は始めに入口を閉じ (close_new_entry_for_compare)、最後にゲートの結果を 1 行書く (record_new_entry_gate) = 照合が失敗した日は閉じたまま。'
+      + '許可が出た = 単品の新商品をポータルで開ける (〜翌日 07:00 JST・要約に「🆕 新商品の入口: 開」)。照合 ② は始めに入口を閉じ (close_new_entry_for_compare)、最後にゲートの結果を 1 行書く (record_new_entry_gate) = 照合が失敗した日は閉じたまま。'
       + 'マスタ照合が失敗・見送り = この段は流さない (⏭️・retry で照合が直ったら RERUN_AFTER で流す)。照合 ② が判定できない・落ちた = grant を呼ばず revoke (閉・exit 0)。'
       + '接続が無い = 「未設定」・関数が無い (0058 の前) = 「閉のまま」で飛ばす (exit 0 = 毎朝の処理を止めない)。widen の前で拒まれた = ⏸️ 閉 (準備中・exit 0)。'
       + 'ほかで拒まれた (kind_gate が 0 でない・最終形・今日でない・停止の床・回の不一致) = revoke してから理由つきで「閉」❌ (retry に載る = 人が直せば同じ日に開く)。'

@@ -3,7 +3,7 @@
  *
  *   その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease('single', 回) を呼ぶ (ログイン new_entry_gate)。
  *   DB の関数が全部を確かめる (一番新しいゲートの結果の行の回 = 渡した回・kind_gate の 5 つが 0・最終形が 0・今日・区分の持ち主が company・widen の後・停止の床より新しい)。
- *   許可が出た = 単品の新商品をポータルで開ける (期限 = 翌日 10:00 JST)。
+ *   許可が出た = 単品の新商品をポータルで開ける (期限 = DB の expires_at = 翌日 07:00 JST = daily-sync の始まり)。
  *
  * 使い方 (miniPC): node apps/company-db/master-compare/new-entry-gate.mjs --daily [--data-dir D]
  *   (--daily は daily-sync の runScript が引数の無いときに '7' を足すのを避ける印)
@@ -129,7 +129,7 @@ export async function runGateStep({ env = process.env, dataDir, now = new Date()
       return { code: 1, state: denied ? 'denied' : 'error', line: `${HEAD} 閉 (${denied ? '拒まれた' : '許可を出せない'}: ${why.slice(0, 220)}${rv.ok ? '' : ` / ${rv.note}`})` };
     }
     if (!g || !g.expires_at) return { code: 1, state: 'error', line: `${HEAD} 閉 (許可の返り値が読めない: ${JSON.stringify(g).slice(0, 80)})` };
-    return { code: 0, state: 'opened', grant: g, line: `${HEAD} 開 (〜翌日 10:00 = ${jstShort(g.expires_at)} JST・照合 ${cr.compareRunId}・許可 #${g.lease_id ?? '?'})` };
+    return { code: 0, state: 'opened', grant: g, line: `${HEAD} 開 (〜${jstShort(g.expires_at)} JST・照合 ${cr.compareRunId}・許可 #${g.lease_id ?? '?'})` };
   } catch (e) {
     return { code: 1, state: 'error', line: `${HEAD} 閉 (確かめられない: ${short(e).slice(0, 160)})` };
   } finally {

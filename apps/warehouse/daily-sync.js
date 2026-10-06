@@ -1743,7 +1743,7 @@ async function main() {
   results.push({ name: 'マスタ照合', ...masterCompareResult, warn: masterCompareResult.success && isWarnSummary(masterCompareResult.summary) });
 
   // ─── 新商品の許可 (照合 ② の次の 1 段・計画 newentry_min_plan.md §3 の 2・PR-7。新しい定期実行ではない) ───
-  // その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease('single', 回) を呼ぶ = 単品の新商品をポータルで開ける (〜翌日 10:00)。
+  // その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease('single', 回) を呼ぶ = 単品の新商品をポータルで開ける (〜翌日 07:00)。
   // 照合が失敗・見送り = 流さない (入口は照合の始めで閉じたまま。retry で照合が直ったら RERUN_AFTER でこの段も流す)。照合 ② が判定できない回はこの段が grant を呼ばない。
   // 接続 COMPANY_DB_NEW_ENTRY_GATE_URL が無い・関数が無い (0058 の前) = 飛ばして要約に一言 (exit 0)。拒まれた = 理由つきで閉・revoke してから ❌ (retry)
   const newEntryGateSkip = skipAfterCompare(masterCompareResult);

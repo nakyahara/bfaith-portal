@@ -3,7 +3,7 @@
  *
  * 固定する契約:
  *   1 照合 (マスタ照合) が失敗・見送り = この段を流さない (⏭️・blocked = この段だけを retry に載せない)。成功 (⚠️ を含む) = 流す
- *   2 許可が出た = 「🆕 新商品の入口: 開 (〜翌日 10:00」・exit 0・grant は ('single', その朝の照合の回) で 1 回
+ *   2 許可が出た = 「🆕 新商品の入口: 開 (〜10/08 07:00 JST」・exit 0・grant は ('single', その朝の照合の回) で 1 回
  *   3 拒まれた = revoke してから理由つきで「閉」・exit 1 (retry)。widen の前だけで拒まれた = ⏸️ 閉・exit 0 (準備中)。取り消しも落ちた = exit 1
  *   4 接続先が無い = 「未設定」・exit 0・接続しない / 関数が無い (0058 の前) = 「閉のまま」・exit 0・grant も revoke も呼ばない
  *   5 照合 ② が判定できない・落ちた・完了していない = grant を呼ばない (revoke だけ・exit 0) / その回の証跡が無い・別の回・別の日 = grant を呼ばない・exit 1
@@ -45,7 +45,7 @@ function fakeDb({ hasFn = true, grant = null, grantError = null, revokeError = n
       if (/to_regprocedure\('ops\.grant_new_entry_lease\(text, text\)'\)/.test(text)) return { rows: [{ ok: hasFn }] };
       if (/ops\.grant_new_entry_lease\(\$1, \$2\)/.test(text)) {
         if (grantError) { const e = new Error(grantError); e.code = 'P0001'; throw e; }
-        return { rows: [{ r: grant ?? { lease_id: '7', kind: 'single', result_id: '42', compare_run_id: params[1], expires_at: '2026-10-08T01:00:00+00:00' } }] };
+        return { rows: [{ r: grant ?? { lease_id: '7', kind: 'single', result_id: '42', compare_run_id: params[1], expires_at: '2026-10-07T22:00:00+00:00' } }] };
       }
       if (/ops\.revoke_new_entry_lease\(\$1, \$2\)/.test(text)) {
         if (revokeError) throw new Error(revokeError);
@@ -71,12 +71,12 @@ await ta('[1] 照合が失敗・見送り = 流さない (⏭️・blocked)。�
   assert.equal(S.skipAfterCompare({ success: true, summary: '⚠️ ②: 判定できない' }), null);   // blocked の判定はこの段が証跡で見る
 });
 
-await ta('[2] 許可が出た = 開 (〜翌日 10:00)・exit 0・grant は (single, その朝の照合の回) で 1 回・接続を閉じる', async () => {
+await ta('[2] 許可が出た = 開 (〜DB の期限)・exit 0・grant は (single, その朝の照合の回) で 1 回・接続を閉じる', async () => {
   const f = fakeDb();
   const r = await run(f);
   assert.equal(r.code, 0);
   assert.equal(r.state, 'opened');
-  assert.match(r.line, /^🆕 新商品の入口: 開 \(〜翌日 10:00 = 10\/08 10:00 JST・照合 mc_20261006T221500123Z_abc123・許可 #7\)$/);
+  assert.match(r.line, /^🆕 新商品の入口: 開 \(〜10\/08 07:00 JST・照合 mc_20261006T221500123Z_abc123・許可 #7\)$/);
   assert.deepEqual(grants(f).map((c) => c.params), [['single', CR]]);
   assert.equal(revokes(f).length, 0);
   assert.equal(f.closed(), 1);
