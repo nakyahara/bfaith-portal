@@ -668,6 +668,7 @@ router.get('/api/reg-csv/exports/:id/file', (req, res) => {
   return withPgApi(res, async (db) => {
     const f = await regExportFile(db, req.params.id);
     if (!f) return res.status(404).json({ ok: false, error: 'ファイルがありません' });
+    if (!f.bytes && f.expired) return res.status(409).json({ ok: false, error: f.message, reason: 'reg_file_expired', detail: f.expired });   // 0058: 配ってから 2 時間・配った時の許可
     if (!f.bytes) return res.status(409).json({ ok: false, error: f.state === 'built' ? '先に「配る」を押してください' : '閉じたファイルは配りません', reason: f.state });
     res.set('Content-Type', 'text/csv; charset=utf-8');
     res.set('Content-Disposition', `attachment; filename="${f.file_name}"`);

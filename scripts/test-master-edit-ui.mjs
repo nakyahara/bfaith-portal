@@ -125,6 +125,7 @@ const bp = (await pg.query('select * from ops.registration_backfill_plan()')).ro
 await as('master_ops', () => pg.query('select ops.backfill_sku_registrations($1, $2, $3)', [bp.sku_count, bp.snapshot_hash, 'naka@test']));
 await toPhase('company_owner');
 await toPhase('new_open');
+await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(db);   // 0058: 単品の新商品は DB の関数が開放の許可を確かめる = 試験の許可を置く
 // ── 発注アプリの台帳 (注文残) とロジザードの写し (在庫) の見本 (PR2) ──
 const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 const mirrorDb = initMirrorDB();
@@ -1266,6 +1267,8 @@ await ta('[38] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウ
   await pg.query('insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, now(), 0)', [run]);
   const codes = (await pg.query("select code_norm from core.skus where code_norm <> 'ui-new-1'")).rows.map((r) => r.code_norm);
   await pg.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: run, entries: codes.map((c) => ({ code_norm: c, kind: 'product', state: 'ok', ne_code: c, spellings: [c] })) })]);
+  // 0058: 本番と同じく、その照合の回の封 → ゲートの許可 (配る = 許可の回と NE のコードの回が同じときだけ・配ったファイルは配った時の許可の間だけ渡す)
+  await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(db, { runId: run });
   try {
     await p.goto(B + '/reg-csv');
     const pick = p.locator('input.pick[value="ui-new-1"]');

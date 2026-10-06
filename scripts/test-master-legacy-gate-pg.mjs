@@ -75,7 +75,7 @@ try {
   await createRoles(M, { watcherPw: 'w-pw', writerPw: 'ww-pw' });
   // ⑤-1 のロールの作り (本物の scripts/company-db/create-master-edit-roles.mjs = まとめの master_gate (ログインなし) と場所ごとのログイン)。
   // 試験は門のログインのパスワードだけ決めて渡す (ほかのロールは作りに任せる)
-  await createMasterEditRoles(M, { pw: Object.fromEntries(Object.values(GATE_LOGIN_ROLES).map((r) => [r, `${r}-pw`])) });
+  await createMasterEditRoles(M, { pw: { ...Object.fromEntries(Object.values(GATE_LOGIN_ROLES).map((r) => [r, `${r}-pw`])), new_entry_gate: 'new_entry_gate-pw' } });
   const gateUrl = (h) => urlFor(u.toString(), `master_gate_${h}`, `master_gate_${h}-pw`);
   process.env.COMPANY_DB_WATCH_URL = urlFor(u.toString(), 'watcher', 'w-pw');   // --stop の確かめ (見るだけ) に使う。門の段階の読みには使わない
   process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = gateUrl('minipc');
@@ -185,7 +185,8 @@ try {
   // ─── 門の記録 (場所ごとの門のログイン・⑤-1 の本物の関数) ───
   await G.closeLegacyGatePool();
   await sleep(300);   // 閉じた接続が pg_stat_activity から消えるまで
-  const env = { ...process.env, RENDER_GIT_COMMIT: 'b'.repeat(40), RENDER_INSTANCE_ID: 'pg-test' };
+  // 0058 (広げる道 PR-1): miniPC の配る前の確かめは新商品の開く前のゲートのログイン (new_entry_gate) も見る
+  const env = { ...process.env, RENDER_GIT_COMMIT: 'b'.repeat(40), RENDER_INSTANCE_ID: 'pg-test', COMPANY_DB_NEW_ENTRY_GATE_URL: urlFor(u.toString(), 'new_entry_gate', 'new_entry_gate-pw') };
   await ta('[8] 門の記録: miniPC の門のログイン (master_gate_minipc) で ⑤-1 の関数に書く・返事を確かめる・段階の読みもこのログイン', async () => {
     G.__resetLegacyAck();
     const before = await ackCount();
@@ -250,6 +251,12 @@ try {
     let r = await checkReadiness({ host: 'minipc', env });
     assert.equal(r.ok, true, r.lines.join('\n'));
     assert.ok(r.lines.some((l) => l.includes('黙っているプロセスは無い')), r.lines.join('\n'));
+    assert.ok(r.lines.some((l) => l.includes('新商品の開く前のゲートのログイン = new_entry_gate')), r.lines.join('\n'));
+    // 0058 の後に new_entry_gate の URL が無い / 別の役 = 足りない (本番の手順の抜けを先に見つける)
+    r = await checkReadiness({ host: 'minipc', env: { ...env, COMPANY_DB_NEW_ENTRY_GATE_URL: '' } });
+    assert.equal(r.ok, false); assert.ok(r.problems.some((x) => /開く前のゲートのログインが無い/.test(x)), r.lines.join('\n'));
+    r = await checkReadiness({ host: 'minipc', env: { ...env, COMPANY_DB_NEW_ENTRY_GATE_URL: gateUrl('minipc') } });
+    assert.equal(r.ok, false); assert.ok(r.problems.some((x) => /期待 new_entry_gate/.test(x)), r.lines.join('\n'));
     r = await checkReadiness({ host: 'render', env: { ...env, COMPANY_DB_MASTER_GATE_RENDER_URL: gateUrl('minipc') } });
     assert.equal(r.ok, false); assert.ok(r.problems.some((x) => /master_gate_minipc/.test(x) && /期待 master_gate_render/.test(x)), r.lines.join('\n'));
     r = await checkReadiness({ host: 'minipc', env: { COMPANY_DB_WATCH_URL: process.env.COMPANY_DB_WATCH_URL } });

@@ -1102,13 +1102,23 @@ await ta('[11d] 上げる直前に構成品がまだ単品か確かめる: 夜�
   const D = [{ code: 's001', qty: 2, sort: 1 }, { code: 's002', qty: 1, sort: 2 }, { code: 's003', qty: 1, sort: 3 }];
   await save('set001', { components: D.map(({ code, qty }) => ({ code, qty })) }, { E: E3 });
   const obsId = (await observe([{ set_code: 'set001', rows: D }], { E: E3 })).set001;
-  await E3.pg.query("update core.skus set sku_kind = 'set' where code = 's003'");   // 夜間ロードが NE の種類替えを写した
+  // 夜間ロードが NE の種類替えを写した (の代わり)。🆕 0058: 区分の持ち主が company の間 (ALL_COMPANY) は保守の印だけが区分を変えられる (G18)・最終形 (G19) を満たす形で
+  const kindAs = async (kind, pid) => {
+    await E3.pg.query('begin');
+    try {
+      await E3.pg.query("select ops.begin_master_maintenance('試験: 夜間ロードの種類替えの代わり')");
+      await E3.pg.query('update core.skus set sku_kind = $1, product_id = $2 where code = $3', [kind, pid, 's003']);
+      await E3.pg.query('commit');
+    } catch (e) { await E3.pg.query('rollback'); throw e; }
+  };
+  const pid3 = (await E3.pg.query("select product_id from core.skus where code = 's003'")).rows[0].product_id;
+  await kindAs('set', null);
   let r = await promote3(obsId);
   assert.deepEqual([r.promoted, r.reason], [false, 'underivable'], JSON.stringify(r));
   assert.match(r.blockers.join(' '), /s003 はセットになった/);
   assert.deepEqual(await comps3('set001'), [['s001', 2], ['s002', 1]]);
   assert.deepEqual(await openBreaches3(), ['underivable']);
-  await E3.pg.query("update core.skus set sku_kind = 'single' where code = 's003'");
+  await kindAs('single', pid3);
   r = await promote3(obsId);
   assert.equal(r.promoted, true, JSON.stringify(r));
   assert.deepEqual(await comps3('set001'), [['s001', 2], ['s002', 1], ['s003', 1]]);

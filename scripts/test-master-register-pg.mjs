@@ -151,6 +151,7 @@ try {
     assert.equal((await q("select count(*)::int as n from core.skus where code = 'bf-1'"))[0].n, 0);
     await toNewOpen();
     assert.equal((await q('select phase from ops.master_cutover_state'))[0].phase, 'new_open');
+    await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(dbM);   // 0058: 新商品の入口は今朝の照合のゲートの許可 (lease) があるときだけ開く
   });
 
   await ta('[4] 遅らせた制約の trigger は commit のときに効く (取引の中では見えている・同じ取引で状態の行を作れば通る)・画面のロールも同じ', async () => {

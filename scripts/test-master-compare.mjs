@@ -274,7 +274,7 @@ await ta('[7] 代表 (親子): 記録 (targets) の親と帰属を今と比べ�
   publishMaterial(P3, S, { semantics: { rep: 'src1' }, complete: '2026-09-27 00:00:00' });
   assert.equal((await nightly(db, 'load_mc_p1')).ok, true);
   const pv = await parentPayload('load_mc_p1');
-  assert.deepEqual(pv.trusted, { matched: true, source_complete_at: '2026-09-27 00:00:00', rep_semantics: 'src1' });
+  assert.deepEqual(pv.trusted, { matched: true, source_complete_at: '2026-09-27T00:00:00Z', rep_semantics: 'src1' });   // 0058 (広げる道 PR-1): 世代を作る所で RFC 3339 (…Z) に直す
   assert.deepEqual(pv.targets.map((x) => [x[0], x[2], x[3]]).sort(), [['a001', 'grp', 'load'], ['b002', 'grp', 'load'], ['c003', null, null]]);
   assert.deepEqual(pv.held, [['Dup1', 'rep_unknown', null, null, null]]);   // 代表が NULL (NE の単品に無い・記録なし) = 不明 = 保持
   const r = await compareIn(db);

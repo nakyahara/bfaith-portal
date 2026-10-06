@@ -65,6 +65,16 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   // 照合の判断の台帳 (0032)・最後に一致した値 (0033) は watch_writer が関数だけで書く (表へ直接は書けない)。watch_writer を作った後に付ける
   //   新商品の NE 登録の CSV の確かめ (0053・回の始まりの写し → 観測 → 受け取り → 確かめの 4 つの関数・#1571 R1 High 2・R2 Medium 1) も同じ
   for (const f of secdefFunctions) if (/^ops\.(record_decision_(candidates|done)|record_ne_baseline|record_ne_codes|snapshot_ne_reg_targets|record_ne_registration_observations|seal_ne_registration_run|record_ne_registration_check)\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);
+  //   0058 (広げる道 PR-1・最小の計画 §3): 照合 ② の新商品のゲートの結果 (ops.record_new_entry_gate) も watch_writer が関数だけで書く。
+  //   🚨 開放の許可 (grant / revoke) は渡さない = 専用のログイン new_entry_gate (create-master-edit-roles.mjs)。照合のコード 1 本で開放まで完結しない
+  //   照合 ② の始めに入口を閉じる (ops.close_new_entry_for_compare) も同じ
+  for (const f of secdefFunctions) if (/^ops\.(record_new_entry_gate|close_new_entry_for_compare)\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);
+  //   0058: watcher は広げる道の読むだけの判定 (ops.widen_check_readonly)・許可の表示用 (ops.new_entry_lease_valid) を実行できる (判定の本体・apply・許可を出す関数は渡さない)
+  for (const f of secdefFunctions) if (/^ops\.(widen_check_readonly|new_entry_lease_valid)\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);
+  //   0058: 保守の印の表は「ops の全部の表」の select から外す (印の UUID を読ませない・G24)
+  s.push(`do $$ begin if to_regclass('ops.master_maintenance_marks') is not null then execute 'revoke all on ops.master_maintenance_marks from watcher, watch_writer'; end if; end $$`);
+  //   0058 (§3.9 の 3・R16 H1): 「全部の表に GRANT」の後に、配った CSV の byte 列 (ops.ne_reg_exports.file_bytes) を外して列ごとに付け直す (流し直しても戻らない)
+  s.push(`do $$ begin if to_regprocedure('ops.restrict_ne_reg_file_bytes()') is not null then perform ops.restrict_ne_reg_file_bytes(); end if; end $$`);
   return s;
 }
 
