@@ -834,6 +834,17 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
 .panel-h h3 { font-size: 15.5px; font-weight: 600; }
 .btn.soft[disabled], .btn.danger[disabled] { background: rgba(255, 255, 255, 0.05); color: var(--faint); border-color: rgba(160, 190, 240, 0.18); }
 .todo-card.warnc { border-color: rgba(255, 200, 87, 0.4); background: linear-gradient(180deg, rgba(255, 200, 87, 0.06), rgba(16, 25, 44, 0.74)); }
+/* 1 つの商品の画面: 名前は見出しのところで直す (10/6) */
+.ph .name-row { padding: 0; display: block; }
+.ph .name-row + .meta { margin-top: 8px; }
+.name-line { display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap; }
+.name-line h1 { margin: 0; }
+.name-edit { color: var(--accent); border-color: rgba(58, 231, 255, 0.45); background: rgba(58, 231, 255, 0.06); }
+.name-lock { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; border: 1px dashed rgba(160, 190, 240, 0.32); color: var(--muted); font-size: 12.5px; }
+.name-lock .ic { color: var(--faint); }
+.name-box { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.name-box .name-in { font-size: 21px; font-weight: 700; height: 48px; width: min(760px, 100%); }
+.ph .name-row.dirty::before { left: -14px; top: 2px; bottom: 2px; }
 
 /* ---------- 利益 (1 個あたり・参考・10/6) = 単品は お金 の箱・セットは 利益 の箱・一覧の列 ---------- */
 .pfhead { display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 28px; align-items: end; margin-bottom: 8px; }

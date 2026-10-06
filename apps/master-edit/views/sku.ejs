@@ -106,7 +106,21 @@
           <% if (reg) { %><span class="b <%= REG_BADGE[reg] || 'mute' %>"><% if (reg === 'available') { %><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg><% } %><%= REG_STATES[reg] || reg %></span><% } %>
           <% if (isSet && c.component_request) { %><span class="b warn">構成の依頼あり</span><% } %>
         </div>
-        <h1><%= c.name %></h1>
+        <%# 名前は見出しのところで直す (10/6 中原さん「名前を直す欄が見つからない」)。名前の欄はこの 1 つだけ (下の「基本」には置かない) %>
+        <div class="f wide name-row" data-row="name">
+          <div class="name-line" id="name-line">
+            <h1 id="sku-title"><%= c.name %></h1>
+            <% if (editable('name')) { %><button class="btn sm name-edit" type="button" id="name-edit" aria-controls="name-box" aria-expanded="false"><span aria-hidden="true">✎</span> 名前を直す</button><% } else { %><span class="name-lock" title="名前はここでは直せません"><svg class="ic s" aria-hidden="true"><use href="#i-lock"/></svg><%- lockWhy('name') || '<span class="lockwhy">' + (closed ? 'いまは保存できません (下の帯)' : cancelled ? '登録をやめた商品' : !canEdit ? '見るだけ (名簿の人だけ直せます)' : '見るだけ') + '</span>' %></span><% } %>
+          </div>
+          <% if (editable('name')) { %>
+          <div class="name-box" id="name-box" hidden>
+            <label class="sr" for="f-name"><%= isSet ? 'セット名' : '名前' %></label>
+            <input class="in name-in" id="f-name" autocomplete="off" maxlength="255" <%- meta('name') %> value="<%= c.name %>">
+            <button class="btn ghost sm" type="button" id="name-close">閉じる</button>
+            <span class="hint">保存は右の「保存する」(Ctrl + S)。Esc で直す前に戻します</span>
+          </div>
+          <% } %>
+        </div>
         <div class="meta">
           <% if (last) { %><span>最後に直した人 <%= ui.actorWords(last) %></span><span class="dotsep" aria-hidden="true"></span><span><%= ui.fmtJst(last.recorded_at, { nowMs }) %></span><% } else { %><span>変更の記録はまだありません</span><% } %>
           <% if (!isSet && c.primary_supplier) { %><span class="dotsep" aria-hidden="true"></span><span>仕入先 <%= c.primary_supplier %> <%= supName(c.primary_supplier) %></span><% } %>
@@ -125,7 +139,7 @@
     <div class="stickyid" id="sku-sticky" hidden>
       <span class="code-pill"><%= c.code %></span><span class="nm"><%= c.name %></span>
       <span class="right"><button class="unsaved" type="button" id="sticky-unsaved" hidden>● 未保存</button>
-        <% if (editable('name')) { %><button class="btn sm" type="button" data-jump="f-name">名前を直す</button><% } %></span>
+        <% if (editable('name')) { %><button class="btn sm" type="button" data-name-open>✎ 名前を直す</button><% } %></span>
     </div>
 
     <% if (closed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= closedWhy %>)</div><div class="hint">見るだけです。切替日までは、この商品の正は NE・/register です。</div></div></div><% } %>
@@ -226,8 +240,7 @@
         </section>
 
         <section class="panel" id="p-basic" aria-labelledby="h-basic">
-          <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-tag"/></svg></span><h2 id="h-basic">基本</h2><span class="sub">名前・代表 (取扱は上の見出しの横)</span></div>
-          <%- row('name', '名前', '<input class="in w-l" id="f-name" autocomplete="off" ' + meta('name') + ' value="' + h(c.name) + '">', c.name, { forId: 'f-name' }) %>
+          <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-tag"/></svg></span><h2 id="h-basic">基本</h2><span class="sub">代表 (名前と取扱は上の見出しのところで直します)</span></div>
           <%- row('parent_code', '代表 (親)', '<input class="in w-s mono" id="f-parent_code" autocomplete="off" placeholder="なし" ' + meta('parent_code') + ' value="' + h(c.parent_code || '') + '">', c.parent_code ? c.parent_code + ' ' + (c.parent_name || '') : 'なし', { forId: 'f-parent_code', mono: false, hint: h((c.parent_name ? c.parent_name + ' · ' : '') + (c.parent_set_by === 'manual' ? '人が決めた · ' : c.parent_set_by === 'load' ? 'NE から · ' : '')) + '親の商品のコード · 空 = 代表なし' }) %>
         </section>
       <% } else { %>
@@ -326,8 +339,7 @@
         </section>
 
         <section class="panel" id="p-basic" aria-labelledby="h-basic">
-          <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-tag"/></svg></span><h2 id="h-basic">基本</h2></div>
-          <%- row('name', 'セット名', '<input class="in w-l" id="f-name" autocomplete="off" ' + meta('name') + ' value="' + h(c.name) + '">', c.name, { forId: 'f-name' }) %>
+          <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-tag"/></svg></span><h2 id="h-basic">基本</h2><span class="sub">セット名は上の見出しのところで直します</span></div>
           <% const ps = dv.current.price_sum; const diffP = ps != null && c.standard_price != null ? c.standard_price - ps : null; %>
           <%- row('standard_price', '標準売価', '<span class="yen"><input class="in w-s" id="f-standard_price" inputmode="numeric" autocomplete="off" ' + meta('standard_price') + ' data-unit=" 円" value="' + h(c.standard_price ?? '') + '"></span><span class="unit">円</span>', c.standard_price == null ? '未入力' : yen(c.standard_price) + ' 円', { forId: 'f-standard_price', hint: ps == null ? '単品の売価の合計は出せません' : '単品の売価の合計 ' + yen(ps) + ' 円' + (diffP == null || diffP === 0 ? '' : diffP < 0 ? 'より ' + yen(-diffP) + ' 円安い' : 'より ' + yen(diffP) + ' 円高い') }) %>
           <%- row('handling_own', '希望する取扱', seg('handling_own', c.handling_own ?? '', [['active', '取扱中'], ['discontinued', '中止']]) + (c.handling_own == null ? '<span class="hint">いまは決めていません (構成品から決めています)</span>' : ''), c.handling_own == null ? '決めていない (構成品から)' : HANDLING[c.handling_own]) %>

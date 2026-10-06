@@ -51,7 +51,8 @@ async function recover(config,{collectorIdleFn=collectorIdle,lock=true}={}){
   const asins=new Set(batch.input_asins);
   const rows=fs.readFileSync(config.source_file,'utf8').split(/\r?\n/).filter(Boolean).map(l=>JSON.parse(l)).filter(r=>asins.has(r.asin));
   check(rows.length===asins.size,'SOURCE_PRODUCTS_MISSING');
-  check(rows.length<=policy.discovery.batch_products,'SOURCE_BATCH_TOO_LARGE');
+  // Batches saved before 2026-10-06 had 100 products (now kw-policy.json says 60). Replay the saved batch whole.
+  check(rows.length<=Math.max(100,policy.discovery.batch_products),'SOURCE_BATCH_TOO_LARGE');
   const own=load(config.own_file,null);check(own&&Array.isArray(own.families),'OWN_REFERENCE_REQUIRED');
   const {ownNames,handledNames}=catalogNames(own);check(ownNames.length>0,'OWN_REFERENCE_EMPTY');
   const live=load(path.join(config.state_dir,'discovery-state.json'),{history:load(path.join(config.state_dir,'history.json'),[])});
@@ -69,7 +70,7 @@ async function recover(config,{collectorIdleFn=collectorIdle,lock=true}={}){
   const result=await discover({run_id,day,rows,ownNames,handledNames,judgements,state,session,
    execution:{cwd:config.cli_cwd,env:{},attestations:config.attestations||{}},
    saveState:async()=>{},
-   saveStage:async(stage,value)=>write(path.join(config.state_dir,'runs',run_id+'.'+stage+'.json'),value),invokeFn});
+   saveStage:async(stage,value)=>write(path.join(config.state_dir,'runs',run_id+'.'+stage+'.json'),value),invokeFn,batchSize:rows.length});
   check(used.R01===1&&used.R03===1,'REPLAY_NOT_USED');
   // 収集が進んで商品の価格・購入数・寸法が変わっていると、当時は材料だった商品が入口で落ちる。
   // 気づかないまま案が減るより、止めて人に知らせる。

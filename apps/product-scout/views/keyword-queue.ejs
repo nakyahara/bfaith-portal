@@ -7,7 +7,7 @@
   <link rel="icon" type="image/png" href="/favicon.png">
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="stylesheet" href="/style.css">
-  <link rel="stylesheet" href="/apps/product-scout/public/keywords.css?v=20260920-1">
+  <link rel="stylesheet" href="/apps/product-scout/public/keywords.css?v=20261006-1">
   <link rel="stylesheet" href="/mobile.css">
 </head>
 <%
@@ -15,6 +15,14 @@
   const STATE = { draft: '判定用の案', idea: '競合確認済み', research: '追加確認', excluded: '見送り候補' };
   const DECIDED = { adopt: 'いい', hold: '保留', reject: '見送り' };
   const FILTERS = { undecided: '未判定', adopt: 'いい', hold: '保留', reject: '見送り', all: 'すべて' };
+  // AIが選別で見送った案の理由コード (kw-screen.cjs の CODES とプログラムの入口判定)。知らないコードはそのまま出す
+  const SCREEN_CODES = { feedback_constraint: '過去の見送り理由に近い', insufficient_market_evidence: '根拠が足りない', brand_dependent: 'ブランドで選ばれる',
+    own_duplicate: '自社品・取扱品と同じ用途', history_duplicate: '過去の案と同じ用途', known_commodity: '規格品・工具', no_opportunity: '検討する理由が弱い',
+    different_use: '元の商品と用途が違う', electrical: '電気を使う製品', apparel: 'アパレル', medicine: '医薬品', source_missing: '元の商品と結びつかない',
+    invalid_screen_response: '選別の返事の形式エラー' };
+  const SCREEN_DECISION = { defer: '調査待ち', exclude: '対象外' };
+  const screenedLink = (p) => '?status=screened&page=' + p;
+  const screenedPages = Math.max(1, Math.ceil(screened.total / screened.limit));
   const yen = (n) => n.toLocaleString() + '円';
   // カードを開かなくても判断の当たりが付くように、根拠の商品を1行に要約する。
   // ⚠️渡すのは詳細に出すのと同じ配列。全件で集計すると、用途が合わず根拠から外した商品の
@@ -94,7 +102,7 @@
         <% if (run) { %>
         <dl class="kw-about__facts">
           <% if (run.filter_audit) { %>
-          <div><dt>今回の選別</dt><dd>内部で作った <%= run.filter_audit.generated.toLocaleString() %>案 → 選別後 <%= run.items.length.toLocaleString() %>案。対象外・重複・調査待ちは判定一覧に含めません。</dd></div>
+          <div><dt>今回の選別</dt><dd>内部で作った <%= run.filter_audit.generated.toLocaleString() %>案 → 選別後 <%= run.items.length.toLocaleString() %>案。対象外・重複・調査待ちは判定一覧に含めず、<a href="?status=screened">「AIが見送った」</a>に理由つきで残します。</dd></div>
           <% } %>
           <% if (run.coverage) { %>
           <div><dt>今回の入力</dt><dd><%= (run.coverage.input_this_run ?? run.coverage.examined_this_run).toLocaleString() %>商品（処理済み <%= run.coverage.examined_this_run.toLocaleString() %>商品）</dd></div>
@@ -109,11 +117,65 @@
     <!-- ② 絞り込み。いま何件残っているかをタブの数字で見せる -->
     <nav class="kw-tabs" aria-label="判断で絞る">
       <% for (const [key, label] of Object.entries(FILTERS)) { %>
-      <a href="?status=<%= key %>" class="kw-tab <%= queue.status === key ? 'is-on' : '' %>" aria-current="<%= queue.status === key ? 'page' : 'false' %>">
+      <a href="?status=<%= key %>" class="kw-tab <%= !showScreened && queue.status === key ? 'is-on' : '' %>" aria-current="<%= !showScreened && queue.status === key ? 'page' : 'false' %>">
         <span><%= label %></span><b data-count="<%= key %>" data-value="<%= key === 'all' ? allCount : queue.counts[key] %>"><%= (key === 'all' ? allCount : queue.counts[key]).toLocaleString() %></b>
       </a>
       <% } %>
+      <a href="?status=screened" class="kw-tab kw-tab--screened <%= showScreened ? 'is-on' : '' %>" aria-current="<%= showScreened ? 'page' : 'false' %>">
+        <span>AIが見送った</span><b><%= screened.total.toLocaleString() %></b>
+      </a>
     </nav>
+
+    <% if (showScreened) { %>
+    <!-- AIが2段目の選別で見送った案。見るだけで、ここでは判定しない -->
+    <section class="kw-screened" aria-label="AIが見送った案">
+      <p class="kw-screened__lead">AIが選別で見送った案です（直近<%= screened.runs.toLocaleString() %>回分・新しい順）。判定一覧には出ていません。気になる案はAmazonで検索して確かめてください。</p>
+      <% const codeRank = Object.entries(screened.code_counts).sort((a, b) => b[1] - a[1]); %>
+      <% if (codeRank.length) { %>
+      <ul class="kw-screened__why" aria-label="見送った理由の内訳">
+        <% codeRank.forEach(([code, n]) => { %><li><span><%= SCREEN_CODES[code] || code %></span><b><%= n.toLocaleString() %></b></li><% }); %>
+      </ul>
+      <% } %>
+      <% if (screened.total === 0) { %>
+      <p class="kw-empty">見送った案はありません。</p>
+      <% } else { %>
+      <p class="kw-range"><b><%= screened.total.toLocaleString() %></b>案（<%= screened.page %> / <%= screenedPages %> ページ）</p>
+      <% } %>
+      <% screened.items.forEach((s) => { %>
+      <article class="kw-card kw-card--screened" data-id="<%= s.candidate_id %>">
+        <div class="kw-card__head">
+          <div class="kw-card__title">
+            <p class="kw-tags">
+              <span class="kw-tag kw-tag--screened"><%= SCREEN_DECISION[s.decision] || s.decision %></span>
+              <span class="kw-tag"><%= s.day %>の回</span>
+              <span class="kw-tag"><%= s.by === 'program' ? 'プログラムの照合' : 'AIの選別' %></span>
+            </p>
+            <h3><%= s.kw %></h3>
+            <% if (s.use) { %><p class="kw-use">用途：<%= s.use %></p><% } %>
+          </div>
+          <div class="kw-card__side">
+            <a class="kw-amazon" href="https://www.amazon.co.jp/s?k=<%= encodeURIComponent(s.kw) %>" target="_blank" rel="noopener noreferrer" aria-label="「<%= s.kw %>」をAmazonで検索（新しいタブ）">Amazonで検索 ↗</a>
+          </div>
+        </div>
+        <div class="kw-text">
+          <% if (s.idea) { %><p><%= s.idea %></p><% } %>
+          <p><b class="kw-label kw-label--why">見送った理由</b><%= s.reason %></p>
+          <% if (s.codes.length) { %><p class="kw-tags"><% s.codes.forEach((c) => { %><span class="kw-tag"><%= SCREEN_CODES[c] || c %></span><% }); %></p><% } %>
+        </div>
+        <% if (s.sources.length) { %>
+        <p class="kw-fine kw-screened__src">発想の元：<% s.sources.forEach((o, n) => { %><%= n ? '、' : '' %><a href="https://www.amazon.co.jp/dp/<%= o.asin %>" target="_blank" rel="noopener noreferrer"><%= o.title || o.asin %></a><% }); %></p>
+        <% } %>
+      </article>
+      <% }); %>
+      <% if (screened.total > 0) { %>
+      <nav class="kw-pager" aria-label="ページ">
+        <% if (screened.page > 1) { %><a href="<%= screenedLink(screened.page - 1) %>">← 前へ</a><% } else { %><span>← 前へ</span><% } %>
+        <span class="kw-pager__now"><%= screened.page %> / <%= screenedPages %> ページ</span>
+        <% if (screened.page * screened.limit < screened.total) { %><a href="<%= screenedLink(screened.page + 1) %>">次へ →</a><% } else { %><span>次へ →</span><% } %>
+      </nav>
+      <% } %>
+    </section>
+    <% } else { %>
 
     <% if (queue.total === 0) { %>
     <p class="kw-empty">この条件の案はありません。<% if (queue.status !== 'undecided') { %><a href="?status=undecided">未判定を見る</a><% } %></p>
@@ -235,6 +297,7 @@
       <span class="kw-pager__now"><%= queue.page %> / <%= totalPages %> ページ</span>
       <% if (queue.page * queue.limit < queue.total) { %><a href="<%= pageLink(queue.page + 1) %>">次へ →</a><% } else { %><span>次へ →</span><% } %>
     </nav>
+    <% } %>
     <% } %>
   </main>
   <script src="/apps/product-scout/public/keywords.js?v=20260920-1" defer></script>

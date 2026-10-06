@@ -32,8 +32,8 @@
   ],
   "demand_lower_bound": 50,
   "discovery": {
-    "batch_products": 100,
-    "generation_calls": 3,
+    "batch_products": 60,
+    "generation_calls": 6,
     "exploration_fraction": 0.25,
     "call_reserve_minutes": 22
   },

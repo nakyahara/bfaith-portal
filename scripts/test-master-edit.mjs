@@ -1713,7 +1713,8 @@ await ta('[15] 保存を開いていない (MASTER_EDIT_OPEN なし / 持ち主�
   assert.match(r.text, /いまは保存できません \(保存を開くスイッチ/);
   assert.match(r.text, /data-can-save="0"/); assert.ok(!/id="save"/.test(r.text), '保存できない画面に保存のボタンを出さない');
   assert.ok(!/data-field="name"/.test(r.text), '直せない欄は入力欄にしない (🔒 の値で見せる)');
-  assert.ok(r.text.includes('data-row="name"><div class="lab" id="lab-name">名前</div><div class="ctl"><span class="lockval">'), '名前は 🔒 の値');
+  assert.match(r.text, /<span class="name-lock" title="名前はここでは直せません">[\s\S]{0,200}?(切替前|いまは保存できません)/, '名前は見出しの横に 🔒 と理由 (10/6・名前は見出しで直す)');
+  assert.ok(!/id="name-edit"/.test(r.text), '直せないときは「名前を直す」を出さない');
   assert.match(r.text, /<span class="b warn" title="この項目の正はまだ NE・\/register です">切替前<\/span>/);
   const body = { request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) }, values: { name: 'x' } };
   assert.deepEqual([(await call('POST', '/api/sku/s001', { body })).status], [409]);
