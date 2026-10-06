@@ -1482,6 +1482,27 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
   assert.ok(wne, JSON.stringify(w13).slice(0, 300));
   assert.deepEqual([wne.observed.reg.failed, wne.observed.reg.partial], [2, 2], JSON.stringify(wne.observed));
   assert.match(wne.reason, /新商品の取込失敗 2/);
+
+  // 確かめの後の読み直しだけが読めない朝 (#1635 Codex R3): 確かめの前の数に戻さない = 要約の先頭に ⚠️ (確かめの内訳つき)・W13:ne は blocked (案件は保持)
+  let regReads = 0;
+  const failSecond = { query: (sql, p) => (/from ops\.master_registrations r/.test(sql) && ++regReads === 2 ? Promise.reject(new Error('reread down')) : db.query(sql, p)) };
+  const u = await compare('2030-08-20', { db: failSecond });
+  assert.equal(regReads, 2);
+  assert.deepEqual([u.result.ne.registrations.write, u.result.ne.reg_after_check.state], ['ok', 'unreadable']);
+  assert.match(u.line, /^⚠️ ②: 新商品の NE 登録の確かめの後の数を読めない \(reread down\) — 確かめ: .*partial 2/);
+  const evU = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
+  assert.equal(evU.ne.reg_after_check.state, 'unreadable');
+  const wU = (await evalW13({ config: W13CFG, asOf: '2030-08-20', evidence: null, syncRunId: null, openIssues: [], dataDir: tmp }, W13CFG.checkById('W13'))).find((r) => r.scopeKey === 'ne');
+  assert.deepEqual([wU.verdict], ['blocked']);
+  assert.match(wU.reason, /確かめの後の数を読めない/);
+  // 確かめの後の証跡を書けない (writeEvidence は失敗で null を返す) = 回を失敗にする (state = failed = W13 は blocked・daily-sync は再試行)
+  const noAfter = (d0, n0, p0) => (p0.state === 'complete' && p0.ne && p0.ne.reg_after_check ? null : writeEvidence(d0, n0, p0, { now: at('2030-08-20', '08:40'), warn: quiet }));
+  const wf = await compare('2030-08-20', { write: noAfter }).catch((e) => e);
+  assert.match(String(wf && wf.message), /証跡 \(新商品の確かめの後\) を書けない/);
+  const evF = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
+  assert.equal(evF.state, 'failed');
+  const wF = (await evalW13({ config: W13CFG, asOf: '2030-08-20', evidence: null, syncRunId: null, openIssues: [], dataDir: tmp }, W13CFG.checkById('W13'))).find((r) => r.scopeKey === 'ne');
+  assert.equal(wF.verdict, 'blocked');
 });
 
 await pg.close();

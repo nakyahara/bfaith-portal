@@ -220,6 +220,14 @@ await ta('[9] ポータルで登録した新商品: NE 登録待ち (out_of_scop
   const r3 = await run(d, ev3, '2026-10-04T23:30:00Z');
   assert.equal(res(r3, 'ne').reason, 'NE 登録待ち 1 件 (差に入れない)・新商品の取込失敗 1');
   assert.equal(res(r3, 'ne').observed.reg.failed, 1);
+  // 確かめの後の読み直しを読めない = blocked (確かめの前の数で pass にしない・案件は保持。#1635 Codex R3)
+  const openBefore = await regIssues('open');
+  const ev4 = evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: {}, extraCounts: { reg_pending: 0, reg_failed: 0 } } });
+  ev4.ne.reg_after_check = { state: 'unreadable', reason: 'reread down', check: { failed: 1 } };
+  const r4 = await run(d, ev4, '2026-10-04T23:40:00Z');
+  assert.equal(res(r4, 'ne').verdict, 'blocked');
+  assert.match(res(r4, 'ne').reason, /確かめの後の数を読めない \(reread down\)/);
+  assert.deepEqual(await regIssues('open'), openBefore);
 });
 
 await pg.close();

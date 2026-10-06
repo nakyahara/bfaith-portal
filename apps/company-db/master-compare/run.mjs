@@ -142,20 +142,29 @@ export function regSummary(ne) {
 }
 /**
  * 確かめ (record_ne_registration_check) の後に登録の段階を読み直す (照合の読む接続・読み取りだけの短い取引)。
- * 区分違いは照合の結果のまま (二重に数えない)。読めない = state unreadable (照合の時の数のまま)
+ * 区分違いは照合の結果のまま (二重に数えない)。読めない = state unreadable (確かめの前の数に戻さない = 要約・W13 は「読めない」で ⚠️ / blocked。#1635 Codex R3)
  */
 export async function regAfterCheck(db, ne, checkCounts) {
   try {
     await db.query('begin transaction read only');
     try {
       const fresh = await readRegistrations(db);
-      if (fresh.state !== 'ok') return { state: fresh.state, check: checkCounts };
+      if (fresh.state !== 'ok') return { state: fresh.state === 'not_applied' ? 'unreadable' : fresh.state, check: checkCounts, reason: fresh.reason ?? fresh.state };
       return { state: 'ok', check: checkCounts, ...regTroubleCounts(fresh, new Set((ne.reg_pending?.kind_mismatch || []).map((e) => e.norm))) };
     } finally { try { await db.query('rollback'); } catch { /* */ } }
   } catch (e) { return { state: 'unreadable', check: checkCounts, reason: String(e && e.message).slice(0, 200) }; }
 }
-/** ポータルで登録した新商品の NE 登録の不一致 (朝の要約の先頭の ⚠️)。確かめの後に読み直した数があればそちら。無ければ null */
+/** 確かめの後の読み直しを読めない (確かめが状態を進めたかもしれない = 確かめの前の数で ✅ にしない)。確かめの内訳は参考に出す */
+export function regAfterCheckTrouble(ne) {
+  const a = ne && ne.reg_after_check;
+  if (!a || a.state === 'ok') return null;
+  const ck = a.check && typeof a.check === 'object' ? Object.entries(a.check).map(([k, v]) => `${k} ${v}`).join('・') : '';
+  return `新商品の NE 登録の確かめの後の数を読めない (${String(a.reason || a.state).slice(0, 80)})${ck ? ` — 確かめ: ${ck}` : ''}`;
+}
+/** ポータルで登録した新商品の NE 登録の不一致 (朝の要約の先頭の ⚠️)。確かめの後に読み直した数があればそちら。読み直せなかった = その旨。無ければ null */
 export function regTrouble(ne) {
+  const bad = regAfterCheckTrouble(ne);
+  if (bad) return bad;
   const a = ne && ne.reg_after_check && ne.reg_after_check.state === 'ok' ? ne.reg_after_check : null;
   const c = { ...((ne && ne.counts) || {}), ...(a ? { reg_failed: a.reg_failed, reg_rejected: a.reg_rejected, reg_partial: a.reg_partial } : {}) };
   const parts = [];
@@ -341,7 +350,10 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       if (rg.write === 'ok') result.ne.reg_after_check = await regAfterCheck(db, result.ne, rg.written?.counts ?? null);
       evidence.ne.registrations = regEvidence();
       if (result.ne.reg_after_check) evidence.ne.reg_after_check = result.ne.reg_after_check;
-      try { write(dataDir, EVIDENCE_NAME, evidence); } catch { /* 完了の証跡はもう書けている */ }
+      // 確かめの後の証跡を書けない = W13 が確かめの前の数を読む → 回を失敗にする (外の catch が state = failed を書く = W13 は blocked・daily-sync は再試行。#1635 Codex R3)
+      let rewritten = null;
+      try { rewritten = write(dataDir, EVIDENCE_NAME, evidence); } catch { rewritten = null; }
+      if (!rewritten) throw new Error('証跡 (新商品の確かめの後) を書けない = 見張りが確かめの前の数を読む');
     }
     } finally { await closeWriter(); }
     pruneResults(dataDir, { now });
