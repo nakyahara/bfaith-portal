@@ -96,7 +96,7 @@ const view = (name) => path.join(__dirname, 'views', name);
 const router = express.Router();
 
 /**
- * 画面の見た目の部品 (新しいデザイン = 一覧・1 つの商品・つかいかた・誤り。CSS 1 つ + 画面の JS)。public/ の中だけを配る (読むだけ)。
+ * 画面の見た目の部品 (新しいデザイン = 全部の画面。CSS 1 つ + 画面の JS)。public/ の中だけを配る (読むだけ)。
  * 版 (assetV) = 中身のハッシュ = 配り直した日に古い CSS / JS が 1 時間残らない
  */
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -292,8 +292,8 @@ const pageLocals = (req, phase = null) => {
     open: isOpen(), phaseText,
     closed: !!why, closedWhy: why,
     amazonClosed: !!amazonWhy, amazonClosedWhy: amazonWhy,
-    // 新しいデザインの画面 (ui2) だけが使う: 見せ方の道具・部品の版・左の列でいまどこか
-    ui, assetV, ui2: false, nav: '', nowMs: clock(),
+    // 見せ方の道具・部品の版・左の列でいまどこか。画面はすべて新しいデザイン (ui2。第 2 段 10/5 で新商品・NE 登録の CSV・Amazon・変更の記録も)
+    ui, assetV, ui2: true, nav: '', nowMs: clock(),
   };
 };
 const fmt = {
@@ -456,7 +456,7 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
   const locals = pageLocals(req, page ? page.phase : null);
   const own = ownershipNow();
   res.render(view('new.ejs'), {
-    ...locals, dbError, kind, page, fmt, KINDS_NEW, MAX_COMPONENTS, MAX_REFERENCE_URLS,
+    ...locals, nav: 'new', dbError, kind, page, fmt, KINDS_NEW, MAX_COMPONENTS, MAX_REFERENCE_URLS,
     // 登録を開いているか = 段階 new_open・持ち主表のハッシュが段階の記録と同じ・MASTER_EDIT_OPEN・この種類で書く列の持ち主が全部 company・
     //   書き込み用の接続 (画面だけのロール)・backfill 済み (lib/master-register.mjs と同じ)
     entryClosed: !newEntryWritable(page ? page.phase : null, own) || !isOpen() || NEW_ENTRY_KEYS[kind].some((k) => own[k] !== 'company') || !writeConfigured() || !(page && page.backfillDone),
@@ -492,8 +492,8 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
 }));
 router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
   const h = db ? await skuHistory(db, req.params.code) : null;
-  if (db && !h) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), message: `商品コード ${req.params.code} は Company DB にありません` });
-  res.render(view('history.ejs'), { ...pageLocals(req), dbError, h, code: req.params.code });
+  if (db && !h) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), nav: 'list', message: `商品コード ${req.params.code} は Company DB にありません` });
+  res.render(view('history.ejs'), { ...pageLocals(req), nav: 'list', dbError, h, code: req.params.code });
 }));
 
 router.get('/api/lookup', (req, res) => withPgApi(res, async (db) => {
@@ -573,7 +573,11 @@ router.get('/amazon', (req, res) => {
     const channels = db ? await amazonChannelsProvider() : null;
     const data = db ? await listAmazonMaps(db, filters, { channels }) : { rows: [], total: 0, offset: 0, limit: 0, filters, tableMissing: false };
     const phase = db ? await readCutoverPhase(db) : null;
-    res.render(view('amazon-index.ejs'), { ...pageLocals(req, phase), dbError, data, filters, MAP_STATES, CHANNELS });
+    // 「売れたのに対応が無い SKU」(未登録の画面と同じ読み方・読むだけ)。絞り込みの無い最初の画面だけ (検索・ページ送りのたびには読まない)
+    const landing = !filters.q && !filters.state && !filters.offset;
+    // 読めない = 札を出さないだけ (一覧は出す)
+    const unmapped = db && landing && !data.tableMissing ? await amazonUnmapped(db, { now: new Date(clock()), channel: '', channels }).catch((e) => { console.error(`[master-edit] 未登録の要約を読めない: ${e && e.message}`); return null; }) : null;
+    res.render(view('amazon-index.ejs'), { ...pageLocals(req, phase), nav: 'amazon', listPage: true, dbError, data, filters, MAP_STATES, CHANNELS, unmapped, UNMAPPED_DAYS });
   });
 });
 router.get('/amazon/unmapped', (req, res) => withPgPage(req, res, async (db, dbError) => {
@@ -582,21 +586,21 @@ router.get('/amazon/unmapped', (req, res) => withPgPage(req, res, async (db, dbE
   const channels = db ? await amazonChannelsProvider() : null;
   const data = db ? await amazonUnmapped(db, { now: new Date(clock()), channel, channels }) : null;
   const phase = db ? await readCutoverPhase(db) : null;
-  res.render(view('amazon-unmapped.ejs'), { ...pageLocals(req, phase), dbError, data, channel, CHANNELS, UNMAPPED_DAYS, MAP_STATES });
+  res.render(view('amazon-unmapped.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, data, channel, CHANNELS, UNMAPPED_DAYS, MAP_STATES });
 }));
 router.get('/amazon/sku/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
   let sku;
-  try { sku = sellerSkuIn(String(req.query.sku ?? '')); } catch (e) { return res.status(400).render(view('error.ejs'), { ...pageLocals(req), message: e.message }); }
+  try { sku = sellerSkuIn(String(req.query.sku ?? '')); } catch (e) { return res.status(400).render(view('error.ejs'), { ...pageLocals(req), nav: 'amazon', message: e.message }); }
   const h = db ? await amazonHistory(db, sku) : null;
-  if (db && !h) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), message: `seller SKU ${sku} の出品は Company DB にありません` });
-  res.render(view('amazon-history.ejs'), { ...pageLocals(req), dbError, h, sku, MAP_STATES });
+  if (db && !h) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), nav: 'amazon', message: `seller SKU ${sku} の出品は Company DB にありません` });
+  res.render(view('amazon-history.ejs'), { ...pageLocals(req), nav: 'amazon', dbError, h, sku, MAP_STATES });
 }));
 router.get('/amazon/sku', (req, res) => withPgPage(req, res, async (db, dbError) => {
   let sku;
-  try { sku = sellerSkuIn(String(req.query.sku ?? '')); } catch (e) { return res.status(400).render(view('error.ejs'), { ...pageLocals(req), message: e.message }); }
+  try { sku = sellerSkuIn(String(req.query.sku ?? '')); } catch (e) { return res.status(400).render(view('error.ejs'), { ...pageLocals(req), nav: 'amazon', message: e.message }); }
   const channels = db ? await amazonChannelsProvider() : null;
   const page = db ? await readAmazonPage(db, sku, { channels }) : null;
-  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), dbError, page, sku, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY });
+  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY });
 }));
 router.post('/api/amazon/save', (req, res) => {
   const gate = editorGate(req);
@@ -627,7 +631,7 @@ router.get('/reg-csv', (req, res) => withPgPage(req, res, async (db, dbError) =>
   const phase = db ? await readCutoverPhase(db) : null;
   const gate = approverGate(req);
   res.render(view('reg-csv.ejs'), {
-    ...pageLocals(req, phase), dbError, summary, canApprove: gate.ok, approveMessage: gate.message || '',
+    ...pageLocals(req, phase), nav: 'regcsv', dbError, summary, canApprove: gate.ok, approveMessage: gate.message || '',
     REG_STATES, ITEM_STATES: REG_ITEM_STATES, RESULTS: REG_RESULTS, EXPORT_STATES: REG_EXPORT_STATES, CLOSE_REASONS: REG_CLOSE_REASONS, CHECK_OUTCOMES: REG_CHECK_OUTCOMES,
   });
 }));

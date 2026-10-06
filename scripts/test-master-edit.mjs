@@ -1612,7 +1612,8 @@ await ta('[15] 見せ方 (PR 画面の作り直し 1): 変更の記録は人の�
   const U = await import('../apps/master-edit/ui-format.mjs');
   const hist = await call('GET', '/sku/s001/history');
   assert.equal(hist.status, 200);
-  assert.ok(hist.text.includes('時刻 (日本時間)') && hist.text.includes('夜間の取り込み'), '描けている');
+  assert.ok(hist.text.includes('時刻はすべて日本時間') && hist.text.includes('夜間の取り込み'), '描けている');
+  assert.match(hist.text, /<article class="hcard load" data-who="load"/, '保存 1 回 = 1 枚のカード (夜間の取り込み)');
   for (const raw of ['standard_price_jpy', 'reorder_months', '{&#34;', 'portal_master_edit']) assert.ok(!hist.text.includes(raw), `変更の記録に生の ${raw} を出さない`);
   assert.ok(!/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(hist.text), 'DB の時刻の文字をそのまま出さない');
   const nf = await call('GET', '/sku/nope');

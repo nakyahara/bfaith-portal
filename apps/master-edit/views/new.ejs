@@ -2,305 +2,229 @@
 <html lang="ja">
 <head>
   <%- include('_head') %>
-  <style>
-    .sec { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 8px 14px; margin-bottom: 10px; }
-    .sec h3 { font-size: 0.95em; margin: 2px 0 8px; color: #343a40; }
-    .fl { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; font-size: 0.9em; }
-    .fl label.k { color: #495057; min-width: 7em; }
-    .fl input[type=text], .fl select, .fl textarea { padding: 4px 6px; font-size: 0.95em; }
-    .req::after { content: ' *'; color: #c92a2a; }
-    .sub { font-size: 0.82em; color: #868e96; }
-    .kinds a { margin-right: 10px; }
-    .kinds a.on { font-weight: 700; text-decoration: none; color: #1f2430; }
-    #comp input.c-code { width: 11em; } #comp input.c-qty { width: 4em; text-align: right; }
-    .bar { position: sticky; bottom: 0; background: #fff; border-top: 2px solid #dee2e6; padding: 8px 0; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-    .result { background: #fff; border: 1px solid #adb5bd; border-radius: 8px; padding: 8px 14px; margin: 8px 0; font-size: 0.88em; }
-    .result li { margin: 2px 0; }
-  </style>
 </head>
 <body>
-  <%- include('_header') %>
-  <%
-    const isSet = kind === 'set';
-    const canSave = !!page && canEdit && !dbError && !entryClosed && !!shippingRates;
-    const dis = canSave ? '' : ' disabled';
-    const SALES = { 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' };
-  %>
-  <div class="me-wrap">
-    <p class="sub"><a href="<%= base %>/">← 一覧へ</a> ・ <a href="<%= base %>/manual">📖 つかいかた</a></p>
-    <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
-    <% if (page && entryClosed) { %><div class="band warn">切替前です (<%= entryWhy || ('段階: ' + phaseText) %>): 新商品はまだ NE・product-hub で登録します。この画面は見るだけです (登録を押しても「切替前」で断られ、何も変わりません)。</div><% } %>
-    <% if (!canEdit) { %><div class="band info"><%= gateMessage %></div><% } %>
-    <% if (page && !shippingRates) { %><div class="band err">送料の表が読めないので、発送方法を選べません (登録できません)。</div><% } %>
+<%
+  // 新商品の登録 (画面 D)。新しいデザイン (第 2 段 10/5): 上から順に入れる 1 ページ・上に飛び先の帯・右に「下書き保存まで あと N つ」。
+  // 保存の送り方 (POST /api/new) と中身は前と同じ。画面の動き = public/me-new.js
+  const isSet = kind === 'set';
+  const canSave = !!page && canEdit && !dbError && !entryClosed && !!shippingRates;
+  const dis = canSave ? '' : ' disabled';
+  const SALES = { 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' };
+  // 切り替えボタン (税率・売上分類・ロジザード・取扱・カード・セット商品)。押された状態は aria-pressed・見出し (lab-…) と結ぶ
+  const h = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const seg = (id, field, current, opts, label) => '<div class="seg" role="group" id="' + id + '" aria-labelledby="lab-' + id + '" data-field="' + field + '" data-dirty-field="' + field + '" data-label="' + label + '" data-value="' + current + '">'
+    + opts.map(([v, t, small]) => '<button type="button" data-v="' + h(v) + '" aria-pressed="' + (current === v ? 'true' : 'false') + '"' + (current === v ? ' class="on"' : '') + dis + '>' + h(t) + (small ? ' <small>' + h(small) + '</small>' : '') + '</button>').join('') + '</div>';
+  const compRow = (i) => '<tr class="comp-row"><td class="no">' + i + '</td><td><input class="in mono c-code" style="width:150px" autocomplete="off" spellcheck="false" placeholder="商品コード" aria-label="' + i + ' 行目の構成品のコード"' + dis + '> <span class="c-name"></span></td>'
+    + '<td><input class="in c-qty" style="width:70px;text-align:right" inputmode="numeric" autocomplete="off" value="1" aria-label="' + i + ' 行目の数"' + dis + '></td><td class="c-tax"></td><td class="c-sales"></td><td class="c-cost n"></td><td class="c-handling"></td>'
+    + '<td class="acts"><button type="button" class="iconbtn" data-act="up" aria-label="' + i + ' 行目を上へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg></button><button type="button" class="iconbtn" data-act="down" aria-label="' + i + ' 行目を下へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-down"/></svg></button><button type="button" class="iconbtn del" data-act="del" aria-label="' + i + ' 行目を外す"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-trash"/></svg></button></td></tr>';
+  // 区切り (上の飛び先の帯と同じ順)。番号は種類で変わる
+  const secs = isSet
+    ? [['sec-code', 'コードと名前'], ['sec-comp', '構成'], ['sec-money', 'お金'], ['sec-ship', '発送'], ['sec-card', '出品カード'], ['sec-yahoo', 'Yahoo!']]
+    : [['sec-code', 'コードと名前'], ['sec-money', 'お金'], ['sec-tax', '税・分類・仕入先'], ['sec-ship', '発送'], ['sec-card', '出品カード'], ['sec-yahoo', 'Yahoo!']];
+  const no = (id) => secs.findIndex((x) => x[0] === id) + 1;
+  // 画面の JS に渡す値 (JSON = EJS の出力を JS の値の位置に直に置かない)
+  const pageData = page ? { base, kind, canSave, maxComponents: MAX_COMPONENTS, maxRefs: MAX_REFERENCE_URLS, secs } : null;
+%>
+  <%- include('_header', { hasSave: canSave }) %>
+  <div class="page" id="new-page">
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">新商品の登録</span></nav>
+    <div class="ph">
+      <div>
+        <h1>新商品の登録</h1>
+        <div class="lead">上から順に入れると下書きができます。NE への登録は、そのあと「NE 登録の CSV」で行います。</div>
+      </div>
+      <div class="ph-actions"><a class="btn" href="<%= base %>/manual#new"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
+    </div>
 
-    <h2 style="font-size: 1.15em; margin: 6px 0;">新商品の登録</h2>
-    <p class="kinds">種類: <a href="?kind=single" class="<%= isSet ? '' : 'on' %>"><%= isSet ? '' : '● ' %>単品</a> <a href="?kind=set" class="<%= isSet ? 'on' : '' %>"><%= isSet ? '● ' : '' %>セット</a>
-      <span class="sub">(* = 必ず入れる)</span></p>
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div><div class="hint">つながったら画面を開き直してください。</div></div></div><% } %>
+    <% if (page && entryClosed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">切替前です (<%= entryWhy || ('段階: ' + phaseText) %>)</div><div class="hint">新商品はまだ NE・product-hub で登録します。この画面は見るだけです (登録を押しても「切替前」で断られ、何も変わりません)。</div></div></div><% } %>
+    <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
+    <% if (page && !shippingRates) { %><div class="callout err"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">送料の表が読めないので、発送方法を選べません (登録できません)</div><div class="hint">少し待ってから画面を開き直してください。</div></div></div><% } %>
 
     <% if (page) { %>
-    <form id="f" onsubmit="return false" data-base="<%= base %>" data-kind="<%= kind %>" data-can-save="<%= canSave ? '1' : '0' %>">
-      <div class="sec"><h3>基本</h3>
-        <div class="fl"><label class="k req">商品コード</label><input type="text" id="code" size="24" maxlength="30" autocomplete="off"<%= dis %>>
-          <button type="button" class="btn-sm" id="code-check"<%= dis %>>確かめる</button>
-          <span class="sub" id="code-msg">小文字の英字・数字・- _ だけ (30 字まで)・大文字は使えません・使ったことのないコード</span></div>
-        <div class="fl"><label class="k req">名前</label><input type="text" data-field="name" size="60" maxlength="255"<%= dis %>>
-          <span class="sub">資材の印 (_白ビ袋 など) は付けない</span></div>
-      </div>
+    <form class="edit" id="f" novalidate data-kind="<%= kind %>" data-can-save="<%= canSave ? '1' : '0' %>">
+      <div>
+        <nav class="jump" id="jump" aria-label="区切りへ飛ぶ">
+          <% for (const [id, t] of secs) { %><a href="#<%= id %>" data-sec="<%= id %>"><span class="n"><%= no(id) %></span> <%= t %></a><% } %>
+        </nav>
+        <div class="kindcards" role="group" aria-label="種類">
+          <a class="kindcard<%= isSet ? '' : ' on' %>" href="?kind=single"<%- isSet ? '' : ' aria-current="page"' %>><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-tag"/></svg></span><span><span class="kt">単品</span><br><span class="ks">1 つの商品 (仕入れたもの・作ったもの)</span></span><span class="radio" aria-hidden="true"></span></a>
+          <a class="kindcard<%= isSet ? ' on' : '' %>" href="?kind=set"<%- isSet ? ' aria-current="page"' : '' %>><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-box"/></svg></span><span><span class="kt">セット</span><br><span class="ks">単品を組み合わせる (ギフト・まとめ買い)</span></span><span class="radio" aria-hidden="true"></span></a>
+        </div>
 
-      <div class="sec"><h3>お金</h3>
-        <div class="fl"><label class="k req">売価</label><input type="text" data-field="standard_price" size="10" placeholder="円"<%= dis %>> 円 <span class="sub">(標準売価・税込)</span></div>
-        <% if (!isSet) { %>
-        <div class="fl"><label class="k">原価</label><input type="text" id="cost-jpy" size="10" placeholder="円"<%= dis %>> 円
-          <span class="sub">今日から</span> 理由 <input type="text" id="cost-reason" size="24" maxlength="200" placeholder="空なら「新商品の登録」"<%= dis %>></div>
+        <section class="panel" id="sec-code" aria-labelledby="h-code">
+          <div class="panel-h"><span class="stepno" data-step="sec-code" aria-hidden="true"><%= no('sec-code') %></span><h2 id="h-code">コードと名前</h2></div>
+          <div class="f" data-row="code"><label class="lab" for="code">商品コード<span class="req">必須</span></label>
+            <div class="ctl"><input class="in w-m mono" id="code" maxlength="30" autocomplete="off" spellcheck="false" data-dirty-field="code" data-label="商品コード" placeholder="例: abc-honey-300"<%= dis %>>
+              <button type="button" class="btn sm" id="code-check"<%= dis %>>確かめる</button>
+              <span class="fmsg" id="code-msg" role="status" aria-live="polite"></span>
+              <span class="hint" style="flex-basis:100%">小文字の英字・数字・- _ だけ (30 字まで)・大文字は使えません・使ったことのないコード · 打つとその場で確かめます</span></div></div>
+          <div class="f" data-row="name"><label class="lab" for="f-name">名前<span class="req">必須</span></label>
+            <div class="ctl"><input class="in w-l" id="f-name" maxlength="255" autocomplete="off" data-field="name" data-dirty-field="name" data-label="名前" placeholder="例: 北海道産 小豆 こしあん 500g"<%= dis %>><span class="hint">資材の印 (_白ビ袋 など) は付けない</span></div></div>
+        </section>
+
+        <% if (isSet) { %>
+        <section class="panel" id="sec-comp" aria-labelledby="h-comp">
+          <div class="panel-h"><span class="stepno" data-step="sec-comp" aria-hidden="true"><%= no('sec-comp') %></span><h2 id="h-comp">構成</h2><span class="sub">NE に登録して、NE の構成が同じと確かめたら「今の構成」になります</span></div>
+          <div class="f wide" data-row="components" style="padding-top:0">
+            <div class="scrollx"><table class="comp" id="comp" data-dirty-field="components" data-label="構成"><caption class="sr">構成 (コードを打つと名前が出ます)</caption>
+              <thead><tr><th scope="col">#</th><th scope="col">構成品 (コードを打つと名前が出ます)</th><th scope="col">数</th><th scope="col">税</th><th scope="col">分類</th><th scope="col" class="n">原価</th><th scope="col">取扱</th><th scope="col"><span class="sr">並べ替え・外す</span></th></tr></thead>
+              <tbody id="comp-rows"><%- compRow(1) %><%- compRow(2) %></tbody>
+            </table></div>
+            <template id="comp-tpl"><%- compRow(0) %></template>
+            <div style="display:flex;gap:12px;align-items:center;margin:6px 0 14px;flex-wrap:wrap"><button class="btn sm" type="button" id="comp-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>構成品を足す</button><span class="hint">1〜<%= MAX_COMPONENTS %> 品 · 数は 1〜999 · 同じ品は 1 行 · セットは入れられません · 並びも入れたとおり</span></div>
+          </div>
+          <div class="tiles" id="set-tiles" aria-live="polite">
+            <div class="tile" id="t-tax"><div class="tl2">税率<span class="est">見込み</span></div><div class="tv">—</div><div class="tr">構成品を入れると出ます</div></div>
+            <div class="tile" id="t-sales"><div class="tl2">売上分類<span class="est">見込み</span></div><div class="tv">—</div><div class="tr">いちばん小さい番号</div></div>
+            <div class="tile" id="t-cost"><div class="tl2">原価 (合計)<span class="est">見込み</span></div><div class="tv">—</div><div class="tr">構成品の原価 × 数</div></div>
+            <div class="tile" id="t-price"><div class="tl2">単品の売価の合計<span class="est">見込み</span></div><div class="tv">—</div><div class="tr">セットの売価とくらべる</div></div>
+          </div>
+          <div class="hint" style="margin-top:8px">「見込み」は構成品の今の値から画面が出したものです。決まるのは保存のとき (サーバーが同じ決まりで計算し、決まらなければ理由を出して断ります)。</div>
+          <details class="more">
+            <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>例外のとき (ふだんは使いません) — セット自身の取扱・売上分類の上書き・例外原価</summary>
+            <div class="body">
+              <div class="f" data-row="handling_own"><div class="lab" id="lab-handling-own">セット自身の取扱</div><div class="ctl"><%- seg('handling-own', 'handling_own', 'active', [['active', '取扱中'], ['discontinued', '中止']], 'セット自身の取扱') %></div></div>
+              <div class="f" data-row="set_sales_class_override"><label class="lab" for="f-set_sales_class_override">売上分類の上書き</label>
+                <div class="ctl"><select class="in w-m" id="f-set_sales_class_override" data-field="set_sales_class_override" data-dirty-field="set_sales_class_override" data-label="売上分類の上書き"<%= dis %>>
+                  <option value="">— (構成品から)</option>
+                  <% for (const [k, v] of Object.entries(SALES)) { %><option value="<%= k %>"><%= v %></option><% } %>
+                </select><span class="hint" id="override-hint">構成品から導けないときだけ (未入力・輸出 4 と 1〜3 の混在)</span></div></div>
+              <div class="f" data-row="exception_cost"><label class="lab" for="xcost-jpy">例外原価</label>
+                <div class="ctl"><span class="yen"><input class="in w-s" id="xcost-jpy" inputmode="numeric" autocomplete="off" data-dirty-field="exception_cost" data-label="例外原価" placeholder="0"<%= dis %>></span><span class="unit">円</span>
+                  <input class="in w-m" id="xcost-reason" maxlength="200" autocomplete="off" aria-label="例外原価の理由" placeholder="理由 (例外原価を入れるときは必要)"<%= dis %>><span class="hint">空なら構成品の原価の合計</span></div></div>
+            </div>
+          </details>
+        </section>
         <% } %>
-      </div>
 
-      <% if (!isSet) { %>
-      <div class="sec"><h3>税・分類・仕入先</h3>
-        <div class="fl"><label class="k req">税率</label>
-          <label><input type="radio" name="tax_rate" data-field="tax_rate" value="0.08"<%= dis %>> 8%</label>
-          <label><input type="radio" name="tax_rate" data-field="tax_rate" value="0.1"<%= dis %>> 10%</label></div>
-        <div class="fl"><label class="k">売上分類</label><select data-field="sales_class"<%= dis %>>
-          <option value="">(あとで)</option>
-          <% for (const [k, v] of Object.entries(SALES)) { %><option value="<%= k %>"><%= v %></option><% } %>
-        </select></div>
-        <div class="fl"><label class="k">代表の仕入先</label><select data-field="primary_supplier"<%= dis %>>
-          <option value="">(あとで)</option>
-          <% for (const s of page.activeSuppliers) { %><option value="<%= s.code %>"><%= s.code %> <%= s.name %></option><% } %>
-        </select><span class="sub">先方品番・入数・ロットは <a href="/apps/purchase-orders">発注アプリ ↗</a></span></div>
-      </div>
-      <% } %>
+        <section class="panel" id="sec-money" aria-labelledby="h-money">
+          <div class="panel-h"><span class="stepno" data-step="sec-money" aria-hidden="true"><%= no('sec-money') %></span><h2 id="h-money">お金</h2></div>
+          <div class="f" data-row="standard_price"><label class="lab" for="f-standard_price">売価<span class="req">必須</span></label>
+            <div class="ctl"><span class="yen"><input class="in w-s" id="f-standard_price" inputmode="numeric" autocomplete="off" data-field="standard_price" data-dirty-field="standard_price" data-label="売価" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">標準売価 · 税込</span></div></div>
+          <% if (!isSet) { %>
+          <div class="f" data-row="cost"><label class="lab" for="cost-jpy">原価<span class="opt">あとでも可</span></label>
+            <div class="ctl"><span class="yen"><input class="in w-s" id="cost-jpy" inputmode="numeric" autocomplete="off" data-dirty-field="cost" data-label="原価" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">今日から</span>
+              <input class="in w-m" id="cost-reason" maxlength="200" autocomplete="off" aria-label="原価の理由" placeholder="理由 (空なら「新商品の登録」)"<%= dis %>></div></div>
+          <% } %>
+        </section>
 
-      <div class="sec"><h3>物流</h3>
-        <div class="fl"><label class="k req">発送方法</label>
-          <% if (shippingRates) { %>
-          <select data-field="shipping_code" id="shipping"<%= dis %>>
-            <option value="">(選ぶ)</option>
-            <% for (const r of shippingRates) { %><option value="<%= r.code %>"><%= r.code %> <%= r.method || '' %> / <%= fmt.yen(r.cost) %> 円</option><% } %>
-          </select>
-          <span class="sub">送料コード → 方法と金額は送料の表から ・ product-hub の楽天の配送方法は対応表から (無ければカードに「要確認」)</span>
-          <% } else { %><span class="tag gray">送料の表が読めません</span><% } %></div>
-        <div class="fl"><label class="k">推奨保有月数</label><input type="text" data-field="reorder_months" size="5"<%= dis %>> か月</div>
         <% if (!isSet) { %>
-        <div class="fl"><label class="k">ロジザード</label>
-          有効期限の管理 <label><input type="radio" name="expiry_managed" data-field="expiry_managed" value="0" checked<%= dis %>> なし</label>
-          <label><input type="radio" name="expiry_managed" data-field="expiry_managed" value="1"<%= dis %>> あり</label>
-          ・ 入荷日の管理 <label><input type="radio" name="inbound_date_managed" data-field="inbound_date_managed" value="0" checked<%= dis %>> なし</label>
-          <label><input type="radio" name="inbound_date_managed" data-field="inbound_date_managed" value="1"<%= dis %>> あり</label>
-          <span class="sub">(最初の値だけ。あとはロジザードが正)</span></div>
+        <section class="panel" id="sec-tax" aria-labelledby="h-tax">
+          <div class="panel-h"><span class="stepno" data-step="sec-tax" aria-hidden="true"><%= no('sec-tax') %></span><h2 id="h-tax">税・分類・仕入先</h2></div>
+          <div class="f" data-row="tax_rate"><div class="lab" id="lab-f-tax_rate">税率<span class="req">必須</span></div>
+            <div class="ctl"><%- seg('f-tax_rate', 'tax_rate', '', [['0.08', '8%', '軽減 · 食品'], ['0.1', '10%', '標準']], '税率') %><span class="misslabel" id="tax-miss"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg>まだ選んでいません</span></div></div>
+          <div class="f" data-row="sales_class"><div class="lab" id="lab-f-sales_class">売上分類<span class="opt">あとでも可</span></div>
+            <div class="ctl"><%- seg('f-sales_class', 'sales_class', '', [...Object.entries(SALES).map(([k, v]) => [k, v]), ['', 'あとで']], '売上分類') %></div></div>
+          <div class="f" data-row="primary_supplier"><label class="lab" for="f-primary_supplier">代表の仕入先<span class="opt">あとでも可</span></label>
+            <div class="ctl"><select class="in w-m" id="f-primary_supplier" data-field="primary_supplier" data-dirty-field="primary_supplier" data-label="代表の仕入先"<%= dis %>>
+              <option value="">(あとで)</option>
+              <% for (const s of page.activeSuppliers) { %><option value="<%= s.code %>"><%= s.code %> <%= s.name %></option><% } %>
+            </select><a class="hint" href="/apps/purchase-orders" target="_blank" rel="noopener">先方品番・入数・ロットは 発注アプリ ↗</a></div></div>
+        </section>
         <% } %>
+
+        <section class="panel" id="sec-ship" aria-labelledby="h-ship">
+          <div class="panel-h"><span class="stepno" data-step="sec-ship" aria-hidden="true"><%= no('sec-ship') %></span><h2 id="h-ship">発送</h2></div>
+          <div class="f" data-row="shipping_code"><label class="lab" for="shipping">発送方法<span class="req">必須</span></label>
+            <div class="ctl">
+              <% if (shippingRates) { %>
+              <select class="in w-m" id="shipping" data-field="shipping_code" data-dirty-field="shipping_code" data-label="発送方法"<%= dis %>>
+                <option value="">(選ぶ)</option>
+                <% for (const r of shippingRates) { %><option value="<%= r.code %>"><%= r.code %> <%= r.method || '' %> / <%= fmt.yen(r.cost) %> 円</option><% } %>
+              </select>
+              <span class="hint">送料コード → 方法と金額は送料の表から · product-hub の楽天の配送方法は対応表から (無ければカードに「要確認」)</span>
+              <% } else { %><span class="lockval"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg>送料の表が読めません</span><% } %>
+            </div></div>
+          <div class="f" data-row="reorder_months"><label class="lab" for="f-reorder_months">推奨保有月数<span class="opt">あとでも可</span></label>
+            <div class="ctl"><span class="stepper"><button type="button" data-step="-1" aria-label="1 か月へらす"<%= dis %>>−</button><input id="f-reorder_months" inputmode="decimal" autocomplete="off" data-field="reorder_months" data-dirty-field="reorder_months" data-label="推奨保有月数" placeholder="—"<%= dis %>><button type="button" data-step="1" aria-label="1 か月ふやす"<%= dis %>>＋</button></span><span class="unit">か月</span></div></div>
+          <% if (!isSet) { %>
+          <div class="f" data-row="expiry_managed"><div class="lab">ロジザード</div>
+            <div class="ctl"><span class="hint" id="lab-f-expiry" style="color:var(--text2)">有効期限の管理</span><%- seg('f-expiry', 'expiry_managed', '0', [['0', 'なし'], ['1', 'あり']], '有効期限の管理') %>
+              <span class="hint" id="lab-f-inbound" style="color:var(--text2);margin-left:8px">入荷日の管理</span><%- seg('f-inbound', 'inbound_date_managed', '0', [['0', 'なし'], ['1', 'あり']], '入荷日の管理') %>
+              <span class="hint">最初の値だけ · あとはロジザードが正</span></div></div>
+          <% } %>
+        </section>
+
+        <section class="panel" id="sec-card" aria-labelledby="h-card">
+          <div class="panel-h"><span class="stepno" data-step="sec-card" aria-hidden="true"><%= no('sec-card') %></span><h2 id="h-card">出品カード (product-hub)</h2>
+            <span class="right"><span class="sr" id="lab-card-create">出品カードを作るか</span><%- seg('card-create', 'card_create', '1', [['1', 'カードを作る'], ['0', '作らない']], '出品カード') %></span></div>
+          <div class="hint" id="card-off-note" hidden style="margin-bottom:6px">カードは作りません (保存しても product-hub のボードにカードはできません)。</div>
+          <div id="card-fields">
+            <div class="f" data-row="card.official_url"><label class="lab" for="official-url">公式ページ URL</label><div class="ctl"><input class="in w-l" id="official-url" autocomplete="off" data-dirty-field="official_url" data-label="公式ページ URL" placeholder="https://"<%= dis %>></div></div>
+            <div class="f" data-row="card.amazon_url"><label class="lab" for="amazon-url">Amazon URL</label><div class="ctl"><input class="in w-l" id="amazon-url" autocomplete="off" data-dirty-field="amazon_url" data-label="Amazon URL" placeholder="https://www.amazon.co.jp/dp/…  (貼ると ASIN を読み取ります)"<%= dis %>></div></div>
+            <div class="f" data-row="card.asin"><label class="lab" for="asin">ASIN</label><div class="ctl"><input class="in w-s mono" id="asin" maxlength="10" autocomplete="off" spellcheck="false" data-dirty-field="asin" data-label="ASIN" placeholder="B0XXXXXXXX"<%= dis %>><span class="fmsg ok" id="asin-msg" role="status" hidden><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>Amazon URL から読み取りました</span></div></div>
+            <div class="f" data-row="card.reference_urls" style="align-items:start"><div class="lab" id="lab-refs" style="padding-top:8px">参考 URL</div>
+              <div class="ctl col" style="gap:0" id="refs" role="group" aria-labelledby="lab-refs" data-dirty-field="reference_urls" data-label="参考 URL">
+                <div id="ref-rows"><div class="urlrow"><span class="idx" aria-hidden="true">1</span><input class="in ref-url" autocomplete="off" aria-label="参考 URL 1" placeholder="https://"<%= dis %>><button class="iconbtn del" type="button" data-ref-del aria-label="参考 URL 1 を外す"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg></button></div></div>
+                <div><button class="btn sm" type="button" id="ref-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>URL を足す</button> <span class="hint"><%= MAX_REFERENCE_URLS %> 個まで</span></div>
+              </div></div>
+            <% if (!isSet) { %>
+            <div class="f" data-row="card.set_decision"><div class="lab" id="lab-set-plan">セット商品を作るか</div>
+              <div class="ctl"><%- seg('set-plan', 'set_plan', '', [...Object.entries(setPlanChoices), ['', 'まだ決めない']], 'セット商品を作るか') %></div></div>
+            <div class="f" id="row-set-reason" hidden><label class="lab" for="set-reason">作らない理由・メモ</label>
+              <div class="ctl"><select class="in w-m" id="set-reason" data-dirty-field="set_reason" data-label="作らない理由"<%= dis %>>
+                <option value="">(作らないときに選ぶ)</option>
+                <% for (const [k, v] of Object.entries(setDecisionReasons)) { %><option value="<%= k %>"><%= v %></option><% } %>
+              </select><input class="in w-m" id="set-text" maxlength="500" autocomplete="off" data-dirty-field="set_text" data-label="セット商品のメモ" aria-label="メモ (その他の理由・保留のメモ)" placeholder="メモ (その他の理由・保留のメモ)"<%= dis %>></div></div>
+            <% } %>
+          </div>
+        </section>
+
+        <details class="panel soft" id="sec-yahoo">
+          <summary><span class="stepno" data-step="sec-yahoo" aria-hidden="true" style="width:26px;height:26px;font-size:13px"><%= no('sec-yahoo') %></span>Yahoo! を楽天と変えるときだけ <span class="b mute" id="yahoo-sum">ふだんは空のまま</span><svg class="ic s chev" aria-hidden="true"><use href="#i-chevr"/></svg></summary>
+          <div class="body">
+            <div class="f" data-row="card.yahoo.price"><label class="lab" for="y-price">Yahoo!売価</label>
+              <div class="ctl"><span class="yen"><input class="in w-s" id="y-price" inputmode="numeric" autocomplete="off" data-dirty-field="y_price" data-label="Yahoo!売価" placeholder="0"<%= dis %>></span><span class="unit">円</span>
+                <label class="hint" for="y-price-sagawa" style="color:var(--text2);margin-left:10px">Yahoo!売価 (佐川)</label><span class="yen"><input class="in w-s" id="y-price-sagawa" inputmode="numeric" autocomplete="off" data-dirty-field="y_price_sagawa" data-label="Yahoo!売価 (佐川)" placeholder="0"<%= dis %>></span><span class="unit">円</span>
+                <span class="hint">1 円以上 (決めていなければ空のまま・0 は入れない)</span></div></div>
+            <div class="f" data-row="card.yahoo.delivery_label"><label class="lab" for="y-delivery">配送方法</label>
+              <div class="ctl"><select class="in w-m" id="y-delivery" data-dirty-field="y_delivery" data-label="Yahoo!の配送方法"<%= dis %>>
+                <option value="">(楽天と同じ)</option>
+                <% for (const d of yahooDeliveries) { %><option value="<%= d %>"><%= d %></option><% } %>
+              </select><span class="hint">楽天と違う配送にするときだけ</span></div></div>
+            <div class="f" data-row="card.yahoo.category_id"><label class="lab" for="y-category">Yahoo!カテゴリID</label>
+              <div class="ctl"><input class="in w-s mono" id="y-category" autocomplete="off" data-dirty-field="y_category" data-label="Yahoo!カテゴリID"<%= dis %>>
+                <label class="hint" for="y-path" style="color:var(--text2);margin-left:10px">Yahoo!path</label><input class="in w-m" id="y-path" maxlength="500" autocomplete="off" data-dirty-field="y_path" data-label="Yahoo!path"<%= dis %>></div></div>
+            <div class="hint">税率は Company DB の税率を使います (ここでは入れません)。</div>
+          </div>
+        </details>
       </div>
 
-      <% if (isSet) { %>
-      <div class="sec"><h3>構成 <span class="sub">(NE に登録して、NE の構成が同じと確かめたら今の構成になります)</span></h3>
-        <table class="me" id="comp">
-          <thead><tr><th>#</th><th>構成品</th><th>数量</th><th>税</th><th>分類</th><th>原価</th><th>取扱</th><th></th></tr></thead>
-          <tbody id="comp-rows"></tbody>
-        </table>
-        <template id="comp-tpl"><tr class="comp-row"><td class="no"></td><td><input type="text" class="c-code" placeholder="商品コード"> <span class="c-name sub"></span></td><td><input type="text" class="c-qty" value="1"></td><td class="c-tax"></td><td class="c-sales"></td><td class="c-cost n"></td><td class="c-handling"></td><td><button type="button" class="btn-sm" data-act="up">↑</button><button type="button" class="btn-sm" data-act="down">↓</button><button type="button" class="btn-sm" data-act="del">×</button></td></tr></template>
-        <div class="fl" style="margin-top: 6px;"><button type="button" class="btn-sm" id="comp-add"<%= dis %>>+ 構成品</button>
-          <span class="sub">1〜<%= MAX_COMPONENTS %> 行・数量 1〜999・同じ品は 1 行・セットは入れられません ・ 並びも入れたとおり</span></div>
-        <div class="fl"><label class="k">セット自身の取扱</label>
-          <label><input type="radio" name="handling_own" data-field="handling_own" value="active" checked<%= dis %>> 取扱中</label>
-          <label><input type="radio" name="handling_own" data-field="handling_own" value="discontinued"<%= dis %>> 中止</label></div>
-        <div class="fl"><label class="k">売上分類の上書き</label><select data-field="set_sales_class_override"<%= dis %>>
-          <option value="">— (構成品から)</option>
-          <% for (const [k, v] of Object.entries(SALES)) { %><option value="<%= k %>"><%= v %></option><% } %>
-        </select><span class="sub">構成品から導けないときだけ</span></div>
-        <div class="fl"><label class="k">例外原価</label><input type="text" id="xcost-jpy" size="10" placeholder="円"<%= dis %>> 円
-          理由 <input type="text" id="xcost-reason" size="24" maxlength="200"<%= dis %>><span class="sub">空なら構成品の原価の合計</span></div>
-      </div>
-      <% } %>
-
-      <div class="sec"><h3>product-hub の出品カード</h3>
-        <div class="fl"><label><input type="checkbox" id="card-create" checked<%= dis %>> 出品カードを作る (保存すると product-hub のボードにカードができます)</label></div>
-        <div class="fl"><label class="k">公式ページ URL</label><input type="text" id="official-url" size="60" placeholder="https://..."<%= dis %>></div>
-        <div class="fl"><label class="k">Amazon URL</label><input type="text" id="amazon-url" size="60" placeholder="https://..."<%= dis %>></div>
-        <div class="fl"><label class="k">ASIN</label><input type="text" id="asin" size="14" maxlength="10" placeholder="B0XXXXXXXX"<%= dis %>></div>
-        <div class="fl"><label class="k">参考 URL</label><textarea id="ref-urls" rows="3" cols="60" placeholder="1 行に 1 つ (<%= MAX_REFERENCE_URLS %> 個まで)"<%= dis %>></textarea></div>
-        <% if (!isSet) { %>
-        <div class="fl"><label class="k">セット商品を作るか</label>
-          <% for (const [k, v] of Object.entries(setPlanChoices)) { %><label><input type="radio" name="set_plan" value="<%= k %>"<%= dis %>> <%= v %></label><% } %>
-          <label><input type="radio" name="set_plan" value="" checked<%= dis %>> まだ決めない</label></div>
-        <div class="fl"><label class="k">作らない理由</label><select id="set-reason"<%= dis %>>
-          <option value="">(作らないときに選ぶ)</option>
-          <% for (const [k, v] of Object.entries(setDecisionReasons)) { %><option value="<%= k %>"><%= v %></option><% } %>
-        </select> メモ <input type="text" id="set-text" size="30" maxlength="500" placeholder="その他の理由・保留のメモ"<%= dis %>></div>
-        <% } %>
-      </div>
-
-      <div class="sec"><h3>Yahoo!向け追記</h3>
-        <div class="fl"><label class="k">Yahoo!売価</label><input type="text" id="y-price" size="10" inputmode="numeric"<%= dis %>> 円
-          <label class="k" style="min-width: auto;">Yahoo!売価 (佐川)</label><input type="text" id="y-price-sagawa" size="10" inputmode="numeric"<%= dis %>> 円
-          <span class="sub">1 円以上 (決めていなければ空のまま・0 は入れない)</span></div>
-        <div class="fl"><label class="k">配送方法</label><select id="y-delivery"<%= dis %>>
-          <option value="">(楽天と同じ)</option>
-          <% for (const d of yahooDeliveries) { %><option value="<%= d %>"><%= d %></option><% } %>
-        </select><span class="sub">楽天と違う配送にするときだけ</span></div>
-        <div class="fl"><label class="k">Yahoo!カテゴリID</label><input type="text" id="y-category" size="12"<%= dis %>>
-          <label class="k" style="min-width: auto;">Yahoo!path</label><input type="text" id="y-path" size="40" maxlength="500"<%= dis %>></div>
-        <div class="sub">税率は Company DB の税率を使います (ここでは入れません)。</div>
-      </div>
-
-      <div class="bar">
-        <label>理由 (任意) <input type="text" id="reason" size="30" maxlength="200"<%= dis %>></label>
-        <button type="button" class="btn-sm" id="save"<%= dis %>>登録 (下書き)</button>
-        <span class="sub">登録の後、NE への登録は <a href="<%= base %>/reg-csv">📤 NE 登録の CSV</a> で行います</span>
-      </div>
+      <aside class="side" aria-label="下書きの保存">
+        <section class="panel savebox hud" id="savebox" aria-labelledby="h-save" tabindex="-1">
+          <div class="mobilebar"><span class="grow"><b class="mb-n">未保存の変更はありません</b></span><button class="btn soft sm" type="button" id="savebox-toggle" aria-expanded="false" aria-controls="savebox">確認して保存</button></div>
+          <h2 class="sr" id="h-save">下書きの保存</h2>
+          <div class="remain" id="remain" aria-live="polite">下書き保存まで あと<b>—</b>つ</div>
+          <div class="hint" style="margin-bottom:4px">① がそろえば下書きにできます。② ③ はあとでも入れられます (押すとその欄へ)</div>
+          <ul class="checklist" id="checklist"></ul>
+          <% if (canSave) { %>
+          <label class="lab2" for="reason">理由 (なくてもよい)</label>
+          <input class="in" id="reason" maxlength="200" autocomplete="off" placeholder="例: 10 月の新商品">
+          <% } %>
+          <button class="btn pri lg block" id="save" disabled type="button" aria-keyshortcuts="Control+S">下書きを保存する</button>
+          <div class="below"><span>保存すると「下書き」になり、その商品の画面を開きます</span></div>
+          <div class="msgline" id="msg" role="status" aria-live="polite"></div>
+          <div id="result" aria-live="polite"></div>
+        </section>
+        <section class="panel" aria-labelledby="h-after">
+          <div class="panel-h" style="margin-bottom:8px"><h2 id="h-after">登録のあと</h2></div>
+          <ol class="after-steps">
+            <li class="first">下書き (この画面) — ① がそろったら</li>
+            <li>NE 登録の CSV を作って配る — ② がそろったら · <a href="<%= base %>/reg-csv">NE 登録の CSV</a></li>
+            <li>NE の画面で取り込む → 申告</li>
+            <li>翌朝の確かめ (NE と同じか)</li>
+            <li>登録済み = 業務で使える</li>
+          </ol>
+          <div class="hint">出品カードは保存のすぐあとに product-hub のボードにできます。</div>
+        </section>
+      </aside>
     </form>
-    <div class="msg" id="msg"></div>
-    <div id="result"></div>
+    <script type="application/json" id="me-new"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
     <% } %>
   </div>
-
-<script>
-(() => {
-  const form = document.getElementById('f');
-  if (!form) return;
-  const D = form.dataset;
-  const $ = (id) => document.getElementById(id);
-  const isSet = D.kind === 'set';
-  const canSave = D.canSave === '1';
-  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const HANDLING = { active: '取扱中', discontinued: '中止', unknown: '不明' };
-  function uuid() {
-    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
-    const b = new Uint8Array(16); crypto.getRandomValues(b); b[6] = (b[6] & 15) | 64; b[8] = (b[8] & 63) | 128;
-    const h = Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
-    return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
-  }
-  // 登録 1 回に 1 つ (通信が切れて押し直しても 2 回入らない)
-  let requestId = uuid();
-  const val = (id) => { const e = $(id); return e ? e.value.trim() : ''; };
-  function fieldValue(name) {
-    const list = Array.from(form.querySelectorAll('[data-field="' + name + '"]'));
-    if (!list.length) return undefined;
-    if (list[0].type === 'radio') { const on = list.find((e) => e.checked); return on ? on.value : ''; }
-    return list[0].value;
-  }
-
-  // ── 商品コードを確かめる ──
-  const codeMsg = $('code-msg');
-  async function checkCode() {
-    const code = $('code').value;
-    if (!code) return;
-    try {
-      const r = await fetch(D.base + '/api/code-check?code=' + encodeURIComponent(code), { headers: { Accept: 'application/json' } });
-      const j = await r.json().catch(() => ({}));
-      codeMsg.style.color = j.ok ? '#2b8a3e' : '#c92a2a';
-      codeMsg.textContent = j.ok ? '使えます' : (j.message || j.error || ('HTTP ' + r.status));
-    } catch (e) { codeMsg.style.color = '#c92a2a'; codeMsg.textContent = '確かめられません (通信)'; }
-  }
-  const cc = $('code-check'); if (cc) cc.addEventListener('click', checkCode);
-
-  // ── セットの構成 ──
-  const rowsEl = $('comp-rows');
-  function renumber() { Array.from(document.querySelectorAll('#comp-rows tr.comp-row')).forEach((tr, i) => { tr.querySelector('.no').textContent = String(i + 1); }); }
-  async function lookup(tr) {
-    const code = tr.querySelector('.c-code').value.trim();
-    const set = (cls, v) => { tr.querySelector(cls).textContent = v; };
-    if (!code) { set('.c-name', ''); return; }
-    try {
-      const r = await fetch(D.base + '/api/lookup?code=' + encodeURIComponent(code), { headers: { Accept: 'application/json' } });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok || !j.ok) { set('.c-name', j.error || '見つかりません'); ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach((c) => set(c, '')); return; }
-      const x = j.item;
-      set('.c-name', x.name + (x.kind !== 'single' ? ' (単品でない = 構成品にできません)' : ''));
-      set('.c-tax', x.tax_rate == null ? '未' : String(Math.round(x.tax_rate * 100)));
-      set('.c-sales', x.sales_class == null ? '未' : String(x.sales_class));
-      set('.c-cost', x.cost_jpy == null ? '未' : x.cost_jpy.toLocaleString('ja-JP'));
-      set('.c-handling', HANDLING[x.handling] || x.handling);
-    } catch (e) { set('.c-name', '引き当てできません (通信)'); }
-  }
-  function addRow() {
-    const tpl = $('comp-tpl');
-    rowsEl.appendChild(tpl.content.firstElementChild.cloneNode(true));
-    renumber();
-    if (!canSave) rowsEl.lastElementChild.querySelectorAll('input, button').forEach((e) => { e.disabled = true; });
-  }
-  if (rowsEl) {
-    rowsEl.addEventListener('click', (ev) => {
-      const b = ev.target.closest('button[data-act]'); if (!b || b.disabled) return;
-      const tr = b.closest('tr');
-      if (b.dataset.act === 'del') tr.remove();
-      if (b.dataset.act === 'up' && tr.previousElementSibling) tr.parentNode.insertBefore(tr, tr.previousElementSibling);
-      if (b.dataset.act === 'down' && tr.nextElementSibling) tr.parentNode.insertBefore(tr.nextElementSibling, tr);
-      renumber();
-    });
-    rowsEl.addEventListener('change', (ev) => { if (ev.target.classList.contains('c-code')) lookup(ev.target.closest('tr')); });
-    addRow(); addRow();
-  }
-  const addBtn = $('comp-add');
-  if (addBtn) addBtn.addEventListener('click', () => { addRow(); rowsEl.lastElementChild.querySelector('.c-code').focus(); });
-
-  // ── 集める ──
-  function collect() {
-    const values = {};
-    const keys = isSet ? ['name', 'standard_price', 'shipping_code', 'reorder_months', 'handling_own', 'set_sales_class_override']
-      : ['name', 'standard_price', 'shipping_code', 'tax_rate', 'sales_class', 'primary_supplier', 'reorder_months', 'expiry_managed', 'inbound_date_managed'];
-    for (const k of keys) { const v = fieldValue(k); if (v !== undefined && v !== '') values[k] = v; }
-    if (isSet) {
-      values.components = Array.from(document.querySelectorAll('#comp-rows tr.comp-row'))
-        .map((tr) => ({ code: tr.querySelector('.c-code').value.trim(), qty: tr.querySelector('.c-qty').value.trim() }))
-        .filter((r) => r.code || (r.qty && r.qty !== '1'));
-      if (val('xcost-jpy')) values.exception_cost = { jpy: val('xcost-jpy'), reason: val('xcost-reason') };
-    } else if (val('cost-jpy')) values.cost = { jpy: val('cost-jpy'), reason: val('cost-reason') };
-    const card = {
-      create: $('card-create').checked,
-      official_url: val('official-url'), amazon_url: val('amazon-url'), asin: val('asin'),
-      reference_urls: val('ref-urls').split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
-      yahoo: { price: val('y-price'), price_sagawa: val('y-price-sagawa'), delivery_label: val('y-delivery'), category_id: val('y-category'), path: val('y-path') },
-    };
-    if (!isSet) {
-      const plan = form.querySelector('input[name="set_plan"]:checked');
-      if (plan && plan.value) card.set_decision = { decision: plan.value, reason_code: plan.value === 'none' ? val('set-reason') : '', reason_text: val('set-text') };
-    }
-    return { request_id: requestId, kind: D.kind, code: $('code').value, reason: val('reason'), values, card };
-  }
-
-  // ── 登録 ──
-  function setMsg(text, cls) { const m = $('msg'); m.className = 'msg ' + (cls || ''); m.textContent = text || ''; }
-  function showResult(j) {
-    const li = (a) => a.map((x) => '<li>' + x + '</li>').join('');
-    const skuUrl = D.base + '/sku/' + encodeURIComponent(j.code);
-    let html = '<div class="result"><b>登録しました (下書き)' + (j.replayed ? ' (前に登録した結果)' : '') + '</b>: <a href="' + esc(skuUrl) + '">' + esc(j.code) + ' を開く</a>'
-      + '<ul><li>税率 ' + esc(j.tax && j.tax.rate != null ? Math.round(j.tax.rate * 100) + '% (' + j.tax.class + ')' : '未決') + ' ・ 原価 ' + esc(j.cost ? j.cost.jpy.toLocaleString('ja-JP') + ' 円' : '未入力')
-      + ' ・ 発送方法 ' + esc(j.shipping ? j.shipping.code + ' ' + (j.shipping.method || '') : '') + '</li></ul>';
-    if (j.card) {
-      html += '<div>product-hub の出品カード: <b>' + esc(j.card_label || j.card.status) + '</b>'
-        + (j.card.status === 'done' && j.card.draft_id ? ' <a href="/apps/product-hub/detail/' + encodeURIComponent(j.card.draft_id) + '">カードを開く ↗</a>' : '')
-        + (j.card.status !== 'done' ? ' <span class="sub">(商品の画面の「カードをもう一度作る」か、product-hub のボードを開くと作り直します)</span>' : '') + '</div>';
-    }
-    if (j.ne_steps && j.ne_steps.length) html += '<div><b>このあと:</b></div><ul>' + li(j.ne_steps.map(esc)) + '</ul>';
-    if (j.warnings && j.warnings.length) html += '<div><b>気をつけること:</b></div><ul>' + li(j.warnings.map(esc)) + '</ul>';
-    $('result').innerHTML = html + '</div>';
-  }
-  function showError(j, status) {
-    let html = '<div class="result"><b style="color:#c92a2a">' + esc(j.error || ('HTTP ' + status)) + '</b>';
-    if (j.reason === 'set_underivable' && Array.isArray(j.blockers)) html += '<ul>' + j.blockers.map((b) => '<li>' + esc(b) + '</li>').join('') + '</ul>';
-    $('result').innerHTML = html + '</div>';
-  }
-  const saveBtn = $('save');
-  if (saveBtn && canSave) saveBtn.addEventListener('click', async () => {
-    const body = collect();
-    // Yahoo!売価の 0 はサーバーと同じく断る (空 = 入れない)
-    const zero = ['y-price', 'y-price-sagawa'].filter((id) => /^[0０]+$/.test(val(id)));
-    if (zero.length) { setMsg('Yahoo!売価は 1 円以上で入れてください (決めていなければ空のまま)', 'err'); return; }
-    saveBtn.disabled = true; setMsg('登録しています…'); $('result').innerHTML = '';
-    let r, j;
-    try {
-      r = await fetch(D.base + '/api/new', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) });
-      j = await r.json().catch(() => ({}));
-    } catch (e) {
-      saveBtn.disabled = false; setMsg('通信できませんでした。もう一度「登録」を押してください (同じ登録は 2 回入りません)', 'err'); return;
-    }
-    if (r.ok && j.ok) { setMsg('登録しました', 'ok'); showResult(j); return; }   // 登録した後はボタンを押せないまま (同じ商品を 2 回作らない)
-    setMsg('', 'err');
-    showError(j, r.status);
-    requestId = uuid();   // 返事が来た = この番号の登録は終わった。直してもう一度押すときは新しい番号
-    saveBtn.disabled = false;
-  });
-})();
-</script>
+  <%- include('_footer') %>
+  <% if (page) { %><script src="<%= base %>/public/me-new.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>

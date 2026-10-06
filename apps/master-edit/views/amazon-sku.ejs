@@ -2,198 +2,143 @@
 <html lang="ja">
 <head>
   <%- include('_head') %>
-  <style>
-    .sec { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 8px 14px; margin-bottom: 10px; }
-    .sec h3 { font-size: 0.95em; margin: 2px 0 8px; color: #343a40; }
-    .fl { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; font-size: 0.9em; }
-    .fl label.k { color: #495057; min-width: 6em; }
-    .fl input[type=text] { padding: 4px 6px; font-size: 0.95em; }
-    .sub { font-size: 0.82em; color: #868e96; }
-    #comp input.c-code { width: 12em; } #comp input.c-qty { width: 4em; text-align: right; }
-    .bar { position: sticky; bottom: 0; background: #fff; border-top: 2px solid #dee2e6; padding: 8px 0; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-    .result { background: #fff; border: 1px solid #adb5bd; border-radius: 8px; padding: 8px 14px; margin: 8px 0; font-size: 0.88em; }
-    .result li { margin: 2px 0; }
-  </style>
 </head>
 <body>
-  <%- include('_header') %>
-  <%
-    const cur = page ? page.cur : null;
-    const map = cur ? cur.map : null;
-    const deleted = !!map && map.state === 'deleted';
-    const canSave = !!page && canEdit && !dbError && !amazonClosed;
-    const dis = canSave ? '' : ' disabled';
-    const RES = { manual: '人', imported: 'SKU マスタから', exact: 'FBM の完全一致', normalized: 'FBM の完全一致 (正規化)', map: '対応表' };
-    const REG = { draft: '下書き', ne_pending: 'NE登録待ち', ne_confirmed: 'NE確認済み', distributable: '配る対象', available: '利用可', quarantined: '要確認', cancelled: 'やめた' };
-    const ts = (v) => (v ? String(v).slice(0, 19).replace('T', ' ') : '');
-    const startRows = cur ? (deleted ? [] : cur.components) : [];
-    const startName = map ? map.name : (cur && cur.listing && cur.listing.title) || '';
-  %>
-  <div class="me-wrap">
-    <p class="sub"><a href="<%= base %>/amazon/">← Amazon SKU の一覧へ</a> ・ <a href="<%= base %>/">商品・セット</a></p>
-    <% if (dbError) { %><div class="band err"><%= dbError %></div><% } %>
+<%
+  // 1 つの seller SKU (新しいデザイン・第 2 段 10/5)。左 = Amazon の情報 (見るだけ)・構成 (1 行目が代表)・削除 (下に分けて理由が必須) / 右 = 保存すると変わること。
+  // 保存・削除の送り方 (POST /api/amazon/save・/api/amazon/delete) は前と同じ。画面の動き = public/me-amazon.js
+  const cur = page ? page.cur : null;
+  const map = cur ? cur.map : null;
+  const deleted = !!map && map.state === 'deleted';
+  const canSave = !!page && canEdit && !dbError && !amazonClosed;
+  const dis = canSave ? '' : ' disabled';
+  const RES = { manual: '人', imported: 'SKU マスタから', exact: 'FBM の完全一致', normalized: 'FBM の完全一致 (正規化)', map: '対応表' };
+  const REG = { draft: '下書き', ne_pending: 'NE登録待ち', ne_confirmed: 'NE確認済み', distributable: '配る対象', available: '登録済み', quarantined: '要確認', cancelled: 'やめた' };
+  const REG_BADGE = { draft: 'warn', ne_pending: 'warn', ne_confirmed: 'ok', distributable: 'ok', available: 'ok', quarantined: 'err', cancelled: 'mute' };
+  const startRows = cur ? (deleted ? [] : cur.components) : [];
+  const startName = map ? map.name : (cur && cur.listing && cur.listing.title) || '';
+  const title = map ? map.name : (cur && cur.listing && cur.listing.title) || '';
+  // 属性に入れる値は必ずエスケープする (コードに引用符があっても属性が増えない = #1628 Codex R1 M4)
+  const h = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const iconBtns = (i, code) => { const who = h(i + ' 行目' + (code ? ' (' + code + ')' : '')); return '<button type="button" class="iconbtn" data-act="up" aria-label="' + who + ' を上へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg></button><button type="button" class="iconbtn" data-act="down" aria-label="' + who + ' を下へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-down"/></svg></button><button type="button" class="iconbtn del" data-act="del" aria-label="' + who + ' を外す"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-trash"/></svg></button>'; };
+  const pageData = page ? { base, sku, canSave, maxComponents: MAX_MAP_COMPONENTS, maxQty: MAX_MAP_QTY, isNew: !map, deleted } : null;
+%>
+  <%- include('_header', { hasSave: canSave }) %>
+  <div class="page" id="amazon-sku-page">
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/amazon/" data-list-back>Amazon SKU</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span class="mono" aria-current="page"><%= sku %></span></nav>
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div><div class="hint">つながったら画面を開き直してください。</div></div></div><% } %>
     <% if (page) { %>
-    <% if (amazonClosed) { %><div class="band warn">いまは保存できません (<%= amazonClosedWhy %>)。見るだけです。切替日までは、この SKU の対応の正は miniPC の SKU マスタ (/apps/warehouse の「SKUマスタ」) です。</div><% } %>
-    <% if (!canEdit) { %><div class="band info"><%= gateMessage %></div><% } %>
-
-    <h2 style="font-size: 1.15em; margin: 6px 0;"><%= sku %>
-      <span class="tag<%= map && !deleted ? ' gray' : '' %>"><%= map ? (MAP_STATES[map.state] || map.state) : '対応なし' %></span>
-      <% if (map && map.origin === 'legacy') { %><span class="tag gray">切替の日の移行</span><% } %></h2>
-    <p class="sub"><% if (cur.listing) { %><a href="<%= base %>/amazon/sku/history?sku=<%= encodeURIComponent(sku) %>">変更の記録</a> ・ <% } %>FBA / FBM: <%= page.channel ? (CHANNELS[page.channel] || page.channel) : '分からない' %>
-      <% if (page.lastRequest) { %> ・ 最後の保存: <%= ts(page.lastRequest.finished_at) %> (UTC) <%= page.lastRequest.actor_id %><% } %></p>
-
-    <% if (!map) { %>
-      <div class="band info">この seller SKU の対応は Company DB にまだありません。<% if (cur.components.length) { %>下の構成は夜間の取り込みが作った今の構成 (miniPC の SKU マスタ・FBM の完全一致から) です。<% } %>保存すると、この seller SKU の対応を新しく作ります。</div>
-    <% } else if (deleted) { %>
-      <div class="band warn">削除済み (墓標) です: <%= ts(map.deleted_at) %> (UTC) <%= map.deleted_by %> 「<%= map.deleted_reason %>」。夜間の取り込みはこの出品の構成を作り直しません。保存すると、同じ seller SKU をもう一度登録します (登録日は新しくなります)。</div>
-    <% } %>
-
-    <div class="sec"><h3>出品 (見るだけ)</h3>
-      <% if (cur.listing) { %>
-      <div class="fl"><span>出品のコード <b><%= cur.listing.listing_code %></b></span><span>タイトル <%= cur.listing.title || '—' %></span><span>状態 <%= cur.listing.status %></span>
-        <span>ASIN <%= cur.listing.asin || '—' %></span><span>FNSKU <%= cur.fnsku || '—' %></span><span class="sub">出品 <%= cur.listing.listing_id %> ・ version <%= cur.listing.version %></span></div>
-      <% if (map) { %><div class="fl sub"><span>登録 <%= ts(map.registered_at) %> (UTC) <%= map.registered_by || '' %></span><span>変えた <%= ts(map.changed_at) %> (UTC) <%= map.changed_by || '' %></span></div><% } %>
-      <% } else { %>
-      <div class="sub">Company DB にこの seller SKU の出品はまだありません。保存すると出品も作ります (ASIN・FNSKU は夜間の取り込みが付けます)。</div>
-      <% } %>
-      <% if (page.related.length) { %><div class="fl sub">同じ NE の商品を使う seller SKU: <% page.related.forEach((r, i) => { %><%= i ? '・' : '' %><a href="?sku=<%= encodeURIComponent(r.seller_sku) %>"><%= r.seller_sku %></a> <%= r.name %><% }) %></div><% } %>
-    </div>
-
-    <div class="sec" id="f" data-base="<%= base %>" data-sku="<%= sku %>" data-versions="<%= JSON.stringify(cur.versions) %>" data-can-save="<%= canSave ? '1' : '0' %>">
-      <h3><%= !map ? '新しい対応' : deleted ? 'もう一度登録する' : '対応を直す' %></h3>
-      <div class="fl"><label class="k" for="name">名前 (社内)</label><input type="text" id="name" value="<%= startName %>" size="60" maxlength="255"<%= dis %>></div>
-      <table class="me" id="comp">
-        <thead><tr><th>#</th><th>NE コード</th><th>数量</th><th>NE の名前</th><th>登録の状態</th><th>どこから</th><th></th></tr></thead>
-        <tbody id="comp-rows">
-          <% startRows.forEach((c, i) => { %>
-          <tr class="comp-row">
-            <td class="no"><%= i + 1 %></td>
-            <td><input type="text" class="c-code" value="<%= c.code %>"<%= dis %>></td>
-            <td><input type="text" class="c-qty" value="<%= c.qty %>"<%= dis %>></td>
-            <td class="c-name"><%= c.name %><%= c.sku_kind === 'exception' ? ' (例外の SKU)' : '' %></td>
-            <td><%= c.reg_state ? (REG[c.reg_state] || c.reg_state) : '—' %></td>
-            <td class="sub"><%= RES[c.resolution] || c.resolution %></td>
-            <td><button type="button" class="btn-sm" data-act="up"<%= dis %>>↑</button><button type="button" class="btn-sm" data-act="down"<%= dis %>>↓</button><button type="button" class="btn-sm" data-act="del"<%= dis %>>×</button></td>
-          </tr>
-          <% }) %>
-        </tbody>
-      </table>
-      <template id="comp-tpl"><tr class="comp-row"><td class="no"></td><td><input type="text" class="c-code" placeholder="NE コード"></td><td><input type="text" class="c-qty" value="1"></td><td class="c-name sub"></td><td></td><td class="sub">人</td><td><button type="button" class="btn-sm" data-act="up">↑</button><button type="button" class="btn-sm" data-act="down">↓</button><button type="button" class="btn-sm" data-act="del">×</button></td></tr></template>
-      <div class="fl" style="margin-top: 6px;"><button type="button" class="btn-sm" id="comp-add"<%= dis %>>＋ 行を足す</button>
-        <span class="sub">1 行目 = 代表の NE コード (↑↓ で並べ替え)。1〜<%= MAX_MAP_COMPONENTS %> 行・数量は 1〜<%= MAX_MAP_QTY %>。NE で確かめた商品 (NE確認済み・利用可) だけ使えます</span></div>
-      <div class="bar">
-        <label>理由 <input type="text" id="reason" size="40" maxlength="200" placeholder="なぜ (なくてもよい)"<%= dis %>></label>
-        <button type="button" class="btn-sm" id="save"<%= dis %>>保存</button>
-        <span class="msg" id="msg"></span>
+    <div class="ph" id="sku-ph">
+      <div>
+        <div class="idrow">
+          <span class="code-pill"><%= sku %></span>
+          <span class="b <%= page.channel === 'FBM' ? 'vio' : 'mute' %>"><%= page.channel ? (CHANNELS[page.channel] || page.channel) : 'FBA / FBM 分からない' %></span>
+          <% if (!map) { %><span class="b warn">対応なし</span><% } else if (deleted) { %><span class="b mute"><%= MAP_STATES[map.state] || map.state %></span><% } else { %><span class="b ok"><span class="dot" aria-hidden="true"></span><%= MAP_STATES[map.state] || map.state %></span><% } %>
+          <% if (map && map.origin === 'legacy') { %><span class="b mute">切替の日の移行</span><% } %>
+        </div>
+        <h1><%= title || (map ? sku : '新しい対応') %></h1>
+        <div class="meta">
+          <% if (page.lastRequest) { %><span>最後に保存した人 <%= page.lastRequest.actor_id %></span><span class="dotsep" aria-hidden="true"></span><span><%= ui.fmtJst(page.lastRequest.finished_at, { nowMs }) %></span><% } else if (map) { %><span>変えた <%= ui.fmtJst(map.changed_at, { nowMs }) %> · <%= map.changed_by || '' %></span><% } else { %><span>まだ Company DB に対応がありません</span><% } %>
+        </div>
       </div>
-      <div id="result"></div>
+      <div class="ph-actions"><% if (cur.listing) { %><a class="btn" href="<%= base %>/amazon/sku/history?sku=<%= encodeURIComponent(sku) %>"><svg class="ic" aria-hidden="true"><use href="#i-history"/></svg>変更の記録</a><% } %></div>
     </div>
 
-    <% if (map && !deleted) { %>
-    <div class="sec" id="del-box"><h3>削除する (墓標にする)</h3>
-      <div class="sub">構成を全部外して、この seller SKU を「削除済み」にします。行は消えずに残ります (夜間の取り込みがこの出品の構成を作り直さないため)。1 件ずつ・理由が要ります。</div>
-      <div class="fl" style="margin-top: 6px;"><label>理由 <input type="text" id="del-reason" size="40" maxlength="200" placeholder="なぜ削除するか (要る)"<%= dis %>></label>
-        <button type="button" class="btn-sm" id="del"<%= dis %>>削除 (墓標にする)</button><span class="msg" id="del-msg"></span></div>
+    <% if (amazonClosed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= amazonClosedWhy %>)</div><div class="hint">見るだけです。切替日までは、この SKU の対応の正は miniPC の SKU マスタ (/apps/warehouse の「SKUマスタ」) です。</div></div></div><% } %>
+    <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
+    <% if (!map) { %>
+      <div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">この seller SKU の対応は Company DB にまだありません</div><div class="hint"><% if (cur.components.length) { %>下の構成は夜間の取り込みが作った今の構成 (miniPC の SKU マスタ・FBM の完全一致から) です。<% } %>保存すると、この seller SKU の対応を新しく作ります。</div></div></div>
+    <% } else if (deleted) { %>
+      <div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-trash"/></svg><div class="grow"><div class="t">削除済み (墓標) です</div><div class="hint"><%= ui.fmtJst(map.deleted_at, { nowMs }) %> · <%= map.deleted_by %> 「<%= map.deleted_reason %>」。夜間の取り込みはこの出品の構成を作り直しません。保存すると、同じ seller SKU をもう一度登録します (登録日は新しくなります)。</div></div></div>
+    <% } %>
+
+    <form class="edit" id="f" novalidate data-base="<%= base %>" data-sku="<%= sku %>" data-versions="<%= JSON.stringify(cur.versions) %>" data-can-save="<%= canSave ? '1' : '0' %>">
+      <div>
+        <section class="panel soft" aria-labelledby="h-listing">
+          <div class="panel-h"><span class="hico" aria-hidden="true" style="color:var(--text2);background:rgba(255,255,255,.05)"><svg class="ic"><use href="#i-lock"/></svg></span><h2 id="h-listing">出品 (Amazon の情報)</h2><span class="sub">見るだけ · 夜間の取り込みが入れます</span></div>
+          <% if (cur.listing) { %>
+          <div class="listing">
+            <div><div class="k">タイトル</div><div class="v"><%= cur.listing.title || '—' %></div></div>
+            <div><div class="k">ASIN</div><div class="v mono"><%= cur.listing.asin || '—' %></div></div>
+            <div><div class="k">FNSKU</div><div class="v<%= cur.fnsku ? ' mono' : ' muted' %>"><%= cur.fnsku || 'まだ無い' %></div></div>
+            <div><div class="k">出品の状態</div><div class="v"><%= cur.listing.status %></div></div>
+            <div><div class="k">出品のコード</div><div class="v mono"><%= cur.listing.listing_code %></div></div>
+            <% if (map) { %><div><div class="k">対応を登録</div><div class="v"><%= ui.fmtJst(map.registered_at, { nowMs }) %> · <%= map.registered_by || '' %></div></div><% } %>
+            <% if (page.related.length) { %><div style="grid-column:1 / -1"><div class="k">同じ NE の商品を使う seller SKU</div><div class="v"><% for (const r of page.related) { %><a class="linkchip" href="?sku=<%= encodeURIComponent(r.seller_sku) %>" title="<%= r.name %>"><span class="mono"><%= r.seller_sku %></span></a><% } %></div></div><% } %>
+          </div>
+          <% } else { %>
+          <div class="hint">Company DB にこの seller SKU の出品はまだありません。保存すると出品も作ります (ASIN・FNSKU は夜間の取り込みが付けます)。</div>
+          <% } %>
+        </section>
+
+        <section class="panel" aria-labelledby="h-comp">
+          <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-box"/></svg></span><h2 id="h-comp"><%= !map ? '新しい対応' : deleted ? 'もう一度登録する' : '対応を直す' %></h2><span class="sub">この SKU 1 個 = 下の NE の商品 × 数</span></div>
+          <div class="f" data-row="name"><label class="lab" for="name">名前 (社内)</label><div class="ctl"><input class="in w-l" id="name" value="<%= startName %>" maxlength="255" autocomplete="off" data-dirty-field="name" data-label="名前 (社内)"<%= dis %>></div></div>
+          <div class="f wide" data-row="components">
+            <div class="scrollx"><table class="comp" id="comp" data-dirty-field="components" data-label="構成"><caption class="sr">構成 (コードを打つと名前が出ます・1 行目が代表)</caption>
+              <thead><tr><th scope="col">#</th><th scope="col">NE の商品 (コードを打つと名前が出ます)</th><th scope="col">数</th><th scope="col">登録の状態</th><th scope="col">どこから</th><th scope="col"><span class="sr">並べ替え・外す</span></th></tr></thead>
+              <tbody id="comp-rows">
+                <% startRows.forEach((c, i) => { %>
+                <tr class="comp-row">
+                  <td class="no"><%= i + 1 %></td>
+                  <td><input class="in mono c-code" style="width:150px" value="<%= c.code %>" autocomplete="off" spellcheck="false" aria-label="<%= i + 1 %> 行目の NE コード"<%= dis %>> <span class="c-name"><%= c.name %><%= c.sku_kind === 'exception' ? ' (例外の SKU)' : '' %></span><% if (i === 0) { %><span class="repbadge">代表</span><% } %></td>
+                  <td><input class="in c-qty" style="width:70px;text-align:right" inputmode="numeric" autocomplete="off" value="<%= c.qty %>" aria-label="<%= i + 1 %> 行目 (<%= c.code %>) の数"<%= dis %>></td>
+                  <td class="c-reg"><% if (c.reg_state) { %><span class="b <%= REG_BADGE[c.reg_state] || 'mute' %>"><%= REG[c.reg_state] || c.reg_state %></span><% } else { %><span class="muted">—</span><% } %></td>
+                  <td class="hint"><%= RES[c.resolution] || c.resolution %></td>
+                  <td class="acts"><%- iconBtns(i + 1, c.code) %></td>
+                </tr>
+                <% }) %>
+              </tbody>
+            </table></div>
+            <template id="comp-tpl"><tr class="comp-row"><td class="no"></td><td><input class="in mono c-code" style="width:150px" autocomplete="off" spellcheck="false" placeholder="NE コード" aria-label="NE コード"> <span class="c-name"></span></td><td><input class="in c-qty" style="width:70px;text-align:right" inputmode="numeric" autocomplete="off" value="1" aria-label="数"></td><td class="c-reg"></td><td class="hint">人</td><td class="acts"><%- iconBtns('', '') %></td></tr></template>
+            <div style="display:flex;gap:12px;align-items:center;margin-top:6px;flex-wrap:wrap"><button class="btn sm" type="button" id="comp-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>NE の商品を足す</button>
+              <span class="hint">1 行目が代表 (↑↓ で並べ替え) · 1〜<%= MAX_MAP_COMPONENTS %> 行 · 数は 1〜<%= MAX_MAP_QTY %> · NE で確かめた商品 (NE確認済み・登録済み) だけ使えます</span></div>
+          </div>
+        </section>
+
+        <% if (map && !deleted) { %>
+        <details class="danger-zone" id="del-box">
+          <summary><svg class="ic" aria-hidden="true"><use href="#i-trash"/></svg>この対応を削除する (墓標にする)</summary>
+          <div style="margin-top:10px" class="hint">構成を全部外して「削除済み」にします。行は消えずに残り、夜間の取り込みもこの出品の構成を作り直しません。同じ seller SKU はあとでもう一度登録できます。1 件ずつ・理由が要ります。</div>
+          <div class="f"><label class="lab" for="del-reason">理由<span class="req">必須</span></label>
+            <div class="ctl"><input class="in w-l" id="del-reason" maxlength="200" autocomplete="off" placeholder="なぜ削除するか (例: 3 個組の出品をやめる)"<%= dis %>><button class="btn danger" type="button" id="del" disabled>削除する</button></div></div>
+          <div class="msgline" id="del-msg" role="status" aria-live="polite"></div>
+        </details>
+        <% } %>
+      </div>
+
+      <aside class="side" aria-label="保存">
+        <section class="panel savebox hud" id="savebox" aria-labelledby="h-save" tabindex="-1">
+          <div class="mobilebar"><span class="grow"><b class="mb-n">未保存の変更はありません</b></span><button class="btn soft sm" type="button" id="savebox-toggle" aria-expanded="false" aria-controls="savebox">確認して保存</button></div>
+          <div class="panel-h" style="margin-bottom:10px"><h2 id="h-save">保存すると変わること</h2><span class="right"><span class="b mute count" id="save-count">0 件</span></span></div>
+          <ul class="diff" id="save-diff" aria-live="polite"></ul>
+          <div class="empty" id="save-empty"><% if (canSave) { %>まだ何も変えていません。<br>古い表 (miniPC の SKU マスタ) と FBA 補充には、翌朝 7:00 の写しで届きます。<% } else { %>この画面ではいま保存できません。<% } %></div>
+          <div class="impact" id="save-impact" hidden><div class="it">保存するとこうなる</div><ul id="save-impact-list"></ul></div>
+          <% if (canSave) { %>
+          <label class="lab2" for="reason">理由 (なくてもよい)</label>
+          <input class="in" id="reason" maxlength="200" autocomplete="off" placeholder="例: ギフトの中身を変えた">
+          <button class="btn pri lg block" id="save" disabled type="button" aria-keyshortcuts="Control+S">保存する <span class="kbd" aria-hidden="true">Ctrl</span><span class="kbd" aria-hidden="true">S</span></button>
+          <div class="below"><button class="btn ghost sm" type="button" id="revert" disabled><svg class="ic s" aria-hidden="true"><use href="#i-undo"/></svg>変更を元に戻す</button><span>通信が切れて押し直しても大丈夫</span></div>
+          <% } %>
+          <div class="msgline" id="msg" role="status" aria-live="polite"></div>
+          <div id="result" aria-live="polite"></div>
+        </section>
+      </aside>
+    </form>
+    <% if (map && !deleted && canSave) { %>
+    <div class="modal-bg" id="del-bg">
+      <div class="modal danger" role="alertdialog" aria-modal="true" aria-labelledby="del-t" aria-describedby="del-d">
+        <h2 id="del-t"><svg class="ic l" aria-hidden="true"><use href="#i-trash"/></svg><span class="mono"><%= sku %></span> の対応を削除します</h2>
+        <div class="hint" id="del-d" style="color:var(--text2)">構成は全部外れ、「削除済み (墓標)」になります。古い表と FBA 補充には翌朝 7:00 の写しで届きます。</div>
+        <ul><li>理由: <span id="del-why"></span></li></ul>
+        <div class="mbtns"><button class="btn ghost" type="button" id="del-stay">やめる</button><button class="btn danger" type="button" id="del-go">削除する</button></div>
+      </div>
     </div>
     <% } %>
+    <script type="application/json" id="me-amazon"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
     <% } %>
   </div>
-
-<script>
-(() => {
-  const box = document.getElementById('f');
-  if (!box) return;
-  const D = box.dataset;
-  const $ = (id) => document.getElementById(id);
-  const canSave = D.canSave === '1';
-  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  function uuid() {
-    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
-    const b = new Uint8Array(16); crypto.getRandomValues(b); b[6] = (b[6] & 15) | 64; b[8] = (b[8] & 63) | 128;
-    const h = Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
-    return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
-  }
-  // 保存 1 回に 1 つ (通信が切れて押し直しても 2 回入らない)。返事が来た後にもう一度保存するときは新しい番号
-  let requestId = uuid();
-  const versions = JSON.parse(D.versions || '{}');
-  const rowsEl = $('comp-rows');
-  function components() {
-    return Array.from(rowsEl.querySelectorAll('tr.comp-row'))
-      .map((tr) => ({ code: tr.querySelector('.c-code').value.trim(), qty: tr.querySelector('.c-qty').value.trim() }))
-      .filter((r) => r.code || r.qty);
-  }
-  function renumber() { Array.from(rowsEl.querySelectorAll('tr.comp-row')).forEach((tr, i) => { tr.querySelector('.no').textContent = String(i + 1); }); }
-  async function lookup(tr) {
-    const code = tr.querySelector('.c-code').value.trim();
-    const cell = tr.querySelector('.c-name');
-    if (!code) { cell.textContent = ''; return; }
-    try {
-      const r = await fetch(D.base + '/api/lookup?code=' + encodeURIComponent(code), { headers: { Accept: 'application/json' } });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok || !j.ok) { cell.textContent = j.error || '見つかりません'; return; }
-      cell.textContent = j.item.name + (j.item.kind === 'exception' ? ' (例外の SKU = 構成品にできません)' : '');
-    } catch (e) { cell.textContent = '引き当てできません (通信)'; }
-  }
-  rowsEl.addEventListener('click', (ev) => {
-    const b = ev.target.closest('button[data-act]'); if (!b || b.disabled) return;
-    const tr = b.closest('tr');
-    if (b.dataset.act === 'del') tr.remove();
-    if (b.dataset.act === 'up' && tr.previousElementSibling) tr.parentNode.insertBefore(tr, tr.previousElementSibling);
-    if (b.dataset.act === 'down' && tr.nextElementSibling) tr.parentNode.insertBefore(tr.nextElementSibling, tr);
-    renumber();
-  });
-  rowsEl.addEventListener('change', (ev) => { if (ev.target.classList.contains('c-code')) lookup(ev.target.closest('tr')); });
-  const addBtn = $('comp-add');
-  if (addBtn) addBtn.addEventListener('click', () => {
-    rowsEl.appendChild($('comp-tpl').content.firstElementChild.cloneNode(true));
-    renumber();
-    rowsEl.lastElementChild.querySelector('.c-code').focus();
-  });
-  function setMsg(id, text, cls) { const m = $(id); m.className = 'msg ' + (cls || ''); m.textContent = text || ''; }
-  function showResult(j) {
-    const li = (a) => a.map((x) => '<li>' + esc(x) + '</li>').join('');
-    if (j.no_change) { $('result').innerHTML = '<div class="result">変わった項目がありません (何も保存していません)。</div>'; return; }
-    $('result').innerHTML = '<div class="result"><b>' + (j.state === 'deleted' ? '削除 (墓標に) しました' : '保存しました') + (j.replayed ? ' (前に保存した結果)' : '') + '</b>'
-      + (j.created ? '<div>新しい対応を作りました' + (j.listing_created ? ' (出品も作りました)' : '') + '</div>' : '')
-      + (j.revived ? '<div>削除済みの seller SKU をもう一度登録しました</div>' : '')
-      + (j.name ? '<div>名前: ' + esc(j.name.from) + ' → ' + esc(j.name.to) + '</div>' : '')
-      + (Array.isArray(j.components) ? '<div>構成: ' + esc(j.components.map((c) => c.code + '×' + c.qty).join(', ')) + '</div>' : '')
-      + (Array.isArray(j.removed) ? '<div>外した構成: ' + esc(j.removed.map((c) => c.code + '×' + c.qty).join(', ') || 'なし') + '</div>' : '')
-      + (j.notes && j.notes.length ? '<ul>' + li(j.notes) + '</ul>' : '')
-      + '<button type="button" class="btn-sm" id="reload">表示し直す</button></div>';
-    $('reload').addEventListener('click', () => location.reload());
-  }
-  function showError(j, status) {
-    const reopen = ['version_conflict', 'request_id_reused', 'retry', 'norm_collision', 'already_deleted'].includes(j.reason);
-    $('result').innerHTML = '<div class="result"><b style="color:#c92a2a">' + esc(j.error || ('HTTP ' + status)) + '</b>'
-      + (reopen ? '<div><button type="button" class="btn-sm" id="reload">画面を開き直す</button></div>' : '') + '</div>';
-    const b = $('reload'); if (b) b.addEventListener('click', () => location.reload());
-    return reopen;
-  }
-  async function post(path, body, btn, msgId) {
-    btn.disabled = true; setMsg(msgId, '保存しています…'); $('result').innerHTML = '';
-    let r, j;
-    try {
-      r = await fetch(D.base + path, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) });
-      j = await r.json().catch(() => ({}));
-    } catch (e) {
-      btn.disabled = false; setMsg(msgId, '通信できませんでした。もう一度押してください (同じ保存は 2 回入りません)', 'err'); return;
-    }
-    if (r.ok && j.ok) { setMsg(msgId, '', 'ok'); showResult(j); if (j.no_change) { requestId = uuid(); btn.disabled = false; } return; }
-    setMsg(msgId, '', 'err');
-    const reopen = showError(j, r.status);
-    requestId = uuid();   // 返事が来た = この番号の保存は終わった。直してもう一度保存するときは新しい番号
-    if (!reopen) btn.disabled = false;
-  }
-  const saveBtn = $('save');
-  if (saveBtn && canSave) saveBtn.addEventListener('click', () => post('/api/amazon/save',
-    { request_id: requestId, seller_sku: D.sku, name: $('name').value, components: components(), reason: $('reason').value, seen: { versions } }, saveBtn, 'msg'));
-  const delBtn = $('del');
-  if (delBtn && canSave) delBtn.addEventListener('click', () => {
-    if (!window.confirm('seller SKU ' + D.sku + ' の対応を削除 (墓標に) します。構成は全部外れます。よろしいですか')) return;
-    post('/api/amazon/delete', { request_id: requestId, seller_sku: D.sku, reason: $('del-reason').value, seen: { versions } }, delBtn, 'del-msg');
-  });
-})();
-</script>
+  <%- include('_footer') %>
+  <% if (page) { %><script src="<%= base %>/public/me-amazon.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>

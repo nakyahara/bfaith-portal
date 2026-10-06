@@ -29,6 +29,9 @@
  *  24 FBA (JP) の在庫 (参考・Company DB の在庫の日次): 一覧の列と見出しの時刻・1 × 1 の出品だけ・「—」と 0・単品の画面の内訳とまとめ売り / セットの出品・古い (26 時間) / 読めない (権限なし)・流し直しで戻る (10/5)
  *  25 売れた数 (参考・商品管理リストの公開の回): 一覧の列と「M/D まで」・セット / 無い商品は「—」・単品の画面の FBA / FBA 以外・モール別・古い / 読めない (10/5)
  *  26 区分の列・コードのコピーのボタン (クリップボード・知らせ・行を開かない・キーボード)・全部コピー (絞った全件)・CSV のリンク (ダウンロード)・区分の順 (10/5)
+ *  35〜44 第 2 段 (10/5・#1628): 新商品の登録 (単品・セット)・Amazon SKU・NE 登録の CSV・変更の記録 = 未保存 (data-dirty-field だけ)・離れるときの確認・保存 → 読み直し / できた商品の画面へ・
+ *        削除は 1 回だけ確かめる・申告はファイルを落として sha256 を照合・1440 / 1280 / 1024 / 150% で横にはみ出さない
+ *        (41〜46 = 構成品の照合・カードを作らないときの欄・確かめ直しの上限・Yahoo! の残値と誤りの欄・Amazon の変わらない保存)
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -919,6 +922,474 @@ await ta('[23] 詳細検索の長い条件 (#1620 Codex R1 M2): 本物の HTTP �
   await Promise.all([p.waitForNavigation(), p.click('#adv-form button[type="submit"]')]);
   assert.equal(new URL(p.url()).searchParams.get('codes').replace(/\r/g, ''), 'k001\nk002');
 });
+
+// ─── 第 2 段 (10/5): 新商品の登録・Amazon SKU・NE 登録の CSV・変更の記録 を新しいデザインに ───
+const skuRow = async (code) => (await pg.query('select s.name, s.standard_price_jpy::int as price, s.tax_rate::float8 as tax, s.shipping_code from core.skus s where s.code = $1', [code])).rows[0];
+const mapOf = async (sku) => (await pg.query('select m.name, m.state from core.amazon_sku_maps m where m.seller_sku = $1', [sku])).rows[0];
+
+await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろうまで押せない)・① を押すとその欄へ・コードをその場で確かめる・理由は数えない・離れるときの確認 (左の列・種類の札)・Ctrl+S で下書き → できた商品の画面へ (知らせ・戻る 1 回で一覧)', async (p) => {
+  await p.goto(B + '/');
+  await Promise.all([p.waitForNavigation(), p.click('.ph-actions a:has-text("新しい単品")')]);
+  assert.match(p.url(), /new\?kind=single$/);
+  assert.equal(await dirty(p), 0);
+  assert.match(await p.textContent('#remain'), /あと\s*5\s*つ/);
+  assert.equal(await p.isDisabled('#save'), true);
+  assert.match(await p.textContent('#save'), /あと 5 つ: 商品コード/);
+  await p.fill('#reason', '理由だけ');
+  assert.equal(await dirty(p), 0, '保存の理由は数えない');
+  await p.click('#checklist button:has-text("税率")');
+  assert.equal(await p.evaluate(() => !!document.activeElement.closest('#f-tax_rate')), true, '① の税率を押すと税率の欄へ: ' + await p.evaluate(() => document.activeElement.outerHTML.slice(0, 120)));
+  // コードをその場で確かめる (もうある・大文字 = 使えない)
+  await p.fill('#code', 's001');
+  await p.waitForSelector('#code-msg.err');
+  assert.match(await p.textContent('#code-msg'), /もう Company DB にあります/);
+  await p.fill('#code', 'UI-NEW');
+  await p.waitForSelector('#code-msg.err');
+  assert.match(await p.textContent('#code-msg'), /大文字は使えません/);
+  await p.fill('#code', 'ui-new-1');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', 'UI 新商品 1');
+  await p.fill('#f-standard_price', '1280');
+  assert.match(await p.textContent('#save'), /あと 2 つ: 税率/);
+  await p.click('#f-tax_rate button[data-v="0.08"]');
+  await p.selectOption('#shipping', 'S02');
+  assert.match(await p.textContent('#remain'), /下書きを保存できます/);
+  assert.equal(await p.isDisabled('#save'), false);
+  assert.equal(await p.locator('#jump a.todo').count(), 0, '飛び先の帯に黄色が残らない');
+  // 出品カードを作らない = ③ を出さない (product-hub につながない)
+  await p.click('#card-create button[data-v="0"]');
+  assert.equal(await p.isHidden('#card-fields'), true);
+  assert.match(await p.textContent('#checklist'), /カードを作らない/);
+  // ② (NE 登録の CSV まで) も入れる
+  await p.fill('#cost-jpy', '500');
+  await p.selectOption('#f-primary_supplier', '0001');
+  assert.ok(await dirty(p) >= 6, String(await dirty(p)));
+  // 離れるときの確認 (左の列・種類の札)
+  await p.click('.rail a[aria-label="つかいかた"]');
+  assert.equal(await p.locator('#leave-bg.on').count(), 1);
+  assert.match(await p.textContent('#leave-list'), /名前: UI 新商品 1/);
+  await p.click('#leave-stay');
+  await p.click('a.kindcard[href="?kind=set"]');
+  assert.equal(await p.locator('#leave-bg.on').count(), 1, '種類を変える (画面が変わる) も聞く');
+  await p.click('#leave-stay');
+  assert.match(p.url(), /new\?kind=single$/);
+  // Ctrl+S = 下書きを保存 → できた商品の画面へ (履歴を置き換える)・上に知らせ
+  await Promise.all([p.waitForURL(/\/sku\/ui-new-1$/), p.keyboard.press('Control+s')]);
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /保存しました/);
+  assert.deepEqual(await skuRow('ui-new-1'), { name: 'UI 新商品 1', price: 1280, tax: 0.08, shipping_code: 'S02' });
+  assert.match(await p.content(), /下書きです/);
+  await p.goBack();
+  await p.waitForSelector('#list-tbl');
+  assert.match(p.url(), /master-edit\/$/, '戻る 1 回で一覧 (入力の途中の画面へは戻らない)');
+});
+
+await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない・構成品のコードで名前と計算の見込み (8% と 10% = 8%・分類は小さい番号・原価の合計)・並べ替えで読み上げの名前・あと N つ', async (p) => {
+  await p.goto(B + '/new?kind=set');
+  assert.equal(await dirty(p), 0, '空の 2 行は数えない');
+  assert.match(await p.textContent('#remain'), /あと\s*5\s*つ/);
+  const rows = p.locator('#comp-rows tr.comp-row');
+  await rows.nth(0).locator('.c-code').fill('s001');
+  await rows.nth(0).locator('.c-code').press('Enter');
+  assert.equal(await p.evaluate(() => document.activeElement.classList.contains('c-qty')), true, 'コードで Enter = 数の欄へ (保存しない)');
+  await rows.nth(1).locator('.c-code').fill('s003');
+  await rows.nth(1).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /単品 3/.test(document.querySelectorAll('#comp-rows .c-name')[1].textContent) && /単品 1/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
+  assert.match(await p.textContent('#t-tax'), /8%[\s\S]*混ざって/);
+  assert.match(await p.textContent('#t-sales'), /1\s*自社/);
+  assert.match(await p.textContent('#t-cost'), /150\s*円/);
+  assert.equal(await dirty(p), 1, '構成は 1 件 (中身どうし)');
+  await rows.nth(1).locator('button[data-act="up"]').click();
+  assert.equal(await rows.nth(0).locator('.c-qty').getAttribute('aria-label'), '1 行目 (s003) の数');
+  assert.match(await p.textContent('#remain'), /あと\s*4\s*つ/);
+  assert.equal(await p.isDisabled('#save'), true);
+  // 売上分類の上書き (#1628 Codex R1 M2): 構成品から導ける (3 と 1 = 1) 間は押せない
+  const ovr = p.locator('#f-set_sales_class_override');
+  assert.equal(await ovr.isDisabled(), true, '導ける間は上書きを押せない');
+  assert.match(await p.textContent('#override-hint'), /導けるので、上書きはできません/);
+  // 売上分類が未入力の構成品 (ui-new-1 = [35] で分類を入れずに登録) = 導けない = 上書きで決める
+  await rows.nth(0).locator('.c-code').fill('ui-new-1');
+  await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /UI 新商品 1/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
+  assert.equal(await ovr.isDisabled(), false, '導けないときは上書きできる');
+  assert.match(await p.textContent('#t-sales'), /決まりません/);
+  await p.click('#sec-comp details.more > summary');
+  await ovr.selectOption('2');
+  assert.match(await p.textContent('#t-sales'), /2\s*取引先限定[\s\S]*導けないので/);
+  // 導ける構成に戻す = サーバーが断る形 = ① で止める (保存のボタンも)
+  await rows.nth(0).locator('.c-code').fill('s003');
+  await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /単品 3/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
+  assert.match(await p.textContent('#t-sales'), /上書きできません/);
+  assert.match(await p.textContent('#checklist'), /売上分類の上書きを空にする/);
+  assert.equal(await ovr.isDisabled(), false, '入れてある上書きは空にできる');
+  await ovr.selectOption('');
+  assert.equal(await ovr.isDisabled(), true);
+  assert.ok(!/売上分類の上書きを空にする/.test(await p.textContent('#checklist')));
+  // 照合中は保存しない (#1628 Codex R2 M1): 導けない構成 + 上書き (保存できる) から、導ける構成品へ打ち直した直後 = 古い答えで保存しない
+  const newCalls = [];
+  p.on('request', (rq) => { if (/\/api\/new$/.test(rq.url())) newCalls.push(rq.url()); });
+  await p.fill('#code', 'ui-set-race');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', '照合中の試験');
+  await p.fill('#f-standard_price', '1500');
+  await p.selectOption('#shipping', 'S02');
+  await rows.nth(0).locator('.c-code').fill('ui-new-1');
+  await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /UI 新商品 1/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
+  await ovr.selectOption('2');
+  assert.equal(await p.isDisabled('#save'), false, '導けない構成 + 上書き = 保存できる');
+  await rows.nth(0).locator('.c-code').fill('s003');   // 欄を離れない (照合は打つのが止まってから)
+  assert.equal(await p.isDisabled('#save'), true, '打ち直した直後 = 照合中 = 押せない');
+  assert.match(await p.textContent('#checklist'), /構成品を確かめています/);
+  await p.keyboard.press('Control+s');
+  await p.waitForFunction(() => /単品 3/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
+  assert.deepEqual(newCalls, [], '照合中の Ctrl+S で送らない');
+  assert.match(await p.textContent('#checklist'), /売上分類の上書きを空にする/, '照合の後は導ける = 上書きを空にするまで止める');
+  assert.equal(await p.isDisabled('#save'), true);
+  await ovr.selectOption('');
+  assert.equal(await p.isDisabled('#save'), false, '上書きを空にすれば保存できる');
+});
+
+await ta('[40] 新商品の登録 (#1628 Codex R2 M2): カードを作らないでも値の残る欄は隠さない (保存のときに確かめる)・カードの欄の誤りは開いてその欄へ・空にすると畳む', async (p) => {
+  await p.goto(B + '/new?kind=single');
+  await p.fill('#amazon-url', 'not-a-url');
+  await p.click('#card-create button[data-v="0"]');
+  assert.equal(await p.isHidden('#card-fields'), false, '値が残っている = 隠さない');
+  assert.match(await p.textContent('#card-off-note'), /要らなければ空にしてください/);
+  await p.fill('#code', 'ui-nocard-1');
+  await p.waitForSelector('#code-msg.ok, #code-msg.err, #code-msg.warn');
+  assert.match(await p.getAttribute('#code-msg', 'class'), /ok/, await p.textContent('#code-msg'));
+  await p.fill('#f-name', 'カードの試験');
+  await p.fill('#f-standard_price', '900');
+  await p.click('#f-tax_rate button[data-v="0.1"]');
+  await p.selectOption('#shipping', 'S01');
+  await p.click('#save');
+  await p.waitForSelector('.result.err');
+  assert.match(await p.textContent('.result.err'), /URL/);
+  assert.equal(await p.isHidden('#card-fields'), false);
+  assert.equal(await p.locator('[data-row="card.amazon_url"].err').count(), 1, '誤りの欄に印');
+  assert.equal(await active(p), 'amazon-url', '誤りの欄へ');
+  assert.equal(await skuRow('ui-nocard-1'), undefined, '登録していない');
+  await p.fill('#amazon-url', '');
+  await p.focus('#f-name');
+  await p.waitForFunction(() => document.getElementById('card-fields').hidden === true);
+  assert.match(await p.textContent('#card-off-note'), /カードは作りません \(保存しても/);
+});
+
+await ta('[41] 新商品 (セット・#1628 Codex R3 M1 / L3): 構成品の照合が 503 = 答えにせず 3 秒後にもう一度 (直れば保存の止めが外れる)・A → B → A と打ち直したら前の A の答えを使わない', async (p) => {
+  let n503 = 0;
+  await p.route('**/api/lookup?code=k001', async (route) => {
+    if (n503 === 0) { n503++; await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'Company DB につながりません' }) }); }
+    else await route.continue();
+  });
+  await p.goto(B + '/new?kind=set');
+  const rows = p.locator('#comp-rows tr.comp-row');
+  await rows.nth(0).locator('.c-code').fill('k001');
+  await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /3 秒後にもう一度/.test(document.querySelector('#comp-rows .c-name').textContent));
+  assert.match(await p.textContent('#checklist'), /構成品を確かめています/, '503 は「確かめている」のまま (できないコードと決めない)');
+  assert.ok(!/構成品にできないコード/.test(await p.textContent('#checklist')));
+  await p.waitForFunction(() => /国産 はちみつ/.test(document.querySelector('#comp-rows .c-name').textContent), null, { timeout: 10000 });
+  assert.equal(n503, 1);
+  assert.ok(!/構成品を確かめています|構成品にできないコード/.test(await p.textContent('#checklist')), '直ったら止めが外れる');
+  // A → B → A (欄を離れずに 0.5 秒以内) = 前の A の答えは捨てる (① で止まる)
+  await rows.nth(0).locator('.c-code').fill('k002');
+  await rows.nth(0).locator('.c-code').fill('k001');
+  assert.match(await p.textContent('#checklist'), /構成品を確かめています/, '打ち直した瞬間に古い答えを捨てる');
+  await p.waitForFunction(() => /国産 はちみつ/.test(document.querySelector('#comp-rows .c-name').textContent));
+  assert.ok(!/構成品を確かめています/.test(await p.textContent('#checklist')));
+});
+
+await ta('[42] 新商品 (#1628 Codex R3 M2): 「作らない」の理由の欄は、カードを作らないときも出す・理由が無くて断られたら理由の欄へ', async (p) => {
+  await p.goto(B + '/new?kind=single');
+  await p.click('#set-plan button[data-v="none"]');
+  await p.click('#card-create button[data-v="0"]');
+  assert.equal(await p.isHidden('#card-fields'), false);
+  assert.equal(await p.isHidden('#row-set-reason'), false, '作らない理由の欄も出す');
+  await p.fill('#code', 'ui-setplan-1');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', 'セット判断の試験');
+  await p.fill('#f-standard_price', '700');
+  await p.click('#f-tax_rate button[data-v="0.1"]');
+  await p.selectOption('#shipping', 'S01');
+  await p.click('#save');
+  await p.waitForSelector('.result.err');
+  assert.match(await p.textContent('.result.err'), /作らない理由を選んでください/);
+  assert.equal(await p.locator('#row-set-reason.err').count(), 1, '理由の欄に印');
+  assert.equal(await active(p), 'set-reason', '理由の欄へ');
+  assert.equal(await skuRow('ui-setplan-1'), undefined);
+  // 「まだ決めない」に戻して空にすれば畳む
+  await p.click('#set-plan button[data-v=""]');
+  await p.focus('#f-name');
+  await p.waitForFunction(() => document.getElementById('card-fields').hidden === true);
+});
+
+await ta('[43] 新商品 (セット・#1628 Codex R4 M1): 確かめ直しは 3 回まで → 「もう一度確かめる」(保存は止めたまま)・401/403 は自動で繰り返さない・行を消したら確かめ直しも止まる', async (p) => {
+  await p.addInitScript(() => { window.__meRetryWaits = [150, 300, 450]; });   // 本物は 3 秒・10 秒・30 秒
+  const hits = { k002: 0, k003: 0, k004: 0 };
+  let k002Down = true;
+  await p.route('**/api/lookup?code=*', async (route) => {
+    const code = new URL(route.request().url()).searchParams.get('code');
+    if (code in hits) hits[code]++;
+    if (code === 'k002' && k002Down) return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'Company DB につながりません' }) });
+    if (code === 'k003') { await new Promise((r) => setTimeout(r, 700)); try { await route.fulfill({ status: 503, contentType: 'application/json', body: '{}' }); } catch { /* 画面が止めた (行を消した) */ } return; }
+    if (code === 'k004') return route.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'このアプリの権限がありません' }) });
+    return route.continue();
+  });
+  await p.goto(B + '/new?kind=set');
+  const rows = p.locator('#comp-rows tr.comp-row');
+  await rows.nth(0).locator('.c-code').fill('k002');
+  await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForSelector('#comp-rows tr.comp-row:nth-child(1) button[data-act="relookup"]', { timeout: 10000 });
+  assert.equal(hits.k002, 4, '最初の 1 回 + 確かめ直し 3 回で止まる');
+  await p.waitForTimeout(1200);
+  assert.equal(hits.k002, 4, '上限の後は自動で聞かない');
+  assert.match(await p.textContent('#checklist'), /構成品を確かめています/, '保存は止めたまま');
+  k002Down = false;
+  await rows.nth(0).locator('button[data-act="relookup"]').click();
+  await p.waitForFunction(() => /ハチミツ/.test(document.querySelector('#comp-rows .c-name').textContent));
+  assert.ok(!/構成品を確かめています/.test(await p.textContent('#checklist')), '「もう一度確かめる」で直る');
+  // 401/403 = 自動で繰り返さない (ログインし直す・開き直す)
+  await rows.nth(1).locator('.c-code').fill('k004');
+  await rows.nth(1).locator('.c-code').press('Tab');
+  await p.waitForSelector('#comp-rows tr.comp-row:nth-child(2) button[data-act="relookup"]');
+  assert.match(await rows.nth(1).locator('.c-name').textContent(), /ログインし直すか/);
+  await p.waitForTimeout(800);
+  assert.equal(hits.k004, 1, '403 は自動で繰り返さない');
+  // 返事待ちの行を消したら、遅れて来た返事で確かめ直しを始めない (#1628 Codex R4 M1)
+  await rows.nth(1).locator('.c-code').fill('k003');
+  await rows.nth(1).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /引き当てています/.test(document.querySelectorAll('#comp-rows .c-name')[1].textContent));
+  await rows.nth(1).locator('button[data-act="del"]').click();
+  await p.waitForTimeout(2000);
+  assert.equal(hits.k003, 1, '消した行は確かめ直さない');
+});
+
+await ta('[44] 新商品 (#1628 Codex R4 M2): カードを作らない + Yahoo! の欄だけ値がある = 「Yahoo! の欄も確かめる」と出す・Yahoo!売価 0 で保存 = その欄を開いて止める', async (p) => {
+  await p.goto(B + '/new?kind=single');
+  await p.click('#sec-yahoo > summary');
+  await p.fill('#y-price', '0');
+  await p.click('#sec-yahoo > summary');   // 畳む
+  await p.click('#card-create button[data-v="0"]');
+  assert.equal(await p.isHidden('#card-fields'), true, 'カードの欄は空 = 畳む');
+  assert.match(await p.textContent('#card-off-note'), /「Yahoo! を楽天と変えるときだけ」の欄に入れた値は保存のときに確かめます/);
+  await p.fill('#code', 'ui-yahoo-1');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', 'Yahoo! の試験');
+  await p.fill('#f-standard_price', '800');
+  await p.click('#f-tax_rate button[data-v="0.1"]');
+  await p.selectOption('#shipping', 'S01');
+  await p.click('#save');
+  assert.match(await p.textContent('#msg'), /Yahoo!売価は 1 円以上/);
+  assert.equal(await p.evaluate(() => document.getElementById('sec-yahoo').open), true, 'Yahoo! の欄を開く');
+  assert.equal(await active(p), 'y-price', 'その欄へ');
+  assert.equal(await skuRow('ui-yahoo-1'), undefined);
+  await p.fill('#y-price', '');
+  await p.focus('#f-name');
+  await p.waitForFunction(() => /保存しても product-hub/.test(document.getElementById('card-off-note').textContent));
+});
+
+await ta('[37] Amazon SKU (10/5): 新しい対応 = 名前で未保存 1 件 (理由は数えない)・離れるときの確認・Ctrl+S → 読み直し (知らせ)・削除の理由は数えない・削除は 1 回だけ確かめる (Esc で戻る)・墓標・変更の記録のカード', async (p) => {
+  await p.goto(B + '/amazon/');
+  assert.match(await p.textContent('#h-um'), /売れたのに対応が無い SKU/);
+  await p.fill('#open-sku', 'pr-k001-b');
+  await Promise.all([p.waitForNavigation(), p.press('#open-sku', 'Enter')]);
+  assert.match(p.url(), /amazon\/sku\?sku=pr-k001-b$/);
+  assert.match(await p.textContent('.idrow'), /対応なし/);
+  assert.equal(await dirty(p), 0);
+  assert.equal(await p.inputValue('#comp-rows tr.comp-row .c-code'), 'k001', '今の構成 (夜間の取り込み) から始まる');
+  assert.match(await p.textContent('#comp-rows tr.comp-row'), /代表/);
+  await p.fill('#name', 'UI の出品');
+  assert.equal(await dirty(p), 1);
+  assert.match(await p.textContent('#save-diff'), /名前 \(社内\)[\s\S]*UI の出品/);
+  assert.match(await p.textContent('#save-impact-list'), /新しく作ります[\s\S]*07:00|新しく作ります[\s\S]*7:00/);
+  await p.fill('#reason', 'UI の試験');
+  assert.equal(await dirty(p), 1, '保存の理由は数えない');
+  await p.click('.rail a[aria-label="商品・セット"]');
+  assert.equal(await p.locator('#leave-bg.on').count(), 1);
+  await p.click('#leave-stay');
+  await p.keyboard.press('Control+s');
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /保存しました[\s\S]*新しい対応を作りました/);
+  assert.deepEqual(await mapOf('pr-k001-b'), { name: 'UI の出品', state: 'active' });
+  assert.equal(await dirty(p), 0);
+  assert.equal(await p.inputValue('#name'), 'UI の出品', '読み直した後の値');
+  // 削除 = 理由を入れると押せる・未保存には数えない・1 回だけ確かめる
+  await p.click('#del-box > summary');
+  assert.equal(await p.isDisabled('#del'), true);
+  await p.fill('#del-reason', 'UI の試験で消す');
+  assert.equal(await dirty(p), 0, '削除の理由は数えない');
+  assert.equal(await p.isDisabled('#del'), false);
+  await p.click('#del');
+  assert.equal(await p.locator('#del-bg.on').count(), 1);
+  assert.match(await p.textContent('#del-why'), /UI の試験で消す/);
+  assert.equal(await active(p), 'del-stay', '確かめの窓は「やめる」から');
+  await p.keyboard.press('Escape');
+  assert.equal(await p.locator('#del-bg.on').count(), 0);
+  assert.equal(await active(p), 'del', 'Esc で押した所へ戻る');
+  assert.equal((await mapOf('pr-k001-b')).state, 'active', 'やめたので消していない');
+  await p.click('#saved-note-close');
+  await p.click('#del');
+  await p.click('#del-go');
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /削除 \(墓標に\) しました/);
+  assert.equal((await mapOf('pr-k001-b')).state, 'deleted');
+  assert.match(await p.content(), /削除済み \(墓標\) です/);
+  await Promise.all([p.waitForNavigation(), p.click('.ph-actions a:has-text("変更の記録")')]);
+  assert.ok(await p.locator('.hcard').count() >= 2, '保存 1 回 = 1 枚');
+  assert.match(await p.textContent('#hist-cards'), /UI の試験で消す/);
+  await p.click('#hist-filter button[data-hf="load"]').catch(() => {});
+  // 対応の無い seller SKU を、夜間の取り込みの名前・構成のまま (変えた欄 0) 新しく登録できる (#1628 Codex R1 M1)
+  await pg.query("update core.listings set title = 'はちみつ 3 個組' where listing_code = 'pr-k001-3p'");
+  await p.goto(B + '/amazon/sku?sku=pr-k001-3p');
+  assert.equal(await dirty(p), 0);
+  assert.equal(await p.inputValue('#name'), 'はちみつ 3 個組');
+  assert.equal(await p.isDisabled('#save'), false, '初期値のままでも保存できる');
+  assert.match(await p.textContent('#save-impact-list'), /新しく作ります \(今の名前・構成のまま\)/);
+  assert.match(await p.textContent('#save-empty'), /このまま保存すると|この名前・構成のまま保存すると/);
+  await p.click('#save');
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /新しい対応を作りました/);
+  assert.deepEqual(await mapOf('pr-k001-3p'), { name: 'はちみつ 3 個組', state: 'active' });
+  assert.equal(await p.isDisabled('#save'), true, '作った後は変えた欄が無ければ押せない');
+});
+
+await ta('[38] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウンロード) → 申告の書きかけ = 未保存 (離れるときの確認) → 違うファイルは照合で止める → 同じファイルで申告 → 読み直し', async (p, ctx) => {
+  process.env.MASTER_DECISION_APPROVERS = 'naka@test';
+  // 今日の照合の回と NE の元のコード (前からある商品 = NE にある / ui-new-1 = 無い)
+  const run = 'mc_' + new Date().toISOString().replace(/[-:.]/g, '') + '_abcdef';
+  await pg.query('insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, now(), 0)', [run]);
+  const codes = (await pg.query("select code_norm from core.skus where code_norm <> 'ui-new-1'")).rows.map((r) => r.code_norm);
+  await pg.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: run, entries: codes.map((c) => ({ code_norm: c, kind: 'product', state: 'ok', ne_code: c, spellings: [c] })) })]);
+  try {
+    await p.goto(B + '/reg-csv');
+    const pick = p.locator('input.pick[value="ui-new-1"]');
+    assert.equal(await pick.isDisabled(), false, await p.textContent('#cands'));
+    const buildBtn = p.locator('button[data-act="build"][data-kind="products"]');
+    assert.equal(await buildBtn.isDisabled(), true, '0 件は押せない');
+    await pick.check();
+    assert.match(await buildBtn.textContent(), /選んだ単品 1 件/);
+    assert.equal(await dirty(p), 0, '選ぶだけは未保存にしない');
+    await buildBtn.click();
+    await p.waitForSelector('.saved-note:has-text("を作りました")');
+    const card = p.locator('article.exp').first();
+    assert.match(await card.textContent(), /配る \(ダウンロード\)/);
+    const [dl] = await Promise.all([p.waitForEvent('download'), card.locator('button[data-act="issue"]').click()]);
+    const file = path.join(DATA_TMP, 'ui-reg.csv');
+    await dl.saveAs(file);
+    await p.waitForSelector('.saved-note:has-text("配りました")');
+    const c2 = p.locator('article.exp').first();
+    await c2.locator('button[data-act="show-declare"]').first().click();
+    await c2.locator('input[name="ne_message"]').fill('1件成功しました。');
+    assert.equal(await dirty(p), 1, '申告の書きかけ = 未保存');
+    await p.click('.rail a[aria-label="つかいかた"]');
+    assert.equal(await p.locator('#leave-bg.on').count(), 1);
+    assert.match(await p.textContent('#leave-list'), /の申告 \(書きかけ\)/);
+    await p.click('#leave-stay');
+    const bad = path.join(DATA_TMP, 'ui-bad.csv');
+    fs.writeFileSync(bad, 'not the file');
+    await c2.locator('input[data-sha-file]').setInputFiles(bad);
+    await p.waitForSelector('[data-drop].bad');
+    await c2.locator('label.choice.r-ok').click();
+    await c2.locator('button[data-act="declare"]').click();
+    assert.match(await c2.locator('[data-drawer="declare"] [data-msg]').textContent(), /sha256 が合いません/);
+    await c2.locator('input[data-sha-file]').setInputFiles(file);
+    await p.waitForSelector('[data-drop].done');
+    // いまの時刻を入れる (#1628 Codex R1 M3): 秒まで・今の時刻 = 配った直後 (配った時刻の秒が 0 でない) でも断られない
+    await c2.locator('[data-now]').click();
+    const imp = await c2.locator('input[name="imported_at"]').inputValue();
+    assert.match(imp, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/, '秒まで入る: ' + imp);
+    assert.ok(Math.abs(new Date(imp).getTime() - Date.now()) < 5000, imp);
+    await c2.locator('button[data-act="declare"]').click();
+    await p.waitForSelector('.saved-note:has-text("申告しました")');
+    const st = (await pg.query("select r.state from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id where s.code_norm = 'ui-new-1'")).rows[0].state;
+    assert.equal(st, 'ne_pending');
+    const att = (await pg.query('select imported_at, declared_at from ops.ne_reg_attempts order by attempt_id desc limit 1')).rows[0];
+    assert.ok(att.imported_at && new Date(att.imported_at) <= new Date(att.declared_at), JSON.stringify(att));
+    assert.equal(await dirty(p), 0);
+  } finally { delete process.env.MASTER_DECISION_APPROVERS; }
+});
+
+await ta('[45] 新商品 (#1628 Codex R5 L1): Yahoo! の 1 行に 2 つある欄 (佐川・path) の誤り = 畳んだ Yahoo! の欄を開き、その欄に印を付けてそこへ', async (p) => {
+  await p.goto(B + '/new?kind=single');
+  await p.fill('#code', 'ui-yahoo-2');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', 'Yahoo! の欄の試験');
+  await p.fill('#f-standard_price', '800');
+  await p.click('#f-tax_rate button[data-v="0.1"]');
+  await p.selectOption('#shipping', 'S01');
+  for (const [id, val, re] of [['y-price-sagawa', 'abc', /Yahoo!売価 \(佐川\)/], ['y-path', 'a\tb', /Yahoo!path/]]) {
+    await p.evaluate(() => { document.getElementById('sec-yahoo').open = true; });
+    await p.fill('#' + id, val);
+    await p.evaluate(() => { document.getElementById('sec-yahoo').open = false; });   // 畳む
+    assert.equal(await p.evaluate(() => document.getElementById('sec-yahoo').open), false);
+    await p.click('#save');
+    await p.waitForSelector('.result.err');
+    assert.match(await p.textContent('.result.err'), re);
+    assert.equal(await p.evaluate(() => document.getElementById('sec-yahoo').open), true, id + ': Yahoo! の欄を開く');
+    assert.equal(await active(p), id, id + ': その欄へ');
+    assert.equal(await p.evaluate((x) => document.getElementById(x).closest('.f').classList.contains('err'), id), true, id + ': 誤りの印');
+    await p.fill('#' + id, '');
+    await p.evaluate(() => { document.getElementById('result').innerHTML = ''; document.querySelectorAll('.f.err').forEach((x) => x.classList.remove('err')); });
+  }
+  assert.equal(await skuRow('ui-yahoo-2'), undefined);
+});
+
+await ta('[46] Amazon SKU (#1628 Codex R5 L2): 変わった項目が無い保存 (数 3 → 03) の後は読み直す = その後に構成を変えて「元に戻す」で未保存 0', async (p) => {
+  await p.goto(B + '/amazon/sku?sku=pr-k001-3p');
+  const qty = p.locator('#comp-rows tr.comp-row .c-qty').first();
+  assert.equal(await qty.inputValue(), '3');
+  await qty.fill('03');
+  assert.equal(await dirty(p), 1);
+  await p.click('#save');
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /変わった項目がありません/);
+  assert.equal(await p.locator('#comp-rows tr.comp-row .c-qty').first().inputValue(), '3', '読み直した = サーバーの値');
+  assert.equal(await dirty(p), 0);
+  await p.locator('#comp-rows tr.comp-row .c-qty').first().fill('5');
+  assert.equal(await dirty(p), 1);
+  await p.click('#revert');
+  assert.equal(await p.locator('#comp-rows tr.comp-row .c-qty').first().inputValue(), '3');
+  assert.equal(await dirty(p), 0, '元に戻したら未保存 0');
+  assert.equal(await p.isDisabled('#save'), true);
+});
+
+// 第 2 段の画面の幅: 1440 / 1280 / 1024 と 1280×720 の 150% で横にはみ出さない・板からはみ出さない・構成の表は横に送る囲いの中。
+// MASTER_EDIT_UI_SHOTS_STAGE2=フォルダ を付けると 1440 / 1280 / 1024 の写しを残す (目で見る用。MASTER_EDIT_UI_SHOTS2 は [20] / [24] の写しで使っている)
+const SHOTS2 = process.env.MASTER_EDIT_UI_SHOTS_STAGE2 || '';
+const fillNew = async (p) => { await p.fill('#code', 'shot-new-1'); await p.waitForSelector('#code-msg.ok'); await p.fill('#f-name', '国産 はちみつ レモン 500g'); await p.fill('#f-standard_price', '1680'); await p.click('#f-tax_rate button[data-v="0.08"]'); };
+const fillSet = async (p) => {
+  const rows = p.locator('#comp-rows tr.comp-row');
+  await rows.nth(0).locator('.c-code').fill('k001'); await rows.nth(0).locator('.c-code').press('Tab');
+  await rows.nth(1).locator('.c-code').fill('k002'); await rows.nth(1).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /ハチミツ/.test(document.querySelectorAll('#comp-rows .c-name')[1].textContent));
+  await p.fill('#f-name', 'はちみつ 2 種 ギフト');
+};
+const SCREENS2 = [
+  ['新商品_単品', '/new?kind=single', fillNew], ['新商品_セット', '/new?kind=set', fillSet],
+  ['Amazon_一覧', '/amazon/', null], ['Amazon_未登録', '/amazon/unmapped?channel=all', null], ['Amazon_1つのSKU', '/amazon/sku?sku=pr-k001', null],
+  ['Amazon_変更の記録', '/amazon/sku/history?sku=pr-k001-b', null], ['NE登録のCSV', '/reg-csv', null], ['変更の記録', '/sku/s003/history', null],
+];
+for (const [label, vp, scale] of [['1440', { width: 1440, height: 900 }, 1], ['1280', { width: 1280, height: 720 }, 1], ['1024', { width: 1024, height: 768 }, 1], ['1280×720 150%', { width: 853, height: 480 }, 1.5]]) {
+  await ta(`[39] ${label}: 第 2 段の画面 (新商品・Amazon・NE 登録の CSV・変更の記録) が横にはみ出さない`, async (p) => {
+    process.env.MASTER_DECISION_APPROVERS = 'naka@test';   // NE 登録の CSV を操作できる人の画面で
+    try {
+    for (const [name, url, prep] of SCREENS2) {
+      await p.goto(B + url);
+      await p.waitForFunction(() => document.querySelector('.page').getAnimations().every((a) => a.playState !== 'running'));
+      if (prep) await prep(p);
+      const [sw, cw] = await p.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+      assert.ok(sw <= cw + 1, `${name}: 横幅 ${sw} > ${cw}`);
+      const spill = await p.evaluate(() => [...document.querySelectorAll('.page .panel, .page .filecard')].filter((x) => x.offsetParent !== null && x.scrollWidth > x.clientWidth + 1).map((x) => (x.querySelector('h2, .ttl') || x).textContent.trim().slice(0, 20)));
+      assert.deepEqual(spill, [], `${name}: 板からはみ出している`);
+      const bare = await p.evaluate(() => [...document.querySelectorAll('table.comp')].filter((t) => { const w = t.parentElement; return !w || !w.classList.contains('scrollx') || getComputedStyle(w).overflowX !== 'auto'; }).length);
+      assert.equal(bare, 0, `${name}: 構成の表が横に送る囲いに入っていない`);
+      if (SHOTS2 && scale === 1) await p.evaluate(() => { if (document.activeElement) document.activeElement.blur(); window.scrollTo(0, 0); }).then(() => p.waitForTimeout(150)).then(() => p.screenshot({ path: `${SHOTS2}/${name}_${label}.png`, fullPage: true }));
+    }
+    } finally { delete process.env.MASTER_DECISION_APPROVERS; }
+  }, vp, scale);
+}
 
 const SHOTDIR = process.env.MASTER_EDIT_UI_SHOTS || '';
 for (const [label, vp] of [['1440', { width: 1440, height: 900 }], ['1280', { width: 1280, height: 720 }], ['1024', { width: 1024, height: 768 }]]) {

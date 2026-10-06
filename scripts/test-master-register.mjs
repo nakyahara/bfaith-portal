@@ -1164,30 +1164,41 @@ async function call(method, url, { body, session = 'editor', origin = true } = {
   let j = null; try { j = JSON.parse(text); } catch { /* HTML */ }
   return { status: r.status, j, text };
 }
-/** 画面の JS が文法として読めること・EJS の出力が JS に混ざっていないこと (属性つきの script も数える) */
-function checkScripts(html, expected) {
+/**
+ * 画面の JS が文法として読めること・EJS の出力が JS に混ざっていないこと (属性つきの script も数える)。
+ * マスタの入力の画面は JS を public/ のファイルに分けた (第 2 段 10/5) = <script src> は中身を HTTP で取ってきて同じに確かめ、返す (インラインの後ろに並べる)
+ */
+async function checkScripts(html, expected) {
   const opens = [...html.matchAll(/<script\b/gi)].length;
   const all = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
   for (const m of all.filter((x) => /type="application\/json"/.test(x[1]))) JSON.parse(m[2]);   // 画面の JS に渡す値
   const scripts = all.filter((m) => !/\bsrc=/.test(m[1]) && !/type="application\/json"/.test(m[1])).map((m) => m[2]);
   assert.equal(all.length, opens, 'script の開きと閉じの数が合わない');
   if (expected != null) assert.equal(scripts.length, expected, `<script> の数 ${scripts.length}`);
-  for (const s of scripts) { new vm.Script(s); assert.ok(!/<%|%>/.test(s), 'EJS のタグが JS に残っている'); }
-  return scripts;
+  const files = [];
+  for (const m of all.filter((x) => /\bsrc="\/apps\/master-edit\/public\//.test(x[1]))) {
+    const src = /\bsrc="([^"]+)"/.exec(m[1])[1];
+    const r = await fetch(ORIGIN + src.replace(/&amp;/g, '&'), { headers: { 'x-test-session': 'editor' } });
+    assert.equal(r.status, 200, src);
+    files.push(await r.text());
+  }
+  for (const x of [...scripts, ...files]) { new vm.Script(x); assert.ok(!/<%|%>/.test(x), 'EJS のタグが JS に残っている'); }
+  return [...scripts, ...files];
 }
 
 await ta('[H1] 新商品の画面 (単品・セット): 描画・画面の JS・必須の印・product-hub と Yahoo! の欄・切替前の帯 (MASTER_EDIT_OPEN なし・持ち主 load)', async () => {
   let r = await call('GET', '/apps/master-edit/new?kind=single');
   assert.equal(r.status, 200, r.text.slice(0, 300));
-  const sc = checkScripts(r.text, 1);
-  for (const api of ["'/api/new'", "'/api/code-check?code='", "'/api/lookup?code='"]) assert.ok(sc[0].includes(api), `画面が ${api} を呼んでいない`);
+  const sc = await checkScripts(r.text, 0);
+  const newJs = sc.find((x) => x.includes('me-new.js — 新商品の登録の画面')) || '';
+  for (const api of ["'/api/new'", "'/api/code-check?code='", "'/api/lookup?code='"]) assert.ok(newJs.includes(api), `画面が ${api} を呼んでいない`);
   for (const word of ['商品コード', '売価', '発送方法', '税率', 'Amazon URL', 'ASIN', '参考 URL', '公式ページ URL', 'セット商品を作るか', 'Yahoo!売価', 'Yahoo!売価 (佐川)', 'Yahoo!カテゴリID', 'Yahoo!path', '有効期限の管理', '入荷日の管理']) {
     assert.ok(r.text.includes(word), `単品の画面に「${word}」が無い`);
   }
   assert.match(r.text, /data-can-save="1"/); assert.ok(!/切替前です/.test(r.text));
   assert.match(r.text, /S03 謎の便 \/ 300 円/);
   r = await call('GET', '/apps/master-edit/new?kind=set');
-  checkScripts(r.text, 1);
+  await checkScripts(r.text, 0);
   assert.match(r.text, /id="comp-rows"/); assert.ok(!r.text.includes('セット商品を作るか'), 'セットに「セット商品を作るか」を出さない');
   assert.ok(!r.text.includes('有効期限の管理'), 'セットにロジザードの欄を出さない');
   delete process.env.MASTER_EDIT_OPEN;
@@ -1231,7 +1242,7 @@ await ta('[H3] カードが作れなかった登録: 登録は成功・「カー
   assert.deepEqual([r.j.card.status, r.j.card_label, r.j.card.error], ['failed', 'カード作成待ち (失敗)', 'SQLite に書けない']);
   let page = await call('GET', '/apps/master-edit/sku/web-2');
   assert.equal(page.status, 200);
-  checkScripts(page.text, 0);
+  await checkScripts(page.text, 0);
   assert.match(page.text, /カード作成待ち \(失敗\)/); assert.match(page.text, /id="card-retry"/); assert.match(page.text, /<span class="b warn">下書き<\/span>/);
   assert.equal((await call('POST', '/apps/master-edit/api/sku/web-2/card-retry', { body: {}, session: 'viewer' })).status, 403);
   applierMode = 'real';
@@ -1248,7 +1259,7 @@ await ta('[H3] カードが作れなかった登録: 登録は成功・「カー
 await ta('[H4] 一覧: 登録の列・絞り込み (下書き・要確認・状態なし)・新商品への入口・つかいかた', async () => {
   let r = await call('GET', '/apps/master-edit/?reg=draft');
   assert.equal(r.status, 200);
-  checkScripts(r.text, 0);
+  await checkScripts(r.text, 0);
   assert.ok(r.text.includes('sku/new-a1') && r.text.includes('sku/web-2') && !r.text.includes('sku/s001"'));
   assert.match(r.text, /href="new\?kind=single"/);
   r = await call('GET', '/apps/master-edit/?reg=quarantined');
@@ -1272,7 +1283,7 @@ await ta('[H5] 衝突の画面: 「既存のカードをこの商品に結ぶ」
   const r = await call('POST', '/apps/master-edit/api/new', { body });
   assert.deepEqual([r.status, r.j.card.status], [200, 'conflict']);
   let page = await call('GET', '/apps/master-edit/sku/web-9');
-  checkScripts(page.text, 0);
+  await checkScripts(page.text, 0);
   assert.match(page.text, /id="card-link" data-draft="\d+"/); assert.match(page.text, /カードの衝突/);
   assert.equal((await call('POST', '/apps/master-edit/api/sku/web-9/card-link', { body: { draft_id: String(old.id) }, session: 'viewer' })).status, 403);
   assert.equal((await call('POST', '/apps/master-edit/api/sku/web-9/card-link', { body: {} })).status, 400);
@@ -1288,7 +1299,7 @@ await ta('[H5] 衝突の画面: 「既存のカードをこの商品に結ぶ」
   // 同じコードのカードが 2 枚以上 ([O10] の dup-1) = 「結ぶ」を出さない・押しても 409 ambiguous (何も結ばない)
   page = await call('GET', '/apps/master-edit/sku/dup-1');
   assert.equal(page.status, 200);
-  checkScripts(page.text, 0);
+  await checkScripts(page.text, 0);
   assert.ok(!/id="card-link"/.test(page.text)); assert.match(page.text, /2 枚以上あります/);
   const dupIds = ph.prepare(`SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = 'dup-1' ORDER BY id`).all().map((x) => x.id);
   for (const d of dupIds) assert.ok(page.text.includes(`/apps/product-hub/detail/${d}"`), `#${d} へのリンク`);
@@ -1334,7 +1345,7 @@ await ta('[P2] MASTER_EDIT_OPEN = 1: 段階 new_open = 案内だけ (新商品�
   let r = await call('GET', '/apps/product-hub/new');
   assert.equal(r.status, 200);
   assert.match(r.text, /\/apps\/master-edit\/new\?kind=single/); assert.match(r.text, /\/apps\/master-edit\/new\?kind=set/); assert.ok(!/id="create-btn"/.test(r.text));
-  checkScripts(r.text);
+  await checkScripts(r.text);
   phMode = 'legacy_open';
   r = await call('GET', '/apps/product-hub/new');
   assert.match(r.text, /id="create-btn"/);
@@ -1367,7 +1378,7 @@ await ta('[P3] ボードを開く = 取り込み待ちの知らせからカー�
   assert.equal(String(d.cdb_sku_id), r.sku_id);
   const b2 = await call('GET', '/apps/product-hub/board');
   assert.match(b2.text, /⚠ 発送方法 要確認/);
-  checkScripts(b2.text);
+  await checkScripts(b2.text);
   phMode = 'down';
   assert.equal((await call('GET', '/apps/product-hub/board')).status, 200);
   phMode = 'pglite';
