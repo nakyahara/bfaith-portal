@@ -214,15 +214,21 @@
     var set = function (cls, v, bad) { var el = $(cls, tr); el.textContent = v; if (cls === '.c-name') el.classList.toggle('bad', !!bad); };
     clearTimeout(tr.__lookupTimer);
     var f0 = facts.get(tr);
-    if (f0 && f0.code === code && !f0.error) return;   // 同じコードの答えはもう持っている
+    if (f0 && f0.code === code) return;   // この世代 (打った後) の答えはもう持っている (打つたびに捨てる = 入力の処理)
     facts.delete(tr);
     if (!code) { ['.c-name', '.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { set(c, ''); }); tiles(); return; }
-    var seq = tr.__lookupSeq = (tr.__lookupSeq || 0) + 1;   // 古い返事を使わない (同じ行で打ち直した後に前の返事が遅れて来る)
+    var seq = tr.__lookupSeq || 0;   // 世代は打った瞬間に進む (入力の処理)。この世代の返事だけ使う
+    if (tr.__inflight === seq + '|' + code) return;   // 同じ世代の同じコードをもう聞いている
+    tr.__inflight = seq + '|' + code;
+    var retry = function (msg) { tr.__inflight = null; set('.c-name', msg, true); tiles(); update(); tr.__lookupTimer = setTimeout(function () { lookup(tr); }, 3000); };
     set('.c-name', '引き当てています…');
     fetch(BASE + '/api/lookup?code=' + encodeURIComponent(code), { headers: { Accept: 'application/json' } })
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
       .then(function (x) {
-        if (tr.__lookupSeq !== seq || $('.c-code', tr).value.trim() !== code) return;
+        if ((tr.__lookupSeq || 0) !== seq || $('.c-code', tr).value.trim() !== code) return;
+        tr.__inflight = null;
+        // 答えにするのは 400 (形が違う)・404 (無い) だけ。5xx (DB につながらない など) は答えにせず、もう一度聞く (#1628 Codex R3 M1)
+        if (!x.r.ok && x.r.status !== 400 && x.r.status !== 404) { retry('いまは確かめられません (' + (x.j.error || 'HTTP ' + x.r.status) + ')。3 秒後にもう一度確かめます'); return; }
         if (!x.r.ok || !x.j.ok) { facts.set(tr, { code: code, item: null }); set('.c-name', x.j.error || '見つかりません', true); ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { set(c, ''); }); tiles(); update(); return; }
         var it = x.j.item;
         facts.set(tr, { code: code, item: it });
@@ -233,7 +239,7 @@
         set('.c-handling', HANDLING[it.handling] || it.handling);
         tiles(); update();
       })
-      .catch(function () { if (tr.__lookupSeq !== seq) return; set('.c-name', '引き当てできません (通信)。少し待ってもう一度確かめます', true); tiles(); update(); tr.__lookupTimer = setTimeout(function () { lookup(tr); }, 3000); });
+      .catch(function () { if ((tr.__lookupSeq || 0) !== seq) return; retry('引き当てできません (通信)。3 秒後にもう一度確かめます'); });
   }
   /** 構成品から導いた売上分類 (導けない・分からない = null) */
   var salesFromComp = null;
@@ -294,7 +300,9 @@
       if (e.target.classList.contains('c-qty')) tiles();
       if (e.target.classList.contains('c-code')) {
         var tr = e.target.closest('tr');
-        if (!factOf(tr)) { ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { $(c, tr).textContent = ''; }); $('.c-name', tr).textContent = e.target.value.trim() ? '確かめています…' : ''; }
+        // 打った瞬間に古い答えを捨てて世代を進める (A → B → A と打ち直しても、前の A の答え・遅れて来る返事は使わない = #1628 Codex R3 L3)
+        facts.delete(tr); tr.__lookupSeq = (tr.__lookupSeq || 0) + 1; tr.__inflight = null;
+        ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { $(c, tr).textContent = ''; }); $('.c-name', tr).textContent = e.target.value.trim() ? '確かめています…' : ''; $('.c-name', tr).classList.remove('bad');
         tiles();
         clearTimeout(tr.__lookupTimer);
         tr.__lookupTimer = setTimeout(function () { lookup(tr); }, 500);
@@ -330,7 +338,8 @@
       note.classList.toggle('wrn', keep);
     }
     var plan = segVal('set-plan');
-    var rr = $('#row-set-reason'); if (rr) rr.hidden = !(on && (plan === 'none' || plan === 'hold'));
+    // 作らない理由・メモは「作らない / 保留」なら出す (カードを作らないときも、値は送って確かめる = 直せるように・#1628 Codex R3 M2)
+    var rr = $('#row-set-reason'); if (rr) rr.hidden = !(plan === 'none' || plan === 'hold');
     var sr = $('#set-reason'); if (sr) sr.disabled = !canSave || plan !== 'none';
   }
   ['card-create', 'set-plan'].forEach(function (id) { var e = document.getElementById(id); if (e) e.addEventListener('change', function () { cardShow(); update(); }); });
@@ -414,6 +423,9 @@
     if (j.field) {
       if (/^card\./.test(String(j.field))) { var cf = $('#card-fields'); if (cf) cf.hidden = false; }   // 隠れた欄の誤りでも直せるように開く
       var row = $('[data-row="' + String(j.field).replace(/"/g, '') + '"]', scope);
+      // セット判断の誤りで「作らない / 保留」を選んでいる = 直すのは理由・メモの欄
+      var plan0 = segVal('set-plan');
+      if (j.field === 'card.set_decision' && (plan0 === 'none' || plan0 === 'hold') && $('#row-set-reason')) { row = $('#row-set-reason'); row.hidden = false; }
       if (row) {
         row.classList.add('err');
         var det = row.closest('details'); if (det) det.open = true;

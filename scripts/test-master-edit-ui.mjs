@@ -969,6 +969,54 @@ await ta('[30] 新商品の登録 (#1628 Codex R2 M2): カードを作らない�
   assert.match(await p.textContent('#card-off-note'), /カードは作りません \(保存しても/);
 });
 
+await ta('[31] 新商品 (セット・#1628 Codex R3 M1 / L3): 構成品の照合が 503 = 答えにせず 3 秒後にもう一度 (直れば保存の止めが外れる)・A → B → A と打ち直したら前の A の答えを使わない', async (p) => {
+  let n503 = 0;
+  await p.route('**/api/lookup?code=k001', async (route) => {
+    if (n503 === 0) { n503++; await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'Company DB につながりません' }) }); }
+    else await route.continue();
+  });
+  await p.goto(B + '/new?kind=set');
+  const rows = p.locator('#comp-rows tr.comp-row');
+  await rows.nth(0).locator('.c-code').fill('k001');
+  await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /3 秒後にもう一度/.test(document.querySelector('#comp-rows .c-name').textContent));
+  assert.match(await p.textContent('#checklist'), /構成品を確かめています/, '503 は「確かめている」のまま (できないコードと決めない)');
+  assert.ok(!/構成品にできないコード/.test(await p.textContent('#checklist')));
+  await p.waitForFunction(() => /国産 はちみつ/.test(document.querySelector('#comp-rows .c-name').textContent), null, { timeout: 10000 });
+  assert.equal(n503, 1);
+  assert.ok(!/構成品を確かめています|構成品にできないコード/.test(await p.textContent('#checklist')), '直ったら止めが外れる');
+  // A → B → A (欄を離れずに 0.5 秒以内) = 前の A の答えは捨てる (① で止まる)
+  await rows.nth(0).locator('.c-code').fill('k002');
+  await rows.nth(0).locator('.c-code').fill('k001');
+  assert.match(await p.textContent('#checklist'), /構成品を確かめています/, '打ち直した瞬間に古い答えを捨てる');
+  await p.waitForFunction(() => /国産 はちみつ/.test(document.querySelector('#comp-rows .c-name').textContent));
+  assert.ok(!/構成品を確かめています/.test(await p.textContent('#checklist')));
+});
+
+await ta('[32] 新商品 (#1628 Codex R3 M2): 「作らない」の理由の欄は、カードを作らないときも出す・理由が無くて断られたら理由の欄へ', async (p) => {
+  await p.goto(B + '/new?kind=single');
+  await p.click('#set-plan button[data-v="none"]');
+  await p.click('#card-create button[data-v="0"]');
+  assert.equal(await p.isHidden('#card-fields'), false);
+  assert.equal(await p.isHidden('#row-set-reason'), false, '作らない理由の欄も出す');
+  await p.fill('#code', 'ui-setplan-1');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', 'セット判断の試験');
+  await p.fill('#f-standard_price', '700');
+  await p.click('#f-tax_rate button[data-v="0.1"]');
+  await p.selectOption('#shipping', 'S01');
+  await p.click('#save');
+  await p.waitForSelector('.result.err');
+  assert.match(await p.textContent('.result.err'), /作らない理由を選んでください/);
+  assert.equal(await p.locator('#row-set-reason.err').count(), 1, '理由の欄に印');
+  assert.equal(await active(p), 'set-reason', '理由の欄へ');
+  assert.equal(await skuRow('ui-setplan-1'), undefined);
+  // 「まだ決めない」に戻して空にすれば畳む
+  await p.click('#set-plan button[data-v=""]');
+  await p.focus('#f-name');
+  await p.waitForFunction(() => document.getElementById('card-fields').hidden === true);
+});
+
 await ta('[27] Amazon SKU (10/5): 新しい対応 = 名前で未保存 1 件 (理由は数えない)・離れるときの確認・Ctrl+S → 読み直し (知らせ)・削除の理由は数えない・削除は 1 回だけ確かめる (Esc で戻る)・墓標・変更の記録のカード', async (p) => {
   await p.goto(B + '/amazon/');
   assert.match(await p.textContent('#h-um'), /売れたのに対応が無い SKU/);
