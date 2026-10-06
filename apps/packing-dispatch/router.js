@@ -15,6 +15,7 @@ import {
   buildExportCsv, commitExport, beginExport, releaseExport,
   listRules, upsertRules, copyRules, searchRules, searchRulesByCondition, bulkUpdateRules,
   listUnregistered, mirrorFreshness, searchAssort, updateAssort, searchProducts,
+  listHiddenUnregistered, hideUnregistered, unhideUnregistered,
   getMeltlineMigrationPreview, executeMeltlineMigration, rollbackMeltlineMigration,
   listMeltlineBackups, readMeltlineBackup,
   importTrackingCsv, setTrackingManual, markReady, markSkipped,
@@ -325,7 +326,13 @@ router.post('/api/rules/bulk', (req, res) => handle(res, () => bulkUpdateRules(r
 router.get('/api/unregistered', (req, res) => handle(res, () => ({
   freshness: mirrorFreshness(),
   rows: listUnregistered(),
+  hidden: listHiddenUnregistered(),
 })));
+// 「削除したもの」を商品コード・商品名で絞る ({ total, rows })
+router.get('/api/unregistered/hidden', (req, res) => handle(res, () => listHiddenUnregistered(req.query.q || '')));
+// 未登録一覧から外す / 元に戻す (body: { codes: [...] })。NE の商品マスタ・配送ルールは触らない。
+router.post('/api/unregistered/hide', (req, res) => handle(res, () => hideUnregistered((req.body || {}).codes, currentUser(req))));
+router.post('/api/unregistered/unhide', (req, res) => handle(res, () => unhideUnregistered((req.body || {}).codes, currentUser(req))));
 
 // ── マスタ状態 (ルール件数)。失敗しても 500 にせずエラー文を返す(原因可視化) ──
 router.get('/api/master-status', (req, res) => handle(res, () => {
