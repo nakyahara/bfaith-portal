@@ -18,7 +18,9 @@
  *     page_limit / pages / page_rows / last_page_rows (API を呼んだ回数と各回の行数。最後のページが短い = そこで止めた。R-g の調べ用)・
  *     version・kind・complete_at・complete_rev (どの完了の印の回の記録か)・
  *     fetch_fingerprint (取得の版 = computeFetchFingerprint。設計 v14 §3.7 の component = fetch。照合が封の expected_fetch_fp と比べる)・
- *     notes (行は落とさないが既定値で書いた行の数。セット = quantity_defaulted_rows)
+ *     notes (行は落とさないが既定値で書いた行の数。セット = quantity_defaulted_rows)・
+ *     started_at / finished_at (取得の始め / 完了。ISO の UTC・ミリ秒。設計 R20: 完了の印の時刻 complete_at は raw の集合の世代 = 始めの時刻のまま変えない。
+ *     完了の時刻は finished_at = 完了の印を書く取引の中の今。キューの取得は products の finished_at の後に始める)
  *   write_attempts は通し番号 (revision) からは導かない: 書いた行を直接数える (セットは入れ替えの DELETE でも通し番号が増える = 前の回の行数が混ざる。R14)
  *
  *   書く前の確かめ (ne-api.js。崩れたら完了の印を書かない = fail-closed):
@@ -110,6 +112,12 @@ export function checkNeFetchCounts(kind, rec, opts = {}) {
   if (rec.kind !== kind) p.push(`kind:${rec.kind}`);
   if (typeof rec.fetch_fingerprint !== 'string' || !FP_RE.test(rec.fetch_fingerprint)) p.push('fetch_fingerprint');
   if (typeof rec.complete_at !== 'string' || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(rec.complete_at)) p.push('complete_at');
+  // 取得の始め (= 完了の印の時刻と同じ時刻・秒まで同じ) と完了 (完了の印を書いた取引の中の今)。ISO の UTC・ミリ秒。完了 ≧ 始め (設計 R20)
+  const isoOk = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(v) && Number.isFinite(Date.parse(v)) && new Date(Date.parse(v)).toISOString() === v;
+  if (!isoOk(rec.started_at)) p.push('started_at');
+  else if (typeof rec.complete_at === 'string' && rec.started_at.replace('T', ' ').slice(0, 19) !== rec.complete_at) p.push('started_at_ne_complete_at');
+  if (!isoOk(rec.finished_at)) p.push('finished_at');
+  else if (isoOk(rec.started_at) && Date.parse(rec.finished_at) < Date.parse(rec.started_at)) p.push('finished_before_started');
   for (const f of COUNT_FIELDS) if (!isCount(rec[f])) p.push(`not_count:${f}`);
   const d = rec.dropped_missing_detail;
   if (!d || typeof d !== 'object' || Array.isArray(d)) p.push('dropped_missing_detail');

@@ -163,7 +163,8 @@ async function fetchProductsRun(h) {
   console.log('[NE] 商品マスタ取得開始');
   await initDB();
   const db = getDB();
-  const ts = now();
+  const startedAt = new Date();   // 取得の始め (API の入力を読む前)。ts (synced_at = raw の集合の世代 = 完了の印の時刻) と同じ時刻
+  const ts = startedAt.toISOString().replace('T', ' ').slice(0, 19);
   const fetchFp = fetchFingerprintOrNull();   // 取得の版 (API の入力を読む前に 1 回だけ・完了まで持ち回る)
 
   const fields = 'goods_id,goods_name,goods_supplier_id,goods_cost_price,goods_selling_price,goods_merchandise_name,goods_representation_id,goods_location,goods_delivery_name,goods_lot,goods_last_time_supplied_date,goods_tag,goods_creation_date,stock_quantity,stock_allocation_quantity,goods_last_modified_date,goods_tax_rate,stock_remaining_order_quantity';
@@ -268,6 +269,7 @@ async function fetchProductsRun(h) {
     // 取得の件数 (広げる道 PR-9・設計 v13 §3.6.3)。stored_rows は DB で数えた「この回の時刻の行」= コードの数えと別の数え方。
     //   式 (fetched = write_attempts + dropped_no_code + dropped_missing_fields) か、重なり (write_attempts − stored_rows = コードが数えた重なり) が崩れたら印を付けない (fail-closed)
     const counts = { version: NE_FETCH_COUNTS_VERSION, kind: 'products', complete_at: ts, complete_rev: rev1, fetch_fingerprint: fetchFp,
+      started_at: startedAt.toISOString(), finished_at: new Date().toISOString(),   // 取得の始め・完了 (この取引の中の今。完了の印の時刻 = 始めの時刻 のままなので、完了は別に残す。設計 R20)
       fetched_rows: fetchedRows, write_attempts: total, stored_rows: completeCount, dropped_no_code: droppedNoCode, dropped_missing_fields: 0, dropped_missing_detail: {}, notes: {},
       page_limit: LIMIT, pages: pageRows.length, page_rows: pageRows, last_page_rows: pageRows.length ? pageRows[pageRows.length - 1] : 0 };
     const problems = checkNeFetchCounts('products', counts, { expectDuplicates: dupRows });
@@ -296,7 +298,8 @@ async function fetchSetProductsRun(h) {
   console.log('[NE] セット商品取得開始');
   await initDB();
   const db = getDB();
-  const ts = now();
+  const startedAt = new Date();   // 取得の始め (API の入力を読む前)。ts (synced_at = raw の集合の世代 = 完了の印の時刻) と同じ時刻
+  const ts = startedAt.toISOString().replace('T', ' ').slice(0, 19);
   const fetchFp = fetchFingerprintOrNull();   // 取得の版 (API の入力を読む前に 1 回だけ・完了まで持ち回る)
 
   // set_goods_creation_date = セットの作成日 (NE の API の説明の取得できる項目にある)。商品管理リストの snapshot の 登録日 (セット) → Company DB の登録日 (0057)
@@ -431,6 +434,7 @@ async function fetchSetProductsRun(h) {
     //   入れ替えは今までどおり行い、前回の印・件数・整合の証跡を同じ取引で消す (CSV の取込と同じ「印が無い」= 照合は判定できない)
     const missingChild = droppedMissingKey - droppedMissingParent;
     const counts = { version: NE_FETCH_COUNTS_VERSION, kind: 'setproducts', complete_at: ts, complete_rev: completeRev, fetch_fingerprint: fetchFp,
+      started_at: startedAt.toISOString(), finished_at: new Date().toISOString(),   // 取得の始め・完了 (この取引の中の今。完了の印の時刻 = 始めの時刻 のままなので、完了は別に残す。設計 R20)
       fetched_rows: seenRows, write_attempts: total, stored_rows: completeCount, dropped_no_code: droppedMissingParent, dropped_missing_fields: missingChild,
       dropped_missing_detail: { set_goods_detail_goods_id: missingChild }, notes: { quantity_defaulted_rows: qtyDefaulted },
       page_limit: LIMIT, pages: pageRows.length, page_rows: pageRows, last_page_rows: pageRows.length ? pageRows[pageRows.length - 1] : 0 };
