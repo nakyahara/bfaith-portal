@@ -30,6 +30,8 @@
   button { font-size:13px; padding:6px 12px; border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:6px; cursor:pointer; }
   button.sub { background:#fff; color:var(--accent); }
   button:disabled { opacity:.5; cursor:not-allowed; }
+  button.danger { background:#fff; color:var(--warn); border-color:var(--warn); }
+  button.danger.fill { background:var(--warn); color:#fff; }
   input,select { font-size:13px; padding:5px 7px; border:1px solid var(--line); border-radius:5px; }
   .summary { display:flex; gap:18px; flex-wrap:wrap; align-items:center; }
   .summary .num { font-size:18px; font-weight:bold; }
@@ -322,11 +324,28 @@
         <button id="btnLoadUnreg" class="sub">未登録を再取得</button>
         <span id="freshness" class="muted"></span>
       </div>
-      <div class="muted">取扱中・非セットで配送方法ルール未登録の商品コード。クリックでマスタ登録へ。</div>
+      <div class="muted">取扱中・非セットで配送方法ルール未登録の商品コード。「登録へ」でマスタ登録へ。間違えて作ったコードなど登録しないものは「削除」で一覧から外せます (NE の商品マスタは消えません・下の「削除したもの」から元に戻せます)。</div>
+      <div class="row" id="unregBulkBar" style="margin-top:8px;display:none">
+        <span id="unregSelCount" class="muted">0件選択</span>
+        <button id="btnUnregHideSel" class="danger fill" disabled>選択したものを削除</button>
+      </div>
       <div class="scroll" style="margin-top:8px"><table>
-        <thead><tr><th>商品コード</th><th>商品名</th><th>取扱区分</th><th></th></tr></thead>
+        <thead><tr><th style="width:28px"><input type="checkbox" id="unregHeadChk" title="すべて選択 / 解除" /></th><th>商品コード</th><th>商品名</th><th>取扱区分</th><th></th></tr></thead>
         <tbody id="unregBody"></tbody>
       </table></div>
+    </div>
+    <div class="card">
+      <details id="unregHiddenWrap">
+        <summary>🗑️ 削除したもの (<span id="unregHiddenCount">0</span>件) — 間違えて削除したら「元に戻す」</summary>
+        <div class="row" style="margin-top:8px">
+          <span id="unregHidSelCount" class="muted">0件選択</span>
+          <button id="btnUnregUnhideSel" class="sub" disabled>選択したものを元に戻す</button>
+        </div>
+        <div class="scroll" style="margin-top:8px"><table>
+          <thead><tr><th style="width:28px"><input type="checkbox" id="unregHidHeadChk" title="すべて選択 / 解除" /></th><th>商品コード</th><th>商品名</th><th>いまの状態</th><th>削除した人・日時</th><th></th></tr></thead>
+          <tbody id="unregHiddenBody"></tbody>
+        </table></div>
+      </details>
     </div>
   </section>
 
@@ -739,8 +758,15 @@
       <h3 id="ch7-unreg">7-4. 未登録一覧</h3>
       <ul>
         <li>取扱中・非セットでルール未登録の商品コード一覧</li>
-        <li>クリックで商品マスタの登録画面へ</li>
+        <li>「登録へ」で商品マスタの登録画面へ</li>
         <li>セット商品は3シグナル判定(商品区分 / 構成品数 / 親存在)で除外済</li>
+        <li><b>登録しないコードを一覧から消す</b>: 間違えて作った商品コードなどは、行の「削除」で 1 件ずつ、または左のチェックで選んで「選択した N 件を削除」でまとめて一覧から外せます (見出しのチェックで全部選択)
+          <ul>
+            <li>消えるのは<b>この一覧の表示だけ</b>です。NE の商品マスタからは消えません。NE からも無くしたいときは、NE で取扱区分を「取扱中止」にしてください</li>
+            <li>削除したコードの注文が来たら、今までどおり「要判断: 未登録」になります (判定は変わりません)</li>
+            <li>間違えて削除したら、一覧の下の「🗑️ 削除したもの」を開いて「元に戻す」</li>
+          </ul>
+        </li>
       </ul>
 
       <h3>7-5. 配送方法一覧</h3>
@@ -1588,16 +1614,82 @@ $('#btnBulkApply').onclick=async()=>{
 };
 
 // ── 未登録一覧 ──
+// 「削除」= 一覧から外すだけ (pd_unregistered_hidden に入れる)。NE の商品マスタ・配送ルール・取込の判定は変わらない。
+let UNREG_ROWS = [], UNREG_HIDDEN = [];
 async function loadUnreg(){
   const r = await api('api/unregistered');
   $('#freshness').textContent = r.freshness ? `ミラー最終同期: ${r.freshness}` : 'ミラー同期時刻不明';
-  const tb=$('#unregBody'); tb.innerHTML='';
-  for(const x of r.rows){ const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${esc(x.product_code)}</td><td>${esc(x.product_name)}</td><td>${esc(x.handling||'')}</td><td><button class="sub">登録へ</button></td>`;
-    tr.querySelector('button').onclick=()=>{ document.querySelector('.tab[data-tab=master]').click(); $('#mProduct').value=x.product_code; loadRules(); };
-    tb.appendChild(tr); }
-  if(!r.rows.length) tb.innerHTML='<tr><td colspan="4" class="muted">未登録はありません 🎉</td></tr>';
+  UNREG_ROWS = r.rows || []; UNREG_HIDDEN = r.hidden || [];
+  renderUnreg(); renderUnregHidden();
 }
+function renderUnreg(){
+  const tb=$('#unregBody'); tb.innerHTML=''; $('#unregHeadChk').checked=false;
+  UNREG_ROWS.forEach((x,i)=>{ const tr=document.createElement('tr');
+    tr.innerHTML=`<td style="text-align:center"><input type="checkbox" class="usel" data-i="${i}"></td>`+
+      `<td>${esc(x.product_code)}</td><td>${esc(x.product_name)}</td><td>${esc(x.handling||'')}</td>`+
+      `<td style="white-space:nowrap"><button class="sub" data-reg>登録へ</button> <button class="danger" data-hide>削除</button></td>`;
+    tr.querySelector('[data-reg]').onclick=()=>{ document.querySelector('.tab[data-tab=master]').click(); $('#mProduct').value=x.product_code; loadRules(); };
+    tr.querySelector('[data-hide]').onclick=()=>hideUnreg([x]);
+    tb.appendChild(tr); });
+  if(!UNREG_ROWS.length) tb.innerHTML='<tr><td colspan="5" class="muted">未登録はありません 🎉</td></tr>';
+  tb.querySelectorAll('.usel').forEach(cb=>cb.onchange=updateUnregSel);
+  $('#unregBulkBar').style.display = UNREG_ROWS.length ? 'flex' : 'none';
+  updateUnregSel();
+}
+function updateUnregSel(){
+  const all=$('#unregBody').querySelectorAll('.usel'); const n=$('#unregBody').querySelectorAll('.usel:checked').length;
+  $('#unregSelCount').textContent=`${n}件選択`;
+  $('#btnUnregHideSel').disabled = n===0;
+  $('#btnUnregHideSel').textContent = n ? `選択した ${n} 件を削除` : '選択したものを削除';
+  const h=$('#unregHeadChk'); h.checked = all.length>0 && n===all.length; h.indeterminate = n>0 && n<all.length;
+}
+function renderUnregHidden(){
+  const tb=$('#unregHiddenBody'); tb.innerHTML=''; $('#unregHidHeadChk').checked=false;
+  $('#unregHiddenCount').textContent = String(UNREG_HIDDEN.length);
+  UNREG_HIDDEN.forEach((x,i)=>{ const tr=document.createElement('tr');
+    const state = x.still_unregistered ? '未登録のまま' : '<span class="muted">一覧の対象外 (取扱中止・登録済み等)</span>';
+    tr.innerHTML=`<td style="text-align:center"><input type="checkbox" class="hsel" data-i="${i}"></td>`+
+      `<td>${esc(x.product_code)}</td><td>${esc(x.product_name||'')}</td><td>${state}</td>`+
+      `<td class="muted">${esc(x.hidden_by||'')} ${esc(fmtJst(x.hidden_at))}</td>`+
+      `<td><button class="sub" data-unhide>元に戻す</button></td>`;
+    tr.querySelector('[data-unhide]').onclick=()=>unhideUnreg([x]);
+    tb.appendChild(tr); });
+  if(!UNREG_HIDDEN.length) tb.innerHTML='<tr><td colspan="6" class="muted">削除したものはありません。</td></tr>';
+  tb.querySelectorAll('.hsel').forEach(cb=>cb.onchange=updateUnregHidSel);
+  updateUnregHidSel();
+}
+function updateUnregHidSel(){
+  const all=$('#unregHiddenBody').querySelectorAll('.hsel'); const n=$('#unregHiddenBody').querySelectorAll('.hsel:checked').length;
+  $('#unregHidSelCount').textContent=`${n}件選択`;
+  $('#btnUnregUnhideSel').disabled = n===0;
+  const h=$('#unregHidHeadChk'); h.checked = all.length>0 && n===all.length; h.indeterminate = n>0 && n<all.length;
+}
+// ISO(UTC) → JST の「M/D HH:MM」。読めなければ原文。
+function fmtJst(iso){
+  const d=new Date(iso||''); if(isNaN(d)) return String(iso||'');
+  const j=new Date(d.getTime()+9*3600*1000);
+  return `${j.getUTCMonth()+1}/${j.getUTCDate()} ${String(j.getUTCHours()).padStart(2,'0')}:${String(j.getUTCMinutes()).padStart(2,'0')}`;
+}
+async function hideUnreg(rows){
+  if(!rows.length) return;
+  const head = rows.length===1 ? `「${rows[0].product_code}」` : `${rows.length} 件`;
+  if(!confirm(`${head}を未登録一覧から削除します。\n\n・NE の商品マスタは消えません (一覧から外すだけです)\n・この商品の注文が来たら、今までどおり「要判断: 未登録」になります\n・「削除したもの」からいつでも元に戻せます\n\n削除しますか?`)) return;
+  try{
+    await api('api/unregistered/hide', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ codes: rows.map(x=>x.product_code) }) });
+    await loadUnreg();
+  }catch(e){ alert('削除できませんでした: '+e.message); }
+}
+async function unhideUnreg(rows){
+  if(!rows.length) return;
+  try{
+    await api('api/unregistered/unhide', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ codes: rows.map(x=>x.product_code) }) });
+    await loadUnreg();
+  }catch(e){ alert('元に戻せませんでした: '+e.message); }
+}
+$('#unregHeadChk').onchange=()=>{ const c=$('#unregHeadChk').checked; $('#unregBody').querySelectorAll('.usel').forEach(cb=>cb.checked=c); updateUnregSel(); };
+$('#unregHidHeadChk').onchange=()=>{ const c=$('#unregHidHeadChk').checked; $('#unregHiddenBody').querySelectorAll('.hsel').forEach(cb=>cb.checked=c); updateUnregHidSel(); };
+$('#btnUnregHideSel').onclick=()=>hideUnreg([...$('#unregBody').querySelectorAll('.usel:checked')].map(cb=>UNREG_ROWS[+cb.dataset.i]).filter(Boolean));
+$('#btnUnregUnhideSel').onclick=()=>unhideUnreg([...$('#unregHiddenBody').querySelectorAll('.hsel:checked')].map(cb=>UNREG_HIDDEN[+cb.dataset.i]).filter(Boolean));
 $('#btnLoadUnreg').onclick=loadUnreg;
 
 // ── アソート学習 検索・編集 ──

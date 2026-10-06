@@ -241,6 +241,17 @@ export function ensureSchema() {
       ts TEXT, who TEXT, action TEXT, target TEXT, detail TEXT
     );
 
+    -- 未登録一覧から外した商品コード (2026-10-06 スタッフ要望「誤って登録した商品コードを一覧から削除したい」)。
+    -- 未登録一覧は mirror_products (NE 商品マスタ) から毎回計算するので行そのものは消せない。ここに入れたコードを
+    -- 一覧から除くだけ。NE の商品マスタ・配送ルール・取込の判定 (ルールが無ければ要判断) には一切影響しない。
+    -- product_code は normProductCode (NFKC+trim+小文字) 済み。元に戻す = 行を DELETE。
+    CREATE TABLE IF NOT EXISTS pd_unregistered_hidden (
+      product_code TEXT PRIMARY KEY,
+      product_name TEXT,                        -- 外した時点の商品名 (NE 側で消えても何だったか分かるように)
+      hidden_by TEXT,
+      hidden_at TEXT NOT NULL
+    );
+
     -- ─────────────────────── 追跡番号 / NE反映 (PR 1) ───────────────────────
     -- pd_shipment_tracking: 1 受注 1 行 (NE 伝票番号 = ne_uketsuke_no が PK)。
     --   packing-dispatch 確定時に自動 UPSERT、キャリア CSV 取込 or 手動入力で追跡番号を紐付け、
@@ -732,9 +743,67 @@ export function listUnregistered() {
          SELECT 1 FROM pd_shipping_rule r
           WHERE r.product_code = lower(trim(mp.商品コード))
        )
+       AND NOT EXISTS (
+         SELECT 1 FROM pd_unregistered_hidden h
+          WHERE h.product_code = lower(trim(mp.商品コード))
+       )
      ORDER BY mp.商品コード
      LIMIT 2000
   `).all();
+}
+
+// 未登録一覧から外した商品コードの一覧 (「削除したもの」欄・元に戻す用)。
+// still_unregistered = いまも取扱中・単品・ルール未登録か (0 なら NE で取扱中止にした等で、戻しても一覧に出ない)。
+export function listHiddenUnregistered() {
+  const db = ensureSchema();
+  return db.prepare(`
+    SELECT h.product_code, COALESCE(mp.商品名, h.product_name) AS product_name,
+           mp.取扱区分 AS handling, h.hidden_by, h.hidden_at,
+           CASE WHEN mp.商品コード IS NOT NULL
+                 AND TRIM(mp.取扱区分) = '取扱中'
+                 AND NOT EXISTS (SELECT 1 FROM pd_shipping_rule r WHERE r.product_code = h.product_code)
+                THEN 1 ELSE 0 END AS still_unregistered
+      FROM pd_unregistered_hidden h
+      LEFT JOIN mirror_products mp ON lower(trim(mp.商品コード)) = h.product_code
+     ORDER BY h.hidden_at DESC, h.product_code
+     LIMIT 2000
+  `).all();
+}
+
+const HIDE_MAX = 2000;
+function vErr(message) { const e = new Error(message); e.code = 'VALIDATION'; return e; }
+function hideCodesFromBody(codes) {
+  if (!Array.isArray(codes)) throw vErr('codes は配列で指定してください');
+  const out = [...new Set(codes.map((c) => normProductCode(c)).filter(Boolean))];
+  if (!out.length) throw vErr('商品コードが選ばれていません');
+  if (out.length > HIDE_MAX) throw vErr(`一度に扱えるのは ${HIDE_MAX} 件までです (${out.length} 件)`);
+  return out;
+}
+
+// 未登録一覧から外す。既に外してあるコードは何もしない (外した人・日時も上書きしない)。
+export function hideUnregistered(codes, who) {
+  const db = ensureSchema();
+  const list = hideCodesFromBody(codes);
+  const now = utcIsoNow();
+  const nameOf = db.prepare(`SELECT 商品名 FROM mirror_products WHERE lower(trim(商品コード)) = ? LIMIT 1`);
+  const ins = db.prepare(`INSERT OR IGNORE INTO pd_unregistered_hidden (product_code, product_name, hidden_by, hidden_at) VALUES (?,?,?,?)`);
+  let hidden = 0;
+  db.transaction(() => {
+    for (const c of list) hidden += ins.run(c, nameOf.get(c)?.商品名 ?? null, who || null, now).changes;
+  })();
+  audit('unregistered_hide', null, { codes: list, hidden }, who);
+  return { requested: list.length, hidden, already: list.length - hidden };
+}
+
+// 外したコードを未登録一覧に戻す。
+export function unhideUnregistered(codes, who) {
+  const db = ensureSchema();
+  const list = hideCodesFromBody(codes);
+  const del = db.prepare(`DELETE FROM pd_unregistered_hidden WHERE product_code = ?`);
+  let restored = 0;
+  db.transaction(() => { for (const c of list) restored += del.run(c).changes; })();
+  audit('unregistered_unhide', null, { codes: list, restored }, who);
+  return { requested: list.length, restored };
 }
 
 // 特定商品コードの判定材料を返す (なぜ未登録一覧に出る/出ないかの切り分け)
@@ -746,7 +815,8 @@ export function productDiag(code) {
   const inSetComp = !!db.prepare(`SELECT 1 FROM mirror_set_components WHERE lower(trim(セット商品コード))=? LIMIT 1`).get(c);
   const inShippingRule = !!db.prepare(`SELECT 1 FROM pd_shipping_rule WHERE product_code=? LIMIT 1`).get(c);
   const compCount = db.prepare(`SELECT COUNT(*) n FROM mirror_set_components WHERE lower(trim(セット商品コード))=?`).get(c).n;
-  return { query: code, normalized: c, mirror_products: mp, in_mirror_set_components: inSetComp, set_component_rows: compCount, in_shipping_rule: inShippingRule };
+  const hidden = db.prepare(`SELECT hidden_by, hidden_at FROM pd_unregistered_hidden WHERE product_code=?`).get(c) || null;
+  return { query: code, normalized: c, mirror_products: mp, in_mirror_set_components: inSetComp, set_component_rows: compCount, in_shipping_rule: inShippingRule, hidden_from_unregistered: hidden };
 }
 
 // 特定商品コードがアソート学習に登録されているかの診断 (有効/無効・どのコード形式で入っているか・利用注文)。
