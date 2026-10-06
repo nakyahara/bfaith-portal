@@ -1,13 +1,14 @@
 /**
- * test-master-widen.mjs — 広げる道 PR-1 (0058) の DB の部品を PGlite で確かめる (設計 = 広げる道 v11 §3・§13)
+ * test-master-widen.mjs — 広げる道 PR-1 (0058) の DB の部品を PGlite で確かめる (設計 = 広げる道 v10 §3 + 最小の計画 newentry_min_plan.md)
  *
  *   1  0058 を当てる。sku_kind の持ち主が load の間は何も変わらない (区分の変更・SKU の削除・最終形の崩れも通る = G18 / G19 は何もしない)・
  *      夜間ロードの番号 (report.load_commit_seq・latestLoadCommit) は文字 (bigint を JS の Number にしない)
  *   G5 段階 new_open では持ち主の epoch を 0058 の関数でだけ変える (今の prepare / 直接の UPDATE は拒む)・足すだけ・広げてよいキーは skus.sku_kind だけ・会社 1 だけ・
  *      知らない古い入口の一覧は拒む・開いている試みがあれば次の prepare は拒む
  *   10 同じ持ち主表で cancel → prepare = 別の試み・新しい base (前の試みのロードは数えない)・試みの表は関数でだけ書く
- *   15 照合の封: started → completed / failed は 1 回だけ・seq と run_id の組・payload の検査・直接の書き込みは拒む
- *   17 取得の件数の守り: 0 件・ページ欠け・直前の completed より 10% 以上の減り = untrusted・減りだけは DB の持ち主が受け入れられる
+ *   15 照合 ② の新商品のゲートの結果 (5 つの数の形・取得の完了は今日・同じ回は 1 回だけ・最終形は DB が数える)・許可を出す条件 (今回の回・全部 0・widen の後)・
+ *      照合 ② の始めに閉じる (停止の床)・取り消し・期限の式
+ *   21 NE で一度でも見たコードの履歴 (seed・毎日の照合が足す・追記だけ)
  *   24 保守の印: 理由が空・GUC だけ・直接の INSERT は拒む / 本物の印は同じ取引だけ有効
  * 使い方: node scripts/test-master-widen.mjs   (実 PostgreSQL の同時実行・ロール・widen 本体・G18 / G19・復元は scripts/test-master-widen-pg.mjs)
  */

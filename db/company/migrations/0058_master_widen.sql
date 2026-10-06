@@ -613,7 +613,6 @@ revoke all on function ops.widen_check_readonly(uuid, integer) from public;
 
 -- ─── 11. prepare --widen / 手の入口の停止 / cancel / widen (DB の持ち主だけ) ───
 -- prepare: epoch の排他の鍵 → 段階の共有の鍵 → 足すだけを確かめ → 鍵の後に base_commit_seq を同じ取引で bigint で取る (走っていたロードは commit を待ってから base に入る)
---   🆕 v14: 照合 (compare)・取得 (fetch) の版を台帳に登録する (今の最新と同じなら足さない)・NE のコードの履歴の一度きりの集約が済んでいなければ拒む
 create function ops.prepare_master_widen(p_company_id integer, p_prepared_map jsonb, p_loader_fingerprint text, p_manifest jsonb, p_actor text) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
@@ -1414,7 +1413,7 @@ begin
   if exists (select 1 from ops.master_edit_requests r where r.request_id = p_request_id) then
     raise exception 'invalid_input: request_id % はもう使われている (保存の記録がある)', p_request_id using errcode = '22023';
   end if;
-  -- 🆕 0058 (v12 §3.7・§3.8): 新商品の開放の許可 (種類ごと・共有の鍵 = 取り消し・新しい照合の封の始めと並ぶ)。無い = new_entry_closed (アプリは 409)
+  -- 🆕 0058 (§3.7・§3.8): 新商品の開放の許可 (種類ごと・共有の鍵 = 取り消し・照合 ② の始めに閉じる・結果の記録と並ぶ)。無い = new_entry_closed (アプリは 409)
   if v_kind = 'single' then perform ops._require_new_entry_lease('single'); end if;   -- セットは sku_components を広げるまで画面の門 (NEW_ENTRY_KEYS) のまま
   -- コード (新しいコードの鍵 = 画面と同じ鍵 → 決まり)
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.new_code:' || coalesce(core.norm_code(v_code), ''), 0));

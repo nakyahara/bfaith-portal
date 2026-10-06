@@ -519,6 +519,7 @@ try {
   const RUN = 'mc_20300110T000000000Z_aaaaaa';
   await O.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, '2030-01-10T00:00:00Z', 0)`, [RUN]);
   await O.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: RUN, entries: ['p001', 'p002', 'p003', 'p004', 'ps01'].map((c) => ({ code_norm: c, kind: 'product', state: 'ok', ne_code: c, spellings: [c] })) })]);
+  await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(dbO, { runId: RUN });   // 0058: 配るは「NE のコードの回 = 許可の回」(本番と同じ = その照合の回の許可)
   const rates = new Map([['S01', { method: 'ゆうパケット', cost: 210 }]]);
   await R.registerNewSku(dbA, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: 'pnew', card: { create: false },
     values: { name: '新しい単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', cost: { jpy: '300' } } },

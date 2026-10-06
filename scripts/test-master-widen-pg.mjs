@@ -13,9 +13,10 @@
  *   5  G19 (deferred・保守の印でも最終形を守る・取引の途中の崩れは commit までに直せば通る)
  *   6  今の origin/master のロードを widen の後に: 区分の変わった材料では取引ごと失敗 (何も残らない)・区分の変わらない材料は今までどおり通る
  *   7  復元の 3 種類 (sku_kind が load のダンプ = 最終形が崩れていても通る / company で整合 = 通る / company で不整合 = 復元全体が rollback)
+ *  18  開放の許可 (照合 ② の始めに閉じる → 結果 → 今回の回で grant・権限・取り消しと閉じるは保存の取引を待つ・停止の床・結果を書く前に落ちた再実行では出ない)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-widen-pg.mjs
  *   (この PC では C:/tmp/pg-embed の run-conc.mjs が使い捨ての PostgreSQL を起動して TEST_PG_URL を渡す)
- *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロールをクラスタに作る)。localhost 以外の URL は拒む (本番を渡さない)。package.json の試験には入れない
+ *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロールをクラスタに作る)。localhost 以外の URL は拒む (本番を渡さない)。TEST_PG_URL が無ければ飛ばす (test:master-edit の最後)
  */
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
