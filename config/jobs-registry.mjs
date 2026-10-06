@@ -478,7 +478,7 @@ export const JOBS_REGISTRY = [
       + 'その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease(\'single\', 回) を呼ぶ (0058・ログイン new_entry_gate = miniPC の .env の COMPANY_DB_NEW_ENTRY_GATE_URL)。'
       + '許可が出た = 単品の新商品をポータルで開ける (〜翌日 07:00 JST・要約に「🆕 新商品の入口: 開」)。照合 ② は始めに入口を閉じ (close_new_entry_for_compare)、最後にゲートの結果を 1 行書く (record_new_entry_gate) = 照合が失敗した日は閉じたまま。'
       + 'マスタ照合が失敗・見送り = この段は流さない (⏭️・retry で照合が直ったら RERUN_AFTER で流す)。照合 ② が判定できない・落ちた = grant を呼ばず revoke (閉・exit 0)。'
-      + '接続が無い = 「未設定」・関数が無い (0058 の前) = 「閉のまま」で飛ばす (exit 0 = 毎朝の処理を止めない)。widen の前で拒まれた = ⏸️ 閉 (準備中・exit 0)。'
+      + '接続が無い = 「未設定」・関数が無い (0058 の前) = 「0058 の前」で飛ばす (exit 0 = 毎朝の処理を止めない)。「閉」と出すのは新しい接続で閉じたのを確かめたときだけ。widen の前で拒まれた = ⏸️ 閉 (準備中・exit 0)。'
       + 'ほかで拒まれた (kind_gate が 0 でない・最終形・今日でない・停止の床・回の不一致) = 新しい接続で revoke → new_entry_lease_valid = false を確かめてから理由つきで「閉」❌。'
       + 'grant の応答が切れた・返り値が壊れた・閉じたのを確かめられない = 「⚠️ 状態不明 (開いている可能性)」❌。'
       + '失敗した朝の retry は「マスタ照合」も載せて、新しい照合の回 (close → record) から許可を出し直す (同じ回は停止の床で二度と開かない = 人が直せば同じ日に開く)。'

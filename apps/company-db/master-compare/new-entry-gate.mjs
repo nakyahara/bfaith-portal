@@ -16,6 +16,7 @@
  *   開かなかった回は、いつも新しい接続で revoke_new_entry_lease → new_entry_lease_valid = false を確かめる (closeAndVerify)。
  *   「閉」と出すのは閉じたのを確かめたときだけ。確かめられない (grant の応答が切れた・返り値が壊れた・新しい接続も落ちた) = 「⚠️ 状態不明 (開いている可能性)」・exit 1 (#1645 Codex R1 High)
  *   🚨 0058 で new_entry_gate に ops.new_entry_lease_valid(text) の EXECUTE が要る (無いと毎回「状態不明」)
+ *   DATA_DIR が無い・引数の間違い・最上位の例外も、URL があれば同じ (runCli・#1645 Codex R2 High)。URL が無い = 「未設定」exit 0 (今の本番のまま)
  */
 import 'dotenv/config';
 import fs from 'node:fs';
@@ -37,7 +38,7 @@ const HEAD = '🆕 新商品の入口:';
  */
 export function skipAfterCompare(compareResult) {
   if (compareResult && compareResult.success) return null;
-  return { name: STEP_NAME, success: false, skipped: true, blocked: true, summary: `⏭️ 見送り (マスタ照合が失敗 = ${HEAD} 閉のまま。照合の再試行が成功したらこの段も流す)` };
+  return { name: STEP_NAME, success: false, skipped: true, blocked: true, summary: `⏭️ 見送り (マスタ照合が失敗 = この段は流さない・今朝は許可を出していない。照合の再試行が成功したらこの段も流す)` };
 }
 
 /**
@@ -123,20 +124,20 @@ const unknownLine = (why, note) => `⚠️ ${HEAD} 状態不明 (開いている
  */
 export async function runGateStep({ env = process.env, dataDir, now = new Date(), connect = connectGate, readEv = (d, a) => readEvidence(d, a) } = {}) {
   const url = String(env[ENV_URL] || '').trim();
-  if (!url) return { code: 0, state: 'not_configured', line: `${HEAD} 未設定 (${ENV_URL} が無い = この段は飛ばした・閉のまま)` };
-  if (!dataDir) return { code: 1, state: 'error', line: `${HEAD} 閉 (DATA_DIR が無い = 照合の証跡を読めない)` };
+  if (!url) return { code: 0, state: 'not_configured', line: `${HEAD} 未設定 (${ENV_URL} が無い = この段は飛ばした)` };
+  /** 開かなかった回の終わり方: 新しい接続で閉じたのを確かめた = 閉 (closedCode) / 確かめられない = 状態不明 (exit 1)。「閉」の語はここ (と runCli) だけ (#1645 Codex R2 High) */
+  const closeOut = async (why, revokeReason, { closedCode = 1, state = 'error', line = null } = {}) => {
+    const v = await closeAndVerify(url, revokeReason, { connect });
+    if (!v.ok) return { code: 1, state: 'unknown', line: unknownLine(why, v.note) };
+    return { code: closedCode, state, line: line || `${HEAD} 閉 (${why})` };
+  };
+  if (!dataDir) return closeOut('DATA_DIR が無い = 照合の証跡を読めない', '新商品の許可の段: DATA_DIR が無い');
   const asOf = jstDateStr(now);
   const syncRunId = String(env.DAILY_SYNC_RUN_ID || '').trim() || null;
   let ev;
   try { const all = readEv(dataDir, asOf) || {}; ev = all[syncRunId ? EVIDENCE_NAME : `${EVIDENCE_NAME}.manual`]; }
   catch (e) { ev = { error: short(e) }; }
   const cr = compareRunOf(ev, { asOf, syncRunId });
-  /** 開かなかった回の終わり方: 新しい接続で閉じたのを確かめた = 閉 (closedCode) / 確かめられない = 状態不明 (exit 1) */
-  const closeOut = async (why, revokeReason, { closedCode = 1, state = 'error', line = null } = {}) => {
-    const v = await closeAndVerify(url, revokeReason, { connect });
-    if (!v.ok) return { code: 1, state: 'unknown', line: unknownLine(why, v.note) };
-    return { code: closedCode, state, line: line || `${HEAD} 閉 (${why})` };
-  };
 
   let c;
   try { c = await connect(url); }
@@ -145,7 +146,7 @@ export async function runGateStep({ env = process.env, dataDir, now = new Date()
   try {
     const db = c.db;
     const has = (await db.query("select to_regprocedure('ops.grant_new_entry_lease(text, text)') is not null as ok")).rows[0]?.ok === true;
-    if (!has) return { code: 0, state: 'not_applied', line: `${HEAD} 閉のまま (許可の関数が無い = 0058 の前・この段は飛ばした)` };
+    if (!has) return { code: 0, state: 'not_applied', line: `${HEAD} 0058 の前 (許可の関数が無い = 許可そのものが無い・この段は飛ばした)` };
     if (cr.ok) {
       phase = 'grant';
       try { g = (await db.query('select ops.grant_new_entry_lease($1, $2) as r', [KIND, cr.compareRunId])).rows[0]?.r ?? null; granted = true; }
@@ -182,6 +183,23 @@ export async function runGateStep({ env = process.env, dataDir, now = new Date()
   return { code: 0, state: 'opened', grant: g, line: `${HEAD} 開 (〜${jstShort(g.expires_at)} JST・照合 ${cr.compareRunId}・許可 #${g.lease_id ?? '?'})` };
 }
 
+/**
+ * CLI の 1 回 (試験が env・接続を差し替える)。引数の間違い・最上位の例外 = URL があれば新しい接続で閉じて確かめる (#1645 Codex R2 High)。
+ *   確かめた = 閉・exit 1 / 確かめられない = 状態不明・exit 1 / URL が無い = 許可は出していない (「閉」とは言わない)・exit 1
+ */
+export async function runCli(argv, { env = process.env, connect = connectGate, readEv = undefined, now = undefined } = {}) {
+  try {
+    const a = parseArgs(argv);
+    return await runGateStep({ env, dataDir: (a.dataDir || env.DATA_DIR || '').trim(), connect, ...(readEv ? { readEv } : {}), ...(now ? { now } : {}) });
+  } catch (e) {
+    const why = `この段が落ちた: ${short(e).slice(0, 160)}`;
+    const url = String(env[ENV_URL] || '').trim();
+    if (!url) return { code: 1, state: 'error', line: `${HEAD} ${why} (${ENV_URL} が無い = 許可は出していない)` };
+    const v = await closeAndVerify(url, `新商品の許可の段: ${why}`, { connect });
+    return v.ok ? { code: 1, state: 'error', line: `${HEAD} 閉 (${why})` } : { code: 1, state: 'unknown', line: unknownLine(why, v.note) };
+  }
+}
+
 export function parseArgs(argv) {
   const out = { dataDir: null };
   for (let i = 0; i < argv.length; i++) {
@@ -198,11 +216,11 @@ const isMain = (() => { try { return !!process.argv[1] && fold(fs.realpathSync.n
 if (isMain) {
   let code = 1, last = '';
   try {
-    const a = parseArgs(process.argv.slice(2));
-    const r = await runGateStep({ dataDir: (a.dataDir || process.env.DATA_DIR || '').trim() });
+    const r = await runCli(process.argv.slice(2));
     code = r.code; last = r.line;
   } catch (e) {
-    last = `${HEAD} 閉 (${short(e)})`;
+    // runCli は投げない作り。投げたら確かめていない = 状態不明
+    last = unknownLine(`この段が落ちた: ${short(e)}`, '閉じたかを確かめられない');
     code = 1;
   }
   console.log(String(last).replace(/\s+/g, ' '));

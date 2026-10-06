@@ -5,7 +5,7 @@
  *   1 照合 (マスタ照合) が失敗・見送り = この段を流さない (⏭️・blocked = この段だけを retry に載せない)。成功 (⚠️ を含む) = 流す
  *   2 許可が出た = 「🆕 新商品の入口: 開 (〜10/08 07:00 JST」(DB の expires_at)・exit 0・grant は ('single', その朝の照合の回) で 1 回
  *   3 拒まれた = 新しい接続で revoke → 閉じたのを確かめて理由つきで「閉」・exit 1。widen の前だけで拒まれた = ⏸️ 閉・exit 0 (準備中)
- *   4 接続先が無い = 「未設定」・exit 0・接続しない / 関数が無い (0058 の前) = 「閉のまま」・exit 0・grant も revoke も呼ばない
+ *   4 接続先が無い = 「未設定」・exit 0・接続しない / 関数が無い (0058 の前) = 「0058 の前」・exit 0・grant も revoke も呼ばない
  *   5 照合 ② が判定できない・落ちた・完了していない = grant を呼ばない (新しい接続で閉じて確かめる・exit 0) / 証跡が無い・別の回・別の日 = exit 1
  *   6 接続できない・問い合わせの失敗 = exit 1 (新しい接続で閉じて確かめる)
  *   7 本物のプロセス (CLI): 未設定 = 最後の行が「未設定」で exit 0
@@ -14,6 +14,8 @@
  *  10 台帳: warehouse-daily-sync の purpose / runbook に載る (新しいエントリは作らない)・写しの門の一覧 (止めない側) に載る
  *  11 (#1645 Codex R1 High) grant の後に成功を確かめられない = 新しい接続で revoke → new_entry_lease_valid = false を確かめて「閉」・
  *     確かめられない = 「⚠️ 状態不明 (開いている可能性)」・exit 1。「閉」と出すのは閉じたのを確かめたときだけ
+ *  12 (#1645 Codex R2 High) DATA_DIR が無い・引数の間違い・最上位の例外も、URL があれば新しい接続で閉じて確かめる (開いた許可が閉じる)・
+ *     確かめられない = 状態不明。URL が無い = 「閉」と言わない。どの試験でも「閉」の行は、偽の DB が閉じたのを確かめた回だけ (run・cli の共通の確かめ)
  * 使い方: node scripts/test-new-entry-gate-step.mjs
  */
 import assert from 'node:assert/strict';
@@ -42,9 +44,9 @@ const evOk = (over = {}) => ({ name: 'master-compare', state: 'complete', as_of:
  *   grantDropped = grant は DB で通った (開いた) が応答が切れた・その接続はもう使えない
  */
 function fakeDb({ hasFn = true, grant = undefined, grantError = null, grantDropped = false, revokeError = null, validError = null, validAfterRevoke = false,
-  queryError = null, connectFailFrom = null } = {}) {
+  queryError = null, connectFailFrom = null, openAtStart = false } = {}) {
   const calls = [];
-  let closed = 0, n = 0, open = false;
+  let closed = 0, n = 0, open = openAtStart, verified = false;
   const connect = async () => {
     n++;
     if (connectFailFrom != null && n >= connectFailFrom) throw new Error(`ECONNREFUSED (接続 ${n})`);
@@ -69,14 +71,21 @@ function fakeDb({ hasFn = true, grant = undefined, grantError = null, grantDropp
         }
         if (/ops\.new_entry_lease_valid\(\$1\)/.test(text)) {
           if (validError) throw new Error(validError);
-          return { rows: [{ v: validAfterRevoke ? true : open }] };
+          const v = validAfterRevoke ? true : open;
+          if (v === false) verified = true;
+          return { rows: [{ v }] };
         }
         throw new Error(`知らない問い合わせ: ${text}`);
       },
     };
     return { db, close: async () => { closed++; } };
   };
-  return { calls, connect, closed: () => closed, connections: () => n, isOpen: () => open };
+  return { calls, connect, closed: () => closed, connections: () => n, isOpen: () => open, verifiedClosed: () => verified };
+}
+/** 「閉」の語 (閉じ… を除く) を出した行は、偽の DB が閉じたのを確かめた回だけ (#1645 Codex R2 High) */
+function assertClosedOnlyIfVerified(r, f) {
+  if (/閉(?!じ)/.test(r.line)) assert.ok(f.verifiedClosed() && !f.isOpen(), `確かめずに「閉」: ${r.line}`);
+  return r;
 }
 const grants = (f) => f.calls.filter((c) => /grant_new_entry_lease\(\$1/.test(c.text));
 const revokes = (f) => f.calls.filter((c) => /revoke_new_entry_lease/.test(c.text));
@@ -91,14 +100,15 @@ function assertFreshCloseVerify(f) {
   assert.ok(f.calls.indexOf(va[0]) > f.calls.indexOf(rv[0]), 'revoke の後に確かめる');
   assert.deepEqual(va[0].params, ['single']);
 }
-const run = (f, { env = ENV, ev = evOk(), name = 'master-compare' } = {}) =>
-  S.runGateStep({ env, dataDir: 'D:/fake', now: NOW, connect: f.connect, readEv: (d, a) => { assert.equal(a, AS_OF); return ev === null ? {} : { [name]: ev }; } });
+const run = async (f, { env = ENV, ev = evOk(), name = 'master-compare' } = {}) =>
+  assertClosedOnlyIfVerified(await S.runGateStep({ env, dataDir: 'D:/fake', now: NOW, connect: f.connect, readEv: (d, a) => { assert.equal(a, AS_OF); return ev === null ? {} : { [name]: ev }; } }), f);
 
 await ta('[1] 照合が失敗・見送り = 流さない (⏭️・blocked)。成功 (⚠️ を含む) = 流す', async () => {
   for (const r of [{ success: false, summary: '❌ x' }, { success: false, blocked: true, gated: true, summary: '⚠️ 見送り' }, undefined, null]) {
     const s = S.skipAfterCompare(r);
     assert.deepEqual([s.name, s.success, s.skipped, s.blocked], ['新商品の許可', false, true, true]);
-    assert.match(s.summary, /^⏭️ 見送り \(マスタ照合が失敗 = 🆕 新商品の入口: 閉のまま/);
+    assert.match(s.summary, /^⏭️ 見送り \(マスタ照合が失敗 = この段は流さない・今朝は許可を出していない/);
+    assert.doesNotMatch(s.summary, /閉/);   // 確かめていない = 「閉」と言わない
   }
   assert.equal(S.skipAfterCompare({ success: true, summary: '✅' }), null);
   assert.equal(S.skipAfterCompare({ success: true, summary: '⚠️ ②: 判定できない' }), null);   // blocked の判定はこの段が証跡で見る
@@ -157,18 +167,18 @@ await ta('[3] 拒まれた = 新しい接続で revoke → 閉じたのを確か
   assert.deepEqual(S.deniedCodes('別の失敗'), []);
 });
 
-await ta('[4] 接続先が無い = 未設定・exit 0・接続しない / 関数が無い (0058 の前) = 閉のまま・exit 0・grant も revoke も呼ばない', async () => {
+await ta('[4] 接続先が無い = 未設定・exit 0・接続しない / 関数が無い (0058 の前) = 0058 の前・exit 0・grant も revoke も呼ばない', async () => {
   let connected = 0;
   for (const env of [{ DAILY_SYNC_RUN_ID: RUN }, { COMPANY_DB_NEW_ENTRY_GATE_URL: '  ', DAILY_SYNC_RUN_ID: RUN }]) {
     const r = await S.runGateStep({ env, dataDir: 'D:/fake', now: NOW, connect: async () => { connected++; throw new Error('x'); }, readEv: () => ({ 'master-compare': evOk() }) });
     assert.deepEqual([r.code, r.state], [0, 'not_configured']);
-    assert.equal(r.line, '🆕 新商品の入口: 未設定 (COMPANY_DB_NEW_ENTRY_GATE_URL が無い = この段は飛ばした・閉のまま)');
+    assert.equal(r.line, '🆕 新商品の入口: 未設定 (COMPANY_DB_NEW_ENTRY_GATE_URL が無い = この段は飛ばした)');
   }
   assert.equal(connected, 0);
   const f = fakeDb({ hasFn: false });
   const r = await run(f);
   assert.deepEqual([r.code, r.state], [0, 'not_applied']);
-  assert.match(r.line, /^🆕 新商品の入口: 閉のまま \(許可の関数が無い = 0058 の前/);
+  assert.equal(r.line, '🆕 新商品の入口: 0058 の前 (許可の関数が無い = 許可そのものが無い・この段は飛ばした)');
   assert.equal(grants(f).length + revokes(f).length + valids(f).length, 0);
   assert.equal(f.connections(), 1);
   // 照合 ② が判定できない朝でも 0058 の前なら同じ (exit 0)
@@ -248,8 +258,6 @@ await ta('[6] 接続できない・問い合わせの失敗 = exit 1 (新しい�
   assert.match(r2.line, /^🆕 新商品の入口: 閉 \(許可を出せない: connection terminated\)$/);
   assertFreshCloseVerify(f);
   assert.equal(f.closed(), 2);
-  // DATA_DIR が無い
-  assert.equal((await S.runGateStep({ env: ENV, dataDir: '', now: NOW, connect: fakeDb().connect })).code, 1);
 });
 
 await ta('[7] 本物のプロセス: 未設定 = 最後の行が「未設定」で exit 0 / 知らない引数 = exit 1', async () => {
@@ -257,10 +265,12 @@ await ta('[7] 本物のプロセス: 未設定 = 最後の行が「未設定」�
   const env = { ...process.env, DATA_DIR: dir, DAILY_SYNC_RUN_ID: RUN, DOTENV_CONFIG_PATH: path.join(dir, 'none.env') };
   delete env.COMPANY_DB_NEW_ENTRY_GATE_URL;
   const out = execFileSync(process.execPath, [path.join(ROOT, 'apps/company-db/master-compare/new-entry-gate.mjs'), '--daily'], { cwd: dir, env, encoding: 'utf8', timeout: 30000 });
-  assert.equal(out.trim().split('\n').pop(), '🆕 新商品の入口: 未設定 (COMPANY_DB_NEW_ENTRY_GATE_URL が無い = この段は飛ばした・閉のまま)');
-  let st = null;
-  try { execFileSync(process.execPath, [path.join(ROOT, 'apps/company-db/master-compare/new-entry-gate.mjs'), '--bogus'], { cwd: dir, env, encoding: 'utf8', timeout: 30000, stdio: 'pipe' }); } catch (e) { st = e.status; }
+  assert.equal(out.trim().split('\n').pop(), '🆕 新商品の入口: 未設定 (COMPANY_DB_NEW_ENTRY_GATE_URL が無い = この段は飛ばした)');
+  let st = null, bogus = '';
+  try { execFileSync(process.execPath, [path.join(ROOT, 'apps/company-db/master-compare/new-entry-gate.mjs'), '--bogus'], { cwd: dir, env, encoding: 'utf8', timeout: 30000, stdio: 'pipe' }); } catch (e) { st = e.status; bogus = String(e.stdout).trim().split('\n').pop(); }
   assert.equal(st, 1);
+  // URL が無い = 確かめられない = 「閉」と言わない
+  assert.equal(bogus, '🆕 新商品の入口: この段が落ちた: 知らない引数: --bogus (COMPANY_DB_NEW_ENTRY_GATE_URL が無い = 許可は出していない)');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -377,6 +387,58 @@ await ta('[11] (#1645 R1 High) grant の後に成功を確かめられない = �
   // 「閉」と出る行は全部、閉じたのを確かめた回 (状態不明の行に「閉」の語が出ない)
   assert.doesNotMatch(rc.line, /入口: 閉/);
   assert.equal(typeof S.closeAndVerify, 'function');
+});
+
+await ta('[12] (#1645 R2 High) DATA_DIR が無い・引数の間違い・最上位の例外 = 開いた許可を新しい接続で閉じて確かめる / 確かめられない = 状態不明', async () => {
+  const cli = async (f, argv, { env = { ...ENV, DATA_DIR: 'D:/fake' }, now = NOW } = {}) =>
+    assertClosedOnlyIfVerified(await S.runCli(argv, { env, connect: f.connect, now, readEv: () => ({ 'master-compare': evOk() }) }), f);
+  // DATA_DIR が無い (朝に開いた許可が残っている)
+  const a = fakeDb({ openAtStart: true });
+  const ra = await S.runGateStep({ env: ENV, dataDir: '', now: NOW, connect: a.connect });
+  assertClosedOnlyIfVerified(ra, a);
+  assert.deepEqual([ra.code, ra.state, ra.line], [1, 'error', '🆕 新商品の入口: 閉 (DATA_DIR が無い = 照合の証跡を読めない)']);
+  assert.equal(a.isOpen(), false);   // DB の許可も閉じた
+  assert.deepEqual([revokes(a).length, valids(a).length, grants(a).length], [1, 1, 0]);
+  assert.match(revokes(a)[0].params[1], /DATA_DIR が無い/);
+  const ra2 = await cli(fakeDb({ openAtStart: true }), ['--daily'], { env: { ...ENV, DATA_DIR: '' } });
+  assert.equal(ra2.line, '🆕 新商品の入口: 閉 (DATA_DIR が無い = 照合の証跡を読めない)');
+  // DATA_DIR が無く、閉じる接続も落ちる = 状態不明 (DB は開いたまま)
+  const b = fakeDb({ openAtStart: true, connectFailFrom: 1 });
+  const rb = assertClosedOnlyIfVerified(await S.runGateStep({ env: ENV, dataDir: '', now: NOW, connect: b.connect }), b);
+  assert.deepEqual([rb.code, rb.state], [1, 'unknown']);
+  assert.match(rb.line, /^⚠️ 🆕 新商品の入口: 状態不明 \(開いている可能性・DATA_DIR が無い = 照合の証跡を読めない \/ 取り消しの接続もできない/);
+  assert.equal(b.isOpen(), true);
+  // 引数の間違い = 閉じて確かめる
+  const c = fakeDb({ openAtStart: true });
+  const rc = await cli(c, ['--bogus']);
+  assert.deepEqual([rc.code, rc.state, rc.line], [1, 'error', '🆕 新商品の入口: 閉 (この段が落ちた: 知らない引数: --bogus)']);
+  assert.equal(c.isOpen(), false);
+  assert.deepEqual([revokes(c).length, valids(c).length, grants(c).length], [1, 1, 0]);
+  // 引数の間違い + 確かめられない (取り消した後も有効と読めた) = 状態不明
+  const d = fakeDb({ openAtStart: true, validAfterRevoke: true });
+  const rd = await cli(d, ['--bogus']);
+  assert.deepEqual([rd.code, rd.state], [1, 'unknown']);
+  assert.match(rd.line, /^⚠️ 🆕 新商品の入口: 状態不明 \(開いている可能性・この段が落ちた: 知らない引数: --bogus \/ 取り消した後も有効と読めた \(true\)\)$/);
+  // 最上位の例外 (段の中で思いがけず投げた = 時計が壊れた) = 閉じて確かめる / 確かめられない = 状態不明
+  const e = fakeDb({ openAtStart: true });
+  const re = await cli(e, ['--daily'], { now: { getTime() { throw new Error('時計が壊れた'); } } });
+  assert.equal(re.code, 1);
+  assert.match(re.line, /^🆕 新商品の入口: 閉 \(この段が落ちた: /);
+  assert.equal(e.isOpen(), false);
+  assert.equal(grants(e).length, 0);
+  const g = fakeDb({ openAtStart: true, revokeError: 'permission denied' });
+  const rg = await cli(g, ['--daily'], { now: { getTime() { throw new Error('時計が壊れた'); } } });
+  assert.deepEqual([rg.code, rg.state], [1, 'unknown']);
+  assert.match(rg.line, /^⚠️ 🆕 新商品の入口: 状態不明 \(開いている可能性・この段が落ちた: .* \/ 取り消しも失敗 \(permission denied\)\)$/);
+  assert.equal(g.isOpen(), true);
+  // ふつうの CLI の回 (引数が正しい) は runGateStep と同じ = 開く
+  const h = fakeDb();
+  assert.equal((await cli(h, ['--daily'])).state, 'opened');
+  // 本体の「閉」の語の出口は、閉じたのを確かめた後 (closeOut・runCli) だけ
+  const src = fs.readFileSync(path.join(ROOT, 'apps/company-db/master-compare/new-entry-gate.mjs'), 'utf8').replace(/\r\n/g, '\n');
+  const outs = src.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*\*)/.test(l) && /\$\{HEAD\} 閉(?!じ)/.test(l));
+  assert.equal(outs.length, 3, outs.join('\n'));
+  assert.ok(outs.every((l) => /line: line \|\| `\$\{HEAD\} 閉 \(\$\{why\}\)`|closeOut\(`widen の前|return v\.ok \? \{ code: 1, state: 'error', line: `\$\{HEAD\} 閉/.test(l)), outs.join('\n'));
 });
 
 console.log(`\n${passed} 件 ok${process.exitCode ? ' (NG あり)' : ''}`);
