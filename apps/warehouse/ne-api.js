@@ -26,7 +26,7 @@ import { fileURLToPath } from 'url';
 import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks, readNeRawRev, neSrc, addSpelling, writeCodeSpellings } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 import { makeNeOrderBaseUpserter, toOrderBaseRow, NE_ORDER_BASE_FIELDS } from './ne-order-base-upsert.js';
-import { NE_FETCH_COUNTS_VERSION, NE_FETCH_COUNTS_KEY, checkNeFetchCounts, beginNeFetch, endNeFetch } from './ne-fetch-counts.js';
+import { NE_FETCH_COUNTS_VERSION, NE_FETCH_COUNTS_KEY, checkNeFetchCounts, beginNeFetch, endNeFetch, computeFetchFingerprint } from './ne-fetch-counts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
@@ -38,6 +38,13 @@ const CLIENT_SECRET = process.env.NE_CLIENT_SECRET;
 const REDIRECT_URI = process.env.NE_REDIRECT_URI || 'https://localhost:3000/callback';
 
 function now() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
+/**
+ * 取得の版 (広げる道 PR-9・設計 v14 §3.7・R14)。商品・セット商品の取得の始め (API の入力を読む前) に 1 回だけ計算し、完了まで持ち回る。
+ * 読めなければ null = 件数の確かめが落ちて完了の印を付けない (fail-closed)。取得そのものは止めない (raw 表への書き込みは今までどおり)
+ */
+function fetchFingerprintOrNull() {
+  try { return computeFetchFingerprint(); } catch (e) { console.warn(`[NE] ⚠️ 取得の版を計算できない (${e.message}) → 最後まで取れた印を付けない`); return null; }
+}
 
 // ─── トークン管理 ───
 
@@ -145,6 +152,7 @@ async function fetchProducts() {
   await initDB();
   const db = getDB();
   const ts = now();
+  const fetchFp = fetchFingerprintOrNull();   // 取得の版 (API の入力を読む前に 1 回だけ・完了まで持ち回る)
 
   const fields = 'goods_id,goods_name,goods_supplier_id,goods_cost_price,goods_selling_price,goods_merchandise_name,goods_representation_id,goods_location,goods_delivery_name,goods_lot,goods_last_time_supplied_date,goods_tag,goods_creation_date,stock_quantity,stock_allocation_quantity,goods_last_modified_date,goods_tax_rate,stock_remaining_order_quantity';
 
@@ -245,8 +253,8 @@ async function fetchProducts() {
     const completeCount = db.prepare('SELECT COUNT(*) AS c FROM raw_ne_products WHERE synced_at = ?').get(ts).c;
     // 取得の件数 (広げる道 PR-9・設計 v13 §3.6.3)。stored_rows は DB で数えた「この回の時刻の行」= コードの数えと別の数え方。
     //   式 (fetched = write_attempts + dropped_no_code + dropped_missing_fields) か、重なり (write_attempts − stored_rows = コードが数えた重なり) が崩れたら印を付けない (fail-closed)
-    const counts = { version: NE_FETCH_COUNTS_VERSION, kind: 'products', complete_at: ts, complete_rev: rev1,
-      fetched_rows: fetchedRows, write_attempts: total, stored_rows: completeCount, dropped_no_code: droppedNoCode, dropped_missing_fields: 0, dropped_missing_detail: {},
+    const counts = { version: NE_FETCH_COUNTS_VERSION, kind: 'products', complete_at: ts, complete_rev: rev1, fetch_fingerprint: fetchFp,
+      fetched_rows: fetchedRows, write_attempts: total, stored_rows: completeCount, dropped_no_code: droppedNoCode, dropped_missing_fields: 0, dropped_missing_detail: {}, notes: {},
       page_limit: LIMIT, pages: pageRows.length, page_rows: pageRows, last_page_rows: pageRows.length ? pageRows[pageRows.length - 1] : 0 };
     const problems = checkNeFetchCounts('products', counts, { expectDuplicates: dupRows });
     if (problems.length) return { ok: false, counts: problems };
@@ -275,6 +283,7 @@ async function fetchSetProducts() {
   await initDB();
   const db = getDB();
   const ts = now();
+  const fetchFp = fetchFingerprintOrNull();   // 取得の版 (API の入力を読む前に 1 回だけ・完了まで持ち回る)
 
   // set_goods_creation_date = セットの作成日 (NE の API の説明の取得できる項目にある)。商品管理リストの snapshot の 登録日 (セット) → Company DB の登録日 (0057)
   const fields = 'set_goods_id,set_goods_name,set_goods_selling_price,set_goods_detail_goods_id,set_goods_detail_quantity,set_goods_representation_id,set_goods_creation_date';
@@ -318,6 +327,7 @@ async function fetchSetProducts() {
   let droppedMissingKey = 0, droppedMissingParent = 0;
   // 取得の件数 (広げる道 PR-9): 受け取った行・同じ親 × 子 (小文字) が 2 度目以降に来た行 (= write_attempts − stored_rows を書く前に確かめる)
   let seenRows = 0, dupRows = 0;
+  let qtyDefaulted = 0;   // 構成品の数を整数として読めない・0 で、今までどおり 1 として書いた行 (落とさない。別の integrity 情報として数だけ。R14)
   const missingChildParents = new Set();   // 親はあるが子のコードが空 (C2。Codex C2-R0 M5 = その親だけ照合を止める)
   const spell = { set: new Map(), child: new Map(), set_rep: new Map() };   // NE のコードの元の書き方 (③b-1b。保存の前に全部の行から)
   // セットの作成日は親ごとに 1 つに決まるときだけ使う (#1624 Codex R1 Medium 1)。保存の前の全部の行 (同じ親 × 子の重複・子のコードが空の行も) で集める
@@ -351,6 +361,7 @@ async function fetchSetProducts() {
     parentAttrs.get(setCode).add(attr);
     const pk = `${setCode}\u0000${childCode}`;
     if (pairSeen.has(pk)) dupRows++;
+    if (!parseInt(item.set_goods_detail_quantity)) qtyDefaulted++;   // 下の parseInt(...) || 1 と同じ条件
     if (!pairSeen.has(pk)) pairSeen.set(pk, []);
     pairSeen.get(pk).push(neSrc(item.set_goods_detail_quantity));
     validRows.push([
@@ -398,13 +409,14 @@ async function fetchSetProducts() {
     }
     const completeCount = db.prepare('SELECT COUNT(*) AS c FROM raw_ne_set_products WHERE synced_at = ?').get(ts).c;
     const completeRev = readNeRawRev('setproducts');
-    // 取得の件数 (広げる道 PR-9・設計 v13 §3.6.3)。コードが空 = 親のコードが空 (子も空の行を含む) / 要る欄の欠け = 親はあるが子のコードが空。
+    // 取得の件数 (広げる道 PR-9・設計 v13 §3.6.3)。1 行は 1 つの分類 (ne-fetch-counts.js の NE_FETCH_MISSING_FIELDS の説明): コードが空 = 親のコードが空
+    //   (子も空の行を含む = 上の droppedMissingParent) / 要る欄の欠け = 親はあるが子のコードが空 (droppedMissingKey − droppedMissingParent)。
     //   stored_rows は DB で数えた「この回の時刻の行」。式か重なりが崩れたら印を付けない (fail-closed):
     //   入れ替えは今までどおり行い、前回の印・件数・整合の証跡を同じ取引で消す (CSV の取込と同じ「印が無い」= 照合は判定できない)
     const missingChild = droppedMissingKey - droppedMissingParent;
-    const counts = { version: NE_FETCH_COUNTS_VERSION, kind: 'setproducts', complete_at: ts, complete_rev: completeRev,
+    const counts = { version: NE_FETCH_COUNTS_VERSION, kind: 'setproducts', complete_at: ts, complete_rev: completeRev, fetch_fingerprint: fetchFp,
       fetched_rows: seenRows, write_attempts: total, stored_rows: completeCount, dropped_no_code: droppedMissingParent, dropped_missing_fields: missingChild,
-      dropped_missing_detail: { set_goods_detail_goods_id: missingChild },
+      dropped_missing_detail: { set_goods_detail_goods_id: missingChild }, notes: { quantity_defaulted_rows: qtyDefaulted },
       page_limit: LIMIT, pages: pageRows.length, page_rows: pageRows, last_page_rows: pageRows.length ? pageRows[pageRows.length - 1] : 0 };
     const problems = checkNeFetchCounts('setproducts', counts, { expectDuplicates: dupRows });
     if (problems.length) { clearNeCompleteMarks('setproducts'); return problems; }
