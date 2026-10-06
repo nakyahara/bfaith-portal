@@ -464,6 +464,39 @@ try {
     assert.deepEqual(notFound, []);
     assert.deepEqual(P.errors, []);
   });
+
+  await ta('[11] #1629 の見せ方: 税率は NE の書き方 (NE = 8%・社内 = 10% (0.1)・提案 = NE を 10 (%) に)・新しい理由 (社内の名前がコードのまま・名前がコードに見える・社内が 0 円) と提案の言葉', async () => {
+    own('x1', 'value:tx-10', 'tax_rate', 0.08, 0.1);
+    mk('k1', { sk: 'value:kk-77-set', col: 'name', kind: 'set', reason: 'cdb_name_is_code', n: null, n_state: 'empty', c: 'kk-77-set', res: ['fix_cdb', 'accept_difference'], prop: { op: 'fill_cdb_name' } });
+    mk('k2', { sk: 'value:kk-78', col: 'name', reason: 'name_like_code', n: 'NE の名前', c: 'KK-78', res: ['accept_difference', 'spec'], prop: { op: 'check_name' } });
+    mk('z1', { sk: 'value:zr-001', col: 'standard_price_jpy', reason: 'cdb_zero_yen', n: 1980, c: 0, res: ['accept_difference', 'fix_cdb'], prop: { op: 'decide_zero' } });
+    await writeDecisions(db, { compareRunId: runId(), observedAt: new Date(nowMs - 30e3).toISOString(), decisions: Object.keys(C).map((l) => C[l]) });
+    await page.goto(BASE);
+    await settle(page);
+    const rowOf = (code) => page.locator('#rows tr', { has: page.locator('a.rowlink', { hasText: code }) });
+    // 行の中の言葉が順に出る (間に何があってもよい)
+    const inOrder = async (code, words) => {
+      const t = await rowOf(code).textContent();
+      let at = 0;
+      for (const w of words) { const k = t.indexOf(w, at); assert.ok(k >= 0, `${code} の行に「${w}」が (順に) 無い: ${t}`); at = k + w.length; }
+    };
+    await inOrder('tx-10', ['NE', '8%', '社内', '10% (0.1)', 'NE を 10 (%) に']);
+    await inOrder('kk-77-set', ['社内の名前がコードのまま (仮の名前)', '社内 (ポータル) で本当の名前を入れる (NE も空)']);
+    await inOrder('kk-78', ['名前がコードに見える (確かめる)', '名前がコードで良いか確かめる (良ければ差を残す)']);
+    await inOrder('zr-001', ['1,980 円', '0 円', '社内が 0 円 (NE は 0 を表せない)', '社内の 0 円で良いか決める']);
+    assert.equal(await rowOf('kk-77-set').locator('[data-q="fix_ne"]').count(), 0);   // 名前 = コードは NE を直すを出さない
+    assert.equal(await rowOf('zr-001').locator('[data-q="fix_ne"]').count(), 0);
+    await shot(page, '08_判断_税率と新しい理由_1440.png');
+    await rowOf('tx-10').locator('a.rowlink').click();
+    await page.waitForSelector('.drawer-bg.on');
+    const d = await page.textContent('#detail');
+    let at = 0;
+    for (const w of ['NE の値', '8%', '社内の値 (Company DB)', '10% (0.1)', 'NE を 10 (%) に']) { const k = d.indexOf(w, at); assert.ok(k >= 0, `1 件の窓に「${w}」が (順に) 無い: ${d}`); at = k + w.length; }
+    if (SHOTS) await page.locator('#dr-bg').evaluate((el) => Promise.all(el.getAnimations({ subtree: true }).map((a) => a.finished)));   // 窓が出きってから写す
+    await shot(page, '09_判断_1件の窓_税率_1440.png', { full: false });
+    await page.keyboard.press('Escape');
+    assert.deepEqual(P.errors, []);
+  });
 } finally {
   if (P) await P.ctx.close().catch(() => {});
   await browser.close();

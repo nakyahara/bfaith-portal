@@ -124,13 +124,21 @@
     name_control: '改行・制御文字を含む', name_astral: '絵文字などを含む', name_length: '255 文字を超える', name_blank: '名前が空・前後に空白', yen_range: '1〜999,999,999 の整数でない',
     tax_value: '10% か 8% でない', handling_value: '取扱中 / 取扱中止 でない', supplier_format: '仕入先コードが 4 桁の数字でない', parent_code: '親のコードに使えない文字がある', target_mismatch: '承認の目標が候補と合わない',
     ne_code_pending: 'NE のコードの元の書き方が、今日の照合の分でまだ無い (照合の後に出ます)', ne_code_unknown: 'NE の取得にこのコードが無い', ne_code_collided: 'NE に同じコードの書き方が 2 つある (大文字・小文字違い。NE を見て決める)',
-    ne_code_invalid: 'NE のコードに CSV に書けない文字がある', parent_code_unknown: '親の名札の書き方が決まらない' };
+    ne_code_invalid: 'NE のコードに CSV に書けない文字がある', parent_code_unknown: '親の名札の書き方が決まらない',
+    name_is_code: '名前が商品コードと同じ (コードは名前ではない = NE に入れない。社内 (ポータル) で本当の名前を入れる)' };
   const VOIDWHY = { superseded: '後から別の判断があった', check_failed: '直前の確かめで外れた', rejected_all: 'NE に全部拒まれた', by_user: '使わないにした' };
-  const FAIL = { not_latest_approval: '承認がもう最後の判断ではない', done: 'もう完了した (NE が目標の値になった)', value_changed: '値が変わった', 'waiting:not_current': '今朝の照合に出ていない (NE の値が変わった)', reserved: 'ほかのファイルが予約中' };
+  const FAIL = { not_latest_approval: '承認がもう最後の判断ではない', done: 'もう完了した (NE が目標の値になった)', value_changed: '値が変わった', 'waiting:not_current': '今朝の照合に出ていない (NE の値が変わった)', reserved: 'ほかのファイルが予約中',
+    // 今の決まりで確かめ直して外れた (直す前に作ったファイル。#1629)。ダウンロードも 410 (unsafe) で配らない
+    'unsafe:name_is_code': '今の決まりでは使えない (名前が商品コードと同じ行がある)', 'unsafe:cell_format': '今の決まりでは使えない (値の形が違う行がある)',
+    'unsafe:bytes_differ': '今の決まりでは使えない (今の作り方とファイルの中身が違う)', 'unsafe:col_not_csv': '今の決まりでは使えない (CSV にしない項目)' };
   // 申告の 3 択 (NE の「進捗状況・履歴」のメッセージで選ぶ)
   const RESULTS = [['ok', '全部取り込めた', '「N件成功しました。」だけ'], ['partial', '一部失敗した', '「N件成功、M件失敗しました。」'], ['rejected_all', '全部拒まれた', '1 件も成功していない']];
   const show = (v) => (v === null || v === undefined ? '<span class="muted">(空)</span>' : esc(typeof v === 'object' ? JSON.stringify(v) : v));
-  const target = (x) => (x.col === 'parent' && x.value === null ? '親なし' : show(x.value));
+  // 税率は NE の書き方 (消費税率 % = 10 / 8) で見せる (CSV にも 10 / 8 と書く。値は Company DB の形 0.1 / 0.08)
+  const isRate = (x, v) => x.col === 'tax_rate' && typeof v === 'number' && Number.isFinite(v);
+  const pct = (v) => Math.round(v * 1000) / 10;
+  const showN = (x) => (isRate(x, x.n) ? esc(pct(x.n) + '%') : show(x.n));
+  const target = (x) => (x.col === 'parent' && x.value === null ? '親なし' : isRate(x, x.value) ? esc(pct(x.value) + '%') : show(x.value));
   const toDate = (s) => { if (!s) return null; const d = new Date(String(s).replace(' ', 'T').replace(/([+-]\d\d)$/, '$1:00')); return isNaN(d) ? null : d; };
   const fmtAt = (s) => { const d = toDate(s); if (!d) return String(s || '').slice(0, 16);
     try { return new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(d); } catch (e) { return String(s).slice(0, 16); } };
@@ -161,13 +169,13 @@
     const free = S.csv_items.filter((x) => !x.export_id).length;
     $('items-n').textContent = free + ' 件';
     $('items').innerHTML = S.csv_items.length ? S.csv_items.map((x, i) => '<tr><td class="ck">' + (x.export_id ? '' : '<input type="checkbox" class="ckb" data-i="' + i + '" aria-label="' + esc(x.code_norm + ' ' + (COL[x.col] || x.col)) + ' を選ぶ">') + '</td><td class="code">' + esc(x.code_norm) + '</td><td>' + esc(COL[x.col] || x.col)
-      + ' <span class="muted">' + esc(x.sku_kind === 'set' ? 'セット' : '単品') + '</span></td><td>' + show(x.n) + ' <span class="muted">→</span> <b>' + target(x) + '</b></td><td>'
+      + ' <span class="muted">' + esc(x.sku_kind === 'set' ? 'セット' : '単品') + '</span></td><td>' + showN(x) + ' <span class="muted">→</span> <b>' + target(x) + '</b></td><td>'
       + (x.export_id ? '<span class="b info">予約中 (ファイル ' + x.export_id + ')</span>' : '<span class="b mute">CSV にできる</span>') + '</td></tr>').join('') : '<tr class="loadrow"><td colspan="5">ありません</td></tr>';
     for (const cb of document.querySelectorAll('#items input[type=checkbox]')) cb.onchange = () => { const i = Number(cb.dataset.i); if (cb.checked) selected.add(i); else selected.delete(i); $('selcount').textContent = selected.size + ' 件を選択中'; };
     $('selcount').textContent = '0 件を選択中';
     $('make-sel').disabled = !CAN || !S.today;
     $('screen-n').textContent = S.ne_screen.length + ' 件';
-    $('screen').innerHTML = S.ne_screen.length ? S.ne_screen.map((x) => '<tr><td class="code">' + esc(x.code_norm) + '</td><td>' + esc(COL[x.col] || x.col) + (x.child ? ' / ' + esc(x.child) : '') + '</td><td>' + show(x.n) + ' <span class="muted">→</span> <b>' + target(x) + '</b></td><td class="muted">' + esc(WHY[x.reason] || x.reason) + '</td></tr>').join('')
+    $('screen').innerHTML = S.ne_screen.length ? S.ne_screen.map((x) => '<tr><td class="code">' + esc(x.code_norm) + '</td><td>' + esc(COL[x.col] || x.col) + (x.child ? ' / ' + esc(x.child) : '') + '</td><td>' + showN(x) + ' <span class="muted">→</span> <b>' + target(x) + '</b></td><td class="muted">' + esc(WHY[x.reason] || x.reason) + '</td></tr>').join('')
       : '<tr class="loadrow"><td colspan="4">ありません</td></tr>';
     renderExports();
     renderFlow();

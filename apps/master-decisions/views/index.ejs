@@ -106,7 +106,8 @@
   const REASON = { tax_fallback: '税率の補い', tax_unresolved: '税率が決まらない', exception_cost: '例外の原価', exception_tax_manual: '例外の税率', set_name_blank: 'セット名が空欄',
     set_price_from_goods: 'セット売価を商品表から', set_tax_from_components: 'セット税率を構成から', not_in_latest_fetch: '最新の取得に無い', 'load_rule:name_blank_to_code': '名前の空欄をコードで',
     manual: '手で入れた構成', parent_manual: '人が決めた代表 (親)', held_by_load: 'ロードが触らなかった', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', none: 'その他',
-    company_owned: '社内の値が正 (ポータルで直した)' };
+    company_owned: '社内の値が正 (ポータルで直した)', cdb_name_is_code: '社内の名前がコードのまま (仮の名前)',
+    name_like_code: '名前がコードに見える (確かめる)', cdb_zero_yen: '社内が 0 円 (NE は 0 を表せない)' };
   const CLS = { rule: '決まりで説明済み', rule_lag: '決まり (反映待ち)', held_by_load: 'ロードが保持', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', incomparable: '比べられない (NE の値が不正)' };
   const COL = { name: '商品名', handling: '取扱区分', tax_rate: '税率', standard_price_jpy: '売価', cost: '原価', primary_supplier: '代表の仕入先', components: '構成', exists: '有無', kind: '種類', parent: '代表 (親)' };
   const RES = { accept_difference: '差を残す', fix_ne: 'NE を直す', fix_cdb: '社内の値を直す', fix_input: '材料を直す', spec: '仕様を決める' };
@@ -119,23 +120,34 @@
   const STATUS = { pending: '判断待ち', approved: '承認済み', rejected: '却下', done: '完了' };
   const STATUS_TONE = { pending: 'warn', approved: 'info', rejected: 'mute', done: 'ok' };
   const SKIP = { not_found: '候補が無い', not_current: '今朝の照合に出ていない (差が消えた・変わった)', stale_view: '画面を開いた後に新しい照合があった (表示し直して)', decided_meanwhile: 'ほかの人が先に決めた (表示し直して)',
-    resolution_not_allowed: 'この差には選べない決め方', needs_target: '直す値の提案が無い (1 件ずつ値を入れて決める)', invalid_target: '直す値の形が違う', nothing_to_revoke: '取り消す判断が無い', db_rejected: 'DB が受け付けなかった' };
+    resolution_not_allowed: 'この差には選べない決め方', needs_target: '直す値の提案が無い (1 件ずつ値を入れて決める)', invalid_target: '直す値の形が違う', nothing_to_revoke: '取り消す判断が無い', db_rejected: 'DB が受け付けなかった',
+    name_is_code: '商品コードは名前ではない (NE に入れない・社内 (ポータル) で本当の名前を入れる)' };
   // 直す値の入れ方 (列ごと。文字のまま送り、サーバーが列に合わせて読む)
   const HINT = { name: '商品名', handling: '取扱中 / 取扱中止', tax_rate: '10 か 8', standard_price_jpy: '円 (整数)', cost: '円 (整数)', primary_supplier: '仕入先コード', components: '数量 か 無い', exists: 'あり / なし', kind: '単品 / セット', parent: '親のコード' };
-  const YEN = new Set(['standard_price_jpy', 'cost']);
-  const HANDLING = { active: '取扱中', discontinued: '取扱中止' };   // 見せ方だけ (送る値・目標はそのまま)
   const LIMIT = 500;
   const show = (v) => (v === null || v === undefined ? '<span class="muted">(空)</span>' : esc(typeof v === 'object' ? JSON.stringify(v) : v));
-  // 値の見せ方: 円は 3 桁ごと・税率は %。文字・(無い) などはそのまま
-  const val = (col, v) => {
+  const YEN = new Set(['standard_price_jpy', 'cost']);
+  const HANDLING = { active: '取扱中', discontinued: '取扱中止' };   // 見せ方だけ (送る値・目標はそのまま)
+  // 税率は NE の書き方 (消費税率 % = 10 / 8) で見せる。社内の値は Company DB の形も添える (10% (0.1))。NE に入れる値 (CSV) も 10 / 8 (#1629)
+  const pct = (v) => Math.round(v * 1000) / 10;
+  const isRate = (col, v) => col === 'tax_rate' && typeof v === 'number' && Number.isFinite(v);
+  const showNe = (col, v) => (isRate(col, v) ? esc(pct(v) + '%') : show(v));
+  const showCdb = (col, v) => (isRate(col, v) ? esc(pct(v) + '% (' + v + ')') : show(v));
+  // 値の見せ方: 円は 3 桁ごと・税率は % (side = 'cdb' は社内の値 = 10% (0.1))。文字・(無い) などはそのまま
+  const val = (col, v, side) => {
     if (v === null || v === undefined || v === '') return '<span class="dvv nil">(空)</span>';
     if (col === 'handling' && Object.hasOwn(HANDLING, String(v))) return '<span class="dvv">' + esc(HANDLING[v]) + '</span>';
     if (typeof v === 'number' && YEN.has(col)) return '<span class="dvv num">' + esc(v.toLocaleString('ja-JP')) + ' 円</span>';
-    if (typeof v === 'number' && col === 'tax_rate' && v > 0 && v < 1) return '<span class="dvv num">' + esc(Math.round(v * 1000) / 10) + '%</span>';
+    if (isRate(col, v)) return '<span class="dvv num">' + (side === 'cdb' ? showCdb(col, v) : showNe(col, v)) + '</span>';
     return '<span class="dvv">' + esc(typeof v === 'object' ? JSON.stringify(v) : v) + '</span>';
   };
   const colName = (c) => (COL[c.col] || c.col) + (c.child ? ' / ' + c.child : '');
-  const proposalText = (c) => { const p = c.proposal || {}; if (p.op === 'set_ne_value') return 'NE を <b>' + val(c.col, p.value) + '</b> に'; if (p.op === 'decide_manual_priority') return '手の構成と NE のどちらを採るか'; if (p.op === 'fix_load_input') return '材料を直す'; if (p.op === 'decide_spec') return '仕様を決める'; return '決める'; };
+  const proposalText = (c) => { const p = c.proposal || {};
+    if (p.op === 'set_ne_value') return 'NE を <b>' + (isRate(c.col, p.value) ? '<span class="dvv num">' + esc(String(pct(p.value))) + ' (%)</span>' : val(c.col, p.value)) + '</b> に';
+    if (p.op === 'check_name') return '名前がコードで良いか確かめる (良ければ差を残す)';
+    if (p.op === 'decide_zero') return '社内の 0 円で良いか決める (良ければ差を残す・違えば社内を直す)';
+    if (p.op === 'fill_cdb_name') return '社内 (ポータル) で本当の名前を入れる (NE も空)';
+    if (p.op === 'decide_manual_priority') return '手の構成と NE のどちらを採るか'; if (p.op === 'fix_load_input') return '材料を直す'; if (p.op === 'decide_spec') return '仕様を決める'; return '決める'; };
   const canFixNe = (c) => (c.resolutions || []).includes('fix_ne') && c.col !== 'parent' && !!c.proposal && c.proposal.op === 'set_ne_value' && c.proposal.value !== null && c.proposal.value !== undefined;
   const canKeep = (c) => (c.resolutions || []).includes('accept_difference');
   const who = (email) => String(email || '').split('@')[0];
@@ -295,7 +307,7 @@
     return '<tr data-i="' + i + '"' + (picked.has(c.fingerprint) ? ' class="picked"' : '') + '>'
       + '<td class="ck">' + (CAN ? '<input type="checkbox" class="ckb" data-i="' + i + '" aria-label="' + esc(lbl) + ' を選ぶ"' + (picked.has(c.fingerprint) ? ' checked' : '') + '>' : '') + '</td>'
       + '<td><a class="rowlink" href="#" data-open="' + i + '" aria-label="' + esc(lbl) + ' を開く">' + esc(c.code_norm) + '</a><span class="sub colname">' + esc(colName(c)) + (c.sku_kind ? ' · ' + (c.sku_kind === 'set' ? 'セット' : '単品') : '') + '</span></td>'
-      + '<td class="dv"><div class="dvline ne"><span class="dvk">NE</span>' + val(c.col, c.n) + '</div><div class="dvline cdb"><span class="dvk">社内</span>' + val(c.col, c.c) + '</div></td>'
+      + '<td class="dv"><div class="dvline ne"><span class="dvk">NE</span>' + val(c.col, c.n) + '</div><div class="dvline cdb"><span class="dvk">社内</span>' + val(c.col, c.c, 'cdb') + '</div></td>'
       + '<td class="rsn">' + esc(REASON[c.reason_kind] || c.reason_kind) + '<span class="sub">' + esc(CLS[c.cls] || c.cls) + '</span></td>'
       + '<td class="prop">' + proposalText(c) + '</td>'
       + '<td class="st">' + st + '</td>'
@@ -414,14 +426,14 @@
     const c = d.candidate;   // 読み直した今の候補 (一覧の古い行ではなく)
     openFp = fp; openC = c; if (!keep) drawerFrom = from || document.activeElement;
     const prevRes = keep && $('d-seg') ? $('d-seg').getAttribute('data-value') : null;
-    const ev = d.events.slice().reverse().map((e) => '<li>' + esc(e.kind === 'action_done' ? '完了 (照合が目標の値を見た)' : e.kind === 'approved' ? '承認: ' + (RES[e.resolution] || e.resolution) + (e.target ? ' → ' + JSON.stringify(e.target.value) : '') : e.kind === 'rejected' ? '却下' : '取り消し')
+    const ev = d.events.slice().reverse().map((e) => '<li>' + esc(e.kind === 'action_done' ? '完了 (照合が目標の値を見た)' : e.kind === 'approved' ? '承認: ' + (RES[e.resolution] || e.resolution) + (e.target ? ' → ' + (isRate(c.col, e.target.value) ? pct(e.target.value) + '%' : JSON.stringify(e.target.value)) : '') : e.kind === 'rejected' ? '却下' : '取り消し')
       + '<span class="w">' + esc(fmtAt(e.created_at)) + ' · ' + esc(e.actor) + (e.note ? ' 「' + esc(e.note) + '」' : '') + '</span></li>').join('');
     const ress = c.resolutions || [];
     const def = prevRes && ress.includes(prevRes) ? prevRes : ress.includes('fix_ne') ? 'fix_ne' : ress[0];
     $('dr-t').innerHTML = '<span class="code-pill">' + esc(c.code_norm) + '</span> ' + esc(colName(c)) + '<span class="sub">' + (c.sku_kind ? (c.sku_kind === 'set' ? 'セット' : '単品') + ' · ' : '') + esc(REASON[c.reason_kind] || c.reason_kind) + ' · ' + esc(CLS[c.cls] || c.cls) + '</span>';
     $('detail').innerHTML = '<div class="idrow"><span class="b ' + (STATUS_TONE[c.status] || 'mute') + '"><span class="dot"></span>' + esc(STATUS[c.status]) + (c.decision && c.status === 'approved' ? ' · ' + esc(RES[c.decision.resolution] || c.decision.resolution) : '') + '</span>' + (c.reoccurred ? '<span class="reo">再発</span>' : '')
       + '<span class="hint">初めて ' + esc(fmtAt(c.first_seen_at, false)) + ' · 最後 ' + esc(fmtAt(c.last_seen_at, false)) + ' · ' + c.seen_count + ' 回の照合' + (c.current ? '' : ' · 今朝の照合には出ていない') + '</span></div>'
-      + '<div class="cmp"><div class="box ne"><div class="k">NE の値</div><div class="v">' + val(c.col, c.n) + '</div></div><div class="box cdb"><div class="k">社内の値 (Company DB)</div><div class="v">' + val(c.col, c.c) + '</div></div></div>'
+      + '<div class="cmp"><div class="box ne"><div class="k">NE の値</div><div class="v">' + val(c.col, c.n) + '</div></div><div class="box cdb"><div class="k">社内の値 (Company DB)</div><div class="v">' + val(c.col, c.c, 'cdb') + '</div></div></div>'
       + '<div class="proprow"><span class="k">照合の提案</span>' + proposalText(c) + '</div>'
       + (CAN ? '<div class="decide"><div class="ttl" id="d-h">この差を決める</div>'
         + '<div class="seg" id="d-seg" role="group" aria-labelledby="d-h" data-value="' + esc(def || '') + '">' + ress.map((r) => '<button type="button" data-v="' + esc(r) + '" class="' + (r === def ? 'on' : '') + '" aria-pressed="' + (r === def) + '">' + esc(RES[r] || r) + '</button>').join('') + '</div>'

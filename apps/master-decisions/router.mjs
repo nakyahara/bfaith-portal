@@ -167,6 +167,7 @@ router.get('/api/csv/exports/:id/file', gated(async (db, req, res) => {
   const f = await exportFile(db, exportIdOf(req), { nowMs: clock() });
   if (!f) return res.status(404).json({ ok: false, error: 'ファイルが無い' });
   if (f.state === 'void') return res.status(410).json({ ok: false, error: 'このファイルは使えません (void)。取り込まないでください', reason: 'void' });
+  if (f.state === 'unsafe') return res.status(410).json({ ok: false, error: `このファイルは今の決まりでは使えません (${f.reason === 'name_is_code' ? '名前が商品コードと同じ行がある' : f.reason})。取り込まないで、作り直してください`, reason: 'unsafe', detail: f.reason });
   if (f.state === 'retired') return res.status(410).json({ ok: false, error: 'この申告済みのファイルはもう使えません。取り込み直すなら作り直してください', reason: 'retired' });
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${f.file_name}"`);
