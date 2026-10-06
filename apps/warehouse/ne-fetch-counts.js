@@ -224,6 +224,8 @@ function markShapeOk(v, kind) {
     && v.version === NE_FETCH_COUNTS_VERSION && (kind === undefined || v.kind === kind)
     && typeof v.run_id === 'string' && /^[0-9a-f-]{36}$/.test(v.run_id)
     && Number.isSafeInteger(v.started_ms) && v.started_ms > 0
+    // Date の範囲 (±8.64e15) の外は safe integer でも toISOString が RangeError = 例外で毎回止まる前に壊れた印にする (Codex #1642 R4 Medium)
+    && Number.isFinite(new Date(v.started_ms).getTime())
     // started_at は started_ms と同じ取得の始めの時刻 (UTC の 'YYYY-MM-DD HH:MM:SS' = started_ms の秒まで)。不正な日付・別の時刻 = 壊れた印 (Codex #1642 R3 Medium)
     && typeof v.started_at === 'string' && v.started_at === utcSecondText(v.started_ms)
     && Number.isSafeInteger(v.pid) && v.pid > 0

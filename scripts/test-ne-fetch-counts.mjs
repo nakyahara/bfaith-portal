@@ -510,6 +510,10 @@ await ta('[14] 同じ種類の取得は 1 本ずつ (Codex #1642 R1・R2): A の
     await reclaim('started_at が無い日付', mark('setproducts', { started_at: '2026-02-30 00:00:00' }));
     await reclaim('started_at が 1 秒ずれ', mark('setproducts', { started_at: sec(Date.now() - 2000) }));
     await reclaim('started_at の形 (ISO)', mark('setproducts', { started_at: new Date().toISOString() }));
+    // started_ms が safe integer でも Date の範囲の外 (toISOString が RangeError) → 例外にせず回収 (Codex #1642 R4 Medium)
+    const hugeMark = () => JSON.stringify({ version: 'fc1', kind: 'setproducts', run_id: crypto.randomUUID(), started_at: sec(Date.now()), started_ms: Number.MAX_SAFE_INTEGER, pid: liveNode.pid, host: os.hostname() });
+    assert.equal(judgeNeFetchMark(hugeMark(), Date.now(), { isAlive: () => true }).alive, false);
+    await reclaim('started_ms が Date の範囲の外', hugeMark());
     // (e) 判定そのもの: 別の host は期限まで生きている・この process の終わった回は死んでいる・今走っている回は生きている・生きているかの判定は差し替えられる
     const now = Date.now();
     const yes = () => true, no = () => false;
