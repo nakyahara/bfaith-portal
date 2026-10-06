@@ -537,7 +537,8 @@ export async function declareExport(db, { actor, exportId, result, note = null, 
       throw new DecideError('この申告済みのファイルはもう使えません (次の日になった・新しい照合があった・行の予約が外れた)。取り込み直すなら作り直してください', 'retired');
     }
     // 今の決まりで確かめ直す (直す前に確かめたファイルを申告で通さない)
-    const unsafe = unsafeReason(e, await exportRowsOf(db, exportId));
+    const bytesRow = (await db.query('select file_bytes from ops.ne_csv_exports where export_id = $1', [exportId])).rows[0];   // ロードした (for update) ファイルの保存した byte 列
+    const unsafe = unsafeReason(e, await exportRowsOf(db, exportId), bytesRow ? Buffer.from(bytesRow.file_bytes) : null);
     if (unsafe) throw new DecideError(`このファイルは今の決まりでは使えません (${unsafe})。取り込まないで、作り直してください`, 'unsafe');
     await db.query(`insert into ops.ne_csv_attempts (export_id, declared_by, declared_at, result, note) values ($1, $2, $3, $4, $5)`, [exportId, actor, iso(nowMs), result, note || null]);
     if (e.state === 'declared') return { state: 'declared', first_declared_at: e.declared_at };

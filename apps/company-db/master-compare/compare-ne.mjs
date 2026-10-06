@@ -611,8 +611,9 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       if (!eqv(copy, c)) return { cls: 'rule_lag', detail, explained: co };
       const why = (reason) => { const x = { reason }; detail.reasons = [...(detail.reasons || []), x]; return { cls: 'rule', detail, explained: x }; };
       if (nameLike) {
-        // 夜間ロードの `name || code` の名残と言える証拠 = 社内の名前が NE のコードの書き方そのもの かつ NE の名前が空 (今の取得・材料)
-        const placeholder = c === neCode && (nst?.raw === 'empty' || blankName.has(norm));
+        // 夜間ロードの `name || code` の名残と言える証拠 = 社内の名前が NE のコードの書き方そのもの かつ 今の NE の取得の名前が空
+        //   (材料の snapshot の名前 = blankName は使わない: 持ち主が C の後の材料は C の写し = 由来の証明にならない。#1629 Codex R2)
+        const placeholder = c === neCode && nst?.raw === 'empty';
         return why(placeholder ? 'cdb_name_is_code' : 'name_like_code');
       }
       // 社内 0 円 (実値) = NE は 0 と未入力を区別できず CSV も 0 を書かない = 人が決める (一致にしない・NE を直すは出さない)

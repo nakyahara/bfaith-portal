@@ -1275,8 +1275,9 @@ await ta('[32] 持ち主が C の名前・売価・原価 (2026-10-05・#1629 Co
     await sku('c003', `name = 'c003', standard_price_jpy = 0`); await zeroCost('c003');
     await sku('d004', `name = 'Ｄ００４', standard_price_jpy = 0`);
     await sku('e005', 'standard_price_jpy = 5555');
-    await sku('f006', 'standard_price_jpy = null');
-    await sku('s001', `name = 's001'`);                            // 材料は前の名前 (セット1) = rule_lag
+    await sku('e005', `name = 'e005'`);                            // NE に名前あり・材料の名前が空・社内 = コード = 証拠なし (材料は由来の証明にしない。#1629 Codex R2)
+    await sku('f006', `name = 'f006', standard_price_jpy = null`);  // 名前: 材料は前の名前 (単品F) = rule_lag
+    await sku('s001', `name = 's001'`);                            // セット: NE に名前 (セット1)・材料の名前が空・社内 = コード = 証拠なし
     await sku('s002', `name = 's002', standard_price_jpy = 0`);
   };
   // 今朝の写し = C の値 (a001 の売価と s001 の名前だけ前の値 = 写し待ち)
@@ -1284,7 +1285,8 @@ await ta('[32] 持ち主が C の名前・売価・原価 (2026-10-05・#1629 Co
     for (const [code, k, v] of [['a001', '商品名', 'a001'], ['b002', '商品名', 'B002'], ['b002', '原価', 0], ['b002', '原価ソース', '例外'], ['b002', '原価状態', 'OVERRIDDEN'],
       ['c003', '商品名', 'c003'], ['c003', '標準売価', 0], ['c003', '原価', 0], ['c003', '原価ソース', '例外'], ['c003', '原価状態', 'OVERRIDDEN'], ['d004', '商品名', 'Ｄ００４'], ['d004', '標準売価', 0],
       ['e005', '標準売価', 5555], ['f006', '標準売価', null], ['f006', '消費税率', 0.1], ['s002', '商品名', 's002'], ['s002', '標準売価', 0]]) setMat(m, code, k, v);
-    setMat(m, 'a001', '標準売価', 1000); setMat(m, 's001', '商品名', 'セット1');
+    setMat(m, 'a001', '標準売価', 1000); setMat(m, 'f006', '商品名', '単品F');   // 写し待ち
+    setMat(m, 'e005', '商品名', ''); setMat(m, 's001', '商品名', '');            // 材料の名前が空 (NE には名前がある)
   });
   const x = await day('2030-07-02', { ne: ne1, material: copyOfC, beforeLoad: cEdit, ownership: own });
   const one = (key, c) => { const cc = col(x.ne, key, c); assert.equal(cc.length, 1, `${key} ${c}: ${JSON.stringify(cc)} held=${x.ne.held[key]}`); return cc[0]; };
@@ -1296,7 +1298,9 @@ await ta('[32] 持ち主が C の名前・売価・原価 (2026-10-05・#1629 Co
     ['value:b002', 'name', 'rule', 'name_like_code', { op: 'check_name' }, ['accept_difference', 'spec']],   // NE に名前 = 社内を NE に戻す既定は出さない
     ['value:d004', 'name', 'rule', 'name_like_code', { op: 'check_name' }, ['accept_difference', 'spec']],   // 全角のコード = 夜間ロードの名残の証拠なし
     ['value:a001', 'name', 'rule', 'name_like_code', { op: 'check_name' }, ['accept_difference', 'spec']],   // NE も社内もコード名 = 一致にしない
-    ['value:s001', 'name', 'rule_lag', 'company_owned', { op: 'decide' }, ['accept_difference', 'fix_ne']],  // 写し待ちを隠さない (コード名でも NE をコードにする提案は出さない)
+    ['value:e005', 'name', 'rule', 'name_like_code', { op: 'check_name' }, ['accept_difference', 'spec']],   // 材料の名前が空でも NE に名前 = 証拠なし (単品)
+    ['value:s001', 'name', 'rule', 'name_like_code', { op: 'check_name' }, ['accept_difference', 'spec']],   // 同じ (セット)
+    ['value:f006', 'name', 'rule_lag', 'company_owned', { op: 'decide' }, ['accept_difference', 'fix_ne']],  // 写し待ちを隠さない (コード名でも NE をコードにする提案は出さない)
     ['value:c003', 'standard_price_jpy', 'rule', 'cdb_zero_yen', { op: 'decide_zero' }, ['accept_difference', 'fix_cdb']],   // NE 0.00・社内 0
     ['value:s002', 'standard_price_jpy', 'rule', 'cdb_zero_yen', { op: 'decide_zero' }, ['accept_difference', 'fix_cdb']],   // セット
     ['value:d004', 'standard_price_jpy', 'rule', 'cdb_zero_yen', { op: 'decide_zero' }, ['accept_difference', 'fix_cdb']],   // NE 1980・社内 0

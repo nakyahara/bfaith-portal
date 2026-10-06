@@ -819,8 +819,8 @@ await ta('[27] 直す前に作った・確かめた CSV (名前 = コード) は
   const ev = async (c) => Number((await f.pg.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'setup@test') returning event_id`,
     [c.fingerprint, JSON.stringify({ subject_key: c.subject_key, col: c.col, child: null, value: 'x' })])).rows[0].event_id);
   // 直す前の作り方 = 照合が出した「NE を akadama-1 に」をそのまま CSV にした (今の buildCsv は作らない = byte 列を手で)
-  const oldFile = async (c, code, cell, state) => {
-    const bytes = Buffer.from(`syohin_code,syohin_name\r\n${code},${cell}\r\n`, 'utf8');
+  const oldFile = async (c, code, cell, state, saved = null) => {
+    const bytes = saved || Buffer.from(`syohin_code,syohin_name\r\n${code},${cell}\r\n`, 'utf8');
     const e = (await f.pg.query(`insert into ops.ne_csv_exports (kind, col, ne_column, converter_version, encoding, trial, row_count, sha256, file_bytes, compare_run_id, created_by, created_at, state, checked_at, checked_run, checked_by)
       values ('products', 'name', 'syohin_name', 'ne-csv-v2', 'utf8', true, 1, $1, $2, $3, 'old@test', $4, $5, $6, $7, $8) returning export_id`,
     [sha(bytes), bytes, run1, new Date(at(day, 9)).toISOString(), state, state === 'checked' ? new Date(at(day, 9)).toISOString() : null, state === 'checked' ? run1 : null, state === 'checked' ? 'old@test' : null])).rows[0].export_id;
@@ -839,6 +839,12 @@ await ta('[27] 直す前に作った・確かめた CSV (名前 = コード) は
   assert.equal((await csvMod.exportFile(f.db, safe, { nowMs })).bytes.toString('utf8'), 'syohin_code,syohin_name\r\nt001,本物の名前\r\n');   // 安全な古いファイルはそのまま
   // 確かめ済みのファイルも申告できない
   await assert.rejects(csvMod.declareExport(f.db, { actor: 'naka@test', exportId: checked, result: 'ok', nowMs }), (e) => e.code === 'unsafe' || /今の決まりでは使えません/.test(e.message));
+  // 行は安全でも、保存した byte 列が行から作る CSV と違う確かめ済みのファイル = 申告を拒む・配らない (#1629 Codex R2)
+  const differ = await oldFile(C.a001, 't002', '本物の名前2', 'checked', Buffer.from('syohin_code,syohin_name\r\nt002,akadama-1\r\n', 'utf8'));
+  await assert.rejects(csvMod.declareExport(f.db, { actor: 'naka@test', exportId: differ, result: 'ok', nowMs }), /bytes_differ/);
+  const df = await csvMod.exportFile(f.db, differ, { nowMs });
+  assert.deepEqual([df.state, df.reason], ['unsafe', 'bytes_differ']);
+  assert.equal((await f.pg.query('select count(*)::int as n from ops.ne_csv_attempts where export_id = $1', [differ])).rows[0].n, 0);   // 申告の試みも残さない
   // 確かめる = 外れて void (予約を外す = 作り直せる)
   const ck = await csvMod.checkExport(f.db, { actor: 'naka@test', exportId: made, nowMs });
   assert.deepEqual([ck.passed, ck.voided, ck.failures.map((x) => x.reason)], [false, true, ['unsafe:name_is_code']]);
