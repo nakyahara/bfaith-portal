@@ -328,6 +328,8 @@ router.get('/api/unregistered', (req, res) => handle(res, () => ({
   rows: listUnregistered(),
   hidden: listHiddenUnregistered(),
 })));
+// 「削除したもの」を商品コード・商品名で絞る ({ total, rows })
+router.get('/api/unregistered/hidden', (req, res) => handle(res, () => listHiddenUnregistered(req.query.q || '')));
 // 未登録一覧から外す / 元に戻す (body: { codes: [...] })。NE の商品マスタ・配送ルールは触らない。
 router.post('/api/unregistered/hide', (req, res) => handle(res, () => hideUnregistered((req.body || {}).codes, currentUser(req))));
 router.post('/api/unregistered/unhide', (req, res) => handle(res, () => unhideUnregistered((req.body || {}).codes, currentUser(req))));

@@ -338,6 +338,8 @@
       <details id="unregHiddenWrap">
         <summary>🗑️ 削除したもの (<span id="unregHiddenCount">0</span>件) — 間違えて削除したら「元に戻す」</summary>
         <div class="row" style="margin-top:8px">
+          <input id="unregHidQ" type="search" placeholder="商品コード・商品名で絞る" style="width:240px" />
+          <span id="unregHidShown" class="muted"></span>
           <span id="unregHidSelCount" class="muted">0件選択</span>
           <button id="btnUnregUnhideSel" class="sub" disabled>選択したものを元に戻す</button>
         </div>
@@ -1619,9 +1621,22 @@ let UNREG_ROWS = [], UNREG_HIDDEN = [];
 async function loadUnreg(){
   const r = await api('api/unregistered');
   $('#freshness').textContent = r.freshness ? `ミラー最終同期: ${r.freshness}` : 'ミラー同期時刻不明';
-  UNREG_ROWS = r.rows || []; UNREG_HIDDEN = r.hidden || [];
-  renderUnreg(); renderUnregHidden();
+  UNREG_ROWS = r.rows || [];
+  renderUnreg();
+  const q = $('#unregHidQ').value.trim();
+  setUnregHidden(q ? await api('api/unregistered/hidden?q='+encodeURIComponent(q)) : r.hidden);
 }
+// 「削除したもの」は新しい順に最大 500 件。総件数は total、それより多ければ検索で絞る。
+let UNREG_HIDDEN_TOTAL = 0;
+function setUnregHidden(h){
+  UNREG_HIDDEN = (h && h.rows) || []; UNREG_HIDDEN_TOTAL = (h && h.total) || 0;
+  renderUnregHidden();
+}
+let unregHidTimer = null;
+$('#unregHidQ').oninput=()=>{ clearTimeout(unregHidTimer); unregHidTimer=setTimeout(async()=>{
+  const q=$('#unregHidQ').value.trim();
+  try{ setUnregHidden(await api('api/unregistered/hidden?q='+encodeURIComponent(q))); }catch(e){ alert('検索できませんでした: '+e.message); }
+}, 300); };
 function renderUnreg(){
   const tb=$('#unregBody'); tb.innerHTML=''; $('#unregHeadChk').checked=false;
   UNREG_ROWS.forEach((x,i)=>{ const tr=document.createElement('tr');
@@ -1645,7 +1660,11 @@ function updateUnregSel(){
 }
 function renderUnregHidden(){
   const tb=$('#unregHiddenBody'); tb.innerHTML=''; $('#unregHidHeadChk').checked=false;
-  $('#unregHiddenCount').textContent = String(UNREG_HIDDEN.length);
+  const q = $('#unregHidQ').value.trim();
+  if(!q) $('#unregHiddenCount').textContent = String(UNREG_HIDDEN_TOTAL);
+  $('#unregHidShown').textContent = UNREG_HIDDEN.length < UNREG_HIDDEN_TOTAL
+    ? `${UNREG_HIDDEN_TOTAL} 件のうち新しい ${UNREG_HIDDEN.length} 件を表示 (検索で絞れます)`
+    : (q ? `${UNREG_HIDDEN_TOTAL} 件見つかりました` : '');
   UNREG_HIDDEN.forEach((x,i)=>{ const tr=document.createElement('tr');
     const state = x.still_unregistered ? '未登録のまま' : '<span class="muted">一覧の対象外 (取扱中止・登録済み等)</span>';
     tr.innerHTML=`<td style="text-align:center"><input type="checkbox" class="hsel" data-i="${i}"></td>`+
@@ -1654,7 +1673,7 @@ function renderUnregHidden(){
       `<td><button class="sub" data-unhide>元に戻す</button></td>`;
     tr.querySelector('[data-unhide]').onclick=()=>unhideUnreg([x]);
     tb.appendChild(tr); });
-  if(!UNREG_HIDDEN.length) tb.innerHTML='<tr><td colspan="6" class="muted">削除したものはありません。</td></tr>';
+  if(!UNREG_HIDDEN.length) tb.innerHTML=`<tr><td colspan="6" class="muted">${q ? '見つかりません。' : '削除したものはありません。'}</td></tr>`;
   tb.querySelectorAll('.hsel').forEach(cb=>cb.onchange=updateUnregHidSel);
   updateUnregHidSel();
 }
@@ -1675,8 +1694,10 @@ async function hideUnreg(rows){
   const head = rows.length===1 ? `「${rows[0].product_code}」` : `${rows.length} 件`;
   if(!confirm(`${head}を未登録一覧から削除します。\n\n・NE の商品マスタは消えません (一覧から外すだけです)\n・この商品の注文が来たら、今までどおり「要判断: 未登録」になります\n・「削除したもの」からいつでも元に戻せます\n\n削除しますか?`)) return;
   try{
-    await api('api/unregistered/hide', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ codes: rows.map(x=>x.product_code) }) });
+    const r = await api('api/unregistered/hide', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ codes: rows.map(x=>x.product_code) }) });
     await loadUnreg();
+    // 開いている間に NE 同期でルール登録済み・取扱中止になった等は外さない (一覧からはもう消えている)
+    if(r.skipped) alert(`${r.hidden} 件を削除しました。${r.skipped} 件はもう未登録一覧の対象ではなかったので、そのままにしました。`);
   }catch(e){ alert('削除できませんでした: '+e.message); }
 }
 async function unhideUnreg(rows){
