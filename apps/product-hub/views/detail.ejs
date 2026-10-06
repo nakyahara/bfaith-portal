@@ -845,7 +845,7 @@ th.attr-unknown { color: #dc2626; }
                         data-current="<%= neCost?.shippingMethod || '' %>"></select>
                 <div id="profit-ship-note" class="muted" style="font-size:11px; margin-top:2px;"></div>
               </div>
-              <script type="application/json" id="profit-ship-data"><%- JSON.stringify({ options: neShippingOptions || [], hints: rakutenGroupNeHints || {}, picks: profitShipPicks || {} }).replace(/</g, '\\u003c') %></script>
+              <script type="application/json" id="profit-ship-data"><%- JSON.stringify({ options: neShippingOptions || [], hints: rakutenGroupNeHints || {}, picks: profitShipPicks || {}, labels: allShippingGroups || {} }).replace(/</g, '\\u003c') %></script>
             <% } %>
           </div>
         </div>
@@ -5275,7 +5275,7 @@ th.attr-unknown { color: #dc2626; }
       if (p.candidates > 1) {
         // 🚨 「大きさで N 通り」とは書かない。候補は配送方法ごとに代表送料 1 件へ畳んである
         //    ので、実際の送料の幅ではない (Codex R4 P2)
-        s += ' — 当てはまる NE の配送方法は ' + p.candidates + ' 件 (代表の送料 '
+        s += ' — 自動で選べる候補 (送料0円は除く) は ' + p.candidates + ' 件 (代表の送料 '
           + Math.round(p.min).toLocaleString() + '〜' + Math.round(p.max).toLocaleString() + '円) あるので、'
           + (p.isNe ? 'NE の登録値' : 'いちばん多く使っているもの') + 'を使いました。違うなら選び直してください';
       } else if (p.isNe) {
@@ -5288,7 +5288,7 @@ th.attr-unknown { color: #dc2626; }
       const note = document.getElementById('profit-ship-note');
       const holder = document.getElementById('profit-ship-data');
       if (!sel || !holder) return;
-      let data = { options: [], hints: {}, picks: {} };
+      let data = { options: [], hints: {}, picks: {}, labels: {} };
       try { data = JSON.parse(holder.textContent) || data; } catch (e) { /* 無ければ選択肢なし */ }
       if (!data.options.length) { sel.closest('div').hidden = true; return; }
       const neCurrent = sel.dataset.current || '';
@@ -5300,15 +5300,14 @@ th.attr-unknown { color: #dc2626; }
 
       // 人が選び直した試算の配送方法を、保存の読み直しをまたいで覚える (2026-10-06 Codex R4 P1)。
       // 🚨 ここは**試算だけ**。NE にも出品内容にも保存しない (sessionStorage = このタブ限り)。
-      //    未保存ガードと違って読んでも消さない — 保存を何度も押しても選択が残るようにする。
-      //    古すぎる退避は使わない (未保存ガードと同じ 30 分)
+      //    未保存ガードと違って (a) 読んでも消さない・(b) 時間で失効させない。
+      //    30 分で失効させると、長く作業してから保存した人の選択が黙って代表候補へ戻る
+      //    (Codex R5 P2)。消すのは**人が楽天の配送方法を変えたとき**だけ (= 合わせ直す合図)
       const MINE_KEY = 'ph-profit-ship:<%= draft.id %>';
-      const MINE_MAX_AGE_MS = 30 * 60 * 1000;
       function readMine() {
         try {
           const d = JSON.parse(sessionStorage.getItem(MINE_KEY) || 'null');
-          if (!d || typeof d.at !== 'number' || Date.now() - d.at > MINE_MAX_AGE_MS) return '';
-          return String(d.method || '');
+          return d ? String(d.method || '') : '';
         } catch (_) { return ''; }   // 使えない環境は覚えないだけ
       }
       const rememberMine = (m) => {
@@ -5363,7 +5362,9 @@ th.attr-unknown { color: #dc2626; }
         ship = Number(op.dataset.cost);
         note.textContent = profitShipNoteText({
           followed, method: sel.value,
-          groupLabel: (rkShip?.selectedOptions?.[0]?.textContent || '').trim(),
+          // 🚨 楽天側の正規ラベル (「定形外」)。プルダウンの文字をそのまま使うと複合選択肢の
+          //    「定形外（ヤフーのみネコポス）」が出て、楽天に送る配送方法と読み違える (Codex R5 P3)
+          groupLabel: data.labels?.[groupOf()] || '',
           neCurrent, isCurrent: !!data.options.find((o) => o.method === sel.value)?.isCurrent,
         });
         render();
@@ -5375,8 +5376,9 @@ th.attr-unknown { color: #dc2626; }
         rkShip.addEventListener('change', () => {
           const g = groupOf();
           // 🚨 ヤフーだけ変えた (定形外 → 定形外（ヤフーのみネコポス）= 1 → 1y5) ときは
-          //    楽天の配送方法は変わっていない。合わせ直すと人の試算選択を奪う (Codex R4 P2)
-          if (g === lastGroup) return;
+          //    楽天の配送方法は変わっていない。合わせ直すと人の試算選択を奪う (Codex R4 P2)。
+          //    注記だけは描き直す — 止めたままだと古いラベルが残る (Codex R5 P3)
+          if (g === lastGroup) { apply(); return; }
           lastGroup = g;
           // 配送方法を変えたのだから、試算もその配送方法に合わせる (前の選択は忘れる)
           forgetMine();

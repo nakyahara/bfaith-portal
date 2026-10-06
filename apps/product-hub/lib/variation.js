@@ -25,6 +25,8 @@
  * (aupay/linegift/amazon-accounting が揃って `* 100` している / 書き込み側は `/ 100`)
  * ただし取り込み経路によっては百分率が入る余地があるので両方を吸収する。
  */
+// 配送方法の名前の正本 (楽天の配送方法セット一覧の写し)。試算の合わせ先を決めるのに使う
+import { RAKUTEN_SHIPPING_METHODS } from '../../price-update/shipping-labels.js';
 export const ALLOWED_TAX_PERCENTS = [8, 10];
 
 export function taxToPercent(v) {
@@ -495,13 +497,15 @@ export function profitShipChoices(options, neMethod, neShippingCost) {
  *      (同数なら高い方 = 利益を実際より良く見せない側。listNeShippingOptions と同じ倒し方)
  *   3) 送料 0 円の便は候補にしない (NE の 0 は「無料」でなく「未入力」が多い)
  *   4) 候補が無ければキーを作らない → 画面は試算の配送方法を**変えない**
+ * ⚠️ 2) の「いちばん多く」より先に、**楽天の配送方法の名前そのものを含む便**を優先する
+ *    (楽天「定形外」の目安 '定形' は 定形内 まで拾うため)
  *
  * @param {Array<{method:string, cost:number, count:number, isCurrent?:boolean}>} choices
  *        profitShipChoices の結果 (画面の選択肢とまったく同じ並び・同じ送料)
  * @param {Record<string,string[]>} hints 楽天グループ → 配送方法名にかかる語
  * @returns {Record<string, {method:string, cost:number, isNe:boolean, from:number, min:number, max:number}>}
  */
-export function profitShipPickByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS) {
+export function profitShipPickByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS, labels = RAKUTEN_SHIPPING_METHODS) {
   // ⚠️ Number(null) は 0。null を先に弾かないと「送料0円」の便で試算して利益を過大に見せる
   //    (profitShipChoices / profit.js の computeProfit と同じ注意)
   const num = (v) => (v == null || v === '' ? NaN : Number(v));
@@ -516,8 +520,14 @@ export function profitShipPickByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS) {
     // NE の登録値が当てはまるならそれ (実送料 = 開いたときの金額と同じ)。
     // 無ければ最多 → 同数なら高い方 (利益を実際より良く見せない側)
     const ne = cand.find((o) => o.isCurrent);
+    // 🚨 目安の語はゆるいので、楽天「定形外」の候補に **定形内** (別の段・安い) まで入る。
+    //    最多だからと 定形内 を選ぶと利益を良く見せるので、**楽天の名前そのもの**を含む便を
+    //    先に置く (定形外規格内/規格外 → 定形内。Codex R5 P2)。名前の正本 = RAKUTEN_SHIPPING_METHODS
+    const label = String(labels?.[group] ?? '');
+    const sameName = (o) => (label && o.method.includes(label) ? 1 : 0);
     const pick = ne || [...cand]
-      .sort((a, b) => (b.count || 0) - (a.count || 0) || num(b.cost) - num(a.cost))[0];
+      .sort((a, b) => sameName(b) - sameName(a)
+        || (b.count || 0) - (a.count || 0) || num(b.cost) - num(a.cost))[0];
     const costs = cand.map((o) => num(o.cost));
     out[group] = {
       method: pick.method, cost: num(pick.cost), isNe: !!ne,

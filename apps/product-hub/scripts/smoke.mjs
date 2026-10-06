@@ -2695,6 +2695,18 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
       [{ method: '定形A', cost: 300, count: 5 }, { method: '定形B', cost: 400, count: 5 }], { '1': ['定形'] });
     check('配送方法で試算: 使われた数が同じなら高い方で試算する (利益を良く見せない側)',
       tie['1']?.method === '定形B' && tie['1']?.cost === 400, JSON.stringify(tie['1']));
+    // 🚨 目安 '定形' は 定形内 (別の段・安い) まで拾う。最多だからと 定形内 を選ぶと
+    //    利益を良く見せるので、楽天の名前「定形外」を含む便を先に置く (Codex R5 P2)
+    const nameFirst = vari.profitShipPickByGroup([
+      { method: '定形内（50g以内）', cost: 146, count: 999 },
+      { method: '定形外規格内（50g以内）', cost: 182, count: 10 },
+    ], { '1': ['定形'] });
+    check('🚨 配送方法で試算: 楽天の名前 (定形外) を含む便を、最多の 定形内 より先に選ぶ',
+      nameFirst['1']?.method === '定形外規格内（50g以内）' && nameFirst['1']?.cost === 182,
+      JSON.stringify(nameFirst['1']));
+    check('配送方法で試算: 名前が当たる便が無ければ今までどおり最多で選ぶ',
+      vari.profitShipPickByGroup([{ method: '定形内（50g以内）', cost: 146, count: 999 }],
+        { '1': ['定形'] })['1']?.method === '定形内（50g以内）');
     // 送料が無い行は画面の選択肢にも無い = 合わせ先にしない (0円で利益を過大に見せない)
     const noCost = vari.profitShipPickByGroup(
       [{ method: '定形なし', cost: null, count: 9 }, { method: '定形あり', cost: 182, count: 1 }], { '1': ['定形'] });
@@ -13035,13 +13047,17 @@ for (const [name, file, data] of renders) {
     /build\(\{ follow: neCurrent !== '' \}\);/.test(sim));
   check('配送費の試算: 試算のプルダウンを自分で選び直したら、合わせた注記は消えて選択を覚える',
     /sel\.addEventListener\('change', \(\) => \{ followed = null; rememberMine\(sel\.value\); apply\(\); \}\)/.test(sim));
-  check('🚨 配送費の試算: ヤフーだけ変えた (1 → 1y5) ときは合わせ直さない (人の試算選択を奪わない)',
-    /if \(g === lastGroup\) return;/.test(sim));
+  check('🚨 配送費の試算: ヤフーだけ変えた (1 → 1y5) ときは合わせ直さず、注記だけ描き直す',
+    /if \(g === lastGroup\) \{ apply\(\); return; \}/.test(sim));
+  check('配送費の試算: 注記の配送方法名は楽天の正規ラベル (複合選択肢の長い名前にしない)',
+    /groupLabel: data\.labels\?\.\[groupOf\(\)\]/.test(sim));
   check('配送費の試算: 楽天の配送方法を変えたら、前に選んだ試算は忘れてその配送方法に合わせる',
     /forgetMine\(\);[\s\S]{0,40}build\(\{ follow: true \}\);/.test(sim));
   check('🚨 配送費の試算: 覚えるのはこのタブ限り (sessionStorage) で、NE や出品内容には保存しない',
-    /sessionStorage\.setItem\(MINE_KEY/.test(sim) && !/localStorage/.test(sim)
-    && /MINE_MAX_AGE_MS = 30 \* 60 \* 1000/.test(sim));
+    /sessionStorage\.setItem\(MINE_KEY/.test(sim) && !/localStorage/.test(sim));
+  // 🚨 時間で失効させない。長く作業してから保存した人の選択が黙って戻る (Codex R5 P2)
+  check('🚨 配送費の試算: 人の試算選択は時間で失効させない (消すのは配送方法を変えたときだけ)',
+    !/MINE_MAX_AGE_MS/.test(sim) && /forgetMine\(\);/.test(sim));
   check('配送費の試算: 売価の入力でも従来どおり再計算する',
     /priceInput\.addEventListener\('input', render\)/.test(sim));
   check('配送費の試算: 試算であって NE や出品内容は変えないと画面に書く',
@@ -13105,7 +13121,7 @@ for (const [name, file, data] of renders) {
     const n = api.profitShipNoteText({ followed: d.followed, method: d.method, groupLabel: '定形外', neCurrent: 'ネコポス', isCurrent: false });
     check('配送方法で試算: 注記に「何で試算しているか」と候補の件数・代表送料の幅を書く',
       n.includes('「定形外」に合わせて「定形外規格内（50g以内）」で試算しています')
-      && n.includes('当てはまる NE の配送方法は 3 件') && n.includes('代表の送料 146〜510円')
+      && n.includes('自動で選べる候補 (送料0円は除く) は 3 件') && n.includes('代表の送料 146〜510円')
       && n.includes('違うなら選び直してください'), n);
     // 🚨 候補は配送方法ごとに代表送料 1 件へ畳んである。「大きさで N 通り」= 実送料の幅と
     //    読めてしまう言い方はしない (Codex R4 P2)
