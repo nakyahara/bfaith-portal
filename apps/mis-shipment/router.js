@@ -42,6 +42,30 @@ const MIS_TYPE_ENUM = new Set(['wrong_item','wrong_qty','damage','missing','wron
 const PROCESS_STAGE_ENUM = new Set(['picking','packing','labeling','inspection','handover','unknown']);
 const ROOT_CAUSE_STAGE_ENUM = new Set(['receiving','supplier','master_data','picking','packing','labeling','inspection','system','other','unknown']);
 
+// miniPC の注文検索は mall に NE の shops.platform を生のまま返す。
+// DB の mall 列 (CHECK) の選択肢とは名前が違うものがあるので、ここで寄せる。
+//   - Amazon の注文は NE の店舗 4 = 'amazon_fbm' で来る → 'amazon'
+//   - ヤフオク・ラクマ・卸・dショッピング など選択肢に無い店舗 → 'other'
+//   ('_ignore' と壊れた応答は、ここに来る前に asLookupMissIfNotCounted で「見つからない」になる)
+// 寄せずに入れると INSERT が CHECK で落ちる (2026-10-06 まで Amazon の注文が登録できなかった)。
+const MALL_ALIAS = { amazon_fbm: 'amazon' };
+function normalizeLookupMall(platform) {
+  const mall = Object.hasOwn(MALL_ALIAS, platform) ? MALL_ALIAS[platform] : platform;
+  return MALL_ENUM.has(mall) ? mall : 'other';
+}
+
+// Express 4 は async ハンドラの中で投げられた例外を拾わない。拾わないと応答が返らず、
+// 画面は「登録中…」のまま固まる (server.js の unhandledRejection はログに出すだけ)。
+function asyncRoute(fn) {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch((e) => {
+      console.error(`[mis-shipment] ${req.method} ${req.path} 失敗:`, e && e.message);
+      if (res.headersSent) return next(e);
+      res.status(500).json({ error: 'server_error' });
+    });
+  };
+}
+
 // ─── helper: admin check ───
 function isAdmin(req) {
   return req.session && req.session.role === 'admin';
@@ -92,7 +116,26 @@ async function lookupOrderFromMinipc(orderId) {
     err.status = res.status;
     throw err;
   }
-  return res.json();
+  return asLookupMissIfNotCounted(await res.json(), orderId);
+}
+
+/**
+ * 誤出荷として数えない伝票・壊れた応答は「見つからない」として扱う。
+ *   - '_ignore' = NE の店舗 7 (使っていないライジングAmazon) と 15 (FBA 納品の内部伝票)。
+ *     お客様の注文ではないので、勝手に「その他」で数えない
+ *   - mall が空・文字列でない = miniPC の応答が壊れている。黙って「その他」にしない
+ * どちらも、画面では「見つかりません」→「モールを手で選んで進む」に流れる (現場は止めない)。
+ * 登録時の引き直しも同じ関数を通るので、手で選んだモールで登録される。
+ */
+function asLookupMissIfNotCounted(result, orderId) {
+  if (!result || result.found !== true) return result;
+  const platform = result.mall;
+  if (typeof platform !== 'string' || platform === '') {
+    console.warn('[mis-shipment] 注文検索の応答に mall がありません。見つからない扱いにします:', orderId);
+    return { found: false };
+  }
+  if (platform === '_ignore') return { found: false };
+  return result;
 }
 
 // ─── helper: 入力 record の正規化と CHECK 制約事前検証 (DB CHECK と二層防御) ───
@@ -101,7 +144,7 @@ function buildSnapshotFields(lookupResult) {
   if (lookupResult && lookupResult.found) {
     return {
       lookup_source: 'mirror_auto',
-      mall: lookupResult.mall || null,
+      mall: normalizeLookupMall(lookupResult.mall),
       sku_snapshot: lookupResult.sku || null,
       product_name_snapshot: lookupResult.product_name || null,
       ordered_qty_snapshot: lookupResult.ordered_qty ?? null,
@@ -145,12 +188,14 @@ function sanitizeText(s, max = 2000) {
 }
 
 // ─── GET /api/orders/lookup?order_id=XXX (UI からのオンライン検索) ───
-router.get('/api/orders/lookup', async (req, res) => {
+router.get('/api/orders/lookup', asyncRoute(async (req, res) => {
   const orderId = String(req.query.order_id || '').trim();
   if (!orderId) return res.status(400).json({ error: 'order_id_required' });
   if (orderId.length > 100) return res.status(400).json({ error: 'order_id_too_long' });
   try {
     const result = await lookupOrderFromMinipc(orderId);
+    // 確認画面に出すモールを、登録で実際に保存される値にそろえる (ヤフオクなら「その他」)
+    if (result && result.found) return res.json({ ...result, mall: normalizeLookupMall(result.mall) });
     return res.json(result);
   } catch (e) {
     if (e.code === 'token_unset') return res.status(503).json({ error: 'lookup_token_unset' });
@@ -158,7 +203,7 @@ router.get('/api/orders/lookup', async (req, res) => {
     console.error('[mis-shipment] lookup error:', e.message);
     return res.status(502).json({ error: 'lookup_failed' });
   }
-});
+}));
 
 // ─── POST /api/submissions (新規登録、mix_up 対応) ───
 // payload: { mix_up: boolean, records: [{...}] (1 or 2 records) }
@@ -166,7 +211,7 @@ router.get('/api/orders/lookup', async (req, res) => {
 //                     mis_type, qty_affected, loss_amount_jpy, process_stage, reporter_note
 //          server-side authoritative fetch: order_id_unknown=false なら mall_order_id をサーバが lookup し直し、
 //          snapshot を取得 (UI 経由の値は信用しない)
-router.post('/api/submissions', async (req, res) => {
+router.post('/api/submissions', asyncRoute(async (req, res) => {
   const reportedBy = req.session.email;
   if (!reportedBy) return res.status(401).json({ error: 'session_expired' });
 
@@ -288,7 +333,7 @@ router.post('/api/submissions', async (req, res) => {
     if (result.idempotent) return res.status(200).json({ id: result.existing.id, idempotent: true });
     return res.status(201).json({ id: result.id });
   }
-});
+}));
 
 // ─── GET /api/submissions ───
 router.get('/api/submissions', (req, res) => {
