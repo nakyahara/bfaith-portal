@@ -45,3 +45,13 @@ test('AIが見送った案を新しい順に1件ずつ見せる。あとで提�
  const on=await render(true);assert.ok(on.includes('見送った理由'));assert.ok(on.includes('自社品・取扱品と同じ用途'));assert.ok(on.includes('元の商品 77'));assert.ok(on.includes('https://www.amazon.co.jp/dp/B000000099'));assert.ok(!on.includes('kw-btn--adopt'),'見るだけの一覧に判定ボタンがある');
  const off=await render(false);assert.ok(!off.includes('見送った理由'));assert.ok(off.includes('AIが見送った'));assert.ok(off.includes('kw-btn--adopt'));
 });
+test('最新の回が既出 (already_seen) なら古い回の見送りも出さない。新しい回が届けば覚えた一覧を作り直す (Codex R1)',t=>{
+ const db=new Database(':memory:');t.after(()=>db.close());createKeywordTables(db);
+ const rec=(kw,codes,reason)=>({candidate_id:keywordId(kw),kw,decision:'defer',codes,reason,by:'R03'});
+ const day=n=>new Date(Date.now()-n*86400000).toISOString();
+ ingestKeywords({...edition('d1'),generated_at:day(2),screened_out:[rec('同じ案',['feedback_constraint'],'古い見送り'),rec('用途12 シート',['brand_dependent'],'翌々日に提案される')]},db);
+ ingestKeywords({...edition('d2',5),generated_at:day(1),screened_out:[{...rec('同じ案',['already_seen'],'既出'),by:'program',decision:'exclude'}]},db);
+ const first=screenedOutKeywords({},db);assert.deepEqual(first.items.map(i=>i.kw),['用途12 シート']);assert.equal(screenedOutKeywords({},db).total,1);
+ ingestKeywords(edition('d3',10),db);
+ assert.equal(screenedOutKeywords({},db).total,0,'提案に出た案が、覚えた一覧のせいで残っている');
+});

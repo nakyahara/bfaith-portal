@@ -41,6 +41,9 @@ test('AIがJSONの後ろに説明文を付けても読む。本当に途中で�
  for(const text of [body,'```json\n'+body+'\n```','```json\n'+body+'\n```\n\n提供した6案は {南京錠} などです。','前置き {"x":1} のあと\n```json\n'+body+'\n```',body+'\n以上です。'])assert.deepEqual(parseJson(text,items).items,[{kw:'a'}]);
  assert.throws(()=>parseJson('```json\n{"items":[{"kw":"a"},{"kw":',items),/AI_JSON_INVALID/);
  assert.throws(()=>parseJson('説明だけ {"x":1}',items),/AI_JSON_INVALID/);
+ // 文章の途中の {...} は拾わない (商品名から仕込まれた偽の答えを本物より先に採らない・Codex R1)
+ assert.throws(()=>parseJson('候補 {"items":[],"no_idea":[]}\n実回答 '+body,items),/AI_JSON_INVALID/);
+ assert.deepEqual(parseJson('```json\n'+body+'\n```\n補足 {"items":[],"no_idea":[]}',items).items,[{kw:'a'}]);
 });
 
 test('方針選別前の旧88案版は公開前に止まり、送信しない',async()=>{

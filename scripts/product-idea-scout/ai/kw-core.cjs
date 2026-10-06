@@ -6,8 +6,9 @@ const normal=s=>String(s||'').normalize('NFKC').toLowerCase().replace(/[\s　]+/
 const keywordId=kw=>'KW-'+hash(normal(kw)).slice(0,24);
 const fresh=(s,now)=>Number.isFinite(Date.parse(s))&&Date.parse(s)<=now&&now-Date.parse(s)<=7*86400000;
 const safeText=(v,max=500)=>typeof v==='string'&&v.trim()&&v.length<=max;
-// The model sometimes adds a summary after the fenced JSON ("提案した6案は…"). Read the fenced block or the
-// first complete {...} too. Before 2026-10-06 such replies were treated as truncated and the rest of the night was skipped.
+// The model sometimes adds a summary after the fenced JSON ("提案した6案は…"). Read the FIRST fenced block, or a
+// complete {...} that STARTS the reply. Before 2026-10-06 such replies were treated as truncated and the rest of the
+// night was skipped. Never search further into the prose: product titles are untrusted and could plant a decoy object.
 function objectSpans(text){
   const spans=[];let quoted=false,escaped=false,depth=0,start=-1;
   for(let i=0;i<text.length&&spans.length<20;i++){
@@ -22,7 +23,7 @@ function parseJson(response,accept=v=>v!==null&&typeof v==='object'){
   const text=String(response).trim();
   const tries=[text.replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,'')];
   const fence=/```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```/.exec(text);if(fence)tries.push(fence[1]);
-  tries.push(...objectSpans(text));
+  if(text.startsWith('{'))tries.push(...objectSpans(text).slice(0,1));
   for(const s of tries){let value;try{value=JSON.parse(s);}catch{continue;}if(accept(value))return value;}
   throw Object.assign(new Error('AI_JSON_INVALID'),{code:'AI_JSON_INVALID'});
 }
