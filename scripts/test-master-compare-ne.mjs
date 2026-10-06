@@ -1749,7 +1749,8 @@ await ta('[38] 区分のゲートは本物の取込 (fetchProducts / fetchSetPro
     const r = await compare(asOf);
     const ne = r.result.ne;
     assert.notEqual(ne.verdict, 'blocked', ne.blocked_reason);
-    assert.deepEqual([ne.fetch_counts.ok, ne.fetch_counts.products, ne.fetch_counts.setproducts],
+    const noAt = ({ complete_at, ...x }) => x;   // 完了の時刻 (ゲートの記録に渡す) は別に見る
+    assert.deepEqual([ne.fetch_counts.ok, noAt(ne.fetch_counts.products), noAt(ne.fetch_counts.setproducts)],
       [true, { ok: true, dropped_no_code: 1, dropped_missing_fields: 0, overwritten: 1 }, { ok: true, dropped_no_code: 0, dropped_missing_fields: 2, overwritten: 0 }]);
     // integrity = 書く前に落とした 3 行 + 重なり 1 行 + 保持した SKU (intBlocked の c003・e005) の保存した商品の行 2 行 = 6
     //   affected = intBlocked の c003 (重なり)・e005・z801 (子が空のセットの親。保存した行が 1 つも無い z801 も) = Company DB にある 3 件
@@ -1760,6 +1761,46 @@ await ta('[38] 区分のゲートは本物の取込 (fetchProducts / fetchSetPro
     assert.deepEqual([r2.result.ne.fetch_counts.products, r2.result.ne.fetch_counts.setproducts, r2.result.ne.kind_gate.integrity_untrusted],
       [{ ok: false, reason: 'no_record' }, { ok: false, reason: 'no_record' }, 2 + 2]);   // 読めない 2 種類 + 保持した SKU の保存した行 2
   } finally { globalThis.fetch = realFetch; }
+});
+
+await ta('[39] 照合 ② の始め (何かを読む前) に新商品の入口を閉じ (ops.close_new_entry_for_compare)、最後に同じ回でゲートの記録 (ops.record_new_entry_gate) を 1 行書く: 関数がある DB = 閉じる → 1 行 (照合の回・取得の完了の時刻 RFC 3339・kind_gate の 5 つ) / 無い DB (0058 の前)・関数が落ちる = 照合は止まらない (書けない・閉じられないは要約に一言)', async () => {
+  const NE = baseNe();
+  // 関数が無い DB (今の積み方 = 0058 の前) = 照合は通る・状態は not_applied
+  const a = await day('2030-12-01', { ne: NE });
+  assert.notEqual(a.result.ne.verdict, 'blocked', a.result.ne.blocked_reason);
+  assert.deepEqual([a.ne.gate_close, a.ne.gate_record], [{ state: 'not_applied' }, { state: 'not_applied' }]);
+  assert.match(a.line, /ℹ️ 新商品のゲートの記録: 関数が無い \(0058 の前\)/);
+  // 関数がある DB (PR-1 の関数の代わりの fixture = 呼ばれた順に 1 行ずつ残す)。閉じる関数は、その時点で照合の読む今朝の NE の取得の印がまだ読まれていないことを見るため、呼ばれた時刻だけ残す
+  await db.exec(`create table ops.test_new_entry_log (seq serial primary key, fn text, compare_run_id text, read_started boolean, products_complete_at text, setproducts_complete_at text, kind_gate jsonb);
+    create function ops.close_new_entry_for_compare(p_compare_run_id text) returns jsonb language sql as $$
+      insert into ops.test_new_entry_log (fn, compare_run_id, read_started) values ('close', p_compare_run_id, exists (select 1 from ops.ne_reg_compare_targets t where t.compare_run_id = p_compare_run_id))
+      returning jsonb_build_object('closed', true) $$;   -- read_started = 照合の回の最初の読み (登録の確かめ待ちの写し) が済んでいたか
+    create function ops.record_new_entry_gate(p_compare_run_id text, p_products_complete_at text, p_setproducts_complete_at text, p_kind_gate jsonb) returns jsonb language sql as $$
+      insert into ops.test_new_entry_log (fn, compare_run_id, products_complete_at, setproducts_complete_at, kind_gate) values ('record', p_compare_run_id, p_products_complete_at, p_setproducts_complete_at, p_kind_gate)
+      returning jsonb_build_object('result_id', 1) $$;`);
+  try {
+    const b = await day('2030-12-02', { ne: NE });
+    const rows = (await db.query('select * from ops.test_new_entry_log order by seq')).rows;
+    assert.deepEqual(rows.map((r) => [r.fn, r.compare_run_id]), [['close', b.result.compare_run_id], ['record', b.result.compare_run_id]]);   // 始めに閉じる → 最後に 1 行・同じ回
+    assert.equal(rows[0].read_started, false);   // 閉じたのは回の最初の読みより前
+    assert.equal((await db.query('select count(*)::int as n from ops.ne_reg_compare_targets where compare_run_id = $1', [b.result.compare_run_id])).rows[0].n, 1);   // 最初の読みはその後に走った
+    const ts = utcText(at('2030-12-02', '07:00')).replace(' ', 'T') + 'Z';
+    assert.deepEqual([rows[1].products_complete_at, rows[1].setproducts_complete_at, rows[1].kind_gate], [ts, ts, b.ne.kind_gate]);
+    assert.deepEqual(Object.keys(rows[1].kind_gate).sort(), ['integrity_untrusted', 'norm_collision', 'raw_mismatch', 'raw_unverifiable_affected_existing_cdb', 'unknown_kind']);
+    assert.deepEqual([b.ne.gate_close.state, b.ne.gate_record.state], ['ok', 'ok']);
+    assert.doesNotMatch(b.line, /新商品の(ゲートの記録|入口を閉じられない)/);
+    // 関数が落ちる = 閉じられない・記録も書けない でも照合は止まらず結果は出る
+    await db.exec(`create or replace function ops.close_new_entry_for_compare(p_compare_run_id text) returns jsonb language plpgsql as $$ begin raise exception 'close_failed: 閉じられない'; end $$;
+      create or replace function ops.record_new_entry_gate(p_compare_run_id text, p_products_complete_at text, p_setproducts_complete_at text, p_kind_gate jsonb) returns jsonb language plpgsql as $$
+        begin raise exception 'stale_fetch: 古い取得'; end $$;`);
+    const c = await day('2030-12-03', { ne: NE });
+    assert.notEqual(c.result.ne.verdict, 'error');
+    assert.deepEqual([c.ne.gate_close.state, c.ne.gate_record.state], ['failed', 'failed']);
+    assert.match(c.line, /ℹ️ 新商品の入口を閉じられない: 書けない \(.*close_failed.* \/ ℹ️ 新商品のゲートの記録: 書けない \(.*stale_fetch/);
+    assert.equal((await db.query('select count(*)::int as n from ops.test_new_entry_log')).rows[0].n, 2);
+  } finally {
+    await db.exec('drop function if exists ops.record_new_entry_gate(text, text, text, jsonb); drop function if exists ops.close_new_entry_for_compare(text); drop table if exists ops.test_new_entry_log;');
+  }
 });
 
 await pg.close();

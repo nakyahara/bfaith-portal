@@ -1184,7 +1184,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
         const c = r.counts;
         const dropped = c.dropped_no_code + c.dropped_missing_fields, dup = c.write_attempts - c.stored_rows;
         fetchUntrusted += dropped + dup;
-        fetchState[kind] = { ok: true, dropped_no_code: c.dropped_no_code, dropped_missing_fields: c.dropped_missing_fields, overwritten: dup };
+        fetchState[kind] = { ok: true, dropped_no_code: c.dropped_no_code, dropped_missing_fields: c.dropped_missing_fields, overwritten: dup, complete_at: c.complete_at };
       } else { fetchUntrusted += 1; fetchState[kind] = { ok: false, reason: r ? r.reason : (fc.error ? 'error' : 'unreadable') }; }
     }
     if (!fc.ok && fc.fetch_fingerprint_mismatch && fetchUntrusted === 0) fetchUntrusted = 1;   // 2 つの取得の版が違う = 信用しない

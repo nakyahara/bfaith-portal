@@ -67,10 +67,51 @@ export function pruneResults(dataDir, { now = new Date(), keepDays = RESULT_KEEP
 
 /** 最後の 1 行 (daily-sync の朝の要約に載る)。②b (古い表) は比べた朝だけ足す (⚠️ なら先頭) */
 export function summaryLine(r) {
-  const base = summaryLine12(r);
+  const base0 = summaryLine12(r);
+  const gr = r.ne && r.ne.gate_record, gc = r.ne && r.ne.gate_close;
+  // 新商品の入口のゲートの記録 (ops.record_new_entry_gate) を書けなかった・入口を閉じられなかった朝は一言 (照合そのものは失敗にしない)
+  const notes = [];
+  if (gc && gc.state !== 'ok' && gc.state !== 'not_applied') notes.push(`ℹ️ 新商品の入口を閉じられない: ${GATE_RECORD_TEXT[gc.state] || gc.state}${gc.error ? ` (${gc.error.slice(0, 80)})` : ''}`);
+  if (gr && gr.state !== 'ok') notes.push(`ℹ️ 新商品のゲートの記録: ${GATE_RECORD_TEXT[gr.state] || gr.state}${gr.error ? ` (${gr.error.slice(0, 80)})` : ''}`);
+  const base = notes.length ? `${base0} / ${notes.join(' / ')}` : base0;
   const old = oldTablesSummary(r.old_tables);
   if (!old) return base;
   return oldTablesBad(r.old_tables) ? `${old} / ${base}` : `${base} / ${old}`;
+}
+const GATE_RECORD_TEXT = { not_applied: '関数が無い (0058 の前)', not_configured: '書く接続が無い', no_kind_gate: '区分のゲートの数が無い', no_fetch_time: '取得の完了の時刻が読めない', failed: '書けない' };
+/** 照合 ② の始めに新商品の入口を閉じる (ops.close_new_entry_for_compare = PR-1 (0058) が作る)。返り値 = 状態 (照合は止めない) */
+export async function closeNewEntryForCompare(getWriter, { compareRunId }) {
+  if (!getWriter) return { state: 'not_configured' };
+  try {
+    const w = await getWriter();
+    const has = (await w.query("select to_regprocedure('ops.close_new_entry_for_compare(text)') is not null as ok")).rows[0].ok;
+    if (!has) return { state: 'not_applied' };
+    const r = (await w.query('select ops.close_new_entry_for_compare($1) as r', [compareRunId])).rows[0]?.r ?? null;
+    return { state: 'ok', result: r };
+  } catch (e) { return { state: 'failed', error: String(e && e.message).slice(0, 200) }; }
+}
+/** 取得の件数の記録の完了の時刻 (sync_meta = UTC の 'YYYY-MM-DD HH:MM:SS') → RFC 3339 ('…Z')。読めない = null */
+export function fetchTimeRfc3339(t) {
+  return typeof t === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(t) ? `${t.replace(' ', 'T')}Z` : null;
+}
+/**
+ * 照合 ② の最後 (結果と証跡を書いた後) に、新商品の入口のゲートの記録を 1 回書く (計画 newentry_min_plan.md §3-1)。
+ *   ops.record_new_entry_gate(照合の回, 単品の取得の完了 (RFC 3339), セットの取得の完了, kind_gate の 5 つの数) = PR-1 (0058) が作る。
+ *   関数が無い (0058 の前)・書く接続が無い・数が無い・時刻が読めない・書けない = 状態だけ返す (照合は失敗にしない)
+ */
+export async function recordNewEntryGate(getWriter, { compareRunId, ne }) {
+  if (!ne || !ne.kind_gate) return { state: 'no_kind_gate' };
+  const fc = ne.fetch_counts || {};
+  const pAt = fetchTimeRfc3339(fc.products?.complete_at), sAt = fetchTimeRfc3339(fc.setproducts?.complete_at);
+  if (!pAt || !sAt) return { state: 'no_fetch_time' };
+  if (!getWriter) return { state: 'not_configured' };
+  try {
+    const w = await getWriter();
+    const has = (await w.query("select to_regprocedure('ops.record_new_entry_gate(text, text, text, jsonb)') is not null as ok")).rows[0].ok;
+    if (!has) return { state: 'not_applied' };
+    const r = (await w.query('select ops.record_new_entry_gate($1, $2, $3, $4::jsonb) as r', [compareRunId, pAt, sAt, JSON.stringify(ne.kind_gate)])).rows[0]?.r ?? null;
+    return { state: 'ok', products_complete_at: pAt, setproducts_complete_at: sAt, result: r };
+  } catch (e) { return { state: 'failed', error: String(e && e.message).slice(0, 200) }; }
 }
 function summaryLine12(r) {
   const one = (() => {
@@ -202,7 +243,11 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
   let wconn = null;
   const writer = async () => writerDb || (wconn ??= await connectWriter()).db;
   const closeWriter = async () => { const c = wconn; wconn = null; if (c && c.close) { try { await c.close(); } catch { /* */ } } };
+  let gateClose = null;
   try {
+    // 新商品の入口を閉じる (計画 newentry_min_plan.md §3 の 0): 何かを読む前に 1 回。最後の ops.record_new_entry_gate と同じ回の番号。
+    //   関数が無い (0058 の前)・書く接続が無い・落ちた = 状態だけ残す (照合は止めない)
+    if (neCompare) gateClose = await closeNewEntryForCompare(writerDb || connectWriter ? writer : null, { compareRunId });
     if (!db) {
       if (!connect) throw new Error('接続が無い (db か connect が要る)');
       const c = await connect();
@@ -373,6 +418,11 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       let rewritten = null;
       try { rewritten = write(dataDir, EVIDENCE_NAME, evidence); } catch { rewritten = null; }
       if (!rewritten) throw new Error('証跡 (新商品の確かめの後) を書けない = 見張りが確かめの前の数を読む');
+    }
+    // 新商品の入口のゲートの記録 (計画 newentry_min_plan.md §3-1)。結果と証跡を書いた後に 1 回・失敗しても照合は失敗にしない (要約に一言)
+    if (result.ne && gateClose) result.ne.gate_close = gateClose;
+    if (result.ne && result.ne.verdict !== 'error' && result.ne.verdict !== 'blocked') {
+      result.ne.gate_record = await recordNewEntryGate(writerDb || connectWriter ? writer : null, { compareRunId, ne: result.ne });
     }
     } finally { await closeWriter(); }
     pruneResults(dataDir, { now });
