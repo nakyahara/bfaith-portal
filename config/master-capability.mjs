@@ -30,9 +30,9 @@ export const PROTOCOL_HISTORY = Object.freeze({
 export const MASTER_OWNER_PROTOCOL = 1;
 
 /**
- * このコードが company として扱えるキー (2026-10-05 の切替で active にした 13 キー)。
- * 🚨 load のままのキー (products.parent・skus.sku_kind・sku_components・listing_components.amazon・suppliers.* の 4 つ) は、
- *    それぞれ扱いの PR ((Y) = skus.sku_kind など) で足す
+ * このコードが company として扱えるキー (2026-10-05 の切替で active にした 13 キー + skus.sku_kind)。
+ *   skus.sku_kind = #1641 (夜間ロードの守り・正規化・写しの 9 升・照合 ② の区分の分類とゲートの数)。configured (config/master-ownership.mjs) は 'load' のまま
+ * 🚨 load のままのキー (products.parent・sku_components・listing_components.amazon・suppliers.* の 4 つ) は、それぞれ扱いの PR で足す
  */
 export const COMPANY_CAPABLE = Object.freeze([
   'external_ids.jan',
@@ -44,6 +44,7 @@ export const COMPANY_CAPABLE = Object.freeze([
   'skus.name',
   'skus.reorder_months',
   'skus.shipping',
+  'skus.sku_kind',
   'skus.standard_price',
   'skus.tax_class',
   'skus.tax_rate',

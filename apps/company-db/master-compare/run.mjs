@@ -67,10 +67,70 @@ export function pruneResults(dataDir, { now = new Date(), keepDays = RESULT_KEEP
 
 /** 最後の 1 行 (daily-sync の朝の要約に載る)。②b (古い表) は比べた朝だけ足す (⚠️ なら先頭) */
 export function summaryLine(r) {
-  const base = summaryLine12(r);
+  const base0 = summaryLine12(r);
+  const gr = r.ne && r.ne.gate_record, gc = r.ne && r.ne.gate_close;
+  // 新商品の入口のゲートの記録 (ops.record_new_entry_gate) を書けなかった・入口を閉じられなかった朝は一言 (照合そのものは失敗にしない)
+  const notes = [];
+  if (gr && gr.state !== 'ok' && gr.state !== 'skipped_not_closed') notes.push(`ℹ️ 新商品のゲートの記録: ${GATE_RECORD_TEXT[gr.state] || gr.state}${gr.error ? ` (${gr.error.slice(0, 80)})` : ''}`);
+  const base = notes.length ? `${base0} / ${notes.join(' / ')}` : base0;
   const old = oldTablesSummary(r.old_tables);
-  if (!old) return base;
-  return oldTablesBad(r.old_tables) ? `${old} / ${base}` : `${base} / ${old}`;
+  const line = !old ? base : oldTablesBad(r.old_tables) ? `${old} / ${base}` : `${base} / ${old}`;
+  // 入口を閉じられなかった (0058 があるのに・有無が確かめられない) = 前日の許可が残りうる = 重大 = 要約の先頭に ⚠️ (照合そのものの結果は変えない。#1641 Codex R3 High)
+  return gateCloseTrouble(gc) ? `⚠️ 新商品の入口を閉じられない (前日の許可が残りうる): ${gateCloseTrouble(gc)} / ${line}` : line;
+}
+/** 入口を閉じられなかった (成功でも「0058 が無いと確かめた」でもない) 理由。問題なし = null */
+export function gateCloseTrouble(gc) {
+  if (!gc || gc.state === 'ok' || gc.state === 'not_applied') return null;
+  return `${GATE_RECORD_TEXT[gc.state] || gc.state}${gc.error ? ` (${String(gc.error).slice(0, 80)})` : ''}`;
+}
+const GATE_RECORD_TEXT = { not_applied: '関数が無い (0058 の前)', not_configured: '書く接続が無い', no_kind_gate: '区分のゲートの数が無い', no_fetch_time: '取得の完了の時刻が読めない', failed: '書けない' };
+/**
+ * 照合 ② の始めに新商品の入口を閉じる (ops.close_new_entry_for_compare = PR-1 (0058) が作る)。返り値 = 状態 (照合そのものは止めない):
+ *   ok = 閉じた / not_applied = 関数が無いと **確かめた** (0058 の前 = 今の本番) /
+ *   not_configured = 書く接続が無い (関数はある・有無が分からない) / failed = 有無を確かめられない (接続・権限) か、閉じる関数が落ちた。
+ *   🚨 not_applied は関数の有無を問い合わせて「無い」と返った時だけ (接続・権限の失敗を「0058 の前」と取り違えない。#1641 Codex R3 High)
+ *   ok と not_applied 以外 = 閉じていない = 呼び手は record を呼ばない・要約の先頭に ⚠️
+ * @param {(() => Promise<object>)|null} getWriter  書く接続 (watch_writer)
+ * @param {{ compareRunId: string, readDb?: object|null }} p  readDb = 書く接続が無いときに関数の有無だけ確かめる読む接続
+ */
+export async function closeNewEntryForCompare(getWriter, { compareRunId, readDb = null }) {
+  const FN = "select to_regprocedure('ops.close_new_entry_for_compare(text)') is not null as ok";
+  if (!getWriter) {
+    if (!readDb) return { state: 'not_configured', fn: 'unknown' };
+    try { return (await readDb.query(FN)).rows[0].ok ? { state: 'not_configured', fn: 'present' } : { state: 'not_applied' }; }
+    catch (e) { return { state: 'failed', stage: 'presence', error: String(e && e.message).slice(0, 200) }; }
+  }
+  let w, has;
+  try { w = await getWriter(); has = (await w.query(FN)).rows[0].ok; }
+  catch (e) { return { state: 'failed', stage: 'presence', error: String(e && e.message).slice(0, 200) }; }
+  if (!has) return { state: 'not_applied' };
+  try {
+    const r = (await w.query('select ops.close_new_entry_for_compare($1) as r', [compareRunId])).rows[0]?.r ?? null;
+    return { state: 'ok', result: r };
+  } catch (e) { return { state: 'failed', stage: 'close', error: String(e && e.message).slice(0, 200) }; }
+}
+/** 取得の件数の記録の完了の時刻 (sync_meta = UTC の 'YYYY-MM-DD HH:MM:SS') → RFC 3339 ('…Z')。読めない = null */
+export function fetchTimeRfc3339(t) {
+  return typeof t === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(t) ? `${t.replace(' ', 'T')}Z` : null;
+}
+/**
+ * 照合 ② の最後 (結果と証跡を書いた後) に、新商品の入口のゲートの記録を 1 回書く (計画 newentry_min_plan.md §3-1)。
+ *   ops.record_new_entry_gate(照合の回, 単品の取得の完了 (RFC 3339), セットの取得の完了, kind_gate の 5 つの数) = PR-1 (0058) が作る。
+ *   関数が無い (0058 の前)・書く接続が無い・数が無い・時刻が読めない・書けない = 状態だけ返す (照合は失敗にしない)
+ */
+export async function recordNewEntryGate(getWriter, { compareRunId, ne }) {
+  if (!ne || !ne.kind_gate) return { state: 'no_kind_gate' };
+  const fc = ne.fetch_counts || {};
+  const pAt = fetchTimeRfc3339(fc.products?.complete_at), sAt = fetchTimeRfc3339(fc.setproducts?.complete_at);
+  if (!pAt || !sAt) return { state: 'no_fetch_time' };
+  if (!getWriter) return { state: 'not_configured' };
+  try {
+    const w = await getWriter();
+    const has = (await w.query("select to_regprocedure('ops.record_new_entry_gate(text, text, text, jsonb)') is not null as ok")).rows[0].ok;
+    if (!has) return { state: 'not_applied' };
+    const r = (await w.query('select ops.record_new_entry_gate($1, $2, $3, $4::jsonb) as r', [compareRunId, pAt, sAt, JSON.stringify(ne.kind_gate)])).rows[0]?.r ?? null;
+    return { state: 'ok', products_complete_at: pAt, setproducts_complete_at: sAt, result: r };
+  } catch (e) { return { state: 'failed', error: String(e && e.message).slice(0, 200) }; }
 }
 function summaryLine12(r) {
   const one = (() => {
@@ -85,8 +145,14 @@ function summaryLine12(r) {
   // daily-sync は要約の先頭の ⚠️ で警告を決める (isWarnSummary) → ② が落ちた・判定できない朝は ② を先頭に (① が ✅ でも見出しを ⚠️ に)
   const two = neSummary(r.ne);
   const bad = r.ne.verdict === 'error' || r.ne.verdict === 'blocked' || ['locked', 'untrusted', 'write_failed'].includes(r.ne.pending?.state) || r.ne.decisions_write === 'failed' || r.ne.decisions_write === 'not_configured'
-    || baselineTrouble(r.ne) || regTrouble(r.ne);
+    || baselineTrouble(r.ne) || regTrouble(r.ne) || kindTrouble(r.ne);
   return bad ? `${two} / ${one}` : `${one} / ${two}`;
+}
+/** 区分の持ち主が C で、完全な NE の取得と Company DB の区分が違う SKU がある (差を残す承認でも消えない) = 要約の先頭に ⚠️ (重大。広げる道 v8・Codex R8) */
+export function kindTrouble(ne) {
+  const k = ne && ne.sku_kind_raw_mismatch;
+  if (!k || !k.alert || !(k.count > 0)) return null;
+  return `区分が NE と違う SKU ${k.count} 件 (NE の画面で直す: ${k.codes.slice(0, 10).join(', ')}${k.count > 10 ? ' ほか' : ''})`;
 }
 /** 最後に一致した値 (D2) を読めない・書けない・拒まれた・書く接続が無い = 要約の先頭に ⚠️ (切替の前でも黙って止めない) */
 export function baselineTrouble(ne) {
@@ -112,7 +178,9 @@ export function neSummary(ne) {
   if (bt) return `⚠️ ②: ${bt} — 差 ${ne.counts?.items ?? 0} 件`;
   // ポータルで登録した新商品の NE 登録の不一致 (区分違い・取り込んだのに NE に無い・NE の中身が違う) = 自動の知らせがほかに無い → 朝の要約の先頭に ⚠️
   const rt = regTrouble(ne);
-  if (rt) return `⚠️ ②: ${rt} — 差 ${ne.counts?.items ?? 0} 件${regSummary(ne)}`;
+  // 区分の差 (区分の持ち主が C) と新商品の登録の不一致は両方とも先頭に (片方で片方を隠さない。区分を先に)
+  const kt = kindTrouble(ne);
+  if (rt || kt) return `⚠️ ②: ${[kt, rt].filter(Boolean).join(" / ")} — 差 ${ne.counts?.items ?? 0} 件${rt ? regSummary(ne) : ""}`;
   const b = ne.counts?.by_class || {};
   const top = Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ');
   // 基準 (D2) を照らさなかった回 (NE の取得と CDB の読みが 4 時間超) は ⚠️ にしないが、続くと基準が貯まらないので見えるようにする
@@ -194,12 +262,16 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
   let wconn = null;
   const writer = async () => writerDb || (wconn ??= await connectWriter()).db;
   const closeWriter = async () => { const c = wconn; wconn = null; if (c && c.close) { try { await c.close(); } catch { /* */ } } };
+  let gateClose = null;
   try {
     if (!db) {
       if (!connect) throw new Error('接続が無い (db か connect が要る)');
       const c = await connect();
       db = c.db; close = c.close || null;
     }
+    // 新商品の入口を閉じる (計画 newentry_min_plan.md §3 の 0): 何かを読む前に 1 回 (読む接続を開くだけ = まだ何も読んでいない)。最後の ops.record_new_entry_gate と同じ回の番号。
+    //   閉じられなかった (0058 があるのに) = record を呼ばない・要約の先頭に ⚠️。0058 が無いと確かめた = 今までどおり。どちらも照合そのものは止めない
+    if (neCompare) gateClose = await closeNewEntryForCompare(writerDb || connectWriter ? writer : null, { compareRunId, readDb: db });
     // ② の台帳は排他を取ってから読む (取れなければ台帳を使う判定は blocked = pending_locked。C2 v6-3)
     const release = neCompare ? (() => { try { return acquireLock(pendingDir(dataDir, RESULT_DIR)); } catch { return null; } })() : null;
     let pendingEntries = null, ledger = null, decisionLedger = null, decisionsDone = [], baselineWrites = [], neCodes = null, regObs = null, regRead = null;
@@ -327,6 +399,11 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         // 新商品の確かめがこの後に走る回 = 確かめの前の完了の証跡には「確かめの後の数はまだ」の印 (fail-closed)。最後の書き直しが成功したときだけ ok / skipped に変わる
         //   (書き直しも failed の書き込みも落ちた = 印が残る = W13:ne は blocked。#1635 Codex R4)
         ...(result.ne.registrations && result.ne.registrations.write === 'observed' ? { reg_after_check: { state: 'pending' } } : {}),
+        // 区分の差の生の数 (承認で減らさない。広げる道 v8)
+        sku_kind_raw_mismatch: result.ne.sku_kind_raw_mismatch ?? null,
+        sku_kind_raw_mismatch_count: result.ne.sku_kind_raw_mismatch_count ?? null,
+        kind_gate: result.ne.kind_gate ?? null,
+        fetch_counts: result.ne.fetch_counts ?? null,   // 今朝の取得の件数の状態 (区分のゲートの integrity_untrusted の内訳)
         baseline: result.ne.baseline ? { state: result.ne.baseline.state, held_reason: result.ne.baseline.held_reason ?? null, write: result.ne.baseline.write ?? null, write_code: result.ne.baseline.write_code ?? null,
           counts: result.ne.baseline.counts ?? null, written: result.ne.baseline.written ?? null } : null } : null,
       // ②b 古い表 (由来 = 作り直しの ID・写しの世代。比べない朝は not_applied と理由だけ)
@@ -360,6 +437,13 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       let rewritten = null;
       try { rewritten = write(dataDir, EVIDENCE_NAME, evidence); } catch { rewritten = null; }
       if (!rewritten) throw new Error('証跡 (新商品の確かめの後) を書けない = 見張りが確かめの前の数を読む');
+    }
+    // 新商品の入口のゲートの記録 (計画 newentry_min_plan.md §3-1)。結果と証跡を書いた後に 1 回・失敗しても照合は失敗にしない (要約に一言)
+    if (result.ne && gateClose) result.ne.gate_close = gateClose;
+    if (result.ne && gateClose && gateClose.state !== 'ok' && gateClose.state !== 'not_applied') {
+      result.ne.gate_record = { state: 'skipped_not_closed' };   // 閉じていない回の結果を許可の材料にしない (#1641 Codex R3 High)
+    } else if (result.ne && result.ne.verdict !== 'error' && result.ne.verdict !== 'blocked') {
+      result.ne.gate_record = await recordNewEntryGate(writerDb || connectWriter ? writer : null, { compareRunId, ne: result.ne });
     }
     } finally { await closeWriter(); }
     pruneResults(dataDir, { now });

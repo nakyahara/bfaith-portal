@@ -154,10 +154,17 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     const readDigest = { products: materialDigest('products', products) };   // ③a-1: この回が実際に読んだ中身 (下で世代と照らす)
     const skuByNorm = new Map();
     const repRaw = new Map();   // sku → 材料の 代表商品コード の元の値 (NULL と '' を分けたまま。状態は世代の意味の版を読んでから決める)
+    // 区分を確かめられない材料の行 (広げる道 v8 §8-4・v11: 落とす前の生の行から = {reason, raw_code, code_norm})。
+    //   empty_code = raw_code は元の文字 (null は空の文字)・code_norm は null / unknown_kind = 知らない商品区分 / norm_collision = 正規化で重なる行 (重なった行ごとに 1 つ)
+    plan.kindUnverifiable = [];
+    const kindRawByNorm = new Map();   // code_norm → 元の書き方の集合 (区分の分かる行。正規化の重なりを数える)
     for (const r of products) {
-      const code = s(r['商品コード']); if (!code) continue;
+      const code = s(r['商品コード']);
+      if (!code) { plan.kindUnverifiable.push({ reason: 'empty_code', raw_code: r['商品コード'] == null ? '' : String(r['商品コード']), code_norm: null }); continue; }
       const kind = mapSkuKind(r['商品区分']);
-      if (!kind) { (src.skipped ||= []).push({ table: 'mirror_products', code, reason: `商品区分 ${r['商品区分']}` }); continue; }
+      if (!kind) { (src.skipped ||= []).push({ table: 'mirror_products', code, reason: `商品区分 ${r['商品区分']}` }); plan.kindUnverifiable.push({ reason: 'unknown_kind', raw_code: code, code_norm: normSku(code) }); continue; }
+      if (!kindRawByNorm.has(normSku(code))) kindRawByNorm.set(normSku(code), []);
+      kindRawByNorm.get(normSku(code)).push(code);
       const taxRate = mapTaxRate(r['消費税率']);
       const sc = n(r['売上分類']);
       const sku = {
@@ -172,6 +179,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       repRaw.set(sku, r['代表商品コード']);
       skuByNorm.set(normSku(code), sku);
     }
+    for (const [k, list] of kindRawByNorm) if (new Set(list).size > 1) for (const c of list) plan.kindUnverifiable.push({ reason: 'norm_collision', raw_code: c, code_norm: k });
     const knownSku = (code) => skuByNorm.has(normSku(code));
     const isSingleSku = (code) => skuByNorm.get(normSku(code))?.kind === 'single';
 

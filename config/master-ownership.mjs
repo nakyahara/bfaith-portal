@@ -18,6 +18,11 @@
  *    --use-prepared のロード → 写し・確かめ → activate で active にする (AI_reference 17 §4.2 の表が正・#1610)。
  * 🆕 2026-10-05 の切替 (中原さんの決定 10/4・10 §13) で C にする 13 キー = 下の 'company'。写せない・手当ての PR が無い列 (products.parent・skus.sku_kind・
  *    sku_components・listing_components.amazon・suppliers の 5 つ) は 'load' のまま (⑦-2・④b の後)
+ * 🆕 2026-10-06 skus.sku_kind は 'company' にしたときの準備だけ済み (値は 'load' のまま。🚨 ここだけ書き換えて配らない = 画面は配ったコードの持ち主表を DB の記録と照らす):
+ *    夜間ロード = 既にある SKU の区分を NE に合わせない・NE と区分が違う SKU は conflicts (sku_kind_held)・判断の記録 (decisions.skus.kind_held) に残し、
+ *    商品の行・束ねの親・セットの構成・構成の観測は社内の区分で決める・区分の最終形の正規化 (load でも) /
+ *    写し = 区分も m_products.商品区分 に写す (C 単品・NE セット = 単品として・ほかの食い違い = 前の行のまま。master-publish.js の PUBLISH_COLUMNS.kind) /
+ *    照合 ② = 区分の差を判断の一覧に (company_owned・NE は NE の画面で)・生の区分差の数 (sku_kind_raw_mismatch)
  * 🚨 列を足すときは engine.mjs でその列を実際に見ているかを確かめる (ここに書いただけでは効かない)。知らないキーは起動時に落とす。
  *
  * ここに無いもの:
