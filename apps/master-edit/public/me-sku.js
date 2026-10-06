@@ -23,6 +23,17 @@
   var yen = function (v) { return v == null || v === '' || isNaN(Number(v)) ? '' : Number(v).toLocaleString('ja-JP'); };
   var half = function (s) { return String(s == null ? '' : s).replace(/[０-９．，、]/g, function (c) { return c === '，' || c === '、' ? ',' : String.fromCharCode(c.charCodeAt(0) - 0xFEE0); }); };
   var HANDLING = { active: '取扱中', discontinued: '中止', unknown: '不明' };
+  /**
+   * 円の欄 (標準売価・原価・例外原価) の読み = サーバー (lib/master-write.mjs の intIn) と同じ: 全角の数字・．，－ を半角に → カンマと空白を除く → 整数だけ。
+   * 読めない = null (10/6: 「3,000」が NaN になって「保存すると変わること」が「→ 円」になっていた)。利益の計算 (me-profit.js) も同じ読み
+   */
+  var intOf = function (s) {
+    var t = String(s == null ? '' : s).replace(/[０-９．，－]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); }).replace(/[,\s]/g, '');
+    return /^-?\d+$/.test(t) ? Number(t) : null;
+  };
+  /** 円の欄の見せ方: 読める = 3,000 円 / 読めない = 打った字のまま (保存はサーバーが断る) */
+  var yenText = function (s) { var n = intOf(s); return n == null ? '「' + String(s == null ? '' : s).trim() + '」(整数ではない)' : yen(n) + ' 円'; };
+  ME.intOf = intOf;
 
   /* ---------- 欄の値 ---------- */
   var compTable = document.getElementById('comp');
@@ -61,7 +72,7 @@
     if (el.tagName === 'SELECT') { var o = $$('option', el).filter(function (x) { return x.value === v; })[0]; return o ? o.textContent : v; }
     if (v === '' || v == null) return '(空)';
     var unit = el.getAttribute('data-unit') || '';
-    if (unit === ' 円' && /^\d+$/.test(half(v).trim())) return yen(half(v).trim()) + unit;
+    if (unit === ' 円' && intOf(v) != null) return yen(intOf(v)) + unit;
     return v + unit;
   }
   var compText = function (rows) { return rows.length ? rows.map(function (r) { return r.code + '×' + r.qty; }).join(', ') : 'なし'; };
@@ -73,11 +84,11 @@
       var el = firstEl(k);
       var label = el.getAttribute('data-label') || k, ne = el.getAttribute('data-ne') || '';
       if (k === 'cost') {
-        return { k: k, label: '原価 (今日 ' + P.todayLabel + ' から)', from: P.costNow == null ? '未入力' : yen(P.costNow) + ' 円', to: yen(half($('#cost-jpy').value)) + ' 円', ne: ne };
+        return { k: k, label: '原価 (今日 ' + P.todayLabel + ' から)', from: P.costNow == null ? '未入力' : yen(P.costNow) + ' 円', to: yenText($('#cost-jpy').value), ne: ne };
       }
       if (k === 'exception_cost') {
         var clear = $('#xcost-clear') && $('#xcost-clear').checked;
-        return { k: k, label: '例外原価 (今日から)', from: P.xcostNow == null ? '未入力' : yen(P.xcostNow) + ' 円', to: clear ? 'やめる (構成品の合計に戻す)' : yen(half($('#xcost-jpy').value)) + ' 円', ne: ne };
+        return { k: k, label: '例外原価 (今日から)', from: P.xcostNow == null ? '未入力' : yen(P.xcostNow) + ' 円', to: clear ? 'やめる (構成品の合計に戻す)' : yenText($('#xcost-jpy').value), ne: ne };
       }
       if (k === 'jan') {
         var a = janList(initial.get(el)), b = janList(el.value).concat(janList(janPending()));
@@ -105,8 +116,8 @@
     if (!isSet && has('handling') && hv('handling') === 'active' && P.handling === 'discontinued' && sets.length) out.push([0, 'セット ' + sets.join('・') + ' の取扱も計算し直します (ほかの構成品も取扱中なら取扱中に戻ります)']);
     if (!isSet && has('tax_rate') && sets.length) out.push([0, 'この商品を使うセット ' + sets.join('・') + ' の税率も計算し直します (変わったら「NE でやること」に出ます)']);
     if (!isSet && has('cost')) {
-      var nv = Number(half($('#cost-jpy').value));
-      if (!isNaN(nv)) out.push([0, P.todayLabel + ' から この商品の原価は ' + yen(nv) + ' 円 (いまの ' + (P.costNow == null ? '未入力' : yen(P.costNow) + ' 円') + ' は昨日で終わり)']);
+      var nv = intOf($('#cost-jpy').value);
+      if (nv != null) out.push([0, P.todayLabel + ' から この商品の原価は ' + yen(nv) + ' 円 (いまの ' + (P.costNow == null ? '未入力' : yen(P.costNow) + ' 円') + ' は昨日で終わり)']);
       if (sets.length) out.push([0, 'セット ' + sets.join('・') + ' の原価 (構成品の合計) も今日から計算し直します']);
     }
     if (!isSet && has('jan')) out.push([0, 'JAN はロジザード・product-hub でも使います。NE の JAN は NE の画面で直してください']);
@@ -177,8 +188,8 @@
   var costOpen = $('#btn-cost-open'), costBox = $('#cost-add');
   function costDelta() {
     var el = $('#cost-delta'); if (!el) return;
-    var v = Number(half($('#cost-jpy').value));
-    if ($('#cost-jpy').value.trim() === '' || isNaN(v) || P.costNow == null) { el.innerHTML = ''; return; }
+    var v = intOf($('#cost-jpy').value);
+    if (v == null || P.costNow == null) { el.innerHTML = ''; return; }
     var d = v - P.costNow, pct = P.costNow ? Math.round((d / P.costNow) * 1000) / 10 : null;
     el.innerHTML = '<span class="hint">いまの ' + yen(P.costNow) + ' 円から</span> <span class="delta ' + (d >= 0 ? 'up' : 'down') + '">' + (d >= 0 ? '+' : '−') + yen(Math.abs(d)) + ' 円' + (pct == null ? '' : ' (' + (d >= 0 ? '+' : '−') + Math.abs(pct) + '%)') + '</span>';
   }

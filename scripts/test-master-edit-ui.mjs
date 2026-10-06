@@ -33,6 +33,7 @@
  *        削除は 1 回だけ確かめる・申告はファイルを落として sha256 を照合・1440 / 1280 / 1024 / 150% で横にはみ出さない
  *        (41〜46 = 構成品の照合・カードを作らないときの欄・確かめ直しの上限・Yahoo! の残値と誤りの欄・Amazon の変わらない保存)
  *  49〜50 利益 (1 個あたり・10/6): 単品 / セットの欄を変えると保存の前にその場で計算し直す (保存すると ○ → ○)・数でない・マイナスは赤・元に戻す・一覧の列と利益の少ない順
+ *  51 円の欄 (標準売価・原価・例外原価) の読みはサーバーと同じ (カンマ・全角の数字・空白): 保存すると変わること・前との差・保存するとこうなる・利益
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -1600,6 +1601,33 @@ await ta('[50] 利益 (セット・10/6): セットの売価・セットの原�
     await p.waitForTimeout(150);
     await p.screenshot({ path: `${PROFIT_SHOTS}/一覧_1440_利益の列.png` });
   }
+});
+
+await ta('[51] 円の欄の読み = サーバーと同じ (10/6): 原価「3,000」・全角「３，０００」・空白入りでも「保存すると変わること」「保存するとこうなる」・前との差・利益が同じ数 / 整数でない = 打った字のまま・利益は理由', async (p) => {
+  await p.goto(B + '/sku/z031');   // 売価 1,000・原価 131・税率 10%・送料 S02 (520) (ほかの試験が触らない商品)
+  await p.waitForSelector('html[data-me-profit="ready"]');
+  // 画面の読み (サーバーの intIn と同じ規則)
+  assert.deepEqual(await p.evaluate(() => ['3,000', '３，０００', '3 000', '3　000', '－5', '1.5', '', 'ab', ' 42 '].map((s) => window.MasterEdit.intOf(s))), [3000, 3000, 3000, 3000, -5, null, null, null, 42]);
+  const diffTo = (label) => p.evaluate((l) => { const li = [...document.querySelectorAll('#save-diff li')].find((x) => x.querySelector('.k span').textContent.startsWith(l)); return li ? li.querySelector('.to').textContent : null; }, label);
+  await p.click('#btn-cost-open');
+  for (const typed of ['3,000', '３，０００', '3 000']) {
+    await p.fill('#cost-jpy', typed);
+    assert.equal(await diffTo('原価'), '3,000 円', `${typed}: 保存すると変わること`);
+    assert.match(await p.textContent('#cost-delta'), /いまの 131 円から\s*\+2,869 円/, `${typed}: 前との差`);
+    assert.match(await p.textContent('#save-impact-list'), /この商品の原価は 3,000 円/, `${typed}: 保存するとこうなる`);
+    assert.equal(await pfText(p, '#pf-val'), '−2,920円', `${typed}: 利益 (1000 − 100 − 3300 − 520)`);
+  }
+  await p.fill('#cost-jpy', 'ab');
+  assert.equal(await diffTo('原価'), '「ab」(整数ではない)');
+  assert.equal(await p.textContent('#cost-delta'), '');
+  assert.equal(await pfText(p, '#pf-why'), '入れた原価が数ではないので計算できません');
+  // 標準売価も同じ読み (全角・カンマ)
+  await p.fill('#cost-jpy', '3000');
+  await p.fill('#f-standard_price', '２，５００');
+  assert.equal(await diffTo('標準売価'), '2,500 円');
+  assert.equal(await pfText(p, '#pf-val'), '−1,570円', '2500 − 250 − 3300 − 520');
+  await p.click('#revert');
+  assert.equal(await dirty(p), 0);
 });
 
 const SHOTDIR = process.env.MASTER_EDIT_UI_SHOTS || '';

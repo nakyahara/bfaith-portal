@@ -20,12 +20,14 @@ function start(PF) {
   const P = JSON.parse(dataEl.textContent);
   const S = P.profit || {};
   const isSet = P.kind === 'set';
-  const half = (s) => String(s == null ? '' : s).replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
-  /** 欄の円 (全角の数字・カンマ・空白は許す = サーバーの intIn と同じ)。空 = null / 数でない = bad */
+  /**
+   * 欄の円 = サーバー (lib/master-write.mjs の intIn)・me-sku.js の intOf と同じ読み: 全角の数字・．，－ を半角に → カンマと空白を除く → 整数だけ。
+   * 空 = null / 整数でない・マイナス = bad (保存もサーバーが断る)
+   */
   const yenIn = (raw) => {
-    const t = half(raw).replace(/[,，\s]/g, '');
+    const t = String(raw == null ? '' : raw).replace(/[０-９．，－]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/[,\s]/g, '');
     if (t === '') return { v: null };
-    return /^\d{1,10}$/.test(t) ? { v: Number(t) } : { bad: true };
+    return /^-?\d+$/.test(t) && Number(t) >= 0 ? { v: Number(t) } : { bad: true };
   };
   const same = (a, b) => (a == null && b == null) || (a != null && b != null && Number(a) === Number(b));
 
