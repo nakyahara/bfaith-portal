@@ -16,6 +16,90 @@ import { dumpCompanyDb, restoreCompanyDb, listTables, tableMeta, listSequences, 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; } }
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; } }
+// ─── 復元の停止 (0058・#1644 Codex R2 High / R4 Medium) の差を、特定の ID の行だけで確かめる部品 ───
+const RESTORE_STOP_REASON = '復元';
+const RESTORE_STOP_REVOKE_REASON = '復元 (ダンプから戻した許可は使わない)';
+const stopColsOf = (l) => /\((.*)\) FROM stdin;$/.exec(l)[1].split(', ').map((c) => c.replace(/"/g, ''));
+/** ダンプの行から、停止の床の表と許可の表の行を読む (= 復元の前にあった行) */
+function stopStateFromDump(lines) {
+  const ls = Array.isArray(lines) ? lines : String(lines).split('\n');
+  const floors = new Map(); const leases = new Map();
+  let block = null; let cols = null;
+  for (const l of ls) {
+    const m = /^COPY "ops"\."(master_new_entry_stop_floors|master_new_entry_leases)" /.exec(l);
+    if (m) { block = m[1]; cols = stopColsOf(l); continue; }
+    if (block && l.startsWith('-- end: ')) { block = null; continue; }
+    if (!block || l === '\\.') continue;   // COPY の終わりの印 (\.) は行でない
+    const f = l.split('\t'); const row = Object.fromEntries(cols.map((c, i) => [c, f[i]]));
+    if (block === 'master_new_entry_stop_floors') floors.set(row.floor_id, row); else leases.set(row.lease_id, row);
+  }
+  return { floors, leases, liveLeaseIds: [...leases.values()].filter((x) => x.revoked_at === '\\N').map((x) => x.lease_id) };
+}
+/**
+ * 復元の停止の差を確かめる (dumpLines = 戻したダンプ):
+ *   床 = 前からあった床は全部そのまま残り、新しい床はちょうど 2 行 (single・set 1 行ずつ・floor_result_id = 戻した後の最新の result_id・reason = 復元・
+ *        closed_by_compare_run_id なし・recorded_by = 復元した接続)・許可 = 前に生きていた許可だけが取り消され (理由 = 復元・取り消した人 = 復元した接続)、
+ *        前から取り消されていた許可の取り消しの記録は変わらない。戻り値 = { newFloorIds, revokedLeaseIds } (正規化はこの ID の行だけ)
+ */
+async function assertRestoreStop(d, r, dumpLines) {
+  const before = stopStateFromDump(dumpLines);
+  assert.ok(r.newEntryStop, '0058 の DB の復元は停止の結果を返す');
+  const who = (await d.query('select session_user::text as u')).rows[0].u;
+  const maxR = (await d.query('select coalesce(max(result_id), 0)::text as m from ops.new_entry_gate_results')).rows[0].m;
+  assert.deepEqual([r.newEntryStop.revoked, r.newEntryStop.floor_result_id], [before.liveLeaseIds.length, maxR]);
+  const floors = (await d.query(`select floor_id::text as id, kind, floor_result_id::text as f, closed_by_compare_run_id as c, reason, recorded_by as by, recorded_at is not null as at
+      from ops.master_new_entry_stop_floors order by floor_id`)).rows;
+  for (const id of before.floors.keys()) assert.ok(floors.some((x) => x.id === id), `前からあった床 ${id} が残る`);
+  const added = floors.filter((x) => !before.floors.has(x.id));
+  assert.deepEqual(added.map((x) => [x.kind, x.f, x.c, x.reason, x.by, x.at]).sort(),
+    [['set', maxR, null, RESTORE_STOP_REASON, who, true], ['single', maxR, null, RESTORE_STOP_REASON, who, true]]);
+  const leases = (await d.query(`select lease_id::text as id, revoked_at is not null as revoked, revoke_reason as reason, revoked_by as by from ops.master_new_entry_leases order by lease_id`)).rows;
+  assert.deepEqual(leases.map((x) => x.id).sort(), [...before.leases.keys()].sort(), '許可の行は増えも減りもしない');
+  for (const x of leases) {
+    const b = before.leases.get(x.id);
+    if (before.liveLeaseIds.includes(x.id)) assert.deepEqual([x.revoked, x.reason, x.by], [true, RESTORE_STOP_REVOKE_REASON, who], `生きていた許可 ${x.id} は停止で取り消す`);
+    else assert.deepEqual([x.reason, x.by], [b.revoke_reason, b.revoked_by], `前から取り消されていた許可 ${x.id} の記録は変えない`);
+  }
+  return { newFloorIds: added.map((x) => x.id), revokedLeaseIds: before.liveLeaseIds };
+}
+/**
+ * 復元した側の再ダンプから、停止が足した床 (newFloorIds) を消し (rows= と total_rows・floor_id の sequence の next もその分戻す)、
+ * 停止が取り消した許可 (revokedLeaseIds) の取り消しの 3 列だけを空 (\N) に戻す。ほかの行 (前からある「復元」の床・前の復元で取り消された許可も) は 1 文字も変えない
+ */
+function normalizeRestoreStop(lines, { newFloorIds, revokedLeaseIds }) {
+  const drop = new Set(newFloorIds); const unrevoke = new Set(revokedLeaseIds);
+  const n = drop.size;
+  const out = []; let block = null; let cols = null;
+  for (const l of lines) {
+    const m = /^COPY "ops"\."(master_new_entry_stop_floors|master_new_entry_leases)" /.exec(l);
+    if (m) { block = m[1]; cols = stopColsOf(l); out.push(l); continue; }
+    if (block && l.startsWith(`-- end: "ops"."${block}" rows=`)) {
+      out.push(block === 'master_new_entry_stop_floors' ? `-- end: "ops"."${block}" rows=${Number(l.split('rows=')[1]) - n}` : l);
+      block = null; continue;
+    }
+    if (block === 'master_new_entry_stop_floors' && drop.has(l.split('\t')[cols.indexOf('floor_id')])) continue;
+    if (block === 'master_new_entry_leases') {
+      const f = l.split('\t');
+      if (unrevoke.has(f[cols.indexOf('lease_id')])) { for (const c of ['revoked_at', 'revoke_reason', 'revoked_by']) f[cols.indexOf(c)] = '\\N'; out.push(f.join('\t')); continue; }
+    }
+    if (n && l.startsWith('-- sequence: "ops"."master_new_entry_stop_floors_floor_id_seq" next=')) { out.push(`-- sequence: "ops"."master_new_entry_stop_floors_floor_id_seq" next=${Number(l.split('next=')[1]) - n}`); continue; }
+    if (n && l.startsWith('-- total_rows: ')) { out.push(`-- total_rows: ${Number(l.slice(15)) - n}`); continue; }
+    out.push(l);
+  }
+  return out;
+}
+/** 停止の床・許可の試験用の DB: 照合 ② の結果を 1 つ (close → record) と許可を直接置く */
+const ZERO_GATE_BK = JSON.stringify({ raw_mismatch: 0, raw_unverifiable_affected_existing_cdb: 0, norm_collision: 0, unknown_kind: 0, integrity_untrusted: 0 });
+async function seedGateAndLease(d, run) {
+  await d.query('select ops.close_new_entry_for_compare($1)', [run]);
+  await d.query('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', [run, new Date(Date.now() - 1000).toISOString(), ZERO_GATE_BK]);
+  await d.query('begin');
+  await d.query("select set_config('ops.lease_protocol', '1', true)");
+  await d.query(`insert into ops.master_new_entry_leases (kind, result_id, compare_run_id, granted_by, expires_at)
+    select 'single', r.result_id, r.compare_run_id, 'test', clock_timestamp() + interval '1 day' from ops.new_entry_gate_results r where r.compare_run_id = $1`, [run]);
+  await d.query('commit');
+}
+const stripMigrations = (ls) => ls.filter((l) => !l.startsWith('-- generated_at')).join('\n').replace(/COPY "ops"\."schema_migrations"[\s\S]*?-- end: "ops"\."schema_migrations" rows=\d+/, '');
 const quiet = () => {};
 /** 表名はダンプでは引用付き ("core"."products") */
 const T = (name) => '"' + name.split('.').join('"."') + '"';
@@ -149,7 +233,7 @@ await ta('空の DB に復元できて、中身が一致する (ID・親子・�
     assert.equal(n, table === T('ops.master_new_entry_stop_floors') ? rows + 2 : rows, table);
   }
   assert.deepEqual(r.skipped, [T('ops.schema_migrations')]);
-  await assertRestoreStop(ddb, r, { liveLeasesInDump: 0 });
+  await assertRestoreStop(ddb, r, dumpText);
   // ID が保たれている
   const srcP = await sq('select product_id, display_code, parent_product_id from core.products order by product_id');
   const dstP = await dq('select product_id, display_code, parent_product_id from core.products order by product_id');
@@ -473,49 +557,6 @@ await ta('書き出しが失敗しても、次のダンプが取れる (カー�
 console.log('\n1 行ずつ読む検証と復元 (ダンプ全体を文字列にしない)');
 /** 文字列を gzip ファイルに (試験用) */
 function writeGz(dir, name, text) { const p = path.join(dir, name); fs.writeFileSync(p, zlib.gzipSync(Buffer.from(text, 'utf-8'))); return p; }
-/**
- * 復元の停止 (0058・#1644 Codex R2 High) で生じた差だけを、形で正規化する (ほかの行・表・sequence は 1 文字も変えない):
- *   停止の床の表の reason = '復元' の行を消す (その分の rows= と total_rows・floor_id の sequence の next を戻す)・
- *   許可の表で停止が取り消した行 (revoke_reason = 復元) の取り消しの 3 列を空 (\N) に戻す
- */
-const RESTORE_STOP_REASON = '復元';
-const RESTORE_STOP_REVOKE_REASON = '復元 (ダンプから戻した許可は使わない)';
-function normalizeRestoreStop(lines) {
-  const colsOf = (l) => /\((.*)\) FROM stdin;$/.exec(l)[1].split(', ').map((c) => c.replace(/"/g, ''));
-  let floorCols = null; let inFloors = false; let removed = 0;
-  for (const l of lines) {
-    if (l.startsWith('COPY "ops"."master_new_entry_stop_floors" ')) { floorCols = colsOf(l); inFloors = true; continue; }
-    if (inFloors) { if (l.startsWith('-- end: "ops"."master_new_entry_stop_floors"')) inFloors = false; else if (l.split('\t')[floorCols.indexOf('reason')] === RESTORE_STOP_REASON) removed++; }
-  }
-  const out = []; let block = null; let cols = null;
-  for (const l of lines) {
-    const m = /^COPY "ops"\."(master_new_entry_stop_floors|master_new_entry_leases)" /.exec(l);
-    if (m) { block = m[1]; cols = colsOf(l); out.push(l); continue; }
-    if (block && l.startsWith(`-- end: "ops"."${block}" rows=`)) {
-      out.push(block === 'master_new_entry_stop_floors' ? `-- end: "ops"."${block}" rows=${Number(l.split('rows=')[1]) - removed}` : l);
-      block = null; continue;
-    }
-    if (block === 'master_new_entry_stop_floors' && l.split('\t')[cols.indexOf('reason')] === RESTORE_STOP_REASON) continue;
-    if (block === 'master_new_entry_leases') {
-      const f = l.split('\t');
-      if (f[cols.indexOf('revoke_reason')] === RESTORE_STOP_REVOKE_REASON) { for (const c of ['revoked_at', 'revoke_reason', 'revoked_by']) f[cols.indexOf(c)] = '\\N'; out.push(f.join('\t')); continue; }
-    }
-    if (removed && l.startsWith('-- sequence: "ops"."master_new_entry_stop_floors_floor_id_seq" next=')) { out.push(`-- sequence: "ops"."master_new_entry_stop_floors_floor_id_seq" next=${Number(l.split('next=')[1]) - removed}`); continue; }
-    if (removed && l.startsWith('-- total_rows: ')) { out.push(`-- total_rows: ${Number(l.slice(15)) - removed}`); continue; }
-    out.push(l);
-  }
-  return out;
-}
-/** 復元の停止の差を明示的に確かめる: 停止の結果が返る・両方の種類の床 (reason = 復元) が戻した後の最新の result_id まで・生きている許可は全部取り消し */
-async function assertRestoreStop(d, r, { liveLeasesInDump }) {
-  assert.ok(r.newEntryStop, '0058 の DB の復元は停止の結果を返す');
-  const maxR = (await d.query('select coalesce(max(result_id), 0)::text as m from ops.new_entry_gate_results')).rows[0].m;
-  assert.deepEqual([r.newEntryStop.revoked, r.newEntryStop.floor_result_id], [liveLeasesInDump, maxR]);
-  const floors = (await d.query("select kind, floor_result_id::text as f from ops.master_new_entry_stop_floors where reason = '復元' order by floor_id desc limit 2")).rows;
-  assert.deepEqual(floors.map((x) => [x.kind, x.f]).sort(), [['set', maxR], ['single', maxR]]);
-  assert.equal((await d.query('select count(*)::int as n from ops.master_new_entry_leases where revoked_at is null')).rows[0].n, 0, '生きている許可は残らない');
-}
-
 const productsNow = async (d) => (await d.query('select display_code, parent_product_id is not null as has_parent from core.products order by display_code')).rows;
 await ta('ファイル版の検証は文字列版と同じ結果 (表ごとの行数・合計・採番)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-verify-'));
@@ -609,37 +650,52 @@ await ta('ファイルから戻した中身 = 元の DB (自己参照・区切�
     }
     return out.join('\n');
   };
-  await assertRestoreStop(pdb, r, { liveLeasesInDump: 0 });
+  const stop = await assertRestoreStop(pdb, r, orig);
   assert.notEqual(strip(again), strip(orig), '停止の差 (床の行・sequence) は正規化の前にはある');
-  assert.equal(strip(normalizeRestoreStop(again)), strip(normalizeRestoreStop(orig)));   // 停止の差だけを正規化 (床の表を丸ごと除かない)
+  assert.equal(strip(normalizeRestoreStop(again, stop)), strip(orig));   // 復元した側の、停止が足した床・取り消した許可の行だけを正規化 (元の側はそのまま)
   await p.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-await ta('0058 の復元の停止: 生きている許可を含むダンプを戻す = 許可は全部取り消し・両方の種類の床が最新の結果まで・ほかの表と sequence は完全に一致 (正規化は停止の差だけ)', async () => {
+await ta('0058 の復元の停止: 生きている許可を含むダンプを戻す = その許可だけ取り消し・新しい床がちょうど 2 行 (列も)・ほかの表と sequence は完全に一致 (正規化は停止が触った ID の行だけ)', async () => {
   const a = new PGlite(); const adb = pgliteAdapter(a);
   await applyMigrations(adb, { log: quiet });
-  const at = new Date(Date.now() - 1000).toISOString();
-  const zero = JSON.stringify({ raw_mismatch: 0, raw_unverifiable_affected_existing_cdb: 0, norm_collision: 0, unknown_kind: 0, integrity_untrusted: 0 });
-  await adb.query("select ops.close_new_entry_for_compare('mc_bk_1')");
-  await adb.query("select ops.record_new_entry_gate('mc_bk_1', $1, $1, $2::jsonb)", [at, zero]);
-  await adb.query('begin');
-  await adb.query("select set_config('ops.lease_protocol', '1', true)");
-  await adb.query(`insert into ops.master_new_entry_leases (kind, result_id, compare_run_id, granted_by, expires_at)
-    select 'single', r.result_id, r.compare_run_id, 'test', clock_timestamp() + interval '1 day' from ops.new_entry_gate_results r where r.compare_run_id = 'mc_bk_1'`);
-  await adb.query('commit');
+  await seedGateAndLease(adb, 'mc_bk_1');
   const orig = []; await dumpCompanyDb(adb, (l) => orig.push(l), { log: quiet });
   const b = new PGlite(); const bdb = pgliteAdapter(b);
   await applyMigrations(bdb, { log: quiet });
   const r = await restoreCompanyDb(bdb, orig.join('\n'), { log: quiet });
-  await assertRestoreStop(bdb, r, { liveLeasesInDump: 1 });
-  assert.equal((await bdb.query("select revoke_reason from ops.master_new_entry_leases where compare_run_id = 'mc_bk_1'")).rows[0].revoke_reason, RESTORE_STOP_REVOKE_REASON);
+  const stop = await assertRestoreStop(bdb, r, orig);
+  assert.equal(stop.revokedLeaseIds.length, 1);
   assert.equal((await bdb.query("select ops.new_entry_lease_valid('single') as v")).rows[0].v, false);
   const again = []; await dumpCompanyDb(bdb, (l) => again.push(l), { log: quiet });
-  const strip = (ls) => ls.filter((l) => !l.startsWith('-- generated_at')).join('\n').replace(/COPY "ops"\."schema_migrations"[\s\S]*?-- end: "ops"\."schema_migrations" rows=\d+/, '');
-  assert.notEqual(strip(again), strip(orig));
-  assert.equal(strip(normalizeRestoreStop(again)), strip(normalizeRestoreStop(orig)));
+  assert.notEqual(stripMigrations(again), stripMigrations(orig));
+  assert.equal(stripMigrations(normalizeRestoreStop(again, stop)), stripMigrations(orig));
   await a.close(); await b.close();
+});
+
+await ta('0058 の復元の停止をもう一度: 前の復元の「復元」の床と、前の復元で取り消された許可を持つ DB を戻す = その履歴は 1 文字も変えずに残り、今回の停止は新しい床 2 行と今生きていた許可だけ', async () => {
+  const a = new PGlite(); const adb = pgliteAdapter(a);
+  await applyMigrations(adb, { log: quiet });
+  await seedGateAndLease(adb, 'mc_bk_2a');
+  const d1 = []; await dumpCompanyDb(adb, (l) => d1.push(l), { log: quiet });
+  const b = new PGlite(); const bdb = pgliteAdapter(b);
+  await applyMigrations(bdb, { log: quiet });
+  await restoreCompanyDb(bdb, d1.join('\n'), { log: quiet });   // 1 回目の復元 = 「復元」の床 2 行・mc_bk_2a の許可は復元で取り消し
+  await seedGateAndLease(bdb, 'mc_bk_2b');                           // そのあと新しい照合 ② と生きている許可
+  const d2 = []; await dumpCompanyDb(bdb, (l) => d2.push(l), { log: quiet });
+  const before = stopStateFromDump(d2);
+  assert.equal([...before.floors.values()].filter((x) => x.reason === RESTORE_STOP_REASON).length, 2, 'ダンプに前の復元の床がある');
+  assert.equal([...before.leases.values()].filter((x) => x.revoke_reason === RESTORE_STOP_REVOKE_REASON).length, 1, 'ダンプに前の復元で取り消された許可がある');
+  const c = new PGlite(); const cdb = pgliteAdapter(c);
+  await applyMigrations(cdb, { log: quiet });
+  const r = await restoreCompanyDb(cdb, d2.join('\n'), { log: quiet });
+  const stop = await assertRestoreStop(cdb, r, d2);
+  assert.deepEqual(stop.revokedLeaseIds, before.liveLeaseIds);
+  assert.equal(stop.revokedLeaseIds.length, 1, '今回取り消すのは mc_bk_2b の許可だけ');
+  const again = []; await dumpCompanyDb(cdb, (l) => again.push(l), { log: quiet });
+  assert.equal(stripMigrations(normalizeRestoreStop(again, stop)), stripMigrations(d2));   // 前の復元の床・取り消しの記録も含めて完全に一致
+  await a.close(); await b.close(); await c.close();
 });
 
 await ta('0058 の無い DB (0057 まで) の復元 = 停止はしない・再ダンプは正規化なしで完全に一致 (今までどおり)', async () => {

@@ -1040,7 +1040,7 @@ begin
 end $$;
 revoke all on function ops._require_new_entry_lease(text) from public;
 
--- 画面の表示用の読むだけ (master_edit・watcher)。保存の強制は上の DB の関数がする
+-- 読むだけ (画面の表示用 = master_edit・watcher / 毎朝の段が取り消しの後に閉じたことを確かめる = new_entry_gate・#1645)。保存の強制は上の DB の関数がする
 create function ops.new_entry_lease_valid(p_kind text) returns boolean
   language sql stable security definer set search_path = pg_catalog, pg_temp as $$
   select ops._new_entry_lease_ok(p_kind)
