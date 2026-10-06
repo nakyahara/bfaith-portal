@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v16';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復) / v13 (9/26): Yahoo を ORDER_MALLS に (売上日次を公開しないモール = W9 なし・W8 は件数と取消率・W6 の公開の確認から外す) / v14 (9/27): W14 (広告費の取込の完了と検算。Company DB構想 11 の ③) / v15 (9/28): Yahoo の売上日次を公開 (salesDaily: false を外す = W9 に Yahoo・W8 は売上も・W6 の公開の確認にも入る) / v16 (10/1): W13 に評価キー old (②b 古い表。④a)
+export const CHECKS_VERSION = 'v17';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復) / v13 (9/26): Yahoo を ORDER_MALLS に (売上日次を公開しないモール = W9 なし・W8 は件数と取消率・W6 の公開の確認から外す) / v14 (9/27): W14 (広告費の取込の完了と検算。Company DB構想 11 の ③) / v15 (9/28): Yahoo の売上日次を公開 (salesDaily: false を外す = W9 に Yahoo・W8 は売上も・W6 の公開の確認にも入る) / v16 (10/1): W13 に評価キー old (②b 古い表。④a) / v17 (10/6): W15 (migrate の lock が朝に残っていない。設計 13 §3.10 の 45 分の見張りの保険・PR #1638)
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -225,6 +225,14 @@ export const W14_CAMPAIGN_TOL_SHARE = 0.005;
 export const W14_MAX_UNRESOLVED_SHARE = 0.05;  // 昨日の費用のうち、SKU なのに出品が分からない行の割合の上限
 export const W14_INFO_UNTIL = '2026-10-11';     // 最初の 2 週間は info (差の目安を見てから warn に)
 
+/**
+ * W15 migrate の lock が朝に残っていない (設計 = AI_reference CompanyDB構想/13 §3.10 v3.9「見張り」・v3.12「45 分の見張り」・§5 0b-3 (o)。PR #1638)。
+ * 本番の migrate は人が昼に scripts/company-db/migrate-watched.mjs で流す (45 分の見張り = GChat つき)。毎朝の見張りの時点で lock (migrate.mjs の MIGRATE_LOCK_NAME) が
+ * 持たれていれば異常 = 止まった migrate・手順の外 (daily-sync の間に流した)・見張りの起動忘れ / 消失の保険 (45 分は測れない = 毎朝 1 回)。
+ * 評価キー = 'db/company'。[] にすると評価キーを作らない (既存の試験)
+ */
+export const W15_SCOPES = Object.freeze(['db/company']);
+
 export const RUN_DEADLINE_MS = 5 * 60 * 1000;
 /** 明細 (watch_result_items) に保存する上限 (行・バイト)。案件の管理には使わない = 判定は全件で行い、保存だけ抜粋 */
 export const ITEMS_MAX_ROWS = 200;
@@ -282,6 +290,9 @@ export const CHECKS = [
   { id: 'W14', version: 'v1', title: '広告費の取込の完了と検算', severity: 'warn', depends: [], issuePerItem: false,
     what: `今朝の広告費の送信の証跡 (同じ daily-sync の回。「昨日」の日付・世代が読めなければ blocked) で失敗・Render の方が新しい取得で書かなかった日 (stale) が無い・昨日の取得の記録が miniPC にある・Company DB の昨日の日が今朝の取得の世代・Company DB の昨日の合計がキャンペーンの合計と ${W14_CAMPAIGN_TOL_JPY} 円 / ${W14_CAMPAIGN_TOL_SHARE * 100}% の大きい方の差まで (証跡の campaign_check = 送った取得と同じ世代・同じ SKU 別の合計のものだけ使う。結びつかない・キャンペーンの合計が無ければ blocked)・SKU なのに出品が分からない費用が ${W14_MAX_UNRESOLVED_SHARE * 100}% 以下。証跡が無い (取込が失敗して送信を見送った) は blocked。${W14_INFO_UNTIL} までは info`,
     runbook: 'db/company/README.md「広告費の日次」。証跡 ad-spend-amazon と daily-sync のログの「Amazon Ads (SKU)」「Amazon Ads (campaign)」「Company DB 広告費」を見る。取り直し = fetch-amazon-ads.js --from --to → ad-spend.mjs --from --to。出品が分からない = core.ad_spend_daily の listing_id が null の sku の行 (商品マスタに出品を登録すると翌朝の relink で結ばれる)' },
+  { id: 'W15', version: 'v1', title: 'migrate の lock が朝に残っていない', severity: 'warn', depends: [], issuePerItem: false,
+    what: '見張りの時点で migrate の lock (migrate.mjs の MIGRATE_LOCK_NAME = pg_locks の advisory) を持つ接続が無い。持たれていれば異常 (持ち主の pid・application_name・45 分の見張りの接続 (company-db-migrate-lock-watch) の有無を出す)。本番の migrate は昼に migrate-watched.mjs で流す (daily-sync の間は流さない) = 朝に持たれているのは止まった migrate か手順の外。45 分は測れない (毎朝 1 回) = 45 分の見張り (migrate-watched.mjs) の保険。今の状態を読む = 世代の指紋に入れない',
+    runbook: 'db/company/README.md「migrate の lock の 45 分の見張り」と「concurrent-index の migration が途中で止まったとき」。node -r dotenv/config scripts/company-db/migrate.mjs --list で持ち主と接続からの分を見る → pg_stat_progress_create_index と pg_stat_activity (application_name = company-db-migrate) で動いているかを見る。止めるなら人が pg_cancel_backend (手で DROP INDEX はしない)。終わったら記録されていない file を migrate-watched.mjs で流し直す' },
 ];
 
 /**

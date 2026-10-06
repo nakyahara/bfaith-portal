@@ -59,6 +59,7 @@
  *   node scripts/company-db/migrate.mjs --url ... --list                         # 適用状況だけ (lock は取らない・持ち主の pid を出す)
  *   node scripts/company-db/migrate.mjs --url ... --dry-run                      # 何を流すかだけ (try の lock を取る・DDL は流さない・許す文と expect.json を検査)
  *   node scripts/company-db/migrate.mjs --url <使い捨ての DB> --index-expect 0057 # そのファイルの index の属性 (expect.json の中身) を出す
+ *   🆕 concurrent-index の file は 45 分の見張りの接続が無いと流れない (LOCK_WATCH_REQUIRED) = 本番は node scripts/company-db/migrate-watched.mjs から
  *   (--dir <フォルダ> で migrations のフォルダを変えられる。試験用)
  *   env (concurrent-index の容量): RENDER_API_KEY・CDB_RENDER_PG_RESOURCE_ID (apps/company-db/profit/render-metrics.mjs)
  *
@@ -89,6 +90,12 @@ export const EXPECTED_PG_MAJOR = 18;
  */
 export const CONCURRENT_INDEX_SETTINGS = Object.freeze({ lockTimeout: '5min', statementTimeout: '30min', clientConnectionCheckInterval: '1s' });
 export const MIGRATE_LOCK_ALERT_MINUTES = 45;
+/**
+ * 🆕 45 分の見張り (scripts/company-db/migrate-lock-watch.mjs) の接続の application_name。CLI は concurrent-index の各文の前に、
+ * この名前の接続が同じ DB にあることを確かめ、無ければ流さない (LOCK_WATCH_REQUIRED・設計 13 §3.10 v3.9「見張り」・PR #1638 Codex R1 High)。
+ * 見張りの起動 → GChat に送れたことの確認 → migrate は 1 つのコマンド (scripts/company-db/migrate-watched.mjs) がする
+ */
+export const MIGRATE_LOCK_WATCH_APPLICATION_NAME = 'company-db-migrate-lock-watch';
 /**
  * 空き容量の関門 (設計 13 §3.10 v3.9):
  *   予想 = reltuples × (index の列の pg_stats.avg_width の和 + 式の列は EXPR_WIDTH + TUPLE_OVERHEAD) × ESTIMATE_FACTOR
@@ -1017,6 +1024,24 @@ async function unlock(db) {
   if (!ok) throw new Error('pg_advisory_unlock が false (持っていなかった)');
 }
 
+/**
+ * 🆕 45 分の見張りの接続 (application_name = MIGRATE_LOCK_WATCH_APPLICATION_NAME・同じ DB・自分以外) が無ければ止まる (LOCK_WATCH_REQUIRED・取引の外)。
+ * application_name と datname はどの役割からも見える (権限の無い役割からほかの役割の session を見ても = 試験 R1)。見張りを人が忘れる・途中で死んだ の守り (偽の名前を付けた接続までは見分けない)
+ */
+export async function assertLockWatchPresent(db, label = '') {
+  const n = await withCatalogPath(db, async () => (await db.query(`select pg_catalog.count(*)::pg_catalog.int4 as n from pg_catalog.pg_stat_activity a
+     where a.application_name = $1 and a.datname = pg_catalog.current_database() and a.pid <> pg_catalog.pg_backend_pid()`, [MIGRATE_LOCK_WATCH_APPLICATION_NAME])).rows[0].n);
+  if (!n) {
+    throw Object.assign(new Error(`${label ? `${label}: ` : ''}migrate の lock の 45 分の見張り (${MIGRATE_LOCK_WATCH_APPLICATION_NAME}) の接続が無い = concurrent-index を流さない (記録しない)。` +
+      'scripts/company-db/migrate-watched.mjs から流す (見張りを起動 → GChat に送れたのを確かめてから migrate)'), { code: 'LOCK_WATCH_REQUIRED', noTransaction: true });
+  }
+  return n;
+}
+/** CLI が migrateWithLock に渡す opts (🆕 concurrent-index の各文の前に見張りの接続を確かめる = requireLockWatch。試験も同じ関数を通す) */
+export function cliRunOptions(o) {
+  return { ...o, requireLockWatch: (db, f) => assertLockWatchPresent(db, f.file) };
+}
+
 /** CLI の入口 = lock の中で applyMigrations (流す / dry-run) */
 export function migrateWithLock(db, opts = {}) {
   return withMigrateLock(db, () => applyMigrations(db, opts), { log: opts.lockLog || (() => {}) });
@@ -1121,6 +1146,8 @@ async function applyConcurrentIndexFile(db, f, plan, opts, log, appliedBy, mode,
     }
     for (const st of plan.statements) {
       const key = `${st.schema}.${st.name}`;
+      // 🆕 45 分の見張りの接続が無ければ、この文から先を流さない (CLI だけが渡す。試験の直の呼び出し・PGlite は渡さない = 今までどおり)
+      if (typeof opts.requireLockWatch === 'function') await opts.requireLockWatch(db, f);
       if (st.kind === 'create') {
         const running = await buildsInProgress(db, `${st.schema}.${st.table}`);
         if (running.length) throw fail(`${st.schema}.${st.table} の index の作りが別の接続で動いている (pid ${running.map((r) => r.pid).join(', ')}) = 終わるか止まるのを待つ\n  ${CONCURRENT_INDEX_RUNBOOK}`, { reason: 'BUILD_IN_PROGRESS' });
@@ -1169,7 +1196,7 @@ async function applyConcurrentIndexFile(db, f, plan, opts, log, appliedBy, mode,
     // 🆕 Codex R5 M2: 記録も search_path = pg_catalog の取引で (ふつうの file の記録と同じ・前の file が残した search_path に依らない)
     await withCatalogPath(db, () => db.query('insert into ops.schema_migrations (version, name, checksum, applied_by) values ($1, $2, $3, $4)', [f.version, f.name, f.checksum, appliedBy]));
   } catch (e) {
-    const err = ['MIGRATION_FAILED', 'DISK_CHECK_FAILED'].includes(e.code) ? e : fail(e.message, { cause: e });
+    const err = ['MIGRATION_FAILED', 'DISK_CHECK_FAILED', 'LOCK_WATCH_REQUIRED'].includes(e.code) ? e : fail(e.message, { cause: e });
     // invalid が残っていれば回収の手順を添える
     try {
       const left = [];
@@ -1637,7 +1664,7 @@ if (isMain) {
       console.log(JSON.stringify(await buildIndexExpect(db, f), null, 2));
       return 0;
     }
-    const r = await migrateWithLock(db, { dir, to, dryRun: args.includes('--dry-run'), readDiskMetrics: await renderDiskMetricsReader(process.env, url, { currentDatabase: (await client.query('select pg_catalog.current_database()::pg_catalog.text as d')).rows[0].d }), lockLog: (m) => console.log(`[company-db] ${m}`) });
+    const r = await migrateWithLock(db, cliRunOptions({ dir, to, dryRun: args.includes('--dry-run'), readDiskMetrics: await renderDiskMetricsReader(process.env, url, { currentDatabase: (await client.query('select pg_catalog.current_database()::pg_catalog.text as d')).rows[0].d }), lockLog: (m) => console.log(`[company-db] ${m}`) }));
     console.log(`[company-db] applied=${r.applied.length} skipped=${r.skipped.length} pending=${r.pending.length}`);
     return 0;
   })().then(async (c) => {

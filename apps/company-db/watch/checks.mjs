@@ -12,6 +12,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { readEvidence } from '../push/evidence.mjs';
+import { MIGRATE_LOCK_NAME, MIGRATE_LOCK_WATCH_APPLICATION_NAME } from '../../../scripts/company-db/migrate.mjs';
+import { LOCK_HOLDER_SQL, holderOfRows, holderLine } from '../../../scripts/company-db/migrate-lock-watch.mjs';
 
 export const scopeKeyOf = (a, b) => `${a}/${b}`;
 export const addDays = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
@@ -42,6 +44,7 @@ export function plannedKeys(config) {
     }
     else if (c.id === 'W10') { for (const k of config.W10_KINDS) keys.push({ checkId: c.id, scopeKey: w10KindKey(k) }); keys.push({ checkId: c.id, scopeKey: W10_OTHER }); }
     else if (c.id === 'W14') for (const s of config.AD_SPEND_SCOPES || []) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(s.mall, s.scope) });
+    else if (c.id === 'W15') for (const s of config.W15_SCOPES || []) keys.push({ checkId: c.id, scopeKey: s });
   }
   return keys;
 }
@@ -1038,7 +1041,31 @@ export async function evalW14(ctx, check) {
   return out;
 }
 
-export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8, W10: evalW10, W11: evalW11, W4: evalW4, W12: evalW12, W13: evalW13, W14: evalW14 };
+// ── W15 migrate の lock が朝に残っていない (設計 13 §3.10 の 45 分の見張りの保険・§5 0b-3 (o))
+/**
+ * pg_locks の migrate の lock (条件は migrate.mjs の describeLockHolder・migrate-lock-watch.mjs と同じ SQL) を読む。持たれていなければ pass / 持たれていれば breach。
+ * watcher の役割からは持ち主の backend_start は見えない (= 何分かは出せないことが多い)。今の状態 (MVCC ではない) = inputGeneration に入れない
+ */
+export async function evalW15(ctx, check) {
+  const { db, config } = ctx;
+  const out = [];
+  for (const scopeKey of config.W15_SCOPES || []) {
+    const r = base(check, scopeKey, { threshold: { lock: MIGRATE_LOCK_NAME, held: false } });
+    const h = holderOfRows(await rowsOf(db, LOCK_HOLDER_SQL, [MIGRATE_LOCK_NAME]));
+    const watchers = Number((await oneOf(db, `select count(*)::int as n from pg_catalog.pg_stat_activity where application_name = $1 and datname = pg_catalog.current_database()`, [MIGRATE_LOCK_WATCH_APPLICATION_NAME])).n);
+    const minutes = h && h.heldMs != null ? Math.floor(h.heldMs / 60000) : null;
+    r.observed = { held: !!h, pid: h ? h.pid : null, application_name: h ? h.applicationName : null, usename: h ? h.usename : null, minutes_since_connect: minutes, phase: h ? h.phase : null, relation: h ? h.relation : null, lock_watch_sessions: watchers };
+    r.sampleSize = 1;
+    if (!h) { r.verdict = 'pass'; out.push(r); continue; }
+    r.verdict = 'breach';
+    r.reason = `見張りの時点で migrate の lock (${MIGRATE_LOCK_NAME}) を ${holderLine(h)} が持っている${minutes != null ? ` (接続から ${minutes} 分)` : ''}${h.phase ? `・${h.relation || ''} の ${h.phase}` : ''}。`
+      + `本番の migrate は昼に migrate-watched.mjs で流す = 止まった migrate か手順の外。45 分の見張りの接続: ${watchers ? `あり (${watchers})` : '無い'}`;
+    out.push(r);
+  }
+  return out;
+}
+
+export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8, W10: evalW10, W11: evalW11, W4: evalW4, W12: evalW12, W13: evalW13, W14: evalW14, W15: evalW15 };
 
 /**
  * 世代の指紋: 各評価が「実際に読む値」を、評価と同じ範囲でまとめた文字列。snapshot の中と、閉じた後で比べる (違えば再評価。09 §2.1)
