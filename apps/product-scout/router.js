@@ -23,7 +23,7 @@ import {
   getConcept, recordDecision, countMatching, REASON_CODES, getOwnImport, getIngestStatus, jstDate,
 } from './db.js';
 import { productScoutInitError } from '../warehouse-mirror/db.js';
-import { ingestKeywords, latestKeywords, keywordSyncState, keywordQueue, REASONS, REASON_GROUPS, recordKeywordDecision } from './keywords.js';
+import { ingestKeywords, latestKeywords, keywordSyncState, keywordQueue, screenedOutKeywords, REASONS, REASON_GROUPS, recordKeywordDecision } from './keywords.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -217,6 +217,8 @@ ingestRouter.get('/keywords',guardTables,keywordSyncAuth,(req,res)=>{
 router.get('/keywords',guardTables,(req,res)=>{
   res.render(path.join(__dirname,'views/keyword-queue'),{
     run:latestKeywords(),today:jstDate(),queue:keywordQueue({status:req.query.status,page:req.query.page}),
+    // ?status=screened = AIが選別で見送った案 (見るだけ)。判定一覧とは別に数える
+    screened:screenedOutKeywords({page:req.query.status==='screened'?req.query.page:1}),showScreened:req.query.status==='screened',
     reasonLabels:REASONS,reasonGroups:REASON_GROUPS,
     username:req.session?.email,displayName:req.session?.displayName,
   });

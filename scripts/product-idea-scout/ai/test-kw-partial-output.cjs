@@ -24,3 +24,13 @@ test('存在しない学習参照と重複した案なし説明を外し、有�
 test('架空の元ASINを持つ1案だけを拒否し、ほかの案と未確認商品を残す',()=>{
  const raw=JSON.stringify({items:[item(1),{...item(2),seed_asins:['B999999999']}],no_idea:[]});const result=parseBatchResponse(raw,rows,learningContext([],rows));assert.equal(result.items.length,1);assert.equal(result.covered_asins.length,1);assert.equal(result.unresolved_asins.length,2);
 });
+test('説明文つきの返事でも組を打ち切らずに最後まで回し、選別で落ちた案は用途・元商品つきで残す (2026-10-06)',async()=>{
+ const state={scan:{cycle:1,seen_asins:[]},history:[]};const stages=[];
+ const data=prompt=>JSON.parse(prompt.split('<untrusted_data>\n')[1].split('\n</untrusted_data>')[0]);
+ const result=await discover({run_id:'prose',day:'2026-10-06',rows,state,batchSize:1,session:{state:{deadline:new Date(Date.now()+80*60000).toISOString()},budget:()=>({}),saveBudget:()=>{},recordStage:()=>{}},execution:{attestations:{}},saveState:async()=>{},saveStage:async()=>{},invokeFn:async(stage,prompt)=>{stages.push(stage);const input=data(prompt);
+  if(stage==='R03')return {status:'OK',response:'```json\n'+JSON.stringify({items:input.candidates.map(i=>i.kw==='用途1 シート'?{candidate_id:i.candidate_id,decision:'propose',codes:[],reason:'室内で土を受ける用途',matched_asins:i.seed_asins,buy_by:'generic',own_overlap:'different',commodity:'clear',opportunity:'植え替え時に床へ土をこぼさず後片付けを減らすシート'}:{candidate_id:i.candidate_id,decision:'defer',codes:['insufficient_market_evidence'],reason:'根拠の商品が1件だけ',matched_asins:i.seed_asins})})+'\n```\n選別しました。'};
+  const n=rows.findIndex(r=>r.asin===input.products[0].asin)+1;return {status:'OK',response:'```json\n'+JSON.stringify({items:[item(n)],no_idea:[]})+'\n```\n\n提供した1案は {用途'+n+'} です。'};}});
+ assert.deepEqual(stages,['R01','R03','R01','R03','R01','R03']);assert.equal(result.status,'completed');assert.equal(result.coverage.seen_in_cycle,3);
+ assert.deepEqual(result.items.map(i=>i.kw),['用途1 シート']);assert.equal(result.screened_out.length,2);
+ for(const r of result.screened_out){const n=r.kw.match(/用途(\d)/)[1];assert.equal(r.use,'用途'+n);assert.equal(r.idea_reason,'用途が明確');assert.deepEqual(r.sources,[{asin:rows[n-1].asin,title:'用途'+n+' シート'}]);assert.equal(r.by,'R03');}
+});

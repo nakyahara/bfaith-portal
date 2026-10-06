@@ -202,3 +202,19 @@
   .kw-reasons { grid-template-columns: minmax(0, 1fr); gap: 10px; }
   .kw-btn { flex: 1 1 100%; padding: 13px; }
 }
+
+/* AIが見送った案 (?status=screened) — 見るだけ。判定カードと見分けがつくよう枠を点線にする */
+.kw-tab--screened { border-style: dashed; }
+.kw-screened__lead { font-size: 13.5px; color: var(--kw-sub); line-height: 1.7; margin: 4px 0 10px; }
+.kw-screened__why { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; padding: 0; }
+.kw-screened__why li {
+  list-style: none; display: inline-flex; gap: 8px; align-items: baseline; padding: 6px 12px;
+  border-radius: 8px; background: var(--kw-face); border: 1px solid var(--kw-line); font-size: 13px;
+}
+.kw-screened__why b { font-variant-numeric: tabular-nums; color: var(--kw-accent); }
+.kw-card--screened { border-style: dashed; border-left-style: solid; border-left-color: #c9d3da; }
+.kw-card--screened h3 { font-size: 19px; }
+.kw-tag--screened { background: #f3ede2; color: #6b4d12; }
+.kw-label--why { background: #f3ede2; color: #6b4d12; }
+.kw-screened__src { margin-top: 6px; }
+.kw-screened__src a { color: var(--kw-accent); }

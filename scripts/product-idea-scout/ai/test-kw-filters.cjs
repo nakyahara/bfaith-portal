@@ -28,8 +28,19 @@ test('固定枠へ絞らず、選別結果で推薦・調査待ち・除外を�
  const out=await screenCandidates([item,{...item,candidate_id:'electric',kw:'電池式ライト'}],[base],{ownNames:[],execution:{attestations:{}},session:{budget:()=>({}),saveBudget:()=>{},recordStage:()=>{}},invokeFn:async()=>({status:'OK',response:JSON.stringify({items:[{...review,decision:'defer',codes:['no_opportunity'],reason:'元の商品名の言い換えだけで検討する理由がまだない'}]})})});
  assert.equal(out.items.length,0);assert.equal(out.records.filter(r=>r.decision==='exclude').length,1);assert.equal(out.records.filter(r=>r.decision==='defer').length,1);
 });
-test('選別付きルートは発案3回と選別3回を同じ利用枠に収める',()=>{
- const b=new RunBudget({run_id:'screen-budget',deadline:new Date(Date.now()+80*60000).toISOString(),profile:'kw-screened-v3'});for(let n=0;n<3;n++){b.reserve('R01');b.reserve('R03');}assert.throws(()=>b.reserve('R01'),/STAGE_CALL_LIMIT/);assert.throws(()=>b.reserve('R03'),/STAGE_CALL_LIMIT/);
+test('選別付きルートは組の数だけ発案と選別を呼べ、再試行は1回だけ (2026-10-06: 60商品×6組)',()=>{
+ const batches=require('./kw-policy.json').discovery.generation_calls;assert.equal(batches,6);
+ const b=new RunBudget({run_id:'screen-budget',deadline:new Date(Date.now()+80*60000).toISOString(),profile:'kw-screened-v3'});for(let n=0;n<batches;n++){b.reserve('R01');b.reserve('R03');}assert.throws(()=>b.reserve('R01'),/STAGE_CALL_LIMIT/);assert.throws(()=>b.reserve('R03'),/STAGE_CALL_LIMIT/);
+ b.reserve('R03',{retry:true});assert.throws(()=>b.reserve('R01',{retry:true}),/CALL_LIMIT/);
+ // 他のプロファイルの上限は変えない
+ const old=new RunBudget({run_id:'old-budget',deadline:new Date(Date.now()+80*60000).toISOString(),profile:'default'});for(let n=0;n<3;n++)old.reserve('R01');assert.throws(()=>old.reserve('R01'),/STAGE_CALL_LIMIT/);
+});
+test('AIがJSONの後ろに説明文を付けても読む。本当に途中で切れた返事は切れたと判定する (2026-10-06)',()=>{
+ const {parseJson}=require('./kw-core.cjs');const items=v=>Array.isArray(v?.items);
+ const body='{"items":[{"kw":"a"}],"no_idea":[{"asin":"B000000001","reason":"x"}]}';
+ for(const text of [body,'```json\n'+body+'\n```','```json\n'+body+'\n```\n\n提供した6案は {南京錠} などです。','前置き {"x":1} のあと\n```json\n'+body+'\n```',body+'\n以上です。'])assert.deepEqual(parseJson(text,items).items,[{kw:'a'}]);
+ assert.throws(()=>parseJson('```json\n{"items":[{"kw":"a"},{"kw":',items),/AI_JSON_INVALID/);
+ assert.throws(()=>parseJson('説明だけ {"x":1}',items),/AI_JSON_INVALID/);
 });
 
 test('方針選別前の旧88案版は公開前に止まり、送信しない',async()=>{

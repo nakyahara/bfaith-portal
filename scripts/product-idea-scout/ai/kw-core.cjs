@@ -6,9 +6,25 @@ const normal=s=>String(s||'').normalize('NFKC').toLowerCase().replace(/[\s　]+/
 const keywordId=kw=>'KW-'+hash(normal(kw)).slice(0,24);
 const fresh=(s,now)=>Number.isFinite(Date.parse(s))&&Date.parse(s)<=now&&now-Date.parse(s)<=7*86400000;
 const safeText=(v,max=500)=>typeof v==='string'&&v.trim()&&v.length<=max;
-function parseJson(response){
-  const s=String(response).trim().replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,'');
-  try{return JSON.parse(s);}catch{throw Object.assign(new Error('AI_JSON_INVALID'),{code:'AI_JSON_INVALID'});}
+// The model sometimes adds a summary after the fenced JSON ("提案した6案は…"). Read the fenced block or the
+// first complete {...} too. Before 2026-10-06 such replies were treated as truncated and the rest of the night was skipped.
+function objectSpans(text){
+  const spans=[];let quoted=false,escaped=false,depth=0,start=-1;
+  for(let i=0;i<text.length&&spans.length<20;i++){
+    const c=text[i];if(depth>0&&quoted){if(escaped)escaped=false;else if(c==='\\')escaped=true;else if(c==='"')quoted=false;continue;}
+    if(depth>0&&c==='"'){quoted=true;continue;}
+    if(c==='{'){if(depth++===0)start=i;}else if(c==='}'&&depth>0&&--depth===0)spans.push(text.slice(start,i+1));
+  }
+  return spans;
+}
+// accept = what a real answer looks like, so a stray {...} in the prose is not taken for it.
+function parseJson(response,accept=v=>v!==null&&typeof v==='object'){
+  const text=String(response).trim();
+  const tries=[text.replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,'')];
+  const fence=/```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```/.exec(text);if(fence)tries.push(fence[1]);
+  tries.push(...objectSpans(text));
+  for(const s of tries){let value;try{value=JSON.parse(s);}catch{continue;}if(accept(value))return value;}
+  throw Object.assign(new Error('AI_JSON_INVALID'),{code:'AI_JSON_INVALID'});
 }
 function selectPool(rows,day,limit=70){
   // Historical titles may seed discovery; no stale price/sales is sent as current evidence.
