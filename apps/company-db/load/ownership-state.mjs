@@ -113,13 +113,17 @@ export const OWNERSHIP_EXCLUSIVE_LOCK_SQL = 'select pg_advisory_xact_lock(ops.ma
  *   番号は DB が commit の直前に振る (epoch の鍵とマスタの書き込みの鍵を持ったまま = 番号の順 = commit の順)。送り手の時計 (started_at / finished_at)・
  *   場所 (host) では並べない。どの場所から流したロードでも数える (毎晩の cron・--use-prepared の明示のロード)。dry-run は行が無い。
  *   activate が「証拠の世代の後にロードが入っていない」を見る・写し (publish/fetch.mjs) がどのロードの世代かを決める
- * @returns {{ commit_seq: number, ingest_run_id: string, epoch: string, ownership_hash: string, host: string|null }|null}  表が無い・行が無い = null
+ * @returns {{ commit_seq: string, ingest_run_id: string, epoch: string, ownership_hash: string, host: string|null }|null}  表が無い・行が無い = null
+ *   🚨 commit_seq は bigint を 10 進の文字のまま (JS の Number にしない = 2^53 を超えても丸めない。広げる道 PR-1・設計 v10 §7.1 の 5)
  */
 export async function latestLoadCommit(db) {
   if ((await rowsOf(db, `select to_regclass('ops.master_load_commits') is not null as ok`))[0].ok !== true) return null;
   const r = (await rowsOf(db, `select c.commit_seq::text as seq, c.ingest_run_id, c.epoch, c.ownership_hash, c.host from ops.master_load_commits c order by c.commit_seq desc limit 1`))[0];
-  return r ? { commit_seq: Number(r.seq), ingest_run_id: r.ingest_run_id, epoch: r.epoch, ownership_hash: r.ownership_hash, host: r.host } : null;   // 数で並べる (文字の列の名前で並べない = '9' > '10' にしない)
+  return r ? { commit_seq: r.seq, ingest_run_id: r.ingest_run_id, epoch: r.epoch, ownership_hash: r.ownership_hash, host: r.host } : null;   // 並べるのは SQL の数 (文字の列の名前で並べない = '9' > '10' にしない)。値は文字のまま
 }
+
+/** commit の番号 (bigint) の文字か = 先頭が 0 でない 10 進 (bigint の上限まで)。Number・BigInt は受けない (呼び手は文字で持つ = 丸めた番号で比べない) */
+export const isCommitSeqText = (v) => typeof v === 'string' && /^[1-9][0-9]{0,18}$/.test(v) && (v.length < 19 || v <= '9223372036854775807');
 
 /**
  * 1 行を用意する (無ければ active = 全部 load で作る) → 行の鍵を取る。取引の中で呼ぶ。
@@ -186,7 +190,7 @@ async function readCutoverPhaseInTx(db) {
  */
 export async function activateOwnership(db, { expectHash, expectPreparedAt, expectLoadCommitSeq, actor, evidence }) {
   if (!expectPreparedAt) throw Object.assign(new Error('証拠を集めたときの prepare の時刻 (expectPreparedAt) が要る'), { code: 'PREPARED_AT_REQUIRED' });
-  if (!Number.isSafeInteger(expectLoadCommitSeq) || expectLoadCommitSeq <= 0) {
+  if (!isCommitSeqText(expectLoadCommitSeq)) {   // 10 進の文字 (bigint のまま。Number は受けない)
     throw Object.assign(new Error('証拠の世代が読んだ夜間ロードの commit の番号 (expectLoadCommitSeq) が要る'), { code: 'LOAD_COMMIT_REQUIRED' });
   }
   return inTx(db, async () => {

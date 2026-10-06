@@ -15,9 +15,14 @@ export async function seedActiveEpoch(db, ownership) {
   const has = (await db.query(`select to_regclass('ops.master_ownership_state') is not null as ok`)).rows[0].ok === true;
   if (!has) return false;
   const m = sorted(ownership);
-  await db.query(`insert into ops.master_ownership_state (id, active_hash, active_map, activated_by) values (1, $1, $2::jsonb, 'test')
-    on conflict (id) do update set active_hash = excluded.active_hash, active_map = excluded.active_map, activated_at = now(), activated_by = 'test',
-      prepared_hash = null, prepared_map = null, prepared_at = null, prepared_by = null, updated_at = now()`, [hashOf(m), JSON.stringify(m)]);
+  // 0058 (G5): 段階 company_owner / new_open では持ち主の epoch は widen の関数でだけ変わる = 試験の置き換えは同じ印 (ops.widen_protocol) を立てて (表が無い / 0058 の前は効かない)
+  const g5 = (await db.query(`select to_regprocedure('ops.guard_master_ownership_widen()') is not null as ok`)).rows[0].ok === true;
+  if (g5) await db.query("select set_config('ops.widen_protocol', '1', false)");
+  try {
+    await db.query(`insert into ops.master_ownership_state (id, active_hash, active_map, activated_by) values (1, $1, $2::jsonb, 'test')
+      on conflict (id) do update set active_hash = excluded.active_hash, active_map = excluded.active_map, activated_at = now(), activated_by = 'test',
+        prepared_hash = null, prepared_map = null, prepared_at = null, prepared_by = null, updated_at = now()`, [hashOf(m), JSON.stringify(m)]);
+  } finally { if (g5) await db.query("select set_config('ops.widen_protocol', '', false)"); }
   return true;
 }
 

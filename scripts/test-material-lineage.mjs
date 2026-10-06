@@ -30,7 +30,7 @@ process.env.MIRROR_SYNC_KEY = 'test-key';
 
 const {
   contentHash, materialDigest, projectMaterialRows, buildMaterialGeneration, saveMaterialSnapshot, readMaterialSnapshot,
-  MATERIAL_DIR_NAME, MATERIAL_COLUMNS, MATERIAL_ID_RE,
+  MATERIAL_DIR_NAME, MATERIAL_COLUMNS, MATERIAL_ID_RE, normalizeSourceCompleteAt,
 } = await import('../apps/warehouse/material-lineage.js');
 
 let passed = 0;
@@ -63,8 +63,17 @@ await ta('[1] ハッシュは mirror の形にそろえてから。並び・鍵�
   assert.match(g.generation_id, MATERIAL_ID_RE);
   assert.match(g.generation_id, /^mat_20260925T001011123Z_/);
   assert.equal(g.products.row_count, 2); assert.equal(g.set_components.row_count, 1);
-  assert.equal(g.products.source_complete_at, '2026-09-25 07:05:00');
+  // 🆕 広げる道 PR-1 (設計 v10 §3.2 ②・R9 M2): ne-api.js の完了の印 (UTC の YYYY-MM-DD HH:mm:ss) は世代を作る所で RFC 3339 (…Z) に直す
+  assert.equal(g.products.source_complete_at, '2026-09-25T07:05:00Z');
   assert.equal(g.set_components.source_complete_at, null);
+  assert.equal(normalizeSourceCompleteAt('2026-09-25 07:05:00'), '2026-09-25T07:05:00Z');
+  assert.equal(normalizeSourceCompleteAt('2026-09-25T07:05:00.123+09:00'), '2026-09-25T07:05:00.123+09:00');   // もう RFC 3339 = そのまま
+  assert.equal(normalizeSourceCompleteAt(null), null); assert.equal(normalizeSourceCompleteAt(''), null);
+  for (const bad of ['2026-02-30 07:00:00', '2026-09-25T07:05:00', '2026/09/25 07:05:00', '2026-09-25 7:05:00', 'infinity', '2026-09-25 07:05:00 ', 12345]) {
+    assert.throws(() => normalizeSourceCompleteAt(bad), (e) => e.code === 'BAD_SOURCE_COMPLETE_AT', String(bad));
+    // 形の分からない時刻 = 世代を作らない (推測で時刻を作らない)
+    assert.throws(() => buildMaterialGeneration({ products: P, set_components: S, neProductsCompleteAt: bad, now: at }), (e) => e.code === 'BAD_SOURCE_COMPLETE_AT');
+  }
   // 同じミリ秒・同じ中身でも別の ID / set_components だけ違えばハッシュの部分も違う
   const g2 = buildMaterialGeneration({ products: P, set_components: S, now: at });
   assert.notEqual(g2.generation_id, g.generation_id);
@@ -170,7 +179,7 @@ await ta('[3] 受け手: 入れた中身からハッシュを出し直し、合�
   const rows = gensOf();
   assert.deepEqual([rows.products.generation_id, rows.products.row_count, rows.products.content_hash], [g.generation_id, 2, g.products.content_hash]);
   assert.deepEqual([rows.set_components.generation_id, rows.set_components.content_hash], [g.generation_id, g.set_components.content_hash]);
-  assert.equal(rows.products.source_complete_at, '2026-09-25 07:05:00');
+  assert.equal(rows.products.source_complete_at, '2026-09-25T07:05:00Z');
   assert.equal(rows.products.semantics, '{"rep":"src1"}'); assert.equal(rows.set_components.semantics, null);   // 受け手は意味の版を残す (D3)
   // 版の形が違う (大文字・数・キーが多い) = 残さない (世代は記録する)
   const gBad = buildMaterialGeneration({ products: MP, set_components: MS, productsSemantics: { rep: 'SRC1' }, now: new Date('2026-09-25T00:21:00Z') });
@@ -257,7 +266,10 @@ await ta('[4] 夜間ロード: 読んだ中身のハッシュを残し、世代�
   let { r, rows } = await load('mat_load_1');
   assert.deepEqual(rows.map((x) => [x.entity, x.status, x.generation_id, x.content_hash, x.row_count]),
     [['products', 'matched', g.generation_id, g.products.content_hash, 2], ['set_components', 'matched', g.generation_id, g.set_components.content_hash, 1]]);
-  assert.equal(rows[0].source_complete_at, '2026-09-27 07:05:00');
+  assert.equal(rows[0].source_complete_at, '2026-09-27T07:05:00Z');
+  // 🆕 広げる道 §13 #14 (材料の時刻の結合): ne-api.js の形 → 世代 (…Z) → Render の受け手 → 夜間ロード → ops.load_materials → 0058 の widen の時刻の確かめ (ops.rfc3339_ts) が読める
+  assert.ok((await db.query('select ops.rfc3339_ts(source_complete_at) is not null as ok from ops.load_materials where ingest_run_id = $1 and entity = $2', ['mat_load_1', 'products'])).rows[0].ok);
+  assert.equal((await db.query("select ops.rfc3339_ts('2026-09-27 07:05:00') as t")).rows[0].t, null);   // 直す前の形 (timezone なし) は widen の確かめで拒む
   assert.match(rows[0].ownership_hash, /^[0-9a-f]{64}$/); assert.equal(rows[0].rule_version, 'v1');
   // 0029: 規則の指紋 (動いているコード)・持ち主の設定そのもの・ロードの条件
   const { LOAD_RULE_FINGERPRINT, loadRuleFingerprint } = await import('../apps/company-db/load/engine.mjs');

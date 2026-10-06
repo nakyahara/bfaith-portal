@@ -607,8 +607,15 @@ export async function restoreFromLines(db, openLines, { log = () => {}, maxDefer
       const n = Number((await db.query(`select count(*)::bigint as n from ${t.table}`)).rows[0].n);
       if (n !== t.rows) throw Object.assign(new Error(`${t.table}: 復元後 ${n} 行 ≠ ダンプ ${t.rows} 行`), { code: 'RESTORE_ROW_MISMATCH' });
     }
+    // 0058 (広げる道 G25): 復元は trigger を止めて入れる = 行の最終形の守り (G19) を通っていない。trigger を戻した後・commit の前に、
+    //   区分 (skus.sku_kind) の持ち主が company なら最終形 2 件を数え直す。0 でなければ投げる = 復元全体を巻き戻す (ダンプを選び直す)。0058 の前の DB は何もしない
+    let kindShape = null;
+    if ((await db.query(`select to_regprocedure('ops.assert_sku_kind_shape_after_restore()') is not null as ok`)).rows[0].ok === true) {
+      try { kindShape = (await db.query('select ops.assert_sku_kind_shape_after_restore() as r')).rows[0].r; }
+      catch (e) { throw Object.assign(new Error(`戻した行の最終形が違う (区分の持ち主が company) = 復元しない: ${e.message}`), { code: 'RESTORE_KIND_SHAPE', cause: e }); }
+    }
     await db.exec('commit');
-    return { tables: summary, totalRows, selfFix, generatedAt: header.generatedAt, skipped: tables.filter((t) => SKIP_RESTORE.includes(t.table)).map((t) => t.table) };
+    return { tables: summary, totalRows, selfFix, generatedAt: header.generatedAt, skipped: tables.filter((t) => SKIP_RESTORE.includes(t.table)).map((t) => t.table), kindShape };
   } catch (e) {
     try { await db.exec('rollback'); } catch { /* 接続が死んでいれば rollback も失敗 */ }
     throw e;

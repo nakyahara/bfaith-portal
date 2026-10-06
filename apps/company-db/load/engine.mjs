@@ -1427,7 +1427,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       await db.query(MASTER_WRITE_EXCLUSIVE_LOCK_SQL);
       const c = (await db.query(`insert into ops.master_load_commits (ingest_run_id, epoch, ownership_hash, host) values ($1, $2, $3, $4) returning commit_seq::text as seq`,
         [runId, report.ownership_epoch?.epoch ?? 'explicit', ownershipHashOf(ownership), opts.host || null])).rows[0];
-      report.load_commit_seq = Number(c.seq);
+      report.load_commit_seq = c.seq;   // bigint の番号は文字のまま (2^53 を超えても丸めない。広げる道 PR-1・設計 v10 §7.1 の 5)
     }
     if (dryRun) { await db.exec('rollback'); log('dry-run: 全部やってから巻き戻した'); }
     else { await db.exec('commit'); log('commit'); }

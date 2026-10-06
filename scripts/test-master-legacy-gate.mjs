@@ -792,6 +792,8 @@ async function forcePhase(phase) {
 // 段階を直接変える試験なので、⑤-2a の前提 (既存の SKU の登録の状態の backfill = 0052 の trigger) は外す (⑤-2a の試験が見る)。
 // 0055 の守り (段階の持ち主表 = active) は残す = setEpoch で本物の形にそろえる
 await pg.query('alter table ops.master_cutover_state disable trigger trg_master_cutover_state_prereq');
+// 0058 (G5): 段階 company_owner / new_open では持ち主の epoch は widen の関数でだけ変わる = この試験は epoch を直接置く (setEpoch) ので同じ印を立てておく (G5 は scripts/test-master-widen.mjs が見る)
+await pg.query("select set_config('ops.widen_protocol', '1', false)");
 const readReal = () => G.readPhaseAndOwner(cdb);
 const SHIP = { owner_cols: ['skus.shipping'] }, AMZ = { owner_cols: ['listing_components.amazon'] };
 await t('Company DB (0055) の持ち主で決める: 行が無い (全部 load) の frozen = 列の入口は開いたまま / C の列の入口だけ閉じる / prepared の C も閉じる / 表を読めない = 閉じる', async () => {

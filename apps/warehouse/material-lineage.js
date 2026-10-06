@@ -116,12 +116,40 @@ export function materialIdTime(id) {
   return Number.isFinite(ms) ? ms : null;
 }
 
+/** RFC 3339 の明示の offset つき (0058 の ops.rfc3339_ts と同じ形。広げる道 §3.2 ②) */
+export const RFC3339_OFFSET_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/;
+/** ne-api.js の完了の印の形 (YYYY-MM-DD HH:mm:ss・UTC = new Date().toISOString() の T を空白にして秒まで) */
+const NE_MARK_UTC_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/;
+/**
+ * 世代に載せる NE の取得の完了の時刻を RFC 3339 (明示の offset つき) にそろえる (広げる道 PR-1・設計 v10 §3.2 ② / R9 M2)。
+ *   null・空 = null / ne-api.js の既知の形 (UTC の YYYY-MM-DD HH:mm:ss) = YYYY-MM-DDTHH:mm:ssZ / もう RFC 3339 = そのまま /
+ *   それ以外 (形の違う・ありえない日時) = 投げる (BAD_SOURCE_COMPLETE_AT = 世代を作らない。推測で時刻を作らない)
+ * 🚨 読み手 (夜間ロード engine.mjs の utcIsoOf・照合 ① compare-load.mjs の validTimestampText と ::timestamptz・Render の受け手) は両方の形を読める
+ */
+export function normalizeSourceCompleteAt(v) {
+  if (v == null || v === '') return null;
+  const bad = () => codedError(`NE の取得の完了の時刻の形が分からない: ${String(v).slice(0, 40)}`, 'BAD_SOURCE_COMPLETE_AT');
+  if (typeof v !== 'string') throw bad();
+  const m = NE_MARK_UTC_RE.exec(v);
+  if (m) {
+    const [y, mo, d, h, mi, s] = m.slice(1).map(Number);
+    const t = new Date(Date.UTC(y, mo - 1, d, h, mi, s));
+    if (t.getUTCFullYear() !== y || t.getUTCMonth() !== mo - 1 || t.getUTCDate() !== d || t.getUTCHours() !== h || t.getUTCMinutes() !== mi || t.getUTCSeconds() !== s) throw bad();
+    return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`;
+  }
+  if (RFC3339_OFFSET_RE.test(v) && Number.isFinite(Date.parse(v))) return v;
+  throw bad();
+}
+
 /**
  * @param {object} [p.build] 作り直しの由来 (master-material.js readMaterialWithLineage の lineage)。build_id が null なら由来不明
  * @param {string|null} [p.neProductsCompleteAt] 作り直しが読んだ NE の印 (由来が分かるときだけ。送信時点の印は使わない)
  * @param {object|null} [p.productsSemantics] products の列の意味の版 (readMasterMaterial の semantics。例 { rep: 'src1' })。受け手・夜間ロードが読み方を決める (D3)
  */
 export function buildMaterialGeneration({ products, set_components, neProductsCompleteAt = null, neSetProductsCompleteAt = null, productsSemantics = null, build = null, now = new Date() }) {
+  // 完了の時刻は RFC 3339 にそろえてから載せる (形の分からない時刻 = 投げる = 世代を作らない。呼び手 sync-to-render.js は送信を止めない)
+  const productsCompleteAt = normalizeSourceCompleteAt(neProductsCompleteAt);
+  const setProductsCompleteAt = normalizeSourceCompleteAt(neSetProductsCompleteAt);
   const p = materialDigest('products', products);
   const s = materialDigest('set_components', set_components);
   const stamp = now.toISOString().replace(/[-:.]/g, '');   // 20260925T001011123Z
@@ -130,8 +158,8 @@ export function buildMaterialGeneration({ products, set_components, neProductsCo
     format: MATERIAL_FORMAT,
     generation_id: `mat_${stamp}_${both.slice(0, 8)}_${crypto.randomBytes(3).toString('hex')}`,
     created_at: now.toISOString(),
-    products: { ...p, source_complete_at: neProductsCompleteAt || null, ...(productsSemantics ? { semantics: productsSemantics } : {}) },
-    set_components: { ...s, source_complete_at: neSetProductsCompleteAt || null },
+    products: { ...p, source_complete_at: productsCompleteAt, ...(productsSemantics ? { semantics: productsSemantics } : {}) },
+    set_components: { ...s, source_complete_at: setProductsCompleteAt },
     build,
   };
 }

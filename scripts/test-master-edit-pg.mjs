@@ -145,6 +145,7 @@ try {
   { const p = (await dbP.query('select * from ops.registration_backfill_plan()')).rows[0]; await dbP.query('select ops.backfill_sku_registrations($1, $2, $3)', [p.sku_count, p.snapshot_hash, 't@test']); }
   await C.advanceCutoverPhase(dbP, { to: 'new_open', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: h } });
   assert.equal((await O.query('select phase from ops.master_cutover_state')).rows[0].phase, 'new_open');
+  await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(dbO);   // 0058: 新商品の入口は今朝の照合のゲートの許可 (lease) があるときだけ開く
 
   const tokenOf = async (code) => W.editTokenOf(await W.readCurrent(dbO, (await q('select sku_id::text as id from core.skus where code = $1', [code]))[0].id, '2030-01-10'));
   const save = (db, code, values, { token, requestId = crypto.randomUUID(), beforeCommit, open = true } = {}) =>

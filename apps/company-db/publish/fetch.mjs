@@ -102,7 +102,7 @@ export async function readPublishSource(db, { prevWatermark = null } = {}) {
  *   切替の日に HTTP (remote-load.mjs load --apply --use-prepared → router の startLoad = host 'render') で流した prepared のロードも、
  *   毎晩の cron (host 'render-nightly') も、後に commit した方が写しの世代になる (照合 ① の selectNightlyLoad は毎晩の cron だけ = 別の目的)。
  *   番号の行がまだ無い (0055 の前・0055 の後に一度も本適用のロードが無い) = 今までどおり毎晩の cron の最新 (commit_seq = null)
- * @returns {{ ingest_run_id, started_at, finished_at, host, commit_seq: number|null, epoch?: string }|null}
+ * @returns {{ ingest_run_id, started_at, finished_at, host, commit_seq: string|null, epoch?: string }|null}  commit_seq = bigint の 10 進の文字 (Number にしない)
  */
 export async function selectPublishLoad(db) {
   const last = await latestLoadCommit(db);

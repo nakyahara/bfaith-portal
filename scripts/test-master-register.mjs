@@ -132,7 +132,10 @@ async function toPhase(to) {
   const mh = await C.manifestHashOf(db, MANIFEST);
   const evidence = to === 'frozen' ? { expected_builds: BUILDS, manifest_hash: mh, owner_hash: LEGACY_HASH, manual_entries_stopped: manualStopped(), drain: drain() }
     : { expected_builds: BUILDS, manifest_hash: mh, owner_hash: C.ownershipHash(ALL_COMPANY) };
-  return asRole('master_ops', () => C.advanceCutoverPhase(db, { to, actor: 'naka@test', evidence }));
+  const r = await asRole('master_ops', () => C.advanceCutoverPhase(db, { to, actor: 'naka@test', evidence }));
+  // 0058 (広げる道 PR-1): 単品の新商品は DB の関数自身が開放の許可を確かめる = new_open に進めたら試験の許可を置く (本番 = widen → 翌朝のゲート)
+  if (to === 'new_open') await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(db);
+  return r;
 }
 /** 0052 の前提の関数 (差し込み口の表の 0052_registrations)。集める関数 (⑤-1) の答え = 「0052_registrations: 」つき */
 const prereq = async (from, to) => (await one('select ops.master_registrations_prereq($1, $2) as p', [from, to])).p;

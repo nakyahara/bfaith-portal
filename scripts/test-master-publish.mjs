@@ -139,6 +139,7 @@ const count = (t, where = '1 = 1', ...p) => db.prepare(`SELECT COUNT(*) AS n FRO
 // ── Company DB (PGlite) と Render の mirror (一時) ──
 const pg = new PGlite(); const pdb = pgliteAdapter(pg);
 await applyMigrations(pdb, { log: quiet });
+await pdb.query("select set_config('ops.widen_protocol', '1', false)");   // 0058 (G5): この試験は持ち主の epoch を直接置く = 同じ印 (G5 そのものは scripts/test-master-widen.mjs が見る)
 const q = async (sql, p) => (await pdb.query(sql, p)).rows;
 /** m_products を Render の mirror に送った状態にする (送り手と受け手と同じ: 中身と、中身から出し直したハッシュの世代) */
 function publishMirror() {
@@ -934,7 +935,7 @@ await ta('[17] 持ち主の epoch (0055): config を書き換えただけでは�
   const lastCommit = await OS.latestLoadCommit(pdb);   // 証拠の世代が読んだ夜間ロード (= 今の最後のロード = HTTP の明示のロード)
   const lastLoad = lastCommit.commit_seq;
   assert.deepEqual(db.prepare('SELECT load_run_id, load_commit_seq FROM cdb_publish_generations WHERE generation_no = ?').get(g.generation_no),
-    { load_run_id: hl.run_id, load_commit_seq: lastLoad });   // 世代に commit の番号
+    { load_run_id: hl.run_id, load_commit_seq: Number(lastLoad) });   // 世代に commit の番号
   assert.deepEqual([evidence().load_run_id, evidence().load_commit_seq], [hl.run_id, lastLoad]);   // 証跡にも
   await assert.rejects(OS.activateOwnership(noCutover, { expectHash: ownHash, expectPreparedAt: (await OS.readOwnershipState(pdb)).prepared.prepared_at, expectLoadCommitSeq: lastLoad, actor: 't', evidence: {} }),
     (e) => e.code === 'CUTOVER_STATE_MISSING');
@@ -954,7 +955,7 @@ await ta('[17] 持ち主の epoch (0055): config を書き換えただけでは�
   await q("update ops.master_ownership_state set prepared_at = prepared_at - interval '1 millisecond' where id = 1");
   assert.equal((await OS.readOwnershipState(pdb)).prepared.prepared_at, pAt);
   // 証拠の世代の後に夜間ロードが入った (最後のロードが証拠のロードでない) = active にしない (#1564 Codex R3 High 1。並んだときの順は本物の PostgreSQL の試験 [21])
-  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, expectLoadCommitSeq: lastLoad - 1, actor: 't', evidence: {} }),
+  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, expectLoadCommitSeq: String(BigInt(lastLoad) - 1n), actor: 't', evidence: {} }),
     (e) => e.code === 'LOAD_AFTER_EVIDENCE' && e.last_load === hl.run_id && e.last_commit_seq === lastLoad);
   assert.equal((await OS.readOwnershipState(pdb)).active.hash, allHash);
   // prepare より前に Company DB を読んだ世代 = active にしない (#1564 の見直し L-1)
@@ -1824,19 +1825,19 @@ await ta('[28] 持ち主表のハッシュは 1 つの式 (load の列は数え�
 await ta('[29] 最後に commit したロード = DB が振る番号の順 (送り手の時計・場所では決めない)・番号の表は足すだけ・写しは場所を問わず最後のロード (#1564 Codex R4 Medium 2・High)', async () => {
   const a = await loadNow();
   const b = await loadNow();
-  assert.equal(b.load_commit_seq, a.load_commit_seq + 1);
+  assert.equal(b.load_commit_seq, String(BigInt(a.load_commit_seq) + 1n));   // 番号は文字 (bigint を Number にしない・広げる道 PR-1)
   // b の送り手の時計が遅れていた (時刻は a より前) = 時刻では a が後に見えるが、commit は b が後 = 番号で b
   await q("update ops.ingest_runs set started_at = started_at - interval '1 day', finished_at = finished_at - interval '1 day' where ingest_run_id = $1", [b.run_id]);
   const last = await OS.latestLoadCommit(pdb);
   assert.deepEqual([last.ingest_run_id, last.commit_seq, last.epoch], [b.run_id, b.load_commit_seq, b.ownership_epoch.epoch]);
   // 番号は数で並べる (文字で並べると '9' が '10' より後になる。この試験では番号が 2 桁を越えている)
-  assert.ok(b.load_commit_seq >= 10, String(b.load_commit_seq));
-  assert.equal(last.commit_seq, Number((await q('select max(commit_seq)::text as m from ops.master_load_commits'))[0].m));
+  assert.ok(BigInt(b.load_commit_seq) >= 10n, String(b.load_commit_seq));
+  assert.equal(last.commit_seq, (await q('select max(commit_seq)::text as m from ops.master_load_commits'))[0].m);
   assert.equal((await F.selectPublishLoad(pdb)).ingest_run_id, b.run_id);
   // 場所: 毎晩の cron (render-nightly) より後に別の場所で commit したロード = 写しはそれを使う (照合 ① の毎晩の回は cron のまま)
   const other = await runInitialLoad(pdb, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: `load_pub_${++loadN}`, host: 'render' });
   assert.equal(other.ok, true, other.error);
-  assert.deepEqual([(await F.selectPublishLoad(pdb)).ingest_run_id, (await F.selectPublishLoad(pdb)).commit_seq], [other.run_id, b.load_commit_seq + 1]);
+  assert.deepEqual([(await F.selectPublishLoad(pdb)).ingest_run_id, (await F.selectPublishLoad(pdb)).commit_seq], [other.run_id, String(BigInt(b.load_commit_seq) + 1n)]);
   // dry-run は番号を取らない (巻き戻す)
   const dry = await runInitialLoad(pdb, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: `load_pub_${++loadN}`, host: 'render-nightly', dryRun: true });
   assert.equal(dry.load_commit_seq, undefined);
@@ -1854,8 +1855,8 @@ await ta('[29] 最後に commit したロード = DB が振る番号の順 (送�
     assert.deepEqual([first.ingest_run_id, first.commit_seq, first.host], ['load_before_0055', null, 'render-nightly']);
     // 0055 の後の最初の本適用のロード = 番号 1 = それを使う
     const next = await runInitialLoad(pdb3, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: 'load_after_0055', host: 'render-nightly' });
-    assert.equal(next.load_commit_seq, 1);
-    assert.deepEqual([(await F.selectPublishLoad(pdb3)).ingest_run_id, (await F.selectPublishLoad(pdb3)).commit_seq], ['load_after_0055', 1]);
+    assert.equal(next.load_commit_seq, '1');
+    assert.deepEqual([(await F.selectPublishLoad(pdb3)).ingest_run_id, (await F.selectPublishLoad(pdb3)).commit_seq], ['load_after_0055', '1']);
   } finally { await pg3.close(); }
   // 足すだけ
   await assert.rejects(q("update ops.master_load_commits set host = 'x'"), /足すだけ/);   // 番号そのものは identity (always) = 書き換えられない
