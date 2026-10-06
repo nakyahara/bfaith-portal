@@ -13,8 +13,9 @@ import {
   setCostFromComponents, deriveSetValues,
 } from '../../lib/master-set-rules.js';
 import crypto from 'node:crypto';
+import { normSku } from '../../lib/sku-norm.js';
 import { ALL_LOAD } from '../company-db/load/ownership-state.mjs';
-import { readCurrentPublish, makePublishResolver, mergeReasons, handlingFromCdb, publishCols, applySideTables, verifyApplied, ownershipHash, writeSetPublishExpect } from './master-publish.js';
+import { readCurrentPublish, makePublishResolver, mergeReasons, kindReason, handlingFromCdb, publishCols, applySideTables, verifyApplied, ownershipHash, writeSetPublishExpect, writeKindFrozen } from './master-publish.js';
 
 // ─── ヘルパー ───
 
@@ -174,6 +175,8 @@ export function applyStagingToProduction(db, { build = null } = {}) {
     const pub = build ? build.publish : null;
     // C にあるセットの導き方の入力・構成品の行 (#1564 Codex R7 High)。m_products と同じ取引で入れ替える = 入れた後の確かめ (今・次の工程) が同じ決め方で導き直して比べる
     if (build) writeSetPublishExpect(db, build.setExpect || []);
+    // 区分の持ち主が C: 前の行のまま にした SKU (C = セット・NE = 単品) の印。持ち主が load の今は書かない (表に触らない)
+    if (build && pub && pub.owns('kind')) writeKindFrozen(db, build.kindFrozen || []);
     const side = pub ? applySideTables(db, pub) : null;
     const applied = pub ? verifyApplied(db, { publication: pub.publication, ownership: pub.ownership, taxRates: TAX_RATES, expected: pub.active ? pub.expected : null }) : null;
     if (applied && !applied.ok) {
@@ -398,14 +401,17 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
       shipCost: ps?.ship_cost ?? null, shipCode: ps?.shipping_code ?? null, shipMethod: ps?.ship_method ?? null,
       taxRate, taxCategory, supplier: p.仕入先コード, salesClass: salesClassMap.get(code) ?? null,
     };
+    // 商品区分 (区分の持ち主が C = C の区分。NE の単品を C がセット・例外とする SKU も C の区分で・値は C の値をそのまま。持ち主が load の今は '単品')
+    const mk = pub.kindOf(code, '単品');
     const v = pub.overlay(code, neV);
     pub.expect(code, neV);
-    reasons.push(...(v === neV ? skuReasons : mergeReasons(code, '単品', neV, v, skuReasons, { cells: pub.peek(code)?.v, generationNo: pub.generation?.generation_no })));
+    reasons.push(...(v === neV ? skuReasons : mergeReasons(code, mk, neV, v, skuReasons, { cells: pub.peek(code)?.v, generationNo: pub.generation?.generation_no })));
+    if (mk !== '単品') reasons.push(kindReason(code, '単品', mk, { cdbKind: pub.peek(code)?.kind, generationNo: pub.generation?.generation_no }));
 
     const co = getCarryover(code);
     const launchDate = resolveLaunchDate(co.new_product_launch_date, p.作成日);
     insertStaging.run(
-      code, v.name, '単品', v.handling,
+      code, v.name, mk, v.handling,
       v.price, v.genka, v.genkaSource, v.genkaStatus,
       v.shipCost, v.shipCode, v.shipMethod,
       v.taxRate, v.taxCategory,
@@ -447,6 +453,9 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
 
     const components = setComponentsQuery.all(sh.セット商品コード);
     const eg = exceptionMap.get(setCode);
+    // 商品区分 (区分の持ち主が C = C の区分)。NE のセットを C が単品・例外とする SKU = 構成の行を作らず (構成品数も空)・構成品から導かず C の値をそのまま
+    const mk = pub.kindOf(setCode, 'セット');
+    const asSet = mk === 'セット';
     const neInfo = db.prepare('SELECT * FROM raw_ne_products WHERE 商品コード = ? COLLATE NOCASE').get(setCode);
     const ps = getShipping(setCode, neInfo?.代表商品コード);
 
@@ -470,6 +479,7 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
         handling: { handlingClass: comp.取扱区分, componentExists: exists },
       };
       neInputs.push(ne);
+      if (!asSet) continue;   // C の区分がセットでない = 構成の行を作らない (今までの決め方の値 neV のための入力だけ集める)
       let compName = comp.商品名 || '';
       let compCost = comp.原価 || null;
       const c = selfC && exists ? pub.of(compCode) : null;
@@ -510,7 +520,8 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
       taxRate: neD.taxRate, taxCategory: neD.taxCategory, supplier: neInfo?.仕入先コード ?? null, salesClass: neD.salesClass,
     };
     let v = neV;
-    if (selfC) {
+    if (selfC && !asSet) v = pub.overlay(setCode, neV);   // C の区分が単品・例外 = C の値をそのまま (構成品から導かない)
+    else if (selfC) {
       // C の構成品の値で同じ決め方を通す (④a)。セット自身が C にあって原価の持ち主が C なら、セットの例外原価の行は使わない
       //   (C の原価の行が人の決めた原価ならそれを重ねる = overlay の set)。
       //   取扱区分はセット自身の C の値から。語は今までの決め方の値 (neD) に合わせる (C はセットの導いた値を持つ = 持ち主を替えただけで ﾒｰｶｰ取扱中止 → 取扱中止 にしない)
@@ -531,7 +542,8 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
       }, { set: true });
     }
     pub.expect(setCode, neV);
-    reasons.push(...(v === neV ? setReasons : mergeReasons(setCode, 'セット', neV, v, setReasons, { cells: pub.peek(setCode)?.v, generationNo: pub.generation?.generation_no })));
+    reasons.push(...(v === neV ? setReasons : mergeReasons(setCode, mk, neV, v, setReasons, { cells: pub.peek(setCode)?.v, generationNo: pub.generation?.generation_no })));
+    if (!asSet) reasons.push(kindReason(setCode, 'セット', mk, { cdbKind: pub.peek(setCode)?.kind, generationNo: pub.generation?.generation_no }));
 
     if (salesClassMap.get(setCode) == null && v.salesClass != null) countSetSalesDerived++;
     // 件数は「従来の式 (NE の値 || 取扱中) から値が変わったセット」= m_products で実際に変わる件数を数える
@@ -544,13 +556,13 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
     const coSet = getCarryover(setCode);
     const setLaunchDate = resolveLaunchDate(coSet.new_product_launch_date, neInfo?.作成日);
     insertStaging.run(
-      setCode, v.name, 'セット', v.handling,
+      setCode, v.name, mk, v.handling,
       v.price,
       v.genka, v.genkaSource, v.genkaStatus,
       v.shipCost, v.shipCode, v.shipMethod,
       v.taxRate, v.taxCategory,
       neInfo?.在庫数 ?? null, neInfo?.引当数 ?? null, v.supplier,
-      components.length, v.salesClass,
+      asSet ? components.length : null, v.salesClass,
       coSet.seasonality_flag, coSet.season_months, coSet.new_product_flag, setLaunchDate,
       ts
     );
@@ -580,9 +592,11 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
       shipCost: ps?.ship_cost ?? null, shipCode: ps?.shipping_code ?? null, shipMethod: ps?.ship_method ?? null,
       taxRate: exTaxRate, taxCategory: exTaxCategory, supplier: null, salesClass: salesClassMap.get(sku) ?? null,
     };
+    const mk = pub.kindOf(sku, '例外');   // 区分の持ち主が C = C の区分 (C が単品・セットとする例外の商品も C の区分で)
     const v = pub.overlay(sku, neV);
     pub.expect(sku, neV);
-    reasons.push(...(v === neV ? exReasons : mergeReasons(sku, '例外', neV, v, exReasons, { cells: pub.peek(sku)?.v, generationNo: pub.generation?.generation_no })));
+    reasons.push(...(v === neV ? exReasons : mergeReasons(sku, mk, neV, v, exReasons, { cells: pub.peek(sku)?.v, generationNo: pub.generation?.generation_no })));
+    if (mk !== '例外') reasons.push(kindReason(sku, '例外', mk, { cdbKind: pub.peek(sku)?.kind, generationNo: pub.generation?.generation_no }));
 
     const coEx = getCarryover(sku);
     // 例外商品も resolveLaunchDate を通すことで、carryover に既存の不正値
@@ -590,7 +604,7 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
     // NE 商品ではないので NE 作成日 のフォールバックはなく、carryover のみを正規化する。
     const exLaunchDate = resolveLaunchDate(coEx.new_product_launch_date, null);
     insertStaging.run(
-      sku, v.name, '例外', v.handling,
+      sku, v.name, mk, v.handling,
       v.price, v.genka, v.genkaSource, v.genkaStatus,
       v.shipCost, v.shipCode, v.shipMethod,
       v.taxRate, v.taxCategory,
@@ -601,6 +615,27 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
     countException++;
   }
   log.push(`例外: ${countException}件`);
+  // 区分の持ち主が C で C = セット・NE = 単品 / 例外を含む食い違い の SKU = 前の m_products・m_set_components の行のまま (fail-closed。設計 = 広げる道 v3 §4.1 b・v4)。
+  //   C のセットの構成 (sku_components) は写さない列 = セットの行を作れない。前の行が無い = 載せない (非掲載・NE の値の行も残さない)。理由 = kind_c_set_ne_single_frozen
+  const kindFrozen = [];
+  {
+    const cols = MP_COLS.filter((c) => c !== 'product_id');
+    for (const code of pub.frozenCodes()) {
+      const prev = db.prepare('SELECT 1 FROM main.m_products WHERE 商品コード = ?').get(code);
+      const neKind = db.prepare('SELECT 商品区分 FROM m_products_staging WHERE 商品コード = ?').get(code)?.商品区分 ?? null;   // NE の表の形の区分 (今朝)
+      db.prepare('DELETE FROM m_products_staging WHERE 商品コード = ?').run(code);
+      db.prepare('DELETE FROM m_set_components_staging WHERE セット商品コード = ?').run(code);
+      if (prev) {
+        db.prepare(`INSERT INTO m_products_staging (${colList(cols)}) SELECT ${colList(cols)} FROM main.m_products WHERE 商品コード = ?`).run(code);
+        db.prepare(`INSERT INTO m_set_components_staging (${colList(MSC_COLS)}) SELECT ${colList(MSC_COLS)} FROM main.m_set_components WHERE セット商品コード = ?`).run(code);
+      }
+      pub.forget(code);
+      kindFrozen.push({ code, prev: !!prev });
+      for (const x of reasons.filter((y) => y.code === code)) reasons.splice(reasons.indexOf(x), 1);   // NE の道の理由は使わない (前の行のまま / 載せない)
+      const ck = pub.publication?.entries?.get(normSku(code))?.kind ?? null;
+      reasons.push({ code, kind: neKind, col: 'kind', reason: 'kind_c_set_ne_single_frozen', owner_key: 'skus.sku_kind', cdb_value: { kind: ck }, value: prev ? 'previous_row' : 'omitted', ne_value: neKind, generation_no: pub.generation?.generation_no ?? null });
+    }
+  }
   // Company DB の写し (④a): 使った世代・重ねた SKU・Company DB にしか無い SKU (m_products に足さない = not_in_ne)
   let publishStats = null;
   if (pub.active) {
@@ -616,6 +651,17 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
       // NE と C で種類が違う SKU (NE でセットを単品にした等) = その SKU だけ写さない (NE の値のまま)。止めずに知らせる (#1564 の見直し M-5)
       warn.push(`NE と Company DB で種類が違う SKU ${publishStats.kind_mismatch} 件は NE の値のまま (写していない): ${publishStats.kind_mismatch_codes.join(', ')}`);
       console.warn(`[m_products] ⚠️ NE と Company DB で種類が違う SKU ${publishStats.kind_mismatch} 件は NE の値のまま: ${publishStats.kind_mismatch_codes.join(', ')}`);
+    }
+    if (publishStats.kind_c_single_ne_set) {
+      // 区分の持ち主が C: 社内は単品・NE はセット = 単品として C の値で写した (構成は写さない・止めない)。NE は判断の一覧から NE の画面で直す
+      const m = `社内は単品・NE はセットの SKU ${publishStats.kind_c_single_ne_set} 件は単品として写した (構成は写さない・NE は NE の画面で直す): ${publishStats.kind_c_single_ne_set_codes.join(', ')}`;
+      warn.push(m); console.warn(`[m_products] ⚠️ ${m}`);
+    }
+    if (publishStats.kind_c_set_ne_single_frozen) {
+      // 社内はセット・NE は単品 = 前の行のまま (fail-closed)。毎朝知らせる
+      const om = kindFrozen.filter((x) => !x.prev).map((x) => x.code);
+      const m = `社内と NE で区分が違う SKU ${publishStats.kind_c_set_ne_single_frozen} 件は前の行のまま (社内がセット・NE が単品 / 例外を含む。NE を社内の区分に直すまで)${om.length ? `・前の行が無い ${om.length} 件は載せない (${om.slice(0, 20).join(', ')})` : ''}: ${publishStats.kind_c_set_ne_single_frozen_codes.join(', ')}`;
+      warn.push(m); console.warn(`[m_products] ⚠️ ${m}`);
     }
   }
 
@@ -734,7 +780,7 @@ async function rebuildMProductsLocked(db, buildId, ownership) {
   //   + 上書き表の既にある行を持ち主が C の列の値にそろえる (④a。同じ取引・記録の前。持ち主が全部 load なら何もしない)
   let build;
   try {
-    build = applyStagingToProduction(db, { build: { buildId, startMarks, startedAt, expectedStagingHash: myStagingHash, reasons, publish: pub, setExpect } });
+    build = applyStagingToProduction(db, { build: { buildId, startMarks, startedAt, expectedStagingHash: myStagingHash, reasons, publish: pub, setExpect, kindFrozen } });
   } catch (e) {
     if (!e || e.code !== 'CDB_PUBLISH_VERIFY') throw e;
     const msg = `❌ 入れた後の確かめで Company DB の値と違う → 反映中止 (巻き戻した = 前の m_products のまま): ${String(e.message).slice(0, 300)}`;

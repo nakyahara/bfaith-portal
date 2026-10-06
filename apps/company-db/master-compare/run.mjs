@@ -85,8 +85,14 @@ function summaryLine12(r) {
   // daily-sync は要約の先頭の ⚠️ で警告を決める (isWarnSummary) → ② が落ちた・判定できない朝は ② を先頭に (① が ✅ でも見出しを ⚠️ に)
   const two = neSummary(r.ne);
   const bad = r.ne.verdict === 'error' || r.ne.verdict === 'blocked' || ['locked', 'untrusted', 'write_failed'].includes(r.ne.pending?.state) || r.ne.decisions_write === 'failed' || r.ne.decisions_write === 'not_configured'
-    || baselineTrouble(r.ne) || regTrouble(r.ne);
+    || baselineTrouble(r.ne) || regTrouble(r.ne) || kindTrouble(r.ne);
   return bad ? `${two} / ${one}` : `${one} / ${two}`;
+}
+/** 区分の持ち主が C で、完全な NE の取得と Company DB の区分が違う SKU がある (差を残す承認でも消えない) = 要約の先頭に ⚠️ (重大。広げる道 v8・Codex R8) */
+export function kindTrouble(ne) {
+  const k = ne && ne.sku_kind_raw_mismatch;
+  if (!k || !k.alert || !(k.count > 0)) return null;
+  return `区分が NE と違う SKU ${k.count} 件 (NE の画面で直す: ${k.codes.slice(0, 10).join(', ')}${k.count > 10 ? ' ほか' : ''})`;
 }
 /** 最後に一致した値 (D2) を読めない・書けない・拒まれた・書く接続が無い = 要約の先頭に ⚠️ (切替の前でも黙って止めない) */
 export function baselineTrouble(ne) {
@@ -112,7 +118,9 @@ export function neSummary(ne) {
   if (bt) return `⚠️ ②: ${bt} — 差 ${ne.counts?.items ?? 0} 件`;
   // ポータルで登録した新商品の NE 登録の不一致 (区分違い・取り込んだのに NE に無い・NE の中身が違う) = 自動の知らせがほかに無い → 朝の要約の先頭に ⚠️
   const rt = regTrouble(ne);
-  if (rt) return `⚠️ ②: ${rt} — 差 ${ne.counts?.items ?? 0} 件${regSummary(ne)}`;
+  // 区分の差 (区分の持ち主が C) と新商品の登録の不一致は両方とも先頭に (片方で片方を隠さない。区分を先に)
+  const kt = kindTrouble(ne);
+  if (rt || kt) return `⚠️ ②: ${[kt, rt].filter(Boolean).join(" / ")} — 差 ${ne.counts?.items ?? 0} 件${rt ? regSummary(ne) : ""}`;
   const b = ne.counts?.by_class || {};
   const top = Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ');
   // 基準 (D2) を照らさなかった回 (NE の取得と CDB の読みが 4 時間超) は ⚠️ にしないが、続くと基準が貯まらないので見えるようにする
@@ -327,6 +335,10 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         // 新商品の確かめがこの後に走る回 = 確かめの前の完了の証跡には「確かめの後の数はまだ」の印 (fail-closed)。最後の書き直しが成功したときだけ ok / skipped に変わる
         //   (書き直しも failed の書き込みも落ちた = 印が残る = W13:ne は blocked。#1635 Codex R4)
         ...(result.ne.registrations && result.ne.registrations.write === 'observed' ? { reg_after_check: { state: 'pending' } } : {}),
+        // 区分の差の生の数 (承認で減らさない。広げる道 v8)
+        sku_kind_raw_mismatch: result.ne.sku_kind_raw_mismatch ?? null,
+        sku_kind_raw_mismatch_count: result.ne.sku_kind_raw_mismatch_count ?? null,
+        kind_gate: result.ne.kind_gate ?? null,
         baseline: result.ne.baseline ? { state: result.ne.baseline.state, held_reason: result.ne.baseline.held_reason ?? null, write: result.ne.baseline.write ?? null, write_code: result.ne.baseline.write_code ?? null,
           counts: result.ne.baseline.counts ?? null, written: result.ne.baseline.written ?? null } : null } : null,
       // ②b 古い表 (由来 = 作り直しの ID・写しの世代。比べない朝は not_applied と理由だけ)

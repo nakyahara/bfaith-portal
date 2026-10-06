@@ -899,6 +899,12 @@ function createTables() {
   addColumnIfMissing('cdb_publish_generations', 'load_commit_seq', 'INTEGER');
   // 16b''. C にあるセットの導き方の入力・構成品の行 (#1564 Codex R7 High)。書くのは作り直しの取引 (m_products と一緒に入れ替える)。
   //   入れた後の確かめ (master-publish.js の verifyApplied) が同じ決め方で導き直して m_products・m_set_components と比べる (持ち主が全部 load = 行が無い)
+  // 16b'''. 区分の持ち主が C で、C = セット・NE = 単品 の SKU = 前の m_products・m_set_components の行のまま にした印 (prev_row = 前の行があった)。
+  //   書くのは作り直しの取引 (区分の持ち主が C のときだけ)。入れた後の確かめ・②b はこの SKU を比べない (master-publish.js)
+  db.exec(`CREATE TABLE IF NOT EXISTS m_publish_kind_frozen (
+    code      TEXT PRIMARY KEY,
+    prev_row  INTEGER NOT NULL CHECK (prev_row IN (0, 1))
+  )`);
   db.exec(`CREATE TABLE IF NOT EXISTS m_set_publish_expect (
     set_code        TEXT PRIMARY KEY,
     args_json       TEXT NOT NULL,

@@ -343,6 +343,13 @@ await ta('[6] 本適用: 全区分で 予定 = 投入 + 既存同 + skip (fail-c
   assert.equal(parent.has_parent, true);                                      // 代表商品コード = abc001
   assert.equal(Number((await q("select cost_jpy from core.sku_costs c join core.skus s on s.sku_id = c.sku_id where s.code = 'abc001' and c.valid_to is null"))[0].cost_jpy), 380);   // 四捨五入
   assert.equal((await q("select count(*)::int as n from ops.ingest_runs where ingest_run_id = 'load_test_1' and status = 'success'"))[0].n, 1);
+  // 区分の記録 (広げる道 v8 §8-4): 形を固定。load = held は空・確かめられない材料の行 = 知らない区分 (weird) と正規化の重なり (ＡＢＣ004)
+  const sk = (await q("select payload -> 'sku_kind' as k from ops.load_decisions where ingest_run_id = 'load_test_1' and section = 'skus'"))[0].k;
+  assert.deepEqual(Object.keys(sk).sort(), ['format', 'held', 'unverifiable']);   // 形 (広げる道 v11 §8-4)
+  assert.deepEqual([sk.format, sk.held], ['sku-kind-v1', []]);
+  // 正規化の重なりは重なった行ごとに 1 つ (abc004 と ＡＢＣ004 の両方)・知らない区分 (weird)
+  assert.deepEqual(sk.unverifiable.map((x) => [x.reason, x.raw_code, x.code_norm]).sort(), [['norm_collision', 'abc004', 'abc004'], ['norm_collision', 'ＡＢＣ004', 'abc004'], ['unknown_kind', 'weird', 'weird']]);
+  assert.ok(sk.unverifiable.every((x) => Object.keys(x).sort().join() === 'code_norm,raw_code,reason'));
   assert.deepEqual((await q("select distinct shop_code from core.listings where mall = 'amazon'")).map((r) => r.shop_code), ['main@A1VC38T7YXB528']);
 });
 

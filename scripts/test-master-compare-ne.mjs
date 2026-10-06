@@ -1530,6 +1530,153 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
   assert.deepEqual([evL.ne.reg_after_check.state, evL.ne.reg_after_check.reg_failed], ['ok', 3]);
 });
 
+await ta('[34] 区分 (skus.sku_kind) の持ち主が C: 夜間ロードは区分を NE に合わせない → ② は区分の差を判断の一覧に (company_owned・NE を社内の区分に・NE の画面で) / ロードの記録に無い差 = rule_lag / 持ち主が load の日は今までどおり NE に合わせる (差が消える)', async () => {
+  const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries((await import('../config/master-ownership.mjs')).OWNED_COLUMNS.map((k) => [k, 'load'])));
+  const own = { ...MASTER_OWNERSHIP, 'skus.sku_kind': 'company' };
+  const NE = baseNe();
+  await day('2030-08-21', { ne: NE });   // 持ち主が全部 load の日 = そろえる
+  // NE で c003 を単品 → セット (a001 × 2)、s002 をセット → 単品 にする (NE の画面で区分を変えた。社内はポータルの区分のまま)
+  const ne1 = clone(NE);
+  ne1.products = ne1.products.filter((r) => r.code !== 'c003');
+  ne1.products.push({ code: 's002', name: 'セット2', supplier: '0001', handling: '取扱中', cost_src: J('900'), price_src: J('900'), tax_src: J('10'), rep: '', rep_src: J('') });
+  ne1.sets = ne1.sets.filter((r) => r.parent !== 's002');
+  ne1.sets.push({ parent: 'c003', name: '単品C', child: 'a001', price_src: J('3000'), qty_src: J('2') });
+  const kindOf = async (code) => (await db.query('select sku_kind, product_id from core.skus where code = $1', [code])).rows[0];
+  const before = { c003: await kindOf('c003'), s002: await kindOf('s002') };
+  // 1 日目: 夜間ロードはまだ前の材料 (NE の変更は今朝の取込から) = ロードの記録に無い差 = rule_lag (黙って一致にも direction_unknown にもしない)
+  const w = await day('2030-08-22', { ne: ne1, ownership: own });
+  for (const code of ['c003', 's002']) assert.deepEqual([clsOf(w.ne, `kind:${code}`, 'kind'), col(w.ne, `kind:${code}`, 'kind')[0]?.why_a], [['rule_lag'], 'not_in_load_record'], code);
+  // 2 日目: 夜間ロードが NE の新しい区分を読む = 区分は社内のまま・NE のセットの構成を社内の単品に入れない・判断の記録に残す
+  const x = await day('2030-08-23', { ne: ne1, ownership: own });
+  assert.deepEqual([await kindOf('c003'), await kindOf('s002')], [before.c003, before.s002]);
+  assert.equal((await db.query(`select count(*)::int as n from core.sku_components where parent_sku_id = (select sku_id from core.skus where code = 'c003')`)).rows[0].n, 0);
+  const D = (await db.query(`select payload from ops.load_decisions where ingest_run_id = 'load_2030-08-23' and section = 'skus'`)).rows[0].payload;
+  assert.deepEqual([...D.kind_held].sort(), [['c003', 'set', 'single'], ['s002', 'single', 'set']]);
+  assert.equal(x.result.verdict, 'pass', JSON.stringify(x.result.items));   // ① ロードの検証: 区分は比べない (持ち主が C)・記録の形は通る
+  for (const [code, n, c] of [['c003', 'set', 'single'], ['s002', 'single', 'set']]) {
+    const cc = col(x.ne, `kind:${code}`, 'kind');
+    assert.equal(cc.length, 1, `kind:${code} が見えない (held = ${x.ne.held[`kind:${code}`]})`);
+    assert.deepEqual([cc[0].cls, cc[0].explained?.reason, cc[0].explained?.owner_key, cc[0].owner, cc[0].n, cc[0].c], ['rule', 'company_owned', 'skus.sku_kind', 'company', n, c], JSON.stringify(cc[0]));
+    const d = x.ne.decisions.find((z) => z.subject_key === `kind:${code}` && z.col === 'kind');
+    assert.deepEqual([d.cls, d.reason_kind, d.proposal, d.resolutions, d.print.owner], ['rule', 'company_owned', { op: 'set_ne_value', value: c }, ['accept_difference', 'fix_ne'], 'company'], JSON.stringify(d));
+    assert.equal(x.ne.held[`value:${code}`], 'kind_mismatch');   // 区分が違う間は値・構成などは比べない (今までどおり)
+  }
+  assert.ok(!x.ne.items.some((i) => i.columns.some((z) => z.col === 'kind' && z.cls === 'direction_unknown')), '区分の差が direction_unknown に落ちた');
+  // 区分の差の生の数 (広げる道 v8・Codex R8): 結果・証跡に・朝の要約の先頭が ⚠️ (重大)・差を残す承認でも減らない
+  assert.deepEqual(x.ne.sku_kind_raw_mismatch, { count: 2, codes: ['c003', 's002'], alert: true });
+  assert.deepEqual([x.ne.sku_kind_raw_mismatch_count, x.ne.kind_gate], [2, { raw_mismatch: 2, raw_unverifiable_affected_existing_cdb: 0, norm_collision: 0, unknown_kind: 0, integrity_untrusted: 0 }]);   // 区分のゲートの 5 つの鍵 (v11 §3.6.4)
+  assert.deepEqual(Object.keys(x.ne.kind_gate).sort(), ['integrity_untrusted', 'norm_collision', 'raw_mismatch', 'raw_unverifiable_affected_existing_cdb', 'unknown_kind']);
+  assert.match(x.line, /^⚠️ ②: 区分が NE と違う SKU 2 件 \(NE の画面で直す: c003, s002\)/);
+  const evK = (await import('../apps/company-db/push/evidence.mjs')).readEvidence(tmp, '2030-08-23')['master-compare']?.ne?.sku_kind_raw_mismatch;
+  assert.deepEqual(evK, x.ne.sku_kind_raw_mismatch);
+  const evN = (await import('../apps/company-db/push/evidence.mjs')).readEvidence(tmp, '2030-08-23')['master-compare']?.ne;
+  assert.deepEqual([evN.sku_kind_raw_mismatch_count, evN.kind_gate], [x.ne.sku_kind_raw_mismatch_count, x.ne.kind_gate]);
+  for (const dd of x.ne.decisions.filter((z) => z.subject_key === 'kind:c003')) {
+    await db.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'accept_difference', null, 'user', 'test@example.com')`, [dd.fingerprint]);
+  }
+  const xa = await compare('2030-08-23');
+  assert.equal(xa.result.ne.out_of_scope['kind:c003'], 'approved_exception');   // 通常の案件は承認で閉じる
+  assert.deepEqual([xa.result.ne.sku_kind_raw_mismatch.count, xa.result.ne.sku_kind_raw_mismatch.codes], [2, ['c003', 's002']]);   // 生の数は減らない
+  assert.match(xa.line, /^⚠️ ②: 区分が NE と違う SKU 2 件/);
+  for (const dd of x.ne.decisions.filter((z) => z.subject_key === 'kind:c003')) {   // 承認を取り消す (後の確かめのため)
+    await db.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'revoked', null, null, 'user', 'test@example.com')`, [dd.fingerprint]);
+  }
+  // 記録と社内の今が違う (ロードの後に区分が変わった) = rule_lag
+  await db.query(`update ops.load_decisions set payload = jsonb_set(payload, '{kind_held}', '[["c003", "set", "single"]]'::jsonb) where section = 'skus' and ingest_run_id = 'load_2030-08-23'`);
+  const y = await compare('2030-08-23');
+  assert.deepEqual(clsOf(y.result.ne, 'kind:c003', 'kind'), ['rule']);
+  assert.deepEqual([clsOf(y.result.ne, 'kind:s002', 'kind'), col(y.result.ne, 'kind:s002', 'kind')[0].why_a], [['rule_lag'], 'not_in_load_record']);
+  // 持ち主が load の日 = 区分を NE に合わせる (今までどおり) → 区分の差は消える
+  const z = await day('2030-08-24', { ne: ne1 });
+  assert.deepEqual([(await kindOf('c003')).sku_kind, (await kindOf('s002')).sku_kind], ['set', 'single']);
+  assert.deepEqual([col(z.ne, 'kind:c003').filter((q) => q.cls !== 'match').length, col(z.ne, 'kind:s002').filter((q) => q.cls !== 'match').length], [0, 0]);
+});
+
+await ta('[35] 区分の持ち主が C: 例外が絡む区分の差 (C 例外・NE 単品 / C 例外・NE セット / C 単品・NE 例外 / C セット・NE 例外) も例外の対象外より先に判断の一覧に・値などは今までどおり対象外 (exception_item)', async () => {
+  const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries((await import('../config/master-ownership.mjs')).OWNED_COLUMNS.map((k) => [k, 'load'])));
+  const own = { ...MASTER_OWNERSHIP, 'skus.sku_kind': 'company' };
+  const NE = baseNe();
+  await day('2030-09-01', { ne: NE });   // 持ち主が全部 load の日 = そろえる
+  // C: e005 (単品) → 例外・s002 (セット) → 例外。NE: f006 を商品の表から外す・s001 をセットの表から外す (どちらも今朝の作り直しでは例外の行)
+  await db.query("update core.skus set sku_kind = 'exception' where code in ('e005', 's002')");
+  const ne1 = clone(NE);
+  ne1.products = ne1.products.filter((r) => r.code !== 'f006');
+  ne1.sets = ne1.sets.filter((r) => r.parent !== 's001');
+  wh().prepare("INSERT OR REPLACE INTO exception_genka (sku, genka, 商品名, synced_at) VALUES ('f006', 99, '例外 f006', 'x'), ('s001', 99, '例外 s001', 'x')").run();   // NE の例外 = 例外の表 (区分のゲートの E)
+  const mat = () => toMaterial(ne1, (m) => {
+    for (const code of ['f006', 's001']) m.products.push({ 商品コード: code, 商品名: `例外 ${code}`, 商品区分: '例外', 取扱区分: '取扱中', 標準売価: null, 原価: 99, 原価ソース: '例外', 原価状態: 'OVERRIDDEN', 消費税率: 0.1, 税区分: 'STANDARD_10', product_id: code === 'f006' ? 6 : 7 });
+  });
+  const want = [['e005', 'single', 'exception'], ['s002', 'set', 'exception'], ['f006', 'exception', 'single'], ['s001', 'exception', 'set']];
+  const check = (ne, clsOfCode) => {
+    for (const [code, n, c] of want) {
+      const cc = col(ne, `kind:${code}`, 'kind');
+      assert.equal(cc.length, 1, `kind:${code} が見えない (out_of_scope = ${ne.out_of_scope[`kind:${code}`]})`);
+      assert.deepEqual([cc[0].cls, cc[0].explained?.reason, cc[0].owner, cc[0].n, cc[0].c], [clsOfCode(code), 'company_owned', 'company', n, c], `${code}: ${JSON.stringify(cc[0])}`);
+      assert.equal(ne.out_of_scope[`value:${code}`], 'exception_item');   // 値などは今までどおり対象外
+      assert.ok(!Object.hasOwn(ne.out_of_scope, `kind:${code}`));
+      const d = ne.decisions.find((z) => z.subject_key === `kind:${code}` && z.col === 'kind');
+      assert.deepEqual([d.reason_kind, d.proposal], ['company_owned', { op: 'set_ne_value', value: c }]);
+    }
+  };
+  // 1 日目: 夜間ロードは前の材料 = 社内の例外 (e005・s002) は記録 (kind_held) あり = rule / NE 側の例外 (f006・s001) はロードの記録に無い = rule_lag
+  const x = await day('2030-09-02', { ne: ne1, material: mat(), ownership: own });
+  check(x.ne, (code) => (['e005', 's002'].includes(code) ? 'rule' : 'rule_lag'));
+  // 2 日目: 夜間ロードも今の材料を読んだ = どれも記録あり = rule・区分は社内のまま
+  const y = await day('2030-09-03', { ne: ne1, material: mat(), ownership: own });
+  check(y.ne, () => 'rule');
+  assert.deepEqual([y.ne.sku_kind_raw_mismatch.codes.filter((c) => c !== 'c003'), y.ne.sku_kind_raw_mismatch.alert], [['e005', 'f006', 's001', 's002'], true]);   // 例外が絡む差も生の数に (c003 = 前の試験の NE の区分替えの残り)
+  wh().prepare("DELETE FROM exception_genka WHERE sku IN ('f006', 's001')").run();
+  assert.deepEqual((await db.query("select code, sku_kind from core.skus where code in ('e005', 's002', 'f006', 's001') order by code")).rows.map((r) => [r.code, r.sku_kind]),
+    [['e005', 'exception'], ['f006', 'single'], ['s001', 'set'], ['s002', 'exception']]);
+});
+
+await ta('[36] 区分のゲートの数は今朝の生の集合 (商品の表 P・セットの表 S・例外の表 E) から数える: 前夜のロードは 0 でも、今朝だけ空のコード・正規化の重なり・壊れたセットがある朝に数える / 例外原価の行は区分不明にしない (NE 単品 + 例外原価・NE セット + 例外原価) / P・S に無い例外商品は例外として比べる (Codex R10 High・R12 High・v11 §3.6.4)', async () => {
+  const NE = baseNe();
+  await day('2030-10-01', { ne: NE });   // 前夜も今朝も きれい
+  // Company DB に例外の商品 x999 (例外) と x998 (単品) を足す (NE は例外の表にだけ持つ)
+  await db.query("insert into core.skus (company_id, sku_kind, code, name) values (1, 'exception', 'x999', '例外 x999')");
+  const xp = (await db.query("insert into core.products (company_id, display_code, name, status) values (1, 'x998', '単品 x998', 'active') returning product_id")).rows[0].product_id;
+  await db.query("insert into core.skus (company_id, product_id, sku_kind, code, name) values (1, $1, 'single', 'x998', '単品 x998')", [xp]);
+  const ne1 = clone(NE);
+  ne1.products.push({ code: '', name: '空のコード', supplier: '', handling: '取扱中', cost_src: J('1'), price_src: J('1'), tax_src: J('10'), rep: '', rep_src: J('') });   // 空のコード = integrity_untrusted
+  ne1.products.push({ code: 'Ｂ００２', name: '全角の b002', supplier: '', handling: '取扱中', cost_src: J('1'), price_src: J('1'), tax_src: J('10'), rep: '', rep_src: J('') });   // 正規化の重なり (b002)
+  ne1.sets.push({ parent: 'f006', name: 'f006 のセット', child: 'a001', price_src: J('100'), qty_src: J('1') });   // 商品の表にもある = セット (正常) → 社内は単品 = 区分の差
+  ne1.sets.push({ parent: 'u777', name: '壊れたセット', child: '', price_src: J('100'), qty_src: J('1') });          // 子のコードが空の行だけのセット = integrity_untrusted に 1 行 (unknown_kind は今の母集合では必ず 0)
+  // 例外の表: d004 (NE 単品 + 例外原価)・s002 (NE セット + 例外原価) = 原価の補完 = 区分不明にしない / x999・x998 = P・S に無い例外商品
+  wh().prepare("INSERT OR REPLACE INTO exception_genka (sku, genka, 商品名, synced_at) VALUES ('d004', 9, 'x', 'x'), ('s002', 9, 'x', 'x'), ('x999', 9, 'x', 'x'), ('x998', 9, 'x', 'x')").run();
+  const x = await day('2030-10-02', { ne: ne1, material: toMaterial(NE) });
+  const D = (await db.query("select payload from ops.load_decisions where ingest_run_id = 'load_2030-10-02' and section = 'skus'")).rows[0].payload;
+  assert.deepEqual(D.sku_kind.unverifiable, []);   // 前夜のロード (前の材料) は 0
+  // raw_mismatch = f006 (NE セット・社内単品)・x998 (NE 例外・社内単品)。d004・s002 (例外原価つき) と x999 (例外同士) は差にしない
+  // affected = b002 (重なり・社内にある) だけ (u777 は社内に無い・空のコードは code_norm が無い)。integrity = 空のコードの行 + 子が空の行 = 2
+  assert.deepEqual(x.ne.kind_gate, { raw_mismatch: 2, raw_unverifiable_affected_existing_cdb: 1, norm_collision: 1, unknown_kind: 0, integrity_untrusted: 2 });
+  assert.deepEqual(x.ne.sku_kind_raw_mismatch.codes, ['f006', 'x998']);
+  wh().prepare("DELETE FROM exception_genka WHERE sku IN ('d004', 's002', 'x999', 'x998')").run();
+  await db.query("delete from core.skus where code in ('x999', 'x998')");
+  await day('2030-10-03', { ne: NE });
+});
+
+await ta('[37] 区分の持ち主が C でも、登録待ち (下書き・NE 登録待ち) の新商品の区分違いは reg_kind_mismatch (#1635) = 1 つの SKU に区分の列は 1 つ (company_owned と二重に数えない)・区分のゲートの生の数には入る', async () => {
+  const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries((await import('../config/master-ownership.mjs')).OWNED_COLUMNS.map((k) => [k, 'load'])));
+  const own = { ...MASTER_OWNERSHIP, 'skus.sku_kind': 'company' };
+  const NE = baseNe();
+  await day('2030-11-01', { ne: NE });
+  // ポータルで単品として登録した新商品 r901 (下書き)。NE はセットとして持つ
+  await pg.query('begin');
+  const pid = (await pg.query(`insert into core.products (company_id, display_code, name, status) values (1, 'r901', '新商品 r901', 'active') returning product_id`)).rows[0].product_id;
+  const sid = (await pg.query(`insert into core.skus (company_id, product_id, sku_kind, code, name) values (1, $1, 'single', 'r901', '新商品 r901') returning sku_id`, [pid])).rows[0].sku_id;
+  await pg.query('select ops.create_sku_registration($1, $2)', [sid, 'naka@test']);
+  await pg.query('commit');
+  const ne1 = clone(NE);
+  ne1.sets.push({ parent: 'r901', name: 'セット R', child: 'a001', price_src: J('3000'), qty_src: J('2') });
+  const x = await day('2030-11-02', { ne: ne1, material: toMaterial(NE), ownership: own });
+  const cc = col(x.ne, 'kind:r901', 'kind');
+  assert.deepEqual([cc.length, cc[0]?.cls], [1, 'reg_kind_mismatch'], JSON.stringify(cc));   // company の分類 (company_owned) にはしない = 1 列
+  assert.deepEqual(x.ne.decisions.filter((d) => d.subject_key === 'kind:r901').map((d) => d.reason_kind), ['reg_kind_mismatch']);
+  assert.ok(x.ne.sku_kind_raw_mismatch.codes.includes('r901'));   // 生の数 (ゲート) には入る = 登録待ちでも区分の差は区分の差
+  assert.equal(x.ne.kind_gate.raw_mismatch, x.ne.sku_kind_raw_mismatch.count);
+});
+
 await pg.close();
 try { WH.getDB().close(); } catch { /* */ }
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* Windows は OS に任せる */ }
