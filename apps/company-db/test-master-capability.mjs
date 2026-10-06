@@ -48,22 +48,39 @@ await ta('[2] 本番の active の 13 キーは全部 capable・configured の c
   assert.deepEqual(configuredBeyondCapable(), []);
   assert.equal(validateConfiguredCapable(), MASTER_OWNERSHIP);
   for (const k of companyOwned(MASTER_OWNERSHIP)) assert.ok(COMPANY_CAPABLE.includes(k), `configured が company なのに capable でない: ${k}`);
-  // 予定が能力を追い越す = 落とす
-  throwsCode(() => validateConfiguredCapable({ ...MASTER_OWNERSHIP, 'skus.sku_kind': 'company' }), /skus\.sku_kind/);
+  // 予定が能力を追い越す = 落とす (products.parent はまだ扱う PR が無い)
+  throwsCode(() => validateConfiguredCapable({ ...MASTER_OWNERSHIP, 'products.parent': 'company' }), /products\.parent/);
+  // skus.sku_kind は #1641 で扱える = 予定に入れても能力の中 (configured の値そのものは 'load' のまま)
+  assert.equal(MASTER_OWNERSHIP['skus.sku_kind'], 'load');
+  assert.deepEqual(configuredBeyondCapable({ ...MASTER_OWNERSHIP, 'skus.sku_kind': 'company' }), []);
+});
+
+await ta('[2b] skus.sku_kind を capable に足しても、今の本番 (DB の active = 2026-10-05 の 13 キー) の動きは変わらない: code_behind 0・写しの列・写しの持ち主の確かめ・夜間ロードの区分は load のまま', async () => {
+  const MP = await import('../warehouse/master-publish.js');
+  const active = { ...ALL_LOAD, ...Object.fromEntries(PROD_ACTIVE_COMPANY_20261005.map((k) => [k, 'company'])) };
+  assert.equal(active['skus.sku_kind'], 'load');
+  assert.deepEqual(codeBehindKeys(active), []);
+  assert.deepEqual(codeBehindKeys(active, COMPANY_CAPABLE.filter((k) => k !== 'skus.sku_kind')), []);   // 足す前の能力でも同じ = 足したことで変わる所が無い
+  assert.deepEqual(MP.checkPublishOwnership(active), []);
+  assert.ok(!MP.publishCols(active).includes('kind'));   // 区分は写さない (load)
+  // 区分も company にした持ち主表 (広げる道の後) = 写しの持ち主の確かめも能力も通る
+  const widened = { ...active, 'skus.sku_kind': 'company' };
+  assert.deepEqual([codeBehindKeys(widened), MP.checkPublishOwnership(widened), MP.publishCols(widened).includes('kind')], [[], [], true]);
 });
 
 await ta('[3] code_behind: capable の外の company のキー (知らないキーも)・load は見ない', async () => {
   assert.deepEqual(codeBehindKeys(ALL_LOAD), []);
-  assert.deepEqual(codeBehindKeys({ ...ALL_LOAD, 'skus.sku_kind': 'company', 'skus.name': 'company' }), ['skus.sku_kind']);
+  assert.deepEqual(codeBehindKeys({ ...ALL_LOAD, 'products.parent': 'company', 'skus.name': 'company' }), ['products.parent']);
   assert.deepEqual(codeBehindKeys({ ...ALL_LOAD, 'future.key': 'company', 'other.future': 'load' }), ['future.key']);
-  assert.deepEqual(codeBehindKeys({ 'skus.sku_kind': 'company' }, [...COMPANY_CAPABLE, 'skus.sku_kind'].sort()), []);
+  assert.deepEqual(codeBehindKeys({ 'products.parent': 'company' }, [...COMPANY_CAPABLE, 'products.parent'].sort()), []);
+  assert.deepEqual(codeBehindKeys({ 'skus.sku_kind': 'company' }), []);   // #1641 から扱える
   assert.deepEqual(codeBehindKeys(null), []);
 });
 
 await ta('[4] 能力のハッシュ: 順によらない・一覧が変わると変わる・指紋', async () => {
   assert.match(capableHash(), /^[0-9a-f]{64}$/);
   assert.equal(capableHash([...COMPANY_CAPABLE].reverse()), capableHash());
-  assert.notEqual(capableHash([...COMPANY_CAPABLE, 'skus.sku_kind']), capableHash());
+  assert.notEqual(capableHash([...COMPANY_CAPABLE, 'products.parent']), capableHash());
   const fp = capabilityFingerprint();
   assert.deepEqual(fp, { protocol: MASTER_OWNER_PROTOCOL, capable_hash: capableHash(), capable: [...COMPANY_CAPABLE] });
 });
@@ -82,6 +99,10 @@ await ta('[5] prepare は capable の外のキーを用意しない (何も残�
   assert.equal((await db.query('select count(*)::int as n from ops.master_ownership_state')).rows[0].n, 0);
   // 能力の中なら用意する (今までどおり)
   assert.equal(await cli(['prepare'], { ownership: own }), 0, logs.at(-1));
+  assert.equal(await cli(['cancel']), 0);
+  // 区分 (skus.sku_kind) を company にした持ち主表も用意できる (#1641 = 能力と写しの両方が知っている)
+  assert.equal(await cli(['prepare'], { ownership: { ...own, 'skus.sku_kind': 'company' } }), 0, logs.at(-1));
+  assert.equal((await db.query('select prepared_map ->> \'skus.sku_kind\' as k from ops.master_ownership_state')).rows[0].k, 'company');
   assert.equal(await cli(['cancel']), 0);
   assert.equal(await cli(['status'], { env: { COMPANY_DB_URL: 'postgres://test' } }), 0);   // status は URL を見る (つなぐのは connect)
   const st = JSON.parse(logs.at(-1));
