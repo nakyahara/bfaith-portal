@@ -47,6 +47,40 @@ export function keywordQueue({status='undecided',page=1,limit=30}={},handle){
  const counts={undecided:0,adopt:0,hold:0,reject:0};for(const r of db.prepare(`SELECT coalesce(d.decision,'undecided') status,count(*) n ${join} GROUP BY coalesce(d.decision,'undecided')`).all())counts[r.status]=r.n;
  return {items:rows.map(r=>({...withDecision(JSON.parse(r.item_json),r),run_id:r.latest_run_id,first_seen_at:r.first_seen_at})),page,limit,total,status,counts};
 }
+// 選別で落ちた案 (見るだけ・判定はしない)。直近の回の screened_out を新しい順に並べ、同じ案は最新の1件だけ。
+// あとで提案に出た案 (カードがある) と、既出と同じKWだとプログラムが外したもの (already_seen) は出さない。
+// 2026-10-06 より前の回は用途・元商品の名前を持たない (KW と理由・ASIN だけ)。
+export const SCREENED_RUNS=14;
+// 一覧は回が届いたとき・案が提案に出たときにだけ変わる。毎回 14 回分の body_json を開かないよう、鍵が同じ間は覚えておく (Codex R1)
+const screenedCache=new WeakMap();
+function screenedList(db){
+ const recent=db.prepare('SELECT run_id,body_hash FROM scout_keyword_runs ORDER BY generated_at DESC,run_id DESC LIMIT ?').all(SCREENED_RUNS);
+ const key=JSON.stringify([recent,db.prepare('SELECT count(*) n FROM scout_keyword_cards').get().n]);
+ const cached=screenedCache.get(db);if(cached?.key===key)return cached;
+ const proposed=new Set(db.prepare('SELECT candidate_id FROM scout_keyword_cards').all().map(r=>r.candidate_id));
+ const seen=new Set(),items=[],code_counts={},byRun=db.prepare('SELECT run_id,day,body_json FROM scout_keyword_runs WHERE run_id=?');
+ for(const {run_id}of recent){
+  const run=byRun.get(run_id),body=JSON.parse(run.body_json);
+  // 同じ回の中でも後の組ほど新しい。後ろから読んで同じ案は後の組の理由と元商品を採り、並びは元の順に戻す (Codex R3)
+  const inRun=[];
+  for(const s of Array.isArray(body.screened_out)?[...body.screened_out].reverse():[]){
+   if(!s||typeof s.candidate_id!=='string'||typeof s.kw!=='string'||seen.has(s.candidate_id))continue;
+   // 最新の回で数えてから出すか決める。最新が already_seen なら古い回の見送りも出さない
+   seen.add(s.candidate_id);const codes=Array.isArray(s.codes)?s.codes.filter(c=>typeof c==='string'):[];
+   if(proposed.has(s.candidate_id)||codes.includes('already_seen'))continue;
+   for(const c of codes)code_counts[c]=(code_counts[c]||0)+1;
+   const sources=Array.isArray(s.sources)?s.sources.filter(o=>/^[A-Z0-9]{10}$/.test(o?.asin)):(Array.isArray(s.source_asins)?s.source_asins:[]).filter(a=>/^[A-Z0-9]{10}$/.test(a)).map(asin=>({asin,title:''}));
+   inRun.push({candidate_id:s.candidate_id,kw:s.kw,decision:s.decision,codes,reason:typeof s.reason==='string'?s.reason:'',by:s.by,use:s.use||'',idea:s.idea||'',idea_reason:s.idea_reason||'',sources:sources.slice(0,5).map(o=>({asin:o.asin,title:typeof o.title==='string'?o.title:''})),run_id:run.run_id,day:run.day});
+  }
+  items.push(...inRun.reverse());
+ }
+ const value={key,items,code_counts,runs:recent.length};screenedCache.set(db,value);return value;
+}
+export function screenedOutKeywords({page=1,limit=30}={},handle){
+ const db=handle||getMirrorDB();page=Math.max(1,Math.floor(Number(page))||1);limit=Math.min(100,Math.max(1,limit));
+ const {items,code_counts,runs}=screenedList(db);
+ return {items:items.slice((page-1)*limit,page*limit),total:items.length,page,limit,runs,code_counts:{...code_counts}};
+}
 function eventRow(row){const i=JSON.parse(row.item_snapshot_json||row.item_json);return {event_seq:row.event_seq,candidate_id:row.candidate_id,kw:i.kw,use:i.use,category:i.category||'',decision:row.decision,reason:row.comment,reason_codes:JSON.parse(row.reason_codes_json||'[]'),decided_at:row.decided_at};}
 export function keywordSyncState(handle,{since=0}={}){
  const db=handle||getMirrorDB();if(!Number.isSafeInteger(since)||since<0)fail('判断カーソルが不正です');

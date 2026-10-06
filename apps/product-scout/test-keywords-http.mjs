@@ -21,7 +21,7 @@ test('HTTPで認証→取り込み→画面→判断→次回への返却まで�
  let response=await fetch(base+'/ingest/keywords',{method:'POST',headers:sync,body:JSON.stringify(edition)});assert.equal(response.status,200);const sent=await response.json();
  const state=await(await fetch(base+'/ingest/keywords',{headers:sync})).json();assert.equal(state.body_hash,sent.body_hash);
  response=await fetch(base+'/keywords',{headers:user});assert.equal(response.status,200);const initial=await response.text();assert.ok(initial.includes(kw));assert.equal(loadHtml(initial)('button[aria-pressed="true"]').length,0);
- const $start=loadHtml(initial);assert.equal($start('.kw-tab').length,5,'絞り込みタブが5つ出ていない');
+ const $start=loadHtml(initial);assert.equal($start('.kw-tab').length,6,'絞り込みタブ5つ + AIが見送った が出ていない');
  const sets=$start('article fieldset'),codes=n=>$start(sets[n]).find('input').map((_,el)=>$start(el).attr('value')).get();
  assert.deepEqual(codes(0).sort(),[...REASON_GROUPS.positive].sort(),'良い点の理由が画面と合っていない');
  assert.deepEqual([...codes(0),...codes(1)].sort(),Object.keys(REASONS).sort(),'選べない理由コードがある (どのまとまりにも入っていない)');
@@ -29,6 +29,7 @@ test('HTTPで認証→取り込み→画面→判断→次回への返却まで�
  assert.ok(!initial.includes('900円'),'現在の値が無い商品で、保存時の値を要約に出している');
  assert.equal($start('article[data-decision="undecided"]').length,1,'カードが自分の判定を持っていない (件数を動かせない)');
  assert.equal($start('.kw-tab b[data-count]').length,5,'タブの件数に印が付いていない');
+ const $screened=loadHtml(await(await fetch(base+'/keywords?status=screened',{headers:user})).text());assert.equal($screened('.kw-tab.is-on').length,1);assert.ok($screened('.kw-tab.is-on').hasClass('kw-tab--screened'),'AIが見送った タブが選ばれていない');assert.ok($screened('.kw-screened').length===1&&$screened('article[data-decision]').length===0,'見送った案の画面に判定カードが混ざっている');
  const selected=async()=>{const page=await fetch(base+'/keywords?status=all',{headers:user});assert.equal(page.status,200);const $=loadHtml(await page.text());return $('button[aria-pressed="true"]').map((_,el)=>$(el).attr('data-decision')).get();};
  const decide=body=>fetch(base+'/keywords/'+id+'/decision',{method:'POST',headers:user,body:JSON.stringify({run_id:edition.run_id,...body})});
  assert.equal((await decide({decision:'reject'})).status,400);assert.equal((await decide({decision:'adopt',comment:'用途がわかる'})).status,200);
