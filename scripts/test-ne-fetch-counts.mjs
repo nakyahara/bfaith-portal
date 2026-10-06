@@ -1,5 +1,5 @@
 /**
- * test-ne-fetch-counts.mjs — NE の商品 / セット商品の取得の件数 (広げる道 PR-9。設計 v12 §3.6.3・R-g・§13 #20 の SQLite の側)
+ * test-ne-fetch-counts.mjs — NE の商品 / セット商品の取得の件数 (広げる道 PR-9。設計 v14 §3.6.3・§3.7・§5.2・R-g・§13 #20 の SQLite の側)
  *
  * 本物の fetchProducts / fetchSetProducts を、NE の API の mock (globalThis.fetch。test-ne-src.mjs と同じ形) に通して流す (raw 表へ直接 INSERT しない)。
  * 固定する契約:
@@ -13,14 +13,20 @@
  *   6 読む時の不合格: 印が無い / 記録が無い / 壊れた JSON / 関係の崩れ / 別の回の記録。印を消す (CSV の取込など) と件数も消える
  *   7 今までの証跡 (complete_count・integrity) の形と値は変わらない
  *   8 取得中の印 (R12): 取得の始め (最初の API の呼び出しの前) に commit・完了の印と同じ取引で消す・途中で失敗した / 印を付けなかった回は残る (読む関数は fetch_in_progress)
+ *   9 取得の版 (v14 §3.7・R14): ne-api.js → ne-fetch-counts.js → db.js の「パス + NUL + 中身 (CRLF → LF) + NUL」をつなげた sha256 を、
+ *     取得の始めに 1 回だけ計算して件数の記録に入れる (途中でファイルが変わっても始めの値)。読む関数は両方の取得の版が同じときだけ返す
+ *  10 落とした行は 1 行 1 分類 (商品 = コードが空 / セット = 親が空 → 親あり子が空)。数が読めないセットの行は落とさず 1 で書き、数だけ notes に残す
+ *  11 空白だけのコードは今までどおり落とさずに書く (設計の表の「空白だけ」とは違う = 今の動きを変えない)
  * 使い方: node scripts/test-ne-fetch-counts.mjs
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ne-fetch-counts-'));
 process.env.DATA_DIR = tmp;
 fs.writeFileSync(path.join(tmp, 'ne-tokens.json'), JSON.stringify({ access_token: 'a', refresh_token: 'r' }));
@@ -48,7 +54,7 @@ globalThis.fetch = async (url, opts) => {
 };
 const { fetchProducts, fetchSetProducts } = await quietly(() => import('../apps/warehouse/ne-api.js'));
 const { getDB, clearNeCompleteMarks } = await import('../apps/warehouse/db.js');
-const { readNeFetchCounts, evalNeFetchCounts, checkNeFetchCounts, beginNeFetch, endNeFetch, NE_FETCH_COUNTS_KEY, NE_FETCH_IN_PROGRESS_KEY, NE_FETCH_SEAL_KEYS, NE_FETCH_MISSING_FIELDS } = await import('../apps/warehouse/ne-fetch-counts.js');
+const { readNeFetchCounts, evalNeFetchCounts, checkNeFetchCounts, beginNeFetch, endNeFetch, NE_FETCH_COUNTS_KEY, NE_FETCH_IN_PROGRESS_KEY, NE_FETCH_SEAL_KEYS, NE_FETCH_MISSING_FIELDS, NE_FETCH_FINGERPRINT_FILES, computeFetchFingerprint } = await import('../apps/warehouse/ne-fetch-counts.js');
 const db = () => getDB();
 const meta = (k) => db().prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value ?? null;
 const counts = (kind) => { const v = meta(NE_FETCH_COUNTS_KEY[kind]); return v == null ? null : JSON.parse(v); };
@@ -66,23 +72,30 @@ await ta('[1] 商品: 空のコード・同じコードが 2 度 (ページの�
   ne.goodsPages = null;
   ne.goods = [
     ...Array.from({ length: 998 }, (_, i) => g(`G${i}`)), g(''), g('ABC-1'),                 // 1 ページ目 1000 行 (空 1)
-    g('G0'), g('G1'), g('G2'), g('abc-1'), { goods_name: 'goods_id の欄が無い' }, ...Array.from({ length: 245 }, (_, i) => g(`H${i}`)),   // 2 ページ目 250 行
+    g('G0'), g('G1'), g('G2'), g('abc-1'), { goods_name: 'goods_id の欄が無い' }, {}, g(null, { goods_name: null }),   // 欄が無い・全部の欄が無い・null = どれもコードが空 (1 行 1 分類)
+    ...Array.from({ length: 243 }, (_, i) => g(`H${i}`)),   // 2 ページ目 250 行
   ];
   await quietly(fetchProducts);
   const c = counts('products');
   // 重なり = write_attempts − stored_rows = 4 (G0〜G2 が 2 度 = 3・ABC-1 と abc-1 が小文字にして衝突 = 1)
   assert.deepEqual([c.fetched_rows, c.write_attempts, c.stored_rows, c.dropped_no_code, c.dropped_missing_fields, c.dropped_missing_detail],
-    [1250, 1248, 1244, 2, 0, {}]);
+    [1250, 1246, 1242, 4, 0, {}]);
   assert.deepEqual([c.page_limit, c.pages, c.page_rows, c.last_page_rows], [1000, 2, [1000, 250], 250]);
   // 印と同じ回 (時刻・通し番号)・DB の行の数 = stored_rows
   assert.equal(c.complete_at, meta('ne_api_products_complete_at'));
   assert.equal(String(c.complete_rev), meta('ne_api_products_complete_rev'));
   assert.equal(String(c.stored_rows), meta('ne_api_products_complete_count'));
-  assert.equal(db().prepare('SELECT COUNT(*) AS n FROM raw_ne_products WHERE synced_at = ?').get(c.complete_at).n, 1244);
+  assert.equal(db().prepare('SELECT COUNT(*) AS n FROM raw_ne_products WHERE synced_at = ?').get(c.complete_at).n, 1242);
   assert.deepEqual(checkNeFetchCounts('products', c), []);
+  // 取得の版 = 固定の順の各ファイルの「パス + NUL + LF にそろえた中身 + NUL」をつなげた sha256 (この試験の中で別に計算する)
+  const crypto = await import('node:crypto');
+  const expectFp = crypto.createHash('sha256').update(NE_FETCH_FINGERPRINT_FILES.map((f) => f + String.fromCharCode(0) + fs.readFileSync(path.join(repoRoot, f), 'utf8').split(String.fromCharCode(13, 10)).join(String.fromCharCode(10)) + String.fromCharCode(0)).join(''), 'utf8').digest('hex');
+  assert.deepEqual([...NE_FETCH_FINGERPRINT_FILES], ['apps/warehouse/ne-api.js', 'apps/warehouse/ne-fetch-counts.js', 'apps/warehouse/db.js']);
+  assert.equal(c.fetch_fingerprint, expectFp);
+  assert.equal(computeFetchFingerprint(), expectFp);
   // 今までの証跡は形も値も今までどおり (written_rows = 書いた回数・dup_codes = 小文字のコード)
   const it = JSON.parse(meta('ne_api_products_integrity'));
-  assert.deepEqual([it.fetched_rows, it.written_rows, it.dropped_no_code, it.distinct_codes, it.dup_code_count, it.dup_codes], [1250, 1248, 2, 1244, 4, ['g0', 'g1', 'g2', 'abc-1']]);
+  assert.deepEqual([it.fetched_rows, it.written_rows, it.dropped_no_code, it.distinct_codes, it.dup_code_count, it.dup_codes], [1250, 1246, 4, 1242, 4, ['g0', 'g1', 'g2', 'abc-1']]);
 });
 
 await ta('[2] 商品: ちょうど 1000 行 = 2 回目の呼び出しが 0 行で止まる (最後のページ 0) / 0 件の取得も記録する', async () => {
@@ -110,24 +123,29 @@ await ta('[3] セット: 親が空・子が空・両方空・同じ親 × 子が
     { set_goods_id: 'S4', set_goods_name: '子の欄が無い' },               // 欄の欠け = 子が空
     sg('S2', 'G3', { set_goods_detail_quantity: '2' }),                   // 同じ親 × 子 (同じ書き方)
     sg('SET-A', 'Up-1'), sg('set-a', 'up-1'),                             // 小文字にして衝突
+    {},                                                                   // 全部の欄が無い = 親が空 (1 行 1 分類・要る欄の欠けには数えない)
+    { set_goods_id: null, set_goods_detail_goods_id: null, set_goods_detail_quantity: null },   // 親も子も null = 親が空
+    { set_goods_id: 'S5' },                                               // 親だけ (子・名前・売価・数量が無い) = 要る欄の欠け 1 つ
   ];
   await quietly(fetchSetProducts);
   const c = counts('setproducts');
-  // コードが空 = 親が空 3 (子も空の 1 を含む) / 要る欄の欠け = 子が空 2 / 重なり = 6 − 4 = 2 (S2 × G3 が 2 度・SET-A × Up-1 と set-a × up-1)
+  // コードが空 = 親が空 5 (子も空・全部の欄が無い行を含む) / 要る欄の欠け = 親はあるが子が空 3 / 重なり = 6 − 4 = 2 (S2 × G3 が 2 度・SET-A × Up-1 と set-a × up-1)
+  //   1 行は 1 つの分類 = 5 + 3 + 6 = 14 = fetched (親子両方の欠けを二重に数えない)
   assert.deepEqual([c.fetched_rows, c.write_attempts, c.stored_rows, c.dropped_no_code, c.dropped_missing_fields, c.dropped_missing_detail],
-    [11, 6, 4, 3, 2, { set_goods_detail_goods_id: 2 }]);
-  assert.deepEqual([c.pages, c.page_rows, c.last_page_rows], [1, [11], 11]);
+    [14, 6, 4, 5, 3, { set_goods_detail_goods_id: 3 }]);
+  assert.deepEqual([c.pages, c.page_rows, c.last_page_rows], [1, [14], 14]);
   assert.equal(c.complete_at, meta('ne_api_setproducts_complete_at'));
   assert.equal(String(c.complete_rev), meta('ne_api_setproducts_complete_rev'));
   assert.equal(String(c.stored_rows), meta('ne_api_setproducts_complete_count'));
   const it = JSON.parse(meta('ne_api_setproducts_integrity'));
   assert.deepEqual([it.fetched_rows, it.valid_rows, it.dropped_missing_key, it.dropped_missing_parent, it.missing_child_parents, it.pair_dup_count],
-    [11, 6, 5, 3, ['s3', 's4'], 2]);
+    [14, 6, 8, 5, ['s3', 's4', 's5'], 2]);
   // 照合の封に渡す形 (設計 v13 §8-4b の products_fetch / set_fetch): 契約の 5 つの鍵だけ (重なりの鍵は無い = DB が write_attempts − stored_rows で数える)
   const r = readInTx((rdb) => readNeFetchCounts(rdb));
   assert.equal(r.ok, true, JSON.stringify(r));
-  assert.deepEqual(r.setproducts.seal, { fetched_rows: 11, write_attempts: 6, stored_rows: 4, dropped_no_code: 3, dropped_missing_fields: 2 });
+  assert.deepEqual(r.setproducts.seal, { fetched_rows: 14, write_attempts: 6, stored_rows: 4, dropped_no_code: 5, dropped_missing_fields: 3 });
   assert.deepEqual(r.products.seal, { fetched_rows: 0, write_attempts: 0, stored_rows: 0, dropped_no_code: 0, dropped_missing_fields: 0 });
+  assert.equal(r.fetch_fingerprint, computeFetchFingerprint());   // 両方の取得の版が同じ = 照合が封へ渡す版
   assert.deepEqual(Object.keys(r.setproducts.seal), [...NE_FETCH_SEAL_KEYS]);
 });
 
@@ -259,6 +277,12 @@ await ta('[9] 読む時の不合格: 記録が無い・壊れた JSON・関係�
     assert.deepEqual(rd(), { ok: false, reason: 'not_this_fetch' });
     setMeta(NE_FETCH_COUNTS_KEY.products, JSON.stringify({ ...g0, version: 'fc0' }));
     assert.equal(rd().reason, 'invalid');
+    setMeta(NE_FETCH_COUNTS_KEY.products, JSON.stringify({ ...g0, fetch_fingerprint: null }));
+    assert.deepEqual(rd(), { ok: false, reason: 'invalid', problems: ['fetch_fingerprint'] });
+    // 商品とセットで取得の版が違う (朝の 2 つの取得が別のコード) = 各 kind は ok でも全体は ok でない・版を返さない
+    setMeta(NE_FETCH_COUNTS_KEY.products, JSON.stringify({ ...g0, fetch_fingerprint: 'f'.repeat(64) }));
+    const mm = readInTx((rdb) => readNeFetchCounts(rdb));
+    assert.deepEqual([mm.products.ok, mm.setproducts.ok, mm.ok, mm.fetch_fingerprint, mm.fetch_fingerprint_mismatch], [true, true, false, null, true]);
   } finally { setMeta(NE_FETCH_COUNTS_KEY.products, good); }
   assert.equal(rd().ok, true);
   for (const kind of ['products', 'setproducts']) {
@@ -274,7 +298,7 @@ await ta('[9] 読む時の不合格: 記録が無い・壊れた JSON・関係�
 await ta('[10] checkNeFetchCounts: 式・重なり・内訳・ページ・形の崩れを 1 つずつ見つける (欄の欠け・余分・負・小数・文字・途中の短いページ・満杯の最後のページ)', async () => {
   const base = { version: 'fc1', kind: 'setproducts', complete_at: '2026-10-06 00:00:00', complete_rev: 5,
     fetched_rows: 1010, write_attempts: 1003, stored_rows: 1000, dropped_no_code: 4, dropped_missing_fields: 3, dropped_missing_detail: { set_goods_detail_goods_id: 3 },
-    page_limit: 1000, pages: 2, page_rows: [1000, 10], last_page_rows: 10 };
+    page_limit: 1000, pages: 2, page_rows: [1000, 10], last_page_rows: 10, fetch_fingerprint: 'a'.repeat(64), notes: { quantity_defaulted_rows: 2 } };
   assert.deepEqual(checkNeFetchCounts('setproducts', base), []);
   assert.deepEqual(checkNeFetchCounts('setproducts', base, { expectDuplicates: 3 }), []);
   assert.deepEqual(checkNeFetchCounts('setproducts', base, { expectDuplicates: 2 }), ['stored_ne_attempts_minus_duplicates']);   // 書く時だけ: コードが数えた重なりと DB が合わない
@@ -286,7 +310,7 @@ await ta('[10] checkNeFetchCounts: 式・重なり・内訳・ページ・形の
   bad({ pages: 3 }, ['pages_ne_page_rows', 'last_page_rows']);
   bad({ page_rows: [999, 11], last_page_rows: 11 }, ['page_not_full_before_last']);
   bad({ page_limit: 10 }, ['page_not_full_before_last', 'last_page_not_short']);
-  bad({ pages: 0, page_rows: [], fetched_rows: 0, write_attempts: 0, stored_rows: 0, dropped_no_code: 0, dropped_missing_fields: 0, dropped_missing_detail: { set_goods_detail_goods_id: 0 } }, ['no_page']);
+  bad({ pages: 0, page_rows: [], fetched_rows: 0, write_attempts: 0, stored_rows: 0, dropped_no_code: 0, dropped_missing_fields: 0, dropped_missing_detail: { set_goods_detail_goods_id: 0 }, notes: { quantity_defaulted_rows: 0 } }, ['no_page']);
   bad({ dropped_missing_detail: {} }, ['detail_keys:', 'not_count:detail.set_goods_detail_goods_id']);
   bad({ dropped_missing_detail: { set_goods_detail_goods_id: 3, other: 0 } }, ['detail_keys:other,set_goods_detail_goods_id']);
   bad({ dropped_missing_detail: null }, ['dropped_missing_detail']);
@@ -297,9 +321,17 @@ await ta('[10] checkNeFetchCounts: 式・重なり・内訳・ページ・形の
   bad({ complete_rev: -1 }, ['not_count:complete_rev']);
   bad({ complete_at: '2026-10-06T00:00:00Z' }, ['complete_at']);
   bad({ version: 'fc0' }, ['version:fc0']);
+  bad({ fetch_fingerprint: 'A'.repeat(64) }, ['fetch_fingerprint']);
+  bad({ fetch_fingerprint: 'a'.repeat(65) }, ['fetch_fingerprint']);
+  bad({ fetch_fingerprint: undefined }, ['fetch_fingerprint']);
+  bad({ notes: undefined }, ['notes']);
+  bad({ notes: {} }, ['note_keys:', 'not_count:notes.quantity_defaulted_rows']);
+  bad({ notes: { quantity_defaulted_rows: 2, x: 1 } }, ['note_keys:quantity_defaulted_rows,x']);
+  bad({ notes: { quantity_defaulted_rows: -1 } }, ['not_count:notes.quantity_defaulted_rows']);
+  bad({ notes: { quantity_defaulted_rows: 1004 } }, ['quantity_defaulted_gt_attempts']);
   bad({ kind: 'products' }, ['kind:products']);
   bad({ page_rows: [1000, -10] }, ['page_rows']);
-  assert.deepEqual(checkNeFetchCounts('products', { ...base, kind: 'products' }), ['detail_keys:set_goods_detail_goods_id']);   // 商品は欠けで落とす欄が無い
+  assert.deepEqual(checkNeFetchCounts('products', { ...base, kind: 'products' }), ['detail_keys:set_goods_detail_goods_id', 'note_keys:quantity_defaulted_rows']);   // 商品は欠けで落とす欄が無い
   assert.deepEqual(checkNeFetchCounts('other', base), ['unknown_kind:other']);
   assert.deepEqual(checkNeFetchCounts('products', null), ['not_object']);
   assert.deepEqual([...NE_FETCH_SEAL_KEYS], ['fetched_rows', 'write_attempts', 'stored_rows', 'dropped_no_code', 'dropped_missing_fields']);
@@ -347,6 +379,39 @@ await ta('[11] 取得中の印 (R12): API と通信している間ずっとあ�
   // 読めない値も「取得中」とみなす
   assert.deepEqual(evalNeFetchCounts({ [NE_FETCH_IN_PROGRESS_KEY.products]: '{壊れ' }).products, { ok: false, reason: 'fetch_in_progress', in_progress: null });
   assert.throws(() => beginNeFetch(db(), 'other', 'x'), /知らない種類/);
+});
+
+await ta('[12] 空白だけのコードは今までどおり落とさずに書く (設計 v14 の分類の表の「空白だけ」とは違う = 今の動きを変えない)・式は合う', async () => {
+  await nextSecond();
+  ne.goods = [g('  '), g('OK1')];
+  ne.setgoods = [sg(' ', 'OK1'), sg('SP1', ' ')];
+  await quietly(fetchProducts); await quietly(fetchSetProducts);
+  const c = counts('products'), s = counts('setproducts');
+  assert.deepEqual([c.fetched_rows, c.write_attempts, c.stored_rows, c.dropped_no_code], [2, 2, 2, 0]);
+  assert.deepEqual([s.fetched_rows, s.write_attempts, s.stored_rows, s.dropped_no_code, s.dropped_missing_fields], [2, 2, 2, 0, 0]);
+  assert.equal(db().prepare("SELECT COUNT(*) AS n FROM raw_ne_products WHERE 商品コード = '  ' AND synced_at = ?").get(c.complete_at).n, 1);
+  assert.equal(readInTx((rdb) => readNeFetchCounts(rdb)).ok, true);
+});
+
+await ta('[13] セットの数が読めない行は落とさず 1 で書く (今までどおり)・数だけ notes に残す / 取得の途中で版の対象のファイルが変わっても、記録する版は始めに計算した値', async () => {
+  await nextSecond();
+  const fpBefore = computeFetchFingerprint();
+  ne.setgoods = [sg('Q1', 'C1', { set_goods_detail_quantity: '' }), sg('Q1', 'C2', { set_goods_detail_quantity: 'abc' }), sg('Q1', 'C3', { set_goods_detail_quantity: '0' }),
+    sg('Q1', 'C4', { set_goods_detail_quantity: null }), { set_goods_id: 'Q1', set_goods_name: 's-Q1', set_goods_detail_goods_id: 'C5' }, sg('Q1', 'C6', { set_goods_detail_quantity: '2' })];
+  // API と通信している間に db.js の中身が変わった (git pull など) ことにする = 読み方だけを差し替える (本物のファイルは書き換えない)
+  const realRead = fs.readFileSync;
+  let changedFp = null;
+  ne.onCall = () => {
+    fs.readFileSync = (f, ...a) => { const v = realRead.call(fs, f, ...a); return String(f).replace(/\\/g, '/').endsWith('apps/warehouse/db.js') ? v + '\n// 変わった' : v; };
+    changedFp = computeFetchFingerprint();
+  };
+  try { await quietly(fetchSetProducts); } finally { fs.readFileSync = realRead; ne.onCall = null; }
+  const c = counts('setproducts');
+  assert.deepEqual([c.fetched_rows, c.write_attempts, c.stored_rows, c.dropped_no_code, c.dropped_missing_fields, c.notes], [6, 6, 6, 0, 0, { quantity_defaulted_rows: 5 }]);
+  assert.deepEqual(db().prepare("SELECT 商品コード AS c, 数量 AS q FROM raw_ne_set_products WHERE セット商品コード = 'q1' ORDER BY 1").all().map((r) => r.q), [1, 1, 1, 1, 1, 2]);
+  assert.ok(changedFp && changedFp !== fpBefore, '途中で中身が変われば版も変わる');
+  assert.equal(c.fetch_fingerprint, fpBefore);   // 記録は始めに計算した値
+  assert.equal(computeFetchFingerprint(), fpBefore);   // 差し替えを戻せば元の版
 });
 
 globalThis.fetch = realFetch;
