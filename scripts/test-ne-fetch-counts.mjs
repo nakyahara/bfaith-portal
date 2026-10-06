@@ -93,6 +93,10 @@ await ta('[1] 商品: 空のコード・同じコードが 2 度 (ページの�
   const expectFp = crypto.createHash('sha256').update(NE_FETCH_FINGERPRINT_FILES.map((f) => f + String.fromCharCode(0) + fs.readFileSync(path.join(repoRoot, f), 'utf8').split(String.fromCharCode(13, 10)).join(String.fromCharCode(10)) + String.fromCharCode(0)).join(''), 'utf8').digest('hex');
   assert.deepEqual([...NE_FETCH_FINGERPRINT_FILES], ['apps/warehouse/ne-api.js', 'apps/warehouse/ne-fetch-counts.js', 'apps/warehouse/db.js', 'apps/warehouse/retry-lock.js']);
   assert.equal(c.fetch_fingerprint, expectFp);
+  // 取得の始め = 完了の印の時刻と同じ時刻 (ISO・ミリ秒) / 完了 = その後 (完了の印を書いた取引の中の今)
+  assert.match(c.started_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  assert.equal(c.started_at.replace('T', ' ').slice(0, 19), c.complete_at);
+  assert.ok(Date.parse(c.finished_at) >= Date.parse(c.started_at) && Date.parse(c.finished_at) <= Date.now());
   assert.equal(computeFetchFingerprint(), expectFp);
   // 今までの証跡は形も値も今までどおり (written_rows = 書いた回数・dup_codes = 小文字のコード)
   const it = JSON.parse(meta('ne_api_products_integrity'));
@@ -102,8 +106,11 @@ await ta('[1] 商品: 空のコード・同じコードが 2 度 (ページの�
 await ta('[2] 商品: ちょうど 1000 行 = 2 回目の呼び出しが 0 行で止まる (最後のページ 0) / 0 件の取得も記録する', async () => {
   await nextSecond();
   ne.goods = Array.from({ length: 1000 }, (_, i) => g(`K${i}`));
-  await quietly(fetchProducts);
+  ne.onCall = () => new Promise((r) => setTimeout(r, 700));   // API が遅い = 完了 (finished_at) は始め (started_at・完了の印の時刻) より後
+  try { await quietly(fetchProducts); } finally { ne.onCall = null; }
   let c = counts('products');
+  assert.ok(Date.parse(c.finished_at) - Date.parse(c.started_at) >= 1400, `${c.started_at} → ${c.finished_at}`);   // 2 回呼ぶ = 1.4 秒以上
+  assert.equal(c.complete_at, c.started_at.replace('T', ' ').slice(0, 19));   // 完了の印の時刻は始めのまま (raw の集合の世代)
   assert.deepEqual([c.fetched_rows, c.write_attempts, c.stored_rows, c.pages, c.page_rows, c.last_page_rows], [1000, 1000, 1000, 2, [1000, 0], 0]);
   await nextSecond();
   ne.goods = [];
@@ -272,7 +279,7 @@ await ta('[9] 読む時の不合格: 記録が無い・壊れた JSON・関係�
     assert.deepEqual(rd(), { ok: false, reason: 'invalid', problems: ['fetched_ne_attempts_plus_dropped'] });
     setMeta(NE_FETCH_COUNTS_KEY.products, JSON.stringify({ ...g0, stored_rows: g0.write_attempts + 1 }));
     assert.deepEqual(rd(), { ok: false, reason: 'invalid', problems: ['stored_gt_attempts'] });
-    setMeta(NE_FETCH_COUNTS_KEY.products, JSON.stringify({ ...g0, complete_at: '2020-01-01 00:00:00' }));
+    setMeta(NE_FETCH_COUNTS_KEY.products, JSON.stringify({ ...g0, complete_at: '2020-01-01 00:00:00', started_at: '2020-01-01T00:00:00.000Z' }));
     assert.deepEqual(rd(), { ok: false, reason: 'not_this_fetch' });
     setMeta(NE_FETCH_COUNTS_KEY.products, JSON.stringify({ ...g0, complete_rev: g0.complete_rev - 1 }));
     assert.deepEqual(rd(), { ok: false, reason: 'not_this_fetch' });
@@ -297,7 +304,7 @@ await ta('[9] 読む時の不合格: 記録が無い・壊れた JSON・関係�
 });
 
 await ta('[10] checkNeFetchCounts: 式・重なり・内訳・ページ・形の崩れを 1 つずつ見つける (欄の欠け・余分・負・小数・文字・途中の短いページ・満杯の最後のページ)', async () => {
-  const base = { version: 'fc1', kind: 'setproducts', complete_at: '2026-10-06 00:00:00', complete_rev: 5,
+  const base = { version: 'fc1', kind: 'setproducts', complete_at: '2026-10-06 00:00:00', started_at: '2026-10-06T00:00:00.123Z', finished_at: '2026-10-06T00:00:09.456Z', complete_rev: 5,
     fetched_rows: 1010, write_attempts: 1003, stored_rows: 1000, dropped_no_code: 4, dropped_missing_fields: 3, dropped_missing_detail: { set_goods_detail_goods_id: 3 },
     page_limit: 1000, pages: 2, page_rows: [1000, 10], last_page_rows: 10, fetch_fingerprint: 'a'.repeat(64), notes: { quantity_defaulted_rows: 2 } };
   assert.deepEqual(checkNeFetchCounts('setproducts', base), []);
@@ -320,7 +327,14 @@ await ta('[10] checkNeFetchCounts: 式・重なり・内訳・ページ・形の
   bad({ stored_rows: '1000' }, ['not_count:stored_rows']);
   bad({ write_attempts: undefined }, ['not_count:write_attempts']);
   bad({ complete_rev: -1 }, ['not_count:complete_rev']);
-  bad({ complete_at: '2026-10-06T00:00:00Z' }, ['complete_at']);
+  bad({ complete_at: '2026-10-06T00:00:00Z' }, ['complete_at', 'started_at_ne_complete_at']);
+  bad({ started_at: undefined }, ['started_at']);
+  bad({ started_at: '2026-10-06 00:00:00' }, ['started_at']);
+  bad({ started_at: '2026-10-06T00:00:01.000Z' }, ['started_at_ne_complete_at']);
+  bad({ started_at: '2026-13-06T00:00:00.000Z' }, ['started_at']);
+  bad({ finished_at: undefined }, ['finished_at']);
+  bad({ finished_at: '2026-10-06T00:00:00.100Z' }, ['finished_before_started']);
+  bad({ finished_at: '2026-02-30T00:00:00.000Z' }, ['finished_at']);
   bad({ version: 'fc0' }, ['version:fc0']);
   bad({ fetch_fingerprint: 'A'.repeat(64) }, ['fetch_fingerprint']);
   bad({ fetch_fingerprint: 'a'.repeat(65) }, ['fetch_fingerprint']);
