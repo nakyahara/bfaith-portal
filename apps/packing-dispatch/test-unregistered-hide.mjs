@@ -117,6 +117,8 @@ t('NE から消えても削除したものに商品名が残る', () => {
 t('削除したものを商品コード・商品名で絞れる (% や _ は文字として扱う)', () => {
   assert.deepEqual(hiddenRows('TYPO').map((x) => x.product_code).sort(), ['typo-001', 'typo-002']);
   assert.deepEqual(hiddenRows('全角').map((x) => x.product_code), ['ＦＷ－００１']);
+  assert.deepEqual(hiddenRows('ＦＷ－００１').map((x) => x.product_code), ['ＦＷ－００１']);   // 全角コードで検索 (Codex R2)
+  assert.deepEqual(hiddenRows('typo-00').map((x) => x.product_code).sort(), ['typo-001', 'typo-002']);
   assert.equal(listHiddenUnregistered('%').total, 0);
   assert.equal(listHiddenUnregistered('_').total, 0);
 });

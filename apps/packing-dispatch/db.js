@@ -244,7 +244,8 @@ export function ensureSchema() {
     -- 未登録一覧から外した商品コード (2026-10-06 スタッフ要望「誤って登録した商品コードを一覧から削除したい」)。
     -- 未登録一覧は mirror_products (NE 商品マスタ) から毎回計算するので行そのものは消せない。ここに入れたコードを
     -- 一覧から除くだけ。NE の商品マスタ・配送ルール・取込の判定 (ルールが無ければ要判断) には一切影響しない。
-    -- product_code は normProductCode (NFKC+trim+小文字) 済み。元に戻す = 行を DELETE。
+    -- product_code は SQLite の lower(trim(mirror_products.商品コード)) そのもの (一覧の除外条件と同じ式)。
+    -- normProductCode (NFKC) と混ぜると全角コードで一致しなくなるので使わない (Codex R1)。元に戻す = 行を DELETE。
     CREATE TABLE IF NOT EXISTS pd_unregistered_hidden (
       product_code TEXT PRIMARY KEY,
       product_name TEXT,                        -- 外した時点の商品名 (NE 側で消えても何だったか分かるように)
@@ -766,7 +767,9 @@ export function listHiddenUnregistered(q = '') {
   const db = ensureSchema();
   const s = String(q || '').trim();
   const where = s ? `WHERE (h.product_code LIKE ? ESCAPE '\\' OR COALESCE(nm.商品名, h.product_name, '') LIKE ? ESCAPE '\\')` : '';
-  const like = s ? ['%' + s.toLowerCase().replace(/[\\%_]/g, '\\$&') + '%', '%' + s.replace(/[\\%_]/g, '\\$&') + '%'] : [];
+  // 保存キーは SQLite の lower() (全角は変えない) なので JS で小文字にしない。英字の大小は SQLite の LIKE が吸収する (Codex R2)
+  const pat = '%' + s.replace(/[\\%_]/g, '\\$&') + '%';
+  const like = s ? [pat, pat] : [];
   // 商品名は NE ミラーの今の名前を優先 (同じ正規化キーの行が複数あっても 1 行にする)
   const from = `
       FROM pd_unregistered_hidden h
