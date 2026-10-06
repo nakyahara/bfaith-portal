@@ -963,6 +963,10 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
   await pgErr(pg.query("select ops._require_new_entry_lease('set')"), /new_entry_closed: 新商品 \(set\)/);
   await pg.query('rollback');
   await pgErr(as(E, 'new_entry_gate', () => pg.query("select ops.grant_new_entry_lease('set', 'mc_20300110T100000000Z_0a5807')")), /invalid_input/);
+  // DB の関数を直接呼んでも、セットの CSV は単品の許可では作れない (今は出す道の無いセットの許可が要る)
+  const setPay = JSON.stringify({ request_id: uuid(), actor: 'boss@test', ownership: ALL_COMPANY, kind: 'sets', schema_version: 'ne-reg-set-v1', header: G.REG_SCHEMAS.sets.header.join(','),
+    ne_codes_run: 'mc_20300110T100000000Z_0a5807', cost_day: TODAY, items: [{ sku_id: await skuId('set001'), expected: {}, rows: [['x']] }] });
+  await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [setPay, Buffer.from('x')])), /new_entry_closed: 新商品 \(set\)/);
   const setEx = (await one("select export_id::text as id from ops.ne_reg_exports where kind = 'sets' and state in ('issued', 'declared') order by export_id desc limit 1"))?.id;
   if (setEx) await pgErr(as(E, 'master_edit', () => pg.query('select * from ops.ne_reg_file($1::bigint)', [setEx])), /reg_file_expired/);
 });
