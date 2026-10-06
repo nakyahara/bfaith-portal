@@ -1396,13 +1396,14 @@ process.env.MASTER_EDITORS = 'Naka@Test, other@test';
 process.env.MASTER_EDIT_OPEN = '1';
 let factoryMode = 'ok';
 const opened = [];
-__setPgClientFactory(async (url) => {
+const pgFactory = async (url) => {
   if (factoryMode === 'down') throw new Error('connect ECONNREFUSED');
   const role = /master_edit@/.test(url) ? 'master_edit' : 'deploy';
   opened.push(role);
   await pg.query(`set role ${role}`);
   return { query: (t, p) => pg.query(t, p), end: async () => { await pg.query('set role deploy'); }, on: () => {} };
-});
+};
+__setPgClientFactory(pgFactory);
 __setClock(() => NOW.getTime());
 __setOwnership(ALL_COMPANY);
 __setShippingRatesProvider(async () => RATES);
@@ -2007,6 +2008,15 @@ await ta('[17] 売れた数 (10/5): 読み元 = 商品管理リストの公開�
     m.prepare(`update mirror_pml_published set src_velocity_as_of = '2030-01-09'`).run();
     r = await call('GET', '/?kind=single');
     assert.equal(r.status, 200); assert.equal(salesCell(r.text, 's001'), '—');
+    assert.equal(salesTh(r.text), '読めない', '明細が読めない = 見出しも「読めない」(日付を出したまま全部「—」にしない・#1627 Codex R2 M2)');
+    assert.match(r.text, /id="th-sales" title="販売数 \(商品管理リスト\) を読めません"|title="販売数 \(商品管理リスト\) を読めません"[^>]*id="th-sales"/);
+    {
+      // 関数: { ok: false, error } を返し、同じ run (見出し) も「読めない」に直す
+      const run = await S.readSalesRun({ now: NOW.getTime() });
+      assert.equal(run.ok, true);
+      const got = await S.salesOfCodes(run, ['s001']);
+      assert.deepEqual([got.ok, got.error, run.ok, run.error], [false, '販売数 (商品管理リスト) を読めません', false, '販売数 (商品管理リスト) を読めません']);
+    }
     assert.match((await call('GET', '/sku/s001')).text, /id="ref-sales-when">読めない/);
   } finally { S.__setSalesMirrorProvider(null); m.close(); }
   // Company DB の権限は広げない (売れた数は Render の写しから読む): master_edit は mart の売上の日次・注文の表を読めない
@@ -2226,8 +2236,44 @@ await ta('[19] 大きめの見本 (#1627 Codex R1 M3 / Low): CSV・全部コピ�
   try {
     const run = await S.readSalesRun({ now: NOW.getTime() });
     await assert.rejects(S.salesOfCodes(run, ['a', 'b'], { deadline: Date.now() - 1 }), ListTimeoutError);
-    assert.deepEqual([...(await S.salesOfCodes(run, ['a'], { deadline: Date.now() + 60e3 })).keys()], [], '期限の中 = 読む');
+    const okRes = await S.salesOfCodes(run, ['a'], { deadline: Date.now() + 60e3 });
+    assert.deepEqual([okRes.ok, [...okRes.map.keys()]], [true, []], '期限の中 = 読む');
   } finally { S.__setSalesMirrorProvider(null); m.close(); }
+  // 接続の待ちも期限に入る (#1627 Codex R2 M1): 期限はルートに入った直後から・残りの時間を connectionTimeoutMillis に渡す・遅れて来た接続は閉じる
+  {
+    const seen = [];
+    let closedLate = 0;
+    __setPgClientFactory(async (url, extra) => {
+      seen.push(extra);
+      await new Promise((ok) => setTimeout(ok, 400));
+      const c = await pgFactory(url, extra);
+      return { ...c, end: async () => { closedLate++; await c.end(); } };
+    });
+    __setExportLimits({ timeMs: 150 });
+    try {
+      let t0 = Date.now();
+      const got = await fetch(BASE + '/list.csv?kind=single', { headers: { 'x-test-session': 'editor' } });
+      const took = Date.now() - t0;
+      assert.equal(got.status, 503); assert.match(await got.text(), /時間がかかりすぎました \(Company DB への接続を待つ間に期限を過ぎた\)/);
+      assert.ok(took < 380, `接続 (400ms) を待たずに期限で返す (${took}ms)`);
+      assert.ok(seen[0] && seen[0].connectionTimeoutMillis > 0 && seen[0].connectionTimeoutMillis <= 150, JSON.stringify(seen[0]));
+      t0 = Date.now();
+      const c = await call('GET', '/api/codes?kind=single');
+      assert.equal(c.status, 503); assert.equal(c.j.reason, 'timeout');
+      assert.ok(Date.now() - t0 < 380);
+      await new Promise((ok) => setTimeout(ok, 600));   // 遅れて来た接続が閉じるのを待つ (共有の PGlite のロールを戻す)
+      assert.equal(closedLate, 2, '遅れて来た接続は閉じる');
+    } finally { __setExportLimits(null); __setPgClientFactory(pgFactory); }
+    // 期限の無い画面 (一覧) は接続の時間の上限を付けない
+    seen.length = 0;
+    __setPgClientFactory(async (url, extra) => { seen.push(extra); return pgFactory(url, extra); });
+    try {
+      assert.equal((await call('GET', '/?kind=single')).status, 200);
+      assert.equal(seen[0].connectionTimeoutMillis, undefined);
+      assert.equal((await fetch(BASE + '/list.csv?codes=s001', { headers: { 'x-test-session': 'editor' } })).status, 200);
+      assert.ok(seen.at(-1).connectionTimeoutMillis > 40e3, 'CSV = 残りの時間 (45 秒から)');
+    } finally { __setPgClientFactory(pgFactory); }
+  }
   // 含むセットが 51 件 = 51 件と数える (表示は 50 件まで)
   const pg3 = (await call('GET', '/sku/s003')).text;
   const nSets = Number((await q("select count(*)::int as n from core.sku_components c join core.skus k on k.sku_id = c.child_sku_id where k.code = 's003'"))[0].n);

@@ -212,12 +212,31 @@ export function editorGate(req) {
 /** 書き込み用の接続 (この画面だけのロール) が設定されているか */
 const writeConfigured = () => !!process.env.COMPANY_DB_MASTER_EDIT_URL;
 /** kind = 'read' (この画面のロール・無ければ持ち主のロールで読むだけ) / 'write' (この画面のロールだけ) */
-async function connect(kind = 'read') {
+/**
+ * deadline (ms・CSV / 全部コピー = ルートに入った直後に作る。#1627 Codex R2 M1) = 接続の待ちも期限に入れる:
+ *   残りの時間を pg の connectionTimeoutMillis に渡し、さらに残りの時間で打ち切る (遅れて来た接続は閉じる)。過ぎたら reason = 'timeout'
+ */
+const TIMEOUT_WORDS = '時間がかかりすぎました (Company DB への接続を待つ間に期限を過ぎた)。少し待ってからもう一度';
+async function connect(kind = 'read', { deadline = null } = {}) {
   const url = kind === 'write' ? process.env.COMPANY_DB_MASTER_EDIT_URL : (process.env.COMPANY_DB_MASTER_EDIT_URL || process.env.COMPANY_DB_URL);
   if (!url && kind === 'write') return { error: '書き込み用の接続 (COMPANY_DB_MASTER_EDIT_URL・この画面だけのロール) が設定されていないので、保存できません (見るだけ)', reason: 'no_write_role' };
   if (!url) return { error: 'Company DB の接続先が設定されていません (COMPANY_DB_URL)。いまは見ることも保存もできません' };
+  const left = deadline == null ? null : deadline - Date.now();
+  if (left != null && left <= 0) return { error: TIMEOUT_WORDS, reason: 'timeout' };
   try {
-    const client = await pgClientFactory(url, { application_name: 'master-edit' });
+    const opening = pgClientFactory(url, { application_name: 'master-edit', ...(left != null ? { connectionTimeoutMillis: Math.max(1, Math.floor(left)) } : {}) });
+    let client;
+    if (left == null) client = await opening;
+    else {
+      let timer;
+      const late = Symbol('late');
+      const got = await Promise.race([opening, new Promise((ok) => { timer = setTimeout(() => ok(late), left); })]).finally(() => clearTimeout(timer));
+      if (got === late) {
+        opening.then((c) => c && c.end && c.end()).catch(() => {});   // 遅れて来た接続は閉じる
+        return { error: TIMEOUT_WORDS, reason: 'timeout' };
+      }
+      client = got;
+    }
     if (client.on) client.on('error', (e) => console.error(`[master-edit] 接続のエラー: ${e.message}`));   // 切れた接続でプロセスを落とさない
     await client.query(`set statement_timeout = '20s'`);
     await client.query(`set lock_timeout = '10s'`);
@@ -225,13 +244,14 @@ async function connect(kind = 'read') {
     return { client };
   } catch (e) {
     console.error(`[master-edit] Company DB につながらない: ${e && e.message}`);
+    if (deadline != null && Date.now() >= deadline) return { error: TIMEOUT_WORDS, reason: 'timeout' };
     return { error: 'Company DB につながりません。いまは保存できません (つながったら画面を開き直してください)' };
   }
 }
 
 /** 画面: つながらないときも画面は出す (帯で知らせる・保存のボタンは出さない) */
-async function withPgPage(req, res, fn) {
-  const c = await connect();
+async function withPgPage(req, res, fn, { deadline = null } = {}) {
+  const c = await connect('read', { deadline });
   try {
     await fn(c.client ? pgAdapter(c.client) : null, c.error || null);
   } catch (e) {
@@ -240,8 +260,8 @@ async function withPgPage(req, res, fn) {
   } finally { if (c.client) { try { await c.client.end(); } catch { /* */ } } }
 }
 /** API: つながらない = 503 (書き込み用の接続が無い = no_write_role) */
-async function withPgApi(res, fn, kind = 'read') {
-  const c = await connect(kind);
+async function withPgApi(res, fn, kind = 'read', { deadline = null } = {}) {
+  const c = await connect(kind, { deadline });
   if (!c.client) return res.status(503).json({ ok: false, error: c.error, reason: c.reason || 'db_unreachable' });
   try {
     await fn(pgAdapter(c.client));
@@ -360,8 +380,9 @@ router.post('/api/search', (req, res) => {
  * 見られる人 = 一覧を見られる人 (server.js の requireAppAccess('master-edit'))・注文残の列は発注アプリの利用権がある人だけ
  */
 const tooManyWords = (data, what) => `${data.atLeast ? `${data.max.toLocaleString('ja-JP')} 件より多く` : `${data.total.toLocaleString('ja-JP')} 件`}あります。${what}は ${data.max.toLocaleString('ja-JP')} 件までです。絞ってから`;
-router.get('/list.csv', (req, res) => withPgPage(req, res, async (db, dbError) => {
-  const deadline = Date.now() + EXPORT_LIMITS.timeMs;   // リクエストの始めから (参考の値の読み込みも入れる)
+router.get('/list.csv', (req, res) => {
+  const deadline = Date.now() + EXPORT_LIMITS.timeMs;   // ルートに入った直後から (接続の待ち・参考の値の読み込みも入れる。#1627 Codex R2 M1)
+  return withPgPage(req, res, async (db, dbError) => {
   const text = (status, msg) => res.status(status).type('text/plain; charset=utf-8').send(msg);
   if (!db) return text(503, dbError || 'Company DB につながりません');
   const { filters, searchExpired, poOk } = listQuery(req);
@@ -381,10 +402,12 @@ router.get('/list.csv', (req, res) => withPgPage(req, res, async (db, dbError) =
   res.set('Content-Disposition', `attachment; filename="${name}"; filename*=UTF-8''${encodeURIComponent(name)}`);
   res.set('Cache-Control', 'no-store');
   res.send(body);
-}));
+  }, { deadline });
+});
 /** 絞った一覧の商品コードを全部 (コピーのボタン)。{ ok, codes, total } / 413 (件数の上限) / 410 (条件の期限切れ) / 503 */
-router.get('/api/codes', (req, res) => withPgApi(res, async (db) => {
-  const deadline = Date.now() + EXPORT_LIMITS.timeMs;
+router.get('/api/codes', (req, res) => {
+  const deadline = Date.now() + EXPORT_LIMITS.timeMs;   // ルートに入った直後から (接続の待ちも入れる)
+  return withPgApi(res, async (db) => {
   const { filters, searchExpired, poOk } = listQuery(req);
   if (searchExpired) return res.status(410).json({ ok: false, error: '条件の期限が切れました。検索し直してください' });
   // 在庫の範囲・注文残ありで絞っているときは、一覧と同じ参考の値で絞る (中身は読まない)
@@ -399,7 +422,8 @@ router.get('/api/codes', (req, res) => withPgApi(res, async (db) => {
   if (data.tooMany) return res.status(413).json({ ok: false, error: tooManyWords(data, '全部コピー'), total: data.total, atLeast: !!data.atLeast, max: data.max });
   res.set('Cache-Control', 'no-store');
   res.json({ ok: true, codes: data.codes, total: data.total });
-}));
+  }, 'read', { deadline });
+});
 router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), ui2: true, nav: 'manual', MAX_COMPONENTS }));
 
 // 新商品の登録 (画面 D)。つながらないときも画面は出す (帯・保存のボタンは出さない)

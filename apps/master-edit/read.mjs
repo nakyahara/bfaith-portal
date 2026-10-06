@@ -337,7 +337,9 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   // FBA (日本) の販売可能 (このページの SKU だけ・Company DB の在庫の日次の最新の complete の日。読めなければ null = 「—」)
   const fbaMap = extras.fba && extras.fba.ok ? await fbaAvailableOf(db, extras.fba, pageIds) : null;
   // 売れた数 (7 日・30 日。このページの商品コードだけ・商品管理リストの公開の回 = 発注アプリと同じ数。読めなければ null = 「—」)
-  const salesMap = extras.sales && extras.sales.ok ? await salesOfCodes(extras.sales, pageIds.map((id) => rowsById.get(id)?.code).filter(Boolean), { deadline }) : null;
+  //   明細が読めない = 見出し (extras.sales) も「読めない」に直る (salesOfCodes が同じ物を直す)
+  const salesRes = extras.sales && extras.sales.ok ? await salesOfCodes(extras.sales, pageIds.map((id) => rowsById.get(id)?.code).filter(Boolean), { deadline }) : null;
+  const salesMap = salesRes && salesRes.ok ? salesRes.map : null;
   const pageRows = pageIds.map((id) => rowsById.get(id)).filter(Boolean).map((r) => {
     const isSet = r.sku_kind === 'set';
     return {

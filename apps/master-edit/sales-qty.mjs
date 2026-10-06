@@ -69,6 +69,11 @@ const inTx = (db, fn) => (typeof db.transaction === 'function' ? db.transaction(
 /**
  * 取引の中で公開の回を読み直す。変わっていたら run をその回に直す (同じ物を見出しにも使う)。読めない形になった = ok: false に直して null を返す
  */
+/** 明細が読めなかった = run (見出しにも使う同じ物) を「読めない」に直す (#1627 Codex R2 M2: 見出しだけ読める日付のまま全部「—」にしない) */
+function failRun(run, error) {
+  for (const k of Object.keys(run)) delete run[k];
+  Object.assign(run, { ok: false, error, reason: 'error' });
+}
 function recheckRun(db, run) {
   const cur = runOf(db.prepare(PUB_SQL).get(), run.now ?? Date.now());
   if (cur.ok && cur.runId === run.runId) return run;
@@ -94,8 +99,9 @@ const SELECT_COLS = `商品コード as code, 販売数7日_合計 as d7, 販売
 const CHUNK = 200;
 
 /**
- * 一覧のページの商品コードの販売数。Map(normProductCode(コード) → { d7, d30, d7fba, d7other, d30fba, d30other })。
- * Map に無いコード = 商品管理リストに無い (NE にまだ無い商品など。0 とは分ける)。読めない回 (run.ok でない) = null
+ * 一覧のページの商品コードの販売数。{ ok: true, map: Map(normProductCode(コード) → { d7, d30, d7fba, d7other, d30fba, d30other }) } /
+ * { ok: false, error } (読めない = run も「読めない」に直す = 見出しも「読めない」)。読めない回 (run.ok でない) で呼んだ = null
+ * Map に無いコード = 商品管理リストに無い (NE にまだ無い商品など。0 とは分ける)
  * 索引 idx_mpsr_run_code_norm (run_id, LOWER(TRIM(商品コード))) で、そのページのコードだけ引く (全部の商品を読まない)
  * ポインタの読み直しと明細を 1 つの取引で (回が変わっていたら run を直す)。deadline = CSV の期限 (塊ごとに確かめる・過ぎたら ListTimeoutError)
  */
@@ -103,23 +109,24 @@ export async function salesOfCodes(run, codes, { deadline = null } = {}) {
   if (!run || !run.ok) return null;
   const keys = [...new Set(codes.map((c) => normProductCode(c)).filter(Boolean))];
   const m = new Map();
-  if (!keys.length) return m;
+  if (!keys.length) return { ok: true, map: m };
   try {
     const db = await mirrorDb();
     return inTx(db, () => {
-      if (!recheckRun(db, run)) return null;
+      if (!recheckRun(db, run)) return { ok: false, error: run.error };
       for (let i = 0; i < keys.length; i += CHUNK) {
         checkDeadline(deadline);
         const part = keys.slice(i, i + CHUNK);
         const rows = db.prepare(`select ${SELECT_COLS} from mirror_pml_snapshot_rows where run_id = ? and lower(trim(商品コード)) in (${part.map(() => '?').join(', ')})`).all(run.runId, ...part);
         for (const r of rows) m.set(normProductCode(r.code), rowOf(r));
       }
-      return m;
+      return { ok: true, map: m };
     });
   } catch (e) {
     if (e instanceof ListTimeoutError) throw e;
     console.error(`[master-edit] 販売数 (一覧) を読めない: ${e && e.message}`);
-    return null;
+    failRun(run, '販売数 (商品管理リスト) を読めません');
+    return { ok: false, error: run.error };
   }
 }
 
@@ -136,7 +143,8 @@ export async function readSalesSku(run, code) {
     return inTx(db, () => readSalesSkuTx(db, run, key));
   } catch (e) {
     console.error(`[master-edit] 販売数 (1 つの商品) を読めない: ${e && e.message}`);
-    return { ok: false, error: '販売数 (商品管理リスト) を読めません' };
+    failRun(run, '販売数 (商品管理リスト) を読めません');
+    return { ok: false, error: run.error };
   }
 }
 function readSalesSkuTx(db, run, key) {
