@@ -835,7 +835,7 @@ await ta('[C18] 観測 = 回の始まりの写しとちょうど同じ商品 (#1
 console.log('\nJAN (H6)');
 
 await ta('[W1] 0058 (広げる道 PR-1): 初回の配る (ne_reg_issue) の直前に NE のコードを確かめ直す (NE の CSV は upsert = 同じコードの既存の商品を上書き) / 許可が無いと単品の登録・新しい build・初回の配るは閉じ、後始末 (replay・配り直し・申告・使わない) は通る', async () => {
-  for (const c of ['new-x1', 'new-x2', 'new-x3', 'new-x4', 'new-x5']) await reg('single', c, single({ name: `広げる道 ${c}` }));
+  for (const c of ['new-x1', 'new-x2', 'new-x3', 'new-x4', 'new-x5', 'new-z1', 'new-z2', 'new-z3', 'new-z4']) await reg('single', c, single({ name: `広げる道 ${c}` }));
   // ① build の後に、今の NE のコード (master_ne_codes) にだけ現れた = 配らない
   const b1 = await build('products', ['new-x1']);
   // ⓪ NE のコードの回が許可の回と違う (新しい照合が NE のコードを書いたが、その回の許可がまだ無い) = 配らない (R16 M5 ne_codes_stale)
@@ -852,6 +852,22 @@ await ta('[W1] 0058 (広げる道 PR-1): 初回の配る (ne_reg_issue) の直�
   await pg.query("insert into ops.master_ne_code_history (code_norm, kind, source) values ('new-x2', 'product', 'record_ne_codes')");
   await pgErr(issue(b2.export.export_id), /new-x2 は NE にもうある/);
   assert.equal((await expOf(b2.export.export_id)).state, 'built');
+  // ②b 登録の後に、同じコードが NE の代表のコード (kind = rep) として今の値 / 履歴に入った = 登録の時と同じく、CSV を作る時も配る直前も拒む (#1640 Codex R5 Medium)
+  const repNow = (code) => pg.query("insert into ops.master_ne_codes (code_norm, kind, state, ne_code, spellings) values ($1, 'rep', 'ok', $1, $2::jsonb)", [code, JSON.stringify([code])]);
+  const repHist = (code) => pg.query("insert into ops.master_ne_code_history (code_norm, kind, source) values ($1, 'rep', 'record_ne_codes')", [code]);
+  await repNow('new-z1');                                                     // 今の値だけ (履歴には無い)
+  assert.equal((await one("select count(*)::int as n from ops.master_ne_code_history where code_norm = 'new-z1'")).n, 0);
+  await pgErr(build('products', ['new-z1']), /new-z1|NE にもうある|already_in_ne/);
+  await repHist('new-z2');                                                    // 履歴だけ (今の値には無い)
+  await pgErr(build('products', ['new-z2']), /new-z2|NE にもうある|already_in_ne/);
+  assert.equal((await one("select count(*)::int as n from ops.ne_reg_export_items i join core.skus s on s.sku_id = i.sku_id where s.code in ('new-z1', 'new-z2')")).n, 0, '作っていない');
+  const bz3 = await build('products', ['new-z3']); const bz4 = await build('products', ['new-z4']);
+  await repNow('new-z3');                                                     // build の後に今の値 (代表のコード)
+  await pgErr(issue(bz3.export.export_id), /new-z3 は NE にもうある/);
+  await repHist('new-z4');                                                    // build の後に履歴 (代表のコード)
+  await pgErr(issue(bz4.export.export_id), /new-z4 は NE にもうある/);
+  assert.deepEqual([(await expOf(bz3.export.export_id)).state, (await expOf(bz4.export.export_id)).state], ['built', 'built']);
+  for (const c of ['new-z1', 'new-z3']) await pg.query("delete from ops.master_ne_codes where code_norm = $1 and kind = 'rep'", [c]);   // 後の試験に残さない (履歴は追記だけ)
   // ③ 許可を取り消す (DB の持ち主) → 閉じるもの / 通るもの (§3.8)
   const b3 = await build('products', ['new-x3']);
   const i3 = await issue(b3.export.export_id);

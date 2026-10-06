@@ -1354,6 +1354,14 @@ begin
   return jsonb_build_object('state', 'written', 'rows', v_n, 'counts', coalesce(v_counts, '{}'::jsonb));
 end $$;
 
+-- NE で見えたコードか (今の NE のコード ops.master_ne_codes か履歴 ops.master_ne_code_history に、kind を限らず = 商品のコードも代表のコードも)。
+--   新しいコードの確かめ (ops.new_sku_code_problem)・CSV を作る時 (ops.ne_reg_build)・配る直前 (ops.ne_reg_issue) が同じこれを見る (#1640 Codex R5 Medium)
+create function ops.ne_code_seen(p_code_norm text) returns boolean language sql stable set search_path = pg_catalog, pg_temp as $$
+  select exists (select 1 from ops.master_ne_codes c where c.code_norm = p_code_norm)
+      or exists (select 1 from ops.master_ne_code_history h where h.code_norm = p_code_norm)
+$$;
+revoke all on function ops.ne_code_seen(text) from public;
+
 -- 14b. 新しいコードの決まり: NE の今のコードに加えて、前に NE で見たコードも「NE にもうある」(0052)
 create or replace function ops.new_sku_code_problem(p_code text) returns text
   language plpgsql stable security definer set search_path = pg_catalog, pg_temp as $$
@@ -1364,8 +1372,7 @@ begin
   v_norm := core.norm_code(p_code);
   if exists (select 1 from core.skus where company_id = 1 and code_norm = v_norm) then return 'code_taken'; end if;
   if exists (select 1 from core.products where company_id = 1 and core.norm_code(display_code) = v_norm) then return 'code_is_rep'; end if;
-  if exists (select 1 from ops.master_ne_codes where code_norm = v_norm) then return 'code_in_ne'; end if;
-  if exists (select 1 from ops.master_ne_code_history h where h.code_norm = v_norm) then return 'code_in_ne'; end if;   -- 🆕 0058: 前に NE で見たコード (今朝の取得で欠けても)
+  if ops.ne_code_seen(v_norm) then return 'code_in_ne'; end if;   -- 🆕 0058: 今の NE のコードと、前に NE で見たコード (今朝の取得で欠けても)・kind を限らない
   if exists (select 1 from events.master_change_events
               where entity_type = 'sku' and operation = 'DELETE' and core.norm_code(old_value ->> 'code') = v_norm) then return 'code_used_before'; end if;
   return null;
@@ -1797,8 +1804,7 @@ begin
     if exists (select 1 from ops.ne_reg_export_items x where x.sku_id = v_sku.sku_id and x.state in ('built', 'issued', 'import_declared', 'partial')) then
       raise exception 'not_ready: % にはまだ終わっていないファイルがある', v_sku.code using errcode = 'P0001';
     end if;
-    if exists (select 1 from ops.master_ne_codes c2 where c2.kind = 'product' and c2.code_norm = v_sku.code_norm)
-       or exists (select 1 from ops.master_ne_code_history h where h.kind = 'product' and h.code_norm = v_sku.code_norm) then   -- 🆕 0058: 前に NE で見たコード
+    if ops.ne_code_seen(v_sku.code_norm) then   -- 🆕 0058: 今の NE のコードと前に NE で見たコード・商品のコードも代表のコードも (登録の時と同じ範囲・#1640 R5)
       raise exception 'already_in_ne: コード % は NE にもうある = 新規登録しない (同じ登録か確かめる / 別のコード)', v_sku.code using errcode = 'P0001';
     end if;
     -- 🚨 行と確かめる値 = 鍵の後に関数が今の値から作ったものと完全に同じ (High 1)
@@ -1929,8 +1935,7 @@ begin
     end if;
     select pg_catalog.array_agg(k.code order by k.code) into v_gone from ops.ne_reg_export_items i join core.skus k on k.sku_id = i.sku_id
      where i.export_id = p_export_id and i.state = 'built'
-       and (exists (select 1 from ops.master_ne_codes c2 where c2.kind = 'product' and c2.code_norm = k.code_norm)
-            or exists (select 1 from ops.master_ne_code_history h where h.kind = 'product' and h.code_norm = k.code_norm));
+       and ops.ne_code_seen(k.code_norm);   -- 商品のコードも代表のコードも (登録の時と同じ範囲・#1640 R5)
     if v_gone is not null then
       raise exception 'already_in_ne: コード % は NE にもうある (build の後に見えた) = 配らない (使わないにして作り直す)', pg_catalog.array_to_string(v_gone, '・') using errcode = 'P0001';
     end if;
