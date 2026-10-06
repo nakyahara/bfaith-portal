@@ -209,6 +209,8 @@
     $$('button[data-act]', tr).forEach(function (b) { b.setAttribute('aria-label', who + ' ' + acts[b.getAttribute('data-act')]); });
   }
   function renumber() { $$('#comp-rows tr.comp-row').forEach(relabel); tiles(); update(); }
+  /** 確かめ直しの間 (3 秒・10 秒・30 秒の 3 回)。試験だけ window.__meRetryWaits で短くする */
+  var RETRY_WAITS = Array.isArray(window.__meRetryWaits) ? window.__meRetryWaits : [3000, 10000, 30000];
   function lookup(tr) {
     var code = $('.c-code', tr).value.trim();
     var set = function (cls, v, bad) { var el = $(cls, tr); el.textContent = v; if (cls === '.c-name') el.classList.toggle('bad', !!bad); };
@@ -217,18 +219,47 @@
     if (f0 && f0.code === code) return;   // この世代 (打った後) の答えはもう持っている (打つたびに捨てる = 入力の処理)
     facts.delete(tr);
     if (!code) { ['.c-name', '.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { set(c, ''); }); tiles(); return; }
-    var seq = tr.__lookupSeq || 0;   // 世代は打った瞬間に進む (入力の処理)。この世代の返事だけ使う
+    var seq = tr.__lookupSeq || 0;   // 世代は打った瞬間・行を消したときに進む。この世代の返事だけ使う
     if (tr.__inflight === seq + '|' + code) return;   // 同じ世代の同じコードをもう聞いている
     tr.__inflight = seq + '|' + code;
-    var retry = function (msg) { tr.__inflight = null; set('.c-name', msg, true); tiles(); update(); tr.__lookupTimer = setTimeout(function () { lookup(tr); }, 3000); };
+    // この世代の返事か (行が画面にある・世代とコードが同じ)
+    var current = function () { return tr.isConnected && (tr.__lookupSeq || 0) === seq && $('.c-code', tr).value.trim() === code; };
+    /**
+     * 確かめられなかった (5xx・通信・401/403)。自動の確かめ直しは 3 秒・10 秒・30 秒の 3 回まで (#1628 Codex R4 M1)。
+     * その後と 401/403 (自動で繰り返しても直らない) は「もう一度確かめる」のボタン。どちらも答えにしない = 保存は止めたまま
+     */
+    var retry = function (msg, auto) {
+      tr.__inflight = null;
+      if (!current()) return;
+      var n = tr.__retryN || 0;
+      var wait = RETRY_WAITS[n];
+      var el = $('.c-name', tr);
+      el.classList.add('bad');
+      if (auto && wait) {
+        tr.__retryN = n + 1;
+        el.textContent = msg + '。' + (wait >= 1000 ? wait / 1000 + ' 秒後' : '少し後') + 'にもう一度確かめます';
+        tr.__lookupTimer = setTimeout(function () { if (current()) lookup(tr); }, wait);
+      } else {
+        el.textContent = msg + '。 ';
+        var btn = document.createElement('button');
+        btn.type = 'button'; btn.className = 'btn sm'; btn.setAttribute('data-act', 'relookup'); btn.textContent = 'もう一度確かめる';
+        el.appendChild(btn);
+      }
+      tiles(); update();
+    };
+    var ctl = window.AbortController ? new AbortController() : null;
+    if (tr.__abort) tr.__abort.abort();
+    tr.__abort = ctl;
     set('.c-name', '引き当てています…');
-    fetch(BASE + '/api/lookup?code=' + encodeURIComponent(code), { headers: { Accept: 'application/json' } })
+    fetch(BASE + '/api/lookup?code=' + encodeURIComponent(code), { headers: { Accept: 'application/json' }, signal: ctl ? ctl.signal : undefined })
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
       .then(function (x) {
-        if ((tr.__lookupSeq || 0) !== seq || $('.c-code', tr).value.trim() !== code) return;
+        if (!current()) return;
         tr.__inflight = null;
-        // 答えにするのは 400 (形が違う)・404 (無い) だけ。5xx (DB につながらない など) は答えにせず、もう一度聞く (#1628 Codex R3 M1)
-        if (!x.r.ok && x.r.status !== 400 && x.r.status !== 404) { retry('いまは確かめられません (' + (x.j.error || 'HTTP ' + x.r.status) + ')。3 秒後にもう一度確かめます'); return; }
+        // 答えにするのは 400 (形が違う)・404 (無い) だけ。ほか (5xx = DB につながらない など・401/403) は答えにしない (#1628 Codex R3 M1・R4 M1)
+        if (x.r.status === 401 || x.r.status === 403) { retry('確かめられません (' + (x.j.error || 'HTTP ' + x.r.status) + ')。ログインし直すか、画面を開き直してください', false); return; }
+        if (!x.r.ok && x.r.status !== 400 && x.r.status !== 404) { retry('いまは確かめられません (' + (x.j.error || 'HTTP ' + x.r.status) + ')', true); return; }
+        tr.__retryN = 0;
         if (!x.r.ok || !x.j.ok) { facts.set(tr, { code: code, item: null }); set('.c-name', x.j.error || '見つかりません', true); ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { set(c, ''); }); tiles(); update(); return; }
         var it = x.j.item;
         facts.set(tr, { code: code, item: it });
@@ -239,7 +270,7 @@
         set('.c-handling', HANDLING[it.handling] || it.handling);
         tiles(); update();
       })
-      .catch(function () { if ((tr.__lookupSeq || 0) !== seq) return; retry('引き当てできません (通信)。3 秒後にもう一度確かめます'); });
+      .catch(function (err) { if (err && err.name === 'AbortError') return; retry('引き当てできません (通信)', true); });
   }
   /** 構成品から導いた売上分類 (導けない・分からない = null) */
   var salesFromComp = null;
@@ -290,7 +321,8 @@
     rowsEl.addEventListener('click', function (e) {
       var b = e.target.closest('button[data-act]'); if (!b || b.disabled) return;
       var tr = b.closest('tr'), act = b.getAttribute('data-act');
-      if (act === 'del') { var next = tr.nextElementSibling || tr.previousElementSibling; clearTimeout(tr.__lookupTimer); facts.delete(tr); tr.remove(); if (next) $('.c-code', next).focus(); else $('#comp-add').focus(); }
+      if (act === 'relookup') { tr.__retryN = 0; tr.__inflight = null; lookup(tr); return; }
+      if (act === 'del') { var next = tr.nextElementSibling || tr.previousElementSibling; clearTimeout(tr.__lookupTimer); tr.__lookupSeq = (tr.__lookupSeq || 0) + 1; tr.__inflight = null; if (tr.__abort) tr.__abort.abort(); facts.delete(tr); tr.remove(); if (next) $('.c-code', next).focus(); else $('#comp-add').focus(); }
       if (act === 'up' && tr.previousElementSibling) { tr.parentNode.insertBefore(tr, tr.previousElementSibling); b.focus(); }
       if (act === 'down' && tr.nextElementSibling) { tr.parentNode.insertBefore(tr.nextElementSibling, tr); b.focus(); }
       renumber();
@@ -301,7 +333,7 @@
       if (e.target.classList.contains('c-code')) {
         var tr = e.target.closest('tr');
         // 打った瞬間に古い答えを捨てて世代を進める (A → B → A と打ち直しても、前の A の答え・遅れて来る返事は使わない = #1628 Codex R3 L3)
-        facts.delete(tr); tr.__lookupSeq = (tr.__lookupSeq || 0) + 1; tr.__inflight = null;
+        facts.delete(tr); tr.__lookupSeq = (tr.__lookupSeq || 0) + 1; tr.__inflight = null; tr.__retryN = 0; if (tr.__abort) tr.__abort.abort();
         ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { $(c, tr).textContent = ''; }); $('.c-name', tr).textContent = e.target.value.trim() ? '確かめています…' : ''; $('.c-name', tr).classList.remove('bad');
         tiles();
         clearTimeout(tr.__lookupTimer);
@@ -324,17 +356,24 @@
 
   /* ---------- 出品カード: 作らない・参考 URL・Amazon URL から ASIN・セット商品を作るか ---------- */
   /** カードの欄に値が残っているか (カードを作らないときも送る = 形が違えば保存で断られる) */
-  function cardHasValues() {
-    return ['official-url', 'amazon-url', 'asin', 'set-text'].some(function (id) { return !!val(id); }) || refUrls().length > 0 || !!segVal('set-plan') || !!val('set-reason');
+  function filled(boxSel) {
+    var box = $(boxSel); if (!box) return false;
+    return $$('input, select, textarea', box).some(function (el) { return el.type !== 'checkbox' && el.type !== 'radio' && el.type !== 'file' && el.value.trim() !== ''; })
+      || $$('.seg', box).some(function (sg) { return !!sg.getAttribute('data-value'); });
   }
+  /** カードの欄・Yahoo! の欄に値が残っているか (DOM から全部見る = 漏れが無い・#1628 Codex R4 M2)。カードを作らないときも送る = 形が違えば保存で断られる */
+  function cardHasValues() { return filled('#card-fields') || yahooHasValues(); }
+  function yahooHasValues() { return filled('#sec-yahoo'); }
   function cardShow() {
     var on = cardOn();
-    var keep = !on && cardHasValues();
-    var cf = $('#card-fields'); if (cf) { cf.hidden = !on && !keep; }
+    var keepCard = !on && filled('#card-fields'), keepYahoo = !on && yahooHasValues();
+    var keep = keepCard || keepYahoo;
+    var cf = $('#card-fields'); if (cf) { cf.hidden = !on && !keepCard; }
     var note = $('#card-off-note');
     if (note) {
       note.hidden = on;
-      note.textContent = keep ? 'カードは作りません。ただし下の欄に入れた値は保存のときに確かめます (形が違うと保存できません)。要らなければ空にしてください。' : 'カードは作りません (保存しても product-hub のボードにカードはできません)。';
+      var where = [keepCard ? '下の欄' : '', keepYahoo ? '「Yahoo! を楽天と変えるときだけ」の欄' : ''].filter(Boolean).join('と');
+      note.textContent = keep ? 'カードは作りません。ただし' + where + 'に入れた値は保存のときに確かめます (形が違うと保存できません)。要らなければ空にしてください。' : 'カードは作りません (保存しても product-hub のボードにカードはできません)。';
       note.classList.toggle('wrn', keep);
     }
     var plan = segVal('set-plan');
@@ -345,6 +384,7 @@
   ['card-create', 'set-plan'].forEach(function (id) { var e = document.getElementById(id); if (e) e.addEventListener('change', function () { cardShow(); update(); }); });
   // カードを作らないときに欄を空にしていったら、全部空になった時点で畳む (打っている途中では畳まない = 欄を離れたとき)
   var cardFieldsEl = $('#card-fields'); if (cardFieldsEl) cardFieldsEl.addEventListener('focusout', function () { setTimeout(cardShow, 0); });
+  var yahooEl = $('#sec-yahoo'); if (yahooEl) { yahooEl.addEventListener('focusout', function () { setTimeout(cardShow, 0); }); yahooEl.addEventListener('change', cardShow); }
   var refRows = $('#ref-rows');
   function refRenumber() { $$('#ref-rows .urlrow').forEach(function (r, i) { $('.idx', r).textContent = String(i + 1); $('.ref-url', r).setAttribute('aria-label', '参考 URL ' + (i + 1)); $('[data-ref-del]', r).setAttribute('aria-label', '参考 URL ' + (i + 1) + ' を外す'); }); }
   var refAdd = $('#ref-add');

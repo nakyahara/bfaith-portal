@@ -1017,6 +1017,71 @@ await ta('[32] 新商品 (#1628 Codex R3 M2): 「作らない」の理由の欄�
   await p.waitForFunction(() => document.getElementById('card-fields').hidden === true);
 });
 
+await ta('[33] 新商品 (セット・#1628 Codex R4 M1): 確かめ直しは 3 回まで → 「もう一度確かめる」(保存は止めたまま)・401/403 は自動で繰り返さない・行を消したら確かめ直しも止まる', async (p) => {
+  await p.addInitScript(() => { window.__meRetryWaits = [150, 300, 450]; });   // 本物は 3 秒・10 秒・30 秒
+  const hits = { k002: 0, k003: 0, k004: 0 };
+  let k002Down = true;
+  await p.route('**/api/lookup?code=*', async (route) => {
+    const code = new URL(route.request().url()).searchParams.get('code');
+    if (code in hits) hits[code]++;
+    if (code === 'k002' && k002Down) return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'Company DB につながりません' }) });
+    if (code === 'k003') { await new Promise((r) => setTimeout(r, 700)); try { await route.fulfill({ status: 503, contentType: 'application/json', body: '{}' }); } catch { /* 画面が止めた (行を消した) */ } return; }
+    if (code === 'k004') return route.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'このアプリの権限がありません' }) });
+    return route.continue();
+  });
+  await p.goto(B + '/new?kind=set');
+  const rows = p.locator('#comp-rows tr.comp-row');
+  await rows.nth(0).locator('.c-code').fill('k002');
+  await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForSelector('#comp-rows tr.comp-row:nth-child(1) button[data-act="relookup"]', { timeout: 10000 });
+  assert.equal(hits.k002, 4, '最初の 1 回 + 確かめ直し 3 回で止まる');
+  await p.waitForTimeout(1200);
+  assert.equal(hits.k002, 4, '上限の後は自動で聞かない');
+  assert.match(await p.textContent('#checklist'), /構成品を確かめています/, '保存は止めたまま');
+  k002Down = false;
+  await rows.nth(0).locator('button[data-act="relookup"]').click();
+  await p.waitForFunction(() => /ハチミツ/.test(document.querySelector('#comp-rows .c-name').textContent));
+  assert.ok(!/構成品を確かめています/.test(await p.textContent('#checklist')), '「もう一度確かめる」で直る');
+  // 401/403 = 自動で繰り返さない (ログインし直す・開き直す)
+  await rows.nth(1).locator('.c-code').fill('k004');
+  await rows.nth(1).locator('.c-code').press('Tab');
+  await p.waitForSelector('#comp-rows tr.comp-row:nth-child(2) button[data-act="relookup"]');
+  assert.match(await rows.nth(1).locator('.c-name').textContent(), /ログインし直すか/);
+  await p.waitForTimeout(800);
+  assert.equal(hits.k004, 1, '403 は自動で繰り返さない');
+  // 返事待ちの行を消したら、遅れて来た返事で確かめ直しを始めない (#1628 Codex R4 M1)
+  await rows.nth(1).locator('.c-code').fill('k003');
+  await rows.nth(1).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /引き当てています/.test(document.querySelectorAll('#comp-rows .c-name')[1].textContent));
+  await rows.nth(1).locator('button[data-act="del"]').click();
+  await p.waitForTimeout(2000);
+  assert.equal(hits.k003, 1, '消した行は確かめ直さない');
+});
+
+await ta('[34] 新商品 (#1628 Codex R4 M2): カードを作らない + Yahoo! の欄だけ値がある = 「Yahoo! の欄も確かめる」と出す・Yahoo!売価 0 で保存 = その欄を開いて止める', async (p) => {
+  await p.goto(B + '/new?kind=single');
+  await p.click('#sec-yahoo > summary');
+  await p.fill('#y-price', '0');
+  await p.click('#sec-yahoo > summary');   // 畳む
+  await p.click('#card-create button[data-v="0"]');
+  assert.equal(await p.isHidden('#card-fields'), true, 'カードの欄は空 = 畳む');
+  assert.match(await p.textContent('#card-off-note'), /「Yahoo! を楽天と変えるときだけ」の欄に入れた値は保存のときに確かめます/);
+  await p.fill('#code', 'ui-yahoo-1');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', 'Yahoo! の試験');
+  await p.fill('#f-standard_price', '800');
+  await p.click('#f-tax_rate button[data-v="0.1"]');
+  await p.selectOption('#shipping', 'S01');
+  await p.click('#save');
+  assert.match(await p.textContent('#msg'), /Yahoo!売価は 1 円以上/);
+  assert.equal(await p.evaluate(() => document.getElementById('sec-yahoo').open), true, 'Yahoo! の欄を開く');
+  assert.equal(await active(p), 'y-price', 'その欄へ');
+  assert.equal(await skuRow('ui-yahoo-1'), undefined);
+  await p.fill('#y-price', '');
+  await p.focus('#f-name');
+  await p.waitForFunction(() => /保存しても product-hub/.test(document.getElementById('card-off-note').textContent));
+});
+
 await ta('[27] Amazon SKU (10/5): 新しい対応 = 名前で未保存 1 件 (理由は数えない)・離れるときの確認・Ctrl+S → 読み直し (知らせ)・削除の理由は数えない・削除は 1 回だけ確かめる (Esc で戻る)・墓標・変更の記録のカード', async (p) => {
   await p.goto(B + '/amazon/');
   assert.match(await p.textContent('#h-um'), /売れたのに対応が無い SKU/);
