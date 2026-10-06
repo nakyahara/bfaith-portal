@@ -438,7 +438,11 @@ export function listNeShippingOptions(db) {
 export const RAKUTEN_GROUP_NE_HINTS = {
   '1': ['定形'],          // 定形外 → 定形内 / 定形外規格内 / 定形外規格外
   '3': ['飛脚'],          // 飛脚宅配便
-  '4': ['宅急便'],        // 宅急便
+  // 🚨 4 は **ゆうパック**。2026-09-04 に楽天の実物に合わせてラベルを直した
+  // (4 を「宅急便」と出していた) ときに、この表を直し忘れていた。
+  // 候補の並べ替えだけなら「近い順が変」で済んだが、2026-10-06 から
+  // 自動で試算に使うので、間違えると**別の運送会社の送料で利益を出す** (Codex R4 P1)
+  '4': ['ゆうパック'],    // ゆうパック
   '5': ['ネコポス'],
   '6': ['クリックポスト'],
   '7': ['宅急便'],        // ヤマト運輸宅急便
@@ -489,7 +493,8 @@ export function profitShipChoices(options, neMethod, neShippingCost) {
  *   1) NE に登録されている配送方法がそのグループに当てはまるなら**それ** (= 実送料。一番確か)
  *   2) 当てはまらないなら、そのグループの候補のうち**いちばん多く使われている**もの
  *      (同数なら高い方 = 利益を実際より良く見せない側。listNeShippingOptions と同じ倒し方)
- *   3) 候補が無ければキーを作らない → 画面は試算の配送方法を**変えない**
+ *   3) 送料 0 円の便は候補にしない (NE の 0 は「無料」でなく「未入力」が多い)
+ *   4) 候補が無ければキーを作らない → 画面は試算の配送方法を**変えない**
  *
  * @param {Array<{method:string, cost:number, count:number, isCurrent?:boolean}>} choices
  *        profitShipChoices の結果 (画面の選択肢とまったく同じ並び・同じ送料)
@@ -503,22 +508,23 @@ export function profitShipPickByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS) {
   const list = (choices || []).filter((o) => o && o.method && Number.isFinite(num(o.cost)));
   const out = {};
   for (const [group, words] of Object.entries(hints || {})) {
-    const near = list.filter((o) => words.some((w) => o.method.includes(w)));
-    // 🚨 送料 0 円の便は**自分では選ばない** (Codex R3 P1)。NE の 送料 0 は「無料」ではなく
-    //    「まだ入っていない」ことが多く、最多だからと採ると利益を過大に見せる。
-    //    人が選ぶぶんは今までどおり選択肢に残る (決めるのは人)。
-    //    NE の登録値 (isCurrent) は 0 円でも残す — 画面を開いたときに使っている金額そのもの
-    const cand = near.filter((o) => num(o.cost) > 0 || o.isCurrent);
+    // 🚨 送料 0 円の便は **NE の登録値でも** 自動選択しない (Codex R3 P1 / R4 P1)。
+    //    NE の 送料 0 は「無料」ではなく「まだ入っていない」ことが多く、選ぶと利益を
+    //    過大に見せる。人が選ぶぶんは今までどおり選択肢に残る (決めるのは人)
+    const cand = list.filter((o) => words.some((w) => o.method.includes(w)) && num(o.cost) > 0);
+    if (!cand.length) continue;   // 当てはまる便なし / 0円の便だけ = 画面は何も変えない
     // NE の登録値が当てはまるならそれ (実送料 = 開いたときの金額と同じ)。
     // 無ければ最多 → 同数なら高い方 (利益を実際より良く見せない側)
     const ne = cand.find((o) => o.isCurrent);
-    const pick = ne || [...cand].filter((o) => num(o.cost) > 0)
+    const pick = ne || [...cand]
       .sort((a, b) => (b.count || 0) - (a.count || 0) || num(b.cost) - num(a.cost))[0];
-    if (!pick) continue;   // 候補なし / 0円の便しかない = 画面は何も変えない
     const costs = cand.map((o) => num(o.cost));
     out[group] = {
       method: pick.method, cost: num(pick.cost), isNe: !!ne,
-      from: cand.length, min: Math.min(...costs), max: Math.max(...costs),
+      // 🚨 candidates は「当てはまる **NE の配送方法** の数」、min/max はその**代表送料**の幅。
+      //    listNeShippingOptions が配送方法ごとに代表送料 1 件へ畳んでいるので、
+      //    「大きさで何通り」や「実送料の幅」ではない。画面の文もそう書く (Codex R4 P2)
+      candidates: cand.length, min: Math.min(...costs), max: Math.max(...costs),
     };
   }
   return out;
