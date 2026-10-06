@@ -1,13 +1,13 @@
 <%#
-  新しいデザインの枠 (上の帯・左の列)。閉じるのは _footer.ejs (</main></div> と「全体から探す」「離れるときの確認」の窓)。
-  左の列の行き先は今ある画面だけ (仕入先・原価の予約 CSV はまだ無い)
+  新しいデザインの枠 (上の帯・左の列)。マスタの入力 (apps/master-edit/views/_header.ejs) と同じ作り。閉じるのは _footer.ejs。
+  左の列 = この画面 (今日の差を決める・NE に取り込む CSV・つかいかた) + マスタの入力へ (商品・セット・Amazon SKU)。
+  件数の札 (#rail-n-decide・#rail-n-csv) は画面の JS が入れる (読めないときは出さない)
 %>
 <a class="skip" href="#main">本文へ</a>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
   <defs>
     <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></symbol>
     <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
-    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
     <symbol id="i-cart" viewBox="0 0 24 24"><circle cx="9" cy="20" r="1.5"/><circle cx="18" cy="20" r="1.5"/><path d="M2 3h3l2.6 12.2a1 1 0 0 0 1 .8h9.7a1 1 0 0 0 1-.8L21 7H6"/></symbol>
     <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 4h10a4 4 0 0 1 4 4v12H8a4 4 0 0 1-4-4z"/><path d="M8 9h6M8 13h6"/></symbol>
     <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></symbol>
@@ -17,32 +17,21 @@
     <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.5h.01"/></symbol>
     <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></symbol>
     <symbol id="i-chevr" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
-    <symbol id="i-up" viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></symbol>
-    <symbol id="i-down" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
-    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></symbol>
-    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7 11l5 5 5-5"/><path d="M5 20h14"/></symbol>
     <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
     <symbol id="i-box" viewBox="0 0 24 24"><path d="M21 8l-9-5-9 5 9 5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/></symbol>
     <symbol id="i-tag" viewBox="0 0 24 24"><path d="M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9z"/><path d="M8 8h.01"/></symbol>
     <symbol id="i-ext" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
-    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></symbol>
     <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
-    <symbol id="i-yen" viewBox="0 0 24 24"><path d="M6 4l6 8 6-8M12 12v8M7 13h10M7 17h10"/></symbol>
-    <symbol id="i-truck" viewBox="0 0 24 24"><path d="M3 6h11v10H3zM14 9h4l3 3v4h-7"/><circle cx="7" cy="18" r="1.8"/><circle cx="17" cy="18" r="1.8"/></symbol>
-    <symbol id="i-percent" viewBox="0 0 24 24"><path d="M19 5L5 19"/><circle cx="7" cy="7" r="2.5"/><circle cx="17" cy="17" r="2.5"/></symbol>
-    <symbol id="i-building" viewBox="0 0 24 24"><path d="M3 21h18M5 21V8l6-4v17M11 21V10l8 3v8"/><path d="M8 11h.01M8 15h.01M15 15h.01M15 18h.01"/></symbol>
     <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/></symbol>
-    <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></symbol>
     <symbol id="i-send" viewBox="0 0 24 24"><path d="M21 3L10 14"/><path d="M21 3l-7 18-4-7-7-4z"/></symbol>
-    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></symbol>
-    <symbol id="i-dl" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5"/><path d="M5 20h14"/></symbol>
-    <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></symbol>
-    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></symbol>
     <symbol id="i-scale" viewBox="0 0 24 24"><path d="M12 3v18M5 7h14M5 7l-3 7a4 4 0 0 0 6 0zM19 7l-3 7a4 4 0 0 0 6 0z"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></symbol>
+    <symbol id="i-flask" viewBox="0 0 24 24"><path d="M9 3h6M10 3v6L4.5 18.5A1.7 1.7 0 0 0 6 21h12a1.7 1.7 0 0 0 1.5-2.5L14 9V3"/><path d="M7 15h10"/></symbol>
   </defs>
 </svg>
 <header class="hdr">
-  <div class="brand"><a href="/"><b>B-Faith Portal</b></a><a class="app-pill" href="<%= base %>/">マスタの入力</a></div>
+  <div class="brand"><a href="/"><b>B-Faith Portal</b></a><a class="app-pill" href="<%= base %>/">マスタの判断</a></div>
   <button class="search-trigger" id="open-palette" type="button" aria-haspopup="dialog" aria-keyshortcuts="Control+K">
     <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg><span class="grow">全体から探す (商品・Amazon SKU・操作)</span><span class="kbd" aria-hidden="true">Ctrl</span><span class="kbd" aria-hidden="true">K</span>
   </button>
@@ -53,29 +42,26 @@
   </div>
 </header>
 <div class="app">
-  <nav class="rail" aria-label="マスタの入力の画面">
+  <nav class="rail" aria-label="マスタの判断の画面">
     <%
       const navs = [
-        ['さがす・直す'],
-        ['list', base + '/', 'i-grid', '商品・セット'],
-        ['amazon', base + '/amazon/', 'i-cart', 'Amazon SKU'],
-        ['登録する'],
-        ['new', base + '/new?kind=single', 'i-plus', '新商品の登録'],
-        ['regcsv', base + '/reg-csv', 'i-send', 'NE 登録の CSV'],
-        ['たすけ'],
-        ['decisions', '/apps/master-decisions/', 'i-scale', 'マスタの判断 (NE との差)'],
+        ['NE との差'],
+        ['decide', base + '/', 'i-scale', '今日の差を決める', 'rail-n-decide'],
+        ['csv', base + '/csv', 'i-send', 'NE に取り込む CSV', 'rail-n-csv'],
         ['manual', base + '/manual', 'i-book', 'つかいかた'],
+        ['マスタの入力'],
+        ['me-list', meBase + '/', 'i-grid', '商品・セット'],
+        ['me-amazon', meBase + '/amazon/', 'i-cart', 'Amazon SKU'],
       ];
     %>
     <% for (const n of navs) { %>
       <% if (n.length === 1) { %><div class="grp" aria-hidden="true"><%= n[0] %></div><% continue; } %>
-      <a class="nav<%= nav === n[0] ? ' on' : '' %>" href="<%= n[1] %>" aria-label="<%= n[3] %>"<%- nav === n[0] ? ' aria-current="page"' : '' %>><svg class="ic" aria-hidden="true"><use href="#<%= n[2] %>"/></svg><span class="lbl"><%= n[3] %></span></a>
+      <a class="nav<%= nav === n[0] ? ' on' : '' %>" href="<%= n[1] %>" aria-label="<%= n[3] %>"<%- nav === n[0] ? ' aria-current="page"' : '' %>><svg class="ic" aria-hidden="true"><use href="#<%= n[2] %>"/></svg><span class="lbl"><%= n[3] %></span><% if (n[4]) { %><span class="cnt warn" id="<%= n[4] %>" hidden></span><% } %></a>
     <% } %>
     <div class="keys" aria-label="キーボード">
       <% if (locals.listPage) { %><div><span class="kbd">/</span> この画面で絞る</div><% } %>
       <div><span class="kbd">Ctrl</span><span class="kbd">K</span> 全体から探す</div>
-      <% if (locals.hasSave) { %><div><span class="kbd">Ctrl</span><span class="kbd">S</span> 保存</div><% } %>
-      <% if (locals.listPage) { %><div><span class="kbd">↑</span><span class="kbd">↓</span><span class="kbd">Enter</span> 一覧で開く</div><% } %>
+      <% if (locals.listPage) { %><div><span class="kbd">↑</span><span class="kbd">↓</span> 行を移る</div><div><span class="kbd">Space</span> 選ぶ <span class="kbd">Enter</span> 開く</div><% } %>
       <div><span class="kbd">Esc</span> 閉じる</div>
     </div>
   </nav>

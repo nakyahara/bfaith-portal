@@ -53,9 +53,12 @@ import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFE
 import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
-import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti } from './read.mjs';
+import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError } from './read.mjs';
+import { buildListCsv, csvFileName } from './list-csv.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
 import { readFbaDay, readFbaSku } from './fba-stock.mjs';
+import { readSalesRun, readSalesSku } from './sales-qty.mjs';
+import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
 import { ui } from './ui-format.mjs';
@@ -209,12 +212,31 @@ export function editorGate(req) {
 /** 書き込み用の接続 (この画面だけのロール) が設定されているか */
 const writeConfigured = () => !!process.env.COMPANY_DB_MASTER_EDIT_URL;
 /** kind = 'read' (この画面のロール・無ければ持ち主のロールで読むだけ) / 'write' (この画面のロールだけ) */
-async function connect(kind = 'read') {
+/**
+ * deadline (ms・CSV / 全部コピー = ルートに入った直後に作る。#1627 Codex R2 M1) = 接続の待ちも期限に入れる:
+ *   残りの時間を pg の connectionTimeoutMillis に渡し、さらに残りの時間で打ち切る (遅れて来た接続は閉じる)。過ぎたら reason = 'timeout'
+ */
+const TIMEOUT_WORDS = '時間がかかりすぎました (Company DB への接続を待つ間に期限を過ぎた)。少し待ってからもう一度';
+async function connect(kind = 'read', { deadline = null } = {}) {
   const url = kind === 'write' ? process.env.COMPANY_DB_MASTER_EDIT_URL : (process.env.COMPANY_DB_MASTER_EDIT_URL || process.env.COMPANY_DB_URL);
   if (!url && kind === 'write') return { error: '書き込み用の接続 (COMPANY_DB_MASTER_EDIT_URL・この画面だけのロール) が設定されていないので、保存できません (見るだけ)', reason: 'no_write_role' };
   if (!url) return { error: 'Company DB の接続先が設定されていません (COMPANY_DB_URL)。いまは見ることも保存もできません' };
+  const left = deadline == null ? null : deadline - Date.now();
+  if (left != null && left <= 0) return { error: TIMEOUT_WORDS, reason: 'timeout' };
   try {
-    const client = await pgClientFactory(url, { application_name: 'master-edit' });
+    const opening = pgClientFactory(url, { application_name: 'master-edit', ...(left != null ? { connectionTimeoutMillis: Math.max(1, Math.floor(left)) } : {}) });
+    let client;
+    if (left == null) client = await opening;
+    else {
+      let timer;
+      const late = Symbol('late');
+      const got = await Promise.race([opening, new Promise((ok) => { timer = setTimeout(() => ok(late), left); })]).finally(() => clearTimeout(timer));
+      if (got === late) {
+        opening.then((c) => c && c.end && c.end()).catch(() => {});   // 遅れて来た接続は閉じる
+        return { error: TIMEOUT_WORDS, reason: 'timeout' };
+      }
+      client = got;
+    }
     if (client.on) client.on('error', (e) => console.error(`[master-edit] 接続のエラー: ${e.message}`));   // 切れた接続でプロセスを落とさない
     await client.query(`set statement_timeout = '20s'`);
     await client.query(`set lock_timeout = '10s'`);
@@ -222,13 +244,14 @@ async function connect(kind = 'read') {
     return { client };
   } catch (e) {
     console.error(`[master-edit] Company DB につながらない: ${e && e.message}`);
+    if (deadline != null && Date.now() >= deadline) return { error: TIMEOUT_WORDS, reason: 'timeout' };
     return { error: 'Company DB につながりません。いまは保存できません (つながったら画面を開き直してください)' };
   }
 }
 
 /** 画面: つながらないときも画面は出す (帯で知らせる・保存のボタンは出さない) */
-async function withPgPage(req, res, fn) {
-  const c = await connect();
+async function withPgPage(req, res, fn, { deadline = null } = {}) {
+  const c = await connect('read', { deadline });
   try {
     await fn(c.client ? pgAdapter(c.client) : null, c.error || null);
   } catch (e) {
@@ -237,8 +260,8 @@ async function withPgPage(req, res, fn) {
   } finally { if (c.client) { try { await c.client.end(); } catch { /* */ } } }
 }
 /** API: つながらない = 503 (書き込み用の接続が無い = no_write_role) */
-async function withPgApi(res, fn, kind = 'read') {
-  const c = await connect(kind);
+async function withPgApi(res, fn, kind = 'read', { deadline = null } = {}) {
+  const c = await connect(kind, { deadline });
   if (!c.client) return res.status(503).json({ ok: false, error: c.error, reason: c.reason || 'db_unreachable' });
   try {
     await fn(pgAdapter(c.client));
@@ -278,29 +301,72 @@ const fmt = {
   tax: (v) => (v == null ? '' : String(Math.round(Number(v) * 100))),
 };
 
+/**
+ * 一覧の絞り込み (画面・CSV・コードを全部コピーで同じ)。長い詳細検索の条件は印 (?s=) で来る = 中身に戻す (URL に同じ名前があっても印の中身が勝つ)。
+ * 期限切れ・再起動で消えた = searchExpired。注文残は発注アプリの利用権がある人だけ (無い人の「注文残あり」の絞り込みも使わない = どの商品に注文残があるかも出さない)
+ */
+function listQuery(req) {
+  let query = req.query;
+  let searchExpired = false;
+  if (req.query.s) {
+    const cond = getSearch(String(req.query.s), clock());
+    if (cond) query = { ...req.query, ...cond };
+    else searchExpired = true;
+  }
+  const filters = normalizeFilters(query);
+  const poOk = canSeeBackorders(req);
+  if (!poOk) filters.po = '';
+  return { filters, searchExpired, poOk };
+}
+/**
+ * 参考の値 (注文残 = 発注アプリ・在庫 = ロジザード・FBA (JP) = Company DB の在庫の日次・売れた数 = 商品管理リストの公開の回)。読めなくても一覧は出す (その欄だけ「読めない」)。
+ * deadline (CSV・全部コピー) = 1 つ読むごとに確かめる (過ぎたら ListTimeoutError)
+ */
+async function listExtras(db, poOk, deadline = null) {
+  const backorders = poOk ? readBackorders() : PO_DENIED;
+  checkDeadline(deadline);
+  const stock = await readWarehouseStock({ now: clock() });
+  checkDeadline(deadline);
+  const fba = db ? await readFbaDay(db, { now: clock() }) : null;
+  checkDeadline(deadline);
+  const sales = await readSalesRun({ now: clock() });
+  checkDeadline(deadline);
+  return { backorders, stock, fba, sales };
+}
+/**
+ * 期限のある読み (CSV・全部コピー) の db (#1627 Codex R3 M1): SQL を投げる前に statement_timeout を min(20 秒, 残りの時間) にする
+ * (残りが無ければ投げずに ListTimeoutError)。SQL が statement_timeout で止まった (57014) も ListTimeoutError = 503 (500 にしない)。
+ * 接続はこのリクエストだけの物 (終わりに閉じる) = セッションの設定でよい。一覧・単品の画面は使わない (今のまま 20 秒)
+ */
+const STATEMENT_MAX_MS = 20e3;
+const isStatementTimeout = (e) => !!e && e.code === '57014';
+function deadlineDb(db, deadline) {
+  let last = null;
+  return {
+    async query(t, p) {
+      const left = Math.floor(deadline - Date.now());
+      if (left <= 0) throw new ListTimeoutError();
+      const ms = Math.min(STATEMENT_MAX_MS, left);
+      if (ms !== last) { await db.query(`set statement_timeout = '${ms}ms'`); last = ms; }
+      try { return await db.query(t, p); } catch (e) { if (isStatementTimeout(e)) throw new ListTimeoutError(); throw e; }
+    },
+  };
+}
+/** CSV・全部コピーの件数・時間の上限 (時間は段ごとに確かめる。1 つの文は min(20s, 残りの時間)・deadlineDb)。試験は小さくする */
+const EXPORT_LIMITS = { max: EXPORT_MAX, timeMs: 45e3 };
+export function __setExportLimits(o) { EXPORT_LIMITS.max = (o && o.max) ?? EXPORT_MAX; EXPORT_LIMITS.timeMs = (o && o.timeMs) ?? 45e3; }
+
 router.get('/', (req, res) => {
   // 画面の中のリンクは相対 (sku/… ・manual) = 末尾の / が無いと 1 つ上を指す
   if (!String(req.originalUrl || '').split('?')[0].endsWith('/')) return res.redirect(301, `${req.baseUrl}/`);
   return withPgPage(req, res, async (db, dbError) => {
-    // 長い詳細検索の条件は印 (?s=) で来る = 中身に戻す (URL に同じ名前があっても印の中身が勝つ)。期限切れ・再起動で消えた = 何も出さずに知らせる
-    let query = req.query;
-    let searchExpired = false;
-    if (req.query.s) {
-      const cond = getSearch(String(req.query.s), clock());
-      if (cond) query = { ...req.query, ...cond };
-      else searchExpired = true;
-    }
-    const filters = normalizeFilters(query);
-    // 参考の値 (注文残 = 発注アプリ・在庫 = ロジザード・FBA (JP) = Company DB の在庫の日次)。読めなくても一覧は出す (その欄だけ「読めない」)。
-    // 注文残は発注アプリの利用権がある人だけ (無い人の「注文残あり」の絞り込みも使わない = どの商品に注文残があるかも出さない)
-    const poOk = canSeeBackorders(req);
-    if (!poOk) filters.po = '';
-    const extras = { backorders: poOk ? readBackorders() : PO_DENIED, stock: await readWarehouseStock({ now: clock() }), fba: db ? await readFbaDay(db, { now: clock() }) : null };
+    const { filters, searchExpired, poOk } = listQuery(req);
+    const extras = await listExtras(db, poOk);
     const empty = { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false, notFound: [], multiCut: false };
     const data = db && !searchExpired ? await listSkus(db, filters, { now: new Date(clock()), extras }) : empty;
     const phase = db ? await readCutoverPhase(db) : null;
     const counts = db ? await listCounts(db, { now: new Date(clock()) }) : null;
-    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt });
+    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max });
   });
 });
 /**
@@ -327,6 +393,58 @@ router.post('/api/search', (req, res) => {
   const rest = Object.fromEntries(['q', 'kind', 'state', 'missing', 'reg', 'card', 'diff', 'sort'].filter((k) => f[k]).map((k) => [k, f[k]]));
   const qs = new URLSearchParams({ ...rest, ...(Object.keys(cond).length ? { s: putSearch(cond, clock()) } : {}) }).toString();
   res.json({ ok: true, url: `${req.baseUrl}/${qs ? `?${qs}` : ''}` });
+});
+/**
+ * 絞った一覧の CSV (10/5 中原さん)。今の一覧の URL の条件 (札・絞る欄・詳細検索・印 ?s=・並び) のまま、ページ分けに関係なく全件 (EXPORT_MAX 件まで)。
+ * 見られる人 = 一覧を見られる人 (server.js の requireAppAccess('master-edit'))・注文残の列は発注アプリの利用権がある人だけ
+ */
+const tooManyWords = (data, what) => `${data.atLeast ? `${data.max.toLocaleString('ja-JP')} 件より多く` : `${data.total.toLocaleString('ja-JP')} 件`}あります。${what}は ${data.max.toLocaleString('ja-JP')} 件までです。絞ってから`;
+router.get('/list.csv', (req, res) => {
+  const deadline = Date.now() + EXPORT_LIMITS.timeMs;   // ルートに入った直後から (接続の待ち・参考の値の読み込みも入れる。#1627 Codex R2 M1)
+  return withPgPage(req, res, async (db, dbError) => {
+  const text = (status, msg) => res.status(status).type('text/plain; charset=utf-8').send(msg);
+  if (!db) return text(503, dbError || 'Company DB につながりません');
+  const { filters, searchExpired, poOk } = listQuery(req);
+  if (searchExpired) return text(410, '条件の期限が切れました。一覧で検索し直してから CSV を出してください');
+  let data; let extras;
+  const tdb = deadlineDb(db, deadline);
+  try {
+    extras = await listExtras(tdb, poOk, deadline);
+    data = await listSkus(tdb, filters, { now: new Date(clock()), extras, mode: 'all', max: EXPORT_LIMITS.max, deadline });
+  } catch (e) {
+    if (e instanceof ListTimeoutError || isStatementTimeout(e)) return text(503, `時間がかかりすぎました (${EXPORT_LIMITS.timeMs / 1000} 秒)。絞ってからもう一度出してください`);
+    throw e;
+  }
+  if (data.tooMany) return text(413, `${tooManyWords(data, 'CSV ')}出してください`);
+  const body = buildListCsv(data, extras, { poOk, nowMs: clock(), regStates: REG_STATES });
+  const name = csvFileName(clock());
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="${name}"; filename*=UTF-8''${encodeURIComponent(name)}`);
+  res.set('Cache-Control', 'no-store');
+  res.send(body);
+  }, { deadline });
+});
+/** 絞った一覧の商品コードを全部 (コピーのボタン)。{ ok, codes, total } / 413 (件数の上限) / 410 (条件の期限切れ) / 503 */
+router.get('/api/codes', (req, res) => {
+  const deadline = Date.now() + EXPORT_LIMITS.timeMs;   // ルートに入った直後から (接続の待ちも入れる)
+  return withPgApi(res, async (db) => {
+  const { filters, searchExpired, poOk } = listQuery(req);
+  if (searchExpired) return res.status(410).json({ ok: false, error: '条件の期限が切れました。検索し直してください' });
+  // 在庫の範囲・注文残ありで絞っているときは、一覧と同じ参考の値で絞る (中身は読まない)
+  let data;
+  const tdb = deadlineDb(db, deadline);
+  try {
+    const extras = filters.stock_min || filters.stock_max || filters.po ? await listExtras(tdb, poOk, deadline) : {};
+    data = await listSkus(tdb, filters, { now: new Date(clock()), extras, mode: 'codes', max: EXPORT_LIMITS.max, deadline });
+  } catch (e) {
+    // 接続の待ちのタイムアウトと同じ形 (reason = timeout。#1627 Codex R3 Low)
+    if (e instanceof ListTimeoutError || isStatementTimeout(e)) return res.status(503).json({ ok: false, error: '時間がかかりすぎました。絞ってからもう一度', reason: 'timeout' });
+    throw e;
+  }
+  if (data.tooMany) return res.status(413).json({ ok: false, error: tooManyWords(data, '全部コピー'), total: data.total, atLeast: !!data.atLeast, max: data.max });
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, codes: data.codes, total: data.total });
+  }, 'read', { deadline });
 });
 router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), ui2: true, nav: 'manual', MAX_COMPONENTS }));
 
@@ -364,6 +482,8 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     buildable: page.cur.sku_kind === 'set' ? buildableOf(stock, (page.cur.components || []).map((x) => ({ code_norm: normSku(x.code), qty: x.qty }))) : null,
     // FBA (JP) = Company DB の在庫の日次 (最新の complete の日・1 × 1 の出品の合計と内訳・まとめ売り / セットの出品は別に)
     fba: await readFbaSku(db, await readFbaDay(db, { now: clock() }), page.cur.sku_id),
+    // 売れた数 (7 日・30 日) = 商品管理リストの公開の回 (発注アプリと同じ数)・FBA / FBA 以外・モール別 (速報)
+    sales: await readSalesSku(await readSalesRun({ now: clock() }), page.cur.code),
   } : null;
   res.render(view('sku.ejs'), {
     ...pageLocals(req, page ? page.phase : null), ui2: true, nav: 'list', dbError, page, FIELD_DEFS: page ? fieldsOf(page.cur.sku_kind) : {}, REG_FIELDS: page ? (REG_CSV_FIELDS[page.cur.sku_kind] || []) : [], code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,

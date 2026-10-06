@@ -640,7 +640,7 @@ await ta('[22] 画面の JS を動かす: ファイルの状態ごとのボタ�
   const before = calls.filter((c) => c[0] === 'api/csv/summary').length;
   clickable.find((e) => e.dataset.check === '9').onclick({ stopPropagation() {} });
   await settle();
-  assert.equal(el('msg').className, 'msg err');
+  assert.equal(el('msg').className, 'msgline err');   // 新しいデザイン (10/5) の知らせの行
   assert.match(el('msg').textContent, /使えなくしました/); assert.match(el('msg').textContent, /x1/);
   assert.equal(calls.filter((c) => c[0] === 'api/csv/summary').length, before + 1, '確かめで外れた後に一覧を読み直していない');
 });
@@ -785,6 +785,88 @@ await ta('[19] migration の権限: watcher が先にいる DB (本番と同じ)
     assert.deepEqual(r, { s: true, i: false, u: false, d: false }, t);
   }
   await p.close();
+});
+
+await ta('[26] 2026-10-05: 名前 = 商品コード は承認されていても CSV に入れない (judge = NE の画面へ name_is_code・buildCsv も拒む) / 税率は % の整数 (10 / 8) だけ・0.1 のような値は CSV に出ない / 売価・原価の 0 は書かない', async () => {
+  const run = 'mc_20300301T000000001Z_abcdef';
+  const neCodes = { run, map: new Map([['product|akadama-big-2l-2', { state: 'ok', ne_code: 'akadama-big-2l-2' }], ['product|abc-1', { state: 'ok', ne_code: 'ABC-1' }], ['product|t-1', { state: 'ok', ne_code: 't-1' }]]) };
+  const u = (code, col, value, kind = 'set') => ({ fingerprint: H(`26-${code}-${col}`), event_id: 1, subject_key: `value:${code}`, code_norm: code, col, child: null, last_seen_run: run, done: false,
+    print: { sku_kind: kind, n: null, c: value }, target: { subject_key: `value:${code}`, col, child: null, value } });
+  const j = (x) => csvMod.judge(x, { run, reservations: new Map(), neCodes });
+  for (const [x, why] of [[u('akadama-big-2l-2', 'name', 'akadama-big-2l-2'), 'name_is_code'], [u('akadama-big-2l-2', 'name', 'AKADAMA-BIG-2L-2'), 'name_is_code'],
+    [u('abc-1', 'name', 'ABC-1', 'single'), 'name_is_code'], [u('abc-1', 'name', 'ａｂｃ－１', 'single'), 'name_is_code'],
+    [u('akadama-big-2l-2', 'standard_price_jpy', 0), 'yen_range'], [u('abc-1', 'cost', 0, 'single'), 'yen_range'], [u('abc-1', 'tax_rate', 10, 'single'), 'tax_value']]) {
+    const r = j(x);
+    assert.deepEqual([r.status, r.reason], ['ne_screen', why], `${x.code_norm} ${x.col} ${x.target.value}`);
+  }
+  assert.deepEqual([j(u('akadama-big-2l-2', 'name', '赤玉土 大粒 2L 2 個')).status, j(u('akadama-big-2l-2', 'name', '赤玉土 大粒 2L 2 個')).cell], ['csv', '赤玉土 大粒 2L 2 個']);
+  // 税率: Company DB の 0.1 / 0.08 → NE の消費税率 (%) 10 / 8
+  assert.deepEqual([0.1, 0.08].map((v) => j(u('t-1', 'tax_rate', v, 'single'))).map((r) => [r.status, r.cell]), [['csv', '10'], ['csv', '8']]);
+  // buildCsv の二重の守り (judge の後で値が崩れても CSV にしない)
+  assert.equal(buildCsv(COLUMNS['products:tax_rate'], [{ ne_code: 't-1', cell: '10' }, { ne_code: 't-2', cell: '8' }]).bytes.toString('utf8'), 'syohin_code,tax_rate\r\nt-1,10\r\nt-2,8\r\n');
+  for (const bad of ['0.1', '0.08', '10.0', '10%', '', '0']) assert.throws(() => buildCsv(COLUMNS['products:tax_rate'], [{ ne_code: 't-1', cell: bad }]), /値の形が違う/, bad);
+  for (const k of ['products:standard_price_jpy', 'products:cost', 'sets:standard_price_jpy']) for (const bad of ['0', '0.00', '-1', '1.5']) assert.throws(() => buildCsv(COLUMNS[k], [{ ne_code: 'x1', cell: bad }]), /値の形が違う/, `${k} ${bad}`);
+  for (const k of ['products:name', 'sets:name']) assert.throws(() => buildCsv(COLUMNS[k], [{ ne_code: 'Akadama-1', cell: 'akadama-1' }]), /名前が商品コードと同じ/, k);
+  // 列の表の全部の値の書き方が cellRe の形に合う (税率・円の列)
+  for (const [k, s] of Object.entries(COLUMNS)) if (s.cellRe) for (const v of [0.1, 0.08, 1, 1980, 999999999]) { const c = s.cell(v); if (c.ok) assert.match(c.cell, s.cellRe, `${k} ${v}`); }
+});
+
+await ta('[27] 直す前に作った・確かめた CSV (名前 = コード) は、確かめを押さなくても配らない (unsafe)・確かめると void・申告できない / 安全な古いファイルは今までどおり (#1629 Codex R1 High)', async () => {
+  const f = await freshDb();
+  const day = '2030-03-01', nowMs = at(day, 10);
+  const run1 = runId(day);
+  await writeDecisions(f.db, { compareRunId: run1, observedAt: new Date(at(day, 8)).toISOString(), decisions: [C.a001, C.q017, C.t001] });
+  const ev = async (c) => Number((await f.pg.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'setup@test') returning event_id`,
+    [c.fingerprint, JSON.stringify({ subject_key: c.subject_key, col: c.col, child: null, value: 'x' })])).rows[0].event_id);
+  // 直す前の作り方 = 照合が出した「NE を akadama-1 に」をそのまま CSV にした (今の buildCsv は作らない = byte 列を手で)
+  const oldFile = async (c, code, cell, state, saved = null) => {
+    const bytes = saved || Buffer.from(`syohin_code,syohin_name\r\n${code},${cell}\r\n`, 'utf8');
+    const e = (await f.pg.query(`insert into ops.ne_csv_exports (kind, col, ne_column, converter_version, encoding, trial, row_count, sha256, file_bytes, compare_run_id, created_by, created_at, state, checked_at, checked_run, checked_by)
+      values ('products', 'name', 'syohin_name', 'ne-csv-v2', 'utf8', true, 1, $1, $2, $3, 'old@test', $4, $5, $6, $7, $8) returning export_id`,
+    [sha(bytes), bytes, run1, new Date(at(day, 9)).toISOString(), state, state === 'checked' ? new Date(at(day, 9)).toISOString() : null, state === 'checked' ? run1 : null, state === 'checked' ? 'old@test' : null])).rows[0].export_id;
+    await f.pg.query(`insert into ops.ne_csv_export_rows (export_id, source, approved_event_id, fingerprint, code_norm, col, child, ne_code, target, cell) values ($1, 'fix_ne', $2, $3, $4, 'name', null, $5, $6::jsonb, $7)`,
+      [e, await ev(c), c.fingerprint, code.toLowerCase(), code, JSON.stringify({ subject_key: c.subject_key, col: 'name', child: null, value: cell }), cell]);
+    return Number(e);
+  };
+  const made = await oldFile(C.a001, 'akadama-1', 'akadama-1', 'made');
+  const checked = await oldFile(C.q017, 'akadama-2', 'AKADAMA-2', 'checked');
+  const safe = await oldFile(C.t001, 't001', '本物の名前', 'made');
+  // 配らない (確かめを押していなくても・確かめ済みでも)
+  for (const id of [made, checked]) {
+    const r = await csvMod.exportFile(f.db, id, { nowMs });
+    assert.deepEqual([r.state, r.reason, r.bytes], ['unsafe', 'name_is_code', null], String(id));
+  }
+  assert.equal((await csvMod.exportFile(f.db, safe, { nowMs })).bytes.toString('utf8'), 'syohin_code,syohin_name\r\nt001,本物の名前\r\n');   // 安全な古いファイルはそのまま
+  // 確かめ済みのファイルも申告できない
+  await assert.rejects(csvMod.declareExport(f.db, { actor: 'naka@test', exportId: checked, result: 'ok', nowMs }), (e) => e.code === 'unsafe' || /今の決まりでは使えません/.test(e.message));
+  // 行は安全でも、保存した byte 列が行から作る CSV と違う確かめ済みのファイル = 申告を拒む・配らない (#1629 Codex R2)
+  const differ = await oldFile(C.a001, 't002', '本物の名前2', 'checked', Buffer.from('syohin_code,syohin_name\r\nt002,akadama-1\r\n', 'utf8'));
+  await assert.rejects(csvMod.declareExport(f.db, { actor: 'naka@test', exportId: differ, result: 'ok', nowMs }), /bytes_differ/);
+  const df = await csvMod.exportFile(f.db, differ, { nowMs });
+  assert.deepEqual([df.state, df.reason], ['unsafe', 'bytes_differ']);
+  assert.equal((await f.pg.query('select count(*)::int as n from ops.ne_csv_attempts where export_id = $1', [differ])).rows[0].n, 0);   // 申告の試みも残さない
+  // 確かめる = 外れて void (予約を外す = 作り直せる)
+  const ck = await csvMod.checkExport(f.db, { actor: 'naka@test', exportId: made, nowMs });
+  assert.deepEqual([ck.passed, ck.voided, ck.failures.map((x) => x.reason)], [false, true, ['unsafe:name_is_code']]);
+  assert.equal((await f.pg.query('select state from ops.ne_csv_exports where export_id = $1', [made])).rows[0].state, 'void');
+  // 値の形が崩れた古いファイル (税率 0.1) も配らない
+  assert.equal(csvMod.unsafeReason({ kind: 'products', col: 'tax_rate' }, [{ ne_code: 't-1', code_norm: 't-1', cell: '0.1' }]), 'cell_format');
+  assert.equal(csvMod.unsafeReason({ kind: 'products', col: 'tax_rate' }, [{ ne_code: 't-1', code_norm: 't-1', cell: '10' }]), null);
+  // 保存した byte 列が今の作り方と違う = 配らない
+  assert.equal(csvMod.unsafeReason({ kind: 'products', col: 'name' }, [{ ne_code: 't001', code_norm: 't001', cell: '名前' }], Buffer.from('syohin_code,syohin_name\r\nt001,別\r\n')), 'bytes_differ');
+  await f.pg.close();
+  // HTTP: 名前 = コードのファイルは 410 (unsafe)
+  const e2 = await (async () => {
+    const run2 = runId('2030-01-10');
+    const bytes = Buffer.from('syohin_code,syohin_name\r\nzz-1,ZZ-1\r\n', 'utf8');
+    const id = Number((await pg.query(`insert into ops.ne_csv_exports (kind, col, ne_column, converter_version, encoding, trial, row_count, sha256, file_bytes, compare_run_id, created_by, state)
+      values ('products', 'name', 'syohin_name', 'ne-csv-v2', 'utf8', true, 1, $1, $2, $3, 'old@test', 'made') returning export_id`, [sha(bytes), bytes, run2])).rows[0].export_id);
+    await pg.query(`insert into ops.ne_csv_export_rows (export_id, source, approved_event_id, fingerprint, code_norm, col, child, ne_code, target, cell) values ($1, 'fix_ne', $2, $3, 'zz-1', 'name', null, 'zz-1', $4::jsonb, 'ZZ-1')`,
+      [id, EV.a001, C.a001.fingerprint, JSON.stringify({ subject_key: 'value:zz-1', col: 'name', child: null, value: 'ZZ-1' })]);
+    return id;
+  })();
+  const r = await call('GET', `/api/csv/exports/${e2}/file`);
+  assert.deepEqual([r.status, r.j?.reason, r.j?.detail], [410, 'unsafe', 'name_is_code']);
 });
 
 server.close();

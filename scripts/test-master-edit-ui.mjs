@@ -27,8 +27,11 @@
  *  22 注文残は発注アプリの利用権がある人だけ (列・絞り込み・内訳) (#1620 Codex R1 M3)
  *  23 詳細検索の長い条件 = 本物の HTTP で 500 件の境目・印 (?s=)・GET なら 431・Origin と JSON の守り・期限切れ (#1620 Codex R1 M2)
  *  24 FBA (JP) の在庫 (参考・Company DB の在庫の日次): 一覧の列と見出しの時刻・1 × 1 の出品だけ・「—」と 0・単品の画面の内訳とまとめ売り / セットの出品・古い (26 時間) / 読めない (権限なし)・流し直しで戻る (10/5)
- *  25〜29 第 2 段 (10/5): 新商品の登録 (単品・セット)・Amazon SKU・NE 登録の CSV・変更の記録 = 未保存 (data-dirty-field だけ)・離れるときの確認・保存 → 読み直し / できた商品の画面へ・
+ *  25 売れた数 (参考・商品管理リストの公開の回): 一覧の列と「M/D まで」・セット / 無い商品は「—」・単品の画面の FBA / FBA 以外・モール別・古い / 読めない (10/5)
+ *  26 区分の列・コードのコピーのボタン (クリップボード・知らせ・行を開かない・キーボード)・全部コピー (絞った全件)・CSV のリンク (ダウンロード)・区分の順 (10/5)
+ *  35〜44 第 2 段 (10/5・#1628): 新商品の登録 (単品・セット)・Amazon SKU・NE 登録の CSV・変更の記録 = 未保存 (data-dirty-field だけ)・離れるときの確認・保存 → 読み直し / できた商品の画面へ・
  *        削除は 1 回だけ確かめる・申告はファイルを落として sha256 を照合・1440 / 1280 / 1024 / 150% で横にはみ出さない
+ *        (41〜44 = 構成品の照合・カードを作らないときの欄・確かめ直しの上限・Yahoo! の残値)
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -620,7 +623,7 @@ await ta('[20] 注文残 (発注アプリ)・在庫 (ロジザード) (10/5): �
   assert.deepEqual([c.s002.stock, c.s002.po], ['5', '4']);
   assert.equal(c.set001.stock, '5作れる', 'セット = 構成品から作れる数 (s001 10 ÷ 1・s002 5 ÷ 1 の小さい方)');
   assert.deepEqual([c.k006.stock, c.k006.po], ['0', ''], '写しに無い = 0');
-  const th = await p.textContent('#list-tbl thead');
+  const th = await p.textContent('#th-stock');
   assert.match(th, /在庫\d{2}:\d{2}/, '見出しに写しの時刻');
   assert.doesNotMatch(th, /古い|読めない/);
   if (SHOT2) await p.screenshot({ path: `${SHOT2}/一覧_在庫と注文残の列.png`, fullPage: true });
@@ -644,11 +647,11 @@ await ta('[20] 注文残 (発注アプリ)・在庫 (ロジザード) (10/5): �
   assert.equal(await p.textContent('#ref-stock'), '5');
   assert.match(await p.textContent('#ref-box'), /作れる数/);
   assert.equal(await p.locator('#ref-po').count(), 0, 'セットは注文残を出さない (発注は単品)');
-  // 古い (2 時間より前)
-  mirrorDb.prepare('update mirror_logizard_stock set captured_at = ?').run(new Date(Date.now() - 3 * 3600e3).toISOString());
+  // 古い (26 時間前 = 写しの時間 (09〜18 時) の外でも古い。18 時台の写しは次の朝 10 時まで古くない = 3 時間前だと夜は古くならない)
+  mirrorDb.prepare('update mirror_logizard_stock set captured_at = ?').run(new Date(Date.now() - 26 * 3600e3).toISOString());
   __clearStockCache();
   await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001' }));
-  assert.match(await p.textContent('#list-tbl thead'), /古い/);
+  assert.match(await p.textContent('#th-stock'), /古い/);
   await p.goto(B + '/sku/k001');
   assert.match(await p.textContent('#ref-stock-when'), /古い/);
   // 読めない (写しが無い)
@@ -656,7 +659,7 @@ await ta('[20] 注文残 (発注アプリ)・在庫 (ロジザード) (10/5): �
   mirrorDb.prepare('delete from mirror_logizard_stock').run();
   __clearStockCache();
   await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001' }));
-  assert.match(await p.textContent('#list-tbl thead'), /読めない/);
+  assert.match(await p.textContent('#th-stock'), /読めない/);
   assert.equal((await cells(p))[0].stock, '—');
   assert.deepEqual(await q({ stock_min: '1' }), [], '読めないときは在庫の範囲で当てない');
   await p.goto(B + '/sku/k001');
@@ -673,7 +676,7 @@ await ta('[21] 在庫の範囲で絞る = 一覧に出す値 (セットは作れ
   assert.deepEqual(await q({ codes: 'set001', stock_min: '1' }), ['set001'], '作れる数 5 は 1 以上に入る');
   assert.deepEqual(await q({ codes: 'set001', stock_max: '0' }), [], '作れる数 5 は 0 以下に入らない');
   assert.deepEqual(await q({ codes: 'set001\ns001\ns002', stock_min: '5', stock_max: '5' }), ['s002', 'set001'], '単品は在庫・セットは作れる数');
-  assert.equal(await p.textContent('#list-tbl tbody tr:has-text("set001") td:nth-child(9)'), '5作れる');   // 9 番目 = 在庫 (4 番目に登録日の列・0057)
+  assert.equal(await p.textContent('#list-tbl tbody tr:has-text("set001") td[data-col="stock"]'), '5作れる');
 });
 
 await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 Codex R1 M3): 無い人 = 列・絞り込み・内訳を出さず「権限がないので出せません」', async (p) => {
@@ -682,7 +685,7 @@ await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 
     await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns002' }));
     assert.doesNotMatch(await p.textContent('#list-tbl thead'), /注文残/, '列を出さない');
     assert.deepEqual((await cells(p)).map((x) => x.code), ['k001', 's002']);
-    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td').count(), 11, '行の欄も 1 つ少ない (12 → 11。FBA (JP) の列を足した)');
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td').count(), 13, '行の欄も 1 つ少ない (14 → 13。FBA (JP)・区分・売れた数の列を足した)');
     assert.equal(await p.locator('input[name="po"]').count(), 0, '「注文残あり」を出さない');
     assert.match(await p.textContent('#po-denied'), /注文残 \(発注アプリの権限がないので出せません\)/);
     // URL に po=1 を付けても、注文残のある商品だけに絞らない (どの商品に注文残があるかを出さない)
@@ -765,6 +768,111 @@ await ta('[24] FBA (JP) の在庫 (10/5): 一覧の列 (参考・灰色)・見�
   assert.equal((await cells(p))[0].fba, '24', '流し直した = 読める');
 });
 
+await ta('[25] 売れた数 (10/5): 一覧の列 (参考・灰色・見出しの下に「M/D まで」)・セット / 商品管理リストに無い = 「—」・単品の画面の FBA / FBA 以外・モール別・古い / 読めない', async (p) => {
+  // 写し (initMirrorDB の本物の表): 商品管理リストの公開の回 = 前日まで
+  const ymd = (d) => new Date(Date.now() + 9 * 3600e3 - d * 864e5).toISOString().slice(0, 10);
+  const md = (s) => `${Number(s.slice(5, 7))}/${Number(s.slice(8, 10))}`;
+  const y1 = ymd(1);
+  const now = new Date().toISOString();
+  mirrorDb.prepare(`insert or replace into mirror_pml_published (id, run_id, status, as_of_date, src_velocity_as_of, synced_at) values (1, 'pml_ui_sales', 'ok', ?, ?, ?)`).run(ymd(0), y1, now);
+  const ins = mirrorDb.prepare(`insert into mirror_pml_snapshot_rows (run_id, 商品コード, 販売数7日_FBA, 販売数7日_FBA以外, 販売数7日_合計, 販売数30日_FBA, 販売数30日_FBA以外, 販売数30日_合計) values ('pml_ui_sales', ?, ?, ?, ?, ?, ?, ?)`);
+  ins.run('K001', 3, 9, 12, 10, 38, 48); ins.run('k002', 0, 0, 0, 0, 0, 0); ins.run('set001', 0, 0, 0, 0, 0, 0);
+  const mi = mirrorDb.prepare('insert into mirror_f_sales_velocity_by_product_mall (商品コード, mall, qty_7d, qty_30d, as_of_date, synced_at) values (?, ?, ?, ?, ?, ?)');
+  mi.run('k001', 'rakuten', 6, 20, y1, now); mi.run('k001', 'amazon_fba', 3, 10, y1, now); mi.run('k001', 'yahoo', 3, 18, y1, now);
+  try {
+    await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\nk002\nk006\nset001' }));
+    const th = p.locator('#th-sales');
+    assert.equal((await th.textContent()).trim(), `売れた 7日/30日${md(y1)} まで`);
+    assert.equal(await th.evaluate((x) => x.className), 'n ref');
+    const cell = (code) => p.locator(`#list-tbl tbody tr:has(a.rowlink:text-is("${code}")) td[data-col="sales"]`).textContent().then((x) => x.trim());
+    assert.deepEqual([await cell('k001'), await cell('k002'), await cell('k006'), await cell('set001')], ['12 / 48', '0 / 0', '—', '—'], 'k006 = 商品管理リストに無い / set001 = 構成品に入る');
+    const [sStyle, stStyle] = await p.evaluate(() => {
+      const tr = document.querySelector('#list-tbl tbody tr');
+      const pick = (el) => { const s = getComputedStyle(el); return [s.color, s.fontSize]; };
+      return [pick(tr.querySelector('td[data-col="sales"]')), pick(tr.querySelector('td[data-col="stock"]'))];
+    });
+    assert.deepEqual(sStyle, stStyle, '売れた数の列は在庫の列と同じ灰色・大きさ');
+    if (SHOT2) await p.screenshot({ path: `${SHOT2}/一覧_売れた数の列.png`, fullPage: true });
+    await p.goto(B + '/sku/k001');
+    assert.equal(await p.textContent('#ref-sales'), '12 / 48');
+    assert.match(await p.textContent('#ref-sales-asof'), new RegExp(`^${md(y1)} \\(.\\) まで \\(7 日 = ${md(ymd(7))}〜・30 日 = ${md(ymd(30))}〜・今日は入れない\\)`));
+    const rows = (sel) => p.$$eval(`${sel} tbody tr`, (trs) => trs.map((tr) => [...tr.children].map((td) => td.textContent.trim())));
+    assert.deepEqual(await rows('#ref-sales-parts'), [['Amazon FBA', '3', '10'], ['FBA 以外 (NE の受注)', '9', '38']]);
+    assert.deepEqual(await rows('#ref-sales-malls'), [['楽天', '6', '20'], ['Yahoo!', '3', '18'], ['Amazon FBA', '3', '10']], '多い順・名前は dim_mall');
+    if (SHOT2) await p.screenshot({ path: `${SHOT2}/単品_売れた数.png`, fullPage: true });
+    await p.goto(B + '/sku/set001');
+    assert.match(await p.textContent('#ref-sales-set'), /セットで売れた分は構成品の数に入る/);
+    // 古い (前日までになっていない・正午の前でも 3 日前は古い)
+    mirrorDb.prepare('update mirror_pml_published set src_velocity_as_of = ? where id = 1').run(ymd(3));
+    await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001' }));
+    assert.equal((await p.textContent('#th-sales')).trim(), `売れた 7日/30日古い ${md(ymd(3))} まで`);
+    assert.equal(await p.locator('#th-sales').evaluate((x) => x.className), 'n ref stale');
+    // 読めない (公開の回が無い)
+    mirrorDb.prepare('delete from mirror_pml_published').run();
+    await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001' }));
+    assert.equal((await p.textContent('#th-sales')).trim(), '売れた 7日/30日読めない');
+    assert.equal(await p.locator('#th-sales').evaluate((x) => x.className), 'n ref bad');
+    assert.equal(await cell('k001'), '—');
+    await p.goto(B + '/sku/k001');
+    assert.match(await p.textContent('#ref-sales-when'), /^読めない/);
+  } finally {
+    mirrorDb.prepare('delete from mirror_pml_published').run();
+    mirrorDb.prepare(`delete from mirror_pml_snapshot_rows where run_id = 'pml_ui_sales'`).run();
+    mirrorDb.prepare('delete from mirror_f_sales_velocity_by_product_mall').run();
+  }
+});
+
+await ta('[26] 区分の列・コードのコピー (10/5): 行のボタン = クリップボードに入り「コピーしました」を 1 回・行は開かない・キーボードでも / 全部コピー = 絞った全件 (ページに関係なく・改行区切り) / CSV のリンクで今の絞り込みの CSV が落ちる', async (p, ctx) => {
+  await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: new URL(B).origin });
+  await p.goto(B + '/?kind=single');
+  const url0 = p.url();
+  // 区分の列 (札)
+  const kindOf = (code) => p.locator(`#list-tbl tbody tr:has(a.rowlink:text-is("${code}")) td[data-col="kind"]`).textContent().then((x) => x.replace(/\s+/g, ' ').trim());
+  assert.equal(await kindOf('k001'), '単品');
+  // 行のコピーのボタン: 押す = クリップボード・知らせ 1 回・行は開かない (覆いのリンクより上)
+  const btn = p.locator('#list-tbl tbody tr:has(a.rowlink:text-is("k002")) button.copybtn');
+  assert.equal(await btn.getAttribute('aria-label'), '商品コード k002 をコピー');
+  await btn.click();
+  await p.waitForFunction(() => document.querySelector('#toast').classList.contains('on'));
+  assert.equal(await p.textContent('#toast-t'), 'コピーしました: k002');
+  assert.equal(await p.evaluate(() => navigator.clipboard.readText()), 'k002');
+  assert.equal(p.url(), url0, '行を開かない');
+  assert.equal(await p.locator('#toast[role="status"]').count(), 1, '知らせは読み上げの場所 (role=status) 1 つ');
+  // キーボード: ボタンに Tab で来て Enter
+  await p.locator('#list-tbl tbody tr:has(a.rowlink:text-is("k003")) a.rowlink').focus();
+  await p.keyboard.press('Tab');
+  assert.equal(await p.evaluate(() => document.activeElement.getAttribute('aria-label')), '商品コード k003 をコピー');
+  await p.keyboard.press('Enter');
+  await p.waitForFunction(() => document.querySelector('#toast-t').textContent === 'コピーしました: k003');
+  assert.equal(await p.evaluate(() => navigator.clipboard.readText()), 'k003');
+  assert.equal(p.url(), url0);
+  // 全部コピー = 絞った全件 (サーバーの一覧の全件と同じ・並びも同じ)
+  const total = Number(await p.getAttribute('#copy-all', 'data-n'));
+  assert.ok(total > 0);
+  await p.click('#copy-all');
+  await p.waitForFunction(() => /件 \(1 行 1 つ\)$/.test(document.querySelector('#toast-t').textContent));
+  assert.equal(await p.textContent('#toast-t'), `コピーしました: 商品コード ${total} 件 (1 行 1 つ)`);
+  const clip = await p.evaluate(() => navigator.clipboard.readText());
+  const want = (await (await fetch(B + '/api/codes?kind=single')).json()).codes;
+  assert.deepEqual(clip.split(/\r?\n/), want, '1 行 1 つ (Windows のクリップボードは CRLF で返す)');
+  assert.equal(want.length, total);
+  assert.equal(await p.locator('#copy-all').isDisabled(), false, '終わったらまた押せる');
+  // CSV のリンク = 今の絞り込みのまま (ダウンロード)
+  const [dl] = await Promise.all([p.waitForEvent('download'), p.click('#csv-link')]);
+  assert.match(dl.suggestedFilename(), /^master-list_\d{8}-\d{4}\.csv$/);
+  const file = await dl.path();
+  const buf = fs.readFileSync(file);
+  assert.deepEqual([...buf.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+  const lines = buf.subarray(3).toString('utf8').trimEnd().split('\r\n');
+  assert.equal(lines.length, total + 1, '見出し + 絞った全件');
+  assert.match(lines[0], /^"商品コード","区分",/);
+  await dl.delete();
+  // 区分の順の並び (札で選ぶ)
+  await p.goto(B + '/?sort=kind');
+  const order = await p.$$eval('#list-tbl tbody td[data-col="kind"]', (tds) => tds.map((td) => td.textContent.trim().split(/\s/)[0]));
+  assert.ok(order.indexOf('セット') > order.lastIndexOf('単品'), '単品 → セット');
+});
+
 await ta('[23] 詳細検索の長い条件 (#1620 Codex R1 M2): 本物の HTTP で商品コード 500 件 = 印 (?s=) で開ける・501 件 = 500 件まで・GET に載せると 431・Origin と JSON の守り・期限切れ', async (p) => {
   const origin = new URL(B).origin;
   const code30 = (i) => `nope-${String(i).padStart(4, '0')}-${'x'.repeat(30)}`.slice(0, 30);
@@ -819,7 +927,7 @@ await ta('[23] 詳細検索の長い条件 (#1620 Codex R1 M2): 本物の HTTP �
 const skuRow = async (code) => (await pg.query('select s.name, s.standard_price_jpy::int as price, s.tax_rate::float8 as tax, s.shipping_code from core.skus s where s.code = $1', [code])).rows[0];
 const mapOf = async (sku) => (await pg.query('select m.name, m.state from core.amazon_sku_maps m where m.seller_sku = $1', [sku])).rows[0];
 
-await ta('[25] 新商品の登録 (単品・10/5): あと N つ (① がそろうまで押せない)・① を押すとその欄へ・コードをその場で確かめる・理由は数えない・離れるときの確認 (左の列・種類の札)・Ctrl+S で下書き → できた商品の画面へ (知らせ・戻る 1 回で一覧)', async (p) => {
+await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろうまで押せない)・① を押すとその欄へ・コードをその場で確かめる・理由は数えない・離れるときの確認 (左の列・種類の札)・Ctrl+S で下書き → できた商品の画面へ (知らせ・戻る 1 回で一覧)', async (p) => {
   await p.goto(B + '/');
   await Promise.all([p.waitForNavigation(), p.click('.ph-actions a:has-text("新しい単品")')]);
   assert.match(p.url(), /new\?kind=single$/);
@@ -876,7 +984,7 @@ await ta('[25] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   assert.match(p.url(), /master-edit\/$/, '戻る 1 回で一覧 (入力の途中の画面へは戻らない)');
 });
 
-await ta('[26] 新商品の登録 (セット・10/5): 空の行は数えない・構成品のコードで名前と計算の見込み (8% と 10% = 8%・分類は小さい番号・原価の合計)・並べ替えで読み上げの名前・あと N つ', async (p) => {
+await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない・構成品のコードで名前と計算の見込み (8% と 10% = 8%・分類は小さい番号・原価の合計)・並べ替えで読み上げの名前・あと N つ', async (p) => {
   await p.goto(B + '/new?kind=set');
   assert.equal(await dirty(p), 0, '空の 2 行は数えない');
   assert.match(await p.textContent('#remain'), /あと\s*5\s*つ/);
@@ -899,7 +1007,7 @@ await ta('[26] 新商品の登録 (セット・10/5): 空の行は数えない�
   const ovr = p.locator('#f-set_sales_class_override');
   assert.equal(await ovr.isDisabled(), true, '導ける間は上書きを押せない');
   assert.match(await p.textContent('#override-hint'), /導けるので、上書きはできません/);
-  // 売上分類が未入力の構成品 (ui-new-1 = [25] で分類を入れずに登録) = 導けない = 上書きで決める
+  // 売上分類が未入力の構成品 (ui-new-1 = [35] で分類を入れずに登録) = 導けない = 上書きで決める
   await rows.nth(0).locator('.c-code').fill('ui-new-1');
   await rows.nth(0).locator('.c-code').press('Tab');
   await p.waitForFunction(() => /UI 新商品 1/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
@@ -943,7 +1051,7 @@ await ta('[26] 新商品の登録 (セット・10/5): 空の行は数えない�
   assert.equal(await p.isDisabled('#save'), false, '上書きを空にすれば保存できる');
 });
 
-await ta('[30] 新商品の登録 (#1628 Codex R2 M2): カードを作らないでも値の残る欄は隠さない (保存のときに確かめる)・カードの欄の誤りは開いてその欄へ・空にすると畳む', async (p) => {
+await ta('[40] 新商品の登録 (#1628 Codex R2 M2): カードを作らないでも値の残る欄は隠さない (保存のときに確かめる)・カードの欄の誤りは開いてその欄へ・空にすると畳む', async (p) => {
   await p.goto(B + '/new?kind=single');
   await p.fill('#amazon-url', 'not-a-url');
   await p.click('#card-create button[data-v="0"]');
@@ -969,7 +1077,7 @@ await ta('[30] 新商品の登録 (#1628 Codex R2 M2): カードを作らない�
   assert.match(await p.textContent('#card-off-note'), /カードは作りません \(保存しても/);
 });
 
-await ta('[31] 新商品 (セット・#1628 Codex R3 M1 / L3): 構成品の照合が 503 = 答えにせず 3 秒後にもう一度 (直れば保存の止めが外れる)・A → B → A と打ち直したら前の A の答えを使わない', async (p) => {
+await ta('[41] 新商品 (セット・#1628 Codex R3 M1 / L3): 構成品の照合が 503 = 答えにせず 3 秒後にもう一度 (直れば保存の止めが外れる)・A → B → A と打ち直したら前の A の答えを使わない', async (p) => {
   let n503 = 0;
   await p.route('**/api/lookup?code=k001', async (route) => {
     if (n503 === 0) { n503++; await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'Company DB につながりません' }) }); }
@@ -993,7 +1101,7 @@ await ta('[31] 新商品 (セット・#1628 Codex R3 M1 / L3): 構成品の照�
   assert.ok(!/構成品を確かめています/.test(await p.textContent('#checklist')));
 });
 
-await ta('[32] 新商品 (#1628 Codex R3 M2): 「作らない」の理由の欄は、カードを作らないときも出す・理由が無くて断られたら理由の欄へ', async (p) => {
+await ta('[42] 新商品 (#1628 Codex R3 M2): 「作らない」の理由の欄は、カードを作らないときも出す・理由が無くて断られたら理由の欄へ', async (p) => {
   await p.goto(B + '/new?kind=single');
   await p.click('#set-plan button[data-v="none"]');
   await p.click('#card-create button[data-v="0"]');
@@ -1017,7 +1125,7 @@ await ta('[32] 新商品 (#1628 Codex R3 M2): 「作らない」の理由の欄�
   await p.waitForFunction(() => document.getElementById('card-fields').hidden === true);
 });
 
-await ta('[33] 新商品 (セット・#1628 Codex R4 M1): 確かめ直しは 3 回まで → 「もう一度確かめる」(保存は止めたまま)・401/403 は自動で繰り返さない・行を消したら確かめ直しも止まる', async (p) => {
+await ta('[43] 新商品 (セット・#1628 Codex R4 M1): 確かめ直しは 3 回まで → 「もう一度確かめる」(保存は止めたまま)・401/403 は自動で繰り返さない・行を消したら確かめ直しも止まる', async (p) => {
   await p.addInitScript(() => { window.__meRetryWaits = [150, 300, 450]; });   // 本物は 3 秒・10 秒・30 秒
   const hits = { k002: 0, k003: 0, k004: 0 };
   let k002Down = true;
@@ -1058,7 +1166,7 @@ await ta('[33] 新商品 (セット・#1628 Codex R4 M1): 確かめ直しは 3 �
   assert.equal(hits.k003, 1, '消した行は確かめ直さない');
 });
 
-await ta('[34] 新商品 (#1628 Codex R4 M2): カードを作らない + Yahoo! の欄だけ値がある = 「Yahoo! の欄も確かめる」と出す・Yahoo!売価 0 で保存 = その欄を開いて止める', async (p) => {
+await ta('[44] 新商品 (#1628 Codex R4 M2): カードを作らない + Yahoo! の欄だけ値がある = 「Yahoo! の欄も確かめる」と出す・Yahoo!売価 0 で保存 = その欄を開いて止める', async (p) => {
   await p.goto(B + '/new?kind=single');
   await p.click('#sec-yahoo > summary');
   await p.fill('#y-price', '0');
@@ -1082,7 +1190,7 @@ await ta('[34] 新商品 (#1628 Codex R4 M2): カードを作らない + Yahoo! 
   await p.waitForFunction(() => /保存しても product-hub/.test(document.getElementById('card-off-note').textContent));
 });
 
-await ta('[27] Amazon SKU (10/5): 新しい対応 = 名前で未保存 1 件 (理由は数えない)・離れるときの確認・Ctrl+S → 読み直し (知らせ)・削除の理由は数えない・削除は 1 回だけ確かめる (Esc で戻る)・墓標・変更の記録のカード', async (p) => {
+await ta('[37] Amazon SKU (10/5): 新しい対応 = 名前で未保存 1 件 (理由は数えない)・離れるときの確認・Ctrl+S → 読み直し (知らせ)・削除の理由は数えない・削除は 1 回だけ確かめる (Esc で戻る)・墓標・変更の記録のカード', async (p) => {
   await p.goto(B + '/amazon/');
   assert.match(await p.textContent('#h-um'), /売れたのに対応が無い SKU/);
   await p.fill('#open-sku', 'pr-k001-b');
@@ -1147,7 +1255,7 @@ await ta('[27] Amazon SKU (10/5): 新しい対応 = 名前で未保存 1 件 (�
   assert.equal(await p.isDisabled('#save'), true, '作った後は変えた欄が無ければ押せない');
 });
 
-await ta('[28] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウンロード) → 申告の書きかけ = 未保存 (離れるときの確認) → 違うファイルは照合で止める → 同じファイルで申告 → 読み直し', async (p, ctx) => {
+await ta('[38] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウンロード) → 申告の書きかけ = 未保存 (離れるときの確認) → 違うファイルは照合で止める → 同じファイルで申告 → 読み直し', async (p, ctx) => {
   process.env.MASTER_DECISION_APPROVERS = 'naka@test';
   // 今日の照合の回と NE の元のコード (前からある商品 = NE にある / ui-new-1 = 無い)
   const run = 'mc_' + new Date().toISOString().replace(/[-:.]/g, '') + '_abcdef';
@@ -1220,7 +1328,7 @@ const SCREENS2 = [
   ['Amazon_変更の記録', '/amazon/sku/history?sku=pr-k001-b', null], ['NE登録のCSV', '/reg-csv', null], ['変更の記録', '/sku/s003/history', null],
 ];
 for (const [label, vp, scale] of [['1440', { width: 1440, height: 900 }, 1], ['1280', { width: 1280, height: 720 }, 1], ['1024', { width: 1024, height: 768 }, 1], ['1280×720 150%', { width: 853, height: 480 }, 1.5]]) {
-  await ta(`[29] ${label}: 第 2 段の画面 (新商品・Amazon・NE 登録の CSV・変更の記録) が横にはみ出さない`, async (p) => {
+  await ta(`[39] ${label}: 第 2 段の画面 (新商品・Amazon・NE 登録の CSV・変更の記録) が横にはみ出さない`, async (p) => {
     process.env.MASTER_DECISION_APPROVERS = 'naka@test';   // NE 登録の CSV を操作できる人の画面で
     try {
     for (const [name, url, prep] of SCREENS2) {

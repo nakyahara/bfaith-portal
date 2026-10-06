@@ -25,6 +25,11 @@
  *     Company DB が無い・届かない = 帯と 503 / 保存を開いていない = 帯・欄と保存のボタンが閉じている / server.js は Render だけ
  *  16 FBA (JP) の在庫 (参考): Company DB の在庫の日次の最新の complete の日・何時時点 (取得の時刻)・1 × 1 の出品だけ足す (まとめ売り・セットの出品は別)・
  *     partial の日は使わない・古い (26 時間) / 読めない (日次なし・権限なし)・master_edit は 2 つの表を読むだけ・流し直しで読める
+ *  17 売れた数 (参考): 商品管理リストの公開の回 (Render の写し・発注アプリと同じ数)・いつまでの数か (前日まで)・FBA / FBA 以外・モール別・セットは構成品に入る (「—」)・
+ *     商品管理リストに無い = 「—」・古い / 読めない・ページの分だけ索引で引く・Company DB の権限は広げない
+ *  18 一覧の区分の列 (区分の札と同じ・区分の順)・コードのコピーのボタン・絞った一覧の全部のコード / CSV (BOM・CRLF・列・式の注入の対策・印 ?s=・並び・offset は無視・
+ *     注文残は発注アプリの権限者だけ・件数 / 時間の上限・期限切れ) / ロジザードの写しの「古い」(写しの時間 09〜18 時の外 = 18 時台の写しは次の朝 10 時まで古くない)
+ *  19 大きめの見本 (例外の SKU 1,500 件・含むセット 51 件): CSV・全部コピーは SQL で上限 + 1 件まで (中身の段に進まない)・JS で絞る条件・期限は参考の値と販売数の読みにも効く・含むセットの数
  * 使い方: node scripts/test-master-edit.mjs
  */
 import assert from 'node:assert/strict';
@@ -61,6 +66,13 @@ const rejectsWith = async (p, status, reason) => {
   assert.fail(`${status} ${reason || ''} にならなかった`);
 };
 const pgCode = async (p) => { try { await p; return 'ok'; } catch (e) { return e.code || e.message; } };
+/** 一覧の HTML の、その商品の行の data-col の欄の字 (タグを除く)。列の位置に頼らない */
+const colCell = (html, code, col) => {
+  const tr = html.split('<tr>').find((x) => x.includes(`href="sku/${code}"`));
+  assert.ok(tr, `一覧に ${code} の行が無い`);
+  const m = new RegExp(`<td[^>]*data-col="${col}"[^>]*>([\\s\\S]*?)<\\/td>`).exec(tr);
+  return m ? m[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() : undefined;
+};
 
 const ALL_COMPANY = Object.fromEntries(Object.keys(MASTER_OWNERSHIP).map((k) => [k, 'company']));
 EPOCH.remember(ALL_COMPANY);
@@ -1384,13 +1396,14 @@ process.env.MASTER_EDITORS = 'Naka@Test, other@test';
 process.env.MASTER_EDIT_OPEN = '1';
 let factoryMode = 'ok';
 const opened = [];
-__setPgClientFactory(async (url) => {
+const pgFactory = async (url) => {
   if (factoryMode === 'down') throw new Error('connect ECONNREFUSED');
   const role = /master_edit@/.test(url) ? 'master_edit' : 'deploy';
   opened.push(role);
   await pg.query(`set role ${role}`);
   return { query: (t, p) => pg.query(t, p), end: async () => { await pg.query('set role deploy'); }, on: () => {} };
-});
+};
+__setPgClientFactory(pgFactory);
 __setClock(() => NOW.getTime());
 __setOwnership(ALL_COMPANY);
 __setShippingRatesProvider(async () => RATES);
@@ -1757,11 +1770,7 @@ await ta('[16] FBA (JP) の在庫 (10/5): 読み元 = Company DB の在庫の日
   const sid = async (code) => Number((await q('select sku_id from core.skus where code = $1', [code]))[0].sku_id);
   const s1 = await sid('s001'), s2 = await sid('s002'), set1 = await sid('set001');
   const fbaTh = (html) => /id="th-fba">FBA \(JP\)<span class="thsub">([^<]*)<\/span>/.exec(html)?.[1];
-  const fbaCell = (html, code) => {
-    const tr = html.split('<tr>').find((x) => x.includes(`href="sku/${code}"`));
-    const tds = [...tr.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)].map((m) => m[1].replace(/<[^>]+>/g, '').trim());
-    return tds[9];   // 0 コード / 1 名前 / 2 状態 / 3 登録日 / 4 売価 / 5 原価 / 6 税 / 7 売上分類 / 8 在庫 / 9 FBA (JP)
-  };
+  const fbaCell = (html, code) => colCell(html, code, 'fba');
   // ① 日次がまだ無い = 「読めない」(一覧・単品とも画面は出る)
   let r = await call('GET', '/?kind=single');
   assert.equal(r.status, 200);
@@ -1855,6 +1864,478 @@ await ta('[16] FBA (JP) の在庫 (10/5): 読み元 = Company DB の在庫の日
   await createMasterEditRoles(pg, {});
   r = await call('GET', '/?kind=single');
   assert.equal(fbaCell(r.text, 's001'), '11', '流し直した = 読める');
+});
+
+await ta('[17] 売れた数 (10/5): 読み元 = 商品管理リストの公開の回 (発注アプリと同じ数)・いつまでの数か (前日まで)・FBA / FBA 以外・モール別・セットは構成品に入る (「—」)・商品管理リストに無い・古い / 読めない・ページの分だけ索引で引く・Company DB の権限は広げない', async () => {
+  const S = await import('../apps/master-edit/sales-qty.mjs');
+  const { default: Database } = await import('better-sqlite3');
+  const salesTh = (html) => /id="th-sales">売れた 7日\/30日<span class="thsub">([^<]*)<\/span>/.exec(html)?.[1];
+  const salesCell = (html, code) => colCell(html, code, 'sales');
+  // ① 写しが無い (warehouse-mirror.db を開いていない) = 「読めない」(一覧・単品とも画面は出る)
+  let r = await call('GET', '/?kind=single');
+  assert.equal(r.status, 200);
+  assert.equal(salesTh(r.text), '読めない');
+  assert.equal(salesCell(r.text, 's001'), '—');
+  assert.match((await call('GET', '/sku/s001')).text, /id="ref-sales-when">読めない \(販売数 \(商品管理リスト\) を読めません\)/);
+  // ② 写し (Render の warehouse-mirror.db と同じ表・索引の部分)。公開の回 pml_b (1/9 まで)・古い回 pml_a は読まない
+  const m = new Database(':memory:');
+  m.exec(`create table mirror_pml_published (id integer primary key check (id = 1), run_id text not null, status text not null, as_of_date text, src_velocity_as_of text, synced_at text not null);
+    create table mirror_pml_snapshot_rows (run_id text not null, 商品コード text not null, 販売数7日_FBA integer, 販売数7日_FBA以外 integer, 販売数7日_合計 integer,
+      販売数30日_FBA integer, 販売数30日_FBA以外 integer, 販売数30日_合計 integer, primary key (run_id, 商品コード));
+    create index idx_mpsr_run_code_norm on mirror_pml_snapshot_rows(run_id, LOWER(TRIM(商品コード)));
+    create table mirror_f_sales_velocity_by_product_mall (商品コード text not null, mall text not null, qty_7d integer not null default 0, qty_30d integer not null default 0, as_of_date text not null, synced_at text not null, primary key (商品コード, mall));
+    create table dim_mall (mall_key text primary key, label text not null, display_order integer not null);`);
+  const sql = [];
+  // swapAfterPointer = 次に公開の回のポインタを読んだ直後に 1 回だけ動かす (同期の切り替え = 古い回の明細を消してポインタを差し替える を、読みの間に挟む)
+  let swapAfterPointer = null;
+  S.__setSalesMirrorProvider(() => ({
+    prepare: (t) => {
+      sql.push(t);
+      const st = m.prepare(t);
+      if (!/from mirror_pml_published/.test(t)) return st;
+      return { get: (...a) => { const r = st.get(...a); if (swapAfterPointer) { const f = swapAfterPointer; swapAfterPointer = null; f(); } return r; } };
+    },
+    transaction: (fn) => m.transaction(fn),
+  }));
+  try {
+    r = await call('GET', '/?kind=single');
+    assert.equal(salesTh(r.text), '読めない', '公開の回がまだ無い');
+    assert.match(r.text, /title="商品管理リスト \(販売数\) の写しがまだありません"/);
+    m.prepare(`insert into mirror_pml_published (id, run_id, status, as_of_date, src_velocity_as_of, synced_at) values (1, 'pml_b', 'ok', '2030-01-10', '2030-01-09', 'x')`).run();
+    const ins = m.prepare('insert into mirror_pml_snapshot_rows values (?, ?, ?, ?, ?, ?, ?, ?)');
+    ins.run('pml_a', 's001', 99, 99, 198, 99, 99, 198);   // 前の回 = 読まない
+    ins.run('pml_b', 'S001', 5, 7, 12, 20, 28, 48);        // 大文字 (NE のコードの書き方) でも当たる
+    ins.run('pml_b', ' s002 ', 0, 0, 0, 0, 0, 0);
+    ins.run('pml_b', 'set001', 1, 1, 2, 2, 3, 5);           // 構成の欠けたセットは上流がセットのコードに数えることがある = 値があっても出さない (#1627 Codex R1 M2)
+    const mi = m.prepare('insert into mirror_f_sales_velocity_by_product_mall values (?, ?, ?, ?, ?, ?)');
+    mi.run('s001', 'amazon_fba', 5, 20, '2030-01-09', 'x'); mi.run('s001', 'rakuten', 4, 18, '2030-01-09', 'x'); mi.run('S001', 'wholesale', 3, 10, '2030-01-09', 'x');
+    for (const [k, l, o] of [['amazon_fba', 'Amazon FBA', 110], ['rakuten', '楽天', 20], ['wholesale', '卸', 130]]) m.prepare('insert into dim_mall values (?, ?, ?)').run(k, l, o);
+    sql.length = 0;
+    r = await call('GET', '/?kind=single');
+    assert.equal(salesTh(r.text), '1/9 まで', '見出しの下 = いつまでの数か (前日まで = 古くない)');
+    assert.match(r.text, /title="売れた数 \(7 日 \/ 30 日\) · 1\/9 \(水\) まで \(7 日 = 1\/3〜・30 日 = 12\/11〜・今日は入れない\) · 参考 · 商品管理リスト・発注アプリと同じ数/);
+    assert.match(r.text, /class="n ref" style="width:96px" title="売れた数/);
+    assert.equal(salesCell(r.text, 's001'), '12 / 48', '公開の回の 7 日 / 30 日の合計 (前の回 pml_a は読まない)');
+    assert.match(r.text, /title="7 日 12 \(FBA 5 · FBA 以外 7\) \/ 30 日 48 \(FBA 20 · FBA 以外 28\)"/);
+    assert.equal(salesCell(r.text, 's002'), '0 / 0', '商品管理リストにあって売れていない = 0');
+    assert.equal(salesCell(r.text, 's003'), '—', '商品管理リストに無い = 「—」(0 とは分ける)');
+    assert.match(r.text, /title="商品管理リストに無い商品 \(NE にまだ無いなど\)">—</);
+    {
+      // ページの分だけ引く: 公開の回を 1 回 + そのページの商品コードだけ (in の ? の数 = 行の数)・索引を使う
+      const hit = sql.filter((t) => /from mirror_pml_snapshot_rows/.test(t));
+      const rows = (r.text.match(/<a class="rowlink"/g) || []).length;
+      assert.equal(hit.length, 1);
+      assert.equal((hit[0].match(/\?/g) || []).length - 1, rows, 'このページの行の数だけ');
+      assert.equal(sql.filter((t) => /from mirror_pml_published/.test(t)).length, 2, '公開の回を読む (見出し) + 明細と同じ取引で読み直す');
+      const plan = m.prepare(`explain query plan ${hit[0]}`).all('pml_b', ...Array.from({ length: rows }, (_, i) => `x${i}`)).map((x) => x.detail).join(' / ');
+      assert.match(plan, /USING INDEX idx_mpsr_run_code_norm/, plan);
+    }
+    r = await call('GET', '/?kind=set');
+    assert.equal(salesCell(r.text, 'set001'), '—', 'セットは値 (2 / 5) があっても「—」');
+    assert.match(r.text, /title="セットで売れた分は構成品の数に入る \(商品管理リスト・発注アプリと同じ数え方\)">—</);
+    {
+      // CSV もセットの売れた数は空・単品は数
+      const csv = await (await fetch(BASE + '/list.csv?codes=set001%0As001', { headers: { 'x-test-session': 'editor' } })).text();
+      const rows = csv.replace(/^\ufeff/, '').trim().split('\r\n').map((line) => [...line.matchAll(/"((?:[^"]|"")*)"(?:,|$)/g)].map((x) => x[1]));
+      const i7 = rows[0].indexOf('売れた 7 日 (1/9 まで)'); const i30 = rows[0].indexOf('売れた 30 日 (1/9 まで)');
+      assert.ok(i7 > 0 && i30 > 0, rows[0].join('|'));
+      const byCode = Object.fromEntries(rows.slice(1).map((x) => [x[0], [x[i7], x[i30]]]));
+      assert.deepEqual(byCode, { s001: ['12', '48'], set001: ['', ''] });
+    }
+    // 単品の画面: 7 日 / 30 日・いつまで・FBA / FBA 以外・モール別 (多い順・名前は dim_mall)・この商品を含むセットの分も入っている
+    {
+      const ps = (await call('GET', '/sku/set001')).text;
+      assert.match(ps, /id="ref-sales-set" style="display:block">セットで売れた分は構成品の数に入る/);
+      assert.ok(!/id="ref-sales"/.test(ps) && !/id="ref-sales-parts"/.test(ps), 'セットの画面は値 (2 / 5) があっても数と内訳を出さない');
+    }
+    let p = (await call('GET', '/sku/s001')).text;
+    assert.match(p, /<h2 id="h-ref">在庫・売れた数・注文残<\/h2>/);
+    assert.match(p, /id="ref-sales">12 \/ 48</);
+    assert.match(p, /id="ref-sales-asof" style="display:block">1\/9 \(水\) まで \(7 日 = 1\/3〜・30 日 = 12\/11〜・今日は入れない\) · 注文日・キャンセルを除く・全部のモール</);
+    const flat = (id) => new RegExp(`<table id="${id}">([\\s\\S]*?)<\\/table>`).exec(p)[1].replace(/\s*<[^>]+>\s*/g, '|').replace(/\|+/g, '|');
+    assert.equal(flat('ref-sales-parts'), '|売れた数の内訳|7 日|30 日|Amazon FBA|5|20|FBA 以外 (NE の受注)|7|28|');
+    assert.equal(flat('ref-sales-malls'), '|モール別|7 日|30 日|Amazon FBA|5|20|楽天|4|18|卸|3|10|');
+    assert.match(p, /id="ref-sales-sets">この商品を含むセット \d+ 件で売れた分も入っている \(セット経由の分だけは分けられない\)/);
+    assert.ok(!/id="ref-sales-malls-lag"/.test(p));
+    p = (await call('GET', '/sku/set001')).text;
+    assert.match(p, /id="ref-sales-set" style="display:block">セットで売れた分は構成品の数に入る/);
+    assert.ok(!/id="ref-sales-parts"/.test(p));
+    p = (await call('GET', '/sku/s003')).text;
+    assert.match(p, /id="ref-sales-missing" style="display:block">商品管理リストに無い商品/);
+    assert.ok(!/id="ref-sales-parts"/.test(p));
+    // モール別だけ前の朝のまま (FBA と NE が重なった朝は作り直さない) = モール別の日を出す
+    m.prepare(`update mirror_f_sales_velocity_by_product_mall set as_of_date = '2030-01-08'`).run();
+    p = (await call('GET', '/sku/s001')).text;
+    assert.match(p, /<th scope="col">モール別 \(1\/8 まで\)<\/th>/);
+    assert.match(p, /id="ref-sales-malls-lag">モール別は 1\/8 \(火\) までの数 \(合計とずれることがある\)/);
+    // 古い: 前日までになっていない (正午から。正午までは前々日まで待つ = 朝の取込の前)
+    m.prepare(`update mirror_pml_published set src_velocity_as_of = '2030-01-08'`).run();
+    r = await call('GET', '/?kind=single');
+    assert.equal(salesTh(r.text), '古い 1/8 まで');
+    assert.match(r.text, /class="n ref stale" style="width:96px"/);
+    assert.match(r.text, /\(前日までの数になっていない = 古い\)/);
+    assert.match((await call('GET', '/sku/s001')).text, /id="ref-sales-asof" style="display:block">古い · 1\/8 \(火\) まで/);
+    assert.equal(S.salesStale('2030-01-08', Date.parse('2030-01-10T02:59:59Z')), false, '1/10 11:59 = 朝の取込の再試行の間 = まだ古くない');
+    assert.equal(S.salesStale('2030-01-08', Date.parse('2030-01-10T03:00:00Z')), true, '1/10 12:00 = 古い');
+    assert.equal(S.salesStale('2030-01-07', Date.parse('2030-01-09T15:00:00Z')), true, '前々々日まで = 夜中でも古い');
+    assert.equal(S.salesStale('2030-01-09', Date.parse('2030-01-10T14:59:59Z')), false);
+    // 同期の切り替え (古い回 pml_b の明細を消してポインタを pml_c へ) を、見出しの読みと明細の読みの間に挟む (#1627 Codex R1 M1):
+    //   明細は新しい回で読み、見出しの日付も新しい回に合わせる (古い回のまま「商品管理リストに無い」にしない)
+    m.prepare(`update mirror_pml_published set src_velocity_as_of = '2030-01-09'`).run();
+    swapAfterPointer = () => m.transaction(() => {
+      m.prepare('insert into mirror_pml_snapshot_rows values (?, ?, ?, ?, ?, ?, ?, ?)').run('pml_c', 's001', 10, 20, 30, 40, 50, 90);
+      m.prepare(`delete from mirror_pml_snapshot_rows where run_id = 'pml_b'`).run();
+      m.prepare(`update mirror_pml_published set run_id = 'pml_c', src_velocity_as_of = '2030-01-10' where id = 1`).run();
+    })();
+    r = await call('GET', '/?kind=single');
+    assert.equal(swapAfterPointer, null, '切り替えを挟んだ');
+    assert.equal(salesCell(r.text, 's001'), '30 / 90', '新しい回の数');
+    assert.equal(salesTh(r.text), '1/10 まで', '見出しの日付も新しい回');
+    assert.equal(salesCell(r.text, 's002'), '—', '新しい回に無い = 無い');
+    // 単品の画面も同じ (見出しの後に切り替わった)
+    swapAfterPointer = () => m.transaction(() => {
+      m.prepare('insert into mirror_pml_snapshot_rows values (?, ?, ?, ?, ?, ?, ?, ?)').run('pml_d', 's001', 1, 2, 3, 4, 5, 9);
+      m.prepare(`delete from mirror_pml_snapshot_rows where run_id = 'pml_c'`).run();
+      m.prepare(`update mirror_pml_published set run_id = 'pml_d' where id = 1`).run();
+    })();
+    p = (await call('GET', '/sku/s001')).text;
+    assert.match(p, /id="ref-sales">3 \/ 9</);
+    // 日付の無い回 = 読めない (いつまでの数か分からない数は出さない)
+    m.prepare(`update mirror_pml_published set src_velocity_as_of = null`).run();
+    r = await call('GET', '/?kind=single');
+    assert.equal(salesTh(r.text), '読めない'); assert.equal(salesCell(r.text, 's001'), '—');
+    // 表が無い (写しの作りが古い) = 読めない (例外にしない)
+    m.exec('drop table mirror_pml_snapshot_rows');
+    m.prepare(`update mirror_pml_published set src_velocity_as_of = '2030-01-09'`).run();
+    r = await call('GET', '/?kind=single');
+    assert.equal(r.status, 200); assert.equal(salesCell(r.text, 's001'), '—');
+    assert.equal(salesTh(r.text), '読めない', '明細が読めない = 見出しも「読めない」(日付を出したまま全部「—」にしない・#1627 Codex R2 M2)');
+    assert.match(r.text, /id="th-sales" title="販売数 \(商品管理リスト\) を読めません"|title="販売数 \(商品管理リスト\) を読めません"[^>]*id="th-sales"/);
+    {
+      // 関数: { ok: false, error } を返し、同じ run (見出し) も「読めない」に直す
+      const run = await S.readSalesRun({ now: NOW.getTime() });
+      assert.equal(run.ok, true);
+      const got = await S.salesOfCodes(run, ['s001']);
+      assert.deepEqual([got.ok, got.error, run.ok, run.error], [false, '販売数 (商品管理リスト) を読めません', false, '販売数 (商品管理リスト) を読めません']);
+    }
+    assert.match((await call('GET', '/sku/s001')).text, /id="ref-sales-when">読めない/);
+  } finally { S.__setSalesMirrorProvider(null); m.close(); }
+  // Company DB の権限は広げない (売れた数は Render の写しから読む): master_edit は mart の売上の日次・注文の表を読めない
+  for (const t of ['select 1 from mart.sales_daily limit 1', 'select 1 from mart.v_sales_daily limit 1', 'select 1 from core.orders limit 1', 'select 1 from core.order_lines limit 1']) {
+    assert.equal(await pgCode(asEditor(E0, () => pg.query(t))), '42501', t);
+  }
+});
+
+await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧の CSV と全部のコード (10/5): 区分の札と同じ・区分の順・BOM / CRLF / 列 / 式の注入の対策・絞り込み (印 ?s=・並び・offset は無視)・注文残は発注アプリの権限者だけ・件数 / 時間の上限・条件の期限切れ / ロジザードの写しの「古い」(写しの時間の外)', async () => {
+  const { __setExportLimits } = await import('../apps/master-edit/router.mjs');
+  const X = await import('../apps/master-edit/extras.mjs');
+  const T = await import('../apps/master-edit/search-token.mjs');
+  const raw = async (url, session = 'editor') => {
+    const r = await fetch(BASE + url, { headers: { 'x-test-session': session }, redirect: 'manual' });
+    return { status: r.status, type: r.headers.get('content-type'), disp: r.headers.get('content-disposition'), buf: Buffer.from(await r.arrayBuffer()) };
+  };
+  /** CSV (全部の欄が "…") を表に。BOM と CRLF を確かめてから */
+  const table = (got) => {
+    assert.equal(got.status, 200, got.buf.toString());
+    assert.deepEqual([...got.buf.subarray(0, 3)], [0xef, 0xbb, 0xbf], 'UTF-8 の BOM');
+    const text = got.buf.subarray(3).toString('utf8');
+    assert.ok(text.endsWith('\r\n'));
+    assert.ok(!/[^\r]\n/.test(text), '行の終わりは全部 CRLF');
+    return text.slice(0, -2).split('\r\n').map((line) => [...line.matchAll(/"((?:[^"]|"")*)"(?:,|$)/g)].map((m) => m[1].replace(/""/g, '"')));
+  };
+  const listOrder = (html) => [...html.matchAll(/<a class="rowlink" href="sku\/([^"]+)"/g)].map((m) => decodeURIComponent(m[1]));
+  // ── 区分の列 (単品 / セット (構成品の数) / 例外)・区分の札で絞った一覧と同じ ──
+  let r = await call('GET', '/');
+  assert.match(r.text, /<th scope="col" style="width:74px" id="th-kind">区分<\/th><th scope="col" style="width:150px">状態<\/th>/, '区分は名前の後・状態の前');
+  assert.equal(colCell(r.text, 's001', 'kind'), '単品');
+  assert.match(colCell(r.text, 'set001', 'kind'), /^セット \d+ 品$/);
+  const allCodes = listOrder(r.text);
+  for (const [kind, label] of [['single', '単品'], ['set', 'セット']]) {
+    const h = (await call('GET', `/?kind=${kind}`)).text;
+    const codes = listOrder(h);
+    assert.ok(codes.length > 0);
+    for (const c of codes) assert.ok(colCell(h, c, 'kind').startsWith(label), `${kind}: ${c}`);
+  }
+  // 区分の順 (単品 → セット → 例外・同じ区分はコード順)
+  r = await call('GET', '/?sort=kind');
+  const byKind = listOrder(r.text);
+  assert.deepEqual([...byKind].sort(), [...allCodes].sort(), '同じ商品・並びだけ違う');
+  const kinds = byKind.map((c) => colCell(r.text, c, 'kind').split(' ')[0]);
+  const rank = { 単品: 0, セット: 1, 例外: 2 };
+  for (let i = 1; i < kinds.length; i++) assert.ok(rank[kinds[i - 1]] < rank[kinds[i]] || (rank[kinds[i - 1]] === rank[kinds[i]] && byKind[i - 1] < byKind[i]), `${byKind[i - 1]} → ${byKind[i]}`);
+  assert.match(r.text, /<b aria-current="true">区分の順 \(単品・セット・例外\)<\/b>/);
+  // コードのコピーのボタン (行ごと・読み上げの名前)・全部コピー・CSV のリンク (今の絞り込みのまま。offset は付けない)
+  r = await call('GET', '/?kind=single&sort=kind&offset=0');
+  assert.match(r.text, /<a class="rowlink" href="sku\/s001">s001<\/a><button type="button" class="copybtn" data-copy="s001" aria-label="商品コード s001 をコピー" title="コピー">/);
+  const nSingle = listOrder(r.text).length;
+  assert.match(r.text, new RegExp(`<button type="button" class="btn sm ghost" id="copy-all" data-url="api/codes\\?kind=single&amp;sort=kind" data-n="${nSingle}" title="[^"]+"><svg[^>]*><use href="#i-copy"/></svg>コードを全部コピー \\(${nSingle} 件\\)</button>`));
+  assert.match(r.text, new RegExp(`<a class="btn sm ghost" id="csv-link" href="list.csv\\?kind=single&amp;sort=kind" download title="[^"]+"><svg[^>]*><use href="#i-download"/></svg>CSV \\(${nSingle} 件\\)</a>`));
+  // ── 全部のコード (コピーのボタンが読む): 一覧と同じ並び・ページに関係なく全件 ──
+  let j = (await call('GET', '/api/codes?kind=single&sort=kind')).j;
+  assert.deepEqual([j.ok, j.total, j.codes], [true, nSingle, listOrder(r.text)]);
+  // ── CSV ──
+  let got = await raw('/list.csv?kind=single&offset=5');
+  assert.equal(got.type, 'text/csv; charset=utf-8');
+  assert.equal(got.disp, `attachment; filename="master-list_20300110-1200.csv"; filename*=UTF-8''master-list_20300110-1200.csv`, 'ファイル名に日時 (日本の 1/10 12:00)');
+  let t = table(got);
+  assert.deepEqual(t[0], ['商品コード', '区分', '構成品の数', '名前', '状態', '登録の状態', '登録日', '売価', '原価', '原価は構成品から計算', '税率 (%)', '売上分類', '代表の仕入先コード', '代表の仕入先', 'JAN', '送料コード', '推奨月数',
+    '在庫 (ロジザード 読めない)', 'FBA (JP) 販売可能 (1/10 08:05 時点)', '売れた 7 日 (読めない)', '売れた 30 日 (読めない)', '対応が必要'], '注文残の列は発注アプリの権限が無い人には無い・読めない参考の値は見出しに「読めない」');
+  assert.deepEqual(t.slice(1).map((x) => x[0]), listOrder((await call('GET', '/?kind=single')).text), 'offset に関係なく絞った全件・一覧と同じ並び');
+  const row = (code) => Object.fromEntries(t[0].map((h, i) => [h, t.find((x) => x[0] === code)[i]]));
+  {
+    const s1 = row('s001');
+    assert.equal(s1['区分'], '単品'); assert.equal(s1['構成品の数'], ''); assert.equal(s1['状態'], '取扱中');
+    assert.equal(s1['代表の仕入先コード'], '0001'); assert.equal(s1['代表の仕入先'], 'AMC');
+    assert.equal(s1['在庫 (ロジザード 読めない)'], '', '読めない参考の値 = 空');
+    assert.equal(s1['FBA (JP) 販売可能 (1/10 08:05 時点)'], '11', '画面の一覧と同じ FBA の数');
+    const jan = (await q(`select string_agg(external_value, ' ' order by external_value) as j from core.external_ids e join core.skus k on k.product_id = e.entity_id
+      where e.entity_type = 'product' and e.system = 'jan' and e.id_kind = 'jan' and e.valid_to is null and k.code = 's001'`))[0].j || '';
+    assert.equal(s1['JAN'], jan, 'JAN = 今の JAN (終わっていない)');
+  }
+  // 画面の一覧と同じ値 (売価・原価・税率・送料・推奨月数)
+  {
+    const s2 = row('s002');
+    const db2 = (await q("select standard_price_jpy::int as p, tax_rate::float8 as t, shipping_code as sc, reorder_months::float8 as m from core.skus where code = 's002'"))[0];
+    assert.deepEqual([s2['売価'], s2['税率 (%)'], s2['送料コード'], s2['推奨月数']], [String(db2.p), String(Math.round(db2.t * 100)), db2.sc || '', db2.m == null ? '' : String(db2.m)]);
+  }
+  // セットの行: 区分・構成品の数・作れる数の列 (読めない = 空)
+  t = table(await raw('/list.csv?kind=set'));
+  {
+    const st = Object.fromEntries(t[0].map((h, i) => [h, t.find((x) => x[0] === 'set001')[i]]));
+    assert.equal(st['区分'], 'セット'); assert.match(st['構成品の数'], /^\d+$/);
+    assert.ok(t.slice(1).every((x) => x[1] === 'セット'), '区分の札で絞った CSV は全部セット');
+  }
+  // 式の注入の対策: 先頭 (空白・制御文字の後) が = + - @ の文字には ' を付ける。数の欄は数のまま
+  const keepName = (await q("select name from core.skus where code = 's006'"))[0].name;
+  await pg.query(`update core.skus set name = ' =HYPERLINK("http://x","y")' where code = 's006'`);
+  try {
+    t = table(await raw('/list.csv?kind=single'));
+    const s6 = Object.fromEntries(t[0].map((h, i) => [h, t.find((x) => x[0] === 's006')[i]]));
+    assert.equal(s6['名前'], `' =HYPERLINK("http://x","y")`);
+  } finally { await pg.query('update core.skus set name = $1 where code = $2', [keepName, 's006']); }
+  // 注文残 = 発注アプリの利用権がある人だけ (admin = 全部のアプリ)
+  t = table(await raw('/list.csv?kind=single', 'admin'));
+  assert.ok(t[0].includes('注文残 (発注アプリ 読めない)') || t[0].includes('注文残 (発注アプリ)'), t[0].join('|'));
+  assert.equal(t[0].indexOf('対応が必要'), t[0].length - 1);
+  // 詳細検索の印 (?s=) でも出せる・並び (区分の順) も一覧と同じ
+  const sr = await call('POST', '/api/search', { body: { codes: 'set001\ns002\ns001', sort: 'kind' } });
+  assert.equal(sr.status, 200, sr.text);
+  const qs = sr.j.url.split('?')[1];
+  assert.match(qs, /(^|&)s=/);
+  t = table(await raw(`/list.csv?${qs}`));
+  assert.deepEqual(t.slice(1).map((x) => x[0]), ['s001', 's002', 'set001'], '印の中身 (コード 3 つ)・区分の順');
+  j = (await call('GET', `/api/codes?${qs}`)).j;
+  assert.deepEqual(j.codes, ['s001', 's002', 'set001']);
+  // 条件の期限切れ (印が消えた) = 410 (全件を出さない)
+  T.__clearSearchTokens();
+  got = await raw(`/list.csv?${qs}`);
+  assert.equal(got.status, 410); assert.match(got.buf.toString(), /条件の期限が切れました/);
+  assert.equal((await call('GET', `/api/codes?${qs}`)).status, 410);
+  // 件数の上限: 超えたら 413 (途中で切った CSV を出さない)・一覧のボタンは押せない
+  __setExportLimits({ max: 2 });
+  try {
+    got = await raw('/list.csv?kind=single');
+    assert.equal(got.status, 413); assert.match(got.buf.toString(), /2 件より多くあります。CSV は 2 件までです。絞ってから出してください/, '上限 + 1 件まで読んで止める = 全部は数えない');
+    r = await call('GET', '/api/codes?kind=single');
+    assert.equal(r.status, 413); assert.match(r.j.error, /全部コピーは 2 件まで/);
+    r = await call('GET', '/?kind=single');
+    assert.match(r.text, /id="copy-all" data-url="api\/codes\?kind=single" data-n="\d+" disabled/);
+    assert.match(r.text, /<span class="btn sm ghost" id="csv-link" aria-disabled="true"/);
+    assert.equal(table(await raw('/list.csv?codes=s001%0As002')).length, 3, '2 件までは出せる');
+  } finally { __setExportLimits(null); }
+  // 時間の上限 (段ごとに確かめる) = 503
+  __setExportLimits({ timeMs: 0 });
+  try {
+    got = await raw('/list.csv');
+    assert.equal(got.status, 503); assert.match(got.buf.toString(), /時間がかかりすぎました/);
+    const c0 = await call('GET', '/api/codes');
+    assert.deepEqual([c0.status, c0.j.reason], [503, 'timeout'], '処理中の期限切れも reason = timeout (接続の待ちと同じ形)');
+  } finally { __setExportLimits(null); }
+  assert.equal((await raw('/list.csv')).status, 200);
+  // つながらない = 503 (画面と同じ)
+  factoryMode = 'down';
+  try { assert.equal((await raw('/list.csv')).status, 503); } finally { factoryMode = 'ok'; }
+  // ── ロジザードの写しの「古い」(10/5): 写しが動くのは毎日 09〜18 時 = その日の最後 (18 時台) の写しは次の朝 10:00 まで古くない ──
+  const at = (jst) => Date.parse(`${jst}+09:00`);
+  const c18 = new Date(at('2030-01-10T18:01:00')).toISOString();
+  assert.equal(X.stockStale(c18, at('2030-01-10T19:30:00')), false, '2 時間以内');
+  assert.equal(X.stockStale(c18, at('2030-01-10T21:30:00')), false, '夜 (前は「古い」と出ていた)');
+  assert.equal(X.stockStale(c18, at('2030-01-11T09:59:59')), false, '次の朝 10 時の前');
+  assert.equal(X.stockStale(c18, at('2030-01-11T10:00:00')), true, '次の朝 10 時 = 9 時の写しが来ていない');
+  assert.equal(X.stockStale(new Date(at('2030-01-10T17:01:00')).toISOString(), at('2030-01-10T20:00:00')), true, '18 時の写しが抜けた夜 = 古い');
+  assert.equal(X.stockStale(new Date(at('2030-01-10T10:00:00')).toISOString(), at('2030-01-10T11:59:00')), false);
+  assert.equal(X.stockStale(new Date(at('2030-01-10T10:00:00')).toISOString(), at('2030-01-10T12:00:01')), true, '日中は 2 時間');
+  assert.equal(X.stockStale('壊れた時刻', at('2030-01-10T12:00:00')), true);
+});
+
+await ta('[19] 大きめの見本 (#1627 Codex R1 M3 / Low): CSV・全部コピーは SQL で上限 + 1 件までしか読まない (中身の段に進まない)・JS で絞る条件のとき・期限は参考の値と販売数の読みにも効く・含むセット 51 件', async () => {
+  const { __setExportLimits } = await import('../apps/master-edit/router.mjs');
+  const S = await import('../apps/master-edit/sales-qty.mjs');
+  const { ListTimeoutError } = await import('../apps/master-edit/deadline.mjs');
+  const { default: Database } = await import('better-sqlite3');
+  // 例外の SKU 1,500 件 + s003 を含むセット 51 件。登録の状態は同じ取引で関数 (ops.create_sku_registration) が作る (= commit の登録の確かめを通る)
+  await pg.query('begin');
+  try {
+    await pg.query(`insert into core.skus (company_id, sku_kind, code, name) select 1, 'exception', 'bulk' || lpad(g::text, 5, '0'), 'まとめ ' || g from generate_series(1, 1500) g`);
+    await pg.query(`insert into core.skus (company_id, sku_kind, code, name) select 1, 'set', 'bset' || lpad(g::text, 3, '0'), '含むセット ' || g from generate_series(1, 51) g`);
+    await pg.query(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, source)
+      select 1, k.sku_id, (select sku_id from core.skus where code = 's003'), 1, 'ne' from core.skus k where k.code like 'bset%'`);
+    await pg.query(`select count(ops.create_sku_registration(sku_id, 'test')) from core.skus where code like 'bulk%' or code like 'bset%'`);
+    await pg.query('commit');
+  } catch (e) { await pg.query('rollback'); throw e; }
+  const log = [];
+  const tdb = { query: async (t, p) => { const r = await db.query(t, p); log.push({ t, n: r.rows.length }); return r; } };
+  const counted = (mode, filters, max) => { log.length = 0; return R.listSkus(tdb, filters, { now: NOW, mode, max }); };
+  const ROWS2 = /where s\.sku_id = any\(\$1::bigint\[\]\)/;
+  for (const mode of ['all', 'codes']) {
+    const d = await counted(mode, { kind: 'exception' }, 1000);
+    assert.deepEqual([d.tooMany, d.atLeast, d.total, d.max], [true, true, 1000, 1000], mode);
+    assert.ok(Math.max(...log.map((x) => x.n)) <= 1001, `${mode}: 1 つの問い合わせで 1,001 行より多く読まない (${Math.max(...log.map((x) => x.n))})`);
+    assert.ok(log.some((x) => / limit 1001$/.test(x.t.trim())), '① の SQL に limit 上限 + 1');
+    assert.ok(!log.some((x) => ROWS2.test(x.t)), `${mode}: 中身の段 (②) に進まない`);
+  }
+  // 上限の中 = 全件を読む (CSV の行 = 1,500 + 見出し)
+  {
+    const d = await counted('all', { kind: 'exception' }, 2000);
+    assert.equal(d.rows.length, 1500); assert.ok(!d.tooMany);
+    __setExportLimits({ max: 2000 });
+    try {
+      const t0 = Date.now();
+      const csv = await (await fetch(BASE + '/list.csv?kind=exception', { headers: { 'x-test-session': 'editor' } })).text();
+      assert.equal(csv.trim().split('\r\n').length, 1501);
+      console.log(`      (CSV 1,500 件 = ${Date.now() - t0} ms・PGlite)`);
+      const j = (await call('GET', '/api/codes?kind=exception')).j;
+      assert.equal(j.codes.length, 1500); assert.equal(j.codes[0], 'bulk00001');
+    } finally { __setExportLimits(null); }
+  }
+  // JS で絞る条件 (売上分類) = SQL では絞れない = 読みの上限は EXPORT_SCAN_MAX。絞った後の数で上限を見る
+  {
+    const d = await counted('all', { sales: '3' }, 1);
+    assert.deepEqual([d.tooMany, d.atLeast], [true, false]);
+    assert.ok(log.some((x) => new RegExp(` limit ${R.EXPORT_SCAN_MAX + 1}$`).test(x.t.trim())));
+    assert.ok(!log.some((x) => ROWS2.test(x.t)));
+  }
+  // HTTP: 413 の言い方 (上限より多く)
+  __setExportLimits({ max: 1000 });
+  try {
+    const got = await fetch(BASE + '/list.csv?kind=exception', { headers: { 'x-test-session': 'editor' } });
+    assert.equal(got.status, 413); assert.match(await got.text(), /1,000 件より多くあります。CSV は 1,000 件までです/);
+    const c = await call('GET', '/api/codes?kind=exception');
+    assert.equal(c.status, 413); assert.equal(c.j.atLeast, true);
+  } finally { __setExportLimits(null); }
+  // 期限はリクエストの始めから = 参考の値 (売れた数の写し) の読みが遅いだけでも 503。販売数の読みの塊の間でも止まる
+  const m = new Database(':memory:');
+  m.exec(`create table mirror_pml_published (id integer primary key, run_id text, status text, as_of_date text, src_velocity_as_of text, synced_at text);
+    create table mirror_pml_snapshot_rows (run_id text not null, 商品コード text not null, 販売数7日_FBA integer, 販売数7日_FBA以外 integer, 販売数7日_合計 integer, 販売数30日_FBA integer, 販売数30日_FBA以外 integer, 販売数30日_合計 integer, primary key (run_id, 商品コード));
+    insert into mirror_pml_published values (1, 'r1', 'ok', '2030-01-10', '2030-01-09', 'x');`);
+  S.__setSalesMirrorProvider(async () => { await new Promise((ok) => setTimeout(ok, 300)); return m; });
+  __setExportLimits({ timeMs: 150 });
+  try {
+    const got = await fetch(BASE + '/list.csv?kind=single', { headers: { 'x-test-session': 'editor' } });
+    assert.equal(got.status, 503); assert.match(await got.text(), /時間がかかりすぎました/);
+  } finally { __setExportLimits(null); S.__setSalesMirrorProvider(null); }
+  S.__setSalesMirrorProvider(() => m);
+  try {
+    const run = await S.readSalesRun({ now: NOW.getTime() });
+    await assert.rejects(S.salesOfCodes(run, ['a', 'b'], { deadline: Date.now() - 1 }), ListTimeoutError);
+    const okRes = await S.salesOfCodes(run, ['a'], { deadline: Date.now() + 60e3 });
+    assert.deepEqual([okRes.ok, [...okRes.map.keys()]], [true, []], '期限の中 = 読む');
+  } finally { S.__setSalesMirrorProvider(null); m.close(); }
+  // 接続の待ちも期限に入る (#1627 Codex R2 M1): 期限はルートに入った直後から・残りの時間を connectionTimeoutMillis に渡す・遅れて来た接続は閉じる
+  {
+    const seen = [];
+    let closedLate = 0;
+    __setPgClientFactory(async (url, extra) => {
+      seen.push(extra);
+      await new Promise((ok) => setTimeout(ok, 400));
+      const c = await pgFactory(url, extra);
+      return { ...c, end: async () => { closedLate++; await c.end(); } };
+    });
+    __setExportLimits({ timeMs: 150 });
+    try {
+      let t0 = Date.now();
+      const got = await fetch(BASE + '/list.csv?kind=single', { headers: { 'x-test-session': 'editor' } });
+      const took = Date.now() - t0;
+      assert.equal(got.status, 503); assert.match(await got.text(), /時間がかかりすぎました \(Company DB への接続を待つ間に期限を過ぎた\)/);
+      assert.ok(took < 380, `接続 (400ms) を待たずに期限で返す (${took}ms)`);
+      assert.ok(seen[0] && seen[0].connectionTimeoutMillis > 0 && seen[0].connectionTimeoutMillis <= 150, JSON.stringify(seen[0]));
+      t0 = Date.now();
+      const c = await call('GET', '/api/codes?kind=single');
+      assert.equal(c.status, 503); assert.equal(c.j.reason, 'timeout');
+      assert.ok(Date.now() - t0 < 380);
+      await new Promise((ok) => setTimeout(ok, 600));   // 遅れて来た接続が閉じるのを待つ (共有の PGlite のロールを戻す)
+      assert.equal(closedLate, 2, '遅れて来た接続は閉じる');
+    } finally { __setExportLimits(null); __setPgClientFactory(pgFactory); }
+    // 期限の無い画面 (一覧) は接続の時間の上限を付けない
+    seen.length = 0;
+    __setPgClientFactory(async (url, extra) => { seen.push(extra); return pgFactory(url, extra); });
+    try {
+      assert.equal((await call('GET', '/?kind=single')).status, 200);
+      assert.equal(seen[0].connectionTimeoutMillis, undefined);
+      assert.equal((await fetch(BASE + '/list.csv?codes=s001', { headers: { 'x-test-session': 'editor' } })).status, 200);
+      assert.ok(seen.at(-1).connectionTimeoutMillis > 40e3, 'CSV = 残りの時間 (45 秒から)');
+    } finally { __setPgClientFactory(pgFactory); }
+  }
+  // 実処理の SQL が遅い・statement_timeout で止まった (#1627 Codex R3 M1): 各 SQL の statement_timeout = min(20 秒, 残り)・57014 = 503 (reason timeout)
+  {
+    const sets = []; let mode = 'slow';
+    const LIST1 = /from core\.skus s\s+left join core\.products p/;
+    __setPgClientFactory(async (url, extra) => {
+      const c = await pgFactory(url, extra);
+      return { ...c, query: async (t, p) => {
+        if (/^set statement_timeout/.test(t)) sets.push(t);
+        const fbaDaySql = /from snapshots\.stock_capture_days/.test(t) && /done_date/.test(t);
+        const fbaSumSql = /sum\(fba_available\)/.test(t);
+        if ((mode === 'fbaDay' && fbaDaySql) || (mode === 'fbaSum' && fbaSumSql)) { const e = new Error('canceling statement due to statement timeout'); e.code = '57014'; throw e; }
+        if (LIST1.test(t) && /order by/.test(t)) {
+          if (mode === 'slow') await new Promise((ok) => setTimeout(ok, 400));   // ① の SQL が遅い (PGlite は止めないので JS で遅らせる)
+          if (mode === '57014') { const e = new Error('canceling statement due to statement timeout'); e.code = '57014'; throw e; }
+        }
+        return c.query(t, p);
+      } };
+    });
+    __setExportLimits({ timeMs: 300 });
+    try {
+      let got = await fetch(BASE + '/list.csv?kind=single', { headers: { 'x-test-session': 'editor' } });
+      assert.equal(got.status, 503); assert.match(await got.text(), /時間がかかりすぎました/);
+      const ms = sets.filter((t) => /'\d+ms'/.test(t)).map((t) => Number(/'(\d+)ms'/.exec(t)[1]));
+      assert.ok(ms.length && ms.every((x) => x > 0 && x <= 300), `statement_timeout = 残りの時間 (${sets.join(' / ')})`);
+      let c = await call('GET', '/api/codes?kind=single');
+      assert.deepEqual([c.status, c.j.reason], [503, 'timeout']);
+      // 57014 (SQL が statement_timeout で止まった) = 500 にせず 503
+      mode = '57014';
+      __setExportLimits({ timeMs: 45e3 });
+      got = await fetch(BASE + '/list.csv?kind=single', { headers: { 'x-test-session': 'editor' } });
+      assert.equal(got.status, 503, '57014 = 503'); assert.match(await got.text(), /時間がかかりすぎました/);
+      c = await call('GET', '/api/codes?kind=single');
+      assert.deepEqual([c.status, c.j.reason], [503, 'timeout']);
+      // FBA の参考の値の SQL が止まった (#1627 Codex R4): 「読めない」に吸い込まず 503 (CSV = 日付の SQL・在庫の集計の SQL / 全部コピー = 在庫の範囲で絞る = 日付の SQL)
+      for (const m2 of ['fbaDay', 'fbaSum']) {
+        mode = m2;
+        got = await fetch(BASE + '/list.csv?kind=single', { headers: { 'x-test-session': 'editor' } });
+        assert.equal(got.status, 503, `${m2}: CSV`); assert.match(await got.text(), /時間がかかりすぎました/);
+      }
+      mode = 'fbaDay';
+      c = await call('GET', '/api/codes?kind=single&stock_min=0');
+      assert.deepEqual([c.status, c.j.reason], [503, 'timeout'], 'fbaDay: 全部コピー');
+      // 期限の無い一覧の画面は今まで通り「読めない」で画面を出す
+      mode = 'fbaDay';
+      const pl = await call('GET', '/?kind=single');
+      assert.equal(pl.status, 200); assert.match(pl.text, /id="th-fba">FBA \(JP\)<span class="thsub">読めない</);
+      mode = 'fbaSum';
+      assert.equal((await call('GET', '/?kind=single')).status, 200);
+      // 一覧の画面は今のまま (期限の db を使わない = statement_timeout は接続の 20s だけ)
+      mode = 'none'; sets.length = 0;
+      assert.equal((await call('GET', '/?kind=single')).status, 200);
+      assert.deepEqual(sets, ["set statement_timeout = '20s'"]);
+    } finally { __setExportLimits(null); __setPgClientFactory(pgFactory); await new Promise((ok) => setTimeout(ok, 50)); }
+  }
+  // 含むセットが 51 件 = 51 件と数える (表示は 50 件まで)
+  const pg3 = (await call('GET', '/sku/s003')).text;
+  const nSets = Number((await q("select count(*)::int as n from core.sku_components c join core.skus k on k.sku_id = c.child_sku_id where k.code = 's003'"))[0].n);
+  assert.ok(nSets >= 51, String(nSets));
+  assert.match(pg3, new RegExp(`<span class="k">セット ${nSets} 件 \\(50 件を表示\\)</span>`), '数えた数 (表示の 50 件ではない)');
+  assert.equal((pg3.match(/class="linkchip" href="[^"]*\/sku\/[^"]*" title=/g) || []).length, 50, '表示は 50 件まで');
 });
 
 server.close();

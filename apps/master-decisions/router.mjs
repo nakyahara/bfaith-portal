@@ -7,7 +7,8 @@
  *   (空 = 誰も決められない。admin でも名簿に無ければ不可。画面で隠すだけでなく API で止める = 価格更新と同じ)
  *   GET  /                          画面
  *   GET  /manual                    つかいかた
- *   GET  /api/summary               最新の照合の回・理由の種類 × 状態の件数・自分が決められるか
+ *   GET  /public/:file              画面の部品 (マスタの入力と同じ CSS・共通の動き + この画面だけの CSS。決めた名前だけ)
+ *   GET  /api/summary              最新の照合の回・理由の種類 × 状態の件数・自分が決められるか
  *   GET  /api/candidates            候補の一覧 (view・status・reason・cls・q・limit・offset)
  *   GET  /api/candidates/:fp/events 1 つの候補の出来事の履歴
  *   POST /api/decisions             決める { kind, resolution?, note?, items: [{ fingerprint, shown_last_seen_run, shown_event_id, target_value? }] }
@@ -25,6 +26,8 @@
  */
 import express from 'express';
 import path from 'node:path';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { summary, listCandidates, candidateEvents, applyDecisions, DecideError } from './decide.mjs';
@@ -33,6 +36,26 @@ import { csvSummary, exportDetail, exportFile, createExport, checkExport, declar
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const view = (name) => path.join(__dirname, 'views', name);
 const router = express.Router();
+
+/**
+ * 画面の見た目の部品 (新しいデザイン = マスタの入力と同じ。10/5)。
+ * CSS と共通の動き (全体から探す・離れるときの確認・キー) は apps/master-edit/public の同じファイルを **この口から** 配る
+ * (写さない = 2 つの画面の見た目がずれない。/apps/master-edit/public を読みに行かない = この画面の利用権だけで見える・master-edit を載せていない日も崩れない)。
+ * 配るのは下の名前だけ (それ以外は 404)。版 (assetV) = 配る中身のハッシュ = 配り直した日に古い CSS / JS が 1 時間残らない
+ */
+const SHARED_PUBLIC = path.join(__dirname, '..', 'master-edit', 'public');
+const OWN_PUBLIC = path.join(__dirname, 'public');
+const ASSETS = Object.freeze({ 'master-edit.css': SHARED_PUBLIC, 'me-shell.js': SHARED_PUBLIC, 'md.css': OWN_PUBLIC, 'favicon.svg': OWN_PUBLIC });
+const assetV = (() => {
+  const h = crypto.createHash('sha256');
+  for (const f of Object.keys(ASSETS).sort()) { try { h.update(f).update(fs.readFileSync(path.join(ASSETS[f], f))); } catch { /* 無ければ名前だけ */ } }
+  return h.digest('hex').slice(0, 12);
+})();
+router.get('/public/:file', (req, res, next) => {
+  const f = String(req.params.file || '');
+  if (!Object.hasOwn(ASSETS, f)) return next();
+  res.sendFile(f, { root: ASSETS[f], maxAge: '1h', dotfiles: 'deny' }, (e) => { if (e && !res.headersSent) next(); });
+});
 
 /** Postgres の接続の作り方 (試験は PGlite に差し替える。本番では触らない) */
 let pgClientFactory = openPgClient;
@@ -86,15 +109,17 @@ async function withPg(res, fn) {
 
 const pageLocals = (req) => {
   const gate = approverGate(req);
-  return { title: 'マスタの判断 (NE との差)', username: req.session?.email || '', displayName: req.session?.displayName || '', canDecide: gate.ok, gateMessage: gate.message || '' };
+  // base = この画面の口 (左の列・部品の URL)。meBase = マスタの入力の口 (左の列の「商品・セット」・全体から探す)
+  return { title: 'マスタの判断 (NE との差)', username: req.session?.email || '', displayName: req.session?.displayName || '', canDecide: gate.ok, gateMessage: gate.message || '',
+    base: req.baseUrl || '/apps/master-decisions', meBase: '/apps/master-edit', assetV, nav: '' };
 };
 router.get('/', (req, res) => {
   // 画面の中のリンク・API は相対 (api/…・manual) = 末尾の / が無いと 1 つ上を指す
   if (!String(req.originalUrl || '').split('?')[0].endsWith('/')) return res.redirect(301, `${req.baseUrl}/`);
-  res.render(view('index.ejs'), pageLocals(req));
+  res.render(view('index.ejs'), { ...pageLocals(req), nav: 'decide', listPage: true });
 });
-router.get('/manual', (req, res) => res.render(view('manual.ejs'), pageLocals(req)));
-router.get('/csv', (req, res) => res.render(view('csv.ejs'), { ...pageLocals(req), title: 'NE に取り込む CSV' }));
+router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), nav: 'manual' }));
+router.get('/csv', (req, res) => res.render(view('csv.ejs'), { ...pageLocals(req), title: 'NE に取り込む CSV', nav: 'csv' }));
 
 router.get('/api/summary', (req, res) => withPg(res, async (db) => {
   const s = await summary(db);
@@ -142,6 +167,7 @@ router.get('/api/csv/exports/:id/file', gated(async (db, req, res) => {
   const f = await exportFile(db, exportIdOf(req), { nowMs: clock() });
   if (!f) return res.status(404).json({ ok: false, error: 'ファイルが無い' });
   if (f.state === 'void') return res.status(410).json({ ok: false, error: 'このファイルは使えません (void)。取り込まないでください', reason: 'void' });
+  if (f.state === 'unsafe') return res.status(410).json({ ok: false, error: `このファイルは今の決まりでは使えません (${f.reason === 'name_is_code' ? '名前が商品コードと同じ行がある' : f.reason})。取り込まないで、作り直してください`, reason: 'unsafe', detail: f.reason });
   if (f.state === 'retired') return res.status(410).json({ ok: false, error: 'この申告済みのファイルはもう使えません。取り込み直すなら作り直してください', reason: 'retired' });
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${f.file_name}"`);
