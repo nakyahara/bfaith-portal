@@ -83,12 +83,45 @@ export function jstShort(ts) {
   return `${d.slice(5, 7)}/${d.slice(8, 10)} ${d.slice(11, 16)}`;
 }
 
-/** 接続 (本番 = ログイン new_entry_gate)。{ db: { query }, close } */
+/**
+ * client 側の期限 (#1645 Codex R3 High)。親 (daily-sync / retry) は 120 秒で子を強制終了する = その前に必ず閉じる道 (closeAndVerify) を通す。
+ *   許可を出す側 (接続 + 確かめ + grant) は mainMs まで・閉じる側 (新しい接続 + revoke + 確かめ) は closeMs まで。1 回の接続 connectMs・1 回の問い合わせ queryMs。
+ *   段全体 = mainMs + closeMs (+ 切断) ≦ 60 秒 = 親の 120 秒から CLI の終わりの待ち (10 秒) を引いても余る。期限が来たら応答を待たずに接続を壊す
+ *   (DB の statement_timeout では「SQL は終わったが応答だけ失われた」を解けない)。試験は timeouts で縮める
+ */
+export const TIMEOUTS = Object.freeze({ connectMs: 10000, queryMs: 15000, mainMs: 30000, closeMs: 25000 });
+
+/** 接続 (本番 = ログイン new_entry_gate)。{ db: { query }, close, kill } (kill = 応答を待たずに socket を壊す) */
 export async function connectGate(url) {
   const { openPgClient, pgAdapter } = await import('../../../scripts/company-db/migrate.mjs');
-  const client = await openPgClient(url);
-  try { await client.query(`set statement_timeout = '60s'`); } catch (e) { try { await client.end(); } catch { /* */ } throw e; }
-  return { db: pgAdapter(client), close: () => client.end() };
+  const client = await openPgClient(url, { connectionTimeoutMillis: TIMEOUTS.connectMs, query_timeout: TIMEOUTS.queryMs });
+  try { await client.query(`set statement_timeout = '15s'`); } catch (e) { try { await client.end(); } catch { /* */ } throw e; }
+  return { db: pgAdapter(client), close: () => client.end(), kill: () => { try { client.connection && client.connection.stream && client.connection.stream.destroy(); } catch { /* */ } } };
+}
+
+/** 期限まで残りの時間 (ms・最小 1) */
+const left = (end, ms) => Math.max(1, Math.min(ms, end - Date.now()));
+/** 応答を待たずに接続を捨てる (kill があれば socket を壊す・無ければ close を待たずに投げる) */
+function dropConn(c) { try { if (c && c.kill) c.kill(); else if (c && c.close) Promise.resolve().then(() => c.close()).catch(() => {}); } catch { /* */ } }
+/** 期限つきで接続する。期限の後に遅れてつながった接続は捨てる */
+async function openConn(connect, url, ms) {
+  let timer, late = false;
+  const p = Promise.resolve().then(() => connect(url));
+  p.then((c) => { if (late) dropConn(c); }, () => {});
+  try { return await Promise.race([p, new Promise((_, rej) => { timer = setTimeout(() => { late = true; rej(new Error(`接続が ${ms}ms で返らない`)); }, ms); })]); }
+  finally { clearTimeout(timer); }
+}
+/** 期限つきの問い合わせ。期限が来たら接続を壊して投げる (DB では終わっているかもしれない = 呼び手が新しい接続で閉じて確かめる) */
+async function query(c, sql, params, ms, what) {
+  let timer;
+  try { return await Promise.race([Promise.resolve().then(() => c.db.query(sql, params)), new Promise((_, rej) => { timer = setTimeout(() => { dropConn(c); rej(new Error(`${what}が ${ms}ms で返らない (応答を待たずに接続を切った)`)); }, ms); })]); }
+  finally { clearTimeout(timer); }
+}
+/** 期限つきの切断 (返らなければ壊す) */
+async function closeConn(c, ms) {
+  let timer;
+  try { await Promise.race([Promise.resolve().then(() => c.close()), new Promise((r) => { timer = setTimeout(() => { dropConn(c); r(); }, ms); })]); }
+  catch { /* */ } finally { clearTimeout(timer); }
 }
 
 const short = (e) => String(e && e.message ? e.message : e).replace(/\s+/g, ' ').slice(0, 200);
@@ -98,20 +131,21 @@ const short = (e) => String(e && e.message ? e.message : e).replace(/\s+/g, ' ')
  *   grant の後に応答が切れた・返り値が壊れた接続は使わない (DB では許可が開いたままかもしれない)。
  *   結果 = { ok: true } (閉じたのを確かめた) か { ok: false, note } (確かめられない = 開いている可能性)
  */
-export async function closeAndVerify(url, reason, { connect = connectGate } = {}) {
+export async function closeAndVerify(url, reason, { connect = connectGate, timeouts = TIMEOUTS } = {}) {
+  const end = Date.now() + timeouts.closeMs;
   let c;
-  try { c = await connect(url); }
+  try { c = await openConn(connect, url, left(end, timeouts.connectMs)); }
   catch (e) { return { ok: false, note: `取り消しの接続もできない (${short(e).slice(0, 80)})` }; }
   try {
-    try { await c.db.query('select ops.revoke_new_entry_lease($1, $2) as r', [KIND, String(reason).slice(0, 480)]); }
+    try { await query(c, 'select ops.revoke_new_entry_lease($1, $2) as r', [KIND, String(reason).slice(0, 480)], left(end, timeouts.queryMs), '取り消し'); }
     catch (e) { return { ok: false, note: `取り消しも失敗 (${short(e).slice(0, 80)})` }; }
     let v;
-    try { v = (await c.db.query('select ops.new_entry_lease_valid($1) as v', [KIND])).rows[0]?.v; }
+    try { v = (await query(c, 'select ops.new_entry_lease_valid($1) as v', [KIND], left(end, timeouts.queryMs), '閉じたかの確かめ')).rows[0]?.v; }
     catch (e) { return { ok: false, note: `取り消したが閉じたかを読めない (${short(e).slice(0, 80)})` }; }
     if (v === false) return { ok: true };
     return { ok: false, note: `取り消した後も有効と読めた (${JSON.stringify(v ?? null)})` };
   } finally {
-    try { await c.close(); } catch { /* */ }
+    await closeConn(c, Math.min(5000, timeouts.queryMs));
   }
 }
 
@@ -122,12 +156,12 @@ const unknownLine = (why, note) => `⚠️ ${HEAD} 状態不明 (開いている
  * 1 回ぶん。戻り値 = { code, state, line }
  *   state: opened / not_configured / not_applied / compare_not_ready / prep / denied / error / unknown
  */
-export async function runGateStep({ env = process.env, dataDir, now = new Date(), connect = connectGate, readEv = (d, a) => readEvidence(d, a) } = {}) {
+export async function runGateStep({ env = process.env, dataDir, now = new Date(), connect = connectGate, readEv = (d, a) => readEvidence(d, a), timeouts = TIMEOUTS } = {}) {
   const url = String(env[ENV_URL] || '').trim();
   if (!url) return { code: 0, state: 'not_configured', line: `${HEAD} 未設定 (${ENV_URL} が無い = この段は飛ばした)` };
   /** 開かなかった回の終わり方: 新しい接続で閉じたのを確かめた = 閉 (closedCode) / 確かめられない = 状態不明 (exit 1)。「閉」の語はここ (と runCli) だけ (#1645 Codex R2 High) */
   const closeOut = async (why, revokeReason, { closedCode = 1, state = 'error', line = null } = {}) => {
-    const v = await closeAndVerify(url, revokeReason, { connect });
+    const v = await closeAndVerify(url, revokeReason, { connect, timeouts });
     if (!v.ok) return { code: 1, state: 'unknown', line: unknownLine(why, v.note) };
     return { code: closedCode, state, line: line || `${HEAD} 閉 (${why})` };
   };
@@ -139,23 +173,24 @@ export async function runGateStep({ env = process.env, dataDir, now = new Date()
   catch (e) { ev = { error: short(e) }; }
   const cr = compareRunOf(ev, { asOf, syncRunId });
 
+  // 許可を出す側は mainMs まで (接続・確かめ・grant の全部に期限)。grant が返らない = 応答を待たずに切って、新しい接続で閉じて確かめる (#1645 Codex R3 High)
+  const end = Date.now() + timeouts.mainMs;
   let c;
-  try { c = await connect(url); }
+  try { c = await openConn(connect, url, left(end, timeouts.connectMs)); }
   catch (e) { const why = `接続できない: ${short(e).slice(0, 120)}`; return closeOut(why, `新商品の許可の段: ${why}`); }
   let phase = 'check', granted = false, g = null, grantError = null;
   try {
-    const db = c.db;
-    const has = (await db.query("select to_regprocedure('ops.grant_new_entry_lease(text, text)') is not null as ok")).rows[0]?.ok === true;
+    const has = (await query(c, "select to_regprocedure('ops.grant_new_entry_lease(text, text)') is not null as ok", undefined, left(end, timeouts.queryMs), '関数の確かめ')).rows[0]?.ok === true;
     if (!has) return { code: 0, state: 'not_applied', line: `${HEAD} 0058 の前 (許可の関数が無い = 許可そのものが無い・この段は飛ばした)` };
     if (cr.ok) {
       phase = 'grant';
-      try { g = (await db.query('select ops.grant_new_entry_lease($1, $2) as r', [KIND, cr.compareRunId])).rows[0]?.r ?? null; granted = true; }
+      try { g = (await query(c, 'select ops.grant_new_entry_lease($1, $2) as r', [KIND, cr.compareRunId], left(end, timeouts.queryMs), '許可 (grant) ')).rows[0]?.r ?? null; granted = true; }
       catch (e) { grantError = e; }
     }
   } catch (e) {
     grantError = grantError || e;
   } finally {
-    try { await c.close(); } catch { /* */ }
+    await closeConn(c, Math.min(5000, timeouts.queryMs));
   }
 
   if (!cr.ok) {
@@ -187,15 +222,15 @@ export async function runGateStep({ env = process.env, dataDir, now = new Date()
  * CLI の 1 回 (試験が env・接続を差し替える)。引数の間違い・最上位の例外 = URL があれば新しい接続で閉じて確かめる (#1645 Codex R2 High)。
  *   確かめた = 閉・exit 1 / 確かめられない = 状態不明・exit 1 / URL が無い = 許可は出していない (「閉」とは言わない)・exit 1
  */
-export async function runCli(argv, { env = process.env, connect = connectGate, readEv = undefined, now = undefined } = {}) {
+export async function runCli(argv, { env = process.env, connect = connectGate, readEv = undefined, now = undefined, timeouts = TIMEOUTS } = {}) {
   try {
     const a = parseArgs(argv);
-    return await runGateStep({ env, dataDir: (a.dataDir || env.DATA_DIR || '').trim(), connect, ...(readEv ? { readEv } : {}), ...(now ? { now } : {}) });
+    return await runGateStep({ env, dataDir: (a.dataDir || env.DATA_DIR || '').trim(), connect, timeouts, ...(readEv ? { readEv } : {}), ...(now ? { now } : {}) });
   } catch (e) {
     const why = `この段が落ちた: ${short(e).slice(0, 160)}`;
     const url = String(env[ENV_URL] || '').trim();
     if (!url) return { code: 1, state: 'error', line: `${HEAD} ${why} (${ENV_URL} が無い = 許可は出していない)` };
-    const v = await closeAndVerify(url, `新商品の許可の段: ${why}`, { connect });
+    const v = await closeAndVerify(url, `新商品の許可の段: ${why}`, { connect, timeouts });
     return v.ok ? { code: 1, state: 'error', line: `${HEAD} 閉 (${why})` } : { code: 1, state: 'unknown', line: unknownLine(why, v.note) };
   }
 }

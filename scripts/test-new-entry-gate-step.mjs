@@ -16,6 +16,8 @@
  *     確かめられない = 「⚠️ 状態不明 (開いている可能性)」・exit 1。「閉」と出すのは閉じたのを確かめたときだけ
  *  12 (#1645 Codex R2 High) DATA_DIR が無い・引数の間違い・最上位の例外も、URL があれば新しい接続で閉じて確かめる (開いた許可が閉じる)・
  *     確かめられない = 状態不明。URL が無い = 「閉」と言わない。どの試験でも「閉」の行は、偽の DB が閉じたのを確かめた回だけ (run・cli の共通の確かめ)
+ *  13 (#1645 Codex R3 High) grant・接続・revoke・確かめが返らない = client 側の期限で切って (接続を壊す) 閉じる道を通る (閉 / 状態不明)・
+ *     段全体が期限の合計の中で終わる。本番の期限の合計は親の 120 秒より十分短い
  * 使い方: node scripts/test-new-entry-gate-step.mjs
  */
 import assert from 'node:assert/strict';
@@ -44,32 +46,39 @@ const evOk = (over = {}) => ({ name: 'master-compare', state: 'complete', as_of:
  *   grantDropped = grant は DB で通った (開いた) が応答が切れた・その接続はもう使えない
  */
 function fakeDb({ hasFn = true, grant = undefined, grantError = null, grantDropped = false, revokeError = null, validError = null, validAfterRevoke = false,
-  queryError = null, connectFailFrom = null, openAtStart = false } = {}) {
+  queryError = null, connectFailFrom = null, openAtStart = false, hang = {} } = {}) {
   const calls = [];
+  const killed = [];
+  const never = () => new Promise(() => {});   // 返らない (応答が失われた)
   let closed = 0, n = 0, open = openAtStart, verified = false;
   const connect = async () => {
     n++;
+    if (hang.connectFrom != null && n >= hang.connectFrom) return never();
     if (connectFailFrom != null && n >= connectFailFrom) throw new Error(`ECONNREFUSED (接続 ${n})`);
     const id = n;
     let dead = false;
     const db = {
       async query(text, params) {
         calls.push({ conn: id, text, params });
+        if (hang.anyOnConn === id) return never();
         if (dead) throw new Error('Client was closed and is not queryable');
         if (queryError && id === 1) throw new Error(queryError);
         if (/to_regprocedure\('ops\.grant_new_entry_lease\(text, text\)'\)/.test(text)) return { rows: [{ ok: hasFn }] };
         if (/ops\.grant_new_entry_lease\(\$1, \$2\)/.test(text)) {
           if (grantError) { const e = new Error(grantError); e.code = 'P0001'; throw e; }
           open = true;
+          if (hang.grant) return never();   // DB では commit した (開いた) が応答が返らない
           if (grantDropped) { dead = true; throw new Error('Connection terminated unexpectedly'); }
           return { rows: [{ r: grant !== undefined ? grant : { lease_id: '7', kind: 'single', result_id: '42', compare_run_id: params[1], expires_at: '2026-10-07T22:00:00+00:00' } }] };
         }
         if (/ops\.revoke_new_entry_lease\(\$1, \$2\)/.test(text)) {
+          if (hang.revoke) return never();
           if (revokeError) throw new Error(revokeError);
           open = false;
           return { rows: [{ r: { revoked: 1, floor_result_id: '42' } }] };
         }
         if (/ops\.new_entry_lease_valid\(\$1\)/.test(text)) {
+          if (hang.valid) return never();
           if (validError) throw new Error(validError);
           const v = validAfterRevoke ? true : open;
           if (v === false) verified = true;
@@ -78,9 +87,9 @@ function fakeDb({ hasFn = true, grant = undefined, grantError = null, grantDropp
         throw new Error(`知らない問い合わせ: ${text}`);
       },
     };
-    return { db, close: async () => { closed++; } };
+    return { db, close: async () => { closed++; if (hang.close) return never(); }, kill: () => { killed.push(id); dead = true; } };
   };
-  return { calls, connect, closed: () => closed, connections: () => n, isOpen: () => open, verifiedClosed: () => verified };
+  return { calls, connect, closed: () => closed, connections: () => n, isOpen: () => open, verifiedClosed: () => verified, killed: () => killed };
 }
 /** 「閉」の語 (閉じ… を除く) を出した行は、偽の DB が閉じたのを確かめた回だけ (#1645 Codex R2 High) */
 function assertClosedOnlyIfVerified(r, f) {
@@ -439,6 +448,76 @@ await ta('[12] (#1645 R2 High) DATA_DIR が無い・引数の間違い・最上�
   const outs = src.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*\*)/.test(l) && /\$\{HEAD\} 閉(?!じ)/.test(l));
   assert.equal(outs.length, 3, outs.join('\n'));
   assert.ok(outs.every((l) => /line: line \|\| `\$\{HEAD\} 閉 \(\$\{why\}\)`|closeOut\(`widen の前|return v\.ok \? \{ code: 1, state: 'error', line: `\$\{HEAD\} 閉/.test(l)), outs.join('\n'));
+});
+
+await ta('[13] (#1645 R3 High) 返らない grant・接続・revoke・確かめ = client 側の期限で切って閉じる道を通る (閉 / 状態不明)・段全体が期限の中で終わる', async () => {
+  const T = { connectMs: 40, queryMs: 60, mainMs: 150, closeMs: 120 };
+  const LIMIT = T.mainMs + T.closeMs + 2 * Math.min(5000, T.queryMs) + 250;   // 段全体の上限 (切断の待ちと余裕を足す)
+  /** 試験そのものが止まらないように (守りを外したときに無限に待たない) */
+  const within = async (p, ms = 3000) => { let t; try { return await Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`試験: ${ms}ms で終わらない = 期限が効いていない`)), ms); })]); } finally { clearTimeout(t); } };
+  const step = async (f, opt = {}) => {
+    const t0 = Date.now();
+    const r = await within(S.runGateStep({ env: ENV, dataDir: 'D:/fake', now: NOW, connect: f.connect, timeouts: T, readEv: () => ({ 'master-compare': evOk() }), ...opt }));
+    const ms = Date.now() - t0;
+    assert.ok(ms < LIMIT, `段全体 ${ms}ms ≧ ${LIMIT}ms`);
+    return assertClosedOnlyIfVerified(r, f);
+  };
+  // ① grant は DB で開いたが返らない → 期限で切って (接続 1 を壊す) 新しい接続で閉じて確かめる = 閉・exit 1
+  const a = fakeDb({ hang: { grant: true } });
+  const ra = await step(a);
+  assert.deepEqual([ra.code, ra.state], [1, 'error']);
+  assert.match(ra.line, /^🆕 新商品の入口: 閉 \(許可を出せない: 許可 \(grant\) が \d+ms で返らない \(応答を待たずに接続を切った\)\)$/);
+  assert.equal(a.isOpen(), false);
+  assertFreshCloseVerify(a);
+  assert.ok(a.killed().includes(1), JSON.stringify(a.killed()));
+  // ② grant が返らず、閉じる接続も返らない = 状態不明 (開いたまま)・期限の中で終わる
+  const b = fakeDb({ hang: { grant: true, connectFrom: 2 } });
+  const rb = await step(b);
+  assert.deepEqual([rb.code, rb.state], [1, 'unknown']);
+  assert.match(rb.line, /^⚠️ 🆕 新商品の入口: 状態不明 \(開いている可能性・許可を出せない: 許可 \(grant\) が .* \/ 取り消しの接続もできない \(接続が \d+ms で返らない\)\)$/);
+  assert.equal(b.isOpen(), true);
+  // ③ grant が返らず、閉じる側の revoke も返らない = 状態不明
+  const c = fakeDb({ hang: { grant: true, revoke: true } });
+  const rc = await step(c);
+  assert.deepEqual([rc.code, rc.state], [1, 'unknown']);
+  assert.match(rc.line, /取り消しも失敗 \(取り消しが \d+ms で返らない/);
+  // ④ 閉じる側の確かめ (new_entry_lease_valid) が返らない = 状態不明
+  const d = fakeDb({ hang: { grant: true, valid: true } });
+  const rd = await step(d);
+  assert.deepEqual([rd.code, rd.state], [1, 'unknown']);
+  assert.match(rd.line, /取り消したが閉じたかを読めない \(閉じたかの確かめが \d+ms で返らない/);
+  // ⑤ 最初の接続が返らない = 新しい接続で閉じて確かめる = 閉
+  const e = fakeDb({ hang: { connectFrom: 1 } });
+  let k = 0;
+  const e2 = fakeDb({ openAtStart: true });
+  const conn = (u) => (++k === 1 ? e.connect(u) : e2.connect(u));
+  const re = assertClosedOnlyIfVerified(await within(S.runGateStep({ env: ENV, dataDir: 'D:/fake', now: NOW, connect: conn, timeouts: T, readEv: () => ({ 'master-compare': evOk() }) })), e2);
+  assert.deepEqual([re.code, re.state], [1, 'error']);
+  assert.match(re.line, /^🆕 新商品の入口: 閉 \(接続できない: 接続が \d+ms で返らない\)$/);
+  assert.equal(e2.isOpen(), false);
+  // ⑥ 関数の確かめが返らない = 切って閉じて確かめる
+  const g = fakeDb({ hang: { anyOnConn: 1 } });
+  const rg = await step(g);
+  assert.deepEqual([rg.code, rg.state], [1, 'error']);
+  assert.match(rg.line, /関数の確かめが \d+ms で返らない/);
+  // ⑦ 切断 (close) が返らない = 待ち続けない (壊して進む)。許可は開いたまま返る
+  const h = fakeDb({ hang: { close: true } });
+  const rh = await step(h);
+  assert.equal(rh.state, 'opened');
+  // ⑧ 引数の間違い + 閉じる接続が返らない (CLI の道) = 状態不明・期限の中
+  const i = fakeDb({ openAtStart: true, hang: { connectFrom: 1 } });
+  const ri = assertClosedOnlyIfVerified(await within(S.runCli(['--bogus'], { env: { ...ENV, DATA_DIR: 'D:/fake' }, connect: i.connect, timeouts: T })), i);
+  assert.deepEqual([ri.code, ri.state], [1, 'unknown']);
+  // 本番の期限: 段全体 (許可の側 + 閉じる側 + 切断 2 回) ≦ 60 秒・親 (daily-sync / retry) の 120 秒から CLI の終わりの待ち 10 秒を引いても余る
+  const D = S.TIMEOUTS;
+  assert.deepEqual(D, { connectMs: 10000, queryMs: 15000, mainMs: 30000, closeMs: 25000 });
+  assert.ok(D.mainMs + D.closeMs + 2 * Math.min(5000, D.queryMs) <= 65000);
+  assert.ok(D.mainMs + D.closeMs <= 60000 && D.connectMs + 2 * D.queryMs <= D.mainMs + D.closeMs);
+  const R = await import('../apps/warehouse/retry-failed-jobs.js');
+  assert.equal(R.JOB_DEFINITIONS['新商品の許可'].timeoutMs, 120000);
+  const ds = fs.readFileSync(path.join(ROOT, 'apps/warehouse/daily-sync.js'), 'utf8');
+  assert.match(ds, /runScript\('apps\/company-db\/master-compare\/new-entry-gate\.mjs --daily', NEW_ENTRY_GATE_STEP, 120000\)/);
+  assert.ok(D.mainMs + D.closeMs + 2 * Math.min(5000, D.queryMs) + 10000 < 120000);
 });
 
 console.log(`\n${passed} 件 ok${process.exitCode ? ' (NG あり)' : ''}`);
