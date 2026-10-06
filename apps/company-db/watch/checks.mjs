@@ -824,9 +824,11 @@ function evalW13Ne(config, check, res, ev, base0) {
   if (ne.verdict === 'error') return hold(`照合 ② が落ちた (${String(ne.error || '').slice(0, 160)})`);
   if (ne.verdict === 'blocked') return hold(`照合 ② が判定できない (${ne.blocked_reason})`);
   if (ne.format !== config.W13_NE_FORMAT) return hold(`照合 ② の形が違う (${ne.format})`);
-  // 新商品の確かめの後の読み直しを読めない = 確かめが状態を進めたかもしれない = 確かめの前の数で pass にしない (案件は保持。#1635 Codex R3)
+  // 新商品の確かめの後の読み直しを読めない・確かめの後の証跡を書けていない (pending の印が残った) = 確かめが状態を進めたかもしれない =
+  //   確かめの前の数で pass にしない (案件は保持。#1635 Codex R3・R4)。skipped = 確かめが何も変えていない = 確かめの前の数で判定してよい
   const ra = ev.ne && ev.ne.reg_after_check;
-  if (ra && ra.state !== 'ok') return hold(`新商品の NE 登録の確かめの後の数を読めない (${String(ra.reason || ra.state).slice(0, 80)})`);
+  if (ra && ra.state === 'pending') return hold('新商品の NE 登録の確かめの後の証跡が書けていない (確かめの前の数のまま)');
+  if (ra && ra.state !== 'ok' && ra.state !== 'skipped') return hold(`新商品の NE 登録の確かめの後の数を読めない (${String(ra.reason || ra.state).slice(0, 80)})`);
   const items = Array.isArray(ne.items) ? ne.items : null, held = ne.held && typeof ne.held === 'object' ? ne.held : null, rec = Array.isArray(ne.recoverable) ? ne.recoverable : null;
   if (!items || !held || !rec) return hold('照合 ② の案件・保持・回復の一覧が無い');
   if (ne.counts && ne.counts.items != null && ne.counts.items !== items.length) return hold('照合 ② の件数が食い違う');

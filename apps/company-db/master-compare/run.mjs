@@ -157,7 +157,7 @@ export async function regAfterCheck(db, ne, checkCounts) {
 /** 確かめの後の読み直しを読めない (確かめが状態を進めたかもしれない = 確かめの前の数で ✅ にしない)。確かめの内訳は参考に出す */
 export function regAfterCheckTrouble(ne) {
   const a = ne && ne.reg_after_check;
-  if (!a || a.state === 'ok') return null;
+  if (!a || a.state === 'ok' || a.state === 'skipped') return null;   // skipped = 確かめが何も変えていない (確かめの前の数のまま正しい)
   const ck = a.check && typeof a.check === 'object' ? Object.entries(a.check).map(([k, v]) => `${k} ${v}`).join('・') : '';
   return `新商品の NE 登録の確かめの後の数を読めない (${String(a.reason || a.state).slice(0, 80)})${ck ? ` — 確かめ: ${ck}` : ''}`;
 }
@@ -324,6 +324,9 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         decisions_read: result.ne.decisions_read ?? null, decisions_write: result.ne.decisions_write ?? null,
         ne_codes: result.ne.ne_codes ? { state: result.ne.ne_codes.state, reason: result.ne.ne_codes.reason ?? null, counts: result.ne.ne_codes.counts ?? null, write: result.ne.ne_codes.write ?? null } : null,
         registrations: regEvidence(),
+        // 新商品の確かめがこの後に走る回 = 確かめの前の完了の証跡には「確かめの後の数はまだ」の印 (fail-closed)。最後の書き直しが成功したときだけ ok / skipped に変わる
+        //   (書き直しも failed の書き込みも落ちた = 印が残る = W13:ne は blocked。#1635 Codex R4)
+        ...(result.ne.registrations && result.ne.registrations.write === 'observed' ? { reg_after_check: { state: 'pending' } } : {}),
         baseline: result.ne.baseline ? { state: result.ne.baseline.state, held_reason: result.ne.baseline.held_reason ?? null, write: result.ne.baseline.write ?? null, write_code: result.ne.baseline.write_code ?? null,
           counts: result.ne.baseline.counts ?? null, written: result.ne.baseline.written ?? null } : null } : null,
       // ②b 古い表 (由来 = 作り直しの ID・写しの世代。比べない朝は not_applied と理由だけ)
@@ -347,9 +350,11 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         catch (e) { Object.assign(rg, { write: 'check_failed', write_error: String(e && e.message).slice(0, 200) }); }
       }
       // 確かめで今日 failed / partial になった商品も今日の要約・証跡 (W13 が読む) に出す = 登録の段階を読み直して数え直す (全件 JSON は不変のまま。#1635 Codex R2 Medium)
-      if (rg.write === 'ok') result.ne.reg_after_check = await regAfterCheck(db, result.ne, rg.written?.counts ?? null);
+      //   確かめが走らなかった・落ちた (1 つの関数 = 何も変えていない) = skipped (確かめの前の数のまま正しい)
+      result.ne.reg_after_check = rg.write === 'ok' ? await regAfterCheck(db, result.ne, rg.written?.counts ?? null)
+        : { state: 'skipped', reason: rg.seal !== 'ok' ? `seal_${rg.seal ?? 'none'}` : rg.write };
       evidence.ne.registrations = regEvidence();
-      if (result.ne.reg_after_check) evidence.ne.reg_after_check = result.ne.reg_after_check;
+      evidence.ne.reg_after_check = result.ne.reg_after_check;
       // 確かめの後の証跡を書けない = W13 が確かめの前の数を読む → 回を失敗にする (外の catch が state = failed を書く = W13 は blocked・daily-sync は再試行。#1635 Codex R3)
       let rewritten = null;
       try { rewritten = write(dataDir, EVIDENCE_NAME, evidence); } catch { rewritten = null; }

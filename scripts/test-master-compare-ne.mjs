@@ -1141,6 +1141,7 @@ await ta('[29] 新商品の NE 登録の CSV (⑤-2b): ② が最後まで走っ
   const failAt = (re) => ({ query: async (sql, p) => { if (re.test(sql)) throw new Error('writer down'); return db.query(sql, p); } });
   x = await day('2030-04-06', { ne: NEh, compareExtra: { writerDb: failAt(/seal_ne_registration_run/) } });
   assert.deepEqual([x.result.ne.registrations.write, x.result.ne.registrations.seal, x.evidence.state], ['observed', 'failed', 'complete'], JSON.stringify(x.result.ne.registrations));
+  assert.deepEqual(x.evidence.ne.reg_after_check, { state: 'skipped', reason: 'seal_failed' });   // 確かめが走らなかった = 何も変えていない = 確かめの前の数のまま (#1635 Codex R4)
   assert.deepEqual([(await pg.query('select state from ops.ne_reg_export_items where item_id = $1', [it])).rows[0].state,
     (await pg.query('select state from ops.master_registrations where sku_id = $1', [sid])).rows[0].state], ['import_declared', 'ne_pending']);
   await assert.rejects(pg.query('select ops.record_ne_registration_check($1)', [x.result.compare_run_id]), /not_sealed/);
@@ -1496,13 +1497,28 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
   assert.deepEqual([wU.verdict], ['blocked']);
   assert.match(wU.reason, /確かめの後の数を読めない/);
   // 確かめの後の証跡を書けない (writeEvidence は失敗で null を返す) = 回を失敗にする (state = failed = W13 は blocked・daily-sync は再試行)
-  const noAfter = (d0, n0, p0) => (p0.state === 'complete' && p0.ne && p0.ne.reg_after_check ? null : writeEvidence(d0, n0, p0, { now: at('2030-08-20', '08:40'), warn: quiet }));
+  const noAfter = (d0, n0, p0) => (p0.state === 'complete' && p0.ne && p0.ne.reg_after_check && p0.ne.reg_after_check.state !== 'pending' ? null : writeEvidence(d0, n0, p0, { now: at('2030-08-20', '08:40'), warn: quiet }));
   const wf = await compare('2030-08-20', { write: noAfter }).catch((e) => e);
   assert.match(String(wf && wf.message), /証跡 \(新商品の確かめの後\) を書けない/);
   const evF = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
   assert.equal(evF.state, 'failed');
   const wF = (await evalW13({ config: W13CFG, asOf: '2030-08-20', evidence: null, syncRunId: null, openIssues: [], dataDir: tmp }, W13CFG.checkById('W13'))).find((r) => r.scopeKey === 'ne');
   assert.equal(wF.verdict, 'blocked');
+  // 確かめの後の書き直しも failed の書き込みも落ちた (同じファイルの障害が続く) = 確かめの前の完了の証跡に残した印 (pending) で W13:ne は blocked (#1635 Codex R4)
+  const bothFail = (d0, n0, p0) => (p0.state === 'failed' || (p0.state === 'complete' && p0.ne && p0.ne.reg_after_check && p0.ne.reg_after_check.state !== 'pending') ? null
+    : writeEvidence(d0, n0, p0, { now: at('2030-08-20', '08:40'), warn: quiet }));
+  const bf = await compare('2030-08-20', { write: bothFail }).catch((e) => e);
+  assert.match(String(bf && bf.message), /証跡 \(新商品の確かめの後\) を書けない/);
+  const evB = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
+  assert.deepEqual([evB.state, evB.ne.reg_after_check], ['complete', { state: 'pending' }]);
+  const wB = (await evalW13({ config: W13CFG, asOf: '2030-08-20', evidence: null, syncRunId: null, openIssues: [], dataDir: tmp }, W13CFG.checkById('W13'))).find((r) => r.scopeKey === 'ne');
+  assert.equal(wB.verdict, 'blocked');
+  assert.match(wB.reason, /確かめの後の証跡が書けていない/);
+  // ふつうの朝は最後の書き直しで ok (印が残らない)
+  const ok2 = await compare('2030-08-20');
+  assert.equal(ok2.evidence.ne.reg_after_check.state, 'ok');
+  const evO = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
+  assert.equal(evO.ne.reg_after_check.state, 'ok');
 });
 
 await pg.close();

@@ -228,6 +228,17 @@ await ta('[9] ポータルで登録した新商品: NE 登録待ち (out_of_scop
   assert.equal(res(r4, 'ne').verdict, 'blocked');
   assert.match(res(r4, 'ne').reason, /確かめの後の数を読めない \(reread down\)/);
   assert.deepEqual(await regIssues('open'), openBefore);
+  // 確かめの後の証跡を書けていない (確かめの前の完了の証跡の pending の印が残った) = blocked・保持 / skipped (確かめが何も変えていない) = 判定する (#1635 Codex R4)
+  const ev5 = evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: {}, extraCounts: { reg_pending: 0 } } });
+  ev5.ne.reg_after_check = { state: 'pending' };
+  const r5 = await run(d, ev5, '2026-10-04T23:50:00Z');
+  assert.deepEqual([res(r5, 'ne').verdict, res(r5, 'ne').reason], ['blocked', '新商品の NE 登録の確かめの後の証跡が書けていない (確かめの前の数のまま)']);
+  assert.deepEqual(await regIssues('open'), openBefore);
+  const ev6 = evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: {}, extraCounts: { reg_pending: 0 } } });
+  ev6.ne.reg_after_check = { state: 'skipped', reason: 'seal_failed' };
+  const r6 = await run(d, ev6, '2026-10-04T23:55:00Z');
+  assert.equal(res(r6, 'ne').verdict, 'pass');
+  assert.deepEqual(await regIssues('open'), []);   // 回復 (recoverable)
 });
 
 await pg.close();
