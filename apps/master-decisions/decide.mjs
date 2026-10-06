@@ -22,6 +22,9 @@ const FP_RE = /^[0-9a-f]{64}$/;
 const RUN_RE = /^mc_\d{8}T\d{9}Z_[0-9a-f]{6}$/;
 const ABSENT = '__absent__';
 const FIX = new Set(['fix_ne', 'fix_cdb']);
+const NO_CDB_DEFAULT = new Set(['cdb_name_is_code', 'name_like_code', 'cdb_zero_yen', 'company_owned']);
+/** 名前が商品コードと同じ (照合の正規化で) = 名前ではない (compare-ne の nameIsCode と同じ決まり) */
+export const nameIsCodeOf = (v, codeNorm) => typeof v === 'string' && !!codeNorm && normSku(v) === normSku(codeNorm);
 
 /** 入力の誤り (400) */
 export class DecideError extends Error {
@@ -182,6 +185,8 @@ export function defaultTargetValue(c, resolution) {
   if (c.col === 'parent') return undefined;   // 代表は目標の入力が必須 (提案の値で「目標が無い」と「親なし」を取り違えない。D3b v2 M3)
   const p = c.proposal || {};
   if (resolution === 'fix_ne' && p.op === 'set_ne_value' && p.value !== undefined && p.value !== null) return p.value;
+  // 社内が正の列の判断 (名前がコード・社内 0 円) は、社内を NE の値に戻す既定を出さない (持ち主を逆転させない。#1629 Codex R1)
+  if (resolution === 'fix_cdb' && NO_CDB_DEFAULT.has(c.reason_kind ?? c.print?.reason_kind)) return undefined;
   if (resolution === 'fix_cdb') {   // manual を CDB で直す = NE の値に合わせる
     const n = c.print?.n;
     if (n === '(無い)') return ABSENT;
@@ -219,7 +224,7 @@ export async function applyDecisions(db, { actor, kind, resolution = null, note 
     const csv = await csvApplied(db);
     if (csv) await db.query(CSV_LOCK_SQL);   // CSV の鍵 → 候補の行 (CSV の操作と同じ順)
     // 候補の行を指紋の順に取る (照合の完了の関数と同じ行・同じ順 = 待ち合いはしてもデッドロックしない)
-    const cands = new Map((await db.query(`select fingerprint, subject_key, code_norm, col, child, resolutions, proposal, print, last_seen_run from ops.master_decision_candidates
+    const cands = new Map((await db.query(`select fingerprint, subject_key, code_norm, col, child, reason_kind, resolutions, proposal, print, last_seen_run from ops.master_decision_candidates
       where fingerprint = any($1::text[]) order by fingerprint for update`, [fps])).rows.map((r) => [r.fingerprint, r]));
     const latest = await latestRun(db);
     const lastDecision = new Map((await db.query(`select distinct on (fingerprint) fingerprint, event_id, kind from ops.master_decision_events
@@ -246,6 +251,8 @@ export async function applyDecisions(db, { actor, kind, resolution = null, note 
           const nv = normalizeTarget(c.col, raw, { selfNorm });
           // 入れた値が読めない = invalid_target / 提案の値が目標にできない (複数の仕入先など) = 値を入れて 1 件ずつ
           if (!nv.ok) { skip(given !== undefined ? 'invalid_target' : 'needs_target'); continue; }
+          // NE の名前を商品コードにしない (コードは名前ではない。社内の名前がコードのまま = 夜間ロードの代わりの値。2026-10-05 の 383 セット)。CSV (ne-csv.mjs) にも同じ守り
+          if (resolution === 'fix_ne' && c.col === 'name' && nameIsCodeOf(nv.value, c.code_norm)) { skip('name_is_code'); continue; }
           target = { subject_key: c.subject_key, col: c.col, child: c.child ?? null, value: nv.value };
         }
       } else if (kind === 'revoked' && (!last || last.kind === 'revoked')) { skip('nothing_to_revoke'); continue; }

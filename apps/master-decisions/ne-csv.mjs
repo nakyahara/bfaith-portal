@@ -15,7 +15,7 @@
  * 🚨 時刻の判定 (今日・同じ日・次の日) は JST。nowMs を渡す (試験で日をまたぐ)
  */
 import crypto from 'node:crypto';
-import { DecideError } from './decide.mjs';
+import { DecideError, nameIsCodeOf } from './decide.mjs';
 import { CSV_LOCK_SQL, csvApplied } from './ne-csv-lock.mjs';
 
 // ne-csv-v2 (③b-1b): コードを NE の元の書き方で書く (v1 = 小文字の norm)。前の版の実機の確かめは引き継がない
@@ -55,10 +55,11 @@ export const COLUMNS = Object.freeze({
   'products:name': { kind: 'products', col: 'name', code: 'syohin_code', ne: 'syohin_name', cell: nameCell },
   'products:handling': { kind: 'products', col: 'handling', code: 'syohin_code', ne: 'toriatukai_kbn',
     cell: (v) => (v === 'active' ? okCell('0') : v === 'discontinued' ? okCell('1') : bad('handling_value')) },   // 1 = 取扱中止 (2 メーカー取扱中止 には戻さない)
-  'products:tax_rate': { kind: 'products', col: 'tax_rate', code: 'syohin_code', ne: 'tax_rate',
+  // 税率 = NE の「消費税率 (%)」= 10 / 8 の整数 (Company DB の 0.1 / 0.08 を % に)。0.1・0.08 のまま書かない (cellRe で buildCsv が二重に確かめる)
+  'products:tax_rate': { kind: 'products', col: 'tax_rate', code: 'syohin_code', ne: 'tax_rate', cellRe: /^(10|8)$/,
     cell: (v) => (v === 0.1 ? okCell('10') : v === 0.08 ? okCell('8') : bad('tax_value')) },
-  'products:standard_price_jpy': { kind: 'products', col: 'standard_price_jpy', code: 'syohin_code', ne: 'baika_tnk', cell: yenCell },
-  'products:cost': { kind: 'products', col: 'cost', code: 'syohin_code', ne: 'genka_tnk', cell: yenCell },
+  'products:standard_price_jpy': { kind: 'products', col: 'standard_price_jpy', code: 'syohin_code', ne: 'baika_tnk', cellRe: /^[1-9]\d*$/, cell: yenCell },
+  'products:cost': { kind: 'products', col: 'cost', code: 'syohin_code', ne: 'genka_tnk', cellRe: /^[1-9]\d*$/, cell: yenCell },
   // 仕入先 = 4 桁の数字だけ (照合の正規化と NE の表記が同じ形。9999 = NE の「設定なし」も承認の値のまま)
   'products:primary_supplier': { kind: 'products', col: 'primary_supplier', code: 'syohin_code', ne: 'sire_code',
     cell: (v) => (typeof v === 'string' && /^\d{4}$/.test(v) ? okCell(v) : bad('supplier_format')) },
@@ -66,7 +67,7 @@ export const COLUMNS = Object.freeze({
   'products:parent': { kind: 'products', col: 'parent', code: 'syohin_code', ne: 'daihyo_syohin_code',
     cell: (v) => (v === null ? okCell('empty') : typeof v === 'string' && NE_CODE_RE.test(v) && !isEmptyWord(v) ? okCell(v) : bad('parent_code')) },
   'sets:name': { kind: 'sets', col: 'name', code: 'set_syohin_code', ne: 'set_syohin_name', cell: nameCell },
-  'sets:standard_price_jpy': { kind: 'sets', col: 'standard_price_jpy', code: 'set_syohin_code', ne: 'set_baika_tnk', cell: yenCell },
+  'sets:standard_price_jpy': { kind: 'sets', col: 'standard_price_jpy', code: 'set_syohin_code', ne: 'set_baika_tnk', cellRe: /^[1-9]\d*$/, cell: yenCell },
 });
 export const specOf = (kind, col) => (Object.hasOwn(COLUMNS, `${kind}:${col}`) ? COLUMNS[`${kind}:${col}`] : null);
 export const headerOf = (spec) => [spec.code, spec.ne];
@@ -81,9 +82,32 @@ const quote = (s) => (/[",]/.test(s) || s !== s.trim() ? `"${s.replace(/"/g, '""
 export function buildCsv(spec, rows) {
   const header = headerOf(spec);
   if (header.some((h) => FORBIDDEN_HEADERS.includes(h))) throw new Error(`出してはいけない列: ${header.join(',')}`);
+  // 値の形の二重の守り: 税率は % の整数 (10 / 8)・売価/原価は 1 以上の整数。名前 = その行のコード は書かない (judge の後で崩れても CSV にしない)
+  for (const r of rows) {
+    if (spec.cellRe && !spec.cellRe.test(String(r.cell))) throw new Error(`${spec.kind}:${spec.col} の値の形が違う: ${r.ne_code} = ${r.cell}`);
+    if (spec.col === 'name' && nameIsCodeOf(String(r.cell), String(r.ne_code))) throw new Error(`名前が商品コードと同じ: ${r.ne_code}`);
+  }
   const lines = [header.join(','), ...rows.map((r) => [quote(r.ne_code), quote(r.cell)].join(','))];
   const bytes = Buffer.from(lines.join('\r\n') + '\r\n', 'utf8');
   return { bytes, sha256: crypto.createHash('sha256').update(bytes).digest('hex'), header: header.join(',') };
+}
+
+/**
+ * 保存したファイルを今の決まりで確かめ直す (直す前・古い版で作ったファイルを配らない・確かめ・申告で通さない。#1629 Codex R1 High)。
+ * 名前 = その行のコード (広い正規化で) / 値の形 (cellRe) / 今の buildCsv で作り直した byte 列が保存した byte 列と同じ。問題が無ければ null
+ * @param {{ kind, col }} e  ファイル / rows = 行 (row_id の順) / bytes = 保存した byte 列 (無ければ byte 列は照らさない)
+ */
+export function unsafeReason(e, rows, bytes = null) {
+  const spec = specOf(String(e.kind), String(e.col));
+  if (!spec) return 'col_not_csv';
+  if (spec.col === 'name' && rows.some((r) => nameIsCodeOf(String(r.cell), r.code_norm) || nameIsCodeOf(String(r.cell), r.ne_code))) return 'name_is_code';
+  let csv;
+  try { csv = buildCsv(spec, rows); } catch { return 'cell_format'; }
+  if (bytes && crypto.createHash('sha256').update(bytes).digest('hex') !== csv.sha256) return 'bytes_differ';
+  return null;
+}
+async function exportRowsOf(db, exportId) {
+  return (await db.query(`select ${ROW_COLS} from ops.ne_csv_export_rows where export_id = $1 order by row_id`, [exportId])).rows.map(shapeRow);
 }
 
 // ─────────── 時刻 (JST) ───────────
@@ -156,6 +180,8 @@ export function judge(u, ctx) {
     if (!parentOwn || parentOwn.state !== 'ok') return { ...base, status: 'ne_screen', reason: 'parent_code_unknown', key };
     value = parentOwn.ne_code;
   }
+  // 名前 = 商品コード は名前ではない (社内の名前がコードのまま = 夜間ロードの代わりの値)。承認されていても CSV に入れない (判断の API・照合と二重の守り。2026-10-05)
+  if (u.col === 'name' && (nameIsCodeOf(value, u.code_norm) || nameIsCodeOf(value, own.ne_code))) return { ...base, status: 'ne_screen', reason: 'name_is_code', key };
   const cv = spec.cell(value);
   if (!cv.ok) return { ...base, status: 'ne_screen', reason: cv.reason, key };
   const held = ctx.reservations.get(unitKey(u));
@@ -368,6 +394,9 @@ export async function exportFile(db, exportId, { nowMs = Date.now() } = {}) {
   if (ex.state === 'declared' && !declaredUsable(ex, { run: (await todayRun(db, nowMs)).run, released: await releasedExports(db, [ex.export_id]), nowMs })) return { state: 'retired', file_name: fileNameOf(ex), bytes: null };
   const bytes = Buffer.from(e.file_bytes);
   if (crypto.createHash('sha256').update(bytes).digest('hex') !== e.sha256) throw new Error(`ファイル ${exportId} の sha256 が記録と違う`);
+  // 今の決まりで確かめ直す (直す前に作った・確かめたファイルも、名前 = コードなどを含めば配らない。確かめを押していなくても)
+  const unsafe = unsafeReason(ex, await exportRowsOf(db, ex.export_id), bytes);
+  if (unsafe) return { state: 'unsafe', reason: unsafe, file_name: fileNameOf(ex), bytes: null };
   return { state: e.state, file_name: fileNameOf(ex), bytes };
 }
 
@@ -452,6 +481,13 @@ export async function checkExport(db, { actor, exportId, nowMs = Date.now() }) {
     if (e.state === 'declared') throw new DecideError('取り込んだと申告したファイルは確かめ直さない', 'already_declared');
     needToday(await todayRun(db, nowMs));
     const rows = (await db.query(`select ${ROW_COLS} from ops.ne_csv_export_rows where export_id = $1 order by row_id`, [exportId])).rows.map(shapeRow);
+    // 今の決まりで確かめ直す (直す前に作ったファイル = 名前 = コードなど)。外れたら void (作り直せる)
+    const bytesRow = (await db.query('select file_bytes from ops.ne_csv_exports where export_id = $1', [exportId])).rows[0];
+    const unsafe = unsafeReason(e, rows, bytesRow ? Buffer.from(bytesRow.file_bytes) : null);
+    if (unsafe) {
+      await voidIn(db, exportId, 'check_failed', actor, nowMs);
+      return { passed: false, voided: true, failures: rows.map((r) => ({ row_id: r.row_id, code_norm: r.code_norm, fingerprint: r.fingerprint, reason: `unsafe:${unsafe}` })), run: null };
+    }
     await lockCandidates(db, rows.map((r) => r.fingerprint).filter(Boolean));
     // 照合の回は候補の行を取った後に読む (その間に入った新しい回で判定する。#1495 Codex R1 High)。この後に入った回は、申告のときに照らす
     const tr = await todayRun(db, nowMs);
@@ -500,6 +536,10 @@ export async function declareExport(db, { actor, exportId, result, note = null, 
     if (e.state === 'declared' && !declaredUsable(e, { run: tr.run, released: await releasedExports(db, [exportId]), nowMs })) {
       throw new DecideError('この申告済みのファイルはもう使えません (次の日になった・新しい照合があった・行の予約が外れた)。取り込み直すなら作り直してください', 'retired');
     }
+    // 今の決まりで確かめ直す (直す前に確かめたファイルを申告で通さない)
+    const bytesRow = (await db.query('select file_bytes from ops.ne_csv_exports where export_id = $1', [exportId])).rows[0];   // ロードした (for update) ファイルの保存した byte 列
+    const unsafe = unsafeReason(e, await exportRowsOf(db, exportId), bytesRow ? Buffer.from(bytesRow.file_bytes) : null);
+    if (unsafe) throw new DecideError(`このファイルは今の決まりでは使えません (${unsafe})。取り込まないで、作り直してください`, 'unsafe');
     await db.query(`insert into ops.ne_csv_attempts (export_id, declared_by, declared_at, result, note) values ($1, $2, $3, $4, $5)`, [exportId, actor, iso(nowMs), result, note || null]);
     if (e.state === 'declared') return { state: 'declared', first_declared_at: e.declared_at };
     if (result === 'rejected_all') { await voidIn(db, exportId, 'rejected_all', actor, nowMs); return { state: 'void' }; }

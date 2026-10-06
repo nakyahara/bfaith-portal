@@ -42,7 +42,7 @@ const { buildPlanFromRender } = await import('../apps/company-db/load/sources.mj
 const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
 const { buildMaterialGeneration, saveMaterialSnapshot, materialDigest, projectMaterialRows, MATERIAL_COLUMNS } = await import('../apps/warehouse/material-lineage.js');
 const { MIRROR_PRODUCTS_DDL, MIRROR_SET_COMPONENTS_DDL } = await import('../apps/warehouse-mirror/material-tables.js');
-const { numState, textState, comparability, KNOWN_DIFF, ABSENT, compareNe } = await import('../apps/company-db/master-compare/compare-ne.mjs');
+const { numState, textState, comparability, KNOWN_DIFF, ABSENT, compareNe, nameIsCode } = await import('../apps/company-db/master-compare/compare-ne.mjs');
 const { writeDecisions } = await import('../apps/company-db/master-compare/decisions.mjs');
 const { runCompare, RESULT_DIR } = await import('../apps/company-db/master-compare/run.mjs');
 const { pendingDir } = await import('../apps/company-db/master-compare/pending.mjs');
@@ -666,6 +666,8 @@ await ta('[23] 判断の台帳 (D1): 候補を書く / 差を残す承認だけ�
   const approve = async (fp, resolution, target = null) => Number((await db.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', $2, $3::jsonb, 'user', 'test@example.com') returning event_id`,
     [fp, resolution, target ? JSON.stringify(target) : null])).rows[0].event_id);
   await day(d, { ne: NE });
+  // c003 = NE の売価 0 (値が無い)。NE の 0 と社内の 0 は差にしない (2026-10-05) = 社内に値 (3000) がある形で試す (最後に 0 に戻す)
+  await db.query(`update core.skus set standard_price_jpy = 3000 where code = 'c003'`);
   let x = await cmp();
   assert.equal(x.result.ne.decisions_write, 'ok', x.result.ne.decisions_write_error);
   const nCand = (await db.query('select count(*)::int as n from ops.master_decision_candidates')).rows[0].n;
@@ -713,6 +715,7 @@ await ta('[23] 判断の台帳 (D1): 候補を書く / 差を残す承認だけ�
   assert.equal(x.result.ne.decisions_write, 'not_configured');
   assert.match(x.line, /^⚠️ ②: 判断の台帳を書けない \(書く接続が無い: COMPANY_DB_WATCH_WRITER_URL\)/);
   assert.equal(x.evidence.ne.decisions_write, 'not_configured');
+  await db.query(`update core.skus set standard_price_jpy = 0 where code = 'c003'`);
   await redo(d, NE);
 });
 
@@ -1248,6 +1251,87 @@ await ta('[31] 持ち主が C の列は NE の値が空・0・null・不正で�
   const ne2 = clone(NE); ne2.products.find((r) => r.code === 'e005').price_src = J('');
   const y = await day('2030-06-03', { ne: ne2 });
   assert.deepEqual(clsOf(y.ne, 'value:e005', 'standard_price_jpy'), ['ne_no_value']);
+});
+
+await ta('[32] 持ち主が C の名前・売価・原価 (2026-10-05・#1629 Codex R1): 社内 0 円は実値 (NE の空・0・非 0 と一致にしない = cdb_zero_yen・NE を直すは出さない) / 社内の名前 = NE のコードで NE が空 = cdb_name_is_code / 証拠の無いコードに見える名前・NE も社内もコード名 = name_like_code (中立) / 写し待ちは rule_lag を先に / W13 の案件', async () => {
+  const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries((await import('../config/master-ownership.mjs')).OWNED_COLUMNS.map((k) => [k, 'load'])));
+  const own = { ...MASTER_OWNERSHIP, ...Object.fromEntries(['skus.name', 'products.name', 'skus.handling', 'products.status', 'skus.tax_rate', 'skus.tax_class', 'skus.standard_price', 'sku_costs', 'supplier_skus.is_primary'].map((k) => [k, 'company'])) };
+  const NE = baseNe();
+  await day('2030-07-01', { ne: NE });   // 持ち主が全部 load の日 = そろえる
+  const ne1 = clone(NE);
+  const P = (code, o) => Object.assign(ne1.products.find((r) => r.code === code), o);
+  P('a001', { name: 'a001' });                                       // NE も社内もコード名
+  P('b002', { cost_src: J('') });                                    // 名前: NE に名前・社内はコード (大文字) / 原価: NE が空・社内 override_zero の 0 円
+  P('c003', { name: '', price_src: J('0.00'), cost_src: J('0') });   // 名前: NE が空・社内 = NE のコード (夜間ロードの名残) / 売価: NE 0.00・社内 0 / 原価: NE 0・社内 override_zero 0
+  P('d004', { name: '', price_src: J('1980') });                     // 名前: NE が空・社内は全角のコード (証拠なし) / 売価: NE 1980・社内 0
+  P('e005', { price_src: J('0') });                                  // NE 0・社内 5555 = NE を 5555 に
+  P('f006', { tax_src: J(''), price_src: J('') });                   // 税率: NE が空・社内 0.1 / 売価: NE が空・社内 null = 一致
+  ne1.sets.filter((r) => r.parent === 's002').forEach((r) => { r.name = ''; r.price_src = J('0.00'); });   // セット: 名前が空・売価 0.00
+  const sku = (code, set) => db.query(`update core.skus set ${set} where code = '${code}'`);
+  const zeroCost = (code) => db.query(`update core.sku_costs set cost_jpy = 0, cost_source = 'override_zero', cost_status = 'OVERRIDDEN' where valid_to is null and sku_id = (select sku_id from core.skus where code = '${code}')`);
+  const cEdit = async () => {
+    await sku('a001', `name = 'a001', standard_price_jpy = 0`);   // 売価 0 は写し待ち (材料は前の 1000) = rule_lag
+    await sku('b002', `name = 'B002'`); await zeroCost('b002');
+    await sku('c003', `name = 'c003', standard_price_jpy = 0`); await zeroCost('c003');
+    await sku('d004', `name = 'Ｄ００４', standard_price_jpy = 0`);
+    await sku('e005', 'standard_price_jpy = 5555');
+    await sku('e005', `name = 'e005'`);                            // NE に名前あり・材料の名前が空・社内 = コード = 証拠なし (材料は由来の証明にしない。#1629 Codex R2)
+    await sku('f006', `name = 'f006', standard_price_jpy = null`);  // 名前: 材料は前の名前 (単品F) = rule_lag
+    await sku('s001', `name = 's001'`);                            // セット: NE に名前 (セット1)・材料の名前が空・社内 = コード = 証拠なし
+    await sku('s002', `name = 's002', standard_price_jpy = 0`);
+  };
+  // 今朝の写し = C の値 (a001 の売価と s001 の名前だけ前の値 = 写し待ち)
+  const copyOfC = toMaterial(ne1, (m) => {
+    for (const [code, k, v] of [['a001', '商品名', 'a001'], ['b002', '商品名', 'B002'], ['b002', '原価', 0], ['b002', '原価ソース', '例外'], ['b002', '原価状態', 'OVERRIDDEN'],
+      ['c003', '商品名', 'c003'], ['c003', '標準売価', 0], ['c003', '原価', 0], ['c003', '原価ソース', '例外'], ['c003', '原価状態', 'OVERRIDDEN'], ['d004', '商品名', 'Ｄ００４'], ['d004', '標準売価', 0],
+      ['e005', '標準売価', 5555], ['f006', '標準売価', null], ['f006', '消費税率', 0.1], ['s002', '商品名', 's002'], ['s002', '標準売価', 0]]) setMat(m, code, k, v);
+    setMat(m, 'a001', '標準売価', 1000); setMat(m, 'f006', '商品名', '単品F');   // 写し待ち
+    setMat(m, 'e005', '商品名', ''); setMat(m, 's001', '商品名', '');            // 材料の名前が空 (NE には名前がある)
+  });
+  const x = await day('2030-07-02', { ne: ne1, material: copyOfC, beforeLoad: cEdit, ownership: own });
+  const one = (key, c) => { const cc = col(x.ne, key, c); assert.equal(cc.length, 1, `${key} ${c}: ${JSON.stringify(cc)} held=${x.ne.held[key]}`); return cc[0]; };
+  const dec = (key, c) => x.ne.decisions.find((d) => d.subject_key === key && d.col === c);
+  const want = [
+    // [案件, 列, 分類, 理由, 提案, 選べる決め方]
+    ['value:c003', 'name', 'rule', 'cdb_name_is_code', { op: 'fill_cdb_name' }, ['fix_cdb', 'accept_difference']],
+    ['value:s002', 'name', 'rule', 'cdb_name_is_code', { op: 'fill_cdb_name' }, ['fix_cdb', 'accept_difference']],
+    ['value:b002', 'name', 'rule', 'name_like_code', { op: 'check_name' }, ['accept_difference', 'spec']],   // NE に名前 = 社内を NE に戻す既定は出さない
+    ['value:d004', 'name', 'rule', 'name_like_code', { op: 'check_name' }, ['accept_difference', 'spec']],   // 全角のコード = 夜間ロードの名残の証拠なし
+    ['value:a001', 'name', 'rule', 'name_like_code', { op: 'check_name' }, ['accept_difference', 'spec']],   // NE も社内もコード名 = 一致にしない
+    ['value:e005', 'name', 'rule', 'name_like_code', { op: 'check_name' }, ['accept_difference', 'spec']],   // 材料の名前が空でも NE に名前 = 証拠なし (単品)
+    ['value:s001', 'name', 'rule', 'name_like_code', { op: 'check_name' }, ['accept_difference', 'spec']],   // 同じ (セット)
+    ['value:f006', 'name', 'rule_lag', 'company_owned', { op: 'decide' }, ['accept_difference', 'fix_ne']],  // 写し待ちを隠さない (コード名でも NE をコードにする提案は出さない)
+    ['value:c003', 'standard_price_jpy', 'rule', 'cdb_zero_yen', { op: 'decide_zero' }, ['accept_difference', 'fix_cdb']],   // NE 0.00・社内 0
+    ['value:s002', 'standard_price_jpy', 'rule', 'cdb_zero_yen', { op: 'decide_zero' }, ['accept_difference', 'fix_cdb']],   // セット
+    ['value:d004', 'standard_price_jpy', 'rule', 'cdb_zero_yen', { op: 'decide_zero' }, ['accept_difference', 'fix_cdb']],   // NE 1980・社内 0
+    ['value:a001', 'standard_price_jpy', 'rule_lag', 'company_owned', { op: 'decide' }, ['accept_difference', 'fix_ne']],    // 社内を 0 にした直後 = 写し待ち
+    ['cost:b002', 'cost', 'rule', 'cdb_zero_yen', { op: 'decide_zero' }, ['accept_difference', 'fix_cdb']],                 // override_zero の 0 円・NE が空
+    ['cost:c003', 'cost', 'rule', 'cdb_zero_yen', { op: 'decide_zero' }, ['accept_difference', 'fix_cdb']],                 // override_zero の 0 円・NE 0
+    ['value:e005', 'standard_price_jpy', 'rule', 'company_owned', { op: 'set_ne_value', value: 5555 }, ['accept_difference', 'fix_ne']],
+    ['value:f006', 'tax_rate', 'rule', 'company_owned', { op: 'set_ne_value', value: 0.1 }, ['accept_difference', 'fix_ne']],   // NE の税率が空 (CSV は 10 と書く = ne-csv の試験)
+  ];
+  for (const [key, c, cls, reason, proposal, res] of want) {
+    const cc = one(key, c);
+    assert.deepEqual([cc.cls, cc.explained?.reason], [cls, reason], `${key} ${c}: ${JSON.stringify(cc)}`);
+    const d = dec(key, c);
+    assert.deepEqual([d.reason_kind, d.proposal, d.resolutions], [reason, proposal, res], `${key} ${c}: ${JSON.stringify(d)}`);
+  }
+  // 社内 null・NE 空 = 一致 (値なし同士)
+  assert.deepEqual(clsOf(x.ne, 'value:f006', 'standard_price_jpy'), ['match']);
+  // NE をコードにする提案・NE を 0 にする提案は 1 つも無い
+  assert.ok(!x.ne.decisions.some((d) => d.proposal?.op === 'set_ne_value' && ((d.col === 'name' && nameIsCode(d.proposal.value, d.norm)) || (['standard_price_jpy', 'cost'].includes(d.col) && Number(d.proposal.value) === 0))));
+  // W13 の案件 (items) = 上の案件が全部入る・件数が items と合う
+  const keys = new Set(x.ne.items.map((i) => i.subject_key));
+  for (const [key] of want) assert.ok(keys.has(key), `${key} が案件に無い`);
+  assert.equal(x.ne.counts.items, x.ne.items.length);
+  // 持ち主が load の列: NE 0 と社内 0 = ne_no_value のまま (社内 0 は実値・0 は NE に提案しない = 決める)
+  const ne3 = clone(NE); ne3.products.find((r) => r.code === 'a001').price_src = J('0');
+  await day('2030-07-03', { ne: ne3 });
+  const y = await day('2030-07-04', { ne: ne3 });
+  assert.deepEqual(clsOf(y.ne, 'value:a001', 'standard_price_jpy'), ['ne_no_value']);
+  const ya = y.ne.decisions.find((d) => d.subject_key === 'value:a001' && d.col === 'standard_price_jpy');
+  assert.deepEqual([ya.c, ya.proposal, ya.resolutions], [0, { op: 'decide' }, ['accept_difference', 'spec']]);
+  await day('2030-07-05', { ne: NE });
 });
 
 await pg.close();
