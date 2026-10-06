@@ -28,6 +28,10 @@ import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
 import express from 'express';
+// 広げる道 PR-2: 画面は DB の active に従う。試験の DB は全部の列を company にする = このコードの能力も全部 (code_behind の試験だけ戻す)
+const W2 = await import('./fixtures/master-widen-pr1.mjs');
+const OG = await import('../lib/master-owner-gate.mjs');
+OG.__setCapableForTest((await import('../config/master-ownership.mjs')).OWNED_COLUMNS);
 
 const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'master-reg-csv-'));
 process.env.DATA_DIR = DATA_DIR;
@@ -121,6 +125,7 @@ async function setupDb() {
   await applyMigrations(db, { log: quiet });
   await createRoles(pg, { watcherPw: 'a', writerPw: 'b' });
   await createMasterEditRoles(pg, {});
+  await W2.useReal0058(pg, { leases: ['single', 'set'], futureSetLease: true });   // 広げる道 PR-2: 本物の 0058 の上で試験の許可を置く (この DB は構成も C = セットの許可は将来の形)
   const r = await runInitialLoad(db, makePlan(), { log: quiet, runId: 'load_setup', now: LOAD_NOW });
   assert.equal(r.ok, true, r.error);
   const E0 = { pg, db, sessionUser };
@@ -183,6 +188,11 @@ const single = (over = {}) => ({ name: '新しい単品', standard_price: '1500'
 const opts = (o = {}) => ({ ownership: ALL_COMPANY, open: true, nowMs: NOW_MS, ...o });
 /** 仕入先の道 (lib/master-supplier.mjs) の持ち主表 = 切替の後 (全部 company) */
 const SOPT = { ownership: ALL_COMPANY };
+/** 広げる道 PR-2: 持ち主は DB の active = 仕入先の列を load にした DB (段階の記録も同じ = widen の後と同じ形) で fn を流して戻す */
+const suppliersLoad = async (fn) => {
+  await W2.setActiveOwnershipInDb(pg, { ...ALL_COMPANY, 'suppliers.name': 'load', 'suppliers.order_method': 'load', 'suppliers.lead_time_days': 'load' });
+  try { return await fn(); } finally { await W2.setActiveOwnershipInDb(pg, ALL_COMPANY); }
+};
 const build = (kind, codes, o = {}) => as(E, 'master_edit', () => G.buildRegExport(db, { actor: 'boss@test', kind, codes, requestId: o.requestId ?? uuid() }, opts(o)));
 const issue = (id, o = {}) => as(E, 'master_edit', () => G.issueRegExport(db, { actor: 'boss@test', exportId: id }, opts(o)));
 const declare = (id, sha, result = 'ok', o = {}) => as(E, 'master_edit', () => G.declareRegExport(db, { actor: 'boss@test', exportId: id, sha256: sha, result, neMessage: o.msg ?? '1件成功しました。' }, opts(o)));
@@ -240,7 +250,9 @@ console.log('新商品の NE 登録の CSV (H5)');
 
 await ta('[C1] 門: 切替の後でないと作れない (MASTER_EDIT_OPEN なし・持ち主表が記録と違う = 409)・名簿の形の誤り 400', async () => {
   await rejectsWith(build('products', ['new-a'], { open: false }), 409, 'before_cutover');
-  await rejectsWith(build('products', ['new-a'], { ownership: MASTER_OWNERSHIP }), 409, 'before_cutover');
+  // 広げる道 PR-2: 持ち主は DB の active。active だけ全部 load = 段階の記録と違う = 409
+  await W2.setActiveMapOnly(pg, MASTER_OWNERSHIP);
+  try { await rejectsWith(build('products', ['new-a']), 409, 'before_cutover'); } finally { await W2.setActiveMapOnly(pg, ALL_COMPANY); }
   await rejectsWith(build('nope', ['new-a']), 400);
   await rejectsWith(build('products', []), 400);
   await rejectsWith(build('products', ['new-a', 'NEW-A']), 400);
@@ -876,11 +888,11 @@ await ta('[W1] 0058 (広げる道 PR-1): 初回の配る (ne_reg_issue) の直�
   const b4 = await build('products', ['new-x4'], { requestId: rid });
   await pg.query("select ops.revoke_new_entry_lease('single', '試験: 許可を取り消す')");
   assert.equal((await one("select ops.new_entry_lease_valid('single') as v")).v, false);
-  await pgErr(reg('single', 'new-x6', single({ name: '閉じた後' })), /new_entry_closed|入口は閉じている/);                 // 単品の登録 = 閉じる
-  await pgErr(build('products', ['new-x5']), /new_entry_closed|入口は閉じている/);                                          // 新しい export = 閉じる
+  await rejectsWith(reg('single', 'new-x6', single({ name: '閉じた後' })), 409, 'new_entry_closed');                 // 単品の登録 = 閉じる
+  await rejectsWith(build('products', ['new-x5']), 409, 'new_entry_closed');                                          // 新しい export = 閉じる
   assert.equal((await build('products', ['new-x4'], { requestId: rid })).export.export_id, b4.export.export_id);   // 同じ request_id・同じ中身の replay = 通る
   assert.equal((await issue(b3.export.export_id)).already, true);                                         // もう配った = 通る
-  await pgErr(issue(b4.export.export_id), /new_entry_closed|入口は閉じている/);                                             // 初回の配る = 閉じる
+  await rejectsWith(issue(b4.export.export_id), 409, 'new_entry_closed');                                             // 初回の配る = 閉じる
   const d = await declare(b3.export.export_id, b3.export.sha256);                                         // 申告 (後始末) = 通る
   assert.equal(d.ok ?? true, true);
   await supersede(b4.export.export_id);                                                                    // 使わない (後始末) = 通る
@@ -1135,7 +1147,7 @@ await ta('[S3] 取引停止: 代表に使っている = 409 (商品の一覧)・
   await reg('single', 'new-sup2', single({ name: 'SUP2', primary_supplier: '0012' }));
   const sx = await build('products', ['new-sup2']);
   await issue(sx.export.export_id);
-  await rejectsWith(SUP.deactivateSupplier(db, { actor: 'po@test', code: '0012', reason: '取引終了' }), 409, 'before_cutover');   // 持ち主表 = 今の本番 (load)
+  await suppliersLoad(() => rejectsWith(SUP.deactivateSupplier(db, { actor: 'po@test', code: '0012', reason: '取引終了' }), 409, 'before_cutover'));   // DB の持ち主 = 仕入先は load (今の本番)
   const e = await rejectsWith(SUP.deactivateSupplier(db, { actor: 'po@test', code: '0012', reason: '取引終了' }, SOPT), 409, 'supplier_in_use');
   assert.deepEqual(e.extra.skus, ['new-sup2', 's004']);
   await pgErr(pg.query("update core.suppliers set active = false where code = '0012'"), /supplier_in_use/);
@@ -1160,8 +1172,10 @@ await ta('[S4] 仕入先の状態は関数だけ: 持ち主のロールでも直
   await pgErr(pg.query("update ops.supplier_registrations set state = 'ne_pending'"), /でだけ書く/);
   await pgErr(pg.query("insert into ops.supplier_registrations (supplier_id, state, created_by) values ($1, 'ne_pending', 'x')", [old]), /でだけ書く/);
   await pgErr(pg.query("select ops.declare_supplier_in_ne(gen_random_uuid(), 'po@test', $1::jsonb, '0002', '0002', null)", [OWN]), /not_new_supplier/);
-  await rejectsWith(SUP.createSupplier(db, { actor: 'po@test', code: '15', name: '十五商事' }), 409, 'before_cutover');   // 持ち主表 = 今の本番 (load)
-  await rejectsWith(SUP.declareSupplierInNe(db, { actor: 'po@test', code: '0012', neCode: '0012' }), 409, 'before_cutover');
+  await suppliersLoad(async () => {   // DB の持ち主 = 仕入先は load (今の本番)
+    await rejectsWith(SUP.createSupplier(db, { actor: 'po@test', code: '15', name: '十五商事' }), 409, 'before_cutover');
+    await rejectsWith(SUP.declareSupplierInNe(db, { actor: 'po@test', code: '0012', neCode: '0012' }), 409, 'before_cutover');
+  });
   await SUP.createSupplier(db, { actor: 'po@test', code: '15', name: '十五商事' }, SOPT);
   await pgErr(pg.query("select ops.declare_supplier_in_ne(gen_random_uuid(), 'po@test', $1::jsonb, '0015', '0016', null)", [OWN]), /ne_code_mismatch/);
   const d = await SUP.declareSupplierInNe(db, { actor: 'po@test', code: '0015', neCode: '15' }, SOPT);
@@ -1508,7 +1522,6 @@ MR.__setPgClientFactory(async (url) => {
   return { query: (t, p) => pg.query(t, p), end: async () => { await pg.query('set role deploy'); }, on: () => {} };
 });
 MR.__setClock(() => NOW_MS);
-MR.__setOwnership(ALL_COMPANY);
 MR.__setShippingRatesProvider(async () => RATES);
 const app = express();
 app.set('view engine', 'ejs');
@@ -1602,6 +1615,93 @@ try {
 } finally {
   await new Promise((r) => server.close(r));
 }
+
+await ta('[L1] 広げる道 PR-2 (二層の門): 新規開始 (作る・まだ配っていないファイルを配る) は DB の開放の許可と非常の止めを見る / 後始末 (配ったファイルの再ダウンロード・申告・使わない・実機の確かめ) は許可が無くても通る', async () => {
+  // 許可あり: 登録 3 つ・作る・配る
+  for (const c of ['new-l1', 'new-l2', 'new-l3']) await reg('single', c, single({ name: `L ${c}` }));
+  const x1 = await build('products', ['new-l1']);
+  await issue(x1.export.export_id);
+  const x2 = await build('products', ['new-l2']);
+  assert.equal((await expOf(x2.export.export_id)).state, 'built');
+  // 許可なし (単品)
+  await W2.setTestLease(pg, 'single', false);
+  try {
+    const before = (await one('select count(*)::int as n from ops.ne_reg_exports')).n;
+    let e = await rejectsWith(build('products', ['new-l3']), 409, 'new_entry_closed');
+    assert.equal(e.extra.cause, 'no_lease');
+    e = await rejectsWith(issue(x2.export.export_id), 409, 'new_entry_closed');   // まだ配っていない = 新規開始
+    assert.equal((await expOf(x2.export.export_id)).state, 'built', '配っていない');
+    assert.equal((await issue(x1.export.export_id)).already, true, 'もう配ったファイル = そのまま (許可は見ない)');
+    assert.equal((await one('select count(*)::int as n from ops.ne_reg_exports')).n, before);
+    // 後始末は通る
+    const d = await declare(x1.export.export_id, x1.export.sha256, 'rejected_all', { msg: '0件成功、1件失敗しました。' });
+    assert.equal(d.state, 'closed');
+    const s = await supersede(x2.export.export_id);
+    assert.equal(s.state, 'closed');
+    await as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'products', result: 'ng', note: '許可が無くても記録できる' }, opts()));
+    // 新商品の登録そのものも閉じる (同じ許可)
+    e = await rejectsWith(reg('single', 'new-l4', single()), 409, 'new_entry_closed');
+  } finally { await W2.setTestLease(pg, 'single', true); }
+  // 非常の止め (許可があっても閉じる)
+  process.env.MASTER_NEW_ENTRY_STOP = '1';
+  try {
+    const e = await rejectsWith(build('products', ['new-l3']), 409, 'new_entry_closed');
+    assert.equal(e.extra.cause, 'stopped');
+  } finally { delete process.env.MASTER_NEW_ENTRY_STOP; }
+  // 許可の関数が無い (0058 の前の DB) = 作れない・後始末は通る
+  await W2.hideLeaseFunctions(pg);
+  try {
+    const e = await rejectsWith(build('products', ['new-l3']), 409, 'new_entry_closed');
+    assert.equal(e.extra.cause, 'no_function');
+  } finally { await W2.restoreLeaseFunctions(pg); }
+  const x3 = await build('products', ['new-l3']);
+  await supersede(x3.export.export_id);
+});
+
+await ta('[L2] DB が新規開始を拒んだ (0058 の強制 = P0001「new_entry_closed: …」・lib の門の後の競合) = CSV の作る・初めて配るは 409 の分かる文・後始末は通る (Codex #1640 R1 Medium 2 / Low 4)', async () => {
+  await reg('single', 'new-l5', single({ name: 'L5' }));
+  await reg('single', 'new-l6', single({ name: 'L6' }));
+  const x = await build('products', ['new-l6']);   // DB の強制の前に作っておく (後で初めて配る)
+  const before = (await one('select count(*)::int as n from ops.ne_reg_exports')).n;
+  await W2.enforceLeaseInDb(pg);
+  try {
+    let e = await rejectsWith(build('products', ['new-l5']), 409, 'new_entry_closed');
+    assert.match(e.message, /Company DB が断った/); assert.equal(e.extra.cause, 'db');
+    e = await rejectsWith(issue(x.export.export_id), 409, 'new_entry_closed');
+    assert.equal(e.extra.cause, 'db');
+    assert.equal((await expOf(x.export.export_id)).state, 'built');
+    assert.equal((await one('select count(*)::int as n from ops.ne_reg_exports')).n, before);
+    assert.equal((await supersede(x.export.export_id)).state, 'closed', '後始末は DB も止めない');
+  } finally { await W2.enforceLeaseInDb(pg, { closed: false }); }
+});
+
+await ta('[L3] 期限つきのファイルの取得 (PR-1 の ops.ne_reg_file・本物の 0058): 画面のロールは file_bytes の列を直接読めない・関数で受け取る・渡せない = 理由つきで返す (画面は 409 reg_file_expired)・0058 の前の DB (関数が無い) = 渡さない (列を直接読みに倒さない)', async () => {
+  await reg('single', 'new-f1', single({ name: 'F1' }));
+  const x = await build('products', ['new-f1']);
+  await issue(x.export.export_id);
+  const fileAs = () => as(E, 'master_edit', () => G.regExportFile(db, x.export.export_id));
+  const f = await fileAs();
+  assert.equal(crypto.createHash('sha256').update(f.bytes).digest('hex'), x.export.sha256);
+  assert.match(f.file_name, /^ne_register_products_\d{8}_\d{6}_\d+(_trial)?\.csv$/);
+  await pgErr(as(E, 'master_edit', () => pg.query('select file_bytes from ops.ne_reg_exports where export_id = $1', [x.export.export_id])), /permission denied/);
+  // 渡せない (配ってから 2 時間を過ぎた = 本物の関数が決める) = bytes なし・理由と画面の文 (router は 409 reg_file_expired)
+  await pg.query('alter table ops.ne_reg_exports disable trigger trg_ne_reg_exports_guard');
+  await pg.query("update ops.ne_reg_exports set issued_at = issued_at - interval '2 hours 1 minute' where export_id = $1", [x.export.export_id]);
+  await pg.query('alter table ops.ne_reg_exports enable trigger trg_ne_reg_exports_guard');
+  const f1 = await fileAs();
+  assert.deepEqual([f1.bytes, f1.expired], [null, 'issued_over_2h']);
+  assert.match(f1.message, /2 時間/);
+  // 0058 の前の DB = 関数が無い = 渡さない (画面のロールが列を読めても、列を直接読みに倒さない = 2 時間・取り消しを迂回しない)
+  await pg.query('alter function ops.ne_reg_file(bigint) rename to ne_reg_file__hidden_pr1640');
+  await W2.hideRegFileBytes(pg, false);
+  try {
+    const f2 = await fileAs();
+    assert.deepEqual([f2.bytes, f2.expired], [null, 'not_applied']);
+    assert.match(f2.message, /0058 の前/);
+  } finally { await pg.query('alter function ops.ne_reg_file__hidden_pr1640(bigint) rename to ne_reg_file'); await W2.hideRegFileBytes(pg, true); }
+  assert.deepEqual(await one(`select has_column_privilege('master_edit', 'ops.ne_reg_exports', 'file_bytes', 'SELECT') as c, has_table_privilege('master_edit', 'ops.ne_reg_exports', 'SELECT') as t`), { c: false, t: false });
+  await supersede(x.export.export_id);
+});
 
 try { fs.rmSync(DATA_DIR, { recursive: true, force: true }); } catch { /* Windows で開いたままのことがある */ }
 console.log(`\n${passed} 件 ok`);

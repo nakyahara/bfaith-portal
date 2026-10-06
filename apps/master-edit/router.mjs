@@ -5,7 +5,9 @@
  *   app.use('/apps/master-edit', requireAppAccess('master-edit'), router)
  *   miniPC は同じ server.js を動かすが載せない (Company DB に人が書く口を 1 つに)
  * 見る = アプリの利用権がある人 / 書く = env MASTER_EDITORS の名簿のメールだけ (空 = 誰も書けない。admin でも名簿に無ければ不可。画面で隠すだけでなく API で止める)
- * 🚨 保存を開く = 切替の段階が new_open (ops.master_cutover_state・読めない = 閉) **かつ** 持ち主表 (config/master-ownership.mjs) の列が 'company'
+ * 🚨 保存を開く = 切替の段階が new_open (ops.master_cutover_state・読めない = 閉) **かつ** 持ち主表の列が 'company'
+ *    (🆕 広げる道 PR-2: 持ち主表 = DB の active (ops.master_ownership_active_map()・保存の取引の中で読む・lib/master-owner-gate.mjs)。配った config は見ない。
+ *     このコードが扱えない C のキーが active にある = 409 code_behind・読めない = 503。新商品・NE 登録の CSV の build / 未配布の issue は、さらに DB の開放の許可 (lease)・非常の止め MASTER_NEW_ENTRY_STOP)
  *    **かつ** env MASTER_EDIT_OPEN = 1 (Codex ⑤-R0 High 1・R1 H1)。どれかが欠ければ、名簿の人でも保存は 409「切替前」(lib/master-write.mjs)。
  *    MASTER_EDIT_ENABLED は画面を載せるだけ (見るだけ)
  *   GET  /                   一覧 (画面 A)。?q=&kind=&state=&missing=&diff=1&offset=
@@ -47,7 +49,6 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
-import { MASTER_OWNERSHIP, validateOwnership } from '../../config/master-ownership.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
 import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
@@ -63,6 +64,7 @@ import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
+import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
 import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, CHANNELS, UNMAPPED_DAYS } from './amazon-read.mjs';
 import { normSku } from '../../lib/sku-norm.js';
@@ -122,10 +124,17 @@ export function __setPgClientFactory(fn) { pgClientFactory = fn || openPgClient;
 let clock = () => Date.now();
 let clockOverridden = false;
 export function __setClock(fn) { clock = fn || (() => Date.now()); clockOverridden = !!fn; }
-/** 列の持ち主 (試験は 'company' にした表に差し替える。本番は config/master-ownership.mjs のまま) */
-let ownershipOverride = null;
-export function __setOwnership(o) { ownershipOverride = o ? validateOwnership(o) : null; }
-const ownershipNow = () => ownershipOverride || MASTER_OWNERSHIP;
+/**
+ * 列の持ち主 (🆕 広げる道 PR-2) = DB の active。画面 (見せ方だけ) は要求ごとに取引の外で読む (読めない = 閉じた側で見せる)。
+ * 保存は lib の門が保存の取引の中で読み直す (画面の値は使わない)
+ */
+const screenOwner = (db) => (db ? readScreenOwnership(db) : Promise.resolve(null));
+/** 段階 + 持ち主 (画面の帯・欄を開くかに使う)。phase.owner に持ち主の答え */
+async function readPhaseView(db) {
+  if (!db) return null;
+  const phase = await readCutoverPhase(db);
+  return { ...phase, owner: await screenOwner(db) };
+}
 /** 保存を開いているか (env MASTER_EDIT_OPEN = 1。切替日に持ち主表と一緒に開ける。要求ごとに読む = 再起動なしで閉じられる) */
 const isOpen = () => process.env.MASTER_EDIT_OPEN === '1';
 
@@ -285,9 +294,12 @@ async function withPgApi(res, fn, kind = 'read', { deadline = null } = {}) {
 /** 画面の共通の値。phase = 切替の段階 (読めない・渡されない = 閉じている扱い)。closed = 保存を開いていない (画面の保存のボタンも出さない = #1563 R1 M5) */
 const pageLocals = (req, phase = null) => {
   const gate = editorGate(req);
-  const own = ownershipNow();
+  const owner = phase && phase.owner ? phase.owner : null;
+  const own = owner ? owner.map : {};
   const phaseText = phase && phase.readable ? PHASE_LABELS[phase.phase] : '読めない (閉じている扱い)';
   const why = !phase || !phase.readable || phase.phase !== 'new_open' ? `段階: ${phaseText}`
+    : !owner || !owner.readable ? '列ごとの持ち主 (Company DB の切替の記録) を読めない'
+      : owner.code_behind.length ? `このサーバーのプログラムが古い (Company DB の持ち主 ${owner.code_behind.join('・')} を扱えない)`
     : !newEntryWritable(phase, own) ? '持ち主表が切替のときの記録と違う'
       : !isOpen() ? '保存を開くスイッチ (MASTER_EDIT_OPEN) が入っていない'
         : Object.values(own).every((v) => v === 'load') ? '持ち主表の列が全部 NE・/register'
@@ -373,7 +385,7 @@ router.get('/', (req, res) => {
     const extras = await listExtras(db, poOk);
     const empty = { rows: [], total: 0, offset: 0, limit: 0, filters, latestRun: null, diffAvailable: false, notFound: [], multiCut: false };
     const data = db && !searchExpired ? await listSkus(db, filters, { now: new Date(clock()), extras }) : empty;
-    const phase = db ? await readCutoverPhase(db) : null;
+    const phase = await readPhaseView(db);
     const counts = db ? await listCounts(db, { now: new Date(clock()) }) : null;
     res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max });
   });
@@ -461,16 +473,22 @@ router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLoca
 router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
   const kind = Object.prototype.hasOwnProperty.call(KINDS_NEW, String(req.query.kind || '')) ? String(req.query.kind) : 'single';
   const page = db ? await readNewPage(db) : null;
+  if (page) page.phase = { ...page.phase, owner: await screenOwner(db) };
   const shipping = await shippingRatesProvider();
   const locals = pageLocals(req, page ? page.phase : null);
-  const own = ownershipNow();
+  const owner = page ? page.phase.owner : null;
+  const own = owner ? owner.map : {};
+  // 新規開始の門 (2 層目・広げる道 PR-2): DB の開放の許可 (lease)・非常の止め。見せ方だけ (登録は lib が取引の中で読み直す)
+  const lease = await readScreenNewEntry(db, kind);
   res.render(view('new.ejs'), {
     ...locals, nav: 'new', dbError, kind, page, fmt, KINDS_NEW, MAX_COMPONENTS, MAX_REFERENCE_URLS,
-    // 登録を開いているか = 段階 new_open・持ち主表のハッシュが段階の記録と同じ・MASTER_EDIT_OPEN・この種類で書く列の持ち主が全部 company・
-    //   書き込み用の接続 (画面だけのロール)・backfill 済み (lib/master-register.mjs と同じ)
-    entryClosed: !newEntryWritable(page ? page.phase : null, own) || !isOpen() || NEW_ENTRY_KEYS[kind].some((k) => own[k] !== 'company') || !writeConfigured() || !(page && page.backfillDone),
+    // 登録を開いているか = 段階 new_open・持ち主表 (DB の active) のハッシュが段階の記録と同じ・MASTER_EDIT_OPEN・この種類で書く列の持ち主が全部 company・
+    //   開放の許可 (lease)・書き込み用の接続 (画面だけのロール)・backfill 済み (lib/master-register.mjs と同じ)
+    entryClosed: !screenOwnerWritable(page ? page.phase : null, owner) || !isOpen() || NEW_ENTRY_KEYS[kind].some((k) => own[k] !== 'company') || !lease.open
+      || !writeConfigured() || !(page && page.backfillDone),
     entryWhy: locals.closedWhy
       || (NEW_ENTRY_KEYS[kind].some((k) => own[k] !== 'company') ? `${KINDS_NEW[kind]}で書く項目の持ち主がまだ NE・/register` : '')
+      || (!lease.open ? lease.why : '')
       || (!(page && page.backfillDone) ? '切替の手順の「既存の商品の登録の状態 (backfill)」がまだ' : ''),
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
     yahooDeliveries: Object.values(SHIPPING_METHOD_GROUPS), setPlanChoices: SET_PLAN_CHOICES, setDecisionReasons: SET_DECISION_REASONS,
@@ -479,7 +497,9 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
 
 router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) => {
   const now = new Date(clock());
-  const page = db ? await readSkuPage(db, req.params.code, { now, ownership: ownershipNow(), open: isOpen() }) : null;
+  const owner = await screenOwner(db);   // 欄を開くか (見せ方だけ) = DB の active・読めない / code_behind = 閉じた側
+  const page = db ? await readSkuPage(db, req.params.code, { now, ownership: owner && owner.readable ? owner.map : null, open: isOpen() && !!owner && owner.readable && !owner.code_behind.length }) : null;
+  if (page) page.phase = { ...page.phase, owner };
   if (db && !page) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), ui2: true, nav: 'list', message: `商品コード ${req.params.code} は Company DB にありません` });
   const shipping = page ? await shippingRatesProvider() : null;
   // 参考の値: 注文残の内訳 (発注アプリ)・在庫 (ロジザード。セットは構成品から作れる数)
@@ -526,7 +546,7 @@ router.post('/api/new', (req, res) => {
   return withPgApi(res, async (db) => {
     const r = await registerNewSku(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card,
-    }, { open: isOpen(), ownership: ownershipNow(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined });
+    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined });
     // カードは保存の後で 1 回だけ試す (同じ取引ではない = 失敗しても登録はできている。ボードを開いたとき・「もう一度」で続きを)
     let card = r.card || null;
     if (card && card.status !== 'done') {
@@ -581,7 +601,7 @@ router.get('/amazon', (req, res) => {
     const filters = normalizeAmazonFilters(req.query);
     const channels = db ? await amazonChannelsProvider() : null;
     const data = db ? await listAmazonMaps(db, filters, { channels }) : { rows: [], total: 0, offset: 0, limit: 0, filters, tableMissing: false };
-    const phase = db ? await readCutoverPhase(db) : null;
+    const phase = await readPhaseView(db);
     // 「売れたのに対応が無い SKU」(未登録の画面と同じ読み方・読むだけ)。絞り込みの無い最初の画面だけ (検索・ページ送りのたびには読まない)
     const landing = !filters.q && !filters.state && !filters.offset;
     // 読めない = 札を出さないだけ (一覧は出す)
@@ -594,7 +614,7 @@ router.get('/amazon/unmapped', (req, res) => withPgPage(req, res, async (db, dbE
   const channel = ['FBA', 'FBM'].includes(want) ? want : '';
   const channels = db ? await amazonChannelsProvider() : null;
   const data = db ? await amazonUnmapped(db, { now: new Date(clock()), channel, channels }) : null;
-  const phase = db ? await readCutoverPhase(db) : null;
+  const phase = await readPhaseView(db);
   res.render(view('amazon-unmapped.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, data, channel, CHANNELS, UNMAPPED_DAYS, MAP_STATES });
 }));
 router.get('/amazon/sku/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
@@ -609,6 +629,7 @@ router.get('/amazon/sku', (req, res) => withPgPage(req, res, async (db, dbError)
   try { sku = sellerSkuIn(String(req.query.sku ?? '')); } catch (e) { return res.status(400).render(view('error.ejs'), { ...pageLocals(req), nav: 'amazon', message: e.message }); }
   const channels = db ? await amazonChannelsProvider() : null;
   const page = db ? await readAmazonPage(db, sku, { channels }) : null;
+  if (page) page.phase = { ...page.phase, owner: await screenOwner(db) };
   res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY });
 }));
 router.post('/api/amazon/save', (req, res) => {
@@ -618,7 +639,7 @@ router.post('/api/amazon/save', (req, res) => {
   return withPgApi(res, async (db) => {
     const r = await saveAmazonMap(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, sellerSku: b.seller_sku, name: b.name, components: b.components, reason: b.reason ?? null, seen: b.seen,
-    }, { open: isOpen(), ownership: ownershipNow() });
+    }, { open: isOpen() });
     res.json(r);
   }, 'write');
 });
@@ -629,7 +650,7 @@ router.post('/api/amazon/delete', (req, res) => {
   return withPgApi(res, async (db) => {
     const r = await deleteAmazonMap(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, sellerSku: b.seller_sku, reason: b.reason ?? null, seen: b.seen,
-    }, { open: isOpen(), ownership: ownershipNow() });
+    }, { open: isOpen() });
     res.json(r);
   }, 'write');
 });
@@ -637,7 +658,7 @@ router.post('/api/amazon/delete', (req, res) => {
 // ─── NE 登録の CSV (⑤-2b) ───
 router.get('/reg-csv', (req, res) => withPgPage(req, res, async (db, dbError) => {
   const summary = db ? await regSummary(db, { nowMs: clock() }) : null;
-  const phase = db ? await readCutoverPhase(db) : null;
+  const phase = await readPhaseView(db);
   const gate = approverGate(req);
   res.render(view('reg-csv.ejs'), {
     ...pageLocals(req, phase), nav: 'regcsv', dbError, summary, canApprove: gate.ok, approveMessage: gate.message || '',
@@ -650,7 +671,7 @@ function regWrite(req, res, fn) {
   const gate = approverGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
   const actor = String(req.session.email).trim().toLowerCase();
-  const opts = { open: isOpen(), ownership: ownershipNow(), nowMs: clock() };
+  const opts = { open: isOpen(), nowMs: clock() };   // 持ち主表は lib が取引の中で DB の active を読む (広げる道 PR-2)
   return withPgApi(res, async (db) => res.json({ ok: true, ...(await fn(db, actor, req.body || {}, opts)) }), 'write');
 }
 router.post('/api/reg-csv/exports', (req, res) => regWrite(req, res, (db, actor, b, o) => buildRegExport(db, { actor, kind: b.kind, codes: b.codes, requestId: b.request_id }, o)));
@@ -665,6 +686,8 @@ router.post('/api/reg-csv/verified', (req, res) => regWrite(req, res, (db, actor
 router.get('/api/reg-csv/exports/:id/file', (req, res) => {
   const gate = approverGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
+  // 🆕 広げる道 PR-2 (Codex #1640 R3 Medium 2): ファイルは画面のロール (COMPANY_DB_MASTER_EDIT_URL) だけで受け取る = 持ち主の接続に落とさない
+  //   (持ち主は file_bytes の列を直接読めてしまう = 期限つきの取得の制限を迂回しうる)。無ければ 503 no_write_role
   return withPgApi(res, async (db) => {
     const f = await regExportFile(db, req.params.id);
     if (!f) return res.status(404).json({ ok: false, error: 'ファイルがありません' });
@@ -674,7 +697,7 @@ router.get('/api/reg-csv/exports/:id/file', (req, res) => {
     res.set('Content-Disposition', `attachment; filename="${f.file_name}"`);
     res.set('X-Content-SHA256', f.sha256);
     res.send(f.bytes);
-  });
+  }, 'write');
 });
 
 router.post('/api/sku/:code', (req, res) => {
@@ -685,7 +708,7 @@ router.post('/api/sku/:code', (req, res) => {
     const shippingRates = b.values && Object.prototype.hasOwnProperty.call(b.values, 'shipping_code') ? await shippingRatesProvider() : null;
     const r = await saveSku(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, code: req.params.code, reason: b.reason ?? null, seen: b.seen, values: b.values,
-    }, { open: isOpen(), ownership: ownershipNow(), shippingRates, now: clockOverridden ? new Date(clock()) : undefined });
+    }, { open: isOpen(), shippingRates, now: clockOverridden ? new Date(clock()) : undefined });
     res.json(r);
   }, 'write');
 });

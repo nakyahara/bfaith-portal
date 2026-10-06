@@ -1,12 +1,16 @@
 /**
  * test-master-widen-locks-pg.mjs — 広げる道 PR-1 (0058) の鍵の順 (設計 §3.10・PR-2 Codex R3 / R4・R19) を本物の PostgreSQL で確かめる
  *
- * 5 つの道を交差させる:
- *   A = 配る (アプリ lib/master-reg-csv.mjs の issueRegExport = request の直後に ops.acquire_new_entry_locks・画面のロール master_edit)
+ * 9 つの道を交差させる (🆕 PR-2 #1640 が載った後: アプリの道は PR-2 の lib = 新規開始の鍵 lib/master-owner-gate.mjs の acquireNewEntryLocksInTx → 段階 → 土台の門 → 新規開始の門):
+ *   A = 配る (アプリ lib/master-reg-csv.mjs の issueRegExport = 初めて配るだけ ops.acquire_new_entry_locks を段階の鍵より前に・画面のロール master_edit)
  *   B = 配る (DB の関数 ops.ne_reg_issue を master_edit で直接呼ぶ = アプリの鍵なし)
  *   C = 照合 ② の始めに閉じる (ops.close_new_entry_for_compare・watch_writer = 許可の排他)
  *   D = 照合の確かめ (0053 の ops.record_ne_registration_check・watch_writer = ne_reg_check → SKU → CSV)
  *   F = CSV を作る (DB の関数 ops.ne_reg_build を master_edit で直接 = request → 許可 → 段階 → マスタの書き込み → SKU → CSV)
+ *   G = CSV を作る (アプリ buildRegExport = request → 許可 → 段階 → マスタの書き込み → SKU → CSV → NE のコード → ops.ne_reg_build)
+ *   R = 新商品の登録 (アプリ registerNewSku = request → 許可 → 段階 → マスタの書き込み → 新しいコード → ops.register_new_sku)
+ *   S = 新商品の登録 (DB の関数 ops.register_new_sku を master_edit で直接 = 許可 → 段階 → マスタの書き込み → 新しいコード)
+ *   V = 許可の取り消し (ops.revoke_new_entry_lease・new_entry_gate = 単品の許可の排他だけ)
  * 段階ごとの barrier: 試験の接続が §3.10 の表の鍵 n を 1 つ排他で持ち、道を (順を変えて) 始める → 全部が「その鍵で待つ」か「終わる」まで待つ →
  *   待っている道ごとに pg_locks から {道・持っている鍵の番号・待っている鍵の番号} を記録し、「待っている鍵の番号 ≥ 持っている全部の鍵の番号」
  *   (= 小さい番号へ戻らない) を確かめる → 鍵を放す → deadlock (40P01) なしに終わる (閉じた後の配るは new_entry_closed)。
@@ -30,6 +34,8 @@ if (!['localhost', '127.0.0.1', '::1', '[::1]'].includes(u0.hostname)) { console
 
 const R = await import('../lib/master-register.mjs');
 const G = await import('../lib/master-reg-csv.mjs');
+// 広げる道 PR-2 (#1640): 持ち主は DB の active (この DB は全部の列が C) = このコードの能力も全部にする (本番は config/master-capability.mjs の COMPANY_CAPABLE)
+(await import('../lib/master-owner-gate.mjs')).__setCapableForTest(OWNED_COLUMNS);
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -82,10 +88,13 @@ try {
 
   const E1 = await open('master_edit'); const E2 = await open('master_edit'); const E3 = await open('master_edit'); const E4 = await open('master_edit');
   const WW = await open('watch_writer'); const WW2 = await open('watch_writer'); const NG = await open('new_entry_gate'); const T = await open(null);
-  clients.push(E1, E2, E3, E4, WW, WW2, NG, T);
+  await M.query('alter role master_edit connection limit 12');   // 試験だけ (使い捨てのクラスタ): 画面のロールの道を 7 本同時に開く (本番の上限 5 は create-master-edit-roles.mjs のまま)
+  const E5 = await open('master_edit'); const E6 = await open('master_edit'); const E7 = await open('master_edit'); const NG2 = await open('new_entry_gate');
+  clients.push(E1, E2, E3, E4, WW, WW2, NG, T, E5, E6, E7, NG2);
+  const [dbE5, dbE6] = [E5, E6].map(pgAdapter);
   const [dbE1, dbE2, dbE3] = [E1, E2, E3].map(pgAdapter);
   const pidOf = async (c) => (await c.query('select pg_backend_pid() as p')).rows[0].p;
-  const PID = { A: await pidOf(E1), B: await pidOf(E2), C: await pidOf(WW), D: await pidOf(WW2), F: await pidOf(E4) };
+  const PID = { A: await pidOf(E1), B: await pidOf(E2), C: await pidOf(WW), D: await pidOf(WW2), F: await pidOf(E4), G: await pidOf(E5), R: await pidOf(E6), S: await pidOf(E7), V: await pidOf(NG2) };
   const single = (name) => ({ name, standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', cost: { jpy: '300' } });
   const reg = (code) => R.registerNewSku(dbE3, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code, values: single(`鍵の順 ${code}`), card: { create: false } },
     { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: RATES });
@@ -116,6 +125,9 @@ try {
   const skuKey = async (id) => (await one(`select hashtextextended('core.sku:' || $1::text, 0)::text as k`, [id])).k;
   const addSku = async (code) => { const k = await skuKey(await skuIdOf(code)); NUM.set(k, 7); return k; };
   const addRequest = async (rid) => { const k = (await one(`select hashtextextended('ops.ne_reg_request:' || $1::text, 0)::text as k`, [rid])).k; NUM.set(k, 1); return k; };
+  /** 🆕 PR-2: 登録の request (保存と同じ ops.master_edit_request) = 1・新しいコードの鍵 = SKU と同じ段 (7) */
+  const addEditRequest = async (rid) => { const k = (await one(`select hashtextextended('ops.master_edit_request:' || $1::text, 0)::text as k`, [rid])).k; NUM.set(k, 1); return k; };
+  const addNewCode = async (code) => { const k = (await one(`select hashtextextended('core.new_code:' || core.norm_code($1), 0)::text as k`, [code])).k; NUM.set(k, 7); return k; };
   await addSku('lk-x');
   /** pg_locks の advisory (bigint の鍵 = objsubid 1) を道ごとに: { held: [番号], waiting: 番号 | null, unknown: [鍵] } */
   const locksOf = async () => {
@@ -176,7 +188,17 @@ try {
     await seedNewEntryLease(dbM, { runId: run });
     assert.equal((await one("select ops.new_entry_lease_valid('single') as v")).v, true);
   };
-  const closedOk = (r) => !r.err || /new_entry_closed|入口は閉じている/.test(String(r.err.message));
+  const closedOk = (r) => !r.err || r.err.reason === 'new_entry_closed' || /new_entry_closed|入口は閉じている/.test(String(r.err.message));
+  // 🆕 PR-2 の道: G = アプリの作る・R = アプリの登録・S = DB の登録の関数を直接・V = 単品の許可の取り消し
+  const pathG = (rid, code) => G.buildRegExport(dbE5, { actor: 'boss@test', kind: 'products', codes: [code], requestId: rid }, opts).then((r) => r.export);
+  const pathR = (rid, code) => R.registerNewSku(dbE6, { actor: 'naka@test', requestId: rid, kind: 'single', code, values: single(`鍵の順 ${code}`), card: { create: false } },
+    { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: RATES });
+  const DIRECT_ENTRY = (code) => ({ kind: 'single', code, started_at: null, product: { name: '直接の単品', sales_class: 3, expiry_managed: false, inbound_date_managed: null },
+    sku: { name: '直接の単品', tax_rate: 0.1, tax_class: 'STANDARD_10', handling: 'active', standard_price_jpy: 1000, shipping_code: 'S01', shipping_method: 'ゆうパケット',
+      shipping_cost_jpy: 210, reorder_months: null, set_sales_class_override: null, handling_own: null }, supplier_id: null, cost: null, component_request: null, card: null });
+  const pathS = (code) => E7.query('select ops.register_new_sku($1::uuid, $2, $3, $4::jsonb, $5, $6::jsonb) as r',
+    [crypto.randomUUID(), 'naka@test', '直接の試験', OWN, 'e'.repeat(64), JSON.stringify(DIRECT_ENTRY(code))]).then((r) => r.rows[0].r);
+  const pathV = () => NG2.query("select ops.revoke_new_entry_lease('single', '試験: 鍵の順の取り消し') as r").then((r) => r.rows[0].r);
 
   let n = 0;
   await ta('[18a] アプリの鍵の入口 ops.acquire_new_entry_locks (PR-2 Codex R3): §3.10 の 2 (許可・種類の順に全部) を共有で取り、取引の終わりまで持つ・戻り値 = 今の許可が有効か', async () => {
@@ -189,9 +211,9 @@ try {
     await E1.query('commit');
     assert.deepEqual((await locksOf()).A.held, []);
   });
-  await ta('[18] 鍵の順 (§3.10・PR-2 Codex R4): 5 つの道 (配る = アプリ / DB を直接・照合 ② の始めに閉じる・照合の確かめ・CSV を作る = DB を直接) を、鍵ごとの barrier と始める順を変えて交差させる = どの道も小さい番号の鍵へ戻らない・deadlock なし・全部終わる (閉じた後の配るは new_entry_closed)', async () => {
+  await ta('[18] 鍵の順 (§3.10・PR-2 Codex R4): 9 つの道 (配る = アプリ / DB を直接・照合 ② の始めに閉じる・照合の確かめ・CSV を作る = DB を直接 / アプリ (PR-2)・登録 = アプリ (PR-2) / DB を直接・許可の取り消し) を、鍵ごとの barrier と始める順を変えて交差させる = どの道も小さい番号の鍵へ戻らない・deadlock なし・全部終わる (閉じた後の配るは new_entry_closed)', async () => {
     const BARRIERS = [2, 4, 5, 6, 7, 8, 9];
-    const ORDERS = [['A', 'B', 'C', 'D', 'F'], ['C', 'D', 'A', 'F', 'B'], ['F', 'B', 'D', 'C', 'A']];
+    const ORDERS = [['A', 'B', 'C', 'D', 'F', 'G', 'R', 'S', 'V'], ['C', 'V', 'D', 'A', 'R', 'F', 'S', 'B', 'G'], ['F', 'S', 'B', 'G', 'D', 'C', 'V', 'A', 'R']];
     for (const b of BARRIERS) {
       for (const order of ORDERS) {
         n++;
@@ -202,10 +224,16 @@ try {
         const kA = await addSku(ya); await addSku(yb); await addSku(yf);
         const ridF = crypto.randomUUID(); await addRequest(ridF);
         const skuF = await skuIdOf(yf);
+        // 🆕 PR-2: G = 登録済みの yg をアプリで作る・R = yr をアプリで登録・S = ys を DB の関数で直接登録
+        const yg = `lk-g${n}`, yr = `lk-r${n}`, ys = `lk-s${n}`;
+        await reg(yg); await addSku(yg);
+        const ridG = crypto.randomUUID(); await addRequest(ridG);
+        const ridR = crypto.randomUUID(); await addEditRequest(ridR); await addNewCode(yr); await addNewCode(ys);
         await T.query('begin');
         await T.query('select pg_advisory_xact_lock($1::bigint)', [b === 7 ? kA : KEY[b]]);   // 7 = A の SKU の鍵
         const paths = {};
-        const start = { A: () => launch(pathA(ea.export_id)), B: () => launch(pathB(eb.export_id)), C: () => launch(pathC(`close_round_${n}`)), D: () => launch(pathD()), F: () => launch(pathF(ridF, skuF)) };
+        const start = { A: () => launch(pathA(ea.export_id)), B: () => launch(pathB(eb.export_id)), C: () => launch(pathC(`close_round_${n}`)), D: () => launch(pathD()), F: () => launch(pathF(ridF, skuF)),
+          G: () => launch(pathG(ridG, yg)), R: () => launch(pathR(ridR, yr)), S: () => launch(pathS(ys)), V: () => launch(pathV()) };
         for (const p of order) { paths[p] = start[p](); await sleep(60); }
         let st;
         try { st = await settle(round, paths); } finally { await T.query('commit'); }
@@ -216,6 +244,12 @@ try {
         assert.ok(closedOk(res.B), `${round} B: ${res.B.err && res.B.err.message}`);
         assert.ok(!res.C.err, `${round} C: ${res.C.err && res.C.err.message}`);
         assert.ok(!res.D.err, `${round} D: ${res.D.err && res.D.err.message}`);
+        assert.ok(closedOk(res.G), `${round} G: ${res.G.err && res.G.err.message}`);
+        assert.ok(closedOk(res.R), `${round} R: ${res.R.err && res.R.err.message}`);
+        assert.ok(!res.V.err, `${round} V: ${res.V.err && res.V.err.message}`);
+        if (res.G.ok) assert.equal(res.G.ok.state, 'built', round);
+        if (res.R.ok) assert.equal(res.R.ok.ok, true, round);
+        // S は形の照らし直しで落ちてよい (試験の偽の約束) = 鍵の順だけを見る。deadlock 以外の失敗は許す
         if (res.A.ok) assert.equal(res.A.ok.export.state, 'issued', round);
         if (res.B.ok) assert.equal(res.B.ok.state, 'issued', round);
         // F は中身の照らし直しで落ちる (試験の偽の行) = 鍵の順だけを見る。deadlock 以外の失敗は許す
@@ -229,6 +263,12 @@ try {
     assert.ok(LOG.some((x) => x.path === 'B' && x.waiting >= 4 && x.held.includes(2)), 'DB の関数を直接呼んでも許可の鍵を段階の鍵より先に取る');
     assert.ok(LOG.some((x) => x.path === 'F' && x.waiting === 4 && x.held.includes(1) && x.held.includes(2)), 'CSV を作る DB の関数は request → 許可の鍵を持って段階の鍵で待つ (R4)');
     assert.ok(LOG.some((x) => x.path === 'D' && x.waiting === 6), '照合の確かめは ne_reg_check の鍵で待つ (許可の鍵は取らない)');
+    // 🆕 PR-2 の道も小さい番号へ戻らない (上の assertMonotonic) うえで、それぞれの鍵の順で実際に待った
+    assert.ok(LOG.some((x) => x.path === 'G' && x.waiting >= 4 && x.held.includes(1) && x.held.includes(2)), 'アプリの作るは request → 許可の鍵を持って段階の鍵より後ろで待つ');
+    assert.ok(LOG.some((x) => x.path === 'R' && x.waiting >= 4 && x.held.includes(1) && x.held.includes(2)), 'アプリの登録は request → 許可の鍵を持って段階の鍵より後ろで待つ');
+    assert.ok(LOG.some((x) => x.path === 'S' && x.waiting >= 4 && x.held.includes(2)), 'DB の登録の関数を直接呼んでも許可の鍵を段階の鍵より先に取る');
+    assert.ok(LOG.some((x) => x.path === 'V' && x.waiting === 2 && x.held.length === 0), '許可の取り消しは許可の排他の鍵で待つ (何も持たずに)');
+    assert.deepEqual(LOG.filter((x) => x.unknown > 0), [], '表に無い advisory の鍵を持って待つ道が無い (持っている鍵は全部 §3.10 の番号で比べた)');
   });
 
   await ta('[18b] ops.ne_reg_file は許可の共有の鍵を返すまで持つ (R19): 取り消し (排他) は渡し終えるのを待つ・取り消しの後は渡さない', async () => {
