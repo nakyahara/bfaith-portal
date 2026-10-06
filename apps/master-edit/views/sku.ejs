@@ -59,6 +59,24 @@
   const REG_BADGE = { draft: 'warn', ne_pending: 'info', ne_confirmed: 'info', distributable: 'info', available: 'ok', quarantined: 'err', cancelled: 'mute' };
   const dv = isSet ? page.derived : null;
   const compKey = (rows) => rows.map((x) => x.code + '×' + x.qty).join(', ');
+  // 利益 (1 個あたり・参考・10/6 中原さん) = lib/profit-estimate.js の masterProfit (一覧・CSV・画面の JS の public/me-profit.js と同じ関数)。
+  //   売価 = 標準売価 (税込)・原価 = 今日の原価 (決まっている = COMPLETE / OVERRIDDEN だけ。セットは構成品の合計か例外原価)・税率 = この SKU の税率・配送料 = 自社の計算用の送料
+  const pfCost = c && c.cost_today && ['COMPLETE', 'OVERRIDDEN'].includes(c.cost_today.cost_status) ? c.cost_today.cost_jpy : null;
+  const pfIn = c ? { price: c.standard_price, cost: pfCost, taxRate: c.tax_rate, shipping: c.shipping_cost } : null;
+  const pfNow = pfIn ? PF.masterProfit(pfIn) : null;
+  const pfFee = Math.round(PF.PLATFORM_FEE_RATES.standard * 1000) / 10;
+  const profitBlock = () => {
+    const ok = pfNow.ok; const neg = ok && pfNow.profit < 0 ? ' neg' : ''; const notes = PF.profitNoteWords(pfNow.notes);
+    return '<div class="f wide profit" data-row="profit" id="profit-row" style="align-items:start"><div class="lab" id="lab-profit">利益 (1 個あたり)</div><div class="ctl col" id="profit-box" role="group" aria-labelledby="lab-profit">'
+      + '<div class="pfhead"><div><div class="lbl" id="pf-when">いまの値で</div><div class="bignum pf' + neg + '" id="pf-val">' + (ok ? h(PF.fmtProfitYen(pfNow.profit)) + '<small>円</small>' : '—') + '</div></div>'
+      + '<div><div class="lbl">利益率</div><div class="bignum pf' + neg + '" id="pf-rate">' + (ok ? h(PF.fmtProfitRate(pfNow.rate)) : '—') + '</div></div>'
+      + '<div class="pf-next" id="pf-next" aria-live="polite" hidden></div></div>'
+      + '<div class="pf-calc" id="pf-calc"' + (ok ? '' : ' hidden') + '>' + h(PF.profitLine(pfNow)) + '</div>'
+      + '<div class="pf-why" id="pf-why"' + (ok ? ' hidden' : '') + '><span class="b warn">' + h(ok ? '' : pfNow.reason) + '</span></div>'
+      + '<div class="pf-notes" id="pf-notes"' + (notes.length ? '' : ' hidden') + '>' + h(notes.join(' · ')) + '</div>'
+      + '<span class="hint">参考の値です · 手数料 = 売価の ' + pfFee + '% · 税込原価 = 原価 × (1 + 税率) · 配送料 = 自社の計算用の送料 (送料コードの表) · モールごとの手数料・送料の違いは入れていません · 欄を変えると保存の前にここが変わります</span>'
+      + '</div></div>';
+  };
   // 画面の JS に渡す値 (JSON = EJS の出力を JS の値の位置に直に置かない)
   const pageData = page ? {
     code: c.code, kind: c.sku_kind, base, today: page.today, todayLabel: ui.fmtDay(page.today), canSave,
@@ -68,6 +86,10 @@
     handling: c.handling, handlingOwn: c.handling_own ?? null, reg,
     request: !!c.component_request, currentComps: isSet ? c.components.map((x) => ({ code: x.code, qty: x.qty })) : [],
     maxComponents: MAX_COMPONENTS,
+    // 利益 (public/me-profit.js): 保存している値・送料コード → 送料 (送料の表)・セットの構成品の合計の原価 (例外原価をやめたとき)
+    profit: { ...pfIn, feeRate: PF.PLATFORM_FEE_RATES.standard, shipCode: c.shipping_code || '',
+      shipCosts: shippingRates ? Object.fromEntries(shippingRates.map((r) => [r.code, r.cost ?? null])) : null,
+      setCostSum: isSet && dv.current.cost.status === 'COMPLETE' ? dv.current.cost.jpy : null },
   } : null;
 %>
   <%- include('_header', { hasSave: canSave }) %>
@@ -174,6 +196,7 @@
               </details>
             </div>
           </div>
+          <%- profitBlock() %>
         </section>
 
         <section class="panel" id="p-logi" aria-labelledby="h-logi">
@@ -309,6 +332,10 @@
           <%- row('standard_price', '標準売価', '<span class="yen"><input class="in w-s" id="f-standard_price" inputmode="numeric" autocomplete="off" ' + meta('standard_price') + ' data-unit=" 円" value="' + h(c.standard_price ?? '') + '"></span><span class="unit">円</span>', c.standard_price == null ? '未入力' : yen(c.standard_price) + ' 円', { forId: 'f-standard_price', hint: ps == null ? '単品の売価の合計は出せません' : '単品の売価の合計 ' + yen(ps) + ' 円' + (diffP == null || diffP === 0 ? '' : diffP < 0 ? 'より ' + yen(-diffP) + ' 円安い' : 'より ' + yen(diffP) + ' 円高い') }) %>
           <%- row('handling_own', '希望する取扱', seg('handling_own', c.handling_own ?? '', [['active', '取扱中'], ['discontinued', '中止']]) + (c.handling_own == null ? '<span class="hint">いまは決めていません (構成品から決めています)</span>' : ''), c.handling_own == null ? '決めていない (構成品から)' : HANDLING[c.handling_own]) %>
           <div class="f"><div class="lab">いまの実際の状態</div><div class="ctl"><span class="b <%= c.handling === 'discontinued' ? 'mute' : 'ok' %>"><% if (c.handling !== 'discontinued') { %><span class="dot" aria-hidden="true"></span><% } %><%= HANDLING[c.handling] || c.handling %></span><span class="hint"><%= c.components.some((x) => x.handling === 'discontinued') ? '中止の構成品があるので中止です。' : c.handling_own === 'discontinued' ? 'セット自身を中止にしているので中止です。' : '' %>構成品が 1 つでも中止になると、セットも中止になります</span></div></div>
+        </section>
+        <section class="panel" id="p-profit" aria-labelledby="h-profit">
+          <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-yen"/></svg></span><h2 id="h-profit">利益</h2><span class="sub">セットの売価・セットの原価 (構成品の合計か例外原価)・セットの税率・送料</span></div>
+          <%- profitBlock() %>
         </section>
         <section class="panel" aria-labelledby="h-logi">
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-truck"/></svg></span><h2 id="h-logi">物流</h2></div>
@@ -478,5 +505,7 @@
   </div>
   <%- include('_footer') %>
   <% if (page) { %><script src="<%= base %>/public/me-sku.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 利益 (1 個あたり) をその場で計算し直す = lib/profit-estimate.js を同じ版で import する (public/me-profit.js) %>
+  <% if (page) { %><script src="<%= base %>/public/me-profit.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>

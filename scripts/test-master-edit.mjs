@@ -29,6 +29,8 @@
  *     商品管理リストに無い = 「—」・古い / 読めない・ページの分だけ索引で引く・Company DB の権限は広げない
  *  18 一覧の区分の列 (区分の札と同じ・区分の順)・コードのコピーのボタン・絞った一覧の全部のコード / CSV (BOM・CRLF・列・式の注入の対策・印 ?s=・並び・offset は無視・
  *     注文残は発注アプリの権限者だけ・件数 / 時間の上限・期限切れ) / ロジザードの写しの「古い」(写しの時間 09〜18 時の外 = 18 時台の写しは次の朝 10 時まで古くない)
+ *  20 利益 (1 個あたり・参考・10/6): 一覧の列 (手で計算した数・計算できない = 「—」と理由・仮・赤)・利益の少ない順 / 利益率の低い順 (計算できない = 最後)・全部のコード・CSV の 2 列・
+ *     単品 / セットの画面の「利益」(内訳の 1 行・画面の JS に渡す値)・計算のファイル (lib/profit-estimate.js) を画面に配る
  *  19 大きめの見本 (例外の SKU 1,500 件・含むセット 51 件): CSV・全部コピーは SQL で上限 + 1 件まで (中身の段に進まない)・JS で絞る条件・期限は参考の値と販売数の読みにも効く・含むセットの数
  * 使い方: node scripts/test-master-edit.mjs
  */
@@ -2078,7 +2080,7 @@ await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧�
   assert.equal(got.type, 'text/csv; charset=utf-8');
   assert.equal(got.disp, `attachment; filename="master-list_20300110-1200.csv"; filename*=UTF-8''master-list_20300110-1200.csv`, 'ファイル名に日時 (日本の 1/10 12:00)');
   let t = table(got);
-  assert.deepEqual(t[0], ['商品コード', '区分', '構成品の数', '名前', '状態', '登録の状態', '登録日', '売価', '原価', '原価は構成品から計算', '税率 (%)', '売上分類', '代表の仕入先コード', '代表の仕入先', 'JAN', '送料コード', '推奨月数',
+  assert.deepEqual(t[0], ['商品コード', '区分', '構成品の数', '名前', '状態', '登録の状態', '登録日', '売価', '原価', '原価は構成品から計算', '税率 (%)', '利益 (1 個あたり・参考・手数料 10%・円)', '利益率 (%)', '売上分類', '代表の仕入先コード', '代表の仕入先', 'JAN', '送料コード', '推奨月数',
     '在庫 (ロジザード 読めない)', 'FBA (JP) 販売可能 (1/10 08:05 時点)', '売れた 7 日 (読めない)', '売れた 30 日 (読めない)', '対応が必要'], '注文残の列は発注アプリの権限が無い人には無い・読めない参考の値は見出しに「読めない」');
   assert.deepEqual(t.slice(1).map((x) => x[0]), listOrder((await call('GET', '/?kind=single')).text), 'offset に関係なく絞った全件・一覧と同じ並び');
   const row = (code) => Object.fromEntries(t[0].map((h, i) => [h, t.find((x) => x[0] === code)[i]]));
@@ -2166,6 +2168,119 @@ await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧�
   assert.equal(X.stockStale(new Date(at('2030-01-10T10:00:00')).toISOString(), at('2030-01-10T11:59:00')), false);
   assert.equal(X.stockStale(new Date(at('2030-01-10T10:00:00')).toISOString(), at('2030-01-10T12:00:01')), true, '日中は 2 時間');
   assert.equal(X.stockStale('壊れた時刻', at('2030-01-10T12:00:00')), true);
+});
+
+await ta('[20] 利益 (1 個あたり・参考・10/6): 一覧の列・並び (利益の少ない順・利益率の低い順)・全部のコード・CSV の 2 列・単品 / セットの画面・計算のファイルを配る', async () => {
+  // 手で計算した利益 (lib を使わない): 売価 − round(売価 × 10%) − 原価 × (1 + 税率 (無ければ 10%)) − 送料 (無ければ 0)。売価・原価が無い = null
+  const facts = await q(`with c as (select distinct on (y.sku_id) y.sku_id, y.cost_jpy, y.cost_status from core.sku_costs y
+       where y.valid_from <= $1::date and (y.valid_to is null or y.valid_to >= $1::date) order by y.sku_id, y.valid_from desc, y.created_at desc, y.sku_cost_id desc)
+    select s.code, s.standard_price_jpy::float8 as p, s.tax_rate::float8 as t, s.shipping_cost_jpy::float8 as sh, case when c.cost_status in ('COMPLETE', 'OVERRIDDEN') then c.cost_jpy::float8 end as c
+      from core.skus s left join c on c.sku_id = s.sku_id where s.company_id = 1`, [TODAY]);
+  const hand = new Map(facts.map((x) => {
+    if (x.p == null || x.p <= 0 || x.c == null) return [x.code, null];
+    const gross = x.p - Math.round(x.p * 0.1) - x.c * (1 + (x.t ?? 0.1)) - (x.sh ?? 0);
+    return [x.code, { profit: Math.round(gross), rate: gross / x.p, fact: x }];
+  }));
+  const yen = (v) => (v < 0 ? '−' : '') + Math.abs(v).toLocaleString('ja-JP');
+  const pct = (v) => { const r = Math.round(v * 1000) / 10; return (r < 0 ? '−' : '') + Math.abs(r).toFixed(1) + '%'; };
+  const listOrder = (html) => [...html.matchAll(/<a class="rowlink" href="sku\/([^"]+)"/g)].map((m) => decodeURIComponent(m[1]));
+  const rowHtml = (html, code) => html.split('<tr>').find((x) => x.includes(`href="sku/${code}"`));
+  // ── 一覧の列 ──
+  let r = await call('GET', '/');
+  assert.match(r.text, /<th scope="col" class="n" style="width:74px">税<\/th><th scope="col" class="n" style="width:92px" id="th-profit" title="[^"]*売価の 10%[^"]*">利益<span class="thsub">1 個・参考<\/span><\/th><th scope="col" class="n" style="width:74px" id="th-profit-rate">利益率<\/th>/, '利益・利益率の列は税の後');
+  const codes = listOrder(r.text);
+  assert.ok(codes.length >= 8);
+  let nNone = 0; let nTmp = 0;
+  for (const code of codes) {
+    const h = hand.get(code);
+    const cell = colCell(r.text, code, 'profit'); const rate = colCell(r.text, code, 'profit-rate');
+    if (!h) {
+      assert.deepEqual([cell, rate], ['—', '—'], `${code}: 計算できない = —`);
+      assert.match(rowHtml(r.text, code), /<td class="n" data-col="profit"><span class="muted" title="[^"]*なので計算できません">—<\/span>/, `${code}: 理由が title に`);
+      nNone++;
+      continue;
+    }
+    assert.equal(cell.replace(/仮$/, ''), yen(h.profit), `${code}: 利益`);
+    assert.equal(rate, pct(h.rate), `${code}: 利益率`);
+    const tmp = h.fact.t == null || h.fact.sh == null;
+    assert.equal(cell.endsWith('仮'), tmp, `${code}: 税率・送料が未入力 = 仮`);
+    if (tmp) nTmp++;
+    if (h.profit < 0) assert.match(rowHtml(r.text, code), /data-col="profit"><span class="pf neg"/, `${code}: マイナスは赤`);
+    else assert.match(rowHtml(r.text, code), /data-col="profit"><span class="pf" title="売価 /, `${code}: 赤でない・内訳が title に`);
+  }
+  assert.ok(nNone >= 1 && nTmp >= 1, `計算できない ${nNone}・仮 ${nTmp} の行を見た`);
+  // 原価の無い商品 (前の試験で原価が入った商品もある = その時の DB から選ぶ)
+  const noCost = codes.find((c) => { const x = facts.find((y) => y.code === c); return x && x.p > 0 && x.c == null; });
+  assert.ok(noCost, '原価の無い商品がある');
+  assert.match(rowHtml(r.text, noCost), /title="原価が未登録なので計算できません"/);
+  // ── 並び: 利益の少ない順・利益率の低い順 (計算できない = 最後・その中はコード順) ──
+  for (const [sort, key, label] of [['profit_asc', 'profit', '利益の少ない順'], ['rate_asc', 'rate', '利益率の低い順']]) {
+    r = await call('GET', '/?sort=' + sort);
+    assert.match(r.text, new RegExp(`<b aria-current="true">${label}</b>`));
+    const ord = listOrder(r.text);
+    assert.deepEqual([...ord].sort(), [...codes].sort(), `${sort}: 同じ商品・並びだけ違う`);
+    const vals = ord.map((c) => (hand.get(c) ? hand.get(c)[key] : null));
+    const firstNull = vals.indexOf(null);
+    assert.ok(firstNull > 0 && vals.slice(firstNull).every((v) => v == null), `${sort}: 計算できない商品は最後`);
+    for (let i = 1; i < firstNull; i++) assert.ok(vals[i - 1] <= vals[i] + 1e-9, `${sort}: ${ord[i - 1]} (${vals[i - 1]}) → ${ord[i]} (${vals[i]})`);
+    const nulls = ord.slice(firstNull);
+    assert.deepEqual(nulls, [...nulls].sort(), `${sort}: 計算できない商品の中はコード順`);
+    const j = (await call('GET', '/api/codes?sort=' + sort)).j;
+    assert.deepEqual(j.codes, ord, `${sort}: 全部のコードも同じ並び`);
+    // 区分で絞っても並ぶ (絞った後に並べる)
+    const ordSingle = listOrder((await call('GET', `/?sort=${sort}&kind=single`)).text);
+    assert.ok(ordSingle.length >= 3);
+    assert.deepEqual(ordSingle, ord.filter((c) => ordSingle.includes(c)));
+  }
+  assert.equal(R.normalizeFilters({ sort: 'profit_asc' }).sort, 'profit_asc');
+  assert.equal(R.normalizeFilters({ sort: 'profit_desc' }).sort, '', '知らない並びは捨てる');
+  // ── CSV の 2 列 (一覧と同じ数・計算できない = 空・並びも同じ) ──
+  const got = await fetch(BASE + '/list.csv?sort=profit_asc', { headers: { 'x-test-session': 'editor' } });
+  assert.equal(got.status, 200);
+  const lines = (await got.text()).replace(/^﻿/, '').trimEnd().split('\r\n').map((line) => [...line.matchAll(/"((?:[^"]|"")*)"(?:,|$)/g)].map((m) => m[1].replace(/""/g, '"')));
+  const hi = lines[0].indexOf('利益 (1 個あたり・参考・手数料 10%・円)'); const ri = lines[0].indexOf('利益率 (%)');
+  assert.ok(hi > 0 && ri === hi + 1, 'CSV に利益・利益率の列');
+  assert.deepEqual(lines.slice(1).map((x) => x[0]), listOrder((await call('GET', '/?sort=profit_asc')).text), 'CSV も利益の少ない順');
+  for (const x of lines.slice(1)) {
+    const h = hand.get(x[0]);
+    assert.deepEqual([x[hi], x[ri]], h ? [String(h.profit), String(Math.round(h.rate * 1000) / 10)] : ['', ''], `CSV ${x[0]}`);
+  }
+  // ── 1 つの商品の画面 (単品・セット) ──
+  for (const code of ['s002', noCost, 'set001', 's005']) {
+    r = await call('GET', '/sku/' + code);
+    assert.equal(r.status, 200);
+    const h = hand.get(code);
+    const page = JSON.parse(/<script type="application\/json" id="me-page">([\s\S]*?)<\/script>/.exec(r.text)[1]);
+    const f = facts.find((x) => x.code === code);
+    assert.deepEqual([page.profit.price, page.profit.cost, page.profit.taxRate, page.profit.shipping, page.profit.feeRate], [f.p, f.c, f.t, f.sh, 0.1], `${code}: 画面の JS に渡す値`);
+    assert.deepEqual(page.profit.shipCosts, { S01: 210.4, S02: 520 }, '送料コード → 送料 (送料の表)');
+    assert.match(r.text, code.startsWith('set') ? /<section class="panel" id="p-profit" aria-labelledby="h-profit">/ : /<section class="panel" id="p-money"[\s\S]*id="profit-row"[\s\S]*<section class="panel" id="p-logi"/, `${code}: 単品は お金 の箱の中・セットは 利益 の箱`);
+    const val = /<div class="bignum pf( neg)?" id="pf-val">([^<]*)(<small>円<\/small>)?<\/div>/.exec(r.text);
+    assert.ok(val, `${code}: 利益の数の場所`);
+    if (!h) {
+      assert.equal(val[2], '—');
+      assert.match(r.text, /<div class="pf-why" id="pf-why"><span class="b warn">原価が未登録なので計算できません<\/span><\/div>/, `${code}: 理由`);
+      assert.match(r.text, /<div class="pf-calc" id="pf-calc" hidden><\/div>/);
+      continue;
+    }
+    assert.equal(val[2], yen(h.profit), `${code}: 利益`);
+    assert.equal(!!val[1], h.profit < 0, `${code}: マイナスは赤`);
+    assert.ok(r.text.includes(`id="pf-rate">${pct(h.rate)}<`), `${code}: 利益率`);
+    const fee = Math.round(f.p * 0.1); const t = f.t ?? 0.1;
+    const line = `売価 ${f.p.toLocaleString('ja-JP')} − 手数料 ${fee.toLocaleString('ja-JP')} (10%) − 税込原価 ${Math.round(f.c * (1 + t)).toLocaleString('ja-JP')} (${f.c.toLocaleString('ja-JP')} × ${(1 + t).toFixed(2)}) − 配送料 ${(f.sh ?? 0).toLocaleString('ja-JP')} = 利益 ${yen(h.profit)} 円`;
+    assert.ok(r.text.includes(`<div class="pf-calc" id="pf-calc">${line}</div>`), `${code}: 内訳の 1 行 ${line}`);
+    assert.equal(r.text.includes('<div class="pf-notes" id="pf-notes">税率が未入力なので 10% として計算</div>'), f.t == null, `${code}: 税率なしの知らせ`);
+  }
+  // ── 計算のファイルを画面に配る (lib/profit-estimate.js そのもの・JavaScript) ──
+  r = await call('GET', '/sku/s002');
+  const js = await checkScripts(r.text, 0);
+  assert.ok(js.some((s) => s.includes('me-profit.js — 1 つの商品の画面の「利益 (1 個あたり)」')), '利益の JS を読む');
+  const lib = await fetch(BASE + '/public/profit-estimate.js', { headers: { 'x-test-session': 'editor' } });
+  assert.equal(lib.status, 200); assert.match(lib.headers.get('content-type') || '', /javascript/);
+  assert.equal(await lib.text(), fs.readFileSync(new URL('../lib/profit-estimate.js', import.meta.url), 'utf8'), 'lib のファイルそのもの');
+  // つかいかた
+  const man = await call('GET', '/manual');
+  assert.match(man.text, /<h2 id="profit">利益 \(1 個あたり・参考\)<\/h2>/); assert.match(man.text, /売価の 10%/); assert.match(man.text, /参考の値です/);
 });
 
 await ta('[19] 大きめの見本 (#1627 Codex R1 M3 / Low): CSV・全部コピーは SQL で上限 + 1 件までしか読まない (中身の段に進まない)・JS で絞る条件のとき・期限は参考の値と販売数の読みにも効く・含むセット 51 件', async () => {

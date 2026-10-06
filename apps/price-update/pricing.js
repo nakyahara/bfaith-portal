@@ -17,9 +17,10 @@
  */
 
 import { blockReasonOf } from './mall-capabilities.js';
+import { estimateGross, DEFAULT_TAX_RATE } from '../../lib/profit-estimate.js';
 
-/** 消費税率が未登録なら 10% (amazon-accounting と同じ扱い) */
-export const DEFAULT_TAX_RATE = 0.10;
+/** 消費税率が未登録なら 10% (amazon-accounting と同じ扱い)。値は lib/profit-estimate.js が正 (ここは export し直すだけ) */
+export { DEFAULT_TAX_RATE };
 /** 楽天APIの許容上限。これを超える値は送る前に落とす */
 export const MAX_PRICE = 999_999_999;
 /** 変更率の許容幅 (決定事項#2)。値下げ −30% / 値上げ +100% */
@@ -47,25 +48,10 @@ function num(v) {
 }
 
 /**
- * 概算粗利 (参考表示用)。
- * @param {{price:number, cost:number|null, taxRate:number|null, feeRate:number, shipping:number|null}} p
- * @returns {{gross:number|null, rate:number|null, fee:number, costInclTax:number|null, shipping:number}}
- *   cost が無い商品は gross=null (「原価未登録」として表示側で区別する。0 円原価として計算しない)
+ * 概算粗利 (参考表示用) = lib/profit-estimate.js の estimateGross (2026-10-06 に移した。マスタの入力の利益と同じ関数 = 式が 2 つにならない)。
+ * 今までの import { estimateGross } from './pricing.js' はそのまま動く (ここで export し直す)
  */
-export function estimateGross({ price, cost, taxRate, feeRate, shipping }) {
-  const p = num(price);
-  const c = num(cost);
-  const t = num(taxRate) ?? DEFAULT_TAX_RATE;
-  const f = num(feeRate) ?? 0;
-  const s = num(shipping) ?? 0;
-  const fee = p == null ? 0 : Math.round(p * f);
-  if (p == null || c == null) {
-    return { gross: null, rate: null, fee, costInclTax: c == null ? null : c * (1 + t), shipping: s };
-  }
-  const costInclTax = c * (1 + t);
-  const gross = p - costInclTax - fee - s;
-  return { gross, rate: p > 0 ? gross / p : null, fee, costInclTax, shipping: s };
-}
+export { estimateGross };
 
 /**
  * 原価割れ判定 (ブロック用・保守側)。手数料は使わない。
