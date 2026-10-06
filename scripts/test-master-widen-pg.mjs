@@ -11,7 +11,7 @@
  *   3  夜間ロードの最中 (epoch の共有の鍵) は widen が 5 秒で諦める (55P03)・保存の取引 (段階の共有の鍵) の途中は widen が待つ / 11 本番の大きさで widen の取引 2 秒以内
  *   4  widen の後の G18 (UPDATE・DELETE・DELETE → INSERT を持ち主 = ロード・画面のロールで拒む) と G24 (GUC だけ・前の取引の印・セッションの違う印・直接の INSERT・理由が空を拒む)
  *   5  G19 (deferred・保守の印でも最終形を守る・取引の途中の崩れは commit までに直せば通る)
- *   6  今の origin/master のロードを widen の後に: 区分の変わった材料では取引ごと失敗 (何も残らない)・区分の変わらない材料は今までどおり通る
+ *   6  今の master のロード (#1641) を widen の後に: 区分の変わった材料でも通り、社内の区分のまま・食い違いとして記録 (report・判断の記録の held)・セットの形の材料は入れない
  *   7  復元の 3 種類 (sku_kind が load のダンプ = 最終形が崩れていても通る / company で整合 = 通る / company で不整合 = 復元全体が rollback)
  *  18  開放の許可 (照合 ② の始めに閉じる → 結果 → 今回の回で grant・権限・取り消しと閉じるは保存の取引を待つ・停止の床・結果を書く前に落ちた再実行では出ない)
  *  19  復元で新商品の許可が生き返らない (有効な許可のときのダンプ → 閉じる → 復元 = 閉じたまま・新しい照合 ② の後だけ開く)
@@ -411,16 +411,38 @@ try {
     assert.equal(e?.code, '23514', e?.message); assert.match(e.message, /sku_kind_shape/);
   });
 
-  await ta('[6] 今の origin/master のロードを widen の後に: 区分の変わった材料 (単品 → セット・セット → 単品) は取引ごと失敗 / 変わらない材料は通る', async () => {
-    const last = (await OS.latestLoadCommit(dbO)).commit_seq;
-    await assert.rejects(runInitialLoad(dbO, planOf({ kindOf: { p4000: 'set' }, extraComponents: [{ parentCode: 'p4000', childCode: 'p4001', qty: 1, source: 'ne' }] }), { log: () => {}, runId: 'wpg_load_6a', host: 'test' }),
-      /sku_kind_shape/);
-    await assert.rejects(runInitialLoad(dbO, planOf({ kindOf: { s2299: 'single' } }), { log: () => {}, runId: 'wpg_load_6b', host: 'test' }), /sku_kind_shape|sku_kind_locked/);
-    assert.equal((await OS.latestLoadCommit(dbO)).commit_seq, last);   // 何も残らない
-    assert.deepEqual(await q("select code, sku_kind from core.skus where code in ('p4000', 's2299') order by code"), [{ code: 'p4000', sku_kind: 'single' }, { code: 's2299', sku_kind: 'set' }]);
-    // 区分の変わらない材料 (p4998・p4996 は保守で例外にした = 材料も例外にそろえる)
+  await ta('[6] 今の master のロード (#1641 = 持ち主が company の区分は NE に合わせない) を widen の後に: 区分の変わった材料 (単品 → セット・セット → 単品) でも通り、社内の区分のまま・食い違いとして記録 (report・判断の記録)・セットの形の材料は入れない / 変わらない材料も通る / G18 は [4] の直接の UPDATE で確かめる', async () => {
+    const commits = async () => (await q('select count(*)::int as n from ops.master_load_commits'))[0].n;
+    const compsOf = async (code) => (await q('select count(*)::int as n from core.sku_components c join core.skus p on p.sku_id = c.parent_sku_id where p.code = $1', [code]))[0].n;
+    const heldOf = async (runId) => (await q("select payload -> 'sku_kind' -> 'held' as h from ops.load_decisions where ingest_run_id = $1 and section = 'skus'", [runId]))[0]?.h;
+    const n0 = await commits();
+    // p4998・p4996 は [4]・[5] の保守で例外にした (社内) = 材料 (NE) は単品のまま = これも食い違いとして記録される (同じ動き)
+    const MAINT = [['p4996', 'single', 'exception'], ['p4998', 'single', 'exception']];
+    const heldList = (r) => r.conflicts.filter((x) => x.kind === 'sku_kind_held').map((x) => [x.code, x.ne_kind, x.cdb_kind]).sort((x, y) => x[0].localeCompare(y[0]));
+    const s2299Comps = await compsOf('s2299');
+    assert.ok(s2299Comps > 0, '前提: s2299 は構成のあるセット');
+    // NE が単品 p4000 をセットに (構成つき) = 社内は単品のまま・構成は入れない・食い違いとして記録
+    const r6a = await runInitialLoad(dbO, planOf({ kindOf: { p4000: 'set' }, extraComponents: [{ parentCode: 'p4000', childCode: 'p4001', qty: 1, source: 'ne' }] }), { log: () => {}, runId: 'wpg_load_6a', host: 'test' });
+    assert.equal(r6a.ok, true, r6a.error);
+    assert.deepEqual(heldList(r6a), [['p4000', 'set', 'single'], ...MAINT]);
+    assert.deepEqual(await heldOf('wpg_load_6a'), ['p4000', 'p4996', 'p4998']);   // 照合 ② が判断の一覧に出す材料 (decisions.skus.sku_kind.held)
+    assert.equal(await compsOf('p4000'), 0, 'NE のセットの構成を社内の単品に入れない');
+    // NE がセット s2299 を単品に = 社内はセットのまま・食い違いとして記録
+    const r6b = await runInitialLoad(dbO, planOf({ kindOf: { s2299: 'single' } }), { log: () => {}, runId: 'wpg_load_6b', host: 'test' });
+    assert.equal(r6b.ok, true, r6b.error);
+    assert.deepEqual(heldList(r6b), [...MAINT, ['s2299', 'single', 'set']]);
+    assert.deepEqual(await heldOf('wpg_load_6b'), ['p4996', 'p4998', 's2299']);
+    assert.equal(await commits(), n0 + 2, '2 つのロードは commit した (G18 で止まったのではない)');
+    assert.deepEqual(await q("select code, sku_kind from core.skus where code in ('p4000', 'p4996', 'p4998', 's2299') order by code"),
+      [{ code: 'p4000', sku_kind: 'single' }, { code: 'p4996', sku_kind: 'exception' }, { code: 'p4998', sku_kind: 'exception' }, { code: 's2299', sku_kind: 'set' }]);
+    assert.equal(await compsOf('s2299') > 0, true, 's2299 はセットのまま構成もある');
+    assert.equal((await q("select product_id is not null as p from core.skus where code = 'p4000'"))[0].p, true, '単品のまま product_id もそのまま');
+    assert.deepEqual((await q('select ops.sku_kind_shape_counts(1) as c'))[0].c, { single_product_mismatch: 0, non_set_parent_components: 0 });   // 最終形は崩れない
+    // 区分の変わらない材料 (p4998・p4996 は保守で例外にした = 材料も例外にそろえる) = 食い違いなし
     const ok = await runInitialLoad(dbO, { ...planOf(), skus: planOf().skus.map((s) => (['p4998', 'p4996'].includes(s.code) ? exc(s.code) : s)) }, { log: () => {}, runId: 'wpg_load_6c', host: 'test' });
     assert.equal(ok.ok, true, ok.error); assert.equal(typeof ok.load_commit_seq, 'string');
+    assert.deepEqual(ok.conflicts.filter((x) => x.kind === 'sku_kind_held'), []);
+    assert.deepEqual(await heldOf('wpg_load_6c'), []);
   });
 
   await ta('[7] 復元の 4 種類: sku_kind が load のダンプ (最終形が崩れていても) = 通る / company で整合 = 通る / company の DB に load のダンプ = 拒む / company で不整合 = 復元全体が rollback', async () => {

@@ -719,7 +719,8 @@ await ta('[23] 判断の台帳 (D1): 候補を書く / 差を残す承認だけ�
   // 台帳はあるのに書く接続が無い (env の入れ忘れ) = 黙って ✅ にしない (Codex #1475 R1)
   x = await compare(d, { writerDb: null });
   assert.equal(x.result.ne.decisions_write, 'not_configured');
-  assert.match(x.line, /^⚠️ ②: 判断の台帳を書けない \(書く接続が無い: COMPANY_DB_WATCH_WRITER_URL\)/);
+  // 0058 がある DB (広げる道 PR-1 の後) = 入口を閉じる関数も同じ書く接続で呼ぶ = 入口の ⚠️ が先頭・その直後に判断の台帳の ⚠️
+  assert.match(x.line, /^⚠️ 新商品の入口を閉じられない \(前日の許可が残りうる\): 書く接続が無い \/ ⚠️ ②: 判断の台帳を書けない \(書く接続が無い: COMPANY_DB_WATCH_WRITER_URL\)/);
   assert.equal(x.evidence.ne.decisions_write, 'not_configured');
   await db.query(`update core.skus set standard_price_jpy = 0 where code = 'c003'`);
   await redo(d, NE);
@@ -913,7 +914,7 @@ await ta('[25] 最後に一致した値 (D2): D2 の意味の一致を書く (�
   await db.query(`update core.skus set name = $1 where code = 'a001'`, [nameA]);
   assert.equal(x.result.ne.baseline.write, 'not_configured');
   assert.equal(dirOf(x, 'a001', 'name'), 'to_ne');
-  assert.match(x.line, /^⚠️ ②: 判断の台帳を書けない \(書く接続が無い/);
+  assert.match(x.line, /^⚠️ 新商品の入口を閉じられない \(前日の許可が残りうる\): 書く接続が無い \/ ⚠️ ②: 判断の台帳を書けない \(書く接続が無い/);   // 0058 がある DB = 入口の ⚠️ が先頭
   // 4 時間: 超え = 全部 held・書かない (⚠️ にはしない) / ちょうど = 書く → その後に古い読みの回 = stale_observation・⚠️
   x = await run2(NE, { cdbReadAt: at(d, '11:00', 0).getTime() + 1000 });
   assert.deepEqual([x.result.ne.baseline.state, x.result.ne.baseline.held_reason, x.result.ne.baseline.write], ['held', 'gap', 'skipped_held']);
@@ -1766,7 +1767,14 @@ await ta('[38] 区分のゲートは本物の取込 (fetchProducts / fetchSetPro
 
 await ta('[39] 照合 ② の始め (何かを読む前) に新商品の入口を閉じ (ops.close_new_entry_for_compare)、最後に同じ回でゲートの記録 (ops.record_new_entry_gate) を 1 行書く: 関数がある DB = 閉じる → 1 行 (照合の回・取得の完了の時刻 RFC 3339・kind_gate の 5 つ) / 無い DB (0058 の前と確かめた) = 照合は今までどおり (ℹ️) / 0058 があるのに閉じられない (関数が落ちる・書く接続が無い・有無を確かめられない) = 記録を呼ばない・要約の先頭に ⚠️・照合そのものは止めない', async () => {
   const NE = baseNe();
-  // 関数が無い DB (今の積み方 = 0058 の前) = 照合は通る・状態は not_applied
+  // 試験の DB には 0058 がある = 本物の 2 つの関数の名前を試験の間だけ変えて「0058 の前」を作る (最後に戻す)
+  const REAL = [['ops.close_new_entry_for_compare(text)', 'close_new_entry_for_compare'], ['ops.record_new_entry_gate(text, text, text, jsonb)', 'record_new_entry_gate']];
+  const hidden = [];
+  for (const [sig, name] of REAL) {
+    if ((await db.query('select to_regprocedure($1) is not null as ok', [sig])).rows[0].ok) { await db.exec(`alter function ${sig} rename to ${name}__0058_hidden`); hidden.push([sig, name]); }
+  }
+  try {
+  // 関数が無い DB (0058 の前) = 照合は通る・状態は not_applied
   const a = await day('2030-12-01', { ne: NE });
   assert.notEqual(a.result.ne.verdict, 'blocked', a.result.ne.blocked_reason);
   assert.deepEqual([a.ne.gate_close, a.ne.gate_record], [{ state: 'not_applied' }, { state: 'not_applied' }]);
@@ -1819,6 +1827,10 @@ await ta('[39] 照合 ② の始め (何かを読む前) に新商品の入口�
   const e = await day('2030-12-06', { ne: NE });
   assert.deepEqual([e.ne.gate_close, e.ne.gate_record], [{ state: 'not_applied' }, { state: 'not_applied' }]);
   assert.doesNotMatch(e.line, /新商品の入口を閉じられない/);
+  } finally {
+    for (const [sig, name] of hidden) await db.exec(`alter function ${sig.replace(name, `${name}__0058_hidden`)} rename to ${name}`);
+  }
+  for (const [sig] of REAL) assert.equal((await db.query('select to_regprocedure($1) is not null as ok', [sig])).rows[0].ok, true, `${sig} を戻した`);
 });
 
 await pg.close();
