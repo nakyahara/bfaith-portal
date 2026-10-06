@@ -71,24 +71,43 @@ export function summaryLine(r) {
   const gr = r.ne && r.ne.gate_record, gc = r.ne && r.ne.gate_close;
   // 新商品の入口のゲートの記録 (ops.record_new_entry_gate) を書けなかった・入口を閉じられなかった朝は一言 (照合そのものは失敗にしない)
   const notes = [];
-  if (gc && gc.state !== 'ok' && gc.state !== 'not_applied') notes.push(`ℹ️ 新商品の入口を閉じられない: ${GATE_RECORD_TEXT[gc.state] || gc.state}${gc.error ? ` (${gc.error.slice(0, 80)})` : ''}`);
-  if (gr && gr.state !== 'ok') notes.push(`ℹ️ 新商品のゲートの記録: ${GATE_RECORD_TEXT[gr.state] || gr.state}${gr.error ? ` (${gr.error.slice(0, 80)})` : ''}`);
+  if (gr && gr.state !== 'ok' && gr.state !== 'skipped_not_closed') notes.push(`ℹ️ 新商品のゲートの記録: ${GATE_RECORD_TEXT[gr.state] || gr.state}${gr.error ? ` (${gr.error.slice(0, 80)})` : ''}`);
   const base = notes.length ? `${base0} / ${notes.join(' / ')}` : base0;
   const old = oldTablesSummary(r.old_tables);
-  if (!old) return base;
-  return oldTablesBad(r.old_tables) ? `${old} / ${base}` : `${base} / ${old}`;
+  const line = !old ? base : oldTablesBad(r.old_tables) ? `${old} / ${base}` : `${base} / ${old}`;
+  // 入口を閉じられなかった (0058 があるのに・有無が確かめられない) = 前日の許可が残りうる = 重大 = 要約の先頭に ⚠️ (照合そのものの結果は変えない。#1641 Codex R3 High)
+  return gateCloseTrouble(gc) ? `⚠️ 新商品の入口を閉じられない (前日の許可が残りうる): ${gateCloseTrouble(gc)} / ${line}` : line;
+}
+/** 入口を閉じられなかった (成功でも「0058 が無いと確かめた」でもない) 理由。問題なし = null */
+export function gateCloseTrouble(gc) {
+  if (!gc || gc.state === 'ok' || gc.state === 'not_applied') return null;
+  return `${GATE_RECORD_TEXT[gc.state] || gc.state}${gc.error ? ` (${String(gc.error).slice(0, 80)})` : ''}`;
 }
 const GATE_RECORD_TEXT = { not_applied: '関数が無い (0058 の前)', not_configured: '書く接続が無い', no_kind_gate: '区分のゲートの数が無い', no_fetch_time: '取得の完了の時刻が読めない', failed: '書けない' };
-/** 照合 ② の始めに新商品の入口を閉じる (ops.close_new_entry_for_compare = PR-1 (0058) が作る)。返り値 = 状態 (照合は止めない) */
-export async function closeNewEntryForCompare(getWriter, { compareRunId }) {
-  if (!getWriter) return { state: 'not_configured' };
+/**
+ * 照合 ② の始めに新商品の入口を閉じる (ops.close_new_entry_for_compare = PR-1 (0058) が作る)。返り値 = 状態 (照合そのものは止めない):
+ *   ok = 閉じた / not_applied = 関数が無いと **確かめた** (0058 の前 = 今の本番) /
+ *   not_configured = 書く接続が無い (関数はある・有無が分からない) / failed = 有無を確かめられない (接続・権限) か、閉じる関数が落ちた。
+ *   🚨 not_applied は関数の有無を問い合わせて「無い」と返った時だけ (接続・権限の失敗を「0058 の前」と取り違えない。#1641 Codex R3 High)
+ *   ok と not_applied 以外 = 閉じていない = 呼び手は record を呼ばない・要約の先頭に ⚠️
+ * @param {(() => Promise<object>)|null} getWriter  書く接続 (watch_writer)
+ * @param {{ compareRunId: string, readDb?: object|null }} p  readDb = 書く接続が無いときに関数の有無だけ確かめる読む接続
+ */
+export async function closeNewEntryForCompare(getWriter, { compareRunId, readDb = null }) {
+  const FN = "select to_regprocedure('ops.close_new_entry_for_compare(text)') is not null as ok";
+  if (!getWriter) {
+    if (!readDb) return { state: 'not_configured', fn: 'unknown' };
+    try { return (await readDb.query(FN)).rows[0].ok ? { state: 'not_configured', fn: 'present' } : { state: 'not_applied' }; }
+    catch (e) { return { state: 'failed', stage: 'presence', error: String(e && e.message).slice(0, 200) }; }
+  }
+  let w, has;
+  try { w = await getWriter(); has = (await w.query(FN)).rows[0].ok; }
+  catch (e) { return { state: 'failed', stage: 'presence', error: String(e && e.message).slice(0, 200) }; }
+  if (!has) return { state: 'not_applied' };
   try {
-    const w = await getWriter();
-    const has = (await w.query("select to_regprocedure('ops.close_new_entry_for_compare(text)') is not null as ok")).rows[0].ok;
-    if (!has) return { state: 'not_applied' };
     const r = (await w.query('select ops.close_new_entry_for_compare($1) as r', [compareRunId])).rows[0]?.r ?? null;
     return { state: 'ok', result: r };
-  } catch (e) { return { state: 'failed', error: String(e && e.message).slice(0, 200) }; }
+  } catch (e) { return { state: 'failed', stage: 'close', error: String(e && e.message).slice(0, 200) }; }
 }
 /** 取得の件数の記録の完了の時刻 (sync_meta = UTC の 'YYYY-MM-DD HH:MM:SS') → RFC 3339 ('…Z')。読めない = null */
 export function fetchTimeRfc3339(t) {
@@ -245,14 +264,14 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
   const closeWriter = async () => { const c = wconn; wconn = null; if (c && c.close) { try { await c.close(); } catch { /* */ } } };
   let gateClose = null;
   try {
-    // 新商品の入口を閉じる (計画 newentry_min_plan.md §3 の 0): 何かを読む前に 1 回。最後の ops.record_new_entry_gate と同じ回の番号。
-    //   関数が無い (0058 の前)・書く接続が無い・落ちた = 状態だけ残す (照合は止めない)
-    if (neCompare) gateClose = await closeNewEntryForCompare(writerDb || connectWriter ? writer : null, { compareRunId });
     if (!db) {
       if (!connect) throw new Error('接続が無い (db か connect が要る)');
       const c = await connect();
       db = c.db; close = c.close || null;
     }
+    // 新商品の入口を閉じる (計画 newentry_min_plan.md §3 の 0): 何かを読む前に 1 回 (読む接続を開くだけ = まだ何も読んでいない)。最後の ops.record_new_entry_gate と同じ回の番号。
+    //   閉じられなかった (0058 があるのに) = record を呼ばない・要約の先頭に ⚠️。0058 が無いと確かめた = 今までどおり。どちらも照合そのものは止めない
+    if (neCompare) gateClose = await closeNewEntryForCompare(writerDb || connectWriter ? writer : null, { compareRunId, readDb: db });
     // ② の台帳は排他を取ってから読む (取れなければ台帳を使う判定は blocked = pending_locked。C2 v6-3)
     const release = neCompare ? (() => { try { return acquireLock(pendingDir(dataDir, RESULT_DIR)); } catch { return null; } })() : null;
     let pendingEntries = null, ledger = null, decisionLedger = null, decisionsDone = [], baselineWrites = [], neCodes = null, regObs = null, regRead = null;
@@ -421,7 +440,9 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
     }
     // 新商品の入口のゲートの記録 (計画 newentry_min_plan.md §3-1)。結果と証跡を書いた後に 1 回・失敗しても照合は失敗にしない (要約に一言)
     if (result.ne && gateClose) result.ne.gate_close = gateClose;
-    if (result.ne && result.ne.verdict !== 'error' && result.ne.verdict !== 'blocked') {
+    if (result.ne && gateClose && gateClose.state !== 'ok' && gateClose.state !== 'not_applied') {
+      result.ne.gate_record = { state: 'skipped_not_closed' };   // 閉じていない回の結果を許可の材料にしない (#1641 Codex R3 High)
+    } else if (result.ne && result.ne.verdict !== 'error' && result.ne.verdict !== 'blocked') {
       result.ne.gate_record = await recordNewEntryGate(writerDb || connectWriter ? writer : null, { compareRunId, ne: result.ne });
     }
     } finally { await closeWriter(); }

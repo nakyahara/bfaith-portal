@@ -714,7 +714,7 @@ await ta('[23] 判断の台帳 (D1): 候補を書く / 差を残す承認だけ�
   const bad = { query: async () => { throw new Error('writer down'); } };
   x = await compare(d, { writerDb: bad });
   assert.equal(x.result.ne.decisions_write, 'failed');
-  assert.match(x.line, /^⚠️ ②: 判断の台帳を書けない/);
+  assert.match(x.line, /^⚠️ 新商品の入口を閉じられない \(前日の許可が残りうる\): 書けない \(writer down\) \/ ⚠️ ②: 判断の台帳を書けない/);   // 書く接続が全部落ちる = 関数の有無も確かめられない = 入口の ⚠️ も先頭に (#1641 Codex R3 High)
   // 台帳はあるのに書く接続が無い (env の入れ忘れ) = 黙って ✅ にしない (Codex #1475 R1)
   x = await compare(d, { writerDb: null });
   assert.equal(x.result.ne.decisions_write, 'not_configured');
@@ -1763,7 +1763,7 @@ await ta('[38] 区分のゲートは本物の取込 (fetchProducts / fetchSetPro
   } finally { globalThis.fetch = realFetch; }
 });
 
-await ta('[39] 照合 ② の始め (何かを読む前) に新商品の入口を閉じ (ops.close_new_entry_for_compare)、最後に同じ回でゲートの記録 (ops.record_new_entry_gate) を 1 行書く: 関数がある DB = 閉じる → 1 行 (照合の回・取得の完了の時刻 RFC 3339・kind_gate の 5 つ) / 無い DB (0058 の前)・関数が落ちる = 照合は止まらない (書けない・閉じられないは要約に一言)', async () => {
+await ta('[39] 照合 ② の始め (何かを読む前) に新商品の入口を閉じ (ops.close_new_entry_for_compare)、最後に同じ回でゲートの記録 (ops.record_new_entry_gate) を 1 行書く: 関数がある DB = 閉じる → 1 行 (照合の回・取得の完了の時刻 RFC 3339・kind_gate の 5 つ) / 無い DB (0058 の前と確かめた) = 照合は今までどおり (ℹ️) / 0058 があるのに閉じられない (関数が落ちる・書く接続が無い・有無を確かめられない) = 記録を呼ばない・要約の先頭に ⚠️・照合そのものは止めない', async () => {
   const NE = baseNe();
   // 関数が無い DB (今の積み方 = 0058 の前) = 照合は通る・状態は not_applied
   const a = await day('2030-12-01', { ne: NE });
@@ -1789,18 +1789,35 @@ await ta('[39] 照合 ② の始め (何かを読む前) に新商品の入口�
     assert.deepEqual(Object.keys(rows[1].kind_gate).sort(), ['integrity_untrusted', 'norm_collision', 'raw_mismatch', 'raw_unverifiable_affected_existing_cdb', 'unknown_kind']);
     assert.deepEqual([b.ne.gate_close.state, b.ne.gate_record.state], ['ok', 'ok']);
     assert.doesNotMatch(b.line, /新商品の(ゲートの記録|入口を閉じられない)/);
-    // 関数が落ちる = 閉じられない・記録も書けない でも照合は止まらず結果は出る
-    await db.exec(`create or replace function ops.close_new_entry_for_compare(p_compare_run_id text) returns jsonb language plpgsql as $$ begin raise exception 'close_failed: 閉じられない'; end $$;
-      create or replace function ops.record_new_entry_gate(p_compare_run_id text, p_products_complete_at text, p_setproducts_complete_at text, p_kind_gate jsonb) returns jsonb language plpgsql as $$
-        begin raise exception 'stale_fetch: 古い取得'; end $$;`);
+    // ② 関数があり閉じるのが落ちる (0058 あり) = 閉じていない = 記録 (record) を呼ばない・要約の先頭に ⚠️・照合そのものは止めない (#1641 Codex R3 High)
+    await db.exec(`create or replace function ops.close_new_entry_for_compare(p_compare_run_id text) returns jsonb language plpgsql as $$ begin raise exception 'close_failed: 閉じられない'; end $$;`);
     const c = await day('2030-12-03', { ne: NE });
     assert.notEqual(c.result.ne.verdict, 'error');
-    assert.deepEqual([c.ne.gate_close.state, c.ne.gate_record.state], ['failed', 'failed']);
-    assert.match(c.line, /ℹ️ 新商品の入口を閉じられない: 書けない \(.*close_failed.* \/ ℹ️ 新商品のゲートの記録: 書けない \(.*stale_fetch/);
-    assert.equal((await db.query('select count(*)::int as n from ops.test_new_entry_log')).rows[0].n, 2);
+    assert.equal(c.result.ne.kind_gate.raw_mismatch, b.ne.kind_gate.raw_mismatch);   // 照合の本体の結果は変えない
+    assert.deepEqual([c.ne.gate_close.state, c.ne.gate_close.stage, c.ne.gate_record.state], ['failed', 'close', 'skipped_not_closed']);
+    assert.match(c.line, /^⚠️ 新商品の入口を閉じられない \(前日の許可が残りうる\): 書けない \(.*close_failed/);
+    assert.equal((await db.query("select count(*)::int as n from ops.test_new_entry_log where fn = 'record'")).rows[0].n, 1);   // 記録の関数は動くのに呼ばれない (前の 1 行のまま)
+    // ③ 書く接続が無い・関数はある (0058 あり) = not_configured = 記録を呼ばない・⚠️
+    await db.exec(`create or replace function ops.close_new_entry_for_compare(p_compare_run_id text) returns jsonb language sql as $$
+      insert into ops.test_new_entry_log (fn, compare_run_id) values ('close', p_compare_run_id) returning jsonb_build_object('closed', true) $$;`);
+    const d3 = await day('2030-12-04', { ne: NE, compareExtra: { writerDb: null } });
+    assert.deepEqual([d3.ne.gate_close.state, d3.ne.gate_close.fn, d3.ne.gate_record.state], ['not_configured', 'present', 'skipped_not_closed']);
+    assert.match(d3.line, /^⚠️ 新商品の入口を閉じられない \(前日の許可が残りうる\): 書く接続が無い/);
+    assert.equal((await db.query("select count(*)::int as n from ops.test_new_entry_log where fn = 'record'")).rows[0].n, 1);
+    // ④ 関数の有無を確かめられない (接続・権限の失敗) = 「0058 の前」と取り違えない = failed・記録を呼ばない・⚠️ (関数を消しておいても not_applied にしない)
+    await db.exec('drop function ops.close_new_entry_for_compare(text);');
+    const denied = { query: async (sql, p) => { if (/to_regprocedure\('ops\.close_new_entry_for_compare/.test(sql)) throw new Error('permission denied for schema ops'); return db.query(sql, p); } };
+    const d4 = await day('2030-12-05', { ne: NE, compareExtra: { writerDb: denied } });
+    assert.deepEqual([d4.ne.gate_close.state, d4.ne.gate_close.stage, d4.ne.gate_record.state], ['failed', 'presence', 'skipped_not_closed']);
+    assert.match(d4.line, /^⚠️ 新商品の入口を閉じられない \(前日の許可が残りうる\): 書けない \(permission denied/);
+    assert.equal((await db.query("select count(*)::int as n from ops.test_new_entry_log where fn = 'record'")).rows[0].n, 1);
   } finally {
     await db.exec('drop function if exists ops.record_new_entry_gate(text, text, text, jsonb); drop function if exists ops.close_new_entry_for_compare(text); drop table if exists ops.test_new_entry_log;');
   }
+  // ① の続き: 関数が無いと確かめた朝 (今の本番) = 先頭は ⚠️ にしない (今までどおり)
+  const e = await day('2030-12-06', { ne: NE });
+  assert.deepEqual([e.ne.gate_close, e.ne.gate_record], [{ state: 'not_applied' }, { state: 'not_applied' }]);
+  assert.doesNotMatch(e.line, /新商品の入口を閉じられない/);
 });
 
 await pg.close();
