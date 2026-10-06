@@ -14,6 +14,8 @@
     <a class="btn btn-primary" href="/apps/product-hub/new">＋ 新規登録</a>
   </div>
 
+  <%# 広げる道 PR-6: 新商品を Company DB の「新商品の登録」へ移したときの帯・案内 (畳んだカードの外 = いつも見える)。今までどおりなら空 %>
+  <%- typeof masterLegacyNewEntryHtml === 'string' ? masterLegacyNewEntryHtml : '' %>
   <!-- NE商品コードからの一括登録 -->
   <div class="card" style="margin-bottom:14px; border-color:#bae6fd;">
     <details>
@@ -23,8 +25,6 @@
           <span class="muted" style="font-weight:400">／ NEに未取込の新商品 <%= intake.pending %> 件</span>
         <% } %>
       </summary>
-      <%# 広げる道 PR-6: 単品 (やセット) の新商品を Company DB の「新商品の登録」へ移したときの案内。移していなければ空 %>
-      <%- typeof masterLegacyKindNotice === 'string' ? masterLegacyKindNotice : '' %>
       <p class="muted" style="margin:10px 0;">
         NE商品マスタにある商品コードを貼り付けると、ドラフトをまとめて作ります。
         <strong>バリエーションは代表商品コード単位で1件にまとまります</strong>（楽天は1ページ＝代表コード単位のため）。

@@ -1742,11 +1742,32 @@ await t('E8 (PR-6): 全部 C (sku_components も) = セットも 409 (入口ご�
   // 全部閉じた = /new は帯 (ボタンを隠す)・種類の案内は出さない (帯と重ねない)
   const page = await call('GET', '/apps/product-hub/new');
   assert.ok(page.text.includes('master-legacy-banner') && page.text.includes('#create-btn{display:none') && !page.text.includes('master-legacy-kind-notice'));
+  // Codex #1636 R1 Medium: /list も帯 + 一括登録・自動取込のボタンを隠す (案内は帯と重ねない)
+  const listCss = (t) => ((t.match(/<style>([^<]*)\{display:none !important\}<\/style>/) || [])[1] || '').split(',');
+  let list = await call('GET', '/apps/product-hub/list');
+  assert.ok(list.text.includes('master-legacy-banner') && !list.text.includes('master-legacy-kind-notice'), '/list の帯 (全部 C)');
+  for (const sel of phMod.LIST_NEW_ENTRY_WRITE_SELECTORS) assert.ok(listCss(list.text).includes(sel), `/list で隠す: ${sel}`);
+  assert.deepEqual([...phMod.LIST_NEW_ENTRY_WRITE_SELECTORS].sort(), ['#intake-run-btn', '#reg-preview-btn', '#reg-run-btn']);
   setOwnerPhase('new_open', 'unreadable'); G.__resetLegacyGate();
   await quiet(async () => {
     assert.equal((await call('POST', '/apps/product-hub/api/drafts', { ne_code: 'ph-set-3', name: 'セット 3' })).status, 503);
     assert.equal((await call('POST', '/apps/product-hub/api/register-codes', { codes: 'ph-set-2' })).status, 503);
+    // Codex #1636 R1 Low: 持ち主を読めない = 書かない試し (dry run) も 503 master_owner_unreadable (段階を読めないときだけ試しを通す)
+    for (const [p, body] of [['/api/register-codes', { codes: 'ph-set-2', dry_run: true }], ['/api/intake/run', { dry_run: true }], ['/api/notion-image-import', { status: 'x' }], ['/api/notion-import-by-status', {}]]) {
+      const r = await call('POST', `/apps/product-hub${p}`, body);
+      assert.deepEqual([r.status, r.json && r.json.error, r.warning], [503, 'master_owner_unreadable', null], `${p}: ${r.text.slice(0, 160)}`);
+    }
   });
+  list = await quiet(() => call('GET', '/apps/product-hub/list'));
+  assert.ok(list.text.includes('列ごとの持ち主を読めない') && listCss(list.text).includes('#reg-run-btn'), '/list の帯 (持ち主を読めない)');
+  // 段階を読めない = 今までどおり試しは注意つきで通す (持ち主の読めないとは分ける)・/list は帯
+  setPhase('unreadable'); G.__resetLegacyGate();
+  await quiet(async () => {
+    const r = await call('POST', '/apps/product-hub/api/register-codes', { codes: 'ph-set-2', dry_run: true });
+    assert.ok(r.status === 200 && r.warning === 'phase_unreadable', `${r.status} ${r.text.slice(0, 160)}`);
+  });
+  list = await quiet(() => call('GET', '/apps/product-hub/list'));
+  assert.ok(list.text.includes('master-legacy-banner') && listCss(list.text).includes('#reg-run-btn'), '/list の帯 (段階を読めない)');
   // legacy_open = 単品の新商品は今までどおり
   setPhase('legacy_open'); G.__resetLegacyGate();
   const r3 = await quiet(() => call('POST', '/apps/product-hub/api/drafts', { ne_code: 'single-legacy-open', name: '切替前の単品' }));
@@ -1768,6 +1789,9 @@ await t('E8 (PR-6): 種類の門の部品 = 門の答えが無い・知らない
     assert.equal(G.refuseLegacyNewKind(fakeRes(unread), 'single', { dryRun: true }), false, '読めない + 書かない試し = 通す');
     res = fakeRes(unread);
     assert.equal(G.refuseLegacyNewKind(res, 'single'), true); assert.equal(res.statusCode, 503);
+    // Codex #1636 R1 Low: 持ち主を読めない = 書かない試しでも 503 master_owner_unreadable
+    res = fakeRes({ masterLegacyKinds: { single: { writable: false, readable: false, owner_unreadable: true, phase: 'new_open' } } });
+    assert.equal(G.refuseLegacyNewKind(res, 'single', { dryRun: true }), true); assert.deepEqual([res.statusCode, res.body.error], [503, 'master_owner_unreadable']);
   });
   // どの持ち主でも: 入口ごと開いている ⇔ どれかの種類が開いている (owner_match 'all' = 種類の列を合わせたもの)
   const st = (company) => ({ writable: false, readable: true, phase: 'new_open', owner: { readable: true, company } });
@@ -1782,6 +1806,26 @@ await t('E8 (PR-6): 種類の門の部品 = 門の答えが無い・知らない
   const { NEW_ENTRY_KEYS } = await import('../lib/master-register.mjs');
   for (const k of ['single', 'set']) assert.deepEqual([...E.NEW_KIND_COLS[k]].sort(), [...NEW_ENTRY_KEYS[k]].sort(), k);
   assert.deepEqual([...E.newKindCols(['single', 'set'])].sort(), [...E.NEW_PRODUCT_COLS].sort());
+});
+await t('E8 (PR-6・Codex #1636 R1 Low): 正規化で同じコードの行が単品とセットに割れた = 単品 (閉じる側)・13 キー + sku_kind C で 409', async () => {
+  const ins = mdb.prepare(`INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 原価状態, 消費税率, 売上分類, 原価, 代表商品コード, updated_at) VALUES (?, ?, ?, 'OK', 0.1, 3, 900, NULL, '2026-10-01 00:00:00')`);
+  ins.run('ph-split', '割れた (セット)', 'セット');
+  ins.run('PH-SPLIT ', '割れた (単品)', '単品');
+  const { newKindOfCode } = await import('../apps/product-hub/services/new-product-intake.js');
+  assert.equal(mdb.prepare("SELECT count(*) AS c FROM mirror_products WHERE LOWER(TRIM(商品コード)) = 'ph-split'").get().c, 2, '正規化で 2 行');
+  assert.equal(newKindOfCode(phdb, 'ph-split'), 'single');
+  assert.equal(newKindOfCode(phdb, 'PH-SPLIT'), 'single');
+  setOwnerPhase('new_open', CUT14); G.__resetLegacyGate();
+  await quiet(async () => {
+    const n0 = nDrafts();
+    const r = await call('POST', '/apps/product-hub/api/drafts', { ne_code: 'ph-split', name: '割れた' });
+    assert.deepEqual([r.status, r.json.error, r.json.kind], [409, 'master_new_entry_moved', 'single'], r.text.slice(0, 160));
+    const r2 = await call('POST', '/apps/product-hub/api/register-codes', { codes: 'ph-split' });
+    assert.deepEqual([r2.status, r2.json.kind, r2.json.codes], [409, 'single', ['ph-split']], r2.text.slice(0, 160));
+    assert.equal(nDrafts(), n0);
+  });
+  mdb.prepare("DELETE FROM mirror_products WHERE LOWER(TRIM(商品コード)) = 'ph-split'").run();
+  setPhase('legacy_open'); G.__resetLegacyGate();
 });
 server.close();
 

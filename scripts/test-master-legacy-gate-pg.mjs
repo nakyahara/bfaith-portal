@@ -233,7 +233,8 @@ try {
     assert.equal(r2.state, 'stopped', JSON.stringify(r2));
     const rows = await listInstances(M, { hours: 24 });
     assert.ok(rows.some((x) => x.instance_id === 'ghost-pc:999:deadbeef' && x.host === 'minipc' && x.stopped === true && x.stopped_reason === '電源が切れて戻らない (試験)'), JSON.stringify(rows));
-    await assert.rejects(() => markStopped({ host: 'render', instance: 'x:1:2', reason: '試験', env: { ...env, COMPANY_DB_MASTER_GATE_RENDER_URL: '' } }), /COMPANY_DB_MASTER_GATE_RENDER_URL/);
+    // 広げる道 PR-6 (Codex #1636 R1 Low): --list はプロセスごとの最後の記録の一覧 (manifest) のハッシュも出す (配った後に新しい一覧がそろったかを見る)
+    assert.ok(rows.length > 0 && rows.every((x) => /^[0-9a-f]{64}$/.test(x.manifest_hash)), JSON.stringify(rows.map((x) => x.manifest_hash)));    await assert.rejects(() => markStopped({ host: 'render', instance: 'x:1:2', reason: '試験', env: { ...env, COMPANY_DB_MASTER_GATE_RENDER_URL: '' } }), /COMPANY_DB_MASTER_GATE_RENDER_URL/);
     // 15 分以内に記録があるプロセス (= 動いているかもしれない) は --force なしでは「止めた」にしない (見る接続 = watcher)
     G.__resetLegacyAck();
     const live = await G.ackLegacyGates({ host: 'minipc', env, instance: null });

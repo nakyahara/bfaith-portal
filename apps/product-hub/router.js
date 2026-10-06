@@ -222,6 +222,8 @@ router.get('/', (req, res) => {
   res.redirect('/apps/product-hub/board');
 });
 
+/** /list の新商品を作る部品 (NE のコードから一括の確認・登録・自動取込を今すぐ)。全部の種類が閉じた・読めない = 隠す (広げる道 PR-6) */
+export const LIST_NEW_ENTRY_WRITE_SELECTORS = Object.freeze(['#reg-preview-btn', '#reg-run-btn', '#intake-run-btn']);
 router.get('/list', (req, res) => {
   const db = getDB();
   maybeBackfillDerivedStatus(db);   // PR4 切替の一回きりバックフィル (実施済みなら即 return)
@@ -268,8 +270,10 @@ router.get('/list', (req, res) => {
     lpSpec: { enabled: lpComposeEnabled(), spec: lpSpecSummary(db, 'product_analysis') },
     shopCategoryCount: countActiveShopCategories(db),
     maxShopCategoryLines: MAX_SHOP_CATEGORY_LINES,
-    // 広げる道 PR-6: 一部の種類 (例: 単品) の新商品を新しい画面へ移したときの案内 (門 product-hub:screen:/list。移していなければ空)
-    masterLegacyKindNotice: legacyNewKindNoticeHtml(res.locals.masterLegacy),
+    // 広げる道 PR-6 (門 product-hub:screen:/list。今までどおりなら空):
+    //   全部の種類が閉じた・段階 / 持ち主が読めない = 帯 + 一括登録・自動取込のボタンを隠す (Codex #1636 R1 Medium)
+    //   一部の種類 (例: 単品) だけ新しい画面へ移した = 案内 (ボタンは残す = セットは作れる)
+    masterLegacyNewEntryHtml: legacyBannerHtml(res.locals.masterLegacy, { hideSelectors: LIST_NEW_ENTRY_WRITE_SELECTORS }) + legacyNewKindNoticeHtml(res.locals.masterLegacy),
   });
 });
 
