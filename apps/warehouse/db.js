@@ -2741,8 +2741,9 @@ export function updateSyncMeta(key, value) {
  */
 export function clearNeCompleteMarks(kind) {
   if (kind !== 'products' && kind !== 'setproducts') throw new Error(`clearNeCompleteMarks: 知らない種類 ${kind}`);
-  db.prepare('DELETE FROM sync_meta WHERE key IN (?, ?, ?, ?, ?)').run(`ne_api_${kind}_complete_at`, `ne_api_${kind}_complete_count`, `ne_api_${kind}_complete_rev`,
-    `ne_api_${kind}_complete_parents`, `ne_api_${kind}_integrity`);
+  // 取得の件数 (ne_api_<kind>_fetch_counts。広げる道 PR-9 = apps/warehouse/ne-fetch-counts.js) も印と一緒に消す (印より長く残さない)
+  db.prepare('DELETE FROM sync_meta WHERE key IN (?, ?, ?, ?, ?, ?)').run(`ne_api_${kind}_complete_at`, `ne_api_${kind}_complete_count`, `ne_api_${kind}_complete_rev`,
+    `ne_api_${kind}_complete_parents`, `ne_api_${kind}_integrity`, `ne_api_${kind}_fetch_counts`);
 }
 
 /**

@@ -110,6 +110,7 @@ await ta('[2] 古い形の DB は列が足され、前からの行・その回�
 });
 
 await ta('[3] 商品の取込の整合 (取った行・コードが空・同じコードが 2 度) を完了の印と一緒に残す。対象のコードは全件', async () => {
+  await new Promise((r) => setTimeout(r, 1100));   // 前の取込と別の秒にする (同じ秒だと前の回の行が今回の時刻に残り、取得の件数 (PR-9 ne-fetch-counts) が合わず印を付けない)
   // 2 ページ目に G0〜G59 がもう一度 (60 件 = 前の上限 50 を超える)・コードが空が 1 行
   ne.goods = [...Array.from({ length: 1000 }, (_, i) => ({ goods_id: `G${i}` })), ...Array.from({ length: 60 }, (_, i) => ({ goods_id: `G${i}` })), { goods_id: '' }, { goods_id: 'X9' }];
   await quietly(fetchProducts);
@@ -186,6 +187,7 @@ await ta('[5] CSV の取込も元の値を残す (列が無ければ NULL)。完
 
 await ta('[6] 自動取込 (auto-import.js を実際に動かす) も元の値を残し、完了の印・親の数・整合の証跡を消す', async () => {
   // 先に API の取込で印を付けておく
+  await new Promise((r) => setTimeout(r, 1100));   // 前の取込と別の秒にする (同じ秒だと前の回の行が今回の時刻に残り、取得の件数 (PR-9 ne-fetch-counts) が合わず印を付けない)
   ne.goods = [{ goods_id: 'A1', goods_cost_price: '1' }];
   ne.setgoods = [{ set_goods_id: 'AS', set_goods_name: 'x', set_goods_selling_price: '1', set_goods_detail_goods_id: 'A1', set_goods_detail_quantity: '1' }];
   await quietly(fetchProducts); await quietly(fetchSetProducts);
@@ -224,8 +226,9 @@ await ta('[7] 証跡の書き込みで失敗したら、セットは入れ替え
     await assert.rejects(quietly(fetchSetProducts), /forced/);
     assert.deepEqual(snap(), before);
     ne.goods = [{ goods_id: 'P1', goods_cost_price: '5' }];
+    await new Promise((r) => setTimeout(r, 1100));   // 前の取込と別の秒にする (同じ秒だと前の回の行が今回の時刻に残り、取得の件数 (PR-9 ne-fetch-counts) が合わず印を付けない)
     await assert.rejects(quietly(fetchProducts), /forced/);
-    for (const k of ['complete_at', 'complete_count', 'complete_rev', 'integrity']) assert.equal(meta(`ne_api_products_${k}`), null, k);
+    for (const k of ['complete_at', 'complete_count', 'complete_rev', 'integrity', 'fetch_counts']) assert.equal(meta(`ne_api_products_${k}`), null, k);
   } finally { db().exec('DROP TRIGGER IF EXISTS t_c1_fail'); }
 });
 
