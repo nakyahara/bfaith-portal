@@ -8,6 +8,7 @@
  *   4 マイナス (赤字) も計算する・見せ方は「−」
  *   5 price-update の estimateGross は同じ関数 (export し直し)・手数料の率は 1 か所 (PLATFORM_FEE_RATES)
  *   6 import の無いファイル (ブラウザにそのまま配る) = import / require を書いていない
+ *   7 内訳の 1 行の等式が必ず成り立つ (税込原価が .5 になる 10%・小数の送料・8% の 2 桁) = 左の式の数 = 右の数・利益 = その四捨五入 (Codex #1632 R1 Low)
  * 使い方: node scripts/test-profit-estimate.mjs
  */
 import assert from 'node:assert/strict';
@@ -97,6 +98,31 @@ t('[5] price-update と同じ関数・手数料の率は 1 か所', () => {
 t('[6] ブラウザにそのまま配るファイル = import / require を書いていない', () => {
   const src = fs.readFileSync(new URL('../lib/profit-estimate.js', import.meta.url), 'utf8');
   assert.ok(!/^\s*import\s/m.test(src) && !/\brequire\(/.test(src) && !/\bprocess\./.test(src), 'Node だけのものを使っていない');
+});
+
+t('[7] 内訳の 1 行の等式が成り立つ: 税込原価 16.5 (原価 15 × 1.10)・小数の送料 210.4・8% の 35.64 / 総当たりで左の式 = 右の数・利益 = 四捨五入 (整数の手計算と同じ)', () => {
+  // Codex の例: 前は「1,000 − 100 − 17 − 0 = 利益 884 円」(左辺は 883)
+  assert.equal(PF.profitLine(PF.masterProfit({ price: 1000, cost: 15, taxRate: 0.1, shipping: 0 })), '売価 1,000 − 手数料 100 (10%) − 税込原価 16.5 (15 × 1.10) − 配送料 0 = 883.5 → 利益 884 円 (四捨五入)');
+  assert.equal(PF.profitLine(PF.masterProfit({ price: 1000, cost: 100, taxRate: 0.08, shipping: 210.4 })), '売価 1,000 − 手数料 100 (10%) − 税込原価 108 (100 × 1.08) − 配送料 210.4 = 581.6 → 利益 582 円 (四捨五入)');
+  assert.equal(PF.profitLine(PF.masterProfit({ price: 1000, cost: 33, taxRate: 0.08, shipping: 0 })), '売価 1,000 − 手数料 100 (10%) − 税込原価 35.64 (33 × 1.08) − 配送料 0 = 864.36 → 利益 864 円 (四捨五入)');
+  assert.equal(PF.profitLine(PF.masterProfit({ price: 1000, cost: 100, taxRate: 0.1, shipping: 520 })), '売価 1,000 − 手数料 100 (10%) − 税込原価 110 (100 × 1.10) − 配送料 520 = 利益 270 円', '割り切れるときは → を出さない');
+  const n = (x) => Number(x.replace(/,/g, '').replace('−', '-'));
+  let checked = 0;
+  for (const price of [980, 1000, 1234, 2980]) for (const cost of Array.from({ length: 400 }, (_, i) => i * 5 + 1).concat([15, 25, 45, 3000])) for (const taxRate of [0.08, 0.1, null]) for (const shipping of [0, 210.4, 520, 99.5, null]) {
+    const r = PF.masterProfit({ price, cost, taxRate, shipping });
+    const line = PF.profitLine(r);
+    const m = /^売価 ([\d,]+) − 手数料 ([\d,]+) \(10%\) − 税込原価 ([\d,.]+) \([\d,]+ × 1\.(?:08|10)\) − 配送料 ([\d,.]+) = (?:(−?[\d,.]+) → )?利益 (−?[\d,]+) 円(?: \(四捨五入\))?$/.exec(line);
+    assert.ok(m, line);
+    const left = Math.round((n(m[1]) - n(m[2]) - n(m[3]) - n(m[4])) * 100) / 100;
+    const right = m[5] == null ? n(m[6]) : n(m[5]);
+    assert.equal(left, right, `左の式 = 右の数: ${line}`);
+    assert.equal(Math.round(right) + 0, n(m[6]), `利益 = 四捨五入: ${line}`);
+    // 整数の手計算 (銭まで): 売価・手数料は円・原価 × (100 + 税率%) は銭・送料は銭
+    const sen = price * 100 - Math.round(price * 0.1) * 100 - cost * Math.round(100 + (taxRate ?? 0.1) * 100) - Math.round((shipping ?? 0) * 100);
+    assert.equal(r.profit, Math.round(sen / 100) + 0, `手計算と同じ: ${line}`);
+    checked++;
+  }
+  assert.ok(checked > 20000);
 });
 
 console.log(`\n${passed} 件 ok`);

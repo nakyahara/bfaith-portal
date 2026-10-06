@@ -2268,7 +2268,9 @@ await ta('[20] 利益 (1 個あたり・参考・10/6): 一覧の列・並び (�
     assert.equal(!!val[1], h.profit < 0, `${code}: マイナスは赤`);
     assert.ok(r.text.includes(`id="pf-rate">${pct(h.rate)}<`), `${code}: 利益率`);
     const fee = Math.round(f.p * 0.1); const t = f.t ?? 0.1;
-    const line = `売価 ${f.p.toLocaleString('ja-JP')} − 手数料 ${fee.toLocaleString('ja-JP')} (10%) − 税込原価 ${Math.round(f.c * (1 + t)).toLocaleString('ja-JP')} (${f.c.toLocaleString('ja-JP')} × ${(1 + t).toFixed(2)}) − 配送料 ${(f.sh ?? 0).toLocaleString('ja-JP')} = 利益 ${yen(h.profit)} 円`;
+    const y2 = (v) => v.toLocaleString('ja-JP', { maximumFractionDigits: 2 });
+    const cit = Math.round(f.c * (1 + t) * 100) / 100; const g = Math.round((f.p - fee - cit - (f.sh ?? 0)) * 100) / 100;
+    const line = `売価 ${f.p.toLocaleString('ja-JP')} − 手数料 ${fee.toLocaleString('ja-JP')} (10%) − 税込原価 ${y2(cit)} (${f.c.toLocaleString('ja-JP')} × ${(1 + t).toFixed(2)}) − 配送料 ${y2(f.sh ?? 0)} = ${Number.isInteger(g) ? '' : `${y2(g).replace('-', '−')} → `}利益 ${yen(h.profit)} 円${Number.isInteger(g) ? '' : ' (四捨五入)'}`;
     assert.ok(r.text.includes(`<div class="pf-calc" id="pf-calc">${line}</div>`), `${code}: 内訳の 1 行 ${line}`);
     assert.equal(r.text.includes('<div class="pf-notes" id="pf-notes">税率が未入力なので 10% として計算</div>'), f.t == null, `${code}: 税率なしの知らせ`);
   }

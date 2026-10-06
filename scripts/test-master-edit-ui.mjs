@@ -1511,7 +1511,7 @@ await ta('[49] 利益 (1 個あたり・10/6): 単品 = 売価・税率・送料
   // 送料 S01 (210): 2500 − 250 − 140.4 − 210 = 1899.6 → 1,900
   await p.selectOption('#f-shipping_code', 'S01');
   assert.equal((await st()).val, '1,900円');
-  assert.match(await pfText(p, '#pf-calc'), /配送料 210 = 利益 1,900 円$/);
+  assert.equal(await pfText(p, '#pf-calc'), '売価 2,500 − 手数料 250 (10%) − 税込原価 140.4 (130 × 1.08) − 配送料 210 = 1,899.6 → 利益 1,900 円 (四捨五入)', '内訳の式と右の数が合う (円未満も出す)');
   const shot = async (name) => {
     if (!PROFIT_SHOTS) return;
     await p.evaluate(() => { if (document.activeElement) document.activeElement.blur(); document.querySelector('#profit-row').scrollIntoView({ block: 'center' }); });
