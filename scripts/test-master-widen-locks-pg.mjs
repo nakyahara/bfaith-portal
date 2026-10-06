@@ -179,13 +179,13 @@ try {
   const closedOk = (r) => !r.err || /new_entry_closed|入口は閉じている/.test(String(r.err.message));
 
   let n = 0;
-  await ta('[18a] アプリの鍵の入口 ops.acquire_new_entry_locks (PR-2 Codex R3): §3.10 の 2 (許可) を共有で取り、取引の終わりまで持つ・戻り値 = 今の許可が有効か', async () => {
+  await ta('[18a] アプリの鍵の入口 ops.acquire_new_entry_locks (PR-2 Codex R3): §3.10 の 2 (許可・種類の順に全部) を共有で取り、取引の終わりまで持つ・戻り値 = 今の許可が有効か', async () => {
     await E1.query('begin');
     assert.equal((await E1.query("select ops.acquire_new_entry_locks('single') as v")).rows[0].v, true);
     const st = await locksOf();
-    assert.deepEqual(st.A.held, [2]);
+    assert.deepEqual(st.A.held, [2, 2]);   // 種類の順に全部 (single → set・#1644 Codex R1 Medium 2 でセットの道も同じ鍵)
     const mode = await q(`select mode from pg_locks where pid = $1 and locktype = 'advisory' order by mode`, [PID.A]);
-    assert.deepEqual(mode.map((x) => x.mode), ['ShareLock']);
+    assert.deepEqual(mode.map((x) => x.mode), ['ShareLock', 'ShareLock']);
     await E1.query('commit');
     assert.deepEqual((await locksOf()).A.held, []);
   });

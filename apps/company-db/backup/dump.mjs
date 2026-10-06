@@ -413,6 +413,9 @@ export async function restoreFromLines(db, openLines, { log = () => {}, maxDefer
   await db.exec('begin');
   try {
     await applySession(db);
+    // 0058 (広げる道 #1644 Codex R1 High 2): 復元の前の区分の持ち主 (skus.sku_kind が company か)。company → load に戻す復元は拒む (下)
+    const lockedBefore = (await db.query(`select to_regprocedure('ops.sku_kind_locked()') is not null as ok`)).rows[0].ok === true
+      ? (await db.query('select ops.sku_kind_locked() as l')).rows[0].l === true : false;
     // migrations は完全一致でなければ拒否 (古いダンプで新しいスキーマの履歴を巻き戻さない)
     const applied = (await db.query('select version from ops.schema_migrations order by version')).rows.map((r) => r.version);
     const want = [...(header.migrations || [])].sort();
@@ -613,6 +616,12 @@ export async function restoreFromLines(db, openLines, { log = () => {}, maxDefer
     if ((await db.query(`select to_regprocedure('ops.assert_sku_kind_shape_after_restore()') is not null as ok`)).rows[0].ok === true) {
       try { kindShape = (await db.query('select ops.assert_sku_kind_shape_after_restore() as r')).rows[0].r; }
       catch (e) { throw Object.assign(new Error(`戻した行の最終形が違う (区分の持ち主が company) = 復元しない: ${e.message}`), { code: 'RESTORE_KIND_SHAPE', cause: e }); }
+    }
+    // 0058 (#1644 Codex R1 High 2): 区分の持ち主が company だった DB に、widen の前のダンプを戻す = 持ち主が load に戻り G18 / G19 / G25 が外れる = 復元しない
+    //   (sku_kind は forward-only。戻すなら、ダンプを選び直す = widen の後のダンプ)
+    if (lockedBefore && (await db.query('select ops.sku_kind_locked() as l')).rows[0].l !== true) {
+      throw Object.assign(new Error('restore_kind_owner_regression: 区分 (skus.sku_kind) の持ち主が company の DB に、load のときのダンプを戻そうとした = 復元しない (widen の後のダンプを選ぶ)'),
+        { code: 'RESTORE_KIND_OWNER_REGRESSION' });
     }
     await db.exec('commit');
     return { tables: summary, totalRows, selfFix, generatedAt: header.generatedAt, skipped: tables.filter((t) => SKIP_RESTORE.includes(t.table)).map((t) => t.table), kindShape };

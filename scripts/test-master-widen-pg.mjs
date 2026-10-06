@@ -321,6 +321,7 @@ try {
     await assert.rejects(W.widenOwnership(dbO, { attemptId: AID, companyId: 1, actor: 't', evidence: { ...ev, load_commit_seq: String(Number(prepared.commitSeq)) } }), /evidence_invalid/);
     await assert.rejects(W.widenOwnership(dbO, { attemptId: AID, companyId: 1, actor: 't', evidence: { ...ev, build_id: '' } }), /evidence_invalid/);
     await assert.rejects(W.widenOwnership(pgAdapter(P), { attemptId: AID, companyId: 1, actor: 't', evidence: ev }), (e) => e.code === '42501');   // DB の持ち主だけ
+    await WW.query("select ops.close_new_entry_for_compare('mc_before_widen')");
     await WW.query("select ops.record_new_entry_gate('mc_before_widen', $1, $1, $2::jsonb)", [new Date(Date.now() - 1000).toISOString(), JSON.stringify(ZERO_GATE)]);   // [18] 用: widen の前に書いた照合 ② の結果
     const before = await check();
     assert.equal(before.ok, true, JSON.stringify(before.problems));
@@ -401,6 +402,12 @@ try {
       await c.query("update core.skus set product_id = null where code = 'p4996'");
     });
     assert.equal(e, null, e?.message);
+    // #1644 Codex R1 Medium 1: 構成の行の主キーを二段に更新 (親をセットでない SKU へ → 同じ行の子を変える) = commit で拒む
+    e = await commitErr(async (c) => {
+      await c.query("update core.sku_components set parent_sku_id = (select sku_id from core.skus where code = 'p0050') where parent_sku_id = (select sku_id from core.skus where code = 's0001') and child_sku_id = (select sku_id from core.skus where code = 'p0002')");
+      await c.query("update core.sku_components set child_sku_id = (select sku_id from core.skus where code = 'p0051') where parent_sku_id = (select sku_id from core.skus where code = 'p0050') and child_sku_id = (select sku_id from core.skus where code = 'p0002')");
+    });
+    assert.equal(e?.code, '23514', e?.message); assert.match(e.message, /sku_kind_shape/);
   });
 
   await ta('[6] 今の origin/master のロードを widen の後に: 区分の変わった材料 (単品 → セット・セット → 単品) は取引ごと失敗 / 変わらない材料は通る', async () => {
@@ -415,7 +422,7 @@ try {
     assert.equal(ok.ok, true, ok.error); assert.equal(typeof ok.load_commit_seq, 'string');
   });
 
-  await ta('[7] 復元の 3 種類: sku_kind が load のダンプ (最終形が崩れていても) = 通る / company で整合 = 通る / company で不整合 = 復元全体が rollback', async () => {
+  await ta('[7] 復元の 4 種類: sku_kind が load のダンプ (最終形が崩れていても) = 通る / company で整合 = 通る / company の DB に load のダンプ = 拒む / company で不整合 = 復元全体が rollback', async () => {
     const T = await openPgClient(u2.toString()); clients.push(T);
     const dbT = pgAdapter(T);
     await applyMigrations(dbT, { log: () => {} });
@@ -425,6 +432,9 @@ try {
     const r2 = await restoreCompanyDb(dbT, dumpOk, { log: () => {} });
     assert.deepEqual(r2.kindShape, { single_product_mismatch: 0, non_set_parent_components: 0, locked: true });
     assert.equal((await T.query('select ops.sku_kind_locked() as l')).rows[0].l, true);
+    // #1644 Codex R1 High 2: 区分の持ち主が company の DB に、widen の前 (0058 の後) のダンプを戻す = 持ち主が load に戻る = 復元全体を拒む
+    await assert.rejects(restoreCompanyDb(dbT, dumpLoad, { log: () => {} }), (e) => e.code === 'RESTORE_KIND_OWNER_REGRESSION' && /restore_kind_owner_regression/.test(e.message));
+    assert.equal((await T.query('select ops.sku_kind_locked() as l')).rows[0].l, true, '前の中身のまま (company)');
     // 不整合を含む company のダンプ (trigger を止めて作る = G19 を通っていない行)
     await O.query('begin');
     await O.query('alter table core.skus disable trigger user');
@@ -497,8 +507,13 @@ try {
     // 再試行も同じ組 (新しい回で 閉じる → 結果 → grant)
     await close('mc_lease_4'); await result('mc_lease_4'); await grant(NG, 'mc_lease_4');
     assert.equal(await valid(), true);
-    // 新しい結果の行 (閉じる無しでも) = 前の許可は無効
-    await result('mc_lease_5');
+    // #1644 Codex R1 High 1: 閉じずに結果 (close なし)・別の回 A を閉じて B の結果 = 拒む → 前の許可は有効のまま
+    await assert.rejects(result('mc_lease_5'), /not_closed/);
+    await close('mc_lease_a'); assert.equal(await valid(), false);
+    await assert.rejects(result('mc_lease_5'), /not_closed/);
+    await assert.rejects(grant(NG, 'mc_lease_5'), /compare_run_mismatch|stop_floor/);
+    // 閉じてから結果 = 新しい結果の行 → 前の許可は無効・この回で出せる
+    await close('mc_lease_5'); await result('mc_lease_5');
     assert.equal(await valid(), false);
     await assert.rejects(grant(NG, 'mc_lease_4'), /compare_run_mismatch/);
     // 最終形が崩れた (取引の途中) = 出さない

@@ -366,9 +366,9 @@ begin
       raise exception 'sku_kind_shape: セットでない SKU % (%) に構成の行がある', v_id, v_kind using errcode = '23514';
     end if;
   else
-    -- commit のときの形 = 構成の行が今もあれば、その親の今の区分 (行を後で消した = 見ない)
-    select s.sku_kind into v_kind from core.sku_components c join core.skus s on s.sku_id = c.parent_sku_id
-     where c.parent_sku_id = new.parent_sku_id and c.child_sku_id = new.child_sku_id;
+    -- commit のときの形 = その親の SKU に今も構成の行があれば、その親の今の区分 (#1644 Codex R1 Medium 1: 主キーの組でなく親ごと = 親 → 子の二段の更新でも見る)
+    select s.sku_kind into v_kind from core.skus s
+     where s.sku_id = new.parent_sku_id and exists (select 1 from core.sku_components c where c.parent_sku_id = new.parent_sku_id);
     if found and v_kind <> 'set' then
       raise exception 'sku_kind_shape: 構成の親 (SKU %) がセットでない (%)', new.parent_sku_id, v_kind using errcode = '23514';
     end if;
@@ -378,7 +378,7 @@ end $$;
 revoke all on function core.check_sku_kind_shape() from public;
 create constraint trigger trg_skus_kind_shape after insert or update of sku_kind, product_id on core.skus
   deferrable initially deferred for each row execute function core.check_sku_kind_shape();
-create constraint trigger trg_sku_components_kind_shape after insert or update of parent_sku_id on core.sku_components
+create constraint trigger trg_sku_components_kind_shape after insert or update of parent_sku_id, child_sku_id on core.sku_components
   deferrable initially deferred for each row execute function core.check_sku_kind_shape();
 
 -- ─── 9. G25: 復元の最後 (trigger を戻した後・commit の前) の数え直し。sku_kind の持ち主が company で最終形が 0 でなければ拒む = 復元全体が rollback ───
@@ -804,6 +804,7 @@ create table ops.new_entry_gate_results (
   kind_gate                 jsonb not null check (jsonb_typeof(kind_gate) = 'object'),
   single_product_mismatch   bigint not null check (single_product_mismatch >= 0),
   non_set_parent_components bigint not null check (non_set_parent_components >= 0),
+  close_floor_id            bigint not null,   -- 同じ回の照合 ② の始めに閉じた停止の床 (single) = 閉じてから数えた回だけ (#1644 Codex R1 High 1・FK は床の表の後)
   recorded_by               text not null,
   created_at                timestamptz not null default clock_timestamp()
 );
@@ -856,6 +857,9 @@ declare
   v_day   date;
   v_shape jsonb;
   v_id    bigint;
+  v_max   bigint;
+  v_close bigint;
+  f       record;
 begin
   foreach k in array ops.new_entry_lease_kinds() loop perform pg_catalog.pg_advisory_xact_lock(ops.new_entry_lease_lock_key(k)); end loop;
   if coalesce(p_compare_run_id, '') !~ '^[A-Za-z0-9_.:-]{1,80}$' then raise exception 'invalid_input: 照合の回 (英数字と _.:- の 1〜80 字) が要る' using errcode = '22023'; end if;
@@ -874,12 +878,22 @@ begin
   if (v_pat at time zone 'Asia/Tokyo')::date <> v_day or (v_sat at time zone 'Asia/Tokyo')::date <> v_day then
     raise exception 'stale_fetch: 取得の完了の日が今日 (JST %) でない = 古い取得の数は残さない', v_day using errcode = 'P0001';
   end if;
+  -- #1644 Codex R1 High 1: この回の照合 ② の始めに閉じてから数えたこと = 種類ごとの最新の停止の床が「この回が閉じた床」で、その床 = 今の一番新しい結果の行
+  --   (close を呼び忘れた回・close の後に取り消し / 別の回の結果が入った回 = 拒む = 照合の途中に入口が開いたままの数で許可を出さない)
+  select coalesce(pg_catalog.max(x.result_id), 0) into v_max from ops.new_entry_gate_results x;
+  foreach k in array ops.new_entry_lease_kinds() loop
+    select * into f from ops.master_new_entry_stop_floors s where s.kind = k order by s.floor_id desc limit 1;
+    if not found or f.closed_by_compare_run_id is distinct from p_compare_run_id or f.floor_result_id is distinct from v_max then
+      raise exception 'not_closed: 照合の回 % の始めに入口を閉じていない (ops.close_new_entry_for_compare が先・種類 %)', p_compare_run_id, k using errcode = 'P0001';
+    end if;
+    if k = 'single' then v_close := f.floor_id; end if;
+  end loop;
   v_shape := ops.sku_kind_shape_counts(1);
   perform pg_catalog.set_config('ops.gate_result_protocol', '1', true);
-  insert into ops.new_entry_gate_results (compare_run_id, products_complete_at, setproducts_complete_at, kind_gate, single_product_mismatch, non_set_parent_components, recorded_by, created_at)
+  insert into ops.new_entry_gate_results (compare_run_id, products_complete_at, setproducts_complete_at, kind_gate, single_product_mismatch, non_set_parent_components, close_floor_id, recorded_by, created_at)
     values (p_compare_run_id, v_pat, v_sat,
             (select pg_catalog.jsonb_object_agg(e.key, ops.jsonb_nonneg_bigint(e.value)) from pg_catalog.jsonb_each(p_kind_gate) e),
-            (v_shape ->> 'single_product_mismatch')::bigint, (v_shape ->> 'non_set_parent_components')::bigint, session_user::text, v_now)
+            (v_shape ->> 'single_product_mismatch')::bigint, (v_shape ->> 'non_set_parent_components')::bigint, v_close, session_user::text, v_now)
     returning result_id into v_id;
   perform pg_catalog.set_config('ops.gate_result_protocol', '', true);
   return pg_catalog.jsonb_build_object('result_id', v_id::text, 'compare_run_id', p_compare_run_id, 'shape', v_shape);
@@ -889,7 +903,7 @@ revoke all on function ops.record_new_entry_gate(text, text, text, jsonb) from p
 -- ─── 12c. 開放の許可 (lease・最小の計画 §3)。新商品を作る DB の関数自身が確かめる (14 で register_new_sku・ne_reg_build・ne_reg_issue に組み込む) ───
 create table ops.master_new_entry_leases (
   lease_id       bigint generated always as identity primary key,
-  kind           text not null check (kind in ('single')),
+  kind           text not null check (kind in ('single', 'set')),   -- set は今は出す道が無い (grant は single だけ・#1644 Codex R1 Medium 2)
   result_id      bigint not null references ops.new_entry_gate_results (result_id),   -- 許可を出した照合 ② の結果の行
   compare_run_id text not null,                                                        -- その行の照合の回 (配る時の「NE のコードの回 = 許可の回」に使う)
   granted_by     text not null,
@@ -940,6 +954,7 @@ create table ops.master_new_entry_stop_floors (
   recorded_at     timestamptz not null default clock_timestamp()
 );
 select core.make_append_only('ops', 'master_new_entry_stop_floors');
+alter table ops.new_entry_gate_results add constraint fk_negr_close_floor foreign key (close_floor_id) references ops.master_new_entry_stop_floors (floor_id);
 
 -- 結果の行で許可を出せるか = 問題の配列 (空 = 出せる)。許可を出すとき (grant) が呼ぶ:
 --   一番新しい結果の行・kind_gate の 5 つが全部 0・その行の最終形の 2 つと今の最終形が 0・その行が今日 (JST)・区分の持ち主が company・その行が widen の後・停止の床より新しい
@@ -960,6 +975,11 @@ begin
   if p_result_id is distinct from v_max then v_out := v_out || format('not_latest: 結果の行 %s は一番新しい行 (%s) でない', p_result_id, v_max); end if;
   select * into r from ops.new_entry_gate_results x where x.result_id = p_result_id;
   if not found then return v_out || 'result_missing'::text; end if;
+  -- #1644 Codex R1 High 1: 結果の行は同じ回が始めに閉じた床に結び付いている (record が確かめた・ここでもう一度)
+  if not exists (select 1 from ops.master_new_entry_stop_floors s where s.floor_id = r.close_floor_id and s.kind = 'single'
+                  and s.closed_by_compare_run_id = r.compare_run_id and s.floor_result_id < r.result_id) then
+    v_out := v_out || 'not_closed: 結果の行が同じ回の照合 ② の始めに閉じた床と結び付いていない'::text;
+  end if;
   select pg_catalog.array_agg(e.key order by e.key) into v_bad from pg_catalog.jsonb_each(r.kind_gate) e where (e.value #>> '{}')::bigint <> 0;
   if v_bad is not null then v_out := v_out || format('kind_gate: 区分のゲートの数が 0 でない (%s)', pg_catalog.array_to_string(v_bad, '・')); end if;
   if r.single_product_mismatch <> 0 or r.non_set_parent_components <> 0 then
@@ -1001,8 +1021,10 @@ revoke all on function ops._new_entry_lease_ok(text) from public;
 -- 許可の共有の鍵 (§3.10 の 2)。新商品を作る 3 つの関数が request の鍵の後・段階の鍵の前に取る (private)。今の新商品の許可は single だけ = single の鍵
 create function ops._new_entry_lease_shared_locks() returns void
   language plpgsql set search_path = pg_catalog, pg_temp as $$
+declare
+  k text;
 begin
-  perform pg_catalog.pg_advisory_xact_lock_shared(ops.new_entry_lease_lock_key('single'));
+  foreach k in array ops.new_entry_lease_kinds() loop perform pg_catalog.pg_advisory_xact_lock_shared(ops.new_entry_lease_lock_key(k)); end loop;
 end $$;
 revoke all on function ops._new_entry_lease_shared_locks() from public;
 
@@ -1033,7 +1055,7 @@ begin
   if p_kind is null or not (p_kind = any (ops.new_entry_lease_kinds())) then
     raise exception 'invalid_input: 知らない新商品の種類 %', coalesce(p_kind, 'null') using errcode = '22023';
   end if;
-  perform pg_catalog.pg_advisory_xact_lock_shared(ops.new_entry_lease_lock_key(p_kind));
+  perform ops._new_entry_lease_shared_locks();   -- 種類の順に全部 (single → set・新商品を作る 3 つの関数と同じ)
   return ops._new_entry_lease_ok(p_kind);
 end $$;
 revoke all on function ops.acquire_new_entry_locks(text) from public;
@@ -1181,8 +1203,9 @@ begin
   if e.lease_id is null then
     raise exception 'reg_file_expired: no_lease (配った時の許可の記録が無い)' using errcode = 'P0001';
   end if;
-  select pg_catalog.max(l.lease_id) into v_last from ops.master_new_entry_leases l where l.kind = 'single';
-  if v_last is distinct from e.lease_id or not ops._new_entry_lease_ok('single') then
+  -- 種類の許可 (単品の CSV = single・セットの CSV = set・#1644 Codex R1 Medium 2)
+  select pg_catalog.max(l.lease_id) into v_last from ops.master_new_entry_leases l where l.kind = case when e.kind = 'products' then 'single' else 'set' end;
+  if v_last is distinct from e.lease_id or not ops._new_entry_lease_ok(case when e.kind = 'products' then 'single' else 'set' end) then
     raise exception 'reg_file_expired: lease_invalid (配った時の許可がもう有効でない = 取り消し・期限切れ・新しい照合の結果)' using errcode = 'P0001';
   end if;
   if pg_catalog.encode(pg_catalog.sha256(e.file_bytes), 'hex') is distinct from e.sha256 then
@@ -1707,7 +1730,8 @@ begin
     return pg_catalog.jsonb_build_object('export_id', v_prev.export_id, 'state', v_prev.state, 'sha256', v_prev.sha256, 'trial', v_prev.trial, 'replayed', true);
   end if;
   -- 🆕 0058 (v13 §3.8): 同じ request_id・同じ中身の replay (上) は許可が要らない。新しい export を作る前だけ許可を確かめる
-  if v_kind = 'products' then perform ops._require_new_entry_lease('single'); end if;   -- 単品の CSV だけ (セットは画面の門のまま)
+  -- 単品の CSV = 単品の許可・セットの CSV = セットの許可 (今は出す道が無い = DB の境界でも閉じたまま・#1644 Codex R1 Medium 2)
+  perform ops._require_new_entry_lease(case when v_kind = 'products' then 'single' else 'set' end);
   -- 鍵: 商品と構成品 (今の構成 + 開いている構成の依頼) の SKU (sku_id の順) → CSV の鍵 → NE の元のコード (共有・照合の書き手と並ぶ)
   select pg_catalog.array_agg(distinct x) into v_ids from (
     select (i ->> 'sku_id')::bigint as x from pg_catalog.jsonb_array_elements(p -> 'items') i
@@ -1858,11 +1882,11 @@ begin
     v_result := pg_catalog.jsonb_build_object('export_id', p_export_id::text, 'state', 'closed', 'refused', true, 'reason', 'item_superseded', 'codes', pg_catalog.to_jsonb(v_gone));
   else
     -- 🆕 0058 (v13 §3.8): 初回の built → issued (初めて配る) だけ許可を確かめる (もう配った・閉じる道は要らない)
-    if e.kind = 'products' then perform ops._require_new_entry_lease('single'); end if;   -- 単品の CSV だけ
+    perform ops._require_new_entry_lease(case when e.kind = 'products' then 'single' else 'set' end);   -- セットはセットの許可 (#1644 Codex R1 Medium 2)
     -- 🆕 0058 (v17 §3.9 R16 M5): 配った時の許可と、その許可を出した朝の照合の回を export に残す (ops.ne_reg_file が「配った時の許可がまだ有効」を見る)。
     --   セットの CSV は許可が要らない = 有効な許可があるときだけ残す (無ければダウンロードできない = 閉じる側・設計への質問)
-    select l.lease_id, l.compare_run_id into v_lease, v_run from ops.master_new_entry_leases l where l.kind = 'single' order by l.lease_id desc limit 1;
-    if v_lease is not null and not ops._new_entry_lease_ok('single') then v_lease := null; v_run := null; end if;
+    select l.lease_id, l.compare_run_id into v_lease, v_run from ops.master_new_entry_leases l
+     where l.kind = case when e.kind = 'products' then 'single' else 'set' end order by l.lease_id desc limit 1;
     -- 🆕 0058 (v15 §3.9): 配る直前に、その時の NE のコード (最新の照合の回) と履歴の両方に無いことをもう一度確かめる (build の後の新しい取得で見えたコードを配らない)
     perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.ne_codes'));
     -- 🆕 0058 (R16 M5): 確かめる NE のコードは許可を出した朝の照合の回のもの (ops.master_ne_code_mark.compare_run_id = 許可の compare_run_id)。違えば ne_codes_stale

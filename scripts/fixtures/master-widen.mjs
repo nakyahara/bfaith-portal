@@ -40,9 +40,9 @@ export const ZERO_GATE = Object.freeze({ raw_mismatch: 0, raw_unverifiable_affec
  * 新商品 (単品) の開放の許可を置く (0058 の後・段階 new_open・区分の持ち主が company の DB)。本番 = widen → 翌朝の照合 ② の結果 → daily-sync の次の段の grant。
  *   試験は「広げた試み」を印 (ops.widen_protocol) で直接置き (無ければ)、本物の関数で照合 ② の結果 (5 つの数が 0) を残し、本物の関数で許可を出す。
  *   結果の回 = 今の NE のコードの印の回 (ops.master_ne_code_mark・まだ結果が無ければ) = 配る (ne_reg_issue) の「許可の回 = NE のコードの回」が通る。runId で指定もできる。
- *   0058 の前の DB = 何もしない (null)。runId の結果がもうある = 何もしない (null)。戻り値 = 許可 ({ lease_id, result_id, ... })
+ *   0058 の前の DB = 何もしない (null)。runId の結果がもうある = 何もしない (null)。戻り値 = 許可 ({ lease_id, result_id, ... })。withSet = セットの許可も直接置く (試験だけ)
  */
-export async function seedNewEntryLease(db, { actor = 'test', runId = null, kindGate = ZERO_GATE } = {}) {
+export async function seedNewEntryLease(db, { actor = 'test', runId = null, kindGate = ZERO_GATE, withSet = false } = {}) {
   if ((await one(db, `select to_regprocedure('ops.grant_new_entry_lease(text, text)') is not null as ok`)).ok !== true) return null;
   if (!(await one(db, "select exists (select 1 from ops.master_widen_attempts where state = 'widened') as e")).e) {
     const mf = JSON.stringify({ entries: [{ id: 'fixture:new-entry-lease', kind: 'code' }] });
@@ -65,7 +65,19 @@ export async function seedNewEntryLease(db, { actor = 'test', runId = null, kind
   const at = new Date(Date.now() - 1000).toISOString();
   await db.query('select ops.close_new_entry_for_compare($1)', [run]);   // 本番と同じ: 照合 ② の始めに閉じる → 結果 → grant (今回の回)
   await db.query('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', [run, at, JSON.stringify(kindGate)]);
-  return (await one(db, "select ops.grant_new_entry_lease('single', $1) as r", [run])).r;
+  const lease = (await one(db, "select ops.grant_new_entry_lease('single', $1) as r", [run])).r;
+  // withSet = セットの CSV の 0053 の道を試験するためだけに、同じ結果の行のセットの許可を直接置く (本番には出す道が無い = grant は single だけ・#1644 Codex R1 Medium 2)
+  if (withSet) {
+    await db.query('begin');
+    try {
+      await db.query("select set_config('ops.lease_protocol', '1', true)");
+      await db.query(`insert into ops.master_new_entry_leases (kind, result_id, compare_run_id, granted_by, expires_at)
+        select 'set', r.result_id, r.compare_run_id, $1, ops.new_entry_lease_expiry(clock_timestamp()) from ops.new_entry_gate_results r where r.compare_run_id = $2`, [actor, run]);
+      await db.query("select set_config('ops.lease_protocol', '', true)");
+      await db.query('commit');
+    } catch (e) { await db.query('rollback'); throw e; }
+  }
+  return lease;
 }
 
 export const hex = (c) => c.repeat(64);

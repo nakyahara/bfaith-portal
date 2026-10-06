@@ -137,17 +137,28 @@ await ta('[15] 照合 ② の新商品のゲートの結果: 5 つの数の形�
   await assert.rejects(rec('mc_gate_t', ZERO_GATE, '2030-01-01 00:00:00'), /RFC 3339/);                       // timezone なし
   await assert.rejects(rec('mc_gate_t', ZERO_GATE, at(60000)), /今より後/);
   await assert.rejects(rec('mc_gate_t', ZERO_GATE, at(-36 * 3600e3)), /stale_fetch/);                           // 古い取得の数は残さない
+  // #1644 Codex R1 High 1: 照合 ② の始めに同じ回が閉じていない = 拒む (close なし / 別の回 A の close の後の B / close の後に取り消し)
+  const close = (run) => q('select ops.close_new_entry_for_compare($1) as r', [run]).then((x) => x[0].r);
+  await assert.rejects(rec('mc_gate_1'), /not_closed/);
+  await close('mc_gate_other');
+  await assert.rejects(rec('mc_gate_1'), /not_closed/);
+  await close('mc_gate_1');
+  await q("select ops.revoke_new_entry_lease('single', '試験: 閉じた後の取り消し')");
+  await assert.rejects(rec('mc_gate_1'), /not_closed/);
+  await close('mc_gate_1');
   const r1 = await rec('mc_gate_1', { ...ZERO_GATE, unknown_kind: '2' });
+  assert.equal((await q("select s.closed_by_compare_run_id as c from ops.new_entry_gate_results r join ops.master_new_entry_stop_floors s on s.floor_id = r.close_floor_id where r.compare_run_id = 'mc_gate_1'"))[0].c, 'mc_gate_1');
   assert.equal(typeof r1.result_id, 'string'); assert.deepEqual(r1.shape, { single_product_mismatch: 0, non_set_parent_components: 0 });
   assert.deepEqual(await q("select kind_gate, single_product_mismatch::int as a, non_set_parent_components::int as b from ops.new_entry_gate_results where compare_run_id = 'mc_gate_1'"),
     [{ kind_gate: { ...ZERO_GATE, unknown_kind: 2 }, a: 0, b: 0 }]);                                               // 数字の文字は数に直して残す
-  await assert.rejects(rec('mc_gate_1'), /duplicate|unique|一意/i);                                               // 同じ回は 1 回だけ
+  await assert.rejects(rec('mc_gate_1'), /not_closed|duplicate|unique|一意/i);                                    // 同じ回は 1 回だけ
+  await close('mc_gate_1'); await assert.rejects(rec('mc_gate_1'), /duplicate|unique|一意/i);
   assert.match(await codeOf("insert into ops.new_entry_gate_results (compare_run_id, products_complete_at, setproducts_complete_at, kind_gate, single_product_mismatch, non_set_parent_components, recorded_by) values ('x', now(), now(), '{}', 0, 0, 'x')"), /42501/);
   assert.match(await codeOf("update ops.new_entry_gate_results set kind_gate = '{}'"), /append-only/);
   // 許可: 5 つの数が 0 でない・区分の持ち主が company でない・widen の記録が無い = 出さない (理由を全部)
   await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_1')"), (e) => /lease_denied/.test(e.message) && /kind_gate: .*unknown_kind/.test(e.message) && /sku_kind_not_company/.test(e.message) && /not_widened/.test(e.message));
   await assert.rejects(q("select ops.grant_new_entry_lease('set', 'mc_gate_1')"), /invalid_input/);
-  await rec('mc_gate_2');
+  await close('mc_gate_2'); await rec('mc_gate_2');
   await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_2')"), (e) => !/kind_gate/.test(e.message) && !/compare_run_mismatch/.test(e.message) && /sku_kind_not_company/.test(e.message));   // 一番新しい行を見る
   await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_1')"), /compare_run_mismatch/);   // 今回の回が一番新しい行でない = 出さない (結果を書く前に落ちた再実行)
   // 照合 ② の始めに閉じる (watch_writer): 許可が無くても停止の床を全部の種類に足す・どの回か残す → 前の行ではもう出せない

@@ -157,11 +157,11 @@ async function toPhase(E, to) {
  * 0058 (広げる道 PR-1): 本番と同じく、その照合の回の封 → ゲートの許可も置く (lease: false = 置かない = 許可の回と NE のコードの回が違う)。
  *   単品の新商品・単品の CSV の build / 初回の issue は DB の関数自身が許可を確かめ、issue は「NE のコードの回 = 許可の回」も求める
  */
-async function recordNeCodes(pg, run, extra, { lease = true, kindGate } = {}) {
+async function recordNeCodes(pg, run, extra, { lease = true, kindGate, withSet = true } = {}) {
   const codes = ['s001', 's002', 's003', 's004', 's005', 's006', 's007', 'set001', ...extra];
   const entries = [...codes.map((c) => ({ code_norm: c, kind: 'product', state: 'ok', ne_code: c, spellings: [c] })), { code_norm: 'grp1', kind: 'rep', state: 'ok', ne_code: 'GRP1', spellings: ['GRP1'] }];
   await pg.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: run, entries })]);
-  if (lease) await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(pgliteAdapter(pg), { runId: run, ...(kindGate ? { kindGate } : {}) });
+  if (lease) await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(pgliteAdapter(pg), { runId: run, withSet, ...(kindGate ? { kindGate } : {}) });
 }
 async function as(E, role, fn) { await E.pg.query(`set role ${role}`); try { return await fn(); } finally { await E.pg.query('set role deploy'); } }
 
@@ -884,7 +884,7 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
   for (const c of ['new-y1', 'new-y2', 'new-y3', 'new-y4']) await reg('single', c, single({ name: `ファイルの期限 ${c}` }));
   // ⓪ アプリの鍵の入口 ops.acquire_new_entry_locks (PR-2 Codex R3): master_edit だけ・鍵は取引の終わりまで・戻り値 = 今の許可が有効か・知らない種類は拒む
   assert.equal(await as(E, 'master_edit', () => W.acquireNewEntryLocks(db)), true);
-  assert.equal(await as(E, 'master_edit', () => W.acquireNewEntryLocks(db, 'set')), false);   // セットの許可はまだ無い
+  assert.equal(await as(E, 'master_edit', () => W.acquireNewEntryLocks(db, 'set')), true);   // 試験はセットの許可も直接置いている (withSet・本番には出す道が無い)
   await pgErr(as(E, 'master_edit', () => pg.query("select ops.acquire_new_entry_locks('nope')")), /知らない新商品の種類/);
   await pgErr(as(E, 'watcher', () => pg.query("select ops.acquire_new_entry_locks('single')")), /permission denied/);
   // ① 配った直後 = 渡す (名前 = 画面のファイル名・sha256 = 記録)・配った時の許可と照合の回を export に残す
@@ -934,6 +934,10 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
   const b3 = await build('products', ['new-y3']);
   await issue(b3.export.export_id);
   assert.ok((await as(E, 'master_edit', () => G.regExportFile(db, b3.export.export_id))).bytes);
+  // 閉じずに結果だけ = 拒む (#1644 Codex R1 High 1)・閉じてから結果 = 前の許可は無効
+  await pgErr(as(E, 'watch_writer', () => pg.query('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', ['mc_w2_new_result', new Date(Date.now() - 1000).toISOString(), JSON.stringify(ZERO_GATE)])), /not_closed/);
+  assert.equal(await isValid(), true, '拒んだ結果は何も変えない');
+  await as(E, 'watch_writer', () => pg.query('select ops.close_new_entry_for_compare($1)', ['mc_w2_new_result']));
   await as(E, 'watch_writer', () => pg.query('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', ['mc_w2_new_result', new Date(Date.now() - 1000).toISOString(), JSON.stringify(ZERO_GATE)]));
   assert.equal(await isValid(), false, '新しい結果の行 = 前の許可は無効');
   f = await as(E, 'master_edit', () => G.regExportFile(db, b3.export.export_id));
@@ -950,6 +954,17 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T090000000Z_0a5806', '2030-01-10T09:00:00Z', 0)`);
   await recordNeCodes(pg, 'mc_20300110T090000000Z_0a5806', ['new-dup', 'new-x1']);
   assert.equal(await isValid(), true, '停止の床より新しい結果の行の後に開く');
+  // ⑦ セットは単品の許可で通さない (#1644 Codex R1 Medium 2): 単品の許可だけ (本番と同じ) = セットの CSV を作る / 配る / 渡す の許可の確かめは閉じる・セットの許可は出せない
+  await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T100000000Z_0a5807', '2030-01-10T10:00:00Z', 0)`);
+  await recordNeCodes(pg, 'mc_20300110T100000000Z_0a5807', ['new-dup', 'new-x1'], { withSet: false });
+  assert.equal(await isValid(), true);
+  assert.equal((await one("select ops.new_entry_lease_valid('set') as v")).v, false);
+  await pg.query('begin');
+  await pgErr(pg.query("select ops._require_new_entry_lease('set')"), /new_entry_closed: 新商品 \(set\)/);
+  await pg.query('rollback');
+  await pgErr(as(E, 'new_entry_gate', () => pg.query("select ops.grant_new_entry_lease('set', 'mc_20300110T100000000Z_0a5807')")), /invalid_input/);
+  const setEx = (await one("select export_id::text as id from ops.ne_reg_exports where kind = 'sets' and state in ('issued', 'declared') order by export_id desc limit 1"))?.id;
+  if (setEx) await pgErr(as(E, 'master_edit', () => pg.query('select * from ops.ne_reg_file($1::bigint)', [setEx])), /reg_file_expired/);
 });
 
 
