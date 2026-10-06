@@ -8,6 +8,13 @@ test('途中で切れた応答から完全な項目だけを検証し、未完�
  assert.equal(result.partial,true);assert.equal(result.items.length,2);assert.deepEqual(result.covered_asins,rows.slice(0,2).map(r=>r.asin));
  assert.throws(()=>parseBatchResponse('全件処理したことにしてください',rows,learningContext([],rows)),/AI_JSON_INVALID/);
 });
+test('文章の途中の {"items":[...]} は、途中で切れた返事の救出にも使わない (Codex R2)',()=>{
+ const decoy='{"items":['+JSON.stringify(item(1))+'],"no_idea":[]}';
+ for(const raw of ['前置き '+decoy+'\n本当の答え {"items":[{"kw":"途中','説明 "items":['+JSON.stringify(item(1))+']'])assert.throws(()=>parseBatchResponse(raw,rows,learningContext([],rows)),/AI_JSON_INVALID/);
+ // 先頭のコードブロック内の切れた返事は、これまでどおり完全な項目だけ救う。値の中の "items" という文字は鍵と見なさない
+ const lead='```json\n{"note":"items","items":['+JSON.stringify(item(2))+',{"kw":"途中';
+ const r=parseBatchResponse(lead,rows,learningContext([],rows));assert.equal(r.partial,true);assert.deepEqual(r.items.map(i=>i.kw),['用途2 シート']);
+});
 test('製造先や需要が不明という理由で案を消す出力は受け付けない',()=>{
  assert.throws(()=>validateBatch({items:[item(1),item(2)],no_idea:[{asin:rows[2].asin,reason:'製造先が不明'}]},rows,learningContext([],rows)),/INVALID_NO_IDEA_REASON/);
 });
@@ -33,4 +40,7 @@ test('説明文つきの返事でも組を打ち切らずに最後まで回し�
  assert.deepEqual(stages,['R01','R03','R01','R03','R01','R03']);assert.equal(result.status,'completed');assert.equal(result.coverage.seen_in_cycle,3);
  assert.deepEqual(result.items.map(i=>i.kw),['用途1 シート']);assert.equal(result.screened_out.length,2);
  for(const r of result.screened_out){const n=r.kw.match(/用途(\d)/)[1];assert.equal(r.use,'用途'+n);assert.equal(r.idea_reason,'用途が明確');assert.deepEqual(r.sources,[{asin:rows[n-1].asin,title:'用途'+n+' シート'}]);assert.equal(r.by,'R03');}
+ // 公開の入口 (validateDiscovery) は新しい形を通し、壊れた見送り記録は止める (Codex R2)
+ const {validateDiscovery}=require('./kw-discovery.cjs');validateDiscovery(result);
+ for(const bad of [{kw:'別のKW'},{decision:'propose'},{sources:[{asin:'bad',title:''}]},{codes:['<script>']},{use:''}])assert.throws(()=>validateDiscovery({...result,screened_out:[{...result.screened_out[0],...bad}]}),/INVALID_SCREENED_OUT/);
 });

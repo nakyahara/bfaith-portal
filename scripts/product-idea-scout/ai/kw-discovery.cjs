@@ -123,13 +123,37 @@ function validateDiscovery(r,now=Date.now()){
       check(e.monthly_units===null||(Number.isInteger(e.monthly_units)&&e.monthly_units>=0&&fresh(e.demand_observed_at,Date.parse(r.generated_at))),'INVALID_DEMAND');}
   }
   check(r.new_count===r.items.filter(i=>i.edition==='new').length&&r.submitted_count===r.items.length,'INVALID_NEW_COUNT');
+  // screened_out is stored and listed on the portal ("AIが見送った") since 2026-10-06. Older editions lack use/idea/sources.
+  check(r.screened_out===undefined||(Array.isArray(r.screened_out)&&r.screened_out.length<=3000),'INVALID_SCREENED_OUT');
+  for(const s of r.screened_out||[]){
+    check(s&&text(s.kw,80)&&s.candidate_id===keywordId(s.kw)&&['defer','exclude'].includes(s.decision)&&text(s.reason,1000),'INVALID_SCREENED_OUT');
+    check(Array.isArray(s.codes)&&s.codes.length<=12&&s.codes.every(c=>/^[a-z_]{1,40}$/.test(c)),'INVALID_SCREENED_OUT');
+    for(const key of ['use','idea','idea_reason'])check(s[key]===undefined||text(s[key]),'INVALID_SCREENED_OUT');
+    check(s.sources===undefined||(Array.isArray(s.sources)&&s.sources.length<=5&&s.sources.every(o=>ASIN.test(o?.asin)&&typeof o.title==='string'&&o.title.length<=120)),'INVALID_SCREENED_OUT');
+    check(s.source_asins===undefined||(Array.isArray(s.source_asins)&&s.source_asins.length<=10&&s.source_asins.every(a=>ASIN.test(a))),'INVALID_SCREENED_OUT');
+  }
   for(const k of ['source_rows','unique_products','examined_this_run','seen_in_cycle','remaining_in_cycle'])check(Number.isInteger(r.coverage?.[k])&&r.coverage[k]>=0,'INVALID_COVERAGE');
   check(r.coverage.seen_in_cycle+r.coverage.remaining_in_cycle===r.coverage.unique_products,'INVALID_COVERAGE');return r;
 }
+// Partial recovery reads only the "items" key of the root object that starts the reply (or its leading ```json
+// fence), the same trusted range as parseJson. A decoy {"items":[...]} later in the prose is never used (Codex R2).
+function rootItemsStart(text){
+  let i=/^\s*(?:```(?:json)?[ \t]*\r?\n)?\s*/.exec(text)[0].length;if(text[i]!=='{')return -1;
+  let quoted=false,escaped=false,depth=0,key=null,from=-1;
+  for(;i<text.length;i++){
+    const c=text[i];
+    if(quoted){if(escaped)escaped=false;else if(c==='\\')escaped=true;else if(c==='"'){quoted=false;if(depth===1)key=text.slice(from+1,i);}continue;}
+    if(c==='"'){quoted=true;from=i;key=null;continue;}
+    if(c===':'&&depth===1&&key==='items'){const m=/^\s*\[/.exec(text.slice(i+1));return m?i+1+m[0].length:-1;}
+    if(c==='{'||c==='[')depth++;else if(c==='}'||c===']'){if(--depth===0)return -1;}
+    if(!/\s/.test(c))key=null;
+  }
+  return -1;
+}
 function completeItems(response){
-  const match=/"items"\s*:\s*\[/.exec(response);if(!match)return [];
+  response=String(response);const begin=rootItemsStart(response);if(begin<0)return [];
   const items=[];let quoted=false,escaped=false,depth=0,start=-1;
-  for(let i=match.index+match[0].length;i<response.length;i++){
+  for(let i=begin;i<response.length;i++){
     const c=response[i];if(quoted){if(escaped)escaped=false;else if(c==='\\')escaped=true;else if(c==='"')quoted=false;continue;}
     if(c==='"'){quoted=true;continue;}if(c==='{'&&depth++===0)start=i;
     if(c==='}'&&--depth===0&&start>=0){try{items.push(JSON.parse(response.slice(start,i+1)));}catch{break;}start=-1;}
