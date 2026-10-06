@@ -2147,7 +2147,8 @@ await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧�
   try {
     got = await raw('/list.csv');
     assert.equal(got.status, 503); assert.match(got.buf.toString(), /時間がかかりすぎました/);
-    assert.equal((await call('GET', '/api/codes')).status, 503);
+    const c0 = await call('GET', '/api/codes');
+    assert.deepEqual([c0.status, c0.j.reason], [503, 'timeout'], '処理中の期限切れも reason = timeout (接続の待ちと同じ形)');
   } finally { __setExportLimits(null); }
   assert.equal((await raw('/list.csv')).status, 200);
   // つながらない = 503 (画面と同じ)
@@ -2273,6 +2274,42 @@ await ta('[19] 大きめの見本 (#1627 Codex R1 M3 / Low): CSV・全部コピ�
       assert.equal((await fetch(BASE + '/list.csv?codes=s001', { headers: { 'x-test-session': 'editor' } })).status, 200);
       assert.ok(seen.at(-1).connectionTimeoutMillis > 40e3, 'CSV = 残りの時間 (45 秒から)');
     } finally { __setPgClientFactory(pgFactory); }
+  }
+  // 実処理の SQL が遅い・statement_timeout で止まった (#1627 Codex R3 M1): 各 SQL の statement_timeout = min(20 秒, 残り)・57014 = 503 (reason timeout)
+  {
+    const sets = []; let mode = 'slow';
+    const LIST1 = /from core\.skus s\s+left join core\.products p/;
+    __setPgClientFactory(async (url, extra) => {
+      const c = await pgFactory(url, extra);
+      return { ...c, query: async (t, p) => {
+        if (/^set statement_timeout/.test(t)) sets.push(t);
+        if (LIST1.test(t) && /order by/.test(t)) {
+          if (mode === 'slow') await new Promise((ok) => setTimeout(ok, 400));   // ① の SQL が遅い (PGlite は止めないので JS で遅らせる)
+          if (mode === '57014') { const e = new Error('canceling statement due to statement timeout'); e.code = '57014'; throw e; }
+        }
+        return c.query(t, p);
+      } };
+    });
+    __setExportLimits({ timeMs: 300 });
+    try {
+      let got = await fetch(BASE + '/list.csv?kind=single', { headers: { 'x-test-session': 'editor' } });
+      assert.equal(got.status, 503); assert.match(await got.text(), /時間がかかりすぎました/);
+      const ms = sets.filter((t) => /'\d+ms'/.test(t)).map((t) => Number(/'(\d+)ms'/.exec(t)[1]));
+      assert.ok(ms.length && ms.every((x) => x > 0 && x <= 300), `statement_timeout = 残りの時間 (${sets.join(' / ')})`);
+      let c = await call('GET', '/api/codes?kind=single');
+      assert.deepEqual([c.status, c.j.reason], [503, 'timeout']);
+      // 57014 (SQL が statement_timeout で止まった) = 500 にせず 503
+      mode = '57014';
+      __setExportLimits({ timeMs: 45e3 });
+      got = await fetch(BASE + '/list.csv?kind=single', { headers: { 'x-test-session': 'editor' } });
+      assert.equal(got.status, 503, '57014 = 503'); assert.match(await got.text(), /時間がかかりすぎました/);
+      c = await call('GET', '/api/codes?kind=single');
+      assert.deepEqual([c.status, c.j.reason], [503, 'timeout']);
+      // 一覧の画面は今のまま (期限の db を使わない = statement_timeout は接続の 20s だけ)
+      mode = 'none'; sets.length = 0;
+      assert.equal((await call('GET', '/?kind=single')).status, 200);
+      assert.deepEqual(sets, ["set statement_timeout = '20s'"]);
+    } finally { __setExportLimits(null); __setPgClientFactory(pgFactory); await new Promise((ok) => setTimeout(ok, 50)); }
   }
   // 含むセットが 51 件 = 51 件と数える (表示は 50 件まで)
   const pg3 = (await call('GET', '/sku/s003')).text;

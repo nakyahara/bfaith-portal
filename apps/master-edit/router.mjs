@@ -333,7 +333,26 @@ async function listExtras(db, poOk, deadline = null) {
   checkDeadline(deadline);
   return { backorders, stock, fba, sales };
 }
-/** CSV・全部コピーの件数・時間の上限 (時間は段ごとに確かめる。1 つの文は接続の statement_timeout 20s)。試験は小さくする */
+/**
+ * 期限のある読み (CSV・全部コピー) の db (#1627 Codex R3 M1): SQL を投げる前に statement_timeout を min(20 秒, 残りの時間) にする
+ * (残りが無ければ投げずに ListTimeoutError)。SQL が statement_timeout で止まった (57014) も ListTimeoutError = 503 (500 にしない)。
+ * 接続はこのリクエストだけの物 (終わりに閉じる) = セッションの設定でよい。一覧・単品の画面は使わない (今のまま 20 秒)
+ */
+const STATEMENT_MAX_MS = 20e3;
+const isStatementTimeout = (e) => !!e && e.code === '57014';
+function deadlineDb(db, deadline) {
+  let last = null;
+  return {
+    async query(t, p) {
+      const left = Math.floor(deadline - Date.now());
+      if (left <= 0) throw new ListTimeoutError();
+      const ms = Math.min(STATEMENT_MAX_MS, left);
+      if (ms !== last) { await db.query(`set statement_timeout = '${ms}ms'`); last = ms; }
+      try { return await db.query(t, p); } catch (e) { if (isStatementTimeout(e)) throw new ListTimeoutError(); throw e; }
+    },
+  };
+}
+/** CSV・全部コピーの件数・時間の上限 (時間は段ごとに確かめる。1 つの文は min(20s, 残りの時間)・deadlineDb)。試験は小さくする */
 const EXPORT_LIMITS = { max: EXPORT_MAX, timeMs: 45e3 };
 export function __setExportLimits(o) { EXPORT_LIMITS.max = (o && o.max) ?? EXPORT_MAX; EXPORT_LIMITS.timeMs = (o && o.timeMs) ?? 45e3; }
 
@@ -388,11 +407,12 @@ router.get('/list.csv', (req, res) => {
   const { filters, searchExpired, poOk } = listQuery(req);
   if (searchExpired) return text(410, '条件の期限が切れました。一覧で検索し直してから CSV を出してください');
   let data; let extras;
+  const tdb = deadlineDb(db, deadline);
   try {
-    extras = await listExtras(db, poOk, deadline);
-    data = await listSkus(db, filters, { now: new Date(clock()), extras, mode: 'all', max: EXPORT_LIMITS.max, deadline });
+    extras = await listExtras(tdb, poOk, deadline);
+    data = await listSkus(tdb, filters, { now: new Date(clock()), extras, mode: 'all', max: EXPORT_LIMITS.max, deadline });
   } catch (e) {
-    if (e instanceof ListTimeoutError) return text(503, `時間がかかりすぎました (${EXPORT_LIMITS.timeMs / 1000} 秒)。絞ってからもう一度出してください`);
+    if (e instanceof ListTimeoutError || isStatementTimeout(e)) return text(503, `時間がかかりすぎました (${EXPORT_LIMITS.timeMs / 1000} 秒)。絞ってからもう一度出してください`);
     throw e;
   }
   if (data.tooMany) return text(413, `${tooManyWords(data, 'CSV ')}出してください`);
@@ -412,11 +432,13 @@ router.get('/api/codes', (req, res) => {
   if (searchExpired) return res.status(410).json({ ok: false, error: '条件の期限が切れました。検索し直してください' });
   // 在庫の範囲・注文残ありで絞っているときは、一覧と同じ参考の値で絞る (中身は読まない)
   let data;
+  const tdb = deadlineDb(db, deadline);
   try {
-    const extras = filters.stock_min || filters.stock_max || filters.po ? await listExtras(db, poOk, deadline) : {};
-    data = await listSkus(db, filters, { now: new Date(clock()), extras, mode: 'codes', max: EXPORT_LIMITS.max, deadline });
+    const extras = filters.stock_min || filters.stock_max || filters.po ? await listExtras(tdb, poOk, deadline) : {};
+    data = await listSkus(tdb, filters, { now: new Date(clock()), extras, mode: 'codes', max: EXPORT_LIMITS.max, deadline });
   } catch (e) {
-    if (e instanceof ListTimeoutError) return res.status(503).json({ ok: false, error: '時間がかかりすぎました。絞ってからもう一度' });
+    // 接続の待ちのタイムアウトと同じ形 (reason = timeout。#1627 Codex R3 Low)
+    if (e instanceof ListTimeoutError || isStatementTimeout(e)) return res.status(503).json({ ok: false, error: '時間がかかりすぎました。絞ってからもう一度', reason: 'timeout' });
     throw e;
   }
   if (data.tooMany) return res.status(413).json({ ok: false, error: tooManyWords(data, '全部コピー'), total: data.total, atLeast: !!data.atLeast, max: data.max });
