@@ -72,6 +72,7 @@ await ta('[P] NE の作成日の読み方 (形・無い日付・2000 年より�
   assert.equal(listOrderBy('reg_desc'), 's.registered_on desc nulls last, s.code_norm');
   assert.equal(listOrderBy('reg_desc', { hasColumn: false }), 's.code_norm');
   assert.equal(listOrderBy('x'), 's.code_norm');
+  assert.equal(listOrderBy('kind', { hasColumn: false }), "case s.sku_kind when 'single' then 0 when 'set' then 1 else 2 end, s.code_norm", '区分の順は登録日の列が無くても使える');
   assert.equal(R.normalizeFilters({ sort: 'reg_desc' }).sort, 'reg_desc');
   assert.equal(R.normalizeFilters({ sort: 'constructor' }).sort, '');
   assert.equal(R.normalizeFilters({}).sort, '');

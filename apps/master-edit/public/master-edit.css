@@ -630,6 +630,17 @@ details.adv[open] > summary { border-color: var(--line-strong); color: #fff; }
 /* 参考の列 (在庫 = ロジザード・注文残 = 発注アプリ): 灰色で小さめ */
 .tbl .ref { color: var(--muted); font-size: 13px; }
 .tbl th.ref { line-height: 1.25; }
+/* 一覧のコードのコピーのボタン (10/5): 行を開く透明の覆い (.rowlink::after) より上 = 押しても行は開かない */
+.tbl .codecell { display: inline-flex; align-items: center; gap: 4px; }
+.tbl .copybtn { position: relative; z-index: 1; width: 24px; height: 24px; display: inline-grid; place-items: center; padding: 0; border-radius: 6px; border: 1px solid transparent; background: transparent; color: var(--faint, var(--muted)); cursor: pointer; opacity: 0.55; }
+.tbl tr:hover .copybtn, .tbl .copybtn:focus-visible { opacity: 1; border-color: rgba(160, 190, 240, 0.25); color: var(--text2); }
+.tbl .copybtn:hover { background: rgba(255, 255, 255, 0.06); }
+.tbl .copybtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.tbl .copybtn .ic { width: 14px; height: 14px; }
+/* 区分の列 (10/5): 短い札 + セットは構成品の数を小さく */
+.tbl .b.kind { height: 21px; padding: 0 7px; font-size: 12px; }
+.tbl .kindn { font-size: 11.5px; margin-top: 2px; }
+.tbl-top .btn[disabled], .tbl-top .btn[aria-disabled="true"] { opacity: 0.45; cursor: not-allowed; }
 .tbl th .thsub { display: block; font-size: 11px; letter-spacing: 0.02em; color: var(--faint); font-weight: 400; }
 .tbl th.ref.stale .thsub { color: var(--warn); }
 .tbl th.ref.bad .thsub { color: var(--err); }

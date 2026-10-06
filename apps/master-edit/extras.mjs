@@ -9,7 +9,9 @@
  *   (inventory/logizard.mjs readMirrorLogizardStock = warehouse-mirror.db の mirror_logizard_stock・miniPC が毎時 09〜18 時に全置換) を読み、
  *   日次の締め (closeStockDay → sku_stock_daily) と同じく 商品ID ごとに全部の行 (ロケ・品質区分) の在庫数を足して、コードの正規化 (norm_code) で SKU に当てる。
  *   Company DB の在庫の view (mart.*) を読まないのは、画面のロール (master_edit) に mart の権限が無いため (足すと mart の関数も呼べる範囲が広がる)。
- *   いつの写しか = 世代 (captured_at)。2 時間より前 = 古い (夜間・休日は古いと出る)。
+ *   いつの写しか = 世代 (captured_at)。2 時間より前 = 古い。ただし写しが動くのは毎日 09〜18 時の毎時 00 分だけ (config/jobs-registry.mjs の
+ *   logizard-stock-hourly) = その日の最後の回 (18 時台の写し) は、次の朝の最初の回 (09:00) と 1 時間の余裕の 10:00 までは古いと言わない
+ *   (10/5 中原さん「夜に在庫の見出しが『古い 18:01』になる」)。18 時の回が抜けた (最後が 17 時台) 夜は 2 時間で古い。
  * どちらも読めないときは null (画面はその欄だけ「読めない」と出す)。
  */
 import { loadLedgerBackorders, loadBackorderLines } from '../purchase-orders/logic.js';
@@ -17,14 +19,33 @@ import { normProductCode } from '../purchase-orders/db.js';
 import { readMirrorLogizardStock } from '../company-db/inventory/logizard.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import path from 'node:path';
+import { ListTimeoutError } from './deadline.mjs';
 
 export const STOCK_STALE_MS = 2 * 3600e3;
+/** ロジザードの在庫の写しが動く時間 (JST・毎時 00 分): logizard-stock-hourly の「毎日 09:00-18:00」 */
+export const STOCK_FIRST_HOUR_JST = 9;
+export const STOCK_LAST_HOUR_JST = 18;
+
+/**
+ * 写しが古いか。captured = 写しの時刻 (ISO)。
+ *   ① 2 時間以内 = 古くない ② 最後の回 (18 時台) の写しなら、次の日の 10:00 (最初の回 09:00 + 1 時間) までは古くない ③ ほかは古い
+ */
+export function stockStale(captured, now = Date.now()) {
+  const t = Date.parse(captured);
+  if (!Number.isFinite(t)) return true;
+  if (now - t <= STOCK_STALE_MS) return false;
+  const j = new Date(t + 9 * 3600e3);
+  if (j.getUTCHours() < STOCK_LAST_HOUR_JST) return true;
+  const until = Date.UTC(j.getUTCFullYear(), j.getUTCMonth(), j.getUTCDate() + 1, STOCK_FIRST_HOUR_JST + 1) - 9 * 3600e3;
+  return now >= until;
+}
 
 /** 注文残の合計 (全商品)。{ ok: true, map: Map(商品の鍵 → 数) } / { ok: false, error } */
 export function readBackorders() {
   try {
     return { ok: true, map: loadLedgerBackorders() };
   } catch (e) {
+    if (e instanceof ListTimeoutError) throw e;   // 期限切れ (CSV・全部コピー) は「読めない」にしない = 503 へ (#1627 Codex R4)
     console.error(`[master-edit] 発注アプリの注文残を読めない: ${e && e.message}`);
     return { ok: false, error: '発注アプリの台帳を読めません' };
   }
@@ -44,6 +65,7 @@ export function readBackorderLines(code) {
     const lines = loadBackorderLines(code);
     return { ok: true, lines, total: lines.reduce((s, l) => s + Number(l.remaining || 0), 0) };
   } catch (e) {
+    if (e instanceof ListTimeoutError) throw e;   // 期限切れ (CSV・全部コピー) は「読めない」にしない = 503 へ (#1627 Codex R4)
     console.error(`[master-edit] 発注アプリの注文残の内訳を読めない: ${e && e.message}`);
     return { ok: false, error: '発注アプリの台帳を読めません' };
   }
@@ -74,6 +96,7 @@ export async function readWarehouseStock({ now = Date.now(), reader = readMirror
       out = { ok: true, asOf: got.capturedAt, map };
     }
   } catch (e) {
+    if (e instanceof ListTimeoutError) throw e;   // 期限切れ (CSV・全部コピー) は「読めない」にしない = 503 へ (#1627 Codex R4)
     console.error(`[master-edit] ロジザードの在庫を読めない: ${e && e.message}`);
     out = { ok: false, error: 'ロジザードの在庫を読めません' };
   }
@@ -82,8 +105,7 @@ export async function readWarehouseStock({ now = Date.now(), reader = readMirror
 }
 function withStale(out, now) {
   if (!out.ok) return out;
-  const t = Date.parse(out.asOf);
-  return { ...out, stale: !Number.isFinite(t) || now - t > STOCK_STALE_MS };
+  return { ...out, stale: stockStale(out.asOf, now) };
 }
 /** 試験だけ: 覚えた在庫を捨てる */
 export function __clearStockCache() { stockCache = null; }
