@@ -118,6 +118,12 @@ r = await post({ mix_up: false, records: [record('373343-20261006-0000001')] });
 check('応答', r.status, 201);
 check('保存されたモール', r.data && mallOf(r.data.id), 'rakuten');
 
+console.log('画面の検索は、登録で保存されるのと同じモールを返す');
+for (const [id, expected] of [['503-0000000-0000001', 'amazon'], ['yauc-1', 'other']]) {
+  const lr = await fetch(BASE + '/orders/lookup?order_id=' + id, { signal: AbortSignal.timeout(3000) });
+  check(id, (await lr.json()).mall, expected);
+}
+
 console.log('DB の選択肢に無い NE の店舗 (ヤフオク)');
 r = await post({ mix_up: false, records: [record('yauc-1')] });
 check('応答', r.status, 201);

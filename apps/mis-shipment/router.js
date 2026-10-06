@@ -194,6 +194,8 @@ router.get('/api/orders/lookup', asyncRoute(async (req, res) => {
   if (orderId.length > 100) return res.status(400).json({ error: 'order_id_too_long' });
   try {
     const result = await lookupOrderFromMinipc(orderId);
+    // 確認画面に出すモールを、登録で実際に保存される値にそろえる (ヤフオクなら「その他」)
+    if (result && result.found) return res.json({ ...result, mall: normalizeLookupMall(result.mall) });
     return res.json(result);
   } catch (e) {
     if (e.code === 'token_unset') return res.status(503).json({ error: 'lookup_token_unset' });
