@@ -22,9 +22,16 @@
  *   - 知らせ: ⚠️ 45 分を超えた最初の見回りで 1 回・その後 60 分ごと・送れなければ次の見回りで送り直す /
  *     ✅ 鳴った後に外れた・❌ 8 時間の打ち切り = 終わりの知らせは数回 (既定 5 回・30 秒おき) 送り直し、届かなければ exit 3 /
  *     ❌ DB を 3 回続けて読めない = 「見張れていない」を 1 回 (届くまで次の読めない見回りで送り直す)
- *   - 終わり方 (exit): 0 = lock が外れた・migrate が終わった (親の done) 後に lock が無い / 1 = 8 時間の打ち切り・見張り自身の失敗 /
- *     2 = 引数・設定の誤り / 3 = 終わりの知らせが届かなかった / 4 = 起動の知らせが届かなかった (= migrate を始めない)
+ *   - 終わり方 (exit): 0 = lock が外れた・migrate が終わった (親の done) 後に lock が無い・親が死んで lock が無い / 1 = 8 時間の打ち切り・見張り自身の失敗 /
+ *     2 = 引数・設定の誤り / 3 = 終わりの知らせ (持ち主が替わった時の「外れた」も) が届かなかった / 4 = 起動の知らせが届かなかった (= migrate を始めない) /
+ *     5 = ready から 10 分 migrate の lock が現れない
  *   - 書かない: 接続は default_transaction_read_only・statement_timeout 10s。lock を取らない・backend を止めない (止めるのは人)
+ *   - 🆕 Codex R2 High: heartbeat = 見回りが通るたびに自分の接続の application_name を `company-db-migrate-lock-watch:<nonce>:<server の epoch 秒>` に変える
+ *     (nonce = 親が run ごとに作り env CDB_MIGRATE_WATCH_NONCE で渡す)。runner は本物の PG の CIC の各文の前に、同じ nonce で 120 秒以内の heartbeat を確かめる
+ *   - 🆕 Codex R2 Medium 2 (親が死んだとき): IPC が切れたら、lock が無ければ知らせて終わる (exit 0)・lock があれば外れるまで見張る (45 分の知らせも出す)。
+ *     ready から 10 分 lock が一度も現れない (migrate が始まらない) = 知らせて終わる (exit 5)。lock の無い状態にも 8 時間の上限。
+ *     見張りは detached で起動される (親が死んでも残る・Windows の job から外れる)。親と一緒に migrate は終わる = 接続が切れて lock が外れる
+ *     (CIC は invalid が残りうる = 次に migrate-watched で流すと回収)。親が死んだ後に見張りも死ぬと知らせる手が無い = 朝の見張り W15 が lock の残りを拾う
  *
  * 引数 (親 = migrate-watched.mjs が付ける): --supervised [--since <epoch ms>]
  *   --dry-run = GChat に送らず、送る文を画面に出すだけ (試しの用)。--interval-sec・--alert-min は --dry-run の時だけ変えられる (本番は 60 秒・45 分)
@@ -32,14 +39,14 @@
  */
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { openPgClient, MIGRATE_LOCK_NAME, MIGRATE_LOCK_ALERT_MINUTES, MIGRATE_LOCK_WATCH_APPLICATION_NAME } from './migrate.mjs';
+import { openPgClient, MIGRATE_LOCK_NAME, MIGRATE_LOCK_ALERT_MINUTES, MIGRATE_LOCK_WATCH_APPLICATION_NAME, LOCK_WATCH_NONCE_ENV, LOCK_WATCH_NONCE_RE } from './migrate.mjs';
 import { jobsHook, sendJobsChat } from '../logizard-import/notify-jobs.mjs';
 
 export const WATCH_APPLICATION_NAME = MIGRATE_LOCK_WATCH_APPLICATION_NAME;
-export const DEFAULTS = Object.freeze({ intervalSec: 60, alertMin: MIGRATE_LOCK_ALERT_MINUTES, repeatMin: 60, waitStartMin: 30, maxHours: 8, readFailAlertCount: 3, terminalRetries: 5, terminalRetrySec: 30 });
+export const DEFAULTS = Object.freeze({ intervalSec: 60, alertMin: MIGRATE_LOCK_ALERT_MINUTES, repeatMin: 60, waitStartMin: 30, noStartMin: 10, maxHours: 8, readFailAlertCount: 3, terminalRetries: 5, terminalRetrySec: 30 });
 /** 本番 (dry-run でない) の上限 = 見回りは 60 秒より間をあけない・知らせは 45 分より遅くしない (Codex R1 Low) */
 export const PROD_LIMITS = Object.freeze({ maxIntervalSec: 60, maxAlertMin: MIGRATE_LOCK_ALERT_MINUTES });
-export const EXIT = Object.freeze({ OK: 0, FAIL: 1, ARGS: 2, NOTIFY_END_FAILED: 3, NOTIFY_START_FAILED: 4 });
+export const EXIT = Object.freeze({ OK: 0, FAIL: 1, ARGS: 2, NOTIFY_END_FAILED: 3, NOTIFY_START_FAILED: 4, NO_START: 5 });
 const MIN = 60000;
 
 export function parseArgs(argv) {
@@ -102,6 +109,15 @@ export async function readLockHolder(client) {
   }
 }
 
+/**
+ * 🆕 Codex R2 High: heartbeat = 自分の接続の application_name を `company-db-migrate-lock-watch:<nonce>:<server の epoch 秒>` に (取引の外・読むだけの session でも SET はできる)。
+ * runner (migrate.mjs の assertLockWatchFresh) が同じ形を読む。見回りが通った時だけ呼ぶ (読めない・止まった見張りは古くなる)
+ */
+export async function writeLockWatchHeartbeat(client, nonce) {
+  if (!LOCK_WATCH_NONCE_RE.test(String(nonce || ''))) throw new Error('heartbeat の nonce の形が違う');
+  await client.query("select pg_catalog.set_config('application_name', $1::pg_catalog.text || ':' || $2::pg_catalog.text || ':' || pg_catalog.floor(extract(epoch from pg_catalog.clock_timestamp()))::pg_catalog.int8::pg_catalog.text, false)", [MIGRATE_LOCK_WATCH_APPLICATION_NAME, nonce]);
+}
+
 const minText = (ms) => `${Math.floor(ms / MIN)} 分`;
 export const holderLine = (h) => `pid ${h.pid}${h.applicationName ? ` (${h.applicationName}${h.usename ? `・${h.usename}` : ''})` : ''}`;
 const COUNT_TEXT = {
@@ -146,17 +162,19 @@ export async function sendWithRetry(send, text, { retries, retrySec, sleep, log 
  *           readFailAlertCount?, terminalRetries?, terminalRetrySec? }} o
  *   priorPoll = 起動の時の見回り (lock が無いのを見た時刻 = 数え始めの上限)。sinceMs = 起動し直した見張りの「migrate を始めた時刻」
  *   isParentDone = 親 (migrate-watched) が「migrate が終わった」と言った。その後 lock が無ければ終わる
- *   supervised = 親の下で動く (起動の待ち (waitStartMin) で終わらない = 終わりは親の done か lock が外れたか)
- * @returns {Promise<{ code: number, outcome: 'released'|'never_seen'|'max_hours'|'parent_done', sent: string[], notifyFailed: boolean }>}
+ *   supervised = 親の下で動く (起動の待ち (waitStartMin) の代わりに noStartMin = ready から lock が一度も現れなければ exit 5)
+ *   isParentGone = 親との IPC が切れた (親が死んだ)。lock が無ければ知らせて終わる・あれば外れるまで見張る
+ * @returns {Promise<{ code: number, outcome: 'released'|'never_seen'|'max_hours'|'parent_done'|'parent_gone'|'no_start', sent: string[], notifyFailed: boolean }>}
  */
 export async function runLockWatch(o) {
   const now = o.now || (() => Date.now());
   const sleep = o.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const log = o.log || (() => {});
   const isParentDone = o.isParentDone || (() => false);
+  const isParentGone = o.isParentGone || (() => false);
   const c = { ...DEFAULTS, ...Object.fromEntries(Object.entries(o).filter(([k, v]) => k in DEFAULTS && v != null)) };
   const dbName = o.dbName || '(不明)';
-  const alertMs = c.alertMin * MIN, repeatMs = c.repeatMin * MIN, waitMs = c.waitStartMin * MIN, maxMs = c.maxHours * 60 * MIN, intervalMs = c.intervalSec * 1000;
+  const alertMs = c.alertMin * MIN, repeatMs = c.repeatMin * MIN, waitMs = c.waitStartMin * MIN, noStartMs = c.noStartMin * MIN, maxMs = c.maxHours * 60 * MIN, intervalMs = c.intervalSec * 1000;
   const sent = [];
   const send = async (text) => { const ok = (await o.send(text).catch(() => false)) === true; if (ok) sent.push(text); else log(`❌ GChat に送れなかった (次の見回りで送り直す): ${text.split('\n')[0]}`); return ok; };
   // 🆕 Codex R1 Medium 1: 終わりの知らせは届くまで数回送り、届かなければ exit 3 (黙って終わらない)
@@ -165,8 +183,9 @@ export async function runLockWatch(o) {
     if (ok) sent.push(text);
     return ok;
   };
+  let earlierNotifyFailed = false;   // 🆕 Codex R2 Medium 1: 持ち主が替わった時の A の「外れた」が届かなかった = 最後に exit 3
   const finish = async (outcome, code, terminalText) => {
-    let notifyFailed = false;
+    let notifyFailed = earlierNotifyFailed;
     if (terminalText && !(await sendTerminal(terminalText))) { notifyFailed = true; log(`❌ 終わりの知らせを ${c.terminalRetries} 回送っても届かなかった = exit ${EXIT.NOTIFY_END_FAILED}`); }
     return { code: notifyFailed ? EXIT.NOTIFY_END_FAILED : code, outcome, sent, notifyFailed };
   };
@@ -177,6 +196,7 @@ export async function runLockWatch(o) {
   let cur = null;             // 今見ている持ち主 { pid, firstMs, countFrom, alertedAtMs, lastH }
   let everSeen = false;
   let readFails = 0, readFailAlerted = false;
+  let parentGoneNoticed = false;
 
   for (;;) {
     const t = now();
@@ -199,7 +219,12 @@ export async function runLockWatch(o) {
         const alerted = cur.alertedAtMs != null;
         cur = null;
         if (!h) return finish('released', EXIT.OK, alerted ? text : null);
-        if (alerted && !(await sendTerminal(text))) log('❌ 「外れた」が届かなかった (持ち主が替わった = 見張りは続ける)');
+        if (alerted && !(await sendTerminal(text))) { earlierNotifyFailed = true; log(`❌ 「外れた」が届かなかった (持ち主が替わった = 見張りは続け、最後に exit ${EXIT.NOTIFY_END_FAILED})`); }
+      }
+      if (h && isParentGone() && !parentGoneNoticed) {
+        parentGoneNoticed = true;
+        log(`親 (migrate-watched) が終わった・lock は ${holderLine(h)} が持っている = 外れるまで見張る`);
+        await send(`⚠️ Company DB の migrate の見張りの親 (migrate-watched) が途中で終わった・DB ${dbName}・migrate の lock は ${holderLine(h)} が持っている = 外れるまで見張る (${c.alertMin} 分の知らせも出す)\n・migrate の窓を人が見る`);
       }
       if (h) {
         everSeen = true;
@@ -226,6 +251,12 @@ export async function runLockWatch(o) {
       } else if (isParentDone()) {
         log('migrate が終わり、lock も無い = 見張りを終える');
         return finish(everSeen ? 'released' : 'parent_done', EXIT.OK, null);
+      } else if (isParentGone()) {
+        log('親 (migrate-watched) が終わり、lock も無い = 知らせて見張りを終える');
+        return finish('parent_gone', EXIT.OK, `⚠️ Company DB の migrate の見張りの親 (migrate-watched) が途中で終わった・DB ${dbName}・migrate の lock は今は無い = 見張りを終える\n・migrate の窓の log と \`migrate.mjs --list\` で、記録されていない file が無いかを確かめる (README の回収の手順)`);
+      } else if (o.supervised && !everSeen && t - startMs >= noStartMs) {
+        log(`ready から ${minText(t - startMs)}、migrate の lock が一度も現れない = 知らせて見張りを終える (exit ${EXIT.NO_START})`);
+        return finish('no_start', EXIT.NO_START, `⚠️ Company DB の migrate が始まらない: 見張りの ready から ${minText(t - startMs)} lock が現れない・DB ${dbName} = 見張りを終える (この後に始まる concurrent-index は heartbeat が無いので止まる)\n・migrate の窓を人が見る`);
       } else if (!o.supervised && !everSeen && t - startMs >= waitMs) {
         log(`起動から ${minText(t - startMs)}、lock は一度も現れなかった = 見張りを終える`);
         return finish('never_seen', EXIT.OK, null);
@@ -233,15 +264,16 @@ export async function runLockWatch(o) {
       prevPid = h ? h.pid : null;
       prevPollMs = t;
     }
-    if (t - startMs >= maxMs && (cur || !readOk)) {
-      return finish('max_hours', EXIT.FAIL, `❌ Company DB の migrate の lock の見張りを打ち切る (${c.maxHours} 時間)${cur ? `: lock はまだ ${holderLine(cur.lastH)} が持っている (${minText(t - cur.firstMs)})` : ': DB を読めないまま'}・DB ${dbName}\n・人が pg_stat_activity と migrate の窓を見る`);
+    // 🆕 Codex R2 Medium 2: lock の無い健康な状態にも上限 (孤児の見張りの接続を残さない)
+    if (t - startMs >= maxMs) {
+      return finish('max_hours', EXIT.FAIL, `❌ Company DB の migrate の lock の見張りを打ち切る (${c.maxHours} 時間)${cur ? `: lock はまだ ${holderLine(cur.lastH)} が持っている (${minText(t - cur.firstMs)})` : !readOk ? ': DB を読めないまま' : ': lock は無い (migrate が終わったか始まっていない)'}・DB ${dbName}\n・人が pg_stat_activity と migrate の窓を見る`);
     }
     await sleep(intervalMs);
   }
 }
 
-/** 本物の接続で読む (見回りごとに読めなければ接続を作り直す)。接続の application_name = migrate.mjs の CLI が CIC の各文の前に探す名前 */
-export function pgHolderReader(url) {
+/** 本物の接続で読む (見回りごとに読めなければ接続を作り直す)。🆕 nonce があれば、読めた見回りのたびに heartbeat を書く (runner が CIC の各文の前に探す) */
+export function pgHolderReader(url, { nonce = null } = {}) {
   let client = null;
   const open = async () => {
     const c = await openPgClient(url, { application_name: WATCH_APPLICATION_NAME, connectionTimeoutMillis: 15000 });
@@ -253,7 +285,11 @@ export function pgHolderReader(url) {
   return {
     async read() {
       if (!client) client = await open();
-      try { return await readLockHolder(client); } catch (e) {
+      try {
+        const h = await readLockHolder(client);
+        if (nonce) await writeLockWatchHeartbeat(client, nonce);
+        return h;
+      } catch (e) {
         const dead = client; client = null;
         try { await dead.end(); } catch { /* */ }
         throw e;
@@ -270,7 +306,7 @@ export function pgHolderReader(url) {
 /**
  * 親の下で動く見張り (CLI の --supervised の本体・試験は読み・送り・IPC を差し替える)。
  * ① DB 名と最初の見回り ② 起動の知らせ (届くまで数回・届かなければ exit 4 = ready を返さない = 親は migrate を始めない) ③ ready ④ 見張り
- * @param {{ reader: { read, dbName }, send, ipcSend: (m) => void, isParentDone, sinceMs?, log?, now?, sleep?, watchOpts? }} o
+ * @param {{ reader: { read, dbName }, send, ipcSend: (m) => void, isParentDone, isParentGone?, sinceMs?, log?, now?, sleep?, watchOpts? }} o
  */
 export async function runSupervised(o) {
   const now = o.now || (() => Date.now());
@@ -291,12 +327,14 @@ export async function runSupervised(o) {
   if (!ok) { log(`❌ 起動の知らせが GChat に届かない (GCHAT_WEBHOOK_JOBS) = 見張りにならない = exit ${EXIT.NOTIFY_START_FAILED}`); return { code: EXIT.NOTIFY_START_FAILED, outcome: 'start_notify_failed', sent: [] }; }
   o.ipcSend({ type: 'ready', dbName });
   log(`見張りを始める: DB ${dbName}・lock ${MIGRATE_LOCK_NAME}・${w.intervalSec} 秒ごと・${w.alertMin} 分で知らせる`);
-  return runLockWatch({ ...w, readHolder: () => o.reader.read(), send: o.send, log, now, sleep, dbName, isParentDone: o.isParentDone, supervised: true, priorPoll: { atMs, pid: first ? first.pid : null }, sinceMs: o.sinceMs ?? null });
+  return runLockWatch({ ...w, readHolder: () => o.reader.read(), send: o.send, log, now, sleep, dbName, isParentDone: o.isParentDone, isParentGone: o.isParentGone, supervised: true, priorPoll: { atMs, pid: first ? first.pid : null }, sinceMs: o.sinceMs ?? null });
 }
 
 const fold = (x) => (process.platform === 'win32' ? x.toLowerCase() : x);
 const isMain = (() => { try { return !!process.argv[1] && fold(fs.realpathSync.native(process.argv[1])) === fold(fs.realpathSync.native(fileURLToPath(import.meta.url))); } catch { return false; } })();
 if (isMain) {
+  // 🆕 Codex R2 Medium 2: 親が死んだ後は画面の pipe が閉じていることがある = 書けなくても落ちない (知らせは GChat)
+  process.stdout.on('error', () => {}); process.stderr.on('error', () => {});
   const say = (m) => console.log(`[migrate-lock-watch] ${new Date(Date.now() + 9 * 3600000).toISOString().slice(11, 19)} ${m}`);
   let code = EXIT.FAIL, reader = null;
   try {
@@ -308,23 +346,27 @@ if (isMain) {
       if (!a.dryRun) { console.error('[migrate-lock-watch] 単独では起動しない = node scripts/company-db/migrate-watched.mjs から (見張りを起動 → GChat に送れたのを確かめてから migrate)'); code = EXIT.ARGS; throw null; }
     }
     const url = (process.env.COMPANY_DB_WATCH_URL || '').trim();
+    // 🆕 Codex R2 High: 親の下では run の nonce が要る (heartbeat = runner が CIC の各文の前に探す)。単独の --dry-run では無くてよい (heartbeat を出さない)
+    const nonce = (process.env[LOCK_WATCH_NONCE_ENV] || '').trim() || null;
+    if (a.supervised && !LOCK_WATCH_NONCE_RE.test(nonce || '')) { console.error(`[migrate-lock-watch] run の nonce (env ${LOCK_WATCH_NONCE_ENV}) が無い・形が違う = migrate-watched.mjs から起動する`); code = EXIT.ARGS; throw null; }
+    if (nonce && !LOCK_WATCH_NONCE_RE.test(nonce)) { console.error(`[migrate-lock-watch] env ${LOCK_WATCH_NONCE_ENV} の形が違う`); code = EXIT.ARGS; throw null; }
     if (!url) { console.error('[migrate-lock-watch] 接続先が無い (env COMPANY_DB_WATCH_URL)'); code = EXIT.ARGS; throw null; }
     if (!a.dryRun && !jobsHook(process.env)) { console.error('[migrate-lock-watch] GChat の送り先 (env GCHAT_WEBHOOK_JOBS) が無い・壊れている = 見張りにならないので起動しない'); code = EXIT.ARGS; throw null; }
     const send = a.dryRun ? async (text) => { console.log(`[migrate-lock-watch] (dry-run・送らない)\n${text}`); return true; } : (text) => sendJobsChat(text);
-    reader = pgHolderReader(url);
+    reader = pgHolderReader(url, { nonce });
     // 親の「migrate が終わった」(done) = 次の見回りを待たずに起こす
-    let parentDone = false;
+    let parentDone = false, parentGone = false;
     const wakers = new Set();
     const sleep = (ms) => new Promise((r) => { const tm = setTimeout(() => { wakers.delete(wake); r(); }, ms); const wake = () => { clearTimeout(tm); wakers.delete(wake); r(); }; wakers.add(wake); });
     const ipc = typeof process.send === 'function' && a.supervised;
     if (ipc) {
       process.on('message', (m) => { if (m && m.type === 'done') { parentDone = true; for (const w of [...wakers]) w(); } });
-      process.on('disconnect', () => say('親 (migrate-watched) との接続が切れた = lock が外れるまで見張りを続ける'));
+      process.on('disconnect', () => { parentGone = true; say('親 (migrate-watched) との接続が切れた = lock が無ければ知らせて終わる・あれば外れるまで見張る'); for (const w of [...wakers]) w(); });
     }
     const watchOpts = { intervalSec: a.intervalSec, alertMin: a.alertMin };
     let r;
     if (ipc) {
-      r = await runSupervised({ reader, send, ipcSend: (m) => { try { process.send(m); } catch { /* 親が先に終わった */ } }, isParentDone: () => parentDone, sinceMs: a.since, log: say, sleep, watchOpts });
+      r = await runSupervised({ reader, send, ipcSend: (m) => { try { process.send(m); } catch { /* 親が先に終わった */ } }, isParentDone: () => parentDone, isParentGone: () => parentGone, sinceMs: a.since, log: say, sleep, watchOpts });
     } else {
       const dbName = await reader.dbName();
       say(`(dry-run・単独) 見張りを始める: DB ${dbName}`);

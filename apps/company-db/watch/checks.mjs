@@ -1052,7 +1052,7 @@ export async function evalW15(ctx, check) {
   for (const scopeKey of config.W15_SCOPES || []) {
     const r = base(check, scopeKey, { threshold: { lock: MIGRATE_LOCK_NAME, held: false } });
     const h = holderOfRows(await rowsOf(db, LOCK_HOLDER_SQL, [MIGRATE_LOCK_NAME]));
-    const watchers = Number((await oneOf(db, `select count(*)::int as n from pg_catalog.pg_stat_activity where application_name = $1 and datname = pg_catalog.current_database()`, [MIGRATE_LOCK_WATCH_APPLICATION_NAME])).n);
+    const watchers = Number((await oneOf(db, `select count(*)::int as n from pg_catalog.pg_stat_activity where pg_catalog.left(application_name, pg_catalog.length($1::pg_catalog.text)) = $1::pg_catalog.text and datname = pg_catalog.current_database()`, [MIGRATE_LOCK_WATCH_APPLICATION_NAME])).n);   // heartbeat の後ろ (:<nonce>:<epoch>) も含めて数える
     const minutes = h && h.heldMs != null ? Math.floor(h.heldMs / 60000) : null;
     r.observed = { held: !!h, pid: h ? h.pid : null, application_name: h ? h.applicationName : null, usename: h ? h.usename : null, minutes_since_connect: minutes, phase: h ? h.phase : null, relation: h ? h.relation : null, lock_watch_sessions: watchers };
     r.sampleSize = 1;

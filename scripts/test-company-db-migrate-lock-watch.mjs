@@ -15,8 +15,18 @@
  *   O1 1 つのコマンドの順番 (差し替え): ready の前に migrate を始めない・ready が来ない / held / 時間切れ = migrate を始めない・見張りが死ねば知らせて起動し直す (since = migrate を始めた時刻)・
  *      起動し直せなければ exit 3・migrate の失敗は exit 1・見張りの終わりの知らせが届かなければ exit 3
  *   R1〜R4 本物の PG 18.4 (権限の無い役割から別の役割の lock の pid は見え backend_start は見えない・別の DB は数えない・runner の lock の間に鳴る・読み手は lock を取らない)
- *   G1 runner の関門: CLI の opts (cliRunOptions) では、見張りの接続 (application_name) が同じ DB に無ければ concurrent-index を流さない (LOCK_WATCH_REQUIRED・何も作らない・記録しない・lock が残らない)・
- *      別の DB の見張りは数えない・見張りの接続があれば流れる・CLI の opts を渡さない直の呼び出しは今までどおり
+ *   🆕 Codex R2:
+ *   T2 持ち主が替わった時の A の「外れた」が届かなければ、B が外れた後に exit 3 (届けば 0)
+ *   P1〜P3 親が死んだ (IPC が切れた): lock が無ければ知らせて終わる / lock があれば知らせて外れるまで見張る (45 分の知らせも) /
+ *      ready から 10 分 lock が現れない = 知らせて exit 5 / lock の無い状態にも 8 時間の上限
+ *   O5 見張りが exit 5 で終わった = 起動し直さない・exit 3 / O6 見張り・migrate を起動できない (例外) = 文書の exit code / O7 run の nonce を見張り (起動し直しも) と migrate に同じに渡す
+ *   R5 heartbeat の契約 (本物の PG): 見張りの読み手が見回りのたびに application_name に nonce と server の epoch を書く・runner は同じ DB・同じ nonce・120 秒以内だけ通す
+ *      (nonce が無い・違う run・idle の接続 (heartbeat の無い名前)・古い heartbeat (止まった見張り)・未来の epoch・別の DB = 通らない)
+ *   G1 runner の関門は本物の PG の CIC の道で既定で必須 (opts を渡さない migrateWithLock の直の呼び出しでも・supportsConcurrentIndex を false にした本物の PG の adapter でも
+ *      heartbeat が無ければ LOCK_WATCH_REQUIRED・何も作らない・記録しない・lock が残らない)・新しい heartbeat があれば流れる・見張りが止まって古くなれば次の file で止まる
+ *   G2 外す道は PGlite の adapter (lockWatchExempt) だけ = pgAdapter は持たない・runner に外す opts は無い・heartbeat を書く関数を試験の外で使うのは見張りだけ (grep の縛り)
+ *   E3 本物の子のプロセス: 親を kill → 見張りは IPC の切れを見て、lock が無ければ知らせて exit 0 / lock があれば外れるまで見張って ✅
+ *   L1 fork / spawn を起動できない (error event) → 未処理の誤りで落ちずに exit 1 に変わる
  *   E1 本物の子のプロセス: migrate-watched の本体 + 見張りの CLI (--supervised --dry-run) + migrate.mjs の CLI = 起動の知らせ → migrate → ⚠️ → ✅ → exit 0
  *   E2 本物の子のプロセス: 起動の知らせが届かない (届かない https) → migrate を始めない (記録の表も無い)
  *   C1 CLI: 見張りは単独で起動しない・--url / --alert-min (dry-run でない) は exit 2 / migrate-watched は送り先・接続先が無い・--url・--dry-run で exit 2
@@ -31,9 +41,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { parseArgs, runLockWatch, runSupervised, readLockHolder, pgHolderReader, alertText, DEFAULTS, EXIT, WATCH_APPLICATION_NAME } from './company-db/migrate-lock-watch.mjs';
-import { runWatchedMigrate, forkWatcher, spawnMigrate, parseArgs as parseWatchedArgs } from './company-db/migrate-watched.mjs';
-import { openPgClient, pgAdapter, withMigrateLock, migrateWithLock, describeLockHolder, buildIndexExpect, readIndexAttrs, cliRunOptions, assertLockWatchPresent, MIGRATE_LOCK_NAME, MIGRATE_LOCK_ALERT_MINUTES, MIGRATE_LOCK_WATCH_APPLICATION_NAME } from './company-db/migrate.mjs';
+import { parseArgs, runLockWatch, runSupervised, readLockHolder, pgHolderReader, alertText, writeLockWatchHeartbeat, DEFAULTS, EXIT, WATCH_APPLICATION_NAME } from './company-db/migrate-lock-watch.mjs';
+import { runWatchedMigrate, forkWatcher, spawnMigrate, newRunNonce, parseArgs as parseWatchedArgs } from './company-db/migrate-watched.mjs';
+import { openPgClient, pgAdapter, pgliteAdapter, withMigrateLock, migrateWithLock, describeLockHolder, buildIndexExpect, readIndexAttrs, assertLockWatchFresh, MIGRATE_LOCK_NAME, MIGRATE_LOCK_ALERT_MINUTES, MIGRATE_LOCK_WATCH_APPLICATION_NAME, LOCK_WATCH_NONCE_ENV, LOCK_WATCH_HEARTBEAT_MAX_AGE_SEC } from './company-db/migrate.mjs';
 import { sendJobsChat } from './logizard-import/notify-jobs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -180,6 +190,42 @@ await t('U10 知らせの文に接続文字列・password を含まない', asyn
   assert.match(txt, /46 分持っている/);
 });
 
+await t('T2 (Codex R2 Medium 1) 持ち主が替わった時 (A の解放と B の取得が見回りの間) に A の「外れた」が 5 回とも届かない → B が外れた後に exit 3 / 届けば exit 0', async () => {
+  const tl = (c) => (c < 50 * MIN ? H(811) : c < 60 * MIN ? H(812) : null);
+  let r = await sim(tl, {}, (i, x) => !(x.startsWith('✅') && x.includes('pid 811')));
+  assert.equal(r.sends.filter((s) => s.text.startsWith('✅') && s.text.includes('pid 811')).length, 5);
+  assert.ok(r.sends.every((s) => !s.text.includes('pid 812') || !s.text.startsWith('✅')), 'B は鳴っていない = B の「外れた」は無い');
+  assert.deepEqual([r.result.code, r.result.outcome, r.result.notifyFailed], [EXIT.NOTIFY_END_FAILED, 'released', true]);
+  r = await sim(tl);
+  assert.deepEqual([r.result.code, r.result.notifyFailed], [0, false]);
+});
+await t('P1 (Codex R2 Medium 2) 親が死んだ (IPC が切れた)・lock が無い → 知らせて終わる (exit 0) / 知らせが届かなければ exit 3', async () => {
+  let gone = false;
+  let r = await sim((c) => { if (c >= 3 * MIN) gone = true; return null; }, { supervised: true, isParentGone: () => gone });
+  assert.deepEqual([r.result.outcome, r.result.code], ['parent_gone', 0]);
+  assert.deepEqual(r.sends.map((s) => s.at / MIN), [3]);
+  assert.match(r.sends[0].text, /親 \(migrate-watched\) が途中で終わった.*lock は今は無い = 見張りを終える/);
+  gone = false;
+  r = await sim((c) => { if (c >= 3 * MIN) gone = true; return null; }, { supervised: true, isParentGone: () => gone }, () => false);
+  assert.deepEqual([r.result.outcome, r.result.code], ['parent_gone', EXIT.NOTIFY_END_FAILED]);
+});
+await t('P2 (Codex R2 Medium 2) 親が死んだ・lock がある → 1 回知らせて外れるまで見張る (45 分の ⚠️ も出す)・外れたら ✅ で exit 0', async () => {
+  let gone = false;
+  const r = await sim((c) => { if (c >= 5 * MIN) gone = true; return c >= 1 * MIN && c < 70 * MIN ? H(821) : null; }, { supervised: true, isParentGone: () => gone, priorPoll: { atMs: 0, pid: null } });
+  assert.deepEqual(r.sends.map((s) => [s.at / MIN, s.text.startsWith('✅') ? '✅' : s.text.startsWith('⚠️') ? '⚠️' : '?']), [[5, '⚠️'], [45, '⚠️'], [70, '✅']]);
+  assert.match(r.sends[0].text, /親 \(migrate-watched\) が途中で終わった.*pid 821 .*が持っている = 外れるまで見張る/);
+  assert.match(r.sends[1].text, /45 分持っている/);
+  assert.deepEqual([r.result.outcome, r.result.code], ['released', 0]);
+});
+await t('P3 (Codex R2 Medium 2) ready から 10 分 lock が一度も現れない (migrate が始まらない) → 知らせて exit 5 / lock の無い状態にも 8 時間の上限 (exit 1)', async () => {
+  let r = await sim(() => null, { supervised: true });
+  assert.deepEqual([r.result.outcome, r.result.code, r.sends.map((s) => s.at / MIN)], ['no_start', EXIT.NO_START, [10]]);
+  assert.match(r.sends[0].text, /migrate が始まらない: 見張りの ready から 10 分 lock が現れない/);
+  r = await sim(() => null, { supervised: true, noStartMin: 600, maxHours: 2 });
+  assert.deepEqual([r.result.outcome, r.result.code], ['max_hours', EXIT.FAIL]);
+  assert.match(r.sends.at(-1).text, /打ち切る \(2 時間\): lock は無い/);
+});
+
 console.log('— 起動の知らせと親の下の見張り —');
 const HOOK_ENV = { GCHAT_WEBHOOK_JOBS: 'https://chat.googleapis.com/v1/spaces/TEST/messages?key=k&token=t' };
 await t('S1 起動の知らせが届かない (有効な https の URL・応答 404 = sendJobsChat が false) → ready を返さない・exit 4 / 届けば ready → 親の done で終わる', async () => {
@@ -210,8 +256,11 @@ function fakes(plans, migrate = { code: 0 }) {
   let wi = 0;
   const deferred = () => { let r; const p = new Promise((x) => { r = x; }); return { p, r }; };
   const mig = deferred();
-  const startWatcher = ({ since }) => {
+  const nonces = [];
+  const startWatcher = ({ since, nonce }) => {
     const plan = plans[Math.min(wi, plans.length - 1)]; const i = ++wi;
+    nonces.push(['watcher', nonce]);
+    if (plan.ready === 'throw') throw new Error('spawn EPERM (試験)');
     ev.push(`watcher${i} start since=${since == null ? '-' : 'set'}`);
     const ready = deferred(), exited = deferred();
     setTimeout(() => {
@@ -222,9 +271,9 @@ function fakes(plans, migrate = { code: 0 }) {
     }, 5);
     return { ready: ready.p, exited: exited.p, done: () => { ev.push(`watcher${i} done`); setTimeout(() => exited.r(plan.doneExit ?? 0), 5); }, kill: () => { ev.push(`watcher${i} kill`); exited.r(1); } };
   };
-  const startMigrate = () => { ev.push('migrate start'); setTimeout(() => { ev.push('migrate exit'); mig.r(migrate.code); }, migrate.ms ?? 60); return { exited: mig.p }; };
+  const startMigrate = ({ nonce }) => { nonces.push(['migrate', nonce]); if (migrate.throw) throw new Error('spawn ENOENT (試験)'); ev.push('migrate start'); setTimeout(() => { ev.push('migrate exit'); mig.r(migrate.code); }, migrate.ms ?? 60); return { exited: mig.p }; };
   const notes = [];
-  return { ev, notes, deps: { startWatcher, startMigrate, notify: async (x) => { notes.push(x); return true; }, readyTimeoutMs: 200 } };
+  return { ev, notes, nonces, deps: { startWatcher, startMigrate, notify: async (x) => { notes.push(x); return true; }, readyTimeoutMs: 200 } };
 }
 await t('O1 ready の後だけ migrate を始める・migrate が終われば done → 見張りの exit 0 で exit 0', async () => {
   const f = fakes([{ ready: 'ready' }]);
@@ -259,6 +308,33 @@ await t('O4 migrate が失敗 → exit 1 / 見張りの終わりの知らせが�
   f = fakes([{ ready: 'ready', doneExit: 3 }]);
   r = await runWatchedMigrate(f.deps);
   assert.deepEqual([r.code, r.reason, r.watcherCode], [3, 'WATCH_FAILED', 3]);
+});
+await t('O5 (Codex R2 Medium 2) 見張りが exit 5 (ready から 10 分 lock が現れない) で終わった → 起動し直さない・migrate の終わりを待って exit 3', async () => {
+  const f = fakes([{ ready: 'ready', exitAfterReady: EXIT.NO_START }, { ready: 'ready' }], { code: 0, ms: 120 });
+  const r = await runWatchedMigrate(f.deps);
+  assert.deepEqual([r.code, r.reason, r.restarts, r.migrateCode], [3, 'WATCH_LOST', 0, 0]);
+  assert.equal(f.ev.filter((x) => /watcher2/.test(x)).length, 0);
+});
+await t('O6 (Codex R2 Low) 見張りを起動できない (例外) → migrate を始めない (exit 1) / migrate を起動できない (例外) → exit 1', async () => {
+  let f = fakes([{ ready: 'throw' }]);
+  let r = await runWatchedMigrate(f.deps);
+  assert.deepEqual([r.code, r.reason, f.ev.includes('migrate start')], [1, 'WATCH_NOT_READY', false]);
+  assert.match(r.why, /見張りを起動できない \(spawn EPERM/);
+  f = fakes([{ ready: 'ready' }], { throw: true });
+  r = await runWatchedMigrate(f.deps);
+  assert.deepEqual([r.code, r.reason, r.migrateCode], [1, 'MIGRATE_FAILED', 1]);
+});
+await t('O7 (Codex R2 High) run の nonce (16 桁の hex) を見張り・起動し直した見張り・migrate に同じに渡す・run ごとに違う', async () => {
+  const f = fakes([{ ready: 'ready', exitAfterReady: 1 }, { ready: 'ready' }], { code: 0, ms: 120 });
+  await runWatchedMigrate(f.deps);
+  assert.deepEqual(f.nonces.map((x) => x[0]), ['watcher', 'migrate', 'watcher']);
+  assert.match(f.nonces[0][1], /^[0-9a-f]{16}$/);
+  assert.equal(new Set(f.nonces.map((x) => x[1])).size, 1);
+  const g = fakes([{ ready: 'ready' }]);
+  await runWatchedMigrate(g.deps);
+  assert.notEqual(g.nonces[0][1], f.nonces[0][1]);
+  assert.match(newRunNonce(), /^[0-9a-f]{16}$/);
+  assert.ok(`${MIGRATE_LOCK_WATCH_APPLICATION_NAME}:${newRunNonce()}:9999999999`.length <= 63, 'application_name は 63 バイトまで');
 });
 
 // ─── 本物の PG (embedded-postgres) ───
@@ -300,7 +376,7 @@ const CI_SQL = `-- migrate:concurrent-index
 create index concurrently if not exists t_b_idx on app.t (b);
 `;
 // 試験の子のプロセスに本物の送り先・本番の接続を渡さない (リポジトリ直下の .env は cwd = tmp で読まない)
-const cleanEnv = (extra = {}) => { const e = { ...process.env }; for (const k of ['GCHAT_WEBHOOK_JOBS', 'COMPANY_DB_WATCH_URL', 'COMPANY_DB_URL', 'RENDER_API_KEY', 'CDB_RENDER_PG_RESOURCE_ID']) delete e[k]; return { ...e, ...extra }; };
+const cleanEnv = (extra = {}) => { const e = { ...process.env }; for (const k of ['GCHAT_WEBHOOK_JOBS', 'COMPANY_DB_WATCH_URL', 'COMPANY_DB_URL', 'RENDER_API_KEY', 'CDB_RENDER_PG_RESOURCE_ID', LOCK_WATCH_NONCE_ENV]) delete e[k]; return { ...e, ...extra }; };
 let cleanupFailed = false;
 console.log('— 本物の PG (embedded-postgres ' + PINNED_EMBEDDED_PG + ' / ' + loaded.from + ') —');
 await cluster.initialise();
@@ -381,56 +457,122 @@ try {
   const ciDir = () => mkDir({ '0001_base.sql': BASE, '0002_idx.sql': CI_SQL, '0002_idx.expect.json': JSON.stringify(EXPECT, null, 2) });
   const versions = async (c) => (await c.query('select version from ops.schema_migrations order by version')).rows.map((r) => r.version);
 
-  await t('G1 runner の関門: CLI の opts (cliRunOptions) = 見張りの接続が同じ DB に無ければ CIC を流さない (LOCK_WATCH_REQUIRED・何も作らない・記録しない・lock が残らない)・別の DB の見張りは数えない・見張りがあれば流れる', async () => {
-    const dbG = await newDb();
-    const c = await open(roleUrl(RUNNER, dbG));
-    const dir = ciDir();
-    const otherReader = pgHolderReader(roleUrl(WATCHER, 'w45_other'));   // 別の DB の見張り = 数えない
-    await otherReader.read();
+  /** 本物の見張りと同じ heartbeat を出す試験の接続 (writeLockWatchHeartbeat = 見張りの読み手と同じ関数)。stop で止める */
+  const startHb = async (url, nonce, everyMs = 1000) => {
+    const c = await open(url);
+    await writeLockWatchHeartbeat(c, nonce);
+    const tm = setInterval(() => { writeLockWatchHeartbeat(c, nonce).catch(() => {}); }, everyMs);
+    return { c, stop: async () => { clearInterval(tm); try { await c.end(); } catch { /* */ } } };
+  };
+  const setAppName = (c, name) => c.query("select pg_catalog.set_config('application_name', $1, false)", [name]);
+  const nowEpoch = async () => Number((await su.query('select floor(extract(epoch from clock_timestamp()))::bigint as e')).rows[0].e);
+
+  await t('R5 heartbeat の契約: 見張りの読み手は見回りのたびに application_name に nonce と epoch を書く・runner は同じ DB・同じ nonce・120 秒以内だけ通す', async () => {
+    const dbH = await newDb();
+    const run = pgAdapter(await open(roleUrl(RUNNER, dbH)));
+    const nonce = newRunNonce(), other = newRunNonce();
+    const reader = pgHolderReader(roleUrl(WATCHER, dbH), { nonce });
     try {
-      await assert.rejects(migrateWithLock(pgAdapter(c), cliRunOptions({ dir, log: quiet, readDiskMetrics: BIG_DISK })), (e) => e.code === 'LOCK_WATCH_REQUIRED' && /migrate-watched\.mjs/.test(e.message) && /0002_idx\.sql/.test(e.message));
-      assert.deepEqual(await versions(c), ['0001']);
-      assert.equal(await readIndexAttrs(pgAdapter(c), 'app', 't_b_idx'), null);
-      assert.deepEqual(await describeLockHolder(pgAdapter(su)), []);
-      await assert.rejects(assertLockWatchPresent(pgAdapter(c), 'x'), (e) => e.code === 'LOCK_WATCH_REQUIRED');
-      // 見張り (watcher の役割・application_name) が同じ DB にある → 流れる
-      const reader = pgHolderReader(roleUrl(WATCHER, dbG));
-      await reader.read();
-      try {
-        assert.equal(await assertLockWatchPresent(pgAdapter(c)), 1);
-        const r = await migrateWithLock(pgAdapter(c), cliRunOptions({ dir, log: quiet, readDiskMetrics: BIG_DISK }));
-        assert.deepEqual(r.applied, ['0002']);
-        assert.deepEqual(await versions(c), ['0001', '0002']);
-        const idx = await readIndexAttrs(pgAdapter(c), 'app', 't_b_idx');
-        assert.ok(idx && idx.valid);
-      } finally { await reader.close(); }
-    } finally { await otherReader.close(); }
+      await assert.rejects(assertLockWatchFresh(run, { nonce }), (e) => e.code === 'LOCK_WATCH_REQUIRED' && /この run の見張りの接続が同じ DB に無い/.test(e.message));
+      await reader.dbName();   // 接続しただけ (見回りをしていない = heartbeat の無い名前の idle の接続)
+      assert.equal((await su.query('select count(*)::int as n from pg_stat_activity where application_name = $1 and datname = $2', [WATCH_APPLICATION_NAME, dbH])).rows[0].n, 1);
+      await assert.rejects(assertLockWatchFresh(run, { nonce }), (e) => e.code === 'LOCK_WATCH_REQUIRED');
+      await reader.read();     // 見回り 1 回 = heartbeat
+      const names = (await su.query('select application_name as a from pg_stat_activity where datname = $1 and application_name like $2', [dbH, WATCH_APPLICATION_NAME + ':%'])).rows.map((x) => x.a);
+      assert.equal(names.length, 1); assert.match(names[0], new RegExp('^' + WATCH_APPLICATION_NAME + ':' + nonce + ':\\d{10}$'));
+      assert.equal((await assertLockWatchFresh(run, { nonce })).fresh, 1);
+      await assert.rejects(assertLockWatchFresh(run, { nonce: other }), (e) => e.code === 'LOCK_WATCH_REQUIRED');   // 別の run
+      await assert.rejects(assertLockWatchFresh(run, { nonce: null }), (e) => /nonce .*が無い/.test(e.message));
+      await assert.rejects(assertLockWatchFresh(run, { nonce: 'XYZ' }), (e) => /形が違う/.test(e.message));
+      await assert.rejects(assertLockWatchFresh(pgAdapter(await open(roleUrl(RUNNER, 'w45_other'))), { nonce }), (e) => e.code === 'LOCK_WATCH_REQUIRED');   // 別の DB
+      // env の nonce (migrate-watched が子に渡す形)
+      process.env[LOCK_WATCH_NONCE_ENV] = nonce;
+      try { assert.equal((await assertLockWatchFresh(run)).fresh, 1); } finally { delete process.env[LOCK_WATCH_NONCE_ENV]; }
+      // 止まった見張り = heartbeat が 121 秒前のまま / 未来の epoch (6 秒先) = 通らない・120 秒ちょうどは通る
+      const fake = await open(roleUrl(WATCHER, dbH));
+      await reader.close();
+      const e0 = await nowEpoch();
+      await setAppName(fake, `${WATCH_APPLICATION_NAME}:${nonce}:${e0 - LOCK_WATCH_HEARTBEAT_MAX_AGE_SEC - 1}`);
+      await assert.rejects(assertLockWatchFresh(run, { nonce }), (e) => /heartbeat が 12[1-3] 秒前で古い/.test(e.message));
+      await setAppName(fake, `${WATCH_APPLICATION_NAME}:${nonce}:${e0 + 30}`);
+      await assert.rejects(assertLockWatchFresh(run, { nonce }), (e) => e.code === 'LOCK_WATCH_REQUIRED');
+      await setAppName(fake, `${WATCH_APPLICATION_NAME}:${nonce}:${(await nowEpoch()) - 100}`);
+      assert.equal((await assertLockWatchFresh(run, { nonce })).fresh, 1);
+      await setAppName(fake, `${WATCH_APPLICATION_NAME}:${nonce}:x${e0}`);   // 形が違う名前は数えない (cast の誤りで落ちない)
+      await assert.rejects(assertLockWatchFresh(run, { nonce }), (e) => e.code === 'LOCK_WATCH_REQUIRED');
+    } finally { await reader.close(); }
   });
-  await t('G2 CLI の opts を渡さない直の呼び出し (試験・PGlite) は今までどおり流れる / migrate.mjs の CLI は cliRunOptions を通す', async () => {
-    const dbG = await newDb();
-    const c = await open(roleUrl(RUNNER, dbG));
-    const r = await migrateWithLock(pgAdapter(c), { dir: ciDir(), log: quiet, readDiskMetrics: BIG_DISK });
-    assert.deepEqual(r.applied, ['0001', '0002']);
+
+  await t('G1 runner の関門は本物の PG の CIC の道で既定で必須: opts の無い migrateWithLock の直の呼び出し・supportsConcurrentIndex を false にした本物の PG の adapter・別の run の heartbeat = LOCK_WATCH_REQUIRED (何も作らない・記録しない・lock が残らない) / 新しい heartbeat なら流れる / 見張りが止まって古くなれば次の file で止まる', async () => {
+    const nonce = newRunNonce();
+    // ① heartbeat が無い (opts を渡さない直の呼び出し)
+    let dbG = await newDb();
+    let c = await open(roleUrl(RUNNER, dbG));
+    await assert.rejects(migrateWithLock(pgAdapter(c), { dir: ciDir(), log: quiet, readDiskMetrics: BIG_DISK, lockWatchNonce: nonce }), (e) => e.code === 'LOCK_WATCH_REQUIRED' && /0002_idx\.sql/.test(e.message) && /migrate-watched\.mjs/.test(e.message));
+    assert.deepEqual(await versions(c), ['0001']);
+    assert.equal(await readIndexAttrs(pgAdapter(c), 'app', 't_b_idx'), null);
+    assert.deepEqual(await describeLockHolder(pgAdapter(su)), []);
+    // ② 本物の PG の adapter で CONCURRENTLY を外す道 (supportsConcurrentIndex = false) も同じ
+    await assert.rejects(migrateWithLock({ ...pgAdapter(c), supportsConcurrentIndex: false }, { dir: ciDir(), log: quiet, readDiskMetrics: BIG_DISK, lockWatchNonce: nonce }), (e) => e.code === 'LOCK_WATCH_REQUIRED');
+    assert.deepEqual(await versions(c), ['0001']);
+    assert.equal(await readIndexAttrs(pgAdapter(c), 'app', 't_b_idx'), null);
+    // ③ 別の run の heartbeat は数えない
+    const hbOther = await startHb(roleUrl(WATCHER, dbG), newRunNonce());
+    try {
+      await assert.rejects(migrateWithLock(pgAdapter(c), { dir: ciDir(), log: quiet, readDiskMetrics: BIG_DISK, lockWatchNonce: nonce }), (e) => e.code === 'LOCK_WATCH_REQUIRED');
+    } finally { await hbOther.stop(); }
+    // ④ この run の新しい heartbeat (本物の見張りの読み手) → 流れる
+    const reader = pgHolderReader(roleUrl(WATCHER, dbG), { nonce });
+    await reader.read();
+    try {
+      const r = await migrateWithLock(pgAdapter(c), { dir: ciDir(), log: quiet, readDiskMetrics: BIG_DISK, lockWatchNonce: nonce });
+      assert.deepEqual(r.applied, ['0002']);
+      assert.ok((await readIndexAttrs(pgAdapter(c), 'app', 't_b_idx')).valid);
+    } finally { await reader.close(); }
+    // ⑤ 見張りが止まった (heartbeat が古い) → 次の file で止まる・前の file は記録済みのまま
+    dbG = await newDb();
+    c = await open(roleUrl(RUNNER, dbG));
+    const stuck = await open(roleUrl(WATCHER, dbG));
+    await setAppName(stuck, `${WATCH_APPLICATION_NAME}:${nonce}:${(await nowEpoch()) - 300}`);
+    await assert.rejects(migrateWithLock(pgAdapter(c), { dir: ciDir(), log: quiet, readDiskMetrics: BIG_DISK, lockWatchNonce: nonce }), (e) => e.code === 'LOCK_WATCH_REQUIRED' && /古い/.test(e.message));
+    assert.deepEqual(await versions(c), ['0001']);
+    assert.deepEqual(await describeLockHolder(pgAdapter(su)), []);
+  });
+  await t('G2 外す道は PGlite の adapter (lockWatchExempt) だけ: pgAdapter は持たない・runner に外す opts は無い (requireLockWatch・cliRunOptions は無い)・heartbeat を書く関数を試験の外で呼ぶのは見張りだけ', async () => {
+    assert.equal(pgAdapter(su).lockWatchExempt, undefined);
+    const { PGlite } = await import('@electric-sql/pglite');
+    const lite = new PGlite();
+    try { assert.equal(pgliteAdapter(lite).lockWatchExempt, true); } finally { await lite.close(); }
     const src = fs.readFileSync(path.join(ROOT, 'scripts', 'company-db', 'migrate.mjs'), 'utf8');
-    assert.equal((src.match(/await migrateWithLock\(db, cliRunOptions\(\{ dir, to, dryRun:/g) || []).length, 1, 'CLI が cliRunOptions を通していない');
-    assert.equal((src.match(/migrateWithLock\(db, \{ dir, to/g) || []).length, 0);
+    assert.equal((src.match(/lockWatchExempt: true/g) || []).length, 1, 'lockWatchExempt: true は pgliteAdapter の 1 か所だけ');
+    assert.ok(/export function pgliteAdapter[\s\S]{0,600}lockWatchExempt: true/.test(src));
+    assert.ok(!/requireLockWatch|cliRunOptions|skipLockWatch|lockWatchOptional/.test(src), '外す opts の名前が無い');
+    assert.equal((src.match(/await assertLockWatchFresh\(db, \{ nonce: opts\.lockWatchNonce \?\? process\.env\[LOCK_WATCH_NONCE_ENV\], label: f\.file \}\)/g) || []).length, 2, 'CIC の 2 つの道で必ず呼ぶ');
+    const hits = [];
+    const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (['node_modules', '.git'].includes(e.name)) continue; const q = path.join(d, e.name); if (e.isDirectory()) walk(q); else if (/\.(m?js)$/.test(e.name) && !/^test-/.test(e.name) && fs.readFileSync(q, 'utf8').includes('writeLockWatchHeartbeat')) hits.push(path.relative(ROOT, q).replace(/\\/g, '/')); } };
+    for (const d of ['apps', 'lib', 'scripts', 'config']) walk(path.join(ROOT, d));
+    assert.deepEqual(hits, ['scripts/company-db/migrate-lock-watch.mjs']);
   });
 
   // ─── 本物の子のプロセス (migrate-watched の本体 + 見張りの CLI + migrate.mjs の CLI) ───
-  await t('E1 本物の子のプロセス: 起動の知らせ (dry-run で画面) → ready の後に migrate → ⚠️ → ✅ → exit 0', async () => {
+  await t('E1 本物の子のプロセス: 起動の知らせ (dry-run で画面) → ready の後に migrate (この run の heartbeat がある) → ⚠️ → ✅ → exit 0', async () => {
     const dbE = await newDb();
+    const su2 = await open(suUrl(dbE));
     const dir = mkDir({ '0001_base.sql': BASE, '0002_slow.sql': 'select pg_sleep(5);\n' });
-    let watchOut = '', migOut = '', readyAt = null, migStartAt = null;
+    let watchOut = '', migOut = '', readyAt = null, migStartAt = null, freshAtStart = null;
+    const nonce = newRunNonce();
     const r = await runWatchedMigrate({
-      startWatcher: ({ since }) => {
-        const w = forkWatcher({ since, extraArgs: ['--dry-run', '--interval-sec', '1', '--alert-min', String(2 / 60)], env: cleanEnv({ COMPANY_DB_WATCH_URL: roleUrl(WATCHER, dbE) }), stdio: 'pipe' });
+      nonce,
+      startWatcher: ({ since, nonce: n }) => {
+        const w = forkWatcher({ since, nonce: n, extraArgs: ['--dry-run', '--interval-sec', '1', '--alert-min', String(2 / 60)], env: cleanEnv({ COMPANY_DB_WATCH_URL: roleUrl(WATCHER, dbE) }), stdio: 'pipe' });
         w.child.stdout.on('data', (d) => { watchOut += d; }); w.child.stderr.on('data', (d) => { watchOut += d; });
         w.ready.then(() => { readyAt = Date.now(); });
         return w;
       },
-      startMigrate: () => {
+      startMigrate: ({ nonce: n }) => {
         migStartAt = Date.now();
-        const m = spawnMigrate({ args: ['--dir', dir], env: cleanEnv({ COMPANY_DB_URL: roleUrl(RUNNER, dbE) }), stdio: 'pipe' });
+        freshAtStart = assertLockWatchFresh(pgAdapter(su2), { nonce: n }).then((x) => x.fresh, (e) => e.message);
+        const m = spawnMigrate({ args: ['--dir', dir], nonce: n, env: cleanEnv({ COMPANY_DB_URL: roleUrl(RUNNER, dbE) }), stdio: 'pipe' });
         m.child.stdout.on('data', (d) => { migOut += d; }); m.child.stderr.on('data', (d) => { migOut += d; });
         return m;
       },
@@ -438,6 +580,7 @@ try {
     });
     assert.deepEqual([r.code, r.reason, r.migrateCode, r.watcherCode], [0, 'OK', 0, 0], watchOut + '\n' + migOut);
     assert.ok(readyAt && migStartAt && readyAt <= migStartAt, 'ready の前に migrate を始めた');
+    assert.equal(await freshAtStart, 1, 'migrate を始めた時にこの run の heartbeat がある');
     assert.match(watchOut, /\(dry-run・送らない\)\n🟢 Company DB の migrate の lock の見張りを始めた/);
     assert.match(watchOut, /\(dry-run・送らない\)\n⚠️ Company DB の migrate の lock/);
     assert.match(watchOut, /前の見回りで lock が無かった時から/);
@@ -449,7 +592,7 @@ try {
     const dbE = await newDb();
     let started = false, watchOut = '';
     const r = await runWatchedMigrate({
-      startWatcher: ({ since }) => { const w = forkWatcher({ since, env: cleanEnv({ COMPANY_DB_WATCH_URL: roleUrl(WATCHER, dbE), GCHAT_WEBHOOK_JOBS: 'https://127.0.0.1:9/never' }), stdio: 'pipe' }); w.child.stdout.on('data', (d) => { watchOut += d; }); w.child.stderr.on('data', (d) => { watchOut += d; }); return w; },
+      startWatcher: ({ since, nonce }) => { const w = forkWatcher({ since, nonce, env: cleanEnv({ COMPANY_DB_WATCH_URL: roleUrl(WATCHER, dbE), GCHAT_WEBHOOK_JOBS: 'https://127.0.0.1:9/never' }), stdio: 'pipe' }); w.child.stdout.on('data', (d) => { watchOut += d; }); w.child.stderr.on('data', (d) => { watchOut += d; }); return w; },
       startMigrate: () => { started = true; throw new Error('migrate を始めた'); },
       notify: async () => true,
     });
@@ -459,6 +602,59 @@ try {
     assert.equal((await c.query(`select to_regclass('ops.schema_migrations') as t`)).rows[0].t, null);
   });
 
+  await t('E3 (Codex R2 Medium 2) 本物の子のプロセス: 親を kill → 見張りは IPC の切れを見て、lock が無ければ知らせて exit 0 / lock があれば知らせて外れるまで見張り ✅ で exit 0', async () => {
+    const dbP = await newDb();
+    const parentSrc = `import { forkWatcher } from ${JSON.stringify(pathToFileURL(WATCHED_CLI).href)};
+const w = forkWatcher({ nonce: process.env.T_NONCE, extraArgs: ['--dry-run', '--interval-sec', '1', '--alert-min', String(2 / 60)] });
+w.ready.then((m) => console.log('READY ' + m.type + ' ' + w.pid));
+setInterval(() => {}, 1000);`;
+    const parentFile = path.join(mkDir({}), 'd60w45-parent.mjs');
+    fs.writeFileSync(parentFile, parentSrc);
+    const runCase = async (holdLock) => {
+      const parent = spawn(process.execPath, [parentFile], { cwd: os.tmpdir(), env: cleanEnv({ COMPANY_DB_WATCH_URL: roleUrl(WATCHER, dbP), T_NONCE: newRunNonce() }), stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      parent.stdout.on('data', (d) => { out += d; }); parent.stderr.on('data', (d) => { out += d; });
+      const end = Date.now() + 30000;
+      while (!/READY ready (\d+)/.test(out) && Date.now() < end) await sleep(100);
+      const wpid = Number((/READY ready (\d+)/.exec(out) || [])[1]);
+      assert.ok(wpid, out);
+      let holder = null;
+      if (holdLock) { holder = await open(roleUrl(RUNNER, dbP)); await holder.query('select pg_advisory_lock(hashtextextended($1, 0))', [MIGRATE_LOCK_NAME]); await sleep(1500); }
+      parent.kill();   // Windows = TerminateProcess。見張りは detached = 親の job に入らず残る・IPC が切れる (detached でなければ一緒に終わる = 前の実験)
+      const alive = () => { try { process.kill(wpid, 0); return true; } catch { return false; } };
+      if (holdLock) {
+        await sleep(4000);
+        assert.ok(alive(), '親が死んでも lock がある間は見張りを続ける');
+        await holder.query('select pg_advisory_unlock(hashtextextended($1, 0))', [MIGRATE_LOCK_NAME]);
+      }
+      const end2 = Date.now() + 30000;
+      while (alive() && Date.now() < end2) await sleep(200);
+      await sleep(300);
+      assert.ok(!alive(), '見張りが終わらない\n' + out);
+      return out;
+    };
+    let out = await runCase(false);
+    assert.match(out, /\(dry-run・送らない\)\n⚠️ Company DB の migrate の見張りの親 \(migrate-watched\) が途中で終わった.*lock は今は無い = 見張りを終える/);
+    assert.match(out, /終わり: parent_gone/);
+    out = await runCase(true);
+    assert.match(out, /\(dry-run・送らない\)\n⚠️ Company DB の migrate の見張りの親 \(migrate-watched\) が途中で終わった.*が持っている = 外れるまで見張る/);
+    assert.match(out, /\(dry-run・送らない\)\n⚠️ Company DB の migrate の lock/);
+    assert.match(out, /\(dry-run・送らない\)\n✅/);
+    assert.match(out, /終わり: released/);
+  });
+  await t('L1 (Codex R2 Low) fork / spawn を起動できない (error event) → 未処理の誤りで落ちずに exit 1 に変わる', async () => {
+    const logs = [];
+    const w = forkWatcher({ nonce: newRunNonce(), execPath: path.join(os.tmpdir(), 'd60w45-no-such-node.exe'), stdio: 'pipe', log: (m) => logs.push(m) });
+    assert.equal(await Promise.race([w.exited, sleep(15000).then(() => 'timeout')]), 1);
+    const m = spawnMigrate({ nonce: newRunNonce(), execPath: path.join(os.tmpdir(), 'd60w45-no-such-node.exe'), stdio: 'pipe', log: (x) => logs.push(x) });
+    assert.equal(await Promise.race([m.exited, sleep(15000).then(() => 'timeout')]), 1);
+    assert.equal(logs.length, 2, logs.join('\n'));
+    assert.match(logs[0], /見張り のプロセスを起動できない/); assert.match(logs[1], /migrate のプロセスを起動できない/);
+    // runWatchedMigrate の中で起動できない見張り = migrate を始めない
+    let started = false;
+    const r = await runWatchedMigrate({ startWatcher: ({ since, nonce }) => forkWatcher({ since, nonce, execPath: path.join(os.tmpdir(), 'd60w45-no-such-node.exe'), stdio: 'pipe', log: () => {} }), startMigrate: () => { started = true; return { exited: Promise.resolve(0) }; }, notify: async () => true });
+    assert.deepEqual([r.code, r.reason, started], [1, 'WATCH_NOT_READY', false]);
+  });
   await t('C1 CLI: 見張りは単独で起動しない・--url・--alert-min (dry-run でない) は exit 2 / migrate-watched は送り先・接続先が無い・--url・--dry-run で exit 2', async () => {
     const env = cleanEnv({ COMPANY_DB_WATCH_URL: 'postgres://nobody:x@127.0.0.1:1/none', COMPANY_DB_URL: 'postgres://nobody:x@127.0.0.1:1/none', GCHAT_WEBHOOK_JOBS: 'https://127.0.0.1:9/never' });
     const run = (cli, args, e = env) => spawnSync(process.execPath, [cli, ...args], { cwd: os.tmpdir(), env: e, encoding: 'utf8', timeout: 60000 });
@@ -469,6 +665,12 @@ try {
     for (const args of [['--url', 'postgres://a:b@c/d'], ['--alert-min', '90'], ['--supervised', '--interval-sec', '3600']]) { r = run(WATCH_CLI, args); assert.equal(r.status, 2, args.join(' ') + r.stderr); }
     r = run(WATCH_CLI, ['--dry-run'], cleanEnv());
     assert.equal(r.status, 2); assert.match(r.stderr, /COMPANY_DB_WATCH_URL/);
+    r = run(WATCH_CLI, ['--dry-run'], cleanEnv({ COMPANY_DB_WATCH_URL: 'postgres://nobody:x@127.0.0.1:1/none', [LOCK_WATCH_NONCE_ENV]: 'not-hex' }));
+    assert.equal(r.status, 2); assert.match(r.stderr, /形が違う/);
+    // 親の下 (IPC あり) で nonce が無い = exit 2
+    const w = forkWatcher({ nonce: 'bad', env: cleanEnv({ COMPANY_DB_WATCH_URL: 'postgres://nobody:x@127.0.0.1:1/none', GCHAT_WEBHOOK_JOBS: 'https://127.0.0.1:9/never' }), stdio: 'pipe' });
+    let wout = ''; w.child.stderr.on('data', (d) => { wout += d; });
+    assert.equal(await w.exited, 2, wout); assert.match(wout, /nonce/);
     r = run(WATCHED_CLI, [], cleanEnv({ COMPANY_DB_URL: 'postgres://x@h/d', COMPANY_DB_WATCH_URL: 'postgres://x@h/d' }));
     assert.equal(r.status, 2, r.stdout + r.stderr); assert.match(r.stderr, /GCHAT_WEBHOOK_JOBS/);
     r = run(WATCHED_CLI, [], cleanEnv({ GCHAT_WEBHOOK_JOBS: 'https://127.0.0.1:9/never' }));
