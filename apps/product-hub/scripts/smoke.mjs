@@ -2684,6 +2684,19 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
     check('配送方法で試算: 送料が分からない配送方法は合わせ先にしない',
       noCost['1']?.method === '定形あり', JSON.stringify(noCost['1']));
     check('配送方法で試算: 選択肢が空でも落ちない', JSON.stringify(vari.profitShipPickByGroup([], hints)) === '{}');
+    // 🚨 送料0円は「無料」ではなく「NEにまだ入っていない」ことが多い。最多でも自動では選ばない
+    //    (選ぶと利益を過大に見せる — Codex R3 P1)。人が選ぶぶんは選択肢に残っている
+    const zero = vari.profitShipPickByGroup(
+      [{ method: '定形0円便', cost: 0, count: 100 }, { method: '定形外規格内（50g以内）', cost: 182, count: 10 }], { '1': ['定形'] });
+    check('🚨 配送方法で試算: 送料0円の便は最多でも自動で選ばない (利益を過大に見せない)',
+      zero['1']?.method === '定形外規格内（50g以内）' && zero['1']?.cost === 182, JSON.stringify(zero['1']));
+    check('🚨 配送方法で試算: 0円の便しか無いグループは合わせ先にしない (キーを作らない)',
+      !('1' in vari.profitShipPickByGroup([{ method: '定形0円便', cost: 0, count: 100 }], { '1': ['定形'] })));
+    // NE の登録値が0円のときは、画面を開いたときに使っている金額そのものなので残す
+    const zeroNe = vari.profitShipPickByGroup(
+      [{ method: '定形0円便', cost: 0, count: 1, isCurrent: true }], { '1': ['定形'] });
+    check('配送方法で試算: NE の登録送料が0円の商品はその行のまま (開いたときの金額と変えない)',
+      zeroNe['1']?.method === '定形0円便' && zeroNe['1']?.isNe === true, JSON.stringify(zeroNe['1']));
     check('配送方法で試算: 既定の目安 (引数を省く) でも楽天「定形外」が決まる',
       vari.profitShipPickByGroup(opts)['1']?.method === '定形外規格内（50g以内）');
   }
@@ -12991,25 +13004,80 @@ for (const [name, file, data] of renders) {
   check('配送費の試算: 配送方法を変えたら利益を再計算する',
     /sel\.addEventListener\('change', [\s\S]{0,60}apply\(\)/.test(sim) && /ship = Number\(op\.dataset\.cost\)/.test(sim)
     && /function apply\(\)[\s\S]{0,600}render\(\)/.test(sim));
-  // 🚨 候補を組み直すだけでは利益が動かない (2026-10-06 中原さん報告)。**選択も合わせる**こと
-  check('配送費の試算: 楽天の配送方法を変えたら候補を組み直し、試算もその配送方法に合わせる',
+  // 🚨 候補を組み直すだけでは利益が動かない (2026-10-06 中原さん報告)。**選択も合わせる**こと。
+  //    配線はソース検査で、決め方と文言は下の切り出しで**入力→出力**で確かめる
+  check('配送費の試算: 楽天の配送方法を変えたら、候補を組み直して試算もその配送方法に合わせる',
     /rkShip\.addEventListener\('change', \(\) => build\(\{ follow: true \}\)\)/.test(sim)
-    && /const pick = doFollow \? data\.picks\?\.\[group\] : null/.test(sim)
-    && /sel\.value = \(pick && data\.options\.some/.test(sim));
-  check('🚨 配送費の試算: 読み込み時は合わせない (開いただけで利益額を代えない)',
-    /build\(\);/.test(sim) && !/build\(\{ follow: true \}\);/.test(sim)
-    && /function build\(\{ follow = false \} = \{\}\)/.test(sim));
-  check('配送費の試算: 未選択 (— 選んでください) に戻したときは合わせない',
-    /const doFollow = follow && group !== ''/.test(sim));
-  check('配送費の試算: 何で試算したか・ほかに何通りあるかを画面に書く',
-    /function followNote\(\)/.test(sim) && sim.includes('で試算しています')
-    && sim.includes('違うなら選び直してください') && sim.includes('選択肢にありません'));
+    && /followed = d\.followed;[\s\S]{0,80}sel\.value = d\.method;[\s\S]{0,40}apply\(\);/.test(sim));
+  check('🚨 配送費の試算: 開いたときも保存済みの配送方法に合わせる (保存すると画面は丸ごと読み直される)',
+    /build\(\{ follow: neCurrent !== '' \}\);/.test(sim));
   check('配送費の試算: 試算のプルダウンを自分で選び直したら、合わせた注記は消える',
     /sel\.addEventListener\('change', \(\) => \{ followed = null; apply\(\); \}\)/.test(sim));
   check('配送費の試算: 売価の入力でも従来どおり再計算する',
     /priceInput\.addEventListener\('input', render\)/.test(sim));
   check('配送費の試算: 試算であって NE や出品内容は変えないと画面に書く',
     /試算だけで、NE や出品内容は変わりません/.test(sim));
+}
+
+{
+  // ─── 試算の配送方法の決め方・文言 (2026-10-06)。画面を触らない純粋関数として切り出して
+  //     **入力→出力**で確かめる。ソース検査だけだと「候補は組み直すが選択は動かない」
+  //     今回の不具合を落とせない (Codex R3 P2) ───
+  const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+  const start = src.indexOf('    function decideProfitShip(');
+  const end = src.indexOf('    (function initProfitShipPicker()');
+  const chunk = start >= 0 && end > start ? src.slice(start, end) : '';
+  check('配送方法で試算: detail.ejs から決め方と文言を切り出せる',
+    chunk.includes('function profitShipNoteText'), String(chunk.length));
+  const api = new Function(chunk + ' return { decideProfitShip, profitShipNoteText };')();
+  const options = [
+    { method: '定形内（50g以内）', cost: 146, count: 12 },
+    { method: '定形外規格内（50g以内）', cost: 182, count: 900 },
+    { method: 'ネコポス', cost: 237, count: 3832, isCurrent: true },
+    { method: '定形外規格外（1kg以内）', cost: 510, count: 40 },
+    { method: '宅急便60サイズ', cost: 538, count: 417 },
+  ];
+  const hints = { '1': ['定形'], '5': ['ネコポス'], '8': ['宅急便'] };
+  const picks = vari.profitShipPickByGroup(options, hints);
+  const decide = (o) => api.decideProfitShip({ options, picks, chosen: '', neCurrent: 'ネコポス', ...o });
+  // 🚨 これが今回の不具合そのもの: 楽天=定形外 なのに NE のネコポスで利益を出していた
+  check('🚨 配送方法で試算: 楽天=定形外 に合わせると定形の便が選ばれる (ネコポスのままにしない)',
+    decide({ group: '1', follow: true }).method === '定形外規格内（50g以内）',
+    decide({ group: '1', follow: true }).method);
+  check('🚨 配送方法で試算: 保存後の読み直し (選択が空の状態) でも定形のまま戻らない',
+    decide({ group: '1', follow: true, chosen: '' }).method === '定形外規格内（50g以内）');
+  check('配送方法で試算: 合わせないとき (NE の配送方法が分からない等) は NE の登録値の行を選ぶ',
+    decide({ group: '1', follow: false }).method === 'ネコポス'
+    && decide({ group: '1', follow: false }).followed === null);
+  check('配送方法で試算: NE の配送方法が当てはまるグループは NE の登録値 (実送料) のまま',
+    decide({ group: '5', follow: true }).method === 'ネコポス');
+  check('🚨 配送方法で試算: 当てはまる便が無いグループでは選択を動かさない',
+    decide({ group: '9', follow: true }).method === 'ネコポス'
+    && decide({ group: '9', follow: true }).followed?.pick === null);
+  check('配送方法で試算: 未選択 (— 選んでください) に戻しても選択を動かさない',
+    decide({ group: '', follow: true }).method === 'ネコポス'
+    && decide({ group: '', follow: true }).followed === null);
+  check('配送方法で試算: 人が選び直した配送方法は、楽天を触らない限り保たれる',
+    decide({ group: '1', follow: false, chosen: '定形外規格外（1kg以内）' }).method === '定形外規格外（1kg以内）');
+  check('配送方法で試算: 選択肢に無い合わせ先は使わない (画面に出していない便で試算しない)',
+    api.decideProfitShip({ options, picks: { '1': { method: 'まぼろし便', cost: 1, from: 1, min: 1, max: 1 } },
+      group: '1', chosen: '', neCurrent: 'ネコポス', follow: true }).method === 'ネコポス');
+  {
+    // 文言: 何の送料で試算しているか・ほかに何通りあるか・**試算であって保存ではない**
+    const d = decide({ group: '1', follow: true });
+    const n = api.profitShipNoteText({ followed: d.followed, method: d.method, groupLabel: '定形外', neCurrent: 'ネコポス', isCurrent: false });
+    check('配送方法で試算: 注記に「何で試算しているか」と大きさの通り数・送料の幅を書く',
+      n.includes('「定形外」に合わせて「定形外規格内（50g以内）」で試算しています')
+      && n.includes('3 通り') && n.includes('146〜510円') && n.includes('違うなら選び直してください'), n);
+    check('🚨 配送方法で試算: 合わせたときも「試算だけで保存されない」と必ず書く (保存されたと誤解させない)',
+      n.includes('試算だけで、NE や出品内容には保存されません'), n);
+    const miss = api.profitShipNoteText({ followed: { group: '9', pick: null }, method: 'ネコポス', groupLabel: 'ゆうパケットパフ', neCurrent: 'ネコポス', isCurrent: true });
+    check('配送方法で試算: 当てはまる便が無いときは「変えていない」と書く',
+      miss.includes('試算できる NE の配送方法が選択肢にありません') && miss.includes('変えていません'), miss);
+    check('配送方法で試算: 合わせていないときの文言は今までどおり',
+      api.profitShipNoteText({ followed: null, method: 'ネコポス', neCurrent: 'ネコポス', isCurrent: true }) === 'NE に登録されている送料です'
+      && api.profitShipNoteText({ followed: null, method: '宅急便60サイズ', neCurrent: 'ネコポス', isCurrent: false }).includes('ここでの変更は試算だけで、NE や出品内容は変わりません'));
+  }
 }
 
   // ─── 楽天項目の保存が「前回の選択」を進めること (2026-09-03 #1152 / Codex R3 high) ───

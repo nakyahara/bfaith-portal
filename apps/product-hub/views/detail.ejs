@@ -944,8 +944,15 @@ th.attr-unknown { color: #dc2626; }
           <% } %>
           <%# 2026-10-06: ここを変えたら利益の配送費も合わせて計算し直す (中原さん報告:
               「配送方法を定形外にしているが利益計算が更新されない」)。大きさで送料が変わる
-              配送方法は 1 つに決まらないので、何で試算したかは左の注記に出す %>
-          <div class="muted" style="font-size:11px;">※ここは楽天へ送る配送方法です。変えると左の「配送方法で試算」も合わせて利益を計算し直します (大きさで送料が変わるものは選び直せます)</div>
+              配送方法は 1 つに決まらないので、何で試算したかは左の注記に出す。
+              🚨 「配送方法で試算」が出ていない商品 (原価がSKUで異なる・NEに原価や送料が無い・
+              税率が決まらない) に「計算し直します」と書くと嘘になるので、左の枠と同じ条件で出し分ける %>
+          <% const simShown = !!(neCost && !neCost.costVaries && neCost.costExTax != null && neCost.shippingCost != null && simTaxPercent != null); %>
+          <% if (simShown) { %>
+            <div class="muted" style="font-size:11px;">※ここは楽天へ送る配送方法です。変えると左の「配送方法で試算」も合わせて利益を計算し直します (大きさで送料が変わるものは選び直せます)</div>
+          <% } else { %>
+            <div class="muted" style="font-size:11px;">※ここは楽天へ送る配送方法です。この商品はいま利益を試算できない状態なので、左の案内をご覧ください</div>
+          <% } %>
         </div>
         <div style="flex:1; min-width:120px;">
           <label>送料<span class="ftag ftag-auto">自動</span></label>
@@ -5217,8 +5224,54 @@ th.attr-unknown { color: #dc2626; }
     // ─── 配送方法を差し替えて試算する ───────────────────────────────
     // 楽天の配送方法グループ (8種) と NE の配送方法 (サイズ別) は粒度が違い、
     // 楽天「宅急便50サイズ以下」は NE の 50〜120 サイズ (479〜945円) のどれにもなる。
-    // なので選択肢は NE の配送方法にし、楽天のプルダウンを変えたら**候補を上に集める**
+    // なので選択肢は NE の配送方法にし、楽天のプルダウンを変えたら候補を上に集める
     // (絞り込みではなく並べ替え — 対応表は目安で、決めるのは人)
+    //
+    // 🚨 2026-10-06 中原さん報告「配送方法を定形外にしているが利益計算が更新されない」:
+    //    候補を上に集めるだけでは利益が動かなかった。**選んでいる楽天の配送方法に合わせて
+    //    試算する**。どれを使ったかは注記に出して選び直させる (決め方 = profitShipPickByGroup)
+    //
+    // 決め方と文言は**画面を触らない純粋関数**にしてある (試験から入力→出力で確かめるため。
+    // ソース検査だけだと「候補は組み直すが選択は動かない」今回の不具合を落とせない — Codex R3 P2)
+    function decideProfitShip({ options, picks, group, chosen, neCurrent, follow }) {
+      const has = (v) => !!v && options.some((o) => o.method === v);
+      // 「— 選んでください」(未選択) に戻したときは合わせ先が無いだけ。選択は動かさない
+      const doFollow = !!follow && group !== '';
+      const pick = (doFollow && picks ? picks[group] : null) || null;
+      // 合わせ先が無ければ 選択中 → NE の登録値 → 先頭。実送料の行を外すと、
+      // 開いただけで利益額が代表送料に変わる (#1167 Codex R3 P1)
+      const current = options.find((o) => o.isCurrent);
+      const want = [chosen, neCurrent].find(has);
+      const method = (pick && has(pick.method) ? pick.method : '')
+        || want || current?.method || options[0]?.method || '';
+      return { method, followed: doFollow ? { group, pick } : null };
+    }
+    // 注記。「何の送料で試算しているか」「ほかに何通りあるか」「試算であって保存ではない」を書く
+    // (追従した説明で「試算だけ」が消えると、NE の配送方法まで保存されたように読める — Codex R3 P2)
+    function profitShipNoteText({ followed, method, groupLabel, neCurrent, isCurrent }) {
+      if (!followed) {
+        return isCurrent
+          ? 'NE に登録されている送料です'
+          : 'NE は「' + (neCurrent || '未設定') + '」です — ここでの変更は試算だけで、NE や出品内容は変わりません';
+      }
+      const tail = '（この配送方法の選択は試算だけで、NE や出品内容には保存されません）';
+      const label = groupLabel || '選んだ配送方法';
+      if (!followed.pick) {
+        // 何も変えていないので「保存されません」は付けない (変えた話をしていない)
+        return '「' + label + '」で試算できる NE の配送方法が選択肢にありません'
+          + ' — 試算の配送方法は変えていません';
+      }
+      const p = followed.pick;
+      let s = '「' + label + '」に合わせて「' + method + '」で試算しています';
+      if (p.from > 1) {
+        s += ' — 大きさで ' + p.from + ' 通り (' + Math.round(p.min).toLocaleString()
+          + '〜' + Math.round(p.max).toLocaleString() + '円) あるので、'
+          + (p.isNe ? 'NE の登録値' : 'いちばん多く使っているもの') + 'を使いました。違うなら選び直してください';
+      } else if (p.isNe) {
+        s += ' (NE に登録されている送料です)';
+      }
+      return s + tail;
+    }
     (function initProfitShipPicker() {
       const sel = document.getElementById('profit-ship-select');
       const note = document.getElementById('profit-ship-note');
@@ -5229,15 +5282,15 @@ th.attr-unknown { color: #dc2626; }
       if (!data.options.length) { sel.closest('div').hidden = true; return; }
       const neCurrent = sel.dataset.current || '';
       const rkShip = document.getElementById('rk-shipping-group');
+      let followed = null;   // 楽天の配送方法に合わせた結果 (注記に出す)。null = 合わせていない
 
-      // 楽天の配送方法を人が変えたときだけ follow = true。
-      // 読み込み時に動かすと、開いただけで利益額が NE の実送料から代表送料へ変わる (Codex R3 P1)
-      let followed = null;   // 追従の結果 (注記に出す)。null = 追従していない
+      // 複合選択肢 (1y5 等) は楽天側のグループで見る
+      const groupOf = () => (rkShip ? String(rkShip.value || '') : '').replace(/y\d+$/, '');
+
       function build({ follow = false } = {}) {
-        const chosen = sel.value || neCurrent;
+        const chosen = sel.value || neCurrent;   // 組み直すと消えるので先に控える
+        const group = groupOf();
         // 楽天で選んでいるグループに関係しそうな配送方法を上のグループに集める
-        const raw = rkShip ? String(rkShip.value || '') : '';
-        const group = raw.replace(/y\d+$/, '');   // 複合選択肢 (1y5 等) は楽天側のグループで見る
         const hints = data.hints[group] || [];
         const match = (o) => hints.some((h) => o.method.includes(h));
         const near = data.options.filter(match);
@@ -5265,55 +5318,33 @@ th.attr-unknown { color: #dc2626; }
         } else {
           addTo(sel, data.options);
         }
-        // 選択中の配送方法を保つ。無ければ「NEの登録値」の行 → それも無ければ先頭。
-        // ここで実送料の行を外すと、開いただけで利益額が代表送料に変わる (Codex R3 P1)
-        const current = data.options.find((o) => o.isCurrent);
-        const want = [chosen, neCurrent].find((v) => v && data.options.some((o) => o.method === v));
-        // 🚨 人が楽天の配送方法を変えたら、試算もその配送方法に合わせる (2026-10-06 中原さん報告:
-        //    「配送方法を定形外にしているが利益計算が更新されない」)。グループは粒度が粗いので
-        //    どれで試算したかは注記に出し、違う大きさなら選び直せるようにする
-        // 「— 選んでください」(未選択) に戻したときは追従しない (合わせる先が無いだけで、不足ではない)
-        const doFollow = follow && group !== '';
-        const pick = doFollow ? data.picks?.[group] : null;
-        followed = doFollow ? { group, label: groupLabel(), pick: pick || null } : null;
-        sel.value = (pick && data.options.some((o) => o.method === pick.method) ? pick.method : null)
-          || want || current?.method || data.options[0].method;
+        const d = decideProfitShip({
+          options: data.options, picks: data.picks, group, chosen, neCurrent, follow,
+        });
+        followed = d.followed;
+        sel.value = d.method;
         apply();
-      }
-      // 楽天のプルダウンに出ている名前 (「定形外」等)。注記で人が選んだ言葉のまま返す
-      function groupLabel() {
-        const op = rkShip?.selectedOptions?.[0];
-        return (op?.textContent || '').trim();
       }
       function apply() {
         const op = sel.selectedOptions[0];
         if (!op) return;
         ship = Number(op.dataset.cost);
-        const isCur = !!data.options.find((o) => o.method === sel.value)?.isCurrent;
-        note.textContent = followNote() || (isCur
-          ? 'NE に登録されている送料です'
-          : 'NE は「' + (neCurrent || '未設定') + '」です — ここでの変更は試算だけで、NE や出品内容は変わりません');
+        note.textContent = profitShipNoteText({
+          followed, method: sel.value,
+          groupLabel: (rkShip?.selectedOptions?.[0]?.textContent || '').trim(),
+          neCurrent, isCurrent: !!data.options.find((o) => o.method === sel.value)?.isCurrent,
+        });
         render();
       }
-      // 楽天の配送方法に合わせたときの説明。「何で試算しているか」と「ほかに何通りあるか」を書く
-      function followNote() {
-        if (!followed) return '';
-        const label = followed.label || '選んだ配送方法';
-        if (!followed.pick) {
-          return '「' + label + '」に当てはまる NE の配送方法が選択肢にありません — 試算の配送方法は変えていません';
-        }
-        const p = followed.pick;
-        const head = '「' + label + '」に合わせて「' + sel.value + '」で試算しています';
-        if (p.from > 1) {
-          return head + ' — この配送方法は大きさで ' + p.from + ' 通り ('
-            + Math.round(p.min).toLocaleString() + '〜' + Math.round(p.max).toLocaleString()
-            + '円) あります。' + (p.isNe ? 'NE の登録値' : 'いちばん多く使っているもの') + 'を使ったので、違うなら選び直してください';
-        }
-        return head + (p.isNe ? ' (NE に登録されている送料です)' : '');
-      }
+      // 自分で選び直したら、合わせた説明は消す (人の選択が最後に勝つ)
       sel.addEventListener('change', () => { followed = null; apply(); });
       if (rkShip) rkShip.addEventListener('change', () => build({ follow: true }));
-      build();
+      // 🚨 開いたときも保存されている楽天の配送方法に合わせる。中原さんの報告は
+      //    「定形外にしている」= 保存済みの状態で、**保存すると画面は丸ごと読み直される**ので、
+      //    ここで合わせないと保存のたびに NE の送料へ戻ってしまう (Codex R3 P1)。
+      //    NE の配送方法が分からない商品 (バリエーションで名前だけ割れている等) は合わせない —
+      //    実送料が分かっているのに代表送料で上書きしないため (#1167 Codex R3 P1)
+      build({ follow: neCurrent !== '' });
     })();
 
     render();

@@ -500,18 +500,25 @@ export function profitShipPickByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS) {
   // ⚠️ Number(null) は 0。null を先に弾かないと「送料0円」の便で試算して利益を過大に見せる
   //    (profitShipChoices / profit.js の computeProfit と同じ注意)
   const num = (v) => (v == null || v === '' ? NaN : Number(v));
-  const list = (choices || []).filter((o) => o && o.method && Number.isFinite(num(o.cost)) && num(o.cost) >= 0);
+  const list = (choices || []).filter((o) => o && o.method && Number.isFinite(num(o.cost)));
   const out = {};
   for (const [group, words] of Object.entries(hints || {})) {
     const near = list.filter((o) => words.some((w) => o.method.includes(w)));
-    if (!near.length) continue;   // 候補なし = 画面は何も変えない (勝手に別の便で試算しない)
-    // NE の登録値が当てはまるならそれ (実送料)。無ければ最多 → 同数なら高い方
-    const ne = near.find((o) => o.isCurrent);
-    const pick = ne || [...near].sort((a, b) => (b.count || 0) - (a.count || 0) || Number(b.cost) - Number(a.cost))[0];
-    const costs = near.map((o) => Number(o.cost));
+    // 🚨 送料 0 円の便は**自分では選ばない** (Codex R3 P1)。NE の 送料 0 は「無料」ではなく
+    //    「まだ入っていない」ことが多く、最多だからと採ると利益を過大に見せる。
+    //    人が選ぶぶんは今までどおり選択肢に残る (決めるのは人)。
+    //    NE の登録値 (isCurrent) は 0 円でも残す — 画面を開いたときに使っている金額そのもの
+    const cand = near.filter((o) => num(o.cost) > 0 || o.isCurrent);
+    // NE の登録値が当てはまるならそれ (実送料 = 開いたときの金額と同じ)。
+    // 無ければ最多 → 同数なら高い方 (利益を実際より良く見せない側)
+    const ne = cand.find((o) => o.isCurrent);
+    const pick = ne || [...cand].filter((o) => num(o.cost) > 0)
+      .sort((a, b) => (b.count || 0) - (a.count || 0) || num(b.cost) - num(a.cost))[0];
+    if (!pick) continue;   // 候補なし / 0円の便しかない = 画面は何も変えない
+    const costs = cand.map((o) => num(o.cost));
     out[group] = {
-      method: pick.method, cost: Number(pick.cost), isNe: !!ne,
-      from: near.length, min: Math.min(...costs), max: Math.max(...costs),
+      method: pick.method, cost: num(pick.cost), isNe: !!ne,
+      from: cand.length, min: Math.min(...costs), max: Math.max(...costs),
     };
   }
   return out;
