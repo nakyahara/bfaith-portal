@@ -8,7 +8,7 @@
  *   4 マイナス (赤字) も計算する・見せ方は「−」
  *   5 price-update の estimateGross は同じ関数 (export し直し)・手数料の率は 1 か所 (PLATFORM_FEE_RATES)
  *   6 import の無いファイル (ブラウザにそのまま配る) = import / require を書いていない
- *   9 四捨五入は 0.5 を 0 から遠い方へ (−51.5 → −52 円・−3.75 → −3.8%)・CSV の利益率も画面と同じ丸め・低い粗利率の境目の警告は 2 桁 (Codex #1632 R3)
+ *   9 四捨五入は 0.5 を 0 から遠い方へ (−51.5 → −52 円・−3.75 → −3.8%)・CSV の利益率も画面と同じ丸め・低い粗利率の境目の警告は 2 桁 (Codex #1632 R3)・10% ちょうどは低いと言わない (R4)
  *   8 マスタの入力と価格改定の画面の円・% が同じ (Codex #1632 R2 M: 売価 1,367・原価 645・10%・送料 520・手数料 10% = 0.5 円が浮動小数で 0.4999… → 前は価格改定だけ 0 円)
  *   7 内訳の 1 行の等式が必ず成り立つ (税込原価が .5 になる 10%・小数の送料・8% の 2 桁) = 左の式の数 = 右の数・利益 = その四捨五入 (Codex #1632 R1 Low)
  * 使い方: node scripts/test-profit-estimate.mjs
@@ -213,6 +213,23 @@ await t('[7] 内訳の 1 行の等式が成り立つ: 税込原価 16.5 (原価 
     const edge = ev({ price: 500, cost: 278, taxRate: 0.08, shipping: 100 });
     assert.ok(edge.estimate.rate < 0.1 && edge.estimate.ratePct === 10, '生は 10% 未満・欄は 10.0');
     assert.ok(edge.warns.includes('粗利率が低いです (概算 9.95%)'), JSON.stringify(edge.warns));
+    // 10% ちょうど (売価 504・原価 276・税率 10%・送料 100 = 504 − 50 − 303.6 − 100 = 50.4 = 10%。浮動小数では 0.09999999999999995) = 低いと言わない (Codex #1632 R4 L)
+    const just = ev({ price: 504, cost: 276, taxRate: 0.1, shipping: 100 });
+    assert.ok(just.estimate.rate < 0.1, `生の率は 10% に届かない (${just.estimate.rate})`);
+    assert.equal(just.estimate.ratePct, 10);
+    assert.ok(!just.warns.some((w) => w.startsWith('粗利率が低い')), JSON.stringify(just.warns));
+    // 10% ちょうどの総当たり (売価 × 10% = 利益 になる組): どれも低いと言わない
+    let nJust = 0;
+    for (let price = 300; price <= 3000; price++) for (const taxRate of [0.08, 0.1]) for (const shipping of [0, 100, 520]) {
+      // 利益 = 売価の 10% ちょうどになる原価 (銭で解く): 売価 − 手数料 − 原価 × (1 + 税率) − 送料 = 売価 × 10%
+      const k = Math.round(100 + taxRate * 100);
+      const left = price * 100 - Math.round(price * 0.1) * 100 - shipping * 100 - price * 10;
+      if (left <= 0 || left % k !== 0) continue;
+      const cost = left / k;
+      nJust++;
+      assert.ok(!ev({ price, cost, taxRate, shipping }).warns.some((w) => w.startsWith('粗利率が低い')), `10% ちょうど ${price}・${cost}・${taxRate}・${shipping}`);
+    }
+    assert.ok(nJust >= 5, `10% ちょうどの組を見た (${nJust})`);
     const low = ev({ price: 1000, cost: 300, taxRate: 0.1, shipping: 520 });   // 1000 − 100 − 330 − 520 = 50 = 5.0%
     assert.ok(low.warns.includes('粗利率が低いです (概算 5.0%)'), '境目でなければ 1 桁');
     const fine = ev({ price: 1000, cost: 100, taxRate: 0.1, shipping: 520 });   // 27%
@@ -221,8 +238,9 @@ await t('[7] 内訳の 1 行の等式が成り立つ: 税込原価 16.5 (原価 
     for (let cost = 250; cost <= 300; cost++) for (const price of [480, 500, 520]) {
       const e = ev({ price, cost, taxRate: 0.08, shipping: 100 });
       const w = e.warns.find((x) => x.startsWith('粗利率が低いです'));
-      assert.equal(!!w, e.estimate.rate < 0.1, '判定 = 生の率 < 10%');
+      assert.equal(!!w, PF.roundHalf(e.estimate.rate, 12) < 0.1, '判定 = 率 (12 桁に丸めた) < 10%');
       if (w) assert.ok(Number(/概算 (-?[\d.]+)%/.exec(w)[1]) < 10, `低いと言うときの数は 10 未満: ${w}`);
+      if (w) assert.ok(!/10\.00?%/.test(w), w);
     }
   });
 }
