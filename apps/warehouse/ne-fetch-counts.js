@@ -29,6 +29,9 @@
  * ■ 取得中の印 (sync_meta の ne_api_<kind>_in_progress。設計 v13 §5.2・R12 M4)
  *   取得の始め (最初の API の呼び出しの前) に独立した取引で commit し、完了の印と同じ取引で消す (自分の run_id の印だけ)。
  *   途中で失敗した・件数が合わず完了の印を付けなかった回は **残る** (次に最後まで取れた回が上書きして消す)。
+ *   🚨 同じ種類の取得は 1 本ずつ (Codex PR #1642 R1 Medium): 印の取得がまだ生きていれば新しい取得は印を書かずに throw (NE_FETCH_BUSY)。
+ *   死んだ印 (この process で終わった回・PID が居ない・読めない・NE_FETCH_STALE_MS より古い) だけ回収する (judgeNeFetchMark)。
+ *   = 「A 開始 → B 開始 → B 完了 → A がまだ通信中」で印が消える、が起きない
  *   セットの取得は全部のページをメモリに集めてから書く = API と通信している間は SQLite の書き込みの鍵を持たない → 開く前のゲート (PR-7) は
  *   BEGIN IMMEDIATE ではこの間を見つけられないので、この印で拒む。
  *
@@ -38,6 +41,7 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -196,22 +200,66 @@ export function readNeFetchCounts(db) {
   return evalNeFetchCounts(meta);
 }
 
+
 const nowText = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
+/** 印を回収してよい年齢 (これより古い印は、PID が生きて見えても回収する = Windows の PID の使い回し対策。取得は数分で終わる) */
+export const NE_FETCH_STALE_MS = 6 * 60 * 60 * 1000;
+/** この process の中で今走っている取得の run_id (取得の関数の finally で外す) */
+const RUNNING = new Set();
+function pidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e && e.code === 'EPERM'; }   // EPERM = 居るが権限が無い = 生きている
+}
 /**
- * 取得中の印を書く (取得の始め。呼び手の取引の中で = 呼び手が commit する)。前の回が残した印は上書きする。返り値 = 書いた値 (消す時に渡す)
- * 中身 = { version, kind, run_id (この取得の回の一意の ID), started_at (この回の時刻 = 完了の印に書く時刻), pid }
+ * 前の印がまだ走っている取得のものか (R1 Codex Medium: 生きている取得の印は上書きしない・死んだ / 期限切れの印だけ回収する)。
+ *   読めない・形が違う = 回収 (このコードが書いた印ではない) / NE_FETCH_STALE_MS より古い = 回収 /
+ *   同じ host・同じ process = この process で今走っている run_id のときだけ生きている (失敗して finally を抜けた回は死んでいる) /
+ *   同じ host・別の process = その PID が生きていれば生きている / 別の host = 期限まで生きているとみなす
+ * @returns {{ alive: boolean, prev: object|null }}
+ */
+export function judgeNeFetchMark(raw, nowMs = Date.now()) {
+  let v = null;
+  try { v = JSON.parse(raw); } catch { return { alive: false, prev: null }; }
+  if (!v || typeof v !== 'object' || typeof v.run_id !== 'string' || !Number.isFinite(v.started_ms)) return { alive: false, prev: v };
+  if (nowMs - v.started_ms >= NE_FETCH_STALE_MS) return { alive: false, prev: v };
+  if (v.host !== os.hostname()) return { alive: true, prev: v };
+  if (v.pid === process.pid) return { alive: RUNNING.has(v.run_id), prev: v };
+  return { alive: pidAlive(v.pid), prev: v };
+}
+/**
+ * 取得中の印を書く (取得の始め・最初の API の呼び出しの前。呼び手の取引の中で = 呼び手が commit する)。返り値 = 書いた値 (消す時に渡す)。
+ * 同じ種類の取得の印が既にあり、その取得が生きていれば **書かずに throw** (code = NE_FETCH_BUSY。同じ種類の取得は 1 本ずつ)。
+ * 死んだ / 期限切れの印は上書きして回収する。
+ * 中身 = { version, kind, run_id (この回の一意の ID), started_at (この回の時刻 = 完了の印に書く時刻), started_ms, pid, host }
  * @param {import('better-sqlite3').Database} db  取込の書き込みの接続
  */
 export function beginNeFetch(db, kind, startedAt) {
   const key = NE_FETCH_IN_PROGRESS_KEY[kind];
   if (!key) throw new Error(`beginNeFetch: 知らない種類 ${kind}`);
-  const value = JSON.stringify({ version: NE_FETCH_COUNTS_VERSION, kind, run_id: crypto.randomUUID(), started_at: startedAt, pid: process.pid });
+  const cur = db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(key);
+  if (cur) {
+    const j = judgeNeFetchMark(cur.value);
+    if (j.alive) {
+      const e = new Error(`[NE] 同じ種類の取得 (${kind}) がまだ走っている (pid ${j.prev.pid}・${j.prev.host}・開始 ${j.prev.started_at}) → この取得はしない`);
+      e.code = 'NE_FETCH_BUSY';
+      throw e;
+    }
+  }
+  const value = JSON.stringify({ version: NE_FETCH_COUNTS_VERSION, kind, run_id: crypto.randomUUID(), started_at: startedAt, started_ms: Date.now(), pid: process.pid, host: os.hostname() });
   db.prepare('INSERT OR REPLACE INTO sync_meta (key, value, updated_at) VALUES (?, ?, ?)').run(key, value, nowText());
+  RUNNING.add(JSON.parse(value).run_id);
   return value;
 }
-/** 自分が書いた取得中の印だけを消す (完了の印と同じ取引の中で)。返り値 = 消した行の数 (0 = 後から別の取得が印を書いた = その印は残す) */
+/** 自分が書いた取得中の印だけを消す (完了の印と同じ取引の中で)。返り値 = 消した行の数 (0 = 自分の印ではない = 残す) */
 export function endNeFetch(db, kind, value) {
   const key = NE_FETCH_IN_PROGRESS_KEY[kind];
   if (!key) throw new Error(`endNeFetch: 知らない種類 ${kind}`);
   return db.prepare('DELETE FROM sync_meta WHERE key = ? AND value = ?').run(key, value).changes;
+}
+/**
+ * 取得の関数を抜けるとき (成功・失敗・印を付けなかった回のどれでも) に呼ぶ。DB の印には触らない (失敗した回の印は残る = ゲートが拒む)。
+ * この process の「今走っている」から外す = 次の取得がその印を死んだ印として回収できる
+ */
+export function releaseNeFetch(value) {
+  try { RUNNING.delete(JSON.parse(value).run_id); } catch { /* 読めない値 = 何もしない */ }
 }

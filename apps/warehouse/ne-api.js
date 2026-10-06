@@ -26,7 +26,7 @@ import { fileURLToPath } from 'url';
 import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks, readNeRawRev, neSrc, addSpelling, writeCodeSpellings } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 import { makeNeOrderBaseUpserter, toOrderBaseRow, NE_ORDER_BASE_FIELDS } from './ne-order-base-upsert.js';
-import { NE_FETCH_COUNTS_VERSION, NE_FETCH_COUNTS_KEY, checkNeFetchCounts, beginNeFetch, endNeFetch, computeFetchFingerprint } from './ne-fetch-counts.js';
+import { NE_FETCH_COUNTS_VERSION, NE_FETCH_COUNTS_KEY, checkNeFetchCounts, beginNeFetch, endNeFetch, releaseNeFetch, computeFetchFingerprint } from './ne-fetch-counts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
@@ -147,7 +147,19 @@ async function callNE(endpoint, params = {}) {
 
 // ─── 商品マスタ取得 ───
 
-async function fetchProducts() {
+/**
+ * 取得の関数を抜けるとき (成功・失敗のどれでも)、この process の「今走っている」から外す (ne-fetch-counts.js の releaseNeFetch)。
+ * DB の取得中の印には触らない = 失敗した回の印は残り (ゲートが拒む)、次の取得が死んだ印として回収する。
+ * 同じ種類の取得がまだ生きていれば、beginNeFetch が throw して何もしない (同じ種類の取得は 1 本ずつ。広げる道 PR-9 Codex R1 Medium)
+ */
+async function withFetchRun(run) {
+  const h = { inProgress: null };
+  try { return await run(h); } finally { if (h.inProgress) releaseNeFetch(h.inProgress); }
+}
+async function fetchProducts() { return withFetchRun(fetchProductsRun); }
+async function fetchSetProducts() { return withFetchRun(fetchSetProductsRun); }
+
+async function fetchProductsRun(h) {
   console.log('[NE] 商品マスタ取得開始');
   await initDB();
   const db = getDB();
@@ -185,7 +197,9 @@ async function fetchProducts() {
   //   (増え方が違う = 同時に別の取込・CSV が書いた = 印を付けない。Codex PR #1453 R1 High-2)
   //   取得中の印 (ne-fetch-counts.js) も同じ取引で書く = 最初の API の呼び出しの前に commit。完了の印と同じ取引で消す (途中で失敗したら残る)
   let inProgress;
+  //   同じ種類の取得がまだ生きていれば beginNeFetch が throw = この取引ごと戻る (前の回の印は消えない)
   const rev0 = db.transaction(() => { clearNeCompleteMarks('products'); inProgress = beginNeFetch(db, 'products', ts); return readNeRawRev('products'); })();
+  h.inProgress = inProgress;
 
   while (true) {
     const data = await callNE('/api_v1_master_goods/search', {
@@ -278,7 +292,7 @@ async function fetchProducts() {
 
 // ─── セット商品取得 ───
 
-async function fetchSetProducts() {
+async function fetchSetProductsRun(h) {
   console.log('[NE] セット商品取得開始');
   await initDB();
   const db = getDB();
@@ -296,7 +310,9 @@ async function fetchSetProducts() {
   const pageRows = [];   // 取得の件数 (広げる道 PR-9): ページごとの行数
   // 取得中の印 (ne-fetch-counts.js): 最初の API の呼び出しの前に独立した取引で commit する (API と通信している間は書き込みの鍵を持たないので、
   //   開く前のゲートはこの印で取得中を見分ける)。入れ替え・完了の印と同じ取引で消す (途中で失敗した・印を付けなかった回は残る)
+  //   同じ種類の取得がまだ生きていれば beginNeFetch が throw (何も書かない)
   const inProgress = db.transaction(() => beginNeFetch(db, 'setproducts', ts))();
+  h.inProgress = inProgress;
   let offset = 0;
   const LIMIT = 1000;
 

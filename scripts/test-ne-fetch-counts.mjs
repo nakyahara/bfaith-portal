@@ -46,7 +46,7 @@ globalThis.fetch = async (url, opts) => {
   const offset = Number(q.get('offset')), limit = Number(q.get('limit'));
   const goods = u.endsWith('/api_v1_master_goods/search');
   ne.calls.push({ goods, offset, limit });
-  if (ne.onCall) ne.onCall({ goods, offset });   // API と通信している最中 (SQLite の取引の外) の様子を見る
+  if (ne.onCall) await ne.onCall({ goods, offset });   // API と通信している最中 (SQLite の取引の外) の様子を見る (promise を返せば待つ)
   if (ne.failAt && ne.failAt.goods === goods && ne.failAt.offset === offset) return { ok: true, status: 200, json: async () => ({ result: 'error', message: 'テストの途中の失敗' }) };
   const pages = goods ? ne.goodsPages : ne.setPages;
   const data = pages ? (pages[offset / limit] || []) : (goods ? ne.goods : ne.setgoods).slice(offset, offset + limit);
@@ -54,7 +54,8 @@ globalThis.fetch = async (url, opts) => {
 };
 const { fetchProducts, fetchSetProducts } = await quietly(() => import('../apps/warehouse/ne-api.js'));
 const { getDB, clearNeCompleteMarks } = await import('../apps/warehouse/db.js');
-const { readNeFetchCounts, evalNeFetchCounts, checkNeFetchCounts, beginNeFetch, endNeFetch, NE_FETCH_COUNTS_KEY, NE_FETCH_IN_PROGRESS_KEY, NE_FETCH_SEAL_KEYS, NE_FETCH_MISSING_FIELDS, NE_FETCH_FINGERPRINT_FILES, computeFetchFingerprint } = await import('../apps/warehouse/ne-fetch-counts.js');
+const { readNeFetchCounts, evalNeFetchCounts, checkNeFetchCounts, beginNeFetch, endNeFetch, NE_FETCH_COUNTS_KEY, NE_FETCH_IN_PROGRESS_KEY, NE_FETCH_SEAL_KEYS, NE_FETCH_MISSING_FIELDS, NE_FETCH_FINGERPRINT_FILES, computeFetchFingerprint, releaseNeFetch, judgeNeFetchMark, NE_FETCH_STALE_MS } = await import('../apps/warehouse/ne-fetch-counts.js');
+const { spawnSync } = await import('node:child_process');
 const db = () => getDB();
 const meta = (k) => db().prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value ?? null;
 const counts = (kind) => { const v = meta(NE_FETCH_COUNTS_KEY[kind]); return v == null ? null : JSON.parse(v); };
@@ -368,13 +369,13 @@ await ta('[11] 取得中の印 (R12): API と通信している間ずっとあ�
     assert.equal(meta(NE_FETCH_IN_PROGRESS_KEY.setproducts), null);
     assert.equal(readInTx((rdb) => readNeFetchCounts(rdb)).ok, true);
   } finally { ne.onCall = null; }
-  // 自分の印だけ消す: A が始まり、後から B が始まった (印を上書き) → A の完了は B の印を消さない
+  // 自分の印だけ消す: A が走っている間は B が印を書けない (上書きしない)・別の値では消えない・A の値で消える
   const a = db().transaction(() => beginNeFetch(db(), 'setproducts', '2026-10-06 00:00:00'))();
-  const b = db().transaction(() => beginNeFetch(db(), 'setproducts', '2026-10-06 00:00:00'))();
-  assert.notEqual(a, b);
-  assert.equal(db().transaction(() => endNeFetch(db(), 'setproducts', a))(), 0);
-  assert.equal(meta(NE_FETCH_IN_PROGRESS_KEY.setproducts), b);
-  assert.equal(db().transaction(() => endNeFetch(db(), 'setproducts', b))(), 1);
+  assert.throws(() => db().transaction(() => beginNeFetch(db(), 'setproducts', '2026-10-06 00:00:00'))(), (e) => e.code === 'NE_FETCH_BUSY');
+  assert.equal(meta(NE_FETCH_IN_PROGRESS_KEY.setproducts), a);
+  assert.equal(db().transaction(() => endNeFetch(db(), 'setproducts', a.replace('"kind"', '"kind" ')))(), 0);   // 自分の値と違う = 消さない
+  assert.equal(db().transaction(() => endNeFetch(db(), 'setproducts', a))(), 1);
+  releaseNeFetch(a);
   assert.equal(meta(NE_FETCH_IN_PROGRESS_KEY.setproducts), null);
   // 読めない値も「取得中」とみなす
   assert.deepEqual(evalNeFetchCounts({ [NE_FETCH_IN_PROGRESS_KEY.products]: '{壊れ' }).products, { ok: false, reason: 'fetch_in_progress', in_progress: null });
@@ -412,6 +413,74 @@ await ta('[13] セットの数が読めない行は落とさず 1 で書く (今
   assert.ok(changedFp && changedFp !== fpBefore, '途中で中身が変われば版も変わる');
   assert.equal(c.fetch_fingerprint, fpBefore);   // 記録は始めに計算した値
   assert.equal(computeFetchFingerprint(), fpBefore);   // 差し替えを戻せば元の版
+});
+
+await ta('[14] 同じ種類の取得は 1 本ずつ (Codex #1642 R1): A の通信中に始めた B は印を書かずに断る (A の印は消えない・A が完了して消す) / 別の process の生きている印は上書きしない / 死んだ・期限切れ・読めない印は回収', async () => {
+  const KS = NE_FETCH_IN_PROGRESS_KEY.setproducts, KP = NE_FETCH_IN_PROGRESS_KEY.products;
+  // (a) セット A の API の通信中 (SQLite の鍵を持たない間) に、同じ種類の B を始めて終わらせる (Codex の「B が先に終わる」順)
+  await nextSecond();
+  ne.setgoods = [sg('AA', 'C1'), sg('AB', 'C1')];
+  // B = 別の process (本番の daily-sync・fetch-all・手動の再実行と同じ形)。NE の API の mock で BB を返し、取れたら入れ替えてしまう
+  const childFile = path.join(tmp, 'w9-child-b.mjs');
+  fs.writeFileSync(childFile, [
+    "globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ result: 'success', data: [{ set_goods_id: 'BB', set_goods_name: 'b', set_goods_selling_price: '1', set_goods_detail_goods_id: 'C9', set_goods_detail_quantity: '1' }] }) });",
+    `const { fetchSetProducts } = await import(${JSON.stringify(new URL('../apps/warehouse/ne-api.js', import.meta.url).href)});`,
+    "console.log = () => {}; console.warn = () => {};",
+    "try { await fetchSetProducts(); process.stdout.write('RESULT done'); } catch (e) { process.stdout.write('RESULT ' + (e.code || e.message)); }",
+  ].join('\n'));
+  let aMark = null, bOut = null, markAfterB = null;
+  ne.onCall = async ({ goods }) => {
+    if (goods) return;
+    ne.onCall = null;
+    aMark = meta(KS);
+    bOut = spawnSync(process.execPath, [childFile], { cwd: tmp, env: { ...process.env, DATA_DIR: tmp }, encoding: 'utf8', timeout: 60000 }).stdout;
+    markAfterB = meta(KS);
+  };
+  await quietly(fetchSetProducts);
+  assert.match(String(bOut), /RESULT NE_FETCH_BUSY$/, 'B は印を書かずに断る (走らない)');
+  assert.ok(aMark && JSON.parse(aMark).pid === process.pid);
+  assert.equal(markAfterB, aMark, 'B が終わった後も A の印のまま (A はまだ通信中)');
+  assert.equal(meta(KS), null, 'A の完了で消える');
+  assert.deepEqual(db().prepare('SELECT セット商品コード AS p FROM raw_ne_set_products ORDER BY 1').all().map((r) => r.p), ['aa', 'ab']);
+  assert.equal(counts('setproducts').stored_rows, 2);
+  // (b) 別の process (この試験の親 = 生きている PID) の新しい印 → 商品・セットとも断る。商品は前の回の完了の印も消さない (同じ取引で戻る)
+  await nextSecond();
+  ne.goods = [g('P1')];
+  await quietly(fetchProducts);
+  const pAt = meta('ne_api_products_complete_at');
+  const live = (kind) => JSON.stringify({ version: 'fc1', kind, run_id: 'other-run', started_at: '2026-10-06 00:00:00', started_ms: Date.now(), pid: process.ppid, host: os.hostname() });
+  const lp = live('products'), ls = live('setproducts');
+  setMeta(KP, lp); setMeta(KS, ls);
+  await assert.rejects(quietly(fetchProducts), (e) => e.code === 'NE_FETCH_BUSY');
+  await assert.rejects(quietly(fetchSetProducts), (e) => e.code === 'NE_FETCH_BUSY');
+  assert.deepEqual([meta(KP), meta(KS), meta('ne_api_products_complete_at')], [lp, ls, pAt]);
+  assert.equal(JSON.parse(meta(KP)).run_id, 'other-run');
+  // (c) 死んだ PID の印 → 回収して最後まで取る (印は消える)
+  const dead = spawnSync(process.execPath, ['-e', '0']).pid;
+  const mark = (kind, extra) => JSON.stringify({ version: 'fc1', kind, run_id: 'x-' + kind, started_at: '2026-10-06 00:00:00', started_ms: Date.now(), pid: dead, host: os.hostname(), ...extra });
+  setMeta(KS, mark('setproducts'));
+  await nextSecond();
+  await quietly(fetchSetProducts);
+  assert.equal(meta(KS), null);
+  // (d) 期限切れ (生きている PID でも NE_FETCH_STALE_MS より古い = PID の使い回し) → 回収
+  setMeta(KP, mark('products', { pid: process.ppid, started_ms: Date.now() - NE_FETCH_STALE_MS - 1000 }));
+  await nextSecond();
+  await quietly(fetchProducts);
+  assert.equal(meta(KP), null);
+  assert.ok(meta('ne_api_products_complete_at'));
+  // (e) 判定そのもの: 別の host は期限まで生きている・読めない / 形の違う印は回収・この process の終わった回は死んでいる・今走っている回は生きている
+  const now = Date.now();
+  assert.equal(judgeNeFetchMark(mark('products', { host: 'other-host' }), now).alive, true);
+  assert.equal(judgeNeFetchMark(mark('products', { host: 'other-host', started_ms: now - NE_FETCH_STALE_MS }), now).alive, false);
+  assert.equal(judgeNeFetchMark('{壊れ', now).alive, false);
+  assert.equal(judgeNeFetchMark(JSON.stringify({ pid: process.ppid }), now).alive, false);
+  assert.equal(judgeNeFetchMark(mark('products', { pid: process.pid, run_id: 'not-running' }), now).alive, false);
+  assert.equal(judgeNeFetchMark(mark('products', { pid: process.ppid }), now).alive, true);
+  const own = db().transaction(() => beginNeFetch(db(), 'products', '2026-10-06 00:00:00'))();
+  assert.equal(judgeNeFetchMark(own).alive, true);
+  releaseNeFetch(own);
+  assert.equal(judgeNeFetchMark(own).alive, false);   // 取得の関数を抜けた (失敗した) 回 = 死んでいる = 次の取得が回収できる
+  db().prepare('DELETE FROM sync_meta WHERE key = ?').run(KP);
 });
 
 globalThis.fetch = realFetch;
