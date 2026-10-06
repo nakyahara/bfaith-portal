@@ -222,6 +222,7 @@ await ta('[1] 未保存の数: 構成の見せ方・保存の理由は 0 件、�
   assert.equal(await dirty(p), 0);
   assert.equal(await p.isDisabled('#save'), true);
   assert.equal(await p.isHidden('#unsaved'), true);
+  await p.click('#name-edit');   // 名前は見出しのところで直す (10/6)
   await p.fill('#f-name', 'セット 1 改');
   assert.equal(await dirty(p), 1);
   assert.equal(await p.isDisabled('#save'), false);
@@ -416,6 +417,7 @@ await ta('[11] 保存が通ったら画面を読み直す (10/5): 読み直す�
   await p.reload();
   assert.equal(await p.locator('#saved-note').count(), 0, '知らせは 1 回だけ');
   // 続けて直す (読み直しで新しい編集の印)
+  await p.click('#name-edit');
   await p.fill('#f-name', '単品 3 改');
   await p.keyboard.press('Control+s');
   await p.waitForSelector('#saved-note');
@@ -1353,6 +1355,55 @@ await ta('[46] Amazon SKU (#1628 Codex R5 L2): 変わった項目が無い保存
   assert.equal(await p.locator('#comp-rows tr.comp-row .c-qty').first().inputValue(), '3');
   assert.equal(await dirty(p), 0, '元に戻したら未保存 0');
   assert.equal(await p.isDisabled('#save'), true);
+});
+
+// MASTER_EDIT_UI_SHOTS_NAME=フォルダ を付けると [47] の写し (1440 幅) を残す
+const SHOTS_NAME = process.env.MASTER_EDIT_UI_SHOTS_NAME || '';
+const shotName = async (p, file) => { if (!SHOTS_NAME) return; await p.evaluate(() => window.scrollTo(0, 0)); await p.waitForTimeout(150); await p.screenshot({ path: `${SHOTS_NAME}/${file}.png` }); };
+await ta('[47] 名前を見出しのところで直す (10/6): 単品・セットとも ✎ で見出しが入力欄になる・名前の欄は 1 つだけ・Esc で戻す・変えた間は閉じない・Ctrl+S → 見出しが新しい名前 / 🔒 (NE に送った値) = 入力欄を出さず理由の印', async (p) => {
+  for (const [code, next, label] of [['k005', 'abc 小袋 改', '単品'], ['set001', 'セット 1 新', 'セット']]) {
+    await p.goto(B + '/sku/' + code);
+    assert.equal(await p.locator('[data-field="name"]').count(), 1, label + ': 名前の欄は 1 つだけ (下の「基本」に無い)');
+    assert.equal(await p.locator('#p-basic [data-field="name"]').count(), 0);
+    assert.equal(await p.isVisible('#name-edit'), true, label + ': 見出しの横に「名前を直す」');
+    assert.equal(await p.isVisible('#f-name'), false);
+    const before = await p.textContent('#sku-title');
+    await shotName(p, label + '_直せるとき_見出し');
+    await p.click('#name-edit');
+    assert.equal(await active(p), 'f-name', label + ': 押すと見出しの場所で入力欄');
+    assert.equal(await p.isVisible('#sku-title'), false);
+    await p.keyboard.press('Escape');
+    assert.equal(await p.isVisible('#sku-title'), true, label + ': Esc で戻す');
+    assert.equal(await dirty(p), 0);
+    await p.click('#name-edit');
+    await p.fill('#f-name', next);
+    assert.equal(await dirty(p), 1);
+    assert.match(await p.textContent('#save-diff'), new RegExp((label === 'セット' ? 'セット名' : '名前') + '[\\s\\S]*' + next));
+    await p.click('#name-close');
+    assert.equal(await p.isVisible('#f-name'), true, label + ': 変えた間は閉じない');
+    await shotName(p, label + '_直せるとき_入力中');
+    await p.keyboard.press('Control+s');
+    await p.waitForSelector('#saved-note');
+    assert.equal((await p.textContent('#sku-title')).trim(), next, label + ': 保存の後は見出しが新しい名前');
+    assert.notEqual(before.trim(), next);
+    assert.equal((await row(code)).name, next);
+    assert.equal(await p.isVisible('#f-name'), false, label + ': 読み直した後は見出しに戻る');
+  }
+  // 🔒 = NE に送った値 ([38] で CSV を配って申告した ui-new-1)。入力欄を出さず、見出しの横に理由
+  await p.goto(B + '/sku/ui-new-1');
+  assert.equal(await p.locator('#name-edit').count(), 0, '🔒 のときは「名前を直す」を出さない');
+  assert.equal(await p.locator('#f-name').count(), 0, '🔒 のときは入力欄を出さない');
+  assert.match(await p.textContent('.name-lock'), /NE に送った値/);
+  await shotName(p, '単品_🔒_NEに送った値');
+  // 🔒 = 保存を開いていない (セット)。入力欄を出さず、見出しの横に理由
+  delete process.env.MASTER_EDIT_OPEN;
+  try {
+    await p.goto(B + '/sku/set001');
+    assert.equal(await p.locator('#name-edit').count(), 0);
+    assert.equal(await p.locator('#f-name').count(), 0);
+    assert.match(await p.textContent('.name-lock'), /切替前|いまは保存できません/);
+    await shotName(p, 'セット_🔒_保存を開いていない');
+  } finally { process.env.MASTER_EDIT_OPEN = '1'; }
 });
 
 // 第 2 段の画面の幅: 1440 / 1280 / 1024 と 1280×720 の 150% で横にはみ出さない・板からはみ出さない・構成の表は横に送る囲いの中。

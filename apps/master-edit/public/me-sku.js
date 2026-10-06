@@ -311,6 +311,28 @@
     });
   }
 
+  /* ---------- 名前を見出しのところで直す (10/6) ---------- */
+  // 名前の欄は見出しの中の 1 つだけ (data-field="name")。✎ で見出しを入力欄に切り替える・変えた間は開いたまま・Esc で直す前に戻す
+  var nameBox = $('#name-box'), nameIn = $('#f-name'), nameBtn = $('#name-edit'), titleEl = $('#sku-title');
+  function openName(focus) {
+    if (!nameBox || !nameIn) return;
+    nameBox.hidden = false; if (titleEl) titleEl.hidden = true; if (nameBtn) { nameBtn.hidden = true; nameBtn.setAttribute('aria-expanded', 'true'); }
+    if (focus) { var ph = $('#sku-ph'); if (ph) ph.scrollIntoView({ behavior: 'smooth', block: 'start' }); nameIn.focus({ preventScroll: true }); nameIn.select(); }
+  }
+  function closeName() {
+    if (!nameBox) return;
+    if (nameIn && initial.has(nameIn) && nameIn.value !== initial.get(nameIn)) { ME.toast('変えた名前は、保存するか Esc で戻すまで開いたままです'); return; }   // 変えた間は閉じない (黄色の欄を見せたまま)
+    nameBox.hidden = true; if (titleEl) titleEl.hidden = false; if (nameBtn) { nameBtn.hidden = false; nameBtn.setAttribute('aria-expanded', 'false'); nameBtn.focus(); }
+  }
+  ME.openName = openName;
+  if (nameBtn) nameBtn.addEventListener('click', function () { openName(true); });
+  $$('[data-name-open]').forEach(function (b) { b.addEventListener('click', function () { openName(true); }); });
+  var nameClose = $('#name-close');
+  if (nameClose) nameClose.addEventListener('click', closeName);
+  if (nameIn) nameIn.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); if (initial.has(nameIn)) nameIn.value = initial.get(nameIn); update(); closeName(); }
+  });
+
   /* ---------- 元に戻す ---------- */
   function revert() {
     tracked().forEach(function (el) {
@@ -330,6 +352,7 @@
     if (costBox) { costBox.hidden = true; if (costOpen) costOpen.setAttribute('aria-expanded', 'false'); costDelta(); }
     $$('.f.err', scope).forEach(function (f) { f.classList.remove('err'); });
     update();
+    if (nameBox && !nameBox.hidden) closeName();
     ME.toast('変更を元に戻しました');
   }
   if (revertBtn) revertBtn.addEventListener('click', revert);
@@ -443,6 +466,7 @@
     var b = $('#reload'); if (b) b.addEventListener('click', function () { saved = true; update(); location.reload(); });
     // 断られた欄に印を付けてそこへ
     if (j.field) {
+      if (j.field === 'name') openName(false);
       var row = $('[data-row="' + j.field + '"]', scope);
       if (row) { row.classList.add('err'); var c = $('input, select, button', row); if (c) { row.scrollIntoView({ behavior: 'smooth', block: 'center' }); } }
     }
@@ -456,7 +480,7 @@
    */
   function lockAfterSave() {
     var main = form.firstElementChild;
-    [main, $('.handling-top'), $('#sku-sticky')].forEach(function (el) {
+    [main, $('.handling-top'), $('#sku-sticky'), $('#name-box')].forEach(function (el) {
       if (!el) return;
       el.setAttribute('inert', '');
       $$('input, select, textarea, button', el).forEach(function (x) { x.disabled = true; });
