@@ -316,21 +316,25 @@
   var nameBox = $('#name-box'), nameIn = $('#f-name'), nameBtn = $('#name-edit'), titleEl = $('#sku-title');
   function openName(focus) {
     if (!nameBox || !nameIn) return;
-    nameBox.hidden = false; if (titleEl) titleEl.hidden = true; if (nameBtn) { nameBtn.hidden = true; nameBtn.setAttribute('aria-expanded', 'true'); }
+    nameBox.hidden = false; if (titleEl) titleEl.classList.add('sr'); if (nameBtn) { nameBtn.hidden = true; nameBtn.setAttribute('aria-expanded', 'true'); }
     if (focus) { var ph = $('#sku-ph'); if (ph) ph.scrollIntoView({ behavior: 'smooth', block: 'start' }); nameIn.focus({ preventScroll: true }); nameIn.select(); }
   }
   function closeName() {
     if (!nameBox) return;
     if (nameIn && initial.has(nameIn) && nameIn.value !== initial.get(nameIn)) { ME.toast('変えた名前は、保存するか Esc で戻すまで開いたままです'); return; }   // 変えた間は閉じない (黄色の欄を見せたまま)
-    nameBox.hidden = true; if (titleEl) titleEl.hidden = false; if (nameBtn) { nameBtn.hidden = false; nameBtn.setAttribute('aria-expanded', 'false'); nameBtn.focus(); }
+    nameBox.hidden = true; if (titleEl) titleEl.classList.remove('sr'); if (nameBtn) { nameBtn.hidden = false; nameBtn.setAttribute('aria-expanded', 'false'); nameBtn.focus(); }
   }
   ME.openName = openName;
   if (nameBtn) nameBtn.addEventListener('click', function () { openName(true); });
   $$('[data-name-open]').forEach(function (b) { b.addEventListener('click', function () { openName(true); }); });
+  if (nameIn) nameIn.addEventListener('input', function () { nameIn.removeAttribute('aria-invalid'); nameIn.removeAttribute('aria-describedby'); });
   var nameClose = $('#name-close');
   if (nameClose) nameClose.addEventListener('click', closeName);
   if (nameIn) nameIn.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); if (initial.has(nameIn)) nameIn.value = initial.get(nameIn); update(); closeName(); }
+    if (e.key === 'Escape') {
+      if (e.isComposing || e.keyCode === 229) return;   // 日本語入力の変換中の Esc = 変換の取り消し (名前は戻さない・#1631 Codex R1 M1)
+      e.preventDefault(); e.stopPropagation(); if (initial.has(nameIn)) nameIn.value = initial.get(nameIn); update(); closeName();
+    }
   });
 
   /* ---------- 元に戻す ---------- */
@@ -453,7 +457,7 @@
   var REOPEN = ['version_conflict', 'request_id_reused', 'retry', 'processing', 'abandoned', 'reg_csv_issued', 'csv_issued', 'before_cutover', 'cancelled_sku'];
   function showError(j, status) {
     var r = $('#result');
-    var h = '<div class="result err" role="alert"><div class="rt">' + esc(j.error || ('HTTP ' + status)) + '</div>';
+    var h = '<div class="result err" role="alert" id="save-err"><div class="rt">' + esc(j.error || ('HTTP ' + status)) + '</div>';
     if (j.reason === 'before_cutover' && j.fields) h += '<div class="muted">切替前の項目: ' + esc(j.fields.join('・')) + '</div>';
     if (j.reason === 'set_underivable' && Array.isArray(j.blockers)) h += '<ul>' + li(j.blockers.map(esc)) + '</ul>';
     if (j.reason === 'version_conflict' && Array.isArray(j.events)) {
@@ -466,7 +470,10 @@
     var b = $('#reload'); if (b) b.addEventListener('click', function () { saved = true; update(); location.reload(); });
     // 断られた欄に印を付けてそこへ
     if (j.field) {
-      if (j.field === 'name') openName(false);
+      if (j.field === 'name' && nameIn) {
+        openName(true);   // 名前の欄を開いてそこへ (保存のボタンに残さない・#1631 Codex R1 L3)
+        nameIn.setAttribute('aria-invalid', 'true'); nameIn.setAttribute('aria-describedby', 'save-err');
+      }
       var row = $('[data-row="' + j.field + '"]', scope);
       if (row) { row.classList.add('err'); var c = $('input, select, button', row); if (c) { row.scrollIntoView({ behavior: 'smooth', block: 'center' }); } }
     }

@@ -1371,9 +1371,10 @@ await ta('[47] 名前を見出しのところで直す (10/6): 単品・セッ�
     await shotName(p, label + '_直せるとき_見出し');
     await p.click('#name-edit');
     assert.equal(await active(p), 'f-name', label + ': 押すと見出しの場所で入力欄');
-    assert.equal(await p.isVisible('#sku-title'), false);
+    assert.equal(await p.evaluate(() => document.getElementById('sku-title').classList.contains('sr')), true, label + ': 見出しは見た目だけ隠す');
+    assert.equal(await p.getByRole('heading', { level: 1 }).count(), 1, label + ': 編集中も h1 (商品名) が読み上げの見出しに残る (#1631 Codex R1 L2)');
     await p.keyboard.press('Escape');
-    assert.equal(await p.isVisible('#sku-title'), true, label + ': Esc で戻す');
+    assert.equal(await p.evaluate(() => document.getElementById('sku-title').classList.contains('sr')), false, label + ': Esc で戻す');
     assert.equal(await dirty(p), 0);
     await p.click('#name-edit');
     await p.fill('#f-name', next);
@@ -1404,6 +1405,37 @@ await ta('[47] 名前を見出しのところで直す (10/6): 単品・セッ�
     assert.match(await p.textContent('.name-lock'), /切替前|いまは保存できません/);
     await shotName(p, 'セット_🔒_保存を開いていない');
   } finally { process.env.MASTER_EDIT_OPEN = '1'; }
+});
+
+await ta('[48] 名前の欄 (#1631 Codex R1): 日本語入力の変換中の Esc は名前を戻さない・変換中の Ctrl+S は保存しない・空の名前で断られたら名前の欄へ (aria-invalid・誤りの文と結ぶ)・ふだんの Esc は戻す', async (p) => {
+  await p.goto(B + '/sku/k004');
+  const posts = [];
+  p.on('request', (rq) => { if (rq.method() === 'POST' && /\/api\/sku\//.test(rq.url())) posts.push(rq.url()); });
+  const before = await p.inputValue('#f-name');
+  await p.click('#name-edit');
+  await p.fill('#f-name', before + ' へんかんちゅう');
+  const key = (init) => p.evaluate((x) => document.getElementById('f-name').dispatchEvent(new KeyboardEvent('keydown', { ...x, bubbles: true, cancelable: true })), init);
+  await key({ key: 'Escape', isComposing: true });
+  assert.equal(await p.inputValue('#f-name'), before + ' へんかんちゅう', '変換中の Esc では名前を戻さない');
+  assert.equal(await p.isVisible('#name-box'), true);
+  await key({ key: 's', ctrlKey: true, isComposing: true });
+  await p.waitForTimeout(400);
+  assert.deepEqual(posts, [], '変換中の Ctrl+S は保存しない');
+  assert.equal(await dirty(p), 1);
+  // 空の名前 = サーバーが断る (名前が空です) → 名前の欄を開いてそこへ・誤りの文と結ぶ
+  await p.fill('#f-name', '');
+  await p.click('#save');
+  await p.waitForSelector('#save-err');
+  assert.equal(posts.length, 1);
+  assert.match(await p.textContent('#save-err'), /名前が空です/);
+  assert.equal(await active(p), 'f-name', '保存のボタンに残さず名前の欄へ');
+  assert.equal(await p.getAttribute('#f-name', 'aria-invalid'), 'true');
+  assert.equal(await p.getAttribute('#f-name', 'aria-describedby'), 'save-err');
+  // ふだんの Esc = 直す前に戻して閉じる
+  await p.keyboard.press('Escape');
+  assert.equal(await p.inputValue('#f-name'), before);
+  assert.equal(await p.isVisible('#name-box'), false);
+  assert.equal(await dirty(p), 0);
 });
 
 // 第 2 段の画面の幅: 1440 / 1280 / 1024 と 1280×720 の 150% で横にはみ出さない・板からはみ出さない・構成の表は横に送る囲いの中。
