@@ -890,11 +890,17 @@
 
     let result = null;
     let networkError = false;
+    // サーバが応答しないときでも「登録中…」のまま止めない。サーバは注文の引き直しに
+    // 1 件 最大 5 秒 (テレコは 2 件) かかるので、それより十分長く待ってから諦める。
+    // (AbortSignal.timeout は古い Safari に無いので、AbortController + setTimeout で作る)
+    const aborter = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = aborter ? setTimeout(() => aborter.abort(), 30000) : null;
     try {
-      result = await apiFetch('/submissions', { method: 'POST', body: payload });
+      result = await apiFetch('/submissions', { method: 'POST', body: payload, signal: aborter ? aborter.signal : undefined });
     } catch (e) {
       networkError = true;
     } finally {
+      if (timer) clearTimeout(timer);
       form.dataset.submitting = '';
       submitBtn.disabled = false;
       submitBtn.textContent = '登録する';
@@ -936,6 +942,15 @@
       goTo(0);
       showErrors(['登録するときにサーバが注文を引き直したところ、マスターに見つかりませんでした。'
         + 'もう一度「🔍 検索」を押して、やはり見つからなければ「📝 モールを手で選んで進む」でモールを選んでください。']);
+      return;
+    }
+    if (result.status === 502 && result.data?.error === 'lookup_failed') {
+      showErrors(['注文の検索に失敗しました。少し待ってから「登録する」をもう一度押してください (同じ内容なら二重には登録されません)。']);
+      return;
+    }
+    if (result.status >= 500) {
+      showErrors(['サーバで登録に失敗しました (' + (result.data?.error || result.status) + ')。'
+        + '少し待って「登録する」をもう一度押しても同じなら、画面の写真を撮って管理者に知らせてください。']);
       return;
     }
     showErrors(['登録エラー: ' + (result.data?.error || result.status)]);

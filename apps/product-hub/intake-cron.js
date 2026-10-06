@@ -40,7 +40,8 @@ export async function runProductHubIntake({ sync = syncNewProducts } = {}) {
     const job = await runLegacyJob('job:product-hub:intake-cron', () => sync({ actor: 'cron:ne-intake' }));
     if (!job.ran) {
       const gate = job.state;
-      const why = gate.readable ? `切替の段階 ${gate.phase}・新しい登録の列が全部 Company DB = 古い新商品の取込は閉じている` : `切替の段階か持ち主を読めない (${gate.error}) = 止める`;
+      // 広げる道 PR-6: 取込は NE の単品だけ = 単品の新しい登録の列 (skus.sku_kind を含む) が全部 C で閉じる (単品はポータルの「新商品の登録」へ)
+      const why = gate.readable ? `切替の段階 ${gate.phase}・単品の新しい登録の列が全部 Company DB = 古い新商品の取込は閉じている (単品は新商品の登録へ)` : `切替の段階か持ち主を読めない (${gate.error}) = 止める`;
       console.log(`[product-hub] intake skipped: ${why}`);
       ping(gate.readable ? 'ok' : 'fail', `skip: ${why}`.slice(0, 180));   // 読めない = 設定・つながりの誤り = 見張りを鳴らす
       return;

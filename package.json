@@ -9,6 +9,7 @@
     "dev": "node --watch server.js",
     "picking:standalone": "node apps/picking/standalone.js",
     "test:amazon-finance-read": "node scripts/test-amazon-finance-read.mjs && node scripts/test-amazon-finance-read-parity.mjs && node scripts/test-amazon-sku-asin-map.mjs",
+    "test:mis-shipment": "node apps/mis-shipment/test-sql.mjs && node apps/mis-shipment/test-submit.mjs",
     "test:amazon-pricing": "node apps/amazon-pricing/test-no-write-path.mjs && node apps/amazon-pricing/test-engine.mjs && node apps/amazon-pricing/test-db.mjs && node apps/amazon-pricing/test-views.mjs",
     "test:company-db-concurrency": "node scripts/test-company-db-concurrency.mjs",
     "test:amazon-finance-coverage": "node apps/warehouse/test-settlement-document-versions.js && node scripts/test-amazon-finance-coverage-run.mjs",

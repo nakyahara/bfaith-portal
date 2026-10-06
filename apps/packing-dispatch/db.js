@@ -241,6 +241,18 @@ export function ensureSchema() {
       ts TEXT, who TEXT, action TEXT, target TEXT, detail TEXT
     );
 
+    -- 未登録一覧から外した商品コード (2026-10-06 スタッフ要望「誤って登録した商品コードを一覧から削除したい」)。
+    -- 未登録一覧は mirror_products (NE 商品マスタ) から毎回計算するので行そのものは消せない。ここに入れたコードを
+    -- 一覧から除くだけ。NE の商品マスタ・配送ルール・取込の判定 (ルールが無ければ要判断) には一切影響しない。
+    -- product_code は SQLite の lower(trim(mirror_products.商品コード)) そのもの (一覧の除外条件と同じ式)。
+    -- normProductCode (NFKC) と混ぜると全角コードで一致しなくなるので使わない (Codex R1)。元に戻す = 行を DELETE。
+    CREATE TABLE IF NOT EXISTS pd_unregistered_hidden (
+      product_code TEXT PRIMARY KEY,
+      product_name TEXT,                        -- 外した時点の商品名 (NE 側で消えても何だったか分かるように)
+      hidden_by TEXT,
+      hidden_at TEXT NOT NULL
+    );
+
     -- ─────────────────────── 追跡番号 / NE反映 (PR 1) ───────────────────────
     -- pd_shipment_tracking: 1 受注 1 行 (NE 伝票番号 = ne_uketsuke_no が PK)。
     --   packing-dispatch 確定時に自動 UPSERT、キャリア CSV 取込 or 手動入力で追跡番号を紐付け、
@@ -710,19 +722,16 @@ export function purgeOldUsage() {
 
 // ───────────────────────── 未登録チェック(取扱中×非セット×②未登録) ─────────────────────────
 
-export function listUnregistered() {
-  const db = ensureSchema();
-  // NE 単品のみ対象。商品区分 ∈ {'単品','セット','例外'}。
-  //  - 'セット' は梱包機振り分けの対象外 (構成品で出荷)。
-  //  - '例外' は売上由来で NE 商品マスタに存在しないコード (楽天等の独自コード 0726-001377 / 10000064 など)。
-  //    NE 商品コードのみ登録したいので除外する。
-  // さらに 商品区分='単品' でも実体がセットのケース(biwakoalfa-2 等)を取りこぼさないよう、
-  // 「セット構成品数>0」と「セット構成品マスタに親として存在」も併せて除外する (3シグナル)。
-  // NOT EXISTS で NULL 罠回避。商品コードは比較前に lower(trim()) で正規化整合。
-  return db.prepare(`
-    SELECT mp.商品コード AS product_code, mp.商品名 AS product_name, mp.取扱区分 AS handling
-      FROM mirror_products mp
-     WHERE TRIM(mp.取扱区分) = '取扱中'
+// 未登録一覧に載る条件 (mp = mirror_products の別名)。一覧・削除の検証・「削除したもの」の状態表示で同じものを使う。
+// NE 単品のみ対象。商品区分 ∈ {'単品','セット','例外'}。
+//  - 'セット' は梱包機振り分けの対象外 (構成品で出荷)。
+//  - '例外' は売上由来で NE 商品マスタに存在しないコード (楽天等の独自コード 0726-001377 / 10000064 など)。
+//    NE 商品コードのみ登録したいので除外する。
+// さらに 商品区分='単品' でも実体がセットのケース(biwakoalfa-2 等)を取りこぼさないよう、
+// 「セット構成品数>0」と「セット構成品マスタに親として存在」も併せて除外する (3シグナル)。
+// NOT EXISTS で NULL 罠回避。商品コードは比較前に lower(trim()) で正規化整合。
+const UNREG_COND = `
+       TRIM(mp.取扱区分) = '取扱中'
        AND TRIM(mp.商品区分) = '単品'
        AND COALESCE(mp.セット構成品数, 0) = 0
        AND NOT EXISTS (
@@ -731,10 +740,102 @@ export function listUnregistered() {
        AND NOT EXISTS (
          SELECT 1 FROM pd_shipping_rule r
           WHERE r.product_code = lower(trim(mp.商品コード))
+       )`;
+
+export function listUnregistered() {
+  const db = ensureSchema();
+  // pd_unregistered_hidden の product_code は SQLite の lower(trim(mp.商品コード)) そのもので入れてある
+  // (hideUnregistered)。JS の normProductCode (NFKC) と混ぜると全角コードで一致しなくなる (Codex R1)。
+  return db.prepare(`
+    SELECT mp.商品コード AS product_code, mp.商品名 AS product_name, mp.取扱区分 AS handling
+      FROM mirror_products mp
+     WHERE ${UNREG_COND}
+       AND NOT EXISTS (
+         SELECT 1 FROM pd_unregistered_hidden h
+          WHERE h.product_code = lower(trim(mp.商品コード))
        )
      ORDER BY mp.商品コード
      LIMIT 2000
   `).all();
+}
+
+// 未登録一覧から外した商品コードの一覧 (「削除したもの」欄・元に戻す用)。新しく外したものから。
+// q があれば商品コード・商品名の部分一致で絞る。total = 絞った後の総件数 (rows は最大 HIDDEN_LIST_MAX 件)。
+// still_unregistered = いまも一覧の条件に当たるか (0 なら NE で取扱中止にした・ルールを登録した等で、戻しても一覧に出ない)。
+const HIDDEN_LIST_MAX = 500;
+export function listHiddenUnregistered(q = '') {
+  const db = ensureSchema();
+  const s = String(q || '').trim();
+  const where = s ? `WHERE (h.product_code LIKE ? ESCAPE '\\' OR COALESCE(nm.商品名, h.product_name, '') LIKE ? ESCAPE '\\')` : '';
+  // 保存キーは SQLite の lower() (全角は変えない) なので JS で小文字にしない。英字の大小は SQLite の LIKE が吸収する (Codex R2)
+  const pat = '%' + s.replace(/[\\%_]/g, '\\$&') + '%';
+  const like = s ? [pat, pat] : [];
+  // 商品名は NE ミラーの今の名前を優先 (同じ正規化キーの行が複数あっても 1 行にする)
+  const from = `
+      FROM pd_unregistered_hidden h
+      LEFT JOIN (SELECT lower(trim(商品コード)) AS k, MIN(商品名) AS 商品名 FROM mirror_products GROUP BY 1) nm
+        ON nm.k = h.product_code
+      ${where}`;
+  const total = db.prepare(`SELECT COUNT(*) n ${from}`).get(...like).n;
+  const rows = db.prepare(`
+    SELECT h.product_code, COALESCE(nm.商品名, h.product_name) AS product_name, h.hidden_by, h.hidden_at,
+           CASE WHEN EXISTS (SELECT 1 FROM mirror_products mp WHERE lower(trim(mp.商品コード)) = h.product_code AND ${UNREG_COND})
+                THEN 1 ELSE 0 END AS still_unregistered
+      ${from}
+     ORDER BY h.hidden_at DESC, h.product_code
+     LIMIT ${HIDDEN_LIST_MAX}
+  `).all(...like);
+  return { total, rows };
+}
+
+const HIDE_MAX = 2000;
+function vErr(message) { const e = new Error(message); e.code = 'VALIDATION'; return e; }
+function codesFromBody(codes) {
+  if (!Array.isArray(codes)) throw vErr('codes は配列で指定してください');
+  const out = [...new Set(codes.filter((c) => typeof c === 'string' && c.trim()))];
+  if (!out.length) throw vErr('商品コードが選ばれていません');
+  if (out.length > HIDE_MAX) throw vErr(`一度に扱えるのは ${HIDE_MAX} 件までです (${out.length} 件)`);
+  return out;
+}
+
+// 未登録一覧から外す。いま一覧に載る条件に当たるコードだけを外す (存在しない・ルール登録済み・セット等は skipped。
+// 先回りで外すと、後で本当に未登録になったときに最初から一覧に出なくなるため — Codex R1)。
+// 既に外してあるコードは何もしない (外した人・日時も上書きしない)。
+// 保存するキーは SQLite の lower(trim(商品コード)) = 一覧の除外条件とまったく同じ式。
+export function hideUnregistered(codes, who) {
+  const db = ensureSchema();
+  const list = codesFromBody(codes);
+  const now = utcIsoNow();
+  const find = db.prepare(`
+    SELECT lower(trim(mp.商品コード)) AS k, mp.商品名 AS name
+      FROM mirror_products mp
+     WHERE lower(trim(mp.商品コード)) = lower(trim(?)) AND ${UNREG_COND}
+     LIMIT 1`);
+  const ins = db.prepare(`INSERT OR IGNORE INTO pd_unregistered_hidden (product_code, product_name, hidden_by, hidden_at) VALUES (?,?,?,?)`);
+  const keys = new Set();
+  let hidden = 0, skipped = 0;
+  db.transaction(() => {
+    for (const c of list) {
+      const m = find.get(c);
+      if (!m) { skipped++; continue; }
+      if (keys.has(m.k)) continue;   // 表記ゆれで同じ商品が 2 回来た
+      keys.add(m.k);
+      hidden += ins.run(m.k, m.name ?? null, who || null, now).changes;
+    }
+  })();
+  audit('unregistered_hide', null, { codes: [...keys], hidden, skipped }, who);
+  return { requested: keys.size + skipped, hidden, already: keys.size - hidden, skipped };
+}
+
+// 外したコードを未登録一覧に戻す。codes は「削除したもの」の product_code (保存したキー) そのもの。
+export function unhideUnregistered(codes, who) {
+  const db = ensureSchema();
+  const list = codesFromBody(codes);
+  const del = db.prepare(`DELETE FROM pd_unregistered_hidden WHERE product_code = ?`);
+  let restored = 0;
+  db.transaction(() => { for (const c of list) restored += del.run(c).changes; })();
+  audit('unregistered_unhide', null, { codes: list, restored }, who);
+  return { requested: list.length, restored };
 }
 
 // 特定商品コードの判定材料を返す (なぜ未登録一覧に出る/出ないかの切り分け)
@@ -746,7 +847,9 @@ export function productDiag(code) {
   const inSetComp = !!db.prepare(`SELECT 1 FROM mirror_set_components WHERE lower(trim(セット商品コード))=? LIMIT 1`).get(c);
   const inShippingRule = !!db.prepare(`SELECT 1 FROM pd_shipping_rule WHERE product_code=? LIMIT 1`).get(c);
   const compCount = db.prepare(`SELECT COUNT(*) n FROM mirror_set_components WHERE lower(trim(セット商品コード))=?`).get(c).n;
-  return { query: code, normalized: c, mirror_products: mp, in_mirror_set_components: inSetComp, set_component_rows: compCount, in_shipping_rule: inShippingRule };
+  // 外したキーは SQLite の lower(trim()) (hideUnregistered)。全角などで normProductCode と違うことがあるので両方で引く
+  const hidden = db.prepare(`SELECT hidden_by, hidden_at FROM pd_unregistered_hidden WHERE product_code=lower(trim(?)) OR product_code=? LIMIT 1`).get(String(code ?? ''), c) || null;
+  return { query: code, normalized: c, mirror_products: mp, in_mirror_set_components: inSetComp, set_component_rows: compCount, in_shipping_rule: inShippingRule, hidden_from_unregistered: hidden };
 }
 
 // 特定商品コードがアソート学習に登録されているかの診断 (有効/無効・どのコード形式で入っているか・利用注文)。
