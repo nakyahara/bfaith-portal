@@ -9,7 +9,10 @@
  *   'company' = Company DB が正。夜間ロードは **既にある行を上書きしない** (新しく見つかった行にだけ最初の値を入れる)。
  *               空欄を埋める (coalesce) こともしない = わざと消した値が翌朝に戻らない (Codex R2)
  *
- * 🚨 ここは configured (コードに書いた「こうしたい」) だけ。これを変えてデプロイしても夜間ロード・写し・古い入口の門は変わらない
+ * 🚨 ここは configured = **次に prepare する予定** (コードに書いた「こうしたい」) だけ。持ち主の正は DB の epoch (active)。
+ *    このコードが company として扱えるキー (capable) と持ち主の読み方の版 (protocol) は config/master-capability.mjs (広げる道 PR-0)。
+ *    configured の company は capable の中だけ (試験 apps/company-db/test-master-capability.mjs・prepare も断る)。
+ *    これを変えてデプロイしても夜間ロード・写し・古い入口の門は変わらない
  *    (夜間ロード・写しは Company DB の epoch = ops.master_ownership_state の active を、古い入口の門は active ∪ prepared を見る。apps/company-db/load/ownership-state.mjs)。
  *    切替の日に人が readiness → prepare → frozen → 書きかけ 0 → 最後の active (全部 load) のロード (prepare をまたいだ古い書き込みの回収) → そのロードの run_id の report の成功 + 照合 ② →
  *    --use-prepared のロード → 写し・確かめ → activate で active にする (AI_reference 17 §4.2 の表が正・#1610)。
