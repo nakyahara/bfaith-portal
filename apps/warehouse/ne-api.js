@@ -199,7 +199,7 @@ async function fetchProductsRun(h) {
   //   取得中の印 (ne-fetch-counts.js) も同じ取引で書く = 最初の API の呼び出しの前に commit。完了の印と同じ取引で消す (途中で失敗したら残る)
   let inProgress;
   //   同じ種類の取得がまだ生きていれば beginNeFetch が throw = この取引ごと戻る (前の回の印は消えない)
-  const rev0 = db.transaction(() => { clearNeCompleteMarks('products'); inProgress = beginNeFetch(db, 'products', ts); return readNeRawRev('products'); })();
+  const rev0 = db.transaction(() => { clearNeCompleteMarks('products'); inProgress = beginNeFetch(db, 'products', startedAt); return readNeRawRev('products'); })();
   h.inProgress = inProgress;
 
   while (true) {
@@ -314,7 +314,7 @@ async function fetchSetProductsRun(h) {
   // 取得中の印 (ne-fetch-counts.js): 最初の API の呼び出しの前に独立した取引で commit する (API と通信している間は書き込みの鍵を持たないので、
   //   開く前のゲートはこの印で取得中を見分ける)。入れ替え・完了の印と同じ取引で消す (途中で失敗した・印を付けなかった回は残る)
   //   同じ種類の取得がまだ生きていれば beginNeFetch が throw (何も書かない)
-  const inProgress = db.transaction(() => beginNeFetch(db, 'setproducts', ts))();
+  const inProgress = db.transaction(() => beginNeFetch(db, 'setproducts', startedAt))();
   h.inProgress = inProgress;
   let offset = 0;
   const LIMIT = 1000;

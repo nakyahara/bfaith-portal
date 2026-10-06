@@ -216,13 +216,16 @@ const nowText = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
 export const NE_FETCH_STALE_MS = 6 * 60 * 60 * 1000;
 /** この process の中で今走っている取得の run_id (取得の関数の finally で外す) */
 const RUNNING = new Set();
+/** ミリ秒 → UTC の 'YYYY-MM-DD HH:MM:SS' (完了の印の時刻・取得中の印の started_at と同じ形) */
+const utcSecondText = (ms) => new Date(ms).toISOString().replace('T', ' ').slice(0, 19);
 /** 印の形 (beginNeFetch が書く形と同じでなければ壊れた印 = 回収する) */
 function markShapeOk(v, kind) {
   return !!v && typeof v === 'object' && !Array.isArray(v)
     && v.version === NE_FETCH_COUNTS_VERSION && (kind === undefined || v.kind === kind)
     && typeof v.run_id === 'string' && /^[0-9a-f-]{36}$/.test(v.run_id)
-    && typeof v.started_at === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v.started_at)
     && Number.isSafeInteger(v.started_ms) && v.started_ms > 0
+    // started_at は started_ms と同じ取得の始めの時刻 (UTC の 'YYYY-MM-DD HH:MM:SS' = started_ms の秒まで)。不正な日付・別の時刻 = 壊れた印 (Codex #1642 R3 Medium)
+    && typeof v.started_at === 'string' && v.started_at === utcSecondText(v.started_ms)
     && Number.isSafeInteger(v.pid) && v.pid > 0
     && typeof v.host === 'string' && v.host.length > 0;
 }
@@ -254,12 +257,15 @@ export function judgeNeFetchMark(raw, nowMs = Date.now(), { kind, isAlive = (pid
  * 取得中の印を書く (取得の始め・最初の API の呼び出しの前。呼び手の取引の中で = 呼び手が commit する)。返り値 = 書いた値 (消す時に渡す)。
  * 同じ種類の取得の印が既にあり、その取得が生きていれば **書かずに throw** (code = NE_FETCH_BUSY。同じ種類の取得は 1 本ずつ)。
  * 死んだ / 期限切れの印は上書きして回収する。
- * 中身 = { version, kind, run_id (この回の一意の ID), started_at (この回の時刻 = 完了の印に書く時刻), started_ms, pid, host }
+ * 中身 = { version, kind, run_id (この回の一意の ID), started_at (この回の時刻 = 完了の印に書く時刻・started_ms の秒まで), started_ms, pid, host }。
+ * startedAt = 取得の始めの時刻 (Date)。started_at と started_ms はこの 1 つの値から作る
  * @param {import('better-sqlite3').Database} db  取込の書き込みの接続
  */
 export function beginNeFetch(db, kind, startedAt) {
   const key = NE_FETCH_IN_PROGRESS_KEY[kind];
   if (!key) throw new Error(`beginNeFetch: 知らない種類 ${kind}`);
+  // 取得の始めの時刻 (Date) 1 つから started_at と started_ms を作る (Codex #1642 R3 Medium = 2 つが別の時刻にならない)
+  if (!(startedAt instanceof Date) || !Number.isFinite(startedAt.getTime())) throw new Error('beginNeFetch: startedAt は Date (取得の始めの時刻)');
   const cur = db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(key);
   if (cur) {
     const j = judgeNeFetchMark(cur.value, Date.now(), { kind });
@@ -269,7 +275,7 @@ export function beginNeFetch(db, kind, startedAt) {
       throw e;
     }
   }
-  const value = JSON.stringify({ version: NE_FETCH_COUNTS_VERSION, kind, run_id: crypto.randomUUID(), started_at: startedAt, started_ms: Date.now(), pid: process.pid, host: os.hostname() });
+  const value = JSON.stringify({ version: NE_FETCH_COUNTS_VERSION, kind, run_id: crypto.randomUUID(), started_at: utcSecondText(startedAt.getTime()), started_ms: startedAt.getTime(), pid: process.pid, host: os.hostname() });
   db.prepare('INSERT OR REPLACE INTO sync_meta (key, value, updated_at) VALUES (?, ?, ?)').run(key, value, nowText());
   RUNNING.add(JSON.parse(value).run_id);
   return value;

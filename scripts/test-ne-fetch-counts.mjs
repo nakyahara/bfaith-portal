@@ -384,8 +384,8 @@ await ta('[11] 取得中の印 (R12): API と通信している間ずっとあ�
     assert.equal(readInTx((rdb) => readNeFetchCounts(rdb)).ok, true);
   } finally { ne.onCall = null; }
   // 自分の印だけ消す: A が走っている間は B が印を書けない (上書きしない)・別の値では消えない・A の値で消える
-  const a = db().transaction(() => beginNeFetch(db(), 'setproducts', '2026-10-06 00:00:00'))();
-  assert.throws(() => db().transaction(() => beginNeFetch(db(), 'setproducts', '2026-10-06 00:00:00'))(), (e) => e.code === 'NE_FETCH_BUSY');
+  const a = db().transaction(() => beginNeFetch(db(), 'setproducts', new Date()))();
+  assert.throws(() => db().transaction(() => beginNeFetch(db(), 'setproducts', new Date()))(), (e) => e.code === 'NE_FETCH_BUSY');
   assert.equal(meta(NE_FETCH_IN_PROGRESS_KEY.setproducts), a);
   assert.equal(db().transaction(() => endNeFetch(db(), 'setproducts', a.replace('"kind"', '"kind" ')))(), 0);   // 自分の値と違う = 消さない
   assert.equal(db().transaction(() => endNeFetch(db(), 'setproducts', a))(), 1);
@@ -393,7 +393,14 @@ await ta('[11] 取得中の印 (R12): API と通信している間ずっとあ�
   assert.equal(meta(NE_FETCH_IN_PROGRESS_KEY.setproducts), null);
   // 読めない値も「取得中」とみなす
   assert.deepEqual(evalNeFetchCounts({ [NE_FETCH_IN_PROGRESS_KEY.products]: '{壊れ' }).products, { ok: false, reason: 'fetch_in_progress', in_progress: null });
-  assert.throws(() => beginNeFetch(db(), 'other', 'x'), /知らない種類/);
+  assert.throws(() => beginNeFetch(db(), 'other', new Date()), /知らない種類/);
+  assert.throws(() => beginNeFetch(db(), 'products', '2026-10-06 00:00:00'), /startedAt は Date/);   // 文字の時刻は受けない (2 つの時刻を 1 つの値から)
+  assert.throws(() => beginNeFetch(db(), 'products', new Date(NaN)), /startedAt は Date/);
+  // 書いた印の started_at と started_ms は同じ時刻 (秒まで)
+  const at = new Date('2026-10-06T01:02:03.456Z');
+  const w = JSON.parse(db().transaction(() => beginNeFetch(db(), 'products', at))());
+  assert.deepEqual([w.started_at, w.started_ms], ['2026-10-06 01:02:03', at.getTime()]);
+  db().prepare('DELETE FROM sync_meta WHERE key = ?').run(NE_FETCH_IN_PROGRESS_KEY.products);
 });
 
 await ta('[12] 空白だけのコードは今までどおり落とさずに書く (設計 v14 の分類の表の「空白だけ」とは違う = 今の動きを変えない)・式は合う', async () => {
@@ -464,7 +471,8 @@ await ta('[14] 同じ種類の取得は 1 本ずつ (Codex #1642 R1・R2): A の
   const notNode = process.platform === 'win32' ? spawn('cmd', ['/c', 'ping -n 120 127.0.0.1 >nul'], { stdio: 'ignore', windowsHide: true }) : null;
   try {
     await new Promise((r) => setTimeout(r, 1500));   // 子が始まってから印を書く (印の時刻 ≧ プロセスの開始)
-    const mark = (kind, extra) => JSON.stringify({ version: 'fc1', kind, run_id: crypto.randomUUID(), started_at: '2026-10-06 00:00:00', started_ms: Date.now(), pid: liveNode.pid, host: os.hostname(), ...extra });
+    const sec = (ms) => new Date(ms).toISOString().replace('T', ' ').slice(0, 19);
+    const mark = (kind, extra = {}) => { const ms = extra.started_ms ?? Date.now(); return JSON.stringify({ version: 'fc1', kind, run_id: crypto.randomUUID(), started_at: sec(ms), started_ms: ms, pid: liveNode.pid, host: os.hostname(), ...extra }); };
     // (b) 生きている node の新しい印 → 商品・セットとも断る。商品は前の回の完了の印も消さない (同じ取引で戻る)
     await nextSecond();
     ne.goods = [g('P1')];
@@ -496,10 +504,18 @@ await ta('[14] 同じ種類の取得は 1 本ずつ (Codex #1642 R1・R2): A の
     await reclaim('別の種類', mark('products'));
     await reclaim('run_id の形', mark('setproducts', { run_id: 'other-run' }));
     await reclaim('未来の時刻', mark('setproducts', { started_ms: Date.now() + 60 * 60 * 1000 }));
+    // started_at と started_ms が違う時刻 (started_ms は今 = 生きている node の判定は通ってしまう形) (Codex #1642 R3 Medium)
+    await reclaim('started_at が未来', mark('setproducts', { started_at: '2099-01-01 00:00:00' }));
+    await reclaim('started_at が過去', mark('setproducts', { started_at: '2020-01-01 00:00:00' }));
+    await reclaim('started_at が無い日付', mark('setproducts', { started_at: '2026-02-30 00:00:00' }));
+    await reclaim('started_at が 1 秒ずれ', mark('setproducts', { started_at: sec(Date.now() - 2000) }));
+    await reclaim('started_at の形 (ISO)', mark('setproducts', { started_at: new Date().toISOString() }));
     // (e) 判定そのもの: 別の host は期限まで生きている・この process の終わった回は死んでいる・今走っている回は生きている・生きているかの判定は差し替えられる
     const now = Date.now();
     const yes = () => true, no = () => false;
     assert.equal(judgeNeFetchMark(mark('products', { host: 'other-host' }), now, { isAlive: no }).alive, true);
+    assert.equal(judgeNeFetchMark(mark('products', { host: 'other-host', started_at: '2099-01-01 00:00:00' }), now, { isAlive: yes }).alive, false);   // 別の host でも壊れた印は回収
+    assert.equal(judgeNeFetchMark(mark('products', { started_ms: now, started_at: sec(now) }), now, { isAlive: yes }).alive, true);
     assert.equal(judgeNeFetchMark(mark('products', { host: 'other-host', started_ms: now - NE_FETCH_STALE_MS }), now, { isAlive: yes }).alive, false);
     assert.equal(judgeNeFetchMark('{壊れ', now, { isAlive: yes }).alive, false);
     assert.equal(judgeNeFetchMark(JSON.stringify({ run_id: crypto.randomUUID(), started_ms: now }), now, { isAlive: yes }).alive, false);   // 壊れた印 (欄の欠け) は「別の host」にもしない
@@ -510,7 +526,7 @@ await ta('[14] 同じ種類の取得は 1 本ずつ (Codex #1642 R1・R2): A の
     assert.equal(judgeNeFetchMark(mark('products'), now, { isAlive: no }).alive, false);
     assert.equal(judgeNeFetchMark(mark('products'), now).alive, true);   // 本物の判定: 生きている node・印より前から動いている
     db().prepare('DELETE FROM sync_meta WHERE key = ?').run(KP);   // (b) の生きている印を除く
-    const own = db().transaction(() => beginNeFetch(db(), 'products', '2026-10-06 00:00:00'))();
+    const own = db().transaction(() => beginNeFetch(db(), 'products', new Date()))();
     assert.equal(judgeNeFetchMark(own).alive, true);
     releaseNeFetch(own);
     assert.equal(judgeNeFetchMark(own).alive, false);   // 取得の関数を抜けた (失敗した) 回 = 死んでいる = 次の取得が回収できる
