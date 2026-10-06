@@ -812,6 +812,65 @@ await t('🆕 #1615 R1 M1: respond と send_rollback は別々 = 25P04 は段・
   assert.equal(CANCEL_UNCLASSIFIED.send_rollback, true);
   assert.equal(CANCEL_MAP.find((e) => e.source === 'client_disconnect').send_rollback, true);
 });
+console.log('🆕 #1615 Codex R2 Low: 疎な配列の穴 / object でない取り消しの入力');
+// 疎な配列 (穴 = hole) を作る。every / forEach は穴を飛ばすが、JSON にすると null になる
+const hasHole = (a) => { for (let i = 0; i < Math.min(a.length, 16); i++) if (!(i in a)) return true; return false; };
+const sparse = (len, at) => { const a = []; a.length = len; for (const [i, v] of Object.entries(at)) a[Number(i)] = v; return a; };
+await t('🆕 R2 Low 1: build503Body は疎な配列の穴も 1 つの要素として見る = 穴が 1 つでもあれば PROFIT_INTERNAL / APP_UNEXPECTED (月も値も出さない)', async () => {
+  const INTERNAL = { ok: false, code: 'PROFIT_INTERNAL', error: PROFIT_503_ERRORS.PROFIT_INTERNAL, reason: 'APP_UNEXPECTED' };
+  const holes = [
+    ['後ろに穴 (Codex R2 の例そのもの)', sparse(2, { 0: '2026-07' })],
+    ['前に穴', sparse(2, { 1: '2026-07' })],
+    ['間に穴', sparse(3, { 0: '2026-07', 2: '2026-08' })],
+    ['全部穴', sparse(3, {})],
+    ['length だけ大きい (2^32-1)', sparse(2 ** 32 - 1, { 0: '2026-07' })],
+  ];
+  for (const [name, fm] of holes) {
+    assert.ok(Array.isArray(fm) && hasHole(fm), `${name}: 試験の配列に穴がある`);
+    for (const reason of PROFIT_503_REASONS.PROFIT_PARTIAL_FAILED) {
+      const b = build503Body('PROFIT_PARTIAL_FAILED', reason, fm);
+      assert.deepEqual(b, INTERNAL, `${name} / ${reason}`);
+      assert.ok(!('failed_months' in b) && !JSON.stringify(b).includes('2026-07'), name);
+      assert.deepEqual(validate503Body(b).errors, [], name);
+      assert.deepEqual(validate503Body(JSON.parse(JSON.stringify(b))).errors, [], `${name}: JSON を通しても`);
+    }
+  }
+  // 直す前に作れた本文 (JSON で ["2026-07", null]) は validate503Body が拒む本文そのもの = 作る側と確かめる側をそろえた
+  assert.equal(validate503Body(PF(['2026-07', null])).ok, false);
+  // 穴の無い同じ月の配列は今までどおり通る (並べ替えと重複の除き)
+  assert.deepEqual(build503Body('PROFIT_PARTIAL_FAILED', 'MONTH_CALC_FAILED', ['2026-08', '2026-07', '2026-07']).failed_months, ['2026-07', '2026-08']);
+});
+await t('🆕 R2 Low 1: validate503Body も疎な配列の穴を飛ばさない (メモリの上の本文でも JSON を通した本文でも拒む)', async () => {
+  for (const [name, fm] of [['後ろに穴', sparse(2, { 0: '2026-07' })], ['前に穴', sparse(2, { 1: '2026-07' })], ['間に穴', sparse(3, { 0: '2026-07', 2: '2026-08' })],
+    ['1 つで穴', sparse(1, {})], ['14 個の疎な配列', sparse(14, { 0: '2026-07' })]]) {
+    const body = PF(fm);
+    const v = validate503Body(body);
+    assert.equal(v.ok, false, name);
+    if (fm.length <= MAX_MONTHS) assert.ok(v.errors.some((e) => /^\$\.failed_months\[\d+\]: 'YYYY-MM' の形でない/.test(e)), `${name}: ${v.errors.join(' / ')}`);
+    assert.equal(validate503Body(JSON.parse(JSON.stringify(body))).ok, false, `${name}: JSON を通しても`);
+    assert.equal(validate503Body(body, { from: '2026-07-01', to: '2026-08-31' }).ok, false, `${name}: 要求つきでも`);
+  }
+});
+await t('🆕 R2 Low 2: classifyCancellation は object でない入力 (null・undefined・配列・文字・数・関数) で例外を投げず「表に無い組」= 知らない印と同じ', async () => {
+  const unknownMark = classifyCancellation({ stage: 'month_body', sqlstate: '57014', mark: { source: 'timer', stage: 'month_body' } });
+  assert.equal(unknownMark, CANCEL_UNCLASSIFIED);
+  for (const x of [null, undefined, [], [{ stage: 'month_body', sqlstate: '57014' }], '57014', '', 0, 1, true, false, () => ({}), 10n, Symbol('x')]) {
+    const label = typeof x === 'symbol' ? 'symbol' : typeof x === 'bigint' ? `${x}n` : JSON.stringify(x) ?? String(x);
+    let r; assert.doesNotThrow(() => { r = classifyCancellation(x); }, label);
+    assert.equal(r, CANCEL_UNCLASSIFIED, label);   // 同じ参照 (凍結した 1 つの行)
+    assert.deepEqual(outcome(r), outcome(unknownMark), label);
+    assert.deepEqual([r.respond, r.send_rollback, r.code, r.reason], [true, true, 'PROFIT_INTERNAL', 'INTERNAL_UNCLASSIFIED_CANCEL'], label);
+    assert.deepEqual(validate503Body(build503Body(r.code, r.reason)).errors, [], label);
+  }
+  // 引数なしも同じ (既定の {} で「取り消しでない」の null にしない)
+  let r0; assert.doesNotThrow(() => { r0 = classifyCancellation(); });
+  assert.equal(r0, CANCEL_UNCLASSIFIED);
+  // object の入力は今までどおり (取り消しでない = null・表の行)
+  assert.equal(classifyCancellation({}), null);
+  assert.equal(classifyCancellation({ stage: 'month_body', sqlstate: 'D6L01', mark: null }), null);
+  assert.equal(classifyCancellation({ stage: 'month_body', sqlstate: '57014', mark: null }).log, 'external_cancel');
+});
+
 await t('文書 (docs/contracts) に v2 の項目: months の token・§4c の取り消しの表の全部のログの理由・§8 の版の履歴', async () => {
   const doc = fs.readFileSync(new URL('../docs/contracts/company_db_amazon_profit_response.contract.md', import.meta.url), 'utf8');
   const section = (h) => { const s = doc.indexOf(h); assert.ok(s >= 0, h); const e = doc.indexOf('\n## ', s + 1); return doc.slice(s, e < 0 ? undefined : e); };
@@ -828,6 +887,9 @@ await t('文書 (docs/contracts) に v2 の項目: months の token・§4c の�
   assert.ok(section('## 4. 503').includes('`reason` も **必須**'), '§4 の M2');
   for (const h of ['## 6.', '## 7.']) assert.ok(section(h).includes('ASCII の英字だけ'), `${h} の Low`);
   assert.ok(!/trim \+ 小文字・UTF-8/.test(doc), '「小文字」をただし書きなしで書かない');
+  // 🆕 #1615 Codex R2 Low: 疎な配列の穴 (§4) と object でない取り消しの入力 (§4c)
+  assert.ok(section('## 4. 503').includes('穴 (hole) も 1 つの要素'), '§4 の R2 Low 1');
+  assert.ok(s4c.includes('入力そのものが object でない'), '§4c の R2 Low 2');
 });
 
 console.log(`\n${ok} 件 PASS${ng ? ` / ${ng} 件 NG` : ''}`);

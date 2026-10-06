@@ -69,7 +69,7 @@
 | `PROFIT_INTERNAL` | 受け口の中の思わぬ失敗なので、どの値も返しません。 | `APP_UNEXPECTED` 🆕 `INTERNAL_EXTERNAL_CANCEL` `INTERNAL_UNCLASSIFIED_CANCEL` |
 
 - `PROFIT_ROUTE_DISABLED` の文は今の router (#1570) の文そのもの。版の「v3.1」は PR 6 で router と一緒に直す (この表も同じ PR で)
-- 🆕 **`failed_months`** (v2・設計 §5 の 0b-3 の (c) = 2026-10-04 中原さんが推しどおり) = `PROFIT_PARTIAL_FAILED` の本文 **だけ** に、止まった月を `"YYYY-MM"` の配列で (例 `{ ok: false, code: "PROFIT_PARTIAL_FAILED", error: "…", reason: "MONTH_CALC_FAILED", failed_months: ["2026-07"] }`)。**必須** (1 つ以上)・月の厳密な昇順 (重複なし)・`MAX_MONTHS` (13) まで・要求の触れる暦月の中。🚨 **値は入れない** = 要素は月の形の文字だけ (金額・行・SKU・例外の文・別の形の日付は違反)。ほかの code の本文に付いていれば違反。`build503Body(code, reason, failedMonths)` は並べ替えと重複の除きをし、月の形でない要素が 1 つでもある・空・13 を超えるときは値を出す道を作らないため `PROFIT_INTERNAL` / `APP_UNEXPECTED` にする。`validate503Body(body, { from, to })` は要求を渡せば暦月の中かも確かめる
+- 🆕 **`failed_months`** (v2・設計 §5 の 0b-3 の (c) = 2026-10-04 中原さんが推しどおり) = `PROFIT_PARTIAL_FAILED` の本文 **だけ** に、止まった月を `"YYYY-MM"` の配列で (例 `{ ok: false, code: "PROFIT_PARTIAL_FAILED", error: "…", reason: "MONTH_CALC_FAILED", failed_months: ["2026-07"] }`)。**必須** (1 つ以上)・月の厳密な昇順 (重複なし)・`MAX_MONTHS` (13) まで・要求の触れる暦月の中。🚨 **値は入れない** = 要素は月の形の文字だけ (金額・行・SKU・例外の文・別の形の日付は違反)。ほかの code の本文に付いていれば違反。`build503Body(code, reason, failedMonths)` は並べ替えと重複の除きをし、月の形でない要素が 1 つでもある・空・13 を超えるときは値を出す道を作らないため `PROFIT_INTERNAL` / `APP_UNEXPECTED` にする (🆕 #1615 Codex R2 Low: 疎な配列の **穴 (hole) も 1 つの要素** として見る = `['2026-07', <穴>]` は JSON で `["2026-07", null]` になるので `PROFIT_INTERNAL`。`build503Body` も `validate503Body` も添字で 0〜length-1 の全部の位置を見る)。`validate503Body(body, { from, to })` は要求を渡せば暦月の中かも確かめる
 - 🆕 `PROFIT_PARTIAL_FAILED` は `reason` も **必須** (#1615 Codex R1 M2・`REASON_REQUIRED_CODES`) = 3 つの reason (`MONTH_META_FAILED` / `MONTH_CALC_FAILED` / `MONTH_STATEMENT_TIMEOUT`) のどれかを必ず持つ。`build503Body` は reason が無い・列挙に無いときも `PROFIT_INTERNAL` / `APP_UNEXPECTED` に落とし (reason の無い `PROFIT_PARTIAL_FAILED` を作らない)、`validate503Body` は reason の無い本文を拒む。ほかの code の reason は今までどおり任意
 - `PROFIT_METRICS_UNAVAILABLE` の reason は metrics の client (PR 2 #1600 の `REASONS`) と同じ一覧。2 つの PR がそろったら試験が一致を確かめる
 
@@ -113,7 +113,7 @@
 - `cancellation_source` = `app_statement_budget` / `app_deadline` / `client_disconnect` / `unmarked`。**アプリが自分で決める** (PostgreSQL の文の文字に頼らない)。アプリの timer (server の `statement_timeout` より 500ms 短い)・関門の wall-clock の deadline・HTTP の切断のどれかが発火したら、`pg_cancel_backend` を送る **前に** 要求の状態に印 `cancel_mark = { source, stage }` を書く (最初の 1 つだけ・後から変えない)
 - **印があれば印の source** (経過時間を見ない・印に段があれば印の段で引く) / **印が無ければ `unmarked`**。印を書いた要求は文が先に終わっても (ほかの例外で終わっても) 結果を使わずに 503 (接続は捨てる)
 - `stage` = 要求の取引の段 `tx_setup` (2.) / `lock_statement` (3.) / `load_count` (4.) / `month_body` (5.) / `commit` (6.)
-- 見る順 (code / reason / 応答 / ログ) = ⓪ 知らない印 (source が一覧に無い・`unmarked` と書いた・中身が無い) = 表に無い組 ① 印 `client_disconnect` (応答を作らない) ② `25P04` (どの段でも) ③ 印あり (印の source と段) ④ 印なしの 57014 (`unmarked`) ⑤ どれにも当たらない = 表に無い組。ROLLBACK はこの順と別に決める (下の表の後の規則)。印が無く sqlstate が 57014 / 25P04 でなければ `null` = 取り消しでない (門の `D6*`・`55P03` は `HEAVY_GUARD_SQLSTATES` の対応 = 3a で固定)
+- 見る順 (code / reason / 応答 / ログ) = ⓪ 知らない印 (source が一覧に無い・`unmarked` と書いた・中身が無い) = 表に無い組 ① 印 `client_disconnect` (応答を作らない) ② `25P04` (どの段でも) ③ 印あり (印の source と段) ④ 印なしの 57014 (`unmarked`) ⑤ どれにも当たらない = 表に無い組。ROLLBACK はこの順と別に決める (下の表の後の規則)。印が無く sqlstate が 57014 / 25P04 でなければ `null` = 取り消しでない (門の `D6*`・`55P03` は `HEAVY_GUARD_SQLSTATES` の対応 = 3a で固定)。🆕 入力そのものが object でない (`null`・`undefined`・配列・文字・数) = 段も印も読めない = 知らない印と同じく **表に無い組** (`PROFIT_INTERNAL` / `INTERNAL_UNCLASSIFIED_CANCEL`・ROLLBACK は送る・例外を投げない・`null` にもしない = #1615 Codex R2 Low)
 
 | stage | sqlstate | cancellation_source | code / reason | 応答 | ROLLBACK | 本文の failed_months | ログの理由 |
 |---|---|---|---|---|---|---|---|
@@ -125,7 +125,7 @@
 | (どれでも) | `25P04` | (どれでも) | `PROFIT_RESOURCE` / `RESOURCE_TRANSACTION_TIMEOUT` | 503 | **送らない** (session が終わる = 接続を捨てる・🆕 印 `client_disconnect`・知らない印で別の行に当たっても = 下の規則) | - | `transaction_timeout` |
 | `load_count` | `57014` | `unmarked` | `PROFIT_INTERNAL` / `INTERNAL_EXTERNAL_CANCEL` | 503 | 送る | - | `external_cancel` (🚨 誰かが計算を止めたか、server の timeout が先) |
 | `month_body` | `57014` | `unmarked` | `PROFIT_INTERNAL` / `INTERNAL_EXTERNAL_CANCEL` | 503 | 送る | - | `external_cancel` |
-| **上の表に無い組** (例 = `tx_setup` や `lock_statement` の 57014・知らない段・知らない source の印) | | | `PROFIT_INTERNAL` / `INTERNAL_UNCLASSIFIED_CANCEL` | 503 (握りつぶして成功・部分の値にしない・rethrow もしない) | 送る (`25P04` なら送らない) | - | `unclassified_cancel` (3 つの組だけ・文と値は出さない) |
+| **上の表に無い組** (例 = `tx_setup` や `lock_statement` の 57014・知らない段・知らない source の印・🆕 object でない入力) | | | `PROFIT_INTERNAL` / `INTERNAL_UNCLASSIFIED_CANCEL` | 503 (握りつぶして成功・部分の値にしない・rethrow もしない) | 送る (`25P04` なら送らない) | - | `unclassified_cancel` (3 つの組だけ・文と値は出さない) |
 
 - 🆕 **respond と send_rollback は別々に決める** (#1615 Codex R1 M1): 応答 = 印 `client_disconnect` なら sqlstate に関係なく **作らない** / ROLLBACK = sqlstate が `NO_ROLLBACK_SQLSTATES` (`25P04`) なら、上の表のどの行 (表に無い組も) に当たっても・印の正しさに関係なく **送らない** (session が終わっている = 接続を捨てる)。例 = 印 `client_disconnect` × `25P04` → 応答なし・ROLLBACK なし / 知らない印 × `25P04` → `PROFIT_INTERNAL` / `INTERNAL_UNCLASSIFIED_CANCEL` の 503・ROLLBACK なし。`classifyCancellation` は当たった行の「送らない」版 (send_rollback だけ違う凍結した object・同じ入力には同じ参照) を返す。golden = `cancel-cases.json` の「表 4 × 表 6」「表 8 × 表 6」の行
 
@@ -363,3 +363,4 @@ null の規則 (nul):
 | `amazon_profit_response_v2` | D-60 PR 2c | `months[].finance_coverage_token`・日の行の `member_seller_skus`・57014 / 25P04 の分け方の reason (`CANCEL_MAP`)・`PROFIT_PARTIAL_FAILED` の `failed_months` |
 
 - 🆕 #1615 の Codex R1 の直し (`25P04` は表のどの行でも ROLLBACK を送らない・`PROFIT_PARTIAL_FAILED` の `reason` を必須に・「小文字」は ASCII の英字だけの保証) は **同じ PR 2c の中** = v2 のまま (版は上げない)。v2 はまだどこにも出していない (受け口は 503 のまま・マージ前) ので、v2 を読む側はまだ居ない
+- 🆕 #1615 の Codex R2 の Low 2 つの直し (`build503Body` / `validate503Body` が疎な配列の穴も 1 つの要素として見る・`classifyCancellation` が object でない入力で例外を投げず表に無い組にする) も **v2 のまま** = 契約が既に拒む本文を作れた・例外を投げた穴を埋めただけで、応答の形 (列・型・列挙) は変わらない。受け口は 503 のまま = v2 を読む側はまだ居ない
