@@ -640,7 +640,7 @@ await ta('[22] 画面の JS を動かす: ファイルの状態ごとのボタ�
   const before = calls.filter((c) => c[0] === 'api/csv/summary').length;
   clickable.find((e) => e.dataset.check === '9').onclick({ stopPropagation() {} });
   await settle();
-  assert.equal(el('msg').className, 'msg err');
+  assert.equal(el('msg').className, 'msgline err');   // 新しいデザイン (10/5) の知らせの行
   assert.match(el('msg').textContent, /使えなくしました/); assert.match(el('msg').textContent, /x1/);
   assert.equal(calls.filter((c) => c[0] === 'api/csv/summary').length, before + 1, '確かめで外れた後に一覧を読み直していない');
 });

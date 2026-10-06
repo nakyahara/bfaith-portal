@@ -1,224 +1,525 @@
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title><%= title %> | B-Faith Portal</title>
-  <link rel="icon" type="image/png" href="/favicon.png">
-  <link rel="stylesheet" href="/style.css">
-  <link rel="stylesheet" href="/mobile.css">
-  <style>
-    .md-wrap { max-width: 1280px; margin: 0 auto; padding: 12px 16px; }
-    .md-box { background: #f8f9fa; border-radius: 8px; padding: 12px 16px; margin-bottom: 14px; }
-    .md-box p.hint { font-size: 0.86em; color: #495057; margin: 0; line-height: 1.6; }
-    .md-cards { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
-    .md-card { background: #fff; border: 1px solid #dee2e6; border-radius: 6px; padding: 6px 10px; font-size: 0.85em; cursor: pointer; }
-    .md-card.on { border-color: #1971c2; box-shadow: 0 0 0 2px #d0ebff; }
-    .md-card b { font-size: 1.1em; }
-    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
-    .row select, .row input { padding: 5px 6px; font-size: 0.9em; }
-    table.md { width: 100%; border-collapse: collapse; font-size: 0.84em; background: #fff; }
-    table.md th, table.md td { border-bottom: 1px solid #dee2e6; padding: 5px 6px; text-align: left; vertical-align: top; }
-    table.md th { background: #f1f3f5; white-space: nowrap; position: sticky; top: 0; }
-    table.md tr.sel td { background: #e7f5ff; }
-    table.md td.v { max-width: 220px; word-break: break-all; }
-    .tbox { max-height: 62vh; overflow: auto; border: 1px solid #dee2e6; }
-    .st { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 0.85em; white-space: nowrap; }
-    .st.pending { background: #fff3bf; } .st.approved { background: #d3f9d8; } .st.rejected { background: #ffe3e3; } .st.done { background: #e9ecef; }
-    .bulk { position: sticky; bottom: 0; background: #fff; border-top: 2px solid #dee2e6; padding: 8px 0; }
-    .btn-sm { padding: 4px 12px; font-size: 0.88em; cursor: pointer; white-space: nowrap; }
-    .btn-sm:disabled { opacity: 0.35; cursor: default; }
-    .msg { font-size: 0.9em; margin: 6px 0; } .msg.err { color: #c92a2a; } .msg.ok { color: #2b8a3e; }
-    .detail { background: #fff; border: 1px solid #adb5bd; border-radius: 8px; padding: 10px 14px; margin: 10px 0; font-size: 0.86em; }
-    .detail pre { background: #f8f9fa; padding: 6px 8px; border-radius: 4px; max-height: 220px; overflow: auto; font-size: 0.9em; }
-    .muted { color: #868e96; }
-  </style>
+  <%- include('_head') %>
 </head>
 <body data-can-decide="<%= canDecide ? '1' : '0' %>" data-gate-message="<%= gateMessage %>">
-  <header class="portal-header">
-    <div class="header-left">
-      <h1>B-Faith Portal</h1>
-      <span class="page-title">⚖️ マスタの判断 (NE との差)</span>
-    </div>
-    <div class="header-right">
-      <span class="user-name"><%= displayName || username %></span>
-      <a href="/" class="btn-logout">ダッシュボード</a>
-    </div>
-  </header>
-
-  <div class="md-wrap">
-    <div class="md-box">
-      <p class="hint">
-        毎朝の照合で見つかった「NE と社内の商品マスタ (Company DB) の差」のうち、<b>人が決めること</b>の一覧です。
-        <b>差を残す</b> = 社内の値として持つ (翌朝から差として出さない) / <b>NE を直す</b> = 提案の値を NE に入れる予定にする (NE がその値になったら自動で「完了」) / <b>却下</b> = この案は採らない。
-        決めたことは全部記録に残り、取り消せます。<a href="manual">📖 つかいかた</a> ・ <a href="csv">📤 NE に取り込む CSV</a> (NE を直すと承認した差を NE の一括登録で入れる)
-      </p>
-      <p class="hint" id="latest">最新の照合: 読み込み中…</p>
-      <div class="md-cards" id="cards"></div>
+  <%- include('_header') %>
+  <%#
+    マスタの判断 (今日の差を決める)。毎日の流れ = ① 今朝の照合の差を見る → ② 1 件ずつ (行の右のボタン) かまとめて (四角で選ぶ → 下の帯) 決める → ③ NE を直すと決めた差を CSV にする → ④ NE に取り込んで申告。
+    上の流れの帯がいまの段と「次にやること」1 つを出す。判断の API・CSV の中身は変えない (画面の描き方と画面の JS だけ・10/5)
+  %>
+  <div class="page" id="md-page">
+    <div class="ph">
+      <div>
+        <h1>マスタの判断 <span class="muted" style="font-size:16px;font-weight:500">NE との差</span></h1>
+        <div class="meta" id="latest" aria-live="polite">最新の照合: 読み込み中…</div>
+      </div>
+      <div class="ph-actions">
+        <a class="btn" href="manual"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a>
+        <a class="btn soft" href="csv" id="go-csv"><svg class="ic" aria-hidden="true"><use href="#i-send"/></svg>NE に取り込む CSV</a>
+      </div>
     </div>
 
-    <div class="row">
-      <label>状態 <select id="f-status">
-        <option value="pending" selected>判断待ち</option><option value="approved">承認済み</option><option value="rejected">却下</option><option value="done">完了</option><option value="any">全部</option>
-      </select></label>
-      <label>理由 <select id="f-reason"><option value="">全部</option></select></label>
-      <label>分類 <select id="f-cls"><option value="">全部</option></select></label>
-      <label>範囲 <select id="f-view"><option value="current" selected>今朝の照合に出ている差</option><option value="all">前に出た差も</option></select></label>
-      <input id="f-q" placeholder="SKU で探す" size="14">
-      <button class="btn-sm" id="reload">表示</button>
-      <span class="muted" id="count"></span>
-    </div>
+    <% if (!canDecide) { %><div class="callout info" id="gate-top"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">見るだけです</div><div class="hint"><%= gateMessage %></div></div></div><% } %>
+    <div class="callout warn" id="stale" hidden><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t" id="stale-t"></div><div class="hint">朝の照合が止まった・まだ のときは、前の照合の差のままです。決めることはできます (新しい照合の後に開いた画面と違う回なら「画面を開いた後に新しい照合があった」で止まります)。</div></div></div>
 
-    <div class="tbox">
-      <table class="md">
-        <thead><tr><th><input type="checkbox" id="all"></th><th>SKU</th><th>項目</th><th>NE の値</th><th>社内の値</th><th>理由</th><th>提案</th><th>状態</th><th>見た回数</th><th>最後に見た</th></tr></thead>
-        <tbody id="rows"><tr><td colspan="10" class="muted">読み込み中…</td></tr></tbody>
+    <section class="panel hud flow" aria-labelledby="flow-h">
+      <h2 class="sr" id="flow-h">今日の流れ</h2>
+      <ol class="steps" id="flow">
+        <li class="step" id="st-1"><div class="dot">1</div><div class="t">今日の差を見る</div><div class="cnt-big num" id="st1-n">–</div><div class="s" id="st1-s">今朝の照合に出ている差</div></li>
+        <li class="step" id="st-2"><div class="dot">2</div><div class="t">決める</div><div class="cnt-big num" id="st2-n">–</div><div class="s" id="st2-s">判断待ち</div></li>
+        <li class="step" id="st-3"><div class="dot">3</div><div class="t">CSV を作る</div><div class="cnt-big num" id="st3-n">–</div><div class="s" id="st3-s">NE を直すと決めた差のうち CSV にできるもの</div></li>
+        <li class="step" id="st-4"><div class="dot">4</div><div class="t">NE に取り込んで申告</div><div class="cnt-big num" id="st4-n">–</div><div class="s" id="st4-s">まだ取り込み・申告していないファイル</div></li>
+      </ol>
+      <div class="nextline" id="next" role="status" aria-live="polite"><svg class="ic" aria-hidden="true"><use href="#i-arrow"/></svg><span class="grow" id="next-t">読み込み中…</span><span id="next-a"></span></div>
+    </section>
+
+    <section class="panel" aria-label="絞り込み">
+      <form id="f" class="bigsearch md-search" role="search" action="" onsubmit="return false">
+        <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+        <input id="q" autocomplete="off" aria-keyshortcuts="/" aria-label="SKU で絞る (商品コード・セットの子のコード)" placeholder="SKU で絞る (商品コード・セットの子のコード)">
+        <button class="btn soft sm go" type="submit" title="Enter でも絞れます">絞る</button>
+        <span class="kbd" aria-hidden="true">/</span>
+      </form>
+      <div class="filters">
+        <div class="chips" role="group" aria-label="状態" id="chips-status"><span class="chip-lab" aria-hidden="true">状態</span></div>
+        <div class="chips" role="group" aria-label="理由" id="chips-reason"><span class="chip-lab" aria-hidden="true">理由</span></div>
+        <details class="more filters-more" id="more">
+          <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>もっと絞る (分類・前に出た差)</summary>
+          <div class="row2">
+            <label for="f-cls">分類</label><select class="in" id="f-cls"><option value="">全部</option></select>
+            <label for="f-view">範囲</label><select class="in" id="f-view"><option value="current">今朝の照合に出ている差</option><option value="all">前に出た差も</option></select>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <%# 決めた結果・失敗の欄 (読み上げ: 結果は status・失敗は alert。空なら見せない = md.css .resbox:empty。#1626 Codex R1 L4) %>
+    <div id="res" class="resbox" role="status" aria-live="polite"></div>
+
+    <div class="tbl-top">
+      <span><b id="count">–</b> 件</span><span id="count-sub"></span>
+      <span class="right">
+        <% if (canDecide) { %><label class="hint" style="display:inline-flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" class="ckb" id="all"> 表示中を全部選ぶ</label><% } %>
+        <button class="btn ghost sm" type="button" id="reload"><svg class="ic s" aria-hidden="true"><use href="#i-history"/></svg>表示し直す</button>
+      </span>
+    </div>
+    <div class="tblwrap">
+      <table class="tbl click" id="list-tbl">
+        <caption class="sr">NE と社内の商品マスタの差の一覧。行を開くと 1 件ずつ決められます</caption>
+        <thead><tr>
+          <th class="ck" scope="col"><span class="sr">選ぶ</span></th><th scope="col">SKU・項目</th><th scope="col">NE の値 → 社内の値</th><th scope="col">理由</th><th scope="col">提案</th><th scope="col">状態</th><th class="acts" scope="col">決める</th>
+        </tr></thead>
+        <tbody id="rows"><tr class="loadrow"><td colspan="7">読み込み中…</td></tr></tbody>
       </table>
     </div>
-    <div class="msg" id="msg"></div>
-    <div id="detail"></div>
-
-    <div class="bulk" id="bulk">
-      <div class="row">
-        <span id="selcount">0 件を選択中</span>
-        <input id="note" placeholder="メモ (任意・500 字まで)" size="40">
-        <button class="btn-sm" data-act="accept_difference">差を残す</button>
-        <button class="btn-sm" data-act="fix_ne">NE を直す (提案の値で)</button>
-        <button class="btn-sm" data-act="rejected">却下</button>
-      </div>
-      <div class="msg err" id="gate"></div>
-    </div>
+    <div class="pager" id="pager"></div>
   </div>
 
+  <% if (canDecide) { %>
+  <div class="bulkbar" id="bulk" role="region" aria-label="選んだ差をまとめて決める" hidden>
+    <div class="bb-n"><b id="selcount" aria-live="polite">0 件を選択中</b><span class="hint" id="sel-break"></span></div>
+    <input class="in" id="note" maxlength="500" placeholder="メモ (任意・500 字まで)" aria-label="まとめて決めるときのメモ (任意・500 字まで)">
+    <button class="btn pri" type="button" data-act="fix_ne">NE を直す (提案の値で)</button>
+    <button class="btn" type="button" data-act="accept_difference">差を残す</button>
+    <button class="btn danger" type="button" data-act="rejected">却下</button>
+    <button class="btn ghost sm" type="button" id="sel-clear">選ぶのをやめる</button>
+  </div>
+  <% } %>
+
+  <div class="drawer-bg" id="dr-bg">
+    <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="dr-t">
+      <div class="dr-h"><h2 id="dr-t">1 件の差</h2><button class="iconbtn" type="button" id="dr-x" aria-label="閉じる (Esc)"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button></div>
+      <div id="detail"></div>
+    </aside>
+  </div>
+
+  <%- include('_footer') %>
 <script>
 (() => {
   const CAN = document.body.dataset.canDecide === '1';
   const GATE = document.body.dataset.gateMessage || '';
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const icon = (id, cls) => '<svg class="ic' + (cls ? ' ' + cls : '') + '" aria-hidden="true"><use href="#' + id + '"/></svg>';
   const REASON = { tax_fallback: '税率の補い', tax_unresolved: '税率が決まらない', exception_cost: '例外の原価', exception_tax_manual: '例外の税率', set_name_blank: 'セット名が空欄',
     set_price_from_goods: 'セット売価を商品表から', set_tax_from_components: 'セット税率を構成から', not_in_latest_fetch: '最新の取得に無い', 'load_rule:name_blank_to_code': '名前の空欄をコードで',
     manual: '手で入れた構成', parent_manual: '人が決めた代表 (親)', held_by_load: 'ロードが触らなかった', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', none: 'その他',
-    company_owned: '社内 (Company DB) の値が正', cdb_name_is_code: '社内の名前がコードのまま (仮の名前)',
+    company_owned: '社内の値が正 (ポータルで直した)', cdb_name_is_code: '社内の名前がコードのまま (仮の名前)',
     name_like_code: '名前がコードに見える (確かめる)', cdb_zero_yen: '社内が 0 円 (NE は 0 を表せない)' };
   const CLS = { rule: '決まりで説明済み', rule_lag: '決まり (反映待ち)', held_by_load: 'ロードが保持', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', incomparable: '比べられない (NE の値が不正)' };
   const COL = { name: '商品名', handling: '取扱区分', tax_rate: '税率', standard_price_jpy: '売価', cost: '原価', primary_supplier: '代表の仕入先', components: '構成', exists: '有無', kind: '種類', parent: '代表 (親)' };
   const RES = { accept_difference: '差を残す', fix_ne: 'NE を直す', fix_cdb: '社内の値を直す', fix_input: '材料を直す', spec: '仕様を決める' };
+  // 決め方を選んだときに出す「決めるとどうなるか」(つかいかたと同じ言葉)
+  const RES_WHAT = { accept_difference: '社内の値として持つ (NE は今のままでよい)。翌朝から、この差は承認済みの例外として出なくなります',
+    fix_ne: 'NE をこの値に直す予定にする。NE に値が入ると、次の朝の照合が自動で「完了」にします (CSV にできる項目は「NE に取り込む CSV」へ)',
+    fix_cdb: '社内の商品マスタ (Company DB) をこの値に直す予定にする。社内の値がその値になったら、次の朝の照合が自動で「完了」にします',
+    fix_input: '材料を直す と決めた記録を残す (自動では完了しません)', spec: '仕様を決める と決めた記録を残す (自動では完了しません)' };
+  const FIXSET = new Set(['fix_ne', 'fix_cdb']);
   const STATUS = { pending: '判断待ち', approved: '承認済み', rejected: '却下', done: '完了' };
+  const STATUS_TONE = { pending: 'warn', approved: 'info', rejected: 'mute', done: 'ok' };
   const SKIP = { not_found: '候補が無い', not_current: '今朝の照合に出ていない (差が消えた・変わった)', stale_view: '画面を開いた後に新しい照合があった (表示し直して)', decided_meanwhile: 'ほかの人が先に決めた (表示し直して)',
     resolution_not_allowed: 'この差には選べない決め方', needs_target: '直す値の提案が無い (1 件ずつ値を入れて決める)', invalid_target: '直す値の形が違う', nothing_to_revoke: '取り消す判断が無い', db_rejected: 'DB が受け付けなかった',
     name_is_code: '商品コードは名前ではない (NE に入れない・社内 (ポータル) で本当の名前を入れる)' };
+  // 直す値の入れ方 (列ごと。文字のまま送り、サーバーが列に合わせて読む)
+  const HINT = { name: '商品名', handling: '取扱中 / 取扱中止', tax_rate: '10 か 8', standard_price_jpy: '円 (整数)', cost: '円 (整数)', primary_supplier: '仕入先コード', components: '数量 か 無い', exists: 'あり / なし', kind: '単品 / セット', parent: '親のコード' };
+  const LIMIT = 500;
   const show = (v) => (v === null || v === undefined ? '<span class="muted">(空)</span>' : esc(typeof v === 'object' ? JSON.stringify(v) : v));
-  // 税率は NE の書き方 (消費税率 % = 10 / 8) で見せる。社内の値は Company DB の形も添える (10% (0.1))。NE に入れる値 (CSV) も 10 / 8
+  const YEN = new Set(['standard_price_jpy', 'cost']);
+  const HANDLING = { active: '取扱中', discontinued: '取扱中止' };   // 見せ方だけ (送る値・目標はそのまま)
+  // 税率は NE の書き方 (消費税率 % = 10 / 8) で見せる。社内の値は Company DB の形も添える (10% (0.1))。NE に入れる値 (CSV) も 10 / 8 (#1629)
   const pct = (v) => Math.round(v * 1000) / 10;
   const isRate = (col, v) => col === 'tax_rate' && typeof v === 'number' && Number.isFinite(v);
   const showNe = (col, v) => (isRate(col, v) ? esc(pct(v) + '%') : show(v));
   const showCdb = (col, v) => (isRate(col, v) ? esc(pct(v) + '% (' + v + ')') : show(v));
+  // 値の見せ方: 円は 3 桁ごと・税率は % (side = 'cdb' は社内の値 = 10% (0.1))。文字・(無い) などはそのまま
+  const val = (col, v, side) => {
+    if (v === null || v === undefined || v === '') return '<span class="dvv nil">(空)</span>';
+    if (col === 'handling' && Object.hasOwn(HANDLING, String(v))) return '<span class="dvv">' + esc(HANDLING[v]) + '</span>';
+    if (typeof v === 'number' && YEN.has(col)) return '<span class="dvv num">' + esc(v.toLocaleString('ja-JP')) + ' 円</span>';
+    if (isRate(col, v)) return '<span class="dvv num">' + (side === 'cdb' ? showCdb(col, v) : showNe(col, v)) + '</span>';
+    return '<span class="dvv">' + esc(typeof v === 'object' ? JSON.stringify(v) : v) + '</span>';
+  };
+  const colName = (c) => (COL[c.col] || c.col) + (c.child ? ' / ' + c.child : '');
   const proposalText = (c) => { const p = c.proposal || {};
-    if (p.op === 'set_ne_value') return 'NE を ' + (isRate(c.col, p.value) ? esc(String(pct(p.value))) + ' (%)' : show(p.value)) + ' に';
+    if (p.op === 'set_ne_value') return 'NE を <b>' + (isRate(c.col, p.value) ? '<span class="dvv num">' + esc(String(pct(p.value))) + ' (%)</span>' : val(c.col, p.value)) + '</b> に';
     if (p.op === 'check_name') return '名前がコードで良いか確かめる (良ければ差を残す)';
     if (p.op === 'decide_zero') return '社内の 0 円で良いか決める (良ければ差を残す・違えば社内を直す)';
     if (p.op === 'fill_cdb_name') return '社内 (ポータル) で本当の名前を入れる (NE も空)';
     if (p.op === 'decide_manual_priority') return '手の構成と NE のどちらを採るか'; if (p.op === 'fix_load_input') return '材料を直す'; if (p.op === 'decide_spec') return '仕様を決める'; return '決める'; };
-  let items = [], selected = new Set(), latest = null;
+  const canFixNe = (c) => (c.resolutions || []).includes('fix_ne') && c.col !== 'parent' && !!c.proposal && c.proposal.op === 'set_ne_value' && c.proposal.value !== null && c.proposal.value !== undefined;
+  const canKeep = (c) => (c.resolutions || []).includes('accept_difference');
+  const who = (email) => String(email || '').split('@')[0];
+  // 日時 (DB の文字) → 日本時間の「10/5 08:12」。読めないときは元の文字の頭
+  const toDate = (s) => { if (!s) return null; const d = new Date(String(s).replace(' ', 'T').replace(/([+-]\d\d)$/, '$1:00')); return isNaN(d) ? null : d; };
+  const fmtAt = (s, withTime = true) => { const d = toDate(s); if (!d) return String(s || '').slice(0, withTime ? 16 : 10);
+    return new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', ...(withTime ? { hour: '2-digit', minute: '2-digit' } : {}) }).format(d); };
+  const jstDay = (d) => new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Tokyo' }).format(d);
+
+  // 絞り込み (URL に残す = 読み直し・戻るで同じ一覧)
+  const F = { status: 'pending', reason: '', cls: '', view: 'current', q: '', offset: 0 };
+  (() => { const u = new URLSearchParams(location.search);
+    if (['pending', 'approved', 'rejected', 'done', 'any'].includes(u.get('status'))) F.status = u.get('status');
+    if (u.get('view') === 'all') F.view = 'all';
+    F.reason = u.get('reason') || ''; F.cls = u.get('cls') || ''; F.q = u.get('q') || ''; F.offset = Math.max(0, Number(u.get('offset')) || 0); })();
+  function writeUrl() {
+    const p = new URLSearchParams();
+    if (F.status !== 'pending') p.set('status', F.status);
+    if (F.view !== 'current') p.set('view', F.view);
+    for (const k of ['reason', 'cls', 'q']) if (F[k]) p.set(k, F[k]);
+    if (F.offset) p.set('offset', String(F.offset));
+    try { history.replaceState(history.state, '', location.pathname + (p.toString() ? '?' + p : '')); } catch (e) { /* そのまま */ }
+  }
+
+  let S = null, CSVS = null, items = [], total = 0, picked = new Set(), openFp = null, openC = null, drawerFrom = null, lastApplied = [], busy = false;
 
   async function getJson(url) { const r = await fetch(url, { headers: { Accept: 'application/json' } }); const j = await r.json().catch(() => ({})); if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }
   async function postJson(url, body) {
     const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({})); if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j;
   }
-  function setMsg(text, cls) { const m = $('msg'); m.className = 'msg ' + (cls || ''); m.textContent = text || ''; }
+  const ME = window.MasterEdit = window.MasterEdit || {};
+  const toast = (t) => { if (ME.toast) ME.toast(t); };
+  /** 結果の箱 (一覧の上)。tone = ok / warn / err。html はエスケープ済み */
+  function showRes(tone, title, html) {
+    const box = $('res');
+    if (!title) { box.innerHTML = ''; box.setAttribute('role', 'status'); return; }
+    box.setAttribute('role', tone === 'err' ? 'alert' : 'status');
+    box.innerHTML = '<div class="callout ' + (tone === 'ok' ? 'info' : tone) + '">' + icon(tone === 'ok' ? 'i-check' : tone === 'warn' ? 'i-warn' : 'i-x') + '<div class="grow"><div class="t">' + esc(title) + '</div>' + (html || '') + '</div>'
+      + (lastApplied.length && CAN ? '<button class="btn sm" type="button" id="undo">' + icon('i-undo', 's') + '元に戻す (取り消す)</button>' : '') + '<button class="iconbtn" type="button" id="res-x" aria-label="この知らせを閉じる">' + icon('i-x', 's') + '</button></div>';
+    if ($('undo')) $('undo').onclick = undo;
+    $('res-x').onclick = () => { lastApplied = []; showRes(null); };
+  }
 
+  // ─────────── 上の件数・流れ ───────────
   async function loadSummary() {
-    const s = await getJson('api/summary');
-    latest = s.latest;
-    $('latest').textContent = s.latest ? ('最新の照合: ' + s.latest.observed_at.slice(0, 16) + ' (今朝の照合に出ている差 ' + s.current + ' 件・判断待ち ' + s.total.pending + ' / 承認済み ' + s.total.approved + ' / 却下 ' + s.total.rejected + ')') : '最新の照合: まだ候補がありません (朝の照合が判定できると入ります)';
-    const cards = $('cards'); cards.innerHTML = '';
-    const sel = $('f-reason'); const keep = sel.value; sel.innerHTML = '<option value="">全部</option>';
-    for (const [k, v] of Object.entries(s.by_reason).sort((a, b) => b[1].pending - a[1].pending)) {
-      const d = document.createElement('div'); d.className = 'md-card' + (keep === k ? ' on' : ''); d.dataset.reason = k;
-      d.innerHTML = esc(REASON[k] || k) + ' <b>' + v.pending + '</b> <span class="muted">判断待ち / 承認 ' + v.approved + ' / 却下 ' + v.rejected + '</span>';
-      d.onclick = () => { $('f-reason').value = k; load(); };
-      cards.appendChild(d);
-      sel.insertAdjacentHTML('beforeend', '<option value="' + esc(k) + '">' + esc(REASON[k] || k) + '</option>');
-    }
-    sel.value = keep;
-    const cs = $('f-cls'); if (cs.options.length === 1) for (const [k, v] of Object.entries(CLS)) cs.insertAdjacentHTML('beforeend', '<option value="' + esc(k) + '">' + esc(v) + '</option>');
-    $('gate').textContent = CAN ? '' : GATE;
-    for (const b of document.querySelectorAll('#bulk button')) b.disabled = !CAN;
+    S = await getJson('api/summary');
+    const L = S.latest;
+    $('latest').innerHTML = L ? '最新の照合 <b class="num">' + esc(fmtAt(L.observed_at)) + '</b><span class="dotsep"></span>今朝の照合に出ている差 <b class="num">' + S.current + '</b> 件'
+      : 'まだ照合の候補がありません (朝の照合が判定できると入ります)';
+    const d = L && toDate(L.observed_at);
+    const stale = d && jstDay(d) !== jstDay(new Date());
+    $('stale').hidden = !stale;
+    if (stale) $('stale-t').textContent = '今日の照合がまだありません (最後の照合は ' + fmtAt(L.observed_at) + ')';
+    const rn = $('rail-n-decide'); if (rn) { rn.hidden = !S.total.pending; rn.textContent = String(S.total.pending); rn.setAttribute('aria-label', '判断待ち ' + S.total.pending + ' 件'); }
+    renderChips(); renderFlow();
   }
-  async function load() {
-    setMsg('');
-    const qs = new URLSearchParams({ status: $('f-status').value, view: $('f-view').value, reason: $('f-reason').value, cls: $('f-cls').value, q: $('f-q').value.trim(), limit: '500' });
-    const r = await getJson('api/candidates?' + qs);
-    items = r.items; selected = new Set();
-    $('count').textContent = r.total + ' 件' + (r.total > r.items.length ? ' (先頭 ' + r.items.length + ' 件を表示)' : '');
-    const tb = $('rows');
-    tb.innerHTML = items.length ? '' : '<tr><td colspan="10" class="muted">該当なし</td></tr>';
-    items.forEach((c, i) => {
-      const tr = document.createElement('tr'); tr.dataset.i = i;
-      tr.innerHTML = '<td><input type="checkbox" data-i="' + i + '"></td><td>' + esc(c.code_norm) + '</td><td>' + esc(COL[c.col] || c.col) + (c.child ? ' / ' + esc(c.child) : '') + '</td>'
-        + '<td class="v">' + showNe(c.col, c.n) + '</td><td class="v">' + showCdb(c.col, c.c) + '</td><td>' + esc(REASON[c.reason_kind] || c.reason_kind) + '<div class="muted">' + esc(CLS[c.cls] || c.cls) + '</div></td>'
-        + '<td class="v">' + proposalText(c) + '</td><td><span class="st ' + c.status + '">' + esc(STATUS[c.status]) + (c.decision && c.status === 'approved' ? ' (' + esc(RES[c.decision.resolution] || c.decision.resolution) + ')' : '') + (c.reoccurred ? ' 再発' : '') + '</span></td>'
-        + '<td>' + c.seen_count + '</td><td>' + esc((c.last_seen_at || '').slice(0, 10)) + '</td>';
-      tr.onclick = (e) => { if (e.target.tagName !== 'INPUT') openDetail(c.fingerprint).catch((x) => setMsg(x.message, 'err')); };
-      tb.appendChild(tr);
-    });
-    for (const cb of tb.querySelectorAll('input[type=checkbox]')) cb.onchange = () => { const i = Number(cb.dataset.i); if (cb.checked) selected.add(i); else selected.delete(i); cb.closest('tr').classList.toggle('sel', cb.checked); $('selcount').textContent = selected.size + ' 件を選択中'; };
-    $('all').checked = false; $('selcount').textContent = '0 件を選択中';
+  async function loadCsv() {
+    try { CSVS = await getJson('api/csv/summary'); } catch (e) { CSVS = null; }
+    renderFlow();
   }
-  const itemOf = (c, extra) => ({ fingerprint: c.fingerprint, shown_last_seen_run: c.last_seen_run, shown_event_id: c.decision ? c.decision.event_id : null, ...(extra || {}) });
-  function report(r) {
-    const skipped = r.skipped.map((s) => s.fingerprint.slice(0, 8) + ': ' + (SKIP[s.reason] || s.reason) + (s.message ? ' (' + s.message + ')' : ''));
-    setMsg('決めた ' + r.applied.length + ' 件' + (skipped.length ? ' / 飛ばした ' + skipped.length + ' 件: ' + skipped.join(' / ') : ''), skipped.length ? 'err' : 'ok');
-  }
-  async function decide(kind, resolution, list, extra) {
-    if (!list.length) return setMsg('選んでください', 'err');
-    try {
-      const r = await postJson('api/decisions', { kind, resolution: resolution || null, note: $('note').value.trim() || null, items: list.map((c) => itemOf(c, extra)) });
-      report(r); await loadSummary(); const keep = $('msg').textContent; const cls = $('msg').className; await load(); $('msg').textContent = keep; $('msg').className = cls;
-      if (openFp) await openDetail(openFp);   // 詳細は読み直す (古い判断のまま続けて決めると「先に決めた」になる。Codex #1481 R1 Low)
-    } catch (e) { setMsg('決められませんでした: ' + e.message, 'err'); }
-  }
-  for (const b of document.querySelectorAll('#bulk button')) b.onclick = () => {
-    const list = [...selected].map((i) => items[i]);
-    const act = b.dataset.act;
-    if (act === 'rejected') return decide('rejected', null, list);
-    return decide('approved', act, list);
+  const csvCounts = () => {
+    if (!CSVS || !CSVS.applied) return { make: null, open: null };
+    return { make: CSVS.csv_items.filter((x) => !x.export_id).length, open: CSVS.exports.filter((e) => e.state === 'made' || e.state === 'checked').length };
   };
-  $('all').onchange = () => { for (const cb of document.querySelectorAll('#rows input[type=checkbox]')) { cb.checked = $('all').checked; cb.onchange(); } };
-  $('reload').onclick = () => loadSummary().then(load).catch((e) => setMsg(e.message, 'err'));   // 上の最新の照合・件数も読み直す (Codex #1481 R2 Low)
-  for (const id of ['f-status', 'f-reason', 'f-cls', 'f-view']) $(id).onchange = () => { for (const d of document.querySelectorAll('.md-card')) d.classList.toggle('on', d.dataset.reason === $('f-reason').value); load().catch((e) => setMsg(e.message, 'err')); };
+  function renderFlow() {
+    if (!S) return;
+    const cc = csvCounts();
+    const rc = $('rail-n-csv'); if (rc) { const n = (cc.make || 0) + (cc.open || 0); rc.hidden = !n; rc.textContent = String(n); rc.setAttribute('aria-label', 'CSV でやること ' + n + ' 件'); }
+    const steps = [
+      { n: S.latest ? S.current : null, s: S.latest ? '照合 ' + fmtAt(S.latest.observed_at) + ' に出ている差' : 'まだ照合の候補がありません', todo: false, known: !!S.latest },
+      { n: S.total.pending, s: '判断待ち (承認済み ' + S.total.approved + '・却下 ' + S.total.rejected + '・完了 ' + S.total.done + ')', todo: S.total.pending > 0, known: true },
+      { n: cc.make, s: cc.make === null ? 'CSV の記録の表がまだ無い' : 'NE を直すと決めた差のうち CSV にできるもの', todo: cc.make > 0, known: cc.make !== null },
+      { n: cc.open, s: cc.open === null ? '—' : 'まだ取り込み・申告していないファイル', todo: cc.open > 0, known: cc.open !== null },
+    ];
+    let cur = -1;
+    steps.forEach((st, i) => { if (cur < 0 && i > 0 && st.todo) cur = i; });
+    steps.forEach((st, i) => {
+      const li = $('st-' + (i + 1));
+      li.className = 'step' + (i === cur ? ' cur' : st.todo ? ' warn' : st.known ? ' done' : '');
+      $('st' + (i + 1) + '-n').textContent = st.n === null ? '—' : String(st.n);
+      $('st' + (i + 1) + '-s').textContent = st.s;
+      li.querySelector('.dot').innerHTML = i !== cur && !st.todo && st.known ? icon('i-check', 's') : String(i + 1);
+      if (i === cur) li.setAttribute('aria-current', 'step'); else li.removeAttribute('aria-current');
+    });
+    const nx = $('next'), nt = $('next-t'), na = $('next-a');
+    let tone = '', text = '', act = '';
+    if (!S.latest) { text = 'まだ照合の候補がありません。朝の照合が判定できると、ここに差が並びます'; }
+    else if (cur === 1) {
+      text = '<b>判断待ちが ' + S.total.pending + ' 件</b>あります。行の右のボタンで 1 件ずつ、または四角で選んでまとめて決めてください' + (CAN ? '' : ' (決めるのは名簿の人だけ)');
+      act = F.status === 'pending' && !F.reason && !F.q && !F.cls && F.view === 'current' ? '<button class="btn soft sm" type="button" id="next-go">最初の行へ ' + icon('i-arrow', 's') + '</button>' : '<button class="btn soft sm" type="button" id="next-go">判断待ちを全部見る ' + icon('i-arrow', 's') + '</button>';
+    } else if (cur === 2) { text = '<b>CSV にできる承認が ' + cc.make + ' 件</b>あります。NE に取り込む CSV を作ってください'; act = '<a class="btn pri sm" href="csv">CSV を作る画面へ ' + icon('i-arrow', 's') + '</a>'; }
+    else if (cur === 3) { text = '<b>まだ取り込み・申告していないファイルが ' + cc.open + ' 個</b>あります。取り込む日に確かめて、NE に取り込んで申告してください'; act = '<a class="btn pri sm" href="csv">CSV の画面へ ' + icon('i-arrow', 's') + '</a>'; }
+    else { tone = 'ok'; text = '<b>今日やることは全部済んでいます。</b>判断待ちの差・CSV にできる承認・申告がまだのファイルはありません'; }
+    nx.className = 'nextline' + (tone ? ' ' + tone : '');
+    nx.querySelector('.ic use').setAttribute('href', tone === 'ok' ? '#i-check' : '#i-arrow');
+    nt.innerHTML = text; na.innerHTML = act;
+    const g = $('next-go');
+    if (g) g.onclick = () => {
+      if (F.status === 'pending' && !F.reason && !F.q && !F.cls && F.view === 'current') { const a = document.querySelector('#rows a.rowlink'); if (a) a.focus(); return; }
+      Object.assign(F, { status: 'pending', reason: '', cls: '', view: 'current', q: '', offset: 0 }); $('q').value = ''; $('f-view').value = 'current'; $('f-cls').value = '';
+      refresh().then(() => { const a = document.querySelector('#rows a.rowlink'); if (a) a.focus(); });
+    };
+  }
 
-  // 直す値の入れ方 (列ごと。文字のまま送り、サーバーが列に合わせて読む)
-  const HINT = { name: '商品名', handling: '取扱中 / 取扱中止', tax_rate: '10 か 8', standard_price_jpy: '円 (整数)', cost: '円 (整数)', primary_supplier: '仕入先コード', components: '数量 か 無い', exists: 'あり / なし', kind: '単品 / セット', parent: '親のコード' };
-  let openFp = null;
-  async function openDetail(fp) {
+  // ─────────── 札 (状態・理由) ───────────
+  function chip(attr, value, label, n, tone, on) {
+    const zero = n === 0 && !on;
+    const num = n === null || n === undefined ? '' : ' <span class="n">' + Number(n).toLocaleString('ja-JP') + '</span>';
+    return '<button type="button" class="chip' + (on ? ' on' : '') + (tone ? ' t-' + tone : '') + (zero ? ' zero' : '') + '" data-' + attr + '="' + esc(value) + '" aria-pressed="' + (on ? 'true' : 'false') + '"'
+      + (zero ? ' disabled aria-label="' + esc(label) + ' いま 0 件"' : '') + '>' + esc(label) + num + '</button>';
+  }
+  function renderChips() {
+    const cnt = F.view === 'current';   // 件数は今朝の照合に出ている差だけ (前に出た差の件数は数えない)
+    const T = S.total;
+    const sts = [['pending', '判断待ち', 'warn'], ['approved', '承認済み', ''], ['rejected', '却下', ''], ['done', '完了', 'ok'], ['any', '全部', '']];
+    $('chips-status').innerHTML = '<span class="chip-lab" aria-hidden="true">状態</span>' + sts.map(([k, l, t]) => chip('status', k, l, cnt ? (k === 'any' ? T.pending + T.approved + T.rejected + T.done : T[k]) : null, t, F.status === k)).join('');
+    const nOf = (v) => (F.status === 'any' ? v.pending + v.approved + v.rejected + v.done : v[F.status]);
+    const rs = Object.entries(S.by_reason).sort((a, b) => b[1].pending - a[1].pending || nOf(b[1]) - nOf(a[1]));
+    if (F.reason && !S.by_reason[F.reason]) rs.push([F.reason, null]);
+    $('chips-reason').innerHTML = '<span class="chip-lab" aria-hidden="true">理由</span>' + chip('reason', '', '全部', null, '', !F.reason)
+      + rs.map(([k, v]) => chip('reason', k, REASON[k] || k, cnt && v ? nOf(v) : null, F.status === 'pending' ? 'warn' : '', F.reason === k)).join('');
+    const cs = $('f-cls');
+    if (cs.options.length === 1) for (const [k, v] of Object.entries(CLS)) cs.insertAdjacentHTML('beforeend', '<option value="' + esc(k) + '">' + esc(v) + '</option>');
+    cs.value = F.cls; $('f-view').value = F.view;
+    if (F.cls || F.view === 'all') $('more').open = true;
+  }
+  $('chips-status').addEventListener('click', (e) => { const b = e.target.closest('[data-status]'); if (!b || b.disabled) return; F.status = b.dataset.status; F.offset = 0; renderChips(); load().catch(fail); });
+  $('chips-reason').addEventListener('click', (e) => { const b = e.target.closest('[data-reason]'); if (!b || b.disabled) return; F.reason = b.dataset.reason; F.offset = 0; renderChips(); load().catch(fail); });
+  $('f-cls').onchange = () => { F.cls = $('f-cls').value; F.offset = 0; load().catch(fail); };
+  $('f-view').onchange = () => { F.view = $('f-view').value; F.offset = 0; renderChips(); load().catch(fail); };
+  $('f').addEventListener('submit', (e) => { e.preventDefault(); F.q = $('q').value.trim(); F.offset = 0; load().catch(fail); });
+  $('q').value = F.q;
+  $('reload').onclick = () => refresh().catch(fail);   // 上の最新の照合・件数も読み直す (Codex #1481 R2 Low)
+  function fail(e) { showRes('err', '読み込めませんでした: ' + (e && e.message)); }
+
+  // ─────────── 一覧 ───────────
+  async function load() {
+    writeUrl();
+    const qs = new URLSearchParams({ status: F.status, view: F.view, reason: F.reason, cls: F.cls, q: F.q, limit: String(LIMIT), offset: String(F.offset) });
+    const r = await getJson('api/candidates?' + qs);
+    items = r.items; total = r.total; picked = new Set();
+    renderRows();
+  }
+  function rowHtml(c, i) {
+    const lbl = c.code_norm + ' ' + colName(c);
+    const tone = STATUS_TONE[c.status] || 'mute';
+    let st = '<span class="b ' + tone + '"><span class="dot"></span>' + esc(STATUS[c.status]) + (c.decision && c.status === 'approved' ? ' · ' + esc(RES[c.decision.resolution] || c.decision.resolution) : '') + '</span>' + (c.reoccurred ? '<span class="reo">再発</span>' : '');
+    st += c.decision && c.decision.kind !== 'revoked' && c.status !== 'pending' ? '<span class="sub">' + esc(who(c.decision.actor)) + ' · ' + esc(fmtAt(c.decision.at, false)) + '</span>'
+      : '<span class="sub">' + c.seen_count + ' 回の照合 · 初めて ' + esc(fmtAt(c.first_seen_at, false)) + '</span>';
+    let qa = '';
+    if (CAN && c.status === 'pending') {
+      if (canFixNe(c)) qa += '<button type="button" class="btn sm soft" data-q="fix_ne" data-i="' + i + '" aria-label="' + esc(lbl) + ': NE を提案の値に直す">NE を直す</button>';
+      if (canKeep(c)) qa += '<button type="button" class="btn sm" data-q="accept_difference" data-i="' + i + '" aria-label="' + esc(lbl) + ': 差を残す">差を残す</button>';
+      if (!qa) qa = '<button type="button" class="btn sm ghost" data-open="' + i + '" aria-label="' + esc(lbl) + ': 決め方を選ぶ">決め方を選ぶ ' + icon('i-chevr', 's') + '</button>';
+    }
+    return '<tr data-i="' + i + '"' + (picked.has(c.fingerprint) ? ' class="picked"' : '') + '>'
+      + '<td class="ck">' + (CAN ? '<input type="checkbox" class="ckb" data-i="' + i + '" aria-label="' + esc(lbl) + ' を選ぶ"' + (picked.has(c.fingerprint) ? ' checked' : '') + '>' : '') + '</td>'
+      + '<td><a class="rowlink" href="#" data-open="' + i + '" aria-label="' + esc(lbl) + ' を開く">' + esc(c.code_norm) + '</a><span class="sub colname">' + esc(colName(c)) + (c.sku_kind ? ' · ' + (c.sku_kind === 'set' ? 'セット' : '単品') : '') + '</span></td>'
+      + '<td class="dv"><div class="dvline ne"><span class="dvk">NE</span>' + val(c.col, c.n) + '</div><div class="dvline cdb"><span class="dvk">社内</span>' + val(c.col, c.c, 'cdb') + '</div></td>'
+      + '<td class="rsn">' + esc(REASON[c.reason_kind] || c.reason_kind) + '<span class="sub">' + esc(CLS[c.cls] || c.cls) + '</span></td>'
+      + '<td class="prop">' + proposalText(c) + '</td>'
+      + '<td class="st">' + st + '</td>'
+      + '<td class="acts"><div class="qa">' + qa + '</div></td></tr>';
+  }
+  function renderRows() {
+    const tb = $('rows');
+    $('count').textContent = total.toLocaleString('ja-JP');
+    $('count-sub').textContent = (STATUS[F.status] || '全部の状態') + (F.reason ? ' · ' + (REASON[F.reason] || F.reason) : '') + (F.q ? ' · 「' + F.q + '」' : '') + (F.view === 'all' ? ' · 前に出た差も' : '');
+    if (!items.length) {
+      const plain = F.status === 'pending' && !F.reason && !F.q && !F.cls;
+      tb.innerHTML = '<tr class="loadrow"><td colspan="7">' + (plain ? icon('i-check', 's') + ' 判断待ちの差はありません' : '該当する差はありません') + '</td></tr>';
+    } else tb.innerHTML = items.map(rowHtml).join('');
+    const pg = $('pager');
+    if (total > items.length || F.offset) {
+      const a = F.offset + 1, b = F.offset + items.length;
+      pg.innerHTML = '<span>' + a.toLocaleString('ja-JP') + '–' + b.toLocaleString('ja-JP') + ' 件目 / 全 ' + total.toLocaleString('ja-JP') + ' 件</span>'
+        + (F.offset ? '<button class="btn sm" type="button" id="pg-prev">前の ' + LIMIT + ' 件</button>' : '') + (b < total ? '<button class="btn sm" type="button" id="pg-next">次の ' + LIMIT + ' 件</button>' : '');
+      if ($('pg-prev')) $('pg-prev').onclick = () => { F.offset = Math.max(0, F.offset - LIMIT); load().catch(fail); };
+      if ($('pg-next')) $('pg-next').onclick = () => { F.offset += LIMIT; load().catch(fail); };
+    } else pg.innerHTML = '';
+    updateBulk();
+  }
+  $('rows').addEventListener('click', (e) => {
+    const q = e.target.closest('[data-q]');
+    if (q) { e.preventDefault(); const i = Number(q.dataset.i); decide('approved', q.dataset.q, [items[i]], undefined, { index: i }); return; }
+    if (e.target.closest('.ckb')) return;
+    const o = e.target.closest('[data-open]');
+    if (o) { e.preventDefault(); const c = items[Number(o.dataset.open)]; if (c) openDetail(c.fingerprint, o.closest('tr') ? o.closest('tr').querySelector('a.rowlink') : o).catch((x) => showRes('err', x.message)); }
+  });
+  $('rows').addEventListener('change', (e) => { const cb = e.target.closest('.ckb'); if (cb) pick(Number(cb.dataset.i), cb.checked); });
+
+  // ─────────── 選ぶ・まとめて決める ───────────
+  function pick(i, on) {
+    const c = items[i]; if (!c) return;
+    if (on) picked.add(c.fingerprint); else picked.delete(c.fingerprint);
+    const tr = document.querySelector('#rows tr[data-i="' + i + '"]');
+    if (tr) { tr.classList.toggle('picked', on); const cb = tr.querySelector('.ckb'); if (cb) cb.checked = on; }
+    updateBulk();
+  }
+  const pickedList = () => items.filter((c) => picked.has(c.fingerprint));
+  function updateBulk() {
+    const all = $('all');
+    if (all) { all.checked = items.length > 0 && picked.size === items.length; all.indeterminate = picked.size > 0 && picked.size < items.length; all.disabled = !items.length; }
+    const bar = $('bulk'); if (!bar) return;
+    const list = pickedList();
+    bar.hidden = !list.length;
+    $('main').classList.toggle('has-bulk', list.length > 0);
+    $('selcount').textContent = list.length + ' 件を選択中';
+    const nFix = list.filter(canFixNe).length, nKeep = list.filter(canKeep).length;
+    const left = (n) => (n < list.length ? ' (' + (list.length - n) + ' 件は飛ばします)' : '');
+    $('sel-break').textContent = 'NE を直せる ' + nFix + ' 件' + left(nFix) + ' · 差を残せる ' + nKeep + ' 件' + left(nKeep);
+    for (const b of document.querySelectorAll('#bulk [data-act]')) b.disabled = busy || (b.dataset.act === 'fix_ne' ? !nFix : b.dataset.act === 'accept_difference' ? !nKeep : false);
+    refreshDirty();
+  }
+  if ($('all')) $('all').onchange = () => { const on = $('all').checked; items.forEach((c, i) => pick(i, on)); };
+  if ($('sel-clear')) $('sel-clear').onclick = () => { items.forEach((c, i) => pick(i, false)); const a = document.querySelector('#rows a.rowlink'); if (a) a.focus(); };
+  for (const b of document.querySelectorAll('#bulk [data-act]')) b.onclick = () => {
+    const list = pickedList();
+    const act = b.dataset.act;
+    const note = $('note').value.trim() || null;
+    if (act === 'rejected') return decide('rejected', null, list, undefined, { note, bulk: true });
+    return decide('approved', act, list, undefined, { note, bulk: true });
+  };
+  if ($('note')) $('note').addEventListener('input', refreshDirty);
+
+  // ─────────── 決める ───────────
+  const itemOf = (c, extra) => ({ fingerprint: c.fingerprint, shown_last_seen_run: c.last_seen_run, shown_event_id: c.decision ? c.decision.event_id : null, ...(extra || {}) });
+  function report(r, kind, resolution, list) {
+    const code = new Map(list.map((c) => [c.fingerprint, c.code_norm + ' ' + colName(c)]));
+    const done = kind === 'approved' ? '「' + (RES[resolution] || resolution) + '」と決めました' : kind === 'rejected' ? '却下しました' : '判断を取り消しました (判断待ちに戻りました)';
+    const title = done + ' ' + r.applied.length + ' 件' + (r.skipped.length ? ' · 飛ばした ' + r.skipped.length + ' 件' : '');
+    const voided = r.applied.flatMap((a) => a.csv_voided || []);
+    const lines = r.skipped.map((s) => '<li>' + esc(code.get(s.fingerprint) || s.fingerprint.slice(0, 8)) + ': ' + esc(SKIP[s.reason] || s.reason) + (s.message ? ' (' + esc(s.message) + ')' : '') + '</li>');
+    if (voided.length) lines.push('<li>NE に取り込む CSV の まだ申告していないファイル ' + esc(voided.map((v) => (v && v.export_id) || v).join(', ')) + ' は使えなくしました (void・作り直せます)</li>');
+    showRes(r.skipped.length ? 'warn' : 'ok', title, lines.length ? '<ul>' + lines.join('') + '</ul>' : '');
+    toast(title);
+  }
+  async function decide(kind, resolution, list, extra, opts = {}) {
+    if (!list.length) return showRes('err', '選んでください');
+    if (busy) return;
+    busy = true; updateBulk();
+    try {
+      const r = await postJson('api/decisions', { kind, resolution: resolution || null, note: opts.note ?? null, items: list.map((c) => itemOf(c, extra)) });
+      lastApplied = kind === 'revoked' ? [] : r.applied.map((a) => ({ fingerprint: a.fingerprint, event_id: a.event_id }));
+      if (opts.bulk && r.applied.length && $('note')) $('note').value = '';
+      // 一覧・件数・窓を読み直してから結果を出す (結果が出た時には一覧も新しい = 決めた行が消えている)
+      let again = null;
+      try {
+        await loadSummary(); await load();
+        if (openFp) { const fp = openFp; if (opts.fromDrawer) { const dv = $('d-val'), dn = $('d-note'); if (dv) dv.value = ''; if (dn) dn.value = ''; } await openDetail(fp, drawerFrom, true); }   // 詳細は読み直す (古い判断のまま続けて決めると「先に決めた」になる。Codex #1481 R1 Low)
+      } catch (e) { again = e; }
+      report(r, kind, resolution, list);
+      if (again) showRes('warn', '決めました (' + r.applied.length + ' 件) が、一覧を読み直せませんでした: ' + again.message + '。「表示し直す」を押してください');
+      loadCsv();
+      if (!openFp && opts.index !== undefined) { const links = document.querySelectorAll('#rows a.rowlink'); const a = links[Math.min(opts.index, links.length - 1)]; if (a) a.focus(); else $('q').focus(); }
+    } catch (e) { showRes('err', '決められませんでした: ' + e.message); }
+    finally { busy = false; updateBulk(); }
+  }
+  async function undo() {
+    const list = lastApplied.slice(); if (!list.length) return;
+    try {
+      const r = await postJson('api/decisions', { kind: 'revoked', resolution: null, note: '画面の「元に戻す」', items: list.map((a) => ({ fingerprint: a.fingerprint, shown_event_id: a.event_id })) });
+      lastApplied = [];
+      try { await loadSummary(); await load(); if (openFp) await openDetail(openFp, drawerFrom, true); } catch (e) { toast('一覧を読み直せませんでした。「表示し直す」を押してください'); }
+      showRes(r.skipped.length ? 'warn' : 'ok', '元に戻しました ' + r.applied.length + ' 件 (判断待ちに戻りました)' + (r.skipped.length ? ' · 戻せなかった ' + r.skipped.length + ' 件: ' + r.skipped.map((s) => SKIP[s.reason] || s.reason).join(' / ') : ''));
+      toast('元に戻しました ' + r.applied.length + ' 件');
+      loadCsv();
+    } catch (e) { showRes('err', '元に戻せませんでした: ' + e.message); }
+  }
+
+  // ─────────── 1 件の窓 (右から出る) ───────────
+  const drawerOpen = () => $('dr-bg').classList.contains('on');
+  async function openDetail(fp, from, keep) {
     const d = await getJson('api/candidates/' + fp + '/events');
     const c = d.candidate;   // 読み直した今の候補 (一覧の古い行ではなく)
-    openFp = fp;
-    const ev = d.events.map((e) => '<li>' + esc(e.created_at.slice(0, 16)) + ' ' + esc(e.kind === 'action_done' ? '完了 (照合が目標の値を見た)' : e.kind === 'approved' ? '承認: ' + (RES[e.resolution] || e.resolution) + (e.target ? ' → ' + (isRate(c.col, e.target.value) ? pct(e.target.value) + '%' : JSON.stringify(e.target.value)) : '') : e.kind === 'rejected' ? '却下' : '取り消し')
-      + ' <span class="muted">' + esc(e.actor) + (e.note ? ' 「' + esc(e.note) + '」' : '') + '</span></li>').join('');
-    const opts = (c.resolutions || []).map((r) => '<option value="' + esc(r) + '">' + esc(RES[r] || r) + '</option>').join('');
-    $('detail').innerHTML = '<div class="detail"><b>' + esc(c.code_norm) + ' / ' + esc(COL[c.col] || c.col) + (c.child ? ' / ' + esc(c.child) : '') + '</b> <span class="st ' + c.status + '">' + esc(STATUS[c.status]) + '</span>'
-      + ' <span class="muted">初めて ' + esc((c.first_seen_at || '').slice(0, 10)) + '・最後 ' + esc((c.last_seen_at || '').slice(0, 10)) + '・' + c.seen_count + ' 回</span>'
-      + '<div>NE: ' + showNe(c.col, c.n) + ' / 社内: ' + showCdb(c.col, c.c) + ' / 提案: ' + proposalText(c) + '</div>'
-      + (CAN ? '<div class="row" style="margin-top:6px">決め方 <select id="d-res">' + opts + '</select> 直す値 <input id="d-val" size="16" placeholder="' + esc(HINT[c.col] || '値') + (c.col === 'parent' ? ' (空 = 親なし)' : ' (空 = 提案の値)') + '"> <button class="btn-sm" id="d-ok">この差を決める</button> <button class="btn-sm" id="d-rej">却下</button>'
-        + (c.decision && c.decision.kind !== 'revoked' ? ' <button class="btn-sm" id="d-rev">判断を取り消す</button>' : '') + '</div>' : '')
-      + '<div>履歴</div><ul>' + (ev || '<li class="muted">まだ決めていない</li>') + '</ul>'
-      + '<details><summary class="muted">指紋の元 (開発用)</summary><pre>' + esc(JSON.stringify(d.print, null, 2)) + '</pre></details></div>';
-    if (!CAN) return;
-    $('d-ok').onclick = () => {
-      const raw = $('d-val').value.trim();
-      let extra;
-      if (raw || c.col === 'parent') extra = { target_text: raw };   // 数字らしくても文字のまま (仕入先 0001・商品名 123 を壊さない。Codex #1481 R1 Medium)。代表は空も送る = 親なし (D3b)
-      decide('approved', $('d-res').value, [c], extra);
-    };
-    $('d-rej').onclick = () => decide('rejected', null, [c]);
-    if ($('d-rev')) $('d-rev').onclick = () => decide('revoked', null, [c]);
+    openFp = fp; openC = c; if (!keep) drawerFrom = from || document.activeElement;
+    const prevRes = keep && $('d-seg') ? $('d-seg').getAttribute('data-value') : null;
+    const ev = d.events.slice().reverse().map((e) => '<li>' + esc(e.kind === 'action_done' ? '完了 (照合が目標の値を見た)' : e.kind === 'approved' ? '承認: ' + (RES[e.resolution] || e.resolution) + (e.target ? ' → ' + (isRate(c.col, e.target.value) ? pct(e.target.value) + '%' : JSON.stringify(e.target.value)) : '') : e.kind === 'rejected' ? '却下' : '取り消し')
+      + '<span class="w">' + esc(fmtAt(e.created_at)) + ' · ' + esc(e.actor) + (e.note ? ' 「' + esc(e.note) + '」' : '') + '</span></li>').join('');
+    const ress = c.resolutions || [];
+    const def = prevRes && ress.includes(prevRes) ? prevRes : ress.includes('fix_ne') ? 'fix_ne' : ress[0];
+    $('dr-t').innerHTML = '<span class="code-pill">' + esc(c.code_norm) + '</span> ' + esc(colName(c)) + '<span class="sub">' + (c.sku_kind ? (c.sku_kind === 'set' ? 'セット' : '単品') + ' · ' : '') + esc(REASON[c.reason_kind] || c.reason_kind) + ' · ' + esc(CLS[c.cls] || c.cls) + '</span>';
+    $('detail').innerHTML = '<div class="idrow"><span class="b ' + (STATUS_TONE[c.status] || 'mute') + '"><span class="dot"></span>' + esc(STATUS[c.status]) + (c.decision && c.status === 'approved' ? ' · ' + esc(RES[c.decision.resolution] || c.decision.resolution) : '') + '</span>' + (c.reoccurred ? '<span class="reo">再発</span>' : '')
+      + '<span class="hint">初めて ' + esc(fmtAt(c.first_seen_at, false)) + ' · 最後 ' + esc(fmtAt(c.last_seen_at, false)) + ' · ' + c.seen_count + ' 回の照合' + (c.current ? '' : ' · 今朝の照合には出ていない') + '</span></div>'
+      + '<div class="cmp"><div class="box ne"><div class="k">NE の値</div><div class="v">' + val(c.col, c.n) + '</div></div><div class="box cdb"><div class="k">社内の値 (Company DB)</div><div class="v">' + val(c.col, c.c, 'cdb') + '</div></div></div>'
+      + '<div class="proprow"><span class="k">照合の提案</span>' + proposalText(c) + '</div>'
+      + (CAN ? '<div class="decide"><div class="ttl" id="d-h">この差を決める</div>'
+        + '<div class="seg" id="d-seg" role="group" aria-labelledby="d-h" data-value="' + esc(def || '') + '">' + ress.map((r) => '<button type="button" data-v="' + esc(r) + '" class="' + (r === def ? 'on' : '') + '" aria-pressed="' + (r === def) + '">' + esc(RES[r] || r) + '</button>').join('') + '</div>'
+        + '<div class="what" id="d-what" aria-live="polite"></div>'
+        + '<div id="d-val-wrap"><label class="lab2" for="d-val">直す値 <span class="muted">(' + esc(HINT[c.col] || '値') + ')</span></label><input class="in" id="d-val" autocomplete="off" placeholder="' + esc(HINT[c.col] || '値') + (c.col === 'parent' ? ' (空 = 親なし)' : ' (空 = 提案の値)') + '"></div>'
+        + '<label class="lab2" for="d-note">メモ <span class="muted">(任意・500 字まで)</span></label><input class="in" id="d-note" maxlength="500" autocomplete="off">'
+        + '<div class="foot"><button class="btn pri" type="button" id="d-ok">' + icon('i-check', 's') + 'この差を決める</button><button class="btn danger" type="button" id="d-rej">却下</button><span class="grow"></span>'
+        + (c.decision && c.decision.kind !== 'revoked' ? '<button class="btn ghost" type="button" id="d-rev">' + icon('i-undo', 's') + '判断を取り消す</button>' : '') + '</div></div>'
+        : '<div class="callout lock">' + icon('i-lock') + '<div class="grow"><div class="t">見るだけです</div><div class="hint">' + esc(GATE) + '</div></div></div>')
+      + '<h3>履歴 (新しい順)</h3><ul class="mini-hist">' + (ev || '<li class="muted">まだ決めていない</li>') + '</ul>'
+      + '<details class="more"><summary>' + icon('i-chevr', 's') + '指紋の元 (開発用)</summary><div class="body"><pre>' + esc(JSON.stringify(d.print, null, 2)) + '</pre></div></details>';
+    const bg = $('dr-bg');
+    const wasOpen = drawerOpen();
+    bg.classList.add('on');
+    if (CAN) {
+      const syncRes = () => {
+        const r = $('d-seg').getAttribute('data-value');
+        $('d-what').textContent = RES_WHAT[r] || '';
+        $('d-val-wrap').hidden = !FIXSET.has(r);
+      };
+      syncRes();
+      $('d-seg').addEventListener('change', syncRes);
+      for (const id of ['d-val', 'd-note']) $(id).addEventListener('input', refreshDirty);
+      $('d-ok').onclick = () => {
+        const res = $('d-seg').getAttribute('data-value');
+        const raw = $('d-val').value.trim();
+        let extra;
+        if (FIXSET.has(res)) {
+          if (raw || c.col === 'parent') extra = { target_text: raw };   // 数字らしくても文字のまま (仕入先 0001・商品名 123 を壊さない。Codex #1481 R1 Medium)。代表は空も送る = 親なし (D3b)
+        }
+        decide('approved', res, [c], extra, { note: $('d-note').value.trim() || null, fromDrawer: true });
+      };
+      $('d-rej').onclick = () => decide('rejected', null, [c], undefined, { note: $('d-note').value.trim() || null, fromDrawer: true });
+      if ($('d-rev')) $('d-rev').onclick = () => decide('revoked', null, [c], undefined, { note: $('d-note').value.trim() || null, fromDrawer: true });
+    }
+    refreshDirty();
+    if (!wasOpen) { const f = $('drawer').querySelector('.seg button.on') || $('dr-x'); f.focus(); }
   }
+  function closeDrawer() {
+    if (!drawerOpen()) return;
+    $('dr-bg').classList.remove('on'); openFp = null; openC = null; $('detail').innerHTML = '';
+    refreshDirty();
+    if (drawerFrom && drawerFrom.focus && document.contains(drawerFrom)) drawerFrom.focus();
+    else { const a = document.querySelector('#rows a.rowlink'); if (a) a.focus(); }
+  }
+  $('dr-x').onclick = closeDrawer;
+  $('dr-bg').addEventListener('click', (e) => { if (e.target === $('dr-bg')) closeDrawer(); });
 
-  loadSummary().then(load).catch((e) => setMsg('読み込めませんでした: ' + e.message, 'err'));
+  // ─────────── キー (窓の中だけで Tab が回る・Esc で閉じる・Space で行を選ぶ) ───────────
+  window.addEventListener('keydown', (e) => {
+    const shellBox = document.querySelector('#leave-bg.on') || document.querySelector('#palette-bg.on');
+    if (shellBox) return;   // 全体から探す・離れるときの確認は me-shell.js が扱う
+    if (drawerOpen()) {
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeDrawer(); return; }
+      if (e.key === 'Tab') {
+        const f = [...$('drawer').querySelectorAll('button, input, a[href], select, textarea, summary')].filter((x) => !x.disabled && x.offsetParent !== null);
+        if (!f.length) return;
+        if (!$('drawer').contains(document.activeElement)) { e.preventDefault(); f[0].focus(); return; }
+        if (e.shiftKey && document.activeElement === f[0]) { e.preventDefault(); f[f.length - 1].focus(); }
+        else if (!e.shiftKey && document.activeElement === f[f.length - 1]) { e.preventDefault(); f[0].focus(); }
+        return;
+      }
+      // 窓が開いている間は、後ろの一覧のキー (/・↑↓) を動かさない
+      if (e.key === '/' || e.key === 'ArrowUp' || e.key === 'ArrowDown') { if (!/^(input|textarea|select)$/i.test(e.target.tagName)) e.stopPropagation(); }
+      return;
+    }
+    const a = document.activeElement;
+    if (CAN && e.key === ' ' && a && a.classList && a.classList.contains('rowlink')) { e.preventDefault(); const i = Number(a.dataset.open); pick(i, !picked.has(items[i].fingerprint)); }
+  }, true);
+
+  // ─────────── 離れるときの確認 (me-shell.js): 数えるのは まだ決めていない入力 (直す値・メモ) だけ。選んだ行は数えない ───────────
+  ME.dirty = () => {
+    const out = [];
+    const note = $('note'); if (note && note.value.trim()) out.push('まとめて決めるメモ「' + note.value.trim().slice(0, 40) + '」');
+    if (drawerOpen() && openC) {
+      const dv = $('d-val'), dn = $('d-note');
+      if (dv && dv.value.trim() && !$('d-val-wrap').hidden) out.push(openC.code_norm + ' ' + colName(openC) + ' の直す値「' + dv.value.trim().slice(0, 40) + '」');
+      if (dn && dn.value.trim()) out.push(openC.code_norm + ' ' + colName(openC) + ' のメモ');
+    }
+    return { n: out.length, items: out, impacts: [] };
+  };
+  ME.review = () => { const t = drawerOpen() ? ($('d-val') && $('d-val').value.trim() ? $('d-val') : $('d-note')) : $('note'); if (t) t.focus(); };
+  function refreshDirty() { if (ME.setUnsaved) ME.setUnsaved(ME.dirty().n); }
+
+  async function refresh() { await loadSummary(); await load(); loadCsv(); }
+  refresh().catch((e) => showRes('err', '読み込めませんでした: ' + e.message));
 })();
 </script>
 </body>

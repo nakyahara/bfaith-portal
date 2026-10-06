@@ -106,8 +106,14 @@ await ta('[1] 画面・つかいかた・末尾の / ・決められるかの印
   const m = await call('GET', '/manual');
   assert.equal(m.status, 200);
   const page = fs.readFileSync(new URL('../apps/master-decisions/views/index.ejs', import.meta.url), 'utf8');
-  const buttons = [...page.matchAll(/<button class="btn-sm" data-act="[^"]+">([^<]+)<\/button>/g)].map((x) => x[1]);
-  assert.deepEqual(buttons, ['差を残す', 'NE を直す (提案の値で)', '却下']);
+  // まとめて決める帯のボタン (新しいデザイン・10/5 = よく使う「NE を直す」を先頭の主ボタンに)
+  const buttons = [...page.matchAll(/<button class="btn[^"]*" type="button" data-act="[^"]+">([^<]+)<\/button>/g)].map((x) => x[1]);
+  assert.deepEqual(buttons, ['NE を直す (提案の値で)', '差を残す', '却下']);
+  // 画面の部品はこの口から配る (マスタの入力の CSS・共通の動きを写さずに共有)・版つき・決めた名前だけ
+  assert.match(r.text, /href="\/apps\/master-decisions\/public\/master-edit\.css\?v=[0-9a-f]{12}"/);
+  assert.match(r.text, /src="\/apps\/master-decisions\/public\/me-shell\.js\?v=[0-9a-f]{12}"/);
+  for (const f of ['master-edit.css', 'me-shell.js', 'md.css', 'favicon.svg']) assert.equal((await call('GET', `/public/${f}`)).status, 200, f);
+  for (const f of ['me-sku.js', '..%2Frouter.mjs', 'router.mjs']) assert.equal((await call('GET', `/public/${f}`)).status, 404, f);
   for (const b of [...buttons, '判断を取り消す']) assert.ok(m.text.includes(b), `つかいかたに「${b}」が無い`);
 });
 
@@ -378,8 +384,11 @@ await ta('[17] 名前 = 商品コード は NE に入れない (2026-10-05): 社
   // 画面: 税率は NE の書き方 (10 / 8 = %)・社内は 10% (0.1)・提案は「NE を 10 (%) に」/ 新しい理由・提案・拒んだ理由の言葉
   const page = (await call('GET', '/')).text;
   const src = page.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/)[1];
-  const fns = new vm.Script(`(function () { const esc = (s) => String(s ?? ''); ${src.match(/const show = [\s\S]*?\n  const proposalText = [\s\S]*?return '決める'; };/)[0]}; return { showNe, showCdb, proposalText }; })()`).runInNewContext({});
-  assert.deepEqual([fns.showNe('tax_rate', 0.1), fns.showCdb('tax_rate', 0.1), fns.showCdb('tax_rate', 0.08), fns.proposalText({ col: 'tax_rate', proposal: { op: 'set_ne_value', value: 0.1 } })],
+  const fns = new vm.Script(`(function () { const esc = (s) => String(s ?? ''); ${src.match(/const show = [\s\S]*?\n  const proposalText = [\s\S]*?return '決める'; };/)[0]}; return { showNe, showCdb, val, proposalText }; })()`).runInNewContext({});
+  const txt = (h) => String(h).replace(/<[^>]+>/g, '');   // 新しいデザイン (#1626) は値を札 (span・b) で包む = 見える文字で比べる
+  // 一覧の行・1 件の窓の値 (val): NE = 10%・社内 = 10% (0.1)・社内 0 円は (空) にしない
+  assert.deepEqual([txt(fns.val('tax_rate', 0.1)), txt(fns.val('tax_rate', 0.1, 'cdb')), txt(fns.val('tax_rate', 0.08, 'cdb')), txt(fns.val('standard_price_jpy', 0, 'cdb'))], ['10%', '10% (0.1)', '8% (0.08)', '0 円']);
+  assert.deepEqual([fns.showNe('tax_rate', 0.1), fns.showCdb('tax_rate', 0.1), fns.showCdb('tax_rate', 0.08), txt(fns.proposalText({ col: 'tax_rate', proposal: { op: 'set_ne_value', value: 0.1 } }))],
     ['10%', '10% (0.1)', '8% (0.08)', 'NE を 10 (%) に']);
   assert.deepEqual([fns.showCdb('name', 'x'), fns.showCdb('standard_price_jpy', 0), fns.proposalText({ col: 'name', proposal: { op: 'fill_cdb_name' } }), fns.proposalText({ col: 'name', proposal: { op: 'check_name' } }),
     fns.proposalText({ col: 'standard_price_jpy', proposal: { op: 'decide_zero' } })],
