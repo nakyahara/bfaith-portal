@@ -327,13 +327,18 @@
   ME.openName = openName;
   if (nameBtn) nameBtn.addEventListener('click', function () { openName(true); });
   $$('[data-name-open]').forEach(function (b) { b.addEventListener('click', function () { openName(true); }); });
-  if (nameIn) nameIn.addEventListener('input', function () { nameIn.removeAttribute('aria-invalid'); nameIn.removeAttribute('aria-describedby'); });
+  /** 名前の誤りの印 (欄の aria-invalid・誤りの文との結び・行の赤) をまとめて外す = 打ち直し・Esc・元に戻すのどれでも (#1631 Codex R2 L1) */
+  function clearNameError() {
+    if (nameIn) { nameIn.removeAttribute('aria-invalid'); nameIn.removeAttribute('aria-describedby'); }
+    var nr = $('[data-row="name"]', scope); if (nr) nr.classList.remove('err');
+  }
+  if (nameIn) nameIn.addEventListener('input', clearNameError);
   var nameClose = $('#name-close');
   if (nameClose) nameClose.addEventListener('click', closeName);
   if (nameIn) nameIn.addEventListener('keydown', function (e) {
     if (e.key === 'Escape') {
       if (e.isComposing || e.keyCode === 229) return;   // 日本語入力の変換中の Esc = 変換の取り消し (名前は戻さない・#1631 Codex R1 M1)
-      e.preventDefault(); e.stopPropagation(); if (initial.has(nameIn)) nameIn.value = initial.get(nameIn); update(); closeName();
+      e.preventDefault(); e.stopPropagation(); if (initial.has(nameIn)) nameIn.value = initial.get(nameIn); clearNameError(); update(); closeName();
     }
   });
 
@@ -355,6 +360,7 @@
     if ($('#xcost-reason')) $('#xcost-reason').value = '';
     if (costBox) { costBox.hidden = true; if (costOpen) costOpen.setAttribute('aria-expanded', 'false'); costDelta(); }
     $$('.f.err', scope).forEach(function (f) { f.classList.remove('err'); });
+    clearNameError();
     update();
     if (nameBox && !nameBox.hidden) closeName();
     ME.toast('変更を元に戻しました');

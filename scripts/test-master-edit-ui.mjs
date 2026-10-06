@@ -1431,11 +1431,24 @@ await ta('[48] 名前の欄 (#1631 Codex R1): 日本語入力の変換中の Esc
   assert.equal(await active(p), 'f-name', '保存のボタンに残さず名前の欄へ');
   assert.equal(await p.getAttribute('#f-name', 'aria-invalid'), 'true');
   assert.equal(await p.getAttribute('#f-name', 'aria-describedby'), 'save-err');
-  // ふだんの Esc = 直す前に戻して閉じる
+  assert.equal(await p.locator('[data-row="name"].err').count(), 1, '名前の行に誤りの印');
+  // 誤りの印 (aria-invalid・aria-describedby・行の赤) は、打ち直し・Esc・元に戻すのどれでもまとめて外れる (#1631 Codex R2 L1)
+  const errState = () => p.evaluate(() => { const i = document.getElementById('f-name'); return [i.getAttribute('aria-invalid'), i.getAttribute('aria-describedby'), document.querySelectorAll('[data-row="name"].err').length]; });
+  const failEmpty = async () => { await p.fill('#f-name', ''); await p.click('#save'); await p.waitForFunction(() => document.getElementById('f-name').getAttribute('aria-invalid') === 'true'); assert.deepEqual(await errState(), ['true', 'save-err', 1]); };
+  await p.type('#f-name', 'x');
+  assert.deepEqual(await errState(), [null, null, 0], '打ち直したら印が全部外れる');
+  await failEmpty();
+  // ふだんの Esc = 直す前に戻して閉じる・印も外れる (開き直しても古い誤りを読み上げない)
   await p.keyboard.press('Escape');
   assert.equal(await p.inputValue('#f-name'), before);
   assert.equal(await p.isVisible('#name-box'), false);
   assert.equal(await dirty(p), 0);
+  assert.deepEqual(await errState(), [null, null, 0], 'Esc の後は印が全部外れる');
+  await p.click('#name-edit');
+  await failEmpty();
+  await p.click('#revert');
+  assert.equal(await p.inputValue('#f-name'), before);
+  assert.deepEqual(await errState(), [null, null, 0], '元に戻すの後も印が全部外れる');
 });
 
 // 第 2 段の画面の幅: 1440 / 1280 / 1024 と 1280×720 の 150% で横にはみ出さない・板からはみ出さない・構成の表は横に送る囲いの中。
