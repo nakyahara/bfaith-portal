@@ -8,6 +8,7 @@
  *   3 ② が判定できない・落ちた・② の節が無い = W13:ne は blocked (案件は全部保持)・W13:load は ① で判定する
  *   4 証跡と全件 JSON の ② の判定が食い違う・件数が食い違う = blocked
  *   5 朝の要約: W13:ne の案件は「新・継続」に混ぜず「NE との差 N 件 (新 M)」にまとめる (他の見張りの知らせを埋もれさせない)
+ *   9 ポータルで登録した新商品の NE 登録待ち (out_of_scope の reg_pending) は案件にしない (前に開いた案件は監視対象外)・reg_stale・区分違いは案件・理由と観測に数
  *   8 W13:old (②b 古い表。④a・#1564 の見直し M-3): breach・overdue = 案件 (old_<列>:<norm>) / 反映待ちだけ = pass (理由つき) / 比べない = pass /
  *     判定できない・落ちた・節が無い・形が違う・件数が食い違う = blocked (案件は保持) / 翌朝に消えた = 回復
  * 使い方: node scripts/test-watch-w13-ne.mjs
@@ -40,7 +41,7 @@ function evidenceFor(asOf, { ne = {}, neVerdictInEvidence, corruptCount = false,
   const neItems = ne ? (ne.items || []) : [];
   const neSec = ne ? { format: ne.format ?? 'mc-ne-v1', verdict: ne.verdict ?? (neItems.length ? 'breach' : 'pass'), blocked_reason: ne.blocked_reason ?? null, error: ne.error ?? null,
     items: neItems, held: ne.held ?? {}, recoverable: ne.recoverable ?? [], out_of_scope: ne.out_of_scope ?? {},
-    counts: { items: corruptCount ? neItems.length + 1 : neItems.length, ne_skus: 100, by_class: { lag: neItems.length }, decisions: 0 } } : undefined;
+    counts: { items: corruptCount ? neItems.length + 1 : neItems.length, ne_skus: 100, by_class: { lag: neItems.length }, decisions: 0, ...(ne.extraCounts || {}) } } : undefined;
   const res = { format: ne ? 'mc-v2' : 'mc-v1', as_of: asOf, compare_run_id: runId, verdict: 'pass', blocked_reason: null, load: { ingest_run_id: 'load_n1', started_at: `${asOf}T17:00:00Z` },
     counts: { items: 0, by_type: {}, compared: { value: 1000 } }, items: [], compared: {}, exclusions: {}, finished_at: `${asOf}T22:11:00Z`, ...(neSec ? { ne: neSec } : {}),
     ...(old ? { old_tables: old } : {}) };
@@ -189,6 +190,55 @@ await ta('[8] W13:old (②b 古い表): breach・overdue = 案件 / 反映待ち
   r = await run(d, evidenceFor(d, {}), '2026-10-03T23:50:00Z');
   assert.deepEqual([res(r, 'old').verdict], ['pass']);
   assert.match(res(r, 'old').reason, /比べない \(load_owned\)/);
+});
+
+await ta('[9] ポータルで登録した新商品: NE 登録待ち (out_of_scope の reg_pending) は案件にしない・前に開いた案件は監視対象外で閉じる / 日がたった reg_stale・区分違いは案件 / 理由と観測に数', async () => {
+  const d = '2026-10-05';
+  const regIssues = async (state) => (await issues(state)).filter((k) => /:n9/.test(k));
+  // 照合を入れる前の朝 = 登録したばかりの新商品が「NE に無い」差で開いていた
+  await run(d, evidenceFor(d, { ne: { items: [item('only_in_cdb', 'n901', 'spec_undecided'), item('only_in_cdb', 'n903', 'spec_undecided')] } }), '2026-10-04T23:00:00Z');
+  assert.deepEqual(await regIssues('open'), ['only_in_cdb:n901', 'only_in_cdb:n903']);
+  // 今朝: n901 = NE 登録待ち (対象外) / n903 = 登録から 14 日以上 (reg_stale = 案件のまま) / n904 = 区分違い (案件)
+  const ne = { items: [item('only_in_cdb', 'n903', 'reg_stale'), item('kind', 'n904', 'reg_kind_mismatch')], recoverable: [],
+    out_of_scope: { 'only_in_cdb:n901': 'reg_pending', 'value:n901': 'reg_pending', 'only_in_cdb:n902': 'reg_cancelled' },
+    extraCounts: { reg_pending: 1, reg_stale: 1, reg_cancelled: 1, reg_kind_mismatch: 1, reg_partial: 0, reg_failed: 0 } };
+  const r = await run(d, evidenceFor(d, { ne }), '2026-10-04T23:10:00Z');
+  const w = res(r, 'ne');
+  assert.equal(w.verdict, 'breach');
+  assert.deepEqual(w.items.map((x) => x.subjectKey).sort(), ['kind:n904', 'only_in_cdb:n903']);   // NE 登録待ちは件数に入れない
+  assert.equal(w.itemTotal, 2);
+  assert.deepEqual(await regIssues('out_of_window'), ['only_in_cdb:n901']);   // 監視対象外 (reg_pending) で閉じる (回復でも保持でもない)
+  assert.deepEqual(await regIssues('open'), ['kind:n904', 'only_in_cdb:n903']);
+  assert.match(w.reason, /NE との差 2 件 .*NE 登録待ち 1 件 \(差に入れない\)・新商品の区分違い 1/);
+  assert.deepEqual(w.observed.reg, { pending: 1, stale: 1, cancelled: 1, kind_mismatch: 1, partial: 0, failed: 0, rejected: 0 });
+  // 差が無く NE 登録待ちだけの朝 = pass (理由に数)
+  const r2 = await run(d, evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: { 'only_in_cdb:n901': 'reg_pending' }, extraCounts: { reg_pending: 1 } } }), '2026-10-04T23:20:00Z');
+  assert.deepEqual([res(r2, 'ne').verdict, res(r2, 'ne').reason], ['pass', 'NE 登録待ち 1 件 (差に入れない)']);
+  // 照合の確かめ (回の後半) で今日 failed になった = 全件 JSON は確かめの前の数 (0)・証跡の reg_after_check が確かめの後の数 → 理由と観測は後の数 (#1635 Codex R2 Medium)
+  const ev3 = evidenceFor(d, { ne: { items: [], recoverable: [], out_of_scope: { 'only_in_cdb:n901': 'reg_pending' }, extraCounts: { reg_pending: 1, reg_failed: 0, reg_partial: 0, reg_rejected: 0 } } });
+  ev3.ne.reg_after_check = { state: 'ok', reg_failed: 1, reg_partial: 0, reg_rejected: 0 };
+  const r3 = await run(d, ev3, '2026-10-04T23:30:00Z');
+  assert.equal(res(r3, 'ne').reason, 'NE 登録待ち 1 件 (差に入れない)・新商品の取込失敗 1');
+  assert.equal(res(r3, 'ne').observed.reg.failed, 1);
+  // 確かめの後の読み直しを読めない = blocked (確かめの前の数で pass にしない・案件は保持。#1635 Codex R3)
+  const openBefore = await regIssues('open');
+  const ev4 = evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: {}, extraCounts: { reg_pending: 0, reg_failed: 0 } } });
+  ev4.ne.reg_after_check = { state: 'unreadable', reason: 'reread down', check: { failed: 1 } };
+  const r4 = await run(d, ev4, '2026-10-04T23:40:00Z');
+  assert.equal(res(r4, 'ne').verdict, 'blocked');
+  assert.match(res(r4, 'ne').reason, /確かめの後の数を読めない \(reread down\)/);
+  assert.deepEqual(await regIssues('open'), openBefore);
+  // 確かめの後の証跡を書けていない (確かめの前の完了の証跡の pending の印が残った) = blocked・保持 / skipped (確かめが何も変えていない) = 判定する (#1635 Codex R4)
+  const ev5 = evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: {}, extraCounts: { reg_pending: 0 } } });
+  ev5.ne.reg_after_check = { state: 'pending' };
+  const r5 = await run(d, ev5, '2026-10-04T23:50:00Z');
+  assert.deepEqual([res(r5, 'ne').verdict, res(r5, 'ne').reason], ['blocked', '新商品の NE 登録の確かめの後の証跡が書けていない (確かめの前の数のまま)']);
+  assert.deepEqual(await regIssues('open'), openBefore);
+  const ev6 = evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: {}, extraCounts: { reg_pending: 0 } } });
+  ev6.ne.reg_after_check = { state: 'skipped', reason: 'seal_failed' };
+  const r6 = await run(d, ev6, '2026-10-04T23:55:00Z');
+  assert.equal(res(r6, 'ne').verdict, 'pass');
+  assert.deepEqual(await regIssues('open'), []);   // 回復 (recoverable)
 });
 
 await pg.close();

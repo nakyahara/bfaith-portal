@@ -25,7 +25,7 @@ import { openPgClient, pgAdapter } from '../../../scripts/company-db/migrate.mjs
 import { jstDateStr } from '../../../lib/jst-date.js';
 import { writeEvidence } from '../push/evidence.mjs';
 import { compareLoad, readCdbMaster, LOAD_CTX } from './compare-load.mjs';
-import { compareNe, NE_FORMAT } from './compare-ne.mjs';
+import { compareNe, NE_FORMAT, readRegistrations, regTroubleCounts } from './compare-ne.mjs';
 import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs, markWriteFailed } from './pending.mjs';
 import { readDecisionLedger, writeDecisions, writeNeCodes, connectDecisionWriter, snapshotRegTargets, writeRegistrationObservations, sealRegistrationRun, runRegistrationCheck } from './decisions.mjs';
 import { readBaseline, writeBaseline, holdAllDirections } from './baseline.mjs';
@@ -85,7 +85,7 @@ function summaryLine12(r) {
   // daily-sync は要約の先頭の ⚠️ で警告を決める (isWarnSummary) → ② が落ちた・判定できない朝は ② を先頭に (① が ✅ でも見出しを ⚠️ に)
   const two = neSummary(r.ne);
   const bad = r.ne.verdict === 'error' || r.ne.verdict === 'blocked' || ['locked', 'untrusted', 'write_failed'].includes(r.ne.pending?.state) || r.ne.decisions_write === 'failed' || r.ne.decisions_write === 'not_configured'
-    || baselineTrouble(r.ne);
+    || baselineTrouble(r.ne) || regTrouble(r.ne);
   return bad ? `${two} / ${one}` : `${one} / ${two}`;
 }
 /** 最後に一致した値 (D2) を読めない・書けない・拒まれた・書く接続が無い = 要約の先頭に ⚠️ (切替の前でも黙って止めない) */
@@ -110,12 +110,69 @@ export function neSummary(ne) {
   if (['locked', 'untrusted', 'write_failed'].includes(ne.pending?.state)) return `⚠️ ②: 反映待ちの台帳が使えない (${ne.pending.state}: ${ne.pending.reason ?? ''}) — 差 ${ne.counts?.items ?? 0} 件・保持 ${ne.counts?.held ?? 0}`;
   const bt = baselineTrouble(ne);
   if (bt) return `⚠️ ②: ${bt} — 差 ${ne.counts?.items ?? 0} 件`;
+  // ポータルで登録した新商品の NE 登録の不一致 (区分違い・取り込んだのに NE に無い・NE の中身が違う) = 自動の知らせがほかに無い → 朝の要約の先頭に ⚠️
+  const rt = regTrouble(ne);
+  if (rt) return `⚠️ ②: ${rt} — 差 ${ne.counts?.items ?? 0} 件${regSummary(ne)}`;
   const b = ne.counts?.by_class || {};
   const top = Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ');
   // 基準 (D2) を照らさなかった回 (NE の取得と CDB の読みが 4 時間超) は ⚠️ にしないが、続くと基準が貯まらないので見えるようにする
   const gap = ne.baseline?.held_reason === 'gap' ? '・基準は照らさず (NE の取得と CDB の読みが 4 時間超)' : '';
-  if (ne.verdict === 'pass') return ((ne.counts?.held ?? 0) > 0 ? `ℹ️ ②: 判明した差 0・比べられない / 判定できない案件 ${ne.counts.held} (保持)` : '✅ ②: NE との差 0') + gap;
-  return `ℹ️ ②: NE との差 ${ne.counts?.items ?? 0} 件 (${top})・判断の一覧 ${ne.counts?.decisions ?? 0}・保持 ${ne.counts?.held ?? 0}${gap}`;
+  const reg = regSummary(ne);
+  if (ne.verdict === 'pass') return ((ne.counts?.held ?? 0) > 0 ? `ℹ️ ②: 判明した差 0・比べられない / 判定できない案件 ${ne.counts.held} (保持)` : '✅ ②: NE との差 0') + reg + gap;
+  return `ℹ️ ②: NE との差 ${ne.counts?.items ?? 0} 件 (${top})・判断の一覧 ${ne.counts?.decisions ?? 0}・保持 ${ne.counts?.held ?? 0}${reg}${gap}`;
+}
+/**
+ * ポータルで登録した新商品で NE に無いもの (差にしない NE 登録待ち・日がたった reg_stale は差の件数にも入る)。0 件なら何も足さない。
+ * 登録の状態を読めない朝 = 待ちを分けていない (差に含む) と書く
+ */
+const STAGE_JA = { before_issue: 'CSV を配る前', issued: '配った', declared: '取り込んだ申告の後', failed: '取り込めていない', rejected: 'NE が全部拒んだ', partial: '中身が違う', verified: '確かめ済み' };
+export function regSummary(ne) {
+  const rp = ne && ne.reg_pending;
+  if (!rp) return '';
+  if (rp.state === 'unreadable') return '・NE 登録待ちを読めない (差に含む)';
+  const c = ne.counts || {};
+  const parts = [];
+  if (c.reg_pending) {
+    // 段階 (CSV を配る前・配った・申告の後・取り込めていない)
+    const st = Object.entries(rp.stages || {}).map(([k, v]) => `${STAGE_JA[k] || k} ${v}`).join('・');
+    parts.push(`NE 登録待ち ${c.reg_pending} 件 (差に入れない${st ? `。${st}` : ''})`);
+  }
+  if (c.reg_stale) parts.push(`登録から ${rp.stale_days} 日以上 NE に無い ${c.reg_stale} 件 (差)`);
+  return parts.length ? `・${parts.join('・')}` : '';
+}
+/**
+ * 確かめ (record_ne_registration_check) の後に登録の段階を読み直す (照合の読む接続・読み取りだけの短い取引)。
+ * 区分違いは照合の結果のまま (二重に数えない)。読めない = state unreadable (確かめの前の数に戻さない = 要約・W13 は「読めない」で ⚠️ / blocked。#1635 Codex R3)
+ */
+export async function regAfterCheck(db, ne, checkCounts) {
+  try {
+    await db.query('begin transaction read only');
+    try {
+      const fresh = await readRegistrations(db);
+      if (fresh.state !== 'ok') return { state: fresh.state === 'not_applied' ? 'unreadable' : fresh.state, check: checkCounts, reason: fresh.reason ?? fresh.state };
+      return { state: 'ok', check: checkCounts, ...regTroubleCounts(fresh, new Set((ne.reg_pending?.kind_mismatch || []).map((e) => e.norm))) };
+    } finally { try { await db.query('rollback'); } catch { /* */ } }
+  } catch (e) { return { state: 'unreadable', check: checkCounts, reason: String(e && e.message).slice(0, 200) }; }
+}
+/** 確かめの後の読み直しを読めない (確かめが状態を進めたかもしれない = 確かめの前の数で ✅ にしない)。確かめの内訳は参考に出す */
+export function regAfterCheckTrouble(ne) {
+  const a = ne && ne.reg_after_check;
+  if (!a || a.state === 'ok' || a.state === 'skipped') return null;   // skipped = 確かめが何も変えていない (確かめの前の数のまま正しい)
+  const ck = a.check && typeof a.check === 'object' ? Object.entries(a.check).map(([k, v]) => `${k} ${v}`).join('・') : '';
+  return `新商品の NE 登録の確かめの後の数を読めない (${String(a.reason || a.state).slice(0, 80)})${ck ? ` — 確かめ: ${ck}` : ''}`;
+}
+/** ポータルで登録した新商品の NE 登録の不一致 (朝の要約の先頭の ⚠️)。確かめの後に読み直した数があればそちら。読み直せなかった = その旨。無ければ null */
+export function regTrouble(ne) {
+  const bad = regAfterCheckTrouble(ne);
+  if (bad) return bad;
+  const a = ne && ne.reg_after_check && ne.reg_after_check.state === 'ok' ? ne.reg_after_check : null;
+  const c = { ...((ne && ne.counts) || {}), ...(a ? { reg_failed: a.reg_failed, reg_rejected: a.reg_rejected, reg_partial: a.reg_partial } : {}) };
+  const parts = [];
+  if (c.reg_kind_mismatch) parts.push(`区分 (単品・セット) 違い ${c.reg_kind_mismatch} 件`);
+  if (c.reg_failed) parts.push(`取り込んだと申告したのに NE に無い ${c.reg_failed} 件`);
+  if (c.reg_rejected) parts.push(`NE が取り込みを全部拒んだ (CSV を作り直す) ${c.reg_rejected} 件`);
+  if (c.reg_partial) parts.push(`NE の中身が登録と違う ${c.reg_partial} 件`);
+  return parts.length ? `新商品の NE 登録の不一致 (${parts.join('・')})` : null;
 }
 
 /**
@@ -164,8 +221,10 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
             decisionLedger = await readDecisionLedger(db);
             // 最後に一致した値 (D2) も同じ取引で (読めない = 方向は全部 held・① と ② は続く)
             const baseline = { ...(await readBaseline(db)), cdbReadAt: readAt };
+            // ポータルで登録した新商品の登録の状態 (0052) も同じ取引で (読めない = NE 登録待ちを分けない = 今までどおり差に出す・報告に残す)
+            const registrations = await readRegistrations(db);
             const r2 = neCompare({ dataDir, asOfJst: asOf, syncRunId, loadCtx: ctx, cdb, ledger, loadVerdict: result.verdict, decisionLedger, baseline,
-              regTargets: regRead.state === 'ok' ? regRead.targets : null });
+              regTargets: regRead.state === 'ok' ? regRead.targets : null, registrations });
             result.ne = r2.result; pendingEntries = r2.pendingEntries; decisionsDone = r2.decisionsDone || []; baselineWrites = r2.baselineWrites || []; neCodes = r2.neCodes || null;
             regObs = r2.regObs || null;
             if (pendingEntries) result.ne.pending_entries = pendingEntries;   // 台帳の保存に失敗した回の復旧の元 (restore-pending.mjs)
@@ -265,6 +324,9 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         decisions_read: result.ne.decisions_read ?? null, decisions_write: result.ne.decisions_write ?? null,
         ne_codes: result.ne.ne_codes ? { state: result.ne.ne_codes.state, reason: result.ne.ne_codes.reason ?? null, counts: result.ne.ne_codes.counts ?? null, write: result.ne.ne_codes.write ?? null } : null,
         registrations: regEvidence(),
+        // 新商品の確かめがこの後に走る回 = 確かめの前の完了の証跡には「確かめの後の数はまだ」の印 (fail-closed)。最後の書き直しが成功したときだけ ok / skipped に変わる
+        //   (書き直しも failed の書き込みも落ちた = 印が残る = W13:ne は blocked。#1635 Codex R4)
+        ...(result.ne.registrations && result.ne.registrations.write === 'observed' ? { reg_after_check: { state: 'pending' } } : {}),
         baseline: result.ne.baseline ? { state: result.ne.baseline.state, held_reason: result.ne.baseline.held_reason ?? null, write: result.ne.baseline.write ?? null, write_code: result.ne.baseline.write_code ?? null,
           counts: result.ne.baseline.counts ?? null, written: result.ne.baseline.written ?? null } : null } : null,
       // ②b 古い表 (由来 = 作り直しの ID・写しの世代。比べない朝は not_applied と理由だけ)
@@ -287,8 +349,17 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         try { rg.written = await runRegistrationCheck(await writer(), { compareRunId }); rg.write = 'ok'; }
         catch (e) { Object.assign(rg, { write: 'check_failed', write_error: String(e && e.message).slice(0, 200) }); }
       }
+      // 確かめで今日 failed / partial になった商品も今日の要約・証跡 (W13 が読む) に出す = 登録の段階を読み直して数え直す (全件 JSON は不変のまま。#1635 Codex R2 Medium)
+      //   確かめの関数を呼ばなかった (封が無い・落ちた) = skipped (何も変えていない = 確かめの前の数のまま正しい)
+      //   関数を呼んだ後は成功・例外のどちらでも読み直す (commit の後に応答だけ失われた = check_failed でも状態は進んでいるかもしれない。#1635 Codex R5)
+      result.ne.reg_after_check = rg.seal === 'ok' ? await regAfterCheck(db, result.ne, rg.written?.counts ?? null)
+        : { state: 'skipped', reason: `seal_${rg.seal ?? 'none'}` };
       evidence.ne.registrations = regEvidence();
-      try { write(dataDir, EVIDENCE_NAME, evidence); } catch { /* 完了の証跡はもう書けている */ }
+      evidence.ne.reg_after_check = result.ne.reg_after_check;
+      // 確かめの後の証跡を書けない = W13 が確かめの前の数を読む → 回を失敗にする (外の catch が state = failed を書く = W13 は blocked・daily-sync は再試行。#1635 Codex R3)
+      let rewritten = null;
+      try { rewritten = write(dataDir, EVIDENCE_NAME, evidence); } catch { rewritten = null; }
+      if (!rewritten) throw new Error('証跡 (新商品の確かめの後) を書けない = 見張りが確かめの前の数を読む');
     }
     } finally { await closeWriter(); }
     pruneResults(dataDir, { now });

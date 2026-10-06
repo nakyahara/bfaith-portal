@@ -42,7 +42,7 @@ const { buildPlanFromRender } = await import('../apps/company-db/load/sources.mj
 const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
 const { buildMaterialGeneration, saveMaterialSnapshot, materialDigest, projectMaterialRows, MATERIAL_COLUMNS } = await import('../apps/warehouse/material-lineage.js');
 const { MIRROR_PRODUCTS_DDL, MIRROR_SET_COMPONENTS_DDL } = await import('../apps/warehouse-mirror/material-tables.js');
-const { numState, textState, comparability, KNOWN_DIFF, ABSENT, compareNe, nameIsCode } = await import('../apps/company-db/master-compare/compare-ne.mjs');
+const { numState, textState, comparability, KNOWN_DIFF, ABSENT, compareNe, nameIsCode, readRegistrations } = await import('../apps/company-db/master-compare/compare-ne.mjs');
 const { writeDecisions } = await import('../apps/company-db/master-compare/decisions.mjs');
 const { runCompare, RESULT_DIR } = await import('../apps/company-db/master-compare/run.mjs');
 const { pendingDir } = await import('../apps/company-db/master-compare/pending.mjs');
@@ -1141,6 +1141,7 @@ await ta('[29] 新商品の NE 登録の CSV (⑤-2b): ② が最後まで走っ
   const failAt = (re) => ({ query: async (sql, p) => { if (re.test(sql)) throw new Error('writer down'); return db.query(sql, p); } });
   x = await day('2030-04-06', { ne: NEh, compareExtra: { writerDb: failAt(/seal_ne_registration_run/) } });
   assert.deepEqual([x.result.ne.registrations.write, x.result.ne.registrations.seal, x.evidence.state], ['observed', 'failed', 'complete'], JSON.stringify(x.result.ne.registrations));
+  assert.deepEqual(x.evidence.ne.reg_after_check, { state: 'skipped', reason: 'seal_failed' });   // 確かめが走らなかった = 何も変えていない = 確かめの前の数のまま (#1635 Codex R4)
   assert.deepEqual([(await pg.query('select state from ops.ne_reg_export_items where item_id = $1', [it])).rows[0].state,
     (await pg.query('select state from ops.master_registrations where sku_id = $1', [sid])).rows[0].state], ['import_declared', 'ne_pending']);
   await assert.rejects(pg.query('select ops.record_ne_registration_check($1)', [x.result.compare_run_id]), /not_sealed/);
@@ -1332,6 +1333,201 @@ await ta('[32] 持ち主が C の名前・売価・原価 (2026-10-05・#1629 Co
   const ya = y.ne.decisions.find((d) => d.subject_key === 'value:a001' && d.col === 'standard_price_jpy');
   assert.deepEqual([ya.c, ya.proposal, ya.resolutions], [0, { op: 'decide' }, ['accept_difference', 'spec']]);
   await day('2030-07-05', { ne: NE });
+});
+
+await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録待ちで NE に無い = NE 登録待ち (差・判断・W13 に出さない・報告に段階と数) / 14 日たつと reg_stale / やめた = 対象外 / 区分違い = reg_kind_mismatch (⚠️) / partial・failed も報告 / 登録の無い NE 欠け・NE 確認済みは今までどおり / 読めない = 今までどおり', async () => {
+  // 新商品 (画面の道 = ops.create_sku_registration と同じ取引で SKU を作る)。n904 はポータルで単品として登録したのに NE はセット
+  const mk = async (code, kind = 'single') => {
+    await pg.query('begin');
+    const pid = (await pg.query(`insert into core.products (company_id, display_code, name, status) values (1, $1, $2, 'active') returning product_id`, [code, `新商品 ${code}`])).rows[0].product_id;
+    const sid = (await pg.query(`insert into core.skus (company_id, product_id, sku_kind, code, name) values (1, $1, $2, $3, $4) returning sku_id`, [pid, kind, code, `新商品 ${code}`])).rows[0].sku_id;
+    await pg.query('select ops.create_sku_registration($1, $2)', [sid, 'naka@test']);
+    await pg.query('commit');
+    return sid;
+  };
+  const sid = {};
+  for (const c of ['n901', 'n902', 'n903', 'n904', 'n905', 'n906', 'n907']) sid[c] = await mk(c);
+  // NE 登録の CSV の段階 ([29] と同じく持ち主のロールで直接): n901 = 配った / n905 = 申告 → NE登録待ち → 取り込めていない (failed) / n906 = 申告 → NE登録待ち → 中身が違う (partial)
+  let shaN = 0;
+  const csvItem = async (code, upTo) => {
+    const sha = (++shaN).toString(16).padStart(64, 'f');
+    const ex = (await pg.query(`insert into ops.ne_reg_exports (kind, schema_version, header, encoding, trial, item_count, row_count, aggregate_token, payload_hash, sha256, file_bytes, request_id, ne_codes_run, cost_day, created_by)
+      values ('products', 'ne-reg-single-v1', 'syohin_code', 'utf8', true, 1, 1, repeat('a', 64), repeat('b', 64), $1, '\\x00', gen_random_uuid(), 'x', '2030-08-01', 't') returning export_id`, [sha])).rows[0].export_id;
+    const expected = { kind: 'single', values: { name: '登録の名前 (NE と違う)', supplier: '0001', cost: 1, price: 1, tax_rate: 0.1, handling: 'active', parent: null } };
+    const it = (await pg.query(`insert into ops.ne_reg_export_items (export_id, sku_id, code_norm, ne_code, sku_kind, item_token, expected, snapshot_hash, row_from, row_to, state_changed_by)
+      values ($1, $2, $3, $3, 'single', repeat('d', 64), $4::jsonb, repeat('e', 64), 1, 1, 't') returning item_id`, [ex, sid[code], code, JSON.stringify(expected)])).rows[0].item_id;
+    await pg.query(`update ops.ne_reg_export_items set state = 'issued' where item_id = $1`, [it]);
+    await pg.query(`update ops.ne_reg_exports set state = 'issued', issued_at = now(), issued_by = 't' where export_id = $1`, [ex]);
+    if (upTo === 'issued') return;
+    // 全部拒まれたと申告 (0053 の ne_reg_declare と同じ = 配った品目を failed (rejected_all) に。登録は下書きのまま)
+    if (upTo === 'rejected') { await pg.query(`update ops.ne_reg_export_items set state = 'failed', failed_reason = 'rejected_all' where item_id = $1`, [it]); return; }
+    const att = (await pg.query(`insert into ops.ne_reg_attempts (export_id, sha256, declared_by, result) values ($1, $2, 't', 'ok') returning attempt_id`, [ex, sha])).rows[0].attempt_id;
+    await pg.query(`update ops.ne_reg_export_items set state = 'import_declared', attempt_id = $2 where item_id = $1`, [it, att]);
+    await pg.query(`update ops.ne_reg_exports set state = 'declared', declared_at = now(), declared_by = 't' where export_id = $1`, [ex]);
+    await pg.query(`select ops.transition_sku_registration($1, 'ne_pending', 'human', 't', null, '{}'::jsonb)`, [sid[code]]);
+    if (upTo === 'declared') return;   // 取り込んだと申告しただけ (翌朝の照合の確かめが failed / partial にする)
+    await pg.query(upTo === 'failed' ? `update ops.ne_reg_export_items set state = 'failed', failed_reason = 'not_in_ne' where item_id = $1` : `update ops.ne_reg_export_items set state = 'partial' where item_id = $1`, [it]);
+  };
+  await csvItem('n901', 'issued'); await csvItem('n905', 'failed'); await csvItem('n906', 'partial'); await csvItem('n907', 'rejected');
+  await pg.query(`select ops.transition_sku_registration($1, 'cancelled', 'human', 't', '売らないことにした', '{}'::jsonb)`, [sid.n902]);
+  // 状態が最後に進んだ日 (本物の now() は 2030 年より前 = 試験の日に合わせる。関数の中の印を立てて持ち主のロールで)
+  const since = async (code, at) => {
+    await pg.query('begin'); await pg.query("select set_config('ops.registration_protocol', '1', true)");
+    await pg.query('update ops.master_registrations set state_changed_at = $2::timestamptz where sku_id = $1', [sid[code], at]); await pg.query('commit');
+  };
+  for (const c of ['n901', 'n902', 'n904', 'n905', 'n906', 'n907']) await since(c, '2030-08-01T10:00:00+09:00');
+  await since('n903', '2030-07-10T10:00:00+09:00');
+  // NE: いつもの商品 (e005 は NE から消えた = 登録の行が無い NE 欠け) + n904 (セット) + n906 (単品)。材料 = NE のまま、ただし n904 は材料に入れない (ロードが区分を直さない)
+  const NE4 = clone(NE);
+  NE4.products = NE4.products.filter((r) => r.code !== 'e005');
+  NE4.products.push({ code: 'n906', name: 'NE の名前', supplier: '0001', handling: '取扱中', cost_src: J('100'), price_src: J('1000'), tax_src: J('10'), rep: '', rep_src: J('') });
+  NE4.sets.push({ parent: 'n904', name: 'セット N4', child: 'a001', price_src: J('3000'), qty_src: J('2') });
+  const mat4 = () => toMaterial(NE4, (m) => { m.products = m.products.filter((r) => r.商品コード !== 'n904'); m.sets = m.sets.filter((r) => r.セット商品コード !== 'n904'); });
+  const d = await day('2030-08-05', { ne: NE4, material: mat4() });
+  const ne = d.ne;
+  assert.equal(ne.verdict, 'breach', ne.blocked_reason);
+  // NE 登録待ち = 差にしない (案件・判断・保持・回復のどれにも無く、対象外の理由つき)
+  for (const c of ['n901', 'n905', 'n907']) {
+    assert.equal(ne.out_of_scope[`only_in_cdb:${c}`], 'reg_pending', c);
+    assert.ok(!ne.items.some((i) => i.norm === c) && !ne.decisions.some((x) => x.norm === c), `${c} が差に出た`);
+  }
+  assert.equal(ne.out_of_scope['only_in_cdb:n902'], 'reg_cancelled');
+  assert.ok(!ne.items.some((i) => i.norm === 'n902'));
+  // 登録から 14 日以上 (7/10 → 8/5 = 26 日) = reg_stale (判断の一覧に・提案は NE 登録の CSV)
+  assert.deepEqual(clsOf(ne, 'only_in_cdb:n903'), ['reg_stale']);
+  const st = ne.decisions.find((x) => x.subject_key === 'only_in_cdb:n903');
+  assert.deepEqual([st.reason_kind, st.proposal, st.resolutions], ['reg_stale', { op: 'register_in_ne', state: 'draft', since: '2030-07-10' }, ['spec', 'accept_difference']]);
+  // 区分違い = 重大な登録の不一致 (NE を登録の区分に・差を残すは出さない)
+  assert.deepEqual(clsOf(ne, 'kind:n904'), ['reg_kind_mismatch']);
+  const km = ne.decisions.find((x) => x.subject_key === 'kind:n904');
+  assert.deepEqual([km.reason_kind, km.proposal, km.resolutions, km.n, km.c], ['reg_kind_mismatch', { op: 'set_ne_value', value: 'single' }, ['fix_ne', 'spec'], 'set', 'single']);
+  // 登録の行が無い NE 欠け (e005)・NE で一度確かめた新商品 (h009 = [29] で NE 確認済み) は今までどおり差
+  assert.deepEqual(clsOf(ne, 'only_in_cdb:e005'), ['spec_undecided']);
+  assert.ok(ne.items.some((i) => i.subject_key === 'only_in_cdb:h009'));
+  assert.ok(!['reg_stale', 'reg_pending'].includes(col(ne, 'only_in_cdb:h009')[0]?.cls));
+  // 報告: 段階と数・一覧
+  const rp = ne.reg_pending;
+  assert.equal(rp.state, 'ok');
+  // failed の理由で分ける: not_in_ne (申告したのに NE に無い) = failed / rejected_all (全部拒まれた・下書きのまま) = rejected (#1635 Codex R1 Low)
+  assert.deepEqual(rp.waiting.map((e) => [e.code, e.state, e.stage, e.days]), [['n901', 'draft', 'issued', 4], ['n905', 'ne_pending', 'failed', 4], ['n907', 'draft', 'rejected', 4]]);
+  assert.deepEqual(rp.stages, { issued: 1, failed: 1, rejected: 1 });
+  assert.deepEqual([rp.stale.map((e) => [e.code, e.days]), rp.cancelled.map((e) => e.code), rp.kind_mismatch.map((e) => [e.code, e.ne_kind]), rp.partial.map((e) => [e.code, e.stage])],
+    [[['n903', 26]], ['n902'], [['n904', 'set']], [['n906', 'partial']]]);
+  assert.deepEqual([ne.counts.reg_pending, ne.counts.reg_stale, ne.counts.reg_cancelled, ne.counts.reg_kind_mismatch, ne.counts.reg_partial, ne.counts.reg_failed, ne.counts.reg_rejected], [3, 1, 1, 1, 1, 1, 1]);
+  assert.equal(ne.counts.items, ne.items.length);
+  disjoint(ne);
+  // 朝の要約: 新商品の登録の不一致 (区分違い・取り込めていない・中身違い) = ② を先頭に ⚠️・NE 登録待ちの数と段階
+  assert.match(d.line, /^⚠️ ②: 新商品の NE 登録の不一致 \(区分 \(単品・セット\) 違い 1 件・取り込んだと申告したのに NE に無い 1 件・NE が取り込みを全部拒んだ \(CSV を作り直す\) 1 件・NE の中身が登録と違う 1 件\)/);
+  assert.match(d.line, /NE 登録待ち 3 件 \(差に入れない。配った 1・取り込めていない 1・NE が全部拒んだ 1\)・登録から 14 日以上 NE に無い 1 件 \(差\)/);
+  // W13:ne の案件 = items だけ (NE 登録待ちは対象外 = 開かない)。証跡にも数が残る
+  const ev = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-05', 'master-compare.json'), 'utf8'));
+  assert.deepEqual([ev.ne.counts.reg_pending, ev.ne.counts.items], [3, ne.items.length]);
+
+  // NE の行が落ちた朝 (同じ日の取り直し): 前の回に区分違い (n904)・partial (n906) だった新商品が NE から欠けても、NE 登録待ちの対象外にしない = 保持 (#1635 Codex R1 Medium)。
+  //   partial は確かめの記録で数える = ⚠️ を消さない / 待ちの n901 も保持 (NE に無いと言えない)
+  const NEd = clone(NE4); NEd.products = NEd.products.filter((r) => r.code !== 'n906'); NEd.sets = NEd.sets.filter((r) => r.parent !== 'n904');
+  const md = setNe(NEd, '2030-08-05', { intP: { dropped_no_code: 1 } });
+  sendToRender(mat4(), '2030-08-05', setBuild('2030-08-05', md, []));
+  const dr = await compare('2030-08-05');
+  const dn = dr.result.ne;
+  for (const c of ['n901', 'n904', 'n906']) {
+    assert.equal(dn.held[`only_in_cdb:${c}`], 'ne_dropped_rows', c);
+    assert.ok(!Object.hasOwn(dn.out_of_scope, `only_in_cdb:${c}`) && !Object.hasOwn(dn.out_of_scope, `kind:${c}`) && !Object.hasOwn(dn.out_of_scope, `value:${c}`), `${c} を対象外にした`);
+  }
+  assert.equal(dn.held['kind:n904'], 'not_in_ne');
+  assert.deepEqual([dn.counts.reg_pending, dn.counts.reg_partial, dn.reg_pending.partial.map((e) => e.code)], [0, 1, ['n906']]);
+  // 取り込めていない (n905)・全部拒まれた (n907) も確かめの記録で数える = 行が落ちた朝も ⚠️ を消さない
+  assert.match(dr.line, /^⚠️ ②: 新商品の NE 登録の不一致 \(取り込んだと申告したのに NE に無い 1 件・NE が取り込みを全部拒んだ \(CSV を作り直す\) 1 件・NE の中身が登録と違う 1 件\)/);
+  disjoint(dn);
+
+  // 13 日目 = まだ待ち / 14 日目 = reg_stale (n901: 8/1 から)
+  let x = await day('2030-08-14', { ne: NE4, material: mat4() });
+  assert.equal(x.ne.out_of_scope['only_in_cdb:n901'], 'reg_pending');
+  x = await day('2030-08-15', { ne: NE4, material: mat4() });
+  assert.deepEqual(clsOf(x.ne, 'only_in_cdb:n901'), ['reg_stale']);
+  assert.equal(x.ne.decisions.find((y) => y.subject_key === 'only_in_cdb:n901').proposal.state, 'draft');
+  assert.deepEqual(x.ne.reg_pending.stale.map((e) => e.code), ['n901', 'n903', 'n905', 'n907']);
+  // 登録の状態を読めない朝 = NE 登録待ちを分けない (今までどおり差に出す)・要約に「読めない」
+  const broken = { query: (sql, p) => (/from ops\.master_registrations r/.test(sql) ? Promise.reject(new Error('permission denied for table master_registrations')) : db.query(sql, p)) };
+  const y = await compare('2030-08-15', { db: broken });
+  assert.equal(y.result.ne.reg_pending.state, 'unreadable');
+  assert.deepEqual(clsOf(y.result.ne, 'only_in_cdb:n901'), ['spec_undecided']);
+  assert.ok(!Object.hasOwn(y.result.ne.out_of_scope, 'only_in_cdb:n902'));
+  assert.match(y.line, /NE 登録待ちを読めない \(差に含む\)/);
+
+  // 登録の状態は照合が使う状態 (NE 登録待ち・やめた) だけ読む = NE 確認済み (h009) の行は読まない (#1635 Codex R2 Low)
+  await pg.query('begin');
+  try {
+    const rr = await readRegistrations(db);
+    assert.deepEqual([rr.state, rr.byNorm.has('h009'), rr.byNorm.has('n902'), rr.byNorm.get('n907')?.stage, rr.byNorm.get('n905')?.stage], ['ok', false, true, 'rejected', 'failed']);
+  } finally { await pg.query('rollback'); }
+
+  // 本物の順番 (#1635 Codex R2 Medium): 取り込んだと申告しただけ (import_declared) の n908 (NE に無い)・n909 (NE にあるが中身が違う) を、その朝の照合の確かめが
+  //   failed / partial にする → 全件 JSON (確かめの前) の数は前のまま・同じ朝の要約と証跡 (W13 が読む) は確かめの後の数で ⚠️
+  for (const c of ['n908', 'n909']) { sid[c] = await mk(c); await csvItem(c, 'declared'); await since(c, '2030-08-19T10:00:00+09:00'); }
+  const NE5 = clone(NE4);
+  NE5.products.push({ code: 'n909', name: 'NE の名前 9', supplier: '0001', handling: '取扱中', cost_src: J('100'), price_src: J('1000'), tax_src: J('10'), rep: '', rep_src: J('') });
+  const mat5 = () => toMaterial(NE5, (m) => { m.products = m.products.filter((r) => r.商品コード !== 'n904'); m.sets = m.sets.filter((r) => r.セット商品コード !== 'n904'); });
+  const z = await day('2030-08-20', { ne: NE5, material: mat5() });
+  assert.deepEqual(z.result.ne.registrations.written?.counts && [z.result.ne.registrations.written.counts.failed, z.result.ne.registrations.written.counts.partial], [1, 2], JSON.stringify(z.result.ne.registrations));
+  const itemState = async (c) => (await pg.query('select state from ops.ne_reg_export_items where sku_id = $1 order by item_id desc limit 1', [sid[c]])).rows[0].state;
+  assert.deepEqual([await itemState('n908'), await itemState('n909')], ['failed', 'partial']);
+  assert.deepEqual([z.ne.counts.reg_failed, z.ne.counts.reg_partial], [1, 1]);   // 全件 JSON = 確かめの前 (n905・n906 だけ)
+  assert.deepEqual([z.ne.reg_after_check.state, z.ne.reg_after_check.reg_failed, z.ne.reg_after_check.reg_partial, z.ne.reg_after_check.reg_rejected], ['ok', 2, 2, 1]);
+  assert.match(z.line, /^⚠️ ②: 新商品の NE 登録の不一致 \(区分 \(単品・セット\) 違い 1 件・取り込んだと申告したのに NE に無い 2 件・NE が取り込みを全部拒んだ \(CSV を作り直す\) 1 件・NE の中身が登録と違う 2 件\)/);
+  const ev5 = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
+  assert.deepEqual([ev5.ne.reg_after_check.reg_failed, ev5.ne.reg_after_check.reg_partial], [2, 2]);
+  // W13:ne は証跡の確かめの後の数を理由と観測に使う
+  const w13 = await evalW13({ config: W13CFG, asOf: '2030-08-20', evidence: null, syncRunId: null, openIssues: [], dataDir: tmp }, W13CFG.checkById('W13'));
+  const wne = (Array.isArray(w13) ? w13 : [w13]).find((r) => r.scopeKey === 'ne');
+  assert.ok(wne, JSON.stringify(w13).slice(0, 300));
+  assert.deepEqual([wne.observed.reg.failed, wne.observed.reg.partial], [2, 2], JSON.stringify(wne.observed));
+  assert.match(wne.reason, /新商品の取込失敗 2/);
+
+  // 確かめの後の読み直しだけが読めない朝 (#1635 Codex R3): 確かめの前の数に戻さない = 要約の先頭に ⚠️ (確かめの内訳つき)・W13:ne は blocked (案件は保持)
+  let regReads = 0;
+  const failSecond = { query: (sql, p) => (/from ops\.master_registrations r/.test(sql) && ++regReads === 2 ? Promise.reject(new Error('reread down')) : db.query(sql, p)) };
+  const u = await compare('2030-08-20', { db: failSecond });
+  assert.equal(regReads, 2);
+  assert.deepEqual([u.result.ne.registrations.write, u.result.ne.reg_after_check.state], ['ok', 'unreadable']);
+  assert.match(u.line, /^⚠️ ②: 新商品の NE 登録の確かめの後の数を読めない \(reread down\) — 確かめ: .*partial 2/);
+  const evU = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
+  assert.equal(evU.ne.reg_after_check.state, 'unreadable');
+  const wU = (await evalW13({ config: W13CFG, asOf: '2030-08-20', evidence: null, syncRunId: null, openIssues: [], dataDir: tmp }, W13CFG.checkById('W13'))).find((r) => r.scopeKey === 'ne');
+  assert.deepEqual([wU.verdict], ['blocked']);
+  assert.match(wU.reason, /確かめの後の数を読めない/);
+  // 確かめの後の証跡を書けない (writeEvidence は失敗で null を返す) = 回を失敗にする (state = failed = W13 は blocked・daily-sync は再試行)
+  const noAfter = (d0, n0, p0) => (p0.state === 'complete' && p0.ne && p0.ne.reg_after_check && p0.ne.reg_after_check.state !== 'pending' ? null : writeEvidence(d0, n0, p0, { now: at('2030-08-20', '08:40'), warn: quiet }));
+  const wf = await compare('2030-08-20', { write: noAfter }).catch((e) => e);
+  assert.match(String(wf && wf.message), /証跡 \(新商品の確かめの後\) を書けない/);
+  const evF = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
+  assert.equal(evF.state, 'failed');
+  const wF = (await evalW13({ config: W13CFG, asOf: '2030-08-20', evidence: null, syncRunId: null, openIssues: [], dataDir: tmp }, W13CFG.checkById('W13'))).find((r) => r.scopeKey === 'ne');
+  assert.equal(wF.verdict, 'blocked');
+  // 確かめの後の書き直しも failed の書き込みも落ちた (同じファイルの障害が続く) = 確かめの前の完了の証跡に残した印 (pending) で W13:ne は blocked (#1635 Codex R4)
+  const bothFail = (d0, n0, p0) => (p0.state === 'failed' || (p0.state === 'complete' && p0.ne && p0.ne.reg_after_check && p0.ne.reg_after_check.state !== 'pending') ? null
+    : writeEvidence(d0, n0, p0, { now: at('2030-08-20', '08:40'), warn: quiet }));
+  const bf = await compare('2030-08-20', { write: bothFail }).catch((e) => e);
+  assert.match(String(bf && bf.message), /証跡 \(新商品の確かめの後\) を書けない/);
+  const evB = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
+  assert.deepEqual([evB.state, evB.ne.reg_after_check], ['complete', { state: 'pending' }]);
+  const wB = (await evalW13({ config: W13CFG, asOf: '2030-08-20', evidence: null, syncRunId: null, openIssues: [], dataDir: tmp }, W13CFG.checkById('W13'))).find((r) => r.scopeKey === 'ne');
+  assert.equal(wB.verdict, 'blocked');
+  assert.match(wB.reason, /確かめの後の証跡が書けていない/);
+  // ふつうの朝は最後の書き直しで ok (印が残らない)
+  const ok2 = await compare('2030-08-20');
+  assert.equal(ok2.evidence.ne.reg_after_check.state, 'ok');
+  const evO = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
+  assert.equal(evO.ne.reg_after_check.state, 'ok');
+  // 確かめの関数が commit した後に応答だけ失われた (接続が切れた) = check_failed でも読み直す (skipped にしない。#1635 Codex R5)
+  sid.n910 = await mk('n910'); await csvItem('n910', 'declared'); await since('n910', '2030-08-19T10:00:00+09:00');
+  const lostReply = { query: async (sql, p) => { const r = await db.query(sql, p); if (/record_ne_registration_check/.test(sql)) throw new Error('connection lost after commit'); return r; } };
+  const lr = await compare('2030-08-20', { writerDb: lostReply });
+  assert.deepEqual([lr.result.ne.registrations.write, await itemState('n910')], ['check_failed', 'failed']);   // DB は確かめを commit 済み
+  assert.deepEqual([lr.result.ne.reg_after_check.state, lr.result.ne.reg_after_check.reg_failed], ['ok', 3]);   // n905・n908・n910
+  assert.match(lr.line, /^⚠️ ②: 新商品の NE 登録の不一致 \(.*取り込んだと申告したのに NE に無い 3 件/);
+  const evL = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
+  assert.deepEqual([evL.ne.reg_after_check.state, evL.ne.reg_after_check.reg_failed], ['ok', 3]);
 });
 
 await pg.close();
