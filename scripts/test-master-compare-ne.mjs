@@ -140,7 +140,8 @@ function setNe(ne, asOf, { intP = {}, intS = {}, dropIntKeys = [] } = {}) {
   const s = { ...INT_S, ...intS }; for (const k of dropIntKeys) delete s[k];
   up('ne_api_products_integrity', JSON.stringify({ ...INT_P, ...intP })); up('ne_api_setproducts_integrity', JSON.stringify(s));
   // 取得の件数 (#1642 の ne-fetch-counts.js の形)。この試験の NE は落とした行・重なりの無いきれいな取得 (本物の取込を通す試験は [38])
-  const fc = (kind, n, rev, detail, notes) => JSON.stringify({ version: 'fc1', kind, fetch_fingerprint: 'a'.repeat(64), complete_at: ts, complete_rev: Number(rev), fetched_rows: n, write_attempts: n, stored_rows: n,
+  const fc = (kind, n, rev, detail, notes) => JSON.stringify({ version: 'fc1', kind, fetch_fingerprint: 'a'.repeat(64), complete_at: ts, complete_rev: Number(rev),
+    started_at: `${ts.replace(' ', 'T')}.000Z`, finished_at: `${ts.replace(' ', 'T')}.000Z`, fetched_rows: n, write_attempts: n, stored_rows: n,
     dropped_no_code: 0, dropped_missing_fields: 0, dropped_missing_detail: detail, notes, page_limit: 1000, pages: 1, page_rows: [n], last_page_rows: n });
   up('ne_api_products_fetch_counts', fc('products', ne.products.length, meta('ne_raw_products_rev'), {}, {}));
   up('ne_api_setproducts_fetch_counts', fc('setproducts', ne.sets.length, meta('ne_raw_setproducts_rev'), { set_goods_detail_goods_id: 0 }, { quantity_defaulted_rows: 0 }));
