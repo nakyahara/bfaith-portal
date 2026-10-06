@@ -214,6 +214,12 @@ await ta('[9] ポータルで登録した新商品: NE 登録待ち (out_of_scop
   // 差が無く NE 登録待ちだけの朝 = pass (理由に数)
   const r2 = await run(d, evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: { 'only_in_cdb:n901': 'reg_pending' }, extraCounts: { reg_pending: 1 } } }), '2026-10-04T23:20:00Z');
   assert.deepEqual([res(r2, 'ne').verdict, res(r2, 'ne').reason], ['pass', 'NE 登録待ち 1 件 (差に入れない)']);
+  // 照合の確かめ (回の後半) で今日 failed になった = 全件 JSON は確かめの前の数 (0)・証跡の reg_after_check が確かめの後の数 → 理由と観測は後の数 (#1635 Codex R2 Medium)
+  const ev3 = evidenceFor(d, { ne: { items: [], recoverable: [], out_of_scope: { 'only_in_cdb:n901': 'reg_pending' }, extraCounts: { reg_pending: 1, reg_failed: 0, reg_partial: 0, reg_rejected: 0 } } });
+  ev3.ne.reg_after_check = { state: 'ok', reg_failed: 1, reg_partial: 0, reg_rejected: 0 };
+  const r3 = await run(d, ev3, '2026-10-04T23:30:00Z');
+  assert.equal(res(r3, 'ne').reason, 'NE 登録待ち 1 件 (差に入れない)・新商品の取込失敗 1');
+  assert.equal(res(r3, 'ne').observed.reg.failed, 1);
 });
 
 await pg.close();

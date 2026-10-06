@@ -25,7 +25,7 @@ import { openPgClient, pgAdapter } from '../../../scripts/company-db/migrate.mjs
 import { jstDateStr } from '../../../lib/jst-date.js';
 import { writeEvidence } from '../push/evidence.mjs';
 import { compareLoad, readCdbMaster, LOAD_CTX } from './compare-load.mjs';
-import { compareNe, NE_FORMAT, readRegistrations } from './compare-ne.mjs';
+import { compareNe, NE_FORMAT, readRegistrations, regTroubleCounts } from './compare-ne.mjs';
 import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs, markWriteFailed } from './pending.mjs';
 import { readDecisionLedger, writeDecisions, writeNeCodes, connectDecisionWriter, snapshotRegTargets, writeRegistrationObservations, sealRegistrationRun, runRegistrationCheck } from './decisions.mjs';
 import { readBaseline, writeBaseline, holdAllDirections } from './baseline.mjs';
@@ -140,9 +140,24 @@ export function regSummary(ne) {
   if (c.reg_stale) parts.push(`登録から ${rp.stale_days} 日以上 NE に無い ${c.reg_stale} 件 (差)`);
   return parts.length ? `・${parts.join('・')}` : '';
 }
-/** ポータルで登録した新商品の NE 登録の不一致 (朝の要約の先頭の ⚠️)。無ければ null */
+/**
+ * 確かめ (record_ne_registration_check) の後に登録の段階を読み直す (照合の読む接続・読み取りだけの短い取引)。
+ * 区分違いは照合の結果のまま (二重に数えない)。読めない = state unreadable (照合の時の数のまま)
+ */
+export async function regAfterCheck(db, ne, checkCounts) {
+  try {
+    await db.query('begin transaction read only');
+    try {
+      const fresh = await readRegistrations(db);
+      if (fresh.state !== 'ok') return { state: fresh.state, check: checkCounts };
+      return { state: 'ok', check: checkCounts, ...regTroubleCounts(fresh, new Set((ne.reg_pending?.kind_mismatch || []).map((e) => e.norm))) };
+    } finally { try { await db.query('rollback'); } catch { /* */ } }
+  } catch (e) { return { state: 'unreadable', check: checkCounts, reason: String(e && e.message).slice(0, 200) }; }
+}
+/** ポータルで登録した新商品の NE 登録の不一致 (朝の要約の先頭の ⚠️)。確かめの後に読み直した数があればそちら。無ければ null */
 export function regTrouble(ne) {
-  const c = (ne && ne.counts) || {};
+  const a = ne && ne.reg_after_check && ne.reg_after_check.state === 'ok' ? ne.reg_after_check : null;
+  const c = { ...((ne && ne.counts) || {}), ...(a ? { reg_failed: a.reg_failed, reg_rejected: a.reg_rejected, reg_partial: a.reg_partial } : {}) };
   const parts = [];
   if (c.reg_kind_mismatch) parts.push(`区分 (単品・セット) 違い ${c.reg_kind_mismatch} 件`);
   if (c.reg_failed) parts.push(`取り込んだと申告したのに NE に無い ${c.reg_failed} 件`);
@@ -322,7 +337,10 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         try { rg.written = await runRegistrationCheck(await writer(), { compareRunId }); rg.write = 'ok'; }
         catch (e) { Object.assign(rg, { write: 'check_failed', write_error: String(e && e.message).slice(0, 200) }); }
       }
+      // 確かめで今日 failed / partial になった商品も今日の要約・証跡 (W13 が読む) に出す = 登録の段階を読み直して数え直す (全件 JSON は不変のまま。#1635 Codex R2 Medium)
+      if (rg.write === 'ok') result.ne.reg_after_check = await regAfterCheck(db, result.ne, rg.written?.counts ?? null);
       evidence.ne.registrations = regEvidence();
+      if (result.ne.reg_after_check) evidence.ne.reg_after_check = result.ne.reg_after_check;
       try { write(dataDir, EVIDENCE_NAME, evidence); } catch { /* 完了の証跡はもう書けている */ }
     }
     } finally { await closeWriter(); }

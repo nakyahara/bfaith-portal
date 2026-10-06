@@ -42,6 +42,8 @@ const DECISION_CLASSES = new Set(['rule', 'rule_lag', 'held_by_load', 'spec_unde
  *   区分 (単品・セット) が違う = reg_kind_mismatch (重大な登録の不一致 = 判断の一覧と W13・朝の要約の先頭の ⚠️)
  */
 export const REG_WAIT_STATES = Object.freeze(['draft', 'ne_pending']);
+/** 照合が読む登録の状態 (NE 登録待ち + やめた)。ne_confirmed 以降・quarantined は読まない (今までどおり) */
+const REG_READ_STATES = Object.freeze([...REG_WAIT_STATES, 'cancelled']);
 export const REG_STALE_DAYS = 14;
 /** 承認の指紋の「意味の版」(理由の種類ごとに手で上げる。C2 v4 §6) */
 export const SEMANTIC_VERSIONS = Object.freeze({ tax_fallback: 1, tax_unresolved: 1, exception_cost: 1, exception_tax_manual: 1, set_name_blank: 1, set_price_from_goods: 1,
@@ -240,11 +242,16 @@ export async function readRegistrations(db, companyId = 1) {
     if (!exists) { await db.query('release savepoint master_registrations_read'); return { state: 'not_applied' }; }
     // NE 登録の CSV (0053) の、その SKU の最後の品目の状態 (段階を分けて報告に残す。0053 の前 = 品目なし)
     const hasItems = (await db.query("select to_regclass('ops.ne_reg_export_items') is not null as ok")).rows[0].ok;
-    const rows = (await db.query(`select s.code_norm, s.sku_kind, r.state, extract(epoch from r.state_changed_at)::float8 as changed, extract(epoch from r.created_at)::float8 as created,
-             ${hasItems ? `(select case when i.state = 'failed' then 'failed:' || coalesce(i.failed_reason, '') else i.state end
-                from ops.ne_reg_export_items i where i.sku_id = r.sku_id order by i.item_id desc limit 1)` : 'null::text'} as item_state
-        from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id
-       where r.company_id = $1 and r.origin = 'new_entry'`, [companyId])).rows;
+    // 照合が使う状態 (NE 登録待ち・やめた) だけ読む = NE 確認済み以降の行は増え続けても読まない。最後の品目は 1 回だけ集約する (行ごとの相関の検索をしない。#1635 Codex R2 Low)
+    const rows = (await db.query(`with regs as (
+          select r.sku_id, r.state, r.state_changed_at, r.created_at from ops.master_registrations r
+           where r.company_id = $1 and r.origin = 'new_entry' and r.state = any ($2::text[]))
+        ${hasItems ? `, last_item as (
+          select distinct on (i.sku_id) i.sku_id, case when i.state = 'failed' then 'failed:' || coalesce(i.failed_reason, '') else i.state end as item_state
+            from ops.ne_reg_export_items i join regs g on g.sku_id = i.sku_id order by i.sku_id, i.item_id desc)` : ''}
+        select s.code_norm, s.sku_kind, g.state, extract(epoch from g.state_changed_at)::float8 as changed, extract(epoch from g.created_at)::float8 as created,
+               ${hasItems ? 'l.item_state' : 'null::text as item_state'}
+          from regs g join core.skus s on s.sku_id = g.sku_id ${hasItems ? 'left join last_item l on l.sku_id = g.sku_id' : ''}`, [companyId, REG_READ_STATES])).rows;
     await db.query('release savepoint master_registrations_read');
     const byNorm = new Map();
     for (const r of rows) {
@@ -256,6 +263,20 @@ export async function readRegistrations(db, companyId = 1) {
     try { await db.query('rollback to savepoint master_registrations_read'); } catch { /* */ }
     return { state: 'unreadable', reason: String(e && e.message).slice(0, 200) };
   }
+}
+/**
+ * 新商品の NE 登録の不一致の数 (NE 登録待ちの状態で、新規登録の CSV の最後の品目が failed (not_in_ne) / rejected (rejected_all) / partial)。
+ * NE の取得の朝 (行が落ちた・NE に無い) に依らず、確かめの記録で数える。区分違いに出した商品 (excludeNorms) は二重に数えない。
+ * run.mjs は確かめ (record_ne_registration_check) の後に読み直して、同じ関数で当日の数にする (#1635 Codex R2 Medium)
+ */
+export function regTroubleCounts(registrations, excludeNorms = new Set()) {
+  const c = { reg_failed: 0, reg_rejected: 0, reg_partial: 0 };
+  if (!registrations || registrations.state !== 'ok') return c;
+  for (const [norm, g] of registrations.byNorm) {
+    if (!REG_WAIT_STATES.includes(g.state) || excludeNorms.has(norm)) continue;
+    if (g.stage === 'failed') c.reg_failed++; else if (g.stage === 'rejected') c.reg_rejected++; else if (g.stage === 'partial') c.reg_partial++;
+  }
+  return c;
 }
 /**
  * NE に無い SKU の登録の扱い。null = 今までどおり (登録の行が無い・new_entry でない・NE で一度確かめた・読めない)
@@ -1062,10 +1083,9 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   const byCode = (a, b) => (a.norm < b.norm ? -1 : a.norm > b.norm ? 1 : 0);
   // 日がたった分で「差を残す」の承認で閉じたもの = 一覧には残し、差の数には入れない
   for (const e of regList.stale) if (out.out_of_scope[subjectKey('only_in_cdb', e.norm)] === 'approved_exception') e.accepted = true;
-  const absent = [...regList.waiting, ...regList.stale];
   const stages = Object.fromEntries(REG_STAGES.map((st) => [st, regList.waiting.filter((e) => e.stage === st).length]).filter(([, v]) => v));   // NE 登録待ちの段階ごとの数
   const regCounts = { reg_pending: regList.waiting.length, reg_stale: regList.stale.filter((e) => !e.accepted).length, reg_cancelled: regList.cancelled.length, reg_kind_mismatch: regList.kind_mismatch.length,
-    reg_partial: regList.partial.length, reg_failed: absent.filter((e) => e.stage === 'failed').length, reg_rejected: absent.filter((e) => e.stage === 'rejected').length };
+    ...regTroubleCounts(registrations, new Set(regList.kind_mismatch.map((e) => e.norm))) };
   out.reg_pending = { state: registrations ? registrations.state : 'not_applied', ...(registrations && registrations.reason ? { reason: registrations.reason } : {}), stale_days: REG_STALE_DAYS,
     stages, waiting: regList.waiting.sort(byCode), stale: regList.stale.sort(byCode), cancelled: regList.cancelled.sort(byCode), kind_mismatch: regList.kind_mismatch.sort(byCode),
     partial: regList.partial.sort(byCode) };

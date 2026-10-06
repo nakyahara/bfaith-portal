@@ -844,7 +844,9 @@ function evalW13Ne(config, check, res, ev, base0) {
   r.observed.held = Object.keys(held).length; r.observed.recoverable = rec.length;
   r.verdict = r.items.length ? 'breach' : 'pass';
   // ポータルで登録した新商品: NE 登録待ち (差に入れない = 案件にしない・out_of_scope の reg_pending) の数と、登録の不一致 (区分違いは案件・取込失敗・中身違いは数だけ)
-  const c = ne.counts || {};
+  // 確かめ (照合の回の後半) で今日 failed / partial になった数 = 証跡の reg_after_check (全件 JSON は確かめの前の数。#1635 Codex R2 Medium)
+  const after = ev.ne && ev.ne.reg_after_check && ev.ne.reg_after_check.state === 'ok' ? ev.ne.reg_after_check : null;
+  const c = { ...(ne.counts || {}), ...(after ? { reg_failed: after.reg_failed, reg_rejected: after.reg_rejected, reg_partial: after.reg_partial } : {}) };
   const regNote = [c.reg_pending ? `NE 登録待ち ${c.reg_pending} 件 (差に入れない)` : null, c.reg_kind_mismatch ? `新商品の区分違い ${c.reg_kind_mismatch}` : null,
     c.reg_failed ? `新商品の取込失敗 ${c.reg_failed}` : null, c.reg_rejected ? `新商品の取込を NE が拒んだ ${c.reg_rejected}` : null,
     c.reg_partial ? `新商品の中身違い ${c.reg_partial}` : null].filter(Boolean).join('・');
