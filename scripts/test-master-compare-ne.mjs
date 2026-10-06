@@ -1519,6 +1519,15 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
   assert.equal(ok2.evidence.ne.reg_after_check.state, 'ok');
   const evO = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
   assert.equal(evO.ne.reg_after_check.state, 'ok');
+  // 確かめの関数が commit した後に応答だけ失われた (接続が切れた) = check_failed でも読み直す (skipped にしない。#1635 Codex R5)
+  sid.n910 = await mk('n910'); await csvItem('n910', 'declared'); await since('n910', '2030-08-19T10:00:00+09:00');
+  const lostReply = { query: async (sql, p) => { const r = await db.query(sql, p); if (/record_ne_registration_check/.test(sql)) throw new Error('connection lost after commit'); return r; } };
+  const lr = await compare('2030-08-20', { writerDb: lostReply });
+  assert.deepEqual([lr.result.ne.registrations.write, await itemState('n910')], ['check_failed', 'failed']);   // DB は確かめを commit 済み
+  assert.deepEqual([lr.result.ne.reg_after_check.state, lr.result.ne.reg_after_check.reg_failed], ['ok', 3]);   // n905・n908・n910
+  assert.match(lr.line, /^⚠️ ②: 新商品の NE 登録の不一致 \(.*取り込んだと申告したのに NE に無い 3 件/);
+  const evL = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
+  assert.deepEqual([evL.ne.reg_after_check.state, evL.ne.reg_after_check.reg_failed], ['ok', 3]);
 });
 
 await pg.close();

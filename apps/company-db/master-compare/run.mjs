@@ -350,9 +350,10 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         catch (e) { Object.assign(rg, { write: 'check_failed', write_error: String(e && e.message).slice(0, 200) }); }
       }
       // 確かめで今日 failed / partial になった商品も今日の要約・証跡 (W13 が読む) に出す = 登録の段階を読み直して数え直す (全件 JSON は不変のまま。#1635 Codex R2 Medium)
-      //   確かめが走らなかった・落ちた (1 つの関数 = 何も変えていない) = skipped (確かめの前の数のまま正しい)
-      result.ne.reg_after_check = rg.write === 'ok' ? await regAfterCheck(db, result.ne, rg.written?.counts ?? null)
-        : { state: 'skipped', reason: rg.seal !== 'ok' ? `seal_${rg.seal ?? 'none'}` : rg.write };
+      //   確かめの関数を呼ばなかった (封が無い・落ちた) = skipped (何も変えていない = 確かめの前の数のまま正しい)
+      //   関数を呼んだ後は成功・例外のどちらでも読み直す (commit の後に応答だけ失われた = check_failed でも状態は進んでいるかもしれない。#1635 Codex R5)
+      result.ne.reg_after_check = rg.seal === 'ok' ? await regAfterCheck(db, result.ne, rg.written?.counts ?? null)
+        : { state: 'skipped', reason: `seal_${rg.seal ?? 'none'}` };
       evidence.ne.registrations = regEvidence();
       evidence.ne.reg_after_check = result.ne.reg_after_check;
       // 確かめの後の証跡を書けない = W13 が確かめの前の数を読む → 回を失敗にする (外の catch が state = failed を書く = W13 は blocked・daily-sync は再試行。#1635 Codex R3)
