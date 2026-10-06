@@ -247,6 +247,8 @@
     }
     if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); openPalette(''); return; }
     if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 's' || e.key === 'S')) {
+      // 日本語入力の変換中 (未確定の字がある) は保存しない = 確定前の字を送らない (#1631 Codex R1 M1)。ブラウザの保存の窓も出さない
+      if (ME.onSave && (e.isComposing || e.keyCode === 229)) { e.preventDefault(); return; }
       if (ME.onSave) { e.preventDefault(); if (!openBox()) ME.onSave(); }
       return;
     }
