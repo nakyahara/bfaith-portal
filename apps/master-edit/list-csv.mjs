@@ -9,7 +9,7 @@
  *   読めない参考の値 = 空 + 見出しに「読めない」。注文残 = 発注アプリの利用権がある人だけ (無い人には列ごと出さない)
  */
 import { fmtJst, fmtDay } from './ui-format.mjs';
-import { PLATFORM_FEE_RATES } from '../../lib/profit-estimate.js';
+import { PLATFORM_FEE_RATES, ratePct1 } from '../../lib/profit-estimate.js';
 
 export const KIND_LABELS = Object.freeze({ single: '単品', set: 'セット', exception: '例外' });
 const SALES_LABELS = Object.freeze({ 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' });
@@ -56,7 +56,7 @@ export function buildListCsv(data, extras, { poOk = false, nowMs = Date.now(), r
     ['原価は構成品から計算', (r) => (r.cost != null && r.cost_derived ? '計算' : '')],
     ['税率 (%)', (r) => (r.tax_rate == null ? null : Math.round(r.tax_rate * 100))],
     [`利益 (1 個あたり・参考・手数料 ${Math.round(PLATFORM_FEE_RATES.standard * 1000) / 10}%・円)`, (r) => (r.profit == null ? null : r.profit)],
-    ['利益率 (%)', (r) => (r.profit_rate == null ? null : Math.round(r.profit_rate * 1000) / 10)],
+    ['利益率 (%)', (r) => ratePct1(r.profit_rate)],   // 画面と同じ丸め (lib の ratePct1。Codex #1632 R3 L: 独自の Math.round だと 0.1 ずれた)
     ['売上分類', (r) => (r.sales_class == null ? '' : SALES_LABELS[r.sales_class] || String(r.sales_class))],
     ['代表の仕入先コード', (r) => r.primary_supplier || ''],
     ['代表の仕入先', (r) => r.primary_supplier_name || ''],
