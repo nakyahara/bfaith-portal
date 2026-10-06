@@ -17,7 +17,7 @@
  */
 
 import { blockReasonOf } from './mall-capabilities.js';
-import { estimateGross, DEFAULT_TAX_RATE } from '../../lib/profit-estimate.js';
+import { estimateGross, DEFAULT_TAX_RATE, grossYen, ratePct1 } from '../../lib/profit-estimate.js';
 
 /** 消費税率が未登録なら 10% (amazon-accounting と同じ扱い)。値は lib/profit-estimate.js が正 (ここは export し直すだけ) */
 export { DEFAULT_TAX_RATE };
@@ -136,12 +136,14 @@ export function evaluateRow(row) {
   const floor = costFloorCheck({ price: next, cost: row.cost, taxRate: row.taxRate, shipping: row.shipping });
   if (next != null && !floor.ok && floor.reason) blocks.push(floor.reason);
 
-  const estimate = estimateGross({
+  const raw = estimateGross({
     price: next ?? current, cost: row.cost, taxRate: row.taxRate,
     feeRate: row.feeRate, shipping: row.shipping,
   });
+  // 見せる円・% (grossYen / ratePct) = マスタの入力の利益と同じ丸め (lib/profit-estimate.js)。生の gross / rate はそのまま残す (判定は生の値)
+  const estimate = { ...raw, grossYen: grossYen(raw.gross), ratePct: ratePct1(raw.rate) };
   if (estimate.rate != null && estimate.rate < LOW_MARGIN_RATE) {
-    warns.push(`粗利率が低いです (概算 ${(estimate.rate * 100).toFixed(1)}%)`);
+    warns.push(`粗利率が低いです (概算 ${estimate.ratePct.toFixed(1)}%)`);
   }
 
   return {

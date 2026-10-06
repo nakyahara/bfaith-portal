@@ -8,11 +8,13 @@
  *   4 マイナス (赤字) も計算する・見せ方は「−」
  *   5 price-update の estimateGross は同じ関数 (export し直し)・手数料の率は 1 か所 (PLATFORM_FEE_RATES)
  *   6 import の無いファイル (ブラウザにそのまま配る) = import / require を書いていない
+ *   8 マスタの入力と価格改定の画面の円・% が同じ (Codex #1632 R2 M: 売価 1,367・原価 645・10%・送料 520・手数料 10% = 0.5 円が浮動小数で 0.4999… → 前は価格改定だけ 0 円)
  *   7 内訳の 1 行の等式が必ず成り立つ (税込原価が .5 になる 10%・小数の送料・8% の 2 桁) = 左の式の数 = 右の数・利益 = その四捨五入 (Codex #1632 R1 Low)
  * 使い方: node scripts/test-profit-estimate.mjs
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import vm from 'node:vm';
 
 const PF = await import('../lib/profit-estimate.js');
 const PU = await import('../apps/price-update/pricing.js');
@@ -124,6 +126,50 @@ t('[7] 内訳の 1 行の等式が成り立つ: 税込原価 16.5 (原価 15 × 
   }
   assert.ok(checked > 20000);
 });
+
+{
+  // 価格改定の画面 (views/index.ejs の画面の JS) の粗利の欄を、本物の関数で描く (サーバーの evaluateRow の答えを JSON で渡すのと同じ)
+  const tpl = fs.readFileSync(new URL('../apps/price-update/views/index.ejs', import.meta.url), 'utf8');
+  const yenSrc = /^ {2}const yen = .*;$/m.exec(tpl)[0];
+  const cellSrc = /^ {2}function grossCell\(r, ev\) \{[\s\S]*?^ {2}\}$/m.exec(tpl)[0];
+  assert.ok(!/<%/.test(yenSrc + cellSrc), 'EJS のタグを含まない部分だけ');
+  const ctx = vm.createContext({});
+  vm.runInContext(`${yenSrc}\n${cellSrc}\nthis.grossCell = grossCell;`, ctx);
+  const puCell = (row) => {
+    const ev = JSON.parse(JSON.stringify(PU.evaluateRow({ mall: 'rakuten', confidence: 'confirmed', currentPrice: row.price, newPrice: row.price, cost: row.cost, taxRate: row.taxRate, shipping: row.shipping, feeRate: 0.1 })));
+    const html = ctx.grossCell({ newPrice: row.price, shippingSource: 'known' }, ev);
+    const m = /<div>(-?[\d,]+) 円<\/div><div class="pu-note">(-?[\d.]+)%<\/div>/.exec(html);
+    assert.ok(m, html);
+    return { yen: Number(m[1].replace(/,/g, '')), pct: Number(m[2]), ev };
+  };
+  const R = await import('../apps/master-edit/read.mjs');
+  const meCell = (row) => {
+    const r = R.rowProfit({ standard_price: row.price, cost: row.cost, tax_rate: row.taxRate, shipping_cost: row.shipping });   // 一覧・CSV・画面の利益
+    return { yen: Number(PF.fmtProfitYen(r.profit).replace('−', '-').replace(/,/g, '')), pct: Number(PF.fmtProfitRate(r.rate).replace('−', '-').replace('%', '')), r };
+  };
+  t('[8] マスタの入力と価格改定の画面の利益の円・% が同じ (Codex の再現値 1,367・645・10%・520 = 両方 1 円)・生の gross は変えない・総当たり', () => {
+    const codex = { price: 1367, cost: 645, taxRate: 0.1, shipping: 520 };
+    const raw = PF.estimateGross({ ...codex, feeRate: 0.1 }).gross;
+    assert.ok(raw > 0.49 && raw < 0.5, `浮動小数では 0.5 に届かない (${raw})`);
+    assert.equal(PF.grossYen(raw), 1, '銭まで丸めてから円 = 1 円');
+    const pu = puCell(codex); const me = meCell(codex);
+    assert.equal(pu.ev.estimate.gross, raw, '価格改定の生の gross はそのまま (判定はこれ)');
+    assert.deepEqual([pu.yen, me.yen], [1, 1], '両方の画面が 1 円');
+    assert.equal(pu.pct, me.pct);
+    assert.equal(PF.masterProfit(codex).profit, 1);
+    assert.equal(PF.grossYen(-0.4), 0); assert.ok(!Object.is(PF.grossYen(-0.4), -0), '−0 は 0');
+    assert.equal(PF.grossYen(null), null); assert.equal(PF.ratePct1(null), null);
+    assert.equal(PF.ratePct1(0.1235), 12.4); assert.ok(!Object.is(PF.ratePct1(-0.00001), -0));
+    let n = 0;
+    for (const price of [980, 1367, 1980, 2500]) for (let cost = 1; cost <= 1500; cost += 7) for (const taxRate of [0.08, 0.1]) for (const shipping of [0, 210.4, 520]) {
+      const row = { price, cost, taxRate, shipping };
+      const a = puCell(row); const b = meCell(row);
+      assert.deepEqual([a.yen, a.pct], [b.yen, b.pct], JSON.stringify(row));
+      n++;
+    }
+    assert.ok(n > 4000);
+  });
+}
 
 console.log(`\n${passed} 件 ok`);
 if (process.exitCode) console.error('NG があります');
