@@ -37,6 +37,8 @@ export const WHEN_FROZEN = Object.freeze({
   banner: '画面は「マスタは新しい画面で直します ↗」の帯を出し、書く部品を隠す (見るだけ)',
   exit_nonzero: 'CLI は何も書かないで終了コード 3 (段階が読めないときも 3)',
   job_skip: '定期の取込を丸ごと止める (閉じている = ログと ok の ping・読めない = fail の ping)',
+  new_entry_409: '新商品の古い作り方: 作れる種類が全部閉じた = 409 {error:"master_new_entry_moved", kinds, message, url: 新しい新商品の画面}・段階 / 持ち主が読めない = 503。何も書かない。'
+    + '入口が開いていても、閉じた種類 (例: 単品) を作る要求は handler が 409 (refuseLegacyNewKind)',
 });
 
 const R = (o) => Object.freeze({ kind: 'route', when_frozen: 'http_410', ...o });
@@ -46,6 +48,27 @@ const R = (o) => Object.freeze({ kind: 'route', when_frozen: 'http_410', ...o })
  */
 export const NEW_PRODUCT_COLS = Object.freeze(['products.name', 'products.sales_class', 'products.status', 'sku_components', 'sku_costs', 'skus.handling', 'skus.name',
   'skus.reorder_months', 'skus.shipping', 'skus.sku_kind', 'skus.standard_price', 'skus.tax_class', 'skus.tax_rate', 'supplier_skus.is_primary']);
+/**
+ * 🆕 広げる道 PR-6 (2026-10-06・設計 v3 G17): 新商品の古い作り方の「種類ごとの門」。種類 (単品 / セット) ごとに、新しい登録 (lib/master-register.mjs の
+ * NEW_ENTRY_KEYS) のその種類の列が**全部 C** になったら、その種類の作成だけ閉じる (試験が NEW_ENTRY_KEYS と同じことを確かめる)。
+ *   単品 = 13 キー (10/4 の C の 12 キー + skus.sku_kind)。skus.sku_kind を C に広げた瞬間 (prepare から = active ∪ prepared) に単品の作成が閉じる
+ *   セット = sku_components も要る = sku_components を広げるまで今までどおり
+ * 入口の new_kinds = その入口が作れる種類。owner_cols = その種類の列を合わせたもの・owner_match = 'all' (= 全部の種類が閉じたときだけ入口ごと閉じる)。
+ * 入口ごと開いている間は、handler が作る種類を決めて refuseLegacyNewKind (lib/master-legacy-gate.mjs) で確かめる (閉じた種類 = 409 + 新しい画面へ案内)
+ */
+export const NEW_KIND_COLS = Object.freeze({
+  single: Object.freeze(['skus.name', 'products.name', 'skus.sku_kind', 'skus.tax_rate', 'skus.tax_class', 'skus.handling', 'products.status', 'products.sales_class',
+    'skus.standard_price', 'skus.shipping', 'skus.reorder_months', 'supplier_skus.is_primary', 'sku_costs']),
+  set: Object.freeze(['skus.name', 'skus.sku_kind', 'skus.tax_rate', 'skus.tax_class', 'skus.handling', 'products.sales_class',
+    'skus.standard_price', 'skus.shipping', 'skus.reorder_months', 'sku_costs', 'sku_components']),
+});
+export const NEW_KIND_LABELS = Object.freeze({ single: '単品', set: 'セット' });
+/** 新しい「新商品の登録」の画面 (種類が閉じたときの案内先) */
+export const NEW_ENTRY_URL = `${MASTER_EDIT_URL}new`;
+/** 入口が作れる種類 (new_kinds) の列を合わせたもの (owner_cols の決め方。起動時の検査と試験が同じ関数を使う) */
+export function newKindCols(kinds) {
+  return [...new Set(kinds.flatMap((k) => NEW_KIND_COLS[k] || []))];
+}
 /** profit-calculator の NE 用 CSV (NE の商品マスタの一括取込) が書く列 = 商品名 (syohin_name)・仕入先 (sire_code)・原価 (genka_tnk)・売価 (baika_tnk)・代表コード (daihyo_syohin_code)・セットの数量 (suryo) */
 const NE_CSV_COLS = Object.freeze(['skus.name', 'products.name', 'sku_costs', 'skus.standard_price', 'supplier_skus.is_primary', 'products.parent', 'sku_components']);
 /** 発注アプリの仕入先の行 (po_suppliers) の全部の列 = 名前・発注方法 (send_method)・リードタイム (lead_days)・連絡先 6 列 (order_memo を含む)。Codex #1610 R1 Medium */
@@ -102,12 +125,18 @@ export const LEGACY_ENTRIES = Object.freeze([
     id: `product-hub:${method}:${p}`, app: 'product-hub', host: 'render', file: 'apps/product-hub/router.js', mount: '/apps/product-hub', method, path: p,
     ...(dryRun ? { dry_run: dryRun } : {}), writes: ['draft_yahoo.tax_rate'], owner_cols: ['skus.tax_rate'], ref: '10 §4 #6 (PR #1565 R1 H4)',
   })),
-  // 古い新商品の作り方 (人が下書きを作る /new・NE のコードから一括登録・NE が先の自動取込を手で回す) = 新しい登録で単品もセットも作れるようになったら閉じる
-  // (owner_match 'all' = NEW_PRODUCT_COLS が全部 C。10 §4 #11・Codex ⑤-2a M5)。それまでは開けたまま (⑤-3b: 10/5 は sku_kind・sku_components が load = 開く)。
+  // 古い新商品の作り方 (人が下書きを作る /new・NE のコードから一括登録・NE が先の自動取込を手で回す・Notion の画像 DB の移植) = 種類ごとの門 (広げる道 PR-6・G17):
+  //   その種類 (new_kinds) の新しい登録の列 (NEW_KIND_COLS) が全部 C (active ∪ prepared) になったら、その種類の作成だけ閉じる (409 + 新しい新商品の画面へ)。
+  //   全部の種類が閉じたら入口ごと閉じる (owner_cols = 種類の列を合わせたもの・owner_match 'all'。10 §4 #11・Codex ⑤-2a M5)。
+  //   POST /api/drafts・NE のコードから一括 = 単品もセットも作れる (NE のセットのコードならセット・それ以外 = 単品) = 開いている間は handler が種類を決めて確かめる。
+  //   自動取込を手で回す = NE の単品だけ (new-product-intake.js の selectCandidates)・Notion の画像 DB の移植 = 自社の商品ページ (種類を見ない) = 単品として閉じる (閉じる側)
+  //   10/6 の時点 (sku_kind・sku_components が load) = 全部開いたまま。
   // 税率 (NE の初期値) も draft_yahoo に書くが、税率が C の間は出品・画面・試算が Company DB の税率を使う (services/listing-tax.mjs) = 古い値は使われない
-  ...[['POST', '/api/drafts'], ['POST', '/api/register-codes', 'body_true'], ['POST', '/api/intake/run', 'body_true'], ['POST', '/api/notion-image-import', 'body_not_false']].map(([method, p, dryRun]) => R({
-    id: `product-hub:${method}:${p}`, app: 'product-hub', host: 'render', file: 'apps/product-hub/router.js', mount: '/apps/product-hub', method, path: p,
-    ...(dryRun ? { dry_run: dryRun } : {}), writes: ['product_drafts (新商品)', 'draft_yahoo.tax_rate'], owner_cols: NEW_PRODUCT_COLS, owner_match: 'all', ref: '10 §4 #11 (Codex ⑤-2a M5)・#6 (PR #1565 R1 H4)・⑤-3b',
+  ...[['POST', '/api/drafts', null, ['single', 'set']], ['POST', '/api/register-codes', 'body_true', ['single', 'set']], ['POST', '/api/intake/run', 'body_true', ['single']],
+    ['POST', '/api/notion-image-import', 'body_not_false', ['single']]].map(([method, p, dryRun, kinds]) => R({
+    id: `product-hub:${method}:${p}`, app: 'product-hub', host: 'render', file: 'apps/product-hub/router.js', mount: '/apps/product-hub', method, path: p, when_frozen: 'new_entry_409',
+    ...(dryRun ? { dry_run: dryRun } : {}), writes: ['product_drafts (新商品)', 'draft_yahoo.tax_rate'], new_kinds: Object.freeze([...kinds]), owner_cols: Object.freeze(newKindCols(kinds)), owner_match: 'all',
+    ref: '10 §4 #11 (Codex ⑤-2a M5)・#6 (PR #1565 R1 H4)・⑤-3b・広げる道 PR-6 (種類ごとの門)',
   })),
   // セットを作る (企画中のセット・仮コード) = 作るのは通す、親の税率だけ写さない (R1 H4)
   Object.freeze({
@@ -115,8 +144,14 @@ export const LEGACY_ENTRIES = Object.freeze([
     file: 'apps/product-hub/router.js', mount: '/apps/product-hub', method: 'POST', path: '/api/drafts/:id/set-drafts', writes: ['draft_yahoo.tax_rate'], owner_cols: ['skus.tax_rate'], ref: '10 §4 #6 (PR #1565 R1 H4)',
   }),
   S({ id: 'product-hub:screen:/detail/:id', app: 'product-hub', host: 'render', file: 'apps/product-hub/router.js', mount: '/apps/product-hub', path: '/detail/:id', owner_cols: ['skus.tax_rate'], ref: '10 §4 #6 (税率の欄 = Company DB の税率を見せるだけ)' }),
-  S({ id: 'product-hub:screen:/new', app: 'product-hub', host: 'render', file: 'apps/product-hub/router.js', mount: '/apps/product-hub', path: '/new', owner_cols: NEW_PRODUCT_COLS, owner_match: 'all', ref: '10 §4 #11 (登録のボタンを隠す)・⑤-3b' }),
-  Object.freeze({ id: 'job:product-hub:intake-cron', kind: 'job', when_frozen: 'job_skip', host: 'render', file: 'apps/product-hub/intake-cron.js', writes: ['product_drafts (新商品)', 'draft_yahoo.tax_rate'], owner_cols: NEW_PRODUCT_COLS, owner_match: 'all', ref: '10 §4 #11 (NE が先の新商品の自動取込。Codex ⑤-2a M5)・⑤-3b' }),
+  // 画面: 全部の種類が閉じた = 帯 (登録のボタンを隠す)。一部の種類だけ閉じた = 案内 (例:「単品の新商品は新しい画面で」・ボタンは残す = セットは作れる)
+  ...[['/new', '10 §4 #11 (登録のボタンを隠す)・⑤-3b・広げる道 PR-6 (単品だけ閉じた = 案内)'], ['/list', '広げる道 PR-6 (NE のコードから一括・自動取込のカードに種類の案内)']].map(([p, ref]) => S({
+    id: `product-hub:screen:${p}`, app: 'product-hub', host: 'render', file: 'apps/product-hub/router.js', mount: '/apps/product-hub', path: p,
+    new_kinds: Object.freeze(['single', 'set']), owner_cols: Object.freeze(newKindCols(['single', 'set'])), owner_match: 'all', ref,
+  })),
+  // NE が先の新商品の自動取込 = NE の単品だけ (selectCandidates) = 単品の列が全部 C で丸ごと止める (Codex ⑤-2a M5・⑤-3b・広げる道 PR-6)
+  Object.freeze({ id: 'job:product-hub:intake-cron', kind: 'job', when_frozen: 'job_skip', host: 'render', file: 'apps/product-hub/intake-cron.js', writes: ['product_drafts (新商品)', 'draft_yahoo.tax_rate'],
+    new_kinds: Object.freeze(['single']), owner_cols: Object.freeze(newKindCols(['single'])), owner_match: 'all', ref: '10 §4 #11 (NE が先の新商品の自動取込。Codex ⑤-2a M5)・⑤-3b・広げる道 PR-6' }),
 
   // ─── NE への 2 つ目の出口 (14 §5) と profit-calculator の仕入先 (10 §4 #9・14 §9 M2) ───
   R({ id: 'profit-calculator:GET:/api/products/csv/ne', app: 'profit-calculator', host: 'render', file: 'apps/profit-calculator/router.js', mount: '/apps/profit-calculator', method: 'GET', path: '/api/products/csv/ne', writes: ['NE の商品 (CSV の出口)'], owner_cols: NE_CSV_COLS, ref: '14 §5 (NE への 2 つ目の出口 → マスタの判断の CSV へ)' }),
@@ -149,7 +184,8 @@ export const LEGACY_ENTRIES = Object.freeze([
  * 閉じない口 (理由の種類を決めて、試験が種類ごとに確かめる。R1: 「理由の文字があれば通す」をやめた)
  *   replication    = 写しの口 (人の入口ではない)。試験: そのルートの定義に guard (例 requireSyncKey) が付いている
  *   already_closed = 別の門で閉じ済み。試験: guard が router.use で全部の書き込みの前に掛かっている
- *   manual         = 機械では閉じられない入口 (NE の画面・GAS)。コードを持たない (file・method・path を持たない)。切替の証拠 manual_entries_stopped に載せる
+ *   manual         = 機械では閉じられない入口 (NE の画面・GAS)。コードを持たない (file・method・path を持たない)。切替の証拠 manual_entries_stopped に載せる。
+ *                    🆕 広げる道 PR-6: owner_cols (人が書くキー) が必須 = manifest に残る。広げるときは足すキーと重なる手の入口だけを止める (manualEntriesForKeys)
  *   seed_on_read   = 読むとき、ファイルが無い・空なら初期データ (コードの中の値) を書くだけ (人の入力ではない・あるファイルは変えない)。
  *                    試験: writer_file に guard (初期データを書く呼び出し) と existsSync (無いときだけ) がある
  *   company_db_outbox = Company DB の新しい登録の知らせを取り込む新しい道 (⑤-2a)。試験: writer_file に guard (MASTER_EDIT_OPEN の確かめ) がある
@@ -159,9 +195,43 @@ export const LEGACY_EXEMPT = Object.freeze([
   Object.freeze({ id: 'warehouse:render-writes', kind: 'already_closed', host: 'render', file: 'apps/warehouse/router.js', guard: 'rejectWritesOnRender', reason: '10 §4 #3 = Render では warehouse の書き込みは全部 409 (切替と関係なく閉じ済み)' }),
   Object.freeze({ id: 'profit-calculator:GET:/api/suppliers', kind: 'seed_on_read', host: 'render', file: 'apps/profit-calculator/router.js', method: 'GET', path: '/api/suppliers', writer_file: 'apps/profit-calculator/suppliers.js', guard: 'saveSuppliers(DEFAULT_SUPPLIERS)', reason: '仕入れ先の一覧を読むとき、suppliers.json が無い・空なら初期データ (DEFAULT_SUPPLIERS) を書くだけ。人の入力ではない・あるファイルは変えない (仕入れ先の追加・削除は閉じる入口)' }),
   Object.freeze({ id: 'product-hub:GET:/board:cdb-card-intake', kind: 'company_db_outbox', host: 'render', file: 'apps/product-hub/router.js', method: 'GET', path: '/board', writer_file: 'lib/product-hub-outbox.mjs', guard: 'if (!cardSweepEnabled()) return', reason: 'ボードを開いたときに、新しい「新商品の登録」(Company DB) の知らせから出品カードを作る = 新しい道 (古い入口ではない)。知らせは new_open の保存 (ops.register_new_sku) だけが書く・MASTER_EDIT_OPEN = 1 の Render だけ取り込む (⑤-2a)' }),
-  Object.freeze({ id: 'ne:item-screen', kind: 'manual', host: 'ne', reason: '10 §4 #1。機械では閉じられない = 運用で禁止・切替の証拠 (manual_entries_stopped) に担当者と止めた時刻 (契約 v3 H1)' }),
-  Object.freeze({ id: 'gas:logizard-sheet-and-sku-map', kind: 'manual', host: 'google', reason: '10 §4 #12・#13。⑥ で順番に止める・切替の証拠 (manual_entries_stopped) に載せる' }),
+  // 🆕 広げる道 PR-6 (設計 v3 G12・Codex R2 M3): 手の入口も owner_cols (その入口で人が書く持ち主表のキー) を必ず持つ = manifest に残る。
+  //   広げる (widen) とき、DB は「manifest の手の入口のうち、owner_cols が足すキーと重なるもの」= 止めた証拠の一覧と完全に同じか、を確かめる (PR-1)。
+  //   🚨 少なく書く = 止めるべき人の入口を止めずに広げる (危ない側)。迷ったら入れる (広げるときに止める入口が増えるだけ)
+  Object.freeze({
+    id: 'ne:item-screen', kind: 'manual', host: 'ne',
+    // NE の商品マスタの画面・セット商品の画面・NE の商品マスタの CSV 取込で人が書く値 (夜間ロードが mirror_products / mirror_set_components から読む列)。
+    // 区分 (単品 / セット) は ne:set-kind に分けた (区分だけを広げるときに NE の画面全部を止めなくてよいように)
+    owner_cols: Object.freeze(['products.name', 'products.sales_class', 'products.status', 'products.parent', 'skus.name', 'skus.tax_rate', 'skus.tax_class', 'skus.handling',
+      'skus.standard_price', 'skus.shipping', 'sku_costs', 'sku_components', 'supplier_skus.is_primary', 'external_ids.jan']),
+    reason: '10 §4 #1。機械では閉じられない = 運用で禁止・切替の証拠 (manual_entries_stopped) に担当者と止めた時刻 (契約 v3 H1)',
+  }),
+  Object.freeze({
+    id: 'ne:set-kind', kind: 'manual', host: 'ne', owner_cols: Object.freeze(['skus.sku_kind']),
+    // 区分が変わる NE の操作 = 「もうある単品と同じコードのセットを作る」「セットを消す」(mirror_products の 商品区分 が変わる = 夜間ロードの skus.sku_kind)。
+    // ふつうのセットの構成の直し (sku_components) は ne:item-screen。広げた後 (C) の運用 = 区分を変えない・変えたいときは中原さんに (設計 v3 §4.1 f)
+    reason: '広げる道 PR-6 (設計 v3 §4.1 e・G12)。skus.sku_kind を広げる前に止めて、止めた人と時刻を widen の証拠に載せる',
+  }),
+  Object.freeze({
+    id: 'gas:logizard-sheet-and-sku-map', kind: 'manual', host: 'google',
+    // #12 = ロジザード用 CSV の加工 (NE の商品名・バーコードをロジザードへ出す)・#13 = 商品コード変換テーブルの往復 (m_sku_master = Amazon SKU ↔ NE コード)
+    owner_cols: Object.freeze(['listing_components.amazon', 'skus.name', 'external_ids.jan']),
+    reason: '10 §4 #12・#13。⑥ で順番に止める・切替の証拠 (manual_entries_stopped) に載せる',
+  }),
 ]);
+/** 手の入口 (NE の画面・GAS)。owner_cols つき */
+export const MANUAL_ENTRIES = Object.freeze(LEGACY_EXEMPT.filter((e) => e.kind === 'manual'));
+/**
+ * 足すキー (keys) から導いた「止める手の入口」の id (並べたもの)。owner_cols がキーと 1 つでも重なる手の入口 (widen の証拠と完全に同じ集合にする・PR-1)。
+ * entries = manifest の entries (DB に残った形) も渡せる (kind = 'manual' の行だけ見る)。owner_cols が無い・配列でない手の入口 = 投げる (黙って外さない)
+ */
+export function manualEntriesForKeys(keys, entries = MANUAL_ENTRIES) {
+  const want = new Set(keys);
+  return entries.filter((e) => e.kind === 'manual').filter((e) => {
+    if (!Array.isArray(e.owner_cols) || !e.owner_cols.length) throw new Error(`master-legacy-entries: 手の入口に owner_cols が無い: ${e.id}`);
+    return e.owner_cols.some((k) => want.has(k));
+  }).map((e) => e.id).sort();
+}
 
 /**
  * CLI のうち、マスタの表に書かないので止めない mode (試験が「全部の mode を数えた」か・実際に動くかを見る)
@@ -222,11 +292,25 @@ export const MASTER_WRITE_TARGETS = Object.freeze({
     if (!Array.isArray(e.owner_cols) || !e.owner_cols.length) throw new Error(`master-legacy-entries: owner_cols が無い: ${e.id}`);
     for (const k of e.owner_cols) if (!OWNED_COLUMNS.includes(k)) throw new Error(`master-legacy-entries: 知らない列 ${k}: ${e.id}`);
     if (e.owner_match !== undefined && !['any', 'all'].includes(e.owner_match)) throw new Error(`master-legacy-entries: 知らない owner_match: ${e.id} ${e.owner_match}`);
+    // 広げる道 PR-6: 種類ごとの門。owner_cols = その種類の列を合わせたもの・owner_match 'all' (全部の種類が閉じたときだけ入口ごと閉じる) でないと、種類の門と入口の門が食い違う
+    if (e.new_kinds !== undefined) {
+      if (!Array.isArray(e.new_kinds) || !e.new_kinds.length || !e.new_kinds.every((k) => Object.hasOwn(NEW_KIND_COLS, k))) throw new Error(`master-legacy-entries: 知らない new_kinds: ${e.id}`);
+      const want = newKindCols(e.new_kinds);
+      if (e.owner_match !== 'all' || e.owner_cols.length !== want.length || !want.every((k) => e.owner_cols.includes(k))) throw new Error(`master-legacy-entries: new_kinds の入口は owner_cols = 種類の列・owner_match 'all': ${e.id}`);
+    }
+    if ((e.when_frozen === 'new_entry_409') !== (e.new_kinds !== undefined && e.kind === 'route')) throw new Error(`master-legacy-entries: new_entry_409 は new_kinds の route だけ: ${e.id}`);
   }
+  for (const k of Object.keys(NEW_KIND_COLS)) for (const c of NEW_KIND_COLS[k]) if (!OWNED_COLUMNS.includes(c)) throw new Error(`master-legacy-entries: NEW_KIND_COLS.${k} に知らない列 ${c}`);
   for (const e of LEGACY_EXEMPT) {
     if (seen.has(e.id)) throw new Error(`master-legacy-entries: id が重なっている: ${e.id}`);
     seen.add(e.id);
     if (!['replication', 'already_closed', 'manual', 'seed_on_read', 'company_db_outbox'].includes(e.kind)) throw new Error(`master-legacy-entries: 閉じない口の知らない kind: ${e.id} ${e.kind}`);
+    // 広げる道 PR-6 (G12): 手の入口も、知っている列のキー (1 つ以上・重ならない) が要る (typo で「止めたつもり」を作らない)
+    if (e.kind === 'manual') {
+      if (!Array.isArray(e.owner_cols) || !e.owner_cols.length) throw new Error(`master-legacy-entries: 手の入口に owner_cols が無い: ${e.id}`);
+      for (const k of e.owner_cols) if (!OWNED_COLUMNS.includes(k)) throw new Error(`master-legacy-entries: 知らない列 ${k}: ${e.id}`);
+      if (new Set(e.owner_cols).size !== e.owner_cols.length) throw new Error(`master-legacy-entries: owner_cols が重なっている: ${e.id}`);
+    }
   }
 }
 
