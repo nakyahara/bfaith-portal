@@ -1947,7 +1947,7 @@ end $$;
 -- ─── 15. 権限 (ロールがある DB だけ。無い DB は create-master-edit-roles.mjs / create-watch-roles.mjs が後で付ける) ───
 --   watcher        = 0058 の表を読む (保守の印の表は除く)・読むだけの判定 ops.widen_check_readonly・画面の表示用の ops.new_entry_lease_valid
 --   watch_writer   = 照合 ② の開始で許可を閉じる ops.close_new_entry_for_compare と結果の記録 ops.record_new_entry_gate だけ (許可は出せない = 照合のコード 1 本で開放まで完結しない)
---   new_entry_gate = 開放の許可を出す / 取り消す だけ (NOINHERIT のログイン)
+--   new_entry_gate = 開放の許可を出す / 取り消す・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ) (NOINHERIT のログイン・表は読まない)
 --   master_edit    = active_map・ops.new_entry_lease_valid (表示用)・ops.acquire_new_entry_locks (鍵の入口)・配ったファイルの ops.ne_reg_file (file_bytes の列は読めない)
 --   master_gate    = 門の記録の 2 版
 --   DB の持ち主だけ (だれにも渡さない) = prepare / cancel / 手の入口の停止 / widen / 保守の印 / 判定の本体 ops._widen_judge / private の _ の関数
@@ -1969,6 +1969,7 @@ do $$ begin
     execute 'grant usage on schema ops to new_entry_gate';
     execute 'grant execute on function ops.grant_new_entry_lease(text, text) to new_entry_gate';
     execute 'grant execute on function ops.revoke_new_entry_lease(text, text) to new_entry_gate';
+    execute 'grant execute on function ops.new_entry_lease_valid(text) to new_entry_gate';   -- 毎朝の段が取り消しの後に閉じたことを確かめる (#1645)
   end if;
   if exists (select 1 from pg_roles where rolname = 'master_edit') then
     execute 'grant execute on function ops.master_ownership_active_map() to master_edit';

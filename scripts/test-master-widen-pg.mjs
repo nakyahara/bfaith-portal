@@ -465,9 +465,11 @@ try {
     }
     for (const [c, sql] of [[NG, "select ops.record_new_entry_gate('x', '2030-01-01T00:00:00Z', '2030-01-01T00:00:00Z', '{}'::jsonb)"], [NG, "select ops.close_new_entry_for_compare('x')"],
       [E, "select ops.close_new_entry_for_compare('x')"], [WA, "select ops.close_new_entry_for_compare('x')"], [NG, 'select ops.widen_check_readonly(gen_random_uuid(), 1)'],
-      [NG, "select ops.new_entry_lease_valid('single')"], [NG, 'select * from ops.new_entry_gate_results']]) {
+      [NG, 'select * from ops.new_entry_gate_results'], [NG, 'select * from ops.master_new_entry_leases'], [NG, 'select * from ops.master_new_entry_stop_floors']]) {
       const e = await errOf(c, sql); assert.equal(e?.code, '42501', `${sql} (${e?.message})`);
     }
+    // #1645: new_entry_gate は取り消した後に閉じたことを確かめる (表示用の関数を呼べて真偽を返す・表は読めない = 上)
+    assert.equal(typeof (await NG.query("select ops.new_entry_lease_valid('single') as v")).rows[0].v, 'boolean');
     const l1 = await grant(NG, 'mc_lease_1');
     assert.equal(typeof l1.lease_id, 'string'); assert.equal(l1.compare_run_id, 'mc_lease_1');
     assert.equal(await valid(E), true); assert.equal(await valid(WA), true);
@@ -487,6 +489,7 @@ try {
     const maxR = async () => (await O.query('select max(result_id)::text as m from ops.new_entry_gate_results')).rows[0].m;
     assert.deepEqual([rvr.ok.rows[0].r.revoked, rvr.ok.rows[0].r.floor_result_id], [1, await maxR()]);
     assert.equal(await valid(), false);
+    assert.equal((await NG.query("select ops.new_entry_lease_valid('single') as v")).rows[0].v, false, '取り消した同じ接続 (new_entry_gate) で閉じたことを確かめられる');
     await O2.query('begin');
     await assert.rejects(O2.query("select ops._require_new_entry_lease('single')"), /new_entry_closed/);
     await O2.query('rollback');

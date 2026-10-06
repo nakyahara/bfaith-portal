@@ -34,7 +34,8 @@
  *   DB の関数がログインのロールと記録の場所 (host) を照らす = Render のログインで minipc を名乗れない
  * 構成の依頼を上げる (promoteComponentRequest) のは夜間ロード = 表の持ち主のロール (COMPANY_DB_URL)
  * 🆕 0058 (広げる道 PR-1): new_entry_gate (NOINHERIT のログイン・開く前のゲート env COMPANY_DB_NEW_ENTRY_GATE_URL = miniPC の .env・中原さんが入れる):
- *   新商品の開放の許可を出す / 取り消す (ops.grant_new_entry_lease / revoke_new_entry_lease) の実行だけ。表は読まない (ゲートの読み取りは watcher)。
+ *   新商品の開放の許可を出す / 取り消す (ops.grant_new_entry_lease / revoke_new_entry_lease) と、取り消した後に閉じたことを確かめる ops.new_entry_lease_valid の実行だけ。
+ *   表は読まない (ゲートの診断の表の読み取りは watcher)。
  *   master_edit には active の持ち主表 (ops.master_ownership_active_map)・許可の表示用 (ops.new_entry_lease_valid)・鍵の入口 (ops.acquire_new_entry_locks)・
  *   配ったファイル (ops.ne_reg_file)、master_gate には門の記録の 2 版の実行を足す。
  *   広げる道の DB の持ち主の関数 (prepare / widen / cancel / 停止 / 保守の印 / private の _ の関数) はだれにも渡さない
@@ -141,6 +142,8 @@ export const RESTRICT_FILE_BYTES_SQL = "do $$ begin if to_regprocedure('ops.rest
 export const ACK_V2_FUNCTION = 'ops.record_legacy_gate_ack_v2(text, text, text, jsonb, text, text, integer, timestamptz, text, text, text[], boolean, text)';
 /** 0058 (§3.7): 開放の許可を出す / 取り消す = NOINHERIT のログイン new_entry_gate だけ (watch_writer には渡さない = 照合のコード 1 本で証拠から開放まで完結しない) */
 export const LEASE_GATE_FUNCTIONS = Object.freeze(['ops.grant_new_entry_lease(text, text)', 'ops.revoke_new_entry_lease(text, text)']);
+/** 0058 (#1645): new_entry_gate も取り消した後に閉じたことを確かめる (読むだけ)。WIDEN_EDIT_FUNCTIONS の 1 つ = master_edit にも付く */
+export const LEASE_VALID_FUNCTION = 'ops.new_entry_lease_valid(text)';
 /** 0058: だれにも渡さない (DB の持ち主だけ = prepare / cancel / 停止 / widen / 保守の印 / 判定の本体 / private の _ の関数 / trigger と部品) */
 export const WIDEN_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.prepare_master_widen(integer, jsonb, text, jsonb, text)', 'ops.cancel_master_widen(uuid, text)',
   'ops.record_widen_manual_stop(uuid, text, text, text)', 'ops.widen_master_ownership(uuid, integer, text, jsonb)', 'ops._widen_judge(uuid, integer)',
@@ -218,9 +221,12 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   for (const f of [...WIDEN_EDIT_FUNCTIONS, ACK_V2_FUNCTION, ...LEASE_GATE_FUNCTIONS, ...WIDEN_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of WIDEN_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
-  // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行だけ (表は読まない = ゲートの診断の読み取りは watcher の接続で・v13)
+  // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
+  //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、
+  //   LEASE_GATE_FUNCTIONS には入れない (入れると上の revoke の対象が増える)。上の revoke の後にここで 1 行足す
   s.push('grant usage on schema ops to new_entry_gate');
   for (const f of LEASE_GATE_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to new_entry_gate';`));
+  s.push(ifFn(LEASE_VALID_FUNCTION, `execute 'grant execute on function ${LEASE_VALID_FUNCTION} to new_entry_gate';`));
   // 0058: 上の「画面が読む表」の GRANT (ops.ne_reg_exports の表の SELECT) の後に、file_bytes を外して列ごとに付け直す (byte 列は ops.ne_reg_file だけ)
   s.push(RESTRICT_FILE_BYTES_SQL);
   return s;
@@ -284,7 +290,7 @@ export function parseRotateArgs(argv) {
 const ENV_OF = {
   master_edit: ['COMPANY_DB_MASTER_EDIT_URL', 'Render (apps/master-edit)'],
   master_ops: ['COMPANY_DB_MASTER_OPS_URL', '切替の段階を進める手の操作'],
-  new_entry_gate: ['COMPANY_DB_NEW_ENTRY_GATE_URL', '開く前のゲート (0058・miniPC の .env・開放の許可を出す / 取り消すだけ)'],
+  new_entry_gate: ['COMPANY_DB_NEW_ENTRY_GATE_URL', '開く前のゲート (0058・miniPC の .env・開放の許可を出す / 取り消す・閉じたかを読むだけ)'],
   master_observer: ['COMPANY_DB_MASTER_OBSERVER_URL', '⑤-2 の夜間ロード (NE の観測)'],
   master_gate_render: ['COMPANY_DB_MASTER_GATE_RENDER_URL', 'Render の ⑤-3 の古い入口の門 (Render の env)'],
   master_gate_minipc: ['COMPANY_DB_MASTER_GATE_MINIPC_URL', 'miniPC の ⑤-3 の古い入口の門 (miniPC の .env)'],

@@ -105,10 +105,11 @@ export async function checkReadiness({ host, env = process.env, open = (url) => 
           g = await open(String(env.COMPANY_DB_NEW_ENTRY_GATE_URL).trim());
           const who = (await g.query('select session_user::text as u')).rows[0].u;
           const can = (await g.query(`select has_function_privilege(session_user, 'ops.grant_new_entry_lease(text, text)', 'execute') as g,
-              has_function_privilege(session_user, 'ops.revoke_new_entry_lease(text, text)', 'execute') as r`)).rows[0];
+              has_function_privilege(session_user, 'ops.revoke_new_entry_lease(text, text)', 'execute') as r,
+              has_function_privilege(session_user, 'ops.new_entry_lease_valid(text)', 'execute') as v`)).rows[0];
           if (who !== 'new_entry_gate') ng(`新商品の開く前のゲートのログインの役が ${who} (期待 new_entry_gate)`);
-          else if (!can.g || !can.r) ng('new_entry_gate に許可を出す / 取り消す関数の実行権が無い (create-master-edit-roles.mjs を流し直す)');
-          else ok('新商品の開く前のゲートのログイン = new_entry_gate (許可を出す / 取り消すを実行できる)');
+          else if (!can.g || !can.r || !can.v) ng('new_entry_gate に許可を出す / 取り消す / 閉じたかを読む関数の実行権が無い (create-master-edit-roles.mjs を流し直す)');
+          else ok('新商品の開く前のゲートのログイン = new_entry_gate (許可を出す / 取り消す / 閉じたかを読むを実行できる)');
         } catch (e) { ng(`新商品の開く前のゲートのログインでつながらない: ${String(e && e.message).slice(0, 200)}`); } finally { if (g) { try { await g.end(); } catch { /* */ } } }
       }
     } catch (e) { ng(`新商品の開く前のゲートを確かめられない: ${String(e && e.message).slice(0, 200)}`); } finally { if (c) { try { await c.end(); } catch { /* */ } } }
