@@ -27,6 +27,7 @@ import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks, readNeRawRev, neSr
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 import { makeNeOrderBaseUpserter, toOrderBaseRow, NE_ORDER_BASE_FIELDS } from './ne-order-base-upsert.js';
 import { NE_FETCH_COUNTS_VERSION, NE_FETCH_COUNTS_KEY, checkNeFetchCounts, beginNeFetch, endNeFetch, releaseNeFetch, computeFetchFingerprint } from './ne-fetch-counts.js';
+import { fetchUploadQueue, readQueueWindowStart } from './ne-upload-queue.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
@@ -109,7 +110,7 @@ async function authenticate(callbackUrl) {
 // 他モジュール (ne-sync-runner 等) から再利用するため export 化 (2026-06-06 構成 4 PR)
 export { callNE, loadTokens, saveTokens };
 // 取込の試験 (scripts/test-material-lineage.mjs の完了の印) 用
-export { fetchProducts, fetchSetProducts };
+export { fetchProducts, fetchSetProducts, fetchNeUploadQueue };
 async function callNE(endpoint, params = {}) {
   const tokens = loadTokens();
   if (!tokens) throw new Error('トークンがありません。先に認証してください: node ne-api.js auth <callback_url>');
@@ -157,6 +158,34 @@ async function withFetchRun(run) {
   try { return await run(h); } finally { if (h.inProgress) releaseNeFetch(h.inProgress); }
 }
 async function fetchProducts() { return withFetchRun(fetchProductsRun); }
+/**
+ * NE のアップロードキューを読むだけで取る (広げる道 PR-9b・ne-upload-queue.js)。**throw しない** = 失敗しても商品・受注の取得は続ける
+ * (失敗・完全でない回は SQLite に残り、照合 / PR-1 は waiting にする)
+ */
+async function fetchNeUploadQueue(deps = {}) {
+  try { return await fetchNeUploadQueueRun(deps); } catch (e) {
+    console.warn(`[NE] ⚠️ アップロードキューの取得で例外 (${e.message}) → 照合は「キューに無い」を決めない`);
+    return { run_id: null, state: 'failed', problems: [], rows: 0, error: String(e && e.message || e) };
+  }
+}
+async function fetchNeUploadQueueRun({ readWindowStart = readQueueWindowStart } = {}) {   // readWindowStart は試験で差し替える
+  await initDB();
+  const db = getDB();
+  const fetchFingerprint = fetchFingerprintOrNull();
+  // 取り始めた時点の商品の取得の完了の印 (キューは商品の取得の完了の後に取る = 期間の終わり ≥ これ を DB が確かめる。R19 M2)
+  const m = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value ?? null;
+  let finishedAt = null;   // 商品の取得の完了 (件数の記録の finished_at・設計 R20)。キューの始めがこれより後であることを DB が確かめる
+  try { const fc = JSON.parse(m(NE_FETCH_COUNTS_KEY.products) ?? 'null'); if (fc && fc.complete_at === m('ne_api_products_complete_at')) finishedAt = fc.finished_at ?? null; } catch { /* 読めない = null */ }
+  const products = { complete_at: m('ne_api_products_complete_at'), complete_rev: m('ne_api_products_complete_rev'), finished_at: finishedAt };
+  // 期間の始め = DB の ops.ne_reg_queue_window_start() (watcher で読むだけ)。読めなければキューは読まない (その回は完全でない = 照合は waiting)
+  const windowStart = await readWindowStart();
+  if (windowStart.source === 'unavailable') console.warn(`[NE] ⚠️ キューの期間の始めを読めない (${windowStart.reason}) → アップロードキューは読まない (照合は waiting)`);
+  const r = await fetchUploadQueue({ db, callNE, fetchFingerprint, windowStart, products });
+  if (r.problems.includes('too_many_pages')) console.error(`[NE] 🚨 アップロードキューの期間が 10 ページを超える → 読まない (古い未決の新規登録の CSV を片付ける)`);
+  if (r.state === 'complete') console.log(`[NE] アップロードキュー: ${r.rows}件 (完全)`);
+  else console.warn(`[NE] ⚠️ アップロードキューの取得が完全でない (${r.state}${r.problems.length ? ': ' + r.problems.join(', ') : ''}${r.error ? ': ' + r.error : ''}) → 照合は「キューに無い」を決めない`);
+  return r;
+}
 async function fetchSetProducts() { return withFetchRun(fetchSetProductsRun); }
 
 async function fetchProductsRun(h) {
@@ -830,9 +859,12 @@ async function main() {
   } else if (command === 'order-base-modified') {
     const days = parseInt(args[1]) || 3;
     await fetchOrderBaseByModified(days);
+  } else if (command === 'queue') {
+    await fetchNeUploadQueue();
   } else if (command === 'sync') {
     await fetchProducts();
     await fetchSetProducts();
+    await fetchNeUploadQueue();   // アップロードキュー (読むだけ・失敗しても続ける。広げる道 PR-9b)
     await fetchOrders(7);
     // 出荷確定日ベースの取り直し (受注日窓から漏れた出荷を拾う。API 1回程度)
     await fetchOrderBaseByShipDate(14);

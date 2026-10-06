@@ -91,7 +91,7 @@ await ta('[1] 商品: 空のコード・同じコードが 2 度 (ページの�
   // 取得の版 = 固定の順の各ファイルの「パス + NUL + LF にそろえた中身 + NUL」をつなげた sha256 (この試験の中で別に計算する)
   const crypto = await import('node:crypto');
   const expectFp = crypto.createHash('sha256').update(NE_FETCH_FINGERPRINT_FILES.map((f) => f + String.fromCharCode(0) + fs.readFileSync(path.join(repoRoot, f), 'utf8').split(String.fromCharCode(13, 10)).join(String.fromCharCode(10)) + String.fromCharCode(0)).join(''), 'utf8').digest('hex');
-  assert.deepEqual([...NE_FETCH_FINGERPRINT_FILES], ['apps/warehouse/ne-api.js', 'apps/warehouse/ne-fetch-counts.js', 'apps/warehouse/db.js', 'apps/warehouse/retry-lock.js']);
+  assert.deepEqual([...NE_FETCH_FINGERPRINT_FILES], ['apps/warehouse/ne-api.js', 'apps/warehouse/ne-fetch-counts.js', 'apps/warehouse/db.js', 'apps/warehouse/retry-lock.js', 'apps/warehouse/ne-upload-queue.js']);
   assert.equal(c.fetch_fingerprint, expectFp);
   // 取得の始め = 完了の印の時刻と同じ時刻 (ISO・ミリ秒) / 完了 = その後 (完了の印を書いた取引の中の今)
   assert.match(c.started_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);

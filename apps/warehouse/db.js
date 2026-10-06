@@ -106,6 +106,22 @@ function createTables() {
   db.exec(`CREATE TABLE IF NOT EXISTS ne_code_spelling_marks (
     side TEXT NOT NULL CHECK (side IN ('products', 'sets')), synced_at TEXT NOT NULL, version TEXT NOT NULL, rows INTEGER NOT NULL, recorded_at TEXT NOT NULL,
     PRIMARY KEY (side, synced_at))`);
+  // 1c. NE のアップロードキューの取得 (広げる道 PR-9b・ne-upload-queue.js)。1 回の取得 = runs の 1 行 + 読んだ行 (生の文字のまま)。
+  //   state: running (始めた・まだ / 途中で止まった) → complete (完全) / incomplete (読めたが完全と言えない・problems) / failed (API の失敗・error)
+  //   同じ条件で全部のページを 2 回読む (pass = 1 / 2)。window_source / window_reason = 期間の始めを決めた材料 (Company DB の ops.ne_reg_queue_window_start())。
+  //   window_from が NULL = 始めを読めなかった = キューを読んでいない。products_* = 取り始めた時点の商品の取得の完了の印と完了の時刻 (finished_at = 件数の記録)。
+  //   DB が「キューの始め (started_at) ≥ 商品の取得の完了 (products_finished_at)」を確かめる (設計 R19 M2・R20)
+  db.exec(`CREATE TABLE IF NOT EXISTS ne_upload_queue_runs (
+    run_id TEXT PRIMARY KEY, version TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+    window_from TEXT, window_to TEXT NOT NULL, window_tz TEXT NOT NULL, method TEXT NOT NULL, page_limit INTEGER NOT NULL, max_pages INTEGER NOT NULL,
+    page_rows TEXT, rows_read INTEGER, distinct_que_ids INTEGER, api_count_before TEXT, api_count_after TEXT,
+    fetch_fingerprint TEXT, state TEXT NOT NULL CHECK (state IN ('running', 'complete', 'incomplete', 'failed')), problems TEXT, error TEXT,
+    window_source TEXT, window_reason TEXT, products_complete_at TEXT, products_complete_rev TEXT, products_finished_at TEXT)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_upload_queue (
+    run_id TEXT NOT NULL, pass INTEGER NOT NULL CHECK (pass IN (1, 2)), row_no INTEGER NOT NULL,
+    que_id TEXT, que_method_name TEXT, que_upload_name TEXT, que_client_file_name TEXT, que_file_name TEXT, que_status_id TEXT,
+    que_message TEXT, que_deleted_flag TEXT, que_creation_date TEXT, que_last_modified_date TEXT, raw_json TEXT NOT NULL, row_hash TEXT NOT NULL,
+    PRIMARY KEY (run_id, pass, row_no))`);
 
   // 2. NE受注明細（追記蓄積、重複排除）
   db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_orders (

@@ -56,12 +56,12 @@ export const NE_FETCH_IN_PROGRESS_KEY = Object.freeze({ products: 'ne_api_produc
 
 /**
  * 取得の版 (設計 v14 §3.7 の component = fetch・R14)。対象のファイル (リポジトリの根からのパス・この固定の順) =
- *   取得 (ne-api.js)・取得が使う守りの部品 (このファイル)・通し番号 / 完了の印 / 書き方の保存がある db.js・取得中の印の生きているかの判定 (retry-lock.js)。
+ *   取得 (ne-api.js)・取得が使う守りの部品 (このファイル)・通し番号 / 完了の印 / 書き方の保存がある db.js・取得中の印の生きているかの判定 (retry-lock.js)・アップロードキューの取得 (ne-upload-queue.js。PR-9b)。
  * 版 = 各ファイルについて「パス + NUL + 中身 (改行を LF にそろえる = CRLF → LF。Windows の checkout でも同じ値) + NUL」をこの順につなげた UTF-8 の sha256 (64 桁の 16 進)。
  * 取得は API の入力を読む前に 1 回だけ計算し、完了まで同じ値を持ち回る (途中でファイルが変わっても、記録する版は始めに計算した値)。
  * 🚨 一覧と計算はここ 1 か所 (PR-1 の版の登録の CLI はこれを import して使う)
  */
-export const NE_FETCH_FINGERPRINT_FILES = Object.freeze(['apps/warehouse/ne-api.js', 'apps/warehouse/ne-fetch-counts.js', 'apps/warehouse/db.js', 'apps/warehouse/retry-lock.js']);
+export const NE_FETCH_FINGERPRINT_FILES = Object.freeze(['apps/warehouse/ne-api.js', 'apps/warehouse/ne-fetch-counts.js', 'apps/warehouse/db.js', 'apps/warehouse/retry-lock.js', 'apps/warehouse/ne-upload-queue.js']);
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** 取得の版を計算する。root = リポジトリの根 (既定 = このファイルから見た根)。読めないファイルがあれば throw */
 export function computeFetchFingerprint(root = REPO_ROOT) {
