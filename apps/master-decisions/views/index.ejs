@@ -107,8 +107,10 @@
     set_price_from_goods: 'セット売価を商品表から', set_tax_from_components: 'セット税率を構成から', not_in_latest_fetch: '最新の取得に無い', 'load_rule:name_blank_to_code': '名前の空欄をコードで',
     manual: '手で入れた構成', parent_manual: '人が決めた代表 (親)', held_by_load: 'ロードが触らなかった', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', none: 'その他',
     company_owned: '社内の値が正 (ポータルで直した)', cdb_name_is_code: '社内の名前がコードのまま (仮の名前)',
-    name_like_code: '名前がコードに見える (確かめる)', cdb_zero_yen: '社内が 0 円 (NE は 0 を表せない)' };
-  const CLS = { rule: '決まりで説明済み', rule_lag: '決まり (反映待ち)', held_by_load: 'ロードが保持', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', incomparable: '比べられない (NE の値が不正)' };
+    name_like_code: '名前がコードに見える (確かめる)', cdb_zero_yen: '社内が 0 円 (NE は 0 を表せない)',
+    reg_stale: '登録した新商品が NE に出てこない', reg_kind_mismatch: '新商品の区分が NE と違う' };
+  const CLS = { rule: '決まりで説明済み', rule_lag: '決まり (反映待ち)', held_by_load: 'ロードが保持', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', incomparable: '比べられない (NE の値が不正)',
+    reg_stale: '登録から日がたった (NE 登録待ちの期限切れ)', reg_kind_mismatch: '登録の不一致 (区分)' };
   const COL = { name: '商品名', handling: '取扱区分', tax_rate: '税率', standard_price_jpy: '売価', cost: '原価', primary_supplier: '代表の仕入先', components: '構成', exists: '有無', kind: '種類', parent: '代表 (親)' };
   const RES = { accept_difference: '差を残す', fix_ne: 'NE を直す', fix_cdb: '社内の値を直す', fix_input: '材料を直す', spec: '仕様を決める' };
   // 決め方を選んだときに出す「決めるとどうなるか」(つかいかたと同じ言葉)
@@ -141,12 +143,15 @@
     if (isRate(col, v)) return '<span class="dvv num">' + (side === 'cdb' ? showCdb(col, v) : showNe(col, v)) + '</span>';
     return '<span class="dvv">' + esc(typeof v === 'object' ? JSON.stringify(v) : v) + '</span>';
   };
+  // ポータルで登録した新商品の登録の状態 (マスタの入力と同じ言葉)
+  const REGST = { draft: '下書き', ne_pending: 'NE登録待ち' };
   const colName = (c) => (COL[c.col] || c.col) + (c.child ? ' / ' + c.child : '');
   const proposalText = (c) => { const p = c.proposal || {};
     if (p.op === 'set_ne_value') return 'NE を <b>' + (isRate(c.col, p.value) ? '<span class="dvv num">' + esc(String(pct(p.value))) + ' (%)</span>' : val(c.col, p.value)) + '</b> に';
     if (p.op === 'check_name') return '名前がコードで良いか確かめる (良ければ差を残す)';
     if (p.op === 'decide_zero') return '社内の 0 円で良いか決める (良ければ差を残す・違えば社内を直す)';
     if (p.op === 'fill_cdb_name') return '社内 (ポータル) で本当の名前を入れる (NE も空)';
+    if (p.op === 'register_in_ne') return 'マスタの入力の「NE 登録の CSV」で NE に取り込む (やめるなら登録をやめる)' + (p.state ? ' — ' + esc(REGST[p.state] || p.state) + (p.since ? ' (' + esc(p.since) + ' から)' : '') : '');
     if (p.op === 'decide_manual_priority') return '手の構成と NE のどちらを採るか'; if (p.op === 'fix_load_input') return '材料を直す'; if (p.op === 'decide_spec') return '仕様を決める'; return '決める'; };
   const canFixNe = (c) => (c.resolutions || []).includes('fix_ne') && c.col !== 'parent' && !!c.proposal && c.proposal.op === 'set_ne_value' && c.proposal.value !== null && c.proposal.value !== undefined;
   const canKeep = (c) => (c.resolutions || []).includes('accept_difference');

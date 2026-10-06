@@ -843,10 +843,15 @@ function evalW13Ne(config, check, res, ev, base0) {
   if (ne.out_of_scope && Object.keys(ne.out_of_scope).length) r.outOfScope = ne.out_of_scope;
   r.observed.held = Object.keys(held).length; r.observed.recoverable = rec.length;
   r.verdict = r.items.length ? 'breach' : 'pass';
+  // ポータルで登録した新商品: NE 登録待ち (差に入れない = 案件にしない・out_of_scope の reg_pending) の数と、登録の不一致 (区分違いは案件・取込失敗・中身違いは数だけ)
+  const c = ne.counts || {};
+  const regNote = [c.reg_pending ? `NE 登録待ち ${c.reg_pending} 件 (差に入れない)` : null, c.reg_kind_mismatch ? `新商品の区分違い ${c.reg_kind_mismatch}` : null,
+    c.reg_failed ? `新商品の取込失敗 ${c.reg_failed}` : null, c.reg_partial ? `新商品の中身違い ${c.reg_partial}` : null].filter(Boolean).join('・');
+  if (c.reg_pending != null) r.observed.reg = { pending: c.reg_pending, stale: c.reg_stale ?? 0, cancelled: c.reg_cancelled ?? 0, kind_mismatch: c.reg_kind_mismatch ?? 0, partial: c.reg_partial ?? 0, failed: c.reg_failed ?? 0 };
   if (r.items.length) {
     const b = ne.counts?.by_class || {};
-    r.reason = `NE との差 ${r.items.length} 件 (${Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ')})・判断の一覧 ${ne.counts?.decisions ?? 0}`;
-  }
+    r.reason = `NE との差 ${r.items.length} 件 (${Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ')})・判断の一覧 ${ne.counts?.decisions ?? 0}${regNote ? `・${regNote}` : ''}`;
+  } else if (regNote) r.reason = regNote;
   return r;
 }
 /**

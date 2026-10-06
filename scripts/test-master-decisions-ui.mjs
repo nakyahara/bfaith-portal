@@ -396,6 +396,36 @@ await ta('[17] 名前 = 商品コード は NE に入れない (2026-10-05): 社
   for (const w of ["cdb_name_is_code: '社内の名前がコードのまま", "name_like_code: '名前がコードに見える", "cdb_zero_yen: '社内が 0 円", "name_is_code: '商品コードは名前ではない"]) assert.ok(page.includes(w), w);
 });
 
+await ta('[18] ポータルで登録した新商品: 登録から NE に出てこない (reg_stale) = 仕様を決める・差を残すだけ (NE を直すは選べない) / 区分違い (reg_kind_mismatch) = NE を登録の区分に (差を残すは選べない) / 画面とつかいかたの言葉', async () => {
+  const R1 = '2'.repeat(63) + 'a', K1 = '2'.repeat(63) + 'b';
+  const more = {
+    [R1]: cand(R1, { subject_key: 'only_in_cdb:n903', col: 'exists', cls: 'reg_stale', reason_kind: 'reg_stale', c: '単品', resolutions: ['spec', 'accept_difference'],
+      proposal: { op: 'register_in_ne', state: 'draft', since: '2030-07-10' } }),
+    [K1]: cand(K1, { subject_key: 'kind:n904', col: 'kind', cls: 'reg_kind_mismatch', reason_kind: 'reg_kind_mismatch', n: 'set', n_state: 'value', c: 'single', resolutions: ['fix_ne', 'spec'],
+      proposal: { op: 'set_ne_value', value: 'single' } }),
+  };
+  await writeDecisions(db, { compareRunId: run(9), observedAt: '2030-01-09T00:00:00Z', decisions: Object.values(more) });
+  const one = async (fp, resolution, extra) => (await decide({ kind: 'approved', resolution, items: [item(await find(fp), extra)] })).j;
+  assert.deepEqual((await one(R1, 'fix_ne', { target_text: 'あり' })).skipped.map((x) => x.reason), ['resolution_not_allowed']);
+  assert.deepEqual((await one(K1, 'accept_difference')).skipped.map((x) => x.reason), ['resolution_not_allowed']);
+  assert.equal((await one(K1, 'fix_ne')).applied.length, 1);   // 提案の値 = 登録の区分
+  assert.equal((await find(K1)).decision.target.value, 'single');
+  assert.equal((await one(R1, 'spec')).applied.length, 1);
+  // 画面: 理由・分類・提案の言葉 / つかいかた
+  const page = (await call('GET', '/')).text;
+  const src = page.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/)[1];
+  const fns = new vm.Script(`(function () { const esc = (s) => String(s ?? ''); ${src.match(/const show = [\s\S]*?\n  const proposalText = [\s\S]*?return '決める'; };/)[0]}; return { proposalText }; })()`).runInNewContext({});
+  assert.equal(fns.proposalText({ col: 'exists', proposal: { op: 'register_in_ne', state: 'ne_pending', since: '2030-07-10' } }),
+    'マスタの入力の「NE 登録の CSV」で NE に取り込む (やめるなら登録をやめる) — NE登録待ち (2030-07-10 から)');
+  for (const w of ["reg_stale: '登録した新商品が NE に出てこない'", "reg_kind_mismatch: '新商品の区分が NE と違う'", "reg_kind_mismatch: '登録の不一致 (区分)'"]) assert.ok(page.includes(w), w);
+  const m = (await call('GET', '/manual')).text;
+  // 照合 (miniPC・ロール watcher) は登録の状態と NE 登録の CSV の品目を読める (0052・0053 の grant と create-watch-roles の ops の select。migration は足さない)
+  const { readRegistrations } = await import('../apps/company-db/master-compare/compare-ne.mjs');
+  await pg.query('set role watcher'); await pg.query('begin');
+  try { const rr = await readRegistrations(db); assert.equal(rr.state, 'ok', rr.reason); } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
+  for (const w of ['NE 登録待ち', '登録した新商品が NE に出てこない', '新商品の区分が NE と違う', '/apps/master-edit/reg-csv', '14 日']) assert.ok(m.includes(w), `つかいかたに「${w}」が無い`);
+});
+
 server.close();
 await pg.close();
 console.log(`\n${passed} 件 PASS`);
