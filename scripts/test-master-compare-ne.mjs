@@ -1345,7 +1345,7 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
     return sid;
   };
   const sid = {};
-  for (const c of ['n901', 'n902', 'n903', 'n904', 'n905', 'n906']) sid[c] = await mk(c);
+  for (const c of ['n901', 'n902', 'n903', 'n904', 'n905', 'n906', 'n907']) sid[c] = await mk(c);
   // NE 登録の CSV の段階 ([29] と同じく持ち主のロールで直接): n901 = 配った / n905 = 申告 → NE登録待ち → 取り込めていない (failed) / n906 = 申告 → NE登録待ち → 中身が違う (partial)
   let shaN = 0;
   const csvItem = async (code, upTo) => {
@@ -1358,20 +1358,22 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
     await pg.query(`update ops.ne_reg_export_items set state = 'issued' where item_id = $1`, [it]);
     await pg.query(`update ops.ne_reg_exports set state = 'issued', issued_at = now(), issued_by = 't' where export_id = $1`, [ex]);
     if (upTo === 'issued') return;
+    // 全部拒まれたと申告 (0053 の ne_reg_declare と同じ = 配った品目を failed (rejected_all) に。登録は下書きのまま)
+    if (upTo === 'rejected') { await pg.query(`update ops.ne_reg_export_items set state = 'failed', failed_reason = 'rejected_all' where item_id = $1`, [it]); return; }
     const att = (await pg.query(`insert into ops.ne_reg_attempts (export_id, sha256, declared_by, result) values ($1, $2, 't', 'ok') returning attempt_id`, [ex, sha])).rows[0].attempt_id;
     await pg.query(`update ops.ne_reg_export_items set state = 'import_declared', attempt_id = $2 where item_id = $1`, [it, att]);
     await pg.query(`update ops.ne_reg_exports set state = 'declared', declared_at = now(), declared_by = 't' where export_id = $1`, [ex]);
     await pg.query(`select ops.transition_sku_registration($1, 'ne_pending', 'human', 't', null, '{}'::jsonb)`, [sid[code]]);
     await pg.query(upTo === 'failed' ? `update ops.ne_reg_export_items set state = 'failed', failed_reason = 'not_in_ne' where item_id = $1` : `update ops.ne_reg_export_items set state = 'partial' where item_id = $1`, [it]);
   };
-  await csvItem('n901', 'issued'); await csvItem('n905', 'failed'); await csvItem('n906', 'partial');
+  await csvItem('n901', 'issued'); await csvItem('n905', 'failed'); await csvItem('n906', 'partial'); await csvItem('n907', 'rejected');
   await pg.query(`select ops.transition_sku_registration($1, 'cancelled', 'human', 't', '売らないことにした', '{}'::jsonb)`, [sid.n902]);
   // 状態が最後に進んだ日 (本物の now() は 2030 年より前 = 試験の日に合わせる。関数の中の印を立てて持ち主のロールで)
   const since = async (code, at) => {
     await pg.query('begin'); await pg.query("select set_config('ops.registration_protocol', '1', true)");
     await pg.query('update ops.master_registrations set state_changed_at = $2::timestamptz where sku_id = $1', [sid[code], at]); await pg.query('commit');
   };
-  for (const c of ['n901', 'n902', 'n904', 'n905', 'n906']) await since(c, '2030-08-01T10:00:00+09:00');
+  for (const c of ['n901', 'n902', 'n904', 'n905', 'n906', 'n907']) await since(c, '2030-08-01T10:00:00+09:00');
   await since('n903', '2030-07-10T10:00:00+09:00');
   // NE: いつもの商品 (e005 は NE から消えた = 登録の行が無い NE 欠け) + n904 (セット) + n906 (単品)。材料 = NE のまま、ただし n904 は材料に入れない (ロードが区分を直さない)
   const NE4 = clone(NE);
@@ -1383,7 +1385,7 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
   const ne = d.ne;
   assert.equal(ne.verdict, 'breach', ne.blocked_reason);
   // NE 登録待ち = 差にしない (案件・判断・保持・回復のどれにも無く、対象外の理由つき)
-  for (const c of ['n901', 'n905']) {
+  for (const c of ['n901', 'n905', 'n907']) {
     assert.equal(ne.out_of_scope[`only_in_cdb:${c}`], 'reg_pending', c);
     assert.ok(!ne.items.some((i) => i.norm === c) && !ne.decisions.some((x) => x.norm === c), `${c} が差に出た`);
   }
@@ -1404,19 +1406,36 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
   // 報告: 段階と数・一覧
   const rp = ne.reg_pending;
   assert.equal(rp.state, 'ok');
-  assert.deepEqual(rp.waiting.map((e) => [e.code, e.state, e.stage, e.days]), [['n901', 'draft', 'issued', 4], ['n905', 'ne_pending', 'failed', 4]]);
-  assert.deepEqual(rp.stages, { issued: 1, failed: 1 });
+  // failed の理由で分ける: not_in_ne (申告したのに NE に無い) = failed / rejected_all (全部拒まれた・下書きのまま) = rejected (#1635 Codex R1 Low)
+  assert.deepEqual(rp.waiting.map((e) => [e.code, e.state, e.stage, e.days]), [['n901', 'draft', 'issued', 4], ['n905', 'ne_pending', 'failed', 4], ['n907', 'draft', 'rejected', 4]]);
+  assert.deepEqual(rp.stages, { issued: 1, failed: 1, rejected: 1 });
   assert.deepEqual([rp.stale.map((e) => [e.code, e.days]), rp.cancelled.map((e) => e.code), rp.kind_mismatch.map((e) => [e.code, e.ne_kind]), rp.partial.map((e) => [e.code, e.stage])],
     [[['n903', 26]], ['n902'], [['n904', 'set']], [['n906', 'partial']]]);
-  assert.deepEqual([ne.counts.reg_pending, ne.counts.reg_stale, ne.counts.reg_cancelled, ne.counts.reg_kind_mismatch, ne.counts.reg_partial, ne.counts.reg_failed], [2, 1, 1, 1, 1, 1]);
+  assert.deepEqual([ne.counts.reg_pending, ne.counts.reg_stale, ne.counts.reg_cancelled, ne.counts.reg_kind_mismatch, ne.counts.reg_partial, ne.counts.reg_failed, ne.counts.reg_rejected], [3, 1, 1, 1, 1, 1, 1]);
   assert.equal(ne.counts.items, ne.items.length);
   disjoint(ne);
   // 朝の要約: 新商品の登録の不一致 (区分違い・取り込めていない・中身違い) = ② を先頭に ⚠️・NE 登録待ちの数と段階
-  assert.match(d.line, /^⚠️ ②: 新商品の NE 登録の不一致 \(区分 \(単品・セット\) 違い 1 件・取り込んだと申告したのに NE に無い 1 件・NE の中身が登録と違う 1 件\)/);
-  assert.match(d.line, /NE 登録待ち 2 件 \(差に入れない。配った 1・取り込めていない 1\)・登録から 14 日以上 NE に無い 1 件 \(差\)/);
+  assert.match(d.line, /^⚠️ ②: 新商品の NE 登録の不一致 \(区分 \(単品・セット\) 違い 1 件・取り込んだと申告したのに NE に無い 1 件・NE が取り込みを全部拒んだ \(CSV を作り直す\) 1 件・NE の中身が登録と違う 1 件\)/);
+  assert.match(d.line, /NE 登録待ち 3 件 \(差に入れない。配った 1・取り込めていない 1・NE が全部拒んだ 1\)・登録から 14 日以上 NE に無い 1 件 \(差\)/);
   // W13:ne の案件 = items だけ (NE 登録待ちは対象外 = 開かない)。証跡にも数が残る
   const ev = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-05', 'master-compare.json'), 'utf8'));
-  assert.deepEqual([ev.ne.counts.reg_pending, ev.ne.counts.items], [2, ne.items.length]);
+  assert.deepEqual([ev.ne.counts.reg_pending, ev.ne.counts.items], [3, ne.items.length]);
+
+  // NE の行が落ちた朝 (同じ日の取り直し): 前の回に区分違い (n904)・partial (n906) だった新商品が NE から欠けても、NE 登録待ちの対象外にしない = 保持 (#1635 Codex R1 Medium)。
+  //   partial は確かめの記録で数える = ⚠️ を消さない / 待ちの n901 も保持 (NE に無いと言えない)
+  const NEd = clone(NE4); NEd.products = NEd.products.filter((r) => r.code !== 'n906'); NEd.sets = NEd.sets.filter((r) => r.parent !== 'n904');
+  const md = setNe(NEd, '2030-08-05', { intP: { dropped_no_code: 1 } });
+  sendToRender(mat4(), '2030-08-05', setBuild('2030-08-05', md, []));
+  const dr = await compare('2030-08-05');
+  const dn = dr.result.ne;
+  for (const c of ['n901', 'n904', 'n906']) {
+    assert.equal(dn.held[`only_in_cdb:${c}`], 'ne_dropped_rows', c);
+    assert.ok(!Object.hasOwn(dn.out_of_scope, `only_in_cdb:${c}`) && !Object.hasOwn(dn.out_of_scope, `kind:${c}`) && !Object.hasOwn(dn.out_of_scope, `value:${c}`), `${c} を対象外にした`);
+  }
+  assert.equal(dn.held['kind:n904'], 'not_in_ne');
+  assert.deepEqual([dn.counts.reg_pending, dn.counts.reg_partial, dn.reg_pending.partial.map((e) => e.code)], [0, 1, ['n906']]);
+  assert.match(dr.line, /^⚠️ ②: 新商品の NE 登録の不一致 \(NE の中身が登録と違う 1 件\)/);
+  disjoint(dn);
 
   // 13 日目 = まだ待ち / 14 日目 = reg_stale (n901: 8/1 から)
   let x = await day('2030-08-14', { ne: NE4, material: mat4() });
@@ -1424,7 +1443,7 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
   x = await day('2030-08-15', { ne: NE4, material: mat4() });
   assert.deepEqual(clsOf(x.ne, 'only_in_cdb:n901'), ['reg_stale']);
   assert.equal(x.ne.decisions.find((y) => y.subject_key === 'only_in_cdb:n901').proposal.state, 'draft');
-  assert.deepEqual(x.ne.reg_pending.stale.map((e) => e.code), ['n901', 'n903', 'n905']);
+  assert.deepEqual(x.ne.reg_pending.stale.map((e) => e.code), ['n901', 'n903', 'n905', 'n907']);
   // 登録の状態を読めない朝 = NE 登録待ちを分けない (今までどおり差に出す)・要約に「読めない」
   const broken = { query: (sql, p) => (/from ops\.master_registrations r/.test(sql) ? Promise.reject(new Error('permission denied for table master_registrations')) : db.query(sql, p)) };
   const y = await compare('2030-08-15', { db: broken });

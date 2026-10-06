@@ -212,15 +212,18 @@ const jstDateOfEpoch = (sec) => (Number.isFinite(sec) ? new Date(sec * 1000 + 9 
 /**
  * NE 登録の CSV の段階 (0053 の品目の最後の状態 → 報告の段階)。
  *   before_issue = CSV を配る前 (品目なし・作っただけ・使わないにした) / issued = 配った (取り込んだ申告の前) / declared = 申告した (NE の完全な取得の確かめ待ち) /
- *   partial = NE にあるが中身が登録と違う / failed = 申告の後の完全な取得に無い (取り込めていない) / verified = 確かめ済み
+ *   partial = NE にあるが中身が登録と違う / failed = 申告の後の完全な取得に無い (failed_reason not_in_ne = 取り込めていない) /
+ *   rejected = 全部拒まれたと申告した (failed_reason rejected_all。登録は下書きのまま = 作り直す) / verified = 確かめ済み
  */
-export const REG_STAGES = Object.freeze(['before_issue', 'issued', 'declared', 'partial', 'failed', 'verified']);
+export const REG_STAGES = Object.freeze(['before_issue', 'issued', 'declared', 'partial', 'failed', 'rejected', 'verified']);
 export function regStage(itemState) {
   switch (itemState) {
     case 'issued': return 'issued';
     case 'import_declared': return 'declared';
     case 'partial': return 'partial';
-    case 'failed': return 'failed';
+    case 'failed:not_in_ne': return 'failed';
+    case 'failed:rejected_all': return 'rejected';
+    case 'failed': case 'failed:': return 'failed';   // 理由が読めない failed = 取り込めていない側 (⚠️ を消さない)
     case 'verified': return 'verified';
     default: return 'before_issue';   // null (品目なし)・built・superseded
   }
@@ -238,7 +241,8 @@ export async function readRegistrations(db, companyId = 1) {
     // NE 登録の CSV (0053) の、その SKU の最後の品目の状態 (段階を分けて報告に残す。0053 の前 = 品目なし)
     const hasItems = (await db.query("select to_regclass('ops.ne_reg_export_items') is not null as ok")).rows[0].ok;
     const rows = (await db.query(`select s.code_norm, s.sku_kind, r.state, extract(epoch from r.state_changed_at)::float8 as changed, extract(epoch from r.created_at)::float8 as created,
-             ${hasItems ? '(select i.state from ops.ne_reg_export_items i where i.sku_id = r.sku_id order by i.item_id desc limit 1)' : 'null::text'} as item_state
+             ${hasItems ? `(select case when i.state = 'failed' then 'failed:' || coalesce(i.failed_reason, '') else i.state end
+                from ops.ne_reg_export_items i where i.sku_id = r.sku_id order by i.item_id desc limit 1)` : 'null::text'} as item_state
         from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id
        where r.company_id = $1 and r.origin = 'new_entry'`, [companyId])).rows;
     await db.query('release savepoint master_registrations_read');
@@ -802,7 +806,9 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     }
     if (!n && cRow) {
       const key = subjectKey('only_in_cdb', norm);
-      // ポータルで登録して NE 登録の前〜確かめ待ち・登録をやめた = NE に無くて当然 (行が落ちた朝でも言える = NE の表を根拠にしない) → 差にしない・報告に残す
+      // NE の行が落ちた朝 = 「NE に無い」と言えない = 先に保持 (NE 登録待ち・やめたの対象外にもしない = 前の朝に開いた区分違い・値の差の案件を「監視対象外」で閉じない。#1635 Codex R1 Medium)
+      if (absenceUntrusted) { holdKey('only_in_cdb', norm, 'ne_dropped_rows'); for (const t of ['value', 'cost', 'primary_supplier', 'components', 'kind', 'parent']) holdKey(t, norm, 'not_in_ne'); continue; }
+      // ポータルで登録して NE 登録の前〜確かめ待ち・登録をやめた = NE に無くて当然 (完全な取得の朝だけ) → 差にしない・報告に残す
       const reg = registrationAbsence(registrations, norm, asOfJst);
       if (reg && reg.kind !== 'stale') {
         const why = reg.kind === 'cancelled' ? 'reg_cancelled' : 'reg_pending';
@@ -810,7 +816,6 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
         regList[reg.kind].push(regEntry(code, norm, cRow.sku_kind, reg));
         continue;
       }
-      if (absenceUntrusted) { holdKey('only_in_cdb', norm, 'ne_dropped_rows'); for (const t of ['value', 'cost', 'primary_supplier', 'components', 'kind', 'parent']) holdKey(t, norm, 'not_in_ne'); continue; }
       const inToday = tToday.has(norm);
       const reasons = reasonsFor(norm, 'exists');
       let r;
@@ -1049,9 +1054,9 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   //   段階 (stage) = CSV を配る前・配った・申告した・partial・failed (申告したのに NE に無い)
   if (registrations && registrations.state === 'ok') {
     for (const [norm, g] of registrations.byNorm) {
-      // 区分違い (kind_mismatch) に出した商品は二重に数えない
-      if (!REG_WAIT_STATES.includes(g.state) || g.stage !== 'partial' || !nm.has(norm) || regList.kind_mismatch.some((e) => e.norm === norm)) continue;
-      regList.partial.push(regEntry(nm.get(norm).code, norm, g.sku_kind, g));
+      // 区分違い (kind_mismatch) に出した商品は二重に数えない。NE にあるかは問わない (確かめの記録で数える = NE の行が落ちた朝も ⚠️ を消さない。#1635 Codex R1 Medium)
+      if (!REG_WAIT_STATES.includes(g.state) || g.stage !== 'partial' || regList.kind_mismatch.some((e) => e.norm === norm)) continue;
+      regList.partial.push(regEntry(nm.get(norm)?.code ?? cdb.skuByNorm.get(norm)?.code ?? norm, norm, g.sku_kind, g));
     }
   }
   const byCode = (a, b) => (a.norm < b.norm ? -1 : a.norm > b.norm ? 1 : 0);
@@ -1060,7 +1065,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   const absent = [...regList.waiting, ...regList.stale];
   const stages = Object.fromEntries(REG_STAGES.map((st) => [st, regList.waiting.filter((e) => e.stage === st).length]).filter(([, v]) => v));   // NE 登録待ちの段階ごとの数
   const regCounts = { reg_pending: regList.waiting.length, reg_stale: regList.stale.filter((e) => !e.accepted).length, reg_cancelled: regList.cancelled.length, reg_kind_mismatch: regList.kind_mismatch.length,
-    reg_partial: regList.partial.length, reg_failed: absent.filter((e) => e.stage === 'failed').length };
+    reg_partial: regList.partial.length, reg_failed: absent.filter((e) => e.stage === 'failed').length, reg_rejected: absent.filter((e) => e.stage === 'rejected').length };
   out.reg_pending = { state: registrations ? registrations.state : 'not_applied', ...(registrations && registrations.reason ? { reason: registrations.reason } : {}), stale_days: REG_STALE_DAYS,
     stages, waiting: regList.waiting.sort(byCode), stale: regList.stale.sort(byCode), cancelled: regList.cancelled.sort(byCode), kind_mismatch: regList.kind_mismatch.sort(byCode),
     partial: regList.partial.sort(byCode) };

@@ -210,7 +210,7 @@ await ta('[9] ポータルで登録した新商品: NE 登録待ち (out_of_scop
   assert.deepEqual(await regIssues('out_of_window'), ['only_in_cdb:n901']);   // 監視対象外 (reg_pending) で閉じる (回復でも保持でもない)
   assert.deepEqual(await regIssues('open'), ['kind:n904', 'only_in_cdb:n903']);
   assert.match(w.reason, /NE との差 2 件 .*NE 登録待ち 1 件 \(差に入れない\)・新商品の区分違い 1/);
-  assert.deepEqual(w.observed.reg, { pending: 1, stale: 1, cancelled: 1, kind_mismatch: 1, partial: 0, failed: 0 });
+  assert.deepEqual(w.observed.reg, { pending: 1, stale: 1, cancelled: 1, kind_mismatch: 1, partial: 0, failed: 0, rejected: 0 });
   // 差が無く NE 登録待ちだけの朝 = pass (理由に数)
   const r2 = await run(d, evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: { 'only_in_cdb:n901': 'reg_pending' }, extraCounts: { reg_pending: 1 } } }), '2026-10-04T23:20:00Z');
   assert.deepEqual([res(r2, 'ne').verdict, res(r2, 'ne').reason], ['pass', 'NE 登録待ち 1 件 (差に入れない)']);

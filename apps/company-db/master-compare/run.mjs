@@ -125,7 +125,7 @@ export function neSummary(ne) {
  * ポータルで登録した新商品で NE に無いもの (差にしない NE 登録待ち・日がたった reg_stale は差の件数にも入る)。0 件なら何も足さない。
  * 登録の状態を読めない朝 = 待ちを分けていない (差に含む) と書く
  */
-const STAGE_JA = { before_issue: 'CSV を配る前', issued: '配った', declared: '取り込んだ申告の後', failed: '取り込めていない', partial: '中身が違う', verified: '確かめ済み' };
+const STAGE_JA = { before_issue: 'CSV を配る前', issued: '配った', declared: '取り込んだ申告の後', failed: '取り込めていない', rejected: 'NE が全部拒んだ', partial: '中身が違う', verified: '確かめ済み' };
 export function regSummary(ne) {
   const rp = ne && ne.reg_pending;
   if (!rp) return '';
@@ -146,6 +146,7 @@ export function regTrouble(ne) {
   const parts = [];
   if (c.reg_kind_mismatch) parts.push(`区分 (単品・セット) 違い ${c.reg_kind_mismatch} 件`);
   if (c.reg_failed) parts.push(`取り込んだと申告したのに NE に無い ${c.reg_failed} 件`);
+  if (c.reg_rejected) parts.push(`NE が取り込みを全部拒んだ (CSV を作り直す) ${c.reg_rejected} 件`);
   if (c.reg_partial) parts.push(`NE の中身が登録と違う ${c.reg_partial} 件`);
   return parts.length ? `新商品の NE 登録の不一致 (${parts.join('・')})` : null;
 }
